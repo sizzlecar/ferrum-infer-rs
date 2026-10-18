@@ -563,9 +563,9 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
 
     async fn determinism_dispatch_failure(
         &self,
-        step: Arc<StepResourceLease<R>>,
+        guard: &mut PreparedWaveGuard<'_, R>,
         error: SubmissionWaveDispatchError<R>,
-    ) -> FerrumError {
+    ) -> WaveFailure {
         match error {
             SubmissionWaveDispatchError::DefinitelyNotSubmitted { failures, retry } => {
                 let message = format!(
@@ -578,59 +578,70 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                         .unwrap_or("missing classified participant failure")
                 );
                 drop(retry);
-                self.abort_unsubmitted_step(step, FerrumError::backend(message))
+                guard.fail(FerrumError::backend(message))
             }
             error @ (SubmissionWaveDispatchError::Contract(_)
             | SubmissionWaveDispatchError::Provider(_)
             | SubmissionWaveDispatchError::Initialization(_)
             | SubmissionWaveDispatchError::InputUpload(_)) => {
-                self.abort_unsubmitted_step(step, FerrumError::backend(error.to_string()))
+                guard.fail(FerrumError::backend(error.to_string()))
             }
             SubmissionWaveDispatchError::SubmissionIndeterminate { recovery } => {
+                guard.observe_indeterminate(&recovery);
+                let route = guard.worker_route();
                 let reaper = Arc::clone(&self.reaper);
                 let recovered = self
                     .completion_worker
                     .execute(VNextCompletionTaskKind::IndeterminateRecovery, move || {
                         let recovered = recovery.recover_by_draining_lane();
                         drop(reaper);
-                        recovered
+                        route.wrap(recovered)
                     })
                     .await;
-                let message = match recovered {
-                    Ok(Ok(_)) => "vNext determinism submission was indeterminate".to_owned(),
-                    Ok(Err(error)) => format!(
+                let recovered = match recovered {
+                    Ok(envelope) => envelope.into_inner(),
+                    Err(error) => {
+                        return guard.fail(FerrumError::backend(format!(
+                            "vNext determinism submission recovery task failed: {error}"
+                        )))
+                    }
+                };
+                let message = match &recovered {
+                    Ok(CompletionRecoveryOutcome::Drained(_)) =>
+                        "vNext determinism submission was indeterminate and drained".to_owned(),
+                    Ok(CompletionRecoveryOutcome::Quarantined(_)) =>
+                        "vNext determinism submission retains quarantined work".to_owned(),
+                    Err(error) => format!(
                         "vNext determinism submission was indeterminate and recovery failed: {error}"
                     ),
-                    Err(error) => format!(
-                        "vNext determinism submission recovery task failed: {error}"
-                    ),
                 };
-                self.abort_step(step, message).await
+                guard.accept_recovery(recovered);
+                guard.fail(FerrumError::backend(message))
             }
             SubmissionWaveDispatchError::PostSubmitContract { error, completion } => {
                 let message = error.to_string();
+                guard.observe_submission(&completion);
+                let route = guard.worker_route();
                 let reaper = Arc::clone(&self.reaper);
-                let _ = self
+                let observed = self
                     .completion_worker
                     .execute(VNextCompletionTaskKind::PostSubmitDrain, move || {
                         let observation = completion.wait();
                         drop(reaper);
-                        observation
+                        route.wrap(observation)
                     })
                     .await;
-                self.abort_step(step, message).await
+                match observed {
+                    Ok(envelope) => guard.accept_observation(envelope.into_inner()),
+                    Err(error) => {
+                        return guard.fail(FerrumError::backend(format!(
+                            "{message}; vNext determinism drain task failed: {error}"
+                        )))
+                    }
+                }
+                guard.fail(FerrumError::backend(message))
             }
         }
-    }
-
-    fn abort_prepared_unsubmitted_step(
-        &self,
-        step: Arc<StepResourceLease<R>>,
-        wave: PreparedStepSubmissionWave<R>,
-        error: FerrumError,
-    ) -> FerrumError {
-        drop(wave);
-        self.abort_unsubmitted_step(step, error)
     }
 
     pub async fn collect_determinism_execution(
@@ -712,6 +723,25 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 )
             })
             .collect::<Result<Vec<_>>>()?;
+        let output_role = match spec.phase {
+            VNextDeterminismPhase::Prefill => VNextParticipantOutputRole::FinalPrefill,
+            VNextDeterminismPhase::Decode => {
+                VNextParticipantOutputRole::Decode(LogitsReturnPolicy::FullLogits)
+            }
+        };
+        let wave_participants = sequences
+            .iter()
+            .zip(&participants)
+            .zip(&spans)
+            .map(
+                |((sequence, participant), span)| VNextExecutionParticipant {
+                    sequence,
+                    tokens: participant.token_ids(),
+                    span,
+                    output_role: &output_role,
+                },
+            )
+            .collect::<Vec<_>>();
         let step = match self.begin_step_for_spans_with_capacity(
             &batch,
             &sequences,
@@ -730,8 +760,15 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         };
         let wave = match self.prepare_determinism_wave(&step, &sequences, &spans) {
             Ok(wave) => wave,
-            Err(error) => return Err(self.abort_unsubmitted_step(step, error)),
+            Err(error) => {
+                let mut guard = PreparedWaveGuard::new(self, step.into(), &wave_participants);
+                return Err(guard.fail(error).into_error());
+            }
         };
+        let mut guard = PreparedWaveGuard::new(self, step.into(), &wave_participants);
+        // Move the prepared-wave owner after the guard in drop order: recovery
+        // may start only after this final temporary owner has been released.
+        let wave = wave;
         let participant_order =
             SubmissionWaveDeterminismParticipantOrder::from_logical_participant_sessions(
                 &wave,
@@ -740,7 +777,11 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                     .map(|(_, sequence)| Arc::clone(&sequence.session))
                     .collect::<Vec<_>>(),
             )
-            .map_err(|error| FerrumError::backend(error.to_string()))?;
+            .map_err(|error| {
+                guard
+                    .fail(FerrumError::backend(error.to_string()))
+                    .into_error()
+            })?;
         let active_bindings = sequences
             .iter()
             .map(|sequence| sequence.active_binding.as_ref())
@@ -753,11 +794,10 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         ) {
             Ok(identity) => identity,
             Err(error) => {
-                return Err(self.abort_prepared_unsubmitted_step(
-                    step,
-                    wave,
-                    FerrumError::backend(error.to_string()),
-                ))
+                drop(wave);
+                return Err(guard
+                    .fail(FerrumError::backend(error.to_string()))
+                    .into_error());
             }
         };
         let restore = match self.bind_determinism_restore(
@@ -770,7 +810,8 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         ) {
             Ok(restore) => restore,
             Err(error) => {
-                return Err(self.abort_prepared_unsubmitted_step(step, wave, error));
+                drop(wave);
+                return Err(guard.fail(error).into_error());
             }
         };
 
@@ -798,19 +839,17 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                         &self.lane,
                     ) {
                         Ok(Some(program_id)) => program_id,
-                        Ok(None) => return Err(self.abort_prepared_unsubmitted_step(
-                            step,
-                            wave,
-                            FerrumError::backend(
+                        Ok(None) => {
+                            drop(wave);
+                            return Err(guard.fail(FerrumError::backend(
                                 "vNext determinism replay has no exact reusable program identity",
-                            ),
-                        )),
+                            )).into_error());
+                        }
                         Err(error) => {
-                            return Err(self.abort_prepared_unsubmitted_step(
-                                step,
-                                wave,
-                                FerrumError::backend(error.to_string()),
-                            ))
+                            drop(wave);
+                            return Err(guard
+                                .fail(FerrumError::backend(error.to_string()))
+                                .into_error());
                         }
                     };
                 let catalog_snapshot = self.reusable_execution_catalog.read().clone();
@@ -819,25 +858,21 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                         catalog
                     }
                     _ => {
-                        return Err(self.abort_prepared_unsubmitted_step(
-                            step,
-                            wave,
-                            FerrumError::backend(
+                        drop(wave);
+                        return Err(guard
+                            .fail(FerrumError::backend(
                                 "vNext determinism replay catalog is absent or stale",
-                            ),
-                        ))
+                            ))
+                            .into_error());
                     }
                 };
                 let reusable_program = match catalog.programs.get(&program_id) {
                     Some(program) => program,
                     None => {
-                        return Err(self.abort_prepared_unsubmitted_step(
-                            step,
-                            wave,
-                            FerrumError::backend(
+                        drop(wave);
+                        return Err(guard.fail(FerrumError::backend(
                                 "vNext determinism replay program is absent from the sealed exact catalog",
-                            ),
-                        ))
+                            )).into_error());
                     }
                 };
                 OperationDispatch::encode_and_submit_determinism_replayed_wave(
@@ -857,31 +892,55 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         };
         let handle = match submission {
             Ok(handle) => handle,
-            Err(error) => return Err(self.determinism_dispatch_failure(step, error).await),
+            Err(error) => {
+                return Err(self
+                    .determinism_dispatch_failure(&mut guard, error)
+                    .await
+                    .into_error())
+            }
         };
+        guard.observe_submission(handle.completion_handle());
+        let route = guard.worker_route();
+        let completion = handle.completion_handle().clone();
+        let readbacks = handle.readback_plan().collection_request().clone();
         let reaper = Arc::clone(&self.reaper);
-        let evidence = self
+        let observation = self
             .completion_worker
             .execute(VNextCompletionTaskKind::WaveReadback, move || {
-                let evidence = handle.wait_into_evidence();
+                let observation = completion.wait_with_readback_collection(readbacks);
                 drop(reaper);
-                evidence
+                route.wrap(observation)
             })
             .await
             .map_err(|error| {
-                FerrumError::backend(format!("vNext determinism completion task failed: {error}"))
+                guard
+                    .fail(FerrumError::backend(format!(
+                        "vNext determinism completion task failed: {error}"
+                    )))
+                    .into_error()
             })?
-            .map_err(|error| FerrumError::backend(error.to_string()));
-        let evidence = match evidence {
-            Ok(evidence) => evidence,
-            Err(error) => return Err(self.abort_step(step, error.to_string()).await),
+            .into_inner();
+        let observation_error = match &observation {
+            Ok(CompletionReadbackBatchObservation::Terminal(_)) => None,
+            Ok(other) => Some(nonterminal_completion_message(other)),
+            Err(error) => Some(error.to_string()),
         };
-        step.try_retire_normal().map_err(|failure| {
-            FerrumError::backend(format!(
-                "vNext determinism step retirement failed: {}",
-                failure.error()
-            ))
-        })?;
+        guard.accept_readback_observation(observation);
+        if let Some(message) = observation_error {
+            return Err(guard.fail(FerrumError::backend(message)).into_error());
+        }
+        // Keep the original terminal proof in the guard before validating the
+        // evidence. A validation error or unwind cannot erase executed work.
+        let evidence = handle
+            .evidence_from_observed(guard.readbacks())
+            .map_err(|error| {
+                guard
+                    .fail(FerrumError::backend(error.to_string()))
+                    .into_error()
+            })?;
+        let retired = guard
+            .retire_normal(evidence)
+            .map_err(WaveFailure::into_error)?;
         drop(operation_guards);
         for guard in &mut execution_guards {
             guard.disarm();
@@ -892,10 +951,11 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 registry.finish_prefill_execution(slot, sequence);
             }
         }
-        for (_, sequence) in admitted {
+        for (_, sequence) in &admitted {
             sequence.abort();
         }
-        Ok(evidence)
+        retired.retirement.finish();
+        Ok(retired.output)
     }
 }
 

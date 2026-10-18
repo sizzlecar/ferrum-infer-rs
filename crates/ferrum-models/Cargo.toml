@@ -25,6 +25,7 @@ ferrum-bench-core = { workspace = true }
 async-trait = { workspace = true }
 tokio = { workspace = true }
 futures = { workspace = true }
+pin-project-lite = "0.2"
 parking_lot = { workspace = true }
 
 # Serialization

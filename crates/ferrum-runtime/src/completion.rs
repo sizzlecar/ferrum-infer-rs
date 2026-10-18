@@ -1901,33 +1901,7 @@ impl<R: DeviceRuntime> CompletionReaper<R> {
     /// Polls a bounded scheduler-owned snapshot. This path remains available
     /// after every external completion handle has detached.
     pub fn poll_bounded(&self, maximum_slots: usize) -> Result<CompletionSweepReceipt, VNextError> {
-        if maximum_slots == 0 || maximum_slots > MAX_COMPLETION_SWEEP_SLOTS {
-            return Err(invalid_completion(format!(
-                "completion sweep size must be in 1..={MAX_COMPLETION_SWEEP_SLOTS}"
-            )));
-        }
-        let slot_ids = {
-            let mut state = self
-                .state
-                .lock()
-                .map_err(|_| invalid_completion("completion reaper state mutex is poisoned"))?;
-            let keys = state.slots.keys().copied().collect::<Vec<_>>();
-            let start = state
-                .sweep_cursor
-                .and_then(|cursor| keys.iter().position(|slot_id| *slot_id > cursor))
-                .unwrap_or(0);
-            let slot_ids = keys
-                .iter()
-                .cycle()
-                .skip(start)
-                .take(maximum_slots.min(keys.len()))
-                .copied()
-                .collect::<Vec<_>>();
-            if let Some(last) = slot_ids.last() {
-                state.sweep_cursor = Some(*last);
-            }
-            slot_ids
-        };
+        let slot_ids = self.bounded_slot_snapshot(maximum_slots)?;
         let mut entries = Vec::new();
         let mut state_transfers = Vec::new();
         for slot_id in slot_ids {
@@ -1980,6 +1954,40 @@ impl<R: DeviceRuntime> CompletionReaper<R> {
             retained_after,
             quarantined_after,
         })
+    }
+
+    fn bounded_slot_snapshot(
+        &self,
+        maximum_slots: usize,
+    ) -> Result<Vec<CompletionSlotId>, VNextError> {
+        if maximum_slots == 0 || maximum_slots > MAX_COMPLETION_SWEEP_SLOTS {
+            return Err(invalid_completion(format!(
+                "completion sweep size must be in 1..={MAX_COMPLETION_SWEEP_SLOTS}"
+            )));
+        }
+        let slot_ids = {
+            let mut state = self
+                .state
+                .lock()
+                .map_err(|_| invalid_completion("completion reaper state mutex is poisoned"))?;
+            let keys = state.slots.keys().copied().collect::<Vec<_>>();
+            let start = state
+                .sweep_cursor
+                .and_then(|cursor| keys.iter().position(|slot_id| *slot_id > cursor))
+                .unwrap_or(0);
+            let slot_ids = keys
+                .iter()
+                .cycle()
+                .skip(start)
+                .take(maximum_slots.min(keys.len()))
+                .copied()
+                .collect::<Vec<_>>();
+            if let Some(last) = slot_ids.last() {
+                state.sweep_cursor = Some(*last);
+            }
+            slot_ids
+        };
+        Ok(slot_ids)
     }
 
     /// Runs the blocking recovery path for an exact slot after an indeterminate
@@ -3463,6 +3471,12 @@ impl CompletionReadbackBatchReceipt {
         &self.completion
     }
 
+    /// Keep the original terminal proof while releasing readback outputs and
+    /// timing data. No new completion or execution authority is issued.
+    pub fn into_completion(self) -> OperationCompletionReceipt {
+        self.completion
+    }
+
     pub fn dispositions(&self) -> &[CompletionReadbackDisposition] {
         &self.dispositions
     }
@@ -3718,6 +3732,7 @@ pub enum CompletionObservation {
 pub struct IndeterminateSubmissionHandle<R: DeviceRuntime> {
     reaper: Weak<CompletionReaper<R>>,
     slot_id: CompletionSlotId,
+    batch_identity: BatchOperationIdentity,
 }
 
 impl<R: DeviceRuntime> Clone for IndeterminateSubmissionHandle<R> {
@@ -3725,6 +3740,7 @@ impl<R: DeviceRuntime> Clone for IndeterminateSubmissionHandle<R> {
         Self {
             reaper: Weak::clone(&self.reaper),
             slot_id: self.slot_id,
+            batch_identity: self.batch_identity.clone(),
         }
     }
 }
@@ -3741,6 +3757,13 @@ impl<R: DeviceRuntime> fmt::Debug for IndeterminateSubmissionHandle<R> {
 impl<R: DeviceRuntime> IndeterminateSubmissionHandle<R> {
     pub const fn slot_id(&self) -> CompletionSlotId {
         self.slot_id
+    }
+
+    /// The original physical attempt's identity, retained even after recovery
+    /// consumes its slot. This observation cannot recreate submission authority
+    /// or establish the outcome of a missing completion slot.
+    pub fn batch_identity(&self) -> &BatchOperationIdentity {
+        &self.batch_identity
     }
 
     pub fn recover_by_draining_lane(&self) -> Result<CompletionRecoveryOutcome, VNextError> {
@@ -4084,6 +4107,7 @@ impl<R: DeviceRuntime> CompletionReservation<R> {
             .batch_identity
             .take()
             .expect("reservation owns batch identity");
+        let recovery_identity = batch_identity.clone();
         let mut record = match self.record.lock() {
             Ok(record) => record,
             Err(poisoned) => poisoned.into_inner(),
@@ -4103,6 +4127,7 @@ impl<R: DeviceRuntime> CompletionReservation<R> {
         IndeterminateSubmissionHandle {
             reaper: Arc::downgrade(&self.reaper),
             slot_id: self.slot_id,
+            batch_identity: recovery_identity,
         }
     }
 

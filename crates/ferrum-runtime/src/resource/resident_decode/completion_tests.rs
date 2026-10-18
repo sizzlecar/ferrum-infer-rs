@@ -393,16 +393,24 @@ fn resident_completion_unknown_submit_quarantines_until_actual_lane_drain() {
     let retirement = retirement.try_abort().unwrap_err().into_retirement();
     assert!(owner_weak.upgrade().is_some());
     harness.runtime.fail_synchronize(1);
-    assert!(matches!(
-        recovery.recover_by_draining_lane().unwrap(),
-        CompletionRecoveryOutcome::Quarantined(_)
-    ));
+    let cloned_recovery = recovery.clone();
+    let CompletionRecoveryOutcome::Quarantined(quarantined) =
+        recovery.recover_by_draining_lane().unwrap()
+    else {
+        panic!("a failed drain must retain the exact resident completion");
+    };
+    assert_eq!(quarantined.slot_id(), recovery.slot_id());
+    assert_eq!(quarantined.batch_identity(), recovery.batch_identity());
     assert_eq!(reaper.retained_count(), 1);
     let retirement = retirement.try_abort().unwrap_err().into_retirement();
-    assert!(matches!(
-        recovery.recover_by_draining_lane().unwrap(),
-        CompletionRecoveryOutcome::Drained(_)
-    ));
+    let CompletionRecoveryOutcome::Drained(drained) =
+        cloned_recovery.recover_by_draining_lane().unwrap()
+    else {
+        panic!("the successful lane drain must prove this completion quiescent");
+    };
+    assert_eq!(drained.slot_id(), recovery.slot_id());
+    assert_eq!(drained.batch_identity(), recovery.batch_identity());
+    assert_eq!(cloned_recovery.batch_identity(), recovery.batch_identity());
     assert_eq!(reaper.retained_count(), 0);
     assert!(harness.runtime.synchronize_calls() >= 2);
     retirement.try_abort().unwrap();

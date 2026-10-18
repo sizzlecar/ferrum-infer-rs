@@ -20,6 +20,13 @@ pub(crate) enum StateTransferObservation {
 }
 
 #[derive(Debug)]
+#[cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        reason = "Native transfer observations are retained in the internal sweep receipt"
+    )
+)]
 pub(crate) struct StateTransferSweepEntry {
     pub(crate) slot_id: CompletionSlotId,
     pub(crate) observation: StateTransferObservation,

@@ -112,7 +112,23 @@ fn determinism_eager_submission_restores_the_complete_typed_denominator() {
     assert!(compute_rows
         .iter()
         .all(|command| command.execution_path() == DeviceExecutionPath::Eager));
-    let evidence = handle.wait_into_evidence().unwrap();
+    let completion_handle = handle.completion_handle().clone();
+    let observed = match handle.wait_with_determinism_readback().unwrap() {
+        CompletionReadbackCollectionObservation::Terminal(receipt) => receipt,
+        other => panic!("determinism readback did not terminate: {other:?}"),
+    };
+    let evidence = handle.evidence_from_observed(&observed).unwrap();
+    assert_eq!(
+        observed.completion().submission(),
+        completion_handle.receipt()
+    );
+    assert_eq!(reaper.retained_count(), 0);
+    assert!(completion_handle.wait().is_err());
+    let terminal_proof = observed.into_completion();
+    assert!(matches!(
+        terminal_proof.disposition(),
+        OperationCompletionDisposition::Succeeded
+    ));
     assert_eq!(evidence.restore_fingerprint(), restore_fingerprint);
     assert_eq!(evidence.initialization_identity(), &initialization_identity);
     assert_eq!(
@@ -152,6 +168,73 @@ fn determinism_eager_submission_restores_the_complete_typed_denominator() {
         .as_array()
         .is_some_and(|witnesses| !witnesses.is_empty()));
 
+    drop(providers);
+    drop(active_bindings);
+    drop(reaper);
+    drop(lane);
+    teardown(fixture, sequence, session, batch, step);
+}
+
+#[test]
+fn determinism_evidence_error_preserves_observed_terminal_proof() {
+    let (fixture, sequence, session, batch, step) = setup_with_fixture(
+        fixture_with_determinism_provider_behavior(false, ProviderBehavior::ScratchOverwrite),
+    );
+    let wave = prepare_determinism_wave(&fixture.plan_resources, &fixture.plan, &step);
+    let active_bindings = wave_active_bindings(&wave, &session);
+    let lane = Arc::clone(step.execution_lane());
+    let reaper = CompletionReaper::new();
+    let providers = fixture
+        .plan
+        .payload()
+        .nodes()
+        .iter()
+        .map(|node| fixture.registry.bind(&fixture.resolved, node.id()).unwrap())
+        .collect::<Vec<_>>();
+    let batch_identity = OperationDispatch::bind_submission_wave_identity(
+        &fixture.resolved,
+        active_bindings.iter(),
+        &wave,
+        &lane,
+    )
+    .unwrap();
+    let restore = determinism_restore(
+        &fixture,
+        &providers,
+        &batch_identity,
+        &active_bindings,
+        &wave,
+        0x42,
+    );
+    let handle = OperationDispatch::encode_and_submit_determinism_eager_wave(
+        &providers,
+        &fixture.resolved,
+        &batch_identity,
+        active_bindings.iter(),
+        DeviceTimingMode::Kernel,
+        &restore,
+        0xa5,
+        wave,
+        &lane,
+        &reaper,
+    )
+    .unwrap();
+    fixture.runtime_trace.lock().unwrap().readback_behavior = ReadbackBehavior::DeviceFailure;
+    let observed = match handle.wait_with_determinism_readback().unwrap() {
+        CompletionReadbackCollectionObservation::Terminal(receipt) => receipt,
+        other => panic!("failed readback did not preserve terminal proof: {other:?}"),
+    };
+    assert!(handle.evidence_from_observed(&observed).is_err());
+    assert_eq!(reaper.retained_count(), 0);
+    assert_eq!(lane.in_flight_count(), 0);
+    let terminal_proof = observed.into_completion();
+    assert_eq!(terminal_proof.submission(), handle.receipt());
+    assert!(matches!(
+        terminal_proof.disposition(),
+        OperationCompletionDisposition::Succeeded
+    ));
+    assert!(handle.completion_handle().wait().is_err());
+    drop(handle);
     drop(providers);
     drop(active_bindings);
     drop(reaper);

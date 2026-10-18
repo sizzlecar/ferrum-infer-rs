@@ -13,15 +13,16 @@ use super::{
 use crate::{
     AllocationKind, AllocationLifetime, BatchInvocationId, BatchParticipantAuthority, BufferUsage,
     CompletionHandle, CompletionReadbackBatchRequest, CompletionReadbackCollectionObservation,
-    CompletionReadbackCollectionRequest, CompletionReadbackDisposition, CompletionReadbackRequest,
-    DeviceCommandPhase, DeviceComputePathRequirement, DeviceExecutionPath,
-    DeviceReusableExecutionProgramId, DeviceRuntime, ExecutablePlanView,
-    ExecutionDeterminismInitializationKind, ExecutionDeterminismInitializationSpec,
-    ExecutionDeterminismValueExtent, ExecutionDeterminismValueLocation,
-    ExecutionDeterminismWitnessKind, ExecutionDeterminismWitnessPlan,
-    ExecutionDeterminismWitnessSpec, HostTransferLayout, NodeId, OperationCompletionDisposition,
-    PlanHash, PreparedStepSubmissionWave, ResourceId, ResourceWorkShape, SequenceSession,
-    SubmittedOperationReceipt, TrustedActiveSequenceBinding, VNextError,
+    CompletionReadbackCollectionReceipt, CompletionReadbackCollectionRequest,
+    CompletionReadbackDisposition, CompletionReadbackRequest, DeviceCommandPhase,
+    DeviceComputePathRequirement, DeviceExecutionPath, DeviceReusableExecutionProgramId,
+    DeviceRuntime, ExecutablePlanView, ExecutionDeterminismInitializationKind,
+    ExecutionDeterminismInitializationSpec, ExecutionDeterminismValueExtent,
+    ExecutionDeterminismValueLocation, ExecutionDeterminismWitnessKind,
+    ExecutionDeterminismWitnessPlan, ExecutionDeterminismWitnessSpec, HostTransferLayout, NodeId,
+    OperationCompletionDisposition, PlanHash, PreparedStepSubmissionWave, ResourceId,
+    ResourceWorkShape, SequenceSession, SubmittedOperationReceipt, TrustedActiveSequenceBinding,
+    VNextError,
 };
 
 const LOGICAL_RESTORE_FINGERPRINT_DOMAIN: &[u8] =
@@ -2023,6 +2024,12 @@ impl<R: DeviceRuntime> SubmissionWaveDeterminismHandle<R> {
         &self.restore_fingerprint
     }
 
+    /// Observes the original submission; this does not create another owner or
+    /// allow a consumed terminal receipt to be observed again.
+    pub fn completion_handle(&self) -> &CompletionHandle<R> {
+        &self.completion
+    }
+
     pub fn wait_with_determinism_readback(
         &self,
     ) -> Result<CompletionReadbackCollectionObservation, VNextError> {
@@ -2035,17 +2042,7 @@ impl<R: DeviceRuntime> SubmissionWaveDeterminismHandle<R> {
     /// completion, failed readback, or any semantic/physical mapping drift is
     /// rejected after the submitted work has been observed to completion.
     pub fn wait_into_evidence(self) -> Result<SubmissionWaveDeterminismEvidence, VNextError> {
-        let Self {
-            completion,
-            attribution,
-            readback_plan,
-            restore_fingerprint,
-            initialization_identity,
-            compute_expectation,
-        } = self;
-        let submission_receipt_fingerprint = completion.receipt().fingerprint().to_owned();
-        let observation =
-            completion.wait_with_readback_collection(readback_plan.collection_request().clone())?;
+        let observation = self.wait_with_determinism_readback()?;
         let receipt = match observation {
             CompletionReadbackCollectionObservation::Terminal(receipt) => receipt,
             other => {
@@ -2054,6 +2051,29 @@ impl<R: DeviceRuntime> SubmissionWaveDeterminismHandle<R> {
                 )))
             }
         };
+        self.evidence_from_observed(&receipt)
+    }
+
+    /// Validates evidence while leaving the actual terminal proof with the
+    /// caller, including when attribution or readback validation fails.
+    pub fn evidence_from_observed(
+        &self,
+        receipt: &CompletionReadbackCollectionReceipt,
+    ) -> Result<SubmissionWaveDeterminismEvidence, VNextError> {
+        let Self {
+            completion,
+            attribution,
+            readback_plan,
+            restore_fingerprint,
+            initialization_identity,
+            compute_expectation,
+        } = self;
+        if receipt.completion().submission() != completion.receipt() {
+            return Err(invalid_operation(
+                "determinism evidence receipt belongs to a different submission",
+            ));
+        }
+        let submission_receipt_fingerprint = completion.receipt().fingerprint().to_owned();
         if !matches!(
             receipt.completion().disposition(),
             OperationCompletionDisposition::Succeeded
@@ -2064,6 +2084,7 @@ impl<R: DeviceRuntime> SubmissionWaveDeterminismHandle<R> {
         }
 
         let attribution = attribution
+            .clone()
             .ok_or_else(|| {
                 invalid_operation("determinism submission lacks actual-path device attribution")
             })?
@@ -2071,7 +2092,7 @@ impl<R: DeviceRuntime> SubmissionWaveDeterminismHandle<R> {
         validate_determinism_attribution(
             &attribution,
             readback_plan.node_ids(),
-            &compute_expectation,
+            compute_expectation,
         )?;
 
         let expected_readbacks = readback_plan
@@ -2179,9 +2200,9 @@ impl<R: DeviceRuntime> SubmissionWaveDeterminismHandle<R> {
         }
         let terminal_receipt_fingerprint = receipt.fingerprint().to_owned();
         Ok(SubmissionWaveDeterminismEvidence {
-            restore_fingerprint,
-            initialization_identity,
-            compute_expectation,
+            restore_fingerprint: restore_fingerprint.clone(),
+            initialization_identity: initialization_identity.clone(),
+            compute_expectation: compute_expectation.clone(),
             submission_receipt_fingerprint,
             terminal_receipt_fingerprint,
             attribution,

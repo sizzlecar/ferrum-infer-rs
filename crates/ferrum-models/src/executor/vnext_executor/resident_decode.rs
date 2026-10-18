@@ -39,6 +39,45 @@ pub(super) enum PreparedRetirement<R: DeviceRuntime> {
     Resident(ResidentFrameRetirement<R>),
 }
 
+#[must_use = "failed finalization retains the exact ordinary step or resident frame"]
+pub(super) enum PreparedFinalizationFailure<R: DeviceRuntime> {
+    Ordinary(StepFinalizationFailure<R>),
+    Resident(ResidentFrameFinalizationFailure<R>),
+}
+
+impl<R: DeviceRuntime> PreparedFinalizationFailure<R> {
+    pub(super) fn error(&self) -> &VNextError {
+        match self {
+            Self::Ordinary(failure) => failure.error(),
+            Self::Resident(failure) => failure.error(),
+        }
+    }
+
+    /// Return the same failed authority for checked cleanup or retention.
+    /// Inspect or retain `error()` before consuming the failure when needed.
+    pub(super) fn into_retirement(self) -> PreparedRetirement<R> {
+        match self {
+            Self::Ordinary(failure) => PreparedRetirement::Ordinary(failure.into_step()),
+            Self::Resident(failure) => PreparedRetirement::Resident(failure.into_retirement()),
+        }
+    }
+}
+
+impl<R: DeviceRuntime> fmt::Debug for PreparedFinalizationFailure<R> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Ordinary(failure) => formatter.debug_tuple("Ordinary").field(failure).finish(),
+            Self::Resident(failure) => formatter.debug_tuple("Resident").field(failure).finish(),
+        }
+    }
+}
+
+impl<R: DeviceRuntime> fmt::Display for PreparedFinalizationFailure<R> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(self.error(), formatter)
+    }
+}
+
 impl<R: DeviceRuntime> From<Arc<StepResourceLease<R>>> for PreparedRetirement<R> {
     fn from(step: Arc<StepResourceLease<R>>) -> Self {
         Self::Ordinary(step)
@@ -46,30 +85,47 @@ impl<R: DeviceRuntime> From<Arc<StepResourceLease<R>>> for PreparedRetirement<R>
 }
 
 impl<R: DeviceRuntime> PreparedRetirement<R> {
-    pub(super) fn try_retire_normal(self) -> std::result::Result<StepRetirementReceipt, String> {
+    pub(super) fn batch_step_id(&self) -> BatchStepId {
         match self {
-            Self::Ordinary(step) => step.try_retire_normal().map_err(|e| e.error().to_string()),
-            Self::Resident(retirement) => retirement
-                .try_retire_normal()
-                .map_err(|e| e.error().to_string()),
+            Self::Ordinary(step) => step.batch_step_id(),
+            Self::Resident(retirement) => retirement.batch_step_id(),
         }
     }
-    pub(super) fn try_abort(self) -> std::result::Result<StepRetirementReceipt, String> {
+
+    pub(super) fn try_retire_normal(
+        self,
+    ) -> std::result::Result<StepRetirementReceipt, PreparedFinalizationFailure<R>> {
         match self {
-            Self::Ordinary(step) => step.try_abort().map_err(|e| e.error().to_string()),
-            Self::Resident(retirement) => retirement.try_abort().map_err(|e| e.error().to_string()),
+            Self::Ordinary(step) => step
+                .try_retire_normal()
+                .map_err(PreparedFinalizationFailure::Ordinary),
+            Self::Resident(retirement) => retirement
+                .try_retire_normal()
+                .map_err(PreparedFinalizationFailure::Resident),
+        }
+    }
+    pub(super) fn try_abort(
+        self,
+    ) -> std::result::Result<StepRetirementReceipt, PreparedFinalizationFailure<R>> {
+        match self {
+            Self::Ordinary(step) => step
+                .try_abort()
+                .map_err(PreparedFinalizationFailure::Ordinary),
+            Self::Resident(retirement) => retirement
+                .try_abort()
+                .map_err(PreparedFinalizationFailure::Resident),
         }
     }
     pub(super) fn try_rollback_unsubmitted(
         self,
-    ) -> std::result::Result<StepRetirementReceipt, String> {
+    ) -> std::result::Result<StepRetirementReceipt, PreparedFinalizationFailure<R>> {
         match self {
             Self::Ordinary(step) => step
                 .try_rollback_unsubmitted()
-                .map_err(|e| e.error().to_string()),
+                .map_err(PreparedFinalizationFailure::Ordinary),
             Self::Resident(retirement) => retirement
                 .try_rollback_unsubmitted()
-                .map_err(|e| e.error().to_string()),
+                .map_err(PreparedFinalizationFailure::Resident),
         }
     }
 }
@@ -277,7 +333,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         };
         if output_modes.uniform() != Some(VNextProductOutputMode::GreedyToken) {
             return PreparedDispatchResult::Outcome(DispatchOutcome::QuiescentFailure(
-                "resident decode requires uniform greedy readbacks".to_owned(),
+                FerrumError::internal("resident decode requires uniform greedy readbacks"),
             ));
         }
         let uploads =
@@ -285,7 +341,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 Ok(uploads) => uploads,
                 Err(error) => {
                     return PreparedDispatchResult::Outcome(DispatchOutcome::QuiescentFailure(
-                        error.to_string(),
+                        error,
                     ))
                 }
             };
@@ -302,7 +358,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 Ok(identity) => identity,
                 Err(error) => {
                     return PreparedDispatchResult::Outcome(DispatchOutcome::QuiescentFailure(
-                        error.to_string(),
+                        FerrumError::backend(error.to_string()),
                     ))
                 }
             };
@@ -376,7 +432,9 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                         completion,
                     }
                 }
-                Err(error) => DispatchOutcome::QuiescentFailure(error.to_string()),
+                Err(error) => {
+                    DispatchOutcome::QuiescentFailure(FerrumError::backend(error.to_string()))
+                }
             };
             return PreparedDispatchResult::Outcome(outcome);
         }

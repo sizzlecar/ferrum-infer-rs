@@ -289,7 +289,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             candidates: &decode_candidates,
             armed: true,
         };
-        let sampling_outputs = match self
+        let retired = match self
             .execute_batch_step(
                 &batch,
                 &sequences,
@@ -298,7 +298,8 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 VNextExecutionWaveKind::Mixed,
                 &output_roles,
             )
-            .await?
+            .await
+            .map_err(WaveFailure::into_error)?
         {
             VNextExecutionCapacityDecision::Ready(outputs) => outputs,
             VNextExecutionCapacityDecision::Deferred(deferral) => {
@@ -312,146 +313,170 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 return Ok(PlanRuntimeMixedBatchOutcome::NotSubmitted(deferral.into()));
             }
         };
-        if sampling_outputs.len() != canonical_indices.len() {
-            return Err(FerrumError::internal(
-                "mixed execution output count differs from its participant set",
-            ));
-        }
-        for (output, role) in sampling_outputs.iter().zip(&output_roles) {
-            match role {
-                // The complete device plan still computes an output for this
-                // participant. Its readback is discarded internally and does
-                // not grant a sampling policy or publish a product token.
-                VNextParticipantOutputRole::IntermediatePrefill => {}
-                VNextParticipantOutputRole::FinalPrefill => {
-                    output.validate_for_policy(
-                        &LogitsReturnPolicy::FullLogits,
-                        self.io.output_elements,
-                    )?;
-                }
-                VNextParticipantOutputRole::Decode(policy) => {
-                    output.validate_for_policy(policy, self.io.output_elements)?;
+        let RetiredWave {
+            output: sampling_outputs,
+            retirement,
+        } = retired;
+        let product = async {
+            if sampling_outputs.len() != canonical_indices.len() {
+                return Err(FerrumError::internal(
+                    "mixed execution output count differs from its participant set",
+                ));
+            }
+            for (output, role) in sampling_outputs.iter().zip(&output_roles) {
+                match role {
+                    // The complete device plan still computes an output for this
+                    // participant. Its readback is discarded internally and does
+                    // not grant a sampling policy or publish a product token.
+                    VNextParticipantOutputRole::IntermediatePrefill => {}
+                    VNextParticipantOutputRole::FinalPrefill => {
+                        output.validate_for_policy(
+                            &LogitsReturnPolicy::FullLogits,
+                            self.io.output_elements,
+                        )?;
+                    }
+                    VNextParticipantOutputRole::Decode(policy) => {
+                        output.validate_for_policy(policy, self.io.output_elements)?;
+                    }
                 }
             }
-        }
 
-        // The shared FullPlan fence has retired. Checkpoint copies belong only
-        // to prefill boundaries, never to their decode peers' token histories.
-        for candidate in &prefill_candidates {
-            self.retain_prefill_boundary(
-                &candidate.sequence,
-                &candidate.tokens,
-                candidate.planned_chunk,
-            )
-            .await?;
-        }
-
-        let mut ordered_prefills = (0..prefills.len()).map(|_| None).collect::<Vec<_>>();
-        let mut ordered_decodes = (0..decodes.len()).map(|_| None).collect::<Vec<_>>();
-        for ((index, output), span) in canonical_indices.iter().zip(sampling_outputs).zip(&spans) {
-            match *index {
-                MixedParticipantIndex::Prefill(index) => {
-                    let candidate = &prefill_candidates[index];
-                    let chunk = candidate.planned_chunk;
-                    let cache = self.cache_handle(&candidate.sequence, chunk.end());
-                    let product = if chunk.is_final() {
-                        PlanRuntimePrefillOutput::final_logits(
-                            candidate.slot.request_id.clone(),
-                            chunk.end(),
-                            output.into_full_logits()?,
-                            cache,
-                        )?
-                    } else {
-                        PlanRuntimePrefillOutput::intermediate(
-                            candidate.slot.request_id.clone(),
-                            chunk.end(),
-                            cache,
-                        )
-                    };
-                    product.validate_for_completion(
-                        &candidate.slot.request_id,
-                        chunk,
-                        self.io.output_elements,
-                    )?;
-                    ordered_prefills[candidate.original_index] =
-                        Some(PlanRuntimePrefillCompletion::exact(product, chunk));
-                }
-                MixedParticipantIndex::Decode(index) => {
-                    let candidate = &decode_candidates[index];
-                    let end = usize::try_from(span.immediate_token_range().end).map_err(|_| {
-                        FerrumError::backend("mixed decode frontier exceeds host address space")
-                    })?;
-                    ordered_decodes[candidate.original_index] = Some(PlanRuntimeDecodeOutput::new(
-                        output,
-                        self.cache_handle(&candidate.sequence, end),
-                    ));
-                }
-            }
-        }
-        let prefills = ordered_prefills
-            .into_iter()
-            .map(|output| {
-                output.ok_or_else(|| FerrumError::internal("mixed execution lost a prefill output"))
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let decodes = ordered_decodes
-            .into_iter()
-            .map(|output| {
-                output.ok_or_else(|| FerrumError::internal("mixed execution lost a decode output"))
-            })
-            .collect::<Result<Vec<_>>>()?;
-
-        let authority = prefill_candidates
-            .iter()
-            .map(|candidate| {
-                (
-                    &candidate.slot,
+            // The shared FullPlan fence has retired. Checkpoint copies belong only
+            // to prefill boundaries, never to their decode peers' token histories.
+            for candidate in &prefill_candidates {
+                self.retain_prefill_boundary(
                     &candidate.sequence,
-                    candidate.planned_chunk.is_final(),
+                    &candidate.tokens,
+                    candidate.planned_chunk,
                 )
-            })
-            .collect::<Vec<_>>();
-        for candidate in &prefill_candidates {
-            candidate
-                .sequence
-                .prefill_tokens_processed
-                .store(candidate.planned_chunk.end(), Ordering::Release);
-        }
-        self.sequences
-            .lock()
-            .commit_prefill_batch_execution(&authority)?;
-        for (index, tokens) in canonical_indices.iter().zip(token_batches) {
-            if let MixedParticipantIndex::Decode(index) = *index {
-                let sequence = &decode_candidates[index].sequence;
-                if sequence.active.load(Ordering::Acquire) {
-                    *sequence.tokens.lock() = tokens;
+                .await?;
+            }
+
+            let mut ordered_prefills = (0..prefills.len()).map(|_| None).collect::<Vec<_>>();
+            let mut ordered_decodes = (0..decodes.len()).map(|_| None).collect::<Vec<_>>();
+            for ((index, output), span) in
+                canonical_indices.iter().zip(sampling_outputs).zip(&spans)
+            {
+                match *index {
+                    MixedParticipantIndex::Prefill(index) => {
+                        let candidate = &prefill_candidates[index];
+                        let chunk = candidate.planned_chunk;
+                        let cache = self.cache_handle(&candidate.sequence, chunk.end());
+                        let product = if chunk.is_final() {
+                            PlanRuntimePrefillOutput::final_logits(
+                                candidate.slot.request_id.clone(),
+                                chunk.end(),
+                                output.into_full_logits()?,
+                                cache,
+                            )?
+                        } else {
+                            PlanRuntimePrefillOutput::intermediate(
+                                candidate.slot.request_id.clone(),
+                                chunk.end(),
+                                cache,
+                            )
+                        };
+                        product.validate_for_completion(
+                            &candidate.slot.request_id,
+                            chunk,
+                            self.io.output_elements,
+                        )?;
+                        ordered_prefills[candidate.original_index] =
+                            Some(PlanRuntimePrefillCompletion::exact(product, chunk));
+                    }
+                    MixedParticipantIndex::Decode(index) => {
+                        let candidate = &decode_candidates[index];
+                        let end =
+                            usize::try_from(span.immediate_token_range().end).map_err(|_| {
+                                FerrumError::backend(
+                                    "mixed decode frontier exceeds host address space",
+                                )
+                            })?;
+                        ordered_decodes[candidate.original_index] =
+                            Some(PlanRuntimeDecodeOutput::new(
+                                output,
+                                self.cache_handle(&candidate.sequence, end),
+                            ));
+                    }
                 }
             }
+            let prefills = ordered_prefills
+                .into_iter()
+                .map(|output| {
+                    output.ok_or_else(|| {
+                        FerrumError::internal("mixed execution lost a prefill output")
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let decodes = ordered_decodes
+                .into_iter()
+                .map(|output| {
+                    output.ok_or_else(|| {
+                        FerrumError::internal("mixed execution lost a decode output")
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+
+            let authority = prefill_candidates
+                .iter()
+                .map(|candidate| {
+                    (
+                        &candidate.slot,
+                        &candidate.sequence,
+                        candidate.planned_chunk.is_final(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            for candidate in &prefill_candidates {
+                candidate
+                    .sequence
+                    .prefill_tokens_processed
+                    .store(candidate.planned_chunk.end(), Ordering::Release);
+            }
+            self.sequences
+                .lock()
+                .commit_prefill_batch_execution(&authority)?;
+            for (index, tokens) in canonical_indices.iter().zip(token_batches) {
+                if let MixedParticipantIndex::Decode(index) = *index {
+                    let sequence = &decode_candidates[index].sequence;
+                    if sequence.active.load(Ordering::Acquire) {
+                        *sequence.tokens.lock() = tokens;
+                    }
+                }
+            }
+            for guard in &mut prefill_guards {
+                guard.disarm();
+            }
+            decode_guard.armed = false;
+            self.metrics
+                .prefill_operations
+                .fetch_add(prefills.len() as u64, Ordering::Relaxed);
+            self.metrics
+                .decode_operations
+                .fetch_add(decodes.len() as u64, Ordering::Relaxed);
+            // These status counters report each participant's observed call latency.
+            // Physical device time is separately attributed only to the mixed wave.
+            let elapsed_us = started.elapsed().as_micros().min(u64::MAX as u128) as u64;
+            self.metrics.total_prefill_us.fetch_add(
+                elapsed_us.saturating_mul(prefills.len() as u64),
+                Ordering::Relaxed,
+            );
+            self.metrics.total_decode_us.fetch_add(
+                elapsed_us.saturating_mul(decodes.len() as u64),
+                Ordering::Relaxed,
+            );
+            // Shared wave timing is reported under "mixed", never added to both
+            // phase timers as if it were two disjoint device intervals.
+            Ok(PlanRuntimeMixedBatchOutcome::Completed { prefills, decodes })
         }
-        for guard in &mut prefill_guards {
-            guard.disarm();
+        .await;
+        match product {
+            Ok(output) => {
+                retirement.finish();
+                Ok(output)
+            }
+            Err(error) => Err(retirement.fail(error).into_error()),
         }
-        decode_guard.armed = false;
-        self.metrics
-            .prefill_operations
-            .fetch_add(prefills.len() as u64, Ordering::Relaxed);
-        self.metrics
-            .decode_operations
-            .fetch_add(decodes.len() as u64, Ordering::Relaxed);
-        // These status counters report each participant's observed call latency.
-        // Physical device time is separately attributed only to the mixed wave.
-        let elapsed_us = started.elapsed().as_micros().min(u64::MAX as u128) as u64;
-        self.metrics.total_prefill_us.fetch_add(
-            elapsed_us.saturating_mul(prefills.len() as u64),
-            Ordering::Relaxed,
-        );
-        self.metrics.total_decode_us.fetch_add(
-            elapsed_us.saturating_mul(decodes.len() as u64),
-            Ordering::Relaxed,
-        );
-        // Shared wave timing is reported under "mixed", never added to both
-        // phase timers as if it were two disjoint device intervals.
-        Ok(PlanRuntimeMixedBatchOutcome::Completed { prefills, decodes })
     }
 }
 

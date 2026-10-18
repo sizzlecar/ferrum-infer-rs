@@ -1,7 +1,10 @@
 use std::fmt;
+use std::future::Future;
 use std::panic::{catch_unwind, AssertUnwindSafe};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
+use std::task::{Context, Poll};
 use std::thread::{self, JoinHandle};
 use std::time::Instant;
 
@@ -9,9 +12,88 @@ use tokio::sync::{mpsc, oneshot};
 
 use super::vnext_timing::AtomicDurationMetrics;
 
+#[cfg(test)]
+mod recovery_tests;
+
 const COMPLETION_WORKER_QUEUE_CAPACITY: usize = 1;
 
 type VNextCompletionTask = Box<dyn FnOnce() + Send + 'static>;
+
+/// A wake-up for recovery retained in the executor's existing sequence registry.
+/// The weak sender does not keep a stopped worker or its executor alive.
+pub(super) struct VNextRecoveryWake {
+    sender: mpsc::WeakSender<VNextCompletionTask>,
+    pending: AtomicBool,
+    callback: OnceLock<Box<dyn Fn() + Send + Sync>>,
+    failed_recoveries: AtomicU64,
+}
+
+impl VNextRecoveryWake {
+    pub(super) fn request(&self) {
+        self.pending.store(true, Ordering::Release);
+        if let Some(sender) = self.sender.upgrade() {
+            // Full may mean either an enqueued job or capacity assigned to an
+            // unpolled reservation. ReservationFuture re-wakes after releasing
+            // such capacity on cancellation; accepted jobs wake on completion.
+            let _ = sender.try_send(Box::new(|| {}));
+        }
+    }
+
+    fn run_pending(&self) {
+        while self.pending.swap(false, Ordering::AcqRel) {
+            if let Some(callback) = self.callback.get() {
+                if catch_unwind(AssertUnwindSafe(callback)).is_err() {
+                    self.failed_recoveries.fetch_add(1, Ordering::Relaxed);
+                    tracing::error!("vNext retained-sequence recovery panicked; cleanup is incomplete and retained owners require recovery");
+                    // Keep failure observable without spinning on a callback
+                    // that may fail again. A later explicit request retries.
+                    self.pending.store(true, Ordering::Release);
+                    break;
+                }
+            }
+        }
+    }
+}
+
+pin_project_lite::pin_project! {
+    /// Tokio may grant capacity before its reservation future is polled again.
+    /// Cancellation must return that capacity before trying to enqueue a wake.
+    struct ReservationFuture<'a, F> {
+        #[pin]
+        inner: Option<F>,
+        recovery: &'a VNextRecoveryWake,
+        completed: bool,
+    }
+
+    impl<F> PinnedDrop for ReservationFuture<'_, F> {
+        fn drop(this: Pin<&mut Self>) {
+            let mut this = this.project();
+            this.inner.set(None);
+            if !*this.completed {
+                this.recovery.request();
+            }
+        }
+    }
+}
+
+impl<F: Future> Future for ReservationFuture<'_, F> {
+    type Output = F::Output;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let mut this = self.project();
+        let result = this
+            .inner
+            .as_mut()
+            .as_pin_mut()
+            .expect("reservation is not polled after completion")
+            .poll(cx);
+        if result.is_ready() {
+            *this.completed = true;
+            this.inner.set(None);
+        }
+        result
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum VNextCompletionTaskKind {
@@ -124,6 +206,7 @@ pub(super) struct VNextCompletionWorker {
     sender: Option<mpsc::Sender<VNextCompletionTask>>,
     thread: Option<JoinHandle<()>>,
     counters: Arc<VNextCompletionWorkerCounters>,
+    recovery: Arc<VNextRecoveryWake>,
     name: String,
 }
 
@@ -144,18 +227,44 @@ impl VNextCompletionWorker {
         let name = format!("ferrum-vnext-completion-{worker_id}");
         let (sender, mut receiver) =
             mpsc::channel::<VNextCompletionTask>(COMPLETION_WORKER_QUEUE_CAPACITY);
+        let recovery = Arc::new(VNextRecoveryWake {
+            sender: sender.downgrade(),
+            pending: AtomicBool::new(false),
+            callback: OnceLock::new(),
+            failed_recoveries: AtomicU64::new(0),
+        });
+        let worker_recovery = Arc::clone(&recovery);
         let thread = thread::Builder::new().name(name.clone()).spawn(move || {
             while let Some(task) = receiver.blocking_recv() {
                 // Each submitted task reports its own panic. This outer boundary
                 // also keeps the worker alive if task bookkeeping regresses.
                 let _ = catch_unwind(AssertUnwindSafe(task));
+                worker_recovery.run_pending();
             }
+            worker_recovery.run_pending();
         })?;
         Ok(Self {
             sender: Some(sender),
             thread: Some(thread),
             counters: Arc::new(VNextCompletionWorkerCounters::default()),
+            recovery,
             name,
+        })
+    }
+
+    pub(super) fn recovery_wake(&self) -> Arc<VNextRecoveryWake> {
+        Arc::clone(&self.recovery)
+    }
+
+    pub(super) fn install_recovery(
+        &self,
+        callback: impl Fn() + Send + Sync + 'static,
+    ) -> std::io::Result<()> {
+        self.recovery.callback.set(Box::new(callback)).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                "completion recovery was already installed",
+            )
         })
     }
 
@@ -173,10 +282,13 @@ impl VNextCompletionWorker {
             .as_ref()
             .ok_or(VNextCompletionWorkerError::QueueClosed)?;
         let reservation_started = Instant::now();
-        let permit = sender
-            .reserve()
-            .await
-            .map_err(|_| VNextCompletionWorkerError::QueueClosed)?;
+        let permit = ReservationFuture {
+            inner: Some(sender.reserve()),
+            recovery: &self.recovery,
+            completed: false,
+        }
+        .await
+        .map_err(|_| VNextCompletionWorkerError::QueueClosed)?;
         let class = self.counters.task_class(kind);
         class.reservation_wait.record(reservation_started.elapsed());
         class.scheduled_tasks.fetch_add(1, Ordering::Relaxed);
@@ -219,6 +331,7 @@ impl VNextCompletionWorker {
             "worker_threads": 1,
             "queue_capacity": COMPLETION_WORKER_QUEUE_CAPACITY,
             "pending_tasks": self.pending_tasks(),
+            "failed_recoveries": self.recovery.failed_recoveries.load(Ordering::Relaxed),
             "scheduled_tasks": self.counters.scheduled_tasks.load(Ordering::Relaxed),
             "completed_tasks": self.counters.completed_tasks.load(Ordering::Relaxed),
             "panicked_tasks": self.counters.panicked_tasks.load(Ordering::Relaxed),
