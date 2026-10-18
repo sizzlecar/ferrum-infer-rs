@@ -21,11 +21,79 @@
 
 #![cfg(feature = "cuda")]
 
-use cudarc::driver::CudaContext;
+use cudarc::driver::{sys, CudaStream};
 use ferrum_kernels::backend::cuda::CudaBackend;
-use ferrum_kernels::backend::Backend;
+use ferrum_kernels::backend::{Backend, BackendCompletion, BackendInt8KvOps};
 use ferrum_kernels::int8_kv::{launch_int8_kv_cache_append, launch_int8_paged_decode_attention};
 use half::f16;
+use std::sync::{Arc, Mutex};
+
+// Backend contexts in this process share a CUDA stream. Keep another test's
+// work out of the stream while the ownership check captures it.
+static CUDA_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+/// Capture only to inspect stream ownership, then discard without replaying.
+/// A NULL-stream escape cannot pass by happening to finish before readback.
+/// Allocations and uploads are complete before this helper is entered.
+fn assert_launches_use_stream(
+    stream: &Arc<CudaStream>,
+    enqueue: impl FnOnce() -> Result<(), String>,
+) {
+    assert!(
+        !stream.cu_stream().is_null(),
+        "test must observe a non-NULL stream"
+    );
+    stream.context().bind_to_thread().unwrap();
+    stream.synchronize().unwrap();
+    let begin = unsafe {
+        sys::cuStreamBeginCapture_v2(
+            stream.cu_stream(),
+            sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_RELAXED,
+        )
+    };
+    assert_eq!(
+        begin,
+        sys::CUresult::CUDA_SUCCESS,
+        "begin stream inspection"
+    );
+    let encoded = std::panic::catch_unwind(std::panic::AssertUnwindSafe(enqueue));
+    let mut graph = std::ptr::null_mut();
+    let end = unsafe { sys::cuStreamEndCapture(stream.cu_stream(), &mut graph) };
+    let mut node_count = 0;
+    let mut kernel_count = 0;
+    let inspected = || {
+        assert_eq!(end, sys::CUresult::CUDA_SUCCESS, "end stream inspection");
+        assert!(!graph.is_null());
+        let status = unsafe { sys::cuGraphGetNodes(graph, std::ptr::null_mut(), &mut node_count) };
+        assert_eq!(status, sys::CUresult::CUDA_SUCCESS);
+        let mut nodes = vec![std::ptr::null_mut(); node_count];
+        let status = unsafe { sys::cuGraphGetNodes(graph, nodes.as_mut_ptr(), &mut node_count) };
+        assert_eq!(status, sys::CUresult::CUDA_SUCCESS);
+        for node in nodes {
+            let mut kind = sys::CUgraphNodeType::CU_GRAPH_NODE_TYPE_EMPTY;
+            let status = unsafe { sys::cuGraphNodeGetType(node, &mut kind) };
+            assert_eq!(status, sys::CUresult::CUDA_SUCCESS);
+            if kind == sys::CUgraphNodeType::CU_GRAPH_NODE_TYPE_KERNEL {
+                kernel_count += 1;
+            }
+        }
+    };
+    // No graph executable or global graph key is created. Cleanup also runs
+    // when a launch or inspection fails, before any captured buffers drop.
+    let inspected = std::panic::catch_unwind(std::panic::AssertUnwindSafe(inspected));
+    if !graph.is_null() {
+        let status = unsafe { sys::cuGraphDestroy(graph) };
+        assert_eq!(status, sys::CUresult::CUDA_SUCCESS);
+    }
+    if let Err(panic) = inspected {
+        std::panic::resume_unwind(panic);
+    }
+    encoded.unwrap().expect("capture both INT8 launches");
+    assert_eq!(
+        kernel_count, 2,
+        "append and attention must use the observed stream"
+    );
+}
 
 fn rnd(state: &mut u64) -> f32 {
     *state = state
@@ -68,6 +136,7 @@ fn quantize_token_per_head(
 #[test]
 #[ignore]
 fn int8_kv_append_roundtrip() {
+    let _guard = CUDA_TEST_LOCK.lock().unwrap();
     const NUM_TOKENS: usize = 16;
     const NUM_KV_HEADS: usize = 4;
     const HEAD_DIM: usize = 128;
@@ -82,8 +151,8 @@ fn int8_kv_append_roundtrip() {
     // 3 + 4*i for i in 0..16 → max = 3 + 60 = 63.
     let slot_mapping: Vec<i32> = (0..NUM_TOKENS).map(|i| (3 + i * 4) as i32).collect();
 
-    let ctx = CudaContext::new(0).expect("CUDA context");
-    let stream = ctx.default_stream();
+    let mut ctx = CudaBackend::new_context();
+    let stream = ctx.stream.clone();
 
     let k_in_dev = CudaBackend::from_slice(&k_in);
     let v_in_dev = CudaBackend::from_slice(&v_in);
@@ -102,7 +171,7 @@ fn int8_kv_append_roundtrip() {
     let slot_dev = stream.clone_htod(&slot_mapping).unwrap();
 
     launch_int8_kv_cache_append(
-        &ctx,
+        &stream,
         k_in_dev.as_f16(),
         v_in_dev.as_f16(),
         &mut k_pool,
@@ -116,7 +185,10 @@ fn int8_kv_append_roundtrip() {
     )
     .expect("int8_kv_cache_append");
 
-    stream.synchronize().unwrap();
+    assert!(matches!(
+        CudaBackend::observe_completion(&mut ctx),
+        BackendCompletion::Succeeded
+    ));
 
     let k_pool_h: Vec<i8> = stream.clone_dtoh(&k_pool).unwrap();
     let v_pool_h: Vec<i8> = stream.clone_dtoh(&v_pool).unwrap();
@@ -212,6 +284,7 @@ fn host_ref_paged_decode(
 #[test]
 #[ignore]
 fn int8_paged_decode_parity_vs_host_ref() {
+    let _guard = CUDA_TEST_LOCK.lock().unwrap();
     const NUM_HEADS: usize = 8;
     const NUM_KV_HEADS: usize = 2;
     const HEAD_DIM: usize = 128;
@@ -251,8 +324,8 @@ fn int8_paged_decode_parity_vs_host_ref() {
     let (k_q, k_s) = quantize_token_per_head(&k_data, pool_tokens, NUM_KV_HEADS, HEAD_DIM);
     let (v_q, v_s) = quantize_token_per_head(&v_data, pool_tokens, NUM_KV_HEADS, HEAD_DIM);
 
-    let ctx = CudaContext::new(0).expect("CUDA context");
-    let stream = ctx.default_stream();
+    let mut ctx = CudaBackend::new_context();
+    let stream = ctx.stream.clone();
 
     let q_dev = CudaBackend::from_slice(&q_data);
     let k_pool_i8 = stream.clone_htod(&k_q).unwrap();
@@ -265,7 +338,7 @@ fn int8_paged_decode_parity_vs_host_ref() {
 
     let mut out_dev = CudaBackend::alloc(NUM_HEADS * HEAD_DIM);
     launch_int8_paged_decode_attention(
-        &ctx,
+        &stream,
         q_dev.as_f16(),
         &k_pool_i8,
         &v_pool_i8,
@@ -281,7 +354,10 @@ fn int8_paged_decode_parity_vs_host_ref() {
         scale,
     )
     .expect("int8 paged decode");
-    stream.synchronize().unwrap();
+    assert!(matches!(
+        CudaBackend::observe_completion(&mut ctx),
+        BackendCompletion::Succeeded
+    ));
 
     let out_int8: Vec<f32> = CudaBackend::to_vec(&out_dev, NUM_HEADS * HEAD_DIM);
 
@@ -332,6 +408,7 @@ fn int8_paged_decode_parity_vs_host_ref() {
 #[test]
 #[ignore]
 fn int8_kv_append_then_decode_e2e() {
+    let _guard = CUDA_TEST_LOCK.lock().unwrap();
     const NUM_HEADS: usize = 8;
     const NUM_KV_HEADS: usize = 2;
     const HEAD_DIM: usize = 128;
@@ -390,8 +467,8 @@ fn int8_kv_append_then_decode_e2e() {
     );
 
     // GPU path: append → decode.
-    let ctx = CudaContext::new(0).expect("CUDA context");
-    let stream = ctx.default_stream();
+    let mut ctx = CudaBackend::new_context();
+    let stream = ctx.stream.clone();
 
     let q_dev = CudaBackend::from_slice(&q_data);
     let k_in_dev = CudaBackend::from_slice(&k_in_data);
@@ -411,40 +488,46 @@ fn int8_kv_append_then_decode_e2e() {
     let slot_dev = stream.clone_htod(&slot_mapping).unwrap();
     let bt_dev = stream.clone_htod(&block_table).unwrap();
 
-    launch_int8_kv_cache_append(
-        &ctx,
-        k_in_dev.as_f16(),
-        v_in_dev.as_f16(),
-        &mut k_pool,
-        &mut v_pool,
-        &mut k_scales,
-        &mut v_scales,
-        &slot_dev,
-        VALID_KV_LEN,
-        NUM_KV_HEADS,
-        HEAD_DIM,
-    )
-    .expect("kv append");
-
     let mut out_dev = CudaBackend::alloc(NUM_HEADS * HEAD_DIM);
-    launch_int8_paged_decode_attention(
-        &ctx,
-        q_dev.as_f16(),
-        &k_pool,
-        &v_pool,
-        &k_scales,
-        &v_scales,
-        &bt_dev.as_view(),
-        out_dev.as_f16_mut(),
-        NUM_HEADS,
-        NUM_KV_HEADS,
-        HEAD_DIM,
-        VALID_KV_LEN,
-        BLOCK_SIZE,
-        scale,
-    )
-    .expect("int8 paged decode");
-    stream.synchronize().unwrap();
+    let mut enqueue = || {
+        launch_int8_kv_cache_append(
+            &stream,
+            k_in_dev.as_f16(),
+            v_in_dev.as_f16(),
+            &mut k_pool,
+            &mut v_pool,
+            &mut k_scales,
+            &mut v_scales,
+            &slot_dev,
+            VALID_KV_LEN,
+            NUM_KV_HEADS,
+            HEAD_DIM,
+        )?;
+        launch_int8_paged_decode_attention(
+            &stream,
+            q_dev.as_f16(),
+            &k_pool,
+            &v_pool,
+            &k_scales,
+            &v_scales,
+            &bt_dev.as_view(),
+            out_dev.as_f16_mut(),
+            NUM_HEADS,
+            NUM_KV_HEADS,
+            HEAD_DIM,
+            VALID_KV_LEN,
+            BLOCK_SIZE,
+            scale,
+        )
+    };
+    assert_launches_use_stream(&stream, &mut enqueue);
+    // The captured graph was never run. This eager submission must provide
+    // the actual write/read result observed through the caller's context.
+    enqueue().expect("append then decode on the caller stream");
+    assert!(matches!(
+        CudaBackend::observe_completion(&mut ctx),
+        BackendCompletion::Succeeded
+    ));
 
     let out_int8: Vec<f32> = CudaBackend::to_vec(&out_dev, NUM_HEADS * HEAD_DIM);
 
@@ -472,12 +555,13 @@ fn int8_kv_append_then_decode_e2e() {
 }
 
 /// Same flow as `int8_kv_append_then_decode_e2e` but driven through
-/// the `KvCacheQuant<CudaBackend, KvInt8>` abstraction (constructor +
-/// typed buffers). This is what a model decode loop would use — it
-/// no longer touches cudarc primitives directly.
+/// the actual `BackendInt8KvOps` entrypoints and a single backend context.
+/// Completion must cover the append's slot upload, cache writes, and attention
+/// reads; there is no NULL-stream synchronization between these operations.
 #[test]
 #[ignore]
 fn kv_cache_quant_int8_e2e() {
+    let _guard = CUDA_TEST_LOCK.lock().unwrap();
     use ferrum_kernels::backend::{KvCacheQuant, KvInt8};
 
     const NUM_HEADS: usize = 8;
@@ -535,27 +619,38 @@ fn kv_cache_quant_int8_e2e() {
     let mut cache: KvCacheQuant<CudaBackend, KvInt8> =
         KvCacheQuant::new_paged_cuda(MAX_BLOCKS, BLOCK_SIZE, NUM_KV_HEADS, HEAD_DIM);
 
-    let ctx_handle = CudaContext::new(0).expect("CUDA context");
-    let stream = ctx_handle.default_stream();
+    let mut ctx = CudaBackend::new_context();
 
-    // Upload the FP16 K/V tokens + Q + slot mapping + block table.
+    // Upload the FP16 K/V tokens + Q. The production append method creates its
+    // slot mapping on ctx.stream from the cache's host block-index mirror.
     let q_dev = CudaBackend::from_slice(&q_data);
     let k_in_dev = CudaBackend::from_slice(&k_in_data);
     let v_in_dev = CudaBackend::from_slice(&v_in_data);
-    let slot_dev = stream.clone_htod(&slot_mapping).unwrap();
-    let bt_dev = stream.clone_htod(&block_table).unwrap();
+    cache.paged_block_indices = block_table.iter().map(|&block| block as u32).collect();
+    CudaBackend::write_typed::<u32>(
+        &mut ctx,
+        cache.block_table.as_mut().unwrap(),
+        &cache.paged_block_indices,
+    );
+    CudaBackend::write_typed::<u32>(
+        &mut ctx,
+        cache.context_lens.as_mut().unwrap(),
+        &[VALID_KV_LEN as u32],
+    );
 
     // Append.
-    launch_int8_kv_cache_append(
-        &ctx_handle,
-        k_in_dev.as_f16(),
-        v_in_dev.as_f16(),
-        cache.k.buffer_mut(),
-        cache.v.buffer_mut(),
-        cache.k_scales.buffer_mut(),
-        cache.v_scales.buffer_mut(),
-        &slot_dev,
+    CudaBackend::int8_kv_append_paged(
+        &mut ctx,
+        &k_in_dev,
+        &v_in_dev,
+        &mut cache.k,
+        &mut cache.v,
+        &mut cache.k_scales,
+        &mut cache.v_scales,
+        &cache.paged_block_indices,
+        0,
         VALID_KV_LEN,
+        BLOCK_SIZE,
         NUM_KV_HEADS,
         HEAD_DIM,
     )
@@ -563,15 +658,15 @@ fn kv_cache_quant_int8_e2e() {
 
     // Decode.
     let mut out_dev = CudaBackend::alloc(NUM_HEADS * HEAD_DIM);
-    launch_int8_paged_decode_attention(
-        &ctx_handle,
-        q_dev.as_f16(),
-        cache.k.buffer(),
-        cache.v.buffer(),
-        cache.k_scales.buffer(),
-        cache.v_scales.buffer(),
-        &bt_dev.as_view(),
-        out_dev.as_f16_mut(),
+    CudaBackend::int8_paged_decode_attention(
+        &mut ctx,
+        &q_dev,
+        &cache.k,
+        &cache.v,
+        &cache.k_scales,
+        &cache.v_scales,
+        cache.block_table.as_ref().unwrap(),
+        &mut out_dev,
         NUM_HEADS,
         NUM_KV_HEADS,
         HEAD_DIM,
@@ -580,7 +675,10 @@ fn kv_cache_quant_int8_e2e() {
         scale,
     )
     .expect("int8 paged decode (cache)");
-    stream.synchronize().unwrap();
+    assert!(matches!(
+        CudaBackend::observe_completion(&mut ctx),
+        BackendCompletion::Succeeded
+    ));
 
     let out_int8: Vec<f32> = CudaBackend::to_vec(&out_dev, NUM_HEADS * HEAD_DIM);
 
@@ -601,4 +699,6 @@ fn kv_cache_quant_int8_e2e() {
         "KvCacheQuant<CudaBackend, KvInt8> e2e: cos={cosine:.5} max|diff|={max_abs:.5} (mag={max_mag:.4})"
     );
     assert!(cosine > 0.999, "cosine similarity too low: {cosine}");
+    let rel_to_mag = max_abs / max_mag.max(1e-6);
+    assert!(rel_to_mag < 0.02, "rel-to-max-mag too high: {rel_to_mag}");
 }

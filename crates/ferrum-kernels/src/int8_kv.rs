@@ -14,12 +14,11 @@
 //!   - scales   : `__half  [num_blocks * block_size * num_kv_heads]`
 //!   - block_table : `i32 [max_blocks_per_seq]`
 //!
-//! These launchers operate on plain cudarc primitives (no candle Tensor)
-//! so they can be unit-tested independently of the `Backend` trait. Trait
-//! integration (`BackendKvDtype<KvInt8>` for `CudaBackend`) lands in a
-//! follow-up PR alongside model wire-up.
+//! These launchers operate on plain cudarc primitives (no candle Tensor).
+//! They enqueue on the caller's stream so preceding writes and the caller's
+//! completion observation cover the same ordered work.
 
-use cudarc::driver::{CudaContext, CudaSlice, CudaView, LaunchConfig, PushKernelArg};
+use cudarc::driver::{CudaSlice, CudaStream, CudaView, LaunchConfig, PushKernelArg};
 use std::sync::Arc;
 
 use crate::ptx;
@@ -31,7 +30,7 @@ use crate::ptx;
 /// carry per-token (per-kv-head) FP16 scales.
 #[allow(clippy::too_many_arguments)]
 pub fn launch_int8_paged_decode_attention(
-    ctx: &Arc<CudaContext>,
+    stream: &Arc<CudaStream>,
     q: &CudaSlice<half::f16>,
     k_pool: &CudaSlice<i8>,
     v_pool: &CudaSlice<i8>,
@@ -46,7 +45,6 @@ pub fn launch_int8_paged_decode_attention(
     block_size: usize,
     scale: f32,
 ) -> std::result::Result<(), String> {
-    let stream = ctx.default_stream();
     let func = stream
         .context()
         .load_module(ptx::INT8_PAGED_DECODE_ATTENTION.into())
@@ -98,7 +96,7 @@ pub fn launch_int8_paged_decode_attention(
 /// physical_block * block_size + slot).
 #[allow(clippy::too_many_arguments)]
 pub fn launch_int8_kv_cache_append(
-    ctx: &Arc<CudaContext>,
+    stream: &Arc<CudaStream>,
     k_in: &CudaSlice<half::f16>,
     v_in: &CudaSlice<half::f16>,
     k_out_pool: &mut CudaSlice<i8>,
@@ -115,7 +113,6 @@ pub fn launch_int8_kv_cache_append(
             "int8_kv_cache_append: head_dim {head_dim} > 256 (kernel uses one thread per element)"
         ));
     }
-    let stream = ctx.default_stream();
     let func = stream
         .context()
         .load_module(ptx::INT8_PAGED_DECODE_ATTENTION.into())

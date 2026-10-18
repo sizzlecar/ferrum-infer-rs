@@ -12,8 +12,8 @@
 //! - `KvCacheQuant<CudaBackend, KvInt8>::new_paged_cuda(...)` one-call
 //!   constructor (K/V int8 pool + FP16 scales + block_table + context_lens).
 //!
-//! Tests: `crates/ferrum-kernels/tests/int8_kv_parity.rs`. All four
-//! ignored tests pass cosine 0.99999 vs FP32 host reference.
+//! Tests: `crates/ferrum-kernels/tests/int8_kv_parity.rs` checks stream
+//! ownership, round-trip quantization and attention against an FP32 host reference.
 
 use ferrum_types::{FerrumError, Result};
 
@@ -155,7 +155,7 @@ impl crate::backend::BackendInt8KvOps for CudaBackend {
         }
 
         crate::int8_kv::launch_int8_kv_cache_append(
-            &ctx.ctx,
+            &ctx.stream,
             k_in.as_f16(),
             v_in.as_f16(),
             layer_k.buffer_mut(),
@@ -198,7 +198,7 @@ impl crate::backend::BackendInt8KvOps for CudaBackend {
                 .ok_or_else(|| FerrumError::model("block_table transmute<i32> failed"))?
         };
         crate::int8_kv::launch_int8_paged_decode_attention(
-            &ctx.ctx,
+            &ctx.stream,
             q.as_f16(),
             layer_k.buffer(),
             layer_v.buffer(),

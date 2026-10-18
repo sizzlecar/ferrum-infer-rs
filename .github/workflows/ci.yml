@@ -604,7 +604,7 @@ jobs:
           targets=(--lib --test op_diff --test "vnext_${BACKEND}_checkpoint_continuation" --test gguf_loader_test --test native_safetensors_loader_test)
           if [[ "$BACKEND" == cuda ]]; then
             features="$features,ferrum-kernels/vllm-moe-marlin,ferrum-kernels/vllm-paged-attn-v2"
-            targets+=(--test compressed_tensors_marlin_eq)
+            targets+=(--test compressed_tensors_marlin_eq --test int8_kv_parity)
           fi
           cargo test --locked -p ferrum-kernels -p ferrum-testkit -p ferrum-models -p ferrum-quantization "${targets[@]}" --features "$features" \
             --no-run --message-format=json > "$RUNNER_TEMP/device-contract-artifacts.jsonl"

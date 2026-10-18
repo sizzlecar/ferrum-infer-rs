@@ -151,6 +151,18 @@ pub fn contract_groups(backend: Backend) -> Vec<ContractGroup> {
                     kind: "lib".into(),
                     name: "models::llama_family::lora_tests::lora_cuda_existing_base_graph_cannot_bypass_adapter".into(),
                 },
+                ContractTest {
+                    package: "ferrum-kernels".into(),
+                    target: "int8_kv_parity".into(),
+                    kind: "test".into(),
+                    name: "int8_kv_append_then_decode_e2e".into(),
+                },
+                ContractTest {
+                    package: "ferrum-kernels".into(),
+                    target: "int8_kv_parity".into(),
+                    kind: "test".into(),
+                    name: "kv_cache_quant_int8_e2e".into(),
+                },
             ]);
         }
         groups.push(ContractGroup {
