@@ -2,7 +2,7 @@
 
 **状态：目标已激活，R0 已合并，R1 验收、R2 实施中。** 工作分支：`refactor/execution-architecture-20261018`，从 2026-10-18 的干净 `main`（`c2be4c67`）开始。首个 checkpoint 退役独立 embedding/ASR/TTS 链路；原工作区未合并的旧 SLO 实现不作为代码基底。
 
-R0 六批清理与正确性修复已合并（PR #429–#434）。R1 已分离 runtime 与产品执行契约，统一 token 提交并退出旧 Tensor 控制流，泛型驱动归入 execution。R2 已实现统一驱动生命周期、持有额度的输出和 HTTP 按需拉取；采样、解码与完成投影已移出全局序列锁。生成历史、完成结果及 CLI/HTTP 保留副本沿用原请求额度，tokenizer 共享解码缓存另有实例限额；真实 CPU 回归覆盖额度不足时不重放已执行工作、独立请求进度与最后持有者释放。runtime/Engine 观测已区分传输降级与契约失败，Engine/HTTP journal 使用有界非阻塞投递，run/serve 共享 typed 预算；关闭诊断时不构造 trace 负载。HTTP 关闭超时或 Engine 失败时保留原 journal，重试等待原任务；共享 journal 的最终关闭权、单调入口时间与真实物理执行事实仍待收尾。R1 仍在验收，R2–R5 未完成；原始证据留在仓库外交接目录，没有新增性能或 SLO 达标声明。
+R0 六批清理与正确性修复已合并（PR #429–#434）。R1 已分离 runtime 与产品执行契约，统一 token 提交并退出旧 Tensor 控制流，泛型驱动归入 execution。R2 已实现统一驱动生命周期、持有额度的输出和 HTTP 按需拉取；采样、解码与完成投影已移出全局序列锁。生成历史、完成结果及 CLI/HTTP 保留副本沿用原请求额度，tokenizer 共享解码缓存另有实例限额；真实 CPU 回归覆盖额度不足时不重放已执行工作、独立请求进度与最后持有者释放。runtime/Engine 观测已区分传输降级与契约失败，Engine/HTTP journal 使用有界非阻塞投递，run/serve 共享 typed 预算；关闭诊断时不构造 trace 负载。产品装配持有唯一日志关闭权，Engine/HTTP 各自结束投递，CLI 尾记录写入原 writer 后才最终关闭；超时保留原清理任务，未知终态保留投递范围。单调入口时间、真实物理执行事实与旧全局 profiler 的隔离仍待收尾。R1 仍在验收，R2–R5 未完成；原始证据留在仓库外交接目录，没有新增性能或 SLO 达标声明。
 
 ## 1. 目标与第一原则
 
@@ -93,6 +93,8 @@ R2 驱动 API：`ContinuousBatchEngine::start_loop()` 返回 `Result<DriverObser
 R2 输出 API：`infer()` / `infer_batch()` 返回持有额度的 `ferrum_output::InferenceOutput`，通过 `response()` 借用结果，克隆共享内容及额度；`infer_stream()` 返回 `InferenceStream`，每项为 `Result<OutputChunk>`，通过 `chunk()` 借用数据。原输出会话随结果、历史记录或帧的最后持有者释放，不能在模型完成或上游 EOF 时提前归还；会话代表一次推理输出，区别于多轮对话。CLI 的 `[output]` 与库的 `EngineConfig.output` 使用同一 typed 配置；HTTP 复用原会话，增长额度不足明确失败，不等待自己持有的历史释放。慢流暂停自己的生成，关闭错误仍由原驱动观察。内容额度计生成内容的逻辑负载，tokenizer 缓存另按条数与字节数限制；输入预算、解析/解码临时分配及分配器开销不在此范围，不能据此宣称总内存有界。
 
 R2 观测 API：`ExecutionEventSinkError` 区分 `Contract` 与 `Transport`；`delivery_policy()` 默认要求完整证据。产品 `--profile-detail replay/verify/full` 保持完整证据要求，其余详细级别允许传输降级；不变量、编码错误及内部 panic 始终失败。生产 journal 使用原 writer 的有界 `try_*` 投递，队列满不等待，关闭报告保留丢样与实际 flush 状态。普通工具的阻塞写入另计，不能据生产队列预算宣称整个进程内存有界。prefix 恢复确认返回 `PrefixRestoreAcknowledgement`，调用方先保存实际 `frontier`，再处理确认后的观测错误，不能据此重新执行已恢复的工作。
+
+`JsonlJournal<T>` 只负责投递；`JsonlProducerScope` 结束组件投递，`JsonlJournalOwner` 在所有范围结束后关闭原 writer。库共享文件须显式注入独立 scope，工具独用 `OwnedJsonlJournal<T>`。flush/final receipt 分别保留固定前缀和真实 join 事实，调用方检查 `receipt.result()`；返回 receipt 不代表证据完整。
 
 产品装配层组合模型准备结果、具体设备 runtime 与泛型驱动。迁移 `VNextModelExecutor<R>` 时同时解开其对 `PreparedProductionModel` 的依赖，将中立准备输入与编译结果归到正确层，并保留 source/registry/初始化身份校验；不能整文件搬迁后让 execution 再引用 models。泛型驱动本身已后端中立，不能将这项整理描述成新消除的具体 GPU 绑定。量化格式描述/解析与设备执行也按此分层，不能经 quantization 引回 kernels 依赖环。
 

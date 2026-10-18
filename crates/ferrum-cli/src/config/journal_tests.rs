@@ -1,6 +1,5 @@
 use super::*;
 use clap::Parser;
-use ferrum_bench_core::{JsonlJournal, JsonlJournalOpenMode};
 
 #[derive(Parser)]
 struct RunCli {
@@ -51,18 +50,11 @@ async fn profile_journal_config_reaches_run_serve_artifacts_and_engine_settings(
         let output = directory
             .path()
             .join(if run { "run.jsonl" } else { "serve.jsonl" });
-        // A default-budget product writer would now conflict with this actual
-        // shared owner. Both real CLI entrypoints must use the declared value.
-        let owner = JsonlJournal::<ferrum_types::FerrumProfileEvent>::open(
-            &output,
-            JsonlJournalOpenMode::Truncate,
-            config.profile_journal.into(),
-        )
-        .unwrap();
+        // The standalone synthetic command owns its writer. A second live
+        // owner is intentionally forbidden by the real ownership protocol.
         synthetic_entrypoint(run, &output, config.clone())
             .await
             .unwrap();
-        owner.close().unwrap();
         let events: Vec<ferrum_types::FerrumProfileEvent> = fs::read_to_string(&output)
             .await
             .unwrap()
@@ -73,8 +65,19 @@ async fn profile_journal_config_reaches_run_serve_artifacts_and_engine_settings(
         for event in events {
             event.validate().unwrap();
         }
-        assert!(owner.delivery_stats().worker_finished);
-        assert_eq!(owner.delivery_stats().failure_kind, None);
+        // A real tiny budget must govern the product writer, rather than only
+        // survive configuration parsing. Basic reports transport loss without
+        // turning a synthetic inference-free command into an execution error.
+        let limited_output = output.with_extension("limited.jsonl");
+        let mut limited = config.clone();
+        limited.profile_journal.max_record_bytes = 1;
+        synthetic_entrypoint(run, &limited_output, limited)
+            .await
+            .unwrap();
+        assert!(
+            !limited_output.exists(),
+            "bounded tool preflight rejects before opening a writer"
+        );
     }
 }
 

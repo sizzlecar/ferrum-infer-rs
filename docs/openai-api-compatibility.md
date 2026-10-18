@@ -80,13 +80,24 @@ Limits apply per physical journal. Values must be positive, with
 include the trailing newline; batches are accepted or rejected whole. The payload
 budget covers measured JSONL bytes retained by nonblocking delivery, including
 active writer work. It excludes object/allocation overhead and is not an RSS limit.
-Startup/shutdown artifact writes obey record/batch limits but use synchronous delivery.
+Startup/shutdown profile records use the same bounded queue. Explicit shutdown
+waits for the original writer to flush and finish.
 
 Explicit settings for a shared journal path must match. Library callers use
 `EngineConfig.runtime.profile_journal` and `ServerConfig.profile_journal`.
+Library components sharing a file take separate producer scopes from one
+`JsonlJournalOwner`, through `EngineBuilder::with_journal_scopes` and
+`AxumServer::with_journal_scopes`. Each component finishes its own scope; the
+owner closes the file after all scopes and final records finish. Opening a second
+independent owner for the same live file is a configuration error. Check both the
+close result and the returned receipt's `result()` for writer failures.
 Optional telemetry loss is reported without replaying inference. Replay, Verify
 and Full require complete evidence; configuration, encoding and internal contract
 failures are never treated as optional delivery loss.
+
+`serve --profile-detail off --profile-jsonl ...` selects the legacy backend
+profiler. Its file is outside these product-journal budgets and must differ from
+any scheduler trace destination.
 
 ## Model Capacity
 

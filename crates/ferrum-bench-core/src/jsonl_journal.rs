@@ -13,12 +13,20 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 mod delivery;
+mod ownership;
 use delivery::{BoundedJob, DeliveryState};
 pub use delivery::{JsonlJournalDeliveryStats, JsonlJournalErrorKind, JsonlJournalWorkerState};
+use ownership::{BarrierRequest, PublicationState, ScopeState};
+pub use ownership::{
+    JsonlFinalReceipt, JsonlFlushReceipt, JsonlJournalOwner, JsonlProducerScope,
+    JsonlPublicationCut, OwnedJsonlJournal,
+};
 #[cfg(test)]
 mod budget_tests;
 #[cfg(test)]
 mod delivery_tests;
+#[cfg(test)]
+mod ownership_tests;
 
 type JournalRegistry = HashMap<PathBuf, Weak<JsonlJournalInner>>;
 static JSONL_JOURNAL_REGISTRY: OnceLock<Mutex<JournalRegistry>> = OnceLock::new();
@@ -124,7 +132,7 @@ impl From<ferrum_types::ObservabilityJournalConfig> for JsonlJournalConfig {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct JsonlJournalError {
     kind: JsonlJournalErrorKind,
     message: String,
@@ -201,14 +209,14 @@ enum JournalCommand {
     Encode(EncodeJob),
     Encoded(Vec<u8>),
     Bounded(BoundedJob),
-    Flush(SyncSender<Result<(), JsonlJournalError>>),
-    Close(SyncSender<Result<(), JsonlJournalError>>),
+    Flush(BarrierRequest),
+    Close(BarrierRequest),
 }
 
 struct JsonlJournalInner {
     path: PathBuf,
     sender: SyncSender<JournalCommand>,
-    send_gate: Mutex<()>,
+    send_gate: Mutex<PublicationState>,
     worker: Mutex<Option<JoinHandle<()>>>,
     failure: Arc<JournalFailure>,
     closed: AtomicBool,
@@ -226,28 +234,101 @@ impl JsonlJournalInner {
         self.failure.current().unwrap_or(error)
     }
 
-    fn send(&self, command: JournalCommand) -> Result<(), JsonlJournalError> {
+    fn send(
+        &self,
+        scope: &ScopeState,
+        command: JournalCommand,
+        records: usize,
+    ) -> Result<(), JsonlJournalError> {
         let _send_guard = self
             .send_gate
             .lock()
             .map_err(|_| self.record_poison("publication gate"))?;
-        if self.closed.load(Ordering::Acquire) {
+        self.check_publication(scope)?;
+        self.sender
+            .send(command)
+            .map_err(|_| self.worker_error("publication"))?;
+        // The accepted cut must include this command before the gate opens.
+        self.delivery.record_unbounded(records);
+        Ok(())
+    }
+
+    fn check_publication(&self, scope: &ScopeState) -> Result<(), JsonlJournalError> {
+        if self.closed.load(Ordering::Acquire) || scope.retired.load(Ordering::Acquire) {
             return Err(JsonlJournalError::with_kind(
                 JsonlJournalErrorKind::Closed,
-                format!("JSONL journal {} is closed", self.path.display()),
+                format!(
+                    "JSONL journal {} producer scope is retired",
+                    self.path.display()
+                ),
             ));
         }
-        if let Some(error) = self.failure.current() {
-            return Err(error);
-        }
-        self.sender.send(command).map_err(|_| {
-            self.failure.current().unwrap_or_else(|| {
-                JsonlJournalError::new(format!(
-                    "JSONL journal worker for {} stopped",
-                    self.path.display()
-                ))
-            })
+        self.failure.current().map_or(Ok(()), Err)
+    }
+
+    fn worker_error(&self, operation: &str) -> JsonlJournalError {
+        self.failure.current().unwrap_or_else(|| {
+            JsonlJournalError::new(format!(
+                "JSONL journal {} {operation} barrier was lost",
+                self.path.display()
+            ))
         })
+    }
+
+    fn cleanup_gate(&self) -> std::sync::MutexGuard<'_, PublicationState> {
+        match self.send_gate.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                self.record_poison("publication gate");
+                poisoned.into_inner()
+            }
+        }
+    }
+
+    fn enqueue_barrier(
+        &self,
+        scope_retired: bool,
+        close: bool,
+    ) -> (JsonlPublicationCut, Option<Receiver<JsonlFlushReceipt>>) {
+        let cut = self.delivery.publication_cut();
+        let (reply, receive) = sync_channel(1);
+        let request = BarrierRequest {
+            cut,
+            scope_retired,
+            reply,
+        };
+        let command = if close {
+            JournalCommand::Close(request)
+        } else {
+            JournalCommand::Flush(request)
+        };
+        if self.sender.send(command).is_err() {
+            self.failure.record(self.worker_error("send"));
+            (cut, None)
+        } else {
+            (cut, Some(receive))
+        }
+    }
+
+    fn receive_barrier(
+        &self,
+        cut: JsonlPublicationCut,
+        receive: Option<Receiver<JsonlFlushReceipt>>,
+        scope_retired: bool,
+    ) -> JsonlFlushReceipt {
+        if let Some(receive) = receive {
+            if let Ok(receipt) = receive.recv() {
+                return receipt;
+            }
+        }
+        JsonlFlushReceipt {
+            cut,
+            scope_retired,
+            barrier_observed: false,
+            flushed: 0,
+            failed: 0,
+            failure: Some(self.worker_error("receive")),
+        }
     }
 
     fn ensure_close_completed(&self) -> Result<(), JsonlJournalError> {
@@ -291,38 +372,29 @@ impl JsonlJournalInner {
         Ok(())
     }
 
-    fn close_and_join(&self) -> Result<(), JsonlJournalError> {
-        // Serialize close with all producers so every accepted command is
-        // ordered before Close and every later producer is rejected.
-        let _send_guard = match self.send_gate.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => {
-                self.record_poison("publication gate");
-                // Recovery only authorizes teardown of the original worker.
-                // The poison remains set and never permits new publication.
-                poisoned.into_inner()
-            }
-        };
-        if !self.closed.swap(true, Ordering::AcqRel) {
-            let (reply_tx, reply_rx) = sync_channel(1);
-            if self.sender.send(JournalCommand::Close(reply_tx)).is_err() {
-                self.failure.record(JsonlJournalError::new(format!(
-                    "JSONL journal worker for {} stopped before close",
-                    self.path.display()
-                )));
-            } else if reply_rx.recv().is_err() {
-                self.failure.record(JsonlJournalError::new(format!(
-                    "JSONL journal close barrier for {} was lost",
-                    self.path.display()
-                )));
-            }
+    fn close_and_join(&self) -> Result<JsonlFinalReceipt, JsonlJournalError> {
+        // This original gate remains held from the close cut through real join.
+        let mut gate = self.cleanup_gate();
+        if gate.active_scopes != 0 {
+            return Err(JsonlJournalError::with_kind(
+                JsonlJournalErrorKind::Config,
+                format!(
+                    "JSONL journal {} still has {} active producer scopes",
+                    self.path.display(),
+                    gate.active_scopes
+                ),
+            ));
         }
-
+        if let Some(receipt) = &gate.final_receipt {
+            return Ok(receipt.clone());
+        }
+        self.closed.store(true, Ordering::Release);
+        let (cut, receive) = self.enqueue_barrier(false, true);
+        let mut flush = self.receive_barrier(cut, receive, false);
         let worker = match self.worker.lock() {
             Ok(mut worker) => worker.take(),
             Err(poisoned) => {
                 self.record_poison("worker handle");
-                // A poisoned handle lock is not permission to detach the worker.
                 poisoned.into_inner().take()
             }
         };
@@ -334,7 +406,20 @@ impl JsonlJournalInner {
                 ));
             }
         }
-        self.failure.current().map_or(Ok(()), Err)
+        // Join can reveal a later panic; it must not be hidden by the barrier.
+        if let Some(error) = self.failure.current() {
+            flush.failure = Some(error);
+        }
+        let receipt = JsonlFinalReceipt {
+            flush,
+            worker_joined: true,
+            stats: self.delivery.snapshot(
+                true,
+                self.failure.current_ref().map(JsonlJournalError::kind),
+            ),
+        };
+        gate.final_receipt = Some(receipt.clone());
+        Ok(receipt)
     }
 }
 
@@ -349,6 +434,7 @@ where
     T: Serialize + Send + 'static,
 {
     inner: Arc<JsonlJournalInner>,
+    scope: Arc<ScopeState>,
     marker: PhantomData<fn(T)>,
 }
 
@@ -359,6 +445,7 @@ where
     fn clone(&self) -> Self {
         Self {
             inner: Arc::clone(&self.inner),
+            scope: self.scope.clone(),
             marker: PhantomData,
         }
     }
@@ -427,17 +514,18 @@ fn open_shared_inner(
                 path.display()
             )));
         }
-        // Append preserves the known failure of a still-owned artifact, even
-        // after close. Only an explicit truncate starts a new closed epoch.
-        if !closed || mode == JsonlJournalOpenMode::Append {
+        if !closed {
+            return Err(journal_config_error(format!(
+                "JSONL journal {} ownership conflict: share the original owner explicitly",
+                path.display()
+            )));
+        }
+        // Only a completed old epoch can be replaced. Append retains a known
+        // failed artifact; explicit Truncate may begin a genuinely new epoch.
+        if mode == JsonlJournalOpenMode::Append {
             if let Some(error) = existing.failure.current() {
                 return Err(io::Error::other(error));
             }
-        }
-        if !closed {
-            // The first live owner controls the initial truncate/append state.
-            // Every later role attaches to the same ordered writer.
-            return Ok(existing);
         }
     }
 
@@ -470,7 +558,7 @@ fn open_shared_inner(
     let inner = Arc::new(JsonlJournalInner {
         path: path.clone(),
         sender,
-        send_gate: Mutex::new(()),
+        send_gate: Mutex::new(PublicationState::default()),
         worker: Mutex::new(Some(worker)),
         failure,
         closed: AtomicBool::new(false),
@@ -481,58 +569,22 @@ fn open_shared_inner(
     Ok(inner)
 }
 
-fn flush_inner(inner: &JsonlJournalInner) -> Result<(), JsonlJournalError> {
-    let (reply_tx, reply_rx) = sync_channel(1);
-    inner.send(JournalCommand::Flush(reply_tx))?;
-    reply_rx.recv().map_err(|_| {
-        inner.failure.current().unwrap_or_else(|| {
-            JsonlJournalError::new(format!(
-                "JSONL journal flush barrier for {} was lost",
-                inner.path.display()
-            ))
-        })
-    })?
-}
-
 impl<T> JsonlJournal<T>
 where
     T: Serialize + Send + 'static,
 {
-    pub fn open(
-        path: impl Into<PathBuf>,
-        mode: JsonlJournalOpenMode,
-        config: JsonlJournalConfig,
-    ) -> io::Result<Self> {
-        Ok(Self {
-            inner: open_shared_inner(path, mode, Some(config))?,
-            marker: PhantomData,
-        })
-    }
-
-    pub fn create(path: impl Into<PathBuf>) -> io::Result<Self> {
-        Ok(Self {
-            inner: open_shared_inner(path, JsonlJournalOpenMode::Truncate, None)?,
-            marker: PhantomData,
-        })
-    }
-
-    pub fn append(path: impl Into<PathBuf>) -> io::Result<Self> {
-        Ok(Self {
-            inner: open_shared_inner(path, JsonlJournalOpenMode::Append, None)?,
-            marker: PhantomData,
-        })
-    }
-
     /// Blocking tool delivery, with original worker-side serialization and no
     /// payload byte limit. Production callbacks should use `try_enqueue`.
     pub fn enqueue(&self, event: T) -> Result<(), JsonlJournalError> {
-        self.inner
-            .send(JournalCommand::Encode(Box::new(move |encoded| {
+        self.inner.send(
+            &self.scope,
+            JournalCommand::Encode(Box::new(move |encoded| {
                 serde_json::to_writer(&mut *encoded, &event)?;
                 encoded.push(b'\n');
                 Ok(())
-            })))?;
-        self.inner.delivery.record_unbounded(1);
+            })),
+            1,
+        )?;
         Ok(())
     }
 
@@ -543,15 +595,17 @@ where
             return Ok(());
         }
         let records = events.len();
-        self.inner
-            .send(JournalCommand::Encode(Box::new(move |encoded| {
+        self.inner.send(
+            &self.scope,
+            JournalCommand::Encode(Box::new(move |encoded| {
                 for event in &events {
                     serde_json::to_writer(&mut *encoded, event)?;
                     encoded.push(b'\n');
                 }
                 Ok(())
-            })))?;
-        self.inner.delivery.record_unbounded(records);
+            })),
+            records,
+        )?;
         Ok(())
     }
 
@@ -573,12 +627,22 @@ where
         )
     }
 
-    pub fn flush(&self) -> Result<(), JsonlJournalError> {
-        flush_inner(&self.inner)
-    }
-
-    pub fn close(&self) -> Result<(), JsonlJournalError> {
-        self.inner.close_and_join()
+    pub fn flush(&self) -> JsonlFlushReceipt {
+        let gate = match self.inner.send_gate.lock() {
+            Ok(gate) => gate,
+            Err(_) => {
+                return JsonlFlushReceipt::rejected(
+                    self.inner.delivery.publication_cut(),
+                    self.inner.record_poison("publication gate"),
+                )
+            }
+        };
+        if let Err(error) = self.inner.check_publication(&self.scope) {
+            return JsonlFlushReceipt::rejected(self.inner.delivery.publication_cut(), error);
+        }
+        let (cut, receive) = self.inner.enqueue_barrier(false, false);
+        drop(gate);
+        self.inner.receive_barrier(cut, receive, false)
     }
 
     pub fn path(&self) -> &Path {
@@ -603,6 +667,29 @@ pub fn write_jsonl_records_with_config<T: Serialize>(
     write_records(path, mode, records, Some(config))
 }
 
+pub fn write_jsonl_records_to<T, R>(
+    producer: &JsonlJournal<T>,
+    records: &[R],
+) -> Result<JsonlFlushReceipt, JsonlJournalError>
+where
+    T: Serialize + Send + 'static,
+    R: Serialize,
+{
+    if records.is_empty() {
+        return Err(JsonlJournalError::with_kind(
+            JsonlJournalErrorKind::Encoding,
+            "JSONL record set must not be empty",
+        ));
+    }
+    let encoded = delivery::encode_records(records, producer.config())?;
+    producer.inner.send(
+        &producer.scope,
+        JournalCommand::Encoded(encoded),
+        records.len(),
+    )?;
+    Ok(producer.flush())
+}
+
 fn write_records<T: Serialize>(
     path: &Path,
     mode: JsonlJournalOpenMode,
@@ -612,47 +699,30 @@ fn write_records<T: Serialize>(
     if records.is_empty() {
         return Err(JsonlJournalError::with_kind(
             JsonlJournalErrorKind::Encoding,
-            format!("JSONL record set for {} must not be empty", path.display()),
+            "JSONL record set must not be empty",
         ));
     }
-    let open_error = |error: io::Error| {
-        error
-            .get_ref()
-            .and_then(|cause| cause.downcast_ref::<JsonlJournalError>())
-            .cloned()
-            .unwrap_or_else(|| {
-                JsonlJournalError::new(format!("open JSONL journal {}: {error}", path.display()))
-            })
-    };
-    let encoded = if let Some(config) = explicit_config {
-        validate_config(config).map_err(open_error)?;
-        delivery::encode_records(records, config)?
-    } else {
-        let mut encoded = Vec::with_capacity(4096);
-        for record in records {
-            serde_json::to_writer(&mut encoded, record).map_err(|error| {
-                JsonlJournalError::with_kind(
-                    JsonlJournalErrorKind::Encoding,
-                    format!("serialize JSONL record for {}: {error}", path.display()),
-                )
-            })?;
-            encoded.push(b'\n');
-        }
-        encoded
-    };
+    let config = explicit_config.unwrap_or_default();
+    validate_config(config).map_err(open_error)?;
+    // Validate before creating/truncating the standalone artifact.
+    let encoded = delivery::encode_records(records, config)?;
+    let mut journal =
+        OwnedJsonlJournal::<serde_json::Value>::open(path.to_path_buf(), mode, config)
+            .map_err(open_error)?;
+    journal.producer.inner.send(
+        &journal.producer.scope,
+        JournalCommand::Encoded(encoded),
+        records.len(),
+    )?;
+    journal.close()?.result()
+}
 
-    let inner = open_shared_inner(path.to_path_buf(), mode, explicit_config).map_err(|error| {
-        error
-            .get_ref()
-            .and_then(|cause| cause.downcast_ref::<JsonlJournalError>())
-            .cloned()
-            .unwrap_or_else(|| {
-                JsonlJournalError::new(format!("open JSONL journal {}: {error}", path.display()))
-            })
-    })?;
-    inner.send(JournalCommand::Encoded(encoded))?;
-    inner.delivery.record_unbounded(records.len());
-    flush_inner(&inner)
+fn open_error(error: io::Error) -> JsonlJournalError {
+    error
+        .get_ref()
+        .and_then(|cause| cause.downcast_ref::<JsonlJournalError>())
+        .cloned()
+        .unwrap_or_else(|| JsonlJournalError::new(format!("open JSONL journal: {error}")))
 }
 
 fn run_writer(
@@ -769,14 +839,14 @@ fn run_writer_loop(
                 flush_deadline.get_or_insert_with(|| Instant::now() + flush_interval);
                 write_encoded_if_healthy(&mut writer, &encoded, &failure, path, &mut writable);
             }
-            Ok(JournalCommand::Flush(reply)) => {
+            Ok(JournalCommand::Flush(request)) => {
                 flush_if_healthy(&mut writer, &failure, path, &mut writable, &delivery);
                 flush_deadline = None;
-                let _ = reply.send(failure.current().map_or(Ok(()), Err));
+                request.reply(&delivery, &failure);
             }
-            Ok(JournalCommand::Close(reply)) => {
+            Ok(JournalCommand::Close(request)) => {
                 flush_if_healthy(&mut writer, &failure, path, &mut writable, &delivery);
-                let _ = reply.send(failure.current().map_or(Ok(()), Err));
+                request.reply(&delivery, &failure);
                 return;
             }
             Err(RecvTimeoutError::Timeout) => {
@@ -864,7 +934,7 @@ mod tests {
     #[test]
     fn flush_makes_ordered_events_and_batches_visible() {
         let path = temp_path("ordered");
-        let journal = JsonlJournal::create(path.clone()).unwrap();
+        let journal = OwnedJsonlJournal::create(path.clone()).unwrap();
         journal.enqueue(serde_json::json!({"ordinal": 1})).unwrap();
         journal
             .enqueue_batch(vec![
@@ -872,7 +942,7 @@ mod tests {
                 serde_json::json!({"ordinal": 3}),
             ])
             .unwrap();
-        journal.flush().unwrap();
+        journal.flush().result().unwrap();
 
         let ordinals: Vec<_> = read_values(&path)
             .into_iter()
@@ -887,7 +957,7 @@ mod tests {
     fn truncate_journal_appends_after_an_external_startup_record() {
         let path = temp_path("external-startup-record");
         std::fs::write(&path, "{\"source\":\"previous-run\"}\n").unwrap();
-        let journal = JsonlJournal::create(path.clone()).unwrap();
+        let journal = OwnedJsonlJournal::create(path.clone()).unwrap();
         assert!(std::fs::read(&path).unwrap().is_empty());
         let mut startup_writer = OpenOptions::new().append(true).open(&path).unwrap();
         writeln!(startup_writer, r#"{{"source":"startup"}}"#).unwrap();
@@ -896,10 +966,20 @@ mod tests {
         journal
             .enqueue(serde_json::json!({"source": "engine"}))
             .unwrap();
-        journal.flush().unwrap();
+        journal.flush().result().unwrap();
 
-        // A later create call joins the live writer without truncating again.
-        let second_owner = JsonlJournal::<serde_json::Value>::create(path.clone()).unwrap();
+        // An unrelated owner cannot truncate or attach to this live writer.
+        let second_owner =
+            OwnedJsonlJournal::<serde_json::Value>::create(path.clone()).unwrap_err();
+        assert_eq!(
+            second_owner
+                .get_ref()
+                .unwrap()
+                .downcast_ref::<JsonlJournalError>()
+                .unwrap()
+                .kind(),
+            JsonlJournalErrorKind::Config
+        );
 
         assert_eq!(
             read_values(&path),
@@ -917,9 +997,9 @@ mod tests {
     fn journal_and_direct_records_share_an_atomic_jsonl_boundary() {
         const RECORDS_PER_WRITER: u64 = 32;
         let path = temp_path("mixed-writers");
-        let journal = JsonlJournal::create(path.clone()).unwrap();
+        let mut journal = OwnedJsonlJournal::create(path.clone()).unwrap();
         let producer = {
-            let journal = journal.clone();
+            let journal = journal.producer().clone();
             std::thread::spawn(move || {
                 for sequence in 0..RECORDS_PER_WRITER {
                     journal
@@ -932,18 +1012,19 @@ mod tests {
             })
         };
         for sequence in 0..RECORDS_PER_WRITER {
-            write_jsonl_records(
-                &path,
-                JsonlJournalOpenMode::Append,
+            write_jsonl_records_to(
+                journal.producer(),
                 &[serde_json::json!({
                     "source": "direct",
                     "sequence": sequence,
                 })],
             )
+            .unwrap()
+            .result()
             .unwrap();
         }
         producer.join().unwrap();
-        journal.close().unwrap();
+        journal.close().unwrap().result().unwrap();
 
         let rows = read_values(&path);
         assert_eq!(rows.len(), 2 * RECORDS_PER_WRITER as usize);
@@ -974,8 +1055,9 @@ mod tests {
             .unwrap()
             .join(".")
             .join(path.file_name().unwrap());
-        let json_journal = JsonlJournal::<serde_json::Value>::create(path.clone()).unwrap();
-        let typed_journal = JsonlJournal::<TypedRecord>::create(alias).unwrap();
+        let json_journal = OwnedJsonlJournal::<serde_json::Value>::create(path.clone()).unwrap();
+        let typed_journal = json_journal.scope.producer::<TypedRecord>();
+        assert_eq!(normalize_jsonl_path(&alias).unwrap(), json_journal.path());
         assert_eq!(json_journal.path(), typed_journal.path());
 
         json_journal
@@ -987,13 +1069,14 @@ mod tests {
                 sequence: 2,
             })
             .unwrap();
-        write_jsonl_records(
-            &path,
-            JsonlJournalOpenMode::Append,
+        write_jsonl_records_to(
+            json_journal.producer(),
             &[serde_json::json!({"source": "direct", "sequence": 3})],
         )
+        .unwrap()
+        .result()
         .unwrap();
-        typed_journal.flush().unwrap();
+        typed_journal.flush().result().unwrap();
 
         assert_eq!(
             read_values(&path),
@@ -1012,7 +1095,7 @@ mod tests {
     fn last_handle_drop_closes_and_flushes() {
         let path = temp_path("drop-flush");
         {
-            let journal = JsonlJournal::create(path.clone()).unwrap();
+            let journal = OwnedJsonlJournal::create(path.clone()).unwrap();
             journal
                 .enqueue(serde_json::json!({"closed": true}))
                 .unwrap();
@@ -1027,11 +1110,11 @@ mod tests {
     #[test]
     fn explicit_close_drains_joins_and_rejects_new_events() {
         let path = temp_path("explicit-close");
-        let journal = JsonlJournal::create(path.clone()).unwrap();
+        let mut journal = OwnedJsonlJournal::create(path.clone()).unwrap();
         journal
             .enqueue(serde_json::json!({"closed": true}))
             .unwrap();
-        journal.close().unwrap();
+        journal.close().unwrap().result().unwrap();
 
         assert_eq!(
             read_values(&path),
@@ -1040,17 +1123,17 @@ mod tests {
         assert!(journal
             .enqueue(serde_json::json!({"after_close": true}))
             .is_err());
-        journal.close().unwrap();
+        journal.close().unwrap().result().unwrap();
         let _ = std::fs::remove_file(path);
     }
 
     #[test]
     fn concurrent_producers_preserve_all_events_and_per_producer_order() {
         let path = temp_path("concurrent");
-        let journal = JsonlJournal::create(path.clone()).unwrap();
+        let journal = OwnedJsonlJournal::create(path.clone()).unwrap();
         let mut workers = Vec::new();
         for producer in 0..4_u64 {
-            let journal = journal.clone();
+            let journal = journal.producer().clone();
             workers.push(std::thread::spawn(move || {
                 for sequence in 0..32_u64 {
                     journal
@@ -1065,7 +1148,7 @@ mod tests {
         for worker in workers {
             worker.join().unwrap();
         }
-        journal.flush().unwrap();
+        journal.flush().result().unwrap();
 
         let rows = read_values(&path);
         assert_eq!(rows.len(), 128);
@@ -1109,9 +1192,9 @@ mod tests {
     #[test]
     fn serialization_failure_is_latched_and_returned_by_flush() {
         let path = temp_path("serialization-failure");
-        let journal = JsonlJournal::create(path.clone()).unwrap();
+        let journal = OwnedJsonlJournal::create(path.clone()).unwrap();
         journal.enqueue(FailingEvent).unwrap();
-        let error = journal.flush().unwrap_err();
+        let error = journal.flush().result().unwrap_err();
         assert!(error
             .message()
             .contains("intentional serialization failure"));
@@ -1143,7 +1226,7 @@ mod tests {
     #[test]
     fn serialization_failure_never_writes_a_partial_batch() {
         let path = temp_path("atomic-batch");
-        let journal = JsonlJournal::create(path.clone()).unwrap();
+        let journal = OwnedJsonlJournal::create(path.clone()).unwrap();
         journal
             .enqueue_batch(vec![
                 BatchEvent::Valid(1),
@@ -1151,7 +1234,7 @@ mod tests {
                 BatchEvent::Valid(3),
             ])
             .unwrap();
-        assert!(journal.flush().is_err());
+        assert!(journal.flush().result().is_err());
         drop(journal);
         assert!(std::fs::read(&path).unwrap().is_empty());
         let _ = std::fs::remove_file(path);
@@ -1209,7 +1292,7 @@ mod tests {
     #[test]
     fn full_bounded_queue_applies_backpressure_without_dropping() {
         let path = temp_path("backpressure");
-        let journal = JsonlJournal::open(
+        let journal = OwnedJsonlJournal::open(
             path.clone(),
             JsonlJournalOpenMode::Truncate,
             JsonlJournalConfig {
@@ -1235,7 +1318,7 @@ mod tests {
             })
             .unwrap();
 
-        let third = journal.clone();
+        let third = journal.producer().clone();
         let (done_tx, done_rx) = sync_channel(1);
         let sender = std::thread::spawn(move || {
             let result = third.enqueue(BlockingEvent {
@@ -1251,7 +1334,7 @@ mod tests {
             .unwrap()
             .unwrap();
         sender.join().unwrap();
-        journal.flush().unwrap();
+        journal.flush().result().unwrap();
 
         let ordinals: Vec<_> = read_values(&path)
             .into_iter()
@@ -1265,7 +1348,7 @@ mod tests {
     #[test]
     fn flush_interval_makes_events_visible_without_explicit_flush() {
         let path = temp_path("periodic-flush");
-        let journal = JsonlJournal::open(
+        let journal = OwnedJsonlJournal::open(
             path.clone(),
             JsonlJournalOpenMode::Truncate,
             JsonlJournalConfig {
@@ -1314,7 +1397,7 @@ mod tests {
     #[test]
     fn continuous_event_stream_cannot_starve_periodic_flush() {
         let path = temp_path("continuous-periodic-flush");
-        let journal = JsonlJournal::open(
+        let mut journal = OwnedJsonlJournal::open(
             path.clone(),
             JsonlJournalOpenMode::Truncate,
             JsonlJournalConfig {
@@ -1338,7 +1421,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(2));
         }
 
-        journal.close().unwrap();
+        journal.close().unwrap().result().unwrap();
         assert_eq!(read_values(&path).len(), 100);
         let _ = std::fs::remove_file(path);
     }

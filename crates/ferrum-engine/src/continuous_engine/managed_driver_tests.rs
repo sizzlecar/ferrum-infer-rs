@@ -343,14 +343,22 @@ async fn managed_driver_failed_report_retains_unproved_owner_without_control_cyc
     assert!(report.result().is_err());
     assert!(report.retains_unproved_owners());
     assert!(fixture.identity.observed_end().is_none());
-    // Diagnostic writers finish even when the report retains an unresolved
-    // execution owner. Read their actual flushed output without reopening them.
+    // Unproved execution keeps the original producer scope live. A readable
+    // flush barrier is not proof that the engine may retire that scope.
     assert!(!report.journal_deliveries().is_empty());
     for delivery in report.journal_deliveries() {
-        assert!(delivery.stats.worker_finished);
-        assert_eq!(delivery.stats.pending_payload_bytes, 0);
-        assert_eq!(delivery.stats.accepted, delivery.stats.flushed);
+        assert!(!delivery.stats.worker_finished);
+        assert!(delivery.scope_receipt.is_none());
+        assert!(delivery.final_receipt.is_none());
     }
+    fixture
+        .engine
+        .inner
+        .scheduler_trace_jsonl
+        .as_ref()
+        .unwrap()
+        .flush()
+        .unwrap();
     assert_eq!(
         fixture::closed_slot_events(
             &fixture.trace.path().join("trace.jsonl"),

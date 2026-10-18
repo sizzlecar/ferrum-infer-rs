@@ -1,7 +1,10 @@
 //! Actual HTTP projection and the real shared JSONL worker. The controlled LLM
 //! isolates delivery behavior; these are not model numerical/performance tests.
 use super::*;
-use ferrum_bench_core::{JsonlJournal, JsonlJournalErrorKind, JsonlJournalOpenMode};
+use ferrum_bench_core::{
+    JsonlJournal, JsonlJournalErrorKind, JsonlJournalOpenMode, JsonlJournalOwner,
+    JsonlProducerScope,
+};
 use ferrum_types::ObservabilityProfileDetail;
 use std::time::Duration;
 
@@ -69,18 +72,24 @@ fn assert_closed(server: &AxumServer) {
 async fn http_profile_delivery_sync_and_stream_preserve_events_and_append() {
     for streaming in [false, true] {
         let path = unique_profile_jsonl("http-profile-append");
-        let original = JsonlJournal::<Value>::append(&path).unwrap();
+        let mut journal_owner =
+            JsonlJournalOwner::open(&path, JsonlJournalOpenMode::Append, Default::default())
+                .unwrap();
+        let mut cli_scope = journal_owner.producer_scope().unwrap();
+        let original = cli_scope.producer::<Value>();
         original
             .try_enqueue(json!({"startup_record":true}))
             .unwrap();
-        original.flush().unwrap();
+        original.flush().result().unwrap();
         let engine = Arc::new(StubLlm::with_stream_chunks(&["O", "K"]));
         // Builder ordering does not decide policy or open a writer.
         let state = AppState::default()
             .with_profile_detail(ObservabilityProfileDetail::Verify)
             .with_llm(engine.clone())
             .with_profile_jsonl(Some(path.clone()));
-        let server = AxumServer::from_state(state);
+        let server = AxumServer::from_state(state).with_journal_scopes(
+            HttpJournalScopes::new(vec![journal_owner.producer_scope().unwrap()]).unwrap(),
+        );
         let router = server.build_router().unwrap();
         let response = post_json(router, "/v1/chat/completions", request(streaming)).await;
         assert_eq!(response.status(), AxumStatusCode::OK);
@@ -110,6 +119,30 @@ async fn http_profile_delivery_sync_and_stream_preserve_events_and_append() {
             .iter()
             .any(|event| event["phase"] == "actual_serve_first_request_done"));
         server.stop(Duration::from_secs(2)).await.unwrap();
+        let proof = server.profile_delivery_report().unwrap();
+        assert!(
+            proof.journals[0]
+                .scope_receipt
+                .as_ref()
+                .unwrap()
+                .scope_retired
+        );
+        assert!(proof.journals[0].final_receipt.is_none());
+        assert!(
+            journal_owner.close().is_err(),
+            "CLI still owns the last publication scope"
+        );
+        original
+            .try_enqueue(json!({"actual_serve_shutdown":true}))
+            .unwrap();
+        cli_scope.finish().result().unwrap();
+        let final_receipt = journal_owner.close().unwrap();
+        final_receipt.result().unwrap();
+        assert!(final_receipt.worker_joined);
+        assert_eq!(
+            read_profile_events(&path).last().unwrap(),
+            &json!({"actual_serve_shutdown":true})
+        );
         assert_closed(&server);
         assert_eq!(engine.shutdown_count.load(Ordering::Acquire), 1);
         let report = server.profile_delivery_report().unwrap();
@@ -126,16 +159,23 @@ async fn http_profile_delivery_sync_and_stream_preserve_events_and_append() {
 async fn saturated_http_fanout(detail: ObservabilityProfileDetail, streaming: bool) {
     let blocked_path = unique_profile_jsonl("http-profile-full");
     let healthy_path = unique_profile_jsonl("http-memory-healthy");
-    let journal_config = ferrum_types::ObservabilityJournalConfig {
-        queue_capacity: 1,
-        ..Default::default()
-    };
-    let blocked = JsonlJournal::<BlockWriter>::open(
+    let journal_config = ferrum_types::ObservabilityJournalConfig::default();
+    let mut blocked_owner = JsonlJournalOwner::open(
         &blocked_path,
         JsonlJournalOpenMode::Append,
         journal_config.clone().into(),
     )
     .unwrap();
+    let mut blocker_scope = blocked_owner.producer_scope().unwrap();
+    let blocked = blocker_scope.producer::<BlockWriter>();
+    let mut healthy_owner = JsonlJournalOwner::open(
+        &healthy_path,
+        JsonlJournalOpenMode::Append,
+        journal_config.into(),
+    )
+    .unwrap();
+    let healthy_scope = healthy_owner.producer_scope().unwrap();
+    let healthy = healthy_scope.producer::<Value>();
     let (entered, waiting) = tokio::sync::oneshot::channel();
     let (release, resume) = std::sync::mpsc::channel();
     blocked
@@ -148,16 +188,25 @@ async fn saturated_http_fanout(detail: ObservabilityProfileDetail, streaming: bo
         .await
         .unwrap()
         .unwrap();
-    let filler = JsonlJournal::<Value>::append(&blocked_path).unwrap();
-    filler
-        .try_enqueue(json!({"fills_original_queue":true}))
-        .unwrap();
+    let filler = blocker_scope.producer::<Value>();
+    // Both destinations have the declared product budget. Only the blocked
+    // writer is saturated; the healthy writer must not lose its own events
+    // merely because the first-request projection emits more than one record.
+    for index in 0..journal_config.queue_capacity {
+        filler
+            .try_enqueue(json!({"fills_original_queue":index}))
+            .unwrap();
+    }
     let server = AxumServer::from_state(
         state_with_stub("OK")
             .with_profile_jsonl(Some(blocked_path.clone()))
             .with_memory_profile_jsonl(Some(healthy_path.clone()))
             .with_profile_detail(detail)
             .with_profile_journal(journal_config),
+    )
+    .with_journal_scopes(
+        HttpJournalScopes::new(vec![blocked_owner.producer_scope().unwrap(), healthy_scope])
+            .unwrap(),
     );
     // Must drop before server/journal owners if an assertion unwinds.
     let mut release = ReleaseWriter(Some(release));
@@ -182,8 +231,7 @@ async fn saturated_http_fanout(detail: ObservabilityProfileDetail, streaming: bo
             "OK"
         );
     }
-    let healthy = JsonlJournal::<Value>::append(&healthy_path).unwrap();
-    healthy.flush().unwrap();
+    healthy.flush().result().unwrap();
     assert!(read_profile_events(&healthy_path)
         .iter()
         .any(|event| event["phase"] == "actual_serve_first_request_done"));
@@ -213,6 +261,9 @@ async fn saturated_http_fanout(detail: ObservabilityProfileDetail, streaming: bo
     release.release();
     let result = server.stop(Duration::from_secs(2)).await;
     assert_eq!(result.is_err(), detail.requires_complete_evidence());
+    blocker_scope.finish().result().unwrap();
+    blocked_owner.close().unwrap().result().unwrap();
+    healthy_owner.close().unwrap().result().unwrap();
     assert_closed(&server);
     let report = server.profile_delivery_report().unwrap();
     assert!(report.is_degraded());
@@ -231,6 +282,152 @@ async fn http_profile_delivery_optional_full_queue_preserves_healthy_destination
 #[tokio::test]
 async fn http_profile_delivery_required_loss_after_sse_is_visible_at_health_and_stop() {
     saturated_http_fanout(ObservabilityProfileDetail::Verify, true).await;
+}
+
+#[tokio::test]
+async fn http_profile_delivery_shared_owner_keeps_second_http_scope_live() {
+    let path = unique_profile_jsonl("http-profile-two-scopes");
+    let mut journal_owner =
+        JsonlJournalOwner::open(&path, JsonlJournalOpenMode::Append, Default::default()).unwrap();
+    let first_engine = Arc::new(StubLlm::new("first"));
+    let second_engine = Arc::new(StubLlm::new("second"));
+    let first = AxumServer::from_state(
+        AppState::default()
+            .with_llm(first_engine.clone())
+            .with_profile_jsonl(Some(path.clone()))
+            .with_profile_detail(ObservabilityProfileDetail::Verify),
+    )
+    .with_journal_scopes(
+        HttpJournalScopes::new(vec![journal_owner.producer_scope().unwrap()]).unwrap(),
+    );
+    let second = AxumServer::from_state(
+        AppState::default()
+            .with_llm(second_engine.clone())
+            .with_profile_jsonl(Some(path.clone()))
+            .with_profile_detail(ObservabilityProfileDetail::Verify),
+    )
+    .with_journal_scopes(
+        HttpJournalScopes::new(vec![journal_owner.producer_scope().unwrap()]).unwrap(),
+    );
+    let first_router = first.build_router().unwrap();
+    let second_router = second.build_router().unwrap();
+    let response = post_json(first_router, "/v1/chat/completions", request(false)).await;
+    assert_eq!(response.status(), AxumStatusCode::OK);
+    assert_eq!(
+        response_json(response).await["choices"][0]["message"]["content"],
+        "first"
+    );
+    first.stop(Duration::from_secs(2)).await.unwrap();
+    let first_report = first.profile_delivery_report().unwrap();
+    let first_receipt = first_report.journals[0].scope_receipt.as_ref().unwrap();
+    first_receipt.result().unwrap();
+    assert!(first_receipt.scope_retired && first_receipt.barrier_observed);
+    assert_eq!(first_receipt.flushed, first_receipt.cut.accepted);
+    assert!(first_report.journals[0].final_receipt.is_none());
+    assert!(!first_report.journals[0].stats.worker_finished);
+    assert_eq!(
+        journal_owner.close().unwrap_err().kind(),
+        JsonlJournalErrorKind::Config,
+        "the second HTTP scope still owns publication authority"
+    );
+
+    let response = post_json(second_router, "/v1/chat/completions", request(false)).await;
+    assert_eq!(response.status(), AxumStatusCode::OK);
+    assert_eq!(
+        response_json(response).await["choices"][0]["message"]["content"],
+        "second"
+    );
+    owner(&second).flush().unwrap();
+    let second_report = second.profile_delivery_report().unwrap();
+    assert!(second_report.journals[0].stats.accepted > first_receipt.cut.accepted);
+    assert!(!second_report.is_degraded());
+    assert_eq!(
+        first.profile_delivery_report().unwrap().journals[0]
+            .scope_receipt
+            .as_ref(),
+        Some(first_receipt),
+        "later peer publications do not move the retired HTTP scope's cut"
+    );
+    assert_eq!(
+        read_profile_events(&path)
+            .iter()
+            .filter(|event| event["phase"] == "chat_completions_sync_complete")
+            .count(),
+        2
+    );
+    second.stop(Duration::from_secs(2)).await.unwrap();
+    let receipt = journal_owner.close().unwrap();
+    receipt.result().unwrap();
+    assert!(receipt.worker_joined);
+    assert_eq!(receipt.flush.flushed, receipt.flush.cut.accepted);
+    assert_eq!(receipt.flush.cut.dropped, 0);
+    assert_closed(&first);
+    assert_closed(&second);
+    assert_eq!(first_engine.shutdown_count.load(Ordering::Acquire), 1);
+    assert_eq!(second_engine.shutdown_count.load(Ordering::Acquire), 1);
+    let _ = fs::remove_file(path);
+}
+
+#[tokio::test]
+async fn http_profile_delivery_retired_scope_is_contract_without_reopening() {
+    let path = unique_profile_jsonl("http-profile-retired-scope");
+    let mut journal_owner =
+        JsonlJournalOwner::open(&path, JsonlJournalOpenMode::Append, Default::default()).unwrap();
+    let mut cli_scope = journal_owner.producer_scope().unwrap();
+    let original = cli_scope.producer::<Value>();
+    original.try_enqueue(json!({"before_http":true})).unwrap();
+    original.flush().result().unwrap();
+    let before = fs::read(&path).unwrap();
+    let mut retired_scope = journal_owner.producer_scope().unwrap();
+    let receipt = retired_scope.finish();
+    receipt.result().unwrap();
+    assert!(receipt.scope_retired && receipt.barrier_observed);
+    let engine = Arc::new(StubLlm::new("OK"));
+    let server = AxumServer::from_state(
+        AppState::default()
+            .with_llm(engine.clone())
+            .with_profile_jsonl(Some(path.clone()))
+            .with_profile_detail(ObservabilityProfileDetail::Basic),
+    )
+    .with_journal_scopes(HttpJournalScopes::new(vec![retired_scope]).unwrap());
+    let error = server.build_router().unwrap_err();
+    assert!(matches!(error, Error::Internal { .. }));
+    let report = server.profile_delivery_report().unwrap();
+    assert!(
+        report.required_error.is_some(),
+        "Basic cannot downgrade Contract"
+    );
+    assert!(report.journals.is_empty());
+    assert_eq!(fs::read(&path).unwrap(), before);
+    assert!(!original.delivery_stats().worker_finished);
+    assert!(server.stop(Duration::from_secs(2)).await.is_err());
+    assert!(
+        server
+            .profile_delivery_report()
+            .unwrap()
+            .close_attempt_finished
+    );
+    assert_eq!(engine.shutdown_count.load(Ordering::Acquire), 1);
+    assert_eq!(
+        journal_owner.close().unwrap_err().kind(),
+        JsonlJournalErrorKind::Config,
+        "the original CLI scope is still live"
+    );
+    original
+        .try_enqueue(json!({"after_rejected_http":true}))
+        .unwrap();
+    cli_scope.finish().result().unwrap();
+    let final_receipt = journal_owner.close().unwrap();
+    final_receipt.result().unwrap();
+    assert!(final_receipt.worker_joined);
+    assert_eq!(
+        read_profile_events(&path),
+        vec![
+            json!({"before_http":true}),
+            json!({"after_rejected_http":true})
+        ]
+    );
+    let _ = fs::remove_file(path);
 }
 
 #[tokio::test]
@@ -277,16 +474,23 @@ impl serde::Serialize for PanicWriter {
 #[tokio::test]
 async fn http_profile_delivery_failed_shared_writer_attach_preserves_contract() {
     let path = unique_profile_jsonl("http-profile-panic");
-    let original = JsonlJournal::<PanicWriter>::append(&path).unwrap();
+    let mut journal_owner =
+        JsonlJournalOwner::open(&path, JsonlJournalOpenMode::Append, Default::default()).unwrap();
+    let mut original_scope = journal_owner.producer_scope().unwrap();
+    let original = original_scope.producer::<PanicWriter>();
     original.enqueue(PanicWriter).unwrap();
-    assert_eq!(
-        original.flush().unwrap_err().kind(),
-        JsonlJournalErrorKind::Panic
-    );
+    let failure = original.flush().result().unwrap_err();
+    assert_eq!(failure.kind(), JsonlJournalErrorKind::Panic);
     let server = AxumServer::from_state(
         state_with_stub("OK")
             .with_profile_jsonl(Some(path.clone()))
             .with_profile_detail(ObservabilityProfileDetail::Basic),
+    )
+    .with_journal_scopes(
+        HttpJournalScopes::new(vec![])
+            .unwrap()
+            .with_open_failure(&path, std::io::Error::other(failure))
+            .unwrap(),
     );
     assert!(server.build_router().is_err());
     assert!(server
@@ -302,7 +506,10 @@ async fn http_profile_delivery_failed_shared_writer_attach_preserves_contract() 
             .close_attempt_finished
     );
     // The retained original handle, not a replacement worker, reports exit.
-    assert!(original.close().is_err());
+    assert!(original_scope.finish().result().is_err());
+    let final_receipt = journal_owner.close().unwrap();
+    assert!(final_receipt.worker_joined);
+    assert!(final_receipt.result().is_err());
     assert!(original.delivery_stats().worker_finished);
     let _ = fs::remove_file(path);
 }
@@ -349,7 +556,10 @@ async fn http_profile_delivery_bind_failure_and_cancelled_close_retain_original_
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let path = unique_profile_jsonl("http-profile-bind");
-    let blocked = JsonlJournal::<BlockWriter>::append(&path).unwrap();
+    let mut journal_owner =
+        JsonlJournalOwner::open(&path, JsonlJournalOpenMode::Append, Default::default()).unwrap();
+    let mut blocker_scope = journal_owner.producer_scope().unwrap();
+    let blocked = blocker_scope.producer::<BlockWriter>();
     let (entered, waiting) = tokio::sync::oneshot::channel();
     let (release, resume) = std::sync::mpsc::channel();
     blocked
@@ -362,7 +572,9 @@ async fn http_profile_delivery_bind_failure_and_cancelled_close_retain_original_
         .await
         .unwrap()
         .unwrap();
-    let server = AxumServer::from_state(state_with_stub("OK"));
+    let server = AxumServer::from_state(state_with_stub("OK")).with_journal_scopes(
+        HttpJournalScopes::new(vec![journal_owner.producer_scope().unwrap()]).unwrap(),
+    );
     let mut release = ReleaseWriter(Some(release));
     let config = ServerConfig {
         host: "127.0.0.1".to_string(),
@@ -378,6 +590,8 @@ async fn http_profile_delivery_bind_failure_and_cancelled_close_retain_original_
     assert!(!report.journals[0].stats.worker_finished);
     release.release();
     server.stop(Duration::from_secs(2)).await.unwrap();
+    blocker_scope.finish().result().unwrap();
+    journal_owner.close().unwrap().result().unwrap();
     assert_closed(&server);
     let _ = fs::remove_file(path);
 }
@@ -427,6 +641,7 @@ async fn http_profile_delivery_invalid_projection_is_contract_before_any_destina
 struct RetryShutdownLlm {
     inner: StubLlm,
     journal: JsonlJournal<Value>,
+    scope: Mutex<JsonlProducerScope>,
     shutdown_calls: std::sync::atomic::AtomicUsize,
 }
 #[async_trait]
@@ -443,7 +658,13 @@ impl InferenceEngine for RetryShutdownLlm {
         self.journal
             .try_enqueue(json!({"engine_producer_finished":true}))
             .map_err(|error| Error::internal(error.to_string()))?;
-        self.inner.shutdown().await
+        self.inner.shutdown().await?;
+        self.scope
+            .lock()
+            .unwrap()
+            .finish()
+            .result()
+            .map_err(|error| Error::internal(error.to_string()))
     }
     fn config(&self) -> &EngineConfig {
         self.inner.config()
@@ -474,15 +695,22 @@ impl LlmInferenceEngine for RetryShutdownLlm {
 #[tokio::test]
 async fn http_profile_delivery_engine_error_retains_live_producer_until_successful_retry() {
     let path = unique_profile_jsonl("http-profile-shutdown-retry");
+    let mut journal_owner =
+        JsonlJournalOwner::open(&path, JsonlJournalOpenMode::Append, Default::default()).unwrap();
+    let engine_scope = journal_owner.producer_scope().unwrap();
     let engine = Arc::new(RetryShutdownLlm {
         inner: StubLlm::new("OK"),
-        journal: JsonlJournal::append(&path).unwrap(),
+        journal: engine_scope.producer(),
+        scope: Mutex::new(engine_scope),
         shutdown_calls: std::sync::atomic::AtomicUsize::new(0),
     });
     let server = AxumServer::from_state(
         AppState::default()
             .with_llm(engine.clone())
             .with_profile_jsonl(Some(path.clone())),
+    )
+    .with_journal_scopes(
+        HttpJournalScopes::new(vec![journal_owner.producer_scope().unwrap()]).unwrap(),
     );
     let response = post_json(
         server.build_router().unwrap(),
@@ -500,21 +728,33 @@ async fn http_profile_delivery_engine_error_retains_live_producer_until_successf
         .to_string()
         .contains("controlled engine cleanup remains incomplete"));
     let report = server.profile_delivery_report().unwrap();
-    assert!(!report.close_attempt_finished);
+    assert!(report.close_attempt_finished);
+    assert!(
+        report.journals[0]
+            .scope_receipt
+            .as_ref()
+            .unwrap()
+            .scope_retired
+    );
     assert!(!report.journals[0].stats.worker_finished);
+    assert!(
+        journal_owner.close().is_err(),
+        "engine producer is still live"
+    );
     assert!(!server.lifecycle.engines_stopped.load(Ordering::Acquire));
     // This is the actual engine-owned original handle, not a reopened writer.
     engine
         .journal
         .try_enqueue(json!({"engine_still_produces_after_failed_shutdown":true}))
         .unwrap();
-    engine.journal.flush().unwrap();
+    engine.journal.flush().result().unwrap();
     let before = fs::read_to_string(&path).unwrap();
     assert!(before
         .lines()
         .map(|line| serde_json::from_str::<Value>(line).unwrap())
         .any(|event| event["engine_still_produces_after_failed_shutdown"] == true));
     server.stop(Duration::from_secs(2)).await.unwrap();
+    journal_owner.close().unwrap().result().unwrap();
     assert_closed(&server);
     assert_eq!(engine.shutdown_calls.load(Ordering::Acquire), 2);
     assert_eq!(engine.inner.shutdown_count.load(Ordering::Acquire), 1);

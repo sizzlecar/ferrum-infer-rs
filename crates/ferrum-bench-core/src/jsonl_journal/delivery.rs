@@ -1,5 +1,8 @@
 //! Bounded, nonwaiting production delivery on the original ordered writer.
-use super::{JournalCommand, JsonlJournal, JsonlJournalConfig, JsonlJournalError};
+use super::{
+    JournalCommand, JsonlJournal, JsonlJournalConfig, JsonlJournalError, JsonlPublicationCut,
+    PublicationState,
+};
 use serde::Serialize;
 use std::io::{self, Write};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -74,6 +77,14 @@ impl DeliveryState {
             bytes: AtomicUsize::new(0),
             peak: AtomicUsize::new(0),
             finished: AtomicBool::new(false),
+        }
+    }
+
+    pub(super) fn publication_cut(&self) -> JsonlPublicationCut {
+        JsonlPublicationCut {
+            accepted: self.accepted.load(Ordering::Acquire),
+            unbounded_accepted: self.unbounded_accepted.load(Ordering::Acquire),
+            dropped: self.dropped.load(Ordering::Acquire),
         }
     }
 
@@ -397,7 +408,7 @@ impl<T: Serialize + Send + 'static> JsonlJournal<T> {
     fn prepare_try<'a>(
         &'a self,
         events: &[T],
-    ) -> Result<(MutexGuard<'a, ()>, usize), JsonlJournalError> {
+    ) -> Result<(MutexGuard<'a, PublicationState>, usize), JsonlJournalError> {
         let result = (|| {
             if self.inner.closed.load(Ordering::Acquire) {
                 return Err(error(
@@ -423,9 +434,7 @@ impl<T: Serialize + Send + 'static> JsonlJournal<T> {
                     "JSONL journal is closed",
                 ));
             }
-            if let Some(error) = self.inner.failure.current() {
-                return Err(error);
-            }
+            self.inner.check_publication(&self.scope)?;
             if events.len() > self.inner.config.max_batch_records {
                 return Err(error(
                     JsonlJournalErrorKind::Limit,

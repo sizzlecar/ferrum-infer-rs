@@ -1699,6 +1699,45 @@ impl ProductExecutionEventSink for VNextProfileExecutionEventSink {
 }
 
 #[cfg(test)]
-pub(super) fn create_scheduler_trace_sink(path: Option<&Path>) -> Option<SchedulerTraceJournal> {
-    SchedulerTraceJournal::create(path?.to_path_buf(), Default::default()).ok()
+pub(super) fn create_scheduler_trace_sink(path: Option<&Path>) -> Option<TestTraceJournal> {
+    TestTraceJournal::create(path?.to_path_buf(), Default::default()).ok()
+}
+
+/// Test fixture owns the real final-close control, separately from the sink's
+/// cloneable publication view. Production journals never gain close authority.
+#[cfg(test)]
+pub(super) struct TestTraceJournal {
+    journal: SchedulerTraceJournal,
+    owner: Mutex<ferrum_bench_core::jsonl_journal::OwnedJsonlJournal<SchedulerTraceRecord>>,
+}
+
+#[cfg(test)]
+impl TestTraceJournal {
+    pub(super) fn create(
+        path: PathBuf,
+        config: ferrum_types::ObservabilityJournalConfig,
+    ) -> std::io::Result<Self> {
+        let owner = ferrum_bench_core::jsonl_journal::OwnedJsonlJournal::open(
+            path,
+            ferrum_bench_core::JsonlJournalOpenMode::Truncate,
+            config.into(),
+        )?;
+        let journal = SchedulerTraceJournal::from_producer(owner.producer().clone());
+        Ok(Self {
+            journal,
+            owner: Mutex::new(owner),
+        })
+    }
+
+    pub(super) fn close(&self) -> std::result::Result<(), JsonlJournalError> {
+        self.owner.lock().close()?.result()
+    }
+}
+
+#[cfg(test)]
+impl std::ops::Deref for TestTraceJournal {
+    type Target = SchedulerTraceJournal;
+    fn deref(&self) -> &Self::Target {
+        &self.journal
+    }
 }

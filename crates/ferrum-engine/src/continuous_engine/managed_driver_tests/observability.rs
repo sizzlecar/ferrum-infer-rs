@@ -1,5 +1,6 @@
 //! Real CPU numerical work remains independent of optional journal delivery.
 use super::*;
+use ferrum_bench_core::jsonl_journal::{JsonlJournalOwner, OwnedJsonlJournal};
 use ferrum_bench_core::{JsonlJournalConfig, JsonlJournalErrorKind, JsonlJournalOpenMode};
 use ferrum_runtime::{ExecutionEventDeliveryPolicy, ExecutionEventSinkErrorKind};
 
@@ -71,12 +72,14 @@ async fn saturated_fanout(detail: ObservabilityProfileDetail) {
     let directory = tempfile::tempdir().unwrap();
     let blocked_path = directory.path().join("blocked.jsonl");
     let journal_config = JsonlJournalConfig::default();
-    let blocked = JsonlJournal::<BlockWriter>::open(
+    let mut owner = JsonlJournalOwner::open(
         &blocked_path,
         JsonlJournalOpenMode::Truncate,
         journal_config,
     )
     .unwrap();
+    let mut tool_scope = owner.producer_scope().unwrap();
+    let blocked = tool_scope.producer::<BlockWriter>();
     let (entered, waiting) = tokio::sync::oneshot::channel();
     let (release, resumed) = std::sync::mpsc::channel();
     // The legacy tool producer deliberately holds the original writer. The
@@ -91,7 +94,7 @@ async fn saturated_fanout(detail: ObservabilityProfileDetail) {
         .await
         .unwrap()
         .unwrap();
-    let filler = JsonlJournal::<serde_json::Value>::append(&blocked_path).unwrap();
+    let filler = tool_scope.producer::<serde_json::Value>();
     // Saturate the actual shared product budget. A conflicting one-slot
     // writer is now a configuration error, not a valid transport-loss fixture.
     for index in 0..journal_config.queue_capacity {
@@ -99,14 +102,32 @@ async fn saturated_fanout(detail: ObservabilityProfileDetail) {
             .try_enqueue(serde_json::json!({"queued": index}))
             .unwrap();
     }
-    let fixture = fixture::Fixture::with_config(|config| {
-        config.runtime.profile_detail = detail;
-        config.runtime.profile_jsonl = Some(blocked_path.clone());
-    });
+    let mut healthy_owner = None;
+    let fixture = fixture::Fixture::with_journal_scopes(
+        |config| {
+            config.runtime.profile_detail = detail;
+            config.runtime.profile_jsonl = Some(blocked_path.clone());
+        },
+        |config| {
+            let healthy = JsonlJournalOwner::open(
+                config.runtime.scheduler_trace_jsonl.as_ref().unwrap(),
+                JsonlJournalOpenMode::Truncate,
+                config.runtime.profile_journal.into(),
+            )
+            .unwrap();
+            let scopes = EngineJournalScopes::new(vec![
+                owner.producer_scope().unwrap(),
+                healthy.producer_scope().unwrap(),
+            ])
+            .unwrap();
+            healthy_owner = Some(healthy);
+            scopes
+        },
+    );
     // Declared after the fixture: unwind releases the real writer before any
     // fixture/journal owner can synchronously join it.
     let mut release = ReleaseWriter(Some(release));
-    let blocked_profile = fixture.engine.inner.profile_trace_jsonl.clone().unwrap();
+    let blocked_profile = fixture.engine.inner.profile_trace_journal().unwrap();
     let healthy = fixture.engine.inner.scheduler_trace_jsonl.clone().unwrap();
     let sink = VNextProfileExecutionEventSink::with_journals(
         vec![blocked_profile.clone(), healthy.clone()],
@@ -133,7 +154,7 @@ async fn saturated_fanout(detail: ObservabilityProfileDetail) {
 
     actual_cpu_request(&fixture).await;
     release.release();
-    blocked.flush().unwrap();
+    blocked.flush().result().unwrap();
     healthy.flush().unwrap();
     // Full was temporary: the original destination can accept later events.
     sink.enqueue_events(vec![accepted]).unwrap();
@@ -147,18 +168,23 @@ async fn saturated_fanout(detail: ObservabilityProfileDetail) {
     let report = tokio::time::timeout(Duration::from_secs(3), observer.wait())
         .await
         .unwrap();
-    let stats = &report
+    let delivery = report
         .journal_deliveries()
         .iter()
         .find(|journal| journal.path == blocked.path())
-        .unwrap()
-        .stats;
+        .unwrap();
+    let stats = &delivery.stats;
     assert_eq!(
         stats.dropped, 1,
         "successful close cannot erase earlier sample loss"
     );
     assert_eq!(stats.accepted, stats.flushed);
-    assert!(stats.worker_finished);
+    assert!(
+        !stats.worker_finished,
+        "injected Engine scope cannot close assembly's writer"
+    );
+    assert!(delivery.scope_receipt.as_ref().unwrap().scope_retired);
+    assert!(delivery.final_receipt.is_none());
     assert_eq!(stats.pending_payload_bytes, 0);
     if detail.requires_complete_evidence() {
         assert!(report.result().is_err());
@@ -172,6 +198,13 @@ async fn saturated_fanout(detail: ObservabilityProfileDetail) {
         inner.upgrade().is_none(),
         "diagnostic status must not retain a clean EngineInner"
     );
+    assert!(tool_scope.finish().scope_retired);
+    let final_receipt = owner.close().unwrap();
+    assert!(final_receipt.worker_joined);
+    final_receipt.result().unwrap();
+    let final_receipt = healthy_owner.as_mut().unwrap().close().unwrap();
+    assert!(final_receipt.worker_joined);
+    final_receipt.result().unwrap();
 }
 
 #[tokio::test]
@@ -189,7 +222,9 @@ async fn closed_journal(detail: ObservabilityProfileDetail) {
     actual_cpu_request(&fixture).await;
     let journal = fixture.engine.inner.scheduler_trace_jsonl.as_ref().unwrap();
     let path = journal.path().to_path_buf();
-    journal.close().unwrap();
+    let closed = fixture.engine.inner.journal_scopes.lock().finish();
+    assert!(closed.iter().all(|(delivery, error)| error.is_none()
+        && delivery.final_receipt.as_ref().unwrap().worker_joined));
     let sink = VNextProfileExecutionEventSink::new(
         journal.clone(),
         ProfileEntrypoint::Run,
@@ -198,6 +233,7 @@ async fn closed_journal(detail: ObservabilityProfileDetail) {
     let (_, _, accepted) = vnext_profile_test_event();
     let error = sink.enqueue_events(vec![accepted]).unwrap_err();
     assert_eq!(error.kind(), ExecutionEventSinkErrorKind::Transport);
+    fixture.engine.inner.report_observation_failure(error);
     let inner = Arc::downgrade(&fixture.engine.inner);
     let observer = fixture
         .engine
@@ -249,7 +285,13 @@ async fn managed_observability_worker_panic_is_contract_but_does_not_retain_clea
         .unwrap()
         .path()
         .to_path_buf();
-    let poison = JsonlJournal::<PanicWriter>::append(&path).unwrap();
+    let poison = fixture
+        .engine
+        .inner
+        .journal_scopes
+        .lock()
+        .producer::<PanicWriter>(&path)
+        .unwrap();
     poison.enqueue(PanicWriter).unwrap();
     let inner = Arc::downgrade(&fixture.engine.inner);
     let report = fixture
@@ -314,6 +356,10 @@ async fn managed_observability_contract_is_rejected_before_enqueue_even_when_opt
     assert!(report.result().is_err());
     assert!(report.telemetry_degradations().is_empty());
     assert!(!report.retains_unproved_owners());
+    for delivery in report.journal_deliveries() {
+        assert!(delivery.scope_receipt.as_ref().unwrap().scope_retired);
+        assert!(delivery.final_receipt.as_ref().unwrap().worker_joined);
+    }
     drop(fixture.engine);
     assert!(inner.upgrade().is_none());
 }
@@ -328,7 +374,7 @@ async fn managed_observability_optional_open_failure_is_observable_and_cpu_conti
         config.runtime.profile_detail = ObservabilityProfileDetail::Basic;
         config.runtime.profile_jsonl = Some(invalid.clone());
     });
-    assert!(fixture.engine.inner.profile_trace_jsonl.is_none());
+    assert!(fixture.engine.inner.profile_trace_journal().is_none());
     actual_cpu_request(&fixture).await;
     let report = fixture
         .engine
@@ -345,7 +391,7 @@ async fn managed_observability_optional_open_failure_is_observable_and_cpu_conti
         Some(&invalid),
         ObservabilityProfileDetail::Replay,
         &health,
-        |path| SchedulerTraceJournal::create(path.to_path_buf(), Default::default())
+        |path| TestTraceJournal::create(path.to_path_buf(), Default::default())
     )
     .is_err());
 }
@@ -354,18 +400,18 @@ async fn managed_observability_optional_open_failure_is_observable_and_cpu_conti
 async fn managed_observability_reopening_failed_shared_writer_preserves_contract_kind() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("failed-writer.jsonl");
-    let poison = JsonlJournal::<PanicWriter>::create(&path).unwrap();
+    let mut poison = OwnedJsonlJournal::<PanicWriter>::create(&path).unwrap();
     poison.enqueue(PanicWriter).unwrap();
     // A real barrier observes the worker failure without closing its registry
     // owner; the next open must attach/reject that same failed physical writer.
-    let failure = poison.flush().unwrap_err();
+    let failure = poison.flush().result().unwrap_err();
     assert_eq!(failure.kind(), JsonlJournalErrorKind::Panic);
     let health = ObservationHealth::default();
     let reopened = open_observation_journal(
         Some(&path),
         ObservabilityProfileDetail::Basic,
         &health,
-        |path| SchedulerTraceJournal::create(path.to_path_buf(), Default::default()),
+        |path| TestTraceJournal::create(path.to_path_buf(), Default::default()),
     );
     assert!(
         reopened.is_err(),
@@ -376,7 +422,7 @@ async fn managed_observability_reopening_failed_shared_writer_preserves_contract
     assert!(optional.is_none());
     assert_eq!(count, 0);
     assert_eq!(
-        poison.close().unwrap_err().kind(),
+        poison.close().unwrap().result().unwrap_err().kind(),
         JsonlJournalErrorKind::Panic
     );
 }
@@ -385,7 +431,7 @@ async fn managed_observability_reopening_failed_shared_writer_preserves_contract
 fn profile_journal_explicit_budget_conflict_is_contract_in_optional_mode() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("different-budget.jsonl");
-    let original = JsonlJournal::<serde_json::Value>::open(
+    let mut original = OwnedJsonlJournal::<serde_json::Value>::open(
         &path,
         JsonlJournalOpenMode::Truncate,
         JsonlJournalConfig {
@@ -399,12 +445,183 @@ fn profile_journal_explicit_budget_conflict_is_contract_in_optional_mode() {
         Some(&path),
         ObservabilityProfileDetail::Basic,
         &health,
-        |path| SchedulerTraceJournal::create(path.to_path_buf(), Default::default()),
+        |path| TestTraceJournal::create(path.to_path_buf(), Default::default()),
     );
     assert!(opened.is_err());
     let (required, optional, count) = health.snapshot();
     assert!(required.is_some());
     assert!(optional.is_none());
     assert_eq!(count, 0);
-    original.close().unwrap();
+    original.close().unwrap().result().unwrap();
+}
+
+#[tokio::test]
+async fn managed_journal_two_cpu_engines_retire_scopes_without_closing_shared_writer() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("shared.jsonl");
+    let mut owner =
+        JsonlJournalOwner::open(&path, JsonlJournalOpenMode::Truncate, Default::default()).unwrap();
+    let mut assembly = owner.producer_scope().unwrap();
+    let events = assembly.producer::<serde_json::Value>();
+    let configure = |config: &mut EngineConfig| {
+        config.runtime.profile_detail = ObservabilityProfileDetail::Basic;
+        // Three producers, including a distinct serialized type, use precisely
+        // one Engine scope for this original canonical writer.
+        config.runtime.profile_jsonl = Some(path.clone());
+        config.runtime.scheduler_trace_jsonl = Some(path.clone());
+        config.runtime.legacy_scheduler_trace_jsonl = Some(path.clone());
+    };
+    let first = fixture::Fixture::with_journal_scopes(configure, |_| {
+        EngineJournalScopes::new(vec![owner.producer_scope().unwrap()]).unwrap()
+    });
+    let second = fixture::Fixture::with_journal_scopes(configure, |_| {
+        EngineJournalScopes::new(vec![owner.producer_scope().unwrap()]).unwrap()
+    });
+    events
+        .try_enqueue(serde_json::json!({"phase":"startup"}))
+        .unwrap();
+    actual_cpu_request(&first).await;
+    let first_inner = Arc::downgrade(&first.engine.inner);
+    let report = first
+        .engine
+        .driver
+        .shutdown(&first.engine.inner)
+        .unwrap()
+        .wait()
+        .await;
+    report.result().unwrap();
+    assert!(!report.retains_unproved_owners());
+    assert_eq!(report.journal_deliveries().len(), 1);
+    let delivery = &report.journal_deliveries()[0];
+    let prefix = delivery.scope_receipt.as_ref().unwrap().clone();
+    assert!(prefix.scope_retired && prefix.barrier_observed);
+    assert_eq!(prefix.cut.accepted, prefix.flushed);
+    assert!(delivery.final_receipt.is_none());
+    assert!(!delivery.stats.worker_finished);
+    assert_eq!(
+        owner.close().unwrap_err().kind(),
+        JsonlJournalErrorKind::Config
+    );
+    drop(first.engine);
+    assert!(first_inner.upgrade().is_none());
+
+    // Work after the first Engine shutdown uses the same actual writer and
+    // still performs full CPU numerical/real-KV comparisons in the fixture.
+    actual_cpu_request(&second).await;
+    let second_report = second
+        .engine
+        .driver
+        .shutdown(&second.engine.inner)
+        .unwrap()
+        .wait()
+        .await;
+    second_report.result().unwrap();
+    assert!(
+        second_report.journal_deliveries()[0]
+            .scope_receipt
+            .as_ref()
+            .unwrap()
+            .scope_retired
+    );
+    events
+        .try_enqueue(serde_json::json!({"phase":"actual_serve_shutdown"}))
+        .unwrap();
+    assert!(events.delivery_stats().accepted > prefix.cut.accepted);
+    assert_eq!(
+        report.journal_deliveries()[0]
+            .scope_receipt
+            .as_ref()
+            .unwrap(),
+        &prefix,
+        "later publications cannot change the original fixed-prefix proof"
+    );
+    assembly.finish().result().unwrap();
+    let final_receipt = owner.close().unwrap();
+    final_receipt.result().unwrap();
+    assert!(final_receipt.worker_joined && final_receipt.stats.worker_finished);
+    assert_eq!(final_receipt.stats.pending_payload_bytes, 0);
+    assert!(std::fs::read_to_string(&path).unwrap().lines().any(|line| {
+        serde_json::from_str::<serde_json::Value>(line).unwrap()["phase"] == "actual_serve_shutdown"
+    }));
+}
+
+#[tokio::test]
+async fn managed_journal_injected_open_failure_is_preserved_without_reopening() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("never-opened.jsonl");
+    let fixture = fixture::Fixture::with_journal_scopes(
+        |config| {
+            config.runtime.profile_detail = ObservabilityProfileDetail::Basic;
+            config.runtime.scheduler_trace_jsonl = Some(path.clone());
+        },
+        |_| {
+            EngineJournalScopes::new(Vec::new())
+                .unwrap()
+                .with_open_failure(
+                    &path,
+                    std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "assembly denied this destination",
+                    ),
+                )
+                .unwrap()
+        },
+    );
+    assert!(!path.exists());
+    actual_cpu_request(&fixture).await;
+    let report = fixture
+        .engine
+        .driver
+        .shutdown(&fixture.engine.inner)
+        .unwrap()
+        .wait()
+        .await;
+    report.result().unwrap();
+    assert_eq!(report.optional_observation_failures(), 1);
+    assert!(report.telemetry_degradations()[0]
+        .to_string()
+        .contains("assembly denied"));
+    assert!(report.journal_deliveries().is_empty());
+    assert!(!path.exists());
+}
+
+#[tokio::test]
+async fn managed_journal_strict_error_retires_injected_scope_before_final_close() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("strict-scope.jsonl");
+    let mut owner =
+        JsonlJournalOwner::open(&path, JsonlJournalOpenMode::Truncate, Default::default()).unwrap();
+    let fixture = fixture::Fixture::with_journal_scopes(
+        |config| {
+            config.runtime.profile_detail = ObservabilityProfileDetail::Verify;
+            config.runtime.scheduler_trace_jsonl = Some(path.clone());
+        },
+        |_| EngineJournalScopes::new(vec![owner.producer_scope().unwrap()]).unwrap(),
+    );
+    actual_cpu_request(&fixture).await;
+    fixture
+        .engine
+        .inner
+        .report_observation_failure(ExecutionEventSinkError::contract(
+            "strict evidence rejected",
+        ));
+    let report = fixture
+        .engine
+        .driver
+        .shutdown(&fixture.engine.inner)
+        .unwrap()
+        .wait()
+        .await;
+    assert!(report
+        .result()
+        .unwrap_err()
+        .to_string()
+        .contains("strict evidence rejected"));
+    assert!(!report.retains_unproved_owners());
+    let delivery = &report.journal_deliveries()[0];
+    assert!(delivery.scope_receipt.as_ref().unwrap().scope_retired);
+    assert!(delivery.final_receipt.is_none());
+    let closed = owner.close().unwrap();
+    closed.result().unwrap();
+    assert!(closed.worker_joined);
 }

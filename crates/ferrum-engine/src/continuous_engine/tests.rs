@@ -2044,7 +2044,7 @@ fn product_profile_path_constructs_a_vnext_execution_journal() {
 
     let engine = test_continuous_engine_with_config(config);
 
-    assert!(engine.inner.profile_trace_jsonl.is_some());
+    assert!(engine.inner.profile_trace_journal().is_some());
     assert!(engine.inner.scheduler_trace_jsonl.is_none());
     assert!(trace_path.exists());
     drop(engine);
@@ -2064,11 +2064,16 @@ fn profile_journal_budget_reaches_profile_scheduler_and_legacy_writers() {
     config.runtime.scheduler_trace_jsonl = Some(paths[1].clone());
     config.runtime.legacy_scheduler_trace_jsonl = Some(paths[2].clone());
     let engine = test_continuous_engine_with_config(config);
-    assert!(engine.inner.profile_trace_jsonl.is_some());
+    assert!(engine.inner.profile_trace_journal().is_some());
     assert!(engine.inner.scheduler_trace_jsonl.is_some());
     assert!(engine.inner.legacy_scheduler_trace_jsonl.is_some());
     for path in &paths {
-        let original = ferrum_bench_core::JsonlJournal::<serde_json::Value>::append(path).unwrap();
+        let original = engine
+            .inner
+            .journal_scopes
+            .lock()
+            .producer::<serde_json::Value>(path)
+            .unwrap();
         assert_eq!(original.config(), expected);
     }
     drop(engine);

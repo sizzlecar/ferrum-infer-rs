@@ -66,7 +66,9 @@ mod profile_delivery;
 mod responses;
 
 use profile_delivery::HttpProfileDelivery;
-pub use profile_delivery::{HttpProfileDeliveryReport, HttpProfileJournalReport};
+pub use profile_delivery::{
+    HttpJournalScopes, HttpProfileDeliveryReport, HttpProfileJournalReport,
+};
 
 const DEFAULT_SAMPLING_TEMPERATURE: f32 = 0.0;
 const DEFAULT_SAMPLING_TOP_P: f32 = 1.0;
@@ -171,6 +173,7 @@ struct AxumServerLifecycle {
     stopped_notify: Notify,
     stop_lock: tokio::sync::Mutex<()>,
     profile_delivery: Mutex<Option<Arc<HttpProfileDelivery>>>,
+    profile_scopes: Mutex<Option<HttpJournalScopes>>,
 }
 
 impl AxumServerLifecycle {
@@ -1115,10 +1118,9 @@ impl HttpServer for AxumServer {
                         .store(true, Ordering::Release);
                 }
                 Ok(Err(error)) => {
-                    // The generic lifecycle Result does not prove producers
-                    // stopped on error (cleanup may have panicked). Retain the
-                    // original journal even for indistinguishable strict-only
-                    // failures until a typed producer-finish contract exists.
+                    // Preserve the execution result. Its independent journal
+                    // scope decides whether final-owner close can proceed;
+                    // a strict evidence error is not a live-producer guess.
                     if first_error.is_none() {
                         first_error = Some(error);
                     }
@@ -1134,12 +1136,10 @@ impl HttpServer for AxumServer {
             }
         }
 
-        // Closing a shared writer while either producer is still live would
-        // turn a drain timeout into lost evidence. Keep the original owner for
-        // a later stop instead. A cancelled close await retains its same job.
-        if !self.lifecycle.running.load(Ordering::Acquire)
-            && self.lifecycle.engines_stopped.load(Ordering::Acquire)
-        {
+        // HTTP retirement depends on its own drained producers. Engine errors
+        // do not grant or withhold final-close authority: injected HTTP has no
+        // owner, and standalone final close checks the original live scopes.
+        if !self.lifecycle.running.load(Ordering::Acquire) {
             match tokio::time::timeout(timeout, self.close_profile_delivery()).await {
                 Ok(Err(error)) => {
                     first_error.get_or_insert(error);
@@ -5873,16 +5873,16 @@ mod tests {
         text: &str,
         request_dump_dir: PathBuf,
         profile_jsonl: PathBuf,
-    ) -> Router {
-        AxumServer::from_state(
+    ) -> (AxumServer, Router) {
+        let server = AxumServer::from_state(
             AppState::default()
                 .with_llm(Arc::new(StubLlm::new(text)))
                 .with_request_dump_dir(Some(request_dump_dir))
                 .with_profile_detail(ferrum_types::ObservabilityProfileDetail::Latency)
                 .with_profile_jsonl(Some(profile_jsonl)),
-        )
-        .build_router()
-        .unwrap()
+        );
+        let router = server.build_router().unwrap();
+        (server, router)
     }
 
     fn router_with_stub_stream_chunks(chunks: &[&str]) -> Router {
@@ -5917,16 +5917,16 @@ mod tests {
         chunks: &[&str],
         request_dump_dir: PathBuf,
         profile_jsonl: PathBuf,
-    ) -> Router {
-        AxumServer::from_state(
+    ) -> (AxumServer, Router) {
+        let server = AxumServer::from_state(
             AppState::default()
                 .with_llm(Arc::new(StubLlm::with_stream_chunks(chunks)))
                 .with_request_dump_dir(Some(request_dump_dir))
                 .with_profile_detail(ferrum_types::ObservabilityProfileDetail::Latency)
                 .with_profile_jsonl(Some(profile_jsonl)),
-        )
-        .build_router()
-        .unwrap()
+        );
+        let router = server.build_router().unwrap();
+        (server, router)
     }
 
     fn router_with_stub_separate_final_stream_chunk(chunks: &[&str]) -> Router {
@@ -6071,16 +6071,16 @@ mod tests {
     fn router_with_failing_llm_request_dump_and_profile(
         request_dump_dir: PathBuf,
         profile_jsonl: PathBuf,
-    ) -> Router {
-        AxumServer::from_state(
+    ) -> (AxumServer, Router) {
+        let server = AxumServer::from_state(
             AppState::default()
                 .with_llm(Arc::new(FailingLlm::new()))
                 .with_request_dump_dir(Some(request_dump_dir))
                 .with_profile_detail(ferrum_types::ObservabilityProfileDetail::Latency)
                 .with_profile_jsonl(Some(profile_jsonl)),
-        )
-        .build_router()
-        .unwrap()
+        );
+        let router = server.build_router().unwrap();
+        (server, router)
     }
 
     fn router_with_resource_exhausted_llm_and_request_dump_dir(
@@ -6175,10 +6175,6 @@ mod tests {
     }
 
     fn read_profile_events(path: &Path) -> Vec<Value> {
-        ferrum_bench_core::JsonlJournal::<Value>::append(path)
-            .expect("attach original profile journal for artifact barrier")
-            .flush()
-            .expect("flush original profile journal");
         let text = fs::read_to_string(path)
             .unwrap_or_else(|err| panic!("failed to read {}: {}", path.display(), err));
         text.lines()
@@ -10400,8 +10396,10 @@ mod tests {
     async fn route_chat_generation_failure_writes_replay_diagnostics() {
         let root = unique_request_dump_dir("chat-sync-failure");
         let profile = unique_profile_jsonl("chat-sync-failure");
+        let (server, router) =
+            router_with_failing_llm_request_dump_and_profile(root.clone(), profile.clone());
         let response = post_json(
-            router_with_failing_llm_request_dump_and_profile(root.clone(), profile.clone()),
+            router,
             "/v1/chat/completions",
             json!({
                 "model": "failing-model",
@@ -10416,6 +10414,15 @@ mod tests {
             "internal",
             "stub generation failed",
         );
+        server
+            .lifecycle
+            .profile_delivery
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .flush()
+            .unwrap();
         let event = read_profile_events(&profile)
             .into_iter()
             .find(|event| event["phase"] == "chat_completions_sync")
@@ -10491,8 +10498,10 @@ mod tests {
     async fn route_chat_sync_success_writes_product_profile_event() {
         let root = unique_request_dump_dir("chat-sync-profile");
         let profile = unique_profile_jsonl("chat-sync-profile");
+        let (server, router) =
+            router_with_stub_request_dump_and_profile("OK", root.clone(), profile.clone());
         let response = post_json(
-            router_with_stub_request_dump_and_profile("OK", root.clone(), profile.clone()),
+            router,
             "/v1/chat/completions",
             json!({
                 "model": "stub-model",
@@ -10503,6 +10512,15 @@ mod tests {
         assert_eq!(response.status(), AxumStatusCode::OK);
         let response_body = response_json(response).await;
 
+        server
+            .lifecycle
+            .profile_delivery
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .flush()
+            .unwrap();
         let events = read_profile_events(&profile);
         assert_eq!(events.len(), 2, "events: {events:#?}");
         let event = events
@@ -10588,8 +10606,10 @@ mod tests {
             17,
         )
         .unwrap();
+        let (server, router) =
+            router_with_stub_request_dump_and_profile("OK", root.clone(), profile.clone());
         let response = post_json_with_benchmark_correlation(
-            router_with_stub_request_dump_and_profile("OK", root.clone(), profile.clone()),
+            router,
             "/v1/chat/completions",
             json!({
                 "model": "stub-model",
@@ -10601,6 +10621,15 @@ mod tests {
         assert_eq!(response.status(), AxumStatusCode::OK);
         let _ = response_json(response).await;
 
+        server
+            .lifecycle
+            .profile_delivery
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .flush()
+            .unwrap();
         let events = read_profile_events(&profile);
         assert_eq!(events.len(), 2, "events: {events:#?}");
         for event in events {
@@ -10746,12 +10775,13 @@ mod tests {
     async fn route_chat_stream_success_writes_product_profile_event() {
         let root = unique_request_dump_dir("chat-stream-profile");
         let profile = unique_profile_jsonl("chat-stream-profile");
+        let (server, router) = router_with_stub_stream_request_dump_and_profile(
+            &["O", "K"],
+            root.clone(),
+            profile.clone(),
+        );
         let response = post_json(
-            router_with_stub_stream_request_dump_and_profile(
-                &["O", "K"],
-                root.clone(),
-                profile.clone(),
-            ),
+            router,
             "/v1/chat/completions",
             json!({
                 "model": "stub-model",
@@ -10764,6 +10794,15 @@ mod tests {
         let body = response_text(response).await;
         assert!(body.contains("data: [DONE]"), "body: {body}");
 
+        server
+            .lifecycle
+            .profile_delivery
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .flush()
+            .unwrap();
         let events = read_profile_events(&profile);
         assert_eq!(events.len(), 2, "events: {events:#?}");
         let event = events
@@ -10851,15 +10890,14 @@ mod tests {
             stream_usage: Some(TokenUsage::new(5, 2)),
             ..StubLlm::with_stream_chunks(&["Paris"])
         };
-        let app = AxumServer::from_state(
+        let server = AxumServer::from_state(
             AppState::default()
                 .with_llm(Arc::new(llm))
                 .with_request_dump_dir(Some(root.clone()))
                 .with_profile_detail(ferrum_types::ObservabilityProfileDetail::Latency)
                 .with_profile_jsonl(Some(profile.clone())),
-        )
-        .build_router()
-        .unwrap();
+        );
+        let app = server.build_router().unwrap();
 
         let response = post_json(
             app,
@@ -10877,6 +10915,15 @@ mod tests {
         assert!(body.contains("\"completion_tokens\":2"), "body: {body}");
         assert!(body.contains("data: [DONE]"), "body: {body}");
 
+        server
+            .lifecycle
+            .profile_delivery
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .flush()
+            .unwrap();
         let events = read_profile_events(&profile);
         let event = events
             .iter()

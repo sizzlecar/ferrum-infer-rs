@@ -24,6 +24,7 @@ mod source_binding;
 
 /// Engine builder for creating inference engines with registry-based components
 pub struct EngineBuilder {
+    journal_scopes: Option<crate::EngineJournalScopes>,
     /// Component registry to use
     registry: Arc<ComponentRegistry>,
     /// Engine configuration
@@ -62,6 +63,7 @@ impl EngineBuilder {
     /// Create a new engine builder with a custom registry
     pub fn with_registry(config: EngineConfig, registry: Arc<ComponentRegistry>) -> Self {
         Self {
+            journal_scopes: None,
             registry,
             config,
             model_sources: None,
@@ -81,6 +83,13 @@ impl EngineBuilder {
     pub fn with_model_sources(mut self, sources: Arc<ProductionModelSourceBundle>) -> Self {
         self.model_sources = Some(sources);
         self.defined_model = None;
+        self
+    }
+
+    /// Use assembly-owned journal destinations. Engine shutdown retires these
+    /// producer scopes; the assembly retains final writer-close authority.
+    pub fn with_journal_scopes(mut self, scopes: crate::EngineJournalScopes) -> Self {
+        self.journal_scopes = Some(scopes);
         self
     }
 
@@ -252,6 +261,7 @@ impl EngineBuilder {
         let custom_kv_cache = self.custom_kv_cache;
         let custom_recurrent_state_manager = self.custom_recurrent_state_manager;
         let custom_executor = self.custom_executor;
+        let journal_scopes = self.journal_scopes;
 
         // 2. Create or use provided tokenizer
         let tokenizer = if let Some(tokenizer) = custom_tokenizer {
@@ -392,20 +402,21 @@ impl EngineBuilder {
         // sink is attached before executor startup emits warmup/capture events.
         let engine = match execution_resource_authority {
             ferrum_execution::model_executor::ExecutionResourceAuthority::PlanRuntime => {
-                crate::ContinuousBatchEngine::new_plan_runtime(
+                crate::ContinuousBatchEngine::new_plan_runtime_with_journal_scopes(
                     config,
                     cb_scheduler,
                     tokenizer,
                     sampler,
                     Arc::clone(&executor),
                     tensor_factory,
+                    journal_scopes,
                 )?
             }
             ferrum_execution::model_executor::ExecutionResourceAuthority::LegacyEngine => {
                 let kv_cache = kv_cache.ok_or_else(|| {
                     FerrumError::internal("legacy-engine composition lost its KV-cache manager")
                 })?;
-                crate::ContinuousBatchEngine::new_with_recurrent_state_manager(
+                crate::ContinuousBatchEngine::new_with_recurrent_state_manager_and_journal_scopes(
                     config,
                     cb_scheduler,
                     tokenizer,
@@ -414,6 +425,7 @@ impl EngineBuilder {
                     Arc::clone(&executor),
                     tensor_factory,
                     recurrent_state_manager,
+                    journal_scopes,
                 )?
             }
         };

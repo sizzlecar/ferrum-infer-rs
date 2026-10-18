@@ -1,3 +1,6 @@
+mod journal_session;
+pub use journal_session::{ProductEngineLifetime, ProductJournalSession};
+
 use chrono::{Duration, Utc};
 use clap::ValueEnum;
 use ferrum_types::{
@@ -292,6 +295,7 @@ pub fn write_synthetic_product_observability(
 }
 
 pub fn write_actual_run_observability(
+    journals: &ProductJournalSession,
     config: &ProductObservabilityConfig,
     observation: &ActualRunObservation<'_>,
 ) -> Result<Vec<PathBuf>> {
@@ -313,10 +317,11 @@ pub fn write_actual_run_observability(
     }
     let replay_command = replay_command(config);
     let events = actual_run_events(config, observation, &replay_command);
-    write_actual_run_artifacts(config, &events, observation, &replay_command)
+    write_actual_run_artifacts(journals, config, &events, observation, &replay_command)
 }
 
 pub fn write_actual_run_failure_observability(
+    journals: &ProductJournalSession,
     config: &ProductObservabilityConfig,
     observation: &ActualRunFailureObservation,
 ) -> Result<Vec<PathBuf>> {
@@ -329,10 +334,11 @@ pub fn write_actual_run_failure_observability(
     }
     let replay_command = replay_command(config);
     let events = actual_run_failure_events(config, observation, &replay_command);
-    write_actual_run_failure_artifacts(config, &events, observation, &replay_command)
+    write_actual_run_failure_artifacts(journals, config, &events, observation, &replay_command)
 }
 
 pub fn write_actual_serve_startup_observability(
+    journals: &ProductJournalSession,
     config: &ProductObservabilityConfig,
     startup_duration_us: u64,
     startup_memory: Option<crate::memory_profile::ProcessMemoryObservation>,
@@ -355,10 +361,11 @@ pub fn write_actual_serve_startup_observability(
         &memory_stages,
         &replay_command,
     );
-    write_actual_artifacts(config, &events, &request_id, &replay_command)
+    write_actual_artifacts(journals, config, &events, &request_id, &replay_command)
 }
 
 pub fn append_actual_serve_memory_stage_observability(
+    journals: &ProductJournalSession,
     config: &ProductObservabilityConfig,
     stage: ActualMemoryStageObservation,
 ) -> Result<Vec<PathBuf>> {
@@ -371,17 +378,11 @@ pub fn append_actual_serve_memory_stage_observability(
     }
     let request_id = format!("serve-memory-{}", Uuid::new_v4().simple());
     let events = actual_memory_stage_events(config, &request_id, &[stage], Utc::now());
-    write_profile_outputs(
-        config,
-        &events,
-        ferrum_bench_core::JsonlJournalOpenMode::Append,
-        true,
-        true,
-        false,
-    )
+    journals.write(&events, true, true, false)
 }
 
 fn write_actual_run_artifacts(
+    journals: &ProductJournalSession,
     config: &ProductObservabilityConfig,
     events: &[FerrumProfileEvent],
     observation: &ActualRunObservation<'_>,
@@ -390,6 +391,7 @@ fn write_actual_run_artifacts(
     // Successful actual inference must prove its scheduler lifecycle at the engine boundary.
     // Adding a product fallback here would duplicate real events or hide missing engine evidence.
     let mut written = write_actual_artifacts_with_scheduler(
+        journals,
         config,
         events,
         &observation.request_id,
@@ -424,13 +426,19 @@ fn write_actual_run_artifacts(
 }
 
 fn write_actual_run_failure_artifacts(
+    journals: &ProductJournalSession,
     config: &ProductObservabilityConfig,
     events: &[FerrumProfileEvent],
     observation: &ActualRunFailureObservation,
     replay_command: &str,
 ) -> Result<Vec<PathBuf>> {
-    let mut written =
-        write_actual_artifacts(config, events, &observation.request_id, replay_command)?;
+    let mut written = write_actual_artifacts(
+        journals,
+        config,
+        events,
+        &observation.request_id,
+        replay_command,
+    )?;
     if let Some(dir) = &config.request_dump_dir {
         written.extend(write_replay_bundle(
             dir,
@@ -459,29 +467,31 @@ fn write_actual_run_failure_artifacts(
 }
 
 fn write_actual_artifacts(
+    journals: &ProductJournalSession,
     config: &ProductObservabilityConfig,
     events: &[FerrumProfileEvent],
     request_id: &str,
     replay_command: &str,
 ) -> Result<Vec<PathBuf>> {
-    write_actual_artifacts_with_scheduler(config, events, request_id, replay_command, true)
+    write_actual_artifacts_with_scheduler(
+        journals,
+        config,
+        events,
+        request_id,
+        replay_command,
+        true,
+    )
 }
 
 fn write_actual_artifacts_with_scheduler(
+    journals: &ProductJournalSession,
     config: &ProductObservabilityConfig,
     events: &[FerrumProfileEvent],
     request_id: &str,
     replay_command: &str,
     include_scheduler: bool,
 ) -> Result<Vec<PathBuf>> {
-    let mut written = write_profile_outputs(
-        config,
-        events,
-        ferrum_bench_core::JsonlJournalOpenMode::Append,
-        true,
-        true,
-        include_scheduler,
-    )?;
+    let mut written = journals.write(events, true, true, include_scheduler)?;
     if let Some(dir) = &config.request_dump_dir {
         fs_create_dir_all(dir)?;
         written.extend(write_replay_bundle(
@@ -1977,16 +1987,6 @@ fn write_profile_jsonl(path: &Path, events: &[FerrumProfileEvent]) -> Result<()>
     )
 }
 
-#[cfg(test)]
-fn append_profile_jsonl(path: &Path, events: &[FerrumProfileEvent]) -> Result<()> {
-    write_profile_events(
-        path,
-        ferrum_bench_core::JsonlJournalOpenMode::Append,
-        events,
-        Default::default(),
-    )
-}
-
 fn write_profile_events(
     path: &Path,
     mode: ferrum_bench_core::JsonlJournalOpenMode,
@@ -2154,12 +2154,19 @@ mod tests {
                 None,
                 default_profile_sample_rate(),
             );
-            assert!(
-                write_actual_serve_startup_observability(&config, 1, None, Vec::new())
-                    .unwrap()
-                    .is_empty()
-            );
+            let journals =
+                ProductJournalSession::prepare(&config, &ferrum_types::EngineConfig::default());
+            assert!(write_actual_serve_startup_observability(
+                &journals,
+                &config,
+                1,
+                None,
+                Vec::new()
+            )
+            .unwrap()
+            .is_empty());
             assert!(append_actual_serve_memory_stage_observability(
+                &journals,
                 &config,
                 ActualMemoryStageObservation::new("shutdown", "shutdown", None, None),
             )
@@ -2178,14 +2185,21 @@ mod tests {
                 memory: None,
                 memory_stages: Vec::new(),
             };
-            assert!(write_actual_run_failure_observability(&config, &failure)
-                .unwrap()
-                .is_empty());
-            config.core.profile_sample_rate = f64::NAN;
-            assert!(write_actual_run_failure_observability(&config, &failure).is_err());
             assert!(
-                write_actual_serve_startup_observability(&config, 1, None, Vec::new()).is_err()
+                write_actual_run_failure_observability(&journals, &config, &failure)
+                    .unwrap()
+                    .is_empty()
             );
+            config.core.profile_sample_rate = f64::NAN;
+            assert!(write_actual_run_failure_observability(&journals, &config, &failure).is_err());
+            assert!(write_actual_serve_startup_observability(
+                &journals,
+                &config,
+                1,
+                None,
+                Vec::new()
+            )
+            .is_err());
         }
     }
 
@@ -2325,6 +2339,8 @@ mod tests {
             Some(&root.join("request_dump")),
             1.0,
         );
+        let journals =
+            ProductJournalSession::prepare(&config, &ferrum_types::EngineConfig::default());
         let memory = crate::memory_profile::ProcessMemoryObservation {
             before_bytes: 100,
             after_bytes: 200,
@@ -2333,6 +2349,7 @@ mod tests {
             source: "test",
         };
         write_actual_serve_startup_observability(
+            &journals,
             &config,
             42,
             Some(memory.clone()),
@@ -2352,7 +2369,9 @@ mod tests {
             ],
         )
         .unwrap();
+        journals.flush().unwrap();
         append_actual_serve_memory_stage_observability(
+            &journals,
             &config,
             ActualMemoryStageObservation::new(
                 "actual_serve_shutdown",
@@ -2362,6 +2381,7 @@ mod tests {
             ),
         )
         .unwrap();
+        journals.flush().unwrap();
         let profile = fs::read_to_string(root.join("profile.jsonl")).unwrap();
         assert!(profile.contains("\"phase\":\"actual_serve_startup\""));
         assert!(profile.contains("\"phase\":\"actual_serve_shutdown\""));
@@ -2401,9 +2421,16 @@ mod tests {
             1.0,
         );
 
+        let mut original_owner = ferrum_bench_core::JsonlJournalOwner::open(
+            &path,
+            ferrum_bench_core::JsonlJournalOpenMode::Append,
+            config.journal.into(),
+        )
+        .unwrap();
         let mut handles = Vec::new();
         for writer in 0..8 {
-            let path = path.clone();
+            let mut scope = original_owner.producer_scope().unwrap();
+            let producer = scope.producer::<FerrumProfileEvent>();
             let config = config.clone();
             handles.push(std::thread::spawn(move || {
                 for seq in 0..32 {
@@ -2420,8 +2447,14 @@ mod tests {
                     event.duration_us = Some(1);
                     event.attributes.insert("writer".to_string(), json!(writer));
                     event.attributes.insert("seq".to_string(), json!(seq));
-                    append_profile_jsonl(&path, &[event]).unwrap();
+                    // Concurrent tool producers share one explicitly supplied
+                    // scope each and one original ordered worker.
+                    ferrum_bench_core::write_jsonl_records_to(&producer, &[event])
+                        .unwrap()
+                        .result()
+                        .unwrap();
                 }
+                scope.finish().result().unwrap();
             }));
         }
 
@@ -2429,6 +2462,7 @@ mod tests {
             handle.join().unwrap();
         }
 
+        original_owner.close().unwrap().result().unwrap();
         let profile = fs::read_to_string(&path).unwrap();
         let mut parsed = 0usize;
         for line in profile.lines().filter(|line| !line.trim().is_empty()) {
@@ -2455,6 +2489,8 @@ mod tests {
             Some(&root.join("request_dump")),
             1.0,
         );
+        let journals =
+            ProductJournalSession::prepare(&config, &ferrum_types::EngineConfig::default());
         let memory = crate::memory_profile::ProcessMemoryObservation {
             before_bytes: 100,
             after_bytes: 200,
@@ -2463,6 +2499,7 @@ mod tests {
             source: "test",
         };
         write_actual_serve_startup_observability(
+            &journals,
             &config,
             42,
             Some(memory.clone()),
@@ -2496,6 +2533,7 @@ mod tests {
             ],
         )
         .unwrap();
+        journals.flush().unwrap();
         let memory_profile = fs::read_to_string(root.join("memory.jsonl")).unwrap();
         let memory_stages = memory_profile
             .lines()
@@ -2536,8 +2574,11 @@ mod tests {
             Some(&root.join("request_dump")),
             1.0,
         );
+        let journals =
+            ProductJournalSession::prepare(&config, &ferrum_types::EngineConfig::default());
         let request_id = "req-failure-test".to_string();
         write_actual_run_failure_observability(
+            &journals,
             &config,
             &ActualRunFailureObservation {
                 request_id: request_id.clone(),
@@ -2554,6 +2595,7 @@ mod tests {
             },
         )
         .unwrap();
+        journals.flush().unwrap();
         let profile = fs::read_to_string(root.join("profile.jsonl")).unwrap();
         let failure = profile
             .lines()
@@ -2600,6 +2642,8 @@ mod tests {
             Some(&root.join("request_dump")),
             1.0,
         );
+        let journals =
+            ProductJournalSession::prepare(&config, &ferrum_types::EngineConfig::default());
         let request_id = "req-run-test".to_string();
         let native_event = actual_base_event(
             &config,
@@ -2610,6 +2654,7 @@ mod tests {
         );
         write_profile_jsonl(&root.join("profile.jsonl"), &[native_event]).unwrap();
         write_actual_run_observability(
+            &journals,
             &config,
             &ActualRunObservation {
                 request_id: request_id.clone(),
@@ -2676,6 +2721,7 @@ mod tests {
             },
         )
         .unwrap();
+        journals.flush().unwrap();
         let bundle_dir = root.join("request_dump").join(&request_id);
         let prompt_tokens: serde_json::Value = serde_json::from_str(
             &fs::read_to_string(bundle_dir.join("prompt_token_ids.json")).unwrap(),
@@ -2791,8 +2837,11 @@ mod tests {
             Some(&root.join("request_dump")),
             1.0,
         );
+        let journals =
+            ProductJournalSession::prepare(&config, &ferrum_types::EngineConfig::default());
         let request_id = "req-resource-failure-test".to_string();
         write_actual_run_failure_observability(
+            &journals,
             &config,
             &ActualRunFailureObservation {
                 request_id: request_id.clone(),
@@ -2815,6 +2864,7 @@ mod tests {
             },
         )
         .unwrap();
+        journals.flush().unwrap();
         let bundle_dir = root.join("request_dump").join(&request_id);
         let scan: serde_json::Value = serde_json::from_str(
             &fs::read_to_string(bundle_dir.join("bad_output_scan.json")).unwrap(),

@@ -1238,13 +1238,23 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
         .or_else(|| crate::runtime_env::runtime_snapshot_value(&runtime_config, "FERRUM_KV_DTYPE"));
     apply_kv_dtype_override(&mut engine_config, effective_kv_dtype)?;
     let numerical_execution = engine_config.numerical_execution.clone();
-    let engine_result = match (defined_model, model_sources.clone()) {
-        (Some(prepared), _) => {
-            ferrum_engine::create_defined_product_engine(engine_config, prepared).await
-        }
-        (None, Some(sources)) => ferrum_engine::create_product_engine(engine_config, sources).await,
-        (None, None) => ferrum_engine::create_default_engine(engine_config).await,
-    };
+    let journals = crate::observability_product::ProductJournalSession::prepare(
+        &product_observability,
+        &engine_config,
+    );
+    let engine_result = async {
+        journals.result()?;
+        let scopes = journals.engine_scopes(&engine_config)?;
+        let mut builder =
+            ferrum_engine::EngineBuilder::new(engine_config).with_journal_scopes(scopes);
+        builder = match (defined_model, model_sources.clone()) {
+            (Some(prepared), _) => builder.with_defined_model(prepared),
+            (None, Some(sources)) => builder.with_model_sources(sources),
+            (None, None) => builder,
+        };
+        builder.build().await
+    }
+    .await;
     let engine = match engine_result {
         Ok(engine) => engine,
         Err(error) => {
@@ -1256,9 +1266,14 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
                 cmd.decision_trace_jsonl.as_deref(),
                 &error,
             );
+            if let Err(cleanup) = journals.finish().await {
+                tracing::warn!(%cleanup, "failed startup journal cleanup");
+            }
             return Err(error);
         }
     };
+    let engine = crate::observability_product::ProductEngineLifetime::new(engine, journals.clone());
+    let execution_result: Result<()> = async {
     crate::startup::apply_engine_plan(&mut startup_auto_config, engine.config());
     crate::commands::serve::write_startup_config_artifacts(
         &startup_auto_config,
@@ -1440,6 +1455,7 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
                 let elapsed = start.elapsed().as_secs_f64();
                 if let Err(observability_err) =
                     crate::observability_product::write_actual_run_failure_observability(
+                        &journals,
                         &product_observability,
                         &crate::observability_product::ActualRunFailureObservation {
                             request_id: profile_request_id,
@@ -1565,7 +1581,8 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
                 .or_else(|| process_start_sample.clone()),
             shutdown_after,
         );
-        crate::observability_product::write_actual_run_observability(
+        let observation_result = crate::observability_product::write_actual_run_observability(
+            &journals,
             &product_observability,
             &crate::observability_product::ActualRunObservation {
                 request_id: profile_request_id,
@@ -1592,10 +1609,12 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
                     cache_allocated_memory.clone(),
                     cache_allocated_status.clone(),
                     shutdown_memory,
-                ),
+                ).into_iter().filter(|stage| stage.stage != "shutdown" || shutdown_result.is_ok()).collect(),
             },
-        )?;
+        );
+        if let Err(error) = &observation_result { tracing::warn!(%error, "final run observation incomplete"); }
         shutdown_result?;
+        observation_result?;
         if format == OutputFormat::Jsonl {
             emit_jsonl_exit(&run_session_id, 0, "one_shot_complete");
         }
@@ -1816,6 +1835,7 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
                         if product_memory_enabled {
                             if let Err(observability_error) =
                                 crate::observability_product::write_actual_run_failure_observability(
+                                    &journals,
                                     &product_observability,
                                     &crate::observability_product::ActualRunFailureObservation {
                                         request_id: request_id_text,
@@ -1938,6 +1958,7 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
 
                 if product_memory_enabled {
                     crate::observability_product::write_actual_run_observability(
+                        &journals,
                         &product_observability,
                         &crate::observability_product::ActualRunObservation {
                             request_id: request_id_text.clone(),
@@ -2001,6 +2022,9 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
     }
     engine.shutdown().await?;
     Ok(())
+    }.await;
+    let cleanup_result = engine.finish().await;
+    execution_result.and(cleanup_result)
 }
 
 fn process_memory_observation_between(

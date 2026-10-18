@@ -74,7 +74,7 @@ pub use ferrum_types::{
 pub use ferrum_scheduler::BatchPlan;
 
 // Re-exports of engine implementation
-pub use continuous_engine::{ContinuousBatchEngine, SequenceState};
+pub use continuous_engine::{ContinuousBatchEngine, EngineJournalScopes, SequenceState};
 
 pub use recurrent_state::{
     InMemoryRecurrentStateConfig, InMemoryRecurrentStateHandle, InMemoryRecurrentStateManager,

@@ -10,7 +10,7 @@ fn path(label: &str) -> PathBuf {
 }
 
 fn typed_open_error<T: Serialize + Send + 'static>(
-    result: io::Result<JsonlJournal<T>>,
+    result: io::Result<OwnedJsonlJournal<T>>,
 ) -> JsonlJournalError {
     let error = match result {
         Ok(_) => panic!("expected a typed journal open error"),
@@ -48,10 +48,10 @@ fn declared_journal_budget_flushes_large_batch_and_rejects_budget_minus_one_atom
     };
     declared.validate().unwrap();
     let output = path("large");
-    let journal =
-        JsonlJournal::open(&output, JsonlJournalOpenMode::Truncate, declared.into()).unwrap();
+    let mut journal =
+        OwnedJsonlJournal::open(&output, JsonlJournalOpenMode::Truncate, declared.into()).unwrap();
     journal.try_enqueue_batch(rows.clone()).unwrap();
-    journal.close().unwrap();
+    journal.close().unwrap().result().unwrap();
     assert_eq!(std::fs::read(&output).unwrap(), expected);
     let stats = journal.delivery_stats();
     assert_eq!(
@@ -77,13 +77,14 @@ fn declared_journal_budget_flushes_large_batch_and_rejects_budget_minus_one_atom
         },
     ] {
         let output = path("rejected");
-        let journal =
-            JsonlJournal::open(&output, JsonlJournalOpenMode::Truncate, limited.into()).unwrap();
+        let mut journal =
+            OwnedJsonlJournal::open(&output, JsonlJournalOpenMode::Truncate, limited.into())
+                .unwrap();
         assert_eq!(
             journal.try_enqueue_batch(rows.clone()).unwrap_err().kind(),
             JsonlJournalErrorKind::Limit
         );
-        journal.close().unwrap();
+        journal.close().unwrap().result().unwrap();
         assert!(std::fs::read(&output).unwrap().is_empty());
         let stats = journal.delivery_stats();
         assert_eq!(
@@ -132,7 +133,7 @@ fn declared_journal_budget_flushes_large_batch_and_rejects_budget_minus_one_atom
 }
 
 #[test]
-fn explicit_journal_budget_conflict_rejects_but_implicit_attach_uses_original_writer() {
+fn explicit_journal_budget_conflict_rejects_and_owner_scopes_use_original_writer() {
     let output = path("shared");
     let alias = output
         .parent()
@@ -144,22 +145,33 @@ fn explicit_journal_budget_conflict_rejects_but_implicit_attach_uses_original_wr
         max_batch_records: 2048,
         ..Default::default()
     };
-    let original =
-        JsonlJournal::<serde_json::Value>::open(&output, JsonlJournalOpenMode::Truncate, declared)
-            .unwrap();
-    let same =
-        JsonlJournal::<serde_json::Value>::open(&alias, JsonlJournalOpenMode::Append, declared)
-            .unwrap();
-    let implicit = JsonlJournal::<serde_json::Value>::append(&alias).unwrap();
-    assert!(Arc::ptr_eq(&original.inner, &same.inner));
-    assert!(Arc::ptr_eq(&original.inner, &implicit.inner));
+    let mut original = OwnedJsonlJournal::<serde_json::Value>::open(
+        &output,
+        JsonlJournalOpenMode::Truncate,
+        declared,
+    )
+    .unwrap();
+    assert_eq!(
+        typed_open_error(OwnedJsonlJournal::<serde_json::Value>::open(
+            &alias,
+            JsonlJournalOpenMode::Append,
+            declared
+        ))
+        .kind(),
+        JsonlJournalErrorKind::Config
+    );
+    let mut sibling = original.owner.producer_scope().unwrap();
+    let same = sibling.producer::<serde_json::Value>();
+    let implicit = original.scope.producer::<serde_json::Value>();
+    assert!(Arc::ptr_eq(&original.producer.inner, &same.inner));
+    assert!(Arc::ptr_eq(&original.producer.inner, &implicit.inner));
     assert_eq!(implicit.config(), declared);
     let mismatch = JsonlJournalConfig {
         max_batch_records: 2049,
         ..declared
     };
     assert_eq!(
-        typed_open_error(JsonlJournal::<serde_json::Value>::open(
+        typed_open_error(OwnedJsonlJournal::<serde_json::Value>::open(
             &alias,
             JsonlJournalOpenMode::Append,
             mismatch
@@ -172,7 +184,7 @@ fn explicit_journal_budget_conflict_rejects_but_implicit_attach_uses_original_wr
         ..declared
     };
     assert_eq!(
-        typed_open_error(JsonlJournal::<serde_json::Value>::open(
+        typed_open_error(OwnedJsonlJournal::<serde_json::Value>::open(
             &alias,
             JsonlJournalOpenMode::Append,
             invalid
@@ -183,13 +195,12 @@ fn explicit_journal_budget_conflict_rejects_but_implicit_attach_uses_original_wr
     original
         .try_enqueue(serde_json::json!({"original": true}))
         .unwrap();
-    write_jsonl_records(
-        &alias,
-        JsonlJournalOpenMode::Append,
-        &[serde_json::json!({"implicit": true})],
-    )
-    .unwrap();
-    original.close().unwrap();
+    write_jsonl_records_to(&implicit, &[serde_json::json!({"implicit": true})])
+        .unwrap()
+        .result()
+        .unwrap();
+    sibling.finish().result().unwrap();
+    original.close().unwrap().result().unwrap();
     let rows: Vec<serde_json::Value> = std::fs::read_to_string(&output)
         .unwrap()
         .lines()
@@ -208,32 +219,33 @@ fn explicit_journal_budget_conflict_rejects_but_implicit_attach_uses_original_wr
 }
 
 #[test]
-fn live_failed_writer_budget_conflict_stays_contract_and_matching_attach_keeps_io_cause() {
+fn live_failed_writer_keeps_io_cause_and_independent_owners_are_contract_conflicts() {
     let output = path("io-conflict");
     drop(File::create(&output).unwrap());
     let config = JsonlJournalConfig {
         queue_capacity: 2,
         ..Default::default()
     };
-    let original = super::delivery_tests::readonly_journal::<serde_json::Value>(&output, config);
+    let mut original =
+        super::delivery_tests::readonly_journal::<serde_json::Value>(&output, config);
     // Register this actual read-only File writer through the same canonical
     // lookup used by production. Its error is produced by the real flush.
     let canonical = normalize_jsonl_path(&output).unwrap();
     lock_journal_registry(JSONL_JOURNAL_REGISTRY.get_or_init(|| Mutex::new(HashMap::new())))
         .unwrap()
-        .insert(canonical, Arc::downgrade(&original.inner));
+        .insert(canonical, Arc::downgrade(&original.producer.inner));
     original
         .try_enqueue(serde_json::json!({"io": "failure"}))
         .unwrap();
-    let failure = original.flush().unwrap_err();
+    let failure = original.flush().result().unwrap_err();
     assert_eq!(failure.kind(), JsonlJournalErrorKind::Worker);
-    assert!(!original.inner.closed.load(Ordering::Acquire));
+    assert!(!original.producer.inner.closed.load(Ordering::Acquire));
     let other = JsonlJournalConfig {
         queue_capacity: 3,
         ..config
     };
     assert_eq!(
-        typed_open_error(JsonlJournal::<serde_json::Value>::open(
+        typed_open_error(OwnedJsonlJournal::<serde_json::Value>::open(
             &output,
             JsonlJournalOpenMode::Append,
             other
@@ -242,18 +254,20 @@ fn live_failed_writer_budget_conflict_stays_contract_and_matching_attach_keeps_i
         JsonlJournalErrorKind::Config
     );
     assert_eq!(
-        typed_open_error(JsonlJournal::<serde_json::Value>::open(
+        typed_open_error(OwnedJsonlJournal::<serde_json::Value>::open(
             &output,
             JsonlJournalOpenMode::Append,
             config
-        )),
-        failure
+        ))
+        .kind(),
+        JsonlJournalErrorKind::Config
     );
     assert_eq!(
-        typed_open_error(JsonlJournal::<serde_json::Value>::append(&output)),
-        failure
+        typed_open_error(OwnedJsonlJournal::<serde_json::Value>::append(&output)).kind(),
+        JsonlJournalErrorKind::Config
     );
-    assert_eq!(original.close().unwrap_err(), failure);
+    assert_eq!(original.flush().result().unwrap_err(), failure);
+    assert_eq!(original.close().unwrap().result().unwrap_err(), failure);
     assert!(original.delivery_stats().worker_finished);
     assert_eq!(original.delivery_stats().pending_payload_bytes, 0);
     drop(original);
@@ -272,34 +286,37 @@ impl Serialize for InvalidRecord {
 #[test]
 fn closed_failed_journal_append_preserves_cause_until_explicit_new_epoch() {
     let output = path("failed-append");
-    let original = JsonlJournal::<InvalidRecord>::create(&output).unwrap();
+    let mut original = OwnedJsonlJournal::<InvalidRecord>::create(&output).unwrap();
     original.enqueue(InvalidRecord).unwrap();
-    let failure = original.close().unwrap_err();
+    let failure = original.close().unwrap().result().unwrap_err();
     assert_eq!(failure.kind(), JsonlJournalErrorKind::Encoding);
     assert_eq!(
-        typed_open_error(JsonlJournal::<serde_json::Value>::append(&output)),
+        typed_open_error(OwnedJsonlJournal::<serde_json::Value>::append(&output)),
         failure
     );
     assert_eq!(
-        typed_open_error(JsonlJournal::<serde_json::Value>::open(
+        typed_open_error(OwnedJsonlJournal::<serde_json::Value>::open(
             &output,
             JsonlJournalOpenMode::Append,
             Default::default()
         )),
         failure
     );
-    let fresh = JsonlJournal::<serde_json::Value>::open(
+    let mut fresh = OwnedJsonlJournal::<serde_json::Value>::open(
         &output,
         JsonlJournalOpenMode::Truncate,
         Default::default(),
     )
     .unwrap();
-    assert!(!Arc::ptr_eq(&original.inner, &fresh.inner));
+    assert!(!Arc::ptr_eq(
+        &original.producer.inner,
+        &fresh.producer.inner
+    ));
     fresh
         .try_enqueue(serde_json::json!({"new_epoch": true}))
         .unwrap();
-    fresh.close().unwrap();
-    assert_eq!(original.close().unwrap_err(), failure);
+    fresh.close().unwrap().result().unwrap();
+    assert_eq!(original.close().unwrap().result().unwrap_err(), failure);
     assert_eq!(
         std::fs::read_to_string(&output).unwrap(),
         "{\"new_epoch\":true}\n"
@@ -308,11 +325,11 @@ fn closed_failed_journal_append_preserves_cause_until_explicit_new_epoch() {
     // Without a live failure owner, file contents do not establish a journal
     // failure: tools may append after unrelated external records.
     std::fs::write(&output, "external history\n").unwrap();
-    let unknown = JsonlJournal::<serde_json::Value>::append(&output).unwrap();
+    let mut unknown = OwnedJsonlJournal::<serde_json::Value>::append(&output).unwrap();
     unknown
         .try_enqueue(serde_json::json!({"appended": true}))
         .unwrap();
-    unknown.close().unwrap();
+    unknown.close().unwrap().result().unwrap();
     assert_eq!(
         std::fs::read_to_string(&output).unwrap(),
         "external history\n{\"appended\":true}\n"

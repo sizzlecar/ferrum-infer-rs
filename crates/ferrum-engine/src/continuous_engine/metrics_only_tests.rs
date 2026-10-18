@@ -23,9 +23,10 @@ fn basic_metrics_only_attaches_to_target_without_journals() {
                 EngineResourceComposition::PlanRuntime,
                 target.clone(),
                 Arc::new(MockTensorFactory),
+                None,
             )
             .unwrap();
-            assert!(engine.inner.profile_trace_jsonl.is_none());
+            assert!(engine.inner.profile_trace_journal().is_none());
             assert!(engine.inner.scheduler_trace_jsonl.is_none());
             let attached = target.event_sink.lock().unwrap();
             if detail == ObservabilityProfileDetail::Off {
@@ -68,7 +69,7 @@ fn basic_with_artifact_keeps_event_sink_and_completion_timing() {
         assert_eq!(sink.device_timing_mode(), DeviceTimingMode::Completion);
         assert!(sink.records_execution_resource_maintenance());
     }
-    assert!(engine.inner.profile_trace_jsonl.is_some());
+    assert!(engine.inner.profile_trace_journal().is_some());
     drop(engine);
     drop(target);
     let _ = std::fs::remove_file(path);

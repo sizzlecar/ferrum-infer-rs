@@ -1,5 +1,10 @@
 //! Serve command - Start the HTTP inference server
 
+mod lifecycle;
+#[cfg(test)]
+#[path = "serve/lifecycle_tests.rs"]
+mod lifecycle_tests;
+
 use crate::config::CliConfig;
 use crate::runtime_env::runtime_snapshot_value;
 use clap::Args;
@@ -421,6 +426,32 @@ async fn execute_with_compatibility(
     configured_interleaved_system_coalescing: bool,
     prefix_rendezvous_max_wait_ms: Option<std::num::NonZeroU64>,
 ) -> Result<()> {
+    let mut observer = lifecycle::ServeTaskObserver::spawn(move |cancellation, report| {
+        run_serve_lifecycle(
+            cmd,
+            config,
+            enable_interleaved_system_coalescing,
+            disable_interleaved_system_coalescing,
+            configured_interleaved_system_coalescing,
+            prefix_rendezvous_max_wait_ms,
+            cancellation,
+            report,
+        )
+    });
+    observer.result().await
+}
+
+async fn run_serve_lifecycle(
+    cmd: ServeCommand,
+    config: CliConfig,
+    enable_interleaved_system_coalescing: bool,
+    disable_interleaved_system_coalescing: bool,
+    configured_interleaved_system_coalescing: bool,
+    prefix_rendezvous_max_wait_ms: Option<std::num::NonZeroU64>,
+    mut cancellation: tokio::sync::oneshot::Receiver<()>,
+    early_result: tokio::sync::oneshot::Sender<Result<()>>,
+) -> Result<()> {
+    let mut early_result = Some(early_result);
     config.profile_journal.validate()?;
     let user_environment = crate::runtime_env::capture_supported_runtime_environment()?;
     let ServeCommand {
@@ -1012,6 +1043,8 @@ async fn execute_with_compatibility(
     let numerical_execution = product_engine_config.numerical_execution.clone();
     let mut resolved_execution_metrics = None;
     let mut cache_allocated_status = None;
+    let mut product_journals = None;
+    let mut engine_lifetime = None;
     let server_result: Result<_> = async {
         println!(
             "{}",
@@ -1038,21 +1071,29 @@ async fn execute_with_compatibility(
             &mut engine_config.backend.backend_options,
         )?;
         super::run::apply_kv_dtype_override(&mut engine_config, effective_kv_dtype)?;
-        let engine: Arc<dyn ferrum_engine::LlmInferenceEngine + Send + Sync> =
-            Arc::from(match (defined_model, model_sources) {
-                (Some(prepared), _) => {
-                    ferrum_engine::create_defined_product_engine(engine_config, prepared).await?
-                }
-                (None, Some(sources)) => {
-                    ferrum_engine::create_product_engine(engine_config, sources).await?
-                }
-                (None, None) => ferrum_engine::create_default_engine(engine_config).await?,
-            });
+        select_serve_profile_destination(&mut engine_config, &product_observability);
+        let journals = crate::observability_product::ProductJournalSession::prepare(
+            &product_observability,
+            &engine_config,
+        );
+        product_journals = Some(journals.clone());
+        journals.result()?;
+        let scopes = journals.engine_scopes(&engine_config)?;
+        let mut builder =
+            ferrum_engine::EngineBuilder::new(engine_config).with_journal_scopes(scopes);
+        builder = match (defined_model, model_sources) {
+            (Some(prepared), _) => builder.with_defined_model(prepared),
+            (None, Some(sources)) => builder.with_model_sources(sources),
+            (None, None) => builder,
+        };
+        let lifetime = crate::observability_product::ProductEngineLifetime::new(
+            builder.build().await?,
+            journals,
+        );
+        let engine = lifetime.engine();
+        engine_lifetime = Some(lifetime);
         if served_model_registry.adapter_count() > 0 {
             if let Err(error) = engine.adapter_execution_support().require_lora() {
-                if let Err(shutdown_error) = engine.shutdown().await {
-                    tracing::warn!(%shutdown_error, "engine cleanup after unsupported LoRA startup failed");
-                }
                 return Err(error);
             }
         }
@@ -1075,9 +1116,22 @@ async fn execute_with_compatibility(
                 decision_trace_jsonl.as_deref(),
                 &error,
             );
+            if let Some(lifetime) = &engine_lifetime {
+                if let Err(cleanup) = lifetime.finish().await {
+                    tracing::warn!(%cleanup, "serve startup cleanup incomplete");
+                }
+            } else if let Some(journals) = &product_journals {
+                if let Err(cleanup) = journals.finish().await {
+                    tracing::warn!(%cleanup, "serve startup journals incomplete");
+                }
+            }
             return Err(error);
         }
     };
+    let journals = product_journals
+        .as_ref()
+        .ok_or_else(|| FerrumError::internal("serve journals missing after engine assembly"))?;
+    let execution_result: Result<()> = async {
     write_startup_config_artifacts(
         &startup_auto_config,
         product_source_identity.as_ref(),
@@ -1144,6 +1198,7 @@ async fn execute_with_compatibility(
     );
     let server = server.with_served_model_registry(served_model_registry);
     crate::observability_product::write_actual_serve_startup_observability(
+        journals,
         &product_observability,
         model_loaded_duration_us,
         model_loaded_memory.clone(),
@@ -1197,7 +1252,7 @@ async fn execute_with_compatibility(
     std::fs::write(&pid_file, std::process::id().to_string()).ok();
 
     // Keep the server future alive while stop requests graceful HTTP drain.
-    let server = Arc::new(server);
+    let server = Arc::new(server.with_journal_scopes(journals.http_scopes(&server_config)?));
     let mut server_task = {
         let server = Arc::clone(&server);
         let server_config = server_config.clone();
@@ -1215,22 +1270,30 @@ async fn execute_with_compatibility(
             let stop_result = server.stop(shutdown_timeout).await;
             start_result.and(stop_result)
         }
-        _ = serve_shutdown_signal() => {
+        _ = async { tokio::select! { _ = serve_shutdown_signal() => {}, _ = &mut cancellation => {} } } => {
             println!();
             println!("{}", "Shutting down...".yellow());
             let stop_result = server.stop(shutdown_timeout).await;
+            if server.is_running() {
+                if let Some(report) = early_result.take() {
+                    let _ = report.send(Err(stop_result.as_ref().err().cloned().unwrap_or_else(|| FerrumError::internal("HTTP shutdown is still pending"))));
+                }
+            }
             let start_result = match tokio::time::timeout(shutdown_timeout, &mut server_task).await {
                 Ok(Ok(result)) => result,
                 Ok(Err(error)) => Err(FerrumError::internal(format!(
                     "serve task failed during shutdown: {error}"
                 ))),
                 Err(_) => {
-                    server_task.abort();
-                    let _ = server_task.await;
-                    Err(FerrumError::internal(format!(
-                        "serve task did not stop within {} ms",
-                        shutdown_timeout.as_millis()
-                    )))
+                    // Keep observing the same task and original owners. A timeout
+                    // is not evidence that HTTP producers have stopped.
+                    tracing::warn!("serve drain exceeded timeout; retaining original shutdown custody");
+                    if let Some(report) = early_result.take() {
+                        let _ = report.send(Err(FerrumError::internal(format!("serve drain did not finish within {} ms", shutdown_timeout.as_millis()))));
+                    }
+                    let joined = (&mut server_task).await.map_err(|error| FerrumError::internal(format!("serve task failed: {error}")))?;
+                    let retry = server.stop(shutdown_timeout).await;
+                    joined.and(retry)
                 }
             };
             stop_result.and(start_result)
@@ -1255,7 +1318,9 @@ async fn execute_with_compatibility(
             .or_else(|| process_start_sample.clone()),
         shutdown_after,
     );
+    if serve_result.is_ok() {
     crate::observability_product::append_actual_serve_memory_stage_observability(
+        journals,
         &product_observability,
         crate::observability_product::ActualMemoryStageObservation::new(
             "actual_serve_shutdown",
@@ -1265,8 +1330,18 @@ async fn execute_with_compatibility(
         ),
     )?;
 
+    }
     serve_result?;
     Ok(())
+    }.await;
+    let cleanup_result = match &engine_lifetime {
+        Some(lifetime) => lifetime.finish().await,
+        None => journals.finish().await,
+    };
+    if let Err(error) = &cleanup_result {
+        tracing::warn!(%error, "serve final cleanup incomplete");
+    }
+    execution_result.and(cleanup_result)
 }
 
 async fn serve_shutdown_signal() {
@@ -2036,6 +2111,19 @@ struct ProfileSinkCliFields {
     model: Option<String>,
     concurrency: Option<u32>,
     runtime_flags_json: Option<String>,
+}
+
+// The public Off+profile mode selects the native backend profile protocol.
+// Do not also assign that same CLI destination to the typed Engine journal.
+// Other typed destinations (scheduler/legacy resource trace) remain intact and
+// the product assembly checks canonical collisions with the native path.
+fn select_serve_profile_destination(
+    engine: &mut ferrum_types::EngineConfig,
+    product: &crate::observability_product::ProductObservabilityConfig,
+) {
+    if product.profile_jsonl.is_some() && !product.unified_product_profile_enabled() {
+        engine.runtime.profile_jsonl = None;
+    }
 }
 
 fn configure_profile_sink(

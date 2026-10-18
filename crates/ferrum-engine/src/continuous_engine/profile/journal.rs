@@ -1,9 +1,11 @@
 use super::*;
-use ferrum_bench_core::jsonl_journal::{JsonlJournalDeliveryStats, JsonlJournalErrorKind};
+#[cfg(test)]
+use ferrum_bench_core::jsonl_journal::JsonlJournalDeliveryStats;
+use ferrum_bench_core::jsonl_journal::JsonlJournalErrorKind;
 use ferrum_runtime::ExecutionEventDeliveryPolicy;
 
 #[derive(Clone)]
-pub(super) struct SchedulerTraceRecord(Arc<FerrumProfileEvent>);
+pub(in crate::continuous_engine) struct SchedulerTraceRecord(Arc<FerrumProfileEvent>);
 
 impl serde::Serialize for SchedulerTraceRecord {
     fn serialize<S: serde::Serializer>(
@@ -23,19 +25,13 @@ pub(in crate::continuous_engine) struct SchedulerTraceJournal {
 }
 
 impl SchedulerTraceJournal {
-    pub(in crate::continuous_engine) fn create(
-        path: impl Into<PathBuf>,
-        config: ferrum_types::ObservabilityJournalConfig,
-    ) -> std::io::Result<Self> {
-        JsonlJournal::open(
-            path,
-            ferrum_bench_core::JsonlJournalOpenMode::Truncate,
-            config.into(),
-        )
-        .map(|inner| Self {
+    pub(in crate::continuous_engine) fn from_producer(
+        inner: JsonlJournal<SchedulerTraceRecord>,
+    ) -> Self {
+        Self {
             inner,
             warned: Arc::new(AtomicBool::new(false)),
-        })
+        }
     }
 
     pub(in crate::continuous_engine) fn enqueue(
@@ -96,17 +92,14 @@ impl SchedulerTraceJournal {
 
     #[cfg(test)]
     pub(in crate::continuous_engine) fn flush(&self) -> std::result::Result<(), JsonlJournalError> {
-        self.inner.flush()
-    }
-
-    pub(in crate::continuous_engine) fn close(&self) -> std::result::Result<(), JsonlJournalError> {
-        self.inner.close()
+        self.inner.flush().result()
     }
 
     pub(in crate::continuous_engine) fn path(&self) -> &Path {
         self.inner.path()
     }
 
+    #[cfg(test)]
     pub(in crate::continuous_engine) fn delivery_stats(&self) -> JsonlJournalDeliveryStats {
         self.inner.delivery_stats()
     }

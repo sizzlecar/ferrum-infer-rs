@@ -17,12 +17,12 @@ fn path(label: &str) -> PathBuf {
 }
 
 #[derive(Default)]
-struct BlockingGate {
+pub(super) struct BlockingGate {
     state: Mutex<(bool, bool)>,
     wake: Condvar,
 }
 impl BlockingGate {
-    fn block(&self) {
+    pub(super) fn block(&self) {
         let mut state = self.state.lock().unwrap();
         state.0 = true;
         self.wake.notify_all();
@@ -30,7 +30,7 @@ impl BlockingGate {
             state = self.wake.wait(state).unwrap();
         }
     }
-    fn wait(&self) {
+    pub(super) fn wait(&self) {
         let state = self.state.lock().unwrap();
         let (state, _) = self
             .wake
@@ -38,19 +38,19 @@ impl BlockingGate {
             .unwrap();
         assert!(state.0, "worker never reached the real serialization gate");
     }
-    fn release(&self) {
+    pub(super) fn release(&self) {
         self.state.lock().unwrap().1 = true;
         self.wake.notify_all();
     }
 }
-struct ReleaseGate(Arc<BlockingGate>);
+pub(super) struct ReleaseGate(pub(super) Arc<BlockingGate>);
 impl Drop for ReleaseGate {
     fn drop(&mut self) {
         self.0.release();
     }
 }
 
-fn nonblocking<T: Send + 'static>(operation: impl FnOnce() -> T + Send + 'static) -> T {
+pub(super) fn nonblocking<T: Send + 'static>(operation: impl FnOnce() -> T + Send + 'static) -> T {
     let (tx, rx) = sync_channel(1);
     let task = thread::spawn(move || {
         let _ = tx.send(operation());
@@ -62,7 +62,7 @@ fn nonblocking<T: Send + 'static>(operation: impl FnOnce() -> T + Send + 'static
     result
 }
 
-struct GatedEvent {
+pub(super) struct GatedEvent {
     text: String,
     gate: Arc<BlockingGate>,
     visits: AtomicUsize,
@@ -79,7 +79,7 @@ impl Serialize for GatedEvent {
         value.end()
     }
 }
-fn gated(gate: &Arc<BlockingGate>, measurement_first: bool) -> GatedEvent {
+pub(super) fn gated(gate: &Arc<BlockingGate>, measurement_first: bool) -> GatedEvent {
     GatedEvent {
         text: "x".repeat(160),
         gate: gate.clone(),
@@ -95,9 +95,9 @@ fn try_delivery_full_and_gate_busy_return_without_poisoning_the_journal() {
         queue_capacity: 1,
         ..Default::default()
     };
-    let blocking =
-        JsonlJournal::open(path.clone(), JsonlJournalOpenMode::Truncate, config).unwrap();
-    let journal = JsonlJournal::<serde_json::Value>::append(path.clone()).unwrap();
+    let mut blocking =
+        OwnedJsonlJournal::open(path.clone(), JsonlJournalOpenMode::Truncate, config).unwrap();
+    let journal = blocking.scope.producer::<serde_json::Value>();
     let gate = Arc::new(BlockingGate::default());
     let release = ReleaseGate(gate.clone());
     blocking.enqueue(gated(&gate, false)).unwrap();
@@ -131,11 +131,11 @@ fn try_delivery_full_and_gate_busy_return_without_poisoning_the_journal() {
     );
     drop(held_gate);
     drop(release);
-    journal.flush().unwrap();
+    journal.flush().result().unwrap();
     journal
         .try_enqueue(serde_json::json!({"ordinal": 4}))
         .unwrap();
-    journal.close().unwrap();
+    blocking.close().unwrap().result().unwrap();
     let stats = journal.delivery_stats();
     assert_eq!((stats.accepted, stats.dropped, stats.failed), (2, 2, 0));
     assert_eq!(
@@ -153,7 +153,7 @@ fn try_delivery_full_and_gate_busy_return_without_poisoning_the_journal() {
 #[test]
 fn try_delivery_payload_credit_covers_the_active_job_and_releases_after_write() {
     let path = path("active-credit");
-    let journal = JsonlJournal::open(
+    let mut journal = OwnedJsonlJournal::open(
         path.clone(),
         JsonlJournalOpenMode::Truncate,
         JsonlJournalConfig {
@@ -172,7 +172,7 @@ fn try_delivery_payload_credit_covers_the_active_job_and_releases_after_write() 
     assert_eq!(stats.accepted, 1);
     assert!(stats.pending_payload_bytes > 128);
     assert_eq!(stats.written, 0);
-    let send = journal.clone();
+    let send = journal.producer().clone();
     let next_gate = gate.clone();
     assert_eq!(
         nonblocking(move || send.try_enqueue(gated(&next_gate, true)))
@@ -185,10 +185,10 @@ fn try_delivery_payload_credit_covers_the_active_job_and_releases_after_write() 
         stats.pending_payload_bytes
     );
     drop(release);
-    journal.flush().unwrap();
+    journal.flush().result().unwrap();
     assert_eq!(journal.delivery_stats().pending_payload_bytes, 0);
     journal.try_enqueue(gated(&gate, true)).unwrap();
-    journal.close().unwrap();
+    journal.close().unwrap().result().unwrap();
     let stats = journal.delivery_stats();
     assert_eq!(
         (stats.accepted, stats.dropped, stats.failed, stats.flushed),
@@ -215,25 +215,21 @@ fn direct_records_keep_serialization_and_existing_worker_failure_categories() {
         "invalid records must not create an artifact"
     );
 
-    let journal = JsonlJournal::create(path.clone()).unwrap();
+    let mut journal = OwnedJsonlJournal::create(path.clone()).unwrap();
     journal.enqueue(Event::Failing).unwrap();
     assert_eq!(
-        journal.flush().unwrap_err().kind(),
+        journal.flush().result().unwrap_err().kind(),
         JsonlJournalErrorKind::Encoding
     );
-    let error = write_jsonl_records(
-        &path,
-        JsonlJournalOpenMode::Append,
-        &[Event::Text("later".into())],
-    )
-    .unwrap_err();
+    let error =
+        write_jsonl_records_to(journal.producer(), &[Event::Text("later".into())]).unwrap_err();
     assert_eq!(
         error.kind(),
         JsonlJournalErrorKind::Encoding,
         "attaching to the failed original writer must retain its cause"
     );
     assert_eq!(
-        journal.close().unwrap_err().kind(),
+        journal.close().unwrap().result().unwrap_err().kind(),
         JsonlJournalErrorKind::Encoding
     );
     let _ = std::fs::remove_file(path);
@@ -250,7 +246,7 @@ impl Serialize for Event {
 #[test]
 fn try_delivery_limits_and_measurement_failures_reject_whole_batches_without_latching() {
     let path = path("limits");
-    let journal = JsonlJournal::open(
+    let mut journal = OwnedJsonlJournal::open(
         path.clone(),
         JsonlJournalOpenMode::Truncate,
         JsonlJournalConfig {
@@ -305,7 +301,7 @@ fn try_delivery_limits_and_measurement_failures_reject_whole_batches_without_lat
             Event::Text("complete".into()),
         ])
         .unwrap();
-    journal.close().unwrap();
+    journal.close().unwrap().result().unwrap();
     let rows: Vec<serde_json::Value> = std::fs::read_to_string(&path)
         .unwrap()
         .lines()
@@ -338,14 +334,14 @@ impl Serialize for ChangingEvent {
 fn try_delivery_worker_encoding_failure_or_panic_releases_exact_accepted_credit() {
     for panic_on_worker in [false, true] {
         let path = path("worker-failure");
-        let journal = JsonlJournal::create(path.clone()).unwrap();
+        let mut journal = OwnedJsonlJournal::create(path.clone()).unwrap();
         journal
             .try_enqueue(ChangingEvent {
                 visits: AtomicUsize::new(0),
                 panic_on_worker,
             })
             .unwrap();
-        let error = journal.close().unwrap_err();
+        let error = journal.close().unwrap().result().unwrap_err();
         assert_eq!(
             error.kind(),
             if panic_on_worker {
@@ -370,15 +366,20 @@ fn try_delivery_worker_encoding_failure_or_panic_releases_exact_accepted_credit(
 #[test]
 fn try_delivery_close_waits_for_the_actual_worker_and_rejects_later_publication() {
     let path = path("close-race");
-    let journal = JsonlJournal::create(path.clone()).unwrap();
+    let journal = OwnedJsonlJournal::create(path.clone()).unwrap();
     let gate = Arc::new(BlockingGate::default());
     let release = ReleaseGate(gate.clone());
     journal.try_enqueue(gated(&gate, true)).unwrap();
     gate.wait();
-    let closing = journal.clone();
+    let OwnedJsonlJournal {
+        producer: journal,
+        scope,
+        mut owner,
+    } = journal;
+    drop(scope);
     let (tx, rx) = sync_channel(1);
     let close = thread::spawn(move || {
-        tx.send(closing.close()).unwrap();
+        tx.send(owner.close()).unwrap();
     });
     let deadline = Instant::now() + Duration::from_secs(2);
     while !journal.inner.closed.load(Ordering::Acquire) {
@@ -400,7 +401,11 @@ fn try_delivery_close_waits_for_the_actual_worker_and_rejects_later_publication(
     assert!(stats.pending_payload_bytes > 0);
     assert!(rx.try_recv().is_err());
     drop(release);
-    rx.recv_timeout(Duration::from_secs(2)).unwrap().unwrap();
+    rx.recv_timeout(Duration::from_secs(2))
+        .unwrap()
+        .unwrap()
+        .result()
+        .unwrap();
     close.join().unwrap();
     let stats = journal.delivery_stats();
     assert!(stats.worker_finished);
@@ -417,12 +422,12 @@ fn try_delivery_flush_failure_is_not_reported_as_a_complete_artifact() {
     drop(File::create(&path).unwrap());
     // The real BufWriter accepts this small payload, but its real File refuses
     // the eventual write. No platform-specific device or synthetic IO error.
-    let journal = readonly_journal::<serde_json::Value>(&path, JsonlJournalConfig::default());
+    let mut journal = readonly_journal::<serde_json::Value>(&path, JsonlJournalConfig::default());
     journal
         .try_enqueue(serde_json::json!({"accepted": true}))
         .unwrap();
     assert_eq!(
-        journal.flush().unwrap_err().kind(),
+        journal.flush().result().unwrap_err().kind(),
         JsonlJournalErrorKind::Worker
     );
     let stats = journal.delivery_stats();
@@ -437,7 +442,7 @@ fn try_delivery_flush_failure_is_not_reported_as_a_complete_artifact() {
             .kind(),
         JsonlJournalErrorKind::Worker
     );
-    assert!(journal.close().is_err());
+    assert!(journal.close().unwrap().result().is_err());
     assert!(journal.delivery_stats().worker_finished);
     assert!(std::fs::read(&path).unwrap().is_empty());
     let _ = std::fs::remove_file(path);
@@ -446,7 +451,7 @@ fn try_delivery_flush_failure_is_not_reported_as_a_complete_artifact() {
 pub(super) fn readonly_journal<T: Serialize + Send + 'static>(
     path: &Path,
     config: JsonlJournalConfig,
-) -> JsonlJournal<T> {
+) -> OwnedJsonlJournal<T> {
     let file = File::open(path).unwrap();
     let (sender, receiver) = sync_channel(config.queue_capacity);
     let failure = Arc::new(JournalFailure::new());
@@ -465,18 +470,24 @@ pub(super) fn readonly_journal<T: Serialize + Send + 'static>(
             worker_delivery,
         );
     });
-    JsonlJournal {
+    let owner = JsonlJournalOwner {
         inner: Arc::new(JsonlJournalInner {
             path: path.to_path_buf(),
             sender,
-            send_gate: Mutex::new(()),
+            send_gate: Mutex::new(PublicationState::default()),
             worker: Mutex::new(Some(worker)),
             failure,
             closed: AtomicBool::new(false),
             config,
             delivery,
         }),
-        marker: PhantomData,
+    };
+    let scope = owner.producer_scope().unwrap();
+    let producer = scope.producer();
+    OwnedJsonlJournal {
+        producer,
+        scope,
+        owner,
     }
 }
 
@@ -526,10 +537,10 @@ fn journal_producer_poison_still_drains_and_joins_on_close_or_unwind() {
             ..Default::default()
         };
         let blocking =
-            JsonlJournal::open(path.clone(), JsonlJournalOpenMode::Truncate, config).unwrap();
-        let journal = JsonlJournal::<serde_json::Value>::append(path.clone()).unwrap();
-        let crashing = JsonlJournal::<PanickingDropEvent>::append(path.clone()).unwrap();
-        assert!(Arc::ptr_eq(&blocking.inner, &journal.inner));
+            OwnedJsonlJournal::open(path.clone(), JsonlJournalOpenMode::Truncate, config).unwrap();
+        let journal = blocking.scope.producer::<serde_json::Value>();
+        let crashing = blocking.scope.producer::<PanickingDropEvent>();
+        assert!(Arc::ptr_eq(&blocking.producer.inner, &journal.inner));
         assert!(Arc::ptr_eq(&crashing.inner, &journal.inner));
         let gate = Arc::new(BlockingGate::default());
         let release = ReleaseGate(gate.clone());
@@ -571,15 +582,16 @@ fn journal_producer_poison_still_drains_and_joins_on_close_or_unwind() {
         let delivery = journal.inner.delivery.clone();
         let failure = journal.inner.failure.clone();
         let weak = Arc::downgrade(&journal.inner);
-        drop(blocking);
         drop(crashing);
+        drop(journal);
+        let mut journal = blocking;
         let (tx, rx) = sync_channel(1);
         let closing = thread::spawn(move || {
             if explicit_close {
-                let error = journal.close().unwrap_err();
+                let error = journal.close().unwrap().result().unwrap_err();
                 assert_eq!(error.kind(), JsonlJournalErrorKind::Panic);
-                assert!(journal.inner.send_gate.is_poisoned());
-                assert!(journal.inner.worker.lock().unwrap().is_none());
+                assert!(journal.producer.inner.send_gate.is_poisoned());
+                assert!(journal.producer.inner.worker.lock().unwrap().is_none());
                 drop(journal);
             } else {
                 // The last journal owner is dropped during an unrelated unwind.
@@ -623,21 +635,21 @@ fn journal_producer_poison_still_drains_and_joins_on_close_or_unwind() {
 #[test]
 fn journal_poisoned_worker_handle_is_recovered_only_to_join() {
     let path = path("worker-handle-poison");
-    let journal = JsonlJournal::create(path.clone()).unwrap();
+    let mut journal = OwnedJsonlJournal::create(path.clone()).unwrap();
     journal
         .try_enqueue(serde_json::json!({"accepted": true}))
         .unwrap();
     let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let _guard = journal.inner.worker.lock().unwrap();
+        let _guard = journal.producer.inner.worker.lock().unwrap();
         panic!("local worker-handle owner failed");
     }));
     assert!(poisoned.is_err());
     assert_eq!(
-        journal.close().unwrap_err().kind(),
+        journal.close().unwrap().result().unwrap_err().kind(),
         JsonlJournalErrorKind::Panic
     );
-    assert!(journal.inner.worker.is_poisoned());
-    let worker = match journal.inner.worker.lock() {
+    assert!(journal.producer.inner.worker.is_poisoned());
+    let worker = match journal.producer.inner.worker.lock() {
         Ok(_) => panic!("cleanup must not clear poison"),
         Err(poisoned) => poisoned.into_inner(),
     };
@@ -679,17 +691,14 @@ fn journal_contract_failure_after_real_io_failure_is_not_transport() {
     for panic in [false, true] {
         let path = path("mixed-contract-failure");
         drop(File::create(&path).unwrap());
-        let journal = readonly_journal::<MixedFailureEvent>(
+        let mut journal = readonly_journal::<MixedFailureEvent>(
             &path,
             JsonlJournalConfig {
                 buffer_capacity_bytes: 1,
                 ..Default::default()
             },
         );
-        let bounded = JsonlJournal::<serde_json::Value> {
-            inner: journal.inner.clone(),
-            marker: PhantomData,
-        };
+        let bounded = journal.scope.producer::<serde_json::Value>();
         let gate = Arc::new(BlockingGate::default());
         let release = ReleaseGate(gate.clone());
         journal
@@ -703,18 +712,25 @@ fn journal_contract_failure_after_real_io_failure_is_not_transport() {
             .unwrap();
         assert!(bounded.delivery_stats().pending_payload_bytes > 0);
         drop(release);
-        let error = journal.close().unwrap_err();
+        let error = journal.close().unwrap().result().unwrap_err();
         let expected = if panic {
             JsonlJournalErrorKind::Panic
         } else {
             JsonlJournalErrorKind::Encoding
         };
         assert_eq!(error.kind(), expected);
-        let first = journal.inner.failure.error.get().unwrap();
+        let first = journal.producer.inner.failure.error.get().unwrap();
         assert_eq!(first.kind(), JsonlJournalErrorKind::Worker);
         assert!(first.message().contains("write JSONL event"));
         assert_eq!(
-            journal.inner.failure.contract_error.get().unwrap().kind(),
+            journal
+                .producer
+                .inner
+                .failure
+                .contract_error
+                .get()
+                .unwrap()
+                .kind(),
             expected
         );
         let stats = journal.delivery_stats();
@@ -743,8 +759,8 @@ impl Serialize for PanickingMeasurement {
 #[test]
 fn journal_measurement_panic_does_not_poison_or_authorize_the_record() {
     let path = path("measurement-panic");
-    let journal = JsonlJournal::<PanickingMeasurement>::create(path.clone()).unwrap();
-    let valid = JsonlJournal::<serde_json::Value>::append(path.clone()).unwrap();
+    let mut journal = OwnedJsonlJournal::<PanickingMeasurement>::create(path.clone()).unwrap();
+    let valid = journal.scope.producer::<serde_json::Value>();
     assert_eq!(
         journal
             .try_enqueue(PanickingMeasurement)
@@ -752,8 +768,8 @@ fn journal_measurement_panic_does_not_poison_or_authorize_the_record() {
             .kind(),
         JsonlJournalErrorKind::Panic
     );
-    assert!(!journal.inner.send_gate.is_poisoned());
-    assert!(journal.inner.failure.current().is_none());
+    assert!(!journal.producer.inner.send_gate.is_poisoned());
+    assert!(journal.producer.inner.failure.current().is_none());
     let rejected = journal.delivery_stats();
     assert_eq!(
         (
@@ -766,7 +782,7 @@ fn journal_measurement_panic_does_not_poison_or_authorize_the_record() {
     valid
         .try_enqueue(serde_json::json!({"valid": true}))
         .unwrap();
-    valid.close().unwrap();
+    journal.close().unwrap().result().unwrap();
     let stats = valid.delivery_stats();
     assert_eq!((stats.accepted, stats.flushed), (1, 1));
     assert_eq!(stats.failure_kind, None);
@@ -784,7 +800,7 @@ fn journal_reopen_waits_for_real_close_join_before_starting_another_epoch() {
             queue_capacity: 1,
             ..Default::default()
         };
-        let journal = JsonlJournal::<serde_json::Value>::open(
+        let journal = OwnedJsonlJournal::<serde_json::Value>::open(
             path.clone(),
             JsonlJournalOpenMode::Truncate,
             config,
@@ -792,10 +808,10 @@ fn journal_reopen_waits_for_real_close_join_before_starting_another_epoch() {
         .unwrap();
         let sentinel = serde_json::json!({"original_epoch": true});
         journal.try_enqueue(sentinel.clone()).unwrap();
-        journal.flush().unwrap();
+        journal.flush().result().unwrap();
         let original_file = std::fs::read(&path).unwrap();
-        let blocking = JsonlJournal::append(path.clone()).unwrap();
-        assert!(Arc::ptr_eq(&journal.inner, &blocking.inner));
+        let blocking = journal.scope.producer::<GatedEvent>();
+        assert!(Arc::ptr_eq(&journal.producer.inner, &blocking.inner));
         let gate = Arc::new(BlockingGate::default());
         let release = ReleaseGate(gate.clone());
         blocking.enqueue(gated(&gate, false)).unwrap();
@@ -804,18 +820,23 @@ fn journal_reopen_waits_for_real_close_join_before_starting_another_epoch() {
             .try_enqueue(serde_json::json!({"ordinal": 1}))
             .unwrap();
         if poison_producer {
-            let crashing = JsonlJournal::<PanickingDropEvent>::append(path.clone()).unwrap();
+            let crashing = journal.scope.producer::<PanickingDropEvent>();
             // A full queue drops the rejected payload under the actual gate.
             assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 crashing.try_enqueue(PanickingDropEvent)
             }))
             .is_err());
-            assert!(journal.inner.send_gate.is_poisoned());
+            assert!(journal.producer.inner.send_gate.is_poisoned());
         }
-        let closing = journal.clone();
+        let OwnedJsonlJournal {
+            producer: journal,
+            scope,
+            mut owner,
+        } = journal;
+        drop(scope);
         let (tx, rx) = sync_channel(1);
         let close = thread::spawn(move || {
-            tx.send(closing.close()).unwrap();
+            tx.send(owner.close()).unwrap();
         });
         let deadline = Instant::now() + Duration::from_secs(2);
         while !journal.inner.closed.load(Ordering::Acquire) {
@@ -828,7 +849,7 @@ fn journal_reopen_waits_for_real_close_join_before_starting_another_epoch() {
         for mode in [JsonlJournalOpenMode::Append, JsonlJournalOpenMode::Truncate] {
             let reopen_path = path.clone();
             let error = nonblocking(move || {
-                JsonlJournal::<serde_json::Value>::open(reopen_path, mode, config)
+                OwnedJsonlJournal::<serde_json::Value>::open(reopen_path, mode, config)
                     .err()
                     .expect("an unjoined writer must not be replaced")
             });
@@ -859,10 +880,13 @@ fn journal_reopen_waits_for_real_close_join_before_starting_another_epoch() {
         let result = rx.recv_timeout(Duration::from_secs(2)).unwrap();
         close.join().unwrap();
         if poison_producer {
-            assert_eq!(result.unwrap_err().kind(), JsonlJournalErrorKind::Panic);
+            assert_eq!(
+                result.unwrap().result().unwrap_err().kind(),
+                JsonlJournalErrorKind::Panic
+            );
             assert!(journal.inner.send_gate.is_poisoned());
         } else {
-            result.unwrap();
+            result.unwrap().result().unwrap();
         }
         assert!(journal.inner.worker.lock().unwrap().is_none());
         assert!(journal.delivery_stats().worker_finished);
@@ -881,7 +905,7 @@ fn journal_reopen_waits_for_real_close_join_before_starting_another_epoch() {
             ]
         );
         if poison_producer {
-            let error = JsonlJournal::<serde_json::Value>::append(path.clone())
+            let error = OwnedJsonlJournal::<serde_json::Value>::append(path.clone())
                 .err()
                 .expect("Append must retain the failed artifact's original cause");
             let error = error
@@ -891,25 +915,26 @@ fn journal_reopen_waits_for_real_close_join_before_starting_another_epoch() {
             assert_eq!(error, &journal.inner.failure.current().unwrap());
             assert_eq!(std::fs::read_to_string(&path).unwrap().lines().count(), 3);
         } else {
-            let appended = JsonlJournal::<serde_json::Value>::append(path.clone()).unwrap();
-            assert!(!Arc::ptr_eq(&appended.inner, &journal.inner));
+            let mut appended =
+                OwnedJsonlJournal::<serde_json::Value>::append(path.clone()).unwrap();
+            assert!(!Arc::ptr_eq(&appended.producer.inner, &journal.inner));
             appended
                 .try_enqueue(serde_json::json!({"next_append": true}))
                 .unwrap();
-            appended.close().unwrap();
+            appended.close().unwrap().result().unwrap();
             assert_eq!(std::fs::read_to_string(&path).unwrap().lines().count(), 4);
         }
-        let next = JsonlJournal::<serde_json::Value>::open(
+        let mut next = OwnedJsonlJournal::<serde_json::Value>::open(
             path.clone(),
             JsonlJournalOpenMode::Truncate,
             config,
         )
         .unwrap();
-        assert!(!Arc::ptr_eq(&next.inner, &journal.inner));
+        assert!(!Arc::ptr_eq(&next.producer.inner, &journal.inner));
         assert!(std::fs::read(&path).unwrap().is_empty());
         next.try_enqueue(serde_json::json!({"new_epoch": true}))
             .unwrap();
-        next.close().unwrap();
+        next.close().unwrap().result().unwrap();
         assert_eq!(
             std::fs::read_to_string(&path).unwrap(),
             "{\"new_epoch\":true}\n"

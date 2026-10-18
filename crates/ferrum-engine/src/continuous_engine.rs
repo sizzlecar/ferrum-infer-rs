@@ -1215,7 +1215,10 @@ use sequence::*;
 use sequence_registry::{SequenceHandle, SequenceRegistry};
 mod execution_close;
 use execution_close::ExecutionCloseRegistry;
+mod journal_scopes;
 mod managed_driver;
+pub use journal_scopes::EngineJournalScopes;
+use journal_scopes::EngineJournals;
 use managed_driver::ManagedDriver;
 pub use managed_driver::{DriverExitReport, DriverJournalDelivery, DriverObserver};
 
@@ -1422,9 +1425,9 @@ struct EngineInner {
     /// Wakes callers or a background loop when new work is submitted.
     work_notify: Arc<Notify>,
     runtime_config: ContinuousEngineRuntimeConfig,
-    profile_trace_jsonl: Option<SchedulerTraceJournal>,
     scheduler_trace_jsonl: Option<SchedulerTraceJournal>,
     legacy_scheduler_trace_jsonl: Option<JsonlJournal<serde_json::Value>>,
+    journal_scopes: Arc<Mutex<EngineJournals>>,
     observation_health: ObservationHealth,
     #[cfg(test)]
     trace_payload_builds: AtomicU64,
@@ -2211,6 +2214,31 @@ impl ContinuousBatchEngine {
         tensor_factory: Arc<dyn TensorFactory>,
         recurrent_state_manager: Option<Arc<dyn RecurrentStateManager + Send + Sync>>,
     ) -> Result<Self> {
+        Self::new_with_recurrent_state_manager_and_journal_scopes(
+            config,
+            scheduler,
+            tokenizer,
+            sampler,
+            kv_cache,
+            model_executor,
+            tensor_factory,
+            recurrent_state_manager,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_recurrent_state_manager_and_journal_scopes(
+        config: EngineConfig,
+        scheduler: Arc<ContinuousBatchScheduler>,
+        tokenizer: Arc<dyn Tokenizer + Send + Sync>,
+        sampler: Arc<dyn Sampler + Send + Sync>,
+        kv_cache: Arc<dyn KvCacheManager + Send + Sync>,
+        model_executor: Arc<dyn ModelExecutor + Send + Sync>,
+        tensor_factory: Arc<dyn TensorFactory>,
+        recurrent_state_manager: Option<Arc<dyn RecurrentStateManager + Send + Sync>>,
+        journal_scopes: Option<EngineJournalScopes>,
+    ) -> Result<Self> {
         Self::new_with_resource_composition(
             config,
             scheduler,
@@ -2222,6 +2250,7 @@ impl ContinuousBatchEngine {
             },
             model_executor,
             tensor_factory,
+            journal_scopes,
         )
     }
 
@@ -2237,6 +2266,26 @@ impl ContinuousBatchEngine {
         model_executor: Arc<dyn ModelExecutor + Send + Sync>,
         tensor_factory: Arc<dyn TensorFactory>,
     ) -> Result<Self> {
+        Self::new_plan_runtime_with_journal_scopes(
+            config,
+            scheduler,
+            tokenizer,
+            sampler,
+            model_executor,
+            tensor_factory,
+            None,
+        )
+    }
+
+    pub fn new_plan_runtime_with_journal_scopes(
+        config: EngineConfig,
+        scheduler: Arc<ContinuousBatchScheduler>,
+        tokenizer: Arc<dyn Tokenizer + Send + Sync>,
+        sampler: Arc<dyn Sampler + Send + Sync>,
+        model_executor: Arc<dyn ModelExecutor + Send + Sync>,
+        tensor_factory: Arc<dyn TensorFactory>,
+        journal_scopes: Option<EngineJournalScopes>,
+    ) -> Result<Self> {
         Self::new_with_resource_composition(
             config,
             scheduler,
@@ -2245,6 +2294,7 @@ impl ContinuousBatchEngine {
             EngineResourceComposition::PlanRuntime,
             model_executor,
             tensor_factory,
+            journal_scopes,
         )
     }
 
@@ -2257,6 +2307,7 @@ impl ContinuousBatchEngine {
         resource_composition: EngineResourceComposition,
         model_executor: Arc<dyn ModelExecutor + Send + Sync>,
         _tensor_factory: Arc<dyn TensorFactory>,
+        journal_scopes: Option<EngineJournalScopes>,
     ) -> Result<Self> {
         let executor_authority = model_executor.execution_resource_authority();
         if resource_composition.authority() != executor_authority {
@@ -2274,33 +2325,18 @@ impl ContinuousBatchEngine {
         config.runtime.profile_journal.validate()?;
         let runtime_config = ContinuousEngineRuntimeConfig::from_engine_config(&config);
         let observation_health = ObservationHealth::default();
+        let journals = EngineJournals::prepare(&config, journal_scopes, &observation_health)?;
         let open_profile = |path: Option<&Path>| {
-            open_observation_journal(
-                path,
-                config.runtime.profile_detail,
-                &observation_health,
-                |path| {
-                    SchedulerTraceJournal::create(
-                        path.to_path_buf(),
-                        config.runtime.profile_journal,
-                    )
-                },
-            )
+            path.and_then(|path| journals.producer(path))
+                .map(SchedulerTraceJournal::from_producer)
         };
-        let profile_trace_jsonl = open_profile(runtime_config.profile_jsonl.as_deref())?;
-        let scheduler_trace_jsonl = open_profile(runtime_config.scheduler_trace_jsonl.as_deref())?;
-        let legacy_scheduler_trace_jsonl = open_observation_journal(
-            runtime_config.legacy_scheduler_trace_jsonl.as_deref(),
-            config.runtime.profile_detail,
-            &observation_health,
-            |path| {
-                JsonlJournal::<serde_json::Value>::open(
-                    path.to_path_buf(),
-                    ferrum_bench_core::JsonlJournalOpenMode::Truncate,
-                    config.runtime.profile_journal.into(),
-                )
-            },
-        )?;
+        let profile_trace_jsonl = open_profile(runtime_config.profile_jsonl.as_deref());
+        let scheduler_trace_jsonl = open_profile(runtime_config.scheduler_trace_jsonl.as_deref());
+        let legacy_scheduler_trace_jsonl = runtime_config
+            .legacy_scheduler_trace_jsonl
+            .as_deref()
+            .and_then(|path| journals.producer(path));
+        let journal_scopes = Arc::new(Mutex::new(journals));
         let mut execution_profile_journals = Vec::with_capacity(2);
         if let Some(journal) = profile_trace_jsonl.as_ref() {
             execution_profile_journals.push(journal.clone());
@@ -2352,9 +2388,9 @@ impl ContinuousBatchEngine {
                 work_notify: Arc::new(Notify::new()),
                 iteration_count: AtomicU64::new(0),
                 runtime_config,
-                profile_trace_jsonl,
                 scheduler_trace_jsonl,
                 legacy_scheduler_trace_jsonl,
+                journal_scopes,
                 observation_health,
                 #[cfg(test)]
                 trace_payload_builds: AtomicU64::new(0),

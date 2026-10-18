@@ -3,8 +3,52 @@
 //! the server's explicit stop path after HTTP and engine producers have drained.
 use super::*;
 use ferrum_bench_core::{
-    JsonlJournal, JsonlJournalDeliveryStats, JsonlJournalError, JsonlJournalErrorKind,
+    JsonlFinalReceipt, JsonlFlushReceipt, JsonlJournal, JsonlJournalDeliveryStats,
+    JsonlJournalError, JsonlJournalErrorKind, JsonlJournalOwner, JsonlProducerScope,
 };
+
+/// Explicit component scopes supplied by the product's unique journal owner.
+/// Failed destinations are part of the assembly result, never reopened by HTTP.
+#[derive(Default)]
+pub struct HttpJournalScopes {
+    entries: BTreeMap<PathBuf, std::io::Result<JsonlProducerScope>>,
+}
+impl HttpJournalScopes {
+    pub fn new(scopes: Vec<JsonlProducerScope>) -> ferrum_types::Result<Self> {
+        let mut result = Self::default();
+        for scope in scopes {
+            let path = scope.path().to_path_buf();
+            if result.entries.insert(path, Ok(scope)).is_some() {
+                return Err(Error::config("duplicate HTTP journal scope"));
+            }
+        }
+        Ok(result)
+    }
+    pub fn with_open_failure(
+        mut self,
+        path: impl Into<PathBuf>,
+        error: std::io::Error,
+    ) -> ferrum_types::Result<Self> {
+        let path = path.into();
+        let key = ferrum_bench_core::normalize_jsonl_path(&path).unwrap_or(path);
+        if self.entries.insert(key, Err(error)).is_some() {
+            return Err(Error::config("duplicate HTTP journal destination"));
+        }
+        Ok(self)
+    }
+}
+
+struct DestinationClosure {
+    scope: JsonlProducerScope,
+    // Present only for standalone HTTP assembly. An injected scope cannot
+    // close any other producer or acquire final authority from its path.
+    owner: Option<JsonlJournalOwner>,
+}
+#[derive(Default)]
+struct DestinationProof {
+    flush: Option<JsonlFlushReceipt>,
+    final_receipt: Option<JsonlFinalReceipt>,
+}
 
 #[derive(Clone)]
 struct ProfileRecord(Arc<FerrumProfileEvent>);
@@ -64,6 +108,8 @@ struct Destination {
     profile: bool,
     journal: JsonlJournal<ProfileRecord>,
     warned: AtomicBool,
+    closure: Mutex<DestinationClosure>,
+    proof: Mutex<DestinationProof>,
 }
 
 #[derive(Default)]
@@ -95,6 +141,8 @@ pub struct HttpProfileDeliveryReport {
 pub struct HttpProfileJournalReport {
     pub path: PathBuf,
     pub stats: JsonlJournalDeliveryStats,
+    pub scope_receipt: Option<JsonlFlushReceipt>,
+    pub final_receipt: Option<JsonlFinalReceipt>,
 }
 
 impl HttpProfileDeliveryReport {
@@ -129,6 +177,8 @@ impl HttpProfileDeliveryReport {
                     "worker_state": format!("{:?}", stats.worker_state),
                     "worker_finished": stats.worker_finished, "flush_pending": stats.flush_pending,
                     "failure_kind": stats.failure_kind.map(|kind| format!("{kind:?}")),
+                    "scope_receipt": journal.scope_receipt,
+                    "final_receipt": journal.final_receipt,
                 })
             }).collect::<Vec<_>>()
         })
@@ -143,42 +193,70 @@ pub(super) struct HttpProfileDelivery {
 }
 
 impl HttpProfileDelivery {
-    pub(super) fn open(state: &AppState) -> Arc<Self> {
-        let mut destinations: Vec<Destination> = Vec::with_capacity(2);
+    pub(super) fn open(state: &AppState, mut injected: Option<HttpJournalScopes>) -> Arc<Self> {
+        let mut destinations = Vec::with_capacity(2);
         let mut failures = Vec::new();
+        let mut targets = BTreeMap::<PathBuf, bool>::new();
         let config_valid = state.profile_journal.validate();
         for (path, profile) in [
             (state.profile_jsonl.as_deref(), true),
             (state.memory_profile_jsonl.as_deref(), false),
         ] {
             let Some(path) = path else { continue };
-            if config_valid.is_err() {
-                continue;
-            }
-            // Opening is configuration work, never a handler operation. Append
-            // attaches to the same normalized writer used by Engine and CLI.
-            match JsonlJournal::<ProfileRecord>::open(
-                path.as_path(),
-                ferrum_bench_core::JsonlJournalOpenMode::Append,
-                state.profile_journal.clone().into(),
-            ) {
-                Ok(journal) => {
-                    if let Some(existing) = destinations
-                        .iter_mut()
-                        .find(|entry| entry.journal.path() == journal.path())
-                    {
-                        existing.profile |= profile;
-                    } else {
-                        destinations.push(Destination {
-                            profile,
-                            journal,
-                            warned: AtomicBool::new(false),
-                        });
-                    }
+            let key = ferrum_bench_core::normalize_jsonl_path(path)
+                .unwrap_or_else(|_| path.to_path_buf());
+            *targets.entry(key).or_default() |= profile;
+        }
+        if config_valid.is_ok() {
+            for (path, profile) in targets {
+                let opened = match injected.as_mut() {
+                    Some(scopes) => match scopes.entries.remove(&path) {
+                        Some(Ok(scope))
+                            if !scope.is_retired()
+                                && scope.config() == state.profile_journal.into() =>
+                        {
+                            Ok((scope, None))
+                        }
+                        Some(Ok(_)) => {
+                            failures.push((path, Failure::contract("HTTP journal scope is retired or differs from declared configuration")));
+                            continue;
+                        }
+                        Some(Err(error)) => Err(error),
+                        None => {
+                            failures.push((
+                                path,
+                                Failure::contract("missing injected HTTP journal destination"),
+                            ));
+                            continue;
+                        }
+                    },
+                    None => JsonlJournalOwner::open(
+                        &path,
+                        ferrum_bench_core::JsonlJournalOpenMode::Append,
+                        state.profile_journal.into(),
+                    )
+                    .and_then(|owner| {
+                        owner
+                            .producer_scope()
+                            .map(|scope| (scope, Some(owner)))
+                            .map_err(std::io::Error::other)
+                    }),
+                };
+                match opened {
+                    Ok((scope, owner)) => destinations.push(Destination {
+                        profile,
+                        journal: scope.producer(),
+                        warned: AtomicBool::new(false),
+                        closure: Mutex::new(DestinationClosure { scope, owner }),
+                        proof: Mutex::new(DestinationProof::default()),
+                    }),
+                    Err(error) => failures.push((path, Failure::open(&error))),
                 }
-                Err(error) => failures.push((path.to_path_buf(), Failure::open(&error))),
             }
         }
+        let unused_scopes = injected
+            .as_ref()
+            .is_some_and(|scopes| !scopes.entries.is_empty());
         let delivery = Arc::new(Self {
             detail: state.profile_detail,
             destinations,
@@ -188,8 +266,13 @@ impl HttpProfileDelivery {
         if let Err(error) = config_valid {
             delivery.record_failure(Failure::contract(error.to_string()));
         }
+        if unused_scopes {
+            delivery.record_failure(Failure::contract(
+                "unused injected HTTP journal destinations",
+            ));
+        }
         for (path, failure) in failures {
-            warn!(path = %path.display(), error = %failure.message, "HTTP profile journal could not be opened");
+            warn!(path = %path.display(), error = %failure.message, "HTTP profile journal could not be prepared");
             delivery.record_failure(failure);
         }
         delivery
@@ -237,15 +320,20 @@ impl HttpProfileDelivery {
     }
 
     pub(super) fn report(&self) -> HttpProfileDeliveryReport {
-        let health = self.health.lock().expect("HTTP profile health");
         let journals: Vec<_> = self
             .destinations
             .iter()
-            .map(|entry| HttpProfileJournalReport {
-                path: entry.journal.path().to_path_buf(),
-                stats: entry.journal.delivery_stats(),
+            .map(|entry| {
+                let proof = entry.proof.lock().expect("HTTP journal proof");
+                HttpProfileJournalReport {
+                    path: entry.journal.path().to_path_buf(),
+                    stats: entry.journal.delivery_stats(),
+                    scope_receipt: proof.flush.clone(),
+                    final_receipt: proof.final_receipt.clone(),
+                }
             })
             .collect();
+        let health = self.health.lock().expect("HTTP profile health");
         let mut contract = health.contract.clone();
         let mut required_transport = health.required_transport.clone();
         // Worker failures may arrive after a successful enqueue and before the
@@ -319,28 +407,47 @@ impl HttpProfileDelivery {
 
     fn close_journals(&self) {
         for destination in &self.destinations {
-            let close = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                destination.journal.close()
-            }));
-            let stats = destination.journal.delivery_stats();
-            let failure = match close {
-                Ok(Err(error)) => Some(Failure::journal(&error)),
-                Err(_) => Some(Failure::contract("HTTP journal close panicked")),
-                Ok(Ok(())) if stats.dropped != 0 || stats.failed != 0 || stats.flushed != stats.accepted
-                    || stats.flush_pending || !stats.worker_finished || stats.pending_payload_bytes != 0
-                    || stats.failure_kind.is_some() => Some(Failure {
-                        kind: match stats.failure_kind {
-                            Some(JsonlJournalErrorKind::Config | JsonlJournalErrorKind::Encoding | JsonlJournalErrorKind::Panic) => FailureKind::Contract,
-                            _ => FailureKind::Transport,
-                        },
-                        message: format!("HTTP journal {} is incomplete: accepted={}, dropped={}, failed={}, flushed={}",
-                            destination.journal.path().display(), stats.accepted, stats.dropped, stats.failed, stats.flushed),
-                    }),
-                Ok(Ok(())) => None,
-            };
-            if let Some(failure) = failure {
-                warn!(path = %destination.journal.path().display(), error = %failure.message, "HTTP journal close reports incomplete evidence");
-                self.record_failure(failure);
+            let mut closure = destination.closure.lock().expect("HTTP journal closure");
+            let finish =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| closure.scope.finish()));
+            match finish {
+                Ok(receipt) => {
+                    if let Err(error) = receipt.result() {
+                        self.record_failure(Failure::journal(&error));
+                    }
+                    // The fixed prefix, not a later global accepted/pending count,
+                    // proves the HTTP producer's accepted records were observed.
+                    if receipt.cut.dropped != 0 || receipt.failed != 0 {
+                        self.record_failure(Failure {
+                            kind: FailureKind::Transport,
+                            message: "HTTP journal prefix contains lost records".to_string(),
+                        });
+                    }
+                    destination.proof.lock().expect("HTTP journal proof").flush = Some(receipt);
+                }
+                Err(_) => {
+                    self.record_failure(Failure::contract("HTTP journal scope finish panicked"))
+                }
+            }
+            if let Some(owner) = closure.owner.as_mut() {
+                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| owner.close())) {
+                    Ok(Ok(receipt)) => {
+                        if let Err(error) = receipt.result() {
+                            self.record_failure(Failure::journal(&error));
+                        }
+                        destination
+                            .proof
+                            .lock()
+                            .expect("HTTP journal proof")
+                            .final_receipt = Some(receipt);
+                    }
+                    Ok(Err(error)) => self.record_failure(Failure::contract(format!(
+                        "HTTP journal final close incomplete: {error}"
+                    ))),
+                    Err(_) => {
+                        self.record_failure(Failure::contract("HTTP journal final close panicked"))
+                    }
+                }
             }
         }
         self.health
@@ -377,6 +484,7 @@ impl HttpProfileDelivery {
             destination
                 .journal
                 .flush()
+                .result()
                 .map_err(|error| Error::internal(error.to_string()))?;
         }
         self.result()
@@ -384,6 +492,17 @@ impl HttpProfileDelivery {
 }
 
 impl AxumServer {
+    /// Supply only this HTTP component's publishing scopes. The caller retains
+    /// final-close authority until all component scopes and tail records finish.
+    pub fn with_journal_scopes(self, scopes: HttpJournalScopes) -> Self {
+        *self
+            .lifecycle
+            .profile_scopes
+            .lock()
+            .expect("HTTP injected scopes") = Some(scopes);
+        self
+    }
+
     pub fn profile_delivery_report(&self) -> Option<HttpProfileDeliveryReport> {
         self.lifecycle
             .profile_delivery
@@ -405,7 +524,13 @@ impl AxumServer {
         if owner.is_some() {
             return Err(Error::internal("HTTP profile lifecycle already prepared"));
         }
-        let delivery = HttpProfileDelivery::open(&state);
+        let injected = self
+            .lifecycle
+            .profile_scopes
+            .lock()
+            .expect("HTTP injected scopes")
+            .take();
+        let delivery = HttpProfileDelivery::open(&state, injected);
         // Install custody before checking startup errors or binding the socket.
         // Failed startup remains closable through this same server lifecycle.
         *owner = Some(Arc::clone(&delivery));

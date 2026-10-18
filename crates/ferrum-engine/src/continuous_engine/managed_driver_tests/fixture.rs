@@ -284,6 +284,25 @@ impl Fixture {
         configure: impl FnOnce(&mut EngineConfig),
         tokenizer: impl FnOnce(usize) -> Arc<dyn Tokenizer>,
     ) -> Self {
+        Self::with_options(configure, tokenizer, |_| None)
+    }
+
+    pub(super) fn with_journal_scopes(
+        configure: impl FnOnce(&mut EngineConfig),
+        scopes: impl FnOnce(&EngineConfig) -> EngineJournalScopes,
+    ) -> Self {
+        Self::with_options(
+            configure,
+            |vocab| Arc::new(TinyTokenizer::new(vocab)),
+            |config| Some(scopes(config)),
+        )
+    }
+
+    fn with_options(
+        configure: impl FnOnce(&mut EngineConfig),
+        tokenizer: impl FnOnce(usize) -> Arc<dyn Tokenizer>,
+        scopes: impl FnOnce(&EngineConfig) -> Option<EngineJournalScopes>,
+    ) -> Self {
         let (inner, observed, cfg) = closure::observed_cpu_model();
         let (reached_tx, reached) = tokio::sync::oneshot::channel();
         let (release, release_rx) = tokio::sync::oneshot::channel();
@@ -314,7 +333,8 @@ impl Fixture {
         config.backend.device = Device::CPU;
         config.runtime.scheduler_trace_jsonl = Some(trace.path().join("trace.jsonl"));
         configure(&mut config);
-        let engine = ContinuousBatchEngine::new(
+        let journal_scopes = scopes(&config);
+        let engine = ContinuousBatchEngine::new_with_recurrent_state_manager_and_journal_scopes(
             config.clone(),
             Arc::new(ContinuousBatchScheduler::new(config.scheduler)),
             tokenizer(cfg.vocab_size),
@@ -322,6 +342,8 @@ impl Fixture {
             Arc::new(MockKvCacheManager::new(128)),
             executor.clone(),
             Arc::new(crate::tensor_factory::CandleTensorFactory::new(Device::CPU)),
+            None,
+            journal_scopes,
         )
         .unwrap();
         Self {
