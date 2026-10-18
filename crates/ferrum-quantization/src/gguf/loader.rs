@@ -176,8 +176,8 @@ impl<B: Backend + BackendQuantGguf + BackendQuantMarlin> GgufLoader<B> {
     ///      `QuantLinear::from_gguf_bytes`, so weights stay quantised in
     ///      backend memory.
     ///   2. **Eager (dense-fused)** — fallback. Each part is dequanted to
-    ///      fp32 and concatenated; the result wraps a dense fp16 weight
-    ///      via `GgufLinear::from_dense_rows`.
+    ///      fp32 and concatenated, preserving each part's bias and filling
+    ///      absent bias segments with zeros.
     ///
     /// Why the dual path: an 8B Qwen3 has 36 layers × (qkv + gate_up) of
     /// ~140M weights apiece — eager-fp32-fusing them inflates 5 GB on disk
@@ -389,6 +389,7 @@ impl<B: Backend + BackendQuantGguf + BackendQuantMarlin> GgufLoader<B> {
     /// or parts with bias. See `load_fused` doc for the trade-off.
     fn load_fused_eager(&self, parts: &[String]) -> Result<Box<dyn Linear<B>>> {
         let mut fused: Vec<f32> = Vec::new();
+        let mut fused_bias: Option<Vec<f32>> = None;
         let mut total_rows = 0usize;
         let mut cols_check: Option<usize> = None;
 
@@ -416,10 +417,41 @@ impl<B: Backend + BackendQuantGguf + BackendQuantMarlin> GgufLoader<B> {
             let data = self.read_dequant(&gguf_name)?;
             debug_assert_eq!(data.len(), rows * cols);
             fused.extend_from_slice(&data);
-            total_rows += rows;
+            let previous_rows = total_rows;
+            total_rows = total_rows
+                .checked_add(rows)
+                .ok_or_else(|| FerrumError::model("fusion output row count overflows usize"))?;
+
+            let bias_name = self
+                .translate(&format!("{stem}.bias"))
+                .filter(|name| self.gguf.has_tensor(name));
+            if let Some(bias_name) = bias_name {
+                let bias_info = self.gguf.tensor_info(&bias_name).ok_or_else(|| {
+                    FerrumError::model(format!("tensor info missing for '{bias_name}'"))
+                })?;
+                let bias_dims = bias_info.shape.dims();
+                if bias_dims != [rows] {
+                    return Err(FerrumError::model(format!(
+                        "GgufLoader: fusion bias shape {bias_dims:?} for '{bias_name}' does not match [{rows}]",
+                    )));
+                }
+                let bias = self.read_dequant(&bias_name)?;
+                fused_bias
+                    .get_or_insert_with(|| vec![0.0; previous_rows])
+                    .extend_from_slice(&bias);
+            } else if let Some(bias) = &mut fused_bias {
+                bias.resize(total_rows, 0.0);
+            }
         }
 
         let cols = cols_check.ok_or_else(|| FerrumError::model("fusion: no parts"))?;
+        if let Some(bias) = fused_bias {
+            return Ok(Box::new(
+                crate::dense::DenseLinear::<B>::from_rows_with_bias(
+                    &fused, &bias, total_rows, cols,
+                ),
+            ));
+        }
         Ok(Box::new(GgufLinear::<B>::from_dense_rows(
             &fused, total_rows, cols,
         )))

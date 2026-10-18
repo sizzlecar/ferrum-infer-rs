@@ -890,7 +890,9 @@ fn external_metadata_id_from_model_dir(
     external_metadata_id_from_bytes(&raw, &path.display().to_string())
 }
 
-fn external_metadata_id_from_bytes(
+/// Parse one declared architecture identity without selecting a built-in family.
+/// This is source metadata validation, not execution capability or authorization.
+pub fn external_metadata_id_from_bytes(
     raw: &[u8],
     source: &str,
 ) -> ferrum_types::Result<ExternalModelMetadataId> {

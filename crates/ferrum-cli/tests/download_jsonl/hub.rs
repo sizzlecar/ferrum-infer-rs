@@ -289,6 +289,9 @@ pub fn gguf_without_weights() -> Vec<u8> {
         ),
         ("llama.context_length", GgufValue::U32(32)),
         ("llama.vocab_size", GgufValue::U32(3)),
+        // Match sidecar_files(): missing weights are intentional, conflicting
+        // semantic and physical RoPE parameters are not.
+        ("llama.rope.freq_base", GgufValue::F32(10_000.0)),
     ];
     let metadata: Vec<_> = metadata
         .iter()

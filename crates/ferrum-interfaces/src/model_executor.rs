@@ -3093,6 +3093,15 @@ pub trait ModelExecutor: Send + Sync {
         None
     }
 
+    /// Reports the immutable sources bound to this executor. The default
+    /// borrows the sources from the exact resolved plan, when one is exposed.
+    /// This is a trusted implementation's consistency report, not runtime
+    /// authorization to allocate resources, bind requests, or submit work.
+    fn bound_resolved_sources(&self) -> Option<&crate::vnext::ResolvedModelSources> {
+        self.resolved_model_plan()
+            .map(|plan| &plan.parts().resolved_sources)
+    }
+
     /// Returns the authoritative memory breakdown for a shared plan runtime.
     /// `LegacyEngine` executors return `None`; `PlanRuntime` executors must
     /// return `Some` while they are ready.

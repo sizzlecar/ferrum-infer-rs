@@ -22,10 +22,14 @@
 //!     `mistral.attention.sliding_window` if present.
 
 use ferrum_quantization::gguf::GgufFile;
-use ferrum_types::{FerrumError, Result};
+use ferrum_types::{Activation, FerrumError, NormType, Result};
 
-use crate::models::llama_family::{LlamaFamilyConfig, RopeScalingConfig};
+use crate::definition::ModelDefinition;
+use crate::models::llama_family::{
+    llama_layer_attention_schedule, LlamaFamilyConfig, RopeScalingConfig,
+};
 use crate::moe_config::Qwen3MoeConfig;
+use crate::registry::Architecture;
 
 /// Architectures that are known MoE — `LlamaFamilyConfig::from_gguf` rejects
 /// them with a pointer to the appropriate MoE constructor rather than
@@ -39,6 +43,337 @@ pub(crate) fn validate_dense_gguf_architecture(arch: &str) -> Result<()> {
         _ => Err(FerrumError::unsupported(format!(
             "GGUF architecture '{arch}' is not supported by the dense Llama-family runtime"
         ))),
+    }
+}
+
+/// Checks semantic compatibility before any weight materialization. Physical
+/// RoPE layout and Gemma norm offsets remain those of the converted GGUF.
+pub(crate) fn validate_dense_gguf_sources(
+    gguf: &GgufFile,
+    definition: &ModelDefinition,
+) -> Result<LlamaFamilyConfig> {
+    let arch = gguf
+        .architecture()
+        .map_err(|error| FerrumError::model(format!("read GGUF arch: {error}")))?;
+    let compatible_architecture = matches!(
+        (definition.architecture, arch),
+        (Architecture::Llama, "llama")
+            | (Architecture::Mistral, "mistral" | "llama")
+            | (Architecture::Qwen2, "qwen2")
+            | (Architecture::Qwen3, "qwen3")
+            | (Architecture::Gemma3, "gemma3")
+    );
+    if !compatible_architecture {
+        return Err(FerrumError::unsupported(format!(
+            "semantic architecture {:?} is incompatible with dense GGUF architecture '{arch}'",
+            definition.architecture,
+        )));
+    }
+    if definition.extra_params.get("architectures").is_none()
+        && definition.extra_params.get("model_type").is_none()
+    {
+        return Err(FerrumError::model(
+            "GGUF semantic source must declare its architecture",
+        ));
+    }
+    if definition.num_attention_heads == 0
+        || definition.hidden_size == 0
+        || definition.norm_type != NormType::RMSNorm
+    {
+        return Err(FerrumError::model(
+            "GGUF semantic source requires nonzero attention dimensions and RMSNorm",
+        ));
+    }
+    if let Some(pattern) = definition.extra_params.get("sliding_window_pattern") {
+        if definition.architecture != Architecture::Gemma3
+            || pattern.as_u64().filter(|value| *value > 0).is_none()
+        {
+            return Err(FerrumError::unsupported(
+                "semantic sliding_window_pattern requires a positive integer on the Gemma3 decoder",
+            ));
+        }
+    }
+    let mut semantic = match definition.architecture {
+        Architecture::Llama => LlamaFamilyConfig::llama_from_def(definition),
+        Architecture::Mistral => LlamaFamilyConfig::mistral_from_def(definition),
+        Architecture::Qwen2 => LlamaFamilyConfig::qwen2_from_def(definition),
+        Architecture::Qwen3 => LlamaFamilyConfig::qwen3_from_def(definition),
+        Architecture::Gemma3 => LlamaFamilyConfig::gemma3_from_def(definition),
+        _ => unreachable!("architecture checked above"),
+    };
+    semantic.activation = match definition.activation {
+        Activation::Swish => Activation::SiLU,
+        activation => activation,
+    };
+    for key in ["rope_scaling", "rope_parameters"] {
+        if let Some(scaling) = definition
+            .extra_params
+            .get(key)
+            .filter(|value| !value.is_null())
+        {
+            if !scaling.is_object() {
+                return Err(FerrumError::model(format!(
+                    "semantic {key} must be an object"
+                )));
+            }
+            if key == "rope_parameters"
+                && scaling
+                    .as_object()
+                    .unwrap()
+                    .values()
+                    .any(|value| value.is_object() || value.is_array())
+            {
+                return Err(FerrumError::unsupported(
+                    "nested semantic rope_parameters are not implemented by the GGUF decoder",
+                ));
+            }
+            for kind_key in ["rope_type", "type"] {
+                if scaling
+                    .get(kind_key)
+                    .is_some_and(|value| !value.is_string())
+                {
+                    return Err(FerrumError::model(format!(
+                        "semantic {key}.{kind_key} must be a string"
+                    )));
+                }
+            }
+            let kind = scaling
+                .get("rope_type")
+                .or_else(|| scaling.get("type"))
+                .and_then(|value| value.as_str());
+            if (key == "rope_scaling" && kind.is_none())
+                || (!matches!(kind, None | Some("default" | "none"))
+                    && (key != "rope_scaling" || semantic.rope_scaling.is_none()))
+            {
+                return Err(FerrumError::unsupported(format!(
+                    "semantic {key} is not implemented by the GGUF decoder"
+                )));
+            }
+        }
+    }
+    // Optional means absent, not malformed. Do not accept an invalid explicit
+    // declaration through from_gguf's compatibility defaults.
+    for suffix in [
+        "attention.head_count_kv",
+        "context_length",
+        "attention.sliding_window",
+        "vocab_size",
+        "attention.key_length",
+        "attention.value_length",
+        "rope.dimension_count",
+    ] {
+        let key = format!("{arch}.{suffix}");
+        if gguf.metadata(&key).is_some() {
+            read_u32(gguf, &key)?;
+        }
+    }
+    let theta_key = format!("{arch}.rope.freq_base");
+    if gguf.metadata(&theta_key).is_some() {
+        read_f32(gguf, &theta_key)?;
+    }
+    let physical = LlamaFamilyConfig::from_gguf(gguf)?;
+    macro_rules! equal {
+        ($field:ident) => {
+            if semantic.$field != physical.$field {
+                return Err(FerrumError::model(format!(
+                    "GGUF semantic mismatch for {}: semantic={:?}, physical={:?}",
+                    stringify!($field),
+                    semantic.$field,
+                    physical.$field,
+                )));
+            }
+        };
+    }
+    equal!(hidden_size);
+    equal!(intermediate_size);
+    equal!(num_heads);
+    equal!(num_kv_heads);
+    equal!(head_dim);
+    equal!(num_layers);
+    equal!(vocab_size);
+    equal!(max_seq_len);
+    equal!(rms_norm_eps);
+    equal!(has_qk_norm);
+    equal!(sliding_window);
+    equal!(activation);
+    equal!(sliding_window_pattern);
+    equal!(rope_local_theta);
+    equal!(sandwich_norms);
+    equal!(embed_scale);
+    if !physical.rms_norm_eps.is_finite()
+        || physical.rms_norm_eps <= 0.0
+        || !physical.rope_theta.is_finite()
+        || physical.rope_theta <= 0.0
+    {
+        return Err(FerrumError::model(
+            "GGUF source has invalid dimensions or normalization parameters",
+        ));
+    }
+    // GGUF stores this scalar as f32; compare after the format conversion.
+    if semantic.rope_theta as f32 as f64 != physical.rope_theta
+        || !equivalent_rope_scaling(&semantic.rope_scaling, &physical.rope_scaling)
+        || semantic
+            .query_pre_attn_scalar
+            .unwrap_or(semantic.head_dim as f64)
+            != physical
+                .query_pre_attn_scalar
+                .unwrap_or(physical.head_dim as f64)
+    {
+        return Err(FerrumError::model(
+            "GGUF semantic mismatch for RoPE scaling/theta or attention scale",
+        ));
+    }
+    for suffix in ["attention.value_length", "rope.dimension_count"] {
+        let key = format!("{arch}.{suffix}");
+        if gguf.metadata(&key).is_some() && read_u32(gguf, &key)? as usize != physical.head_dim {
+            return Err(FerrumError::unsupported(format!(
+                "GGUF {key} differs from the full head dimension supported by this decoder"
+            )));
+        }
+    }
+    validate_declared_layer_types(definition, &physical)?;
+    validate_projection_biases(gguf, definition, &physical)?;
+    // These two representation differences are intentional: llama.cpp permutes
+    // Llama/Mistral Q/K for interleaved RoPE and folds Gemma's 1+w into weights.
+    // They must not be overwritten by the semantic safetensors configuration.
+    Ok(physical)
+}
+
+fn validate_declared_layer_types(
+    definition: &ModelDefinition,
+    physical: &LlamaFamilyConfig,
+) -> Result<()> {
+    let Some(declaration) = definition
+        .extra_params
+        .get("layer_types")
+        .filter(|v| !v.is_null())
+    else {
+        return Ok(());
+    };
+    let layers = declaration
+        .as_array()
+        .ok_or_else(|| FerrumError::model("semantic layer_types must be an array"))?;
+    if layers.len() != physical.num_layers {
+        return Err(FerrumError::model(
+            "semantic layer_types length differs from the GGUF layer count",
+        ));
+    }
+    for (index, layer) in layers.iter().enumerate() {
+        let schedule = llama_layer_attention_schedule(physical, index);
+        let expected = if !schedule.is_global_layer || schedule.sliding_window > 0 {
+            "sliding_attention"
+        } else {
+            "full_attention"
+        };
+        if layer.as_str() != Some(expected) {
+            return Err(FerrumError::unsupported(format!(
+                "semantic layer_types[{index}] does not match the GGUF decoder's {expected} schedule"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_projection_biases(
+    gguf: &GgufFile,
+    definition: &ModelDefinition,
+    physical: &LlamaFamilyConfig,
+) -> Result<()> {
+    let declared_bool = |key: &str| -> Result<Option<bool>> {
+        definition
+            .extra_params
+            .get(key)
+            .map(|value| {
+                value
+                    .as_bool()
+                    .ok_or_else(|| FerrumError::model(format!("semantic {key} must be a boolean")))
+            })
+            .transpose()
+    };
+    let attention = declared_bool("attention_bias")?;
+    let mlp = declared_bool("mlp_bias")?;
+    // Family contracts: Qwen2 always has Q/K/V bias and no O/MLP bias;
+    // Mistral has none. Llama's MLP and Llama/Qwen3/Gemma3 attention are
+    // configured independently. These are architecture rules, not model IDs.
+    let (fixed_attention, fixed_mlp) = match definition.architecture {
+        Architecture::Qwen2 => (Some(true), Some(false)),
+        Architecture::Mistral => (Some(false), Some(false)),
+        Architecture::Llama => (None, None),
+        Architecture::Qwen3 | Architecture::Gemma3 => (None, Some(false)),
+        _ => unreachable!("dense source architecture checked above"),
+    };
+    for (key, declared, fixed) in [
+        ("attention_bias", attention, fixed_attention),
+        ("mlp_bias", mlp, fixed_mlp),
+    ] {
+        if let (Some(declared), Some(fixed)) = (declared, fixed) {
+            if declared != fixed {
+                return Err(FerrumError::model(format!(
+                    "semantic {key}={declared} contradicts the {:?} fixed bias contract ({fixed})",
+                    definition.architecture,
+                )));
+            }
+        }
+    }
+    let attention = attention.unwrap_or(false);
+    let mlp = mlp.unwrap_or(false);
+    let (qkv_bias, output_bias, mlp_bias) = match definition.architecture {
+        Architecture::Qwen2 => (true, false, false),
+        Architecture::Mistral => (false, false, false),
+        Architecture::Llama => (attention, attention, mlp),
+        Architecture::Qwen3 | Architecture::Gemma3 => (attention, attention, false),
+        _ => unreachable!("dense source architecture checked above"),
+    };
+    let width = |heads: usize| {
+        heads
+            .checked_mul(physical.head_dim)
+            .ok_or_else(|| FerrumError::model("GGUF attention projection width overflows usize"))
+    };
+    let projections = [
+        ("attn_q", qkv_bias, width(physical.num_heads)?),
+        ("attn_k", qkv_bias, width(physical.num_kv_heads)?),
+        ("attn_v", qkv_bias, width(physical.num_kv_heads)?),
+        ("attn_output", output_bias, physical.hidden_size),
+        ("ffn_gate", mlp_bias, physical.intermediate_size),
+        ("ffn_up", mlp_bias, physical.intermediate_size),
+        ("ffn_down", mlp_bias, physical.hidden_size),
+    ];
+    for layer in 0..physical.num_layers {
+        for (projection, expected, length) in projections {
+            let name = format!("blk.{layer}.{projection}.bias");
+            let tensor = gguf.tensor_info(&name);
+            if tensor.is_some() != expected {
+                return Err(FerrumError::model(format!(
+                    "GGUF semantic mismatch for {name}: expected bias presence {expected}"
+                )));
+            }
+            if tensor.is_some_and(|tensor| tensor.shape.dims() != [length]) {
+                return Err(FerrumError::model(format!(
+                    "GGUF bias {name} must have shape [{length}]"
+                )));
+            }
+        }
+    }
+    if gguf.has_tensor("output.bias") {
+        return Err(FerrumError::model(
+            "GGUF semantic mismatch: supported causal language heads have no output.bias",
+        ));
+    }
+    Ok(())
+}
+
+fn equivalent_rope_scaling(
+    left: &Option<RopeScalingConfig>,
+    right: &Option<RopeScalingConfig>,
+) -> bool {
+    match (left, right) {
+        (
+            Some(RopeScalingConfig::Linear { factor: left }),
+            Some(RopeScalingConfig::Linear { factor: right }),
+        ) => *left as f32 == *right as f32,
+        (None, Some(RopeScalingConfig::Linear { factor }))
+        | (Some(RopeScalingConfig::Linear { factor }), None) => *factor == 1.0,
+        _ => left == right,
     }
 }
 
@@ -67,11 +402,21 @@ impl LlamaFamilyConfig {
         let hidden_size = read_u32(gguf, &format!("{arch}.embedding_length"))? as usize;
         let intermediate_size = read_u32(gguf, &format!("{arch}.feed_forward_length"))? as usize;
         let num_heads = read_u32(gguf, &format!("{arch}.attention.head_count"))? as usize;
+        if [block_count, hidden_size, intermediate_size, num_heads].contains(&0) {
+            return Err(FerrumError::model(
+                "GGUF dense layer, embedding, FFN and attention dimensions must be nonzero",
+            ));
+        }
         // GQA models put kv-head count here; older ones omit it (= num_heads)
         let num_kv_heads = match read_u32(gguf, &format!("{arch}.attention.head_count_kv")) {
             Ok(v) => v as usize,
             Err(_) => num_heads,
         };
+        if num_kv_heads == 0 || num_heads % num_kv_heads != 0 {
+            return Err(FerrumError::model(
+                "GGUF KV head count must be nonzero and divide the attention head count",
+            ));
+        }
         let rms_norm_eps =
             read_f32(gguf, &format!("{arch}.attention.layer_norm_rms_epsilon"))? as f32;
         // Some GGUFs store context length, some don't — fall back to a sane
@@ -90,7 +435,7 @@ impl LlamaFamilyConfig {
         let rope_theta = read_f32(gguf, &format!("{arch}.rope.freq_base"))
             .map(|v| v as f64)
             .unwrap_or(default_rope);
-        let rope_scaling = infer_llama3_rope_scaling(gguf, arch.as_str(), max_seq_len, rope_theta);
+        let rope_scaling = read_rope_scaling(gguf, arch.as_str(), max_seq_len, rope_theta)?;
 
         // QK-norm: Qwen3 and Gemma3 among supported architectures.
         let has_qk_norm = matches!(arch.as_str(), "qwen3" | "gemma3");
@@ -123,6 +468,11 @@ impl LlamaFamilyConfig {
                 hidden_size / num_heads
             }
         };
+        if [head_dim, vocab_size, max_seq_len].contains(&0) {
+            return Err(FerrumError::model(
+                "GGUF head, vocabulary and context dimensions must be nonzero",
+            ));
+        }
 
         let mut cfg = LlamaFamilyConfig {
             hidden_size,
@@ -303,6 +653,49 @@ fn read_u32(gguf: &GgufFile, key: &str) -> Result<u32> {
 fn read_f32(gguf: &GgufFile, key: &str) -> Result<f32> {
     gguf.metadata_f32(key)
         .map_err(|e| FerrumError::model(format!("GGUF {key}: {e}")))
+}
+
+fn read_rope_scaling(
+    gguf: &GgufFile,
+    arch: &str,
+    max_seq_len: usize,
+    rope_theta: f64,
+) -> Result<Option<RopeScalingConfig>> {
+    let key = format!("{arch}.rope.scaling.type");
+    if gguf.metadata(&key).is_none() {
+        if gguf
+            .metadata(&format!("{arch}.rope.scaling.factor"))
+            .is_some()
+        {
+            return Err(FerrumError::model(format!(
+                "GGUF {key} is required with an explicit scaling factor"
+            )));
+        }
+        return Ok(infer_llama3_rope_scaling(
+            gguf,
+            arch,
+            max_seq_len,
+            rope_theta,
+        ));
+    }
+    let kind = gguf
+        .metadata_string(&key)
+        .map_err(|error| FerrumError::model(format!("GGUF {key}: {error}")))?;
+    match kind {
+        "none" => Ok(None),
+        "linear" => {
+            let factor = read_f32(gguf, &format!("{arch}.rope.scaling.factor"))? as f64;
+            if !factor.is_finite() || factor <= 0.0 {
+                return Err(FerrumError::model(
+                    "GGUF linear RoPE scaling factor must be finite and positive",
+                ));
+            }
+            Ok(Some(RopeScalingConfig::Linear { factor }))
+        }
+        _ => Err(FerrumError::unsupported(format!(
+            "GGUF RoPE scaling '{kind}' is not implemented by the dense decoder"
+        ))),
+    }
 }
 
 fn infer_llama3_rope_scaling(

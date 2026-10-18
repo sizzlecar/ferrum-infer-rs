@@ -14,10 +14,12 @@ use ferrum_quantization::gguf::{GgufFile, GgufLoader};
 use ferrum_types::{DataType, Device, FerrumError, ModelId, ModelInfo, ModelType, Result};
 
 use crate::common::DecoderOnlyLLM;
-use crate::gguf_config::validate_dense_gguf_architecture;
+use crate::definition::{ConfigManager, ModelDefinition};
+use crate::gguf_config::{validate_dense_gguf_architecture, validate_dense_gguf_sources};
 use crate::models::llama_family::{LlamaFamilyConfig, LlamaFamilyModel};
 use crate::models::Qwen3MoeModel;
 use crate::moe_config::Qwen3MoeConfig;
+use crate::vnext::{ProductionModelSourceBundle, ProductionWeightArtifact};
 
 /// Returns `true` if the path looks like a GGUF model (ends in `.gguf`
 /// case-insensitively). Used by the engine factory to branch model loading.
@@ -127,6 +129,35 @@ pub fn load_gguf_decoder_with_info(
 ) -> Result<(Box<dyn DecoderOnlyLLM>, ModelInfo)> {
     let gguf = GgufFile::open(gguf_path)
         .map_err(|e| FerrumError::model(format!("GgufFile::open {}: {e}", gguf_path.display())))?;
+    load_open_gguf_decoder_with_info(gguf, device, model_id, None)
+}
+
+/// Loads a dense GGUF only after checking its physical architecture and
+/// execution configuration against the retained semantic definition. Validation
+/// and weight construction use the same opened file. Compatibility is not proof
+/// of checkpoint equivalence or tokenizer identity.
+pub fn load_gguf_decoder_from_sources_with_info(
+    sources: &ProductionModelSourceBundle,
+    device: &Device,
+    model_id: ModelId,
+) -> Result<(Box<dyn DecoderOnlyLLM>, ModelInfo)> {
+    let ProductionWeightArtifact::GgufFile(path) = sources.weights() else {
+        return Err(FerrumError::model(
+            "GGUF decoder requires a GGUF weight source",
+        ));
+    };
+    let definition = ConfigManager::new().load_from_bytes(sources.config_json())?;
+    let gguf = GgufFile::open(path)
+        .map_err(|e| FerrumError::model(format!("GgufFile::open {}: {e}", path.display())))?;
+    load_open_gguf_decoder_with_info(gguf, device, model_id, Some(&definition))
+}
+
+fn load_open_gguf_decoder_with_info(
+    gguf: GgufFile,
+    device: &Device,
+    model_id: ModelId,
+    semantic: Option<&ModelDefinition>,
+) -> Result<(Box<dyn DecoderOnlyLLM>, ModelInfo)> {
     let arch = gguf
         .architecture()
         .map_err(|e| FerrumError::model(format!("read GGUF arch: {e}")))?
@@ -141,7 +172,9 @@ pub fn load_gguf_decoder_with_info(
         validate_dense_gguf_architecture(&arch)?;
     }
 
-    let dense_cfg = if is_moe {
+    let dense_cfg = if let Some(definition) = semantic {
+        Some(validate_dense_gguf_sources(&gguf, definition)?)
+    } else if is_moe {
         None
     } else {
         Some(LlamaFamilyConfig::from_gguf(&gguf)?)
@@ -250,6 +283,10 @@ pub fn load_gguf_decoder_with_info(
 
     Ok((llm, model_info))
 }
+
+#[cfg(test)]
+#[path = "gguf_engine_loader/source_tests.rs"]
+mod source_tests;
 
 #[cfg(test)]
 mod tests {
