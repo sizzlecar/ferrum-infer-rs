@@ -131,21 +131,147 @@ fn runtime_lora_apply_projection_adds_scaled_delta() {
 mod execution {
     use super::*;
     use ferrum_execution::model_executor::{
-        DecodeInput, PrefillInput, UnifiedBatch, UnifiedBatchItem,
+        ExecutorPrefillAdmission, ExecutorSamplingOutput, LogitsReturnPolicy, PrefillChunk,
     };
-    use ferrum_models::executor::common;
+    use ferrum_execution::token_execution::*;
+    use ferrum_execution::ModelExecutor;
+    use ferrum_interfaces::adapter::LoraAdapterSelection;
     use ferrum_models::test_support::{tiny_llama_executor, TinyLlamaConfig};
-    use ferrum_types::FerrumError;
+    use ferrum_types::{FerrumError, RequestId, Result, TokenId};
 
-    pub(super) fn tokens(ids: &[u32]) -> ferrum_interfaces::TensorRef {
-        common::wrap_tensor(common::tokens_to_tensor(ids, &candle_core::Device::Cpu).unwrap())
+    pub(super) fn selection(path: &std::path::Path) -> LoraAdapterSelection<'_> {
+        LoraAdapterSelection {
+            name: "delta",
+            path: path.to_str().unwrap(),
+        }
     }
 
-    pub(super) fn metadata(path: &std::path::Path) -> HashMap<String, serde_json::Value> {
-        HashMap::from([
-            ("ferrum_lora_adapter".into(), serde_json::json!("delta")),
-            ("ferrum_lora_path".into(), serde_json::json!(path)),
-        ])
+    pub(super) async fn try_admit(
+        executor: &dyn ModelExecutor,
+        request: &RequestId,
+        ids: &[u32],
+        adapter: Option<LoraAdapterSelection<'_>>,
+    ) -> Result<TokenAdmissionOutcome> {
+        let tokens: Vec<_> = ids.iter().copied().map(TokenId::new).collect();
+        executor
+            .admit_tokens(ExecutionAdmission {
+                context: ExecutorPrefillAdmission::for_product_request(
+                    request,
+                    &tokens,
+                    16,
+                    tokens.len(),
+                    0,
+                )?,
+                adapter,
+            })
+            .await
+    }
+
+    pub(super) async fn admit(
+        executor: &dyn ModelExecutor,
+        request: &RequestId,
+        ids: &[u32],
+        adapter: Option<LoraAdapterSelection<'_>>,
+    ) -> ExecutionFrontier {
+        let outcome = try_admit(executor, request, ids, adapter).await.unwrap();
+        let TokenAdmissionOutcome::Admitted(frontier) = outcome else {
+            panic!("tiny LoRA request did not admit: {outcome:?}");
+        };
+        assert_eq!(frontier.consumed_tokens(), 0);
+        frontier
+    }
+
+    pub(super) async fn execute(
+        executor: &dyn ModelExecutor,
+        frontier: &ExecutionFrontier,
+        work: TokenWork,
+    ) -> ExecutionCompletion {
+        let policy = LogitsReturnPolicy::FullLogits;
+        let input = ExecutionWork::new(frontier, work, &policy).unwrap();
+        let outcome = executor
+            .execute_tokens(std::slice::from_ref(&input))
+            .await
+            .unwrap();
+        let ExecutionBatchOutcome::Completed(batch) = outcome else {
+            panic!("tiny LoRA work did not complete: {outcome:?}");
+        };
+        let mut completed = batch.into_completions();
+        assert_eq!(completed.len(), 1);
+        let completion = completed.pop().unwrap();
+        completion
+            .validate_for(0, &input, executor.info().vocab_size)
+            .unwrap();
+        completion
+    }
+
+    pub(super) async fn prefill(
+        executor: &dyn ModelExecutor,
+        frontier: &ExecutionFrontier,
+        count: usize,
+        total: usize,
+    ) -> ExecutionCompletion {
+        execute(
+            executor,
+            frontier,
+            TokenWork::Prefill(
+                PrefillChunk::new(frontier.consumed_tokens(), count, total).unwrap(),
+            ),
+        )
+        .await
+    }
+
+    pub(super) async fn decode(
+        executor: &dyn ModelExecutor,
+        frontier: &ExecutionFrontier,
+        token: u32,
+    ) -> ExecutionCompletion {
+        execute(
+            executor,
+            frontier,
+            TokenWork::Decode {
+                token: TokenId::new(token),
+                position: frontier.consumed_tokens(),
+            },
+        )
+        .await
+    }
+
+    pub(super) fn logits(completion: &ExecutionCompletion) -> &[f32] {
+        let ExecutionProduct::Sampling(ExecutorSamplingOutput::FullLogits(logits)) =
+            completion.product()
+        else {
+            panic!("expected the complete model vocabulary: {completion:?}");
+        };
+        assert!(logits.iter().all(|value| value.is_finite()));
+        logits
+    }
+
+    pub(super) async fn finish(
+        executor: &dyn ModelExecutor,
+        frontier: &ExecutionFrontier,
+        input_tokens: usize,
+        output_tokens: usize,
+    ) {
+        let closed = executor
+            .finish_tokens(
+                frontier.sequence(),
+                ExecutionEndReason::Completed {
+                    input_tokens,
+                    output_tokens,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(closed.error.is_none(), "{:?}", closed.error);
+        let ended = match closed.disposition {
+            ExecutionCloseDisposition::Ended(ended) => ended,
+            ExecutionCloseDisposition::Held(held) => {
+                let terminal = held.wait().await.unwrap();
+                assert!(terminal.error.is_none(), "{:?}", terminal.error);
+                terminal.ended
+            }
+        };
+        assert_eq!(ended.sequence(), frontier.sequence());
     }
 
     pub(super) fn model_adapter(cfg: &TinyLlamaConfig) -> TempDir {
@@ -188,22 +314,17 @@ mod execution {
             ferrum_interfaces::adapter::AdapterExecutionSupport::PerSequenceLora
         );
         let directory = model_adapter(&cfg);
-        let adapter = metadata(directory.path());
         let mut outputs = Vec::new();
-        for selection in [HashMap::new(), adapter.clone(), HashMap::new()] {
-            let prefill = executor
-                .prefill(&PrefillInput::new(tokens(&[0, 1, 2])).with_metadata(selection.clone()))
-                .await
-                .unwrap();
-            let decode = executor
-                .decode(&DecodeInput::new(tokens(&[3]), prefill.kv_cache).with_metadata(selection))
-                .await
-                .unwrap();
-            outputs.push((
-                prefill.logits.to_vec_f32().unwrap(),
-                decode.logits.to_vec_f32().unwrap(),
-            ));
-            executor.release_cache(&decode.kv_cache.cache_id());
+        for adapter in [None, Some(selection(directory.path())), None] {
+            let start = admit(executor.as_ref(), &RequestId::new(), &[0, 1, 2], adapter).await;
+            let first = prefill(executor.as_ref(), &start, 3, 3).await;
+            let next = decode(executor.as_ref(), first.next_frontier(), 3).await;
+            outputs.push((logits(&first).to_vec(), logits(&next).to_vec()));
+            finish(executor.as_ref(), next.next_frontier(), 3, 2).await;
+            assert_eq!(
+                executor.lora_metrics_snapshot().unwrap()["active_cache_bindings"],
+                0
+            );
         }
         assert_eq!(
             outputs[0], outputs[2],
@@ -222,106 +343,61 @@ mod execution {
     }
 
     #[tokio::test]
-    async fn lora_invalid_second_unified_member_cannot_advance_first_cache() {
+    async fn lora_invalid_admission_cannot_advance_or_rebind_existing_base() {
         let cfg = TinyLlamaConfig::default();
         let executor = tiny_llama_executor(&cfg);
         let reference = tiny_llama_executor(&cfg);
-        let prompt = PrefillInput::new(tokens(&[0, 1]));
-        let actual = executor.prefill(&prompt).await.unwrap();
-        let expected = reference.prefill(&prompt).await.unwrap();
+        let request = RequestId::new();
+        let start = admit(executor.as_ref(), &request, &[0, 1], None).await;
+        let reference_start = admit(reference.as_ref(), &RequestId::new(), &[0, 1], None).await;
+        let actual = prefill(executor.as_ref(), &start, 2, 2).await;
+        let expected = prefill(reference.as_ref(), &reference_start, 2, 2).await;
+        assert_eq!(logits(&actual), logits(&expected));
         let directory = model_adapter(&cfg);
-        let adapter = metadata(directory.path());
-        let malformed = HashMap::from([
-            ("ferrum_lora_adapter".into(), serde_json::json!(17)),
-            ("ferrum_lora_path".into(), serde_json::json!(false)),
-        ]);
-        let valid_prefill = PrefillInput::new(tokens(&[0, 1])).with_metadata(adapter.clone());
-        let invalid_prefill = PrefillInput::new(tokens(&[0, 1])).with_metadata(malformed.clone());
-        let result = executor
-            .batch_prefill(&[valid_prefill, invalid_prefill])
-            .await;
-        assert!(matches!(result, Err(FerrumError::RequestValidation { .. })));
-        let valid_decode =
-            DecodeInput::new(tokens(&[2]), actual.kv_cache.clone()).with_metadata(adapter.clone());
-        let invalid_decode = DecodeInput::new(tokens(&[2]), actual.kv_cache.clone())
-            .with_metadata(malformed.clone());
-        let result = executor
-            .batch_decode(&[valid_decode.clone(), invalid_decode.clone()])
-            .await;
-        assert!(matches!(result, Err(FerrumError::RequestValidation { .. })));
-        let result = executor
-            .forward_verify(&[valid_decode.clone(), invalid_decode])
-            .await;
-        assert!(matches!(result, Err(FerrumError::RequestValidation { .. })));
-        // A valid but different later selection must not be ignored either.
-        let result = executor
-            .forward_verify(&[
-                valid_decode,
-                DecodeInput::new(tokens(&[3]), actual.kv_cache.clone()),
-            ])
-            .await;
-        assert!(matches!(result, Err(FerrumError::RequestValidation { .. })));
-        let mut second = UnifiedBatchItem {
-            seq_id: "invalid-lora-second".into(),
-            q_tokens: vec![2, 3],
-            kv_cache: std::sync::Arc::new(common::GenericKvCacheHandle::new(
-                cfg.num_layers,
-                cfg.num_heads,
-                cfg.head_dim,
-                candle_core::Device::Cpu,
-                0,
-                "invalid-lora-second".into(),
-            )),
-            recurrent_state: None,
-            pos_offset: 0,
-            is_final_chunk: true,
-            metadata: malformed,
-            logits_policy: Default::default(),
-        };
-        let first = UnifiedBatchItem {
-            seq_id: actual.kv_cache.cache_id(),
-            q_tokens: vec![2, 3],
-            kv_cache: actual.kv_cache.clone(),
-            recurrent_state: None,
-            pos_offset: 2,
-            is_final_chunk: true,
-            metadata: adapter,
-            logits_policy: Default::default(),
-        };
-        let result = executor
-            .unified_decode(&UnifiedBatch {
-                items: vec![first, second.clone()],
-            })
-            .await;
-        assert!(
-            matches!(result, Err(FerrumError::RequestValidation { .. })),
-            "{result:?}"
-        );
+        let rejected_request = RequestId::new();
+
+        // Selection is immutable admission state, not per-work metadata. Invalid
+        // admissions cannot publish a base fallback or change a live incarnation.
+        for invalid in [
+            LoraAdapterSelection {
+                name: "",
+                path: directory.path().to_str().unwrap(),
+            },
+            LoraAdapterSelection {
+                name: "delta",
+                path: "",
+            },
+        ] {
+            assert!(matches!(
+                try_admit(executor.as_ref(), &rejected_request, &[0, 1], Some(invalid)).await,
+                Err(FerrumError::RequestValidation { .. })
+            ));
+        }
+        assert!(matches!(
+            try_admit(
+                executor.as_ref(),
+                &request,
+                &[0, 1],
+                Some(selection(directory.path())),
+            )
+            .await,
+            Err(FerrumError::RequestValidation { .. })
+        ));
         let metrics = executor.lora_metrics_snapshot().unwrap();
-        assert_eq!(metrics["active_cache_bindings"].as_u64().unwrap(), 0);
-        assert_eq!(metrics["adapter_count"].as_u64().unwrap(), 0);
-        let actual = executor
-            .decode(&DecodeInput::new(tokens(&[2]), actual.kv_cache))
-            .await
-            .unwrap();
-        let expected = reference
-            .decode(&DecodeInput::new(tokens(&[2]), expected.kv_cache))
-            .await
-            .unwrap();
-        assert_eq!(
-            actual.logits.to_vec_f32().unwrap(),
-            expected.logits.to_vec_f32().unwrap()
-        );
-        executor.release_cache(&actual.kv_cache.cache_id());
-        reference.release_cache(&expected.kv_cache.cache_id());
-        second.metadata.clear();
-        executor
-            .unified_decode(&UnifiedBatch {
-                items: vec![second],
-            })
-            .await
-            .unwrap();
-        executor.release_cache("invalid-lora-second");
+        assert_eq!(metrics["active_cache_bindings"], 0);
+        assert_eq!(metrics["adapter_count"], 0);
+        let actual = decode(executor.as_ref(), actual.next_frontier(), 2).await;
+        let expected = decode(reference.as_ref(), expected.next_frontier(), 2).await;
+        assert_eq!(logits(&actual), logits(&expected));
+        finish(executor.as_ref(), actual.next_frontier(), 2, 2).await;
+        finish(reference.as_ref(), expected.next_frontier(), 2, 2).await;
+
+        // The rejected request never owned a live incarnation; it can now
+        // explicitly admit a base request through the same public protocol.
+        let fresh = admit(executor.as_ref(), &rejected_request, &[0, 1], None).await;
+        let first = prefill(executor.as_ref(), &fresh, 2, 2).await;
+        assert!(!logits(&first).is_empty());
+        finish(executor.as_ref(), first.next_frontier(), 2, 1).await;
     }
 }
 

@@ -1,24 +1,27 @@
-use super::execution::{metadata, model_adapter, tokens};
-use super::*;
-use ferrum_execution::model_executor::{
-    DecodeInput, KvSlotRequest, KvSlotReservation, PrefillInput, UnifiedBatch, UnifiedBatchItem,
+use super::execution::{
+    admit, decode, finish, logits, model_adapter, prefill, selection, try_admit,
 };
-use ferrum_execution::ModelExecutor;
-use ferrum_interfaces::adapter::AdapterExecutionSupport;
+use super::*;
+use ferrum_execution::model_executor::{KvSlotRequest, KvSlotReservation};
+use ferrum_execution::token_execution::ExecutionProduct;
+use ferrum_interfaces::adapter::{AdapterExecutionSupport, LoraAdapterSelection};
+use ferrum_models::common::llm::{ModelKvReservation, ModelTokenOutcome, ModelTokenWork};
 use ferrum_models::common::{DecoderOnlyLLM, LlmRuntimeConfig};
 use ferrum_models::models::LlamaFamilyModel;
 use ferrum_models::test_support::{tiny_llama_model, tiny_model_info, TinyLlamaConfig};
 use ferrum_models::LlmExecutor;
-use ferrum_types::Result;
+use ferrum_types::{FerrumError, RequestId, Result};
 use parking_lot::Mutex;
 use std::sync::Arc;
 
-// Keep access to the actual model's live KV map after it is boxed by the
-// executor. Forward, loading, binding and reservation remain real CPU paths.
+// Retain observation of the actual model after boxing it. Preparation,
+// forward, adapter binding and checked release remain real CPU operations.
 struct Observation {
     model: LlamaFamilyModel<CpuBackend>,
     forwards: usize,
-    fail_reservation: bool,
+    fail_preparation: bool,
+    failed_preparations: Vec<(String, Vec<usize>)>,
+    releases: Vec<(String, Vec<usize>)>,
 }
 
 struct ObservedLlama {
@@ -31,8 +34,16 @@ impl DecoderOnlyLLM for ObservedLlama {
         &self.config
     }
 
+    fn supports_direct_token_execution(&self) -> bool {
+        self.state.lock().model.supports_direct_token_execution()
+    }
+
     fn adapter_execution_support(&self) -> AdapterExecutionSupport {
         self.state.lock().model.adapter_execution_support()
+    }
+
+    fn lora_metrics_snapshot(&self) -> Option<serde_json::Value> {
+        self.state.lock().model.lora_metrics_snapshot()
     }
 
     fn preload_lora_adapter(&mut self, adapter: &ActiveLoraAdapter) -> Result<()> {
@@ -50,42 +61,80 @@ impl DecoderOnlyLLM for ObservedLlama {
             .set_lora_adapter_for_cache(cache_id, adapter)
     }
 
-    fn prepare_kv_capacity(&mut self, cache_id: &str, capacity_hint: usize) {
-        self.state
-            .lock()
-            .model
-            .prepare_kv_capacity(cache_id, capacity_hint);
-    }
-
-    fn reserve_kv_slots(
+    fn prepare_token_kv(
         &mut self,
-        requests: &[KvSlotRequest],
-    ) -> Result<Option<KvSlotReservation>> {
+        cache_id: &str,
+        capacity_hint: usize,
+        prompt_tokens: usize,
+    ) -> Result<ModelKvReservation> {
         let mut state = self.state.lock();
-        let reservation = state.model.reserve_kv_slots(requests)?;
-        if state.fail_reservation {
-            Err(ferrum_types::FerrumError::resource_exhausted(
-                "injected capacity rejection after cache preparation",
+        let reservation = state
+            .model
+            .prepare_token_kv(cache_id, capacity_hint, prompt_tokens)?;
+        if state.fail_preparation {
+            assert!(matches!(reservation, ModelKvReservation::Reserved(_)));
+            let lengths = state
+                .model
+                .kv_caches
+                .get(cache_id)
+                .expect("fault must follow actual cache preparation")
+                .iter()
+                .map(|layer| layer.len)
+                .collect();
+            state
+                .failed_preparations
+                .push((cache_id.to_owned(), lengths));
+            Err(FerrumError::resource_exhausted(
+                "injected capacity rejection after actual cache preparation",
             ))
         } else {
             Ok(reservation)
         }
     }
 
-    fn prefill(&mut self, cache_id: &str, tokens: &[u32]) -> Vec<f32> {
-        let mut state = self.state.lock();
-        state.forwards += 1;
-        state.model.prefill(cache_id, tokens)
+    fn reserve_kv_slots(
+        &mut self,
+        requests: &[KvSlotRequest],
+    ) -> Result<Option<KvSlotReservation>> {
+        self.state.lock().model.reserve_kv_slots(requests)
     }
 
-    fn decode(&mut self, cache_id: &str, token: u32, pos: u32) -> Vec<f32> {
+    fn execute_token_work(
+        &mut self,
+        cache_id: &str,
+        work: ModelTokenWork<'_>,
+    ) -> ModelTokenOutcome {
         let mut state = self.state.lock();
         state.forwards += 1;
-        state.model.decode(cache_id, token, pos)
+        state.model.execute_token_work(cache_id, work)
     }
 
-    fn release(&mut self, cache_id: &str) {
-        self.state.lock().model.release(cache_id);
+    fn close_token_sequence(&mut self, cache_id: &str) -> Result<()> {
+        let mut state = self.state.lock();
+        let lengths = state
+            .model
+            .kv_caches
+            .get(cache_id)
+            .expect("checked close must retain the actual prepared cache")
+            .iter()
+            .map(|layer| layer.len)
+            .collect();
+        state.model.close_token_sequence(cache_id)?;
+        assert!(!state.model.kv_caches.contains_key(cache_id));
+        state.releases.push((cache_id.to_owned(), lengths));
+        Ok(())
+    }
+
+    fn prefill(&mut self, _cache_id: &str, _tokens: &[u32]) -> Vec<f32> {
+        panic!("token test must not call the old model prefill entry")
+    }
+
+    fn decode(&mut self, _cache_id: &str, _token: u32, _pos: u32) -> Vec<f32> {
+        panic!("token test must not call the old model decode entry")
+    }
+
+    fn release(&mut self, _cache_id: &str) {
+        panic!("token test requires checked model closure")
     }
 }
 
@@ -95,7 +144,9 @@ fn observed(cfg: &TinyLlamaConfig) -> (LlmExecutor, Arc<Mutex<Observation>>) {
     let state = Arc::new(Mutex::new(Observation {
         model,
         forwards: 0,
-        fail_reservation: false,
+        fail_preparation: false,
+        failed_preparations: Vec::new(),
+        releases: Vec::new(),
     }));
     let executor = LlmExecutor::new(
         Box::new(ObservedLlama {
@@ -105,17 +156,6 @@ fn observed(cfg: &TinyLlamaConfig) -> (LlmExecutor, Arc<Mutex<Observation>>) {
         tiny_model_info(cfg),
     );
     (executor, state)
-}
-
-fn bad_adapter(path: &std::path::Path) -> HashMap<String, serde_json::Value> {
-    let mut selected = metadata(&path.join("missing-adapter"));
-    selected.insert("ferrum_lora_adapter".into(), serde_json::json!("missing"));
-    selected
-}
-
-fn hinted(mut selected: HashMap<String, serde_json::Value>) -> HashMap<String, serde_json::Value> {
-    selected.insert("ferrum_kv_capacity_hint".into(), serde_json::json!(16));
-    selected
 }
 
 fn snapshot(state: &Mutex<Observation>) -> (Vec<(String, Vec<usize>)>, u64, usize) {
@@ -137,149 +177,162 @@ fn snapshot(state: &Mutex<Observation>) -> (Vec<(String, Vec<usize>)>, u64, usiz
 async fn lora_preparation_load_failure_leaves_no_hidden_prefill_cache() {
     let cfg = TinyLlamaConfig::default();
     let directory = model_adapter(&cfg);
+    let missing_path = directory.path().join("missing-adapter");
+    let invalid = LoraAdapterSelection {
+        name: "missing",
+        path: missing_path.to_str().unwrap(),
+    };
     let (executor, state) = observed(&cfg);
-    let valid =
-        PrefillInput::new(tokens(&[0, 1])).with_metadata(hinted(metadata(directory.path())));
-    let invalid =
-        PrefillInput::new(tokens(&[0, 1])).with_metadata(hinted(bad_adapter(directory.path())));
+    let rejected_request = RequestId::new();
+    assert!(
+        try_admit(&executor, &rejected_request, &[0, 1], Some(invalid))
+            .await
+            .is_err()
+    );
+    assert_eq!(snapshot(&state), (vec![], 0, 0));
+    assert!(state.lock().releases.is_empty());
 
-    assert!(executor.prefill(&invalid).await.is_err());
-    assert_eq!(snapshot(&state), (vec![], 0, 0));
-    assert!(executor
-        .batch_prefill(&[valid.clone(), invalid])
-        .await
-        .is_err());
-    assert_eq!(snapshot(&state), (vec![], 0, 0));
-    // A successfully preloaded adapter may remain cached and must be reusable.
-    let output = executor.prefill(&valid).await.unwrap();
+    // A failed unpublished admission does not poison its request identity.
+    let start = admit(
+        &executor,
+        &rejected_request,
+        &[0, 1],
+        Some(selection(directory.path())),
+    )
+    .await;
     assert_eq!(snapshot(&state).1, 1);
-    executor.release_cache(&output.kv_cache.cache_id());
+    let output = prefill(&executor, &start, 2, 2).await;
+    assert!(!logits(&output).is_empty());
+    finish(&executor, output.next_frontier(), 2, 1).await;
     assert!(snapshot(&state).0.is_empty());
     assert_eq!(snapshot(&state).1, 0);
+    assert_eq!(state.lock().releases.len(), 1);
+
+    // Reusable adapter weights may stay cached, but a subsequent load failure
+    // must not create a new sequence cache or change any execution state.
+    let before = snapshot(&state);
+    assert!(
+        try_admit(&executor, &RequestId::new(), &[0, 1], Some(invalid))
+            .await
+            .is_err()
+    );
+    assert_eq!(snapshot(&state), before);
+    assert_eq!(state.lock().releases.len(), 1);
 }
 
 #[tokio::test]
-async fn lora_preparation_failed_batches_preserve_existing_adapter_and_kv() {
+async fn lora_failed_admission_preserves_existing_adapter_kv_and_logits() {
     let cfg = TinyLlamaConfig::default();
     let directory = model_adapter(&cfg);
-    let selected = metadata(directory.path());
+    let selected = Some(selection(directory.path()));
     let (executor, state) = observed(&cfg);
-    let (reference, _) = observed(&cfg);
-    let prompt = PrefillInput::new(tokens(&[0, 1])).with_metadata(selected.clone());
-    let initial = executor.prefill(&prompt).await.unwrap();
-    let expected = reference.prefill(&prompt).await.unwrap();
+    let (reference, reference_state) = observed(&cfg);
+    let request = RequestId::new();
+    let start = admit(&executor, &request, &[0, 1, 2], selected).await;
+    let reference_start = admit(&reference, &RequestId::new(), &[0, 1, 2], selected).await;
+    let initial = prefill(&executor, &start, 2, 3).await;
+    let expected = prefill(&reference, &reference_start, 2, 3).await;
+    assert!(matches!(initial.product(), ExecutionProduct::Intermediate));
+    assert!(matches!(expected.product(), ExecutionProduct::Intermediate));
     let before = snapshot(&state);
+    assert_eq!(before.0.len(), 1);
+    assert!(before.0[0].1.iter().all(|length| *length == 2));
     assert_eq!(before.1, 1);
-    let bad = bad_adapter(directory.path());
-    let continuation = PrefillInput::new(tokens(&[2])).with_kv_cache(initial.kv_cache.clone());
-    assert!(executor
-        .prefill(&continuation.clone().with_metadata(bad.clone()))
-        .await
-        .is_err());
-    assert!(executor
-        .batch_prefill(&[
-            continuation,
-            PrefillInput::new(tokens(&[2])).with_metadata(bad.clone()),
-        ])
-        .await
-        .is_err());
-    let base = DecodeInput::new(tokens(&[2]), initial.kv_cache.clone());
-    let invalid = base.clone().with_metadata(bad.clone());
-    assert!(executor.decode(&invalid).await.is_err());
-    assert!(executor.batch_decode(&[base, invalid]).await.is_err());
-    let item = |id: &str, metadata| UnifiedBatchItem {
-        seq_id: id.into(),
-        q_tokens: vec![2],
-        kv_cache: initial.kv_cache.clone(),
-        recurrent_state: None,
-        pos_offset: 2,
-        is_final_chunk: true,
-        metadata,
-        logits_policy: Default::default(),
-    };
-    assert!(executor
-        .unified_decode(&UnifiedBatch {
-            items: vec![
-                item(&initial.kv_cache.cache_id(), HashMap::new()),
-                item("caller-owned-not-yet-executed", bad),
-            ]
-        })
-        .await
-        .is_err());
-    assert_eq!(snapshot(&state), before);
+    let missing_path = directory.path().join("missing-adapter");
 
-    let actual = executor
-        .decode(&DecodeInput::new(tokens(&[2]), initial.kv_cache).with_metadata(selected.clone()))
-        .await
-        .unwrap();
-    let expected = reference
-        .decode(&DecodeInput::new(tokens(&[2]), expected.kv_cache).with_metadata(selected))
-        .await
-        .unwrap();
-    assert_eq!(
-        actual.logits.to_vec_f32().unwrap(),
-        expected.logits.to_vec_f32().unwrap()
-    );
-    executor.release_cache(&actual.kv_cache.cache_id());
-    reference.release_cache(&expected.kv_cache.cache_id());
+    assert!(try_admit(
+        &executor,
+        &RequestId::new(),
+        &[2],
+        Some(LoraAdapterSelection {
+            name: "missing",
+            path: missing_path.to_str().unwrap()
+        }),
+    )
+    .await
+    .is_err());
+    // A new base admission cannot rebind the existing adapter incarnation.
+    assert!(matches!(
+        try_admit(&executor, &request, &[0, 1, 2], None).await,
+        Err(FerrumError::RequestValidation { .. })
+    ));
+    assert_eq!(snapshot(&state), before);
+    assert!(state.lock().releases.is_empty());
+
+    // Complete the original immutable prompt after the failed admission and
+    // compare all vocabulary logits to an independently executed model.
+    let actual = prefill(&executor, initial.next_frontier(), 1, 3).await;
+    let expected = prefill(&reference, expected.next_frontier(), 1, 3).await;
+    assert_eq!(logits(&actual), logits(&expected));
+    let actual = decode(&executor, actual.next_frontier(), 3).await;
+    let expected = decode(&reference, expected.next_frontier(), 3).await;
+    assert_eq!(logits(&actual), logits(&expected));
+    finish(&executor, actual.next_frontier(), 3, 2).await;
+    finish(&reference, expected.next_frontier(), 3, 2).await;
+    for observation in [&state, &reference_state] {
+        let after = snapshot(observation);
+        assert!(after.0.is_empty());
+        assert_eq!(after.1, 0);
+        let observation = observation.lock();
+        assert_eq!(observation.releases.len(), 1);
+        assert_eq!(observation.releases[0].1, vec![4; cfg.num_layers]);
+    }
 }
 
 #[tokio::test]
-async fn lora_preparation_capacity_failure_preserves_existing_and_discards_new_caches() {
+async fn lora_admission_capacity_failure_preserves_existing_and_discards_new_caches() {
     let cfg = TinyLlamaConfig::default();
     let directory = model_adapter(&cfg);
-    let selected = metadata(directory.path());
+    let selected = Some(selection(directory.path()));
     let (executor, state) = observed(&cfg);
-    let (reference, _) = observed(&cfg);
-    let prompt = PrefillInput::new(tokens(&[0, 1])).with_metadata(selected.clone());
-    let initial = executor.prefill(&prompt).await.unwrap();
-    let expected = reference.prefill(&prompt).await.unwrap();
+    let (reference, reference_state) = observed(&cfg);
+    let start = admit(&executor, &RequestId::new(), &[0, 1], selected).await;
+    let reference_start = admit(&reference, &RequestId::new(), &[0, 1], selected).await;
+    let initial = prefill(&executor, &start, 2, 2).await;
+    let expected = prefill(&reference, &reference_start, 2, 2).await;
+    assert_eq!(logits(&initial), logits(&expected));
     let before = snapshot(&state);
-    state.lock().fail_reservation = true;
-    let fresh = || PrefillInput::new(tokens(&[2])).with_metadata(hinted(selected.clone()));
-    assert!(executor.prefill(&fresh()).await.is_err());
-    assert_eq!(snapshot(&state), before);
-    assert!(executor
-        .batch_prefill(&[
-            PrefillInput::new(tokens(&[2])).with_kv_cache(initial.kv_cache.clone()),
-            fresh(),
-            fresh(),
-        ])
-        .await
-        .is_err());
-    assert_eq!(snapshot(&state), before);
-    let base = DecodeInput::new(tokens(&[2]), initial.kv_cache.clone());
-    assert!(executor.decode(&base).await.is_err());
-    assert!(executor.batch_decode(&[base]).await.is_err());
-    assert!(executor
-        .unified_decode(&UnifiedBatch {
-            items: vec![UnifiedBatchItem {
-                seq_id: initial.kv_cache.cache_id(),
-                q_tokens: vec![2],
-                kv_cache: initial.kv_cache.clone(),
-                recurrent_state: None,
-                pos_offset: 2,
-                is_final_chunk: true,
-                metadata: HashMap::new(),
-                logits_policy: Default::default(),
-            }]
-        })
-        .await
-        .is_err());
-    assert_eq!(snapshot(&state), before);
-    state.lock().fail_reservation = false;
-    let actual = executor
-        .decode(&DecodeInput::new(tokens(&[2]), initial.kv_cache).with_metadata(selected.clone()))
-        .await
-        .unwrap();
-    let expected = reference
-        .decode(&DecodeInput::new(tokens(&[2]), expected.kv_cache).with_metadata(selected))
-        .await
-        .unwrap();
+    state.lock().fail_preparation = true;
+    for _ in 0..2 {
+        assert!(matches!(
+            try_admit(&executor, &RequestId::new(), &[2], selected).await,
+            Err(FerrumError::ResourceExhausted { .. })
+        ));
+        assert_eq!(snapshot(&state), before);
+    }
+    {
+        let observation = state.lock();
+        assert_eq!(observation.failed_preparations.len(), 2);
+        assert_ne!(
+            observation.failed_preparations[0].0,
+            observation.failed_preparations[1].0
+        );
+        assert_eq!(observation.releases, observation.failed_preparations);
+        for (cache_id, lengths) in &observation.failed_preparations {
+            assert_ne!(cache_id, &before.0[0].0);
+            assert_eq!(lengths, &vec![0; cfg.num_layers]);
+        }
+    }
+    // This injected preparation failure covers unpublished fresh admissions.
+    // No retry permission is inferred for an execution that itself failed.
+    state.lock().fail_preparation = false;
+    let actual = decode(&executor, initial.next_frontier(), 2).await;
+    let expected = decode(&reference, expected.next_frontier(), 2).await;
+    assert_eq!(logits(&actual), logits(&expected));
+    finish(&executor, actual.next_frontier(), 2, 2).await;
+    finish(&reference, expected.next_frontier(), 2, 2).await;
+    assert!(snapshot(&state).0.is_empty());
+    assert_eq!(snapshot(&state).1, 0);
+    assert_eq!(state.lock().releases.len(), 3);
     assert_eq!(
-        actual.logits.to_vec_f32().unwrap(),
-        expected.logits.to_vec_f32().unwrap()
+        state.lock().releases.last().unwrap().1,
+        vec![3; cfg.num_layers]
     );
-    executor.release_cache(&actual.kv_cache.cache_id());
-    reference.release_cache(&expected.kv_cache.cache_id());
+    assert!(snapshot(&reference_state).0.is_empty());
+    assert_eq!(snapshot(&reference_state).1, 0);
+    assert_eq!(reference_state.lock().releases.len(), 1);
+    assert_eq!(
+        reference_state.lock().releases[0].1,
+        vec![3; cfg.num_layers]
+    );
 }
