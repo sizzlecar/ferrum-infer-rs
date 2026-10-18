@@ -54,7 +54,7 @@ pub fn start_probe_timer_if<B: Backend>(enabled: bool, ctx: &mut B::Context) -> 
     }
 }
 
-/// Close a timer started by [`start_probe_timer`] and return the
+/// Close a timer started by [`start_probe_timer_if`] and return the
 /// elapsed microseconds. `None` propagates the "disabled" state so the
 /// caller can keep the `if let Some(us) = ... { record(us) }` pattern.
 pub fn finish_probe_timer<B: Backend>(
@@ -64,24 +64,6 @@ pub fn finish_probe_timer<B: Backend>(
     let mut t = timer?;
     t.record_end(ctx);
     Some((t.elapsed_ms() * 1000.0) as u64)
-}
-
-/// Convenience wrapper: close a timer AND push a chrome-trace event in
-/// one call. When `FERRUM_TRACE_OUT` is unset, the trace push is a
-/// no-op (cheap atomic check inside [`global_trace`]).
-///
-/// The trace is standard chrome-trace JSON and can be inspected with common
-/// profiling tools.
-pub fn finish_probe_timer_traced<B: Backend>(
-    timer: Option<B::Timer>,
-    ctx: &mut B::Context,
-    name: &str,
-    cat: &str,
-    tid: u32,
-) -> Option<u64> {
-    let us = finish_probe_timer::<B>(timer, ctx)?;
-    ferrum_bench_core::trace::global_trace().push(name, cat, (us as f64) / 1000.0, tid);
-    Some(us)
 }
 
 /// GPU-side timer scoped to a single Backend context.

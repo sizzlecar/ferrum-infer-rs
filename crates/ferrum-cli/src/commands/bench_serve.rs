@@ -1957,9 +1957,6 @@ fn emit_then_enforce_error_policy(cmd: &BenchServeCommand, reports: &[BenchRepor
     // still leave quality/error-count evidence in --out artifacts.
     emit_reports(cmd, reports)?;
 
-    // PLAYBOOK § 1.5: static globals don't drop on Rust process exit.
-    ferrum_bench_core::trace::flush_global_trace();
-
     enforce_error_policy(cmd, reports)?;
     if cmd.latency_slo_fail_on_violation
         && reports.iter().any(|report| {

@@ -108,38 +108,36 @@ async fn serve_lifecycle_dropped_observer_requests_same_task_cleanup_without_ret
         .contains("original_cleanup"));
 }
 
-#[test]
-fn serve_native_off_profile_assembly_uses_only_native_writer_and_rejects_scheduler_alias() {
+#[tokio::test]
+async fn serve_off_profile_assembly_shares_typed_scheduler_destination() {
     use crate::observability_product::{
         ProductJournalSession, ProductObservabilityConfig, ProfileDetailArg,
     };
     let directory = tempfile::tempdir().unwrap();
-    let path = directory.path().join("native.jsonl");
+    let path = directory.path().join("profile.jsonl");
     let product = ProductObservabilityConfig::new(
         ferrum_types::ProfileEntrypoint::Serve,
-        "native-profile",
+        "profile",
         Some(&path),
         ProfileDetailArg::Off,
         None,
-        None,
+        Some(&path),
         None,
         1.0,
     );
     let mut engine = ferrum_types::EngineConfig::default();
     engine.runtime.profile_jsonl = Some(path.clone());
-    super::select_serve_profile_destination(&mut engine, &product);
-    assert!(engine.runtime.profile_jsonl.is_none());
+    engine.runtime.scheduler_trace_jsonl = Some(directory.path().join(".").join("profile.jsonl"));
     let journals = ProductJournalSession::prepare(&product, &engine);
     journals.result().unwrap();
-    assert!(
-        !path.exists(),
-        "typed assembly must not create the native writer"
+    assert_eq!(
+        engine.runtime.profile_detail,
+        ferrum_types::ObservabilityProfileDetail::Off
     );
-    drop(journals);
-    engine.runtime.scheduler_trace_jsonl = Some(directory.path().join(".").join("native.jsonl"));
-    let journals = ProductJournalSession::prepare(&product, &engine);
-    assert!(matches!(journals.result(), Err(FerrumError::Config { .. })));
-    assert!(!path.exists());
+    assert!(product.unified_product_profile_enabled());
+    journals.finish().await.unwrap();
+    assert!(journals.is_closed());
+    assert!(path.exists());
 }
 
 #[tokio::test]

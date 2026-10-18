@@ -4,12 +4,14 @@ mod lifecycle;
 #[cfg(test)]
 #[path = "serve/lifecycle_tests.rs"]
 mod lifecycle_tests;
+#[cfg(test)]
+#[path = "serve/profile_metadata_tests.rs"]
+mod profile_metadata_tests;
 
 use crate::config::CliConfig;
 use crate::runtime_env::runtime_snapshot_value;
 use clap::Args;
 use colored::*;
-use ferrum_bench_core::{ProfileMetadata, ProfileSinkConfig};
 use ferrum_models::source::ModelFormat;
 use ferrum_server::{AxumServer, HttpServer, ServedModelKind, ServedModelRegistry, ServerConfig};
 use ferrum_types::{
@@ -305,7 +307,7 @@ pub struct ServeCommand {
     #[command(flatten)]
     pub vnext_checkpoint: crate::commands::vnext_checkpoint::VNextCheckpointArgs,
 
-    /// Write native structured profile events to this JSONL path.
+    /// Write standard product profile events to this JSONL path.
     #[arg(long, value_name = "PATH")]
     pub profile_jsonl: Option<PathBuf>,
 
@@ -333,23 +335,23 @@ pub struct ServeCommand {
     #[arg(long, default_value_t = crate::observability_product::default_profile_sample_rate())]
     pub profile_sample_rate: f64,
 
-    /// Git commit stamped into native structured profile events.
+    /// Git commit recorded in product session metadata.
     #[arg(long, value_name = "SHA")]
     pub profile_commit_sha: Option<String>,
 
-    /// Runtime environment hash stamped into native structured profile events.
+    /// Runtime environment hash recorded in product session metadata.
     #[arg(long, value_name = "SHA256")]
     pub profile_env_hash: Option<String>,
 
-    /// Model label stamped into native structured profile events.
+    /// Model label recorded in product session metadata.
     #[arg(long, value_name = "MODEL")]
     pub profile_model: Option<String>,
 
-    /// Concurrency stamped into native structured profile events.
+    /// Concurrency recorded in product session metadata.
     #[arg(long, value_name = "N")]
     pub profile_concurrency: Option<u32>,
 
-    /// Runtime flags/config JSON object embedded in native profile events.
+    /// Runtime flags/config JSON object embedded in product session metadata.
     #[arg(long, value_name = "JSON")]
     pub profile_runtime_flags_json: Option<String>,
 
@@ -861,11 +863,6 @@ async fn run_serve_lifecycle(
         session_cache_max_tokens,
         profile_jsonl.as_ref(),
         scheduler_trace_jsonl.as_ref(),
-        profile_commit_sha.as_deref(),
-        profile_env_hash.as_deref(),
-        profile_model.as_deref(),
-        profile_concurrency,
-        profile_runtime_flags_json.as_deref(),
         layer_split_pipeline_mode,
     );
     push_invocation_preparation_strategy_cli_entry(
@@ -1016,6 +1013,20 @@ async fn run_serve_lifecycle(
         runtime_config,
     )?;
     crate::runtime_env::materialize_runtime_env_effective(&startup_auto_config.runtime_config);
+    let profile_metadata = profile_jsonl
+        .as_ref()
+        .map(|_| {
+            crate::observability_product::ProductSessionMetadata::new(
+                profile_commit_sha,
+                profile_env_hash,
+                profile_model,
+                profile_concurrency,
+                profile_runtime_flags_json,
+                &startup_auto_config,
+                &model_id,
+            )
+        })
+        .transpose()?;
     let lora_server_models: Vec<ferrum_server::LoraAdapterModel> = startup_lora_adapters
         .iter()
         .map(|adapter| {
@@ -1071,13 +1082,15 @@ async fn run_serve_lifecycle(
             &mut engine_config.backend.backend_options,
         )?;
         super::run::apply_kv_dtype_override(&mut engine_config, effective_kv_dtype)?;
-        select_serve_profile_destination(&mut engine_config, &product_observability);
         let journals = crate::observability_product::ProductJournalSession::prepare(
             &product_observability,
             &engine_config,
         );
         product_journals = Some(journals.clone());
         journals.result()?;
+        if let Some(metadata) = &profile_metadata {
+            metadata.write(&journals, &product_observability)?;
+        }
         let scopes = journals.engine_scopes(&engine_config)?;
         let mut builder =
             ferrum_engine::EngineBuilder::new(engine_config).with_journal_scopes(scopes);
@@ -1138,23 +1151,6 @@ async fn run_serve_lifecycle(
         &numerical_execution,
         effective_config_json.as_deref(),
         decision_trace_jsonl.as_deref(),
-    )?;
-    let native_profile_jsonl = if product_observability.unified_product_profile_enabled() {
-        None
-    } else {
-        profile_jsonl.clone()
-    };
-    configure_profile_sink(
-        native_profile_jsonl,
-        ProfileSinkCliFields {
-            commit_sha: profile_commit_sha,
-            env_hash: profile_env_hash,
-            model: profile_model,
-            concurrency: profile_concurrency,
-            runtime_flags_json: profile_runtime_flags_json,
-        },
-        &startup_auto_config,
-        &model_id,
     )?;
 
     write_resolved_execution_config(
@@ -1217,16 +1213,10 @@ async fn run_serve_lifecycle(
         host: host.clone(),
         port,
         request_dump_dir: request_dump_dir.clone(),
-        profile_jsonl: product_observability
-            .unified_product_profile_enabled()
-            .then(|| profile_jsonl.clone())
-            .flatten(),
+        profile_jsonl: profile_jsonl.clone(),
         profile_detail: product_observability.profile_detail,
         profile_journal: product_observability.journal,
-        memory_profile_jsonl: product_observability
-            .unified_product_profile_enabled()
-            .then(|| memory_profile_jsonl.clone())
-            .flatten(),
+        memory_profile_jsonl: memory_profile_jsonl.clone(),
         ..Default::default()
     };
 
@@ -1288,11 +1278,6 @@ async fn run_serve_lifecycle(
     // Clean up PID file
     std::fs::remove_file(&pid_file).ok();
 
-    // PLAYBOOK § 1.5: Rust statics don't drop on exit, so the global
-    // TraceWriter's buffered events would be lost. Force-flush on
-    // ctrl_c-driven shutdown (matches bench / bench-serve exit paths).
-    ferrum_bench_core::trace::flush_global_trace();
-    ferrum_bench_core::flush_global_profile();
     let shutdown_after = product_memory_enabled
         .then(|| memory_sampler.sample())
         .flatten();
@@ -1689,11 +1674,6 @@ fn serve_cli_runtime_entries(
     session_cache_max_tokens: Option<usize>,
     profile_jsonl: Option<&PathBuf>,
     scheduler_trace_jsonl: Option<&PathBuf>,
-    profile_commit_sha: Option<&str>,
-    profile_env_hash: Option<&str>,
-    profile_model: Option<&str>,
-    profile_concurrency: Option<u32>,
-    profile_runtime_flags_json: Option<&str>,
     layer_split_pipeline_mode: Option<crate::layer_split_pipeline::LayerSplitPipelineModeArg>,
 ) -> Vec<RuntimeConfigEntry> {
     let mut entries = Vec::new();
@@ -1793,25 +1773,6 @@ fn serve_cli_runtime_entries(
             RuntimeConfigSource::Cli,
         ));
     }
-    push_cli_runtime_entry(
-        &mut entries,
-        "FERRUM_PROFILE_COMMIT_SHA",
-        profile_commit_sha,
-    );
-    push_cli_runtime_entry(&mut entries, "FERRUM_PROFILE_ENV_HASH", profile_env_hash);
-    push_cli_runtime_entry(&mut entries, "FERRUM_PROFILE_MODEL", profile_model);
-    if let Some(concurrency) = profile_concurrency {
-        entries.push(RuntimeConfigEntry::new(
-            "FERRUM_PROFILE_CONCURRENCY",
-            concurrency.to_string(),
-            RuntimeConfigSource::Cli,
-        ));
-    }
-    push_cli_runtime_entry(
-        &mut entries,
-        "FERRUM_PROFILE_RUNTIME_FLAGS_JSON",
-        profile_runtime_flags_json,
-    );
     crate::layer_split_pipeline::push_cli_runtime_entry(&mut entries, layer_split_pipeline_mode);
     entries
 }
@@ -2092,85 +2053,6 @@ pub(crate) fn write_resolved_execution_config(
         .map_err(|error| ferrum_types::FerrumError::serialization(error.to_string()))?;
     std::fs::write(path, [bytes.as_slice(), b"\n"].concat())
         .map_err(|error| ferrum_types::FerrumError::io(error.to_string()))
-}
-
-struct ProfileSinkCliFields {
-    commit_sha: Option<String>,
-    env_hash: Option<String>,
-    model: Option<String>,
-    concurrency: Option<u32>,
-    runtime_flags_json: Option<String>,
-}
-
-// The public Off+profile mode selects the native backend profile protocol.
-// Do not also assign that same CLI destination to the typed Engine journal.
-// Other typed destinations (scheduler/legacy resource trace) remain intact and
-// the product assembly checks canonical collisions with the native path.
-fn select_serve_profile_destination(
-    engine: &mut ferrum_types::EngineConfig,
-    product: &crate::observability_product::ProductObservabilityConfig,
-) {
-    if product.profile_jsonl.is_some() && !product.unified_product_profile_enabled() {
-        engine.runtime.profile_jsonl = None;
-    }
-}
-
-fn configure_profile_sink(
-    profile_jsonl: Option<PathBuf>,
-    fields: ProfileSinkCliFields,
-    auto_config: &ResolvedFerrumConfig,
-    model_id: &str,
-) -> Result<()> {
-    let Some(path) = profile_jsonl else {
-        return Ok(());
-    };
-
-    let runtime_flags = match fields.runtime_flags_json {
-        Some(json) => {
-            let value = serde_json::from_str::<serde_json::Value>(&json).map_err(|err| {
-                ferrum_types::FerrumError::config(format!(
-                    "invalid --profile-runtime-flags-json: {err}"
-                ))
-            })?;
-            if !value.is_object() {
-                return Err(ferrum_types::FerrumError::config(
-                    "--profile-runtime-flags-json must be a JSON object",
-                ));
-            }
-            value
-        }
-        None => auto_config.effective_config_document(),
-    };
-
-    let env_hash = match fields.env_hash {
-        Some(value) if value.starts_with("sha256:") => value,
-        Some(_) => {
-            return Err(ferrum_types::FerrumError::config(
-                "--profile-env-hash must start with sha256:",
-            ))
-        }
-        None => auto_config.runtime_env_hash(),
-    };
-
-    let metadata = ProfileMetadata {
-        commit_sha: fields.commit_sha.filter(|value| !value.trim().is_empty()),
-        env_hash,
-        model: fields
-            .model
-            .filter(|value| !value.trim().is_empty())
-            .unwrap_or_else(|| model_id.to_string()),
-        concurrency: fields
-            .concurrency
-            .filter(|value| *value > 0)
-            .unwrap_or_else(|| auto_config.workload_profile.target_concurrency.max(1) as u32),
-        runtime_flags,
-    };
-    let profile_config = ProfileSinkConfig::enabled(path, metadata);
-    ferrum_bench_core::configure_global_profile(profile_config.clone())
-        .map_err(|err| ferrum_types::FerrumError::io(err.to_string()))?;
-    ferrum_kernels::configure_native_profile_sink(&profile_config)
-        .map_err(|err| ferrum_types::FerrumError::io(err.to_string()))?;
-    Ok(())
 }
 
 #[cfg(test)]
@@ -3246,11 +3128,6 @@ mod tests {
             Some(1024),
             Some(&PathBuf::from("/tmp/profile.jsonl")),
             Some(&PathBuf::from("/tmp/scheduler-trace.jsonl")),
-            Some("abc123"),
-            Some("sha256:test"),
-            Some("Qwen/Qwen3-30B-A3B-GPTQ-Int4"),
-            Some(32),
-            Some("{\"schema_version\":1}"),
             Some(crate::layer_split_pipeline::LayerSplitPipelineModeArg::Batch),
         );
         push_sequence_fit_policy_cli_entry(
@@ -3334,11 +3211,10 @@ mod tests {
             "/tmp/scheduler-trace.jsonl"
         );
         assert_eq!(entry("FERRUM_PROFILE_ENTRYPOINT").effective_value, "serve");
-        assert_eq!(
-            entry("FERRUM_PROFILE_ENV_HASH").effective_value,
-            "sha256:test"
-        );
-        assert_eq!(entry("FERRUM_PROFILE_CONCURRENCY").effective_value, "32");
+        assert!(!snapshot.entries.iter().any(|entry| matches!(
+            entry.key.as_str(),
+            "FERRUM_PROFILE_ENV_HASH" | "FERRUM_PROFILE_CONCURRENCY"
+        )));
         assert_eq!(
             entry("FERRUM_SEQUENCE_FIT_POLICY").effective_value,
             "full-input-must-fit"
@@ -3397,11 +3273,6 @@ mod tests {
         .runtime_config_entries();
         let mut cli_entries = serve_cli_runtime_entries(
             Some("int8"),
-            None,
-            None,
-            None,
-            None,
-            None,
             None,
             None,
             None,
@@ -3546,11 +3417,6 @@ mod tests {
             Some(crate::commands::PrefillDecodeExecutionArg::Split),
             Some(false),
             Some(false),
-            None,
-            None,
-            None,
-            None,
-            None,
             None,
             None,
             None,
@@ -3978,11 +3844,6 @@ mod tests {
             None,
             None,
             None,
-            None,
-            None,
-            None,
-            None,
-            None,
         );
 
         let snapshot = merge_runtime_config_sources(Vec::new(), env_snapshot, cli_entries);
@@ -4055,11 +3916,6 @@ mod tests {
             None,
             None,
             None,
-            None,
-            None,
-            None,
-            None,
-            None,
         );
         let product_enabled_entries = serve_cli_runtime_entries(
             None,
@@ -4076,11 +3932,6 @@ mod tests {
             None,
             None,
             prefix_cache_cli_override(false, false, true, false),
-            None,
-            None,
-            None,
-            None,
-            None,
             None,
             None,
             None,
@@ -4109,11 +3960,6 @@ mod tests {
             None,
             None,
             None,
-            None,
-            None,
-            None,
-            None,
-            None,
         );
         let product_disabled_entries = serve_cli_runtime_entries(
             None,
@@ -4130,11 +3976,6 @@ mod tests {
             None,
             None,
             prefix_cache_cli_override(false, false, false, true),
-            None,
-            None,
-            None,
-            None,
-            None,
             None,
             None,
             None,

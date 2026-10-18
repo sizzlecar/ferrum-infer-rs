@@ -20,10 +20,7 @@
 //! — same kernel ferrum already uses for dense Llama-family models.
 
 use std::path::Path;
-use std::sync::{
-    atomic::{AtomicU64, Ordering},
-    OnceLock,
-};
+use std::sync::OnceLock;
 
 use candle_core::quantized::GgmlDType;
 use candle_core::{Device, Result as CandleResult};
@@ -39,88 +36,8 @@ use ferrum_types::{FerrumError, Result};
 
 use crate::moe::router::RouterOutput;
 
-/// MoE per-op timers. Public so the model wrapper can drain + print at
-/// end of decode. Times are in microseconds, atomically accumulated.
-/// Toggle via env `FERRUM_MOE_PROFILE=1`.
-pub static MOE_SYNC_US: AtomicU64 = AtomicU64::new(0);
-pub static MOE_SYNC_CALLS: AtomicU64 = AtomicU64::new(0);
-pub static MOE_GEMV_GATE_UP_US: AtomicU64 = AtomicU64::new(0);
-pub static MOE_GEMV_GATE_UP_CALLS: AtomicU64 = AtomicU64::new(0);
-pub static MOE_SILU_US: AtomicU64 = AtomicU64::new(0);
-pub static MOE_SILU_CALLS: AtomicU64 = AtomicU64::new(0);
-pub static MOE_GEMV_DOWN_US: AtomicU64 = AtomicU64::new(0);
-pub static MOE_GEMV_DOWN_CALLS: AtomicU64 = AtomicU64::new(0);
-pub static MOE_SCALED_ADD_US: AtomicU64 = AtomicU64::new(0);
-pub static MOE_SCALED_ADD_CALLS: AtomicU64 = AtomicU64::new(0);
-pub static MOE_COPY_US: AtomicU64 = AtomicU64::new(0);
-pub static MOE_COPY_CALLS: AtomicU64 = AtomicU64::new(0);
-pub static MOE_HOST_TOPK_US: AtomicU64 = AtomicU64::new(0);
-pub static MOE_HOST_TOPK_CALLS: AtomicU64 = AtomicU64::new(0);
-
-// Bucketed-path per-phase timers. Drained by the model wrapper alongside
-// the per-pair counters above. Same `FERRUM_MOE_PROFILE=1` gate.
-pub static MOE_BUCKET_SYNC_US: AtomicU64 = AtomicU64::new(0);
-pub static MOE_BUCKET_D2H_US: AtomicU64 = AtomicU64::new(0);
-pub static MOE_BUCKET_ROUTE_US: AtomicU64 = AtomicU64::new(0);
-pub static MOE_BUCKET_PLAN_US: AtomicU64 = AtomicU64::new(0);
-pub static MOE_BUCKET_GATHER_US: AtomicU64 = AtomicU64::new(0);
-pub static MOE_BUCKET_GEMM1_US: AtomicU64 = AtomicU64::new(0);
-pub static MOE_BUCKET_SILU_US: AtomicU64 = AtomicU64::new(0);
-pub static MOE_BUCKET_GEMM3_US: AtomicU64 = AtomicU64::new(0);
-pub static MOE_BUCKET_COMBINE_US: AtomicU64 = AtomicU64::new(0);
-pub static MOE_BUCKET_LAYER_CALLS: AtomicU64 = AtomicU64::new(0);
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct MoeBucketProfileSnapshot {
-    pub layers: u64,
-    pub sync_us: u64,
-    pub d2h_us: u64,
-    pub route_us: u64,
-    pub plan_us: u64,
-    pub gather_us: u64,
-    pub gemm1_us: u64,
-    pub silu_us: u64,
-    pub gemm3_us: u64,
-    pub combine_us: u64,
-}
-
-impl MoeBucketProfileSnapshot {
-    pub fn total_us(self) -> u64 {
-        self.sync_us
-            + self.d2h_us
-            + self.route_us
-            + self.plan_us
-            + self.gather_us
-            + self.gemm1_us
-            + self.silu_us
-            + self.gemm3_us
-            + self.combine_us
-    }
-
-    pub fn has_layers(self) -> bool {
-        self.layers > 0
-    }
-}
-
-pub fn drain_moe_bucket_profile() -> MoeBucketProfileSnapshot {
-    MoeBucketProfileSnapshot {
-        layers: MOE_BUCKET_LAYER_CALLS.swap(0, Ordering::Relaxed),
-        sync_us: MOE_BUCKET_SYNC_US.swap(0, Ordering::Relaxed),
-        d2h_us: MOE_BUCKET_D2H_US.swap(0, Ordering::Relaxed),
-        route_us: MOE_BUCKET_ROUTE_US.swap(0, Ordering::Relaxed),
-        plan_us: MOE_BUCKET_PLAN_US.swap(0, Ordering::Relaxed),
-        gather_us: MOE_BUCKET_GATHER_US.swap(0, Ordering::Relaxed),
-        gemm1_us: MOE_BUCKET_GEMM1_US.swap(0, Ordering::Relaxed),
-        silu_us: MOE_BUCKET_SILU_US.swap(0, Ordering::Relaxed),
-        gemm3_us: MOE_BUCKET_GEMM3_US.swap(0, Ordering::Relaxed),
-        combine_us: MOE_BUCKET_COMBINE_US.swap(0, Ordering::Relaxed),
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct MoeDispatchRuntimeConfig {
-    moe_profile: bool,
-    decode_op_profile: bool,
     vllm_moe_zero_ws: bool,
     vllm_moe_pair_ids: bool,
     moe_load_trace: bool,
@@ -134,8 +51,6 @@ struct MoeDispatchRuntimeConfig {
 impl Default for MoeDispatchRuntimeConfig {
     fn default() -> Self {
         Self {
-            moe_profile: false,
-            decode_op_profile: false,
             vllm_moe_zero_ws: false,
             vllm_moe_pair_ids: false,
             moe_load_trace: false,
@@ -163,8 +78,6 @@ impl MoeDispatchRuntimeConfig {
         for (name, value) in vars {
             let value = value.as_ref();
             match name.as_ref() {
-                "FERRUM_MOE_PROFILE" => config.moe_profile = true,
-                "FERRUM_DECODE_OP_PROFILE" => config.decode_op_profile = true,
                 "FERRUM_VLLM_MOE_ZERO_WS" => config.vllm_moe_zero_ws = value == "1",
                 "FERRUM_VLLM_MOE_PAIR_IDS" => config.vllm_moe_pair_ids = value == "1",
                 "FERRUM_MOE_LOAD_TRACE" => config.moe_load_trace = true,
@@ -196,10 +109,6 @@ fn parse_moe_block_size_value(value: &str) -> Option<usize> {
 fn moe_dispatch_runtime_config() -> &'static MoeDispatchRuntimeConfig {
     static CONFIG: OnceLock<MoeDispatchRuntimeConfig> = OnceLock::new();
     CONFIG.get_or_init(MoeDispatchRuntimeConfig::from_env)
-}
-
-fn moe_profile_enabled() -> bool {
-    moe_dispatch_runtime_config().moe_profile
 }
 
 /// Per-layer expert weights, materialised as `[num_experts]`-long vectors
@@ -1145,48 +1054,18 @@ pub fn moe_forward<B: QuantLlmBackend + BackendMoeFused>(
         )));
     }
 
-    let prof = moe_profile_enabled();
-
     // Routing on host. Sized batch*num_experts (e.g. 512*128 = 64k floats
     // per layer for Qwen3-30B-A3B prefill); cheap relative to the per-
     // expert gemvs that follow.
-    let t0 = if prof {
-        Some(std::time::Instant::now())
-    } else {
-        None
-    };
     B::sync(ctx);
-    if let Some(t) = t0 {
-        MOE_SYNC_US.fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
-        MOE_SYNC_CALLS.fetch_add(1, Ordering::Relaxed);
-    }
-
-    let t0 = if prof {
-        Some(std::time::Instant::now())
-    } else {
-        None
-    };
     let logits_host = B::to_vec(router_logits, batch * num_experts);
     let route_out =
         crate::moe::router::route(&logits_host, batch, num_experts, top_k, norm_topk_prob);
-    if let Some(t) = t0 {
-        MOE_HOST_TOPK_US.fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
-        MOE_HOST_TOPK_CALLS.fetch_add(1, Ordering::Relaxed);
-    }
 
     for b in 0..batch {
         // Load x[b] into x_single + reset accumulator.
-        let t0 = if prof {
-            Some(std::time::Instant::now())
-        } else {
-            None
-        };
         B::copy_slice(ctx, x, b * hidden_size, x_single, 0, hidden_size);
         B::copy_slice(ctx, zero_hidden, 0, acc_buf, 0, hidden_size);
-        if let Some(t) = t0 {
-            MOE_COPY_US.fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
-            MOE_COPY_CALLS.fetch_add(2, Ordering::Relaxed);
-        }
 
         for k in 0..top_k {
             let pair = b * top_k + k;
@@ -1199,70 +1078,20 @@ pub fn moe_forward<B: QuantLlmBackend + BackendMoeFused>(
             }
 
             // Fused gate||up gemv → [2 * expert_inter]
-            let t0 = if prof {
-                B::sync(ctx);
-                Some(std::time::Instant::now())
-            } else {
-                None
-            };
             experts.gate_up[expert_id].forward(ctx, x_single, gate_up_buf, 1);
-            if let Some(t) = t0 {
-                B::sync(ctx);
-                MOE_GEMV_GATE_UP_US.fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
-                MOE_GEMV_GATE_UP_CALLS.fetch_add(1, Ordering::Relaxed);
-            }
 
             // SiLU(gate) * up → [expert_inter]
-            let t0 = if prof {
-                Some(std::time::Instant::now())
-            } else {
-                None
-            };
             B::fused_silu_mul_split(ctx, gate_up_buf, silu_buf, 1, expert_intermediate);
-            if let Some(t) = t0 {
-                B::sync(ctx);
-                MOE_SILU_US.fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
-                MOE_SILU_CALLS.fetch_add(1, Ordering::Relaxed);
-            }
 
             // down gemv → [hidden]
-            let t0 = if prof {
-                Some(std::time::Instant::now())
-            } else {
-                None
-            };
             experts.down[expert_id].forward(ctx, silu_buf, down_buf, 1);
-            if let Some(t) = t0 {
-                B::sync(ctx);
-                MOE_GEMV_DOWN_US.fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
-                MOE_GEMV_DOWN_CALLS.fetch_add(1, Ordering::Relaxed);
-            }
 
             // acc_buf += weight * down_buf
-            let t0 = if prof {
-                Some(std::time::Instant::now())
-            } else {
-                None
-            };
             B::scaled_add_inplace(ctx, acc_buf, down_buf, weight, hidden_size);
-            if let Some(t) = t0 {
-                B::sync(ctx);
-                MOE_SCALED_ADD_US.fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
-                MOE_SCALED_ADD_CALLS.fetch_add(1, Ordering::Relaxed);
-            }
         }
 
         // Final write: out[b] = acc_buf
-        let t0 = if prof {
-            Some(std::time::Instant::now())
-        } else {
-            None
-        };
         B::copy_slice(ctx, acc_buf, 0, out, b * hidden_size, hidden_size);
-        if let Some(t) = t0 {
-            MOE_COPY_US.fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
-            MOE_COPY_CALLS.fetch_add(1, Ordering::Relaxed);
-        }
     }
 
     Ok(())
@@ -1544,7 +1373,6 @@ pub struct MoeForwardBucketedParams<'a, B: QuantLlmBackend + BackendMoeFused> {
     pub silu_packed: &'a mut B::Buffer,
     pub down_packed: &'a mut B::Buffer,
     pub route_scratch: &'a mut MoeRouteScratch,
-    pub profile_bucket: bool,
     // Caller-owned routing scratch. Some permits the graph-capturable device
     // route when vLLM MoE is enabled and host routing is not forced; None uses
     // the host-mediated path (used by tests + the non-vLLM path).
@@ -1571,7 +1399,6 @@ pub fn moe_forward_bucketed<B: QuantLlmBackend + BackendMoeFused>(
         silu_packed,
         down_packed,
         route_scratch,
-        profile_bucket,
         device_route,
     } = params;
     if experts.num_experts() != num_experts {
@@ -1582,12 +1409,6 @@ pub fn moe_forward_bucketed<B: QuantLlmBackend + BackendMoeFused>(
     }
 
     let runtime_config = moe_dispatch_runtime_config();
-    // Bucket profiling fires on either FERRUM_MOE_PROFILE=1 (legacy)
-    // or FERRUM_DECODE_OP_PROFILE=1 (the gate the print site uses).
-    let prof = profile_bucket || runtime_config.moe_profile || runtime_config.decode_op_profile;
-    if prof {
-        MOE_BUCKET_LAYER_CALLS.fetch_add(1, Ordering::Relaxed);
-    }
 
     // ── Device-route fast path (caller provides device_route scratch,
     //     vLLM MoE enabled, and host routing not forced) ──────────────
@@ -1673,11 +1494,6 @@ pub fn moe_forward_bucketed<B: QuantLlmBackend + BackendMoeFused>(
     // weights (~1 KB at c=32) into RouterOutput. Host fallback covers
     // backends without the override (CPU / Metal / future).
     let plan: Option<&crate::moe::MoeBucketPlan> = if !use_device_route {
-        let t_route_total = if prof {
-            Some(std::time::Instant::now())
-        } else {
-            None
-        };
         let gpu_route = B::try_gpu_route_topk_into_host(
             ctx,
             router_logits,
@@ -1689,29 +1505,8 @@ pub fn moe_forward_bucketed<B: QuantLlmBackend + BackendMoeFused>(
             norm_topk_prob,
         );
         if gpu_route.is_err() {
-            let t_sync = if prof {
-                Some(std::time::Instant::now())
-            } else {
-                None
-            };
             B::sync(ctx);
-            if let Some(t) = t_sync {
-                MOE_BUCKET_SYNC_US.fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
-            }
-            let t_d2h = if prof {
-                Some(std::time::Instant::now())
-            } else {
-                None
-            };
             let logits_host = B::to_vec(router_logits, batch * num_experts);
-            if let Some(t) = t_d2h {
-                MOE_BUCKET_D2H_US.fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
-            }
-            let t_route = if prof {
-                Some(std::time::Instant::now())
-            } else {
-                None
-            };
             crate::moe::router::route_into(
                 &logits_host,
                 batch,
@@ -1721,23 +1516,11 @@ pub fn moe_forward_bucketed<B: QuantLlmBackend + BackendMoeFused>(
                 &mut route_scratch.output,
                 &mut route_scratch.probs,
             );
-            if let Some(t) = t_route {
-                MOE_BUCKET_ROUTE_US.fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
-            }
-        } else if let Some(t) = t_route_total {
-            MOE_BUCKET_ROUTE_US.fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
         }
-        let t_plan = if prof {
-            Some(std::time::Instant::now())
-        } else {
-            None
-        };
         route_scratch
             .plan
             .rebuild_into(&route_scratch.output, batch, num_experts, top_k);
-        if let Some(t) = t_plan {
-            MOE_BUCKET_PLAN_US.fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
-        }
+
         Some(&route_scratch.plan)
     } else {
         None
@@ -1747,11 +1530,6 @@ pub fn moe_forward_bucketed<B: QuantLlmBackend + BackendMoeFused>(
     // Under use_device_route, read packed_token_idx from device (no
     // host roundtrip → graph-capturable). Else use the host plan.
     if !use_vllm_pair_ids {
-        let t_gather = if prof {
-            Some(std::time::Instant::now())
-        } else {
-            None
-        };
         if let Some(ref dr) = dr_kept {
             B::embedding_lookup_dev(
                 ctx,
@@ -1764,10 +1542,6 @@ pub fn moe_forward_bucketed<B: QuantLlmBackend + BackendMoeFused>(
         } else {
             let plan = plan.expect("plan is Some when !use_device_route");
             B::embedding_lookup(ctx, x, &plan.packed_token_idx, x_packed, hidden_size);
-        }
-        if let Some(t) = t_gather {
-            B::sync(ctx);
-            MOE_BUCKET_GATHER_US.fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
         }
     }
 
@@ -1964,21 +1738,9 @@ pub fn moe_forward_bucketed<B: QuantLlmBackend + BackendMoeFused>(
     } else {
         Vec::new()
     };
-    let t_gemm1 = if prof {
-        Some(std::time::Instant::now())
-    } else {
-        None
-    };
     if let Some((sorted_tokens, block_ids, total_post_pad)) = vllm_refs {
         // fp32_reduce path: kernel writes C directly via global reduce.
-        #[cfg(feature = "cuda")]
-        let _marlin_label = if ferrum_kernels::backend::cuda::marlin::profile_marlin() {
-            Some(ferrum_kernels::backend::cuda::push_alloc_label(
-                "moe.vllm.gate_up_proj",
-            ))
-        } else {
-            None
-        };
+
         if use_vllm_pair_ids {
             gu_store.gemm_phase_vllm(
                 ctx,
@@ -2013,10 +1775,6 @@ pub fn moe_forward_bucketed<B: QuantLlmBackend + BackendMoeFused>(
             hidden_size,
         )?;
     }
-    if let Some(t) = t_gemm1 {
-        B::sync(ctx);
-        MOE_BUCKET_GEMM1_US.fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
-    }
 
     // Phase 2: SiLU(gate) * up — single launch covering ALL active
     // expert rows in the packed buffer. The unused rows (zeros from
@@ -2024,11 +1782,6 @@ pub fn moe_forward_bucketed<B: QuantLlmBackend + BackendMoeFused>(
     // ignores via pairs_by_token. Saves num_active_experts-1 launches
     // per layer.
     let total_pairs_active = batch * top_k;
-    let t_silu = if prof {
-        Some(std::time::Instant::now())
-    } else {
-        None
-    };
     B::fused_silu_mul_split(
         ctx,
         gate_up_packed,
@@ -2036,10 +1789,6 @@ pub fn moe_forward_bucketed<B: QuantLlmBackend + BackendMoeFused>(
         total_pairs_active,
         expert_intermediate,
     );
-    if let Some(t) = t_silu {
-        B::sync(ctx);
-        MOE_BUCKET_SILU_US.fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
-    }
 
     // Phase 3: down GEMM per active expert. Multi-stream batched.
     let d_store = experts.down_stacked_store(0).ok_or_else(|| {
@@ -2067,20 +1816,7 @@ pub fn moe_forward_bucketed<B: QuantLlmBackend + BackendMoeFused>(
     } else {
         Vec::new()
     };
-    let t_gemm3 = if prof {
-        Some(std::time::Instant::now())
-    } else {
-        None
-    };
     if let Some((sorted_tokens, block_ids, total_post_pad)) = vllm_refs {
-        #[cfg(feature = "cuda")]
-        let _marlin_label = if ferrum_kernels::backend::cuda::marlin::profile_marlin() {
-            Some(ferrum_kernels::backend::cuda::push_alloc_label(
-                "moe.vllm.down_proj",
-            ))
-        } else {
-            None
-        };
         d_store.gemm_phase_vllm(
             ctx,
             silu_packed,
@@ -2101,10 +1837,6 @@ pub fn moe_forward_bucketed<B: QuantLlmBackend + BackendMoeFused>(
             expert_intermediate,
         )?;
     }
-    if let Some(t) = t_gemm3 {
-        B::sync(ctx);
-        MOE_BUCKET_GEMM3_US.fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
-    }
 
     // ── Combine: out[b, h] = Σ_k weights[b,k] * down_packed[pairs_by_token[b,k], h]
     //
@@ -2123,11 +1855,6 @@ pub fn moe_forward_bucketed<B: QuantLlmBackend + BackendMoeFused>(
     // does the same counting-sort the host plan rebuild does, just
     // on-device via the moe_build_pairs kernel.
     let total_pairs = batch * top_k;
-    let t_comb = if prof {
-        Some(std::time::Instant::now())
-    } else {
-        None
-    };
     if use_vllm_pair_ids {
         let dr = dr_kept
             .as_ref()
@@ -2166,10 +1893,6 @@ pub fn moe_forward_bucketed<B: QuantLlmBackend + BackendMoeFused>(
             top_k,
             total_pairs,
         );
-    }
-    if let Some(t) = t_comb {
-        B::sync(ctx);
-        MOE_BUCKET_COMBINE_US.fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
     }
 
     Ok(())
@@ -2337,18 +2060,12 @@ type _CandleResult<T> = CandleResult<T>;
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::Ordering;
 
     use ferrum_kernels::backend::cpu::CpuBackend;
     use ferrum_kernels::backend::Backend;
     use ferrum_kernels::StackedExpertGgufLinear;
 
-    use super::{
-        drain_moe_bucket_profile, pick_moe_block_size_with_config, ExpertStack,
-        MoeDispatchRuntimeConfig, MOE_BUCKET_COMBINE_US, MOE_BUCKET_D2H_US, MOE_BUCKET_GATHER_US,
-        MOE_BUCKET_GEMM1_US, MOE_BUCKET_GEMM3_US, MOE_BUCKET_LAYER_CALLS, MOE_BUCKET_PLAN_US,
-        MOE_BUCKET_ROUTE_US, MOE_BUCKET_SILU_US, MOE_BUCKET_SYNC_US,
-    };
+    use super::{pick_moe_block_size_with_config, ExpertStack, MoeDispatchRuntimeConfig};
 
     struct FakeStackedGgufLinear {
         num_experts: usize,
@@ -2498,8 +2215,6 @@ mod tests {
     #[test]
     fn moe_dispatch_runtime_config_parses_m3_startup_knobs() {
         let config = MoeDispatchRuntimeConfig::from_env_vars([
-            ("FERRUM_MOE_PROFILE", "0"),
-            ("FERRUM_DECODE_OP_PROFILE", "true"),
             ("FERRUM_VLLM_MOE_ZERO_WS", "1"),
             ("FERRUM_VLLM_MOE_PAIR_IDS", "1"),
             ("FERRUM_MOE_LOAD_TRACE", ""),
@@ -2509,9 +2224,6 @@ mod tests {
             ("FERRUM_VLLM_MOE", "1"),
             ("FERRUM_MOE_HOST_ROUTE", "1"),
         ]);
-
-        assert!(config.moe_profile);
-        assert!(config.decode_op_profile);
         assert!(config.vllm_moe_zero_ws);
         assert!(config.vllm_moe_pair_ids);
         assert!(config.moe_load_trace);
@@ -2520,31 +2232,6 @@ mod tests {
         assert_eq!(config.moe_large_m_min_pairs, 2048);
         assert!(config.vllm_moe);
         assert!(config.moe_host_route);
-    }
-
-    #[test]
-    fn drain_moe_bucket_profile_returns_and_clears_counters() {
-        let _ = drain_moe_bucket_profile();
-        MOE_BUCKET_LAYER_CALLS.store(2, Ordering::Relaxed);
-        MOE_BUCKET_SYNC_US.store(3, Ordering::Relaxed);
-        MOE_BUCKET_D2H_US.store(5, Ordering::Relaxed);
-        MOE_BUCKET_ROUTE_US.store(7, Ordering::Relaxed);
-        MOE_BUCKET_PLAN_US.store(11, Ordering::Relaxed);
-        MOE_BUCKET_GATHER_US.store(13, Ordering::Relaxed);
-        MOE_BUCKET_GEMM1_US.store(17, Ordering::Relaxed);
-        MOE_BUCKET_SILU_US.store(19, Ordering::Relaxed);
-        MOE_BUCKET_GEMM3_US.store(23, Ordering::Relaxed);
-        MOE_BUCKET_COMBINE_US.store(29, Ordering::Relaxed);
-
-        let snapshot = drain_moe_bucket_profile();
-        assert_eq!(snapshot.layers, 2);
-        assert_eq!(snapshot.total_us(), 127);
-        assert!(snapshot.has_layers());
-
-        let cleared = drain_moe_bucket_profile();
-        assert_eq!(cleared.layers, 0);
-        assert_eq!(cleared.total_us(), 0);
-        assert!(!cleared.has_layers());
     }
 
     #[test]

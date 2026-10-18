@@ -18,7 +18,6 @@
 
 use std::collections::HashMap;
 use std::ops::Range;
-use std::sync::atomic::AtomicU64;
 
 use ferrum_execution::model_executor::{
     KvSlotAllocation, KvSlotCapacitySnapshot, KvSlotRequest, KvSlotReservation, LogitsReturnPolicy,
@@ -35,30 +34,6 @@ use ferrum_kernels::backend::{
 pub(crate) const SINGLE_ITEM_GRAPH_KEY: u64 = 0;
 const LLAMA_PAGED_BLOCK_SIZE: usize = 16;
 
-/// Diag counters for the batched graph dispatcher (replay vs eager).
-pub(crate) static BATCHED_GRAPH_REPLAY_COUNT: AtomicU64 = AtomicU64::new(0);
-pub(crate) static BATCHED_GRAPH_EAGER_COUNT: AtomicU64 = AtomicU64::new(0);
-
-pub(crate) static ATTN_TIME_US: AtomicU64 = AtomicU64::new(0);
-pub(crate) static ATTN_CALLS: AtomicU64 = AtomicU64::new(0);
-pub(crate) static QKR_TIME_US: AtomicU64 = AtomicU64::new(0);
-pub(crate) static QKR_CALLS: AtomicU64 = AtomicU64::new(0);
-pub(crate) static MATMUL_TIME_US: AtomicU64 = AtomicU64::new(0);
-pub(crate) static MATMUL_CALLS: AtomicU64 = AtomicU64::new(0);
-pub(crate) static NORM_TIME_US: AtomicU64 = AtomicU64::new(0);
-pub(crate) static NORM_CALLS: AtomicU64 = AtomicU64::new(0);
-pub(crate) static OTHER_TIME_US: AtomicU64 = AtomicU64::new(0);
-pub(crate) static OTHER_CALLS: AtomicU64 = AtomicU64::new(0);
-pub(crate) static TAIL_NORM_TIME_US: AtomicU64 = AtomicU64::new(0);
-pub(crate) static TAIL_NORM_CALLS: AtomicU64 = AtomicU64::new(0);
-pub(crate) static TAIL_GATE_UP_TIME_US: AtomicU64 = AtomicU64::new(0);
-pub(crate) static TAIL_GATE_UP_CALLS: AtomicU64 = AtomicU64::new(0);
-pub(crate) static TAIL_DOWN_TIME_US: AtomicU64 = AtomicU64::new(0);
-pub(crate) static TAIL_DOWN_CALLS: AtomicU64 = AtomicU64::new(0);
-pub(crate) static TAIL_ACT_TIME_US: AtomicU64 = AtomicU64::new(0);
-pub(crate) static TAIL_ACT_CALLS: AtomicU64 = AtomicU64::new(0);
-pub(crate) static TAIL_RESID_TIME_US: AtomicU64 = AtomicU64::new(0);
-pub(crate) static TAIL_RESID_CALLS: AtomicU64 = AtomicU64::new(0);
 use ferrum_quantization::{Linear, WeightLoader};
 use ferrum_types::{Activation, Result};
 
@@ -348,11 +323,8 @@ pub(crate) struct LlamaFamilyRuntimeEnv {
     pub(crate) kv_max_blocks: Option<usize>,
     pub(crate) metal_paged_kv: Option<bool>,
     pub(crate) paged_max_seqs: usize,
-    pub(crate) decode_op_profile: bool,
-    pub(crate) prefill_op_profile: bool,
     pub(crate) prefix_cache: bool,
     pub(crate) cuda_graph: bool,
-    pub(crate) decode_layer_profile: bool,
     pub(crate) nan_trace: LlamaNanTraceConfig,
     /// `FERRUM_OP_DUMP=<dir>`: when nan tracing is enabled, write each traced
     /// op buffer as f32 little-endian `.bin` plus summary JSONL. Debug-only.
@@ -391,11 +363,8 @@ impl LlamaFamilyRuntimeEnv {
             kv_max_blocks: None,
             metal_paged_kv: None,
             paged_max_seqs: 32,
-            decode_op_profile: false,
-            prefill_op_profile: false,
             prefix_cache: false,
             cuda_graph: false,
-            decode_layer_profile: false,
             nan_trace: LlamaNanTraceConfig::Disabled,
             op_dump_dir: None,
             layer_dump_dir: None,
@@ -413,11 +382,8 @@ impl LlamaFamilyRuntimeEnv {
                         config.paged_max_seqs = max_seqs;
                     }
                 }
-                "FERRUM_DECODE_OP_PROFILE" => config.decode_op_profile = true,
-                "FERRUM_PREFILL_OP_PROFILE" => config.prefill_op_profile = true,
                 "FERRUM_PREFIX_CACHE" => config.prefix_cache = value == "1",
                 "FERRUM_CUDA_GRAPH" => config.cuda_graph = true,
-                "FERRUM_DECODE_LAYER_PROFILE" => config.decode_layer_profile = true,
                 "FERRUM_NAN_TRACE" => config.nan_trace = LlamaNanTraceConfig::from_raw(value),
                 "FERRUM_OP_DUMP" => config.op_dump_dir = Some(value.to_string()),
                 "FERRUM_LAYER_DUMP" => config.layer_dump_dir = Some(value.to_string()),
@@ -445,10 +411,7 @@ impl LlamaFamilyRuntimeEnv {
     }
 
     pub(crate) fn graph_capture_allowed(&self) -> bool {
-        !self.decode_op_profile
-            && !self.prefill_op_profile
-            && !self.decode_layer_profile
-            && self.nan_trace == LlamaNanTraceConfig::Disabled
+        self.nan_trace == LlamaNanTraceConfig::Disabled
             && self.op_dump_dir.is_none()
             && self.layer_dump_dir.is_none()
     }
@@ -460,14 +423,6 @@ fn paged_kv_allowed_for_layer_schedule(
     sliding_window_pattern: usize,
 ) -> bool {
     paged_enabled && (sliding_window_pattern == 0 || backend_supports_varlen_qkv)
-}
-
-/// Whether decode-op profiling is enabled, resolved from the runtime snapshot
-/// installed at the composition root. Used by pipeline paths that operate on a
-/// `LlamaFamilyPipelineModel` and so don't hold a `LlamaFamilyModel`'s
-/// `runtime_env` field. Called once per decode-batch, not per op.
-pub(crate) fn llama_family_decode_op_profile_enabled() -> bool {
-    LlamaFamilyRuntimeEnv::from_env().decode_op_profile
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1948,6 +1903,12 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         loader: &dyn WeightLoader<B>,
         stage: LlamaFamilyLayerStageConfig,
     ) -> Result<Self> {
+        ferrum_types::active_runtime_snapshot()
+            .validate_retired_options()
+            .map_err(|(key, reason)| {
+                ferrum_types::FerrumError::config(format!("{key}: {reason}"))
+            })?;
+
         if stage.source_layers.is_empty() {
             return Err(ferrum_types::FerrumError::model(
                 "llama layer stage must include at least one source layer",
@@ -2964,16 +2925,9 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
             };
         }
         nt!("residual-in", residual, tokens * h, h);
-        let op_profile = self.runtime_env.decode_op_profile
-            || (self.runtime_env.prefill_op_profile && tokens > 1);
 
         // 1. Input RMSNorm
-        let _t0 = if op_profile {
-            B::sync(ctx);
-            Some(std::time::Instant::now())
-        } else {
-            None
-        };
+
         if let Some(host) = host_residual.as_deref() {
             Self::rms_norm_host_to_activation(
                 ctx,
@@ -3006,22 +2960,9 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
             );
         }
         nt!("input_norm", &self.scratch.norm_out, tokens * h, h);
-        if let Some(t0) = _t0 {
-            B::sync(ctx);
-            NORM_TIME_US.fetch_add(
-                t0.elapsed().as_micros() as u64,
-                std::sync::atomic::Ordering::Relaxed,
-            );
-            NORM_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        }
 
         // 2. Fused QKV projection (Linear dispatches to Dense/GPTQ/AWQ/GGUF)
-        let _t0 = if op_profile {
-            B::sync(ctx);
-            Some(std::time::Instant::now())
-        } else {
-            None
-        };
+
         {
             #[cfg(feature = "cuda")]
             let _alloc_label =
@@ -3053,14 +2994,6 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
                 )
                 .expect("validated LoRA qkv_proj");
             self.lora_projection_applications += applied as u64;
-        }
-        if let Some(t0) = _t0 {
-            B::sync(ctx);
-            MATMUL_TIME_US.fetch_add(
-                t0.elapsed().as_micros() as u64,
-                std::sync::atomic::Ordering::Relaxed,
-            );
-            MATMUL_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
 
         // 3-5. Fused split-QKV + QK-norm + RoPE + cache-write.
@@ -3207,12 +3140,7 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
 
         // Non-paged (contig) path. INT8 path doesn't reach here:
         // KvInt8::alloc_contig panics in ensure_kv.
-        let _qkr_t0 = if op_profile {
-            B::sync(ctx);
-            Some(std::time::Instant::now())
-        } else {
-            None
-        };
+
         K::contig_write(
             ctx,
             &mut caches[li],
@@ -3242,24 +3170,11 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
             nh * tokens * hd,
             hd
         );
-        if let Some(t0) = _qkr_t0 {
-            B::sync(ctx);
-            QKR_TIME_US.fetch_add(
-                t0.elapsed().as_micros() as u64,
-                std::sync::atomic::Ordering::Relaxed,
-            );
-            QKR_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        }
+
         let new_len = cache_len_before + tokens;
         K::set_len(&mut caches[li], new_len);
         let kv_stride = cache_capacity;
 
-        let _attn_t0 = if op_profile {
-            B::sync(ctx);
-            Some(std::time::Instant::now())
-        } else {
-            None
-        };
         let attn_cfg = ferrum_kernels::backend::AttnConfig {
             num_heads: nh,
             num_kv_heads: nkv,
@@ -3288,14 +3203,6 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         let _ = q_dim;
         let _ = kv_dim;
         let _ = dummy;
-        if let Some(t0) = _attn_t0 {
-            B::sync(ctx);
-            ATTN_TIME_US.fetch_add(
-                t0.elapsed().as_micros() as u64,
-                std::sync::atomic::Ordering::Relaxed,
-            );
-            ATTN_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        }
 
         self.forward_layer_post_attn_with_host_residual(
             ctx,
@@ -3453,27 +3360,6 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
                 }
             };
         }
-        let tail_profile = self.runtime_env.decode_op_profile
-            || (self.runtime_env.prefill_op_profile && tokens > 1)
-            || self.batched_cfg.decode_op_profile_enabled();
-        macro_rules! time_tail {
-            ($bucket_us:expr, $bucket_n:expr, $body:block) => {{
-                if tail_profile {
-                    B::sync(ctx);
-                    let t0 = std::time::Instant::now();
-                    let out = { $body };
-                    B::sync(ctx);
-                    $bucket_us.fetch_add(
-                        t0.elapsed().as_micros() as u64,
-                        std::sync::atomic::Ordering::Relaxed,
-                    );
-                    $bucket_n.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    out
-                } else {
-                    $body
-                }
-            }};
-        }
 
         // 9. Residual + pre-MLP norm.
         //
@@ -3481,7 +3367,7 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         // (post_attention_layernorm in Gemma naming), add to residual,
         // then norm the residual with pre_feedforward_layernorm.
         // Legacy families: single fused residual-add + post-attn norm.
-        time_tail!(TAIL_NORM_TIME_US, TAIL_NORM_CALLS, {
+        {
             if let Some(post_attn_w) = &layer.post_attn_ln_w {
                 if let Some(host) = host_residual.as_deref_mut() {
                     let branch = Self::rms_norm_device_to_host(
@@ -3581,10 +3467,10 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
                     h,
                 );
             }
-        });
+        };
 
         // 10. Fused gate+up projection.
-        time_tail!(TAIL_GATE_UP_TIME_US, TAIL_GATE_UP_CALLS, {
+        {
             #[cfg(feature = "cuda")]
             let _alloc_label =
                 ferrum_kernels::backend::cuda::push_alloc_label("llama.forward_layer.gate_up_proj");
@@ -3610,7 +3496,7 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
                     .expect("validated LoRA gate_up_proj");
                 self.lora_projection_applications += applied as u64;
             }
-        });
+        };
 
         nt!("pre_mlp_norm", &self.scratch.norm_out, tokens * h, h);
         nt!(
@@ -3620,7 +3506,7 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
             2 * im
         );
         // 11. Gated activation: SwiGLU (silu) or GeGLU (gelu_tanh, Gemma).
-        time_tail!(TAIL_ACT_TIME_US, TAIL_ACT_CALLS, {
+        {
             match cfg.activation {
                 Activation::GeluTanh => B::fused_gelu_tanh_mul_split(
                     ctx,
@@ -3637,11 +3523,11 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
                     im,
                 ),
             }
-        });
+        };
 
         nt!("act_mul", &self.scratch.silu_out, tokens * im, im);
         // 12. Down projection.
-        time_tail!(TAIL_DOWN_TIME_US, TAIL_DOWN_CALLS, {
+        {
             #[cfg(feature = "cuda")]
             let _alloc_label =
                 ferrum_kernels::backend::cuda::push_alloc_label("llama.forward_layer.down_proj");
@@ -3667,12 +3553,12 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
                     .expect("validated LoRA down_proj");
                 self.lora_projection_applications += applied as u64;
             }
-        });
+        };
         nt!("down_proj", &self.scratch.mlp_out, tokens * h, h);
 
         // 13. Final residual add. Sandwich families norm the MLP output
         // (post_feedforward_layernorm) before adding it to the residual.
-        time_tail!(TAIL_RESID_TIME_US, TAIL_RESID_CALLS, {
+        {
             if let Some(post_ffn_w) = &layer.post_ffn_ln_w {
                 if let Some(host) = host_residual.as_deref_mut() {
                     let branch = Self::rms_norm_device_to_host(
@@ -3726,7 +3612,7 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
             } else {
                 B::add_inplace(ctx, residual, &self.scratch.mlp_out, tokens * h);
             }
-        });
+        };
         if let Some(device) = device_residual.as_ref() {
             nt!("resid_ffn", &**device, tokens * h, h);
         } else if host_residual.is_none() {
@@ -4017,34 +3903,6 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         }
         let device_branch_shadow = &mut frame.branch_f32;
 
-        let prefill_profile = self.runtime_env.prefill_op_profile;
-        let prefill_t0 = if prefill_profile {
-            device_execution::checked_sync::<B>(&mut ctx);
-            ATTN_TIME_US.swap(0, std::sync::atomic::Ordering::Relaxed);
-            ATTN_CALLS.swap(0, std::sync::atomic::Ordering::Relaxed);
-            QKR_TIME_US.swap(0, std::sync::atomic::Ordering::Relaxed);
-            QKR_CALLS.swap(0, std::sync::atomic::Ordering::Relaxed);
-            MATMUL_TIME_US.swap(0, std::sync::atomic::Ordering::Relaxed);
-            MATMUL_CALLS.swap(0, std::sync::atomic::Ordering::Relaxed);
-            NORM_TIME_US.swap(0, std::sync::atomic::Ordering::Relaxed);
-            NORM_CALLS.swap(0, std::sync::atomic::Ordering::Relaxed);
-            OTHER_TIME_US.swap(0, std::sync::atomic::Ordering::Relaxed);
-            OTHER_CALLS.swap(0, std::sync::atomic::Ordering::Relaxed);
-            TAIL_NORM_TIME_US.swap(0, std::sync::atomic::Ordering::Relaxed);
-            TAIL_NORM_CALLS.swap(0, std::sync::atomic::Ordering::Relaxed);
-            TAIL_GATE_UP_TIME_US.swap(0, std::sync::atomic::Ordering::Relaxed);
-            TAIL_GATE_UP_CALLS.swap(0, std::sync::atomic::Ordering::Relaxed);
-            TAIL_ACT_TIME_US.swap(0, std::sync::atomic::Ordering::Relaxed);
-            TAIL_ACT_CALLS.swap(0, std::sync::atomic::Ordering::Relaxed);
-            TAIL_DOWN_TIME_US.swap(0, std::sync::atomic::Ordering::Relaxed);
-            TAIL_DOWN_CALLS.swap(0, std::sync::atomic::Ordering::Relaxed);
-            TAIL_RESID_TIME_US.swap(0, std::sync::atomic::Ordering::Relaxed);
-            TAIL_RESID_CALLS.swap(0, std::sync::atomic::Ordering::Relaxed);
-            Some(std::time::Instant::now())
-        } else {
-            None
-        };
-
         // W2 L1 gate: per-layer residual dumps for HF comparison.
         let layer_dump = self.runtime_env.layer_dump_dir.clone();
         let dump = |ctx: &mut B::Context, buf: &B::Buffer, name: &str| {
@@ -4087,62 +3945,6 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
                     dump(&mut ctx, &residual, &format!("layer_{li:02}"));
                 }
             }
-        }
-
-        if let Some(t0) = prefill_t0 {
-            device_execution::checked_sync::<B>(&mut ctx);
-            let total_us = t0.elapsed().as_micros() as u64;
-            let attn_us = ATTN_TIME_US.swap(0, std::sync::atomic::Ordering::Relaxed);
-            let attn_n = ATTN_CALLS.swap(0, std::sync::atomic::Ordering::Relaxed);
-            let qkr_us = QKR_TIME_US.swap(0, std::sync::atomic::Ordering::Relaxed);
-            let qkr_n = QKR_CALLS.swap(0, std::sync::atomic::Ordering::Relaxed);
-            let mm_us = MATMUL_TIME_US.swap(0, std::sync::atomic::Ordering::Relaxed);
-            let mm_n = MATMUL_CALLS.swap(0, std::sync::atomic::Ordering::Relaxed);
-            let norm_us = NORM_TIME_US.swap(0, std::sync::atomic::Ordering::Relaxed);
-            let norm_n = NORM_CALLS.swap(0, std::sync::atomic::Ordering::Relaxed);
-            let other_us = OTHER_TIME_US.swap(0, std::sync::atomic::Ordering::Relaxed);
-            let other_n = OTHER_CALLS.swap(0, std::sync::atomic::Ordering::Relaxed);
-            let tail_norm_us = TAIL_NORM_TIME_US.swap(0, std::sync::atomic::Ordering::Relaxed);
-            let tail_norm_n = TAIL_NORM_CALLS.swap(0, std::sync::atomic::Ordering::Relaxed);
-            let tail_gate_up_us =
-                TAIL_GATE_UP_TIME_US.swap(0, std::sync::atomic::Ordering::Relaxed);
-            let tail_gate_up_n = TAIL_GATE_UP_CALLS.swap(0, std::sync::atomic::Ordering::Relaxed);
-            let tail_act_us = TAIL_ACT_TIME_US.swap(0, std::sync::atomic::Ordering::Relaxed);
-            let tail_act_n = TAIL_ACT_CALLS.swap(0, std::sync::atomic::Ordering::Relaxed);
-            let tail_down_us = TAIL_DOWN_TIME_US.swap(0, std::sync::atomic::Ordering::Relaxed);
-            let tail_down_n = TAIL_DOWN_CALLS.swap(0, std::sync::atomic::Ordering::Relaxed);
-            let tail_resid_us = TAIL_RESID_TIME_US.swap(0, std::sync::atomic::Ordering::Relaxed);
-            let tail_resid_n = TAIL_RESID_CALLS.swap(0, std::sync::atomic::Ordering::Relaxed);
-            eprintln!(
-                "[prefill-profile] tokens={} layers total={} ms",
-                seq_len,
-                total_us / 1000
-            );
-            let bucket = |label: &str, n: u64, us: u64| {
-                if n > 0 {
-                    eprintln!(
-                        "[prefill-profile] {label}: {} calls {} ms (avg {} us)",
-                        n,
-                        us / 1000,
-                        us / n
-                    );
-                }
-            };
-            bucket("flash_attn", attn_n, attn_us);
-            bucket("qk_norm_rope", qkr_n, qkr_us);
-            bucket("matmuls", mm_n, mm_us);
-            bucket("norms", norm_n, norm_us);
-            bucket("other", other_n, other_us);
-            bucket("tail_norm", tail_norm_n, tail_norm_us);
-            bucket("tail_gate_up", tail_gate_up_n, tail_gate_up_us);
-            bucket("tail_act", tail_act_n, tail_act_us);
-            bucket("tail_down", tail_down_n, tail_down_us);
-            bucket(
-                "tail_mlp",
-                tail_gate_up_n.max(tail_act_n).max(tail_down_n),
-                tail_gate_up_us + tail_act_us + tail_down_us,
-            );
-            bucket("tail_resid", tail_resid_n, tail_resid_us);
         }
 
         if let Some(host) = host_residual.as_deref() {
@@ -4556,106 +4358,17 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         }
         let device_branch_shadow = &mut frame.branch_f32;
 
-        // Per-layer wall-time profile (env-gated, off by default — adds
-        // a B::sync between layers which serializes the pipeline). Helps
-        // localise non-matmul bottlenecks during perf work.
-        let layer_profile = self.runtime_env.decode_layer_profile;
-        let mut layer_times = if layer_profile {
-            Some(Vec::with_capacity(self.local_layer_count()))
-        } else {
-            None
-        };
-
         for li in self.local_layer_indices() {
-            if layer_profile {
-                let t0 = std::time::Instant::now();
-                self.forward_layer_with_residual_shadow(
-                    &mut ctx,
-                    li,
-                    cache_id,
-                    &mut residual,
-                    pos as usize,
-                    1,
-                    host_residual.as_deref_mut(),
-                    device_residual_shadow.as_mut(),
-                    device_branch_shadow.as_mut(),
-                );
-                device_execution::checked_sync::<B>(&mut ctx);
-                let elapsed_us = t0.elapsed().as_micros() as u64;
-                if let Some(v) = layer_times.as_mut() {
-                    v.push(elapsed_us);
-                }
-            } else {
-                self.forward_layer_with_residual_shadow(
-                    &mut ctx,
-                    li,
-                    cache_id,
-                    &mut residual,
-                    pos as usize,
-                    1,
-                    host_residual.as_deref_mut(),
-                    device_residual_shadow.as_mut(),
-                    device_branch_shadow.as_mut(),
-                );
-            }
-        }
-        if let Some(times) = layer_times.take() {
-            let sum: u64 = times.iter().sum();
-            let avg = sum / times.len() as u64;
-            let mn = *times.iter().min().unwrap_or(&0);
-            let mx = *times.iter().max().unwrap_or(&0);
-            eprintln!(
-                "[layer-profile] {} layers total={} ms avg={} us min={} us max={} us",
-                times.len(),
-                sum / 1000,
-                avg,
-                mn,
-                mx
-            );
-            for (i, t) in times.iter().enumerate() {
-                eprint!("L{i}={}ms ", t / 1000);
-                if (i + 1) % 6 == 0 {
-                    eprintln!();
-                }
-            }
-            eprintln!();
-            let attn_us = ATTN_TIME_US.swap(0, std::sync::atomic::Ordering::Relaxed);
-            let attn_n = ATTN_CALLS.swap(0, std::sync::atomic::Ordering::Relaxed);
-            let qkr_us = QKR_TIME_US.swap(0, std::sync::atomic::Ordering::Relaxed);
-            let qkr_n = QKR_CALLS.swap(0, std::sync::atomic::Ordering::Relaxed);
-            let mm_us = MATMUL_TIME_US.swap(0, std::sync::atomic::Ordering::Relaxed);
-            let mm_n = MATMUL_CALLS.swap(0, std::sync::atomic::Ordering::Relaxed);
-            let norm_us = NORM_TIME_US.swap(0, std::sync::atomic::Ordering::Relaxed);
-            let norm_n = NORM_CALLS.swap(0, std::sync::atomic::Ordering::Relaxed);
-            let other_us = OTHER_TIME_US.swap(0, std::sync::atomic::Ordering::Relaxed);
-            let other_n = OTHER_CALLS.swap(0, std::sync::atomic::Ordering::Relaxed);
-            eprintln!(
-                "[op-profile] flash_attn: {} calls {} ms (avg {} us)",
-                attn_n,
-                attn_us / 1000,
-                if attn_n > 0 { attn_us / attn_n } else { 0 }
-            );
-            eprintln!(
-                "[op-profile] qk_norm_rope: {} calls {} ms (avg {} us)",
-                qkr_n,
-                qkr_us / 1000,
-                if qkr_n > 0 { qkr_us / qkr_n } else { 0 }
-            );
-            eprintln!(
-                "[op-profile] matmuls (Linear::forward): {} calls {} ms (avg {} us)",
-                mm_n,
-                mm_us / 1000,
-                if mm_n > 0 { mm_us / mm_n } else { 0 }
-            );
-            eprintln!(
-                "[op-profile] norms (rms+fused_add_rms): {} calls {} ms (avg {} us)",
-                norm_n,
-                norm_us / 1000,
-                if norm_n > 0 { norm_us / norm_n } else { 0 }
-            );
-            eprintln!(
-                "[op-profile] other (split_qkv, kv_append, transpose, silu, add): {} calls {} ms (avg {} us)",
-                other_n, other_us / 1000, if other_n > 0 { other_us / other_n } else { 0 }
+            self.forward_layer_with_residual_shadow(
+                &mut ctx,
+                li,
+                cache_id,
+                &mut residual,
+                pos as usize,
+                1,
+                host_residual.as_deref_mut(),
+                device_residual_shadow.as_mut(),
+                device_branch_shadow.as_mut(),
             );
         }
 
@@ -6445,10 +6158,7 @@ mod tests {
             ("FERRUM_KV_MAX_BLOCKS", "1234"),
             ("FERRUM_METAL_PAGED_KV", "0"),
             ("FERRUM_PAGED_MAX_SEQS", "64"),
-            ("FERRUM_DECODE_OP_PROFILE", "0"),
-            ("FERRUM_PREFILL_OP_PROFILE", ""),
             ("FERRUM_CUDA_GRAPH", ""),
-            ("FERRUM_DECODE_LAYER_PROFILE", "false"),
             ("FERRUM_NAN_TRACE", "layer3, source9"),
             ("FERRUM_OP_DUMP", "/tmp/ferrum-op-dump"),
         ]);
@@ -6457,10 +6167,7 @@ mod tests {
         assert_eq!(env.kv_max_blocks, Some(1234));
         assert_eq!(env.metal_paged_kv, Some(false));
         assert_eq!(env.paged_max_seqs, 64);
-        assert!(env.decode_op_profile);
-        assert!(env.prefill_op_profile);
         assert!(env.cuda_graph);
-        assert!(env.decode_layer_profile);
         assert!(env.nan_trace.matches_layer(3, 9));
         assert_eq!(env.op_dump_dir.as_deref(), Some("/tmp/ferrum-op-dump"));
         assert!(!env.graph_capture_allowed());

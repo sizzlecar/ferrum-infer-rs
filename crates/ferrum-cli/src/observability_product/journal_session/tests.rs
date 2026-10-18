@@ -151,13 +151,13 @@ async fn product_journal_live_scope_close_refusal_is_not_optional_success() {
     assert!(fs::read_to_string(path).unwrap().contains("still_live"));
 }
 
-#[test]
-fn product_journal_rejects_legacy_canonical_alias_before_open() {
+#[tokio::test]
+async fn product_journal_serve_off_canonical_alias_uses_one_original_writer() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("profile.jsonl");
     let config = ProductObservabilityConfig::new(
         ProfileEntrypoint::Serve,
-        "legacy-scope-test",
+        "typed-scope-test",
         Some(&path),
         ProfileDetailArg::Off,
         None,
@@ -168,8 +168,16 @@ fn product_journal_rejects_legacy_canonical_alias_before_open() {
     let mut engine = ferrum_types::EngineConfig::default();
     engine.runtime.scheduler_trace_jsonl = Some(directory.path().join(".").join("profile.jsonl"));
     let session = ProductJournalSession::prepare(&config, &engine);
-    assert!(matches!(session.result(), Err(FerrumError::Config { .. })));
-    assert!(!path.exists());
+    session.result().unwrap();
+    assert_eq!(session.routes.lock().unwrap().len(), 1);
+    session
+        .write(&event(&config, "actual_serve_shutdown"), true, false, false)
+        .unwrap();
+    session.finish().await.unwrap();
+    assert!(session.is_closed());
+    assert!(fs::read_to_string(path)
+        .unwrap()
+        .contains("actual_serve_shutdown"));
 }
 
 #[tokio::test]

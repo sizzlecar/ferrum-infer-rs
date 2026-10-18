@@ -6,17 +6,13 @@
 //! Constraints: K % 128 == 0, N % 256 == 0, SM >= 8.0 (Ampere+).
 
 use cudarc::driver::{CudaSlice, CudaStream, DevicePtr};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, OnceLock};
 
 use crate::backend::native_status::StagedNativeStatus;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct CudaMarlinRuntimeConfig {
-    profile: bool,
     skip_ws_zero: bool,
-    trace_shapes: bool,
-    trace_shapes_max: u64,
 }
 
 impl CudaMarlinRuntimeConfig {
@@ -31,21 +27,11 @@ impl CudaMarlinRuntimeConfig {
         V: AsRef<str>,
     {
         let mut config = Self {
-            profile: false,
             skip_ws_zero: false,
-            trace_shapes: false,
-            trace_shapes_max: 256,
         };
         for (name, value) in vars {
             match name.as_ref() {
-                "FERRUM_MARLIN_PROFILE" => config.profile = value.as_ref() == "1",
                 "FERRUM_MARLIN_SKIP_WS_ZERO" => config.skip_ws_zero = value.as_ref() == "1",
-                "FERRUM_MARLIN_TRACE_SHAPES" => config.trace_shapes = value.as_ref() == "1",
-                "FERRUM_MARLIN_TRACE_SHAPES_MAX" => {
-                    if let Ok(max) = value.as_ref().parse::<u64>() {
-                        config.trace_shapes_max = max;
-                    }
-                }
                 _ => {}
             }
         }
@@ -66,226 +52,6 @@ fn skip_ws_zero() -> bool {
 
 fn should_zero_workspace(config: &CudaMarlinRuntimeConfig) -> bool {
     !config.skip_ws_zero
-}
-
-/// Profile-only nested dense Marlin counters. They are intentionally not part
-/// of normal model timings because callers already time the full projection.
-pub static MARLIN_WS_ZERO_TIME_US: AtomicU64 = AtomicU64::new(0);
-pub static MARLIN_WS_ZERO_CALLS: AtomicU64 = AtomicU64::new(0);
-pub static MARLIN_GATHER_TIME_US: AtomicU64 = AtomicU64::new(0);
-pub static MARLIN_GATHER_CALLS: AtomicU64 = AtomicU64::new(0);
-pub static MARLIN_KERNEL_TIME_US: AtomicU64 = AtomicU64::new(0);
-pub static MARLIN_KERNEL_CALLS: AtomicU64 = AtomicU64::new(0);
-static MARLIN_TRACE_SHAPE_CALLS: AtomicU64 = AtomicU64::new(0);
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct MarlinProfileBucketStats {
-    pub ws_zero_us: u64,
-    pub ws_zero_calls: u64,
-    pub gather_us: u64,
-    pub gather_calls: u64,
-    pub kernel_us: u64,
-    pub kernel_calls: u64,
-}
-
-impl MarlinProfileBucketStats {
-    pub const ZERO: Self = Self {
-        ws_zero_us: 0,
-        ws_zero_calls: 0,
-        gather_us: 0,
-        gather_calls: 0,
-        kernel_us: 0,
-        kernel_calls: 0,
-    };
-
-    fn record_ws_zero(&mut self, us: u64) {
-        self.ws_zero_us += us;
-        self.ws_zero_calls += 1;
-    }
-
-    fn record_gather(&mut self, us: u64) {
-        self.gather_us += us;
-        self.gather_calls += 1;
-    }
-
-    fn record_kernel(&mut self, us: u64) {
-        self.kernel_us += us;
-        self.kernel_calls += 1;
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct MarlinProfileByProjection {
-    pub qkv: MarlinProfileBucketStats,
-    pub o_proj: MarlinProfileBucketStats,
-    pub gate_up: MarlinProfileBucketStats,
-    pub down: MarlinProfileBucketStats,
-    pub lm_head: MarlinProfileBucketStats,
-    pub other: MarlinProfileBucketStats,
-}
-
-impl MarlinProfileByProjection {
-    pub const ZERO: Self = Self {
-        qkv: MarlinProfileBucketStats::ZERO,
-        o_proj: MarlinProfileBucketStats::ZERO,
-        gate_up: MarlinProfileBucketStats::ZERO,
-        down: MarlinProfileBucketStats::ZERO,
-        lm_head: MarlinProfileBucketStats::ZERO,
-        other: MarlinProfileBucketStats::ZERO,
-    };
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum MarlinProfileBucket {
-    Qkv,
-    OProj,
-    GateUp,
-    Down,
-    LmHead,
-    Other,
-}
-
-static MARLIN_PROFILE_BY_PROJECTION: Mutex<MarlinProfileByProjection> =
-    Mutex::new(MarlinProfileByProjection::ZERO);
-
-struct CudaMarlinEventTimer {
-    start: cudarc::driver::sys::CUevent,
-    end: cudarc::driver::sys::CUevent,
-}
-
-impl CudaMarlinEventTimer {
-    fn start(raw_stream: cudarc::driver::sys::CUstream) -> Option<Self> {
-        use cudarc::driver::sys as cu;
-        let mut start: cu::CUevent = std::ptr::null_mut();
-        let mut end: cu::CUevent = std::ptr::null_mut();
-        unsafe {
-            let _ = cu::cuEventCreate(&mut start, 0);
-            let _ = cu::cuEventCreate(&mut end, 0);
-        }
-        if start.is_null() || end.is_null() {
-            unsafe {
-                if !start.is_null() {
-                    let _ = cu::cuEventDestroy_v2(start);
-                }
-                if !end.is_null() {
-                    let _ = cu::cuEventDestroy_v2(end);
-                }
-            }
-            return None;
-        }
-        let timer = Self { start, end };
-        timer.record_start(raw_stream);
-        Some(timer)
-    }
-
-    fn record_start(&self, raw_stream: cudarc::driver::sys::CUstream) {
-        unsafe {
-            let _ = cudarc::driver::sys::cuEventRecord(self.start, raw_stream);
-        }
-    }
-
-    fn finish_us(&self, raw_stream: cudarc::driver::sys::CUstream) -> u64 {
-        unsafe {
-            let _ = cudarc::driver::sys::cuEventRecord(self.end, raw_stream);
-            let _ = cudarc::driver::sys::cuEventSynchronize(self.end);
-        }
-        (unsafe { cudarc::driver::result::event::elapsed(self.start, self.end) }
-            .ok()
-            .unwrap_or(0.0) as f64
-            * 1000.0) as u64
-    }
-}
-
-impl Drop for CudaMarlinEventTimer {
-    fn drop(&mut self) {
-        unsafe {
-            let _ = cudarc::driver::sys::cuEventDestroy_v2(self.start);
-            let _ = cudarc::driver::sys::cuEventDestroy_v2(self.end);
-        }
-    }
-}
-
-fn marlin_profile_bucket_from_label(label: &str) -> MarlinProfileBucket {
-    if label.contains("qkv_proj") {
-        MarlinProfileBucket::Qkv
-    } else if label.contains("o_proj") {
-        MarlinProfileBucket::OProj
-    } else if label.contains("gate_up_proj") {
-        MarlinProfileBucket::GateUp
-    } else if label.contains("down_proj") {
-        MarlinProfileBucket::Down
-    } else if label.contains("lm_head") {
-        MarlinProfileBucket::LmHead
-    } else {
-        MarlinProfileBucket::Other
-    }
-}
-
-fn current_marlin_profile_bucket() -> MarlinProfileBucket {
-    marlin_profile_bucket_from_label(&super::current_cuda_alloc_label())
-}
-
-fn marlin_profile_bucket_mut(
-    stats: &mut MarlinProfileByProjection,
-    bucket: MarlinProfileBucket,
-) -> &mut MarlinProfileBucketStats {
-    match bucket {
-        MarlinProfileBucket::Qkv => &mut stats.qkv,
-        MarlinProfileBucket::OProj => &mut stats.o_proj,
-        MarlinProfileBucket::GateUp => &mut stats.gate_up,
-        MarlinProfileBucket::Down => &mut stats.down,
-        MarlinProfileBucket::LmHead => &mut stats.lm_head,
-        MarlinProfileBucket::Other => &mut stats.other,
-    }
-}
-
-fn with_marlin_profile_bucket_stats(
-    bucket: MarlinProfileBucket,
-    f: impl FnOnce(&mut MarlinProfileBucketStats),
-) {
-    let mut stats = MARLIN_PROFILE_BY_PROJECTION
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    f(marlin_profile_bucket_mut(&mut stats, bucket));
-}
-
-fn record_marlin_ws_zero(bucket: MarlinProfileBucket, us: u64) {
-    with_marlin_profile_bucket_stats(bucket, |stats| stats.record_ws_zero(us));
-}
-
-fn record_marlin_gather(bucket: MarlinProfileBucket, us: u64) {
-    with_marlin_profile_bucket_stats(bucket, |stats| stats.record_gather(us));
-}
-
-fn record_marlin_kernel(bucket: MarlinProfileBucket, us: u64) {
-    with_marlin_profile_bucket_stats(bucket, |stats| stats.record_kernel(us));
-}
-
-pub fn record_marlin_gather_for_current_label(us: u64) {
-    MARLIN_GATHER_TIME_US.fetch_add(us, Ordering::Relaxed);
-    MARLIN_GATHER_CALLS.fetch_add(1, Ordering::Relaxed);
-    record_marlin_gather(current_marlin_profile_bucket(), us);
-}
-
-pub fn drain_marlin_profile_by_projection() -> MarlinProfileByProjection {
-    let mut stats = MARLIN_PROFILE_BY_PROJECTION
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let snapshot = *stats;
-    *stats = MarlinProfileByProjection::ZERO;
-    snapshot
-}
-
-pub fn profile_marlin() -> bool {
-    cuda_marlin_runtime_config().profile
-}
-
-fn trace_marlin_shapes() -> bool {
-    cuda_marlin_runtime_config().trace_shapes
-}
-
-fn marlin_shape_trace_max() -> u64 {
-    cuda_marlin_runtime_config().trace_shapes_max
 }
 
 // FFI declaration for the Marlin CUDA kernel.
@@ -350,17 +116,6 @@ extern "C" {
 // `vllm-moe-marlin` feature is built in.
 #[cfg(feature = "vllm-moe-marlin")]
 extern "C" {
-    fn ferrum_vllm_marlin_moe_set_profile_config(
-        path: *const std::ffi::c_char,
-        commit_sha: *const std::ffi::c_char,
-        env_hash: *const std::ffi::c_char,
-        model: *const std::ffi::c_char,
-        concurrency: i32,
-        runtime_flags_json: *const std::ffi::c_char,
-    );
-
-    fn ferrum_vllm_marlin_moe_clear_profile_config();
-
     fn ferrum_vllm_marlin_moe_f16(
         a: *const std::ffi::c_void,        // [size_m, size_k] fp16
         b: *const std::ffi::c_void,        // [num_experts, k/16, n*pack/16] i32 marlin-packed
@@ -442,64 +197,6 @@ extern "C" {
     ) -> i32;
 }
 
-#[cfg(feature = "vllm-moe-marlin")]
-pub fn configure_vllm_moe_profile_sink(
-    config: &ferrum_bench_core::ProfileSinkConfig,
-) -> std::io::Result<()> {
-    use std::ffi::CString;
-
-    let Some(path) = &config.jsonl_path else {
-        unsafe { ferrum_vllm_marlin_moe_clear_profile_config() };
-        return Ok(());
-    };
-
-    let path = CString::new(path.as_os_str().to_string_lossy().into_owned()).map_err(|err| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            format!("profile path contains NUL byte: {err}"),
-        )
-    })?;
-    let commit_sha = CString::new(
-        config
-            .metadata
-            .commit_sha
-            .as_deref()
-            .unwrap_or_default()
-            .to_string(),
-    )
-    .map_err(profile_cstring_error("profile commit_sha"))?;
-    let env_hash = CString::new(config.metadata.env_hash.clone())
-        .map_err(profile_cstring_error("env_hash"))?;
-    let model =
-        CString::new(config.metadata.model.clone()).map_err(profile_cstring_error("model"))?;
-    let runtime_flags_json =
-        serde_json::to_string(&config.metadata.runtime_flags).unwrap_or_else(|_| "{}".to_string());
-    let runtime_flags_json =
-        CString::new(runtime_flags_json).map_err(profile_cstring_error("runtime_flags_json"))?;
-
-    unsafe {
-        ferrum_vllm_marlin_moe_set_profile_config(
-            path.as_ptr(),
-            commit_sha.as_ptr(),
-            env_hash.as_ptr(),
-            model.as_ptr(),
-            config.metadata.concurrency.min(i32::MAX as u32) as i32,
-            runtime_flags_json.as_ptr(),
-        );
-    }
-    Ok(())
-}
-
-#[cfg(feature = "vllm-moe-marlin")]
-fn profile_cstring_error(field: &'static str) -> impl FnOnce(std::ffi::NulError) -> std::io::Error {
-    move |err| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            format!("{field} contains NUL byte: {err}"),
-        )
-    }
-}
-
 /// Check if Marlin kernel is available at compile time.
 pub fn is_available() -> bool {
     cfg!(feature = "marlin")
@@ -548,7 +245,6 @@ pub fn marlin_gemm(
     m: i32,
 ) -> candle_core::Result<()> {
     let n = weight.n as i32;
-    let k = weight.k as i32;
 
     // Layers with n % 256 != 0 (e.g. a quantized 2048x128 MoE router or a
     // 151936-wide lm_head from repacked repos) only have valid kernel
@@ -587,26 +283,13 @@ fn marlin_gemm_chunk(
     let k = weight.k as i32;
 
     let raw_stream = stream.cu_stream();
-    let profile = profile_marlin();
-    let profile_bucket = profile.then(current_marlin_profile_bucket);
 
     // Zero workspace on the runner's stream — Marlin uses it as mutex locks.
     // All operations (memset + kernel) on same stream → naturally ordered.
     if should_zero_workspace(cuda_marlin_runtime_config()) {
-        let timer = profile
-            .then(|| CudaMarlinEventTimer::start(raw_stream))
-            .flatten();
         let (ws_ptr, _guard) = weight.workspace.device_ptr(stream);
         unsafe {
             cudarc::driver::sys::cuMemsetD32Async(ws_ptr, 0, weight.workspace.len(), raw_stream);
-        }
-        if let Some(timer) = timer {
-            let elapsed_us = timer.finish_us(raw_stream);
-            MARLIN_WS_ZERO_TIME_US.fetch_add(elapsed_us, Ordering::Relaxed);
-            MARLIN_WS_ZERO_CALLS.fetch_add(1, Ordering::Relaxed);
-            if let Some(bucket) = profile_bucket {
-                record_marlin_ws_zero(bucket, elapsed_us);
-            }
         }
     }
 
@@ -617,35 +300,6 @@ fn marlin_gemm_chunk(
     let (s_ptr, _s_guard) = weight.scales.device_ptr(stream);
     let (ws_ptr, _ws_guard) = weight.workspace.device_ptr(stream);
 
-    if trace_marlin_shapes() {
-        let call = MARLIN_TRACE_SHAPE_CALLS.fetch_add(1, Ordering::Relaxed);
-        if call < marlin_shape_trace_max() {
-            let label = super::current_cuda_alloc_label();
-            let bucket = marlin_profile_bucket_from_label(&label);
-            eprintln!(
-                "[marlin-shape-trace] call={} label={} bucket={:?} m={} n={} k={} gs={} qweight_len={} scales_len={} workspace_len={} a=0x{:x} b=0x{:x} c=0x{:x} s=0x{:x} ws=0x{:x}",
-                call,
-                label,
-                bucket,
-                m,
-                n,
-                k,
-                weight.group_size,
-                weight.qweight.len(),
-                weight.scales.len(),
-                weight.workspace.len(),
-                a_ptr,
-                b_ptr,
-                c_ptr,
-                s_ptr,
-                ws_ptr,
-            );
-        }
-    }
-
-    let timer = profile
-        .then(|| CudaMarlinEventTimer::start(raw_stream))
-        .flatten();
     let ret = unsafe {
         marlin_cuda(
             a_ptr as *const _,
@@ -666,14 +320,6 @@ fn marlin_gemm_chunk(
             -1, // prob_n_full = prob_n (non-stacked)
         )
     };
-    if let Some(timer) = timer {
-        let elapsed_us = timer.finish_us(raw_stream);
-        MARLIN_KERNEL_TIME_US.fetch_add(elapsed_us, Ordering::Relaxed);
-        MARLIN_KERNEL_CALLS.fetch_add(1, Ordering::Relaxed);
-        if let Some(bucket) = profile_bucket {
-            record_marlin_kernel(bucket, elapsed_us);
-        }
-    }
 
     if ret != 0 {
         return Err(candle_core::Error::Msg(format!(
@@ -1696,9 +1342,6 @@ pub fn marlin_gemm_moe_vllm(
     prob_k: i32,
 ) -> candle_core::Result<()> {
     use cudarc::driver::DevicePtr;
-    let raw_stream = stream.cu_stream();
-    let profile = profile_marlin();
-    let profile_bucket = profile.then(current_marlin_profile_bucket);
 
     let (a_ptr, _ag) = input.device_ptr(stream);
     let (b_ptr, _bg) = weight.qweight.device_ptr(stream);
@@ -1722,9 +1365,6 @@ pub fn marlin_gemm_moe_vllm(
         None => None,
     };
 
-    let timer = profile
-        .then(|| CudaMarlinEventTimer::start(raw_stream))
-        .flatten();
     let result = launch_marlin_moe_vllm_raw(
         stream,
         MarlinMoeRawLaunchArgs {
@@ -1754,14 +1394,6 @@ pub fn marlin_gemm_moe_vllm(
             use_fp32_reduce: c_tmp_ptr.is_some(),
         },
     );
-    if let Some(timer) = timer {
-        let elapsed_us = timer.finish_us(raw_stream);
-        MARLIN_KERNEL_TIME_US.fetch_add(elapsed_us, Ordering::Relaxed);
-        MARLIN_KERNEL_CALLS.fetch_add(1, Ordering::Relaxed);
-        if let Some(bucket) = profile_bucket {
-            record_marlin_kernel(bucket, elapsed_us);
-        }
-    }
     result
 }
 
@@ -1798,15 +1430,18 @@ pub use crate::marlin_repack::{
 #[path = "../../../tests/compressed_tensors_marlin_eq/guards.rs"]
 mod test_guards;
 
+#[cfg(all(test, feature = "vllm-moe-marlin"))]
+#[path = "marlin/profile_retirement_tests.rs"]
+mod profile_retirement_tests;
+
 #[cfg(test)]
 mod tests {
     #[cfg(feature = "vllm-moe-marlin")]
     use super::{launch_marlin_moe_mxfp4_bf16, launch_marlin_moe_vllm_raw};
     use super::{
-        marlin_moe_ffi_status, marlin_profile_bucket_from_label, should_zero_workspace,
-        CudaMarlinRuntimeConfig, MarlinMoeF16WeightType, MarlinMoeMxfp4Bf16LaunchArgs,
-        MarlinMoeMxfp4WeightType, MarlinMoeRawLaunchArgs, MarlinProfileBucket,
-        MarlinProfileBucketStats,
+        marlin_moe_ffi_status, should_zero_workspace, CudaMarlinRuntimeConfig,
+        MarlinMoeF16WeightType, MarlinMoeMxfp4Bf16LaunchArgs, MarlinMoeMxfp4WeightType,
+        MarlinMoeRawLaunchArgs,
     };
     #[cfg(feature = "vllm-moe-marlin")]
     use crate::marlin_repack::{prepare_block_fp8_weight_for_fp8_marlin, repack_gptq_to_marlin};
@@ -2484,7 +2119,7 @@ mod tests {
     #[test]
     #[ignore = "requires an sm89 CUDA host and the GPT-OSS MXFP4 Marlin-MoE native artifact"]
     #[cfg(feature = "vllm-moe-marlin")]
-    fn gpt_oss_mxfp4_marlin_moe_bf16_ffi_matches_source_reference_for_four_cases() {
+    pub(super) fn gpt_oss_mxfp4_marlin_moe_bf16_ffi_matches_source_reference_for_four_cases() {
         const MOE_BLOCK_SIZE: usize = 16;
         const LCG_MULTIPLIER: u64 = 0x5851_f42d_4c95_7f2d;
         const LCG_INCREMENT: u64 = 0x1405_7b7e_f767_814f;
@@ -3031,7 +2666,7 @@ mod tests {
     #[test]
     #[ignore = "requires an sm89 CUDA host and the FP8 Marlin-MoE native artifact"]
     #[cfg(feature = "vllm-moe-marlin")]
-    fn qwen36_a3_fp8_marlin_moe_ffi_matches_cpu_reference_for_four_cases() {
+    pub(super) fn qwen36_a3_fp8_marlin_moe_ffi_matches_cpu_reference_for_four_cases() {
         const BLOCK_SHAPE: [usize; 2] = [128, 128];
         const MOE_BLOCK_SIZE: usize = 16;
         const LCG_MULTIPLIER: u64 = 0x5851_f42d_4c95_7f2d;
@@ -3261,30 +2896,15 @@ mod tests {
 
     #[test]
     fn cuda_marlin_runtime_config_parses_skip_ws_zero() {
-        let config = CudaMarlinRuntimeConfig::from_env_vars([
-            ("FERRUM_MARLIN_PROFILE", "1"),
-            ("FERRUM_MARLIN_SKIP_WS_ZERO", "1"),
-            ("FERRUM_MARLIN_TRACE_SHAPES", "1"),
-            ("FERRUM_MARLIN_TRACE_SHAPES_MAX", "17"),
-        ]);
-        assert!(config.profile);
+        let config = CudaMarlinRuntimeConfig::from_env_vars([("FERRUM_MARLIN_SKIP_WS_ZERO", "1")]);
         assert!(config.skip_ws_zero);
-        assert!(config.trace_shapes);
-        assert_eq!(config.trace_shapes_max, 17);
     }
 
     #[test]
     fn cuda_marlin_runtime_config_defaults_to_zero_workspace() {
-        let config = CudaMarlinRuntimeConfig::from_env_vars([
-            ("FERRUM_MARLIN_PROFILE", "true"),
-            ("FERRUM_MARLIN_SKIP_WS_ZERO", "true"),
-            ("FERRUM_MARLIN_TRACE_SHAPES", "true"),
-            ("FERRUM_MARLIN_TRACE_SHAPES_MAX", "not-a-number"),
-        ]);
-        assert!(!config.profile);
+        let config =
+            CudaMarlinRuntimeConfig::from_env_vars([("FERRUM_MARLIN_SKIP_WS_ZERO", "true")]);
         assert!(!config.skip_ws_zero);
-        assert!(!config.trace_shapes);
-        assert_eq!(config.trace_shapes_max, 256);
     }
 
     #[test]
@@ -3295,49 +2915,5 @@ mod tests {
         let skip_config =
             CudaMarlinRuntimeConfig::from_env_vars([("FERRUM_MARLIN_SKIP_WS_ZERO", "1")]);
         assert!(!should_zero_workspace(&skip_config));
-    }
-
-    #[test]
-    fn marlin_profile_bucket_labels_match_projection_names() {
-        assert_eq!(
-            marlin_profile_bucket_from_label("label=llama.batched_layer.qkv_proj"),
-            MarlinProfileBucket::Qkv
-        );
-        assert_eq!(
-            marlin_profile_bucket_from_label("label=llama.forward_layer.o_proj"),
-            MarlinProfileBucket::OProj
-        );
-        assert_eq!(
-            marlin_profile_bucket_from_label("label=llama.forward_layer.gate_up_proj"),
-            MarlinProfileBucket::GateUp
-        );
-        assert_eq!(
-            marlin_profile_bucket_from_label("label=llama.forward_layer.down_proj"),
-            MarlinProfileBucket::Down
-        );
-        assert_eq!(
-            marlin_profile_bucket_from_label("label=llama.batched.lm_head"),
-            MarlinProfileBucket::LmHead
-        );
-        assert_eq!(
-            marlin_profile_bucket_from_label("label=<none>"),
-            MarlinProfileBucket::Other
-        );
-    }
-
-    #[test]
-    fn marlin_profile_bucket_stats_record_all_profile_phases() {
-        let mut stats = MarlinProfileBucketStats::ZERO;
-
-        stats.record_ws_zero(3);
-        stats.record_gather(5);
-        stats.record_kernel(7);
-
-        assert_eq!(stats.ws_zero_us, 3);
-        assert_eq!(stats.ws_zero_calls, 1);
-        assert_eq!(stats.gather_us, 5);
-        assert_eq!(stats.gather_calls, 1);
-        assert_eq!(stats.kernel_us, 7);
-        assert_eq!(stats.kernel_calls, 1);
     }
 }

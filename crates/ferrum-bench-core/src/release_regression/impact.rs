@@ -123,6 +123,7 @@ fn cuda_operator_member(path: &str) -> Option<&str> {
         "upstream-linear"
             | "upstream-extra-linear"
             | "upstream-q6-f32-linear"
+            | "vllm-moe-marlin-profiler-free"
             | "vllm-paged-attention-indexed"
     ) && !filename.is_empty()
         && !filename.contains('/'))
@@ -734,6 +735,7 @@ mod tests {
             "native-operators/cuda/package-definitions/vllm-paged-attention-v2.json",
             "native-operators/cuda/source-locks/vllm-moe-marlin.plan.json",
             "native-operators/cuda/source-overlays/vllm-paged-attention-indexed.json",
+            "native-operators/cuda/source-overlays/vllm-moe-marlin-profiler-free.json",
         ];
         for path in descriptors {
             assert_eq!(path_backend(path), Some(Backend::Cuda));
@@ -777,6 +779,7 @@ mod tests {
             "native-operators/cuda/upstream-extra-linear/abi.h",
             "native-operators/cuda/upstream-q6-f32-linear/f16_adapter.cuh",
             "native-operators/cuda/vllm-paged-attention-indexed/launcher_gqa2_test.cu",
+            "native-operators/cuda/vllm-moe-marlin-profiler-free/ops.cu",
         ];
         for path in sources {
             let impact = analyze_paths([path]);
@@ -789,6 +792,7 @@ mod tests {
             "native-operators/cuda/upstream-extra-linear/llama-MIT.txt",
             "native-operators/cuda/upstream-q6-f32-linear/llama-MIT.txt",
             "native-operators/cuda/vllm-paged-attention-indexed/README.md",
+            "native-operators/cuda/vllm-moe-marlin-profiler-free/README.md",
         ] {
             assert_eq!(analyze_paths([path]).areas, [ChangeArea::Build]);
             assert_eq!(path_backend(path), Some(Backend::Cuda));

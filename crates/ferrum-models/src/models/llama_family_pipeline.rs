@@ -4,9 +4,7 @@ use ferrum_types::{FerrumError, Result};
 
 use crate::common::{DecoderOnlyLLM, LlmRuntimeConfig};
 
-use super::llama_family::{
-    llama_family_decode_op_profile_enabled, LlamaFamilyModel, LlamaStageHiddenBridgeTiming,
-};
+use super::llama_family::{LlamaFamilyModel, LlamaStageHiddenBridgeTiming};
 
 fn elapsed_micros_u64(t0: std::time::Instant) -> u64 {
     t0.elapsed().as_micros().min(u64::MAX as u128) as u64
@@ -688,12 +686,10 @@ where
         batch: &[(String, u32, u32)],
         force_full_logits: bool,
     ) -> Vec<Vec<f32>> {
-        let profile = llama_family_decode_op_profile_enabled();
         let total_t0 = std::time::Instant::now();
         let mut stage_us: Vec<u64> = Vec::with_capacity(self.stages.len());
         let mut host_bridge_bytes = 0usize;
         let mut bridge_timing = LlamaStageHiddenBridgeTiming::default();
-        let stage_bridge = self.placement.stage_bridge();
 
         let stage_t0 = std::time::Instant::now();
         let mut hidden =
@@ -733,27 +729,7 @@ where
             logits_us,
             total_us,
         );
-        if profile {
-            static PIPELINE_PROFILE_CALLS: std::sync::atomic::AtomicU64 =
-                std::sync::atomic::AtomicU64::new(0);
-            let n = PIPELINE_PROFILE_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            if n.is_multiple_of(8) {
-                eprintln!(
-                    "[pipeline-decode-profile] call#{} m={} hidden={:?} mode=batch bridge={} host_bridge_bytes={} bridge_us={} host_copy_us={} device_copy_us={} stage_us={:?} logits_us={} total_us={}",
-                    n,
-                    batch.len(),
-                    hidden.metadata_json(),
-                    stage_bridge.as_str(),
-                    host_bridge_bytes,
-                    bridge_timing.bridge_us,
-                    bridge_timing.host_copy_us,
-                    bridge_timing.device_copy_us,
-                    stage_us,
-                    logits_us,
-                    total_us,
-                );
-            }
-        }
+
         logits
     }
 
@@ -773,11 +749,9 @@ where
             return self.decode_batch_sequential_internal(batch, force_full_logits);
         }
 
-        let profile = llama_family_decode_op_profile_enabled();
         let total_t0 = std::time::Instant::now();
         let stage0_device = self.placement.stage(0).backend_device_ordinal;
         let stage1_device = self.placement.stage(1).backend_device_ordinal;
-        let stage_bridge = self.placement.stage_bridge();
         let (stage0_slice, stage1_slice) = self.stages.split_at_mut(1);
         let stage0 = &mut stage0_slice[0];
         let stage1 = &mut stage1_slice[0];
@@ -850,28 +824,6 @@ where
             logits_us_total,
             total_us,
         );
-        if profile {
-            static PIPELINE_PROFILE_CALLS: std::sync::atomic::AtomicU64 =
-                std::sync::atomic::AtomicU64::new(0);
-            let n = PIPELINE_PROFILE_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            if n.is_multiple_of(8) {
-                eprintln!(
-                    "[pipeline-decode-profile] call#{} m={} mode=overlapped microbatch_size={} microbatch_count={} bridge={} host_bridge_bytes={} bridge_us={} host_copy_us={} device_copy_us={} stage_us={:?} logits_us={} total_us={}",
-                    n,
-                    batch.len(),
-                    microbatch_size,
-                    chunk_count,
-                    stage_bridge.as_str(),
-                    host_bridge_bytes,
-                    bridge_timing.bridge_us,
-                    bridge_timing.host_copy_us,
-                    bridge_timing.device_copy_us,
-                    stage_us,
-                    logits_us_total,
-                    total_us,
-                );
-            }
-        }
 
         let mut logits = Vec::with_capacity(batch.len());
         for chunk_logits in ordered_logits {

@@ -4,16 +4,6 @@
 //! On CUDA builds, kernels are compiled to PTX during `cargo build` and loaded
 //! on demand at runtime.
 
-pub fn configure_native_profile_sink(
-    config: &ferrum_bench_core::ProfileSinkConfig,
-) -> std::io::Result<()> {
-    #[cfg(all(feature = "cuda", feature = "vllm-moe-marlin"))]
-    backend::cuda::marlin::configure_vllm_moe_profile_sink(config)?;
-    #[cfg(not(all(feature = "cuda", feature = "vllm-moe-marlin")))]
-    let _ = config;
-    Ok(())
-}
-
 #[cfg(feature = "cuda")]
 pub fn cuda_device_count() -> Result<usize, String> {
     cudarc::driver::CudaContext::device_count()

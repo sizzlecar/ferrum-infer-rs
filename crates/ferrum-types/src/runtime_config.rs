@@ -56,6 +56,23 @@ impl RuntimeConfigSnapshot {
                 "FERRUM_SPEC_DRAFT" | "FERRUM_SPEC_N" => Some(
                     "speculative decoding has been retired; remove this option",
                 ),
+                "FERRUM_PROFILE_COMMIT_SHA" | "FERRUM_PROFILE_ENV_HASH"
+                | "FERRUM_PROFILE_MODEL" | "FERRUM_PROFILE_CONCURRENCY"
+                | "FERRUM_PROFILE_RUNTIME_FLAGS_JSON" => Some(
+                    "process-global profile metadata has been retired; use serve --profile-commit-sha, --profile-env-hash, --profile-model, --profile-concurrency or --profile-runtime-flags-json for instance session metadata",
+                ),
+                "FERRUM_TRACE_OUT"
+                | "FERRUM_VLLM_MOE_LOG_CONFIG" | "FERRUM_VLLM_MOE_LOG_CONFIG_LIMIT"
+                | "FERRUM_VLLM_MOE_LOG_CONFIG_MIN_PAIRS" | "FERRUM_VLLM_MOE_LOG_CONFIG_MAX_PAIRS"
+                | "FERRUM_GRAPH_PROF"
+                | "FERRUM_MOE_DUMP" | "FERRUM_MOE_DUMP_BATCH_X_TOPK"
+                | "FERRUM_MARLIN_PROFILE" | "FERRUM_MARLIN_TRACE_SHAPES"
+                | "FERRUM_MARLIN_TRACE_SHAPES_MAX"
+                | "FERRUM_DECODE_OP_PROFILE" | "FERRUM_PREFILL_OP_PROFILE"
+                | "FERRUM_DECODE_LAYER_PROFILE" | "FERRUM_UNIFIED_PROFILE"
+                | "FERRUM_BATCHED_TRACE" | "FERRUM_MOE_PROFILE" => Some(
+                    "process-global backend profiling has been retired; remove this option and select an instance product profile with --profile-jsonl and --profile-detail",
+                ),
                 _ => None,
             };
             if let Some(reason) = retired {
@@ -561,5 +578,46 @@ mod tests {
             .unwrap();
         assert_eq!(profile.source, RuntimeConfigSource::Cli);
         assert!(profile.affects.contains(&RuntimeConfigEffect::Diagnostics));
+    }
+}
+
+#[cfg(test)]
+mod retired_profiler_tests {
+    use super::*;
+    #[test]
+    fn retired_global_profile_controls_reject_even_disabled_values() {
+        for key in [
+            "FERRUM_GRAPH_PROF",
+            "FERRUM_MOE_DUMP",
+            "FERRUM_MOE_DUMP_BATCH_X_TOPK",
+            "FERRUM_MARLIN_PROFILE",
+            "FERRUM_MARLIN_TRACE_SHAPES",
+            "FERRUM_MARLIN_TRACE_SHAPES_MAX",
+            "FERRUM_DECODE_OP_PROFILE",
+            "FERRUM_PREFILL_OP_PROFILE",
+            "FERRUM_DECODE_LAYER_PROFILE",
+            "FERRUM_UNIFIED_PROFILE",
+            "FERRUM_BATCHED_TRACE",
+            "FERRUM_MOE_PROFILE",
+        ] {
+            for value in ["0", "1"] {
+                let snapshot = RuntimeConfigSnapshot::from_entries(vec![RuntimeConfigEntry::new(
+                    key,
+                    value,
+                    RuntimeConfigSource::Cli,
+                )]);
+                assert_eq!(snapshot.validate_retired_options().unwrap_err().0, key);
+            }
+        }
+        let retained = RuntimeConfigSnapshot::from_entries(vec![
+            RuntimeConfigEntry::new(
+                "FERRUM_PROFILE_JSONL",
+                "profile.jsonl",
+                RuntimeConfigSource::Cli,
+            ),
+            RuntimeConfigEntry::new("FERRUM_BATCH_DECODE_PROF", "1", RuntimeConfigSource::Cli),
+            RuntimeConfigEntry::new("FERRUM_UNIFIED_GRAPH", "1", RuntimeConfigSource::Cli),
+        ]);
+        assert!(retained.validate_retired_options().is_ok());
     }
 }

@@ -2344,18 +2344,8 @@ fn validate_package_spec(spec: &NativeOperatorPackageSpec) -> Result<()> {
         }
     }
     if let Some(unit) = CudaNativeBuildUnit::from_artifact_operator(&spec.operator) {
-        for required in unit.required_exports() {
-            if !spec
-                .required_exports
-                .iter()
-                .any(|export| export == required)
-            {
-                return Err(NativeOperatorBuilderError::Invalid(format!(
-                    "{} package spec is missing build-unit export {required}",
-                    unit.as_str()
-                )));
-            }
-        }
+        unit.validate_package_contract(&spec.operator_abi_version, &spec.required_exports)
+            .map_err(|error| NativeOperatorBuilderError::Invalid(error.to_string()))?;
     }
     if spec.license_files.is_empty() {
         return Err(NativeOperatorBuilderError::Invalid(
@@ -3166,6 +3156,29 @@ fn sha256_bytes(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod canonical_input_tests {
     use super::*;
+
+    #[test]
+    fn moe_profiler_retirement_rejects_old_package_definition_contract() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../native-operators/cuda/package-definitions/vllm-moe-marlin.json");
+        let definition: NativeOperatorPackageDefinition = read_json(&path).unwrap();
+        validate_package_definition(&definition).unwrap();
+        let mut old = definition.clone();
+        old.operator_abi_version = "1".into();
+        assert!(validate_package_definition(&old)
+            .unwrap_err()
+            .to_string()
+            .contains("operator ABI"));
+        for symbol in CudaNativeBuildUnit::VllmMoeMarlin.forbidden_exports() {
+            let mut stale = definition.clone();
+            stale.required_exports.push((*symbol).into());
+            stale.required_exports.sort();
+            assert!(validate_package_definition(&stale)
+                .unwrap_err()
+                .to_string()
+                .contains("forbidden export"));
+        }
+    }
 
     #[test]
     fn checked_in_native_package_definitions_and_abi_are_canonical() {

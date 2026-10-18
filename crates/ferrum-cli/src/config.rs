@@ -370,8 +370,8 @@ pub struct RuntimeCliConfig {
     #[serde(default)]
     pub unified_graph_lm_head_eager: Option<bool>,
 
-    /// Emit engine batch iteration profile logs, equivalent to
-    /// `FERRUM_BATCH_DECODE_PROF`.
+    /// Emit instance Engine iteration and first-text events to a configured
+    /// typed journal, equivalent to `FERRUM_BATCH_DECODE_PROF`.
     #[serde(default)]
     pub batch_decode_prof: Option<bool>,
 
@@ -394,31 +394,6 @@ pub struct RuntimeCliConfig {
     /// `FERRUM_UNIFIED_POST_PROF`.
     #[serde(default)]
     pub unified_post_prof: Option<bool>,
-
-    /// Emit model decode operator profile logs, equivalent to
-    /// `FERRUM_DECODE_OP_PROFILE`.
-    #[serde(default)]
-    pub decode_op_profile: Option<bool>,
-
-    /// Emit model prefill operator profile logs, equivalent to
-    /// `FERRUM_PREFILL_OP_PROFILE`.
-    #[serde(default)]
-    pub prefill_op_profile: Option<bool>,
-
-    /// Emit dense Marlin inner-kernel timing counters, equivalent to
-    /// `FERRUM_MARLIN_PROFILE`.
-    #[serde(default)]
-    pub marlin_profile: Option<bool>,
-
-    /// Emit dense Marlin shape/label trace lines, equivalent to
-    /// `FERRUM_MARLIN_TRACE_SHAPES`.
-    #[serde(default)]
-    pub marlin_trace_shapes: Option<bool>,
-
-    /// Maximum dense Marlin shape/label trace lines, equivalent to
-    /// `FERRUM_MARLIN_TRACE_SHAPES_MAX`.
-    #[serde(default)]
-    pub marlin_trace_shapes_max: Option<usize>,
 
     /// vLLM paged attention policy, equivalent to
     /// `FERRUM_USE_VLLM_PAGED_ATTN`.
@@ -670,27 +645,6 @@ impl RuntimeCliConfig {
             &mut entries,
             "FERRUM_UNIFIED_POST_PROF",
             self.unified_post_prof,
-        );
-        push_true_entry(
-            &mut entries,
-            "FERRUM_DECODE_OP_PROFILE",
-            self.decode_op_profile,
-        );
-        push_true_entry(
-            &mut entries,
-            "FERRUM_PREFILL_OP_PROFILE",
-            self.prefill_op_profile,
-        );
-        push_true_entry(&mut entries, "FERRUM_MARLIN_PROFILE", self.marlin_profile);
-        push_true_entry(
-            &mut entries,
-            "FERRUM_MARLIN_TRACE_SHAPES",
-            self.marlin_trace_shapes,
-        );
-        push_usize_entry(
-            &mut entries,
-            "FERRUM_MARLIN_TRACE_SHAPES_MAX",
-            self.marlin_trace_shapes_max,
         );
         push_bool_entry(
             &mut entries,
@@ -1159,6 +1113,28 @@ mod tests {
     }
 
     #[test]
+    fn runtime_config_rejects_retired_global_profiler_fields() {
+        for key in [
+            "decode_op_profile",
+            "prefill_op_profile",
+            "marlin_profile",
+            "marlin_trace_shapes",
+            "marlin_trace_shapes_max",
+        ] {
+            for value in if key.ends_with("_max") {
+                ["0", "17"]
+            } else {
+                ["false", "true"]
+            } {
+                let error = toml::from_str::<CliConfig>(&format!("[runtime]\n{key} = {value}\n"))
+                    .unwrap_err();
+                assert!(error.to_string().contains("unknown field"), "{error}");
+                assert!(error.to_string().contains(key), "{error}");
+            }
+        }
+    }
+
+    #[test]
     fn runtime_config_rejects_retired_moe_and_unknown_fields() {
         for (key, value) in [
             ("moe_graph", "true"),
@@ -1578,11 +1554,6 @@ mod tests {
             next_batch_prof: Some(true),
             rbd_prof: Some(true),
             unified_post_prof: Some(true),
-            decode_op_profile: Some(true),
-            prefill_op_profile: Some(true),
-            marlin_profile: Some(true),
-            marlin_trace_shapes: Some(true),
-            marlin_trace_shapes_max: Some(17),
             use_vllm_paged_attn: Some(true),
             vllm_paged_attn_v1_short: Some(false),
             vllm_moe: Some(true),
@@ -1716,17 +1687,6 @@ mod tests {
         assert_eq!(entry("FERRUM_NEXT_BATCH_PROF").effective_value, "1");
         assert_eq!(entry("FERRUM_RBD_PROF").effective_value, "1");
         assert_eq!(entry("FERRUM_UNIFIED_POST_PROF").effective_value, "1");
-        assert_eq!(entry("FERRUM_DECODE_OP_PROFILE").effective_value, "1");
-        assert_eq!(entry("FERRUM_PREFILL_OP_PROFILE").effective_value, "1");
-        assert_eq!(entry("FERRUM_MARLIN_PROFILE").effective_value, "1");
-        assert!(entry("FERRUM_MARLIN_PROFILE")
-            .affects
-            .contains(&RuntimeConfigEffect::Diagnostics));
-        assert_eq!(entry("FERRUM_MARLIN_TRACE_SHAPES").effective_value, "1");
-        assert_eq!(
-            entry("FERRUM_MARLIN_TRACE_SHAPES_MAX").effective_value,
-            "17"
-        );
         assert_eq!(entry("FERRUM_USE_VLLM_PAGED_ATTN").effective_value, "1");
         assert_eq!(
             entry("FERRUM_VLLM_PAGED_ATTN_V1_SHORT").effective_value,
@@ -1773,10 +1733,6 @@ mod tests {
             next_batch_prof: Some(false),
             rbd_prof: Some(false),
             unified_post_prof: Some(false),
-            decode_op_profile: Some(false),
-            prefill_op_profile: Some(false),
-            marlin_profile: Some(false),
-            marlin_trace_shapes: Some(false),
             ..Default::default()
         }
         .runtime_config_entries();

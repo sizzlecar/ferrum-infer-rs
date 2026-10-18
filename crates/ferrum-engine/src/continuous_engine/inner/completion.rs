@@ -600,7 +600,7 @@ impl EngineInner {
             // socket, which the engine can't observe.
             let mut ttft_s: Option<f64> = None;
             let mut itl_s: Option<f64> = None;
-            let mut first_emit_prof: Option<(usize, usize, u64)> = None;
+            let mut first_emit_prof = None;
             if !delta.is_empty() {
                 let now = Instant::now();
                 match seq.first_emit_at {
@@ -608,11 +608,18 @@ impl EngineInner {
                         let ttft = now.duration_since(seq.start_time);
                         ttft_s = Some(ttft.as_secs_f64());
                         if self.runtime_config.batch_decode_prof {
-                            first_emit_prof = Some((
-                                seq.input_tokens.len(),
-                                seq.generated_tokens.len(),
-                                ttft.as_micros() as u64,
-                            ));
+                            if let Some(ingress) = seq.original_request.ingress {
+                                first_emit_prof = Some((
+                                    seq.input_tokens.len(),
+                                    seq.generated_tokens.len(),
+                                    ingress,
+                                    now,
+                                ));
+                            } else {
+                                self.report_observation_failure(ExecutionEventSinkError::contract(
+                                    "stream first-text observation lacks its original ingress anchor",
+                                ));
+                            }
                         }
                         seq.first_emit_at = Some(now);
                     }
@@ -635,26 +642,14 @@ impl EngineInner {
         if let Some(t) = itl_s {
             histogram!("ferrum.engine.itl_seconds").record(t);
         }
-        if let Some((prompt_tokens, generated_tokens, ttft_us)) = first_emit_prof {
-            eprintln!(
-                "[stream-ttft-prof] req={} prompt_tokens={} generated_tokens={} ttft={}us",
-                request_id, prompt_tokens, generated_tokens, ttft_us,
-            );
-            let profile = global_profile();
-            if profile.is_enabled() {
-                let _ = profile.push_event(
-                    "stream_ttft_prof",
-                    profile_fields_from_json(serde_json::json!({
-                        "request_id": request_id.to_string(),
-                        "prompt_tokens": prompt_tokens,
-                        "generated_tokens": generated_tokens,
-                    })),
-                    profile_fields_from_json(serde_json::json!({
-                        "ttft": ttft_us,
-                    })),
-                    false,
-                );
-            }
+        if let Some((prompt_tokens, generated_tokens, ingress, committed_at)) = first_emit_prof {
+            self.record_host_observation(EngineHostObservation::FirstStreamText {
+                request_id,
+                prompt_tokens,
+                generated_tokens,
+                ingress,
+                committed_at,
+            });
         }
         Ok(())
     }

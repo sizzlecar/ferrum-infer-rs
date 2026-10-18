@@ -10,137 +10,13 @@
 //! Marlin GEMM phase (`moe_gemm_phase_*` impl methods) lives on
 //! `BackendQuantMarlin` and is in `cuda/quant.rs`.
 
-use cudarc::driver::{CudaStream, LaunchConfig, PushKernelArg};
-use ferrum_bench_core::{global_profile, profile_fields_from_json};
+use cudarc::driver::{LaunchConfig, PushKernelArg};
 use ferrum_types::{FerrumError, Result};
 use half::f16;
-use std::sync::{Arc, OnceLock};
 
 use super::CudaBackend;
 use crate::backend::{Backend, BackendMoeFused, CudaBuf};
 use crate::ptx;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct MoeDumpRuntimeConfig {
-    enabled: bool,
-    batch_x_topk_filter: Option<usize>,
-}
-
-fn moe_dump_runtime_config() -> &'static MoeDumpRuntimeConfig {
-    static CONFIG: OnceLock<MoeDumpRuntimeConfig> = OnceLock::new();
-    CONFIG.get_or_init(|| {
-        let mut config = MoeDumpRuntimeConfig {
-            enabled: false,
-            batch_x_topk_filter: None,
-        };
-        for (name, value) in std::env::vars() {
-            match name.as_str() {
-                "FERRUM_MOE_DUMP" => config.enabled = true,
-                "FERRUM_MOE_DUMP_BATCH_X_TOPK" => {
-                    config.batch_x_topk_filter = value.parse::<usize>().ok();
-                }
-                _ => {}
-            }
-        }
-        config
-    })
-}
-
-fn maybe_dump_moe_routing(
-    kind: &str,
-    stream: &Arc<CudaStream>,
-    sorted_token_ids: &CudaBuf,
-    block_ids: &CudaBuf,
-    total_tokens_post_pad: &CudaBuf,
-    batch_x_topk: usize,
-    num_experts: usize,
-    block_size: usize,
-) {
-    let config = moe_dump_runtime_config();
-    if !config.enabled {
-        return;
-    }
-    if config
-        .batch_x_topk_filter
-        .is_some_and(|target| target != batch_x_topk)
-    {
-        return;
-    }
-
-    use std::sync::atomic::{AtomicBool, Ordering};
-    static DUMPED: AtomicBool = AtomicBool::new(false);
-    if DUMPED.swap(true, Ordering::Relaxed) {
-        return;
-    }
-
-    let read_i32 = |buf: &CudaBuf, len: usize| -> Vec<i32> {
-        let n = len.min(buf.len());
-        if n == 0 {
-            return Vec::new();
-        }
-        let view = buf.as_i32().slice(0..n);
-        let mut host = vec![0i32; n];
-        if stream.memcpy_dtoh(&view, host.as_mut_slice()).is_err() {
-            return Vec::new();
-        }
-        if stream.synchronize().is_err() {
-            return Vec::new();
-        }
-        host
-    };
-
-    let st = read_i32(sorted_token_ids, sorted_token_ids.len());
-    let bi = read_i32(block_ids, block_ids.len());
-    let tp = read_i32(total_tokens_post_pad, 1);
-    let total_post_pad = tp.first().copied().unwrap_or(-1);
-    let total_blocks = if total_post_pad > 0 {
-        ((total_post_pad as usize) / block_size).min(bi.len())
-    } else {
-        0
-    };
-    let mut seen = vec![false; num_experts];
-    let mut unique_experts = 0usize;
-    for &expert_id in bi.iter().take(total_blocks) {
-        if expert_id >= 0 {
-            let expert_idx = expert_id as usize;
-            if expert_idx < seen.len() && !seen[expert_idx] {
-                seen[expert_idx] = true;
-                unique_experts += 1;
-            }
-        }
-    }
-    let n_show = 48.min(st.len());
-    let n_bi = 32.min(bi.len());
-    eprintln!(
-        "[MOE_DUMP:{kind}] batch_x_topk={batch_x_topk} block_size={block_size} \
-         num_experts={num_experts} total_post_pad={total_post_pad} \
-         active_blocks={total_blocks} unique_experts={unique_experts}",
-    );
-    eprintln!(
-        "[MOE_DUMP:{kind}] sorted_token_ids[0..{n_show}] = {:?}",
-        &st[..n_show]
-    );
-    eprintln!("[MOE_DUMP:{kind}] block_ids[0..{n_bi}] = {:?}", &bi[..n_bi]);
-    let profile = global_profile();
-    if profile.is_enabled() {
-        let _ = profile.push_event(
-            "moe_dump",
-            profile_fields_from_json(serde_json::json!({
-                "kind": kind,
-                "batch_x_topk": batch_x_topk,
-                "block_size": block_size,
-                "num_experts": num_experts,
-                "total_post_pad": total_post_pad,
-                "active_blocks": total_blocks,
-                "unique_experts": unique_experts,
-                "sorted_token_ids_preview": &st[..n_show],
-                "block_ids_preview": &bi[..n_bi],
-            })),
-            profile_fields_from_json(serde_json::json!({})),
-            false,
-        );
-    }
-}
 
 impl BackendMoeFused for CudaBackend {
     fn route_topk_softmax(
@@ -404,16 +280,6 @@ impl BackendMoeFused for CudaBackend {
             .map_err(|e| FerrumError::model(format!("moe_align_block_size launch: {e}")))?;
         }
 
-        maybe_dump_moe_routing(
-            "packed",
-            &stream,
-            sorted_token_ids,
-            block_ids,
-            total_tokens_post_pad,
-            batch_x_topk,
-            num_experts,
-            block_size,
-        );
         Ok(())
     }
 
@@ -460,16 +326,6 @@ impl BackendMoeFused for CudaBackend {
             })
         }
         .map_err(|e| FerrumError::model(format!("moe_align_block_size_pair_ids launch: {e}")))?;
-        maybe_dump_moe_routing(
-            "pair_ids",
-            &stream,
-            sorted_token_ids,
-            block_ids,
-            total_tokens_post_pad,
-            batch_x_topk,
-            num_experts,
-            block_size,
-        );
         Ok(())
     }
 

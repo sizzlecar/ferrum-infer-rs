@@ -1527,33 +1527,14 @@ impl EngineInner {
         if let (Some(t0), Some(ts)) = (t_iter_start, t_after_sched) {
             let n = self.iteration_count.load(Ordering::Relaxed);
             if n < 64 || n.is_multiple_of(32) {
-                let total = t0.elapsed().as_micros();
-                let sched = ts.duration_since(t0).as_micros();
-                let proc = ts.elapsed().as_micros();
-                eprintln!(
-                    "[iter-prof] iter#{} total={}us sched={}us process={}us batch_size={}",
+                self.record_host_observation(EngineHostObservation::Iteration {
                     iteration,
-                    total,
-                    sched,
-                    proc,
-                    batch.size()
-                );
-                let profile = global_profile();
-                if profile.is_enabled() {
-                    let _ = profile.push_event(
-                        "iter_prof",
-                        profile_fields_from_json(serde_json::json!({
-                            "iter": iteration,
-                            "batch_size": batch.size(),
-                        })),
-                        profile_fields_from_json(serde_json::json!({
-                            "total": total,
-                            "sched": sched,
-                            "process": proc,
-                        })),
-                        false,
-                    );
-                }
+                    batch_size: batch.size(),
+                    started: t0,
+                    scheduled: ts,
+                    completed: Instant::now(),
+                    error: r.as_ref().err(),
+                });
             }
         }
         r?;

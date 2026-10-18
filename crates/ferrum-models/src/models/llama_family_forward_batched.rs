@@ -6,8 +6,6 @@
 //! `impl` block in a peer file (Rust allows multiple `impl` blocks for
 //! the same type across the crate).
 
-use std::sync::atomic::{AtomicU64, Ordering};
-
 use ferrum_execution::model_executor::{
     ExecutorSamplingOutput, GreedyRepetitionPenalty, LogitsReturnPolicy, TokenSelectionMask,
 };
@@ -19,23 +17,12 @@ use ferrum_kernels::backend::{
 use ferrum_quantization::Linear;
 use ferrum_types::{Activation, Result, TokenId};
 
-#[cfg(feature = "cuda")]
-use ferrum_kernels::backend::cuda::marlin::{
-    drain_marlin_profile_by_projection, MarlinProfileBucketStats, MARLIN_GATHER_CALLS,
-    MARLIN_GATHER_TIME_US, MARLIN_KERNEL_CALLS, MARLIN_KERNEL_TIME_US, MARLIN_WS_ZERO_CALLS,
-    MARLIN_WS_ZERO_TIME_US,
-};
-
 use super::llama_family::device_execution::{
     self, FrameLayout, LlamaExecutionFrame, QuiescentContext,
 };
 use super::llama_family::{
     elapsed_micros_u64_floor1, llama_layer_attention_schedule, llama_qk_mode, LlamaFamilyModel,
-    LlamaStageHiddenBridgeTiming, ATTN_CALLS, ATTN_TIME_US, BATCHED_GRAPH_EAGER_COUNT,
-    BATCHED_GRAPH_REPLAY_COUNT, MATMUL_CALLS, MATMUL_TIME_US, NORM_CALLS, NORM_TIME_US,
-    OTHER_CALLS, OTHER_TIME_US, QKR_CALLS, QKR_TIME_US, SINGLE_ITEM_GRAPH_KEY, TAIL_ACT_CALLS,
-    TAIL_ACT_TIME_US, TAIL_DOWN_CALLS, TAIL_DOWN_TIME_US, TAIL_GATE_UP_CALLS, TAIL_GATE_UP_TIME_US,
-    TAIL_NORM_CALLS, TAIL_NORM_TIME_US, TAIL_RESID_CALLS, TAIL_RESID_TIME_US,
+    LlamaStageHiddenBridgeTiming, SINGLE_ITEM_GRAPH_KEY,
 };
 use super::llama_family_pipeline::{LlamaPipelineStageBatchOps, PipelineHidden};
 
@@ -90,13 +77,10 @@ fn replay_new_batched_graph<B: BackendGraph>(
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct LlamaBatchedRuntimeConfig {
-    decode_op_profile: bool,
     unified_graph: bool,
     unified_graph_layers_only: bool,
     unified_graph_lm_head_eager: bool,
-    unified_profile: bool,
     batched_graph: bool,
-    batched_trace: bool,
     greedy_argmax: bool,
     split_k_attn: Option<bool>,
 }
@@ -224,14 +208,6 @@ fn resolve_unified_logits_return<'a>(
 }
 
 impl LlamaBatchedRuntimeConfig {
-    pub(crate) fn decode_op_profile_enabled(&self) -> bool {
-        self.decode_op_profile
-    }
-
-    fn graph_capture_allowed(&self) -> bool {
-        !self.decode_op_profile && !self.unified_profile && !self.batched_trace
-    }
-
     /// Resolve from the process-wide snapshot installed at the composition root
     /// (was a direct `std::env::vars()` read). The model holds this in a
     /// `batched_cfg` field, resolved once at construction.
@@ -255,20 +231,16 @@ impl LlamaBatchedRuntimeConfig {
         V: AsRef<str>,
     {
         let mut config = Self {
-            decode_op_profile: false,
             unified_graph: false,
             unified_graph_layers_only: false,
             unified_graph_lm_head_eager: false,
-            unified_profile: false,
             batched_graph: false,
-            batched_trace: false,
             greedy_argmax: false,
             split_k_attn: None,
         };
         for (name, value) in vars {
             let value = value.as_ref();
             match name.as_ref() {
-                "FERRUM_DECODE_OP_PROFILE" => config.decode_op_profile = true,
                 "FERRUM_UNIFIED_GRAPH" => config.unified_graph = value == "1",
                 "FERRUM_UNIFIED_GRAPH_LAYERS_ONLY" => {
                     config.unified_graph_layers_only = value == "1"
@@ -276,9 +248,7 @@ impl LlamaBatchedRuntimeConfig {
                 "FERRUM_UNIFIED_GRAPH_LM_HEAD_EAGER" => {
                     config.unified_graph_lm_head_eager = value == "1"
                 }
-                "FERRUM_UNIFIED_PROFILE" => config.unified_profile = true,
                 "FERRUM_BATCHED_GRAPH" => config.batched_graph = value != "0",
-                "FERRUM_BATCHED_TRACE" => config.batched_trace = true,
                 "FERRUM_GREEDY_ARGMAX" => config.greedy_argmax = value == "1",
                 "FERRUM_SPLIT_K_ATTN" => {
                     config.split_k_attn = match value {
@@ -310,178 +280,7 @@ fn batched_decode_graph_key(m_padded: usize, use_device_residual_shadow: bool) -
     }
 }
 
-fn should_log_batched_graph_replay_count(count: u64) -> bool {
-    count.is_power_of_two()
-}
-
-fn record_batched_graph_replay(
-    origin: &str,
-    graph_key: u64,
-    m: usize,
-    m_padded: usize,
-    use_device_residual_shadow: bool,
-) {
-    let count = BATCHED_GRAPH_REPLAY_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
-    if should_log_batched_graph_replay_count(count) {
-        eprintln!(
-            "[batched-graph-replay] origin={origin} count={count} key={graph_key} \
-             m={m} m_padded={m_padded} device_shadow={use_device_residual_shadow}",
-        );
-    }
-}
-
-static UNIFIED_GRAPH_REPLAY_COUNT: AtomicU64 = AtomicU64::new(0);
-static UNIFIED_GRAPH_EAGER_COUNT: AtomicU64 = AtomicU64::new(0);
-static UNIFIED_GRAPH_CAPTURE_COUNT: AtomicU64 = AtomicU64::new(0);
-static UNIFIED_GRAPH_CAPTURE_SKIP_COUNT: AtomicU64 = AtomicU64::new(0);
-
 const UNIFIED_GRAPH_MAX_CACHED_KEYS: usize = 16;
-
-static UNIFIED_QKV_TIME_US: AtomicU64 = AtomicU64::new(0);
-static UNIFIED_QKV_CALLS: AtomicU64 = AtomicU64::new(0);
-static UNIFIED_QKR_TIME_US: AtomicU64 = AtomicU64::new(0);
-static UNIFIED_QKR_CALLS: AtomicU64 = AtomicU64::new(0);
-static UNIFIED_ATTN_TIME_US: AtomicU64 = AtomicU64::new(0);
-static UNIFIED_ATTN_CALLS: AtomicU64 = AtomicU64::new(0);
-static UNIFIED_O_PROJ_TIME_US: AtomicU64 = AtomicU64::new(0);
-static UNIFIED_O_PROJ_CALLS: AtomicU64 = AtomicU64::new(0);
-static UNIFIED_NORM_TIME_US: AtomicU64 = AtomicU64::new(0);
-static UNIFIED_NORM_CALLS: AtomicU64 = AtomicU64::new(0);
-static UNIFIED_GATE_UP_TIME_US: AtomicU64 = AtomicU64::new(0);
-static UNIFIED_GATE_UP_CALLS: AtomicU64 = AtomicU64::new(0);
-static UNIFIED_ACT_TIME_US: AtomicU64 = AtomicU64::new(0);
-static UNIFIED_ACT_CALLS: AtomicU64 = AtomicU64::new(0);
-static UNIFIED_DOWN_TIME_US: AtomicU64 = AtomicU64::new(0);
-static UNIFIED_DOWN_CALLS: AtomicU64 = AtomicU64::new(0);
-static UNIFIED_RESID_TIME_US: AtomicU64 = AtomicU64::new(0);
-static UNIFIED_RESID_CALLS: AtomicU64 = AtomicU64::new(0);
-static UNIFIED_FINAL_NORM_TIME_US: AtomicU64 = AtomicU64::new(0);
-static UNIFIED_FINAL_NORM_CALLS: AtomicU64 = AtomicU64::new(0);
-static UNIFIED_FINAL_COPY_TIME_US: AtomicU64 = AtomicU64::new(0);
-static UNIFIED_FINAL_COPY_CALLS: AtomicU64 = AtomicU64::new(0);
-static UNIFIED_LM_HEAD_TIME_US: AtomicU64 = AtomicU64::new(0);
-static UNIFIED_LM_HEAD_CALLS: AtomicU64 = AtomicU64::new(0);
-static UNIFIED_READBACK_TIME_US: AtomicU64 = AtomicU64::new(0);
-static UNIFIED_READBACK_CALLS: AtomicU64 = AtomicU64::new(0);
-
-fn should_log_unified_graph_count(count: u64) -> bool {
-    count.is_power_of_two()
-}
-
-fn should_log_unified_op_profile_call(call: u64) -> bool {
-    call < 16 || call.is_multiple_of(64)
-}
-
-fn should_log_unified_op_profile_sample(call: u64, m_total: usize, prefill_items: usize) -> bool {
-    should_log_unified_op_profile_call(call) || m_total >= 128 || prefill_items > 1
-}
-
-#[cfg(feature = "cuda")]
-fn format_marlin_projection_bucket(label: &str, stats: MarlinProfileBucketStats) -> String {
-    format!(
-        "{label}_ws={}us({}) {label}_gather={}us({}) {label}_kernel={}us({})",
-        stats.ws_zero_us,
-        stats.ws_zero_calls,
-        stats.gather_us,
-        stats.gather_calls,
-        stats.kernel_us,
-        stats.kernel_calls
-    )
-}
-
-#[cfg(feature = "cuda")]
-fn drain_and_format_marlin_projection_profile() -> String {
-    let profile = drain_marlin_profile_by_projection();
-    [
-        format_marlin_projection_bucket("marlin_qkv", profile.qkv),
-        format_marlin_projection_bucket("marlin_o", profile.o_proj),
-        format_marlin_projection_bucket("marlin_gate_up", profile.gate_up),
-        format_marlin_projection_bucket("marlin_down", profile.down),
-        format_marlin_projection_bucket("marlin_lm_head", profile.lm_head),
-        format_marlin_projection_bucket("marlin_other", profile.other),
-    ]
-    .join(" ")
-}
-
-#[cfg(not(feature = "cuda"))]
-fn drain_and_format_marlin_projection_profile() -> &'static str {
-    concat!(
-        "marlin_qkv_ws=0us(0) marlin_qkv_gather=0us(0) marlin_qkv_kernel=0us(0) ",
-        "marlin_o_ws=0us(0) marlin_o_gather=0us(0) marlin_o_kernel=0us(0) ",
-        "marlin_gate_up_ws=0us(0) marlin_gate_up_gather=0us(0) marlin_gate_up_kernel=0us(0) ",
-        "marlin_down_ws=0us(0) marlin_down_gather=0us(0) marlin_down_kernel=0us(0) ",
-        "marlin_lm_head_ws=0us(0) marlin_lm_head_gather=0us(0) marlin_lm_head_kernel=0us(0) ",
-        "marlin_other_ws=0us(0) marlin_other_gather=0us(0) marlin_other_kernel=0us(0)"
-    )
-}
-
-fn unified_graph_scope_label(scope: UnifiedGraphCaptureScope) -> &'static str {
-    match scope {
-        UnifiedGraphCaptureScope::LayersOnly => "layers_only",
-        UnifiedGraphCaptureScope::LmHeadEager => "lm_head_eager",
-        UnifiedGraphCaptureScope::Full => "full",
-    }
-}
-
-fn record_unified_graph_replay(
-    origin: &str,
-    graph_key: u64,
-    scope: UnifiedGraphCaptureScope,
-    attention_launch_key: u64,
-    m_total: usize,
-    num_seqs: usize,
-    max_kv_len: usize,
-) {
-    let count = UNIFIED_GRAPH_REPLAY_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
-    if should_log_unified_graph_count(count) {
-        let scope = unified_graph_scope_label(scope);
-        eprintln!(
-            "[unified-graph-replay] origin={origin} count={count} scope={scope} key={graph_key} \
-             attention_key={attention_launch_key} m_total={m_total} num_seqs={num_seqs} \
-             max_kv_len={max_kv_len}",
-        );
-    }
-}
-
-fn record_unified_graph_capture(
-    graph_key: u64,
-    scope: UnifiedGraphCaptureScope,
-    attention_launch_key: u64,
-    m_total: usize,
-    num_seqs: usize,
-    max_kv_len: usize,
-) {
-    let count = UNIFIED_GRAPH_CAPTURE_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
-    if should_log_unified_graph_count(count) {
-        let scope = unified_graph_scope_label(scope);
-        eprintln!(
-            "[unified-graph-capture] count={count} scope={scope} key={graph_key} \
-             attention_key={attention_launch_key} m_total={m_total} num_seqs={num_seqs} \
-             max_kv_len={max_kv_len}",
-        );
-    }
-}
-
-fn record_unified_graph_capture_skip(
-    reason: &str,
-    graph_key: u64,
-    scope: UnifiedGraphCaptureScope,
-    attention_launch_key: u64,
-    m_total: usize,
-    num_seqs: usize,
-    max_kv_len: usize,
-    cached_keys: usize,
-) {
-    let count = UNIFIED_GRAPH_CAPTURE_SKIP_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
-    if should_log_unified_graph_count(count) {
-        let scope = unified_graph_scope_label(scope);
-        eprintln!(
-            "[unified-graph-skip] reason={reason} count={count} scope={scope} key={graph_key} \
-             attention_key={attention_launch_key} m_total={m_total} num_seqs={num_seqs} \
-             max_kv_len={max_kv_len} cached_keys={cached_keys}",
-        );
-    }
-}
 
 fn unified_graph_capture_skip_reason(
     m_total: usize,
@@ -497,92 +296,12 @@ fn unified_graph_capture_skip_reason(
     }
 }
 
-fn record_unified_graph_eager(
-    graph_key: u64,
-    scope: UnifiedGraphCaptureScope,
-    attention_launch_key: u64,
-    m_total: usize,
-    num_seqs: usize,
-    max_kv_len: usize,
-) {
-    let count = UNIFIED_GRAPH_EAGER_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
-    if count.is_multiple_of(256) {
-        let scope = unified_graph_scope_label(scope);
-        eprintln!(
-            "[unified-graph-stats] scope={scope} key={graph_key} \
-             attention_key={attention_launch_key} m_total={m_total} num_seqs={num_seqs} \
-             max_kv_len={max_kv_len} replays={} eagers={} captures={} skips={}",
-            UNIFIED_GRAPH_REPLAY_COUNT.load(Ordering::Relaxed),
-            UNIFIED_GRAPH_EAGER_COUNT.load(Ordering::Relaxed),
-            UNIFIED_GRAPH_CAPTURE_COUNT.load(Ordering::Relaxed),
-            UNIFIED_GRAPH_CAPTURE_SKIP_COUNT.load(Ordering::Relaxed),
-        );
-    }
-}
-
-#[derive(Debug, Clone, PartialEq)]
-struct LogitRowDiagnostics {
-    finite_count: usize,
-    nan_count: usize,
-    pos_inf_count: usize,
-    neg_inf_count: usize,
-    top: Vec<(usize, f32)>,
-}
-
-fn logit_row_diagnostics(row: &[f32], k: usize) -> LogitRowDiagnostics {
-    let mut diag = LogitRowDiagnostics {
-        finite_count: 0,
-        nan_count: 0,
-        pos_inf_count: 0,
-        neg_inf_count: 0,
-        top: Vec::new(),
-    };
-
-    for (idx, &value) in row.iter().enumerate() {
-        if value.is_nan() {
-            diag.nan_count += 1;
-        } else if value == f32::INFINITY {
-            diag.pos_inf_count += 1;
-        } else if value == f32::NEG_INFINITY {
-            diag.neg_inf_count += 1;
-        } else {
-            diag.finite_count += 1;
-            if k > 0 {
-                diag.top.push((idx, value));
-                diag.top
-                    .sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-                diag.top.truncate(k);
-            }
-        }
-    }
-
-    diag
-}
-
-fn format_logit_top(top: &[(usize, f32)]) -> String {
-    let entries = top
-        .iter()
-        .map(|(idx, value)| format!("{idx}:{value:.6}"))
-        .collect::<Vec<_>>()
-        .join(",");
-    format!("[{entries}]")
-}
-
-fn should_log_unified_logits_diag(call: u64) -> bool {
-    call < 8 || call.is_multiple_of(64)
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
-        batched_decode_graph_key, format_logit_top, logit_row_diagnostics,
-        resolve_unified_logits_return, should_log_batched_graph_replay_count,
-        should_log_unified_graph_count, should_log_unified_logits_diag,
-        should_log_unified_op_profile_call, should_log_unified_op_profile_sample,
-        should_use_batched_decode_graph, unified_graph_capture_skip_reason,
-        unified_graph_scope_label, DecodeLogitsReturn, LlamaBatchedRuntimeConfig,
-        UnifiedGraphCaptureScope, BATCHED_DEVICE_SHADOW_GRAPH_KEY_BIT,
-        UNIFIED_GRAPH_MAX_CACHED_KEYS,
+        batched_decode_graph_key, resolve_unified_logits_return, should_use_batched_decode_graph,
+        unified_graph_capture_skip_reason, DecodeLogitsReturn, LlamaBatchedRuntimeConfig,
+        BATCHED_DEVICE_SHADOW_GRAPH_KEY_BIT, UNIFIED_GRAPH_MAX_CACHED_KEYS,
     };
     use ferrum_execution::model_executor::{
         GreedyRepetitionPenalty, LogitsReturnPolicy, TokenSelectionMask,
@@ -618,7 +337,6 @@ mod tests {
             current.runtime_env.cuda_graph = false;
             current.runtime_env.kv_capacity = Some(32);
             current.batched_cfg.batched_graph = false;
-            current.batched_cfg.decode_op_profile = false;
             current.prefill_internal("a", &[1, 2, 3]);
             current.prefill_internal("b", &[3, 2, 1]);
         }
@@ -866,27 +584,19 @@ mod tests {
     #[test]
     fn llama_batched_runtime_config_parses_startup_knobs() {
         let config = LlamaBatchedRuntimeConfig::from_env_vars([
-            ("FERRUM_DECODE_OP_PROFILE", "0"),
             ("FERRUM_UNIFIED_GRAPH", "1"),
             ("FERRUM_UNIFIED_GRAPH_LAYERS_ONLY", "1"),
             ("FERRUM_UNIFIED_GRAPH_LM_HEAD_EAGER", "1"),
-            ("FERRUM_UNIFIED_PROFILE", ""),
             ("FERRUM_BATCHED_GRAPH", "1"),
-            ("FERRUM_BATCHED_TRACE", "0"),
             ("FERRUM_GREEDY_ARGMAX", "1"),
             ("FERRUM_SPLIT_K_ATTN", "1"),
         ]);
-
-        assert!(config.decode_op_profile);
         assert!(config.unified_graph);
         assert!(config.unified_graph_layers_only);
         assert!(config.unified_graph_lm_head_eager);
-        assert!(config.unified_profile);
         assert!(config.batched_graph);
-        assert!(config.batched_trace);
         assert!(config.greedy_argmax);
         assert_eq!(config.split_k_attn, Some(true));
-        assert!(!config.graph_capture_allowed());
     }
 
     #[test]
@@ -899,33 +609,12 @@ mod tests {
             ("FERRUM_GREEDY_ARGMAX", "true"),
             ("FERRUM_SPLIT_K_ATTN", "auto"),
         ]);
-
-        assert!(!config.decode_op_profile);
         assert!(!config.unified_graph);
         assert!(!config.unified_graph_layers_only);
         assert!(!config.unified_graph_lm_head_eager);
-        assert!(!config.unified_profile);
         assert!(!config.batched_graph);
-        assert!(!config.batched_trace);
         assert!(!config.greedy_argmax);
         assert_eq!(config.split_k_attn, None);
-        assert!(config.graph_capture_allowed());
-    }
-
-    #[test]
-    fn batched_graph_capture_is_disabled_by_syncing_diagnostics() {
-        for (key, value) in [
-            ("FERRUM_DECODE_OP_PROFILE", "1"),
-            ("FERRUM_UNIFIED_PROFILE", "1"),
-            ("FERRUM_BATCHED_TRACE", "1"),
-        ] {
-            let config = LlamaBatchedRuntimeConfig::from_env_vars([
-                ("FERRUM_BATCHED_GRAPH", "1"),
-                (key, value),
-            ]);
-
-            assert!(!config.graph_capture_allowed());
-        }
     }
 
     #[test]
@@ -944,34 +633,6 @@ mod tests {
         assert_ne!(plain, shadow);
         assert_eq!(shadow, BATCHED_DEVICE_SHADOW_GRAPH_KEY_BIT | 16);
         assert_eq!(shadow & (1u64 << 63), 0);
-    }
-
-    #[test]
-    fn batched_decode_graph_replay_log_is_power_of_two() {
-        assert!(should_log_batched_graph_replay_count(1));
-        assert!(should_log_batched_graph_replay_count(2));
-        assert!(!should_log_batched_graph_replay_count(3));
-        assert!(should_log_batched_graph_replay_count(4));
-    }
-
-    #[test]
-    fn unified_graph_observability_uses_sparse_power_of_two_logs() {
-        assert!(should_log_unified_graph_count(1));
-        assert!(should_log_unified_graph_count(2));
-        assert!(!should_log_unified_graph_count(3));
-        assert!(should_log_unified_graph_count(4));
-        assert_eq!(
-            unified_graph_scope_label(UnifiedGraphCaptureScope::LayersOnly),
-            "layers_only"
-        );
-        assert_eq!(
-            unified_graph_scope_label(UnifiedGraphCaptureScope::LmHeadEager),
-            "lm_head_eager"
-        );
-        assert_eq!(
-            unified_graph_scope_label(UnifiedGraphCaptureScope::Full),
-            "full"
-        );
     }
 
     #[test]
@@ -997,60 +658,6 @@ mod tests {
             unified_graph_capture_skip_reason(16, 16, UNIFIED_GRAPH_MAX_CACHED_KEYS),
             Some("cache_full")
         );
-    }
-
-    #[test]
-    fn logit_row_diagnostics_counts_and_sorts_top_values() {
-        let diag = logit_row_diagnostics(
-            &[
-                1.0,
-                f32::NAN,
-                5.0,
-                f32::INFINITY,
-                f32::NEG_INFINITY,
-                5.5,
-                -0.0,
-            ],
-            3,
-        );
-
-        assert_eq!(diag.finite_count, 4);
-        assert_eq!(diag.nan_count, 1);
-        assert_eq!(diag.pos_inf_count, 1);
-        assert_eq!(diag.neg_inf_count, 1);
-        assert_eq!(diag.top, vec![(5, 5.5), (2, 5.0), (0, 1.0)]);
-        assert_eq!(
-            format_logit_top(&diag.top),
-            "[5:5.500000,2:5.000000,0:1.000000]"
-        );
-    }
-
-    #[test]
-    fn unified_logits_diag_uses_front_loaded_sampling() {
-        for call in 0..8 {
-            assert!(should_log_unified_logits_diag(call));
-        }
-        assert!(!should_log_unified_logits_diag(8));
-        assert!(!should_log_unified_logits_diag(63));
-        assert!(should_log_unified_logits_diag(64));
-    }
-
-    #[test]
-    fn unified_op_profile_uses_front_loaded_sampling() {
-        for call in 0..16 {
-            assert!(should_log_unified_op_profile_call(call));
-        }
-        assert!(!should_log_unified_op_profile_call(16));
-        assert!(!should_log_unified_op_profile_call(63));
-        assert!(should_log_unified_op_profile_call(64));
-    }
-
-    #[test]
-    fn unified_op_profile_samples_large_or_mixed_prefill_calls() {
-        assert!(should_log_unified_op_profile_sample(23, 823, 11));
-        assert!(should_log_unified_op_profile_sample(23, 128, 0));
-        assert!(should_log_unified_op_profile_sample(23, 4, 2));
-        assert!(!should_log_unified_op_profile_sample(23, 4, 0));
     }
 }
 
@@ -1134,15 +741,8 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
             _ => (&self.rope.cos, &self.rope.sin),
         };
 
-        let _bp = self.batched_cfg.decode_op_profile && !B::graph_capture_in_flight(ctx);
-
         // 1. rms_norm [M, H]  → norm_out
-        let _t = if _bp {
-            B::sync(ctx);
-            Some(std::time::Instant::now())
-        } else {
-            None
-        };
+
         if let Some(host) = host_residual.as_deref() {
             Self::rms_norm_host_to_activation(
                 ctx,
@@ -1174,22 +774,9 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
                 h,
             );
         }
-        if let Some(t0) = _t {
-            B::sync(ctx);
-            NORM_TIME_US.fetch_add(
-                t0.elapsed().as_micros() as u64,
-                std::sync::atomic::Ordering::Relaxed,
-            );
-            NORM_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        }
 
         // 2. qkv_proj (GEMM m=M): norm_out [M, H] → qkv_out [M, QKV]
-        let _t = if _bp {
-            B::sync(ctx);
-            Some(std::time::Instant::now())
-        } else {
-            None
-        };
+
         {
             #[cfg(feature = "cuda")]
             let _alloc_label =
@@ -1197,14 +784,6 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
             layer
                 .qkv_proj
                 .forward(ctx, &self.scratch.norm_out, &mut self.scratch.qkv_out, m);
-        }
-        if let Some(t0) = _t {
-            B::sync(ctx);
-            MATMUL_TIME_US.fetch_add(
-                t0.elapsed().as_micros() as u64,
-                std::sync::atomic::Ordering::Relaxed,
-            );
-            MATMUL_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
 
         // ── Paged-KV batched path (Phase 4b) ──────────────────────────
@@ -1255,12 +834,7 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
             let elem_size = B::activation_elem_size_bytes();
             let q_head_major_size_bytes = (q_dim * elem_size) as u64;
             let qkv_stride_bytes = (qkv_stride * elem_size) as u64;
-            let _t_qkr = if _bp {
-                B::sync(ctx);
-                Some(std::time::Instant::now())
-            } else {
-                None
-            };
+
             for (i, (cache_id, _, pos)) in batch.iter().enumerate() {
                 let pos_i = *pos as usize;
                 let caches = self
@@ -1307,14 +881,6 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
                 )
                 .expect("paged batched write");
             }
-            if let Some(t0) = _t_qkr {
-                B::sync(ctx);
-                QKR_TIME_US.fetch_add(
-                    t0.elapsed().as_micros() as u64,
-                    std::sync::atomic::Ordering::Relaxed,
-                );
-                QKR_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            }
 
             // Step 2: build the stacked block_tables + post-append
             // context_lens host-side, then upload to device scratch. Do not
@@ -1360,12 +926,7 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
             let cl_safe = unsafe { &*cl_ptr };
             let q_safe = unsafe { &*q_ptr };
             let o_safe = unsafe { &mut *o_ptr };
-            let _t = if _bp {
-                B::sync(ctx);
-                Some(std::time::Instant::now())
-            } else {
-                None
-            };
+
             B::paged_decode_attention(
                 ctx,
                 q_safe,
@@ -1383,14 +944,6 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
                 1, // q_len
             )
             .expect("paged batched decode");
-            if let Some(t0) = _t {
-                B::sync(ctx);
-                ATTN_TIME_US.fetch_add(
-                    t0.elapsed().as_micros() as u64,
-                    std::sync::atomic::Ordering::Relaxed,
-                );
-                ATTN_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            }
 
             // Step 4: per-item copy paged_batch_o[i] → attn_flat[i * q_dim].
             // Both have q_dim floats per item; same head-major-equals-token-major
@@ -1419,12 +972,7 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
         }
 
         // 3. split_qkv [M, QKV] → q_buf [M, Q], k_buf [M, KV], v_buf [M, KV]
-        let _t = if _bp {
-            B::sync(ctx);
-            Some(std::time::Instant::now())
-        } else {
-            None
-        };
+
         B::split_qkv(
             ctx,
             &self.scratch.qkv_out,
@@ -1435,14 +983,6 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
             q_dim,
             kv_dim,
         );
-        if let Some(t0) = _t {
-            B::sync(ctx);
-            OTHER_TIME_US.fetch_add(
-                t0.elapsed().as_micros() as u64,
-                std::sync::atomic::Ordering::Relaxed,
-            );
-            OTHER_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        }
 
         // 4. Try the batched per-item qk_norm_rope path: one launch
         //    each for Q/K/V instead of M sequential per-item launches.
@@ -1455,15 +995,6 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
         // layer loop — required so a captured CUDA graph reads from
         // stable buffer contents on replay (per-layer write_u32 inside
         // the captured region would freeze the values).
-        let _t_qkr_contig = if _bp {
-            B::sync(ctx);
-            Some(std::time::Instant::now())
-        } else {
-            None
-        };
-        let mut q_batched_err = None;
-        let mut k_batched_err = None;
-        let mut v_batched_err = None;
         let use_batched_qkr = if B::supports_qk_norm_rope_batched_per_item() {
             let q_batched = B::qk_norm_rope_batched_per_item(
                 ctx,
@@ -1510,39 +1041,10 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
                 eps,
                 0,
             );
-            q_batched_err = q_batched.as_ref().err().map(|e| e.to_string());
-            k_batched_err = k_batched.as_ref().err().map(|e| e.to_string());
-            v_batched_err = v_batched.as_ref().err().map(|e| e.to_string());
             q_batched.is_ok() && k_batched.is_ok() && v_batched.is_ok()
         } else {
             false
         };
-        if let Some(t0) = _t_qkr_contig {
-            B::sync(ctx);
-            QKR_TIME_US.fetch_add(
-                t0.elapsed().as_micros() as u64,
-                std::sync::atomic::Ordering::Relaxed,
-            );
-            QKR_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        }
-
-        // One-time diagnostic so we can verify in server logs that the
-        // batched qkr path is actually being taken (vs. silently falling
-        // back to the per-item loop). Prints once total per process.
-        {
-            use std::sync::atomic::{AtomicBool, Ordering};
-            static REPORTED: AtomicBool = AtomicBool::new(false);
-            if !REPORTED.swap(true, Ordering::Relaxed) {
-                tracing::debug!(
-                    "[batched-qkr] first batched_decode call: m={} use_batched_qkr={} (q={:?} k={:?} v={:?})",
-                    m,
-                    use_batched_qkr,
-                    q_batched_err,
-                    k_batched_err,
-                    v_batched_err,
-                );
-            }
-        }
 
         // 5. Batched kv_cache_append (when use_batched_qkr is on): one
         //    launch each for K and V replaces M sequential per-item
@@ -1551,12 +1053,7 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
         //    away. cache_lens captured BEFORE the bump.
         let mut kv_lens_host: Vec<u32> = Vec::with_capacity(m);
         let mut batched_kv_append_ok = false;
-        let _t_kvapp = if _bp {
-            B::sync(ctx);
-            Some(std::time::Instant::now())
-        } else {
-            None
-        };
+
         if use_batched_qkr && B::supports_kv_cache_append_batched_per_cache() {
             let mut k_caches_ref: Vec<&B::Buffer> = Vec::with_capacity(m);
             let mut v_caches_ref: Vec<&B::Buffer> = Vec::with_capacity(m);
@@ -1606,31 +1103,11 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
                 li + MAX_LAYERS_FOR_GRAPH,
             );
             batched_kv_append_ok = k_append_res.is_ok() && v_append_res.is_ok();
-            // One-time diag
-            {
-                use std::sync::atomic::{AtomicBool, Ordering};
-                static REPORTED_KV: AtomicBool = AtomicBool::new(false);
-                if !REPORTED_KV.swap(true, Ordering::Relaxed) {
-                    tracing::debug!(
-                        "[batched-kv-append] first call: m={} ok={} k_err={:?} v_err={:?}",
-                        m,
-                        batched_kv_append_ok,
-                        k_append_res.as_ref().err().map(|e| e.to_string()),
-                        v_append_res.as_ref().err().map(|e| e.to_string()),
-                    );
-                }
-            }
+
             // Note: cache.len bump moved to decode_batch_internal post-forward
             // (so a graph replay doesn't double-bump). No-op here.
         }
-        if let Some(t0) = _t_kvapp {
-            B::sync(ctx);
-            OTHER_TIME_US.fetch_add(
-                t0.elapsed().as_micros() as u64,
-                std::sync::atomic::Ordering::Relaxed,
-            );
-            OTHER_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        }
+
         // kv_lens_host no longer used; flash_attn reads
         // scratch.batch_kv_lens_post (also pre-populated).
         let _ = kv_lens_host;
@@ -1844,14 +1321,8 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
             // flash_attn_batched uses its own k_ptrs/v_ptrs host
             // arrays in CudaState (separate from kv_cache_append's
             // cache_ptrs), so per-layer slot = li is sufficient.
-            let _t_attn = if _bp {
-                B::sync(ctx);
-                Some(std::time::Instant::now())
-            } else {
-                None
-            };
+
             let mut batched_attn_ok = false;
-            let mut batched_attn_err = None;
             if B::supports_flash_attention_batched_per_cache() {
                 let batched_attn_res = B::flash_attention_batched_per_cache(
                     ctx,
@@ -1870,29 +1341,8 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
                     li,
                 );
                 batched_attn_ok = batched_attn_res.is_ok();
-                batched_attn_err = batched_attn_res.as_ref().err().map(|e| e.to_string());
             }
-            if let Some(t0) = _t_attn {
-                B::sync(ctx);
-                ATTN_TIME_US.fetch_add(
-                    t0.elapsed().as_micros() as u64,
-                    std::sync::atomic::Ordering::Relaxed,
-                );
-                ATTN_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            }
-            // One-time diagnostic
-            {
-                use std::sync::atomic::{AtomicBool, Ordering};
-                static REPORTED_ATTN: AtomicBool = AtomicBool::new(false);
-                if !REPORTED_ATTN.swap(true, Ordering::Relaxed) {
-                    tracing::debug!(
-                        "[batched-attn] first call: m={} ok={} err={:?}",
-                        m,
-                        batched_attn_ok,
-                        batched_attn_err,
-                    );
-                }
-            }
+
             if !batched_attn_ok {
                 // Per-item flash_attn fallback for backends that
                 // implement the batched qkr but not the batched attn.
@@ -1968,15 +1418,9 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
         device_branch: Option<&mut B::Buffer>,
     ) {
         let layer = &self.layers[li];
-        let _bp = self.batched_cfg.decode_op_profile && !B::graph_capture_in_flight(ctx);
 
         // 7. o_proj (GEMM m=M): attn_flat [M, Q] → o_proj_out [M, H]
-        let _t = if _bp {
-            B::sync(ctx);
-            Some(std::time::Instant::now())
-        } else {
-            None
-        };
+
         {
             #[cfg(feature = "cuda")]
             let _alloc_label =
@@ -1987,14 +1431,6 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
                 &mut self.scratch.o_proj_out,
                 m,
             );
-        }
-        if let Some(t0) = _t {
-            B::sync(ctx);
-            MATMUL_TIME_US.fetch_add(
-                t0.elapsed().as_micros() as u64,
-                std::sync::atomic::Ordering::Relaxed,
-            );
-            MATMUL_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
 
         self.forward_layer_post_o_proj_with_residual_shadow(
@@ -2236,8 +1672,7 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
         // Bench (RTX 4090, Llama-3.1-8B GPTQ-INT4, c=16):
         //   varlen-only:     680 tok/s, TPOT 19.3 ms
         //   varlen + graph:  714 tok/s, TPOT 18.3 ms  (+5% / -5%)
-        let graph_enabled =
-            self.batched_cfg.unified_graph && self.batched_cfg.graph_capture_allowed();
+        let graph_enabled = self.batched_cfg.unified_graph;
         let graph_scope = UnifiedGraphCaptureScope::from_config(&self.batched_cfg);
         let attention_launch_key = crate::common::decoder_unified::unified_attention_launch_key(
             m_total,
@@ -2284,69 +1719,6 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
         // must be settled.
         device_execution::checked_sync::<B>(&mut ctx);
 
-        macro_rules! reset_profile_counter {
-            ($us:expr, $n:expr) => {{
-                $us.swap(0, Ordering::Relaxed);
-                $n.swap(0, Ordering::Relaxed);
-            }};
-        }
-        macro_rules! take_profile_counter {
-            ($us:expr, $n:expr) => {{
-                (
-                    $us.swap(0, Ordering::Relaxed),
-                    $n.swap(0, Ordering::Relaxed),
-                )
-            }};
-        }
-        macro_rules! add_profile_counter {
-            ($us:expr, $n:expr, $elapsed_us:expr) => {{
-                $us.fetch_add($elapsed_us, Ordering::Relaxed);
-                $n.fetch_add(1, Ordering::Relaxed);
-            }};
-        }
-
-        let unified_op_profile =
-            self.batched_cfg.decode_op_profile && !B::graph_capture_in_flight(&ctx);
-        let unified_op_t0 = if unified_op_profile {
-            reset_profile_counter!(ATTN_TIME_US, ATTN_CALLS);
-            reset_profile_counter!(QKR_TIME_US, QKR_CALLS);
-            reset_profile_counter!(MATMUL_TIME_US, MATMUL_CALLS);
-            reset_profile_counter!(NORM_TIME_US, NORM_CALLS);
-            reset_profile_counter!(OTHER_TIME_US, OTHER_CALLS);
-            reset_profile_counter!(UNIFIED_QKV_TIME_US, UNIFIED_QKV_CALLS);
-            reset_profile_counter!(UNIFIED_QKR_TIME_US, UNIFIED_QKR_CALLS);
-            reset_profile_counter!(UNIFIED_ATTN_TIME_US, UNIFIED_ATTN_CALLS);
-            reset_profile_counter!(UNIFIED_O_PROJ_TIME_US, UNIFIED_O_PROJ_CALLS);
-            reset_profile_counter!(UNIFIED_NORM_TIME_US, UNIFIED_NORM_CALLS);
-            reset_profile_counter!(UNIFIED_GATE_UP_TIME_US, UNIFIED_GATE_UP_CALLS);
-            reset_profile_counter!(UNIFIED_ACT_TIME_US, UNIFIED_ACT_CALLS);
-            reset_profile_counter!(UNIFIED_DOWN_TIME_US, UNIFIED_DOWN_CALLS);
-            reset_profile_counter!(UNIFIED_RESID_TIME_US, UNIFIED_RESID_CALLS);
-            reset_profile_counter!(UNIFIED_FINAL_NORM_TIME_US, UNIFIED_FINAL_NORM_CALLS);
-            reset_profile_counter!(UNIFIED_FINAL_COPY_TIME_US, UNIFIED_FINAL_COPY_CALLS);
-            reset_profile_counter!(UNIFIED_LM_HEAD_TIME_US, UNIFIED_LM_HEAD_CALLS);
-            reset_profile_counter!(UNIFIED_READBACK_TIME_US, UNIFIED_READBACK_CALLS);
-            #[cfg(feature = "cuda")]
-            {
-                reset_profile_counter!(MARLIN_WS_ZERO_TIME_US, MARLIN_WS_ZERO_CALLS);
-                reset_profile_counter!(MARLIN_GATHER_TIME_US, MARLIN_GATHER_CALLS);
-                reset_profile_counter!(MARLIN_KERNEL_TIME_US, MARLIN_KERNEL_CALLS);
-                let _ = drain_marlin_profile_by_projection();
-            }
-            device_execution::checked_sync::<B>(&mut ctx);
-            Some(std::time::Instant::now())
-        } else {
-            None
-        };
-
-        let unified_profile = self.batched_cfg.unified_profile;
-        let layer_t0 = if unified_profile {
-            device_execution::checked_sync::<B>(&mut ctx);
-            Some(std::time::Instant::now())
-        } else {
-            None
-        };
-
         macro_rules! run_unified_layers {
             () => {
                 for li in 0..num_layers {
@@ -2386,15 +1758,6 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
             match B::replay_graph(&mut ctx, graph_key) {
                 Ok(true) => {
                     did_pure_replay = true;
-                    record_unified_graph_replay(
-                        "pure",
-                        graph_key,
-                        graph_scope,
-                        attention_launch_key,
-                        m_total,
-                        num_seqs,
-                        max_kv_len,
-                    );
                 }
                 Ok(false) => {}
                 Err(e) => {
@@ -2423,28 +1786,6 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
         if !did_pure_replay {
             self.unified_graph_warmup += 1;
         }
-        if graph_enabled && !did_pure_replay {
-            record_unified_graph_eager(
-                graph_key,
-                graph_scope,
-                attention_launch_key,
-                m_total,
-                num_seqs,
-                max_kv_len,
-            );
-        }
-        if let Some(reason) = capture_skip_reason {
-            record_unified_graph_capture_skip(
-                reason,
-                graph_key,
-                graph_scope,
-                attention_launch_key,
-                m_total,
-                num_seqs,
-                max_kv_len,
-                self.unified_graph_keys_seen.len(),
-            );
-        }
 
         if should_capture {
             if let Err(e) = B::begin_graph_capture(&mut ctx) {
@@ -2464,28 +1805,12 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
                     std::panic::panic_any(e);
                 } else {
                     self.unified_graph_keys_seen.insert(graph_key);
-                    record_unified_graph_capture(
-                        graph_key,
-                        graph_scope,
-                        attention_launch_key,
-                        m_total,
-                        num_seqs,
-                        max_kv_len,
-                    );
+
                     match B::replay_graph(&mut ctx, graph_key) {
                         Ok(true) => {
                             layers_ready = true;
                             final_pack_ready = graph_scope.captures_final_pack();
                             lm_head_ready = graph_scope.captures_lm_head();
-                            record_unified_graph_replay(
-                                "post_capture",
-                                graph_key,
-                                graph_scope,
-                                attention_launch_key,
-                                m_total,
-                                num_seqs,
-                                max_kv_len,
-                            );
                         }
                         Ok(false) => {
                             self.unified_graph_failed = true;
@@ -2519,30 +1844,9 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
                 layers_ready = true;
             }
         }
-        if let Some(t0) = layer_t0.filter(|_| !B::graph_capture_in_flight(&ctx)) {
-            device_execution::checked_sync::<B>(&mut ctx);
-            static UNIFIED_PROF_CALLS: std::sync::atomic::AtomicU64 =
-                std::sync::atomic::AtomicU64::new(0);
-            let n = UNIFIED_PROF_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            if n.is_multiple_of(64) {
-                let total_us = t0.elapsed().as_micros();
-                let per_layer = total_us / num_layers as u128;
-                eprintln!(
-                    "[unified-prof] call#{n} m_total={m_total} num_seqs={num_seqs} layers={num_layers} total={total_us}us per_layer={per_layer}us"
-                );
-            }
-        }
-        // Unified op profiling is drained once near function exit so a single
-        // line covers layers, final pack, lm_head, and logits readback.
 
         macro_rules! run_unified_final_pack {
             () => {{
-                let final_norm_t0 = if unified_op_profile {
-                    device_execution::checked_sync::<B>(&mut ctx);
-                    Some(std::time::Instant::now())
-                } else {
-                    None
-                };
                 if let Some(device) = device_residual_shadow.as_ref() {
                     B::rms_norm_f32_to_activation(
                         &mut ctx,
@@ -2564,23 +1868,8 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
                         h,
                     );
                 }
-                if let Some(t0) = final_norm_t0 {
-                    device_execution::checked_sync::<B>(&mut ctx);
-                    let elapsed_us = t0.elapsed().as_micros() as u64;
-                    add_profile_counter!(NORM_TIME_US, NORM_CALLS, elapsed_us);
-                    add_profile_counter!(
-                        UNIFIED_FINAL_NORM_TIME_US,
-                        UNIFIED_FINAL_NORM_CALLS,
-                        elapsed_us
-                    );
-                }
+
                 if num_sampled > 0 {
-                    let final_copy_t0 = if unified_op_profile {
-                        device_execution::checked_sync::<B>(&mut ctx);
-                        Some(std::time::Instant::now())
-                    } else {
-                        None
-                    };
                     let packed_normed = self
                         .scratch
                         .unified_packed_normed
@@ -2589,16 +1878,6 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
                     for (j, &(_, global)) in final_indices.iter().enumerate() {
                         B::copy_slice(&mut ctx, &norm_out, global * h, packed_normed, j * h, h);
                     }
-                    if let Some(t0) = final_copy_t0 {
-                        device_execution::checked_sync::<B>(&mut ctx);
-                        let elapsed_us = t0.elapsed().as_micros() as u64;
-                        add_profile_counter!(OTHER_TIME_US, OTHER_CALLS, elapsed_us);
-                        add_profile_counter!(
-                            UNIFIED_FINAL_COPY_TIME_US,
-                            UNIFIED_FINAL_COPY_CALLS,
-                            elapsed_us
-                        );
-                    }
                 }
             }};
         }
@@ -2606,12 +1885,6 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
         macro_rules! run_unified_lm_head {
             () => {{
                 if num_sampled > 0 {
-                    let lm_head_t0 = if unified_op_profile {
-                        device_execution::checked_sync::<B>(&mut ctx);
-                        Some(std::time::Instant::now())
-                    } else {
-                        None
-                    };
                     let packed_normed = self
                         .scratch
                         .unified_packed_normed
@@ -2632,16 +1905,6 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
                             "llama.unified.lm_head",
                         );
                         lm_head.forward(&mut ctx, packed_normed, packed_logits, num_sampled);
-                    }
-                    if let Some(t0) = lm_head_t0 {
-                        device_execution::checked_sync::<B>(&mut ctx);
-                        let elapsed_us = t0.elapsed().as_micros() as u64;
-                        add_profile_counter!(MATMUL_TIME_US, MATMUL_CALLS, elapsed_us);
-                        add_profile_counter!(
-                            UNIFIED_LM_HEAD_TIME_US,
-                            UNIFIED_LM_HEAD_CALLS,
-                            elapsed_us
-                        );
                     }
                 }
             }};
@@ -2718,7 +1981,6 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
         let mut quiescent = Some(device_execution::checked_sync::<B>(&mut ctx));
         let mut out: Vec<Option<ExecutorSamplingOutput>> = (0..items.len()).map(|_| None).collect();
         if num_sampled > 0 {
-            let readback_t0 = unified_op_profile.then(std::time::Instant::now);
             let logits_return =
                 resolve_unified_logits_return(logits_policies, items.len(), &final_indices);
             let argmax_mode = match &logits_return {
@@ -2867,171 +2129,12 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
                     &mut quiescent,
                 )
             };
-            if let Some(t0) = readback_t0 {
-                let elapsed_us = t0.elapsed().as_micros() as u64;
-                add_profile_counter!(UNIFIED_READBACK_TIME_US, UNIFIED_READBACK_CALLS, elapsed_us);
-            }
-            if self.batched_cfg.decode_op_profile && !returned_argmax {
-                static UNIFIED_LOGITS_DIAG_CALLS: AtomicU64 = AtomicU64::new(0);
-                let call = UNIFIED_LOGITS_DIAG_CALLS.fetch_add(1, Ordering::Relaxed);
-                if should_log_unified_logits_diag(call) {
-                    for (j, &(orig_idx, global)) in final_indices.iter().take(2).enumerate() {
-                        let row = &logits_flat[j * vocab..(j + 1) * vocab];
-                        let diag = logit_row_diagnostics(row, 5);
-                        eprintln!(
-                            "[unified-logits] call#{} row={} orig_idx={} global={} finite={} nan={} pos_inf={} neg_inf={} top={}",
-                            call,
-                            j,
-                            orig_idx,
-                            global,
-                            diag.finite_count,
-                            diag.nan_count,
-                            diag.pos_inf_count,
-                            diag.neg_inf_count,
-                            format_logit_top(&diag.top)
-                        );
-                    }
-                }
-            }
+
             if !returned_argmax {
                 for (j, &(orig_idx, _)) in final_indices.iter().enumerate() {
                     let row = logits_flat[j * vocab..(j + 1) * vocab].to_vec();
                     out[orig_idx] = Some(ExecutorSamplingOutput::FullLogits(row));
                 }
-            }
-        }
-
-        if let Some(t0) = unified_op_t0 {
-            device_execution::checked_sync::<B>(&mut ctx);
-            static UNIFIED_OP_PROFILE_CALLS: AtomicU64 = AtomicU64::new(0);
-            let call = UNIFIED_OP_PROFILE_CALLS.fetch_add(1, Ordering::Relaxed);
-            let total_us = t0.elapsed().as_micros() as u64;
-            let (attn_us, attn_n) = take_profile_counter!(ATTN_TIME_US, ATTN_CALLS);
-            let (qkr_us, qkr_n) = take_profile_counter!(QKR_TIME_US, QKR_CALLS);
-            let (mm_us, mm_n) = take_profile_counter!(MATMUL_TIME_US, MATMUL_CALLS);
-            let (norm_us, norm_n) = take_profile_counter!(NORM_TIME_US, NORM_CALLS);
-            let (other_us, other_n) = take_profile_counter!(OTHER_TIME_US, OTHER_CALLS);
-            let (qkv_us, qkv_n) = take_profile_counter!(UNIFIED_QKV_TIME_US, UNIFIED_QKV_CALLS);
-            let (uqkr_us, uqkr_n) = take_profile_counter!(UNIFIED_QKR_TIME_US, UNIFIED_QKR_CALLS);
-            let (uattn_us, uattn_n) =
-                take_profile_counter!(UNIFIED_ATTN_TIME_US, UNIFIED_ATTN_CALLS);
-            let (o_proj_us, o_proj_n) =
-                take_profile_counter!(UNIFIED_O_PROJ_TIME_US, UNIFIED_O_PROJ_CALLS);
-            let (unorm_us, unorm_n) =
-                take_profile_counter!(UNIFIED_NORM_TIME_US, UNIFIED_NORM_CALLS);
-            let (gate_up_us, gate_up_n) =
-                take_profile_counter!(UNIFIED_GATE_UP_TIME_US, UNIFIED_GATE_UP_CALLS);
-            let (act_us, act_n) = take_profile_counter!(UNIFIED_ACT_TIME_US, UNIFIED_ACT_CALLS);
-            let (down_us, down_n) = take_profile_counter!(UNIFIED_DOWN_TIME_US, UNIFIED_DOWN_CALLS);
-            let (resid_us, resid_n) =
-                take_profile_counter!(UNIFIED_RESID_TIME_US, UNIFIED_RESID_CALLS);
-            let (final_norm_us, final_norm_n) =
-                take_profile_counter!(UNIFIED_FINAL_NORM_TIME_US, UNIFIED_FINAL_NORM_CALLS);
-            let (final_copy_us, final_copy_n) =
-                take_profile_counter!(UNIFIED_FINAL_COPY_TIME_US, UNIFIED_FINAL_COPY_CALLS);
-            let (lm_head_us, lm_head_n) =
-                take_profile_counter!(UNIFIED_LM_HEAD_TIME_US, UNIFIED_LM_HEAD_CALLS);
-            let (readback_us, readback_n) =
-                take_profile_counter!(UNIFIED_READBACK_TIME_US, UNIFIED_READBACK_CALLS);
-            #[cfg(feature = "cuda")]
-            let (
-                marlin_ws_zero_us,
-                marlin_ws_zero_n,
-                marlin_gather_us,
-                marlin_gather_n,
-                marlin_kernel_us,
-                marlin_kernel_n,
-            ) = {
-                let ws_us = MARLIN_WS_ZERO_TIME_US.swap(0, Ordering::Relaxed);
-                let ws_n = MARLIN_WS_ZERO_CALLS.swap(0, Ordering::Relaxed);
-                let gather_us = MARLIN_GATHER_TIME_US.swap(0, Ordering::Relaxed);
-                let gather_n = MARLIN_GATHER_CALLS.swap(0, Ordering::Relaxed);
-                let kernel_us = MARLIN_KERNEL_TIME_US.swap(0, Ordering::Relaxed);
-                let kernel_n = MARLIN_KERNEL_CALLS.swap(0, Ordering::Relaxed);
-                (ws_us, ws_n, gather_us, gather_n, kernel_us, kernel_n)
-            };
-            #[cfg(not(feature = "cuda"))]
-            let (
-                marlin_ws_zero_us,
-                marlin_ws_zero_n,
-                marlin_gather_us,
-                marlin_gather_n,
-                marlin_kernel_us,
-                marlin_kernel_n,
-            ) = (0, 0, 0, 0, 0, 0);
-            let marlin_proj = drain_and_format_marlin_projection_profile();
-            let wrapped_us = qkv_us
-                + uqkr_us
-                + uattn_us
-                + o_proj_us
-                + unorm_us
-                + gate_up_us
-                + act_us
-                + down_us
-                + resid_us
-                + final_norm_us
-                + final_copy_us
-                + lm_head_us
-                + readback_us;
-            let unwrapped_us = total_us.saturating_sub(wrapped_us);
-            let prefill_items = items.iter().filter(|(_, q, _, _)| q.len() > 1).count();
-            let decode_items = items.len().saturating_sub(prefill_items);
-            if should_log_unified_op_profile_sample(call, m_total, prefill_items) {
-                eprintln!(
-                    "[unified-op-profile] call#{} m_total={} num_seqs={} prefill={} decode={} max_kv={} sampled={} total={}us qkv={}us({}) qkr={}us({}) attn={}us({}) o_proj={}us({}) norm={}us({}) gate_up={}us({}) act={}us({}) down={}us({}) resid={}us({}) final_norm={}us({}) final_copy={}us({}) lm_head={}us({}) readback={}us({}) generic_matmul={}us({}) generic_attn={}us({}) generic_qkr={}us({}) generic_norm={}us({}) generic_other={}us({}) marlin_ws_zero={}us({}) marlin_gather={}us({}) marlin_kernel={}us({}) {} unwrapped={}us",
-                    call,
-                    m_total,
-                    num_seqs,
-                    prefill_items,
-                    decode_items,
-                    max_kv_len,
-                    num_sampled,
-                    total_us,
-                    qkv_us,
-                    qkv_n,
-                    uqkr_us,
-                    uqkr_n,
-                    uattn_us,
-                    uattn_n,
-                    o_proj_us,
-                    o_proj_n,
-                    unorm_us,
-                    unorm_n,
-                    gate_up_us,
-                    gate_up_n,
-                    act_us,
-                    act_n,
-                    down_us,
-                    down_n,
-                    resid_us,
-                    resid_n,
-                    final_norm_us,
-                    final_norm_n,
-                    final_copy_us,
-                    final_copy_n,
-                    lm_head_us,
-                    lm_head_n,
-                    readback_us,
-                    readback_n,
-                    mm_us,
-                    mm_n,
-                    attn_us,
-                    attn_n,
-                    qkr_us,
-                    qkr_n,
-                    norm_us,
-                    norm_n,
-                    other_us,
-                    other_n,
-                    marlin_ws_zero_us,
-                    marlin_ws_zero_n,
-                    marlin_gather_us,
-                    marlin_gather_n,
-                    marlin_kernel_us,
-                    marlin_kernel_n,
-                    marlin_proj,
-                    unwrapped_us
-                );
             }
         }
 
@@ -3100,67 +2203,36 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
             (Some(local), false) => (&local.cos, &local.sin),
             _ => (&self.rope.cos, &self.rope.sin),
         };
-        let op_prof = self.batched_cfg.decode_op_profile && !B::graph_capture_in_flight(ctx);
-
-        macro_rules! time_op {
-            ($bucket_us:expr, $bucket_n:expr, $detail_us:expr, $detail_n:expr, $body:block) => {{
-                if op_prof {
-                    B::sync(ctx);
-                    let _t0 = std::time::Instant::now();
-                    $body
-                    B::sync(ctx);
-                    let elapsed_us = _t0.elapsed().as_micros() as u64;
-                    $bucket_us.fetch_add(elapsed_us, std::sync::atomic::Ordering::Relaxed);
-                    $bucket_n.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    $detail_us.fetch_add(elapsed_us, std::sync::atomic::Ordering::Relaxed);
-                    $detail_n.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                } else {
-                    $body
-                }
-            }};
-        }
 
         // 1. rms_norm [M_total, h] → unified_norm_out
-        time_op!(
-            NORM_TIME_US,
-            NORM_CALLS,
-            UNIFIED_NORM_TIME_US,
-            UNIFIED_NORM_CALLS,
-            {
-                if let Some(device) = device_residual.as_mut() {
-                    B::rms_norm_f32_to_activation(
-                        ctx,
-                        &**device,
-                        &layer.input_ln_w,
-                        eps,
-                        norm_out,
-                        m_total,
-                        h,
-                    );
-                } else {
-                    B::rms_norm(ctx, residual, &layer.input_ln_w, eps, norm_out, m_total, h);
-                }
+        {
+            if let Some(device) = device_residual.as_mut() {
+                B::rms_norm_f32_to_activation(
+                    ctx,
+                    &**device,
+                    &layer.input_ln_w,
+                    eps,
+                    norm_out,
+                    m_total,
+                    h,
+                );
+            } else {
+                B::rms_norm(ctx, residual, &layer.input_ln_w, eps, norm_out, m_total, h);
             }
-        );
+        };
 
         // 2. qkv_proj GEMM (m=M_total): unified_norm_out → unified_qkv_out
-        time_op!(
-            MATMUL_TIME_US,
-            MATMUL_CALLS,
-            UNIFIED_QKV_TIME_US,
-            UNIFIED_QKV_CALLS,
-            {
-                let qkv_out = self
-                    .scratch
-                    .unified_qkv_out
-                    .as_mut()
-                    .expect("unified_qkv_out missing");
-                #[cfg(feature = "cuda")]
-                let _alloc_label =
-                    ferrum_kernels::backend::cuda::push_alloc_label("llama.unified_layer.qkv_proj");
-                layer.qkv_proj.forward(ctx, norm_out, qkv_out, m_total);
-            }
-        );
+        {
+            let qkv_out = self
+                .scratch
+                .unified_qkv_out
+                .as_mut()
+                .expect("unified_qkv_out missing");
+            #[cfg(feature = "cuda")]
+            let _alloc_label =
+                ferrum_kernels::backend::cuda::push_alloc_label("llama.unified_layer.qkv_proj");
+            layer.qkv_proj.forward(ctx, norm_out, qkv_out, m_total);
+        };
 
         // 3. Single-launch varlen split_qkv_norm_rope. Reads
         //    cu_seqlens_q / pos_offsets / block_tables from device
@@ -3184,322 +2256,272 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
         let _ = pos_offsets;
         let _ = qkv_stride;
 
-        time_op!(
-            QKR_TIME_US,
-            QKR_CALLS,
-            UNIFIED_QKR_TIME_US,
-            UNIFIED_QKR_CALLS,
-            {
-                let qkv_out = self
-                    .scratch
-                    .unified_qkv_out
-                    .as_ref()
-                    .expect("unified_qkv_out missing");
-                let packed_q = self
-                    .scratch
-                    .unified_packed_q
-                    .as_mut()
-                    .expect("unified_packed_q missing");
-                let cu_seqlens_buf = self
-                    .scratch
-                    .unified_cu_seqlens_q
-                    .as_ref()
-                    .expect("unified_cu_seqlens_q missing");
-                let pos_offsets_buf = self
-                    .scratch
-                    .unified_pos_offsets
-                    .as_ref()
-                    .expect("unified_pos_offsets missing");
-                let bt_buf = self
-                    .scratch
-                    .unified_block_tables
-                    .as_ref()
-                    .expect("unified_block_tables missing");
-                B::split_qkv_norm_rope_into_paged_cache_varlen(
-                    ctx,
-                    qkv_out,
-                    q_norm_w,
-                    k_norm_w,
-                    rope_cos,
-                    rope_sin,
-                    packed_q,
-                    pool_k,
-                    pool_v,
-                    cu_seqlens_buf,
-                    pos_offsets_buf,
-                    bt_buf,
-                    num_seqs,
-                    m_total,
-                    nh,
-                    nkv,
-                    hd,
-                    eps,
-                    qk_mode,
-                    block_size,
-                    max_blocks_per_seq,
-                )
-                .expect("paged unified: split_qkv_norm_rope_into_paged_cache_varlen");
-            }
-        );
+        {
+            let qkv_out = self
+                .scratch
+                .unified_qkv_out
+                .as_ref()
+                .expect("unified_qkv_out missing");
+            let packed_q = self
+                .scratch
+                .unified_packed_q
+                .as_mut()
+                .expect("unified_packed_q missing");
+            let cu_seqlens_buf = self
+                .scratch
+                .unified_cu_seqlens_q
+                .as_ref()
+                .expect("unified_cu_seqlens_q missing");
+            let pos_offsets_buf = self
+                .scratch
+                .unified_pos_offsets
+                .as_ref()
+                .expect("unified_pos_offsets missing");
+            let bt_buf = self
+                .scratch
+                .unified_block_tables
+                .as_ref()
+                .expect("unified_block_tables missing");
+            B::split_qkv_norm_rope_into_paged_cache_varlen(
+                ctx,
+                qkv_out,
+                q_norm_w,
+                k_norm_w,
+                rope_cos,
+                rope_sin,
+                packed_q,
+                pool_k,
+                pool_v,
+                cu_seqlens_buf,
+                pos_offsets_buf,
+                bt_buf,
+                num_seqs,
+                m_total,
+                nh,
+                nkv,
+                hd,
+                eps,
+                qk_mode,
+                block_size,
+                max_blocks_per_seq,
+            )
+            .expect("paged unified: split_qkv_norm_rope_into_paged_cache_varlen");
+        };
 
         // 4. paged_varlen_attention: one call covering all M_total tokens.
-        time_op!(
-            ATTN_TIME_US,
-            ATTN_CALLS,
-            UNIFIED_ATTN_TIME_US,
-            UNIFIED_ATTN_CALLS,
-            {
-                let packed_q = self
-                    .scratch
-                    .unified_packed_q
-                    .as_ref()
-                    .expect("unified_packed_q missing");
-                let cu_seqlens_buf = self
-                    .scratch
-                    .unified_cu_seqlens_q
-                    .as_ref()
-                    .expect("unified_cu_seqlens_q missing");
-                let pos_offsets_buf = self
-                    .scratch
-                    .unified_pos_offsets
-                    .as_ref()
-                    .expect("unified_pos_offsets missing");
-                let bt_buf = self
-                    .scratch
-                    .unified_block_tables
-                    .as_ref()
-                    .expect("unified_block_tables missing");
-                let attn_out = self
-                    .scratch
-                    .unified_attn_out
-                    .as_mut()
-                    .expect("unified_attn_out missing");
-                B::paged_varlen_attention(
-                    ctx,
-                    packed_q,
-                    pool_k,
-                    pool_v,
-                    attn_out,
-                    cu_seqlens_buf,
-                    pos_offsets_buf,
-                    bt_buf,
-                    num_seqs,
-                    m_total,
-                    max_kv_len,
-                    nh,
-                    nkv,
-                    hd,
-                    layer_window,
-                    block_size,
-                    max_blocks_per_seq,
-                )
-                .expect("paged_varlen_attention");
-            }
-        );
+        {
+            let packed_q = self
+                .scratch
+                .unified_packed_q
+                .as_ref()
+                .expect("unified_packed_q missing");
+            let cu_seqlens_buf = self
+                .scratch
+                .unified_cu_seqlens_q
+                .as_ref()
+                .expect("unified_cu_seqlens_q missing");
+            let pos_offsets_buf = self
+                .scratch
+                .unified_pos_offsets
+                .as_ref()
+                .expect("unified_pos_offsets missing");
+            let bt_buf = self
+                .scratch
+                .unified_block_tables
+                .as_ref()
+                .expect("unified_block_tables missing");
+            let attn_out = self
+                .scratch
+                .unified_attn_out
+                .as_mut()
+                .expect("unified_attn_out missing");
+            B::paged_varlen_attention(
+                ctx,
+                packed_q,
+                pool_k,
+                pool_v,
+                attn_out,
+                cu_seqlens_buf,
+                pos_offsets_buf,
+                bt_buf,
+                num_seqs,
+                m_total,
+                max_kv_len,
+                nh,
+                nkv,
+                hd,
+                layer_window,
+                block_size,
+                max_blocks_per_seq,
+            )
+            .expect("paged_varlen_attention");
+        };
 
         // 5. o_proj (M_total): attn_out → o_proj_out
-        time_op!(
-            MATMUL_TIME_US,
-            MATMUL_CALLS,
-            UNIFIED_O_PROJ_TIME_US,
-            UNIFIED_O_PROJ_CALLS,
-            {
-                let attn_out = self
-                    .scratch
-                    .unified_attn_out
-                    .as_ref()
-                    .expect("unified_attn_out missing");
-                let o_proj_out = self
-                    .scratch
-                    .unified_o_proj_out
-                    .as_mut()
-                    .expect("unified_o_proj_out missing");
-                #[cfg(feature = "cuda")]
-                let _alloc_label =
-                    ferrum_kernels::backend::cuda::push_alloc_label("llama.unified_layer.o_proj");
-                layer.o_proj.forward(ctx, attn_out, o_proj_out, m_total);
-            }
-        );
+        {
+            let attn_out = self
+                .scratch
+                .unified_attn_out
+                .as_ref()
+                .expect("unified_attn_out missing");
+            let o_proj_out = self
+                .scratch
+                .unified_o_proj_out
+                .as_mut()
+                .expect("unified_o_proj_out missing");
+            #[cfg(feature = "cuda")]
+            let _alloc_label =
+                ferrum_kernels::backend::cuda::push_alloc_label("llama.unified_layer.o_proj");
+            layer.o_proj.forward(ctx, attn_out, o_proj_out, m_total);
+        };
 
         // 6. residual + pre-MLP norm.
         //    Legacy Llama path: fused residual add + RMSNorm.
         //    Gemma sandwich path: RMSNorm(o_proj_out) -> F32 residual add,
         //    then RMSNorm(F32 residual) for pre-MLP input.
-        time_op!(
-            NORM_TIME_US,
-            NORM_CALLS,
-            UNIFIED_NORM_TIME_US,
-            UNIFIED_NORM_CALLS,
-            {
-                let o_proj_out = self
-                    .scratch
-                    .unified_o_proj_out
-                    .as_ref()
-                    .expect("unified_o_proj_out missing");
-                if let Some(post_attn_w) = &layer.post_attn_ln_w {
-                    if let Some(device) = device_residual.as_mut() {
-                        let branch = device_branch
-                            .as_mut()
-                            .expect("unified F32 sandwich branch scratch missing");
-                        B::rms_norm_activation_add_to_f32(
-                            ctx,
-                            o_proj_out,
-                            post_attn_w,
-                            eps,
-                            &mut **device,
-                            &mut **branch,
-                            m_total,
-                            h,
-                        );
-                        B::rms_norm_f32_to_activation(
-                            ctx,
-                            &**device,
-                            &layer.post_ln_w,
-                            eps,
-                            norm_out,
-                            m_total,
-                            h,
-                        );
-                    } else {
-                        let tmp = self
-                            .scratch
-                            .unified_sandwich_tmp
-                            .as_mut()
-                            .expect("unified sandwich tmp missing");
-                        B::rms_norm(ctx, o_proj_out, post_attn_w, eps, tmp, m_total, h);
-                        B::add_inplace(ctx, residual, tmp, m_total * h);
-                        B::rms_norm(ctx, residual, &layer.post_ln_w, eps, norm_out, m_total, h);
-                    }
-                } else {
-                    B::fused_add_rms_norm(
+        {
+            let o_proj_out = self
+                .scratch
+                .unified_o_proj_out
+                .as_ref()
+                .expect("unified_o_proj_out missing");
+            if let Some(post_attn_w) = &layer.post_attn_ln_w {
+                if let Some(device) = device_residual.as_mut() {
+                    let branch = device_branch
+                        .as_mut()
+                        .expect("unified F32 sandwich branch scratch missing");
+                    B::rms_norm_activation_add_to_f32(
                         ctx,
-                        residual,
                         o_proj_out,
+                        post_attn_w,
+                        eps,
+                        &mut **device,
+                        &mut **branch,
+                        m_total,
+                        h,
+                    );
+                    B::rms_norm_f32_to_activation(
+                        ctx,
+                        &**device,
                         &layer.post_ln_w,
                         eps,
                         norm_out,
                         m_total,
                         h,
                     );
+                } else {
+                    let tmp = self
+                        .scratch
+                        .unified_sandwich_tmp
+                        .as_mut()
+                        .expect("unified sandwich tmp missing");
+                    B::rms_norm(ctx, o_proj_out, post_attn_w, eps, tmp, m_total, h);
+                    B::add_inplace(ctx, residual, tmp, m_total * h);
+                    B::rms_norm(ctx, residual, &layer.post_ln_w, eps, norm_out, m_total, h);
                 }
+            } else {
+                B::fused_add_rms_norm(
+                    ctx,
+                    residual,
+                    o_proj_out,
+                    &layer.post_ln_w,
+                    eps,
+                    norm_out,
+                    m_total,
+                    h,
+                );
             }
-        );
+        };
 
         // 7. gate_up_proj
-        time_op!(
-            MATMUL_TIME_US,
-            MATMUL_CALLS,
-            UNIFIED_GATE_UP_TIME_US,
-            UNIFIED_GATE_UP_CALLS,
-            {
-                let gate_up_out = self
-                    .scratch
-                    .unified_gate_up_out
-                    .as_mut()
-                    .expect("unified_gate_up_out missing");
-                #[cfg(feature = "cuda")]
-                let _alloc_label = ferrum_kernels::backend::cuda::push_alloc_label(
-                    "llama.unified_layer.gate_up_proj",
-                );
-                layer
-                    .gate_up_proj
-                    .forward(ctx, norm_out, gate_up_out, m_total);
-            }
-        );
+        {
+            let gate_up_out = self
+                .scratch
+                .unified_gate_up_out
+                .as_mut()
+                .expect("unified_gate_up_out missing");
+            #[cfg(feature = "cuda")]
+            let _alloc_label =
+                ferrum_kernels::backend::cuda::push_alloc_label("llama.unified_layer.gate_up_proj");
+            layer
+                .gate_up_proj
+                .forward(ctx, norm_out, gate_up_out, m_total);
+        };
 
         // 8. Gated activation: SwiGLU for Llama, GeGLU for Gemma.
-        time_op!(
-            OTHER_TIME_US,
-            OTHER_CALLS,
-            UNIFIED_ACT_TIME_US,
-            UNIFIED_ACT_CALLS,
-            {
-                let gate_up_out = self
-                    .scratch
-                    .unified_gate_up_out
-                    .as_ref()
-                    .expect("unified_gate_up_out missing");
-                let silu_out = self
-                    .scratch
-                    .unified_silu_out
-                    .as_mut()
-                    .expect("unified_silu_out missing");
-                match self.cfg.activation {
-                    Activation::GeluTanh => {
-                        B::fused_gelu_tanh_mul_split(ctx, gate_up_out, silu_out, m_total, im)
-                    }
-                    _ => B::fused_silu_mul_split(ctx, gate_up_out, silu_out, m_total, im),
+        {
+            let gate_up_out = self
+                .scratch
+                .unified_gate_up_out
+                .as_ref()
+                .expect("unified_gate_up_out missing");
+            let silu_out = self
+                .scratch
+                .unified_silu_out
+                .as_mut()
+                .expect("unified_silu_out missing");
+            match self.cfg.activation {
+                Activation::GeluTanh => {
+                    B::fused_gelu_tanh_mul_split(ctx, gate_up_out, silu_out, m_total, im)
                 }
+                _ => B::fused_silu_mul_split(ctx, gate_up_out, silu_out, m_total, im),
             }
-        );
+        };
 
         // 9. down_proj
-        time_op!(
-            MATMUL_TIME_US,
-            MATMUL_CALLS,
-            UNIFIED_DOWN_TIME_US,
-            UNIFIED_DOWN_CALLS,
-            {
-                let silu_out = self
-                    .scratch
-                    .unified_silu_out
-                    .as_ref()
-                    .expect("unified_silu_out missing");
-                let mlp_out = self
-                    .scratch
-                    .unified_mlp_out
-                    .as_mut()
-                    .expect("unified_mlp_out missing");
-                #[cfg(feature = "cuda")]
-                let _alloc_label = ferrum_kernels::backend::cuda::push_alloc_label(
-                    "llama.unified_layer.down_proj",
-                );
-                layer.down_proj.forward(ctx, silu_out, mlp_out, m_total);
-            }
-        );
+        {
+            let silu_out = self
+                .scratch
+                .unified_silu_out
+                .as_ref()
+                .expect("unified_silu_out missing");
+            let mlp_out = self
+                .scratch
+                .unified_mlp_out
+                .as_mut()
+                .expect("unified_mlp_out missing");
+            #[cfg(feature = "cuda")]
+            let _alloc_label =
+                ferrum_kernels::backend::cuda::push_alloc_label("llama.unified_layer.down_proj");
+            layer.down_proj.forward(ctx, silu_out, mlp_out, m_total);
+        };
 
         // 10. final residual add. Gemma sandwich path normalizes the MLP
         //     branch before adding it to the F32 residual shadow.
-        time_op!(
-            OTHER_TIME_US,
-            OTHER_CALLS,
-            UNIFIED_RESID_TIME_US,
-            UNIFIED_RESID_CALLS,
-            {
-                let mlp_out = self
-                    .scratch
-                    .unified_mlp_out
-                    .as_ref()
-                    .expect("unified_mlp_out missing");
-                if let Some(post_ffn_w) = &layer.post_ffn_ln_w {
-                    if let Some(device) = device_residual.as_mut() {
-                        let branch = device_branch
-                            .as_mut()
-                            .expect("unified F32 sandwich branch scratch missing");
-                        B::rms_norm_activation_add_to_f32(
-                            ctx,
-                            mlp_out,
-                            post_ffn_w,
-                            eps,
-                            &mut **device,
-                            &mut **branch,
-                            m_total,
-                            h,
-                        );
-                    } else {
-                        let tmp = self
-                            .scratch
-                            .unified_sandwich_tmp
-                            .as_mut()
-                            .expect("unified sandwich tmp missing");
-                        B::rms_norm(ctx, mlp_out, post_ffn_w, eps, tmp, m_total, h);
-                        B::add_inplace(ctx, residual, tmp, m_total * h);
-                    }
+        {
+            let mlp_out = self
+                .scratch
+                .unified_mlp_out
+                .as_ref()
+                .expect("unified_mlp_out missing");
+            if let Some(post_ffn_w) = &layer.post_ffn_ln_w {
+                if let Some(device) = device_residual.as_mut() {
+                    let branch = device_branch
+                        .as_mut()
+                        .expect("unified F32 sandwich branch scratch missing");
+                    B::rms_norm_activation_add_to_f32(
+                        ctx,
+                        mlp_out,
+                        post_ffn_w,
+                        eps,
+                        &mut **device,
+                        &mut **branch,
+                        m_total,
+                        h,
+                    );
                 } else {
-                    B::add_inplace(ctx, residual, mlp_out, m_total * h);
+                    let tmp = self
+                        .scratch
+                        .unified_sandwich_tmp
+                        .as_mut()
+                        .expect("unified sandwich tmp missing");
+                    B::rms_norm(ctx, mlp_out, post_ffn_w, eps, tmp, m_total, h);
+                    B::add_inplace(ctx, residual, tmp, m_total * h);
                 }
+            } else {
+                B::add_inplace(ctx, residual, mlp_out, m_total * h);
             }
-        );
+        };
     }
     /// Batched decode: process M concurrent requests at potentially different
     /// positions in one forward pass. GEMM-heavy ops (qkv_proj, o_proj,
@@ -3880,7 +2902,7 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
         // gated on FERRUM_BATCHED_GRAPH=1; skipped on backends without
         // graph support (begin_graph_capture returns Err).
         let graph_enabled = should_use_batched_decode_graph(
-            self.batched_cfg.batched_graph && self.batched_cfg.graph_capture_allowed(),
+            self.batched_cfg.batched_graph,
             use_host_residual_shadow,
         );
         let m_padded = m.next_power_of_two();
@@ -3900,13 +2922,6 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
             match B::replay_graph(&mut ctx, graph_key) {
                 Ok(true) => {
                     did_pure_replay = true;
-                    record_batched_graph_replay(
-                        "pure",
-                        graph_key,
-                        m,
-                        m_padded,
-                        use_device_residual_shadow,
-                    );
                 }
                 Ok(false) => {}
                 Err(e) => {
@@ -3915,21 +2930,6 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
                 }
             }
         }
-        if graph_enabled && !did_pure_replay {
-            BATCHED_GRAPH_EAGER_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        }
-        // Periodic stats (every 256 calls).
-        let total = BATCHED_GRAPH_REPLAY_COUNT.load(std::sync::atomic::Ordering::Relaxed)
-            + BATCHED_GRAPH_EAGER_COUNT.load(std::sync::atomic::Ordering::Relaxed);
-        if graph_enabled && total > 0 && total.is_multiple_of(256) {
-            eprintln!(
-                "[batched-graph-stats] m={m} m_padded={m_padded} replays={} eagers={} keys_seen={:?}",
-                BATCHED_GRAPH_REPLAY_COUNT.load(std::sync::atomic::Ordering::Relaxed),
-                BATCHED_GRAPH_EAGER_COUNT.load(std::sync::atomic::Ordering::Relaxed),
-                self.batched_graph_keys_seen,
-            );
-        }
-
         if !did_pure_replay {
             const BATCHED_GRAPH_WARMUP: usize = 3;
             let should_capture = graph_enabled
@@ -3944,65 +2944,6 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
             }
             self.batched_graph_warmup += 1;
 
-            // Trace mode (env): sync after each major op so that the
-            // first panicking sync localises which kernel/section faulted.
-            // Off by default (adds 32 syncs per token = pipeline serialisation).
-            let trace = self.batched_cfg.batched_trace;
-            macro_rules! tracesync {
-                ($label:expr) => {
-                    if trace {
-                        device_execution::checked_sync::<B>(&mut ctx);
-                        eprintln!("[trace-batched] {}", $label);
-                    }
-                };
-            }
-            tracesync!("entry-after-writes-and-embed");
-
-            // Op-profile: time the entire batched forward (eager only —
-            // pure replay short-circuits above and does not increment
-            // the per-op counters since the wrapped ops aren't executed
-            // by the Rust dispatch path).
-            let batched_profile =
-                self.batched_cfg.decode_op_profile && !B::graph_capture_in_flight(&ctx);
-            let batched_iter_t0 = if batched_profile {
-                // Drain shared counters first so this iter's print isn't
-                // contaminated by prior prefill/single-decode contributions.
-                ATTN_TIME_US.swap(0, std::sync::atomic::Ordering::Relaxed);
-                ATTN_CALLS.swap(0, std::sync::atomic::Ordering::Relaxed);
-                QKR_TIME_US.swap(0, std::sync::atomic::Ordering::Relaxed);
-                QKR_CALLS.swap(0, std::sync::atomic::Ordering::Relaxed);
-                MATMUL_TIME_US.swap(0, std::sync::atomic::Ordering::Relaxed);
-                MATMUL_CALLS.swap(0, std::sync::atomic::Ordering::Relaxed);
-                NORM_TIME_US.swap(0, std::sync::atomic::Ordering::Relaxed);
-                NORM_CALLS.swap(0, std::sync::atomic::Ordering::Relaxed);
-                OTHER_TIME_US.swap(0, std::sync::atomic::Ordering::Relaxed);
-                OTHER_CALLS.swap(0, std::sync::atomic::Ordering::Relaxed);
-                TAIL_NORM_TIME_US.swap(0, std::sync::atomic::Ordering::Relaxed);
-                TAIL_NORM_CALLS.swap(0, std::sync::atomic::Ordering::Relaxed);
-                TAIL_GATE_UP_TIME_US.swap(0, std::sync::atomic::Ordering::Relaxed);
-                TAIL_GATE_UP_CALLS.swap(0, std::sync::atomic::Ordering::Relaxed);
-                TAIL_DOWN_TIME_US.swap(0, std::sync::atomic::Ordering::Relaxed);
-                TAIL_DOWN_CALLS.swap(0, std::sync::atomic::Ordering::Relaxed);
-                #[cfg(feature = "cuda")]
-                {
-                    MARLIN_WS_ZERO_TIME_US.swap(0, std::sync::atomic::Ordering::Relaxed);
-                    MARLIN_WS_ZERO_CALLS.swap(0, std::sync::atomic::Ordering::Relaxed);
-                    MARLIN_GATHER_TIME_US.swap(0, std::sync::atomic::Ordering::Relaxed);
-                    MARLIN_GATHER_CALLS.swap(0, std::sync::atomic::Ordering::Relaxed);
-                    MARLIN_KERNEL_TIME_US.swap(0, std::sync::atomic::Ordering::Relaxed);
-                    MARLIN_KERNEL_CALLS.swap(0, std::sync::atomic::Ordering::Relaxed);
-                    let _ = drain_marlin_profile_by_projection();
-                }
-                TAIL_ACT_TIME_US.swap(0, std::sync::atomic::Ordering::Relaxed);
-                TAIL_ACT_CALLS.swap(0, std::sync::atomic::Ordering::Relaxed);
-                TAIL_RESID_TIME_US.swap(0, std::sync::atomic::Ordering::Relaxed);
-                TAIL_RESID_CALLS.swap(0, std::sync::atomic::Ordering::Relaxed);
-                device_execution::checked_sync::<B>(&mut ctx);
-                Some(std::time::Instant::now())
-            } else {
-                None
-            };
-
             // Eager forward (records into graph if capture is active).
             for li in 0..num_layers {
                 self.forward_layer_batched_decode(
@@ -4015,14 +2956,8 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
                     device_residual_shadow.as_mut(),
                     device_branch_shadow.as_mut(),
                 );
-                tracesync!(format!("after layer {}", li));
             }
-            let _t0_norm = if batched_profile {
-                device_execution::checked_sync::<B>(&mut ctx);
-                Some(std::time::Instant::now())
-            } else {
-                None
-            };
+
             if let Some(host) = host_residual.as_deref() {
                 Self::rms_norm_host_to_activation(
                     &mut ctx,
@@ -4054,25 +2989,12 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
                     h,
                 );
             }
-            if let Some(t0) = _t0_norm {
-                device_execution::checked_sync::<B>(&mut ctx);
-                NORM_TIME_US.fetch_add(
-                    t0.elapsed().as_micros() as u64,
-                    std::sync::atomic::Ordering::Relaxed,
-                );
-                NORM_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            }
-            tracesync!("after final rms_norm");
+
             let lm_head = self
                 .lm_head
                 .as_ref()
                 .expect("decode_batch_internal called on backbone-only model (no lm_head)");
-            let _t0_lm = if batched_profile {
-                device_execution::checked_sync::<B>(&mut ctx);
-                Some(std::time::Instant::now())
-            } else {
-                None
-            };
+
             {
                 #[cfg(feature = "cuda")]
                 let _alloc_label =
@@ -4082,165 +3004,6 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
                     &self.scratch.norm_out,
                     &mut self.scratch.batch_logits,
                     m,
-                );
-            }
-            if let Some(t0) = _t0_lm {
-                device_execution::checked_sync::<B>(&mut ctx);
-                MATMUL_TIME_US.fetch_add(
-                    t0.elapsed().as_micros() as u64,
-                    std::sync::atomic::Ordering::Relaxed,
-                );
-                MATMUL_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            }
-            tracesync!("after lm_head");
-
-            if let Some(t0) = batched_iter_t0 {
-                device_execution::checked_sync::<B>(&mut ctx);
-                let total_us = t0.elapsed().as_micros() as u64;
-                let attn_us = ATTN_TIME_US.swap(0, std::sync::atomic::Ordering::Relaxed);
-                let attn_n = ATTN_CALLS.swap(0, std::sync::atomic::Ordering::Relaxed);
-                let qkr_us = QKR_TIME_US.swap(0, std::sync::atomic::Ordering::Relaxed);
-                let qkr_n = QKR_CALLS.swap(0, std::sync::atomic::Ordering::Relaxed);
-                let mm_us = MATMUL_TIME_US.swap(0, std::sync::atomic::Ordering::Relaxed);
-                let mm_n = MATMUL_CALLS.swap(0, std::sync::atomic::Ordering::Relaxed);
-                let norm_us = NORM_TIME_US.swap(0, std::sync::atomic::Ordering::Relaxed);
-                let norm_n = NORM_CALLS.swap(0, std::sync::atomic::Ordering::Relaxed);
-                let other_us = OTHER_TIME_US.swap(0, std::sync::atomic::Ordering::Relaxed);
-                let other_n = OTHER_CALLS.swap(0, std::sync::atomic::Ordering::Relaxed);
-                let tail_norm_us = TAIL_NORM_TIME_US.swap(0, std::sync::atomic::Ordering::Relaxed);
-                let tail_norm_n = TAIL_NORM_CALLS.swap(0, std::sync::atomic::Ordering::Relaxed);
-                let tail_gate_up_us =
-                    TAIL_GATE_UP_TIME_US.swap(0, std::sync::atomic::Ordering::Relaxed);
-                let tail_gate_up_n =
-                    TAIL_GATE_UP_CALLS.swap(0, std::sync::atomic::Ordering::Relaxed);
-                let tail_down_us = TAIL_DOWN_TIME_US.swap(0, std::sync::atomic::Ordering::Relaxed);
-                let tail_down_n = TAIL_DOWN_CALLS.swap(0, std::sync::atomic::Ordering::Relaxed);
-                let tail_mlp_us = tail_gate_up_us + tail_down_us;
-                let tail_mlp_n = tail_gate_up_n + tail_down_n;
-                #[cfg(feature = "cuda")]
-                let (
-                    marlin_ws_zero_us,
-                    marlin_ws_zero_n,
-                    marlin_gather_us,
-                    marlin_gather_n,
-                    marlin_kernel_us,
-                    marlin_kernel_n,
-                ) = {
-                    let ws_us =
-                        MARLIN_WS_ZERO_TIME_US.swap(0, std::sync::atomic::Ordering::Relaxed);
-                    let ws_n = MARLIN_WS_ZERO_CALLS.swap(0, std::sync::atomic::Ordering::Relaxed);
-                    let gather_us =
-                        MARLIN_GATHER_TIME_US.swap(0, std::sync::atomic::Ordering::Relaxed);
-                    let gather_n =
-                        MARLIN_GATHER_CALLS.swap(0, std::sync::atomic::Ordering::Relaxed);
-                    let kernel_us =
-                        MARLIN_KERNEL_TIME_US.swap(0, std::sync::atomic::Ordering::Relaxed);
-                    let kernel_n =
-                        MARLIN_KERNEL_CALLS.swap(0, std::sync::atomic::Ordering::Relaxed);
-                    (ws_us, ws_n, gather_us, gather_n, kernel_us, kernel_n)
-                };
-                #[cfg(not(feature = "cuda"))]
-                let (
-                    marlin_ws_zero_us,
-                    marlin_ws_zero_n,
-                    marlin_gather_us,
-                    marlin_gather_n,
-                    marlin_kernel_us,
-                    marlin_kernel_n,
-                ) = (0, 0, 0, 0, 0, 0);
-                #[cfg(feature = "cuda")]
-                let marlin_proj = {
-                    let p = drain_marlin_profile_by_projection();
-                    format!(
-                        "marlin_qkv_ws={}us({}) marlin_qkv_gather={}us({}) marlin_qkv_kernel={}us({}) \
-                         marlin_o_ws={}us({}) marlin_o_gather={}us({}) marlin_o_kernel={}us({}) \
-                         marlin_gate_up_ws={}us({}) marlin_gate_up_gather={}us({}) marlin_gate_up_kernel={}us({}) \
-                         marlin_down_ws={}us({}) marlin_down_gather={}us({}) marlin_down_kernel={}us({}) \
-                         marlin_lm_head_ws={}us({}) marlin_lm_head_gather={}us({}) marlin_lm_head_kernel={}us({}) \
-                         marlin_other_ws={}us({}) marlin_other_gather={}us({}) marlin_other_kernel={}us({})",
-                        p.qkv.ws_zero_us,
-                        p.qkv.ws_zero_calls,
-                        p.qkv.gather_us,
-                        p.qkv.gather_calls,
-                        p.qkv.kernel_us,
-                        p.qkv.kernel_calls,
-                        p.o_proj.ws_zero_us,
-                        p.o_proj.ws_zero_calls,
-                        p.o_proj.gather_us,
-                        p.o_proj.gather_calls,
-                        p.o_proj.kernel_us,
-                        p.o_proj.kernel_calls,
-                        p.gate_up.ws_zero_us,
-                        p.gate_up.ws_zero_calls,
-                        p.gate_up.gather_us,
-                        p.gate_up.gather_calls,
-                        p.gate_up.kernel_us,
-                        p.gate_up.kernel_calls,
-                        p.down.ws_zero_us,
-                        p.down.ws_zero_calls,
-                        p.down.gather_us,
-                        p.down.gather_calls,
-                        p.down.kernel_us,
-                        p.down.kernel_calls,
-                        p.lm_head.ws_zero_us,
-                        p.lm_head.ws_zero_calls,
-                        p.lm_head.gather_us,
-                        p.lm_head.gather_calls,
-                        p.lm_head.kernel_us,
-                        p.lm_head.kernel_calls,
-                        p.other.ws_zero_us,
-                        p.other.ws_zero_calls,
-                        p.other.gather_us,
-                        p.other.gather_calls,
-                        p.other.kernel_us,
-                        p.other.kernel_calls,
-                    )
-                };
-                #[cfg(not(feature = "cuda"))]
-                let marlin_proj = concat!(
-                    "marlin_qkv_ws=0us(0) marlin_qkv_gather=0us(0) marlin_qkv_kernel=0us(0) ",
-                    "marlin_o_ws=0us(0) marlin_o_gather=0us(0) marlin_o_kernel=0us(0) ",
-                    "marlin_gate_up_ws=0us(0) marlin_gate_up_gather=0us(0) marlin_gate_up_kernel=0us(0) ",
-                    "marlin_down_ws=0us(0) marlin_down_gather=0us(0) marlin_down_kernel=0us(0) ",
-                    "marlin_lm_head_ws=0us(0) marlin_lm_head_gather=0us(0) marlin_lm_head_kernel=0us(0) ",
-                    "marlin_other_ws=0us(0) marlin_other_gather=0us(0) marlin_other_kernel=0us(0)"
-                );
-                let tail_act_us = TAIL_ACT_TIME_US.swap(0, std::sync::atomic::Ordering::Relaxed);
-                let tail_act_n = TAIL_ACT_CALLS.swap(0, std::sync::atomic::Ordering::Relaxed);
-                let tail_resid_us =
-                    TAIL_RESID_TIME_US.swap(0, std::sync::atomic::Ordering::Relaxed);
-                let tail_resid_n = TAIL_RESID_CALLS.swap(0, std::sync::atomic::Ordering::Relaxed);
-                let wrapped_us = attn_us
-                    + qkr_us
-                    + mm_us
-                    + norm_us
-                    + other_us
-                    + tail_norm_us
-                    + tail_gate_up_us
-                    + tail_down_us
-                    + tail_act_us
-                    + tail_resid_us;
-                let unwrapped_us = total_us.saturating_sub(wrapped_us);
-                eprintln!(
-                    "[batched-op-profile] m={} total={}us  matmul={}us({}) attn={}us({}) qkr={}us({}) norm={}us({}) other={}us({}) tail_norm={}us({}) tail_mlp={}us({}) tail_gate_up={}us({}) tail_down={}us({}) marlin_ws_zero={}us({}) marlin_gather={}us({}) marlin_kernel={}us({}) {} tail_act={}us({}) tail_resid={}us({})  unwrapped={}us",
-                    m,
-                    total_us,
-                    mm_us, mm_n,
-                    attn_us, attn_n,
-                    qkr_us, qkr_n,
-                    norm_us, norm_n,
-                    other_us, other_n,
-                    tail_norm_us, tail_norm_n,
-                    tail_mlp_us, tail_mlp_n,
-                    tail_gate_up_us, tail_gate_up_n,
-                    tail_down_us, tail_down_n,
-                    marlin_ws_zero_us, marlin_ws_zero_n,
-                    marlin_gather_us, marlin_gather_n,
-                    marlin_kernel_us, marlin_kernel_n,
-                    marlin_proj,
-                    tail_act_us, tail_act_n,
-                    tail_resid_us, tail_resid_n,
-                    unwrapped_us,
                 );
             }
 
@@ -4260,13 +3023,6 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
                         &mut self.batched_graph_failed,
                     )
                     .unwrap_or_else(|error| std::panic::panic_any(error));
-                    record_batched_graph_replay(
-                        "post_capture",
-                        graph_key,
-                        m,
-                        m_padded,
-                        use_device_residual_shadow,
-                    );
                 }
             }
         }

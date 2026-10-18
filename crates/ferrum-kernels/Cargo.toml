@@ -13,7 +13,6 @@ ferrum-types = { workspace = true }
 ferrum-interfaces = { workspace = true }
 ferrum-native-ops = { workspace = true }
 # Trace writer for FERRUM_TRACE_OUT chrome-trace JSON (Phase 1.5).
-ferrum-bench-core = { workspace = true }
 candle-core = { workspace = true }
 half = { workspace = true }
 float8 = { workspace = true }

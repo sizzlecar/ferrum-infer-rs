@@ -2,7 +2,7 @@
 
 **状态：目标已激活，R0 已合并，R1 验收、R2 实施中。** 工作分支：`refactor/execution-architecture-20261018`，从 2026-10-18 的干净 `main`（`c2be4c67`）开始。首个 checkpoint 退役独立 embedding/ASR/TTS 链路；原工作区未合并的旧 SLO 实现不作为代码基底。
 
-R0 六批清理与正确性修复已合并（PR #429–#434）。R1 已分离 runtime 与产品执行契约，统一 token 提交并退出旧 Tensor 控制流，泛型驱动归入 execution。R2 已统一驱动、关闭与输出生命周期，采样和文本投影移出全局序列锁；观测故障分类、唯一日志关闭权与入口单调时间已接通。当前工作量与真实终态沿原提交所有者交付；CUDA Q6 的实际投影形状、数值路线与当前请求行绑定通过真实后端回归，未覆盖的计算命令明确标记。旧全局 profiler 隔离仍待完成。R1 验收、R2–R5 仍开放；原始证据留在仓库外，没有新增性能或 SLO 达标声明。
+R0 六批清理与正确性修复已合并（PR #429–#434）。R1 已分离 runtime 与产品执行契约，统一 token 提交并退出旧 Tensor 控制流，泛型驱动归入 execution。R2 已统一驱动、关闭与输出生命周期，采样和文本投影移出全局序列锁；观测故障分类、唯一日志关闭权与入口单调时间已接通。当前工作量与真实终态沿原提交所有者交付；CUDA Q6 的实际投影形状、数值路线与当前请求行绑定通过真实后端回归，未覆盖的计算命令明确标记。旧全局 profiler 的退役与实例日志迁移进入验证，CUDA 新制品接通及实机验证尚未完成。R1 验收、R2–R5 仍开放；原始证据留在仓库外，没有新增性能或 SLO 达标声明。
 
 ## 1. 目标与第一原则
 
@@ -42,6 +42,8 @@ R0 六批清理与正确性修复已合并（PR #429–#434）。R1 已分离 ru
 来源 API 迁移：移除 `LlmExecutor::new_with_vnext_model`、`vnext_model`、`vnext_family` 的未接线计划标签；实际使用产品来源的 legacy 构造器改用 `new_with_model_sources`，保留无来源的 `new`。配置了产品来源的自定义 executor 须通过 `bound_resolved_sources` 报告其实际来源；typed 实现还校验真实 plan。此报告是可信实现的组装一致性合同，不是执行授权或全部文件的原子快照。
 
 MoE API 迁移：移除旧 `Qwen3MoeModel`、`Qwen3MoeConfig`、`Qwen3MoeLayer` 和独立 `GgufRuntime`；通过产品来源注册入口使用保留的 typed MoE。旧 CPU MoE 整模型路径随之退役，CPU 路由/dispatch 数值参考不代表 typed CPU MoE 可运行。旧 MoE graph/batch 专属选项明确拒绝；`[runtime]` 未知字段及已有 `ferrum.toml` 的读取/解析错误会报错，缺少配置文件仍使用默认值。
+
+观测 API 迁移：移除 bench-core 全局 profile/trace writer、旧算子计数诊断与 native profile set/clear 导出；历史 `ProfileEvent` 解析保留。`run` / `serve` 显式指定日志路径时统一使用实例产品 schema，`Off` 仍不采集设备计时或计算事实。旧诊断配置明确拒绝；保留的 serve metadata 参数仅作为用户声明。MoE native 包升级至 operator ABI 2，数学入口签名不变；旧包须更换，不能仅删除 Rust 调用后继续链接旧 writer。
 
 旧执行 API 迁移：移除独立 FIFO/Priority、pipeline/模拟 parallel、speculative 驱动及 whole-prompt 缓存 API；Engine 使用连续批处理配置，普通 prefix 使用原有 `FERRUM_PREFIX_CACHE`/CLI 选项。旧 speculative/whole-prompt 参数、退役配置字段和策略名称明确拒绝，不能静默转成默认行为；原生 checkpoint、请求优先级、真实 layer-split/chunked prefill 和显式自定义注册保留。`GenericKvCacheHandle::clone_handle` 拒绝没有物理 fork 的复制；Phi/GPT2 不再被内建注册为可执行家族，通用元数据识别和下载不受此限制。
 

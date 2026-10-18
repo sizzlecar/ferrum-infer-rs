@@ -9,6 +9,7 @@ async fn disabled_trace_skips_payloads_through_real_cpu_stream_and_completion() 
         config.runtime.profile_jsonl = None;
         config.runtime.legacy_scheduler_trace_jsonl = None;
         config.runtime.profile_detail = ObservabilityProfileDetail::Off;
+        config.runtime.batch_decode_prof = true;
     });
     fixture.executor.remove_execution_gate();
     fixture.engine.inner.write_scheduler_trace_event(|| {

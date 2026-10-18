@@ -1,0 +1,49 @@
+{
+  "schema_version": 1,
+  "base_bundle_manifest": {
+    "path": "native-operators/cuda/source-bundles/ferrum-native-cuda-v1.json",
+    "sha256": "bd26697de60f222e9b38da4af3ef39a0a6b7cc72ac1ae7d540e7a4ef1d0b91a5"
+  },
+  "files": [
+    {
+      "path": "kernels/vllm_marlin_moe/core/scalar_type.hpp",
+      "base_sha256": "981808135cbe1456fa8f9dd476af5a70ee8bcfb9b4fbd50b5ed22b8f456de52c"
+    },
+    {
+      "path": "kernels/vllm_marlin_moe/kernel.h",
+      "base_sha256": "a022529facc9ebcb64a00ab57e11de34c223e887a3b13bc4788e55c4efb3d364"
+    },
+    {
+      "path": "kernels/vllm_marlin_moe/kernel_instantiations.cu",
+      "base_sha256": "13e19d5179aada54dc57e1c69fa174eeb5ee0b9afd35f4eac6a14d21fe1e4f5d"
+    },
+    {
+      "path": "kernels/vllm_marlin_moe/marlin_template.h",
+      "base_sha256": "2a68bab99c31dcf0759a7e89c067f8bf199a2917a9d422a91c752e945c49c700"
+    },
+    {
+      "path": "kernels/vllm_marlin_moe/ops.cu",
+      "base_sha256": "64cc641c31962b288d1bd70188aeea3c33dd334dd9cd7fb14d41b5a2fe7eeebc",
+      "repository_override": {
+        "path": "native-operators/cuda/vllm-moe-marlin-profiler-free/ops.cu",
+        "sha256": "915166e5ebcce8b90a2dc881e6f364dc8842655f589c8e21400b5ecab65eb45a"
+      }
+    },
+    {
+      "path": "kernels/vllm_marlin_moe/quantization/gptq_marlin/dequant.h",
+      "base_sha256": "8d8de7ec568d47928ff2f4fc833e8365d6afe46ab16b07fdf524a6dc5a1ddf95"
+    },
+    {
+      "path": "kernels/vllm_marlin_moe/quantization/gptq_marlin/marlin.cuh",
+      "base_sha256": "02c99b24fde6c1ab0179dfa27034c7ef6ae7b1bd5654b767e4c196dc8ee12a86"
+    },
+    {
+      "path": "kernels/vllm_marlin_moe/quantization/gptq_marlin/marlin_dtypes.cuh",
+      "base_sha256": "bd0e545afa3ecc23fbf919f50826219832258ce81d31d118a30b350e5cb9699a"
+    },
+    {
+      "path": "kernels/vllm_marlin_moe/vllm_torch_shim.h",
+      "base_sha256": "6798f312dde391a9a02a685e47c96b716647b8a405200b87d5e68af7b402af50"
+    }
+  ]
+}

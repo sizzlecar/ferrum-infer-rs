@@ -33,7 +33,6 @@ pub mod release_regression;
 pub mod report;
 pub mod sse_text_event_gap;
 pub mod stats;
-pub mod trace;
 
 pub use env::{Env, EnvHash};
 pub use jsonl_journal::{
@@ -42,11 +41,7 @@ pub use jsonl_journal::{
     JsonlJournalError, JsonlJournalErrorKind, JsonlJournalOpenMode, JsonlJournalOwner,
     JsonlJournalWorkerState, JsonlProducerScope, JsonlPublicationCut, OwnedJsonlJournal,
 };
-pub use profile::{
-    configure_global_profile, flush_global_profile, global_profile, parse_profile_event_value,
-    parse_profile_jsonl_str, profile_fields_from_json, ProfileEvent, ProfileJsonlWriter,
-    ProfileMetadata, ProfileSinkConfig,
-};
+pub use profile::{parse_profile_event_value, parse_profile_jsonl_str, ProfileEvent};
 pub use stats::{ci95_half_width, percentile, student_t_975, PercentileStats, ScalarStats};
 
 use serde::{Deserialize, Serialize};

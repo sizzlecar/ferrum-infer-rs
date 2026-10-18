@@ -15,6 +15,7 @@ use thiserror::Error;
 
 use crate::abi::FERRUM_NATIVE_ABI_VERSION;
 use crate::manifest::load_manifest;
+use crate::{CudaNativeBuildCoverageError, CudaNativeBuildUnit};
 
 pub type Result<T> = std::result::Result<T, NativeOperatorResolveError>;
 
@@ -72,6 +73,8 @@ pub enum NativeOperatorResolveError {
     HostAbiMismatch(String),
     #[error("invalid native operator COFF library {path}: {reason}")]
     InvalidCoffLibrary { path: PathBuf, reason: String },
+    #[error("native operator package contract: {0}")]
+    BuildContract(#[from] CudaNativeBuildCoverageError),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -281,6 +284,10 @@ impl NativeOperatorResolver {
         };
         resolve_native_operator_manifest(Some(&manifest), &requirement)
             .map_err(NativeOperatorResolveError::ManifestInvalid)?;
+        let build_unit = CudaNativeBuildUnit::from_artifact_operator(&manifest.operator);
+        if let Some(unit) = build_unit {
+            unit.validate_package_contract(&manifest.operator_abi_version, &manifest.exports)?;
+        }
 
         let artifact_sha256 = file_sha256(&request.artifact_path)?;
         if artifact_sha256 != manifest.binary_sha256 {
@@ -301,6 +308,9 @@ impl NativeOperatorResolver {
         } else {
             validate_binary_artifact(&request.artifact_path, manifest.linkage, &manifest.exports)?
         };
+        if let Some(unit) = build_unit {
+            unit.validate_binary_exports(&binary_validation.defined_symbols)?;
+        }
         Ok(ResolvedNativeOperator {
             manifest,
             manifest_path: request.manifest_path.clone(),
@@ -920,6 +930,61 @@ mod tests {
             matches!(err, NativeOperatorResolveError::ManifestInvalid(_)),
             "{err:?}"
         );
+    }
+
+    #[test]
+    fn moe_profiler_retirement_rejects_undeclared_archive_writer_symbols() {
+        let unit = CudaNativeBuildUnit::VllmMoeMarlin;
+        for retired in std::iter::once(None).chain(unit.forbidden_exports().iter().map(Some)) {
+            let dir = temp_dir("moe-profiler-retirement");
+            let artifact = dir.path().join("native.lib");
+            let manifest_path = dir.path().join("manifest.json");
+            let mut declared = required_exports();
+            declared.extend(
+                unit.required_exports()
+                    .iter()
+                    .map(|symbol| (*symbol).to_owned()),
+            );
+            declared.sort();
+            let mut actual = declared.iter().map(String::as_str).collect::<Vec<_>>();
+            if let Some(retired) = retired {
+                actual.push(retired);
+            }
+            let bytes = crate::coff::tests::native_library(&actual);
+            fs::write(&artifact, &bytes).unwrap();
+            write_manifest(
+                &manifest_path,
+                digest_bytes(&bytes),
+                FERRUM_NATIVE_ABI_VERSION,
+                vec!["sm_89".into()],
+                declared,
+            );
+            let mut manifest: NativeOperatorManifest =
+                serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+            let host = NativeOperatorHostAbi::for_target("x86_64-pc-windows-msvc").unwrap();
+            manifest.host_abi = Some(host.clone());
+            manifest.operator = unit.artifact_operator().into();
+            manifest.operator_abi_version = "2".into();
+            fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+            let request = NativeOperatorResolveRequest::new(
+                unit.artifact_operator(),
+                NativeOperatorBackend::Cuda,
+                &manifest_path,
+                &artifact,
+            )
+            .with_operator_abi_version("2")
+            .with_host_abi(host);
+            let result = NativeOperatorResolver.resolve(&request);
+            match retired {
+                Some(retired) => assert!(matches!(result,
+                    Err(NativeOperatorResolveError::BuildContract(
+                        CudaNativeBuildCoverageError::ForbiddenExport { export, .. }))
+                        if export == *retired)),
+                None => {
+                    result.unwrap();
+                }
+            }
+        }
     }
 
     #[test]

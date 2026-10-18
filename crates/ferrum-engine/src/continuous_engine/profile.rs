@@ -71,6 +71,8 @@ struct VNextProfileEventContext {
 mod journal;
 pub(super) use journal::*;
 mod execution_facts;
+mod host;
+pub(super) use host::EngineHostObservation;
 
 pub(super) struct VNextProfileExecutionEventSink {
     journals: Box<[SchedulerTraceJournal]>,

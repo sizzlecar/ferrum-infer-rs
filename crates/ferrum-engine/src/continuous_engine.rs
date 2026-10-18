@@ -10,9 +10,7 @@ use crate::resource_lifecycle::{
     ResourceLedgerTransition, ResourceLifecycleLedger, ResourceOwnerCloseSummary,
 };
 use async_trait::async_trait;
-use ferrum_bench_core::{
-    global_profile, profile_fields_from_json, JsonlJournal, JsonlJournalError,
-};
+use ferrum_bench_core::{JsonlJournal, JsonlJournalError};
 use ferrum_execution::{
     model_executor::{
         ExecutionResourceAuthority, ExecutorAdmissionEpochs, ExecutorCapacityWaitRegistration,
@@ -1427,6 +1425,7 @@ struct EngineInner {
     work_notify: Arc<Notify>,
     runtime_config: ContinuousEngineRuntimeConfig,
     scheduler_trace_jsonl: Option<SchedulerTraceJournal>,
+    host_profile_sink: Option<Arc<VNextProfileExecutionEventSink>>,
     legacy_scheduler_trace_jsonl: Option<JsonlJournal<serde_json::Value>>,
     journal_scopes: Arc<Mutex<EngineJournals>>,
     observation_health: ObservationHealth,
@@ -2350,22 +2349,21 @@ impl ContinuousBatchEngine {
                 execution_profile_journals.push(journal.clone());
             }
         }
-        let execution_sink: Option<Arc<dyn ProductExecutionEventSink>> =
-            if !execution_profile_journals.is_empty() {
-                Some(Arc::new(VNextProfileExecutionEventSink::with_journals(
-                    execution_profile_journals,
-                    runtime_config
-                        .profile_entrypoint
-                        .unwrap_or(ProfileEntrypoint::Synthetic),
-                    &config,
-                )))
-            } else if config.runtime.profile_detail == ObservabilityProfileDetail::Basic {
-                Some(Arc::new(MetricsOnlyExecutionEventSink))
-            } else {
-                None
-            };
-        if let Some(sink) = execution_sink {
-            model_executor.attach_execution_event_sink(sink);
+        // Host diagnostics and executor events share the same instance and
+        // producer scopes. The legacy executor need not implement a profiler.
+        let host_profile_sink = (!execution_profile_journals.is_empty()).then(|| {
+            Arc::new(VNextProfileExecutionEventSink::with_journals(
+                execution_profile_journals,
+                runtime_config
+                    .profile_entrypoint
+                    .unwrap_or(ProfileEntrypoint::Synthetic),
+                &config,
+            ))
+        });
+        if let Some(sink) = &host_profile_sink {
+            model_executor.attach_execution_event_sink(sink.clone());
+        } else if config.runtime.profile_detail == ObservabilityProfileDetail::Basic {
+            model_executor.attach_execution_event_sink(Arc::new(MetricsOnlyExecutionEventSink));
         }
 
         let driver = Arc::new(ManagedDriver::default());
@@ -2390,6 +2388,7 @@ impl ContinuousBatchEngine {
                 iteration_count: AtomicU64::new(0),
                 runtime_config,
                 scheduler_trace_jsonl,
+                host_profile_sink,
                 legacy_scheduler_trace_jsonl,
                 journal_scopes,
                 observation_health,

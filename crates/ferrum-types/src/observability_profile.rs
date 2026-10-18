@@ -314,12 +314,10 @@ impl FerrumObservabilityConfig {
             && self.request_dump_dir.is_none()
     }
 
+    /// Any explicit artifact uses the standard instance-owned product schema.
+    /// Off still disables device timing and detailed execution facts.
     pub fn unified_product_profile_enabled(&self) -> bool {
         self.enabled()
-            && (self.profile_detail != ObservabilityProfileDetail::Off
-                || self.memory_profile_jsonl.is_some()
-                || self.scheduler_trace_jsonl.is_some()
-                || self.request_dump_dir.is_some())
     }
 
     pub fn validate(&self) -> std::result::Result<(), String> {
@@ -706,6 +704,28 @@ mod tests {
         );
         assert_eq!(ObservabilityProfileDetail::Verify.as_str(), "verify");
         assert!(ObservabilityProfileDetail::Verify.diagnostic_only());
+    }
+
+    #[test]
+    fn off_with_explicit_profile_uses_product_schema_without_device_capture() {
+        for entrypoint in [ProfileEntrypoint::Run, ProfileEntrypoint::Serve] {
+            let config = FerrumObservabilityConfig::new(
+                entrypoint,
+                "actual-model",
+                Some(PathBuf::from("profile.jsonl")),
+                ObservabilityProfileDetail::Off,
+                None,
+                None,
+                None,
+                1.0,
+            );
+            config.validate().unwrap();
+            assert!(config.enabled());
+            assert!(config.unified_product_profile_enabled());
+            assert!(!config.profile_detail.captures_engine_token_timing());
+            assert!(!config.profile_detail.captures_execution_facts());
+            assert!(!config.profile_detail.requires_complete_evidence());
+        }
     }
 
     #[test]

@@ -95,9 +95,28 @@ Optional telemetry loss is reported without replaying inference. Replay, Verify
 and Full require complete evidence; configuration, encoding and internal contract
 failures are never treated as optional delivery loss.
 
-`serve --profile-detail off --profile-jsonl ...` selects the legacy backend
-profiler. Its file is outside these product-journal budgets and must differ from
-any scheduler trace destination.
+`run` and `serve --profile-detail off --profile-jsonl ...` write the standard
+`FerrumProfileEvent` product schema through those same bounded journals. Off
+keeps device timing and detailed execution facts disabled; explicit artifacts
+still contain startup, request/output and close observations. Aliased profile
+and scheduler paths share one writer and producer scopes.
+
+Serve's `--profile-commit-sha`, `--profile-env-hash`, `--profile-model`,
+`--profile-concurrency` and `--profile-runtime-flags-json` are preserved as
+`declared_metadata` in one `product_session_metadata` event per invocation.
+These labels do not override actual model identity, execution geometry or
+capacity. The environment-only versions of these metadata controls and the old
+process-global profiler/trace switches are rejected, including explicitly
+forced-off values. Historical native-profile files remain readable by the
+historical parser; new product artifacts do not use that schema.
+
+The optional Engine batch diagnostic (`runtime.batch_decode_prof`) writes
+`iter_prof` and `stream_ttft_prof` through its own instance sink when a typed
+journal is configured. First-text duration retains the original request ingress
+anchor and ends when the Engine commits nonempty text to output. It is not
+client-observed SSE latency. Retired legacy per-operator/graph/Marlin/MoE
+profiling switches do not implicitly enable detailed profiles on the retained
+executor.
 
 ## Model Capacity
 

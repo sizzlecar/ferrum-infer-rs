@@ -81,13 +81,7 @@ impl ProductJournalSession {
         let mut paths =
             BTreeMap::<PathBuf, (PathBuf, ProfileOutputRoles, JsonlJournalOpenMode)>::new();
         for (path, role) in [
-            (
-                (config.entrypoint == ProfileEntrypoint::Run
-                    || config.unified_product_profile_enabled())
-                .then_some(config.profile_jsonl.as_ref())
-                .flatten(),
-                0,
-            ),
+            (config.profile_jsonl.as_ref(), 0),
             (config.memory_profile_jsonl.as_ref(), 1),
             (config.scheduler_trace_jsonl.as_ref(), 2),
         ] {
@@ -125,17 +119,6 @@ impl ProductJournalSession {
                     )
                 });
         }
-        // Legacy backend profiling has a different writer/protocol. It may
-        // not share a canonical destination with any typed product journal.
-        let legacy_conflict = (config.entrypoint == ProfileEntrypoint::Serve
-            && !config.unified_product_profile_enabled())
-        .then_some(config.profile_jsonl.as_ref())
-        .flatten()
-        .map(|path| ferrum_bench_core::normalize_jsonl_path(path).unwrap_or_else(|_| path.clone()))
-        .is_some_and(|path| paths.contains_key(&path));
-        if legacy_conflict {
-            paths.clear();
-        }
         let mut roles = BTreeMap::new();
         let mut routes = BTreeMap::new();
         for (key, (path, role, mode)) in paths {
@@ -166,15 +149,6 @@ impl ProductJournalSession {
             errors: Mutex::new(Errors::default()),
             close: tokio::sync::Mutex::new(None),
         });
-        if legacy_conflict {
-            result
-                .errors
-                .lock()
-                .expect("product journal errors")
-                .contract = Some(FerrumError::config(
-                "legacy backend profile and typed journal destinations must be distinct",
-            ));
-        }
         {
             let routes = result.routes.lock().expect("product journal routes");
             for route in routes.values() {

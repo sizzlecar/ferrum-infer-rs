@@ -1,5 +1,7 @@
 mod journal_session;
+mod session_metadata;
 pub use journal_session::{ProductEngineLifetime, ProductJournalSession};
+pub(crate) use session_metadata::ProductSessionMetadata;
 
 use chrono::{Duration, Utc};
 use clap::ValueEnum;

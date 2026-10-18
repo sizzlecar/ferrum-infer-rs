@@ -457,6 +457,8 @@ mod output;
 #[path = "managed_driver_tests/semantic.rs"]
 mod semantic;
 
+#[path = "managed_driver_tests/host_profile.rs"]
+mod host_profile;
 #[path = "managed_driver_tests/trace_lazy.rs"]
 mod trace_lazy;
 
