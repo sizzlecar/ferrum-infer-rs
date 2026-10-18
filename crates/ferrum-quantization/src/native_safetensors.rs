@@ -642,11 +642,16 @@ impl<B: Backend + BackendQuantMarlin> WeightLoader<B> for NativeSafetensorsLoade
                     "linear '{name}': expected 2D weight, got {shape:?}"
                 )));
             }
+            // Validate the optional bias before allocating backend buffers.
+            // A directly stored fused projection obeys the same row contract.
+            let bias = self.cat_optional_biases(std::slice::from_ref(&direct), shape[0])?;
             let weight = B::from_weight_bytes(raw, src_dtype);
-            return Ok(Box::new(
-                DenseLinear::<B>::from_buffer(weight, shape[0], shape[1])
-                    .with_metadata(LinearMetadata::from_name(name)),
-            ));
+            let mut linear = DenseLinear::<B>::from_buffer(weight, shape[0], shape[1])
+                .with_metadata(LinearMetadata::from_name(name));
+            if let Some(bias) = bias {
+                linear = linear.with_bias(B::from_slice(&bias));
+            }
+            return Ok(Box::new(linear));
         }
 
         // Llama-family fusion shims: synthesise qkv_proj / gate_up_proj from

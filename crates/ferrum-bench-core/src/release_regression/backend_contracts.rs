@@ -155,6 +155,23 @@ pub fn contract_groups(backend: Backend) -> Vec<ContractGroup> {
                 ),
             }],
         });
+        groups.push(ContractGroup {
+            id: format!(
+                "backend-contract.{}.safetensors-direct-bias",
+                backend_name(backend),
+            ),
+            behavior: Behavior::KernelNumerics,
+            entrypoints: Vec::new(),
+            tests: vec![ContractTest {
+                package: "ferrum-quantization".into(),
+                target: "native_safetensors_loader_test".into(),
+                kind: "test".into(),
+                name: format!(
+                    "{}_direct_bias_matches_complete_oracles",
+                    backend_name(backend),
+                ),
+            }],
+        });
     }
     if backend == Backend::Cuda {
         // Dense Marlin coverage requires these matrices and the numerical
