@@ -4366,27 +4366,64 @@ fn vnext_profile_preserves_the_complete_canonical_execution_identity() {
 
 #[test]
 fn basic_vnext_profile_serializes_identity_once_and_stays_within_request_budget() {
+    assert_compact_vnext_profile(ObservabilityProfileDetail::Basic);
+}
+
+#[test]
+fn off_vnext_profile_compacts_nodes_and_preserves_lifecycle_identity() {
+    assert_compact_vnext_profile(ObservabilityProfileDetail::Off);
+}
+
+fn assert_compact_vnext_profile(detail: ObservabilityProfileDetail) {
     use ferrum_runtime::ExecutionEventKind;
 
     const NODES_PER_REQUEST: usize = 132;
     const LIFECYCLE_EVENTS_PER_REQUEST: usize = 6;
     const MAX_BYTES_PER_REQUEST: usize = 1024 * 1024;
 
-    let trace_path = resource_trace_temp_path("vnext-basic-compact-execution-identity");
+    let trace_path = resource_trace_temp_path(&format!(
+        "vnext-{}-compact-execution-identity",
+        detail.as_str()
+    ));
     let journal = create_scheduler_trace_sink(Some(&trace_path)).unwrap();
     let mut config = EngineConfig::default();
-    config.runtime.profile_detail = ObservabilityProfileDetail::Basic;
+    config.runtime.profile_detail = detail;
     let sink =
         VNextProfileExecutionEventSink::new(journal.clone(), ProfileEntrypoint::Serve, &config);
+
+    assert_eq!(
+        sink.capture_policy(),
+        ExecutionEventCapturePolicy::FirstFramePerRequest
+    );
+    assert_eq!(
+        sink.device_timing_mode(),
+        match detail {
+            ObservabilityProfileDetail::Off => ferrum_runtime::DeviceTimingMode::Off,
+            ObservabilityProfileDetail::Basic => ferrum_runtime::DeviceTimingMode::Completion,
+            _ => unreachable!("this helper checks Off and Basic projections"),
+        }
+    );
+    assert_eq!(
+        sink.execution_facts_capture(),
+        ferrum_runtime::ExecutionFactsCapture::Off
+    );
 
     let operation = sink
         .profile_event(&vnext_profile_test_operation_event())
         .unwrap();
     operation.validate().unwrap();
-    assert!(!operation.attributes.contains_key("execution_identity"));
-    assert!(!operation.attributes.contains_key("execution_request_id"));
-    assert!(!operation.attributes.contains_key("backend_device"));
-    assert!(!operation.attributes.contains_key("backend_type"));
+    for field in [
+        "execution_identity",
+        "execution_request_id",
+        "backend_device",
+        "backend_type",
+    ] {
+        assert_eq!(
+            operation.attributes.contains_key(field),
+            detail == ObservabilityProfileDetail::Off,
+            "{detail:?} operation projection changed {field}"
+        );
+    }
     assert_eq!(
         operation.attributes["execution_identity_version"],
         ferrum_runtime::EXECUTION_IDENTITY_VERSION.to_string()
@@ -4435,6 +4472,13 @@ fn basic_vnext_profile_serializes_identity_once_and_stays_within_request_budget(
         ))
         .unwrap();
     for event in [&started, &retired] {
+        event.validate().unwrap();
+        assert_eq!(event.request_id, operation.request_id);
+        assert_eq!(event.shape["frame_id"], operation.shape["frame_id"]);
+        assert_eq!(
+            event.shape["node_invocation_id"],
+            operation.shape["node_invocation_id"]
+        );
         for field in [
             "plan_id",
             "plan_hash",
@@ -4457,6 +4501,9 @@ fn basic_vnext_profile_serializes_identity_once_and_stays_within_request_budget(
         }
         for field in [
             "execution_identity",
+            "execution_request_id",
+            "backend_device",
+            "backend_type",
             "resource_pool_identity_fingerprint",
             "provisioning_run_id",
             "provisioning_request_id",
@@ -4474,6 +4521,16 @@ fn basic_vnext_profile_serializes_identity_once_and_stays_within_request_budget(
 
     let (_, _, accepted) = vnext_profile_test_event();
     let lifecycle = sink.profile_event(&accepted).unwrap();
+    lifecycle.validate().unwrap();
+    assert_eq!(lifecycle.phase, "vnext.request_accepted");
+    assert_eq!(
+        lifecycle.attributes["vnext_monotonic_wall_anchor_unix_nanos"],
+        1_700_000_000_000_000_000_i64
+    );
+    assert_eq!(
+        lifecycle.attributes.contains_key("execution_identity"),
+        detail == ObservabilityProfileDetail::Off
+    );
     let serialized_request_upper_bound = NODES_PER_REQUEST
         * (serde_json::to_vec(&started).unwrap().len()
             + serde_json::to_vec(&operation).unwrap().len()
@@ -4483,16 +4540,46 @@ fn basic_vnext_profile_serializes_identity_once_and_stays_within_request_budget(
                 .unwrap()
                 .len()
                 .max(serde_json::to_vec(&lifecycle).unwrap().len());
-    assert!(
-        serialized_request_upper_bound <= MAX_BYTES_PER_REQUEST,
-        "basic execution trace upper bound is {serialized_request_upper_bound} bytes"
-    );
+    if detail == ObservabilityProfileDetail::Basic {
+        assert!(
+            serialized_request_upper_bound <= MAX_BYTES_PER_REQUEST,
+            "basic execution trace upper bound is {serialized_request_upper_bound} bytes"
+        );
+    }
 
     let failure = sink
         .profile_event(&vnext_profile_test_resource_failure_event())
         .unwrap();
     assert!(failure.attributes.contains_key("execution_identity"));
     assert!(failure.attributes.contains_key("execution_request_id"));
+
+    let mut terminal_identity = accepted.identity().parts().clone();
+    terminal_identity.sequence = 5;
+    let terminal = ferrum_runtime::ExecutionEvent::new(
+        ferrum_runtime::MonotonicTimestamp {
+            nanos_since_run_start: 5,
+        },
+        ferrum_runtime::ExecutionPhase::Completion,
+        ExecutionEventKind::RequestFailed,
+        ferrum_runtime::ExecutionIdentityEnvelope::new(terminal_identity).unwrap(),
+        ferrum_runtime::ExecutionEventDetail::FailureTerminal {
+            first_failure_fingerprint: failure.attributes["first_failure_fingerprint"]
+                .as_str()
+                .unwrap()
+                .to_owned(),
+        },
+    )
+    .unwrap();
+    let terminal = sink.profile_event(&terminal).unwrap();
+    terminal.validate().unwrap();
+    assert_eq!(terminal.phase, "vnext.request_failed");
+    assert_eq!(terminal.status, ProfileStatus::Failure);
+    assert_eq!(
+        terminal.attributes["first_failure_fingerprint"],
+        failure.attributes["first_failure_fingerprint"]
+    );
+    assert!(terminal.attributes.contains_key("execution_identity"));
+    assert!(terminal.attributes.contains_key("execution_request_id"));
 
     drop(sink);
     journal.close().unwrap();

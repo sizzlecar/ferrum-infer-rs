@@ -68,6 +68,7 @@ impl RuntimeConfigSnapshot {
                 | "FERRUM_MOE_DUMP" | "FERRUM_MOE_DUMP_BATCH_X_TOPK"
                 | "FERRUM_MARLIN_PROFILE" | "FERRUM_MARLIN_TRACE_SHAPES"
                 | "FERRUM_MARLIN_TRACE_SHAPES_MAX"
+                | "FERRUM_METAL_QUANT_PROFILE"
                 | "FERRUM_DECODE_OP_PROFILE" | "FERRUM_PREFILL_OP_PROFILE"
                 | "FERRUM_DECODE_LAYER_PROFILE" | "FERRUM_UNIFIED_PROFILE"
                 | "FERRUM_BATCHED_TRACE" | "FERRUM_MOE_PROFILE" => Some(
@@ -593,6 +594,7 @@ mod retired_profiler_tests {
             "FERRUM_MARLIN_PROFILE",
             "FERRUM_MARLIN_TRACE_SHAPES",
             "FERRUM_MARLIN_TRACE_SHAPES_MAX",
+            "FERRUM_METAL_QUANT_PROFILE",
             "FERRUM_DECODE_OP_PROFILE",
             "FERRUM_PREFILL_OP_PROFILE",
             "FERRUM_DECODE_LAYER_PROFILE",

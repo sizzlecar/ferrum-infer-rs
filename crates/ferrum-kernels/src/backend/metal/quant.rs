@@ -14,20 +14,6 @@ use crate::backend::{Backend, GgufQuantType};
 use ferrum_types::{FerrumError, Result};
 use metal::MTLResourceOptions;
 use std::ffi::c_void;
-use std::sync::OnceLock;
-
-// ── Profiling counters for `gemm_quant` (off by default) ─────────────
-
-static QUANT_GEMM_TIME_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-static QUANT_GEMM_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-static QUANT_GEMM_LAST_M: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-static QUANT_GEMM_LAST_N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-static QUANT_GEMM_LAST_K: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-fn debug_per_call_flush() -> bool {
-    static FLAG: OnceLock<bool> = OnceLock::new();
-    *FLAG.get_or_init(|| std::env::vars().any(|(name, _)| name == "FERRUM_METAL_QUANT_PROFILE"))
-}
 
 // ── MetalQuantStore (GGUF k-quant container) ──────────────────────────
 
@@ -797,12 +783,6 @@ pub fn metal_gemm_quant_dispatch(
         }
     };
 
-    let _t0 = if debug_per_call_flush() {
-        Some(std::time::Instant::now())
-    } else {
-        None
-    };
-
     let a_buf = a.expect_f32("gemm_quant a");
     let out_buf = out.expect_f32_mut("gemm_quant out");
 
@@ -897,23 +877,5 @@ pub fn metal_gemm_quant_dispatch(
         let _ = n_blocks; // not consumed by mul_mm path; kept for the load-time block accounting
     }
 
-    // Optional per-call timing: commit + wait the cmd buffer right
-    // here so we measure the GPU work for *this* matmul. Off by
-    // default (would serialize the whole pipeline).
-    if let Some(t0) = _t0 {
-        ctx.flush();
-        let elapsed_us = t0.elapsed().as_micros();
-        QUANT_GEMM_TIME_US.fetch_add(elapsed_us as u64, std::sync::atomic::Ordering::Relaxed);
-        QUANT_GEMM_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        QUANT_GEMM_LAST_M.store(m as u64, std::sync::atomic::Ordering::Relaxed);
-        QUANT_GEMM_LAST_N.store(n_rows as u64, std::sync::atomic::Ordering::Relaxed);
-        QUANT_GEMM_LAST_K.store(n_cols as u64, std::sync::atomic::Ordering::Relaxed);
-        if QUANT_GEMM_CALLS.load(std::sync::atomic::Ordering::Relaxed) <= 16 {
-            eprintln!(
-                "[gemm_quant] m={} n={} k={} took {} us",
-                m, n_rows, n_cols, elapsed_us
-            );
-        }
-    }
     Ok(())
 }

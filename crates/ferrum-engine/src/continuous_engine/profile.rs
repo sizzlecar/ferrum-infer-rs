@@ -252,11 +252,16 @@ impl VNextProfileEventContext {
             .unwrap_or(self.capture_policy);
         let event_name = vnext_execution_event_name(event.kind());
         let compact_basic = self.profile_detail == ObservabilityProfileDetail::Basic;
-        let compact_repeated_node = compact_basic
-            && matches!(
-                event.kind(),
-                VNextExecutionEventKind::NodeStarted | VNextExecutionEventKind::NodeRetired
-            );
+        let compact_repeated_node = matches!(
+            self.profile_detail,
+            ObservabilityProfileDetail::Off | ObservabilityProfileDetail::Basic
+        ) && matches!(
+            event.kind(),
+            VNextExecutionEventKind::NodeStarted | VNextExecutionEventKind::NodeRetired
+        );
+        // Off keeps its lifecycle and operation evidence. Only repeated node
+        // envelopes share Basic's compact projection.
+        let compact_identity = compact_basic || compact_repeated_node;
         let failure = match event.detail() {
             ExecutionEventDetail::Failure(failure) => Some(ProfileError {
                 kind: failure.failure().code().to_string(),
@@ -344,7 +349,7 @@ impl VNextProfileEventContext {
                 serde_json::json!(identity.version.to_string()),
             ),
         ]);
-        if !compact_basic {
+        if !compact_identity {
             attributes.insert(
                 "backend_device".to_string(),
                 serde_json::json!(self.backend_device),
@@ -354,7 +359,7 @@ impl VNextProfileEventContext {
                 serde_json::json!(self.backend_type),
             );
         }
-        if !compact_basic || failure.is_some() {
+        if !compact_identity || failure.is_some() {
             attributes.insert(
                 "execution_identity".to_string(),
                 serde_json::to_value(identity).map_err(|error| {
@@ -368,7 +373,7 @@ impl VNextProfileEventContext {
                 serde_json::json!(identity.request_id.to_string()),
             );
         }
-        if !compact_basic || !identity.async_links.is_empty() {
+        if !compact_identity || !identity.async_links.is_empty() {
             attributes.insert(
                 "async_links".to_string(),
                 serde_json::json!(identity
