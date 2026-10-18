@@ -83,7 +83,6 @@ struct ContinuousBatchRuntimeConfig {
     prefill_step_chunk: Option<usize>,
     active_decode_prefill_chunk: Option<usize>,
     active_decode_prefill_token_budget: Option<usize>,
-    scheduler_none_prof: bool,
 }
 
 impl ContinuousBatchRuntimeConfig {
@@ -96,7 +95,6 @@ impl ContinuousBatchRuntimeConfig {
             active_decode_prefill_token_budget: config
                 .active_decode_prefill_token_budget
                 .filter(|budget| *budget > 0),
-            scheduler_none_prof: config.scheduler_none_prof,
         }
     }
 }
@@ -4414,47 +4412,7 @@ impl ContinuousBatchScheduler {
                 .store(false, Ordering::Release);
         }
 
-        // FERRUM_SCHED_NONE_PROF=1: log when next_batch is about to return SOME.
-        if self.runtime_config.scheduler_none_prof && !batch_requests.is_empty() {
-            use std::sync::atomic::AtomicU64;
-            static SOME_PROF_N: AtomicU64 = AtomicU64::new(0);
-            let n = SOME_PROF_N.fetch_add(1, Ordering::Relaxed);
-            if n.is_multiple_of(64) {
-                let d_len = self.decode_queue.read().requests.len();
-                let p_len = self.prefill_queue.read().len();
-                let w_len = self.waiting_queue.read().len();
-                eprintln!(
-                    "[sched-some] n={} returning_batch={} | decode_queue={} prefill_queue={} waiting_queue={}",
-                    n,
-                    batch_requests.len(),
-                    d_len,
-                    p_len,
-                    w_len,
-                );
-            }
-        }
         if batch_requests.is_empty() {
-            // FERRUM_SCHED_NONE_PROF=1: log why we returned None. Rate-limited.
-            if self.runtime_config.scheduler_none_prof {
-                use std::sync::atomic::AtomicU64;
-                static NONE_PROF_N: AtomicU64 = AtomicU64::new(0);
-                let n = NONE_PROF_N.fetch_add(1, Ordering::Relaxed);
-                if n.is_multiple_of(512) {
-                    let d_len = self.decode_queue.read().requests.len();
-                    let p_len = self.prefill_queue.read().len();
-                    let w_len = self.waiting_queue.read().len();
-                    let d_count = self.decoding_count();
-                    eprintln!(
-                        "[sched-none] n={} decode_queue={} prefill_queue={} waiting_queue={} decoding_count={} hint.max_batch={}",
-                        n,
-                        d_len,
-                        p_len,
-                        w_len,
-                        d_count,
-                        hint.max_batch_size,
-                    );
-                }
-            }
             return Ok(None);
         }
 

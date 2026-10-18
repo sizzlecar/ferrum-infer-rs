@@ -92,12 +92,6 @@ const CHUNKED_PREFILL_ENV: &str = "FERRUM_CHUNKED_PREFILL";
 const KV_CAPACITY_ENV: &str = "FERRUM_KV_CAPACITY";
 #[cfg(test)]
 const MAX_MODEL_LEN_ENV: &str = "FERRUM_MAX_MODEL_LEN";
-#[cfg(test)]
-const NEXT_BATCH_PROF_ENV: &str = "FERRUM_NEXT_BATCH_PROF";
-#[cfg(test)]
-const RBD_PROF_ENV: &str = "FERRUM_RBD_PROF";
-#[cfg(test)]
-const UNIFIED_POST_PROF_ENV: &str = "FERRUM_UNIFIED_POST_PROF";
 const GENERATION_POLICY_SCAN_LIMIT: usize = 262_144;
 const FORBIDDEN_DECODE_RESAMPLE_LIMIT: usize = 64;
 const TOKEN_TRACE_PROMPT_PREFIX_LIMIT: usize = 64;
@@ -133,13 +127,10 @@ struct ContinuousEngineRuntimeConfig {
     chunked_prefill_size: Option<usize>,
     kv_capacity: Option<usize>,
     max_model_len: Option<usize>,
-    next_batch_prof: bool,
     profile_entrypoint: Option<ProfileEntrypoint>,
     profile_jsonl: Option<PathBuf>,
-    rbd_prof: bool,
     scheduler_trace_jsonl: Option<PathBuf>,
     legacy_scheduler_trace_jsonl: Option<PathBuf>,
-    unified_post_prof: bool,
 }
 
 impl ContinuousEngineRuntimeConfig {
@@ -155,13 +146,10 @@ impl ContinuousEngineRuntimeConfig {
             chunked_prefill_size: r.chunked_prefill_size,
             kv_capacity: r.kv_capacity,
             max_model_len: r.max_model_len,
-            next_batch_prof: r.next_batch_prof,
             profile_entrypoint: r.profile_entrypoint,
             profile_jsonl: r.profile_jsonl.clone(),
-            rbd_prof: r.rbd_prof,
             scheduler_trace_jsonl: r.scheduler_trace_jsonl.clone(),
             legacy_scheduler_trace_jsonl: r.legacy_scheduler_trace_jsonl.clone(),
-            unified_post_prof: r.unified_post_prof,
         }
     }
 
@@ -183,21 +171,18 @@ impl ContinuousEngineRuntimeConfig {
             chunked_prefill_size: parse_positive_usize_env(&vars, CHUNKED_PREFILL_ENV),
             kv_capacity: parse_positive_usize_env(&vars, KV_CAPACITY_ENV),
             max_model_len: parse_positive_usize_env(&vars, MAX_MODEL_LEN_ENV),
-            next_batch_prof: vars.contains_key(NEXT_BATCH_PROF_ENV),
             profile_entrypoint: vars
                 .get("FERRUM_PROFILE_ENTRYPOINT")
                 .and_then(|value| ProfileEntrypoint::parse(value)),
             profile_jsonl: vars
                 .get("FERRUM_PROFILE_JSONL")
                 .and_then(|value| ferrum_types::parse_path_env_value(value).ok()),
-            rbd_prof: vars.contains_key(RBD_PROF_ENV),
             scheduler_trace_jsonl: vars
                 .get("FERRUM_SCHEDULER_TRACE_JSONL")
                 .and_then(|value| ferrum_types::parse_path_env_value(value).ok()),
             legacy_scheduler_trace_jsonl: vars
                 .get("FERRUM_LEGACY_SCHEDULER_TRACE_JSONL")
                 .and_then(|value| ferrum_types::parse_path_env_value(value).ok()),
-            unified_post_prof: vars.contains_key(UNIFIED_POST_PROF_ENV),
         }
     }
 }

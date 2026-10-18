@@ -329,15 +329,11 @@ impl ManagedDriver {
 
     async fn run_iterations(&self, inner: &EngineInner) {
         info!("Background iteration loop started");
-        let prof = inner.runtime_config.batch_decode_prof;
-        let mut last_iter_end: Option<Instant> = None;
-        static GAP_PROF_CALLS: AtomicU64 = AtomicU64::new(0);
         while self.is_running() {
             #[cfg(test)]
             if self.panic_next_iteration.swap(false, Ordering::AcqRel) {
                 panic!("injected managed driver iteration panic");
             }
-            let inter_iter_us = last_iter_end.map(|previous| previous.elapsed().as_micros() as u64);
             let outcome = match inner.run_iteration().await {
                 Ok(outcome) => outcome,
                 Err(error) => {
@@ -345,15 +341,6 @@ impl ManagedDriver {
                     EngineIterationOutcome::Progressed
                 }
             };
-            if prof {
-                let count = GAP_PROF_CALLS.fetch_add(1, Ordering::Relaxed);
-                if count.is_multiple_of(8) {
-                    if let Some(gap_us) = inter_iter_us {
-                        eprintln!("[bg-loop-gap] call#{} inter_iter={}us", count, gap_us);
-                    }
-                }
-            }
-            last_iter_end = Some(Instant::now());
             if !self.is_running() {
                 break;
             }

@@ -19,6 +19,11 @@ is the only supported source compilation path. It creates source locks,
 reproducible build receipts, packages, and the artifact-set lock consumed by
 `FERRUM_NATIVE_OPERATOR_SET_LOCK`.
 
+MoE operator ABI 2 requires the
+[profiler-free source overlay](vllm-moe-marlin-profiler-free/README.md).
+Materialize that overlay on the pinned bundle before locking and building the
+MoE sources; the unmodified bundle still contains the retired profiler exports.
+
 The product build fails closed when an active CUDA native unit is not covered by
 the supplied artifact-set lock. It never falls back to compiling the source
 bundle.

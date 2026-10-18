@@ -345,7 +345,6 @@ fn scheduler_config_applies_runtime_snapshot() {
             "64",
             RuntimeConfigSource::Env,
         ),
-        RuntimeConfigEntry::new("FERRUM_SCHED_NONE_PROF", "", RuntimeConfigSource::Env),
     ]);
     let mut cfg = SchedulerConfig::default();
 
@@ -354,7 +353,6 @@ fn scheduler_config_applies_runtime_snapshot() {
     assert!(cfg.prompt_token_estimate);
     assert_eq!(cfg.prefill_first_until_active, Some(4));
     assert_eq!(cfg.active_decode_prefill_chunk, Some(64));
-    assert!(cfg.scheduler_none_prof);
 }
 
 #[test]
@@ -369,6 +367,71 @@ fn scheduler_config_rejects_invalid_runtime_snapshot() {
     let err = cfg.apply_runtime_config_snapshot(&snapshot).unwrap_err();
 
     assert!(err.contains("FERRUM_ACTIVE_DECODE_PREFILL_CHUNK"));
+}
+
+#[test]
+fn retired_profiler_snapshots_reject_before_engine_or_scheduler_mutation() {
+    for key in [
+        "FERRUM_BATCH_PREFILL_PROF",
+        "FERRUM_RBD_PROF",
+        "FERRUM_UNIFIED_POST_PROF",
+        "FERRUM_NEXT_BATCH_PROF",
+        "FERRUM_SCHED_NONE_PROF",
+    ] {
+        for value in ["", "0", "1"] {
+            for source in [
+                RuntimeConfigSource::Env,
+                RuntimeConfigSource::ConfigFile,
+                RuntimeConfigSource::Cli,
+            ] {
+                let snapshot = RuntimeConfigSnapshot::from_entries([
+                    RuntimeConfigEntry::new("FERRUM_KV_CAPACITY", "1024", source),
+                    RuntimeConfigEntry::new("FERRUM_SCHED_PROMPT_TOKEN_ESTIMATE", "0", source),
+                    RuntimeConfigEntry::new(key, value, source),
+                ]);
+                let mut engine = EngineConfig::default();
+                let engine_before = serde_json::to_value(&engine).unwrap();
+                let error = engine.apply_runtime_config_snapshot(&snapshot).unwrap_err();
+                assert!(error.contains(key) && error.contains("retired"), "{error}");
+                assert_eq!(serde_json::to_value(&engine).unwrap(), engine_before);
+
+                // Library users may configure the scheduler without building
+                // an Engine. Its own entry point must reject before mutation.
+                let mut scheduler = SchedulerConfig::default();
+                let scheduler_before = serde_json::to_value(&scheduler).unwrap();
+                let error = scheduler
+                    .apply_runtime_config_snapshot(&snapshot)
+                    .unwrap_err();
+                assert!(error.contains(key) && error.contains("retired"), "{error}");
+                assert_eq!(serde_json::to_value(&scheduler).unwrap(), scheduler_before);
+            }
+        }
+    }
+}
+
+#[test]
+fn retired_profiler_fields_reject_in_typed_configuration() {
+    for field in [
+        "batch_prefill_prof",
+        "rbd_prof",
+        "unified_post_prof",
+        "next_batch_prof",
+    ] {
+        for enabled in [false, true] {
+            let mut wire = serde_json::to_value(EngineConfig::default()).unwrap();
+            wire["runtime"][field] = serde_json::json!(enabled);
+            let error = serde_json::from_value::<EngineConfig>(wire).unwrap_err();
+            assert!(error.to_string().contains("unknown field"), "{error}");
+            assert!(error.to_string().contains(field), "{error}");
+        }
+    }
+    for enabled in [false, true] {
+        let mut wire = serde_json::to_value(SchedulerConfig::default()).unwrap();
+        wire["scheduler_none_prof"] = serde_json::json!(enabled);
+        let error = serde_json::from_value::<SchedulerConfig>(wire).unwrap_err();
+        assert!(error.to_string().contains("unknown field"), "{error}");
+        assert!(error.to_string().contains("scheduler_none_prof"), "{error}");
+    }
 }
 
 #[test]

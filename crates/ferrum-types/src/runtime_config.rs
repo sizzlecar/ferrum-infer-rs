@@ -74,6 +74,11 @@ impl RuntimeConfigSnapshot {
                 | "FERRUM_BATCHED_TRACE" | "FERRUM_MOE_PROFILE" => Some(
                     "process-global backend profiling has been retired; remove this option and select an instance product profile with --profile-jsonl and --profile-detail",
                 ),
+                "FERRUM_BATCH_PREFILL_PROF" | "FERRUM_RBD_PROF"
+                | "FERRUM_UNIFIED_POST_PROF" | "FERRUM_NEXT_BATCH_PROF"
+                | "FERRUM_SCHED_NONE_PROF" => Some(
+                    "legacy executor and scheduler profiling has been retired; remove this option and select an instance product profile with --profile-jsonl and --profile-detail",
+                ),
                 _ => None,
             };
             if let Some(reason) = retired {
@@ -601,6 +606,11 @@ mod retired_profiler_tests {
             "FERRUM_UNIFIED_PROFILE",
             "FERRUM_BATCHED_TRACE",
             "FERRUM_MOE_PROFILE",
+            "FERRUM_BATCH_PREFILL_PROF",
+            "FERRUM_RBD_PROF",
+            "FERRUM_UNIFIED_POST_PROF",
+            "FERRUM_NEXT_BATCH_PROF",
+            "FERRUM_SCHED_NONE_PROF",
         ] {
             for value in ["0", "1"] {
                 let snapshot = RuntimeConfigSnapshot::from_entries(vec![RuntimeConfigEntry::new(

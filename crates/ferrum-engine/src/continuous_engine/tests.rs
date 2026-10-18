@@ -1909,11 +1909,8 @@ fn continuous_engine_runtime_config_parses_env_snapshot() {
             (CHUNKED_PREFILL_ENV, "128"),
             (KV_CAPACITY_ENV, "2048"),
             (MAX_MODEL_LEN_ENV, "4096"),
-            (NEXT_BATCH_PROF_ENV, "1"),
-            (RBD_PROF_ENV, "1"),
             ("FERRUM_PROFILE_JSONL", "/tmp/profile.jsonl"),
             ("FERRUM_SCHEDULER_TRACE_JSONL", "/tmp/scheduler-trace.jsonl"),
-            (UNIFIED_POST_PROF_ENV, "1"),
         ],
     );
 
@@ -1938,8 +1935,6 @@ fn continuous_engine_runtime_config_parses_env_snapshot() {
     );
     assert_eq!(cfg.kv_capacity, Some(2048));
     assert_eq!(cfg.max_model_len, Some(4096));
-    assert!(cfg.next_batch_prof);
-    assert!(cfg.rbd_prof);
     assert_eq!(
         cfg.profile_jsonl.as_deref(),
         Some(std::path::Path::new("/tmp/profile.jsonl"))
@@ -1948,7 +1943,6 @@ fn continuous_engine_runtime_config_parses_env_snapshot() {
         cfg.scheduler_trace_jsonl.as_deref(),
         Some(std::path::Path::new("/tmp/scheduler-trace.jsonl"))
     );
-    assert!(cfg.unified_post_prof);
 }
 
 #[test]

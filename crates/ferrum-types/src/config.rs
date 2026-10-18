@@ -720,8 +720,6 @@ pub struct RuntimeKnobs {
     pub max_model_len: Option<usize>,
     pub chunked_prefill_size: Option<usize>,
     pub batch_decode_prof: bool,
-    pub next_batch_prof: bool,
-    pub rbd_prof: bool,
     #[serde(default)]
     pub profile_jsonl: Option<PathBuf>,
     pub scheduler_trace_jsonl: Option<PathBuf>,
@@ -730,7 +728,6 @@ pub struct RuntimeKnobs {
     pub profile_detail: ObservabilityProfileDetail,
     #[serde(default)]
     pub profile_journal: crate::ObservabilityJournalConfig,
-    pub unified_post_prof: bool,
     /// Retain independent vNext sequence-state checkpoints across requests.
     #[serde(default)]
     pub prefix_state_cache_enabled: bool,
@@ -1016,9 +1013,6 @@ impl EngineConfig {
         }
         self.runtime.batch_decode_prof |=
             runtime_config_value(snapshot, "FERRUM_BATCH_DECODE_PROF").is_some();
-        self.runtime.next_batch_prof |=
-            runtime_config_value(snapshot, "FERRUM_NEXT_BATCH_PROF").is_some();
-        self.runtime.rbd_prof |= runtime_config_value(snapshot, "FERRUM_RBD_PROF").is_some();
         if let Some(value) = runtime_config_value(snapshot, "FERRUM_PROFILE_JSONL") {
             self.runtime.profile_jsonl = Some(parse_path_env_value(value)?);
         }
@@ -1048,8 +1042,6 @@ impl EngineConfig {
                     .map_err(|reason| format!("FERRUM_VNEXT_DIAGNOSTIC_FAULT: {reason}"))?,
             );
         }
-        self.runtime.unified_post_prof |=
-            runtime_config_value(snapshot, "FERRUM_UNIFIED_POST_PROF").is_some();
         if let Some(value) = runtime_config_value(snapshot, "FERRUM_PREFIX_CACHE") {
             self.runtime.prefix_state_cache_enabled = parse_bool_env_value(value)
                 .map_err(|reason| format!("FERRUM_PREFIX_CACHE: {reason}"))?;
@@ -1223,9 +1215,6 @@ pub struct SchedulerConfig {
     /// not restrict pure-prefill iterations. `None` or zero disables the limit.
     #[serde(default)]
     pub active_decode_prefill_token_budget: Option<usize>,
-    /// Emit diagnostic scheduler None/SOME decisions.
-    #[serde(default)]
-    pub scheduler_none_prof: bool,
     /// Non-reserving sequence fit gate used before prefill admission.
     #[serde(default)]
     pub sequence_fit_policy: SequenceFitPolicy,
@@ -1245,7 +1234,6 @@ impl Default for SchedulerConfig {
             prefill_step_chunk: None,
             active_decode_prefill_chunk: None,
             active_decode_prefill_token_budget: None,
-            scheduler_none_prof: false,
             sequence_fit_policy: SequenceFitPolicy::default(),
         }
     }
@@ -1260,6 +1248,9 @@ impl SchedulerConfig {
         &mut self,
         snapshot: &RuntimeConfigSnapshot,
     ) -> std::result::Result<(), String> {
+        snapshot
+            .validate_retired_options()
+            .map_err(|(key, reason)| format!("{key}: {reason}"))?;
         if let Some(value) = runtime_config_value(snapshot, "FERRUM_PREFIX_RENDEZVOUS_MAX_WAIT_MS")
         {
             self.prefix_rendezvous_max_wait_ms = Some(
@@ -1291,10 +1282,6 @@ impl SchedulerConfig {
         {
             self.active_decode_prefill_token_budget =
                 parse_optional_positive_usize("FERRUM_ACTIVE_DECODE_PREFILL_TOKEN_BUDGET", value)?;
-        }
-        if let Some(value) = runtime_config_value(snapshot, "FERRUM_SCHED_NONE_PROF") {
-            self.scheduler_none_prof = parse_presence_bool(value)
-                .map_err(|reason| format!("FERRUM_SCHED_NONE_PROF: {reason}"))?;
         }
         if let Some(value) = runtime_config_value(snapshot, "FERRUM_SEQUENCE_FIT_POLICY") {
             self.sequence_fit_policy = SequenceFitPolicy::parse_runtime_value(value)
