@@ -5,6 +5,7 @@
 
 mod event_sink;
 pub mod model_executor;
+pub mod token_execution;
 
 pub use event_sink::ProductExecutionEventSink;
 pub use ferrum_runtime::{ExecutorRequestOrigin, PlanRuntimeResourceSnapshot};

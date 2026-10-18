@@ -2797,6 +2797,52 @@ pub enum ExecutorPrefillAdmissionDecision {
 /// Core model executor trait focusing on tensor operations
 #[async_trait]
 pub trait ModelExecutor: Send + Sync {
+    /// Admit immutable token work using this executor's actual resource owner.
+    /// Deferred probes do not issue an executable incarnation.
+    fn admit_tokens(
+        &self,
+        _input: crate::token_execution::ExecutionAdmission<'_>,
+    ) -> Result<crate::token_execution::TokenAdmissionOutcome> {
+        Err(FerrumError::unsupported(
+            "executor has not implemented token admission",
+        ))
+    }
+
+    /// Execute at exact, live frontiers. A bare error is permitted only before
+    /// preparation starts. Once work may have advanced, preserve each member's
+    /// actual progress and continuation in the returned batch outcome.
+    async fn execute_tokens(
+        &self,
+        _work: &[crate::token_execution::ExecutionWork<'_>],
+    ) -> Result<crate::token_execution::ExecutionBatchOutcome> {
+        Err(FerrumError::unsupported(
+            "executor has not implemented token execution",
+        ))
+    }
+
+    /// Close an exact incarnation. Held preserves recovery independently of
+    /// the returned observer; only checked terminal ownership permits Ended.
+    async fn finish_tokens(
+        &self,
+        _sequence: &crate::token_execution::ExecutorSequence,
+        _reason: crate::token_execution::ExecutionEndReason,
+    ) -> Result<crate::token_execution::ExecutionCloseOutcome> {
+        Err(FerrumError::unsupported(
+            "executor has not implemented token closure",
+        ))
+    }
+
+    /// Request cancellation without awaiting while a scheduler lock is held.
+    /// The caller tracks a returned Held observer outside its critical section.
+    fn cancel_tokens(
+        &self,
+        _sequence: &crate::token_execution::ExecutorSequence,
+    ) -> Result<crate::token_execution::ExecutionCloseOutcome> {
+        Err(FerrumError::unsupported(
+            "executor has not implemented token cancellation",
+        ))
+    }
+
     /// Plan an optional prompt-tail checkpoint before a prefill chunk is
     /// dispatched. The boundary must lie after this chunk's start and no later
     /// than its end, leaving a legal suffix for logits. None preserves the chunk. Planning

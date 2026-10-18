@@ -349,6 +349,14 @@ impl Backend for CpuBackend {
 
     fn new_context() -> Self::Context {}
     fn sync(_ctx: &mut Self::Context) {}
+
+    fn host_execution_is_synchronous() -> bool {
+        true
+    }
+
+    fn try_sync(_ctx: &mut Self::Context) -> ferrum_types::Result<()> {
+        Ok(())
+    }
     fn activation_elem_size_bytes() -> usize {
         std::mem::size_of::<f32>()
     }

@@ -1412,6 +1412,7 @@ dependencies = [
  "ferrum-interfaces",
  "ferrum-runtime",
  "ferrum-types",
+ "futures",
  "serde",
  "serde_json",
 ]

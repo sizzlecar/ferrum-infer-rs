@@ -4262,6 +4262,66 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
     }
 
     /// Decode: process 1 token at position `pos`, return `[vocab_size]` logits.
+    pub(crate) fn execute_host_token_work(
+        &mut self,
+        cache_id: &str,
+        work: crate::common::llm::ModelTokenWork<'_>,
+    ) -> crate::common::llm::ModelTokenOutcome {
+        use crate::common::llm::{catch_host_execution, ModelTokenOutcome, ModelTokenWork};
+        if !B::host_execution_is_synchronous() {
+            return ModelTokenOutcome::NotSubmitted(ferrum_types::FerrumError::unsupported(
+                "device token execution requires retained submission-context ownership",
+            ));
+        }
+        let (position, count, tokens_valid) = match work {
+            ModelTokenWork::Prefill { tokens, position } => (
+                position,
+                tokens.len(),
+                tokens
+                    .iter()
+                    .all(|&token| (token as usize) < self.cfg.vocab_size),
+            ),
+            ModelTokenWork::Decode { token, position } => {
+                (position as usize, 1, (token as usize) < self.cfg.vocab_size)
+            }
+        };
+        if count == 0
+            || !tokens_valid
+            || position.checked_add(count).is_none_or(|end| {
+                end > self.runtime_env.kv_capacity_for_model(self.cfg.max_seq_len)
+                    || end > u32::MAX as usize
+            })
+            || self
+                .kv_caches
+                .get(cache_id)
+                .is_some_and(|layers| layers.iter().any(|cache| K::len(cache) != position))
+            || (!self.kv_caches.contains_key(cache_id) && position != 0)
+        {
+            return ModelTokenOutcome::NotSubmitted(ferrum_types::FerrumError::request_validation(
+                "token work does not match the model's live per-layer KV frontier",
+            ));
+        }
+        let result = catch_host_execution(|| match work {
+            ModelTokenWork::Prefill { tokens, .. } => self.prefill_internal(cache_id, tokens),
+            ModelTokenWork::Decode { token, position } => {
+                self.decode_internal(cache_id, token, position)
+            }
+        });
+        if result.is_err() {
+            // Host operations have finished even when a layer panics. Rebuild
+            // only scratch that the unwinding core may have taken out; never
+            // reset another sequence's KV or claim the failed range committed.
+            self.recover_host_token_scratch();
+        }
+        ModelTokenOutcome::Terminal(result)
+    }
+
+    pub(crate) fn recover_host_token_scratch(&mut self) {
+        assert!(B::host_execution_is_synchronous());
+        self.resize_scratch(self.scratch.max_tokens);
+    }
+
+    /// Decode: process 1 token at position `pos`, return `[vocab_size]` logits.
     pub fn decode_internal(&mut self, cache_id: &str, token: u32, pos: u32) -> Vec<f32> {
         self.ensure_scratch(1);
         self.ensure_kv(cache_id);
@@ -4998,6 +5058,27 @@ impl<B: MoeLlmBackend> DecoderOnlyLLM for LlamaFamilyModel<B, KvFp16> {
         &self.runtime_cfg
     }
 
+    fn supports_direct_token_execution(&self) -> bool {
+        B::host_execution_is_synchronous()
+    }
+
+    fn execute_token_work(
+        &mut self,
+        cache_id: &str,
+        work: crate::common::llm::ModelTokenWork<'_>,
+    ) -> crate::common::llm::ModelTokenOutcome {
+        self.execute_host_token_work(cache_id, work)
+    }
+
+    fn close_token_sequence(&mut self, cache_id: &str) -> Result<()> {
+        if !B::host_execution_is_synchronous() {
+            return Err(ferrum_types::FerrumError::unsupported(
+                "device token closure requires its actual submission context",
+            ));
+        }
+        crate::common::llm::catch_host_execution(|| self.release(cache_id))
+    }
+
     fn adapter_execution_support(&self) -> ferrum_interfaces::adapter::AdapterExecutionSupport {
         self.lora_execution_support()
     }
@@ -5236,6 +5317,27 @@ impl<B: MoeLlmBackend> DecoderOnlyLLM for LlamaFamilyModel<B, KvFp16> {
 impl<B: MoeLlmBackend + BackendInt8KvOps> DecoderOnlyLLM for LlamaFamilyModel<B, KvInt8> {
     fn config(&self) -> &LlmRuntimeConfig {
         &self.runtime_cfg
+    }
+
+    fn supports_direct_token_execution(&self) -> bool {
+        B::host_execution_is_synchronous()
+    }
+
+    fn execute_token_work(
+        &mut self,
+        cache_id: &str,
+        work: crate::common::llm::ModelTokenWork<'_>,
+    ) -> crate::common::llm::ModelTokenOutcome {
+        self.execute_host_token_work(cache_id, work)
+    }
+
+    fn close_token_sequence(&mut self, cache_id: &str) -> Result<()> {
+        if !B::host_execution_is_synchronous() {
+            return Err(ferrum_types::FerrumError::unsupported(
+                "device token closure requires its actual submission context",
+            ));
+        }
+        crate::common::llm::catch_host_execution(|| self.release(cache_id))
     }
 
     fn adapter_execution_support(&self) -> ferrum_interfaces::adapter::AdapterExecutionSupport {

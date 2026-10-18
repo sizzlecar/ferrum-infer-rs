@@ -1,8 +1,38 @@
 //! Publication of restored state before constructing a prefill batch.
 
 use super::{KvCacheHandle, PlanRuntimePrefillAuthority, PrefixCaptureLease};
+use crate::token_execution::{ExecutionFrontier, ExecutorSequence};
 use ferrum_types::{FerrumError, RequestId, Result, TokenId};
 use std::{fmt, sync::Arc};
+
+enum RestoreAcknowledgement {
+    Legacy(Box<dyn FnOnce() -> Result<()> + Send>),
+    Tokens {
+        sequence: ExecutorSequence,
+        acknowledge: Box<dyn FnOnce() -> Result<ExecutionFrontier> + Send>,
+    },
+}
+
+impl RestoreAcknowledgement {
+    fn acknowledge(self, restored_tokens: usize) -> Result<Option<ExecutionFrontier>> {
+        match self {
+            Self::Legacy(acknowledge) => acknowledge().map(|()| None),
+            Self::Tokens {
+                sequence,
+                acknowledge,
+            } => {
+                let frontier = acknowledge()?;
+                if frontier.sequence() != &sequence || frontier.consumed_tokens() != restored_tokens
+                {
+                    return Err(FerrumError::backend(
+                        "prefix acknowledgement returned a different incarnation or frontier",
+                    ));
+                }
+                Ok(Some(frontier))
+            }
+        }
+    }
+}
 
 /// Observation only: neither an index hit nor a completed copy authorizes use
 /// of restored state. `Restored` is emitted after publication acknowledgement.
@@ -110,7 +140,7 @@ pub enum PlanRuntimePrefixRestoreOutcome {
 pub struct PlanRuntimePrefixRestoreOutput {
     authority: PlanRuntimePrefillAuthority,
     prompt_tokens: usize,
-    acknowledge: Box<dyn FnOnce() -> Result<()> + Send>,
+    acknowledge: RestoreAcknowledgement,
 }
 
 impl PlanRuntimePrefixRestoreOutput {
@@ -131,10 +161,43 @@ impl PlanRuntimePrefixRestoreOutput {
                 kv_cache,
             },
             prompt_tokens,
-            acknowledge: Box::new(acknowledge),
+            acknowledge: RestoreAcknowledgement::Legacy(Box::new(acknowledge)),
         };
         output.validate_for(output.request_id(), prompt_tokens)?;
         Ok(output)
+    }
+
+    /// The same native publication callback returns the actual executable
+    /// frontier after acknowledgement. No lookup by request id can replace it.
+    pub fn new_tokens(
+        request_id: RequestId,
+        restored_tokens: usize,
+        prompt_tokens: usize,
+        kv_cache: Arc<dyn KvCacheHandle>,
+        sequence: ExecutorSequence,
+        acknowledge: impl FnOnce() -> Result<ExecutionFrontier> + Send + 'static,
+    ) -> Result<Self> {
+        let output = Self {
+            authority: PlanRuntimePrefillAuthority {
+                request_id,
+                committed_tokens: restored_tokens,
+                kv_cache,
+            },
+            prompt_tokens,
+            acknowledge: RestoreAcknowledgement::Tokens {
+                sequence,
+                acknowledge: Box::new(acknowledge),
+            },
+        };
+        output.validate_for(output.request_id(), prompt_tokens)?;
+        Ok(output)
+    }
+
+    pub fn token_sequence(&self) -> Option<&ExecutorSequence> {
+        match &self.acknowledge {
+            RestoreAcknowledgement::Legacy(_) => None,
+            RestoreAcknowledgement::Tokens { sequence, .. } => Some(sequence),
+        }
     }
 
     pub fn request_id(&self) -> &RequestId {
@@ -178,8 +241,29 @@ impl PlanRuntimePrefixRestoreOutput {
             acknowledge,
             ..
         } = self;
-        acknowledge()?;
+        acknowledge.acknowledge(authority.committed_tokens())?;
         Ok(authority)
+    }
+
+    /// Opens the original publication gate and returns its actual frontier.
+    /// Legacy-only callbacks are rejected without invoking acknowledgement.
+    /// An error requires closing the exact target, never replaying from zero.
+    pub fn acknowledge_tokens(self) -> Result<ExecutionFrontier> {
+        let Self {
+            authority,
+            acknowledge,
+            ..
+        } = self;
+        if matches!(&acknowledge, RestoreAcknowledgement::Legacy(_)) {
+            return Err(FerrumError::unsupported(
+                "prefix restore implementation has no token frontier publication",
+            ));
+        }
+        acknowledge
+            .acknowledge(authority.committed_tokens())?
+            .ok_or_else(|| {
+                FerrumError::internal("token prefix acknowledgement omitted its frontier")
+            })
     }
 }
 
