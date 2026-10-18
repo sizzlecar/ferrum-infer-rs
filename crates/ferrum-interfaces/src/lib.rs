@@ -12,6 +12,7 @@
 #[cfg(test)]
 extern crate self as ferrum_interfaces;
 
+pub mod adapter;
 pub mod engine;
 pub mod kv_cache;
 pub mod kv_dtype;

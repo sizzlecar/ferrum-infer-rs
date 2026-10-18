@@ -89,10 +89,12 @@ async fn thinking_metadata_uses_effective_default_for_loaded_aliases_and_adapter
         )
         .unwrap();
         let entries = model_entries(
-            AxumServer::from_llm(Arc::new(StubLlm::new("ok")))
-                .with_served_model_registry(registry)
-                .with_prompt_template(Some(toggle_template()))
-                .with_default_enable_thinking(override_enabled),
+            AxumServer::from_llm(Arc::new(
+                StubLlm::new("ok").with_adapter_support(AdapterExecutionSupport::PerSequenceLora),
+            ))
+            .with_served_model_registry(registry)
+            .with_prompt_template(Some(toggle_template()))
+            .with_default_enable_thinking(override_enabled),
         )
         .await;
         assert_eq!(entries.len(), 3);

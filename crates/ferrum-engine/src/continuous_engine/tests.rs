@@ -27,6 +27,9 @@ use ferrum_models::{DecoderOnlyLLM, LlmExecutor, LlmRuntimeConfig};
 use ferrum_testkit::{MockKvCacheManager, MockModelExecutor, MockTensor, MockTensorFactory};
 use std::time::Duration;
 
+#[path = "adapter_admission_tests.rs"]
+mod adapter_admission_tests;
+
 #[path = "stop_boundary_tests.rs"]
 mod stop_boundary_tests;
 

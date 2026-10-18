@@ -3307,6 +3307,10 @@ pub trait ModelExecutor: Send + Sync {
     /// batch; the serial fallback runs each in ~47 ms while a true batched
     /// path runs all 32 in ~100 ms).
     async fn batch_prefill(&self, inputs: &[PrefillInput]) -> Result<Vec<PrefillOutput>> {
+        let support = self.adapter_execution_support();
+        for input in inputs {
+            support.validate_metadata(&input.metadata)?;
+        }
         let mut outputs = Vec::with_capacity(inputs.len());
         for input in inputs {
             outputs.push(self.prefill(input).await?);
@@ -3390,6 +3394,10 @@ pub trait ModelExecutor: Send + Sync {
     /// Executors with a typed batch submission path should override this so one
     /// call maps to one resource step and one terminal submission fence.
     async fn batch_decode(&self, inputs: &[DecodeInput]) -> Result<Vec<DecodeOutput>> {
+        let support = self.adapter_execution_support();
+        for input in inputs {
+            support.validate_metadata(&input.metadata)?;
+        }
         let mut outputs = Vec::with_capacity(inputs.len());
         for input in inputs {
             outputs.push(self.decode(input).await?);
@@ -3484,6 +3492,10 @@ pub trait ModelExecutor: Send + Sync {
     /// Returns a `Vec<DecodeOutput>` of length `inputs.len()` with the
     /// final KV handle attached to the last element.
     async fn forward_verify(&self, inputs: &[DecodeInput]) -> Result<Vec<DecodeOutput>> {
+        let support = self.adapter_execution_support();
+        for input in inputs {
+            support.validate_metadata(&input.metadata)?;
+        }
         let mut out = Vec::with_capacity(inputs.len());
         for input in inputs {
             out.push(self.decode(input).await?);
@@ -3493,6 +3505,12 @@ pub trait ModelExecutor: Send + Sync {
 
     /// Get executor capabilities
     fn capabilities(&self) -> ExecutorCapabilities;
+
+    /// Actual adapter execution, independently of model architecture and resource
+    /// authority. Overrides must apply the adapter and isolate sequence state.
+    fn adapter_execution_support(&self) -> crate::adapter::AdapterExecutionSupport {
+        crate::adapter::AdapterExecutionSupport::Unsupported
+    }
 
     /// Get current executor status
     fn status(&self) -> ExecutorStatus;

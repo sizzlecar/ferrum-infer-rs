@@ -14,6 +14,7 @@ use ferrum_bench_core::{
     global_profile, profile_fields_from_json, JsonlJournal, JsonlJournalError,
 };
 use ferrum_interfaces::{
+    adapter::AdapterExecutionSupport,
     engine::{InferenceEngine, LlmInferenceEngine},
     kv_cache::AllocationRequest,
     model_executor::{
@@ -2990,6 +2991,10 @@ impl ContinuousBatchEngine {
 
 #[async_trait]
 impl LlmInferenceEngine for ContinuousBatchEngine {
+    fn adapter_execution_support(&self) -> AdapterExecutionSupport {
+        self.inner.model_executor.adapter_execution_support()
+    }
+
     fn execution_resource_authority(&self) -> ExecutionResourceAuthority {
         self.inner.resource_composition.authority()
     }
@@ -3003,6 +3008,8 @@ impl LlmInferenceEngine for ContinuousBatchEngine {
     }
 
     async fn infer(&self, mut request: InferenceRequest) -> Result<InferenceResponse> {
+        self.adapter_execution_support()
+            .validate_metadata(&request.metadata)?;
         let request_id = request.id.clone();
         let infer_start = Instant::now();
         counter!("ferrum.engine.requests_total").increment(1);
@@ -3124,6 +3131,8 @@ impl LlmInferenceEngine for ContinuousBatchEngine {
         &self,
         mut request: InferenceRequest,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamChunk>> + Send>>> {
+        self.adapter_execution_support()
+            .validate_metadata(&request.metadata)?;
         let (tx, rx) = mpsc::channel(100);
         let receiver_drop_wake = ClientReceiverDropWake::new(Arc::clone(&self.inner.work_notify));
         let request_id = request.id.clone();

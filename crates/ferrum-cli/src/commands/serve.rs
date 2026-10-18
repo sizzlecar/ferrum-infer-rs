@@ -1136,6 +1136,14 @@ async fn execute_with_compatibility(
                 }
                 (None, None) => ferrum_engine::create_default_engine(engine_config).await?,
             });
+        if served_model_registry.adapter_count() > 0 {
+            if let Err(error) = engine.adapter_execution_support().require_lora() {
+                if let Err(shutdown_error) = engine.shutdown().await {
+                    tracing::warn!(%shutdown_error, "engine cleanup after unsupported LoRA startup failed");
+                }
+                return Err(error);
+            }
+        }
         crate::startup::apply_engine_plan(&mut startup_auto_config, engine.config());
         resolved_execution_metrics = engine.cache_metrics_snapshot();
         if product_memory_enabled {

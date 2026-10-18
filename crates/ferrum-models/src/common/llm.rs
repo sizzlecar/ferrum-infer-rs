@@ -46,6 +46,11 @@ pub trait DecoderOnlyLLM: Send + Sync {
     /// Runtime-facing configuration.
     fn config(&self) -> &LlmRuntimeConfig;
 
+    /// Adapter execution implemented by this configured model instance.
+    fn adapter_execution_support(&self) -> ferrum_interfaces::adapter::AdapterExecutionSupport {
+        ferrum_interfaces::adapter::AdapterExecutionSupport::Unsupported
+    }
+
     /// Optional model-level cache metrics.
     ///
     /// Models with real paged-KV prefix reuse override this so the executor

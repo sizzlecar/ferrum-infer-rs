@@ -35,6 +35,14 @@ is omitted; it is not inferred from the model name or nominal weights context
 window. This discovery field affects `serve`;
 `run` continues to use the same existing engine admission boundary.
 
+LoRA aliases require an execution implementation that applies adapters per
+sequence. Single-device LlamaFamily supports this with prefix reuse disabled;
+its token-only prefix cache does not distinguish adapters. Typed plan execution
+and layer-split execution currently reject adapter registration and requests.
+Unsupported or malformed adapter selections never fall back to
+base-model inference. Custom Rust engines/executors must explicitly declare
+adapter execution support; exposing alias metadata alone is insufficient.
+
 ## Chat Fields
 
 | Field | Status | Behavior |

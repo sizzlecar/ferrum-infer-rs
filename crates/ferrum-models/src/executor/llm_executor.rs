@@ -17,6 +17,7 @@ use parking_lot::{Mutex, MutexGuard};
 use tracing::debug;
 
 use ferrum_interfaces::{
+    adapter::AdapterExecutionSupport,
     model_executor::{
         AttentionType, DecodeInput, DecodeOutput, ExecutorCapabilities, ExecutorStatus,
         KvSlotCapacitySnapshot, KvSlotRequest, KvSlotReservation, LogitsReturnPolicy,
@@ -82,24 +83,15 @@ fn llm_executor_runtime_env() -> &'static LlmExecutorRuntimeEnv {
 }
 
 fn active_lora_from_metadata(
+    support: AdapterExecutionSupport,
     metadata: &std::collections::HashMap<String, serde_json::Value>,
 ) -> Result<Option<ActiveLoraAdapter>> {
-    let name = metadata
-        .get("ferrum_lora_adapter")
-        .and_then(|value| value.as_str());
-    let path = metadata
-        .get("ferrum_lora_path")
-        .and_then(|value| value.as_str());
-    match (name, path) {
-        (Some(name), Some(path)) => Ok(Some(ActiveLoraAdapter {
-            name: name.to_string(),
-            path: std::path::PathBuf::from(path),
-        })),
-        (None, None) => Ok(None),
-        _ => Err(FerrumError::model(
-            "incomplete LoRA metadata: expected ferrum_lora_adapter and ferrum_lora_path",
-        )),
-    }
+    Ok(support
+        .validate_metadata(metadata)?
+        .map(|selection| ActiveLoraAdapter {
+            name: selection.name.to_owned(),
+            path: selection.path.into(),
+        }))
 }
 
 fn metadata_requires_full_logits(
@@ -190,6 +182,7 @@ fn ferrum_device_to_candle(d: &ferrum_types::Device) -> ferrum_types::Result<can
 
 pub struct LlmExecutor {
     model: Mutex<Box<dyn DecoderOnlyLLM>>,
+    adapter_support: AdapterExecutionSupport,
     info: ModelInfo,
     vnext_model: Option<Arc<crate::vnext::PreparedProductionModel>>,
     next_cache_id: AtomicU64,
@@ -215,8 +208,10 @@ impl LlmExecutor {
         info: ModelInfo,
         vnext_model: Option<Arc<crate::vnext::PreparedProductionModel>>,
     ) -> Self {
+        let adapter_support = model.adapter_execution_support();
         Self {
             model: Mutex::new(model),
+            adapter_support,
             info,
             vnext_model,
             next_cache_id: AtomicU64::new(0),
@@ -298,6 +293,10 @@ impl ModelExecutor for LlmExecutor {
         &self.info
     }
 
+    fn adapter_execution_support(&self) -> AdapterExecutionSupport {
+        self.adapter_support
+    }
+
     fn supports_native_unified_decode(&self) -> bool {
         // CUDA has a native unified mixed prefill+decode forward; CPU and Metal
         // use the legacy split path. The device→capability mapping lives here
@@ -332,6 +331,7 @@ impl ModelExecutor for LlmExecutor {
     }
 
     async fn prefill(&self, input: &PrefillInput) -> Result<PrefillOutput> {
+        let adapter = active_lora_from_metadata(self.adapter_support, &input.metadata)?;
         let tokens = common::tensor_to_tokens(&input.input_ids)?;
 
         // Reuse an existing cache_id when the caller supplies a KV handle
@@ -366,10 +366,7 @@ impl ModelExecutor for LlmExecutor {
         let force_full_logits = metadata_requires_full_logits(&input.metadata);
         let logits = {
             let mut model = self.lock_model();
-            model.set_lora_adapter_for_cache(
-                &cache_id,
-                active_lora_from_metadata(&input.metadata)?,
-            )?;
+            model.set_lora_adapter_for_cache(&cache_id, adapter)?;
             if let Some(capacity_hint) = metadata_kv_capacity_hint(&input.metadata) {
                 model.prepare_kv_capacity(&cache_id, capacity_hint);
             }
@@ -442,6 +439,9 @@ impl ModelExecutor for LlmExecutor {
         if inputs.is_empty() {
             return Ok(Vec::new());
         }
+        for input in inputs {
+            self.adapter_support.validate_metadata(&input.metadata)?;
+        }
         let force_full_logits = inputs
             .iter()
             .any(|input| metadata_requires_full_logits(&input.metadata));
@@ -475,7 +475,10 @@ impl ModelExecutor for LlmExecutor {
             cache_ids.push(cache_id);
             prior_seq_lens.push(prior_seq_len);
             tokens_per_input.push(tokens);
-            lora_per_input.push(active_lora_from_metadata(&input.metadata)?);
+            lora_per_input.push(active_lora_from_metadata(
+                self.adapter_support,
+                &input.metadata,
+            )?);
         }
 
         // Build unified items and ONE `unified_forward` call. If the model
@@ -614,6 +617,21 @@ impl ModelExecutor for LlmExecutor {
             return Ok(Vec::new());
         }
 
+        let selection = self
+            .adapter_support
+            .validate_metadata(&inputs[0].metadata)?;
+        for input in &inputs[1..] {
+            if self.adapter_support.validate_metadata(&input.metadata)? != selection {
+                return Err(FerrumError::request_validation(
+                    "forward_verify requires the same adapter selection for every position",
+                ));
+            }
+        }
+        let adapter = selection.map(|selection| ActiveLoraAdapter {
+            name: selection.name.to_owned(),
+            path: selection.path.into(),
+        });
+
         // All inputs must share the same KV handle (speculative decoding
         // contract). Extract cache_id + starting seq_len once.
         let first_handle = inputs[0].kv_cache.clone();
@@ -643,10 +661,7 @@ impl ModelExecutor for LlmExecutor {
         // One model forward for all N+1 positions → flat seq_len*vocab.
         let flat = {
             let mut model = self.lock_model();
-            model.set_lora_adapter_for_cache(
-                &cache_id,
-                active_lora_from_metadata(&inputs[0].metadata)?,
-            )?;
+            model.set_lora_adapter_for_cache(&cache_id, adapter)?;
             model.forward_verify(&cache_id, &token_ids)
         };
 
@@ -687,6 +702,7 @@ impl ModelExecutor for LlmExecutor {
     }
 
     async fn decode(&self, input: &DecodeInput) -> Result<DecodeOutput> {
+        let adapter = active_lora_from_metadata(self.adapter_support, &input.metadata)?;
         let input_handle = input
             .kv_cache
             .as_any()
@@ -712,10 +728,7 @@ impl ModelExecutor for LlmExecutor {
         let force_full_logits = metadata_requires_full_logits(&input.metadata);
         let logits = {
             let mut model = self.lock_model();
-            model.set_lora_adapter_for_cache(
-                &cache_id,
-                active_lora_from_metadata(&input.metadata)?,
-            )?;
+            model.set_lora_adapter_for_cache(&cache_id, adapter)?;
             model.reserve_kv_slots(&[KvSlotRequest {
                 cache_id: cache_id.clone(),
                 target_len: seq_len.saturating_add(1),
@@ -752,6 +765,9 @@ impl ModelExecutor for LlmExecutor {
         if inputs.is_empty() {
             return Ok(Vec::new());
         }
+        for input in inputs {
+            self.adapter_support.validate_metadata(&input.metadata)?;
+        }
         let prof = llm_executor_runtime_env().batch_decode_prof;
         let t0 = if prof {
             Some(std::time::Instant::now())
@@ -786,7 +802,7 @@ impl ModelExecutor for LlmExecutor {
                 cache_id: input_handle.request_cache_id().to_string(),
                 token: tokens[0],
                 seq_len,
-                lora: active_lora_from_metadata(&input.metadata)?,
+                lora: active_lora_from_metadata(self.adapter_support, &input.metadata)?,
                 requires_full_logits: metadata_requires_full_logits(&input.metadata),
                 logits_policy: input.logits_policy.clone(),
                 handle: Arc::new(input_handle.with_sequence_length((seq_len + 1) as usize)),
@@ -932,6 +948,11 @@ impl ModelExecutor for LlmExecutor {
         if batch.items.is_empty() {
             return Ok(results);
         }
+        // Validate the complete batch before binding adapters, preparing KV,
+        // or advancing any participant in either execution path.
+        for item in &batch.items {
+            self.adapter_support.validate_metadata(&item.metadata)?;
+        }
         let env = llm_executor_runtime_env();
         let prof = env.batch_prefill_prof || env.batch_decode_prof;
         let prof_t0 = prof.then(std::time::Instant::now);
@@ -978,7 +999,7 @@ impl ModelExecutor for LlmExecutor {
                 for item in &batch.items {
                     model.set_lora_adapter_for_cache(
                         &item.seq_id,
-                        active_lora_from_metadata(&item.metadata)?,
+                        active_lora_from_metadata(self.adapter_support, &item.metadata)?,
                     )?;
                     if item.pos_offset == 0 {
                         if let Some(capacity_hint) = metadata_kv_capacity_hint(&item.metadata) {
@@ -1067,7 +1088,7 @@ impl ModelExecutor for LlmExecutor {
                 let item = &batch.items[i];
                 model.set_lora_adapter_for_cache(
                     &item.seq_id,
-                    active_lora_from_metadata(&item.metadata)?,
+                    active_lora_from_metadata(self.adapter_support, &item.metadata)?,
                 )?;
                 if item.pos_offset == 0 {
                     if let Some(capacity_hint) = metadata_kv_capacity_hint(&item.metadata) {
@@ -1096,7 +1117,7 @@ impl ModelExecutor for LlmExecutor {
                     let item = &batch.items[i];
                     model.set_lora_adapter_for_cache(
                         &item.seq_id,
-                        active_lora_from_metadata(&item.metadata)?,
+                        active_lora_from_metadata(self.adapter_support, &item.metadata)?,
                     )?;
                 }
                 let policies: Vec<_> = decode_indices
@@ -1185,6 +1206,67 @@ mod tests {
     use ferrum_interfaces::KvCacheHandle;
     use ferrum_testkit::MockTensor;
     use ferrum_types::{Device, ModelId, ModelType};
+
+    #[cfg(feature = "test-support")]
+    #[tokio::test]
+    async fn lora_prefix_cache_instance_rejects_before_binding_or_prefill() {
+        use crate::test_support::{tiny_llama_model, tiny_model_info, TinyLlamaConfig};
+
+        let cfg = TinyLlamaConfig::default();
+        let mut model = tiny_llama_model(&cfg);
+        assert_eq!(
+            model.adapter_execution_support(),
+            AdapterExecutionSupport::PerSequenceLora
+        );
+        model.runtime_env.prefix_cache = true;
+        assert_eq!(
+            model.adapter_execution_support(),
+            AdapterExecutionSupport::Unsupported
+        );
+        let error = model
+            .set_lora_adapter_for_cache(
+                "adapter-cache",
+                Some(ActiveLoraAdapter {
+                    name: "adapter".into(),
+                    path: "unused-adapter-path".into(),
+                }),
+            )
+            .unwrap_err();
+        assert!(matches!(error, FerrumError::Unsupported { .. }));
+        assert!(model.kv_caches.is_empty());
+
+        let executor = LlmExecutor::new(Box::new(model), tiny_model_info(&cfg));
+        assert_eq!(
+            executor.adapter_execution_support(),
+            AdapterExecutionSupport::Unsupported
+        );
+        let input = PrefillInput::new(common::wrap_tensor(
+            common::tokens_to_tensor(&[0, 1], &candle_core::Device::Cpu).unwrap(),
+        ));
+        let selected = input.clone().with_metadata(HashMap::from([
+            ("ferrum_lora_adapter".into(), serde_json::json!("adapter")),
+            (
+                "ferrum_lora_path".into(),
+                serde_json::json!("unused-adapter-path"),
+            ),
+        ]));
+        assert!(matches!(
+            executor.prefill(&selected).await,
+            Err(FerrumError::Unsupported { .. })
+        ));
+        assert_eq!(executor.next_cache_id.load(Ordering::Relaxed), 0);
+        let metrics = executor.lora_metrics_snapshot().unwrap();
+        assert_eq!(metrics["active_cache_bindings"].as_u64().unwrap(), 0);
+        assert_eq!(metrics["adapter_count"].as_u64().unwrap(), 0);
+        // Rejecting adapters does not disable the explicitly requested prefix
+        // mode, nor does it reject ordinary base inference.
+        assert_eq!(
+            executor.lock_model().cache_metrics_snapshot().unwrap()["enabled"],
+            true
+        );
+        let base = executor.prefill(&input).await.unwrap();
+        executor.release_cache(&base.kv_cache.cache_id());
+    }
 
     #[derive(Default)]
     struct RecordingCalls {

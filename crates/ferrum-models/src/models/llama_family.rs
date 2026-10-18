@@ -2762,7 +2762,23 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         Ok(())
     }
 
+    fn lora_execution_support(&self) -> ferrum_interfaces::adapter::AdapterExecutionSupport {
+        // Prefix hashes currently contain token identity only. They cannot
+        // distinguish adapter-generated KV from base KV, so do not advertise
+        // per-sequence isolation when this instance enables prefix reuse.
+        if self.runtime_env.prefix_cache {
+            ferrum_interfaces::adapter::AdapterExecutionSupport::Unsupported
+        } else {
+            ferrum_interfaces::adapter::AdapterExecutionSupport::PerSequenceLora
+        }
+    }
+
     fn ensure_lora_adapter_loaded(&mut self, adapter: ActiveLoraAdapter) -> Result<()> {
+        if self.runtime_env.prefix_cache {
+            return Err(ferrum_types::FerrumError::unsupported(
+                "LoRA inference cannot use the token-only Llama-family prefix cache",
+            ));
+        }
         if self.lora_adapters.contains_key(&adapter.name) {
             return Ok(());
         }
@@ -4971,6 +4987,10 @@ impl<B: MoeLlmBackend> DecoderOnlyLLM for LlamaFamilyModel<B, KvFp16> {
         &self.runtime_cfg
     }
 
+    fn adapter_execution_support(&self) -> ferrum_interfaces::adapter::AdapterExecutionSupport {
+        self.lora_execution_support()
+    }
+
     fn cache_metrics_snapshot(&self) -> Option<serde_json::Value> {
         Some(self.prefix_cache_snapshot_json())
     }
@@ -5201,6 +5221,10 @@ impl<B: MoeLlmBackend> DecoderOnlyLLM for LlamaFamilyModel<B, KvFp16> {
 impl<B: MoeLlmBackend + BackendInt8KvOps> DecoderOnlyLLM for LlamaFamilyModel<B, KvInt8> {
     fn config(&self) -> &LlmRuntimeConfig {
         &self.runtime_cfg
+    }
+
+    fn adapter_execution_support(&self) -> ferrum_interfaces::adapter::AdapterExecutionSupport {
+        self.lora_execution_support()
     }
 
     fn cache_metrics_snapshot(&self) -> Option<serde_json::Value> {
