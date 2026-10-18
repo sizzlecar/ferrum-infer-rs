@@ -2,9 +2,7 @@
 //! observations. No model forward or GPU numerical qualification is claimed.
 
 use super::*;
-use ferrum_execution::model_executor::{
-    DecodeInput, DecodeOutput, ExecutorCapabilities, ExecutorStatus, PrefillInput, PrefillOutput,
-};
+use ferrum_execution::model_executor::{ExecutorCapabilities, ExecutorStatus};
 use ferrum_execution::token_execution::{
     ExecutedTokenWork, ExecutionCompletion, ExecutionProduct, ExecutionProgress,
     ExecutorSequenceIssuer, LastKnownExecutionStage, NoSubmissionStage,
@@ -42,12 +40,6 @@ impl ModelExecutor for ProtocolExecutor {
     }
     fn status(&self) -> ExecutorStatus {
         self.metadata.status()
-    }
-    async fn prefill(&self, _: &PrefillInput) -> Result<PrefillOutput> {
-        panic!("protocol test does not execute a model")
-    }
-    async fn decode(&self, _: &DecodeInput) -> Result<DecodeOutput> {
-        panic!("protocol test does not execute a model")
     }
     async fn finish_tokens(
         &self,

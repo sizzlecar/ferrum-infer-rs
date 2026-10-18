@@ -4,12 +4,11 @@ use async_trait::async_trait;
 use ferrum_execution::{model_executor::ExecutorSamplingOutput, token_execution::*};
 use ferrum_execution::{
     model_executor::{
-        AttentionType, DecodeInput, DecodeOutput, ExecutorCapabilities, ExecutorMemoryUsage,
-        ExecutorState, ExecutorStatus, MemoryRequirements, PrefillInput, PrefillOutput,
+        AttentionType, ExecutorCapabilities, ExecutorMemoryUsage, ExecutorState, ExecutorStatus,
+        MemoryRequirements,
     },
     ModelExecutor,
 };
-use ferrum_interfaces::{BlockTable, KvCacheHandle, TensorFactory};
 use ferrum_types::{DataType, Device, ModelInfo, ModelType, Result};
 use ferrum_types::{FerrumError, RequestId};
 use parking_lot::Mutex;
@@ -30,17 +29,12 @@ struct StubSequence {
 /// Returns dummy outputs to allow pipeline testing without real models.
 pub struct StubModelExecutor {
     info: ModelInfo,
-    tensor_factory: Arc<dyn TensorFactory>,
     issuer: ExecutorSequenceIssuer,
     sequences: Mutex<HashMap<ExecutorSequence, StubSequence>>,
 }
 
 impl StubModelExecutor {
-    pub fn new(
-        model_id: impl Into<ferrum_types::ModelId>,
-        vocab_size: usize,
-        tensor_factory: Arc<dyn TensorFactory>,
-    ) -> Self {
+    pub fn new(model_id: impl Into<ferrum_types::ModelId>, vocab_size: usize) -> Self {
         let info = ModelInfo {
             model_id: model_id.into(),
             model_type: ModelType::Custom("stub".into()),
@@ -62,7 +56,6 @@ impl StubModelExecutor {
 
         Self {
             info,
-            tensor_factory,
             issuer: ExecutorSequenceIssuer::new(),
             sequences: Mutex::new(HashMap::new()),
         }
@@ -224,45 +217,6 @@ impl ModelExecutor for StubModelExecutor {
         &self.info
     }
 
-    async fn prefill(&self, input: &PrefillInput) -> Result<PrefillOutput> {
-        let batch_size = input.batch_size();
-        let seq_len = input.sequence_length();
-        let vocab_size = self.info.vocab_size;
-
-        debug!("Stub prefill: batch={}, seq_len={}", batch_size, seq_len);
-
-        // Create dummy logits
-        let logits = self.tensor_factory.zeros(
-            &[batch_size, seq_len, vocab_size],
-            DataType::FP32,
-            &self.info.device,
-        )?;
-
-        // Create stub KV cache
-        let kv_cache = create_stub_kv_cache(
-            ferrum_types::RequestId::new(),
-            self.info.num_layers,
-            seq_len,
-        );
-
-        Ok(PrefillOutput::new(logits, kv_cache))
-    }
-
-    async fn decode(&self, input: &DecodeInput) -> Result<DecodeOutput> {
-        let batch_size = input.batch_size();
-        let vocab_size = self.info.vocab_size;
-
-        debug!("Stub decode: batch={}", batch_size);
-
-        let logits = self.tensor_factory.zeros(
-            &[batch_size, vocab_size],
-            DataType::FP32,
-            &self.info.device,
-        )?;
-
-        Ok(DecodeOutput::new(logits, input.kv_cache.clone()))
-    }
-
     fn capabilities(&self) -> ExecutorCapabilities {
         ExecutorCapabilities {
             max_batch_size: 32,
@@ -305,89 +259,6 @@ impl ModelExecutor for StubModelExecutor {
     }
 }
 
-/// Create stub KV cache handle
-fn create_stub_kv_cache(
-    request_id: ferrum_types::RequestId,
-    num_layers: usize,
-    seq_len: usize,
-) -> Arc<dyn KvCacheHandle> {
-    #[derive(Debug)]
-    struct StubKvCache {
-        request_id: ferrum_types::RequestId,
-        block_table: BlockTable,
-        num_layers: usize,
-    }
-
-    impl KvCacheHandle for StubKvCache {
-        fn block_table(&self) -> &BlockTable {
-            &self.block_table
-        }
-
-        fn block_table_mut(&mut self) -> &mut BlockTable {
-            &mut self.block_table
-        }
-
-        fn as_any(&self) -> &dyn std::any::Any {
-            self
-        }
-
-        fn device(&self) -> Device {
-            Device::CPU
-        }
-
-        fn num_layers(&self) -> usize {
-            self.num_layers
-        }
-
-        fn num_heads(&self) -> usize {
-            12
-        }
-
-        fn head_dim(&self) -> usize {
-            64
-        }
-
-        fn key_cache(&self, _layer: usize) -> Result<Option<ferrum_interfaces::TensorRef>> {
-            Ok(None)
-        }
-
-        fn value_cache(&self, _layer: usize) -> Result<Option<ferrum_interfaces::TensorRef>> {
-            Ok(None)
-        }
-
-        fn clone_handle(&self) -> Result<Arc<dyn KvCacheHandle>> {
-            Err(ferrum_types::FerrumError::unsupported("Stub cache clone"))
-        }
-
-        fn stats(&self) -> ferrum_interfaces::kv_cache::CacheHandleStats {
-            ferrum_interfaces::kv_cache::CacheHandleStats {
-                memory_bytes: 1024,
-                blocks_allocated: 1,
-                tokens_stored: self.block_table.sequence_length,
-                utilization: 0.5,
-                last_access: std::time::Instant::now(),
-            }
-        }
-
-        fn is_valid(&self) -> bool {
-            true
-        }
-
-        fn cache_id(&self) -> String {
-            format!("stub_{}", self.request_id.to_string())
-        }
-    }
-
-    let mut block_table = BlockTable::new(16);
-    block_table.sequence_length = seq_len;
-
-    Arc::new(StubKvCache {
-        request_id,
-        block_table,
-        num_layers,
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -406,8 +277,7 @@ mod tests {
 
     #[tokio::test]
     async fn stub_tokens_chunk_then_decode_and_replacement_use_exact_incarnations() {
-        let executor =
-            StubModelExecutor::new("stub", 16, Arc::new(ferrum_testkit::MockTensorFactory));
+        let executor = StubModelExecutor::new("stub", 16);
         let request = RequestId::new();
         let prompt = [TokenId::new(1), TokenId::new(2)];
         let admission = || ExecutionAdmission {

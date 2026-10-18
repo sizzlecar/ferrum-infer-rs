@@ -784,18 +784,9 @@ impl ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>> for StubExecutorFact
             config.engine_config.model.model_id
         );
 
-        // The stub executor only needs a `TensorFactory` to mint dummy
-        // logits — no real backend dispatch involved. Wire the candle
-        // tensor factory directly without the legacy `ComputeBackend`
-        // wrapper.
-        let tensor_factory: Arc<dyn ferrum_interfaces::TensorFactory> = Arc::new(
-            crate::tensor_factory::candle::CandleTensorFactory::new(config.device.clone()),
-        );
-
         let executor = ferrum_models::StubModelExecutor::new(
             config.engine_config.model.model_id.clone(),
             vocab_size,
-            tensor_factory,
         );
 
         Ok(Arc::new(executor))

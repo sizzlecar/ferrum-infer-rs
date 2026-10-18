@@ -164,12 +164,6 @@ impl ModelExecutor for TokenCapacityExecutor {
     fn cancel_tokens(&self, sequence: &ExecutorSequence) -> Result<ExecutionCloseOutcome> {
         self.close(sequence)
     }
-    async fn prefill(&self, _: &PrefillInput) -> Result<PrefillOutput> {
-        panic!("capacity test must use the common token protocol")
-    }
-    async fn decode(&self, _: &DecodeInput) -> Result<DecodeOutput> {
-        panic!("capacity test must use the common token protocol")
-    }
 }
 
 fn fixture(

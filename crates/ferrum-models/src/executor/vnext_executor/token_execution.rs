@@ -218,7 +218,10 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         }
     }
 
-    fn sequence_for_token(&self, identity: &ExecutorSequence) -> Result<Arc<VNextSequence<R>>> {
+    pub(super) fn sequence_for_token(
+        &self,
+        identity: &ExecutorSequence,
+    ) -> Result<Arc<VNextSequence<R>>> {
         self.token_issuer.frontier(identity, 0)?;
         self.sequences
             .lock()
@@ -724,7 +727,9 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 {
                     Ok(VNextExecutionCapacityDecision::Ready(())) => {}
                     Ok(VNextExecutionCapacityDecision::Deferred(value)) => {
-                        if actual.len() == 1 {
+                        if actual.len() == 1
+                            && sequence.request_origin != ExecutorRequestOrigin::Startup
+                        {
                             if let ExecutedTokenWork::Prefill {
                                 chunk,
                                 capacity_probe_count,
@@ -804,8 +809,11 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             match decision {
                 Ok(VNextExecutionCapacityDecision::Ready(retired)) => break retired,
                 Ok(VNextExecutionCapacityDecision::Deferred(deferred)) => {
-                    // Reuse the existing legal adaptive single-prefill narrowing.
-                    if actual.len() == 1 {
+                    // Product work may narrow; startup capture must retain its
+                    // exact fingerprinted range, including prerequisite chunks.
+                    if actual.len() == 1
+                        && sequences[0].request_origin != ExecutorRequestOrigin::Startup
+                    {
                         if let ExecutedTokenWork::Prefill {
                             chunk,
                             capacity_probe_count,

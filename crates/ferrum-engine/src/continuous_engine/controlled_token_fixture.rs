@@ -1,9 +1,9 @@
-//! Common-protocol plumbing for controlled scheduler fixtures only. The fake
-//! operations below are host-only and have no in-flight device work. Genuine
-//! allocator, model and device lifecycle evidence lives in the real-model tests.
+//! Controlled host-only protocol fixtures. Hooks describe fake work and faults;
+//! the sole identity/frontier table below is test plumbing, not a second driver.
 use super::*;
-use ferrum_execution::model_executor::{PlanRuntimeMixedBatchOutcome, PlanRuntimePrefillProduct};
 use ferrum_execution::token_execution::*;
+#[path = "controlled_token_fixture/hooks.rs"]
+mod hooks;
 
 #[derive(Clone)]
 struct Entry {
@@ -11,7 +11,6 @@ struct Entry {
     prompt: Arc<[TokenId]>,
     maximum_tokens: usize,
     frontier: ExecutionFrontier,
-    cache: Option<Arc<dyn KvCacheHandle>>,
 }
 
 #[derive(Default)]
@@ -29,7 +28,6 @@ impl ControlledTokenState {
             .map(|entry| entry.frontier.clone())
     }
 
-    /// Called only by a fixture's successful prefix-publication callback.
     pub(super) fn restore_frontier(
         &self,
         sequence: &ExecutorSequence,
@@ -44,13 +42,67 @@ impl ControlledTokenState {
                 "fixture restore has an invalid target frontier",
             ));
         }
-        entry.frontier = self.issuer.frontier(entry.frontier.sequence(), tokens)?;
-        entry.cache = Some(Arc::new(ferrum_testkit::MockKvCacheHandle::new(
-            entry.request_id.clone(),
-            1,
-            tokens,
-        )));
+        entry.frontier = self.issuer.frontier(sequence, tokens)?;
         Ok(entry.frontier.clone())
+    }
+}
+
+pub(super) struct FixtureInput<'a, 'work> {
+    pub index: usize,
+    pub request_id: &'a RequestId,
+    pub work: &'a ExecutionWork<'work>,
+}
+
+pub(super) struct Row {
+    pub index: usize,
+    pub sequence: ExecutorSequence,
+    pub executed: ExecutedTokenWork,
+    pub product: ExecutionProduct,
+}
+
+impl FixtureInput<'_, '_> {
+    pub fn row(&self, executed: ExecutedTokenWork, token: usize, vocabulary: usize) -> Row {
+        let product = if matches!(executed, ExecutedTokenWork::Prefill { chunk, .. } if !chunk.is_final())
+        {
+            ExecutionProduct::Intermediate
+        } else {
+            let mut logits = vec![0.0; vocabulary];
+            logits[token] = 1.0;
+            ExecutionProduct::Sampling(ExecutorSamplingOutput::FullLogits(logits))
+        };
+        Row {
+            index: self.index,
+            sequence: self.work.sequence().clone(),
+            executed,
+            product,
+        }
+    }
+
+    pub fn exact(&self, token: usize, vocabulary: usize) -> Row {
+        self.row(
+            match self.work.work() {
+                TokenWork::Prefill(chunk) => ExecutedTokenWork::Prefill {
+                    chunk,
+                    capacity_probe_count: 0,
+                },
+                TokenWork::Decode { position, .. } => ExecutedTokenWork::Decode { position },
+            },
+            token,
+            vocabulary,
+        )
+    }
+}
+
+pub(super) enum FixtureOutcome {
+    Rows(Vec<Row>),
+    Deferred(ferrum_execution::model_executor::ExecutorExecutionDeferral),
+    Unsupported,
+}
+
+pub(super) trait ControlledHooks: ModelExecutor {
+    fn work(&self, inputs: &[FixtureInput<'_, '_>]) -> Result<FixtureOutcome>;
+    fn closed(&self, _request: &RequestId, _reason: ExecutionEndReason) -> Result<()> {
+        Ok(())
     }
 }
 
@@ -60,8 +112,7 @@ pub(super) fn admit(
     input: ExecutionAdmission<'_>,
 ) -> Result<TokenAdmissionOutcome> {
     input.validate()?;
-    let decision = executor.try_admit_prefill(input.context)?;
-    Ok(match decision {
+    Ok(match executor.try_admit_prefill(input.context)? {
         ExecutorPrefillAdmissionDecision::Admitted(_) => {
             let sequence = state.issuer.issue_sequence()?;
             let frontier = state.issuer.frontier(&sequence, 0)?;
@@ -70,7 +121,6 @@ pub(super) fn admit(
                 prompt: input.context.input_tokens.into(),
                 maximum_tokens: input.context.maximum_sequence_tokens,
                 frontier: frontier.clone(),
-                cache: None,
             };
             assert!(state.entries.lock().insert(sequence, entry).is_none());
             TokenAdmissionOutcome::Admitted(frontier)
@@ -86,15 +136,15 @@ pub(super) fn admit(
 }
 
 pub(super) fn cancel(
-    executor: &impl ModelExecutor,
+    executor: &impl ControlledHooks,
     state: &ControlledTokenState,
     sequence: &ExecutorSequence,
 ) -> Result<ExecutionCloseOutcome> {
     state.issuer.frontier(sequence, 0)?;
     if let Some(entry) = state.entries.lock().remove(sequence) {
         executor.cancel_prefill_admission(&entry.request_id);
-        if let Some(cache) = entry.cache {
-            executor.release_cache(&cache.cache_id());
+        if entry.frontier.consumed_tokens() > 0 {
+            executor.closed(&entry.request_id, ExecutionEndReason::Cancelled)?;
         }
         return Ok(ExecutionCloseOutcome::ended(state.issuer.ended(sequence)?));
     }
@@ -105,32 +155,20 @@ pub(super) fn cancel(
 }
 
 pub(super) async fn finish(
-    executor: &impl ModelExecutor,
+    executor: &impl ControlledHooks,
     state: &ControlledTokenState,
     sequence: &ExecutorSequence,
     reason: ExecutionEndReason,
 ) -> Result<ExecutionCloseOutcome> {
-    let ExecutionEndReason::Completed {
-        input_tokens,
-        output_tokens,
-    } = reason
-    else {
+    if reason == ExecutionEndReason::Cancelled {
         return cancel(executor, state, sequence);
-    };
+    }
     state.issuer.frontier(sequence, 0)?;
-    let entry = state.entries.lock().get(sequence).cloned();
-    let Some(entry) = entry else {
+    let Some(entry) = state.entries.lock().get(sequence).cloned() else {
         return cancel(executor, state, sequence);
     };
-    if let Some(cache) = &entry.cache {
-        executor
-            .complete_cache(ExecutorSequenceCompletion::new(
-                entry.request_id.clone(),
-                cache.cache_id(),
-                input_tokens,
-                output_tokens,
-            )?)
-            .await?;
+    if entry.frontier.consumed_tokens() > 0 {
+        executor.closed(&entry.request_id, reason)?;
     }
     executor.cancel_prefill_admission(&entry.request_id);
     state
@@ -152,105 +190,17 @@ pub(super) fn release_sources(
     let Some(entry) = state.entries.lock().get(sequence).cloned() else {
         return Ok(false);
     };
-    let cache_id = entry
-        .cache
-        .as_ref()
-        .map(|cache| cache.cache_id())
-        .unwrap_or_else(|| entry.request_id.to_string());
     executor.write_execution_capacity_release_sources(
-        &ExecutorExecutionCapacityPreemption::new(entry.request_id, cache_id)?,
+        &ExecutorExecutionCapacityPreemption::new(
+            entry.request_id.clone(),
+            entry.request_id.to_string(),
+        )?,
         sources,
     )
 }
 
-struct Row {
-    index: usize,
-    executed: ExecutedTokenWork,
-    product: ExecutionProduct,
-    cache: Arc<dyn KvCacheHandle>,
-    error: Option<FerrumError>,
-}
-
-fn prefill_rows(
-    indices: &[usize],
-    inputs: &[PlanRuntimePrefillInput],
-    outputs: Vec<PlanRuntimePrefillCompletion>,
-    vocabulary: usize,
-) -> (Vec<Row>, bool) {
-    let wrong_length = indices.len() != outputs.len();
-    let rows = outputs
-        .into_iter()
-        .enumerate()
-        .map(|(position, completion)| {
-            let error = inputs.get(position).and_then(|input| {
-                completion
-                    .validate_for(&input.request_id, input.chunk, vocabulary)
-                    .err()
-            });
-            let (output, _, chunk, capacity_probe_count) = completion.into_parts();
-            let (authority, product) = output.into_parts();
-            Row {
-                index: indices.get(position).copied().unwrap_or(usize::MAX),
-                executed: ExecutedTokenWork::Prefill {
-                    chunk,
-                    capacity_probe_count,
-                },
-                product: match product {
-                    PlanRuntimePrefillProduct::Intermediate => ExecutionProduct::Intermediate,
-                    PlanRuntimePrefillProduct::FinalLogits(values) => {
-                        ExecutionProduct::Sampling(ExecutorSamplingOutput::FullLogits(values))
-                    }
-                },
-                cache: authority.into_cache(),
-                error,
-            }
-        })
-        .collect();
-    (rows, wrong_length)
-}
-
-fn decode_rows(
-    indices: &[usize],
-    inputs: &[PlanRuntimeDecodeInput],
-    outputs: Vec<PlanRuntimeDecodeOutput>,
-    work: &[ExecutionWork<'_>],
-) -> (Vec<Row>, bool) {
-    let wrong_length = indices.len() != outputs.len();
-    let rows = outputs
-        .into_iter()
-        .enumerate()
-        .map(|(position, output)| {
-            let index = indices.get(position).copied().unwrap_or(usize::MAX);
-            let token_position = match work.get(index).map(|input| input.work()) {
-                Some(TokenWork::Decode { position, .. }) => position,
-                _ => 0,
-            };
-            let error = inputs.get(position).and_then(|input| {
-                (input.kv_cache.cache_id() != output.kv_cache.cache_id())
-                    .then(|| FerrumError::backend("controlled decode returned a foreign cache"))
-            });
-            Row {
-                index,
-                executed: ExecutedTokenWork::Decode {
-                    position: token_position,
-                },
-                product: ExecutionProduct::Sampling(output.sampling_output),
-                cache: output.kv_cache,
-                error,
-            }
-        })
-        .collect();
-    (rows, wrong_length)
-}
-
-enum FakeOutcome {
-    Rows(Vec<Row>, bool),
-    Deferred(ferrum_execution::model_executor::ExecutorExecutionDeferral),
-    Unsupported,
-}
-
 pub(super) async fn execute(
-    executor: &impl ModelExecutor,
+    executor: &impl ControlledHooks,
     state: &ControlledTokenState,
     work: &[ExecutionWork<'_>],
 ) -> Result<ExecutionBatchOutcome> {
@@ -273,135 +223,36 @@ pub(super) async fn execute(
             })
             .collect::<Result<Vec<_>>>()?
     };
-    let mut prefills = Vec::new();
-    let mut prefill_indices = Vec::new();
-    let mut decodes = Vec::new();
-    let mut decode_indices = Vec::new();
-    for (index, (input, entry)) in work.iter().zip(&entries).enumerate() {
-        match input.work() {
-            TokenWork::Prefill(chunk) => {
-                prefills.push(PlanRuntimePrefillInput::new(
-                    entry.request_id.clone(),
-                    entry.prompt.clone(),
-                    entry.maximum_tokens,
-                    chunk,
-                )?);
-                prefill_indices.push(index);
-            }
-            TokenWork::Decode { token, .. } => {
-                decodes.push(
-                    PlanRuntimeDecodeInput::new(
-                        entry.request_id.clone(),
-                        token,
-                        entry.cache.clone().ok_or_else(|| {
-                            FerrumError::internal("fixture decode has no completed prefill")
-                        })?,
-                    )
-                    .with_logits_policy(input.logits_policy().clone()),
-                );
-                decode_indices.push(index);
-            }
-        }
-    }
-    let result: Result<FakeOutcome> = async {
-        if decodes.is_empty() {
-            if prefills.len() == 1 {
-                return Ok(
-                    match executor
-                        .plan_runtime_prefill_with_capacity(&prefills[0])
-                        .await?
-                    {
-                        PlanRuntimePrefillOutcome::Completed(value) => {
-                            let (rows, bad) = prefill_rows(
-                                &prefill_indices,
-                                &prefills,
-                                vec![value],
-                                executor.info().vocab_size,
-                            );
-                            FakeOutcome::Rows(rows, bad)
-                        }
-                        PlanRuntimePrefillOutcome::Deferred(value) => FakeOutcome::Deferred(value),
-                    },
-                );
-            }
-            return Ok(
-                match executor
-                    .plan_runtime_batch_prefill_with_capacity(&prefills)
-                    .await?
-                {
-                    PlanRuntimeBatchPrefillOutcome::Completed(values) => {
-                        let (rows, bad) = prefill_rows(
-                            &prefill_indices,
-                            &prefills,
-                            values,
-                            executor.info().vocab_size,
-                        );
-                        FakeOutcome::Rows(rows, bad)
-                    }
-                    PlanRuntimeBatchPrefillOutcome::NotSubmitted(value) => {
-                        FakeOutcome::Deferred(value)
-                    }
-                    PlanRuntimeBatchPrefillOutcome::Unsupported => FakeOutcome::Unsupported,
-                },
-            );
-        }
-        if prefills.is_empty() {
-            return Ok(
-                match executor
-                    .plan_runtime_batch_decode_with_capacity(&decodes)
-                    .await?
-                {
-                    PlanRuntimeBatchDecodeOutcome::Completed(values) => {
-                        let (rows, bad) = decode_rows(&decode_indices, &decodes, values, work);
-                        FakeOutcome::Rows(rows, bad)
-                    }
-                    PlanRuntimeBatchDecodeOutcome::Deferred(value) => FakeOutcome::Deferred(value),
-                },
-            );
-        }
-        Ok(
-            match executor
-                .plan_runtime_mixed_batch_with_capacity(&prefills, &decodes)
-                .await?
-            {
-                PlanRuntimeMixedBatchOutcome::Unsupported => FakeOutcome::Unsupported,
-                PlanRuntimeMixedBatchOutcome::NotSubmitted(value) => FakeOutcome::Deferred(value),
-                PlanRuntimeMixedBatchOutcome::Completed {
-                    prefills: first,
-                    decodes: second,
-                } => {
-                    let (mut rows, a) = prefill_rows(
-                        &prefill_indices,
-                        &prefills,
-                        first,
-                        executor.info().vocab_size,
-                    );
-                    let (tail, b) = decode_rows(&decode_indices, &decodes, second, work);
-                    rows.extend(tail);
-                    rows.sort_by_key(|row| row.index);
-                    FakeOutcome::Rows(rows, a || b)
-                }
-            },
-        )
-    }
-    .await;
-    let (rows, mut violation, mut causes) = match result {
-        Ok(FakeOutcome::Deferred(value)) => {
+    let inputs = work
+        .iter()
+        .zip(&entries)
+        .enumerate()
+        .map(|(index, (work, entry))| FixtureInput {
+            index,
+            request_id: &entry.request_id,
+            work,
+        })
+        .collect::<Vec<_>>();
+    let (rows, mut violation, mut causes) = match executor.work(&inputs) {
+        Ok(FixtureOutcome::Deferred(value)) => {
             return Ok(scope.not_submitted(NoSubmissionReason::Deferred(value)))
         }
-        Ok(FakeOutcome::Unsupported) => {
+        Ok(FixtureOutcome::Unsupported) => {
             return Ok(scope.not_submitted(NoSubmissionReason::UnsupportedShape))
         }
-        Ok(FakeOutcome::Rows(rows, bad)) => (
-            rows,
-            bad.then(|| {
-                ExecutionContractViolation::new(
-                    FerrumError::backend("controlled batch returned a wrong row count"),
-                    (Vec::new(), Vec::new(), Vec::new()),
-                )
-            }),
-            Vec::new(),
-        ),
+        Ok(FixtureOutcome::Rows(rows)) => {
+            let bad = rows.len() != work.len();
+            (
+                rows,
+                bad.then(|| {
+                    ExecutionContractViolation::new(
+                        FerrumError::backend("controlled batch returned a wrong row count"),
+                        (Vec::new(), Vec::new(), Vec::new()),
+                    )
+                }),
+                Vec::new(),
+            )
+        }
         Err(error) => (
             Vec::new(),
             None,
@@ -422,7 +273,8 @@ pub(super) async fn execute(
                 .push(row.product);
             continue;
         }
-        if let Some(error) = row.error {
+        if row.sequence != *work[row.index].sequence() {
+            let error = FerrumError::backend("controlled work returned a foreign incarnation");
             let value = violation.get_or_insert_with(|| {
                 ExecutionContractViolation::new(error, (Vec::new(), Vec::new(), Vec::new()))
             });
@@ -438,7 +290,6 @@ pub(super) async fn execute(
                     .get_mut(work[row.index].sequence())
                     .expect("controlled work owns its incarnation");
                 entry.frontier = value.next_frontier().clone();
-                entry.cache = Some(row.cache);
                 completed.push(value);
             }
             Err(rejected) => {

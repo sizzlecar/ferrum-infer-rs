@@ -47,9 +47,8 @@ where
     T::try_from(value.into()).unwrap()
 }
 
-fn device() -> Device {
-    Device::CUDA(0)
-}
-
 #[path = "checks.rs"]
 mod checks;
+
+#[path = "startup_fixture.rs"]
+mod startup_fixture;

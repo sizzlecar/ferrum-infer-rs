@@ -14,32 +14,27 @@ use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use ferrum_execution::model_executor::{
-    AttentionType, DecodeInput, DecodeOutput, ExecutionResourceAuthority, ExecutorAdmissionEpochs,
-    ExecutorBatchDecodeOutcome, ExecutorBatchPrefillOutcome, ExecutorCapabilities,
+    AttentionType, ExecutionResourceAuthority, ExecutorAdmissionEpochs, ExecutorCapabilities,
     ExecutorCapacityWaitRegistration, ExecutorExecutionCapacityDeferral,
     ExecutorExecutionCapacityPreemption, ExecutorExecutionCapacityPreemptionAuthority,
     ExecutorExecutionCapacityPreemptionReceipt, ExecutorExecutionCapacityStage,
     ExecutorExecutionDeferral, ExecutorMemoryUsage, ExecutorPrefillAdmission,
-    ExecutorPrefillAdmissionDecision, ExecutorPrefillAdmissionReceipt, ExecutorPrefillCompletion,
-    ExecutorPrefillMaintenanceDeferral, ExecutorPrefillMaintenanceOutcome, ExecutorPrefillOutcome,
-    ExecutorRequestOrigin, ExecutorRequestStateDeferral, ExecutorSamplingOutput,
-    ExecutorSequenceCompletion, ExecutorState, ExecutorStatus, LogitsReturnPolicy,
-    MemoryRequirements, PlanRuntimeBatchDecodeOutcome, PlanRuntimeBatchPrefillOutcome,
-    PlanRuntimeDecodeInput, PlanRuntimeDecodeOutput, PlanRuntimeMixedBatchOutcome,
-    PlanRuntimePrefillAuthority, PlanRuntimePrefillCompletion, PlanRuntimePrefillInput,
-    PlanRuntimePrefillOutcome, PlanRuntimePrefillOutput, PlanRuntimePrefillProduct,
+    ExecutorPrefillAdmissionDecision, ExecutorPrefillAdmissionReceipt,
+    ExecutorPrefillMaintenanceDeferral, ExecutorPrefillMaintenanceOutcome, ExecutorRequestOrigin,
+    ExecutorRequestStateDeferral, ExecutorSamplingOutput, ExecutorSequenceCompletion,
+    ExecutorState, ExecutorStatus, LogitsReturnPolicy, MemoryRequirements,
     PlanRuntimePrefixRestoreDeferral, PlanRuntimePrefixRestoreInput,
     PlanRuntimePrefixRestoreOutcome, PlanRuntimePrefixRestoreOutput, PlanRuntimeResourceSnapshot,
-    PrefillChunk, PrefillInput, PrefillOutput, PrefixCaptureBoundary, PrefixCaptureLease,
-    PrefixCapturePlan, PrefixCaptureRequest, TypedSequenceStateMemory,
+    PrefillChunk, PrefixCaptureBoundary, PrefixCaptureLease, PrefixCapturePlan,
+    PrefixCaptureRequest, TypedSequenceStateMemory,
 };
 use ferrum_execution::prepared_model::PreparedExecutionInput;
 use ferrum_execution::token_execution::{
-    ExecutionRecoveryKey, ExecutorSequence, ExecutorSequenceIssuer,
+    ExecutedTokenWork, ExecutionAdmission, ExecutionBatchOutcome, ExecutionFrontier,
+    ExecutionInterruptionCause, ExecutionRecoveryKey, ExecutionWork, ExecutorSequence,
+    ExecutorSequenceIssuer, TokenAdmissionOutcome, TokenWork,
 };
 use ferrum_execution::{ModelExecutor, ProductExecutionEventSink};
-use ferrum_interfaces::kv_cache::{BlockTable, CacheHandleStats};
-use ferrum_interfaces::{KvCacheHandle, TensorRef};
 use ferrum_runtime::*;
 use ferrum_types::{
     AttentionExecutionPolicy, Device, EngineConfig, ExecutorAdmissionLimits, FerrumError,
@@ -53,7 +48,6 @@ use serde::Serialize;
 use tokio::sync::Mutex as AsyncMutex;
 
 use super::{
-    common,
     vnext_checkpoint::{
         VNextCheckpointArtifactRecord, VNextCheckpointCapture, VNextCheckpointClaim,
         VNextCheckpointProductOutputMode, VNextCheckpointProductOutputRecord,
@@ -69,11 +63,10 @@ mod determinism;
 mod input_uploads;
 mod invocation_preparation;
 mod resident_decode;
+pub use composition::{VNextCompiledModel, VNextModelCompilationError, VNextRuntimeComposition};
 use resident_decode::{
     PreparedDispatch, PreparedDispatchResult, PreparedRetirement, ResidentCache, ResidentMetrics,
 };
-mod mixed_batch;
-pub use composition::{VNextCompiledModel, VNextModelCompilationError, VNextRuntimeComposition};
 mod prefix_cache;
 mod program_binding_upload;
 mod request;
@@ -203,12 +196,6 @@ fn resolve_runtime_attention_authority(
 enum VNextReusableExecutionDecodeWidthSource {
     Automatic,
     Explicit,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum VNextPrefillFrontierPolicy {
-    Adaptive,
-    ExactStartup,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -2059,15 +2046,6 @@ fn nonterminal_completion_message(observation: &CompletionReadbackBatchObservati
     format!("vNext completion did not reach a quiescent terminal: {observation:?}")
 }
 
-fn decode_output_width(output_elements: usize, vocabulary_size: usize) -> Result<usize> {
-    if output_elements == 1 || output_elements == vocabulary_size {
-        return Ok(output_elements);
-    }
-    Err(FerrumError::model(format!(
-        "vNext decode output contains {output_elements} elements, expected one selected token or {vocabulary_size} logits"
-    )))
-}
-
 enum VNextTerminalReadbacks {
     Batch(CompletionReadbackBatchRequest),
     Collection(CompletionReadbackCollectionRequest),
@@ -2959,22 +2937,6 @@ impl VNextDeviceTimingMetrics {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DecodeFailureDisposition {
-    PreserveForCapacityRetry,
-    AbortSequence,
-}
-
-impl DecodeFailureDisposition {
-    fn from_error(error: &FerrumError) -> Self {
-        if matches!(error, FerrumError::ResourceExhausted { .. }) {
-            Self::PreserveForCapacityRetry
-        } else {
-            Self::AbortSequence
-        }
-    }
-}
-
 impl VNextExecutorMetrics {
     fn wave_timing_for(&self, kind: VNextExecutionWaveKind) -> &VNextWaveTimingMetrics {
         match kind {
@@ -3807,23 +3769,6 @@ struct VNextExecutionParticipant<'a, R: DeviceRuntime> {
     output_role: &'a VNextParticipantOutputRole,
 }
 
-struct VNextDecodeCandidate<R: DeviceRuntime> {
-    original_index: usize,
-    sequence: Arc<VNextSequence<R>>,
-    cache_id: String,
-    next_token: u32,
-    logits_policy: LogitsReturnPolicy,
-}
-
-struct VNextPrefillCandidate<R: DeviceRuntime> {
-    original_index: usize,
-    slot: Arc<VNextPrefillSlot<R>>,
-    sequence: Arc<VNextSequence<R>>,
-    tokens: Vec<u32>,
-    maximum_tokens: usize,
-    planned_chunk: PrefillChunk,
-}
-
 fn validate_sequence_completion_accounting(
     request_id: &RequestId,
     product_prompt_tokens: u64,
@@ -3976,116 +3921,6 @@ impl<R: DeviceRuntime> Drop for VNextSequence<R> {
         self.active.store(false, Ordering::Release);
         let _ = self.session.request_cancel();
         let _ = self.session.try_abort();
-    }
-}
-
-struct VNextKvCacheHandle<R: DeviceRuntime> {
-    block_table: BlockTable,
-    cache_id: String,
-    sequence: Weak<VNextSequence<R>>,
-    device: Device,
-    num_layers: usize,
-    num_heads: usize,
-    head_dim: usize,
-    maximum_tokens: usize,
-}
-
-impl<R: DeviceRuntime> VNextKvCacheHandle<R> {
-    fn new(
-        sequence: &Arc<VNextSequence<R>>,
-        info: &ModelInfo,
-        attention_head_dimension: usize,
-        tokens: usize,
-    ) -> Self {
-        let mut block_table = BlockTable::new(16);
-        block_table.sequence_length = tokens;
-        Self {
-            block_table,
-            cache_id: sequence.cache_id.clone(),
-            sequence: Arc::downgrade(sequence),
-            device: info.device.clone(),
-            num_layers: info.num_layers,
-            num_heads: info.num_kv_heads,
-            head_dim: attention_head_dimension,
-            maximum_tokens: sequence.maximum_tokens,
-        }
-    }
-}
-
-impl<R: DeviceRuntime> fmt::Debug for VNextKvCacheHandle<R> {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("VNextKvCacheHandle")
-            .field("cache_id", &self.cache_id)
-            .field("tokens", &self.block_table.sequence_length)
-            .field("maximum_tokens", &self.maximum_tokens)
-            .field("device", &self.device)
-            .finish_non_exhaustive()
-    }
-}
-
-impl<R: DeviceRuntime> KvCacheHandle for VNextKvCacheHandle<R> {
-    fn block_table(&self) -> &BlockTable {
-        &self.block_table
-    }
-
-    fn block_table_mut(&mut self) -> &mut BlockTable {
-        &mut self.block_table
-    }
-
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
-    fn device(&self) -> Device {
-        self.device.clone()
-    }
-
-    fn num_layers(&self) -> usize {
-        self.num_layers
-    }
-
-    fn num_heads(&self) -> usize {
-        self.num_heads
-    }
-
-    fn head_dim(&self) -> usize {
-        self.head_dim
-    }
-
-    fn key_cache(&self, _layer: usize) -> Result<Option<TensorRef>> {
-        Ok(None)
-    }
-
-    fn value_cache(&self, _layer: usize) -> Result<Option<TensorRef>> {
-        Ok(None)
-    }
-
-    fn clone_handle(&self) -> Result<Arc<dyn KvCacheHandle>> {
-        Err(FerrumError::unsupported(
-            "vNext cache cloning requires an explicit typed copy-on-write contract",
-        ))
-    }
-
-    fn stats(&self) -> CacheHandleStats {
-        let tokens = self.block_table.sequence_length;
-        CacheHandleStats {
-            memory_bytes: 0,
-            blocks_allocated: tokens.div_ceil(self.block_table.block_size),
-            tokens_stored: tokens,
-            utilization: tokens as f32 / self.maximum_tokens.max(1) as f32,
-            last_access: Instant::now(),
-        }
-    }
-
-    fn is_valid(&self) -> bool {
-        self.sequence
-            .upgrade()
-            .is_some_and(|sequence| sequence.active.load(Ordering::Acquire))
-    }
-
-    fn cache_id(&self) -> String {
-        self.cache_id.clone()
     }
 }
 
@@ -4459,79 +4294,6 @@ impl<R: DeviceRuntime> VNextSequenceRegistry<R> {
         Ok(())
     }
 
-    fn restore_prefill_batch_ready(
-        &mut self,
-        executions: &[(&Arc<VNextPrefillSlot<R>>, &Arc<VNextSequence<R>>)],
-    ) -> Result<()> {
-        for (slot, sequence) in executions {
-            if slot.cancelled.load(Ordering::Acquire)
-                || !self
-                    .prefills
-                    .get(&slot.request_id)
-                    .is_some_and(|current| Arc::ptr_eq(current, slot))
-                || !matches!(
-                    &*slot.state.lock(),
-                    VNextPrefillSlotState::Executing(current) if Arc::ptr_eq(current, sequence)
-                )
-            {
-                return Err(FerrumError::cancelled(format!(
-                    "vNext batch prefill for `{}` lost its retained authority",
-                    slot.request_id
-                )));
-            }
-        }
-        for (slot, sequence) in executions {
-            *slot.state.lock() = VNextPrefillSlotState::Ready(Arc::clone(sequence));
-        }
-        Ok(())
-    }
-
-    fn commit_prefill_batch_execution(
-        &mut self,
-        executions: &[(&Arc<VNextPrefillSlot<R>>, &Arc<VNextSequence<R>>, bool)],
-    ) -> Result<()> {
-        for (index, (slot, sequence, final_chunk)) in executions.iter().enumerate() {
-            if slot.cancelled.load(Ordering::Acquire)
-                || !self
-                    .prefills
-                    .get(&slot.request_id)
-                    .is_some_and(|current| Arc::ptr_eq(current, slot))
-                || !matches!(
-                    &*slot.state.lock(),
-                    VNextPrefillSlotState::Executing(current) if Arc::ptr_eq(current, sequence)
-                )
-            {
-                return Err(FerrumError::cancelled(format!(
-                    "vNext batch prefill for `{}` lost its retained authority",
-                    slot.request_id
-                )));
-            }
-            if *final_chunk
-                && (self.active.contains_key(&sequence.cache_id)
-                    || executions[..index].iter().any(|(_, prior, prior_final)| {
-                        *prior_final && prior.cache_id == sequence.cache_id
-                    }))
-            {
-                return Err(FerrumError::already_exists(format!(
-                    "vNext cache `{}` raced with another batch prefill",
-                    sequence.cache_id
-                )));
-            }
-        }
-
-        for (slot, sequence, final_chunk) in executions {
-            if *final_chunk {
-                *slot.state.lock() = VNextPrefillSlotState::Terminal;
-                self.prefills.remove(&slot.request_id);
-                self.active
-                    .insert(sequence.cache_id.clone(), Arc::clone(sequence));
-            } else {
-                *slot.state.lock() = VNextPrefillSlotState::Ready(Arc::clone(sequence));
-            }
-        }
-        Ok(())
-    }
-
     fn cancel_prefill(&mut self, request_id: &RequestId) -> bool {
         let Some(slot) = self.prefills.get(request_id).cloned() else {
             return false;
@@ -4802,7 +4564,6 @@ pub struct VNextModelExecutor<R: DeviceRuntime> {
     reaper: Arc<CompletionReaper<R>>,
     io: VNextIoBinding,
     maximum_model_tokens: usize,
-    attention_head_dimension: usize,
     startup_memory_plan: Option<ferrum_types::StartupMemoryPlan>,
     run_id: RunId,
     family_fingerprint: String,
@@ -4847,111 +4608,115 @@ impl<R: DeviceRuntime> fmt::Debug for VNextModelExecutor<R> {
     }
 }
 
-struct VNextStartupSequence {
-    request_id: RequestId,
-    kv_cache: Arc<dyn KvCacheHandle>,
+struct VNextStartupSequence<R: DeviceRuntime> {
+    sequence: Arc<VNextSequence<R>>,
+    frontier: ExecutionFrontier,
 }
 
+/// Startup owns the same admitted incarnations as ordinary token execution.
+/// Keep the actual owner immediately after admission, including intermediate
+/// prerequisite prefill; neither request IDs nor copied cache handles authorize
+/// cleanup of a later incarnation.
 struct VNextStartupSequenceGuard<'executor, R: DeviceRuntime> {
     executor: &'executor VNextModelExecutor<R>,
-    pending_request: Option<RequestId>,
-    sequences: Vec<VNextStartupSequence>,
+    pending: Option<Arc<VNextPrefillSlot<R>>>,
+    sequences: Vec<VNextStartupSequence<R>>,
 }
 
 impl<'executor, R: DeviceRuntime> VNextStartupSequenceGuard<'executor, R> {
     fn new(executor: &'executor VNextModelExecutor<R>) -> Self {
         Self {
             executor,
-            pending_request: None,
+            pending: None,
             sequences: Vec::new(),
         }
     }
 
-    fn begin_request(&mut self, request_id: RequestId) {
-        debug_assert!(self.pending_request.is_none());
-        self.pending_request = Some(request_id);
+    fn track_pending(&mut self, request_id: &RequestId) {
+        self.pending = self
+            .executor
+            .sequences
+            .lock()
+            .prefills
+            .get(request_id)
+            .cloned();
     }
 
-    fn activate(&mut self, kv_cache: Arc<dyn KvCacheHandle>) {
-        let request_id = self
-            .pending_request
-            .take()
-            .expect("startup sequence activation requires a pending request");
-        self.sequences.push(VNextStartupSequence {
-            request_id,
-            kv_cache,
-        });
+    fn activate(&mut self, frontier: ExecutionFrontier) -> Result<usize> {
+        let sequence = self.executor.sequence_for_token(frontier.sequence())?;
+        if sequence.request_origin != ExecutorRequestOrigin::Startup
+            || !self.pending.as_ref().is_some_and(|slot| {
+                slot.request_id == *sequence.request_id()
+                    && matches!(&*slot.state.lock(), VNextPrefillSlotState::Ready(current)
+                        if Arc::ptr_eq(current, &sequence))
+            })
+        {
+            return Err(FerrumError::internal(
+                "startup admission lost its original sequence owner",
+            ));
+        }
+        let index = self.sequences.len();
+        self.sequences
+            .push(VNextStartupSequence { sequence, frontier });
+        self.pending = None;
+        Ok(index)
     }
 
     fn complete(mut self) -> Result<()> {
         self.cancel_pending();
-        let retained = self.take_active_sequences();
-        if retained.iter().any(|(request_id, sequence)| {
-            sequence
-                .as_ref()
-                .is_none_or(|sequence| sequence.request_id() != request_id)
-        }) {
-            for sequence in retained.into_iter().filter_map(|(_, sequence)| sequence) {
-                sequence.abort();
+        for startup in &self.sequences {
+            let sequence = &startup.sequence;
+            if sequence.token_identity != *startup.frontier.sequence()
+                || sequence.request_origin != ExecutorRequestOrigin::Startup
+            {
+                return Err(FerrumError::internal(
+                    "startup completion changed its admitted incarnation",
+                ));
             }
-            return Err(FerrumError::internal(
-                "vNext startup completion lost synthetic sequence authority",
-            ));
-        }
-        let sequences = retained
-            .into_iter()
-            .map(|(_, sequence)| {
-                sequence.expect("startup sequence authority was checked before completion")
-            })
-            .collect::<Vec<_>>();
-        for (index, sequence) in sequences.iter().enumerate() {
-            if let Err(error) = sequence.complete_startup() {
-                for unfinished in &sequences[index..] {
-                    unfinished.abort();
-                }
-                return Err(FerrumError::backend(format!(
-                    "vNext startup sequence completion: {error}"
-                )));
-            }
+            // This emits the original Startup accounting, without product
+            // usage or optional product-prefix retention. A journal error may
+            // coexist with actual Ended and must still be returned.
+            let result = sequence.complete_startup();
             self.executor.sequences.lock().remove_ended_exact(sequence);
+            result.map_err(|error| {
+                FerrumError::backend(format!("vNext startup sequence completion: {error}"))
+            })?;
+            if sequence.settlement.lock().terminal.is_none() {
+                return Err(FerrumError::backend(
+                    "startup completion has no native terminal receipt",
+                ));
+            }
         }
+        self.sequences.clear();
         Ok(())
     }
 
     fn cancel_pending(&mut self) {
-        if let Some(request_id) = self.pending_request.take() {
-            self.executor.sequences.lock().cancel_prefill(&request_id);
+        if let Some(slot) = self.pending.take() {
+            let mut registry = self.executor.sequences.lock();
+            if registry
+                .prefills
+                .get(&slot.request_id)
+                .is_some_and(|current| Arc::ptr_eq(current, &slot))
+            {
+                registry.cancel_prefill(&slot.request_id);
+            }
         }
-    }
-
-    fn take_active_sequences(&mut self) -> Vec<(RequestId, Option<Arc<VNextSequence<R>>>)> {
-        self.sequences
-            .drain(..)
-            .map(|startup| {
-                let sequence = self
-                    .executor
-                    .sequences
-                    .lock()
-                    .active
-                    .get(&startup.kv_cache.cache_id())
-                    .cloned();
-                (startup.request_id, sequence)
-            })
-            .collect()
     }
 }
 
 impl<R: DeviceRuntime> Drop for VNextStartupSequenceGuard<'_, R> {
     fn drop(&mut self) {
         self.cancel_pending();
-        for sequence in self
-            .take_active_sequences()
-            .into_iter()
-            .filter_map(|(_, sequence)| sequence)
-        {
-            sequence.abort();
-            self.executor.sequences.lock().remove_ended_exact(&sequence);
+        for startup in &self.sequences {
+            startup.sequence.abort();
+            self.executor
+                .sequences
+                .lock()
+                .remove_ended_exact(&startup.sequence);
         }
+        // A nonterminal owner remains in the original registry/reaper. Drop
+        // initiates cancellation; it does not assert that held work is released.
     }
 }
 
@@ -5140,7 +4905,6 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         let runtime = Arc::clone(&composition.runtime);
         let registry = &composition.registry;
         let catalog = composition.catalog.clone();
-        let attention_head_dimension = prepared.facts().attention_head_dimension();
         let family = prepared.family();
         let resolve_bind_phase = StartupPhaseTimer::start("plan_resolve_and_bind");
         let resolved_plan = resolve_plan(&config.runtime_policy, &catalog, &compilation)?;
@@ -5378,7 +5142,6 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             reaper,
             io,
             maximum_model_tokens: config.maximum_model_tokens,
-            attention_head_dimension,
             startup_memory_plan: config.startup_memory_plan,
             run_id,
             family_fingerprint,
@@ -5420,55 +5183,48 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         input_tokens: Arc<[TokenId]>,
         maximum_sequence_tokens: usize,
     ) -> Result<bool> {
-        let Some(request_id) = self
-            .reserve_startup_sequence(resources, &input_tokens, maximum_sequence_tokens)
-            .await?
+        let Some(index) =
+            self.reserve_startup_sequence(resources, &input_tokens, maximum_sequence_tokens)?
         else {
             return Ok(false);
         };
-        let input_token_count = input_tokens.len();
-        let chunk = PrefillChunk::new(0, input_token_count, input_token_count)?;
-        let Some(kv_cache) = self
-            .execute_startup_prefill_chunk(
-                resources,
-                &request_id,
-                input_tokens,
-                maximum_sequence_tokens,
-                chunk,
-                "decode-sequence admission",
-            )
+        let chunk = PrefillChunk::new(0, input_tokens.len(), input_tokens.len())?;
+        if !self
+            .execute_startup_prefill_chunk(resources, index, chunk, "decode-sequence admission")
             .await?
-        else {
-            return Ok(false);
-        };
-        resources.activate(kv_cache);
+        {
+            return Err(FerrumError::resource_exhausted(
+                "vNext startup decode-sequence prefill was not submitted; refusing an unprepared capture participant",
+            ));
+        }
         Ok(true)
     }
 
-    async fn reserve_startup_sequence(
+    fn reserve_startup_sequence(
         &self,
         resources: &mut VNextStartupSequenceGuard<'_, R>,
         input_tokens: &[TokenId],
         maximum_sequence_tokens: usize,
-    ) -> Result<Option<RequestId>> {
+    ) -> Result<Option<usize>> {
         let request_id = RequestId::new();
-        resources.begin_request(request_id.clone());
         let mut maintenance_attempts = 0_u32;
         loop {
-            match self.try_admit_prefill(ExecutorPrefillAdmission::for_startup(
-                &request_id,
-                input_tokens,
-                maximum_sequence_tokens,
-            ))? {
-                ExecutorPrefillAdmissionDecision::Admitted(receipt) => {
-                    if receipt.request_id != request_id {
-                        return Err(FerrumError::internal(
-                            "vNext startup prefill admission changed request identity",
-                        ));
-                    }
-                    break;
+            let decision = self.admit_native_tokens(ExecutionAdmission {
+                context: ExecutorPrefillAdmission::for_startup(
+                    &request_id,
+                    input_tokens,
+                    maximum_sequence_tokens,
+                ),
+                adapter: None,
+            });
+            // Capture the exact pending slot before propagating any failure.
+            // Admitted incarnations are promoted into the guard synchronously.
+            resources.track_pending(&request_id);
+            match decision? {
+                TokenAdmissionOutcome::Admitted(frontier) => {
+                    return resources.activate(frontier).map(Some)
                 }
-                ExecutorPrefillAdmissionDecision::MaintenanceDeferred(_) => {
+                TokenAdmissionOutcome::MaintenanceDeferred(_) => {
                     if maintenance_attempts >= MAX_BACKING_MAINTENANCE_ATTEMPTS {
                         return Err(FerrumError::resource_exhausted(format!(
                             "vNext startup prefill backing did not converge after {maintenance_attempts} attempts"
@@ -5489,58 +5245,84 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                         }
                     }
                 }
-                ExecutorPrefillAdmissionDecision::Deferred(_) => {
+                TokenAdmissionOutcome::Deferred(_) | TokenAdmissionOutcome::CapacityDeferred(_) => {
                     resources.cancel_pending();
                     return Ok(None);
                 }
-                ExecutorPrefillAdmissionDecision::PermanentRejected(rejected) => {
+                TokenAdmissionOutcome::PermanentRejected(rejected) => {
                     return Err(FerrumError::resource_exhausted(format!(
                         "vNext startup prefill was permanently rejected: {rejected:?}"
                     )));
                 }
             }
         }
-        Ok(Some(request_id))
+    }
+
+    fn startup_execution_failure(
+        outcome: ExecutionBatchOutcome,
+        phase: &'static str,
+    ) -> FerrumError {
+        match outcome {
+            ExecutionBatchOutcome::Interrupted(interruption) => interruption
+                .causes()
+                .iter()
+                .find_map(ExecutionInterruptionCause::as_error)
+                .cloned()
+                .unwrap_or_else(|| {
+                    FerrumError::resource_exhausted(format!(
+                        "vNext startup {phase} was interrupted"
+                    ))
+                }),
+            ExecutionBatchOutcome::ContractViolation(violation) => violation.error,
+            ExecutionBatchOutcome::NotSubmitted(_) => {
+                FerrumError::resource_exhausted(format!("vNext startup {phase} was not submitted"))
+            }
+            ExecutionBatchOutcome::Completed(_) => {
+                FerrumError::internal("startup rejected a completed token batch")
+            }
+        }
+        // Exact native owners stay in VNextStartupSequenceGuard and the
+        // registry/reaper. Dropping an observation never stands in for Ended.
     }
 
     async fn execute_startup_prefill_chunk(
         &self,
         resources: &mut VNextStartupSequenceGuard<'_, R>,
-        request_id: &RequestId,
-        input_tokens: Arc<[TokenId]>,
-        maximum_sequence_tokens: usize,
+        index: usize,
         chunk: PrefillChunk,
         phase: &'static str,
-    ) -> Result<Option<Arc<dyn KvCacheHandle>>> {
-        let input = PlanRuntimePrefillInput::new(
-            request_id.clone(),
-            input_tokens,
-            maximum_sequence_tokens,
-            chunk,
+    ) -> Result<bool> {
+        let policy = LogitsReturnPolicy::FullLogits;
+        let input = ExecutionWork::new(
+            &resources.sequences[index].frontier,
+            TokenWork::Prefill(chunk),
+            &policy,
         )?;
-        match self
-            .execute_plan_runtime_prefill_with_capacity_policy(
-                &input,
-                VNextPrefillFrontierPolicy::ExactStartup,
-            )
-            .await?
-        {
-            PlanRuntimePrefillOutcome::Completed(completion) => {
-                let (output, planned, completed, _) = completion.into_parts();
-                if planned != chunk || completed != chunk {
-                    return Err(FerrumError::internal(format!(
-                        "vNext startup {phase} did not complete its exact {:?} frontier",
-                        chunk.range()
-                    )));
-                }
-                let (authority, _) = output.into_parts();
-                Ok(Some(authority.into_cache()))
-            }
-            PlanRuntimePrefillOutcome::Deferred(_) => {
-                resources.cancel_pending();
-                Ok(None)
-            }
+        let outcome = self
+            .execute_native_tokens(std::slice::from_ref(&input))
+            .await?;
+        let completed = match outcome {
+            ExecutionBatchOutcome::Completed(completed) => completed,
+            ExecutionBatchOutcome::NotSubmitted(_) => return Ok(false),
+            other => return Err(Self::startup_execution_failure(other, phase)),
+        };
+        let mut completions = completed.into_completions();
+        if completions.len() != 1 {
+            return Err(FerrumError::internal(
+                "startup prefill returned an incorrect participant count",
+            ));
         }
+        let completion = completions.pop().expect("one startup completion");
+        completion.validate_for(0, &input, self.info.vocab_size)?;
+        if !matches!(completion.executed(), ExecutedTokenWork::Prefill { chunk: actual, capacity_probe_count: 0 } if actual == chunk)
+        {
+            return Err(FerrumError::internal(format!(
+                "vNext startup {phase} did not complete its exact {:?} frontier",
+                chunk.range()
+            )));
+        }
+        resources.sequences[index].frontier = completion.into_parts().1;
+        Ok(true)
     }
 
     async fn execute_startup_prefill_request(
@@ -5553,9 +5335,11 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             .collect::<Vec<_>>()
             .into();
         let mut resources = VNextStartupSequenceGuard::new(self);
-        let Some(request_id) = self
-            .reserve_startup_sequence(&mut resources, &input_tokens, chunk.total_prompt_tokens())
-            .await?
+        let Some(index) = self.reserve_startup_sequence(
+            &mut resources,
+            &input_tokens,
+            chunk.total_prompt_tokens(),
+        )?
         else {
             return Err(FerrumError::resource_exhausted(format!(
                 "vNext startup {phase} could not admit prefill chunk {:?}",
@@ -5565,17 +5349,9 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         if chunk.tokens_processed() > 0 {
             let prefix =
                 PrefillChunk::new(0, chunk.tokens_processed(), chunk.total_prompt_tokens())?;
-            if self
-                .execute_startup_prefill_chunk(
-                    &mut resources,
-                    &request_id,
-                    Arc::clone(&input_tokens),
-                    chunk.total_prompt_tokens(),
-                    prefix,
-                    phase,
-                )
+            if !self
+                .execute_startup_prefill_chunk(&mut resources, index, prefix, phase)
                 .await?
-                .is_none()
             {
                 return Err(FerrumError::resource_exhausted(format!(
                     "vNext startup {phase} deferred the prerequisite prefill chunk {:?}",
@@ -5583,27 +5359,13 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 )));
             }
         }
-        let Some(kv_cache) = self
-            .execute_startup_prefill_chunk(
-                &mut resources,
-                &request_id,
-                input_tokens,
-                chunk.total_prompt_tokens(),
-                chunk,
-                phase,
-            )
+        if !self
+            .execute_startup_prefill_chunk(&mut resources, index, chunk, phase)
             .await?
-        else {
+        {
             return Err(FerrumError::resource_exhausted(format!(
                 "vNext startup {phase} deferred prefill chunk {:?}",
                 chunk.range()
-            )));
-        };
-        resources.activate(kv_cache);
-        if resources.sequences.len() != 1 {
-            return Err(FerrumError::internal(format!(
-                "vNext startup {phase} retained {} sequences for one prefill descriptor",
-                resources.sequences.len()
             )));
         }
         resources.complete()
@@ -5622,38 +5384,52 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 resources.sequences.len()
             )));
         }
+        let policy = LogitsReturnPolicy::FullLogits;
         let inputs = resources
             .sequences
             .iter()
             .take(width)
-            .map(|sequence| {
-                PlanRuntimeDecodeInput::new(
-                    sequence.request_id.clone(),
-                    input_token,
-                    Arc::clone(&sequence.kv_cache),
+            .map(|startup| {
+                ExecutionWork::new(
+                    &startup.frontier,
+                    TokenWork::Decode {
+                        token: input_token,
+                        position: startup.frontier.consumed_tokens(),
+                    },
+                    &policy,
                 )
             })
-            .collect::<Vec<_>>();
-        match self.execute_plan_runtime_decode_batch(&inputs).await? {
-            PlanRuntimeBatchDecodeOutcome::Completed(outputs) => {
-                if outputs.len() != width {
-                    return Err(FerrumError::internal(format!(
-                        "vNext startup {phase} returned {} outputs for width {width}",
-                        outputs.len()
-                    )));
-                }
-                for (sequence, output) in resources.sequences.iter_mut().take(width).zip(outputs) {
-                    sequence.kv_cache = output.kv_cache;
-                }
-                Ok(())
-            }
-            PlanRuntimeBatchDecodeOutcome::Deferred(deferred) => {
-                Err(FerrumError::resource_exhausted(format!(
-                    "vNext startup {phase} width {width} deferred at {:?}",
-                    deferred.stage()
-                )))
-            }
+            .collect::<Result<Vec<_>>>()?;
+        let completed = match self.execute_native_tokens(&inputs).await? {
+            ExecutionBatchOutcome::Completed(completed) => completed,
+            other => return Err(Self::startup_execution_failure(other, phase)),
+        };
+        let completions = completed.into_completions();
+        if completions.len() != width {
+            return Err(FerrumError::internal(format!(
+                "vNext startup {phase} returned {} outputs for width {width}",
+                completions.len()
+            )));
         }
+        let mut seen = BTreeSet::new();
+        for completion in &completions {
+            let index = completion.input_index();
+            let input = inputs.get(index).ok_or_else(|| {
+                FerrumError::internal("startup decode returned a foreign participant index")
+            })?;
+            if !seen.insert(index) {
+                return Err(FerrumError::internal(
+                    "startup decode returned a duplicate participant",
+                ));
+            }
+            completion.validate_for(index, input, self.info.vocab_size)?;
+        }
+        drop(inputs);
+        for completion in completions {
+            let (index, frontier, _, _) = completion.into_parts();
+            resources.sequences[index].frontier = frontier;
+        }
+        Ok(())
     }
 
     async fn prepare_reusable_execution_startup(
@@ -6830,28 +6606,6 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         ))
     }
 
-    fn execution_deferral_error(deferral: &ExecutorExecutionDeferral) -> FerrumError {
-        match deferral {
-            ExecutorExecutionDeferral::Capacity(deferral) => {
-                Self::execution_capacity_error(deferral)
-            }
-            ExecutorExecutionDeferral::AllocatorCapacity(deferral) => {
-                FerrumError::resource_exhausted(format!(
-                    "KV allocator requires {} blocks with {} available",
-                    deferral.required_blocks(),
-                    deferral.snapshot().free_blocks,
-                ))
-            }
-            ExecutorExecutionDeferral::RequestState(deferral) => {
-                FerrumError::resource_exhausted(format!(
-                    "vNext {:?} is waiting for Request-state hazards: {:?}",
-                    deferral.stage(),
-                    deferral.hazard().blockers()
-                ))
-            }
-        }
-    }
-
     fn extend_sequence_with_capacity(
         &self,
         sequence: &VNextSequence<R>,
@@ -7052,18 +6806,6 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         }
     }
 
-    fn try_begin_step_once(
-        &self,
-        batch: &ExecutionBatchParticipants<R>,
-        span: &TokenSpanWork,
-    ) -> Result<StepResourceAdmissionDecision<R>> {
-        self.try_begin_step_for_spans(
-            batch,
-            std::slice::from_ref(span),
-            VNextExecutionWaveKind::Decode,
-        )
-    }
-
     fn step_request_for_spans(
         &self,
         batch: &ExecutionBatchParticipants<R>,
@@ -7150,6 +6892,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         }
     }
 
+    #[cfg(test)]
     fn begin_step(
         &self,
         batch: &ExecutionBatchParticipants<R>,
@@ -7310,14 +7053,6 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         }
     }
 
-    fn try_prepare_wave_once(
-        &self,
-        step: &Arc<StepResourceLease<R>>,
-        span: &TokenSpanWork,
-    ) -> Result<StepSubmissionWaveAdmissionDecision<R>> {
-        self.try_prepare_wave_for_spans(step, std::slice::from_ref(span))
-    }
-
     fn try_prepare_wave_for_spans(
         &self,
         step: &Arc<StepResourceLease<R>>,
@@ -7352,6 +7087,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         Ok(())
     }
 
+    #[cfg(test)]
     fn prepare_wave(
         &self,
         step: &Arc<StepResourceLease<R>>,
@@ -8022,75 +7758,6 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         prefix_cache::retain_token_evidence(self.resolved_plan.execution_plan(), span, tokens)
     }
 
-    async fn execute_step(
-        &self,
-        sequence: &Arc<VNextSequence<R>>,
-        tokens: &[u32],
-        span: TokenSpanWork,
-        logits_policy: &LogitsReturnPolicy,
-    ) -> std::result::Result<RetiredWave<ExecutorSamplingOutput, R>, WaveFailure> {
-        // The Step retains its original work Arc. Adding evidence only to a
-        // later wave would leave the completed-state proof without tokens.
-        let span = self
-            .retain_checkpoint_token_evidence(span, tokens)
-            .map_err(WaveFailure::not_submitted)?;
-        let output_role = VNextParticipantOutputRole::Decode(logits_policy.clone());
-        let participant = VNextExecutionParticipant {
-            sequence,
-            tokens,
-            span: &span,
-            output_role: &output_role,
-        };
-        let prepared = {
-            let _timing = self.metrics.wave_timing.resource_prepare_attempt.start();
-            let _phase_timing = self
-                .metrics
-                .decode_wave_timing
-                .resource_prepare_attempt
-                .start();
-            let batch = ExecutionBatchParticipants::new(vec![Arc::clone(&sequence.session)])
-                .map_err(|error| {
-                    WaveFailure::not_submitted(FerrumError::backend(error.to_string()))
-                })?;
-            if let Some(prepared) = self
-                .try_prepare_resident_decode(
-                    &batch,
-                    std::slice::from_ref(&span),
-                    VNextExecutionWaveKind::Decode,
-                    matches!(logits_policy, LogitsReturnPolicy::GreedyArgmax { .. }),
-                )
-                .map_err(WaveFailure::not_submitted)?
-            {
-                prepared
-            } else {
-                let step = self
-                    .begin_step(&batch, sequence, &span)
-                    .map_err(WaveFailure::not_submitted)?;
-                let wave = match self.prepare_wave(&step, sequence, &span) {
-                    Ok(wave) => wave,
-                    Err(error) => {
-                        let mut guard = PreparedWaveGuard::new(
-                            self,
-                            step.into(),
-                            std::slice::from_ref(&participant),
-                        );
-                        return Err(guard.fail(error));
-                    }
-                };
-                PreparedVNextPrefill::ordinary(step, wave)
-            }
-        };
-        self.execute_prepared_step(
-            sequence,
-            tokens,
-            span,
-            prepared,
-            VNextExecutionWaveKind::Decode,
-            output_role,
-        )
-        .await
-    }
-
     async fn execute_batch_step(
         &self,
         batch: &ExecutionBatchParticipants<R>,
@@ -8229,35 +7896,6 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         self.execute_prepared_participants(&participants, prepared, kind)
             .await
             .map(VNextExecutionCapacityDecision::Ready)
-    }
-
-    async fn execute_prepared_step(
-        &self,
-        sequence: &Arc<VNextSequence<R>>,
-        tokens: &[u32],
-        span: TokenSpanWork,
-        prepared: PreparedVNextPrefill<R>,
-        kind: VNextExecutionWaveKind,
-        output_role: VNextParticipantOutputRole,
-    ) -> std::result::Result<RetiredWave<ExecutorSamplingOutput, R>, WaveFailure> {
-        let participant = VNextExecutionParticipant {
-            sequence,
-            tokens,
-            span: &span,
-            output_role: &output_role,
-        };
-        let RetiredWave {
-            output: mut logits,
-            retirement,
-        } = self
-            .execute_prepared_participants(std::slice::from_ref(&participant), prepared, kind)
-            .await?;
-        match logits.pop() {
-            Some(output) => Ok(RetiredWave { output, retirement }),
-            None => Err(retirement.fail(FerrumError::internal(
-                "vNext single execution returned no logits",
-            ))),
-        }
     }
 
     async fn execute_prepared_participants(
@@ -9132,1109 +8770,6 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         }
     }
 
-    fn prefill_tensor(&self, logits: Vec<f32>) -> Result<TensorRef> {
-        let tensor = candle_core::Tensor::from_vec(
-            logits,
-            (1, 1, self.io.output_elements),
-            &candle_core::Device::Cpu,
-        )
-        .map_err(|error| FerrumError::model(format!("vNext prefill logits tensor: {error}")))?;
-        Ok(common::wrap_tensor(tensor))
-    }
-
-    fn decode_tensor(&self, logits: Vec<f32>) -> Result<TensorRef> {
-        let output_elements = decode_output_width(logits.len(), self.io.output_elements)?;
-        let tensor =
-            candle_core::Tensor::from_vec(logits, (1, output_elements), &candle_core::Device::Cpu)
-                .map_err(|error| {
-                    FerrumError::model(format!("vNext decode logits tensor: {error}"))
-                })?;
-        Ok(common::wrap_tensor(tensor))
-    }
-
-    fn cache_handle(
-        &self,
-        sequence: &Arc<VNextSequence<R>>,
-        tokens: usize,
-    ) -> Arc<dyn KvCacheHandle> {
-        Arc::new(VNextKvCacheHandle::new(
-            sequence,
-            &self.info,
-            self.attention_head_dimension,
-            tokens,
-        ))
-    }
-
-    fn sequence_for_cache(&self, cache_id: &str) -> Result<Arc<VNextSequence<R>>> {
-        self.sequences
-            .lock()
-            .active
-            .get(cache_id)
-            .cloned()
-            .ok_or_else(|| {
-                FerrumError::not_found(format!("vNext cache `{cache_id}` is not active"))
-            })
-    }
-
-    fn abort_decode_candidates(&self, candidates: &[VNextDecodeCandidate<R>]) {
-        self.release_resident_decode();
-        for candidate in candidates {
-            candidate.sequence.abort();
-            self.sequences
-                .lock()
-                .remove_ended_exact(&candidate.sequence);
-        }
-    }
-
-    async fn execute_plan_runtime_decode_batch(
-        &self,
-        inputs: &[PlanRuntimeDecodeInput],
-    ) -> Result<PlanRuntimeBatchDecodeOutcome> {
-        let started = Instant::now();
-        if inputs.is_empty() {
-            return Ok(PlanRuntimeBatchDecodeOutcome::Completed(Vec::new()));
-        }
-
-        let mut candidates = Vec::with_capacity(inputs.len());
-        for (original_index, input) in inputs.iter().enumerate() {
-            let cache_id = input.kv_cache.cache_id();
-            let sequence = self.sequence_for_cache(&cache_id)?;
-            if &input.request_id != sequence.request_id() {
-                return Err(FerrumError::request_validation(
-                    "vNext batch-decode request identity differs from its cache owner",
-                ));
-            }
-            candidates.push(VNextDecodeCandidate {
-                original_index,
-                sequence,
-                cache_id,
-                next_token: input.input_token.get(),
-                logits_policy: input.logits_policy.clone(),
-            });
-        }
-
-        let batch = ExecutionBatchParticipants::new(
-            candidates
-                .iter()
-                .map(|candidate| Arc::clone(&candidate.sequence.session))
-                .collect(),
-        )
-        .map_err(|error| FerrumError::request_validation(error.to_string()))?;
-        let mut candidates_by_authority = BTreeMap::new();
-        for candidate in candidates {
-            let authority = candidate.sequence.session.sequence_authority();
-            if candidates_by_authority
-                .insert(authority, candidate)
-                .is_some()
-            {
-                return Err(FerrumError::request_validation(
-                    "vNext batch-decode inputs contain a duplicate sequence",
-                ));
-            }
-        }
-        let canonical_candidates = batch
-            .sessions()
-            .iter()
-            .map(|session| {
-                candidates_by_authority
-                    .remove(&session.sequence_authority())
-                    .ok_or_else(|| {
-                        FerrumError::internal(
-                            "vNext canonical decode participant is absent from its input batch",
-                        )
-                    })
-            })
-            .collect::<Result<Vec<_>>>()?;
-        if !candidates_by_authority.is_empty() {
-            return Err(FerrumError::internal(
-                "vNext decode input is absent from its canonical participant batch",
-            ));
-        }
-
-        let mut operation_guards = Vec::with_capacity(canonical_candidates.len());
-        for candidate in &canonical_candidates {
-            operation_guards.push(candidate.sequence.operation.lock().await);
-        }
-
-        let mut token_batches = Vec::with_capacity(canonical_candidates.len());
-        let mut previous_lengths = Vec::with_capacity(canonical_candidates.len());
-        let mut spans = Vec::with_capacity(canonical_candidates.len());
-        for candidate in &canonical_candidates {
-            if !candidate.sequence.active.load(Ordering::Acquire) {
-                return Err(FerrumError::cancelled(format!(
-                    "vNext cache `{}` is no longer active",
-                    candidate.cache_id
-                )));
-            }
-            let (tokens, previous_len) = {
-                let current = candidate.sequence.tokens.lock();
-                let previous_len = current.len();
-                if previous_len >= candidate.sequence.maximum_tokens {
-                    return Err(FerrumError::request_validation(format!(
-                        "vNext sequence reached its {} token ceiling",
-                        candidate.sequence.maximum_tokens
-                    )));
-                }
-                let mut tokens = current.clone();
-                tokens.push(candidate.next_token);
-                (tokens, previous_len)
-            };
-            let extension_span = TokenSpanWork::from_token_ids(&tokens, 0..tokens.len())
-                .map_err(|error| FerrumError::backend(error.to_string()))?;
-            let extension = ResourceWorkShape::single(extension_span)
-                .map_err(|error| FerrumError::backend(error.to_string()))?;
-            match self.extend_sequence_with_capacity(&candidate.sequence, extension) {
-                Ok(VNextExecutionCapacityDecision::Ready(())) => {}
-                Ok(VNextExecutionCapacityDecision::Deferred(deferred)) => {
-                    return Ok(PlanRuntimeBatchDecodeOutcome::Deferred(deferred.into()));
-                }
-                Ok(VNextExecutionCapacityDecision::RequestStateDeferred(_)) => {
-                    return Err(FerrumError::internal(
-                        "sequence extension unexpectedly produced a Request-state deferral",
-                    ));
-                }
-                Err(error) => {
-                    if DecodeFailureDisposition::from_error(&error)
-                        == DecodeFailureDisposition::AbortSequence
-                    {
-                        self.abort_decode_candidates(std::slice::from_ref(candidate));
-                    }
-                    return Err(error);
-                }
-            }
-            let span = TokenSpanWork::from_token_ids(&tokens, previous_len..tokens.len())
-                .map_err(|error| FerrumError::backend(error.to_string()))?;
-            token_batches.push(tokens);
-            previous_lengths.push(previous_len);
-            spans.push(span);
-        }
-
-        let sequences = canonical_candidates
-            .iter()
-            .map(|candidate| Arc::clone(&candidate.sequence))
-            .collect::<Vec<_>>();
-        let output_roles = canonical_candidates
-            .iter()
-            .map(|candidate| VNextParticipantOutputRole::Decode(candidate.logits_policy.clone()))
-            .collect::<Vec<_>>();
-        let retired = match self
-            .execute_batch_step(
-                &batch,
-                &sequences,
-                &token_batches,
-                &spans,
-                VNextExecutionWaveKind::Decode,
-                &output_roles,
-            )
-            .await
-        {
-            Ok(VNextExecutionCapacityDecision::Ready(logits)) => logits,
-            Ok(VNextExecutionCapacityDecision::Deferred(deferred)) => {
-                return Ok(PlanRuntimeBatchDecodeOutcome::Deferred(deferred.into()));
-            }
-            Ok(VNextExecutionCapacityDecision::RequestStateDeferred(deferred)) => {
-                return Ok(PlanRuntimeBatchDecodeOutcome::Deferred(deferred.into()));
-            }
-            Err(failure) => return Err(failure.into_error()),
-        };
-        let RetiredWave {
-            output: logits,
-            retirement,
-        } = retired;
-        let product = (|| -> Result<PlanRuntimeBatchDecodeOutcome> {
-            if logits.len() != canonical_candidates.len() {
-                return Err(FerrumError::internal(format!(
-                    "vNext batch decode returned {} logits rows for {} participants",
-                    logits.len(),
-                    canonical_candidates.len()
-                )));
-            }
-            for (sampling_output, candidate) in logits.iter().zip(&canonical_candidates) {
-                if let Err(error) = sampling_output
-                    .validate_for_policy(&candidate.logits_policy, self.io.output_elements)
-                {
-                    return Err(error);
-                }
-            }
-
-            let mut ordered_outputs = (0..inputs.len()).map(|_| None).collect::<Vec<_>>();
-            for (((candidate, tokens), previous_len), sampling_output) in canonical_candidates
-                .iter()
-                .zip(token_batches)
-                .zip(previous_lengths)
-                .zip(logits)
-            {
-                if candidate.sequence.active.load(Ordering::Acquire) {
-                    *candidate.sequence.tokens.lock() = tokens;
-                }
-                let cache = self.cache_handle(&candidate.sequence, previous_len + 1);
-                ordered_outputs[candidate.original_index] =
-                    Some(PlanRuntimeDecodeOutput::new(sampling_output, cache));
-            }
-
-            let participant_count = u64::try_from(inputs.len()).unwrap_or(u64::MAX);
-            self.metrics
-                .decode_operations
-                .fetch_add(participant_count, Ordering::Relaxed);
-            let elapsed_us = started.elapsed().as_micros().min(u64::MAX as u128) as u64;
-            self.metrics.total_decode_us.fetch_add(
-                elapsed_us.saturating_mul(participant_count),
-                Ordering::Relaxed,
-            );
-            let outputs = ordered_outputs
-                .into_iter()
-                .map(|output| {
-                    output.ok_or_else(|| {
-                        FerrumError::internal(
-                            "vNext batch decode lost the original participant ordering",
-                        )
-                    })
-                })
-                .collect::<Result<Vec<_>>>()?;
-            Ok(PlanRuntimeBatchDecodeOutcome::Completed(outputs))
-        })();
-        match product {
-            Ok(output) => {
-                retirement.finish();
-                Ok(output)
-            }
-            Err(error) => Err(retirement.fail(error).into_error()),
-        }
-    }
-
-    async fn execute_legacy_decode_batch(
-        &self,
-        inputs: &[DecodeInput],
-    ) -> Result<ExecutorBatchDecodeOutcome> {
-        let adapter_support = self.adapter_execution_support();
-        for input in inputs {
-            adapter_support.validate_metadata(&input.metadata)?;
-        }
-        let mut typed_inputs = Vec::with_capacity(inputs.len());
-        for input in inputs {
-            if input.batch_size() != 1 {
-                return Err(FerrumError::unsupported(
-                    "each vNext batch-decode input must contain exactly one sequence",
-                ));
-            }
-            let tokens = common::tensor_to_tokens(&input.input_ids)?;
-            let [input_token] = tokens.as_slice() else {
-                return Err(FerrumError::request_validation(
-                    "each vNext batch-decode participant requires exactly one input token",
-                ));
-            };
-            let sequence = self.sequence_for_cache(&input.kv_cache.cache_id())?;
-            let request_id = input
-                .request_id
-                .clone()
-                .unwrap_or_else(|| sequence.request_id().clone());
-            let typed = PlanRuntimeDecodeInput::new(
-                request_id,
-                TokenId::new(*input_token),
-                Arc::clone(&input.kv_cache),
-            )
-            .with_logits_policy(input.logits_policy.clone());
-            typed_inputs.push(typed);
-        }
-
-        match self
-            .execute_plan_runtime_decode_batch(&typed_inputs)
-            .await?
-        {
-            PlanRuntimeBatchDecodeOutcome::Completed(outputs) => {
-                let outputs = outputs
-                    .into_iter()
-                    .map(|output| {
-                        let legacy_values = match output.sampling_output {
-                            ExecutorSamplingOutput::FullLogits(logits) => logits,
-                            ExecutorSamplingOutput::GreedyToken(token) => {
-                                vec![token.get() as f32]
-                            }
-                            ExecutorSamplingOutput::NoSelectableFiniteLogit => {
-                                return Err(FerrumError::backend(
-                                    "No finite logits available for sampling",
-                                ));
-                            }
-                        };
-                        let logits = self.decode_tensor(legacy_values)?;
-                        Ok(DecodeOutput::new(logits, output.kv_cache))
-                    })
-                    .collect::<Result<Vec<_>>>()?;
-                Ok(ExecutorBatchDecodeOutcome::Completed(outputs))
-            }
-            PlanRuntimeBatchDecodeOutcome::Deferred(deferred) => {
-                Ok(ExecutorBatchDecodeOutcome::Deferred(deferred))
-            }
-        }
-    }
-
-    async fn execute_plan_runtime_prefill_with_capacity(
-        &self,
-        input: &PlanRuntimePrefillInput,
-    ) -> Result<PlanRuntimePrefillOutcome> {
-        self.execute_plan_runtime_prefill_with_capacity_policy(
-            input,
-            VNextPrefillFrontierPolicy::Adaptive,
-        )
-        .await
-    }
-
-    async fn execute_plan_runtime_prefill_with_capacity_policy(
-        &self,
-        input: &PlanRuntimePrefillInput,
-        frontier_policy: VNextPrefillFrontierPolicy,
-    ) -> Result<PlanRuntimePrefillOutcome> {
-        let started = Instant::now();
-        let request_id = input.request_id.clone();
-        let tokens = input
-            .input_tokens
-            .iter()
-            .map(|token| token.get())
-            .collect::<Vec<_>>();
-        let maximum_tokens = input.maximum_sequence_tokens;
-        if maximum_tokens < tokens.len() || maximum_tokens > self.maximum_model_tokens {
-            return Err(FerrumError::request_validation(format!(
-                "request sequence ceiling {maximum_tokens} must cover prompt {} and not exceed {}",
-                tokens.len(),
-                self.maximum_model_tokens
-            )));
-        }
-        let planned_chunk = input.chunk;
-        if planned_chunk.total_prompt_tokens() != tokens.len() {
-            return Err(FerrumError::request_validation(format!(
-                "vNext prefill chunk declares {} prompt tokens for input length {}",
-                planned_chunk.total_prompt_tokens(),
-                tokens.len()
-            )));
-        }
-
-        let (slot, sequence) = self.sequences.lock().begin_prefill_execution(&request_id)?;
-        let mut execution = VNextPrefillExecutionGuard::new(
-            &self.sequences,
-            Arc::clone(&slot),
-            Arc::clone(&sequence),
-        );
-        let _operation = sequence.operation.lock().await;
-        if sequence.maximum_tokens != maximum_tokens || *sequence.tokens.lock() != tokens {
-            return Err(FerrumError::request_validation(format!(
-                "vNext prefill input for `{request_id}` differs from its admitted work"
-            )));
-        }
-        let processed = sequence.prefill_tokens_processed.load(Ordering::Acquire);
-        if processed != planned_chunk.tokens_processed() {
-            return Err(FerrumError::request_validation(format!(
-                "vNext prefill chunk for `{request_id}` starts at {}, expected {processed}",
-                planned_chunk.tokens_processed()
-            )));
-        }
-        if slot.cancelled.load(Ordering::Acquire) {
-            return Err(FerrumError::cancelled(format!(
-                "vNext prefill for `{request_id}` was cancelled before submission"
-            )));
-        }
-
-        let batch = ExecutionBatchParticipants::new(vec![Arc::clone(&sequence.session)])
-            .map_err(|error| FerrumError::backend(error.to_string()))?;
-        let mut completed_chunk = planned_chunk;
-        let mut capacity_probe_count = 0_u32;
-        let retired = loop {
-            let extension_tokens = &tokens[..completed_chunk.end()];
-            let extension_span =
-                TokenSpanWork::from_token_ids(extension_tokens, 0..extension_tokens.len())
-                    .map_err(|error| FerrumError::backend(error.to_string()))?;
-            let extension = ResourceWorkShape::single(extension_span)
-                .map_err(|error| FerrumError::backend(error.to_string()))?;
-            if let VNextExecutionCapacityDecision::Deferred(deferred) =
-                self.extend_sequence_with_capacity(&sequence, extension)?
-            {
-                let Some(next_tokens) =
-                    deferred.narrower_prefill_tokens(completed_chunk.tokens_to_process())
-                else {
-                    execution.restore_ready()?;
-                    return Ok(PlanRuntimePrefillOutcome::Deferred(deferred.into()));
-                };
-                if frontier_policy == VNextPrefillFrontierPolicy::ExactStartup {
-                    execution.restore_ready()?;
-                    return Err(FerrumError::resource_exhausted(format!(
-                        "vNext reusable startup prefill {:?} would narrow to {next_tokens} tokens before submission; refusing to capture a shape outside the resolved matrix",
-                        completed_chunk.range()
-                    )));
-                }
-                capacity_probe_count = capacity_probe_count.checked_add(1).ok_or_else(|| {
-                    FerrumError::internal("vNext prefill capacity probe count overflow")
-                })?;
-                self.metrics
-                    .prefill_frontier_narrowings
-                    .fetch_add(1, Ordering::Relaxed);
-                completed_chunk = PrefillChunk::new(
-                    completed_chunk.tokens_processed(),
-                    next_tokens,
-                    completed_chunk.total_prompt_tokens(),
-                )?;
-                continue;
-            }
-
-            let span = TokenSpanWork::from_token_ids_with_fit(
-                &tokens,
-                completed_chunk.range(),
-                maximum_tokens,
-            )
-            .map_err(|error| FerrumError::backend(error.to_string()))?;
-            match self
-                .execute_batch_step(
-                    &batch,
-                    std::slice::from_ref(&sequence),
-                    std::slice::from_ref(&tokens),
-                    std::slice::from_ref(&span),
-                    VNextExecutionWaveKind::Prefill,
-                    &[VNextParticipantOutputRole::prefill(completed_chunk)],
-                )
-                .await
-                .map_err(WaveFailure::into_error)?
-            {
-                VNextExecutionCapacityDecision::Ready(logits) => break logits,
-                VNextExecutionCapacityDecision::Deferred(deferred) => {
-                    let Some(next_tokens) =
-                        deferred.narrower_prefill_tokens(completed_chunk.tokens_to_process())
-                    else {
-                        execution.restore_ready()?;
-                        return Ok(PlanRuntimePrefillOutcome::Deferred(deferred.into()));
-                    };
-                    if frontier_policy == VNextPrefillFrontierPolicy::ExactStartup {
-                        execution.restore_ready()?;
-                        return Err(FerrumError::resource_exhausted(format!(
-                            "vNext reusable startup prefill {:?} would narrow to {next_tokens} tokens before submission; refusing to capture a shape outside the resolved matrix",
-                            completed_chunk.range()
-                        )));
-                    }
-                    capacity_probe_count =
-                        capacity_probe_count.checked_add(1).ok_or_else(|| {
-                            FerrumError::internal("vNext prefill capacity probe count overflow")
-                        })?;
-                    self.metrics
-                        .prefill_frontier_narrowings
-                        .fetch_add(1, Ordering::Relaxed);
-                    completed_chunk = PrefillChunk::new(
-                        completed_chunk.tokens_processed(),
-                        next_tokens,
-                        completed_chunk.total_prompt_tokens(),
-                    )?;
-                }
-                VNextExecutionCapacityDecision::RequestStateDeferred(deferred) => {
-                    execution.restore_ready()?;
-                    return Ok(PlanRuntimePrefillOutcome::Deferred(deferred.into()));
-                }
-            }
-        };
-        let RetiredWave {
-            output: mut logits,
-            retirement,
-        } = retired;
-        let product = async {
-            let logits = logits.pop().ok_or_else(|| {
-                FerrumError::internal("vNext single prefill execution returned no logits")
-            })?;
-            let logits = logits.into_full_logits()?;
-            self.retain_prefill_boundary(&sequence, &tokens, completed_chunk)
-                .await?;
-            let cache = self.cache_handle(&sequence, completed_chunk.end());
-            let output = if completed_chunk.is_final() {
-                PlanRuntimePrefillOutput::final_logits(
-                    request_id.clone(),
-                    completed_chunk.end(),
-                    logits,
-                    cache,
-                )?
-            } else {
-                PlanRuntimePrefillOutput::intermediate(
-                    request_id.clone(),
-                    completed_chunk.end(),
-                    cache,
-                )
-            };
-            output.validate_for_completion(
-                &request_id,
-                completed_chunk,
-                self.io.output_elements,
-            )?;
-            sequence
-                .prefill_tokens_processed
-                .store(completed_chunk.end(), Ordering::Release);
-            if completed_chunk.is_final() {
-                self.sequences.lock().activate(&slot, &sequence)?;
-                execution.disarm();
-            } else {
-                execution.restore_ready()?;
-            }
-            self.metrics
-                .prefill_operations
-                .fetch_add(1, Ordering::Relaxed);
-            self.metrics.total_prefill_us.fetch_add(
-                started.elapsed().as_micros().min(u64::MAX as u128) as u64,
-                Ordering::Relaxed,
-            );
-            Ok(PlanRuntimePrefillOutcome::Completed(
-                PlanRuntimePrefillCompletion::new(
-                    output,
-                    planned_chunk,
-                    completed_chunk,
-                    capacity_probe_count,
-                )?,
-            ))
-        }
-        .await;
-        match product {
-            Ok(output) => {
-                retirement.finish();
-                Ok(output)
-            }
-            Err(error) => Err(retirement.fail(error).into_error()),
-        }
-    }
-
-    async fn execute_plan_runtime_prefill_batch_with_capacity(
-        &self,
-        inputs: &[PlanRuntimePrefillInput],
-    ) -> Result<PlanRuntimeBatchPrefillOutcome> {
-        if inputs.is_empty() {
-            return Ok(PlanRuntimeBatchPrefillOutcome::Completed(Vec::new()));
-        }
-        let started = Instant::now();
-        let mut parsed = Vec::with_capacity(inputs.len());
-        for (original_index, input) in inputs.iter().enumerate() {
-            let request_id = input.request_id.clone();
-            let tokens = input
-                .input_tokens
-                .iter()
-                .map(|token| token.get())
-                .collect::<Vec<_>>();
-            let maximum_tokens = input.maximum_sequence_tokens;
-            if maximum_tokens < tokens.len() || maximum_tokens > self.maximum_model_tokens {
-                return Err(FerrumError::request_validation(format!(
-                    "request sequence ceiling {maximum_tokens} must cover prompt {} and not exceed {}",
-                    tokens.len(),
-                    self.maximum_model_tokens
-                )));
-            }
-            let planned_chunk = input.chunk;
-            if planned_chunk.total_prompt_tokens() != tokens.len() {
-                return Err(FerrumError::request_validation(format!(
-                    "vNext batch prefill chunk declares {} prompt tokens for input length {}",
-                    planned_chunk.total_prompt_tokens(),
-                    tokens.len()
-                )));
-            }
-            parsed.push((
-                original_index,
-                request_id,
-                tokens,
-                maximum_tokens,
-                planned_chunk,
-            ));
-        }
-
-        let request_ids = parsed
-            .iter()
-            .map(|(_, request_id, _, _, _)| request_id.clone())
-            .collect::<Vec<_>>();
-        let executions = self
-            .sequences
-            .lock()
-            .begin_prefill_batch_execution(&request_ids)?;
-        let candidates = parsed
-            .into_iter()
-            .zip(executions)
-            .map(
-                |(
-                    (original_index, _request_id, tokens, maximum_tokens, planned_chunk),
-                    (slot, sequence),
-                )| {
-                    VNextPrefillCandidate {
-                        original_index,
-                        slot,
-                        sequence,
-                        tokens,
-                        maximum_tokens,
-                        planned_chunk,
-                    }
-                },
-            )
-            .collect::<Vec<_>>();
-        let mut execution_guards = candidates
-            .iter()
-            .map(|candidate| {
-                VNextPrefillExecutionGuard::new(
-                    &self.sequences,
-                    Arc::clone(&candidate.slot),
-                    Arc::clone(&candidate.sequence),
-                )
-            })
-            .collect::<Vec<_>>();
-
-        let batch = ExecutionBatchParticipants::new(
-            candidates
-                .iter()
-                .map(|candidate| Arc::clone(&candidate.sequence.session))
-                .collect(),
-        )
-        .map_err(|error| FerrumError::request_validation(error.to_string()))?;
-        let mut candidates_by_authority = BTreeMap::new();
-        for candidate in candidates {
-            let authority = candidate.sequence.session.sequence_authority();
-            if candidates_by_authority
-                .insert(authority, candidate)
-                .is_some()
-            {
-                return Err(FerrumError::request_validation(
-                    "vNext batch-prefill inputs contain a duplicate sequence",
-                ));
-            }
-        }
-        let candidates = batch
-            .sessions()
-            .iter()
-            .map(|session| {
-                candidates_by_authority
-                    .remove(&session.sequence_authority())
-                    .ok_or_else(|| {
-                        FerrumError::internal(
-                            "vNext canonical prefill participant is absent from its input batch",
-                        )
-                    })
-            })
-            .collect::<Result<Vec<_>>>()?;
-        if !candidates_by_authority.is_empty() {
-            return Err(FerrumError::internal(
-                "vNext prefill input is absent from its canonical participant batch",
-            ));
-        }
-
-        let mut operation_guards = Vec::with_capacity(candidates.len());
-        for candidate in &candidates {
-            operation_guards.push(candidate.sequence.operation.lock().await);
-            if candidate.sequence.request_id() != &candidate.slot.request_id
-                || candidate.sequence.maximum_tokens != candidate.maximum_tokens
-                || *candidate.sequence.tokens.lock() != candidate.tokens
-            {
-                return Err(FerrumError::request_validation(format!(
-                    "vNext batch prefill input for `{}` differs from its admitted work",
-                    candidate.slot.request_id
-                )));
-            }
-            let processed = candidate
-                .sequence
-                .prefill_tokens_processed
-                .load(Ordering::Acquire);
-            if processed != candidate.planned_chunk.tokens_processed() {
-                return Err(FerrumError::request_validation(format!(
-                    "vNext batch prefill chunk for `{}` starts at {}, expected {processed}",
-                    candidate.slot.request_id,
-                    candidate.planned_chunk.tokens_processed()
-                )));
-            }
-        }
-
-        let token_batches = candidates
-            .iter()
-            .map(|candidate| candidate.tokens.clone())
-            .collect::<Vec<_>>();
-        let sequences = candidates
-            .iter()
-            .map(|candidate| Arc::clone(&candidate.sequence))
-            .collect::<Vec<_>>();
-        let mut completed_chunks = candidates
-            .iter()
-            .map(|candidate| candidate.planned_chunk)
-            .collect::<Vec<_>>();
-        let mut capacity_probe_counts = vec![0_u32; candidates.len()];
-
-        let retired = 'capacity: loop {
-            for (index, candidate) in candidates.iter().enumerate() {
-                let completed_chunk = completed_chunks[index];
-                let extension_tokens = &candidate.tokens[..completed_chunk.end()];
-                let extension_span =
-                    TokenSpanWork::from_token_ids(extension_tokens, 0..extension_tokens.len())
-                        .map_err(|error| FerrumError::backend(error.to_string()))?;
-                let extension = ResourceWorkShape::single(extension_span)
-                    .map_err(|error| FerrumError::backend(error.to_string()))?;
-                if let VNextExecutionCapacityDecision::Deferred(deferred) =
-                    self.extend_sequence_with_capacity(&candidate.sequence, extension)?
-                {
-                    if let Some(next_tokens) =
-                        deferred.narrower_prefill_tokens(completed_chunk.tokens_to_process())
-                    {
-                        capacity_probe_counts[index] =
-                            capacity_probe_counts[index].checked_add(1).ok_or_else(|| {
-                                FerrumError::internal(
-                                    "vNext batch prefill capacity probe count overflow",
-                                )
-                            })?;
-                        self.metrics
-                            .prefill_frontier_narrowings
-                            .fetch_add(1, Ordering::Relaxed);
-                        completed_chunks[index] = PrefillChunk::new(
-                            completed_chunk.tokens_processed(),
-                            next_tokens,
-                            completed_chunk.total_prompt_tokens(),
-                        )?;
-                        continue 'capacity;
-                    }
-                    let authority = candidates
-                        .iter()
-                        .map(|candidate| (&candidate.slot, &candidate.sequence))
-                        .collect::<Vec<_>>();
-                    self.sequences
-                        .lock()
-                        .restore_prefill_batch_ready(&authority)?;
-                    for guard in &mut execution_guards {
-                        guard.disarm();
-                    }
-                    return Ok(PlanRuntimeBatchPrefillOutcome::NotSubmitted(
-                        deferred.into(),
-                    ));
-                }
-            }
-
-            let spans = candidates
-                .iter()
-                .zip(&completed_chunks)
-                .map(|(candidate, completed_chunk)| {
-                    TokenSpanWork::from_token_ids(&candidate.tokens, completed_chunk.range())
-                        .map_err(|error| FerrumError::backend(error.to_string()))
-                })
-                .collect::<Result<Vec<_>>>()?;
-            let output_roles = completed_chunks
-                .iter()
-                .copied()
-                .map(VNextParticipantOutputRole::prefill)
-                .collect::<Vec<_>>();
-            match self
-                .execute_batch_step(
-                    &batch,
-                    &sequences,
-                    &token_batches,
-                    &spans,
-                    VNextExecutionWaveKind::Prefill,
-                    &output_roles,
-                )
-                .await
-                .map_err(WaveFailure::into_error)?
-            {
-                VNextExecutionCapacityDecision::Ready(logits) => break logits,
-                VNextExecutionCapacityDecision::Deferred(deferred) => {
-                    let mut narrowed = false;
-                    for (index, completed_chunk) in completed_chunks.iter_mut().enumerate() {
-                        let Some(next_tokens) =
-                            deferred.narrower_prefill_tokens(completed_chunk.tokens_to_process())
-                        else {
-                            continue;
-                        };
-                        capacity_probe_counts[index] =
-                            capacity_probe_counts[index].checked_add(1).ok_or_else(|| {
-                                FerrumError::internal(
-                                    "vNext batch prefill capacity probe count overflow",
-                                )
-                            })?;
-                        self.metrics
-                            .prefill_frontier_narrowings
-                            .fetch_add(1, Ordering::Relaxed);
-                        *completed_chunk = PrefillChunk::new(
-                            completed_chunk.tokens_processed(),
-                            next_tokens,
-                            completed_chunk.total_prompt_tokens(),
-                        )?;
-                        narrowed = true;
-                    }
-                    if narrowed {
-                        continue 'capacity;
-                    }
-                    let authority = candidates
-                        .iter()
-                        .map(|candidate| (&candidate.slot, &candidate.sequence))
-                        .collect::<Vec<_>>();
-                    self.sequences
-                        .lock()
-                        .restore_prefill_batch_ready(&authority)?;
-                    for guard in &mut execution_guards {
-                        guard.disarm();
-                    }
-                    return Ok(PlanRuntimeBatchPrefillOutcome::NotSubmitted(
-                        deferred.into(),
-                    ));
-                }
-                VNextExecutionCapacityDecision::RequestStateDeferred(deferred) => {
-                    let authority = candidates
-                        .iter()
-                        .map(|candidate| (&candidate.slot, &candidate.sequence))
-                        .collect::<Vec<_>>();
-                    self.sequences
-                        .lock()
-                        .restore_prefill_batch_ready(&authority)?;
-                    for guard in &mut execution_guards {
-                        guard.disarm();
-                    }
-                    return Ok(PlanRuntimeBatchPrefillOutcome::NotSubmitted(
-                        deferred.into(),
-                    ));
-                }
-            }
-        };
-        let RetiredWave {
-            output: logits,
-            retirement,
-        } = retired;
-        let product = async {
-            if logits.len() != candidates.len() {
-                return Err(FerrumError::internal(format!(
-                    "vNext batch prefill returned {} logits rows for {} participants",
-                    logits.len(),
-                    candidates.len()
-                )));
-            }
-
-            // Every participating FullPlan has retired. Optional copying here
-            // cannot turn a zero-submission capacity outcome into hidden work.
-            for (candidate, chunk) in candidates.iter().zip(&completed_chunks) {
-                self.retain_prefill_boundary(&candidate.sequence, &candidate.tokens, *chunk)
-                    .await?;
-            }
-
-            let mut ordered = (0..inputs.len()).map(|_| None).collect::<Vec<_>>();
-            for (((candidate, completed_chunk), capacity_probe_count), logits) in candidates
-                .iter()
-                .zip(&completed_chunks)
-                .zip(&capacity_probe_counts)
-                .zip(logits)
-            {
-                let logits = logits.into_full_logits()?;
-                let cache = self.cache_handle(&candidate.sequence, completed_chunk.end());
-                let output = if completed_chunk.is_final() {
-                    PlanRuntimePrefillOutput::final_logits(
-                        candidate.slot.request_id.clone(),
-                        completed_chunk.end(),
-                        logits,
-                        cache,
-                    )?
-                } else {
-                    PlanRuntimePrefillOutput::intermediate(
-                        candidate.slot.request_id.clone(),
-                        completed_chunk.end(),
-                        cache,
-                    )
-                };
-                output.validate_for_completion(
-                    &candidate.slot.request_id,
-                    *completed_chunk,
-                    self.io.output_elements,
-                )?;
-                ordered[candidate.original_index] = Some(PlanRuntimePrefillCompletion::new(
-                    output,
-                    candidate.planned_chunk,
-                    *completed_chunk,
-                    *capacity_probe_count,
-                )?);
-            }
-            let outputs = ordered
-                .into_iter()
-                .map(|output| {
-                    output.ok_or_else(|| {
-                        FerrumError::internal(
-                            "vNext batch prefill lost the original participant ordering",
-                        )
-                    })
-                })
-                .collect::<Result<Vec<_>>>()?;
-
-            let authority = candidates
-                .iter()
-                .zip(&completed_chunks)
-                .map(|(candidate, completed_chunk)| {
-                    (
-                        &candidate.slot,
-                        &candidate.sequence,
-                        completed_chunk.is_final(),
-                    )
-                })
-                .collect::<Vec<_>>();
-            for (candidate, completed_chunk) in candidates.iter().zip(&completed_chunks) {
-                candidate
-                    .sequence
-                    .prefill_tokens_processed
-                    .store(completed_chunk.end(), Ordering::Release);
-            }
-            self.sequences
-                .lock()
-                .commit_prefill_batch_execution(&authority)?;
-            for guard in &mut execution_guards {
-                guard.disarm();
-            }
-
-            let participant_count = u64::try_from(inputs.len()).unwrap_or(u64::MAX);
-            self.metrics
-                .prefill_operations
-                .fetch_add(participant_count, Ordering::Relaxed);
-            let elapsed_us = started.elapsed().as_micros().min(u64::MAX as u128) as u64;
-            self.metrics.total_prefill_us.fetch_add(
-                elapsed_us.saturating_mul(participant_count),
-                Ordering::Relaxed,
-            );
-            drop(operation_guards);
-            Ok(PlanRuntimeBatchPrefillOutcome::Completed(outputs))
-        }
-        .await;
-        match product {
-            Ok(output) => {
-                retirement.finish();
-                Ok(output)
-            }
-            Err(error) => Err(retirement.fail(error).into_error()),
-        }
-    }
-
-    fn plan_runtime_prefill_input_from_legacy(
-        &self,
-        input: &PrefillInput,
-    ) -> Result<PlanRuntimePrefillInput> {
-        self.adapter_execution_support()
-            .validate_metadata(&input.metadata)?;
-        if input.batch_size() != 1 {
-            return Err(FerrumError::unsupported(
-                "each vNext legacy prefill input must contain exactly one sequence",
-            ));
-        }
-        let request_id = input.request_id.clone().ok_or_else(|| {
-            FerrumError::request_validation("vNext legacy prefill requires a request_id")
-        })?;
-        let tokens = common::tensor_to_tokens(&input.input_ids)?
-            .into_iter()
-            .map(TokenId::new)
-            .collect::<Vec<_>>();
-        let maximum_tokens = input.maximum_sequence_tokens.ok_or_else(|| {
-            FerrumError::request_validation("vNext legacy prefill requires maximum_sequence_tokens")
-        })?;
-        let chunk = match input.chunk {
-            Some(chunk) => chunk,
-            None => PrefillChunk::new(0, tokens.len(), tokens.len())?,
-        };
-        PlanRuntimePrefillInput::new(request_id, tokens, maximum_tokens, chunk)
-    }
-
-    fn legacy_prefill_completion(
-        &self,
-        completion: PlanRuntimePrefillCompletion,
-    ) -> Result<ExecutorPrefillCompletion> {
-        let (output, planned_chunk, completed_chunk, capacity_probe_count) =
-            completion.into_parts();
-        let (authority, product) = output.into_parts();
-        let PlanRuntimePrefillProduct::FinalLogits(logits) = product else {
-            self.discard_plan_runtime_prefill(authority)?;
-            return Err(FerrumError::unsupported(
-                "legacy vNext prefill cannot represent an intermediate typed product",
-            ));
-        };
-        let logits = match self.prefill_tensor(logits) {
-            Ok(logits) => logits,
-            Err(error) => {
-                if let Err(cleanup_error) = self.discard_plan_runtime_prefill(authority) {
-                    return Err(FerrumError::internal(format!(
-                        "{error}; exact prefill authority cleanup also failed: {cleanup_error}"
-                    )));
-                }
-                return Err(error);
-            }
-        };
-        ExecutorPrefillCompletion::new(
-            PrefillOutput::new(logits, authority.into_cache()),
-            planned_chunk,
-            completed_chunk,
-            capacity_probe_count,
-        )
-    }
-
-    fn discard_plan_runtime_prefill_completions(
-        &self,
-        completions: impl IntoIterator<Item = PlanRuntimePrefillCompletion>,
-    ) -> Result<()> {
-        let mut failures = Vec::new();
-        for completion in completions {
-            let (output, _, _, _) = completion.into_parts();
-            let (authority, _) = output.into_parts();
-            if let Err(error) = self.discard_plan_runtime_prefill(authority) {
-                failures.push(error.to_string());
-            }
-        }
-        if failures.is_empty() {
-            Ok(())
-        } else {
-            Err(FerrumError::internal(format!(
-                "failed to discard {} legacy-adapter prefill authorities: {}",
-                failures.len(),
-                failures.join("; ")
-            )))
-        }
-    }
-
-    async fn execute_legacy_prefill_with_capacity(
-        &self,
-        input: &PrefillInput,
-    ) -> Result<ExecutorPrefillOutcome> {
-        let input = self.plan_runtime_prefill_input_from_legacy(input)?;
-        match self
-            .execute_plan_runtime_prefill_with_capacity(&input)
-            .await?
-        {
-            PlanRuntimePrefillOutcome::Completed(completion) => self
-                .legacy_prefill_completion(completion)
-                .map(ExecutorPrefillOutcome::Completed),
-            PlanRuntimePrefillOutcome::Deferred(deferred) => {
-                Ok(ExecutorPrefillOutcome::Deferred(deferred))
-            }
-        }
-    }
-
-    async fn execute_legacy_prefill_batch_with_capacity(
-        &self,
-        inputs: &[PrefillInput],
-    ) -> Result<ExecutorBatchPrefillOutcome> {
-        let adapter_support = self.adapter_execution_support();
-        for input in inputs {
-            adapter_support.validate_metadata(&input.metadata)?;
-        }
-        let inputs = inputs
-            .iter()
-            .map(|input| self.plan_runtime_prefill_input_from_legacy(input))
-            .collect::<Result<Vec<_>>>()?;
-        match self
-            .execute_plan_runtime_prefill_batch_with_capacity(&inputs)
-            .await?
-        {
-            PlanRuntimeBatchPrefillOutcome::Completed(completions) => {
-                if completions.iter().any(|completion| {
-                    !matches!(
-                        completion.output().product(),
-                        PlanRuntimePrefillProduct::FinalLogits(_)
-                    )
-                }) {
-                    self.discard_plan_runtime_prefill_completions(completions)?;
-                    return Err(FerrumError::unsupported(
-                        "legacy vNext batch prefill cannot represent an intermediate typed product",
-                    ));
-                }
-                completions
-                    .into_iter()
-                    .map(|completion| self.legacy_prefill_completion(completion))
-                    .collect::<Result<Vec<_>>>()
-                    .map(ExecutorBatchPrefillOutcome::Completed)
-            }
-            PlanRuntimeBatchPrefillOutcome::NotSubmitted(deferred) => {
-                Ok(ExecutorBatchPrefillOutcome::NotSubmitted(deferred))
-            }
-            PlanRuntimeBatchPrefillOutcome::Unsupported => {
-                Ok(ExecutorBatchPrefillOutcome::Unsupported)
-            }
-        }
-    }
-
     fn metrics_snapshot(&self) -> serde_json::Value {
         let pool_status = self
             .plan_resources
@@ -10814,276 +9349,6 @@ impl<R: DeviceRuntime> ModelExecutor for VNextModelExecutor<R> {
         }
     }
 
-    async fn prefill(&self, input: &PrefillInput) -> Result<PrefillOutput> {
-        match self.execute_legacy_prefill_with_capacity(input).await? {
-            ExecutorPrefillOutcome::Completed(completion) => {
-                let (output, _, _, _) = completion.into_parts();
-                Ok(output)
-            }
-            ExecutorPrefillOutcome::Deferred(deferred) => {
-                Err(Self::execution_deferral_error(&deferred))
-            }
-        }
-    }
-
-    async fn prefill_with_capacity(&self, input: &PrefillInput) -> Result<ExecutorPrefillOutcome> {
-        self.execute_legacy_prefill_with_capacity(input).await
-    }
-
-    async fn batch_prefill(&self, inputs: &[PrefillInput]) -> Result<Vec<PrefillOutput>> {
-        match self
-            .execute_legacy_prefill_batch_with_capacity(inputs)
-            .await?
-        {
-            ExecutorBatchPrefillOutcome::Completed(completions) => completions
-                .into_iter()
-                .map(|completion| {
-                    let (output, _, _, _) = completion.into_parts();
-                    Ok(output)
-                })
-                .collect(),
-            ExecutorBatchPrefillOutcome::NotSubmitted(deferred) => {
-                Err(Self::execution_deferral_error(&deferred))
-            }
-            ExecutorBatchPrefillOutcome::Unsupported => Err(FerrumError::internal(
-                "vNext batch prefill returned its own unsupported marker",
-            )),
-        }
-    }
-
-    async fn batch_prefill_with_capacity(
-        &self,
-        inputs: &[PrefillInput],
-    ) -> Result<ExecutorBatchPrefillOutcome> {
-        self.execute_legacy_prefill_batch_with_capacity(inputs)
-            .await
-    }
-
-    async fn plan_runtime_prefill_with_capacity(
-        &self,
-        input: &PlanRuntimePrefillInput,
-    ) -> Result<PlanRuntimePrefillOutcome> {
-        self.execute_plan_runtime_prefill_with_capacity(input).await
-    }
-
-    async fn plan_runtime_batch_prefill_with_capacity(
-        &self,
-        inputs: &[PlanRuntimePrefillInput],
-    ) -> Result<PlanRuntimeBatchPrefillOutcome> {
-        self.execute_plan_runtime_prefill_batch_with_capacity(inputs)
-            .await
-    }
-
-    async fn plan_runtime_mixed_batch_with_capacity(
-        &self,
-        prefills: &[PlanRuntimePrefillInput],
-        decodes: &[PlanRuntimeDecodeInput],
-    ) -> Result<PlanRuntimeMixedBatchOutcome> {
-        self.execute_plan_runtime_mixed_batch(prefills, decodes)
-            .await
-    }
-
-    async fn decode(&self, input: &DecodeInput) -> Result<DecodeOutput> {
-        self.adapter_execution_support()
-            .validate_metadata(&input.metadata)?;
-        let started = Instant::now();
-        if input.batch_size() != 1 {
-            return Err(FerrumError::unsupported(
-                "vNext decode currently requires one sequence per typed submission wave",
-            ));
-        }
-        let cache_id = input.kv_cache.cache_id();
-        let sequence = self.sequence_for_cache(&cache_id)?;
-        if input
-            .request_id
-            .as_ref()
-            .is_some_and(|request_id| request_id != sequence.request_id())
-        {
-            return Err(FerrumError::request_validation(
-                "vNext decode request identity differs from its cache owner",
-            ));
-        }
-        let _operation = sequence.operation.lock().await;
-        if !sequence.active.load(Ordering::Acquire) {
-            return Err(FerrumError::cancelled(format!(
-                "vNext cache `{cache_id}` is no longer active"
-            )));
-        }
-        let next = common::tensor_to_tokens(&input.input_ids)?;
-        let [next_token] = next.as_slice() else {
-            return Err(FerrumError::request_validation(
-                "vNext decode requires exactly one input token",
-            ));
-        };
-        let (tokens, previous_len) = {
-            let current = sequence.tokens.lock();
-            let previous_len = current.len();
-            if previous_len >= sequence.maximum_tokens {
-                return Err(FerrumError::request_validation(format!(
-                    "vNext sequence reached its {} token ceiling",
-                    sequence.maximum_tokens
-                )));
-            }
-            let mut tokens = current.clone();
-            tokens.push(*next_token);
-            (tokens, previous_len)
-        };
-        let extension_span = TokenSpanWork::from_token_ids(&tokens, 0..tokens.len())
-            .map_err(|error| FerrumError::backend(error.to_string()))?;
-        let extension = ResourceWorkShape::single(extension_span)
-            .map_err(|error| FerrumError::backend(error.to_string()))?;
-        if let Err(error) = self.extend_sequence(&sequence, extension) {
-            if DecodeFailureDisposition::from_error(&error)
-                == DecodeFailureDisposition::AbortSequence
-            {
-                sequence.abort();
-                self.sequences.lock().remove_ended_exact(&sequence);
-            }
-            return Err(error);
-        }
-        let step_span = TokenSpanWork::from_token_ids(&tokens, previous_len..tokens.len())
-            .map_err(|error| FerrumError::backend(error.to_string()))?;
-        let retired = match self
-            .execute_step(&sequence, &tokens, step_span, &input.logits_policy)
-            .await
-        {
-            Ok(sampling_output) => sampling_output,
-            Err(failure) => return Err(failure.into_error()),
-        };
-        let RetiredWave {
-            output: sampling_output,
-            retirement,
-        } = retired;
-        let product = (|| -> Result<DecodeOutput> {
-            sampling_output.validate_for_policy(&input.logits_policy, self.io.output_elements)?;
-            *sequence.tokens.lock() = tokens;
-            self.metrics
-                .decode_operations
-                .fetch_add(1, Ordering::Relaxed);
-            self.metrics.total_decode_us.fetch_add(
-                started.elapsed().as_micros().min(u64::MAX as u128) as u64,
-                Ordering::Relaxed,
-            );
-            let legacy_values = match sampling_output {
-                ExecutorSamplingOutput::FullLogits(logits) => logits,
-                ExecutorSamplingOutput::GreedyToken(token) => vec![token.get() as f32],
-                ExecutorSamplingOutput::NoSelectableFiniteLogit => {
-                    return Err(FerrumError::backend(
-                        "No finite logits available for sampling",
-                    ));
-                }
-            };
-            let logits = self.decode_tensor(legacy_values)?;
-            let cache = self.cache_handle(&sequence, previous_len + 1);
-            Ok(DecodeOutput::new(logits, cache))
-        })();
-        match product {
-            Ok(output) => {
-                retirement.finish();
-                Ok(output)
-            }
-            Err(error) => Err(retirement.fail(error).into_error()),
-        }
-    }
-
-    async fn batch_decode(&self, inputs: &[DecodeInput]) -> Result<Vec<DecodeOutput>> {
-        match self.execute_legacy_decode_batch(inputs).await? {
-            ExecutorBatchDecodeOutcome::Completed(outputs) => Ok(outputs),
-            ExecutorBatchDecodeOutcome::Deferred(deferred) => {
-                Err(Self::execution_deferral_error(&deferred))
-            }
-        }
-    }
-
-    async fn batch_decode_with_capacity(
-        &self,
-        inputs: &[DecodeInput],
-    ) -> Result<ExecutorBatchDecodeOutcome> {
-        self.execute_legacy_decode_batch(inputs).await
-    }
-
-    async fn plan_runtime_batch_decode_with_capacity(
-        &self,
-        inputs: &[PlanRuntimeDecodeInput],
-    ) -> Result<PlanRuntimeBatchDecodeOutcome> {
-        self.execute_plan_runtime_decode_batch(inputs).await
-    }
-
-    fn discard_plan_runtime_prefill(&self, authority: PlanRuntimePrefillAuthority) -> Result<()> {
-        let handle = authority
-            .kv_cache()
-            .as_any()
-            .downcast_ref::<VNextKvCacheHandle<R>>()
-            .ok_or_else(|| {
-                FerrumError::request_validation(
-                    "vNext prefill discard received a foreign cache handle",
-                )
-            })?;
-        let sequence = handle.sequence.upgrade().ok_or_else(|| {
-            FerrumError::not_found("vNext prefill discard sequence is no longer retained")
-        })?;
-        if authority.request_id() != sequence.request_id()
-            || authority.committed_tokens() != handle.num_tokens()
-            || handle.cache_id != sequence.cache_id
-        {
-            return Err(FerrumError::request_validation(
-                "vNext prefill discard authority does not match its exact sequence",
-            ));
-        }
-        if !self.sequences.lock().discard_exact_sequence(&sequence) {
-            return Err(FerrumError::not_found(format!(
-                "vNext prefill discard authority `{}` is no longer current",
-                sequence.cache_id
-            )));
-        }
-        Ok(())
-    }
-
-    fn release_cache(&self, cache_id: &str) {
-        self.release_resident_decode();
-        let sequence = self.sequences.lock().active.get(cache_id).cloned();
-        if let Some(sequence) = sequence {
-            sequence.abort();
-            self.sequences.lock().remove_ended_exact(&sequence);
-        }
-    }
-
-    async fn complete_cache(&self, completion: ExecutorSequenceCompletion) -> Result<()> {
-        self.release_resident_decode();
-        let sequence = self
-            .sequences
-            .lock()
-            .active
-            .get(completion.cache_id())
-            .cloned()
-            .ok_or_else(|| {
-                FerrumError::not_found(format!(
-                    "vNext completion cache `{}` is not active",
-                    completion.cache_id()
-                ))
-            })?;
-        // Close admission but retain this incarnation while its existing work
-        // and any native transfer settle. Cancellation must not orphan it.
-        sequence.begin_closing();
-        let mut pending = PendingSequenceCompletion {
-            sequence: &sequence,
-            operation: None,
-            completed: false,
-        };
-        pending.operation = Some(sequence.operation.lock().await);
-        validate_sequence_completion_accounting(
-            sequence.request_id(),
-            sequence.product_prompt_tokens,
-            sequence.replayed_output_tokens,
-            &completion,
-        )?;
-        self.retain_completed_sequence_boundary(&sequence).await?;
-        sequence.complete(&completion)?;
-        pending.completed = true;
-        self.sequences.lock().remove_ended_exact(&sequence);
-        Ok(())
-    }
-
     fn capabilities(&self) -> ExecutorCapabilities {
         ExecutorCapabilities {
             max_batch_size: self.policy.memory().maximum_active_sequences as usize,
@@ -11184,7 +9449,7 @@ mod tests {
 
     use super::{
         apply_teacher_forced_decision, bounded_wall_anchor, budget_reusable_decode_seed_prefill,
-        decode_output_width, decode_selected_token, is_language_masked_argmax_operation,
+        decode_selected_token, is_language_masked_argmax_operation,
         is_language_token_embedding_operation, journal_clock_anchor_required,
         nonterminal_completion_message, normalized_product_token_mask,
         padded_repetition_token_id_bytes, product_output_mode_for_roles, product_repetition_input,
@@ -11194,17 +9459,16 @@ mod tests {
         reusable_execution_program_catalog_is_usable, reusable_execution_requires_eager_fallback,
         reusable_program_identity_required, reusable_startup_case_budget_violation,
         submission_execution_policy_for_timing, validate_sequence_completion_accounting,
-        AdmissionFitPolicy, DecodeFailureDisposition, FerrumError, SequenceFitPolicy,
-        VNextDeviceTimingMetrics, VNextExecutionWaveKind, VNextParticipantOutputRole,
-        VNextPhysicalSpanTimingMetrics, VNextPreparedWaveTopologyMetrics, VNextProductOutputMode,
-        VNextProductTokenMaskContent, VNextProductTokenMaskResidency,
-        VNextProductTokenMaskResidencyTransaction, VNextProductTokenMaskSlotIdentity,
-        VNextProductTokenMaskSlotTarget, VNextReusableExecutionCatalogMissKey,
-        VNextReusableExecutionCatalogMissLedger, VNextReusableExecutionCatalogMissReason,
-        VNextReusableExecutionDescriptor, VNextReusableExecutionMetrics,
-        VNextReusableExecutionStartupPlan, VNextTeacherForcedDecision, VNextWaveTimingMetrics,
-        VNextWaveTimingSink, MAX_PRODUCT_TOKEN_MASK_SLOT_CACHE_ENTRIES,
-        MAX_REUSABLE_EXECUTION_CATALOG_MISS_KEYS,
+        AdmissionFitPolicy, FerrumError, SequenceFitPolicy, VNextDeviceTimingMetrics,
+        VNextExecutionWaveKind, VNextParticipantOutputRole, VNextPhysicalSpanTimingMetrics,
+        VNextPreparedWaveTopologyMetrics, VNextProductOutputMode, VNextProductTokenMaskContent,
+        VNextProductTokenMaskResidency, VNextProductTokenMaskResidencyTransaction,
+        VNextProductTokenMaskSlotIdentity, VNextProductTokenMaskSlotTarget,
+        VNextReusableExecutionCatalogMissKey, VNextReusableExecutionCatalogMissLedger,
+        VNextReusableExecutionCatalogMissReason, VNextReusableExecutionDescriptor,
+        VNextReusableExecutionMetrics, VNextReusableExecutionStartupPlan,
+        VNextTeacherForcedDecision, VNextWaveTimingMetrics, VNextWaveTimingSink,
+        MAX_PRODUCT_TOKEN_MASK_SLOT_CACHE_ENTRIES, MAX_REUSABLE_EXECUTION_CATALOG_MISS_KEYS,
     };
     use ferrum_execution::model_executor::{
         ExecutorSamplingOutput, ExecutorSequenceCompletion, GreedyRepetitionPenalty,
@@ -12236,26 +10500,6 @@ mod tests {
     }
 
     #[test]
-    fn decode_capacity_deferral_preserves_plan_runtime_sequence() {
-        let error = FerrumError::resource_exhausted("dynamic pool is waiting for release");
-
-        assert_eq!(
-            DecodeFailureDisposition::from_error(&error),
-            DecodeFailureDisposition::PreserveForCapacityRetry
-        );
-    }
-
-    #[test]
-    fn decode_permanent_failure_aborts_plan_runtime_sequence() {
-        let error = FerrumError::request_validation("sequence exceeds its configured ceiling");
-
-        assert_eq!(
-            DecodeFailureDisposition::from_error(&error),
-            DecodeFailureDisposition::AbortSequence
-        );
-    }
-
-    #[test]
     fn completion_readback_policy_declares_only_canonical_greedy_scalar_batches() {
         use super::{ElementType, VNextTerminalReadbacks};
         use ferrum_runtime::{
@@ -12674,14 +10918,6 @@ mod tests {
         assert!(decode_selected_token(&8_u32.to_le_bytes(), 8).is_err());
         assert!(decode_selected_token(&u32::MAX.to_le_bytes(), 8).is_err());
         assert!(decode_selected_token(&[0, 1, 2], 8).is_err());
-    }
-
-    #[test]
-    fn decode_output_width_accepts_only_full_logits_or_one_token_sentinel() {
-        assert_eq!(decode_output_width(1, 248_320).unwrap(), 1);
-        assert_eq!(decode_output_width(248_320, 248_320).unwrap(), 248_320);
-        assert!(decode_output_width(2, 248_320).is_err());
-        assert!(decode_output_width(0, 248_320).is_err());
     }
 
     #[test]

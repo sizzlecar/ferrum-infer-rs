@@ -2,7 +2,7 @@
 use super::*;
 
 #[cfg(test)]
-mod runtime_tests;
+pub(super) mod runtime_tests;
 
 /// Uniform waves retain their existing allocation-free mode representation.
 /// Participant modes exist only when a pure decode wave can safely avoid

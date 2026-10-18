@@ -7,7 +7,6 @@ use futures::StreamExt;
 // remain protocol fixtures, not model numerical evidence.
 struct StopBoundaryExecutor {
     inner: ferrum_testkit::ConfigurableModelExecutor,
-    tokens: ControlledTokenState,
 }
 
 impl StopBoundaryExecutor {
@@ -16,7 +15,6 @@ impl StopBoundaryExecutor {
             inner: ferrum_testkit::ConfigurableModelExecutor::with_token_sequence(
                 vocabulary, tokens,
             ),
-            tokens: ControlledTokenState::default(),
         }
     }
 }
@@ -45,58 +43,20 @@ impl ModelExecutor for StopBoundaryExecutor {
     }
     async fn admit_tokens(&self, input: ExecutionAdmission<'_>) -> Result<TokenAdmissionOutcome> {
         assert!(input.adapter.is_none());
-        controlled_token_fixture::admit(self, &self.tokens, input)
+        self.inner.admit_tokens(input).await
     }
     async fn execute_tokens(&self, work: &[ExecutionWork<'_>]) -> Result<ExecutionBatchOutcome> {
-        controlled_token_fixture::execute(self, &self.tokens, work).await
+        self.inner.execute_tokens(work).await
     }
     async fn finish_tokens(
         &self,
         sequence: &ExecutorSequence,
         reason: ExecutionEndReason,
     ) -> Result<ExecutionCloseOutcome> {
-        controlled_token_fixture::finish(self, &self.tokens, sequence, reason).await
+        self.inner.finish_tokens(sequence, reason).await
     }
     fn cancel_tokens(&self, sequence: &ExecutorSequence) -> Result<ExecutionCloseOutcome> {
-        controlled_token_fixture::cancel(self, &self.tokens, sequence)
-    }
-    async fn plan_runtime_prefill_with_capacity(
-        &self,
-        input: &PlanRuntimePrefillInput,
-    ) -> Result<PlanRuntimePrefillOutcome> {
-        let output = self
-            .inner
-            .prefill(&plan_runtime_prefill_to_mock_input(input))
-            .await?;
-        plan_runtime_prefill_completion_from_mock(
-            &input.request_id,
-            ExecutorPrefillCompletion::exact(output, input.chunk),
-        )
-        .map(PlanRuntimePrefillOutcome::Completed)
-    }
-    async fn plan_runtime_batch_decode_with_capacity(
-        &self,
-        inputs: &[PlanRuntimeDecodeInput],
-    ) -> Result<PlanRuntimeBatchDecodeOutcome> {
-        let mut outputs = Vec::new();
-        for input in inputs {
-            let old = DecodeInput::new(
-                MockTensor::from_f32(vec![input.input_token.get() as f32], &[1, 1]).into_ref(),
-                input.kv_cache.clone(),
-            );
-            let output = self.inner.decode(&old).await?;
-            outputs.push(PlanRuntimeDecodeOutput::new(
-                ExecutorSamplingOutput::FullLogits(output.logits.to_vec_f32()?),
-                output.kv_cache,
-            ));
-        }
-        Ok(PlanRuntimeBatchDecodeOutcome::Completed(outputs))
-    }
-    async fn prefill(&self, _: &PrefillInput) -> Result<PrefillOutput> {
-        panic!("Engine must execute the controlled token protocol")
-    }
-    async fn decode(&self, _: &DecodeInput) -> Result<DecodeOutput> {
-        panic!("Engine must execute the controlled token protocol")
+        self.inner.cancel_tokens(sequence)
     }
 }
 

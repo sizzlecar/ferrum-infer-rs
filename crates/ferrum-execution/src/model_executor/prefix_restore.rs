@@ -1,38 +1,9 @@
 //! Publication of restored state before constructing a prefill batch.
 
-use super::{KvCacheHandle, PlanRuntimePrefillAuthority, PrefixCaptureLease};
+use super::PrefixCaptureLease;
 use crate::token_execution::{ExecutionFrontier, ExecutorSequence};
 use ferrum_types::{FerrumError, RequestId, Result, TokenId};
 use std::{fmt, sync::Arc};
-
-enum RestoreAcknowledgement {
-    Legacy(Box<dyn FnOnce() -> Result<()> + Send>),
-    Tokens {
-        sequence: ExecutorSequence,
-        acknowledge: Box<dyn FnOnce() -> Result<ExecutionFrontier> + Send>,
-    },
-}
-
-impl RestoreAcknowledgement {
-    fn acknowledge(self, restored_tokens: usize) -> Result<Option<ExecutionFrontier>> {
-        match self {
-            Self::Legacy(acknowledge) => acknowledge().map(|()| None),
-            Self::Tokens {
-                sequence,
-                acknowledge,
-            } => {
-                let frontier = acknowledge()?;
-                if frontier.sequence() != &sequence || frontier.consumed_tokens() != restored_tokens
-                {
-                    return Err(FerrumError::backend(
-                        "prefix acknowledgement returned a different incarnation or frontier",
-                    ));
-                }
-                Ok(Some(frontier))
-            }
-        }
-    }
-}
 
 /// Observation only: neither an index hit nor a completed copy authorizes use
 /// of restored state. `Restored` is emitted after publication acknowledgement.
@@ -129,149 +100,246 @@ pub enum PlanRuntimePrefixRestoreOutcome {
     Deferred(PlanRuntimePrefixRestoreDeferral),
 }
 
-/// Independently restored state whose execution gate remains closed while the
-/// engine installs its physical cache authority and advances scheduler progress.
+/// Independently restored state whose execution gate remains closed until the
+/// caller validates its admitted incarnation and acknowledges publication.
 ///
-/// The executor callback owns the native publication guard. Dropping this value
-/// must drop that guard and cancel its exact target; the callback must never
-/// retain only a request id or a later registry lookup. No logits are cached:
-/// at least one remaining prompt token must execute before sampling.
-#[must_use = "publish matching progress and acknowledge, or drop to cancel the restored target"]
+/// The callback owns the native publication guard. Dropping this value must
+/// cancel that exact target; a request ID lookup cannot replace its ownership.
+/// Source liveness, physical extent and target identity are validated by the
+/// callback. These outer fields are observations, not native authorization.
+/// At least one remaining prompt token must execute before sampling.
+#[must_use = "acknowledge the matching admitted frontier, or drop to cancel the restored target"]
 pub struct PlanRuntimePrefixRestoreOutput {
-    authority: PlanRuntimePrefillAuthority,
+    request_id: RequestId,
+    restored_tokens: usize,
     prompt_tokens: usize,
-    acknowledge: RestoreAcknowledgement,
+    sequence: ExecutorSequence,
+    acknowledge: Box<dyn FnOnce() -> Result<ExecutionFrontier> + Send>,
 }
 
 impl PlanRuntimePrefixRestoreOutput {
-    /// Implementer constructor. The callback must own and acknowledge the
-    /// exact native restoration, revalidating cancellation and target identity.
-    /// Rejected construction drops the callback and its retained guard.
-    pub fn new(
-        request_id: RequestId,
-        restored_tokens: usize,
-        prompt_tokens: usize,
-        kv_cache: Arc<dyn KvCacheHandle>,
-        acknowledge: impl FnOnce() -> Result<()> + Send + 'static,
-    ) -> Result<Self> {
-        let output = Self {
-            authority: PlanRuntimePrefillAuthority {
-                request_id,
-                committed_tokens: restored_tokens,
-                kv_cache,
-            },
-            prompt_tokens,
-            acknowledge: RestoreAcknowledgement::Legacy(Box::new(acknowledge)),
-        };
-        output.validate_for(output.request_id(), prompt_tokens)?;
-        Ok(output)
-    }
-
-    /// The same native publication callback returns the actual executable
-    /// frontier after acknowledgement. No lookup by request id can replace it.
+    /// Retain the original publication callback and exact token incarnation.
+    /// Rejected construction drops the callback and its native rollback guard.
     pub fn new_tokens(
         request_id: RequestId,
         restored_tokens: usize,
         prompt_tokens: usize,
-        kv_cache: Arc<dyn KvCacheHandle>,
         sequence: ExecutorSequence,
         acknowledge: impl FnOnce() -> Result<ExecutionFrontier> + Send + 'static,
     ) -> Result<Self> {
         let output = Self {
-            authority: PlanRuntimePrefillAuthority {
-                request_id,
-                committed_tokens: restored_tokens,
-                kv_cache,
-            },
+            request_id,
+            restored_tokens,
             prompt_tokens,
-            acknowledge: RestoreAcknowledgement::Tokens {
-                sequence,
-                acknowledge: Box::new(acknowledge),
-            },
+            sequence,
+            acknowledge: Box::new(acknowledge),
         };
-        output.validate_for(output.request_id(), prompt_tokens)?;
+        output.validate_for(output.request_id(), prompt_tokens, output.token_sequence())?;
         Ok(output)
     }
 
-    pub fn token_sequence(&self) -> Option<&ExecutorSequence> {
-        match &self.acknowledge {
-            RestoreAcknowledgement::Legacy(_) => None,
-            RestoreAcknowledgement::Tokens { sequence, .. } => Some(sequence),
-        }
+    pub fn token_sequence(&self) -> &ExecutorSequence {
+        &self.sequence
     }
 
     pub fn request_id(&self) -> &RequestId {
-        self.authority.request_id()
+        &self.request_id
     }
 
     pub fn restored_tokens(&self) -> usize {
-        self.authority.committed_tokens()
+        self.restored_tokens
     }
 
-    pub fn kv_cache(&self) -> &Arc<dyn KvCacheHandle> {
-        self.authority.kv_cache()
-    }
-
-    pub fn validate_for(&self, request_id: &RequestId, prompt_tokens: usize) -> Result<()> {
-        if self.request_id() != request_id || self.prompt_tokens != prompt_tokens {
+    /// Compare against the caller's actual admitted incarnation before opening
+    /// the native gate. Matching request text alone cannot establish this link.
+    pub fn validate_for(
+        &self,
+        request_id: &RequestId,
+        prompt_tokens: usize,
+        sequence: &ExecutorSequence,
+    ) -> Result<()> {
+        if self.request_id() != request_id
+            || self.prompt_tokens != prompt_tokens
+            || self.token_sequence() != sequence
+        {
             return Err(FerrumError::backend(
-                "prefix restore publication does not match the admitted request",
+                "prefix restore publication does not match the admitted request incarnation",
             ));
         }
-        let restored = self.restored_tokens();
-        if restored == 0 || restored >= prompt_tokens {
+        if self.restored_tokens == 0 || self.restored_tokens >= prompt_tokens {
             return Err(FerrumError::backend(
                 "prefix restore must leave a nonempty prompt suffix for execution",
             ));
         }
-        if self.kv_cache().num_tokens() != restored || !self.kv_cache().is_valid() {
+        if self.sequence.observed_end().is_some() {
             return Err(FerrumError::backend(
-                "prefix restore cache authority does not match the restored extent",
+                "prefix restore publication belongs to an ended incarnation",
             ));
         }
         Ok(())
     }
 
-    /// Opens the native execution gate only after outer progress is installed.
-    /// An error requires cancellation of the corresponding outer request; it
-    /// does not authorize falling back to execution on the restored target.
-    pub fn acknowledge(self) -> Result<PlanRuntimePrefillAuthority> {
-        let Self {
-            authority,
-            acknowledge,
-            ..
-        } = self;
-        acknowledge.acknowledge(authority.committed_tokens())?;
-        Ok(authority)
-    }
-
-    /// Opens the original publication gate and returns its actual frontier.
-    /// Legacy-only callbacks are rejected without invoking acknowledgement.
-    /// An error requires closing the exact target, never replaying from zero.
+    /// Open the original native publication gate and return its actual frontier.
+    /// The callback must revalidate cancellation and the physical restored target.
+    /// Any error requires closing this incarnation, never replaying from zero.
     pub fn acknowledge_tokens(self) -> Result<ExecutionFrontier> {
-        let Self {
-            authority,
-            acknowledge,
-            ..
-        } = self;
-        if matches!(&acknowledge, RestoreAcknowledgement::Legacy(_)) {
-            return Err(FerrumError::unsupported(
-                "prefix restore implementation has no token frontier publication",
+        self.validate_for(&self.request_id, self.prompt_tokens, &self.sequence)?;
+        let frontier = (self.acknowledge)()?;
+        if frontier.sequence() != &self.sequence
+            || frontier.consumed_tokens() != self.restored_tokens
+        {
+            return Err(FerrumError::backend(
+                "prefix acknowledgement returned a different incarnation or frontier",
             ));
         }
-        acknowledge
-            .acknowledge(authority.committed_tokens())?
-            .ok_or_else(|| {
-                FerrumError::internal("token prefix acknowledgement omitted its frontier")
-            })
+        Ok(frontier)
     }
 }
 
 impl fmt::Debug for PlanRuntimePrefixRestoreOutput {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("PlanRuntimePrefixRestoreOutput")
-            .field("authority", &self.authority)
+            .field("request_id", &self.request_id)
+            .field("restored_tokens", &self.restored_tokens)
             .field("prompt_tokens", &self.prompt_tokens)
+            .field("sequence", &self.sequence)
             .finish_non_exhaustive()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::token_execution::ExecutorSequenceIssuer;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct RetainedCallback(Arc<AtomicUsize>);
+
+    impl Drop for RetainedCallback {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    fn publication(
+        request: RequestId,
+        sequence: ExecutorSequence,
+        restored: usize,
+        result: ExecutionFrontier,
+        called: &Arc<AtomicUsize>,
+        dropped: &Arc<AtomicUsize>,
+    ) -> Result<PlanRuntimePrefixRestoreOutput> {
+        let retained = RetainedCallback(Arc::clone(dropped));
+        let called = Arc::clone(called);
+        PlanRuntimePrefixRestoreOutput::new_tokens(request, restored, 8, sequence, move || {
+            called.fetch_add(1, Ordering::SeqCst);
+            drop(retained);
+            Ok(result)
+        })
+    }
+
+    #[test]
+    fn publication_requires_the_admitted_request_and_incarnation() {
+        let issuer = ExecutorSequenceIssuer::new();
+        let sequence = issuer.issue_sequence().unwrap();
+        let replacement = issuer.issue_sequence().unwrap();
+        let request = RequestId::new();
+        let called = Arc::new(AtomicUsize::new(0));
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let output = publication(
+            request.clone(),
+            sequence.clone(),
+            3,
+            issuer.frontier(&sequence, 3).unwrap(),
+            &called,
+            &dropped,
+        )
+        .unwrap();
+        assert!(output.validate_for(&request, 8, &replacement).is_err());
+        assert!(output
+            .validate_for(&RequestId::new(), 8, &sequence)
+            .is_err());
+        assert!(output.validate_for(&request, 9, &sequence).is_err());
+        assert_eq!(called.load(Ordering::SeqCst), 0);
+        output.validate_for(&request, 8, &sequence).unwrap();
+        let frontier = output.acknowledge_tokens().unwrap();
+        assert_eq!(frontier.sequence(), &sequence);
+        assert_eq!(frontier.consumed_tokens(), 3);
+        assert_eq!(called.load(Ordering::SeqCst), 1);
+        assert_eq!(dropped.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn publication_rejects_invalid_extent_without_opening_callback() {
+        let issuer = ExecutorSequenceIssuer::new();
+        for restored in [0, 8, 9] {
+            let sequence = issuer.issue_sequence().unwrap();
+            let called = Arc::new(AtomicUsize::new(0));
+            let dropped = Arc::new(AtomicUsize::new(0));
+            assert!(publication(
+                RequestId::new(),
+                sequence.clone(),
+                restored,
+                issuer.frontier(&sequence, restored).unwrap(),
+                &called,
+                &dropped,
+            )
+            .is_err());
+            assert_eq!(called.load(Ordering::SeqCst), 0);
+            assert_eq!(dropped.load(Ordering::SeqCst), 1);
+        }
+    }
+
+    #[test]
+    fn publication_rejects_conflicting_actual_frontier() {
+        let issuer = ExecutorSequenceIssuer::new();
+        let sequence = issuer.issue_sequence().unwrap();
+        let replacement = issuer.issue_sequence().unwrap();
+        for result in [
+            issuer.frontier(&replacement, 3).unwrap(),
+            issuer.frontier(&sequence, 4).unwrap(),
+        ] {
+            let called = Arc::new(AtomicUsize::new(0));
+            let dropped = Arc::new(AtomicUsize::new(0));
+            let output = publication(
+                RequestId::new(),
+                sequence.clone(),
+                3,
+                result,
+                &called,
+                &dropped,
+            )
+            .unwrap();
+            assert!(output.acknowledge_tokens().is_err());
+            assert_eq!(called.load(Ordering::SeqCst), 1);
+            assert_eq!(dropped.load(Ordering::SeqCst), 1);
+        }
+    }
+
+    #[test]
+    fn discarded_or_ended_publication_drops_callback_without_acknowledging() {
+        let issuer = ExecutorSequenceIssuer::new();
+        for ended in [false, true] {
+            let sequence = issuer.issue_sequence().unwrap();
+            let called = Arc::new(AtomicUsize::new(0));
+            let dropped = Arc::new(AtomicUsize::new(0));
+            let output = publication(
+                RequestId::new(),
+                sequence.clone(),
+                3,
+                issuer.frontier(&sequence, 3).unwrap(),
+                &called,
+                &dropped,
+            )
+            .unwrap();
+            if ended {
+                issuer.ended(&sequence).unwrap();
+                assert!(output.acknowledge_tokens().is_err());
+            } else {
+                drop(output);
+            }
+            assert_eq!(called.load(Ordering::SeqCst), 0);
+            assert_eq!(dropped.load(Ordering::SeqCst), 1);
+        }
     }
 }

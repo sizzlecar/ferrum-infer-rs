@@ -4,8 +4,7 @@
 
 use super::*;
 use ferrum_execution::model_executor::{
-    DecodeInput, DecodeOutput, ExecutorCapabilities, ExecutorStatus, KvSlotRequest, PrefillChunk,
-    PrefillInput, PrefillOutput,
+    ExecutorCapabilities, ExecutorStatus, KvSlotRequest, PrefillChunk,
 };
 use ferrum_execution::token_execution::*;
 use ferrum_kernels::backend::cpu::CpuBackend;
@@ -106,12 +105,6 @@ impl ModelExecutor for CloseGate {
     }
     async fn execute_tokens(&self, input: &[ExecutionWork<'_>]) -> Result<ExecutionBatchOutcome> {
         self.inner.execute_tokens(input).await
-    }
-    async fn prefill(&self, _: &PrefillInput) -> Result<PrefillOutput> {
-        panic!("no tensor bridge in this fixture")
-    }
-    async fn decode(&self, _: &DecodeInput) -> Result<DecodeOutput> {
-        panic!("no tensor bridge in this fixture")
     }
     async fn finish_tokens(
         &self,

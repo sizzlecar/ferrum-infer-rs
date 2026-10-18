@@ -1,49 +1,88 @@
+//! Retained mixed-role guards over the real common token execution boundary.
 use super::*;
 use ferrum_execution::model_executor::TokenSelectionMask;
-use ferrum_testkit::MockKvCacheHandle;
 
-fn prefill(request_id: RequestId, chunk: PrefillChunk) -> PlanRuntimePrefillInput {
-    let tokens = (0..chunk.total_prompt_tokens())
-        .map(|token| TokenId::new(token as u32))
-        .collect::<Vec<_>>();
-    PlanRuntimePrefillInput::new(request_id, tokens, 32, chunk).unwrap()
-}
-
-fn decode(request_id: RequestId) -> PlanRuntimeDecodeInput {
-    PlanRuntimeDecodeInput::new(
-        request_id.clone(),
-        TokenId::new(3),
-        Arc::new(MockKvCacheHandle::new(request_id, 1, 4)),
+#[tokio::test]
+async fn mixed_frontiers_reject_the_same_incarnation_in_both_phases_before_state_changes() {
+    let fixture = cpu(SamplingReadbackMode::Uniform);
+    let request = RequestId::new();
+    let tokens = [TokenId::new(0), TokenId::new(1)];
+    let frontier = admit_tokens(&fixture, &request, &tokens).await;
+    let policy = LogitsReturnPolicy::FullLogits;
+    let before = fixture.executor.cache_metrics_snapshot().unwrap();
+    let work = [
+        ExecutionWork::new(
+            &frontier,
+            TokenWork::Prefill(PrefillChunk::new(0, 1, 2).unwrap()),
+            &policy,
+        )
+        .unwrap(),
+        ExecutionWork::new(
+            &frontier,
+            TokenWork::Decode {
+                token: TokenId::new(1),
+                position: 0,
+            },
+            &policy,
+        )
+        .unwrap(),
+    ];
+    assert!(fixture.executor.execute_tokens(&work).await.is_err());
+    assert_no_adapter_execution(&fixture.executor, &before);
+    let completion = execute_one(
+        &fixture,
+        &frontier,
+        TokenWork::Prefill(PrefillChunk::new(0, 2, 2).unwrap()),
     )
+    .await;
+    assert_eq!(completion.next_frontier().consumed_tokens(), 2);
+    close(&fixture.executor, frontier.sequence()).await;
 }
 
-#[test]
-fn mixed_frontiers_reject_the_same_request_in_both_phases_before_state_changes() {
-    let id = RequestId::new();
-    let prompt = prefill(id.clone(), PrefillChunk::new(0, 2, 4).unwrap());
-    let continuation = decode(id);
-    assert!(validate_mixed_request_ids(&[prompt], &[continuation]).is_err());
-}
-
-#[test]
-fn mixed_frontiers_reject_duplicate_decodes_and_duplicate_prefills() {
-    let prompt = prefill(RequestId::new(), PrefillChunk::new(0, 2, 4).unwrap());
-    let continuation = decode(RequestId::new());
-    assert!(validate_mixed_request_ids(
-        &[prompt.clone(), prompt.clone()],
-        std::slice::from_ref(&continuation),
-    )
-    .is_err());
-    assert!(validate_mixed_request_ids(&[prompt], &[continuation.clone(), continuation]).is_err());
+#[tokio::test]
+async fn mixed_frontiers_reject_duplicate_decodes_and_duplicate_prefills() {
+    let fixture = cpu(SamplingReadbackMode::Uniform);
+    let request = RequestId::new();
+    let tokens = [TokenId::new(0)];
+    let frontier = admit_tokens(&fixture, &request, &tokens).await;
+    let policy = LogitsReturnPolicy::FullLogits;
+    let work = TokenWork::Prefill(PrefillChunk::new(0, 1, 1).unwrap());
+    let before = fixture.executor.cache_metrics_snapshot().unwrap();
+    assert!(fixture
+        .executor
+        .execute_tokens(&[
+            ExecutionWork::new(&frontier, work, &policy).unwrap(),
+            ExecutionWork::new(&frontier, work, &policy).unwrap(),
+        ])
+        .await
+        .is_err());
+    assert_no_adapter_execution(&fixture.executor, &before);
+    let prefill = execute_one(&fixture, &frontier, work).await;
+    let next = prefill.next_frontier();
+    let decode = TokenWork::Decode {
+        token: TokenId::new(1),
+        position: 1,
+    };
+    let before = fixture.executor.cache_metrics_snapshot().unwrap();
+    assert!(fixture
+        .executor
+        .execute_tokens(&[
+            ExecutionWork::new(next, decode, &policy).unwrap(),
+            ExecutionWork::new(next, decode, &policy).unwrap(),
+        ])
+        .await
+        .is_err());
+    assert_no_adapter_execution(&fixture.executor, &before);
+    let output = execute_one(&fixture, next, decode).await;
+    assert_eq!(
+        sampling(&output),
+        &ExecutorSamplingOutput::FullLogits(vec![3.0, 2.0, 1.0, -4.0])
+    );
+    close(&fixture.executor, next.sequence()).await;
 }
 
 #[test]
 fn mixed_readback_roles_preserve_final_logits_and_decode_processors() {
-    let final_prompt = prefill(RequestId::new(), PrefillChunk::new(2, 3, 5).unwrap());
-    let intermediate_prompt = prefill(RequestId::new(), PrefillChunk::new(0, 4, 9).unwrap());
-    let continuation = decode(RequestId::new());
-    validate_mixed_request_ids(&[final_prompt, intermediate_prompt], &[continuation]).unwrap();
-
     let greedy = LogitsReturnPolicy::GreedyArgmax {
         token_mask: Some(TokenSelectionMask::new(vec![1, 0, 1, 1])),
         repetition_penalty: None,

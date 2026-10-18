@@ -71,22 +71,29 @@ async fn settle_worker(executor: &VNextModelExecutor<CpuRuntime>) {
     marker(&executor.completion_worker).await;
 }
 
-fn sequence(cache: &Arc<dyn KvCacheHandle>) -> Weak<VNextSequence<CpuRuntime>> {
-    cache
-        .as_any()
-        .downcast_ref::<VNextKvCacheHandle<CpuRuntime>>()
+fn sequence(
+    executor: &VNextModelExecutor<CpuRuntime>,
+    frontier: &ExecutionFrontier,
+) -> Weak<VNextSequence<CpuRuntime>> {
+    executor
+        .sequences
+        .lock()
+        .token_index
+        .get(frontier.sequence())
         .unwrap()
-        .sequence
         .clone()
 }
 
-fn input(
-    request_id: &RequestId,
-    cache: &Arc<dyn KvCacheHandle>,
-    token: u32,
-) -> PlanRuntimeDecodeInput {
-    PlanRuntimeDecodeInput::new(request_id.clone(), TokenId::new(token), Arc::clone(cache))
-        .with_logits_policy(LogitsReturnPolicy::FullLogits)
+fn input(frontier: &ExecutionFrontier, token: u32) -> ExecutionWork<'_> {
+    ExecutionWork::new(
+        frontier,
+        TokenWork::Decode {
+            token: TokenId::new(token),
+            position: frontier.consumed_tokens(),
+        },
+        &LogitsReturnPolicy::FullLogits,
+    )
+    .unwrap()
 }
 
 fn assert_no_live_resources(executor: &VNextModelExecutor<CpuRuntime>) {
@@ -155,7 +162,7 @@ fn close_fixture(fixture: Fixture<CpuRuntime>) {
 
 async fn assert_cancelled(
     executor: &VNextModelExecutor<CpuRuntime>,
-    inputs: &[PlanRuntimeDecodeInput],
+    inputs: &[ExecutionWork<'_>],
     owners: &[Weak<VNextSequence<CpuRuntime>>],
 ) {
     settle_worker(executor).await;
@@ -167,10 +174,7 @@ async fn assert_cancelled(
         );
     }
     let before = executor.metrics.submitted_waves.load(Ordering::Relaxed);
-    assert!(executor
-        .plan_runtime_batch_decode_with_capacity(inputs)
-        .await
-        .is_err());
+    assert!(executor.execute_tokens(inputs).await.is_err());
     assert_eq!(
         executor.metrics.submitted_waves.load(Ordering::Relaxed),
         before,
@@ -217,22 +221,21 @@ async fn sampling_readback_cpu_lifecycle_full_logits_retires_and_completes_real_
         admit(&fixture, &ids[0]).await,
         admit(&fixture, &ids[1]).await,
     ];
-    let owners = caches.iter().map(sequence).collect::<Vec<_>>();
+    let owners = caches
+        .iter()
+        .map(|frontier| sequence(executor, frontier))
+        .collect::<Vec<_>>();
     // Reverse caller order relative to admission; the independent numerical
     // oracle is the fixture's dyadic embedding row and identity dense head.
-    let inputs = [input(&ids[1], &caches[1], 3), input(&ids[0], &caches[0], 1)];
+    let inputs = [input(&caches[1], 3), input(&caches[0], 1)];
     let before = executor.metrics.submitted_waves.load(Ordering::Relaxed);
-    let PlanRuntimeBatchDecodeOutcome::Completed(outputs) = executor
-        .plan_runtime_batch_decode_with_capacity(&inputs)
-        .await
-        .unwrap()
-    else {
-        panic!("admitted CPU cohort unexpectedly deferred")
-    };
+    let outputs = completed(executor.execute_tokens(&inputs).await.unwrap());
     assert_eq!(outputs.len(), 2);
     let expected = [[1.0_f32, 1.0009765625, -1.0, -2.0], [3.0, 2.0, 1.0, -4.0]];
-    for ((output, input), expected) in outputs.iter().zip(&inputs).zip(expected) {
-        let ExecutorSamplingOutput::FullLogits(logits) = &output.sampling_output else {
+    for (index, ((output, input), expected)) in
+        outputs.iter().zip(&inputs).zip(expected).enumerate()
+    {
+        let ExecutorSamplingOutput::FullLogits(logits) = sampling(output) else {
             panic!("full-logits policy was not retained")
         };
         assert_eq!(
@@ -242,8 +245,9 @@ async fn sampling_readback_cpu_lifecycle_full_logits_retires_and_completes_real_
                 .collect::<Vec<_>>(),
             expected.map(f32::to_bits)
         );
-        assert_eq!(output.kv_cache.cache_id(), input.kv_cache.cache_id());
-        assert_eq!(output.kv_cache.num_tokens(), 2);
+        output.validate_for(index, input, VOCAB).unwrap();
+        assert_eq!(output.next_frontier().sequence(), input.sequence());
+        assert_eq!(output.next_frontier().consumed_tokens(), 2);
     }
     assert_eq!(
         executor.metrics.submitted_waves.load(Ordering::Relaxed),
@@ -254,28 +258,28 @@ async fn sampling_readback_cpu_lifecycle_full_logits_retires_and_completes_real_
     for (owner, token) in owners.iter().zip([1, 3]) {
         assert_eq!(*owner.upgrade().unwrap().tokens.lock(), [0, token]);
     }
-    for (output, input) in outputs.iter().zip(&inputs) {
-        executor
-            .complete_cache(
-                ExecutorSequenceCompletion::new(
-                    input.request_id.clone(),
-                    output.kv_cache.cache_id(),
-                    1,
-                    1,
-                )
-                .unwrap(),
+    for output in &outputs {
+        let outcome = executor
+            .finish_tokens(
+                output.next_frontier().sequence(),
+                ExecutionEndReason::Completed {
+                    input_tokens: 1,
+                    output_tokens: 1,
+                },
             )
             .await
             .unwrap();
+        assert!(outcome.error.is_none(), "{:?}", outcome.error);
+        let ExecutionCloseDisposition::Ended(ended) = outcome.disposition else {
+            panic!("quiescent actual cohort must end")
+        };
+        assert_eq!(ended.sequence(), output.next_frontier().sequence());
     }
     settle_worker(executor).await;
     assert_no_live_resources(executor);
     assert!(owners.iter().all(|owner| owner.upgrade().is_none()));
     let before = executor.metrics.submitted_waves.load(Ordering::Relaxed);
-    assert!(executor
-        .plan_runtime_batch_decode_with_capacity(&inputs)
-        .await
-        .is_err());
+    assert!(executor.execute_tokens(&inputs).await.is_err());
     assert_eq!(
         executor.metrics.submitted_waves.load(Ordering::Relaxed),
         before
@@ -289,7 +293,7 @@ async fn sampling_readback_cpu_lifecycle_failed_retirement_returns_exact_step_ow
     let executor = &fixture.executor;
     let id = RequestId::new();
     let cache = admit(&fixture, &id).await;
-    let owner = sequence(&cache);
+    let owner = sequence(executor, &cache);
     let sequence = owner.upgrade().unwrap();
     let tokens = [0, 1];
     executor
@@ -366,7 +370,7 @@ async fn sampling_readback_cpu_lifecycle_failed_retirement_returns_exact_step_ow
     );
     drop(batch);
     drop(sequence);
-    executor.release_cache(&cache.cache_id());
+    close(executor, cache.sequence()).await;
     settle_worker(executor).await;
     assert!(owner.upgrade().is_none());
     assert_no_live_resources(executor);
@@ -379,14 +383,14 @@ async fn sampling_readback_cpu_lifecycle_cancel_waiting_for_worker_capacity() {
     let executor = &fixture.executor;
     let id = RequestId::new();
     let cache = admit(&fixture, &id).await;
-    let owners = [sequence(&cache)];
-    let inputs = [input(&id, &cache, 1)];
+    let owners = [sequence(executor, &cache)];
+    let inputs = [input(&cache, 1)];
     let gate = WorkerGate::closed(&executor.completion_worker).await;
     let mut queued = marker(&executor.completion_worker);
     assert!(futures::poll!(queued.as_mut()).is_pending());
     let scheduled = executor.completion_worker.metrics_snapshot()["scheduled_tasks"].clone();
     let before = executor.metrics.submitted_waves.load(Ordering::Relaxed);
-    let mut decode = Box::pin(executor.plan_runtime_batch_decode_with_capacity(&inputs));
+    let mut decode = Box::pin(executor.execute_tokens(&inputs));
     assert!(futures::poll!(decode.as_mut()).is_pending());
     assert_submitted_waiting(executor, before, &owners);
     assert_eq!(
@@ -410,14 +414,17 @@ async fn sampling_readback_cpu_lifecycle_cancel_queued_shared_cohort() {
         admit(&fixture, &ids[0]).await,
         admit(&fixture, &ids[1]).await,
     ];
-    let owners = caches.iter().map(sequence).collect::<Vec<_>>();
-    let inputs = [input(&ids[1], &caches[1], 3), input(&ids[0], &caches[0], 1)];
+    let owners = caches
+        .iter()
+        .map(|frontier| sequence(executor, frontier))
+        .collect::<Vec<_>>();
+    let inputs = [input(&caches[1], 3), input(&caches[0], 1)];
     let gate = WorkerGate::closed(&executor.completion_worker).await;
     let scheduled = executor.completion_worker.metrics_snapshot()["scheduled_tasks"]
         .as_u64()
         .unwrap();
     let before = executor.metrics.submitted_waves.load(Ordering::Relaxed);
-    let mut decode = Box::pin(executor.plan_runtime_batch_decode_with_capacity(&inputs));
+    let mut decode = Box::pin(executor.execute_tokens(&inputs));
     assert!(futures::poll!(decode.as_mut()).is_pending());
     assert_submitted_waiting(executor, before, &owners);
     assert_eq!(
@@ -440,15 +447,18 @@ async fn sampling_readback_cpu_lifecycle_cancel_delivered_unpolled_result() {
         admit(&fixture, &ids[0]).await,
         admit(&fixture, &ids[1]).await,
     ];
-    let owners = caches.iter().map(sequence).collect::<Vec<_>>();
-    let inputs = [input(&ids[1], &caches[1], 3), input(&ids[0], &caches[0], 1)];
+    let owners = caches
+        .iter()
+        .map(|frontier| sequence(executor, frontier))
+        .collect::<Vec<_>>();
+    let inputs = [input(&caches[1], 3), input(&caches[0], 1)];
     let gate = WorkerGate::closed(&executor.completion_worker).await;
     let before = executor.metrics.submitted_waves.load(Ordering::Relaxed);
     let readbacks_before = executor.completion_worker.metrics_snapshot()["task_classes"]
         ["wave_readback"]["completed_tasks"]
         .as_u64()
         .unwrap();
-    let mut decode = Box::pin(executor.plan_runtime_batch_decode_with_capacity(&inputs));
+    let mut decode = Box::pin(executor.execute_tokens(&inputs));
     assert!(futures::poll!(decode.as_mut()).is_pending());
     assert_submitted_waiting(executor, before, &owners);
     let mut delivered = marker(&executor.completion_worker);

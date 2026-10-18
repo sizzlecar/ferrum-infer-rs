@@ -82,14 +82,6 @@ impl ModelExecutor for AdvancedThenGatedAdmission {
     fn cancel_tokens(&self, sequence: &ExecutorSequence) -> Result<ExecutionCloseOutcome> {
         self.gate.cancel_tokens(sequence)
     }
-
-    async fn prefill(&self, _: &PrefillInput) -> Result<PrefillOutput> {
-        panic!("faulted admission must use the real direct token core")
-    }
-
-    async fn decode(&self, _: &DecodeInput) -> Result<DecodeOutput> {
-        panic!("faulted admission must use the real direct token core")
-    }
 }
 
 #[tokio::test]

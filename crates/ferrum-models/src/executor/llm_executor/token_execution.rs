@@ -10,7 +10,7 @@ use std::collections::HashMap;
 mod capacity;
 
 #[cfg(test)]
-use ferrum_execution::model_executor::ExecutorSamplingOutput;
+use ferrum_execution::model_executor::{ExecutorSamplingOutput, LogitsReturnPolicy};
 use ferrum_execution::token_execution::*;
 
 use super::*;

@@ -5,26 +5,21 @@ use ferrum_execution::token_execution::{
 };
 use ferrum_execution::{
     model_executor::{
-        DecodeInput, DecodeOutput, ExecutorAdmissionEpochs, ExecutorBatchPrefillOutcome,
-        ExecutorCapabilities, ExecutorCapacityWaitRegistration, ExecutorExecutionCapacityDeferral,
-        ExecutorExecutionCapacityPreemption, ExecutorExecutionCapacityStage,
-        ExecutorPrefillAdmission, ExecutorPrefillAdmissionDecision,
-        ExecutorPrefillAdmissionReceipt, ExecutorPrefillCompletion,
-        ExecutorPrefillMaintenanceBlocker, ExecutorPrefillMaintenanceDeferral,
-        ExecutorPrefillMaintenanceOutcome, ExecutorPrefillMaintenanceStage, ExecutorPrefillOutcome,
-        ExecutorSamplingOutput, ExecutorSequenceCompletion, ExecutorStatus,
-        PlanRuntimeBatchDecodeOutcome, PlanRuntimeBatchPrefillOutcome, PlanRuntimeDecodeInput,
-        PlanRuntimeDecodeOutput, PlanRuntimePrefillCompletion, PlanRuntimePrefillInput,
-        PlanRuntimePrefillOutcome, PlanRuntimePrefillOutput, PlanRuntimeResourceSnapshot,
-        PrefillChunk, PrefillInput, PrefillOutput,
+        ExecutorAdmissionEpochs, ExecutorCapabilities, ExecutorCapacityWaitRegistration,
+        ExecutorExecutionCapacityDeferral, ExecutorExecutionCapacityPreemption,
+        ExecutorExecutionCapacityStage, ExecutorPrefillAdmission, ExecutorPrefillAdmissionDecision,
+        ExecutorPrefillAdmissionReceipt, ExecutorPrefillMaintenanceBlocker,
+        ExecutorPrefillMaintenanceDeferral, ExecutorPrefillMaintenanceOutcome,
+        ExecutorPrefillMaintenanceStage, ExecutorSamplingOutput, ExecutorSequenceCompletion,
+        ExecutorStatus, PlanRuntimeResourceSnapshot, PrefillChunk,
     },
     ModelExecutor,
 };
 use ferrum_interfaces::kv_cache::AllocationRequest;
 use ferrum_interfaces::tokenizer::{TokenizerInfo, TokenizerType};
-use ferrum_interfaces::{KvCacheHandle, KvCacheManager, TensorRef};
+use ferrum_interfaces::{KvCacheManager, TensorRef};
 use ferrum_models::DecoderOnlyLLM;
-use ferrum_testkit::{MockKvCacheManager, MockModelExecutor, MockTensor, MockTensorFactory};
+use ferrum_testkit::{MockKvCacheManager, MockModelExecutor, MockTensorFactory};
 use ferrum_types::{DataType, Priority};
 use std::time::Duration;
 
@@ -196,56 +191,6 @@ struct PlanRuntimeBatchDecodeTestExecutor {
     mixed_calls: AtomicU64,
 }
 
-fn plan_runtime_prefill_to_mock_input(input: &PlanRuntimePrefillInput) -> PrefillInput {
-    let values = input
-        .input_tokens
-        .iter()
-        .map(|token| token.get() as f32)
-        .collect::<Vec<_>>();
-    PrefillInput::new(MockTensor::from_f32(values, &[1, input.input_tokens.len()]).into_ref())
-        .with_request_context(input.request_id.clone(), input.maximum_sequence_tokens)
-        .with_chunk(input.chunk)
-}
-
-fn plan_runtime_prefill_completion_from_mock(
-    request_id: &RequestId,
-    completion: ExecutorPrefillCompletion,
-) -> Result<PlanRuntimePrefillCompletion> {
-    let (output, planned_chunk, completed_chunk, capacity_probe_count) = completion.into_parts();
-    let logits = output.last_token_logits()?.to_vec_f32()?;
-    let cache: Arc<dyn KvCacheHandle> = Arc::new(ferrum_testkit::MockKvCacheHandle::new(
-        request_id.clone(),
-        output.kv_cache.num_layers(),
-        completed_chunk.end(),
-    ));
-    let output = if completed_chunk.is_final() {
-        PlanRuntimePrefillOutput::final_logits(
-            request_id.clone(),
-            completed_chunk.end(),
-            logits,
-            cache,
-        )?
-    } else {
-        PlanRuntimePrefillOutput::intermediate(request_id.clone(), completed_chunk.end(), cache)
-    };
-    PlanRuntimePrefillCompletion::new(output, planned_chunk, completed_chunk, capacity_probe_count)
-}
-
-fn plan_runtime_prefill_outcome_from_mock(
-    request_id: &RequestId,
-    outcome: ExecutorPrefillOutcome,
-) -> Result<PlanRuntimePrefillOutcome> {
-    match outcome {
-        ExecutorPrefillOutcome::Completed(completion) => {
-            plan_runtime_prefill_completion_from_mock(request_id, completion)
-                .map(PlanRuntimePrefillOutcome::Completed)
-        }
-        ExecutorPrefillOutcome::Deferred(deferral) => {
-            Ok(PlanRuntimePrefillOutcome::Deferred(deferral))
-        }
-    }
-}
-
 impl PlanRuntimeBatchDecodeTestExecutor {
     fn token_frontier_for_request(&self, request: &RequestId) -> Option<ExecutionFrontier> {
         self.tokens.frontier_for_request(request)
@@ -281,25 +226,6 @@ impl PlanRuntimeBatchDecodeTestExecutor {
 
 #[async_trait::async_trait]
 impl ModelExecutor for PlanRuntimeChunkedPrefillTestExecutor {
-    async fn plan_runtime_batch_decode_with_capacity(
-        &self,
-        inputs: &[PlanRuntimeDecodeInput],
-    ) -> Result<PlanRuntimeBatchDecodeOutcome> {
-        let mut outputs = Vec::new();
-        for input in inputs {
-            let old = DecodeInput::new(
-                MockTensor::from_f32(vec![input.input_token.get() as f32], &[1, 1]).into_ref(),
-                input.kv_cache.clone(),
-            );
-            let output = self.decode(&old).await?;
-            outputs.push(PlanRuntimeDecodeOutput::new(
-                ExecutorSamplingOutput::FullLogits(output.logits.to_vec_f32()?),
-                output.kv_cache,
-            ));
-        }
-        Ok(PlanRuntimeBatchDecodeOutcome::Completed(outputs))
-    }
-
     async fn admit_tokens(&self, input: ExecutionAdmission<'_>) -> Result<TokenAdmissionOutcome> {
         controlled_token_fixture::admit(self, &self.tokens, input)
     }
@@ -548,131 +474,6 @@ impl ModelExecutor for PlanRuntimeChunkedPrefillTestExecutor {
         })
     }
 
-    async fn prefill(&self, input: &PrefillInput) -> Result<PrefillOutput> {
-        self.inner.prefill(input).await
-    }
-
-    async fn prefill_with_capacity(&self, input: &PrefillInput) -> Result<ExecutorPrefillOutcome> {
-        let request_id = input
-            .request_id
-            .as_ref()
-            .ok_or_else(|| FerrumError::request_validation("missing request id"))?;
-        let chunk = input
-            .chunk
-            .ok_or_else(|| FerrumError::request_validation("missing typed prefill chunk"))?;
-        if !self
-            .retained
-            .lock()
-            .expect("chunked prefill retained mutex poisoned")
-            .contains(request_id)
-        {
-            return Err(FerrumError::internal(
-                "chunked prefill submit has no retained admission",
-            ));
-        }
-        self.attempted_chunks
-            .lock()
-            .expect("chunked prefill attempt mutex poisoned")
-            .push(chunk);
-        if let Some(state) = &self.prefix_retry {
-            state.computed(request_id, chunk);
-        }
-
-        if self.defer_next_prefill.swap(false, Ordering::AcqRel) {
-            return Ok(ExecutorPrefillOutcome::Deferred(
-                test_execution_capacity_deferral(
-                    self.epochs(),
-                    self.wait_condition(),
-                    ExecutorExecutionCapacityStage::StepAdmission,
-                )
-                .into(),
-            ));
-        }
-
-        let completed_chunk = if self.narrow_next_prefill.swap(false, Ordering::AcqRel) {
-            PrefillChunk::new(
-                chunk.tokens_processed(),
-                chunk.tokens_to_process().div_ceil(2),
-                chunk.total_prompt_tokens(),
-            )?
-        } else {
-            chunk
-        };
-        let mut completed_input = input.clone();
-        completed_input.chunk = Some(completed_chunk);
-        let output = self.inner.prefill(&completed_input).await?;
-        if let Some(state) = &self.rendezvous {
-            state.retired(request_id, completed_chunk);
-        }
-        self.completed_chunks.fetch_add(1, Ordering::Relaxed);
-        if completed_chunk.is_final() {
-            assert!(self
-                .retained
-                .lock()
-                .expect("chunked prefill retained mutex poisoned")
-                .remove(request_id));
-        }
-        Ok(ExecutorPrefillOutcome::Completed(
-            ExecutorPrefillCompletion::new(
-                output,
-                chunk,
-                completed_chunk,
-                u32::from(completed_chunk != chunk),
-            )?,
-        ))
-    }
-
-    async fn plan_runtime_prefill_with_capacity(
-        &self,
-        input: &PlanRuntimePrefillInput,
-    ) -> Result<PlanRuntimePrefillOutcome> {
-        let mock_input = plan_runtime_prefill_to_mock_input(input);
-        let outcome = self.prefill_with_capacity(&mock_input).await?;
-        let outcome = plan_runtime_prefill_outcome_from_mock(&input.request_id, outcome)?;
-        if self.prompt_tail_reserve.is_some() {
-            if let PlanRuntimePrefillOutcome::Completed(completion) = &outcome {
-                assert_eq!(completion.capacity_probe_count(), 0);
-                assert_eq!(completion.planned_chunk(), completion.completed_chunk());
-            }
-        }
-        Ok(outcome)
-    }
-
-    async fn plan_runtime_batch_prefill_with_capacity(
-        &self,
-        inputs: &[PlanRuntimePrefillInput],
-    ) -> Result<PlanRuntimeBatchPrefillOutcome> {
-        if self.prompt_tail_reserve.is_none() {
-            return Ok(PlanRuntimeBatchPrefillOutcome::Unsupported);
-        }
-        self.tail_batch_prefill_calls
-            .fetch_add(1, Ordering::Relaxed);
-        let mut completions = Vec::new();
-        for input in inputs {
-            let PlanRuntimePrefillOutcome::Completed(completion) =
-                self.plan_runtime_prefill_with_capacity(input).await?
-            else {
-                return Err(FerrumError::internal("tail fixture unexpectedly deferred"));
-            };
-            assert_eq!(
-                completion.capacity_probe_count(),
-                0,
-                "planned tail cuts are not capacity failures"
-            );
-            assert_eq!(completion.planned_chunk(), completion.completed_chunk());
-            completions.push(completion);
-        }
-        Ok(PlanRuntimeBatchPrefillOutcome::Completed(completions))
-    }
-
-    async fn decode(&self, input: &DecodeInput) -> Result<DecodeOutput> {
-        self.inner.decode(input).await
-    }
-
-    fn release_cache(&self, cache_id: &str) {
-        self.inner.release_cache(cache_id);
-    }
-
     fn capabilities(&self) -> ExecutorCapabilities {
         self.inner.capabilities()
     }
@@ -727,13 +528,6 @@ impl ModelExecutor for PlanRuntimeBatchDecodeTestExecutor {
             },
         ))
     }
-    async fn plan_runtime_mixed_batch_with_capacity(
-        &self,
-        prefills: &[PlanRuntimePrefillInput],
-        decodes: &[PlanRuntimeDecodeInput],
-    ) -> Result<ferrum_execution::model_executor::PlanRuntimeMixedBatchOutcome> {
-        self.mock_mixed_batch(prefills, decodes).await
-    }
 
     fn info(&self) -> &ferrum_types::ModelInfo {
         self.inner.info()
@@ -778,80 +572,6 @@ impl ModelExecutor for PlanRuntimeBatchDecodeTestExecutor {
         sources.clear();
         sources.push(ferrum_runtime::CapacityAvailabilitySource::ActiveSequenceSlots);
         Ok(true)
-    }
-
-    async fn prefill(&self, input: &PrefillInput) -> Result<PrefillOutput> {
-        let mut output = self.inner.prefill(input).await?;
-        let batch_size = input.batch_size();
-        let sequence_length = input.sequence_length();
-        let vocabulary_size = self.info().vocab_size;
-        let mut logits = vec![0.0; batch_size * sequence_length * vocabulary_size];
-        for position in 0..batch_size * sequence_length {
-            logits[position * vocabulary_size + 6] = 1.0;
-        }
-        output.logits =
-            MockTensor::from_f32(logits, &[batch_size, sequence_length, vocabulary_size])
-                .into_ref();
-        Ok(output)
-    }
-
-    async fn plan_runtime_prefill_with_capacity(
-        &self,
-        input: &PlanRuntimePrefillInput,
-    ) -> Result<PlanRuntimePrefillOutcome> {
-        let mock_input = plan_runtime_prefill_to_mock_input(input);
-        let outcome = self.prefill_with_capacity(&mock_input).await?;
-        plan_runtime_prefill_outcome_from_mock(&input.request_id, outcome)
-    }
-
-    async fn decode(&self, input: &DecodeInput) -> Result<DecodeOutput> {
-        self.decode_calls.fetch_add(1, Ordering::Relaxed);
-        self.inner.decode(input).await
-    }
-
-    async fn plan_runtime_batch_decode_with_capacity(
-        &self,
-        inputs: &[PlanRuntimeDecodeInput],
-    ) -> Result<PlanRuntimeBatchDecodeOutcome> {
-        let call = self.batch_decode_calls.fetch_add(1, Ordering::Relaxed);
-        if matches!(self.behavior, PlanRuntimeBatchDecodeBehavior::Exact)
-            || (matches!(
-                self.behavior,
-                PlanRuntimeBatchDecodeBehavior::DeferUntilPeerCacheRelease
-            ) && self.released_cache_count.load(Ordering::Acquire) > 0)
-        {
-            return Ok(PlanRuntimeBatchDecodeOutcome::Completed(
-                inputs
-                    .iter()
-                    .map(|input| {
-                        let mut logits = vec![0.0; self.info().vocab_size];
-                        logits[6] = 1.0;
-                        PlanRuntimeDecodeOutput::new(
-                            ExecutorSamplingOutput::FullLogits(logits),
-                            input.kv_cache.clone(),
-                        )
-                    })
-                    .collect(),
-            ));
-        }
-        let mut availability = Vec::new();
-        let observed = self
-            .write_execution_capacity_snapshot(&mut availability)?
-            .unwrap();
-        let wait = ferrum_runtime::CapacityWaitCondition::from_observation(
-            observed.coordinator_id.get(),
-            availability,
-        )
-        .unwrap();
-        Ok(PlanRuntimeBatchDecodeOutcome::Deferred(
-            test_execution_capacity_deferral(observed, wait, self.capacity_stage_for_call(call))
-                .into(),
-        ))
-    }
-
-    fn release_cache(&self, cache_id: &str) {
-        self.released_cache_count.fetch_add(1, Ordering::Release);
-        self.inner.release_cache(cache_id);
     }
 
     fn capabilities(&self) -> ExecutorCapabilities {
@@ -939,25 +659,6 @@ impl PlanRuntimeAdmissionTestExecutor {
 
 #[async_trait::async_trait]
 impl ModelExecutor for PlanRuntimeAdmissionTestExecutor {
-    async fn plan_runtime_batch_decode_with_capacity(
-        &self,
-        inputs: &[PlanRuntimeDecodeInput],
-    ) -> Result<PlanRuntimeBatchDecodeOutcome> {
-        let mut outputs = Vec::new();
-        for input in inputs {
-            let old = DecodeInput::new(
-                MockTensor::from_f32(vec![input.input_token.get() as f32], &[1, 1]).into_ref(),
-                input.kv_cache.clone(),
-            );
-            let output = self.decode(&old).await?;
-            outputs.push(PlanRuntimeDecodeOutput::new(
-                ExecutorSamplingOutput::FullLogits(output.logits.to_vec_f32()?),
-                output.kv_cache,
-            ));
-        }
-        Ok(PlanRuntimeBatchDecodeOutcome::Completed(outputs))
-    }
-
     async fn admit_tokens(&self, input: ExecutionAdmission<'_>) -> Result<TokenAdmissionOutcome> {
         controlled_token_fixture::admit(self, &self.tokens, input)
     }
@@ -1107,125 +808,6 @@ impl ModelExecutor for PlanRuntimeAdmissionTestExecutor {
         }
     }
 
-    async fn prefill(&self, input: &PrefillInput) -> Result<PrefillOutput> {
-        let request_id = input
-            .request_id
-            .as_ref()
-            .ok_or_else(|| FerrumError::request_validation("missing request id"))?;
-        if !self
-            .retained
-            .lock()
-            .expect("retained admission mutex poisoned")
-            .remove(request_id)
-        {
-            return Err(FerrumError::internal(
-                "test prefill reached submit without retained admission",
-            ));
-        }
-        self.prefill_calls.fetch_add(1, Ordering::Relaxed);
-        if self
-            .fail_next_prefill_after_admission
-            .swap(false, Ordering::AcqRel)
-        {
-            return Err(FerrumError::resource_exhausted(
-                "typed diagnostic resource failure after prefill submission",
-            ));
-        }
-        self.inner.prefill(input).await
-    }
-
-    async fn batch_prefill_with_capacity(
-        &self,
-        inputs: &[PrefillInput],
-    ) -> Result<ExecutorBatchPrefillOutcome> {
-        self.batch_prefill_calls.fetch_add(1, Ordering::Relaxed);
-        if self.defer_batch_prefill_once.swap(false, Ordering::AcqRel) {
-            return Ok(ExecutorBatchPrefillOutcome::NotSubmitted(
-                test_execution_capacity_deferral(
-                    self.capacity_epochs(),
-                    self.capacity_wait_condition(),
-                    ExecutorExecutionCapacityStage::SubmissionWave,
-                )
-                .into(),
-            ));
-        }
-        let mut completions = Vec::with_capacity(inputs.len());
-        for input in inputs {
-            let request_id = input
-                .request_id
-                .as_ref()
-                .ok_or_else(|| FerrumError::request_validation("missing request id"))?;
-            if !self
-                .retained
-                .lock()
-                .expect("retained admission mutex poisoned")
-                .remove(request_id)
-            {
-                return Err(FerrumError::internal(
-                    "test batch prefill reached submit without retained admission",
-                ));
-            }
-            let chunk = input
-                .chunk
-                .ok_or_else(|| FerrumError::request_validation("missing typed prefill chunk"))?;
-            let output = self.inner.prefill(input).await?;
-            completions.push(ExecutorPrefillCompletion::exact(output, chunk));
-        }
-        Ok(ExecutorBatchPrefillOutcome::Completed(completions))
-    }
-
-    async fn plan_runtime_prefill_with_capacity(
-        &self,
-        input: &PlanRuntimePrefillInput,
-    ) -> Result<PlanRuntimePrefillOutcome> {
-        let mock_input = plan_runtime_prefill_to_mock_input(input);
-        let outcome = self.prefill_with_capacity(&mock_input).await?;
-        plan_runtime_prefill_outcome_from_mock(&input.request_id, outcome)
-    }
-
-    async fn plan_runtime_batch_prefill_with_capacity(
-        &self,
-        inputs: &[PlanRuntimePrefillInput],
-    ) -> Result<PlanRuntimeBatchPrefillOutcome> {
-        let mock_inputs = inputs
-            .iter()
-            .map(plan_runtime_prefill_to_mock_input)
-            .collect::<Vec<_>>();
-        match self.batch_prefill_with_capacity(&mock_inputs).await? {
-            ExecutorBatchPrefillOutcome::Completed(completions) => completions
-                .into_iter()
-                .zip(inputs)
-                .map(|(completion, input)| {
-                    plan_runtime_prefill_completion_from_mock(&input.request_id, completion)
-                })
-                .collect::<Result<Vec<_>>>()
-                .map(PlanRuntimeBatchPrefillOutcome::Completed),
-            ExecutorBatchPrefillOutcome::NotSubmitted(deferral) => {
-                Ok(PlanRuntimeBatchPrefillOutcome::NotSubmitted(deferral))
-            }
-            ExecutorBatchPrefillOutcome::Unsupported => {
-                Ok(PlanRuntimeBatchPrefillOutcome::Unsupported)
-            }
-        }
-    }
-
-    async fn decode(&self, input: &DecodeInput) -> Result<DecodeOutput> {
-        self.inner.decode(input).await
-    }
-
-    fn release_cache(&self, cache_id: &str) {
-        self.inner.release_cache(cache_id);
-    }
-
-    async fn complete_cache(&self, completion: ExecutorSequenceCompletion) -> Result<()> {
-        self.inner.release_cache(completion.cache_id());
-        self.completions
-            .lock()
-            .expect("completion receipt mutex poisoned")
-            .push(completion);
-        Ok(())
-    }
-
     fn capabilities(&self) -> ExecutorCapabilities {
         self.inner.capabilities()
     }
@@ -1316,25 +898,6 @@ impl PlanRuntimeMaintenanceTestExecutor {
 
 #[async_trait::async_trait]
 impl ModelExecutor for PlanRuntimeMaintenanceTestExecutor {
-    async fn plan_runtime_batch_decode_with_capacity(
-        &self,
-        inputs: &[PlanRuntimeDecodeInput],
-    ) -> Result<PlanRuntimeBatchDecodeOutcome> {
-        let mut outputs = Vec::new();
-        for input in inputs {
-            let old = DecodeInput::new(
-                MockTensor::from_f32(vec![input.input_token.get() as f32], &[1, 1]).into_ref(),
-                input.kv_cache.clone(),
-            );
-            let output = self.decode(&old).await?;
-            outputs.push(PlanRuntimeDecodeOutput::new(
-                ExecutorSamplingOutput::FullLogits(output.logits.to_vec_f32()?),
-                output.kv_cache,
-            ));
-        }
-        Ok(PlanRuntimeBatchDecodeOutcome::Completed(outputs))
-    }
-
     async fn admit_tokens(&self, input: ExecutionAdmission<'_>) -> Result<TokenAdmissionOutcome> {
         controlled_token_fixture::admit(self, &self.tokens, input)
     }
@@ -1561,46 +1124,6 @@ impl ModelExecutor for PlanRuntimeMaintenanceTestExecutor {
                 Err(FerrumError::backend("synthetic backing allocation failure"))
             }
         }
-    }
-
-    async fn prefill(&self, input: &PrefillInput) -> Result<PrefillOutput> {
-        let request_id = input
-            .request_id
-            .as_ref()
-            .ok_or_else(|| FerrumError::request_validation("missing request id"))?;
-        if !self
-            .retained
-            .lock()
-            .expect("retained admission mutex poisoned")
-            .remove(request_id)
-        {
-            return Err(FerrumError::internal(
-                "test prefill reached submit without retained admission",
-            ));
-        }
-        self.prefill_calls.fetch_add(1, Ordering::Relaxed);
-        self.call_order
-            .lock()
-            .expect("call order mutex poisoned")
-            .push("prefill");
-        self.inner.prefill(input).await
-    }
-
-    async fn plan_runtime_prefill_with_capacity(
-        &self,
-        input: &PlanRuntimePrefillInput,
-    ) -> Result<PlanRuntimePrefillOutcome> {
-        let mock_input = plan_runtime_prefill_to_mock_input(input);
-        let outcome = self.prefill_with_capacity(&mock_input).await?;
-        plan_runtime_prefill_outcome_from_mock(&input.request_id, outcome)
-    }
-
-    async fn decode(&self, input: &DecodeInput) -> Result<DecodeOutput> {
-        self.inner.decode(input).await
-    }
-
-    fn release_cache(&self, cache_id: &str) {
-        self.inner.release_cache(cache_id);
     }
 
     fn capabilities(&self) -> ExecutorCapabilities {

@@ -1038,18 +1038,20 @@ fn restore_metrics_wait_for_consuming_ack_and_ignore_cancelled_or_dropped_output
             acknowledged: false,
         };
         let request = RequestId::new();
-        PlanRuntimePrefixRestoreOutput::new(
-            request.clone(),
+        let issuer = ferrum_execution::token_execution::ExecutorSequenceIssuer::default();
+        let sequence = issuer.issue_sequence().unwrap();
+        PlanRuntimePrefixRestoreOutput::new_tokens(
+            request,
             restored,
             prompt,
-            Arc::new(ferrum_testkit::MockKvCacheHandle::new(request, 1, restored)),
+            sequence.clone(),
             move || {
                 metrics.acknowledge_restore(restored, || {
                     if cancelled.load(Ordering::Acquire) {
                         return Err(FerrumError::cancelled("exact restore target was cancelled"));
                     }
                     publication.acknowledge();
-                    Ok(())
+                    issuer.frontier(&sequence, restored)
                 })
             },
         )
@@ -1061,7 +1063,7 @@ fn restore_metrics_wait_for_consuming_ack_and_ignore_cancelled_or_dropped_output
     let pending = output(3, 4).unwrap();
     assert_eq!(cancellations.load(Ordering::Relaxed), 2);
     cancelled.store(true, Ordering::Release);
-    assert!(pending.acknowledge().is_err());
+    assert!(pending.acknowledge_tokens().is_err());
     assert_eq!(cancellations.load(Ordering::Relaxed), 3);
     assert_eq!(metrics.hits.load(Ordering::Relaxed), 0);
     assert_eq!(metrics.saved_prefill_tokens.load(Ordering::Relaxed), 0);
@@ -1069,8 +1071,8 @@ fn restore_metrics_wait_for_consuming_ack_and_ignore_cancelled_or_dropped_output
     cancelled.store(false, Ordering::Release);
     let pending = output(3, 4).unwrap();
     assert_eq!(metrics.hits.load(Ordering::Relaxed), 0);
-    pending.acknowledge().unwrap();
-    output(2, 4).unwrap().acknowledge().unwrap();
+    pending.acknowledge_tokens().unwrap();
+    output(2, 4).unwrap().acknowledge_tokens().unwrap();
     assert_eq!(metrics.hits.load(Ordering::Relaxed), 2);
     assert_eq!(metrics.saved_prefill_tokens.load(Ordering::Relaxed), 5);
     assert_eq!(metrics.misses.load(Ordering::Relaxed), 0);

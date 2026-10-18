@@ -157,16 +157,10 @@ impl CaptureState {
             .sequence()
             .clone();
         let owner = Arc::clone(self);
-        let cache = Arc::new(ferrum_testkit::MockKvCacheHandle::new(
-            target.clone(),
-            1,
-            boundary,
-        ));
         PlanRuntimePrefixRestoreOutput::new_tokens(
             target.clone(),
             boundary,
             input.input_tokens.len(),
-            cache,
             sequence.clone(),
             move || {
                 let frontier = tokens.restore_frontier(&sequence, boundary)?;

@@ -424,6 +424,7 @@ mod tests {
     use ferrum_execution::model_executor::{
         ExecutorPrefillAdmission, LogitsReturnPolicy, PrefillChunk,
     };
+    use ferrum_interfaces::KvCacheManager;
     use ferrum_kv::managers::paged::PagedKvCacheConfig;
 
     fn fixture() -> (PagedAttentionExecutor, Arc<PagedKvCacheManager>) {
@@ -504,6 +505,55 @@ mod tests {
             panic!("physical paged owner must be released");
         };
         assert_eq!(ended.sequence(), sequence);
+    }
+
+    // Independent dense f64 attention. It does not call paged_attention,
+    // executor embedding/projection helpers, or a second executor path. Inputs
+    // use the fixture's specified f32 embeddings; accumulation/softmax are f64.
+    fn assert_dense_oracle(actual: &[f32], tokens: &[u32], config: &PagedExecutorConfig) {
+        let embeddings: Vec<Vec<f64>> = tokens
+            .iter()
+            .map(|token| {
+                (0..config.num_kv_heads * config.head_dim)
+                    .map(|dimension| {
+                        (((*token as f32 + 1.0) * (dimension as f32 + 1.0)).sin()) as f64
+                    })
+                    .collect()
+            })
+            .collect();
+        let query = embeddings.last().unwrap();
+        let mut expected = vec![0.0_f64; config.vocab_size];
+        for head in 0..config.num_heads {
+            let kv_head = head / (config.num_heads / config.num_kv_heads);
+            let offset = kv_head * config.head_dim;
+            let scores: Vec<f64> = embeddings
+                .iter()
+                .map(|key| {
+                    (0..config.head_dim)
+                        .map(|dimension| query[offset + dimension] * key[offset + dimension])
+                        .sum::<f64>()
+                        / (config.head_dim as f64).sqrt()
+                })
+                .collect();
+            let maximum = scores.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+            let weights: Vec<f64> = scores.iter().map(|score| (score - maximum).exp()).collect();
+            let denominator: f64 = weights.iter().sum();
+            for dimension in 0..config.head_dim {
+                let value: f64 = embeddings
+                    .iter()
+                    .zip(&weights)
+                    .map(|(value, weight)| value[offset + dimension] * weight / denominator)
+                    .sum();
+                expected[(head * config.head_dim + dimension) % config.vocab_size] += value;
+            }
+        }
+        assert_eq!(actual.len(), expected.len());
+        for (index, (&actual, &expected)) in actual.iter().zip(&expected).enumerate() {
+            assert!(
+                (f64::from(actual) - expected).abs() <= 2e-6 * (1.0 + expected.abs()),
+                "logit {index}: {actual} differs from dense f64 reference {expected}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -595,30 +645,6 @@ mod tests {
         assert_eq!(shortfall.snapshot().free_blocks, 1);
         assert!(manager.get_handle(peer.clone()).is_none());
 
-        // Independent existing full-prompt/one-token reference, using a second
-        // real manager. The new path never calls these tensor methods.
-        let (reference, reference_manager) = fixture();
-        let reference_id = RequestId::new();
-        let reference_cache = reference_manager
-            .allocate_sync(&AllocationRequest {
-                request_id: reference_id.clone(),
-                initial_tokens: 3,
-                max_sequence_length: 5,
-                num_layers: 1,
-                num_heads: 1,
-                head_dim: 2,
-                device: Device::CPU,
-                dtype: DataType::FP32,
-                priority: Priority::Normal,
-            })
-            .unwrap();
-        let oracle = reference
-            .prefill(
-                &PrefillInput::new(MockTensor::from_u32(&[3, 4, 5], &[1, 3]).into_ref())
-                    .with_kv_cache(reference_cache),
-            )
-            .await
-            .unwrap();
         let first = run(
             &executor,
             &frontier,
@@ -632,15 +658,7 @@ mod tests {
             TokenWork::Prefill(PrefillChunk::new(2, 1, 3).unwrap()),
         )
         .await;
-        let reference_logits = oracle.logits.to_vec_f32().unwrap();
-        assert_eq!(logits(&last), &reference_logits[128..192]);
-        let decode_oracle = reference
-            .decode(&DecodeInput::new(
-                MockTensor::from_u32(&[6], &[1, 1]).into_ref(),
-                oracle.kv_cache,
-            ))
-            .await
-            .unwrap();
+        assert_dense_oracle(logits(&last), &[3, 4, 5], &executor.config);
         let decode = run(
             &executor,
             last.next_frontier(),
@@ -650,22 +668,25 @@ mod tests {
             },
         )
         .await;
-        assert_eq!(logits(&decode), decode_oracle.logits.to_vec_f32().unwrap());
+        assert_dense_oracle(logits(&decode), &[3, 4, 5, 6], &executor.config);
         let handle = manager.get_handle(id.clone()).unwrap();
         assert_eq!(handle.num_tokens(), 4);
-        assert_eq!(
-            manager
-                .read_kv(
-                    PagedAttentionExecutor::as_paged_handle(handle.as_ref()).unwrap(),
-                    0,
-                    0,
-                    4
-                )
-                .unwrap()
-                .0
-                .len(),
-            8
-        );
+        let (keys, values) = manager
+            .read_kv(
+                PagedAttentionExecutor::as_paged_handle(handle.as_ref()).unwrap(),
+                0,
+                0,
+                4,
+            )
+            .unwrap();
+        let expected_kv: Vec<f32> = [3_u32, 4, 5, 6]
+            .into_iter()
+            .flat_map(|token| {
+                (0..2).map(move |dimension| ((token as f32 + 1.0) * (dimension as f32 + 1.0)).sin())
+            })
+            .collect();
+        assert_eq!(keys, expected_kv);
+        assert_eq!(values, expected_kv);
 
         let closed = executor.cancel_tokens(frontier.sequence()).unwrap();
         assert!(closed.error.is_none());
@@ -687,7 +708,6 @@ mod tests {
             panic!("released capacity must admit");
         };
         close(&executor, peer.sequence());
-        reference_manager.deallocate_sync(&reference_id).unwrap();
         assert_eq!(manager.gpu_pool().stats().allocated_blocks, 0);
     }
 }

@@ -202,7 +202,7 @@ impl EngineInner {
                     continue;
                 }
             };
-            if let Err(error) = output.validate_for(&request_id, prompt_tokens) {
+            if let Err(error) = output.validate_for(&request_id, prompt_tokens, &incarnation) {
                 drop(output);
                 drop(prepared);
                 self.complete_request_with_error(&request_id, error).await?;
@@ -225,7 +225,7 @@ impl EngineInner {
                         "prefix restore outer sequence changed before publication",
                     ));
                 }
-                if output.token_sequence() != Some(&incarnation) {
+                if output.token_sequence() != &incarnation {
                     return Err(FerrumError::internal(
                         "prefix publication belongs to a different token incarnation",
                     ));

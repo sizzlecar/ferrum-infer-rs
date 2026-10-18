@@ -3,8 +3,7 @@
 
 use super::*;
 use ferrum_execution::model_executor::{
-    DecodeInput, DecodeOutput, ExecutorCapabilities, ExecutorPrefillAdmission, ExecutorStatus,
-    PrefillInput, PrefillOutput, PrefixCapturePlan,
+    ExecutorCapabilities, ExecutorPrefillAdmission, ExecutorStatus, PrefixCapturePlan,
 };
 use ferrum_execution::token_execution::{
     ExecutionAdmission, ExecutionCloseDisposition, ExecutionEndReason, ExecutorSequence,
@@ -32,12 +31,6 @@ impl ModelExecutor for InvalidTailExecutor {
     }
     fn status(&self) -> ExecutorStatus {
         self.inner.status()
-    }
-    async fn prefill(&self, _: &PrefillInput) -> Result<PrefillOutput> {
-        panic!("preparation test must execute the token protocol")
-    }
-    async fn decode(&self, _: &DecodeInput) -> Result<DecodeOutput> {
-        panic!("preparation test must execute the token protocol")
     }
     async fn admit_tokens(&self, input: ExecutionAdmission<'_>) -> Result<TokenAdmissionOutcome> {
         self.inner.admit_tokens(input).await

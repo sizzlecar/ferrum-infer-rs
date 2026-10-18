@@ -64,18 +64,6 @@ fn product_publication(
     metrics: Arc<PrefixCacheMetrics>,
 ) -> PlanRuntimePrefixRestoreOutput {
     let restored_tokens = publication.completed_tokens();
-    let mut block_table = BlockTable::new(16);
-    block_table.sequence_length = restored_tokens;
-    let cache = Arc::new(VNextKvCacheHandle {
-        block_table,
-        cache_id: sequence.cache_id.clone(),
-        sequence: Arc::downgrade(sequence),
-        device: device(),
-        num_layers: 1,
-        num_heads: 2,
-        head_dim: 128,
-        maximum_tokens: INPUT,
-    });
     let callback = RestoreAcknowledgement {
         publication: Some(publication),
         slot,
@@ -91,7 +79,6 @@ fn product_publication(
         sequence.request_id().clone(),
         restored_tokens,
         INPUT,
-        cache,
         sequence.token_identity.clone(),
         move || observer.acknowledge(&metrics, restored_tokens, || callback.acknowledge()),
     )
@@ -142,7 +129,7 @@ fn native_prefix_tokens_ack_preserves_incarnation_and_gpu_continuation() {
         &target,
         Arc::clone(&metrics),
     );
-    assert_eq!(output.token_sequence(), Some(&target.token_identity));
+    assert_eq!(output.token_sequence(), &target.token_identity);
     assert_eq!(target.prefill_tokens_processed.load(Ordering::Acquire), 0);
     assert_eq!(metrics.hits.load(Ordering::Acquire), 0);
     let frontier = output.acknowledge_tokens().unwrap();

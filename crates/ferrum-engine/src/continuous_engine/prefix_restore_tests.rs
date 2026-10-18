@@ -146,16 +146,10 @@ impl RestoreState {
             .expect("restore target must be admitted")
             .sequence()
             .clone();
-        let cache = Arc::new(ferrum_testkit::MockKvCacheHandle::new(
-            request_id.clone(),
-            1,
-            self.tokens,
-        ));
         PlanRuntimePrefixRestoreOutput::new_tokens(
             request_id,
             self.tokens,
             input.input_tokens.len(),
-            cache,
             sequence.clone(),
             move || {
                 if matches!(guard.state.behavior, RestoreBehavior::FailedAcknowledgement) {

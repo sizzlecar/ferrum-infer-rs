@@ -1,9 +1,6 @@
 use super::*;
 use ferrum_execution::{
-    model_executor::{
-        DecodeInput, DecodeOutput, ExecutorCapabilities, ExecutorStatus, PrefillInput,
-        PrefillOutput,
-    },
+    model_executor::{ExecutorCapabilities, ExecutorStatus},
     token_execution::ExecutorSequenceIssuer,
 };
 use ferrum_kv::{PagedKvCacheConfig, PagedKvCacheManager};
@@ -69,12 +66,6 @@ impl ModelExecutor for CloseProbe {
     }
     fn status(&self) -> ExecutorStatus {
         self.inner.status()
-    }
-    async fn prefill(&self, input: &PrefillInput) -> Result<PrefillOutput> {
-        self.inner.prefill(input).await
-    }
-    async fn decode(&self, input: &DecodeInput) -> Result<DecodeOutput> {
-        self.inner.decode(input).await
     }
     async fn finish_tokens(
         &self,

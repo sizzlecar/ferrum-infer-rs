@@ -35,10 +35,16 @@ pub(super) fn bind_executor(
 mod tests {
     use super::*;
     use crate::registry::{ComponentConfig, ComponentFactory, LlmExecutorFactory};
-    use ferrum_execution::model_executor::PrefillInput;
+    use ferrum_execution::model_executor::{
+        ExecutorPrefillAdmission, ExecutorSamplingOutput, LogitsReturnPolicy, PrefillChunk,
+    };
+    use ferrum_execution::token_execution::{
+        ExecutionAdmission, ExecutionBatchOutcome, ExecutionCloseDisposition, ExecutionProduct,
+        ExecutionWork, TokenAdmissionOutcome, TokenWork,
+    };
     use ferrum_models::vnext::ProductionWeightArtifact;
     use ferrum_runtime::{ModelSourceKind, OriginalModelSource, OriginalModelSources};
-    use ferrum_types::{Device, EngineConfig};
+    use ferrum_types::{Device, EngineConfig, RequestId, TokenId};
     use safetensors::tensor::{serialize_to_file, Dtype, TensorView};
     use serde_json::json;
 
@@ -148,28 +154,46 @@ mod tests {
             executor.bound_resolved_sources(),
             Some(sources.resolved_sources())
         );
-        let tokens =
-            ferrum_models::executor::common::tokens_to_tensor(&[0, 1], &candle_core::Device::Cpu)
-                .unwrap();
-        let output = executor
-            .prefill(&PrefillInput::new(
-                ferrum_models::executor::common::wrap_tensor(tokens),
-            ))
+        let request = RequestId::new();
+        let tokens = [TokenId::new(0), TokenId::new(1)];
+        let TokenAdmissionOutcome::Admitted(frontier) = executor
+            .admit_tokens(ExecutionAdmission {
+                context: ExecutorPrefillAdmission::for_diagnostic(&request, &tokens, 4),
+                adapter: None,
+            })
             .await
-            .unwrap();
-        assert_eq!(output.logits.shape().last().copied(), Some(4));
-        assert!(output
-            .logits
-            .to_vec_f32()
             .unwrap()
-            .iter()
-            .all(|value| value.is_finite()));
-        let cache = output
-            .kv_cache
-            .as_any()
-            .downcast_ref::<ferrum_models::executor::common::GenericKvCacheHandle>()
-            .unwrap();
-        executor.release_cache(cache.request_cache_id());
+        else {
+            panic!("tiny frozen model admission must succeed")
+        };
+        let policy = LogitsReturnPolicy::FullLogits;
+        let work = ExecutionWork::new(
+            &frontier,
+            TokenWork::Prefill(PrefillChunk::new(0, 2, 2).unwrap()),
+            &policy,
+        )
+        .unwrap();
+        let ExecutionBatchOutcome::Completed(output) =
+            executor.execute_tokens(&[work]).await.unwrap()
+        else {
+            panic!("tiny frozen model prefill must complete")
+        };
+        let completions = output.into_completions();
+        assert_eq!(completions.len(), 1);
+        let ExecutionProduct::Sampling(ExecutorSamplingOutput::FullLogits(logits)) =
+            completions[0].product()
+        else {
+            panic!("final prefill must return its real logits")
+        };
+        assert_eq!(logits.len(), 4);
+        assert!(logits.iter().all(|value| value.is_finite()));
+        assert_eq!(completions[0].next_frontier().consumed_tokens(), 2);
+        let closed = executor.cancel_tokens(frontier.sequence()).unwrap();
+        assert!(closed.error.is_none());
+        let ExecutionCloseDisposition::Ended(ended) = closed.disposition else {
+            panic!("tiny CPU model must release its exact incarnation")
+        };
+        assert_eq!(ended.sequence(), frontier.sequence());
     }
 
     #[tokio::test]

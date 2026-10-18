@@ -292,6 +292,19 @@ impl ModelFamilyRegistry for FamilyRegistry {
 pub(super) struct FixtureOptions {
     pub logits_type: ElementType,
     pub nonfinite_token: Option<usize>,
+    pub reusable_startup: bool,
+    pub usable_capacity_bytes: Option<usize>,
+}
+
+impl Default for FixtureOptions {
+    fn default() -> Self {
+        Self {
+            logits_type: ElementType::F32,
+            nonfinite_token: None,
+            reusable_startup: false,
+            usable_capacity_bytes: None,
+        }
+    }
 }
 
 pub(super) struct Fixture<R: DeviceRuntime> {
@@ -443,13 +456,18 @@ impl<R: DeviceRuntime> Fixture<R> {
         engine.batching.max_num_batched_tokens = MAX_TOKENS;
         engine.runtime.max_model_len = Some(MAX_TOKENS);
         engine.runtime.sampling_readback_mode = mode;
+        engine.memory.usable_capacity_bytes = options.usable_capacity_bytes;
         if matches!(&info.device, Device::CUDA(_)) {
             // This attention-free fixture installs the portable CUDA composition.
             engine.runtime.attention_execution_policy = AttentionExecutionPolicy::Portable;
             engine.runtime.completion_readback_policy =
                 ferrum_types::CompletionReadbackPolicy::BatchedU32;
         }
-        engine.backend.enable_reusable_execution = false;
+        engine.backend.enable_reusable_execution = options.reusable_startup;
+        if options.reusable_startup {
+            engine.backend.reusable_execution_capture.preparation =
+                ReusableExecutionPreparationMode::Startup;
+        }
         let executor = VNextModelExecutor::from_runtime_composition(
             prepared.execution_input().unwrap(),
             info,
@@ -467,6 +485,13 @@ impl<R: DeviceRuntime> Fixture<R> {
                     compilation,
                     &family_registry,
                     &definition,
+                    ferrum_types::KvStorageFormat::F16,
+                    StopPolicy {
+                        maximum_output_tokens: 8,
+                        token_ids: BTreeSet::from([2]),
+                        strings: vec![],
+                        collision_policy: StopTokenCollisionPolicy::require_distinct(),
+                    },
                 )
             },
         )
@@ -478,18 +503,20 @@ impl<R: DeviceRuntime> Fixture<R> {
     }
 }
 
-fn resolve_plan(
+pub(in crate::executor::vnext_executor) fn resolve_plan(
     prepared: &PreparedProductionModel,
     runtime: &ResolvedRuntimePolicy,
     catalog: &CapabilityCatalog,
     compilation: &ProgramPlanCompilation,
-    registry: &FamilyRegistry,
+    registry: &dyn ModelFamilyRegistry,
     definition: &ModelFamilyDefinition,
+    kv_storage: ferrum_types::KvStorageFormat,
+    stop: StopPolicy,
 ) -> ferrum_types::Result<ResolvedModelPlan> {
     let plan = compilation.executable().execution_plan();
     let numerical = NumericalProfileResolution::from_static_plan(
         NumericalExecutionPolicy::Auto,
-        ferrum_types::KvStorageFormat::F16,
+        kv_storage,
         definition,
         prepared.family(),
         catalog,
@@ -523,7 +550,7 @@ fn resolve_plan(
                 .unwrap()
                 .sha256
                 .clone(),
-            vocabulary_size: VOCAB as u64,
+            vocabulary_size: prepared.descriptor().vocabulary_size() as u64,
         },
         device: catalog.device().clone(),
         capabilities: catalog.clone(),
@@ -545,12 +572,7 @@ fn resolve_plan(
             TriStatePolicy::ModelDefault,
         )
         .unwrap(),
-        stop: StopPolicy {
-            maximum_output_tokens: 8,
-            token_ids: BTreeSet::from([2]),
-            strings: vec![],
-            collision_policy: StopTokenCollisionPolicy::require_distinct(),
-        },
+        stop,
         structured_output: StructuredOutputPolicy::Disabled,
     };
     // Verified typed evidence is supplied through the same construction API as

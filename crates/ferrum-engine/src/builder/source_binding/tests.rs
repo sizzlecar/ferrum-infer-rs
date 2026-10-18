@@ -1,8 +1,7 @@
 use super::*;
 use crate::builder::EngineBuilder;
 use ferrum_execution::model_executor::{
-    DecodeInput, DecodeOutput, ExecutorCapabilities, ExecutorStatus, PlanRuntimeResourceSnapshot,
-    PrefillInput, PrefillOutput,
+    ExecutorCapabilities, ExecutorStatus, PlanRuntimeResourceSnapshot,
 };
 use ferrum_runtime::{
     DeviceId, ModelSourceKind, OriginalModelSource, OriginalModelSources, ResolvedModelSources,
@@ -95,14 +94,6 @@ impl ModelExecutor for BindingProbe {
     async fn prepare_startup(&self) -> Result<()> {
         self.startup_calls.fetch_add(1, Ordering::Relaxed);
         self.inner.prepare_startup().await
-    }
-
-    async fn prefill(&self, input: &PrefillInput) -> Result<PrefillOutput> {
-        self.inner.prefill(input).await
-    }
-
-    async fn decode(&self, input: &DecodeInput) -> Result<DecodeOutput> {
-        self.inner.decode(input).await
     }
 
     fn capabilities(&self) -> ExecutorCapabilities {

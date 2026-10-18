@@ -2,9 +2,8 @@
 use super::*;
 use ferrum_execution::{
     model_executor::{
-        DecodeInput, DecodeOutput, ExecutionResourceAuthority, ExecutorCapabilities,
-        ExecutorSamplingOutput, ExecutorSequenceCompletion, ExecutorStatus,
-        PlanRuntimeResourceSnapshot, PrefillInput, PrefillOutput,
+        ExecutionResourceAuthority, ExecutorCapabilities, ExecutorSamplingOutput,
+        ExecutorSequenceCompletion, ExecutorStatus, PlanRuntimeResourceSnapshot,
     },
     token_execution::*,
     ModelExecutor,
@@ -281,15 +280,5 @@ impl ModelExecutor for ScriptedExecutor {
     }
     fn cancel_tokens(&self, sequence: &ExecutorSequence) -> Result<ExecutionCloseOutcome> {
         self.close(sequence, ExecutionEndReason::Cancelled)
-    }
-    async fn prefill(&self, _: &PrefillInput) -> Result<PrefillOutput> {
-        Err(FerrumError::unsupported(
-            "script requires common token execution",
-        ))
-    }
-    async fn decode(&self, _: &DecodeInput) -> Result<DecodeOutput> {
-        Err(FerrumError::unsupported(
-            "script requires common token execution",
-        ))
     }
 }

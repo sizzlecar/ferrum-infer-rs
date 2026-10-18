@@ -132,28 +132,30 @@ mod tests {
                 PrefixRestoreSource::Rendezvous,
             );
             let metrics = Arc::clone(&metrics);
-            PlanRuntimePrefixRestoreOutput::new(
-                request.clone(),
-                3,
-                4,
-                Arc::new(ferrum_testkit::MockKvCacheHandle::new(request, 1, 3)),
-                move || {
-                    observer.acknowledge(&metrics, 3, || {
-                        if cancelled {
-                            Err(FerrumError::cancelled("target cancelled"))
-                        } else {
-                            Ok(())
-                        }
-                    })
-                },
-            )
+            let issuer = ferrum_execution::token_execution::ExecutorSequenceIssuer::default();
+            let sequence = issuer.issue_sequence().unwrap();
+            PlanRuntimePrefixRestoreOutput::new_tokens(request, 3, 4, sequence.clone(), move || {
+                observer.acknowledge(&metrics, 3, || {
+                    if cancelled {
+                        Err(FerrumError::cancelled("target cancelled"))
+                    } else {
+                        issuer.frontier(&sequence, 3)
+                    }
+                })
+            })
             .unwrap()
         };
         drop(output(false));
-        assert!(output(true).acknowledge().is_err());
+        assert!(output(true).acknowledge_tokens().is_err());
         assert!(sink.decisions.lock().is_empty());
         assert_eq!(metrics.hits.load(Ordering::Relaxed), 0);
-        assert_eq!(output(false).acknowledge().unwrap().committed_tokens(), 3);
+        assert_eq!(
+            output(false)
+                .acknowledge_tokens()
+                .unwrap()
+                .consumed_tokens(),
+            3
+        );
         assert_eq!(metrics.hits.load(Ordering::Relaxed), 1);
         assert_eq!(metrics.saved_prefill_tokens.load(Ordering::Relaxed), 3);
         let decisions = sink.decisions.lock();

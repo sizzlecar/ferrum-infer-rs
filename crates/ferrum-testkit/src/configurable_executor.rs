@@ -4,21 +4,18 @@
 //! to produce specific token sequences, emit EOS after N tokens, etc.
 
 use crate::executor::token_state::TokenState;
-use crate::kv_cache::MockKvCacheHandle;
-use crate::tensor::MockTensor;
 use async_trait::async_trait;
 use ferrum_execution::token_execution::*;
 use ferrum_execution::{
     model_executor::{
-        AttentionType, DecodeInput, DecodeOutput, ExecutorCapabilities, ExecutorMemoryUsage,
-        ExecutorState, ExecutorStatus, MemoryRequirements, PrefillInput, PrefillOutput,
+        AttentionType, ExecutorCapabilities, ExecutorMemoryUsage, ExecutorState, ExecutorStatus,
+        MemoryRequirements,
     },
     ModelExecutor,
 };
-use ferrum_types::{DataType, Device, ModelInfo, ModelType, RequestId, Result};
+use ferrum_types::{DataType, Device, ModelInfo, ModelType, Result};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
 
 /// Model executor that produces a configurable sequence of tokens.
 pub struct ConfigurableModelExecutor {
@@ -56,29 +53,6 @@ impl ConfigurableModelExecutor {
             decode_count: AtomicU64::new(0),
             tokens: TokenState::default(),
         }
-    }
-
-    fn next_token_logits(&self) -> Vec<f32> {
-        let step = self.decode_count.load(Ordering::Relaxed) as usize;
-        let vocab_size = self.info.vocab_size;
-        let mut logits = vec![0.0f32; vocab_size];
-
-        // Check if we should emit EOS
-        if let Some(eos_n) = self.eos_after {
-            if step >= eos_n {
-                if (self.eos_token as usize) < vocab_size {
-                    logits[self.eos_token as usize] = 10.0;
-                }
-                return logits;
-            }
-        }
-
-        // Cycle through token sequence
-        let token = self.token_sequence[step % self.token_sequence.len()];
-        if (token as usize) < vocab_size {
-            logits[token as usize] = 10.0;
-        }
-        logits
     }
 }
 
@@ -142,49 +116,6 @@ impl ModelExecutor for ConfigurableModelExecutor {
 
     fn info(&self) -> &ModelInfo {
         &self.info
-    }
-
-    async fn prefill(&self, input: &PrefillInput) -> Result<PrefillOutput> {
-        let batch_size = input.batch_size();
-        let seq_len = input.sequence_length();
-        let vocab_size = self.info.vocab_size;
-
-        // Prefill logits: bias first token from sequence
-        let token = self.token_sequence[0];
-        let mut logits_data = vec![0.0f32; batch_size * seq_len * vocab_size];
-        for b in 0..batch_size {
-            for s in 0..seq_len {
-                let offset = (b * seq_len + s) * vocab_size;
-                if offset + token as usize >= logits_data.len() {
-                    continue;
-                }
-                logits_data[offset + token as usize] = 10.0;
-            }
-        }
-        let logits =
-            MockTensor::from_f32(logits_data, &[batch_size, seq_len, vocab_size]).into_ref();
-        let kv_cache = Arc::new(MockKvCacheHandle::new(
-            RequestId::new(),
-            self.info.num_layers,
-            seq_len,
-        ));
-        Ok(PrefillOutput::new(logits, kv_cache))
-    }
-
-    async fn decode(&self, input: &DecodeInput) -> Result<DecodeOutput> {
-        let batch_size = input.batch_size();
-        let vocab_size = self.info.vocab_size;
-
-        let single_logits = self.next_token_logits();
-        self.decode_count.fetch_add(1, Ordering::Relaxed);
-
-        // Replicate for batch
-        let mut logits_data = Vec::with_capacity(batch_size * vocab_size);
-        for _ in 0..batch_size {
-            logits_data.extend_from_slice(&single_logits);
-        }
-        let logits = MockTensor::from_f32(logits_data, &[batch_size, vocab_size]).into_ref();
-        Ok(DecodeOutput::new(logits, input.kv_cache.clone()))
     }
 
     fn capabilities(&self) -> ExecutorCapabilities {

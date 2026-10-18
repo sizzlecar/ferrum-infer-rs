@@ -1,14 +1,15 @@
 use super::*;
 use ferrum_execution::model_executor::{GreedyRepetitionPenalty, TokenSelectionMask};
+use ferrum_execution::token_execution::*;
 use ferrum_interfaces::sampler::{
     GreedySampler, LogitsProcessor, RepetitionPenaltyProcessor, Sampler, SamplingContext,
     SamplingRng,
 };
 use ferrum_kernels::backend::cpu::vnext_ops::CpuVNextComposition;
-use serde_json::json;
 
-mod fixture;
+pub(in crate::executor::vnext_executor) mod fixture;
 mod lifecycle;
+pub(in crate::executor::vnext_executor) mod startup;
 mod token_execution;
 use fixture::{Fixture, FixtureOptions, VOCAB};
 
@@ -47,6 +48,7 @@ fn cpu_with_precision(
         FixtureOptions {
             logits_type,
             nonfinite_token: nonfinite,
+            ..FixtureOptions::default()
         },
     )
 }
@@ -107,57 +109,66 @@ fn assert_delta(before: &serde_json::Value, after: &serde_json::Value, field: &s
     );
 }
 
-fn reserve_prefill<R: DeviceRuntime>(fixture: &Fixture<R>, request_id: &RequestId) {
-    let executor = &fixture.executor;
+async fn reserve_prefill<R: DeviceRuntime>(
+    fixture: &Fixture<R>,
+    request_id: &RequestId,
+) -> ExecutionFrontier {
     let tokens = [TokenId::new(0)];
-    loop {
-        match executor
-            .try_admit_prefill(ExecutorPrefillAdmission::for_diagnostic(
-                request_id, &tokens, 16,
-            ))
-            .unwrap()
-        {
-            ExecutorPrefillAdmissionDecision::Admitted(_) => break,
-            ExecutorPrefillAdmissionDecision::MaintenanceDeferred(_) => {
-                assert!(matches!(
-                    executor.maintain_prefill_backing(request_id).unwrap(),
-                    ExecutorPrefillMaintenanceOutcome::Maintained { .. }
-                        | ExecutorPrefillMaintenanceOutcome::RetryAdmission { .. }
-                ));
-            }
-            other => panic!("tiny admitted fixture unexpectedly deferred: {other:?}"),
+    token_execution::admit_tokens(fixture, request_id, &tokens).await
+}
+
+fn sampling(completion: &ExecutionCompletion) -> &ExecutorSamplingOutput {
+    let ExecutionProduct::Sampling(value) = completion.product() else {
+        panic!("final prefill/decode omitted its sampling product")
+    };
+    value
+}
+
+fn completed(outcome: ExecutionBatchOutcome) -> Vec<ExecutionCompletion> {
+    let ExecutionBatchOutcome::Completed(batch) = outcome else {
+        panic!("tiny native wave did not complete: {outcome:?}")
+    };
+    batch.into_completions()
+}
+
+async fn close<R: DeviceRuntime>(executor: &VNextModelExecutor<R>, sequence: &ExecutorSequence) {
+    let outcome = executor.cancel_tokens(sequence).unwrap();
+    assert!(outcome.error.is_none(), "{:?}", outcome.error);
+    let ended = match outcome.disposition {
+        ExecutionCloseDisposition::Ended(ended) => ended,
+        ExecutionCloseDisposition::Held(held) => {
+            let terminal = held.wait().await.unwrap();
+            assert!(terminal.error.is_none(), "{:?}", terminal.error);
+            terminal.ended
         }
-    }
+    };
+    assert_eq!(ended.sequence(), sequence);
 }
 
 async fn admit<R: DeviceRuntime>(
     fixture: &Fixture<R>,
     request_id: &RequestId,
-) -> Arc<dyn KvCacheHandle> {
-    reserve_prefill(fixture, request_id);
+) -> ExecutionFrontier {
+    let frontier = reserve_prefill(fixture, request_id).await;
     let executor = &fixture.executor;
-    let tokens = [TokenId::new(0)];
-    let input = PlanRuntimePrefillInput::new(
-        request_id.clone(),
-        Arc::<[TokenId]>::from(tokens),
-        16,
-        PrefillChunk::new(0, 1, 1).unwrap(),
+    let policy = LogitsReturnPolicy::FullLogits;
+    let input = ExecutionWork::new(
+        &frontier,
+        TokenWork::Prefill(PrefillChunk::new(0, 1, 1).unwrap()),
+        &policy,
     )
     .unwrap();
     let before = readback(executor);
-    let completion = match executor
-        .plan_runtime_prefill_with_capacity(&input)
-        .await
-        .unwrap()
-    {
-        PlanRuntimePrefillOutcome::Completed(completion) => completion,
-        PlanRuntimePrefillOutcome::Deferred(_) => panic!("tiny admitted prefill did not execute"),
-    };
-    completion
-        .validate_for(request_id, input.chunk, VOCAB)
-        .unwrap();
-    let output = completion.output();
-    let PlanRuntimePrefillProduct::FinalLogits(logits) = output.product() else {
+    let mut outputs = completed(
+        executor
+            .execute_tokens(std::slice::from_ref(&input))
+            .await
+            .unwrap(),
+    );
+    assert_eq!(outputs.len(), 1);
+    let output = outputs.pop().unwrap();
+    output.validate_for(0, &input, VOCAB).unwrap();
+    let ExecutorSamplingOutput::FullLogits(logits) = sampling(&output) else {
         panic!("final prefill lost full logits")
     };
     assert_eq!(logits, &[-1.0, -1.0, -2.0, -3.0]);
@@ -170,18 +181,7 @@ async fn admit<R: DeviceRuntime>(
         "product_bytes",
         executor.io.output_layout.byte_len().unwrap(),
     );
-    Arc::clone(output.kv_cache())
-}
-
-fn legacy_tokens(tokens: &[u32]) -> TensorRef {
-    common::wrap_tensor(common::tokens_to_tensor(tokens, &candle_core::Device::Cpu).unwrap())
-}
-
-fn lora_metadata() -> std::collections::HashMap<String, serde_json::Value> {
-    std::collections::HashMap::from([
-        ("ferrum_lora_adapter".into(), json!("adapter")),
-        ("ferrum_lora_path".into(), json!("unused-adapter-path")),
-    ])
+    output.next_frontier().clone()
 }
 
 fn assert_no_adapter_execution<R: DeviceRuntime>(
@@ -206,92 +206,88 @@ fn assert_no_adapter_execution<R: DeviceRuntime>(
 }
 
 #[tokio::test]
-async fn lora_legacy_prefill_rejects_before_any_plan_runtime_submission() {
+async fn lora_token_admission_rejects_before_any_native_submission() {
     let fixture = cpu(SamplingReadbackMode::Uniform);
-    let first_id = RequestId::new();
-    let second_id = RequestId::new();
-    reserve_prefill(&fixture, &first_id);
-    reserve_prefill(&fixture, &second_id);
-    let first = PrefillInput::new(legacy_tokens(&[0])).with_request_context(first_id, 16);
-    let second = PrefillInput::new(legacy_tokens(&[0]))
-        .with_request_context(second_id, 16)
-        .with_metadata(lora_metadata());
-    let executor = &fixture.executor;
-    let before = executor.cache_metrics_snapshot().unwrap();
-
-    let results = [
-        executor.prefill(&second).await.map(|_| ()),
-        executor.prefill_with_capacity(&second).await.map(|_| ()),
-        executor
-            .batch_prefill(&[first.clone(), second.clone()])
-            .await
-            .map(|_| ()),
-        executor
-            .batch_prefill_with_capacity(&[first.clone(), second.clone()])
-            .await
-            .map(|_| ()),
-    ];
-    for result in results {
-        assert!(
-            matches!(result, Err(FerrumError::Unsupported { .. })),
-            "{result:?}"
-        );
-    }
-    assert_no_adapter_execution(executor, &before);
-
-    // The valid participant remains executable after rejecting the whole batch.
-    executor.prefill(&first).await.unwrap();
-    assert_eq!(
-        executor.metrics.prefill_operations.load(Ordering::Relaxed),
-        1
+    let first = RequestId::new();
+    let rejected = RequestId::new();
+    let frontier = reserve_prefill(&fixture, &first).await;
+    let before = fixture.executor.cache_metrics_snapshot().unwrap();
+    let tokens = [TokenId::new(0)];
+    let result = fixture
+        .executor
+        .admit_tokens(ExecutionAdmission {
+            context: ExecutorPrefillAdmission::for_diagnostic(&rejected, &tokens, 16),
+            adapter: Some(ferrum_interfaces::adapter::LoraAdapterSelection {
+                name: "adapter",
+                path: "unused-adapter-path",
+            }),
+        })
+        .await;
+    assert!(
+        matches!(result, Err(FerrumError::Unsupported { .. })),
+        "{result:?}"
     );
+    assert_no_adapter_execution(&fixture.executor, &before);
+    let output = token_execution::execute_one(
+        &fixture,
+        &frontier,
+        TokenWork::Prefill(PrefillChunk::new(0, 1, 1).unwrap()),
+    )
+    .await;
+    assert_eq!(
+        sampling(&output),
+        &ExecutorSamplingOutput::FullLogits(vec![-1.0, -1.0, -2.0, -3.0])
+    );
+    close(&fixture.executor, frontier.sequence()).await;
 }
 
 #[tokio::test]
-async fn lora_legacy_decode_and_verify_reject_the_whole_batch_before_progress() {
+async fn lora_rejected_admission_cannot_rebind_live_decode_incarnation() {
     let fixture = cpu(SamplingReadbackMode::Uniform);
-    let first_id = RequestId::new();
-    let second_id = RequestId::new();
-    let first_cache = admit(&fixture, &first_id).await;
-    let second_cache = admit(&fixture, &second_id).await;
-    let first =
-        DecodeInput::new(legacy_tokens(&[1]), first_cache.clone()).with_request_id(first_id);
-    let second = DecodeInput::new(legacy_tokens(&[1]), second_cache.clone())
-        .with_request_id(second_id)
-        .with_metadata(lora_metadata());
-    let executor = &fixture.executor;
-    let before = executor.cache_metrics_snapshot().unwrap();
-    let results = [
-        executor.decode(&second).await.map(|_| ()),
-        executor
-            .batch_decode(&[first.clone(), second.clone()])
-            .await
-            .map(|_| ()),
-        executor
-            .batch_decode_with_capacity(&[first.clone(), second.clone()])
-            .await
-            .map(|_| ()),
-        executor
-            .forward_verify(&[first.clone(), second.clone()])
-            .await
-            .map(|_| ()),
-    ];
-    for result in results {
-        assert!(
-            matches!(result, Err(FerrumError::Unsupported { .. })),
-            "{result:?}"
-        );
-    }
-    assert_no_adapter_execution(executor, &before);
-    for cache in [&first_cache, &second_cache] {
-        let sequence = executor.sequence_for_cache(&cache.cache_id()).unwrap();
-        assert_eq!(sequence.tokens.lock().len(), 1);
-    }
-    executor.decode(&first).await.unwrap();
-    assert_eq!(
-        executor.metrics.decode_operations.load(Ordering::Relaxed),
-        1
+    let id = RequestId::new();
+    let frontier = admit(&fixture, &id).await;
+    let before = fixture.executor.cache_metrics_snapshot().unwrap();
+    let tokens = [TokenId::new(0)];
+    let result = fixture
+        .executor
+        .admit_tokens(ExecutionAdmission {
+            context: ExecutorPrefillAdmission::for_diagnostic(&id, &tokens, 16),
+            adapter: Some(ferrum_interfaces::adapter::LoraAdapterSelection {
+                name: "adapter",
+                path: "unused-adapter-path",
+            }),
+        })
+        .await;
+    assert!(
+        matches!(result, Err(FerrumError::Unsupported { .. })),
+        "{result:?}"
     );
+    assert_no_adapter_execution(&fixture.executor, &before);
+    let owner = fixture
+        .executor
+        .sequences
+        .lock()
+        .token_index
+        .get(frontier.sequence())
+        .unwrap()
+        .upgrade()
+        .unwrap();
+    assert_eq!(*owner.tokens.lock(), [0]);
+    let output = token_execution::execute_one(
+        &fixture,
+        &frontier,
+        TokenWork::Decode {
+            token: TokenId::new(1),
+            position: 1,
+        },
+    )
+    .await;
+    assert_eq!(
+        sampling(&output),
+        &ExecutorSamplingOutput::FullLogits(vec![3.0, 2.0, 1.0, -4.0])
+    );
+    drop(owner);
+    close(&fixture.executor, frontier.sequence()).await;
 }
 
 struct Wave {
@@ -409,63 +405,58 @@ async fn compare<R: DeviceRuntime>(uniform: Fixture<R>, participant: Fixture<R>)
                 .zip(&wave.tokens)
                 .zip(&wave.policies)
                 .map(|((&request, &token), policy)| {
-                    PlanRuntimeDecodeInput::new(
-                        ids[request].clone(),
-                        TokenId::new(token),
-                        Arc::clone(&caches[arm][request]),
+                    ExecutionWork::new(
+                        &caches[arm][request],
+                        TokenWork::Decode {
+                            token: TokenId::new(token),
+                            position: caches[arm][request].consumed_tokens(),
+                        },
+                        policy,
                     )
-                    .with_logits_policy(policy.clone())
+                    .unwrap()
                 })
                 .collect::<Vec<_>>();
             let before = readback(&fixture.executor);
-            let completed = match fixture
-                .executor
-                .plan_runtime_batch_decode_with_capacity(&input)
-                .await
-                .unwrap()
-            {
-                PlanRuntimeBatchDecodeOutcome::Completed(output) => output,
-                PlanRuntimeBatchDecodeOutcome::Deferred(_) => {
-                    panic!("tiny decode wave {index} did not execute")
-                }
-            };
+            let completed = completed(fixture.executor.execute_tokens(&input).await.unwrap());
             assert_eq!(completed.len(), input.len());
+            let input_len = input.len();
             let scalar = if arm == 0 {
                 vec![wave.uniform_scalar; input.len()]
             } else {
                 wave.participant_scalar.clone()
             };
-            for ((output, input), (&request, scalar)) in completed
+            for (input_index, ((output, input), (&request, scalar))) in completed
                 .iter()
                 .zip(&input)
                 .zip(wave.order.iter().zip(&scalar))
+                .enumerate()
             {
+                output.validate_for(input_index, input, VOCAB).unwrap();
                 assert_eq!(
-                    output.kv_cache.cache_id(),
-                    input.kv_cache.cache_id(),
+                    output.next_frontier().sequence(),
+                    input.sequence(),
                     "caller request order"
                 );
                 assert_eq!(
-                    output.kv_cache.num_tokens(),
-                    input.kv_cache.num_tokens() + 1,
+                    output.next_frontier().consumed_tokens(),
+                    input.expected_frontier().consumed_tokens() + 1,
                     "committed frontier"
                 );
-                output
-                    .sampling_output
-                    .validate_for_policy(&input.logits_policy, VOCAB)
+                sampling(output)
+                    .validate_for_policy(input.logits_policy(), VOCAB)
                     .unwrap();
                 assert_eq!(
-                    matches!(
-                        output.sampling_output,
-                        ExecutorSamplingOutput::GreedyToken(_)
-                    ),
+                    matches!(sampling(output), ExecutorSamplingOutput::GreedyToken(_)),
                     *scalar,
                     "arm {arm}, wave {index}, request {request}"
                 );
-                caches[arm][request] = Arc::clone(&output.kv_cache);
+            }
+            // Work borrows the old frontiers until all outputs were validated.
+            for (output, &request) in completed.iter().zip(&wave.order) {
+                caches[arm][request] = output.next_frontier().clone();
             }
             let greedy = scalar.iter().filter(|&&scalar| scalar).count() as u64;
-            let full = input.len() as u64 - greedy;
+            let full = input_len as u64 - greedy;
             let after = readback(&fixture.executor);
             assert_delta(&before, &after, "full_logits_participants", full);
             assert_delta(&before, &after, "greedy_token_participants", greedy);
@@ -490,7 +481,7 @@ async fn compare<R: DeviceRuntime>(uniform: Fixture<R>, participant: Fixture<R>)
             outputs.push(completed);
         }
         if uniform.executor.io.output_element_type == ElementType::F16 && wave.tokens[0] == 2 {
-            let ExecutorSamplingOutput::FullLogits(logits) = &outputs[0][0].sampling_output else {
+            let ExecutorSamplingOutput::FullLogits(logits) = sampling(&outputs[0][0]) else {
                 panic!("signed-zero oracle requires the original Full route")
             };
             assert_eq!(logits[0].to_bits(), (-0.0_f32).to_bits());
@@ -502,7 +493,7 @@ async fn compare<R: DeviceRuntime>(uniform: Fixture<R>, participant: Fixture<R>)
         }
         for ((baseline, selected), policy) in outputs[0].iter().zip(&outputs[1]).zip(&wave.policies)
         {
-            match (&baseline.sampling_output, &selected.sampling_output) {
+            match (sampling(baseline), sampling(selected)) {
                 (ExecutorSamplingOutput::FullLogits(a), ExecutorSamplingOutput::FullLogits(b)) => {
                     assert_eq!(
                         a.iter().map(|value| value.to_bits()).collect::<Vec<_>>(),
@@ -521,7 +512,7 @@ async fn compare<R: DeviceRuntime>(uniform: Fixture<R>, participant: Fixture<R>)
             }
             if matches!(policy, LogitsReturnPolicy::GreedyArgmax { token_mask: Some(mask), .. } if mask.valid_token_mask.iter().all(|&valid| valid == 0))
             {
-                let ExecutorSamplingOutput::FullLogits(logits) = &selected.sampling_output else {
+                let ExecutorSamplingOutput::FullLogits(logits) = sampling(selected) else {
                     panic!("all-masked row must preserve host failure scope")
                 };
                 assert!(host_token(logits, policy).is_err());
@@ -530,7 +521,7 @@ async fn compare<R: DeviceRuntime>(uniform: Fixture<R>, participant: Fixture<R>)
     }
     for (fixture, caches) in fixtures.iter().zip(caches) {
         for cache in caches {
-            fixture.executor.release_cache(&cache.cache_id());
+            close(&fixture.executor, cache.sequence()).await;
         }
         assert_eq!(
             fixture.executor.cache_metrics_snapshot().unwrap()["active_sequences"],
@@ -583,33 +574,26 @@ async fn compare_no_finite<R: DeviceRuntime>(uniform: Fixture<R>, participant: F
             .zip([3, 1, 0])
             .zip(&policies)
             .map(|((owner, token), policy)| {
-                PlanRuntimeDecodeInput::new(
-                    ids[owner].clone(),
-                    TokenId::new(token),
-                    Arc::clone(&caches[owner]),
+                ExecutionWork::new(
+                    &caches[owner],
+                    TokenWork::Decode {
+                        token: TokenId::new(token),
+                        position: caches[owner].consumed_tokens(),
+                    },
+                    policy,
                 )
-                .with_logits_policy(policy.clone())
+                .unwrap()
             })
             .collect::<Vec<_>>();
         let before = readback(&fixture.executor);
-        let completed = match fixture
-            .executor
-            .plan_runtime_batch_decode_with_capacity(&input)
-            .await
-            .unwrap()
-        {
-            PlanRuntimeBatchDecodeOutcome::Completed(completed) => completed,
-            PlanRuntimeBatchDecodeOutcome::Deferred(_) => {
-                panic!("nonfinite fixture did not execute")
-            }
-        };
+        let completed = completed(fixture.executor.execute_tokens(&input).await.unwrap());
         assert_eq!(completed.len(), 3);
-        for (output, input) in completed.iter().zip(&input) {
-            assert_eq!(output.kv_cache.cache_id(), input.kv_cache.cache_id());
-            assert_eq!(output.kv_cache.num_tokens(), 2);
-            output
-                .sampling_output
-                .validate_for_policy(&input.logits_policy, VOCAB)
+        for (index, (output, input)) in completed.iter().zip(&input).enumerate() {
+            output.validate_for(index, input, VOCAB).unwrap();
+            assert_eq!(output.next_frontier().sequence(), input.sequence());
+            assert_eq!(output.next_frontier().consumed_tokens(), 2);
+            sampling(output)
+                .validate_for_policy(input.logits_policy(), VOCAB)
                 .unwrap();
         }
         let after = readback(&fixture.executor);
@@ -642,24 +626,24 @@ async fn compare_no_finite<R: DeviceRuntime>(uniform: Fixture<R>, participant: F
         );
         outputs.push(completed);
         for cache in caches {
-            fixture.executor.release_cache(&cache.cache_id());
+            close(&fixture.executor, cache.sequence()).await;
         }
     }
-    let ExecutorSamplingOutput::FullLogits(failed_logits) = &outputs[0][0].sampling_output else {
+    let ExecutorSamplingOutput::FullLogits(failed_logits) = sampling(&outputs[0][0]) else {
         panic!("baseline failure must remain host sampling")
     };
     assert!(failed_logits.iter().all(|value| !value.is_finite()));
     assert!(host_token(failed_logits, &policies[0]).is_err());
     assert_eq!(
-        outputs[1][0].sampling_output,
+        *sampling(&outputs[1][0]),
         ExecutorSamplingOutput::NoSelectableFiniteLogit
     );
-    assert_eq!(outputs[0][1].sampling_output, outputs[1][1].sampling_output);
-    let ExecutorSamplingOutput::FullLogits(healthy_logits) = &outputs[0][2].sampling_output else {
+    assert_eq!(*sampling(&outputs[0][1]), *sampling(&outputs[1][1]));
+    let ExecutorSamplingOutput::FullLogits(healthy_logits) = sampling(&outputs[0][2]) else {
         panic!("baseline healthy row must remain full")
     };
     assert_eq!(
-        outputs[1][2].sampling_output,
+        *sampling(&outputs[1][2]),
         ExecutorSamplingOutput::GreedyToken(host_token(healthy_logits, &policies[2]).unwrap())
     );
 }
@@ -705,6 +689,7 @@ async fn sampling_readback_cuda_terminal_preserves_mixed_outputs_masks_order_and
             FixtureOptions {
                 logits_type: ElementType::F32,
                 nonfinite_token: nonfinite,
+                ..FixtureOptions::default()
             },
         )
     };
@@ -743,6 +728,7 @@ async fn sampling_readback_cuda_f16_terminal_preserves_mixed_outputs_and_failure
             FixtureOptions {
                 logits_type: ElementType::F16,
                 nonfinite_token: nonfinite,
+                ..FixtureOptions::default()
             },
         )
     };

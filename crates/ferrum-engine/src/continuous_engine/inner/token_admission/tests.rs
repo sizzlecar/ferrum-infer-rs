@@ -2,9 +2,7 @@
 //! identity belong to the existing real CPU Llama fixture.
 use super::*;
 use crate::continuous_engine::token_completion_tests::{observed_cpu_model, ModelObservation};
-use ferrum_execution::model_executor::{
-    DecodeInput, DecodeOutput, ExecutorCapabilities, ExecutorStatus, PrefillInput, PrefillOutput,
-};
+use ferrum_execution::model_executor::{ExecutorCapabilities, ExecutorStatus};
 use ferrum_execution::token_execution::{
     ExecutionBatchOutcome, ExecutionCloseDisposition, ExecutionCloseOutcome, ExecutionWork,
     ExecutorSequence,
@@ -100,14 +98,6 @@ impl ModelExecutor for AdmissionGate {
             self.closed.lock().push(sequence.clone());
         }
         Ok(outcome)
-    }
-
-    async fn prefill(&self, _: &PrefillInput) -> Result<PrefillOutput> {
-        panic!("admission ownership tests must not enter the tensor bridge")
-    }
-
-    async fn decode(&self, _: &DecodeInput) -> Result<DecodeOutput> {
-        panic!("admission ownership tests must not enter the tensor bridge")
     }
 }
 

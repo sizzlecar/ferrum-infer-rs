@@ -48,9 +48,5 @@ where
     T::try_from(value.into()).unwrap()
 }
 
-fn device() -> Device {
-    Device::Metal
-}
-
 #[path = "checks.rs"]
 mod checks;

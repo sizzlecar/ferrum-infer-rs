@@ -1,20 +1,17 @@
 //! Mock model executor with configurable latency for scheduling tests.
 
-use crate::kv_cache::MockKvCacheHandle;
-use crate::tensor::MockTensor;
 use async_trait::async_trait;
 use ferrum_execution::token_execution::*;
 use ferrum_execution::{
     model_executor::{
-        AttentionType, DecodeInput, DecodeOutput, ExecutorCapabilities, ExecutorMemoryUsage,
-        ExecutorState, ExecutorStatus, MemoryRequirements, PrefillInput, PrefillOutput,
+        AttentionType, ExecutorCapabilities, ExecutorMemoryUsage, ExecutorState, ExecutorStatus,
+        MemoryRequirements,
     },
     ModelExecutor,
 };
-use ferrum_types::{DataType, Device, ModelInfo, ModelType, RequestId, Result};
+use ferrum_types::{DataType, Device, ModelInfo, ModelType, Result};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
 use std::time::Duration;
 
 pub(crate) mod token_state;
@@ -130,61 +127,6 @@ impl ModelExecutor for MockModelExecutor {
 
     fn info(&self) -> &ModelInfo {
         &self.info
-    }
-
-    async fn prefill(&self, input: &PrefillInput) -> Result<PrefillOutput> {
-        if !self.prefill_latency.is_zero() {
-            tokio::time::sleep(self.prefill_latency).await;
-        }
-        self.prefill_count.fetch_add(1, Ordering::Relaxed);
-
-        let batch_size = input.batch_size();
-        let seq_len = input.sequence_length();
-        let vocab_size = self.info.vocab_size;
-
-        // Return synthetic logits [batch, seq_len, vocab_size]
-        // Put a slight bias toward token 42 so greedy sampling is deterministic
-        let mut logits_data = vec![0.0f32; batch_size * seq_len * vocab_size];
-        for b in 0..batch_size {
-            for s in 0..seq_len {
-                let offset = (b * seq_len + s) * vocab_size;
-                if offset + 42 < logits_data.len() {
-                    logits_data[offset + 42] = 1.0;
-                }
-            }
-        }
-        let logits =
-            MockTensor::from_f32(logits_data, &[batch_size, seq_len, vocab_size]).into_ref();
-
-        let kv_cache = Arc::new(MockKvCacheHandle::new(
-            RequestId::new(),
-            self.info.num_layers,
-            seq_len,
-        ));
-
-        Ok(PrefillOutput::new(logits, kv_cache))
-    }
-
-    async fn decode(&self, input: &DecodeInput) -> Result<DecodeOutput> {
-        if !self.decode_latency.is_zero() {
-            tokio::time::sleep(self.decode_latency).await;
-        }
-        self.decode_count.fetch_add(1, Ordering::Relaxed);
-
-        let batch_size = input.batch_size();
-        let vocab_size = self.info.vocab_size;
-
-        // Return logits [batch, vocab_size] with bias toward token 42
-        let mut logits_data = vec![0.0f32; batch_size * vocab_size];
-        for b in 0..batch_size {
-            let offset = b * vocab_size;
-            if offset + 42 < logits_data.len() {
-                logits_data[offset + 42] = 1.0;
-            }
-        }
-        let logits = MockTensor::from_f32(logits_data, &[batch_size, vocab_size]).into_ref();
-
-        Ok(DecodeOutput::new(logits, input.kv_cache.clone()))
     }
 
     fn capabilities(&self) -> ExecutorCapabilities {

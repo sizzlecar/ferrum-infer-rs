@@ -536,8 +536,8 @@ pub async fn create_defined_product_engine(
 mod tests {
     use super::*;
     use ferrum_execution::model_executor::{
-        DecodeInput, DecodeOutput, ExecutionResourceAuthority, ExecutorCapabilities,
-        ExecutorStatus, PlanRuntimeResourceSnapshot, PrefillInput, PrefillOutput,
+        ExecutionResourceAuthority, ExecutorCapabilities, ExecutorStatus,
+        PlanRuntimeResourceSnapshot,
     };
     use ferrum_execution::ProductExecutionEventSink;
     use ferrum_interfaces::{
@@ -582,14 +582,6 @@ mod tests {
                 return Err(FerrumError::backend("startup preparation rejected"));
             }
             Ok(())
-        }
-
-        async fn prefill(&self, input: &PrefillInput) -> Result<PrefillOutput> {
-            self.inner.prefill(input).await
-        }
-
-        async fn decode(&self, input: &DecodeInput) -> Result<DecodeOutput> {
-            self.inner.decode(input).await
         }
 
         fn capabilities(&self) -> ExecutorCapabilities {
@@ -637,14 +629,6 @@ mod tests {
                 .event_sink
                 .lock()
                 .expect("profile startup probe sink lock") = Some(sink);
-        }
-
-        async fn prefill(&self, input: &PrefillInput) -> Result<PrefillOutput> {
-            self.inner.prefill(input).await
-        }
-
-        async fn decode(&self, input: &DecodeInput) -> Result<DecodeOutput> {
-            self.inner.decode(input).await
         }
 
         fn capabilities(&self) -> ExecutorCapabilities {
@@ -726,14 +710,6 @@ mod tests {
 
         fn plan_runtime_resource_snapshot(&self) -> Result<Option<PlanRuntimeResourceSnapshot>> {
             PlanRuntimeResourceSnapshot::new(1_000, 900, 700, 700, 400, 300, 200, 0, 0).map(Some)
-        }
-
-        async fn prefill(&self, input: &PrefillInput) -> Result<PrefillOutput> {
-            self.inner.prefill(input).await
-        }
-
-        async fn decode(&self, input: &DecodeInput) -> Result<DecodeOutput> {
-            self.inner.decode(input).await
         }
 
         fn capabilities(&self) -> ExecutorCapabilities {

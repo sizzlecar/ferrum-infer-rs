@@ -1,8 +1,9 @@
 //! Controlled mixed-work protocol tests. Fake logits/cache handles are test
 //! plumbing; these checks do not claim model or backend numerical coverage.
 
+use super::controlled_token_fixture::{FixtureInput, FixtureOutcome};
 use super::*;
-use ferrum_execution::model_executor::PlanRuntimeMixedBatchOutcome;
+use ferrum_execution::token_execution::{ExecutorSequenceIssuer, TokenWork};
 
 #[derive(Clone, Copy)]
 pub(super) enum MixedBehavior {
@@ -14,15 +15,13 @@ pub(super) enum MixedBehavior {
 }
 
 impl PlanRuntimeBatchDecodeTestExecutor {
-    pub(super) async fn mock_mixed_batch(
+    pub(super) fn mock_mixed_tokens(
         &self,
-        prefills: &[PlanRuntimePrefillInput],
-        decodes: &[PlanRuntimeDecodeInput],
-    ) -> Result<PlanRuntimeMixedBatchOutcome> {
+        inputs: &[FixtureInput<'_, '_>],
+    ) -> Result<FixtureOutcome> {
         self.mixed_calls.fetch_add(1, Ordering::Relaxed);
-        let behavior = *self.mixed_behavior.lock().unwrap();
-        let Some(behavior) = behavior else {
-            return Ok(PlanRuntimeMixedBatchOutcome::Unsupported);
+        let Some(behavior) = *self.mixed_behavior.lock().unwrap() else {
+            return Ok(FixtureOutcome::Unsupported);
         };
         match behavior {
             MixedBehavior::NotSubmitted => {
@@ -34,7 +33,7 @@ impl PlanRuntimeBatchDecodeTestExecutor {
                 let wait =
                     ferrum_runtime::CapacityWaitCondition::from_observation(47, vec![observed])
                         .unwrap();
-                return Ok(PlanRuntimeMixedBatchOutcome::NotSubmitted(
+                return Ok(FixtureOutcome::Deferred(
                     test_execution_capacity_deferral(
                         ExecutorAdmissionEpochs::new(std::num::NonZeroU64::new(47).unwrap(), 0, 0),
                         wait,
@@ -50,56 +49,26 @@ impl PlanRuntimeBatchDecodeTestExecutor {
             }
             _ => {}
         }
-        let mut prefill_outputs = Vec::new();
-        for input in prefills {
-            let cache: Arc<dyn KvCacheHandle> = Arc::new(ferrum_testkit::MockKvCacheHandle::new(
-                input.request_id.clone(),
-                1,
-                input.chunk.end(),
-            ));
-            let output = if input.chunk.is_final() {
-                let mut logits = vec![0.0; self.info().vocab_size];
-                logits[6] = 1.0;
-                PlanRuntimePrefillOutput::final_logits(
-                    input.request_id.clone(),
-                    input.chunk.end(),
-                    logits,
-                    cache,
-                )?
-            } else {
-                PlanRuntimePrefillOutput::intermediate(
-                    input.request_id.clone(),
-                    input.chunk.end(),
-                    cache,
-                )
-            };
-            prefill_outputs.push(PlanRuntimePrefillCompletion::exact(output, input.chunk));
-        }
-        let mut decode_outputs = decodes
+        let mut rows = inputs
             .iter()
-            .map(|input| {
-                let mut logits = vec![0.0; self.info().vocab_size];
-                logits[6] = 1.0;
-                PlanRuntimeDecodeOutput::new(
-                    ExecutorSamplingOutput::FullLogits(logits),
-                    input.kv_cache.clone(),
-                )
-            })
+            .map(|input| input.exact(6, self.info().vocab_size))
             .collect::<Vec<_>>();
         if matches!(behavior, MixedBehavior::WrongDecodeCache) {
-            decode_outputs[0].kv_cache = Arc::new(ferrum_testkit::MockKvCacheHandle::new(
-                RequestId::new(),
-                1,
-                1,
-            ));
+            let index = inputs
+                .iter()
+                .position(|input| matches!(input.work.work(), TokenWork::Decode { .. }))
+                .unwrap();
+            // A real foreign opaque identity, never a fabricated cache string.
+            rows[index].sequence = ExecutorSequenceIssuer::default().issue_sequence()?;
         }
         if matches!(behavior, MixedBehavior::ShortPrefill) {
-            prefill_outputs.pop();
+            let index = inputs
+                .iter()
+                .rposition(|input| matches!(input.work.work(), TokenWork::Prefill(_)))
+                .unwrap();
+            rows.remove(index);
         }
-        Ok(PlanRuntimeMixedBatchOutcome::Completed {
-            prefills: prefill_outputs,
-            decodes: decode_outputs,
-        })
+        Ok(FixtureOutcome::Rows(rows))
     }
 }
 

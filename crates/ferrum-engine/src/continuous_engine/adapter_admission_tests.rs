@@ -45,7 +45,6 @@ impl Tokenizer for CountingTokenizer {
 // This probe tests admission and metadata transport, not adapter arithmetic.
 struct AdapterCapableExecutor {
     inner: MockModelExecutor,
-    tokens: ControlledTokenState,
     support: AdapterExecutionSupport,
     selections: Mutex<Vec<Option<(String, String)>>>,
     admitted: Mutex<Vec<ExecutorSequence>>,
@@ -55,7 +54,6 @@ impl AdapterCapableExecutor {
     fn new(support: AdapterExecutionSupport) -> Self {
         Self {
             inner: MockModelExecutor::instant(128),
-            tokens: ControlledTokenState::default(),
             support,
             selections: Mutex::new(Vec::new()),
             admitted: Mutex::new(Vec::new()),
@@ -83,7 +81,14 @@ impl ModelExecutor for AdapterCapableExecutor {
                 .adapter
                 .map(|selection| (selection.name.to_owned(), selection.path.to_owned())),
         );
-        let outcome = controlled_token_fixture::admit(self, &self.tokens, input)?;
+        // This fixture observes adapter transport; the inner fake has no adapter arithmetic.
+        let outcome = self
+            .inner
+            .admit_tokens(ExecutionAdmission {
+                adapter: None,
+                ..input
+            })
+            .await?;
         if let TokenAdmissionOutcome::Admitted(frontier) = &outcome {
             self.admitted.lock().push(frontier.sequence().clone());
         }
@@ -103,7 +108,7 @@ impl ModelExecutor for AdapterCapableExecutor {
     }
 
     async fn execute_tokens(&self, work: &[ExecutionWork<'_>]) -> Result<ExecutionBatchOutcome> {
-        controlled_token_fixture::execute(self, &self.tokens, work).await
+        self.inner.execute_tokens(work).await
     }
 
     async fn finish_tokens(
@@ -111,53 +116,11 @@ impl ModelExecutor for AdapterCapableExecutor {
         sequence: &ExecutorSequence,
         reason: ExecutionEndReason,
     ) -> Result<ExecutionCloseOutcome> {
-        controlled_token_fixture::finish(self, &self.tokens, sequence, reason).await
+        self.inner.finish_tokens(sequence, reason).await
     }
 
     fn cancel_tokens(&self, sequence: &ExecutorSequence) -> Result<ExecutionCloseOutcome> {
-        controlled_token_fixture::cancel(self, &self.tokens, sequence)
-    }
-
-    async fn plan_runtime_prefill_with_capacity(
-        &self,
-        input: &PlanRuntimePrefillInput,
-    ) -> Result<PlanRuntimePrefillOutcome> {
-        let output = self
-            .inner
-            .prefill(&plan_runtime_prefill_to_mock_input(input))
-            .await?;
-        plan_runtime_prefill_completion_from_mock(
-            &input.request_id,
-            ExecutorPrefillCompletion::exact(output, input.chunk),
-        )
-        .map(PlanRuntimePrefillOutcome::Completed)
-    }
-
-    async fn plan_runtime_batch_decode_with_capacity(
-        &self,
-        inputs: &[PlanRuntimeDecodeInput],
-    ) -> Result<PlanRuntimeBatchDecodeOutcome> {
-        let mut outputs = Vec::new();
-        for input in inputs {
-            let old = DecodeInput::new(
-                MockTensor::from_f32(vec![input.input_token.get() as f32], &[1, 1]).into_ref(),
-                input.kv_cache.clone(),
-            );
-            let output = self.inner.decode(&old).await?;
-            outputs.push(PlanRuntimeDecodeOutput::new(
-                ExecutorSamplingOutput::FullLogits(output.logits.to_vec_f32()?),
-                output.kv_cache,
-            ));
-        }
-        Ok(PlanRuntimeBatchDecodeOutcome::Completed(outputs))
-    }
-
-    async fn prefill(&self, _: &PrefillInput) -> Result<PrefillOutput> {
-        panic!("Engine must use token admission and execution")
-    }
-
-    async fn decode(&self, _: &DecodeInput) -> Result<DecodeOutput> {
-        panic!("Engine must use token admission and execution")
+        self.inner.cancel_tokens(sequence)
     }
 
     fn capabilities(&self) -> ExecutorCapabilities {

@@ -1411,7 +1411,6 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             input.request_id.clone(),
             restored_tokens,
             tokens.len(),
-            self.cache_handle(&sequence, restored_tokens),
             sequence.token_identity.clone(),
             move || observer.acknowledge(&metrics, restored_tokens, || callback.acknowledge()),
         )

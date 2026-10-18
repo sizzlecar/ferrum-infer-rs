@@ -2,8 +2,7 @@
 
 use super::*;
 use ferrum_execution::model_executor::{
-    DecodeInput, DecodeOutput, ExecutorCapabilities, ExecutorSamplingOutput, ExecutorStatus,
-    KvSlotRequest, KvSlotReservation, PrefillInput, PrefillOutput,
+    ExecutorCapabilities, ExecutorSamplingOutput, ExecutorStatus, KvSlotRequest, KvSlotReservation,
 };
 use ferrum_execution::token_execution::*;
 use ferrum_kernels::backend::cpu::CpuBackend;
@@ -267,12 +266,6 @@ impl ModelExecutor for FaultAfterForward {
     }
     fn cancel_tokens(&self, sequence: &ExecutorSequence) -> Result<ExecutionCloseOutcome> {
         self.inner.cancel_tokens(sequence)
-    }
-    async fn prefill(&self, _: &PrefillInput) -> Result<PrefillOutput> {
-        panic!("no Tensor bridge")
-    }
-    async fn decode(&self, _: &DecodeInput) -> Result<DecodeOutput> {
-        panic!("no Tensor bridge")
     }
 }
 

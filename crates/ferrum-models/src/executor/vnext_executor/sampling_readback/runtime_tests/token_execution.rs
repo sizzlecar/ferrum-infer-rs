@@ -1,9 +1,9 @@
 //! Real CPU embedding/head execution through the public token protocol.
 //! This fixture exercises native resource ownership, not an attention KV model.
 use super::*;
-use ferrum_execution::token_execution::*;
+mod mixed_roles;
 
-async fn admit_tokens<R: DeviceRuntime>(
+pub(super) async fn admit_tokens<R: DeviceRuntime>(
     fixture: &Fixture<R>,
     request: &RequestId,
     tokens: &[TokenId],
@@ -27,7 +27,7 @@ async fn admit_tokens<R: DeviceRuntime>(
     }
 }
 
-async fn execute_one<R: DeviceRuntime>(
+pub(super) async fn execute_one<R: DeviceRuntime>(
     fixture: &Fixture<R>,
     frontier: &ExecutionFrontier,
     work: TokenWork,

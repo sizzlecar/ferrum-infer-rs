@@ -5,7 +5,6 @@ use ferrum_execution::model_executor::{
     PlanRuntimePrefixRestoreOutcome, PlanRuntimePrefixRestoreOutput, PrefixCaptureLease,
     PrefixCaptureStatus, PrefixRestoreSource,
 };
-use ferrum_testkit::MockKvCacheHandle;
 
 #[derive(Debug)]
 struct Checkpoint {
@@ -94,13 +93,11 @@ impl RestoreState {
             .expect("restore target must be admitted")
             .sequence()
             .clone();
-        let cache = Arc::new(MockKvCacheHandle::new(id.clone(), 1, checkpoint.boundary()));
         let state = Arc::clone(self);
         PlanRuntimePrefixRestoreOutput::new_tokens(
             id.clone(),
             checkpoint.boundary(),
             input.input_tokens.len(),
-            cache,
             sequence.clone(),
             move || {
                 assert_eq!(checkpoint.status(), PrefixCaptureStatus::Ready);
