@@ -19,11 +19,45 @@ pub enum ModelTokenWork<'a> {
 /// Actual execution status supplied by the model implementation. In
 /// particular, a returned error alone does not establish zero submission.
 #[derive(Debug)]
-pub enum ModelTokenOutcome {
+pub enum ModelTokenOutcome<T = Vec<f32>> {
     NotSubmitted(FerrumError),
     /// The implementation observed synchronous completion (or an actual
     /// terminal failure). Logit validation is a later product operation.
-    Terminal(Result<Vec<f32>>),
+    Terminal(Result<T>),
+    /// The original model still owns an unobserved physical frame. A caller
+    /// must not retry this work or release its cache on the strength of Err.
+    Held(FerrumError),
+}
+
+/// Borrowed numerical inputs. Executor identities and queue claims stay above
+/// this boundary; the model retains its own physical KV and context owners.
+pub struct ModelTokenInput<'a> {
+    pub cache_id: &'a str,
+    pub work: ModelTokenWork<'a>,
+    pub logits_policy: &'a ferrum_execution::model_executor::LogitsReturnPolicy,
+    pub sample: bool,
+}
+
+pub type ModelTokenProduct = Option<ferrum_execution::model_executor::ExecutorSamplingOutput>;
+
+/// A physical cohort has one terminal observation. Serial fallbacks retain
+/// each actual result, including successful peers before a later failure.
+pub enum ModelTokenBatchOutcome {
+    Cohort(ModelTokenOutcome<Vec<ModelTokenProduct>>),
+    Serial(Vec<ModelTokenOutcome<ModelTokenProduct>>),
+}
+
+/// Closing an incarnation is independent of whether its operation succeeded.
+/// Held retains the actual model-owned context and cache for later recovery.
+pub enum ModelTokenCloseOutcome {
+    Ended { error: Option<FerrumError> },
+    Held { error: FerrumError },
+}
+
+/// Observation of the original shared context, not a sequence release.
+pub enum ModelExecutionRecovery {
+    Quiescent { error: Option<FerrumError> },
+    Held { error: FerrumError },
 }
 
 /// Only callers with an actual synchronous-host implementation may use this.

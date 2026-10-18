@@ -4443,6 +4443,182 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         self.resize_scratch(self.scratch.max_tokens);
     }
 
+    pub(crate) fn validate_managed_token_work(
+        &self,
+        cache_id: &str,
+        work: crate::common::llm::ModelTokenWork<'_>,
+    ) -> Result<()> {
+        use crate::common::llm::ModelTokenWork;
+        let (position, count, valid) = match work {
+            ModelTokenWork::Prefill { tokens, position } => (
+                position,
+                tokens.len(),
+                tokens
+                    .iter()
+                    .all(|&token| (token as usize) < self.cfg.vocab_size),
+            ),
+            ModelTokenWork::Decode { token, position } => {
+                (position as usize, 1, (token as usize) < self.cfg.vocab_size)
+            }
+        };
+        self.ensure_preparation_available()?;
+        if count == 0
+            || !valid
+            || position
+                .checked_add(count)
+                .is_none_or(|end| end > self.kv_capacity_limit() || end > u32::MAX as usize)
+            || self
+                .kv_caches
+                .get(cache_id)
+                .is_none_or(|layers| layers.iter().any(|cache| K::len(cache) != position))
+        {
+            return Err(ferrum_types::FerrumError::request_validation(
+                "token work does not match the model's live per-layer KV frontier",
+            ));
+        }
+        Ok(())
+    }
+
+    fn kv_capacity_limit(&self) -> usize {
+        self.runtime_env.kv_capacity_for_model(self.cfg.max_seq_len)
+    }
+
+    pub(crate) fn prepare_managed_token_capacity(
+        &mut self,
+        requests: &[KvSlotRequest],
+    ) -> crate::common::llm::ModelTokenOutcome<()> {
+        use crate::common::llm::{ModelKvReservation, ModelTokenOutcome};
+        // Cached extents take the existing context-free reservation path;
+        // growth retains and observes its actual preparation frame. No token
+        // computation has started at this boundary.
+        match self.reserve_paged_token_kv_slots(requests) {
+            Ok(ModelKvReservation::Reserved(_)) => ModelTokenOutcome::Terminal(Ok(())),
+            Ok(ModelKvReservation::CapacityDeferred(deferred)) => ModelTokenOutcome::NotSubmitted(
+                ferrum_types::FerrumError::resource_exhausted(format!(
+                    "paged token work requires {} blocks with {} available",
+                    deferred.required_blocks(),
+                    deferred.snapshot().free_blocks,
+                )),
+            ),
+            Err(error) if self.pending_device_frame.is_some() => ModelTokenOutcome::Held(error),
+            Err(error) => ModelTokenOutcome::NotSubmitted(error),
+        }
+    }
+
+    pub(crate) fn execute_managed_token_work(
+        &mut self,
+        cache_id: &str,
+        work: crate::common::llm::ModelTokenWork<'_>,
+    ) -> crate::common::llm::ModelTokenOutcome {
+        use crate::common::llm::{ModelTokenOutcome, ModelTokenWork};
+        if let Err(error) = self.validate_managed_token_work(cache_id, work) {
+            return ModelTokenOutcome::NotSubmitted(error);
+        }
+        let target_len = match work {
+            ModelTokenWork::Prefill { tokens, position } => position + tokens.len(),
+            ModelTokenWork::Decode { position, .. } => position as usize + 1,
+        };
+        match self.prepare_managed_token_capacity(&[KvSlotRequest {
+            cache_id: cache_id.to_owned(),
+            target_len,
+            admission_target_len: None,
+        }]) {
+            ModelTokenOutcome::Terminal(Ok(())) => {}
+            ModelTokenOutcome::NotSubmitted(error) => {
+                return ModelTokenOutcome::NotSubmitted(error)
+            }
+            ModelTokenOutcome::Held(error) => return ModelTokenOutcome::Held(error),
+            ModelTokenOutcome::Terminal(Err(error)) => {
+                return ModelTokenOutcome::NotSubmitted(error)
+            }
+        }
+        match self.run_device_frame(|model, frame| match work {
+            ModelTokenWork::Prefill { tokens, .. } => {
+                model.prefill_in_frame(frame, cache_id, tokens)
+            }
+            ModelTokenWork::Decode { token, position } => {
+                model.decode_in_frame(frame, cache_id, token, position)
+            }
+        }) {
+            DeviceFrameResult::Rejected(error) => ModelTokenOutcome::NotSubmitted(error),
+            DeviceFrameResult::Terminal(result) => ModelTokenOutcome::Terminal(result),
+            DeviceFrameResult::Held(error) => ModelTokenOutcome::Held(error),
+        }
+    }
+
+    pub(crate) fn execute_managed_serial_tokens(
+        &mut self,
+        inputs: &[crate::common::llm::ModelTokenInput<'_>],
+    ) -> crate::common::llm::ModelTokenBatchOutcome {
+        use crate::common::llm::{ModelTokenBatchOutcome, ModelTokenOutcome};
+        use ferrum_execution::model_executor::ExecutorSamplingOutput;
+        let mut rows = Vec::with_capacity(inputs.len());
+        let mut held = false;
+        for input in inputs {
+            let outcome = if held {
+                ModelTokenOutcome::NotSubmitted(ferrum_types::FerrumError::backend(
+                    "earlier participant retains the model context",
+                ))
+            } else {
+                match self.execute_managed_token_work(input.cache_id, input.work) {
+                    ModelTokenOutcome::Terminal(result) => {
+                        ModelTokenOutcome::Terminal(result.map(|logits| {
+                            input
+                                .sample
+                                .then_some(ExecutorSamplingOutput::FullLogits(logits))
+                        }))
+                    }
+                    ModelTokenOutcome::NotSubmitted(error) => {
+                        ModelTokenOutcome::NotSubmitted(error)
+                    }
+                    ModelTokenOutcome::Held(error) => {
+                        held = true;
+                        ModelTokenOutcome::Held(error)
+                    }
+                }
+            };
+            rows.push(outcome);
+        }
+        ModelTokenBatchOutcome::Serial(rows)
+    }
+
+    fn close_managed_token_cache(
+        &mut self,
+        cache_id: &str,
+    ) -> crate::common::llm::ModelTokenCloseOutcome {
+        use crate::common::llm::{ModelExecutionRecovery, ModelTokenCloseOutcome};
+        let error = match self.recover_token_frame() {
+            ModelExecutionRecovery::Held { error } => {
+                return ModelTokenCloseOutcome::Held { error }
+            }
+            ModelExecutionRecovery::Quiescent { error } => error,
+        };
+        // Every token/preparation encoder used the original retained frame.
+        // Its actual terminal observation permits metadata retirement; making
+        // and syncing an unrelated context here would prove nothing new.
+        self.graph_warmup = 0;
+        self.graph_capture_failed = false;
+        self.lora_cache_adapters.remove(cache_id);
+        if let Some(mut caches) = self.kv_caches.remove(cache_id) {
+            if let Some(allocator) = &self.paged_block_alloc {
+                let mut allocator = allocator
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if let Some(first) = caches.first() {
+                    let indices = K::paged_block_indices(first);
+                    if !indices.is_empty() {
+                        allocator.free(indices);
+                    }
+                }
+                for cache in &mut caches {
+                    K::paged_block_indices_mut(cache).clear();
+                }
+            }
+            self.kv_free_pool.push(caches);
+        }
+        ModelTokenCloseOutcome::Ended { error }
+    }
+
     /// Decode: process 1 token at position `pos`, return `[vocab_size]` logits.
     pub fn decode_internal(&mut self, cache_id: &str, token: u32, pos: u32) -> Vec<f32> {
         self.run_device_frame(|model, frame| model.decode_in_frame(frame, cache_id, token, pos))
@@ -5195,12 +5371,38 @@ impl<B: MoeLlmBackend> DecoderOnlyLLM for LlamaFamilyModel<B, KvFp16> {
         B::host_execution_is_synchronous()
     }
 
+    fn token_execution_requires_worker(&self) -> bool {
+        !B::host_execution_is_synchronous()
+    }
+
     fn execute_token_work(
         &mut self,
         cache_id: &str,
         work: crate::common::llm::ModelTokenWork<'_>,
     ) -> crate::common::llm::ModelTokenOutcome {
-        self.execute_host_token_work(cache_id, work)
+        if B::host_execution_is_synchronous() {
+            self.execute_host_token_work(cache_id, work)
+        } else {
+            self.execute_managed_token_work(cache_id, work)
+        }
+    }
+
+    fn execute_token_batch(
+        &mut self,
+        inputs: &[crate::common::llm::ModelTokenInput<'_>],
+    ) -> crate::common::llm::ModelTokenBatchOutcome {
+        self.execute_managed_fp16_tokens(inputs)
+    }
+
+    fn close_token_execution(
+        &mut self,
+        cache_id: &str,
+    ) -> crate::common::llm::ModelTokenCloseOutcome {
+        self.close_managed_token_cache(cache_id)
+    }
+
+    fn recover_token_execution(&mut self) -> crate::common::llm::ModelExecutionRecovery {
+        self.recover_token_frame()
     }
 
     fn close_token_sequence(&mut self, cache_id: &str) -> Result<()> {
@@ -5473,12 +5675,38 @@ impl<B: MoeLlmBackend + BackendInt8KvOps> DecoderOnlyLLM for LlamaFamilyModel<B,
         B::host_execution_is_synchronous()
     }
 
+    fn token_execution_requires_worker(&self) -> bool {
+        !B::host_execution_is_synchronous()
+    }
+
     fn execute_token_work(
         &mut self,
         cache_id: &str,
         work: crate::common::llm::ModelTokenWork<'_>,
     ) -> crate::common::llm::ModelTokenOutcome {
-        self.execute_host_token_work(cache_id, work)
+        if B::host_execution_is_synchronous() {
+            self.execute_host_token_work(cache_id, work)
+        } else {
+            self.execute_managed_token_work(cache_id, work)
+        }
+    }
+
+    fn execute_token_batch(
+        &mut self,
+        inputs: &[crate::common::llm::ModelTokenInput<'_>],
+    ) -> crate::common::llm::ModelTokenBatchOutcome {
+        self.execute_managed_serial_tokens(inputs)
+    }
+
+    fn close_token_execution(
+        &mut self,
+        cache_id: &str,
+    ) -> crate::common::llm::ModelTokenCloseOutcome {
+        self.close_managed_token_cache(cache_id)
+    }
+
+    fn recover_token_execution(&mut self) -> crate::common::llm::ModelExecutionRecovery {
+        self.recover_token_frame()
     }
 
     fn close_token_sequence(&mut self, cache_id: &str) -> Result<()> {

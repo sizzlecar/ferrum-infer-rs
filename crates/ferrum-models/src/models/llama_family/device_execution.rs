@@ -307,22 +307,30 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
     /// Called only by the actual model's recovery worker. This does not retry
     /// numerical work, publish logits, or advance any participant frontier.
     pub(crate) fn recover_device_frame(&mut self) -> Result<bool> {
-        let Some(frame) = self.pending_device_frame.take() else {
-            return Ok(true);
-        };
-        match frame.observe() {
-            FrameObservation::Terminal { owners, error } => {
-                owners.restore(&mut self.scratch);
-                // A terminal error proves lifetime only. The worker still
-                // reports the original failure and closes affected sequences.
+        match self.recover_token_frame() {
+            crate::common::llm::ModelExecutionRecovery::Quiescent { error } => {
                 if let Some(error) = error {
                     tracing::error!(%error, "retained device frame reached terminal failure");
                 }
                 Ok(true)
             }
+            crate::common::llm::ModelExecutionRecovery::Held { error } => Err(error),
+        }
+    }
+
+    pub(crate) fn recover_token_frame(&mut self) -> crate::common::llm::ModelExecutionRecovery {
+        use crate::common::llm::ModelExecutionRecovery;
+        let Some(frame) = self.pending_device_frame.take() else {
+            return ModelExecutionRecovery::Quiescent { error: None };
+        };
+        match frame.observe() {
+            FrameObservation::Terminal { owners, error } => {
+                owners.restore(&mut self.scratch);
+                ModelExecutionRecovery::Quiescent { error }
+            }
             FrameObservation::Unresolved { owners, error } => {
                 self.pending_device_frame = Some(owners);
-                Err(error)
+                ModelExecutionRecovery::Held { error }
             }
         }
     }

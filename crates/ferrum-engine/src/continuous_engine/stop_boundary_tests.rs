@@ -43,7 +43,7 @@ impl ModelExecutor for StopBoundaryExecutor {
             },
         ))
     }
-    fn admit_tokens(&self, input: ExecutionAdmission<'_>) -> Result<TokenAdmissionOutcome> {
+    async fn admit_tokens(&self, input: ExecutionAdmission<'_>) -> Result<TokenAdmissionOutcome> {
         assert!(input.adapter.is_none());
         controlled_token_fixture::admit(self, &self.tokens, input)
     }

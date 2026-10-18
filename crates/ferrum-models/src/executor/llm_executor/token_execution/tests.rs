@@ -136,12 +136,17 @@ fn fixture(
     (executor, observation, config)
 }
 
-fn admit(executor: &LlmExecutor, request: &RequestId, tokens: &[TokenId]) -> ExecutionFrontier {
+async fn admit(
+    executor: &LlmExecutor,
+    request: &RequestId,
+    tokens: &[TokenId],
+) -> ExecutionFrontier {
     let TokenAdmissionOutcome::Admitted(frontier) = executor
         .admit_tokens(ExecutionAdmission {
             context: ExecutorPrefillAdmission::for_startup(request, tokens, 16),
             adapter: None,
         })
+        .await
         .unwrap()
     else {
         panic!("expected admission")
@@ -184,12 +189,13 @@ async fn direct_tokens_real_llama_partial_final_decode_and_close() {
     let mut reference = model(&config);
     let request = RequestId::new();
     let prompt = [TokenId(1), TokenId(2), TokenId(3)];
-    let start = admit(&executor, &request, &prompt);
+    let start = admit(&executor, &request, &prompt).await;
     assert!(executor
         .admit_tokens(ExecutionAdmission {
             context: ExecutorPrefillAdmission::for_startup(&request, &prompt, 16),
             adapter: None
         })
+        .await
         .is_err());
     {
         let state = observation.lock();
@@ -288,6 +294,7 @@ async fn direct_tokens_real_llama_completion_accepts_last_output_at_physical_cap
                 .unwrap(),
                 adapter: None,
             })
+            .await
             .unwrap()
         else {
             panic!("exact-capacity CPU admission must succeed");
@@ -371,6 +378,7 @@ async fn direct_tokens_real_llama_completion_rejects_excess_and_overflow_without
             .unwrap(),
             adapter: None,
         })
+        .await
         .unwrap()
     else {
         panic!("CPU admission must succeed");
@@ -477,6 +485,7 @@ async fn direct_tokens_real_llama_completion_preserves_zero_output_and_replay_ac
                 .unwrap(),
                 adapter: None,
             })
+            .await
             .unwrap()
         else {
             panic!("CPU replay admission must succeed");
@@ -521,8 +530,8 @@ async fn direct_tokens_real_llama_completion_preserves_zero_output_and_replay_ac
     }
 }
 
-#[test]
-fn direct_tokens_real_llama_admission_reserves_actual_blocks_and_retries_after_release() {
+#[tokio::test]
+async fn direct_tokens_real_llama_admission_reserves_actual_blocks_and_retries_after_release() {
     let (executor, observation, _) = fixture(None);
     {
         let mut state = observation.lock();
@@ -540,12 +549,14 @@ fn direct_tokens_real_llama_admission_reserves_actual_blocks_and_retries_after_r
     }
     let TokenAdmissionOutcome::Admitted(first) = executor
         .admit_tokens(admission(&first_request, &prompt))
+        .await
         .unwrap()
     else {
         panic!("first prompt should reserve two physical blocks");
     };
     let TokenAdmissionOutcome::CapacityDeferred(deferred) = executor
         .admit_tokens(admission(&second_request, &prompt))
+        .await
         .unwrap()
     else {
         panic!("second prompt must observe the occupied physical pool");
@@ -585,6 +596,7 @@ fn direct_tokens_real_llama_admission_reserves_actual_blocks_and_retries_after_r
     );
     let TokenAdmissionOutcome::Admitted(second) = executor
         .admit_tokens(admission(&second_request, &prompt))
+        .await
         .unwrap()
     else {
         panic!("actual release must permit the unchanged second request");
@@ -602,6 +614,7 @@ fn direct_tokens_real_llama_admission_reserves_actual_blocks_and_retries_after_r
             context: ExecutorPrefillAdmission::for_startup(&RequestId::new(), &impossible, 64),
             adapter: None,
         })
+        .await
         .is_err());
     assert!(executor.token_sequences.lock().live.is_empty());
     let state = observation.lock();
@@ -613,8 +626,8 @@ fn direct_tokens_real_llama_admission_reserves_actual_blocks_and_retries_after_r
     );
 }
 
-#[test]
-fn direct_tokens_real_llama_admission_preserves_primary_failure_and_original_owner() {
+#[tokio::test]
+async fn direct_tokens_real_llama_admission_preserves_primary_failure_and_original_owner() {
     let (executor, observation, _) = fixture(None);
     {
         let mut state = observation.lock();
@@ -628,6 +641,7 @@ fn direct_tokens_real_llama_admission_preserves_primary_failure_and_original_own
             context: ExecutorPrefillAdmission::for_startup(&request, &prompt, 16),
             adapter: None,
         })
+        .await
         .unwrap_err();
     assert!(matches!(error, FerrumError::Backend { .. }));
     assert!(error
@@ -668,10 +682,10 @@ async fn partial_failure(fault: Fault) {
         [TokenId(3), TokenId(4)],
         [TokenId(5), TokenId(6)],
     ];
-    let frontiers = prompts
-        .iter()
-        .map(|prompt| admit(&executor, &RequestId::new(), prompt))
-        .collect::<Vec<_>>();
+    let mut frontiers = Vec::with_capacity(prompts.len());
+    for prompt in &prompts {
+        frontiers.push(admit(&executor, &RequestId::new(), prompt).await);
+    }
     let cache_ids = frontiers
         .iter()
         .map(|frontier| {
@@ -811,7 +825,7 @@ async fn direct_tokens_real_llama_later_invalid_output_preserves_terminal_progre
 async fn direct_tokens_real_llama_inconsistent_layer_frontier_is_not_retryable() {
     let (executor, observation, config) = fixture(None);
     let mut reference = model(&config);
-    let start = admit(&executor, &RequestId::new(), &[TokenId(1), TokenId(2)]);
+    let start = admit(&executor, &RequestId::new(), &[TokenId(1), TokenId(2)]).await;
     let first = prefill(&executor, &start, 2, 2).await;
     let cache_id = executor.token_sequences.lock().live[start.sequence()]
         .cache_id
@@ -825,7 +839,7 @@ async fn direct_tokens_real_llama_inconsistent_layer_frontier_is_not_retryable()
         .get_mut(&cache_id)
         .unwrap()[0]
         .len = 3;
-    let peer = admit(&executor, &RequestId::new(), &[TokenId(5), TokenId(6)]);
+    let peer = admit(&executor, &RequestId::new(), &[TokenId(5), TokenId(6)]).await;
     let policy = LogitsReturnPolicy::FullLogits;
     let work = [
         ExecutionWork::new(

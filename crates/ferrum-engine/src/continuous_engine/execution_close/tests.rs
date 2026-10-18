@@ -575,6 +575,7 @@ async fn execution_close_real_cpu_held_terminal_preserves_error_and_releases_onc
             context: ExecutorPrefillAdmission::for_startup(&request_id, &prompt, cfg.max_seq_len),
             adapter: None,
         })
+        .await
         .unwrap()
     else {
         panic!("real tiny model must admit the test prompt")

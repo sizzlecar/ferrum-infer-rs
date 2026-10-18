@@ -68,7 +68,7 @@ impl ModelExecutor for TokenCapacityExecutor {
         sources.push(ferrum_runtime::CapacityAvailabilitySource::ActiveSequenceSlots);
         Ok(true)
     }
-    fn admit_tokens(&self, input: ExecutionAdmission<'_>) -> Result<TokenAdmissionOutcome> {
+    async fn admit_tokens(&self, input: ExecutionAdmission<'_>) -> Result<TokenAdmissionOutcome> {
         input.validate()?;
         let sequence = self.issuer.issue_sequence()?;
         let frontier = self.issuer.frontier(&sequence, 0)?;
@@ -221,6 +221,7 @@ async fn install_decode_cohort(
                 .unwrap(),
                 adapter: None,
             })
+            .await
             .unwrap();
         let TokenAdmissionOutcome::Admitted(frontier) = admitted else {
             panic!("controlled admission")
@@ -290,6 +291,7 @@ async fn close_auxiliary_incarnation(
                 .unwrap(),
             adapter: None,
         })
+        .await
         .unwrap();
     let TokenAdmissionOutcome::Admitted(frontier) = admitted else {
         unreachable!()

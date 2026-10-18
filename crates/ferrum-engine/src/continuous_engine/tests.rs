@@ -300,7 +300,7 @@ impl ModelExecutor for PlanRuntimeChunkedPrefillTestExecutor {
         Ok(PlanRuntimeBatchDecodeOutcome::Completed(outputs))
     }
 
-    fn admit_tokens(&self, input: ExecutionAdmission<'_>) -> Result<TokenAdmissionOutcome> {
+    async fn admit_tokens(&self, input: ExecutionAdmission<'_>) -> Result<TokenAdmissionOutcome> {
         controlled_token_fixture::admit(self, &self.tokens, input)
     }
     async fn execute_tokens(&self, work: &[ExecutionWork<'_>]) -> Result<ExecutionBatchOutcome> {
@@ -684,7 +684,7 @@ impl ModelExecutor for PlanRuntimeChunkedPrefillTestExecutor {
 
 #[async_trait::async_trait]
 impl ModelExecutor for PlanRuntimeBatchDecodeTestExecutor {
-    fn admit_tokens(&self, input: ExecutionAdmission<'_>) -> Result<TokenAdmissionOutcome> {
+    async fn admit_tokens(&self, input: ExecutionAdmission<'_>) -> Result<TokenAdmissionOutcome> {
         controlled_token_fixture::admit(self, &self.tokens, input)
     }
     async fn execute_tokens(&self, work: &[ExecutionWork<'_>]) -> Result<ExecutionBatchOutcome> {
@@ -958,7 +958,7 @@ impl ModelExecutor for PlanRuntimeAdmissionTestExecutor {
         Ok(PlanRuntimeBatchDecodeOutcome::Completed(outputs))
     }
 
-    fn admit_tokens(&self, input: ExecutionAdmission<'_>) -> Result<TokenAdmissionOutcome> {
+    async fn admit_tokens(&self, input: ExecutionAdmission<'_>) -> Result<TokenAdmissionOutcome> {
         controlled_token_fixture::admit(self, &self.tokens, input)
     }
     async fn execute_tokens(&self, work: &[ExecutionWork<'_>]) -> Result<ExecutionBatchOutcome> {
@@ -1335,7 +1335,7 @@ impl ModelExecutor for PlanRuntimeMaintenanceTestExecutor {
         Ok(PlanRuntimeBatchDecodeOutcome::Completed(outputs))
     }
 
-    fn admit_tokens(&self, input: ExecutionAdmission<'_>) -> Result<TokenAdmissionOutcome> {
+    async fn admit_tokens(&self, input: ExecutionAdmission<'_>) -> Result<TokenAdmissionOutcome> {
         controlled_token_fixture::admit(self, &self.tokens, input)
     }
     async fn execute_tokens(&self, work: &[ExecutionWork<'_>]) -> Result<ExecutionBatchOutcome> {
@@ -2825,6 +2825,7 @@ async fn install_plan_runtime_decode_frontiers(
                 .unwrap(),
                 adapter: None,
             })
+            .await
             .unwrap()
         else {
             panic!("controlled cohort admission must succeed");
@@ -2894,6 +2895,7 @@ async fn install_profiled_plan_runtime_decode_frontier(
             .unwrap(),
             adapter: None,
         })
+        .await
         .unwrap()
     else {
         panic!("controlled profile admission must succeed");
@@ -3284,8 +3286,8 @@ async fn plan_runtime_prefill_resource_failure_preserves_terminal_error_and_rele
     assert_eq!(executor.prefill_calls.load(Ordering::Relaxed), 1);
 }
 
-#[test]
-fn plan_runtime_recompute_admission_preserves_product_usage_accounting() {
+#[tokio::test]
+async fn plan_runtime_recompute_admission_preserves_product_usage_accounting() {
     let mut config = EngineConfig::default();
     config.kv_cache.max_blocks = 128;
     let scheduler = Arc::new(ContinuousBatchScheduler::new(config.scheduler.clone()));
@@ -3318,7 +3320,8 @@ fn plan_runtime_recompute_admission_preserves_product_usage_accounting() {
 
     let admitted = engine
         .inner
-        .probe_executor_prefill_admission_for_test(&request);
+        .probe_executor_prefill_admission_for_test(&request)
+        .await;
 
     assert!(admitted);
     assert_eq!(
@@ -3394,6 +3397,7 @@ async fn plan_runtime_prefill_cohort_uses_one_capacity_aware_batch() {
                 .unwrap(),
                 adapter: None,
             })
+            .await
             .unwrap()
         else {
             panic!("fixture batch admission must succeed");
@@ -3487,6 +3491,7 @@ async fn plan_runtime_batch_prefill_deferral_falls_back_without_failing_requests
                 .unwrap(),
                 adapter: None,
             })
+            .await
             .unwrap()
         else {
             panic!("fixture batch admission must succeed");

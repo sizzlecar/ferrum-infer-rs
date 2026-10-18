@@ -187,9 +187,9 @@ impl ModelExecutor for FaultAfterForward {
     fn kv_capacity(&self) -> Option<usize> {
         self.inner.kv_capacity()
     }
-    fn admit_tokens(&self, input: ExecutionAdmission<'_>) -> Result<TokenAdmissionOutcome> {
+    async fn admit_tokens(&self, input: ExecutionAdmission<'_>) -> Result<TokenAdmissionOutcome> {
         let before = self.observed.lock().prepared.len();
-        let outcome = self.inner.admit_tokens(input)?;
+        let outcome = self.inner.admit_tokens(input).await?;
         if let TokenAdmissionOutcome::Admitted(frontier) = &outcome {
             let state = self.observed.lock();
             assert_eq!(state.prepared.len(), before + 1);
@@ -460,9 +460,12 @@ async fn assert_batch_fault(fault: FaultKind, fault_index: usize) {
         .unwrap();
     assert_eq!(prefill.requests.len(), 3);
     for scheduled in &prefill.requests {
-        assert!(engine
-            .inner
-            .probe_executor_prefill_admission_for_test(&scheduled.request));
+        assert!(
+            engine
+                .inner
+                .probe_executor_prefill_admission_for_test(&scheduled.request)
+                .await
+        );
         engine
             .inner
             .sequences

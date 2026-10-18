@@ -33,13 +33,14 @@ mod tests {
         assert_eq!(ended.sequence(), sequence);
     }
 
-    fn admit(executor: &impl ModelExecutor, request: &RequestId) -> ExecutionFrontier {
+    async fn admit(executor: &impl ModelExecutor, request: &RequestId) -> ExecutionFrontier {
         let prompt = [TokenId::new(3), TokenId::new(4), TokenId::new(5)];
         let TokenAdmissionOutcome::Admitted(frontier) = executor
             .admit_tokens(ExecutionAdmission {
                 context: ExecutorPrefillAdmission::for_diagnostic(request, &prompt, 8),
                 adapter: None,
             })
+            .await
             .unwrap()
         else {
             panic!("fixture admission");
@@ -79,7 +80,7 @@ mod tests {
     #[tokio::test]
     async fn token_fixture_chunks_and_script_positions_are_per_incarnation() {
         let executor = ConfigurableModelExecutor::with_token_sequence(64, vec![7, 9]);
-        let a = admit(&executor, &RequestId::new());
+        let a = admit(&executor, &RequestId::new()).await;
         let first = run(
             &executor,
             &a,
@@ -114,7 +115,7 @@ mod tests {
         )
         .await;
         assert_eq!(selected(&decode), 9);
-        let b = admit(&executor, &RequestId::new());
+        let b = admit(&executor, &RequestId::new()).await;
         let full = run(
             &executor,
             &b,
@@ -144,14 +145,14 @@ mod tests {
     async fn token_fixture_rejects_foreign_stale_and_mixed_work_without_advancing_peers() {
         let executor = MockModelExecutor::instant(64);
         let id = RequestId::new();
-        let a = admit(&executor, &id);
+        let a = admit(&executor, &id).await;
         let a_done = run(
             &executor,
             &a,
             TokenWork::Prefill(PrefillChunk::new(0, 3, 3).unwrap()),
         )
         .await;
-        let b = admit(&executor, &RequestId::new());
+        let b = admit(&executor, &RequestId::new()).await;
         let policy = LogitsReturnPolicy::FullLogits;
         let mixed = [
             ExecutionWork::new(
@@ -175,7 +176,7 @@ mod tests {
             ExecutionBatchOutcome::NotSubmitted(_)
         ));
         let foreign_executor = MockModelExecutor::instant(64);
-        let foreign = admit(&foreign_executor, &RequestId::new());
+        let foreign = admit(&foreign_executor, &RequestId::new()).await;
         let bad = [ExecutionWork::new(
             &foreign,
             TokenWork::Prefill(PrefillChunk::new(0, 3, 3).unwrap()),
@@ -184,7 +185,7 @@ mod tests {
         .unwrap()];
         assert!(executor.execute_tokens(&bad).await.is_err());
         close(&executor, a.sequence());
-        let replacement = admit(&executor, &id);
+        let replacement = admit(&executor, &id).await;
         assert_ne!(replacement.sequence(), a.sequence());
         close(&executor, a.sequence());
         assert!(replacement.sequence().observed_end().is_none());

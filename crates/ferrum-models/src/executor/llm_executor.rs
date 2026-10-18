@@ -33,6 +33,7 @@ use crate::vnext::ProductionModelSourceBundle;
 
 use super::common::{self, GenericKvCacheHandle};
 
+mod device_worker;
 mod token_execution;
 
 const KV_ADMISSION_TARGET_LEN_METADATA_KEY: &str = "ferrum_kv_admission_target_len";
@@ -195,7 +196,9 @@ pub struct LlmExecutor {
     total_model_lock_wait_us: AtomicU64,
     model_lock_wait_samples: AtomicU64,
     token_issuer: ferrum_execution::token_execution::ExecutorSequenceIssuer,
-    token_sequences: Mutex<token_execution::TokenSequences>,
+    token_sequences: Arc<Mutex<token_execution::TokenSequences>>,
+    token_worker_required: bool,
+    token_worker: OnceLock<Result<device_worker::LlmDeviceWorker>>,
 }
 
 impl LlmExecutor {
@@ -218,6 +221,7 @@ impl LlmExecutor {
         bound_sources: Option<Arc<ProductionModelSourceBundle>>,
     ) -> Self {
         let adapter_support = model.adapter_execution_support();
+        let token_worker_required = model.token_execution_requires_worker();
         Self {
             model: Arc::new(Mutex::new(model)),
             adapter_support,
@@ -227,7 +231,9 @@ impl LlmExecutor {
             total_model_lock_wait_us: AtomicU64::new(0),
             model_lock_wait_samples: AtomicU64::new(0),
             token_issuer: ferrum_execution::token_execution::ExecutorSequenceIssuer::new(),
-            token_sequences: Mutex::new(token_execution::TokenSequences::default()),
+            token_sequences: Arc::new(Mutex::new(token_execution::TokenSequences::default())),
+            token_worker_required,
+            token_worker: OnceLock::new(),
         }
     }
 
@@ -292,18 +298,22 @@ impl LlmExecutor {
 
 #[async_trait::async_trait]
 impl ModelExecutor for LlmExecutor {
-    fn admit_tokens(
+    async fn admit_tokens(
         &self,
         input: ferrum_execution::token_execution::ExecutionAdmission<'_>,
     ) -> Result<ferrum_execution::token_execution::TokenAdmissionOutcome> {
-        self.admit_token_sequence(input)
+        self.admit_token_sequence_async(input).await
     }
 
     async fn execute_tokens(
         &self,
         work: &[ferrum_execution::token_execution::ExecutionWork<'_>],
     ) -> Result<ferrum_execution::token_execution::ExecutionBatchOutcome> {
-        self.execute_token_batch(work)
+        if self.token_worker_required {
+            self.token_device_worker()?.execute(work).await
+        } else {
+            self.execute_token_batch(work)
+        }
     }
 
     async fn finish_tokens(
@@ -311,17 +321,23 @@ impl ModelExecutor for LlmExecutor {
         sequence: &ferrum_execution::token_execution::ExecutorSequence,
         reason: ferrum_execution::token_execution::ExecutionEndReason,
     ) -> Result<ferrum_execution::token_execution::ExecutionCloseOutcome> {
-        self.close_token_incarnation(sequence, reason)
+        if self.token_worker_required {
+            self.token_device_worker()?.close(sequence, reason)
+        } else {
+            self.close_token_incarnation(sequence, reason)
+        }
     }
 
     fn cancel_tokens(
         &self,
         sequence: &ferrum_execution::token_execution::ExecutorSequence,
     ) -> Result<ferrum_execution::token_execution::ExecutionCloseOutcome> {
-        self.close_token_incarnation(
-            sequence,
-            ferrum_execution::token_execution::ExecutionEndReason::Cancelled,
-        )
+        let reason = ferrum_execution::token_execution::ExecutionEndReason::Cancelled;
+        if self.token_worker_required {
+            self.token_device_worker()?.close(sequence, reason)
+        } else {
+            self.close_token_incarnation(sequence, reason)
+        }
     }
 
     fn info(&self) -> &ModelInfo {

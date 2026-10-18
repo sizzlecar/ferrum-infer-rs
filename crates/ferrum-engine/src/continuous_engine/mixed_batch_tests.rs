@@ -208,9 +208,12 @@ async fn install_mixed_request(
         .sequences
         .write()
         .insert(request_id.clone(), sequence);
-    assert!(engine
-        .inner
-        .probe_executor_prefill_admission_for_test(&request));
+    assert!(
+        engine
+            .inner
+            .probe_executor_prefill_admission_for_test(&request)
+            .await
+    );
     engine
         .inner
         .sequences

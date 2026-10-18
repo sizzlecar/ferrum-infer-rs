@@ -39,8 +39,8 @@ impl ModelExecutor for InvalidTailExecutor {
     async fn decode(&self, _: &DecodeInput) -> Result<DecodeOutput> {
         panic!("preparation test must execute the token protocol")
     }
-    fn admit_tokens(&self, input: ExecutionAdmission<'_>) -> Result<TokenAdmissionOutcome> {
-        self.inner.admit_tokens(input)
+    async fn admit_tokens(&self, input: ExecutionAdmission<'_>) -> Result<TokenAdmissionOutcome> {
+        self.inner.admit_tokens(input).await
     }
     fn plan_prompt_tail_capture_boundary(&self, chunk: PrefillChunk) -> Option<PrefixCapturePlan> {
         (self.bad_hook.load(Ordering::Relaxed) && chunk.total_prompt_tokens() == 3).then(|| {
@@ -162,6 +162,7 @@ async fn fixture(
                 .unwrap(),
                 adapter: None,
             })
+            .await
             .unwrap()
         else {
             panic!("real CPU admission must succeed");
@@ -270,6 +271,7 @@ async fn token_preparation_failure_preserves_same_request_replacement_incarnatio
                 .unwrap(),
                 adapter: None,
             })
+            .await
             .unwrap()
         else {
             panic!("replacement must genuinely admit");

@@ -124,9 +124,12 @@ async fn prompt_tail_batch_prefill_commits_each_boundary_before_sampling() {
             .sequences
             .write()
             .insert(request.id.clone(), sequence);
-        assert!(engine
-            .inner
-            .probe_executor_prefill_admission_for_test(&request));
+        assert!(
+            engine
+                .inner
+                .probe_executor_prefill_admission_for_test(&request)
+                .await
+        );
         engine
             .inner
             .sequences

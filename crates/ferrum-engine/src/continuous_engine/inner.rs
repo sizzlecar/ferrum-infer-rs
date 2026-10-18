@@ -10,6 +10,7 @@ mod batch;
 mod completion;
 pub(super) mod prefix_rendezvous;
 pub(super) mod prefix_restore;
+mod token_admission;
 mod token_batch;
 
 /// Retained admission maintenance is an owned obligation even while product
@@ -134,257 +135,6 @@ fn scheduler_trace_distribution(mut values: Vec<usize>) -> SchedulerTraceDistrib
 }
 
 impl EngineInner {
-    fn probe_executor_prefill_admission(
-        &self,
-        request: &InferenceRequest,
-        capture_trace: bool,
-    ) -> ExecutorPrefillProbeResult {
-        let Some((
-            input_tokens,
-            maximum_sequence_tokens,
-            product_prompt_tokens,
-            replayed_output_tokens,
-        )) = self.sequences.read().get(&request.id).map(|sequence| {
-            (
-                sequence.prefill_context_tokens(),
-                sequence.model_maximum_sequence_tokens(),
-                sequence.input_tokens.len(),
-                sequence.generated_tokens.len(),
-            )
-        })
-        else {
-            let error = FerrumError::internal(format!(
-                "request {} reached typed admission before its sequence state was published",
-                request.id
-            ));
-            return ExecutorPrefillProbeResult {
-                trace: capture_trace.then(|| ExecutorPrefillAdmissionTrace {
-                    request_id: request.id.clone(),
-                    input_token_count: None,
-                    maximum_sequence_tokens: None,
-                    evidence: ExecutorPrefillAdmissionTraceEvidence::Faulted(error.to_string()),
-                }),
-                outcome: AdmissionProbeOutcome::Faulted(error),
-                maintenance: None,
-            };
-        };
-        let admission = match ExecutorPrefillAdmission::for_product_request(
-            &request.id,
-            &input_tokens,
-            maximum_sequence_tokens,
-            product_prompt_tokens,
-            replayed_output_tokens,
-        ) {
-            Ok(admission) => admission,
-            Err(error) => {
-                return ExecutorPrefillProbeResult {
-                    trace: capture_trace.then(|| ExecutorPrefillAdmissionTrace {
-                        request_id: request.id.clone(),
-                        input_token_count: Some(input_tokens.len()),
-                        maximum_sequence_tokens: Some(maximum_sequence_tokens),
-                        evidence: ExecutorPrefillAdmissionTraceEvidence::Faulted(error.to_string()),
-                    }),
-                    outcome: AdmissionProbeOutcome::Faulted(error),
-                    maintenance: None,
-                };
-            }
-        };
-        let capture_admission_trace = |evidence| {
-            capture_trace.then(|| ExecutorPrefillAdmissionTrace {
-                request_id: request.id.clone(),
-                input_token_count: Some(input_tokens.len()),
-                maximum_sequence_tokens: Some(maximum_sequence_tokens),
-                evidence,
-            })
-        };
-        let adapter = match ferrum_interfaces::adapter::parse_lora_selection(&request.metadata) {
-            Ok(adapter) => adapter,
-            Err(error) => {
-                return ExecutorPrefillProbeResult {
-                    trace: capture_admission_trace(ExecutorPrefillAdmissionTraceEvidence::Faulted(
-                        error.to_string(),
-                    )),
-                    outcome: AdmissionProbeOutcome::Faulted(error),
-                    maintenance: None,
-                }
-            }
-        };
-        if let Some(frontier) = self
-            .sequences
-            .read()
-            .get(&request.id)
-            .and_then(|sequence| sequence.execution_frontier.clone())
-        {
-            if frontier.consumed_tokens() == 0 && frontier.sequence().observed_end().is_none() {
-                let receipt = ExecutorPrefillAdmissionReceipt {
-                    request_id: request.id.clone(),
-                };
-                return ExecutorPrefillProbeResult {
-                    trace: capture_admission_trace(
-                        ExecutorPrefillAdmissionTraceEvidence::Admitted(receipt.clone()),
-                    ),
-                    outcome: AdmissionProbeOutcome::Admitted(receipt),
-                    maintenance: None,
-                };
-            }
-            let error = FerrumError::internal(
-                "admission cannot replace an advanced or ended token incarnation",
-            );
-            return ExecutorPrefillProbeResult {
-                trace: capture_admission_trace(ExecutorPrefillAdmissionTraceEvidence::Faulted(
-                    error.to_string(),
-                )),
-                outcome: AdmissionProbeOutcome::Faulted(error),
-                maintenance: None,
-            };
-        }
-        match self.model_executor.admit_tokens(ExecutionAdmission {
-            context: admission,
-            adapter,
-        }) {
-            Ok(TokenAdmissionOutcome::Admitted(frontier)) => {
-                let mut sequences = self.sequences.write();
-                let valid_initial =
-                    frontier.consumed_tokens() == 0 && frontier.sequence().observed_end().is_none();
-                let sequence = sequences.get_mut(&request.id);
-                if let Some(sequence) =
-                    sequence.filter(|sequence| sequence.execution_frontier.is_none())
-                {
-                    // Retain even malformed progress for exact-owner closure.
-                    sequence.execution_frontier = Some(frontier);
-                    if valid_initial {
-                        let receipt = ExecutorPrefillAdmissionReceipt {
-                            request_id: request.id.clone(),
-                        };
-                        return ExecutorPrefillProbeResult {
-                            trace: capture_admission_trace(
-                                ExecutorPrefillAdmissionTraceEvidence::Admitted(receipt.clone()),
-                            ),
-                            outcome: AdmissionProbeOutcome::Admitted(receipt),
-                            maintenance: None,
-                        };
-                    }
-                } else {
-                    drop(sequences);
-                    if let Err(error) = self.begin_execution_close(
-                        request.id.clone(),
-                        frontier.sequence().clone(),
-                        None,
-                        ExecutionEndReason::Cancelled,
-                    ) {
-                        warn!(%error, "Could not register unexpected token admission");
-                    }
-                }
-                let error = FerrumError::internal(
-                    "token admission did not match the initial outer sequence",
-                );
-                ExecutorPrefillProbeResult {
-                    trace: capture_admission_trace(ExecutorPrefillAdmissionTraceEvidence::Faulted(
-                        error.to_string(),
-                    )),
-                    outcome: AdmissionProbeOutcome::Faulted(error),
-                    maintenance: None,
-                }
-            }
-            Ok(TokenAdmissionOutcome::CapacityDeferred(deferred)) => ExecutorPrefillProbeResult {
-                trace: capture_admission_trace(
-                    ExecutorPrefillAdmissionTraceEvidence::CapacityDeferred(deferred),
-                ),
-                outcome: AdmissionProbeOutcome::CapacityDeferred,
-                maintenance: None,
-            },
-            Ok(TokenAdmissionOutcome::Deferred(deferred)) => {
-                if deferred.action() == DeferredAction::AwaitBackingGrowth {
-                    self.model_executor.cancel_prefill_admission(&request.id);
-                    let error = FerrumError::internal(format!(
-                        "executor returned AwaitBackingGrowth for {} without retaining typed maintenance state",
-                        request.id
-                    ));
-                    return ExecutorPrefillProbeResult {
-                        trace: capture_admission_trace(
-                            ExecutorPrefillAdmissionTraceEvidence::Faulted(error.to_string()),
-                        ),
-                        outcome: AdmissionProbeOutcome::Faulted(error),
-                        maintenance: None,
-                    };
-                }
-                let outcome = AdmissionProbeOutcome::Deferred(AdmissionDeferral::from_admission(
-                    &deferred, 0,
-                ));
-                ExecutorPrefillProbeResult {
-                    trace: capture_admission_trace(
-                        ExecutorPrefillAdmissionTraceEvidence::Deferred(deferred),
-                    ),
-                    outcome,
-                    maintenance: None,
-                }
-            }
-            Ok(TokenAdmissionOutcome::MaintenanceDeferred(deferred)) => {
-                if deferred.request_id() != &request.id {
-                    self.model_executor.cancel_prefill_admission(&request.id);
-                    let error = FerrumError::internal(format!(
-                        "executor maintenance deferral belongs to {}, expected {}",
-                        deferred.request_id(),
-                        request.id
-                    ));
-                    return ExecutorPrefillProbeResult {
-                        trace: capture_admission_trace(
-                            ExecutorPrefillAdmissionTraceEvidence::Faulted(error.to_string()),
-                        ),
-                        outcome: AdmissionProbeOutcome::Faulted(error),
-                        maintenance: None,
-                    };
-                }
-                let observed = deferred.observed();
-                let outcome = AdmissionProbeOutcome::Deferred(AdmissionDeferral::new(
-                    DeferredAction::AwaitBackingGrowth,
-                    AdmissionWakeEpochs::new(
-                        observed.coordinator_id,
-                        observed.release_epoch,
-                        observed.capacity_epoch,
-                        0,
-                    ),
-                    deferred.wait_condition().clone(),
-                ));
-                ExecutorPrefillProbeResult {
-                    trace: capture_admission_trace(
-                        ExecutorPrefillAdmissionTraceEvidence::MaintenanceDeferred(
-                            deferred.clone(),
-                        ),
-                    ),
-                    outcome,
-                    maintenance: Some(deferred),
-                }
-            }
-            Ok(TokenAdmissionOutcome::PermanentRejected(rejected)) => ExecutorPrefillProbeResult {
-                trace: capture_admission_trace(
-                    ExecutorPrefillAdmissionTraceEvidence::PermanentRejected(rejected.clone()),
-                ),
-                outcome: AdmissionProbeOutcome::PermanentRejected(rejected),
-                maintenance: None,
-            },
-            Err(error) => ExecutorPrefillProbeResult {
-                trace: capture_admission_trace(ExecutorPrefillAdmissionTraceEvidence::Faulted(
-                    error.to_string(),
-                )),
-                outcome: AdmissionProbeOutcome::Faulted(error),
-                maintenance: None,
-            },
-        }
-    }
-
-    #[cfg(test)]
-    pub(super) fn probe_executor_prefill_admission_for_test(
-        &self,
-        request: &InferenceRequest,
-    ) -> bool {
-        matches!(
-            self.probe_executor_prefill_admission(request, false)
-                .outcome,
-            AdmissionProbeOutcome::Admitted(_)
-        )
-    }
-
     fn write_executor_scheduler_profile_event(
         &self,
         request_id: &RequestId,
@@ -1106,91 +856,6 @@ impl EngineInner {
         }
     }
 
-    fn prepare_dynamic_admission_round(
-        &self,
-        maximum_admissions: usize,
-    ) -> Result<(usize, Vec<ExecutorPrefillMaintenanceDeferral>)> {
-        let mut maintenance = Vec::new();
-        let mut availability = self.dynamic_admission_availability.lock();
-        let epochs = self
-            .model_executor
-            .write_execution_capacity_snapshot(&mut availability)?;
-        let wake = epochs.map(|epochs| {
-            AdmissionWakeSnapshot::new(
-                AdmissionWakeEpochs::new(
-                    epochs.coordinator_id,
-                    epochs.release_epoch,
-                    epochs.capacity_epoch,
-                    0,
-                ),
-                &availability,
-            )
-        });
-        let capture_trace = self.scheduler_trace_jsonl.is_some();
-        let records = std::cell::RefCell::new(Vec::<ExecutorSchedulerTraceRecord>::new());
-        let mut prefix_pressure = false;
-        let mut probe = |request: &InferenceRequest| {
-            let result = self.probe_executor_prefill_admission(request, capture_trace);
-            if (self
-                .config
-                .scheduler
-                .prefix_rendezvous_max_wait_ms
-                .is_some()
-                || !self.prefix_restore_pending.lock().is_empty())
-                && matches!(&result.outcome, AdmissionProbeOutcome::Deferred(_))
-                && result.maintenance.is_none()
-            {
-                prefix_pressure = true;
-            }
-            if let Some(deferral) = result.maintenance {
-                maintenance.push(deferral);
-            }
-            if let Some(trace) = result.trace {
-                records
-                    .borrow_mut()
-                    .push(ExecutorSchedulerTraceRecord::PrefillAdmission(trace));
-            }
-            result.outcome
-        };
-        let prepared =
-            self.scheduler.prepare_token_admission_observed(
-                maximum_admissions,
-                wake,
-                &mut probe,
-                &mut |observation| {
-                    records.borrow_mut().push(
-                        ExecutorSchedulerTraceRecord::AdmissionQueueObservation(observation),
-                    )
-                },
-            );
-        drop(probe);
-        drop(availability);
-        if prefix_pressure {
-            self.release_prefix_rendezvous_for_capacity_pressure();
-        }
-
-        for record in records.into_inner() {
-            match record {
-                ExecutorSchedulerTraceRecord::PrefillAdmission(trace) => {
-                    self.trace_executor_prefill_admission(trace);
-                }
-                ExecutorSchedulerTraceRecord::AdmissionQueueObservation(observation) => {
-                    self.trace_executor_admission_queue_observation(observation);
-                }
-            }
-        }
-        match prepared {
-            Ok(receipt) => Ok((receipt.admitted(), maintenance)),
-            Err(error) => {
-                for deferral in &maintenance {
-                    self.model_executor
-                        .cancel_prefill_admission(deferral.request_id());
-                }
-                Err(error)
-            }
-        }
-    }
-
     /// Fill-first is allowed to delay decode until its active target, so form
     /// that target's retained admission cohort before constructing a physical
     /// batch. Each round performs one bounded maintenance attempt per deferred
@@ -1217,7 +882,7 @@ impl EngineInner {
             if desired == 0 || self.scheduler.waiting_count() == 0 {
                 break;
             }
-            let (admitted, maintenance) = self.prepare_dynamic_admission_round(desired)?;
+            let (admitted, maintenance) = self.prepare_dynamic_admission_round(desired).await?;
             let maintenance =
                 PendingPrefillMaintenance::new(self.model_executor.as_ref(), maintenance);
             progressed |= admitted > 0;
@@ -1236,15 +901,22 @@ impl EngineInner {
     }
 
     async fn complete_typed_admission_failures(&self) -> Result<()> {
-        for (request_id, error) in self.scheduler.take_admission_failures() {
+        let mut first_error = None;
+        // Keep not-yet-processed failures in the scheduler's original queue.
+        // Explicit-error completion transfers this one's frontier/slot before
+        // its first await, so cancellation cannot lose the remaining owners.
+        while let Some((request_id, error)) = self.scheduler.take_next_admission_failure() {
             warn!(
                 request_id = %request_id,
                 error = %error,
-                "Typed prefill admission failed before device submission"
+                "Typed prefill admission failed"
             );
-            self.complete_request_with_error(&request_id, error).await?;
+            if let Err(error) = self.complete_request_with_error(&request_id, error).await {
+                warn!(request_id = %request_id, %error, "Admission failure cleanup reported an error");
+                first_error.get_or_insert(error);
+            }
         }
-        Ok(())
+        first_error.map_or(Ok(()), Err)
     }
 
     async fn defer_for_request_state_readiness(
@@ -1469,7 +1141,9 @@ impl EngineInner {
         if self.prepare_token_prefill_cohort(&hint).await? {
             return Ok(EngineIterationOutcome::Progressed);
         }
-        let (_, prefill_maintenance) = self.prepare_dynamic_admission_round(hint.max_batch_size)?;
+        let (_, prefill_maintenance) = self
+            .prepare_dynamic_admission_round(hint.max_batch_size)
+            .await?;
         let prefill_maintenance =
             PendingPrefillMaintenance::new(self.model_executor.as_ref(), prefill_maintenance);
         self.complete_typed_admission_failures().await?;

@@ -10611,7 +10611,7 @@ impl<R: DeviceRuntime> ModelExecutor for VNextModelExecutor<R> {
         self.admit_bound_prefill(input, false)
     }
 
-    fn admit_tokens(
+    async fn admit_tokens(
         &self,
         input: ferrum_execution::token_execution::ExecutionAdmission<'_>,
     ) -> Result<ferrum_execution::token_execution::TokenAdmissionOutcome> {

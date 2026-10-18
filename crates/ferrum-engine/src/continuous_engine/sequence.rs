@@ -244,6 +244,9 @@ pub struct SequenceState {
     pub generated_tokens: Vec<TokenId>,
     /// The executor's sole live incarnation and committed token position.
     /// This is an execution observation, not a second physical KV allocation.
+    /// Exact existing scheduler queue identity while preparation is in flight.
+    pub(super) pending_token_admission:
+        Option<ferrum_scheduler::implementations::continuous::PrefixRequestKey>,
     pub(super) execution_frontier: Option<ferrum_execution::token_execution::ExecutionFrontier>,
     /// Preserve an interrupted participant's actual close observation until
     /// terminal processing transfers it into the independent close registry.
@@ -541,6 +544,7 @@ impl SequenceState {
             original_request: request.clone(),
             input_tokens,
             generated_tokens: Vec::new(),
+            pending_token_admission: None,
             execution_frontier: None,
             execution_close: None,
             sampling_params: request.sampling_params,

@@ -73,7 +73,7 @@ impl ModelExecutor for AdapterCapableExecutor {
         self.support
     }
 
-    fn admit_tokens(&self, input: ExecutionAdmission<'_>) -> Result<TokenAdmissionOutcome> {
+    async fn admit_tokens(&self, input: ExecutionAdmission<'_>) -> Result<TokenAdmissionOutcome> {
         input.validate()?;
         if input.adapter.is_some() {
             self.support.require_lora()?;

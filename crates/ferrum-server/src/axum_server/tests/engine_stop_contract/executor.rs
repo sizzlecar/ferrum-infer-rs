@@ -162,7 +162,7 @@ impl ModelExecutor for ScriptedExecutor {
     fn plan_runtime_resource_snapshot(&self) -> Result<Option<PlanRuntimeResourceSnapshot>> {
         PlanRuntimeResourceSnapshot::new(0, 0, 0, 0, 0, 0, 0, 0, 0).map(Some)
     }
-    fn admit_tokens(&self, input: ExecutionAdmission<'_>) -> Result<TokenAdmissionOutcome> {
+    async fn admit_tokens(&self, input: ExecutionAdmission<'_>) -> Result<TokenAdmissionOutcome> {
         input.validate()?;
         if input.adapter.is_some() {
             return Err(FerrumError::unsupported(

@@ -2161,6 +2161,9 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
             .expect("unified frame scratch");
         let mut ctx = &mut frame.context;
         let mut residual = frame.residual.as_mut().expect("frame unified residual");
+        // Layers and final packing borrow the same frame-owned buffer. The
+        // model scratch slot stays empty until actual context retirement.
+        let mut norm_out = frame.norm_out.as_mut().expect("frame unified norm_out");
         let embed = self
             .embed
             .as_ref()
@@ -2352,6 +2355,7 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
                         &cu_seqlens_q,
                         &pos_offsets,
                         &mut residual,
+                        &mut norm_out,
                         device_residual_shadow.as_mut(),
                         device_branch_shadow.as_mut(),
                         m_total,
@@ -2527,11 +2531,6 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
         }
         // Unified op profiling is drained once near function exit so a single
         // line covers layers, final pack, lm_head, and logits readback.
-
-        // Take scratch buffers we'll either record into the graph or
-        // restore on return — outside the !did_pure_replay branch so
-        // both paths can put them back.
-        let mut norm_out = frame.norm_out.as_mut().expect("frame unified norm_out");
 
         macro_rules! run_unified_final_pack {
             () => {{
@@ -3068,6 +3067,7 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
         cu_seqlens_q: &[u32],
         pos_offsets: &[u32],
         residual: &mut B::Buffer,
+        norm_out: &mut B::Buffer,
         mut device_residual: Option<&mut B::Buffer>,
         mut device_branch: Option<&mut B::Buffer>,
         m_total: usize,
@@ -3124,11 +3124,6 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
             UNIFIED_NORM_TIME_US,
             UNIFIED_NORM_CALLS,
             {
-                let norm_out = self
-                    .scratch
-                    .unified_norm_out
-                    .as_mut()
-                    .expect("unified_norm_out missing");
                 if let Some(device) = device_residual.as_mut() {
                     B::rms_norm_f32_to_activation(
                         ctx,
@@ -3152,11 +3147,6 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
             UNIFIED_QKV_TIME_US,
             UNIFIED_QKV_CALLS,
             {
-                let norm_out = self
-                    .scratch
-                    .unified_norm_out
-                    .as_ref()
-                    .expect("unified_norm_out missing");
                 let qkv_out = self
                     .scratch
                     .unified_qkv_out
@@ -3343,11 +3333,6 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
                     .unified_o_proj_out
                     .as_ref()
                     .expect("unified_o_proj_out missing");
-                let norm_out = self
-                    .scratch
-                    .unified_norm_out
-                    .as_mut()
-                    .expect("unified_norm_out missing");
                 if let Some(post_attn_w) = &layer.post_attn_ln_w {
                     if let Some(device) = device_residual.as_mut() {
                         let branch = device_branch
@@ -3404,11 +3389,6 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
             UNIFIED_GATE_UP_TIME_US,
             UNIFIED_GATE_UP_CALLS,
             {
-                let norm_out = self
-                    .scratch
-                    .unified_norm_out
-                    .as_ref()
-                    .expect("unified_norm_out missing");
                 let gate_up_out = self
                     .scratch
                     .unified_gate_up_out
@@ -3547,8 +3527,18 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
         batch: &[(String, u32, u32)],
         policies: &[LogitsReturnPolicy],
     ) -> Vec<Vec<f32>> {
-        if policies.len() != batch.len() {
-            return self.decode_batch_internal_with_full_logits(batch, true);
+        self.decode_batch_internal_with_logits_return(
+            batch,
+            Self::decode_token_logits_return(policies, batch.len()),
+        )
+    }
+
+    fn decode_token_logits_return(
+        policies: &[LogitsReturnPolicy],
+        count: usize,
+    ) -> DecodeLogitsReturn<'_> {
+        if policies.len() != count {
+            return DecodeLogitsReturn::Full;
         }
 
         let mut selected_mask: Option<&TokenSelectionMask> = None;
@@ -3556,26 +3546,25 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
         for policy in policies {
             match policy {
                 LogitsReturnPolicy::FullLogits => {
-                    return self.decode_batch_internal_with_full_logits(batch, true);
+                    return DecodeLogitsReturn::Full;
                 }
                 LogitsReturnPolicy::GreedyArgmax {
                     token_mask,
                     repetition_penalty,
                 } => {
                     if repetition_penalty.is_some() {
-                        return self.decode_batch_internal_with_full_logits(batch, true);
+                        return DecodeLogitsReturn::Full;
                     }
                     match token_mask.as_ref() {
                         Some(mask) => {
                             if saw_unmasked {
-                                return self.decode_batch_internal_with_full_logits(batch, true);
+                                return DecodeLogitsReturn::Full;
                             }
                             if let Some(selected) = selected_mask {
                                 if selected.fingerprint != mask.fingerprint
                                     || selected.len() != mask.len()
                                 {
-                                    return self
-                                        .decode_batch_internal_with_full_logits(batch, true);
+                                    return DecodeLogitsReturn::Full;
                                 }
                             } else {
                                 selected_mask = Some(mask);
@@ -3583,7 +3572,7 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
                         }
                         None => {
                             if selected_mask.is_some() {
-                                return self.decode_batch_internal_with_full_logits(batch, true);
+                                return DecodeLogitsReturn::Full;
                             }
                             saw_unmasked = true;
                         }
@@ -3592,13 +3581,125 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
             }
         }
 
-        self.decode_batch_internal_with_logits_return(
-            batch,
-            DecodeLogitsReturn::GreedyArgmax {
-                token_mask: selected_mask,
-                repetition_penalties: vec![None; batch.len()],
-            },
-        )
+        DecodeLogitsReturn::GreedyArgmax {
+            token_mask: selected_mask,
+            repetition_penalties: vec![None; count],
+        }
+    }
+
+    pub(crate) fn execute_managed_fp16_tokens(
+        &mut self,
+        inputs: &[crate::common::llm::ModelTokenInput<'_>],
+    ) -> crate::common::llm::ModelTokenBatchOutcome {
+        use super::llama_family::device_execution::DeviceFrameResult;
+        use crate::common::llm::{ModelTokenBatchOutcome, ModelTokenOutcome, ModelTokenWork};
+        for input in inputs {
+            if let Err(error) = self.validate_managed_token_work(input.cache_id, input.work) {
+                return ModelTokenBatchOutcome::Cohort(ModelTokenOutcome::NotSubmitted(error));
+            }
+        }
+        if inputs.is_empty() {
+            return ModelTokenBatchOutcome::Cohort(ModelTokenOutcome::Terminal(Ok(Vec::new())));
+        }
+        let has_lora = inputs
+            .iter()
+            .any(|input| self.active_lora_adapter_for_cache(input.cache_id).is_some());
+        let all_decode = inputs
+            .iter()
+            .all(|input| matches!(input.work, ModelTokenWork::Decode { .. }));
+        let requests: Vec<_> = inputs
+            .iter()
+            .map(|input| {
+                let target_len = match input.work {
+                    ModelTokenWork::Prefill { tokens, position } => position + tokens.len(),
+                    ModelTokenWork::Decode { position, .. } => position as usize + 1,
+                };
+                ferrum_execution::model_executor::KvSlotRequest {
+                    cache_id: input.cache_id.to_owned(),
+                    target_len,
+                    admission_target_len: None,
+                }
+            })
+            .collect();
+        match self.prepare_managed_token_capacity(&requests) {
+            ModelTokenOutcome::Terminal(Ok(())) => {}
+            ModelTokenOutcome::NotSubmitted(error) | ModelTokenOutcome::Terminal(Err(error)) => {
+                return ModelTokenBatchOutcome::Cohort(ModelTokenOutcome::NotSubmitted(error));
+            }
+            ModelTokenOutcome::Held(error) => {
+                return ModelTokenBatchOutcome::Cohort(ModelTokenOutcome::Held(error))
+            }
+        }
+        let policies: Vec<_> = inputs
+            .iter()
+            .map(|input| input.logits_policy.clone())
+            .collect();
+        if all_decode
+            && self.supports_batched_decode
+            && !has_lora
+            && (inputs.len() > 1
+                || !policies
+                    .iter()
+                    .any(LogitsReturnPolicy::requires_full_logits))
+        {
+            let batch: Vec<_> = inputs
+                .iter()
+                .map(|input| {
+                    let ModelTokenWork::Decode { token, position } = input.work else {
+                        unreachable!()
+                    };
+                    (input.cache_id.to_owned(), token, position)
+                })
+                .collect();
+            let policy = Self::decode_token_logits_return(&policies, batch.len());
+            self.decode_batch_stats
+                .record_call(batch.len(), matches!(policy, DecodeLogitsReturn::Full));
+            return ModelTokenBatchOutcome::Cohort(
+                match self.run_device_frame(|model, frame| {
+                    model.decode_batch_in_frame(frame, &batch, policy)
+                }) {
+                    DeviceFrameResult::Rejected(error) => ModelTokenOutcome::NotSubmitted(error),
+                    DeviceFrameResult::Held(error) => ModelTokenOutcome::Held(error),
+                    DeviceFrameResult::Terminal(result) => ModelTokenOutcome::Terminal(
+                        result.map(|rows| rows.into_iter().map(Some).collect()),
+                    ),
+                },
+            );
+        }
+        let fresh_prefix = self.runtime_env.prefix_cache && inputs.iter().any(|input| {
+            matches!(input.work, ModelTokenWork::Prefill { tokens, position: 0 } if tokens.len() > 1)
+        });
+        if !all_decode
+            && self.supports_varlen_qkv
+            && self.paged_pools.is_some()
+            && !has_lora
+            && !fresh_prefix
+        {
+            let items: Vec<_> = inputs
+                .iter()
+                .map(|input| {
+                    let (tokens, position) = match input.work {
+                        ModelTokenWork::Prefill { tokens, position } => (tokens.to_vec(), position),
+                        ModelTokenWork::Decode { token, position } => {
+                            (vec![token], position as usize)
+                        }
+                    };
+                    (input.cache_id.to_owned(), tokens, position, input.sample)
+                })
+                .collect();
+            return ModelTokenBatchOutcome::Cohort(
+                match self.run_device_frame(|model, frame| {
+                    model.unified_in_frame(frame, &items, Some(&policies))
+                }) {
+                    DeviceFrameResult::Rejected(error) => ModelTokenOutcome::NotSubmitted(error),
+                    DeviceFrameResult::Held(error) => ModelTokenOutcome::Held(error),
+                    DeviceFrameResult::Terminal(result) => {
+                        ModelTokenOutcome::Terminal(result.and_then(|rows| rows))
+                    }
+                },
+            );
+        }
+        self.execute_managed_serial_tokens(inputs)
     }
 
     fn decode_batch_internal_with_logits_return(

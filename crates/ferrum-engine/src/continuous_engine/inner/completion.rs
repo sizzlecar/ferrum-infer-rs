@@ -644,7 +644,7 @@ impl EngineInner {
         request_id: &RequestId,
         finish_reason: FinishReason,
     ) -> Result<()> {
-        self.complete_request_inner(request_id, finish_reason, None)
+        self.complete_request_inner(request_id, finish_reason, None, None)
             .await
     }
 
@@ -653,7 +653,7 @@ impl EngineInner {
         request_id: &RequestId,
         error: FerrumError,
     ) -> Result<()> {
-        self.complete_request_inner(request_id, FinishReason::Error, Some(error))
+        self.complete_request_inner(request_id, FinishReason::Error, Some(error), None)
             .await
     }
 
@@ -663,8 +663,22 @@ impl EngineInner {
         request_id: &RequestId,
         finish_reason: FinishReason,
     ) -> Result<()> {
-        self.complete_request_inner(request_id, finish_reason, None)
+        self.complete_request_inner(request_id, finish_reason, None, None)
             .await
+    }
+
+    pub(super) async fn complete_unpublished_admission(
+        &self,
+        key: &ferrum_scheduler::implementations::continuous::PrefixRequestKey,
+        error: FerrumError,
+    ) -> Result<()> {
+        self.complete_request_inner(
+            key.request_id(),
+            FinishReason::Error,
+            Some(error),
+            Some(key),
+        )
+        .await
     }
 
     async fn complete_request_inner(
@@ -672,8 +686,16 @@ impl EngineInner {
         request_id: &RequestId,
         finish_reason: FinishReason,
         mut explicit_terminal_error: Option<FerrumError>,
+        expected_admission: Option<
+            &ferrum_scheduler::implementations::continuous::PrefixRequestKey,
+        >,
     ) -> Result<()> {
-        self.discard_pending_prefix_restore(request_id);
+        // An unpublished admission has no prefix restore, and its original
+        // scheduler ticket has already been removed. Neither operation may
+        // touch a replacement merely because it reuses the RequestId.
+        if expected_admission.is_none() {
+            self.discard_pending_prefix_restore(request_id);
+        }
         let mut classified_api_response = None;
         if explicit_terminal_error.is_none() {
             explicit_terminal_error = self.sequences.read().get(request_id).and_then(|seq| {
@@ -714,6 +736,14 @@ impl EngineInner {
             token_close,
         ) = {
             let mut sequences = self.sequences.write();
+            if let Some(key) = expected_admission {
+                if !sequences
+                    .get(request_id)
+                    .is_some_and(|sequence| sequence.pending_token_admission.as_ref() == Some(key))
+                {
+                    return Ok(());
+                }
+            }
             if let Some(mut seq) = sequences.remove(request_id) {
                 let mut terminal_error = explicit_terminal_error.take();
                 let mut finish_reason = if terminal_error.is_some() {
@@ -779,10 +809,13 @@ impl EngineInner {
                 let mut completion_resources = seq.take_completion_resources();
                 // The same outer lock excludes a recompute drain until this
                 // exact incarnation and its slot have reached the registry.
-                if let Err(error) = self
-                    .scheduler
-                    .complete_request(request_id.clone(), &response)
-                {
+                let scheduler_completion = if expected_admission.is_none() {
+                    self.scheduler
+                        .complete_request(request_id.clone(), &response)
+                } else {
+                    Ok(())
+                };
+                if let Err(error) = scheduler_completion {
                     warn!(request_id = %request_id, error = %error, "Scheduler completion failed");
                     terminal_error.get_or_insert_with(|| error.clone());
                     completion_error.get_or_insert(error);
@@ -846,7 +879,9 @@ impl EngineInner {
                 response.api_response = None;
             }
         } else {
-            self.model_executor.cancel_prefill_admission(request_id);
+            if expected_admission.is_none() {
+                self.model_executor.cancel_prefill_admission(request_id);
+            }
             if let Some(request_slot) = completion_resources.request_slot {
                 request_slot.close(self);
             }

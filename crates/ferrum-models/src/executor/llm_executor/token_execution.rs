@@ -23,16 +23,37 @@ pub(super) struct TokenSequences {
 struct TokenSequence {
     request_id: RequestId,
     cache_id: String,
-    prompt: Vec<u32>,
+    prompt: Arc<[u32]>,
     maximum_tokens: usize,
     product_prompt_tokens: usize,
     replayed_output_tokens: usize,
     frontier: ExecutionFrontier,
     recovery_key: ExecutionRecoveryKey,
     closing: bool,
+    device: Option<device_state::DeviceSequenceState>,
 }
 
 impl TokenSequence {
+    fn validate_close(&self, reason: ExecutionEndReason) -> Result<()> {
+        if let ExecutionEndReason::Completed {
+            input_tokens,
+            output_tokens,
+        } = reason
+        {
+            if input_tokens != self.product_prompt_tokens
+                || output_tokens < self.replayed_output_tokens
+                || input_tokens
+                    .checked_add(output_tokens.saturating_sub(1))
+                    .is_none_or(|consumed| consumed > self.maximum_tokens)
+            {
+                return Err(FerrumError::request_validation(
+                    "token completion usage differs from immutable admission",
+                ));
+            }
+        }
+        Ok(())
+    }
+
     fn validate_work(&self, input: &ExecutionWork<'_>) -> Result<()> {
         if self.closing || input.expected_frontier() != &self.frontier {
             return Err(FerrumError::request_validation(
@@ -58,6 +79,29 @@ impl TokenSequence {
 }
 
 impl LlmExecutor {
+    pub(super) fn token_device_worker(&self) -> Result<&super::device_worker::LlmDeviceWorker> {
+        self.token_worker
+            .get_or_init(|| {
+                let state = Arc::new(TokenWorkerState::new(self)?);
+                super::device_worker::LlmDeviceWorker::new(state)
+            })
+            .as_ref()
+            .map_err(Clone::clone)
+    }
+
+    pub(super) async fn admit_token_sequence_async(
+        &self,
+        input: ExecutionAdmission<'_>,
+    ) -> Result<TokenAdmissionOutcome> {
+        if self.token_worker_required {
+            self.token_device_worker()?
+                .admit(input, self.gen_cache_id())
+                .await
+        } else {
+            self.admit_token_sequence(input)
+        }
+    }
+
     pub(super) fn admit_token_sequence(
         &self,
         input: ExecutionAdmission<'_>,
@@ -133,6 +177,7 @@ impl LlmExecutor {
                 frontier: frontier.clone(),
                 recovery_key,
                 closing: false,
+                device: None,
             },
         );
         let preparation = catch_host_execution(|| -> Result<ModelKvReservation> {
@@ -279,6 +324,13 @@ impl LlmExecutor {
                     },
                     error,
                 ),
+                ModelTokenOutcome::Held(error) => (
+                    ExecutionProgress::Unknown {
+                        last_known: LastKnownExecutionStage::EnteredSubmit,
+                        known_executed_range: None,
+                    },
+                    error,
+                ),
                 ModelTokenOutcome::Terminal(Ok(logits)) => {
                     let product = match input.work() {
                         TokenWork::Prefill(chunk) if !chunk.is_final() => {
@@ -373,25 +425,7 @@ impl LlmExecutor {
             .live
             .get(sequence)
             .ok_or_else(|| FerrumError::request_validation("token incarnation is not live"))?;
-        if let ExecutionEndReason::Completed {
-            input_tokens,
-            output_tokens,
-        } = reason
-        {
-            if input_tokens != entry.product_prompt_tokens
-                || output_tokens < entry.replayed_output_tokens
-                // The final output is sampled from the last consumed input;
-                // it does not itself occupy KV. Zero-output completion still
-                // retains the admitted prompt bound without subtracting it.
-                || input_tokens
-                    .checked_add(output_tokens.saturating_sub(1))
-                    .is_none_or(|consumed| consumed > entry.maximum_tokens)
-            {
-                return Err(FerrumError::request_validation(
-                    "token completion usage differs from immutable admission",
-                ));
-            }
-        }
+        entry.validate_close(reason)?;
         self.close_token_locked(&mut sequences, &mut **self.lock_model(), sequence)
     }
 
@@ -449,3 +483,9 @@ fn contract_violation(
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod managed_tests;
+
+mod device_state;
+pub(super) use device_state::TokenWorkerState;

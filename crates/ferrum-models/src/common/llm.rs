@@ -13,7 +13,10 @@ use ferrum_types::{RequestId, Result, TokenId};
 
 mod token;
 pub(crate) use token::catch_host_execution;
-pub use token::{ModelKvReservation, ModelTokenOutcome, ModelTokenWork};
+pub use token::{
+    ModelExecutionRecovery, ModelKvReservation, ModelTokenBatchOutcome, ModelTokenCloseOutcome,
+    ModelTokenInput, ModelTokenOutcome, ModelTokenProduct, ModelTokenWork,
+};
 
 /// Runtime configuration every decoder-only LLM must expose.
 ///
@@ -56,6 +59,12 @@ pub trait DecoderOnlyLLM: Send + Sync {
         false
     }
 
+    /// Device work must run under the executor's independently owned service.
+    /// This is an implementation property, never inferred from a model name.
+    fn token_execution_requires_worker(&self) -> bool {
+        false
+    }
+
     /// Execute borrowed tokens directly in the model's numerical core. A
     /// terminal outcome covers this participant only; it does not attest that
     /// any later member of a batch ran or that its product was accepted.
@@ -69,12 +78,62 @@ pub trait DecoderOnlyLLM: Send + Sync {
         ))
     }
 
+    /// Preserve physical batching where implemented. The host fallback keeps
+    /// per-participant outcomes instead of pretending a serial batch is atomic.
+    fn execute_token_batch(&mut self, inputs: &[ModelTokenInput<'_>]) -> ModelTokenBatchOutcome {
+        let mut rows = Vec::with_capacity(inputs.len());
+        let mut held = false;
+        for input in inputs {
+            let result = if held {
+                ModelTokenOutcome::NotSubmitted(ferrum_types::FerrumError::backend(
+                    "earlier participant retains the model execution context",
+                ))
+            } else {
+                match self.execute_token_work(input.cache_id, input.work) {
+                    ModelTokenOutcome::NotSubmitted(error) => ModelTokenOutcome::NotSubmitted(error),
+                    ModelTokenOutcome::Held(error) => {
+                        held = true;
+                        ModelTokenOutcome::Held(error)
+                    }
+                    ModelTokenOutcome::Terminal(result) => ModelTokenOutcome::Terminal(result.map(
+                        |logits| input.sample.then_some(
+                            ferrum_execution::model_executor::ExecutorSamplingOutput::FullLogits(logits),
+                        ),
+                    )),
+                }
+            };
+            rows.push(result);
+        }
+        ModelTokenBatchOutcome::Serial(rows)
+    }
+
     /// Checked model-owned cache retirement. An error retains the cache and
     /// cannot be converted into an ended sequence by the executor.
     fn close_token_sequence(&mut self, _cache_id: &str) -> Result<()> {
         Err(ferrum_types::FerrumError::unsupported(
             "model has not implemented checked token closure",
         ))
+    }
+
+    /// Device implementations return lifetime and operation error separately.
+    /// The default preserves the checked synchronous-host implementation.
+    fn close_token_execution(&mut self, cache_id: &str) -> ModelTokenCloseOutcome {
+        match self.close_token_sequence(cache_id) {
+            Ok(()) => ModelTokenCloseOutcome::Ended { error: None },
+            Err(error) => ModelTokenCloseOutcome::Held { error },
+        }
+    }
+
+    fn recover_token_execution(&mut self) -> ModelExecutionRecovery {
+        if self.token_execution_requires_worker() {
+            ModelExecutionRecovery::Held {
+                error: ferrum_types::FerrumError::unsupported(
+                    "device model has not implemented context recovery",
+                ),
+            }
+        } else {
+            ModelExecutionRecovery::Quiescent { error: None }
+        }
     }
 
     /// Adapter execution implemented by this configured model instance.

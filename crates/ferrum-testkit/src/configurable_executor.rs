@@ -84,7 +84,7 @@ impl ConfigurableModelExecutor {
 
 #[async_trait]
 impl ModelExecutor for ConfigurableModelExecutor {
-    fn admit_tokens(&self, input: ExecutionAdmission<'_>) -> Result<TokenAdmissionOutcome> {
+    async fn admit_tokens(&self, input: ExecutionAdmission<'_>) -> Result<TokenAdmissionOutcome> {
         if self.token_sequence.is_empty() {
             return Err(ferrum_types::FerrumError::request_validation(
                 "empty configurable output sequence",

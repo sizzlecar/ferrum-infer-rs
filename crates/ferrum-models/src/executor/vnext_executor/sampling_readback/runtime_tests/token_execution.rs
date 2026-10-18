@@ -3,7 +3,7 @@
 use super::*;
 use ferrum_execution::token_execution::*;
 
-fn admit_tokens<R: DeviceRuntime>(
+async fn admit_tokens<R: DeviceRuntime>(
     fixture: &Fixture<R>,
     request: &RequestId,
     tokens: &[TokenId],
@@ -13,7 +13,7 @@ fn admit_tokens<R: DeviceRuntime>(
         adapter: None,
     };
     loop {
-        match fixture.executor.admit_tokens(input).unwrap() {
+        match fixture.executor.admit_tokens(input).await.unwrap() {
             TokenAdmissionOutcome::Admitted(frontier) => return frontier,
             TokenAdmissionOutcome::MaintenanceDeferred(_) => {
                 assert!(matches!(
@@ -49,8 +49,8 @@ async fn native_tokens_cpu_partial_final_decode_and_terminal_receipt() {
     let fixture = cpu(SamplingReadbackMode::Uniform);
     let request = RequestId::new();
     let tokens = [TokenId::new(0), TokenId::new(1)];
-    let initial = admit_tokens(&fixture, &request, &tokens);
-    let repeated = admit_tokens(&fixture, &request, &tokens);
+    let initial = admit_tokens(&fixture, &request, &tokens).await;
+    let repeated = admit_tokens(&fixture, &request, &tokens).await;
     assert_eq!(
         initial, repeated,
         "repeat probe must retain the same session"
@@ -71,6 +71,7 @@ async fn native_tokens_cpu_partial_final_decode_and_terminal_receipt() {
                 context: ExecutorPrefillAdmission::for_diagnostic(&request, &tokens, 16),
                 adapter: None,
             })
+            .await
             .is_err(),
         "initial admission cannot be replayed after a committed partial prefill"
     );
@@ -129,7 +130,7 @@ async fn native_tokens_cpu_foreign_stale_and_admission_mutation_rejected() {
     let other = cpu(SamplingReadbackMode::Uniform);
     let request = RequestId::new();
     let tokens = [TokenId::new(0), TokenId::new(1)];
-    let initial = admit_tokens(&fixture, &request, &tokens);
+    let initial = admit_tokens(&fixture, &request, &tokens).await;
     let mut changed = ExecutorPrefillAdmission::for_diagnostic(&request, &tokens, 16);
     changed.request_origin = ExecutorRequestOrigin::Product;
     assert!(fixture
@@ -138,6 +139,7 @@ async fn native_tokens_cpu_foreign_stale_and_admission_mutation_rejected() {
             context: changed,
             adapter: None
         })
+        .await
         .is_err());
     let policy = LogitsReturnPolicy::FullLogits;
     let work = TokenWork::Prefill(PrefillChunk::new(0, 1, 2).unwrap());
@@ -195,14 +197,14 @@ async fn native_tokens_cpu_mixed_preserves_original_order_and_frontiers() {
     let fixture = cpu(SamplingReadbackMode::Uniform);
     let first_request = RequestId::new();
     let second_request = RequestId::new();
-    let first = admit_tokens(&fixture, &first_request, &[TokenId::new(0)]);
+    let first = admit_tokens(&fixture, &first_request, &[TokenId::new(0)]).await;
     let active = execute_one(
         &fixture,
         &first,
         TokenWork::Prefill(PrefillChunk::new(0, 1, 1).unwrap()),
     )
     .await;
-    let second = admit_tokens(&fixture, &second_request, &[TokenId::new(1)]);
+    let second = admit_tokens(&fixture, &second_request, &[TokenId::new(1)]).await;
     let policy = LogitsReturnPolicy::FullLogits;
     let inputs = [
         ExecutionWork::new(
@@ -256,10 +258,10 @@ async fn native_tokens_cpu_mixed_preserves_original_order_and_frontiers() {
 async fn native_tokens_cpu_bad_middle_product_preserves_both_successful_peers() {
     let fixture = cpu(SamplingReadbackMode::Uniform);
     let requests = [RequestId::new(), RequestId::new(), RequestId::new()];
-    let frontiers = requests
-        .iter()
-        .map(|request| admit_tokens(&fixture, request, &[TokenId::new(1)]))
-        .collect::<Vec<_>>();
+    let mut frontiers = Vec::with_capacity(requests.len());
+    for request in &requests {
+        frontiers.push(admit_tokens(&fixture, request, &[TokenId::new(1)]).await);
+    }
     let policy = LogitsReturnPolicy::FullLogits;
     let inputs = frontiers
         .iter()
@@ -343,7 +345,7 @@ async fn native_tokens_cpu_bad_middle_product_preserves_both_successful_peers() 
 async fn native_tokens_cpu_extra_output_row_retains_unassigned_products_and_closes_every_owner() {
     let fixture = cpu(SamplingReadbackMode::Uniform);
     let request = RequestId::new();
-    let frontier = admit_tokens(&fixture, &request, &[TokenId::new(1)]);
+    let frontier = admit_tokens(&fixture, &request, &[TokenId::new(1)]).await;
     let policy = LogitsReturnPolicy::FullLogits;
     let input = ExecutionWork::new(
         &frontier,
@@ -390,7 +392,7 @@ async fn native_tokens_cpu_extra_output_row_retains_unassigned_products_and_clos
 async fn native_tokens_cpu_cancel_queued_wave_waits_for_actual_terminal_receipt() {
     let fixture = cpu(SamplingReadbackMode::Uniform);
     let request = RequestId::new();
-    let frontier = admit_tokens(&fixture, &request, &[TokenId::new(0)]);
+    let frontier = admit_tokens(&fixture, &request, &[TokenId::new(0)]).await;
     let active = execute_one(
         &fixture,
         &frontier,
@@ -465,7 +467,7 @@ async fn native_tokens_cpu_cancel_one_shared_participant_preserves_healthy_peer(
     let requests = [RequestId::new(), RequestId::new()];
     let mut active = Vec::new();
     for request in &requests {
-        let frontier = admit_tokens(&fixture, request, &[TokenId::new(0)]);
+        let frontier = admit_tokens(&fixture, request, &[TokenId::new(0)]).await;
         active.push(
             execute_one(
                 &fixture,
@@ -572,7 +574,7 @@ async fn native_tokens_cpu_cancel_one_shared_participant_preserves_healthy_peer(
 async fn native_tokens_cpu_deferral_retry_checks_decode_frontier_and_cancellation() {
     let fixture = cpu(SamplingReadbackMode::Uniform);
     let request = RequestId::new();
-    let initial = admit_tokens(&fixture, &request, &[TokenId::new(0)]);
+    let initial = admit_tokens(&fixture, &request, &[TokenId::new(0)]).await;
     let active = execute_one(
         &fixture,
         &initial,

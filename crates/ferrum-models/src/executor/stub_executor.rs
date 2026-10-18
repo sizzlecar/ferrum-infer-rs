@@ -103,7 +103,7 @@ impl StubModelExecutor {
 
 #[async_trait]
 impl ModelExecutor for StubModelExecutor {
-    fn admit_tokens(&self, input: ExecutionAdmission<'_>) -> Result<TokenAdmissionOutcome> {
+    async fn admit_tokens(&self, input: ExecutionAdmission<'_>) -> Result<TokenAdmissionOutcome> {
         input.validate()?;
         if input.adapter.is_some() {
             return Err(FerrumError::unsupported("stub does not implement adapters"));
@@ -414,7 +414,8 @@ mod tests {
             context: ExecutorPrefillAdmission::for_diagnostic(&request, &prompt, 4),
             adapter: None,
         };
-        let TokenAdmissionOutcome::Admitted(first) = executor.admit_tokens(admission()).unwrap()
+        let TokenAdmissionOutcome::Admitted(first) =
+            executor.admit_tokens(admission()).await.unwrap()
         else {
             panic!("admission");
         };
@@ -462,7 +463,7 @@ mod tests {
             .unwrap();
         assert_ended(outcome, first.sequence());
         let TokenAdmissionOutcome::Admitted(replacement) =
-            executor.admit_tokens(admission()).unwrap()
+            executor.admit_tokens(admission()).await.unwrap()
         else {
             panic!("replacement");
         };

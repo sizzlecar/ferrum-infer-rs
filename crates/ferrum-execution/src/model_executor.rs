@@ -2798,8 +2798,12 @@ pub enum ExecutorPrefillAdmissionDecision {
 #[async_trait]
 pub trait ModelExecutor: Send + Sync {
     /// Admit immutable token work using this executor's actual resource owner.
-    /// Deferred probes do not issue an executable incarnation.
-    fn admit_tokens(
+    /// Deferred probes do not issue an executable incarnation. An implementation
+    /// that queues device preparation retains its actual resources independently
+    /// of this future: dropping it must reclaim the unpublished incarnation.
+    /// Returning `Admitted` transfers that exact frontier to the caller, which
+    /// must publish it or close it without an intervening ownership gap.
+    async fn admit_tokens(
         &self,
         _input: crate::token_execution::ExecutionAdmission<'_>,
     ) -> Result<crate::token_execution::TokenAdmissionOutcome> {

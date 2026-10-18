@@ -96,8 +96,8 @@ impl ModelExecutor for CloseGate {
     fn status(&self) -> ExecutorStatus {
         self.inner.status()
     }
-    fn admit_tokens(&self, input: ExecutionAdmission<'_>) -> Result<TokenAdmissionOutcome> {
-        self.inner.admit_tokens(input)
+    async fn admit_tokens(&self, input: ExecutionAdmission<'_>) -> Result<TokenAdmissionOutcome> {
+        self.inner.admit_tokens(input).await
     }
     async fn execute_tokens(&self, input: &[ExecutionWork<'_>]) -> Result<ExecutionBatchOutcome> {
         self.inner.execute_tokens(input).await
@@ -245,6 +245,7 @@ async fn fixture(delayed: bool, publication_error: bool) -> Fixture {
             context: ExecutorPrefillAdmission::for_startup(&request_id, &prompt, cfg.max_seq_len),
             adapter: None,
         })
+        .await
         .unwrap()
     else {
         panic!("real CPU admission")
@@ -522,6 +523,7 @@ async fn token_completion_cpu_stale_failure_does_not_repeat_release_or_close_rep
             ),
             adapter: None,
         })
+        .await
         .unwrap()
     else {
         panic!("replacement must genuinely admit");

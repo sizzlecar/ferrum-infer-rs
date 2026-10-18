@@ -1663,6 +1663,11 @@ impl ContinuousBatchScheduler {
         self.admission_failures.lock().drain(..).collect()
     }
 
+    /// Transfer one failure so interrupted completion leaves later notices queued.
+    pub fn take_next_admission_failure(&self) -> Option<(RequestId, FerrumError)> {
+        self.admission_failures.lock().pop_front()
+    }
+
     /// Fail one still-waiting typed admission after executor maintenance
     /// returned a terminal error. The queue entry is removed before any
     /// completion or backend work can run.

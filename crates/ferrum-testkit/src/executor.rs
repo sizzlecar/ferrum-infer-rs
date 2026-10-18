@@ -75,7 +75,7 @@ impl MockModelExecutor {
 
 #[async_trait]
 impl ModelExecutor for MockModelExecutor {
-    fn admit_tokens(&self, input: ExecutionAdmission<'_>) -> Result<TokenAdmissionOutcome> {
+    async fn admit_tokens(&self, input: ExecutionAdmission<'_>) -> Result<TokenAdmissionOutcome> {
         self.tokens
             .admit(input, self.info.max_sequence_length, self.info.vocab_size)
     }

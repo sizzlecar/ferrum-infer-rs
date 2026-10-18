@@ -457,7 +457,7 @@ mod tests {
         )
     }
 
-    fn admit(
+    async fn admit(
         executor: &PagedAttentionExecutor,
         request: &RequestId,
         maximum: usize,
@@ -468,6 +468,7 @@ mod tests {
                 context: ExecutorPrefillAdmission::for_diagnostic(request, &prompt, maximum),
                 adapter: None,
             })
+            .await
             .unwrap()
     }
 
@@ -508,7 +509,7 @@ mod tests {
     async fn paged_tokens_external_manager_replacement_rejects_old_access_and_close() {
         let (executor, manager) = fixture();
         let request = RequestId::new();
-        let TokenAdmissionOutcome::Admitted(old) = admit(&executor, &request, 5) else {
+        let TokenAdmissionOutcome::Admitted(old) = admit(&executor, &request, 5).await else {
             panic!("original admission");
         };
         let old_handle = manager.get_handle(request.clone()).unwrap();
@@ -579,13 +580,14 @@ mod tests {
     async fn paged_tokens_preserve_real_chunked_attention_capacity_and_exact_release() {
         let (executor, manager) = fixture();
         let id = RequestId::new();
-        let TokenAdmissionOutcome::Admitted(frontier) = admit(&executor, &id, 5) else {
+        let TokenAdmissionOutcome::Admitted(frontier) = admit(&executor, &id, 5).await else {
             panic!("admit");
         };
         assert_eq!(manager.stats().active_caches, 1);
         assert_eq!(manager.gpu_pool().stats().allocated_blocks, 3);
         let peer = RequestId::new();
-        let TokenAdmissionOutcome::CapacityDeferred(shortfall) = admit(&executor, &peer, 3) else {
+        let TokenAdmissionOutcome::CapacityDeferred(shortfall) = admit(&executor, &peer, 3).await
+        else {
             panic!("real capacity rejection");
         };
         assert_eq!(shortfall.required_blocks(), 2);
@@ -672,7 +674,7 @@ mod tests {
         ));
         assert_eq!(manager.stats().active_caches, 0);
         assert_eq!(manager.gpu_pool().stats().allocated_blocks, 0);
-        let TokenAdmissionOutcome::Admitted(replacement) = admit(&executor, &id, 5) else {
+        let TokenAdmissionOutcome::Admitted(replacement) = admit(&executor, &id, 5).await else {
             panic!("replacement");
         };
         assert_ne!(frontier.sequence(), replacement.sequence());
@@ -680,7 +682,7 @@ mod tests {
         assert_eq!(manager.stats().active_caches, 1);
         assert!(replacement.sequence().observed_end().is_none());
         close(&executor, replacement.sequence());
-        let TokenAdmissionOutcome::Admitted(peer) = admit(&executor, &peer, 3) else {
+        let TokenAdmissionOutcome::Admitted(peer) = admit(&executor, &peer, 3).await else {
             panic!("released capacity must admit");
         };
         close(&executor, peer.sequence());
