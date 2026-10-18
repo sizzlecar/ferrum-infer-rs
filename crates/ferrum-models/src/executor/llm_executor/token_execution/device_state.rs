@@ -37,6 +37,9 @@ pub(in crate::executor::llm_executor) struct TokenWorkerState {
     capacity: usize,
     next_claim: AtomicU64,
     shutdown: AtomicBool,
+    #[cfg(test)]
+    pub(super) admission_before_registry_lock:
+        Mutex<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>>,
 }
 
 impl TokenWorkerState {
@@ -56,6 +59,8 @@ impl TokenWorkerState {
             capacity: model.kv_capacity(),
             next_claim: AtomicU64::new(1),
             shutdown: AtomicBool::new(false),
+            #[cfg(test)]
+            admission_before_registry_lock: Mutex::new(None),
         })
     }
 
@@ -90,7 +95,22 @@ impl TokenWorkerState {
             }
             None => None,
         };
+        #[cfg(test)]
+        if let Some((entered, resume)) = self.admission_before_registry_lock.lock().take() {
+            entered
+                .send(())
+                .expect("registration test must observe its gate");
+            resume
+                .recv()
+                .expect("registration test must release its gate");
+        }
         let mut sequences = self.sequences.lock();
+        // Shutdown marks existing entries while holding this same lock.
+        // An earlier fast rejection check cannot exclude a shutdown that
+        // finished its scan before this registration acquired the lock.
+        if self.shutdown.load(Ordering::Acquire) {
+            return Err(FerrumError::backend("model worker is closing"));
+        }
         if sequences
             .live
             .values()
@@ -195,12 +215,46 @@ impl TokenWorkerState {
         }
     }
 
-    pub(in crate::executor::llm_executor) fn accept_admission(&self, frontier: &ExecutionFrontier) {
-        if let Some(entry) = self.sequences.lock().live.get_mut(frontier.sequence()) {
-            if let Some(device) = &mut entry.device {
-                device.published = device.prepared && !entry.closing;
-            }
+    pub(in crate::executor::llm_executor) fn accept_admission(
+        &self,
+        frontier: &ExecutionFrontier,
+    ) -> Result<()> {
+        let mut sequences = self.sequences.lock();
+        // Terminal publication/removal uses this same lock. Preparing a
+        // response on the worker does not promise it is still usable when
+        // the admission future is eventually polled again.
+        if frontier.sequence().observed_end().is_some() {
+            return Err(FerrumError::request_validation(
+                "token admission ended before delivery was accepted",
+            ));
         }
+        let entry = sequences.live.get_mut(frontier.sequence()).ok_or_else(|| {
+            FerrumError::internal("admission delivery lost its original incarnation")
+        })?;
+        let device = entry
+            .device
+            .as_mut()
+            .ok_or_else(|| FerrumError::internal("admission delivery has no device owner"))?;
+        if let Some(error) = &device.operation_error {
+            return Err(error.clone());
+        }
+        if self.shutdown.load(Ordering::Acquire) || entry.closing {
+            return Err(FerrumError::request_validation(
+                "token admission closed before delivery was accepted",
+            ));
+        }
+        if entry.frontier != *frontier
+            || !device.prepared
+            || device.published
+            || device.claim.is_some()
+            || device.needs_recovery
+        {
+            return Err(FerrumError::internal(
+                "admission delivery does not match an unpublished prepared frontier",
+            ));
+        }
+        device.published = true;
+        Ok(())
     }
 
     pub(in crate::executor::llm_executor) fn abandon_admission(

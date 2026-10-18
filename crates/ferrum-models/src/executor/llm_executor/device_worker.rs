@@ -44,17 +44,6 @@ struct DeliveryClaim {
     wake: mpsc::SyncSender<()>,
 }
 
-impl DeliveryClaim {
-    fn accept(&mut self) {
-        if let Some(kind) = self.kind.take() {
-            match kind {
-                ClaimKind::Admission(frontier) => self.state.accept_admission(&frontier),
-                ClaimKind::Execution(batch) => self.state.accept_device_batch(&batch),
-            }
-        }
-    }
-}
-
 impl Drop for DeliveryClaim {
     fn drop(&mut self) {
         if let Some(kind) = self.kind.take() {
@@ -71,10 +60,34 @@ struct Delivery<T> {
     value: T,
     claim: DeliveryClaim,
 }
-impl<T> Delivery<T> {
-    fn accept(mut self) -> T {
-        self.claim.accept();
+impl Delivery<ExecutionBatchOutcome> {
+    fn accept(mut self) -> ExecutionBatchOutcome {
+        // Actual products remain observable even if an incarnation closed
+        // after execution. Admission validity must never discard them.
+        if let Some(ClaimKind::Execution(batch)) = self.claim.kind.as_ref() {
+            self.claim.state.accept_device_batch(batch);
+            self.claim.kind = None;
+        }
         self.value
+    }
+}
+
+impl Delivery<TokenAdmissionOutcome> {
+    fn try_accept(mut self) -> Result<TokenAdmissionOutcome> {
+        let (TokenAdmissionOutcome::Admitted(frontier), Some(ClaimKind::Admission(claimed))) =
+            (&self.value, self.claim.kind.as_ref())
+        else {
+            return Err(FerrumError::internal("invalid admission delivery claim"));
+        };
+        if frontier != claimed {
+            return Err(FerrumError::internal(
+                "admission delivery changed its original frontier",
+            ));
+        }
+        self.claim.state.accept_admission(frontier)?;
+        // On rejection the armed claim instead closes the original owner.
+        self.claim.kind = None;
+        Ok(self.value)
     }
 }
 
@@ -154,14 +167,35 @@ impl LlmDeviceWorker {
         });
         match observed.and_then(|result| result) {
             Ok(delivery) if matches!(&delivery.value, TokenAdmissionOutcome::Admitted(_)) => {
-                Ok(delivery.accept())
+                match delivery.try_accept() {
+                    Ok(outcome) => Ok(outcome),
+                    Err(rejection) => {
+                        // This delivery never became a usable admission.
+                        // Keep the original terminal observer through cleanup,
+                        // including an error published before the entry left
+                        // the registry. It is more specific than stale-delivery
+                        // validation when both fail.
+                        match self.finish_unpublished_admission(&sequence, terminal).await {
+                            Ok(()) => Err(rejection),
+                            Err(terminal_error) => {
+                                tracing::error!(%rejection, %terminal_error,
+                                    "admission delivery was rejected and its original owner failed");
+                                Err(terminal_error)
+                            }
+                        }
+                    }
+                }
             }
             Ok(delivery) => {
                 // A retryable admission result must not race the physical
                 // cleanup of the unpublished incarnation that attempted it.
                 self.finish_unpublished_admission(&sequence, terminal)
                     .await?;
-                Ok(delivery.accept())
+                let Delivery { value, claim } = delivery;
+                // Non-admission results are not published. The original
+                // incarnation has already reached its checked terminal state.
+                drop(claim);
+                Ok(value)
             }
             Err(error) => {
                 if let Err(cleanup_error) =

@@ -430,6 +430,168 @@ async fn managed_worker_cpu_sent_unpolled_result_and_executor_drop_still_close()
     );
 }
 
+async fn stale_admission_delivery(terminal_before_accept: bool) {
+    let (executor, model, control) = fixture::<CpuBackend>(false);
+    let prompt = [TokenId(1), TokenId(2)];
+    let policy = LogitsReturnPolicy::FullLogits;
+    let blocker = admit(&executor, &RequestId::new(), &prompt).await;
+    let blocker_input = [ExecutionWork::new(
+        &blocker,
+        TokenWork::Prefill(PrefillChunk::new(0, 2, 2).unwrap()),
+        &policy,
+    )
+    .unwrap()];
+    let (started, release) = control.block_next();
+    let mut blocked_work = Box::pin(executor.execute_tokens(&blocker_input));
+    poll_pending(blocked_work.as_mut());
+    started.await.unwrap();
+    let request = RequestId::new();
+    let mut pending = Box::pin(executor.admit_tokens(ExecutionAdmission {
+        context: ExecutorPrefillAdmission::for_startup(&request, &prompt, 32),
+        adapter: None,
+    }));
+    poll_pending(pending.as_mut());
+    release.send(()).unwrap();
+    assert_eq!(completed(blocked_work.await.unwrap()).len(), 1);
+    // A later FIFO command proves the original admission response was sent.
+    // Its receiver has deliberately not been polled again.
+    let sentinel = admit(&executor, &RequestId::new(), &prompt).await;
+    let (original, original_cache) = {
+        let sequences = executor.token_sequences.lock();
+        let entry = sequences
+            .live
+            .values()
+            .find(|entry| entry.request_id == request)
+            .unwrap();
+        (entry.frontier.clone(), entry.cache_id.clone())
+    };
+    assert!(model.lock().kv_caches.contains_key(&original_cache));
+    assert!(original.sequence().observed_end().is_none());
+
+    control.close_once.store(true, Ordering::Release);
+    let close_gate = (!terminal_before_accept).then(|| control.block_next());
+    let close = executor.cancel_tokens(original.sequence()).unwrap();
+    if let Some((started, release)) = close_gate {
+        started.await.unwrap();
+        // Acceptance must reject the closing incarnation and keep waiting
+        // for its real terminal fact, not return the queued Admitted value.
+        poll_pending(pending.as_mut());
+        assert!(original.sequence().observed_end().is_none());
+        assert!(model.lock().kv_caches.contains_key(&original_cache));
+        release.send(()).unwrap();
+    }
+    let closed = terminal(close).await;
+    assert_eq!(closed.ended.sequence(), original.sequence());
+    assert!(closed
+        .error
+        .unwrap()
+        .to_string()
+        .contains("first close observation failed"));
+    assert!(!executor
+        .token_sequences
+        .lock()
+        .live
+        .contains_key(original.sequence()));
+    assert!(!model.lock().kv_caches.contains_key(&original_cache));
+
+    // When terminal preceded acceptance, a replacement can already own the
+    // same public request ID. The old delivery may close only its old identity.
+    let replacement = if terminal_before_accept {
+        Some(admit(&executor, &request, &prompt).await)
+    } else {
+        None
+    };
+    let error = pending
+        .await
+        .expect_err("an ended admission must never be published");
+    assert!(error.to_string().contains("first close observation failed"));
+    let replacement = match replacement {
+        Some(frontier) => frontier,
+        None => admit(&executor, &request, &prompt).await,
+    };
+    assert_ne!(replacement.sequence(), original.sequence());
+    assert!(replacement.sequence().observed_end().is_none());
+    {
+        let sequences = executor.token_sequences.lock();
+        let entry = &sequences.live[replacement.sequence()];
+        assert!(!entry.closing);
+        assert_eq!(entry.frontier, replacement);
+    }
+    let replacement_input = [ExecutionWork::new(
+        &replacement,
+        TokenWork::Prefill(PrefillChunk::new(0, 2, 2).unwrap()),
+        &policy,
+    )
+    .unwrap()];
+    let rows = completed(executor.execute_tokens(&replacement_input).await.unwrap());
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].next_frontier().sequence(), replacement.sequence());
+    assert_eq!(rows[0].next_frontier().consumed_tokens(), 2);
+    let mut reference = real_model::<CpuBackend>(false);
+    compare_logits(
+        full_logits(&rows[0]),
+        &reference.prefill_internal("reference", &[1, 2]),
+    );
+    reference.release("reference");
+    assert_eq!(control.batches.load(Ordering::Relaxed), 2);
+    for frontier in [blocker, sentinel, replacement] {
+        let closed = terminal(executor.cancel_tokens(frontier.sequence()).unwrap()).await;
+        assert_eq!(closed.ended.sequence(), frontier.sequence());
+        assert!(closed.error.is_none());
+    }
+    assert!(executor.token_sequences.lock().live.is_empty());
+    assert!(model.lock().kv_caches.is_empty());
+}
+
+#[tokio::test]
+async fn managed_worker_cpu_admission_accept_waits_for_closing_owner() {
+    stale_admission_delivery(false).await;
+}
+
+#[tokio::test]
+async fn managed_worker_cpu_admission_accept_rejects_ended_original_not_replacement() {
+    stale_admission_delivery(true).await;
+}
+
+#[test]
+fn managed_worker_cpu_admission_registration_cannot_follow_shutdown_scan() {
+    let (executor, model, _) = fixture::<CpuBackend>(false);
+    // This state uses the actual executor's model and original registry. No
+    // preparation or independent resource owner is invented for the race.
+    let state = Arc::new(TokenWorkerState::new(&executor).unwrap());
+    let (entered, reached) = mpsc::channel();
+    let (resume, resumed) = mpsc::channel();
+    *state.admission_before_registry_lock.lock() = Some((entered, resumed));
+    let registering = Arc::clone(&state);
+    let registration = std::thread::spawn(move || {
+        registering.register_device_admission(
+            ExecutionAdmission {
+                context: ExecutorPrefillAdmission::for_startup(
+                    &RequestId::new(),
+                    &[TokenId(1), TokenId(2)],
+                    32,
+                ),
+                adapter: None,
+            },
+            "shutdown-race".to_owned(),
+        )
+    });
+    reached.recv_timeout(Duration::from_secs(5)).unwrap();
+    // Registration has passed the original pre-lock check. Complete the real
+    // shutdown scan before allowing it to acquire the same registry lock.
+    state.request_shutdown();
+    assert!(state.shutdown_complete());
+    resume.send(()).unwrap();
+    let error = registration
+        .join()
+        .unwrap()
+        .expect_err("a closed worker must not acquire a late unpublished incarnation");
+    assert!(error.to_string().contains("model worker is closing"));
+    assert!(executor.token_sequences.lock().live.is_empty());
+    assert!(model.lock().kv_caches.is_empty());
+    assert!(state.shutdown_complete());
+}
+
 #[tokio::test]
 async fn managed_worker_cpu_missing_middle_row_preserves_raw_logits_without_misattribution() {
     let (executor, model, control) = fixture::<CpuBackend>(false);
