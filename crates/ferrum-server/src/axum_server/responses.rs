@@ -6,6 +6,7 @@ use axum::{
     response::Response,
     Json,
 };
+use ferrum_types::{RequestIngressAnchor, RequestIngressBoundary};
 use serde_json::{json, Map, Value};
 use std::collections::HashMap;
 use uuid::Uuid;
@@ -102,6 +103,7 @@ pub(super) async fn responses_handler(
     headers: HeaderMap,
     request: std::result::Result<Json<ResponsesRequest>, JsonRejection>,
 ) -> std::result::Result<Response, ServerError> {
+    let ingress = RequestIngressAnchor::capture(RequestIngressBoundary::HttpHandler);
     let Json(request) = request.map_err(|error| {
         ServerError::invalid_request(
             format!(
@@ -111,6 +113,10 @@ pub(super) async fn responses_handler(
             None,
         )
     })?;
+    #[cfg(test)]
+    if let Some(observer) = &state.request_construction_observer {
+        observer(ingress, "responses_conversion");
+    }
     let converted = request.convert()?;
     super::chat_completions_handler_with_projection(
         State(state),
@@ -118,6 +124,7 @@ pub(super) async fn responses_handler(
         Ok(Json(converted.chat)),
         Some(converted.message_phases),
         Some(converted.response),
+        ingress,
     )
     .await
 }

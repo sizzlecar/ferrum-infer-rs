@@ -75,7 +75,7 @@ fn rejection(executor: &ProtocolExecutor) -> NoSubmissionReason {
     ))
 }
 
-async fn commit_initial_products(
+pub(super) async fn commit_initial_products(
     engine: &ContinuousBatchEngine,
     executor: &ProtocolExecutor,
     inputs: &mut [TokenBatchInput],
@@ -194,8 +194,21 @@ fn assert_no_peer_readmission(engine: &ContinuousBatchEngine) {
 
 #[tokio::test]
 async fn token_allocator_shared_peers_close_in_order_before_recompute_can_readmit() {
-    let (engine, executor, mut inputs) = fixture_with_request_count(3).await;
+    let (engine, executor, mut inputs) = fixture_with_clock(3, true).await;
     commit_initial_products(&engine, &executor, &mut inputs).await;
+    let ingress = inputs
+        .iter()
+        .map(|input| {
+            input
+                .handle
+                .lock()
+                .as_ref()
+                .unwrap()
+                .original_request
+                .ingress
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
     let mut pool = BlockAllocator::new(2);
     let blocked_block = pool.allocate().unwrap();
     let shared_block = pool.allocate().unwrap();
@@ -345,6 +358,40 @@ async fn token_allocator_shared_peers_close_in_order_before_recompute_can_readmi
     assert_waiting_owner(&engine, first);
     assert_waiting_owner(&engine, remaining);
     assert_no_peer_readmission(&engine);
+    for (input, original) in inputs[1..].iter().zip(&ingress[1..]) {
+        let mut state = input.handle.lock();
+        let sequence = state.as_mut().unwrap();
+        assert_eq!(sequence.start_time, original.instant());
+        assert_eq!(sequence.original_request.ingress, Some(*original));
+        assert!(
+            !sequence.closes_pending_decode_scheduling(),
+            "Held and recompute wait are not decode scheduling"
+        );
+        let timing = sequence
+            .take_execution_evidence()
+            .unwrap()
+            .unwrap()
+            .engine_token_timing
+            .unwrap();
+        assert_eq!(timing.token_commit_nanos_since_request_start.len(), 1);
+        assert!(
+            timing.decode_ready_nanos_since_request_start.unwrap()
+                <= timing.token_commit_nanos_since_request_start[0]
+        );
+        assert_eq!(timing.decode_stage_intervals.len(), 1);
+        assert_eq!(
+            timing.decode_stage_intervals[0].stage,
+            EngineDecodeStage::DecodeScheduling
+        );
+        assert_eq!(
+            timing.decode_stage_intervals[0].start_nanos_since_request_start,
+            timing.token_commit_nanos_since_request_start[0]
+        );
+        assert!(
+            timing.decode_stage_intervals[0].end_nanos_since_request_start
+                <= original.elapsed().as_nanos() as u64
+        );
+    }
     let runnable = engine
         .inner
         .scheduler

@@ -2,7 +2,7 @@
 
 **状态：目标已激活，R0 已合并，R1 验收、R2 实施中。** 工作分支：`refactor/execution-architecture-20261018`，从 2026-10-18 的干净 `main`（`c2be4c67`）开始。首个 checkpoint 退役独立 embedding/ASR/TTS 链路；原工作区未合并的旧 SLO 实现不作为代码基底。
 
-R0 六批清理与正确性修复已合并（PR #429–#434）。R1 已分离 runtime 与产品执行契约，统一 token 提交并退出旧 Tensor 控制流，泛型驱动归入 execution。R2 已实现统一驱动生命周期、持有额度的输出和 HTTP 按需拉取；采样、解码与完成投影已移出全局序列锁。生成历史、完成结果及 CLI/HTTP 保留副本沿用原请求额度，tokenizer 共享解码缓存另有实例限额；真实 CPU 回归覆盖额度不足时不重放已执行工作、独立请求进度与最后持有者释放。runtime/Engine 观测已区分传输降级与契约失败，Engine/HTTP journal 使用有界非阻塞投递，run/serve 共享 typed 预算；关闭诊断时不构造 trace 负载。产品装配持有唯一日志关闭权，Engine/HTTP 各自结束投递，CLI 尾记录写入原 writer 后才最终关闭；超时保留原清理任务，未知终态保留投递范围。单调入口时间、真实物理执行事实与旧全局 profiler 的隔离仍待收尾。R1 仍在验收，R2–R5 未完成；原始证据留在仓库外交接目录，没有新增性能或 SLO 达标声明。
+R0 六批清理与正确性修复已合并（PR #429–#434）。R1 已分离 runtime 与产品执行契约，统一 token 提交并退出旧 Tensor 控制流，泛型驱动归入 execution。R2 已统一驱动与关闭生命周期，输出额度跟随实际持有者，采样、解码与完成投影移出全局序列锁；观测区分传输降级和契约失败，产品装配持有唯一日志关闭权。入口单调时间已贯通 HTTP、Engine 和 Scheduler，排队分段保留原请求年龄；真实 CPU 回归覆盖 tokenization 等待和计时额度不足时的精确资源收口。实际物理执行事实与旧全局 profiler 隔离仍待实施。R1 仍在验收，R2–R5 未完成；原始证据在仓库外交接目录，没有新增性能或 SLO 达标声明。
 
 ## 1. 目标与第一原则
 
@@ -152,6 +152,8 @@ CUDA graph、stream、工作区与可变配置归属于 runtime 实例。确需�
 沿用 [README 的目标](../README.md)：固定硬件、模型、输出策略、请求集合/到达计划和测量窗口，在预先声明的 TTFT、TPOT、ITL 分位数上限及最低完成率约束下，最大化有效输出吞吐。
 
 请求从入口携带单调时间锚点，覆盖排队与 tokenization；墙钟跳变不改变 deadline，跨边界传递不能悄悄重置请求年龄。跨进程只比较有明确定义的持续时间/关联事件，不直接相减不同时钟。保留生成、排队、服务端发送与客户端接收的不同时间。TTFT 以首个非空可见文本为准；主表 ITL 是相邻非空 SSE 文本事件间隔，单 token 诊断另列并披露传输合并。TPOT 的样本单位、分母和不足两个输出 token 的处理须声明。拒绝、失败、超时和未完成请求保留在固定 cohort 的完成率分母，不能通过拒单或删掉缺失样本制造达标。
+
+本地计时合同：`InferenceRequest.ingress` 不序列化，首个 HTTP handler、Engine 或直接 Scheduler 入口捕获 `RequestIngressAnchor`，后续原样传递。HTTP 起点在 JSON 提取之后，包含请求转换与 prompt 准备，不能代替客户端可见延迟；新 evidence 标注 `request_start_boundary`，旧产物缺此字段表示起点未声明。墙钟仅关联事件，转换失败不影响普通请求的单调计时。Scheduler 的请求年龄沿原起点，queue wait 仅统计每次实际入队至晋升的区间；重新排队不重复累计先前执行时间，公有 wall 时间字段不再决定 duration。
 
 ### 数据面只提供执行事实
 

@@ -1406,6 +1406,7 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
             client_id: None,
             session_id: None,
             created_at: Utc::now(),
+            ingress: None,
             api_request: None,
             evidence_request: ferrum_types::InferenceEvidenceRequest {
                 capture_engine_token_timing: product_observability
@@ -1755,6 +1756,7 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
                     client_id: None,
                     session_id: None,
                     created_at: Utc::now(),
+                    ingress: None,
                     api_request: None,
                     evidence_request: ferrum_types::InferenceEvidenceRequest {
                         capture_engine_token_timing: product_observability

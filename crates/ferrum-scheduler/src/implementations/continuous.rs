@@ -55,7 +55,8 @@ use ferrum_interfaces::scheduler::{PreparedPrefixRestore, SchedulerMetrics};
 use ferrum_runtime::{AdmissionRejected, CapacityAvailabilityEpoch};
 use ferrum_types::{
     AllocatorCapacityDomain, BatchId, FerrumError, InferenceRequest, InferenceResponse, Priority,
-    RequestId, RequestState, Result, SchedulerConfig, PROMPT_TOKENS_METADATA_KEY,
+    RequestId, RequestIngressBoundary, RequestState, Result, SchedulerConfig,
+    PROMPT_TOKENS_METADATA_KEY,
 };
 use indexmap::IndexMap;
 use parking_lot::{Mutex, RwLock};
@@ -908,7 +909,8 @@ impl ContinuousBatchMetrics {
 
 impl ContinuousBatchScheduler {
     /// Publish one request synchronously under the scheduler's existing queue locks.
-    pub fn submit_request(&self, request: InferenceRequest) -> Result<RequestId> {
+    pub fn submit_request(&self, mut request: InferenceRequest) -> Result<RequestId> {
+        request.ensure_ingress(RequestIngressBoundary::SchedulerApi);
         self.validate_slo()?;
         let request_id = request.id.clone();
         debug!(
@@ -951,10 +953,11 @@ impl ContinuousBatchScheduler {
         let ticket = waiting_queue
             .enqueue(req)
             .map_err(|error| FerrumError::scheduler(error.to_string()))?;
-        waiting_queue
+        let queued = waiting_queue
             .request_mut(ticket)
-            .expect("newly enqueued admission ticket remains present")
-            .waiting_admission_ticket = Some(ticket);
+            .expect("newly enqueued admission ticket remains present");
+        queued.inner.mark_queued_at(Instant::now());
+        queued.waiting_admission_ticket = Some(ticket);
 
         // Update the lifecycle index and arm fill-first only when this request
         // starts a new cohort after every prior request has left. Doing both
@@ -1672,6 +1675,11 @@ impl ContinuousBatchScheduler {
         let result = waiting_queue.requeue(ticket, request);
         match result {
             Ok(()) => {
+                waiting_queue
+                    .request_mut(ticket)
+                    .expect("successfully requeued admission ticket remains present")
+                    .inner
+                    .requeue_at(Instant::now());
                 request_index.insert(request_id, RequestPhase::Waiting);
                 true
             }
@@ -1717,13 +1725,11 @@ impl ContinuousBatchScheduler {
             req.prefix_restore.begin_admission();
             req.phase = RequestPhase::Prefilling;
             req.inner.state = RequestState::Running;
-            let started_at = chrono::Utc::now();
-            let wait_us = started_at
-                .signed_duration_since(req.inner.submitted_at)
-                .num_microseconds()
-                .unwrap_or(0)
-                .max(0) as u64;
-            req.inner.started_at = Some(started_at);
+            let wait_us = req
+                .inner
+                .mark_started_at(Instant::now())
+                .as_micros()
+                .min(u64::MAX as u128) as u64;
             self.total_wait_time_us
                 .fetch_add(wait_us, Ordering::Relaxed);
             self.admitted_counter.fetch_add(1, Ordering::Relaxed);
@@ -1761,13 +1767,11 @@ impl ContinuousBatchScheduler {
         request.prefix_restore.begin_admission();
         request.phase = RequestPhase::Prefilling;
         request.inner.state = RequestState::Running;
-        let started_at = chrono::Utc::now();
-        let wait_us = started_at
-            .signed_duration_since(request.inner.submitted_at)
-            .num_microseconds()
-            .unwrap_or(0)
-            .max(0) as u64;
-        request.inner.started_at = Some(started_at);
+        let wait_us = request
+            .inner
+            .mark_started_at(Instant::now())
+            .as_micros()
+            .min(u64::MAX as u128) as u64;
         self.total_wait_time_us
             .fetch_add(wait_us, Ordering::Relaxed);
         self.admitted_counter.fetch_add(1, Ordering::Relaxed);
@@ -2918,7 +2922,6 @@ impl ContinuousBatchScheduler {
             let mut req = prefill_queue.remove(pos).unwrap();
             req.phase = RequestPhase::Waiting;
             req.inner.state = RequestState::Waiting;
-            req.inner.started_at = None;
             req.prefill_tokens = 0;
             req.kv_blocks.clear();
             req.chunked_prefill = false;
@@ -3260,7 +3263,6 @@ impl ContinuousBatchScheduler {
             let waiting_ticket = request.waiting_admission_ticket;
             request.phase = RequestPhase::Waiting;
             request.inner.state = RequestState::Waiting;
-            request.inner.started_at = None;
             request.prefill_tokens = 0;
             request.decode_tokens = 0;
             request.kv_blocks.clear();
@@ -3306,7 +3308,6 @@ impl ContinuousBatchScheduler {
         if let Some(mut req) = decode_queue.remove(request_id) {
             req.phase = RequestPhase::Waiting;
             req.inner.state = RequestState::Waiting;
-            req.inner.started_at = None;
             req.prefill_tokens = 0;
             req.decode_tokens = 0;
             req.kv_blocks.clear();
@@ -3480,19 +3481,19 @@ impl ContinuousBatchScheduler {
         }
     }
 
-    fn prioritize_ttft(&self, queue: &mut VecDeque<ContinuousBatchRequest>) {
+    fn prioritize_ttft(&self, queue: &mut VecDeque<ContinuousBatchRequest>, now: Instant) {
         let (Some(targets), Some(controller)) = (self.config.slo, &self.slo_controller) else {
             return;
         };
         let prefill_cost = controller.lock().prefill_ms_per_token().unwrap_or(0.0);
-        let now = chrono::Utc::now();
         let urgency_window_ms = targets.tpot_ms.min(targets.itl_ms);
         let slack = |request: &ContinuousBatchRequest| {
-            let age_ms = (now - request.inner.submitted_at)
-                .to_std()
-                .unwrap_or_default()
-                .as_secs_f64()
-                * 1000.0;
+            // A recompute after output has no first-token deadline. Keep it
+            // in stable non-urgent order, just as the dynamic budget does.
+            if request.slo_first_token_emitted {
+                return f64::INFINITY;
+            }
+            let age_ms = request.inner.age_at(now).as_secs_f64() * 1000.0;
             targets.ttft_ms - age_ms - self.remaining_prefill_tokens(request) as f64 * prefill_cost
         };
         // Keep non-urgent work stable. Only requests that are within one decode
@@ -3681,6 +3682,7 @@ impl ContinuousBatchScheduler {
     fn add_prefill_requests_to_batch(
         &self,
         iteration: u64,
+        now: Instant,
         hint: &BatchHint,
         batch_requests: &mut Vec<ScheduledRequest>,
         total_tokens: &mut usize,
@@ -3701,7 +3703,7 @@ impl ContinuousBatchScheduler {
         }
 
         let mut prefill_queue = self.prefill_queue.write();
-        self.prioritize_ttft(&mut prefill_queue);
+        self.prioritize_ttft(&mut prefill_queue, now);
         for req in prefill_queue.iter_mut() {
             if batch_requests.len() >= hint.max_batch_size {
                 break;
@@ -4116,7 +4118,16 @@ impl ContinuousBatchScheduler {
     fn create_iteration_batch_with_admission(
         &self,
         hint: BatchHint,
+        waiting_admission: WaitingAdmissionMode<'_>,
+    ) -> Result<Option<BatchPlan>> {
+        self.create_iteration_batch_with_admission_at(hint, waiting_admission, Instant::now())
+    }
+
+    fn create_iteration_batch_with_admission_at(
+        &self,
+        hint: BatchHint,
         mut waiting_admission: WaitingAdmissionMode<'_>,
+        now: Instant,
     ) -> Result<Option<BatchPlan>> {
         self.validate_slo()?;
         if let Some(controller) = &self.slo_controller {
@@ -4191,7 +4202,6 @@ impl ContinuousBatchScheduler {
                 // Waiting admission stays unchanged; once admitted, a request
                 // participates with its real remaining work and chunk ceiling.
                 let prefill_queue = self.prefill_queue.read();
-                let now = chrono::Utc::now();
                 let active_prefills = prefill_queue
                     .iter()
                     // Recompute after visible output has no first-token deadline.
@@ -4204,11 +4214,7 @@ impl ContinuousBatchScheduler {
                             prefill_step_chunk,
                             static_limit,
                         ),
-                        age_ms: (now - request.inner.submitted_at)
-                            .to_std()
-                            .unwrap_or_default()
-                            .as_secs_f64()
-                            * 1000.0,
+                        age_ms: request.inner.age_at(now).as_secs_f64() * 1000.0,
                     });
                 let budget = controller.lock().budget(
                     targets,
@@ -4273,6 +4279,7 @@ impl ContinuousBatchScheduler {
         // max_tokens, which is pre-allocated to the same budget).
         self.add_prefill_requests_to_batch(
             iteration,
+            now,
             &hint,
             &mut batch_requests,
             &mut total_tokens,
@@ -4365,6 +4372,7 @@ impl ContinuousBatchScheduler {
         // the current batch already contains decode work.
         self.add_prefill_requests_to_batch(
             iteration,
+            now,
             &hint,
             &mut batch_requests,
             &mut total_tokens,
@@ -4923,6 +4931,7 @@ mod tests {
     mod active_decode_budget;
     mod allocator_capacity;
     mod capacity_release;
+    mod request_clock;
     mod slo_policy;
     mod token_admission;
 
@@ -4937,6 +4946,7 @@ mod tests {
             client_id: None,
             session_id: None,
             created_at: chrono::Utc::now(),
+            ingress: None,
             api_request: None,
             evidence_request: Default::default(),
             metadata: std::collections::HashMap::new(),

@@ -12,6 +12,8 @@ use ferrum_models::test_support::{tiny_llama_executor, TinyLlamaConfig, TinyToke
 
 #[path = "tests/allocator_tests.rs"]
 mod allocator_tests;
+#[path = "tests/request_clock.rs"]
+mod request_clock;
 
 struct ProtocolExecutor {
     metadata: Arc<dyn ModelExecutor>,
@@ -81,6 +83,17 @@ async fn fixture_with_request_count(
     Arc<ProtocolExecutor>,
     Vec<TokenBatchInput>,
 ) {
+    fixture_with_clock(request_count, false).await
+}
+
+async fn fixture_with_clock(
+    request_count: usize,
+    capture_timing: bool,
+) -> (
+    ContinuousBatchEngine,
+    Arc<ProtocolExecutor>,
+    Vec<TokenBatchInput>,
+) {
     let cfg = TinyLlamaConfig::default();
     let executor = Arc::new(ProtocolExecutor {
         metadata: tiny_llama_executor(&cfg),
@@ -88,7 +101,10 @@ async fn fixture_with_request_count(
         closed: Mutex::new(Vec::new()),
         allocator: Mutex::new(None),
     });
-    let config = EngineConfig::default();
+    let mut config = EngineConfig::default();
+    if capture_timing {
+        config.runtime.profile_detail = ObservabilityProfileDetail::Latency;
+    }
     let scheduler = Arc::new(ContinuousBatchScheduler::new(config.scheduler.clone()));
     let tokenizer = Arc::new(TinyTokenizer::new(cfg.vocab_size));
     let kv = Arc::new(
@@ -120,6 +136,8 @@ async fn fixture_with_request_count(
     let mut inputs = Vec::new();
     for _ in 0..request_count {
         let mut request = InferenceRequest::new("protocol", "tiny-llama-test");
+        request.ensure_ingress(RequestIngressBoundary::EngineApi);
+        request.evidence_request.capture_engine_token_timing = capture_timing;
         request
             .metadata
             .insert(PROMPT_TOKENS_METADATA_KEY.into(), serde_json::json!(2));

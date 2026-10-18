@@ -10,8 +10,8 @@ pub use native_projection::{
 };
 
 use crate::{
-    ids::*, models::TokenUsage, FinishReason, Priority, ResponseCompletionEnvelope, SamplingParams,
-    TokenId,
+    ids::*, models::TokenUsage, FinishReason, Priority, RequestIngressAnchor,
+    RequestIngressBoundary, ResponseCompletionEnvelope, SamplingParams, TokenId,
 };
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -37,13 +37,7 @@ pub struct InferenceEvidenceRequest {
     pub capture_engine_token_timing: bool,
 }
 
-/// Engine-boundary timing for one inference request.
-///
-/// Every token timestamp is an offset from the same `std::time::Instant`
-/// captured at request admission. The wall anchor exists only to correlate
-/// this monotonic domain with profile events; durations and ITL must be
-/// computed from `token_commit_nanos_since_request_start`, never by
-/// subtracting wall-clock timestamps.
+/// Explicit stages observed by the engine for decode work.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum EngineDecodeStage {
@@ -66,9 +60,16 @@ pub struct EngineDecodeStageInterval {
     pub end_nanos_since_request_start: u64,
 }
 
+/// Engine token commits measured from the original local request ingress.
+///
+/// The wall anchor only correlates events. Durations use monotonic offsets,
+/// and engine token commits are distinct from client-visible text updates.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct EngineTokenTimingEvidence {
     pub clock_source: String,
+    /// Missing in legacy artifacts, whose starting boundary is unspecified.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_start_boundary: Option<RequestIngressBoundary>,
     pub wall_anchor_unix_nanos: i64,
     pub wall_anchor_max_error_nanos: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -169,6 +170,10 @@ pub struct InferenceRequest {
     pub session_id: Option<SessionId>,
     /// Request creation timestamp
     pub created_at: DateTime<Utc>,
+    /// Original process-local entrypoint sample. Not transported on the wire;
+    /// the first local entrypoint captures it when absent.
+    #[serde(skip)]
+    pub ingress: Option<RequestIngressAnchor>,
     /// Structured product/API request context. `prompt` remains the rendered
     /// model input for current engines; this carries the original semantic
     /// request boundary for API features such as tools and response formats.
@@ -1043,10 +1048,24 @@ impl InferenceRequest {
             client_id: None,
             session_id: None,
             created_at: Utc::now(),
+            ingress: None,
             api_request: None,
             evidence_request: InferenceEvidenceRequest::default(),
             metadata: HashMap::new(),
         }
+    }
+
+    /// Capture at the first local boundary; subsequent layers retain it.
+    pub fn ensure_ingress(&mut self, boundary: RequestIngressBoundary) -> RequestIngressAnchor {
+        *self
+            .ingress
+            .get_or_insert_with(|| RequestIngressAnchor::capture(boundary))
+    }
+
+    /// Propagate a sample captured before preparing this request.
+    pub fn with_ingress(mut self, ingress: RequestIngressAnchor) -> Self {
+        self.ingress = Some(ingress);
+        self
     }
 
     /// Set sampling parameters

@@ -59,9 +59,10 @@ use ferrum_types::{
     Device, EngineConfig, EngineDecodeStage, EngineDecodeStageInterval, EngineStatus,
     EngineTokenTimingEvidence, FerrumError, FerrumProfileEvent, FinishReason,
     InferenceExecutionEvidence, InferenceRequest, InferenceResponse, ObservabilityProfileDetail,
-    ProfileEntrypoint, ProfileError, ProfileEventKind, ProfileStatus, RequestId, ResourceAction,
-    ResourceTraceEvent, ResponseCompletionBoundary, Result, SamplingParams, StreamChunk, TokenId,
-    TokenUsage, DEFAULT_MAX_TOKENS_METADATA_KEY, ENGINE_RUNTIME_TRACE_PRESET_HASH,
+    ProfileEntrypoint, ProfileError, ProfileEventKind, ProfileStatus, RequestId,
+    RequestIngressAnchor, RequestIngressBoundary, ResourceAction, ResourceTraceEvent,
+    ResponseCompletionBoundary, Result, SamplingParams, StreamChunk, TokenId, TokenUsage,
+    DEFAULT_MAX_TOKENS_METADATA_KEY, ENGINE_RUNTIME_TRACE_PRESET_HASH,
     OBSERVABILITY_PROFILE_SCHEMA_VERSION, PROMPT_TOKENS_METADATA_KEY,
 };
 use futures::{stream::Stream, FutureExt};
@@ -77,7 +78,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::OnceLock;
 use std::sync::{Arc, Weak};
 use std::task::{Context, Poll};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, Notify, Semaphore};
 use tracing::{debug, info, warn};
 
@@ -2483,10 +2484,10 @@ impl LlmInferenceEngine for ContinuousBatchEngine {
     }
 
     async fn infer(&self, mut request: InferenceRequest) -> Result<InferenceOutput> {
+        let ingress = request.ensure_ingress(RequestIngressBoundary::EngineApi);
         self.adapter_execution_support()
             .validate_metadata(&request.metadata)?;
         let session = self.inner.output_budget.try_open_session()?;
-        let infer_start = Instant::now();
         counter!("ferrum.engine.requests_total").increment(1);
 
         let input_tokens = self.inner.tokenizer.encode(&request.prompt, true)?;
@@ -2540,7 +2541,7 @@ impl LlmInferenceEngine for ContinuousBatchEngine {
         });
         receiver_drop_wake.disarm();
 
-        let elapsed_ms = infer_start.elapsed().as_secs_f64() * 1000.0;
+        let elapsed_ms = ingress.elapsed().as_secs_f64() * 1000.0;
         histogram!("ferrum.engine.request_duration_ms").record(elapsed_ms);
 
         if let Ok(ref resp) = result {
@@ -2559,6 +2560,7 @@ impl LlmInferenceEngine for ContinuousBatchEngine {
     }
 
     async fn infer_stream(&self, mut request: InferenceRequest) -> Result<InferenceStream> {
+        request.ensure_ingress(RequestIngressBoundary::EngineApi);
         self.adapter_execution_support()
             .validate_metadata(&request.metadata)?;
         let session = self.inner.output_budget.try_open_session()?;

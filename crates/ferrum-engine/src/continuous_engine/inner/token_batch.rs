@@ -35,6 +35,12 @@ impl TokenBatchInput {
     }
 }
 
+#[derive(Clone, Copy)]
+struct TokenExecutionTiming {
+    started_at: Instant,
+    completed_at: Instant,
+}
+
 struct TokenPreparationFailure {
     handle: Option<Arc<SequenceHandle>>,
     request_id: RequestId,
@@ -78,15 +84,17 @@ impl EngineInner {
                 let sequence = state.as_ref().ok_or_else(|| {
                     FerrumError::internal("scheduled token request has no published sequence")
                 })?;
-                if let Some(error) = sequence.output_accounting_error() {
-                    return Err(error.clone());
-                }
                 let frontier = sequence.execution_frontier.clone().ok_or_else(|| {
                     FerrumError::internal("scheduled token request has no admitted incarnation")
                 })?;
                 // Once captured, preserve this exact owner even if any later
                 // preparation fails. No error can assign a different live owner.
                 let prepared = (|| -> Result<_> {
+                    // A latched accounting failure still owns this admitted
+                    // incarnation, including after a real recompute pause.
+                    if let Some(error) = sequence.output_accounting_error() {
+                        return Err(error.clone());
+                    }
                     if sequence.execution_close.is_some() {
                         return Err(FerrumError::internal(
                             "closing token incarnation was scheduled",
@@ -307,23 +315,15 @@ impl EngineInner {
                     && completed.completions().iter().enumerate().all(|(index, completion)| {
                         completion.validate_for(index, &works[index], self.model_executor.info().vocab_size).is_ok()
                     }));
-            if let (Some(started_at), Some(completed_at)) = (started_at, completed_at) {
-                for input in &selected {
-                    let mut state = input.handle.lock();
-                    if matches!(input.work, TokenWork::Decode { .. }) {
-                        if let Some(sequence) = state.as_mut().filter(|sequence| {
-                            sequence.execution_frontier.as_ref() == Some(&input.frontier)
-                                && sequence.execution_close.is_none()
-                        }) {
-                            sequence.close_decode_scheduling(started_at);
-                            sequence.record_decode_execution(started_at, completed_at);
-                        }
-                    }
-                }
-            }
+            let timing = started_at
+                .zip(completed_at)
+                .map(|(started_at, completed_at)| TokenExecutionTiming {
+                    started_at,
+                    completed_at,
+                });
             let mut deferred = Vec::new();
             match self
-                .consume_token_outcome(&selected, &works, outcome, completed_at, &mut deferred)
+                .consume_token_outcome(&selected, &works, outcome, timing, &mut deferred)
                 .await
             {
                 Ok(()) => {

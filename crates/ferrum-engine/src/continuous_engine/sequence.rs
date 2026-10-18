@@ -5,6 +5,7 @@ mod semantic;
 
 #[derive(Debug)]
 struct SequenceTokenTiming {
+    request_start_boundary: RequestIngressBoundary,
     wall_anchor_unix_nanos: i64,
     wall_anchor_max_error_nanos: u64,
     decode_ready_nanos_since_request_start: Option<u64>,
@@ -14,25 +15,23 @@ struct SequenceTokenTiming {
 }
 
 impl SequenceTokenTiming {
-    fn capture_anchor() -> Result<(Instant, Self)> {
-        let wall_before = system_time_unix_nanos(SystemTime::now())?;
-        let request_start = Instant::now();
-        let wall_after = system_time_unix_nanos(SystemTime::now())?;
-        let lower = wall_before.min(wall_after);
-        let upper = wall_before.max(wall_after);
-        let span = upper.saturating_sub(lower);
-        let midpoint = lower.saturating_add(span / 2);
-        Ok((
-            request_start,
-            Self {
-                wall_anchor_unix_nanos: midpoint,
-                wall_anchor_max_error_nanos: u64::try_from(span).unwrap_or(u64::MAX),
-                decode_ready_nanos_since_request_start: None,
-                token_commit_nanos_since_request_start: Vec::new(),
-                decode_stage_intervals: Vec::new(),
-                pending_decode_scheduling_started_at: None,
-            },
-        ))
+    fn from_ingress(anchor: RequestIngressAnchor) -> Result<Self> {
+        // Wall correlation can fail independently; ordinary requests retain
+        // their monotonic anchor without evaluating this opt-in conversion.
+        let wall = anchor.wall_correlation().map_err(|error| {
+            FerrumError::internal(format!(
+                "request ingress wall correlation unavailable: {error}"
+            ))
+        })?;
+        Ok(Self {
+            request_start_boundary: anchor.boundary(),
+            wall_anchor_unix_nanos: wall.unix_nanos,
+            wall_anchor_max_error_nanos: wall.max_error_nanos,
+            decode_ready_nanos_since_request_start: None,
+            token_commit_nanos_since_request_start: Vec::new(),
+            decode_stage_intervals: Vec::new(),
+            pending_decode_scheduling_started_at: None,
+        })
     }
 
     fn nanos_since_request_start(request_start: Instant, at: Instant) -> Option<u64> {
@@ -109,6 +108,7 @@ impl SequenceTokenTiming {
     fn into_evidence(self, output_tokens: usize) -> Result<EngineTokenTimingEvidence> {
         let evidence = EngineTokenTimingEvidence {
             clock_source: "rust_std_instant".to_string(),
+            request_start_boundary: Some(self.request_start_boundary),
             wall_anchor_unix_nanos: self.wall_anchor_unix_nanos,
             wall_anchor_max_error_nanos: self.wall_anchor_max_error_nanos,
             decode_ready_nanos_since_request_start: self.decode_ready_nanos_since_request_start,
@@ -120,14 +120,6 @@ impl SequenceTokenTiming {
         })?;
         Ok(evidence)
     }
-}
-
-fn system_time_unix_nanos(time: SystemTime) -> Result<i64> {
-    let duration = time.duration_since(UNIX_EPOCH).map_err(|error| {
-        FerrumError::internal(format!("system clock predates Unix epoch: {error}"))
-    })?;
-    i64::try_from(duration.as_nanos())
-        .map_err(|_| FerrumError::internal("system clock Unix nanos exceed i64"))
 }
 
 /// Selects which generated-token domain is visible to logits processors.
@@ -429,13 +421,16 @@ impl SequenceState {
     }
 
     pub fn try_new_with_tokenizer_model_vocab_and_structured_factory(
-        request: InferenceRequest,
+        mut request: InferenceRequest,
         input_tokens: Vec<TokenId>,
         tokenizer: Option<Arc<dyn Tokenizer + Send + Sync>>,
         model_vocab_size: Option<usize>,
         shared_structured_factory: Option<&StructuredOutputFactory>,
         output_session: OutputSession,
     ) -> Result<Self> {
+        // Direct internal/test construction uses the same local fallback;
+        // published product requests already carry their original API anchor.
+        let ingress = request.ensure_ingress(RequestIngressBoundary::EngineApi);
         request.sampling_params.validate()?;
         if request.sampling_params.tfs.is_some()
             || request.sampling_params.typical_p.is_some()
@@ -580,12 +575,12 @@ impl SequenceState {
                 mask.set_tokens_validity(&model_eos_token_ids, false);
             }
         }
-        let (start_time, token_timing) = if request.evidence_request.capture_engine_token_timing {
-            let (start_time, timing) = SequenceTokenTiming::capture_anchor()?;
-            (start_time, Some(timing))
-        } else {
-            (Instant::now(), None)
-        };
+        let start_time = ingress.instant();
+        let token_timing = request
+            .evidence_request
+            .capture_engine_token_timing
+            .then(|| SequenceTokenTiming::from_ingress(ingress))
+            .transpose()?;
         Ok(Self {
             request_id: request.id.clone(),
             original_request: request.clone(),
@@ -663,6 +658,17 @@ impl SequenceState {
         }
         if let Some(timing) = &mut self.token_timing {
             timing.close_decode_scheduling(self.start_time, ended_at);
+        }
+    }
+
+    /// A real capacity yield stops decode eligibility until causal prefill
+    /// finishes again. Preserve the original ingress and first-ready evidence.
+    pub(super) fn pause_decode_scheduling(&mut self, at: Instant, capture_stages: bool) {
+        if capture_stages {
+            self.close_decode_scheduling(at);
+        }
+        if let Some(timing) = &mut self.token_timing {
+            timing.pending_decode_scheduling_started_at = None;
         }
     }
 

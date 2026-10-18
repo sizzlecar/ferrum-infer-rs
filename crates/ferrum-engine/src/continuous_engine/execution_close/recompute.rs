@@ -76,7 +76,8 @@ impl EngineInner {
         let slot = sequence.request_slot.take();
         // No await separates installing the scheduling barrier and transferring
         // the existing slot into the independent close observation task.
-        self.execution_closes.start(
+        let paused_at = Instant::now();
+        let result = self.execution_closes.start(
             request_id,
             frontier.sequence().clone(),
             slot,
@@ -94,7 +95,17 @@ impl EngineInner {
                 failure_marked: false,
             }),
             Arc::clone(&self.work_notify),
-        )
+        );
+        if result.is_ok() {
+            sequence.pause_decode_scheduling(
+                paused_at,
+                self.config
+                    .runtime
+                    .profile_detail
+                    .captures_engine_token_timing(),
+            );
+        }
+        result
     }
 
     /// Product failures remain attached to the original close entry until

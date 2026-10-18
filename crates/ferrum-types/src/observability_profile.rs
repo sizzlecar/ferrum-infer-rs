@@ -587,6 +587,7 @@ mod tests {
     fn engine_token_timing_preserves_exact_commit_intervals() {
         let timing = EngineTokenTimingEvidence {
             clock_source: "rust_std_instant".to_string(),
+            request_start_boundary: None,
             wall_anchor_unix_nanos: 1_700_000_000_000_000_000,
             wall_anchor_max_error_nanos: 400,
             decode_ready_nanos_since_request_start: Some(2_000_000),

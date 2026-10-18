@@ -12,6 +12,8 @@ mod fixture;
 #[path = "managed_driver_tests/metrics.rs"]
 mod metrics;
 
+#[path = "managed_driver_tests/request_clock.rs"]
+mod request_clock;
 #[path = "managed_driver_tests/sequence_isolation.rs"]
 mod sequence_isolation;
 

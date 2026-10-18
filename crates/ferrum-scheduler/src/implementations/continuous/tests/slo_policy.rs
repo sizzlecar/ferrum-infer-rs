@@ -1,5 +1,5 @@
 use super::*;
-use ferrum_types::SchedulerSloConfig;
+use ferrum_types::{RequestIngressAnchor, SchedulerSloConfig};
 
 fn scheduler(static_budget: Option<usize>) -> ContinuousBatchScheduler {
     ContinuousBatchScheduler::new(SchedulerConfig {
@@ -191,48 +191,93 @@ fn slo_decode_overload_keeps_prefill_progress_and_no_progress_does_not_train() {
 
 #[test]
 fn slo_ttft_prioritizes_urgent_prefill_and_rejects_an_infeasible_dynamic_budget() {
-    let scheduler = scheduler(None);
-    activate_decode_requests(&scheduler, 1);
-    train(&scheduler);
-    let short = waiting(&scheduler, 20);
-    let urgent = waiting(&scheduler, 120);
-    scheduler.promote_to_prefill_with_empty_retry(&short, None);
-    scheduler.promote_to_prefill_with_empty_retry(&urgent, None);
-    let now = chrono::Utc::now();
-    for request in scheduler.prefill_queue.write().iter_mut() {
-        // The urgent request has 200 ms left: 120 + 19.75*ceil(120/100)
-        // fits within the 180 ms allowance, while the short request has slack.
-        let age_ms = if request.inner.request.id == short {
-            200
-        } else {
-            800
-        };
-        request.inner.submitted_at = now - chrono::Duration::milliseconds(age_ms);
-    }
-    let batch = scheduler.create_iteration_batch(hint()).unwrap();
-    assert_eq!(batch.requests[1].request.id, urgent);
-    assert_eq!(batch.requests[1].tokens_to_process, Some(100));
-    assert!(!batch
-        .requests
-        .iter()
-        .any(|request| request.request.id == short));
-    assert!(!scheduler.slo_snapshot().unwrap().ttft_budget_infeasible);
-
-    // With only 150 ms left, the same optimistic completion time cannot fit.
-    // Retain the original static budget and report the actual fallback.
-    for request in scheduler.prefill_queue.write().iter_mut() {
-        if request.inner.request.id == urgent {
-            request.inner.submitted_at = chrono::Utc::now() - chrono::Duration::milliseconds(850);
+    for wall_direction in [-1, 1] {
+        let scheduler = scheduler(None);
+        activate_decode_requests(&scheduler, 1);
+        train(&scheduler);
+        let ingress = RequestIngressAnchor::capture(RequestIngressBoundary::SchedulerApi);
+        let short_request =
+            create_test_request_with_prompt_tokens(Priority::Normal, 20).with_ingress(ingress);
+        let urgent_request =
+            create_test_request_with_prompt_tokens(Priority::Normal, 120).with_ingress(ingress);
+        let short = short_request.id.clone();
+        let urgent = urgent_request.id.clone();
+        enqueue_waiting(&scheduler, short_request);
+        enqueue_waiting(&scheduler, urgent_request);
+        scheduler.promote_to_prefill_with_empty_retry(&short, None);
+        scheduler.promote_to_prefill_with_empty_retry(&urgent, None);
+        let now = ingress.instant() + Duration::from_millis(800);
+        for request in scheduler.prefill_queue.write().iter_mut() {
+            // Contradict the monotonic order with wall diagnostics in both
+            // directions. Both requests have 200 ms left; only the long prompt
+            // is urgent, and 120 + 19.75*ceil(120/100) fits the 180 ms allowance.
+            let direction = if request.inner.request.id == short {
+                wall_direction
+            } else {
+                -wall_direction
+            };
+            let wall = chrono::Utc::now() + chrono::Duration::days(direction * 3650);
+            request.inner.submitted_at = wall;
+            request.inner.started_at = Some(wall);
+            request.inner.request.created_at = wall;
         }
+        let batch = scheduler
+            .create_iteration_batch_with_admission_at(hint(), WaitingAdmissionMode::Legacy, now)
+            .unwrap()
+            .unwrap();
+        assert_eq!(batch.requests[1].request.id, urgent);
+        assert_eq!(batch.requests[1].tokens_to_process, Some(100));
+        assert!(!batch
+            .requests
+            .iter()
+            .any(|request| request.request.id == short));
+        assert!(!scheduler.slo_snapshot().unwrap().ttft_budget_infeasible);
+
+        // With only 150 ms left, the same optimistic completion time cannot fit.
+        // Retain the original static budget and report the actual fallback.
+        let fallback = scheduler
+            .create_iteration_batch_with_admission_at(
+                hint(),
+                WaitingAdmissionMode::Legacy,
+                now + Duration::from_millis(50),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(fallback.requests[1].request.id, urgent);
+        assert_eq!(fallback.requests[1].tokens_to_process, Some(120));
+        let snapshot = scheduler.slo_snapshot().unwrap();
+        assert!(snapshot.ttft_budget_infeasible);
+        assert_eq!(snapshot.ttft_fallback_steps, 1);
+        assert_eq!(snapshot.prefill_budget_tokens, None);
+        assert_eq!(snapshot.budget_target_ms, None);
     }
-    let fallback = scheduler.create_iteration_batch(hint()).unwrap();
-    assert_eq!(fallback.requests[1].request.id, urgent);
-    assert_eq!(fallback.requests[1].tokens_to_process, Some(120));
-    let snapshot = scheduler.slo_snapshot().unwrap();
-    assert!(snapshot.ttft_budget_infeasible);
-    assert_eq!(snapshot.ttft_fallback_steps, 1);
-    assert_eq!(snapshot.prefill_budget_tokens, None);
-    assert_eq!(snapshot.budget_target_ms, None);
+}
+
+#[test]
+fn request_clock_recompute_after_output_has_no_ttft_priority() {
+    let scheduler = scheduler(None);
+    train(&scheduler);
+    let ingress = RequestIngressAnchor::capture(RequestIngressBoundary::SchedulerApi);
+    let recompute =
+        create_test_request_with_prompt_tokens(Priority::Normal, 1000).with_ingress(ingress);
+    let recompute_id = recompute.id.clone();
+    scheduler.submit_request(recompute).unwrap();
+    assert!(scheduler.promote_to_prefill_with_empty_retry(&recompute_id, None));
+    scheduler.mark_prefill_complete(&recompute_id, 1000);
+    scheduler.update_decode_progress(&recompute_id, 1);
+    assert!(scheduler.defer_decode_to_waiting_for_capacity(&recompute_id, 1));
+    assert!(scheduler.promote_to_prefill_with_empty_retry(&recompute_id, None));
+
+    let fresh = create_test_request_with_prompt_tokens(Priority::Normal, 120).with_ingress(ingress);
+    let fresh_id = fresh.id.clone();
+    scheduler.submit_request(fresh).unwrap();
+    assert!(scheduler.promote_to_prefill_with_empty_retry(&fresh_id, None));
+    let mut queue = scheduler.prefill_queue.write();
+    assert_eq!(queue.front().unwrap().inner.request.id, recompute_id);
+    assert!(queue.front().unwrap().slo_first_token_emitted);
+    scheduler.prioritize_ttft(&mut queue, ingress.instant() + Duration::from_millis(800));
+    assert_eq!(queue.front().unwrap().inner.request.id, fresh_id);
+    assert_eq!(queue.back().unwrap().inner.request.id, recompute_id);
 }
 
 #[tokio::test]

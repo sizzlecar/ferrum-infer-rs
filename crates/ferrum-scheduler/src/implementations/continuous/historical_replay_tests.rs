@@ -306,6 +306,7 @@ fn request(_role: HistoricalRequestRole, request_id: RequestId) -> InferenceRequ
         client_id: None,
         session_id: None,
         created_at: chrono::Utc::now(),
+        ingress: None,
         api_request: None,
         evidence_request: Default::default(),
         metadata: std::collections::HashMap::new(),

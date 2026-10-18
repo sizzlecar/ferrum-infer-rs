@@ -110,7 +110,9 @@ pub(super) async fn open_chat_events(
         .and_then(serde_json::Value::as_bool);
     let replay_request_id = inference_request.id.to_string();
     let profile_request_model = openai_request.model.clone();
-    let profile_started_at = Instant::now();
+    let profile_started_at = inference_request.ingress.ok_or_else(|| {
+        ServerError::InternalError("HTTP request is missing its handler ingress clock".into())
+    })?;
     let request_memory_before = request_memory_sample_before(&state);
     let mut stream = match engine.infer_stream(inference_request).await {
         Ok(stream) => stream,

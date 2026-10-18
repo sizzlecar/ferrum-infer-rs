@@ -18,7 +18,7 @@ impl EngineInner {
         &self,
         inputs: &[&TokenBatchInput],
         completions: Vec<ExecutionCompletion>,
-        postprocess_started_at: Option<Instant>,
+        timing: Option<TokenExecutionTiming>,
     ) -> TokenBatchEffects {
         let mut effects = TokenBatchEffects {
             ready: Vec::new(),
@@ -100,6 +100,12 @@ impl EngineInner {
                     ));
                     continue;
                 };
+                if matches!(executed, ExecutedTokenWork::Decode { .. }) {
+                    if let Some(timing) = timing {
+                        sequence.close_decode_scheduling(timing.started_at);
+                        sequence.record_decode_execution(timing.started_at, timing.completed_at);
+                    }
+                }
                 let sampled = (|| -> Result<Option<TokenId>> {
                     if let Some(error) = sequence.output_accounting_error() {
                         return Err(error.clone());
@@ -136,7 +142,7 @@ impl EngineInner {
                         }
                         ExecutedTokenWork::Decode { .. } => {
                             sequence.record_generated_token_commit_with_decode_postprocess(
-                                postprocess_started_at,
+                                timing.map(|timing| timing.completed_at),
                             );
                         }
                     }

@@ -35,11 +35,12 @@ use ferrum_types::{
     FinishReason, InferenceExecutionEvidence, InferenceRequest, InferenceResponse, ModelId,
     ModelOutputProtocol, ParsedReasoningResponse, Priority, ProcessMemoryObservation,
     ProcessMemorySample, ProcessMemorySampler, ProfileEntrypoint, ProfileError, ProfileEventKind,
-    ProfileStatus, ReplayReference, RequestId, ResolvedFerrumConfig, ResourceAction,
-    ResourceTraceEvent, ResponseCompletionBoundary, RuntimeConfigSnapshot, SamplingParams,
-    StructuredOutputStart, TokenId, TokenUsage, DEFAULT_CHAT_REPETITION_PENALTY,
-    DEFAULT_MAX_TOKENS_METADATA_KEY, OBSERVABILITY_PROFILE_SCHEMA_VERSION,
-    PROMPT_OPENED_REASONING_METADATA_KEY, THINK_END_TAG, THINK_START_TAG,
+    ProfileStatus, ReplayReference, RequestId, RequestIngressAnchor, RequestIngressBoundary,
+    ResolvedFerrumConfig, ResourceAction, ResourceTraceEvent, ResponseCompletionBoundary,
+    RuntimeConfigSnapshot, SamplingParams, StructuredOutputStart, TokenId, TokenUsage,
+    DEFAULT_CHAT_REPETITION_PENALTY, DEFAULT_MAX_TOKENS_METADATA_KEY,
+    OBSERVABILITY_PROFILE_SCHEMA_VERSION, PROMPT_OPENED_REASONING_METADATA_KEY, THINK_END_TAG,
+    THINK_START_TAG,
 };
 use sha2::{Digest, Sha256};
 use std::{
@@ -51,7 +52,6 @@ use std::{
         atomic::{AtomicBool, Ordering},
         Arc, Mutex, OnceLock,
     },
-    time::Instant,
 };
 use tokio::sync::Notify;
 use tokio_stream::StreamExt;
@@ -435,6 +435,9 @@ pub struct AppState {
     pub first_request_memory_recorded: Arc<AtomicBool>,
     profile_delivery: Option<Arc<HttpProfileDelivery>>,
     cache: Arc<CacheRuntimeState>,
+    #[cfg(test)]
+    request_construction_observer:
+        Option<Arc<dyn Fn(RequestIngressAnchor, &'static str) + Send + Sync>>,
 }
 
 impl AppState {
@@ -1257,7 +1260,8 @@ async fn chat_completions_handler(
     headers: HeaderMap,
     request: std::result::Result<Json<ChatCompletionsRequest>, JsonRejection>,
 ) -> std::result::Result<Response, ServerError> {
-    chat_completions_handler_with_phases(State(state), headers, request, None).await
+    let ingress = RequestIngressAnchor::capture(RequestIngressBoundary::HttpHandler);
+    chat_completions_handler_with_phases(State(state), headers, request, None, ingress).await
 }
 
 async fn chat_completions_handler_with_phases(
@@ -1265,9 +1269,17 @@ async fn chat_completions_handler_with_phases(
     headers: HeaderMap,
     request: std::result::Result<Json<ChatCompletionsRequest>, JsonRejection>,
     message_phases: Option<Vec<Option<AssistantMessagePhase>>>,
+    ingress: RequestIngressAnchor,
 ) -> std::result::Result<Response, ServerError> {
-    chat_completions_handler_with_projection(State(state), headers, request, message_phases, None)
-        .await
+    chat_completions_handler_with_projection(
+        State(state),
+        headers,
+        request,
+        message_phases,
+        None,
+        ingress,
+    )
+    .await
 }
 
 async fn chat_completions_handler_with_projection(
@@ -1276,7 +1288,12 @@ async fn chat_completions_handler_with_projection(
     request: std::result::Result<Json<ChatCompletionsRequest>, JsonRejection>,
     mut message_phases: Option<Vec<Option<AssistantMessagePhase>>>,
     response_context: Option<responses::ResponseContext>,
+    ingress: RequestIngressAnchor,
 ) -> std::result::Result<Response, ServerError> {
+    #[cfg(test)]
+    if let Some(observer) = &state.request_construction_observer {
+        observer(ingress, "chat_session_and_prompt");
+    }
     let Json(mut request) = request.map_err(|error| {
         ServerError::invalid_request(
             format!(
@@ -1338,6 +1355,7 @@ async fn chat_completions_handler_with_projection(
         message_phases.as_deref(),
     )
     .map_err(server_error_from_ferrum_error)?;
+    inference_request.ingress = Some(ingress);
     apply_served_model_resolution(&mut inference_request, engine_model_id, lora_adapter);
     if state.request_dump_dir.is_some() {
         inference_request.evidence_request.capture_prompt_token_ids = true;
@@ -1650,7 +1668,7 @@ fn write_chat_request_profile_event(
     model: &str,
     stream: bool,
     phase: &str,
-    started_at: Instant,
+    started_at: RequestIngressAnchor,
     timing: ChatRequestProfileTiming<'_>,
     output_token_count: usize,
     usage: Option<&TokenUsage>,
@@ -1680,6 +1698,16 @@ fn write_chat_request_profile_event(
         (
             "e2e_duration_us".to_string(),
             serde_json::json!(duration_us),
+        ),
+        (
+            "request_start_boundary".to_string(),
+            serde_json::json!(started_at.boundary().as_str()),
+        ),
+        (
+            "request_start_excludes".to_string(),
+            serde_json::json!(
+                "body reception, JSON extraction, network transport and client-visible latency"
+            ),
         ),
         ("l0_only".to_string(), serde_json::json!(false)),
         (
@@ -1839,7 +1867,7 @@ fn maybe_write_first_request_memory_stage(
     benchmark_correlation: Option<&BenchmarkRequestCorrelation>,
     model: &str,
     stream: bool,
-    started_at: Instant,
+    started_at: RequestIngressAnchor,
     before: Option<ProcessMemorySample>,
 ) -> std::result::Result<(), String> {
     if state.profile_jsonl.is_none() && state.memory_profile_jsonl.is_none() {
@@ -1869,6 +1897,14 @@ fn maybe_write_first_request_memory_stage(
         (
             "memory_stage".to_string(),
             serde_json::json!("first_request_done"),
+        ),
+        (
+            "request_start_boundary".to_string(),
+            serde_json::json!(started_at.boundary().as_str()),
+        ),
+        (
+            "memory_before_boundary".to_string(),
+            serde_json::json!("before_engine_call_after_request_preparation"),
         ),
         (
             "profile_detail".to_string(),
@@ -1960,8 +1996,9 @@ fn append_profile_event(
         .map_err(|error| error.to_string())
 }
 
-fn elapsed_us_since(started_at: Instant) -> u64 {
+fn elapsed_us_since(started_at: RequestIngressAnchor) -> u64 {
     started_at
+        .instant()
         .elapsed()
         .as_micros()
         .max(1)
@@ -2569,7 +2606,9 @@ async fn handle_chat_completions_sync(
         .and_then(serde_json::Value::as_bool);
     let replay_request_id = inference_request.id.to_string();
     let profile_request_model = openai_request.model.clone();
-    let profile_started_at = Instant::now();
+    let profile_started_at = inference_request.ingress.ok_or_else(|| {
+        ServerError::InternalError("HTTP request is missing its handler ingress clock".into())
+    })?;
     let request_memory_before = request_memory_sample_before(&state);
     match engine.infer(inference_request).await {
         Ok(output) => {
@@ -3228,6 +3267,7 @@ fn convert_chat_request_with_template_model_and_default(
         client_id: None,
         session_id: None,
         created_at: chrono::Utc::now(),
+        ingress: None,
         api_request: Some(ferrum_types::ApiRequest::Chat(api_chat)),
         evidence_request: Default::default(),
         metadata,
@@ -4447,6 +4487,7 @@ fn convert_completion_request(request: &CompletionsRequest) -> InferenceRequest 
         client_id: None,
         session_id: None,
         created_at: chrono::Utc::now(),
+        ingress: None,
         api_request: Some(ferrum_types::ApiRequest::Completion(
             ferrum_types::ApiCompletionRequest {
                 prompt: prompt.to_string(),
@@ -4662,6 +4703,11 @@ async fn completions_handler(
     State(state): State<AppState>,
     request: std::result::Result<Json<CompletionsRequest>, JsonRejection>,
 ) -> std::result::Result<Response, ServerError> {
+    let ingress = RequestIngressAnchor::capture(RequestIngressBoundary::HttpHandler);
+    #[cfg(test)]
+    if let Some(observer) = &state.request_construction_observer {
+        observer(ingress, "completion_prompt");
+    }
     let Json(request) = request.map_err(|e| {
         ServerError::invalid_request(format!("invalid completions request: {e}"), None)
     })?;
@@ -4669,6 +4715,7 @@ async fn completions_handler(
     let (engine_model_id, lora_adapter) =
         resolve_request_model(&state, &request.model, ServedModelKind::Llm)?;
     let mut inference_request = convert_completion_request(&request);
+    inference_request.ingress = Some(ingress);
     apply_served_model_resolution(&mut inference_request, engine_model_id, lora_adapter);
     if request.stream.unwrap_or(false) {
         handle_completions_stream(state, request, inference_request).await
@@ -5081,6 +5128,7 @@ mod tests {
     mod native_tool_stream;
     mod profile_delivery_tests;
     mod reasoning_controls;
+    mod request_clock_tests;
     mod retired_routes;
     mod semantic_output;
     mod tool_argument_strictness;
@@ -5653,6 +5701,7 @@ mod tests {
             engine_token_timing: requested.capture_engine_token_timing.then(|| {
                 EngineTokenTimingEvidence {
                     clock_source: "rust_std_instant".to_string(),
+                    request_start_boundary: request.ingress.map(|anchor| anchor.boundary()),
                     wall_anchor_unix_nanos: 1_700_000_000_000_000_000,
                     wall_anchor_max_error_nanos: 500,
                     decode_ready_nanos_since_request_start: Some(1_000_000),

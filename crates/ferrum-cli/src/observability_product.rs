@@ -2676,6 +2676,7 @@ mod tests {
                     ],
                     engine_token_timing: Some(ferrum_types::EngineTokenTimingEvidence {
                         clock_source: "rust_std_instant".to_string(),
+                        request_start_boundary: None,
                         wall_anchor_unix_nanos: 1_700_000_000_000_000_000,
                         wall_anchor_max_error_nanos: 500,
                         decode_ready_nanos_since_request_start: Some(1_000_000),

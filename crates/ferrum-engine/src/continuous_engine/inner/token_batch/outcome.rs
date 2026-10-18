@@ -27,7 +27,7 @@ impl EngineInner {
         inputs: &[&TokenBatchInput],
         works: &[ExecutionWork<'_>],
         outcome: ExecutionBatchOutcome,
-        completed_at: Option<Instant>,
+        timing: Option<TokenExecutionTiming>,
         deferred: &mut Vec<TokenDeferredGroup>,
     ) -> Result<()> {
         let vocabulary_size = self.model_executor.info().vocab_size;
@@ -55,11 +55,8 @@ impl EngineInner {
                         (batch.into_completions(), Vec::new(), Vec::new()),
                     )
                 } else {
-                    let effects = self.commit_token_completions(
-                        inputs,
-                        batch.into_completions(),
-                        completed_at,
-                    );
+                    let effects =
+                        self.commit_token_completions(inputs, batch.into_completions(), timing);
                     return self.publish_token_effects(inputs, effects).await;
                 }
             }
@@ -162,6 +159,7 @@ impl EngineInner {
         let mut closures = (0..inputs.len())
             .map(|_| None)
             .collect::<Vec<Option<ExecutionCloseOutcome>>>();
+        let mut executed_failures = Vec::new();
         for participant in remaining {
             let (index, sequence, progress, continuation, cause_index) = participant.into_parts();
             let actual_index = cohort_index(inputs, &sequence);
@@ -193,6 +191,13 @@ impl EngineInner {
                     }
                     continue;
                 }
+            }
+            if validated_interruption
+                && matching
+                && claims[index] == 1
+                && !matches!(progress, ExecutionProgress::NotSubmitted { .. })
+            {
+                executed_failures.push(index);
             }
             let cause = causes
                 .get(cause_index)
@@ -230,7 +235,27 @@ impl EngineInner {
         // Save every healthy model result before any close/output await. Close
         // observations for failed peers move into engine-owned sequence state,
         // so cancelling the caller cannot drop the rest of this batch's Helds.
-        let mut effects = self.commit_token_completions(inputs, accepted, completed_at);
+        let mut effects = self.commit_token_completions(inputs, accepted, timing);
+        // The real healthy frontiers are already saved. Only independently
+        // validated submitted/terminal participants consume scheduling time;
+        // NotSubmitted retries preserve the still-open interval.
+        if let Some(timing) = timing {
+            for index in executed_failures {
+                let input = inputs[index];
+                if !matches!(input.work, TokenWork::Decode { .. }) {
+                    continue;
+                }
+                let mut state = input.handle.lock();
+                if let Some(sequence) = state.as_mut().filter(|sequence| {
+                    self.sequences.is_current(&input.handle)
+                        && sequence.execution_frontier.as_ref() == Some(&input.frontier)
+                        && sequence.execution_close.is_none()
+                }) {
+                    sequence.close_decode_scheduling(timing.started_at);
+                    sequence.record_decode_execution(timing.started_at, timing.completed_at);
+                }
+            }
+        }
         for (index, input) in inputs.iter().enumerate() {
             if !succeeded[index] && !deferred_indices[index] {
                 effects.failed.push((

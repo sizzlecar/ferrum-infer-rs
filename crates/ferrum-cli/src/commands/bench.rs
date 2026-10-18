@@ -423,6 +423,7 @@ fn make_request(model_id: &str, prompt: &str, max_tokens: u32) -> InferenceReque
         client_id: None,
         session_id: None,
         created_at: Utc::now(),
+        ingress: None,
         api_request: None,
         evidence_request: Default::default(),
         metadata: HashMap::new(),

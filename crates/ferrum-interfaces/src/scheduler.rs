@@ -5,14 +5,21 @@
 
 use async_trait::async_trait;
 use ferrum_types::{
-    BatchId, InferenceRequest, InferenceResponse, Priority, RequestId, RequestState, Result,
-    SchedulerConfig as TypesSchedulerConfig, SchedulerStats,
+    BatchId, InferenceRequest, InferenceResponse, Priority, RequestId, RequestIngressAnchor,
+    RequestIngressBoundary, RequestState, Result, SchedulerConfig as TypesSchedulerConfig,
+    SchedulerStats,
 };
 use serde::{Deserialize, Serialize};
-use std::{collections::HashMap, time::Duration};
+use std::{
+    collections::HashMap,
+    time::{Duration, Instant},
+};
 
 mod prefix_restore;
 pub use prefix_restore::PreparedPrefixRestore;
+
+#[cfg(test)]
+mod request_clock_tests;
 
 /// Main scheduler trait for request management and batching
 #[async_trait]
@@ -202,15 +209,21 @@ pub struct ScheduledRequest {
     pub tokens_to_process: Option<usize>,
     /// Allocated resources
     pub allocated_resources: AllocatedResources,
-    /// Request submission time
+    /// Wall time for event correlation only; not used to compute durations.
     pub submitted_at: chrono::DateTime<chrono::Utc>,
-    /// Request start time (when moved from waiting to running)
+    /// Wall time when moved from waiting to running, for event correlation.
     pub started_at: Option<chrono::DateTime<chrono::Utc>>,
+    ingress: RequestIngressAnchor,
+    submitted_offset: Duration,
+    queue_enter_offset: Duration,
+    started_offset: Option<Duration>,
 }
 
 impl ScheduledRequest {
     /// Create new scheduled request
-    pub fn new(request: InferenceRequest) -> Self {
+    pub fn new(mut request: InferenceRequest) -> Self {
+        let ingress = request.ensure_ingress(RequestIngressBoundary::SchedulerApi);
+        let submitted_offset = ingress.elapsed();
         Self {
             request,
             state: RequestState::Waiting,
@@ -221,20 +234,69 @@ impl ScheduledRequest {
             allocated_resources: AllocatedResources::default(),
             submitted_at: chrono::Utc::now(),
             started_at: None,
+            ingress,
+            submitted_offset,
+            queue_enter_offset: submitted_offset,
+            started_offset: None,
         }
     }
 
-    /// Get request age since submission
-    pub fn age(&self) -> Duration {
-        (chrono::Utc::now() - self.submitted_at)
-            .to_std()
-            .unwrap_or_default()
+    /// Original local ingress, retained across all scheduling epochs.
+    pub fn ingress(&self) -> RequestIngressAnchor {
+        self.ingress
     }
 
-    /// Get processing time (if started)
+    /// First scheduler construction, relative to the original ingress.
+    pub fn submitted_offset(&self) -> Duration {
+        self.submitted_offset
+    }
+
+    /// Request age since original ingress, including preparation before enqueue.
+    pub fn age(&self) -> Duration {
+        self.age_at(Instant::now())
+    }
+
+    pub fn age_at(&self, now: Instant) -> Duration {
+        self.ingress.elapsed_at(now)
+    }
+
+    /// Enter a new waiting segment after successful enqueue. Does not reset
+    /// original ingress or submission; construction can remain outside locks.
+    pub fn mark_queued_at(&mut self, now: Instant) {
+        self.queue_enter_offset = self.ingress.elapsed_at(now);
+        self.started_offset = None;
+        self.started_at = None;
+    }
+
+    /// Re-enter waiting after active work yields capacity.
+    pub fn requeue_at(&mut self, now: Instant) {
+        self.mark_queued_at(now);
+    }
+
+    /// Current waiting segment, frozen at promotion into active work.
+    pub fn queue_wait_at(&self, now: Instant) -> Duration {
+        self.started_offset
+            .unwrap_or_else(|| self.ingress.elapsed_at(now))
+            .saturating_sub(self.queue_enter_offset)
+    }
+
+    /// Begin the active epoch and return only this segment's queue wait.
+    pub fn mark_started_at(&mut self, now: Instant) -> Duration {
+        let waited = self.queue_wait_at(now);
+        self.started_offset = Some(self.ingress.elapsed_at(now));
+        self.started_at = Some(chrono::Utc::now());
+        waited
+    }
+
+    /// Elapsed time in the current active epoch, including active holds.
+    /// Requeue ends that epoch; this is not device execution time.
     pub fn processing_time(&self) -> Option<Duration> {
-        self.started_at
-            .map(|start| (chrono::Utc::now() - start).to_std().unwrap_or_default())
+        self.processing_time_at(Instant::now())
+    }
+
+    pub fn processing_time_at(&self, now: Instant) -> Option<Duration> {
+        self.started_offset
+            .map(|start| self.ingress.elapsed_at(now).saturating_sub(start))
     }
 }
 
