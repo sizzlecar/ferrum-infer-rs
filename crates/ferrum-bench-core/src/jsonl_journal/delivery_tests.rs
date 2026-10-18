@@ -775,3 +775,149 @@ fn journal_measurement_panic_does_not_poison_or_authorize_the_record() {
     drop(journal);
     let _ = std::fs::remove_file(path);
 }
+
+#[test]
+fn journal_reopen_waits_for_real_close_join_before_starting_another_epoch() {
+    for poison_producer in [false, true] {
+        let path = path("reopen-closing");
+        let config = JsonlJournalConfig {
+            queue_capacity: 1,
+            ..Default::default()
+        };
+        let journal = JsonlJournal::<serde_json::Value>::open(
+            path.clone(),
+            JsonlJournalOpenMode::Truncate,
+            config,
+        )
+        .unwrap();
+        let sentinel = serde_json::json!({"original_epoch": true});
+        journal.try_enqueue(sentinel.clone()).unwrap();
+        journal.flush().unwrap();
+        let original_file = std::fs::read(&path).unwrap();
+        let blocking = JsonlJournal::append(path.clone()).unwrap();
+        assert!(Arc::ptr_eq(&journal.inner, &blocking.inner));
+        let gate = Arc::new(BlockingGate::default());
+        let release = ReleaseGate(gate.clone());
+        blocking.enqueue(gated(&gate, false)).unwrap();
+        gate.wait();
+        journal
+            .try_enqueue(serde_json::json!({"ordinal": 1}))
+            .unwrap();
+        if poison_producer {
+            let crashing = JsonlJournal::<PanickingDropEvent>::append(path.clone()).unwrap();
+            // A full queue drops the rejected payload under the actual gate.
+            assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                crashing.try_enqueue(PanickingDropEvent)
+            }))
+            .is_err());
+            assert!(journal.inner.send_gate.is_poisoned());
+        }
+        let closing = journal.clone();
+        let (tx, rx) = sync_channel(1);
+        let close = thread::spawn(move || {
+            tx.send(closing.close()).unwrap();
+        });
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !journal.inner.closed.load(Ordering::Acquire) {
+            assert!(
+                Instant::now() < deadline,
+                "close never acquired its original gate"
+            );
+            thread::yield_now();
+        }
+        for mode in [JsonlJournalOpenMode::Append, JsonlJournalOpenMode::Truncate] {
+            let reopen_path = path.clone();
+            let error = nonblocking(move || {
+                JsonlJournal::<serde_json::Value>::open(reopen_path, mode, config)
+                    .err()
+                    .expect("an unjoined writer must not be replaced")
+            });
+            let error = error
+                .get_ref()
+                .and_then(|source| source.downcast_ref::<JsonlJournalError>())
+                .expect("closing rejection must preserve its typed source");
+            assert_eq!(
+                error.kind(),
+                if poison_producer {
+                    JsonlJournalErrorKind::Panic
+                } else {
+                    JsonlJournalErrorKind::Closed
+                }
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), original_file);
+            let registered = lock_journal_registry(JSONL_JOURNAL_REGISTRY.get().unwrap())
+                .unwrap()
+                .get(journal.path())
+                .and_then(Weak::upgrade)
+                .unwrap();
+            assert!(Arc::ptr_eq(&registered, &journal.inner));
+            assert!(journal.inner.worker.lock().unwrap().is_some());
+            assert!(!journal.delivery_stats().worker_finished);
+            assert!(rx.try_recv().is_err());
+        }
+        drop(release);
+        let result = rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        close.join().unwrap();
+        if poison_producer {
+            assert_eq!(result.unwrap_err().kind(), JsonlJournalErrorKind::Panic);
+            assert!(journal.inner.send_gate.is_poisoned());
+        } else {
+            result.unwrap();
+        }
+        assert!(journal.inner.worker.lock().unwrap().is_none());
+        assert!(journal.delivery_stats().worker_finished);
+        assert_eq!(journal.delivery_stats().pending_payload_bytes, 0);
+        let rows: Vec<serde_json::Value> = std::fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(
+            rows,
+            vec![
+                sentinel,
+                serde_json::json!({"text": "x".repeat(160)}),
+                serde_json::json!({"ordinal": 1}),
+            ]
+        );
+        if poison_producer {
+            let error = JsonlJournal::<serde_json::Value>::append(path.clone())
+                .err()
+                .expect("Append must retain the failed artifact's original cause");
+            let error = error
+                .get_ref()
+                .and_then(|source| source.downcast_ref::<JsonlJournalError>())
+                .unwrap();
+            assert_eq!(error, &journal.inner.failure.current().unwrap());
+            assert_eq!(std::fs::read_to_string(&path).unwrap().lines().count(), 3);
+        } else {
+            let appended = JsonlJournal::<serde_json::Value>::append(path.clone()).unwrap();
+            assert!(!Arc::ptr_eq(&appended.inner, &journal.inner));
+            appended
+                .try_enqueue(serde_json::json!({"next_append": true}))
+                .unwrap();
+            appended.close().unwrap();
+            assert_eq!(std::fs::read_to_string(&path).unwrap().lines().count(), 4);
+        }
+        let next = JsonlJournal::<serde_json::Value>::open(
+            path.clone(),
+            JsonlJournalOpenMode::Truncate,
+            config,
+        )
+        .unwrap();
+        assert!(!Arc::ptr_eq(&next.inner, &journal.inner));
+        assert!(std::fs::read(&path).unwrap().is_empty());
+        next.try_enqueue(serde_json::json!({"new_epoch": true}))
+            .unwrap();
+        next.close().unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "{\"new_epoch\":true}\n"
+        );
+        assert_eq!(journal.inner.send_gate.is_poisoned(), poison_producer);
+        drop(next);
+        drop(blocking);
+        drop(journal);
+        let _ = std::fs::remove_file(path);
+    }
+}

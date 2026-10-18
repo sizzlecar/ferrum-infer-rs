@@ -250,6 +250,47 @@ impl JsonlJournalInner {
         })
     }
 
+    fn ensure_close_completed(&self) -> Result<(), JsonlJournalError> {
+        let closing = || {
+            self.failure
+                .contract_error
+                .get()
+                .cloned()
+                .unwrap_or_else(|| {
+                    JsonlJournalError::with_kind(
+                        JsonlJournalErrorKind::Closed,
+                        format!("JSONL journal {} is still closing", self.path.display()),
+                    )
+                })
+        };
+        // close_and_join owns this gate from closed=true through the actual
+        // JoinHandle::join. Do not wait while holding the global path registry.
+        let _send_guard = match self.send_gate.try_lock() {
+            Ok(guard) => guard,
+            Err(std::sync::TryLockError::WouldBlock) => return Err(closing()),
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+                self.record_poison("publication gate");
+                // Only observe the original teardown; never clear poison or
+                // authorize another publication on the old writer.
+                poisoned.into_inner()
+            }
+        };
+        let worker = match self.worker.try_lock() {
+            Ok(worker) => worker,
+            Err(std::sync::TryLockError::WouldBlock) => return Err(closing()),
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+                self.record_poison("worker handle");
+                poisoned.into_inner()
+            }
+        };
+        if worker.is_some() {
+            return Err(closing());
+        }
+        // None alone is insufficient: close takes the handle before joining.
+        // Holding the same gate proves that close has also left its join scope.
+        Ok(())
+    }
+
     fn close_and_join(&self) -> Result<(), JsonlJournalError> {
         // Serialize close with all producers so every accepted command is
         // ordered before Close and every later producer is rejected.
@@ -371,6 +412,13 @@ fn open_shared_inner(
         lock_journal_registry(JSONL_JOURNAL_REGISTRY.get_or_init(|| Mutex::new(HashMap::new())))?;
     if let Some(existing) = registry.get(&path).and_then(Weak::upgrade) {
         let closed = existing.closed.load(Ordering::Acquire);
+        if closed {
+            // A close barrier starts rejection of producers, but does not yet
+            // permit a second writer or truncation of the still-owned file.
+            existing
+                .ensure_close_completed()
+                .map_err(io::Error::other)?;
+        }
         if !closed && explicit_config.is_some_and(|requested| requested != existing.config) {
             // A transport failure on the existing owner cannot turn a caller's
             // contradictory explicit configuration into optional telemetry.
