@@ -343,6 +343,7 @@ impl Fixture {
             timing: CudaFenceTiming::NotRequested,
             command_timing: CudaFenceCommandTiming::NotRequested,
             attribution: None,
+            execution_facts: None,
             stream_state: Arc::clone(&pending.stream.state),
             terminal_accounted: AtomicBool::new(false),
             _stream: Arc::clone(&pending.stream.stream),

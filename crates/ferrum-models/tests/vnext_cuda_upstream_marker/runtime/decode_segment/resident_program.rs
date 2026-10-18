@@ -316,7 +316,7 @@ fn execute_observed(
         diagnostic.prepare_and_submit_ns = prepare_started.unwrap().elapsed().as_nanos();
     }
     let (handle, observation) = profiled.into_parts();
-    let (_, attribution) = observation.into_parts();
+    let (_, attribution, _) = observation.into_parts();
     let bootstrap_step = match &retire {
         Retire::Bootstrap(step) => Some(Arc::downgrade(step)),
         _ => None,

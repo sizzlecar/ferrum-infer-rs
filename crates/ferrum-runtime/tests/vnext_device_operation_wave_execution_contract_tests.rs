@@ -175,7 +175,7 @@ fn kernel_profile_binds_native_work_to_exact_plan_nodes() {
     )
     .unwrap();
     let (handle, observation) = profiled.into_parts();
-    let (_, attribution) = observation.into_parts();
+    let (_, attribution, _) = observation.into_parts();
     let attribution = attribution.expect("kernel profile must return bound native work");
     assert_eq!(
         attribution.submission_fingerprint(),

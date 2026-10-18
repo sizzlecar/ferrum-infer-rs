@@ -2,7 +2,7 @@
 
 **状态：目标已激活，R0 已合并，R1 验收、R2 实施中。** 工作分支：`refactor/execution-architecture-20261018`，从 2026-10-18 的干净 `main`（`c2be4c67`）开始。首个 checkpoint 退役独立 embedding/ASR/TTS 链路；原工作区未合并的旧 SLO 实现不作为代码基底。
 
-R0 六批清理与正确性修复已合并（PR #429–#434）。R1 已分离 runtime 与产品执行契约，统一 token 提交并退出旧 Tensor 控制流，泛型驱动归入 execution。R2 已统一驱动与关闭生命周期，输出额度跟随实际持有者，采样、解码与完成投影移出全局序列锁；观测区分传输降级和契约失败，产品装配持有唯一日志关闭权。入口单调时间已贯通 HTTP、Engine 和 Scheduler，排队分段保留原请求年龄；当前 token 工作量与真实终态沿原提交所有者交付，真实 CPU 回归覆盖观测失败、取消和资源收口。设备叶子算子的实际几何/路线与旧全局 profiler 隔离仍待实施。R1 仍在验收，R2–R5 未完成；原始证据在仓库外交接目录，没有新增性能或 SLO 达标声明。
+R0 六批清理与正确性修复已合并（PR #429–#434）。R1 已分离 runtime 与产品执行契约，统一 token 提交并退出旧 Tensor 控制流，泛型驱动归入 execution。R2 已统一驱动、关闭与输出生命周期，采样和文本投影移出全局序列锁；观测故障分类、唯一日志关闭权与入口单调时间已接通。当前工作量与真实终态沿原提交所有者交付；CUDA Q6 的实际投影形状、数值路线与当前请求行绑定通过真实后端回归，未覆盖的计算命令明确标记。旧全局 profiler 隔离仍待完成。R1 验收、R2–R5 仍开放；原始证据留在仓库外，没有新增性能或 SLO 达标声明。
 
 ## 1. 目标与第一原则
 
@@ -96,7 +96,7 @@ R2 观测 API：`ExecutionEventSinkError` 区分 `Contract` 与 `Transport`；`d
 
 `JsonlJournal<T>` 只负责投递；`JsonlProducerScope` 结束组件投递，`JsonlJournalOwner` 在所有范围结束后关闭原 writer。库共享文件须显式注入独立 scope，工具独用 `OwnedJsonlJournal<T>`。flush/final receipt 分别保留固定前缀和真实 join 事实，调用方检查 `receipt.result()`；返回 receipt 不代表证据完整。
 
-执行事实由独立的 `ExecutionFactsCapture` 开关控制，不改变计时模式、程序身份或缓存资格。`ProfiledSubmissionHandle::into_parts()` 返回完成句柄与 `SubmissionObservation`；提交后错误也保留同一附件。`TerminalExecutionFacts` 借用原终态和当前波次的有序 token 范围，不授予重试或资源释放权。产品详细观测经原有界日志队列交付；缺少设备叶子事实明确记为 `Unavailable(NotCaptured)`，不能用逻辑节点或 packed token 行数冒充实际 kernel 几何。
+执行事实由独立的 `ExecutionFactsCapture` 开关控制，不改变计时模式、程序身份或缓存资格。`ProfiledSubmissionHandle::into_parts()` 返回完成句柄与 `SubmissionObservation`；后者持有当前工作量、可选计时归因和设备事实，提交后错误保留有效附件。`TerminalExecutionFacts` 只借用原终态，不授予重试或释放权。CUDA Q6 执行与观测共用实际选择，原图保存无请求身份的投影模板，重放时绑定当前 token 范围；Off 捕获的图不回填模板，明确记为 `CachedTemplateUnavailable`。设备事实仅声明计算命令覆盖，不代表传输、初始化或每个 kernel 成功；缺失与未支持分别标记。产品投影经原有界日志队列交付，不用逻辑节点或 packed token 行数冒充物理矩阵。
 
 产品装配层组合模型准备结果、具体设备 runtime 与泛型驱动。迁移 `VNextModelExecutor<R>` 时同时解开其对 `PreparedProductionModel` 的依赖，将中立准备输入与编译结果归到正确层，并保留 source/registry/初始化身份校验；不能整文件搬迁后让 execution 再引用 models。泛型驱动本身已后端中立，不能将这项整理描述成新消除的具体 GPU 绑定。量化格式描述/解析与设备执行也按此分层，不能经 quantization 引回 kernels 依赖环。
 

@@ -1,7 +1,7 @@
 use super::*;
 use runtime::{Fixture, Path};
 
-fn tokens(rows: usize, count: usize) -> Vec<Arc<[u32]>> {
+pub(super) fn tokens(rows: usize, count: usize) -> Vec<Arc<[u32]>> {
     (0..rows)
         .map(|p| {
             (0..count)
@@ -11,14 +11,18 @@ fn tokens(rows: usize, count: usize) -> Vec<Arc<[u32]>> {
         })
         .collect()
 }
-fn sessions(f: &Fixture, name: &str, tokens: &[Arc<[u32]>]) -> Vec<Arc<SequenceSession<Runtime>>> {
+pub(super) fn sessions(
+    f: &Fixture,
+    name: &str,
+    tokens: &[Arc<[u32]>],
+) -> Vec<Arc<SequenceSession<Runtime>>> {
     tokens
         .iter()
         .enumerate()
         .map(|(p, t)| f.admit(&format!("{name}.{p}"), t.clone()))
         .collect()
 }
-fn oracle(f: &Fixture, output: &[Vec<u8>], tokens: &[Arc<[u32]>], last: usize) {
+pub(super) fn oracle(f: &Fixture, output: &[Vec<u8>], tokens: &[Arc<[u32]>], last: usize) {
     assert_eq!(output.len(), tokens.len());
     for (p, (bytes, t)) in output.iter().zip(tokens).enumerate() {
         assert_eq!(bytes.len(), OUTPUTS as usize * 4);

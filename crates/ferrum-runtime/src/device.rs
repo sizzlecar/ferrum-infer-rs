@@ -3507,6 +3507,10 @@ impl<C> DeviceCommandBatch<C> {
         self.commands.is_empty()
     }
 
+    pub(crate) fn entries(&self) -> &[DeviceCommandEntry<C>] {
+        &self.commands
+    }
+
     pub const fn timing_mode(&self) -> DeviceTimingMode {
         self.timing_mode
     }
@@ -3994,6 +3998,17 @@ pub trait DeviceRuntime: Send + Sync + 'static {
     /// resource-release authority.
     fn submission_attribution(&self, _fence: &Self::Fence) -> Option<DeviceSubmissionAttribution> {
         None
+    }
+
+    /// Facts attached to this exact submitted fence. Core calls this only for
+    /// an enabled capture and arms the fence even if inspection fails or panics.
+    /// Missing coverage is not an execution failure and must not change replay
+    /// qualification, enqueue behavior or cached executable identity.
+    fn submission_execution_facts(
+        &self,
+        _fence: &Self::Fence,
+    ) -> Result<Option<crate::DeviceSubmissionExecutionFacts>, Self::Error> {
+        Ok(None)
     }
 
     /// Observes a fence without blocking. `Indeterminate` is not terminal and

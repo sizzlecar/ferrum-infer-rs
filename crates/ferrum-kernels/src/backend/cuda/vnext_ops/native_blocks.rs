@@ -9,6 +9,8 @@ use cudarc::{
 };
 
 pub(super) mod hadamard;
+mod linear;
+pub(super) use linear::TransformedLinearSelection;
 mod q8_predecode;
 pub(super) mod q8act;
 pub(super) mod upstream_linear;
@@ -71,56 +73,6 @@ pub(super) struct CudaNativeBlockKernels {
 }
 
 impl CudaNativeBlockKernels {
-    #[allow(clippy::too_many_arguments)]
-    pub(super) fn transformed_linear(
-        &self,
-        stream: &CudaStream,
-        input: u64,
-        weight: u64,
-        output: u64,
-        part: &weights::MatrixPart,
-        rows: u32,
-        output_stride: u32,
-        activation: ferrum_runtime::ElementType,
-        signs: u64,
-        scratch: u64,
-    ) -> Result<(), CudaDeviceRuntimeError> {
-        use ferrum_runtime::{ElementType, HadamardApplication};
-        let (input, input_type) = if let Some(spec) = &part.transform {
-            if !matches!(spec.application, HadamardApplication::BeforeMatmul { .. }) || scratch == 0
-            {
-                return Err(CudaDeviceRuntimeError::contract(
-                    "native linear requires a forward transform and planned F32 scratch",
-                ));
-            }
-            self.hadamard.launch(
-                stream,
-                input,
-                scratch,
-                signs,
-                rows,
-                part.columns,
-                activation,
-                ElementType::F32,
-                spec,
-            )?;
-            (scratch, ElementType::F32)
-        } else {
-            (input, activation)
-        };
-        self.linear_with_precision(
-            stream,
-            input,
-            weight,
-            output,
-            part,
-            rows,
-            output_stride,
-            input_type,
-            activation,
-        )
-    }
-
     #[allow(clippy::too_many_arguments)]
     pub(super) fn transformed_embedding(
         &self,
@@ -281,103 +233,6 @@ impl CudaNativeBlockKernels {
             activation,
             activation,
         )
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub(super) fn linear_with_precision(
-        &self,
-        stream: &CudaStream,
-        input: u64,
-        weight: u64,
-        output: u64,
-        part: &weights::MatrixPart,
-        rows: u32,
-        output_stride: u32,
-        input_type: ferrum_runtime::ElementType,
-        output_type: ferrum_runtime::ElementType,
-    ) -> Result<(), CudaDeviceRuntimeError> {
-        use ferrum_runtime::ElementType;
-        if rows == 0
-            || rows > u16::MAX as u32
-            || part
-                .output_offset
-                .checked_add(part.rows)
-                .is_none_or(|end| end > output_stride)
-        {
-            return Err(CudaDeviceRuntimeError::contract(
-                "CUDA native linear launch extent is invalid",
-            ));
-        }
-        let q4k =
-            part.format == weights::MatrixFormat::Block(crate::gguf_blocks::GgufBlockFormat::Q4K);
-        let q8_0 =
-            part.format == weights::MatrixFormat::Block(crate::gguf_blocks::GgufBlockFormat::Q8_0);
-        let q5k =
-            part.format == weights::MatrixFormat::Block(crate::gguf_blocks::GgufBlockFormat::Q5K);
-        let iq4xs =
-            part.format == weights::MatrixFormat::Block(crate::gguf_blocks::GgufBlockFormat::Iq4Xs);
-        let q6k =
-            part.format == weights::MatrixFormat::Block(crate::gguf_blocks::GgufBlockFormat::Q6K);
-        let row_tile = if q8_0 && input_type == ElementType::F16 && output_type == ElementType::F16
-        {
-            q8_0_f16_row_tile(rows, part.columns, part.rows, self.multiprocessors)
-        } else if rows > 1 {
-            LINEAR_ROW_TILE
-        } else {
-            1
-        };
-        let kernel = match (input_type, output_type, row_tile > 1) {
-            (ElementType::F16, ElementType::F16, false) if q4k => &self.linear_q4k_f16,
-            (ElementType::F16, ElementType::F16, true) if q4k => &self.linear_q4k_tiled_f16,
-            (ElementType::F16, ElementType::F16, false) if q8_0 => &self.linear_q8_0_f16,
-            (ElementType::F16, ElementType::F16, false) if q5k => &self.linear_q5k_f16,
-            (ElementType::F16, ElementType::F16, true) if q5k => &self.linear_q5k_tiled_f16,
-            (ElementType::F16, ElementType::F16, false) if iq4xs => &self.linear_iq4xs_f16,
-            (ElementType::F16, ElementType::F16, true) if iq4xs => &self.linear_iq4xs_tiled_f16,
-            (ElementType::F16, ElementType::F16, false) if q6k => &self.linear_q6k_f16,
-            (ElementType::F16, ElementType::F16, true) if q6k => &self.linear_q6k_tiled_f16,
-            (ElementType::F32, ElementType::F32, false) if q6k => &self.linear_q6k_f32,
-            (ElementType::F32, ElementType::F32, true) if q6k => &self.linear_q6k_tiled_f32,
-            (ElementType::F16, ElementType::F16, false) => &self.linear_f16,
-            (ElementType::F32, ElementType::F32, false) => &self.linear_f32,
-            (ElementType::F16, ElementType::F16, true) => &self.linear_tiled_f16,
-            (ElementType::F32, ElementType::F32, true) => &self.linear_tiled_f32,
-            (ElementType::F32, ElementType::F16, false) => &self.linear_f32_f16,
-            (ElementType::F32, ElementType::F16, true) => &self.linear_tiled_f32_f16,
-            _ => {
-                return Err(CudaDeviceRuntimeError::contract(
-                    "CUDA native linear activation dtype is unsupported",
-                ))
-            }
-        };
-        let [format, values, bytes] = part.format.parameters();
-        let parameters = [
-            rows,
-            part.columns,
-            part.rows,
-            output_stride,
-            part.output_offset,
-            format,
-            values,
-            bytes,
-        ];
-        let mut launch = stream.launch_builder(kernel);
-        launch.arg(&input).arg(&weight).arg(&output);
-        for parameter in &parameters {
-            launch.arg(parameter);
-        }
-        // SAFETY: The provider retains exact row-complete matrix and activation
-        // regions. One complete warp writes each guarded output column for
-        // every row in its tile; the final partial tile guards all row accesses.
-        unsafe {
-            launch.launch(LaunchConfig {
-                grid_dim: (part.rows.div_ceil(4), rows.div_ceil(row_tile), 1),
-                block_dim: (128, 1, 1),
-                shared_mem_bytes: 0,
-            })
-        }
-        .map(|_| ())
-        .map_err(|error| CudaDeviceRuntimeError::driver("native matrix linear launch", error))
     }
 }
 

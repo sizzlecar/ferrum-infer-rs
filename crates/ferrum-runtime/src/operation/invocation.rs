@@ -1260,6 +1260,7 @@ impl<'a, B> OperationInvocation<'a, B> {
 /// resources remain separate projections while invocation/step/plan resources
 /// may be shared by every projection.
 pub struct BatchedOperationInvocation<'a, B> {
+    execution_facts_capture: crate::ExecutionFactsCapture,
     batch_identity: &'a BatchOperationIdentity,
     node_identity: &'a BatchOperationNodeIdentity,
     participants: Vec<OperationInvocation<'a, B>>,
@@ -1448,6 +1449,7 @@ impl<'a, B> BatchedOperationInvocation<'a, B> {
             node_identity,
             participants,
             program_binding,
+            execution_facts_capture: crate::ExecutionFactsCapture::Off,
             retained_dependency_scope: Arc::new(()),
             retained_persistent_preserve: node.provider_resources().persistent().is_some_and(|p| {
                 p.scope() == crate::ProviderWorkspaceScope::Plan
@@ -1458,6 +1460,20 @@ impl<'a, B> BatchedOperationInvocation<'a, B> {
 
     pub fn batch_identity(&self) -> &BatchOperationIdentity {
         self.batch_identity
+    }
+
+    pub(crate) fn with_execution_facts_capture(
+        mut self,
+        capture: crate::ExecutionFactsCapture,
+    ) -> Self {
+        self.execution_facts_capture = capture;
+        self
+    }
+
+    /// Observation request fixed before this provider encodes. It is excluded
+    /// from execution qualification, plan hashes and reusable program keys.
+    pub const fn execution_facts_capture(&self) -> crate::ExecutionFactsCapture {
+        self.execution_facts_capture
     }
 
     pub fn participants(&self) -> &[OperationInvocation<'a, B>] {

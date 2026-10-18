@@ -34,11 +34,12 @@ use ferrum_runtime::{
     DeviceReusableExecutionObservation, DeviceReusableExecutionPlan,
     DeviceReusableExecutionPreparation, DeviceReusableExecutionProgram,
     DeviceReusableExecutionProgramGapReason, DeviceReusableExecutionTrim, DeviceRuntime,
-    DeviceSubmissionAttribution, DeviceSubmissionExecutionSpan, DeviceSubmissionExecutionTiming,
-    DeviceSubmissionStage, DeviceSubmissionTimingSink, DeviceTerminal, DeviceTerminalReceipt,
-    DeviceTimingMeasurement, DeviceTimingMode, DeviceTimingUnavailableReason,
-    DisabledDeviceSubmissionTimingSink, DynamicStorageProfile, ElementType, FenceIndeterminate,
-    FenceQuery, HostTransferLayout, ProgramBindingNodeBinding, RetainedHostMemoryRegion,
+    DeviceSubmissionAttribution, DeviceSubmissionExecutionFacts, DeviceSubmissionExecutionSpan,
+    DeviceSubmissionExecutionTiming, DeviceSubmissionStage, DeviceSubmissionTimingSink,
+    DeviceTerminal, DeviceTerminalReceipt, DeviceTimingMeasurement, DeviceTimingMode,
+    DeviceTimingUnavailableReason, DisabledDeviceSubmissionTimingSink, DynamicStorageProfile,
+    ElementType, ExecutionFactsCapture, FenceIndeterminate, FenceQuery, HostTransferLayout,
+    ProgramBindingNodeBinding, ProjectionInvocationTemplate, RetainedHostMemoryRegion,
     StaticWeightTransformPlan, StaticWeightTransformRequest, StreamState, VNextError,
     DEVICE_COPY_NATIVE_OPERATION_ID, DEVICE_ZERO_NATIVE_OPERATION_ID,
     HOST_UPLOAD_NATIVE_OPERATION_ID,
@@ -54,6 +55,7 @@ mod binding_scatter;
 mod binding_transfers;
 #[cfg(test)]
 mod compact_upload_scatter_tests;
+mod execution_facts;
 mod input_upload_packet;
 #[cfg(test)]
 mod input_upload_packet_tests;
@@ -1140,6 +1142,7 @@ impl CudaBindingProgramSink {
             program_binding_patch: None,
             binding_program: Some(projection),
             reusable_execution: None,
+            execution_facts: None,
             completion_checks: checks,
         })
     }
@@ -1167,6 +1170,8 @@ pub struct CudaDeviceCommand {
     program_binding_patch: Option<CudaProgramBindingPatch>,
     binding_program: Option<Arc<CudaBindingProgramProjection>>,
     reusable_execution: Option<DeviceReusableExecutionInvocation>,
+    // Pure provider descriptions, independent of replay keys and resource owners.
+    execution_facts: Option<Arc<[ProjectionInvocationTemplate]>>,
 }
 
 impl fmt::Debug for CudaDeviceCommand {
@@ -1210,6 +1215,18 @@ impl fmt::Debug for CudaDeviceCommand {
 }
 
 impl CudaDeviceCommand {
+    pub(crate) fn with_execution_facts(
+        mut self,
+        facts: Arc<[ProjectionInvocationTemplate]>,
+    ) -> Self {
+        self.execution_facts = Some(facts);
+        self
+    }
+
+    pub(crate) fn execution_facts(&self) -> Option<Arc<[ProjectionInvocationTemplate]>> {
+        self.execution_facts.as_ref().map(Arc::clone)
+    }
+
     pub(crate) fn with_numerical_status(
         mut self,
         source: CudaBufferRegion,
@@ -1328,6 +1345,7 @@ impl CudaDeviceCommand {
             binding_program: None,
             program_binding_patch: None,
             reusable_execution: None,
+            execution_facts: None,
             completion_checks: Vec::new(),
         })
     }
@@ -1541,6 +1559,7 @@ impl CudaDeviceCommand {
             binding_program: None,
             program_binding_patch: None,
             reusable_execution: None,
+            execution_facts: None,
             completion_checks: Vec::new(),
         })
     }
@@ -1586,6 +1605,7 @@ impl CudaDeviceCommand {
             binding_program: None,
             program_binding_patch: None,
             reusable_execution: None,
+            execution_facts: None,
             completion_checks: Vec::new(),
         })
     }
@@ -1620,6 +1640,7 @@ impl CudaDeviceCommand {
             binding_program: None,
             program_binding_patch: None,
             reusable_execution: None,
+            execution_facts: None,
             completion_checks: Vec::new(),
         }
     }
@@ -1728,6 +1749,7 @@ impl CudaDeviceCommand {
                 retention,
             }),
             reusable_execution: None,
+            execution_facts: None,
             completion_checks: Vec::new(),
         })
     }
@@ -1818,6 +1840,7 @@ impl CudaDeviceCommand {
             binding_program: None,
             program_binding_patch: None,
             reusable_execution: Some(invocation),
+            execution_facts: None,
             completion_checks: Vec::new(),
         }
     }
@@ -2124,6 +2147,7 @@ impl CudaDeviceCommand {
                 binding_program: None,
                 program_binding_patch: None,
                 reusable_execution: None,
+                execution_facts: None,
                 completion_checks,
             }]);
         }
@@ -2211,6 +2235,7 @@ impl CudaDeviceCommand {
             binding_program: None,
             program_binding_patch: None,
             reusable_execution: None,
+            execution_facts: None,
             completion_checks,
         }])
     }
@@ -2279,6 +2304,7 @@ impl CudaDeviceCommand {
             binding_program: None,
             program_binding_patch: None,
             reusable_execution: None,
+            execution_facts: None,
             completion_checks: Vec::new(),
         }])
     }
@@ -2773,6 +2799,7 @@ pub struct CudaDeviceFence {
     timing: CudaFenceTiming,
     command_timing: CudaFenceCommandTiming,
     attribution: Option<DeviceSubmissionAttribution>,
+    execution_facts: Option<DeviceSubmissionExecutionFacts>,
     stream_state: Arc<CudaStreamState>,
     terminal_accounted: AtomicBool,
     _stream: Arc<CudaStream>,
@@ -5188,6 +5215,7 @@ impl DeviceRuntime for CudaDeviceRuntime {
             ));
         }
         let timing_mode = commands.timing_mode();
+        let facts_capture = commands.execution_facts_capture();
         let compute_path_requirement = commands.compute_path_requirement();
         let declared_eager_compute_node_indices = commands
             .declared_eager_compute_node_indices()
@@ -5223,10 +5251,16 @@ impl DeviceRuntime for CudaDeviceRuntime {
             .collect::<Result<Vec<_>, CudaDeviceRuntimeError>>()
             .map_err(DefinitelyNotSubmitted::new)?;
         // Core has already validated every input's authority and typed range.
+        let mut execution_facts = (facts_capture == ExecutionFactsCapture::On).then(|| {
+            execution_facts::CudaSubmissionComputeFacts::new(&entries, entries.len() as u32)
+        });
         // Compact only fresh eager uploads, before physical command indices,
         // timing spans, or replay candidates are derived from these entries.
         let entries =
             input_upload_packet::coalesce(self, entries).map_err(DefinitelyNotSubmitted::new)?;
+        if let Some(facts) = execution_facts.as_mut() {
+            facts.after_upload_coalescing(&entries);
+        }
         let declaration_shape_matches = match compute_path_requirement {
             DeviceComputePathRequirement::ReplayedWithDeclaredEagerBoundaries => {
                 !declared_eager_compute_node_indices.is_empty()
@@ -5423,6 +5457,7 @@ impl DeviceRuntime for CudaDeviceRuntime {
             &commands,
             &executable_candidates,
             capture_allowed,
+            facts_capture,
         ) {
             Ok(preparation) => preparation,
             Err(error) => {
@@ -5544,6 +5579,7 @@ impl DeviceRuntime for CudaDeviceRuntime {
                     invocation,
                     timing_mode,
                     logical_attribution,
+                    facts_capture,
                     timing_sink,
                 );
                 let end = command_spans.as_ref().and_then(|_| {
@@ -5554,6 +5590,9 @@ impl DeviceRuntime for CudaDeviceRuntime {
                 });
                 match launched {
                     Ok(Some(launch)) => {
+                        if let Some(facts) = execution_facts.as_mut() {
+                            facts.resident_replay(index, invocation.segment(), &launch);
+                        }
                         if let Some(replayed_segments) = replayed_segments.as_mut() {
                             let physical_command_index = u32::try_from(index).expect(
                                 "CUDA direct replay command index was validated before submission",
@@ -5660,6 +5699,7 @@ impl DeviceRuntime for CudaDeviceRuntime {
                         &stream.stream,
                         candidate,
                         timing_mode,
+                        facts_capture,
                         timing_sink,
                     );
                     let end = command_spans.as_ref().and_then(|_| {
@@ -5676,6 +5716,7 @@ impl DeviceRuntime for CudaDeviceRuntime {
                             start.zip(end),
                             launch.reusable_executable_fingerprint(),
                             launch.reusable_graph_node_counts(),
+                            launch,
                         ))),
                         Ok(None) => None,
                         Err(error) => Some(Err(error)),
@@ -5686,9 +5727,10 @@ impl DeviceRuntime for CudaDeviceRuntime {
                         &stream.stream,
                         candidate,
                         timing_mode,
+                        facts_capture,
                         timing_sink,
                     ) {
-                        Ok(Some(_)) => Some(Ok((candidate.end(), None, None, None))),
+                        Ok(Some(launch)) => Some(Ok((candidate.end(), None, None, None, launch))),
                         Ok(None) => None,
                         Err(error) => Some(Err(error)),
                     }
@@ -5701,7 +5743,11 @@ impl DeviceRuntime for CudaDeviceRuntime {
                     events,
                     reusable_executable_fingerprint,
                     graph_node_counts,
+                    launch,
                 ))) => {
+                    if let Some(facts) = execution_facts.as_mut() {
+                        facts.adaptive_replay(index, segment_end, &launch);
+                    }
                     if let Some(execution_paths) = execution_paths.as_mut() {
                         execution_paths[index..segment_end].fill(DeviceExecutionPath::Replayed);
                     }
@@ -5770,6 +5816,11 @@ impl DeviceRuntime for CudaDeviceRuntime {
                 (observed_dependencies.as_mut(), work)
             {
                 observed[index] = Some(work);
+            }
+            if command_phases[index] == DeviceCommandPhase::Compute {
+                if let Some(facts) = execution_facts.as_mut() {
+                    facts.eager(index, &commands[index]);
+                }
             }
             if let Some(command_spans) = command_spans.as_mut() {
                 let command_end = stream
@@ -5913,6 +5964,8 @@ impl DeviceRuntime for CudaDeviceRuntime {
             timing,
             command_timing,
             attribution,
+            execution_facts: execution_facts
+                .map(execution_facts::CudaSubmissionComputeFacts::finish),
             stream_state: Arc::clone(&stream.state),
             terminal_accounted: AtomicBool::new(false),
             _stream: Arc::clone(&stream.stream),
@@ -5925,6 +5978,13 @@ impl DeviceRuntime for CudaDeviceRuntime {
 
     fn submission_attribution(&self, fence: &Self::Fence) -> Option<DeviceSubmissionAttribution> {
         fence.attribution.clone()
+    }
+
+    fn submission_execution_facts(
+        &self,
+        fence: &Self::Fence,
+    ) -> Result<Option<DeviceSubmissionExecutionFacts>, Self::Error> {
+        Ok(fence.execution_facts.clone())
     }
 
     fn query_fence(&self, fence: &Self::Fence) -> FenceQuery<Self::Error> {
@@ -6163,6 +6223,7 @@ mod tests {
                 timing: CudaFenceTiming::NotRequested,
                 command_timing: CudaFenceCommandTiming::NotRequested,
                 attribution: None,
+                execution_facts: None,
                 stream_state: stream.state.clone(),
                 terminal_accounted: AtomicBool::new(false),
                 _stream: stream.stream.clone(),
@@ -6720,6 +6781,7 @@ mod tests {
             binding_program: None,
             program_binding_patch: None,
             reusable_execution: None,
+            execution_facts: None,
             completion_checks: Vec::new(),
         }
     }

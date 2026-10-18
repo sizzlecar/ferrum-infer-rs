@@ -255,10 +255,12 @@ pub(super) fn fingerprint() -> String {
     implementation_fingerprint(&[
         include_bytes!("q6_head.rs"),
         include_bytes!("q6_head/encode.rs"),
+        include_bytes!("q6_head/encode/facts.rs"),
         include_bytes!("transformer/segment_bindings.rs"),
         include_bytes!("native_io.rs"),
         include_bytes!("../vnext_ops.rs"),
         include_bytes!("native_blocks.rs"),
+        include_bytes!("native_blocks/linear.rs"),
         include_bytes!("native_blocks/weights.rs"),
         include_bytes!("native_blocks/hadamard.rs"),
         include_bytes!("native_blocks/upstream_linear/weight_validation.rs"),

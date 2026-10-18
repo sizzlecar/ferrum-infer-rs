@@ -8,6 +8,7 @@ mod compiled_submission_wave;
 mod descriptor;
 mod determinism;
 mod determinism_artifact;
+mod device_facts;
 mod dispatch;
 mod dispatch_contract;
 mod foundation;

@@ -66,6 +66,18 @@ impl VNextProfileEventContext {
             completion.disposition(),
             OperationCompletionDisposition::Succeeded
         );
+        // Borrow the pure command descriptions and resolved current-work rows.
+        // Serializing the bound receipt would repeat every participant identity.
+        // This scope excludes transfers, initialization, and terminal readback;
+        // a terminal success is not evidence of complete device-leaf coverage.
+        let device_commands = facts.device_facts().map(|facts| {
+            serde_json::json!({
+                "scope": "compute_commands",
+                "batch_command_count": facts.device().batch_command_count(),
+                "commands": facts.device().compute_commands(),
+                "projection_rows": facts.projection_rows(),
+            })
+        });
         let event = FerrumProfileEvent {
             schema_version: OBSERVABILITY_PROFILE_SCHEMA_VERSION,
             ts_unix_nanos: timestamp
@@ -122,6 +134,14 @@ impl VNextProfileEventContext {
                 ("plan_id".to_owned(), serde_json::json!(batch.plan_id())),
                 ("plan_hash".to_owned(), serde_json::json!(batch.plan_hash())),
                 (
+                    "execution_device_id".to_owned(),
+                    serde_json::json!(batch.device_id()),
+                ),
+                (
+                    "runtime_implementation_fingerprint".to_owned(),
+                    serde_json::json!(batch.runtime_implementation_fingerprint()),
+                ),
+                (
                     "submission_fingerprint".to_owned(),
                     serde_json::json!(submission.fingerprint()),
                 ),
@@ -137,6 +157,10 @@ impl VNextProfileEventContext {
                 (
                     "device_facts_coverage".to_owned(),
                     serde_json::json!(facts.device_coverage()),
+                ),
+                (
+                    "device_execution".to_owned(),
+                    serde_json::json!(device_commands),
                 ),
                 (
                     "has_device_attribution".to_owned(),

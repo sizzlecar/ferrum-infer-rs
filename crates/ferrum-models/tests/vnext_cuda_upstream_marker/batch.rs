@@ -617,7 +617,7 @@ impl Fixture {
             .unwrap()
         };
         let (handle, observation) = profiled.into_parts();
-        let (_, attribution) = observation.into_parts();
+        let (_, attribution, _) = observation.into_parts();
         let segment_publication = handle.take_segment_binding_publication();
         let receipt = match handle
             .wait_with_readback_collection(

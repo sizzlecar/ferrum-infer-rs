@@ -86,13 +86,12 @@ async fn execution_facts_real_cpu_work_reaches_run_and_serve_journals() {
                 entrypoint,
                 &config,
             ));
-            let (runtime, registry, materializers, _, catalog) = CpuVNextComposition::create(
-                DeviceId::new("device.test.execution-facts-profile").unwrap(),
-                256 << 20,
-            )
-            .unwrap()
-            .into_parts()
-            .unwrap();
+            let device_id = DeviceId::new("device.test.execution-facts-profile").unwrap();
+            let (runtime, registry, materializers, _, catalog) =
+                CpuVNextComposition::create(device_id.clone(), 256 << 20)
+                    .unwrap()
+                    .into_parts()
+                    .unwrap();
             let fixture = Fixture::new(
                 SamplingReadbackMode::Uniform,
                 Device::CPU,
@@ -125,6 +124,14 @@ async fn execution_facts_real_cpu_work_reaches_run_and_serve_journals() {
                 event.validate().unwrap();
                 assert_eq!(event.entrypoint, entrypoint);
                 assert_eq!(event.status, ProfileStatus::Ok);
+                assert_eq!(
+                    event.attributes["execution_device_id"],
+                    serde_json::json!(device_id)
+                );
+                assert!(!event.attributes["runtime_implementation_fingerprint"]
+                    .as_str()
+                    .unwrap()
+                    .is_empty());
                 assert!(event.duration_us.is_none(), "do not invent device time");
                 assert_eq!(
                     event.attributes["completion_disposition"]["status"],
@@ -134,6 +141,7 @@ async fn execution_facts_real_cpu_work_reaches_run_and_serve_journals() {
                     event.attributes["device_facts_coverage"],
                     serde_json::json!({"status":"unavailable", "reason":"not_captured"})
                 );
+                assert!(event.attributes["device_execution"].is_null());
                 let nodes = event.attributes["submitted_node_work"].as_array().unwrap();
                 assert!(!nodes.is_empty());
                 for (index, node) in nodes.iter().enumerate() {

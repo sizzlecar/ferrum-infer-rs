@@ -10,6 +10,23 @@ const VOCAB: u64 = 64;
 pub enum Head {
     Q6,
     Dense,
+    Q6Split,
+    Q6Hadamard,
+}
+impl Head {
+    pub fn quantized(self) -> bool {
+        self != Self::Dense
+    }
+    pub fn transformed(self) -> bool {
+        self == Self::Q6Hadamard
+    }
+    pub fn parts(self) -> usize {
+        if self == Self::Q6Split {
+            2
+        } else {
+            1
+        }
+    }
 }
 
 pub struct Family {
@@ -88,35 +105,43 @@ impl ModelFamilyProvider for Family {
             .find(|t| t.id.as_str() == "weight.embedding")
             .unwrap()
             .dimensions[0] = VOCAB;
-        let quant = self.head == Head::Q6;
-        let cid: WeightId = id("component.head");
-        schema.components.push(WeightComponentSpec {
-            id: cid.clone(),
-            role: if quant {
-                WeightComponentRole::PackedValues
+        let quant = self.head.quantized();
+        let widths = if self.head == Head::Q6Split {
+            vec![64, OUTPUTS - 64]
+        } else {
+            vec![OUTPUTS]
+        };
+        let mut parts = Vec::new();
+        let mut offset = 0;
+        for (ordinal, rows) in widths.into_iter().enumerate() {
+            let cid: WeightId = if self.head == Head::Q6Split {
+                id(format!("component.head.{ordinal}"))
             } else {
-                WeightComponentRole::Values
-            },
-            external_names: vec!["head".into()],
-            dimensions: vec![OUTPUTS, if quant { HIDDEN / 256 } else { HIDDEN }],
-            encoding: if quant {
-                WeightEncoding::BlockQuantized(BlockQuantizationSpec {
-                    format_id: id("quantization.gguf.q6-k"),
-                    logical_values_per_block: 256,
-                    bytes_per_block: 210,
-                })
-            } else {
-                WeightEncoding::Dense {
-                    element_type: ElementType::F16,
-                }
-            },
-            required: true,
-        });
-        schema.tensors.push(WeightTensorSpec {
-            id: id("weight.head"),
-            dimensions: vec![OUTPUTS, HIDDEN],
-            logical_element_type: ElementType::F16,
-            physical_layout: if quant {
+                id("component.head")
+            };
+            schema.components.push(WeightComponentSpec {
+                id: cid.clone(),
+                role: if quant {
+                    WeightComponentRole::PackedValues
+                } else {
+                    WeightComponentRole::Values
+                },
+                external_names: vec![format!("head.{ordinal}")],
+                dimensions: vec![rows, if quant { HIDDEN / 256 } else { HIDDEN }],
+                encoding: if quant {
+                    WeightEncoding::BlockQuantized(BlockQuantizationSpec {
+                        format_id: id("quantization.gguf.q6-k"),
+                        logical_values_per_block: 256,
+                        bytes_per_block: 210,
+                    })
+                } else {
+                    WeightEncoding::Dense {
+                        element_type: ElementType::F16,
+                    }
+                },
+                required: true,
+            });
+            let mut layout = if quant {
                 PhysicalWeightLayout::BlockQuantized {
                     blocks: PhysicalWeightComponentBinding::exact_contiguous(cid),
                     block_axis: 1,
@@ -124,7 +149,36 @@ impl ModelFamilyProvider for Family {
                 }
             } else {
                 PhysicalWeightLayout::Dense { component_id: cid }
-            },
+            };
+            if self.head.transformed() {
+                layout = PhysicalWeightLayout::Hadamard {
+                    values: Box::new(layout),
+                    transform: HadamardTransformSpec {
+                        block_size: std::num::NonZeroU32::new(64).unwrap(),
+                        signs: HadamardSigns::Identity,
+                        application: HadamardApplication::BeforeMatmul {
+                            input_permutation: None,
+                        },
+                    },
+                };
+            }
+            parts.push(CompositeWeightPart {
+                layout: Box::new(layout),
+                logical_offsets: vec![offset, 0],
+                extents: vec![rows, HIDDEN],
+            });
+            offset += rows;
+        }
+        let physical_layout = if parts.len() == 1 {
+            *parts.remove(0).layout
+        } else {
+            PhysicalWeightLayout::Composite { parts }
+        };
+        schema.tensors.push(WeightTensorSpec {
+            id: id("weight.head"),
+            dimensions: vec![OUTPUTS, HIDDEN],
+            logical_element_type: ElementType::F16,
+            physical_layout,
             required: true,
         });
         Ok(schema)
@@ -236,15 +290,14 @@ fn weight_code(n: usize, k: usize) -> i32 {
 pub struct Weights {
     values: BTreeMap<WeightId, Vec<u8>>,
     base: legacy_family::Weights,
+    transformed: bool,
 }
 impl Weights {
     pub fn new(schema: &WeightSchema, bad_token: Option<u32>, bad_weight: bool) -> Self {
         let mut values = BTreeMap::new();
-        for c in schema
-            .components
-            .iter()
-            .filter(|c| matches!(c.id.as_str(), "component.embedding" | "component.head"))
-        {
+        for c in schema.components.iter().filter(|c| {
+            c.id.as_str() == "component.embedding" || c.id.as_str().starts_with("component.head")
+        }) {
             let bytes = if c.id.as_str() == "component.embedding" {
                 (0..VOCAB as usize * HIDDEN as usize)
                     .flat_map(|i| {
@@ -259,7 +312,13 @@ impl Weights {
                     .collect()
             } else if matches!(c.encoding, WeightEncoding::BlockQuantized(_)) {
                 let mut bytes = Vec::new();
-                for n in 0..OUTPUTS as usize {
+                let offset = if c.id.as_str() == "component.head.1" {
+                    64
+                } else {
+                    0
+                };
+                for local_n in 0..c.dimensions[0] as usize {
+                    let n = offset + local_n;
                     for block in 0..HIDDEN as usize / 256 {
                         let mut b = [0u8; 210];
                         b[192..208].fill(1);
@@ -302,13 +361,38 @@ impl Weights {
         Self {
             values,
             base: legacy_family::Weights::new(&base_schema),
+            transformed: schema.tensors.iter().any(|t| {
+                t.id.as_str() == "weight.head"
+                    && matches!(t.physical_layout, PhysicalWeightLayout::Hadamard { .. })
+            }),
         }
     }
     pub fn expected(&self, token: u32) -> Vec<f64> {
+        let input = (0..HIDDEN as usize)
+            .map(|k| f64::from(activation(token, k)))
+            .collect::<Vec<_>>();
+        let transformed = self.transformed.then(|| {
+            (0..HIDDEN as usize)
+                .map(|k| {
+                    let start = k / 64 * 64;
+                    (0..64)
+                        .map(|j| {
+                            let sign = if ((k % 64) & j).count_ones() % 2 == 0 {
+                                1.0
+                            } else {
+                                -1.0
+                            };
+                            sign * input[start + j] / 8.0
+                        })
+                        .sum::<f64>()
+                })
+                .collect::<Vec<_>>()
+        });
+        let input = transformed.as_ref().unwrap_or(&input);
         (0..OUTPUTS as usize)
             .map(|n| {
                 (0..HIDDEN as usize)
-                    .map(|k| f64::from(activation(token, k)) * f64::from(weight_code(n, k)) / 256.0)
+                    .map(|k| input[k] * f64::from(weight_code(n, k)) / 256.0)
                     .sum()
             })
             .collect()

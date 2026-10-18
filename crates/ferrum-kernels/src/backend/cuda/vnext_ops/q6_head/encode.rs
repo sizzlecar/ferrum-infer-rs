@@ -1,6 +1,16 @@
 use super::super::native_blocks::upstream_linear::WeightValidation;
 use super::*;
 
+mod facts;
+
+enum ProjectionPlan {
+    Mmq {
+        plan: Arc<PreparedQ6F32Linear>,
+        state: Arc<WeightValidation>,
+    },
+    Strict(native_blocks::TransformedLinearSelection),
+}
+
 pub(super) fn encode(
     provider: &CudaQ6MmqF32LastTokenProvider,
     invocation: BatchedOperationInvocation<'_, CudaDeviceBuffer>,
@@ -117,7 +127,7 @@ pub(super) fn encode(
     regions.push(persistent.clone());
     let mut dependency_parts = BTreeSet::new();
     let mut dependencies = Vec::new();
-    let mut plans: Vec<Vec<Option<(Arc<PreparedQ6F32Linear>, Arc<WeightValidation>)>>> = Vec::new();
+    let mut plans: Vec<Vec<ProjectionPlan>> = Vec::new();
     let mut dispatches = 0u64;
     let mut transfers = 0u64;
     for &(_, _, rows) in &launches {
@@ -166,10 +176,15 @@ pub(super) fn encode(
                 // rowflag reset and optional guard reset are CUDA memsets.
                 dispatches += 4 + u64::from(g.fixup != 0);
                 transfers += 1 + u64::from(g.guard_blocks != 0);
-                selected.push(Some((plan, state)));
+                selected.push(ProjectionPlan::Mmq { plan, state });
             } else {
                 dispatches += 1 + u64::from(part.transform.is_some());
-                selected.push(None);
+                selected.push(ProjectionPlan::Strict(
+                    provider
+                        .strict
+                        .select_transformed_linear(part, rows, stride, ElementType::F32)
+                        .map_err(|error| error.to_string())?,
+                ));
             }
         }
         plans.push(selected);
@@ -181,6 +196,19 @@ pub(super) fn encode(
             segment_validations.unwrap_or_default(),
         )?);
     }
+    let execution_facts =
+        if invocation.execution_facts_capture() == ferrum_runtime::ExecutionFactsCapture::On {
+            Some(facts::project(
+                &weight.parts,
+                &launches,
+                &plans,
+                participants,
+                packed_rows.is_some(),
+                stride,
+            )?)
+        } else {
+            None
+        };
     let kernels = provider.strict.clone();
     let command = CudaDeviceCommand::replayable_operation(
         "vnext_q6_f32_last_token_linear",
@@ -189,67 +217,67 @@ pub(super) fn encode(
         move |stream, regions| {
             for ((input, output, rows), plans) in launches.iter().copied().zip(&plans) {
                 for (index, part) in weight.parts.iter().enumerate() {
-                    if let Some((plan, state)) = &plans[index] {
-                        // All merged row leases remain in `regions`. Their exact
-                        // adjacency and extents were proved before truncating launches.
-                        let input_bytes = u64::from(rows)
-                            .checked_mul(u64::from(part.columns))
-                            .and_then(|n| n.checked_mul(4))
-                            .ok_or_else(|| {
-                                CudaDeviceRuntimeError::contract("Q6 input extent overflow")
-                            })?;
-                        let output_offset = u64::from(part.output_offset) * 4;
-                        let output_bytes = (u64::from(rows) - 1)
-                            .checked_mul(u64::from(stride))
-                            .and_then(|n| n.checked_add(u64::from(part.rows)))
-                            .and_then(|n| n.checked_mul(4))
-                            .ok_or_else(|| {
-                                CudaDeviceRuntimeError::contract("Q6 output extent overflow")
-                            })?;
-                        let output_address = regions[output]
-                            .device_ptr()
-                            .checked_add(output_offset)
-                            .ok_or_else(|| {
-                                CudaDeviceRuntimeError::contract("Q6 output offset overflow")
-                            })?;
-                        unsafe {
-                            plan.launch(
-                                DeviceSpan {
-                                    address: regions[input].device_ptr(),
-                                    bytes: input_bytes,
-                                },
-                                part.columns,
-                                DeviceSpan {
-                                    address: regions[index].device_ptr(),
-                                    bytes: regions[index].length_bytes(),
-                                },
-                                DeviceSpan {
-                                    address: output_address,
-                                    bytes: output_bytes,
-                                },
-                                stride,
-                                DeviceSpan {
-                                    address: regions[workspace_index].device_ptr(),
-                                    bytes: regions[workspace_index].length_bytes(),
-                                },
-                                state.flag_span(),
-                                stream.cu_stream().cast(),
-                            )
+                    match &plans[index] {
+                        ProjectionPlan::Mmq { plan, state } => {
+                            // All merged row leases remain in `regions`. Their exact
+                            // adjacency and extents were proved before truncating launches.
+                            let input_bytes = u64::from(rows)
+                                .checked_mul(u64::from(part.columns))
+                                .and_then(|n| n.checked_mul(4))
+                                .ok_or_else(|| {
+                                    CudaDeviceRuntimeError::contract("Q6 input extent overflow")
+                                })?;
+                            let output_offset = u64::from(part.output_offset) * 4;
+                            let output_bytes = (u64::from(rows) - 1)
+                                .checked_mul(u64::from(stride))
+                                .and_then(|n| n.checked_add(u64::from(part.rows)))
+                                .and_then(|n| n.checked_mul(4))
+                                .ok_or_else(|| {
+                                    CudaDeviceRuntimeError::contract("Q6 output extent overflow")
+                                })?;
+                            let output_address = regions[output]
+                                .device_ptr()
+                                .checked_add(output_offset)
+                                .ok_or_else(|| {
+                                    CudaDeviceRuntimeError::contract("Q6 output offset overflow")
+                                })?;
+                            unsafe {
+                                plan.launch(
+                                    DeviceSpan {
+                                        address: regions[input].device_ptr(),
+                                        bytes: input_bytes,
+                                    },
+                                    part.columns,
+                                    DeviceSpan {
+                                        address: regions[index].device_ptr(),
+                                        bytes: regions[index].length_bytes(),
+                                    },
+                                    DeviceSpan {
+                                        address: output_address,
+                                        bytes: output_bytes,
+                                    },
+                                    stride,
+                                    DeviceSpan {
+                                        address: regions[workspace_index].device_ptr(),
+                                        bytes: regions[workspace_index].length_bytes(),
+                                    },
+                                    state.flag_span(),
+                                    stream.cu_stream().cast(),
+                                )
+                            }
+                            .map_err(|e| CudaDeviceRuntimeError::contract(e.to_string()))?;
                         }
-                        .map_err(|e| CudaDeviceRuntimeError::contract(e.to_string()))?;
-                    } else {
-                        kernels.transformed_linear(
-                            stream,
-                            regions[input].device_ptr(),
-                            regions[index].device_ptr(),
-                            regions[output].device_ptr(),
-                            part,
-                            rows,
-                            stride,
-                            ElementType::F32,
-                            part.signs_region.map_or(0, |i| regions[i].device_ptr()),
-                            scratch.map_or(0, |i| regions[i].device_ptr()),
-                        )?;
+                        ProjectionPlan::Strict(selection) => {
+                            kernels.launch_transformed_linear(
+                                stream,
+                                regions[input].device_ptr(),
+                                regions[index].device_ptr(),
+                                regions[output].device_ptr(),
+                                *selection,
+                                part.signs_region.map_or(0, |i| regions[i].device_ptr()),
+                                scratch.map_or(0, |i| regions[i].device_ptr()),
+                            )?;
+                        }
                     }
                 }
             }
@@ -270,6 +298,10 @@ pub(super) fn encode(
         )
     })
     .map_err(|e| e.to_string())?;
+    let command = match execution_facts {
+        Some(facts) => command.with_execution_facts(facts),
+        None => command,
+    };
     let mut operation = EncodedDeviceOperation::compute(command);
     for dependency in dependencies {
         operation = operation.with_retained_plan_dependency(dependency);

@@ -220,6 +220,7 @@ impl CudaGatedDeltaRecurrentAttentionProvider {
             include_bytes!("attention/segment_bindings.rs"),
             include_bytes!("segment_bindings.rs"),
             include_bytes!("../native_blocks.rs"),
+            include_bytes!("../native_blocks/linear.rs"),
             include_bytes!("../native_blocks/weights.rs"),
             include_bytes!("../native_blocks/hadamard.rs"),
             crate::ptx::VNEXT_GGUF.as_bytes(),

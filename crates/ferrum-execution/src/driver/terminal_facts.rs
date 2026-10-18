@@ -33,7 +33,7 @@ impl PendingSubmissionObservation {
             observation,
             legacy_attribution,
         } = self;
-        let (work, attribution) = observation.into_parts();
+        let (work, attribution, device_facts) = observation.into_parts();
         let mut failure = None;
         let mut record =
             |call: &mut dyn FnMut() -> std::result::Result<(), ExecutionEventSinkError>| {
@@ -65,8 +65,13 @@ impl PendingSubmissionObservation {
                         "facts-enabled submission has no original work observation",
                     )
                 })?;
-                let facts = TerminalExecutionFacts::new(receipt, work, attribution.as_ref())
-                    .map_err(|error| ExecutionEventSinkError::contract(error.to_string()))?;
+                let facts = TerminalExecutionFacts::new(
+                    receipt,
+                    work,
+                    attribution.as_ref(),
+                    device_facts.as_ref(),
+                )
+                .map_err(|error| ExecutionEventSinkError::contract(error.to_string()))?;
                 sink.record_execution_facts(facts)
             });
         }

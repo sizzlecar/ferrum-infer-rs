@@ -2,10 +2,9 @@
 //! constructs neither an ordinary Step/Wave nor per-node binding frames.
 use super::buffer_view::sequence_execution_shape;
 use super::compiled_identity::SubmissionWaveParticipantIdentitySeed;
+use super::device_facts::{PreparedDeviceFacts, SubmissionAttachments};
 use super::dispatch::encode_submission_wave_inputs;
-use super::dispatch_contract::{
-    BoundDeviceSubmissionAttribution, SubmissionWaveDispatchStageTimer,
-};
+use super::dispatch_contract::SubmissionWaveDispatchStageTimer;
 use super::foundation::invalid_operation;
 use super::retained_dependency::SealedResidentPlanDependencies;
 use super::segment_compile::{CompiledSegmentBindingRecipe, CompiledSegmentResourceSource};
@@ -818,6 +817,9 @@ impl OperationDispatch {
                 });
             }
         }
+        let device_facts =
+            PreparedDeviceFacts::capture(facts_capture, &commands, Some(&program.replay))
+                .map_err(invalid)?;
         completion.mark_submission_started();
         let submit = enqueue.submit_with_timing(commands, timing);
         drop(enqueue);
@@ -839,70 +841,28 @@ impl OperationDispatch {
                 })
             }
             LaneSubmitOutcome::Submitted(fence) => {
-                // Catch attribution panic, then arm even on failure. No
-                // unowned in-flight fence or reservation may unwind here.
-                let device = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    runtime.submission_attribution(&fence)
-                }));
-                let handle = match completion.arm(fence, timing_mode) {
-                    Ok(handle) => handle,
-                    Err((error, completion)) => {
-                        let observation = SubmissionObservation::new(
-                            work.map(|work| work.bind(completion.receipt())),
-                            None,
-                        );
-                        return Err(ResidentDecodeDispatchError::PostSubmitContract {
-                            error,
-                            completion,
-                            observation,
-                        });
-                    }
+                let attachments = SubmissionAttachments::read(runtime, &fence, facts_capture);
+                let attachment_panicked = attachments.panicked();
+                let (handle, arm_error) = match completion.arm(fence, timing_mode) {
+                    Ok(handle) => (handle, None),
+                    Err((error, completion)) => (completion, Some(error)),
                 };
-                let work = work.map(|work| work.bind(handle.receipt()));
-                let device = match device {
-                    Ok(device) => device,
-                    Err(_) => {
-                        lane.fail_closed();
-                        return Err(ResidentDecodeDispatchError::PostSubmitContract {
-                            error: invalid_operation(
-                                "resident attribution panicked after submission",
-                            ),
-                            completion: handle,
-                            observation: SubmissionObservation::new(work, None),
-                        });
-                    }
-                };
-                if !lane.current_descriptor_matches_snapshot() {
+                let (observation, observation_error) =
+                    attachments.bind(handle.receipt(), work, device_facts);
+                let drifted = !lane.current_descriptor_matches_snapshot();
+                if attachment_panicked || drifted {
                     lane.fail_closed();
+                }
+                if let Some(error) = arm_error.or(observation_error).or_else(|| {
+                    drifted.then(|| invalid_operation("resident runtime drifted after submission"))
+                }) {
                     return Err(ResidentDecodeDispatchError::PostSubmitContract {
-                        error: invalid_operation("resident runtime drifted after submission"),
+                        error,
                         completion: handle,
-                        observation: SubmissionObservation::new(work, None),
+                        observation,
                     });
                 }
-                let attribution = match device
-                    .map(|device| {
-                        BoundDeviceSubmissionAttribution::new(
-                            identity.clone(),
-                            handle.receipt().fingerprint().to_owned(),
-                            device,
-                        )
-                    })
-                    .transpose()
-                {
-                    Ok(attribution) => attribution,
-                    Err(error) => {
-                        return Err(ResidentDecodeDispatchError::PostSubmitContract {
-                            error,
-                            completion: handle,
-                            observation: SubmissionObservation::new(work, None),
-                        })
-                    }
-                };
-                Ok(ProfiledSubmissionHandle::new(
-                    handle,
-                    SubmissionObservation::new(work, attribution),
-                ))
+                Ok(ProfiledSubmissionHandle::new(handle, observation))
             }
         };
         drop(lane_stage);

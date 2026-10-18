@@ -132,6 +132,10 @@ fn bootstrap(
 }
 
 fn resident_facts(post_submit_panic: bool) {
+    resident_facts_with_device(post_submit_panic, false);
+}
+
+fn resident_facts_with_device(post_submit_panic: bool, capture_device: bool) {
     let bucket = ReusableExecutionBucketSpec::new(
         ReusableExecutionClassId::new("execution.resident-work-facts").unwrap(),
         ReusableExecutionCapacity::new(1, 1, 1).unwrap(),
@@ -144,6 +148,10 @@ fn resident_facts(post_submit_panic: bool) {
         trace.segment_encoder_enabled = true;
         trace.resident_enabled = true;
         trace.segment_entry = Some(DeviceReusableExecutionEntryIdentity::new());
+        if capture_device {
+            trace.device_facts_templates =
+                Some(super::work_facts_tests::projection_templates(false, 1));
+        }
     }
     // Establish actual physical coverage for every later source window, while
     // each submitted resident use still has exactly one immediate token.
@@ -306,15 +314,49 @@ fn resident_facts(post_submit_panic: bool) {
             capture == ExecutionFactsCapture::On
         );
         assert!(observation.attribution().is_none());
+        assert_eq!(
+            observation.device_facts().is_some(),
+            capture_device && capture == ExecutionFactsCapture::On
+        );
         if let Some(work) = observation.work() {
-            assert!(TerminalExecutionFacts::new(&bootstrap_completion, work, None).is_err());
-            let facts = TerminalExecutionFacts::new(&completion, work, None).unwrap();
-            assert_eq!(
-                facts.device_coverage(),
-                DeviceExecutionFactsCoverage::Unavailable(
-                    DeviceExecutionFactsUnavailableReason::NotCaptured
-                )
-            );
+            assert!(TerminalExecutionFacts::new(&bootstrap_completion, work, None, None).is_err());
+            let facts =
+                TerminalExecutionFacts::new(&completion, work, None, observation.device_facts())
+                    .unwrap();
+            if capture_device {
+                let device = facts.device_facts().unwrap();
+                assert_eq!(
+                    facts.device_coverage(),
+                    DeviceExecutionFactsCoverage::ComputeCommands {
+                        described_compute_commands: count,
+                        unavailable_compute_commands: 0,
+                    }
+                );
+                assert_eq!(device.device().compute_commands().len(), count as usize);
+                let first_index = device.device().compute_commands()[0].submission_command_index;
+                for (index, command) in device.device().compute_commands().iter().enumerate() {
+                    assert_eq!(command.submission_command_index, first_index);
+                    assert_eq!(command.replay_command_ordinal, Some(index as u32));
+                    assert_eq!(command.node_index, Some(index as u32));
+                    assert_eq!(command.path, DeviceExecutionPath::Replayed);
+                }
+                for projection in device.projection_rows() {
+                    assert_eq!(projection.rows.len(), 1);
+                    assert_eq!(
+                        projection.rows[0].source_token_range,
+                        start as u64..start as u64 + 1
+                    );
+                    assert_eq!(projection.rows[0].packed_token_range, 0..1);
+                    assert_eq!(projection.rows[0].physical_rows, 0..1);
+                }
+            } else {
+                assert_eq!(
+                    facts.device_coverage(),
+                    DeviceExecutionFactsCoverage::Unavailable(
+                        DeviceExecutionFactsUnavailableReason::NotCaptured
+                    )
+                );
+            }
             sink.record_execution_facts(facts).unwrap();
             assert_eq!(work.nodes().len(), count as usize);
             for (index, node) in work.nodes().iter().enumerate() {
@@ -341,6 +383,10 @@ fn resident_facts(post_submit_panic: bool) {
         let trace = fixture.runtime_trace.lock().unwrap();
         assert_eq!(trace.resident_compile_calls, 1);
         assert_eq!(trace.resident_encode_calls, 3);
+        assert_eq!(
+            trace.device_facts_calls, 2,
+            "Off must not inspect the submitted fence for facts"
+        );
         assert_eq!(
             trace.resident_source_ranges,
             vec![vec![1..2], vec![2..3], vec![3..4]]
@@ -389,4 +435,9 @@ fn execution_work_facts_direct_resident_keeps_cache_and_fresh_source_windows() {
 #[test]
 fn execution_work_facts_direct_resident_retains_post_submit_contract_terminal() {
     resident_facts(true);
+}
+
+#[test]
+fn execution_device_facts_direct_resident_binds_current_rows_and_keeps_post_submit_owner() {
+    resident_facts_with_device(true, true);
 }

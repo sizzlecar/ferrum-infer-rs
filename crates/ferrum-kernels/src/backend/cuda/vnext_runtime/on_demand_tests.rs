@@ -3,7 +3,7 @@
 use super::*;
 use crate::backend::cuda::vnext_replay::{
     cuda_executable_candidates, CudaCommandReplayKeyBuilder, CudaExecutableCache,
-    CudaExecutablePreparation,
+    CudaExecutableLaunch, CudaExecutablePreparation,
 };
 use cudarc::driver::{sys, CudaSlice, DevicePtr, LaunchConfig, PushKernelArg};
 use cudarc::nvrtc::Ptx;
@@ -119,6 +119,17 @@ impl CaptureHarness {
         quiescent: bool,
         expected: u32,
     ) -> CudaExecutablePreparation {
+        self.execute_with_facts(command, quiescent, expected, ExecutionFactsCapture::Off)
+            .0
+    }
+
+    fn execute_with_facts(
+        &mut self,
+        command: CudaDeviceCommand,
+        quiescent: bool,
+        expected: u32,
+        capture: ExecutionFactsCapture,
+    ) -> (CudaExecutablePreparation, Option<CudaExecutableLaunch>) {
         let commands = [command];
         let candidates =
             cuda_executable_candidates(&[DeviceCommandPhase::Compute], &commands, None, &[])
@@ -134,6 +145,7 @@ impl CaptureHarness {
                 &commands,
                 &candidates,
                 quiescent,
+                capture,
             )
             .unwrap();
         // Capture and graph upload must not execute the stateful operation.
@@ -142,17 +154,17 @@ impl CaptureHarness {
             self.stream.clone_dtoh(self.counter.as_ref()).unwrap()[0],
             before
         );
-        if self
+        let launched = self
             .cache
             .launch(
                 &self.stream,
                 &candidates[0],
                 DeviceTimingMode::Off,
+                capture,
                 &DisabledDeviceSubmissionTimingSink,
             )
-            .unwrap()
-            .is_none()
-        {
+            .unwrap();
+        if launched.is_none() {
             commands[0].enqueue(&self.stream, &self.blas).unwrap();
         }
         self.stream.synchronize().unwrap();
@@ -164,8 +176,89 @@ impl CaptureHarness {
             self.cache.preparation().unwrap().resident_executables()
                 <= self.cache.preparation().unwrap().maximum_executables()
         );
-        report
+        (report, launched)
     }
+}
+
+#[test]
+fn execution_facts_off_capture_is_not_backfilled_when_replay_observation_turns_on() {
+    use ferrum_runtime::{DeviceExecutionFactsUnavailableReason, ProjectionCommandCoverage};
+    let mut h = CaptureHarness::new(1);
+    h.execute(h.command(1, false), true, 1);
+    let captured = h.execute(h.command(1, false), true, 2);
+    assert_eq!(captured.captured_segments(), 1);
+    let before = h.cache.preparation().unwrap();
+    let (report, launch) =
+        h.execute_with_facts(h.command(1, false), true, 3, ExecutionFactsCapture::On);
+    assert_eq!(report.captured_segments(), 0);
+    assert_eq!(report.uploaded_segments(), 0);
+    assert_eq!(report.cache_hit_segments(), 1);
+    let launch = launch.expect("the original executable must still replay");
+    assert!(launch.execution_facts().is_none());
+    let entries = vec![(DeviceCommandPhase::Compute, Some(7), h.command(1, false))];
+    let mut facts = execution_facts::CudaSubmissionComputeFacts::new(&entries, 1);
+    facts.adaptive_replay(0, 1, &launch);
+    let facts = facts.finish();
+    assert_eq!(facts.batch_command_count(), 1);
+    let [record] = facts.compute_commands() else {
+        panic!("one actual compute command")
+    };
+    assert_eq!(record.node_index, Some(7));
+    assert_eq!(record.path, DeviceExecutionPath::Replayed);
+    assert!(matches!(
+        record.coverage,
+        ProjectionCommandCoverage::Unavailable(
+            DeviceExecutionFactsUnavailableReason::CachedTemplateUnavailable
+        )
+    ));
+    let after = h.cache.preparation().unwrap();
+    assert_eq!(after.resident_executables(), before.resident_executables());
+    assert_eq!(after.maximum_executables(), before.maximum_executables());
+}
+
+#[test]
+fn execution_facts_on_capture_preserves_unsupported_slots_without_changing_replay() {
+    use ferrum_runtime::{DeviceExecutionFactsUnavailableReason, ProjectionCommandCoverage};
+    let mut h = CaptureHarness::new(1);
+    let (warmup, eager) =
+        h.execute_with_facts(h.command(1, false), true, 1, ExecutionFactsCapture::On);
+    assert_eq!(warmup.warmup_required_segments(), 1);
+    assert!(eager.is_none());
+    let entries = vec![(DeviceCommandPhase::Compute, Some(2), h.command(1, false))];
+    let mut facts = execution_facts::CudaSubmissionComputeFacts::new(&entries, 1);
+    facts.eager(0, &entries[0].2);
+    let eager = facts.finish();
+    assert_eq!(eager.compute_commands()[0].path, DeviceExecutionPath::Eager);
+    assert!(matches!(
+        eager.compute_commands()[0].coverage,
+        ProjectionCommandCoverage::Unavailable(
+            DeviceExecutionFactsUnavailableReason::UnsupportedProducer
+        )
+    ));
+    let (report, launch) =
+        h.execute_with_facts(h.command(1, false), true, 2, ExecutionFactsCapture::On);
+    assert_eq!(report.captured_segments(), 1);
+    let original = launch.unwrap().execution_facts().unwrap().clone();
+    assert_eq!(original.len(), 1);
+    assert!(
+        original[0].is_none(),
+        "the counter is not a projection producer"
+    );
+    let (_, off) = h.execute_with_facts(h.command(1, false), true, 3, ExecutionFactsCapture::Off);
+    assert!(off.unwrap().execution_facts().is_none());
+    let (report, launch) =
+        h.execute_with_facts(h.command(1, false), true, 4, ExecutionFactsCapture::On);
+    assert_eq!(report.captured_segments(), 0);
+    let launch = launch.unwrap();
+    assert!(Arc::ptr_eq(&original, launch.execution_facts().unwrap()));
+    let mut facts = execution_facts::CudaSubmissionComputeFacts::new(&entries, 1);
+    facts.adaptive_replay(0, 1, &launch);
+    assert!(matches!(
+        facts.finish().compute_commands()[0].coverage,
+        ProjectionCommandCoverage::Unavailable(
+            DeviceExecutionFactsUnavailableReason::UnsupportedProducer
+        )
+    ));
 }
 
 #[test]
@@ -253,7 +346,15 @@ fn on_demand_logical_catalog_is_bounded_and_stale_references_miss_before_launch(
         let candidates = cuda_executable_candidates(&phases, &commands, Some(&nodes), &[]).unwrap();
         let preparation = h
             .cache
-            .prepare_all(&h.context, &h.stream, &h.blas, &commands, &candidates, true)
+            .prepare_all(
+                &h.context,
+                &h.stream,
+                &h.blas,
+                &commands,
+                &candidates,
+                true,
+                ExecutionFactsCapture::Off,
+            )
             .unwrap();
         h.cache
             .register_program(
@@ -323,7 +424,15 @@ fn on_demand_forced_eager_preserves_resident_program_and_recipe_for_replay() {
     let candidates = cuda_executable_candidates(&phases, &commands, Some(&nodes), &[]).unwrap();
     let preparation = h
         .cache
-        .prepare_all(&h.context, &h.stream, &h.blas, &commands, &candidates, true)
+        .prepare_all(
+            &h.context,
+            &h.stream,
+            &h.blas,
+            &commands,
+            &candidates,
+            true,
+            ExecutionFactsCapture::Off,
+        )
         .unwrap();
     h.cache
         .register_program(
@@ -352,6 +461,7 @@ fn on_demand_forced_eager_preserves_resident_program_and_recipe_for_replay() {
             &invocation,
             DeviceTimingMode::Off,
             false,
+            ExecutionFactsCapture::Off,
             &DisabledDeviceSubmissionTimingSink
         )
         .unwrap()
@@ -364,7 +474,15 @@ fn on_demand_forced_eager_preserves_resident_program_and_recipe_for_replay() {
     let eager_commands = [h.command(1, false)];
     let eager_preparation = h
         .cache
-        .prepare_all(&h.context, &h.stream, &h.blas, &eager_commands, &[], true)
+        .prepare_all(
+            &h.context,
+            &h.stream,
+            &h.blas,
+            &eager_commands,
+            &[],
+            true,
+            ExecutionFactsCapture::Off,
+        )
         .unwrap();
     assert_eq!(eager_preparation, CudaExecutablePreparation::default());
     h.cache
@@ -415,12 +533,58 @@ fn on_demand_forced_eager_preserves_resident_program_and_recipe_for_replay() {
             &invocation,
             DeviceTimingMode::Off,
             false,
+            ExecutionFactsCapture::Off,
             &DisabledDeviceSubmissionTimingSink
         )
         .unwrap()
         .is_some());
     h.stream.synchronize().unwrap();
     assert_eq!(h.stream.clone_dtoh(h.counter.as_ref()).unwrap(), vec![5]);
+
+    // Observation may turn on after the original graph was captured Off. The
+    // same sealed program and recipe still execute; no fresh command metadata
+    // may pretend to describe that old graph.
+    let observed = h
+        .cache
+        .launch_program_segment(
+            &h.stream,
+            &invocation,
+            DeviceTimingMode::Off,
+            false,
+            ExecutionFactsCapture::On,
+            &DisabledDeviceSubmissionTimingSink,
+        )
+        .unwrap()
+        .unwrap();
+    h.stream.synchronize().unwrap();
+    assert_eq!(h.stream.clone_dtoh(h.counter.as_ref()).unwrap(), vec![6]);
+    assert!(observed.execution_facts().is_none());
+    let entries = vec![(
+        DeviceCommandPhase::Compute,
+        None,
+        CudaDeviceCommand::reusable_execution(1, invocation.clone()),
+    )];
+    let mut facts = execution_facts::CudaSubmissionComputeFacts::new(&entries, 1);
+    facts.resident_replay(0, invocation.segment(), &observed);
+    let facts = facts.finish();
+    let [record] = facts.compute_commands() else {
+        panic!("one captured compute command")
+    };
+    assert_eq!(record.submission_command_index, 0);
+    assert_eq!(record.replay_command_ordinal, Some(0));
+    assert_eq!(
+        record.node_index,
+        Some(invocation.segment().start_node_index())
+    );
+    assert_eq!(record.path, DeviceExecutionPath::Replayed);
+    assert!(matches!(
+        record.coverage,
+        ferrum_runtime::ProjectionCommandCoverage::Unavailable(
+            ferrum_runtime::DeviceExecutionFactsUnavailableReason::CachedTemplateUnavailable
+        )
+    ));
+    assert_eq!(h.cache.catalog().unwrap(), catalog);
+    assert!(recipe_owner.same_entry(&h.cache.recipe_program_owner(&id).unwrap()));
 
     // Keeping the recipe token alive cannot authorize an explicitly evicted
     // graph. The original invocation must miss before issuing another launch.
@@ -434,9 +598,10 @@ fn on_demand_forced_eager_preserves_resident_program_and_recipe_for_replay() {
             &invocation,
             DeviceTimingMode::Off,
             false,
+            ExecutionFactsCapture::Off,
             &DisabledDeviceSubmissionTimingSink
         )
         .unwrap()
         .is_none());
-    assert_eq!(h.stream.clone_dtoh(h.counter.as_ref()).unwrap(), vec![5]);
+    assert_eq!(h.stream.clone_dtoh(h.counter.as_ref()).unwrap(), vec![6]);
 }
