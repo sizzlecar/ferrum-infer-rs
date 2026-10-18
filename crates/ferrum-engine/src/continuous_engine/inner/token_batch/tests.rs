@@ -168,7 +168,9 @@ fn held(
     sequence: &ExecutorSequence,
 ) -> (
     ContinuationDisposition,
-    tokio::sync::oneshot::Sender<Result<ferrum_execution::token_execution::ExecutionEnded>>,
+    tokio::sync::oneshot::Sender<
+        Result<ferrum_execution::token_execution::ExecutionTerminalOutcome>,
+    >,
 ) {
     let (sender, receiver) = tokio::sync::oneshot::channel();
     let held = issuer

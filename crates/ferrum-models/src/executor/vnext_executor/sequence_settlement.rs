@@ -658,11 +658,14 @@ impl<R: DeviceRuntime> VNextSequence<R> {
         settlement.terminal_waiters.push(sender);
         self.token_issuer
             .held(key, async move {
-                receiver.await.map_err(|_| {
-                    FerrumError::backend(
-                        "native terminal owner ended without publishing a terminal receipt",
-                    )
-                })
+                receiver
+                    .await
+                    .map_err(|_| {
+                        FerrumError::backend(
+                            "native terminal owner ended without publishing a terminal receipt",
+                        )
+                    })
+                    .map(ferrum_execution::token_execution::ExecutionTerminalOutcome::ended)
             })
             .map(ExecutionCloseOutcome::held)
     }

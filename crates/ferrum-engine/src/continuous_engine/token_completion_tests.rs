@@ -21,9 +21,9 @@ use std::sync::atomic::AtomicUsize;
 #[path = "completion_failure_tests.rs"]
 mod failure;
 
-struct ModelObservation {
-    model: LlamaFamilyModel<CpuBackend>,
-    releases: Vec<Vec<usize>>,
+pub(super) struct ModelObservation {
+    pub(super) model: LlamaFamilyModel<CpuBackend>,
+    pub(super) releases: Vec<Vec<usize>>,
 }
 
 struct ObservedModel {
@@ -157,7 +157,11 @@ struct Fixture {
     layers: usize,
 }
 
-async fn fixture(delayed: bool, publication_error: bool) -> Fixture {
+pub(super) fn observed_cpu_model() -> (
+    Arc<LlmExecutor>,
+    Arc<Mutex<ModelObservation>>,
+    TinyLlamaConfig,
+) {
     let cfg = TinyLlamaConfig::default();
     let model = tiny_llama_model(&cfg);
     let runtime_config = model.config().clone();
@@ -172,6 +176,11 @@ async fn fixture(delayed: bool, publication_error: bool) -> Fixture {
         }),
         tiny_model_info(&cfg),
     ));
+    (inner, model, cfg)
+}
+
+async fn fixture(delayed: bool, publication_error: bool) -> Fixture {
+    let (inner, model, cfg) = observed_cpu_model();
     let (gate, receiver) = tokio::sync::oneshot::channel();
     let (started_sender, started) = tokio::sync::oneshot::channel();
     let executor = Arc::new(CloseGate {

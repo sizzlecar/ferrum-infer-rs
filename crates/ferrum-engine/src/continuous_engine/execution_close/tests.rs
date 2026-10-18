@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize};
 struct CloseProbe {
     inner: Arc<dyn ModelExecutor>,
     issuer: ExecutorSequenceIssuer,
-    terminal: Mutex<Option<tokio::sync::oneshot::Receiver<Result<ExecutionEnded>>>>,
+    terminal: Mutex<Option<tokio::sync::oneshot::Receiver<Result<ExecutionTerminalOutcome>>>>,
     calls: AtomicUsize,
     initial_error: bool,
     end_then_error: AtomicBool,
@@ -105,12 +105,27 @@ fn fixture(
     ExecutorSequence,
     RequestId,
     RequestSlotLease,
-    tokio::sync::oneshot::Sender<Result<ExecutionEnded>>,
+    tokio::sync::oneshot::Sender<Result<ExecutionTerminalOutcome>>,
+) {
+    let cfg = TinyLlamaConfig::default();
+    fixture_with_inner(initial_error, tiny_llama_executor(&cfg))
+}
+
+fn fixture_with_inner(
+    initial_error: bool,
+    inner: Arc<dyn ModelExecutor>,
+) -> (
+    ContinuousBatchEngine,
+    Arc<CloseProbe>,
+    ExecutorSequence,
+    RequestId,
+    RequestSlotLease,
+    tokio::sync::oneshot::Sender<Result<ExecutionTerminalOutcome>>,
 ) {
     let cfg = TinyLlamaConfig::default();
     let (sender, terminal) = tokio::sync::oneshot::channel();
     let executor = Arc::new(CloseProbe {
-        inner: tiny_llama_executor(&cfg),
+        inner,
         issuer: ExecutorSequenceIssuer::new(),
         terminal: Mutex::new(Some(terminal)),
         calls: AtomicUsize::new(0),
@@ -263,7 +278,9 @@ async fn execution_close_recompute_waits_for_ended_before_requeue_and_release() 
     }
     executor.capacity_epoch.store(2, Ordering::Release);
     sender
-        .send(Ok(executor.issuer.ended(&identity).unwrap()))
+        .send(Ok(ExecutionTerminalOutcome::ended(
+            executor.issuer.ended(&identity).unwrap(),
+        )))
         .unwrap();
     engine.inner.execution_closes.join_observers().await;
     engine.inner.drain_execution_closes().unwrap();
@@ -333,7 +350,9 @@ async fn execution_close_recompute_source_error_preserves_feedback_and_once_rele
     // deliberately does not advance. Reconciliation must retain this error
     // while reporting the queue mutation and the actual Ended exactly once.
     sender
-        .send(Ok(executor.issuer.ended(&identity).unwrap()))
+        .send(Ok(ExecutionTerminalOutcome::ended(
+            executor.issuer.ended(&identity).unwrap(),
+        )))
         .unwrap();
     engine.inner.execution_closes.join_observers().await;
     let error = engine
@@ -395,7 +414,9 @@ async fn execution_close_recompute_cancel_while_held_does_not_revive_or_repeat_c
             sender
                 .take()
                 .unwrap()
-                .send(Ok(executor.issuer.ended(&identity).unwrap()))
+                .send(Ok(ExecutionTerminalOutcome::ended(
+                    executor.issuer.ended(&identity).unwrap(),
+                )))
                 .unwrap();
             engine.inner.execution_closes.join_observers().await;
         }
@@ -433,7 +454,9 @@ async fn execution_close_recompute_cancel_while_held_does_not_revive_or_repeat_c
         if let Some(sender) = sender {
             executor.capacity_epoch.store(2, Ordering::Release);
             sender
-                .send(Ok(executor.issuer.ended(&identity).unwrap()))
+                .send(Ok(ExecutionTerminalOutcome::ended(
+                    executor.issuer.ended(&identity).unwrap(),
+                )))
                 .unwrap();
         }
         engine.inner.execution_closes.join_observers().await;
@@ -505,7 +528,9 @@ async fn execution_close_held_preserves_slot_until_exact_ended_and_notifies_once
         assert_eq!(entry.recovery.as_ref().unwrap().sequence(), &sequence);
     }
     sender
-        .send(Ok(executor.issuer.ended(&sequence).unwrap()))
+        .send(Ok(ExecutionTerminalOutcome::ended(
+            executor.issuer.ended(&sequence).unwrap(),
+        )))
         .unwrap();
     engine.inner.execution_closes.join_observers().await;
     engine.inner.drain_execution_closes().unwrap();
@@ -527,6 +552,169 @@ async fn execution_close_held_preserves_slot_until_exact_ended_and_notifies_once
             .capacity_release_epoch,
         epoch + 1
     );
+}
+
+#[tokio::test]
+async fn execution_close_real_cpu_held_terminal_preserves_error_and_releases_once() {
+    use super::super::token_completion_tests::observed_cpu_model;
+    use ferrum_execution::model_executor::{
+        ExecutorPrefillAdmission, ExecutorSamplingOutput, LogitsReturnPolicy, PrefillChunk,
+    };
+    use ferrum_execution::token_execution::{
+        ExecutionAdmission, ExecutionBatchOutcome, ExecutionProduct, ExecutionWork,
+        TokenAdmissionOutcome, TokenWork,
+    };
+    use ferrum_models::{test_support::tiny_llama_model, DecoderOnlyLLM};
+
+    let (inner, model, cfg) = observed_cpu_model();
+    let (engine, executor, sequence, request_id, slot, sender) =
+        fixture_with_inner(false, inner.clone());
+    let prompt = [TokenId(1), TokenId(2), TokenId(3)];
+    let TokenAdmissionOutcome::Admitted(frontier) = inner
+        .admit_tokens(ExecutionAdmission {
+            context: ExecutorPrefillAdmission::for_startup(&request_id, &prompt, cfg.max_seq_len),
+            adapter: None,
+        })
+        .unwrap()
+    else {
+        panic!("real tiny model must admit the test prompt")
+    };
+    let policy = LogitsReturnPolicy::FullLogits;
+    let work = ExecutionWork::new(
+        &frontier,
+        TokenWork::Prefill(PrefillChunk::new(0, prompt.len(), prompt.len()).unwrap()),
+        &policy,
+    )
+    .unwrap();
+    let ExecutionBatchOutcome::Completed(batch) = inner.execute_tokens(&[work]).await.unwrap()
+    else {
+        panic!("real CPU prefill must complete")
+    };
+    let completion = batch.into_completions().pop().unwrap();
+    let ExecutionProduct::Sampling(ExecutorSamplingOutput::FullLogits(logits)) =
+        completion.product()
+    else {
+        panic!("full vocabulary reference is required")
+    };
+    let reference = tiny_llama_model(&cfg).prefill("independent-reference", &[1, 2, 3]);
+    assert_eq!(logits, &reference);
+    assert_eq!(logits.len(), cfg.vocab_size);
+    assert!(logits.iter().all(|value| value.is_finite()));
+
+    // This test wrapper owns an explicit outer -> actual-inner binding. It
+    // may publish its outer Ended only after the real inner executor closes
+    // this exact incarnation, not merely when this task or its gate finishes.
+    let binding = (
+        sequence.clone(),
+        completion.next_frontier().sequence().clone(),
+    );
+    let issuer = executor.issuer.clone();
+    let (release, gate) = tokio::sync::oneshot::channel();
+    let closer = tokio::spawn(async move {
+        gate.await.unwrap();
+        let close = inner
+            .finish_tokens(
+                &binding.1,
+                ExecutionEndReason::Completed {
+                    input_tokens: 3,
+                    output_tokens: 1,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(close.error.is_none());
+        let ExecutionCloseDisposition::Ended(actual) = close.disposition else {
+            panic!("real CPU cache must be released before publication")
+        };
+        assert_eq!(actual.sequence(), &binding.1);
+        let terminal = ExecutionTerminalOutcome::ended(issuer.ended(&binding.0).unwrap())
+            .with_error(FerrumError::backend(
+                "deferred post-close publication failure",
+            ));
+        sender.send(Ok(terminal)).unwrap();
+    });
+    engine
+        .inner
+        .begin_execution_close(
+            request_id,
+            sequence.clone(),
+            Some(slot),
+            ExecutionEndReason::Completed {
+                input_tokens: prompt.len(),
+                output_tokens: 1,
+            },
+        )
+        .unwrap()
+        .initial_result()
+        .await
+        .unwrap();
+    assert!(sequence.observed_end().is_none());
+    {
+        let state = model.lock();
+        assert_eq!(state.model.kv_caches.len(), 1);
+        assert!(state.model.kv_caches.values().all(|layers| {
+            layers.len() == cfg.num_layers && layers.iter().all(|layer| layer.len == prompt.len())
+        }));
+        assert!(state.releases.is_empty());
+    }
+    {
+        let state = engine.inner.execution_closes.state.lock();
+        let entry = &state.entries[&sequence];
+        assert!(matches!(entry.observation, CloseObservation::Pending));
+        assert!(entry.slot.as_ref().unwrap().armed);
+    }
+    assert_eq!(
+        engine
+            .inner
+            .scheduler
+            .trace_snapshot()
+            .capacity_release_epoch,
+        0
+    );
+    release.send(()).unwrap();
+    closer.await.unwrap();
+    engine.inner.execution_closes.join_observers().await;
+    {
+        let state = engine.inner.execution_closes.state.lock();
+        let entry = &state.entries[&sequence];
+        assert!(entry.operation_error.is_none());
+        let CloseObservation::Ended(ended, Some(FerrumError::Backend { message })) =
+            &entry.observation
+        else {
+            panic!("Held must deliver both authentic Ended and its deferred error")
+        };
+        assert_eq!(ended.sequence(), &sequence);
+        assert!(message.contains("deferred post-close publication failure"));
+    }
+    let error = engine.inner.drain_execution_closes().unwrap_err();
+    assert!(matches!(&error, FerrumError::Backend { message }
+        if message.contains("deferred post-close publication failure")));
+    assert_eq!(engine.inner.execution_closes.unreclaimed_count(), 0);
+    assert_eq!(
+        engine
+            .inner
+            .scheduler
+            .trace_snapshot()
+            .capacity_release_epoch,
+        1
+    );
+    assert_eq!(executor.calls.load(Ordering::SeqCst), 1);
+    {
+        let state = model.lock();
+        assert!(state.model.kv_caches.is_empty());
+        assert_eq!(state.releases, vec![vec![prompt.len(); cfg.num_layers]]);
+    }
+    engine.inner.drain_execution_closes().unwrap();
+    assert_eq!(
+        engine
+            .inner
+            .scheduler
+            .trace_snapshot()
+            .capacity_release_epoch,
+        1
+    );
+    assert_eq!(executor.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(model.lock().releases.len(), 1);
 }
 
 #[tokio::test]
@@ -572,7 +760,9 @@ async fn execution_close_dropped_ticket_and_join_do_not_cancel_owner() {
             .unwrap();
     }
     sender
-        .send(Ok(executor.issuer.ended(&sequence).unwrap()))
+        .send(Ok(ExecutionTerminalOutcome::ended(
+            executor.issuer.ended(&sequence).unwrap(),
+        )))
         .unwrap();
     // join cancellation removed only the JoinHandle; completion is stored in
     // the same retained record and still wakes the engine.
@@ -898,7 +1088,9 @@ async fn execution_close_duplicate_retains_the_second_real_observer() {
         .to_string()
         .contains("duplicate publication error"));
     sender
-        .send(Ok(executor.issuer.ended(&sequence).unwrap()))
+        .send(Ok(ExecutionTerminalOutcome::ended(
+            executor.issuer.ended(&sequence).unwrap(),
+        )))
         .unwrap();
     engine.inner.execution_closes.join_observers().await;
     engine.inner.drain_execution_closes().unwrap();
@@ -1071,7 +1263,9 @@ async fn execution_close_unassigned_retains_observer_without_registering_foreign
     );
     assert!(!foreign_sender.is_closed());
     sender
-        .send(Ok(executor.issuer.ended(&sequence).unwrap()))
+        .send(Ok(ExecutionTerminalOutcome::ended(
+            executor.issuer.ended(&sequence).unwrap(),
+        )))
         .unwrap();
     engine.inner.execution_closes.join_observers().await;
     engine.inner.drain_execution_closes().unwrap();
@@ -1153,7 +1347,9 @@ async fn execution_close_detached_joins_held_without_downgrading_release_obligat
         assert!(entry.slot.as_ref().unwrap().armed);
     }
     sender
-        .send(Ok(executor.issuer.ended(&sequence).unwrap()))
+        .send(Ok(ExecutionTerminalOutcome::ended(
+            executor.issuer.ended(&sequence).unwrap(),
+        )))
         .unwrap();
     engine.inner.execution_closes.join_observers().await;
     engine.inner.drain_execution_closes().unwrap();
@@ -1207,7 +1403,9 @@ async fn execution_close_detached_held_and_fresh_slotless_release_have_distinct_
             0
         );
         sender
-            .send(Ok(executor.issuer.ended(&sequence).unwrap()))
+            .send(Ok(ExecutionTerminalOutcome::ended(
+                executor.issuer.ended(&sequence).unwrap(),
+            )))
             .unwrap();
         engine.inner.execution_closes.join_observers().await;
         engine.inner.drain_execution_closes().unwrap();

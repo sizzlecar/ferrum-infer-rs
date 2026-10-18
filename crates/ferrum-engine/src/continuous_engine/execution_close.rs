@@ -5,7 +5,7 @@
 use super::*;
 use ferrum_execution::token_execution::{
     ExecutionCloseDisposition, ExecutionCloseOutcome, ExecutionEndReason, ExecutionEnded,
-    ExecutionFrontier, ExecutionRecoveryKey, ExecutorSequence,
+    ExecutionFrontier, ExecutionRecoveryKey, ExecutionTerminalOutcome, ExecutorSequence,
 };
 
 mod recompute;
@@ -326,7 +326,9 @@ impl ExecutionCloseRegistry {
                 }
                 let initial_result = outcome.error.clone().map_or(Ok(()), Err);
                 match outcome.disposition {
-                    ExecutionCloseDisposition::Ended(ended) => Ok(ended),
+                    ExecutionCloseDisposition::Ended(ended) => {
+                        Ok(ExecutionTerminalOutcome::ended(ended))
+                    }
                     ExecutionCloseDisposition::Held(held) => {
                         {
                             let mut state = shared.lock();
@@ -348,10 +350,13 @@ impl ExecutionCloseRegistry {
                 Ok(result) => result,
                 Err(_) => Err(FerrumError::internal("execution close observer panicked")),
             };
-            let result_error = result.as_ref().err().cloned();
+            let result_error = match &result {
+                Ok(terminal) => terminal.error.clone(),
+                Err(error) => Some(error.clone()),
+            };
             let observation = match result {
-                Ok(ended) if ended.sequence() == &task_sequence => {
-                    CloseObservation::Ended(ended, None)
+                Ok(terminal) if terminal.ended.sequence() == &task_sequence => {
+                    CloseObservation::Ended(terminal.ended, terminal.error)
                 }
                 Ok(_) => CloseObservation::Unproved(FerrumError::internal(
                     "execution close returned another incarnation",

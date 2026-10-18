@@ -440,11 +440,12 @@ async fn native_tokens_cpu_cancel_queued_wave_waits_for_actual_terminal_receipt(
     drop(execution);
     release.send(()).unwrap();
     blocker.await.unwrap();
-    let ended = tokio::time::timeout(Duration::from_secs(3), terminal)
+    let terminal = tokio::time::timeout(Duration::from_secs(3), terminal)
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(ended.sequence(), frontier.sequence());
+    assert_eq!(terminal.ended.sequence(), frontier.sequence());
+    assert!(terminal.error.is_none());
     assert!(sequence.settlement.lock().terminal.is_some());
     fixture
         .executor
@@ -531,11 +532,12 @@ async fn native_tokens_cpu_cancel_one_shared_participant_preserves_healthy_peer(
         interrupted.remaining()[0].continuation(),
         ContinuationDisposition::Ended(_)
     ));
-    let ended = tokio::time::timeout(Duration::from_secs(3), terminal)
+    let terminal = tokio::time::timeout(Duration::from_secs(3), terminal)
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(ended.sequence(), cancelled);
+    assert_eq!(terminal.ended.sequence(), cancelled);
+    assert!(terminal.error.is_none());
     assert_eq!(fixture.executor.sequences.lock().total_len(), 1);
     let next = execute_one(
         &fixture,

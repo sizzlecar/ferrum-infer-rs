@@ -1561,13 +1561,20 @@ mod tests {
         )) else {
             panic!("invalid metadata cannot discard actual recovery")
         };
-        sender.send(issuer.ended(&sequence).unwrap()).unwrap();
+        sender
+            .send(ExecutionTerminalOutcome::ended(
+                issuer.ended(&sequence).unwrap(),
+            ))
+            .unwrap();
         let (_, _, continuation, _) = violation.rejected_participants.into_iter().next().unwrap();
         let ContinuationDisposition::Held(held) = continuation else {
             panic!("missing original observer")
         };
         assert_eq!(
-            futures::executor::block_on(held.wait()).unwrap().sequence(),
+            futures::executor::block_on(held.wait())
+                .unwrap()
+                .ended
+                .sequence(),
             &sequence
         );
     }

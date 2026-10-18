@@ -123,7 +123,28 @@ impl ExecutorSequence {
     }
 }
 
-type CloseFuture = Pin<Box<dyn Future<Output = Result<ExecutionEnded>> + Send + 'static>>;
+/// A checked terminal observation, independent of whether the operation
+/// succeeded. The original executor must establish `ended` before constructing
+/// this result; an operation error never creates a terminal fact.
+#[derive(Debug)]
+#[must_use = "terminal observation must preserve both the ended identity and operation error"]
+pub struct ExecutionTerminalOutcome {
+    pub ended: ExecutionEnded,
+    pub error: Option<ferrum_types::FerrumError>,
+}
+
+impl ExecutionTerminalOutcome {
+    pub fn ended(ended: ExecutionEnded) -> Self {
+        Self { ended, error: None }
+    }
+
+    pub fn with_error(mut self, error: ferrum_types::FerrumError) -> Self {
+        self.error.get_or_insert(error);
+        self
+    }
+}
+
+type CloseFuture = Pin<Box<dyn Future<Output = Result<ExecutionTerminalOutcome>> + Send + 'static>>;
 
 /// Cold-path observer obtained before returning Held, so completion cannot be
 /// lost when the original registry entry is removed. The executor/reaper keeps
@@ -148,14 +169,15 @@ impl ExecutionHeld {
         &self.key
     }
 
-    /// An error means closure has not been proved. It never grants permission
-    /// to release native resources or retry the original work.
-    pub async fn wait(self) -> Result<ExecutionEnded> {
-        let ended = self.future.await?;
-        if ended.sequence() != self.key.sequence() {
+    /// `Err` means this observation did not prove closure. An `Ok` terminal
+    /// result may still carry an operation error; that error must not discard
+    /// its checked ended identity or be reported as successful model work.
+    pub async fn wait(self) -> Result<ExecutionTerminalOutcome> {
+        let terminal = self.future.await?;
+        if terminal.ended.sequence() != self.key.sequence() {
             return Err(invalid("close observer returned a different incarnation"));
         }
-        Ok(ended)
+        Ok(terminal)
     }
 }
 
@@ -211,7 +233,7 @@ impl ExecutorSequenceIssuer {
 
     pub fn held<F>(&self, key: ExecutionRecoveryKey, future: F) -> Result<ExecutionHeld>
     where
-        F: Future<Output = Result<ExecutionEnded>> + Send + 'static,
+        F: Future<Output = Result<ExecutionTerminalOutcome>> + Send + 'static,
     {
         self.require_sequence(key.sequence())?;
         Ok(ExecutionHeld {
@@ -254,8 +276,40 @@ mod tests {
                     .map_err(|_| invalid("terminal publisher disappeared"))
             })
             .unwrap();
-        sender.send(issuer.ended(&sequence).unwrap()).unwrap();
-        assert_eq!(block_on(held.wait()).unwrap().sequence(), &sequence);
+        sender
+            .send(ExecutionTerminalOutcome::ended(
+                issuer.ended(&sequence).unwrap(),
+            ))
+            .unwrap();
+        let terminal = block_on(held.wait()).unwrap();
+        assert_eq!(terminal.ended.sequence(), &sequence);
+        assert!(terminal.error.is_none());
+    }
+
+    #[test]
+    fn held_terminal_error_preserves_the_same_ended_identity() {
+        let issuer = ExecutorSequenceIssuer::new();
+        let sequence = issuer.issue_sequence().unwrap();
+        let (sender, receiver) = oneshot::channel();
+        let held = issuer
+            .held(issuer.recovery_key(&sequence).unwrap(), async move {
+                receiver
+                    .await
+                    .map_err(|_| invalid("terminal publisher disappeared"))
+            })
+            .unwrap();
+        sender
+            .send(
+                ExecutionTerminalOutcome::ended(issuer.ended(&sequence).unwrap()).with_error(
+                    ferrum_types::FerrumError::backend("terminal operation failed"),
+                ),
+            )
+            .unwrap();
+        let terminal = block_on(held.wait()).expect("operation failure must not erase closure");
+        assert_eq!(terminal.ended.sequence(), &sequence);
+        assert!(matches!(terminal.error,
+            Some(ferrum_types::FerrumError::Backend { message })
+                if message == "terminal operation failed"));
     }
 
     #[test]
@@ -265,7 +319,11 @@ mod tests {
         let other = issuer.issue_sequence().unwrap();
         let wrong = issuer.ended(&other).unwrap();
         let held = issuer
-            .held(issuer.recovery_key(&sequence).unwrap(), async { Ok(wrong) })
+            .held(issuer.recovery_key(&sequence).unwrap(), async {
+                Ok(ExecutionTerminalOutcome::ended(wrong).with_error(
+                    ferrum_types::FerrumError::backend("foreign terminal failure"),
+                ))
+            })
             .unwrap();
         assert!(block_on(held.wait()).is_err());
 
