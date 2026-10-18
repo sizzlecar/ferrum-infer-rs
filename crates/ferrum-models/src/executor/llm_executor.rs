@@ -343,6 +343,7 @@ impl ModelExecutor for LlmExecutor {
                 .downcast_ref::<GenericKvCacheHandle>()
                 .map(|g| g.request_cache_id().to_string())
         });
+        let owns_new_cache = supplied_handle_id.is_none();
         let cache_id = supplied_handle_id
             .clone()
             .unwrap_or_else(|| self.gen_cache_id());
@@ -366,16 +367,31 @@ impl ModelExecutor for LlmExecutor {
         let force_full_logits = metadata_requires_full_logits(&input.metadata);
         let logits = {
             let mut model = self.lock_model();
-            model.set_lora_adapter_for_cache(&cache_id, adapter)?;
-            if let Some(capacity_hint) = metadata_kv_capacity_hint(&input.metadata) {
-                model.prepare_kv_capacity(&cache_id, capacity_hint);
+            let preparation = (|| -> Result<()> {
+                if let Some(adapter) = &adapter {
+                    model.preload_lora_adapter(adapter)?;
+                }
+                if let Some(capacity_hint) = metadata_kv_capacity_hint(&input.metadata) {
+                    model.prepare_kv_capacity(&cache_id, capacity_hint);
+                }
+                model.reserve_kv_slots(&[KvSlotRequest {
+                    cache_id: cache_id.clone(),
+                    target_len: prior_seq_len + tokens.len(),
+                    admission_target_len: metadata_kv_admission_target_len(&input.metadata)
+                        .map(|len| len.max(prior_seq_len + tokens.len())),
+                }])?;
+                model.set_lora_adapter_for_cache(&cache_id, adapter)
+            })();
+            if let Err(error) = preparation {
+                // Only this fresh identity is ours to discard. A supplied
+                // continuation may already contain committed tokens.
+                if owns_new_cache {
+                    model.release(&cache_id);
+                }
+                return Err(error);
             }
-            model.reserve_kv_slots(&[KvSlotRequest {
-                cache_id: cache_id.clone(),
-                target_len: prior_seq_len + tokens.len(),
-                admission_target_len: metadata_kv_admission_target_len(&input.metadata)
-                    .map(|len| len.max(prior_seq_len + tokens.len())),
-            }])?;
+            // Execution errors below are not preparation rollback: a forward
+            // may already have advanced a supplied participant.
             if force_full_logits {
                 model.prefill(&cache_id, &tokens)
             } else {
@@ -500,16 +516,6 @@ impl ModelExecutor for LlmExecutor {
         let mut fallback_reason = "none";
         let per_item_logits: Vec<Vec<f32>> = {
             let mut model = self.lock_model();
-            for ((cache_id, adapter), input) in cache_ids
-                .iter()
-                .zip(lora_per_input.iter())
-                .zip(inputs.iter())
-            {
-                model.set_lora_adapter_for_cache(cache_id, adapter.clone())?;
-                if let Some(capacity_hint) = metadata_kv_capacity_hint(&input.metadata) {
-                    model.prepare_kv_capacity(cache_id, capacity_hint);
-                }
-            }
             let kv_requests: Vec<KvSlotRequest> = cache_ids
                 .iter()
                 .zip(prior_seq_lens.iter())
@@ -525,7 +531,35 @@ impl ModelExecutor for LlmExecutor {
                     }
                 })
                 .collect();
-            model.reserve_kv_slots(&kv_requests)?;
+            let preparation = (|| -> Result<()> {
+                for adapter in lora_per_input.iter().flatten() {
+                    model.preload_lora_adapter(adapter)?;
+                }
+                for (cache_id, input) in cache_ids.iter().zip(inputs) {
+                    if let Some(capacity_hint) = metadata_kv_capacity_hint(&input.metadata) {
+                        model.prepare_kv_capacity(cache_id, capacity_hint);
+                    }
+                }
+                model.reserve_kv_slots(&kv_requests)?;
+                for (cache_id, adapter) in cache_ids.iter().zip(&lora_per_input) {
+                    model.set_lora_adapter_for_cache(cache_id, adapter.clone())?;
+                }
+                Ok(())
+            })();
+            if let Err(error) = preparation {
+                for (input, cache_id) in inputs.iter().zip(&cache_ids) {
+                    // Recheck the immutable input only on failure; no success-
+                    // path allocation is needed to track generated identities.
+                    let supplied = input
+                        .kv_cache
+                        .as_ref()
+                        .and_then(|handle| handle.as_any().downcast_ref::<GenericKvCacheHandle>());
+                    if supplied.is_none() {
+                        model.release(cache_id);
+                    }
+                }
+                return Err(error);
+            }
             if force_full_logits {
                 took_fallback = true;
                 fallback_reason = "requires_full_logits";
@@ -661,6 +695,9 @@ impl ModelExecutor for LlmExecutor {
         // One model forward for all N+1 positions → flat seq_len*vocab.
         let flat = {
             let mut model = self.lock_model();
+            if let Some(adapter) = &adapter {
+                model.preload_lora_adapter(adapter)?;
+            }
             model.set_lora_adapter_for_cache(&cache_id, adapter)?;
             model.forward_verify(&cache_id, &token_ids)
         };
@@ -728,13 +765,16 @@ impl ModelExecutor for LlmExecutor {
         let force_full_logits = metadata_requires_full_logits(&input.metadata);
         let logits = {
             let mut model = self.lock_model();
-            model.set_lora_adapter_for_cache(&cache_id, adapter)?;
+            if let Some(adapter) = &adapter {
+                model.preload_lora_adapter(adapter)?;
+            }
             model.reserve_kv_slots(&[KvSlotRequest {
                 cache_id: cache_id.clone(),
                 target_len: seq_len.saturating_add(1),
                 admission_target_len: metadata_kv_admission_target_len(&input.metadata)
                     .map(|len| len.max(seq_len.saturating_add(1))),
             }])?;
+            model.set_lora_adapter_for_cache(&cache_id, adapter)?;
             if force_full_logits || input.logits_policy.requires_full_logits() {
                 model.decode(&cache_id, token, seq_len as u32)
             } else {
@@ -832,8 +872,8 @@ impl ModelExecutor for LlmExecutor {
             } else {
                 None
             };
-            for p in &prepped {
-                model.set_lora_adapter_for_cache(&p.cache_id, p.lora.clone())?;
+            for adapter in prepped.iter().filter_map(|p| p.lora.as_ref()) {
+                model.preload_lora_adapter(adapter)?;
             }
             let kv_requests: Vec<KvSlotRequest> = prepped
                 .iter()
@@ -844,6 +884,9 @@ impl ModelExecutor for LlmExecutor {
                 })
                 .collect();
             model.reserve_kv_slots(&kv_requests)?;
+            for p in &prepped {
+                model.set_lora_adapter_for_cache(&p.cache_id, p.lora.clone())?;
+            }
             let unified_items: Vec<(String, Vec<u32>, usize, bool)> = prepped
                 .iter()
                 .map(|p| (p.cache_id.clone(), vec![p.token], p.seq_len as usize, true))
@@ -997,10 +1040,13 @@ impl ModelExecutor for LlmExecutor {
             let model_result = {
                 let mut model = self.lock_model();
                 for item in &batch.items {
-                    model.set_lora_adapter_for_cache(
-                        &item.seq_id,
-                        active_lora_from_metadata(self.adapter_support, &item.metadata)?,
-                    )?;
+                    if let Some(adapter) =
+                        active_lora_from_metadata(self.adapter_support, &item.metadata)?
+                    {
+                        model.preload_lora_adapter(&adapter)?;
+                    }
+                }
+                for item in &batch.items {
                     if item.pos_offset == 0 {
                         if let Some(capacity_hint) = metadata_kv_capacity_hint(&item.metadata) {
                             model.prepare_kv_capacity(&item.seq_id, capacity_hint);
@@ -1019,6 +1065,12 @@ impl ModelExecutor for LlmExecutor {
                     })
                     .collect();
                 model.reserve_kv_slots(&kv_requests)?;
+                for item in &batch.items {
+                    model.set_lora_adapter_for_cache(
+                        &item.seq_id,
+                        active_lora_from_metadata(self.adapter_support, &item.metadata)?,
+                    )?;
+                }
                 if force_full_logits && !model.unified_forward_can_return_full_logits() {
                     fallback_reason = "requires_full_logits_unavailable";
                     None
@@ -1277,6 +1329,9 @@ mod tests {
         decode: usize,
         decode_batch_force_full_logits: Vec<bool>,
         prepared_kv: Vec<(String, usize)>,
+        live_caches: std::collections::HashSet<String>,
+        reserved_ids: Vec<String>,
+        released_ids: Vec<String>,
     }
 
     struct RecordingLlm {
@@ -1285,6 +1340,8 @@ mod tests {
         unified_unsupported_message: Option<String>,
         unified_full_logits_supported: bool,
         recurrent_state_spec: Option<RecurrentStateSpec>,
+        fail_reservation: bool,
+        fail_forward: bool,
     }
 
     impl RecordingLlm {
@@ -1294,6 +1351,8 @@ mod tests {
                 unified_unsupported_message: None,
                 unified_full_logits_supported: true,
                 recurrent_state_spec: None,
+                fail_reservation: false,
+                fail_forward: false,
                 config: crate::common::LlmRuntimeConfig {
                     hidden_size: 4,
                     num_layers: 1,
@@ -1381,6 +1440,9 @@ mod tests {
             calls.unified_forward += 1;
             calls.unified_forward_items.push(items.to_vec());
             drop(calls);
+            if self.fail_forward {
+                return Err(FerrumError::model("injected failure after forward entry"));
+            }
             if let Some(message) = &self.unified_unsupported_message {
                 return Err(FerrumError::unsupported(message.clone()));
             }
@@ -1411,13 +1473,38 @@ mod tests {
         }
 
         fn prepare_kv_capacity(&mut self, cache_id: &str, capacity_hint: usize) {
-            self.calls
-                .lock()
+            let mut calls = self.calls.lock();
+            calls
                 .prepared_kv
                 .push((cache_id.to_string(), capacity_hint));
+            calls.live_caches.insert(cache_id.to_string());
         }
 
-        fn release(&mut self, _cache_id: &str) {}
+        fn reserve_kv_slots(
+            &mut self,
+            requests: &[KvSlotRequest],
+        ) -> Result<Option<KvSlotReservation>> {
+            let mut calls = self.calls.lock();
+            for request in requests {
+                // Real paged reservation also ensures cache records before
+                // rejecting an over-capacity batch, without forwarding.
+                calls.live_caches.insert(request.cache_id.clone());
+                calls.reserved_ids.push(request.cache_id.clone());
+            }
+            if self.fail_reservation {
+                Err(FerrumError::resource_exhausted(
+                    "injected KV capacity failure",
+                ))
+            } else {
+                Ok(None)
+            }
+        }
+
+        fn release(&mut self, cache_id: &str) {
+            let mut calls = self.calls.lock();
+            calls.released_ids.push(cache_id.to_string());
+            calls.live_caches.remove(cache_id);
+        }
 
         fn cache_metrics_snapshot(&self) -> Option<serde_json::Value> {
             Some(serde_json::json!({
@@ -1527,6 +1614,103 @@ mod tests {
             seq_len,
             cache_id.to_string(),
         ))
+    }
+
+    #[test]
+    fn lora_preparation_capacity_failure_releases_only_generated_prefill_ids() {
+        let foreign: Arc<dyn KvCacheHandle> = Arc::new(ferrum_testkit::MockKvCacheHandle::new(
+            RequestId::new(),
+            1,
+            0,
+        ));
+        for supplied in [None, Some(test_kv_handle("existing", 2)), Some(foreign)] {
+            let calls = Arc::new(Mutex::new(RecordingCalls::default()));
+            calls.lock().live_caches.insert("existing".into());
+            let executor = LlmExecutor::new(
+                Box::new(RecordingLlm {
+                    fail_reservation: true,
+                    ..RecordingLlm::new(calls.clone())
+                }),
+                test_model_info(),
+            );
+            let mut input = PrefillInput::new(MockTensor::from_u32(&[1], &[1]).into_ref())
+                .with_metadata(kv_capacity_hint_metadata(16));
+            input.kv_cache = supplied;
+            let error = tokio_test::block_on(executor.prefill(&input)).unwrap_err();
+            assert!(matches!(error, FerrumError::ResourceExhausted { .. }));
+            let calls = calls.lock();
+            let new_ids: Vec<_> = calls
+                .reserved_ids
+                .iter()
+                .filter(|id| id.as_str() != "existing")
+                .cloned()
+                .collect();
+            assert_eq!(calls.released_ids, new_ids);
+            assert_eq!(
+                calls.live_caches,
+                std::collections::HashSet::from(["existing".into()])
+            );
+            assert_eq!((calls.prefill, calls.unified_forward), (0, 0));
+        }
+
+        let calls = Arc::new(Mutex::new(RecordingCalls::default()));
+        calls.lock().live_caches.insert("existing".into());
+        let executor = LlmExecutor::new(
+            Box::new(RecordingLlm {
+                fail_reservation: true,
+                ..RecordingLlm::new(calls.clone())
+            }),
+            test_model_info(),
+        );
+        let input = || {
+            PrefillInput::new(MockTensor::from_u32(&[1], &[1]).into_ref())
+                .with_metadata(kv_capacity_hint_metadata(16))
+        };
+        let inputs = [
+            input().with_kv_cache(test_kv_handle("existing", 2)),
+            input(),
+            input().with_kv_cache(Arc::new(ferrum_testkit::MockKvCacheHandle::new(
+                RequestId::new(),
+                1,
+                0,
+            ))),
+        ];
+        let error = tokio_test::block_on(executor.batch_prefill(&inputs)).unwrap_err();
+        assert!(matches!(error, FerrumError::ResourceExhausted { .. }));
+        let calls = calls.lock();
+        let new_ids: Vec<_> = calls
+            .reserved_ids
+            .iter()
+            .filter(|id| id.as_str() != "existing")
+            .cloned()
+            .collect();
+        assert_eq!(new_ids.len(), 2);
+        assert_eq!(calls.released_ids, new_ids);
+        assert_eq!(
+            calls.live_caches,
+            std::collections::HashSet::from(["existing".into()])
+        );
+        assert_eq!((calls.prefill, calls.unified_forward), (0, 0));
+    }
+
+    #[test]
+    fn lora_preparation_does_not_release_continuation_after_forward_error() {
+        let calls = Arc::new(Mutex::new(RecordingCalls::default()));
+        calls.lock().live_caches.insert("existing".into());
+        let executor = LlmExecutor::new(
+            Box::new(RecordingLlm {
+                fail_forward: true,
+                ..RecordingLlm::new(calls.clone())
+            }),
+            test_model_info(),
+        );
+        let input = PrefillInput::new(MockTensor::from_u32(&[1], &[1]).into_ref())
+            .with_kv_cache(test_kv_handle("existing", 2));
+        assert!(tokio_test::block_on(executor.prefill(&input)).is_err());
+        let calls = calls.lock();
+        assert_eq!(calls.unified_forward, 1);
+        assert!(calls.released_ids.is_empty());
+        assert!(calls.live_caches.contains("existing"));
     }
 
     #[test]

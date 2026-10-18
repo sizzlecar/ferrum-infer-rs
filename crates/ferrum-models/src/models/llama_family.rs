@@ -2779,13 +2779,30 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
                 "LoRA inference cannot use the token-only Llama-family prefix cache",
             ));
         }
-        if self.lora_adapters.contains_key(&adapter.name) {
+        if let Some(loaded) = self.lora_adapters.get(&adapter.name) {
+            if loaded.path != adapter.path {
+                return Err(ferrum_types::FerrumError::config(format!(
+                    "LoRA adapter {} is already loaded from {:?}, not {:?}",
+                    adapter.name, loaded.path, adapter.path
+                )));
+            }
             return Ok(());
         }
         let runtime = load_runtime_lora_adapter::<B>(&adapter)?;
         self.validate_lora_adapter(&runtime)?;
         self.lora_adapters.insert(adapter.name.clone(), runtime);
         Ok(())
+    }
+
+    fn single_decode_graph_enabled(&self) -> bool {
+        self.runtime_env.cuda_graph
+            && self.runtime_env.graph_capture_allowed()
+            && !self.use_host_residual_shadow()
+            && !self.use_device_residual_shadow()
+            // The single graph slot has no adapter identity. Both replay and
+            // capture must stay eager while any sequence binds an adapter;
+            // otherwise a cached base graph can bypass its LoRA projections.
+            && self.lora_cache_adapters.is_empty()
     }
 
     pub(crate) fn active_lora_adapter_for_cache(
@@ -4268,10 +4285,7 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         const GRAPH_WARMUP: usize = 3;
         let use_host_residual_shadow = self.use_host_residual_shadow();
         let use_device_residual_shadow = self.use_device_residual_shadow();
-        let graph_enabled = self.runtime_env.cuda_graph
-            && self.runtime_env.graph_capture_allowed()
-            && !use_host_residual_shadow
-            && !use_device_residual_shadow;
+        let graph_enabled = self.single_decode_graph_enabled();
 
         if graph_enabled {
             // Refresh device-side dynamic state (token/pos/kv_len) before
@@ -4999,6 +5013,10 @@ impl<B: MoeLlmBackend> DecoderOnlyLLM for LlamaFamilyModel<B, KvFp16> {
         Some(self.lora_metrics_snapshot_json())
     }
 
+    fn preload_lora_adapter(&mut self, adapter: &ActiveLoraAdapter) -> Result<()> {
+        self.ensure_lora_adapter_loaded(adapter.clone())
+    }
+
     fn set_lora_adapter_for_cache(
         &mut self,
         cache_id: &str,
@@ -5235,6 +5253,10 @@ impl<B: MoeLlmBackend + BackendInt8KvOps> DecoderOnlyLLM for LlamaFamilyModel<B,
         Some(self.lora_metrics_snapshot_json())
     }
 
+    fn preload_lora_adapter(&mut self, adapter: &ActiveLoraAdapter) -> Result<()> {
+        self.ensure_lora_adapter_loaded(adapter.clone())
+    }
+
     fn set_lora_adapter_for_cache(
         &mut self,
         cache_id: &str,
@@ -5426,6 +5448,10 @@ fn scale_llama3_rope_freq(
         (1.0 - smooth) * freq / factor + smooth * freq
     }
 }
+
+#[cfg(test)]
+#[path = "llama_family_lora_tests.rs"]
+mod lora_tests;
 
 #[cfg(test)]
 mod tests {

@@ -1,7 +1,7 @@
 //! Deterministic tiny-model construction for full-stack tests.
 //!
-//! Gated behind the `test-support` feature so it never ships in release
-//! builds. Downstream test code (e.g. `ferrum-engine/tests/tiny_stack.rs`)
+//! Available to unit tests and behind the `test-support` feature, so it never
+//! ships in release builds. Downstream tests (e.g. `ferrum-engine/tests/tiny_stack.rs`)
 //! uses this to assemble a real `ContinuousBatchEngine` over a real model
 //! forward + real paged KV on the CPU backend — no GPU, no model download,
 //! milliseconds per forward.
@@ -16,7 +16,7 @@ use std::sync::Arc;
 use ferrum_interfaces::kv_dtype::KvFp16;
 use ferrum_interfaces::tokenizer::{TokenizerInfo, TokenizerType};
 use ferrum_interfaces::{ModelExecutor, Tokenizer};
-use ferrum_kernels::backend::cpu::CpuBackend;
+use ferrum_kernels::backend::{cpu::CpuBackend, Backend};
 use ferrum_quantization::{DenseLinear, QuantConfig, WeightLoader};
 use ferrum_types::{
     DataType, Device, FerrumError, ModelInfo, ModelType, Result, SpecialTokens, TokenId,
@@ -135,31 +135,31 @@ impl SyntheticLlamaLoader {
     }
 }
 
-impl WeightLoader<CpuBackend> for SyntheticLlamaLoader {
-    fn load_tensor(&self, name: &str) -> Result<Vec<f32>> {
+impl<B: Backend> WeightLoader<B> for SyntheticLlamaLoader {
+    fn load_tensor(&self, name: &str) -> Result<B::Buffer> {
         if name == "model.embed_tokens.weight" {
-            return Ok(Self::deterministic_values(
+            return Ok(B::from_slice(&Self::deterministic_values(
                 name,
                 self.cfg.vocab_size * self.cfg.hidden_size,
                 0.0,
                 0.02,
-            ));
+            )));
         }
         if name == "model.norm.weight"
             || name.ends_with(".input_layernorm.weight")
             || name.ends_with(".post_attention_layernorm.weight")
         {
-            return Ok(self.layer_norm_values(name));
+            return Ok(B::from_slice(&self.layer_norm_values(name)));
         }
         Err(FerrumError::model(format!(
             "unexpected tensor requested by synthetic loader: {name}"
         )))
     }
 
-    fn load_linear(&self, name: &str) -> Result<Box<dyn ferrum_quantization::Linear<CpuBackend>>> {
+    fn load_linear(&self, name: &str) -> Result<Box<dyn ferrum_quantization::Linear<B>>> {
         let (out_features, in_features) = self.linear_dims(name)?;
         let weights = Self::deterministic_values(name, out_features * in_features, 0.0, 0.015);
-        Ok(Box::new(DenseLinear::<CpuBackend>::from_rows(
+        Ok(Box::new(DenseLinear::<B>::from_rows(
             &weights,
             out_features,
             in_features,

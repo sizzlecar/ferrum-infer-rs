@@ -65,6 +65,17 @@ pub trait DecoderOnlyLLM: Send + Sync {
         None
     }
 
+    /// Load and validate an adapter without binding a sequence or preparing KV.
+    /// Successfully prepared adapters may remain cached if another member of
+    /// the batch fails. While holding the same exclusive model access, binding
+    /// this exact name/path must not perform further fallible loading.
+    fn preload_lora_adapter(&mut self, adapter: &crate::lora::ActiveLoraAdapter) -> Result<()> {
+        Err(ferrum_types::FerrumError::unsupported(format!(
+            "LoRA preparation is not supported by this model/backend for adapter {}",
+            adapter.name
+        )))
+    }
+
     /// Bind or clear a startup LoRA adapter for a model-side KV cache id.
     ///
     /// The executor calls this before prefill/decode based on request

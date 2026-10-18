@@ -137,18 +137,18 @@ mod execution {
     use ferrum_models::test_support::{tiny_llama_executor, TinyLlamaConfig};
     use ferrum_types::FerrumError;
 
-    fn tokens(ids: &[u32]) -> ferrum_interfaces::TensorRef {
+    pub(super) fn tokens(ids: &[u32]) -> ferrum_interfaces::TensorRef {
         common::wrap_tensor(common::tokens_to_tensor(ids, &candle_core::Device::Cpu).unwrap())
     }
 
-    fn metadata(path: &std::path::Path) -> HashMap<String, serde_json::Value> {
+    pub(super) fn metadata(path: &std::path::Path) -> HashMap<String, serde_json::Value> {
         HashMap::from([
             ("ferrum_lora_adapter".into(), serde_json::json!("delta")),
             ("ferrum_lora_path".into(), serde_json::json!(path)),
         ])
     }
 
-    fn model_adapter(cfg: &TinyLlamaConfig) -> TempDir {
+    pub(super) fn model_adapter(cfg: &TinyLlamaConfig) -> TempDir {
         let directory = TempDir::new().unwrap();
         let mut a = vec![0.0; cfg.hidden_size];
         a[0] = 1.0;
@@ -324,3 +324,7 @@ mod execution {
         executor.release_cache("invalid-lora-second");
     }
 }
+
+#[cfg(feature = "test-support")]
+#[path = "lora_runtime_loader/preparation.rs"]
+mod preparation;
