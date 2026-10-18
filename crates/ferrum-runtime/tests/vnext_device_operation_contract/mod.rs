@@ -1593,6 +1593,7 @@ pub(crate) struct RuntimeTrace {
     pub(crate) tamper_buffer_descriptor: bool,
     pub(crate) persistent_descriptor_fault: Option<PersistentDescriptorFault>,
     pub(crate) drift_on_submit: bool,
+    pub(crate) submission_attribution_panics: bool,
     pub(crate) next_fence: u64,
     pub(crate) submit_behavior: SubmitBehavior,
     pub(crate) fence_behavior: FenceBehavior,
@@ -2450,6 +2451,12 @@ impl DeviceRuntime for TestRuntime {
     }
 
     fn submission_attribution(&self, fence: &Self::Fence) -> Option<DeviceSubmissionAttribution> {
+        let panics = self.trace.lock().unwrap().submission_attribution_panics;
+        // Do not poison the shared fixture state: subsequent real fence
+        // observation and cleanup must remain available after the fault.
+        if panics {
+            panic!("injected submission attribution panic");
+        }
         fence.2.clone()
     }
 

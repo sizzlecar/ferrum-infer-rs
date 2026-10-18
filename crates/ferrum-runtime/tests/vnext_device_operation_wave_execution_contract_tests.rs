@@ -48,6 +48,96 @@ fn reusable_topology_observes_packed_step_token_coordinates() {
 }
 
 #[test]
+fn wave_attribution_panic_keeps_submitted_fence_until_terminal() {
+    let (fixture, sequence, session, batch, step) = setup();
+    let wave = prepare_wave(&fixture.plan_resources, &fixture.plan, &step);
+    let active_bindings = wave_active_bindings(&wave, &session);
+    let lane = Arc::clone(step.execution_lane());
+    let reaper = CompletionReaper::new();
+    let providers = fixture
+        .plan
+        .payload()
+        .nodes()
+        .iter()
+        .map(|node| fixture.registry.bind(&fixture.resolved, node.id()).unwrap())
+        .collect::<Vec<_>>();
+    let batch_identity = OperationDispatch::bind_submission_wave_identity(
+        &fixture.resolved,
+        active_bindings.iter(),
+        &wave,
+        &lane,
+    )
+    .unwrap();
+    let step_owner = Arc::downgrade(&step);
+    {
+        let mut trace = fixture.runtime_trace.lock().unwrap();
+        trace.submission_attribution_panics = true;
+        trace.fence_behavior = FenceBehavior::Pending;
+    }
+
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        OperationDispatch::encode_and_submit_wave(
+            &providers,
+            &fixture.resolved,
+            &batch_identity,
+            active_bindings.iter(),
+            DeviceTimingMode::Off,
+            wave,
+            &lane,
+            &reaper,
+        )
+    }))
+    .expect("attribution panic must return the submitted completion, not unwind");
+    let completion = match outcome {
+        Err(SubmissionWaveDispatchError::PostSubmitContract { completion, .. }) => completion,
+        other => panic!("attribution panic lost its submitted completion: {other:?}"),
+    };
+    assert_eq!(completion.receipt().batch_identity(), &batch_identity);
+    assert_eq!(fixture.runtime_trace.lock().unwrap().submit_calls, 1);
+    assert!(lane.is_fail_closed());
+    assert_eq!(lane.in_flight_count(), 1);
+    assert_eq!(reaper.retained_count(), 1);
+    assert!(matches!(
+        completion.poll().unwrap(),
+        CompletionObservation::Pending
+    ));
+    let step = step
+        .try_retire_normal()
+        .expect_err("pending submitted work must retain its step resources")
+        .into_step();
+    assert!(std::sync::Weak::ptr_eq(&step_owner, &Arc::downgrade(&step)));
+    assert_eq!(lane.in_flight_count(), 1);
+    assert_eq!(reaper.retained_count(), 1);
+
+    fixture.runtime_trace.lock().unwrap().fence_behavior = FenceBehavior::Succeeded;
+    let terminal = match completion.poll().unwrap() {
+        CompletionObservation::Terminal(receipt) => receipt,
+        other => panic!("submitted fence did not reach its real terminal result: {other:?}"),
+    };
+    assert_eq!(terminal.submission(), completion.receipt());
+    assert!(matches!(
+        terminal.disposition(),
+        OperationCompletionDisposition::Succeeded
+    ));
+    assert_eq!(reaper.retained_count(), 0);
+    assert_eq!(lane.in_flight_count(), 0);
+    {
+        let trace = fixture.runtime_trace.lock().unwrap();
+        assert_eq!(trace.submit_calls, 1);
+        assert_eq!(trace.synchronize_calls, 0);
+    }
+    assert!(completion.poll().is_err(), "terminal slot is consumed once");
+
+    drop(completion);
+    drop(providers);
+    drop(active_bindings);
+    drop(reaper);
+    drop(lane);
+    teardown(fixture, sequence, session, batch, step);
+    assert!(step_owner.upgrade().is_none());
+}
+
+#[test]
 fn kernel_profile_binds_native_work_to_exact_plan_nodes() {
     let (fixture, sequence, session, batch, step) = setup();
     let wave = prepare_wave(&fixture.plan_resources, &fixture.plan, &step);
