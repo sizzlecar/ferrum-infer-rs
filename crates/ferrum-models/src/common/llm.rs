@@ -13,7 +13,7 @@ use ferrum_types::{RequestId, Result, TokenId};
 
 mod token;
 pub(crate) use token::catch_host_execution;
-pub use token::{ModelTokenOutcome, ModelTokenWork};
+pub use token::{ModelKvReservation, ModelTokenOutcome, ModelTokenWork};
 
 /// Runtime configuration every decoder-only LLM must expose.
 ///
@@ -182,6 +182,14 @@ pub trait DecoderOnlyLLM: Send + Sync {
         _requests: &[KvSlotRequest],
     ) -> std::result::Result<Option<KvSlotReservation>, ferrum_types::FerrumError> {
         Ok(None)
+    }
+
+    /// Reserve through the same model-owned allocator, preserving its typed
+    /// fit rejection where available. The default does not reinterpret an
+    /// error or a diagnostic snapshot as a capacity deferral.
+    fn reserve_token_kv_slots(&mut self, requests: &[KvSlotRequest]) -> Result<ModelKvReservation> {
+        self.reserve_kv_slots(requests)
+            .map(ModelKvReservation::Reserved)
     }
 
     /// Snapshot model-owned paged-KV capacity without allocating slots.

@@ -24,6 +24,8 @@ struct Observation {
     forwards: Vec<(String, usize, usize)>,
     releases: Vec<(String, Vec<usize>)>,
     fail_on_forward: Option<(usize, Fault)>,
+    fail_prepare_after_allocation: bool,
+    fail_close: bool,
 }
 
 struct ObservedModel {
@@ -39,16 +41,21 @@ impl DecoderOnlyLLM for ObservedModel {
         true
     }
     fn prepare_kv_capacity(&mut self, cache_id: &str, capacity_hint: usize) {
-        self.state
-            .lock()
-            .model
-            .prepare_kv_capacity(cache_id, capacity_hint);
+        let mut state = self.state.lock();
+        state.model.prepare_kv_capacity(cache_id, capacity_hint);
+        assert!(
+            !state.fail_prepare_after_allocation,
+            "injected preparation panic after actual KV allocation"
+        );
     }
     fn reserve_kv_slots(
         &mut self,
         requests: &[KvSlotRequest],
     ) -> Result<Option<KvSlotReservation>> {
         self.state.lock().model.reserve_kv_slots(requests)
+    }
+    fn reserve_token_kv_slots(&mut self, requests: &[KvSlotRequest]) -> Result<ModelKvReservation> {
+        self.state.lock().model.reserve_token_kv_slots(requests)
     }
     fn execute_token_work(
         &mut self,
@@ -78,6 +85,9 @@ impl DecoderOnlyLLM for ObservedModel {
     }
     fn close_token_sequence(&mut self, cache_id: &str) -> Result<()> {
         let mut state = self.state.lock();
+        if state.fail_close {
+            return Err(FerrumError::device("injected cleanup observation failure"));
+        }
         let lengths = state
             .model
             .kv_caches
@@ -113,6 +123,8 @@ fn fixture(
         forwards: Vec::new(),
         releases: Vec::new(),
         fail_on_forward: fault,
+        fail_prepare_after_allocation: false,
+        fail_close: false,
     }));
     let executor = LlmExecutor::new(
         Box::new(ObservedModel {
@@ -179,7 +191,17 @@ async fn direct_tokens_real_llama_partial_final_decode_and_close() {
             adapter: None
         })
         .is_err());
-    assert!(observation.lock().model.kv_caches.is_empty());
+    {
+        let state = observation.lock();
+        assert_eq!(state.model.kv_caches.len(), 1);
+        assert!(state
+            .model
+            .kv_caches
+            .values()
+            .flatten()
+            .all(|cache| cache.len == 0 && cache.capacity >= 16));
+        assert!(state.forwards.is_empty());
+    }
     let partial = prefill(&executor, &start, 2, 3).await;
     assert!(matches!(partial.product(), ExecutionProduct::Intermediate));
     reference.prefill("reference", &[1, 2]);
@@ -244,6 +266,145 @@ async fn direct_tokens_real_llama_partial_final_decode_and_close() {
     assert_eq!(state.releases.len(), 1);
     assert_eq!(state.releases[0].1, vec![4; config.num_layers]);
     assert!(executor.token_sequences.lock().live.is_empty());
+}
+
+#[test]
+fn direct_tokens_real_llama_admission_reserves_actual_blocks_and_retries_after_release() {
+    let (executor, observation, _) = fixture(None);
+    {
+        let mut state = observation.lock();
+        state.model.runtime_env.metal_paged_kv = Some(true);
+        state.model.runtime_env.kv_max_blocks = Some(3);
+    }
+    let prompt = vec![TokenId(1); 17];
+    let first_request = RequestId::new();
+    let second_request = RequestId::new();
+    fn admission<'a>(request: &'a RequestId, prompt: &'a [TokenId]) -> ExecutionAdmission<'a> {
+        ExecutionAdmission {
+            context: ExecutorPrefillAdmission::for_startup(request, prompt, 64),
+            adapter: None,
+        }
+    }
+    let TokenAdmissionOutcome::Admitted(first) = executor
+        .admit_tokens(admission(&first_request, &prompt))
+        .unwrap()
+    else {
+        panic!("first prompt should reserve two physical blocks");
+    };
+    let TokenAdmissionOutcome::CapacityDeferred(deferred) = executor
+        .admit_tokens(admission(&second_request, &prompt))
+        .unwrap()
+    else {
+        panic!("second prompt must observe the occupied physical pool");
+    };
+    assert_eq!(deferred.required_blocks(), 2);
+    assert_eq!(deferred.snapshot().block_size, 16);
+    assert_eq!(deferred.snapshot().total_blocks, 3);
+    assert_eq!(deferred.snapshot().free_blocks, 1);
+    {
+        let state = observation.lock();
+        assert!(state.forwards.is_empty());
+        assert_eq!(state.model.kv_caches.len(), 1);
+        for cache in state.model.kv_caches.values().flatten() {
+            assert_eq!(cache.len, 0);
+            assert_eq!(cache.paged_block_indices.len(), 2);
+        }
+        assert_eq!(
+            state.model.kv_slot_capacity_snapshot().unwrap().free_blocks,
+            1
+        );
+    }
+    assert_eq!(executor.token_sequences.lock().live.len(), 1);
+    let closed = executor.cancel_tokens(first.sequence()).unwrap();
+    assert!(closed.error.is_none());
+    assert!(matches!(
+        closed.disposition,
+        ExecutionCloseDisposition::Ended(_)
+    ));
+    assert_eq!(
+        observation
+            .lock()
+            .model
+            .kv_slot_capacity_snapshot()
+            .unwrap()
+            .free_blocks,
+        3
+    );
+    let TokenAdmissionOutcome::Admitted(second) = executor
+        .admit_tokens(admission(&second_request, &prompt))
+        .unwrap()
+    else {
+        panic!("actual release must permit the unchanged second request");
+    };
+    assert!(matches!(
+        executor
+            .cancel_tokens(second.sequence())
+            .unwrap()
+            .disposition,
+        ExecutionCloseDisposition::Ended(_)
+    ));
+    let impossible = vec![TokenId(1); 49];
+    assert!(executor
+        .admit_tokens(ExecutionAdmission {
+            context: ExecutorPrefillAdmission::for_startup(&RequestId::new(), &impossible, 64),
+            adapter: None,
+        })
+        .is_err());
+    assert!(executor.token_sequences.lock().live.is_empty());
+    let state = observation.lock();
+    assert!(state.model.kv_caches.is_empty());
+    assert!(state.forwards.is_empty());
+    assert_eq!(
+        state.model.kv_slot_capacity_snapshot().unwrap().free_blocks,
+        3
+    );
+}
+
+#[test]
+fn direct_tokens_real_llama_admission_preserves_primary_failure_and_original_owner() {
+    let (executor, observation, _) = fixture(None);
+    {
+        let mut state = observation.lock();
+        state.fail_prepare_after_allocation = true;
+        state.fail_close = true;
+    }
+    let prompt = [TokenId(1), TokenId(2)];
+    let request = RequestId::new();
+    let error = executor
+        .admit_tokens(ExecutionAdmission {
+            context: ExecutorPrefillAdmission::for_startup(&request, &prompt, 16),
+            adapter: None,
+        })
+        .unwrap_err();
+    assert!(matches!(error, FerrumError::Backend { .. }));
+    assert!(error
+        .to_string()
+        .contains("injected preparation panic after actual KV allocation"));
+    let sequence = {
+        let sequences = executor.token_sequences.lock();
+        assert_eq!(sequences.live.len(), 1);
+        let (sequence, entry) = sequences.live.iter().next().unwrap();
+        assert!(entry.closing);
+        let state = observation.lock();
+        assert_eq!(state.model.kv_caches.len(), 1);
+        assert!(state.model.kv_caches[&entry.cache_id]
+            .iter()
+            .all(|cache| cache.len == 0));
+        assert!(state.forwards.is_empty());
+        assert!(state.releases.is_empty());
+        sequence.clone()
+    };
+    observation.lock().fail_close = false;
+    let closed = executor.cancel_tokens(&sequence).unwrap();
+    assert!(closed.error.is_none());
+    assert!(matches!(
+        closed.disposition,
+        ExecutionCloseDisposition::Ended(_)
+    ));
+    assert!(executor.token_sequences.lock().live.is_empty());
+    let state = observation.lock();
+    assert!(state.model.kv_caches.is_empty());
+    assert_eq!(state.releases.len(), 1);
 }
 
 async fn partial_failure(fault: Fault) {

@@ -2,6 +2,14 @@
 
 use ferrum_types::{FerrumError, Result};
 
+/// An observation made by the model's actual KV allocator. A deferred fit
+/// check has not reserved the requested blocks and grants no execution right.
+#[derive(Debug)]
+pub enum ModelKvReservation {
+    Reserved(Option<ferrum_execution::model_executor::KvSlotReservation>),
+    CapacityDeferred(ferrum_execution::token_execution::TokenAdmissionCapacityDeferral),
+}
+
 #[derive(Debug, Clone, Copy)]
 pub enum ModelTokenWork<'a> {
     Prefill { tokens: &'a [u32], position: usize },
@@ -22,6 +30,9 @@ pub enum ModelTokenOutcome {
 /// A device enqueue panic cannot be made terminal by catching it here.
 pub(crate) fn catch_host_execution<T>(work: impl FnOnce() -> T) -> Result<T> {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(work)).map_err(|payload| {
+        if let Some(error) = payload.downcast_ref::<FerrumError>() {
+            return error.clone();
+        }
         let detail = payload
             .downcast_ref::<String>()
             .map(String::as_str)

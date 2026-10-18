@@ -971,6 +971,33 @@ where
         }
     }
 
+    fn reserve_token_kv_slots(
+        &mut self,
+        requests: &[ferrum_execution::model_executor::KvSlotRequest],
+    ) -> Result<crate::common::llm::ModelKvReservation> {
+        use crate::common::llm::ModelKvReservation;
+        if self.stages.is_empty() || self.stages.len() != self.placement.stages().len() {
+            return Err(FerrumError::request_validation(
+                "token reservation requires a complete layer-stage placement",
+            ));
+        }
+        for (index, stage) in self.stages.iter_mut().enumerate() {
+            let result =
+                B::with_device_ordinal(self.placement.stage(index).backend_device_ordinal, || {
+                    stage.reserve_token_kv_slots(requests)
+                })?;
+            if matches!(result, ModelKvReservation::CapacityDeferred(_)) {
+                // This is the actual rejecting stage's allocator observation,
+                // not a fabricated aggregate pool. Earlier reservations stay
+                // with their stages until the caller closes the incarnation.
+                return Ok(result);
+            }
+        }
+        // Every stage reserved successfully. There is no single physical
+        // allocator snapshot representing these independent stage pools.
+        Ok(ModelKvReservation::Reserved(None))
+    }
+
     fn cache_metrics_snapshot(&self) -> Option<serde_json::Value> {
         let stage_bridge = self.placement.stage_bridge();
         let pipeline_mode = self.pipeline_mode();

@@ -39,7 +39,9 @@ pub trait Backend: Send + Sync + Sized + 'static {
     ///   - CPU: `()` (no-op, ops execute inline)
     ///   - Metal: wraps a CommandBuffer
     ///   - CUDA: wraps a CudaStream
-    type Context;
+    // Submitted contexts must be retainable by the model's recovery service,
+    // independently of the thread/future that initiated the operation.
+    type Context: Send + Sync;
 
     /// GPU-side timer scoped to this backend. See `super::timer` —
     /// CPU: `Instant`; Metal: sync-wrap; CUDA: `cuEvent`.

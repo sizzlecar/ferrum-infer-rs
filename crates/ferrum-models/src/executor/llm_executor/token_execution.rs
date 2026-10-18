@@ -11,7 +11,9 @@ use ferrum_execution::model_executor::ExecutorSamplingOutput;
 use ferrum_execution::token_execution::*;
 
 use super::*;
-use crate::common::llm::{catch_host_execution, ModelTokenOutcome, ModelTokenWork};
+use crate::common::llm::{
+    catch_host_execution, ModelKvReservation, ModelTokenOutcome, ModelTokenWork,
+};
 
 #[derive(Default)]
 pub(super) struct TokenSequences {
@@ -27,8 +29,6 @@ struct TokenSequence {
     replayed_output_tokens: usize,
     frontier: ExecutionFrontier,
     recovery_key: ExecutionRecoveryKey,
-    adapter: Option<ActiveLoraAdapter>,
-    prepared: bool,
     closing: bool,
 }
 
@@ -112,11 +112,16 @@ impl LlmExecutor {
         let sequence = self.token_issuer.issue_sequence()?;
         let frontier = self.token_issuer.frontier(&sequence, 0)?;
         let recovery_key = self.token_issuer.recovery_key(&sequence)?;
+        let cache_id = self.gen_cache_id();
+        // Keep the incarnation reachable before preparing any physical KV.
+        // It becomes externally usable only after the model has reserved the
+        // prompt and bound the already-loaded adapter. Failed preparation is
+        // retired through the same actual model owner, never a global reset.
         sequences.live.insert(
-            sequence,
+            sequence.clone(),
             TokenSequence {
                 request_id: context.request_id.clone(),
-                cache_id: self.gen_cache_id(),
+                cache_id: cache_id.clone(),
                 prompt: context
                     .input_tokens
                     .iter()
@@ -127,12 +132,59 @@ impl LlmExecutor {
                 replayed_output_tokens: context.replayed_output_tokens,
                 frontier: frontier.clone(),
                 recovery_key,
-                adapter,
-                prepared: false,
                 closing: false,
             },
         );
-        Ok(TokenAdmissionOutcome::Admitted(frontier))
+        let preparation = catch_host_execution(|| -> Result<ModelKvReservation> {
+            model.prepare_kv_capacity(&cache_id, context.maximum_sequence_tokens);
+            let reservation = model.reserve_token_kv_slots(&[KvSlotRequest {
+                cache_id: cache_id.clone(),
+                target_len: context.input_tokens.len(),
+                admission_target_len: Some(context.input_tokens.len()),
+            }])?;
+            if matches!(reservation, ModelKvReservation::Reserved(_)) {
+                model.set_lora_adapter_for_cache(&cache_id, adapter)?;
+            }
+            Ok(reservation)
+        })
+        .and_then(|result| result);
+        match preparation {
+            Ok(ModelKvReservation::Reserved(_)) => Ok(TokenAdmissionOutcome::Admitted(frontier)),
+            result => {
+                let cleanup_error =
+                    match self.close_token_locked(&mut sequences, &mut **model, &sequence) {
+                        Err(error) => Some(error),
+                        Ok(closed) => closed.error.or_else(|| {
+                            (!matches!(closed.disposition, ExecutionCloseDisposition::Ended(_)))
+                                .then(|| {
+                                    FerrumError::backend(
+                                        "token admission cleanup remains held by the model",
+                                    )
+                                })
+                        }),
+                    };
+                if let Some(cleanup_error) = cleanup_error {
+                    // Keep the primary error's actual variant/panic detail.
+                    // FerrumError has no source stack, so report the separate
+                    // cleanup failure while its original owner stays reachable
+                    // through the closing registry entry.
+                    tracing::error!(
+                        request_id = %context.request_id,
+                        primary_error = ?result.as_ref().err(),
+                        %cleanup_error,
+                        "token admission cleanup failed; model ownership retained",
+                    );
+                    return Err(result.err().unwrap_or(cleanup_error));
+                }
+                match result {
+                    Ok(ModelKvReservation::CapacityDeferred(deferred)) => {
+                        Ok(TokenAdmissionOutcome::CapacityDeferred(deferred))
+                    }
+                    Err(error) => Err(error),
+                    Ok(ModelKvReservation::Reserved(_)) => unreachable!(),
+                }
+            }
+        }
     }
 
     pub(super) fn execute_token_batch(
@@ -180,18 +232,11 @@ impl LlmExecutor {
                 }
             };
             let preparation = catch_host_execution(|| -> Result<()> {
-                if !entry.prepared {
-                    model.prepare_kv_capacity(&entry.cache_id, entry.maximum_tokens);
-                }
                 model.reserve_kv_slots(&[KvSlotRequest {
                     cache_id: entry.cache_id.clone(),
                     target_len: range.end(),
                     admission_target_len: Some(entry.prompt.len().max(range.end())),
                 }])?;
-                if !entry.prepared {
-                    model.set_lora_adapter_for_cache(&entry.cache_id, entry.adapter.clone())?;
-                    entry.prepared = true;
-                }
                 Ok(())
             })
             .and_then(|result| result);

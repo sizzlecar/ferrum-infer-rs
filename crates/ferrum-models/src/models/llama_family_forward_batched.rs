@@ -9,7 +9,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use ferrum_execution::model_executor::{
-    GreedyRepetitionPenalty, LogitsReturnPolicy, TokenSelectionMask,
+    ExecutorSamplingOutput, GreedyRepetitionPenalty, LogitsReturnPolicy, TokenSelectionMask,
 };
 use ferrum_interfaces::kv_dtype::KvFp16;
 use ferrum_kernels::backend::{
@@ -17,7 +17,7 @@ use ferrum_kernels::backend::{
     KvCache, MoeLlmBackend, MAX_LAYERS_FOR_GRAPH,
 };
 use ferrum_quantization::Linear;
-use ferrum_types::{Activation, Result};
+use ferrum_types::{Activation, Result, TokenId};
 
 #[cfg(feature = "cuda")]
 use ferrum_kernels::backend::cuda::marlin::{
@@ -26,6 +26,9 @@ use ferrum_kernels::backend::cuda::marlin::{
     MARLIN_WS_ZERO_TIME_US,
 };
 
+use super::llama_family::device_execution::{
+    self, FrameLayout, LlamaExecutionFrame, QuiescentContext,
+};
 use super::llama_family::{
     elapsed_micros_u64_floor1, llama_layer_attention_schedule, llama_qk_mode, LlamaFamilyModel,
     LlamaStageHiddenBridgeTiming, ATTN_CALLS, ATTN_TIME_US, BATCHED_GRAPH_EAGER_COUNT,
@@ -35,6 +38,55 @@ use super::llama_family::{
     TAIL_NORM_CALLS, TAIL_NORM_TIME_US, TAIL_RESID_CALLS, TAIL_RESID_TIME_US,
 };
 use super::llama_family_pipeline::{LlamaPipelineStageBatchOps, PipelineHidden};
+
+// Compatibility for the retiring vector API. The numerical core records its
+// actual readback kind before this conversion; direct token execution never
+// interprets a one-element vector as evidence of GPU argmax.
+fn legacy_sampling_values(output: ExecutorSamplingOutput) -> Result<Vec<f32>> {
+    match output {
+        ExecutorSamplingOutput::FullLogits(logits) => Ok(logits),
+        ExecutorSamplingOutput::GreedyToken(token) => Ok(vec![token.get() as f32]),
+        ExecutorSamplingOutput::NoSelectableFiniteLogit => Err(ferrum_types::FerrumError::backend(
+            "No finite logits available for sampling",
+        )),
+    }
+}
+
+/// Selection may have encoded additional work before declining the fast
+/// path. A full readback must observe that work, even if the original logits
+/// were ready before the selection attempt.
+fn read_full_logits_after_selection<B: MoeLlmBackend>(
+    context: &mut B::Context,
+    logits: &B::Buffer,
+    count: usize,
+    quiescent: &mut Option<QuiescentContext>,
+) -> Vec<f32> {
+    if quiescent.is_none() {
+        *quiescent = Some(device_execution::checked_sync::<B>(context));
+    }
+    B::to_vec(logits, count)
+}
+
+/// A missing graph is an eager opportunity only before capture. After a
+/// successful capture, the recorded operations have not run until this
+/// first replay actually succeeds.
+fn replay_new_batched_graph<B: BackendGraph>(
+    context: &mut B::Context,
+    graph_key: u64,
+    failed: &mut bool,
+) -> Result<()> {
+    let result = match B::replay_graph(context, graph_key) {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(ferrum_types::FerrumError::backend(
+            "captured batched graph was unavailable before its first execution",
+        )),
+        Err(error) => Err(error),
+    };
+    if result.is_err() {
+        *failed = true;
+    }
+    result
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct LlamaBatchedRuntimeConfig {
@@ -535,6 +587,178 @@ mod tests {
     use ferrum_execution::model_executor::{
         GreedyRepetitionPenalty, LogitsReturnPolicy, TokenSelectionMask,
     };
+
+    fn physical_batch_frame_retains_scratch<B: ferrum_kernels::backend::MoeLlmBackend>(
+        identity: impl Fn(&B::Buffer) -> usize,
+    ) {
+        use super::super::llama_family::device_execution::DeviceFrameResult;
+        use crate::common::DecoderOnlyLLM;
+        use crate::models::llama_family::{LlamaFamilyConfig, LlamaFamilyModel};
+        use crate::test_support::SyntheticLlamaLoader;
+        use ferrum_execution::model_executor::ExecutorSamplingOutput;
+        use ferrum_interfaces::kv_dtype::KvFp16;
+
+        let config = LlamaFamilyConfig {
+            hidden_size: 128,
+            intermediate_size: 256,
+            num_heads: 2,
+            num_kv_heads: 1,
+            head_dim: 64,
+            num_layers: 1,
+            vocab_size: 128,
+            max_seq_len: 32,
+            ..Default::default()
+        };
+        let loader = SyntheticLlamaLoader::new(config.clone());
+        let mut model = LlamaFamilyModel::<B, KvFp16>::new(config.clone(), &loader).unwrap();
+        let mut reference = LlamaFamilyModel::<B, KvFp16>::new(config, &loader).unwrap();
+        for current in [&mut model, &mut reference] {
+            current.runtime_env.metal_paged_kv = Some(false);
+            current.runtime_env.prefix_cache = false;
+            current.runtime_env.cuda_graph = false;
+            current.runtime_env.kv_capacity = Some(32);
+            current.batched_cfg.batched_graph = false;
+            current.batched_cfg.decode_op_profile = false;
+            current.prefill_internal("a", &[1, 2, 3]);
+            current.prefill_internal("b", &[3, 2, 1]);
+        }
+        assert!(model.supports_batched_decode);
+        let batch = vec![("a".to_string(), 4, 3), ("b".to_string(), 5, 3)];
+        let expected: Vec<_> = batch
+            .iter()
+            .map(|(id, token, position)| reference.decode_internal(id, *token, *position))
+            .collect();
+        let original = identity(model.scratch.residual.as_ref().unwrap());
+        let result: DeviceFrameResult<()> = model.run_device_frame(|model, frame| {
+            let outputs = model.decode_batch_in_frame(frame, &batch, DecodeLogitsReturn::Full);
+            assert_eq!(outputs.len(), 2);
+            for (output, expected) in outputs.into_iter().zip(&expected) {
+                let ExecutorSamplingOutput::FullLogits(actual) = output else {
+                    panic!("full batch policy must preserve every logit");
+                };
+                assert_eq!(actual.len(), expected.len());
+                for (actual, expected) in actual.iter().zip(expected) {
+                    assert!(actual.is_finite() && expected.is_finite());
+                    assert!((actual - expected).abs() <= 1e-5 * (1.0 + expected.abs()));
+                }
+            }
+            assert!(model.scratch.residual.is_none());
+            assert_eq!(identity(frame.residual.as_ref().unwrap()), original);
+            std::panic::panic_any(ferrum_types::FerrumError::backend(
+                "injected after physical batch readback",
+            ));
+        });
+        let DeviceFrameResult::Terminal(Err(error)) = result else {
+            panic!("completed physical batch must preserve its terminal failure");
+        };
+        assert!(error
+            .to_string()
+            .contains("injected after physical batch readback"));
+        assert_eq!(identity(model.scratch.residual.as_ref().unwrap()), original);
+        for id in ["a", "b"] {
+            assert!(model.kv_caches[id].iter().all(|cache| cache.len == 4));
+        }
+        // CPU/Metal have no cached CUDA graph, so the real replay API returns
+        // Ok(false). Exercise the same first-replay check used after capture:
+        // no logits/length bump may follow it, and already encoded preparation
+        // must still finish before the original scratch returns to the model.
+        let missing_graph: DeviceFrameResult<()> = model.run_device_frame(|model, frame| {
+            frame
+                .take_scratch(&mut model.scratch, super::FrameLayout::Single, false)
+                .unwrap();
+            B::scale_inplace(
+                &mut frame.context,
+                frame.residual.as_mut().unwrap(),
+                2.0,
+                2 * model.cfg.hidden_size,
+            );
+            super::replay_new_batched_graph::<B>(
+                &mut frame.context,
+                u64::MAX,
+                &mut model.batched_graph_failed,
+            )
+            .unwrap_or_else(|error| std::panic::panic_any(error));
+            panic!("missing first graph replay must not reach readback");
+        });
+        let DeviceFrameResult::Terminal(Err(error)) = missing_graph else {
+            panic!("missing graph must retain the real terminal failure");
+        };
+        assert!(error
+            .to_string()
+            .contains("unavailable before its first execution"));
+        assert!(model.batched_graph_failed);
+        assert_eq!(identity(model.scratch.residual.as_ref().unwrap()), original);
+        for id in ["a", "b"] {
+            assert!(model.kv_caches[id].iter().all(|cache| cache.len == 4));
+        }
+        model.release("a");
+        let actual_peer = model.decode_internal("b", 6, 4);
+        let expected_peer = reference.decode_internal("b", 6, 4);
+        assert_eq!(actual_peer.len(), expected_peer.len());
+        for (actual, expected) in actual_peer.iter().zip(&expected_peer) {
+            assert!(actual.is_finite() && expected.is_finite());
+            assert!((actual - expected).abs() <= 1e-5 * (1.0 + expected.abs()));
+        }
+        assert!(model.kv_caches["b"].iter().all(|cache| cache.len == 5));
+        model.release("b");
+        assert!(model.kv_caches.is_empty());
+    }
+
+    #[test]
+    fn physical_batch_frame_preserves_real_cpu_logits_and_scratch_on_failure() {
+        physical_batch_frame_retains_scratch::<ferrum_kernels::backend::cpu::CpuBackend>(
+            |buffer| buffer.as_ptr() as usize,
+        );
+    }
+
+    #[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
+    #[test]
+    #[ignore = "requires an actual Metal device"]
+    fn physical_batch_frame_preserves_real_metal_logits_and_scratch_on_failure() {
+        physical_batch_frame_retains_scratch::<ferrum_kernels::backend::metal::MetalBackend>(
+            |buffer| buffer.raw().contents() as usize,
+        );
+    }
+
+    fn selection_failure_readback_observes_pending_work<
+        B: ferrum_kernels::backend::MoeLlmBackend,
+    >() {
+        let mut context = B::new_context();
+        let mut logits = B::from_slice_typed(&[1.0f32, 2.0, 3.0, 4.0]);
+        B::scale_inplace(&mut context, &mut logits, 1.0, 4);
+        let mut quiescent = Some(super::device_execution::checked_sync::<B>(&mut context));
+        assert_eq!(B::to_vec(&logits, 4), [1.0, 2.0, 3.0, 4.0]);
+
+        // Inject selection failure after real preparation work has been
+        // encoded, but before its readback/synchronization. On Metal this
+        // command buffer is still uncommitted: reading first deterministically
+        // returns the old values, rather than relying on a device timing race.
+        let _ = quiescent.take();
+        B::scale_inplace(&mut context, &mut logits, 2.0, 4);
+        let selected: ferrum_types::Result<Vec<u32>> = Err(ferrum_types::FerrumError::backend(
+            "injected selection failure before readback",
+        ));
+        assert!(selected.is_err());
+        let full =
+            super::read_full_logits_after_selection::<B>(&mut context, &logits, 4, &mut quiescent);
+        assert_eq!(full, [2.0, 4.0, 6.0, 8.0]);
+        assert!(quiescent.is_some());
+    }
+
+    #[test]
+    fn selection_failure_full_readback_observes_real_cpu_preparation() {
+        selection_failure_readback_observes_pending_work::<ferrum_kernels::backend::cpu::CpuBackend>(
+        );
+    }
+
+    #[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
+    #[test]
+    #[ignore = "requires an actual Metal device"]
+    fn selection_failure_full_readback_observes_real_metal_preparation() {
+        selection_failure_readback_observes_pending_work::<
+            ferrum_kernels::backend::metal::MetalBackend,
+        >();
+    }
 
     #[test]
     fn unified_logits_policy_keeps_sparse_repetition_on_greedy_path() {
@@ -1785,9 +2009,30 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
         items: &[(String, Vec<u32>, usize, bool)],
         logits_policies: Option<&[LogitsReturnPolicy]>,
     ) -> Result<Vec<Option<Vec<f32>>>> {
+        self.unified_sampling_internal(items, logits_policies)?
+            .into_iter()
+            .map(|output| output.map(legacy_sampling_values).transpose())
+            .collect()
+    }
+
+    fn unified_sampling_internal(
+        &mut self,
+        items: &[(String, Vec<u32>, usize, bool)],
+        logits_policies: Option<&[LogitsReturnPolicy]>,
+    ) -> Result<Vec<Option<ExecutorSamplingOutput>>> {
         if items.is_empty() {
             return Ok(Vec::new());
         }
+        self.run_device_frame(|model, frame| model.unified_in_frame(frame, items, logits_policies))
+            .into_legacy_result()
+    }
+
+    fn unified_in_frame(
+        &mut self,
+        frame: &mut LlamaExecutionFrame<B>,
+        items: &[(String, Vec<u32>, usize, bool)],
+        logits_policies: Option<&[LogitsReturnPolicy]>,
+    ) -> Result<Vec<Option<ExecutorSamplingOutput>>> {
         // Snapshot cfg fields into Copy locals so we can take &mut self later
         // without a long-lived `&self.cfg` borrow conflicting.
         let h = self.cfg.hidden_size;
@@ -1833,9 +2078,12 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
         let max_blocks_per_seq = self.scratch.paged_max_blocks_per_seq;
         let block_size = 16usize; // matches PAGED_BLOCK_SIZE in ensure_kv
 
-        let mut ctx = B::new_context();
         for (cid, tokens, pos_offset, _) in items {
-            self.ensure_paged_kv_capacity_for_cache_id(&mut ctx, cid, *pos_offset + tokens.len())?;
+            self.ensure_paged_kv_capacity_for_cache_id(
+                &mut frame.context,
+                cid,
+                *pos_offset + tokens.len(),
+            )?;
         }
 
         // Make sure scratch fits this batch. Use the engine-side
@@ -1877,12 +2125,17 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
             self.unified_graph_failed = false;
         }
 
-        // Embed all q-tokens into the unified residual buffer.
-        let mut residual = self
-            .scratch
-            .unified_residual
-            .take()
-            .expect("unified_residual missing after ensure");
+        let use_device_residual_shadow =
+            self.cfg.sandwich_norms && B::supports_device_f32_residual_shadow();
+        frame
+            .take_scratch(
+                &mut self.scratch,
+                FrameLayout::Unified,
+                use_device_residual_shadow,
+            )
+            .expect("unified frame scratch");
+        let mut ctx = &mut frame.context;
+        let mut residual = frame.residual.as_mut().expect("frame unified residual");
         let embed = self
             .embed
             .as_ref()
@@ -1891,29 +2144,11 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
         if let Some(scale) = self.cfg.embed_scale {
             B::scale_inplace(&mut ctx, &mut residual, scale, m_total * h);
         }
-        let use_device_residual_shadow =
-            self.cfg.sandwich_norms && B::supports_device_f32_residual_shadow();
-        let mut device_residual_shadow = if use_device_residual_shadow {
-            let mut shadow = self
-                .scratch
-                .unified_residual_f32_shadow
-                .take()
-                .expect("unified F32 residual shadow missing for sandwich unified path");
-            B::activation_to_f32_shadow(&mut ctx, &residual, &mut shadow, m_total * h);
-            Some(shadow)
-        } else {
-            None
-        };
-        let mut device_branch_shadow = if use_device_residual_shadow {
-            Some(
-                self.scratch
-                    .unified_sandwich_branch_f32
-                    .take()
-                    .expect("unified F32 sandwich branch scratch missing"),
-            )
-        } else {
-            None
-        };
+        let device_residual_shadow = &mut frame.residual_f32;
+        if let Some(shadow) = device_residual_shadow.as_mut() {
+            B::activation_to_f32_shadow(&mut ctx, &residual, shadow, m_total * h);
+        }
+        let device_branch_shadow = &mut frame.branch_f32;
 
         // Upload index buffers.
         {
@@ -2016,7 +2251,7 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
         // Sync eager pre-work (write_u32 + embedding + scratch grow)
         // before either a replay or a capture starts — buffer state
         // must be settled.
-        B::sync(&mut ctx);
+        device_execution::checked_sync::<B>(&mut ctx);
 
         macro_rules! reset_profile_counter {
             ($us:expr, $n:expr) => {{
@@ -2067,7 +2302,7 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
                 reset_profile_counter!(MARLIN_KERNEL_TIME_US, MARLIN_KERNEL_CALLS);
                 let _ = drain_marlin_profile_by_projection();
             }
-            B::sync(&mut ctx);
+            device_execution::checked_sync::<B>(&mut ctx);
             Some(std::time::Instant::now())
         } else {
             None
@@ -2075,7 +2310,7 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
 
         let unified_profile = self.batched_cfg.unified_profile;
         let layer_t0 = if unified_profile {
-            B::sync(&mut ctx);
+            device_execution::checked_sync::<B>(&mut ctx);
             Some(std::time::Instant::now())
         } else {
             None
@@ -2132,7 +2367,7 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
                 Ok(false) => {}
                 Err(e) => {
                     self.unified_graph_failed = true;
-                    eprintln!("[unified-graph] replay err: {e}");
+                    std::panic::panic_any(e);
                 }
             }
         }
@@ -2181,8 +2416,8 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
 
         if should_capture {
             if let Err(e) = B::begin_graph_capture(&mut ctx) {
-                eprintln!("[unified-graph] begin_capture err: {e}");
                 self.unified_graph_failed = true;
+                std::panic::panic_any(e);
             }
         }
 
@@ -2192,13 +2427,9 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
         let mut lm_head_ready = did_pure_replay && graph_scope.captures_lm_head();
         macro_rules! finish_unified_graph_capture {
             () => {{
-                let scope_label = unified_graph_scope_label(graph_scope);
                 if let Err(e) = B::end_graph_capture(&mut ctx, graph_key) {
-                    eprintln!("[unified-graph] {scope_label} end_capture err: {e}");
                     self.unified_graph_failed = true;
-                    layers_ready = false;
-                    final_pack_ready = false;
-                    lm_head_ready = false;
+                    std::panic::panic_any(e);
                 } else {
                     self.unified_graph_keys_seen.insert(graph_key);
                     record_unified_graph_capture(
@@ -2225,18 +2456,14 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
                             );
                         }
                         Ok(false) => {
-                            eprintln!("[unified-graph] {scope_label} post-capture replay skipped");
                             self.unified_graph_failed = true;
-                            layers_ready = false;
-                            final_pack_ready = false;
-                            lm_head_ready = false;
+                            std::panic::panic_any(ferrum_types::FerrumError::backend(
+                                "captured unified graph was unavailable before its first execution",
+                            ));
                         }
                         Err(e) => {
-                            eprintln!("[unified-graph] {scope_label} post-capture replay err: {e}");
                             self.unified_graph_failed = true;
-                            layers_ready = false;
-                            final_pack_ready = false;
-                            lm_head_ready = false;
+                            std::panic::panic_any(e);
                         }
                     }
                 }
@@ -2261,7 +2488,7 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
             }
         }
         if let Some(t0) = layer_t0.filter(|_| !B::graph_capture_in_flight(&ctx)) {
-            B::sync(&mut ctx);
+            device_execution::checked_sync::<B>(&mut ctx);
             static UNIFIED_PROF_CALLS: std::sync::atomic::AtomicU64 =
                 std::sync::atomic::AtomicU64::new(0);
             let n = UNIFIED_PROF_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -2279,16 +2506,12 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
         // Take scratch buffers we'll either record into the graph or
         // restore on return — outside the !did_pure_replay branch so
         // both paths can put them back.
-        let mut norm_out = self
-            .scratch
-            .unified_norm_out
-            .take()
-            .expect("unified_norm_out missing");
+        let mut norm_out = frame.norm_out.as_mut().expect("frame unified norm_out");
 
         macro_rules! run_unified_final_pack {
             () => {{
                 let final_norm_t0 = if unified_op_profile {
-                    B::sync(&mut ctx);
+                    device_execution::checked_sync::<B>(&mut ctx);
                     Some(std::time::Instant::now())
                 } else {
                     None
@@ -2315,7 +2538,7 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
                     );
                 }
                 if let Some(t0) = final_norm_t0 {
-                    B::sync(&mut ctx);
+                    device_execution::checked_sync::<B>(&mut ctx);
                     let elapsed_us = t0.elapsed().as_micros() as u64;
                     add_profile_counter!(NORM_TIME_US, NORM_CALLS, elapsed_us);
                     add_profile_counter!(
@@ -2326,7 +2549,7 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
                 }
                 if num_sampled > 0 {
                     let final_copy_t0 = if unified_op_profile {
-                        B::sync(&mut ctx);
+                        device_execution::checked_sync::<B>(&mut ctx);
                         Some(std::time::Instant::now())
                     } else {
                         None
@@ -2340,7 +2563,7 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
                         B::copy_slice(&mut ctx, &norm_out, global * h, packed_normed, j * h, h);
                     }
                     if let Some(t0) = final_copy_t0 {
-                        B::sync(&mut ctx);
+                        device_execution::checked_sync::<B>(&mut ctx);
                         let elapsed_us = t0.elapsed().as_micros() as u64;
                         add_profile_counter!(OTHER_TIME_US, OTHER_CALLS, elapsed_us);
                         add_profile_counter!(
@@ -2357,7 +2580,7 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
             () => {{
                 if num_sampled > 0 {
                     let lm_head_t0 = if unified_op_profile {
-                        B::sync(&mut ctx);
+                        device_execution::checked_sync::<B>(&mut ctx);
                         Some(std::time::Instant::now())
                     } else {
                         None
@@ -2384,7 +2607,7 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
                         lm_head.forward(&mut ctx, packed_normed, packed_logits, num_sampled);
                     }
                     if let Some(t0) = lm_head_t0 {
-                        B::sync(&mut ctx);
+                        device_execution::checked_sync::<B>(&mut ctx);
                         let elapsed_us = t0.elapsed().as_micros() as u64;
                         add_profile_counter!(MATMUL_TIME_US, MATMUL_CALLS, elapsed_us);
                         add_profile_counter!(
@@ -2465,8 +2688,8 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
         // Readback. Keep full logits only for rows whose policy
         // requires CPU-side sampling. Policy-compatible greedy rows use the
         // existing GPU argmax kernels and return a one-element token sentinel.
-        B::sync_before_host_readback(&mut ctx);
-        let mut out: Vec<Option<Vec<f32>>> = (0..items.len()).map(|_| None).collect();
+        let mut quiescent = Some(device_execution::checked_sync::<B>(&mut ctx));
+        let mut out: Vec<Option<ExecutorSamplingOutput>> = (0..items.len()).map(|_| None).collect();
         if num_sampled > 0 {
             let readback_t0 = unified_op_profile.then(std::time::Instant::now);
             let logits_return =
@@ -2494,6 +2717,7 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
             };
             let mut returned_argmax = false;
             if let Some(argmax_mode) = argmax_mode {
+                quiescent = None;
                 let tokens = match argmax_mode {
                     ArgmaxMode::Raw => {
                         let packed_logits = self
@@ -2594,7 +2818,8 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
                 if let Ok(tokens) = tokens {
                     if tokens.iter().all(|&token| token != u32::MAX) {
                         for (j, &(orig_idx, _)) in final_indices.iter().enumerate() {
-                            out[orig_idx] = Some(vec![tokens[j] as f32]);
+                            out[orig_idx] =
+                                Some(ExecutorSamplingOutput::GreedyToken(TokenId::new(tokens[j])));
                         }
                         returned_argmax = true;
                     }
@@ -2608,7 +2833,12 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
                     .unified_packed_logits
                     .as_ref()
                     .expect("unified_packed_logits missing");
-                B::to_vec(packed_logits, num_sampled * vocab)
+                read_full_logits_after_selection::<B>(
+                    &mut ctx,
+                    packed_logits,
+                    num_sampled * vocab,
+                    &mut quiescent,
+                )
             };
             if let Some(t0) = readback_t0 {
                 let elapsed_us = t0.elapsed().as_micros() as u64;
@@ -2639,13 +2869,13 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
             if !returned_argmax {
                 for (j, &(orig_idx, _)) in final_indices.iter().enumerate() {
                     let row = logits_flat[j * vocab..(j + 1) * vocab].to_vec();
-                    out[orig_idx] = Some(row);
+                    out[orig_idx] = Some(ExecutorSamplingOutput::FullLogits(row));
                 }
             }
         }
 
         if let Some(t0) = unified_op_t0 {
-            B::sync(&mut ctx);
+            device_execution::checked_sync::<B>(&mut ctx);
             static UNIFIED_OP_PROFILE_CALLS: AtomicU64 = AtomicU64::new(0);
             let call = UNIFIED_OP_PROFILE_CALLS.fetch_add(1, Ordering::Relaxed);
             let total_us = t0.elapsed().as_micros() as u64;
@@ -2791,11 +3021,11 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
             }
         }
 
-        // Restore scratch for next call.
-        self.scratch.unified_residual_f32_shadow = device_residual_shadow;
-        self.scratch.unified_sandwich_branch_f32 = device_branch_shadow;
-        self.scratch.unified_residual = Some(residual);
-        self.scratch.unified_norm_out = Some(norm_out);
+        // A successful argmax includes additional device work after the first
+        // full-logits readiness observation. Retain this same context until
+        // that work has also actually completed.
+        frame.completed =
+            Some(quiescent.unwrap_or_else(|| device_execution::checked_sync::<B>(&mut ctx)));
 
         Ok(out)
     }
@@ -3351,6 +3581,21 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
         batch: &[(String, u32, u32)],
         logits_return: DecodeLogitsReturn<'_>,
     ) -> Vec<Vec<f32>> {
+        self.decode_batch_sampling_with_logits_return(batch, logits_return)
+            .into_iter()
+            .map(legacy_sampling_values)
+            .collect::<Result<Vec<_>>>()
+            // The retiring Vec-only entry cannot represent a sampling error.
+            // Keep the actual error payload for its existing catch boundary;
+            // never invent a token or a sentinel logits vector.
+            .unwrap_or_else(|error| std::panic::panic_any(error))
+    }
+
+    fn decode_batch_sampling_with_logits_return(
+        &mut self,
+        batch: &[(String, u32, u32)],
+        logits_return: DecodeLogitsReturn<'_>,
+    ) -> Vec<ExecutorSamplingOutput> {
         let force_full_logits = matches!(&logits_return, DecodeLogitsReturn::Full);
         let m = batch.len();
         if m == 0 {
@@ -3360,7 +3605,9 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
         if m == 1 && !force_full_logits {
             let (cid, tok, pos) = &batch[0];
             self.decode_batch_stats.record_singleton_fast_path();
-            return vec![self.decode_internal(cid, *tok, *pos)];
+            return vec![ExecutorSamplingOutput::FullLogits(
+                self.decode_internal(cid, *tok, *pos),
+            )];
         }
         if !self.supports_batched_decode {
             // Some backends do not yet produce correct follow-up logits in
@@ -3371,7 +3618,9 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
             self.decode_batch_stats.record_unsupported_fallback();
             return batch
                 .iter()
-                .map(|(cid, tok, pos)| self.decode_internal(cid, *tok, *pos))
+                .map(|(cid, tok, pos)| {
+                    ExecutorSamplingOutput::FullLogits(self.decode_internal(cid, *tok, *pos))
+                })
                 .collect();
         }
         if batch
@@ -3381,10 +3630,25 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
             self.decode_batch_stats.record_lora_fallback();
             return batch
                 .iter()
-                .map(|(cid, tok, pos)| self.decode_internal(cid, *tok, *pos))
+                .map(|(cid, tok, pos)| {
+                    ExecutorSamplingOutput::FullLogits(self.decode_internal(cid, *tok, *pos))
+                })
                 .collect();
         }
 
+        self.run_device_frame(|model, frame| {
+            model.decode_batch_in_frame(frame, batch, logits_return)
+        })
+        .into_legacy_result()
+    }
+
+    fn decode_batch_in_frame(
+        &mut self,
+        frame: &mut LlamaExecutionFrame<B>,
+        batch: &[(String, u32, u32)],
+        logits_return: DecodeLogitsReturn<'_>,
+    ) -> Vec<ExecutorSamplingOutput> {
+        let m = batch.len();
         // Ensure all caches exist and scratch is sized for M tokens.
         for (cid, _, _) in batch {
             self.ensure_kv(cid);
@@ -3399,7 +3663,16 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
         let h = self.cfg.hidden_size;
         let vocab = self.cfg.vocab_size;
         let num_layers = self.cfg.num_layers;
-        let mut ctx = B::new_context();
+        let use_host_residual_shadow = self.use_host_residual_shadow();
+        let use_device_residual_shadow = self.use_device_residual_shadow();
+        frame
+            .take_scratch(
+                &mut self.scratch,
+                FrameLayout::Single,
+                use_device_residual_shadow,
+            )
+            .expect("batched decode frame scratch");
+        let mut ctx = &mut frame.context;
         for (cid, _, _) in batch {
             let target_len = self.cache_len(cid).saturating_add(1);
             self.ensure_paged_kv_capacity_for_cache_id(&mut ctx, cid, target_len)
@@ -3438,11 +3711,7 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
         // 0. Embed all M tokens into residual [M, H]. Eager, OUTSIDE
         //    any captured graph (host tokens slice; embedding_lookup_dyn
         //    is single-item only).
-        let mut residual = self
-            .scratch
-            .residual
-            .take()
-            .expect("scratch residual missing (previous call didn't restore)");
+        let mut residual = frame.residual.as_mut().expect("frame residual");
         let embed = self
             .embed
             .as_ref()
@@ -3451,35 +3720,17 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
         if let Some(scale) = self.cfg.embed_scale {
             B::scale_inplace(&mut ctx, &mut residual, scale, m * h);
         }
-        let use_host_residual_shadow = self.use_host_residual_shadow();
-        let use_device_residual_shadow = self.use_device_residual_shadow();
         let mut host_residual = if use_host_residual_shadow {
-            B::sync(&mut ctx);
+            device_execution::checked_sync::<B>(&mut ctx);
             Some(B::to_vec(&residual, m * h))
         } else {
             None
         };
-        let mut device_residual_shadow = if use_device_residual_shadow {
-            let mut shadow = self
-                .scratch
-                .residual_f32_shadow
-                .take()
-                .expect("device F32 residual shadow scratch missing");
-            B::activation_to_f32_shadow(&mut ctx, &residual, &mut shadow, m * h);
-            Some(shadow)
-        } else {
-            None
-        };
-        let mut device_branch_shadow = if use_device_residual_shadow {
-            Some(
-                self.scratch
-                    .sandwich_branch_f32
-                    .take()
-                    .expect("device F32 sandwich branch scratch missing"),
-            )
-        } else {
-            None
-        };
+        let device_residual_shadow = &mut frame.residual_f32;
+        if let Some(shadow) = device_residual_shadow.as_mut() {
+            B::activation_to_f32_shadow(&mut ctx, &residual, shadow, m * h);
+        }
+        let device_branch_shadow = &mut frame.branch_f32;
 
         // ── Phase 4d: CUDA-graph replay path ─────────────────────────
         // gated on FERRUM_BATCHED_GRAPH=1; skipped on backends without
@@ -3501,7 +3752,7 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
             // Sync stream first so embedding_lookup (just queued) plus
             // any null-stream cuMemcpyHtoD_v2's from write_u32 are all
             // settled before cuGraphLaunch.
-            B::sync(&mut ctx);
+            device_execution::checked_sync::<B>(&mut ctx);
             match B::replay_graph(&mut ctx, graph_key) {
                 Ok(true) => {
                     did_pure_replay = true;
@@ -3516,7 +3767,7 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
                 Ok(false) => {}
                 Err(e) => {
                     self.batched_graph_failed = true;
-                    eprintln!("[batched-trace] replay err: {}", e);
+                    std::panic::panic_any(e);
                 }
             }
         }
@@ -3543,8 +3794,8 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
             if should_capture {
                 tracing::debug!("[batched-graph] BEGIN CAPTURE m_padded={m_padded}");
                 if let Err(e) = B::begin_graph_capture(&mut ctx) {
-                    eprintln!("[batched-trace] begin_capture err: {}", e);
                     self.batched_graph_failed = true;
+                    std::panic::panic_any(e);
                 }
             }
             self.batched_graph_warmup += 1;
@@ -3556,7 +3807,7 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
             macro_rules! tracesync {
                 ($label:expr) => {
                     if trace {
-                        B::sync(&mut ctx);
+                        device_execution::checked_sync::<B>(&mut ctx);
                         eprintln!("[trace-batched] {}", $label);
                     }
                 };
@@ -3602,7 +3853,7 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
                 TAIL_ACT_CALLS.swap(0, std::sync::atomic::Ordering::Relaxed);
                 TAIL_RESID_TIME_US.swap(0, std::sync::atomic::Ordering::Relaxed);
                 TAIL_RESID_CALLS.swap(0, std::sync::atomic::Ordering::Relaxed);
-                B::sync(&mut ctx);
+                device_execution::checked_sync::<B>(&mut ctx);
                 Some(std::time::Instant::now())
             } else {
                 None
@@ -3623,7 +3874,7 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
                 tracesync!(format!("after layer {}", li));
             }
             let _t0_norm = if batched_profile {
-                B::sync(&mut ctx);
+                device_execution::checked_sync::<B>(&mut ctx);
                 Some(std::time::Instant::now())
             } else {
                 None
@@ -3660,7 +3911,7 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
                 );
             }
             if let Some(t0) = _t0_norm {
-                B::sync(&mut ctx);
+                device_execution::checked_sync::<B>(&mut ctx);
                 NORM_TIME_US.fetch_add(
                     t0.elapsed().as_micros() as u64,
                     std::sync::atomic::Ordering::Relaxed,
@@ -3673,7 +3924,7 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
                 .as_ref()
                 .expect("decode_batch_internal called on backbone-only model (no lm_head)");
             let _t0_lm = if batched_profile {
-                B::sync(&mut ctx);
+                device_execution::checked_sync::<B>(&mut ctx);
                 Some(std::time::Instant::now())
             } else {
                 None
@@ -3690,7 +3941,7 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
                 );
             }
             if let Some(t0) = _t0_lm {
-                B::sync(&mut ctx);
+                device_execution::checked_sync::<B>(&mut ctx);
                 MATMUL_TIME_US.fetch_add(
                     t0.elapsed().as_micros() as u64,
                     std::sync::atomic::Ordering::Relaxed,
@@ -3700,7 +3951,7 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
             tracesync!("after lm_head");
 
             if let Some(t0) = batched_iter_t0 {
-                B::sync(&mut ctx);
+                device_execution::checked_sync::<B>(&mut ctx);
                 let total_us = t0.elapsed().as_micros() as u64;
                 let attn_us = ATTN_TIME_US.swap(0, std::sync::atomic::Ordering::Relaxed);
                 let attn_n = ATTN_CALLS.swap(0, std::sync::atomic::Ordering::Relaxed);
@@ -3851,26 +4102,27 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
 
             if should_capture && B::graph_capture_in_flight(&ctx) {
                 if let Err(e) = B::end_graph_capture(&mut ctx, graph_key) {
-                    eprintln!("[batched-trace] end_capture err: {}", e);
                     self.batched_graph_failed = true;
+                    std::panic::panic_any(e);
                 } else {
                     self.batched_graph_keys_seen.insert(graph_key);
                     eprintln!(
                         "[batched-graph-capture] key={graph_key} m={m} m_padded={m_padded} \
                          device_shadow={use_device_residual_shadow}"
                     );
-                    if let Err(e) = B::replay_graph(&mut ctx, graph_key) {
-                        eprintln!("[batched-trace] post-capture replay err: {}", e);
-                        self.batched_graph_failed = true;
-                    } else {
-                        record_batched_graph_replay(
-                            "post_capture",
-                            graph_key,
-                            m,
-                            m_padded,
-                            use_device_residual_shadow,
-                        );
-                    }
+                    replay_new_batched_graph::<B>(
+                        &mut ctx,
+                        graph_key,
+                        &mut self.batched_graph_failed,
+                    )
+                    .unwrap_or_else(|error| std::panic::panic_any(error));
+                    record_batched_graph_replay(
+                        "post_capture",
+                        graph_key,
+                        m,
+                        m_padded,
+                        use_device_residual_shadow,
+                    );
                 }
             }
         }
@@ -3885,19 +4137,9 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
             }
         }
 
-        // Sync before to_vec (Metal: no internal sync on buffer read).
-        B::sync(&mut ctx);
-        if use_device_residual_shadow {
-            self.scratch.residual_f32_shadow = device_residual_shadow;
-            self.scratch.sandwich_branch_f32 = device_branch_shadow;
-        }
-        self.scratch.residual = Some(residual);
-
-        // Greedy fast path: FERRUM_GREEDY_ARGMAX=1 → GPU argmax + tiny
-        // D2H (m × 4 B) instead of full logit download (m × vocab × 2 B).
-        // Saves ~5 ms / iter at c=32 on Qwen3 vocab=152064. Engine has a
-        // matching size-1-Vec fast path in run_batch_decode that picks
-        // `logits[0] as u32` and skips sample_with_processors entirely.
+        // Greedy returns explicit token products after the tiny D2H readback;
+        // full sampling retains every logit. Only the retiring numerical API
+        // wrapper above converts typed tokens to its historical vector form.
         let argmax_mode = match logits_return {
             DecodeLogitsReturn::Full => None,
             DecodeLogitsReturn::LegacyDefault if self.batched_cfg.greedy_argmax => {
@@ -3936,15 +4178,24 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
             };
             if let Ok(tokens) = tokens {
                 if tokens.iter().all(|&token| token != u32::MAX) {
-                    return tokens.into_iter().map(|t| vec![t as f32]).collect();
+                    let quiescent = device_execution::checked_sync::<B>(&mut ctx);
+                    let output = tokens
+                        .into_iter()
+                        .map(|token| ExecutorSamplingOutput::GreedyToken(TokenId::new(token)))
+                        .collect();
+                    frame.completed = Some(quiescent);
+                    return output;
                 }
             }
         }
 
+        let quiescent = device_execution::checked_sync::<B>(&mut ctx);
         let all = B::to_vec(&self.scratch.batch_logits, m * vocab);
-        (0..m)
-            .map(|i| all[i * vocab..(i + 1) * vocab].to_vec())
-            .collect()
+        let output = (0..m)
+            .map(|i| ExecutorSamplingOutput::FullLogits(all[i * vocab..(i + 1) * vocab].to_vec()))
+            .collect();
+        frame.completed = Some(quiescent);
+        output
     }
 }
 
