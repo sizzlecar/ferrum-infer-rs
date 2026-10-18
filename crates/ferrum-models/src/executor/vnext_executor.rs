@@ -33,6 +33,7 @@ use ferrum_execution::model_executor::{
     PrefillChunk, PrefillInput, PrefillOutput, PrefixCaptureBoundary, PrefixCaptureLease,
     PrefixCapturePlan, PrefixCaptureRequest, TypedSequenceStateMemory,
 };
+use ferrum_execution::prepared_model::PreparedExecutionInput;
 use ferrum_execution::token_execution::{
     ExecutionRecoveryKey, ExecutorSequence, ExecutorSequenceIssuer,
 };
@@ -50,8 +51,6 @@ use ferrum_types::{
 use parking_lot::{Mutex, RwLock};
 use serde::Serialize;
 use tokio::sync::Mutex as AsyncMutex;
-
-use crate::vnext::PreparedProductionModel;
 
 use super::{
     common,
@@ -5052,7 +5051,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
     }
 
     pub fn from_runtime_composition<F>(
-        prepared: &PreparedProductionModel,
+        prepared: PreparedExecutionInput<'_>,
         info: ModelInfo,
         engine_config: &EngineConfig,
         runtime: Arc<R>,
@@ -5064,12 +5063,12 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
     ) -> Result<Self>
     where
         F: FnOnce(
-            &PreparedProductionModel,
             &ResolvedRuntimePolicy,
             &CapabilityCatalog,
             &ProgramPlanCompilation,
         ) -> Result<ResolvedModelPlan>,
     {
+        prepared.validate_info(&info)?;
         let config =
             VNextExecutorConfig::from_engine_config(engine_config, &info, runtime.as_ref())?;
         Self::from_runtime_composition_with_config(
@@ -5088,7 +5087,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
 
     #[allow(clippy::too_many_arguments)]
     pub fn from_runtime_composition_with_config<F>(
-        prepared: &PreparedProductionModel,
+        prepared: PreparedExecutionInput<'_>,
         info: ModelInfo,
         engine_config: &EngineConfig,
         config: VNextExecutorConfig,
@@ -5101,7 +5100,6 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
     ) -> Result<Self>
     where
         F: FnOnce(
-            &PreparedProductionModel,
             &ResolvedRuntimePolicy,
             &CapabilityCatalog,
             &ProgramPlanCompilation,
@@ -5123,7 +5121,6 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
     fn from_compiled_model<F>(compiled: VNextCompiledModel<'_, R>, resolve_plan: F) -> Result<Self>
     where
         F: FnOnce(
-            &PreparedProductionModel,
             &ResolvedRuntimePolicy,
             &CapabilityCatalog,
             &ProgramPlanCompilation,
@@ -5143,19 +5140,20 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         let runtime = Arc::clone(&composition.runtime);
         let registry = &composition.registry;
         let catalog = composition.catalog.clone();
-        let attention_head_dimension = prepared.descriptor().attention_head_dimension();
+        let attention_head_dimension = prepared.facts().attention_head_dimension();
         let family = prepared.family();
-        let sequence_state_memory = state_memory::logical_sequence_state_memory(
-            &family.numerical_profile().states,
-            &family.numerical_profile().kv_storage,
-        )?;
         let resolve_bind_phase = StartupPhaseTimer::start("plan_resolve_and_bind");
-        let resolved_plan = resolve_plan(prepared, &config.runtime_policy, &catalog, &compilation)?;
+        let resolved_plan = resolve_plan(&config.runtime_policy, &catalog, &compilation)?;
         if resolved_plan.execution_plan() != compilation.executable().execution_plan() {
             return Err(FerrumError::internal(
                 "product composition returned a different execution plan than the compiler",
             ));
         }
+        prepared.validate_resolved_plan(&resolved_plan)?;
+        let sequence_state_memory = state_memory::logical_sequence_state_memory(
+            &family.numerical_profile().states,
+            &family.numerical_profile().kv_storage,
+        )?;
         let providers = registry
             .bind_plan(&resolved_plan)
             .map_err(|error| FerrumError::model(format!("vNext provider binding: {error}")))?;

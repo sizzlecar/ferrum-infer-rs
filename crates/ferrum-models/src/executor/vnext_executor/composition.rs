@@ -82,7 +82,7 @@ pub struct VNextRuntimeComposition<R: DeviceRuntime> {
 /// prepared source and runtime composition, including on the Auto path.
 pub struct VNextCompiledModel<'a, R: DeviceRuntime> {
     pub(super) composition: &'a VNextRuntimeComposition<R>,
-    pub(super) prepared: &'a PreparedProductionModel,
+    pub(super) prepared: PreparedExecutionInput<'a>,
     pub(super) info: ModelInfo,
     pub(super) config: VNextExecutorConfig,
     pub(super) compilation: ProgramPlanCompilation,
@@ -119,12 +119,13 @@ impl<R: DeviceRuntime> VNextRuntimeComposition<R> {
 
     pub fn compile_model<'a>(
         &'a self,
-        prepared: &'a PreparedProductionModel,
+        prepared: PreparedExecutionInput<'a>,
         info: ModelInfo,
         engine_config: &EngineConfig,
         config: VNextExecutorConfig,
         materializer_selection: WeightMaterializerSelection,
     ) -> std::result::Result<VNextCompiledModel<'a, R>, VNextModelCompilationError> {
+        prepared.validate_info(&info)?;
         if self.runtime.descriptor() != self.catalog.device() {
             return Err(FerrumError::device(
                 "vNext static compilation catalog differs from the actual device runtime",
@@ -203,9 +204,9 @@ impl<R: DeviceRuntime> VNextRuntimeComposition<R> {
     }
 }
 
-impl<R: DeviceRuntime> VNextCompiledModel<'_, R> {
-    pub fn prepared(&self) -> &PreparedProductionModel {
-        self.prepared
+impl<'a, R: DeviceRuntime> VNextCompiledModel<'a, R> {
+    pub fn prepared(&self) -> &PreparedExecutionInput<'a> {
+        &self.prepared
     }
     pub fn compilation(&self) -> &ProgramPlanCompilation {
         &self.compilation
@@ -268,7 +269,6 @@ impl<R: DeviceRuntime> VNextCompiledModel<'_, R> {
     pub fn initialize<F>(self, resolve_plan: F) -> Result<VNextModelExecutor<R>>
     where
         F: FnOnce(
-            &PreparedProductionModel,
             &ResolvedRuntimePolicy,
             &CapabilityCatalog,
             &ProgramPlanCompilation,

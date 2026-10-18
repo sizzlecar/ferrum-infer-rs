@@ -1,6 +1,8 @@
 //! A tiny language program using the production compiler, providers and terminal worker.
 use super::*;
-use crate::vnext::{CausalLanguageModelDescriptor, ProductionModelSourceBundle};
+use crate::vnext::{
+    CausalLanguageModelDescriptor, PreparedProductionModel, ProductionModelSourceBundle,
+};
 use ferrum_quantization::SafetensorsArchive;
 use ferrum_runtime::*;
 use half::f16;
@@ -449,7 +451,7 @@ impl<R: DeviceRuntime> Fixture<R> {
         }
         engine.backend.enable_reusable_execution = false;
         let executor = VNextModelExecutor::from_runtime_composition(
-            &prepared,
+            prepared.execution_input().unwrap(),
             info,
             &engine,
             runtime,
@@ -457,9 +459,9 @@ impl<R: DeviceRuntime> Fixture<R> {
             materializers,
             WeightMaterializerSelection::exact(id(IDENTITY_WEIGHT_MATERIALIZER_ID)),
             catalog,
-            |prepared, policy, catalog, compilation| {
+            |policy, catalog, compilation| {
                 resolve_plan(
-                    prepared,
+                    &prepared,
                     policy,
                     catalog,
                     compilation,

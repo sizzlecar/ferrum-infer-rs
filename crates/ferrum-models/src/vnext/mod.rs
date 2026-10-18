@@ -437,6 +437,31 @@ impl PreparedProductionModel {
         &self.sources
     }
 
+    /// Borrow this exact preparation for the backend-neutral execution driver.
+    /// Geometry comes from the same typed definition; weights and frozen source
+    /// records remain owned by this model package throughout initialization.
+    pub fn execution_input(
+        &self,
+    ) -> ferrum_types::Result<ferrum_execution::PreparedExecutionInput<'_>> {
+        let descriptor = &self.descriptor;
+        ferrum_execution::PreparedExecutionInput::new(
+            &self.family,
+            self.weights.as_ref(),
+            ferrum_execution::CausalExecutionFacts::new(
+                descriptor.hidden_size(),
+                descriptor.layer_count(),
+                descriptor.attention_head_count(),
+                descriptor.kv_head_count(),
+                descriptor.attention_head_dimension(),
+                descriptor.vocabulary_size(),
+                descriptor.maximum_sequence_tokens(),
+                descriptor.execution_dtype(),
+            )?,
+            self.sources.original_sources(),
+            self.sources.resolved_sources(),
+        )
+    }
+
     pub fn product_source_identity(
         &self,
         requested_model: impl Into<String>,

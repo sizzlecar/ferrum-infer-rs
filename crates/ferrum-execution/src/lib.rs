@@ -5,6 +5,7 @@
 
 mod event_sink;
 pub mod model_executor;
+pub mod prepared_model;
 pub mod token_execution;
 
 pub use event_sink::ProductExecutionEventSink;
@@ -19,3 +20,4 @@ pub use model_executor::{
     PlanRuntimePrefillCompletion, PlanRuntimePrefillInput, PlanRuntimePrefillOutcome,
     PlanRuntimePrefillOutput, PlanRuntimePrefillProduct, PrefillInput, PrefillOutput,
 };
+pub use prepared_model::{CausalExecutionFacts, PreparedExecutionInput};

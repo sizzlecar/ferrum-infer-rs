@@ -2764,7 +2764,7 @@ pub(crate) mod tests {
             VNextExecutorConfig::from_engine_config(&engine, &info, retained.runtime()).unwrap();
         let compiled = retained
             .compile_model(
-                &prepared,
+                prepared.execution_input().unwrap(),
                 info.clone(),
                 &engine,
                 config,
@@ -2792,7 +2792,7 @@ pub(crate) mod tests {
             VNextExecutorConfig::from_engine_config(&trial_engine, &info, trial.runtime()).unwrap();
         assert!(matches!(
             trial.compile_model(
-                &prepared,
+                prepared.execution_input().unwrap(),
                 info,
                 &trial_engine,
                 trial_config,
@@ -2811,7 +2811,7 @@ pub(crate) mod tests {
         // not be interpreted as permission to retry another storage layout.
         let mut initializations = 0;
         let error = compiled
-            .initialize(|_, _, _, _| {
+            .initialize(|_, _, _| {
                 initializations += 1;
                 Err(FerrumError::device("terminal initialization failure"))
             })
