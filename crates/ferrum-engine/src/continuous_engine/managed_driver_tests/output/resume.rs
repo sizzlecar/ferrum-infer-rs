@@ -23,8 +23,10 @@ async fn output_slow_stream_resumes_exact_text_tokens_and_terminal_once() {
         .unwrap()
         .unwrap();
     {
-        let sequences = fixture.engine.inner.sequences.read();
-        let slow = &sequences[&slow_id];
+        let sequences = &fixture.engine.inner.sequences;
+        let slow_handle = sequences.get(&slow_id).unwrap();
+        let slow_guard = slow_handle.lock();
+        let slow = slow_guard.as_ref().unwrap();
         assert_eq!(slow.generated_tokens.len(), 2);
         assert_eq!(slow.generated_tokens, healthy.tokens[..2]);
     }

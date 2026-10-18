@@ -452,11 +452,7 @@ async fn assert_batch_fault(fault: FaultKind, fault_index: usize) {
         sequence.stream_sender = Some(sender);
         sequence.request_slot = Some(RequestSlotLease::open(&engine.inner, request.id.clone()));
         streams.insert(request.id.clone(), receiver);
-        engine
-            .inner
-            .sequences
-            .write()
-            .insert(request.id.clone(), sequence);
+        engine.inner.sequences.insert(request.id.clone(), sequence);
         scheduler.submit(request).await.unwrap();
     }
     let prefill = scheduler
@@ -474,8 +470,10 @@ async fn assert_batch_fault(fault: FaultKind, fault_index: usize) {
         engine
             .inner
             .sequences
-            .write()
-            .get_mut(&scheduled.request.id)
+            .get(&scheduled.request.id)
+            .unwrap()
+            .lock()
+            .as_mut()
             .unwrap()
             .request_slot
             .as_mut()
@@ -492,8 +490,10 @@ async fn assert_batch_fault(fault: FaultKind, fault_index: usize) {
     let mut identities = HashMap::new();
     for scheduled in &prefill.requests {
         let id = &scheduled.request.id;
-        let sequences = engine.inner.sequences.read();
-        let sequence = &sequences[id];
+        let sequences = &engine.inner.sequences;
+        let sequence_handle = sequences.get(id).unwrap();
+        let sequence_guard = sequence_handle.lock();
+        let sequence = sequence_guard.as_ref().unwrap();
         assert!(sequence.prefill_complete);
         assert_eq!(sequence.generated_tokens.len(), 1);
         let frontier = sequence.execution_frontier.as_ref().unwrap();
@@ -610,14 +610,16 @@ async fn assert_batch_fault(fault: FaultKind, fault_index: usize) {
         assert_eq!(actual_released, expected_released);
     }
     {
-        let sequences = engine.inner.sequences.read();
-        let sequence = &sequences[&a];
+        let sequences = &engine.inner.sequences;
+        let sequence_handle = sequences.get(&a).unwrap();
+        let sequence_guard = sequence_handle.lock();
+        let sequence = sequence_guard.as_ref().unwrap();
         assert_eq!(sequence.generated_tokens.len(), 2);
         assert_eq!(&sequence.generated_tokens[..1], a_tokens);
         let frontier = sequence.execution_frontier.as_ref().unwrap();
         assert_eq!(frontier.sequence(), &identities[&a]);
         assert_eq!(frontier.consumed_tokens(), a_len + 1);
-        assert!(!sequences.contains_key(&b));
+        assert!(!sequences.get(&b).is_some());
     }
     let a_updates = drain(streams.get_mut(&a).unwrap());
     assert_eq!(a_updates.len(), 1);
@@ -625,7 +627,14 @@ async fn assert_batch_fault(fault: FaultKind, fault_index: usize) {
     assert_visible_update(update, a_expected_token, &tokenizer);
     assert_eq!(
         update.chunk().token,
-        engine.inner.sequences.read()[&a]
+        engine
+            .inner
+            .sequences
+            .get(&a)
+            .unwrap()
+            .lock()
+            .as_ref()
+            .unwrap()
             .generated_tokens
             .last()
             .copied()
@@ -667,11 +676,27 @@ async fn assert_batch_fault(fault: FaultKind, fault_index: usize) {
         assert_full_logits(&peer_expected, &outputs[0].logits, cfg.vocab_size);
     }
     assert_eq!(
-        engine.inner.sequences.read()[&peer].generated_tokens.len(),
+        engine
+            .inner
+            .sequences
+            .get(&peer)
+            .unwrap()
+            .lock()
+            .as_ref()
+            .unwrap()
+            .generated_tokens
+            .len(),
         2
     );
     assert_eq!(
-        engine.inner.sequences.read()[&peer]
+        engine
+            .inner
+            .sequences
+            .get(&peer)
+            .unwrap()
+            .lock()
+            .as_ref()
+            .unwrap()
             .execution_frontier
             .as_ref()
             .unwrap()
@@ -701,8 +726,10 @@ async fn assert_batch_fault(fault: FaultKind, fault_index: usize) {
             assert_eq!(oracle.generated_tokens.len(), previous_outputs);
             let position = prompt_len + previous_outputs - 1;
             {
-                let sequences = engine.inner.sequences.read();
-                let sequence = &sequences[id];
+                let sequences = &engine.inner.sequences;
+                let sequence_handle = sequences.get(id).unwrap();
+                let sequence_guard = sequence_handle.lock();
+                let sequence = sequence_guard.as_ref().unwrap();
                 assert_eq!(sequence.generated_tokens, oracle.generated_tokens);
                 let frontier = sequence.execution_frontier.as_ref().unwrap();
                 assert_eq!(frontier.sequence(), &identities[id]);
@@ -764,16 +791,27 @@ async fn assert_batch_fault(fault: FaultKind, fault_index: usize) {
                 let usage = terminal.usage.as_ref().unwrap();
                 assert_eq!(usage.prompt_tokens, *prompt_len);
                 assert_eq!(usage.completion_tokens, 4);
-                assert!(!engine.inner.sequences.read().contains_key(id));
+                assert!(!engine.inner.sequences.get(id).is_some());
                 assert!(identities[id].observed_end().is_some());
             } else {
-                let sequences = engine.inner.sequences.read();
+                let sequences = &engine.inner.sequences;
                 assert_eq!(
-                    sequences[id].generated_tokens,
+                    sequences
+                        .get(id)
+                        .unwrap()
+                        .lock()
+                        .as_ref()
+                        .unwrap()
+                        .generated_tokens,
                     reference_sequences[id].generated_tokens
                 );
                 assert_eq!(
-                    sequences[id]
+                    sequences
+                        .get(id)
+                        .unwrap()
+                        .lock()
+                        .as_ref()
+                        .unwrap()
                         .execution_frontier
                         .as_ref()
                         .unwrap()
@@ -786,7 +824,7 @@ async fn assert_batch_fault(fault: FaultKind, fault_index: usize) {
     }
     engine.inner.execution_closes.join_observers().await;
     engine.inner.drain_execution_closes().unwrap();
-    assert!(engine.inner.sequences.read().is_empty());
+    assert!(engine.inner.sequences.is_empty());
     assert!(observed.lock().model.kv_caches.is_empty());
     let mut released: Vec<_> = observed
         .lock()

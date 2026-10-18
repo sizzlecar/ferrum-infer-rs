@@ -269,7 +269,7 @@ async fn prefix_restore_rejects_foreign_full_or_cancelled_state_before_execution
         assert_eq!(state.cancellations.load(Ordering::Relaxed), 1);
         assert_eq!(engine.inner.total_prefill_tokens.load(Ordering::Relaxed), 0);
         assert_eq!(engine.inner.prefix_cache_hits.load(Ordering::Relaxed), 0);
-        assert!(engine.inner.sequences.read().is_empty());
+        assert!(engine.inner.sequences.is_empty());
         engine.shutdown().await.unwrap();
     }
 }

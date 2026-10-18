@@ -154,12 +154,20 @@ async fn token_admission_later_publish_error_retires_earlier_real_faulted_fronti
     let first_frontier = executor.advanced.lock().clone().unwrap();
     let first_identity = first_frontier.sequence().clone();
     {
-        let sequences = fixture.engine.inner.sequences.try_write().unwrap();
-        let first = &sequences[&fixture.request.id];
+        assert!(fixture.engine.inner.sequences.index_is_unlocked());
+        let sequences = &fixture.engine.inner.sequences;
+        let first_handle = sequences.get(&fixture.request.id).unwrap();
+        let first_guard = first_handle.lock();
+        let first = first_guard.as_ref().unwrap();
         assert_eq!(first.execution_frontier.as_ref(), Some(&first_frontier));
         assert!(first.request_slot.as_ref().unwrap().armed);
         assert!(first.pending_token_admission.is_none());
-        assert!(sequences[&second_request.id]
+        assert!(sequences
+            .get(&second_request.id)
+            .unwrap()
+            .lock()
+            .as_ref()
+            .unwrap()
             .pending_token_admission
             .is_some());
     }
@@ -212,8 +220,7 @@ async fn token_admission_later_publish_error_retires_earlier_real_faulted_fronti
         .engine
         .inner
         .sequences
-        .write()
-        .remove(&second_request.id)
+        .take(&second_request.id)
         .unwrap();
     assert!(removed.execution_frontier.is_none());
     removed
@@ -243,7 +250,7 @@ async fn token_admission_later_publish_error_retires_earlier_real_faulted_fronti
     fixture.engine.inner.drain_execution_closes().unwrap();
 
     assert!(fixture.response.try_recv().unwrap().is_err());
-    assert!(fixture.engine.inner.sequences.read().is_empty());
+    assert!(fixture.engine.inner.sequences.is_empty());
     assert!(fixture
         .engine
         .inner

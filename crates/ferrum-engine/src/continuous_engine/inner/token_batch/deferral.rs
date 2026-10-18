@@ -43,7 +43,13 @@ impl EngineInner {
                         "token readiness deferral names another cohort",
                     ));
                 }
-                self.defer_for_request_state_readiness(deferral).await?;
+                let handles = inputs
+                    .iter()
+                    .filter(|input| affected.contains(&input.request_id))
+                    .map(|input| (Arc::clone(&input.handle), input.frontier.sequence().clone()))
+                    .collect();
+                self.defer_for_request_state_readiness(deferral, handles)
+                    .await?;
                 Ok(vec![request_ids
                     .iter()
                     .enumerate()
@@ -230,14 +236,22 @@ impl EngineInner {
     ) -> Result<Option<ExecutionCapacityReleaseSnapshot>> {
         let mut candidates = self
             .sequences
-            .read()
-            .iter()
-            .filter_map(|(id, state)| {
+            .snapshot()
+            .into_iter()
+            .filter_map(|handle| {
+                let state = handle.lock();
                 state
+                    .as_ref()?
                     .execution_frontier
                     .as_ref()
                     .filter(|frontier| frontier.sequence() != input.frontier.sequence())
-                    .map(|frontier| (id.clone(), frontier.sequence().clone(), false))
+                    .map(|frontier| {
+                        (
+                            handle.request_id().clone(),
+                            frontier.sequence().clone(),
+                            false,
+                        )
+                    })
             })
             .collect::<Vec<_>>();
         for (request, sequence) in self.execution_closes.pending_incarnations() {

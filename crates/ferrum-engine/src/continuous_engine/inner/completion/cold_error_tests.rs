@@ -137,11 +137,7 @@ async fn fixture() -> Fixture {
     let mut slot = RequestSlotLease::open(&engine.inner, request_id.clone());
     slot.admit(&engine.inner);
     sequence.request_slot = Some(slot);
-    engine
-        .inner
-        .sequences
-        .write()
-        .insert(request_id.clone(), sequence);
+    engine.inner.sequences.insert(request_id.clone(), sequence);
     Fixture {
         engine,
         model,
@@ -194,8 +190,8 @@ async fn cancelled_error_publication(close_before_caller_drop: bool) {
         .engine
         .inner
         .sequences
-        .read()
-        .contains_key(&fixture.request_id));
+        .get(&fixture.request_id)
+        .is_some());
     assert_eq!(fixture.engine.inner.execution_closes.unreclaimed_count(), 1);
     assert!(fixture.identity.observed_end().is_none());
     assert_eq!(fixture.model.lock().model.kv_caches.len(), 1);

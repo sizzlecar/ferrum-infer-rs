@@ -234,13 +234,13 @@ impl EngineInner {
         for (index, input) in inputs.iter().enumerate() {
             if !succeeded[index] && !deferred_indices[index] {
                 effects.failed.push((
-                    input.request_id.clone(),
+                    Arc::clone(&input.handle),
                     failures[index].take().unwrap_or_else(|| error.clone()),
                 ));
             }
             if let Some(outcome) = closures[index].take() {
-                let mut sequences = self.sequences.write();
-                if let Some(sequence) = sequences.get_mut(&input.request_id).filter(|sequence| {
+                let mut state = input.handle.lock();
+                if let Some(sequence) = state.as_mut().filter(|sequence| {
                     sequence
                         .execution_frontier
                         .as_ref()
@@ -249,7 +249,7 @@ impl EngineInner {
                 }) {
                     sequence.execution_close = Some(Box::new(Mutex::new(outcome)));
                 } else {
-                    drop(sequences);
+                    drop(state);
                     self.retain_unassigned_execution_close(
                         input.request_id.clone(),
                         outcome,
@@ -300,10 +300,11 @@ impl EngineInner {
         error: FerrumError,
         outcome: Option<ExecutionCloseOutcome>,
     ) -> Result<()> {
-        self.fail_token_frontier(&input.request_id, &input.frontier, error, outcome)
+        self.fail_token_handle_frontier(&input.handle, &input.frontier, error, outcome)
             .await
     }
 
+    #[cfg(test)]
     pub(in crate::continuous_engine) async fn fail_token_frontier(
         &self,
         request_id: &RequestId,
@@ -311,48 +312,78 @@ impl EngineInner {
         error: FerrumError,
         outcome: Option<ExecutionCloseOutcome>,
     ) -> Result<()> {
-        let current = self
-            .sequences
-            .read()
-            .get(request_id)
-            .is_some_and(|sequence| {
-                sequence
-                    .execution_frontier
-                    .as_ref()
-                    .is_some_and(|current| current.sequence() == frontier.sequence())
+        if let Some(handle) = self.sequences.get(request_id) {
+            return self
+                .fail_token_handle_frontier(&handle, frontier, error, outcome)
+                .await;
+        }
+        self.close_stale_token_frontier(request_id, frontier, error, outcome)
+            .await
+    }
+
+    pub(in crate::continuous_engine) async fn fail_token_handle_frontier(
+        &self,
+        handle: &Arc<SequenceHandle>,
+        frontier: &ExecutionFrontier,
+        error: FerrumError,
+        mut outcome: Option<ExecutionCloseOutcome>,
+    ) -> Result<()> {
+        let current = {
+            let mut state = handle.lock();
+            let current = state.as_mut().filter(|sequence| {
+                self.sequences.is_current(handle)
+                    && sequence
+                        .execution_frontier
+                        .as_ref()
+                        .is_some_and(|current| current.sequence() == frontier.sequence())
             });
+            if let Some(sequence) = current {
+                if sequence.execution_close.is_none() {
+                    sequence.execution_close =
+                        outcome.take().map(|outcome| Box::new(Mutex::new(outcome)));
+                }
+                true
+            } else {
+                false
+            }
+        };
         if current {
             if let Some(outcome) = outcome {
-                let mut sequences = self.sequences.write();
-                let sequence = sequences
-                    .get_mut(request_id)
-                    .expect("iteration owner keeps the failed request present");
-                if sequence.execution_close.is_none() {
-                    sequence.execution_close = Some(Box::new(Mutex::new(outcome)));
-                } else {
-                    drop(sequences);
-                    self.retain_unassigned_execution_close(
-                        request_id.clone(),
-                        outcome,
-                        error.clone(),
-                    );
-                }
+                self.retain_unassigned_execution_close(
+                    handle.request_id().clone(),
+                    outcome,
+                    error.clone(),
+                );
             }
-            self.complete_request_detached(request_id, FinishReason::Error, Some(error))
+            self.complete_request_exact_frontier_detached(
+                handle,
+                frontier.sequence(),
+                FinishReason::Error,
+                Some(error),
+            )
         } else {
-            // Never cancel a replacement merely because it reused RequestId.
-            // The old product's slot/close obligation is no longer ours. Keep
-            // observing its exact executor owner without minting another
-            // capacity-release notification for a previously drained Ended.
-            let ticket = self.begin_detached_execution_close(
-                request_id.clone(),
-                frontier.sequence().clone(),
-                outcome,
-            )?;
-            let result = ticket.initial_result().await;
-            let observation = self.drain_execution_closes();
-            result.and(observation).and(Err(error))
+            self.close_stale_token_frontier(handle.request_id(), frontier, error, outcome)
+                .await
         }
+    }
+
+    async fn close_stale_token_frontier(
+        &self,
+        request_id: &RequestId,
+        frontier: &ExecutionFrontier,
+        error: FerrumError,
+        outcome: Option<ExecutionCloseOutcome>,
+    ) -> Result<()> {
+        // Observing an old incarnation never grants a second product slot or
+        // a second capacity-release notification.
+        let ticket = self.begin_detached_execution_close(
+            request_id.clone(),
+            frontier.sequence().clone(),
+            outcome,
+        )?;
+        let result = ticket.initial_result().await;
+        let observation = self.drain_execution_closes();
+        result.and(observation).and(Err(error))
     }
 
     async fn publish_token_effects(
@@ -361,31 +392,33 @@ impl EngineInner {
         effects: TokenBatchEffects,
     ) -> Result<()> {
         let mut first_error = None;
-        let failed_ids = effects
-            .failed
-            .iter()
-            .map(|(id, _)| id)
-            .collect::<HashSet<_>>();
-        for (request_id, token) in &effects.ready {
-            if failed_ids.contains(request_id) {
+        for (handle, token) in &effects.ready {
+            if effects
+                .failed
+                .iter()
+                .any(|(failed, _)| Arc::ptr_eq(failed, handle))
+            {
                 continue;
             }
-            let stop = self.stop_reason_for_request(request_id);
-            if self.should_stream_generated_token(request_id, *token, stop) {
-                self.send_stream_update(request_id, *token).await;
+            let stop = self.stop_reason_for_sequence(handle);
+            if self.should_stream_sequence_token(handle, *token, stop) {
+                self.send_stream_update_for_sequence(handle, *token).await;
             }
             if let Some(reason) = stop {
-                if let Err(error) = self.complete_request_detached(request_id, reason, None) {
+                if let Err(error) = self.complete_request_exact_detached(handle, reason, None) {
                     first_error.get_or_insert(error);
                 }
             }
         }
         let mut closed = HashSet::new();
-        for (request_id, error) in effects.failed {
-            if !closed.insert(request_id.clone()) {
+        for (handle, error) in effects.failed {
+            if !closed.insert(Arc::as_ptr(&handle) as usize) {
                 continue;
             }
-            if let Some(input) = inputs.iter().find(|input| input.request_id == request_id) {
+            if let Some(input) = inputs
+                .iter()
+                .find(|input| Arc::ptr_eq(&input.handle, &handle))
+            {
                 if let Err(close_error) = self.fail_token_input(input, error, None).await {
                     first_error.get_or_insert(close_error);
                 }

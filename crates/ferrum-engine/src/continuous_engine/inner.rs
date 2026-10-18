@@ -992,12 +992,22 @@ impl EngineInner {
     async fn defer_for_request_state_readiness(
         &self,
         deferral: ExecutorRequestStateDeferral,
+        handles: Vec<(
+            Arc<SequenceHandle>,
+            ferrum_execution::token_execution::ExecutorSequence,
+        )>,
     ) -> Result<()> {
         let slot = self.execution_readiness_waiters.reserve().await?;
         let registration = deferral.register_waiter()?;
-        let receipt = self
-            .scheduler
-            .defer_for_execution_readiness(deferral.request_ids())?;
+        // Slot reservation can suspend. Use the captured original cohort;
+        // the short index transaction excludes replacement publication while
+        // the synchronous scheduler operation still accepts RequestIds.
+        let receipt =
+            self.sequences
+                .with_current(handles.iter().map(|(handle, _)| handle), || {
+                    self.scheduler
+                        .defer_for_execution_readiness(deferral.request_ids())
+                })?;
         if receipt.deferred_count() != deferral.request_ids().len() {
             receipt.wake().cancel();
             return Err(FerrumError::scheduler(format!(
@@ -1016,7 +1026,13 @@ impl EngineInner {
                     .map(|_| ())
                     .map_err(|error| error.to_string())
             },
-            deferral.request_ids().to_vec(),
+            handles
+                .iter()
+                .map(|(handle, sequence)| ExecutionReadinessWaitTarget {
+                    request: Arc::downgrade(handle),
+                    sequence: sequence.clone(),
+                })
+                .collect(),
             Arc::clone(&self.work_notify),
             slot,
         )?;
@@ -1036,9 +1052,16 @@ impl EngineInner {
     async fn complete_execution_readiness_failures(&self) -> Result<()> {
         self.execution_readiness_waiters.reap_finished();
         for failure in self.execution_readiness_waiters.take_failures() {
-            for request_id in failure.request_ids {
-                self.complete_request_detached(
-                    &request_id,
+            for request in failure.requests {
+                let Some(handle) = request.request.upgrade() else {
+                    continue;
+                };
+                // Cancelling a scheduler wake does not retract a later waiter
+                // error. A recompute keeps its logical handle but replaces the
+                // executor incarnation, which an old failure cannot close.
+                self.complete_request_exact_frontier_detached(
+                    &handle,
+                    &request.sequence,
                     FinishReason::Error,
                     Some(FerrumError::backend(format!(
                         "Request-state readiness ticket {} failed: {}",
@@ -1064,7 +1087,6 @@ impl EngineInner {
         };
         let mut decode_generated_tokens = Vec::new();
         let mut prefill_prompt_tokens = Vec::new();
-        let sequences = self.sequences.read();
 
         for scheduled_req in &batch.requests {
             let request_id = &scheduled_req.request.id;
@@ -1075,7 +1097,9 @@ impl EngineInner {
             stats.scheduled_tokens_total += scheduled_tokens;
 
             let phase = self.scheduler.trace_phase(request_id);
-            let seq = sequences.get(request_id);
+            let handle = self.sequences.get(request_id);
+            let state = handle.as_ref().map(|handle| handle.lock());
+            let seq = state.as_ref().and_then(|state| state.as_ref());
             let prompt_tokens = seq.map(|seq| seq.prefill_context_len());
             let generated_tokens = seq.map(|seq| seq.generated_tokens.len());
             let prefill_tokens_processed = seq.map(|seq| seq.prefill_tokens_processed);

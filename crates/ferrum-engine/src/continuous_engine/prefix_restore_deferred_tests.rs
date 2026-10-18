@@ -172,12 +172,7 @@ async fn submit(
     );
     let (sender, receiver) = tokio::sync::oneshot::channel();
     sequence.response_sender = Some(sender);
-    assert!(engine
-        .inner
-        .sequences
-        .write()
-        .insert(id, sequence)
-        .is_none());
+    assert!(engine.inner.sequences.insert(id, sequence).is_none());
     engine.inner.scheduler.submit(request).await.unwrap();
     receiver
 }
@@ -185,7 +180,7 @@ async fn submit(
 async fn finish(engine: &ContinuousBatchEngine) {
     tokio::time::timeout(Duration::from_secs(2), async {
         for _ in 0..64 {
-            if engine.inner.sequences.read().is_empty() {
+            if engine.inner.sequences.is_empty() {
                 return;
             }
             engine.inner.run_iteration().await.unwrap();
@@ -273,7 +268,7 @@ async fn prefix_restore_cancelled_wait_cannot_leak_into_reused_request_id() {
     assert!(state.computed_for(&id).is_empty());
     drop(cancelled);
     engine.inner.run_iteration().await.unwrap();
-    assert!(!engine.inner.sequences.read().contains_key(&id));
+    assert!(!engine.inner.sequences.get(&id).is_some());
     state.assert_unpinned();
 
     state.ready.store(true, Ordering::Release);

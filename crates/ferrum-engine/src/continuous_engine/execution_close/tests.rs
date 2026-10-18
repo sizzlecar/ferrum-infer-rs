@@ -207,11 +207,7 @@ async fn install_recompute_request(
     state.generated_tokens.push(TokenId(2));
     state.phase = RequestPhase::Decoding;
     state.request_slot = Some(slot);
-    engine
-        .inner
-        .sequences
-        .write()
-        .insert(request_id.clone(), state);
+    engine.inner.sequences.insert(request_id.clone(), state);
     let source = CapacityAvailabilitySource::ActiveSequenceSlots;
     let condition = CapacityWaitCondition::from_observation(
         41,
@@ -270,8 +266,10 @@ async fn execution_close_recompute_waits_for_ended_before_requeue_and_release() 
         0
     );
     {
-        let sequences = engine.inner.sequences.read();
-        let sequence = &sequences[&request_id];
+        let sequences = &engine.inner.sequences;
+        let sequence_handle = sequences.get(&request_id).unwrap();
+        let sequence_guard = sequence_handle.lock();
+        let sequence = sequence_guard.as_ref().unwrap();
         assert_eq!(
             sequence.execution_frontier.as_ref().unwrap().sequence(),
             &identity
@@ -304,8 +302,10 @@ async fn execution_close_recompute_waits_for_ended_before_requeue_and_release() 
         1
     );
     {
-        let sequences = engine.inner.sequences.read();
-        let sequence = &sequences[&request_id];
+        let sequences = &engine.inner.sequences;
+        let sequence_handle = sequences.get(&request_id).unwrap();
+        let sequence_guard = sequence_handle.lock();
+        let sequence = sequence_guard.as_ref().unwrap();
         assert!(sequence.execution_frontier.is_none());
         assert!(sequence.request_slot.as_ref().unwrap().armed);
         assert!(!sequence.prefill_complete);
@@ -326,7 +326,7 @@ async fn execution_close_recompute_waits_for_ended_before_requeue_and_release() 
         .scheduler
         .cancel_request(request_id.clone())
         .unwrap());
-    let mut sequence = engine.inner.sequences.write().remove(&request_id).unwrap();
+    let mut sequence = engine.inner.sequences.take(&request_id).unwrap();
     sequence.request_slot.take().unwrap().close(&engine.inner);
 }
 
@@ -375,7 +375,7 @@ async fn managed_driver_closing_does_not_revive_a_completed_recompute() {
         1
     );
     observer.wait().await.result().unwrap();
-    assert!(engine.inner.sequences.read().is_empty());
+    assert!(engine.inner.sequences.is_empty());
     assert_eq!(engine.inner.scheduler.trace_phase(&request_id), None);
     assert_eq!(engine.inner.execution_closes.unreclaimed_count(), 0);
     assert_eq!(
@@ -438,7 +438,14 @@ async fn execution_close_recompute_source_error_preserves_feedback_and_once_rele
         engine.inner.scheduler.trace_phase(&request_id),
         Some(RequestPhase::Waiting)
     );
-    assert!(engine.inner.sequences.read()[&request_id]
+    assert!(engine
+        .inner
+        .sequences
+        .get(&request_id)
+        .unwrap()
+        .lock()
+        .as_ref()
+        .unwrap()
         .execution_frontier
         .is_none());
     assert_eq!(executor.calls.load(Ordering::SeqCst), 1);
@@ -457,7 +464,7 @@ async fn execution_close_recompute_source_error_preserves_feedback_and_once_rele
         .scheduler
         .cancel_request(request_id.clone())
         .unwrap());
-    let mut sequence = engine.inner.sequences.write().remove(&request_id).unwrap();
+    let mut sequence = engine.inner.sequences.take(&request_id).unwrap();
     sequence.request_slot.take().unwrap().close(&engine.inner);
 }
 
@@ -492,7 +499,7 @@ async fn execution_close_recompute_cancel_while_held_does_not_revive_or_repeat_c
             .scheduler
             .cancel_request(request_id.clone())
             .unwrap());
-        let mut state = engine.inner.sequences.write().remove(&request_id).unwrap();
+        let mut state = engine.inner.sequences.take(&request_id).unwrap();
         let frontier = state.execution_frontier.take().unwrap();
         assert!(state.request_slot.is_none());
         let ticket = engine
@@ -529,7 +536,7 @@ async fn execution_close_recompute_cancel_while_held_does_not_revive_or_repeat_c
         engine.inner.execution_closes.join_observers().await;
         engine.inner.drain_execution_closes().unwrap();
         assert_eq!(engine.inner.execution_closes.unreclaimed_count(), 0);
-        assert!(engine.inner.sequences.read().get(&request_id).is_none());
+        assert!(engine.inner.sequences.get(&request_id).is_none());
         assert_eq!(engine.inner.scheduler.trace_phase(&request_id), None);
         assert_eq!(engine.inner.scheduler.waiting_count(), 0);
         assert_eq!(

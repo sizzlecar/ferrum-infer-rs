@@ -209,7 +209,7 @@ fn assert_no_admission(
     request_id: &RequestId,
 ) {
     assert_eq!(tokenizer.encodes.load(Ordering::Relaxed), 0);
-    assert!(engine.inner.sequences.read().is_empty());
+    assert!(engine.inner.sequences.is_empty());
     assert_eq!(engine.inner.scheduler.waiting_count(), 0);
     assert_eq!(engine.inner.scheduler.prefilling_count(), 0);
     assert_eq!(engine.inner.scheduler.decoding_count(), 0);

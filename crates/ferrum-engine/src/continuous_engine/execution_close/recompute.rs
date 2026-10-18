@@ -11,23 +11,51 @@ impl EngineInner {
         observed_free_blocks: Option<usize>,
     ) -> Result<ExecutionCloseTicket> {
         let request_id = transaction.victim_request_id().clone();
-        let mut sequences = self.sequences.write();
-        let failure_targets = self
-            .scheduler
-            .execution_capacity_yield_requests(&transaction)?
-            .into_iter()
-            .filter_map(|key| {
-                sequences
-                    .get(key.request_id())
-                    .map(|sequence| RecomputeFailureTarget {
-                        key,
-                        frontier: sequence.execution_frontier.clone(),
-                    })
-            })
-            .collect();
-        let sequence = sequences
-            .get_mut(&request_id)
+        let request = self
+            .sequences
+            .get(&request_id)
             .ok_or_else(|| FerrumError::internal("capacity yield lost its outer request"))?;
+        let request_weak = Arc::downgrade(&request);
+        let target_keys = self
+            .scheduler
+            .execution_capacity_yield_requests(&transaction)?;
+        let mut failure_targets = std::collections::VecDeque::new();
+        for key in target_keys {
+            let Some(target) = self.sequences.get(key.request_id()) else {
+                continue;
+            };
+            let state = target.lock();
+            let Some(sequence) = state.as_ref().filter(|_| {
+                self.sequences.is_current(&target)
+                    && self.scheduler.execution_capacity_request_is_current(&key)
+            }) else {
+                continue;
+            };
+            failure_targets.push_back(RecomputeFailureTarget {
+                request: Arc::downgrade(&target),
+                key,
+                frontier: sequence.execution_frontier.clone(),
+            });
+        }
+        // Capture peers one at a time before locking the victim. No request
+        // lock nests another, and an ID replacement cannot inherit this yield.
+        let victim_key = failure_targets
+            .iter()
+            .find(|target| target.request.ptr_eq(&request_weak))
+            .map(|target| &target.key)
+            .ok_or_else(|| {
+                FerrumError::internal("capacity yield lost its original scheduler request")
+            })?;
+        let mut state = request.lock();
+        let sequence = state
+            .as_mut()
+            .filter(|_| {
+                self.sequences.is_current(&request)
+                    && self
+                        .scheduler
+                        .execution_capacity_request_is_current(victim_key)
+            })
+            .ok_or_else(|| FerrumError::internal("capacity yield outer request changed"))?;
         let frontier = sequence.execution_frontier.clone().ok_or_else(|| {
             FerrumError::internal("capacity yield requires the actual token incarnation")
         })?;
@@ -55,6 +83,7 @@ impl EngineInner {
             Arc::clone(&self.model_executor),
             CloseStart::Execute(ExecutionEndReason::Cancelled),
             ClosePurpose::Recompute(RecomputeClose {
+                request: request_weak,
                 frontier,
                 transaction,
                 attempted_width,
@@ -78,29 +107,17 @@ impl EngineInner {
         let mut handled = false;
         while let Some((closing, target, error)) = self.execution_closes.next_recompute_failure() {
             handled = true;
-            let current = {
-                let sequences = self.sequences.read();
-                self.scheduler
-                    .execution_capacity_request_is_current(&target.key)
-                    && sequences
-                        .get(target.key.request_id())
-                        .is_some_and(|sequence| {
-                            sequence.execution_frontier.as_ref() == target.frontier.as_ref()
-                        })
-            };
-            if current {
-                let result = match &target.frontier {
-                    Some(frontier) => {
-                        self.fail_token_frontier(target.key.request_id(), frontier, error, None)
-                            .await
-                    }
-                    None => self.complete_request_detached(
-                        target.key.request_id(),
-                        FinishReason::Error,
-                        Some(error),
-                    ),
-                };
-                if let Err(error) = result {
+            if let Some(request) = target.request.upgrade() {
+                // The exact key and optional frontier are checked under the
+                // same request lock as terminal handoff, including a waiting
+                // peer with no executor incarnation. No old ID lookup can
+                // close a replacement or a newly recomputed incarnation.
+                if let Err(error) = self.complete_request_exact_recompute_detached(
+                    &request,
+                    &target.key,
+                    target.frontier.as_ref(),
+                    error,
+                ) {
                     first_error.get_or_insert(error);
                 }
             }
@@ -119,13 +136,15 @@ impl EngineInner {
 
     pub(super) fn finish_execution_recompute(
         &self,
-        sequences: &mut HashMap<RequestId, SequenceState>,
+        request: Option<&Arc<SequenceHandle>>,
+        sequence: Option<&mut SequenceState>,
         request_id: &RequestId,
         ended: &ExecutorSequence,
         recompute: RecomputeClose,
         slot: &mut Option<RequestSlotLease>,
     ) -> (bool, Result<()>) {
         let RecomputeClose {
+            request: original_request,
             frontier,
             transaction,
             attempted_width,
@@ -154,10 +173,15 @@ impl EngineInner {
                 ))),
             );
         }
+        let sequence = sequence.filter(|_| {
+            request.is_some_and(|request| {
+                original_request.ptr_eq(&Arc::downgrade(request))
+                    && self.sequences.is_current(request)
+            })
+        });
         if self.shutdown_started() {
-            if let Some(sequence) = sequences
-                .get_mut(request_id)
-                .filter(|sequence| sequence.execution_frontier.as_ref() == Some(&frontier))
+            if let Some(sequence) =
+                sequence.filter(|sequence| sequence.execution_frontier.as_ref() == Some(&frontier))
             {
                 // The caller is consuming this exact entry's actual Ended
                 // receipt. Leave its slot in that entry, but remove the stale
@@ -178,7 +202,7 @@ impl EngineInner {
                     .map(|_| ()),
             );
         }
-        let live = sequences.get_mut(request_id).filter(|sequence| {
+        let live = sequence.filter(|sequence| {
             sequence.execution_frontier.as_ref() == Some(&frontier)
                 && matches!(
                     self.scheduler.trace_phase(request_id),

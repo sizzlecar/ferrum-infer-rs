@@ -11,6 +11,7 @@ use ferrum_execution::token_execution::{
 mod recompute;
 
 pub(super) struct RecomputeClose {
+    request: Weak<SequenceHandle>,
     frontier: ExecutionFrontier,
     transaction: PressureYieldTransaction,
     attempted_width: usize,
@@ -23,8 +24,14 @@ pub(super) struct RecomputeClose {
 
 #[derive(Clone)]
 struct RecomputeFailureTarget {
+    request: Weak<SequenceHandle>,
     key: ferrum_scheduler::implementations::continuous::PrefixRequestKey,
     frontier: Option<ExecutionFrontier>,
+}
+
+struct ReadyExecutionClose {
+    sequence: ExecutorSequence,
+    request: Option<Weak<SequenceHandle>>,
 }
 
 enum ClosePurpose {
@@ -485,10 +492,10 @@ impl ExecutionCloseRegistry {
         }
     }
 
-    fn take_ended_and_errors(
+    fn observe_ended_and_errors(
         &self,
         scheduler: &ContinuousBatchScheduler,
-    ) -> (Vec<CloseEntry>, Vec<FerrumError>, bool) {
+    ) -> (Vec<ReadyExecutionClose>, Vec<FerrumError>, bool) {
         let mut state = self.state.lock();
         let mut errors = Vec::new();
         for entry in state.entries.values_mut() {
@@ -521,7 +528,13 @@ impl ExecutionCloseRegistry {
             .filter_map(|(sequence, entry)| {
                 (matches!(entry.observation, CloseObservation::Ended(..))
                     && !entry.has_pending_product_failure())
-                .then(|| sequence.clone())
+                .then(|| ReadyExecutionClose {
+                    sequence: sequence.clone(),
+                    request: entry
+                        .purpose
+                        .recompute()
+                        .map(|recompute| recompute.request.clone()),
+                })
             })
             .collect::<Vec<_>>();
         let mut newly_unproved = false;
@@ -550,11 +563,24 @@ impl ExecutionCloseRegistry {
                 }
             }
         }
-        let ended = ended
-            .into_iter()
-            .map(|sequence| state.entries.remove(&sequence).unwrap())
-            .collect();
         (ended, errors, newly_unproved)
+    }
+
+    /// Recheck and claim only after the original recompute request is locked.
+    /// Removing a recompute before that lock would let concurrent completion
+    /// register a second close instead of upgrading the retained obligation.
+    fn take_ended(&self, sequence: &ExecutorSequence) -> Option<CloseEntry> {
+        let mut state = self.state.lock();
+        let ready = state.entries.get(sequence).is_some_and(|entry| {
+            matches!(entry.observation, CloseObservation::Ended(..))
+                && !entry.has_pending_product_failure()
+        });
+        ready.then(|| {
+            state
+                .entries
+                .remove(sequence)
+                .expect("checked close remains registered")
+        })
     }
 
     fn next_recompute_failure(
@@ -697,13 +723,18 @@ impl EngineInner {
     }
 
     pub(super) fn drain_execution_closes(&self) -> Result<()> {
-        // Serialize terminal consumption with the product's synchronous
-        // frontier/slot handoff. A completion must register its original
-        // incarnation while holding this same outer lock, before awaiting.
-        let mut sequences = self.sequences.write();
-        let (ended, mut errors, newly_unproved) =
-            self.execution_closes.take_ended_and_errors(&self.scheduler);
-        for mut entry in ended {
+        // Snapshot without consuming the close owner. Completion may still
+        // upgrade Recompute to Finalize while holding its original request.
+        // Never wait for that request while holding the close registry lock.
+        let (ended, mut errors, newly_unproved) = self
+            .execution_closes
+            .observe_ended_and_errors(&self.scheduler);
+        for ready in ended {
+            let request = ready.request.and_then(|request| request.upgrade());
+            let mut state = request.as_ref().map(|request| request.lock());
+            let Some(mut entry) = self.execution_closes.take_ended(&ready.sequence) else {
+                continue;
+            };
             let CloseObservation::Ended(ended, _) = &entry.observation else {
                 unreachable!("only checked terminal entries are removed")
             };
@@ -714,7 +745,8 @@ impl EngineInner {
             match std::mem::take(&mut entry.purpose) {
                 ClosePurpose::Recompute(recompute) => {
                     let (requeued, result) = self.finish_execution_recompute(
-                        &mut sequences,
+                        request.as_ref(),
+                        state.as_mut().and_then(|state| state.as_mut()),
                         &entry.request_id,
                         &identity,
                         recompute,
@@ -756,7 +788,6 @@ impl EngineInner {
                 slot.close(self);
             }
         }
-        drop(sequences);
         if newly_unproved && self.scheduler.invalidate_allocator_capacity_waits() {
             // Losing a pending release witness is not a physical release.
             // Re-probe the allocator and re-evaluate actual contributors;

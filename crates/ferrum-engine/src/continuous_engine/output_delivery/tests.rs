@@ -3,7 +3,15 @@ use crate::continuous_engine::token_completion_tests as actual;
 
 async fn completion_after_delivery_failure(panic: bool) {
     let mut fixture = actual::fixture(false, false).await;
-    let sender = fixture.engine.inner.sequences.read()[&fixture.request_id]
+    let sender = fixture
+        .engine
+        .inner
+        .sequences
+        .get(&fixture.request_id)
+        .unwrap()
+        .lock()
+        .as_ref()
+        .unwrap()
         .stream_sender
         .as_ref()
         .unwrap()
@@ -112,8 +120,11 @@ async fn output_terminal_payload_budget_error_is_not_silent_eof() {
         4,
     );
     {
-        let mut sequences = fixture.engine.inner.sequences.write();
-        let sequence = sequences.get_mut(&fixture.request_id).unwrap();
+        let sequences = &fixture.engine.inner.sequences;
+        let sequence_handle = sequences.get(&fixture.request_id).unwrap();
+        sender.bind_sequence(Arc::downgrade(&sequence_handle));
+        let mut sequence_guard = sequence_handle.lock();
+        let sequence = sequence_guard.as_mut().unwrap();
         sequence.streamed_text_len = fixture
             .engine
             .inner
@@ -184,8 +195,11 @@ async fn output_full_queue_does_not_hide_actual_close_control_error_from_driver(
         .output_channel(fixture.request_id.clone(), 1)
         .unwrap();
     let token = {
-        let mut sequences = fixture.engine.inner.sequences.write();
-        let sequence = sequences.get_mut(&fixture.request_id).unwrap();
+        let sequences = &fixture.engine.inner.sequences;
+        let sequence_handle = sequences.get(&fixture.request_id).unwrap();
+        sender.bind_sequence(Arc::downgrade(&sequence_handle));
+        let mut sequence_guard = sequence_handle.lock();
+        let sequence = sequence_guard.as_mut().unwrap();
         sequence.stream_sender = Some(sender.clone());
         sequence.generated_tokens[0]
     };

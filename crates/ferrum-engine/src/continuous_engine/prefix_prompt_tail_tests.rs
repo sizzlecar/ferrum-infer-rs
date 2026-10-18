@@ -119,11 +119,7 @@ async fn prompt_tail_batch_prefill_commits_each_boundary_before_sampling() {
         );
         sequence.request_slot = Some(RequestSlotLease::open(&engine.inner, request.id.clone()));
         request_ids.push(request.id.clone());
-        engine
-            .inner
-            .sequences
-            .write()
-            .insert(request.id.clone(), sequence);
+        engine.inner.sequences.insert(request.id.clone(), sequence);
         assert!(
             engine
                 .inner
@@ -133,8 +129,10 @@ async fn prompt_tail_batch_prefill_commits_each_boundary_before_sampling() {
         engine
             .inner
             .sequences
-            .write()
-            .get_mut(&request.id)
+            .get(&request.id)
+            .unwrap()
+            .lock()
+            .as_mut()
             .unwrap()
             .request_slot
             .as_mut()
@@ -150,8 +148,16 @@ async fn prompt_tail_batch_prefill_commits_each_boundary_before_sampling() {
     let incarnations = request_ids
         .iter()
         .map(|id| {
-            let sequences = engine.inner.sequences.read();
-            let frontier = sequences[id].execution_frontier.as_ref().unwrap();
+            let sequences = &engine.inner.sequences;
+            let frontier = sequences
+                .get(id)
+                .unwrap()
+                .lock()
+                .as_ref()
+                .unwrap()
+                .execution_frontier
+                .clone()
+                .unwrap();
             assert_eq!(frontier.consumed_tokens(), 0);
             (id.clone(), frontier.sequence().clone())
         })
@@ -159,9 +165,11 @@ async fn prompt_tail_batch_prefill_commits_each_boundary_before_sampling() {
     engine.inner.process_batch(&first).await.unwrap();
     assert_eq!(executor.tail_batch_prefill_calls.load(Ordering::Relaxed), 1);
     {
-        let sequences = engine.inner.sequences.read();
+        let sequences = &engine.inner.sequences;
         for id in &request_ids {
-            let sequence = &sequences[id];
+            let sequence_handle = sequences.get(id).unwrap();
+            let sequence_guard = sequence_handle.lock();
+            let sequence = sequence_guard.as_ref().unwrap();
             assert_eq!(sequence.prefill_tokens_processed, 3);
             assert!(!sequence.prefill_complete);
             assert!(sequence.generated_tokens.is_empty());
@@ -183,9 +191,11 @@ async fn prompt_tail_batch_prefill_commits_each_boundary_before_sampling() {
     engine.inner.process_batch(&last).await.unwrap();
     assert_eq!(executor.tail_batch_prefill_calls.load(Ordering::Relaxed), 2);
     {
-        let sequences = engine.inner.sequences.read();
+        let sequences = &engine.inner.sequences;
         for id in &request_ids {
-            let sequence = &sequences[id];
+            let sequence_handle = sequences.get(id).unwrap();
+            let sequence_guard = sequence_handle.lock();
+            let sequence = sequence_guard.as_ref().unwrap();
             assert!(sequence.prefill_complete);
             assert_eq!(sequence.generated_tokens.len(), 1);
             let frontier = sequence.execution_frontier.as_ref().unwrap();

@@ -1207,8 +1207,10 @@ fn token_id_tail(tokens: &[TokenId], limit: usize) -> Vec<u32> {
 }
 
 mod sequence;
+mod sequence_registry;
 pub use sequence::SequenceState;
 use sequence::*;
+use sequence_registry::{SequenceHandle, SequenceRegistry};
 mod execution_close;
 use execution_close::ExecutionCloseRegistry;
 mod managed_driver;
@@ -1231,9 +1233,14 @@ enum EngineResourceComposition {
 
 const MAX_EXECUTION_READINESS_WAITERS: usize = 64;
 
+struct ExecutionReadinessWaitTarget {
+    request: Weak<SequenceHandle>,
+    sequence: ferrum_execution::token_execution::ExecutorSequence,
+}
+
 struct ExecutionReadinessWaitFailure {
     ticket_id: u64,
-    request_ids: Vec<RequestId>,
+    requests: Vec<ExecutionReadinessWaitTarget>,
     message: String,
 }
 
@@ -1268,7 +1275,7 @@ impl ExecutionReadinessWaitRegistry {
         &self,
         wake: ExecutionReadinessWake,
         wait: F,
-        request_ids: Vec<RequestId>,
+        requests: Vec<ExecutionReadinessWaitTarget>,
         work_notify: Arc<Notify>,
         slot: tokio::sync::OwnedSemaphorePermit,
     ) -> Result<()>
@@ -1282,7 +1289,7 @@ impl ExecutionReadinessWaitRegistry {
         if tasks.contains_key(&ticket_id) {
             failures.lock().push_back(ExecutionReadinessWaitFailure {
                 ticket_id,
-                request_ids,
+                requests,
                 message: format!("execution readiness ticket {ticket_id} was registered twice"),
             });
             wake.mark_failed();
@@ -1301,7 +1308,7 @@ impl ExecutionReadinessWaitRegistry {
                 Ok(Err(error)) => {
                     failures.lock().push_back(ExecutionReadinessWaitFailure {
                         ticket_id,
-                        request_ids,
+                        requests,
                         message: error.to_string(),
                     });
                     wake.mark_failed();
@@ -1309,7 +1316,7 @@ impl ExecutionReadinessWaitRegistry {
                 Err(_) => {
                     failures.lock().push_back(ExecutionReadinessWaitFailure {
                         ticket_id,
-                        request_ids,
+                        requests,
                         message: "Request-state readiness waiter panicked".to_string(),
                     });
                     wake.mark_failed();
@@ -1403,7 +1410,7 @@ struct EngineInner {
     sampler: Arc<dyn Sampler + Send + Sync>,
     resource_composition: EngineResourceComposition,
     model_executor: Arc<dyn ModelExecutor + Send + Sync>,
-    sequences: RwLock<HashMap<RequestId, SequenceState>>,
+    sequences: SequenceRegistry,
     driver: Weak<ManagedDriver>,
     shutdown_notify: Arc<Notify>,
     /// Serializes request publication with cancellation and BatchPlan
@@ -2335,7 +2342,7 @@ impl ContinuousBatchEngine {
                 sampler,
                 resource_composition,
                 model_executor,
-                sequences: RwLock::new(HashMap::new()),
+                sequences: SequenceRegistry::default(),
                 driver: Arc::downgrade(&driver),
                 shutdown_notify: Arc::new(Notify::new()),
                 iteration_lock: tokio::sync::Mutex::new(()),
@@ -2388,28 +2395,27 @@ impl ContinuousBatchEngine {
         let request_id = request.id.clone();
         let _iteration = self.inner.iteration_lock.lock().await;
         self.driver.publish(&self.inner, || {
-            let mut sequences = self.inner.sequences.write();
-            if sequences.contains_key(&request_id) {
-                return Err(FerrumError::already_exists(format!(
-                    "request {request_id} is already active"
-                )));
-            }
-            // No cancellable await exists after opening the product slot.
-            // The same gate serializes this publication with shutdown.
-            sequence.request_slot = Some(RequestSlotLease::open(&self.inner, request_id.clone()));
-            if let Err(error) = self.inner.scheduler.submit_request(request) {
-                if let Some(slot) = sequence.request_slot.take() {
-                    slot.reject(&self.inner, error.to_string());
-                }
-                return Err(error);
-            }
-            sequence
-                .request_slot
-                .as_mut()
-                .expect("new publication owns its slot")
-                .admit(&self.inner);
-            sequences.insert(request_id, sequence);
-            Ok(())
+            self.inner
+                .sequences
+                .publish(request_id.clone(), || {
+                    // No cancellable await exists after opening the product slot.
+                    // The same gate serializes this publication with shutdown.
+                    sequence.request_slot =
+                        Some(RequestSlotLease::open(&self.inner, request_id.clone()));
+                    if let Err(error) = self.inner.scheduler.submit_request(request) {
+                        if let Some(slot) = sequence.request_slot.take() {
+                            slot.reject(&self.inner, error.to_string());
+                        }
+                        return Err(error);
+                    }
+                    sequence
+                        .request_slot
+                        .as_mut()
+                        .expect("new publication owns its slot")
+                        .admit(&self.inner);
+                    Ok(sequence)
+                })
+                .map(drop)
         })?;
         self.inner.work_notify.notify_one();
         Ok(())
@@ -2762,7 +2768,7 @@ impl std::fmt::Debug for ContinuousBatchEngine {
                 "iteration_count",
                 &self.inner.iteration_count.load(Ordering::SeqCst),
             )
-            .field("active_sequences", &self.inner.sequences.read().len())
+            .field("active_sequences", &self.inner.sequences.len())
             .finish()
     }
 }

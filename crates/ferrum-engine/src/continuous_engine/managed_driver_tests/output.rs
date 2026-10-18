@@ -24,10 +24,12 @@ async fn output_slow_stream_pauses_only_its_request_and_shutdown_joins_delivery(
         .unwrap();
     assert_eq!(healthy.tokens.len(), 4);
     {
-        let sequences = fixture.engine.inner.sequences.read();
-        let slow = sequences
+        let sequences = &fixture.engine.inner.sequences;
+        let slow_handle = sequences
             .get(&slow_id)
             .expect("backpressure retains exact request");
+        let slow_guard = slow_handle.lock();
+        let slow = slow_guard.as_ref().unwrap();
         assert_eq!(
             slow.generated_tokens.len(),
             2,
@@ -97,7 +99,7 @@ async fn output_completed_unread_streams_retain_session_admission_until_drop() {
     fixture.engine.inner.execution_closes.join_observers().await;
     fixture.engine.inner.output_tasks.join_current().await;
     fixture.engine.inner.drain_execution_closes().unwrap();
-    assert!(fixture.engine.inner.sequences.read().is_empty());
+    assert!(fixture.engine.inner.sequences.is_empty());
     assert_eq!(fixture.engine.inner.output_budget.usage().sessions, 1);
 
     let second = fixture.engine.infer_stream(second_request).await.unwrap();

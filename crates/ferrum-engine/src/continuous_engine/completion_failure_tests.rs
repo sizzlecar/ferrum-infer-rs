@@ -13,8 +13,10 @@ enum CompletionFault {
 async fn completion_failure_closes_known_owners(fault: CompletionFault) {
     let mut fixture = fixture(false, false).await;
     let (frontier, token, prompt) = {
-        let states = fixture.engine.inner.sequences.read();
-        let state = &states[&fixture.request_id];
+        let states = &fixture.engine.inner.sequences;
+        let state_handle = states.get(&fixture.request_id).unwrap();
+        let state_guard = state_handle.lock();
+        let state = state_guard.as_ref().unwrap();
         (
             state.execution_frontier.clone().unwrap(),
             state.generated_tokens[0],
@@ -28,8 +30,10 @@ async fn completion_failure_closes_known_owners(fault: CompletionFault) {
                 .engine
                 .inner
                 .sequences
-                .write()
-                .get_mut(&fixture.request_id)
+                .get(&fixture.request_id)
+                .unwrap()
+                .lock()
+                .as_mut()
                 .unwrap()
                 .record_generated_token_commit();
         }
@@ -65,8 +69,8 @@ async fn completion_failure_closes_known_owners(fault: CompletionFault) {
         .engine
         .inner
         .sequences
-        .read()
-        .contains_key(&fixture.request_id));
+        .get(&fixture.request_id)
+        .is_some());
     assert_eq!(
         fixture.engine.inner.scheduler.trace_snapshot().active_len,
         0

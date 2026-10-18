@@ -230,11 +230,7 @@ async fn install_decode_cohort(
             Some(64),
         );
         state.execution_frontier = Some(frontier);
-        engine
-            .inner
-            .sequences
-            .write()
-            .insert(request.id.clone(), state);
+        engine.inner.sequences.insert(request.id.clone(), state);
         scheduler.submit(request.clone()).await.unwrap();
         ids.push(request.id);
     }
@@ -245,8 +241,10 @@ async fn install_decode_cohort(
     assert_eq!(batch.requests.len(), ids.len());
     engine.inner.process_batch(&batch).await.unwrap();
     for id in &ids {
-        let sequences = engine.inner.sequences.read();
-        let state = &sequences[id];
+        let sequences = &engine.inner.sequences;
+        let state_handle = sequences.get(id).unwrap();
+        let state_guard = state_handle.lock();
+        let state = state_guard.as_ref().unwrap();
         assert!(state.prefill_complete);
         assert_eq!(
             state.execution_frontier.as_ref().unwrap().consumed_tokens(),
@@ -269,10 +267,17 @@ async fn run_decode_width(engine: &ContinuousBatchEngine, width: usize) {
         .await
         .expect("live decode cohort");
     assert_eq!(batch.requests.len(), width);
-    assert!(batch
-        .requests
-        .iter()
-        .all(|request| { engine.inner.sequences.read()[&request.request.id].prefill_complete }));
+    assert!(batch.requests.iter().all(|request| {
+        engine
+            .inner
+            .sequences
+            .get(&request.request.id)
+            .unwrap()
+            .lock()
+            .as_ref()
+            .unwrap()
+            .prefill_complete
+    }));
     engine.inner.process_batch(&batch).await.unwrap();
 }
 
@@ -401,7 +406,15 @@ async fn token_capacity_sequence_extension_pressure_does_not_cap_survivors_durin
         .expect("already admitted survivors remain schedulable");
     assert_eq!(survivors.requests.len(), ids.len() - 1);
     assert!(survivors.requests.iter().all(|scheduled| {
-        engine.inner.sequences.read()[&scheduled.request.id].prefill_complete
+        engine
+            .inner
+            .sequences
+            .get(&scheduled.request.id)
+            .unwrap()
+            .lock()
+            .as_ref()
+            .unwrap()
+            .prefill_complete
     }));
 }
 

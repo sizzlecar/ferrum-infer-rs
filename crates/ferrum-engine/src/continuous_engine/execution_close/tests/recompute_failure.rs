@@ -14,8 +14,10 @@ fn attach_clients(
 ) {
     let (response, receiver) = tokio::sync::oneshot::channel();
     let (stream, updates) = engine.inner.output_channel(request_id.clone(), 4).unwrap();
-    let mut sequences = engine.inner.sequences.write();
-    let sequence = sequences.get_mut(request_id).unwrap();
+    let sequences = &engine.inner.sequences;
+    let sequence_handle = sequences.get(request_id).unwrap();
+    let mut sequence_guard = sequence_handle.lock();
+    let sequence = sequence_guard.as_mut().unwrap();
     sequence.response_sender = Some(response);
     sequence.stream_sender = Some(stream);
     (receiver, updates)
@@ -64,7 +66,7 @@ async fn install_controlled_request(
     let mut slot = RequestSlotLease::open(&engine.inner, id.clone());
     slot.admit(&engine.inner);
     state.request_slot = Some(slot);
-    engine.inner.sequences.write().insert(id.clone(), state);
+    engine.inner.sequences.insert(id.clone(), state);
     (id, identity)
 }
 
@@ -149,7 +151,14 @@ async fn execution_close_late_recompute_failure_ends_products_but_retains_real_c
                 engine.inner.scheduler.trace_phase(&prior),
                 Some(RequestPhase::Waiting)
             );
-            assert!(engine.inner.sequences.read()[&prior]
+            assert!(engine
+                .inner
+                .sequences
+                .get(&prior)
+                .unwrap()
+                .lock()
+                .as_ref()
+                .unwrap()
                 .execution_frontier
                 .is_none());
             let tick = engine
@@ -222,7 +231,7 @@ async fn execution_close_late_recompute_failure_ends_products_but_retains_real_c
         for (response, stream) in clients {
             assert_client_failed(response, stream).await;
         }
-        assert!(engine.inner.sequences.read().is_empty());
+        assert!(engine.inner.sequences.is_empty());
         assert_eq!(engine.inner.scheduler.active_count(), 0);
         assert_eq!(engine.inner.scheduler.waiting_count(), 0);
         assert_eq!(engine.inner.execution_closes.unreclaimed_count(), 1);
@@ -291,6 +300,6 @@ async fn execution_close_late_recompute_failure_ends_products_but_retains_real_c
             engine.inner.scheduler.confirmed_capacity_release_epoch(),
             prior_releases + 1
         );
-        assert!(engine.inner.sequences.read().is_empty());
+        assert!(engine.inner.sequences.is_empty());
     }
 }

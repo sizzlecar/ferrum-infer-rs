@@ -7,6 +7,7 @@ use ferrum_scheduler::implementations::continuous::{PrefixRequestKey, TokenAdmis
 struct PreparedTokenAdmission<'a> {
     engine: &'a EngineInner,
     request: RequestId,
+    handle: Option<Arc<SequenceHandle>>,
     key: Option<PrefixRequestKey>,
     frontier: Option<ExecutionFrontier>,
     newly_admitted: bool,
@@ -16,6 +17,7 @@ impl<'a> PreparedTokenAdmission<'a> {
     fn new(engine: &'a EngineInner, request: RequestId, key: Option<PrefixRequestKey>) -> Self {
         Self {
             engine,
+            handle: engine.sequences.get(&request),
             request,
             key,
             frontier: None,
@@ -29,10 +31,16 @@ impl<'a> PreparedTokenAdmission<'a> {
                 "unpublished admission lacks a scheduler identity",
             ));
         };
+        let Some(handle) = self.handle.as_ref() else {
+            return Ok(());
+        };
         {
-            let mut sequences = self.engine.sequences.write();
-            let Some(sequence) = sequences
-                .get_mut(&self.request)
+            let mut state = handle.lock();
+            if !self.engine.sequences.is_current(handle) {
+                return Ok(());
+            }
+            let Some(sequence) = state
+                .as_mut()
                 .filter(|sequence| sequence.pending_token_admission.as_ref() == Some(&key))
             else {
                 return Ok(());
@@ -45,14 +53,23 @@ impl<'a> PreparedTokenAdmission<'a> {
         // Explicit-error completion atomically moves the exact frontier and
         // slot into the existing close registry before its first await.
         self.engine
-            .complete_unpublished_admission(&key, error)
+            .complete_unpublished_admission(handle, &key, error)
             .await
     }
 
     fn publish(&mut self) -> Result<()> {
-        let mut sequences = self.engine.sequences.write();
-        let sequence = sequences
-            .get_mut(&self.request)
+        let handle = self
+            .handle
+            .as_ref()
+            .ok_or_else(|| FerrumError::internal("admission has no original outer request"))?;
+        let mut state = handle.lock();
+        if !self.engine.sequences.is_current(handle) {
+            return Err(FerrumError::internal(
+                "admission outer request incarnation changed",
+            ));
+        }
+        let sequence = state
+            .as_mut()
             .filter(|sequence| sequence.pending_token_admission == self.key)
             .ok_or_else(|| FerrumError::internal("admission outer request incarnation changed"))?;
         let frontier = self
@@ -79,20 +96,21 @@ impl<'a> PreparedTokenAdmission<'a> {
 
 impl Drop for PreparedTokenAdmission<'_> {
     fn drop(&mut self) {
-        let mut sequences = self.engine.sequences.write();
-        if let Some(sequence) = sequences
-            .get_mut(&self.request)
-            .filter(|sequence| sequence.pending_token_admission == self.key)
-        {
-            sequence.pending_token_admission = None;
-            if self.newly_admitted && sequence.execution_frontier.is_none() {
-                // An error after preparation cannot lose the original outer
-                // owner or release its request slot. Ordinary terminal handling
-                // closes this exact frontier, including malformed progress.
-                sequence.execution_frontier = self.frontier.take();
+        if let Some(handle) = &self.handle {
+            let mut state = handle.lock();
+            if let Some(sequence) = state.as_mut().filter(|sequence| {
+                self.engine.sequences.is_current(handle)
+                    && sequence.pending_token_admission == self.key
+            }) {
+                sequence.pending_token_admission = None;
+                if self.newly_admitted && sequence.execution_frontier.is_none() {
+                    // An error after preparation cannot lose the original outer
+                    // owner or release its request slot. Ordinary terminal handling
+                    // closes this exact frontier, including malformed progress.
+                    sequence.execution_frontier = self.frontier.take();
+                }
             }
         }
-        drop(sequences);
         if self.newly_admitted {
             if let Some(frontier) = self.frontier.take() {
                 // The original outer owner disappeared or was replaced. This
@@ -146,11 +164,12 @@ impl EngineInner {
             replayed_output_tokens,
             existing_frontier,
             closing,
-        )) = self
-            .sequences
-            .write()
-            .get_mut(&request.id)
-            .and_then(|sequence| {
+        )) = pending.handle.as_ref().and_then(|handle| {
+            let mut state = handle.lock();
+            if !self.sequences.is_current(handle) {
+                return None;
+            }
+            state.as_mut().and_then(|sequence| {
                 if sequence.pending_token_admission.is_some()
                     && sequence.pending_token_admission != pending.key
                 {
@@ -166,6 +185,7 @@ impl EngineInner {
                     sequence.execution_close.is_some(),
                 ))
             })
+        })
         else {
             let error = FerrumError::internal(format!(
                 "request {} reached typed admission before its sequence state was published",

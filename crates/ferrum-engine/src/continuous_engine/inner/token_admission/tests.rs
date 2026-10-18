@@ -12,6 +12,9 @@ use ferrum_testkit::{MockKvCacheManager, MockTensorFactory};
 use std::time::Duration;
 use tokio::sync::oneshot;
 
+#[path = "tests/readiness.rs"]
+mod readiness;
+
 struct AdmissionGate {
     inner: Arc<dyn ModelExecutor>,
     ready: Mutex<Option<oneshot::Sender<ExecutorSequence>>>,
@@ -131,7 +134,6 @@ async fn install_outer(
     assert!(engine
         .inner
         .sequences
-        .write()
         .insert(request.id.clone(), state)
         .is_none());
     engine.inner.scheduler.submit(request).await.unwrap();
@@ -195,13 +197,14 @@ async fn start_round(
     // All preparation resources already exist, but no product result has been
     // published and neither outer nor capacity-cache lock may span the await.
     {
-        let sequences = fixture
-            .engine
-            .inner
-            .sequences
-            .try_write()
-            .expect("outer lock must be available during executor admission");
-        let state = sequences.get(&fixture.request.id).unwrap();
+        assert!(
+            fixture.engine.inner.sequences.index_is_unlocked(),
+            "outer index must be available during executor admission"
+        );
+        let sequences = &fixture.engine.inner.sequences;
+        let state_handle = sequences.get(&fixture.request.id).unwrap();
+        let state_guard = state_handle.lock();
+        let state = state_guard.as_ref().unwrap();
         assert!(state.pending_token_admission.is_some());
         assert!(state.execution_frontier.is_none());
         assert!(state.request_slot.as_ref().unwrap().armed);
@@ -275,16 +278,16 @@ async fn token_admission_cancelled_ticket_closes_original_outer() {
         .engine
         .inner
         .sequences
-        .read()
-        .contains_key(&fixture.request.id));
+        .get(&fixture.request.id)
+        .is_some());
     assert_eq!(slot_events(&fixture, ResourceAction::Release), 0);
     finish_round(&mut fixture, task, &identity).await;
     assert!(!fixture
         .engine
         .inner
         .sequences
-        .read()
-        .contains_key(&fixture.request.id));
+        .get(&fixture.request.id)
+        .is_some());
     assert!(fixture
         .engine
         .inner
@@ -319,8 +322,7 @@ async fn token_admission_replacement_keeps_new_outer() {
         .engine
         .inner
         .sequences
-        .write()
-        .remove(&fixture.request.id)
+        .take(&fixture.request.id)
         .unwrap();
     assert!(old.execution_frontier.is_none());
     assert!(old.pending_token_admission.is_some());
@@ -342,10 +344,12 @@ async fn token_admission_replacement_keeps_new_outer() {
     .await;
     finish_round(&mut fixture, task, &identity).await;
     {
-        let sequences = fixture.engine.inner.sequences.read();
-        let state = sequences
+        let sequences = &fixture.engine.inner.sequences;
+        let state_handle = sequences
             .get(&fixture.request.id)
             .expect("replacement must stay present");
+        let state_guard = state_handle.lock();
+        let state = state_guard.as_ref().unwrap();
         assert_eq!(state.original_request.prompt, replacement.prompt);
         assert_eq!(state.input_tokens, replacement_prompt);
         assert!(state.generated_tokens.is_empty());
@@ -389,7 +393,15 @@ async fn token_admission_replacement_keeps_new_outer() {
         .unwrap();
     assert_eq!(admitted, 1);
     assert!(maintenance.is_empty());
-    let replacement_identity = fixture.engine.inner.sequences.read()[&fixture.request.id]
+    let replacement_identity = fixture
+        .engine
+        .inner
+        .sequences
+        .get(&fixture.request.id)
+        .unwrap()
+        .lock()
+        .as_ref()
+        .unwrap()
         .execution_frontier
         .as_ref()
         .unwrap()

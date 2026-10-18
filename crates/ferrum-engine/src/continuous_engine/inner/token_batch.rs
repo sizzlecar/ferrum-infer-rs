@@ -20,6 +20,7 @@ mod prefill;
 mod preparation_tests;
 
 struct TokenBatchInput {
+    handle: Arc<SequenceHandle>,
     request_id: RequestId,
     frontier: ExecutionFrontier,
     work: TokenWork,
@@ -35,6 +36,7 @@ impl TokenBatchInput {
 }
 
 struct TokenPreparationFailure {
+    handle: Option<Arc<SequenceHandle>>,
     request_id: RequestId,
     // A preparation failure can close only the incarnation actually observed.
     // A missing outer state/frontier provides no authority over a replacement.
@@ -49,8 +51,8 @@ struct PreparedTokenBatch {
 
 #[derive(Default)]
 struct TokenBatchEffects {
-    ready: Vec<(RequestId, TokenId)>,
-    failed: Vec<(RequestId, FerrumError)>,
+    ready: Vec<(Arc<SequenceHandle>, TokenId)>,
+    failed: Vec<(Arc<SequenceHandle>, FerrumError)>,
 }
 
 /// Cold-path groups of unchanged work. Indices refer only to the current
@@ -67,9 +69,13 @@ impl EngineInner {
         let mut failures = Vec::new();
         for scheduled in &batch.requests {
             let request_id = &scheduled.request.id;
+            let handle = self.sequences.get(request_id);
             let snapshot = (|| -> Result<_> {
-                let sequences = self.sequences.read();
-                let sequence = sequences.get(request_id).ok_or_else(|| {
+                let handle = handle.as_ref().ok_or_else(|| {
+                    FerrumError::internal("scheduled token request has no published handle")
+                })?;
+                let state = handle.lock();
+                let sequence = state.as_ref().ok_or_else(|| {
                     FerrumError::internal("scheduled token request has no published sequence")
                 })?;
                 let frontier = sequence.execution_frontier.clone().ok_or_else(|| {
@@ -122,6 +128,7 @@ impl EngineInner {
                 Ok(snapshot) => snapshot,
                 Err(error) => {
                     failures.push(TokenPreparationFailure {
+                        handle: handle.clone(),
                         request_id: request_id.clone(),
                         frontier: None,
                         error,
@@ -140,6 +147,9 @@ impl EngineInner {
             });
             match prepared {
                 Ok((context_tokens, work, logits_policy)) => inputs.push(TokenBatchInput {
+                    handle: handle
+                        .clone()
+                        .expect("successful snapshot retained its handle"),
                     request_id: request_id.clone(),
                     frontier,
                     work,
@@ -148,6 +158,7 @@ impl EngineInner {
                     context_tokens,
                 }),
                 Err(error) => failures.push(TokenPreparationFailure {
+                    handle,
                     request_id: request_id.clone(),
                     frontier: Some(frontier),
                     error,
@@ -189,14 +200,10 @@ impl EngineInner {
                 !self
                     .execution_closes
                     .contains_incarnation(input.frontier.sequence())
-                    && self
-                        .sequences
-                        .read()
-                        .get(&input.request_id)
-                        .is_some_and(|sequence| {
-                            sequence.execution_frontier.as_ref() == Some(&input.frontier)
-                                && sequence.execution_close.is_none()
-                        })
+                    && input.handle.lock().as_ref().is_some_and(|sequence| {
+                        sequence.execution_frontier.as_ref() == Some(&input.frontier)
+                            && sequence.execution_close.is_none()
+                    })
             });
             if indices.is_empty() {
                 continue;
@@ -298,15 +305,13 @@ impl EngineInner {
                         completion.validate_for(index, &works[index], self.model_executor.info().vocab_size).is_ok()
                     }));
             if let (Some(started_at), Some(completed_at)) = (started_at, completed_at) {
-                let mut sequences = self.sequences.write();
                 for input in &selected {
+                    let mut state = input.handle.lock();
                     if matches!(input.work, TokenWork::Decode { .. }) {
-                        if let Some(sequence) =
-                            sequences.get_mut(&input.request_id).filter(|sequence| {
-                                sequence.execution_frontier.as_ref() == Some(&input.frontier)
-                                    && sequence.execution_close.is_none()
-                            })
-                        {
+                        if let Some(sequence) = state.as_mut().filter(|sequence| {
+                            sequence.execution_frontier.as_ref() == Some(&input.frontier)
+                                && sequence.execution_close.is_none()
+                        }) {
                             sequence.close_decode_scheduling(started_at);
                             sequence.record_decode_execution(started_at, completed_at);
                         }
@@ -375,9 +380,9 @@ impl EngineInner {
         for failure in failures {
             warn!(request_id = %failure.request_id, error = %failure.error, "token preparation failed");
             first_error.get_or_insert_with(|| failure.error.clone());
-            if let Some(frontier) = failure.frontier {
+            if let (Some(handle), Some(frontier)) = (failure.handle, failure.frontier) {
                 if let Err(error) = self
-                    .fail_token_frontier(&failure.request_id, &frontier, failure.error, None)
+                    .fail_token_handle_frontier(&handle, &frontier, failure.error, None)
                     .await
                 {
                     first_error.get_or_insert(error);

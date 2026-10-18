@@ -12,6 +12,9 @@ mod fixture;
 #[path = "managed_driver_tests/metrics.rs"]
 mod metrics;
 
+#[path = "managed_driver_tests/sequence_isolation.rs"]
+mod sequence_isolation;
+
 async fn pending_once<F: Future>(mut future: Pin<&mut F>) {
     poll_fn(|context| {
         assert!(
@@ -77,7 +80,7 @@ async fn managed_driver_explicit_lazy_share_one_real_cpu_execution() {
     let third = fixture.engine.start_loop().unwrap();
     let mut inference = Box::pin(fixture.engine.infer(fixture.request()));
     pending_once(inference.as_mut()).await;
-    assert_eq!(fixture.engine.inner.sequences.read().len(), 2);
+    assert_eq!(fixture.engine.inner.sequences.len(), 2);
     fixture.release.send(()).unwrap();
     let (response, chunks) = tokio::time::timeout(Duration::from_secs(3), async {
         tokio::join!(inference, stream.collect::<Vec<_>>())
@@ -137,7 +140,7 @@ async fn managed_driver_closing_wins_both_ingress_publications() {
     let mut streaming = Box::pin(fixture.engine.infer_stream(fixture.request()));
     pending_once(inference.as_mut()).await;
     pending_once(streaming.as_mut()).await;
-    assert!(fixture.engine.inner.sequences.read().is_empty());
+    assert!(fixture.engine.inner.sequences.is_empty());
     assert_eq!(
         fixture::slot_events(
             &fixture.engine,
@@ -162,7 +165,7 @@ async fn managed_driver_closing_wins_both_ingress_publications() {
     assert_eq!(fixture.executor.admissions.load(Ordering::SeqCst), 0);
     assert_eq!(fixture.executor.checked_outputs.load(Ordering::SeqCst), 0);
     assert_eq!(fixture.engine.inner.scheduler.waiting_count(), 0);
-    assert!(fixture.engine.inner.sequences.read().is_empty());
+    assert!(fixture.engine.inner.sequences.is_empty());
     assert_eq!(
         fixture::closed_slot_events(
             &fixture.trace.path().join("trace.jsonl"),
@@ -230,14 +233,14 @@ async fn managed_driver_cancel_published_infer_balances_gauge_and_closes_real_kv
     let mut shutdown = Box::pin(fixture.engine.shutdown());
     pending_once(shutdown.as_mut()).await;
     assert!(fixture.engine.start_loop().is_err());
-    assert!(fixture.engine.inner.sequences.read().contains_key(&id));
+    assert!(fixture.engine.inner.sequences.get(&id).is_some());
     fixture.release.send(()).unwrap();
     tokio::time::timeout(Duration::from_secs(2), shutdown)
         .await
         .unwrap()
         .unwrap();
     observer.wait().await.result().unwrap();
-    assert!(fixture.engine.inner.sequences.read().is_empty());
+    assert!(fixture.engine.inner.sequences.is_empty());
     assert_eq!(fixture.engine.inner.scheduler.trace_phase(&id), None);
     assert!(fixture.executor.observed.lock().model.kv_caches.is_empty());
     assert_eq!(fixture.executor.closes.load(Ordering::SeqCst), 1);
@@ -267,7 +270,7 @@ async fn managed_driver_dropped_shutdown_observer_preserves_actual_close_and_joi
         started = &mut fixture.started => started.unwrap(),
     }
     drop(completion);
-    assert!(fixture.engine.inner.sequences.read().is_empty());
+    assert!(fixture.engine.inner.sequences.is_empty());
     let observer = fixture.engine.start_loop().unwrap();
     let remaining_observer = observer.clone();
     let mut shutdown = Box::pin(fixture.engine.shutdown());

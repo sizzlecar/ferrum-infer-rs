@@ -8,6 +8,7 @@ use ferrum_execution::token_execution::{ExecutedTokenWork, ExecutionCompletion, 
 struct SchedulerProgress {
     input_index: usize,
     executed: ExecutedTokenWork,
+    frontier: ExecutionFrontier,
     product: Option<ExecutionProduct>,
     generated_tokens: Option<usize>,
 }
@@ -25,7 +26,6 @@ impl EngineInner {
         };
         let mut progress = Vec::with_capacity(completions.len());
         {
-            let mut sequences = self.sequences.write();
             // The caller has already validated mapping, role, output policy
             // and duplicate/conflicting batch membership. Recheck the live
             // owner under the same lock used to publish every actual frontier.
@@ -33,25 +33,27 @@ impl EngineInner {
             for completion in completions {
                 let (input_index, next_frontier, executed, product) = completion.into_parts();
                 let input = inputs[input_index];
-                let Some(sequence) = sequences.get_mut(&input.request_id) else {
+                let mut state = input.handle.lock();
+                let Some(sequence) = state.as_mut() else {
                     effects.failed.push((
-                        input.request_id.clone(),
+                        Arc::clone(&input.handle),
                         FerrumError::internal("completed token work lost its outer request"),
                     ));
                     continue;
                 };
-                if sequence.execution_frontier.as_ref() != Some(&input.frontier)
+                if !self.sequences.is_current(&input.handle)
+                    || sequence.execution_frontier.as_ref() != Some(&input.frontier)
                     || sequence.execution_close.is_some()
                 {
                     effects.failed.push((
-                        input.request_id.clone(),
+                        Arc::clone(&input.handle),
                         FerrumError::internal(
                             "completed token work no longer matches the live outer frontier",
                         ),
                     ));
                     continue;
                 }
-                sequence.execution_frontier = Some(next_frontier);
+                sequence.execution_frontier = Some(next_frontier.clone());
                 match executed {
                     ExecutedTokenWork::Prefill { chunk, .. } => {
                         sequence.prefill_tokens_processed = chunk.end();
@@ -68,6 +70,7 @@ impl EngineInner {
                 }
                 progress.push(SchedulerProgress {
                     input_index,
+                    frontier: next_frontier,
                     executed,
                     product: Some(product),
                     generated_tokens: None,
@@ -83,9 +86,20 @@ impl EngineInner {
                     .product
                     .take()
                     .expect("each retained product is consumed exactly once");
-                let sequence = sequences
-                    .get_mut(&input.request_id)
-                    .expect("accepted outer owner remains locked through product commit");
+                let mut state = input.handle.lock();
+                let Some(sequence) = state.as_mut().filter(|sequence| {
+                    self.sequences.is_current(&input.handle)
+                        && sequence.execution_frontier.as_ref() == Some(&pending.frontier)
+                        && sequence.execution_close.is_none()
+                }) else {
+                    effects.failed.push((
+                        Arc::clone(&input.handle),
+                        FerrumError::internal(
+                            "completed token product lost its original live frontier",
+                        ),
+                    ));
+                    continue;
+                };
                 let sampled = (|| -> Result<Option<TokenId>> {
                     let ExecutionProduct::Sampling(output) = product else {
                         return Ok(None);
@@ -127,12 +141,12 @@ impl EngineInner {
                 })();
                 pending.generated_tokens = match sampled {
                     Ok(Some(token)) => {
-                        effects.ready.push((input.request_id.clone(), token));
+                        effects.ready.push((Arc::clone(&input.handle), token));
                         Some(sequence.generated_tokens.len())
                     }
                     Ok(None) => None,
                     Err(error) => {
-                        effects.failed.push((input.request_id.clone(), error));
+                        effects.failed.push((Arc::clone(&input.handle), error));
                         None
                     }
                 };
@@ -143,6 +157,16 @@ impl EngineInner {
         // progress and all successful sampled tokens have been retained.
         for progress in progress {
             let input = &inputs[progress.input_index];
+            // Keep the original owner live through synchronous scheduler
+            // publication, so a reused RequestId cannot receive old progress.
+            let state = input.handle.lock();
+            if !state.as_ref().is_some_and(|sequence| {
+                self.sequences.is_current(&input.handle)
+                    && sequence.execution_frontier.as_ref() == Some(&progress.frontier)
+                    && sequence.execution_close.is_none()
+            }) {
+                continue;
+            }
             match progress.executed {
                 ExecutedTokenWork::Prefill { chunk, .. } => {
                     let scheduler_result = self
@@ -162,10 +186,16 @@ impl EngineInner {
                     };
                     let scheduler_committed = error.is_none();
                     if let Some(error) = error {
-                        if !effects.failed.iter().any(|(id, _)| id == &input.request_id) {
-                            effects.failed.push((input.request_id.clone(), error));
+                        if !effects
+                            .failed
+                            .iter()
+                            .any(|(id, _)| Arc::ptr_eq(id, &input.handle))
+                        {
+                            effects.failed.push((Arc::clone(&input.handle), error));
                         }
-                        effects.ready.retain(|(id, _)| id != &input.request_id);
+                        effects
+                            .ready
+                            .retain(|(id, _)| !Arc::ptr_eq(id, &input.handle));
                     }
                     // These tokens really executed even if sampling or logical
                     // publication subsequently failed. They are not retries.

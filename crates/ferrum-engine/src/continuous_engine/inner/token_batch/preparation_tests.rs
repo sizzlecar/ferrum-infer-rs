@@ -61,8 +61,10 @@ impl ModelExecutor for InvalidTailExecutor {
     fn cancel_tokens(&self, sequence: &ExecutorSequence) -> Result<ExecutionCloseOutcome> {
         if let Some((engine, request)) = self.healthy_at_close.lock().as_ref() {
             let engine = engine.upgrade().expect("test engine remains live");
-            let states = engine.sequences.read();
-            let healthy = &states[request];
+            let states = &engine.sequences;
+            let healthy_handle = states.get(request).unwrap();
+            let healthy_guard = healthy_handle.lock();
+            let healthy = healthy_guard.as_ref().unwrap();
             self.close_progress.lock().push((
                 healthy
                     .execution_frontier
@@ -164,11 +166,7 @@ async fn fixture(
         let mut slot = RequestSlotLease::open(&engine.inner, request.id.clone());
         slot.admit(&engine.inner);
         state.request_slot = Some(slot);
-        engine
-            .inner
-            .sequences
-            .write()
-            .insert(request.id.clone(), state);
+        engine.inner.sequences.insert(request.id.clone(), state);
         identities.push((request.id.clone(), frontier));
         scheduler.submit(request).await.unwrap();
     }
@@ -204,7 +202,7 @@ async fn token_preparation_bad_tail_commits_healthy_cpu_peer_before_closing_fail
     );
     assert_eq!(*executor.close_progress.lock(), vec![(4, 1)]);
     assert!(bad_frontier.sequence().observed_end().is_some());
-    assert!(!engine.inner.sequences.read().contains_key(bad));
+    assert!(!engine.inner.sequences.get(bad).is_some());
     assert!(healthy_frontier.sequence().observed_end().is_none());
     let next = engine
         .inner
@@ -216,8 +214,10 @@ async fn token_preparation_bad_tail_commits_healthy_cpu_peer_before_closing_fail
     assert_eq!(&next.requests[0].request.id, healthy);
     engine.inner.process_batch(&next).await.unwrap();
     {
-        let states = engine.inner.sequences.read();
-        let state = &states[healthy];
+        let states = &engine.inner.sequences;
+        let state_handle = states.get(healthy).unwrap();
+        let state_guard = state_handle.lock();
+        let state = state_guard.as_ref().unwrap();
         assert_eq!(
             state.execution_frontier.as_ref().unwrap().consumed_tokens(),
             5
@@ -253,16 +253,23 @@ async fn token_preparation_failure_preserves_same_request_replacement_incarnatio
         old_close.disposition,
         ExecutionCloseDisposition::Ended(_)
     ));
+    let state_handle = engine.inner.sequences.get(request_id).unwrap();
+    let (input_tokens, maximum_sequence_tokens) = {
+        let state_guard = state_handle.lock();
+        let state = state_guard.as_ref().unwrap();
+        (
+            state.input_tokens.clone(),
+            state.model_maximum_sequence_tokens(),
+        )
+    };
     let replacement = {
-        let mut states = engine.inner.sequences.write();
-        let state = states.get_mut(request_id).unwrap();
         let TokenAdmissionOutcome::Admitted(frontier) = executor
             .admit_tokens(ExecutionAdmission {
                 context: ExecutorPrefillAdmission::for_product_request(
                     request_id,
-                    &state.input_tokens,
-                    state.model_maximum_sequence_tokens(),
-                    state.input_tokens.len(),
+                    &input_tokens,
+                    maximum_sequence_tokens,
+                    input_tokens.len(),
                     0,
                 )
                 .unwrap(),
@@ -274,6 +281,8 @@ async fn token_preparation_failure_preserves_same_request_replacement_incarnatio
             panic!("replacement must genuinely admit");
         };
         assert_ne!(frontier.sequence(), original.sequence());
+        let mut state_guard = state_handle.lock();
+        let state = state_guard.as_mut().unwrap();
         state.execution_frontier = Some(frontier.clone());
         frontier
     };
@@ -292,20 +301,36 @@ async fn token_preparation_failure_preserves_same_request_replacement_incarnatio
         vec![original.sequence().clone()]
     );
     assert_eq!(
-        engine.inner.sequences.read()[request_id]
+        engine
+            .inner
+            .sequences
+            .get(request_id)
+            .unwrap()
+            .lock()
+            .as_ref()
+            .unwrap()
             .execution_frontier
             .as_ref(),
         Some(&replacement)
     );
     assert!(replacement.sequence().observed_end().is_none());
-    assert!(engine.inner.sequences.read()[request_id]
+    assert!(engine
+        .inner
+        .sequences
+        .get(request_id)
+        .unwrap()
+        .lock()
+        .as_ref()
+        .unwrap()
         .request_slot
         .is_some());
     executor.bad_hook.store(false, Ordering::Relaxed);
     engine.inner.process_batch(&batch).await.unwrap();
     {
-        let states = engine.inner.sequences.read();
-        let state = &states[request_id];
+        let states = &engine.inner.sequences;
+        let state_handle = states.get(request_id).unwrap();
+        let state_guard = state_handle.lock();
+        let state = state_guard.as_ref().unwrap();
         assert_eq!(
             state.execution_frontier.as_ref().unwrap().consumed_tokens(),
             3

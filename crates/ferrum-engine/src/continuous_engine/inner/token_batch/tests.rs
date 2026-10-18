@@ -134,13 +134,10 @@ async fn fixture_with_request_count(
         );
         sequence.execution_frontier = Some(frontier.clone());
         sequence.phase = RequestPhase::Prefilling;
-        engine
-            .inner
-            .sequences
-            .write()
-            .insert(request_id.clone(), sequence);
+        engine.inner.sequences.insert(request_id.clone(), sequence);
         scheduler.submit(request).await.unwrap();
         inputs.push(TokenBatchInput {
+            handle: engine.inner.sequences.get(&request_id).unwrap(),
             request_id,
             frontier,
             work: TokenWork::Prefill(PrefillChunk::new(0, 1, 2).unwrap()),
@@ -197,8 +194,10 @@ fn held(
 }
 
 fn assert_healthy(engine: &ContinuousBatchEngine, input: &TokenBatchInput) {
-    let sequences = engine.inner.sequences.read();
-    let sequence = &sequences[&input.request_id];
+    let sequences = &engine.inner.sequences;
+    let sequence_handle = sequences.get(&input.request_id).unwrap();
+    let sequence_guard = sequence_handle.lock();
+    let sequence = sequence_guard.as_ref().unwrap();
     let frontier = sequence.execution_frontier.as_ref().unwrap();
     assert_eq!(frontier.sequence(), input.frontier.sequence());
     assert_eq!(frontier.consumed_tokens(), 1);
@@ -264,11 +263,7 @@ async fn token_outcome_wrong_index_held_conflicts_only_with_its_actual_incarnati
             FerrumError::backend("conflicting actual incarnation").to_string()
         );
         engine.inner.drain_execution_closes().unwrap();
-        assert!(!engine
-            .inner
-            .sequences
-            .read()
-            .contains_key(&inputs[0].request_id));
+        assert!(!engine.inner.sequences.get(&inputs[0].request_id).is_some());
         assert_healthy(&engine, &inputs[1]);
         assert_eq!(
             executor.closed.lock().as_slice(),
@@ -424,8 +419,10 @@ async fn token_outcome_foreign_retryable_preserves_another_live_split_request() 
         assert_healthy(&engine, input);
     }
     {
-        let sequences = engine.inner.sequences.read();
-        let sequence = &sequences[&pending.request_id];
+        let sequences = &engine.inner.sequences;
+        let sequence_handle = sequences.get(&pending.request_id).unwrap();
+        let sequence_guard = sequence_handle.lock();
+        let sequence = sequence_guard.as_ref().unwrap();
         assert_eq!(
             sequence.execution_frontier.as_ref(),
             Some(&pending.frontier)
@@ -552,8 +549,10 @@ async fn token_outcome_keeps_deferred_subcohort_after_peer_close_and_commit() {
     let group = deferred.pop().unwrap();
     assert_eq!(group.input_indices, vec![2, 3]);
     for input in &inputs[2..] {
-        let sequences = engine.inner.sequences.read();
-        let state = &sequences[&input.request_id];
+        let sequences = &engine.inner.sequences;
+        let state_handle = sequences.get(&input.request_id).unwrap();
+        let state_guard = state_handle.lock();
+        let state = state_guard.as_ref().unwrap();
         assert_eq!(state.execution_frontier.as_ref(), Some(&input.frontier));
         assert_eq!(state.prefill_tokens_processed, 0);
         assert!(state.execution_close.is_none());
@@ -665,10 +664,6 @@ async fn token_outcome_contract_violation_never_grants_capacity_retry() {
     engine.inner.drain_execution_closes().unwrap();
     for input in &inputs {
         assert!(input.frontier.sequence().observed_end().is_some());
-        assert!(!engine
-            .inner
-            .sequences
-            .read()
-            .contains_key(&input.request_id));
+        assert!(!engine.inner.sequences.get(&input.request_id).is_some());
     }
 }

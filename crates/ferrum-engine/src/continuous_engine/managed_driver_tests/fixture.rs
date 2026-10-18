@@ -30,12 +30,14 @@ pub(super) struct NumericalExecutor {
     pub(super) observed: Arc<Mutex<closure::ModelObservation>>,
     reference: Mutex<ReferenceState>,
     gate: Mutex<Option<ExecutionGate>>,
+    next_prefill: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     in_flight: AtomicUsize,
     pub(super) maximum_in_flight: AtomicUsize,
     pub(super) admissions: AtomicUsize,
     pub(super) closes: AtomicUsize,
     close_notify: Notify,
     pub(super) checked_outputs: AtomicUsize,
+    output_notify: Notify,
     pub(super) dropped: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
     layers: usize,
 }
@@ -168,6 +170,16 @@ impl ModelExecutor for NumericalExecutor {
                 self.checked_outputs.fetch_add(1, Ordering::SeqCst);
             }
         }
+        self.output_notify.notify_waiters();
+        if work
+            .iter()
+            .any(|input| matches!(input.work(), TokenWork::Prefill(_)))
+        {
+            let hook = self.next_prefill.lock().take();
+            if let Some(hook) = hook {
+                hook();
+            }
+        }
         let gate = self.gate.lock().take();
         if let Some(gate) = gate {
             gate.reached.send(()).unwrap();
@@ -196,6 +208,26 @@ impl ModelExecutor for NumericalExecutor {
 }
 
 impl NumericalExecutor {
+    pub(super) fn remove_execution_gate(&self) {
+        self.gate.lock().take();
+    }
+
+    pub(super) fn after_next_prefill(&self, hook: impl FnOnce() + Send + 'static) {
+        assert!(self.next_prefill.lock().replace(Box::new(hook)).is_none());
+    }
+
+    pub(super) async fn wait_for_outputs(&self, count: usize) {
+        loop {
+            let changed = self.output_notify.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if self.checked_outputs.load(Ordering::SeqCst) >= count {
+                return;
+            }
+            changed.await;
+        }
+    }
+
     pub(super) async fn wait_for_closes(&self, count: usize) {
         loop {
             let changed = self.close_notify.notified();
@@ -245,6 +277,13 @@ impl Fixture {
     }
 
     pub(super) fn with_config(configure: impl FnOnce(&mut EngineConfig)) -> Self {
+        Self::with_tokenizer(configure, |vocab| Arc::new(TinyTokenizer::new(vocab)))
+    }
+
+    pub(super) fn with_tokenizer(
+        configure: impl FnOnce(&mut EngineConfig),
+        tokenizer: impl FnOnce(usize) -> Arc<dyn Tokenizer>,
+    ) -> Self {
         let (inner, observed, cfg) = closure::observed_cpu_model();
         let (reached_tx, reached) = tokio::sync::oneshot::channel();
         let (release, release_rx) = tokio::sync::oneshot::channel();
@@ -259,12 +298,14 @@ impl Fixture {
                 reached: reached_tx,
                 release: release_rx,
             })),
+            next_prefill: Mutex::new(None),
             in_flight: AtomicUsize::new(0),
             maximum_in_flight: AtomicUsize::new(0),
             admissions: AtomicUsize::new(0),
             closes: AtomicUsize::new(0),
             close_notify: Notify::new(),
             checked_outputs: AtomicUsize::new(0),
+            output_notify: Notify::new(),
             dropped: Mutex::new(None),
             layers: cfg.num_layers,
         });
@@ -276,7 +317,7 @@ impl Fixture {
         let engine = ContinuousBatchEngine::new(
             config.clone(),
             Arc::new(ContinuousBatchScheduler::new(config.scheduler)),
-            Arc::new(TinyTokenizer::new(cfg.vocab_size)),
+            tokenizer(cfg.vocab_size),
             Arc::new(crate::registry::GreedySampler),
             Arc::new(MockKvCacheManager::new(128)),
             executor.clone(),

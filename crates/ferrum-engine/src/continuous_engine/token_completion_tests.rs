@@ -303,11 +303,7 @@ pub(super) async fn fixture(delayed: bool, publication_error: bool) -> Fixture {
     let mut slot = RequestSlotLease::open(&engine.inner, request_id.clone());
     slot.admit(&engine.inner);
     state.request_slot = Some(slot);
-    engine
-        .inner
-        .sequences
-        .write()
-        .insert(request_id.clone(), state);
+    engine.inner.sequences.insert(request_id.clone(), state);
     assert_eq!(model.lock().model.kv_caches.len(), 1);
     Fixture {
         engine,
@@ -398,8 +394,8 @@ async fn token_completion_cpu_caller_cancel_preserves_actual_close_owner() {
         .engine
         .inner
         .sequences
-        .read()
-        .contains_key(&fixture.request_id));
+        .get(&fixture.request_id)
+        .is_some());
     assert_eq!(
         fixture.engine.inner.scheduler.trace_snapshot().active_len,
         0
@@ -468,8 +464,10 @@ async fn token_completion_cpu_observed_close_is_consumed_without_reclosing() {
         .engine
         .inner
         .sequences
-        .write()
-        .get_mut(&fixture.request_id)
+        .get(&fixture.request_id)
+        .unwrap()
+        .lock()
+        .as_mut()
         .unwrap()
         .execution_close = Some(Box::new(Mutex::new(outcome)));
     let error = fixture
@@ -499,8 +497,10 @@ async fn token_completion_cpu_observed_close_is_consumed_without_reclosing() {
 async fn token_completion_cpu_stale_failure_does_not_repeat_release_or_close_replacement() {
     let fixture = fixture(false, false).await;
     let (request, prompt, original) = {
-        let states = fixture.engine.inner.sequences.read();
-        let state = &states[&fixture.request_id];
+        let states = &fixture.engine.inner.sequences;
+        let state_handle = states.get(&fixture.request_id).unwrap();
+        let state_guard = state_handle.lock();
+        let state = state_guard.as_ref().unwrap();
         (
             state.original_request.clone(),
             state.input_tokens.clone(),
@@ -601,7 +601,6 @@ async fn token_completion_cpu_stale_failure_does_not_repeat_release_or_close_rep
         .engine
         .inner
         .sequences
-        .write()
         .insert(fixture.request_id.clone(), state)
         .is_none());
     fixture
@@ -645,8 +644,10 @@ async fn token_completion_cpu_stale_failure_does_not_repeat_release_or_close_rep
         assert_eq!(slot_events(&fixture, ResourceAction::Release), 1);
         assert_eq!(slot_events(&fixture, ResourceAction::RequestClose), 1);
         {
-            let states = fixture.engine.inner.sequences.read();
-            let state = &states[&fixture.request_id];
+            let states = &fixture.engine.inner.sequences;
+            let state_handle = states.get(&fixture.request_id).unwrap();
+            let state_guard = state_handle.lock();
+            let state = state_guard.as_ref().unwrap();
             assert_eq!(state.execution_frontier.as_ref(), Some(&replacement));
             assert!(state.request_slot.as_ref().unwrap().armed);
         }
@@ -691,8 +692,10 @@ async fn token_completion_cpu_stale_failure_does_not_repeat_release_or_close_rep
         &reference.decode("replacement-reference", sampled.get(), prompt.len() as u32)
     );
     {
-        let mut states = fixture.engine.inner.sequences.write();
-        let state = states.get_mut(&fixture.request_id).unwrap();
+        let states = &fixture.engine.inner.sequences;
+        let state_handle = states.get(&fixture.request_id).unwrap();
+        let mut state_guard = state_handle.lock();
+        let state = state_guard.as_mut().unwrap();
         state.execution_frontier = Some(completion.next_frontier().clone());
         state.generated_tokens.push(TokenId(
             logits

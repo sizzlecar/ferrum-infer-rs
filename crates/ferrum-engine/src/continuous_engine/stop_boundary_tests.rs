@@ -151,7 +151,7 @@ async fn output_stop_prefix_flush_preserves_two_pending_spans_before_terminal() 
             output_tokens: 4
         }
     );
-    assert!(engine.inner.sequences.read().is_empty());
+    assert!(engine.inner.sequences.is_empty());
 
     let chunks = tokio::time::timeout(Duration::from_secs(2), stream.collect::<Vec<_>>())
         .await

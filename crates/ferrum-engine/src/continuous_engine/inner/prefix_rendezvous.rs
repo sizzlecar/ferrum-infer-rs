@@ -29,22 +29,31 @@ impl EngineInner {
             return Ok(());
         };
         let candidates = self.scheduler.prefix_rendezvous_candidates();
-        let sequences = self.sequences.read();
         let mut used = HashSet::new();
         for producer in &candidates {
             if used.contains(producer.key.request_id()) {
                 continue;
             }
-            let Some(source) = sequences.get(producer.key.request_id()) else {
+            let Some(source_handle) = self.sequences.get(producer.key.request_id()) else {
                 continue;
             };
-            if !source.generated_tokens.is_empty()
-                || source.preemption_count != 0
-                || source.prefill_tokens_processed != producer.processed_tokens
-            {
-                continue;
-            }
-            let source_tokens = source.prefill_context_tokens();
+            let (source_tokens, maximum_sequence_tokens) = {
+                let state = source_handle.lock();
+                let Some(source) = state.as_ref() else {
+                    continue;
+                };
+                if !self.sequences.is_current(&source_handle)
+                    || !source.generated_tokens.is_empty()
+                    || source.preemption_count != 0
+                    || source.prefill_tokens_processed != producer.processed_tokens
+                {
+                    continue;
+                }
+                (
+                    source.prefill_context_tokens(),
+                    source.model_maximum_sequence_tokens(),
+                )
+            };
             let mut common = source_tokens.len();
             let mut followers = Vec::new();
             let mut prompt_lengths = Vec::new();
@@ -57,13 +66,23 @@ impl EngineInner {
                 {
                     continue;
                 }
-                let Some(target) = sequences.get(follower.key.request_id()) else {
+                let Some(target_handle) = self.sequences.get(follower.key.request_id()) else {
                     continue;
                 };
-                if target.preemption_count != 0 || !target.generated_tokens.is_empty() {
-                    continue;
-                }
-                let tokens = target.prefill_context_tokens();
+                // Never hold a producer lock while waiting for a follower.
+                let tokens = {
+                    let state = target_handle.lock();
+                    let Some(target) = state.as_ref() else {
+                        continue;
+                    };
+                    if !self.sequences.is_current(&target_handle)
+                        || target.preemption_count != 0
+                        || !target.generated_tokens.is_empty()
+                    {
+                        continue;
+                    }
+                    target.prefill_context_tokens()
+                };
                 let shared = source_tokens
                     .iter()
                     .zip(&tokens)
@@ -109,6 +128,19 @@ impl EngineInner {
             {
                 continue;
             }
+            // Serialize the producer's logical hold with its own completion.
+            // Follower identities are independently validated by the scheduler.
+            let state = source_handle.lock();
+            let Some(source) = state.as_ref() else {
+                continue;
+            };
+            if !self.sequences.is_current(&source_handle)
+                || !source.generated_tokens.is_empty()
+                || source.preemption_count != 0
+                || source.prefill_tokens_processed != producer.processed_tokens
+            {
+                continue;
+            }
             let Some(hold) = self
                 .scheduler
                 .hold_prefix_followers(&producer.key, &followers, plan)
@@ -121,7 +153,7 @@ impl EngineInner {
                 hold,
                 followers,
                 source_tokens,
-                maximum_sequence_tokens: source.model_maximum_sequence_tokens(),
+                maximum_sequence_tokens,
                 expires_at,
                 capture: None,
             });

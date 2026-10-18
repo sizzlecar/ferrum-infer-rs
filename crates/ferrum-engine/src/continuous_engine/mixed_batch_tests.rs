@@ -117,8 +117,10 @@ async fn mixed_fixture_with_execution(
     assert_eq!(first.requests.len(), 1);
     engine.inner.process_batch(&first).await.unwrap();
     {
-        let sequences = engine.inner.sequences.read();
-        let decode = &sequences[&decode_id];
+        let sequences = &engine.inner.sequences;
+        let decode_handle = sequences.get(&decode_id).unwrap();
+        let decode_guard = decode_handle.lock();
+        let decode = decode_guard.as_ref().unwrap();
         assert!(decode.prefill_complete);
         assert_eq!(decode.generated_tokens, [TokenId::new(6)]);
         assert_eq!(
@@ -170,11 +172,7 @@ async fn install_mixed_request(
         Some(64),
     );
     sequence.request_slot = Some(RequestSlotLease::open(&engine.inner, request_id.clone()));
-    engine
-        .inner
-        .sequences
-        .write()
-        .insert(request_id.clone(), sequence);
+    engine.inner.sequences.insert(request_id.clone(), sequence);
     assert!(
         engine
             .inner
@@ -184,8 +182,10 @@ async fn install_mixed_request(
     engine
         .inner
         .sequences
-        .write()
-        .get_mut(&request_id)
+        .get(&request_id)
+        .unwrap()
+        .lock()
+        .as_mut()
         .unwrap()
         .request_slot
         .as_mut()
@@ -219,12 +219,32 @@ async fn mixed_batch_default_split_does_not_invoke_mixed_executor() {
         ferrum_types::PrefillDecodeExecution::Split
     );
     engine.inner.process_batch(&batch).await.unwrap();
-    let sequences = engine.inner.sequences.read();
-    assert_eq!(sequences[&prefill_id].generated_tokens.len(), 1);
-    assert_eq!(sequences[&decode_id].generated_tokens.len(), 2);
+    let sequences = &engine.inner.sequences;
+    assert_eq!(
+        sequences
+            .get(&prefill_id)
+            .unwrap()
+            .lock()
+            .as_ref()
+            .unwrap()
+            .generated_tokens
+            .len(),
+        1
+    );
+    assert_eq!(
+        sequences
+            .get(&decode_id)
+            .unwrap()
+            .lock()
+            .as_ref()
+            .unwrap()
+            .generated_tokens
+            .len(),
+        2
+    );
     assert_eq!(executor.mixed_calls.load(Ordering::Relaxed), 0);
     assert_eq!(executor.batch_decode_calls.load(Ordering::Relaxed), 1);
-    drop(sequences);
+
     close_mixed_requests(&engine, &[&prefill_id, &decode_id]).await;
 }
 
@@ -234,15 +254,27 @@ async fn mixed_batch_commits_both_phases_and_preserves_nonfinal_prefill() {
         let (engine, executor, batch, prefill_id, decode_id) =
             mixed_fixture(Some(MixedBehavior::Exact), final_prefill).await;
         engine.inner.process_batch(&batch).await.unwrap();
-        let sequences = engine.inner.sequences.read();
-        let prefill = &sequences[&prefill_id];
+        let sequences = &engine.inner.sequences;
+        let prefill_handle = sequences.get(&prefill_id).unwrap();
+        let prefill_guard = prefill_handle.lock();
+        let prefill = prefill_guard.as_ref().unwrap();
         assert_eq!(
             prefill.prefill_tokens_processed,
             if final_prefill { 4 } else { 2 }
         );
         assert_eq!(prefill.prefill_complete, final_prefill);
         assert_eq!(prefill.generated_tokens.len(), usize::from(final_prefill));
-        assert_eq!(sequences[&decode_id].generated_tokens.len(), 2);
+        assert_eq!(
+            sequences
+                .get(&decode_id)
+                .unwrap()
+                .lock()
+                .as_ref()
+                .unwrap()
+                .generated_tokens
+                .len(),
+            2
+        );
         let prefill_frontier = prefill.execution_frontier.as_ref().unwrap();
         assert_eq!(
             prefill_frontier.consumed_tokens(),
@@ -252,15 +284,23 @@ async fn mixed_batch_commits_both_phases_and_preserves_nonfinal_prefill() {
             executor.token_frontier_for_request(&prefill_id).as_ref(),
             Some(prefill_frontier)
         );
-        let decode_frontier = sequences[&decode_id].execution_frontier.as_ref().unwrap();
+        let decode_frontier = sequences
+            .get(&decode_id)
+            .unwrap()
+            .lock()
+            .as_ref()
+            .unwrap()
+            .execution_frontier
+            .clone()
+            .unwrap();
         assert_eq!(decode_frontier.consumed_tokens(), 2);
         assert_eq!(
             executor.token_frontier_for_request(&decode_id).as_ref(),
-            Some(decode_frontier)
+            Some(&decode_frontier)
         );
         assert_eq!(executor.mixed_calls.load(Ordering::Relaxed), 1);
         assert_eq!(executor.batch_decode_calls.load(Ordering::Relaxed), 0);
-        drop(sequences);
+        drop(prefill_guard);
         close_mixed_requests(&engine, &[&prefill_id, &decode_id]).await;
     }
 }
@@ -270,11 +310,36 @@ async fn mixed_batch_zero_submission_falls_back_once() {
     for behavior in [None, Some(MixedBehavior::NotSubmitted)] {
         let (engine, executor, batch, prefill_id, decode_id) = mixed_fixture(behavior, true).await;
         engine.inner.process_batch(&batch).await.unwrap();
-        let sequences = engine.inner.sequences.read();
-        assert_eq!(sequences[&prefill_id].generated_tokens.len(), 1);
-        assert_eq!(sequences[&decode_id].generated_tokens.len(), 2);
+        let sequences = &engine.inner.sequences;
         assert_eq!(
-            sequences[&prefill_id]
+            sequences
+                .get(&prefill_id)
+                .unwrap()
+                .lock()
+                .as_ref()
+                .unwrap()
+                .generated_tokens
+                .len(),
+            1
+        );
+        assert_eq!(
+            sequences
+                .get(&decode_id)
+                .unwrap()
+                .lock()
+                .as_ref()
+                .unwrap()
+                .generated_tokens
+                .len(),
+            2
+        );
+        assert_eq!(
+            sequences
+                .get(&prefill_id)
+                .unwrap()
+                .lock()
+                .as_ref()
+                .unwrap()
                 .execution_frontier
                 .as_ref()
                 .unwrap()
@@ -282,7 +347,12 @@ async fn mixed_batch_zero_submission_falls_back_once() {
             4
         );
         assert_eq!(
-            sequences[&decode_id]
+            sequences
+                .get(&decode_id)
+                .unwrap()
+                .lock()
+                .as_ref()
+                .unwrap()
                 .execution_frontier
                 .as_ref()
                 .unwrap()
@@ -291,7 +361,7 @@ async fn mixed_batch_zero_submission_falls_back_once() {
         );
         assert_eq!(executor.mixed_calls.load(Ordering::Relaxed), 1);
         assert_eq!(executor.batch_decode_calls.load(Ordering::Relaxed), 1);
-        drop(sequences);
+
         close_mixed_requests(&engine, &[&prefill_id, &decode_id]).await;
     }
 }
@@ -300,17 +370,35 @@ async fn mixed_batch_zero_submission_falls_back_once() {
 async fn mixed_batch_zero_submission_preserves_decode_scheduling_interval() {
     for behavior in [None, Some(MixedBehavior::NotSubmitted)] {
         let (engine, executor, batch, prefill_id, decode_id) = mixed_fixture(behavior, true).await;
-        assert!(engine.inner.sequences.read()[&decode_id].closes_pending_decode_scheduling());
+        assert!(engine
+            .inner
+            .sequences
+            .get(&decode_id)
+            .unwrap()
+            .lock()
+            .as_ref()
+            .unwrap()
+            .closes_pending_decode_scheduling());
         engine.inner.process_batch(&batch).await.unwrap();
         // A zero-submission mixed attempt is not a decode execution interval.
         // Its successful single-phase fallback records exactly one scheduling,
         // execution and postprocess span, then opens the next scheduling span.
-        assert!(engine.inner.sequences.read()[&decode_id].closes_pending_decode_scheduling());
+        assert!(engine
+            .inner
+            .sequences
+            .get(&decode_id)
+            .unwrap()
+            .lock()
+            .as_ref()
+            .unwrap()
+            .closes_pending_decode_scheduling());
         let evidence = engine
             .inner
             .sequences
-            .write()
-            .get_mut(&decode_id)
+            .get(&decode_id)
+            .unwrap()
+            .lock()
+            .as_mut()
             .unwrap()
             .take_execution_evidence()
             .unwrap()
@@ -358,8 +446,8 @@ async fn mixed_batch_submitted_failure_never_replays() {
     assert!(error
         .to_string()
         .contains("mixed device failure after submission"));
-    assert!(!engine.inner.sequences.read().contains_key(&prefill_id));
-    assert!(!engine.inner.sequences.read().contains_key(&decode_id));
+    assert!(!engine.inner.sequences.get(&prefill_id).is_some());
+    assert!(!engine.inner.sequences.get(&decode_id).is_some());
     assert!(prefill.sequence().observed_end().is_some());
     assert!(decode.sequence().observed_end().is_some());
     assert!(executor.token_frontier_for_request(&prefill_id).is_none());
@@ -386,8 +474,8 @@ async fn mixed_batch_submitted_failure_terminates_peers_when_first_cleanup_fails
     engine.inner.execution_closes.join_observers().await;
     engine.inner.output_tasks.join_current().await;
     assert!(engine.inner.run_iteration().await.is_err());
-    assert!(!engine.inner.sequences.read().contains_key(&prefill_id));
-    assert!(!engine.inner.sequences.read().contains_key(&decode_id));
+    assert!(!engine.inner.sequences.get(&prefill_id).is_some());
+    assert!(!engine.inner.sequences.get(&decode_id).is_some());
     assert!(prefill.sequence().observed_end().is_some());
     assert!(decode.sequence().observed_end().is_some());
     assert_eq!(executor.mixed_calls.load(Ordering::Relaxed), 1);
@@ -411,7 +499,7 @@ async fn mixed_batch_rejects_invalid_phase_without_discarding_valid_peer() {
         engine.inner.execution_closes.join_observers().await;
         engine.inner.output_tasks.join_current().await;
         assert!(engine.inner.run_iteration().await.is_err());
-        let sequences = engine.inner.sequences.read();
+        let sequences = &engine.inner.sequences;
         let (
             healthy_id,
             healthy_before,
@@ -424,7 +512,9 @@ async fn mixed_batch_rejects_invalid_phase_without_discarding_valid_peer() {
             MixedBehavior::ShortPrefill => (&decode_id, &decode, &prefill_id, &prefill, 2, 2),
             _ => unreachable!(),
         };
-        let healthy = &sequences[healthy_id];
+        let healthy_handle = sequences.get(healthy_id).unwrap();
+        let healthy_guard = healthy_handle.lock();
+        let healthy = healthy_guard.as_ref().unwrap();
         assert_eq!(healthy.generated_tokens.len(), expected_tokens);
         let frontier = healthy.execution_frontier.as_ref().unwrap();
         assert_eq!(frontier.sequence(), healthy_before.sequence());
@@ -434,12 +524,12 @@ async fn mixed_batch_rejects_invalid_phase_without_discarding_valid_peer() {
             executor.token_frontier_for_request(healthy_id).as_ref(),
             Some(frontier)
         );
-        assert!(!sequences.contains_key(failed_id));
+        assert!(!sequences.get(failed_id).is_some());
         assert!(failed_before.sequence().observed_end().is_some());
         assert!(executor.token_frontier_for_request(failed_id).is_none());
         assert_eq!(executor.mixed_calls.load(Ordering::Relaxed), 1);
         assert_eq!(executor.batch_decode_calls.load(Ordering::Relaxed), 0);
-        drop(sequences);
+        drop(healthy_guard);
         close_mixed_requests(&engine, &[healthy_id]).await;
     }
 }

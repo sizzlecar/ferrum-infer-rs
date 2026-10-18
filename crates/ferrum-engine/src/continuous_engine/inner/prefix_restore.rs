@@ -8,6 +8,7 @@ use ferrum_interfaces::scheduler::PreparedPrefixRestore;
 use ferrum_scheduler::implementations::continuous::PrefixRestoreCapacityStatus;
 
 pub(in super::super) struct PendingPrefixRestore {
+    handle: Arc<SequenceHandle>,
     prepared: PreparedPrefixRestore,
     tokens: Vec<TokenId>,
     maximum_sequence_tokens: usize,
@@ -46,8 +47,8 @@ impl EngineInner {
     fn prefix_restore_resume_status(
         &self,
         prepared: &PreparedPrefixRestore,
+        release: &ExecutionCapacityReleaseSnapshot,
     ) -> Result<PrefixRestoreCapacityStatus> {
-        let release = self.execution_capacity_release_snapshot()?;
         let mut availability = Vec::new();
         let epochs = self
             .model_executor
@@ -63,19 +64,21 @@ impl EngineInner {
             &availability,
         );
         self.scheduler
-            .resume_prefix_restore_after_capacity(prepared, wake, &release)
+            .resume_prefix_restore_after_capacity(prepared, wake, release)
     }
 
-    /// Called under the existing iteration lock, after admission and before
-    /// publishing a batch. Submit/replacement uses the same lock, so one
-    /// scheduler preparation cannot be applied to another outer sequence.
+    /// Planning owns the iteration gate. Each preparation additionally retains
+    /// its original request handle across the device await and publication.
     pub(super) async fn restore_admitted_prefixes(&self) -> Result<()> {
         let candidates = self
             .sequences
-            .read()
-            .iter()
-            .filter(|(_, sequence)| {
-                !sequence.prefill_complete
+            .snapshot()
+            .into_iter()
+            .filter_map(|handle| {
+                let state = handle.lock();
+                let sequence = state.as_ref()?;
+                let eligible = self.sequences.is_current(&handle)
+                    && !sequence.prefill_complete
                     && sequence.prefill_tokens_processed == 0
                     && sequence
                         .execution_frontier
@@ -83,74 +86,121 @@ impl EngineInner {
                         .is_some_and(|frontier| {
                             frontier.consumed_tokens() == 0
                                 && frontier.sequence().observed_end().is_none()
-                        })
+                        });
+                let prompt_tokens = sequence.prefill_context_len();
+                drop(state);
+                eligible.then_some((handle, prompt_tokens))
             })
-            .map(|(id, sequence)| (id.clone(), sequence.prefill_context_len()))
             .collect::<Vec<_>>();
 
         let stale = self
             .prefix_restore_pending
             .lock()
             .keys()
-            .filter(|id| !candidates.iter().any(|(candidate, _)| candidate == *id))
+            .filter(|id| {
+                !candidates
+                    .iter()
+                    .any(|(candidate, _)| candidate.request_id() == *id)
+            })
             .cloned()
             .collect::<Vec<_>>();
         for request_id in stale {
             self.discard_pending_prefix_restore(&request_id);
         }
 
-        for (request_id, prompt_tokens) in candidates {
-            let Some((tokens, maximum_sequence_tokens, incarnation)) =
-                self.sequences.read().get(&request_id).and_then(|sequence| {
+        for (handle, prompt_tokens) in candidates {
+            let request_id = handle.request_id().clone();
+            let Some((tokens, maximum_sequence_tokens, incarnation)) = (|| {
+                let state = handle.lock();
+                if !self.sequences.is_current(&handle) {
+                    return None;
+                }
+                state.as_ref().and_then(|sequence| {
                     Some((
                         sequence.prefill_context_tokens(),
                         sequence.model_maximum_sequence_tokens(),
                         sequence.execution_frontier.as_ref()?.sequence().clone(),
                     ))
                 })
-            else {
+            })() else {
                 continue;
             };
             let pending = self.prefix_restore_pending.lock().remove(&request_id);
-            let (prepared, retry) = if let Some(pending) = pending {
-                if pending.tokens != tokens
-                    || pending.maximum_sequence_tokens != maximum_sequence_tokens
-                    || pending.sequence != incarnation
+            // This observation visits peer requests, so collect it before
+            // taking the original request lock. Scheduler consumption below
+            // still revalidates its exact preparation under that lock.
+            let pending = pending
+                .map(|pending| {
+                    self.execution_capacity_release_snapshot()
+                        .map(|release| (pending, release))
+                })
+                .transpose()?;
+            let (prepared, retry, checkpoint) = {
+                // Do not let cancellation remove this owner between scheduler
+                // preparation and retaining its optional retry/checkpoint state.
+                let state = handle.lock();
+                if !self.sequences.is_current(&handle)
+                    || !state.as_ref().is_some_and(|sequence| {
+                        !sequence.prefill_complete
+                            && sequence.prefill_tokens_processed == 0
+                            && sequence
+                                .execution_frontier
+                                .as_ref()
+                                .is_some_and(|frontier| {
+                                    frontier.sequence() == &incarnation
+                                        && frontier.consumed_tokens() == 0
+                                })
+                    })
                 {
-                    self.scheduler
-                        .abandon_prefix_restore_capacity(&pending.prepared)?;
+                    if let Some((pending, _)) = pending {
+                        self.scheduler
+                            .abandon_prefix_restore_capacity(&pending.prepared)?;
+                    }
                     continue;
                 }
-                match self.prefix_restore_resume_status(&pending.prepared)? {
-                    PrefixRestoreCapacityStatus::Pending => {
-                        self.prefix_restore_pending
-                            .lock()
-                            .insert(request_id, pending);
-                        continue;
-                    }
-                    PrefixRestoreCapacityStatus::Fallback | PrefixRestoreCapacityStatus::Stale => {
+                let (prepared, retry) = if let Some((pending, release)) = pending {
+                    if !Arc::ptr_eq(&pending.handle, &handle)
+                        || pending.tokens != tokens
+                        || pending.maximum_sequence_tokens != maximum_sequence_tokens
+                        || pending.sequence != incarnation
+                    {
                         self.scheduler
                             .abandon_prefix_restore_capacity(&pending.prepared)?;
                         continue;
                     }
-                    PrefixRestoreCapacityStatus::Retry => {
-                        (pending.prepared, Some(pending.deferral))
+                    match self.prefix_restore_resume_status(&pending.prepared, &release)? {
+                        PrefixRestoreCapacityStatus::Pending => {
+                            self.prefix_restore_pending
+                                .lock()
+                                .insert(request_id, pending);
+                            continue;
+                        }
+                        PrefixRestoreCapacityStatus::Fallback
+                        | PrefixRestoreCapacityStatus::Stale => {
+                            self.scheduler
+                                .abandon_prefix_restore_capacity(&pending.prepared)?;
+                            continue;
+                        }
+                        PrefixRestoreCapacityStatus::Retry => {
+                            (pending.prepared, Some(pending.deferral))
+                        }
                     }
-                }
-            } else {
-                let Some(prepared) =
-                    self.scheduler
-                        .prepare_prefix_restore(&request_id, 0, prompt_tokens)?
-                else {
-                    continue;
+                } else {
+                    let Some(prepared) =
+                        self.scheduler
+                            .prepare_prefix_restore(&request_id, 0, prompt_tokens)?
+                    else {
+                        continue;
+                    };
+                    (prepared, None)
                 };
-                (prepared, None)
+                let checkpoint = retry
+                    .is_none()
+                    .then(|| self.take_rendezvous_checkpoint(&request_id))
+                    .flatten();
+                (prepared, retry, checkpoint)
             };
             let started = Instant::now();
-            let checkpoint = retry
-                .is_none()
-                .then(|| self.take_rendezvous_checkpoint(&request_id))
-                .flatten();
             let output = match self
                 .model_executor
                 .try_restore_plan_runtime_prefix(PlanRuntimePrefixRestoreInput {
@@ -166,6 +216,23 @@ impl EngineInner {
                 Ok(PlanRuntimePrefixRestoreOutcome::Unavailable) => continue,
                 Ok(PlanRuntimePrefixRestoreOutcome::Deferred(deferral)) => {
                     let release = self.execution_capacity_release_snapshot()?;
+                    let state = handle.lock();
+                    if !self.sequences.is_current(&handle)
+                        || !state.as_ref().is_some_and(|sequence| {
+                            !sequence.prefill_complete
+                                && sequence.prefill_tokens_processed == 0
+                                && sequence
+                                    .execution_frontier
+                                    .as_ref()
+                                    .is_some_and(|frontier| {
+                                        frontier.sequence() == &incarnation
+                                            && frontier.consumed_tokens() == 0
+                                    })
+                        })
+                    {
+                        self.scheduler.abandon_prefix_restore_capacity(&prepared)?;
+                        continue;
+                    }
                     let retained = self.scheduler.defer_prefix_restore_for_capacity(
                         &prepared,
                         deferral.capacity(),
@@ -184,6 +251,7 @@ impl EngineInner {
                         self.prefix_restore_pending.lock().insert(
                             request_id,
                             PendingPrefixRestore {
+                                handle: Arc::clone(&handle),
                                 prepared,
                                 tokens,
                                 maximum_sequence_tokens,
@@ -198,20 +266,35 @@ impl EngineInner {
                 }
                 Err(error) => {
                     drop(prepared);
-                    self.complete_request_detached(&request_id, FinishReason::Error, Some(error))?;
+                    self.complete_request_exact_frontier_detached(
+                        &handle,
+                        &incarnation,
+                        FinishReason::Error,
+                        Some(error),
+                    )?;
                     continue;
                 }
             };
             if let Err(error) = output.validate_for(&request_id, prompt_tokens, &incarnation) {
                 drop(output);
                 drop(prepared);
-                self.complete_request_detached(&request_id, FinishReason::Error, Some(error))?;
+                self.complete_request_exact_frontier_detached(
+                    &handle,
+                    &incarnation,
+                    FinishReason::Error,
+                    Some(error),
+                )?;
                 continue;
             }
             let restored_tokens = output.restored_tokens();
             let committed = (|| {
-                let mut sequences = self.sequences.write();
-                let sequence = sequences.get_mut(&request_id).ok_or_else(|| {
+                let mut state = handle.lock();
+                if !self.sequences.is_current(&handle) {
+                    return Err(FerrumError::internal(
+                        "prefix restore outer request incarnation changed",
+                    ));
+                }
+                let sequence = state.as_mut().ok_or_else(|| {
                     FerrumError::internal("prefix restore lost its outer sequence")
                 })?;
                 if sequence.prefill_tokens_processed != 0
@@ -247,7 +330,12 @@ impl EngineInner {
                     .commit_prefix_restored(prepared, restored_tokens)
             })();
             if let Err(error) = committed {
-                self.complete_request_detached(&request_id, FinishReason::Error, Some(error))?;
+                self.complete_request_exact_frontier_detached(
+                    &handle,
+                    &incarnation,
+                    FinishReason::Error,
+                    Some(error),
+                )?;
                 continue;
             }
             self.prefix_cache_hits.fetch_add(1, Ordering::Relaxed);

@@ -13,13 +13,15 @@ impl EngineInner {
     ) -> Result<ExecutionCapacityReleaseSnapshot> {
         let authorities = self
             .sequences
-            .read()
-            .iter()
-            .filter_map(|(request_id, sequence)| {
-                sequence
+            .snapshot()
+            .into_iter()
+            .filter_map(|handle| {
+                let state = handle.lock();
+                state
+                    .as_ref()?
                     .execution_frontier
                     .as_ref()
-                    .map(|frontier| (request_id.clone(), frontier.sequence().clone()))
+                    .map(|frontier| (handle.request_id().clone(), frontier.sequence().clone()))
             })
             .collect::<Vec<_>>();
         let mut capabilities = Vec::with_capacity(authorities.len());

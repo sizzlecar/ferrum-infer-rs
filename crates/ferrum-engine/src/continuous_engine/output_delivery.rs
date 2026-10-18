@@ -33,6 +33,8 @@ struct Delivery {
     session: OutputSession,
     inner: Weak<EngineInner>,
     request_id: RequestId,
+    // Weak back-reference: the live state already owns this OutputSender.
+    sequence: Mutex<Weak<SequenceHandle>>,
     state: Mutex<DeliveryState>,
     changed: Notify,
     terminal: Arc<Mutex<OutputTerminal>>,
@@ -114,6 +116,7 @@ impl OutputSender {
                 session,
                 inner,
                 request_id,
+                sequence: Mutex::new(Weak::new()),
                 changed: Notify::new(),
                 terminal: Arc::clone(&terminal),
                 #[cfg(test)]
@@ -133,6 +136,14 @@ impl OutputSender {
             })),
             OutputReceiver { receiver, terminal },
         )
+    }
+
+    pub(super) fn bind_sequence(&self, sequence: Weak<SequenceHandle>) {
+        *self.0.sequence.lock() = sequence;
+    }
+
+    pub(super) fn source_sequence(&self) -> Option<Arc<SequenceHandle>> {
+        self.0.sequence.lock().upgrade()
     }
 
     pub(super) fn same_owner(&self, other: &Self) -> bool {

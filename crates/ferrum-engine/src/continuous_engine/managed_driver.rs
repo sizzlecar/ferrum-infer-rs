@@ -52,7 +52,7 @@ impl DriverExitReport {
 
     pub fn retains_unproved_owners(&self) -> bool {
         self.retained.as_ref().is_some_and(|inner| {
-            !inner.sequences.read().is_empty()
+            !inner.sequences.is_empty()
                 || inner.execution_closes.unreclaimed_count() != 0
                 || inner.execution_readiness_waiters.pending_count() != 0
         })
@@ -356,10 +356,10 @@ impl EngineInner {
             errors.push(error);
         }
         let unreclaimed = self.execution_closes.unreclaimed_count();
-        if unreclaimed > 0 || !self.sequences.read().is_empty() {
+        if unreclaimed > 0 || !self.sequences.is_empty() {
             errors.push(FerrumError::internal(format!(
                 "engine shutdown retains {unreclaimed} unproved execution closures and {} requests",
-                self.sequences.read().len()
+                self.sequences.len()
             )));
             return errors;
         }

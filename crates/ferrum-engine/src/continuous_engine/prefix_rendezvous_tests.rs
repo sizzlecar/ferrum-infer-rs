@@ -219,14 +219,14 @@ async fn submit(
     );
     let (sender, receiver) = tokio::sync::oneshot::channel();
     sequence.response_sender = Some(sender);
-    engine.inner.sequences.write().insert(id.clone(), sequence);
+    engine.inner.sequences.insert(id.clone(), sequence);
     engine.inner.scheduler.submit(request).await.unwrap();
     (id, receiver)
 }
 
 async fn finish(engine: &ContinuousBatchEngine) {
     for _ in 0..32 {
-        if engine.inner.sequences.read().is_empty() {
+        if engine.inner.sequences.is_empty() {
             return;
         }
         engine.inner.run_iteration().await.unwrap();

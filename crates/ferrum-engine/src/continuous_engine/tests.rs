@@ -1414,6 +1414,25 @@ async fn install_execution_readiness_wake(
     (request_id, receipt.into_wake())
 }
 
+fn readiness_wait_target(
+    request_id: &RequestId,
+) -> (Arc<SequenceHandle>, ExecutionReadinessWaitTarget) {
+    let issuer = ferrum_execution::token_execution::ExecutorSequenceIssuer::new();
+    let sequence = issuer.issue_sequence().unwrap();
+    let mut request = policy_request();
+    request.id = request_id.clone();
+    let mut state = SequenceState::new(request, vec![TokenId(1)]);
+    state.execution_frontier = Some(issuer.frontier(&sequence, 0).unwrap());
+    let sequences = SequenceRegistry::default();
+    assert!(sequences.insert(request_id.clone(), state).is_none());
+    let handle = sequences.get(request_id).unwrap();
+    let target = ExecutionReadinessWaitTarget {
+        request: Arc::downgrade(&handle),
+        sequence,
+    };
+    (handle, target)
+}
+
 #[test]
 fn execution_readiness_registry_enforces_an_independent_fixed_cap() {
     let registry = ExecutionReadinessWaitRegistry::new();
@@ -1430,6 +1449,8 @@ async fn execution_readiness_registry_resumes_only_after_successful_wait() {
     let scheduler = ContinuousBatchScheduler::new(ferrum_types::SchedulerConfig::default());
     let (request_id, wake) = install_execution_readiness_wake(&scheduler).await;
     let registry = ExecutionReadinessWaitRegistry::new();
+    let (handle, target) = readiness_wait_target(&request_id);
+    let sequence = target.sequence.clone();
     let work_notify = Arc::new(Notify::new());
     let notified = work_notify.notified();
     tokio::pin!(notified);
@@ -1438,7 +1459,7 @@ async fn execution_readiness_registry_resumes_only_after_successful_wait() {
         .track(
             wake,
             async { Ok(()) },
-            vec![request_id.clone()],
+            vec![target],
             Arc::clone(&work_notify),
             slot,
         )
@@ -1449,6 +1470,17 @@ async fn execution_readiness_registry_resumes_only_after_successful_wait() {
         .expect("successful waiter must wake the engine");
     assert_eq!(registry.pending_count(), 0);
     assert!(registry.take_failures().is_empty());
+    assert_eq!(
+        handle
+            .lock()
+            .as_ref()
+            .unwrap()
+            .execution_frontier
+            .as_ref()
+            .unwrap()
+            .sequence(),
+        &sequence
+    );
     let resumed = scheduler
         .next_batch(ferrum_interfaces::BatchHint::simple(1))
         .await
@@ -1473,6 +1505,8 @@ async fn execution_readiness_registry_reports_wait_errors_without_rescheduling()
     let scheduler = ContinuousBatchScheduler::new(ferrum_types::SchedulerConfig::default());
     let (request_id, wake) = install_execution_readiness_wake(&scheduler).await;
     let registry = ExecutionReadinessWaitRegistry::new();
+    let (handle, target) = readiness_wait_target(&request_id);
+    let sequence = target.sequence.clone();
     let work_notify = Arc::new(Notify::new());
     let notified = work_notify.notified();
     tokio::pin!(notified);
@@ -1481,7 +1515,7 @@ async fn execution_readiness_registry_reports_wait_errors_without_rescheduling()
         .track(
             wake,
             async { Err("hazard channel closed".to_string()) },
-            vec![request_id.clone()],
+            vec![target],
             Arc::clone(&work_notify),
             slot,
         )
@@ -1492,7 +1526,11 @@ async fn execution_readiness_registry_reports_wait_errors_without_rescheduling()
         .expect("failed waiter must wake the terminal owner");
     let failures = registry.take_failures();
     assert_eq!(failures.len(), 1);
-    assert_eq!(failures[0].request_ids, vec![request_id]);
+    assert_eq!(failures[0].requests.len(), 1);
+    assert!(failures[0].requests[0]
+        .request
+        .ptr_eq(&Arc::downgrade(&handle)));
+    assert_eq!(failures[0].requests[0].sequence, sequence);
     assert_eq!(failures[0].message, "hazard channel closed");
     assert!(scheduler
         .next_batch(ferrum_interfaces::BatchHint::simple(1))
@@ -1505,6 +1543,8 @@ async fn execution_readiness_registry_converts_waiter_panic_to_terminal_failure(
     let scheduler = ContinuousBatchScheduler::new(ferrum_types::SchedulerConfig::default());
     let (request_id, wake) = install_execution_readiness_wake(&scheduler).await;
     let registry = ExecutionReadinessWaitRegistry::new();
+    let (handle, target) = readiness_wait_target(&request_id);
+    let sequence = target.sequence.clone();
     let work_notify = Arc::new(Notify::new());
     let notified = work_notify.notified();
     tokio::pin!(notified);
@@ -1517,7 +1557,7 @@ async fn execution_readiness_registry_converts_waiter_panic_to_terminal_failure(
                 #[allow(unreachable_code)]
                 Ok::<(), String>(())
             },
-            vec![request_id.clone()],
+            vec![target],
             Arc::clone(&work_notify),
             slot,
         )
@@ -1528,7 +1568,11 @@ async fn execution_readiness_registry_converts_waiter_panic_to_terminal_failure(
         .expect("panicked waiter must wake the terminal owner");
     let failures = registry.take_failures();
     assert_eq!(failures.len(), 1);
-    assert_eq!(failures[0].request_ids, vec![request_id]);
+    assert_eq!(failures[0].requests.len(), 1);
+    assert!(failures[0].requests[0]
+        .request
+        .ptr_eq(&Arc::downgrade(&handle)));
+    assert_eq!(failures[0].requests[0].sequence, sequence);
     assert_eq!(
         failures[0].message,
         "Request-state readiness waiter panicked"
@@ -1544,13 +1588,15 @@ async fn execution_readiness_registry_cancels_ticket_before_shutdown_join() {
     let scheduler = ContinuousBatchScheduler::new(ferrum_types::SchedulerConfig::default());
     let (request_id, wake) = install_execution_readiness_wake(&scheduler).await;
     let registry = ExecutionReadinessWaitRegistry::new();
+    let (handle, target) = readiness_wait_target(&request_id);
+    let sequence = target.sequence.clone();
     let work_notify = Arc::new(Notify::new());
     let slot = registry.reserve().await.unwrap();
     registry
         .track(
             wake,
             std::future::pending::<std::result::Result<(), String>>(),
-            vec![request_id.clone()],
+            vec![target],
             work_notify,
             slot,
         )
@@ -1564,6 +1610,17 @@ async fn execution_readiness_registry_cancels_ticket_before_shutdown_join() {
     assert_eq!(registry.pending_count(), 0);
     assert!(registry.tasks.lock().is_empty());
     assert!(registry.take_failures().is_empty());
+    assert_eq!(
+        handle
+            .lock()
+            .as_ref()
+            .unwrap()
+            .execution_frontier
+            .as_ref()
+            .unwrap()
+            .sequence(),
+        &sequence
+    );
     let resumed = scheduler
         .next_batch(ferrum_interfaces::BatchHint::simple(1))
         .await
@@ -2094,10 +2151,9 @@ async fn process_batch_rejects_a_scheduler_item_without_published_sequence_state
         .await
         .expect_err("batch processing must not create a second tokenized request state");
 
-    assert!(error
-        .to_string()
-        .contains("scheduled token request has no published sequence"));
-    assert!(!engine.inner.sequences.read().contains_key(&request_id));
+    assert!(matches!(error, FerrumError::Internal { .. }));
+    assert!(engine.inner.sequences.get(&request_id).is_none());
+    assert_eq!(engine.inner.execution_closes.unreclaimed_count(), 0);
 }
 
 #[test]
@@ -2345,11 +2401,7 @@ async fn install_plan_runtime_decode_frontiers(
         };
         sequence.execution_frontier = Some(frontier);
         ids.push(request.id.clone());
-        engine
-            .inner
-            .sequences
-            .write()
-            .insert(request.id.clone(), sequence);
+        engine.inner.sequences.insert(request.id.clone(), sequence);
         scheduler.submit(request).await.unwrap();
     }
     let batch = scheduler
@@ -2358,15 +2410,31 @@ async fn install_plan_runtime_decode_frontiers(
         .unwrap();
     assert_eq!(batch.requests.len(), ids.len());
     engine.inner.process_batch(&batch).await.unwrap();
-    let sequences = engine.inner.sequences.read();
+    let sequences = &engine.inner.sequences;
     let initial = ids
         .iter()
-        .map(|id| sequences[id].generated_tokens[0])
+        .map(|id| {
+            sequences
+                .get(id)
+                .unwrap()
+                .lock()
+                .as_ref()
+                .unwrap()
+                .generated_tokens[0]
+        })
         .collect();
     let identities = ids
         .iter()
         .map(|id| {
-            let frontier = sequences[id].execution_frontier.as_ref().unwrap();
+            let frontier = sequences
+                .get(id)
+                .unwrap()
+                .lock()
+                .as_ref()
+                .unwrap()
+                .execution_frontier
+                .clone()
+                .unwrap();
             assert_eq!(frontier.consumed_tokens(), 1);
             frontier.sequence().clone()
         })
@@ -2414,7 +2482,7 @@ async fn install_profiled_plan_runtime_decode_frontier(
         panic!("controlled profile admission must succeed");
     };
     sequence.execution_frontier = Some(frontier);
-    engine.inner.sequences.write().insert(id.clone(), sequence);
+    engine.inner.sequences.insert(id.clone(), sequence);
     scheduler.submit(request).await.unwrap();
     let batch = scheduler
         .next_batch(ferrum_interfaces::BatchHint::simple(1))
@@ -2479,8 +2547,10 @@ async fn token_lone_decode_self_recompute_releases_exact_incarnation_before_requ
     assert_eq!(trace.waiting_queue_len, 1);
     assert_eq!(trace.pressure_pending_release_fences, 0);
     assert_eq!(trace.capacity_release_epoch, 1);
-    let sequences = engine.inner.sequences.read();
-    let sequence = &sequences[id];
+    let sequences = &engine.inner.sequences;
+    let sequence_handle = sequences.get(id).unwrap();
+    let sequence_guard = sequence_handle.lock();
+    let sequence = sequence_guard.as_ref().unwrap();
     assert!(sequence.execution_frontier.is_none());
     assert_eq!(sequence.generated_tokens, initial_tokens);
     assert_eq!(sequence.phase, RequestPhase::Waiting);
@@ -2506,11 +2576,13 @@ async fn plan_runtime_batch_decode_process_batch_submits_one_cohort() {
 
     assert_eq!(executor.batch_decode_calls.load(Ordering::Relaxed), 1);
     assert_eq!(executor.decode_calls.load(Ordering::Relaxed), 0);
-    let sequences = engine.inner.sequences.read();
+    let sequences = &engine.inner.sequences;
     for ((request_id, initial_token), cache_id) in
         request_ids.iter().zip(initial_tokens).zip(cache_ids)
     {
-        let sequence = sequences.get(request_id).expect("decoded sequence");
+        let sequence_handle = sequences.get(request_id).expect("decoded sequence");
+        let sequence_guard = sequence_handle.lock();
+        let sequence = sequence_guard.as_ref().unwrap();
         assert_eq!(sequence.generated_tokens.first(), Some(&initial_token));
         assert_eq!(sequence.generated_tokens.len(), 2);
         assert_eq!(
@@ -2519,7 +2591,7 @@ async fn plan_runtime_batch_decode_process_batch_submits_one_cohort() {
         );
         assert_eq!(sequence.tokens_this_iteration, 1);
     }
-    drop(sequences);
+
     flush_engine_profile_events(&engine);
     let trace = std::fs::read_to_string(&trace_path).unwrap();
     let events = trace
@@ -2594,8 +2666,10 @@ async fn plan_runtime_profile_records_only_explicit_decode_host_stages() {
         let timing = engine
             .inner
             .sequences
-            .write()
-            .get_mut(&request_id)
+            .get(&request_id)
+            .unwrap()
+            .lock()
+            .as_mut()
             .unwrap()
             .take_execution_evidence()
             .unwrap()
@@ -2663,12 +2737,15 @@ async fn plan_runtime_batch_decode_does_not_materialize_host_token_tensors() {
 
     assert_eq!(executor.batch_decode_calls.load(Ordering::Relaxed), 1);
     assert_eq!(executor.decode_calls.load(Ordering::Relaxed), 0);
-    let sequences = engine.inner.sequences.read();
+    let sequences = &engine.inner.sequences;
     for request_id in request_ids {
         assert_eq!(
             sequences
                 .get(&request_id)
                 .expect("decoded sequence must remain active")
+                .lock()
+                .as_ref()
+                .unwrap()
                 .generated_tokens
                 .len(),
             2
@@ -2793,7 +2870,7 @@ async fn plan_runtime_prefill_resource_failure_preserves_terminal_error_and_rele
     assert!(error
         .to_string()
         .contains("typed diagnostic resource failure after prefill submission"));
-    assert!(!engine.inner.sequences.read().contains_key(&request_id));
+    assert!(!engine.inner.sequences.get(&request_id).is_some());
     assert!(executor
         .retained
         .lock()
@@ -2828,11 +2905,7 @@ async fn plan_runtime_recompute_admission_preserves_product_usage_accounting() {
         SequenceState::new(request.clone(), vec![TokenId::new(11), TokenId::new(12)]);
     sequence.generated_tokens.push(TokenId::new(13));
     sequence.phase = RequestPhase::Waiting;
-    engine
-        .inner
-        .sequences
-        .write()
-        .insert(request_id.clone(), sequence);
+    engine.inner.sequences.insert(request_id.clone(), sequence);
 
     let admitted = engine
         .inner
@@ -2920,11 +2993,7 @@ async fn plan_runtime_prefill_cohort_uses_one_capacity_aware_batch() {
         };
         sequence.execution_frontier = Some(frontier);
         request_ids.push(request.id.clone());
-        engine
-            .inner
-            .sequences
-            .write()
-            .insert(request.id.clone(), sequence);
+        engine.inner.sequences.insert(request.id.clone(), sequence);
     }
     let batch = scheduler
         .next_batch(ferrum_interfaces::BatchHint::simple(2))
@@ -2941,15 +3010,21 @@ async fn plan_runtime_prefill_cohort_uses_one_capacity_aware_batch() {
         .lock()
         .expect("retained admission mutex poisoned")
         .is_empty());
-    let sequences = engine.inner.sequences.read();
-    let remaining_request_ids = sequences.keys().cloned().collect::<Vec<_>>();
+    let sequences = &engine.inner.sequences;
+    let remaining_request_ids = sequences
+        .snapshot()
+        .iter()
+        .map(|handle| handle.request_id().clone())
+        .collect::<Vec<_>>();
     let scheduler_trace = scheduler.trace_snapshot();
     for request_id in request_ids {
-        let sequence = sequences.get(&request_id).unwrap_or_else(|| {
+        let sequence_handle = sequences.get(&request_id).unwrap_or_else(|| {
             panic!(
                 "prefilled sequence {request_id} disappeared; remaining={remaining_request_ids:?}; scheduler={scheduler_trace:?}"
             )
         });
+        let sequence_guard = sequence_handle.lock();
+        let sequence = sequence_guard.as_ref().unwrap();
         assert!(sequence.prefill_complete);
         assert_eq!(sequence.generated_tokens.len(), 1);
         assert!(sequence.execution_frontier.is_some());
@@ -3014,11 +3089,7 @@ async fn plan_runtime_batch_prefill_deferral_falls_back_without_failing_requests
         };
         sequence.execution_frontier = Some(frontier);
         request_ids.push(request.id.clone());
-        engine
-            .inner
-            .sequences
-            .write()
-            .insert(request.id.clone(), sequence);
+        engine.inner.sequences.insert(request.id.clone(), sequence);
     }
     let batch = scheduler
         .next_batch(ferrum_interfaces::BatchHint::simple(2))
@@ -3034,11 +3105,13 @@ async fn plan_runtime_batch_prefill_deferral_falls_back_without_failing_requests
         .lock()
         .expect("retained admission mutex poisoned")
         .is_empty());
-    let sequences = engine.inner.sequences.read();
+    let sequences = &engine.inner.sequences;
     for request_id in request_ids {
-        let sequence = sequences
+        let sequence_handle = sequences
             .get(&request_id)
             .expect("deferred batch participant must survive per-request fallback");
+        let sequence_guard = sequence_handle.lock();
+        let sequence = sequence_guard.as_ref().unwrap();
         assert!(sequence.prefill_complete);
         assert_eq!(sequence.generated_tokens.len(), 1);
     }
@@ -3079,7 +3152,7 @@ async fn plan_runtime_serial_backing_growth_converges_before_batch_submission() 
             .insert(PROMPT_TOKENS_METADATA_KEY.to_string(), serde_json::json!(1));
         scheduler.submit(request.clone()).await.unwrap();
         let tokens = tokenizer.encode(&request.prompt, true).unwrap();
-        engine.inner.sequences.write().insert(
+        engine.inner.sequences.insert(
             request.id.clone(),
             SequenceState::new_with_tokenizer_and_model_vocab_size(
                 request,
@@ -3136,7 +3209,7 @@ async fn request_publication_lock_is_released_during_device_execution() {
         .insert(PROMPT_TOKENS_METADATA_KEY.to_string(), serde_json::json!(1));
     scheduler.submit(request.clone()).await.unwrap();
     let tokens = tokenizer.encode(&request.prompt, true).unwrap();
-    engine.inner.sequences.write().insert(
+    engine.inner.sequences.insert(
         request.id.clone(),
         SequenceState::new_with_tokenizer_and_model_vocab_size(
             request,
@@ -3212,10 +3285,12 @@ async fn plan_runtime_chunked_prefill_retries_exact_chunk_and_samples_only_final
         vec![PrefillChunk::new(0, 2, 5).unwrap()]
     );
     {
-        let sequences = engine.inner.sequences.read();
-        let sequence = sequences
+        let sequences = &engine.inner.sequences;
+        let sequence_handle = sequences
             .get(&request_id)
             .expect("deferred prefill retains engine sequence state");
+        let sequence_guard = sequence_handle.lock();
+        let sequence = sequence_guard.as_ref().unwrap();
         assert_eq!(sequence.prefill_tokens_processed, 0);
         assert!(sequence.generated_tokens.is_empty());
     }
@@ -3384,7 +3459,7 @@ async fn plan_runtime_one_token_prefill_without_external_releaser_fails_closed()
         .lock()
         .expect("chunked prefill retained mutex poisoned")
         .is_empty());
-    assert!(!engine.inner.sequences.read().contains_key(&request_id));
+    assert!(!engine.inner.sequences.get(&request_id).is_some());
     assert_eq!(engine.inner.execution_closes.unreclaimed_count(), 0);
     assert_eq!(scheduler.active_count(), 0);
     assert_eq!(scheduler.waiting_count(), 0);
@@ -3608,7 +3683,7 @@ async fn plan_runtime_capacity_wait_wakes_and_cancels_when_stream_is_dropped() {
     drop(stream);
 
     tokio::time::timeout(Duration::from_secs(1), async {
-        while engine.inner.sequences.read().contains_key(&request_id) {
+        while engine.inner.sequences.get(&request_id).is_some() {
             tokio::task::yield_now().await;
         }
     })
@@ -3638,7 +3713,7 @@ async fn plan_runtime_capacity_wait_wakes_and_cancels_when_sync_future_is_aborte
         .is_cancelled());
 
     tokio::time::timeout(Duration::from_secs(1), async {
-        while engine.inner.sequences.read().contains_key(&request_id) {
+        while engine.inner.sequences.get(&request_id).is_some() {
             tokio::task::yield_now().await;
         }
     })
@@ -3722,7 +3797,7 @@ async fn plan_runtime_capacity_wait_accepts_new_work_and_shutdown_without_reprob
             .expect("inference task must not panic")
             .is_err());
     }
-    assert!(engine.inner.sequences.read().is_empty());
+    assert!(engine.inner.sequences.is_empty());
     assert_eq!(engine.inner.scheduler.waiting_count(), 0);
     assert_eq!(engine.inner.scheduler.trace_snapshot().active_len, 0);
     assert_eq!(executor.admission_probes.load(Ordering::Acquire), 2);
@@ -3819,7 +3894,7 @@ async fn plan_runtime_invalid_maintenance_fails_waiting_request_without_retry_lo
             0
         );
         assert!(executor.tokens.frontier_for_request(&request_id).is_none());
-        assert!(!engine.inner.sequences.read().contains_key(&request_id));
+        assert!(!engine.inner.sequences.get(&request_id).is_some());
         assert_eq!(engine.inner.execution_closes.unreclaimed_count(), 0);
         assert_eq!(scheduler.active_count(), 0);
         assert_eq!(scheduler.waiting_count(), 0);
@@ -3885,7 +3960,7 @@ async fn scheduler_trace_plan_stats_reports_request_details() {
     );
     seq.prefill_tokens_processed = 1;
     {
-        let mut sequences = engine.inner.sequences.write();
+        let sequences = &engine.inner.sequences;
         sequences.insert(request_id.clone(), seq);
     }
 

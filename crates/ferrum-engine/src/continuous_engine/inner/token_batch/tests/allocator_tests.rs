@@ -124,8 +124,10 @@ async fn commit_initial_products(
     assert!(deferred.is_empty());
     drop(works);
     for input in inputs {
-        let mut sequences = engine.inner.sequences.write();
-        let sequence = sequences.get_mut(&input.request_id).unwrap();
+        let sequences = &engine.inner.sequences;
+        let sequence_handle = sequences.get(&input.request_id).unwrap();
+        let mut sequence_guard = sequence_handle.lock();
+        let sequence = sequence_guard.as_mut().unwrap();
         assert_eq!(sequence.generated_tokens, vec![TokenId(7)]);
         assert_eq!(sequence.prefill_tokens_processed, 2);
         input.frontier = sequence.execution_frontier.clone().unwrap();
@@ -143,8 +145,10 @@ async fn commit_initial_products(
 
 fn assert_waiting_owner(engine: &ContinuousBatchEngine, input: &TokenBatchInput) {
     assert!(input.frontier.sequence().observed_end().is_some());
-    let sequences = engine.inner.sequences.read();
-    let sequence = &sequences[&input.request_id];
+    let sequences = &engine.inner.sequences;
+    let sequence_handle = sequences.get(&input.request_id).unwrap();
+    let sequence_guard = sequence_handle.lock();
+    let sequence = sequence_guard.as_ref().unwrap();
     assert!(sequence.execution_frontier.is_none());
     assert!(sequence.execution_close.is_none());
     assert_eq!(sequence.phase, RequestPhase::Waiting);
@@ -296,8 +300,10 @@ async fn token_allocator_shared_peers_close_in_order_before_recompute_can_readmi
         Some(RequestPhase::Decoding)
     );
     {
-        let sequences = engine.inner.sequences.read();
-        let peer = &sequences[&remaining.request_id];
+        let sequences = &engine.inner.sequences;
+        let peer_handle = sequences.get(&remaining.request_id).unwrap();
+        let peer_guard = peer_handle.lock();
+        let peer = peer_guard.as_ref().unwrap();
         assert_eq!(peer.execution_frontier.as_ref(), Some(&remaining.frontier));
         assert_eq!(peer.generated_tokens, vec![TokenId(7)]);
         assert!(remaining.frontier.sequence().observed_end().is_none());
@@ -406,8 +412,10 @@ async fn token_allocator_shared_peers_close_in_order_before_recompute_can_readmi
         .unwrap();
     assert!(deferred.is_empty());
     {
-        let sequences = engine.inner.sequences.read();
-        let owner = &sequences[&inputs[0].request_id];
+        let sequences = &engine.inner.sequences;
+        let owner_handle = sequences.get(&inputs[0].request_id).unwrap();
+        let owner_guard = owner_handle.lock();
+        let owner = owner_guard.as_ref().unwrap();
         let frontier = owner.execution_frontier.as_ref().unwrap();
         assert_eq!(frontier.sequence(), inputs[0].frontier.sequence());
         assert_eq!(frontier.consumed_tokens(), 3);
@@ -432,11 +440,13 @@ async fn token_allocator_shared_peers_close_in_order_before_recompute_can_readmi
     assert_eq!(engine.inner.scheduler.confirmed_capacity_release_epoch(), 3);
     assert_eq!(engine.inner.scheduler.waiting_count(), 2);
     {
-        let mut sequences = engine.inner.sequences.write();
+        let sequences = &engine.inner.sequences;
         for input in &inputs[1..] {
             let (sender, receiver) = tokio::sync::oneshot::channel();
             drop(receiver);
-            let sequence = sequences.get_mut(&input.request_id).unwrap();
+            let sequence_handle = sequences.get(&input.request_id).unwrap();
+            let mut sequence_guard = sequence_handle.lock();
+            let sequence = sequence_guard.as_mut().unwrap();
             sequence.response_sender = Some(sender);
             assert!(sequence.client_receiver_closed());
         }
@@ -459,7 +469,7 @@ async fn token_allocator_shared_peers_close_in_order_before_recompute_can_readmi
     assert!(inputs
         .iter()
         .all(|input| input.frontier.sequence().observed_end().is_some()));
-    assert!(engine.inner.sequences.read().is_empty());
+    assert!(engine.inner.sequences.is_empty());
     assert_eq!(engine.inner.execution_closes.unreclaimed_count(), 0);
 }
 
@@ -476,8 +486,10 @@ async fn token_allocator_sole_owner_impossible_growth_errors_without_parking() {
     engine
         .inner
         .sequences
-        .write()
-        .get_mut(&inputs[0].request_id)
+        .get(&inputs[0].request_id)
+        .unwrap()
+        .lock()
+        .as_mut()
         .unwrap()
         .response_sender = Some(sender);
     let mut width = None;
@@ -520,6 +532,6 @@ async fn token_allocator_sole_owner_impossible_growth_errors_without_parking() {
     assert_eq!(state.pool.free_count(), 2);
     assert!(state.owners.is_empty());
     assert_eq!(engine.inner.scheduler.confirmed_capacity_release_epoch(), 1);
-    assert!(engine.inner.sequences.read().is_empty());
+    assert!(engine.inner.sequences.is_empty());
     assert_eq!(engine.inner.execution_closes.unreclaimed_count(), 0);
 }

@@ -1,17 +1,29 @@
 use super::*;
 
-// Restoring the original outer state on unwind preserves owners that have not
-// reached the close registry yet. The guard never synthesizes terminal facts.
-struct RemovedCompletionSequence<'a> {
-    sequences: &'a mut HashMap<RequestId, SequenceState>,
-    request_id: RequestId,
-    sequence: Option<SequenceState>,
+use ferrum_execution::token_execution::{ExecutionFrontier, ExecutorSequence};
+use ferrum_scheduler::implementations::continuous::PrefixRequestKey;
+
+#[derive(Clone, Copy)]
+enum CompletionExpectation<'a> {
+    Current,
+    Admission(&'a PrefixRequestKey),
+    Frontier(&'a ExecutorSequence),
+    Recompute(&'a PrefixRequestKey, Option<&'a ExecutionFrontier>),
 }
 
-impl Drop for RemovedCompletionSequence<'_> {
-    fn drop(&mut self) {
-        if let Some(sequence) = self.sequence.take() {
-            self.sequences.insert(self.request_id.clone(), sequence);
+impl CompletionExpectation<'_> {
+    fn matches(&self, inner: &EngineInner, sequence: &SequenceState) -> bool {
+        match self {
+            Self::Current => true,
+            Self::Admission(key) => sequence.pending_token_admission.as_ref() == Some(*key),
+            Self::Frontier(expected) => sequence
+                .execution_frontier
+                .as_ref()
+                .is_some_and(|frontier| frontier.sequence() == *expected),
+            Self::Recompute(key, frontier) => {
+                inner.scheduler.execution_capacity_request_is_current(key)
+                    && sequence.execution_frontier.as_ref() == *frontier
+            }
         }
     }
 }
@@ -328,17 +340,22 @@ impl EngineInner {
 
     // ── stream helper ──────────────────────────────────────────────────
 
-    pub(super) fn stop_reason_for_request(&self, request_id: &RequestId) -> Option<FinishReason> {
-        let sequences = self.sequences.read();
-        match sequences.get(request_id) {
-            Some(seq) => seq.stop_reason(Some(self.tokenizer.as_ref())),
+    pub(super) fn stop_reason_for_sequence(
+        &self,
+        handle: &Arc<SequenceHandle>,
+    ) -> Option<FinishReason> {
+        match handle.lock().as_ref() {
+            Some(seq) if self.sequences.is_current(handle) => {
+                seq.stop_reason(Some(self.tokenizer.as_ref()))
+            }
+            Some(_) => Some(FinishReason::Error),
             None => Some(FinishReason::Error),
         }
     }
 
-    pub(super) fn should_stream_generated_token(
+    pub(super) fn should_stream_sequence_token(
         &self,
-        request_id: &RequestId,
+        handle: &Arc<SequenceHandle>,
         token: TokenId,
         stop_reason: Option<FinishReason>,
     ) -> bool {
@@ -348,30 +365,45 @@ impl EngineInner {
         ) {
             return !matches!(stop_reason, Some(FinishReason::Error));
         }
-        self.sequences
-            .read()
-            .get(request_id)
-            .is_some_and(|sequence| {
-                sequence.should_stream_generated_token(
+        handle.lock().as_ref().is_some_and(|sequence| {
+            self.sequences.is_current(handle)
+                && sequence.should_stream_generated_token(
                     Some(self.tokenizer.as_ref()),
                     token,
                     stop_reason,
                 )
-            })
+        })
     }
 
+    #[cfg(test)]
     pub(in crate::continuous_engine) async fn send_stream_update(
         &self,
         request_id: &RequestId,
         token: TokenId,
     ) {
-        self.send_stream_text(request_id, Some(token), None);
+        if let Some(handle) = self.sequences.get(request_id) {
+            self.send_stream_update_for_sequence(&handle, token).await;
+        }
+    }
+
+    pub(super) async fn send_stream_update_for_sequence(
+        &self,
+        handle: &Arc<SequenceHandle>,
+        token: TokenId,
+    ) {
+        {
+            let mut state = handle.lock();
+            if let Some(seq) = state.as_mut().filter(|_| self.sequences.is_current(handle)) {
+                self.send_stream_text_locked(handle.request_id(), seq, Some(token), None);
+            }
+        }
         tokio::task::yield_now().await;
     }
 
-    fn send_stream_text(
+    fn send_stream_text_locked(
         &self,
         request_id: &RequestId,
+        seq: &mut SequenceState,
         token: Option<TokenId>,
         terminal: Option<FinishReason>,
     ) {
@@ -391,10 +423,6 @@ impl EngineInner {
         // past `streamed_text_len` and bump the watermark. Possible stop
         // prefixes are held until they match, diverge, or generation ends.
         let (ttft_s, itl_s, first_emit_prof) = {
-            let mut sequences = self.sequences.write();
-            let Some(seq) = sequences.get_mut(request_id) else {
-                return;
-            };
             let sender = seq.stream_sender.clone();
             let Ok(mut full) = self.tokenizer.decode(&seq.generated_tokens, true) else {
                 return;
@@ -520,18 +548,24 @@ impl EngineInner {
         request_id: &RequestId,
         span: &output_delivery::TextSpan,
     ) -> Result<Option<StreamChunk>> {
-        // Sequence -> output lock order matches publication. Reading both
-        // sources under this lock closes the remove/handoff lookup race.
-        let sequences = self.sequences.read();
+        // Delivery keeps only a weak association with the original request;
+        // no index lookup can redirect a pending span to a replacement.
+        let handle = sender.source_sequence();
+        let state = handle.as_ref().map(|handle| handle.lock());
         let text = match sender.completed_text(span.bytes.clone())? {
             Some(text) => text,
             None => {
-                let Some(sequence) = sequences.get(request_id).filter(|sequence| {
-                    sequence
-                        .stream_sender
+                let Some(sequence) =
+                    state
                         .as_ref()
-                        .is_some_and(|actual| actual.same_owner(sender))
-                }) else {
+                        .and_then(|state| state.as_ref())
+                        .filter(|sequence| {
+                            sequence
+                                .stream_sender
+                                .as_ref()
+                                .is_some_and(|actual| actual.same_owner(sender))
+                        })
+                else {
                     return Ok(None);
                 };
                 let visible =
@@ -562,53 +596,48 @@ impl EngineInner {
     // ── completion ─────────────────────────────────────────────────────
 
     pub(super) async fn cancel_abandoned_requests(&self) -> Result<()> {
-        let failed: Vec<_> = self
-            .sequences
-            .read()
-            .iter()
-            .filter_map(|(id, sequence)| {
-                sequence
-                    .stream_sender
-                    .as_ref()
-                    .and_then(OutputSender::failure)
-                    .map(|error| (id.clone(), error))
-            })
-            .collect();
-        for (id, error) in failed {
-            self.complete_request_detached(&id, FinishReason::Error, Some(error))?;
-        }
-        let abandoned: Vec<_> = self
-            .sequences
-            .read()
-            .iter()
-            .filter_map(|(request_id, sequence)| {
-                sequence
-                    .client_receiver_closed()
-                    .then(|| request_id.clone())
-            })
-            .collect();
-
-        for request_id in abandoned {
-            self.cancel_abandoned_request(&request_id).await?;
+        for handle in self.sequences.snapshot() {
+            let (failure, abandoned) = {
+                let state = handle.lock();
+                let Some(sequence) = state.as_ref() else {
+                    continue;
+                };
+                (
+                    sequence
+                        .stream_sender
+                        .as_ref()
+                        .and_then(OutputSender::failure),
+                    sequence.client_receiver_closed(),
+                )
+            };
+            if let Some(error) = failure {
+                self.complete_request_exact_detached(&handle, FinishReason::Error, Some(error))?;
+            } else if abandoned {
+                self.cancel_abandoned_sequence(&handle).await?;
+            }
         }
         Ok(())
     }
 
-    async fn cancel_abandoned_request(&self, request_id: &RequestId) -> Result<()> {
-        self.discard_pending_prefix_restore(request_id);
+    async fn cancel_abandoned_sequence(&self, handle: &Arc<SequenceHandle>) -> Result<()> {
+        let request_id = handle.request_id();
         let detected_scheduler_iteration = self.scheduler.trace_snapshot().current_iteration;
-        let (completion_resources, terminal_token_trace, token_close, request_slot_present) = {
-            let mut sequences = self.sequences.write();
-            let Some(mut sequence) = sequences.remove(request_id) else {
+        let (terminal_token_trace, token_close, request_slot_present, scheduler_cancel) = {
+            let mut state = handle.lock();
+            let Some(sequence) = state.as_mut() else {
                 return Ok(());
             };
+            if !self.sequences.is_current(handle) {
+                return Ok(());
+            }
+            self.discard_pending_prefix_restore(request_id);
+            let scheduler_cancel = self.scheduler.cancel_request(request_id.clone());
             let terminal_token_trace = self.capture_sequence_terminal_token_trace(&sequence);
             let mut resources = sequence.take_completion_resources();
             let request_slot_present = resources.request_slot.is_some();
             // Keep the outer handoff atomic with terminal consumption by the
             // close registry. No await may separate removal and registration.
             let token_close = resources.execution_frontier.take().map(|frontier| {
-                let cancelled = self.scheduler.cancel_request(request_id.clone());
                 let ticket = match resources.execution_close.take() {
                     Some(outcome) => self.begin_observed_close(
                         request_id.clone(),
@@ -623,13 +652,23 @@ impl EngineInner {
                         ferrum_execution::token_execution::ExecutionEndReason::Cancelled,
                     ),
                 };
-                (frontier, cancelled, ticket)
+                (frontier, ticket)
             });
+            if token_close.is_none() {
+                self.model_executor.cancel_prefill_admission(request_id);
+            }
+            if let Some(slot) = resources.request_slot.take() {
+                slot.close(self);
+            }
+            // Keep the index occupied until scheduler termination and exact
+            // physical handoff are complete. Old Arcs subsequently see Taken.
+            state.take();
+            self.sequences.remove_exact(handle);
             (
-                resources,
                 terminal_token_trace,
                 token_close,
                 request_slot_present,
+                scheduler_cancel,
             )
         };
         self.write_sequence_terminal_token_trace(
@@ -664,7 +703,7 @@ impl EngineInner {
 
         let mut close_error = None;
         let mut token_close_pending = false;
-        let scheduler_cancel = if let Some((frontier, scheduler_cancel, ticket)) = token_close {
+        if let Some((frontier, ticket)) = token_close {
             let close_result = match ticket {
                 Ok(ticket) => ticket.initial_result().await,
                 Err(error) => Err(error),
@@ -672,17 +711,7 @@ impl EngineInner {
             let observation_result = self.drain_execution_closes();
             close_error = close_result.and(observation_result).err();
             token_close_pending = frontier.sequence().observed_end().is_none();
-            scheduler_cancel
-        } else {
-            // No token incarnation was admitted. Cancel only the retained
-            // admission obligation; no physical release is inferred here.
-            self.model_executor.cancel_prefill_admission(request_id);
-            let scheduler_cancel = self.scheduler.cancel_request(request_id.clone());
-            if let Some(request_slot) = completion_resources.request_slot {
-                request_slot.close(self);
-            }
-            scheduler_cancel
-        };
+        }
 
         let terminal_scheduler_iteration = self.scheduler.trace_snapshot().current_iteration;
         let scheduler_tick_delta =
@@ -803,14 +832,15 @@ impl EngineInner {
 
     pub(super) async fn complete_unpublished_admission(
         &self,
+        handle: &Arc<SequenceHandle>,
         key: &ferrum_scheduler::implementations::continuous::PrefixRequestKey,
         error: FerrumError,
     ) -> Result<()> {
         self.register_request_completion(
-            key.request_id(),
+            handle,
             FinishReason::Error,
             Some(error),
-            Some(key),
+            CompletionExpectation::Admission(key),
         )
         .map(drop)
     }
@@ -825,11 +855,17 @@ impl EngineInner {
             &ferrum_scheduler::implementations::continuous::PrefixRequestKey,
         >,
     ) -> Result<()> {
+        let Some(handle) = self.sequences.get(request_id) else {
+            return Ok(());
+        };
         let Some(receiver) = self.register_request_completion(
-            request_id,
+            &handle,
             finish_reason,
             explicit_terminal_error,
-            expected_admission,
+            expected_admission.map_or(
+                CompletionExpectation::Current,
+                CompletionExpectation::Admission,
+            ),
         )?
         else {
             return Ok(());
@@ -841,58 +877,59 @@ impl EngineInner {
 
     fn register_request_completion(
         &self,
-        request_id: &RequestId,
+        handle: &Arc<SequenceHandle>,
         finish_reason: FinishReason,
         mut explicit_terminal_error: Option<FerrumError>,
-        expected_admission: Option<
-            &ferrum_scheduler::implementations::continuous::PrefixRequestKey,
-        >,
+        expected: CompletionExpectation<'_>,
     ) -> Result<Option<tokio::sync::oneshot::Receiver<Result<()>>>> {
-        // An unpublished admission has no prefix restore, and its original
-        // scheduler ticket has already been removed. Neither operation may
-        // touch a replacement merely because it reuses the RequestId.
-        if expected_admission.is_none() {
-            self.discard_pending_prefix_restore(request_id);
-        }
-        let mut classified_api_response = None;
-        let mut terminal_error_is_delivery = false;
-        if explicit_terminal_error.is_none() {
-            explicit_terminal_error = self.sequences.read().get(request_id).and_then(|seq| {
+        let request_id = handle.request_id();
+        let handoff = {
+            let mut state = handle.lock();
+            let Some(seq) = state.as_mut() else {
+                return Ok(None);
+            };
+            if !self.sequences.is_current(handle) || !expected.matches(self, seq) {
+                return Ok(None);
+            }
+            if !matches!(expected, CompletionExpectation::Admission(_)) {
+                self.discard_pending_prefix_restore(request_id);
+            }
+            let mut classified_api_response = None;
+            let mut terminal_error_is_delivery = false;
+            if explicit_terminal_error.is_none() {
                 let delivery_error = seq.stream_sender.as_ref().and_then(OutputSender::failure);
-                if delivery_error.is_some() {
-                    terminal_error_is_delivery = true;
-                    return delivery_error;
-                }
-                seq.structured_output_terminal_error(finish_reason)
-                    .or_else(|| {
-                        seq.validate_structured_stop_boundary(self.tokenizer.as_ref())
-                            .err()
-                    })
-                    .or_else(
-                        || match seq.classified_structured_api_response(finish_reason) {
-                            Ok(response) => {
-                                classified_api_response = response;
-                                None
-                            }
-                            Err(error) => Some(error),
-                        },
-                    )
-            });
-        }
-        if explicit_terminal_error.is_none() && finish_reason != FinishReason::Error {
-            // Flush held, unmatched prefixes and legal text before an in-token
-            // stop as a separate text chunk. Consumers may defer a text delta;
-            // they must still receive the independent terminal/usage event.
-            self.send_stream_text(request_id, None, Some(finish_reason));
-        }
-        let Some(handoff) = self.handoff_request_completion(
-            request_id,
-            finish_reason,
-            explicit_terminal_error,
-            terminal_error_is_delivery,
-            expected_admission,
-            classified_api_response,
-        ) else {
+                terminal_error_is_delivery = delivery_error.is_some();
+                explicit_terminal_error = delivery_error.or_else(|| {
+                    seq.structured_output_terminal_error(finish_reason)
+                        .or_else(|| {
+                            seq.validate_structured_stop_boundary(self.tokenizer.as_ref())
+                                .err()
+                        })
+                        .or_else(
+                            || match seq.classified_structured_api_response(finish_reason) {
+                                Ok(response) => {
+                                    classified_api_response = response;
+                                    None
+                                }
+                                Err(error) => Some(error),
+                            },
+                        )
+                });
+            }
+            if explicit_terminal_error.is_none() && finish_reason != FinishReason::Error {
+                self.send_stream_text_locked(request_id, seq, None, Some(finish_reason));
+            }
+            self.handoff_request_completion_locked(
+                handle,
+                &mut state,
+                finish_reason,
+                explicit_terminal_error,
+                terminal_error_is_delivery,
+                expected,
+                classified_api_response,
+            )
+        };
+        let Some(handoff) = handoff else {
             return Ok(None);
         };
         self.schedule_output_completion(request_id, handoff)
@@ -905,8 +942,57 @@ impl EngineInner {
         finish_reason: FinishReason,
         error: Option<FerrumError>,
     ) -> Result<()> {
-        self.register_request_completion(request_id, finish_reason, error, None)
-            .map(drop)
+        let Some(handle) = self.sequences.get(request_id) else {
+            return Ok(());
+        };
+        self.complete_request_exact_detached(&handle, finish_reason, error)
+    }
+
+    pub(in crate::continuous_engine) fn complete_request_exact_detached(
+        &self,
+        handle: &Arc<SequenceHandle>,
+        finish_reason: FinishReason,
+        error: Option<FerrumError>,
+    ) -> Result<()> {
+        self.register_request_completion(
+            handle,
+            finish_reason,
+            error,
+            CompletionExpectation::Current,
+        )
+        .map(drop)
+    }
+
+    pub(in crate::continuous_engine) fn complete_request_exact_frontier_detached(
+        &self,
+        handle: &Arc<SequenceHandle>,
+        expected: &ExecutorSequence,
+        finish_reason: FinishReason,
+        error: Option<FerrumError>,
+    ) -> Result<()> {
+        self.register_request_completion(
+            handle,
+            finish_reason,
+            error,
+            CompletionExpectation::Frontier(expected),
+        )
+        .map(drop)
+    }
+
+    pub(in crate::continuous_engine) fn complete_request_exact_recompute_detached(
+        &self,
+        handle: &Arc<SequenceHandle>,
+        key: &PrefixRequestKey,
+        frontier: Option<&ExecutionFrontier>,
+        error: FerrumError,
+    ) -> Result<()> {
+        self.register_request_completion(
+            handle,
+            FinishReason::Error,
+            Some(error),
+            CompletionExpectation::Recompute(key, frontier),
+        )
+        .map(drop)
     }
 
     fn schedule_output_completion(
@@ -946,17 +1032,17 @@ impl EngineInner {
         Ok(receiver)
     }
 
-    fn handoff_request_completion(
+    fn handoff_request_completion_locked(
         &self,
-        request_id: &RequestId,
+        handle: &Arc<SequenceHandle>,
+        state: &mut Option<SequenceState>,
         finish_reason: FinishReason,
         mut explicit_terminal_error: Option<FerrumError>,
         terminal_error_is_delivery: bool,
-        expected_admission: Option<
-            &ferrum_scheduler::implementations::continuous::PrefixRequestKey,
-        >,
+        expected: CompletionExpectation<'_>,
         mut classified_api_response: Option<ferrum_types::ApiResponse>,
     ) -> Option<CompletionHandoff> {
+        let request_id = handle.request_id();
         // A terminal failure is not permission to abandon the other owners.
         // Keep the first control-plane error, while independently closing the
         // resources and client channels whose disposition is still known.
@@ -969,25 +1055,10 @@ impl EngineInner {
             terminal_token_trace,
             token_close,
         ) = {
-            let mut sequences = self.sequences.write();
-            if let Some(key) = expected_admission {
-                if !sequences
-                    .get(request_id)
-                    .is_some_and(|sequence| sequence.pending_token_admission.as_ref() == Some(key))
-                {
+            if let Some(seq) = state.as_mut() {
+                if !self.sequences.is_current(handle) || !expected.matches(self, seq) {
                     return None;
                 }
-            }
-            if let Some(sequence) = sequences.remove(request_id) {
-                let mut removed = RemovedCompletionSequence {
-                    sequences: &mut sequences,
-                    request_id: request_id.clone(),
-                    sequence: Some(sequence),
-                };
-                let seq = removed
-                    .sequence
-                    .as_mut()
-                    .expect("removed sequence is retained");
                 let mut terminal_error = explicit_terminal_error.take();
                 let mut finish_reason = if terminal_error.is_some() {
                     FinishReason::Error
@@ -1051,12 +1122,13 @@ impl EngineInner {
 
                 // The same outer lock excludes a recompute drain until this
                 // exact incarnation and its slot have reached the registry.
-                let scheduler_completion = if expected_admission.is_none() {
-                    self.scheduler
-                        .complete_request(request_id.clone(), &response)
-                } else {
-                    Ok(())
-                };
+                let scheduler_completion =
+                    if !matches!(expected, CompletionExpectation::Admission(_)) {
+                        self.scheduler
+                            .complete_request(request_id.clone(), &response)
+                    } else {
+                        Ok(())
+                    };
                 if let Err(error) = scheduler_completion {
                     warn!(request_id = %request_id, error = %error, "Scheduler completion failed");
                     terminal_error.get_or_insert_with(|| error.clone());
@@ -1064,7 +1136,9 @@ impl EngineInner {
                     response.finish_reason = FinishReason::Error;
                     response.api_response = None;
                 }
-                if seq.execution_frontier.is_none() && expected_admission.is_none() {
+                if seq.execution_frontier.is_none()
+                    && !matches!(expected, CompletionExpectation::Admission(_))
+                {
                     self.model_executor.cancel_prefill_admission(request_id);
                 }
                 let mut completion_resources = seq.take_completion_resources();
@@ -1102,7 +1176,11 @@ impl EngineInner {
                     slot.close(self);
                 }
                 let senders = (seq.stream_sender.take(), seq.response_sender.take());
-                removed.sequence.take();
+                // The index remains occupied until synchronous scheduler
+                // termination and exact owner transfer finish. Unwinding
+                // earlier leaves the remaining state in its original handle.
+                state.take();
+                self.sequences.remove_exact(handle);
                 (
                     response,
                     senders.0,
@@ -1148,20 +1226,28 @@ impl EngineInner {
         self.release_pending_prefix_restores_for_capacity_pressure();
         let cohorts = std::mem::take(&mut *self.prefix_rendezvous.lock());
         drop(cohorts);
-        let request_ids: Vec<_> = self.sequences.read().keys().cloned().collect();
         let mut errors = Vec::new();
-        for request_id in request_ids {
-            self.discard_pending_prefix_restore(&request_id);
-            if let Some(mut handoff) = self.handoff_request_completion(
-                &request_id,
-                FinishReason::Error,
-                Some(FerrumError::scheduler(
-                    "engine shut down before request completion",
-                )),
-                false,
-                None,
-                None,
-            ) {
+        for handle in self.sequences.snapshot() {
+            let request_id = handle.request_id();
+            let handoff = {
+                let mut state = handle.lock();
+                if !self.sequences.is_current(&handle) {
+                    continue;
+                }
+                self.discard_pending_prefix_restore(request_id);
+                self.handoff_request_completion_locked(
+                    &handle,
+                    &mut state,
+                    FinishReason::Error,
+                    Some(FerrumError::scheduler(
+                        "engine shut down before request completion",
+                    )),
+                    false,
+                    CompletionExpectation::Current,
+                    None,
+                )
+            };
+            if let Some(mut handoff) = handoff {
                 // Shutdown cannot wait for a full client queue. Publish one
                 // bounded fallback before relinquishing the last sender; the
                 // receiver emits it only after already queued data.
