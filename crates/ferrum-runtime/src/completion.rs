@@ -3718,6 +3718,7 @@ pub enum CompletionObservation {
 pub struct IndeterminateSubmissionHandle<R: DeviceRuntime> {
     reaper: Weak<CompletionReaper<R>>,
     slot_id: CompletionSlotId,
+    batch_identity: BatchOperationIdentity,
 }
 
 impl<R: DeviceRuntime> Clone for IndeterminateSubmissionHandle<R> {
@@ -3725,6 +3726,7 @@ impl<R: DeviceRuntime> Clone for IndeterminateSubmissionHandle<R> {
         Self {
             reaper: Weak::clone(&self.reaper),
             slot_id: self.slot_id,
+            batch_identity: self.batch_identity.clone(),
         }
     }
 }
@@ -3741,6 +3743,13 @@ impl<R: DeviceRuntime> fmt::Debug for IndeterminateSubmissionHandle<R> {
 impl<R: DeviceRuntime> IndeterminateSubmissionHandle<R> {
     pub const fn slot_id(&self) -> CompletionSlotId {
         self.slot_id
+    }
+
+    /// The original physical attempt's identity, retained even after recovery
+    /// consumes its slot. This observation cannot recreate submission authority
+    /// or establish the outcome of a missing completion slot.
+    pub fn batch_identity(&self) -> &BatchOperationIdentity {
+        &self.batch_identity
     }
 
     pub fn recover_by_draining_lane(&self) -> Result<CompletionRecoveryOutcome, VNextError> {
@@ -4084,6 +4093,7 @@ impl<R: DeviceRuntime> CompletionReservation<R> {
             .batch_identity
             .take()
             .expect("reservation owns batch identity");
+        let recovery_identity = batch_identity.clone();
         let mut record = match self.record.lock() {
             Ok(record) => record,
             Err(poisoned) => poisoned.into_inner(),
@@ -4103,6 +4113,7 @@ impl<R: DeviceRuntime> CompletionReservation<R> {
         IndeterminateSubmissionHandle {
             reaper: Arc::downgrade(&self.reaper),
             slot_id: self.slot_id,
+            batch_identity: recovery_identity,
         }
     }
 
