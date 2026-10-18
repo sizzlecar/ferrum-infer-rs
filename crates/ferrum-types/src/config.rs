@@ -728,6 +728,8 @@ pub struct RuntimeKnobs {
     pub legacy_scheduler_trace_jsonl: Option<PathBuf>,
     pub profile_entrypoint: Option<ProfileEntrypoint>,
     pub profile_detail: ObservabilityProfileDetail,
+    #[serde(default)]
+    pub profile_journal: crate::ObservabilityJournalConfig,
     pub unified_post_prof: bool,
     /// Retain independent vNext sequence-state checkpoints across requests.
     #[serde(default)]

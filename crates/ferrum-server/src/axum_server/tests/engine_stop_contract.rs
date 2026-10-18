@@ -190,7 +190,8 @@ async fn request_with_wire(
     );
     let router = AxumServer::from_llm(engine.clone())
         .with_prompt_template(Some(template(protocol)))
-        .build_router();
+        .build_router()
+        .unwrap();
     // Preserve timeout/panic outcomes until the production engine is shut down.
     let outcome = AssertUnwindSafe(tokio::time::timeout(Duration::from_secs(5), async {
         let response = post_json(router, "/v1/chat/completions", wire).await;

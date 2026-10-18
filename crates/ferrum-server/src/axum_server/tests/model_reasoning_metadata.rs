@@ -11,7 +11,7 @@ fn toggle_template() -> ModelChatTemplate {
 }
 
 async fn model_entries(server: AxumServer) -> Vec<Value> {
-    let response = get(server.build_router(), "/v1/models").await;
+    let response = get(server.build_router().unwrap(), "/v1/models").await;
     assert_eq!(response.status(), AxumStatusCode::OK);
     response_json(response).await["data"]
         .as_array()

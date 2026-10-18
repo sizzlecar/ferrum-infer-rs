@@ -1700,5 +1700,5 @@ impl ProductExecutionEventSink for VNextProfileExecutionEventSink {
 
 #[cfg(test)]
 pub(super) fn create_scheduler_trace_sink(path: Option<&Path>) -> Option<SchedulerTraceJournal> {
-    SchedulerTraceJournal::create(path?.to_path_buf()).ok()
+    SchedulerTraceJournal::create(path?.to_path_buf(), Default::default()).ok()
 }

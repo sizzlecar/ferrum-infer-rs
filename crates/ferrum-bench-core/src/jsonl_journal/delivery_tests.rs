@@ -443,7 +443,7 @@ fn try_delivery_flush_failure_is_not_reported_as_a_complete_artifact() {
     let _ = std::fs::remove_file(path);
 }
 
-fn readonly_journal<T: Serialize + Send + 'static>(
+pub(super) fn readonly_journal<T: Serialize + Send + 'static>(
     path: &Path,
     config: JsonlJournalConfig,
 ) -> JsonlJournal<T> {

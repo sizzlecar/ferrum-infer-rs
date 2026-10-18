@@ -2,7 +2,7 @@
 
 **状态：目标已激活，R0 已合并，R1 验收、R2 实施中。** 工作分支：`refactor/execution-architecture-20261018`，从 2026-10-18 的干净 `main`（`c2be4c67`）开始。首个 checkpoint 退役独立 embedding/ASR/TTS 链路；原工作区未合并的旧 SLO 实现不作为代码基底。
 
-R0 六批清理与正确性修复已合并（PR #429–#434）。R1 已分离 runtime 与产品执行契约，统一 token 提交并退出旧 Tensor 控制流，泛型驱动归入 execution。R2 已实现统一驱动生命周期、持有额度的输出和 HTTP 按需拉取；采样、解码与完成投影已移出全局序列锁。生成历史、完成结果及 CLI/HTTP 保留副本沿用原请求额度，tokenizer 共享解码缓存另有实例限额；真实 CPU 回归覆盖额度不足时不重放已执行工作、独立请求进度与最后持有者释放。runtime/Engine 观测已区分传输降级与契约失败，生产 journal 使用有界非阻塞投递，关闭诊断时不构造 trace 负载；HTTP profile 写入、产品 journal 预算配置和真实物理执行事实仍待收尾。R1 仍在验收，R2–R5 未完成；原始证据留在仓库外交接目录，没有新增性能或 SLO 达标声明。
+R0 六批清理与正确性修复已合并（PR #429–#434）。R1 已分离 runtime 与产品执行契约，统一 token 提交并退出旧 Tensor 控制流，泛型驱动归入 execution。R2 已实现统一驱动生命周期、持有额度的输出和 HTTP 按需拉取；采样、解码与完成投影已移出全局序列锁。生成历史、完成结果及 CLI/HTTP 保留副本沿用原请求额度，tokenizer 共享解码缓存另有实例限额；真实 CPU 回归覆盖额度不足时不重放已执行工作、独立请求进度与最后持有者释放。runtime/Engine 观测已区分传输降级与契约失败，Engine/HTTP journal 使用有界非阻塞投递，run/serve 共享 typed 预算；关闭诊断时不构造 trace 负载。HTTP 关闭超时或 Engine 失败时保留原 journal，重试等待原任务；共享 journal 的最终关闭权、单调入口时间与真实物理执行事实仍待收尾。R1 仍在验收，R2–R5 未完成；原始证据留在仓库外交接目录，没有新增性能或 SLO 达标声明。
 
 ## 1. 目标与第一原则
 

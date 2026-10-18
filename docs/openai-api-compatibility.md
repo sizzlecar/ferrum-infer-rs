@@ -62,6 +62,32 @@ limit. Library callers configure `EngineConfig.output` and
 `EngineConfig.model.tokenizer.decode_cache`; borrow `InferenceOutput::response()`
 or `OutputChunk::chunk()`. Cloning `InferenceOutput` shares its content and credit.
 
+## Profile Delivery Limits
+
+`run` and `serve` share optional journal limits in `ferrum.toml` (defaults shown):
+
+```toml
+[profile_journal]
+queue_capacity = 256
+payload_capacity_bytes = 16777216
+max_record_bytes = 1048576
+max_batch_bytes = 4194304
+max_batch_records = 1024
+```
+
+Limits apply per physical journal. Values must be positive, with
+`max_record_bytes <= max_batch_bytes <= payload_capacity_bytes`. Record sizes
+include the trailing newline; batches are accepted or rejected whole. The payload
+budget covers measured JSONL bytes retained by nonblocking delivery, including
+active writer work. It excludes object/allocation overhead and is not an RSS limit.
+Startup/shutdown artifact writes obey record/batch limits but use synchronous delivery.
+
+Explicit settings for a shared journal path must match. Library callers use
+`EngineConfig.runtime.profile_journal` and `ServerConfig.profile_journal`.
+Optional telemetry loss is reported without replaying inference. Replay, Verify
+and Full require complete evidence; configuration, encoding and internal contract
+failures are never treated as optional delivery loss.
+
 ## Model Capacity
 
 For loaded language models, each model card includes `max_model_len` when the

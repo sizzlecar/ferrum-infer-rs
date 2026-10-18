@@ -185,6 +185,15 @@ impl ActualMemoryStageObservation {
 }
 
 impl ProductObservabilityConfig {
+    pub fn with_journal(
+        mut self,
+        journal: ferrum_types::ObservabilityJournalConfig,
+    ) -> Result<Self> {
+        journal.validate()?;
+        self.core.journal = journal;
+        Ok(self)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         entrypoint: ProfileEntrypoint,
@@ -582,7 +591,7 @@ fn write_profile_outputs(
         if selected.is_empty() {
             continue;
         }
-        match write_profile_events(&path, mode, &selected) {
+        match write_profile_events(&path, mode, &selected, config.journal) {
             Ok(()) => written.push(path),
             Err(error) => {
                 record_profile_transport_failure(config, Some(&path), error, &mut required_failure)?
@@ -1279,6 +1288,16 @@ fn runtime_preset_hash(config: &ProductObservabilityConfig) -> String {
     hasher.update(config.profile_detail.as_str().as_bytes());
     hasher.update(b"\0");
     hasher.update(config.profile_sample_rate.to_string().as_bytes());
+    for value in [
+        config.journal.queue_capacity,
+        config.journal.payload_capacity_bytes,
+        config.journal.max_record_bytes,
+        config.journal.max_batch_bytes,
+        config.journal.max_batch_records,
+    ] {
+        hasher.update(b"\0");
+        hasher.update(value.to_string().as_bytes());
+    }
     format!("sha256:{:x}", hasher.finalize())
 }
 
@@ -1564,6 +1583,7 @@ fn write_replay_bundle(
                 "entrypoint": entrypoint_label(config.entrypoint),
                 "profile_detail": config.profile_detail.as_str(),
                 "profile_sample_rate": config.profile_sample_rate,
+                "profile_journal": config.journal,
                 "profile_jsonl": config.profile_jsonl.as_ref().map(|path| path.to_string_lossy().to_string()),
                 "memory_profile_jsonl": config.memory_profile_jsonl.as_ref().map(|path| path.to_string_lossy().to_string()),
                 "scheduler_trace_jsonl": config.scheduler_trace_jsonl.as_ref().map(|path| path.to_string_lossy().to_string()),
@@ -1953,6 +1973,7 @@ fn write_profile_jsonl(path: &Path, events: &[FerrumProfileEvent]) -> Result<()>
         path,
         ferrum_bench_core::JsonlJournalOpenMode::Truncate,
         events,
+        Default::default(),
     )
 }
 
@@ -1962,6 +1983,7 @@ fn append_profile_jsonl(path: &Path, events: &[FerrumProfileEvent]) -> Result<()
         path,
         ferrum_bench_core::JsonlJournalOpenMode::Append,
         events,
+        Default::default(),
     )
 }
 
@@ -1969,6 +1991,7 @@ fn write_profile_events(
     path: &Path,
     mode: ferrum_bench_core::JsonlJournalOpenMode,
     events: &[FerrumProfileEvent],
+    config: ferrum_types::ObservabilityJournalConfig,
 ) -> Result<()> {
     if events.is_empty() {
         return Err(FerrumError::internal("profile event set must be non-empty"));
@@ -1978,11 +2001,18 @@ fn write_profile_events(
             FerrumError::internal(format!("invalid product observability event: {err}"))
         })?;
     }
-    ferrum_bench_core::write_jsonl_records(path, mode, events).map_err(|error| {
+    ferrum_bench_core::jsonl_journal::write_jsonl_records_with_config(
+        path,
+        mode,
+        events,
+        config.into(),
+    )
+    .map_err(|error| {
         if matches!(
             error.kind(),
             ferrum_bench_core::JsonlJournalErrorKind::Encoding
                 | ferrum_bench_core::JsonlJournalErrorKind::Panic
+                | ferrum_bench_core::JsonlJournalErrorKind::Config
         ) {
             FerrumError::serialization(error.to_string())
         } else {

@@ -26,7 +26,7 @@ fn request_for(path: &str, stream: bool) -> Value {
 async fn http_semantic_sync_three_protocols_retain_only_the_final_encoded_owner() {
     for path in ["/v1/chat/completions", "/v1/responses", "/v1/completions"] {
         let (engine, budget) = budgeted_stub("full answer 字节", OutputConfig::default());
-        let router = AxumServer::from_llm(engine).build_router();
+        let router = AxumServer::from_llm(engine).build_router().unwrap();
         let response = post_json(router, path, request_for(path, false)).await;
         assert_eq!(response.status(), AxumStatusCode::OK, "{path}");
         assert_eq!(
@@ -79,7 +79,7 @@ async fn http_semantic_chat_and_responses_report_quota_without_waiting_for_owned
                 ..Default::default()
             },
         );
-        let router = AxumServer::from_llm(engine).build_router();
+        let router = AxumServer::from_llm(engine).build_router().unwrap();
         let response = post_json(router, path, request_for(path, true)).await;
         assert_eq!(response.status(), AxumStatusCode::OK);
         let wire = tokio::time::timeout(std::time::Duration::from_secs(2), response_text(response)).await.expect("history growth rejects synchronously instead of waiting on its own retained credit");
@@ -118,7 +118,7 @@ async fn http_semantic_completions_stream_does_not_retain_prior_text() {
     fixture.stream_usage = Some(TokenUsage::new(7, 3));
     assert!(expected.len() > budget.config().semantic_bytes_per_session);
     let response = post_json(
-        AxumServer::from_llm(engine).build_router(),
+        AxumServer::from_llm(engine).build_router().unwrap(),
         "/v1/completions",
         request_for("/v1/completions", true),
     )
@@ -180,7 +180,7 @@ async fn http_semantic_completions_rejects_a_current_dto_larger_than_its_quota()
         },
     );
     let response = post_json(
-        AxumServer::from_llm(engine).build_router(),
+        AxumServer::from_llm(engine).build_router().unwrap(),
         "/v1/completions",
         request_for("/v1/completions", true),
     )

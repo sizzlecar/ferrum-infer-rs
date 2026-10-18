@@ -1218,6 +1218,7 @@ impl EngineInner {
                 error.kind(),
                 ferrum_bench_core::JsonlJournalErrorKind::Encoding
                     | ferrum_bench_core::JsonlJournalErrorKind::Panic
+                    | ferrum_bench_core::JsonlJournalErrorKind::Config
             ) {
                 ExecutionEventSinkError::contract(message)
             } else {

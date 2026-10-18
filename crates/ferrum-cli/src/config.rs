@@ -10,6 +10,9 @@ use std::collections::HashMap;
 use std::path::Path;
 use tokio::fs;
 
+#[cfg(test)]
+mod journal_tests;
+
 /// CLI configuration
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(default)]
@@ -28,6 +31,9 @@ pub struct CliConfig {
 
     /// Bound the tokenizer decode cache for both run and serve; either zero disables it.
     pub tokenizer_decode_cache: ferrum_types::TokenizerDecodeCacheConfig,
+
+    /// Per-writer observability limits used by run, serve, and their artifacts.
+    pub profile_journal: ferrum_types::ObservabilityJournalConfig,
 
     /// Server configuration
     pub server: ServerCliConfig,
@@ -805,6 +811,15 @@ fn push_true_entry(entries: &mut Vec<RuntimeConfigEntry>, key: &str, value: Opti
 }
 
 impl CliConfig {
+    pub fn apply_profile_journal_config(
+        &self,
+        engine: &mut ferrum_types::EngineConfig,
+    ) -> Result<()> {
+        self.profile_journal.validate()?;
+        engine.runtime.profile_journal = self.profile_journal;
+        Ok(())
+    }
+
     pub fn apply_output_and_tokenizer_config(
         &self,
         engine: &mut ferrum_types::EngineConfig,
@@ -852,6 +867,7 @@ impl CliConfig {
         })?;
         config.output.validate()?;
         config.tokenizer_decode_cache.validate()?;
+        config.profile_journal.validate()?;
         Ok(config)
     }
 
@@ -869,6 +885,7 @@ impl CliConfig {
     /// Validate configuration
     pub fn validate(&self) -> Result<()> {
         self.resolve_scheduler_slo(None)?;
+        self.profile_journal.validate()?;
         self.output.validate()?;
         self.tokenizer_decode_cache.validate()?;
         // Validate server config

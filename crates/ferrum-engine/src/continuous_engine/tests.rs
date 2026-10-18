@@ -2051,6 +2051,29 @@ fn product_profile_path_constructs_a_vnext_execution_journal() {
     let _ = std::fs::remove_file(trace_path);
 }
 
+#[test]
+fn profile_journal_budget_reaches_profile_scheduler_and_legacy_writers() {
+    let directory = tempfile::tempdir().unwrap();
+    let paths = ["profile.jsonl", "scheduler.jsonl", "legacy.jsonl"]
+        .map(|name| directory.path().join(name));
+    let mut config = EngineConfig::default();
+    config.runtime.profile_journal.queue_capacity = 2;
+    config.runtime.profile_journal.max_batch_records = 2048;
+    let expected: ferrum_bench_core::JsonlJournalConfig = config.runtime.profile_journal.into();
+    config.runtime.profile_jsonl = Some(paths[0].clone());
+    config.runtime.scheduler_trace_jsonl = Some(paths[1].clone());
+    config.runtime.legacy_scheduler_trace_jsonl = Some(paths[2].clone());
+    let engine = test_continuous_engine_with_config(config);
+    assert!(engine.inner.profile_trace_jsonl.is_some());
+    assert!(engine.inner.scheduler_trace_jsonl.is_some());
+    assert!(engine.inner.legacy_scheduler_trace_jsonl.is_some());
+    for path in &paths {
+        let original = ferrum_bench_core::JsonlJournal::<serde_json::Value>::append(path).unwrap();
+        assert_eq!(original.config(), expected);
+    }
+    drop(engine);
+}
+
 #[tokio::test]
 async fn idle_background_loop_parks_and_new_work_resumes_it() {
     let engine = Arc::new(test_continuous_engine());

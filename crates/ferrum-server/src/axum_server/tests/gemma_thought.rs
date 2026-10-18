@@ -131,7 +131,8 @@ async fn gemma_routes_separate_native_thought_for_plain_and_tool_result_turns() 
                 .collect();
             let router = AxumServer::from_llm(Arc::new(StubLlm::with_stream_chunks(&chunks)))
                 .with_prompt_template(Some(template()))
-                .build_router();
+                .build_router()
+                .unwrap();
             let response = post_json(
                 router,
                 "/v1/chat/completions",
@@ -180,7 +181,8 @@ async fn gemma_plain_stream_emits_content_deltas_before_completion() {
     ]);
     let router = AxumServer::from_llm(Arc::new(engine))
         .with_prompt_template(Some(template()))
-        .build_router();
+        .build_router()
+        .unwrap();
     let response = post_json(router, "/v1/chat/completions", request(false, true, true)).await;
     let body = response_text(response).await;
     let events = responses_sse_json_events(&body);
@@ -205,7 +207,8 @@ async fn gemma_stream_flushes_visible_tail_when_final_chunk_has_partial_framing(
     ] {
         let router = AxumServer::from_llm(Arc::new(StubLlm::with_stream_chunks(&chunks)))
             .with_prompt_template(Some(template()))
-            .build_router();
+            .build_router()
+            .unwrap();
         let response = post_json(router, "/v1/chat/completions", request(false, false, true)).await;
         let body = response_text(response).await;
         let events = responses_sse_json_events(&body);

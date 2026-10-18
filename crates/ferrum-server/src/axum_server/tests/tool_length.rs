@@ -25,6 +25,7 @@ fn router(finish_reason: FinishReason, typed_response: bool) -> Router {
     }))
     .with_prompt_template(Some(template))
     .build_router()
+    .unwrap()
 }
 
 fn request(responses: bool, stream: bool) -> (&'static str, Value) {

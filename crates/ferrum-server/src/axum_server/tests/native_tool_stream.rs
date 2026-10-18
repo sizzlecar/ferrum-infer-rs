@@ -62,6 +62,7 @@ fn router(stub: StubLlm) -> Router {
     AxumServer::from_llm(Arc::new(stub))
         .with_prompt_template(Some(template()))
         .build_router()
+        .unwrap()
 }
 
 fn text_deltas(events: &[Value], responses: bool) -> String {

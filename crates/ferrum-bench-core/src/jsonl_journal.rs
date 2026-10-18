@@ -16,6 +16,8 @@ mod delivery;
 use delivery::{BoundedJob, DeliveryState};
 pub use delivery::{JsonlJournalDeliveryStats, JsonlJournalErrorKind, JsonlJournalWorkerState};
 #[cfg(test)]
+mod budget_tests;
+#[cfg(test)]
 mod delivery_tests;
 
 type JournalRegistry = HashMap<PathBuf, Weak<JsonlJournalInner>>;
@@ -109,6 +111,19 @@ impl Default for JsonlJournalConfig {
     }
 }
 
+impl From<ferrum_types::ObservabilityJournalConfig> for JsonlJournalConfig {
+    fn from(config: ferrum_types::ObservabilityJournalConfig) -> Self {
+        Self {
+            queue_capacity: config.queue_capacity,
+            payload_capacity_bytes: config.payload_capacity_bytes,
+            max_record_bytes: config.max_record_bytes,
+            max_batch_bytes: config.max_batch_bytes,
+            max_batch_records: config.max_batch_records,
+            ..Self::default()
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JsonlJournalError {
     kind: JsonlJournalErrorKind,
@@ -162,7 +177,9 @@ impl JournalFailure {
     fn record(&self, error: JsonlJournalError) {
         if matches!(
             error.kind(),
-            JsonlJournalErrorKind::Encoding | JsonlJournalErrorKind::Panic
+            JsonlJournalErrorKind::Encoding
+                | JsonlJournalErrorKind::Panic
+                | JsonlJournalErrorKind::Config
         ) {
             let _ = self.contract_error.set(error.clone());
         }
@@ -307,40 +324,41 @@ where
 }
 
 fn validate_config(config: JsonlJournalConfig) -> io::Result<()> {
-    if config.max_record_bytes == 0
-        || config.max_batch_records == 0
-        || config.max_record_bytes > config.max_batch_bytes
-        || config.max_batch_bytes > config.payload_capacity_bytes
-    {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput,
-            "JSONL limits require 0 < record <= batch <= payload capacity and nonzero batch records"));
+    ferrum_types::ObservabilityJournalConfig {
+        queue_capacity: config.queue_capacity,
+        payload_capacity_bytes: config.payload_capacity_bytes,
+        max_record_bytes: config.max_record_bytes,
+        max_batch_bytes: config.max_batch_bytes,
+        max_batch_records: config.max_batch_records,
     }
-    if config.queue_capacity == 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "JSONL journal queue capacity must be greater than zero",
-        ));
-    }
-    if config.buffer_capacity_bytes == 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "JSONL journal buffer capacity must be greater than zero",
+    .validate()
+    .map_err(|error| journal_config_error(error.to_string()))?;
+    if config.buffer_capacity_bytes == 0 || config.buffer_capacity_bytes > isize::MAX as usize {
+        return Err(journal_config_error(
+            "JSONL journal buffer capacity must be nonzero and addressable",
         ));
     }
     if config.flush_interval.is_zero() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
+        return Err(journal_config_error(
             "JSONL journal flush interval must be greater than zero",
         ));
     }
     Ok(())
 }
 
+fn journal_config_error(message: impl Into<String>) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidInput,
+        JsonlJournalError::with_kind(JsonlJournalErrorKind::Config, message),
+    )
+}
+
 fn open_shared_inner(
     path: impl Into<PathBuf>,
     mode: JsonlJournalOpenMode,
-    config: JsonlJournalConfig,
+    explicit_config: Option<JsonlJournalConfig>,
 ) -> io::Result<Arc<JsonlJournalInner>> {
+    let config = explicit_config.unwrap_or_default();
     validate_config(config)?;
     let path = normalize_jsonl_path(&path.into())?;
     if let Some(parent) = path.parent() {
@@ -352,10 +370,23 @@ fn open_shared_inner(
     let mut registry =
         lock_journal_registry(JSONL_JOURNAL_REGISTRY.get_or_init(|| Mutex::new(HashMap::new())))?;
     if let Some(existing) = registry.get(&path).and_then(Weak::upgrade) {
-        if !existing.closed.load(Ordering::Acquire) {
+        let closed = existing.closed.load(Ordering::Acquire);
+        if !closed && explicit_config.is_some_and(|requested| requested != existing.config) {
+            // A transport failure on the existing owner cannot turn a caller's
+            // contradictory explicit configuration into optional telemetry.
+            return Err(journal_config_error(format!(
+                "JSONL journal {} is already open with different explicit limits",
+                path.display()
+            )));
+        }
+        // Append preserves the known failure of a still-owned artifact, even
+        // after close. Only an explicit truncate starts a new closed epoch.
+        if !closed || mode == JsonlJournalOpenMode::Append {
             if let Some(error) = existing.failure.current() {
                 return Err(io::Error::other(error));
             }
+        }
+        if !closed {
             // The first live owner controls the initial truncate/append state.
             // Every later role attaches to the same ordered writer.
             return Ok(existing);
@@ -425,25 +456,23 @@ where
         config: JsonlJournalConfig,
     ) -> io::Result<Self> {
         Ok(Self {
-            inner: open_shared_inner(path, mode, config)?,
+            inner: open_shared_inner(path, mode, Some(config))?,
             marker: PhantomData,
         })
     }
 
     pub fn create(path: impl Into<PathBuf>) -> io::Result<Self> {
-        Self::open(
-            path,
-            JsonlJournalOpenMode::Truncate,
-            JsonlJournalConfig::default(),
-        )
+        Ok(Self {
+            inner: open_shared_inner(path, JsonlJournalOpenMode::Truncate, None)?,
+            marker: PhantomData,
+        })
     }
 
     pub fn append(path: impl Into<PathBuf>) -> io::Result<Self> {
-        Self::open(
-            path,
-            JsonlJournalOpenMode::Append,
-            JsonlJournalConfig::default(),
-        )
+        Ok(Self {
+            inner: open_shared_inner(path, JsonlJournalOpenMode::Append, None)?,
+            marker: PhantomData,
+        })
     }
 
     /// Blocking tool delivery, with original worker-side serialization and no
@@ -514,36 +543,65 @@ pub fn write_jsonl_records<T: Serialize>(
     mode: JsonlJournalOpenMode,
     records: &[T],
 ) -> Result<(), JsonlJournalError> {
+    write_records(path, mode, records, None)
+}
+
+pub fn write_jsonl_records_with_config<T: Serialize>(
+    path: &Path,
+    mode: JsonlJournalOpenMode,
+    records: &[T],
+    config: JsonlJournalConfig,
+) -> Result<(), JsonlJournalError> {
+    write_records(path, mode, records, Some(config))
+}
+
+fn write_records<T: Serialize>(
+    path: &Path,
+    mode: JsonlJournalOpenMode,
+    records: &[T],
+    explicit_config: Option<JsonlJournalConfig>,
+) -> Result<(), JsonlJournalError> {
     if records.is_empty() {
         return Err(JsonlJournalError::with_kind(
             JsonlJournalErrorKind::Encoding,
             format!("JSONL record set for {} must not be empty", path.display()),
         ));
     }
-    let mut encoded = Vec::with_capacity(4096);
-    for record in records {
-        serde_json::to_writer(&mut encoded, record).map_err(|error| {
-            JsonlJournalError::with_kind(
-                JsonlJournalErrorKind::Encoding,
-                format!("serialize JSONL record for {}: {error}", path.display()),
-            )
-        })?;
-        encoded.push(b'\n');
-    }
+    let open_error = |error: io::Error| {
+        error
+            .get_ref()
+            .and_then(|cause| cause.downcast_ref::<JsonlJournalError>())
+            .cloned()
+            .unwrap_or_else(|| {
+                JsonlJournalError::new(format!("open JSONL journal {}: {error}", path.display()))
+            })
+    };
+    let encoded = if let Some(config) = explicit_config {
+        validate_config(config).map_err(open_error)?;
+        delivery::encode_records(records, config)?
+    } else {
+        let mut encoded = Vec::with_capacity(4096);
+        for record in records {
+            serde_json::to_writer(&mut encoded, record).map_err(|error| {
+                JsonlJournalError::with_kind(
+                    JsonlJournalErrorKind::Encoding,
+                    format!("serialize JSONL record for {}: {error}", path.display()),
+                )
+            })?;
+            encoded.push(b'\n');
+        }
+        encoded
+    };
 
-    let inner = open_shared_inner(path.to_path_buf(), mode, JsonlJournalConfig::default())
-        .map_err(|error| {
-            error
-                .get_ref()
-                .and_then(|cause| cause.downcast_ref::<JsonlJournalError>())
-                .cloned()
-                .unwrap_or_else(|| {
-                    JsonlJournalError::new(format!(
-                        "open JSONL journal {}: {error}",
-                        path.display()
-                    ))
-                })
-        })?;
+    let inner = open_shared_inner(path.to_path_buf(), mode, explicit_config).map_err(|error| {
+        error
+            .get_ref()
+            .and_then(|cause| cause.downcast_ref::<JsonlJournalError>())
+            .cloned()
+            .unwrap_or_else(|| {
+                JsonlJournalError::new(format!("open JSONL journal {}: {error}", path.display()))
+            })
+    })?;
     inner.send(JournalCommand::Encoded(encoded))?;
     inner.delivery.record_unbounded(records.len());
     flush_inner(&inner)

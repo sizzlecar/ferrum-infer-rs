@@ -7,6 +7,9 @@ use serde_json::Value;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
+mod journal;
+pub use journal::ObservabilityJournalConfig;
+
 pub const OBSERVABILITY_PROFILE_SCHEMA_VERSION: u32 = 1;
 pub const DEFAULT_OBSERVABILITY_PROFILE_SAMPLE_RATE: f64 = 0.01;
 pub const SYNTHETIC_RUNTIME_PRESET_HASH: &str =
@@ -238,6 +241,8 @@ pub struct FerrumObservabilityConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile_jsonl: Option<PathBuf>,
     pub profile_detail: ObservabilityProfileDetail,
+    #[serde(default)]
+    pub journal: ObservabilityJournalConfig,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory_profile_jsonl: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -264,6 +269,7 @@ impl FerrumObservabilityConfig {
             model: model.into(),
             profile_jsonl,
             profile_detail,
+            journal: ObservabilityJournalConfig::default(),
             memory_profile_jsonl,
             scheduler_trace_jsonl,
             request_dump_dir,
@@ -301,6 +307,7 @@ impl FerrumObservabilityConfig {
     }
 
     pub fn validate(&self) -> std::result::Result<(), String> {
+        self.journal.validate().map_err(|error| error.to_string())?;
         if !self.profile_sample_rate.is_finite()
             || self.profile_sample_rate < 0.0
             || self.profile_sample_rate > 1.0

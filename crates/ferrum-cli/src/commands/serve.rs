@@ -421,6 +421,7 @@ async fn execute_with_compatibility(
     configured_interleaved_system_coalescing: bool,
     prefix_rendezvous_max_wait_ms: Option<std::num::NonZeroU64>,
 ) -> Result<()> {
+    config.profile_journal.validate()?;
     let user_environment = crate::runtime_env::capture_supported_runtime_environment()?;
     let ServeCommand {
         model,
@@ -557,7 +558,8 @@ async fn execute_with_compatibility(
         scheduler_trace_jsonl.as_ref(),
         request_dump_dir.as_ref(),
         profile_sample_rate,
-    );
+    )
+    .with_journal(config.profile_journal)?;
     let memory_sampler = crate::memory_profile::ProcessMemorySampler;
     let product_memory_enabled = product_observability.enabled();
     let process_start_sample = product_memory_enabled
@@ -625,6 +627,7 @@ async fn execute_with_compatibility(
     let source = product_input.source;
     let mut product_engine_config = product_input.engine_config;
     config.apply_output_and_tokenizer_config(&mut product_engine_config)?;
+    config.apply_profile_journal_config(&mut product_engine_config)?;
     product_engine_config.scheduler.slo = scheduler_slo;
     product_engine_config.numerical_execution =
         config.resolve_numerical_execution(numerical_profile.as_ref());
@@ -1164,6 +1167,7 @@ async fn execute_with_compatibility(
             .then(|| profile_jsonl.clone())
             .flatten(),
         profile_detail: product_observability.profile_detail,
+        profile_journal: product_observability.journal,
         memory_profile_jsonl: product_observability
             .unified_product_profile_enabled()
             .then(|| memory_profile_jsonl.clone())

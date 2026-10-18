@@ -203,7 +203,8 @@ async fn infer_with_real_engine(
     );
     let router = AxumServer::from_llm(engine.clone())
         .with_prompt_template(Some(template))
-        .build_router();
+        .build_router()
+        .unwrap();
     wire["model"] = json!("reasoning-contract");
     wire["temperature"] = json!(0);
     wire["max_tokens"] = json!(8);

@@ -74,7 +74,8 @@ async fn injected_lora_alias_cannot_fall_through_to_base_inference() {
     let engine = Arc::new(CapturingLlm::new());
     let router = AxumServer::from_llm(engine.clone())
         .with_served_model_registry(registry())
-        .build_router();
+        .build_router()
+        .unwrap();
     for stream in [false, true] {
         for (path, body) in [
             (

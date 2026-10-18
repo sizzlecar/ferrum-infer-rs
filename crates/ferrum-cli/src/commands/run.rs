@@ -967,6 +967,7 @@ pub struct RunCommand {
 }
 
 pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
+    config.profile_journal.validate()?;
     // Capture user input once, before model selection or device preparation.
     let user_environment = crate::runtime_env::capture_supported_runtime_environment()?;
     let scheduler_slo = config.resolve_scheduler_slo(cmd.scheduler_slo)?;
@@ -993,7 +994,8 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
         cmd.scheduler_trace_jsonl.as_ref(),
         cmd.request_dump_dir.as_ref(),
         cmd.profile_sample_rate,
-    );
+    )
+    .with_journal(config.profile_journal)?;
     let memory_sampler = crate::memory_profile::ProcessMemorySampler;
     let product_memory_enabled = product_observability.enabled();
     let process_start_sample = product_memory_enabled
@@ -1060,6 +1062,7 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
     let source = product_input.source;
     let mut engine_config = product_input.engine_config;
     config.apply_output_and_tokenizer_config(&mut engine_config)?;
+    config.apply_profile_journal_config(&mut engine_config)?;
     engine_config.scheduler.slo = scheduler_slo;
     engine_config.numerical_execution =
         config.resolve_numerical_execution(cmd.numerical_profile.as_ref());

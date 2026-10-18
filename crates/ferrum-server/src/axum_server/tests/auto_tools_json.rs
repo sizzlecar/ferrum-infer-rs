@@ -749,7 +749,8 @@ async fn native_xml_typed_engine_response_projects_only_outside_reasoning() {
             let arguments = response.message.tool_calls[0].function.arguments.clone();
             let router = AxumServer::from_llm(Arc::new(StubLlm::with_api_response(&raw, typed)))
                 .with_prompt_template(Some(template.clone()))
-                .build_router();
+                .build_router()
+                .unwrap();
             let response = post_json(router, Endpoint::Chat.path(), wire).await;
             let (parts, body) = response.into_parts();
             let bytes = to_bytes(body, usize::MAX).await.unwrap();
@@ -960,7 +961,8 @@ async fn run_branch_request(
     );
     let router = AxumServer::from_llm(engine.clone())
         .with_prompt_template(Some(template))
-        .build_router();
+        .build_router()
+        .unwrap();
     wire["model"] = json!("auto-tools-contract");
     wire["temperature"] = json!(0);
     match endpoint {

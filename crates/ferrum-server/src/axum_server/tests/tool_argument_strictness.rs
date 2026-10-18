@@ -379,7 +379,7 @@ async fn non_strict_tool_validation_error_reaches_the_next_model_turn() {
     // resulting error through the server's normal message/template conversion.
     for stream in [false, true] {
         let engine = Arc::new(ToolFeedbackLlm::new());
-        let router = AxumServer::from_llm(engine.clone()).build_router();
+        let router = AxumServer::from_llm(engine.clone()).build_router().unwrap();
         let mut request = tool_request(Some(false), Some(json!("auto")), stream);
         let first = post_json(router.clone(), "/v1/chat/completions", request.clone()).await;
         let call = accepted_tool_call(first, stream).await;

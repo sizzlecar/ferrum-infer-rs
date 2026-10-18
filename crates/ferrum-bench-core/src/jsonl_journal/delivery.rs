@@ -14,6 +14,7 @@ pub enum JsonlJournalErrorKind {
     Worker,
     Panic,
     Encoding,
+    Config,
     Limit,
 }
 
@@ -243,6 +244,43 @@ impl Write for PayloadWriter {
     fn flush(&mut self) -> io::Result<()> {
         Ok(())
     }
+}
+
+/// Borrowed synchronous tool encoding obeys the same record/batch limits.
+/// It does not claim bounded production queue credit or split a batch.
+pub(super) fn encode_records<T: Serialize>(
+    records: &[T],
+    config: JsonlJournalConfig,
+) -> Result<Vec<u8>, JsonlJournalError> {
+    if records.len() > config.max_batch_records {
+        return Err(error(
+            JsonlJournalErrorKind::Limit,
+            "JSONL batch has too many records",
+        ));
+    }
+    let mut writer = PayloadWriter::new(config, Some(config.max_batch_bytes));
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        for record in records {
+            if let Err(cause) = writer.record(record) {
+                return Err(if writer.exceeded {
+                    error(
+                        JsonlJournalErrorKind::Limit,
+                        "JSONL record or batch exceeds its configured payload limit",
+                    )
+                } else {
+                    cause
+                });
+            }
+        }
+        Ok(())
+    }))
+    .map_err(|_| {
+        error(
+            JsonlJournalErrorKind::Panic,
+            "JSONL tool serializer panicked",
+        )
+    })??;
+    Ok(writer.encoded.expect("synchronous encoding owns storage"))
 }
 
 type BoundedEncoder = Box<dyn FnOnce(&mut PayloadWriter) -> Result<(), JsonlJournalError> + Send>;

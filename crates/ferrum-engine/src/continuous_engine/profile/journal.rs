@@ -23,8 +23,16 @@ pub(in crate::continuous_engine) struct SchedulerTraceJournal {
 }
 
 impl SchedulerTraceJournal {
-    pub(in crate::continuous_engine) fn create(path: impl Into<PathBuf>) -> std::io::Result<Self> {
-        JsonlJournal::create(path).map(|inner| Self {
+    pub(in crate::continuous_engine) fn create(
+        path: impl Into<PathBuf>,
+        config: ferrum_types::ObservabilityJournalConfig,
+    ) -> std::io::Result<Self> {
+        JsonlJournal::open(
+            path,
+            ferrum_bench_core::JsonlJournalOpenMode::Truncate,
+            config.into(),
+        )
+        .map(|inner| Self {
             inner,
             warned: Arc::new(AtomicBool::new(false)),
         })
@@ -73,6 +81,7 @@ impl SchedulerTraceJournal {
                     JsonlJournalErrorKind::Worker => "worker",
                     JsonlJournalErrorKind::Panic => "panic",
                     JsonlJournalErrorKind::Encoding => "encoding",
+                    JsonlJournalErrorKind::Config => "config",
                     JsonlJournalErrorKind::Limit => "limit",
                 };
                 counter!("ferrum.engine.journal_delivery_failures_total", "reason" => reason)
@@ -107,9 +116,9 @@ pub(in crate::continuous_engine) fn journal_observation_error(
     error: JsonlJournalError,
 ) -> ExecutionEventSinkError {
     match error.kind() {
-        JsonlJournalErrorKind::Encoding | JsonlJournalErrorKind::Panic => {
-            ExecutionEventSinkError::contract(error.to_string())
-        }
+        JsonlJournalErrorKind::Encoding
+        | JsonlJournalErrorKind::Panic
+        | JsonlJournalErrorKind::Config => ExecutionEventSinkError::contract(error.to_string()),
         _ => ExecutionEventSinkError::transport(error.to_string()),
     }
 }

@@ -62,7 +62,11 @@ use uuid::Uuid;
 
 mod chat_stream;
 mod output;
+mod profile_delivery;
 mod responses;
+
+use profile_delivery::HttpProfileDelivery;
+pub use profile_delivery::{HttpProfileDeliveryReport, HttpProfileJournalReport};
 
 const DEFAULT_SAMPLING_TEMPERATURE: f32 = 0.0;
 const DEFAULT_SAMPLING_TOP_P: f32 = 1.0;
@@ -166,6 +170,7 @@ struct AxumServerLifecycle {
     shutdown_notify: Notify,
     stopped_notify: Notify,
     stop_lock: tokio::sync::Mutex<()>,
+    profile_delivery: Mutex<Option<Arc<HttpProfileDelivery>>>,
 }
 
 impl AxumServerLifecycle {
@@ -294,8 +299,9 @@ impl AxumServer {
 
     /// Build the router with all routes
     #[allow(dead_code)]
-    fn build_router(&self) -> Router {
-        self.build_router_with_state(self.state.clone())
+    fn build_router(&self) -> ferrum_types::Result<Router> {
+        let state = self.prepare_profile_state(self.state.clone())?;
+        Ok(self.build_router_with_state(state))
     }
 
     fn build_router_with_state(&self, app_state: AppState) -> Router {
@@ -331,8 +337,10 @@ pub struct AppState {
     pub request_dump_dir: Option<Arc<PathBuf>>,
     pub profile_jsonl: Option<Arc<PathBuf>>,
     pub profile_detail: ferrum_types::ObservabilityProfileDetail,
+    pub profile_journal: ferrum_types::ObservabilityJournalConfig,
     pub memory_profile_jsonl: Option<Arc<PathBuf>>,
     pub first_request_memory_recorded: Arc<AtomicBool>,
+    profile_delivery: Option<Arc<HttpProfileDelivery>>,
     cache: Arc<CacheRuntimeState>,
 }
 
@@ -402,6 +410,7 @@ impl AppState {
 
     pub fn with_profile_jsonl(mut self, profile_jsonl: Option<PathBuf>) -> Self {
         self.profile_jsonl = profile_jsonl.map(Arc::new);
+        self.profile_delivery = None;
         self
     }
 
@@ -410,11 +419,22 @@ impl AppState {
         profile_detail: ferrum_types::ObservabilityProfileDetail,
     ) -> Self {
         self.profile_detail = profile_detail;
+        self.profile_delivery = None;
+        self
+    }
+
+    pub fn with_profile_journal(
+        mut self,
+        config: ferrum_types::ObservabilityJournalConfig,
+    ) -> Self {
+        self.profile_journal = config;
+        self.profile_delivery = None;
         self
     }
 
     pub fn with_memory_profile_jsonl(mut self, memory_profile_jsonl: Option<PathBuf>) -> Self {
         self.memory_profile_jsonl = memory_profile_jsonl.map(Arc::new);
+        self.profile_delivery = None;
         self
     }
 
@@ -1044,14 +1064,16 @@ impl HttpServer for AxumServer {
         let addr = format!("{}:{}", config.host, config.port);
         info!("Starting Axum server on {}", addr);
 
-        let app = self.build_router_with_state(
+        let state = self.prepare_profile_state(
             self.state
                 .clone()
                 .with_request_dump_dir(config.request_dump_dir.clone())
                 .with_profile_jsonl(config.profile_jsonl.clone())
                 .with_profile_detail(config.profile_detail)
+                .with_profile_journal(config.profile_journal.clone())
                 .with_memory_profile_jsonl(config.memory_profile_jsonl.clone()),
-        );
+        )?;
+        let app = self.build_router_with_state(state);
         let listener = tokio::net::TcpListener::bind(&addr)
             .await
             .map_err(|e| Error::internal(format!("Failed to bind to {}: {}", addr, e)))?;
@@ -1093,6 +1115,10 @@ impl HttpServer for AxumServer {
                         .store(true, Ordering::Release);
                 }
                 Ok(Err(error)) => {
+                    // The generic lifecycle Result does not prove producers
+                    // stopped on error (cleanup may have panicked). Retain the
+                    // original journal even for indistinguishable strict-only
+                    // failures until a typed producer-finish contract exists.
                     if first_error.is_none() {
                         first_error = Some(error);
                     }
@@ -1108,6 +1134,27 @@ impl HttpServer for AxumServer {
             }
         }
 
+        // Closing a shared writer while either producer is still live would
+        // turn a drain timeout into lost evidence. Keep the original owner for
+        // a later stop instead. A cancelled close await retains its same job.
+        if !self.lifecycle.running.load(Ordering::Acquire)
+            && self.lifecycle.engines_stopped.load(Ordering::Acquire)
+        {
+            match tokio::time::timeout(timeout, self.close_profile_delivery()).await {
+                Ok(Err(error)) => {
+                    first_error.get_or_insert(error);
+                }
+                Err(_) => {
+                    first_error.get_or_insert_with(|| {
+                        Error::internal(format!(
+                            "HTTP profile journal close did not finish within {} ms",
+                            timeout.as_millis()
+                        ))
+                    });
+                }
+                Ok(Ok(())) => {}
+            }
+        }
         first_error.map_or(Ok(()), Err)
     }
 
@@ -1155,7 +1202,11 @@ impl HttpServer for AxumServer {
     }
 
     async fn health_check(&self) -> HealthStatus {
-        HealthStatus::Healthy
+        match self.profile_delivery_report() {
+            Some(report) if report.required_error.is_some() => HealthStatus::Unhealthy,
+            Some(report) if report.is_degraded() => HealthStatus::Degraded,
+            _ => HealthStatus::Healthy,
+        }
     }
 }
 
@@ -1565,9 +1616,9 @@ fn write_chat_request_profile_event(
     finish_reason: Option<&str>,
     error: Option<ProfileError>,
 ) -> std::result::Result<(), String> {
-    let Some(path) = state.profile_jsonl.as_ref() else {
+    if state.profile_jsonl.is_none() {
         return Ok(());
-    };
+    }
     let timestamp = chrono::Utc::now();
     let status = if error.is_some() {
         ProfileStatus::Failure
@@ -1738,7 +1789,7 @@ fn write_chat_request_profile_event(
         backend_detail: None,
         attributes,
     };
-    append_profile_event(path.as_path(), &event)
+    append_profile_event(state, event, false)
 }
 
 fn maybe_write_first_request_memory_stage(
@@ -1846,13 +1897,7 @@ fn maybe_write_first_request_memory_stage(
         backend_detail: None,
         attributes,
     };
-    if let Some(path) = &state.profile_jsonl {
-        append_profile_event(path.as_path(), &event)?;
-    }
-    if let Some(path) = &state.memory_profile_jsonl {
-        append_profile_event(path.as_path(), &event)?;
-    }
-    Ok(())
+    append_profile_event(state, event, true)
 }
 
 fn request_memory_sample_before(state: &AppState) -> Option<ProcessMemorySample> {
@@ -1862,16 +1907,16 @@ fn request_memory_sample_before(state: &AppState) -> Option<ProcessMemorySample>
 }
 
 fn append_profile_event(
-    path: &Path,
-    event: &FerrumProfileEvent,
+    state: &AppState,
+    event: FerrumProfileEvent,
+    include_memory: bool,
 ) -> std::result::Result<(), String> {
-    event.validate().map_err(|err| err.to_string())?;
-    ferrum_bench_core::write_jsonl_records(
-        path,
-        ferrum_bench_core::JsonlJournalOpenMode::Append,
-        std::slice::from_ref(event),
-    )
-    .map_err(|error| error.to_string())
+    state
+        .profile_delivery
+        .as_ref()
+        .ok_or_else(|| "HTTP profile delivery was not prepared before publication".to_string())?
+        .enqueue(event, include_memory)
+        .map_err(|error| error.to_string())
 }
 
 fn elapsed_us_since(started_at: Instant) -> u64 {
@@ -4731,8 +4776,20 @@ async fn health_handler(
         runtime_admission_error.as_deref(),
     );
 
+    let profile_report = state
+        .profile_delivery
+        .as_ref()
+        .map(|delivery| delivery.report());
+    let profile_failed = profile_report
+        .as_ref()
+        .is_some_and(|report| report.required_error.is_some());
+    let profile_degraded = profile_report
+        .as_ref()
+        .is_some_and(HttpProfileDeliveryReport::is_degraded);
     let health = serde_json::json!({
-        "status": if runtime_admission_error.is_some() { "unhealthy" } else { "healthy" },
+        "status": if runtime_admission_error.is_some() || profile_failed { "unhealthy" }
+            else if profile_degraded { "degraded" } else { "healthy" },
+        "profile_delivery": profile_report.as_ref().map(HttpProfileDeliveryReport::health_json),
         "reasoning_protocol": state.prompt_template.as_deref().map(ModelChatTemplate::reasoning_capability).unwrap_or_default(),
         "timestamp": chrono::Utc::now().to_rfc3339(),
         "version": env!("CARGO_PKG_VERSION"),
@@ -4981,6 +5038,7 @@ mod tests {
     mod lora_execution_support;
     mod model_reasoning_metadata;
     mod native_tool_stream;
+    mod profile_delivery_tests;
     mod reasoning_controls;
     mod retired_routes;
     mod semantic_output;
@@ -5789,13 +5847,16 @@ mod tests {
     }
 
     fn router_with_stub(text: &str) -> Router {
-        AxumServer::from_llm(Arc::new(StubLlm::new(text))).build_router()
+        AxumServer::from_llm(Arc::new(StubLlm::new(text)))
+            .build_router()
+            .unwrap()
     }
 
     fn router_with_stub_and_template(text: &str, template: ModelChatTemplate) -> Router {
         AxumServer::from_llm(Arc::new(StubLlm::new(text)))
             .with_prompt_template(Some(template))
             .build_router()
+            .unwrap()
     }
 
     fn router_with_stub_and_request_dump_dir(text: &str, request_dump_dir: PathBuf) -> Router {
@@ -5805,6 +5866,7 @@ mod tests {
                 .with_request_dump_dir(Some(request_dump_dir)),
         )
         .build_router()
+        .unwrap()
     }
 
     fn router_with_stub_request_dump_and_profile(
@@ -5820,10 +5882,13 @@ mod tests {
                 .with_profile_jsonl(Some(profile_jsonl)),
         )
         .build_router()
+        .unwrap()
     }
 
     fn router_with_stub_stream_chunks(chunks: &[&str]) -> Router {
-        AxumServer::from_llm(Arc::new(StubLlm::with_stream_chunks(chunks))).build_router()
+        AxumServer::from_llm(Arc::new(StubLlm::with_stream_chunks(chunks)))
+            .build_router()
+            .unwrap()
     }
 
     fn router_with_stub_finish_reason(text: &str, finish_reason: FinishReason) -> Router {
@@ -5832,6 +5897,7 @@ mod tests {
             ..StubLlm::new(text)
         }))
         .build_router()
+        .unwrap()
     }
 
     fn router_with_stub_stream_chunks_and_request_dump_dir(
@@ -5844,6 +5910,7 @@ mod tests {
                 .with_request_dump_dir(Some(request_dump_dir)),
         )
         .build_router()
+        .unwrap()
     }
 
     fn router_with_stub_stream_request_dump_and_profile(
@@ -5859,11 +5926,13 @@ mod tests {
                 .with_profile_jsonl(Some(profile_jsonl)),
         )
         .build_router()
+        .unwrap()
     }
 
     fn router_with_stub_separate_final_stream_chunk(chunks: &[&str]) -> Router {
         AxumServer::from_llm(Arc::new(StubLlm::with_separate_final_stream_chunk(chunks)))
             .build_router()
+            .unwrap()
     }
 
     fn router_with_stub_api_response(
@@ -5872,6 +5941,7 @@ mod tests {
     ) -> Router {
         AxumServer::from_llm(Arc::new(StubLlm::with_api_response(text, api_response)))
             .build_router()
+            .unwrap()
     }
 
     fn router_with_stub_api_response_and_finish_reason(
@@ -5885,6 +5955,7 @@ mod tests {
             finish_reason,
         )))
         .build_router()
+        .unwrap()
     }
 
     fn weather_tool_api_response() -> ferrum_types::ApiResponse {
@@ -5970,15 +6041,21 @@ mod tests {
     }
 
     fn router_with_stub_without_stream_usage(text: &str) -> Router {
-        AxumServer::from_llm(Arc::new(StubLlm::without_stream_usage(text))).build_router()
+        AxumServer::from_llm(Arc::new(StubLlm::without_stream_usage(text)))
+            .build_router()
+            .unwrap()
     }
 
     fn router_without_llm() -> Router {
-        AxumServer::from_state(AppState::default()).build_router()
+        AxumServer::from_state(AppState::default())
+            .build_router()
+            .unwrap()
     }
 
     fn router_with_failing_llm() -> Router {
-        AxumServer::from_llm(Arc::new(FailingLlm::new())).build_router()
+        AxumServer::from_llm(Arc::new(FailingLlm::new()))
+            .build_router()
+            .unwrap()
     }
 
     fn router_with_failing_llm_and_request_dump_dir(request_dump_dir: PathBuf) -> Router {
@@ -5988,6 +6065,7 @@ mod tests {
                 .with_request_dump_dir(Some(request_dump_dir)),
         )
         .build_router()
+        .unwrap()
     }
 
     fn router_with_failing_llm_request_dump_and_profile(
@@ -6002,6 +6080,7 @@ mod tests {
                 .with_profile_jsonl(Some(profile_jsonl)),
         )
         .build_router()
+        .unwrap()
     }
 
     fn router_with_resource_exhausted_llm_and_request_dump_dir(
@@ -6013,10 +6092,13 @@ mod tests {
                 .with_request_dump_dir(Some(request_dump_dir)),
         )
         .build_router()
+        .unwrap()
     }
 
     fn router_with_stream_chunk_failing_llm() -> Router {
-        AxumServer::from_llm(Arc::new(FailingLlm::after_stream_start())).build_router()
+        AxumServer::from_llm(Arc::new(FailingLlm::after_stream_start()))
+            .build_router()
+            .unwrap()
     }
 
     fn router_with_stream_chunk_failing_llm_and_request_dump_dir(
@@ -6028,6 +6110,7 @@ mod tests {
                 .with_request_dump_dir(Some(request_dump_dir)),
         )
         .build_router()
+        .unwrap()
     }
 
     fn router_with_capturing_llm() -> (Router, Arc<CapturingLlm>) {
@@ -6045,7 +6128,8 @@ mod tests {
         .unwrap();
         let router = AxumServer::from_llm(engine.clone())
             .with_served_model_registry(registry)
-            .build_router();
+            .build_router()
+            .unwrap();
         (router, engine)
     }
 
@@ -6091,6 +6175,10 @@ mod tests {
     }
 
     fn read_profile_events(path: &Path) -> Vec<Value> {
+        ferrum_bench_core::JsonlJournal::<Value>::append(path)
+            .expect("attach original profile journal for artifact barrier")
+            .flush()
+            .expect("flush original profile journal");
         let text = fs::read_to_string(path)
             .unwrap_or_else(|err| panic!("failed to read {}: {}", path.display(), err));
         text.lines()
@@ -6222,7 +6310,8 @@ mod tests {
             .with_served_model_registry(registry)
             .with_prompt_template(Some(template))
             .with_default_enable_thinking(default_enable_thinking)
-            .build_router();
+            .build_router()
+            .unwrap();
         (router, engine)
     }
 
@@ -6305,7 +6394,8 @@ mod tests {
                 )],
             )
             .unwrap()
-            .build_router();
+            .build_router()
+            .unwrap();
         (router, engine)
     }
 
@@ -6787,7 +6877,8 @@ mod tests {
                 .with_prompt_template(Some(template))
                 .with_interleaved_system_coalescing(false),
         )
-        .build_router();
+        .build_router()
+        .unwrap();
         let response = post_json(
             router,
             "/v1/responses",
@@ -6863,7 +6954,8 @@ mod tests {
                 .with_prompt_template(Some(template()))
                 .with_interleaved_system_coalescing(false),
         )
-        .build_router();
+        .build_router()
+        .unwrap();
         let disabled = post_json(disabled_router, "/v1/chat/completions", request()).await;
         assert_eq!(disabled.status(), AxumStatusCode::BAD_REQUEST);
         let body = response_json(disabled).await;
@@ -7472,7 +7564,8 @@ mod tests {
             )],
         )
         .unwrap()
-        .build_router();
+        .build_router()
+        .unwrap();
         let response = get(router, "/health").await;
         assert_eq!(response.status(), AxumStatusCode::OK);
         let body = response_json(response).await;
@@ -7503,7 +7596,7 @@ mod tests {
                 "fallback_counts": {"silent": 0, "dense": 0, "legacy": 0}
             }),
         )))
-        .build_router();
+        .build_router().unwrap();
         let response = get(router, "/health").await;
         assert_eq!(response.status(), AxumStatusCode::OK);
         let body = response_json(response).await;
@@ -7552,7 +7645,8 @@ mod tests {
         .unwrap();
         let router = AxumServer::from_llm(engine.clone())
             .with_served_model_registry(registry)
-            .build_router();
+            .build_router()
+            .unwrap();
         let response = post_json(
             router,
             "/v1/chat/completions",
@@ -7581,7 +7675,8 @@ mod tests {
         .unwrap();
         let router = AxumServer::from_llm(Arc::new(CapturingLlm::new()))
             .with_served_model_registry(registry)
-            .build_router();
+            .build_router()
+            .unwrap();
         let body = response_json(get(router, "/v1/models").await).await;
         let ids = body["data"]
             .as_array()
@@ -7620,7 +7715,8 @@ mod tests {
         .unwrap();
         let router = AxumServer::from_llm(Arc::new(engine))
             .with_served_model_registry(registry)
-            .build_router();
+            .build_router()
+            .unwrap();
         let body = response_json(get(router, "/v1/models").await).await;
         let entries = body["data"].as_array().unwrap();
         assert_eq!(entries.len(), 3);
@@ -7643,7 +7739,8 @@ mod tests {
             )],
         )
         .unwrap()
-        .build_router();
+        .build_router()
+        .unwrap();
         let response = get(router, "/v1/models").await;
         assert_eq!(response.status(), AxumStatusCode::OK);
         let body = response_json(response).await;
@@ -7735,7 +7832,7 @@ mod tests {
     #[tokio::test]
     async fn route_chat_unknown_served_model_returns_openai_model_error() {
         let engine = Arc::new(CapturingLlm::new());
-        let router = AxumServer::from_llm(engine.clone()).build_router();
+        let router = AxumServer::from_llm(engine.clone()).build_router().unwrap();
         let response = post_json(
             router,
             "/v1/chat/completions",
@@ -8513,7 +8610,8 @@ mod tests {
             AxumServer::from_llm(Arc::new(StubLlm::with_pending_stream(Arc::clone(
                 &stream_dropped,
             ))))
-            .build_router(),
+            .build_router()
+            .unwrap(),
             "/v1/chat/completions",
             required_tool_with_strict_response_format_request(true),
         )
@@ -9204,7 +9302,8 @@ mod tests {
                 request["prompt"] = json!("hello");
             }
             let router = AxumServer::from_llm(Arc::new(StubLlm::with_tokenless_tail(&chunks)))
-                .build_router();
+                .build_router()
+                .unwrap();
             let response = post_json(router, path, request).await;
             assert_eq!(response.status(), AxumStatusCode::OK);
             let body = response_text(response).await;
@@ -9793,7 +9892,7 @@ mod tests {
     #[tokio::test]
     async fn chat_request_forbids_initial_think_close_token() {
         let engine = Arc::new(CapturingLlm::new());
-        let router = AxumServer::from_llm(engine.clone()).build_router();
+        let router = AxumServer::from_llm(engine.clone()).build_router().unwrap();
         let response = post_json(
             router,
             "/v1/chat/completions",
@@ -10254,7 +10353,8 @@ mod tests {
                 input["model"] = json!("failing-model");
                 input["stream"] = json!(stream);
                 let router = AxumServer::from_llm(Arc::new(FailingLlm::context_length_exceeded()))
-                    .build_router();
+                    .build_router()
+                    .unwrap();
                 let response = post_json(router, path, input).await;
                 assert_eq!(
                     response.status(),
@@ -10541,7 +10641,12 @@ mod tests {
     async fn route_chat_sync_profile_jsonl_is_parseable_under_concurrent_requests() {
         let root = unique_request_dump_dir("chat-sync-profile-concurrent");
         let profile = unique_profile_jsonl("chat-sync-profile-concurrent");
-        let app = router_with_stub_request_dump_and_profile("OK", root.clone(), profile.clone());
+        let server = AxumServer::from_state(
+            state_with_stub("OK")
+                .with_request_dump_dir(Some(root.clone()))
+                .with_profile_jsonl(Some(profile.clone())),
+        );
+        let app = server.build_router().unwrap();
 
         let mut handles = Vec::new();
         for request_index in 0..8 {
@@ -10566,6 +10671,24 @@ mod tests {
             handle.await.expect("concurrent request task");
         }
 
+        server
+            .lifecycle
+            .profile_delivery
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .flush()
+            .unwrap();
+        let report = server.profile_delivery_report().unwrap();
+        let stats = report.journals[0].stats;
+        assert_eq!(
+            stats.accepted + stats.dropped,
+            9,
+            "8 completions and 1 first-request memory observation"
+        );
+        assert_eq!(stats.failed, 0);
+        assert_eq!(stats.accepted, stats.flushed);
         let raw = fs::read_to_string(&profile).expect("profile jsonl");
         let mut completion_events = 0usize;
         for (line_index, line) in raw
@@ -10583,7 +10706,18 @@ mod tests {
                 completion_events += 1;
             }
         }
-        assert_eq!(completion_events, 8);
+        assert_eq!(
+            raw.lines().filter(|line| !line.trim().is_empty()).count() as u64,
+            stats.accepted
+        );
+        assert!(completion_events <= 8);
+        if stats.dropped == 0 {
+            assert_eq!(completion_events, 8);
+        }
+        server
+            .stop(std::time::Duration::from_secs(2))
+            .await
+            .unwrap();
         let _ = fs::remove_dir_all(root);
         let _ = fs::remove_file(profile);
     }
@@ -10724,7 +10858,8 @@ mod tests {
                 .with_profile_detail(ferrum_types::ObservabilityProfileDetail::Latency)
                 .with_profile_jsonl(Some(profile.clone())),
         )
-        .build_router();
+        .build_router()
+        .unwrap();
 
         let response = post_json(
             app,
@@ -10943,7 +11078,9 @@ mod tests {
             output_session: Some(session),
             ..FailingLlm::after_stream_start()
         };
-        let router = AxumServer::from_llm(Arc::new(engine)).build_router();
+        let router = AxumServer::from_llm(Arc::new(engine))
+            .build_router()
+            .unwrap();
         let response = post_json(
             router,
             "/v1/completions",
@@ -11024,7 +11161,8 @@ mod tests {
         .unwrap();
         let router = AxumServer::from_llm(engine.clone())
             .with_served_model_registry(registry)
-            .build_router();
+            .build_router()
+            .unwrap();
         let response = post_json(
             router,
             "/v1/completions",
@@ -12217,7 +12355,8 @@ mod tests {
         ] {
             let router = AxumServer::from_llm(Arc::new(StubLlm::with_stream_chunks(&chunks)))
                 .with_prompt_template(Some(prompt_opened_literal_json_template()))
-                .build_router();
+                .build_router()
+                .unwrap();
             let response = post_json(
                 router,
                 "/v1/chat/completions",
@@ -12565,7 +12704,8 @@ mod tests {
                 };
                 let router = AxumServer::from_llm(Arc::new(engine))
                     .with_prompt_template(Some(harmony_json_template()))
-                    .build_router();
+                    .build_router()
+                    .unwrap();
                 let mut request = harmony_json_request(stream);
                 if finish_reason == FinishReason::Stop {
                     // An explicit stop at the model's terminal removes that

@@ -2271,6 +2271,7 @@ impl ContinuousBatchEngine {
             ?executor_authority,
             "Creating ContinuousBatchEngine (recurrent_state_manager={})", recurrent_state_manager
         );
+        config.runtime.profile_journal.validate()?;
         let runtime_config = ContinuousEngineRuntimeConfig::from_engine_config(&config);
         let observation_health = ObservationHealth::default();
         let open_profile = |path: Option<&Path>| {
@@ -2278,7 +2279,12 @@ impl ContinuousBatchEngine {
                 path,
                 config.runtime.profile_detail,
                 &observation_health,
-                |path| SchedulerTraceJournal::create(path.to_path_buf()),
+                |path| {
+                    SchedulerTraceJournal::create(
+                        path.to_path_buf(),
+                        config.runtime.profile_journal,
+                    )
+                },
             )
         };
         let profile_trace_jsonl = open_profile(runtime_config.profile_jsonl.as_deref())?;
@@ -2287,7 +2293,13 @@ impl ContinuousBatchEngine {
             runtime_config.legacy_scheduler_trace_jsonl.as_deref(),
             config.runtime.profile_detail,
             &observation_health,
-            |path| JsonlJournal::<serde_json::Value>::create(path.to_path_buf()),
+            |path| {
+                JsonlJournal::<serde_json::Value>::open(
+                    path.to_path_buf(),
+                    ferrum_bench_core::JsonlJournalOpenMode::Truncate,
+                    config.runtime.profile_journal.into(),
+                )
+            },
         )?;
         let mut execution_profile_journals = Vec::with_capacity(2);
         if let Some(journal) = profile_trace_jsonl.as_ref() {
