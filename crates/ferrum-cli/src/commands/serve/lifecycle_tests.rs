@@ -141,3 +141,116 @@ fn serve_native_off_profile_assembly_uses_only_native_writer_and_rejects_schedul
     assert!(matches!(journals.result(), Err(FerrumError::Config { .. })));
     assert!(!path.exists());
 }
+
+#[tokio::test]
+async fn serve_lifecycle_real_deadline_keeps_same_cleanup_and_timeout_after_late_success() {
+    actual_shutdown_deadline(false, false).await;
+}
+
+#[tokio::test]
+async fn serve_lifecycle_post_http_cleanup_deadline_preserves_timeout_and_late_failure() {
+    actual_shutdown_deadline(true, true).await;
+}
+
+async fn actual_shutdown_deadline(http_already_drained: bool, late_failure: bool) {
+    use super::lifecycle::ShutdownObservation;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("deadline.jsonl");
+    let mut owner =
+        JsonlJournalOwner::open(&path, JsonlJournalOpenMode::Append, Default::default()).unwrap();
+    let mut scope = owner.producer_scope().unwrap();
+    let producer = scope.producer::<serde_json::Value>();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let finished = Arc::new(AtomicUsize::new(0));
+    let run_calls = calls.clone();
+    let run_finished = finished.clone();
+    let (release, wait) = tokio::sync::oneshot::channel();
+    let mut observer = ServeTaskObserver::spawn(move |_cancel, report| async move {
+        // A zero observation deadline makes the pending-future boundary
+        // deterministic without sleep, while exercising the actual timer.
+        let mut shutdown = ShutdownObservation::new(std::time::Duration::ZERO, report);
+        if http_already_drained {
+            shutdown.wait(std::future::ready(())).await;
+        }
+        let actual = shutdown
+            .wait(async {
+                run_calls.fetch_add(1, Ordering::SeqCst);
+                producer
+                    .try_enqueue(json!({"before_pending_cleanup": true}))
+                    .unwrap();
+                wait.await.unwrap();
+                producer
+                    .try_enqueue(json!({"actual_cleanup_finished": true}))
+                    .unwrap();
+                scope.finish().result().unwrap();
+                run_finished.fetch_add(1, Ordering::SeqCst);
+                if late_failure {
+                    Err(FerrumError::io("controlled late cleanup failure"))
+                } else {
+                    Ok(())
+                }
+            })
+            .await;
+        assert_eq!(
+            actual.is_err(),
+            late_failure,
+            "the original cleanup result is still observed"
+        );
+        shutdown.finish(actual)
+    });
+    let first = observer.result().await.unwrap_err();
+    assert!(first
+        .to_string()
+        .contains("original cleanup remains pending"));
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(finished.load(Ordering::SeqCst), 0);
+    assert!(
+        owner.close().is_err(),
+        "a timeout cannot retire the original producer"
+    );
+    assert!(!owner.delivery_stats().worker_finished);
+    {
+        let second = observer.result();
+        tokio::pin!(second);
+        futures::future::poll_fn(|cx| {
+            use std::future::Future;
+            assert!(second.as_mut().poll(cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+    }
+    release.send(()).unwrap();
+    let terminal = observer.result().await.unwrap_err();
+    assert_eq!(
+        terminal.to_string(),
+        first.to_string(),
+        "actual completion cannot erase the reported timeout"
+    );
+    assert_eq!(
+        observer.join().await.unwrap_err().to_string(),
+        first.to_string()
+    );
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "no replacement cleanup attempt"
+    );
+    assert_eq!(finished.load(Ordering::SeqCst), 1);
+    let receipt = owner.close().unwrap();
+    receipt.result().unwrap();
+    assert!(receipt.worker_joined);
+    let rows: Vec<serde_json::Value> = std::fs::read_to_string(path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(
+        rows,
+        [
+            json!({"before_pending_cleanup": true}),
+            json!({"actual_cleanup_finished": true})
+        ]
+    );
+}

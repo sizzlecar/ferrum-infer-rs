@@ -1977,16 +1977,6 @@ fn push_path_arg(parts: &mut Vec<String>, flag: &str, path: Option<&PathBuf>) {
     }
 }
 
-#[cfg(test)]
-fn write_profile_jsonl(path: &Path, events: &[FerrumProfileEvent]) -> Result<()> {
-    write_profile_events(
-        path,
-        ferrum_bench_core::JsonlJournalOpenMode::Truncate,
-        events,
-        Default::default(),
-    )
-}
-
 fn write_profile_events(
     path: &Path,
     mode: ferrum_bench_core::JsonlJournalOpenMode,
@@ -2626,8 +2616,8 @@ mod tests {
         fs::remove_dir_all(root).ok();
     }
 
-    #[test]
-    fn actual_run_observability_writes_prompt_token_ids() {
+    #[tokio::test]
+    async fn actual_run_observability_writes_prompt_token_ids() {
         let root = std::env::temp_dir().join(format!(
             "ferrum-run-observability-{}",
             Uuid::new_v4().simple()
@@ -2652,7 +2642,9 @@ mod tests {
             ProfileEventKind::Instant,
             Utc::now(),
         );
-        write_profile_jsonl(&root.join("profile.jsonl"), &[native_event]).unwrap();
+        // Seed the earlier event through the original assembly producer. The
+        // product append must preserve it without opening a second writer.
+        journals.write(&[native_event], true, false, false).unwrap();
         write_actual_run_observability(
             &journals,
             &config,
@@ -2721,7 +2713,8 @@ mod tests {
             },
         )
         .unwrap();
-        journals.flush().unwrap();
+        journals.finish().await.unwrap();
+        assert!(journals.is_closed());
         let bundle_dir = root.join("request_dump").join(&request_id);
         let prompt_tokens: serde_json::Value = serde_json::from_str(
             &fs::read_to_string(bundle_dir.join("prompt_token_ids.json")).unwrap(),
@@ -2814,7 +2807,7 @@ mod tests {
             .expect("shutdown stage");
         assert!(first_request_index < shutdown_index);
         assert!(
-            !root.join("scheduler.jsonl").exists(),
+            fs::read(root.join("scheduler.jsonl")).unwrap().is_empty(),
             "the engine owns successful actual-run scheduler lifecycles"
         );
         fs::remove_dir_all(root).ok();

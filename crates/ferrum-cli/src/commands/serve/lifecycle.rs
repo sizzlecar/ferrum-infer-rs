@@ -3,6 +3,63 @@ use ferrum_types::{FerrumError, Result};
 use std::future::Future;
 use tokio::sync::oneshot;
 
+/// A deadline limits observation, never the lifetime of the cleanup future.
+/// All cleanup stages share one deadline, including stages after HTTP drain.
+pub(super) struct ShutdownObservation {
+    timeout: std::time::Duration,
+    deadline: Option<tokio::time::Instant>,
+    report: Option<oneshot::Sender<Result<()>>>,
+    timed_out: Option<FerrumError>,
+}
+
+impl ShutdownObservation {
+    pub(super) fn new(timeout: std::time::Duration, report: oneshot::Sender<Result<()>>) -> Self {
+        Self {
+            timeout,
+            deadline: None,
+            report: Some(report),
+            timed_out: None,
+        }
+    }
+
+    pub(super) async fn wait<F: Future>(&mut self, cleanup: F) -> F::Output {
+        let deadline = *self
+            .deadline
+            .get_or_insert_with(|| tokio::time::Instant::now() + self.timeout);
+        tokio::pin!(cleanup);
+        if self.timed_out.is_none() {
+            match tokio::time::timeout_at(deadline, &mut cleanup).await {
+                Ok(result) => return result,
+                Err(_) => {
+                    let error = FerrumError::internal(format!(
+                        "serve shutdown did not finish within {} ms; original cleanup remains pending",
+                        self.timeout.as_millis()
+                    ));
+                    tracing::warn!(%error, "retaining original serve cleanup custody");
+                    if let Some(report) = self.report.take() {
+                        let _ = report.send(Err(error.clone()));
+                    }
+                    self.timed_out = Some(error);
+                }
+            }
+        }
+        // Re-poll this exact future, not a fresh stop attempt or cleanup task.
+        cleanup.await
+    }
+
+    pub(super) fn finish(self, actual: Result<()>) -> Result<()> {
+        match self.timed_out {
+            Some(timeout) => {
+                if let Err(error) = actual {
+                    tracing::warn!(%error, "serve cleanup later failed after reported timeout");
+                }
+                Err(timeout)
+            }
+            None => actual,
+        }
+    }
+}
+
 pub(super) struct ServeTaskObserver {
     task: tokio::task::JoinHandle<Result<()>>,
     reported: Option<oneshot::Receiver<Result<()>>>,

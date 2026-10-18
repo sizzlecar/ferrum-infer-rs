@@ -172,6 +172,7 @@ struct AxumServerLifecycle {
     shutdown_notify: Notify,
     stopped_notify: Notify,
     stop_lock: tokio::sync::Mutex<()>,
+    profile_detail: Mutex<Option<ferrum_types::ObservabilityProfileDetail>>,
     profile_delivery: Mutex<Option<Arc<HttpProfileDelivery>>>,
     profile_scopes: Mutex<Option<HttpJournalScopes>>,
 }
@@ -183,14 +184,22 @@ impl AxumServerLifecycle {
     }
 
     async fn wait_for_shutdown(&self) {
-        while !self.shutdown_requested.load(Ordering::Acquire) {
-            self.shutdown_notify.notified().await;
+        loop {
+            let notified = self.shutdown_notify.notified();
+            if self.shutdown_requested.load(Ordering::Acquire) {
+                return;
+            }
+            notified.await;
         }
     }
 
     async fn wait_until_stopped(&self) {
-        while self.running.load(Ordering::Acquire) {
-            self.stopped_notify.notified().await;
+        loop {
+            let notified = self.stopped_notify.notified();
+            if !self.running.load(Ordering::Acquire) {
+                return;
+            }
+            notified.await;
         }
     }
 }
@@ -295,6 +304,87 @@ impl AxumServer {
         if let Some(engine) = &self.state.llm {
             if let Err(error) = engine.shutdown().await {
                 first_error = Some(error);
+            }
+        }
+        first_error.map_or(Ok(()), Err)
+    }
+
+    /// Finish the original shutdown without abandoning its waits at a timeout.
+    /// A caller may time out an observation of this future and then continue
+    /// awaiting the same future; no second cleanup task or journal is created.
+    pub async fn finish_stop(&self) -> ferrum_types::Result<()> {
+        self.stop_inner(None).await
+    }
+
+    async fn stop_inner(&self, timeout: Option<std::time::Duration>) -> ferrum_types::Result<()> {
+        let _stop_guard = self.lifecycle.stop_lock.lock().await;
+        info!("Stopping Axum server");
+        self.lifecycle.request_shutdown();
+
+        let mut first_error = None;
+        if self.lifecycle.running.load(Ordering::Acquire) {
+            if let Some(timeout) = timeout {
+                if tokio::time::timeout(timeout, self.lifecycle.wait_until_stopped())
+                    .await
+                    .is_err()
+                {
+                    first_error = Some(Error::internal(format!(
+                        "Axum server did not drain within {} ms",
+                        timeout.as_millis()
+                    )));
+                }
+            } else {
+                self.lifecycle.wait_until_stopped().await;
+            }
+        }
+
+        if !self.lifecycle.engines_stopped.load(Ordering::Acquire) {
+            let result = match timeout {
+                Some(timeout) => {
+                    match tokio::time::timeout(timeout, self.shutdown_loaded_engines()).await {
+                        Ok(result) => result,
+                        Err(_) => Err(Error::internal(format!(
+                            "engine shutdown did not complete within {} ms",
+                            timeout.as_millis()
+                        ))),
+                    }
+                }
+                None => self.shutdown_loaded_engines().await,
+            };
+            match result {
+                Ok(()) => self
+                    .lifecycle
+                    .engines_stopped
+                    .store(true, Ordering::Release),
+                Err(error) => {
+                    if first_error.is_some() {
+                        warn!(%error, "additional engine shutdown failure");
+                    }
+                    first_error.get_or_insert(error);
+                }
+            }
+        }
+
+        // Only drained or never-started HTTP may retire its scopes. An engine
+        // error is independent of this component's publication authority.
+        if !self.lifecycle.running.load(Ordering::Acquire) {
+            let result = match timeout {
+                Some(timeout) => {
+                    match tokio::time::timeout(timeout, self.close_profile_delivery()).await {
+                        Ok(result) => result,
+                        Err(_) => Err(Error::internal(format!(
+                            "HTTP profile journal close did not finish within {} ms",
+                            timeout.as_millis()
+                        ))),
+                    }
+                }
+                None => self.close_profile_delivery().await,
+            };
+            if let Err(error) = result {
+                if first_error.is_some() {
+                    warn!(%error, "additional HTTP profile close failure");
+                }
+                first_error.get_or_insert(error);
             }
         }
         first_error.map_or(Ok(()), Err)
@@ -1049,11 +1139,23 @@ fn trim_messages_to_token_budget(messages: &mut Vec<SessionMessage>, max_tokens:
 #[async_trait]
 impl HttpServer for AxumServer {
     async fn start(&self, config: &ServerConfig) -> ferrum_types::Result<()> {
+        // Publish start before stop can decide HTTP is drained. The guard is
+        // released before profile assembly, bind, and serving: shutdown never
+        // waits for a running task that needs this same lock to make progress.
+        let start_guard = self.lifecycle.stop_lock.lock().await;
         if self.lifecycle.shutdown_requested.load(Ordering::Acquire) {
             return Err(Error::internal(
                 "cannot start Axum server after shutdown was requested",
             ));
         }
+        if self.lifecycle.running.load(Ordering::Acquire) {
+            return Err(Error::internal("Axum server is already running"));
+        }
+        *self
+            .lifecycle
+            .profile_detail
+            .lock()
+            .expect("HTTP selected profile detail") = Some(config.profile_detail);
         self.state.validate_lora_execution_support(
             self.state.served_model_registry.adapter_count() > 0,
         )?;
@@ -1064,6 +1166,7 @@ impl HttpServer for AxumServer {
         let _run_guard = AxumServerRunGuard {
             lifecycle: Arc::clone(&self.lifecycle),
         };
+        drop(start_guard);
         let addr = format!("{}:{}", config.host, config.port);
         info!("Starting Axum server on {}", addr);
 
@@ -1093,69 +1196,7 @@ impl HttpServer for AxumServer {
     }
 
     async fn stop(&self, timeout: std::time::Duration) -> ferrum_types::Result<()> {
-        let _stop_guard = self.lifecycle.stop_lock.lock().await;
-        info!("Stopping Axum server");
-        self.lifecycle.request_shutdown();
-
-        let mut first_error = None;
-        if self.lifecycle.running.load(Ordering::Acquire) {
-            if tokio::time::timeout(timeout, self.lifecycle.wait_until_stopped())
-                .await
-                .is_err()
-            {
-                first_error = Some(Error::internal(format!(
-                    "Axum server did not drain within {} ms",
-                    timeout.as_millis()
-                )));
-            }
-        }
-
-        if !self.lifecycle.engines_stopped.load(Ordering::Acquire) {
-            match tokio::time::timeout(timeout, self.shutdown_loaded_engines()).await {
-                Ok(Ok(())) => {
-                    self.lifecycle
-                        .engines_stopped
-                        .store(true, Ordering::Release);
-                }
-                Ok(Err(error)) => {
-                    // Preserve the execution result. Its independent journal
-                    // scope decides whether final-owner close can proceed;
-                    // a strict evidence error is not a live-producer guess.
-                    if first_error.is_none() {
-                        first_error = Some(error);
-                    }
-                }
-                Err(_) => {
-                    if first_error.is_none() {
-                        first_error = Some(Error::internal(format!(
-                            "engine shutdown did not complete within {} ms",
-                            timeout.as_millis()
-                        )));
-                    }
-                }
-            }
-        }
-
-        // HTTP retirement depends on its own drained producers. Engine errors
-        // do not grant or withhold final-close authority: injected HTTP has no
-        // owner, and standalone final close checks the original live scopes.
-        if !self.lifecycle.running.load(Ordering::Acquire) {
-            match tokio::time::timeout(timeout, self.close_profile_delivery()).await {
-                Ok(Err(error)) => {
-                    first_error.get_or_insert(error);
-                }
-                Err(_) => {
-                    first_error.get_or_insert_with(|| {
-                        Error::internal(format!(
-                            "HTTP profile journal close did not finish within {} ms",
-                            timeout.as_millis()
-                        ))
-                    });
-                }
-                Ok(Ok(())) => {}
-            }
-        }
-        first_error.map_or(Ok(()), Err)
+        self.stop_inner(Some(timeout)).await
     }
 
     fn is_running(&self) -> bool {

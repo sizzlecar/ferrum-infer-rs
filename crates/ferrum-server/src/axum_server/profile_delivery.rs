@@ -193,6 +193,38 @@ pub(super) struct HttpProfileDelivery {
 }
 
 impl HttpProfileDelivery {
+    /// Retain and finish transferred scopes even when startup never reached
+    /// profile assembly. This does not open paths or manufacture HTTP events.
+    fn unprepared(
+        scopes: HttpJournalScopes,
+        detail: ferrum_types::ObservabilityProfileDetail,
+    ) -> Arc<Self> {
+        let mut destinations = Vec::new();
+        let mut failures = Vec::new();
+        for (_, entry) in scopes.entries {
+            match entry {
+                Ok(scope) => destinations.push(Destination {
+                    profile: false,
+                    journal: scope.producer(),
+                    warned: AtomicBool::new(false),
+                    closure: Mutex::new(DestinationClosure { scope, owner: None }),
+                    proof: Mutex::new(DestinationProof::default()),
+                }),
+                Err(error) => failures.push(Failure::open(&error)),
+            }
+        }
+        let delivery = Arc::new(Self {
+            detail,
+            destinations,
+            health: Mutex::new(Health::default()),
+            close: tokio::sync::Mutex::new(CloseOwner::Idle),
+        });
+        for failure in failures {
+            delivery.record_failure(failure);
+        }
+        delivery
+    }
+
     pub(super) fn open(state: &AppState, mut injected: Option<HttpJournalScopes>) -> Arc<Self> {
         let mut destinations = Vec::with_capacity(2);
         let mut failures = Vec::new();
@@ -541,12 +573,34 @@ impl AxumServer {
     }
 
     pub(super) async fn close_profile_delivery(&self) -> ferrum_types::Result<()> {
-        let delivery = self
-            .lifecycle
-            .profile_delivery
-            .lock()
-            .expect("server profile owner")
-            .clone();
+        let delivery = {
+            // Same lock order as prepare_profile_state. start/stop publication
+            // is serialized separately by stop_lock, so an unprepared scope
+            // cannot be retired while a late start takes it for publication.
+            let mut delivery = self
+                .lifecycle
+                .profile_delivery
+                .lock()
+                .expect("server profile owner");
+            if delivery.is_none() {
+                let pending = self
+                    .lifecycle
+                    .profile_scopes
+                    .lock()
+                    .expect("HTTP injected scopes")
+                    .take();
+                if let Some(scopes) = pending {
+                    let detail = self
+                        .lifecycle
+                        .profile_detail
+                        .lock()
+                        .expect("HTTP selected profile detail")
+                        .unwrap_or(self.state.profile_detail);
+                    *delivery = Some(HttpProfileDelivery::unprepared(scopes, detail));
+                }
+            }
+            delivery.clone()
+        };
         match delivery {
             Some(delivery) => delivery.close().await,
             None => Ok(()),

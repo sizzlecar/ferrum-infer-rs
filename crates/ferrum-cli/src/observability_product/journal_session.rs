@@ -78,7 +78,8 @@ impl ProductJournalSession {
         config: &ProductObservabilityConfig,
         engine: &ferrum_types::EngineConfig,
     ) -> Arc<Self> {
-        let mut paths = BTreeMap::<PathBuf, (PathBuf, ProfileOutputRoles)>::new();
+        let mut paths =
+            BTreeMap::<PathBuf, (PathBuf, ProfileOutputRoles, JsonlJournalOpenMode)>::new();
         for (path, role) in [
             (
                 (config.entrypoint == ProfileEntrypoint::Run
@@ -93,9 +94,13 @@ impl ProductJournalSession {
             if let Some(path) = path {
                 let key =
                     ferrum_bench_core::normalize_jsonl_path(path).unwrap_or_else(|_| path.clone());
-                let entry = paths
-                    .entry(key)
-                    .or_insert_with(|| (path.clone(), ProfileOutputRoles::default()));
+                let entry = paths.entry(key).or_insert_with(|| {
+                    (
+                        path.clone(),
+                        ProfileOutputRoles::default(),
+                        JsonlJournalOpenMode::Append,
+                    )
+                });
                 match role {
                     0 => entry.1.profile = true,
                     1 => entry.1.memory = true,
@@ -106,9 +111,19 @@ impl ProductJournalSession {
         for path in ferrum_engine::EngineJournalScopes::configured_paths(engine) {
             let key =
                 ferrum_bench_core::normalize_jsonl_path(&path).unwrap_or_else(|_| path.clone());
+            // Preserve the existing product epoch: an Engine trace starts a
+            // new artifact, while an independent CLI memory log appends. One
+            // canonical route is opened once even when these roles alias.
             paths
                 .entry(key)
-                .or_insert_with(|| (path, ProfileOutputRoles::default()));
+                .and_modify(|entry| entry.2 = JsonlJournalOpenMode::Truncate)
+                .or_insert_with(|| {
+                    (
+                        path,
+                        ProfileOutputRoles::default(),
+                        JsonlJournalOpenMode::Truncate,
+                    )
+                });
         }
         // Legacy backend profiling has a different writer/protocol. It may
         // not share a canonical destination with any typed product journal.
@@ -123,12 +138,8 @@ impl ProductJournalSession {
         }
         let mut roles = BTreeMap::new();
         let mut routes = BTreeMap::new();
-        for (key, (path, role)) in paths {
-            let route = match JsonlJournalOwner::open(
-                path,
-                JsonlJournalOpenMode::Append,
-                config.journal.into(),
-            ) {
+        for (key, (path, role, mode)) in paths {
+            let route = match JsonlJournalOwner::open(path, mode, config.journal.into()) {
                 Ok(owner) => match owner.producer_scope() {
                     Ok(scope) => {
                         let producer = scope.producer();
@@ -380,6 +391,18 @@ impl ProductJournalSession {
             }
         }
         if let Some(error) = incomplete {
+            // The owner and any final receipts remain intact. A previous
+            // Contract stays primary; incomplete cleanup is still visible.
+            if let Some(contract) = self
+                .errors
+                .lock()
+                .expect("product journal errors")
+                .contract
+                .clone()
+            {
+                tracing::warn!(%error, "product journal final cleanup remains incomplete after contract failure");
+                return Err(contract);
+            }
             return Err(error);
         }
         self.result()
@@ -453,6 +476,11 @@ impl ProductEngineLifetime {
             self.journals.is_closed(),
             std::sync::atomic::Ordering::Release,
         );
+        if engine.is_err() {
+            if let Err(error) = &journals {
+                tracing::warn!(%error, "product journal cleanup failed after engine shutdown error");
+            }
+        }
         engine.and(journals)
     }
 }

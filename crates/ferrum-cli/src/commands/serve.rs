@@ -451,7 +451,7 @@ async fn run_serve_lifecycle(
     mut cancellation: tokio::sync::oneshot::Receiver<()>,
     early_result: tokio::sync::oneshot::Sender<Result<()>>,
 ) -> Result<()> {
-    let mut early_result = Some(early_result);
+    let mut shutdown = lifecycle::ShutdownObservation::new(Duration::from_secs(30), early_result);
     config.profile_journal.validate()?;
     let user_environment = crate::runtime_env::capture_supported_runtime_environment()?;
     let ServeCommand {
@@ -1117,15 +1117,15 @@ async fn run_serve_lifecycle(
                 &error,
             );
             if let Some(lifetime) = &engine_lifetime {
-                if let Err(cleanup) = lifetime.finish().await {
+                if let Err(cleanup) = shutdown.wait(lifetime.finish()).await {
                     tracing::warn!(%cleanup, "serve startup cleanup incomplete");
                 }
             } else if let Some(journals) = &product_journals {
-                if let Err(cleanup) = journals.finish().await {
+                if let Err(cleanup) = shutdown.wait(journals.finish()).await {
                     tracing::warn!(%cleanup, "serve startup journals incomplete");
                 }
             }
-            return Err(error);
+            return shutdown.finish(Err(error));
         }
     };
     let journals = product_journals
@@ -1258,47 +1258,32 @@ async fn run_serve_lifecycle(
         let server_config = server_config.clone();
         tokio::spawn(async move { server.start(&server_config).await })
     };
-    let shutdown_timeout = Duration::from_secs(30);
-    let serve_result: Result<()> = tokio::select! {
-        joined = &mut server_task => {
-            let start_result = match joined {
-                Ok(result) => result,
-                Err(error) => Err(FerrumError::internal(format!(
-                    "serve task failed: {error}"
-                ))),
-            };
-            let stop_result = server.stop(shutdown_timeout).await;
-            start_result.and(stop_result)
-        }
+    let already_joined = tokio::select! {
+        joined = &mut server_task => Some(joined),
         _ = async { tokio::select! { _ = serve_shutdown_signal() => {}, _ = &mut cancellation => {} } } => {
             println!();
             println!("{}", "Shutting down...".yellow());
-            let stop_result = server.stop(shutdown_timeout).await;
-            if server.is_running() {
-                if let Some(report) = early_result.take() {
-                    let _ = report.send(Err(stop_result.as_ref().err().cloned().unwrap_or_else(|| FerrumError::internal("HTTP shutdown is still pending"))));
-                }
-            }
-            let start_result = match tokio::time::timeout(shutdown_timeout, &mut server_task).await {
-                Ok(Ok(result)) => result,
-                Ok(Err(error)) => Err(FerrumError::internal(format!(
-                    "serve task failed during shutdown: {error}"
-                ))),
-                Err(_) => {
-                    // Keep observing the same task and original owners. A timeout
-                    // is not evidence that HTTP producers have stopped.
-                    tracing::warn!("serve drain exceeded timeout; retaining original shutdown custody");
-                    if let Some(report) = early_result.take() {
-                        let _ = report.send(Err(FerrumError::internal(format!("serve drain did not finish within {} ms", shutdown_timeout.as_millis()))));
-                    }
-                    let joined = (&mut server_task).await.map_err(|error| FerrumError::internal(format!("serve task failed: {error}")))?;
-                    let retry = server.stop(shutdown_timeout).await;
-                    joined.and(retry)
-                }
-            };
-            stop_result.and(start_result)
+            None
         }
     };
+    let serve_result = shutdown.wait(async {
+        // This one cleanup future owns HTTP drain, Engine shutdown and the
+        // HTTP scope receipt. An observation timeout does not drop or retry it.
+        let stop_result = server.finish_stop().await;
+        let joined = match already_joined {
+            Some(joined) => joined,
+            None => (&mut server_task).await,
+        };
+        let start_result = joined.unwrap_or_else(|error| Err(FerrumError::internal(format!(
+            "serve task failed: {error}"
+        ))));
+        if start_result.is_err() {
+            if let Err(error) = &stop_result {
+                tracing::warn!(%error, "serve cleanup failed after server task failure");
+            }
+        }
+        start_result.and(stop_result)
+    }).await;
 
     // Clean up PID file
     std::fs::remove_file(&pid_file).ok();
@@ -1334,14 +1319,18 @@ async fn run_serve_lifecycle(
     serve_result?;
     Ok(())
     }.await;
-    let cleanup_result = match &engine_lifetime {
-        Some(lifetime) => lifetime.finish().await,
-        None => journals.finish().await,
-    };
+    let cleanup_result = shutdown
+        .wait(async {
+            match &engine_lifetime {
+                Some(lifetime) => lifetime.finish().await,
+                None => journals.finish().await,
+            }
+        })
+        .await;
     if let Err(error) = &cleanup_result {
         tracing::warn!(%error, "serve final cleanup incomplete");
     }
-    execution_result.and(cleanup_result)
+    shutdown.finish(execution_result.and(cleanup_result))
 }
 
 async fn serve_shutdown_signal() {

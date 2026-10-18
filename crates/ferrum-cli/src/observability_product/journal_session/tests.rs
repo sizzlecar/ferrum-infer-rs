@@ -203,3 +203,121 @@ async fn product_journal_run_off_profile_remains_typed_original_owner() {
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0]["phase"], "actual_run_shutdown");
 }
+
+fn memory_event(config: &ProductObservabilityConfig, stage: &str) -> Vec<FerrumProfileEvent> {
+    super::super::actual_memory_stage_events(
+        config,
+        "actual-memory-request",
+        &[ActualMemoryStageObservation::new(
+            stage,
+            stage,
+            None,
+            Some(crate::memory_profile::ProcessMemoryObservation {
+                before_bytes: 1,
+                after_bytes: 2,
+                current_bytes: 2,
+                high_water_bytes: 2,
+                source: "controlled-memory-observation",
+            }),
+        )],
+        Utc::now(),
+    )
+}
+
+#[tokio::test]
+async fn product_journal_epoch_truncates_engine_routes_but_preserves_independent_memory_append() {
+    let directory = tempfile::tempdir().unwrap();
+    let profile = directory.path().join("profile.jsonl");
+    let memory = directory.path().join("memory.jsonl");
+    fs::write(&profile, "{\"old_profile\":true}\n").unwrap();
+    fs::write(&memory, "{\"old_memory\":true}\n").unwrap();
+    let config = ProductObservabilityConfig::new(
+        ProfileEntrypoint::Serve,
+        "epochs",
+        Some(&profile),
+        ProfileDetailArg::Basic,
+        Some(&memory),
+        None,
+        None,
+        1.0,
+    );
+    let mut engine = ferrum_types::EngineConfig::default();
+    engine.runtime.profile_jsonl = Some(directory.path().join(".").join("profile.jsonl"));
+    for stage in ["first_shutdown", "second_shutdown"] {
+        let session = ProductJournalSession::prepare(&config, &engine);
+        session.result().unwrap();
+        assert!(
+            fs::read_to_string(&profile).unwrap().is_empty(),
+            "Engine canonical path starts a fresh epoch"
+        );
+        assert!(fs::read_to_string(&memory).unwrap().contains("old_memory"));
+        session
+            .write(&memory_event(&config, stage), true, true, false)
+            .unwrap();
+        session.finish().await.unwrap();
+        assert!(session.is_closed());
+    }
+    let profile_rows: Vec<Value> = fs::read_to_string(&profile)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(profile_rows.len(), 1);
+    assert_eq!(profile_rows[0]["phase"], "second_shutdown");
+    let memory_rows: Vec<Value> = fs::read_to_string(&memory)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(memory_rows.len(), 3);
+    assert_eq!(memory_rows[0], json!({"old_memory":true}));
+    assert_eq!(memory_rows[1]["phase"], "first_shutdown");
+    assert_eq!(memory_rows[2]["phase"], "second_shutdown");
+}
+
+#[tokio::test]
+async fn product_journal_epoch_alias_truncates_once_before_all_original_scope_records() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("shared.jsonl");
+    fs::write(&path, "{\"old_epoch\":true}\n").unwrap();
+    let config = configuration(&path, ProfileDetailArg::Verify);
+    let mut engine = ferrum_types::EngineConfig::default();
+    engine.runtime.scheduler_trace_jsonl = Some(directory.path().join(".").join("shared.jsonl"));
+    let session = ProductJournalSession::prepare(&config, &engine);
+    session.result().unwrap();
+    assert!(fs::read_to_string(&path).unwrap().is_empty());
+    session
+        .write(&memory_event(&config, "startup"), true, true, false)
+        .unwrap();
+    let mut component = {
+        let routes = session.routes.lock().unwrap();
+        assert_eq!(routes.len(), 1);
+        let Route::Ready(ready) = routes.values().next().unwrap() else {
+            panic!("ready writer")
+        };
+        ready.owner.producer_scope().unwrap()
+    };
+    component
+        .producer::<Value>()
+        .try_enqueue(json!({"actual_component_record":true}))
+        .unwrap();
+    component.finish().result().unwrap();
+    session
+        .write(
+            &memory_event(&config, "actual_serve_shutdown"),
+            true,
+            true,
+            false,
+        )
+        .unwrap();
+    session.finish().await.unwrap();
+    let rows: Vec<Value> = fs::read_to_string(path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(rows.len(), 3);
+    assert_eq!(rows[0]["phase"], "startup");
+    assert_eq!(rows[1], json!({"actual_component_record":true}));
+    assert_eq!(rows[2]["phase"], "actual_serve_shutdown");
+}

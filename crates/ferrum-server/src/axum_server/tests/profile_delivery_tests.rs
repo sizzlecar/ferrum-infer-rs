@@ -430,6 +430,293 @@ async fn http_profile_delivery_retired_scope_is_contract_without_reopening() {
     let _ = fs::remove_file(path);
 }
 
+fn declared_adapter_registry() -> ServedModelRegistry {
+    ServedModelRegistry::try_new(
+        "stub-model",
+        ServedModelKind::Llm,
+        vec!["stub-model".to_owned()],
+        vec![LoraAdapterModel::new(
+            "sql",
+            "stub-model:sql",
+            "/unused-adapter",
+        )],
+    )
+    .unwrap()
+}
+
+#[tokio::test]
+async fn http_profile_delivery_unstarted_and_rejected_start_retire_injected_scopes() {
+    for rejected_start in [false, true] {
+        let path = unique_profile_jsonl("http-profile-unprepared");
+        let invalid = unique_profile_jsonl("http-profile-unprepared-open-failure");
+        let mut journal_owner =
+            JsonlJournalOwner::open(&path, JsonlJournalOpenMode::Append, Default::default())
+                .unwrap();
+        let scope = journal_owner.producer_scope().unwrap();
+        let original = scope.producer::<Value>();
+        original
+            .try_enqueue(json!({"original_scope_record":true}))
+            .unwrap();
+        original.flush().result().unwrap();
+        let before = fs::read(&path).unwrap();
+        assert_eq!(
+            journal_owner.close().unwrap_err().kind(),
+            JsonlJournalErrorKind::Config
+        );
+        let mut scopes = HttpJournalScopes::new(vec![scope]).unwrap();
+        if rejected_start {
+            fs::create_dir(&invalid).unwrap();
+            let error =
+                JsonlJournalOwner::open(&invalid, JsonlJournalOpenMode::Append, Default::default())
+                    .unwrap_err();
+            scopes = scopes.with_open_failure(&invalid, error).unwrap();
+        }
+        let engine = Arc::new(StubLlm::new("OK"));
+        // The rejected start selects Verify in its actual ServerConfig; the
+        // AppState default is Basic and must not downgrade cleanup to optional.
+        let mut server = AxumServer::from_llm(engine.clone()).with_journal_scopes(scopes);
+        if rejected_start {
+            server = server.with_served_model_registry(declared_adapter_registry());
+        }
+        let config = ServerConfig {
+            profile_jsonl: Some(path.clone()),
+            profile_detail: ObservabilityProfileDetail::Verify,
+            ..ServerConfig::default()
+        };
+        if rejected_start {
+            assert!(matches!(
+                server.start(&config).await,
+                Err(Error::Unsupported { .. })
+            ));
+        }
+        assert!(!server.is_running());
+        assert!(server.profile_delivery_report().is_none());
+        let stopped = server.stop(Duration::from_secs(2)).await;
+        if rejected_start {
+            assert!(matches!(stopped, Err(Error::IO { .. })));
+        } else {
+            stopped.unwrap();
+        }
+        let report = server.profile_delivery_report().unwrap();
+        assert!(report.close_attempt_finished);
+        assert_eq!(report.required_error.is_some(), rejected_start);
+        let receipt = report.journals[0].scope_receipt.as_ref().unwrap();
+        receipt.result().unwrap();
+        assert!(receipt.scope_retired && receipt.barrier_observed);
+        assert_eq!(receipt.cut.accepted, 1);
+        assert_eq!(receipt.flushed, 1);
+        assert!(report.journals[0].final_receipt.is_none());
+        // Keep server and the old producer alive. Final ownership must not
+        // depend on their Drop, and a late start cannot open another epoch.
+        let final_receipt = journal_owner.close().unwrap();
+        final_receipt.result().unwrap();
+        assert!(final_receipt.worker_joined);
+        assert!(server.start(&config).await.is_err());
+        assert_eq!(fs::read(&path).unwrap(), before);
+        assert!(original.delivery_stats().worker_finished);
+        assert_eq!(engine.shutdown_count.load(Ordering::Acquire), 1);
+        assert_closed(&server);
+        let _ = fs::remove_file(path);
+        if rejected_start {
+            fs::remove_dir(invalid).unwrap();
+        }
+    }
+}
+
+#[tokio::test]
+async fn http_profile_delivery_unprepared_cancelled_finish_observes_original_barrier() {
+    let path = unique_profile_jsonl("http-profile-unprepared-blocked");
+    let mut journal_owner =
+        JsonlJournalOwner::open(&path, JsonlJournalOpenMode::Append, Default::default()).unwrap();
+    let scope = journal_owner.producer_scope().unwrap();
+    let original = scope.producer::<BlockWriter>();
+    let (entered, waiting) = tokio::sync::oneshot::channel();
+    let (release, resume) = std::sync::mpsc::channel();
+    original
+        .enqueue(BlockWriter {
+            entered: Mutex::new(Some(entered)),
+            resume: Mutex::new(resume),
+        })
+        .unwrap();
+    let engine = Arc::new(StubLlm::new("OK"));
+    let server = AxumServer::from_llm(engine.clone())
+        .with_journal_scopes(HttpJournalScopes::new(vec![scope]).unwrap());
+    let mut release = ReleaseWriter(Some(release));
+    tokio::time::timeout(Duration::from_secs(2), waiting)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        journal_owner.close().unwrap_err().kind(),
+        JsonlJournalErrorKind::Config
+    );
+    {
+        let finish = server.finish_stop();
+        tokio::pin!(finish);
+        assert!(tokio::time::timeout(Duration::from_millis(1), &mut finish)
+            .await
+            .is_err());
+    }
+    let custody = owner(&server);
+    let report = server.profile_delivery_report().unwrap();
+    assert!(!report.close_attempt_finished);
+    assert!(report.journals[0].scope_receipt.is_none());
+    assert!(report.journals[0].final_receipt.is_none());
+    assert!(!original.delivery_stats().worker_finished);
+    release.release();
+    tokio::time::timeout(Duration::from_secs(2), server.finish_stop())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(Arc::ptr_eq(&custody, &owner(&server)));
+    let report = server.profile_delivery_report().unwrap();
+    let receipt = report.journals[0].scope_receipt.as_ref().unwrap();
+    receipt.result().unwrap();
+    assert!(receipt.scope_retired && receipt.barrier_observed);
+    assert_eq!(receipt.cut.unbounded_accepted, 1);
+    assert!(report.journals[0].final_receipt.is_none());
+    let final_receipt = journal_owner.close().unwrap();
+    final_receipt.result().unwrap();
+    assert!(final_receipt.worker_joined);
+    assert_closed(&server);
+    assert_eq!(engine.shutdown_count.load(Ordering::Acquire), 1);
+    assert_eq!(
+        read_profile_events(&path),
+        vec![json!("original writer resumed")]
+    );
+    let _ = fs::remove_file(path);
+}
+
+struct GatedStartLlm {
+    inner: StubLlm,
+    entered: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    resume: Mutex<std::sync::mpsc::Receiver<()>>,
+}
+#[async_trait]
+impl InferenceEngine for GatedStartLlm {
+    async fn status(&self) -> EngineStatus {
+        self.inner.status().await
+    }
+    async fn shutdown(&self) -> ferrum_types::Result<()> {
+        self.inner.shutdown().await
+    }
+    fn config(&self) -> &EngineConfig {
+        self.inner.config()
+    }
+    fn metrics(&self) -> EngineMetrics {
+        self.inner.metrics()
+    }
+    async fn health_check(&self) -> EngineHealthStatus {
+        self.inner.health_check().await
+    }
+}
+#[async_trait]
+impl LlmInferenceEngine for GatedStartLlm {
+    fn adapter_execution_support(&self) -> AdapterExecutionSupport {
+        self.entered
+            .lock()
+            .unwrap()
+            .take()
+            .unwrap()
+            .send(())
+            .unwrap();
+        self.resume
+            .lock()
+            .unwrap()
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap();
+        AdapterExecutionSupport::PerSequenceLora
+    }
+    async fn infer(
+        &self,
+        request: InferenceRequest,
+    ) -> ferrum_types::Result<ferrum_output::InferenceOutput> {
+        self.inner.infer(request).await
+    }
+    async fn infer_stream(
+        &self,
+        request: InferenceRequest,
+    ) -> ferrum_types::Result<ferrum_output::InferenceStream> {
+        self.inner.infer_stream(request).await
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn http_profile_delivery_start_stop_gate_prevents_late_profile_assembly() {
+    let path = unique_profile_jsonl("http-profile-start-stop-gate");
+    let mut journal_owner =
+        JsonlJournalOwner::open(&path, JsonlJournalOpenMode::Append, Default::default()).unwrap();
+    let scope = journal_owner.producer_scope().unwrap();
+    let original = scope.producer::<Value>();
+    original.try_enqueue(json!({"before_start":true})).unwrap();
+    original.flush().result().unwrap();
+    let (entered, waiting) = tokio::sync::oneshot::channel();
+    let (release, resume) = std::sync::mpsc::channel();
+    let engine = Arc::new(GatedStartLlm {
+        inner: StubLlm::new("OK"),
+        entered: Mutex::new(Some(entered)),
+        resume: Mutex::new(resume),
+    });
+    let server = Arc::new(
+        AxumServer::from_llm(engine.clone())
+            .with_served_model_registry(declared_adapter_registry())
+            .with_journal_scopes(HttpJournalScopes::new(vec![scope]).unwrap()),
+    );
+    let mut release = ReleaseWriter(Some(release));
+    let occupied = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let config = ServerConfig {
+        host: "127.0.0.1".to_owned(),
+        port: occupied.local_addr().unwrap().port(),
+        profile_jsonl: Some(path.clone()),
+        ..ServerConfig::default()
+    };
+    let start = {
+        let server = server.clone();
+        tokio::spawn(async move { server.start(&config).await })
+    };
+    tokio::time::timeout(Duration::from_secs(2), waiting)
+        .await
+        .unwrap()
+        .unwrap();
+    let finish = server.finish_stop();
+    tokio::pin!(finish);
+    std::future::poll_fn(|cx| {
+        assert!(std::future::Future::poll(finish.as_mut(), cx).is_pending());
+        std::task::Poll::Ready(())
+    })
+    .await;
+    // The stop cannot pass an already-entered start gate while capability
+    // validation is held. No timing sleep or assumed scheduling is involved.
+    assert!(!server.lifecycle.shutdown_requested.load(Ordering::Acquire));
+    assert_eq!(engine.inner.shutdown_count.load(Ordering::Acquire), 0);
+    release.release();
+    tokio::time::timeout(Duration::from_secs(2), &mut finish)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(tokio::time::timeout(Duration::from_secs(2), start)
+        .await
+        .unwrap()
+        .unwrap()
+        .is_err());
+    assert!(!server.is_running());
+    assert!(
+        server.profile_delivery_report().unwrap().journals[0]
+            .scope_receipt
+            .as_ref()
+            .unwrap()
+            .scope_retired
+    );
+    journal_owner.close().unwrap().result().unwrap();
+    assert_closed(&server);
+    assert_eq!(engine.inner.shutdown_count.load(Ordering::Acquire), 1);
+    assert_eq!(
+        read_profile_events(&path),
+        vec![json!({"before_start":true})]
+    );
+    let _ = fs::remove_file(path);
+}
+
 #[tokio::test]
 async fn http_profile_delivery_canonical_alias_enqueues_memory_once() {
     let path = unique_profile_jsonl("http-profile-alias");

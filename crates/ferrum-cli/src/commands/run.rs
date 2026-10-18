@@ -2024,6 +2024,9 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
     Ok(())
     }.await;
     let cleanup_result = engine.finish().await;
+    if let Err(error) = &cleanup_result {
+        tracing::warn!(%error, "run final cleanup incomplete");
+    }
     execution_result.and(cleanup_result)
 }
 
