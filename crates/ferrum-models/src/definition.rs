@@ -208,7 +208,7 @@ impl ConfigManager {
             };
         let obj = text_merged.as_ref().unwrap_or(obj);
 
-        // Parse common fields (CLIP stores these in text_config/vision_config)
+        // Parse common fields, including nested text configuration.
         let text_cfg = obj.get("text_config");
         let hidden_size = obj
             .get("hidden_size")
@@ -226,7 +226,7 @@ impl ConfigManager {
             .or_else(|| obj.get("ffn_dim").and_then(|v| v.as_u64()))
             .unwrap_or(11008) as usize;
 
-        // CLIP models store vocab_size in text_config, not at top level
+        // Text configuration may declare its own vocabulary size.
         let vocab_size = obj
             .get("vocab_size")
             .and_then(|v| v.as_u64())
@@ -356,6 +356,11 @@ impl ConfigManager {
         // authority when a broad `model_type` label is also present.
         if let Some(architectures) = obj.get("architectures").and_then(|v| v.as_array()) {
             if let Some(arch) = architectures.first().and_then(|v| v.as_str()) {
+                if Architecture::is_retired_task_label(arch) {
+                    return Err(FerrumError::unsupported(format!(
+                        "model architecture {arch} belongs to a retired embedding or speech task"
+                    )));
+                }
                 return Ok(Architecture::from_str(arch));
             }
         }
@@ -363,6 +368,11 @@ impl ConfigManager {
         // Older local fixtures without a concrete class retain their legacy
         // model_type fallback outside the registered product path.
         if let Some(model_type) = obj.get("model_type").and_then(|v| v.as_str()) {
+            if Architecture::is_retired_task_label(model_type) {
+                return Err(FerrumError::unsupported(format!(
+                    "model type {model_type} belongs to a retired embedding or speech task"
+                )));
+            }
             return Ok(Architecture::from_str(model_type));
         }
 
@@ -392,5 +402,48 @@ mod tests {
             manager.detect_architecture(&config).unwrap(),
             Architecture::Llama
         );
+    }
+
+    #[test]
+    fn retired_task_configs_reject_decoder_fallback() {
+        let mut manager = ConfigManager::new();
+        for (architecture, model_type) in [
+            ("BertModel", "bert"),
+            ("BertForMaskedLM", "bert"),
+            ("BertForSequenceClassification", "bert"),
+            ("CLIPModel", "clip"),
+            ("ChineseCLIPModel", "chinese_clip"),
+            ("SiglipModel", "siglip"),
+            ("WhisperForConditionalGeneration", "whisper"),
+            ("Qwen3TTSForConditionalGeneration", "qwen3_tts"),
+        ] {
+            for config in [
+                serde_json::json!({
+                    "architectures": [architecture],
+                    "model_type": "llama",
+                }),
+                serde_json::json!({"model_type": model_type}),
+            ] {
+                let error = manager
+                    .load_from_bytes(&serde_json::to_vec(&config).unwrap())
+                    .expect_err("retired task must fail before decoder field parsing");
+                assert!(matches!(error, FerrumError::Unsupported { .. }));
+            }
+        }
+    }
+
+    #[test]
+    fn retired_task_rejection_preserves_registered_and_text_model_identities() {
+        let manager = ConfigManager::new();
+        for (architecture, expected) in [
+            ("LlamaForCausalLM", Architecture::Llama),
+            ("Gemma3ForConditionalGeneration", Architecture::Gemma3),
+            ("Qwen3MoeForCausalLM", Architecture::Qwen3Moe),
+            // This compatibility parser does not own typed family selection.
+            ("Qwen3_5ForConditionalGeneration", Architecture::Unknown),
+        ] {
+            let config = serde_json::json!({"architectures": [architecture]});
+            assert_eq!(manager.detect_architecture(&config).unwrap(), expected);
+        }
     }
 }

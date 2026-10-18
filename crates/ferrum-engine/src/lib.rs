@@ -48,9 +48,7 @@
 
 pub mod builder;
 pub mod continuous_engine;
-pub mod embedding_engine;
 pub(crate) mod layer_split;
-pub mod modality_stubs;
 pub mod parallel;
 pub mod pipeline;
 mod product_composition;
@@ -59,13 +57,11 @@ pub mod registry;
 pub(crate) mod resource_lifecycle;
 pub mod speculative;
 pub mod tensor_factory;
-pub mod transcription_engine;
-pub mod tts_engine;
 #[cfg(feature = "cuda")]
 pub mod vnext_determinism;
 
 // Re-exports of interfaces
-pub use ferrum_interfaces::engine::{EmbedEngine, LlmInferenceEngine, TranscribeEngine, TtsEngine};
+pub use ferrum_interfaces::engine::LlmInferenceEngine;
 pub use ferrum_interfaces::{
     IncrementalTokenizer, InferenceEngine as InferenceEngineInterface, KvCacheManager,
     ModelExecutor, Sampler, SchedulerInterface as Scheduler, Tokenizer,

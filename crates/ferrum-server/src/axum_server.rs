@@ -16,7 +16,7 @@ use crate::{
 };
 use async_trait::async_trait;
 use axum::{
-    extract::{multipart::MultipartRejection, rejection::JsonRejection, State},
+    extract::{rejection::JsonRejection, State},
     http::{HeaderMap, StatusCode as AxumStatusCode},
     response::{sse::Event, IntoResponse, Response, Sse},
     routing::{get, post},
@@ -26,7 +26,7 @@ use ferrum_bench_core::{
     BenchmarkRequestCorrelation, BENCHMARK_CELL_ID_HEADER, BENCHMARK_PHASE_HEADER,
     BENCHMARK_REPEAT_INDEX_HEADER, BENCHMARK_REQUEST_INDEX_HEADER, BENCHMARK_RUN_ID_HEADER,
 };
-use ferrum_interfaces::engine::{EmbedEngine, LlmInferenceEngine, TranscribeEngine, TtsEngine};
+use ferrum_interfaces::engine::LlmInferenceEngine;
 use ferrum_types::{
     has_unclosed_model_reasoning_block, model_reasoning_markers,
     parse_harmony_response_for_finish_reason, parse_model_reasoning_response,
@@ -149,9 +149,8 @@ pub fn init_prometheus_recorder() {
 
 /// Axum-based server implementation.
 ///
-/// The server is built around [`AppState`], which holds an optional
-/// engine per modality. Handlers fault to 503 when the modality they
-/// need isn't loaded, instead of running stub error logic.
+/// The server is built around [`AppState`], which holds the text inference
+/// engine. Text handlers return 503 when no engine is loaded.
 pub struct AxumServer {
     state: AppState,
     config: ServerConfig,
@@ -219,24 +218,8 @@ impl AxumServer {
         Self::from_state(AppState::default().with_llm(engine))
     }
 
-    /// Convenience constructor for an embedding-only server (`/v1/embeddings`).
-    pub fn from_embed(engine: Arc<dyn EmbedEngine + Send + Sync>) -> Self {
-        Self::from_state(AppState::default().with_embed(engine))
-    }
-
-    /// Convenience constructor for a transcription-only server
-    /// (`/v1/audio/transcriptions`).
-    pub fn from_transcribe(engine: Arc<dyn TranscribeEngine + Send + Sync>) -> Self {
-        Self::from_state(AppState::default().with_transcribe(engine))
-    }
-
-    /// Convenience constructor for a TTS-only server (`/v1/audio/speech`).
-    pub fn from_tts(engine: Arc<dyn TtsEngine + Send + Sync>) -> Self {
-        Self::from_state(AppState::default().with_tts(engine))
-    }
-
     /// Attach the startup auto-configuration decision trace exposed by
-    /// `/health`. Constructors keep this optional so tests and non-LLM
+    /// `/health`. Constructors keep this optional so tests and embedded
     /// deployments can use the server without a model-specific resolver.
     pub fn with_auto_config(mut self, auto_config: ResolvedFerrumConfig) -> Self {
         self.state = self.state.with_auto_config(auto_config);
@@ -303,27 +286,6 @@ impl AxumServer {
                 first_error = Some(error);
             }
         }
-        if let Some(engine) = &self.state.embed {
-            if let Err(error) = engine.shutdown().await {
-                if first_error.is_none() {
-                    first_error = Some(error);
-                }
-            }
-        }
-        if let Some(engine) = &self.state.transcribe {
-            if let Err(error) = engine.shutdown().await {
-                if first_error.is_none() {
-                    first_error = Some(error);
-                }
-            }
-        }
-        if let Some(engine) = &self.state.tts {
-            if let Err(error) = engine.shutdown().await {
-                if first_error.is_none() {
-                    first_error = Some(error);
-                }
-            }
-        }
         first_error.map_or(Ok(()), Err)
     }
 
@@ -339,9 +301,6 @@ impl AxumServer {
             .route("/v1/chat/completions", post(chat_completions_handler))
             .route("/v1/responses", post(responses::responses_handler))
             .route("/v1/completions", post(completions_handler))
-            .route("/v1/embeddings", post(embeddings_handler))
-            .route("/v1/audio/transcriptions", post(transcriptions_handler))
-            .route("/v1/audio/speech", post(speech_handler))
             .route("/v1/models", get(models_handler))
             // Health & observability
             .route("/health", get(health_handler))
@@ -357,15 +316,10 @@ impl AxumServer {
     }
 }
 
-/// Application state shared across handlers — one optional engine per
-/// modality. Handlers reach into the field they need and 503 when it's
-/// not loaded.
+/// Application state shared across text inference and observability handlers.
 #[derive(Clone, Default)]
 pub struct AppState {
     pub llm: Option<Arc<dyn LlmInferenceEngine + Send + Sync>>,
-    pub embed: Option<Arc<dyn EmbedEngine + Send + Sync>>,
-    pub transcribe: Option<Arc<dyn TranscribeEngine + Send + Sync>>,
-    pub tts: Option<Arc<dyn TtsEngine + Send + Sync>>,
     pub auto_config: Option<ResolvedFerrumConfig>,
     pub prompt_template: Option<Arc<ModelChatTemplate>>,
     pub default_enable_thinking: Option<bool>,
@@ -402,37 +356,6 @@ impl AppState {
         self.llm = Some(engine);
         self
     }
-    pub fn with_embed(mut self, engine: Arc<dyn EmbedEngine + Send + Sync>) -> Self {
-        if self.served_model_registry.is_empty() {
-            self.served_model_registry = Arc::new(single_model_registry(
-                engine.config().model.model_id.clone(),
-                ServedModelKind::Embedding,
-            ));
-        }
-        self.embed = Some(engine);
-        self
-    }
-    pub fn with_transcribe(mut self, engine: Arc<dyn TranscribeEngine + Send + Sync>) -> Self {
-        if self.served_model_registry.is_empty() {
-            self.served_model_registry = Arc::new(single_model_registry(
-                engine.config().model.model_id.clone(),
-                ServedModelKind::Transcription,
-            ));
-        }
-        self.transcribe = Some(engine);
-        self
-    }
-    pub fn with_tts(mut self, engine: Arc<dyn TtsEngine + Send + Sync>) -> Self {
-        if self.served_model_registry.is_empty() {
-            self.served_model_registry = Arc::new(single_model_registry(
-                engine.config().model.model_id.clone(),
-                ServedModelKind::Speech,
-            ));
-        }
-        self.tts = Some(engine);
-        self
-    }
-
     pub fn with_auto_config(mut self, auto_config: ResolvedFerrumConfig) -> Self {
         self.auto_config = Some(auto_config);
         self
@@ -481,19 +404,9 @@ impl AppState {
         self
     }
 
-    /// Async aggregated status across whichever modality is loaded.
-    /// In single-modality deployments (current CLI), exactly one is Some.
+    /// Report the loaded text engine status, or an unavailable status.
     async fn status(&self) -> EngineStatus {
         if let Some(e) = &self.llm {
-            return e.status().await;
-        }
-        if let Some(e) = &self.embed {
-            return e.status().await;
-        }
-        if let Some(e) = &self.transcribe {
-            return e.status().await;
-        }
-        if let Some(e) = &self.tts {
             return e.status().await;
         }
         EngineStatus {
@@ -518,15 +431,6 @@ impl AppState {
 
     fn metrics(&self) -> EngineMetrics {
         if let Some(e) = &self.llm {
-            return e.metrics();
-        }
-        if let Some(e) = &self.embed {
-            return e.metrics();
-        }
-        if let Some(e) = &self.transcribe {
-            return e.metrics();
-        }
-        if let Some(e) = &self.tts {
             return e.metrics();
         }
         EngineMetrics {
@@ -4905,7 +4809,6 @@ fn compiled_json_schema_validator(
 fn stream_validation_error_message(error: ServerError) -> String {
     match error {
         ServerError::InternalError(message)
-        | ServerError::NotImplemented(message)
         | ServerError::ServiceUnavailable(message)
         | ServerError::ContextLengthExceeded(message)
         | ServerError::InvalidRequest { message, .. }
@@ -5226,340 +5129,6 @@ fn validate_completion_request(
     Ok(())
 }
 
-/// Embeddings handler — text and image embedding via OpenAI-compatible API.
-async fn embeddings_handler(
-    State(state): State<AppState>,
-    request: std::result::Result<Json<EmbeddingsRequest>, JsonRejection>,
-) -> std::result::Result<Response, ServerError> {
-    let Json(request) = request.map_err(|e| {
-        ServerError::invalid_request(format!("invalid embeddings request: {e}"), None)
-    })?;
-
-    let span = span!(Level::INFO, "embeddings", model = %request.model);
-    let _enter = span.enter();
-
-    validate_embeddings_request(&request)?;
-    resolve_request_model(
-        &state.served_model_registry,
-        &request.model,
-        ServedModelKind::Embedding,
-    )?;
-
-    // Flatten input into individual items
-    let items: Vec<EmbeddingItem> = match request.input {
-        EmbeddingInput::Single(text) => vec![EmbeddingItem {
-            text: Some(text),
-            image: None,
-        }],
-        EmbeddingInput::Batch(texts) => texts
-            .into_iter()
-            .map(|t| EmbeddingItem {
-                text: Some(t),
-                image: None,
-            })
-            .collect(),
-        EmbeddingInput::SingleObject(item) => vec![item],
-        EmbeddingInput::BatchObjects(items) => items,
-    };
-
-    if items.is_empty() {
-        return Err(ServerError::invalid_request(
-            "input must not be empty",
-            Some("input"),
-        ));
-    }
-
-    let mut data = Vec::with_capacity(items.len());
-    let mut total_tokens = 0u32;
-
-    let engine = state.embed.as_ref().ok_or_else(|| {
-        ServerError::NotImplemented("Embed engine not loaded; embeddings unavailable".into())
-    })?;
-    for (idx, item) in items.iter().enumerate() {
-        let embedding = if let Some(ref image) = item.image {
-            engine
-                .embed_image(image)
-                .await
-                .map_err(|e| ServerError::InternalError(format!("embed_image: {e}")))?
-        } else if let Some(ref text) = item.text {
-            total_tokens += text.len() as u32;
-            engine
-                .embed_text(text)
-                .await
-                .map_err(|e| ServerError::InternalError(format!("embed_text: {e}")))?
-        } else {
-            return Err(ServerError::invalid_request(
-                "each input item must have either text or image",
-                Some("input"),
-            ));
-        };
-
-        data.push(EmbeddingData {
-            object: "embedding".to_string(),
-            embedding,
-            index: idx,
-        });
-    }
-
-    let response = EmbeddingsResponse {
-        object: "list".to_string(),
-        data,
-        model: request.model,
-        usage: EmbeddingUsage {
-            prompt_tokens: total_tokens,
-            total_tokens,
-        },
-    };
-
-    Ok(Json(response).into_response())
-}
-
-fn validate_embeddings_request(
-    request: &EmbeddingsRequest,
-) -> std::result::Result<(), ServerError> {
-    if let Some(format) = request.encoding_format.as_deref() {
-        if !format.eq_ignore_ascii_case("float") {
-            return Err(ServerError::unsupported_feature(
-                "only encoding_format=float is supported for embeddings",
-                Some("encoding_format"),
-            ));
-        }
-    }
-    Ok(())
-}
-
-/// Audio transcription handler (OpenAI-compatible multipart form).
-async fn transcriptions_handler(
-    State(state): State<AppState>,
-    multipart: std::result::Result<axum::extract::Multipart, MultipartRejection>,
-) -> std::result::Result<Response, ServerError> {
-    let mut multipart = multipart.map_err(|e| {
-        ServerError::invalid_request(format!("invalid transcriptions request: {e}"), None)
-    })?;
-
-    let span = span!(Level::INFO, "transcription");
-    let _enter = span.enter();
-
-    let mut file_data: Option<Vec<u8>> = None;
-    let mut language: Option<String> = None;
-    let mut response_format: Option<String> = None;
-
-    while let Some(field) = multipart
-        .next_field()
-        .await
-        .map_err(|e| ServerError::invalid_request(format!("multipart: {e}"), None))?
-    {
-        let name = field.name().unwrap_or("").to_string();
-        match name.as_str() {
-            "file" => {
-                file_data = Some(
-                    field
-                        .bytes()
-                        .await
-                        .map_err(|e| {
-                            ServerError::invalid_request(format!("read file: {e}"), Some("file"))
-                        })?
-                        .to_vec(),
-                );
-            }
-            "language" => {
-                language = field.text().await.ok().filter(|s| !s.is_empty());
-            }
-            "response_format" => {
-                response_format = field.text().await.ok().filter(|s| !s.is_empty());
-            }
-            _ => {} // ignore model and other optional multipart fields for now
-        }
-    }
-
-    validate_transcription_response_format(response_format.as_deref())?;
-
-    let data = file_data
-        .ok_or_else(|| ServerError::invalid_request("missing file field", Some("file")))?;
-
-    let engine = state.transcribe.as_ref().ok_or_else(|| {
-        ServerError::NotImplemented("Transcribe engine not loaded; ASR unavailable".into())
-    })?;
-    let text = engine
-        .transcribe_bytes(&data, language.as_deref())
-        .await
-        .map_err(|e| ServerError::InternalError(format!("transcribe: {e}")))?;
-
-    Ok(Json(TranscriptionResponse { text }).into_response())
-}
-
-fn validate_transcription_response_format(
-    response_format: Option<&str>,
-) -> std::result::Result<(), ServerError> {
-    if let Some(format) = response_format {
-        if !format.eq_ignore_ascii_case("json") {
-            return Err(ServerError::unsupported_feature(
-                "only response_format=json is supported for transcriptions",
-                Some("response_format"),
-            ));
-        }
-    }
-    Ok(())
-}
-
-/// TTS speech synthesis handler (OpenAI-compatible /v1/audio/speech)
-async fn speech_handler(
-    State(state): State<AppState>,
-    request: std::result::Result<Json<SpeechRequest>, JsonRejection>,
-) -> std::result::Result<Response, ServerError> {
-    let Json(request) = request
-        .map_err(|e| ServerError::invalid_request(format!("invalid speech request: {e}"), None))?;
-
-    let response_format = speech_output_format(&request)?;
-    resolve_request_model(
-        &state.served_model_registry,
-        &request.model,
-        ServedModelKind::Speech,
-    )?;
-
-    let span = span!(Level::INFO, "speech");
-    let _guard = span.enter();
-
-    let language = if request.language.is_empty() || request.language == "auto" {
-        None
-    } else {
-        Some(request.language.as_str())
-    };
-
-    let chunk_frames = 10usize;
-    let tts = state.tts.as_ref().ok_or_else(|| {
-        ServerError::NotImplemented("TTS engine not loaded; speech unavailable".into())
-    })?;
-    let sample_rate = tts.tts_sample_rate();
-
-    if request.stream {
-        // Streaming: chunked transfer encoding with WAV audio
-        let (tx, rx) =
-            mpsc::unbounded_channel::<std::result::Result<axum::body::Bytes, std::io::Error>>();
-
-        let engine = tts.clone();
-        let text = request.input.clone();
-        let lang = request.language.clone();
-
-        tokio::task::spawn_blocking(move || {
-            let lang_opt = if lang.is_empty() || lang == "auto" {
-                None
-            } else {
-                Some(lang.as_str())
-            };
-            let rt = tokio::runtime::Handle::current();
-
-            match rt.block_on(engine.synthesize_speech(&text, lang_opt, chunk_frames)) {
-                Ok(chunks) => {
-                    for chunk in &chunks {
-                        let audio_bytes = encode_speech_audio(chunk, sample_rate, response_format);
-                        let _ = tx.send(Ok(axum::body::Bytes::from(audio_bytes)));
-                    }
-                }
-                Err(e) => {
-                    error!("TTS error: {e}");
-                }
-            }
-        });
-
-        let stream = tokio_stream::wrappers::UnboundedReceiverStream::new(rx);
-        let body = axum::body::Body::from_stream(stream);
-        Ok(Response::builder()
-            .status(200)
-            .header("content-type", speech_content_type(response_format))
-            .header("transfer-encoding", "chunked")
-            .body(body)
-            .unwrap())
-    } else {
-        // Non-streaming: return complete WAV
-        let chunks = tts
-            .synthesize_speech(&request.input, language, chunk_frames)
-            .await
-            .map_err(|e| ServerError::InternalError(format!("TTS: {e}")))?;
-
-        let all_samples: Vec<f32> = chunks.into_iter().flatten().collect();
-        let audio_bytes = encode_speech_audio(&all_samples, sample_rate, response_format);
-
-        Ok(Response::builder()
-            .status(200)
-            .header("content-type", speech_content_type(response_format))
-            .header("content-length", audio_bytes.len().to_string())
-            .body(axum::body::Body::from(audio_bytes))
-            .unwrap())
-    }
-}
-
-#[derive(Clone, Copy)]
-enum SpeechOutputFormat {
-    Wav,
-    Pcm,
-}
-
-fn speech_output_format(
-    request: &SpeechRequest,
-) -> std::result::Result<SpeechOutputFormat, ServerError> {
-    if request.response_format.eq_ignore_ascii_case("wav") {
-        Ok(SpeechOutputFormat::Wav)
-    } else if request.response_format.eq_ignore_ascii_case("pcm") {
-        Ok(SpeechOutputFormat::Pcm)
-    } else {
-        Err(ServerError::unsupported_feature(
-            "only response_format=wav or response_format=pcm is supported for speech",
-            Some("response_format"),
-        ))
-    }
-}
-
-fn speech_content_type(format: SpeechOutputFormat) -> &'static str {
-    match format {
-        SpeechOutputFormat::Wav => "audio/wav",
-        SpeechOutputFormat::Pcm => "audio/pcm",
-    }
-}
-
-fn encode_speech_audio(samples: &[f32], sample_rate: u32, format: SpeechOutputFormat) -> Vec<u8> {
-    match format {
-        SpeechOutputFormat::Wav => pcm_to_wav_bytes(samples, sample_rate),
-        SpeechOutputFormat::Pcm => pcm_to_s16le_bytes(samples),
-    }
-}
-
-/// Convert PCM f32 samples to WAV bytes (16-bit, mono).
-fn pcm_to_wav_bytes(samples: &[f32], sample_rate: u32) -> Vec<u8> {
-    let num_samples = samples.len();
-    let data_size = num_samples * 2; // 16-bit = 2 bytes per sample
-    let file_size = 44 + data_size;
-
-    let mut buf = Vec::with_capacity(file_size);
-    // RIFF header
-    buf.extend_from_slice(b"RIFF");
-    buf.extend_from_slice(&((file_size - 8) as u32).to_le_bytes());
-    buf.extend_from_slice(b"WAVE");
-    // fmt chunk
-    buf.extend_from_slice(b"fmt ");
-    buf.extend_from_slice(&16u32.to_le_bytes()); // chunk size
-    buf.extend_from_slice(&1u16.to_le_bytes()); // PCM
-    buf.extend_from_slice(&1u16.to_le_bytes()); // mono
-    buf.extend_from_slice(&sample_rate.to_le_bytes());
-    buf.extend_from_slice(&(sample_rate * 2).to_le_bytes()); // byte rate
-    buf.extend_from_slice(&2u16.to_le_bytes()); // block align
-    buf.extend_from_slice(&16u16.to_le_bytes()); // bits per sample
-                                                 // data chunk
-    buf.extend_from_slice(b"data");
-    buf.extend_from_slice(&(data_size as u32).to_le_bytes());
-    buf.extend_from_slice(&pcm_to_s16le_bytes(samples));
-    buf
-}
-
-fn pcm_to_s16le_bytes(samples: &[f32]) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(samples.len() * 2);
-    for &s in samples {
-        let i16_val = (s.clamp(-1.0, 1.0) * 32767.0) as i16;
-        buf.extend_from_slice(&i16_val.to_le_bytes());
-    }
-    buf
-}
-
 async fn models_handler(
     State(state): State<AppState>,
 ) -> std::result::Result<Response, ServerError> {
@@ -5593,10 +5162,7 @@ async fn models_handler(
             object: "model".to_string(),
             created: now,
             owned_by: "ferrum".to_string(),
-            max_model_len: match entry.kind() {
-                ServedModelKind::Llm => state.llm.as_ref().and_then(|llm| llm.context_capacity()),
-                _ => None,
-            },
+            max_model_len: state.llm.as_ref().and_then(|llm| llm.context_capacity()),
             reasoning: if entry.kind() == ServedModelKind::Llm
                 && state
                     .llm
@@ -5781,7 +5347,6 @@ enum ServerError {
     },
     InternalError(String),
     ContextLengthExceeded(String),
-    NotImplemented(String),
     ServiceUnavailable(String),
 }
 
@@ -5828,12 +5393,6 @@ impl IntoResponse for ServerError {
                 AxumStatusCode::INTERNAL_SERVER_ERROR,
                 msg,
                 "internal_server_error",
-                None,
-            ),
-            ServerError::NotImplemented(msg) => (
-                AxumStatusCode::SERVICE_UNAVAILABLE,
-                msg,
-                "service_unavailable_error",
                 None,
             ),
             ServerError::ServiceUnavailable(msg) => (
@@ -5924,6 +5483,7 @@ mod tests {
     mod model_reasoning_metadata;
     mod native_tool_stream;
     mod reasoning_controls;
+    mod retired_routes;
     mod tool_argument_strictness;
     mod tool_length;
     use super::*;
@@ -5933,9 +5493,7 @@ mod tests {
         http::{header, Request},
         response::Response,
     };
-    use ferrum_interfaces::engine::{
-        EmbedEngine, InferenceEngine, LlmInferenceEngine, TranscribeEngine, TtsEngine,
-    };
+    use ferrum_interfaces::engine::{InferenceEngine, LlmInferenceEngine};
     use ferrum_types::{
         has_unclosed_thinking_block, parse_reasoning_response_started_in_think, EngineConfig,
         EngineMetrics, EngineStatus, EngineTokenTimingEvidence, FinishReason,
@@ -6208,42 +5766,6 @@ mod tests {
         }
     }
 
-    struct StubEmbed {
-        config: EngineConfig,
-    }
-
-    impl StubEmbed {
-        fn new() -> Self {
-            let mut config = EngineConfig::default();
-            config.model.model_id = ModelId::new("stub-embed");
-            Self { config }
-        }
-    }
-
-    struct StubTranscribe {
-        config: EngineConfig,
-    }
-
-    impl StubTranscribe {
-        fn new() -> Self {
-            let mut config = EngineConfig::default();
-            config.model.model_id = ModelId::new("stub-transcribe");
-            Self { config }
-        }
-    }
-
-    struct StubTts {
-        config: EngineConfig,
-    }
-
-    impl StubTts {
-        fn new() -> Self {
-            let mut config = EngineConfig::default();
-            config.model.model_id = ModelId::new("stub-tts");
-            Self { config }
-        }
-    }
-
     struct FailingLlm {
         config: EngineConfig,
         fail_after_stream_start: bool,
@@ -6374,180 +5896,6 @@ mod tests {
 
         fn lora_metrics_snapshot(&self) -> Option<Value> {
             self.lora_metrics.clone()
-        }
-    }
-
-    #[async_trait]
-    impl InferenceEngine for StubEmbed {
-        async fn status(&self) -> EngineStatus {
-            EngineStatus {
-                is_ready: true,
-                loaded_models: vec![self.config.model.model_id.clone()],
-                active_requests: 0,
-                queued_requests: 0,
-                memory_usage: MemoryUsage {
-                    total_bytes: 0,
-                    used_bytes: 0,
-                    free_bytes: 0,
-                    gpu_memory_bytes: None,
-                    cpu_memory_bytes: None,
-                    cache_memory_bytes: 0,
-                    utilization_percent: 0.0,
-                },
-                uptime_seconds: 0,
-                last_heartbeat: chrono::Utc::now(),
-                version: "test".to_string(),
-            }
-        }
-
-        async fn shutdown(&self) -> ferrum_types::Result<()> {
-            Ok(())
-        }
-
-        fn config(&self) -> &EngineConfig {
-            &self.config
-        }
-
-        fn metrics(&self) -> EngineMetrics {
-            EngineMetrics::default()
-        }
-
-        async fn health_check(&self) -> EngineHealthStatus {
-            EngineHealthStatus::healthy()
-        }
-    }
-
-    #[async_trait]
-    impl EmbedEngine for StubEmbed {
-        async fn embed_text(&self, text: &str) -> ferrum_types::Result<Vec<f32>> {
-            Ok(vec![text.len() as f32, 1.0, 0.0])
-        }
-
-        async fn embed_image(&self, image: &str) -> ferrum_types::Result<Vec<f32>> {
-            Ok(vec![image.len() as f32, 0.0, 1.0])
-        }
-
-        fn embedding_dim(&self) -> usize {
-            3
-        }
-    }
-
-    #[async_trait]
-    impl InferenceEngine for StubTranscribe {
-        async fn status(&self) -> EngineStatus {
-            EngineStatus {
-                is_ready: true,
-                loaded_models: vec![self.config.model.model_id.clone()],
-                active_requests: 0,
-                queued_requests: 0,
-                memory_usage: MemoryUsage {
-                    total_bytes: 0,
-                    used_bytes: 0,
-                    free_bytes: 0,
-                    gpu_memory_bytes: None,
-                    cpu_memory_bytes: None,
-                    cache_memory_bytes: 0,
-                    utilization_percent: 0.0,
-                },
-                uptime_seconds: 0,
-                last_heartbeat: chrono::Utc::now(),
-                version: "test".to_string(),
-            }
-        }
-
-        async fn shutdown(&self) -> ferrum_types::Result<()> {
-            Ok(())
-        }
-
-        fn config(&self) -> &EngineConfig {
-            &self.config
-        }
-
-        fn metrics(&self) -> EngineMetrics {
-            EngineMetrics::default()
-        }
-
-        async fn health_check(&self) -> EngineHealthStatus {
-            EngineHealthStatus::healthy()
-        }
-    }
-
-    #[async_trait]
-    impl TranscribeEngine for StubTranscribe {
-        async fn transcribe_file(
-            &self,
-            path: &str,
-            language: Option<&str>,
-        ) -> ferrum_types::Result<String> {
-            Ok(format!("file:{path}:{}", language.unwrap_or("auto")))
-        }
-
-        async fn transcribe_bytes(
-            &self,
-            data: &[u8],
-            language: Option<&str>,
-        ) -> ferrum_types::Result<String> {
-            Ok(format!(
-                "bytes:{}:{}",
-                data.len(),
-                language.unwrap_or("auto")
-            ))
-        }
-    }
-
-    #[async_trait]
-    impl InferenceEngine for StubTts {
-        async fn status(&self) -> EngineStatus {
-            EngineStatus {
-                is_ready: true,
-                loaded_models: vec![self.config.model.model_id.clone()],
-                active_requests: 0,
-                queued_requests: 0,
-                memory_usage: MemoryUsage {
-                    total_bytes: 0,
-                    used_bytes: 0,
-                    free_bytes: 0,
-                    gpu_memory_bytes: None,
-                    cpu_memory_bytes: None,
-                    cache_memory_bytes: 0,
-                    utilization_percent: 0.0,
-                },
-                uptime_seconds: 0,
-                last_heartbeat: chrono::Utc::now(),
-                version: "test".to_string(),
-            }
-        }
-
-        async fn shutdown(&self) -> ferrum_types::Result<()> {
-            Ok(())
-        }
-
-        fn config(&self) -> &EngineConfig {
-            &self.config
-        }
-
-        fn metrics(&self) -> EngineMetrics {
-            EngineMetrics::default()
-        }
-
-        async fn health_check(&self) -> EngineHealthStatus {
-            EngineHealthStatus::healthy()
-        }
-    }
-
-    #[async_trait]
-    impl TtsEngine for StubTts {
-        async fn synthesize_speech(
-            &self,
-            _text: &str,
-            _language: Option<&str>,
-            _chunk_frames: usize,
-        ) -> ferrum_types::Result<Vec<Vec<f32>>> {
-            Ok(vec![vec![0.0, 0.5, -0.5]])
-        }
-
-        fn tts_sample_rate(&self) -> u32 {
-            16_000
         }
     }
 
@@ -7374,18 +6722,6 @@ mod tests {
         (router, engine)
     }
 
-    fn router_with_stub_embed() -> Router {
-        AxumServer::from_embed(Arc::new(StubEmbed::new())).build_router()
-    }
-
-    fn router_with_stub_transcribe() -> Router {
-        AxumServer::from_transcribe(Arc::new(StubTranscribe::new())).build_router()
-    }
-
-    fn router_with_stub_tts() -> Router {
-        AxumServer::from_tts(Arc::new(StubTts::new())).build_router()
-    }
-
     async fn post_json(app: Router, path: &str, body: Value) -> Response {
         app.oneshot(
             Request::builder()
@@ -7441,22 +6777,6 @@ mod tests {
         .expect("route response")
     }
 
-    async fn post_multipart(app: Router, path: &str, boundary: &str, body: &str) -> Response {
-        app.oneshot(
-            Request::builder()
-                .method("POST")
-                .uri(path)
-                .header(
-                    header::CONTENT_TYPE,
-                    format!("multipart/form-data; boundary={boundary}"),
-                )
-                .body(Body::from(body.to_string()))
-                .expect("request"),
-        )
-        .await
-        .expect("route response")
-    }
-
     async fn get(app: Router, path: &str) -> Response {
         app.oneshot(
             Request::builder()
@@ -7489,13 +6809,6 @@ mod tests {
             .filter(|data| *data != "[DONE]")
             .map(|data| serde_json::from_str(data).expect("Responses SSE JSON event"))
             .collect()
-    }
-
-    async fn response_bytes(response: Response) -> Vec<u8> {
-        to_bytes(response.into_body(), usize::MAX)
-            .await
-            .expect("body bytes")
-            .to_vec()
     }
 
     async fn error_json(error: ServerError) -> (AxumStatusCode, Value) {
@@ -8694,17 +8007,6 @@ mod tests {
             .unwrap()
             .iter()
             .all(|entry| entry["modalities"] == json!(["text"])));
-    }
-
-    #[tokio::test]
-    async fn route_models_lists_embedding_registry_capabilities() {
-        let body = response_json(get(router_with_stub_embed(), "/v1/models").await).await;
-        let data = body["data"].as_array().unwrap();
-
-        assert_eq!(data.len(), 1);
-        assert_eq!(data[0]["id"], "stub-embed");
-        assert_eq!(data[0]["modalities"], json!(["text", "image"]));
-        assert!(data[0].get("max_model_len").is_none());
     }
 
     #[tokio::test]
@@ -11990,401 +11292,6 @@ mod tests {
         let body = response_json(response).await;
         assert_eq!(body["error"]["type"], "service_unavailable_error");
         assert_eq!(body["error"]["param"], Value::Null);
-    }
-
-    #[tokio::test]
-    async fn route_embeddings_engine_unavailable_maps_to_503() {
-        let response = post_json(
-            router_without_llm(),
-            "/v1/embeddings",
-            json!({
-                "model": "embed-model",
-                "input": "hello"
-            }),
-        )
-        .await;
-        assert_eq!(response.status(), AxumStatusCode::SERVICE_UNAVAILABLE);
-        let body = response_json(response).await;
-        assert_eq!(body["error"]["type"], "service_unavailable_error");
-        assert_eq!(body["error"]["param"], Value::Null);
-    }
-
-    #[tokio::test]
-    async fn route_embeddings_contract_uses_stub_engine() {
-        let response = post_json(
-            router_with_stub_embed(),
-            "/v1/embeddings",
-            json!({
-                "model": "stub-embed",
-                "input": ["hi", "world"],
-                "encoding_format": "float"
-            }),
-        )
-        .await;
-        assert_eq!(response.status(), AxumStatusCode::OK);
-        let body = response_json(response).await;
-        assert_eq!(body["object"], "list");
-        assert_eq!(body["model"], "stub-embed");
-        assert_eq!(body["usage"]["prompt_tokens"], 7);
-        assert_eq!(body["usage"]["total_tokens"], 7);
-
-        let data = body["data"].as_array().expect("embedding data");
-        assert_eq!(data.len(), 2, "body: {body}");
-        assert_eq!(data[0]["object"], "embedding");
-        assert_eq!(data[0]["index"], 0);
-        assert_eq!(data[0]["embedding"].as_array().unwrap().len(), 3);
-        assert_eq!(data[0]["embedding"][0].as_f64().unwrap(), 2.0);
-        assert_eq!(data[1]["index"], 1);
-        assert_eq!(data[1]["embedding"][0].as_f64().unwrap(), 5.0);
-    }
-
-    #[tokio::test]
-    async fn route_embeddings_public_alias_succeeds_and_unknown_alias_is_rejected() {
-        let registry = ServedModelRegistry::try_new(
-            "stub-embed",
-            ServedModelKind::Embedding,
-            vec!["public-embed".to_string()],
-            vec![],
-        )
-        .unwrap();
-        let server =
-            AxumServer::from_embed(Arc::new(StubEmbed::new())).with_served_model_registry(registry);
-        let accepted = post_json(
-            server.build_router(),
-            "/v1/embeddings",
-            json!({"model": "public-embed", "input": "hello"}),
-        )
-        .await;
-        assert_eq!(accepted.status(), AxumStatusCode::OK);
-        assert_eq!(response_json(accepted).await["model"], "public-embed");
-
-        let rejected = post_json(
-            server.build_router(),
-            "/v1/embeddings",
-            json!({"model": "stub-embed", "input": "hello"}),
-        )
-        .await;
-        assert_eq!(rejected.status(), AxumStatusCode::BAD_REQUEST);
-        let body = response_json(rejected).await;
-        assert_eq!(body["error"]["type"], "invalid_request_error");
-        assert_eq!(body["error"]["param"], "model");
-    }
-
-    #[tokio::test]
-    async fn route_embeddings_rejects_unsupported_encoding_format() {
-        let response = post_json(
-            router_with_stub_embed(),
-            "/v1/embeddings",
-            json!({
-                "model": "stub-embed",
-                "input": "hi",
-                "encoding_format": "base64"
-            }),
-        )
-        .await;
-        assert_eq!(response.status(), AxumStatusCode::BAD_REQUEST);
-        let body = response_json(response).await;
-        assert_eq!(body["error"]["type"], "invalid_request_error");
-        assert_eq!(body["error"]["param"], "encoding_format");
-    }
-
-    #[tokio::test]
-    async fn route_embeddings_rejects_empty_input_with_field_param() {
-        let response = post_json(
-            router_with_stub_embed(),
-            "/v1/embeddings",
-            json!({
-                "model": "stub-embed",
-                "input": []
-            }),
-        )
-        .await;
-        assert_eq!(response.status(), AxumStatusCode::BAD_REQUEST);
-        let body = response_json(response).await;
-        assert_eq!(body["error"]["type"], "invalid_request_error");
-        assert_eq!(body["error"]["param"], "input");
-    }
-
-    #[tokio::test]
-    async fn route_embeddings_rejects_empty_item_with_field_param() {
-        let response = post_json(
-            router_with_stub_embed(),
-            "/v1/embeddings",
-            json!({
-                "model": "stub-embed",
-                "input": [{}]
-            }),
-        )
-        .await;
-        assert_eq!(response.status(), AxumStatusCode::BAD_REQUEST);
-        let body = response_json(response).await;
-        assert_eq!(body["error"]["type"], "invalid_request_error");
-        assert_eq!(body["error"]["param"], "input");
-    }
-
-    #[tokio::test]
-    async fn route_embeddings_invalid_json_maps_to_openai_error() {
-        let response = post_raw_json(router_with_stub_embed(), "/v1/embeddings", "{").await;
-        assert_eq!(response.status(), AxumStatusCode::BAD_REQUEST);
-        let body = response_json(response).await;
-        assert_eq!(body["error"]["type"], "invalid_request_error");
-        assert_eq!(body["error"]["param"], Value::Null);
-        assert!(body["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("invalid embeddings request"));
-    }
-
-    #[tokio::test]
-    async fn route_transcriptions_engine_unavailable_maps_to_503() {
-        let boundary = "ferrum-test-boundary";
-        let body = concat!(
-            "--ferrum-test-boundary\r\n",
-            "Content-Disposition: form-data; name=\"file\"; filename=\"audio.wav\"\r\n",
-            "Content-Type: audio/wav\r\n",
-            "\r\n",
-            "RIFFtest\r\n",
-            "--ferrum-test-boundary--\r\n"
-        );
-        let response = post_multipart(
-            router_without_llm(),
-            "/v1/audio/transcriptions",
-            boundary,
-            body,
-        )
-        .await;
-        assert_eq!(response.status(), AxumStatusCode::SERVICE_UNAVAILABLE);
-        let body = response_json(response).await;
-        assert_eq!(body["error"]["type"], "service_unavailable_error");
-        assert_eq!(body["error"]["param"], Value::Null);
-    }
-
-    #[tokio::test]
-    async fn route_transcriptions_contract_uses_stub_engine() {
-        let boundary = "ferrum-test-boundary";
-        let body = concat!(
-            "--ferrum-test-boundary\r\n",
-            "Content-Disposition: form-data; name=\"file\"; filename=\"audio.wav\"\r\n",
-            "Content-Type: audio/wav\r\n",
-            "\r\n",
-            "RIFFtest\r\n",
-            "--ferrum-test-boundary\r\n",
-            "Content-Disposition: form-data; name=\"language\"\r\n",
-            "\r\n",
-            "en\r\n",
-            "--ferrum-test-boundary\r\n",
-            "Content-Disposition: form-data; name=\"response_format\"\r\n",
-            "\r\n",
-            "json\r\n",
-            "--ferrum-test-boundary--\r\n"
-        );
-        let response = post_multipart(
-            router_with_stub_transcribe(),
-            "/v1/audio/transcriptions",
-            boundary,
-            body,
-        )
-        .await;
-        assert_eq!(response.status(), AxumStatusCode::OK);
-        let body = response_json(response).await;
-        assert_eq!(body["text"], "bytes:8:en");
-    }
-
-    #[tokio::test]
-    async fn route_transcriptions_rejects_unsupported_response_format() {
-        let boundary = "ferrum-test-boundary";
-        let body = concat!(
-            "--ferrum-test-boundary\r\n",
-            "Content-Disposition: form-data; name=\"file\"; filename=\"audio.wav\"\r\n",
-            "Content-Type: audio/wav\r\n",
-            "\r\n",
-            "RIFFtest\r\n",
-            "--ferrum-test-boundary\r\n",
-            "Content-Disposition: form-data; name=\"response_format\"\r\n",
-            "\r\n",
-            "text\r\n",
-            "--ferrum-test-boundary--\r\n"
-        );
-        let response = post_multipart(
-            router_with_stub_transcribe(),
-            "/v1/audio/transcriptions",
-            boundary,
-            body,
-        )
-        .await;
-        assert_eq!(response.status(), AxumStatusCode::BAD_REQUEST);
-        let body = response_json(response).await;
-        assert_eq!(body["error"]["type"], "invalid_request_error");
-        assert_eq!(body["error"]["param"], "response_format");
-    }
-
-    #[tokio::test]
-    async fn route_transcriptions_rejects_missing_file_with_field_param() {
-        let boundary = "ferrum-test-boundary";
-        let body = concat!(
-            "--ferrum-test-boundary\r\n",
-            "Content-Disposition: form-data; name=\"language\"\r\n",
-            "\r\n",
-            "en\r\n",
-            "--ferrum-test-boundary--\r\n"
-        );
-        let response = post_multipart(
-            router_with_stub_transcribe(),
-            "/v1/audio/transcriptions",
-            boundary,
-            body,
-        )
-        .await;
-        assert_eq!(response.status(), AxumStatusCode::BAD_REQUEST);
-        let body = response_json(response).await;
-        assert_eq!(body["error"]["type"], "invalid_request_error");
-        assert_eq!(body["error"]["param"], "file");
-    }
-
-    #[tokio::test]
-    async fn route_transcriptions_invalid_multipart_maps_to_openai_error() {
-        let response = post_json(
-            router_with_stub_transcribe(),
-            "/v1/audio/transcriptions",
-            json!({}),
-        )
-        .await;
-        assert_eq!(response.status(), AxumStatusCode::BAD_REQUEST);
-        let body = response_json(response).await;
-        assert_eq!(body["error"]["type"], "invalid_request_error");
-        assert_eq!(body["error"]["param"], Value::Null);
-        assert!(body["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("invalid transcriptions request"));
-    }
-
-    #[tokio::test]
-    async fn route_speech_engine_unavailable_maps_to_503() {
-        let response = post_json(
-            router_without_llm(),
-            "/v1/audio/speech",
-            json!({
-                "model": "tts-model",
-                "input": "hello",
-                "voice": "default"
-            }),
-        )
-        .await;
-        assert_eq!(response.status(), AxumStatusCode::SERVICE_UNAVAILABLE);
-        let body = response_json(response).await;
-        assert_eq!(body["error"]["type"], "service_unavailable_error");
-        assert_eq!(body["error"]["param"], Value::Null);
-    }
-
-    #[tokio::test]
-    async fn route_speech_contract_uses_stub_engine() {
-        let response = post_json(
-            router_with_stub_tts(),
-            "/v1/audio/speech",
-            json!({
-                "model": "stub-tts",
-                "input": "hello",
-                "voice": "default",
-                "response_format": "wav",
-                "language": "english"
-            }),
-        )
-        .await;
-        assert_eq!(response.status(), AxumStatusCode::OK);
-        assert_eq!(
-            response.headers().get(header::CONTENT_TYPE).unwrap(),
-            "audio/wav"
-        );
-        let body = response_bytes(response).await;
-        assert!(body.len() > 44, "WAV should include header and PCM data");
-        assert_eq!(&body[0..4], b"RIFF");
-        assert_eq!(&body[8..12], b"WAVE");
-    }
-
-    #[tokio::test]
-    async fn route_speech_streaming_contract_uses_stub_engine() {
-        let response = post_json(
-            router_with_stub_tts(),
-            "/v1/audio/speech",
-            json!({
-                "model": "stub-tts",
-                "input": "hello",
-                "voice": "default",
-                "response_format": "wav",
-                "stream": true
-            }),
-        )
-        .await;
-        assert_eq!(response.status(), AxumStatusCode::OK);
-        assert_eq!(
-            response.headers().get(header::CONTENT_TYPE).unwrap(),
-            "audio/wav"
-        );
-        assert_eq!(
-            response.headers().get(header::TRANSFER_ENCODING).unwrap(),
-            "chunked"
-        );
-        let body = response_bytes(response).await;
-        assert!(body.len() > 44, "streaming WAV should include audio bytes");
-        assert_eq!(&body[0..4], b"RIFF");
-        assert_eq!(&body[8..12], b"WAVE");
-    }
-
-    #[tokio::test]
-    async fn route_speech_pcm_response_format_returns_raw_pcm() {
-        let response = post_json(
-            router_with_stub_tts(),
-            "/v1/audio/speech",
-            json!({
-                "model": "stub-tts",
-                "input": "hello",
-                "voice": "default",
-                "response_format": "pcm"
-            }),
-        )
-        .await;
-        assert_eq!(response.status(), AxumStatusCode::OK);
-        assert_eq!(
-            response.headers().get(header::CONTENT_TYPE).unwrap(),
-            "audio/pcm"
-        );
-        let body = response_bytes(response).await;
-        assert_eq!(body.len(), 6, "three f32 samples should encode as s16le");
-        assert_eq!(&body[0..2], &[0, 0]);
-        assert_ne!(&body[0..4], b"RIFF");
-    }
-
-    #[tokio::test]
-    async fn route_speech_rejects_unsupported_response_format() {
-        let response = post_json(
-            router_with_stub_tts(),
-            "/v1/audio/speech",
-            json!({
-                "model": "stub-tts",
-                "input": "hello",
-                "voice": "default",
-                "response_format": "mp3"
-            }),
-        )
-        .await;
-        assert_eq!(response.status(), AxumStatusCode::BAD_REQUEST);
-        let body = response_json(response).await;
-        assert_eq!(body["error"]["type"], "invalid_request_error");
-        assert_eq!(body["error"]["param"], "response_format");
-    }
-
-    #[tokio::test]
-    async fn route_speech_invalid_json_maps_to_openai_error() {
-        let response = post_raw_json(router_with_stub_tts(), "/v1/audio/speech", "{").await;
-        assert_eq!(response.status(), AxumStatusCode::BAD_REQUEST);
-        let body = response_json(response).await;
-        assert_eq!(body["error"]["type"], "invalid_request_error");
-        assert_eq!(body["error"]["param"], Value::Null);
-        assert!(body["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("invalid speech request"));
     }
 
     #[tokio::test]

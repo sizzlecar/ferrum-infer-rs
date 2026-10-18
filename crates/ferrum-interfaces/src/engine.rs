@@ -1,10 +1,7 @@
-//! Inference engine interfaces — split per modality.
+//! Engine lifecycle and text-generation contracts.
 //!
-//! Phase 5a step 2 splits the historical mega-trait (which mixed LLM
-//! generation, embedding, transcription, and TTS in one) into a base
-//! lifecycle trait and four modality-specific supertraits. Each
-//! engine impl now implements exactly the trait its modality needs;
-//! no more inert "unsupported" stubs.
+//! Future task-specific engines can extend the lifecycle contract without
+//! implementing text-generation operations or creating dummy KV state.
 
 use async_trait::async_trait;
 use ferrum_types::{
@@ -16,9 +13,7 @@ use std::pin::Pin;
 
 /// Lifecycle / status methods shared by every engine kind.
 ///
-/// LLM engines, embedders, transcribers, and TTS services all expose
-/// the same minimal status/metrics surface to the server / CLI. The
-/// modality-specific traits below extend this base.
+/// Task-specific execution contracts extend this minimal lifecycle surface.
 #[async_trait]
 pub trait InferenceEngine: Send + Sync {
     /// Get current engine status.
@@ -38,9 +33,8 @@ pub trait InferenceEngine: Send + Sync {
 
     /// Optional cache metrics emitted by concrete LLM engines.
     ///
-    /// The default keeps non-LLM and stub engines source-compatible. Real
-    /// engines can expose prefix/session cache counters without forcing those
-    /// fields into every modality's core metrics type.
+    /// Engines can expose prefix/session cache counters without requiring
+    /// cache support from every implementation of the lifecycle contract.
     fn cache_metrics_snapshot(&self) -> Option<serde_json::Value> {
         None
     }
@@ -71,9 +65,8 @@ pub trait InferenceEngine: Send + Sync {
 
 /// LLM text-generation engine.
 ///
-/// Implemented by `ContinuousBatchEngine` (the production path) and
-/// `DefaultInferenceEngine` (legacy reference path). Backs
-/// `/v1/chat/completions` and `/v1/completions`.
+/// Implemented by `ContinuousBatchEngine`. Backs the chat, completions and
+/// Responses APIs.
 #[async_trait]
 pub trait LlmInferenceEngine: InferenceEngine {
     /// Authoritative owner of request-lifetime state and capacity. This is a
@@ -99,52 +92,6 @@ pub trait LlmInferenceEngine: InferenceEngine {
         &self,
         request: InferenceRequest,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamChunk>> + Send>>>;
-}
-
-/// Embedding engine (CLIP, BERT, etc.).
-///
-/// Backs `/v1/embeddings`. Distinct from LLM engines — no token
-/// generation, no scheduling, no KV cache.
-#[async_trait]
-pub trait EmbedEngine: InferenceEngine {
-    /// Embed raw text string → float vector (engine handles tokenization).
-    async fn embed_text(&self, text: &str) -> Result<Vec<f32>>;
-
-    /// Embed image (file path or base64) → float vector.
-    async fn embed_image(&self, image: &str) -> Result<Vec<f32>>;
-
-    /// Get embedding dimension.
-    fn embedding_dim(&self) -> usize;
-}
-
-/// Speech-to-text (Whisper) engine.
-///
-/// Backs `/v1/audio/transcriptions`.
-#[async_trait]
-pub trait TranscribeEngine: InferenceEngine {
-    /// Transcribe audio file → text.
-    async fn transcribe_file(&self, path: &str, language: Option<&str>) -> Result<String>;
-
-    /// Transcribe audio bytes (WAV / etc.) → text.
-    async fn transcribe_bytes(&self, data: &[u8], language: Option<&str>) -> Result<String>;
-}
-
-/// Text-to-speech (Qwen3-TTS, etc.) engine.
-///
-/// Backs `/v1/audio/speech`.
-#[async_trait]
-pub trait TtsEngine: InferenceEngine {
-    /// Synthesize speech → PCM audio chunks (streaming).
-    /// Returns Vec of PCM f32 samples per chunk.
-    async fn synthesize_speech(
-        &self,
-        text: &str,
-        language: Option<&str>,
-        chunk_frames: usize,
-    ) -> Result<Vec<Vec<f32>>>;
-
-    /// Get TTS sample rate.
-    fn tts_sample_rate(&self) -> u32;
 }
 
 /// Advanced engine capabilities — opt-in addition to LLM engines that

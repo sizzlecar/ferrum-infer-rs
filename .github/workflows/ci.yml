@@ -322,8 +322,6 @@ jobs:
         run: |
           # Verify help works
           ./target/debug/ferrum --help
-          ./target/debug/ferrum tts --help
-          ./target/debug/ferrum transcribe --help
           ./target/debug/ferrum serve --help
 
   # ── Metal (macOS) ────────────────────────────────────────────────────
@@ -363,7 +361,6 @@ jobs:
       - name: "Test: CLI help (macOS build)"
         run: |
           ./target/debug/ferrum --help
-          ./target/debug/ferrum tts --help
 
   # ── CUDA (Linux + CUDA toolkit) ─────────────────────────────────────
   # Type-checks CUDA code paths. PTX build optional (slow).

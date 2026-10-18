@@ -15,7 +15,7 @@ use ferrum_interfaces::{
     KvCacheManager, ModelExecutor, Sampler, SchedulerInterface as Scheduler, Tokenizer,
 };
 use ferrum_models::vnext::{DefinedProductionModel, ProductionModelSourceBundle};
-use ferrum_types::{Device, EngineConfig, FerrumError, Result, RuntimeKnobs};
+use ferrum_types::{Device, EngineConfig, FerrumError, Result};
 use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
@@ -132,98 +132,6 @@ fn cpu_cuda_and_optional_metal_devices() -> Vec<Device> {
     #[cfg(not(all(feature = "metal", any(target_os = "macos", target_os = "ios"))))]
     {
         vec![Device::CPU, Device::CUDA(0)]
-    }
-}
-
-fn parse_executor_dtype(s: &str) -> Option<candle_core::DType> {
-    match s.trim().to_ascii_lowercase().as_str() {
-        "fp16" | "f16" | "float16" => Some(candle_core::DType::F16),
-        "fp32" | "f32" | "float32" => Some(candle_core::DType::F32),
-        _ => None,
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct RegistryRuntimeEnv {
-    model_path: Option<String>,
-    metal_dtype: Option<String>,
-    dtype: Option<String>,
-    tp: usize,
-}
-
-impl RegistryRuntimeEnv {
-    /// Build from the typed runtime snapshot resolved at the composition root.
-    /// Replaces the former `std::env`-reading `from_env`/`OnceLock` pair; the
-    /// CLI lands FERRUM_MODEL_PATH / FERRUM_DTYPE / FERRUM_METAL_DTYPE /
-    /// FERRUM_TP into `EngineConfig.runtime`, and the registry reads that.
-    fn from_runtime_knobs(knobs: &RuntimeKnobs) -> Self {
-        Self {
-            model_path: knobs.model_path.clone(),
-            metal_dtype: knobs.metal_dtype.clone(),
-            dtype: knobs.dtype.clone(),
-            tp: knobs.tp.unwrap_or(0),
-        }
-    }
-
-    #[cfg(test)]
-    fn from_env_vars<I, K, V>(vars: I) -> Self
-    where
-        I: IntoIterator<Item = (K, V)>,
-        K: AsRef<str>,
-        V: Into<String>,
-    {
-        let mut model_path = None;
-        let mut metal_dtype = None;
-        let mut dtype = None;
-        let mut tp = None;
-
-        for (key, value) in vars {
-            let value = value.into();
-            match key.as_ref() {
-                "FERRUM_MODEL_PATH" => model_path = Some(value),
-                "FERRUM_METAL_DTYPE" => metal_dtype = Some(value),
-                "FERRUM_DTYPE" => dtype = Some(value),
-                "FERRUM_TP" => tp = value.parse::<usize>().ok(),
-                _ => {}
-            }
-        }
-
-        Self {
-            model_path,
-            metal_dtype,
-            dtype,
-            tp: tp.unwrap_or(0),
-        }
-    }
-
-    #[cfg(test)]
-    fn model_path(&self) -> Option<String> {
-        self.model_path.clone()
-    }
-
-    fn dtype_for_device(&self, device: &Device) -> candle_core::DType {
-        match device {
-            Device::CPU => candle_core::DType::F32,
-            #[cfg(any(target_os = "macos", target_os = "ios"))]
-            Device::Metal => self
-                .metal_dtype
-                .as_deref()
-                .and_then(parse_executor_dtype)
-                .or_else(|| self.dtype.as_deref().and_then(parse_executor_dtype))
-                .unwrap_or(candle_core::DType::F32),
-            Device::CUDA(_) | Device::ROCm(_) => self
-                .dtype
-                .as_deref()
-                .and_then(parse_executor_dtype)
-                .unwrap_or(candle_core::DType::F16),
-        }
-    }
-
-    #[allow(dead_code)]
-    fn metal_dtype_hint(&self) -> String {
-        self.metal_dtype
-            .clone()
-            .unwrap_or_else(|| "f32".to_string())
     }
 }
 
@@ -948,8 +856,7 @@ impl ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>> for StubExecutorFact
 /// Builds a [`ModelExecutor`] from a resolved model path. Despite the
 /// historical "candle" name (PR #127 deleted the legacy `CandleBackend`
 /// trait), this factory now produces real `Backend<B>`-based executors
-/// for LLMs (LlamaFamilyModel / Qwen3MoeModel) and candle-based
-/// executors for embedding / multimodal / ASR (Bert, CLIP, Whisper).
+/// for text LLMs (LlamaFamilyModel / Qwen3MoeModel).
 ///
 /// The factory dispatches over four axes:
 ///   - Dim 1 (architecture): LlamaFamilyModel vs Qwen3MoeModel — runtime
@@ -1643,7 +1550,6 @@ impl ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>> for LlmExecutorFacto
         &self,
         config: &ComponentConfig,
     ) -> Result<Arc<dyn ModelExecutor + Send + Sync>> {
-        use candle_core::{DType, Device as CandleDevice};
         use ferrum_models::weight_format::WeightFormat;
 
         validate_causal_decode_preparation_mode(config, true)?;
@@ -1782,44 +1688,6 @@ impl ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>> for LlmExecutorFacto
             model_def.architecture, model_def.num_hidden_layers, model_def.vocab_size
         );
 
-        // Dense decoder families below use Ferrum's Backend<B> stack and do
-        // not need a Candle device. Resolve the legacy Candle device lazily so
-        // the official CUDA graph can run those families without enabling the
-        // explicit candle-cuda-compat feature. Candle-backed BERT/CLIP/Whisper
-        // arms still fail closed on CUDA unless that compatibility feature is
-        // intentionally selected.
-        let legacy_candle_device = || -> Result<CandleDevice> {
-            validate_fixed_storage_kv_dtype(
-                config.engine_config.kv_cache.dtype,
-                "legacy Candle executor",
-            )?;
-            match &config.device {
-                Device::CPU => Ok(CandleDevice::Cpu),
-                #[cfg(feature = "candle-cuda-compat")]
-                Device::CUDA(id) => CandleDevice::new_cuda(*id)
-                    .map_err(|e| FerrumError::device(format!("CUDA error: {}", e))),
-                #[cfg(not(feature = "candle-cuda-compat"))]
-                Device::CUDA(_) => Err(FerrumError::unsupported(
-                    "legacy Candle CUDA executors require the candle-cuda-compat feature",
-                )),
-                #[cfg(any(target_os = "macos", target_os = "ios"))]
-                Device::Metal => CandleDevice::new_metal(0)
-                    .map_err(|e| FerrumError::device(format!("Metal error: {}", e))),
-                Device::ROCm(_) => Err(FerrumError::device("ROCm not yet supported")),
-            }
-        };
-
-        // Select dtype.
-        //
-        // IMPORTANT (correctness): Metal defaults to FP32 for stability.
-        // This was introduced to address cases where CPU inference is correct but Metal results
-        // can deviate. If you want higher performance and accept potential numerical risk, you
-        // can explicitly opt-in via env:
-        // - FERRUM_METAL_DTYPE=fp16|fp32 (takes precedence on Metal)
-        // - FERRUM_DTYPE=fp16|fp32 (global override for non-CPU)
-        let dtype: DType = RegistryRuntimeEnv::from_runtime_knobs(&config.engine_config.runtime)
-            .dtype_for_device(&config.device);
-
         // Create model based on architecture
         info!("Building model...");
         match model_def.architecture {
@@ -1948,10 +1816,12 @@ impl ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>> for LlmExecutorFacto
                                 // FERRUM_METAL_DTYPE=f16 toggles fp16 weight storage
                                 // inside MetalBackend. Halves big-tensor RAM;
                                 // recommended for 4B+ models on 16 GB Macs.
-                                let dtype_hint = RegistryRuntimeEnv::from_runtime_knobs(
-                                    &config.engine_config.runtime,
-                                )
-                                .metal_dtype_hint();
+                                let dtype_hint = config
+                                    .engine_config
+                                    .runtime
+                                    .metal_dtype
+                                    .as_deref()
+                                    .unwrap_or("f32");
                                 info!("  Backend: Metal (weights {}), KV: fp16", dtype_hint);
                                 build_llm::<ferrum_kernels::backend::metal::MetalBackend, KvFp16>(
                                     arch,
@@ -2031,35 +1901,6 @@ impl ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>> for LlmExecutorFacto
 
                 Ok(Arc::new(ferrum_models::LlmExecutor::new(llm, model_info)))
             }
-            ferrum_models::Architecture::Bert => {
-                info!("Using BERT executor for embeddings");
-                let executor = ferrum_models::BertModelExecutor::from_path(
-                    &model_path,
-                    &model_def,
-                    legacy_candle_device()?,
-                )
-                .await?;
-
-                Ok(Arc::new(executor))
-            }
-            ferrum_models::Architecture::Clip => {
-                info!("Using CLIP executor for multimodal embeddings");
-                let executor = ferrum_models::ClipModelExecutor::from_path(
-                    &model_path,
-                    legacy_candle_device()?,
-                    dtype,
-                )?;
-                Ok(Arc::new(executor))
-            }
-            ferrum_models::Architecture::Whisper => {
-                info!("Using Whisper executor for ASR");
-                let executor = ferrum_models::WhisperModelExecutor::from_path(
-                    &model_path,
-                    legacy_candle_device()?,
-                    dtype,
-                )?;
-                Ok(Arc::new(executor))
-            }
             _ => Err(FerrumError::model(format!(
                 "Architecture {:?} not supported",
                 model_def.architecture
@@ -2071,9 +1912,7 @@ impl ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>> for LlmExecutorFacto
         ComponentMetadata {
             name: "llm".to_string(),
             version: "0.2.0".to_string(),
-            description: "LLM executor (LlamaFamily / Qwen3MoE via Backend<B>; \
-                 BERT / CLIP / Whisper via candle)"
-                .to_string(),
+            description: "LLM executor (LlamaFamily / Qwen3MoE via Backend<B>)".to_string(),
             supported_devices: cpu_cuda_and_optional_metal_devices(),
             capabilities: vec![
                 "llama".to_string(),
@@ -2081,9 +1920,6 @@ impl ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>> for LlmExecutorFacto
                 "qwen3".to_string(),
                 "qwen3_moe".to_string(),
                 "mistral".to_string(),
-                "bert".to_string(),
-                "clip".to_string(),
-                "whisper".to_string(),
                 "safetensors".to_string(),
                 "gguf".to_string(),
                 "fp16".to_string(),
@@ -2726,13 +2562,12 @@ mod tests {
     #[test]
     fn fixed_storage_loaders_preserve_default_and_reject_other_kv_dtypes() {
         use ferrum_types::KvCacheDtype;
-        for loader in ["legacy GGUF loader", "legacy Candle executor"] {
-            validate_fixed_storage_kv_dtype(KvCacheDtype::Fp16, loader).unwrap();
-            for dtype in [KvCacheDtype::Int8, KvCacheDtype::Bf16, KvCacheDtype::Fp8] {
-                let error = validate_fixed_storage_kv_dtype(dtype, loader).unwrap_err();
-                assert!(error.to_string().contains(loader));
-                assert!(error.to_string().contains(dtype.as_str()));
-            }
+        let loader = "legacy GGUF loader";
+        validate_fixed_storage_kv_dtype(KvCacheDtype::Fp16, loader).unwrap();
+        for dtype in [KvCacheDtype::Int8, KvCacheDtype::Bf16, KvCacheDtype::Fp8] {
+            let error = validate_fixed_storage_kv_dtype(dtype, loader).unwrap_err();
+            assert!(error.to_string().contains(loader));
+            assert!(error.to_string().contains(dtype.as_str()));
         }
     }
 
@@ -2740,49 +2575,26 @@ mod tests {
     fn fixed_storage_factory_rejects_int8_before_loading_legacy_weights() {
         let directory = unique_test_dir("fixed-storage-kv-rejection");
         let gguf = directory.join("unloaded.gguf");
-        // Deliberately invalid weights prove the storage check runs before
-        // either loader opens tensors or creates a backend device.
+        // Invalid weights prove the storage check runs before tensor loading.
         std::fs::write(&gguf, b"not model weights").unwrap();
-        let candle = directory.join("candle");
-        std::fs::create_dir(&candle).unwrap();
-        std::fs::write(
-            candle.join("config.json"),
-            serde_json::to_vec(&serde_json::json!({
-                "architectures": ["BertModel"],
-                "model_type": "bert",
-                "hidden_size": 4,
-                "num_hidden_layers": 1,
-                "num_attention_heads": 1,
-                "intermediate_size": 4,
-                "vocab_size": 8,
-                "max_position_embeddings": 8,
-            }))
-            .unwrap(),
-        )
-        .unwrap();
-        for (path, loader) in [
-            (&gguf, "legacy GGUF loader"),
-            (&candle, "legacy Candle executor"),
-        ] {
-            let mut engine = EngineConfig::default();
-            engine.kv_cache.dtype = ferrum_types::KvCacheDtype::Int8;
-            engine.backend.device = Device::CPU;
-            engine.backend.backend_options.insert(
-                "model_path".to_owned(),
-                serde_json::Value::String(path.to_string_lossy().into_owned()),
-            );
-            let component = ComponentConfig::from_engine_config(&engine);
-            let error = match tokio_test::block_on(LlmExecutorFactory.create(&component)) {
-                Ok(_) => panic!("a fixed-storage loader accepted INT8 KV"),
-                Err(error) => error,
-            };
-            assert!(
-                error
-                    .to_string()
-                    .contains(&format!("{loader} does not support KV dtype int8")),
-                "unexpected early error: {error}"
-            );
-        }
+        let mut engine = EngineConfig::default();
+        engine.kv_cache.dtype = ferrum_types::KvCacheDtype::Int8;
+        engine.backend.device = Device::CPU;
+        engine.backend.backend_options.insert(
+            "model_path".to_owned(),
+            serde_json::Value::String(gguf.to_string_lossy().into_owned()),
+        );
+        let component = ComponentConfig::from_engine_config(&engine);
+        let error = match tokio_test::block_on(LlmExecutorFactory.create(&component)) {
+            Ok(_) => panic!("a fixed-storage loader accepted INT8 KV"),
+            Err(error) => error,
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("legacy GGUF loader does not support KV dtype int8"),
+            "unexpected early error: {error}"
+        );
         std::fs::remove_dir_all(directory).unwrap();
     }
 
@@ -3553,52 +3365,6 @@ mod tests {
 
         assert!(err.contains("device-scoped execution"));
         assert!(err.contains("refusing to silently use the default device"));
-    }
-
-    #[test]
-    fn test_registry_runtime_env_parses_model_dtype_and_tp() {
-        let env = RegistryRuntimeEnv::from_env_vars([
-            ("FERRUM_MODEL_PATH", "/models/qwen"),
-            ("FERRUM_METAL_DTYPE", "fp16"),
-            ("FERRUM_DTYPE", "fp32"),
-            ("FERRUM_TP", "4"),
-        ]);
-
-        assert_eq!(env.model_path.as_deref(), Some("/models/qwen"));
-        assert_eq!(env.metal_dtype.as_deref(), Some("fp16"));
-        assert_eq!(env.dtype.as_deref(), Some("fp32"));
-        assert_eq!(env.tp, 4);
-    }
-
-    #[test]
-    fn test_registry_runtime_env_defaults_invalid_tp_and_cuda_dtype() {
-        let env = RegistryRuntimeEnv::from_env_vars([
-            ("FERRUM_DTYPE", "not-a-dtype"),
-            ("FERRUM_TP", "not-a-number"),
-        ]);
-
-        assert_eq!(env.model_path(), None);
-        assert_eq!(env.tp, 0);
-        assert_eq!(
-            env.dtype_for_device(&Device::CUDA(0)),
-            candle_core::DType::F16
-        );
-        assert_eq!(env.dtype_for_device(&Device::CPU), candle_core::DType::F32);
-    }
-
-    #[cfg(any(target_os = "macos", target_os = "ios"))]
-    #[test]
-    fn test_registry_runtime_env_metal_dtype_precedence() {
-        let env = RegistryRuntimeEnv::from_env_vars([
-            ("FERRUM_METAL_DTYPE", "fp16"),
-            ("FERRUM_DTYPE", "fp32"),
-        ]);
-
-        assert_eq!(
-            env.dtype_for_device(&Device::Metal),
-            candle_core::DType::F16
-        );
-        assert_eq!(env.metal_dtype_hint(), "fp16");
     }
 
     #[test]

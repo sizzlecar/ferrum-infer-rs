@@ -52,18 +52,6 @@ enum Commands {
     #[command(hide = true)]
     VnextDeterminism(vnext_determinism::VNextDeterminismCommand),
 
-    /// Generate text embeddings using BERT models
-    #[command(visible_alias = "e", hide = true)]
-    Embed(embed::EmbedCommand),
-
-    /// Transcribe audio files using Whisper models
-    #[command(visible_alias = "t", hide = true)]
-    Transcribe(transcribe::TranscribeCommand),
-
-    /// Text-to-speech synthesis using Qwen3-TTS models
-    #[command(hide = true)]
-    Tts(tts::TtsCommand),
-
     /// Start the inference HTTP server
     Serve(serve::ServeCliCommand),
 
@@ -124,9 +112,6 @@ fn command_future(
         Commands::BenchServe(cmd) => Box::pin(bench_serve::execute(cmd, config)),
         Commands::ReplayBundle(cmd) => Box::pin(replay_bundle::execute(cmd, config)),
         Commands::VnextDeterminism(cmd) => Box::pin(vnext_determinism::execute(cmd)),
-        Commands::Embed(cmd) => Box::pin(embed::execute(cmd, config)),
-        Commands::Transcribe(cmd) => Box::pin(transcribe::execute(cmd, config)),
-        Commands::Tts(cmd) => Box::pin(tts::execute(cmd, config)),
         Commands::Serve(cmd) => Box::pin(async move {
             let compatibility = if config_loaded {
                 ferrum_cli::config::load_interleaved_system_coalescing("ferrum.toml").await

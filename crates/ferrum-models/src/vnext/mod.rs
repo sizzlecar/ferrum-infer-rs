@@ -164,30 +164,6 @@ const LEGACY_MODELS: &[LegacyModelRegistration] = &[
     LegacyModelRegistration {
         external_metadata_id: "hf.architecture.GPT2LMHeadModel",
     },
-    LegacyModelRegistration {
-        external_metadata_id: "hf.architecture.BertModel",
-    },
-    LegacyModelRegistration {
-        external_metadata_id: "hf.architecture.BertForMaskedLM",
-    },
-    LegacyModelRegistration {
-        external_metadata_id: "hf.architecture.BertForSequenceClassification",
-    },
-    LegacyModelRegistration {
-        external_metadata_id: "hf.architecture.CLIPModel",
-    },
-    LegacyModelRegistration {
-        external_metadata_id: "hf.architecture.ChineseCLIPModel",
-    },
-    LegacyModelRegistration {
-        external_metadata_id: "hf.architecture.SiglipModel",
-    },
-    LegacyModelRegistration {
-        external_metadata_id: "hf.architecture.WhisperForConditionalGeneration",
-    },
-    LegacyModelRegistration {
-        external_metadata_id: "hf.architecture.Qwen3TTSForConditionalGeneration",
-    },
 ];
 
 /// Product executor category selected by model semantics, never by a family
@@ -1088,6 +1064,39 @@ mod tests {
             error.contains("implicit architecture fallback is forbidden"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn retired_task_metadata_is_rejected_before_weight_loading() {
+        let directory = tempfile::tempdir().unwrap();
+        for architecture in [
+            "BertModel",
+            "BertForMaskedLM",
+            "BertForSequenceClassification",
+            "CLIPModel",
+            "ChineseCLIPModel",
+            "SiglipModel",
+            "WhisperForConditionalGeneration",
+            "Qwen3TTSForConditionalGeneration",
+        ] {
+            fs::write(
+                directory.path().join("config.json"),
+                serde_json::to_vec(&serde_json::json!({
+                    "architectures": [architecture],
+                    "model_type": "llama",
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            let error = resolve_registered_model_from_dir(directory.path())
+                .err()
+                .expect("retired task cannot use a decoder fallback");
+            assert!(matches!(
+                &error,
+                ferrum_types::FerrumError::Unsupported { .. }
+            ));
+            assert!(error.to_string().contains(architecture), "{error}");
+        }
     }
 
     #[test]

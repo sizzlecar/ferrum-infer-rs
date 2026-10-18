@@ -3,10 +3,15 @@
 Ferrum exposes OpenAI-shaped HTTP endpoints for local serving. This document
 describes the current product contract for the always-on server path.
 
-Ferrum v0.8 release support is language-model serving: chat completions, text
-completions, and model discovery. Embedding, ASR, and TTS routes remain in the
-source tree for legacy/specialized engines, but are outside the v0.8 release
-support matrix and are hidden from the default CLI help.
+Ferrum serves text language models through chat completions, Responses, text
+completions, and model discovery. Experimental standalone embedding, ASR, and
+TTS implementations have been retired. Their HTTP routes return 404; the
+`embed`, `transcribe`, and `tts` CLI commands are no longer available.
+
+This also removes the experimental embedding/speech engines, executors,
+task traits, and dedicated model loaders from the Rust API. Text generation
+continues through `run`, `serve`, and the LLM engine interfaces; future tasks
+will define their own contracts at the model registration and assembly boundary.
 
 ## Endpoints
 
@@ -16,30 +21,19 @@ support matrix and are hidden from the default CLI help.
 | `POST /v1/responses` | Supported, stateless | Ordered text/reasoning/tool history, non-streaming and streaming output, usage, and caller-owned function/namespace-tool loops. |
 | `POST /v1/completions` | Supported | Non-streaming and streaming text completions with a single string `prompt`; prompt arrays/objects are rejected with `param=prompt`. |
 | `GET /v1/models` | Supported | Lists public model names and optional effective serving capacity. |
-| `POST /v1/embeddings` | Experimental / outside v0.8 release scope | Text and image embedding support depends on a specialized loaded model. |
-| `POST /v1/audio/transcriptions` | Experimental / outside v0.8 release scope | Multipart form input for specialized ASR engines. |
-| `POST /v1/audio/speech` | Experimental / outside v0.8 release scope | Speech output depends on a specialized TTS engine. |
+| `POST /v1/embeddings` | Removed | Returns HTTP 404; requests are not routed to a text model. |
+| `POST /v1/audio/transcriptions` | Removed | Returns HTTP 404. |
+| `POST /v1/audio/speech` | Removed | Returns HTTP 404. |
 
-## Modality Endpoint Fields
+## Model Capacity
 
 For loaded language models, each model card includes `max_model_len` when the
 engine reports its effective per-request capacity. This is the same input-plus-output
 limit used by request admission, including runtime and executor capacity constraints.
 Public aliases and LoRA adapters report their base engine's limit. Unreported capacity
-is omitted, including on the specialized non-LLM routes; it is not inferred from the
-model name or nominal weights context window. This discovery field affects `serve`;
+is omitted; it is not inferred from the model name or nominal weights context
+window. This discovery field affects `serve`;
 `run` continues to use the same existing engine admission boundary.
-
-| Endpoint / field | Status | Behavior |
-|---|---|---|
-| `/v1/embeddings input` | Supported | Accepts a string, array of strings, object with `text` or `image`, or array of those objects. |
-| `/v1/embeddings encoding_format=float` | Supported | Returns numeric float embeddings. |
-| `/v1/embeddings encoding_format=base64` | Rejected | Returns HTTP 400 with `param=encoding_format`; base64 embedding encoding is not implemented. |
-| `/v1/audio/transcriptions response_format=json` | Supported | Returns `{ "text": ... }`. |
-| `/v1/audio/transcriptions` other `response_format` values | Rejected | Returns HTTP 400 with `param=response_format`; text/SRT/VTT/verbose JSON transcription formats are not implemented. |
-| `/v1/audio/speech response_format=wav` | Supported | Returns 16-bit mono WAV bytes with `content-type: audio/wav`. |
-| `/v1/audio/speech response_format=pcm` | Supported | Returns raw 16-bit little-endian mono PCM bytes with `content-type: audio/pcm`. |
-| `/v1/audio/speech` other `response_format` values | Rejected | Returns HTTP 400 with `param=response_format`; compressed speech formats are not implemented. |
 
 ## Chat Fields
 

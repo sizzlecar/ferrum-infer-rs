@@ -5,18 +5,12 @@ use std::fmt;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ServedModelKind {
     Llm,
-    Embedding,
-    Transcription,
-    Speech,
 }
 
 impl ServedModelKind {
     pub fn modalities(self) -> &'static [&'static str] {
         match self {
             Self::Llm => &["text"],
-            Self::Embedding => &["text", "image"],
-            Self::Transcription => &["audio"],
-            Self::Speech => &["text", "audio"],
         }
     }
 }
@@ -119,12 +113,6 @@ impl ServedModelRegistry {
                 "at least one served model name is required".to_string(),
             ));
         }
-        if kind != ServedModelKind::Llm && !adapters.is_empty() {
-            return Err(ServedModelRegistryError(
-                "LoRA adapters may only be registered for LLM models".to_string(),
-            ));
-        }
-
         let mut registry = Self {
             entries: Vec::with_capacity(served_model_names.len() + adapters.len()),
             entry_by_public_name: HashMap::with_capacity(served_model_names.len() + adapters.len()),
@@ -228,11 +216,6 @@ impl ServedModelRegistry {
         let primary = base_entries.first().ok_or_else(|| {
             ServedModelRegistryError("cannot attach LoRA adapters to an empty registry".to_string())
         })?;
-        if primary.kind != ServedModelKind::Llm {
-            return Err(ServedModelRegistryError(
-                "LoRA adapters may only be registered for LLM models".to_string(),
-            ));
-        }
         require_same_base_model(&base_entries)?;
         let expected_base_matches = primary.engine_model_id.0 == expected_base
             || base_entries
@@ -312,9 +295,6 @@ mod tests {
         }
         assert!(registry
             .resolve("internal-model", ServedModelKind::Llm)
-            .is_none());
-        assert!(registry
-            .resolve("public-model", ServedModelKind::Embedding)
             .is_none());
     }
 
