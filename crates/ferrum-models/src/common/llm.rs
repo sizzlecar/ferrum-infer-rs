@@ -14,8 +14,8 @@ use ferrum_types::{RequestId, Result, TokenId};
 mod token;
 pub(crate) use token::catch_host_execution;
 pub use token::{
-    ModelExecutionRecovery, ModelKvReservation, ModelTokenBatchOutcome, ModelTokenCloseOutcome,
-    ModelTokenInput, ModelTokenOutcome, ModelTokenProduct, ModelTokenWork,
+    ModelExecutionRecovery, ModelKvPreparation, ModelKvReservation, ModelTokenBatchOutcome,
+    ModelTokenCloseOutcome, ModelTokenInput, ModelTokenOutcome, ModelTokenProduct, ModelTokenWork,
 };
 
 /// Runtime configuration every decoder-only LLM must expose.
@@ -70,9 +70,8 @@ pub trait DecoderOnlyLLM: Send + Sync {
     /// any later member of a batch ran or that its product was accepted.
     fn execute_token_work(
         &mut self,
-        _cache_id: &str,
-        _work: ModelTokenWork<'_>,
-    ) -> ModelTokenOutcome {
+        _input: &ModelTokenInput<'_>,
+    ) -> ModelTokenOutcome<ModelTokenProduct> {
         ModelTokenOutcome::NotSubmitted(ferrum_types::FerrumError::unsupported(
             "model has not implemented direct token execution",
         ))
@@ -89,21 +88,9 @@ pub trait DecoderOnlyLLM: Send + Sync {
                     "earlier participant retains the model execution context",
                 ))
             } else {
-                match self.execute_token_work(input.cache_id, input.work) {
-                    ModelTokenOutcome::NotSubmitted(error) => ModelTokenOutcome::NotSubmitted(error),
-                    ModelTokenOutcome::CapacityDeferred(deferred) => {
-                        ModelTokenOutcome::CapacityDeferred(deferred)
-                    }
-                    ModelTokenOutcome::Held(error) => {
-                        held = true;
-                        ModelTokenOutcome::Held(error)
-                    }
-                    ModelTokenOutcome::Terminal(result) => ModelTokenOutcome::Terminal(result.map(
-                        |logits| input.sample.then_some(
-                            ferrum_execution::model_executor::ExecutorSamplingOutput::FullLogits(logits),
-                        ),
-                    )),
-                }
+                let result = self.execute_token_work(input);
+                held = matches!(result, ModelTokenOutcome::Held(_));
+                result
             };
             rows.push(result);
         }
@@ -222,17 +209,13 @@ pub trait DecoderOnlyLLM: Send + Sync {
     /// the model's actual ownership boundary. Device models override this to
     /// use one retained context for both operations. An error does not prove
     /// quiescence: the caller must close through this same model owner.
-    fn prepare_token_kv(
-        &mut self,
-        cache_id: &str,
-        capacity_hint: usize,
-        prompt_tokens: usize,
-    ) -> Result<ModelKvReservation> {
-        self.prepare_kv_capacity(cache_id, capacity_hint);
+    fn prepare_token_kv(&mut self, request: ModelKvPreparation<'_>) -> Result<ModelKvReservation> {
+        self.set_lora_adapter_for_cache(request.cache_id, request.adapter.cloned())?;
+        self.prepare_kv_capacity(request.cache_id, request.capacity_hint);
         self.reserve_token_kv_slots(&[KvSlotRequest {
-            cache_id: cache_id.to_owned(),
-            target_len: prompt_tokens,
-            admission_target_len: Some(prompt_tokens),
+            cache_id: request.cache_id.to_owned(),
+            target_len: request.prompt.len(),
+            admission_target_len: Some(request.prompt.len()),
         }])
     }
 

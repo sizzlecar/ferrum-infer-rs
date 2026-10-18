@@ -74,13 +74,8 @@ impl<B: MoeLlmBackend> DecoderOnlyLLM for ManagedModel<B> {
     fn kv_capacity(&self) -> usize {
         self.model.lock().kv_capacity()
     }
-    fn prepare_token_kv(
-        &mut self,
-        id: &str,
-        capacity: usize,
-        prompt: usize,
-    ) -> Result<ModelKvReservation> {
-        self.model.lock().prepare_token_kv(id, capacity, prompt)
+    fn prepare_token_kv(&mut self, request: ModelKvPreparation<'_>) -> Result<ModelKvReservation> {
+        self.model.lock().prepare_token_kv(request)
     }
     fn observe_token_allocator_reclaim(
         &self,

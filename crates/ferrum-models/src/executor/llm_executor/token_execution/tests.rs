@@ -1,4 +1,5 @@
 use super::*;
+use crate::common::llm::ModelTokenBatchOutcome;
 use crate::common::LlmRuntimeConfig;
 use crate::models::LlamaFamilyModel;
 use crate::test_support::{tiny_llama_model, tiny_model_info, TinyLlamaConfig};
@@ -59,12 +60,12 @@ impl DecoderOnlyLLM for ObservedModel {
     }
     fn execute_token_work(
         &mut self,
-        cache_id: &str,
-        work: ModelTokenWork<'_>,
-    ) -> ModelTokenOutcome {
+        input: &ModelTokenInput<'_>,
+    ) -> ModelTokenOutcome<ModelTokenProduct> {
         let mut state = self.state.lock();
+        let cache_id = input.cache_id;
         let before = state.model.cache_len(cache_id);
-        let result = state.model.execute_token_work(cache_id, work);
+        let result = state.model.execute_token_work(input);
         let after = state.model.cache_len(cache_id);
         state.forwards.push((cache_id.to_owned(), before, after));
         if let Some((call, fault)) = state.fail_on_forward {
@@ -77,7 +78,9 @@ impl DecoderOnlyLLM for ObservedModel {
                     Fault::ModelFailure => ModelTokenOutcome::Terminal(Err(FerrumError::backend(
                         "injected post-forward model failure",
                     ))),
-                    Fault::InvalidOutput => ModelTokenOutcome::Terminal(Ok(vec![0.0])),
+                    Fault::InvalidOutput => ModelTokenOutcome::Terminal(Ok(Some(
+                        ExecutorSamplingOutput::FullLogits(vec![0.0]),
+                    ))),
                 };
             }
         }
@@ -271,6 +274,114 @@ async fn direct_tokens_real_llama_partial_final_decode_and_close() {
     assert!(state.model.kv_caches.is_empty());
     assert_eq!(state.releases.len(), 1);
     assert_eq!(state.releases[0].1, vec![4; config.num_layers]);
+    assert!(executor.token_sequences.lock().live.is_empty());
+}
+
+#[test]
+fn direct_tokens_real_llama_default_batch_preserves_optional_products() {
+    let (executor, observation, config) = fixture(None);
+    let mut reference = model(&config);
+    reference.prefill("reference", &[1, 2]);
+    let expected = reference.prefill("reference", &[3]);
+    let policy = LogitsReturnPolicy::FullLogits;
+    let prompt: Arc<[u32]> = Arc::from([1, 2, 3]);
+    let mut actual = executor.lock_model();
+    assert!(matches!(
+        actual
+            .prepare_token_kv(ModelKvPreparation {
+                cache_id: "model-default-batch",
+                capacity_hint: 16,
+                prompt: &prompt,
+                adapter: None,
+            })
+            .unwrap(),
+        ModelKvReservation::Reserved(_)
+    ));
+    // ObservedModel inherits the real trait's serial fallback. Each scalar
+    // call reaches tiny Llama, including the intermediate no-product chunk.
+    let ModelTokenBatchOutcome::Serial(rows) = actual.execute_token_batch(&[
+        ModelTokenInput {
+            cache_id: "model-default-batch",
+            work: ModelTokenWork::Prefill {
+                tokens: &[1, 2],
+                position: 0,
+            },
+            logits_policy: &policy,
+            sample: false,
+        },
+        ModelTokenInput {
+            cache_id: "model-default-batch",
+            work: ModelTokenWork::Prefill {
+                tokens: &[3],
+                position: 2,
+            },
+            logits_policy: &policy,
+            sample: true,
+        },
+    ]) else {
+        panic!("default batch must retain the serial outcomes");
+    };
+    assert_eq!(rows.len(), 2);
+    assert!(matches!(&rows[0], ModelTokenOutcome::Terminal(Ok(None))));
+    assert!(matches!(
+        &rows[1],
+        ModelTokenOutcome::Terminal(Ok(Some(ExecutorSamplingOutput::FullLogits(logits))))
+            if logits == &expected
+    ));
+    actual.close_token_sequence("model-default-batch").unwrap();
+    drop(actual);
+    let state = observation.lock();
+    assert_eq!(state.forwards.len(), 2);
+    assert_eq!(state.forwards[0].1, 0);
+    assert_eq!(state.forwards[0].2, 2);
+    assert_eq!(state.forwards[1].1, 2);
+    assert_eq!(state.forwards[1].2, 3);
+    assert_eq!(
+        state.releases,
+        [("model-default-batch".to_owned(), vec![3; config.num_layers])]
+    );
+    assert!(state.model.kv_caches.is_empty());
+}
+
+#[tokio::test]
+async fn direct_tokens_real_llama_partial_product_is_not_silently_discarded() {
+    let (executor, observation, config) = fixture(Some((1, Fault::InvalidOutput)));
+    let frontier = admit(
+        &executor,
+        &RequestId::new(),
+        &[TokenId(1), TokenId(2), TokenId(3)],
+    )
+    .await;
+    let policy = LogitsReturnPolicy::FullLogits;
+    let work = ExecutionWork::new(
+        &frontier,
+        TokenWork::Prefill(PrefillChunk::new(0, 2, 3).unwrap()),
+        &policy,
+    )
+    .unwrap();
+    let ExecutionBatchOutcome::ContractViolation(violation) =
+        executor.execute_tokens(&[work]).await.unwrap()
+    else {
+        panic!("an unexpected sampling product must not become Intermediate");
+    };
+    assert!(violation.completed.is_empty());
+    assert_eq!(violation.rejected_completions.len(), 1);
+    let (index, executed, product) = &violation.rejected_completions[0];
+    assert_eq!(*index, 0);
+    assert_eq!(executed.range().unwrap().as_range(), 0..2);
+    assert!(
+        matches!(product, ExecutionProduct::Sampling(ExecutorSamplingOutput::FullLogits(values)) if values == &[0.0])
+    );
+    assert_eq!(violation.remaining.len(), 1);
+    assert!(
+        matches!(violation.remaining[0].continuation(), ContinuationDisposition::Ended(ended) if ended.sequence() == frontier.sequence())
+    );
+    let state = observation.lock();
+    assert_eq!(state.forwards.len(), 1);
+    assert_eq!((state.forwards[0].1, state.forwards[0].2), (0, 2));
+    assert_eq!(state.releases.len(), 1);
+    assert_eq!(state.releases[0].1, vec![2; config.num_layers]);
+    assert!(state.model.kv_caches.is_empty());
     assert!(executor.token_sequences.lock().live.is_empty());
 }
 

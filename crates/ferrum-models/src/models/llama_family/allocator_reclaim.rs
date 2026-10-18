@@ -88,7 +88,7 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::common::llm::ModelKvReservation;
+    use crate::common::llm::{ModelKvPreparation, ModelKvReservation};
     use crate::test_support::SyntheticLlamaLoader;
     use ferrum_kernels::backend::cpu::CpuBackend;
 
@@ -119,7 +119,14 @@ mod tests {
 
     fn prepare(model: &mut LlamaFamilyModel<CpuBackend, KvFp16>, cache_id: &str, tokens: usize) {
         assert!(matches!(
-            model.prepare_token_kv(cache_id, 32, tokens).unwrap(),
+            model
+                .prepare_token_kv(ModelKvPreparation {
+                    cache_id,
+                    capacity_hint: 32,
+                    prompt: &std::sync::Arc::from(vec![1; tokens]),
+                    adapter: None,
+                })
+                .unwrap(),
             ModelKvReservation::Reserved(_)
         ));
     }

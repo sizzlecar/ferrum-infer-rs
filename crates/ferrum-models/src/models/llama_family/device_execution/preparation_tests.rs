@@ -1,5 +1,5 @@
 use super::*;
-use crate::common::llm::ModelKvReservation;
+use crate::common::llm::{ModelKvPreparation, ModelKvReservation};
 use crate::common::DecoderOnlyLLM;
 use crate::models::llama_family::LlamaFamilyConfig;
 use crate::test_support::SyntheticLlamaLoader;
@@ -38,6 +38,19 @@ fn request(cache_id: &str, target_len: usize) -> KvSlotRequest {
     }
 }
 
+fn preparation<'a>(
+    cache_id: &'a str,
+    capacity_hint: usize,
+    prompt: &'a std::sync::Arc<[u32]>,
+) -> ModelKvPreparation<'a> {
+    ModelKvPreparation {
+        cache_id,
+        capacity_hint,
+        prompt,
+        adapter: None,
+    }
+}
+
 fn free_blocks<B: MoeLlmBackend>(model: &LlamaFamilyModel<B, KvFp16>) -> usize {
     model
         .paged_block_alloc
@@ -56,7 +69,9 @@ fn real_preparation_preserves_allocator_and_numerical_state<B: MoeLlmBackend>(
 ) {
     let mut paged = model::<B>(true);
     assert!(matches!(
-        paged.prepare_token_kv("first", 32, 17).unwrap(),
+        paged
+            .prepare_token_kv(preparation("first", 32, &std::sync::Arc::from([1; 17])))
+            .unwrap(),
         ModelKvReservation::Reserved(_)
     ));
     assert!(paged.pending_device_frame.is_none());
@@ -70,8 +85,9 @@ fn real_preparation_preserves_allocator_and_numerical_state<B: MoeLlmBackend>(
         );
         assert_eq!(read_u32(cache.context_lens.as_ref().unwrap(), 1), [0]);
     }
-    let ModelKvReservation::CapacityDeferred(deferral) =
-        paged.prepare_token_kv("waiter", 32, 17).unwrap()
+    let ModelKvReservation::CapacityDeferred(deferral) = paged
+        .prepare_token_kv(preparation("waiter", 32, &std::sync::Arc::from([1; 17])))
+        .unwrap()
     else {
         panic!("real three-block pool must reject the second two-block reservation");
     };
@@ -121,8 +137,16 @@ fn real_preparation_preserves_allocator_and_numerical_state<B: MoeLlmBackend>(
 
     let mut actual = model::<B>(false);
     let mut reference = model::<B>(false);
-    actual.prepare_token_kv("sequence", 3, 3).unwrap();
-    reference.prepare_token_kv("reference", 32, 3).unwrap();
+    actual
+        .prepare_token_kv(preparation("sequence", 3, &std::sync::Arc::from([1, 2, 3])))
+        .unwrap();
+    reference
+        .prepare_token_kv(preparation(
+            "reference",
+            32,
+            &std::sync::Arc::from([1, 2, 3]),
+        ))
+        .unwrap();
     let first = actual.prefill_internal("sequence", &[1, 2, 3]);
     assert_eq!(first, reference.prefill_internal("reference", &[1, 2, 3]));
     assert!(first.iter().all(|value| value.is_finite()));
@@ -234,7 +258,9 @@ fn preparation_frame_real_metal_pending_context_blocks_allocation() {
         model.run_device_frame(|_, _| ()),
         DeviceFrameResult::Held(_)
     ));
-    assert!(model.prepare_token_kv("blocked", 32, 1).is_err());
+    assert!(model
+        .prepare_token_kv(preparation("blocked", 32, &std::sync::Arc::from([1])))
+        .is_err());
     assert!(model.kv_caches.is_empty());
     assert!(model.paged_block_alloc.is_none());
     let mut frame = model.pending_device_frame.take().unwrap();
@@ -253,7 +279,9 @@ fn preparation_frame_real_metal_pending_context_blocks_allocation() {
         vec![2.0; count]
     );
     assert!(matches!(
-        model.prepare_token_kv("ready", 32, 1).unwrap(),
+        model
+            .prepare_token_kv(preparation("ready", 32, &std::sync::Arc::from([1])))
+            .unwrap(),
         ModelKvReservation::Reserved(_)
     ));
     model.release("ready");

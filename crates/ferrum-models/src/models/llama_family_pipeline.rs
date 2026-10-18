@@ -899,10 +899,11 @@ where
 
     fn execute_token_work(
         &mut self,
-        cache_id: &str,
-        work: crate::common::llm::ModelTokenWork<'_>,
-    ) -> crate::common::llm::ModelTokenOutcome {
+        input: &crate::common::llm::ModelTokenInput<'_>,
+    ) -> crate::common::llm::ModelTokenOutcome<crate::common::llm::ModelTokenProduct> {
         use crate::common::llm::{catch_host_execution, ModelTokenOutcome, ModelTokenWork};
+        let cache_id = input.cache_id;
+        let work = input.work;
         if !B::host_execution_is_synchronous() {
             return ModelTokenOutcome::NotSubmitted(FerrumError::unsupported(
                 "device pipeline token execution requires retained stage submissions",
@@ -951,7 +952,11 @@ where
                 stage.recover_host_token_scratch();
             }
         }
-        ModelTokenOutcome::Terminal(result)
+        ModelTokenOutcome::Terminal(result.map(|logits| {
+            input.sample.then_some(
+                ferrum_execution::model_executor::ExecutorSamplingOutput::FullLogits(logits),
+            )
+        }))
     }
 
     fn close_token_sequence(&mut self, cache_id: &str) -> Result<()> {
@@ -1000,9 +1005,7 @@ where
 
     fn prepare_token_kv(
         &mut self,
-        cache_id: &str,
-        capacity_hint: usize,
-        prompt_tokens: usize,
+        request: crate::common::llm::ModelKvPreparation<'_>,
     ) -> Result<crate::common::llm::ModelKvReservation> {
         use crate::common::llm::ModelKvReservation;
         if self.stages.is_empty() || self.stages.len() != self.placement.stages().len() {
@@ -1013,7 +1016,10 @@ where
         for (index, stage) in self.stages.iter_mut().enumerate() {
             let result =
                 B::with_device_ordinal(self.placement.stage(index).backend_device_ordinal, || {
-                    stage.prepare_token_kv(cache_id, capacity_hint, prompt_tokens)
+                    // Pipeline stage execution does not yet consume a common
+                    // prefix span. Preserve stage-owned KV without acquiring
+                    // independent shared-prefix spans per stage.
+                    stage.prepare_pipeline_token_kv(request)
                 })?;
             if matches!(result, ModelKvReservation::CapacityDeferred(_)) {
                 // The rejecting stage supplies its actual allocator evidence.
@@ -1356,7 +1362,8 @@ mod tests {
 
     #[test]
     fn pipeline_direct_tokens_validate_before_mutation_and_match_real_forward() {
-        use crate::common::llm::{ModelTokenOutcome, ModelTokenWork};
+        use crate::common::llm::{ModelTokenInput, ModelTokenOutcome, ModelTokenWork};
+        use ferrum_execution::model_executor::{ExecutorSamplingOutput, LogitsReturnPolicy};
         let (mut full, mut pipeline) = build_full_and_pipeline();
         for stage in std::iter::once(&mut full).chain(pipeline.stages.iter_mut()) {
             stage.runtime_env.metal_paged_kv = Some(false);
@@ -1382,7 +1389,12 @@ mod tests {
             },
         ] {
             assert!(matches!(
-                pipeline.execute_token_work("pipe", work),
+                pipeline.execute_token_work(&ModelTokenInput {
+                    cache_id: "pipe",
+                    work,
+                    logits_policy: &LogitsReturnPolicy::FullLogits,
+                    sample: true,
+                }),
                 ModelTokenOutcome::NotSubmitted(_)
             ));
             assert!(pipeline
@@ -1390,13 +1402,17 @@ mod tests {
                 .iter()
                 .all(|stage| stage.kv_caches.is_empty()));
         }
-        let ModelTokenOutcome::Terminal(Ok(logits)) = pipeline.execute_token_work(
-            "pipe",
-            ModelTokenWork::Prefill {
-                tokens: &[0, 1],
-                position: 0,
-            },
-        ) else {
+        let ModelTokenOutcome::Terminal(Ok(Some(ExecutorSamplingOutput::FullLogits(logits)))) =
+            pipeline.execute_token_work(&ModelTokenInput {
+                cache_id: "pipe",
+                work: ModelTokenWork::Prefill {
+                    tokens: &[0, 1],
+                    position: 0,
+                },
+                logits_policy: &LogitsReturnPolicy::FullLogits,
+                sample: true,
+            })
+        else {
             panic!("expected real terminal prefill")
         };
         assert_logits_close("direct prefill", &full.prefill("full", &[0, 1]), &logits);
@@ -1404,13 +1420,17 @@ mod tests {
             .stages
             .iter()
             .all(|stage| stage.cache_len("pipe") == 2));
-        let ModelTokenOutcome::Terminal(Ok(logits)) = pipeline.execute_token_work(
-            "pipe",
-            ModelTokenWork::Decode {
-                token: 2,
-                position: 2,
-            },
-        ) else {
+        let ModelTokenOutcome::Terminal(Ok(Some(ExecutorSamplingOutput::FullLogits(logits)))) =
+            pipeline.execute_token_work(&ModelTokenInput {
+                cache_id: "pipe",
+                work: ModelTokenWork::Decode {
+                    token: 2,
+                    position: 2,
+                },
+                logits_policy: &LogitsReturnPolicy::FullLogits,
+                sample: true,
+            })
+        else {
             panic!("expected real terminal decode")
         };
         assert_logits_close("direct decode", &full.decode("full", 2, 2), &logits);
@@ -1425,21 +1445,24 @@ mod tests {
             .all(|stage| stage.kv_caches.is_empty()));
         pipeline.stages.clear();
         assert!(matches!(
-            pipeline.execute_token_work(
-                "missing",
-                ModelTokenWork::Prefill {
+            pipeline.execute_token_work(&ModelTokenInput {
+                cache_id: "missing",
+                work: ModelTokenWork::Prefill {
                     tokens: &[0],
                     position: 0
-                }
-            ),
+                },
+                logits_policy: &LogitsReturnPolicy::FullLogits,
+                sample: true,
+            }),
             ModelTokenOutcome::NotSubmitted(_)
         ));
     }
 
     #[test]
     fn pipeline_token_preparation_later_stage_capacity_keeps_exact_stage_owners() {
-        use crate::common::llm::ModelKvReservation;
+        use crate::common::llm::{ModelKvPreparation, ModelKvReservation};
         let (_, mut pipeline) = build_full_and_pipeline();
+        let prompt: std::sync::Arc<[u32]> = std::sync::Arc::from([0]);
         for stage in &mut pipeline.stages {
             stage.runtime_env.metal_paged_kv = Some(true);
             stage.runtime_env.prefix_cache = false;
@@ -1449,15 +1472,26 @@ mod tests {
         }
         assert!(matches!(
             pipeline.stages[1]
-                .prepare_token_kv("occupied", 16, 1)
+                .prepare_pipeline_token_kv(ModelKvPreparation {
+                    cache_id: "occupied",
+                    capacity_hint: 16,
+                    prompt: &prompt,
+                    adapter: None
+                })
                 .unwrap(),
             ModelKvReservation::Reserved(_),
         ));
         let occupied = pipeline.stages[1].kv_caches["occupied"][0]
             .paged_block_indices
             .clone();
-        let ModelKvReservation::CapacityDeferred(rejected) =
-            pipeline.prepare_token_kv("candidate", 16, 1).unwrap()
+        let ModelKvReservation::CapacityDeferred(rejected) = pipeline
+            .prepare_token_kv(ModelKvPreparation {
+                cache_id: "candidate",
+                capacity_hint: 16,
+                prompt: &prompt,
+                adapter: None,
+            })
+            .unwrap()
         else {
             panic!("the second stage's real pool is occupied");
         };
@@ -1502,7 +1536,14 @@ mod tests {
             .all(|cache| cache.len == 0 && cache.paged_block_indices == occupied));
         pipeline.stages[1].close_token_sequence("occupied").unwrap();
         assert!(matches!(
-            pipeline.prepare_token_kv("retry", 16, 1).unwrap(),
+            pipeline
+                .prepare_token_kv(ModelKvPreparation {
+                    cache_id: "retry",
+                    capacity_hint: 16,
+                    prompt: &prompt,
+                    adapter: None
+                })
+                .unwrap(),
             ModelKvReservation::Reserved(_)
         ));
         pipeline.close_token_sequence("retry").unwrap();

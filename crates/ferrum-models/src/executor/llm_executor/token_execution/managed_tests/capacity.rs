@@ -45,18 +45,11 @@ impl DecoderOnlyLLM for CapacityModel {
     fn token_execution_requires_worker(&self) -> bool {
         self.worker
     }
-    fn prepare_token_kv(
-        &mut self,
-        id: &str,
-        capacity: usize,
-        prompt: usize,
-    ) -> Result<ModelKvReservation> {
-        let reserved = self.storage.lock().prepare_token_kv(id, capacity, prompt)?;
+    fn prepare_token_kv(&mut self, request: ModelKvPreparation<'_>) -> Result<ModelKvReservation> {
+        let reserved = self.storage.lock().prepare_token_kv(request)?;
         if matches!(reserved, ModelKvReservation::Reserved(_)) {
             assert!(matches!(
-                self.numerical
-                    .lock()
-                    .prepare_token_kv(id, capacity, prompt)?,
+                self.numerical.lock().prepare_token_kv(request)?,
                 ModelKvReservation::Reserved(_)
             ));
         }
@@ -65,9 +58,12 @@ impl DecoderOnlyLLM for CapacityModel {
     fn reserve_token_kv_slots(&mut self, requests: &[KvSlotRequest]) -> Result<ModelKvReservation> {
         self.storage.lock().reserve_token_kv_slots(requests)
     }
-    fn execute_token_work(&mut self, id: &str, work: ModelTokenWork<'_>) -> ModelTokenOutcome {
+    fn execute_token_work(
+        &mut self,
+        input: &ModelTokenInput<'_>,
+    ) -> ModelTokenOutcome<ModelTokenProduct> {
         self.forwards.fetch_add(1, Ordering::Relaxed);
-        self.numerical.lock().execute_token_work(id, work)
+        self.numerical.lock().execute_token_work(input)
     }
     fn execute_token_batch(&mut self, inputs: &[ModelTokenInput<'_>]) -> ModelTokenBatchOutcome {
         if let Some(gate) = self.control.gate.lock().take() {
@@ -104,24 +100,7 @@ impl DecoderOnlyLLM for CapacityModel {
                 ModelTokenOutcome::NotSubmitted(error)
                 | ModelTokenOutcome::Terminal(Err(error)) => ModelTokenOutcome::NotSubmitted(error),
                 ModelTokenOutcome::Held(error) => ModelTokenOutcome::Held(error),
-                ModelTokenOutcome::Terminal(Ok(())) => {
-                    match self.execute_token_work(input.cache_id, input.work) {
-                        ModelTokenOutcome::Terminal(result) => {
-                            ModelTokenOutcome::Terminal(result.map(|logits| {
-                                input
-                                    .sample
-                                    .then_some(ExecutorSamplingOutput::FullLogits(logits))
-                            }))
-                        }
-                        ModelTokenOutcome::CapacityDeferred(deferred) => {
-                            ModelTokenOutcome::CapacityDeferred(deferred)
-                        }
-                        ModelTokenOutcome::NotSubmitted(error) => {
-                            ModelTokenOutcome::NotSubmitted(error)
-                        }
-                        ModelTokenOutcome::Held(error) => ModelTokenOutcome::Held(error),
-                    }
-                }
+                ModelTokenOutcome::Terminal(Ok(())) => self.execute_token_work(input),
             };
             rows.push(row);
         }

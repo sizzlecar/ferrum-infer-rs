@@ -1,8 +1,52 @@
 //! Real paged prefix reuse, with the recomputed suffix kept private.
 
 use super::*;
-use crate::common::llm::ModelKvReservation;
+use crate::common::llm::{
+    ModelKvPreparation, ModelKvReservation, ModelTokenInput, ModelTokenOutcome, ModelTokenWork,
+};
 use crate::test_support::SyntheticLlamaLoader;
+use ferrum_execution::model_executor::{ExecutorSamplingOutput, LogitsReturnPolicy};
+use std::sync::Arc;
+
+mod admission;
+
+fn preparation<'a>(cache_id: &'a str, prompt: &'a Arc<[u32]>) -> ModelKvPreparation<'a> {
+    ModelKvPreparation {
+        cache_id,
+        capacity_hint: 64,
+        prompt,
+        adapter: None,
+    }
+}
+
+fn prefill_product<B: MoeLlmBackend>(
+    model: &mut LlamaFamilyModel<B, KvFp16>,
+    cache_id: &str,
+    tokens: &[u32],
+    position: usize,
+    sample: bool,
+) -> Option<Vec<f32>> {
+    match model.execute_token_work(&ModelTokenInput {
+        cache_id,
+        work: ModelTokenWork::Prefill { tokens, position },
+        logits_policy: &LogitsReturnPolicy::FullLogits,
+        sample,
+    }) {
+        ModelTokenOutcome::Terminal(Ok(Some(ExecutorSamplingOutput::FullLogits(logits)))) => {
+            assert!(sample);
+            assert_eq!(logits.len(), model.cfg.vocab_size);
+            assert!(logits.iter().all(|value| value.is_finite()));
+            Some(logits)
+        }
+        ModelTokenOutcome::Terminal(Ok(None)) => {
+            assert!(!sample);
+            None
+        }
+        other => {
+            panic!("actual prefix work did not return the expected terminal product: {other:?}")
+        }
+    }
+}
 
 fn model<B: MoeLlmBackend>(prefix: bool) -> LlamaFamilyModel<B, KvFp16> {
     let config = LlamaFamilyConfig {
@@ -22,8 +66,8 @@ fn model<B: MoeLlmBackend>(prefix: bool) -> LlamaFamilyModel<B, KvFp16> {
     model.runtime_env.prefix_cache = prefix;
     model.runtime_env.cuda_graph = false;
     model.runtime_env.kv_capacity = Some(64);
-    // Keep admission unconstrained here: over-reservation before prefix lookup
-    // is a separate issue from sharing the block that the suffix must rewrite.
+    // Keep the existing suffix numerical oracle unconstrained. The admission
+    // child additionally checks prefix lookup in a tight three-block pool.
     model.runtime_env.kv_max_blocks = Some(8);
     model.runtime_env.paged_max_seqs = 2;
     model
@@ -36,7 +80,11 @@ fn tokenwise<B: MoeLlmBackend>(
 ) -> Vec<f32> {
     let mut logits = Vec::new();
     for &token in tokens {
-        logits = model.prefill_internal(cache_id, &[token]);
+        let position = model
+            .kv_caches
+            .get(cache_id)
+            .map_or(0, |layers| layers[0].len);
+        logits = prefill_product(model, cache_id, &[token], position, true).unwrap();
         assert_eq!(logits.len(), model.cfg.vocab_size);
         assert!(logits.iter().all(|value| value.is_finite()));
     }
@@ -88,23 +136,36 @@ fn prefix_reuse_preserves_private_suffix_and_original_owner<B: MoeLlmBackend>() 
         let mut owner_reference = model::<B>(false);
         let mut consumer_reference = model::<B>(false);
         let tokens: Vec<u32> = (1..=33).collect();
-        let producer_tokens = &tokens[..32];
+        let producer_tokens: Arc<[u32]> = Arc::from(&tokens[..32]);
+        assert!(matches!(
+            actual
+                .prepare_token_kv(preparation("owner", &producer_tokens))
+                .unwrap(),
+            ModelKvReservation::Reserved(_)
+        ));
+        assert!(matches!(
+            owner_reference
+                .prepare_token_kv(preparation("owner", &producer_tokens))
+                .unwrap(),
+            ModelKvReservation::Reserved(_)
+        ));
         assert_eq!(
-            tokenwise(&mut actual, "owner", producer_tokens),
-            tokenwise(&mut owner_reference, "owner", producer_tokens)
+            tokenwise(&mut actual, "owner", &producer_tokens),
+            tokenwise(&mut owner_reference, "owner", &producer_tokens)
         );
-        // All registered values came from the actual model's numerical core.
-        actual.register_prefix_cache("owner", producer_tokens, 0);
+        // Full prompt hashes are published by actual committed token work.
         let original_mapping = actual.kv_caches["owner"][0].paged_block_indices.clone();
         let original_bits = owner_bits(&actual, "owner");
-        let prompt = &tokens[..prompt_len];
+        let prompt: Arc<[u32]> = Arc::from(&tokens[..prompt_len]);
         assert!(matches!(
-            actual.prepare_token_kv("consumer", 64, prompt_len).unwrap(),
+            actual
+                .prepare_token_kv(preparation("consumer", &prompt))
+                .unwrap(),
             ModelKvReservation::Reserved(_)
         ));
         assert!(matches!(
             consumer_reference
-                .prepare_token_kv("consumer", 64, prompt_len)
+                .prepare_token_kv(preparation("consumer", &prompt))
                 .unwrap(),
             ModelKvReservation::Reserved(_)
         ));
@@ -118,8 +179,15 @@ fn prefix_reuse_preserves_private_suffix_and_original_owner<B: MoeLlmBackend>() 
             "consumer",
             &prompt[..shared_tokens],
         );
-        let expected = consumer_reference.prefill_internal("consumer", &prompt[shared_tokens..]);
-        let output = actual.prefill_internal("consumer", prompt);
+        let expected = prefill_product(
+            &mut consumer_reference,
+            "consumer",
+            &prompt[shared_tokens..],
+            shared_tokens,
+            true,
+        )
+        .unwrap();
+        let output = prefill_product(&mut actual, "consumer", &prompt, 0, true).unwrap();
         assert!(
             actual.kv_caches["consumer"]
                 .iter()

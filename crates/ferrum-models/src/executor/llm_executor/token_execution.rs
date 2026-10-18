@@ -9,12 +9,14 @@ use std::collections::HashMap;
 
 mod capacity;
 
+#[cfg(test)]
 use ferrum_execution::model_executor::ExecutorSamplingOutput;
 use ferrum_execution::token_execution::*;
 
 use super::*;
 use crate::common::llm::{
-    catch_host_execution, ModelKvReservation, ModelTokenOutcome, ModelTokenWork,
+    catch_host_execution, ModelKvPreparation, ModelKvReservation, ModelTokenInput,
+    ModelTokenOutcome, ModelTokenProduct, ModelTokenWork,
 };
 
 #[derive(Default)]
@@ -182,16 +184,14 @@ impl LlmExecutor {
                 device: None,
             },
         );
+        let prompt = Arc::clone(&sequences.live[&sequence].prompt);
         let preparation = catch_host_execution(|| -> Result<ModelKvReservation> {
-            let reservation = model.prepare_token_kv(
-                &cache_id,
-                context.maximum_sequence_tokens,
-                context.input_tokens.len(),
-            )?;
-            if matches!(reservation, ModelKvReservation::Reserved(_)) {
-                model.set_lora_adapter_for_cache(&cache_id, adapter)?;
-            }
-            Ok(reservation)
+            model.prepare_token_kv(ModelKvPreparation {
+                cache_id: &cache_id,
+                capacity_hint: context.maximum_sequence_tokens,
+                prompt: &prompt,
+                adapter: adapter.as_ref(),
+            })
         })
         .and_then(|result| result);
         match preparation {
@@ -292,7 +292,7 @@ impl LlmExecutor {
                 },
                 TokenWork::Decode { position, .. } => ExecutedTokenWork::Decode { position },
             };
-            let outcome = match preparation {
+            let outcome: ModelTokenOutcome<ModelTokenProduct> = match preparation {
                 Err(error) => ModelTokenOutcome::NotSubmitted(error),
                 Ok(ModelKvReservation::CapacityDeferred(deferred)) => {
                     ModelTokenOutcome::CapacityDeferred(deferred)
@@ -308,7 +308,12 @@ impl LlmExecutor {
                             position: position as u32,
                         },
                     };
-                    model.execute_token_work(&entry.cache_id, work)
+                    model.execute_token_work(&ModelTokenInput {
+                        cache_id: &entry.cache_id,
+                        work,
+                        logits_policy: input.logits_policy(),
+                        sample: !matches!(input.work(), TokenWork::Prefill(chunk) if !chunk.is_final()),
+                    })
                 }
             };
             let (progress, error) = match outcome {
@@ -362,13 +367,9 @@ impl LlmExecutor {
                     },
                     error,
                 ),
-                ModelTokenOutcome::Terminal(Ok(logits)) => {
-                    let product = match input.work() {
-                        TokenWork::Prefill(chunk) if !chunk.is_final() => {
-                            ExecutionProduct::Intermediate
-                        }
-                        _ => ExecutionProduct::Sampling(ExecutorSamplingOutput::FullLogits(logits)),
-                    };
+                ModelTokenOutcome::Terminal(Ok(product)) => {
+                    let product =
+                        product.map_or(ExecutionProduct::Intermediate, ExecutionProduct::Sampling);
                     match batch.completion(index, actual, product) {
                         Ok(completion) => {
                             entry.frontier = completion.next_frontier().clone();

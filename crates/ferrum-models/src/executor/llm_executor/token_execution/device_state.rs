@@ -158,7 +158,7 @@ impl TokenWorkerState {
         &self,
         frontier: &ExecutionFrontier,
     ) -> Result<TokenAdmissionOutcome> {
-        let (cache_id, capacity, prompt_len, adapter) = {
+        let (cache_id, capacity, prompt, adapter) = {
             let sequences = self.sequences.lock();
             let entry = sequences
                 .live
@@ -172,7 +172,7 @@ impl TokenWorkerState {
             (
                 entry.cache_id.clone(),
                 entry.maximum_tokens,
-                entry.prompt.len(),
+                Arc::clone(&entry.prompt),
                 device.adapter.clone(),
             )
         };
@@ -182,11 +182,12 @@ impl TokenWorkerState {
                 if let Some(adapter) = &adapter {
                     model.preload_lora_adapter(adapter)?;
                 }
-                let reservation = model.prepare_token_kv(&cache_id, capacity, prompt_len)?;
-                if matches!(reservation, ModelKvReservation::Reserved(_)) {
-                    model.set_lora_adapter_for_cache(&cache_id, adapter)?;
-                }
-                Ok(reservation)
+                model.prepare_token_kv(ModelKvPreparation {
+                    cache_id: &cache_id,
+                    capacity_hint: capacity,
+                    prompt: &prompt,
+                    adapter: adapter.as_ref(),
+                })
             })()
         };
         let mut sequences = self.sequences.lock();

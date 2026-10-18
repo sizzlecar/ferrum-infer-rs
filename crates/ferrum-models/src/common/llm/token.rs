@@ -2,6 +2,17 @@
 
 use ferrum_types::{FerrumError, Result};
 
+/// Immutable preparation inputs for the incarnation's actual model owner.
+/// The executor preloads the adapter; preparation must bind it before looking
+/// up reusable prompt storage. Retaining storage does not consume the prompt.
+#[derive(Clone, Copy)]
+pub struct ModelKvPreparation<'a> {
+    pub cache_id: &'a str,
+    pub capacity_hint: usize,
+    pub prompt: &'a std::sync::Arc<[u32]>,
+    pub adapter: Option<&'a crate::lora::ActiveLoraAdapter>,
+}
+
 /// An observation made by the model's actual KV allocator. A deferred fit
 /// check has not reserved the requested blocks and grants no execution right.
 #[derive(Debug)]

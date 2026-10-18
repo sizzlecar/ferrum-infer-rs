@@ -5,7 +5,9 @@ use super::*;
 use ferrum_execution::model_executor::{KvSlotRequest, KvSlotReservation};
 use ferrum_execution::token_execution::ExecutionProduct;
 use ferrum_interfaces::adapter::{AdapterExecutionSupport, LoraAdapterSelection};
-use ferrum_models::common::llm::{ModelKvReservation, ModelTokenOutcome, ModelTokenWork};
+use ferrum_models::common::llm::{
+    ModelKvPreparation, ModelKvReservation, ModelTokenInput, ModelTokenOutcome, ModelTokenProduct,
+};
 use ferrum_models::common::{DecoderOnlyLLM, LlmRuntimeConfig};
 use ferrum_models::models::LlamaFamilyModel;
 use ferrum_models::test_support::{tiny_llama_model, tiny_model_info, TinyLlamaConfig};
@@ -61,16 +63,10 @@ impl DecoderOnlyLLM for ObservedLlama {
             .set_lora_adapter_for_cache(cache_id, adapter)
     }
 
-    fn prepare_token_kv(
-        &mut self,
-        cache_id: &str,
-        capacity_hint: usize,
-        prompt_tokens: usize,
-    ) -> Result<ModelKvReservation> {
+    fn prepare_token_kv(&mut self, request: ModelKvPreparation<'_>) -> Result<ModelKvReservation> {
+        let cache_id = request.cache_id;
         let mut state = self.state.lock();
-        let reservation = state
-            .model
-            .prepare_token_kv(cache_id, capacity_hint, prompt_tokens)?;
+        let reservation = state.model.prepare_token_kv(request)?;
         if state.fail_preparation {
             assert!(matches!(reservation, ModelKvReservation::Reserved(_)));
             let lengths = state
@@ -101,12 +97,11 @@ impl DecoderOnlyLLM for ObservedLlama {
 
     fn execute_token_work(
         &mut self,
-        cache_id: &str,
-        work: ModelTokenWork<'_>,
-    ) -> ModelTokenOutcome {
+        input: &ModelTokenInput<'_>,
+    ) -> ModelTokenOutcome<ModelTokenProduct> {
         let mut state = self.state.lock();
         state.forwards += 1;
-        state.model.execute_token_work(cache_id, work)
+        state.model.execute_token_work(input)
     }
 
     fn close_token_sequence(&mut self, cache_id: &str) -> Result<()> {
@@ -335,4 +330,174 @@ async fn lora_admission_capacity_failure_preserves_existing_and_discards_new_cac
         reference_state.lock().releases[0].1,
         vec![3; cfg.num_layers]
     );
+}
+
+#[test]
+fn lora_direct_paged_preparation_commits_binding_only_after_reservation() {
+    // The production runtime snapshot is process-wide. Isolate its installation
+    // from the other real-model tests, rather than racing their constructors.
+    const CHILD: &str = "FERRUM_TEST_LORA_PAGED_PREPARATION_CHILD";
+    let test_name = std::thread::current()
+        .name()
+        .expect("Rust test thread must have its exact test name")
+        .to_owned();
+    if std::env::var(CHILD).ok().as_deref() != Some(test_name.as_str()) {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                test_name.as_str(),
+                "--test-threads=1",
+                "--nocapture",
+            ])
+            .env(CHILD, &test_name)
+            .output()
+            .expect("run isolated direct-model preparation regression");
+        assert!(
+            output.status.success(),
+            "isolated preparation regression failed: {:?}\nstdout:\n{}\nstderr:\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+
+    ferrum_types::install_runtime_snapshot(ferrum_types::RuntimeConfigSnapshot::from_env_vars([
+        ("FERRUM_METAL_PAGED_KV", "1"),
+        ("FERRUM_KV_CAPACITY", "64"),
+        ("FERRUM_KV_MAX_BLOCKS", "2"),
+        ("FERRUM_PAGED_MAX_SEQS", "2"),
+        ("FERRUM_PREFIX_CACHE", "0"),
+    ]));
+    let cfg = TinyLlamaConfig {
+        max_seq_len: 64,
+        ..TinyLlamaConfig::default()
+    };
+    let directory = model_adapter(&cfg);
+    let adapter = ActiveLoraAdapter {
+        name: "delta".to_owned(),
+        path: directory.path().to_path_buf(),
+    };
+    let mut model = tiny_llama_model(&cfg);
+    model.preload_lora_adapter(&adapter).unwrap();
+    let prompt: Arc<[u32]> = vec![0; 16].into();
+    let two_blocks: Arc<[u32]> = vec![0; 32].into();
+    let impossible_new: Arc<[u32]> = vec![0; 48].into();
+    let impossible_growth: Arc<[u32]> = vec![0; 64].into();
+
+    fn prepare(
+        model: &mut LlamaFamilyModel<CpuBackend>,
+        cache_id: &str,
+        prompt: &Arc<[u32]>,
+        adapter: Option<&ActiveLoraAdapter>,
+    ) -> Result<ModelKvReservation> {
+        model.prepare_token_kv(ModelKvPreparation {
+            cache_id,
+            capacity_hint: 64,
+            prompt,
+            adapter,
+        })
+    }
+
+    fn assert_state(model: &LlamaFamilyModel<CpuBackend>, bindings: u64, free_blocks: usize) {
+        let metrics = model.lora_metrics_snapshot().unwrap();
+        assert_eq!(metrics["active_cache_bindings"].as_u64(), Some(bindings));
+        assert_eq!(metrics["projection_applications"].as_u64(), Some(0));
+        let capacity = model.kv_slot_capacity_snapshot().unwrap();
+        assert_eq!(capacity.block_size, 16);
+        assert_eq!(capacity.total_blocks, 2);
+        assert_eq!(capacity.free_blocks, free_blocks);
+        let mut owned_blocks = std::collections::HashSet::new();
+        for layers in model.kv_caches.values() {
+            let first = layers.first().expect("real model has KV layers");
+            for layer in layers {
+                assert_eq!(layer.len, 0, "preparation must not consume prompt tokens");
+                assert_eq!(layer.paged_block_indices, first.paged_block_indices);
+            }
+            for &block in &first.paged_block_indices {
+                assert!(
+                    owned_blocks.insert(block),
+                    "base caches must not alias blocks"
+                );
+            }
+        }
+        assert_eq!(owned_blocks.len(), capacity.total_blocks - free_blocks);
+    }
+
+    assert!(matches!(
+        prepare(&mut model, "existing", &prompt, Some(&adapter)).unwrap(),
+        ModelKvReservation::Reserved(Some(_))
+    ));
+    assert_state(&model, 1, 1);
+    let original_mapping = model.kv_caches["existing"][0].paged_block_indices.clone();
+    assert!(matches!(
+        prepare(&mut model, "blocker", &prompt, None).unwrap(),
+        ModelKvReservation::Reserved(Some(_))
+    ));
+    assert_state(&model, 1, 0);
+
+    // This is the actual two-block allocator refusing one additional block,
+    // not an injected OOM or a numerical CPU paged-attention claim.
+    for (cache_id, requested_prompt, requested_adapter) in [
+        ("candidate", &prompt, Some(&adapter)),
+        ("existing", &two_blocks, None),
+    ] {
+        let ModelKvReservation::CapacityDeferred(deferred) =
+            prepare(&mut model, cache_id, requested_prompt, requested_adapter).unwrap()
+        else {
+            panic!("one-block shortfall must produce a typed capacity deferral");
+        };
+        assert_eq!(deferred.required_blocks(), 1);
+        assert_eq!(deferred.snapshot().total_blocks, 2);
+        assert_eq!(deferred.snapshot().free_blocks, 0);
+        assert_state(&model, 1, 0);
+        assert_eq!(
+            model.kv_caches["existing"][0].paged_block_indices,
+            original_mapping
+        );
+        assert!(model.kv_caches["candidate"][0]
+            .paged_block_indices
+            .is_empty());
+    }
+
+    // Both permanent errors arise from actual allocator demand after adapter
+    // validation: three new blocks cannot fit even if every live owner closes.
+    for (cache_id, requested_prompt, requested_adapter) in [
+        ("impossible", &impossible_new, Some(&adapter)),
+        ("existing", &impossible_growth, None),
+    ] {
+        assert!(matches!(
+            prepare(&mut model, cache_id, requested_prompt, requested_adapter),
+            Err(FerrumError::ResourceExhausted { .. })
+        ));
+        assert_state(&model, 1, 0);
+        assert_eq!(
+            model.kv_caches["existing"][0].paged_block_indices,
+            original_mapping
+        );
+    }
+
+    // Only actual checked release makes the deferred request satisfiable.
+    // Reusing its original, still-empty cache must publish the adapter binding
+    // after Reserved, without changing the existing len-zero binding.
+    model.close_token_sequence("blocker").unwrap();
+    assert!(!model.kv_caches.contains_key("blocker"));
+    assert_state(&model, 1, 1);
+    assert!(matches!(
+        prepare(&mut model, "candidate", &prompt, Some(&adapter)).unwrap(),
+        ModelKvReservation::Reserved(Some(_))
+    ));
+    assert_state(&model, 2, 0);
+    assert_eq!(
+        model.kv_caches["existing"][0].paged_block_indices,
+        original_mapping
+    );
+
+    model.close_token_sequence("impossible").unwrap();
+    assert_state(&model, 2, 0);
+    model.close_token_sequence("candidate").unwrap();
+    assert_state(&model, 1, 1);
+    model.close_token_sequence("existing").unwrap();
+    assert_state(&model, 0, 2);
+    assert!(model.kv_caches.is_empty());
 }

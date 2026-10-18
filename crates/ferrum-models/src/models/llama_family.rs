@@ -62,12 +62,12 @@ pub(crate) static TAIL_RESID_CALLS: AtomicU64 = AtomicU64::new(0);
 use ferrum_quantization::{Linear, WeightLoader};
 use ferrum_types::{Activation, Result};
 
-use crate::common::paged_pool::block_hash_chain;
 use crate::common::{DecoderOnlyLLM, LlmRuntimeConfig};
 use crate::lora::{load_runtime_lora_adapter, ActiveLoraAdapter, RuntimeLoraAdapter};
 
 mod allocator_reclaim;
 pub(super) mod device_execution;
+mod prefix_preparation;
 use device_execution::{DeviceFrameResult, FrameLayout, LlamaExecutionFrame};
 
 const DEFAULT_KV_CAPACITY: usize = 512;
@@ -1832,6 +1832,7 @@ pub struct LlamaFamilyModel<B: MoeLlmBackend, K: KvLayer<B> = KvFp16> {
     ///   placeholders; the real K/V live in [`Self::paged_pools`] and
     ///   the cache's `block_table` + `context_lens` index into them.
     pub kv_caches: HashMap<String, Vec<K::Layer>>,
+    prepared_prefixes: HashMap<String, prefix_preparation::PreparedPrefix>,
     /// Free pool of pre-allocated KV cache slots. Released caches return
     /// here instead of being dropped, so their device pointers stay valid
     /// across requests — critical for graph capture (pointers baked into
@@ -2042,6 +2043,7 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
             scratch,
             pending_device_frame: None,
             kv_caches: HashMap::new(),
+            prepared_prefixes: HashMap::new(),
             kv_free_pool: Vec::new(),
             paged_pools: None,
             paged_block_alloc: None,
@@ -2422,30 +2424,6 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         }
     }
 
-    fn prepare_token_kv_in_frame(
-        &mut self,
-        cache_id: &str,
-        capacity_hint: usize,
-        prompt_tokens: usize,
-    ) -> Result<crate::common::llm::ModelKvReservation> {
-        self.ensure_preparation_available()?;
-        let request = KvSlotRequest {
-            cache_id: cache_id.to_owned(),
-            target_len: prompt_tokens,
-            admission_target_len: Some(prompt_tokens),
-        };
-        if self.kv_caches.contains_key(cache_id) {
-            return self.reserve_paged_token_kv_slots(&[request]);
-        }
-        match self.run_preparation_frame(|model, frame| {
-            model.ensure_kv_in_context(&mut frame.context, cache_id, Some(capacity_hint));
-            model.reserve_paged_token_kv_slots_in_context(Some(&mut frame.context), &[request])
-        }) {
-            DeviceFrameResult::Terminal(result) => result?,
-            DeviceFrameResult::Rejected(error) | DeviceFrameResult::Held(error) => Err(error),
-        }
-    }
-
     pub(crate) fn reserve_paged_token_kv_slots(
         &mut self,
         requests: &[KvSlotRequest],
@@ -2655,148 +2633,6 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
             free_blocks_after,
             allocations: plans,
         })))
-    }
-
-    fn record_prefix_cache_probe(&mut self, saved_tokens: usize) {
-        if saved_tokens > 0 {
-            self.prefix_cache_hits += 1;
-            self.prefix_cache_saved_prefill_tokens += saved_tokens as u64;
-        } else {
-            self.prefix_cache_misses += 1;
-        }
-    }
-
-    fn try_acquire_prefix_cache(
-        &mut self,
-        ctx: &mut B::Context,
-        cache_id: &str,
-        tokens: &[u32],
-    ) -> usize {
-        let Some(alloc_arc) = self.paged_block_alloc.as_ref() else {
-            return 0;
-        };
-        let caches = match self.kv_caches.get(cache_id) {
-            Some(caches) => caches,
-            None => return 0,
-        };
-        let block_size = caches.first().map(K::block_size).unwrap_or(0);
-        if block_size == 0 {
-            return 0;
-        }
-
-        // Final logits require at least one freshly computed token. Acquire
-        // only complete blocks strictly before that suffix: backing up the
-        // logical length after acquisition would leave the recomputed suffix
-        // pointing at another sequence's shared physical block.
-        let token_ids: Vec<ferrum_types::TokenId> = tokens[..tokens.len().saturating_sub(1)]
-            .iter()
-            .map(|&token| ferrum_types::TokenId::new(token))
-            .collect();
-        let hashes = block_hash_chain(&token_ids, block_size);
-        if hashes.is_empty() {
-            return 0;
-        }
-
-        let mut alloc = alloc_arc.lock().unwrap_or_else(|p| p.into_inner());
-        let mut matched = Vec::with_capacity(hashes.len());
-        for hash in hashes {
-            match alloc.try_acquire_by_hash(hash) {
-                Some(block) => matched.push(block),
-                None => break,
-            }
-        }
-        if matched.is_empty() {
-            return 0;
-        }
-        let n_matched = matched.len();
-
-        let displaced = caches
-            .first()
-            .map(|cache| {
-                let existing = K::paged_block_indices(cache);
-                existing[..n_matched.min(existing.len())].to_vec()
-            })
-            .unwrap_or_default();
-        alloc.free(&displaced);
-        drop(alloc);
-
-        let caches_mut = self.kv_caches.get_mut(cache_id).expect("cache present");
-        let max_blocks = caches_mut
-            .first()
-            .map(|cache| K::paged_block_indices(cache).len())
-            .unwrap_or(0);
-        let new_len = n_matched * block_size;
-        for cache in caches_mut.iter_mut() {
-            {
-                let indices = K::paged_block_indices_mut(cache);
-                if indices.len() < matched.len() {
-                    indices.resize(matched.len(), 0);
-                }
-                for (idx, &block) in matched.iter().enumerate() {
-                    indices[idx] = block;
-                }
-            }
-            K::set_len(cache, new_len);
-            let padded = {
-                let mut padded = K::paged_block_indices(cache).to_vec();
-                padded.resize(max_blocks, 0);
-                padded
-            };
-            if let Some(block_table) = K::block_table_mut(cache) {
-                B::write_typed::<u32>(ctx, block_table, &padded);
-            }
-            if let Some(context_lens) = K::context_lens_mut(cache) {
-                B::write_typed::<u32>(ctx, context_lens, &[new_len as u32]);
-            }
-        }
-        // Metal table writes are synchronous unified-memory stores and may
-        // create no command buffer. This flush is not a terminal certificate
-        // for the later model forward, which observes its actual context.
-        B::sync(ctx);
-
-        new_len
-    }
-
-    fn register_prefix_cache(
-        &mut self,
-        cache_id: &str,
-        all_tokens: &[u32],
-        prior_cached_tokens: usize,
-    ) {
-        let Some(alloc_arc) = self.paged_block_alloc.as_ref() else {
-            return;
-        };
-        let caches = match self.kv_caches.get(cache_id) {
-            Some(caches) => caches,
-            None => return,
-        };
-        let cache0 = match caches.first() {
-            Some(cache) => cache,
-            None => return,
-        };
-        let block_size = K::block_size(cache0);
-        if block_size == 0 {
-            return;
-        }
-
-        let token_ids: Vec<ferrum_types::TokenId> = all_tokens
-            .iter()
-            .map(|&token| ferrum_types::TokenId::new(token))
-            .collect();
-        let hashes = block_hash_chain(&token_ids, block_size);
-        if hashes.is_empty() {
-            return;
-        }
-
-        let start_block = prior_cached_tokens / block_size;
-        let mut alloc = alloc_arc.lock().unwrap_or_else(|p| p.into_inner());
-        for i in start_block..hashes.len().min(K::paged_block_indices(cache0).len()) {
-            let block_end_token = (i + 1) * block_size;
-            if block_end_token > K::len(cache0) {
-                break;
-            }
-            alloc.register_block_hash(K::paged_block_indices(cache0)[i], hashes[i]);
-        }
     }
 
     fn prefix_cache_snapshot_json(&self) -> serde_json::Value {
@@ -3910,6 +3746,13 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
     /// `pos_offset = cache.len` the same way prefill_internal does, so
     /// chunked prefill semantics carry over for free.
     pub fn forward_verify(&mut self, cache_id: &str, tokens: &[u32]) -> Vec<f32> {
+        self.validate_prepared_legacy_write(
+            cache_id,
+            self.cache_len(cache_id),
+            tokens.len(),
+            Some(tokens),
+        )
+        .unwrap_or_else(|error| std::panic::panic_any(error));
         let seq_len = tokens.len();
         assert!(seq_len > 0, "forward_verify called with empty tokens");
         self.ensure_scratch(seq_len);
@@ -4057,6 +3900,32 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
     /// `[kv_len, kv_len + tokens.len())` so RoPE and causal masking stay
     /// aligned. Used by the engine's chunked-prefill path.
     pub fn prefill_internal(&mut self, cache_id: &str, tokens: &[u32]) -> Vec<f32> {
+        if self.prepared_prefixes.contains_key(cache_id) {
+            use crate::common::llm::{ModelTokenInput, ModelTokenOutcome, ModelTokenWork};
+            use ferrum_execution::model_executor::ExecutorSamplingOutput;
+            let position = self.cache_len(cache_id);
+            return match self.execute_managed_token_work(&ModelTokenInput {
+                cache_id,
+                work: ModelTokenWork::Prefill { tokens, position },
+                logits_policy: &LogitsReturnPolicy::FullLogits,
+                sample: true,
+            }) {
+                ModelTokenOutcome::Terminal(Ok(Some(ExecutorSamplingOutput::FullLogits(
+                    logits,
+                )))) => logits,
+                ModelTokenOutcome::Terminal(Err(error))
+                | ModelTokenOutcome::NotSubmitted(error)
+                | ModelTokenOutcome::Held(error) => std::panic::panic_any(error),
+                ModelTokenOutcome::CapacityDeferred(_) => {
+                    std::panic::panic_any(ferrum_types::FerrumError::resource_exhausted(
+                        "prepared prefill capacity deferred",
+                    ))
+                }
+                ModelTokenOutcome::Terminal(Ok(_)) => {
+                    panic!("full-logit prefill returned an incompatible product")
+                }
+            };
+        }
         self.run_device_frame(|model, frame| model.prefill_in_frame(frame, cache_id, tokens))
             .into_legacy_result()
     }
@@ -4070,46 +3939,27 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         assert!(!tokens.is_empty(), "prefill called with empty token list");
         self.ensure_kv_in_context(&mut frame.context, cache_id, None);
 
-        let cache_len_before = self
+        let position = self
             .kv_caches
             .get(cache_id)
             .and_then(|layers| layers.first())
             .map(K::len)
             .unwrap_or(0);
-        let cached_prefix_tokens = if self.runtime_env.prefix_cache && cache_len_before == 0 {
-            self.try_acquire_prefix_cache(&mut frame.context, cache_id, tokens)
-        } else {
-            0
-        };
-        if self.runtime_env.prefix_cache && cache_len_before == 0 {
-            self.record_prefix_cache_probe(cached_prefix_tokens);
-        }
-
-        if cached_prefix_tokens > 0 {
-            let caches_mut = self.kv_caches.get_mut(cache_id).expect("cache present");
-            for cache in caches_mut.iter_mut() {
-                if K::len(cache) != cached_prefix_tokens {
-                    K::set_len(cache, cached_prefix_tokens);
-                    if let Some(context_lens) = K::context_lens_mut(cache) {
-                        B::write_typed::<u32>(
-                            &mut frame.context,
-                            context_lens,
-                            &[cached_prefix_tokens as u32],
-                        );
-                    }
-                }
-            }
-            // The table update can be a host store on unified memory; no
-            // device submission is required for this preparation step.
-            B::sync(&mut frame.context);
-        }
-
-        let suffix_tokens = &tokens[cached_prefix_tokens..];
-        let seq_len = suffix_tokens.len();
-        assert!(
-            seq_len > 0,
-            "prefix cache must leave at least one suffix token"
+        self.validate_prepared_prompt(
+            cache_id,
+            crate::common::llm::ModelTokenWork::Prefill { tokens, position },
+        )
+        .unwrap_or_else(|error| std::panic::panic_any(error));
+        assert_eq!(
+            self.reusable_prefix_for_work(
+                cache_id,
+                crate::common::llm::ModelTokenWork::Prefill { tokens, position }
+            ),
+            0,
+            "prepared shared prefix must be consumed before encoding the private suffix"
         );
+        let suffix_tokens = tokens;
+        let seq_len = tokens.len();
         self.ensure_scratch(seq_len);
 
         // Starting position for this chunk — 0 for a fresh prefill, kv_len
@@ -4373,68 +4223,23 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
             write_f32_dump(dir, "logits", &v);
         }
 
-        if self.runtime_env.prefix_cache && cache_len_before == 0 {
-            self.register_prefix_cache(cache_id, tokens, cached_prefix_tokens);
-        }
-
         let logits = B::to_vec(&self.scratch.logits, vocab);
         frame.completed = Some(quiescent);
         logits
     }
 
-    /// Decode: process 1 token at position `pos`, return `[vocab_size]` logits.
     pub(crate) fn execute_host_token_work(
         &mut self,
-        cache_id: &str,
-        work: crate::common::llm::ModelTokenWork<'_>,
-    ) -> crate::common::llm::ModelTokenOutcome {
-        use crate::common::llm::{catch_host_execution, ModelTokenOutcome, ModelTokenWork};
+        input: &crate::common::llm::ModelTokenInput<'_>,
+    ) -> crate::common::llm::ModelTokenOutcome<crate::common::llm::ModelTokenProduct> {
         if !B::host_execution_is_synchronous() {
-            return ModelTokenOutcome::NotSubmitted(ferrum_types::FerrumError::unsupported(
-                "device token execution requires retained submission-context ownership",
-            ));
+            return crate::common::llm::ModelTokenOutcome::NotSubmitted(
+                ferrum_types::FerrumError::unsupported(
+                    "device token execution requires retained submission-context ownership",
+                ),
+            );
         }
-        let (position, count, tokens_valid) = match work {
-            ModelTokenWork::Prefill { tokens, position } => (
-                position,
-                tokens.len(),
-                tokens
-                    .iter()
-                    .all(|&token| (token as usize) < self.cfg.vocab_size),
-            ),
-            ModelTokenWork::Decode { token, position } => {
-                (position as usize, 1, (token as usize) < self.cfg.vocab_size)
-            }
-        };
-        if count == 0
-            || !tokens_valid
-            || position.checked_add(count).is_none_or(|end| {
-                end > self.runtime_env.kv_capacity_for_model(self.cfg.max_seq_len)
-                    || end > u32::MAX as usize
-            })
-            || self
-                .kv_caches
-                .get(cache_id)
-                .is_some_and(|layers| layers.iter().any(|cache| K::len(cache) != position))
-            || (!self.kv_caches.contains_key(cache_id) && position != 0)
-        {
-            return ModelTokenOutcome::NotSubmitted(ferrum_types::FerrumError::request_validation(
-                "token work does not match the model's live per-layer KV frontier",
-            ));
-        }
-        let result = catch_host_execution(|| match work {
-            ModelTokenWork::Prefill { tokens, .. } => self.prefill_internal(cache_id, tokens),
-            ModelTokenWork::Decode { token, position } => {
-                self.decode_internal(cache_id, token, position)
-            }
-        });
-        if result.is_err() {
-            // Host operations have finished even when a layer panics. Rebuild
-            // only scratch that the unwinding core may have taken out; never
-            // reset another sequence's KV or claim the failed range committed.
-            self.recover_host_token_scratch();
-        }
-        ModelTokenOutcome::Terminal(result)
+        self.execute_managed_token_work(input)
     }
 
     pub(crate) fn recover_host_token_scratch(&mut self) {
@@ -4461,6 +4266,7 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
             }
         };
         self.ensure_preparation_available()?;
+        self.validate_prepared_prompt(cache_id, work)?;
         if count == 0
             || !valid
             || position
@@ -4502,10 +4308,12 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
 
     pub(crate) fn execute_managed_token_work(
         &mut self,
-        cache_id: &str,
-        work: crate::common::llm::ModelTokenWork<'_>,
-    ) -> crate::common::llm::ModelTokenOutcome {
+        input: &crate::common::llm::ModelTokenInput<'_>,
+    ) -> crate::common::llm::ModelTokenOutcome<crate::common::llm::ModelTokenProduct> {
         use crate::common::llm::{ModelTokenOutcome, ModelTokenWork};
+        use ferrum_execution::model_executor::ExecutorSamplingOutput;
+        let cache_id = input.cache_id;
+        let work = input.work;
         if let Err(error) = self.validate_managed_token_work(cache_id, work) {
             return ModelTokenOutcome::NotSubmitted(error);
         }
@@ -4513,6 +4321,14 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
             ModelTokenWork::Prefill { tokens, position } => position + tokens.len(),
             ModelTokenWork::Decode { position, .. } => position as usize + 1,
         };
+        let reused = self.reusable_prefix_for_work(cache_id, work);
+        let cached_only =
+            matches!(work, ModelTokenWork::Prefill { tokens, .. } if reused == tokens.len());
+        if cached_only && input.sample {
+            return ModelTokenOutcome::NotSubmitted(ferrum_types::FerrumError::request_validation(
+                "a fully cached intermediate chunk cannot supply sampling logits",
+            ));
+        }
         match self.prepare_managed_token_capacity(&[KvSlotRequest {
             cache_id: cache_id.to_owned(),
             target_len,
@@ -4522,22 +4338,47 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
             ModelTokenOutcome::CapacityDeferred(deferred) => {
                 return ModelTokenOutcome::CapacityDeferred(deferred)
             }
-            ModelTokenOutcome::NotSubmitted(error) => {
+            ModelTokenOutcome::NotSubmitted(error) | ModelTokenOutcome::Terminal(Err(error)) => {
                 return ModelTokenOutcome::NotSubmitted(error)
             }
             ModelTokenOutcome::Held(error) => return ModelTokenOutcome::Held(error),
-            ModelTokenOutcome::Terminal(Err(error)) => {
-                return ModelTokenOutcome::NotSubmitted(error)
-            }
         }
-        match self.run_device_frame(|model, frame| match work {
-            ModelTokenWork::Prefill { tokens, .. } => {
-                model.prefill_in_frame(frame, cache_id, tokens)
-            }
-            ModelTokenWork::Decode { token, position } => {
-                model.decode_in_frame(frame, cache_id, token, position)
-            }
-        }) {
+        let result = if cached_only {
+            // Unified-memory length updates may encode no device operation.
+            // The preparation frame proves this precise host-only case; an
+            // empty ordinary execution context is never forged as completed.
+            self.run_preparation_frame(|model, frame| {
+                model.advance_cached_prefix(&mut frame.context, cache_id, target_len);
+                None
+            })
+        } else {
+            self.run_device_frame(|model, frame| {
+                let logits = match work {
+                    ModelTokenWork::Prefill { tokens, position } => {
+                        if reused != 0 {
+                            model.advance_cached_prefix(
+                                &mut frame.context,
+                                cache_id,
+                                position + reused,
+                            );
+                        }
+                        model.prefill_in_frame(frame, cache_id, &tokens[reused..])
+                    }
+                    ModelTokenWork::Decode { token, position } => {
+                        model.decode_in_frame(frame, cache_id, token, position)
+                    }
+                };
+                input
+                    .sample
+                    .then_some(ExecutorSamplingOutput::FullLogits(logits))
+            })
+        };
+        if matches!(&result, DeviceFrameResult::Terminal(Ok(_)))
+            && matches!(work, ModelTokenWork::Prefill { .. })
+        {
+            self.publish_prepared_prefix(cache_id, reused);
+        }
+        match result {
             DeviceFrameResult::Rejected(error) => ModelTokenOutcome::NotSubmitted(error),
             DeviceFrameResult::Terminal(result) => ModelTokenOutcome::Terminal(result),
             DeviceFrameResult::Held(error) => ModelTokenOutcome::Held(error),
@@ -4549,7 +4390,6 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         inputs: &[crate::common::llm::ModelTokenInput<'_>],
     ) -> crate::common::llm::ModelTokenBatchOutcome {
         use crate::common::llm::{ModelTokenBatchOutcome, ModelTokenOutcome};
-        use ferrum_execution::model_executor::ExecutorSamplingOutput;
         let mut rows = Vec::with_capacity(inputs.len());
         let mut held = false;
         for input in inputs {
@@ -4558,17 +4398,11 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
                     "earlier participant retains the model context",
                 ))
             } else {
-                match self.execute_managed_token_work(input.cache_id, input.work) {
+                match self.execute_managed_token_work(input) {
                     ModelTokenOutcome::CapacityDeferred(deferred) => {
                         ModelTokenOutcome::CapacityDeferred(deferred)
                     }
-                    ModelTokenOutcome::Terminal(result) => {
-                        ModelTokenOutcome::Terminal(result.map(|logits| {
-                            input
-                                .sample
-                                .then_some(ExecutorSamplingOutput::FullLogits(logits))
-                        }))
-                    }
+                    ModelTokenOutcome::Terminal(result) => ModelTokenOutcome::Terminal(result),
                     ModelTokenOutcome::NotSubmitted(error) => {
                         ModelTokenOutcome::NotSubmitted(error)
                     }
@@ -4600,6 +4434,7 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         self.graph_warmup = 0;
         self.graph_capture_failed = false;
         self.lora_cache_adapters.remove(cache_id);
+        self.prepared_prefixes.remove(cache_id);
         if let Some(mut caches) = self.kv_caches.remove(cache_id) {
             if let Some(allocator) = &self.paged_block_alloc {
                 let mut allocator = allocator
@@ -4622,6 +4457,8 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
 
     /// Decode: process 1 token at position `pos`, return `[vocab_size]` logits.
     pub fn decode_internal(&mut self, cache_id: &str, token: u32, pos: u32) -> Vec<f32> {
+        self.validate_prepared_legacy_decode(cache_id, token, pos)
+            .unwrap_or_else(|error| std::panic::panic_any(error));
         self.run_device_frame(|model, frame| model.decode_in_frame(frame, cache_id, token, pos))
             .into_legacy_result()
     }
@@ -4921,6 +4758,8 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         tokens: &[u32],
         pos_offset: usize,
     ) -> Vec<f32> {
+        self.validate_prepared_legacy_write(cache_id, pos_offset, tokens.len(), Some(tokens))
+            .unwrap_or_else(|error| std::panic::panic_any(error));
         let seq_len = tokens.len();
         assert!(seq_len > 0, "stage token forward called with zero length");
         self.ensure_scratch(seq_len);
@@ -5044,6 +4883,8 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         seq_len: usize,
         pos_offset: usize,
     ) -> (Vec<f32>, LlamaStageHiddenBridgeTiming) {
+        self.validate_prepared_legacy_write(cache_id, pos_offset, seq_len, None)
+            .unwrap_or_else(|error| std::panic::panic_any(error));
         let h = self.cfg.hidden_size;
         assert_eq!(
             hidden.len(),
@@ -5182,6 +5023,8 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         embeds: &[f32],
         seq_len: usize,
     ) -> Vec<f32> {
+        self.validate_prepared_legacy_write(cache_id, 0, seq_len, None)
+            .unwrap_or_else(|error| std::panic::panic_any(error));
         let h = self.cfg.hidden_size;
         assert_eq!(
             embeds.len(),
@@ -5227,6 +5070,8 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
     /// Returns the pre-norm hidden state for the position `pos`. Caller
     /// applies final norm + its own output head.
     pub fn decode_from_embed(&mut self, cache_id: &str, embed: &[f32], pos: u32) -> Vec<f32> {
+        self.validate_prepared_legacy_write(cache_id, pos as usize, 1, None)
+            .unwrap_or_else(|error| std::panic::panic_any(error));
         let h = self.cfg.hidden_size;
         assert_eq!(
             embed.len(),
@@ -5276,6 +5121,8 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         seq_len: usize,
         pos_offset: usize,
     ) -> Vec<f32> {
+        self.validate_prepared_legacy_write(cache_id, pos_offset, seq_len, None)
+            .unwrap_or_else(|error| std::panic::panic_any(error));
         let h = self.cfg.hidden_size;
         assert_eq!(
             embeds.len(),
@@ -5327,6 +5174,8 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         embed: &[f32],
         pos: u32,
     ) -> Vec<f32> {
+        self.validate_prepared_legacy_write(cache_id, pos as usize, 1, None)
+            .unwrap_or_else(|error| std::panic::panic_any(error));
         let h = self.cfg.hidden_size;
         assert_eq!(embed.len(), h);
 
@@ -5387,13 +5236,12 @@ impl<B: MoeLlmBackend> DecoderOnlyLLM for LlamaFamilyModel<B, KvFp16> {
 
     fn execute_token_work(
         &mut self,
-        cache_id: &str,
-        work: crate::common::llm::ModelTokenWork<'_>,
-    ) -> crate::common::llm::ModelTokenOutcome {
+        input: &crate::common::llm::ModelTokenInput<'_>,
+    ) -> crate::common::llm::ModelTokenOutcome<crate::common::llm::ModelTokenProduct> {
         if B::host_execution_is_synchronous() {
-            self.execute_host_token_work(cache_id, work)
+            self.execute_host_token_work(input)
         } else {
-            self.execute_managed_token_work(cache_id, work)
+            self.execute_managed_token_work(input)
         }
     }
 
@@ -5462,6 +5310,7 @@ impl<B: MoeLlmBackend> DecoderOnlyLLM for LlamaFamilyModel<B, KvFp16> {
 
         const WARMUP_CACHE: &str = "__ferrum_warmup__";
         let _ = self.prefill_internal(WARMUP_CACHE, &[0u32]);
+        self.prepared_prefixes.remove(WARMUP_CACHE);
         if let Some(mut caches) = self.kv_caches.remove(WARMUP_CACHE) {
             if let Some(alloc_arc) = self.paged_block_alloc.as_ref() {
                 let mut alloc = alloc_arc.lock().unwrap_or_else(|p| p.into_inner());
@@ -5484,11 +5333,9 @@ impl<B: MoeLlmBackend> DecoderOnlyLLM for LlamaFamilyModel<B, KvFp16> {
 
     fn prepare_token_kv(
         &mut self,
-        cache_id: &str,
-        capacity_hint: usize,
-        prompt_tokens: usize,
+        request: crate::common::llm::ModelKvPreparation<'_>,
     ) -> Result<crate::common::llm::ModelKvReservation> {
-        self.prepare_token_kv_in_frame(cache_id, capacity_hint, prompt_tokens)
+        self.prepare_token_kv_in_frame(request)
     }
 
     fn kv_capacity(&self) -> usize {
@@ -5562,16 +5409,8 @@ impl<B: MoeLlmBackend> DecoderOnlyLLM for LlamaFamilyModel<B, KvFp16> {
         if items.is_empty() {
             return Ok(Vec::new());
         }
-        if self.runtime_env.prefix_cache
-            && items
-                .iter()
-                .any(|(_, tokens, pos_offset, _)| *pos_offset == 0 && tokens.len() > 1)
-        {
-            return Err(ferrum_types::FerrumError::unsupported(
-                "LlamaFamilyModel::unified_forward: fresh prefill with prefix cache enabled \
-                 routes through prefill_internal so real paged-block KV reuse can probe and \
-                 register block hashes",
-            ));
+        for (cache_id, tokens, position, _) in items {
+            self.validate_prepared_legacy_write(cache_id, *position, tokens.len(), Some(tokens))?;
         }
         if !self.supports_varlen_qkv {
             let reason = unified_varlen_qkv_unsupported_reason(
@@ -5619,6 +5458,8 @@ impl<B: MoeLlmBackend> DecoderOnlyLLM for LlamaFamilyModel<B, KvFp16> {
     }
 
     fn truncate_kv(&mut self, cache_id: &str, new_len: usize) {
+        self.validate_prepared_truncate(cache_id, new_len)
+            .unwrap_or_else(|error| std::panic::panic_any(error));
         if let Some(caches) = self.kv_caches.get_mut(cache_id) {
             for c in caches.iter_mut() {
                 if new_len < c.len {
@@ -5638,6 +5479,7 @@ impl<B: MoeLlmBackend> DecoderOnlyLLM for LlamaFamilyModel<B, KvFp16> {
         self.graph_warmup = 0;
         self.graph_capture_failed = false;
         self.lora_cache_adapters.remove(cache_id);
+        self.prepared_prefixes.remove(cache_id);
         if let Some(mut caches) = self.kv_caches.remove(cache_id) {
             if let Some(alloc_arc) = self.paged_block_alloc.as_ref() {
                 let mut alloc = alloc_arc.lock().unwrap_or_else(|p| p.into_inner());
@@ -5664,6 +5506,7 @@ impl<B: MoeLlmBackend> DecoderOnlyLLM for LlamaFamilyModel<B, KvFp16> {
         self.batched_graph_keys_seen.clear();
         self.batched_graph_warmup = 0;
         self.batched_graph_failed = false;
+        self.prepared_prefixes.clear();
         self.kv_caches.clear();
         self.kv_free_pool.clear();
         self.paged_pools = None;
@@ -5700,13 +5543,12 @@ impl<B: MoeLlmBackend + BackendInt8KvOps> DecoderOnlyLLM for LlamaFamilyModel<B,
 
     fn execute_token_work(
         &mut self,
-        cache_id: &str,
-        work: crate::common::llm::ModelTokenWork<'_>,
-    ) -> crate::common::llm::ModelTokenOutcome {
+        input: &crate::common::llm::ModelTokenInput<'_>,
+    ) -> crate::common::llm::ModelTokenOutcome<crate::common::llm::ModelTokenProduct> {
         if B::host_execution_is_synchronous() {
-            self.execute_host_token_work(cache_id, work)
+            self.execute_host_token_work(input)
         } else {
-            self.execute_managed_token_work(cache_id, work)
+            self.execute_managed_token_work(input)
         }
     }
 
@@ -5775,6 +5617,7 @@ impl<B: MoeLlmBackend + BackendInt8KvOps> DecoderOnlyLLM for LlamaFamilyModel<B,
 
         const WARMUP_CACHE: &str = "__ferrum_warmup__";
         let _ = self.prefill_internal(WARMUP_CACHE, &[0u32]);
+        self.prepared_prefixes.remove(WARMUP_CACHE);
         if let Some(mut caches) = self.kv_caches.remove(WARMUP_CACHE) {
             if let Some(alloc_arc) = self.paged_block_alloc.as_ref() {
                 let mut alloc = alloc_arc.lock().unwrap_or_else(|p| p.into_inner());
@@ -5797,11 +5640,9 @@ impl<B: MoeLlmBackend + BackendInt8KvOps> DecoderOnlyLLM for LlamaFamilyModel<B,
 
     fn prepare_token_kv(
         &mut self,
-        cache_id: &str,
-        capacity_hint: usize,
-        prompt_tokens: usize,
+        request: crate::common::llm::ModelKvPreparation<'_>,
     ) -> Result<crate::common::llm::ModelKvReservation> {
-        self.prepare_token_kv_in_frame(cache_id, capacity_hint, prompt_tokens)
+        self.prepare_token_kv_in_frame(request)
     }
 
     fn kv_capacity(&self) -> usize {
@@ -5847,6 +5688,8 @@ impl<B: MoeLlmBackend + BackendInt8KvOps> DecoderOnlyLLM for LlamaFamilyModel<B,
     }
 
     fn truncate_kv(&mut self, cache_id: &str, new_len: usize) {
+        self.validate_prepared_truncate(cache_id, new_len)
+            .unwrap_or_else(|error| std::panic::panic_any(error));
         if let Some(caches) = self.kv_caches.get_mut(cache_id) {
             for c in caches.iter_mut() {
                 if new_len < c.len {
@@ -5866,6 +5709,7 @@ impl<B: MoeLlmBackend + BackendInt8KvOps> DecoderOnlyLLM for LlamaFamilyModel<B,
         self.graph_warmup = 0;
         self.graph_capture_failed = false;
         self.lora_cache_adapters.remove(cache_id);
+        self.prepared_prefixes.remove(cache_id);
         if let Some(mut caches) = self.kv_caches.remove(cache_id) {
             if let Some(alloc_arc) = self.paged_block_alloc.as_ref() {
                 let mut alloc = alloc_arc.lock().unwrap_or_else(|p| p.into_inner());
@@ -5889,6 +5733,7 @@ impl<B: MoeLlmBackend + BackendInt8KvOps> DecoderOnlyLLM for LlamaFamilyModel<B,
         B::sync(&mut ctx);
         self.graph_warmup = 0;
         self.graph_capture_failed = false;
+        self.prepared_prefixes.clear();
         self.kv_caches.clear();
         self.kv_free_pool.clear();
         self.paged_pools = None;

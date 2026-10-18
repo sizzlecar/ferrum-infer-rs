@@ -2045,6 +2045,9 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
         items: &[(String, Vec<u32>, usize, bool)],
         logits_policies: Option<&[LogitsReturnPolicy]>,
     ) -> Result<Vec<Option<ExecutorSamplingOutput>>> {
+        for (cache_id, tokens, position, _) in items {
+            self.validate_prepared_legacy_write(cache_id, *position, tokens.len(), Some(tokens))?;
+        }
         if items.is_empty() {
             return Ok(Vec::new());
         }
@@ -3671,14 +3674,14 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
                 },
             );
         }
-        let fresh_prefix = self.runtime_env.prefix_cache && inputs.iter().any(|input| {
-            matches!(input.work, ModelTokenWork::Prefill { tokens, position: 0 } if tokens.len() > 1)
-        });
+        let reused_prefix = inputs
+            .iter()
+            .any(|input| self.reusable_prefix_for_work(input.cache_id, input.work) != 0);
         if !all_decode
             && self.supports_varlen_qkv
             && self.paged_pools.is_some()
             && !has_lora
-            && !fresh_prefix
+            && !reused_prefix
         {
             let items: Vec<_> = inputs
                 .iter()
@@ -3692,17 +3695,23 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
                     (input.cache_id.to_owned(), tokens, position, input.sample)
                 })
                 .collect();
-            return ModelTokenBatchOutcome::Cohort(
-                match self.run_device_frame(|model, frame| {
-                    model.unified_in_frame(frame, &items, Some(&policies))
-                }) {
-                    DeviceFrameResult::Rejected(error) => ModelTokenOutcome::NotSubmitted(error),
-                    DeviceFrameResult::Held(error) => ModelTokenOutcome::Held(error),
-                    DeviceFrameResult::Terminal(result) => {
-                        ModelTokenOutcome::Terminal(result.and_then(|rows| rows))
+            let outcome = self.run_device_frame(|model, frame| {
+                model.unified_in_frame(frame, &items, Some(&policies))
+            });
+            if matches!(&outcome, DeviceFrameResult::Terminal(Ok(Ok(_)))) {
+                for input in inputs {
+                    if matches!(input.work, ModelTokenWork::Prefill { .. }) {
+                        self.publish_prepared_prefix(input.cache_id, 0);
                     }
-                },
-            );
+                }
+            }
+            return ModelTokenBatchOutcome::Cohort(match outcome {
+                DeviceFrameResult::Rejected(error) => ModelTokenOutcome::NotSubmitted(error),
+                DeviceFrameResult::Held(error) => ModelTokenOutcome::Held(error),
+                DeviceFrameResult::Terminal(result) => {
+                    ModelTokenOutcome::Terminal(result.and_then(|rows| rows))
+                }
+            });
         }
         self.execute_managed_serial_tokens(inputs)
     }
@@ -3727,6 +3736,10 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
         batch: &[(String, u32, u32)],
         logits_return: DecodeLogitsReturn<'_>,
     ) -> Vec<ExecutorSamplingOutput> {
+        for (cache_id, token, position) in batch {
+            self.validate_prepared_legacy_decode(cache_id, *token, *position)
+                .unwrap_or_else(|error| std::panic::panic_any(error));
+        }
         let force_full_logits = matches!(&logits_return, DecodeLogitsReturn::Full);
         let m = batch.len();
         if m == 0 {
@@ -4335,6 +4348,10 @@ impl<B: MoeLlmBackend> LlamaPipelineStageBatchOps<B> for LlamaFamilyModel<B, KvF
         &mut self,
         batch: &[(String, u32, u32)],
     ) -> PipelineHidden<B> {
+        for (cache_id, token, position) in batch {
+            self.validate_prepared_legacy_decode(cache_id, *token, *position)
+                .unwrap_or_else(|error| std::panic::panic_any(error));
+        }
         if batch.is_empty() {
             return PipelineHidden::host(Vec::new(), 0, self.cfg.hidden_size);
         }
@@ -4386,6 +4403,10 @@ impl<B: MoeLlmBackend> LlamaPipelineStageBatchOps<B> for LlamaFamilyModel<B, KvF
         batch: &[(String, u32, u32)],
         hidden: &PipelineHidden<B>,
     ) -> (PipelineHidden<B>, LlamaStageHiddenBridgeTiming) {
+        for (cache_id, _, position) in batch {
+            self.validate_prepared_legacy_write(cache_id, *position as usize, 1, None)
+                .unwrap_or_else(|error| std::panic::panic_any(error));
+        }
         if batch.is_empty() {
             return (
                 PipelineHidden::host(Vec::new(), 0, self.cfg.hidden_size),

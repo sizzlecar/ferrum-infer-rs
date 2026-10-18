@@ -10,7 +10,9 @@ use ferrum_execution::model_executor::{
 use ferrum_execution::token_execution::*;
 use ferrum_kernels::backend::cpu::CpuBackend;
 use ferrum_kv::{PagedKvCacheConfig, PagedKvCacheManager};
-use ferrum_models::common::llm::{ModelTokenOutcome, ModelTokenWork};
+use ferrum_models::common::llm::{
+    ModelKvPreparation, ModelKvReservation, ModelTokenInput, ModelTokenOutcome, ModelTokenProduct,
+};
 use ferrum_models::models::LlamaFamilyModel;
 use ferrum_models::test_support::{
     tiny_llama_model, tiny_model_info, TinyLlamaConfig, TinyTokenizer,
@@ -38,8 +40,8 @@ impl DecoderOnlyLLM for ObservedModel {
     fn supports_direct_token_execution(&self) -> bool {
         true
     }
-    fn prepare_kv_capacity(&mut self, id: &str, capacity: usize) {
-        self.state.lock().model.prepare_kv_capacity(id, capacity);
+    fn prepare_token_kv(&mut self, request: ModelKvPreparation<'_>) -> Result<ModelKvReservation> {
+        self.state.lock().model.prepare_token_kv(request)
     }
     fn reserve_kv_slots(
         &mut self,
@@ -47,8 +49,11 @@ impl DecoderOnlyLLM for ObservedModel {
     ) -> Result<Option<ferrum_execution::model_executor::KvSlotReservation>> {
         self.state.lock().model.reserve_kv_slots(requests)
     }
-    fn execute_token_work(&mut self, id: &str, work: ModelTokenWork<'_>) -> ModelTokenOutcome {
-        self.state.lock().model.execute_token_work(id, work)
+    fn execute_token_work(
+        &mut self,
+        input: &ModelTokenInput<'_>,
+    ) -> ModelTokenOutcome<ModelTokenProduct> {
+        self.state.lock().model.execute_token_work(input)
     }
     fn close_token_sequence(&mut self, id: &str) -> Result<()> {
         let mut state = self.state.lock();
