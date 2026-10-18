@@ -49,6 +49,10 @@ async fn run_journal_keeps_actual_output_after_engine_shutdown() {
     let generation = &records[unique_phase(&records, "actual_run_generation")];
     assert_eq!(generation["attributes"]["output_tokens"], 1);
     assert_eq!(generation["status"], "ok");
+    assert_eq!(
+        generation["attributes"]["engine_request_start_boundary"],
+        "engine_api"
+    );
 }
 
 #[cfg(unix)]
@@ -64,6 +68,19 @@ async fn serve_journal_keeps_startup_http_and_graceful_shutdown_records() {
     let startup = unique_phase(&records, "actual_serve_startup");
     let response = unique_phase(&records, "actual_serve_first_request_done");
     let shutdown = unique_phase(&records, "actual_serve_shutdown");
+    let generation = records
+        .iter()
+        .find(|event| {
+            matches!(
+                event["phase"].as_str(),
+                Some("chat_completions_sync_complete" | "chat_completions_stream_complete")
+            )
+        })
+        .expect("HTTP generation profile");
+    assert_eq!(
+        generation["attributes"]["engine_request_start_boundary"],
+        "http_handler"
+    );
     assert!(startup < response && response < shutdown);
     assert_eq!(
         shutdown + 1,

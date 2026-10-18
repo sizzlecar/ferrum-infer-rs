@@ -2676,7 +2676,9 @@ mod tests {
                     ],
                     engine_token_timing: Some(ferrum_types::EngineTokenTimingEvidence {
                         clock_source: "rust_std_instant".to_string(),
-                        request_start_boundary: None,
+                        request_start_boundary: Some(
+                            ferrum_types::RequestIngressBoundary::EngineApi,
+                        ),
                         wall_anchor_unix_nanos: 1_700_000_000_000_000_000,
                         wall_anchor_max_error_nanos: 500,
                         decode_ready_nanos_since_request_start: Some(1_000_000),
@@ -2757,6 +2759,10 @@ mod tests {
         );
         assert_eq!(generation["attributes"]["e2e_duration_us"], 42);
         assert_eq!(generation["attributes"]["profile_detail"], "latency");
+        assert_eq!(
+            generation["attributes"]["engine_request_start_boundary"],
+            "engine_api"
+        );
         assert_eq!(
             generation["attributes"]["engine_token_commit_nanos_since_request_start"],
             serde_json::json!([2_000_000, 4_000_000])

@@ -72,6 +72,12 @@ pub fn engine_token_timing_profile_attributes(
             serde_json::json!(average_itl_nanos / 1_000),
         ),
     ]);
+    if let Some(boundary) = timing.request_start_boundary {
+        attributes.insert(
+            "engine_request_start_boundary".to_string(),
+            serde_json::json!(boundary.as_str()),
+        );
+    }
     if let Some(ttft_nanos) = timing.ttft_nanos() {
         attributes.insert("ttft_us".to_string(), serde_json::json!(ttft_nanos / 1_000));
     }
@@ -665,6 +671,21 @@ mod tests {
             attributes["itl_source"],
             serde_json::json!("engine_token_commit")
         );
+        assert!(!attributes.contains_key("engine_request_start_boundary"));
+        for boundary in [
+            crate::RequestIngressBoundary::EngineApi,
+            crate::RequestIngressBoundary::HttpHandler,
+            crate::RequestIngressBoundary::SchedulerApi,
+        ] {
+            let mut anchored = timing.clone();
+            anchored.request_start_boundary = Some(boundary);
+            let mut projected = engine_token_timing_profile_attributes(&anchored);
+            assert_eq!(
+                projected.remove("engine_request_start_boundary"),
+                Some(serde_json::json!(boundary.as_str()))
+            );
+            assert_eq!(projected, attributes);
+        }
     }
 
     #[test]
