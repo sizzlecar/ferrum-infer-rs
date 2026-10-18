@@ -99,8 +99,16 @@ pub trait Backend: Send + Sync + Sized + 'static {
     /// Observe completion on the actual execution context. Unsupported is not
     /// evidence of quiescence; callers must retain that context and its owners.
     fn try_sync(_ctx: &mut Self::Context) -> ferrum_types::Result<()> {
-        Err(ferrum_types::FerrumError::unsupported(
-            "backend has no checked synchronization implementation",
+        Self::observe_completion(_ctx).into_result()
+    }
+
+    /// Observe this exact context, preserving the distinction between a
+    /// terminal device failure and an unresolved lifetime. An implementation
+    /// must cover every stream/command buffer it submitted, including failed
+    /// paths that did not finish installing their usual cross-stream joins.
+    fn observe_completion(_ctx: &mut Self::Context) -> super::BackendCompletion {
+        super::BackendCompletion::Unresolved(FerrumError::unsupported(
+            "backend has no checked completion observation",
         ))
     }
 

@@ -17,7 +17,6 @@
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
 
-use cudarc::driver::CudaStream;
 use ferrum_bench_core::{global_profile, profile_fields_from_json};
 use ferrum_types::{FerrumError, Result};
 
@@ -180,8 +179,6 @@ impl BackendGraph for CudaBackend {
         if !ctx.capture_in_flight {
             return Err(FerrumError::unsupported("end_capture without begin"));
         }
-        ctx.capture_in_flight = false;
-
         // Bypass cudarc's end_capture — it does cuStreamEndCapture +
         // cuGraphInstantiateWithFlags in one call, and one of those corrupts
         // the context on Blackwell. Call them separately so we can see which.
@@ -197,6 +194,10 @@ impl BackendGraph for CudaBackend {
                 "cuStreamEndCapture failed: {st1:?}"
             )));
         }
+        // A failed EndCapture is not proof that capture ended. Keep the
+        // context unavailable for completion/reuse until the driver confirms
+        // the transition; the frame owner retains it on failure.
+        ctx.capture_in_flight = false;
         if cu_graph.is_null() {
             return Err(FerrumError::unsupported(
                 "cuStreamEndCapture returned null graph",
@@ -226,13 +227,17 @@ impl BackendGraph for CudaBackend {
         // cuGraphLaunch does lazy JIT + resource upload while the stream
         // still has pending ops — libcuda dereferences not-yet-uploaded
         // graph state and SIGSEGVs on Blackwell + CUDA 13.
+        let graph = Arc::new(GraphSlotRaw {
+            cu_graph,
+            cu_graph_exec,
+            _stream: ctx.stream.clone(),
+        });
+        // Keep the exact graph before crossing the fallible upload boundary.
+        // On failure the context's execution owner must retain this lease.
+        ctx.graph_leases.retain(graph.clone());
         let st3 = unsafe { sys::cuGraphUpload(cu_graph_exec, cu_stream) };
         if st3 != sys::CUresult::CUDA_SUCCESS {
             let graph_summary = captured_graph_summary(cu_graph);
-            unsafe {
-                sys::cuGraphExecDestroy(cu_graph_exec);
-                sys::cuGraphDestroy(cu_graph);
-            }
             return Err(FerrumError::unsupported(format!(
                 "cuGraphUpload failed: {st3:?} key={key} {graph_summary}"
             )));
@@ -242,7 +247,7 @@ impl BackendGraph for CudaBackend {
         // existing graph for the same key; the old GraphSlotRaw drops
         // (cuCtxSync + cuGraphExecDestroy + cuGraphDestroy in its Drop
         // impl) before the new one takes its place.
-        install_decode_graph_raw(key, cu_graph, cu_graph_exec, ctx.stream.clone());
+        install_decode_graph_raw(key, graph);
         Ok(())
     }
 
@@ -262,6 +267,9 @@ impl BackendGraph for CudaBackend {
             .map_err(|e| FerrumError::unsupported(format!("bind pre-replay: {e}")))?;
         with_decode_graph(key, |g_opt| {
             if let Some(g) = g_opt {
+                // Cache eviction is not execution retirement. Retain the
+                // selected object before either upload or launch can fail.
+                ctx.graph_leases.retain(g.clone());
                 let runtime_config = cuda_graph_runtime_config();
                 let prof = runtime_config.graph_prof;
                 let t_pre = if prof {
@@ -345,13 +353,10 @@ impl BackendGraph for CudaBackend {
 // Process-global decode graph slot
 // ────────────────────────────────────────────────────────────────────────
 //
-// Stored here (not on `CudaState`) because:
-//   - Backend::Context isn't Send+Sync for all backends (Metal holds a
-//     raw CommandBufferRef) — the model struct gets Send issues if ctx
-//     is stored on it.
-//   - Only CUDA uses graph capture, so global-per-process is fine.
-//   - Kernel arg pointers captured in the graph reference model-owned
-//     scratch buffers; the model outlives any graph, so no dangling refs.
+// The cache owns reusable executables. Each CudaState additionally retains the
+// exact executable before upload/launch; removing a cache entry does not retire
+// an in-flight use. Model-owned capture buffers still need their model/frame
+// owner until that use has been observed terminal.
 //
 // `CudaGraph` isn't automatically `Send+Sync` in cudarc's public API —
 // we wrap in our own marker struct with `unsafe impl`. The stream itself
@@ -363,11 +368,38 @@ impl BackendGraph for CudaBackend {
 /// cuStreamEndCapture + cuGraphInstantiateWithFlags in one non-overridable
 /// call, and one of those corrupts the context on Blackwell; bypassing lets
 /// us split the FFI calls and choose which instantiate variant to use.
-struct GraphSlotRaw {
+pub(super) struct GraphSlotRaw {
     cu_graph: cudarc::driver::sys::CUgraph,
     cu_graph_exec: cudarc::driver::sys::CUgraphExec,
     // Keep the stream Arc alive so its underlying cu_stream stays valid.
     _stream: std::sync::Arc<cudarc::driver::CudaStream>,
+}
+
+/// The usual one-graph decode needs no new heap allocation. Multiple distinct
+/// graphs (for example separate layer/head captures) retain all exact owners.
+#[derive(Default)]
+pub(super) struct GraphLeases {
+    first: Option<Arc<GraphSlotRaw>>,
+    additional: Vec<Arc<GraphSlotRaw>>,
+}
+
+impl GraphLeases {
+    fn retain(&mut self, graph: Arc<GraphSlotRaw>) {
+        match &self.first {
+            None => self.first = Some(graph),
+            Some(first) if Arc::ptr_eq(first, &graph) => {}
+            Some(_) => {
+                if !self.additional.iter().any(|held| Arc::ptr_eq(held, &graph)) {
+                    self.additional.push(graph);
+                }
+            }
+        }
+    }
+
+    pub(super) fn clear(&mut self) {
+        self.first = None;
+        self.additional.clear();
+    }
 }
 
 impl Drop for GraphSlotRaw {
@@ -402,31 +434,22 @@ unsafe impl Sync for GraphSlotRaw {}
 // Native CUDA microbench (graph_upload_bench.cu, 320 launches × 500 iters,
 // alternating two graph sizes) confirmed multi-slot replay is stable
 // at ~0.26ms/iter with no degradation vs single slot.
-static DECODE_GRAPHS: std::sync::OnceLock<std::sync::RwLock<HashMap<u64, GraphSlotRaw>>> =
+static DECODE_GRAPHS: std::sync::OnceLock<std::sync::RwLock<HashMap<u64, Arc<GraphSlotRaw>>>> =
     std::sync::OnceLock::new();
 
-fn graph_slots() -> &'static std::sync::RwLock<HashMap<u64, GraphSlotRaw>> {
+fn graph_slots() -> &'static std::sync::RwLock<HashMap<u64, Arc<GraphSlotRaw>>> {
     DECODE_GRAPHS.get_or_init(|| std::sync::RwLock::new(HashMap::new()))
 }
 
-fn install_decode_graph_raw(
-    key: u64,
-    cu_graph: cudarc::driver::sys::CUgraph,
-    cu_graph_exec: cudarc::driver::sys::CUgraphExec,
-    stream: std::sync::Arc<cudarc::driver::CudaStream>,
-) {
+fn install_decode_graph_raw(key: u64, graph: Arc<GraphSlotRaw>) {
     let mut g = graph_slots().write().expect("DECODE_GRAPHS poisoned");
-    g.insert(
-        key,
-        GraphSlotRaw {
-            cu_graph,
-            cu_graph_exec,
-            _stream: stream,
-        },
-    );
+    g.insert(key, graph);
 }
 
-fn with_decode_graph<R>(key: u64, f: impl FnOnce(Option<&GraphSlotRaw>) -> Result<R>) -> Result<R> {
+fn with_decode_graph<R>(
+    key: u64,
+    f: impl FnOnce(Option<&Arc<GraphSlotRaw>>) -> Result<R>,
+) -> Result<R> {
     let guard = graph_slots().read().expect("DECODE_GRAPHS poisoned");
     f(guard.get(&key))
 }
@@ -476,5 +499,32 @@ mod tests {
         assert!(!config.graph_prof);
         assert!(!config.skip_upload);
         assert!(!config.skip_sync);
+    }
+
+    #[test]
+    #[ignore = "requires an actual CUDA device"]
+    fn graph_eviction_keeps_the_actual_submitted_executable_alive() {
+        use super::*;
+        static NEXT_KEY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1 << 63);
+        let key = NEXT_KEY.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mut ctx = CudaBackend::new_context();
+        let mut buffer = CudaBackend::from_slice(&[1.0, 2.0, 3.0, 4.0]);
+        CudaBackend::begin_graph_capture(&mut ctx).unwrap();
+        CudaBackend::zero_buffer(&mut ctx, &mut buffer, 4).unwrap();
+        CudaBackend::end_graph_capture(&mut ctx, key).unwrap();
+        assert!(matches!(
+            CudaBackend::observe_completion(&mut ctx),
+            crate::backend::BackendCompletion::Succeeded
+        ));
+        assert!(CudaBackend::replay_graph(&mut ctx, key).unwrap());
+        let exact_graph = Arc::downgrade(ctx.graph_leases.first.as_ref().unwrap());
+        invalidate_decode_graph(key);
+        assert!(exact_graph.upgrade().is_some());
+        assert!(matches!(
+            CudaBackend::observe_completion(&mut ctx),
+            crate::backend::BackendCompletion::Succeeded
+        ));
+        assert!(exact_graph.upgrade().is_none());
+        assert_eq!(CudaBackend::to_vec(&buffer, 4), vec![0.0; 4]);
     }
 }

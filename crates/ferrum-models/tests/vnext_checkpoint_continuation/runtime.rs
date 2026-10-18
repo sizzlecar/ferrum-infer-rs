@@ -798,6 +798,27 @@ impl Fixture {
         checkpoint: &SequenceCheckpoint<Runtime>,
         tokens: Arc<[u32]>,
     ) {
+        self.restore_publication(target, checkpoint, tokens)
+            .acknowledge()
+            .unwrap();
+        self.assert_checkpoint_timing(
+            self.reaper.checkpoint_timing_snapshot().restore,
+            checkpoint.logical_bytes(),
+        );
+    }
+
+    /// Returns the real device-copy publication without opening its target gate.
+    /// Product acknowledgement tests use this exact owner, not a mock callback.
+    pub fn restore_publication(
+        &self,
+        target: &Arc<SequenceSession<Runtime>>,
+        checkpoint: &SequenceCheckpoint<Runtime>,
+        tokens: Arc<[u32]>,
+    ) -> CheckpointRestorePublication<Runtime> {
+        let suffix = token_span(
+            Arc::clone(&tokens),
+            checkpoint.completed_tokens()..tokens.len(),
+        );
         let start = self
             .reaper
             .try_restore_sequence_checkpoint_with_timing(
@@ -816,11 +837,42 @@ impl Fixture {
                     publication.completed_tokens(),
                     checkpoint.completed_tokens()
                 );
-                publication.acknowledge().unwrap();
-                self.assert_checkpoint_timing(
-                    self.reaper.checkpoint_timing_snapshot().restore,
-                    checkpoint.logical_bytes(),
-                );
+                assert!(target.try_abort_if_quiescent().is_err());
+                let batch = ExecutionBatchParticipants::new(vec![Arc::clone(target)]).unwrap();
+                let request = StepResourceAdmissionRequest::new(
+                    batch.bind_work_shape(vec![suffix]).unwrap(),
+                    AdmissionFitPolicy::ImmediateOnly,
+                    AdmissionPressureAction::WaitForRelease,
+                )
+                .unwrap();
+                // Step admission checks backing/capacity before capturing the
+                // session frame. A larger suffix may legitimately defer there;
+                // that is neither execution permission nor proof of the gate.
+                // Resolve those real deferrals, then require frame rejection
+                // while retaining the exact publication. Existing continuation
+                // checks execute the same suffix only after acknowledgement.
+                loop {
+                    match batch.try_begin_step(request.clone(), &self.lane) {
+                        Err(_) => break,
+                        Ok(StepResourceAdmissionDecision::Admitted(_)) => panic!(
+                            "a completed copy must keep execution gated until acknowledgement"
+                        ),
+                        Ok(StepResourceAdmissionDecision::BackingDeferred(deferred)) => {
+                            require_progress(deferred.maintain().unwrap());
+                        }
+                        Ok(StepResourceAdmissionDecision::Deferred(reason)) => {
+                            require_progress(
+                                self.resources
+                                    .maintain_for_admission_deferred(&reason)
+                                    .unwrap(),
+                            );
+                        }
+                        Ok(StepResourceAdmissionDecision::PermanentRejected(reason)) => {
+                            panic!("fixture suffix must remain executable after acknowledgement: {reason:?}");
+                        }
+                    }
+                }
+                publication
             }
             _ => panic!("restore did not publish its exact target frontier"),
         }

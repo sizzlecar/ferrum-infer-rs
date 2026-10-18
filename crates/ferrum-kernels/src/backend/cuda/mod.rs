@@ -259,6 +259,9 @@ pub struct CudaState {
     pub use_dev_state: bool,
     /// True between begin_graph_capture and end_graph_capture.
     pub capture_in_flight: bool,
+    // Every graph uploaded/launched through this context remains owned until
+    // this exact context is known quiescent, even if its cache entry is evicted.
+    graph_leases: graph::GraphLeases,
     /// Stable scratch buffers for batched-decode kernels that take per-item
     /// device-pointer arrays (flash_attn_batched, kv_cache_append_batched).
     /// Per-call `alloc_zeros::<T>(m)` was 3 allocs × 32 layers × 3 ops
@@ -688,6 +691,7 @@ impl Backend for CudaBackend {
             modules: HashMap::new(),
             use_dev_state: false,
             capture_in_flight: false,
+            graph_leases: graph::GraphLeases::default(),
             batched_scratch_u64_k: None,
             batched_scratch_u64_v: None,
             batched_scratch_u64_cache: None,
@@ -871,14 +875,45 @@ impl Backend for CudaBackend {
 
     fn sync(ctx: &mut Self::Context) {
         ctx.stream.synchronize().expect("CudaBackend: stream sync");
+        ctx.graph_leases.clear();
     }
 
     fn try_sync(ctx: &mut Self::Context) -> ferrum_types::Result<()> {
-        ctx.stream.synchronize().map_err(|error| {
-            ferrum_types::FerrumError::backend(format!(
-                "CUDA stream synchronization failed: {error}"
-            ))
-        })
+        Self::observe_completion(ctx).into_result()
+    }
+
+    fn observe_completion(ctx: &mut Self::Context) -> super::BackendCompletion {
+        use super::BackendCompletion;
+        if ctx.capture_in_flight {
+            return BackendCompletion::Unresolved(ferrum_types::FerrumError::backend(
+                "CUDA completion is unresolved while graph capture is active",
+            ));
+        }
+        // An encode error can bypass the usual pool -> main-stream event
+        // joins. Observe the actual pool as well as the main stream before
+        // permitting any context-owned scratch or host staging to retire.
+        let mut failure = None;
+        for stream in ctx
+            .moe_streams
+            .iter()
+            .flatten()
+            .chain(std::iter::once(&ctx.stream))
+        {
+            if let Err(error) = stream.synchronize() {
+                failure.get_or_insert_with(|| {
+                    ferrum_types::FerrumError::backend(format!(
+                        "CUDA execution stream synchronization failed: {error}"
+                    ))
+                });
+            }
+        }
+        match failure {
+            Some(error) => BackendCompletion::Unresolved(error),
+            None => {
+                ctx.graph_leases.clear();
+                BackendCompletion::Succeeded
+            }
+        }
     }
 
     fn graph_capture_in_flight(ctx: &Self::Context) -> bool {

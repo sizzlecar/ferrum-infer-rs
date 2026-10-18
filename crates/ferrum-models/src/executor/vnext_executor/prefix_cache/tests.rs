@@ -8,6 +8,14 @@ mod vnext_core_contract;
 #[path = "completion_guard_tests.rs"]
 mod completion_guard_tests;
 
+#[cfg(all(feature = "metal", target_os = "macos"))]
+#[path = "gpu_token_ack/metal.rs"]
+mod metal_token_ack;
+
+#[cfg(feature = "cuda")]
+#[path = "gpu_token_ack/cuda.rs"]
+mod cuda_token_ack;
+
 #[path = "retention_tests.rs"]
 mod retention_tests;
 
