@@ -1490,6 +1490,7 @@ dependencies = [
  "candle-flash-attn",
  "candle-nn",
  "chrono",
+ "cudarc 0.19.4",
  "dirs 5.0.1",
  "ferrum-bench-core",
  "ferrum-execution",

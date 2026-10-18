@@ -658,7 +658,7 @@ mod tests {
         for id in ["a", "b"] {
             assert!(model.kv_caches[id].iter().all(|cache| cache.len == 4));
         }
-        // CPU/Metal have no cached CUDA graph, so the real replay API returns
+        // This key has no captured graph, so the real replay API returns
         // Ok(false). Exercise the same first-replay check used after capture:
         // no logits/length bump may follow it, and already encoded preparation
         // must still finish before the original scratch returns to the model.
@@ -720,11 +720,27 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "requires an actual CUDA device"]
+    fn physical_batch_frame_preserves_real_cuda_logits_and_scratch_on_failure() {
+        use cudarc::driver::DevicePtr;
+        use ferrum_kernels::backend::{cuda::CudaBackend, Backend};
+
+        let context = CudaBackend::new_context();
+        physical_batch_frame_retains_scratch::<CudaBackend>(|buffer| {
+            let (pointer, _record) = buffer.as_f16().device_ptr(&context.stream);
+            usize::try_from(pointer)
+                .expect("CUDA allocation address must fit the host pointer width")
+        });
+    }
+
     fn selection_failure_readback_observes_pending_work<
         B: ferrum_kernels::backend::MoeLlmBackend,
     >() {
         let mut context = B::new_context();
-        let mut logits = B::from_slice_typed(&[1.0f32, 2.0, 3.0, 4.0]);
+        // Use the backend's activation dtype, including CUDA's F16 scale kernel.
+        let mut logits = B::from_slice(&[1.0f32, 2.0, 3.0, 4.0]);
         B::scale_inplace(&mut context, &mut logits, 1.0, 4);
         let mut quiescent = Some(super::device_execution::checked_sync::<B>(&mut context));
         assert_eq!(B::to_vec(&logits, 4), [1.0, 2.0, 3.0, 4.0]);
@@ -757,6 +773,15 @@ mod tests {
     fn selection_failure_full_readback_observes_real_metal_preparation() {
         selection_failure_readback_observes_pending_work::<
             ferrum_kernels::backend::metal::MetalBackend,
+        >();
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "requires an actual CUDA device"]
+    fn selection_failure_full_readback_observes_real_cuda_preparation() {
+        selection_failure_readback_observes_pending_work::<
+            ferrum_kernels::backend::cuda::CudaBackend,
         >();
     }
 

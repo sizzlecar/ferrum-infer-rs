@@ -47,6 +47,8 @@ memmap2 = "0.9"
 ferrum-kernels = { workspace = true }
 ferrum-quantization = { workspace = true }
 half = { workspace = true }
+# CUDA ownership tests inspect the same device allocations as ferrum-kernels.
+cudarc = { version = "0.19", default-features = false, features = ["driver"], optional = true }
 
 # Error handling
 anyhow = { workspace = true }
@@ -88,7 +90,7 @@ default = []
 # Enable CUDA FlashAttention-2 and fused custom kernels
 accelerate = ["candle-core/accelerate", "candle-nn/accelerate"]
 metal = ["ferrum-kernels/metal"]
-cuda = ["ferrum-kernels/cuda"]
+cuda = ["ferrum-kernels/cuda", "dep:cudarc"]
 cuda-indexed-causal-attention = ["cuda", "ferrum-kernels/cuda-indexed-causal-attention"]
 cuda-causal-gqa2 = ["cuda-indexed-causal-attention", "ferrum-kernels/cuda-causal-gqa2"]
 cuda-q4-shared-weight-decode = ["cuda", "ferrum-kernels/cuda-q4-shared-weight-decode"]
