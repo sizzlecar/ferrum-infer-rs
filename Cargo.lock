@@ -1508,6 +1508,7 @@ dependencies = [
  "once_cell",
  "parking_lot",
  "pathdiff",
+ "pin-project-lite",
  "rand 0.8.5",
  "reqwest",
  "safetensors 0.4.5",

@@ -38,6 +38,8 @@ fn completion_sequence(
         tokens: Mutex::new(vec![1]),
         maximum_tokens: 1,
         active: AtomicBool::new(true),
+        settlement: Mutex::new(SequenceSettlement::default()),
+        recovery_wake: VNextCompletionWorker::new().unwrap().recovery_wake(),
         operation: AsyncMutex::new(()),
         events: None,
         product_prompt_tokens: 1,

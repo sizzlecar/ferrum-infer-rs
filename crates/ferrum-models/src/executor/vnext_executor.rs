@@ -78,6 +78,8 @@ mod request;
 mod reusable_catalog;
 mod reusable_cold_path;
 mod sampling_readback;
+mod sequence_settlement;
+use sequence_settlement::{PreparedWaveGuard, RetiredWave, SequenceSettlement, WaveFailure};
 mod state_memory;
 pub use determinism::{
     VNextDeterminismExecutionMode, VNextDeterminismExecutionSpec, VNextDeterminismInitialState,
@@ -3778,6 +3780,8 @@ struct VNextSequence<R: DeviceRuntime> {
     tokens: Mutex<Vec<u32>>,
     maximum_tokens: usize,
     active: AtomicBool,
+    settlement: Mutex<SequenceSettlement<R>>,
+    recovery_wake: Arc<super::vnext_completion_worker::VNextRecoveryWake>,
     operation: AsyncMutex<()>,
     events: Option<Mutex<VNextExecutionJournal>>,
     product_prompt_tokens: u64,
@@ -3841,7 +3845,7 @@ fn validate_sequence_completion_accounting(
     Ok(())
 }
 
-/// Own cancellation as soon as the registry relinquishes this incarnation.
+/// Own cancellation while the registry retains this closing incarnation.
 /// Other already-admitted callers can still hold Arcs, so the sequence's final
 /// Drop cannot be relied upon to cancel an abandoned completion future.
 struct PendingSequenceCompletion<'a, R: DeviceRuntime> {
@@ -3897,17 +3901,18 @@ impl<R: DeviceRuntime> VNextSequence<R> {
     }
 
     fn complete_with_counts(&self, input_tokens: u64, output_tokens: u64) -> Result<()> {
-        if !self.active.swap(false, Ordering::AcqRel) {
+        if self.settlement.lock().terminal.is_some() {
             return Err(FerrumError::already_exists(format!(
                 "vNext request `{}` is already terminal",
                 self.request_id()
             )));
         }
-        let receipt = self.session.try_complete().map_err(|error| {
-            let _ = self.session.request_cancel();
-            let _ = self.session.try_abort();
-            FerrumError::backend(format!("vNext sequence completion: {error}"))
-        })?;
+        self.begin_closing();
+        let receipt = self
+            .session
+            .try_complete()
+            .map_err(|error| FerrumError::backend(format!("vNext sequence completion: {error}")))?;
+        self.settlement.lock().terminal = Some(receipt.clone());
         if let Some(events) = &self.events {
             events
                 .lock()
@@ -3920,9 +3925,12 @@ impl<R: DeviceRuntime> VNextSequence<R> {
     }
 
     fn abort(&self) {
-        self.active.store(false, Ordering::Release);
-        let _ = self.session.request_cancel();
-        let _ = self.session.try_abort();
+        self.begin_closing();
+        self.settlement.lock().cancel_requested = true;
+        // Only the real lower terminal receipt permits registry removal.
+        // A held frame/transfer remains owned for the independent worker.
+        let _ = self.try_end_cancelled();
+        self.recovery_wake.request();
     }
 
     fn abort_after_observed_failure(&self) -> Result<()> {
@@ -3939,6 +3947,7 @@ impl<R: DeviceRuntime> VNextSequence<R> {
             .session
             .try_abort()
             .map_err(|error| FerrumError::backend(format!("vNext failure abort: {error}")))?;
+        self.settlement.lock().terminal = Some(receipt.clone());
         self.events
             .as_ref()
             .ok_or_else(|| {
@@ -4077,7 +4086,7 @@ enum DispatchOutcome<R: DeviceRuntime> {
         completion: CompletionHandle<R>,
         attribution: Option<BoundDeviceSubmissionAttribution>,
     },
-    QuiescentFailure(String),
+    QuiescentFailure(FerrumError),
     SubmissionIndeterminate {
         message: String,
         recovery: IndeterminateSubmissionHandle<R>,
@@ -4217,6 +4226,7 @@ impl<R: DeviceRuntime> Drop for VNextPrefillSlot<R> {
 struct VNextSequenceRegistry<R: DeviceRuntime> {
     prefills: HashMap<RequestId, Arc<VNextPrefillSlot<R>>>,
     active: HashMap<String, Arc<VNextSequence<R>>>,
+    recovery_wake: Option<Arc<super::vnext_completion_worker::VNextRecoveryWake>>,
 }
 
 impl<R: DeviceRuntime> Default for VNextSequenceRegistry<R> {
@@ -4224,6 +4234,7 @@ impl<R: DeviceRuntime> Default for VNextSequenceRegistry<R> {
         Self {
             prefills: HashMap::new(),
             active: HashMap::new(),
+            recovery_wake: None,
         }
     }
 }
@@ -4520,6 +4531,13 @@ impl<R: DeviceRuntime> VNextSequenceRegistry<R> {
             sequence.abort();
             return true;
         }
+        if let VNextPrefillSlotState::Ready(sequence) = &*state {
+            let sequence = Arc::clone(sequence);
+            drop(state);
+            sequence.abort();
+            self.remove_ended_exact(&sequence);
+            return true;
+        }
         let defer_cleanup = matches!(&*state, VNextPrefillSlotState::Probing)
             || matches!(
                 &*state,
@@ -4544,8 +4562,8 @@ impl<R: DeviceRuntime> VNextSequenceRegistry<R> {
             .get(&sequence.cache_id)
             .is_some_and(|current| Arc::ptr_eq(current, sequence))
         {
-            self.active.remove(&sequence.cache_id);
             sequence.abort();
+            self.remove_ended_exact(sequence);
             return true;
         }
 
@@ -4559,7 +4577,7 @@ impl<R: DeviceRuntime> VNextSequenceRegistry<R> {
         {
             return false;
         }
-        let mut state = slot.state.lock();
+        let state = slot.state.lock();
         let owns_sequence = matches!(
             &*state,
             VNextPrefillSlotState::Ready(current)
@@ -4569,11 +4587,10 @@ impl<R: DeviceRuntime> VNextSequenceRegistry<R> {
         if !owns_sequence {
             return false;
         }
-        *state = VNextPrefillSlotState::Terminal;
         slot.cancelled.store(true, Ordering::Release);
         drop(state);
-        self.prefills.remove(sequence.request_id());
         sequence.abort();
+        self.remove_ended_exact(sequence);
         true
     }
 
@@ -4689,16 +4706,16 @@ impl<R: DeviceRuntime> VNextSequenceRegistry<R> {
         {
             return;
         }
-        let mut state = slot.state.lock();
+        let state = slot.state.lock();
         if !matches!(
             &*state,
             VNextPrefillSlotState::Executing(current) if Arc::ptr_eq(current, sequence)
         ) {
             return;
         }
-        *state = VNextPrefillSlotState::Terminal;
         drop(state);
-        self.prefills.remove(&slot.request_id);
+        sequence.abort();
+        self.remove_ended_exact(sequence);
     }
 }
 
@@ -4787,7 +4804,7 @@ pub struct VNextModelExecutor<R: DeviceRuntime> {
         BTreeMap<VNextReusableExecutionDescriptor, BTreeSet<DeviceReusableExecutionProgramId>>,
     >,
     startup_preparation: Mutex<VNextStartupPreparationState>,
-    sequences: Mutex<VNextSequenceRegistry<R>>,
+    sequences: Arc<Mutex<VNextSequenceRegistry<R>>>,
     prefix_cache: Mutex<prefix_cache::PrefixIndex<SequenceCheckpoint<R>>>,
     prefix_capture_identity: Arc<()>,
     product_token_mask_residency: Mutex<VNextProductTokenMaskResidency>,
@@ -4880,6 +4897,7 @@ impl<'executor, R: DeviceRuntime> VNextStartupSequenceGuard<'executor, R> {
                     "vNext startup sequence completion: {error}"
                 )));
             }
+            self.executor.sequences.lock().remove_ended_exact(sequence);
         }
         Ok(())
     }
@@ -4899,7 +4917,8 @@ impl<'executor, R: DeviceRuntime> VNextStartupSequenceGuard<'executor, R> {
                     .sequences
                     .lock()
                     .active
-                    .remove(&startup.kv_cache.cache_id());
+                    .get(&startup.kv_cache.cache_id())
+                    .cloned();
                 (startup.request_id, sequence)
             })
             .collect()
@@ -4915,6 +4934,7 @@ impl<R: DeviceRuntime> Drop for VNextStartupSequenceGuard<'_, R> {
             .filter_map(|(_, sequence)| sequence)
         {
             sequence.abort();
+            self.executor.sequences.lock().remove_ended_exact(&sequence);
         }
     }
 }
@@ -5259,6 +5279,13 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             FerrumError::device(format!("vNext completion worker creation failed: {error}"))
         })?;
         let reaper = CompletionReaper::new();
+        let sequences = Arc::new(Mutex::new(VNextSequenceRegistry {
+            recovery_wake: Some(completion_worker.recovery_wake()),
+            ..VNextSequenceRegistry::default()
+        }));
+        sequence_settlement::install_recovery(&completion_worker, &sequences, &reaper).map_err(
+            |error| FerrumError::device(format!("vNext recovery initialization failed: {error}")),
+        )?;
         let reusable_execution_supported = runtime
             .descriptor()
             .capabilities
@@ -5351,7 +5378,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             reusable_execution_catalog_refresh_needed: AtomicBool::new(false),
             startup_reusable_programs: Mutex::new(BTreeMap::new()),
             startup_preparation: Mutex::new(VNextStartupPreparationState::Pending),
-            sequences: Mutex::new(VNextSequenceRegistry::default()),
+            sequences,
             prefix_cache: Mutex::new(prefix_cache::PrefixIndex::default()),
             prefix_capture_identity: Arc::new(()),
             product_token_mask_residency: Mutex::new(VNextProductTokenMaskResidency::default()),
@@ -6517,6 +6544,8 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             tokens: Mutex::new(tokens),
             maximum_tokens,
             active: AtomicBool::new(true),
+            settlement: Mutex::new(SequenceSettlement::default()),
+            recovery_wake: self.completion_worker.recovery_wake(),
             operation: AsyncMutex::new(()),
             events: events.map(Mutex::new),
             product_prompt_tokens,
@@ -7547,10 +7576,9 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             || participants.len() != token_mask_plans.len()
             || participants.len() != output_modes.len()
         {
-            return DispatchOutcome::QuiescentFailure(
-                "vNext submission wave requires matching participants and token-mask decisions"
-                    .to_owned(),
-            );
+            return DispatchOutcome::QuiescentFailure(FerrumError::internal(
+                "vNext submission wave requires matching participants and token-mask decisions",
+            ));
         }
         let active_bindings = || {
             participants
@@ -7566,7 +7594,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             token_mask_plans,
         ) {
             Ok(uploads) => uploads,
-            Err(error) => return DispatchOutcome::QuiescentFailure(error.to_string()),
+            Err(error) => return DispatchOutcome::QuiescentFailure(error),
         };
 
         let mut wave = wave;
@@ -7589,7 +7617,11 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 )
             } {
                 Ok(identity) => identity,
-                Err(error) => return DispatchOutcome::QuiescentFailure(error.to_string()),
+                Err(error) => {
+                    return DispatchOutcome::QuiescentFailure(FerrumError::backend(
+                        error.to_string(),
+                    ))
+                }
             };
             let timing_sink = VNextWaveTimingSink {
                 aggregate: &self.metrics.wave_timing,
@@ -7617,7 +7649,9 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 ) {
                     Ok(program_id) => program_id,
                     Err(error) => {
-                        return DispatchOutcome::QuiescentFailure(error.to_string());
+                        return DispatchOutcome::QuiescentFailure(FerrumError::backend(
+                            error.to_string(),
+                        ));
                     }
                 };
                 match program_id {
@@ -7696,7 +7730,11 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                     &self.lane,
                 ) {
                     Ok(compiled) => *resident_install = compiled,
-                    Err(error) => return DispatchOutcome::QuiescentFailure(error.to_string()),
+                    Err(error) => {
+                        return DispatchOutcome::QuiescentFailure(FerrumError::backend(
+                            error.to_string(),
+                        ))
+                    }
                 }
             }
             reusable_direct_attempted |= reusable_program.is_some();
@@ -7902,8 +7940,10 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                     match retry.retry() {
                         Ok(retry_wave) => wave = retry_wave,
                         Err(error) => {
-                            return DispatchOutcome::QuiescentFailure(format!(
-                                "vNext wave retry authority failed after {failures:?}: {error}"
+                            return DispatchOutcome::QuiescentFailure(FerrumError::backend(
+                                format!(
+                                    "vNext wave retry authority failed after {failures:?}: {error}"
+                                ),
                             ))
                         }
                     }
@@ -7913,7 +7953,9 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 | Err(error @ SubmissionWaveDispatchError::Provider(_))
                 | Err(error @ SubmissionWaveDispatchError::Initialization(_))
                 | Err(error @ SubmissionWaveDispatchError::InputUpload(_)) => {
-                    return DispatchOutcome::QuiescentFailure(error.to_string())
+                    return DispatchOutcome::QuiescentFailure(FerrumError::backend(
+                        error.to_string(),
+                    ))
                 }
                 Err(SubmissionWaveDispatchError::SubmissionIndeterminate { recovery }) => {
                     return DispatchOutcome::SubmissionIndeterminate {
@@ -7927,71 +7969,6 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                         completion,
                     }
                 }
-            }
-        }
-    }
-
-    async fn abort_step(
-        &self,
-        step: impl Into<PreparedRetirement<R>>,
-        message: impl Into<String>,
-    ) -> FerrumError {
-        let message = message.into();
-        self.metrics.record_failure(message.clone());
-        self.release_resident_decode();
-        match step.into().try_abort() {
-            Ok(_) => FerrumError::backend(message),
-            Err(failure) => {
-                FerrumError::backend(format!("{message}; vNext step abort failed: {}", failure))
-            }
-        }
-    }
-
-    fn abort_unsubmitted_step(
-        &self,
-        step: Arc<StepResourceLease<R>>,
-        error: FerrumError,
-    ) -> FerrumError {
-        if !matches!(&error, FerrumError::ResourceExhausted { .. }) {
-            self.metrics.record_failure(error.to_string());
-        }
-        match step.try_abort() {
-            Ok(_) => error,
-            Err(failure) => FerrumError::backend(format!(
-                "{error}; vNext unsubmitted step abort failed: {}",
-                failure.error()
-            )),
-        }
-    }
-
-    fn rollback_unsubmitted_step(
-        &self,
-        step: Arc<StepResourceLease<R>>,
-        context: &'static str,
-    ) -> Result<()> {
-        let rollback_failure = match step.try_rollback_unsubmitted() {
-            Ok(_) => return Ok(()),
-            Err(failure) => failure,
-        };
-        let rollback_error = rollback_failure.error().to_string();
-        let step = rollback_failure.into_step();
-        match step.try_abort() {
-            Ok(_) => {
-                let message = format!(
-                    "{context} rollback failed: {rollback_error}; exact step was aborted fail-closed"
-                );
-                self.metrics.record_failure(message.clone());
-                Err(FerrumError::backend(message))
-            }
-            Err(abort_failure) => {
-                let abort_error = abort_failure.error().to_string();
-                let step = abort_failure.into_step();
-                drop(step);
-                let message = format!(
-                    "{context} rollback failed: {rollback_error}; explicit abort failed: {abort_error}; exact step authority was released to fail-closed Drop"
-                );
-                self.metrics.record_failure(message.clone());
-                Err(FerrumError::backend(message))
             }
         }
     }
@@ -8014,10 +7991,19 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         tokens: &[u32],
         span: TokenSpanWork,
         logits_policy: &LogitsReturnPolicy,
-    ) -> Result<ExecutorSamplingOutput> {
+    ) -> std::result::Result<RetiredWave<ExecutorSamplingOutput, R>, WaveFailure> {
         // The Step retains its original work Arc. Adding evidence only to a
         // later wave would leave the completed-state proof without tokens.
-        let span = self.retain_checkpoint_token_evidence(span, tokens)?;
+        let span = self
+            .retain_checkpoint_token_evidence(span, tokens)
+            .map_err(WaveFailure::not_submitted)?;
+        let output_role = VNextParticipantOutputRole::Decode(logits_policy.clone());
+        let participant = VNextExecutionParticipant {
+            sequence,
+            tokens,
+            span: &span,
+            output_role: &output_role,
+        };
         let prepared = {
             let _timing = self.metrics.wave_timing.resource_prepare_attempt.start();
             let _phase_timing = self
@@ -8026,19 +8012,33 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 .resource_prepare_attempt
                 .start();
             let batch = ExecutionBatchParticipants::new(vec![Arc::clone(&sequence.session)])
-                .map_err(|error| FerrumError::backend(error.to_string()))?;
-            if let Some(prepared) = self.try_prepare_resident_decode(
-                &batch,
-                std::slice::from_ref(&span),
-                VNextExecutionWaveKind::Decode,
-                matches!(logits_policy, LogitsReturnPolicy::GreedyArgmax { .. }),
-            )? {
+                .map_err(|error| {
+                    WaveFailure::not_submitted(FerrumError::backend(error.to_string()))
+                })?;
+            if let Some(prepared) = self
+                .try_prepare_resident_decode(
+                    &batch,
+                    std::slice::from_ref(&span),
+                    VNextExecutionWaveKind::Decode,
+                    matches!(logits_policy, LogitsReturnPolicy::GreedyArgmax { .. }),
+                )
+                .map_err(WaveFailure::not_submitted)?
+            {
                 prepared
             } else {
-                let step = self.begin_step(&batch, sequence, &span)?;
+                let step = self
+                    .begin_step(&batch, sequence, &span)
+                    .map_err(WaveFailure::not_submitted)?;
                 let wave = match self.prepare_wave(&step, sequence, &span) {
                     Ok(wave) => wave,
-                    Err(error) => return Err(self.abort_unsubmitted_step(step, error)),
+                    Err(error) => {
+                        let mut guard = PreparedWaveGuard::new(
+                            self,
+                            step.into(),
+                            std::slice::from_ref(&participant),
+                        );
+                        return Err(guard.fail(error));
+                    }
                 };
                 PreparedVNextPrefill::ordinary(step, wave)
             }
@@ -8049,7 +8049,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             span,
             prepared,
             VNextExecutionWaveKind::Decode,
-            VNextParticipantOutputRole::Decode(logits_policy.clone()),
+            output_role,
         )
         .await
     }
@@ -8062,7 +8062,10 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         spans: &[TokenSpanWork],
         kind: VNextExecutionWaveKind,
         output_roles: &[VNextParticipantOutputRole],
-    ) -> Result<VNextExecutionCapacityDecision<Vec<ExecutorSamplingOutput>>> {
+    ) -> std::result::Result<
+        VNextExecutionCapacityDecision<RetiredWave<Vec<ExecutorSamplingOutput>, R>>,
+        WaveFailure,
+    > {
         if sequences.is_empty()
             || sequences.len() != token_batches.len()
             || sequences.len() != spans.len()
@@ -8079,9 +8082,9 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 .zip(sequences)
                 .any(|(session, sequence)| !Arc::ptr_eq(session, &sequence.session))
         {
-            return Err(FerrumError::internal(
+            return Err(WaveFailure::not_submitted(FerrumError::internal(
                 "vNext decode batch differs from its canonical participant set",
-            ));
+            )));
         }
         let retained_spans = if self.checkpoint_token_evidence_enabled() {
             Some(
@@ -8091,7 +8094,8 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                     .map(|(span, tokens)| {
                         self.retain_checkpoint_token_evidence(span.clone(), tokens)
                     })
-                    .collect::<Result<Vec<_>>>()?,
+                    .collect::<Result<Vec<_>>>()
+                    .map_err(WaveFailure::not_submitted)?,
             )
         } else {
             None
@@ -8099,73 +8103,6 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         // Unsupported/default plans keep the original slice and do not copy
         // full token inputs or repeat their hash calculation.
         let spans = retained_spans.as_deref().unwrap_or(spans);
-        let prepared = {
-            let _timing = self.metrics.wave_timing.resource_prepare_attempt.start();
-            let _phase_timing = self
-                .metrics
-                .wave_timing_for(kind)
-                .resource_prepare_attempt
-                .start();
-            if let Some(prepared) = self.try_prepare_resident_decode(
-                batch,
-                spans,
-                kind,
-                output_roles.iter().all(|role| {
-                    matches!(
-                        role.logits_policy(),
-                        Some(LogitsReturnPolicy::GreedyArgmax { .. })
-                    )
-                }),
-            )? {
-                prepared
-            } else {
-                let step =
-                    match self.begin_step_for_spans_with_capacity(batch, sequences, spans, kind)? {
-                        VNextExecutionCapacityDecision::Ready(step) => step,
-                        VNextExecutionCapacityDecision::Deferred(deferred) => {
-                            return Ok(VNextExecutionCapacityDecision::Deferred(deferred))
-                        }
-                        VNextExecutionCapacityDecision::RequestStateDeferred(deferred) => {
-                            return Ok(VNextExecutionCapacityDecision::RequestStateDeferred(
-                                deferred,
-                            ))
-                        }
-                    };
-                let wave_decision = match self
-                    .prepare_wave_for_spans_with_capacity(&step, sequences, spans, kind)
-                {
-                    Ok(decision) => decision,
-                    Err(error) => {
-                        if let Err(cleanup_error) = self
-                            .rollback_unsubmitted_step(step, "vNext failed-wave unsubmitted step")
-                        {
-                            return Err(FerrumError::backend(format!("{error}; {cleanup_error}")));
-                        }
-                        return Err(error);
-                    }
-                };
-                let wave = match wave_decision {
-                    VNextExecutionCapacityDecision::Ready(wave) => wave,
-                    VNextExecutionCapacityDecision::Deferred(deferred) => {
-                        self.rollback_unsubmitted_step(
-                            step,
-                            "vNext capacity-deferred unsubmitted step",
-                        )?;
-                        return Ok(VNextExecutionCapacityDecision::Deferred(deferred));
-                    }
-                    VNextExecutionCapacityDecision::RequestStateDeferred(deferred) => {
-                        self.rollback_unsubmitted_step(
-                            step,
-                            "vNext readiness-deferred unsubmitted step",
-                        )?;
-                        return Ok(VNextExecutionCapacityDecision::RequestStateDeferred(
-                            deferred,
-                        ));
-                    }
-                };
-                PreparedVNextPrefill::ordinary(step, wave)
-            }
-        };
         let participants = sequences
             .iter()
             .zip(token_batches)
@@ -8180,6 +8117,78 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 },
             )
             .collect::<Vec<_>>();
+        let prepared = {
+            let _timing = self.metrics.wave_timing.resource_prepare_attempt.start();
+            let _phase_timing = self
+                .metrics
+                .wave_timing_for(kind)
+                .resource_prepare_attempt
+                .start();
+            if let Some(prepared) = self
+                .try_prepare_resident_decode(
+                    batch,
+                    spans,
+                    kind,
+                    output_roles.iter().all(|role| {
+                        matches!(
+                            role.logits_policy(),
+                            Some(LogitsReturnPolicy::GreedyArgmax { .. })
+                        )
+                    }),
+                )
+                .map_err(WaveFailure::not_submitted)?
+            {
+                prepared
+            } else {
+                let step = match self
+                    .begin_step_for_spans_with_capacity(batch, sequences, spans, kind)
+                    .map_err(WaveFailure::not_submitted)?
+                {
+                    VNextExecutionCapacityDecision::Ready(step) => step,
+                    VNextExecutionCapacityDecision::Deferred(deferred) => {
+                        return Ok(VNextExecutionCapacityDecision::Deferred(deferred))
+                    }
+                    VNextExecutionCapacityDecision::RequestStateDeferred(deferred) => {
+                        return Ok(VNextExecutionCapacityDecision::RequestStateDeferred(
+                            deferred,
+                        ))
+                    }
+                };
+                let wave_decision = match self
+                    .prepare_wave_for_spans_with_capacity(&step, sequences, spans, kind)
+                {
+                    Ok(decision) => decision,
+                    Err(error) => {
+                        let mut guard = PreparedWaveGuard::new(self, step.into(), &participants);
+                        if let Err(cleanup_error) = guard.rollback_unsubmitted() {
+                            return Err(guard
+                                .fail(FerrumError::backend(format!("{error}; {cleanup_error}"))));
+                        }
+                        return Err(WaveFailure::not_submitted(error));
+                    }
+                };
+                let wave = match wave_decision {
+                    VNextExecutionCapacityDecision::Ready(wave) => wave,
+                    VNextExecutionCapacityDecision::Deferred(deferred) => {
+                        let mut guard = PreparedWaveGuard::new(self, step.into(), &participants);
+                        guard
+                            .rollback_unsubmitted()
+                            .map_err(|error| guard.fail(error))?;
+                        return Ok(VNextExecutionCapacityDecision::Deferred(deferred));
+                    }
+                    VNextExecutionCapacityDecision::RequestStateDeferred(deferred) => {
+                        let mut guard = PreparedWaveGuard::new(self, step.into(), &participants);
+                        guard
+                            .rollback_unsubmitted()
+                            .map_err(|error| guard.fail(error))?;
+                        return Ok(VNextExecutionCapacityDecision::RequestStateDeferred(
+                            deferred,
+                        ));
+                    }
+                };
+                PreparedVNextPrefill::ordinary(step, wave)
+            }
+        };
         self.execute_prepared_participants(&participants, prepared, kind)
             .await
             .map(VNextExecutionCapacityDecision::Ready)
@@ -8193,19 +8202,25 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         prepared: PreparedVNextPrefill<R>,
         kind: VNextExecutionWaveKind,
         output_role: VNextParticipantOutputRole,
-    ) -> Result<ExecutorSamplingOutput> {
+    ) -> std::result::Result<RetiredWave<ExecutorSamplingOutput, R>, WaveFailure> {
         let participant = VNextExecutionParticipant {
             sequence,
             tokens,
             span: &span,
             output_role: &output_role,
         };
-        let mut logits = self
+        let RetiredWave {
+            output: mut logits,
+            retirement,
+        } = self
             .execute_prepared_participants(std::slice::from_ref(&participant), prepared, kind)
             .await?;
-        logits
-            .pop()
-            .ok_or_else(|| FerrumError::internal("vNext single execution returned no logits"))
+        match logits.pop() {
+            Some(output) => Ok(RetiredWave { output, retirement }),
+            None => Err(retirement.fail(FerrumError::internal(
+                "vNext single execution returned no logits",
+            ))),
+        }
     }
 
     async fn execute_prepared_participants(
@@ -8213,14 +8228,17 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         participants: &[VNextExecutionParticipant<'_, R>],
         prepared: PreparedVNextPrefill<R>,
         kind: VNextExecutionWaveKind,
-    ) -> Result<Vec<ExecutorSamplingOutput>> {
+    ) -> std::result::Result<RetiredWave<Vec<ExecutorSamplingOutput>, R>, WaveFailure> {
         let _execution_timing = self.metrics.wave_timing.submitted_wave_total.start();
         let phase_timing = self.metrics.wave_timing_for(kind);
         let _phase_execution_timing = phase_timing.submitted_wave_total.start();
         let PreparedVNextPrefill {
-            retirement: mut step,
-            dispatch: mut wave,
+            retirement,
+            dispatch,
         } = prepared;
+        let mut guard = PreparedWaveGuard::new(self, retirement, participants);
+        // Prepared wave owners must drop before the guard publishes recovery.
+        let mut wave = dispatch;
         let mut resident_install = None;
         let capture_claim = match (kind, self.checkpoint_capture.as_ref()) {
             (VNextExecutionWaveKind::Prefill, Some(capture)) => {
@@ -8229,29 +8247,35 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                     participant.span.immediate_token_range().end
                         == participant.span.full_input_tokens()
                 });
-                capture.claim_prefill_wave(
-                    participants.len(),
-                    first.map(|participant| participant.sequence.request_id()),
-                    first.map(|participant| participant.tokens),
-                    is_final_prefill,
-                )?
+                capture
+                    .claim_prefill_wave(
+                        participants.len(),
+                        first.map(|participant| participant.sequence.request_id()),
+                        first.map(|participant| participant.tokens),
+                        is_final_prefill,
+                    )
+                    .map_err(|error| guard.fail(error))?
             }
-            (VNextExecutionWaveKind::Decode, Some(capture)) => capture.claim_decode_wave(
-                participants.len(),
-                participants
-                    .first()
-                    .map(|participant| participant.sequence.request_id()),
-                participants.first().map(|participant| participant.tokens),
-            )?,
+            (VNextExecutionWaveKind::Decode, Some(capture)) => capture
+                .claim_decode_wave(
+                    participants.len(),
+                    participants
+                        .first()
+                        .map(|participant| participant.sequence.request_id()),
+                    participants.first().map(|participant| participant.tokens),
+                )
+                .map_err(|error| guard.fail(error))?,
             (VNextExecutionWaveKind::Mixed, Some(_)) => {
-                return Err(FerrumError::internal(
+                return Err(guard.fail(FerrumError::internal(
                     "mixed execution must fall back before diagnostic checkpoint capture",
-                ));
+                )));
             }
             (_, None) => None,
         };
         let teacher_forced_decision = match (capture_claim, self.checkpoint_capture.as_ref()) {
-            (Some(claim), Some(capture)) => capture.teacher_forced_decision(claim)?,
+            (Some(claim), Some(capture)) => capture
+                .teacher_forced_decision(claim)
+                .map_err(|error| guard.fail(error))?,
             _ => None,
         };
         let output_modes = ProductReadbackModes::resolve(
@@ -8265,8 +8289,9 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 .iter()
                 .map(|participant| participant.output_role),
         );
-        let readbacks =
-            self.prepare_terminal_readbacks(participants, capture_claim, &output_modes)?;
+        let readbacks = self
+            .prepare_terminal_readbacks(participants, capture_claim, &output_modes)
+            .map_err(|error| guard.fail(error))?;
         if let Some(request) = output_modes.uniform().and_then(|mode| {
             readbacks.terminal_packet_request(
                 self.completion_readback_policy,
@@ -8275,7 +8300,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             )
         }) {
             wave.set_terminal_readbacks(request.clone())
-                .map_err(|error| FerrumError::backend(error.to_string()))?;
+                .map_err(|error| guard.fail(FerrumError::backend(error.to_string())))?;
         }
         let mut cold_wave = self
             .metrics
@@ -8323,8 +8348,9 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                     let mut token_mask_residency = token_mask_residency;
                     token_mask_residency.invalidate_before_slot_release();
                     self.release_resident_decode();
-                    step.try_rollback_unsubmitted()
-                        .map_err(FerrumError::backend)?;
+                    guard
+                        .rollback_unsubmitted()
+                        .map_err(|error| guard.fail(error))?;
                     let sequences = participants
                         .iter()
                         .map(|p| Arc::clone(p.sequence))
@@ -8336,12 +8362,15 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                     let batch = ExecutionBatchParticipants::new(
                         sequences.iter().map(|s| Arc::clone(&s.session)).collect(),
                     )
-                    .map_err(|e| FerrumError::backend(e.to_string()))?;
-                    let ordinary = self.begin_step_for_spans(&batch, &sequences, &spans)?;
+                    .map_err(|e| guard.fail(FerrumError::backend(e.to_string())))?;
+                    let ordinary = self
+                        .begin_step_for_spans(&batch, &sequences, &spans)
+                        .map_err(|error| guard.fail(error))?;
+                    guard.replace_retirement(PreparedRetirement::Ordinary(Arc::clone(&ordinary)));
                     let mut ordinary_wave =
                         match self.prepare_wave_for_spans(&ordinary, &sequences, &spans) {
                             Ok(wave) => wave,
-                            Err(error) => return Err(self.abort_unsubmitted_step(ordinary, error)),
+                            Err(error) => return Err(guard.fail(error)),
                         };
                     if let Some(request) = output_modes.uniform().and_then(|mode| {
                         readbacks.terminal_packet_request(
@@ -8352,9 +8381,9 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                     }) {
                         ordinary_wave
                             .set_terminal_readbacks(request.clone())
-                            .map_err(|e| FerrumError::backend(e.to_string()))?;
+                            .map_err(|e| guard.fail(FerrumError::backend(e.to_string())))?;
                     }
-                    step = PreparedRetirement::Ordinary(ordinary);
+                    drop(ordinary);
                     wave = PreparedDispatch::Ordinary {
                         wave: ordinary_wave,
                         reservation: None,
@@ -8376,74 +8405,72 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             DispatchOutcome::Submitted {
                 completion,
                 attribution,
-            } => (completion, attribution),
-            DispatchOutcome::QuiescentFailure(message) => {
+            } => {
+                guard.observe_submission(&completion);
+                (completion, attribution)
+            }
+            DispatchOutcome::QuiescentFailure(error) => {
                 token_mask_residency.invalidate_before_slot_release();
-                return Err(self.abort_step(step, message).await);
+                return Err(guard.fail(error));
             }
             DispatchOutcome::SubmissionIndeterminate { message, recovery } => {
+                guard.observe_indeterminate(&recovery);
+                let route = guard.worker_route();
                 let reaper = Arc::clone(&self.reaper);
                 let recovered = self
                     .completion_worker
                     .execute(VNextCompletionTaskKind::IndeterminateRecovery, move || {
                         let recovered = recovery.recover_by_draining_lane();
                         drop(reaper);
-                        recovered
+                        route.wrap(recovered)
                     })
                     .await
-                    .map_err(|error| FerrumError::backend(format!("{message}: {error}")))?;
-                match recovered {
-                    Ok(_) => {
-                        token_mask_residency.invalidate_before_slot_release();
-                        return Err(self.abort_step(step, message).await);
+                    .map_err(|error| {
+                        guard.fail(FerrumError::backend(format!("{message}: {error}")))
+                    })?
+                    .into_inner();
+                let message = match &recovered {
+                    Ok(CompletionRecoveryOutcome::Drained(_)) => message,
+                    Ok(CompletionRecoveryOutcome::Quarantined(_)) => {
+                        format!("{message}; recovery retained quarantined work")
                     }
-                    Err(error) => {
-                        token_mask_residency.invalidate_before_slot_release();
-                        self.metrics
-                            .record_failure(format!("{message}; recovery failed: {error}"));
-                        return Err(FerrumError::backend(format!(
-                            "{message}; recovery failed: {error}"
-                        )));
-                    }
-                }
+                    Err(error) => format!("{message}; recovery failed: {error}"),
+                };
+                guard.accept_recovery(recovered);
+                token_mask_residency.invalidate_before_slot_release();
+                self.metrics.record_failure(message.clone());
+                return Err(guard.fail(FerrumError::backend(message)));
             }
             DispatchOutcome::PostSubmitContract {
                 message,
                 completion,
             } => {
+                guard.observe_submission(&completion);
+                let route = guard.worker_route();
                 let reaper = Arc::clone(&self.reaper);
                 let observed = self
                     .completion_worker
                     .execute(VNextCompletionTaskKind::PostSubmitDrain, move || {
                         let observed = completion.wait();
                         drop(reaper);
-                        observed
+                        route.wrap(observed)
                     })
                     .await
-                    .map_err(|error| FerrumError::backend(format!("{message}: {error}")))?;
-                match observed {
-                    Ok(CompletionObservation::Terminal(_)) => {
-                        token_mask_residency.invalidate_before_slot_release();
-                        return Err(self.abort_step(step, message).await);
-                    }
+                    .map_err(|error| {
+                        guard.fail(FerrumError::backend(format!("{message}: {error}")))
+                    })?
+                    .into_inner();
+                let message = match &observed {
+                    Ok(CompletionObservation::Terminal(_)) => message,
                     Ok(other) => {
-                        token_mask_residency.invalidate_before_slot_release();
-                        self.metrics.record_failure(format!(
-                            "{message}; post-submit drain remained nonterminal: {other:?}"
-                        ));
-                        return Err(FerrumError::backend(format!(
-                            "{message}; post-submit drain remained nonterminal"
-                        )));
+                        format!("{message}; post-submit drain remained nonterminal: {other:?}")
                     }
-                    Err(error) => {
-                        token_mask_residency.invalidate_before_slot_release();
-                        self.metrics
-                            .record_failure(format!("{message}; drain failed: {error}"));
-                        return Err(FerrumError::backend(format!(
-                            "{message}; drain failed: {error}"
-                        )));
-                    }
-                }
+                    Err(error) => format!("{message}; drain failed: {error}"),
+                };
+                guard.accept_observation(observed);
+                token_mask_residency.invalidate_before_slot_release();
+                self.metrics.record_failure(message.clone());
+                return Err(guard.fail(FerrumError::backend(message)));
             }
         };
         for participant in participants {
@@ -8495,6 +8522,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         // Take the optional hint before the completion handle moves to the
         // worker. The ticket owns no Step or Sequence resources.
         let segment_publication = completion.take_segment_binding_publication();
+        let route = guard.worker_route();
         let reaper = Arc::clone(&self.reaper);
         let observation = {
             let _timing = self.metrics.wave_timing.completion_round_trip.start();
@@ -8513,28 +8541,34 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                         }
                     };
                     drop(reaper);
-                    observation
+                    route.wrap(observation)
                 })
                 .await
                 .map_err(|error| {
-                    FerrumError::backend(format!("vNext completion task failed: {error}"))
+                    guard.fail(FerrumError::backend(format!(
+                        "vNext completion task failed: {error}"
+                    )))
                 })?
-                .map_err(|error| FerrumError::backend(error.to_string()))?
+                .into_inner()
         };
         let _postprocess_timing = self.metrics.wave_timing.host_postprocess.start();
         let _phase_postprocess_timing = phase_timing.host_postprocess.start();
-        let receipt = match observation {
-            CompletionReadbackBatchObservation::Terminal(receipt) => receipt,
-            other => {
-                let message = nonterminal_completion_message(&other);
-                self.metrics.record_failure(message.clone());
-                token_mask_residency.invalidate_before_slot_release();
-                return Err(FerrumError::backend(message));
-            }
+        let observation_error = match &observation {
+            Ok(CompletionReadbackBatchObservation::Terminal(_)) => None,
+            Ok(other) => Some(nonterminal_completion_message(other)),
+            Err(error) => Some(error.to_string()),
         };
-        self.refresh_on_demand_reusable_execution_catalog()?;
-        self.metrics.device_timing.record(&receipt);
-        self.metrics.device_timing_for(kind).record(&receipt);
+        guard.accept_readback_observation(observation);
+        if let Some(message) = observation_error {
+            self.metrics.record_failure(message.clone());
+            token_mask_residency.invalidate_before_slot_release();
+            return Err(guard.fail(FerrumError::backend(message)));
+        }
+        self.refresh_on_demand_reusable_execution_catalog()
+            .map_err(|error| guard.fail(error))?;
+        let receipt = guard.readbacks();
+        self.metrics.device_timing.record(receipt);
+        self.metrics.device_timing_for(kind).record(receipt);
         if let Some(attribution) = attribution {
             match attribution.bind_terminal_timing(receipt.completion().submission_timing().clone())
             {
@@ -8582,8 +8616,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 receipt.completion().disposition()
             );
             token_mask_residency.invalidate_before_slot_release();
-            drop(receipt);
-            return Err(self.abort_step(step, message).await);
+            return Err(guard.fail(FerrumError::backend(message)));
         }
         // A terminally successful command batch proves every encoded mask
         // upload reached this still-owned Step slot. Host output processing and
@@ -8603,23 +8636,22 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                     execution_event_error.get_or_insert_with(|| error.to_string());
                 }
             }
-            drop(receipt);
-            if let Err(failure) = step.try_retire_normal() {
-                execution_event_error.get_or_insert_with(|| {
-                    format!("vNext diagnostic step retirement failed: {}", failure)
-                });
-            }
+            let retired = guard.retire_normal(())?;
             if let Some(error) = execution_event_error {
                 participants[0].sequence.abort();
                 let message =
                     format!("vNext diagnostic resource failure attribution failed closed: {error}");
                 self.metrics.record_failure(message.clone());
-                return Err(FerrumError::backend(message));
+                return Err(retired.retirement.fail(FerrumError::backend(message)));
             }
-            participants[0].sequence.abort_after_observed_failure()?;
+            if let Err(error) = participants[0].sequence.abort_after_observed_failure() {
+                return Err(retired.retirement.fail(error));
+            }
             let message = "typed diagnostic resource failure after prefill submission".to_string();
             self.metrics.record_failure(message.clone());
-            return Err(FerrumError::resource_exhausted(message));
+            return Err(retired
+                .retirement
+                .fail(FerrumError::resource_exhausted(message)));
         }
         // Only this successful, non-diagnostic terminal may qualify a hint.
         // Readback/output/event/retirement failures below still discard it.
@@ -8777,8 +8809,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         ) = match processed {
             Ok(processed) => processed,
             Err(error) => {
-                drop(receipt);
-                return Err(self.abort_step(step, error.to_string()).await);
+                return Err(guard.fail(error));
             }
         };
         if let (Some(capture_claim), Some(capture)) =
@@ -8792,14 +8823,12 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 checkpoint_records,
                 product_output_records,
             ) {
-                drop(receipt);
-                return Err(self.abort_step(step, error.to_string()).await);
+                return Err(guard.fail(error));
             }
         }
         if let Some(decision) = teacher_forced_decision {
             if let Err(error) = apply_teacher_forced_decision(&mut logits, decision) {
-                drop(receipt);
-                return Err(self.abort_step(step, error.to_string()).await);
+                return Err(guard.fail(error));
             }
         }
         self.metrics
@@ -8895,32 +8924,22 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 .greedy_policy_fallback_waves
                 .fetch_add(1, Ordering::Relaxed);
         }
-        drop(receipt);
-        match step.try_retire_normal() {
-            Ok(retirement) => {
-                self.metrics.completed_waves.fetch_add(1, Ordering::Relaxed);
-                if let Some(error) = execution_event_error {
-                    let message = format!("vNext execution event emission failed: {error}");
-                    self.metrics.record_failure(message.clone());
-                    Err(FerrumError::backend(message))
-                } else {
-                    if let Some(ready) = ready_segment_publication {
-                        // Publication checks exact retirement and current entry.
-                        // A stale or cancelled hint cannot fail a completed wave.
-                        let _ = ready.publish(&retirement);
-                    }
-                    if let Some(program) = resident_install {
-                        self.install_resident_decode(program);
-                    }
-                    Ok(logits)
-                }
-            }
-            Err(failure) => {
-                let message = format!("vNext step retirement failed: {}", failure);
-                self.metrics.record_failure(message.clone());
-                Err(FerrumError::backend(message))
-            }
+        let retired = guard.retire_normal(logits)?;
+        self.metrics.completed_waves.fetch_add(1, Ordering::Relaxed);
+        if let Some(error) = execution_event_error {
+            let message = format!("vNext execution event emission failed: {error}");
+            self.metrics.record_failure(message.clone());
+            return Err(retired.retirement.fail(FerrumError::backend(message)));
         }
+        if let Some(ready) = ready_segment_publication {
+            // Publication checks exact retirement and current entry.
+            // A stale or cancelled hint cannot fail a completed wave.
+            let _ = ready.publish(retired.retirement.receipt());
+        }
+        if let Some(program) = resident_install {
+            self.install_resident_decode(program);
+        }
+        Ok(retired)
     }
 
     fn prepare_terminal_readbacks(
@@ -9122,20 +9141,11 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
 
     fn abort_decode_candidates(&self, candidates: &[VNextDecodeCandidate<R>]) {
         self.release_resident_decode();
-        {
-            let mut registry = self.sequences.lock();
-            for candidate in candidates {
-                if registry
-                    .active
-                    .get(&candidate.cache_id)
-                    .is_some_and(|current| Arc::ptr_eq(current, &candidate.sequence))
-                {
-                    registry.active.remove(&candidate.cache_id);
-                }
-            }
-        }
         for candidate in candidates {
             candidate.sequence.abort();
+            self.sequences
+                .lock()
+                .remove_ended_exact(&candidate.sequence);
         }
     }
 
@@ -9270,7 +9280,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             .iter()
             .map(|candidate| VNextParticipantOutputRole::Decode(candidate.logits_policy.clone()))
             .collect::<Vec<_>>();
-        let logits = match self
+        let retired = match self
             .execute_batch_step(
                 &batch,
                 &sequences,
@@ -9288,67 +9298,71 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             Ok(VNextExecutionCapacityDecision::RequestStateDeferred(deferred)) => {
                 return Ok(PlanRuntimeBatchDecodeOutcome::Deferred(deferred.into()));
             }
-            Err(error) => {
-                if DecodeFailureDisposition::from_error(&error)
-                    == DecodeFailureDisposition::AbortSequence
-                {
-                    self.abort_decode_candidates(&canonical_candidates);
-                }
-                return Err(error);
-            }
+            Err(failure) => return Err(failure.into_error()),
         };
-        if logits.len() != canonical_candidates.len() {
-            self.abort_decode_candidates(&canonical_candidates);
-            return Err(FerrumError::internal(format!(
-                "vNext batch decode returned {} logits rows for {} participants",
-                logits.len(),
-                canonical_candidates.len()
-            )));
-        }
-        for (sampling_output, candidate) in logits.iter().zip(&canonical_candidates) {
-            if let Err(error) = sampling_output
-                .validate_for_policy(&candidate.logits_policy, self.io.output_elements)
+        let RetiredWave {
+            output: logits,
+            retirement,
+        } = retired;
+        let product = (|| -> Result<PlanRuntimeBatchDecodeOutcome> {
+            if logits.len() != canonical_candidates.len() {
+                return Err(FerrumError::internal(format!(
+                    "vNext batch decode returned {} logits rows for {} participants",
+                    logits.len(),
+                    canonical_candidates.len()
+                )));
+            }
+            for (sampling_output, candidate) in logits.iter().zip(&canonical_candidates) {
+                if let Err(error) = sampling_output
+                    .validate_for_policy(&candidate.logits_policy, self.io.output_elements)
+                {
+                    return Err(error);
+                }
+            }
+
+            let mut ordered_outputs = (0..inputs.len()).map(|_| None).collect::<Vec<_>>();
+            for (((candidate, tokens), previous_len), sampling_output) in canonical_candidates
+                .iter()
+                .zip(token_batches)
+                .zip(previous_lengths)
+                .zip(logits)
             {
-                self.abort_decode_candidates(&canonical_candidates);
-                return Err(error);
+                if candidate.sequence.active.load(Ordering::Acquire) {
+                    *candidate.sequence.tokens.lock() = tokens;
+                }
+                let cache = self.cache_handle(&candidate.sequence, previous_len + 1);
+                ordered_outputs[candidate.original_index] =
+                    Some(PlanRuntimeDecodeOutput::new(sampling_output, cache));
             }
-        }
 
-        let mut ordered_outputs = (0..inputs.len()).map(|_| None).collect::<Vec<_>>();
-        for (((candidate, tokens), previous_len), sampling_output) in canonical_candidates
-            .iter()
-            .zip(token_batches)
-            .zip(previous_lengths)
-            .zip(logits)
-        {
-            if candidate.sequence.active.load(Ordering::Acquire) {
-                *candidate.sequence.tokens.lock() = tokens;
-            }
-            let cache = self.cache_handle(&candidate.sequence, previous_len + 1);
-            ordered_outputs[candidate.original_index] =
-                Some(PlanRuntimeDecodeOutput::new(sampling_output, cache));
-        }
-
-        let participant_count = u64::try_from(inputs.len()).unwrap_or(u64::MAX);
-        self.metrics
-            .decode_operations
-            .fetch_add(participant_count, Ordering::Relaxed);
-        let elapsed_us = started.elapsed().as_micros().min(u64::MAX as u128) as u64;
-        self.metrics.total_decode_us.fetch_add(
-            elapsed_us.saturating_mul(participant_count),
-            Ordering::Relaxed,
-        );
-        let outputs = ordered_outputs
-            .into_iter()
-            .map(|output| {
-                output.ok_or_else(|| {
-                    FerrumError::internal(
-                        "vNext batch decode lost the original participant ordering",
-                    )
+            let participant_count = u64::try_from(inputs.len()).unwrap_or(u64::MAX);
+            self.metrics
+                .decode_operations
+                .fetch_add(participant_count, Ordering::Relaxed);
+            let elapsed_us = started.elapsed().as_micros().min(u64::MAX as u128) as u64;
+            self.metrics.total_decode_us.fetch_add(
+                elapsed_us.saturating_mul(participant_count),
+                Ordering::Relaxed,
+            );
+            let outputs = ordered_outputs
+                .into_iter()
+                .map(|output| {
+                    output.ok_or_else(|| {
+                        FerrumError::internal(
+                            "vNext batch decode lost the original participant ordering",
+                        )
+                    })
                 })
-            })
-            .collect::<Result<Vec<_>>>()?;
-        Ok(PlanRuntimeBatchDecodeOutcome::Completed(outputs))
+                .collect::<Result<Vec<_>>>()?;
+            Ok(PlanRuntimeBatchDecodeOutcome::Completed(outputs))
+        })();
+        match product {
+            Ok(output) => {
+                retirement.finish();
+                Ok(output)
+            }
+            Err(error) => Err(retirement.fail(error).into_error()),
+        }
     }
 
     async fn execute_legacy_decode_batch(
@@ -9486,7 +9500,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             .map_err(|error| FerrumError::backend(error.to_string()))?;
         let mut completed_chunk = planned_chunk;
         let mut capacity_probe_count = 0_u32;
-        let mut logits = loop {
+        let retired = loop {
             let extension_tokens = &tokens[..completed_chunk.end()];
             let extension_span =
                 TokenSpanWork::from_token_ids(extension_tokens, 0..extension_tokens.len())
@@ -9538,7 +9552,8 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                     VNextExecutionWaveKind::Prefill,
                     &[VNextParticipantOutputRole::prefill(completed_chunk)],
                 )
-                .await?
+                .await
+                .map_err(WaveFailure::into_error)?
             {
                 VNextExecutionCapacityDecision::Ready(logits) => break logits,
                 VNextExecutionCapacityDecision::Deferred(deferred) => {
@@ -9574,48 +9589,70 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 }
             }
         };
-        let logits = logits.pop().ok_or_else(|| {
-            FerrumError::internal("vNext single prefill execution returned no logits")
-        })?;
-        let logits = logits.into_full_logits()?;
-        self.retain_prefill_boundary(&sequence, &tokens, completed_chunk)
-            .await?;
-        let cache = self.cache_handle(&sequence, completed_chunk.end());
-        let output = if completed_chunk.is_final() {
-            PlanRuntimePrefillOutput::final_logits(
-                request_id.clone(),
-                completed_chunk.end(),
-                logits,
-                cache,
-            )?
-        } else {
-            PlanRuntimePrefillOutput::intermediate(request_id.clone(), completed_chunk.end(), cache)
-        };
-        output.validate_for_completion(&request_id, completed_chunk, self.io.output_elements)?;
-        sequence
-            .prefill_tokens_processed
-            .store(completed_chunk.end(), Ordering::Release);
-        if completed_chunk.is_final() {
-            self.sequences.lock().activate(&slot, &sequence)?;
-            execution.disarm();
-        } else {
-            execution.restore_ready()?;
-        }
-        self.metrics
-            .prefill_operations
-            .fetch_add(1, Ordering::Relaxed);
-        self.metrics.total_prefill_us.fetch_add(
-            started.elapsed().as_micros().min(u64::MAX as u128) as u64,
-            Ordering::Relaxed,
-        );
-        Ok(PlanRuntimePrefillOutcome::Completed(
-            PlanRuntimePrefillCompletion::new(
-                output,
-                planned_chunk,
+        let RetiredWave {
+            output: mut logits,
+            retirement,
+        } = retired;
+        let product = async {
+            let logits = logits.pop().ok_or_else(|| {
+                FerrumError::internal("vNext single prefill execution returned no logits")
+            })?;
+            let logits = logits.into_full_logits()?;
+            self.retain_prefill_boundary(&sequence, &tokens, completed_chunk)
+                .await?;
+            let cache = self.cache_handle(&sequence, completed_chunk.end());
+            let output = if completed_chunk.is_final() {
+                PlanRuntimePrefillOutput::final_logits(
+                    request_id.clone(),
+                    completed_chunk.end(),
+                    logits,
+                    cache,
+                )?
+            } else {
+                PlanRuntimePrefillOutput::intermediate(
+                    request_id.clone(),
+                    completed_chunk.end(),
+                    cache,
+                )
+            };
+            output.validate_for_completion(
+                &request_id,
                 completed_chunk,
-                capacity_probe_count,
-            )?,
-        ))
+                self.io.output_elements,
+            )?;
+            sequence
+                .prefill_tokens_processed
+                .store(completed_chunk.end(), Ordering::Release);
+            if completed_chunk.is_final() {
+                self.sequences.lock().activate(&slot, &sequence)?;
+                execution.disarm();
+            } else {
+                execution.restore_ready()?;
+            }
+            self.metrics
+                .prefill_operations
+                .fetch_add(1, Ordering::Relaxed);
+            self.metrics.total_prefill_us.fetch_add(
+                started.elapsed().as_micros().min(u64::MAX as u128) as u64,
+                Ordering::Relaxed,
+            );
+            Ok(PlanRuntimePrefillOutcome::Completed(
+                PlanRuntimePrefillCompletion::new(
+                    output,
+                    planned_chunk,
+                    completed_chunk,
+                    capacity_probe_count,
+                )?,
+            ))
+        }
+        .await;
+        match product {
+            Ok(output) => {
+                retirement.finish();
+                Ok(output)
+            }
+            Err(error) => Err(retirement.fail(error).into_error()),
+        }
     }
 
     async fn execute_plan_runtime_prefill_batch_with_capacity(
@@ -9774,7 +9811,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             .collect::<Vec<_>>();
         let mut capacity_probe_counts = vec![0_u32; candidates.len()];
 
-        let logits = 'capacity: loop {
+        let retired = 'capacity: loop {
             for (index, candidate) in candidates.iter().enumerate() {
                 let completed_chunk = completed_chunks[index];
                 let extension_tokens = &candidate.tokens[..completed_chunk.end()];
@@ -9843,7 +9880,8 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                     VNextExecutionWaveKind::Prefill,
                     &output_roles,
                 )
-                .await?
+                .await
+                .map_err(WaveFailure::into_error)?
             {
                 VNextExecutionCapacityDecision::Ready(logits) => break logits,
                 VNextExecutionCapacityDecision::Deferred(deferred) => {
@@ -9904,102 +9942,116 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 }
             }
         };
-        if logits.len() != candidates.len() {
-            return Err(FerrumError::internal(format!(
-                "vNext batch prefill returned {} logits rows for {} participants",
-                logits.len(),
-                candidates.len()
-            )));
-        }
+        let RetiredWave {
+            output: logits,
+            retirement,
+        } = retired;
+        let product = async {
+            if logits.len() != candidates.len() {
+                return Err(FerrumError::internal(format!(
+                    "vNext batch prefill returned {} logits rows for {} participants",
+                    logits.len(),
+                    candidates.len()
+                )));
+            }
 
-        // Every participating FullPlan has retired. Optional copying here
-        // cannot turn a zero-submission capacity outcome into hidden work.
-        for (candidate, chunk) in candidates.iter().zip(&completed_chunks) {
-            self.retain_prefill_boundary(&candidate.sequence, &candidate.tokens, *chunk)
-                .await?;
-        }
+            // Every participating FullPlan has retired. Optional copying here
+            // cannot turn a zero-submission capacity outcome into hidden work.
+            for (candidate, chunk) in candidates.iter().zip(&completed_chunks) {
+                self.retain_prefill_boundary(&candidate.sequence, &candidate.tokens, *chunk)
+                    .await?;
+            }
 
-        let mut ordered = (0..inputs.len()).map(|_| None).collect::<Vec<_>>();
-        for (((candidate, completed_chunk), capacity_probe_count), logits) in candidates
-            .iter()
-            .zip(&completed_chunks)
-            .zip(&capacity_probe_counts)
-            .zip(logits)
-        {
-            let logits = logits.into_full_logits()?;
-            let cache = self.cache_handle(&candidate.sequence, completed_chunk.end());
-            let output = if completed_chunk.is_final() {
-                PlanRuntimePrefillOutput::final_logits(
-                    candidate.slot.request_id.clone(),
-                    completed_chunk.end(),
-                    logits,
-                    cache,
-                )?
-            } else {
-                PlanRuntimePrefillOutput::intermediate(
-                    candidate.slot.request_id.clone(),
-                    completed_chunk.end(),
-                    cache,
-                )
-            };
-            output.validate_for_completion(
-                &candidate.slot.request_id,
-                *completed_chunk,
-                self.io.output_elements,
-            )?;
-            ordered[candidate.original_index] = Some(PlanRuntimePrefillCompletion::new(
-                output,
-                candidate.planned_chunk,
-                *completed_chunk,
-                *capacity_probe_count,
-            )?);
-        }
-        let outputs = ordered
-            .into_iter()
-            .map(|output| {
-                output.ok_or_else(|| {
-                    FerrumError::internal(
-                        "vNext batch prefill lost the original participant ordering",
+            let mut ordered = (0..inputs.len()).map(|_| None).collect::<Vec<_>>();
+            for (((candidate, completed_chunk), capacity_probe_count), logits) in candidates
+                .iter()
+                .zip(&completed_chunks)
+                .zip(&capacity_probe_counts)
+                .zip(logits)
+            {
+                let logits = logits.into_full_logits()?;
+                let cache = self.cache_handle(&candidate.sequence, completed_chunk.end());
+                let output = if completed_chunk.is_final() {
+                    PlanRuntimePrefillOutput::final_logits(
+                        candidate.slot.request_id.clone(),
+                        completed_chunk.end(),
+                        logits,
+                        cache,
+                    )?
+                } else {
+                    PlanRuntimePrefillOutput::intermediate(
+                        candidate.slot.request_id.clone(),
+                        completed_chunk.end(),
+                        cache,
+                    )
+                };
+                output.validate_for_completion(
+                    &candidate.slot.request_id,
+                    *completed_chunk,
+                    self.io.output_elements,
+                )?;
+                ordered[candidate.original_index] = Some(PlanRuntimePrefillCompletion::new(
+                    output,
+                    candidate.planned_chunk,
+                    *completed_chunk,
+                    *capacity_probe_count,
+                )?);
+            }
+            let outputs = ordered
+                .into_iter()
+                .map(|output| {
+                    output.ok_or_else(|| {
+                        FerrumError::internal(
+                            "vNext batch prefill lost the original participant ordering",
+                        )
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+
+            let authority = candidates
+                .iter()
+                .zip(&completed_chunks)
+                .map(|(candidate, completed_chunk)| {
+                    (
+                        &candidate.slot,
+                        &candidate.sequence,
+                        completed_chunk.is_final(),
                     )
                 })
-            })
-            .collect::<Result<Vec<_>>>()?;
+                .collect::<Vec<_>>();
+            for (candidate, completed_chunk) in candidates.iter().zip(&completed_chunks) {
+                candidate
+                    .sequence
+                    .prefill_tokens_processed
+                    .store(completed_chunk.end(), Ordering::Release);
+            }
+            self.sequences
+                .lock()
+                .commit_prefill_batch_execution(&authority)?;
+            for guard in &mut execution_guards {
+                guard.disarm();
+            }
 
-        let authority = candidates
-            .iter()
-            .zip(&completed_chunks)
-            .map(|(candidate, completed_chunk)| {
-                (
-                    &candidate.slot,
-                    &candidate.sequence,
-                    completed_chunk.is_final(),
-                )
-            })
-            .collect::<Vec<_>>();
-        for (candidate, completed_chunk) in candidates.iter().zip(&completed_chunks) {
-            candidate
-                .sequence
-                .prefill_tokens_processed
-                .store(completed_chunk.end(), Ordering::Release);
+            let participant_count = u64::try_from(inputs.len()).unwrap_or(u64::MAX);
+            self.metrics
+                .prefill_operations
+                .fetch_add(participant_count, Ordering::Relaxed);
+            let elapsed_us = started.elapsed().as_micros().min(u64::MAX as u128) as u64;
+            self.metrics.total_prefill_us.fetch_add(
+                elapsed_us.saturating_mul(participant_count),
+                Ordering::Relaxed,
+            );
+            drop(operation_guards);
+            Ok(PlanRuntimeBatchPrefillOutcome::Completed(outputs))
         }
-        self.sequences
-            .lock()
-            .commit_prefill_batch_execution(&authority)?;
-        for guard in &mut execution_guards {
-            guard.disarm();
+        .await;
+        match product {
+            Ok(output) => {
+                retirement.finish();
+                Ok(output)
+            }
+            Err(error) => Err(retirement.fail(error).into_error()),
         }
-
-        let participant_count = u64::try_from(inputs.len()).unwrap_or(u64::MAX);
-        self.metrics
-            .prefill_operations
-            .fetch_add(participant_count, Ordering::Relaxed);
-        let elapsed_us = started.elapsed().as_micros().min(u64::MAX as u128) as u64;
-        self.metrics.total_prefill_us.fetch_add(
-            elapsed_us.saturating_mul(participant_count),
-            Ordering::Relaxed,
-        );
-        drop(operation_guards);
-        Ok(PlanRuntimeBatchPrefillOutcome::Completed(outputs))
     }
 
     fn plan_runtime_prefill_input_from_legacy(
@@ -10850,49 +10902,54 @@ impl<R: DeviceRuntime> ModelExecutor for VNextModelExecutor<R> {
             if DecodeFailureDisposition::from_error(&error)
                 == DecodeFailureDisposition::AbortSequence
             {
-                self.sequences.lock().active.remove(&cache_id);
                 sequence.abort();
+                self.sequences.lock().remove_ended_exact(&sequence);
             }
             return Err(error);
         }
         let step_span = TokenSpanWork::from_token_ids(&tokens, previous_len..tokens.len())
             .map_err(|error| FerrumError::backend(error.to_string()))?;
-        let sampling_output = match self
+        let retired = match self
             .execute_step(&sequence, &tokens, step_span, &input.logits_policy)
             .await
         {
             Ok(sampling_output) => sampling_output,
-            Err(error) => {
-                if DecodeFailureDisposition::from_error(&error)
-                    == DecodeFailureDisposition::AbortSequence
-                {
-                    self.sequences.lock().active.remove(&cache_id);
-                    sequence.abort();
+            Err(failure) => return Err(failure.into_error()),
+        };
+        let RetiredWave {
+            output: sampling_output,
+            retirement,
+        } = retired;
+        let product = (|| -> Result<DecodeOutput> {
+            sampling_output.validate_for_policy(&input.logits_policy, self.io.output_elements)?;
+            *sequence.tokens.lock() = tokens;
+            self.metrics
+                .decode_operations
+                .fetch_add(1, Ordering::Relaxed);
+            self.metrics.total_decode_us.fetch_add(
+                started.elapsed().as_micros().min(u64::MAX as u128) as u64,
+                Ordering::Relaxed,
+            );
+            let legacy_values = match sampling_output {
+                ExecutorSamplingOutput::FullLogits(logits) => logits,
+                ExecutorSamplingOutput::GreedyToken(token) => vec![token.get() as f32],
+                ExecutorSamplingOutput::NoSelectableFiniteLogit => {
+                    return Err(FerrumError::backend(
+                        "No finite logits available for sampling",
+                    ));
                 }
-                return Err(error);
+            };
+            let logits = self.decode_tensor(legacy_values)?;
+            let cache = self.cache_handle(&sequence, previous_len + 1);
+            Ok(DecodeOutput::new(logits, cache))
+        })();
+        match product {
+            Ok(output) => {
+                retirement.finish();
+                Ok(output)
             }
-        };
-        sampling_output.validate_for_policy(&input.logits_policy, self.io.output_elements)?;
-        *sequence.tokens.lock() = tokens;
-        self.metrics
-            .decode_operations
-            .fetch_add(1, Ordering::Relaxed);
-        self.metrics.total_decode_us.fetch_add(
-            started.elapsed().as_micros().min(u64::MAX as u128) as u64,
-            Ordering::Relaxed,
-        );
-        let legacy_values = match sampling_output {
-            ExecutorSamplingOutput::FullLogits(logits) => logits,
-            ExecutorSamplingOutput::GreedyToken(token) => vec![token.get() as f32],
-            ExecutorSamplingOutput::NoSelectableFiniteLogit => {
-                return Err(FerrumError::backend(
-                    "No finite logits available for sampling",
-                ));
-            }
-        };
-        let logits = self.decode_tensor(legacy_values)?;
-        let cache = self.cache_handle(&sequence, previous_len + 1);
-        Ok(DecodeOutput::new(logits, cache))
+            Err(error) => Err(retirement.fail(error).into_error()),
+        }
     }
 
     async fn batch_decode(&self, inputs: &[DecodeInput]) -> Result<Vec<DecodeOutput>> {
@@ -10950,8 +11007,10 @@ impl<R: DeviceRuntime> ModelExecutor for VNextModelExecutor<R> {
 
     fn release_cache(&self, cache_id: &str) {
         self.release_resident_decode();
-        if let Some(sequence) = self.sequences.lock().active.remove(cache_id) {
+        let sequence = self.sequences.lock().active.get(cache_id).cloned();
+        if let Some(sequence) = sequence {
             sequence.abort();
+            self.sequences.lock().remove_ended_exact(&sequence);
         }
     }
 
@@ -10961,16 +11020,17 @@ impl<R: DeviceRuntime> ModelExecutor for VNextModelExecutor<R> {
             .sequences
             .lock()
             .active
-            .remove(completion.cache_id())
+            .get(completion.cache_id())
+            .cloned()
             .ok_or_else(|| {
                 FerrumError::not_found(format!(
                     "vNext completion cache `{}` is not active",
                     completion.cache_id()
                 ))
             })?;
-        // Removing the registry entry prevents new callers from finding this
-        // incarnation. Wait for already-owned work before inspecting its final
-        // executed tokens or completing the native session.
+        // Close admission but retain this incarnation while its existing work
+        // and any native transfer settle. Cancellation must not orphan it.
+        sequence.begin_closing();
         let mut pending = PendingSequenceCompletion {
             sequence: &sequence,
             operation: None,
@@ -10986,6 +11046,7 @@ impl<R: DeviceRuntime> ModelExecutor for VNextModelExecutor<R> {
         self.retain_completed_sequence_boundary(&sequence).await?;
         sequence.complete(&completion)?;
         pending.completed = true;
+        self.sequences.lock().remove_ended_exact(&sequence);
         Ok(())
     }
 

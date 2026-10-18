@@ -8,6 +8,7 @@ use ferrum_kernels::backend::cpu::vnext_ops::CpuVNextComposition;
 use serde_json::json;
 
 mod fixture;
+mod lifecycle;
 use fixture::{Fixture, FixtureOptions, VOCAB};
 
 fn cpu(
