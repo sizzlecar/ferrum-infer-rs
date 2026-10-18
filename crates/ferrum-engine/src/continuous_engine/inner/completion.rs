@@ -1,13 +1,5 @@
 use super::*;
 
-impl SequencePhysicalResources {
-    pub(super) fn is_empty(&self) -> bool {
-        self.legacy_kv_allocation.is_none()
-            && self.recurrent_state_allocation.is_none()
-            && self.model_cache_id.is_none()
-    }
-}
-
 impl SequenceState {
     /// Return the first matched stop, or hold the longest suffix that could
     /// still become a stop. Character boundaries keep Unicode stops safe.
@@ -463,13 +455,40 @@ impl EngineInner {
     async fn cancel_abandoned_request(&self, request_id: &RequestId) -> Result<()> {
         self.discard_pending_prefix_restore(request_id);
         let detected_scheduler_iteration = self.scheduler.trace_snapshot().current_iteration;
-        let (completion_resources, terminal_token_trace) = {
+        let (completion_resources, terminal_token_trace, token_close, request_slot_present) = {
             let mut sequences = self.sequences.write();
             let Some(mut sequence) = sequences.remove(request_id) else {
                 return Ok(());
             };
             let terminal_token_trace = self.capture_sequence_terminal_token_trace(&sequence);
-            (sequence.take_completion_resources(), terminal_token_trace)
+            let mut resources = sequence.take_completion_resources();
+            let request_slot_present = resources.request_slot.is_some();
+            // Keep the outer handoff atomic with terminal consumption by the
+            // close registry. No await may separate removal and registration.
+            let token_close = resources.execution_frontier.take().map(|frontier| {
+                let cancelled = self.scheduler.cancel_request(request_id.clone());
+                let ticket = match resources.execution_close.take() {
+                    Some(outcome) => self.begin_observed_close(
+                        request_id.clone(),
+                        frontier.sequence().clone(),
+                        resources.request_slot.take(),
+                        outcome,
+                    ),
+                    None => self.begin_execution_close(
+                        request_id.clone(),
+                        frontier.sequence().clone(),
+                        resources.request_slot.take(),
+                        ferrum_execution::token_execution::ExecutionEndReason::Cancelled,
+                    ),
+                };
+                (frontier, cancelled, ticket)
+            });
+            (
+                resources,
+                terminal_token_trace,
+                token_close,
+                request_slot_present,
+            )
         };
         self.write_sequence_terminal_token_trace(
             request_id,
@@ -477,8 +496,7 @@ impl EngineInner {
             None,
             terminal_token_trace.as_ref(),
         );
-        let physical_resources_present = !completion_resources.physical.is_empty();
-        let request_slot_present = completion_resources.request_slot.is_some();
+        let execution_incarnation_present = token_close.is_some();
         self.write_executor_scheduler_profile_event(
             request_id,
             "engine_client_disconnect_detected",
@@ -502,24 +520,27 @@ impl EngineInner {
             None,
         );
 
-        if self.model_executor.execution_resource_authority()
-            == ExecutionResourceAuthority::PlanRuntime
-        {
+        let mut close_error = None;
+        let mut token_close_pending = false;
+        let scheduler_cancel = if let Some((frontier, scheduler_cancel, ticket)) = token_close {
+            let close_result = match ticket {
+                Ok(ticket) => ticket.initial_result().await,
+                Err(error) => Err(error),
+            };
+            let observation_result = self.drain_execution_closes();
+            close_error = close_result.and(observation_result).err();
+            token_close_pending = frontier.sequence().observed_end().is_none();
+            scheduler_cancel
+        } else {
+            // No token incarnation was admitted. Cancel only the retained
+            // admission obligation; no physical release is inferred here.
             self.model_executor.cancel_prefill_admission(request_id);
-        }
-
-        let released_waiting_capacity = self.scheduler.trace_phase(request_id)
-            == Some(RequestPhase::Waiting)
-            && !completion_resources.physical.is_empty();
-        self.release_sequence_physical_resources(request_id, completion_resources.physical)
-            .await;
-        let scheduler_cancel = self.scheduler.cancel(request_id.clone()).await;
-        if released_waiting_capacity {
-            self.scheduler.record_external_capacity_release();
-        }
-        if let Some(request_slot) = completion_resources.request_slot {
-            request_slot.close(self);
-        }
+            let scheduler_cancel = self.scheduler.cancel_request(request_id.clone());
+            if let Some(request_slot) = completion_resources.request_slot {
+                request_slot.close(self);
+            }
+            scheduler_cancel
+        };
 
         let terminal_scheduler_iteration = self.scheduler.trace_snapshot().current_iteration;
         let scheduler_tick_delta =
@@ -583,11 +604,15 @@ impl EngineInner {
                 ),
                 (
                     "terminal_state".to_string(),
-                    serde_json::json!(terminal_state),
+                    serde_json::json!(if token_close_pending {
+                        "close_pending"
+                    } else {
+                        terminal_state
+                    }),
                 ),
                 (
-                    "physical_resources_present".to_string(),
-                    serde_json::json!(physical_resources_present),
+                    "execution_incarnation_present".to_string(),
+                    serde_json::json!(execution_incarnation_present),
                 ),
                 (
                     "request_slot_present".to_string(),
@@ -597,7 +622,7 @@ impl EngineInner {
             profile_error,
         );
 
-        match scheduler_cancel {
+        let scheduler_result = match scheduler_cancel {
             Ok(true) => {
                 debug!(request_id = %request_id, "Cancelled request after client disconnected");
                 Ok(())
@@ -610,7 +635,8 @@ impl EngineInner {
                 Ok(())
             }
             Err(error) => Err(error),
-        }
+        };
+        scheduler_result.and(close_error.map_or(Ok(()), Err))
     }
 
     pub(super) async fn complete_request(
@@ -685,6 +711,7 @@ impl EngineInner {
             completion_resources,
             mut terminal_error,
             terminal_token_trace,
+            token_close,
         ) = {
             let mut sequences = self.sequences.write();
             if let Some(mut seq) = sequences.remove(request_id) {
@@ -732,7 +759,7 @@ impl EngineInner {
                     }
                 }
 
-                let response = InferenceResponse {
+                let mut response = InferenceResponse {
                     request_id: request_id.clone(),
                     text,
                     tokens: seq.generated_tokens.clone(),
@@ -749,7 +776,47 @@ impl EngineInner {
                     execution_evidence,
                 };
 
-                let completion_resources = seq.take_completion_resources();
+                let mut completion_resources = seq.take_completion_resources();
+                // The same outer lock excludes a recompute drain until this
+                // exact incarnation and its slot have reached the registry.
+                if let Err(error) = self
+                    .scheduler
+                    .complete_request(request_id.clone(), &response)
+                {
+                    warn!(request_id = %request_id, error = %error, "Scheduler completion failed");
+                    terminal_error.get_or_insert_with(|| error.clone());
+                    completion_error.get_or_insert(error);
+                    response.finish_reason = FinishReason::Error;
+                    response.api_response = None;
+                }
+                let token_close = completion_resources
+                    .execution_frontier
+                    .take()
+                    .map(|frontier| {
+                        use ferrum_execution::token_execution::ExecutionEndReason;
+                        let reason = if response.finish_reason == FinishReason::Error {
+                            ExecutionEndReason::Cancelled
+                        } else {
+                            ExecutionEndReason::Completed {
+                                input_tokens: response.usage.prompt_tokens,
+                                output_tokens: response.usage.completion_tokens,
+                            }
+                        };
+                        match completion_resources.execution_close.take() {
+                            Some(outcome) => self.begin_observed_close(
+                                request_id.clone(),
+                                frontier.sequence().clone(),
+                                completion_resources.request_slot.take(),
+                                outcome,
+                            ),
+                            None => self.begin_execution_close(
+                                request_id.clone(),
+                                frontier.sequence().clone(),
+                                completion_resources.request_slot.take(),
+                                reason,
+                            ),
+                        }
+                    });
                 (
                     response,
                     seq.stream_sender.take(),
@@ -757,49 +824,32 @@ impl EngineInner {
                     completion_resources,
                     terminal_error,
                     terminal_token_trace,
+                    token_close,
                 )
             } else {
                 return Ok(());
             }
         };
-        if self.model_executor.execution_resource_authority()
-            == ExecutionResourceAuthority::PlanRuntime
-        {
-            self.model_executor.cancel_prefill_admission(request_id);
-        }
-
-        if response.finish_reason == FinishReason::Error {
-            self.release_sequence_physical_resources(request_id, completion_resources.physical)
-                .await;
-        } else {
-            if let Err(error) = self
-                .complete_sequence_physical_resources(
-                    request_id,
-                    completion_resources.physical,
-                    &response.usage,
-                )
-                .await
-            {
-                // complete_cache owns the disposition of its native state.
-                // In particular, an error must not trigger a second generic
-                // release that could free state still retained in quarantine.
-                warn!(request_id = %request_id, error = %error, "Model completion failed");
+        // Physical closure may remain held after logical completion. Awaiting
+        // the initial result cannot cancel the registry's independent owner.
+        if let Some(ticket) = token_close {
+            let close_result = match ticket {
+                Ok(ticket) => ticket.initial_result().await,
+                Err(error) => Err(error),
+            };
+            // Drain all terminal owners even if the operation itself failed.
+            let observation_result = self.drain_execution_closes();
+            if let Err(error) = close_result.and(observation_result) {
                 terminal_error.get_or_insert_with(|| error.clone());
                 completion_error.get_or_insert(error);
                 response.finish_reason = FinishReason::Error;
                 response.api_response = None;
             }
-        }
-
-        if let Err(error) = self.scheduler.complete(request_id.clone(), &response).await {
-            warn!(request_id = %request_id, error = %error, "Scheduler completion failed");
-            terminal_error.get_or_insert_with(|| error.clone());
-            completion_error.get_or_insert(error);
-            response.finish_reason = FinishReason::Error;
-            response.api_response = None;
-        }
-        if let Some(request_slot) = completion_resources.request_slot {
-            request_slot.close(self);
+        } else {
+            self.model_executor.cancel_prefill_admission(request_id);
+            if let Some(request_slot) = completion_resources.request_slot {
+                request_slot.close(self);
+            }
         }
         self.write_sequence_terminal_token_trace(
             request_id,

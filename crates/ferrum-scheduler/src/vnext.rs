@@ -201,6 +201,8 @@ impl WaitingAdmissionTicket {
 pub enum AdmissionProbeOutcome<A, R, E> {
     Admitted(A),
     Deferred(AdmissionDeferral),
+    /// The executor observed an actual allocator shortfall without native epochs.
+    CapacityDeferred,
     PermanentRejected(R),
     Faulted(E),
 }
@@ -366,6 +368,7 @@ struct WaitingEntry<T> {
     ticket: WaitingAdmissionTicket,
     request: T,
     deferral: Option<AdmissionDeferral>,
+    release_deferred_at: Option<u64>,
     relevant_bypass_events: u64,
     fairness_opportunity: bool,
 }
@@ -489,6 +492,17 @@ impl<T> DynamicAdmissionQueue<T> {
         .map_err(|error| DynamicAdmissionQueueError::InvalidWakeCondition(error.to_string()))
     }
 
+    /// True only when every eligible queued request is waiting for a confirmed
+    /// physical close. A new request or a changed release generation stays runnable.
+    pub fn waits_for_external_release(&self, release_epoch: u64) -> bool {
+        !self.waiting.is_empty()
+            && self.waiting.iter().all(|entry| {
+                entry
+                    .release_deferred_at
+                    .is_some_and(|observed| release_epoch <= observed)
+            })
+    }
+
     pub fn iter(&self) -> impl Iterator<Item = &T> {
         self.waiting.iter().map(|entry| &entry.request)
     }
@@ -536,6 +550,7 @@ impl<T> DynamicAdmissionQueue<T> {
             ticket,
             request,
             deferral: None,
+            release_deferred_at: None,
             relevant_bypass_events: 0,
             fairness_opportunity: false,
         });
@@ -555,6 +570,7 @@ impl<T> DynamicAdmissionQueue<T> {
             ticket,
             request,
             deferral: None,
+            release_deferred_at: None,
             relevant_bypass_events: 0,
             fairness_opportunity: false,
         });
@@ -716,15 +732,43 @@ impl<T> DynamicAdmissionQueue<T> {
         maximum_probes: usize,
         maximum_admissions: usize,
         events: &mut Vec<AdmissionQueueEvent<T, A, R, E>>,
+        eligibility: impl FnMut(&mut T, WaitingAdmissionTicket) -> AdmissionQueueEligibility,
+        observe_held: impl FnMut(&T, WaitingAdmissionTicket),
+        observe_skipped_unchanged: impl FnMut(&T, WaitingAdmissionTicket, &AdmissionDeferral),
+        probe: impl FnMut(&mut T) -> AdmissionProbeOutcome<A, R, E>,
+    ) -> Result<AdmissionTickReceipt, DynamicAdmissionQueueError> {
+        self.schedule_with_capacity_observed(
+            Some(wake),
+            0,
+            maximum_probes,
+            maximum_admissions,
+            events,
+            eligibility,
+            observe_held,
+            observe_skipped_unchanged,
+            probe,
+        )
+    }
+
+    /// Shared admission scan: native epochs are optional; allocator-only deferrals
+    /// are retried only after a confirmed executor terminal release.
+    pub fn schedule_with_capacity_observed<A, R, E>(
+        &mut self,
+        wake: Option<AdmissionWakeSnapshot<'_>>,
+        release_epoch: u64,
+        maximum_probes: usize,
+        maximum_admissions: usize,
+        events: &mut Vec<AdmissionQueueEvent<T, A, R, E>>,
         mut eligibility: impl FnMut(&mut T, WaitingAdmissionTicket) -> AdmissionQueueEligibility,
         mut observe_held: impl FnMut(&T, WaitingAdmissionTicket),
         mut observe_skipped_unchanged: impl FnMut(&T, WaitingAdmissionTicket, &AdmissionDeferral),
         mut probe: impl FnMut(&mut T) -> AdmissionProbeOutcome<A, R, E>,
     ) -> Result<AdmissionTickReceipt, DynamicAdmissionQueueError> {
         events.clear();
-        let wake_epochs = wake.epochs();
-        self.validate_wake(wake_epochs)?;
-        self.last_wake = Some(wake_epochs);
+        if let Some(wake) = wake {
+            self.validate_wake(wake.epochs())?;
+            self.last_wake = Some(wake.epochs());
+        }
 
         let initial_len = self.waiting.len();
         let mut receipt = AdmissionTickReceipt {
@@ -755,7 +799,7 @@ impl<T> DynamicAdmissionQueue<T> {
                 self.waiting.push_back(entry);
                 continue;
             }
-            let first_probe = entry.deferral.is_none();
+            let first_probe = entry.deferral.is_none() && entry.release_deferred_at.is_none();
             entry.fairness_opportunity = false;
             let aged = entry.relevant_bypass_events >= self.policy.max_relevant_bypass_events;
             if admission_closed
@@ -769,7 +813,32 @@ impl<T> DynamicAdmissionQueue<T> {
                 continue;
             }
 
+            if let Some(observed) = entry.release_deferred_at {
+                if release_epoch <= observed {
+                    receipt.skipped_unchanged += 1;
+                    if aged {
+                        receipt.fairness_barrier = Some(entry.ticket);
+                        admission_closed = true;
+                    }
+                    self.waiting.push_back(entry);
+                    continue;
+                }
+                entry.fairness_opportunity = true;
+            }
             if let Some(deferral) = entry.deferral.as_ref() {
+                let Some(wake) = wake else {
+                    receipt.faulted += 1;
+                    events.push(AdmissionQueueEvent::ContractFaulted {
+                        ticket: entry.ticket,
+                        request: entry.request,
+                        error: DynamicAdmissionQueueError::InvalidWakeCondition(
+                            "native deferral requires its actual capacity snapshot".into(),
+                        ),
+                    });
+                    continue;
+                };
+                let wake_epochs = wake.epochs();
+
                 let contract_error =
                     if deferral.observed.coordinator_id != wake_epochs.coordinator_id {
                         Some(DynamicAdmissionQueueError::ForeignCoordinator {
@@ -805,6 +874,8 @@ impl<T> DynamicAdmissionQueue<T> {
                 }
             }
             if let Some(deferral) = entry.deferral.as_mut() {
+                let wake = wake.expect("native deferral snapshot was validated");
+                let wake_epochs = wake.epochs();
                 let policy_changed = wake_epochs.policy_epoch > deferral.observed.policy_epoch;
                 let audit_changed = wake_epochs.release_epoch > deferral.observed.release_epoch
                     || wake_epochs.capacity_epoch > deferral.observed.capacity_epoch;
@@ -859,7 +930,30 @@ impl<T> DynamicAdmissionQueue<T> {
                         error,
                     });
                 }
+                AdmissionProbeOutcome::CapacityDeferred => {
+                    entry.deferral = None;
+                    entry.release_deferred_at = Some(release_epoch);
+                    receipt.deferred += 1;
+                    if aged {
+                        receipt.fairness_barrier = Some(entry.ticket);
+                        admission_closed = true;
+                    }
+                    self.waiting.push_back(entry);
+                }
                 AdmissionProbeOutcome::Deferred(deferral) => {
+                    let Some(wake) = wake else {
+                        receipt.faulted += 1;
+                        events.push(AdmissionQueueEvent::ContractFaulted {
+                            ticket: entry.ticket,
+                            request: entry.request,
+                            error: DynamicAdmissionQueueError::InvalidWakeCondition(
+                                "native deferral requires its actual capacity snapshot".into(),
+                            ),
+                        });
+                        continue;
+                    };
+                    let wake_epochs = wake.epochs();
+
                     let contract_error = if deferral.observed.coordinator_id
                         != wake_epochs.coordinator_id
                     {
@@ -894,6 +988,7 @@ impl<T> DynamicAdmissionQueue<T> {
                     }
                     let action = deferral.action;
                     entry.deferral = Some(deferral.clone());
+                    entry.release_deferred_at = None;
                     receipt.deferred += 1;
                     if action == DeferredAction::PreemptAndRecompute {
                         receipt.preemption_requested += 1;
@@ -919,7 +1014,7 @@ impl<T> DynamicAdmissionQueue<T> {
 
         for entry in &mut self.waiting {
             if maximum_admitted_ticket.is_some_and(|admitted| entry.ticket < admitted)
-                && entry.deferral.is_some()
+                && (entry.deferral.is_some() || entry.release_deferred_at.is_some())
                 && entry.fairness_opportunity
             {
                 entry.relevant_bypass_events = entry.relevant_bypass_events.saturating_add(1);
@@ -931,7 +1026,7 @@ impl<T> DynamicAdmissionQueue<T> {
                 .waiting
                 .iter()
                 .find(|entry| {
-                    entry.deferral.is_some()
+                    (entry.deferral.is_some() || entry.release_deferred_at.is_some())
                         && entry.relevant_bypass_events >= self.policy.max_relevant_bypass_events
                 })
                 .map(|entry| entry.ticket);

@@ -1,6 +1,105 @@
 use super::*;
 use futures::StreamExt;
 
+// Preserve the existing controlled token stream, including its repeated first
+// decode token. Only Engine plumbing changes: opaque admission/frontiers and
+// explicit closure now flow through the common token protocol. Fake logits
+// remain protocol fixtures, not model numerical evidence.
+struct StopBoundaryExecutor {
+    inner: ferrum_testkit::ConfigurableModelExecutor,
+    tokens: ControlledTokenState,
+}
+
+impl StopBoundaryExecutor {
+    fn with_token_sequence(vocabulary: usize, tokens: Vec<u32>) -> Self {
+        Self {
+            inner: ferrum_testkit::ConfigurableModelExecutor::with_token_sequence(
+                vocabulary, tokens,
+            ),
+            tokens: ControlledTokenState::default(),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl ModelExecutor for StopBoundaryExecutor {
+    fn info(&self) -> &ferrum_types::ModelInfo {
+        self.inner.info()
+    }
+    fn capabilities(&self) -> ExecutorCapabilities {
+        self.inner.capabilities()
+    }
+    fn status(&self) -> ExecutorStatus {
+        self.inner.status()
+    }
+    fn try_admit_prefill(
+        &self,
+        input: ExecutorPrefillAdmission<'_>,
+    ) -> Result<ExecutorPrefillAdmissionDecision> {
+        input.validate()?;
+        Ok(ExecutorPrefillAdmissionDecision::Admitted(
+            ExecutorPrefillAdmissionReceipt {
+                request_id: input.request_id.clone(),
+            },
+        ))
+    }
+    fn admit_tokens(&self, input: ExecutionAdmission<'_>) -> Result<TokenAdmissionOutcome> {
+        assert!(input.adapter.is_none());
+        controlled_token_fixture::admit(self, &self.tokens, input)
+    }
+    async fn execute_tokens(&self, work: &[ExecutionWork<'_>]) -> Result<ExecutionBatchOutcome> {
+        controlled_token_fixture::execute(self, &self.tokens, work).await
+    }
+    async fn finish_tokens(
+        &self,
+        sequence: &ExecutorSequence,
+        reason: ExecutionEndReason,
+    ) -> Result<ExecutionCloseOutcome> {
+        controlled_token_fixture::finish(self, &self.tokens, sequence, reason).await
+    }
+    fn cancel_tokens(&self, sequence: &ExecutorSequence) -> Result<ExecutionCloseOutcome> {
+        controlled_token_fixture::cancel(self, &self.tokens, sequence)
+    }
+    async fn plan_runtime_prefill_with_capacity(
+        &self,
+        input: &PlanRuntimePrefillInput,
+    ) -> Result<PlanRuntimePrefillOutcome> {
+        let output = self
+            .inner
+            .prefill(&plan_runtime_prefill_to_mock_input(input))
+            .await?;
+        plan_runtime_prefill_completion_from_mock(
+            &input.request_id,
+            ExecutorPrefillCompletion::exact(output, input.chunk),
+        )
+        .map(PlanRuntimePrefillOutcome::Completed)
+    }
+    async fn plan_runtime_batch_decode_with_capacity(
+        &self,
+        inputs: &[PlanRuntimeDecodeInput],
+    ) -> Result<PlanRuntimeBatchDecodeOutcome> {
+        let mut outputs = Vec::new();
+        for input in inputs {
+            let old = DecodeInput::new(
+                MockTensor::from_f32(vec![input.input_token.get() as f32], &[1, 1]).into_ref(),
+                input.kv_cache.clone(),
+            );
+            let output = self.inner.decode(&old).await?;
+            outputs.push(PlanRuntimeDecodeOutput::new(
+                ExecutorSamplingOutput::FullLogits(output.logits.to_vec_f32()?),
+                output.kv_cache,
+            ));
+        }
+        Ok(PlanRuntimeBatchDecodeOutcome::Completed(outputs))
+    }
+    async fn prefill(&self, _: &PrefillInput) -> Result<PrefillOutput> {
+        panic!("Engine must execute the controlled token protocol")
+    }
+    async fn decode(&self, _: &DecodeInput) -> Result<DecodeOutput> {
+        panic!("Engine must execute the controlled token protocol")
+    }
+}
+
 fn stop_boundary_engine(pieces: &[&str], end_with_eos: bool) -> ContinuousBatchEngine {
     let mut pairs = vec![("test", 5), ("", 6)];
     pairs.extend(
@@ -23,7 +122,7 @@ fn stop_boundary_engine(pieces: &[&str], end_with_eos: bool) -> ContinuousBatchE
         tokenizer,
         Arc::new(crate::registry::GreedySampler),
         Arc::new(MockKvCacheManager::new(256)),
-        Arc::new(ferrum_testkit::ConfigurableModelExecutor::with_token_sequence(128, tokens)),
+        Arc::new(StopBoundaryExecutor::with_token_sequence(128, tokens)),
         Arc::new(MockTensorFactory),
     )
     .unwrap()
@@ -286,7 +385,7 @@ async fn stop_boundary_rejects_strict_json_truncated_inside_a_token() {
             tokenizer,
             Arc::new(crate::registry::GreedySampler),
             Arc::new(MockKvCacheManager::new(256)),
-            Arc::new(ferrum_testkit::ConfigurableModelExecutor::with_token_sequence(16, vec![7])),
+            Arc::new(StopBoundaryExecutor::with_token_sequence(16, vec![7])),
             Arc::new(MockTensorFactory),
         )
         .unwrap()

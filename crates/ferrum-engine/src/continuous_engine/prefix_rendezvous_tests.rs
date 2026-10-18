@@ -135,6 +135,7 @@ impl CaptureState {
     pub(super) fn restore(
         self: &Arc<Self>,
         input: PlanRuntimePrefixRestoreInput<'_>,
+        tokens: Arc<ControlledTokenState>,
     ) -> Result<PlanRuntimePrefixRestoreOutcome> {
         let Some(lease) = input
             .checkpoint
@@ -150,23 +151,30 @@ impl CaptureState {
         }
         let boundary = lease.boundary();
         let target = input.request_id.clone();
+        let sequence = tokens
+            .frontier_for_request(&target)
+            .expect("restore target must be admitted")
+            .sequence()
+            .clone();
         let owner = Arc::clone(self);
         let cache = Arc::new(ferrum_testkit::MockKvCacheHandle::new(
             target.clone(),
             1,
             boundary,
         ));
-        PlanRuntimePrefixRestoreOutput::new(
+        PlanRuntimePrefixRestoreOutput::new_tokens(
             target.clone(),
             boundary,
             input.input_tokens.len(),
             cache,
+            sequence.clone(),
             move || {
+                let frontier = tokens.restore_frontier(&sequence, boundary)?;
                 owner
                     .events
                     .lock()
                     .push(Event::Acknowledged(target, boundary));
-                Ok(())
+                Ok(frontier)
             },
         )
         .map(PlanRuntimePrefixRestoreOutcome::Restored)

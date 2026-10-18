@@ -1,3 +1,5 @@
+//! Controlled executor protocol checks, not model numerical validation.
+
 use super::*;
 
 #[tokio::test]
@@ -109,26 +111,32 @@ async fn prompt_tail_batch_prefill_commits_each_boundary_before_sampling() {
             serde_json::json!(tokens.len()),
         );
         scheduler.submit(request.clone()).await.unwrap();
-        let sequence = SequenceState::new_with_tokenizer_and_model_vocab_size(
+        let mut sequence = SequenceState::new_with_tokenizer_and_model_vocab_size(
             request.clone(),
             tokens.clone(),
             Some(Arc::clone(&tokenizer)),
             Some(128),
         );
-        executor
-            .try_admit_prefill(
-                ExecutorPrefillAdmission::for_product_request(
-                    &request.id,
-                    &tokens,
-                    sequence.model_maximum_sequence_tokens(),
-                    tokens.len(),
-                    0,
-                )
-                .unwrap(),
-            )
-            .unwrap();
+        sequence.request_slot = Some(RequestSlotLease::open(&engine.inner, request.id.clone()));
         request_ids.push(request.id.clone());
-        engine.inner.sequences.write().insert(request.id, sequence);
+        engine
+            .inner
+            .sequences
+            .write()
+            .insert(request.id.clone(), sequence);
+        assert!(engine
+            .inner
+            .probe_executor_prefill_admission_for_test(&request));
+        engine
+            .inner
+            .sequences
+            .write()
+            .get_mut(&request.id)
+            .unwrap()
+            .request_slot
+            .as_mut()
+            .unwrap()
+            .admit(&engine.inner);
     }
 
     let first = scheduler
@@ -136,6 +144,15 @@ async fn prompt_tail_batch_prefill_commits_each_boundary_before_sampling() {
         .await
         .unwrap();
     assert_eq!(first.requests.len(), 3);
+    let incarnations = request_ids
+        .iter()
+        .map(|id| {
+            let sequences = engine.inner.sequences.read();
+            let frontier = sequences[id].execution_frontier.as_ref().unwrap();
+            assert_eq!(frontier.consumed_tokens(), 0);
+            (id.clone(), frontier.sequence().clone())
+        })
+        .collect::<HashMap<_, _>>();
     engine.inner.process_batch(&first).await.unwrap();
     assert_eq!(executor.tail_batch_prefill_calls.load(Ordering::Relaxed), 1);
     {
@@ -145,6 +162,9 @@ async fn prompt_tail_batch_prefill_commits_each_boundary_before_sampling() {
             assert_eq!(sequence.prefill_tokens_processed, 3);
             assert!(!sequence.prefill_complete);
             assert!(sequence.generated_tokens.is_empty());
+            let frontier = sequence.execution_frontier.as_ref().unwrap();
+            assert_eq!(frontier.sequence(), &incarnations[id]);
+            assert_eq!(frontier.consumed_tokens(), 3);
         }
     }
     assert_eq!(
@@ -165,6 +185,9 @@ async fn prompt_tail_batch_prefill_commits_each_boundary_before_sampling() {
             let sequence = &sequences[id];
             assert!(sequence.prefill_complete);
             assert_eq!(sequence.generated_tokens.len(), 1);
+            let frontier = sequence.execution_frontier.as_ref().unwrap();
+            assert_eq!(frontier.sequence(), &incarnations[id]);
+            assert_eq!(frontier.consumed_tokens(), 5);
         }
     }
     assert_eq!(
@@ -178,4 +201,15 @@ async fn prompt_tail_batch_prefill_commits_each_boundary_before_sampling() {
             .execution_capacity_blocked_prefill_len,
         0
     );
+    for id in &request_ids {
+        engine
+            .inner
+            .complete_request_for_test(id, FinishReason::Error)
+            .await
+            .unwrap();
+        assert!(incarnations[id].observed_end().is_some());
+    }
+    engine.inner.execution_closes.join_observers().await;
+    engine.inner.drain_execution_closes().unwrap();
+    assert_eq!(engine.inner.execution_closes.unreclaimed_count(), 0);
 }

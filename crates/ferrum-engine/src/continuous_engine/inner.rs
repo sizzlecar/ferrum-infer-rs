@@ -1,127 +1,49 @@
 //! EngineInner iteration and request-processing implementation.
 
 use super::*;
+use ferrum_execution::token_execution::{
+    ExecutionAdmission, ExecutionEndReason, TokenAdmissionCapacityDeferral, TokenAdmissionOutcome,
+};
 use ferrum_runtime::DynamicBackingPressure;
 
 mod batch;
 mod completion;
-mod decode;
-mod mixed;
-mod prefill;
 pub(super) mod prefix_rendezvous;
 pub(super) mod prefix_restore;
+mod token_batch;
 
-#[derive(Debug)]
-pub(super) enum PlanRuntimeBatchPrefillDisposition {
-    Completed,
-    PerRequestFallback(Vec<RequestId>),
+/// Retained admission maintenance is an owned obligation even while product
+/// completion/prefix work awaits. An early error or dropped iteration must
+/// cancel those exact pending admissions, not abandon their native owners.
+struct PendingPrefillMaintenance<'a> {
+    executor: &'a (dyn ModelExecutor + Send + Sync),
+    pending: Vec<ExecutorPrefillMaintenanceDeferral>,
 }
 
-pub(super) fn is_resource_exhausted_error(error: &FerrumError) -> bool {
-    matches!(error, FerrumError::ResourceExhausted { .. })
-}
+impl<'a> PendingPrefillMaintenance<'a> {
+    fn new(
+        executor: &'a (dyn ModelExecutor + Send + Sync),
+        pending: Vec<ExecutorPrefillMaintenanceDeferral>,
+    ) -> Self {
+        Self { executor, pending }
+    }
 
-pub(super) fn unaffected_maintenance_retry_frontiers(
-    current_request_ids: &[RequestId],
-    affected_request_ids: &[RequestId],
-) -> Vec<RequestId> {
-    current_request_ids
-        .iter()
-        .filter(|request_id| !affected_request_ids.contains(request_id))
-        .cloned()
-        .collect()
-}
+    fn is_empty(&self) -> bool {
+        self.pending.is_empty()
+    }
 
-#[cfg(test)]
-mod maintenance_retry_scope_tests {
-    use super::unaffected_maintenance_retry_frontiers;
-    use ferrum_types::RequestId;
-
-    #[test]
-    fn maintenance_retry_keeps_healthy_cohort_frontiers_runnable() {
-        let healthy = RequestId::new();
-        let affected = RequestId::new();
-
-        assert_eq!(
-            unaffected_maintenance_retry_frontiers(
-                &[healthy.clone(), affected.clone()],
-                std::slice::from_ref(&affected),
-            ),
-            [healthy]
-        );
-        assert!(unaffected_maintenance_retry_frontiers(
-            std::slice::from_ref(&affected),
-            std::slice::from_ref(&affected),
-        )
-        .is_empty());
+    fn into_pending(mut self) -> Vec<ExecutorPrefillMaintenanceDeferral> {
+        std::mem::take(&mut self.pending)
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct PagedKvAdmissionPressure {
-    pub(super) admission_blocks: usize,
-    pub(super) immediate_blocks: usize,
-    pub(super) free_blocks: usize,
-}
-
-pub(super) fn paged_kv_admission_pressure(error: &FerrumError) -> Option<PagedKvAdmissionPressure> {
-    let FerrumError::ResourceExhausted { message } = error else {
-        return None;
-    };
-    let (_, after_need) = message.split_once("paged KV admission: need ")?;
-    let (admission_blocks, rest) = parse_usize_prefix(after_need)?;
-    let rest = rest.strip_prefix(" admission blocks (")?;
-    let (immediate_blocks, rest) = parse_usize_prefix(rest)?;
-    let rest = rest.strip_prefix(" immediate) but only ")?;
-    let (free_blocks, rest) = parse_usize_prefix(rest)?;
-    if rest != " free" {
-        return None;
+impl Drop for PendingPrefillMaintenance<'_> {
+    fn drop(&mut self) {
+        for deferral in &self.pending {
+            self.executor
+                .cancel_prefill_admission(deferral.request_id());
+        }
     }
-    Some(PagedKvAdmissionPressure {
-        admission_blocks,
-        immediate_blocks,
-        free_blocks,
-    })
-}
-
-fn parse_usize_prefix(input: &str) -> Option<(usize, &str)> {
-    let end = input
-        .char_indices()
-        .find_map(|(index, ch)| (!ch.is_ascii_digit()).then_some(index))
-        .unwrap_or(input.len());
-    if end == 0 {
-        return None;
-    }
-    let value = input[..end].parse().ok()?;
-    Some((value, &input[end..]))
-}
-
-pub(super) fn kv_slot_requests_for_unified_batch(
-    batch: &ferrum_execution::model_executor::UnifiedBatch,
-) -> Vec<KvSlotRequest> {
-    batch
-        .items
-        .iter()
-        .map(|item| {
-            let target_len = item.pos_offset.saturating_add(item.q_tokens.len());
-            KvSlotRequest {
-                cache_id: item.seq_id.clone(),
-                target_len,
-                admission_target_len: metadata_kv_admission_target_len(&item.metadata)
-                    .map(|len| len.max(target_len)),
-            }
-        })
-        .collect()
-}
-
-pub(super) fn metadata_kv_admission_target_len(
-    metadata: &HashMap<String, serde_json::Value>,
-) -> Option<usize> {
-    metadata
-        .get(KV_ADMISSION_TARGET_LEN_METADATA_KEY)
-        .and_then(|value| value.as_u64())
-        .map(|value| value as usize)
-        .filter(|&value| value > 0)
 }
 
 #[derive(Debug, Default, serde::Serialize)]
@@ -171,6 +93,7 @@ struct ExecutorPrefillProbeResult {
 enum ExecutorPrefillAdmissionTraceEvidence {
     Admitted(ExecutorPrefillAdmissionReceipt),
     Deferred(AdmissionDeferred),
+    CapacityDeferred(TokenAdmissionCapacityDeferral),
     MaintenanceDeferred(ExecutorPrefillMaintenanceDeferral),
     PermanentRejected(AdmissionRejected),
     Faulted(String),
@@ -207,50 +130,6 @@ fn scheduler_trace_distribution(mut values: Vec<usize>) -> SchedulerTraceDistrib
         min: values.first().copied(),
         p50: values.get(values.len() / 2).copied(),
         max: values.last().copied(),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn paged_kv_admission_pressure_parses_qwen35_resource_error() {
-        let error = FerrumError::resource_exhausted(
-            "Qwen3.5 paged KV admission: need 24 admission blocks (4 immediate) but only 3 free",
-        );
-
-        assert_eq!(
-            paged_kv_admission_pressure(&error),
-            Some(PagedKvAdmissionPressure {
-                admission_blocks: 24,
-                immediate_blocks: 4,
-                free_blocks: 3,
-            })
-        );
-    }
-
-    #[test]
-    fn paged_kv_admission_pressure_parses_generic_llama_resource_error() {
-        let error = FerrumError::resource_exhausted(
-            "paged KV admission: need 1 admission blocks (1 immediate) but only 0 free",
-        );
-
-        assert_eq!(
-            paged_kv_admission_pressure(&error),
-            Some(PagedKvAdmissionPressure {
-                admission_blocks: 1,
-                immediate_blocks: 1,
-                free_blocks: 0,
-            })
-        );
-    }
-
-    #[test]
-    fn paged_kv_admission_pressure_ignores_unrelated_resource_errors() {
-        let error = FerrumError::resource_exhausted("synthetic unified reserve failure");
-
-        assert_eq!(paged_kv_admission_pressure(&error), None);
     }
 }
 
@@ -318,15 +197,103 @@ impl EngineInner {
                 evidence,
             })
         };
-        match self.model_executor.try_admit_prefill(admission) {
-            Ok(ExecutorPrefillAdmissionDecision::Admitted(receipt)) => ExecutorPrefillProbeResult {
-                trace: capture_admission_trace(ExecutorPrefillAdmissionTraceEvidence::Admitted(
-                    receipt.clone(),
+        let adapter = match ferrum_interfaces::adapter::parse_lora_selection(&request.metadata) {
+            Ok(adapter) => adapter,
+            Err(error) => {
+                return ExecutorPrefillProbeResult {
+                    trace: capture_admission_trace(ExecutorPrefillAdmissionTraceEvidence::Faulted(
+                        error.to_string(),
+                    )),
+                    outcome: AdmissionProbeOutcome::Faulted(error),
+                    maintenance: None,
+                }
+            }
+        };
+        if let Some(frontier) = self
+            .sequences
+            .read()
+            .get(&request.id)
+            .and_then(|sequence| sequence.execution_frontier.clone())
+        {
+            if frontier.consumed_tokens() == 0 && frontier.sequence().observed_end().is_none() {
+                let receipt = ExecutorPrefillAdmissionReceipt {
+                    request_id: request.id.clone(),
+                };
+                return ExecutorPrefillProbeResult {
+                    trace: capture_admission_trace(
+                        ExecutorPrefillAdmissionTraceEvidence::Admitted(receipt.clone()),
+                    ),
+                    outcome: AdmissionProbeOutcome::Admitted(receipt),
+                    maintenance: None,
+                };
+            }
+            let error = FerrumError::internal(
+                "admission cannot replace an advanced or ended token incarnation",
+            );
+            return ExecutorPrefillProbeResult {
+                trace: capture_admission_trace(ExecutorPrefillAdmissionTraceEvidence::Faulted(
+                    error.to_string(),
                 )),
-                outcome: AdmissionProbeOutcome::Admitted(receipt),
+                outcome: AdmissionProbeOutcome::Faulted(error),
+                maintenance: None,
+            };
+        }
+        match self.model_executor.admit_tokens(ExecutionAdmission {
+            context: admission,
+            adapter,
+        }) {
+            Ok(TokenAdmissionOutcome::Admitted(frontier)) => {
+                let mut sequences = self.sequences.write();
+                let valid_initial =
+                    frontier.consumed_tokens() == 0 && frontier.sequence().observed_end().is_none();
+                let sequence = sequences.get_mut(&request.id);
+                if let Some(sequence) =
+                    sequence.filter(|sequence| sequence.execution_frontier.is_none())
+                {
+                    // Retain even malformed progress for exact-owner closure.
+                    sequence.execution_frontier = Some(frontier);
+                    if valid_initial {
+                        let receipt = ExecutorPrefillAdmissionReceipt {
+                            request_id: request.id.clone(),
+                        };
+                        return ExecutorPrefillProbeResult {
+                            trace: capture_admission_trace(
+                                ExecutorPrefillAdmissionTraceEvidence::Admitted(receipt.clone()),
+                            ),
+                            outcome: AdmissionProbeOutcome::Admitted(receipt),
+                            maintenance: None,
+                        };
+                    }
+                } else {
+                    drop(sequences);
+                    if let Err(error) = self.begin_execution_close(
+                        request.id.clone(),
+                        frontier.sequence().clone(),
+                        None,
+                        ExecutionEndReason::Cancelled,
+                    ) {
+                        warn!(%error, "Could not register unexpected token admission");
+                    }
+                }
+                let error = FerrumError::internal(
+                    "token admission did not match the initial outer sequence",
+                );
+                ExecutorPrefillProbeResult {
+                    trace: capture_admission_trace(ExecutorPrefillAdmissionTraceEvidence::Faulted(
+                        error.to_string(),
+                    )),
+                    outcome: AdmissionProbeOutcome::Faulted(error),
+                    maintenance: None,
+                }
+            }
+            Ok(TokenAdmissionOutcome::CapacityDeferred(deferred)) => ExecutorPrefillProbeResult {
+                trace: capture_admission_trace(
+                    ExecutorPrefillAdmissionTraceEvidence::CapacityDeferred(deferred),
+                ),
+                outcome: AdmissionProbeOutcome::CapacityDeferred,
                 maintenance: None,
             },
-            Ok(ExecutorPrefillAdmissionDecision::Deferred(deferred)) => {
+            Ok(TokenAdmissionOutcome::Deferred(deferred)) => {
                 if deferred.action() == DeferredAction::AwaitBackingGrowth {
                     self.model_executor.cancel_prefill_admission(&request.id);
                     let error = FerrumError::internal(format!(
@@ -352,7 +319,7 @@ impl EngineInner {
                     maintenance: None,
                 }
             }
-            Ok(ExecutorPrefillAdmissionDecision::MaintenanceDeferred(deferred)) => {
+            Ok(TokenAdmissionOutcome::MaintenanceDeferred(deferred)) => {
                 if deferred.request_id() != &request.id {
                     self.model_executor.cancel_prefill_admission(&request.id);
                     let error = FerrumError::internal(format!(
@@ -389,15 +356,13 @@ impl EngineInner {
                     maintenance: Some(deferred),
                 }
             }
-            Ok(ExecutorPrefillAdmissionDecision::PermanentRejected(rejected)) => {
-                ExecutorPrefillProbeResult {
-                    trace: capture_admission_trace(
-                        ExecutorPrefillAdmissionTraceEvidence::PermanentRejected(rejected.clone()),
-                    ),
-                    outcome: AdmissionProbeOutcome::PermanentRejected(rejected),
-                    maintenance: None,
-                }
-            }
+            Ok(TokenAdmissionOutcome::PermanentRejected(rejected)) => ExecutorPrefillProbeResult {
+                trace: capture_admission_trace(
+                    ExecutorPrefillAdmissionTraceEvidence::PermanentRejected(rejected.clone()),
+                ),
+                outcome: AdmissionProbeOutcome::PermanentRejected(rejected),
+                maintenance: None,
+            },
             Err(error) => ExecutorPrefillProbeResult {
                 trace: capture_admission_trace(ExecutorPrefillAdmissionTraceEvidence::Faulted(
                     error.to_string(),
@@ -508,6 +473,20 @@ impl EngineInner {
                 "deferred",
                 serde_json::to_value(&deferred).unwrap_or(serde_json::Value::Null),
                 deferred.blockers().len(),
+                false,
+                false,
+                None,
+            ),
+            ExecutorPrefillAdmissionTraceEvidence::CapacityDeferred(deferred) => (
+                "capacity_deferred",
+                serde_json::json!({
+                    "required_blocks": deferred.required_blocks(),
+                    "free_blocks": deferred.snapshot().free_blocks,
+                    "total_blocks": deferred.snapshot().total_blocks,
+                    "block_size": deferred.snapshot().block_size,
+                    "retry_after": "confirmed_physical_release",
+                }),
+                1,
                 false,
                 false,
                 None,
@@ -862,108 +841,6 @@ impl EngineInner {
         }
     }
 
-    fn trace_executor_decode_capacity_decision(
-        &self,
-        request_ids: &[RequestId],
-        deferral: &ExecutorExecutionCapacityDeferral,
-        decision: &'static str,
-        pressure_yield: Option<&PressureYieldTransaction>,
-    ) {
-        let Some(request_id) = request_ids.first() else {
-            return;
-        };
-        let observed = deferral.observed();
-        let mut attributes = BTreeMap::from([
-            ("request_ids".to_string(), serde_json::json!(request_ids)),
-            (
-                "capacity_evidence".to_string(),
-                serde_json::json!({
-                    "stage": deferral.stage(),
-                    "observed": {
-                        "coordinator_id": observed.coordinator_id,
-                        "release_epoch": observed.release_epoch,
-                        "capacity_epoch": observed.capacity_epoch,
-                    },
-                    "wait_condition": deferral.wait_condition(),
-                    "shortfalls": deferral.shortfalls(),
-                    "backing_blockers": deferral.backing_blockers(),
-                    "typed_evidence": deferral.evidence(),
-                    "maintenance_retry": deferral.maintenance_retry(),
-                }),
-            ),
-        ]);
-        if let Some(transaction) = pressure_yield {
-            attributes.insert(
-                "episode_id".to_string(),
-                serde_json::json!(transaction.episode_id().get()),
-            );
-            attributes.insert(
-                "planned_transition_ordinal".to_string(),
-                serde_json::json!(transaction.planned_ordinal().get()),
-            );
-            attributes.insert(
-                "handoff_generation".to_string(),
-                serde_json::json!(transaction.handoff_generation()),
-            );
-            attributes.insert(
-                "yield_kind".to_string(),
-                serde_json::json!(transaction.kind().as_str()),
-            );
-            attributes.insert(
-                "victim_request_id".to_string(),
-                serde_json::json!(transaction.victim_request_id()),
-            );
-            attributes.insert(
-                "progress_owner_id".to_string(),
-                serde_json::json!(transaction.progress_owner_id()),
-            );
-            attributes.insert(
-                "progress_baseline".to_string(),
-                serde_json::json!(transaction.progress_baseline().get()),
-            );
-            attributes.insert(
-                "rotated_from_progress_owner_id".to_string(),
-                serde_json::json!(transaction.rotated_from_progress_owner_id()),
-            );
-            attributes.insert(
-                "rotated_from_progress_baseline".to_string(),
-                serde_json::json!(transaction
-                    .rotated_from_progress_baseline()
-                    .map(|generation| generation.get())),
-            );
-            attributes.insert(
-                "rotated_from_progress_current".to_string(),
-                serde_json::json!(transaction
-                    .rotated_from_progress_current()
-                    .map(|generation| generation.get())),
-            );
-        }
-        self.write_executor_scheduler_profile_event(
-            request_id,
-            "vnext.decode_capacity_deferred",
-            ProfileEventKind::Instant,
-            ProfileStatus::Ok,
-            None,
-            BTreeMap::from([
-                ("decision".to_string(), serde_json::json!(decision)),
-                (
-                    "attempted_decode_width".to_string(),
-                    serde_json::json!(request_ids.len()),
-                ),
-                (
-                    "execution_stage".to_string(),
-                    serde_json::json!(deferral.stage()),
-                ),
-                (
-                    "decode_submit_observed".to_string(),
-                    serde_json::json!(false),
-                ),
-            ]),
-            attributes,
-            None,
-        );
-    }
-
     fn validate_executor_prefill_maintenance(
         &self,
         deferral: &ExecutorPrefillMaintenanceDeferral,
@@ -1237,17 +1114,18 @@ impl EngineInner {
         let mut availability = self.dynamic_admission_availability.lock();
         let epochs = self
             .model_executor
-            .write_execution_capacity_snapshot(&mut availability)?
-            .ok_or_else(|| {
-                FerrumError::scheduler("plan runtime did not expose typed admission epochs")
-            })?;
-        let wake_epochs = AdmissionWakeEpochs::new(
-            epochs.coordinator_id,
-            epochs.release_epoch,
-            epochs.capacity_epoch,
-            0,
-        );
-        let wake = AdmissionWakeSnapshot::new(wake_epochs, &availability);
+            .write_execution_capacity_snapshot(&mut availability)?;
+        let wake = epochs.map(|epochs| {
+            AdmissionWakeSnapshot::new(
+                AdmissionWakeEpochs::new(
+                    epochs.coordinator_id,
+                    epochs.release_epoch,
+                    epochs.capacity_epoch,
+                    0,
+                ),
+                &availability,
+            )
+        });
         let capture_trace = self.scheduler_trace_jsonl.is_some();
         let records = std::cell::RefCell::new(Vec::<ExecutorSchedulerTraceRecord>::new());
         let mut prefix_pressure = false;
@@ -1275,7 +1153,7 @@ impl EngineInner {
             result.outcome
         };
         let prepared =
-            self.scheduler.prepare_dynamic_admission_observed(
+            self.scheduler.prepare_token_admission_observed(
                 maximum_admissions,
                 wake,
                 &mut probe,
@@ -1317,7 +1195,7 @@ impl EngineInner {
     /// that target's retained admission cohort before constructing a physical
     /// batch. Each round performs one bounded maintenance attempt per deferred
     /// request and then re-probes against fresh typed capacity evidence.
-    async fn prepare_plan_runtime_prefill_cohort(
+    async fn prepare_token_prefill_cohort(
         &self,
         hint: &ferrum_interfaces::BatchHint,
     ) -> Result<bool> {
@@ -1340,13 +1218,15 @@ impl EngineInner {
                 break;
             }
             let (admitted, maintenance) = self.prepare_dynamic_admission_round(desired)?;
+            let maintenance =
+                PendingPrefillMaintenance::new(self.model_executor.as_ref(), maintenance);
             progressed |= admitted > 0;
             self.complete_typed_admission_failures().await?;
             if maintenance.is_empty() {
                 break;
             }
             progressed = true;
-            self.execute_executor_prefill_maintenance(maintenance);
+            self.execute_executor_prefill_maintenance(maintenance.into_pending());
             self.complete_typed_admission_failures().await?;
         }
 
@@ -1362,9 +1242,7 @@ impl EngineInner {
                 error = %error,
                 "Typed prefill admission failed before device submission"
             );
-            self.model_executor.cancel_prefill_admission(&request_id);
-            self.complete_request(&request_id, FinishReason::Error)
-                .await?;
+            self.complete_request_with_error(&request_id, error).await?;
         }
         Ok(())
     }
@@ -1428,68 +1306,6 @@ impl EngineInner {
             }
         }
         Ok(())
-    }
-
-    // ── tensor helper ──────────────────────────────────────────────────
-
-    pub(super) fn tokens_to_tensor(&self, token_ids: &[u32]) -> Result<TensorRef> {
-        let f32_data: Vec<f32> = token_ids.iter().map(|&v| v as f32).collect();
-        let len = f32_data.len();
-        self.tensor_factory
-            .from_slice(&f32_data, &[1, len], DataType::FP32, Device::CPU)
-    }
-
-    /// Build the model-executor KV handle used by `LlmExecutor::decode`.
-    ///
-    /// The continuous engine has two KV identities:
-    /// - `KvCacheManager` allocations, keyed by request id, track resource
-    ///   lifetime and are deallocated on preemption/completion.
-    /// - model/executor cache ids track the actual model-side KV contents.
-    ///
-    /// `SequenceState` model-KV state must carry the second identity because the
-    /// fallback single-request decode path downcasts it to
-    /// `GenericKvCacheHandle`. Unified CUDA paths don't read the handle body,
-    /// but keeping this invariant prevents resource-pressure fallbacks from
-    /// feeding a manager handle into `LlmExecutor::decode`.
-    pub(super) fn make_model_kv_handle_with_seq(
-        &self,
-        cache_id: String,
-        seq_len: usize,
-    ) -> std::sync::Arc<dyn ferrum_interfaces::KvCacheHandle> {
-        let info = self.model_executor.info();
-        let head_dim = if info.num_heads == 0 {
-            info.hidden_size.max(1)
-        } else {
-            (info.hidden_size / info.num_heads).max(1)
-        };
-        let num_kv_heads = if info.num_kv_heads == 0 {
-            info.num_heads.max(1)
-        } else {
-            info.num_kv_heads
-        };
-        std::sync::Arc::new(ferrum_models::executor::common::GenericKvCacheHandle::new(
-            info.num_layers,
-            num_kv_heads,
-            head_dim,
-            candle_core::Device::Cpu,
-            seq_len,
-            cache_id,
-        ))
-    }
-
-    pub(super) fn decode_ready_request_ids(&self, request_ids: &[RequestId]) -> Vec<RequestId> {
-        let sequences = self.sequences.read();
-        request_ids
-            .iter()
-            .filter(|rid| {
-                sequences.get(*rid).is_some_and(|seq| {
-                    seq.prefill_complete
-                        && seq.kv_cache_handle().is_some()
-                        && !seq.generated_tokens.is_empty()
-                })
-            })
-            .cloned()
-            .collect()
     }
 
     fn scheduler_trace_enabled(&self) -> bool {
@@ -1581,7 +1397,10 @@ impl EngineInner {
         stats
     }
 
-    fn write_scheduler_trace_event(&self, event: serde_json::Value) {
+    pub(in crate::continuous_engine) fn write_scheduler_trace_event(
+        &self,
+        event: serde_json::Value,
+    ) {
         let Some(file) = &self.legacy_scheduler_trace_jsonl else {
             return;
         };
@@ -1602,6 +1421,7 @@ impl EngineInner {
         let lock_wait_start = Instant::now();
         let iteration_guard = self.iteration_lock.lock().await;
         self.record_iteration_lock_wait(lock_wait_start.elapsed());
+        self.drain_execution_closes()?;
         self.cancel_abandoned_requests().await?;
         self.complete_execution_readiness_failures().await?;
         self.prepare_prefix_rendezvous()?;
@@ -1646,28 +1466,25 @@ impl EngineInner {
         let nb_prof = self.runtime_config.next_batch_prof;
         let sched_t0 = Instant::now();
         let nb_t0 = if nb_prof { Some(Instant::now()) } else { None };
-        let plan_runtime_managed = self.model_executor.execution_resource_authority()
-            == ExecutionResourceAuthority::PlanRuntime;
-        if plan_runtime_managed && self.prepare_plan_runtime_prefill_cohort(&hint).await? {
+        if self.prepare_token_prefill_cohort(&hint).await? {
             return Ok(EngineIterationOutcome::Progressed);
         }
-        let mut prefill_maintenance = Vec::new();
-        let nb_result = if plan_runtime_managed
-            && self.model_executor.supports_plan_runtime_prefix_restore()
-        {
-            let (_, maintenance) = self.prepare_dynamic_admission_round(hint.max_batch_size)?;
+        let (_, prefill_maintenance) = self.prepare_dynamic_admission_round(hint.max_batch_size)?;
+        let prefill_maintenance =
+            PendingPrefillMaintenance::new(self.model_executor.as_ref(), prefill_maintenance);
+        self.complete_typed_admission_failures().await?;
+        self.refresh_prefix_rendezvous()?;
+        if self.model_executor.supports_plan_runtime_prefix_restore() {
+            self.restore_admitted_prefixes().await?;
             self.refresh_prefix_rendezvous()?;
-            prefill_maintenance = maintenance;
-            let scheduled = async {
-                self.complete_typed_admission_failures().await?;
-                self.restore_admitted_prefixes().await?;
-                self.refresh_prefix_rendezvous()?;
-                let mut availability = self.dynamic_admission_availability.lock();
-                let epochs = self
-                    .model_executor
-                    .write_execution_capacity_snapshot(&mut availability)?
-                    .ok_or_else(|| FerrumError::scheduler("plan runtime lost admission epochs"))?;
-                let wake = AdmissionWakeSnapshot::new(
+        }
+        let (scheduled, observations) = {
+            let mut availability = self.dynamic_admission_availability.lock();
+            let epochs = self
+                .model_executor
+                .write_execution_capacity_snapshot(&mut availability)?;
+            let wake = epochs.map(|epochs| {
+                AdmissionWakeSnapshot::new(
                     AdmissionWakeEpochs::new(
                         epochs.coordinator_id,
                         epochs.release_epoch,
@@ -1675,101 +1492,20 @@ impl EngineInner {
                         0,
                     ),
                     &availability,
-                );
-                let mut observations = Vec::new();
-                let scheduled = self.scheduler.next_batch_with_prepared_admission_observed(
-                    hint,
-                    wake,
-                    &mut |observation| observations.push(observation),
-                );
-                drop(availability);
-                for observation in observations {
-                    self.trace_executor_admission_queue_observation(observation);
-                }
-                scheduled
-            }
-            .await;
-            if scheduled.is_err() {
-                for deferral in &prefill_maintenance {
-                    self.model_executor
-                        .cancel_prefill_admission(deferral.request_id());
-                }
-                prefill_maintenance.clear();
-            }
-            scheduled?
-        } else if plan_runtime_managed {
-            let mut availability = self.dynamic_admission_availability.lock();
-            let epochs = self
-                .model_executor
-                .write_execution_capacity_snapshot(&mut availability)?
-                .ok_or_else(|| {
-                    FerrumError::scheduler("plan runtime did not expose typed admission epochs")
-                })?;
-            let wake_epochs = AdmissionWakeEpochs::new(
-                epochs.coordinator_id,
-                epochs.release_epoch,
-                epochs.capacity_epoch,
-                0,
-            );
-            let wake = AdmissionWakeSnapshot::new(wake_epochs, &availability);
-            let capture_trace = self.scheduler_trace_jsonl.is_some();
-            // The scheduler invokes queue-observation and admission-probe
-            // callbacks in causal order. Keep one buffer so trace emission
-            // cannot reorder a released pressure hold behind its admission.
-            let scheduler_trace_records = capture_trace
-                .then(|| std::cell::RefCell::new(Vec::<ExecutorSchedulerTraceRecord>::new()));
-            let mut probe = |request: &InferenceRequest| {
-                let result = self.probe_executor_prefill_admission(request, capture_trace);
-                if let Some(maintenance) = result.maintenance {
-                    prefill_maintenance.push(maintenance);
-                }
-                if let (Some(records), Some(trace)) = (&scheduler_trace_records, result.trace) {
-                    records
-                        .borrow_mut()
-                        .push(ExecutorSchedulerTraceRecord::PrefillAdmission(trace));
-                }
-                result.outcome
-            };
-            let scheduled = if let Some(records) = &scheduler_trace_records {
-                self.scheduler.next_batch_with_dynamic_admission_observed(
-                    hint,
-                    wake,
-                    &mut probe,
-                    &mut |observation| {
-                        records.borrow_mut().push(
-                            ExecutorSchedulerTraceRecord::AdmissionQueueObservation(observation),
-                        )
-                    },
                 )
-            } else {
+            });
+            let mut observations = Vec::new();
+            let scheduled =
                 self.scheduler
-                    .next_batch_with_dynamic_admission(hint, wake, &mut probe)
-            };
-            drop(availability);
-            drop(probe);
-            if let Some(records) = scheduler_trace_records {
-                for record in records.into_inner() {
-                    match record {
-                        ExecutorSchedulerTraceRecord::PrefillAdmission(trace) => {
-                            self.trace_executor_prefill_admission(trace);
-                        }
-                        ExecutorSchedulerTraceRecord::AdmissionQueueObservation(observation) => {
-                            self.trace_executor_admission_queue_observation(observation);
-                        }
-                    }
-                }
-            }
-            if scheduled.is_err() {
-                for deferral in &prefill_maintenance {
-                    self.model_executor
-                        .cancel_prefill_admission(deferral.request_id());
-                }
-                prefill_maintenance.clear();
-            }
-            scheduled?
-        } else {
-            self.scheduler.next_batch(hint).await
+                    .next_batch_with_token_admissions(hint, wake, &mut |observation| {
+                        observations.push(observation)
+                    });
+            (scheduled, observations)
         };
+        for observation in observations {
+            self.trace_executor_admission_queue_observation(observation);
+        }
+        let nb_result = scheduled?;
         self.complete_typed_admission_failures().await?;
         let sched_elapsed = sched_t0.elapsed();
         self.record_scheduling_time(sched_elapsed);
@@ -1812,7 +1548,7 @@ impl EngineInner {
         let batch = match nb_result {
             Some(b) => b,
             None => {
-                self.execute_executor_prefill_maintenance(prefill_maintenance);
+                self.execute_executor_prefill_maintenance(prefill_maintenance.into_pending());
                 self.complete_typed_admission_failures().await?;
                 if trace_enabled {
                     let none_streak = self
@@ -1837,7 +1573,7 @@ impl EngineInner {
                         }));
                     }
                 }
-                if plan_runtime_managed {
+                {
                     if let Some(observed) = self.scheduler.passive_capacity_wait_condition()? {
                         let registration = self
                             .model_executor
@@ -1852,6 +1588,11 @@ impl EngineInner {
                     if self.scheduler.all_active_execution_readiness_blocked() {
                         return Ok(EngineIterationOutcome::Idle);
                     }
+                }
+                if self.scheduler.active_count() == 0
+                    && self.scheduler.waiting_for_confirmed_capacity_release()
+                {
+                    return Ok(EngineIterationOutcome::Idle);
                 }
                 if self.scheduler.active_count() > 0 {
                     return Ok(EngineIterationOutcome::Progressed);
@@ -1918,7 +1659,7 @@ impl EngineInner {
                 );
             }
         }
-        self.execute_executor_prefill_maintenance(prefill_maintenance);
+        self.execute_executor_prefill_maintenance(prefill_maintenance.into_pending());
         self.complete_typed_admission_failures().await?;
         if trace_enabled {
             let prefill_tokens_after = self.total_prefill_tokens.load(Ordering::Relaxed);

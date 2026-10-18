@@ -3033,6 +3033,19 @@ pub trait ModelExecutor: Send + Sync {
         Ok(false)
     }
 
+    /// Query the real release footprint of this executor's exact live token
+    /// incarnation. This is scheduling evidence, not permission to release or
+    /// proof of quiescence: callers must still observe `cancel_tokens` reaching
+    /// `Ended`. Executors without native source generations return `false`.
+    fn write_token_capacity_release_sources(
+        &self,
+        _sequence: &crate::token_execution::ExecutorSequence,
+        sources: &mut Vec<ferrum_runtime::CapacityAvailabilitySource>,
+    ) -> Result<bool> {
+        sources.clear();
+        Ok(false)
+    }
+
     /// Retire one exact request-scoped runtime authority for recompute.
     ///
     /// Success is a terminal release fence: all provider/device work that can

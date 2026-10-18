@@ -48,6 +48,7 @@ impl RestoreState {
     pub(super) fn restore(
         self: &Arc<Self>,
         input: PlanRuntimePrefixRestoreInput<'_>,
+        tokens: Arc<ControlledTokenState>,
         epochs: ExecutorAdmissionEpochs,
         wait: ferrum_runtime::CapacityWaitCondition,
     ) -> Result<PlanRuntimePrefixRestoreOutcome> {
@@ -88,17 +89,24 @@ impl RestoreState {
             ));
         }
         let id = input.request_id.clone();
+        let sequence = tokens
+            .frontier_for_request(&id)
+            .expect("restore target must be admitted")
+            .sequence()
+            .clone();
         let cache = Arc::new(MockKvCacheHandle::new(id.clone(), 1, checkpoint.boundary()));
         let state = Arc::clone(self);
-        PlanRuntimePrefixRestoreOutput::new(
+        PlanRuntimePrefixRestoreOutput::new_tokens(
             id.clone(),
             checkpoint.boundary(),
             input.input_tokens.len(),
             cache,
+            sequence.clone(),
             move || {
                 assert_eq!(checkpoint.status(), PrefixCaptureStatus::Ready);
+                let frontier = tokens.restore_frontier(&sequence, checkpoint.boundary())?;
                 state.acknowledged.lock().push(id);
-                Ok(())
+                Ok(frontier)
             },
         )
         .map(PlanRuntimePrefixRestoreOutcome::Restored)

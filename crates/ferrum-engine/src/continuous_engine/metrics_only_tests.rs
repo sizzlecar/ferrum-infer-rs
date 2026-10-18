@@ -1,3 +1,6 @@
+//! Assembly-only observer checks. The controlled executor supports the common
+//! token protocol; no model execution or numerical timing is asserted here.
+
 use super::*;
 use ferrum_runtime::{DeviceTimingMode, ExecutionEventSinkEnablement};
 

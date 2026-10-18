@@ -127,6 +127,7 @@ impl RestoreState {
     pub(super) fn restore(
         self: &Arc<Self>,
         input: PlanRuntimePrefixRestoreInput<'_>,
+        tokens: Arc<ControlledTokenState>,
     ) -> Result<PlanRuntimePrefixRestoreOutcome> {
         if matches!(self.behavior, RestoreBehavior::Miss) {
             return Ok(PlanRuntimePrefixRestoreOutcome::Unavailable);
@@ -140,23 +141,30 @@ impl RestoreState {
             state: Arc::clone(self),
             acknowledged: false,
         };
+        let sequence = tokens
+            .frontier_for_request(input.request_id)
+            .expect("restore target must be admitted")
+            .sequence()
+            .clone();
         let cache = Arc::new(ferrum_testkit::MockKvCacheHandle::new(
             request_id.clone(),
             1,
             self.tokens,
         ));
-        PlanRuntimePrefixRestoreOutput::new(
+        PlanRuntimePrefixRestoreOutput::new_tokens(
             request_id,
             self.tokens,
             input.input_tokens.len(),
             cache,
+            sequence.clone(),
             move || {
                 if matches!(guard.state.behavior, RestoreBehavior::FailedAcknowledgement) {
                     return Err(FerrumError::cancelled("restored target was cancelled"));
                 }
+                let frontier = tokens.restore_frontier(&sequence, guard.state.tokens)?;
                 guard.acknowledged = true;
                 guard.state.acknowledgements.fetch_add(1, Ordering::Relaxed);
-                Ok(())
+                Ok(frontier)
             },
         )
         .map(PlanRuntimePrefixRestoreOutcome::Restored)

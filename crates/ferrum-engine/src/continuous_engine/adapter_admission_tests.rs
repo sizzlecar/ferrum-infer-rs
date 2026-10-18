@@ -45,7 +45,22 @@ impl Tokenizer for CountingTokenizer {
 // This probe tests admission and metadata transport, not adapter arithmetic.
 struct AdapterCapableExecutor {
     inner: MockModelExecutor,
-    metadata: Mutex<Vec<HashMap<String, serde_json::Value>>>,
+    tokens: ControlledTokenState,
+    support: AdapterExecutionSupport,
+    selections: Mutex<Vec<Option<(String, String)>>>,
+    admitted: Mutex<Vec<ExecutorSequence>>,
+}
+
+impl AdapterCapableExecutor {
+    fn new(support: AdapterExecutionSupport) -> Self {
+        Self {
+            inner: MockModelExecutor::instant(128),
+            tokens: ControlledTokenState::default(),
+            support,
+            selections: Mutex::new(Vec::new()),
+            admitted: Mutex::new(Vec::new()),
+        }
+    }
 }
 
 #[async_trait::async_trait]
@@ -55,16 +70,94 @@ impl ModelExecutor for AdapterCapableExecutor {
     }
 
     fn adapter_execution_support(&self) -> AdapterExecutionSupport {
-        AdapterExecutionSupport::PerSequenceLora
+        self.support
     }
 
-    async fn prefill(&self, input: &PrefillInput) -> Result<PrefillOutput> {
-        self.metadata.lock().push(input.metadata.clone());
-        self.inner.prefill(input).await
+    fn admit_tokens(&self, input: ExecutionAdmission<'_>) -> Result<TokenAdmissionOutcome> {
+        input.validate()?;
+        if input.adapter.is_some() {
+            self.support.require_lora()?;
+        }
+        self.selections.lock().push(
+            input
+                .adapter
+                .map(|selection| (selection.name.to_owned(), selection.path.to_owned())),
+        );
+        let outcome = controlled_token_fixture::admit(self, &self.tokens, input)?;
+        if let TokenAdmissionOutcome::Admitted(frontier) = &outcome {
+            self.admitted.lock().push(frontier.sequence().clone());
+        }
+        Ok(outcome)
     }
 
-    async fn decode(&self, input: &DecodeInput) -> Result<DecodeOutput> {
-        self.inner.decode(input).await
+    fn try_admit_prefill(
+        &self,
+        input: ExecutorPrefillAdmission<'_>,
+    ) -> Result<ExecutorPrefillAdmissionDecision> {
+        input.validate()?;
+        Ok(ExecutorPrefillAdmissionDecision::Admitted(
+            ExecutorPrefillAdmissionReceipt {
+                request_id: input.request_id.clone(),
+            },
+        ))
+    }
+
+    async fn execute_tokens(&self, work: &[ExecutionWork<'_>]) -> Result<ExecutionBatchOutcome> {
+        controlled_token_fixture::execute(self, &self.tokens, work).await
+    }
+
+    async fn finish_tokens(
+        &self,
+        sequence: &ExecutorSequence,
+        reason: ExecutionEndReason,
+    ) -> Result<ExecutionCloseOutcome> {
+        controlled_token_fixture::finish(self, &self.tokens, sequence, reason).await
+    }
+
+    fn cancel_tokens(&self, sequence: &ExecutorSequence) -> Result<ExecutionCloseOutcome> {
+        controlled_token_fixture::cancel(self, &self.tokens, sequence)
+    }
+
+    async fn plan_runtime_prefill_with_capacity(
+        &self,
+        input: &PlanRuntimePrefillInput,
+    ) -> Result<PlanRuntimePrefillOutcome> {
+        let output = self
+            .inner
+            .prefill(&plan_runtime_prefill_to_mock_input(input))
+            .await?;
+        plan_runtime_prefill_completion_from_mock(
+            &input.request_id,
+            ExecutorPrefillCompletion::exact(output, input.chunk),
+        )
+        .map(PlanRuntimePrefillOutcome::Completed)
+    }
+
+    async fn plan_runtime_batch_decode_with_capacity(
+        &self,
+        inputs: &[PlanRuntimeDecodeInput],
+    ) -> Result<PlanRuntimeBatchDecodeOutcome> {
+        let mut outputs = Vec::new();
+        for input in inputs {
+            let old = DecodeInput::new(
+                MockTensor::from_f32(vec![input.input_token.get() as f32], &[1, 1]).into_ref(),
+                input.kv_cache.clone(),
+            );
+            let output = self.inner.decode(&old).await?;
+            outputs.push(PlanRuntimeDecodeOutput::new(
+                ExecutorSamplingOutput::FullLogits(output.logits.to_vec_f32()?),
+                output.kv_cache,
+            ));
+        }
+        Ok(PlanRuntimeBatchDecodeOutcome::Completed(outputs))
+    }
+
+    async fn prefill(&self, _: &PrefillInput) -> Result<PrefillOutput> {
+        panic!("Engine must use token admission and execution")
+    }
+
+    async fn decode(&self, _: &DecodeInput) -> Result<DecodeOutput> {
+        panic!("Engine must use token admission and execution")
     }
 
     fn capabilities(&self) -> ExecutorCapabilities {
@@ -200,10 +293,9 @@ async fn unsupported_adapter_requests_are_rejected_before_admission() {
 
 #[tokio::test]
 async fn malformed_adapter_requests_never_reach_tokenization() {
-    let capable = Arc::new(AdapterCapableExecutor {
-        inner: MockModelExecutor::instant(128),
-        metadata: Mutex::new(Vec::new()),
-    });
+    let capable = Arc::new(AdapterCapableExecutor::new(
+        AdapterExecutionSupport::PerSequenceLora,
+    ));
     let executors: [Arc<dyn ModelExecutor + Send + Sync>; 2] =
         [Arc::new(MockModelExecutor::instant(128)), capable.clone()];
     for executor in executors {
@@ -224,7 +316,8 @@ async fn malformed_adapter_requests_never_reach_tokenization() {
             }
         }
     }
-    assert!(capable.metadata.lock().is_empty());
+    assert!(capable.selections.lock().is_empty());
+    assert!(capable.admitted.lock().is_empty());
 }
 
 async fn execute_one_token(
@@ -260,10 +353,9 @@ async fn execute_one_token(
 
 #[tokio::test]
 async fn adapter_support_is_forwarded_and_base_requests_still_execute() {
-    let capable = Arc::new(AdapterCapableExecutor {
-        inner: MockModelExecutor::instant(128),
-        metadata: Mutex::new(Vec::new()),
-    });
+    let capable = Arc::new(AdapterCapableExecutor::new(
+        AdapterExecutionSupport::PerSequenceLora,
+    ));
     let (engine, _, _) = engine_with_executor(capable.clone());
     let public: &dyn LlmInferenceEngine = &engine;
     assert_eq!(
@@ -273,19 +365,37 @@ async fn adapter_support_is_forwarded_and_base_requests_still_execute() {
     for streaming in [false, true] {
         execute_one_token(&engine, adapter_request(), streaming).await;
     }
-    let observed = capable.metadata.lock().clone();
+    let observed = capable.selections.lock().clone();
     assert_eq!(observed.len(), 2);
-    for metadata in observed {
-        assert_eq!(metadata["ferrum_lora_adapter"], "adapter-a");
-        assert_eq!(metadata["ferrum_lora_path"], "/adapters/a");
+    for selection in observed {
+        assert_eq!(
+            selection,
+            Some(("adapter-a".to_owned(), "/adapters/a".to_owned()))
+        );
     }
+    assert_eq!(capable.inner.prefill_count(), 2);
+    assert_eq!(capable.admitted.lock().len(), 2);
+    assert!(capable
+        .admitted
+        .lock()
+        .iter()
+        .all(|sequence| sequence.observed_end().is_some()));
     engine.shutdown().await.unwrap();
 
-    let executor = Arc::new(MockModelExecutor::instant(128));
+    let executor = Arc::new(AdapterCapableExecutor::new(
+        AdapterExecutionSupport::Unsupported,
+    ));
     let (base, _, _) = engine_with_executor(executor.clone());
     for streaming in [false, true] {
         execute_one_token(&base, policy_request(), streaming).await;
     }
-    assert_eq!(executor.prefill_count(), 2);
+    assert_eq!(executor.inner.prefill_count(), 2);
+    assert_eq!(*executor.selections.lock(), [None, None]);
+    assert_eq!(executor.admitted.lock().len(), 2);
+    assert!(executor
+        .admitted
+        .lock()
+        .iter()
+        .all(|sequence| sequence.observed_end().is_some()));
     base.shutdown().await.unwrap();
 }

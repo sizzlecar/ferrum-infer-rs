@@ -10640,6 +10640,14 @@ impl<R: DeviceRuntime> ModelExecutor for VNextModelExecutor<R> {
         self.cancel_native_tokens(sequence)
     }
 
+    fn write_token_capacity_release_sources(
+        &self,
+        sequence: &ExecutorSequence,
+        sources: &mut Vec<CapacityAvailabilitySource>,
+    ) -> Result<bool> {
+        self.write_native_token_release_sources(sequence, sources)
+    }
+
     fn cancel_prefill_admission(&self, request_id: &RequestId) -> bool {
         self.sequences.lock().cancel_prefill(request_id)
     }

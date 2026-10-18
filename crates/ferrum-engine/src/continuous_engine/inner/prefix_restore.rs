@@ -3,6 +3,7 @@ use ferrum_execution::model_executor::{
     PlanRuntimePrefixRestoreDeferral, PlanRuntimePrefixRestoreInput,
     PlanRuntimePrefixRestoreOutcome,
 };
+use ferrum_execution::token_execution::ExecutorSequence;
 use ferrum_interfaces::scheduler::PreparedPrefixRestore;
 use ferrum_scheduler::implementations::continuous::PrefixRestoreCapacityStatus;
 
@@ -10,6 +11,7 @@ pub(in super::super) struct PendingPrefixRestore {
     prepared: PreparedPrefixRestore,
     tokens: Vec<TokenId>,
     maximum_sequence_tokens: usize,
+    sequence: ExecutorSequence,
     deferral: PlanRuntimePrefixRestoreDeferral,
 }
 
@@ -73,7 +75,15 @@ impl EngineInner {
             .read()
             .iter()
             .filter(|(_, sequence)| {
-                !sequence.prefill_complete && sequence.prefill_tokens_processed == 0
+                !sequence.prefill_complete
+                    && sequence.prefill_tokens_processed == 0
+                    && sequence
+                        .execution_frontier
+                        .as_ref()
+                        .is_some_and(|frontier| {
+                            frontier.consumed_tokens() == 0
+                                && frontier.sequence().observed_end().is_none()
+                        })
             })
             .map(|(id, sequence)| (id.clone(), sequence.prefill_context_len()))
             .collect::<Vec<_>>();
@@ -90,12 +100,13 @@ impl EngineInner {
         }
 
         for (request_id, prompt_tokens) in candidates {
-            let Some((tokens, maximum_sequence_tokens)) =
-                self.sequences.read().get(&request_id).map(|sequence| {
-                    (
+            let Some((tokens, maximum_sequence_tokens, incarnation)) =
+                self.sequences.read().get(&request_id).and_then(|sequence| {
+                    Some((
                         sequence.prefill_context_tokens(),
                         sequence.model_maximum_sequence_tokens(),
-                    )
+                        sequence.execution_frontier.as_ref()?.sequence().clone(),
+                    ))
                 })
             else {
                 continue;
@@ -104,6 +115,7 @@ impl EngineInner {
             let (prepared, retry) = if let Some(pending) = pending {
                 if pending.tokens != tokens
                     || pending.maximum_sequence_tokens != maximum_sequence_tokens
+                    || pending.sequence != incarnation
                 {
                     self.scheduler
                         .abandon_prefix_restore_capacity(&pending.prepared)?;
@@ -175,6 +187,7 @@ impl EngineInner {
                                 prepared,
                                 tokens,
                                 maximum_sequence_tokens,
+                                sequence: incarnation.clone(),
                                 deferral,
                             },
                         );
@@ -204,32 +217,36 @@ impl EngineInner {
                 if sequence.prefill_tokens_processed != 0
                     || sequence.prefill_complete
                     || sequence.prefill_context_tokens() != tokens
+                    || sequence.execution_frontier.as_ref().is_none_or(|frontier| {
+                        frontier.sequence() != &incarnation || frontier.consumed_tokens() != 0
+                    })
                 {
                     return Err(FerrumError::internal(
                         "prefix restore outer sequence changed before publication",
                     ));
                 }
-                self.scheduler
-                    .commit_prefix_restored(prepared, restored_tokens)?;
-                let update = sequence.commit_plan_runtime_prefill_chunk_resources(
-                    Arc::clone(output.kv_cache()),
-                    restored_tokens,
-                    false,
-                );
-                // Both outer owners now agree. Only the native publication
-                // may open the target execution gate. The closure also drops
-                // that owner before error cleanup awaits request release.
-                Ok((update, output.acknowledge()))
-            })();
-            let (update, acknowledged) = match committed {
-                Ok(value) => value,
-                Err(error) => {
-                    self.complete_request_with_error(&request_id, error).await?;
-                    continue;
+                if output.token_sequence() != Some(&incarnation) {
+                    return Err(FerrumError::internal(
+                        "prefix publication belongs to a different token incarnation",
+                    ));
                 }
-            };
-            self.apply_model_cache_ref_update(&request_id, update);
-            if let Err(error) = acknowledged {
+                // The actual native acknowledgement opens the execution gate.
+                // Publish its frontier before a fallible scheduler transition:
+                // failure closes this incarnation, never replays from zero.
+                let frontier = output.acknowledge_tokens()?;
+                if frontier.sequence() != &incarnation
+                    || frontier.consumed_tokens() != restored_tokens
+                {
+                    return Err(FerrumError::internal(
+                        "prefix acknowledgement returned conflicting token progress",
+                    ));
+                }
+                sequence.execution_frontier = Some(frontier);
+                sequence.prefill_tokens_processed = restored_tokens;
+                self.scheduler
+                    .commit_prefix_restored(prepared, restored_tokens)
+            })();
+            if let Err(error) = committed {
                 self.complete_request_with_error(&request_id, error).await?;
                 continue;
             }

@@ -227,6 +227,30 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             })
     }
 
+    pub(super) fn write_native_token_release_sources(
+        &self,
+        identity: &ExecutorSequence,
+        sources: &mut Vec<CapacityAvailabilitySource>,
+    ) -> Result<bool> {
+        sources.clear();
+        // Validate the issuer before consulting the original weak owner index.
+        // A missing/closed incarnation is not a releasable victim and never
+        // aliases a later admission using the same product request ID.
+        self.token_issuer.frontier(identity, 0)?;
+        let registry = self.sequences.lock();
+        let Some(sequence) = registry.token_index.get(identity).and_then(Weak::upgrade) else {
+            return Ok(false);
+        };
+        if !sequence.token_frontier_is_open() {
+            return Ok(false);
+        }
+        sequence
+            .session
+            .write_release_capacity_sources(sources)
+            .map_err(|error| FerrumError::backend(error.to_string()))?;
+        Ok(true)
+    }
+
     /// A zero-submit capacity result does not by itself preserve continuation.
     /// The caller holds all original operation gates; validate the whole cohort
     /// before changing any prefill slot back to Ready.
