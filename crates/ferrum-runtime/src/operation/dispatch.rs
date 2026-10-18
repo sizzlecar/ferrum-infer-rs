@@ -2477,7 +2477,12 @@ impl OperationDispatch {
                 Err(SubmissionWaveDispatchError::SubmissionIndeterminate { recovery })
             }
             LaneSubmitOutcome::Submitted(fence) => {
-                let device_attribution = runtime.submission_attribution(&fence);
+                // Attribution runs after submission, so even a panicking runtime
+                // must leave the original fence armed and observable.
+                let device_attribution =
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        runtime.submission_attribution(&fence)
+                    }));
                 let completion_arm_stage = SubmissionWaveDispatchStageTimer::start(
                     timing_sink,
                     SubmissionWaveDispatchStage::CompletionArm,
@@ -2487,6 +2492,16 @@ impl OperationDispatch {
                     Err((error, completion)) => {
                         return Err(SubmissionWaveDispatchError::PostSubmitContract {
                             error,
+                            completion,
+                        });
+                    }
+                };
+                let device_attribution = match device_attribution {
+                    Ok(attribution) => attribution,
+                    Err(_) => {
+                        lane.fail_closed();
+                        return Err(SubmissionWaveDispatchError::PostSubmitContract {
+                            error: invalid_operation("wave attribution panicked after submission"),
                             completion,
                         });
                     }
