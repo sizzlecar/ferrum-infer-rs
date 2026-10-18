@@ -894,6 +894,72 @@ impl ContinuousBatchMetrics {
 }
 
 impl ContinuousBatchScheduler {
+    /// Publish one request synchronously under the scheduler's existing queue locks.
+    pub fn submit_request(&self, request: InferenceRequest) -> Result<RequestId> {
+        self.validate_slo()?;
+        let request_id = request.id.clone();
+        debug!(
+            "Submitting request {} to continuous batch scheduler",
+            request_id
+        );
+
+        // Check queue capacity
+        let waiting_count = self.waiting_count();
+        if waiting_count >= self.config.max_waiting_requests {
+            warn!("Queue is full, rejecting request {}", request_id);
+            return Err(FerrumError::scheduler(
+                "Queue is full, cannot accept more requests",
+            ));
+        }
+
+        // Create continuous batch request
+        let cb_request = ContinuousBatchRequest::new(request);
+
+        // Add to waiting queue
+        let mut waiting_queue = self.waiting_queue.write();
+        let mut request_index = self.request_index.write();
+        // Selection can now await outside this lock. Enforce the queue bound
+        // here as well, so concurrent submissions cannot both consume its last slot.
+        if waiting_queue.len() >= self.config.max_waiting_requests {
+            return Err(FerrumError::scheduler(
+                "Queue is full, cannot accept more requests",
+            ));
+        }
+        if request_index.contains_key(&request_id) {
+            return Err(FerrumError::scheduler(format!(
+                "Request {request_id} is already tracked by the scheduler"
+            )));
+        }
+        let queue_position = waiting_queue.len();
+
+        let mut req = cb_request;
+        req.inner.queue_position = Some(queue_position);
+
+        let ticket = waiting_queue
+            .enqueue(req)
+            .map_err(|error| FerrumError::scheduler(error.to_string()))?;
+        waiting_queue
+            .request_mut(ticket)
+            .expect("newly enqueued admission ticket remains present")
+            .waiting_admission_ticket = Some(ticket);
+
+        // Update the lifecycle index and arm fill-first only when this request
+        // starts a new cohort after every prior request has left. Doing both
+        // under the index write lock makes the idle transition exact with
+        // respect to concurrent completion and submission.
+        if request_index.is_empty() {
+            self.fill_first_initial_cohort_armed
+                .store(true, Ordering::Release);
+        }
+        request_index.insert(request_id.clone(), RequestPhase::Waiting);
+
+        info!(
+            "Request {} queued at position {}",
+            request_id, queue_position
+        );
+        Ok(request_id)
+    }
+
     /// End logical request tracking without claiming that executor capacity was released.
     pub fn complete_request(
         &self,
@@ -4590,68 +4656,7 @@ impl Scheduler for ContinuousBatchScheduler {
     }
 
     async fn submit(&self, request: InferenceRequest) -> Result<RequestId> {
-        self.validate_slo()?;
-        let request_id = request.id.clone();
-        debug!(
-            "Submitting request {} to continuous batch scheduler",
-            request_id
-        );
-
-        // Check queue capacity
-        let waiting_count = self.waiting_count();
-        if waiting_count >= self.config.max_waiting_requests {
-            warn!("Queue is full, rejecting request {}", request_id);
-            return Err(FerrumError::scheduler(
-                "Queue is full, cannot accept more requests",
-            ));
-        }
-
-        // Create continuous batch request
-        let cb_request = ContinuousBatchRequest::new(request);
-
-        // Add to waiting queue
-        let mut waiting_queue = self.waiting_queue.write();
-        let mut request_index = self.request_index.write();
-        // Selection can now await outside this lock. Enforce the queue bound
-        // here as well, so concurrent submissions cannot both consume its last slot.
-        if waiting_queue.len() >= self.config.max_waiting_requests {
-            return Err(FerrumError::scheduler(
-                "Queue is full, cannot accept more requests",
-            ));
-        }
-        if request_index.contains_key(&request_id) {
-            return Err(FerrumError::scheduler(format!(
-                "Request {request_id} is already tracked by the scheduler"
-            )));
-        }
-        let queue_position = waiting_queue.len();
-
-        let mut req = cb_request;
-        req.inner.queue_position = Some(queue_position);
-
-        let ticket = waiting_queue
-            .enqueue(req)
-            .map_err(|error| FerrumError::scheduler(error.to_string()))?;
-        waiting_queue
-            .request_mut(ticket)
-            .expect("newly enqueued admission ticket remains present")
-            .waiting_admission_ticket = Some(ticket);
-
-        // Update the lifecycle index and arm fill-first only when this request
-        // starts a new cohort after every prior request has left. Doing both
-        // under the index write lock makes the idle transition exact with
-        // respect to concurrent completion and submission.
-        if request_index.is_empty() {
-            self.fill_first_initial_cohort_armed
-                .store(true, Ordering::Release);
-        }
-        request_index.insert(request_id.clone(), RequestPhase::Waiting);
-
-        info!(
-            "Request {} queued at position {}",
-            request_id, queue_position
-        );
-        Ok(request_id)
+        self.submit_request(request)
     }
 
     async fn next_batch(&self, hint: BatchHint) -> Option<BatchPlan> {

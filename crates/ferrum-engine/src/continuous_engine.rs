@@ -1210,6 +1210,9 @@ pub use sequence::SequenceState;
 use sequence::*;
 mod execution_close;
 use execution_close::ExecutionCloseRegistry;
+mod managed_driver;
+use managed_driver::ManagedDriver;
+pub use managed_driver::{DriverExitReport, DriverObserver};
 
 enum EngineIterationOutcome {
     Progressed,
@@ -1394,7 +1397,7 @@ struct EngineInner {
     resource_composition: EngineResourceComposition,
     model_executor: Arc<dyn ModelExecutor + Send + Sync>,
     sequences: RwLock<HashMap<RequestId, SequenceState>>,
-    is_running: AtomicBool,
+    driver: Weak<ManagedDriver>,
     shutdown_notify: Arc<Notify>,
     /// Serializes request publication with cancellation and BatchPlan
     /// construction. Device execution deliberately runs after this guard is
@@ -1426,14 +1429,22 @@ struct EngineInner {
     scheduling_time_samples: AtomicU64,
     total_model_execution_time_us: AtomicU64,
     model_execution_time_samples: AtomicU64,
-    /// Set true the first time `ensure_bg_loop` runs, so per-request
-    /// `infer_stream` callers don't each spawn their own competing
-    /// driver task (16 streaming requests = 16 drivers thrashing on
-    /// `iteration_lock`, ~5ms/iter of tokio scheduling overhead).
-    bg_loop_spawned: AtomicBool,
-    shutdown_started: AtomicBool,
-    shutdown_lock: tokio::sync::Mutex<()>,
-    background_loop: Mutex<Option<tokio::task::JoinHandle<()>>>,
+}
+
+struct ActiveInferGuard(metrics::Gauge);
+
+impl ActiveInferGuard {
+    fn new() -> Self {
+        let active = gauge!("ferrum.engine.active_requests");
+        active.increment(1.0);
+        Self(active)
+    }
+}
+
+impl Drop for ActiveInferGuard {
+    fn drop(&mut self) {
+        self.0.decrement(1.0);
+    }
 }
 
 struct ClientReceiverDropWake {
@@ -1442,16 +1453,10 @@ struct ClientReceiverDropWake {
 }
 
 impl EngineInner {
-    fn signal_shutdown(&self) {
-        self.shutdown_started.store(true, Ordering::Release);
-        self.is_running.store(false, Ordering::SeqCst);
-
-        // The background loop can be between its state check and registering
-        // the async wait. `notify_one` retains a permit across that window;
-        // `notify_waiters` would lose the shutdown signal when no waiter is
-        // registered yet.
-        self.shutdown_notify.notify_one();
-        self.work_notify.notify_one();
+    fn shutdown_started(&self) -> bool {
+        self.driver
+            .upgrade()
+            .is_none_or(|driver| driver.is_closing())
     }
 
     fn structured_output_factory(&self) -> Result<Arc<StructuredOutputFactory>> {
@@ -2155,6 +2160,7 @@ mod inner;
 /// all pending requests to be processed in each iteration's batch.
 pub struct ContinuousBatchEngine {
     inner: Arc<EngineInner>,
+    driver: Arc<ManagedDriver>,
 }
 
 impl ContinuousBatchEngine {
@@ -2308,6 +2314,7 @@ impl ContinuousBatchEngine {
             model_executor.attach_execution_event_sink(sink);
         }
 
+        let driver = Arc::new(ManagedDriver::default());
         Ok(Self {
             inner: Arc::new(EngineInner {
                 config,
@@ -2318,7 +2325,7 @@ impl ContinuousBatchEngine {
                 resource_composition,
                 model_executor,
                 sequences: RwLock::new(HashMap::new()),
-                is_running: AtomicBool::new(false),
+                driver: Arc::downgrade(&driver),
                 shutdown_notify: Arc::new(Notify::new()),
                 iteration_lock: tokio::sync::Mutex::new(()),
                 work_notify: Arc::new(Notify::new()),
@@ -2345,31 +2352,9 @@ impl ContinuousBatchEngine {
                 scheduling_time_samples: AtomicU64::new(0),
                 total_model_execution_time_us: AtomicU64::new(0),
                 model_execution_time_samples: AtomicU64::new(0),
-                bg_loop_spawned: AtomicBool::new(false),
-                shutdown_started: AtomicBool::new(false),
-                shutdown_lock: tokio::sync::Mutex::new(()),
-                background_loop: Mutex::new(None),
             }),
+            driver,
         })
-    }
-
-    /// Spawn the background iteration loop on first request. Without this,
-    /// every concurrent infer/infer_stream call spawned its own
-    /// drive_to_completion task → 16 streaming requests = 16 tasks all
-    /// racing for `iteration_lock` (thundering herd, observed as ~5ms of
-    /// per-iter tokio scheduling overhead at c=16). With one bg loop +
-    /// per-request tasks just consuming their channel, lock is uncontested.
-    fn ensure_bg_loop(&self) {
-        if self.inner.bg_loop_spawned.load(Ordering::Acquire) {
-            return;
-        }
-        let mut background_loop = self.inner.background_loop.lock();
-        if self.inner.shutdown_started.load(Ordering::Acquire) {
-            return;
-        }
-        if !self.inner.bg_loop_spawned.swap(true, Ordering::AcqRel) {
-            *background_loop = Some(self.start_loop());
-        }
     }
 
     /// Hit count since engine construction (prefix cache). Exposed for
@@ -2378,71 +2363,45 @@ impl ContinuousBatchEngine {
         self.inner.prefix_cache_hits.load(Ordering::Relaxed)
     }
 
-    /// Start a background iteration loop.  Returns a `JoinHandle` that
-    /// runs until `shutdown()` is called.  When a background loop is
-    /// active, `infer()` / `infer_stream()` simply submit and wait.
-    pub fn start_loop(&self) -> tokio::task::JoinHandle<()> {
-        let inner = self.inner.clone();
-        inner.is_running.store(true, Ordering::SeqCst);
-        tokio::spawn(async move {
-            info!("Background iteration loop started");
-            let prof = inner.runtime_config.batch_decode_prof;
-            let mut last_iter_end: Option<std::time::Instant> = None;
-            static GAP_PROF_CALLS: std::sync::atomic::AtomicU64 =
-                std::sync::atomic::AtomicU64::new(0);
-            loop {
-                if !inner.is_running.load(Ordering::SeqCst) {
-                    break;
-                }
-                let inter_iter_us = if let Some(prev) = last_iter_end {
-                    Some(prev.elapsed().as_micros() as u64)
-                } else {
-                    None
-                };
-                let outcome = match inner.run_iteration().await {
-                    Ok(outcome) => outcome,
-                    Err(error) => {
-                        warn!("Iteration error: {}", error);
-                        EngineIterationOutcome::Progressed
-                    }
-                };
-                if prof {
-                    let n = GAP_PROF_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    if n.is_multiple_of(8) {
-                        if let Some(gap_us) = inter_iter_us {
-                            eprintln!("[bg-loop-gap] call#{} inter_iter={}us", n, gap_us);
-                        }
-                    }
-                }
-                last_iter_end = Some(std::time::Instant::now());
-                if !inner.is_running.load(Ordering::SeqCst) {
-                    break;
-                }
-                match outcome {
-                    EngineIterationOutcome::Progressed => tokio::task::yield_now().await,
-                    EngineIterationOutcome::Idle => {
-                        tokio::select! {
-                            _ = inner.wait_for_prefix_deadline() => {}
-                            _ = inner.shutdown_notify.notified() => {}
-                            _ = inner.work_notify.notified() => {}
-                        }
-                    }
-                    EngineIterationOutcome::CapacityBlocked(registration) => {
-                        tokio::select! {
-                            _ = inner.wait_for_prefix_deadline() => {}
-                            _ = inner.shutdown_notify.notified() => {}
-                            _ = inner.work_notify.notified() => {}
-                            result = registration.wait_for_change() => {
-                                if let Err(error) = result {
-                                    warn!("Executor capacity wait error: {}", error);
-                                }
-                            }
-                        }
-                    }
-                }
+    /// Start or observe the one managed iteration task. The returned observer
+    /// has no abort authority. A closing engine cannot be restarted.
+    pub fn start_loop(&self) -> Result<DriverObserver> {
+        self.driver.start(&self.inner)
+    }
+
+    async fn publish_request(
+        &self,
+        request: InferenceRequest,
+        mut sequence: SequenceState,
+    ) -> Result<()> {
+        let request_id = request.id.clone();
+        let _iteration = self.inner.iteration_lock.lock().await;
+        self.driver.publish(&self.inner, || {
+            let mut sequences = self.inner.sequences.write();
+            if sequences.contains_key(&request_id) {
+                return Err(FerrumError::already_exists(format!(
+                    "request {request_id} is already active"
+                )));
             }
-            info!("Background iteration loop stopped");
-        })
+            // No cancellable await exists after opening the product slot.
+            // The same gate serializes this publication with shutdown.
+            sequence.request_slot = Some(RequestSlotLease::open(&self.inner, request_id.clone()));
+            if let Err(error) = self.inner.scheduler.submit_request(request) {
+                if let Some(slot) = sequence.request_slot.take() {
+                    slot.reject(&self.inner, error.to_string());
+                }
+                return Err(error);
+            }
+            sequence
+                .request_slot
+                .as_mut()
+                .expect("new publication owns its slot")
+                .admit(&self.inner);
+            sequences.insert(request_id, sequence);
+            Ok(())
+        })?;
+        self.inner.work_notify.notify_one();
+        Ok(())
     }
 }
 
@@ -2467,7 +2426,6 @@ impl LlmInferenceEngine for ContinuousBatchEngine {
     async fn infer(&self, mut request: InferenceRequest) -> Result<InferenceResponse> {
         self.adapter_execution_support()
             .validate_metadata(&request.metadata)?;
-        let request_id = request.id.clone();
         let infer_start = Instant::now();
         counter!("ferrum.engine.requests_total").increment(1);
 
@@ -2510,54 +2468,9 @@ impl LlmInferenceEngine for ContinuousBatchEngine {
                 Some(self.inner.model_executor.info().vocab_size),
                 structured_factory.as_deref(),
             )?;
-        gauge!("ferrum.engine.active_requests").increment(1.0);
-        let request_slot = RequestSlotLease::open(&self.inner, request_id.clone());
         seq_state.response_sender = Some(resp_tx);
-        seq_state.request_slot = Some(request_slot);
-        {
-            let _iteration = self.inner.iteration_lock.lock().await;
-            {
-                let mut sequences = self.inner.sequences.write();
-                if sequences.contains_key(&request_id) {
-                    let error = FerrumError::already_exists(format!(
-                        "request {} is already active",
-                        request_id
-                    ));
-                    if let Some(request_slot) = seq_state.request_slot.take() {
-                        request_slot.reject(&self.inner, error.to_string());
-                    }
-                    gauge!("ferrum.engine.active_requests").decrement(1.0);
-                    return Err(error);
-                }
-                sequences.insert(request_id.clone(), seq_state);
-            }
-            if let Err(error) = self.inner.scheduler.submit(request).await {
-                let mut sequence = self
-                    .inner
-                    .sequences
-                    .write()
-                    .remove(&request_id)
-                    .expect("just-published sequence remains present after submit failure");
-                if let Some(request_slot) = sequence.request_slot.take() {
-                    request_slot.reject(&self.inner, error.to_string());
-                }
-                gauge!("ferrum.engine.active_requests").decrement(1.0);
-                return Err(error);
-            }
-            self.inner
-                .sequences
-                .write()
-                .get_mut(&request_id)
-                .and_then(|sequence| sequence.request_slot.as_mut())
-                .expect("submitted sequence retains its request slot")
-                .admit(&self.inner);
-        }
-
-        // Make sure the single shared bg loop is running, then just wait
-        // for our oneshot to fire. Avoids per-request drive_to_completion
-        // contention on iteration_lock.
-        self.ensure_bg_loop();
-        self.inner.work_notify.notify_one();
+        self.publish_request(request, seq_state).await?;
+        let _active_request = ActiveInferGuard::new();
 
         let result = resp_rx.await.unwrap_or_else(|_| {
             Err(FerrumError::internal(
@@ -2566,7 +2479,6 @@ impl LlmInferenceEngine for ContinuousBatchEngine {
         });
         receiver_drop_wake.disarm();
 
-        gauge!("ferrum.engine.active_requests").decrement(1.0);
         let elapsed_ms = infer_start.elapsed().as_secs_f64() * 1000.0;
         histogram!("ferrum.engine.request_duration_ms").record(elapsed_ms);
 
@@ -2592,7 +2504,6 @@ impl LlmInferenceEngine for ContinuousBatchEngine {
             .validate_metadata(&request.metadata)?;
         let (tx, rx) = mpsc::channel(100);
         let receiver_drop_wake = ClientReceiverDropWake::new(Arc::clone(&self.inner.work_notify));
-        let request_id = request.id.clone();
 
         let input_tokens = self.inner.tokenizer.encode(&request.prompt, true)?;
         clamp_default_max_tokens_to_context(
@@ -2629,54 +2540,8 @@ impl LlmInferenceEngine for ContinuousBatchEngine {
                 Some(self.inner.model_executor.info().vocab_size),
                 structured_factory.as_deref(),
             )?;
-        let request_slot = RequestSlotLease::open(&self.inner, request_id.clone());
         seq_state.stream_sender = Some(tx);
-        seq_state.request_slot = Some(request_slot);
-        {
-            let _iteration = self.inner.iteration_lock.lock().await;
-            {
-                let mut sequences = self.inner.sequences.write();
-                if sequences.contains_key(&request_id) {
-                    let error = FerrumError::already_exists(format!(
-                        "request {} is already active",
-                        request_id
-                    ));
-                    if let Some(request_slot) = seq_state.request_slot.take() {
-                        request_slot.reject(&self.inner, error.to_string());
-                    }
-                    return Err(error);
-                }
-                sequences.insert(request_id.clone(), seq_state);
-            }
-            if let Err(error) = self.inner.scheduler.submit(request).await {
-                let mut sequence = self
-                    .inner
-                    .sequences
-                    .write()
-                    .remove(&request_id)
-                    .expect("just-published sequence remains present after submit failure");
-                if let Some(request_slot) = sequence.request_slot.take() {
-                    request_slot.reject(&self.inner, error.to_string());
-                }
-                return Err(error);
-            }
-            self.inner
-                .sequences
-                .write()
-                .get_mut(&request_id)
-                .and_then(|sequence| sequence.request_slot.as_mut())
-                .expect("submitted sequence retains its request slot")
-                .admit(&self.inner);
-        }
-
-        // Single shared bg loop drives iters; per-request stream just
-        // consumes from `rx`. Used to spawn a per-request drive_to_completion
-        // task here, but with c=N concurrent streams that produced N
-        // tasks all racing for `iteration_lock` — measured ~5ms/iter of
-        // tokio thundering-herd overhead at c=16.
-        let _ = request_id;
-        self.ensure_bg_loop();
-        self.inner.work_notify.notify_one();
+        self.publish_request(request, seq_state).await?;
 
         Ok(Box::pin(CancellationAwareResponseStream {
             receiver: tokio_stream::wrappers::ReceiverStream::new(rx),
@@ -2744,7 +2609,7 @@ impl InferenceEngine for ContinuousBatchEngine {
         };
         memory_usage.calculate_utilization();
         EngineStatus {
-            is_ready: resource_status_ready && self.inner.is_running.load(Ordering::SeqCst),
+            is_ready: resource_status_ready && self.driver.is_running(),
             loaded_models: vec![self.inner.config.model.model_id.clone()],
             active_requests: metrics.running_requests,
             queued_requests: metrics.waiting_requests,
@@ -2756,78 +2621,7 @@ impl InferenceEngine for ContinuousBatchEngine {
     }
 
     async fn shutdown(&self) -> Result<()> {
-        let _shutdown_guard = self.inner.shutdown_lock.lock().await;
-        info!("Shutting down continuous batch engine");
-        let background_loop = {
-            let mut background_loop = self.inner.background_loop.lock();
-            self.inner.signal_shutdown();
-            background_loop.take()
-        };
-
-        let loop_result = match background_loop {
-            Some(background_loop) => background_loop.await.map_err(|error| {
-                FerrumError::internal(format!("background iteration loop failed: {error}"))
-            }),
-            None => Ok(()),
-        };
-        let readiness_result = self
-            .inner
-            .execution_readiness_waiters
-            .abort_and_join()
-            .await;
-        self.inner.execution_closes.join_observers().await;
-        let close_result = self.inner.drain_execution_closes();
-        let unreclaimed = self.inner.execution_closes.unreclaimed_count();
-        if unreclaimed > 0 {
-            // Keep unknown owners, leases, and their trace journal intact. A
-            // stopped worker or failed observer does not establish release.
-            return Err(close_result.err().unwrap_or_else(|| {
-                FerrumError::internal(format!(
-                    "engine shutdown retains {unreclaimed} unproved execution closures"
-                ))
-            }));
-        }
-        // Drop immutable checkpoint pins outside the cohort mutex before native
-        // resource shutdown. No pending dependency survives engine shutdown.
-        let prefix_cohorts = std::mem::take(&mut *self.inner.prefix_rendezvous.lock());
-        drop(prefix_cohorts);
-        let prefix_restores = std::mem::take(&mut *self.inner.prefix_restore_pending.lock());
-        drop(prefix_restores);
-
-        let mut trace_journals = Vec::with_capacity(2);
-        if let Some(journal) = self.inner.profile_trace_jsonl.clone() {
-            trace_journals.push(journal);
-        }
-        if let Some(journal) = self.inner.scheduler_trace_jsonl.clone() {
-            if trace_journals
-                .iter()
-                .all(|existing| existing.path() != journal.path())
-            {
-                trace_journals.push(journal);
-            }
-        }
-        let trace_result = if trace_journals.is_empty() {
-            Ok(())
-        } else {
-            tokio::task::spawn_blocking(move || {
-                for journal in trace_journals {
-                    journal.close()?;
-                }
-                Ok::<(), JsonlJournalError>(())
-            })
-            .await
-            .map_err(|error| {
-                FerrumError::internal(format!("scheduler trace close task failed: {error}"))
-            })?
-            .map_err(|error| {
-                FerrumError::internal(format!("scheduler trace close failed: {error}"))
-            })
-        };
-
-        loop_result?;
-        readiness_result?;
-        close_result?;
-        trace_result
+        self.driver.shutdown(&self.inner)?.wait().await.result()
     }
 
     fn config(&self) -> &EngineConfig {
@@ -2931,7 +2725,7 @@ impl InferenceEngine for ContinuousBatchEngine {
     }
 
     async fn health_check(&self) -> ferrum_types::HealthStatus {
-        if self.inner.is_running.load(Ordering::SeqCst) {
+        if self.driver.is_running() {
             ferrum_types::HealthStatus::healthy()
         } else {
             ferrum_types::HealthStatus {
@@ -2946,7 +2740,7 @@ impl InferenceEngine for ContinuousBatchEngine {
 impl std::fmt::Debug for ContinuousBatchEngine {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ContinuousBatchEngine")
-            .field("is_running", &self.inner.is_running.load(Ordering::SeqCst))
+            .field("is_running", &self.driver.is_running())
             .field(
                 "iteration_count",
                 &self.inner.iteration_count.load(Ordering::SeqCst),

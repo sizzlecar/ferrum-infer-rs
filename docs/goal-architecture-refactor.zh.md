@@ -1,8 +1,8 @@
 # Goal：统一执行架构，为 SLO 优化建立可靠基础
 
-**状态：目标已激活，R0 已合并，R1 实施中。** 工作分支：`refactor/execution-architecture-20261018`，从 2026-10-18 的干净 `main`（`c2be4c67`）开始。首个 checkpoint 退役独立 embedding/ASR/TTS 链路；原工作区未合并的旧 SLO 实现不作为代码基底。
+**状态：目标已激活，R0 已合并，R1 验收、R2 实施中。** 工作分支：`refactor/execution-architecture-20261018`，从 2026-10-18 的干净 `main`（`c2be4c67`）开始。首个 checkpoint 退役独立 embedding/ASR/TTS 链路；原工作区未合并的旧 SLO 实现不作为代码基底。
 
-R0 六批清理与正确性修复已合并（PR #429–#434）。R1 已分离 runtime 与产品执行契约，统一 token 提交并退出旧 Tensor 控制流，泛型驱动归入 execution。R1 仍在验收，R2–R5 未完成；原始证据留在仓库外交接目录，没有新增性能或 SLO 达标声明。
+R0 六批清理与正确性修复已合并（PR #429–#434）。R1 已分离 runtime 与产品执行契约，统一 token 提交并退出旧 Tensor 控制流，泛型驱动归入 execution。R2 首片统一驱动启动、关闭准入和退出清理；有界输出与后续隔离仍未完成。R1 仍在验收，R2–R5 未完成；原始证据留在仓库外交接目录，没有新增性能或 SLO 达标声明。
 
 ## 1. 目标与第一原则
 
@@ -86,6 +86,8 @@ MoE API 迁移：移除旧 `Qwen3MoeModel`、`Qwen3MoeConfig`、`Qwen3MoeLayer` 
 依赖方向（箭头指向被依赖者）：`engine → scheduler → execution → {runtime, interfaces} → types`，Engine 也直接消费 execution；execution 不反向依赖 scheduler。runtime 当前不需要依赖 interfaces。kernels 实现 runtime 的设备端口，models 提供语义/权重和合法执行实现；execution/runtime 不反向依赖 models 或具体 kernels。基础 interfaces 不重导出依赖自己的上层 crate。SLO 组件消费只读执行事实，发布策略快照；数据面不反向依赖 SLO 实现。上述责任和依赖关系必须落地，同时更新 workspace membership 和发布依赖顺序。
 
 R1 Rust API 迁移：原 `ferrum_interfaces::vnext::*` 改为 `ferrum_runtime::*`，`model_executor` 与 `ModelExecutor` 改由 `ferrum_execution` 导出。原 `ferrum_models::VNextModelExecutor` / `VNextExecutorConfig` 改为 `ferrum_execution::ProgramExecutor` / `ProgramExecutorConfig`，编译结果与装配合同改为 `CompiledProgram` / `RuntimeComposition`；不保留旧路径别名。产品 prefix 观测使用 `ProductExecutionEventSink`，可向上转型为 runtime sink，不增加队列或放宽事件授权；基础 interfaces 不向上重导出。
+
+R2 驱动 API：`ContinuousBatchEngine::start_loop()` 返回 `Result<DriverObserver>`；显式启动和首请求共用同一任务。用 `observer.wait().await.result()` 观察退出，停止仍调用 `shutdown()`；观察端没有 abort 权限，取消等待不取消清理。关闭后拒绝新请求和重启；失败报告保留未证明已释放的原资源。慢消费者下的有界输出仍待后续切片完成。
 
 产品装配层组合模型准备结果、具体设备 runtime 与泛型驱动。迁移 `VNextModelExecutor<R>` 时同时解开其对 `PreparedProductionModel` 的依赖，将中立准备输入与编译结果归到正确层，并保留 source/registry/初始化身份校验；不能整文件搬迁后让 execution 再引用 models。泛型驱动本身已后端中立，不能将这项整理描述成新消除的具体 GPU 绑定。量化格式描述/解析与设备执行也按此分层，不能经 quantization 引回 kernels 依赖环。
 

@@ -225,7 +225,7 @@ fn assert_no_admission(
             .load(Ordering::Relaxed),
         0
     );
-    assert!(!engine.inner.bg_loop_spawned.load(Ordering::Acquire));
+    assert_eq!(engine.driver.start_count(), 0);
     assert_eq!(engine.inner.iteration_count.load(Ordering::Acquire), 0);
 }
 

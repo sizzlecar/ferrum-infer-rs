@@ -153,9 +153,32 @@ impl EngineInner {
                 ))),
             );
         }
+        if self.shutdown_started() {
+            if let Some(sequence) = sequences
+                .get_mut(request_id)
+                .filter(|sequence| sequence.execution_frontier.as_ref() == Some(&frontier))
+            {
+                // The caller is consuming this exact entry's actual Ended
+                // receipt. Leave its slot in that entry, but remove the stale
+                // outer frontier so shutdown cannot register a second close
+                // and notify the same capacity release twice.
+                sequence.execution_frontier = None;
+            }
+            readiness.cancel();
+            return (
+                false,
+                self.scheduler
+                    .abort_execution_capacity_yield(
+                        &transaction,
+                        false,
+                        attempted_width,
+                        observed_free_blocks,
+                    )
+                    .map(|_| ()),
+            );
+        }
         let live = sequences.get_mut(request_id).filter(|sequence| {
             sequence.execution_frontier.as_ref() == Some(&frontier)
-                && !self.shutdown_started.load(Ordering::Acquire)
                 && matches!(
                     self.scheduler.trace_phase(request_id),
                     Some(RequestPhase::Prefilling | RequestPhase::Decoding)

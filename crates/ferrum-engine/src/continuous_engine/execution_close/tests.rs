@@ -331,6 +331,70 @@ async fn execution_close_recompute_waits_for_ended_before_requeue_and_release() 
 }
 
 #[tokio::test]
+async fn managed_driver_closing_does_not_revive_a_completed_recompute() {
+    // Protocol/resource ownership fixture: no numerical claim. The original
+    // observer publishes Ended before Closing, but product consumption occurs
+    // after the gate closes and before the newly spawned cleanup task polls.
+    let (engine, executor, identity, request_id, slot, sender) = fixture(false);
+    let transaction =
+        install_recompute_request(&engine, &executor, &identity, &request_id, slot).await;
+    assert!(!engine
+        .inner
+        .execute_capacity_yield(&transaction, 1, None)
+        .await
+        .unwrap());
+    assert_eq!(executor.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        engine
+            .inner
+            .scheduler
+            .trace_snapshot()
+            .capacity_release_epoch,
+        0
+    );
+    executor.capacity_epoch.store(2, Ordering::Release);
+    sender
+        .send(Ok(ExecutionTerminalOutcome::ended(
+            executor.issuer.ended(&identity).unwrap(),
+        )))
+        .unwrap();
+    engine.inner.execution_closes.join_observers().await;
+    let observer = engine.driver.shutdown(&engine.inner).unwrap();
+    engine.inner.drain_execution_closes().unwrap();
+    assert_ne!(
+        engine.inner.scheduler.trace_phase(&request_id),
+        Some(RequestPhase::Waiting)
+    );
+    assert_eq!(engine.inner.scheduler.waiting_count(), 0);
+    assert_eq!(
+        engine
+            .inner
+            .scheduler
+            .trace_snapshot()
+            .capacity_release_epoch,
+        1
+    );
+    observer.wait().await.result().unwrap();
+    assert!(engine.inner.sequences.read().is_empty());
+    assert_eq!(engine.inner.scheduler.trace_phase(&request_id), None);
+    assert_eq!(engine.inner.execution_closes.unreclaimed_count(), 0);
+    assert_eq!(
+        engine
+            .inner
+            .scheduler
+            .trace_snapshot()
+            .capacity_release_epoch,
+        1,
+        "consuming the old Ended during cleanup must not announce a second release"
+    );
+    assert_eq!(
+        executor.calls.load(Ordering::SeqCst),
+        1,
+        "the original recompute closure already owns the physical terminal"
+    );
+}
+
+#[tokio::test]
 async fn execution_close_recompute_source_error_preserves_feedback_and_once_release() {
     let (engine, executor, identity, request_id, slot, sender) = fixture(false);
     let transaction =

@@ -40,6 +40,8 @@ mod prefix_restore_deferred_tests;
 #[path = "prefix_restore_tests.rs"]
 mod prefix_restore_tests;
 
+#[path = "managed_driver_tests.rs"]
+mod managed_driver_tests;
 #[path = "metrics_only_tests.rs"]
 mod metrics_only_tests;
 #[path = "mixed_batch_tests.rs"]
@@ -2032,7 +2034,7 @@ async fn idle_background_loop_parks_and_new_work_resumes_it() {
 #[tokio::test]
 async fn shutdown_wakes_an_idle_background_loop() {
     let engine = test_continuous_engine();
-    let background = engine.start_loop();
+    let background = engine.start_loop().unwrap();
     tokio::time::timeout(Duration::from_secs(1), async {
         while engine.inner.iteration_count.load(Ordering::Acquire) == 0 {
             tokio::task::yield_now().await;
@@ -2042,9 +2044,10 @@ async fn shutdown_wakes_an_idle_background_loop() {
     .expect("background loop must enter one idle iteration");
 
     engine.shutdown().await.unwrap();
-    tokio::time::timeout(Duration::from_secs(1), background)
+    tokio::time::timeout(Duration::from_secs(1), background.wait())
         .await
         .expect("shutdown must wake the idle loop")
+        .result()
         .expect("background loop must not panic");
 }
 
@@ -2052,10 +2055,10 @@ async fn shutdown_wakes_an_idle_background_loop() {
 async fn shutdown_signal_retains_wakes_before_wait_registration() {
     let engine = test_continuous_engine();
 
-    engine.inner.signal_shutdown();
+    let observer = engine.driver.shutdown(&engine.inner).unwrap();
 
-    assert!(engine.inner.shutdown_started.load(Ordering::Acquire));
-    assert!(!engine.inner.is_running.load(Ordering::SeqCst));
+    assert!(engine.driver.is_closing());
+    assert!(!engine.driver.is_running());
     tokio::time::timeout(
         Duration::from_millis(100),
         engine.inner.shutdown_notify.notified(),
@@ -2068,6 +2071,7 @@ async fn shutdown_signal_retains_wakes_before_wait_registration() {
     )
     .await
     .expect("work wake must survive registration after the signal");
+    observer.wait().await.result().unwrap();
 }
 
 #[tokio::test]
@@ -3681,8 +3685,7 @@ async fn plan_runtime_capacity_wait_accepts_new_work_and_shutdown_without_reprob
         )
         .unwrap(),
     );
-    engine.inner.bg_loop_spawned.store(true, Ordering::Release);
-    let background = engine.start_loop();
+    let background = engine.start_loop().unwrap();
 
     let mut first = policy_request();
     first.sampling_params.max_tokens = 1;
@@ -3718,12 +3721,23 @@ async fn plan_runtime_capacity_wait_accepts_new_work_and_shutdown_without_reprob
     assert_eq!(executor.prefill_calls.load(Ordering::Acquire), 0);
 
     engine.shutdown().await.unwrap();
-    tokio::time::timeout(Duration::from_secs(1), background)
+    tokio::time::timeout(Duration::from_secs(1), background.wait())
         .await
         .expect("shutdown must interrupt the capacity waiter")
+        .result()
         .expect("capacity-waiting background loop must not panic");
-    first_task.abort();
-    second_task.abort();
+    for task in [first_task, second_task] {
+        assert!(tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("shutdown must notify every parked request")
+            .expect("inference task must not panic")
+            .is_err());
+    }
+    assert!(engine.inner.sequences.read().is_empty());
+    assert_eq!(engine.inner.scheduler.waiting_count(), 0);
+    assert_eq!(engine.inner.scheduler.trace_snapshot().active_len, 0);
+    assert_eq!(executor.admission_probes.load(Ordering::Acquire), 2);
+    assert_eq!(executor.prefill_calls.load(Ordering::Acquire), 0);
 }
 
 #[tokio::test]

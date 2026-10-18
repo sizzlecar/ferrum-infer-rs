@@ -1,5 +1,31 @@
 use super::*;
 
+// Restoring the original outer state on unwind preserves owners that have not
+// reached the close registry yet. The guard never synthesizes terminal facts.
+struct RemovedCompletionSequence<'a> {
+    sequences: &'a mut HashMap<RequestId, SequenceState>,
+    request_id: RequestId,
+    sequence: Option<SequenceState>,
+}
+
+impl Drop for RemovedCompletionSequence<'_> {
+    fn drop(&mut self) {
+        if let Some(sequence) = self.sequence.take() {
+            self.sequences.insert(self.request_id.clone(), sequence);
+        }
+    }
+}
+
+struct CompletionHandoff {
+    response: InferenceResponse,
+    stream_sender: Option<mpsc::Sender<Result<StreamChunk>>>,
+    response_sender: Option<tokio::sync::oneshot::Sender<Result<InferenceResponse>>>,
+    terminal_error: Option<FerrumError>,
+    completion_error: Option<FerrumError>,
+    terminal_token_trace: Option<SequenceTokenTraceEvidence>,
+    token_close: Option<Result<execution_close::ExecutionCloseTicket>>,
+}
+
 impl SequenceState {
     /// Return the first matched stop, or hold the longest suffix that could
     /// still become a stop. Character boundaries keep Unicode stops safe.
@@ -722,16 +748,37 @@ impl EngineInner {
             self.send_stream_text(request_id, None, Some(finish_reason))
                 .await;
         }
+        let Some(handoff) = self.handoff_request_completion(
+            request_id,
+            finish_reason,
+            explicit_terminal_error,
+            expected_admission,
+            classified_api_response,
+        ) else {
+            return Ok(());
+        };
+        self.finish_request_completion(request_id, handoff).await
+    }
+
+    fn handoff_request_completion(
+        &self,
+        request_id: &RequestId,
+        finish_reason: FinishReason,
+        mut explicit_terminal_error: Option<FerrumError>,
+        expected_admission: Option<
+            &ferrum_scheduler::implementations::continuous::PrefixRequestKey,
+        >,
+        mut classified_api_response: Option<ferrum_types::ApiResponse>,
+    ) -> Option<CompletionHandoff> {
         // A terminal failure is not permission to abandon the other owners.
         // Keep the first control-plane error, while independently closing the
         // resources and client channels whose disposition is still known.
         let mut completion_error = None;
         let (
-            mut response,
+            response,
             mut stream_sender,
             mut response_sender,
-            completion_resources,
-            mut terminal_error,
+            terminal_error,
             terminal_token_trace,
             token_close,
         ) = {
@@ -741,17 +788,26 @@ impl EngineInner {
                     .get(request_id)
                     .is_some_and(|sequence| sequence.pending_token_admission.as_ref() == Some(key))
                 {
-                    return Ok(());
+                    return None;
                 }
             }
-            if let Some(mut seq) = sequences.remove(request_id) {
+            if let Some(sequence) = sequences.remove(request_id) {
+                let mut removed = RemovedCompletionSequence {
+                    sequences: &mut sequences,
+                    request_id: request_id.clone(),
+                    sequence: Some(sequence),
+                };
+                let seq = removed
+                    .sequence
+                    .as_mut()
+                    .expect("removed sequence is retained");
                 let mut terminal_error = explicit_terminal_error.take();
                 let mut finish_reason = if terminal_error.is_some() {
                     FinishReason::Error
                 } else {
                     finish_reason
                 };
-                let terminal_token_trace = self.capture_sequence_terminal_token_trace(&seq);
+                let terminal_token_trace = self.capture_sequence_terminal_token_trace(seq);
                 let text = seq
                     .decoded_output_text(self.tokenizer.as_ref(), Some(finish_reason))
                     .unwrap_or_default();
@@ -806,7 +862,6 @@ impl EngineInner {
                     execution_evidence,
                 };
 
-                let mut completion_resources = seq.take_completion_resources();
                 // The same outer lock excludes a recompute drain until this
                 // exact incarnation and its slot have reached the registry.
                 let scheduler_completion = if expected_admission.is_none() {
@@ -822,6 +877,10 @@ impl EngineInner {
                     response.finish_reason = FinishReason::Error;
                     response.api_response = None;
                 }
+                if seq.execution_frontier.is_none() && expected_admission.is_none() {
+                    self.model_executor.cancel_prefill_admission(request_id);
+                }
+                let mut completion_resources = seq.take_completion_resources();
                 let token_close = completion_resources
                     .execution_frontier
                     .take()
@@ -850,17 +909,23 @@ impl EngineInner {
                             ),
                         }
                     });
+                // Non-materialized requests own no executor sequence; their
+                // product slot can close synchronously before any await.
+                if let Some(slot) = completion_resources.request_slot.take() {
+                    slot.close(self);
+                }
+                let senders = (seq.stream_sender.take(), seq.response_sender.take());
+                removed.sequence.take();
                 (
                     response,
-                    seq.stream_sender.take(),
-                    seq.response_sender.take(),
-                    completion_resources,
+                    senders.0,
+                    senders.1,
                     terminal_error,
                     terminal_token_trace,
                     token_close,
                 )
             } else {
-                return Ok(());
+                return None;
             }
         };
         // This error is already final for the client, independently of the
@@ -884,6 +949,72 @@ impl EngineInner {
                 }
             }
         }
+        Some(CompletionHandoff {
+            response,
+            stream_sender,
+            response_sender,
+            terminal_error,
+            completion_error,
+            terminal_token_trace,
+            token_close,
+        })
+    }
+
+    /// All original outer owners and known errors are handed off synchronously
+    /// before shutdown waits for any executor's close result.
+    pub(in crate::continuous_engine) fn handoff_shutdown_requests(&self) -> Vec<FerrumError> {
+        // These are optional source-checkpoint/capture pins, not restored
+        // target publications. Relinquish all coordination (including stale
+        // entries without an outer request) before waiting for physical close.
+        self.release_pending_prefix_restores_for_capacity_pressure();
+        let cohorts = std::mem::take(&mut *self.prefix_rendezvous.lock());
+        drop(cohorts);
+        let request_ids: Vec<_> = self.sequences.read().keys().cloned().collect();
+        let mut errors = Vec::new();
+        for request_id in request_ids {
+            self.discard_pending_prefix_restore(&request_id);
+            if let Some(handoff) = self.handoff_request_completion(
+                &request_id,
+                FinishReason::Error,
+                Some(FerrumError::scheduler(
+                    "engine shut down before request completion",
+                )),
+                None,
+                None,
+            ) {
+                self.write_sequence_terminal_token_trace(
+                    &request_id,
+                    "completed",
+                    Some(handoff.response.finish_reason),
+                    handoff.terminal_token_trace.as_ref(),
+                );
+                if let Some(error) = handoff.completion_error {
+                    errors.push(error);
+                }
+                if let Some(Err(error)) = handoff.token_close {
+                    errors.push(error);
+                }
+                // The ticket is observation only. Registry tasks retain all
+                // actual owners; shutdown joins them after the entire handoff.
+            }
+        }
+        errors
+    }
+
+    async fn finish_request_completion(
+        &self,
+        request_id: &RequestId,
+        handoff: CompletionHandoff,
+    ) -> Result<()> {
+        let CompletionHandoff {
+            mut response,
+            stream_sender,
+            response_sender,
+            mut terminal_error,
+            mut completion_error,
+            terminal_token_trace,
+            token_close,
+        } = handoff;
         // Physical closure may remain held after logical completion. Awaiting
         // the initial result cannot cancel the registry's independent owner.
         if let Some(ticket) = token_close {
@@ -898,13 +1029,6 @@ impl EngineInner {
                 completion_error.get_or_insert(error);
                 response.finish_reason = FinishReason::Error;
                 response.api_response = None;
-            }
-        } else {
-            if expected_admission.is_none() {
-                self.model_executor.cancel_prefill_admission(request_id);
-            }
-            if let Some(request_slot) = completion_resources.request_slot {
-                request_slot.close(self);
             }
         }
         self.write_sequence_terminal_token_trace(

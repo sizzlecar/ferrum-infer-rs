@@ -79,12 +79,13 @@ impl DecoderOnlyLLM for ObservedModel {
     }
 }
 
-struct CloseGate {
+pub(super) struct CloseGate {
     inner: Arc<dyn ModelExecutor>,
     gate: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
     started: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
     publication_error: bool,
     fail_confirmation: AtomicBool,
+    pub(super) fail_cancellation: AtomicBool,
     finishes: AtomicUsize,
     cancels: AtomicUsize,
 }
@@ -136,23 +137,28 @@ impl ModelExecutor for CloseGate {
     }
     fn cancel_tokens(&self, sequence: &ExecutorSequence) -> Result<ExecutionCloseOutcome> {
         self.cancels.fetch_add(1, Ordering::SeqCst);
+        if self.fail_cancellation.load(Ordering::SeqCst) {
+            return Err(FerrumError::backend(
+                "injected cancellation without terminal proof",
+            ));
+        }
         self.inner.cancel_tokens(sequence)
     }
 }
 
-struct Fixture {
-    engine: ContinuousBatchEngine,
-    executor: Arc<CloseGate>,
-    model: Arc<Mutex<ModelObservation>>,
-    identity: ExecutorSequence,
-    request_id: RequestId,
-    response: tokio::sync::oneshot::Receiver<Result<InferenceResponse>>,
-    stream: tokio::sync::mpsc::Receiver<Result<StreamChunk>>,
-    started: tokio::sync::oneshot::Receiver<()>,
-    gate: Option<tokio::sync::oneshot::Sender<()>>,
-    trace: tempfile::TempDir,
-    prompt_len: usize,
-    layers: usize,
+pub(super) struct Fixture {
+    pub(super) engine: ContinuousBatchEngine,
+    pub(super) executor: Arc<CloseGate>,
+    pub(super) model: Arc<Mutex<ModelObservation>>,
+    pub(super) identity: ExecutorSequence,
+    pub(super) request_id: RequestId,
+    pub(super) response: tokio::sync::oneshot::Receiver<Result<InferenceResponse>>,
+    pub(super) stream: tokio::sync::mpsc::Receiver<Result<StreamChunk>>,
+    pub(super) started: tokio::sync::oneshot::Receiver<()>,
+    pub(super) gate: Option<tokio::sync::oneshot::Sender<()>>,
+    pub(super) trace: tempfile::TempDir,
+    pub(super) prompt_len: usize,
+    pub(super) layers: usize,
 }
 
 pub(super) fn observed_cpu_model() -> (
@@ -177,7 +183,7 @@ pub(super) fn observed_cpu_model() -> (
     (inner, model, cfg)
 }
 
-async fn fixture(delayed: bool, publication_error: bool) -> Fixture {
+pub(super) async fn fixture(delayed: bool, publication_error: bool) -> Fixture {
     let (inner, model, cfg) = observed_cpu_model();
     let (gate, receiver) = tokio::sync::oneshot::channel();
     let (started_sender, started) = tokio::sync::oneshot::channel();
@@ -187,6 +193,7 @@ async fn fixture(delayed: bool, publication_error: bool) -> Fixture {
         started: Mutex::new(Some(started_sender)),
         publication_error,
         fail_confirmation: AtomicBool::new(false),
+        fail_cancellation: AtomicBool::new(false),
         finishes: AtomicUsize::new(0),
         cancels: AtomicUsize::new(0),
     });
@@ -318,7 +325,7 @@ async fn fixture(delayed: bool, publication_error: bool) -> Fixture {
     }
 }
 
-fn slot_events(fixture: &Fixture, action: ResourceAction) -> usize {
+pub(super) fn slot_events(fixture: &Fixture, action: ResourceAction) -> usize {
     fixture
         .engine
         .inner
@@ -336,7 +343,7 @@ fn slot_events(fixture: &Fixture, action: ResourceAction) -> usize {
         .count()
 }
 
-async fn assert_closed_once(fixture: &Fixture) {
+pub(super) async fn assert_closed_once(fixture: &Fixture) {
     fixture.engine.inner.execution_closes.join_observers().await;
     fixture.engine.inner.drain_execution_closes().unwrap();
     assert_eq!(fixture.engine.inner.execution_closes.unreclaimed_count(), 0);
