@@ -16,7 +16,7 @@ struct Fixture {
     model: Arc<Mutex<ModelObservation>>,
     identity: ExecutorSequence,
     request_id: RequestId,
-    response: tokio::sync::oneshot::Receiver<Result<InferenceResponse>>,
+    response: tokio::sync::oneshot::Receiver<Result<InferenceOutput>>,
     stream: OutputReceiver,
     trace: tempfile::TempDir,
     layers: usize,

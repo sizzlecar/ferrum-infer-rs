@@ -472,6 +472,12 @@ pub struct HuggingFaceTokenizerFactory;
 #[async_trait]
 impl ComponentFactory<Arc<dyn Tokenizer + Send + Sync>> for HuggingFaceTokenizerFactory {
     async fn create(&self, config: &ComponentConfig) -> Result<Arc<dyn Tokenizer + Send + Sync>> {
+        config
+            .engine_config
+            .model
+            .tokenizer
+            .decode_cache
+            .validate()?;
         if let Some(sources) = config.model_sources.as_ref() {
             let tokenizer =
                 ferrum_tokenizer::implementations::HuggingFaceTokenizer::from_source_bytes(
@@ -479,7 +485,10 @@ impl ComponentFactory<Arc<dyn Tokenizer + Send + Sync>> for HuggingFaceTokenizer
                     sources.tokenizer_config_json(),
                     sources.generation_config_json(),
                 )
-                .await?;
+                .await?
+                .with_decode_cache_config(
+                    config.engine_config.model.tokenizer.decode_cache.clone(),
+                )?;
             info!(
                 tokenizer_root = %sources.tokenizer_root().display(),
                 "Loaded HuggingFace tokenizer from typed product sources"
@@ -521,6 +530,9 @@ impl ComponentFactory<Arc<dyn Tokenizer + Send + Sync>> for HuggingFaceTokenizer
                 .await
                 {
                     Ok(tokenizer) => {
+                        let tokenizer = tokenizer.with_decode_cache_config(
+                            config.engine_config.model.tokenizer.decode_cache.clone(),
+                        )?;
                         info!("HuggingFace tokenizer loaded successfully");
                         return Ok(Arc::new(tokenizer));
                     }

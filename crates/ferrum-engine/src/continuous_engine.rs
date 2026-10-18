@@ -30,7 +30,10 @@ use ferrum_interfaces::{
     KvCacheManager, RecurrentStateManager, Sampler, SchedulerInterface as Scheduler, TensorFactory,
     Tokenizer,
 };
-use ferrum_output::{InferenceStream, OutputBudget, OutputChunk};
+use ferrum_output::{
+    semantic_cost, InferenceOutput, InferenceStream, OutputBudget, OutputChunk,
+    OutputSemanticLease, OutputSession,
+};
 use ferrum_runtime::{
     AdmissionDeferred, AdmissionRejected, BoundDeviceSubmissionAttribution,
     BoundExecutionResourceMaintenance, CapacityAvailabilityEpoch, DeferredAction,
@@ -2440,9 +2443,10 @@ impl LlmInferenceEngine for ContinuousBatchEngine {
         )
     }
 
-    async fn infer(&self, mut request: InferenceRequest) -> Result<InferenceResponse> {
+    async fn infer(&self, mut request: InferenceRequest) -> Result<InferenceOutput> {
         self.adapter_execution_support()
             .validate_metadata(&request.metadata)?;
+        let session = self.inner.output_budget.try_open_session()?;
         let infer_start = Instant::now();
         counter!("ferrum.engine.requests_total").increment(1);
 
@@ -2484,6 +2488,7 @@ impl LlmInferenceEngine for ContinuousBatchEngine {
                 Some(self.inner.tokenizer.clone()),
                 Some(self.inner.model_executor.info().vocab_size),
                 structured_factory.as_deref(),
+                session.clone(),
             )?;
         seq_state.response_sender = Some(resp_tx);
         self.publish_request(request, seq_state).await?;
@@ -2501,7 +2506,8 @@ impl LlmInferenceEngine for ContinuousBatchEngine {
 
         if let Ok(ref resp) = result {
             counter!("ferrum.engine.requests_completed").increment(1);
-            counter!("ferrum.engine.tokens_generated_total").increment(resp.tokens.len() as u64);
+            counter!("ferrum.engine.tokens_generated_total")
+                .increment(resp.response().tokens.len() as u64);
             // NOTE: real TTFT lives in `send_stream_update` —
             // emitted as `ferrum.engine.ttft_seconds`. The sync `infer`
             // path returns the whole response at once, so there's no
@@ -2559,6 +2565,7 @@ impl LlmInferenceEngine for ContinuousBatchEngine {
                 Some(self.inner.tokenizer.clone()),
                 Some(self.inner.model_executor.info().vocab_size),
                 structured_factory.as_deref(),
+                session.clone(),
             )?;
         seq_state.stream_sender = Some(tx);
         self.publish_request(request, seq_state).await?;

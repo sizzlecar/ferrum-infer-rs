@@ -6,18 +6,30 @@ use clap::{Args, ValueEnum};
 use colored::*;
 use console::{measure_text_width, Key, Term};
 use ferrum_models::source::{ModelFormat, ResolvedModelSource};
+use ferrum_output::{semantic_cost, OutputSemanticLease};
 use ferrum_server::chat_template::{ChatTemplateOptions, ModelChatTemplate, PromptMessage};
+use ferrum_types::TokenId;
 use ferrum_types::{
     has_unclosed_model_reasoning_block, model_reasoning_markers,
     parse_harmony_response_for_finish_reason, parse_model_reasoning_response,
     should_defer_model_reasoning_stream_delta, FerrumError, FinishReason, InferenceRequest,
-    InferenceResponse, ModelCapabilities, ModelOutputProtocol, ParsedReasoningResponse, Priority,
-    RequestId, ResolvedFerrumConfig, ResponseCompletionBoundary, Result, RuntimeConfigEntry,
+    ModelCapabilities, ModelOutputProtocol, ParsedReasoningResponse, Priority, RequestId,
+    ResolvedFerrumConfig, ResponseCompletionBoundary, Result, RuntimeConfigEntry,
     RuntimeConfigSnapshot, RuntimeConfigSource, SamplingParams, TokenUsage, WorkloadProfile,
     DEFAULT_CHAT_REPETITION_PENALTY, THINK_START_TAG,
 };
 use futures::StreamExt;
+
+mod jsonl;
+mod semantic;
+#[cfg(test)]
+mod semantic_tests;
 use indicatif::{ProgressBar, ProgressStyle};
+use jsonl::{jsonl_assistant_delta_record, jsonl_assistant_record};
+use semantic::{
+    resize_field, stream_reservation, CollectedRunGeneration, RetainedRunProjection,
+    RunGenerationView, RunHistoryMessage, StreamGenerationData,
+};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::io::{self, BufRead, IsTerminal, Write};
@@ -31,45 +43,10 @@ use uuid::Uuid;
 #[cfg(test)]
 use crate::source_resolver::tokenizer_sibling_repo;
 #[cfg(test)]
-use ferrum_types::{has_unclosed_thinking_block, StreamChunk, THINK_END_TAG};
+use ferrum_types::{has_unclosed_thinking_block, InferenceResponse, StreamChunk, THINK_END_TAG};
 
 const RUN_INITIAL_FORBIDDEN_TOKEN_TEXTS_METADATA_KEY: &str = "ferrum_initial_forbidden_token_texts";
 const RUN_JSONL_SCHEMA_VERSION: u32 = 2;
-
-/// Keep the raw history evidence separate from the model template's messages.
-#[derive(Clone, Debug)]
-struct RunHistoryMessage {
-    prompt: PromptMessage,
-    raw_content: String,
-}
-
-impl RunHistoryMessage {
-    fn new(role: &str, content: &str) -> Self {
-        Self {
-            prompt: PromptMessage::new(role, content),
-            raw_content: content.to_string(),
-        }
-    }
-
-    fn assistant(
-        raw_content: &str,
-        protocol: ModelOutputProtocol,
-        parsed: &ParsedReasoningResponse,
-    ) -> Self {
-        let mut message = Self::new("assistant", raw_content);
-        match protocol {
-            // Text templates own their policy for inline <think> history.
-            ModelOutputProtocol::Text => {}
-            // Reuse the validated result, including valid user/length truncation.
-            // Native channel envelopes are not an assistant message's content.
-            ModelOutputProtocol::HarmonyGptOss | ModelOutputProtocol::GemmaThought => {
-                message.prompt.content = parsed.content.clone();
-                message.prompt.reasoning_content = parsed.reasoning.clone();
-            }
-        }
-        message
-    }
-}
 
 /// Output format for `ferrum run`. JSONL mode emits one record per event
 /// (assistant generation result, user input, exit) on stdout — used by
@@ -156,29 +133,6 @@ fn emit_jsonl_assistant_delta(
     ));
 }
 
-fn jsonl_assistant_delta_record(
-    session_id: &str,
-    history_epoch: usize,
-    request_id: &str,
-    turn: usize,
-    index: usize,
-    raw_text_delta: &str,
-    token_id: Option<u32>,
-) -> serde_json::Value {
-    serde_json::json!({
-        "schema_version": RUN_JSONL_SCHEMA_VERSION,
-        "event": "assistant_delta",
-        "session_id": session_id,
-        "history_epoch": history_epoch,
-        "request_id": request_id,
-        "turn": turn,
-        "index": index,
-        "raw_text_delta": raw_text_delta,
-        "utf8_bytes": raw_text_delta.len(),
-        "token_id": token_id,
-    })
-}
-
 fn emit_jsonl_assistant(
     session_id: &str,
     history_epoch: usize,
@@ -211,40 +165,6 @@ fn emit_jsonl_assistant(
     ));
 }
 
-fn jsonl_assistant_record(
-    session_id: &str,
-    history_epoch: usize,
-    request_id: &str,
-    turn: usize,
-    content: &str,
-    reasoning: Option<&str>,
-    history: &[RunHistoryMessage],
-    finish_reason: Option<FinishReason>,
-    usage: Option<&TokenUsage>,
-    n_tokens: usize,
-    chunk_count: usize,
-    raw_text: &str,
-    ms: f64,
-) -> serde_json::Value {
-    serde_json::json!({
-        "schema_version": RUN_JSONL_SCHEMA_VERSION,
-        "event": "assistant",
-        "session_id": session_id,
-        "history_epoch": history_epoch,
-        "request_id": request_id,
-        "turn": turn,
-        "content": content,
-        "reasoning": reasoning,
-        "history_before": history_evidence(history),
-        "finish_reason": finish_reason.map(finish_reason_str),
-        "usage": usage,
-        "n_tokens": n_tokens,
-        "chunk_count": chunk_count,
-        "raw_text_sha256": sha256_text(raw_text),
-        "ms": ms,
-    })
-}
-
 fn emit_jsonl_exit(session_id: &str, history_epoch: usize, reason: &str) {
     let record = serde_json::json!({
         "schema_version": RUN_JSONL_SCHEMA_VERSION,
@@ -256,9 +176,11 @@ fn emit_jsonl_exit(session_id: &str, history_epoch: usize, reason: &str) {
     emit_jsonl_record(&record);
 }
 
-fn emit_jsonl_record(record: &serde_json::Value) {
-    println!("{record}");
-    io::stdout().flush().ok();
+fn emit_jsonl_record(record: &impl serde::Serialize) {
+    let mut stdout = io::stdout().lock();
+    serde_json::to_writer(&mut stdout, record).expect("run JSONL serialization failed");
+    writeln!(stdout).expect("run JSONL write failed");
+    stdout.flush().ok();
 }
 
 fn sha256_text(value: &str) -> String {
@@ -266,15 +188,10 @@ fn sha256_text(value: &str) -> String {
 }
 
 fn history_evidence(history: &[RunHistoryMessage]) -> serde_json::Value {
-    let raw_history: Vec<_> = history
-        .iter()
-        .map(|message| (&message.prompt.role, &message.raw_content))
-        .collect();
-    let encoded = serde_json::to_vec(&raw_history).expect("run history serialization cannot fail");
     serde_json::json!({
         "message_count": history.len(),
         "turn_count": count_user_turns(history),
-        "sha256": format!("{:x}", Sha256::digest(encoded)),
+        "sha256": jsonl::hash_history(history),
     })
 }
 
@@ -412,8 +329,8 @@ impl RunBudget {
     }
 }
 
-fn display_response_text(text: &str) -> String {
-    text.trim().to_string()
+fn display_response_text(text: &str) -> &str {
+    text.trim()
 }
 
 fn parse_run_model_output(
@@ -441,37 +358,6 @@ fn parse_run_model_output(
     }
 }
 
-struct CollectedRunGeneration {
-    request_id: String,
-    raw_text: String,
-    finish_reason: Option<FinishReason>,
-    usage: Option<TokenUsage>,
-    token_count: usize,
-    token_ids: Vec<u32>,
-    chunk_count: usize,
-    execution_evidence: Option<ferrum_types::InferenceExecutionEvidence>,
-}
-
-impl CollectedRunGeneration {
-    fn from_response(response: InferenceResponse) -> Result<Self> {
-        require_run_terminal_reason(Some(response.finish_reason))?;
-        Ok(Self {
-            request_id: response.request_id.to_string(),
-            raw_text: response.text,
-            finish_reason: Some(response.finish_reason),
-            usage: Some(response.usage),
-            token_count: response.tokens.len(),
-            token_ids: response
-                .tokens
-                .into_iter()
-                .map(|token| token.get())
-                .collect(),
-            chunk_count: 1,
-            execution_evidence: response.execution_evidence,
-        })
-    }
-}
-
 fn require_run_terminal_reason(reason: Option<FinishReason>) -> Result<()> {
     match reason {
         Some(FinishReason::Error) => Err(FerrumError::model(
@@ -490,6 +376,7 @@ struct RunStreamOutput {
     protocol: ModelOutputProtocol,
     prompt_opened_thinking: bool,
     emitted_content: String,
+    semantic: Option<OutputSemanticLease>,
 }
 
 impl RunStreamOutput {
@@ -498,12 +385,18 @@ impl RunStreamOutput {
             protocol,
             prompt_opened_thinking,
             emitted_content: String::new(),
+            semantic: None,
         }
     }
 
-    fn delta(&mut self, raw_text: &str, raw_delta: &str) -> Result<Option<String>> {
+    fn bind_session(mut self, session: &ferrum_output::OutputSession) -> Result<Self> {
+        self.semantic = Some(session.try_reserve_semantic(0)?);
+        Ok(self)
+    }
+
+    fn delta<'a>(&'a mut self, raw_text: &str, raw_delta: &'a str) -> Result<Option<&'a str>> {
         match self.protocol {
-            ModelOutputProtocol::Text => Ok(Some(raw_delta.to_string())),
+            ModelOutputProtocol::Text => Ok(Some(raw_delta)),
             ModelOutputProtocol::HarmonyGptOss => Ok(None),
             ModelOutputProtocol::GemmaThought => {
                 if should_defer_model_reasoning_stream_delta(self.protocol, raw_text) {
@@ -514,7 +407,7 @@ impl RunStreamOutput {
         }
     }
 
-    fn finish(&mut self, raw_text: &str) -> Result<Option<String>> {
+    fn finish(&mut self, raw_text: &str) -> Result<Option<&str>> {
         match self.protocol {
             // Ordinary text has already streamed; Harmony is validated and
             // displayed as a complete message by the caller.
@@ -525,19 +418,27 @@ impl RunStreamOutput {
         }
     }
 
-    fn parsed_content_delta(&mut self, raw_text: &str) -> Result<Option<String>> {
+    fn parsed_content_delta(&mut self, raw_text: &str) -> Result<Option<&str>> {
         let parsed =
             parse_model_reasoning_response(self.protocol, raw_text, self.prompt_opened_thinking)?;
-        let delta = parsed
-            .content
-            .strip_prefix(&self.emitted_content)
-            .ok_or_else(|| {
-                FerrumError::invalid_format(
-                    "model reasoning parsing changed previously emitted content",
-                )
-            })?
-            .to_string();
+        let previous_len = self.emitted_content.len();
+        if !parsed.content.starts_with(&self.emitted_content) {
+            return Err(FerrumError::invalid_format(
+                "model reasoning parsing changed previously emitted content",
+            ));
+        }
+        let lease = self
+            .semantic
+            .as_mut()
+            .ok_or_else(|| FerrumError::internal("run stream output has no output session"))?;
+        // The old prefix remains allocated until assignment; reserve the new
+        // retained value before replacing it. Parser-local scratch is separate.
+        let next = lease
+            .output_session()
+            .try_reserve_semantic(parsed.content.len())?;
         self.emitted_content = parsed.content;
+        *lease = next;
+        let delta = &self.emitted_content[previous_len..];
         Ok((!delta.is_empty()).then_some(delta))
     }
 }
@@ -551,6 +452,12 @@ async fn collect_run_stream(
     history_epoch: usize,
     expected_request_id: &str,
 ) -> Result<CollectedRunGeneration> {
+    let session = stream.output_session().clone();
+    let expected_id = RequestId(
+        Uuid::parse_str(expected_request_id)
+            .map_err(|error| FerrumError::internal(error.to_string()))?,
+    );
+    let mut semantic = stream_reservation(&session, &expected_id)?;
     let mut request_id = None;
     let mut raw_text = String::new();
     let mut finish_reason = None;
@@ -568,9 +475,10 @@ async fn collect_run_stream(
                 "run stream request id drift: expected {expected_request_id}, got {chunk_request_id}"
             )));
         }
-        request_id.get_or_insert_with(|| chunk_request_id.clone());
+        request_id.get_or_insert_with(|| chunk.request_id.clone());
         let token_id = chunk.token.map(|token| token.get());
         if !chunk.text.is_empty() {
+            semantic.try_grow(chunk.text.len())?;
             raw_text.push_str(&chunk.text);
             // JSONL raw_text_delta is an evidence field: concatenation must
             // match raw_text_sha256, including native channel framing. The
@@ -595,27 +503,32 @@ async fn collect_run_stream(
                     token_id, chunk.text
                 );
             }
-            token_ids.push(token_id);
+            semantic.try_grow(4)?;
+            token_ids.push(TokenId::new(token_id));
             token_count += 1;
         }
         if let Some(usage) = chunk.usage.as_ref() {
             token_count = usage.completion_tokens;
+            resize_field(&mut semantic, &latest_usage.as_ref(), &Some(usage))?;
             latest_usage = Some(usage.clone());
         }
         if chunk.finish_reason.is_some() {
+            resize_field(&mut semantic, &finish_reason, &chunk.finish_reason)?;
             finish_reason = chunk.finish_reason;
         }
         if let Some(evidence) = chunk.execution_evidence.as_ref() {
-            if execution_evidence.replace(evidence.clone()).is_some() {
+            if execution_evidence.is_some() {
                 return Err(FerrumError::internal(
                     "run stream emitted engine execution evidence more than once",
                 ));
             }
+            semantic.try_grow(semantic_cost(evidence)?)?;
+            execution_evidence = Some(evidence.clone());
         }
     }
     require_run_terminal_reason(finish_reason)?;
-    Ok(CollectedRunGeneration {
-        request_id: request_id.unwrap_or_else(|| expected_request_id.to_string()),
+    let data = StreamGenerationData {
+        request_id: request_id.unwrap_or(expected_id),
         raw_text,
         finish_reason,
         usage: latest_usage,
@@ -623,7 +536,9 @@ async fn collect_run_stream(
         token_ids,
         chunk_count,
         execution_evidence,
-    })
+    };
+    semantic.try_resize(semantic_cost(&data)?)?;
+    Ok(CollectedRunGeneration::Stream { data, semantic })
 }
 
 async fn collect_run_text_stream(
@@ -635,7 +550,11 @@ async fn collect_run_text_stream(
     stdin_is_tty: bool,
     capture_token_ids: bool,
 ) -> Result<CollectedRunGeneration> {
-    let mut first_token_indicator = start_first_token_indicator(stdin_is_tty);
+    let session = stream.output_session().clone();
+    let mut semantic = stream_reservation(&session, expected_request_id)?;
+    output = output.bind_session(&session)?;
+    let mut indicator = FirstTokenIndicator(start_first_token_indicator(stdin_is_tty));
+    let first_token_indicator = &mut indicator.0;
     let mut request_id = None;
     let mut raw_text = String::new();
     let mut finish_reason = None;
@@ -648,13 +567,13 @@ async fn collect_run_text_stream(
         let output_chunk = match chunk {
             Ok(chunk) => chunk,
             Err(error) => {
-                clear_first_token_indicator(&mut first_token_indicator);
+                clear_first_token_indicator(first_token_indicator);
                 return Err(error);
             }
         };
         let chunk = output_chunk.chunk();
         if &chunk.request_id != expected_request_id {
-            clear_first_token_indicator(&mut first_token_indicator);
+            clear_first_token_indicator(first_token_indicator);
             return Err(FerrumError::internal(format!(
                 "run stream request id drift: expected {expected_request_id}, got {}",
                 chunk.request_id
@@ -665,7 +584,7 @@ async fn collect_run_text_stream(
         if first_token_indicator.is_some()
             && (!chunk.text.is_empty() || token_id.is_some() || chunk.finish_reason.is_some())
         {
-            clear_first_token_indicator(&mut first_token_indicator);
+            clear_first_token_indicator(first_token_indicator);
         }
         if trace_tokens {
             if let Some(token_id) = token_id {
@@ -676,9 +595,10 @@ async fn collect_run_text_stream(
             }
         }
         if !chunk.text.is_empty() {
+            semantic.try_grow(chunk.text.len())?;
             raw_text.push_str(&chunk.text);
             let delta = output.delta(&raw_text, &chunk.text).inspect_err(|_| {
-                clear_first_token_indicator(&mut first_token_indicator);
+                clear_first_token_indicator(first_token_indicator);
             })?;
             if let Some(delta) = delta {
                 print!("{delta}");
@@ -688,36 +608,39 @@ async fn collect_run_text_stream(
         }
         if let Some(token_id) = token_id {
             if capture_token_ids {
-                token_ids.push(token_id);
+                semantic.try_grow(4)?;
+                token_ids.push(TokenId::new(token_id));
             }
             token_count += 1;
         }
         if let Some(usage) = chunk.usage.as_ref() {
             token_count = usage.completion_tokens;
+            resize_field(&mut semantic, &latest_usage.as_ref(), &Some(usage))?;
             latest_usage = Some(usage.clone());
         }
         if chunk.finish_reason.is_some() {
+            resize_field(&mut semantic, &finish_reason, &chunk.finish_reason)?;
             finish_reason = chunk.finish_reason;
         }
         if let Some(evidence) = chunk.execution_evidence.as_ref() {
-            if execution_evidence.replace(evidence.clone()).is_some() {
-                clear_first_token_indicator(&mut first_token_indicator);
+            if execution_evidence.is_some() {
+                clear_first_token_indicator(first_token_indicator);
                 return Err(FerrumError::internal(
                     "run stream emitted engine execution evidence more than once",
                 ));
             }
+            semantic.try_grow(semantic_cost(evidence)?)?;
+            execution_evidence = Some(evidence.clone());
         }
     }
-    clear_first_token_indicator(&mut first_token_indicator);
+    clear_first_token_indicator(first_token_indicator);
     require_run_terminal_reason(finish_reason)?;
     if let Some(delta) = output.finish(&raw_text)? {
         print!("{delta}");
         io::stdout().flush().ok();
     }
-    Ok(CollectedRunGeneration {
-        request_id: request_id
-            .unwrap_or_else(|| expected_request_id.clone())
-            .to_string(),
+    let data = StreamGenerationData {
+        request_id: request_id.unwrap_or_else(|| expected_request_id.clone()),
         raw_text,
         finish_reason,
         usage: latest_usage,
@@ -725,7 +648,9 @@ async fn collect_run_text_stream(
         token_ids,
         chunk_count,
         execution_evidence,
-    })
+    };
+    semantic.try_resize(semantic_cost(&data)?)?;
+    Ok(CollectedRunGeneration::Stream { data, semantic })
 }
 
 #[derive(Args)]
@@ -1134,8 +1059,7 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
     let model_id = product_input.public_model_id.clone();
     let source = product_input.source;
     let mut engine_config = product_input.engine_config;
-    engine_config.output = config.output.clone();
-    engine_config.output.validate()?;
+    config.apply_output_and_tokenizer_config(&mut engine_config)?;
     engine_config.scheduler.slo = scheduler_slo;
     engine_config.numerical_execution =
         config.resolve_numerical_execution(cmd.numerical_profile.as_ref());
@@ -1548,7 +1472,7 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
             .then(|| memory_sampler.sample())
             .flatten();
         let memory = process_memory_observation_between(memory_before, memory_after.clone());
-        let CollectedRunGeneration {
+        let RunGenerationView {
             request_id: response_request_id,
             raw_text,
             finish_reason,
@@ -1557,19 +1481,23 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
             token_ids: output_token_ids,
             chunk_count,
             execution_evidence,
-        } = generation;
-        if response_request_id != request_id_text {
+        } = generation.view();
+        if response_request_id.to_string() != request_id_text {
             return Err(FerrumError::internal(format!(
                 "run response request id drift: expected {request_id_text}, got {response_request_id}"
             )));
         }
         let raw_response = display_response_text(&raw_text);
-        let parsed = parse_run_model_output(
-            model_output_protocol,
-            &raw_response,
-            prompt_opened_thinking,
-            finish_reason,
+        let projection = RetainedRunProjection::new(
+            generation.session(),
+            parse_run_model_output(
+                model_output_protocol,
+                &raw_response,
+                prompt_opened_thinking,
+                finish_reason,
+            )?,
         )?;
+        let parsed = &projection.parsed;
         let content = display_response_text(&parsed.content);
         let reasoning = parsed
             .reasoning
@@ -1614,7 +1542,7 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
                     reasoning,
                     &one_shot_history,
                     finish_reason,
-                    usage.as_ref(),
+                    usage,
                     tokens,
                     chunk_count,
                     &raw_response,
@@ -1917,7 +1845,7 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
                     .then(|| memory_sampler.sample())
                     .flatten();
                 let memory = process_memory_observation_between(memory_before, memory_after);
-                let CollectedRunGeneration {
+                let RunGenerationView {
                     request_id: response_request_id,
                     raw_text,
                     finish_reason,
@@ -1926,25 +1854,40 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
                     token_ids: output_token_ids,
                     chunk_count,
                     execution_evidence,
-                } = generation;
-                if response_request_id != request_id_text {
+                } = generation.view();
+                if response_request_id.to_string() != request_id_text {
                     return Err(FerrumError::internal(format!(
                         "run response request id drift: expected {request_id_text}, got {response_request_id}"
                     )));
                 }
                 let raw_response = display_response_text(&raw_text);
-                let parsed = parse_run_model_output(
-                    model_output_protocol,
-                    &raw_response,
-                    prompt_opened_thinking,
-                    finish_reason,
+                let projection = RetainedRunProjection::new(
+                    generation.session(),
+                    parse_run_model_output(
+                        model_output_protocol,
+                        &raw_response,
+                        prompt_opened_thinking,
+                        finish_reason,
+                    )?,
                 )?;
+                let parsed = &projection.parsed;
                 let clean_response = display_response_text(&parsed.content);
                 let reasoning = (format == OutputFormat::Jsonl)
                     .then_some(parsed.reasoning.as_deref())
                     .flatten()
-                    .map(|value| value.trim().to_string())
+                    .map(str::trim)
                     .filter(|value| !value.is_empty());
+
+                let assistant_history = if raw_response.is_empty() {
+                    None
+                } else {
+                    Some(RunHistoryMessage::assistant(
+                        generation.session(),
+                        raw_response,
+                        model_output_protocol,
+                        parsed,
+                    )?)
+                };
 
                 if format == OutputFormat::Text
                     && model_output_protocol == ModelOutputProtocol::HarmonyGptOss
@@ -1981,7 +1924,7 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
                             reasoning.as_deref(),
                             &history,
                             finish_reason,
-                            usage.as_ref(),
+                            usage,
                             token_count,
                             chunk_count,
                             &raw_response,
@@ -2007,7 +1950,7 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
                             finish_reason: finish_reason.map(finish_reason_str).map(str::to_string),
                             prompt_chars,
                             response_chars: raw_response.chars().count(),
-                            response_text: raw_response.clone(),
+                            response_text: raw_response,
                             execution_evidence,
                             memory,
                             memory_stages,
@@ -2023,12 +1966,8 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
 
                 // Add to history
                 history.push(RunHistoryMessage::new("user", input));
-                if !raw_response.is_empty() {
-                    history.push(RunHistoryMessage::assistant(
-                        &raw_response,
-                        model_output_protocol,
-                        &parsed,
-                    ));
+                if let Some(message) = assistant_history {
+                    history.push(message);
                 }
 
                 // Limit history
@@ -2282,6 +2221,13 @@ fn read_tty_input_line(term: &Term) -> io::Result<Option<String>> {
         }
     }
     Ok(Some(chars.into_iter().collect()))
+}
+
+struct FirstTokenIndicator(Option<ProgressBar>);
+impl Drop for FirstTokenIndicator {
+    fn drop(&mut self) {
+        clear_first_token_indicator(&mut self.0);
+    }
 }
 
 fn start_first_token_indicator(enabled: bool) -> Option<ProgressBar> {
@@ -2638,7 +2584,11 @@ fn build_chat_prompt(
     if let Some(sys) = system {
         messages.push(PromptMessage::new("system", sys));
     }
-    messages.extend(history.iter().map(|message| message.prompt.clone()));
+    let mut prompt_copy_leases = Vec::with_capacity(history.len());
+    for message in history {
+        prompt_copy_leases.push(message.reserve_prompt_copy()?);
+        messages.push(message.prompt.clone());
+    }
     messages.push(PromptMessage::new("user", user_input));
     ferrum_server::chat_template::render_prompt_messages_with_options(
         &messages,
@@ -2996,6 +2946,18 @@ pub fn apply_kv_dtype_override(
 
 #[cfg(test)]
 mod tests {
+    fn test_output_session() -> ferrum_output::OutputSession {
+        ferrum_output::OutputBudget::new(ferrum_types::OutputConfig::default())
+            .unwrap()
+            .try_open_session()
+            .unwrap()
+    }
+
+    fn retained_test_response(response: InferenceResponse) -> ferrum_output::InferenceOutput {
+        let session = test_output_session();
+        ferrum_output::InferenceOutput::new(response, session.try_reserve_semantic(0).unwrap())
+            .unwrap()
+    }
     use super::*;
     use ferrum_types::{RuntimeConfigSource, SequenceFitPolicy, TokenId};
 
@@ -4463,7 +4425,9 @@ mod tests {
                 .map(|(index, _)| index)
                 .chain(std::iter::once(raw.len()))
             {
-                let mut output = RunStreamOutput::new(ModelOutputProtocol::GemmaThought, opened);
+                let mut output = RunStreamOutput::new(ModelOutputProtocol::GemmaThought, opened)
+                    .bind_session(&test_output_session())
+                    .unwrap();
                 let mut cumulative = String::new();
                 let mut visible = String::new();
                 for chunk in [&raw[..split], &raw[split..]] {
@@ -4492,7 +4456,9 @@ mod tests {
 
     #[test]
     fn gemma_run_stream_delivers_plain_content_early_and_rejects_unknown_channels() {
-        let mut output = RunStreamOutput::new(ModelOutputProtocol::GemmaThought, false);
+        let mut output = RunStreamOutput::new(ModelOutputProtocol::GemmaThought, false)
+            .bind_session(&test_output_session())
+            .unwrap();
         assert_eq!(
             output.delta("Hello.", "Hello.").unwrap().as_deref(),
             Some("Hello.")
@@ -4530,6 +4496,7 @@ mod tests {
             "<think>why</think>answer",
             12.5,
         );
+        let record = serde_json::to_value(record).unwrap();
         assert_eq!(record["schema_version"], RUN_JSONL_SCHEMA_VERSION);
         assert_eq!(record["session_id"], "session-1");
         assert_eq!(record["history_epoch"], 2);
@@ -4572,13 +4539,20 @@ mod tests {
             raw,
             0.0,
         );
+        let record = serde_json::to_value(record).unwrap();
 
         assert_eq!(record["content"], r#"{"text":"<think>literal</think>"}"#);
         assert_eq!(record["reasoning"], "reason");
         assert_eq!(record["raw_text_sha256"], sha256_text(raw));
 
         // Text history remains raw; these parsed fields belong to JSONL output.
-        let history = RunHistoryMessage::assistant(raw, ModelOutputProtocol::Text, &parsed);
+        let history = RunHistoryMessage::assistant(
+            &test_output_session(),
+            raw,
+            ModelOutputProtocol::Text,
+            &parsed,
+        )
+        .unwrap();
         assert_eq!(history.prompt.content, raw);
         assert!(history.prompt.reasoning_content.is_none());
     }
@@ -4600,6 +4574,7 @@ mod tests {
     fn jsonl_v2_delta_preserves_utf8_bytes_and_request_binding() {
         let record =
             jsonl_assistant_delta_record("session-1", 3, "request-1", 4, 2, "🙂", Some(9271));
+        let record = serde_json::to_value(record).unwrap();
         assert_eq!(record["event"], "assistant_delta");
         assert_eq!(record["session_id"], "session-1");
         assert_eq!(record["history_epoch"], 3);
@@ -4646,7 +4621,9 @@ mod tests {
                 collect_run_text_stream(
                     stream,
                     false,
-                    RunStreamOutput::new(ModelOutputProtocol::HarmonyGptOss, false),
+                    RunStreamOutput::new(ModelOutputProtocol::HarmonyGptOss, false)
+                        .bind_session(&test_output_session())
+                        .unwrap(),
                     0,
                     &request_id,
                     false,
@@ -4658,12 +4635,12 @@ mod tests {
             }
             .expect("collect stream with a separately flushed tail");
 
-            assert_eq!(result.raw_text, "hello 尾");
-            assert_eq!(result.finish_reason, Some(FinishReason::Length));
-            assert_eq!(result.token_ids, vec![11]);
-            assert_eq!(result.token_count, 2, "final usage is authoritative");
-            assert_eq!(result.chunk_count, 2);
-            let usage = result.usage.expect("terminal usage");
+            assert_eq!(result.view().raw_text, "hello 尾");
+            assert_eq!(result.view().finish_reason, Some(FinishReason::Length));
+            assert_eq!(result.view().token_ids, &[TokenId::new(11)]);
+            assert_eq!(result.view().token_count, 2, "final usage is authoritative");
+            assert_eq!(result.view().chunk_count, 2);
+            let usage = result.view().usage.expect("terminal usage");
             assert_eq!(usage.prompt_tokens, 7);
             assert_eq!(usage.completion_tokens, 2);
         }
@@ -4701,7 +4678,9 @@ mod tests {
                     collect_run_text_stream(
                         stream,
                         false,
-                        RunStreamOutput::new(ModelOutputProtocol::Text, false),
+                        RunStreamOutput::new(ModelOutputProtocol::Text, false)
+                            .bind_session(&test_output_session())
+                            .unwrap(),
                         0,
                         &request_id,
                         false,
@@ -4746,11 +4725,15 @@ mod tests {
             api_response: None,
             execution_evidence: None,
         };
-        assert!(CollectedRunGeneration::from_response(response.clone()).is_err());
+        assert!(
+            CollectedRunGeneration::from_response(retained_test_response(response.clone()))
+                .is_err()
+        );
         response.finish_reason = FinishReason::Length;
-        let collected = CollectedRunGeneration::from_response(response).unwrap();
-        assert_eq!(collected.raw_text, "partial output before failure");
-        assert_eq!(collected.token_count, 1);
+        let collected =
+            CollectedRunGeneration::from_response(retained_test_response(response)).unwrap();
+        assert_eq!(collected.view().raw_text, "partial output before failure");
+        assert_eq!(collected.view().token_count, 1);
     }
 
     #[test]
@@ -5656,7 +5639,13 @@ mod tests {
                     .unwrap();
             let history = vec![
                 RunHistoryMessage::new("user", "17+25?"),
-                RunHistoryMessage::assistant(raw, template.output_protocol, &parsed),
+                RunHistoryMessage::assistant(
+                    &test_output_session(),
+                    raw,
+                    template.output_protocol,
+                    &parsed,
+                )
+                .unwrap(),
             ];
             let plan = build_run_prompt_plan(
                 &history,
@@ -5700,6 +5689,7 @@ mod tests {
                 raw,
                 1.0,
             );
+            let record = serde_json::to_value(record).unwrap();
             assert_eq!(record["content"], content);
             assert_eq!(record["raw_text_sha256"], sha256_text(raw));
             assert_eq!(record["finish_reason"], finish_reason_str(finish_reason));
@@ -5758,7 +5748,13 @@ mod tests {
             .unwrap();
             let history = vec![
                 RunHistoryMessage::new("user", "123+456?"),
-                RunHistoryMessage::assistant(raw, template.output_protocol, &parsed),
+                RunHistoryMessage::assistant(
+                    &test_output_session(),
+                    raw,
+                    template.output_protocol,
+                    &parsed,
+                )
+                .unwrap(),
             ];
             assert_eq!(history[1].prompt.content, content);
             assert_eq!(history[1].prompt.reasoning_content.as_deref(), reasoning);
@@ -5808,10 +5804,12 @@ mod tests {
             )
             .unwrap();
             let history = [RunHistoryMessage::assistant(
+                &test_output_session(),
                 raw,
                 ModelOutputProtocol::Text,
                 &parsed,
-            )];
+            )
+            .unwrap()];
             let prompt = build_chat_prompt(
                 &history,
                 "Continue.",

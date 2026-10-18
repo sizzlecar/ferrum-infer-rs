@@ -161,7 +161,7 @@ pub(super) struct Fixture {
     pub(super) model: Arc<Mutex<ModelObservation>>,
     pub(super) identity: ExecutorSequence,
     pub(super) request_id: RequestId,
-    pub(super) response: tokio::sync::oneshot::Receiver<Result<InferenceResponse>>,
+    pub(super) response: tokio::sync::oneshot::Receiver<Result<InferenceOutput>>,
     pub(super) stream: OutputReceiver,
     pub(super) started: tokio::sync::oneshot::Receiver<()>,
     pub(super) gate: Option<tokio::sync::oneshot::Sender<()>>,

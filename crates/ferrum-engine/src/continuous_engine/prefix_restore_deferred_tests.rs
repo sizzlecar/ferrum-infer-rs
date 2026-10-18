@@ -156,7 +156,7 @@ async fn submit(
     engine: &ContinuousBatchEngine,
     id: RequestId,
     tokens: &[u32],
-) -> tokio::sync::oneshot::Receiver<Result<InferenceResponse>> {
+) -> tokio::sync::oneshot::Receiver<Result<InferenceOutput>> {
     let mut request = policy_request();
     request.id = id.clone();
     request.sampling_params.max_tokens = 1;

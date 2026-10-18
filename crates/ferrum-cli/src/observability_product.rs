@@ -76,20 +76,20 @@ impl Deref for ProductObservabilityConfig {
     }
 }
 
-pub struct ActualRunObservation {
+pub struct ActualRunObservation<'a> {
     pub request_id: String,
     pub duration_us: u64,
     pub sampling_params: SamplingParams,
     pub prompt_token_ids: Option<Vec<u32>>,
     pub prompt_token_count: Option<usize>,
     pub output_tokens: usize,
-    pub output_token_ids: Vec<u32>,
+    pub output_token_ids: &'a [ferrum_types::TokenId],
     pub chunk_count: usize,
     pub finish_reason: Option<String>,
     pub prompt_chars: usize,
     pub response_chars: usize,
-    pub response_text: String,
-    pub execution_evidence: Option<ferrum_types::InferenceExecutionEvidence>,
+    pub response_text: &'a str,
+    pub execution_evidence: Option<&'a ferrum_types::InferenceExecutionEvidence>,
     pub memory: Option<crate::memory_profile::ProcessMemoryObservation>,
     pub memory_stages: Vec<ActualMemoryStageObservation>,
 }
@@ -262,13 +262,16 @@ pub fn write_synthetic_product_observability(
             &replay_command,
             ReplayBundleData {
                 request: request_dump(config, &request_id, &replay_command),
-                prompt_token_ids: Some(vec![101, 202, 303, 404]),
+                prompt_token_ids: Some(&[101, 202, 303, 404]),
                 prompt_token_count: Some(4),
                 prompt_token_unavailable_reason: None,
-                sampling_params: Some(SamplingParams::greedy()),
+                sampling_params: Some(&SamplingParams::greedy()),
                 backend: SYNTHETIC_BACKEND,
                 actual_model_smoke: false,
-                output_token_ids: Some(vec![909, 808]),
+                output_token_ids: Some(&[
+                    ferrum_types::TokenId::new(909),
+                    ferrum_types::TokenId::new(808),
+                ]),
                 output_text: Some("synthetic ok"),
                 finish_reason: Some("stop"),
                 failure_kind: None,
@@ -281,7 +284,7 @@ pub fn write_synthetic_product_observability(
 
 pub fn write_actual_run_observability(
     config: &ProductObservabilityConfig,
-    observation: &ActualRunObservation,
+    observation: &ActualRunObservation<'_>,
 ) -> Result<Vec<PathBuf>> {
     if !config.enabled() {
         return Ok(Vec::new());
@@ -372,7 +375,7 @@ pub fn append_actual_serve_memory_stage_observability(
 fn write_actual_run_artifacts(
     config: &ProductObservabilityConfig,
     events: &[FerrumProfileEvent],
-    observation: &ActualRunObservation,
+    observation: &ActualRunObservation<'_>,
     replay_command: &str,
 ) -> Result<Vec<PathBuf>> {
     // Successful actual inference must prove its scheduler lifecycle at the engine boundary.
@@ -392,15 +395,15 @@ fn write_actual_run_artifacts(
             replay_command,
             ReplayBundleData {
                 request: actual_request_dump(config, &observation.request_id, replay_command),
-                prompt_token_ids: observation.prompt_token_ids.clone(),
+                prompt_token_ids: observation.prompt_token_ids.as_deref(),
                 prompt_token_count: observation.prompt_token_count,
                 prompt_token_unavailable_reason: observation.prompt_token_ids.is_none().then_some(
                     "rendered prompt token ids were unavailable for run one-shot observability",
                 ),
-                sampling_params: Some(observation.sampling_params.clone()),
+                sampling_params: Some(&observation.sampling_params),
                 backend: "actual",
                 actual_model_smoke: true,
-                output_token_ids: Some(observation.output_token_ids.clone()),
+                output_token_ids: Some(observation.output_token_ids),
                 output_text: Some(&observation.response_text),
                 finish_reason: observation.finish_reason.as_deref(),
                 failure_kind: None,
@@ -427,15 +430,15 @@ fn write_actual_run_failure_artifacts(
             replay_command,
             ReplayBundleData {
                 request: actual_request_dump(config, &observation.request_id, replay_command),
-                prompt_token_ids: observation.prompt_token_ids.clone(),
+                prompt_token_ids: observation.prompt_token_ids.as_deref(),
                 prompt_token_count: observation.prompt_token_count,
                 prompt_token_unavailable_reason: observation.prompt_token_ids.is_none().then_some(
                     "rendered prompt token ids were unavailable for run failure observability",
                 ),
-                sampling_params: Some(observation.sampling_params.clone()),
+                sampling_params: Some(&observation.sampling_params),
                 backend: "actual",
                 actual_model_smoke: true,
-                output_token_ids: Some(Vec::new()),
+                output_token_ids: Some(&[]),
                 output_text: Some(""),
                 finish_reason: Some("error"),
                 failure_kind: Some(observation.failure_kind.as_str()),
@@ -487,7 +490,7 @@ fn write_actual_artifacts_with_scheduler(
                 sampling_params: None,
                 backend: "actual",
                 actual_model_smoke: true,
-                output_token_ids: Some(Vec::new()),
+                output_token_ids: Some(&[]),
                 output_text: None,
                 finish_reason: None,
                 failure_kind: None,
@@ -698,7 +701,7 @@ fn product_events(
 
 fn actual_run_events(
     config: &ProductObservabilityConfig,
-    observation: &ActualRunObservation,
+    observation: &ActualRunObservation<'_>,
     replay_command: &str,
 ) -> Vec<FerrumProfileEvent> {
     let base = Utc::now();
@@ -1408,13 +1411,13 @@ fn actual_attrs(config: &ProductObservabilityConfig) -> BTreeMap<String, Value> 
 
 struct ReplayBundleData<'a> {
     request: serde_json::Value,
-    prompt_token_ids: Option<Vec<u32>>,
+    prompt_token_ids: Option<&'a [u32]>,
     prompt_token_count: Option<usize>,
     prompt_token_unavailable_reason: Option<&'a str>,
-    sampling_params: Option<SamplingParams>,
+    sampling_params: Option<&'a SamplingParams>,
     backend: &'a str,
     actual_model_smoke: bool,
-    output_token_ids: Option<Vec<u32>>,
+    output_token_ids: Option<&'a [ferrum_types::TokenId]>,
     output_text: Option<&'a str>,
     finish_reason: Option<&'a str>,
     failure_kind: Option<&'a str>,
@@ -1442,18 +1445,47 @@ fn write_replay_bundle(
 
     let prompt_token_count = data
         .prompt_token_count
-        .or_else(|| data.prompt_token_ids.as_ref().map(Vec::len));
-    let output_token_count = data.output_token_ids.as_ref().map(Vec::len).unwrap_or(0);
-    let prompt_tokens = json!({
-        "schema_version": OBSERVABILITY_PROFILE_SCHEMA_VERSION,
-        "request_id": request_id,
-        "model": config.model,
-        "tokenizer_or_model": config.model,
-        "token_ids": data.prompt_token_ids,
-        "token_count": prompt_token_count,
-        "unavailable_reason": data.prompt_token_unavailable_reason,
-        "sanitized": true
-    });
+        .or_else(|| data.prompt_token_ids.map(<[u32]>::len));
+    let output_token_count = data
+        .output_token_ids
+        .map(<[ferrum_types::TokenId]>::len)
+        .unwrap_or(0);
+    #[derive(serde::Serialize)]
+    struct PromptTokens<'a> {
+        schema_version: u32,
+        request_id: &'a str,
+        model: &'a str,
+        tokenizer_or_model: &'a str,
+        token_ids: Option<&'a [u32]>,
+        token_count: Option<usize>,
+        unavailable_reason: Option<&'a str>,
+        sanitized: bool,
+    }
+    let prompt_tokens = PromptTokens {
+        schema_version: OBSERVABILITY_PROFILE_SCHEMA_VERSION,
+        request_id,
+        model: &config.model,
+        tokenizer_or_model: &config.model,
+        token_ids: data.prompt_token_ids,
+        token_count: prompt_token_count,
+        unavailable_reason: data.prompt_token_unavailable_reason,
+        sanitized: true,
+    };
+    #[derive(serde::Serialize)]
+    struct OutputTokens<'a> {
+        schema_version: u32,
+        request_id: &'a str,
+        token_ids: &'a [ferrum_types::TokenId],
+        token_count: usize,
+        finish_reason: Option<&'a str>,
+    }
+    let output_tokens = OutputTokens {
+        schema_version: OBSERVABILITY_PROFILE_SCHEMA_VERSION,
+        request_id,
+        token_ids: data.output_token_ids.unwrap_or_default(),
+        token_count: output_token_count,
+        finish_reason: data.finish_reason,
+    };
     let output_text = data.output_text.unwrap_or("");
     let sampling_unavailable_reason = if data.sampling_params.is_some() {
         Value::Null
@@ -1461,25 +1493,26 @@ fn write_replay_bundle(
         json!("sampling params unavailable for this replay bundle kind in WP9 L0")
     };
     let output_text_body = if data.actual_model_smoke && config.model != SYNTHETIC_MODEL {
-        format!(
+        std::borrow::Cow::Owned(format!(
             "[redacted actual output]\nsha256={}\nchars={}\n",
             sha256_hex(output_text.as_bytes()),
             output_text.chars().count()
-        )
+        ))
     } else {
-        format!("{output_text}\n")
+        std::borrow::Cow::Borrowed(output_text)
     };
-    let output_scan = bad_output_scan(
-        request_id,
-        output_text,
-        data.failure_kind,
-        output_text_body.as_bytes(),
-    );
+    let output_newline = !matches!(output_text_body, std::borrow::Cow::Owned(_));
+    let mut artifact_hash = Sha256::new();
+    artifact_hash.update(output_text_body.as_bytes());
+    if output_newline {
+        artifact_hash.update(b"\n");
+    }
+    let artifact_hash = format!("{:x}", artifact_hash.finalize());
+    let output_scan = bad_output_scan(request_id, output_text, data.failure_kind, &artifact_hash);
     let engine_replay_args = engine_replay_command_args(&bundle_dir);
     let engine_replay_command = replay_command_from_args(&engine_replay_args);
     let files = [
         ("request.json", data.request),
-        ("prompt_token_ids.json", prompt_tokens),
         (
             "sampling_params.json",
             json!({
@@ -1514,16 +1547,6 @@ fn write_replay_bundle(
                 "actual_model_smoke": data.actual_model_smoke
             }),
         ),
-        (
-            "output_token_ids.json",
-            json!({
-                "schema_version": OBSERVABILITY_PROFILE_SCHEMA_VERSION,
-                "request_id": request_id,
-                "token_ids": data.output_token_ids.unwrap_or_default(),
-                "token_count": output_token_count,
-                "finish_reason": data.finish_reason
-            }),
-        ),
         ("bad_output_scan.json", output_scan),
         (
             "replay.command.json",
@@ -1548,6 +1571,15 @@ fn write_replay_bundle(
         let path = bundle_dir.join(name);
         write_json(&path, &value)?;
         written.push(path);
+        if name == "request.json" {
+            let path = bundle_dir.join("prompt_token_ids.json");
+            write_json(&path, &prompt_tokens)?;
+            written.push(path);
+        } else if name == "backend_selection.json" {
+            let path = bundle_dir.join("output_token_ids.json");
+            write_json(&path, &output_tokens)?;
+            written.push(path);
+        }
     }
     if let Some(diagnostics) = data.failure_diagnostics {
         let path = bundle_dir.join("failure_diagnostics.json");
@@ -1555,7 +1587,14 @@ fn write_replay_bundle(
         written.push(path);
     }
     let output_text_path = bundle_dir.join("output_text.txt");
-    fs_write(&output_text_path, output_text_body)?;
+    let mut output_file =
+        fs::File::create(&output_text_path).map_err(|error| FerrumError::io(error.to_string()))?;
+    std::io::Write::write_all(&mut output_file, output_text_body.as_bytes())
+        .map_err(|error| FerrumError::io(error.to_string()))?;
+    if output_newline {
+        std::io::Write::write_all(&mut output_file, b"\n")
+            .map_err(|error| FerrumError::io(error.to_string()))?;
+    }
     written.push(output_text_path);
     Ok(written)
 }
@@ -1664,7 +1703,7 @@ fn bad_output_scan(
     request_id: &str,
     text: &str,
     failure_kind: Option<&str>,
-    output_artifact_bytes: &[u8],
+    output_artifact_sha256: &str,
 ) -> serde_json::Value {
     let mut reasons = Vec::new();
     let mut first_span: Option<serde_json::Value> = None;
@@ -1712,7 +1751,7 @@ fn bad_output_scan(
         "failure_kind": failure_kind,
         "output_chars": text.chars().count(),
         "classified_output_sha256": sha256_hex(text.as_bytes()),
-        "output_sha256": sha256_hex(output_artifact_bytes)
+        "output_sha256": output_artifact_sha256
     })
 }
 
@@ -1909,10 +1948,21 @@ fn write_profile_events(
         .map_err(|error| FerrumError::io(error.to_string()))
 }
 
-fn write_json(path: &Path, value: &serde_json::Value) -> Result<()> {
-    let body = serde_json::to_string_pretty(value)
-        .map_err(|err| FerrumError::serialization(format!("failed to serialize JSON: {err}")))?;
-    fs_write(path, format!("{body}\n"))
+fn write_json<T: serde::Serialize + ?Sized>(path: &Path, value: &T) -> Result<()> {
+    use std::io::Write;
+    if let Some(parent) = path.parent() {
+        fs_create_dir_all(parent)?;
+    }
+    let file = fs::File::create(path)
+        .map_err(|error| FerrumError::io(format!("failed to write {}: {error}", path.display())))?;
+    let mut writer = std::io::BufWriter::new(file);
+    serde_json::to_writer_pretty(&mut writer, value).map_err(|error| {
+        FerrumError::serialization(format!("failed to serialize JSON: {error}"))
+    })?;
+    writer
+        .write_all(b"\n")
+        .and_then(|()| writer.flush())
+        .map_err(|error| FerrumError::io(error.to_string()))
 }
 
 fn fs_create_dir_all(path: &Path) -> Result<()> {
@@ -2428,13 +2478,16 @@ mod tests {
                 prompt_token_ids: Some(vec![7, 8, 9]),
                 prompt_token_count: Some(3),
                 output_tokens: 2,
-                output_token_ids: vec![10, 11],
+                output_token_ids: &[
+                    ferrum_types::TokenId::new(10),
+                    ferrum_types::TokenId::new(11),
+                ],
                 chunk_count: 1,
                 finish_reason: Some("stop".to_string()),
                 prompt_chars: 12,
                 response_chars: 2,
-                response_text: "OK".to_string(),
-                execution_evidence: Some(ferrum_types::InferenceExecutionEvidence {
+                response_text: "OK",
+                execution_evidence: Some(&ferrum_types::InferenceExecutionEvidence {
                     prompt_token_ids: vec![
                         ferrum_types::TokenId::new(7),
                         ferrum_types::TokenId::new(8),

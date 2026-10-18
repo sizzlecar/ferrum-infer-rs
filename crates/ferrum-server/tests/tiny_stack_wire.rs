@@ -23,6 +23,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 struct StubLlm {
+    output_budget: ferrum_output::OutputBudget,
     config: EngineConfig,
 }
 
@@ -30,7 +31,10 @@ impl StubLlm {
     fn new() -> Self {
         let mut config = EngineConfig::default();
         config.model.model_id = ModelId::new("stub-model");
-        Self { config }
+        Self {
+            output_budget: ferrum_output::OutputBudget::new(config.output.clone()).unwrap(),
+            config,
+        }
     }
 }
 
@@ -76,19 +80,27 @@ impl InferenceEngine for StubLlm {
 
 #[async_trait]
 impl LlmInferenceEngine for StubLlm {
-    async fn infer(&self, request: InferenceRequest) -> ferrum_types::Result<InferenceResponse> {
-        Ok(InferenceResponse {
-            request_id: request.id,
-            text: "ok".to_string(),
-            tokens: vec![TokenId::new(11)],
-            finish_reason: FinishReason::Stop,
-            usage: TokenUsage::new(7, 1),
-            latency_ms: 1,
-            created_at: chrono::Utc::now(),
-            metadata: HashMap::new(),
-            api_response: None,
-            execution_evidence: None,
-        })
+    async fn infer(
+        &self,
+        request: InferenceRequest,
+    ) -> ferrum_types::Result<ferrum_output::InferenceOutput> {
+        ferrum_output::InferenceOutput::new(
+            InferenceResponse {
+                request_id: request.id,
+                text: "ok".to_string(),
+                tokens: vec![TokenId::new(11)],
+                finish_reason: FinishReason::Stop,
+                usage: TokenUsage::new(7, 1),
+                latency_ms: 1,
+                created_at: chrono::Utc::now(),
+                metadata: HashMap::new(),
+                api_response: None,
+                execution_evidence: None,
+            },
+            self.output_budget
+                .try_open_session()?
+                .try_reserve_semantic(0)?,
+        )
     }
 
     async fn infer_stream(
@@ -106,8 +118,7 @@ impl LlmInferenceEngine for StubLlm {
             api_response: None,
             execution_evidence: None,
         };
-        let budget = ferrum_output::OutputBudget::new(ferrum_types::OutputConfig::default())?;
-        let session = budget.try_open_session()?;
+        let session = self.output_budget.try_open_session()?;
         let chunk = session.wrap_chunk(chunk).await?;
         Ok(ferrum_output::InferenceStream::new(
             session,

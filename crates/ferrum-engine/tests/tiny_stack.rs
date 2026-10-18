@@ -80,11 +80,11 @@ async fn observe_stream(prompt: &str, max_tokens: usize) -> Vec<u32> {
         .await
         .expect("observe run completes");
     assert_eq!(
-        resp.finish_reason,
+        resp.response().finish_reason,
         FinishReason::Length,
         "observe run must not early-stop"
     );
-    resp.tokens.iter().map(|t| t.get()).collect()
+    resp.response().tokens.iter().map(|t| t.get()).collect()
 }
 
 /// Five sequential turns whose prompt grows each round, simulating an
@@ -102,16 +102,16 @@ async fn tiny_stack_multi_turn_five_rounds() {
         let req = greedy_request(&history, 6);
         let resp = engine.infer(req).await.expect("turn must complete");
         assert!(
-            !resp.text.is_empty(),
+            !resp.response().text.is_empty(),
             "round {round}: response text must be non-empty"
         );
         assert_eq!(
-            resp.finish_reason,
+            resp.response().finish_reason,
             ferrum_types::FinishReason::Length,
             "round {round}: short max_tokens must stop by Length"
         );
         if round == 0 {
-            first_round_text = Some(resp.text.clone());
+            first_round_text = Some(resp.response().text.clone());
         }
         history.push_str(" more context turn ");
         history.push_str(&round.to_string());
@@ -124,7 +124,7 @@ async fn tiny_stack_multi_turn_five_rounds() {
         .await
         .expect("replay must complete");
     assert_eq!(
-        Some(replay.text),
+        Some(replay.response().text.clone()),
         first_round_text,
         "greedy decode must be deterministic across engine instances"
     );
@@ -146,12 +146,12 @@ async fn tiny_stack_eos_terminates() {
         .await
         .expect("observe run completes");
     assert_eq!(
-        observed.finish_reason,
+        observed.response().finish_reason,
         FinishReason::Length,
         "observe run must not early-stop; got {:?}",
-        observed.finish_reason
+        observed.response().finish_reason
     );
-    let ids: Vec<u32> = observed.tokens.iter().map(|t| t.get()).collect();
+    let ids: Vec<u32> = observed.response().tokens.iter().map(|t| t.get()).collect();
     assert!(ids.len() >= 4, "need >=4 tokens to pick an EOS: {ids:?}");
     // Pick a token the model actually emits, then compute where the engine
     // should stop = first occurrence of that token + 1. Robust whether the
@@ -167,11 +167,11 @@ async fn tiny_stack_eos_terminates() {
         .expect("eos run completes");
 
     assert_eq!(
-        resp.finish_reason,
+        resp.response().finish_reason,
         FinishReason::EOS,
         "must report model EOS"
     );
-    let out_ids: Vec<u32> = resp.tokens.iter().map(|t| t.get()).collect();
+    let out_ids: Vec<u32> = resp.response().tokens.iter().map(|t| t.get()).collect();
     assert_eq!(
         out_ids.last(),
         Some(&eos),
@@ -204,7 +204,7 @@ async fn tiny_stack_stop_sequence_composite_token() {
     let resp = engine.infer(req).await.expect("stop run completes");
 
     assert_eq!(
-        resp.finish_reason,
+        resp.response().finish_reason,
         FinishReason::Stop,
         "marker inside composite token must stop generation, not run to Length"
     );
@@ -254,8 +254,7 @@ async fn tiny_stack_concurrent_sessions_isolated() {
     let solo = engine
         .infer(greedy_request("anchor prompt", 6))
         .await
-        .expect("solo completes")
-        .text;
+        .expect("solo completes");
 
     let mut handles = Vec::new();
     for i in 0..4 {
@@ -275,12 +274,13 @@ async fn tiny_stack_concurrent_sessions_isolated() {
     }
 
     assert_eq!(
-        results[0].text, solo,
+        results[0].response().text,
+        solo.response().text,
         "anchor result must match whether run alone or amid concurrent load"
     );
     for r in &results {
         assert!(
-            !r.text.is_empty(),
+            !r.response().text.is_empty(),
             "every concurrent request produces output"
         );
     }
@@ -309,7 +309,7 @@ async fn tiny_stack_cancel_mid_stream() {
         .infer(greedy_request("after cancel", 5))
         .await
         .expect("engine still works after cancellation");
-    assert!(!after.text.is_empty());
+    assert!(!after.response().text.is_empty());
 }
 
 /// Repetition-runaway guard: a model that emits a near-constant token must
@@ -322,11 +322,11 @@ async fn tiny_stack_repetition_runaway_guard() {
         .infer(greedy_request("repeat repeat", budget))
         .await
         .expect("completes");
-    assert_eq!(resp.finish_reason, FinishReason::Length);
+    assert_eq!(resp.response().finish_reason, FinishReason::Length);
     assert!(
-        resp.tokens.len() <= budget,
+        resp.response().tokens.len() <= budget,
         "generated {} tokens, must not exceed budget {budget}",
-        resp.tokens.len()
+        resp.response().tokens.len()
     );
 }
 
@@ -360,7 +360,7 @@ async fn tiny_stack_kv_capacity_boundary() {
         .infer(greedy_request("recovered", 4))
         .await
         .expect("engine usable after capacity pressure");
-    assert!(!after.text.is_empty());
+    assert!(!after.response().text.is_empty());
 }
 
 /// Capability-fallback law (Gate A5, Llama path). The tiny model runs on
@@ -383,8 +383,8 @@ async fn tiny_stack_capability_fallback_law_cpu() {
         .infer(greedy_request("fallback path", 6))
         .await
         .expect("all-capabilities-off backend must complete via fallback code");
-    assert_eq!(resp.finish_reason, FinishReason::Length);
-    assert!(!resp.tokens.is_empty());
+    assert_eq!(resp.response().finish_reason, FinishReason::Length);
+    assert!(!resp.response().tokens.is_empty());
 }
 
 /// Guided / tool constraints. Two checks:
@@ -404,8 +404,16 @@ async fn tiny_stack_guided_tool_constraint() {
     let mut req = greedy_request("constrain me", 4);
     req.sampling_params.response_format =
         ResponseFormat::JsonSchema("{\"type\":\"object\"}".into());
-    let seq =
-        SequenceState::new_with_tokenizer(req, vec![TokenId::new(1)], Some(tokenizer.clone()));
+    let output_budget = ferrum_output::OutputBudget::new(Default::default()).unwrap();
+    let seq = SequenceState::try_new_with_tokenizer_model_vocab_and_structured_factory(
+        req,
+        vec![TokenId::new(1)],
+        Some(tokenizer.clone()),
+        None,
+        None,
+        output_budget.try_open_session().unwrap(),
+    )
+    .expect("valid guided sequence must compile its grammar");
     assert!(
         seq.has_structured_output_constraint(),
         "a JsonSchema request must compile a tokenizer-aware grammar processor"
@@ -425,13 +433,16 @@ async fn tiny_stack_guided_tool_constraint() {
         .await
         .expect("guided request must complete without panic");
     assert!(
-        matches!(resp.finish_reason, FinishReason::Length | FinishReason::EOS),
+        matches!(
+            resp.response().finish_reason,
+            FinishReason::Length | FinishReason::EOS
+        ),
         "guided run terminates cleanly: {:?}",
-        resp.finish_reason
+        resp.response().finish_reason
     );
     assert!(
-        serde_json::from_str::<i64>(&resp.text).is_ok(),
+        serde_json::from_str::<i64>(&resp.response().text).is_ok(),
         "guided output must be a JSON integer: {:?}",
-        resp.text
+        resp.response().text
     );
 }

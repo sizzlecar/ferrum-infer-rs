@@ -30,8 +30,8 @@ async fn prompt_tail_single_prefill_samples_only_after_the_remaining_suffix() {
             .await
             .expect("planned tail must finish without a capacity wake")
             .unwrap();
-        assert_eq!(response.finish_reason, FinishReason::Length);
-        assert_eq!(response.tokens.len(), 1);
+        assert_eq!(response.response().finish_reason, FinishReason::Length);
+        assert_eq!(response.response().tokens.len(), 1);
         let expected = match reserve {
             Some(tail) => vec![
                 PrefillChunk::new(0, 5 - tail, 5).unwrap(),

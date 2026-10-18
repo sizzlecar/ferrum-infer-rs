@@ -592,6 +592,27 @@ enum Activation {
 }
 
 impl StructuredOutputProcessor {
+    /// Reserve once for a committed token, before any mask/stop/classification
+    /// advances the composed history. External EOS may use less than this bound.
+    pub fn retained_token_growth_bound(&self, token: TokenId) -> Result<usize> {
+        self.state
+            .lock()
+            .composed
+            .as_ref()
+            .map_or(Ok(0), |composed| {
+                composed.retained_token_growth_bound(token)
+            })
+    }
+
+    /// Logical retained bytes, excluding matcher and allocation overhead.
+    pub fn retained_payload_bytes(&self) -> Result<usize> {
+        self.state
+            .lock()
+            .composed
+            .as_ref()
+            .map_or(Ok(0), |composed| composed.retained_payload_bytes())
+    }
+
     /// Consume newly generated tokens and hard-mask every illegal next token.
     /// Waiting-for-reasoning mode leaves normal logits untouched until the
     /// typed delimiter has been observed.

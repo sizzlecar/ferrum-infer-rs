@@ -4,10 +4,9 @@
 //! implementing text-generation operations or creating dummy KV state.
 
 use async_trait::async_trait;
-use ferrum_output::InferenceStream;
+use ferrum_output::{InferenceOutput, InferenceStream};
 use ferrum_types::{
-    EngineConfig, ExecutionResourceAuthority, ExecutorAdmissionSnapshot, InferenceRequest,
-    InferenceResponse, Result,
+    EngineConfig, ExecutionResourceAuthority, ExecutorAdmissionSnapshot, InferenceRequest, Result,
 };
 
 /// Lifecycle / status methods shared by every engine kind.
@@ -89,7 +88,7 @@ pub trait LlmInferenceEngine: InferenceEngine {
     }
 
     /// Execute single inference request.
-    async fn infer(&self, request: InferenceRequest) -> Result<InferenceResponse>;
+    async fn infer(&self, request: InferenceRequest) -> Result<InferenceOutput>;
 
     /// Execute streaming inference request. Each output chunk retains its
     /// session budget until the consumer releases it.
@@ -104,7 +103,7 @@ pub trait AdvancedInferenceEngine: LlmInferenceEngine {
     async fn infer_batch(
         &self,
         requests: Vec<InferenceRequest>,
-    ) -> Result<Vec<Result<InferenceResponse>>>;
+    ) -> Result<Vec<Result<InferenceOutput>>>;
 
     /// Warm up engine with sample requests.
     async fn warmup(

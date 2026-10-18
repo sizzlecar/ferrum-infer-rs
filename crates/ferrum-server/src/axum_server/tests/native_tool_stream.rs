@@ -331,3 +331,123 @@ async fn native_xml_stream_length_and_engine_error_never_publish_executable_call
         }
     }
 }
+
+#[tokio::test]
+async fn native_xml_stream_terminal_moves_projection_credit_and_preserves_upstream_api() {
+    use ferrum_output::{semantic_cost, OutputBudget};
+
+    let local_city = "城市".repeat(1000);
+    let raw = format!("<tool_call><function=weather><parameter=city>{local_city}</parameter></function></tool_call>");
+    let limit = 15_000;
+    for upstream_api in [false, true] {
+        let (path, wire) = request(false, true);
+        let openai_request: ChatCompletionsRequest = serde_json::from_value(wire.clone()).unwrap();
+        let api_request = api_chat_request(
+            &openai_request,
+            openai_request.tool_choice.as_ref(),
+            ferrum_types::ApiToolCallProtocol::FunctionParameterXml,
+        );
+        let projection = ferrum_types::project_native_chat_output(
+            &api_request,
+            ModelOutputProtocol::Text,
+            false,
+            &raw,
+            FinishReason::EOS,
+        )
+        .unwrap();
+        let original_projection_bytes =
+            semantic_cost(&(&projection.visible.content, &projection.visible.reasoning)).unwrap()
+                + semantic_cost(&projection.api_response).unwrap();
+        let expected_city = if upstream_api {
+            "都会".repeat(1000)
+        } else {
+            local_city.clone()
+        };
+        let mut expected_api = projection.api_response.clone().unwrap();
+        if upstream_api {
+            expected_api.message.tool_calls[0].id = "upstream_call".into();
+            expected_api.message.tool_calls[0].function.arguments =
+                serde_json::to_string(&json!({"city": expected_city})).unwrap();
+        }
+        let terminal_bytes =
+            semantic_cost(&(&projection.visible.content, &projection.visible.reasoning)).unwrap()
+                + semantic_cost(&Some(&expected_api)).unwrap();
+        let token_bytes = semantic_cost(&vec![TokenId::new(11)]).unwrap();
+        assert!(raw.len() + token_bytes < limit);
+        let config = ferrum_types::OutputConfig {
+            semantic_bytes_total: limit,
+            semantic_bytes_per_session: limit,
+            ..Default::default()
+        };
+        let budget = OutputBudget::new(config.clone()).unwrap();
+        let mut stub = StubLlm::with_separate_final_stream_chunk(&[&raw]);
+        stub.config.output = config;
+        stub.output_budget = budget.clone();
+        if upstream_api {
+            stub.api_response = Some(ferrum_types::ApiResponse::Chat(expected_api.clone()));
+        }
+        let response = post_json(router(stub), path, wire).await;
+        assert_eq!(response.status(), AxumStatusCode::OK);
+        let text = tokio::time::timeout(Duration::from_secs(2), response_text(response))
+            .await
+            .expect("moved terminal credit must not wait on its old owner");
+        let events = responses_sse_json_events(&text);
+        assert!(
+            events.iter().all(|event| event["error"].is_null()),
+            "{text}"
+        );
+        assert_eq!(text_deltas(&events, false), "");
+        assert_eq!(
+            serde_json::from_str::<Value>(&arguments(&events, false)).unwrap(),
+            json!({"city": expected_city})
+        );
+        let tool_events: Vec<_> = events
+            .iter()
+            .filter(|event| event["choices"][0]["delta"]["tool_calls"].is_array())
+            .collect();
+        assert_eq!(tool_events.len(), 1);
+        assert_eq!(
+            tool_events[0]["choices"][0]["delta"]["tool_calls"][0]["function"]["name"],
+            "weather"
+        );
+        if upstream_api {
+            assert_eq!(
+                tool_events[0]["choices"][0]["delta"]["tool_calls"][0]["id"],
+                "upstream_call"
+            );
+        }
+        let published: ChatCompletionsResponse =
+            serde_json::from_value(tool_events[0].clone()).unwrap();
+        let live_bytes = token_bytes + terminal_bytes + semantic_cost(&published).unwrap();
+        assert!(
+            live_bytes <= limit,
+            "the actual terminal and wire DTO both fit"
+        );
+        assert!(
+            live_bytes + original_projection_bytes > limit,
+            "an unused second native projection would reject this real event"
+        );
+        let reasons: Vec<_> = events
+            .iter()
+            .filter_map(|event| event["choices"][0]["finish_reason"].as_str())
+            .collect();
+        assert_eq!(reasons, ["tool_calls"]);
+        let usages: Vec<_> = events
+            .iter()
+            .filter_map(|event| event.get("usage").filter(|usage| !usage.is_null()))
+            .collect();
+        assert_eq!(
+            usages,
+            [&json!({"prompt_tokens":5,"completion_tokens":1,"total_tokens":6})]
+        );
+        assert_eq!(
+            text.lines().filter(|line| *line == "data: [DONE]").count(),
+            1
+        );
+        assert_eq!(budget.usage().semantic_bytes, 0);
+        assert_eq!(budget.usage().queued_bytes, 0);
+        assert_eq!(budget.usage().encoded_bytes, 0);
+        assert_eq!(budget.usage().control_bytes, 0);
+        assert_eq!(budget.usage().sessions, 0);
+    }
+}

@@ -4,7 +4,10 @@ mod native_projection;
 mod xml_parameter_schema;
 mod xml_tool_calls;
 
-pub use native_projection::{NativeChatOutputProjection, NativeChatOutputProjector};
+pub use native_projection::{
+    native_chat_projection_eligible, native_initial_boundary, project_native_chat_output,
+    NativeChatOutputProjection, NativeInitialBoundary,
+};
 
 use crate::{
     ids::*, models::TokenUsage, FinishReason, Priority, ResponseCompletionEnvelope, SamplingParams,
@@ -461,12 +464,22 @@ pub fn api_response_from_generated_text(
     text: &str,
     finish_reason: FinishReason,
 ) -> Option<ApiResponse> {
-    if let Some(mut projector) = NativeChatOutputProjector::for_request(request) {
-        projector.push(text);
-        return projector
-            .finish(finish_reason)
-            .api_response
-            .map(ApiResponse::Chat);
+    if let (Some(ApiRequest::Chat(chat)), Some(started)) = (
+        request.api_request.as_ref(),
+        request
+            .metadata
+            .get(PROMPT_OPENED_REASONING_METADATA_KEY)
+            .and_then(serde_json::Value::as_bool),
+    ) {
+        if let Some(projected) = project_native_chat_output(
+            chat,
+            request.sampling_params.model_output_protocol,
+            started,
+            text,
+            finish_reason,
+        ) {
+            return projected.api_response.map(ApiResponse::Chat);
+        }
     }
     let ApiRequest::Chat(chat_request) = request.api_request.as_ref()? else {
         return None;

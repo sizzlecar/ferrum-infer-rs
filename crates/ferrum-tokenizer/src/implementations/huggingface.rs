@@ -2,7 +2,9 @@
 
 use crate::{IncrementalTokenizer, Tokenizer, TokenizerFactory, TokenizerInfo, TokenizerType};
 use async_trait::async_trait;
-use ferrum_types::{ModelOutputProtocol, Result, SpecialTokens, TokenId};
+use ferrum_types::{
+    ModelOutputProtocol, Result, SpecialTokens, TokenId, TokenizerDecodeCacheConfig,
+};
 use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
@@ -71,14 +73,16 @@ pub struct IncrementalState {
 #[derive(Debug, Default)]
 struct DecodeCache {
     cache: std::collections::HashMap<Vec<TokenId>, String>,
-    max_size: usize,
+    config: TokenizerDecodeCacheConfig,
+    payload_bytes: usize,
 }
 
 impl DecodeCache {
-    fn new(max_size: usize) -> Self {
+    fn new(config: TokenizerDecodeCacheConfig) -> Self {
         Self {
             cache: std::collections::HashMap::new(),
-            max_size,
+            config,
+            payload_bytes: 0,
         }
     }
 
@@ -86,19 +90,49 @@ impl DecodeCache {
         self.cache.get(tokens)
     }
 
-    fn insert(&mut self, tokens: Vec<TokenId>, text: String) {
-        if self.cache.len() >= self.max_size {
-            let to_remove: Vec<_> = self
-                .cache
-                .keys()
-                .take(self.cache.len() / 2)
-                .cloned()
-                .collect();
-            for key in to_remove {
-                self.cache.remove(&key);
-            }
+    fn entry_bytes(tokens: &[TokenId], text: &str) -> Option<usize> {
+        tokens.len().checked_mul(4)?.checked_add(text.len())
+    }
+
+    fn insert(&mut self, tokens: &[TokenId], text: &str) {
+        self.insert_key(std::borrow::Cow::Borrowed(tokens), text);
+    }
+
+    fn insert_owned(&mut self, tokens: Vec<TokenId>, text: &str) {
+        self.insert_key(std::borrow::Cow::Owned(tokens), text);
+    }
+
+    fn insert_key(&mut self, tokens: std::borrow::Cow<'_, [TokenId]>, text: &str) {
+        let Some(bytes) = Self::entry_bytes(tokens.as_ref(), text) else {
+            return;
+        };
+        if self.config.max_entries == 0
+            || bytes > self.config.max_bytes
+            || self.config.max_bytes == 0
+        {
+            return;
         }
-        self.cache.insert(tokens, text);
+        // Decide whether the entry fits before copying its token key or text.
+        if let Some(previous) = self.cache.remove(tokens.as_ref()) {
+            self.payload_bytes -= tokens.len() * 4 + previous.len();
+        }
+        while self.cache.len() >= self.config.max_entries
+            || bytes > self.config.max_bytes - self.payload_bytes
+        {
+            // Preserve the existing half-cache eviction policy without making
+            // a temporary vector of full history keys just to remove them.
+            let mut remaining = (self.cache.len() / 2).max(1);
+            self.cache.retain(|tokens, text| {
+                if remaining == 0 {
+                    return true;
+                }
+                remaining -= 1;
+                self.payload_bytes -= tokens.len() * 4 + text.len();
+                false
+            });
+        }
+        self.cache.insert(tokens.into_owned(), text.to_owned());
+        self.payload_bytes += bytes;
     }
 }
 
@@ -149,8 +183,16 @@ impl HuggingFaceTokenizer {
             byte_level_decoder,
             byte_level_decode_vocab,
             semantic_markers,
-            decode_cache: RwLock::new(DecodeCache::new(1000)),
+            decode_cache: RwLock::new(DecodeCache::new(TokenizerDecodeCacheConfig::default())),
         })
+    }
+
+    /// Configure the shared cache before publishing this tokenizer instance.
+    /// Cache misses and oversized entries use the same canonical decoder.
+    pub fn with_decode_cache_config(mut self, config: TokenizerDecodeCacheConfig) -> Result<Self> {
+        config.validate()?;
+        self.decode_cache = RwLock::new(DecodeCache::new(config));
+        Ok(self)
     }
 
     fn decode_segment(&self, token_ids: &[u32], skip_special: bool) -> Result<String> {
@@ -299,7 +341,7 @@ impl Tokenizer for HuggingFaceTokenizer {
 
             self.decode_cache
                 .write()
-                .insert(all_tokens, full_text.clone());
+                .insert_owned(all_tokens, &full_text);
 
             return decoded_incremental_delta(&cached_prev, &full_text);
         }
@@ -319,9 +361,9 @@ impl Tokenizer for HuggingFaceTokenizer {
         {
             let mut cache = self.decode_cache.write();
             if !prev.is_empty() {
-                cache.insert(prev.to_vec(), prev_text.clone());
+                cache.insert(prev, &prev_text);
             }
-            cache.insert(all_tokens, full_text.clone());
+            cache.insert_owned(all_tokens, &full_text);
         }
 
         decoded_incremental_delta(&prev_text, &full_text)
@@ -452,8 +494,13 @@ impl TokenizerFactory for HuggingFaceTokenizerFactory {
         &self,
         config: &ferrum_interfaces::tokenizer::TokenizerConfig,
     ) -> Result<Box<dyn Tokenizer>> {
+        config.decode_cache.validate()?;
         // Load from path specified in config
-        self.load_from_file(&config.path).await
+        Ok(Box::new(
+            HuggingFaceTokenizer::from_file(&config.path)
+                .await?
+                .with_decode_cache_config(config.decode_cache.clone())?,
+        ))
     }
 
     fn supported_types(&self) -> Vec<TokenizerType> {
@@ -765,18 +812,24 @@ mod tests {
 
     #[test]
     fn test_decode_cache_creation() {
-        let cache = DecodeCache::new(100);
-        assert_eq!(cache.max_size, 100);
+        let cache = DecodeCache::new(TokenizerDecodeCacheConfig {
+            max_entries: 100,
+            ..Default::default()
+        });
+        assert_eq!(cache.config.max_entries, 100);
         assert_eq!(cache.cache.len(), 0);
     }
 
     #[test]
     fn test_decode_cache_insert_and_get() {
-        let mut cache = DecodeCache::new(10);
+        let mut cache = DecodeCache::new(TokenizerDecodeCacheConfig {
+            max_entries: 10,
+            ..Default::default()
+        });
         let tokens = vec![TokenId::new(1), TokenId::new(2)];
         let text = "hello".to_string();
 
-        cache.insert(tokens.clone(), text.clone());
+        cache.insert(&tokens, &text);
 
         let result = cache.get(&tokens);
         assert!(result.is_some());
@@ -785,19 +838,126 @@ mod tests {
 
     #[test]
     fn test_decode_cache_eviction() {
-        let mut cache = DecodeCache::new(2);
+        let mut cache = DecodeCache::new(TokenizerDecodeCacheConfig {
+            max_entries: 2,
+            ..Default::default()
+        });
 
         // 填满缓存
-        cache.insert(vec![TokenId::new(1)], "a".to_string());
-        cache.insert(vec![TokenId::new(2)], "b".to_string());
+        cache.insert(&[TokenId::new(1)], "a");
+        cache.insert(&[TokenId::new(2)], "b");
 
         assert_eq!(cache.cache.len(), 2);
 
         // 触发驱逐
-        cache.insert(vec![TokenId::new(3)], "c".to_string());
+        cache.insert(&[TokenId::new(3)], "c");
 
         // 应该已经清理了一些旧条目
         assert!(cache.cache.len() <= 2);
+    }
+
+    #[test]
+    fn decode_cache_replacement_and_byte_pressure_keep_exact_retained_content() {
+        let mut cache = DecodeCache::new(TokenizerDecodeCacheConfig {
+            max_entries: 10,
+            max_bytes: 12,
+        });
+        cache.insert(&[TokenId(1)], "a");
+        cache.insert(&[TokenId(1)], "bc");
+        assert_eq!((cache.cache.len(), cache.payload_bytes), (1, 6));
+        cache.insert(&[TokenId(2)], "de");
+        assert_eq!(cache.payload_bytes, 12);
+        cache.insert(&[TokenId(3)], "fgh");
+        assert_eq!(cache.get(&[TokenId(3)]).map(String::as_str), Some("fgh"));
+        assert!(cache.payload_bytes <= 12);
+        let retained: usize = cache
+            .cache
+            .iter()
+            .map(|(ids, text)| ids.len() * 4 + text.len())
+            .sum();
+        assert_eq!(cache.payload_bytes, retained);
+        let before = cache.payload_bytes;
+        cache.insert(&[TokenId(4)], "larger than the entire cache");
+        assert_eq!(cache.payload_bytes, before);
+        assert!(cache.get(&[TokenId(4)]).is_none());
+    }
+
+    #[tokio::test]
+    async fn decode_cache_hit_eviction_and_disabled_paths_keep_canonical_bytes() {
+        use tokenizers::models::bpe::{Vocab, BPE};
+        let vocab: Vocab = [
+            ("a".to_owned(), 0),
+            ("b".to_owned(), 1),
+            ("中".to_owned(), 2),
+        ]
+        .into_iter()
+        .collect();
+        let tokenizer = HfTokenizer::new(
+            BPE::builder()
+                .vocab_and_merges(vocab, vec![])
+                .build()
+                .unwrap(),
+        );
+        for config in [
+            TokenizerDecodeCacheConfig::default(),
+            TokenizerDecodeCacheConfig {
+                max_entries: 2,
+                max_bytes: 12,
+            },
+            TokenizerDecodeCacheConfig {
+                max_entries: 0,
+                max_bytes: 12,
+            },
+            TokenizerDecodeCacheConfig {
+                max_entries: 2,
+                max_bytes: 0,
+            },
+        ] {
+            let decoder = HuggingFaceTokenizer::new(tokenizer.clone())
+                .await
+                .unwrap()
+                .with_decode_cache_config(config.clone())
+                .unwrap();
+            let tokens = [TokenId(0), TokenId(1), TokenId(2), TokenId(1)];
+            for _ in 0..2 {
+                let mut actual = String::new();
+                for (i, token) in tokens.iter().enumerate() {
+                    actual.push_str(&decoder.decode_incremental(&tokens[..i], *token).unwrap());
+                    assert_eq!(actual, decoder.decode(&tokens[..=i], true).unwrap());
+                }
+            }
+            let cache = decoder.decode_cache.read();
+            assert!(cache.payload_bytes <= config.max_bytes);
+            assert!(cache.cache.len() <= config.max_entries);
+            if config.max_entries == 0 || config.max_bytes == 0 {
+                assert!(cache.cache.is_empty());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn decode_cache_factory_rejects_unaddressable_policy_before_loading() {
+        let config = ferrum_interfaces::tokenizer::TokenizerConfig {
+            decode_cache: TokenizerDecodeCacheConfig {
+                max_entries: 1,
+                max_bytes: usize::MAX,
+            },
+            tokenizer_type: TokenizerType::BPE,
+            path: "not-loaded-for-invalid-cache-policy".into(),
+            add_special_tokens: true,
+            use_fast: true,
+            truncation: None,
+            padding: None,
+            chat_template: None,
+            extra_options: HashMap::new(),
+        };
+        let result = HuggingFaceTokenizerFactory::new()
+            .create_from_config(&config)
+            .await;
+        assert!(matches!(
+            result,
+            Err(ferrum_types::FerrumError::Config { .. })
+        ));
     }
 
     #[test]

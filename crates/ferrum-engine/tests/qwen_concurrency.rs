@@ -62,7 +62,7 @@ async fn qwen_25_05b_requests_are_serialized_for_correctness() {
     for task in tasks {
         let response = task.await.expect("join inference task").expect("inference");
         assert!(
-            !response.text.trim().is_empty() || !response.tokens.is_empty(),
+            !response.response().text.trim().is_empty() || !response.response().tokens.is_empty(),
             "empty generation response"
         );
     }

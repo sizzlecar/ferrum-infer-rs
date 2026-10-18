@@ -150,6 +150,33 @@ impl OutputSender {
         Arc::ptr_eq(&self.0, &other.0)
     }
 
+    #[cfg(test)]
+    pub(super) fn output_session(&self) -> &OutputSession {
+        &self.0.session
+    }
+
+    pub(super) async fn send_retained(
+        &self,
+        chunk: StreamChunk,
+        mut credit: OutputSemanticLease,
+    ) -> Result<()> {
+        credit.try_resize(semantic_cost(&chunk)?)?;
+        let cost = OutputChunk::queued_cost(&chunk)?;
+        let lease = tokio::select! {
+            biased;
+            _ = self.0.sender.closed() => return Err(FerrumError::internal("output receiver closed")),
+            lease = self.0.session.reserve_queued(cost) => lease?,
+        };
+        let chunk = OutputChunk::new_retained(chunk, lease, credit)?;
+        self.0
+            .sender
+            .send(Ok(chunk))
+            .await
+            .map_err(|_| FerrumError::internal("output receiver closed"))?;
+        self.0.terminal.lock().delivered = true;
+        Ok(())
+    }
+
     pub(super) fn is_closed(&self) -> bool {
         self.0.sender.is_closed()
     }
@@ -451,22 +478,25 @@ impl OutputSender {
         }
     }
 
-    pub(super) fn completed_text(&self, range: Range<usize>) -> Result<Option<String>> {
+    pub(super) fn rebuild_completed_text(
+        &self,
+        range: Range<usize>,
+    ) -> Result<Option<inner::completion::CompletedTextProjection>> {
         let state = self.0.state.lock();
         state
             .completion
             .as_ref()
-            .map(|completion| {
-                completion
-                    .response
-                    .text
-                    .get(range)
-                    .map(str::to_owned)
-                    .ok_or_else(|| {
-                        FerrumError::internal("pending output span disagrees with completed text")
-                    })
-            })
+            .map(|completion| completion.rebuild_completed_text(range))
             .transpose()
+    }
+
+    #[cfg(test)]
+    pub(super) fn completed_text(&self, range: Range<usize>) -> Result<Option<String>> {
+        match self.rebuild_completed_text(range)? {
+            Some(inner::completion::CompletedTextProjection::Available(text)) => Ok(Some(text)),
+            Some(inner::completion::CompletedTextProjection::RecordedFailure(error)) => Err(error),
+            None => Ok(None),
+        }
     }
 }
 

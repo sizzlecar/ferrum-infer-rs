@@ -22,7 +22,8 @@ async fn output_slow_stream_pauses_only_its_request_and_shutdown_joins_delivery(
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(healthy.tokens.len(), 4);
+    assert_eq!(healthy.response().tokens.len(), 4);
+    drop(healthy);
     {
         let sequences = &fixture.engine.inner.sequences;
         let slow_handle = sequences

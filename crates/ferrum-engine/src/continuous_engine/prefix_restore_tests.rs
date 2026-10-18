@@ -214,7 +214,7 @@ async fn prefix_restore_executes_only_suffix_and_samples_after_real_prefill() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(response.tokens.len(), 1);
+    assert_eq!(response.response().tokens.len(), 1);
     assert_eq!(state.acknowledgements.load(Ordering::Relaxed), 1);
     assert_eq!(state.cancellations.load(Ordering::Relaxed), 0);
     assert_eq!(

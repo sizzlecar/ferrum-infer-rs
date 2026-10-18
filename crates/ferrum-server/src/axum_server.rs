@@ -33,14 +33,13 @@ use ferrum_types::{
     should_defer_model_reasoning_stream_delta, EngineMetrics, EngineStatus,
     ExecutionResourceAuthority, FerrumConfigBuilder, FerrumError as Error, FerrumProfileEvent,
     FinishReason, InferenceExecutionEvidence, InferenceRequest, InferenceResponse, ModelId,
-    ModelOutputProtocol, NativeChatOutputProjector, ParsedReasoningResponse, Priority,
-    ProcessMemoryObservation, ProcessMemorySample, ProcessMemorySampler, ProfileEntrypoint,
-    ProfileError, ProfileEventKind, ProfileStatus, ReplayReference, RequestId,
-    ResolvedFerrumConfig, ResourceAction, ResourceTraceEvent, ResponseCompletionBoundary,
-    RuntimeConfigSnapshot, SamplingParams, StructuredOutputStart, TokenId, TokenUsage,
-    DEFAULT_CHAT_REPETITION_PENALTY, DEFAULT_MAX_TOKENS_METADATA_KEY,
-    OBSERVABILITY_PROFILE_SCHEMA_VERSION, PROMPT_OPENED_REASONING_METADATA_KEY, THINK_END_TAG,
-    THINK_START_TAG,
+    ModelOutputProtocol, ParsedReasoningResponse, Priority, ProcessMemoryObservation,
+    ProcessMemorySample, ProcessMemorySampler, ProfileEntrypoint, ProfileError, ProfileEventKind,
+    ProfileStatus, ReplayReference, RequestId, ResolvedFerrumConfig, ResourceAction,
+    ResourceTraceEvent, ResponseCompletionBoundary, RuntimeConfigSnapshot, SamplingParams,
+    StructuredOutputStart, TokenId, TokenUsage, DEFAULT_CHAT_REPETITION_PENALTY,
+    DEFAULT_MAX_TOKENS_METADATA_KEY, OBSERVABILITY_PROFILE_SCHEMA_VERSION,
+    PROMPT_OPENED_REASONING_METADATA_KEY, THINK_END_TAG, THINK_START_TAG,
 };
 use sha2::{Digest, Sha256};
 use std::{
@@ -469,7 +468,7 @@ impl AppState {
 struct CacheRuntimeState {
     stats: Mutex<CacheStats>,
     prefix_prompts: Mutex<HashMap<String, usize>>,
-    sessions: Mutex<HashMap<String, Vec<ChatMessage>>>,
+    sessions: Mutex<HashMap<String, Vec<SessionMessage>>>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -488,10 +487,27 @@ struct CacheStats {
 }
 
 #[derive(Clone)]
+enum SessionMessage {
+    Input(ChatMessage),
+    Assistant(ChatSyncOutput),
+}
+impl SessionMessage {
+    fn message(&self) -> &ChatMessage {
+        match self {
+            Self::Input(message) => message,
+            Self::Assistant(output) => output.value().choices[0]
+                .message
+                .as_ref()
+                .expect("cached assistant message"),
+        }
+    }
+}
+
 struct SessionContext {
     id: String,
-    prior_messages: Vec<ChatMessage>,
+    prior_messages: Vec<SessionMessage>,
     incoming_messages: Vec<ChatMessage>,
+    _request_copies: Vec<ferrum_output::OutputSemanticLease>,
 }
 
 impl CacheRuntimeState {
@@ -533,10 +549,12 @@ impl CacheRuntimeState {
         request: &mut ChatCompletionsRequest,
         headers: &HeaderMap,
         policy: &CachePolicy,
-    ) -> Option<SessionContext> {
-        let session_id = request_session_id(headers, request)?;
+    ) -> std::result::Result<Option<SessionContext>, ServerError> {
+        let Some(session_id) = request_session_id(headers, request) else {
+            return Ok(None);
+        };
         if !policy.session_memory_enabled() {
-            return None;
+            return Ok(None);
         }
 
         let incoming_messages = request.messages.clone();
@@ -544,29 +562,45 @@ impl CacheRuntimeState {
             let sessions = self.sessions.lock().expect("session cache lock");
             sessions.get(&session_id).cloned().unwrap_or_default()
         };
+        let mut request_copies = Vec::new();
         {
             let mut stats = self.stats.lock().expect("cache stats lock");
             if prior_messages.is_empty() {
                 stats.session_misses += 1;
             } else {
                 stats.session_hits += 1;
-                let mut merged = prior_messages.clone();
+                let mut merged = Vec::with_capacity(prior_messages.len() + request.messages.len());
+                for prior in &prior_messages {
+                    if let SessionMessage::Assistant(output) = prior {
+                        request_copies.push(
+                            output
+                                .output_session()
+                                .try_reserve_semantic(
+                                    ferrum_output::semantic_cost(prior.message())
+                                        .map_err(server_error_from_ferrum_error)?,
+                                )
+                                .map_err(server_error_from_ferrum_error)?,
+                        );
+                    }
+                    merged.push(prior.message().clone());
+                }
                 merged.extend(request.messages.clone());
                 request.messages = merged;
             }
         }
 
-        Some(SessionContext {
+        Ok(Some(SessionContext {
             id: session_id,
             prior_messages,
             incoming_messages,
-        })
+            _request_copies: request_copies,
+        }))
     }
 
     fn update_session(
         &self,
         context: Option<SessionContext>,
-        assistant_message: ChatMessage,
+        assistant_message: ChatSyncOutput,
         policy: &CachePolicy,
     ) {
         let Some(context) = context else {
@@ -577,8 +611,13 @@ impl CacheRuntimeState {
         }
 
         let mut history = context.prior_messages;
-        history.extend(context.incoming_messages);
-        history.push(assistant_message);
+        history.extend(
+            context
+                .incoming_messages
+                .into_iter()
+                .map(SessionMessage::Input),
+        );
+        history.push(SessionMessage::Assistant(assistant_message));
         trim_messages_to_token_budget(&mut history, policy.session_cache_max_tokens);
 
         let mut sessions = self.sessions.lock().expect("session cache lock");
@@ -601,7 +640,7 @@ impl CacheRuntimeState {
             .map(|messages| {
                 messages
                     .iter()
-                    .map(|msg| approx_tokens(&msg.content))
+                    .map(|msg| approx_tokens(&msg.message().content))
                     .sum::<usize>()
             })
             .sum::<usize>() as u64;
@@ -620,7 +659,7 @@ impl CacheRuntimeState {
             .map(|messages| {
                 messages
                     .iter()
-                    .map(|msg| approx_tokens(&msg.content))
+                    .map(|msg| approx_tokens(&msg.message().content))
                     .sum::<usize>()
             })
             .sum::<usize>() as u64;
@@ -971,12 +1010,12 @@ fn longest_common_prefix_chars(a: &str, b: &str) -> usize {
     a.chars().zip(b.chars()).take_while(|(a, b)| a == b).count()
 }
 
-fn trim_messages_to_token_budget(messages: &mut Vec<ChatMessage>, max_tokens: usize) {
+fn trim_messages_to_token_budget(messages: &mut Vec<SessionMessage>, max_tokens: usize) {
     let max_tokens = max_tokens.max(1);
     while messages.len() > 1
         && messages
             .iter()
-            .map(|msg| approx_tokens(&msg.content))
+            .map(|msg| approx_tokens(&msg.message().content))
             .sum::<usize>()
             > max_tokens
     {
@@ -1168,7 +1207,7 @@ async fn chat_completions_handler_with_projection(
     let session_context =
         state
             .cache
-            .prepare_session_request(&mut request, &headers, &cache_policy);
+            .prepare_session_request(&mut request, &headers, &cache_policy)?;
     if let Some(phases) = &mut message_phases {
         let prepended = request
             .messages
@@ -1229,17 +1268,25 @@ async fn chat_completions_handler_with_projection(
             inference_request,
             benchmark_correlation,
             response_context,
+            session_context,
         )
         .await
     } else {
-        handle_chat_completions_sync(
+        let output = handle_chat_completions_sync(
             state,
             request,
             inference_request,
             session_context,
             benchmark_correlation,
         )
-        .await
+        .await?;
+        if let Some(context) = response_context {
+            responses::adapt_chat_sync(output, context).await
+        } else {
+            output::json_response(output.output_session(), output.value())
+                .await
+                .map_err(server_error_from_ferrum_error)
+        }
     }
 }
 
@@ -2386,12 +2433,14 @@ async fn handle_chat_completions_stream(
     inference_request: InferenceRequest,
     benchmark_correlation: Option<BenchmarkRequestCorrelation>,
     response_context: Option<responses::ResponseContext>,
+    session_context: Option<SessionContext>,
 ) -> std::result::Result<Response, ServerError> {
     let events = chat_stream::open_chat_events(
         state,
         openai_request,
         inference_request,
         benchmark_correlation,
+        session_context,
     )
     .await?;
     Ok(match response_context {
@@ -2401,13 +2450,15 @@ async fn handle_chat_completions_stream(
 }
 
 /// Handle non-streaming chat completions
+type ChatSyncOutput = output::Retained<ChatCompletionsResponse>;
+
 async fn handle_chat_completions_sync(
     state: AppState,
     openai_request: ChatCompletionsRequest,
     inference_request: InferenceRequest,
     session_context: Option<SessionContext>,
     benchmark_correlation: Option<BenchmarkRequestCorrelation>,
-) -> std::result::Result<Response, ServerError> {
+) -> std::result::Result<ChatSyncOutput, ServerError> {
     info!("Processing non-streaming chat completion");
 
     let engine = state.llm.clone().ok_or_else(|| {
@@ -2426,7 +2477,10 @@ async fn handle_chat_completions_sync(
     let model_output_protocol = inference_request.sampling_params.model_output_protocol;
     // R1-distill-style templates open the think block inside the prompt.
     let started_in_think = request_started_in_reasoning(&inference_request);
-    let mut native_projector = NativeChatOutputProjector::for_request(&inference_request);
+    let native_render_state = inference_request
+        .metadata
+        .get(ferrum_types::PROMPT_OPENED_REASONING_METADATA_KEY)
+        .and_then(serde_json::Value::as_bool);
     let replay_request_id = inference_request.id.to_string();
     let profile_request_model = openai_request.model.clone();
     let profile_started_at = Instant::now();
@@ -2441,7 +2495,8 @@ async fn handle_chat_completions_sync(
                 api_response,
                 execution_evidence,
                 ..
-            } = output;
+            } = output.response();
+            let finish_reason = *finish_reason;
             if let Err(err) = write_chat_prompt_token_evidence(
                 state.request_dump_dir.as_ref().map(|root| root.as_path()),
                 &replay_request_id,
@@ -2456,10 +2511,17 @@ async fn handle_chat_completions_sync(
             // here; malformed output must fail the response contract below.
             let stop_sequences = openai_request.stop.clone().unwrap_or_default();
             let content = strip_after_stop(&output_text, &stop_sequences);
-            let native_projected = native_projector.take().map(|mut projector| {
-                projector.push(&content);
-                projector.finish(finish_reason)
-            });
+            let native_projected = request_chat_api.as_ref().zip(native_render_state).and_then(
+                |(request, started)| {
+                    ferrum_types::project_native_chat_output(
+                        request,
+                        model_output_protocol,
+                        started,
+                        &content,
+                        finish_reason,
+                    )
+                },
+            );
             let parsed_model_output = if let Some(projected) = native_projected.as_ref() {
                 ParsedChatModelOutput {
                     visible: projected.visible.clone(),
@@ -2660,9 +2722,6 @@ async fn handle_chat_completions_sync(
             ) {
                 warn!("failed to write chat sync memory profile event: {}", err);
             }
-            state
-                .cache
-                .update_session(session_context, message.clone(), &CachePolicy::current());
             let response = ChatCompletionsResponse {
                 id: replay_request_id,
                 object: "chat.completion".to_string(),
@@ -2677,7 +2736,12 @@ async fn handle_chat_completions_sync(
                 usage: Some(openai_usage_from_token_usage(&usage)),
             };
 
-            Ok(Json(response).into_response())
+            let response = output::Retained::new(output.output_session(), response)
+                .map_err(server_error_from_ferrum_error)?;
+            state
+                .cache
+                .update_session(session_context, response.clone(), &CachePolicy::current());
+            Ok(response)
         }
         Err(e) => {
             let failure_kind = e.observability_failure_kind();
@@ -4373,7 +4437,7 @@ async fn handle_completions_sync(
                 usage,
                 api_response,
                 ..
-            } = output;
+            } = output.response();
             let stop_sequences = openai_request.stop.clone().unwrap_or_default();
             let mut text = strip_after_stop(&output_text, &stop_sequences);
             let mut openai_finish_reason = finish_reason_to_string(&finish_reason);
@@ -4397,7 +4461,11 @@ async fn handle_completions_sync(
                 }],
                 usage: Some(openai_usage_from_token_usage(&usage)),
             };
-            Ok(Json(response).into_response())
+            let response = output::Retained::new(output.output_session(), response)
+                .map_err(server_error_from_ferrum_error)?;
+            output::json_response(response.output_session(), response.value())
+                .await
+                .map_err(server_error_from_ferrum_error)
         }
         Err(e) => {
             error!("Completion generation failed: {}", e);
@@ -4444,7 +4512,7 @@ async fn handle_completions_stream(
                         }],
                         usage: None,
                     };
-                    let encoded = output::encode_json(&session, None, &response_chunk).await;
+                    let encoded = match output::Retained::new(&session, response_chunk) { Ok(value) => output::encode_json(&session, None, value.value()).await, Err(error) => Err(error) };
                     let (bytes, terminal_error) = output::chat_encoding_result(&session, encoded)?;
                     if terminal_error {
                         drop(owned_chunk);
@@ -4464,7 +4532,7 @@ async fn handle_completions_stream(
                                 choices: vec![],
                                 usage: Some(usage),
                             };
-                            let encoded = output::encode_json(&session, None, &final_chunk).await;
+                            let encoded = match output::Retained::new(&session, final_chunk) { Ok(value) => output::encode_json(&session, None, value.value()).await, Err(error) => Err(error) };
                             let (bytes, terminal_error) = output::chat_encoding_result(&session, encoded)?;
                             if terminal_error {
                                 drop(owned_chunk);
@@ -4915,6 +4983,7 @@ mod tests {
     mod native_tool_stream;
     mod reasoning_controls;
     mod retired_routes;
+    mod semantic_output;
     mod tool_argument_strictness;
     mod tool_length;
     use super::*;
@@ -5054,6 +5123,7 @@ mod tests {
     }
 
     struct StubLlm {
+        output_budget: ferrum_output::OutputBudget,
         config: EngineConfig,
         adapter_support: AdapterExecutionSupport,
         resource_authority: ExecutionResourceAuthority,
@@ -5078,6 +5148,7 @@ mod tests {
             let mut config = EngineConfig::default();
             config.model.model_id = ModelId::new("stub-model");
             Self {
+                output_budget: ferrum_output::OutputBudget::new(config.output.clone()).unwrap(),
                 config,
                 adapter_support: AdapterExecutionSupport::Unsupported,
                 resource_authority: ExecutionResourceAuthority::LegacyEngine,
@@ -5195,6 +5266,24 @@ mod tests {
         ))
     }
 
+    fn inference_stream_with_budget(
+        budget: &ferrum_output::OutputBudget,
+        source: impl Stream<Item = ferrum_types::Result<StreamChunk>> + Send + 'static,
+    ) -> ferrum_types::Result<ferrum_output::InferenceStream> {
+        let session = budget.try_open_session()?;
+        let producer_session = session.clone();
+        let mut source = Box::pin(source);
+        let wrapped = async_stream::try_stream! {
+            while let Some(chunk) = source.next().await {
+                yield producer_session.wrap_chunk(chunk?).await?;
+            }
+        };
+        Ok(ferrum_output::InferenceStream::new(
+            session,
+            Box::pin(wrapped),
+        ))
+    }
+
     struct PendingDropStream {
         drop_notify: Arc<Notify>,
     }
@@ -5281,6 +5370,7 @@ mod tests {
     }
 
     struct CapturingLlm {
+        output_budget: ferrum_output::OutputBudget,
         config: EngineConfig,
         adapter_support: AdapterExecutionSupport,
         last_request: Mutex<Option<InferenceRequest>>,
@@ -5291,6 +5381,7 @@ mod tests {
             let mut config = EngineConfig::default();
             config.model.model_id = ModelId::new("qwen3");
             Self {
+                output_budget: ferrum_output::OutputBudget::new(config.output.clone()).unwrap(),
                 config,
                 adapter_support: AdapterExecutionSupport::Unsupported,
                 last_request: Mutex::new(None),
@@ -5492,20 +5583,25 @@ mod tests {
         async fn infer(
             &self,
             request: InferenceRequest,
-        ) -> ferrum_types::Result<InferenceResponse> {
+        ) -> ferrum_types::Result<ferrum_output::InferenceOutput> {
             let execution_evidence = stub_execution_evidence(&request, 2);
-            Ok(InferenceResponse {
-                request_id: request.id,
-                text: self.text.clone(),
-                tokens: vec![TokenId::new(11), TokenId::new(12)],
-                finish_reason: self.finish_reason,
-                usage: TokenUsage::new(7, 2),
-                latency_ms: 1,
-                created_at: chrono::Utc::now(),
-                metadata: HashMap::new(),
-                api_response: self.api_response.clone(),
-                execution_evidence,
-            })
+            ferrum_output::InferenceOutput::new(
+                InferenceResponse {
+                    request_id: request.id,
+                    text: self.text.clone(),
+                    tokens: vec![TokenId::new(11), TokenId::new(12)],
+                    finish_reason: self.finish_reason,
+                    usage: TokenUsage::new(7, 2),
+                    latency_ms: 1,
+                    created_at: chrono::Utc::now(),
+                    metadata: HashMap::new(),
+                    api_response: self.api_response.clone(),
+                    execution_evidence,
+                },
+                self.output_budget
+                    .try_open_session()?
+                    .try_reserve_semantic(0)?,
+            )
         }
 
         async fn infer_stream(
@@ -5513,9 +5609,12 @@ mod tests {
             request: InferenceRequest,
         ) -> ferrum_types::Result<ferrum_output::InferenceStream> {
             if let Some(drop_notify) = self.pending_stream_drop_notify.as_ref() {
-                return test_inference_stream(PendingDropStream {
-                    drop_notify: Arc::clone(drop_notify),
-                });
+                return inference_stream_with_budget(
+                    &self.output_budget,
+                    PendingDropStream {
+                        drop_notify: Arc::clone(drop_notify),
+                    },
+                );
             }
             if let Some(chunks) = &self.stream_chunks {
                 let completion_token_count = self
@@ -5569,19 +5668,25 @@ mod tests {
                     );
                 }
                 if let Some(gate) = self.stream_after_first_gate.clone() {
-                    return test_inference_stream(stream::unfold(
-                        (stream_chunks.into_iter().enumerate(), gate),
-                        |(mut chunks, gate)| async move {
-                            let (index, chunk) = chunks.next()?;
-                            if index == 1 {
-                                gate.entered.notify_one();
-                                gate.resume.notified().await;
-                            }
-                            Some((chunk, (chunks, gate)))
-                        },
-                    ));
+                    return inference_stream_with_budget(
+                        &self.output_budget,
+                        stream::unfold(
+                            (stream_chunks.into_iter().enumerate(), gate),
+                            |(mut chunks, gate)| async move {
+                                let (index, chunk) = chunks.next()?;
+                                if index == 1 {
+                                    gate.entered.notify_one();
+                                    gate.resume.notified().await;
+                                }
+                                Some((chunk, (chunks, gate)))
+                            },
+                        ),
+                    );
                 }
-                return test_inference_stream(stream::iter(stream_chunks));
+                return inference_stream_with_budget(
+                    &self.output_budget,
+                    stream::iter(stream_chunks),
+                );
             }
 
             let execution_evidence = stub_execution_evidence(&request, 1);
@@ -5596,7 +5701,7 @@ mod tests {
                 api_response: self.api_response.clone(),
                 execution_evidence,
             };
-            test_inference_stream(stream::iter(vec![Ok(chunk)]))
+            inference_stream_with_budget(&self.output_budget, stream::iter(vec![Ok(chunk)]))
         }
     }
 
@@ -5605,7 +5710,7 @@ mod tests {
         async fn infer(
             &self,
             _request: InferenceRequest,
-        ) -> ferrum_types::Result<InferenceResponse> {
+        ) -> ferrum_types::Result<ferrum_output::InferenceOutput> {
             Err(self.infer_failure.clone())
         }
 
@@ -5638,20 +5743,25 @@ mod tests {
         async fn infer(
             &self,
             request: InferenceRequest,
-        ) -> ferrum_types::Result<InferenceResponse> {
+        ) -> ferrum_types::Result<ferrum_output::InferenceOutput> {
             *self.last_request.lock().expect("capture lock") = Some(request.clone());
-            Ok(InferenceResponse {
-                request_id: request.id,
-                text: "captured".to_string(),
-                tokens: vec![TokenId::new(21)],
-                finish_reason: FinishReason::Stop,
-                usage: TokenUsage::new(9, 1),
-                latency_ms: 1,
-                created_at: chrono::Utc::now(),
-                metadata: HashMap::new(),
-                api_response: None,
-                execution_evidence: None,
-            })
+            ferrum_output::InferenceOutput::new(
+                InferenceResponse {
+                    request_id: request.id,
+                    text: "captured".to_string(),
+                    tokens: vec![TokenId::new(21)],
+                    finish_reason: FinishReason::Stop,
+                    usage: TokenUsage::new(9, 1),
+                    latency_ms: 1,
+                    created_at: chrono::Utc::now(),
+                    metadata: HashMap::new(),
+                    api_response: None,
+                    execution_evidence: None,
+                },
+                self.output_budget
+                    .try_open_session()?
+                    .try_reserve_semantic(0)?,
+            )
         }
 
         async fn infer_stream(
@@ -5670,7 +5780,7 @@ mod tests {
                 api_response: None,
                 execution_evidence: None,
             };
-            test_inference_stream(stream::iter(vec![Ok(chunk)]))
+            inference_stream_with_budget(&self.output_budget, stream::iter(vec![Ok(chunk)]))
         }
     }
 

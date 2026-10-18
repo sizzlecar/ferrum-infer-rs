@@ -16,6 +16,24 @@ use std::{
     task::{Context, Poll},
 };
 
+mod semantic;
+pub(super) use semantic::Retained;
+
+pub(super) async fn json_response<T: Serialize + ?Sized>(
+    session: &OutputSession,
+    value: &T,
+) -> Result<Response> {
+    let bytes = encode(session, |writer| {
+        serde_json::to_writer(writer, value).map_err(std::io::Error::other)
+    })
+    .await?;
+    Ok((
+        [(header::CONTENT_TYPE, "application/json")],
+        Body::from(bytes),
+    )
+        .into_response())
+}
+
 struct EncodedFrame {
     bytes: Box<[u8]>,
     _encoded: OutputBytesLease,

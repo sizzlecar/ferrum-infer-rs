@@ -28,12 +28,93 @@ impl CompletionExpectation<'_> {
     }
 }
 
+pub(in crate::continuous_engine) enum CompletionTextProvenance {
+    Available,
+    DecodeFailed(FerrumError),
+    RetentionFailed(FerrumError),
+}
+
+struct CompletionOutputDraft {
+    response: InferenceResponse,
+    semantic: OutputSemanticLease,
+    // Only dual observers need an independent retained terminal copy. Its
+    // complete cost is granted before scheduler/executor success publication.
+    terminal_copy_credit: Option<OutputSemanticLease>,
+}
+
+/// Exact borrowed shape of the later terminal chunk. No generated payload is
+/// cloned to count it, and its timestamp is fixed by the response draft.
+#[derive(Serialize)]
+struct TerminalProjection<'a> {
+    request_id: &'a RequestId,
+    text: &'static str,
+    token: Option<TokenId>,
+    finish_reason: Option<FinishReason>,
+    usage: Option<&'a TokenUsage>,
+    created_at: chrono::DateTime<chrono::Utc>,
+    metadata: &'a HashMap<String, serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    api_response: Option<&'a ferrum_types::ApiResponse>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    execution_evidence: Option<&'a ferrum_types::InferenceExecutionEvidence>,
+}
+
+impl<'a> TerminalProjection<'a> {
+    fn new(response: &'a InferenceResponse) -> Self {
+        Self {
+            request_id: &response.request_id,
+            text: "",
+            token: None,
+            finish_reason: Some(response.finish_reason),
+            usage: Some(&response.usage),
+            created_at: response.created_at,
+            metadata: &response.metadata,
+            api_response: response.api_response.as_ref(),
+            execution_evidence: response.execution_evidence.as_ref(),
+        }
+    }
+}
+
+enum CompletionOutput {
+    Draft(CompletionOutputDraft),
+    Transferred,
+}
+
+impl CompletionOutput {
+    fn draft(&self) -> Result<&CompletionOutputDraft> {
+        match self {
+            Self::Draft(draft) => Ok(draft),
+            Self::Transferred => Err(FerrumError::internal(
+                "completion output already transferred",
+            )),
+        }
+    }
+    fn draft_mut(&mut self) -> Result<&mut CompletionOutputDraft> {
+        match self {
+            Self::Draft(draft) => Ok(draft),
+            Self::Transferred => Err(FerrumError::internal(
+                "completion output already transferred",
+            )),
+        }
+    }
+    fn take(&mut self) -> Result<CompletionOutputDraft> {
+        match std::mem::replace(self, Self::Transferred) {
+            Self::Draft(draft) => Ok(draft),
+            Self::Transferred => Err(FerrumError::internal(
+                "completion output already transferred",
+            )),
+        }
+    }
+}
+
 pub(in crate::continuous_engine) struct CompletionHandoff {
     inner: Weak<EngineInner>,
     pub(in crate::continuous_engine) done: Option<tokio::sync::oneshot::Sender<Result<()>>>,
-    pub(in crate::continuous_engine) response: InferenceResponse,
+    request_id: RequestId,
+    output: CompletionOutput,
+    text_provenance: CompletionTextProvenance,
     pub(in crate::continuous_engine) stream_sender: Option<OutputSender>,
-    response_sender: Option<tokio::sync::oneshot::Sender<Result<InferenceResponse>>>,
+    response_sender: Option<tokio::sync::oneshot::Sender<Result<InferenceOutput>>>,
     terminal_error: Option<FerrumError>,
     terminal_error_published: bool,
     terminal_error_is_delivery: bool,
@@ -58,7 +139,7 @@ impl Drop for CompletionHandoff {
         if let Some(trace) = self.terminal_token_trace.take() {
             if let Some(inner) = self.inner.upgrade() {
                 inner.write_sequence_terminal_token_trace(
-                    &self.response.request_id,
+                    &self.request_id,
                     "completed",
                     Some(FinishReason::Error),
                     Some(&trace),
@@ -81,15 +162,46 @@ impl Drop for CompletionHandoff {
     }
 }
 
+/// A completion failure was already published to the control plane during
+/// handoff. Rebuilding a pending span must propagate it without republishing it.
+pub(in crate::continuous_engine) enum CompletedTextProjection {
+    Available(String),
+    RecordedFailure(FerrumError),
+}
+
 impl CompletionHandoff {
+    pub(in crate::continuous_engine) fn rebuild_completed_text(
+        &self,
+        range: std::ops::Range<usize>,
+    ) -> Result<CompletedTextProjection> {
+        match &self.text_provenance {
+            CompletionTextProvenance::DecodeFailed(error)
+            | CompletionTextProvenance::RetentionFailed(error) => {
+                Ok(CompletedTextProjection::RecordedFailure(error.clone()))
+            }
+            CompletionTextProvenance::Available => self
+                .output
+                .draft()?
+                .response
+                .text
+                .get(range)
+                .map(|text| CompletedTextProjection::Available(text.to_owned()))
+                .ok_or_else(|| {
+                    FerrumError::internal("pending output span disagrees with completed text")
+                }),
+        }
+    }
+
     pub(in crate::continuous_engine) fn retain_delivery_error(&mut self, error: FerrumError) {
         if self.terminal_error.is_none() {
             self.terminal_error_is_delivery = true;
             self.terminal_error = Some(error.clone());
         }
         self.completion_error.get_or_insert(error);
-        self.response.finish_reason = FinishReason::Error;
-        self.response.api_response = None;
+        if let Ok(draft) = self.output.draft_mut() {
+            draft.response.finish_reason = FinishReason::Error;
+            draft.response.api_response = None;
+        }
     }
 }
 
@@ -555,8 +667,16 @@ impl EngineInner {
         // no index lookup can redirect a pending span to a replacement.
         let handle = sender.source_sequence();
         let state = handle.as_ref().map(|handle| handle.lock());
-        let text = match sender.completed_text(span.bytes.clone())? {
-            Some(text) => text,
+        let report_projection_error = |error: &FerrumError| {
+            self.output_tasks.record_control_error(error.clone());
+            self.work_notify.notify_one();
+        };
+        let text = match sender
+            .rebuild_completed_text(span.bytes.clone())
+            .inspect_err(&report_projection_error)?
+        {
+            Some(CompletedTextProjection::Available(text)) => text,
+            Some(CompletedTextProjection::RecordedFailure(error)) => return Err(error),
             None => {
                 let Some(sequence) =
                     state
@@ -571,15 +691,17 @@ impl EngineInner {
                 else {
                     return Ok(None);
                 };
-                let visible =
-                    sequence.decoded_output_text(self.tokenizer.as_ref(), span.terminal)?;
+                let visible = sequence
+                    .decoded_output_text(self.tokenizer.as_ref(), span.terminal)
+                    .inspect_err(&report_projection_error)?;
                 visible
                     .get(span.bytes.clone())
                     .ok_or_else(|| {
                         FerrumError::internal(
                             "pending output span disagrees with original token history",
                         )
-                    })?
+                    })
+                    .inspect_err(&report_projection_error)?
                     .to_owned()
             }
         };
@@ -1059,6 +1181,9 @@ impl EngineInner {
         // resources and client channels whose disposition is still known.
         let (
             response,
+            semantic,
+            terminal_copy_credit,
+            text_provenance,
             stream_sender,
             mut response_sender,
             terminal_error,
@@ -1076,11 +1201,22 @@ impl EngineInner {
                     finish_reason
                 };
                 let terminal_token_trace = self.capture_sequence_terminal_token_trace(seq);
+                let mut text_provenance = CompletionTextProvenance::Available;
                 let text = match seq
                     .decoded_output_text(self.tokenizer.as_ref(), Some(finish_reason))
                 {
-                    Ok(text) => text,
+                    Ok(text) => match seq.reserve_output_bytes(text.len()) {
+                        Ok(()) => text,
+                        Err(error) => {
+                            terminal_error.get_or_insert_with(|| error.clone());
+                            completion_error.get_or_insert_with(|| error.clone());
+                            text_provenance = CompletionTextProvenance::RetentionFailed(error);
+                            finish_reason = FinishReason::Error;
+                            String::new()
+                        }
+                    },
                     Err(error) => {
+                        text_provenance = CompletionTextProvenance::DecodeFailed(error.clone());
                         warn!(request_id = %request_id, error = %error, "Request completion decoding failed");
                         terminal_error.get_or_insert_with(|| error.clone());
                         completion_error.get_or_insert(error);
@@ -1090,7 +1226,7 @@ impl EngineInner {
                         String::new()
                     }
                 };
-                let api_response = classified_api_response.take().or_else(|| {
+                let mut api_response = classified_api_response.take().or_else(|| {
                     // Declared native chat uses the same output projection as
                     // HTTP streaming; an authoritative grammar result wins.
                     ferrum_types::api_response_from_generated_text(
@@ -1099,6 +1235,16 @@ impl EngineInner {
                         finish_reason,
                     )
                 });
+                if let Some(api) = api_response.as_ref() {
+                    if let Err(error) =
+                        semantic_cost(api).and_then(|bytes| seq.reserve_output_bytes(bytes))
+                    {
+                        terminal_error.get_or_insert_with(|| error.clone());
+                        completion_error.get_or_insert(error);
+                        finish_reason = FinishReason::Error;
+                        api_response = None;
+                    }
+                }
                 let prompt_token_count = seq.input_tokens.len();
                 let execution_evidence = match seq.take_execution_evidence() {
                     Ok(evidence) => evidence,
@@ -1124,12 +1270,13 @@ impl EngineInner {
                     }
                 }
 
+                let output_token_count = seq.generated_tokens.len();
                 let mut response = InferenceResponse {
                     request_id: request_id.clone(),
                     text,
-                    tokens: seq.generated_tokens.clone(),
+                    tokens: std::mem::take(&mut seq.generated_tokens),
                     finish_reason,
-                    usage: TokenUsage::new(prompt_token_count, seq.generated_tokens.len()),
+                    usage: TokenUsage::new(prompt_token_count, output_token_count),
                     latency_ms: seq.start_time.elapsed().as_millis() as u64,
                     created_at: chrono::Utc::now(),
                     metadata: HashMap::new(),
@@ -1140,6 +1287,51 @@ impl EngineInner {
                     },
                     execution_evidence,
                 };
+
+                // Generated mutable state is now retired, while this original
+                // sequence still owns its slot/frontier. Only after dropping
+                // those payloads may their grant be reconciled with the draft.
+                seq.retire_generated_output_state();
+                let mut terminal_copy_credit = None;
+                if terminal_error.is_none() {
+                    let preparation = (|| -> Result<()> {
+                        let response_bytes = semantic_cost(&response)?;
+                        let terminal_bytes = seq
+                            .stream_sender
+                            .as_ref()
+                            .map(|_| semantic_cost(&TerminalProjection::new(&response)))
+                            .transpose()?;
+                        match (seq.response_sender.is_some(), terminal_bytes) {
+                            (true, Some(terminal_bytes)) => {
+                                let retained = response_bytes
+                                    .checked_add(terminal_bytes)
+                                    .ok_or_else(|| {
+                                        FerrumError::resource_exhausted(
+                                            "completion content size overflow",
+                                        )
+                                    })?;
+                                seq.output_semantic.try_resize(retained)?;
+                                terminal_copy_credit =
+                                    Some(seq.output_semantic.split_off(terminal_bytes)?);
+                            }
+                            (_, Some(terminal_bytes)) => {
+                                seq.output_semantic
+                                    .try_resize(response_bytes.max(terminal_bytes))?;
+                            }
+                            (_, None) => seq.output_semantic.try_resize(response_bytes)?,
+                        }
+                        Ok(())
+                    })();
+                    if let Err(error) = preparation {
+                        terminal_error.get_or_insert_with(|| error.clone());
+                        completion_error.get_or_insert(error);
+                        response.finish_reason = FinishReason::Error;
+                        response.api_response = None;
+                        // Text that was already retained remains the exact
+                        // source of pending spans. An envelope failure is not
+                        // permission to discard it or bypass range validation.
+                    }
+                }
 
                 // The same outer lock excludes a recompute drain until this
                 // exact incarnation and its slot have reached the registry.
@@ -1200,10 +1392,15 @@ impl EngineInner {
                 // The index remains occupied until synchronous scheduler
                 // termination and exact owner transfer finish. Unwinding
                 // earlier leaves the remaining state in its original handle.
-                state.take();
+                let semantic = seq.output_semantic.take_all();
+                let finished = state.take();
                 self.sequences.remove_exact(handle);
+                drop(finished);
                 (
                     response,
+                    semantic,
+                    terminal_copy_credit,
+                    text_provenance,
                     senders.0,
                     senders.1,
                     terminal_error,
@@ -1226,7 +1423,13 @@ impl EngineInner {
         Some(CompletionHandoff {
             inner: self.self_weak.clone(),
             done: None,
-            response,
+            request_id: request_id.clone(),
+            output: CompletionOutput::Draft(CompletionOutputDraft {
+                response,
+                semantic,
+                terminal_copy_credit,
+            }),
+            text_provenance,
             stream_sender,
             response_sender,
             terminal_error,
@@ -1279,7 +1482,13 @@ impl EngineInner {
                 self.write_sequence_terminal_token_trace(
                     &request_id,
                     "completed",
-                    Some(handoff.response.finish_reason),
+                    Some(
+                        handoff
+                            .output
+                            .draft()
+                            .map(|draft| draft.response.finish_reason)
+                            .unwrap_or(FinishReason::Error),
+                    ),
                     handoff.terminal_token_trace.take().as_ref(),
                 );
                 if let Some(error) = handoff.completion_error.take() {
@@ -1316,88 +1525,131 @@ impl EngineInner {
         handoff: &mut CompletionHandoff,
         stream_sender: Option<&OutputSender>,
     ) -> Result<()> {
-        let terminal_error = &mut handoff.terminal_error;
         let mut completion_error = handoff.completion_error.take();
-        let token_close = handoff.token_close.take();
-        let response = &mut handoff.response;
-        // An already-known product error precedes physical-close observation,
-        // but follows every earlier text span in this same delivery owner.
-        let known_stream_error = terminal_error.is_some();
-        if let (Some(sender), Some(error)) = (stream_sender, terminal_error.as_ref()) {
+        let known_stream_error = handoff.terminal_error.is_some();
+        if let (Some(sender), Some(error)) = (stream_sender, handoff.terminal_error.as_ref()) {
             if sender.send(Err(error.clone())).await.is_ok() {
                 handoff.terminal_error_published = true;
             }
         }
-        // Physical closure may remain held after logical completion. Awaiting
-        // the initial result cannot cancel the registry's independent owner.
-        if let Some(ticket) = token_close {
+        if let Some(ticket) = handoff.token_close.take() {
             let close_result = match ticket {
                 Ok(ticket) => ticket.initial_result().await,
                 Err(error) => Err(error),
             };
-            // Drain all terminal owners even if the operation itself failed.
             let observation_result = self.drain_execution_closes();
             if let Err(error) = close_result.and(observation_result) {
                 self.output_tasks.record_control_error(error.clone());
                 self.work_notify.notify_one();
-                terminal_error.get_or_insert_with(|| error.clone());
+                handoff.terminal_error.get_or_insert_with(|| error.clone());
                 completion_error.get_or_insert(error);
-                response.finish_reason = FinishReason::Error;
-                response.api_response = None;
+                let draft = handoff.output.draft_mut()?;
+                draft.response.finish_reason = FinishReason::Error;
+                draft.response.api_response = None;
             }
         }
         self.write_sequence_terminal_token_trace(
             request_id,
             "completed",
-            Some(response.finish_reason),
+            Some(
+                handoff
+                    .output
+                    .draft()
+                    .map(|draft| draft.response.finish_reason)
+                    .unwrap_or(FinishReason::Error),
+            ),
             handoff.terminal_token_trace.take().as_ref(),
         );
 
+        // No pending range remains when delivery calls this function. The
+        // single draft can now be moved to the non-streaming output owner.
+        let mut shared_output = None;
         if let Some(tx) = handoff.response_sender.take() {
-            let response_result = terminal_error
-                .as_ref()
-                .map_or_else(|| Ok(response.clone()), |error| Err(error.clone()));
-            let _ = tx.send(response_result);
+            let result = if let Some(error) = handoff.terminal_error.as_ref() {
+                Err(error.clone())
+            } else {
+                let CompletionOutputDraft {
+                    response,
+                    semantic,
+                    terminal_copy_credit,
+                } = handoff.output.take()?;
+                match InferenceOutput::new(response, semantic) {
+                    Ok(output) => {
+                        shared_output = Some((output.clone(), terminal_copy_credit));
+                        Ok(output)
+                    }
+                    Err(error) => {
+                        handoff.terminal_error.get_or_insert_with(|| error.clone());
+                        completion_error.get_or_insert_with(|| error.clone());
+                        Err(error)
+                    }
+                }
+            };
+            let _ = tx.send(result);
         }
-
-        if let Some(tx) = stream_sender.filter(|_| !known_stream_error) {
-            if let Some(error) = terminal_error.as_ref() {
-                if tx.send(Err(error.clone())).await.is_ok() {
+        if let Some(sender) = stream_sender.filter(|_| !known_stream_error) {
+            if let Some(error) = handoff.terminal_error.as_ref() {
+                if sender.send(Err(error.clone())).await.is_ok() {
                     handoff.terminal_error_published = true;
                 }
             } else {
-                let final_chunk = StreamChunk {
-                    request_id: request_id.clone(),
-                    text: String::new(),
-                    token: None,
-                    finish_reason: Some(response.finish_reason),
-                    usage: Some(response.usage.clone()),
-                    created_at: chrono::Utc::now(),
-                    metadata: HashMap::new(),
-                    api_response: response.api_response.clone(),
-                    execution_evidence: response.execution_evidence.clone(),
+                let terminal = (|| -> Result<(StreamChunk, OutputSemanticLease)> {
+                    if let Some((output, terminal_copy_credit)) = &mut shared_output {
+                        let response = output.response();
+                        let credit = terminal_copy_credit.take().ok_or_else(|| {
+                            FerrumError::internal(
+                                "dual completion has no pre-reserved terminal credit",
+                            )
+                        })?;
+                        Ok((
+                            StreamChunk {
+                                request_id: response.request_id.clone(),
+                                text: String::new(),
+                                token: None,
+                                finish_reason: Some(response.finish_reason),
+                                usage: Some(response.usage.clone()),
+                                created_at: response.created_at,
+                                metadata: response.metadata.clone(),
+                                api_response: response.api_response.clone(),
+                                execution_evidence: response.execution_evidence.clone(),
+                            },
+                            credit,
+                        ))
+                    } else {
+                        let CompletionOutputDraft {
+                            mut response,
+                            semantic,
+                            terminal_copy_credit: _,
+                        } = handoff.output.take()?;
+                        let chunk = StreamChunk {
+                            request_id: request_id.clone(),
+                            text: String::new(),
+                            token: None,
+                            finish_reason: Some(response.finish_reason),
+                            usage: Some(response.usage.clone()),
+                            created_at: response.created_at,
+                            metadata: std::mem::take(&mut response.metadata),
+                            api_response: response.api_response.take(),
+                            execution_evidence: response.execution_evidence.take(),
+                        };
+                        // Pending ranges are drained; only the actual moved
+                        // terminal fields remain. Drop history before resizing.
+                        drop(response);
+                        Ok((chunk, semantic))
+                    }
+                })();
+                let sent = match terminal {
+                    Ok((chunk, credit)) => sender.send_retained(chunk, credit).await,
+                    Err(error) => Err(error),
                 };
-                if let Err(error) = tx.send(Ok(final_chunk)).await {
-                    if !tx.is_closed() {
-                        // A terminal payload can exceed the queue byte limit
-                        // (for example structured output/evidence). EOF is not
-                        // a valid substitute for that explicit delivery error.
-                        let _ = tx.send(Err(error.clone())).await;
+                if let Err(error) = sent {
+                    if !sender.is_closed() {
+                        let _ = sender.send(Err(error.clone())).await;
                         completion_error.get_or_insert(error);
                     }
                 }
             }
         }
-
-        debug!(
-            "Request {} completed: {} tokens, {:?}",
-            request_id,
-            response.tokens.len(),
-            response.finish_reason
-        );
-
-        // All requested publication attempts have reached their disposition.
-        // Only cancellation before this point uses the shutdown fallback.
         handoff.terminal_error.take();
         completion_error.map_or(Ok(()), Err)
     }
@@ -1416,3 +1668,6 @@ fn finish_reason_trace_name(reason: FinishReason) -> &'static str {
 
 #[cfg(test)]
 mod cold_error_tests;
+
+#[cfg(test)]
+mod semantic_tests;

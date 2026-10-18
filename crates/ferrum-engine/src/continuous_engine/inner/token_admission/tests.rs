@@ -109,7 +109,7 @@ struct Fixture {
     executor: Arc<AdmissionGate>,
     model: Arc<Mutex<ModelObservation>>,
     request: InferenceRequest,
-    response: oneshot::Receiver<Result<InferenceResponse>>,
+    response: oneshot::Receiver<Result<InferenceOutput>>,
     ready: Option<oneshot::Receiver<ExecutorSequence>>,
     resume: Option<oneshot::Sender<()>>,
     trace: tempfile::TempDir,
@@ -120,7 +120,7 @@ async fn install_outer(
     engine: &ContinuousBatchEngine,
     mut request: InferenceRequest,
     prompt: Vec<TokenId>,
-) -> oneshot::Receiver<Result<InferenceResponse>> {
+) -> oneshot::Receiver<Result<InferenceOutput>> {
     request.metadata.insert(
         PROMPT_TOKENS_METADATA_KEY.into(),
         serde_json::json!(prompt.len()),

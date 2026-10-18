@@ -119,8 +119,13 @@ impl SequenceRegistry {
     pub(super) fn insert(
         &self,
         id: RequestId,
-        state: SequenceState,
+        mut state: SequenceState,
     ) -> Option<Arc<SequenceHandle>> {
+        if let Some(sender) = &state.stream_sender {
+            state
+                .bind_output_session(sender.output_session().clone())
+                .expect("fixture content fits real output budget");
+        }
         self.index
             .write()
             .insert(id.clone(), SequenceHandle::new(id, state))

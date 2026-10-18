@@ -28,7 +28,7 @@ async fn output_slow_stream_resumes_exact_text_tokens_and_terminal_once() {
         let slow_guard = slow_handle.lock();
         let slow = slow_guard.as_ref().unwrap();
         assert_eq!(slow.generated_tokens.len(), 2);
-        assert_eq!(slow.generated_tokens, healthy.tokens[..2]);
+        assert_eq!(slow.generated_tokens, healthy.response().tokens[..2]);
     }
     assert_eq!(fixture.executor.checked_outputs.load(Ordering::SeqCst), 6);
     let chunks = tokio::time::timeout(Duration::from_secs(3), stream.collect::<Vec<_>>())
@@ -41,12 +41,13 @@ async fn output_slow_stream_resumes_exact_text_tokens_and_terminal_once() {
         .iter()
         .map(|chunk| chunk.chunk().text.as_str())
         .collect();
-    assert_eq!(text, healthy.text);
+    assert_eq!(text, healthy.response().text);
     let tokens: Vec<_> = chunks
         .iter()
         .filter_map(|chunk| chunk.chunk().token)
         .collect();
     let visible: Vec<_> = healthy
+        .response()
         .tokens
         .iter()
         .copied()
@@ -63,13 +64,14 @@ async fn output_slow_stream_resumes_exact_text_tokens_and_terminal_once() {
     assert!(terminals[0].text.is_empty());
     assert_eq!(
         terminals[0].usage.as_ref().unwrap().prompt_tokens,
-        healthy.usage.prompt_tokens
+        healthy.response().usage.prompt_tokens
     );
     assert_eq!(terminals[0].usage.as_ref().unwrap().completion_tokens, 4);
     assert_eq!(
         chunks.last().unwrap().chunk().finish_reason,
         Some(FinishReason::Length)
     );
+    drop(healthy);
     fixture.engine.shutdown().await.unwrap();
     assert_eq!(fixture.executor.checked_outputs.load(Ordering::SeqCst), 8);
     assert_eq!(fixture.executor.maximum_in_flight.load(Ordering::SeqCst), 1);

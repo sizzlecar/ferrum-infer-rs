@@ -1,7 +1,4 @@
-use super::{
-    function_call_arguments_done, function_call_item, message_output_item, reasoning_output_item,
-    ResponseContext,
-};
+use super::{wire, ResponseContext};
 use crate::axum_server::{
     chat_stream::{ChatEventStream, ChatStreamEvent},
     output, stream_error_payload,
@@ -16,8 +13,15 @@ use uuid::Uuid;
 
 type ResponseEvents<'a> = std::pin::Pin<Box<dyn futures::Stream<Item = ResponseEvent> + Send + 'a>>;
 
+#[cfg(test)]
+mod semantic_tests;
+
 enum ResponseEvent {
-    Json { name: &'static str, value: Value },
+    Json {
+        name: &'static str,
+        value: output::Retained<Value>,
+    },
+    Encoded(ferrum_types::Result<axum::body::Bytes>),
     Failed(crate::openai::OpenAiError),
     Done,
 }
@@ -32,7 +36,14 @@ pub(in crate::axum_server) fn adapt_chat_stream(
     let response_id = context.id.clone();
     let created_at = context.created_at;
     let frames = async_stream::try_stream! {
-        let mut state = ResponsesStreamState::new(context);
+        let mut state = match ResponsesStreamState::new(context, chat.session.clone()) {
+            Ok(state) => state,
+            Err(error) => {
+                let (kind, _) = output::encoding_error_details(&error);
+                let bytes = encode_upstream_failure(&chat.session, &response_id, created_at, 0, &stream_error_payload(error.to_string(), kind, None))?;
+                drop(chat); yield bytes; return;
+            }
+        };
         let mut next_sequence = 0;
         {
             let mut events = state.send_initial_events();
@@ -72,11 +83,15 @@ async fn encode_event(
     created_at: u64,
     next_sequence: &mut u64,
 ) -> ferrum_types::Result<(axum::body::Bytes, bool)> {
-    let numbered = matches!(&event, ResponseEvent::Json { .. });
+    let numbered = matches!(
+        &event,
+        ResponseEvent::Json { .. } | ResponseEvent::Encoded(_)
+    );
     let encoded = match event {
         ResponseEvent::Json { name, value } => {
-            output::encode_json(session, Some(name), &value).await
+            output::encode_json(session, Some(name), value.value()).await
         }
+        ResponseEvent::Encoded(encoded) => encoded,
         ResponseEvent::Done => output::encode_done(session).await,
         ResponseEvent::Failed(error) => {
             let bytes =
@@ -166,6 +181,7 @@ fn encode_upstream_failure(
 }
 
 struct ResponsesStreamState {
+    history: ferrum_output::OutputSemanticLease,
     context: ResponseContext,
     sequence: u64,
     next_output_index: usize,
@@ -183,7 +199,7 @@ struct ResponsesStreamState {
     terminal: bool,
 }
 
-#[derive(Default)]
+#[derive(Default, serde::Serialize)]
 struct ToolCallAccumulator {
     id: String,
     name: String,
@@ -191,16 +207,29 @@ struct ToolCallAccumulator {
 }
 
 impl ResponsesStreamState {
-    fn new(context: ResponseContext) -> Self {
-        Self {
+    fn new(
+        context: ResponseContext,
+        session: ferrum_output::OutputSession,
+    ) -> ferrum_types::Result<Self> {
+        let reasoning_item_id = format!("rs_{}", Uuid::new_v4().simple());
+        let text_item_id = format!("msg_{}", Uuid::new_v4().simple());
+        let history = session.try_reserve_semantic(ferrum_output::semantic_cost(&(
+            &reasoning_item_id,
+            &text_item_id,
+            BTreeMap::<u32, ToolCallAccumulator>::new(),
+            Option::<String>::None,
+            Option::<Usage>::None,
+        ))?)?;
+        Ok(Self {
+            history,
             context,
             sequence: 0,
             next_output_index: 0,
-            reasoning_item_id: format!("rs_{}", Uuid::new_v4().simple()),
+            reasoning_item_id,
             reasoning: String::new(),
             reasoning_output_index: None,
             reasoning_done: false,
-            text_item_id: format!("msg_{}", Uuid::new_v4().simple()),
+            text_item_id,
             text: String::new(),
             text_started: false,
             text_output_index: None,
@@ -208,79 +237,116 @@ impl ResponsesStreamState {
             finish_reason: None,
             usage: None,
             terminal: false,
-        }
+        })
     }
 
     fn send_initial_events(&mut self) -> ResponseEvents<'_> {
         Box::pin(async_stream::stream! {
-        let response = self.context.response("in_progress", vec![], None, None);
-        yield self.event("response.created", json!({"response": response}));
-        let response = self.context.response("in_progress", vec![], None, None);
-        yield self.event("response.in_progress", json!({"response": response}));
+            let session = self.history.output_session().clone();
+            for kind in ["response.created", "response.in_progress"] {
+                yield borrowed_event(&session, &mut self.sequence, kind, wire::ResponseEvent { response: wire::ResponseView { context: &self.context, status: "in_progress", output: &[(); 0], usage: None, completed_at: None } }).await;
+            }
         })
     }
 
     fn consume_chat_event(&mut self, event: ChatStreamEvent) -> ResponseEvents<'_> {
         Box::pin(async_stream::stream! {
-        if self.terminal { return; }
-        let chunk = match event {
-            ChatStreamEvent::Done => {
-                let mut events = self.complete();
-                while let Some(event) = events.next().await { yield event; }
-                return;
+            if self.terminal { return; }
+            let owner = match event {
+                ChatStreamEvent::Done => { let mut events = self.complete(); while let Some(event) = events.next().await { yield event; } return; }
+                ChatStreamEvent::Error(error) => { let mut events = self.fail(error); while let Some(event) = events.next().await { yield event; } return; }
+                ChatStreamEvent::Chunk(chunk) => chunk,
+            };
+            let chunk = owner.value();
+            if let Some(usage) = &chunk.usage {
+                if let Err(error) = self.replace_usage(usage) { yield self.quota_error(error); return; }
             }
-            ChatStreamEvent::Error(error) => {
-                let mut events = self.fail(error);
-                while let Some(event) = events.next().await { yield event; }
-                return;
-            }
-            ChatStreamEvent::Chunk(chunk) => chunk,
-        };
-        if let Some(usage) = chunk.usage {
-            self.usage = Some(usage);
-        }
-        for choice in chunk.choices {
-            if let Some(delta) = choice.delta {
-                if let Some(reasoning) = delta.reasoning.filter(|value| !value.is_empty()) {
-                    { let mut events = self.push_reasoning(&reasoning); while let Some(event) = events.next().await { yield event; } }
-                }
-                if !delta.content.is_empty() {
-                    { let mut events = self.push_text(&delta.content); while let Some(event) = events.next().await { yield event; } }
-                }
-                let tool_calls = delta.tool_calls.unwrap_or_default();
-                if !tool_calls.is_empty() {
-                    { let mut events = self.finish_reasoning("completed"); while let Some(event) = events.next().await { yield event; } }
-                }
-                for (position, call) in tool_calls.into_iter().enumerate() {
-                    let index = call.index.unwrap_or(position as u32);
-                    let accumulated = self.tool_calls.entry(index).or_default();
-                    if !call.id.is_empty() {
-                        accumulated.id = call.id;
+            for choice in &chunk.choices {
+                if let Some(delta) = &choice.delta {
+                    if let Some(reasoning) = delta.reasoning.as_deref().filter(|value| !value.is_empty()) {
+                        let mut events = self.push_reasoning(reasoning); while let Some(event) = events.next().await { yield event; }
                     }
-                    if !call.function.name.is_empty() {
-                        accumulated.name = call.function.name;
+                    if !delta.content.is_empty() {
+                        let mut events = self.push_text(&delta.content); while let Some(event) = events.next().await { yield event; }
                     }
-                    accumulated.arguments.push_str(&call.function.arguments);
+                    let calls = delta.tool_calls.as_deref().unwrap_or_default();
+                    if !calls.is_empty() { let mut events = self.finish_reasoning("completed"); while let Some(event) = events.next().await { yield event; } }
+                    for (position, call) in calls.iter().enumerate() {
+                        if let Err(error) = self.append_call(call.index.unwrap_or(position as u32), &call.id, &call.function.name, &call.function.arguments) { yield self.quota_error(error); return; }
+                    }
+                    if let Some(function) = &delta.function_call {
+                        { let mut events = self.finish_reasoning("completed"); while let Some(event) = events.next().await { yield event; } }
+                        let call_id = self.tool_calls.get(&0).filter(|call| !call.id.is_empty()).map(|call| call.id.clone()).unwrap_or_else(|| format!("call_{}", Uuid::new_v4().simple()));
+                        if let Err(error) = self.append_call(0, &call_id, &function.name, &function.arguments) { yield self.quota_error(error); return; }
+                    }
                 }
-                if let Some(function) = delta.function_call {
-                    { let mut events = self.finish_reasoning("completed"); while let Some(event) = events.next().await { yield event; } }
-                    let accumulated = self.tool_calls.entry(0).or_default();
-                    accumulated.id = accumulated
-                        .id
-                        .is_empty()
-                        .then(|| format!("call_{}", Uuid::new_v4().simple()))
-                        .unwrap_or_else(|| accumulated.id.clone());
-                    if !function.name.is_empty() {
-                        accumulated.name = function.name;
-                    }
-                    accumulated.arguments.push_str(&function.arguments);
+                if let Some(reason) = &choice.finish_reason {
+                    let old = self.finish_reason.as_ref().map_or(0, String::len);
+                    if let Err(error) = self.history.try_grow(reason.len().saturating_sub(old)) { yield self.quota_error(error); return; }
+                    self.finish_reason = Some(reason.clone());
+                    if old > reason.len() { self.history.shrink_to(self.history.bytes() - (old - reason.len())).expect("shrinking retained finish reason"); }
                 }
             }
-            if choice.finish_reason.is_some() {
-                self.finish_reason = choice.finish_reason;
-            }
-        }
         })
+    }
+
+    fn quota_error(&mut self, error: ferrum_types::FerrumError) -> ResponseEvent {
+        self.terminal = true;
+        let (kind, _) = output::encoding_error_details(&error);
+        ResponseEvent::Failed(stream_error_payload(error.to_string(), kind, None))
+    }
+
+    fn replace_usage(&mut self, usage: &Usage) -> ferrum_types::Result<()> {
+        let old = ferrum_output::semantic_cost(&self.usage)?;
+        let new = ferrum_output::semantic_cost(&Some(usage))?;
+        self.history.try_resize(self.history.bytes() - old + new)?;
+        self.usage = Some(usage.clone());
+        Ok(())
+    }
+
+    fn append_call(
+        &mut self,
+        index: u32,
+        id: &str,
+        name: &str,
+        arguments: &str,
+    ) -> ferrum_types::Result<()> {
+        let old = self.tool_calls.get(&index);
+        let old_id = old.map_or(0, |call| call.id.len());
+        let old_name = old.map_or(0, |call| call.name.len());
+        let new_id = if id.is_empty() { old_id } else { id.len() };
+        let new_name = if name.is_empty() {
+            old_name
+        } else {
+            name.len()
+        };
+        let entry = if old.is_none() {
+            ferrum_output::semantic_cost(&index)?
+                + ferrum_output::semantic_cost(&ToolCallAccumulator::default())?
+        } else {
+            0
+        };
+        let next = self
+            .history
+            .bytes()
+            .checked_sub(old_id + old_name)
+            .and_then(|n| n.checked_add(new_id))
+            .and_then(|n| n.checked_add(new_name))
+            .and_then(|n| n.checked_add(arguments.len()))
+            .and_then(|n| n.checked_add(entry))
+            .ok_or_else(|| {
+                ferrum_types::FerrumError::resource_exhausted("response call history size overflow")
+            })?;
+        self.history.try_resize(next)?;
+        let call = self.tool_calls.entry(index).or_default();
+        if !id.is_empty() {
+            call.id = id.to_owned();
+        }
+        if !name.is_empty() {
+            call.name = name.to_owned();
+        }
+        call.arguments.push_str(arguments);
+        Ok(())
     }
 
     fn allocate_output_index(&mut self) -> usize {
@@ -318,6 +384,7 @@ impl ResponsesStreamState {
                 }),
             );
         }
+        if let Err(error) = self.history.try_grow(delta.len()) { yield self.quota_error(error); return; }
         self.reasoning.push_str(delta);
         let output_index = self
             .reasoning_output_index
@@ -335,38 +402,13 @@ impl ResponsesStreamState {
 
     fn finish_reasoning<'a>(&'a mut self, status: &'a str) -> ResponseEvents<'a> {
         Box::pin(async_stream::stream! {
-        let Some(output_index) = self.reasoning_output_index else {
-            return;
-        };
-        if self.reasoning_done {
-            return;
-        }
-        yield self.event("response.reasoning_text.done",
-            json!({
-                "item_id": self.reasoning_item_id,
-                "output_index": output_index,
-                "content_index": 0,
-                "text": self.reasoning
-            }),
-        );
-        yield self.event("response.content_part.done",
-            json!({
-                "item_id": self.reasoning_item_id,
-                "output_index": output_index,
-                "content_index": 0,
-                "part": {"type": "reasoning_text", "text": self.reasoning}
-            }),
-        );
-        let item = reasoning_output_item(
-            self.reasoning_item_id.clone(),
-            self.reasoning.clone(),
-            status,
-            self.context.include_encrypted_reasoning,
-        );
-        yield self.event("response.output_item.done",
-            json!({"output_index": output_index, "item": item}),
-        );
-        self.reasoning_done = true;
+            let Some(output_index) = self.reasoning_output_index else { return; };
+            if self.reasoning_done { return; }
+            let session = self.history.output_session().clone();
+            yield borrowed_event(&session, &mut self.sequence, "response.reasoning_text.done", wire::TextEvent { item_id: &self.reasoning_item_id, output_index, content_index: 0, text: &self.reasoning, logprobs: None }).await;
+            yield borrowed_event(&session, &mut self.sequence, "response.content_part.done", wire::PartEvent { item_id: &self.reasoning_item_id, output_index, content_index: 0, part: wire::ReasoningPart { kind: "reasoning_text", text: &self.reasoning } }).await;
+            yield borrowed_event(&session, &mut self.sequence, "response.output_item.done", wire::ItemEvent { output_index, item: wire::Item::Reasoning { id: &self.reasoning_item_id, text: &self.reasoning, status, encrypted: self.context.include_encrypted_reasoning } }).await;
+            self.reasoning_done = true;
         })
     }
 
@@ -398,6 +440,7 @@ impl ResponsesStreamState {
                 }),
             );
         }
+        if let Err(error) = self.history.try_grow(delta.len()) { yield self.quota_error(error); return; }
         self.text.push_str(delta);
         let output_index = self.text_output_index.expect("text output index assigned");
         yield self.event("response.output_text.delta",
@@ -414,151 +457,49 @@ impl ResponsesStreamState {
 
     fn complete(&mut self) -> ResponseEvents<'_> {
         Box::pin(async_stream::stream! {
-        if self.terminal {
-            return;
-        }
-        if !self.context.parallel_tool_calls && self.tool_calls.len() > 1 {
-            { let mut events = self.fail(stream_error_payload("model emitted multiple function calls while parallel_tool_calls=false", "internal_server_error", None)); while let Some(event) = events.next().await { yield event; } }
-            return;
-        }
-        let status = if self.finish_reason.as_deref() == Some("length") {
-            "incomplete"
-        } else {
-            "completed"
-        };
-        let reasoning_status = if status == "incomplete"
-            && !self.text_started
-            && self.tool_calls.is_empty()
-            && self.reasoning_output_index.is_some()
-        {
-            "incomplete"
-        } else {
-            "completed"
-        };
-        { let mut events = self.finish_reasoning(reasoning_status); while let Some(event) = events.next().await { yield event; } }
-        let mut output = BTreeMap::new();
-        if self.text_started
-            || (self.tool_calls.is_empty() && self.reasoning_output_index.is_none())
-        {
-            if !self.text_started {
-                { let mut events = self.push_text(""); while let Some(event) = events.next().await { yield event; } }
+            if self.terminal { return; }
+            if !self.context.parallel_tool_calls && self.tool_calls.len() > 1 {
+                let mut events = self.fail(stream_error_payload("model emitted multiple function calls while parallel_tool_calls=false", "internal_server_error", None)); while let Some(event) = events.next().await { yield event; } return;
             }
-            let output_index = self.text_output_index.expect("text output index assigned");
-            yield self.event("response.output_text.done",
-                json!({
-                    "item_id": self.text_item_id,
-                    "output_index": output_index,
-                    "content_index": 0,
-                    "text": self.text,
-                    "logprobs": []
-                }),
-            );
-            let text_status = if status == "incomplete" && self.tool_calls.is_empty() {
-                "incomplete"
-            } else {
-                "completed"
-            };
-            let phase = if self.tool_calls.is_empty() {
-                AssistantMessagePhase::FinalAnswer
-            } else {
-                AssistantMessagePhase::Commentary
-            };
-            let item = message_output_item(
-                self.text_item_id.clone(),
-                self.text.clone(),
-                text_status,
-                phase,
-            );
-            yield self.event("response.content_part.done",
-                json!({
-                    "item_id": self.text_item_id,
-                    "output_index": output_index,
-                    "content_index": 0,
-                    "part": item["content"][0].clone()
-                }),
-            );
-            yield self.event("response.output_item.done",
-                json!({"output_index": output_index, "item": item.clone()}),
-            );
-            output.insert(output_index, item);
-        }
-        if let Some(output_index) = self.reasoning_output_index {
-            output.insert(
-                output_index,
-                reasoning_output_item(
-                    self.reasoning_item_id.clone(),
-                    self.reasoning.clone(),
-                    reasoning_status,
-                    self.context.include_encrypted_reasoning,
-                ),
-            );
-        }
-
-        let calls = std::mem::take(&mut self.tool_calls);
-        let call_count = calls.len();
-        for (position, (_, call)) in calls.into_iter().enumerate() {
-            let output_index = self.allocate_output_index();
-            let call_id = if call.id.is_empty() {
-                format!("call_{}", Uuid::new_v4().simple())
-            } else {
-                call.id
-            };
-            let item_id = format!("fc_{}", Uuid::new_v4().simple());
-            let response_name = self.context.tool_names.response_name(&call.name);
-            let in_progress =
-                function_call_item(item_id.clone(), "in_progress", &call_id, &response_name, "");
-            yield self.event("response.output_item.added",
-                json!({"output_index": output_index, "item": in_progress}),
-            );
-            if !call.arguments.is_empty() {
-                yield self.event("response.function_call_arguments.delta",
-                    json!({
-                        "item_id": item_id,
-                        "output_index": output_index,
-                        "delta": call.arguments
-                    }),
-                );
+            let status = if self.finish_reason.as_deref() == Some("length") { "incomplete" } else { "completed" };
+            let reasoning_status = if status == "incomplete" && !self.text_started && self.tool_calls.is_empty() && self.reasoning_output_index.is_some() { "incomplete" } else { "completed" };
+            { let mut events = self.finish_reasoning(reasoning_status); while let Some(event) = events.next().await { yield event; } }
+            if !self.text_started && self.tool_calls.is_empty() && self.reasoning_output_index.is_none() {
+                let mut events = self.push_text(""); while let Some(event) = events.next().await { yield event; }
             }
-            let arguments_done = function_call_arguments_done(
-                &item_id,
-                output_index,
-                &call_id,
-                &response_name,
-                &call.arguments,
-            );
-            yield self.event("response.function_call_arguments.done", arguments_done);
-            let call_status = if status == "incomplete" && position + 1 == call_count {
-                "incomplete"
-            } else {
-                "completed"
-            };
-            let item = function_call_item(
-                item_id,
-                call_status,
-                &call_id,
-                &response_name,
-                &call.arguments,
-            );
-            yield self.event("response.output_item.done",
-                json!({"output_index": output_index, "item": item.clone()}),
-            );
-            output.insert(output_index, item);
-        }
-
-        let response = self.context.response(
-            status,
-            output.into_values().collect(),
-            self.usage.as_ref(),
-            None,
-        );
-        let terminal_event = if status == "incomplete" {
-            "response.incomplete"
-        } else {
-            "response.completed"
-        };
-        yield self.event(terminal_event, json!({"response": response}));
-        yield ResponseEvent::Done;
-        self.terminal = true;
+            let session = self.history.output_session().clone();
+            let phase = if self.tool_calls.is_empty() { AssistantMessagePhase::FinalAnswer } else { AssistantMessagePhase::Commentary };
+            let text_status = if status == "incomplete" && self.tool_calls.is_empty() { "incomplete" } else { "completed" };
+            if let Some(output_index) = self.text_output_index {
+                yield borrowed_event(&session, &mut self.sequence, "response.output_text.done", wire::TextEvent { item_id: &self.text_item_id, output_index, content_index: 0, text: &self.text, logprobs: Some([]) }).await;
+                yield borrowed_event(&session, &mut self.sequence, "response.content_part.done", wire::PartEvent { item_id: &self.text_item_id, output_index, content_index: 0, part: wire::TextPart { kind: "output_text", text: &self.text, annotations: [], logprobs: [] } }).await;
+                yield borrowed_event(&session, &mut self.sequence, "response.output_item.done", wire::ItemEvent { output_index, item: wire::Item::Message { id: &self.text_item_id, text: &self.text, status: text_status, phase } }).await;
+            }
+            // Only small wire identities are newly owned. Full text and arguments
+            // below borrow the existing history for every terminal event.
+            let call_metadata: Vec<_> = self.tool_calls.values().map(|call| (format!("fc_{}", Uuid::new_v4().simple()), if call.id.is_empty() { format!("call_{}", Uuid::new_v4().simple()) } else { call.id.clone() }, self.context.tool_names.response_name(&call.name))).collect();
+            let _metadata = match ferrum_output::semantic_cost(&call_metadata).and_then(|n| session.try_reserve_semantic(n)) { Ok(lease) => lease, Err(error) => { yield self.quota_error(error); return; } };
+            let call_base = self.next_output_index;
+            self.next_output_index += self.tool_calls.len();
+            for (position, (call, (item_id, call_id, name))) in self.tool_calls.values().zip(&call_metadata).enumerate() {
+                let output_index = call_base + position;
+                yield borrowed_event(&session, &mut self.sequence, "response.output_item.added", wire::ItemEvent { output_index, item: wire::Item::Function { id: item_id, call_id, name, arguments: "", status: "in_progress" } }).await;
+                if !call.arguments.is_empty() {
+                    yield borrowed_event(&session, &mut self.sequence, "response.function_call_arguments.delta", wire::ArgumentsDelta { item_id, output_index, delta: &call.arguments }).await;
+                }
+                yield borrowed_event(&session, &mut self.sequence, "response.function_call_arguments.done", wire::ArgumentsEvent { item_id, output_index, call_id, name: &name.name, arguments: &call.arguments, namespace: name.namespace.as_deref() }).await;
+                let call_status = if status == "incomplete" && position + 1 == self.tool_calls.len() { "incomplete" } else { "completed" };
+                yield borrowed_event(&session, &mut self.sequence, "response.output_item.done", wire::ItemEvent { output_index, item: wire::Item::Function { id: item_id, call_id, name, arguments: &call.arguments, status: call_status } }).await;
+            }
+            let mut items = BTreeMap::new();
+            if let Some(index) = self.reasoning_output_index { items.insert(index, wire::Item::Reasoning { id: &self.reasoning_item_id, text: &self.reasoning, status: reasoning_status, encrypted: self.context.include_encrypted_reasoning }); }
+            if let Some(index) = self.text_output_index { items.insert(index, wire::Item::Message { id: &self.text_item_id, text: &self.text, status: text_status, phase }); }
+            for (position, (call, (id, call_id, name))) in self.tool_calls.values().zip(&call_metadata).enumerate() { items.insert(call_base + position, wire::Item::Function { id, call_id, name, arguments: &call.arguments, status: if status == "incomplete" && position + 1 == self.tool_calls.len() { "incomplete" } else { "completed" } }); }
+            let ordered: Vec<_> = items.into_values().collect();
+            let response = wire::ResponseView { context: &self.context, status, output: ordered, usage: self.usage.as_ref(), completed_at: Some(chrono::Utc::now().timestamp() as u64) };
+            yield borrowed_event(&session, &mut self.sequence, if status == "incomplete" { "response.incomplete" } else { "response.completed" }, wire::ResponseEvent { response }).await;
+            yield ResponseEvent::Done;
+            self.terminal = true;
         })
     }
 
@@ -578,11 +519,29 @@ impl ResponsesStreamState {
             object.insert("sequence_number".to_string(), json!(self.sequence));
         }
         self.sequence += 1;
-        ResponseEvent::Json {
-            name: event_type,
-            value: event,
+        match output::Retained::new(self.history.output_session(), event) {
+            Ok(value) => ResponseEvent::Json {
+                name: event_type,
+                value,
+            },
+            Err(error) => self.quota_error(error),
         }
     }
+}
+
+async fn borrowed_event<T: serde::Serialize + Send + Sync>(
+    session: &ferrum_output::OutputSession,
+    sequence: &mut u64,
+    kind: &'static str,
+    fields: T,
+) -> ResponseEvent {
+    let event = wire::Event {
+        kind,
+        sequence_number: *sequence,
+        fields,
+    };
+    *sequence += 1;
+    ResponseEvent::Encoded(output::encode_json(session, Some(kind), &event).await)
 }
 
 #[cfg(test)]
@@ -900,30 +859,35 @@ mod tests {
             ..Default::default()
         })
         .unwrap();
+        let session = budget.try_open_session().unwrap();
         let chat = ChatEventStream {
-            session: budget.try_open_session().unwrap(),
+            session: session.clone(),
             events: Box::pin(futures::stream::iter([ChatStreamEvent::Chunk(
-                ChatCompletionsResponse {
-                    id: "chat_test".into(),
-                    object: "chat.completion.chunk".into(),
-                    created: 0,
-                    model: "test-model".into(),
-                    usage: None,
-                    choices: vec![ChatChoice {
-                        index: 0,
-                        message: None,
-                        finish_reason: None,
-                        delta: Some(ChatMessage {
-                            role: MessageRole::Assistant,
-                            content: "x".repeat(4096),
-                            reasoning: None,
-                            name: None,
-                            tool_calls: None,
-                            tool_call_id: None,
-                            function_call: None,
-                        }),
-                    }],
-                },
+                output::Retained::new(
+                    &session,
+                    ChatCompletionsResponse {
+                        id: "chat_test".into(),
+                        object: "chat.completion.chunk".into(),
+                        created: 0,
+                        model: "test-model".into(),
+                        usage: None,
+                        choices: vec![ChatChoice {
+                            index: 0,
+                            message: None,
+                            finish_reason: None,
+                            delta: Some(ChatMessage {
+                                role: MessageRole::Assistant,
+                                content: "x".repeat(4096),
+                                reasoning: None,
+                                name: None,
+                                tool_calls: None,
+                                tool_call_id: None,
+                                function_call: None,
+                            }),
+                        }],
+                    },
+                )
+                .unwrap(),
             )])),
         };
         let mut body = adapt_chat_stream(chat, response_context())
@@ -952,6 +916,11 @@ mod tests {
             "failure must follow the two valid initial events"
         );
         drop(body);
+        assert_eq!(budget.usage().semantic_bytes, 0);
+        assert_eq!(budget.usage().encoded_bytes, 0);
+        assert_eq!(budget.usage().control_bytes, 0);
+        assert_eq!(budget.usage().sessions, 1);
+        drop(session);
         assert_eq!(budget.usage().sessions, 0);
     }
 }

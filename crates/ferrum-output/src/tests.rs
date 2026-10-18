@@ -56,6 +56,7 @@ async fn consumed_chunk_keeps_its_bytes_and_session_after_stream_drop() {
             sessions: 1,
             queued_bytes: bytes,
             encoded_bytes: 0,
+            semantic_bytes: 0,
             control_bytes: 0,
         }
     );
@@ -67,6 +68,7 @@ async fn consumed_chunk_keeps_its_bytes_and_session_after_stream_drop() {
             sessions: 0,
             queued_bytes: 0,
             encoded_bytes: 0,
+            semantic_bytes: 0,
             control_bytes: 0,
         }
     );
@@ -120,6 +122,7 @@ async fn encoding_uses_a_distinct_pool_and_lease_keeps_session() {
             sessions: 1,
             queued_bytes: 0,
             encoded_bytes: 16,
+            semantic_bytes: 0,
             control_bytes: 0,
         }
     );

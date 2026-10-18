@@ -4,11 +4,12 @@
 
 use ferrum_engine::{ContinuousBatchEngine, KvCacheManager, LlmInferenceEngine};
 use ferrum_kv::managers::paged::{PagedKvCacheConfig, PagedKvCacheManager};
+use ferrum_output::InferenceOutput;
 use ferrum_scheduler::implementations::ContinuousBatchScheduler;
 use ferrum_testkit::{
     MockSampler, MockTensorFactory, MockTokenizer, PagedAttentionExecutor, PagedExecutorConfig,
 };
-use ferrum_types::{InferenceRequest, InferenceResponse, SchedulerConfig};
+use ferrum_types::{InferenceRequest, SchedulerConfig};
 use std::sync::Arc;
 
 const VOCAB_SIZE: usize = 256;
@@ -78,7 +79,7 @@ async fn single_request_with_paged_kv() {
 
     // Should complete with some tokens generated
     assert!(
-        !response.text.is_empty() || !response.tokens.is_empty(),
+        !response.response().text.is_empty() || !response.response().tokens.is_empty(),
         "Should produce output"
     );
 
@@ -95,7 +96,7 @@ async fn multiple_requests_sequential() {
         let request = make_request(&format!("Request {}", i));
         let response = engine.infer(request).await.unwrap();
         assert!(
-            !response.tokens.is_empty(),
+            !response.response().tokens.is_empty(),
             "Request {} should produce tokens",
             i
         );
@@ -261,7 +262,7 @@ async fn preemption_allows_all_requests_to_complete() {
         }));
     }
 
-    let results: Vec<InferenceResponse> = futures::future::join_all(handles)
+    let results: Vec<InferenceOutput> = futures::future::join_all(handles)
         .await
         .into_iter()
         .map(|r| r.unwrap().unwrap())
@@ -269,7 +270,10 @@ async fn preemption_allows_all_requests_to_complete() {
 
     assert_eq!(results.len(), 5, "All requests should complete");
     for resp in &results {
-        assert!(!resp.tokens.is_empty(), "Each should generate tokens");
+        assert!(
+            !resp.response().tokens.is_empty(),
+            "Each should generate tokens"
+        );
     }
 
     // All KV caches freed after completion

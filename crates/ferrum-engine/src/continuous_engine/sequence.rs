@@ -1,5 +1,8 @@
 use super::*;
 
+#[path = "sequence_semantic.rs"]
+mod semantic;
+
 #[derive(Debug)]
 struct SequenceTokenTiming {
     wall_anchor_unix_nanos: i64,
@@ -155,6 +158,7 @@ impl SequenceSamplingHistory {
         &mut self,
         start_token_index: usize,
         generated_tokens: &[TokenId],
+        credit: &mut OutputSemanticLease,
     ) -> Result<bool> {
         if start_token_index > generated_tokens.len() {
             return Err(FerrumError::internal(format!(
@@ -167,31 +171,64 @@ impl SequenceSamplingHistory {
             return Ok(false);
         }
         self.scope = scope;
-        self.rebuild_from(start_token_index, generated_tokens);
+        self.rebuild_from(start_token_index, generated_tokens, credit)?;
         Ok(true)
     }
 
-    pub(super) fn enter_hidden_structured_output(&mut self) -> bool {
+    pub(super) fn enter_hidden_structured_output(
+        &mut self,
+        credit: &mut OutputSemanticLease,
+    ) -> Result<bool> {
         if self.scope == SequenceSamplingHistoryScope::HiddenStructuredOutput {
-            return false;
+            return Ok(false);
         }
         self.scope = SequenceSamplingHistoryScope::HiddenStructuredOutput;
-        self.token_frequencies.clear();
-        true
+        self.clear(credit)?;
+        Ok(true)
     }
 
-    fn rebuild_from(&mut self, start_token_index: usize, generated_tokens: &[TokenId]) {
+    const ENTRY_BYTES: usize = std::mem::size_of::<TokenId>() + std::mem::size_of::<usize>();
+
+    fn clear(&mut self, credit: &mut OutputSemanticLease) -> Result<()> {
+        let bytes = self
+            .token_frequencies
+            .len()
+            .checked_mul(Self::ENTRY_BYTES)
+            .ok_or_else(|| FerrumError::internal("sampling history accounting overflow"))?;
+        let remaining = credit
+            .bytes()
+            .checked_sub(bytes)
+            .ok_or_else(|| FerrumError::internal("sampling history lost its content credit"))?;
         self.token_frequencies.clear();
-        for &token in &generated_tokens[start_token_index..] {
-            *self.token_frequencies.entry(token).or_insert(0) += 1;
+        credit.shrink_to(remaining)
+    }
+
+    fn rebuild_from(
+        &mut self,
+        start: usize,
+        generated: &[TokenId],
+        credit: &mut OutputSemanticLease,
+    ) -> Result<()> {
+        self.clear(credit)?;
+        for &token in &generated[start..] {
+            self.record(token, credit)?;
         }
+        Ok(())
     }
 
-    pub(super) fn record(&mut self, token: TokenId) {
+    pub(super) fn record(
+        &mut self,
+        token: TokenId,
+        credit: &mut OutputSemanticLease,
+    ) -> Result<()> {
         if self.scope == SequenceSamplingHistoryScope::HiddenStructuredOutput {
-            return;
+            return Ok(());
+        }
+        if !self.token_frequencies.contains_key(&token) {
+            credit.try_grow(Self::ENTRY_BYTES)?;
         }
         *self.token_frequencies.entry(token).or_insert(0) += 1;
+        Ok(())
     }
 
     pub(super) fn previous_tokens<'a>(
@@ -242,6 +279,10 @@ pub struct SequenceState {
     pub original_request: InferenceRequest,
     pub input_tokens: Vec<TokenId>,
     pub generated_tokens: Vec<TokenId>,
+    // One credit owner for this request's retained generated payload. All
+    // mutable token/grammar/sampling state remains in this original state.
+    pub(super) output_semantic: OutputSemanticLease,
+    output_accounting_error: Option<FerrumError>,
     /// The executor's sole live incarnation and committed token position.
     /// This is an execution observation, not a second physical KV allocation.
     /// Exact existing scheduler queue identity while preparation is in flight.
@@ -262,7 +303,7 @@ pub struct SequenceState {
     /// opt-in unified chunked prefill. Zero for the normal full-prefill path.
     pub prefill_tokens_processed: usize,
     pub(super) stream_sender: Option<OutputSender>,
-    pub response_sender: Option<tokio::sync::oneshot::Sender<Result<InferenceResponse>>>,
+    pub response_sender: Option<tokio::sync::oneshot::Sender<Result<InferenceOutput>>>,
     pub(super) request_slot: Option<RequestSlotLease>,
     pub start_time: Instant,
     /// Present only for callers that explicitly request the latency preset.
@@ -351,6 +392,7 @@ pub(super) struct SequenceCompletionResources {
 }
 
 impl SequenceState {
+    #[cfg(test)]
     pub fn new(request: InferenceRequest, input_tokens: Vec<TokenId>) -> Self {
         Self::new_with_tokenizer(request, input_tokens, None)
     }
@@ -358,6 +400,7 @@ impl SequenceState {
     /// Build sequence state, optionally wiring a tokenizer for constrained
     /// decoding. Test-only direct constructors build a local grammar factory;
     /// product entrypoints use the fallible shared-factory constructor below.
+    #[cfg(test)]
     pub fn new_with_tokenizer(
         request: InferenceRequest,
         input_tokens: Vec<TokenId>,
@@ -366,6 +409,7 @@ impl SequenceState {
         Self::new_with_tokenizer_and_model_vocab_size(request, input_tokens, tokenizer, None)
     }
 
+    #[cfg(test)]
     pub fn new_with_tokenizer_and_model_vocab_size(
         request: InferenceRequest,
         input_tokens: Vec<TokenId>,
@@ -378,6 +422,8 @@ impl SequenceState {
             tokenizer,
             model_vocab_size,
             None,
+            OutputBudget::new(Default::default()).expect("valid fixture budget")
+                .try_open_session().expect("fixture output session"),
         )
         .expect("direct SequenceState construction requires supported sampling and structured-output contracts")
     }
@@ -388,6 +434,7 @@ impl SequenceState {
         tokenizer: Option<Arc<dyn Tokenizer + Send + Sync>>,
         model_vocab_size: Option<usize>,
         shared_structured_factory: Option<&StructuredOutputFactory>,
+        output_session: OutputSession,
     ) -> Result<Self> {
         request.sampling_params.validate()?;
         if request.sampling_params.tfs.is_some()
@@ -544,6 +591,8 @@ impl SequenceState {
             original_request: request.clone(),
             input_tokens,
             generated_tokens: Vec::new(),
+            output_semantic: output_session.try_reserve_semantic(0)?,
+            output_accounting_error: None,
             pending_token_admission: None,
             execution_frontier: None,
             execution_close: None,
@@ -588,6 +637,9 @@ impl SequenceState {
     }
 
     pub(super) fn record_generated_token_commit(&mut self) {
+        if self.token_timing.is_some() && !self.reserve_timing_bytes(8) {
+            return;
+        }
         if let Some(timing) = &mut self.token_timing {
             timing.record_commit(self.start_time, Instant::now());
         }
@@ -601,12 +653,23 @@ impl SequenceState {
     }
 
     pub(super) fn close_decode_scheduling(&mut self, ended_at: Instant) {
+        if self
+            .token_timing
+            .as_ref()
+            .is_some_and(|timing| timing.pending_decode_scheduling_started_at.is_some())
+            && !self.reserve_timing_bytes(64)
+        {
+            return;
+        }
         if let Some(timing) = &mut self.token_timing {
             timing.close_decode_scheduling(self.start_time, ended_at);
         }
     }
 
     pub(super) fn record_decode_execution(&mut self, started_at: Instant, ended_at: Instant) {
+        if self.token_timing.is_some() && !self.reserve_timing_bytes(64) {
+            return;
+        }
         if let Some(timing) = &mut self.token_timing {
             timing.record_decode_stage_interval(
                 self.start_time,
@@ -621,6 +684,19 @@ impl SequenceState {
         &mut self,
         postprocess_started_at: Option<Instant>,
     ) {
+        // A stage has two u64 endpoints and a fixed enum name; reserve a
+        // conservative constant, reconciled once when evidence is frozen.
+        if self.token_timing.is_some()
+            && !self.reserve_timing_bytes(
+                8 + if postprocess_started_at.is_some() {
+                    64
+                } else {
+                    0
+                },
+            )
+        {
+            return;
+        }
         let Some(timing) = &mut self.token_timing else {
             return;
         };
@@ -643,10 +719,28 @@ impl SequenceState {
     }
 
     pub(super) fn take_execution_evidence(&mut self) -> Result<Option<InferenceExecutionEvidence>> {
+        if let Some(error) = self.output_accounting_error.as_ref() {
+            return Err(error.clone());
+        }
         let capture_prompt = self
             .original_request
             .evidence_request
             .capture_prompt_token_ids;
+        if capture_prompt || self.token_timing.is_some() {
+            let copied = self
+                .generated_tokens
+                .len()
+                .checked_add(if capture_prompt {
+                    self.input_tokens.len()
+                } else {
+                    0
+                })
+                .and_then(|count| count.checked_mul(4))
+                .ok_or_else(|| {
+                    FerrumError::resource_exhausted("execution evidence size overflow")
+                })?;
+            self.output_semantic.try_grow(copied)?;
+        }
         let timing = self
             .token_timing
             .take()
@@ -872,9 +966,38 @@ impl SequenceState {
                 token.get()
             )));
         }
+        let growth = 4usize
+            .checked_add(
+                self.structured_output_processor
+                    .as_ref()
+                    .map_or(Ok(0), |processor| {
+                        processor.retained_token_growth_bound(token)
+                    })?,
+            )
+            .ok_or_else(|| FerrumError::resource_exhausted("generated output size overflow"))?;
+        let new_frequency = self.sampling_history.scope
+            != SequenceSamplingHistoryScope::HiddenStructuredOutput
+            && !self.sampling_history.token_frequencies.contains_key(&token);
+        let growth = growth
+            .checked_add(if new_frequency {
+                SequenceSamplingHistory::ENTRY_BYTES
+            } else {
+                0
+            })
+            .ok_or_else(|| FerrumError::resource_exhausted("generated output size overflow"))?;
+        // Acquire the whole growth before any mutable completion/grammar
+        // state changes. A later error retains this credit until that state
+        // really drops; it cannot claim those mutations were rolled back.
+        self.output_semantic.try_grow(growth)?;
         self.accept_response_completion_token(tokenizer, token)?;
+        if self.sampling_history.scope != SequenceSamplingHistoryScope::HiddenStructuredOutput {
+            *self
+                .sampling_history
+                .token_frequencies
+                .entry(token)
+                .or_insert(0) += 1;
+        }
         self.generated_tokens.push(token);
-        self.sampling_history.record(token);
         match next_pending_utf8_bytes {
             Some(Ok(bytes)) => {
                 self.pending_decoded_utf8_fragment = !bytes.is_empty();
@@ -981,7 +1104,8 @@ impl SequenceState {
             // Replay has not resolved the hidden/visible boundary yet. Keep
             // penalties disabled until the grammar mask reports the exact
             // visible-output start, then rebuild that suffix once.
-            self.sampling_history.enter_hidden_structured_output();
+            self.sampling_history
+                .enter_hidden_structured_output(&mut self.output_semantic)?;
         }
         Ok(())
     }
@@ -1163,10 +1287,12 @@ impl SequenceState {
                 self.sampling_history.activate_visible_structured_output(
                     start_token_index,
                     &self.generated_tokens,
+                    &mut self.output_semantic,
                 )?;
             }
             (true, None) => {
-                self.sampling_history.enter_hidden_structured_output();
+                self.sampling_history
+                    .enter_hidden_structured_output(&mut self.output_semantic)?;
             }
             (false, _) => {}
         }

@@ -78,7 +78,7 @@ async fn decode_count_matches_generated_tokens() {
 
     let resp = eng.infer(req("hello", 10)).await.unwrap();
     // prefill produces 1 token, decode produces the rest
-    let _total_tokens = resp.text.split_whitespace().count().max(1);
+    let _total_tokens = resp.response().text.split_whitespace().count().max(1);
     assert!(
         executor.decode_count() >= 9,
         "expected ≥9 decodes, got {}",
@@ -165,7 +165,10 @@ async fn concurrent_requests_complete_independently() {
     let mut successes = 0;
     for h in handles {
         if let Ok(Ok(resp)) = h.await {
-            assert_eq!(resp.finish_reason, ferrum_types::FinishReason::Length);
+            assert_eq!(
+                resp.response().finish_reason,
+                ferrum_types::FinishReason::Length
+            );
             successes += 1;
         }
     }
@@ -178,7 +181,7 @@ async fn concurrent_requests_complete_independently() {
 async fn single_token_generation() {
     let eng = engine();
     let resp = eng.infer(req("test", 1)).await.unwrap();
-    assert!(!resp.text.is_empty());
+    assert!(!resp.response().text.is_empty());
 }
 
 #[tokio::test]
@@ -194,11 +197,14 @@ async fn response_has_valid_metadata() {
     let eng = engine();
     let resp = eng.infer(req("test metadata", 5)).await.unwrap();
 
-    assert_eq!(resp.finish_reason, ferrum_types::FinishReason::Length);
-    assert!(resp.usage.completion_tokens > 0);
-    assert!(resp.usage.prompt_tokens > 0);
     assert_eq!(
-        resp.usage.total_tokens,
-        resp.usage.prompt_tokens + resp.usage.completion_tokens
+        resp.response().finish_reason,
+        ferrum_types::FinishReason::Length
+    );
+    assert!(resp.response().usage.completion_tokens > 0);
+    assert!(resp.response().usage.prompt_tokens > 0);
+    assert_eq!(
+        resp.response().usage.total_tokens,
+        resp.response().usage.prompt_tokens + resp.response().usage.completion_tokens
     );
 }

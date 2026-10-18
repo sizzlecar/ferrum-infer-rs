@@ -267,3 +267,145 @@ async fn completion_terminal_decode_error_preserves_prior_client_error() {
     assert_eq!(fixture.executor.close_call_counts(), (0, 1));
     actual::assert_closed_once(&fixture).await;
 }
+
+async fn pending_span_terminal_provenance(decode_fails: bool) {
+    let (mut fixture, fault) = fixture().await;
+    let handle = fixture
+        .engine
+        .inner
+        .sequences
+        .get(&fixture.request_id)
+        .unwrap();
+    let (sender, text, token) = {
+        let state = handle.lock();
+        let state = state.as_ref().unwrap();
+        (
+            state.stream_sender.as_ref().unwrap().clone(),
+            fixture
+                .engine
+                .inner
+                .tokenizer
+                .decode(&state.generated_tokens, true)
+                .unwrap(),
+            *state.generated_tokens.last().unwrap(),
+        )
+    };
+    assert!(!text.is_empty());
+    let session = sender.output_session().clone();
+    let held = session
+        .reserve_queued(session.config().queued_bytes_total)
+        .await
+        .unwrap();
+    let range = 0..text.len() + usize::from(!decode_fails);
+    // The positive arm uses the actual previously generated text. The negative
+    // arm deliberately violates its byte range while keeping decoding valid.
+    sender
+        .publish_text(
+            &fixture.engine.inner,
+            StreamChunk {
+                request_id: fixture.request_id.clone(),
+                text,
+                token: Some(token),
+                finish_reason: None,
+                usage: None,
+                created_at: chrono::Utc::now(),
+                metadata: HashMap::new(),
+                api_response: None,
+                execution_evidence: None,
+            },
+            range.clone(),
+            None,
+        )
+        .unwrap();
+    assert!(matches!(
+        fixture.stream.try_recv(),
+        Err(mpsc::error::TryRecvError::Empty)
+    ));
+    if decode_fails {
+        fault.remaining.store(usize::MAX, Ordering::SeqCst);
+    }
+    let original =
+        FerrumError::request_validation("prior client failure must not conceal provenance");
+    fixture
+        .engine
+        .inner
+        .complete_request_detached(
+            &fixture.request_id,
+            FinishReason::Error,
+            Some(original.clone()),
+        )
+        .unwrap();
+    assert_eq!(
+        fixture
+            .response
+            .try_recv()
+            .unwrap()
+            .unwrap_err()
+            .to_string(),
+        original.to_string()
+    );
+    let projection = sender.completed_text(range).unwrap_err();
+    if decode_fails {
+        assert_tokenizer_error(&projection);
+    } else {
+        assert!(matches!(&projection, FerrumError::Internal { message }
+            if message == "pending output span disagrees with completed text"));
+    }
+    if decode_fails {
+        // The driver may consume the first decode error while the reader is
+        // still blocked. Later delivery must not report that same failure again.
+        let recorded = fixture
+            .engine
+            .inner
+            .output_tasks
+            .take_control_error()
+            .unwrap();
+        assert_eq!(recorded.to_string(), projection.to_string());
+    } else {
+        assert!(fixture
+            .engine
+            .inner
+            .output_tasks
+            .take_control_error()
+            .is_none());
+    }
+    drop(held);
+    fixture.engine.inner.output_tasks.join_current().await;
+    fixture.engine.inner.execution_closes.join_observers().await;
+    fixture.engine.inner.drain_execution_closes().unwrap();
+    assert_eq!(
+        sender.failure().unwrap().to_string(),
+        projection.to_string()
+    );
+    if !decode_fails {
+        assert_eq!(
+            fixture
+                .engine
+                .inner
+                .output_tasks
+                .take_control_error()
+                .unwrap()
+                .to_string(),
+            projection.to_string()
+        );
+    }
+    assert!(fixture
+        .engine
+        .inner
+        .output_tasks
+        .take_control_error()
+        .is_none());
+    drop(sender);
+    assert_one_stream_error(&mut fixture, &original).await;
+    actual::assert_closed_once(&fixture).await;
+}
+
+#[tokio::test]
+async fn completion_pending_span_preserves_actual_decode_failure() {
+    pending_span_terminal_provenance(true).await;
+}
+
+#[tokio::test]
+async fn completion_pending_available_text_rejects_bad_range_despite_prior_error() {
+    pending_span_terminal_provenance(false).await;
+}

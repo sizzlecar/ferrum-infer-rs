@@ -88,18 +88,19 @@ async fn managed_driver_explicit_lazy_share_one_real_cpu_execution() {
     .await
     .unwrap();
     let response = response.unwrap();
-    assert_eq!(response.tokens.len(), 4);
+    assert_eq!(response.response().tokens.len(), 4);
     let chunks = chunks.into_iter().collect::<Result<Vec<_>>>().unwrap();
     let text: String = chunks
         .iter()
         .map(|chunk| chunk.chunk().text.as_str())
         .collect();
-    assert_eq!(text, response.text);
+    assert_eq!(text, response.response().text);
     let stream_tokens: Vec<_> = chunks
         .iter()
         .filter_map(|chunk| chunk.chunk().token)
         .collect();
     let visible: Vec<_> = response
+        .response()
         .tokens
         .iter()
         .copied()
@@ -397,7 +398,7 @@ async fn managed_driver_clean_exit_releases_inner_without_observer_wait() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(response.tokens.len(), 4);
+    assert_eq!(response.response().tokens.len(), 4);
     assert_eq!(fixture.executor.checked_outputs.load(Ordering::SeqCst), 4);
     assert_eq!(fixture.executor.closes.load(Ordering::SeqCst), 1);
     assert!(fixture.executor.observed.lock().model.kv_caches.is_empty());
@@ -428,3 +429,6 @@ async fn managed_driver_clean_exit_releases_inner_without_observer_wait() {
 
 #[path = "managed_driver_tests/output.rs"]
 mod output;
+
+#[path = "managed_driver_tests/semantic.rs"]
+mod semantic;

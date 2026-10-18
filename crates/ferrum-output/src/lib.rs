@@ -16,6 +16,12 @@ use std::{
 };
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, TryAcquireError};
 
+mod semantic;
+pub use semantic::{semantic_cost, InferenceOutput, OutputSemanticLease};
+
+mod native_projection;
+pub use native_projection::{NativeChatOutputProjector, OwnedNativeChatOutputProjection};
+
 /// A single terminal error can explain a full or undersized data pool without
 /// waiting for it. This fixed allowance is per admitted session, never per event.
 pub const TERMINAL_ERROR_BYTES: usize = 1024;
@@ -26,6 +32,7 @@ struct BudgetInner {
     sessions: Arc<Semaphore>,
     queued: Arc<Semaphore>,
     encoded: Arc<Semaphore>,
+    semantic: Arc<Semaphore>,
     control_bytes: AtomicUsize,
 }
 
@@ -45,6 +52,8 @@ impl OutputBudget {
             config.engine_queue_items,
             config.queued_bytes_total,
             config.encoded_bytes_total,
+            config.semantic_bytes_total,
+            config.semantic_bytes_per_session,
         ] {
             if count > Semaphore::MAX_PERMITS {
                 return Err(FerrumError::config(
@@ -56,6 +65,7 @@ impl OutputBudget {
             sessions: Arc::new(Semaphore::new(config.max_sessions)),
             queued: Arc::new(Semaphore::new(config.queued_bytes_total)),
             encoded: Arc::new(Semaphore::new(config.encoded_bytes_total)),
+            semantic: Arc::new(Semaphore::new(config.semantic_bytes_total)),
             control_bytes: AtomicUsize::new(0),
             config,
         })))
@@ -70,6 +80,7 @@ impl OutputBudget {
             budget: self.0.clone(),
             _permit: permit,
             error_claimed: AtomicBool::new(false),
+            semantic: Arc::new(Semaphore::new(self.0.config.semantic_bytes_per_session)),
         })))
     }
 
@@ -82,6 +93,8 @@ impl OutputBudget {
             sessions: self.0.config.max_sessions - self.0.sessions.available_permits(),
             queued_bytes: self.0.config.queued_bytes_total - self.0.queued.available_permits(),
             encoded_bytes: self.0.config.encoded_bytes_total - self.0.encoded.available_permits(),
+            semantic_bytes: self.0.config.semantic_bytes_total
+                - self.0.semantic.available_permits(),
             control_bytes: self.0.control_bytes.load(Ordering::Acquire),
         }
     }
@@ -92,6 +105,7 @@ pub struct OutputUsage {
     pub sessions: usize,
     pub queued_bytes: usize,
     pub encoded_bytes: usize,
+    pub semantic_bytes: usize,
     pub control_bytes: usize,
 }
 
@@ -100,6 +114,7 @@ struct SessionInner {
     budget: Arc<BudgetInner>,
     _permit: OwnedSemaphorePermit,
     error_claimed: AtomicBool,
+    semantic: Arc<Semaphore>,
 }
 
 /// Cloning transfers shared ownership of the same session, not a new admission.
@@ -231,6 +246,7 @@ impl OutputSession {
         Ok(OutputChunk {
             chunk,
             _lease: lease,
+            _semantic: None,
         })
     }
 }
@@ -240,6 +256,7 @@ impl OutputSession {
 pub struct OutputChunk {
     chunk: StreamChunk,
     _lease: OutputBytesLease,
+    _semantic: Option<OutputSemanticLease>,
 }
 
 impl OutputChunk {
@@ -262,7 +279,26 @@ impl OutputChunk {
         Ok(Self {
             chunk,
             _lease: lease,
+            _semantic: None,
         })
+    }
+
+    /// Transfer a retained terminal payload without detaching its history
+    /// reservation. Both reservations belong to the original output session.
+    pub fn new_retained(
+        chunk: StreamChunk,
+        lease: OutputBytesLease,
+        mut semantic: OutputSemanticLease,
+    ) -> Result<Self> {
+        if !Arc::ptr_eq(&lease._session.0, &semantic.output_session().0) {
+            return Err(FerrumError::internal(
+                "output reservations belong to different sessions",
+            ));
+        }
+        semantic.try_resize(semantic_cost(&chunk)?)?;
+        let mut output = Self::new(chunk, lease)?;
+        output._semantic = Some(semantic);
+        Ok(output)
     }
 
     pub fn chunk(&self) -> &StreamChunk {

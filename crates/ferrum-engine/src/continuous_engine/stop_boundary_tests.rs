@@ -434,7 +434,7 @@ async fn harmony_pending_return_marker_survives_explicit_completion_error() {
 async fn stop_boundary_outputs(
     pieces: &[&str],
     stops: &[&str],
-) -> (InferenceResponse, Vec<ferrum_output::OutputChunk>) {
+) -> (InferenceOutput, Vec<ferrum_output::OutputChunk>) {
     stop_boundary_outputs_with_eos(pieces, stops, false).await
 }
 
@@ -442,7 +442,7 @@ async fn stop_boundary_outputs_with_eos(
     pieces: &[&str],
     stops: &[&str],
     end_with_eos: bool,
-) -> (InferenceResponse, Vec<ferrum_output::OutputChunk>) {
+) -> (InferenceOutput, Vec<ferrum_output::OutputChunk>) {
     let mut request = policy_request();
     request.sampling_params.stop_sequences = stops.iter().map(|s| (*s).to_owned()).collect();
     request.sampling_params.max_tokens = pieces.len() + 2 + usize::from(end_with_eos);
@@ -453,7 +453,7 @@ async fn stop_boundary_outputs_for_request(
     pieces: &[&str],
     end_with_eos: bool,
     mut request: InferenceRequest,
-) -> (InferenceResponse, Vec<ferrum_output::OutputChunk>) {
+) -> (InferenceOutput, Vec<ferrum_output::OutputChunk>) {
     let engine = stop_boundary_engine(pieces, end_with_eos);
     let response = tokio::time::timeout(Duration::from_secs(2), engine.infer(request.clone()))
         .await
@@ -500,17 +500,23 @@ async fn harmony_user_stop_preserves_exact_payload_and_terminal_usage() {
                 "a stop prefix leaked: {streamed:?}"
             );
         }
-        assert_eq!(response.text, expected);
+        assert_eq!(response.response().text, expected);
         assert_eq!(streamed, expected);
-        assert_eq!(response.finish_reason, FinishReason::Stop);
+        assert_eq!(response.response().finish_reason, FinishReason::Stop);
         let terminal = chunks.last().unwrap();
         assert!(terminal.chunk().text.is_empty());
         assert_eq!(terminal.chunk().finish_reason, Some(FinishReason::Stop));
         let usage = terminal.chunk().usage.as_ref().unwrap();
-        assert_eq!(usage.prompt_tokens, response.usage.prompt_tokens);
-        assert_eq!(usage.completion_tokens, response.usage.completion_tokens);
-        assert_eq!(usage.total_tokens, response.usage.total_tokens);
-        assert_eq!(response.usage.completion_tokens, response.tokens.len());
+        assert_eq!(usage.prompt_tokens, response.response().usage.prompt_tokens);
+        assert_eq!(
+            usage.completion_tokens,
+            response.response().usage.completion_tokens
+        );
+        assert_eq!(usage.total_tokens, response.response().usage.total_tokens);
+        assert_eq!(
+            response.response().usage.completion_tokens,
+            response.response().tokens.len()
+        );
     }
 }
 
@@ -530,18 +536,23 @@ async fn stop_boundary_react_marker_never_leaks_into_stream() {
         "stop prefixes must remain buffered"
     );
     assert_eq!(
-        response.text, text,
+        response.response().text,
+        text,
         "sync and stream must have the same boundary"
     );
-    assert_eq!(response.finish_reason, FinishReason::Stop);
+    assert_eq!(response.response().finish_reason, FinishReason::Stop);
     let terminal = chunks.last().unwrap();
     assert_eq!(terminal.chunk().finish_reason, Some(FinishReason::Stop));
     let usage = terminal.chunk().usage.as_ref().unwrap();
-    assert_eq!(usage.prompt_tokens, response.usage.prompt_tokens);
-    assert_eq!(usage.completion_tokens, response.usage.completion_tokens);
-    assert_eq!(usage.total_tokens, response.usage.total_tokens);
+    assert_eq!(usage.prompt_tokens, response.response().usage.prompt_tokens);
     assert_eq!(
-        response.usage.completion_tokens, 6,
+        usage.completion_tokens,
+        response.response().usage.completion_tokens
+    );
+    assert_eq!(usage.total_tokens, response.response().usage.total_tokens);
+    assert_eq!(
+        response.response().usage.completion_tokens,
+        6,
         "stop tokens still consumed model work"
     );
 }
@@ -557,8 +568,8 @@ async fn stop_boundary_inside_token_preserves_preceding_text() {
         text, "OK ",
         "a stop must not discard the valid text before it"
     );
-    assert_eq!(response.text, text);
-    assert_eq!(response.finish_reason, FinishReason::Stop);
+    assert_eq!(response.response().text, text);
+    assert_eq!(response.response().finish_reason, FinishReason::Stop);
 }
 
 #[tokio::test]
@@ -611,8 +622,8 @@ async fn stop_boundary_flushes_and_selects_the_earliest_match() {
             "pieces={:?}, stops={:?}",
             case.pieces, case.stops
         );
-        assert_eq!(response.text, text);
-        assert_eq!(response.finish_reason, case.finish);
+        assert_eq!(response.response().text, text);
+        assert_eq!(response.response().finish_reason, case.finish);
         assert_eq!(
             chunks.last().unwrap().chunk().finish_reason,
             Some(case.finish)
@@ -634,8 +645,8 @@ async fn stop_boundary_mismatch_releases_the_prefix_before_later_output() {
         "a disproven stop prefix must become visible before subsequent output"
     );
     assert_eq!(text, "abx tail");
-    assert_eq!(response.text, text);
-    assert_eq!(response.finish_reason, FinishReason::Length);
+    assert_eq!(response.response().text, text);
+    assert_eq!(response.response().finish_reason, FinishReason::Length);
 }
 
 #[test]
@@ -720,7 +731,7 @@ async fn stop_boundary_rejects_strict_json_truncated_inside_a_token() {
         let response = engine.infer(request.clone()).await.unwrap_or_else(|error| {
             panic!("no-stop control failed: generated={generated:?}, stop={stop:?}: {error}")
         });
-        assert_eq!(response.text, generated);
+        assert_eq!(response.response().text, generated);
         engine.shutdown().await.unwrap();
 
         // Stop token 8 does not mask ordinary token 7. A stop inside its JSON
@@ -735,10 +746,13 @@ async fn stop_boundary_rejects_strict_json_truncated_inside_a_token() {
             let response = result.unwrap_or_else(|error| {
                 panic!("stop after complete value failed: generated={generated:?}, stop={stop:?}: {error}")
             });
-            assert_eq!(response.text, expected);
-            assert_eq!(response.finish_reason, FinishReason::Stop);
+            assert_eq!(response.response().text, expected);
+            assert_eq!(response.response().finish_reason, FinishReason::Stop);
             if let Some(terminal_token) = terminal_token {
-                assert_eq!(response.tokens.last(), Some(&TokenId::new(terminal_token)));
+                assert_eq!(
+                    response.response().tokens.last(),
+                    Some(&TokenId::new(terminal_token))
+                );
             }
         } else {
             assert!(

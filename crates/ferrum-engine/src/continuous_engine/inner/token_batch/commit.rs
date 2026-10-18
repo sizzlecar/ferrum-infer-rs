@@ -101,6 +101,9 @@ impl EngineInner {
                     continue;
                 };
                 let sampled = (|| -> Result<Option<TokenId>> {
+                    if let Some(error) = sequence.output_accounting_error() {
+                        return Err(error.clone());
+                    }
                     let ExecutionProduct::Sampling(output) = product else {
                         return Ok(None);
                     };
@@ -136,6 +139,9 @@ impl EngineInner {
                                 postprocess_started_at,
                             );
                         }
+                    }
+                    if let Some(error) = sequence.output_accounting_error() {
+                        return Err(error.clone());
                     }
                     Ok(Some(token))
                 })();

@@ -202,7 +202,7 @@ async fn submit(
     tokens: &[u32],
 ) -> (
     RequestId,
-    tokio::sync::oneshot::Receiver<Result<InferenceResponse>>,
+    tokio::sync::oneshot::Receiver<Result<InferenceOutput>>,
 ) {
     let mut request = policy_request();
     request.sampling_params.max_tokens = 1;

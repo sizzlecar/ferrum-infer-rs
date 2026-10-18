@@ -25,7 +25,7 @@ will define their own contracts at the model registration and assembly boundary.
 | `POST /v1/audio/transcriptions` | Removed | Returns HTTP 404. |
 | `POST /v1/audio/speech` | Removed | Returns HTTP 404. |
 
-## Streaming Output Limits
+## Output Limits
 
 `run` and `serve` share these optional `ferrum.toml` settings (shown with defaults):
 
@@ -33,22 +33,34 @@ will define their own contracts at the model registration and assembly boundary.
 [output]
 max_sessions = 2048
 engine_queue_items = 100
+semantic_bytes_total = 268435456
+semantic_bytes_per_session = 33554432
 queued_bytes_total = 67108864
 encoded_bytes_total = 67108864
 max_event_bytes = 33554432
+
+[tokenizer_decode_cache]
+max_entries = 1000
+max_bytes = 67108864
 ```
 
-Limits must be positive; a single encoded event must fit its pool. Completed
-streams and retained HTTP frames still hold their session until their owners are
-dropped. Exhausted session capacity rejects new streaming requests before model
-admission. Slow consumers pause their own generation; they do not receive
-silently truncated output. An oversized event terminates with an explicit error;
-each session has one separate error allowance of at most 1 KiB.
+Output limits must be positive; per-session content and individual encoded events
+must fit their respective per-engine shared pools. Generated history, completion results,
+cached assistant messages and CLI history retain their content credit until their
+last owner is dropped. A session means one inference output, not a conversation:
+retaining several turns can occupy several sessions. Exhausted session capacity
+rejects new requests before model admission. Persistent content growth fails
+explicitly when full; slow wire consumers pause their own generation. Each session
+has one separate error allowance of at most 1 KiB.
 
-These limits cover queued content and encoded frames. Semantic text/tool history,
-tokenizer scratch space, allocator overhead and transport buffers are separate;
-the values are not a process-memory limit. Library callers use
-`EngineConfig.output` and borrow each `OutputChunk` through `chunk()`.
+Semantic limits count logical retained payload; queued/encoded limits count wire
+content. Each tokenizer instance has its own token-ID plus UTF-8 cache byte limit;
+either cache limit set to zero disables caching. Oversized entries use ordinary
+decoding without entering the cache. These limits exclude tokenizer/parser scratch,
+allocation capacity/overhead and transport buffers, so they are not a process-memory
+limit. Library callers configure `EngineConfig.output` and
+`EngineConfig.model.tokenizer.decode_cache`; borrow `InferenceOutput::response()`
+or `OutputChunk::chunk()`. Cloning `InferenceOutput` shares its content and credit.
 
 ## Model Capacity
 
@@ -160,7 +172,8 @@ internal aliases are never part of the public Responses contract.
 Streaming uses typed Responses lifecycle events with contiguous sequence numbers.
 It emits the applicable semantic terminal event (`response.completed`,
 `response.incomplete`, or `response.failed`) and then the transport sentinel
-`[DONE]`.
+`[DONE]`. If an event exceeds the encoding limit, the stream instead ends with
+`response.failed` and no `[DONE]`.
 
 Ferrum does not store Response objects. Requests for `store=true`,
 `previous_response_id`, conversations, background execution, built-in tools, or

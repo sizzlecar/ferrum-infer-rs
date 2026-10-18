@@ -78,6 +78,9 @@ impl EngineInner {
                 let sequence = state.as_ref().ok_or_else(|| {
                     FerrumError::internal("scheduled token request has no published sequence")
                 })?;
+                if let Some(error) = sequence.output_accounting_error() {
+                    return Err(error.clone());
+                }
                 let frontier = sequence.execution_frontier.clone().ok_or_else(|| {
                     FerrumError::internal("scheduled token request has no admitted incarnation")
                 })?;

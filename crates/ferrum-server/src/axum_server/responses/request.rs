@@ -176,7 +176,6 @@ impl ResponsesRequest {
             chat,
             message_phases: phases,
             response,
-            stream,
         })
     }
 

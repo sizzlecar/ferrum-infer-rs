@@ -9,7 +9,7 @@ fn attach_clients(
     engine: &ContinuousBatchEngine,
     request_id: &RequestId,
 ) -> (
-    tokio::sync::oneshot::Receiver<Result<InferenceResponse>>,
+    tokio::sync::oneshot::Receiver<Result<InferenceOutput>>,
     OutputReceiver,
 ) {
     let (response, receiver) = tokio::sync::oneshot::channel();
@@ -71,7 +71,7 @@ async fn install_controlled_request(
 }
 
 async fn assert_client_failed(
-    response: tokio::sync::oneshot::Receiver<Result<InferenceResponse>>,
+    response: tokio::sync::oneshot::Receiver<Result<InferenceOutput>>,
     mut stream: OutputReceiver,
 ) {
     let error = response.await.unwrap().unwrap_err();

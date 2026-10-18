@@ -2808,7 +2808,7 @@ async fn plan_runtime_product_path_requires_typed_admission_before_prefill() {
 
     let response = engine.infer(request).await.unwrap();
 
-    assert_eq!(response.finish_reason, FinishReason::Length);
+    assert_eq!(response.response().finish_reason, FinishReason::Length);
     assert_eq!(executor.admission_probes.load(Ordering::Relaxed), 1);
     assert_eq!(executor.prefill_calls.load(Ordering::Relaxed), 1);
     let completions = executor
@@ -2816,14 +2816,14 @@ async fn plan_runtime_product_path_requires_typed_admission_before_prefill() {
         .lock()
         .expect("completion receipt mutex poisoned");
     assert_eq!(completions.len(), 1);
-    assert_eq!(completions[0].request_id(), &response.request_id);
+    assert_eq!(completions[0].request_id(), &response.response().request_id);
     assert_eq!(
         completions[0].input_tokens(),
-        response.usage.prompt_tokens as u64
+        response.response().usage.prompt_tokens as u64
     );
     assert_eq!(
         completions[0].output_tokens(),
-        response.usage.completion_tokens as u64
+        response.response().usage.completion_tokens as u64
     );
     drop(completions);
     assert!(executor
@@ -3311,8 +3311,12 @@ async fn plan_runtime_chunked_prefill_retries_exact_chunk_and_samples_only_final
         .expect("chunked prefill inference task must not panic")
         .unwrap();
 
-    assert_eq!(response.finish_reason, FinishReason::Length);
-    assert_eq!(response.tokens.len(), 1, "only the final chunk may sample");
+    assert_eq!(response.response().finish_reason, FinishReason::Length);
+    assert_eq!(
+        response.response().tokens.len(),
+        1,
+        "only the final chunk may sample"
+    );
     assert_eq!(executor.completed_chunks.load(Ordering::Relaxed), 3);
     assert_eq!(
         *executor
@@ -3368,8 +3372,12 @@ async fn plan_runtime_partial_prefill_completion_commits_only_the_executor_prefi
 
     let response = engine.infer(request).await.unwrap();
 
-    assert_eq!(response.finish_reason, FinishReason::Length);
-    assert_eq!(response.tokens.len(), 1, "only the final prefix may sample");
+    assert_eq!(response.response().finish_reason, FinishReason::Length);
+    assert_eq!(
+        response.response().tokens.len(),
+        1,
+        "only the final prefix may sample"
+    );
     assert_eq!(executor.completed_chunks.load(Ordering::Relaxed), 3);
     assert_eq!(
         *executor
@@ -3497,7 +3505,7 @@ async fn plan_runtime_backing_maintenance_advances_epoch_before_prefill() {
 
     let response = engine.infer(request).await.unwrap();
 
-    assert_eq!(response.finish_reason, FinishReason::Length);
+    assert_eq!(response.response().finish_reason, FinishReason::Length);
     assert_eq!(executor.admission_probes.load(Ordering::Relaxed), 2);
     assert_eq!(executor.maintenance_calls.load(Ordering::Relaxed), 1);
     assert_eq!(executor.prefill_calls.load(Ordering::Relaxed), 1);
@@ -3657,7 +3665,7 @@ async fn plan_runtime_capacity_pressure_waits_without_spinning_then_retries_on_r
         .expect("release epoch must wake the waiting request")
         .expect("inference task must not panic")
         .unwrap();
-    assert_eq!(response.finish_reason, FinishReason::Length);
+    assert_eq!(response.response().finish_reason, FinishReason::Length);
     assert_eq!(executor.admission_probes.load(Ordering::Relaxed), 2);
     assert_eq!(executor.maintenance_calls.load(Ordering::Relaxed), 1);
     assert_eq!(executor.prefill_calls.load(Ordering::Relaxed), 1);
@@ -3836,7 +3844,7 @@ async fn plan_runtime_retry_admission_does_not_require_a_published_epoch() {
         .expect("physical recheck must force a bounded admission retry")
         .unwrap();
 
-    assert_eq!(response.finish_reason, FinishReason::Length);
+    assert_eq!(response.response().finish_reason, FinishReason::Length);
     assert_eq!(executor.admission_probes.load(Ordering::Relaxed), 2);
     assert_eq!(executor.maintenance_calls.load(Ordering::Relaxed), 1);
     assert_eq!(executor.prefill_calls.load(Ordering::Relaxed), 1);
@@ -3999,8 +4007,8 @@ async fn scheduler_trace_jsonl_resource_events_balance_successful_infer() {
     let request_id = request.id.clone();
     let response = engine.infer(request).await.unwrap();
 
-    assert_eq!(response.request_id, request_id);
-    assert_eq!(response.finish_reason, FinishReason::Length);
+    assert_eq!(response.response().request_id, request_id);
+    assert_eq!(response.response().finish_reason, FinishReason::Length);
 
     engine.shutdown().await.unwrap();
     let resources = assert_engine_resource_trace_balanced(&trace_path);
@@ -5612,6 +5620,10 @@ fn structured_sequence_requires_a_tokenizer_aware_grammar_factory() {
         None,
         None,
         None,
+        OutputBudget::new(Default::default())
+            .unwrap()
+            .try_open_session()
+            .unwrap(),
     )
     .unwrap_err()
     .to_string();
@@ -6467,8 +6479,14 @@ fn request_sampling_plan_applies_presence_and_frequency_penalties() {
     request.sampling_params.frequency_penalty = 0.5;
     let mut state = SequenceState::new(request, vec![TokenId::new(0)]);
     state.generated_tokens = vec![TokenId::new(1), TokenId::new(1)];
-    state.sampling_history.record(TokenId::new(1));
-    state.sampling_history.record(TokenId::new(1));
+    state
+        .sampling_history
+        .record(TokenId::new(1), &mut state.output_semantic)
+        .unwrap();
+    state
+        .sampling_history
+        .record(TokenId::new(1), &mut state.output_semantic)
+        .unwrap();
 
     assert_eq!(
         state.sampling_plan.processor_chain.processor_names(),
@@ -6497,6 +6515,12 @@ fn request_sampling_plan_applies_presence_and_frequency_penalties() {
 
 #[test]
 fn sampling_history_transitions_keep_scope_and_frequency_table_consistent() {
+    let mut credit = OutputBudget::new(Default::default())
+        .unwrap()
+        .try_open_session()
+        .unwrap()
+        .try_reserve_semantic(0)
+        .unwrap();
     let mut history = SequenceSamplingHistory::default();
     let generated = vec![
         TokenId::new(1),
@@ -6505,7 +6529,7 @@ fn sampling_history_transitions_keep_scope_and_frequency_table_consistent() {
         TokenId::new(3),
     ];
     for &token in &generated {
-        history.record(token);
+        history.record(token, &mut credit).unwrap();
     }
     assert_eq!(
         history.scope(),
@@ -6514,14 +6538,19 @@ fn sampling_history_transitions_keep_scope_and_frequency_table_consistent() {
     assert_eq!(history.previous_tokens(&generated).unwrap(), &generated);
     assert_eq!(history.token_frequencies().get(&TokenId::new(1)), Some(&2));
 
-    assert!(history.enter_hidden_structured_output());
+    assert_eq!(
+        credit.bytes(),
+        3 * (std::mem::size_of::<TokenId>() + std::mem::size_of::<usize>())
+    );
+    assert!(history.enter_hidden_structured_output(&mut credit).unwrap());
     assert_eq!(history.previous_tokens(&generated).unwrap(), &[]);
     assert!(history.token_frequencies().is_empty());
-    history.record(TokenId::new(4));
+    assert_eq!(credit.bytes(), 0);
+    history.record(TokenId::new(4), &mut credit).unwrap();
     assert!(history.token_frequencies().is_empty());
 
     assert!(history
-        .activate_visible_structured_output(2, &generated)
+        .activate_visible_structured_output(2, &generated, &mut credit)
         .unwrap());
     assert_eq!(
         history.scope(),
@@ -6534,11 +6563,15 @@ fn sampling_history_transitions_keep_scope_and_frequency_table_consistent() {
         &[TokenId::new(2), TokenId::new(3)]
     );
     assert_eq!(history.token_frequencies().len(), 2);
+    assert_eq!(
+        credit.bytes(),
+        2 * (std::mem::size_of::<TokenId>() + std::mem::size_of::<usize>())
+    );
     assert!(!history
-        .activate_visible_structured_output(2, &generated)
+        .activate_visible_structured_output(2, &generated, &mut credit)
         .unwrap());
     assert!(history
-        .activate_visible_structured_output(generated.len() + 1, &generated)
+        .activate_visible_structured_output(generated.len() + 1, &generated, &mut credit)
         .is_err());
 }
 
@@ -6553,6 +6586,10 @@ fn sequence_rejects_unrepresented_sampling_modes_before_execution() {
         None,
         None,
         None,
+        OutputBudget::new(Default::default())
+            .unwrap()
+            .try_open_session()
+            .unwrap(),
     )
     .unwrap_err()
     .to_string();

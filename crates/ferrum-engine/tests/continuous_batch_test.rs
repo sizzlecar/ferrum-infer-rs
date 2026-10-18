@@ -2,11 +2,12 @@
 //! Runs on any platform — no GPU required.
 
 use ferrum_engine::{ContinuousBatchEngine, LlmInferenceEngine, Scheduler, Tokenizer};
+use ferrum_output::InferenceOutput;
 use ferrum_scheduler::implementations::ContinuousBatchScheduler;
 use ferrum_testkit::{
     MockKvCacheManager, MockModelExecutor, MockSampler, MockTensorFactory, MockTokenizer,
 };
-use ferrum_types::{InferenceRequest, InferenceResponse, SchedulerConfig, SpecialTokens, TokenId};
+use ferrum_types::{InferenceRequest, SchedulerConfig, SpecialTokens, TokenId};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -127,8 +128,11 @@ async fn single_request_completes() {
     let request = make_request("Hello world");
     let response = engine.infer(request).await.unwrap();
 
-    assert_eq!(response.finish_reason, ferrum_types::FinishReason::Length);
-    assert!(!response.text.is_empty());
+    assert_eq!(
+        response.response().finish_reason,
+        ferrum_types::FinishReason::Length
+    );
+    assert!(!response.response().text.is_empty());
 }
 
 #[tokio::test]
@@ -138,7 +142,10 @@ async fn multiple_requests_complete_sequentially() {
     for i in 0..5 {
         let request = make_request(&format!("Request number {}", i));
         let response = engine.infer(request).await.unwrap();
-        assert_eq!(response.finish_reason, ferrum_types::FinishReason::Length);
+        assert_eq!(
+            response.response().finish_reason,
+            ferrum_types::FinishReason::Length
+        );
     }
 }
 
@@ -177,11 +184,17 @@ async fn non_streaming_usage_matches_tokenizer_and_generated_tokens() {
 
     let response = engine.infer(make_request(prompt)).await.unwrap();
 
-    assert_eq!(response.usage.prompt_tokens, expected_prompt_tokens);
-    assert_eq!(response.usage.completion_tokens, response.tokens.len());
     assert_eq!(
-        response.usage.total_tokens,
-        response.usage.prompt_tokens + response.usage.completion_tokens
+        response.response().usage.prompt_tokens,
+        expected_prompt_tokens
+    );
+    assert_eq!(
+        response.response().usage.completion_tokens,
+        response.response().tokens.len()
+    );
+    assert_eq!(
+        response.response().usage.total_tokens,
+        response.response().usage.prompt_tokens + response.response().usage.completion_tokens
     );
 }
 
@@ -322,9 +335,12 @@ async fn engine_with_latency_still_completes() {
 
     let request = make_request("Latency test");
     let response = engine.infer(request).await.unwrap();
-    assert_eq!(response.finish_reason, ferrum_types::FinishReason::Length);
+    assert_eq!(
+        response.response().finish_reason,
+        ferrum_types::FinishReason::Length
+    );
     // With 5ms prefill + 4*2ms decode = ~13ms minimum
-    assert!(response.latency_ms >= 10);
+    assert!(response.response().latency_ms >= 10);
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -348,7 +364,7 @@ async fn concurrent_requests_all_complete() {
         }));
     }
 
-    let results: Vec<InferenceResponse> = futures::future::join_all(handles)
+    let results: Vec<InferenceOutput> = futures::future::join_all(handles)
         .await
         .into_iter()
         .map(|r| r.unwrap().unwrap())
@@ -356,8 +372,11 @@ async fn concurrent_requests_all_complete() {
 
     assert_eq!(results.len(), 5);
     for resp in &results {
-        assert_eq!(resp.finish_reason, ferrum_types::FinishReason::Length);
-        assert!(!resp.tokens.is_empty());
+        assert_eq!(
+            resp.response().finish_reason,
+            ferrum_types::FinishReason::Length
+        );
+        assert!(!resp.response().tokens.is_empty());
     }
 }
 
@@ -494,8 +513,8 @@ async fn prefix_cache_avoids_second_prefill() {
     );
 
     // Both should produce the same output (same prompt + deterministic sampling)
-    assert_eq!(resp1.tokens, resp2.tokens);
-    assert!(!resp1.tokens.is_empty());
+    assert_eq!(resp1.response().tokens, resp2.response().tokens);
+    assert!(!resp1.response().tokens.is_empty());
 }
 
 #[tokio::test]
@@ -509,7 +528,7 @@ async fn json_mode_biases_first_token() {
     plain_req.sampling_params.max_tokens = 1;
     let plain_resp = engine.infer(plain_req).await.unwrap();
     assert_eq!(
-        plain_resp.tokens[0].get(),
+        plain_resp.response().tokens[0].get(),
         42,
         "Without JSON mode, greedy should pick token 42"
     );
@@ -520,9 +539,9 @@ async fn json_mode_biases_first_token() {
     json_req.sampling_params.response_format = ResponseFormat::JsonObject;
     let json_resp = engine.infer(json_req).await.unwrap();
     assert_eq!(
-        json_resp.tokens[0].get(),
+        json_resp.response().tokens[0].get(),
         JSON_OBJECT_TOKEN_ID,
         "JSON mode should select the complete JSON object token"
     );
-    assert_eq!(json_resp.text, "{}");
+    assert_eq!(json_resp.response().text, "{}");
 }

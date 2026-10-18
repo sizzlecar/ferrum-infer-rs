@@ -1,11 +1,11 @@
 //! Shared semantic Chat stream, consumed directly by Chat and Responses.
 use super::*;
-use ferrum_output::OutputSession;
+use ferrum_output::{NativeChatOutputProjector, OutputSession};
 use futures::Stream;
 use std::pin::Pin;
 
 pub(super) enum ChatStreamEvent {
-    Chunk(ChatCompletionsResponse),
+    Chunk(output::Retained<ChatCompletionsResponse>),
     Error(OpenAiError),
     Done,
 }
@@ -23,12 +23,23 @@ fn error_event(
     ChatStreamEvent::Error(stream_error_payload(message, error_type, param))
 }
 
+fn terminal_projection_bytes(
+    visible: &ParsedReasoningResponse,
+    structured: Option<&ferrum_types::ApiChatResponse>,
+) -> ferrum_types::Result<usize> {
+    ferrum_output::semantic_cost(&(&visible.content, &visible.reasoning))?
+        .checked_add(ferrum_output::semantic_cost(&structured)?)
+        .ok_or_else(|| {
+            ferrum_types::FerrumError::resource_exhausted("terminal projection size overflow")
+        })
+}
+
 pub(super) fn into_response(mut stream: ChatEventStream) -> Response {
     let session = stream.session.clone();
     let frames = async_stream::try_stream! {
         while let Some(event) = stream.events.next().await {
             let encoded = match event {
-                ChatStreamEvent::Chunk(chunk) => output::encode_json(&stream.session, None, &chunk).await,
+                ChatStreamEvent::Chunk(chunk) => output::encode_json(&stream.session, None, chunk.value()).await,
                 ChatStreamEvent::Error(error) => {
                     let bytes = output::encode_chat_failure(&stream.session, &error)?;
                     drop(stream);
@@ -54,6 +65,7 @@ pub(super) async fn open_chat_events(
     openai_request: ChatCompletionsRequest,
     inference_request: InferenceRequest,
     benchmark_correlation: Option<BenchmarkRequestCorrelation>,
+    session_context: Option<SessionContext>,
 ) -> std::result::Result<ChatEventStream, ServerError> {
     let engine = state.llm.clone().ok_or_else(|| {
         ServerError::ServiceUnavailable("LLM engine not loaded; chat unavailable".into())
@@ -73,7 +85,7 @@ pub(super) async fn open_chat_events(
         output_contract,
         EffectiveChatOutputContract::StrictJsonSchemaContent
     );
-    let stream_api_request = match inference_request.api_request.as_ref() {
+    let mut stream_api_request = match inference_request.api_request.as_ref() {
         Some(ferrum_types::ApiRequest::Chat(request)) => request.clone(),
         _ => api_chat_request(
             &openai_request,
@@ -81,6 +93,7 @@ pub(super) async fn open_chat_events(
             ferrum_types::ApiToolCallProtocol::default(),
         ),
     };
+    stream_api_request.messages.clear();
     let buffer_structured_api_stream =
         ferrum_types::chat_api_may_emit_tool_or_function_call(&stream_api_request);
     let model_output_protocol = inference_request.sampling_params.model_output_protocol;
@@ -91,7 +104,10 @@ pub(super) async fn open_chat_events(
     // R1-distill-style templates open the think block inside the prompt;
     // the parser must know generation starts mid-think.
     let started_in_think = request_started_in_reasoning(&inference_request);
-    let mut native_projector = NativeChatOutputProjector::for_request(&inference_request);
+    let native_render_state = inference_request
+        .metadata
+        .get(ferrum_types::PROMPT_OPENED_REASONING_METADATA_KEY)
+        .and_then(serde_json::Value::as_bool);
     let replay_request_id = inference_request.id.to_string();
     let profile_request_model = openai_request.model.clone();
     let profile_started_at = Instant::now();
@@ -154,7 +170,23 @@ pub(super) async fn open_chat_events(
     let profile_state = state.clone();
 
     let session = stream.output_session().clone();
-    let events = async_stream::stream! {
+    let event_session = session.clone();
+    let mut native_projector = native_render_state
+        .map(|started| {
+            NativeChatOutputProjector::new(
+                &session,
+                &stream_api_request,
+                model_output_protocol,
+                started,
+            )
+        })
+        .transpose()
+        .map_err(server_error_from_ferrum_error)?
+        .flatten();
+    let events = async_stream::try_stream! {
+        let _retained_input_history = session_context;
+        let mut history_lease = event_session.try_reserve_semantic(0)?;
+        let mut tokens_lease = event_session.try_reserve_semantic(ferrum_output::semantic_cost(&Vec::<ferrum_types::TokenId>::new())?)?;
         let mut current_text = String::new();
         let mut output_token_ids = Vec::new();
         let mut first_engine_chunk_received_us = None;
@@ -176,12 +208,15 @@ pub(super) async fn open_chat_events(
                         first_engine_chunk_received_us = Some(elapsed_us_since(profile_started_at));
                     }
                     if let Some(token) = chunk.token {
+                        tokens_lease.try_grow(ferrum_output::semantic_cost(&token)?)?;
                         output_token_ids.push(token);
                     }
                     if !chunk.text.is_empty() {
-                        current_text.push_str(&chunk.text);
                         if let Some(projector) = native_projector.as_mut() {
-                            projector.push(&chunk.text);
+                            projector.push(&chunk.text)?;
+                        } else {
+                            history_lease.try_grow(chunk.text.len())?;
+                            current_text.push_str(&chunk.text);
                         }
 
                         if native_projector.is_some()
@@ -215,6 +250,8 @@ pub(super) async fn open_chat_events(
                                     break;
                                 }
                             };
+                            // This parsed copy lives across yield; it is a distinct retained owner.
+                            let _parsed_lease = event_session.try_reserve_semantic(ferrum_output::semantic_cost(&(&parsed.content, &parsed.reasoning))?)?;
                             let full_reasoning = parsed.reasoning.as_deref().unwrap_or("");
                             let reasoning_delta =
                                 stream_text_delta(full_reasoning, &mut sent_reasoning_len);
@@ -246,7 +283,7 @@ pub(super) async fn open_chat_events(
                                 };
 
                                 first_sse_enqueue_us.get_or_insert_with(|| elapsed_us_since(profile_started_at));
-                                yield ChatStreamEvent::Chunk(response_chunk);
+                                yield ChatStreamEvent::Chunk(output::Retained::new(&event_session, response_chunk)?);
                             }
                         }
                     }
@@ -264,21 +301,32 @@ pub(super) async fn open_chat_events(
                             warn!("failed to write chat stream prompt-token evidence: {}", err);
                         }
                         let usage = chunk.usage.as_ref().map(openai_usage_from_token_usage);
+                        let had_text = !current_text.is_empty() || native_projector.as_ref().is_some_and(|projector| !projector.raw().is_empty());
                         let native_projected = native_projector
                             .take()
-                            .map(|projector| projector.finish(terminal_finish_reason));
-                        let parsed_output_result =
-                            if let Some(projected) = native_projected.as_ref() {
-                                Ok(ParsedChatModelOutput {
-                                    visible: projected.visible.clone(),
-                                    harmony_response: None,
-                                })
+                            .map(|projector| projector.finish(terminal_finish_reason)).transpose()?;
+                        let has_native_projection = native_projected.is_some();
+                        let (parsed_output_result, mut native_api_response, mut native_lease) =
+                            if let Some(projected) = native_projected {
+                                let (projection, lease) = projected.into_parts();
+                                (
+                                    Ok(ParsedChatModelOutput {
+                                        visible: projection.visible,
+                                        harmony_response: None,
+                                    }),
+                                    projection.api_response,
+                                    Some(lease),
+                                )
                             } else {
-                                parse_chat_model_output(
-                                    model_output_protocol,
-                                    &current_text,
-                                    started_in_think,
-                                    terminal_finish_reason,
+                                (
+                                    parse_chat_model_output(
+                                        model_output_protocol,
+                                        &current_text,
+                                        started_in_think,
+                                        terminal_finish_reason,
+                                    ),
+                                    None,
+                                    None,
                                 )
                             };
                         let parsed_model_output = match parsed_output_result {
@@ -295,26 +343,39 @@ pub(super) async fn open_chat_events(
                             }
                         };
                         let mut parsed_final = parsed_model_output.visible;
-                        parsed_final.content = normalize_structured_response_content(
-                            &openai_request,
-                            &parsed_final.content,
-                        );
-                        let mut structured_chat_response =
+                        // Native eligibility permits only plain text. Preserve the
+                        // moved allocation instead of cloning it for a no-op normalization.
+                        if !has_native_projection {
+                            parsed_final.content = normalize_structured_response_content(
+                                &openai_request,
+                                &parsed_final.content,
+                            );
+                        }
+                        let mut structured_chat_response = if
                             finish_reason_allows_structured_api_response(terminal_finish_reason)
-                                .then(|| match chunk.api_response.as_ref() {
+                        {
+                            match chunk.api_response.as_ref() {
                                     // The native envelope owns the recipient and whether this is
                                     // a call at all, including a final answer containing JSON.
                                     _ if model_output_protocol
                                         == ModelOutputProtocol::HarmonyGptOss =>
                                     {
-                                        parsed_model_output.harmony_response.clone()
+                                        parsed_model_output.harmony_response
                                     }
                                     Some(ferrum_types::ApiResponse::Chat(response)) => {
+                                        // The upstream API keeps its established precedence.
+                                        // Discard the unused local API before reusing its
+                                        // credit, then charge the replacement before cloning.
+                                        if let Some(lease) = native_lease.as_mut() {
+                                            drop(native_api_response.take());
+                                            lease.try_resize(terminal_projection_bytes(
+                                                &parsed_final,
+                                                Some(response),
+                                            )?)?;
+                                        }
                                         Some(response.clone())
                                     }
-                                    _ if native_projected.is_some() => native_projected
-                                        .as_ref()
-                                        .and_then(|projected| projected.api_response.clone()),
+                                    _ if has_native_projection => native_api_response.take(),
                                     _ if buffer_structured_api_stream => {
                                         chat_api_response_from_parsed_generated_text(
                                             &stream_api_request,
@@ -323,10 +384,13 @@ pub(super) async fn open_chat_events(
                                         )
                                     }
                                     _ => None,
-                                })
-                                .flatten();
+                            }
+                        } else {
+                            None
+                        };
+                        drop(native_api_response);
 
-                        if native_projected.is_none()
+                        if !has_native_projection
                             && matches!(
                                 chunk.api_response,
                                 Some(ferrum_types::ApiResponse::Chat(_))
@@ -349,6 +413,13 @@ pub(super) async fn open_chat_events(
                             }
                         }
 
+                        let final_bytes = terminal_projection_bytes(&parsed_final, structured_chat_response.as_ref())?;
+                        let _final_lease = if let Some(mut lease) = native_lease {
+                            lease.try_resize(final_bytes)?;
+                            lease
+                        } else {
+                            event_session.try_reserve_semantic(final_bytes)?
+                        };
                         if let Some(chat_response) = structured_chat_response.as_ref() {
                             if let Err(e) =
                                 validate_structured_tool_response(&openai_request, chat_response)
@@ -394,14 +465,14 @@ pub(super) async fn open_chat_events(
 
                         if let Some(chat_response) = structured_chat_response.as_ref() {
                             let mut delta = openai_chat_delta_from_api(&chat_response.message);
-                            if native_projected.is_some() {
+                            if has_native_projection {
                                 delta.content =
                                     stream_text_delta(&delta.content, &mut sent_content_len);
                             }
                             if delta.reasoning.is_none() {
                                 delta.reasoning = parsed_final.reasoning.clone();
                             }
-                            if native_projected.is_some() {
+                            if has_native_projection {
                                 let reasoning = stream_text_delta(
                                     delta.reasoning.as_deref().unwrap_or(""),
                                     &mut sent_reasoning_len,
@@ -423,7 +494,7 @@ pub(super) async fn open_chat_events(
                             };
 
                             first_sse_enqueue_us.get_or_insert_with(|| elapsed_us_since(profile_started_at));
-                                yield ChatStreamEvent::Chunk(response_chunk);
+                                yield ChatStreamEvent::Chunk(output::Retained::new(&event_session, response_chunk)?);
                         } else if buffer_structured_api_stream
                             && parsed_final.content.trim().is_empty()
                             // A token-limited response may contain only reasoning.
@@ -439,7 +510,7 @@ pub(super) async fn open_chat_events(
                             yield error_event;
                             yield ChatStreamEvent::Done;
                             break;
-                        } else if !current_text.is_empty() {
+                        } else if had_text {
                             // Flush safe text held with an incomplete trailing
                             // marker, including when text and finish share a chunk.
                             // Buffered streams have sent lengths of zero.
@@ -474,7 +545,7 @@ pub(super) async fn open_chat_events(
                                 };
 
                                 first_sse_enqueue_us.get_or_insert_with(|| elapsed_us_since(profile_started_at));
-                                yield ChatStreamEvent::Chunk(response_chunk);
+                                yield ChatStreamEvent::Chunk(output::Retained::new(&event_session, response_chunk)?);
                             }
                         }
                         // Send final chunk. OpenAI-style streaming
@@ -567,7 +638,7 @@ pub(super) async fn open_chat_events(
                         }
                         // Persist terminal diagnostics before yielding the terminal
                         // choice: a client may drop immediately after reading it.
-                        yield ChatStreamEvent::Chunk(final_chunk);
+                        yield ChatStreamEvent::Chunk(output::Retained::new(&event_session, final_chunk)?);
                         if include_stream_usage && usage.is_some() {
                             let usage_chunk = ChatCompletionsResponse {
                                 id: request_id.clone(),
@@ -577,7 +648,7 @@ pub(super) async fn open_chat_events(
                                 choices: vec![],
                                 usage,
                             };
-                            yield ChatStreamEvent::Chunk(usage_chunk);
+                            yield ChatStreamEvent::Chunk(output::Retained::new(&event_session, usage_chunk)?);
                         }
                         yield ChatStreamEvent::Done;
                         break;
@@ -645,6 +716,11 @@ pub(super) async fn open_chat_events(
     };
     Ok(ChatEventStream {
         session,
-        events: Box::pin(events),
+        events: Box::pin(events.map(|event: ferrum_types::Result<ChatStreamEvent>| {
+            event.unwrap_or_else(|error| {
+                let (kind, _) = output::encoding_error_details(&error);
+                error_event(error.to_string(), kind, None)
+            })
+        })),
     })
 }

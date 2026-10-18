@@ -307,7 +307,7 @@ async fn execute_one_token(
             assert!(finished);
         } else {
             let response = engine.infer(request).await.unwrap();
-            assert_eq!(response.tokens.len(), 1);
+            assert_eq!(response.response().tokens.len(), 1);
         }
     })
     .await

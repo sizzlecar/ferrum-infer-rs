@@ -1726,9 +1726,41 @@ pub enum BackendType {
     Custom,
 }
 
+/// Shared tokenizer-instance cache policy, independent of request output credit.
+/// Either zero disables caching; it never means an unlimited cache.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct TokenizerDecodeCacheConfig {
+    pub max_entries: usize,
+    /// Retained token IDs (four bytes each) plus decoded UTF-8 text bytes.
+    pub max_bytes: usize,
+}
+
+impl Default for TokenizerDecodeCacheConfig {
+    fn default() -> Self {
+        Self {
+            max_entries: 1000,
+            max_bytes: 64 * 1024 * 1024,
+        }
+    }
+}
+
+impl TokenizerDecodeCacheConfig {
+    pub fn validate(&self) -> crate::Result<()> {
+        if self.max_bytes > isize::MAX as usize || self.max_entries > isize::MAX as usize {
+            return Err(crate::FerrumError::config(
+                "tokenizer decode cache limits exceed addressable storage",
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// Tokenizer configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TokenizerConfig {
+    #[serde(default)]
+    pub decode_cache: TokenizerDecodeCacheConfig,
     /// Tokenizer type
     pub tokenizer_type: TokenizerType,
     /// Path to tokenizer files
@@ -1746,6 +1778,7 @@ pub struct TokenizerConfig {
 impl Default for TokenizerConfig {
     fn default() -> Self {
         Self {
+            decode_cache: TokenizerDecodeCacheConfig::default(),
             tokenizer_type: TokenizerType::BPE,
             tokenizer_path: None,
             enable_fast: true,

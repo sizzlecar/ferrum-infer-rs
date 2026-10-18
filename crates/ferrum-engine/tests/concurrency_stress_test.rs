@@ -54,7 +54,7 @@ async fn concurrent_32_all_complete() {
     let mut completed = 0;
     for h in handles {
         let resp = h.await.unwrap().unwrap();
-        assert_eq!(resp.finish_reason, FinishReason::Length);
+        assert_eq!(resp.response().finish_reason, FinishReason::Length);
         completed += 1;
     }
     assert_eq!(completed, 32);
@@ -76,7 +76,7 @@ async fn concurrent_64_all_complete() {
     for h in handles {
         match h.await.unwrap() {
             Ok(resp) => {
-                assert!(!resp.tokens.is_empty());
+                assert!(!resp.response().tokens.is_empty());
                 completed += 1;
             }
             Err(e) => {
@@ -107,7 +107,7 @@ async fn concurrent_mixed_lengths() {
 
     for h in handles {
         let resp = h.await.unwrap().unwrap();
-        assert!(!resp.tokens.is_empty());
+        assert!(!resp.response().tokens.is_empty());
     }
 }
 

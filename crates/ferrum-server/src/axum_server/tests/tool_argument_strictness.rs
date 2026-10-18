@@ -326,7 +326,9 @@ impl ToolFeedbackLlm {
         } else {
             malformed_arguments()
         };
-        StubLlm::with_api_response("", tool_response(&arguments))
+        let mut reply = StubLlm::with_api_response("", tool_response(&arguments));
+        reply.output_budget = self.base.output_budget.clone();
+        reply
     }
 }
 
@@ -355,7 +357,10 @@ impl InferenceEngine for ToolFeedbackLlm {
 
 #[async_trait]
 impl LlmInferenceEngine for ToolFeedbackLlm {
-    async fn infer(&self, request: InferenceRequest) -> ferrum_types::Result<InferenceResponse> {
+    async fn infer(
+        &self,
+        request: InferenceRequest,
+    ) -> ferrum_types::Result<ferrum_output::InferenceOutput> {
         self.reply(&request).infer(request).await
     }
 

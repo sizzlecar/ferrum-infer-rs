@@ -21,8 +21,13 @@ pub struct CliConfig {
     /// Shared run/serve scheduler policy; explicit CLI selection takes precedence.
     pub scheduler: SchedulerCliConfig,
 
-    /// Output sessions and byte budgets shared by run and serve.
+    /// Output sessions and byte budgets shared by run and serve. Retained
+    /// interactive assistant history keeps its original output session: a
+    /// small max_sessions can reject another turn until history is cleared.
     pub output: ferrum_types::OutputConfig,
+
+    /// Bound the tokenizer decode cache for both run and serve; either zero disables it.
+    pub tokenizer_decode_cache: ferrum_types::TokenizerDecodeCacheConfig,
 
     /// Server configuration
     pub server: ServerCliConfig,
@@ -800,6 +805,17 @@ fn push_true_entry(entries: &mut Vec<RuntimeConfigEntry>, key: &str, value: Opti
 }
 
 impl CliConfig {
+    pub fn apply_output_and_tokenizer_config(
+        &self,
+        engine: &mut ferrum_types::EngineConfig,
+    ) -> Result<()> {
+        self.output.validate()?;
+        self.tokenizer_decode_cache.validate()?;
+        engine.output = self.output.clone();
+        engine.model.tokenizer.decode_cache = self.tokenizer_decode_cache.clone();
+        Ok(())
+    }
+
     pub fn resolve_scheduler_slo(
         &self,
         cli: Option<ferrum_types::SchedulerSloConfig>,
@@ -835,6 +851,7 @@ impl CliConfig {
             ferrum_types::FerrumError::configuration(format!("Failed to parse config: {}", e))
         })?;
         config.output.validate()?;
+        config.tokenizer_decode_cache.validate()?;
         Ok(config)
     }
 
@@ -853,6 +870,7 @@ impl CliConfig {
     pub fn validate(&self) -> Result<()> {
         self.resolve_scheduler_slo(None)?;
         self.output.validate()?;
+        self.tokenizer_decode_cache.validate()?;
         // Validate server config
         if self.server.port == 0 {
             return Err(ferrum_types::FerrumError::configuration(
@@ -1000,6 +1018,47 @@ impl Default for DevConfig {
 mod tests {
     use super::*;
     use clap::{Parser, Subcommand};
+
+    #[tokio::test]
+    async fn output_and_tokenizer_cache_config_reaches_shared_engine_settings() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("ferrum.toml");
+        fs::write(&path, "[output]\nsemantic_bytes_total = 4096\nsemantic_bytes_per_session = 1024\n[tokenizer_decode_cache]\nmax_entries = 7\nmax_bytes = 8192\n").await.unwrap();
+        let config = CliConfig::load(&path).await.unwrap();
+        let mut engine = ferrum_types::EngineConfig::default();
+        config
+            .apply_output_and_tokenizer_config(&mut engine)
+            .unwrap();
+        assert_eq!(engine.output, config.output);
+        assert_eq!(
+            engine.model.tokenizer.decode_cache,
+            config.tokenizer_decode_cache
+        );
+        assert_eq!(engine.model.tokenizer.decode_cache.max_entries, 7);
+        assert_eq!(engine.model.tokenizer.decode_cache.max_bytes, 8192);
+        config.save(&path).await.unwrap();
+        let saved = CliConfig::load(&path).await.unwrap();
+        assert_eq!(saved.output, config.output);
+        assert_eq!(saved.tokenizer_decode_cache, config.tokenizer_decode_cache);
+        fs::write(
+            &path,
+            "[tokenizer_decode_cache]\nmax_entries = 0\nmax_bytes = 8192\n",
+        )
+        .await
+        .unwrap();
+        let disabled = CliConfig::load(&path).await.unwrap();
+        disabled
+            .apply_output_and_tokenizer_config(&mut engine)
+            .unwrap();
+        assert_eq!(engine.model.tokenizer.decode_cache.max_entries, 0);
+        fs::write(
+            &path,
+            "[output]\nsemantic_bytes_total = 10\nsemantic_bytes_per_session = 11\n",
+        )
+        .await
+        .unwrap();
+        assert!(CliConfig::load(&path).await.is_err());
+    }
 
     #[tokio::test]
     async fn output_config_load_preserves_explicit_limits_and_defaults() {

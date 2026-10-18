@@ -1574,6 +1574,7 @@ dependencies = [
  "chrono",
  "ferrum-types",
  "futures",
+ "serde",
  "serde_json",
  "tokio",
 ]

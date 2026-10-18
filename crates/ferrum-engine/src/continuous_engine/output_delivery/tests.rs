@@ -48,6 +48,34 @@ async fn completion_after_delivery_failure(panic: bool) {
         .failure()
         .expect("the original projection failure is retained");
     assert!(!sender.0.state.lock().running);
+    if panic {
+        // The panic guard retains a delivery failure, independently of the
+        // checked text projection's control-error reporting path.
+        assert!(matches!(&original, FerrumError::Internal { message }
+            if message == "output delivery panicked"));
+        assert!(fixture
+            .engine
+            .inner
+            .output_tasks
+            .take_control_error()
+            .is_none());
+    } else {
+        let control = fixture
+            .engine
+            .inner
+            .output_tasks
+            .take_control_error()
+            .expect("actual invalid live span must reach the driver control path");
+        assert!(matches!(&control, FerrumError::Internal { message }
+            if message == "pending output span disagrees with original token history"));
+        assert_eq!(control.to_string(), original.to_string());
+        assert!(fixture
+            .engine
+            .inner
+            .output_tasks
+            .take_control_error()
+            .is_none());
+    }
     // The previous worker is still stopped at the handoff barrier. A later
     // completion must own a new run and deliver the retained original error.
     let result = tokio::time::timeout(
@@ -88,6 +116,15 @@ async fn completion_after_delivery_failure(panic: bool) {
     );
     resume.send(()).unwrap();
     fixture.engine.inner.output_tasks.join_current().await;
+    assert!(
+        fixture
+            .engine
+            .inner
+            .output_tasks
+            .take_control_error()
+            .is_none(),
+        "the later completion must preserve the client failure without re-reporting control"
+    );
     assert!(!sender.0.state.lock().running);
     assert_eq!(sender.0.state.lock().enqueued_bytes, 0);
     drop(sender);
@@ -132,6 +169,9 @@ async fn output_terminal_payload_budget_error_is_not_silent_eof() {
             .decode(&sequence.generated_tokens, true)
             .unwrap()
             .len();
+        sequence
+            .bind_output_session(sender.output_session().clone())
+            .unwrap();
         sequence.stream_sender = Some(sender);
     }
     let error = fixture

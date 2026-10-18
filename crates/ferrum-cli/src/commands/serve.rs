@@ -624,8 +624,7 @@ async fn execute_with_compatibility(
     let model_id = product_input.public_model_id.clone();
     let source = product_input.source;
     let mut product_engine_config = product_input.engine_config;
-    product_engine_config.output = config.output.clone();
-    product_engine_config.output.validate()?;
+    config.apply_output_and_tokenizer_config(&mut product_engine_config)?;
     product_engine_config.scheduler.slo = scheduler_slo;
     product_engine_config.numerical_execution =
         config.resolve_numerical_execution(numerical_profile.as_ref());
