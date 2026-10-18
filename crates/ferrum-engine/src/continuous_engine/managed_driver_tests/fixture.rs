@@ -35,7 +35,16 @@ pub(super) struct NumericalExecutor {
     pub(super) admissions: AtomicUsize,
     pub(super) closes: AtomicUsize,
     pub(super) checked_outputs: AtomicUsize,
+    pub(super) dropped: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
     layers: usize,
+}
+
+impl Drop for NumericalExecutor {
+    fn drop(&mut self) {
+        if let Some(sender) = self.dropped.get_mut().take() {
+            let _ = sender.send(());
+        }
+    }
 }
 
 struct Flight<'a>(&'a AtomicUsize);
@@ -237,6 +246,7 @@ impl Fixture {
             admissions: AtomicUsize::new(0),
             closes: AtomicUsize::new(0),
             checked_outputs: AtomicUsize::new(0),
+            dropped: Mutex::new(None),
             layers: cfg.num_layers,
         });
         let trace = tempfile::tempdir().unwrap();

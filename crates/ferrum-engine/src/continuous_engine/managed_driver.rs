@@ -259,6 +259,13 @@ impl ManagedDriver {
         });
         self.mark_finished();
         exit.armed = false;
+        // The completed report now owns any unresolved custody. Keep the
+        // fallback only for exits without a report; an observer that never
+        // joins must not retain a clean EngineInner through the task handle.
+        // No await follows this transfer.
+        if let DriverState::Finished(task) = &*self.state.lock() {
+            task.custody.lock().take();
+        }
         report
     }
 

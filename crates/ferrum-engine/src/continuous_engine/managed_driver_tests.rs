@@ -369,3 +369,50 @@ async fn managed_driver_failed_report_retains_unproved_owner_without_control_cyc
         "the resolved custody has no permanent Arc cycle"
     );
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn managed_driver_clean_exit_releases_inner_without_observer_wait() {
+    let mut fixture = fixture::Fixture::new();
+    let observer = fixture.engine.start_loop().unwrap();
+    let inner = Arc::downgrade(&fixture.engine.inner);
+    let control = Arc::downgrade(&fixture.engine.driver);
+    let request = fixture.request();
+    let mut inference = Box::pin(fixture.engine.infer(request));
+    pending_once(inference.as_mut()).await;
+    tokio::time::timeout(Duration::from_secs(2), &mut fixture.reached)
+        .await
+        .unwrap()
+        .unwrap();
+    fixture.release.send(()).unwrap();
+    let response = tokio::time::timeout(Duration::from_secs(2), inference)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(response.tokens.len(), 4);
+    assert_eq!(fixture.executor.checked_outputs.load(Ordering::SeqCst), 4);
+    assert_eq!(fixture.executor.closes.load(Ordering::SeqCst), 1);
+    assert!(fixture.executor.observed.lock().model.kv_caches.is_empty());
+
+    let (dropped, executor_dropped) = tokio::sync::oneshot::channel();
+    *fixture.executor.dropped.lock() = Some(dropped);
+    // Request shutdown synchronously without polling any observer's wait.
+    drop(
+        fixture
+            .engine
+            .driver
+            .shutdown(&fixture.engine.inner)
+            .unwrap(),
+    );
+    drop(fixture.engine);
+    drop(fixture.executor);
+    // The drop signal comes from the actual model executor owned by Inner.
+    // On this current-thread runtime, its drop and task return finish before
+    // this test can resume; no timing sleep or join side effect is involved.
+    tokio::time::timeout(Duration::from_secs(2), executor_dropped)
+        .await
+        .expect("clean task must release its original Inner without wait")
+        .unwrap();
+    assert!(inner.upgrade().is_none());
+    assert!(control.upgrade().is_none());
+    drop(observer);
+}
