@@ -17,7 +17,9 @@
 
 use ferrum_types::{FerrumError, Result};
 
-use crate::backend::{Backend, BackendInt8KvOps, KvCache, KvCacheQuant, QuantizedPagedKvPool};
+use crate::backend::{
+    Backend, BackendInt8KvOps, KvCache, KvCacheQuant, KvTokenLayout, QuantizedPagedKvPool,
+};
 use ferrum_interfaces::kv_dtype::{KvDtypeKind, KvFp16, KvInt8};
 
 /// Per-K-dtype dispatch trait.
@@ -660,6 +662,7 @@ impl<B: Backend + BackendInt8KvOps> KvLayer<B> for KvInt8 {
             &layer.paged_block_indices,
             cache_len_before,
             tokens,
+            KvTokenLayout::HeadMajor,
             block_size,
             num_kv_heads,
             head_dim,
@@ -676,7 +679,7 @@ impl<B: Backend + BackendInt8KvOps> KvLayer<B> for KvInt8 {
         num_kv_heads: usize,
         head_dim: usize,
         final_kv_len: usize,
-        _tokens: usize,
+        tokens: usize,
     ) -> Result<()> {
         let block_size = layer.block_size;
         let cl_buf = layer
@@ -700,6 +703,8 @@ impl<B: Backend + BackendInt8KvOps> KvLayer<B> for KvInt8 {
             num_kv_heads,
             head_dim,
             final_kv_len,
+            tokens,
+            KvTokenLayout::HeadMajor,
             block_size,
             scale,
         )

@@ -7,7 +7,7 @@ pub use super::capabilities::{
 };
 use super::dtype::Dtype;
 pub use super::types::MoeRouting;
-use super::types::{AttnConfig, KvCacheQuant, QuantizedPagedKvPool, SrcDtype};
+use super::types::{AttnConfig, KvCacheQuant, KvTokenLayout, QuantizedPagedKvPool, SrcDtype};
 
 /// Maximum decode-graph layer count. Per-layer call sites that share
 /// graph-captured host staging arrays use this as the stride between
@@ -2347,6 +2347,7 @@ pub trait BackendInt8KvOps: Backend + BackendKvDtype<KvInt8> {
         _paged_block_indices: &[u32],
         _cache_len_before: usize,
         _tokens: usize,
+        _input_layout: KvTokenLayout,
         _block_size: usize,
         _num_kv_heads: usize,
         _head_dim: usize,
@@ -2356,10 +2357,10 @@ pub trait BackendInt8KvOps: Backend + BackendKvDtype<KvInt8> {
         ))
     }
 
-    /// Run paged decode attention reading from an INT8 cache. Q is FP16,
-    /// output is FP16; the kernel dequantizes K/V on the fly using the
-    /// per-token scales. `valid_kv_len` is the post-append cache length
-    /// (i.e. the kernel attends over `[0, valid_kv_len)` tokens).
+    /// Run causal paged attention against the shared INT8 pool. Q and output
+    /// use `query_layout`. The query rows occupy the last `query_rows` positions
+    /// of `valid_kv_len`; row r reads only the prefix through its own position.
+    /// Decode is the same contract with one query row.
     fn int8_paged_decode_attention(
         _ctx: &mut Self::Context,
         _q: &Self::Buffer,
@@ -2371,6 +2372,8 @@ pub trait BackendInt8KvOps: Backend + BackendKvDtype<KvInt8> {
         _num_kv_heads: usize,
         _head_dim: usize,
         _valid_kv_len: usize,
+        _query_rows: usize,
+        _query_layout: KvTokenLayout,
         _block_size: usize,
         _scale: f32,
     ) -> Result<()> {

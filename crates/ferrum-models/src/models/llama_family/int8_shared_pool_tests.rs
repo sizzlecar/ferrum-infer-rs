@@ -1,5 +1,4 @@
-//! Real retained CUDA model storage tests. These deliberately use single-query
-//! forwards to isolate storage from the separate multi-query prefill contract.
+//! Real retained CUDA storage and causal prefill tests.
 
 use super::*;
 use crate::common::{llm::ModelKvReservation, DecoderOnlyLLM};
@@ -9,11 +8,15 @@ use ferrum_kernels::backend::cuda::CudaBackend;
 type Model = LlamaFamilyModel<CudaBackend, KvInt8>;
 
 fn model(prefix: bool) -> Model {
+    model_with_heads(prefix, 1)
+}
+
+fn model_with_heads(prefix: bool, kv_heads: usize) -> Model {
     let config = LlamaFamilyConfig {
         hidden_size: 128,
         intermediate_size: 256,
         num_heads: 2,
-        num_kv_heads: 1,
+        num_kv_heads: kv_heads,
         head_dim: 64,
         num_layers: 2,
         vocab_size: 128,
@@ -145,4 +148,47 @@ fn int8_shared_pool_real_cuda_serial_soft_free_rotation_preserves_logits() {
     // has only two logical table entries. No simultaneous requests are needed.
     assert!(actual.kv_caches.is_empty());
     assert_eq!(actual.paged_pools.as_ref().unwrap()[0].num_blocks, 3);
+}
+
+#[test]
+#[ignore]
+fn int8_shared_pool_real_cuda_multiquery_prefill_matches_single_query_reference() {
+    let mut whole = model_with_heads(false, 2);
+    let mut chunked = model_with_heads(false, 2);
+    let mut reference = model_with_heads(false, 2);
+    let tokens: Vec<u32> = (1..=20).collect();
+    let expected = fill(&mut reference, "reference", &tokens);
+    let full = whole.prefill_internal("whole", &tokens);
+    chunked.prefill_internal("chunked", &tokens[..13]);
+    let partial = chunked.prefill_internal("chunked", &tokens[13..]);
+    let compare = |actual: &[f32], expected: &[f32]| {
+        assert_eq!(actual.len(), expected.len());
+        assert!(actual.iter().all(|value| value.is_finite()));
+        let magnitude = expected.iter().fold(0.0f32, |m, value| m.max(value.abs()));
+        let error = actual
+            .iter()
+            .zip(expected)
+            .fold(0.0f32, |m, (a, b)| m.max((a - b).abs()));
+        // Batched F16 projections and INT8 rounding may differ from M=1.
+        // The independent per-query arithmetic oracle is in int8_kv_parity.
+        assert!(
+            error < 0.02 * magnitude.max(1e-6),
+            "full-logits error={error}, magnitude={magnitude}"
+        );
+    };
+    compare(&full, &expected);
+    compare(&partial, &expected);
+    let next_reference = reference.decode_internal("reference", 71, 20);
+    compare(&whole.decode_internal("whole", 71, 20), &next_reference);
+    compare(&chunked.decode_internal("chunked", 71, 20), &next_reference);
+    for (model, id) in [
+        (&mut whole, "whole"),
+        (&mut chunked, "chunked"),
+        (&mut reference, "reference"),
+    ] {
+        assert!(model.kv_caches[id].iter().all(|cache| cache.len == 21));
+        model.release(id);
+        assert!(model.kv_caches.is_empty());
+        assert_eq!(free_blocks(model), 3);
+    }
 }

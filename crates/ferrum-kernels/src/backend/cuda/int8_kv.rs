@@ -14,7 +14,7 @@
 //! Tests: `crates/ferrum-kernels/tests/int8_kv_parity.rs` checks stream
 //! ownership, round-trip quantization and attention against an FP32 host reference.
 
-use crate::backend::{KvInt8, QuantizedPagedKvPool};
+use crate::backend::{KvInt8, KvTokenLayout, QuantizedPagedKvPool};
 use ferrum_types::{FerrumError, Result};
 
 use super::{default_stream, CudaBackend};
@@ -121,6 +121,7 @@ impl crate::backend::BackendInt8KvOps for CudaBackend {
         paged_block_indices: &[u32],
         cache_len_before: usize,
         tokens: usize,
+        input_layout: KvTokenLayout,
         block_size: usize,
         num_kv_heads: usize,
         head_dim: usize,
@@ -163,6 +164,7 @@ impl crate::backend::BackendInt8KvOps for CudaBackend {
             tokens,
             num_kv_heads,
             head_dim,
+            input_layout,
         )
         .map_err(|e| FerrumError::model(format!("launch_int8_kv_cache_append: {e}")))?;
         Ok(())
@@ -179,6 +181,8 @@ impl crate::backend::BackendInt8KvOps for CudaBackend {
         num_kv_heads: usize,
         head_dim: usize,
         valid_kv_len: usize,
+        query_rows: usize,
+        query_layout: KvTokenLayout,
         block_size: usize,
         scale: f32,
     ) -> Result<()> {
@@ -212,6 +216,8 @@ impl crate::backend::BackendInt8KvOps for CudaBackend {
             num_kv_heads,
             head_dim,
             valid_kv_len,
+            query_rows,
+            query_layout,
             block_size,
             scale,
         )

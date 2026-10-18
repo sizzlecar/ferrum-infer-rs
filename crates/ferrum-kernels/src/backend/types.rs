@@ -234,6 +234,25 @@ pub struct KvCacheQuant<B: BackendKvDtype<K>, K: KvDtypeKind> {
     pub _kv_dtype: std::marker::PhantomData<K>,
 }
 
+/// Layout of a dense token/head tensor consumed or produced by KV kernels.
+/// Callers select it explicitly; token-major projection inputs and head-major
+/// norm/RoPE outputs are not interchangeable when either axis has length > 1.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KvTokenLayout {
+    TokenMajor,
+    HeadMajor,
+}
+
+impl KvTokenLayout {
+    /// Element strides for (token, head), excluding the contiguous dim axis.
+    pub fn strides(self, tokens: usize, heads: usize, dim: usize) -> Option<(usize, usize)> {
+        match self {
+            Self::TokenMajor => Some((heads.checked_mul(dim)?, dim)),
+            Self::HeadMajor => Some((dim, tokens.checked_mul(dim)?)),
+        }
+    }
+}
+
 /// Routing buffers consumed by `moe_gemm_phase_vllm` — held by the
 /// caller across phase 1 and phase 3 of one MoE forward. All three
 /// fields are i32 device tensors in disguise (`Self::Buffer = fp16` on
