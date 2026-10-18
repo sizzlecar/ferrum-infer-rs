@@ -25,43 +25,8 @@ pub(crate) use state_transfer::*;
 mod completed_boundary;
 pub(crate) use completed_boundary::*;
 
-const SEQUENCE_DISPATCH_COUNT_MASK: u64 = SEQUENCE_DISPATCH_POISONED_BIT - 1;
-
 pub(super) fn sequence_dispatch_is_poisoned(gate: &AtomicU64) -> bool {
     gate.load(Ordering::Acquire) & SEQUENCE_DISPATCH_POISONED_BIT != 0
-}
-
-pub(super) struct SequenceDispatchGuard<'a> {
-    gate: &'a AtomicU64,
-}
-
-impl Drop for SequenceDispatchGuard<'_> {
-    fn drop(&mut self) {
-        let previous = self.gate.fetch_sub(1, Ordering::AcqRel);
-        debug_assert!(previous & SEQUENCE_DISPATCH_COUNT_MASK > 0);
-    }
-}
-
-pub(super) fn enter_sequence_dispatch(
-    gate: &AtomicU64,
-) -> Result<SequenceDispatchGuard<'_>, VNextError> {
-    gate.fetch_update(Ordering::AcqRel, Ordering::Acquire, |state| {
-        if state & SEQUENCE_DISPATCH_POISONED_BIT != 0
-            || state & SEQUENCE_DISPATCH_COUNT_MASK == SEQUENCE_DISPATCH_COUNT_MASK
-        {
-            None
-        } else {
-            Some(state + 1)
-        }
-    })
-    .map_err(|state| {
-        if state & SEQUENCE_DISPATCH_POISONED_BIT != 0 {
-            invalid_resource("poisoned resource pool cannot dispatch another operation")
-        } else {
-            invalid_resource("resource pool dispatch counter is exhausted")
-        }
-    })?;
-    Ok(SequenceDispatchGuard { gate })
 }
 
 pub enum RequestResourceAdmissionDecision<R>
@@ -875,7 +840,13 @@ pub(super) enum SequenceSessionSlotState {
         next_epoch: Option<SequenceSessionEpoch>,
     },
     Active(ActiveSequenceSessionState),
-    Terminal(SequenceSessionTerminalReceipt),
+    Terminal(
+        #[allow(
+            dead_code,
+            reason = "Retains terminal provenance in the session slot until reuse or drop"
+        )]
+        SequenceSessionTerminalReceipt,
+    ),
     FailClosed,
 }
 
@@ -975,6 +946,7 @@ impl SequenceSessionLiveWitness {
         self.ensure_open()
     }
 
+    #[cfg(test)]
     pub(crate) fn ensure_live_identity(
         &self,
         epoch: SequenceSessionEpoch,

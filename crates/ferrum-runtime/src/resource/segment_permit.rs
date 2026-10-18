@@ -725,6 +725,7 @@ impl<'a, B> SegmentPhysicalRegion<'a, B> {
 }
 
 impl<R: DeviceRuntime> DynamicPoolSet<R> {
+    #[cfg(test)]
     pub(super) fn segment_backing_batch(
         &self,
         groups: &[&[LogicalBackingSliceAuthority]],

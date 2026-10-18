@@ -4,9 +4,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use super::super::{
-    NumericalArithmeticStage, PreparedProjectionNumerics, PreparedProjectionRoute,
-    ProjectionBlockFormat, ProjectionRole, StrictProjectionReason,
-    COMPOSITE_NUMERICAL_ARITHMETIC_SCHEMA_VERSION_UPSTREAM,
+    PreparedProjectionNumerics, PreparedProjectionRoute, ProjectionBlockFormat, ProjectionRole,
+    StrictProjectionReason, COMPOSITE_NUMERICAL_ARITHMETIC_SCHEMA_VERSION_UPSTREAM,
 };
 use super::{UpstreamActivationPack, UpstreamProjectionArithmetic, UpstreamProjectionLayout};
 use crate::WeightId;

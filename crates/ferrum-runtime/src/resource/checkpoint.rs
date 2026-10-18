@@ -10,8 +10,8 @@ use super::{
     BackingClaimCertificate, BackingPrepareDecision, BufferUsage, CapacityEntry, CapacityUnits,
     CapacityVector, DeviceBufferRetention, DeviceRuntime, DynamicBackingDeferred,
     EvaluatedBackingProjection, EvaluatedBackingRequest, LogicalBackingBufferView,
-    LogicalBackingSliceAuthority, LogicalBackingSliceEvidence, PhysicalBackingClaimIdentity,
-    PlanHash, PlanRuntimeResources, ResourceId, TrustedPlanRuntimeBinding, VNextError,
+    LogicalBackingSliceAuthority, PhysicalBackingClaimIdentity, PlanHash, PlanRuntimeResources,
+    ResourceId, TrustedPlanRuntimeBinding, VNextError,
 };
 use crate::{
     CheckpointAuthorityId, CheckpointCapacityClaimDecision, CheckpointRetentionSkipReason,
@@ -46,12 +46,9 @@ impl CheckpointBackingRequest {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn resource_id(&self) -> &ResourceId {
         &self.resource_id
-    }
-
-    pub(crate) const fn logical_bytes(&self) -> u64 {
-        self.logical_bytes
     }
 }
 
@@ -84,6 +81,7 @@ impl CheckpointBackingRequests {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn requests(&self) -> &[CheckpointBackingRequest] {
         &self.requests
     }
@@ -117,6 +115,7 @@ impl<R: DeviceRuntime> CheckpointBackingOwner<R> {
         self.logical_lease.authority()
     }
 
+    #[cfg(test)]
     pub(crate) fn claims(&self) -> &CapacityVector {
         self.logical_lease.claims()
     }
@@ -132,20 +131,16 @@ impl<R: DeviceRuntime> CheckpointBackingOwner<R> {
         self.extent_bytes
     }
 
-    pub(crate) fn backing_evidence(&self) -> impl Iterator<Item = &LogicalBackingSliceEvidence> {
+    #[cfg(test)]
+    pub(crate) fn backing_evidence(
+        &self,
+    ) -> impl Iterator<Item = &super::LogicalBackingSliceEvidence> {
         self.backing_slices
             .iter()
             .map(LogicalBackingSliceAuthority::evidence)
     }
 
-    pub(in crate::resource) fn backing_slices(&self) -> &[LogicalBackingSliceAuthority] {
-        &self.backing_slices
-    }
-
-    pub(in crate::resource) fn plan_resources(&self) -> &Arc<PlanRuntimeResources<R>> {
-        &self.plan
-    }
-
+    #[cfg(test)]
     pub(crate) fn device_buffer_retention(self: &Arc<Self>) -> DeviceBufferRetention {
         // Checkpoints have no reusable address scope. The second reference is
         // intentional: use the existing opaque retention without inventing a

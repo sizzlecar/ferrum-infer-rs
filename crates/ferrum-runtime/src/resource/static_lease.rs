@@ -1,9 +1,9 @@
 use super::{
     expected_lease_transition, invalid_resource, AdmissionFitPolicy, AdmissionPressureAction, Arc,
-    BTreeSet, BufferDescriptor, CoreOwnedAllocation, DeviceRuntime, DynamicResourceShape,
-    ResourceAllocation, ResourceId, ResourceLeaseAction, ResourceLeaseEntry, ResourceLeaseState,
-    ResourceOwnedBuffer, ResourceReservation, ResourceReservationBatch,
-    ResourceTransactionIdentity, ResourceWorkShape, StaticProvisioningBinding, VNextError,
+    BTreeSet, BufferDescriptor, CoreOwnedAllocation, DeviceRuntime, ResourceAllocation, ResourceId,
+    ResourceLeaseAction, ResourceLeaseEntry, ResourceLeaseState, ResourceOwnedBuffer,
+    ResourceReservation, ResourceReservationBatch, ResourceTransactionIdentity, ResourceWorkShape,
+    StaticProvisioningBinding, VNextError,
 };
 
 pub(super) struct OwnedLeaseSlot<B> {
@@ -396,17 +396,6 @@ macro_rules! scoped_resource_admission_request {
 
             pub fn work_shape(&self) -> &ResourceWorkShape {
                 &self.work_shape
-            }
-
-            pub(crate) const fn immediate_shape(&self) -> DynamicResourceShape {
-                self.work_shape.immediate_shape()
-            }
-
-            pub(crate) const fn fit_shape(&self) -> DynamicResourceShape {
-                match self.fit_policy {
-                    AdmissionFitPolicy::ImmediateOnly => self.work_shape.immediate_shape(),
-                    AdmissionFitPolicy::FullInputMustFit => self.work_shape.fit_shape(),
-                }
             }
 
             pub const fn fit_policy(&self) -> AdmissionFitPolicy {

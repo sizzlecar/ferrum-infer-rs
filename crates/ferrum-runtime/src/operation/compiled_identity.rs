@@ -322,7 +322,6 @@ pub(crate) struct CompiledOperationIdentity {
     topology: CompiledSubmissionWaveIdentity,
     node_index: usize,
     node_invocation_id: NodeInvocationId,
-    sequence: u64,
     parts: OnceLock<ExecutionIdentityParts>,
     materializations: Arc<AtomicU64>,
 }
@@ -348,10 +347,8 @@ impl CompiledOperationIdentity {
         let topology = self.topology.data.as_ref();
         let node = &topology.nodes[self.node_index];
         super::super::event::ExecutionIdentityProjection {
-            version: EXECUTION_IDENTITY_VERSION,
             run_id: &seed.run_id,
             request_id: &seed.request_id,
-            sequence: self.sequence,
             plan_id: Some(&topology.plan_id),
             plan_hash: Some(&topology.plan_hash),
             frame_id: Some(seed.frame.frame_id()),
@@ -396,7 +393,9 @@ impl SubmissionWaveParticipantIdentitySeed {
             .checked_add(u64::from(node.node_index))?
             .checked_add(1)?;
         let events_per_frame = node_count.checked_mul(3)?.checked_add(2)?;
-        let sequence = completed_frames
+        // Validate the event sequence before admitting a lazy identity. The
+        // complete wire identity materializes this value in operation_parts.
+        completed_frames
             .checked_mul(events_per_frame)?
             .checked_add(u64::from(node.node_index).checked_mul(3)?)?
             .checked_add(5)?;
@@ -407,7 +406,6 @@ impl SubmissionWaveParticipantIdentitySeed {
                 topology: topology.clone(),
                 node_index,
                 node_invocation_id: NodeInvocationId::try_from(node_invocation).ok()?,
-                sequence,
                 parts: OnceLock::new(),
                 materializations: Arc::clone(materializations),
             },

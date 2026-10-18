@@ -93,10 +93,22 @@ impl Default for Spec {
 }
 
 pub struct Fixture {
+    #[allow(
+        dead_code,
+        reason = "Used by checkpoint revalidation tests; other consumers reuse only the prepared plan"
+    )]
     pub family: PreparedModelFamily,
     pub catalog: CapabilityCatalog,
+    #[allow(
+        dead_code,
+        reason = "Used by checkpoint revalidation tests; other consumers reuse only the prepared plan"
+    )]
     pub policy: ResolvedRuntimePolicy,
     _registry: OperationRuntimeRegistry<PlanningTestRuntime>,
+    #[allow(
+        dead_code,
+        reason = "Used by checkpoint revalidation tests; other consumers reuse only the prepared plan"
+    )]
     resolutions: Vec<PlanNodeResolution>,
     pub plan: ExecutionPlan,
 }
@@ -225,6 +237,10 @@ impl Fixture {
         }
     }
 
+    #[allow(
+        dead_code,
+        reason = "Unsupported-layout tests use this helper; backing initialization tests reuse the same fixture"
+    )]
     pub fn reasons(&self) -> &[SequenceCheckpointUnsupportedReason] {
         match self.plan.sequence_checkpoint_capability() {
             SequenceCheckpointCapability::Unsupported(reasons) => reasons,
@@ -232,6 +248,10 @@ impl Fixture {
         }
     }
 
+    #[allow(
+        dead_code,
+        reason = "Wire-contract tests use this helper; backing initialization tests reuse the same fixture"
+    )]
     pub fn revalidate(&self, wire: &[u8]) -> Result<ExecutionPlan, VNextError> {
         ExecutionPlan::from_json_validated(
             wire,

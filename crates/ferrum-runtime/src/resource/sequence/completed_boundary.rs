@@ -102,6 +102,7 @@ impl CompletedSequenceBoundary {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn batch_invocation_id(&self) -> Option<BatchInvocationId> {
         match self.provenance {
             CompletedSequenceProvenance::FullPlan {

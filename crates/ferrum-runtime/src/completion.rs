@@ -1466,12 +1466,20 @@ impl CompletionSweepEntry {
 #[must_use = "a bounded completion sweep contains scheduler-owned progress evidence"]
 pub struct CompletionSweepReceipt {
     entries: Vec<CompletionSweepEntry>,
+    #[cfg_attr(
+        not(test),
+        allow(
+            dead_code,
+            reason = "Retains native state-transfer sweep observations with the completion receipt"
+        )
+    )]
     state_transfers: Vec<StateTransferSweepEntry>,
     retained_after: usize,
     quarantined_after: usize,
 }
 
 impl CompletionSweepReceipt {
+    #[cfg(test)]
     pub(crate) fn state_transfers(&self) -> &[StateTransferSweepEntry] {
         &self.state_transfers
     }
@@ -1738,13 +1746,29 @@ enum CompletionQuarantineOwnership<R: DeviceRuntime> {
     InFlight {
         resources: CompletionResourceLease<R>,
         lane: Arc<ExecutionLane<R>>,
+        #[allow(
+            dead_code,
+            reason = "Keeps the native fence alive with quarantined resources until safe cleanup"
+        )]
         fence: R::Fence,
+        #[allow(
+            dead_code,
+            reason = "Retains the original cohort identity with its quarantined submission owner"
+        )]
         batch_identity: BatchOperationIdentity,
+        #[allow(
+            dead_code,
+            reason = "Retains submitted evidence until the quarantined owner is safely released"
+        )]
         submission: SubmittedOperationReceipt,
     },
     SubmissionIndeterminate {
         resources: CompletionResourceLease<R>,
         lane: Arc<ExecutionLane<R>>,
+        #[allow(
+            dead_code,
+            reason = "Retains the exact cohort identity while indeterminate ownership is quarantined"
+        )]
         batch_identity: BatchOperationIdentity,
     },
 }

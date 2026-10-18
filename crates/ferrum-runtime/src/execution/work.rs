@@ -15,6 +15,7 @@ pub(crate) struct DynamicResourceShape {
 }
 
 impl DynamicResourceShape {
+    #[cfg(test)]
     pub(crate) fn new(sequences: u32, tokens: u64, pages: u64) -> Result<Self, VNextError> {
         if sequences == 0 || tokens == 0 || pages == 0 {
             return Err(invalid_plan(
@@ -199,18 +200,6 @@ pub(crate) struct CommittedPageWork {
 }
 
 impl CommittedPageWork {
-    pub(crate) fn new(pages: u64, fingerprint: String) -> Result<Self, VNextError> {
-        if pages == 0
-            || fingerprint.len() != 64
-            || !fingerprint
-                .bytes()
-                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-        {
-            return Err(invalid_plan("committed page work evidence is invalid"));
-        }
-        Ok(Self { pages, fingerprint })
-    }
-
     pub(crate) const fn pages(&self) -> u64 {
         self.pages
     }
@@ -735,23 +724,6 @@ impl DynamicResourceDemand {
                     pages: bucket.maximum_pages,
                 }
             }
-        }
-    }
-
-    pub(super) fn is_fixed(&self) -> bool {
-        matches!(self, Self::Fixed { .. })
-    }
-
-    pub(super) fn is_valid_for_sequence_scope(&self) -> bool {
-        match self {
-            Self::Fixed { .. } | Self::Tokens { .. } | Self::Pages { .. } => true,
-            Self::Affine {
-                bytes_per_sequence, ..
-            } => *bytes_per_sequence == 0,
-            Self::BoundedShapeBuckets { buckets } => {
-                buckets.iter().all(|bucket| bucket.maximum_sequences == 1)
-            }
-            Self::ActualSequences { .. } => false,
         }
     }
 }

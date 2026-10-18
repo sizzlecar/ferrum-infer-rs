@@ -936,6 +936,7 @@ struct ReusableExecutionMemoryPlanWire {
 }
 
 impl ReusableExecutionMemoryPlan {
+    #[cfg(test)]
     pub(crate) fn new(
         maximum_reusable_lanes: u32,
         maximum_device_executables: u64,

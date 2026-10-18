@@ -1316,6 +1316,7 @@ where
     /// Derives the exact additional physical/logical claim needed to advance
     /// one sequence's committed frontier. Existing extents remain owned by the
     /// prior snapshot; only paged storage can append disjoint extents.
+    #[cfg(test)]
     pub(super) fn sequence_extension_demand(
         &self,
         committed: DynamicResourceShape,

@@ -3,13 +3,6 @@ use crate::{CompletionSlotId, DeviceRuntime, VNextError};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum StateTransferResultStatus {
-    Pending,
-    Ready,
-    Taken,
-}
-
 enum ResultState<R: DeviceRuntime> {
     Pending,
     Ready(StateTransferResult<R>),
@@ -59,18 +52,6 @@ impl<R: DeviceRuntime> StateTransferResultSlot<R> {
 
     pub(crate) fn slot_id(&self) -> CompletionSlotId {
         self.slot_id
-    }
-
-    pub(crate) fn status(&self) -> Result<StateTransferResultStatus, VNextError> {
-        let state = self
-            .state
-            .lock()
-            .map_err(|_| invalid_completion("native transfer result slot is poisoned"))?;
-        Ok(match &*state {
-            ResultState::Pending => StateTransferResultStatus::Pending,
-            ResultState::Ready(_) => StateTransferResultStatus::Ready,
-            ResultState::Taken => StateTransferResultStatus::Taken,
-        })
     }
 
     pub(in crate::completion) fn publish(

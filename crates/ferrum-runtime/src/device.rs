@@ -3309,23 +3309,6 @@ pub struct DeviceCommandBatch<C> {
 }
 
 impl<C> DeviceCommandBatch<C> {
-    pub(crate) fn singleton(command: C) -> Self {
-        Self {
-            commands: vec![DeviceCommandEntry {
-                phase: DeviceCommandPhase::Compute,
-                node_index: None,
-                logical_work: None,
-                command,
-            }],
-            timing_mode: DeviceTimingMode::Off,
-            compute_path_requirement: DeviceComputePathRequirement::Adaptive,
-            declared_eager_compute_node_indices: Vec::new(),
-            attribution_requirement: DeviceSubmissionAttributionRequirement::None,
-            reusable_execution_capture: None,
-            terminal_readback: None,
-        }
-    }
-
     pub(crate) fn with_capacity(capacity: usize) -> Self {
         Self {
             commands: Vec::with_capacity(capacity),
@@ -3439,6 +3422,7 @@ impl<C> DeviceCommandBatch<C> {
         });
     }
 
+    #[cfg(test)]
     pub(crate) fn push_compute(&mut self, command: C) {
         self.commands.push(DeviceCommandEntry {
             phase: DeviceCommandPhase::Compute,
@@ -3499,10 +3483,6 @@ impl<C> DeviceCommandBatch<C> {
                 command,
             });
         }
-    }
-
-    pub(crate) fn push(&mut self, command: C) {
-        self.push_compute(command);
     }
 
     pub fn len(&self) -> usize {

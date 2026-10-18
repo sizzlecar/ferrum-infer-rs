@@ -41,13 +41,6 @@ impl StepResourceAdmissionRequest {
         self.work_shape.immediate_shape()
     }
 
-    pub(crate) fn fit_shape(&self) -> DynamicResourceShape {
-        match self.fit_policy {
-            AdmissionFitPolicy::ImmediateOnly => self.work_shape.immediate_shape(),
-            AdmissionFitPolicy::FullInputMustFit => self.work_shape.fit_shape(),
-        }
-    }
-
     pub const fn fit_policy(&self) -> AdmissionFitPolicy {
         self.fit_policy
     }
@@ -425,10 +418,6 @@ impl StepParticipantFrameAssignment {
     pub const fn frame_id(self) -> ExecutionFrameId {
         self.frame_id
     }
-
-    const fn canonical_key(self) -> (u32, u64, u32, u64) {
-        self.participant.canonical_key()
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -469,17 +458,6 @@ impl InvocationResourceAdmissionRequest {
 
     pub fn work_shape(&self) -> &BatchWorkShape {
         self.work_shape.as_ref()
-    }
-
-    pub(crate) fn immediate_shape(&self) -> DynamicResourceShape {
-        self.work_shape.immediate_shape()
-    }
-
-    pub(crate) fn fit_shape(&self) -> DynamicResourceShape {
-        match self.fit_policy {
-            AdmissionFitPolicy::ImmediateOnly => self.work_shape.immediate_shape(),
-            AdmissionFitPolicy::FullInputMustFit => self.work_shape.fit_shape(),
-        }
     }
 
     pub const fn fit_policy(&self) -> AdmissionFitPolicy {

@@ -91,6 +91,7 @@ impl<R: DeviceRuntime> PendingRestoreCommit<R> {
         &self.identity
     }
 
+    #[cfg(test)]
     pub(crate) fn checkpoint(&self) -> &Arc<CapturedCheckpoint<R>> {
         &self.checkpoint
     }
@@ -205,6 +206,7 @@ pub(crate) struct RestoreFrontierPublication<R: DeviceRuntime> {
 }
 
 impl<R: DeviceRuntime> RestoreFrontierPublication<R> {
+    #[cfg(test)]
     pub(crate) fn boundary(&self) -> &Arc<CompletedSequenceBoundary> {
         &self.boundary
     }

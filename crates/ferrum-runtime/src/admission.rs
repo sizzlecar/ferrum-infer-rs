@@ -2304,23 +2304,7 @@ impl LogicalAdmissionCoordinator {
         ))
     }
 
-    pub(crate) fn refresh_wait_snapshot(
-        &self,
-        observed: &CapacityWaitCondition,
-    ) -> Result<CapacityWaitSnapshot, VNextError> {
-        let state = self.inner.lock_state()?;
-        if state.poisoned {
-            return Err(admission_fault(
-                DynamicAdmissionFaultKind::Poisoned,
-                "coordinator is fail-closed",
-            ));
-        }
-        Ok(CapacityWaitSnapshot::new(
-            state.epochs(self.id()),
-            state.refresh_wait_condition(self.id(), observed)?,
-        ))
-    }
-
+    #[cfg(test)]
     pub(crate) fn set_domain_total(
         &self,
         domain: CapacityDomainId,

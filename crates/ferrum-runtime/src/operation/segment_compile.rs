@@ -77,6 +77,7 @@ pub(super) struct CompiledSegmentBindingNode {
     pub dependencies: Vec<CompiledSegmentDependency>,
     pub persistent_preserve: bool,
     /// Full captured node closure, including resources not exported as patches.
+    #[cfg(test)]
     pub resource_indices: Vec<usize>,
     pub dynamic_window_base: usize,
     pub dynamic_window_count: usize,
@@ -200,14 +201,13 @@ impl CompiledSegmentBindingRecipe {
             required.extend(node.scratch_resource().cloned());
             required.extend(node.binding_resource().cloned());
             required.extend(node.persistent_resource().cloned());
+            #[cfg(test)]
             let mut resource_indices = Vec::with_capacity(required.len());
             for resource in required {
-                resource_indices.push(resolve_resource(
-                    memory,
-                    &resource,
-                    &mut resources,
-                    &mut indices,
-                )?);
+                let _resource_index =
+                    resolve_resource(memory, &resource, &mut resources, &mut indices)?;
+                #[cfg(test)]
+                resource_indices.push(_resource_index);
             }
             // Compile the complete value/workspace contract, including values
             // never exported in the provider's patch table. The fresh path
@@ -519,6 +519,7 @@ impl CompiledSegmentBindingRecipe {
                 regions,
                 dependencies,
                 persistent_preserve,
+                #[cfg(test)]
                 resource_indices,
                 dynamic_window_base: 0,
                 dynamic_window_count: 0,

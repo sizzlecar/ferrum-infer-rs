@@ -1,14 +1,13 @@
 //! Step admission and bound execution-stream lifecycle.
 
 use super::{
-    acquire_session_frames_with_backing, enter_sequence_dispatch, fmt, invalid_resource,
-    issue_batch_step_id, record_step_admission_profile, sequence_dispatch_is_poisoned,
-    sequence_slot_active, sequence_slot_is_poisoned, sequence_slot_poisoned_drained,
-    sequence_slot_poisoned_undrained, session_frame_capture_candidates,
-    step_admission_profile_start, AbandonedSequenceMetadata, AbandonedSequenceRecoveryError,
-    ActiveSequenceAbortDisposition, ActiveSequenceAbortReceipt, AdmissionFitPolicy,
-    AdmittedSequenceResources, AdmittedStepParticipant, AllocationLifetime, Arc, AtomicU64,
-    BatchCapacityClaimDecision, BatchParticipantAuthority, BoundExecutionStream,
+    acquire_session_frames_with_backing, fmt, invalid_resource, issue_batch_step_id,
+    record_step_admission_profile, sequence_dispatch_is_poisoned, sequence_slot_active,
+    sequence_slot_is_poisoned, sequence_slot_poisoned_drained, sequence_slot_poisoned_undrained,
+    session_frame_capture_candidates, step_admission_profile_start, AbandonedSequenceMetadata,
+    AbandonedSequenceRecoveryError, ActiveSequenceAbortDisposition, ActiveSequenceAbortReceipt,
+    AdmissionFitPolicy, AdmittedSequenceResources, AdmittedStepParticipant, AllocationLifetime,
+    Arc, AtomicU64, BatchCapacityClaimDecision, BatchParticipantAuthority, BoundExecutionStream,
     BoundExecutionStreamState, ClaimedBackingTransaction, DeviceRuntime,
     ExecutionBatchParticipants, ExecutionLane, ExecutionStreamCreationError,
     LaneBackingPrepareDecision, LogicalAdmissionCoordinatorId, LogicalBackingSliceAuthority,
@@ -537,22 +536,6 @@ where
 
     pub fn runtime_implementation_fingerprint(&self) -> &str {
         &self.runtime_fingerprint
-    }
-
-    pub(crate) fn with_runtime_and_stream<T>(
-        &mut self,
-        action: impl FnOnce(&R, &mut R::Stream) -> T,
-    ) -> Result<T, VNextError> {
-        if self.stream.state != BoundExecutionStreamState::InUse {
-            return Err(invalid_resource(
-                "operation dispatch requires one core-owned in-use stream",
-            ));
-        }
-        let _dispatch_guard = enter_sequence_dispatch(&self.resources.sequence_dispatch_gate)?;
-        Ok(action(
-            self.resources.request.plan.runtime(),
-            self.stream.stream_mut(),
-        ))
     }
 
     /// Consumes dispatch authority before draining the exact bound stream.

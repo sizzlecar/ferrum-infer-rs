@@ -581,26 +581,6 @@ where
         Ok(descriptor)
     }
 
-    pub(crate) fn participant_backing_views(
-        &self,
-        resource_id: &ResourceId,
-    ) -> Result<Vec<(SequenceAuthorityId, LogicalBackingBufferView<'_, R::Buffer>)>, VNextError>
-    {
-        self.participants
-            .iter()
-            .map(|participant| {
-                let authority = BatchParticipantAuthority::new(
-                    participant.session.sequence_authority(),
-                    participant.session.request_authority(),
-                );
-                Ok((
-                    participant.session.sequence_authority(),
-                    self.participant_backing_view(authority, resource_id)?,
-                ))
-            })
-            .collect()
-    }
-
     pub fn try_admit_invocation(
         self: &Arc<Self>,
         request: InvocationResourceAdmissionRequest,
@@ -1504,6 +1484,10 @@ where
 {
     participants: Vec<Arc<AdmittedSequenceResources<R>>>,
     participant_frames: Vec<StepParticipantFrameAssignment>,
+    #[allow(
+        dead_code,
+        reason = "Retains the admitted session epochs and fingerprints with prepared invocation metadata"
+    )]
     participant_session_identities: Vec<(SequenceSessionEpoch, SequenceSessionFingerprint)>,
     flight_candidates: Vec<ParticipantFlightCandidate>,
     node_id: NodeId,
@@ -2113,18 +2097,6 @@ where
 
     /// Consumes the complete compiled segment's fresh resource requirements in
     /// one canonical pool observation. No per-node invocation is materialized.
-    pub(crate) fn prepare_segment_backings(
-        &self,
-        requests: &[super::SegmentBackingRequest],
-        windows: &[super::SegmentBackingWindow],
-    ) -> Result<super::SegmentBackingBatch<R::Buffer>, VNextError> {
-        self.prepare_segment_backings_with_timing(
-            requests,
-            windows,
-            &crate::operation::DisabledSubmissionWaveDispatchTimingSink,
-        )
-    }
-
     pub(crate) fn prepare_segment_backings_with_timing<S>(
         &self,
         requests: &[super::SegmentBackingRequest],
@@ -2715,6 +2687,7 @@ where
         &self.step
     }
 
+    #[cfg(test)]
     pub(crate) fn participant_backing_snapshot(
         &self,
         index: usize,
@@ -2780,26 +2753,6 @@ where
                 .view(authority);
         }
         self.step.backing_view(resource_id)
-    }
-
-    pub(crate) fn participant_backing_views(
-        &self,
-        resource_id: &ResourceId,
-    ) -> Result<Vec<(SequenceAuthorityId, LogicalBackingBufferView<'_, R::Buffer>)>, VNextError>
-    {
-        self.participants
-            .iter()
-            .map(|participant| {
-                let authority = BatchParticipantAuthority::new(
-                    participant.sequence_authority(),
-                    participant.request_authority(),
-                );
-                Ok((
-                    participant.sequence_authority(),
-                    self.step.participant_backing_view(authority, resource_id)?,
-                ))
-            })
-            .collect()
     }
 }
 

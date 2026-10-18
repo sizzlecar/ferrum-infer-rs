@@ -612,6 +612,7 @@ impl<R: DeviceRuntime> CompletionReaper<R> {
         Ok(Some(observation))
     }
 
+    #[cfg(test)]
     pub(crate) fn take_completed_state_transfer(
         &self,
         slot_id: CompletionSlotId,
@@ -621,6 +622,7 @@ impl<R: DeviceRuntime> CompletionReaper<R> {
 
     /// Recovery workers use the scheduler-owned sweep slot after external
     /// handles detach. The existing registry remains the sole owner.
+    #[cfg(test)]
     pub(crate) fn wait_state_transfer_for_recovery(
         &self,
         slot_id: CompletionSlotId,
@@ -628,6 +630,7 @@ impl<R: DeviceRuntime> CompletionReaper<R> {
         self.with_state_transfer(slot_id, None, |transfer| transfer.observe(true))
     }
 
+    #[cfg(test)]
     pub(crate) fn recover_state_transfer_by_draining_lane(
         &self,
         slot_id: CompletionSlotId,

@@ -47,20 +47,6 @@ pub struct BackingSegment {
 }
 
 impl BackingSegment {
-    pub(crate) fn new(
-        chunk: BackingChunkIdentity,
-        offset_bytes: u64,
-        length_bytes: u64,
-    ) -> Result<Self, VNextError> {
-        Self::from_chunk(
-            &chunk.pool_id,
-            chunk.ordinal,
-            chunk.generation,
-            offset_bytes,
-            length_bytes,
-        )
-    }
-
     pub(super) fn from_chunk(
         pool_id: &DynamicBackingPoolId,
         chunk_ordinal: u32,

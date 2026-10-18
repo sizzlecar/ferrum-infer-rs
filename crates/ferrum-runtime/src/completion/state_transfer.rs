@@ -156,22 +156,6 @@ impl StateTransferIdentity {
         self.kind
     }
 
-    pub(crate) fn lane_id(&self) -> ExecutionLaneId {
-        self.lane_id
-    }
-
-    pub(crate) fn checkpoint_authority(&self) -> CheckpointAuthorityId {
-        self.checkpoint
-    }
-
-    pub(crate) fn boundary_tokens(&self) -> u64 {
-        self.boundary_tokens
-    }
-
-    pub(crate) fn plan_hash(&self) -> &PlanHash {
-        &self.plan_hash
-    }
-
     pub(crate) fn layout_fingerprint(&self) -> &str {
         &self.layout_fingerprint
     }

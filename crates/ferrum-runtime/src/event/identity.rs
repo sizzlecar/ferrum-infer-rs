@@ -324,10 +324,8 @@ impl ExecutionIdentityEnvelope {
 
 /// Non-owning logical fields; never carries resource or submission authority.
 pub(crate) struct ExecutionIdentityProjection<'a> {
-    pub(crate) version: ContractVersion,
     pub(crate) run_id: &'a RunId,
     pub(crate) request_id: &'a RequestIdentity,
-    pub(crate) sequence: u64,
     pub(crate) plan_id: Option<&'a PlanId>,
     pub(crate) plan_hash: Option<&'a PlanHash>,
     pub(crate) frame_id: Option<ExecutionFrameId>,
@@ -355,10 +353,8 @@ pub(crate) struct ExecutionIdentityProjection<'a> {
 impl<'a> ExecutionIdentityProjection<'a> {
     fn from_parts(parts: &'a ExecutionIdentityParts) -> Self {
         Self {
-            version: parts.version,
             run_id: &parts.run_id,
             request_id: &parts.request_id,
-            sequence: parts.sequence,
             plan_id: parts.plan_id.as_ref(),
             plan_hash: parts.plan_hash.as_ref(),
             frame_id: parts.frame_id,

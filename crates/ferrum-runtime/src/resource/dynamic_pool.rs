@@ -5,8 +5,8 @@ use super::{
     DeviceBufferRetention, DeviceCapacityAvailabilitySnapshot, DeviceCapacityGrant, DeviceRuntime,
     DynamicBackingPoolId, DynamicBackingPoolSpec, DynamicResourceDescriptor, DynamicResourceShape,
     DynamicStorageAllocator, DynamicStorageProfile, ElementType, ExecutionLaneId, FreeExtentIndex,
-    InvocationLivenessMode, LogicalAdmissionCoordinator, LogicalAdmissionCoordinatorId, Mutex,
-    Ordering, PlanNode, ResourceId, Serialize, StateInitialization, VNextError,
+    InvocationLivenessMode, LogicalAdmissionCoordinator, Mutex, Ordering, PlanNode, ResourceId,
+    Serialize, StateInitialization, VNextError,
 };
 use crate::{
     DeviceCapacityPressure, DeviceReusableAddressScope, DynamicPoolProvisioningPolicy,

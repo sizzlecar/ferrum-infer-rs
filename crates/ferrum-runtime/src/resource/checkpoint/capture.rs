@@ -13,6 +13,7 @@ pub(crate) struct CheckpointCaptureAttemptId {
     serial: NonZeroU64,
 }
 
+#[cfg(test)]
 impl CheckpointCaptureAttemptId {
     pub(crate) fn checkpoint_authority(self) -> CheckpointAuthorityId {
         self.checkpoint
@@ -115,9 +116,6 @@ impl<R: DeviceRuntime> std::fmt::Debug for CheckpointCaptureFinishFailure<R> {
 }
 
 impl<R: DeviceRuntime> CheckpointCaptureFinishFailure<R> {
-    pub(crate) fn error(&self) -> &VNextError {
-        &self.error
-    }
     pub(crate) fn into_parts(self) -> (VNextError, CheckpointCapturePermit<R>) {
         (self.error, self.permit)
     }

@@ -836,6 +836,7 @@ fn execution_frame_successor(frame_id: ExecutionFrameId) -> Option<ExecutionFram
         .and_then(|next| ExecutionFrameId::try_from(next).ok())
 }
 
+#[cfg(test)]
 pub(super) fn acquire_session_frames(
     candidates: &[SequenceFrameCandidate],
     batch_step_id: BatchStepId,
@@ -912,19 +913,6 @@ pub(super) fn acquire_session_frames(
         });
     }
     Ok(holds)
-}
-
-pub(super) fn session_frame_candidates<R: DeviceRuntime>(
-    sessions: &[Arc<SequenceSession<R>>],
-) -> Vec<SequenceFrameCandidate> {
-    sessions
-        .iter()
-        .map(|session| SequenceFrameCandidate {
-            slot: Arc::clone(&session.slot),
-            epoch: session.epoch,
-            fingerprint: session.fingerprint.clone(),
-        })
-        .collect()
 }
 
 pub(super) fn acquire_session_frames_with_backing<R>(
@@ -1077,6 +1065,7 @@ pub(super) enum StepFrameFinalization {
     RollbackUnsubmitted,
 }
 
+#[cfg(test)]
 pub(super) fn finalize_session_frames(
     holds: &mut [&mut SessionFrameHold],
     finalization: StepFrameFinalization,
