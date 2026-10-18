@@ -46,6 +46,11 @@ pub trait DecoderOnlyLLM: Send + Sync {
     /// Runtime-facing configuration.
     fn config(&self) -> &LlmRuntimeConfig;
 
+    /// Adapter execution implemented by this configured model instance.
+    fn adapter_execution_support(&self) -> ferrum_interfaces::adapter::AdapterExecutionSupport {
+        ferrum_interfaces::adapter::AdapterExecutionSupport::Unsupported
+    }
+
     /// Optional model-level cache metrics.
     ///
     /// Models with real paged-KV prefix reuse override this so the executor
@@ -58,6 +63,17 @@ pub trait DecoderOnlyLLM: Send + Sync {
     /// Optional runtime LoRA metrics.
     fn lora_metrics_snapshot(&self) -> Option<serde_json::Value> {
         None
+    }
+
+    /// Load and validate an adapter without binding a sequence or preparing KV.
+    /// Successfully prepared adapters may remain cached if another member of
+    /// the batch fails. While holding the same exclusive model access, binding
+    /// this exact name/path must not perform further fallible loading.
+    fn preload_lora_adapter(&mut self, adapter: &crate::lora::ActiveLoraAdapter) -> Result<()> {
+        Err(ferrum_types::FerrumError::unsupported(format!(
+            "LoRA preparation is not supported by this model/backend for adapter {}",
+            adapter.name
+        )))
     }
 
     /// Bind or clear a startup LoRA adapter for a model-side KV cache id.

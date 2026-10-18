@@ -31,7 +31,7 @@ pub mod qwen35_weights;
 pub mod registry;
 pub mod source;
 pub mod tensor_wrapper;
-#[cfg(feature = "test-support")]
+#[cfg(any(test, feature = "test-support"))]
 pub mod test_support;
 pub mod tokenizer;
 pub mod vnext;

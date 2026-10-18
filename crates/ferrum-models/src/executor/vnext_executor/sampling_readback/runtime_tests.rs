@@ -5,6 +5,7 @@ use ferrum_interfaces::sampler::{
     SamplingRng,
 };
 use ferrum_kernels::backend::cpu::vnext_ops::CpuVNextComposition;
+use serde_json::json;
 
 mod fixture;
 use fixture::{Fixture, FixtureOptions, VOCAB};
@@ -104,10 +105,7 @@ fn assert_delta(before: &serde_json::Value, after: &serde_json::Value, field: &s
     );
 }
 
-async fn admit<R: DeviceRuntime>(
-    fixture: &Fixture<R>,
-    request_id: &RequestId,
-) -> Arc<dyn KvCacheHandle> {
+fn reserve_prefill<R: DeviceRuntime>(fixture: &Fixture<R>, request_id: &RequestId) {
     let executor = &fixture.executor;
     let tokens = [TokenId::new(0)];
     loop {
@@ -128,6 +126,15 @@ async fn admit<R: DeviceRuntime>(
             other => panic!("tiny admitted fixture unexpectedly deferred: {other:?}"),
         }
     }
+}
+
+async fn admit<R: DeviceRuntime>(
+    fixture: &Fixture<R>,
+    request_id: &RequestId,
+) -> Arc<dyn KvCacheHandle> {
+    reserve_prefill(fixture, request_id);
+    let executor = &fixture.executor;
+    let tokens = [TokenId::new(0)];
     let input = PlanRuntimePrefillInput::new(
         request_id.clone(),
         Arc::<[TokenId]>::from(tokens),
@@ -162,6 +169,127 @@ async fn admit<R: DeviceRuntime>(
         executor.io.output_layout.byte_len().unwrap(),
     );
     Arc::clone(output.kv_cache())
+}
+
+fn legacy_tokens(tokens: &[u32]) -> TensorRef {
+    common::wrap_tensor(common::tokens_to_tensor(tokens, &candle_core::Device::Cpu).unwrap())
+}
+
+fn lora_metadata() -> std::collections::HashMap<String, serde_json::Value> {
+    std::collections::HashMap::from([
+        ("ferrum_lora_adapter".into(), json!("adapter")),
+        ("ferrum_lora_path".into(), json!("unused-adapter-path")),
+    ])
+}
+
+fn assert_no_adapter_execution<R: DeviceRuntime>(
+    executor: &VNextModelExecutor<R>,
+    before: &serde_json::Value,
+) {
+    let after = executor.cache_metrics_snapshot().unwrap();
+    for field in ["active_sequences", "pending_sequences"] {
+        assert_eq!(
+            after[field].as_u64().expect(field),
+            before[field].as_u64().expect(field),
+            "{field}"
+        );
+    }
+    for field in ["submitted_waves", "prefill_operations", "decode_operations"] {
+        assert_eq!(
+            after["counters"][field].as_u64().expect(field),
+            before["counters"][field].as_u64().expect(field),
+            "{field}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn lora_legacy_prefill_rejects_before_any_plan_runtime_submission() {
+    let fixture = cpu(SamplingReadbackMode::Uniform);
+    let first_id = RequestId::new();
+    let second_id = RequestId::new();
+    reserve_prefill(&fixture, &first_id);
+    reserve_prefill(&fixture, &second_id);
+    let first = PrefillInput::new(legacy_tokens(&[0])).with_request_context(first_id, 16);
+    let second = PrefillInput::new(legacy_tokens(&[0]))
+        .with_request_context(second_id, 16)
+        .with_metadata(lora_metadata());
+    let executor = &fixture.executor;
+    let before = executor.cache_metrics_snapshot().unwrap();
+
+    let results = [
+        executor.prefill(&second).await.map(|_| ()),
+        executor.prefill_with_capacity(&second).await.map(|_| ()),
+        executor
+            .batch_prefill(&[first.clone(), second.clone()])
+            .await
+            .map(|_| ()),
+        executor
+            .batch_prefill_with_capacity(&[first.clone(), second.clone()])
+            .await
+            .map(|_| ()),
+    ];
+    for result in results {
+        assert!(
+            matches!(result, Err(FerrumError::Unsupported { .. })),
+            "{result:?}"
+        );
+    }
+    assert_no_adapter_execution(executor, &before);
+
+    // The valid participant remains executable after rejecting the whole batch.
+    executor.prefill(&first).await.unwrap();
+    assert_eq!(
+        executor.metrics.prefill_operations.load(Ordering::Relaxed),
+        1
+    );
+}
+
+#[tokio::test]
+async fn lora_legacy_decode_and_verify_reject_the_whole_batch_before_progress() {
+    let fixture = cpu(SamplingReadbackMode::Uniform);
+    let first_id = RequestId::new();
+    let second_id = RequestId::new();
+    let first_cache = admit(&fixture, &first_id).await;
+    let second_cache = admit(&fixture, &second_id).await;
+    let first =
+        DecodeInput::new(legacy_tokens(&[1]), first_cache.clone()).with_request_id(first_id);
+    let second = DecodeInput::new(legacy_tokens(&[1]), second_cache.clone())
+        .with_request_id(second_id)
+        .with_metadata(lora_metadata());
+    let executor = &fixture.executor;
+    let before = executor.cache_metrics_snapshot().unwrap();
+    let results = [
+        executor.decode(&second).await.map(|_| ()),
+        executor
+            .batch_decode(&[first.clone(), second.clone()])
+            .await
+            .map(|_| ()),
+        executor
+            .batch_decode_with_capacity(&[first.clone(), second.clone()])
+            .await
+            .map(|_| ()),
+        executor
+            .forward_verify(&[first.clone(), second.clone()])
+            .await
+            .map(|_| ()),
+    ];
+    for result in results {
+        assert!(
+            matches!(result, Err(FerrumError::Unsupported { .. })),
+            "{result:?}"
+        );
+    }
+    assert_no_adapter_execution(executor, &before);
+    for cache in [&first_cache, &second_cache] {
+        let sequence = executor.sequence_for_cache(&cache.cache_id()).unwrap();
+        assert_eq!(sequence.tokens.lock().len(), 1);
+    }
+    executor.decode(&first).await.unwrap();
+    assert_eq!(
+        executor.metrics.decode_operations.load(Ordering::Relaxed),
+        1
+    );
 }
 
 struct Wave {

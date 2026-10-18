@@ -69,6 +69,11 @@ pub trait InferenceEngine: Send + Sync {
 /// Responses APIs.
 #[async_trait]
 pub trait LlmInferenceEngine: InferenceEngine {
+    /// Adapter support of the implementation that will execute requests.
+    fn adapter_execution_support(&self) -> crate::adapter::AdapterExecutionSupport {
+        crate::adapter::AdapterExecutionSupport::Unsupported
+    }
+
     /// Authoritative owner of request-lifetime state and capacity. This is a
     /// cheap capability query; it must not construct a metrics snapshot.
     /// Plan-runtime engines supply native prefix observations even when their

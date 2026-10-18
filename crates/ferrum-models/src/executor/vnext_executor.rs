@@ -9357,6 +9357,10 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         &self,
         inputs: &[DecodeInput],
     ) -> Result<ExecutorBatchDecodeOutcome> {
+        let adapter_support = self.adapter_execution_support();
+        for input in inputs {
+            adapter_support.validate_metadata(&input.metadata)?;
+        }
         let mut typed_inputs = Vec::with_capacity(inputs.len());
         for input in inputs {
             if input.batch_size() != 1 {
@@ -10004,6 +10008,8 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         &self,
         input: &PrefillInput,
     ) -> Result<PlanRuntimePrefillInput> {
+        self.adapter_execution_support()
+            .validate_metadata(&input.metadata)?;
         if input.batch_size() != 1 {
             return Err(FerrumError::unsupported(
                 "each vNext legacy prefill input must contain exactly one sequence",
@@ -10103,6 +10109,10 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         &self,
         inputs: &[PrefillInput],
     ) -> Result<ExecutorBatchPrefillOutcome> {
+        let adapter_support = self.adapter_execution_support();
+        for input in inputs {
+            adapter_support.validate_metadata(&input.metadata)?;
+        }
         let inputs = inputs
             .iter()
             .map(|input| self.plan_runtime_prefill_input_from_legacy(input))
@@ -10790,6 +10800,8 @@ impl<R: DeviceRuntime> ModelExecutor for VNextModelExecutor<R> {
     }
 
     async fn decode(&self, input: &DecodeInput) -> Result<DecodeOutput> {
+        self.adapter_execution_support()
+            .validate_metadata(&input.metadata)?;
         let started = Instant::now();
         if input.batch_size() != 1 {
             return Err(FerrumError::unsupported(

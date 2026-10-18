@@ -120,12 +120,20 @@ pub fn contract_groups(backend: Backend) -> Vec<ContractGroup> {
             id: LEGACY_CUDA_CHECK.into(),
             behavior: Behavior::SubmissionCompletion,
             entrypoints: Vec::new(),
-            tests: vec![ContractTest {
-                package: "ferrum-kernels".into(),
-                target: "ferrum_kernels".into(),
-                kind: "lib".into(),
-                name: "backend::cuda::submission_tests::legacy_stream_preserves_upload_compute_copy_order_and_context_reuse".into(),
-            }],
+            tests: vec![
+                ContractTest {
+                    package: "ferrum-kernels".into(),
+                    target: "ferrum_kernels".into(),
+                    kind: "lib".into(),
+                    name: "backend::cuda::submission_tests::legacy_stream_preserves_upload_compute_copy_order_and_context_reuse".into(),
+                },
+                ContractTest {
+                    package: "ferrum-models".into(),
+                    target: "ferrum_models".into(),
+                    kind: "lib".into(),
+                    name: "models::llama_family::lora_tests::lora_cuda_existing_base_graph_cannot_bypass_adapter".into(),
+                },
+            ],
         });
     }
     groups.extend(numerical::groups(backend));

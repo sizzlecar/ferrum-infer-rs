@@ -26,7 +26,7 @@ use ferrum_bench_core::{
     BenchmarkRequestCorrelation, BENCHMARK_CELL_ID_HEADER, BENCHMARK_PHASE_HEADER,
     BENCHMARK_REPEAT_INDEX_HEADER, BENCHMARK_REQUEST_INDEX_HEADER, BENCHMARK_RUN_ID_HEADER,
 };
-use ferrum_interfaces::engine::LlmInferenceEngine;
+use ferrum_interfaces::{adapter::AdapterExecutionSupport, engine::LlmInferenceEngine};
 use ferrum_types::{
     has_unclosed_model_reasoning_block, model_reasoning_markers,
     parse_harmony_response_for_finish_reason, parse_model_reasoning_response,
@@ -261,6 +261,8 @@ impl AxumServer {
         base_model_id: impl Into<String>,
         adapters: Vec<LoraAdapterModel>,
     ) -> ferrum_types::Result<Self> {
+        self.state
+            .validate_lora_execution_support(!adapters.is_empty())?;
         let base_model_id = base_model_id.into();
         let registry = if self.state.served_model_registry.is_empty() {
             ServedModelRegistry::try_new(
@@ -334,6 +336,17 @@ pub struct AppState {
 }
 
 impl AppState {
+    fn validate_lora_execution_support(&self, has_adapters: bool) -> ferrum_types::Result<()> {
+        if has_adapters {
+            self.llm
+                .as_ref()
+                .map(|engine| engine.adapter_execution_support())
+                .unwrap_or(AdapterExecutionSupport::Unsupported)
+                .require_lora()?;
+        }
+        Ok(())
+    }
+
     fn record_prefix_prompt(&self, prompt: &str, policy: &CachePolicy) {
         if self.llm.as_ref().is_some_and(|engine| {
             engine.execution_resource_authority() == ExecutionResourceAuthority::PlanRuntime
@@ -977,6 +990,9 @@ impl HttpServer for AxumServer {
                 "cannot start Axum server after shutdown was requested",
             ));
         }
+        self.state.validate_lora_execution_support(
+            self.state.served_model_registry.adapter_count() > 0,
+        )?;
         self.lifecycle
             .running
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
@@ -1165,11 +1181,8 @@ async fn chat_completions_handler_with_phases(
     // OpenAI spec requires at least one message. Reject empty arrays at
     // the boundary rather than synthesising a fake prompt downstream.
     validate_chat_request(&request)?;
-    let (engine_model_id, lora_adapter) = resolve_request_model(
-        &state.served_model_registry,
-        &request.model,
-        ServedModelKind::Llm,
-    )?;
+    let (engine_model_id, lora_adapter) =
+        resolve_request_model(&state, &request.model, ServedModelKind::Llm)?;
 
     // Convert OpenAI request to internal format
     let mut inference_request = convert_chat_request_with_template_model_and_default(
@@ -4904,10 +4917,11 @@ fn convert_completion_request(request: &CompletionsRequest) -> InferenceRequest 
 }
 
 fn resolve_request_model<'a>(
-    registry: &'a ServedModelRegistry,
+    state: &'a AppState,
     request_model: &str,
     required_kind: ServedModelKind,
 ) -> std::result::Result<(ModelId, Option<&'a LoraAdapterModel>), ServerError> {
+    let registry = &state.served_model_registry;
     if registry.is_empty() {
         return Ok((ModelId::new(request_model), None));
     }
@@ -4916,6 +4930,9 @@ fn resolve_request_model<'a>(
         .ok_or_else(|| {
             ServerError::invalid_request(format!("unknown model: {request_model}"), Some("model"))
         })?;
+    state
+        .validate_lora_execution_support(entry.adapter().is_some())
+        .map_err(|error| ServerError::unsupported_feature(error.to_string(), Some("model")))?;
     Ok((entry.engine_model_id().clone(), entry.adapter()))
 }
 
@@ -5079,11 +5096,8 @@ async fn completions_handler(
         ServerError::invalid_request(format!("invalid completions request: {e}"), None)
     })?;
     validate_completion_request(&request)?;
-    let (engine_model_id, lora_adapter) = resolve_request_model(
-        &state.served_model_registry,
-        &request.model,
-        ServedModelKind::Llm,
-    )?;
+    let (engine_model_id, lora_adapter) =
+        resolve_request_model(&state, &request.model, ServedModelKind::Llm)?;
     let mut inference_request = convert_completion_request(&request);
     apply_served_model_resolution(&mut inference_request, engine_model_id, lora_adapter);
     if request.stream.unwrap_or(false) {
@@ -5480,6 +5494,7 @@ mod tests {
     mod engine_stop_contract;
     mod gemma_thought;
     mod harmony_stops;
+    mod lora_execution_support;
     mod model_reasoning_metadata;
     mod native_tool_stream;
     mod reasoning_controls;
@@ -5624,6 +5639,7 @@ mod tests {
 
     struct StubLlm {
         config: EngineConfig,
+        adapter_support: AdapterExecutionSupport,
         resource_authority: ExecutionResourceAuthority,
         context_capacity: Option<usize>,
         text: String,
@@ -5647,6 +5663,7 @@ mod tests {
             config.model.model_id = ModelId::new("stub-model");
             Self {
                 config,
+                adapter_support: AdapterExecutionSupport::Unsupported,
                 resource_authority: ExecutionResourceAuthority::LegacyEngine,
                 text: text.to_string(),
                 context_capacity: None,
@@ -5722,6 +5739,11 @@ mod tests {
                 lora_metrics: Some(lora_metrics),
                 ..Self::new(text)
             }
+        }
+
+        fn with_adapter_support(mut self, support: AdapterExecutionSupport) -> Self {
+            self.adapter_support = support;
+            self
         }
 
         fn with_execution_attribution(text: &str, execution_attribution: Value) -> Self {
@@ -5824,6 +5846,7 @@ mod tests {
 
     struct CapturingLlm {
         config: EngineConfig,
+        adapter_support: AdapterExecutionSupport,
         last_request: Mutex<Option<InferenceRequest>>,
     }
 
@@ -5833,8 +5856,14 @@ mod tests {
             config.model.model_id = ModelId::new("qwen3");
             Self {
                 config,
+                adapter_support: AdapterExecutionSupport::Unsupported,
                 last_request: Mutex::new(None),
             }
+        }
+
+        fn with_adapter_support(mut self, support: AdapterExecutionSupport) -> Self {
+            self.adapter_support = support;
+            self
         }
 
         fn last_request(&self) -> InferenceRequest {
@@ -6012,6 +6041,10 @@ mod tests {
 
     #[async_trait]
     impl LlmInferenceEngine for StubLlm {
+        fn adapter_execution_support(&self) -> AdapterExecutionSupport {
+            self.adapter_support
+        }
+
         fn execution_resource_authority(&self) -> ExecutionResourceAuthority {
             self.resource_authority
         }
@@ -6160,6 +6193,10 @@ mod tests {
 
     #[async_trait]
     impl LlmInferenceEngine for CapturingLlm {
+        fn adapter_execution_support(&self) -> AdapterExecutionSupport {
+            self.adapter_support
+        }
+
         async fn infer(
             &self,
             request: InferenceRequest,
@@ -6707,7 +6744,11 @@ mod tests {
     }
 
     fn router_with_capturing_lora_llm() -> (Router, Arc<CapturingLlm>) {
-        let engine = Arc::new(CapturingLlm::new());
+        // This fixture proves routing only; numerical adapter application is
+        // covered by the model executor's real tensor tests.
+        let engine = Arc::new(
+            CapturingLlm::new().with_adapter_support(AdapterExecutionSupport::PerSequenceLora),
+        );
         let router = AxumServer::from_llm(engine.clone())
             .with_lora_adapters(
                 "qwen3",
@@ -7862,17 +7903,20 @@ mod tests {
 
     #[tokio::test]
     async fn route_health_includes_engine_lora_metrics_snapshot() {
-        let router = AxumServer::from_llm(Arc::new(StubLlm::with_lora_metrics(
-            "ok",
-            json!({
-                "enabled": true,
-                "adapter_count": 1,
-                "active_cache_bindings": 0,
-                "projection_applications": 7,
-                "position": "real-inference",
-                "source": "test-lora",
-            }),
-        )))
+        let router = AxumServer::from_llm(Arc::new(
+            StubLlm::with_lora_metrics(
+                "ok",
+                json!({
+                    "enabled": true,
+                    "adapter_count": 1,
+                    "active_cache_bindings": 0,
+                    "projection_applications": 7,
+                    "position": "real-inference",
+                    "source": "test-lora",
+                }),
+            )
+            .with_adapter_support(AdapterExecutionSupport::PerSequenceLora),
+        ))
         .with_lora_adapters(
             "stub-model",
             vec![LoraAdapterModel::new(
@@ -8013,6 +8057,7 @@ mod tests {
     async fn route_models_reports_engine_capacity_for_public_aliases_and_adapters() {
         let capacity = 3072;
         let engine = StubLlm {
+            adapter_support: AdapterExecutionSupport::PerSequenceLora,
             context_capacity: Some(capacity),
             ..StubLlm::new("ok")
         };
@@ -8040,17 +8085,19 @@ mod tests {
 
     #[tokio::test]
     async fn route_models_lists_startup_lora_adapters() {
-        let router = AxumServer::from_llm(Arc::new(StubLlm::new("ok")))
-            .with_lora_adapters(
-                "stub-model",
-                vec![LoraAdapterModel::new(
-                    "sql",
-                    "stub-model:sql",
-                    "/tmp/sql-adapter",
-                )],
-            )
-            .unwrap()
-            .build_router();
+        let router = AxumServer::from_llm(Arc::new(
+            StubLlm::new("ok").with_adapter_support(AdapterExecutionSupport::PerSequenceLora),
+        ))
+        .with_lora_adapters(
+            "stub-model",
+            vec![LoraAdapterModel::new(
+                "sql",
+                "stub-model:sql",
+                "/tmp/sql-adapter",
+            )],
+        )
+        .unwrap()
+        .build_router();
         let response = get(router, "/v1/models").await;
         assert_eq!(response.status(), AxumStatusCode::OK);
         let body = response_json(response).await;

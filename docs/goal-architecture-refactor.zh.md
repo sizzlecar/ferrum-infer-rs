@@ -2,7 +2,7 @@
 
 **状态：目标已激活，R0 实施中。** 工作分支：`refactor/execution-architecture-20261018`，从 2026-10-18 的干净 `main`（`c2be4c67`）开始。首个 checkpoint 退役独立 embedding/ASR/TTS 链路；原工作区未合并的旧 SLO 实现不作为代码基底。
 
-R0 首批已合并（PR #429），本机完整测试 5,110 通过、76 忽略，必需 CI 全过。Claude R181 补充的孤立 TTS kernel 与公开 GGUF 构造校验已修正，28 项定向测试通过，包含真实 CPU `run` / `serve` 与 Metal attention；后续改动仍需合并。没有新增性能或 SLO 达标声明。
+R0 两批退役清理已合并（PR #429、#430），必需 CI 全过；保留链路通过真实 CPU `run` / `serve` 与 Metal attention 定向检查。当前修复 LoRA 静默退回基础模型的问题：实际能力声明、全批前置校验及入口拒绝，保留有效 adapter 数值路线。原始证据留在仓库外交接目录，没有新增性能或 SLO 达标声明。
 
 ## 1. 目标与第一原则
 
