@@ -67,7 +67,7 @@ use crate::common::{DecoderOnlyLLM, LlmRuntimeConfig};
 use crate::lora::{load_runtime_lora_adapter, ActiveLoraAdapter, RuntimeLoraAdapter};
 
 pub(super) mod device_execution;
-use device_execution::{FrameLayout, LlamaExecutionFrame};
+use device_execution::{DeviceFrameResult, FrameLayout, LlamaExecutionFrame};
 
 const DEFAULT_KV_CAPACITY: usize = 512;
 
@@ -2151,6 +2151,24 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         cache_id: &str,
         capacity_hint: Option<usize>,
     ) {
+        if let Err(error) = self.ensure_preparation_available() {
+            std::panic::panic_any(error);
+        }
+        if self.kv_caches.contains_key(cache_id) {
+            return;
+        }
+        self.run_preparation_frame(|model, frame| {
+            model.ensure_kv_in_context(&mut frame.context, cache_id, capacity_hint);
+        })
+        .into_legacy_result();
+    }
+
+    pub(in crate::models) fn ensure_kv_in_context(
+        &mut self,
+        ctx: &mut B::Context,
+        cache_id: &str,
+        capacity_hint: Option<usize>,
+    ) {
         if self.kv_caches.contains_key(cache_id) {
             return;
         }
@@ -2253,7 +2271,7 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
                 })
                 .collect()
         };
-        let mut caches = match self.kv_free_pool.pop() {
+        let caches = match self.kv_free_pool.pop() {
             Some(mut cached)
                 if !paged
                     && capacity_hint.is_some()
@@ -2278,19 +2296,26 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
             None => allocate_caches(),
         };
 
+        // The original model map owns the whole cache before the first table
+        // write. Unknown completion keeps that map and this exact context;
+        // it never returns the physical blocks to a different incarnation.
+        self.kv_caches.insert(cache_id.to_string(), caches);
+        let caches = self
+            .kv_caches
+            .get_mut(cache_id)
+            .expect("cache was inserted");
+
         // Physical blocks are allocated on demand before each forward writes
         // KV. At creation time the cache owns no blocks; block_table is all
         // zeroes and context_lens is zero.
         if paged {
             let padded = vec![0u32; max_blocks_per_seq];
-            let mut ctx_tmp = B::new_context();
             for c in caches.iter_mut() {
                 if let Some(bt) = K::block_table_mut(c) {
-                    B::write_typed::<u32>(&mut ctx_tmp, bt, &padded);
+                    B::write_typed::<u32>(ctx, bt, &padded);
                 }
                 K::paged_block_indices_mut(c).clear();
             }
-            B::sync(&mut ctx_tmp);
         }
 
         // Reset logical length; buffers stay. No need to zero the memory —
@@ -2299,12 +2324,9 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         for c in caches.iter_mut() {
             K::set_len(c, 0);
             if let Some(cl) = K::context_lens_mut(c) {
-                let mut ctx_tmp = B::new_context();
-                B::write_typed::<u32>(&mut ctx_tmp, cl, &[0u32]);
-                B::sync(&mut ctx_tmp);
+                B::write_typed::<u32>(ctx, cl, &[0u32]);
             }
         }
-        self.kv_caches.insert(cache_id.to_string(), caches);
     }
 
     pub(crate) fn ensure_paged_kv_capacity_for_cache_id(
@@ -2395,8 +2417,61 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         }
     }
 
+    fn prepare_token_kv_in_frame(
+        &mut self,
+        cache_id: &str,
+        capacity_hint: usize,
+        prompt_tokens: usize,
+    ) -> Result<crate::common::llm::ModelKvReservation> {
+        self.ensure_preparation_available()?;
+        let request = KvSlotRequest {
+            cache_id: cache_id.to_owned(),
+            target_len: prompt_tokens,
+            admission_target_len: Some(prompt_tokens),
+        };
+        if self.kv_caches.contains_key(cache_id) {
+            return self.reserve_paged_token_kv_slots(&[request]);
+        }
+        match self.run_preparation_frame(|model, frame| {
+            model.ensure_kv_in_context(&mut frame.context, cache_id, Some(capacity_hint));
+            model.reserve_paged_token_kv_slots_in_context(Some(&mut frame.context), &[request])
+        }) {
+            DeviceFrameResult::Terminal(result) => result?,
+            DeviceFrameResult::Rejected(error) | DeviceFrameResult::Held(error) => Err(error),
+        }
+    }
+
     pub(crate) fn reserve_paged_token_kv_slots(
         &mut self,
+        requests: &[KvSlotRequest],
+    ) -> Result<crate::common::llm::ModelKvReservation> {
+        self.ensure_preparation_available()?;
+        let needs_context = requests.iter().any(|request| {
+            let Some(caches) = self.kv_caches.get(&request.cache_id) else {
+                return true;
+            };
+            caches.first().is_some_and(|cache| {
+                let block_size = K::block_size(cache);
+                block_size > 0
+                    && request.target_len.div_ceil(block_size) > K::paged_block_indices(cache).len()
+            })
+        });
+        if !needs_context {
+            // Revalidate capacity/admission and preserve the real reservation
+            // evidence, without a context or synchronization on a cached hit.
+            return self.reserve_paged_token_kv_slots_in_context(None, requests);
+        }
+        match self.run_preparation_frame(|model, frame| {
+            model.reserve_paged_token_kv_slots_in_context(Some(&mut frame.context), requests)
+        }) {
+            DeviceFrameResult::Terminal(result) => result?,
+            DeviceFrameResult::Rejected(error) | DeviceFrameResult::Held(error) => Err(error),
+        }
+    }
+
+    pub(in crate::models) fn reserve_paged_token_kv_slots_in_context(
+        &mut self,
+        mut ctx: Option<&mut B::Context>,
         requests: &[KvSlotRequest],
     ) -> Result<crate::common::llm::ModelKvReservation> {
         use crate::common::llm::ModelKvReservation;
@@ -2426,7 +2501,14 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         }
 
         for (cache_id, _, _) in &targets {
-            self.ensure_kv(cache_id);
+            if !self.kv_caches.contains_key(cache_id) {
+                self.ensure_kv_in_context(
+                    ctx.as_deref_mut()
+                        .expect("new cache requires a preparation context"),
+                    cache_id,
+                    None,
+                );
+            }
         }
         if self.paged_pools.is_none() {
             return Ok(ModelKvReservation::Reserved(None));
@@ -2509,7 +2591,6 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
             ));
         }
 
-        let mut ctx = B::new_context();
         for plan in &plans {
             if plan.new_blocks == 0 {
                 continue;
@@ -2543,11 +2624,15 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
             for cache in caches.iter_mut() {
                 *K::paged_block_indices_mut(cache) = block_indices.clone();
                 if let Some(block_table) = K::block_table_mut(cache) {
-                    B::write_typed::<u32>(&mut ctx, block_table, &padded);
+                    B::write_typed::<u32>(
+                        ctx.as_deref_mut()
+                            .expect("new blocks require a preparation context"),
+                        block_table,
+                        &padded,
+                    );
                 }
             }
         }
-        B::sync(&mut ctx);
 
         let (total_blocks, free_blocks_after) = {
             let alloc = alloc_arc.lock().unwrap_or_else(|p| p.into_inner());
@@ -3975,7 +4060,7 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         tokens: &[u32],
     ) -> Vec<f32> {
         assert!(!tokens.is_empty(), "prefill called with empty token list");
-        self.ensure_kv(cache_id);
+        self.ensure_kv_in_context(&mut frame.context, cache_id, None);
 
         let cache_len_before = self
             .kv_caches
@@ -4374,7 +4459,7 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         pos: u32,
     ) -> Vec<f32> {
         self.ensure_scratch(1);
-        self.ensure_kv(cache_id);
+        self.ensure_kv_in_context(&mut frame.context, cache_id, None);
 
         let h = self.cfg.hidden_size;
         let vocab = self.cfg.vocab_size;
@@ -5187,6 +5272,15 @@ impl<B: MoeLlmBackend> DecoderOnlyLLM for LlamaFamilyModel<B, KvFp16> {
         self.ensure_kv_with_capacity_hint(cache_id, Some(capacity_hint));
     }
 
+    fn prepare_token_kv(
+        &mut self,
+        cache_id: &str,
+        capacity_hint: usize,
+        prompt_tokens: usize,
+    ) -> Result<crate::common::llm::ModelKvReservation> {
+        self.prepare_token_kv_in_frame(cache_id, capacity_hint, prompt_tokens)
+    }
+
     fn kv_capacity(&self) -> usize {
         self.runtime_env.kv_capacity_for_model(self.cfg.max_seq_len)
     }
@@ -5454,6 +5548,15 @@ impl<B: MoeLlmBackend + BackendInt8KvOps> DecoderOnlyLLM for LlamaFamilyModel<B,
 
     fn prepare_kv_capacity(&mut self, cache_id: &str, capacity_hint: usize) {
         self.ensure_kv_with_capacity_hint(cache_id, Some(capacity_hint));
+    }
+
+    fn prepare_token_kv(
+        &mut self,
+        cache_id: &str,
+        capacity_hint: usize,
+        prompt_tokens: usize,
+    ) -> Result<crate::common::llm::ModelKvReservation> {
+        self.prepare_token_kv_in_frame(cache_id, capacity_hint, prompt_tokens)
     }
 
     fn kv_capacity(&self) -> usize {

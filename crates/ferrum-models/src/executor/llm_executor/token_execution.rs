@@ -136,12 +136,11 @@ impl LlmExecutor {
             },
         );
         let preparation = catch_host_execution(|| -> Result<ModelKvReservation> {
-            model.prepare_kv_capacity(&cache_id, context.maximum_sequence_tokens);
-            let reservation = model.reserve_token_kv_slots(&[KvSlotRequest {
-                cache_id: cache_id.clone(),
-                target_len: context.input_tokens.len(),
-                admission_target_len: Some(context.input_tokens.len()),
-            }])?;
+            let reservation = model.prepare_token_kv(
+                &cache_id,
+                context.maximum_sequence_tokens,
+                context.input_tokens.len(),
+            )?;
             if matches!(reservation, ModelKvReservation::Reserved(_)) {
                 model.set_lora_adapter_for_cache(&cache_id, adapter)?;
             }

@@ -29,6 +29,7 @@ pub(in crate::models) struct LlamaExecutionFrame<B: QuantLlmBackend + BackendMoe
     /// returns it directly without a box or another buffer allocation.
     produced_owners: Option<Box<dyn Send + Sync>>,
     layout: Option<FrameLayout>,
+    preparation_only: bool,
     pub(in crate::models) completed: Option<QuiescentContext>,
 }
 
@@ -100,6 +101,7 @@ impl<B: QuantLlmBackend + BackendMoeFused> LlamaExecutionFrame<B> {
             norm_out: None,
             produced_owners: None,
             layout: None,
+            preparation_only: false,
             completed: None,
         }
     }
@@ -148,7 +150,9 @@ impl<B: QuantLlmBackend + BackendMoeFused> LlamaExecutionFrame<B> {
     }
 
     pub(in crate::models) fn observe(mut self) -> FrameObservation<B> {
-        if self.completed.take().is_some() {
+        if self.completed.take().is_some()
+            || self.preparation_only && B::preparation_is_host_only(&self.context)
+        {
             return FrameObservation::Terminal {
                 owners: QuiescentLlamaFrame { frame: self },
                 error: None,
@@ -187,6 +191,7 @@ impl<B: QuantLlmBackend + BackendMoeFused> QuiescentLlamaFrame<B> {
             norm_out,
             produced_owners,
             layout,
+            preparation_only: _,
             completed: _,
         } = self.frame;
         match layout {
@@ -225,6 +230,15 @@ fn panic_error(payload: Box<dyn std::any::Any + Send>) -> FerrumError {
 }
 
 impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
+    pub(in crate::models) fn ensure_preparation_available(&self) -> Result<()> {
+        if self.pending_device_frame.is_some() {
+            return Err(FerrumError::backend(
+                "model still owns an unresolved device execution frame",
+            ));
+        }
+        Ok(())
+    }
+
     /// Numerical encoding borrows the actual frame. The catch boundary is
     /// outside every moved scratch owner, and terminal observation happens on
     /// that same context before restoration or release is permitted.
@@ -232,12 +246,29 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         &mut self,
         encode: impl FnOnce(&mut Self, &mut LlamaExecutionFrame<B>) -> T,
     ) -> DeviceFrameResult<T> {
-        if self.pending_device_frame.is_some() {
-            return DeviceFrameResult::Rejected(FerrumError::backend(
-                "model still owns an unresolved device execution frame",
-            ));
+        self.run_owned_frame(false, encode)
+    }
+
+    /// One retained owner for allocation, table initialization and physical
+    /// reservation. Numerical callers already owning a frame use the
+    /// in-context helpers instead of nesting this boundary.
+    pub(in crate::models) fn run_preparation_frame<T: Send + Sync + 'static>(
+        &mut self,
+        prepare: impl FnOnce(&mut Self, &mut LlamaExecutionFrame<B>) -> T,
+    ) -> DeviceFrameResult<T> {
+        self.run_owned_frame(true, prepare)
+    }
+
+    fn run_owned_frame<T: Send + Sync + 'static>(
+        &mut self,
+        preparation_only: bool,
+        encode: impl FnOnce(&mut Self, &mut LlamaExecutionFrame<B>) -> T,
+    ) -> DeviceFrameResult<T> {
+        if let Err(error) = self.ensure_preparation_available() {
+            return DeviceFrameResult::Rejected(error);
         }
         let mut frame = LlamaExecutionFrame::new();
+        frame.preparation_only = preparation_only;
         let result =
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| encode(self, &mut frame)))
                 .map_err(panic_error);
@@ -299,3 +330,6 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod preparation_tests;

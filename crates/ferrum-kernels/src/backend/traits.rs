@@ -114,6 +114,15 @@ pub trait Backend: Send + Sync + Sized + 'static {
         ))
     }
 
+    /// Prove that storage allocation and table initialization on this exact
+    /// context have performed only synchronous host work. This is restricted
+    /// to preparation; it does not certify a numerical operation or replace
+    /// checked synchronization. Device allocators that enqueue initialization
+    /// must return false, even when no numerical kernel was launched.
+    fn preparation_is_host_only(_ctx: &Self::Context) -> bool {
+        false
+    }
+
     /// Whether the backend context is currently inside a graph-capture window.
     ///
     /// Synchronizing a CUDA stream while capture is active raises

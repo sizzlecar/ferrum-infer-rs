@@ -2087,7 +2087,7 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
 
         // Ensure all items' KV caches exist.
         for (cid, _, _, _) in items {
-            self.ensure_kv(cid);
+            self.ensure_kv_in_context(&mut frame.context, cid, None);
         }
 
         // Concatenated input tokens for one embedding_lookup.
@@ -3676,7 +3676,7 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
         let m = batch.len();
         // Ensure all caches exist and scratch is sized for M tokens.
         for (cid, _, _) in batch {
-            self.ensure_kv(cid);
+            self.ensure_kv_in_context(&mut frame.context, cid, None);
         }
         self.ensure_scratch(m);
         self.scratch.ensure_batch_logits(&self.cfg, m);

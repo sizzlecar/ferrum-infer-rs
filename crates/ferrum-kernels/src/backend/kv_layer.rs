@@ -26,7 +26,10 @@ pub trait KvLayer<B: Backend>: KvDtypeKind {
     /// Per-layer cache type (FP16 → `KvCache`, INT8 → `KvCacheQuant`).
     type Layer: Send + Sync;
 
-    /// Allocate a paged cache layer for one sequence.
+    /// Allocate storage for a paged cache layer for one sequence. The caller
+    /// must initialize its block table and context length on its own retained
+    /// preparation context before using the layer. Allocator RAII still covers
+    /// backend-internal zero initialization.
     fn alloc_paged(
         max_blocks_per_seq: usize,
         block_size: usize,
@@ -52,7 +55,9 @@ pub trait KvLayer<B: Backend>: KvDtypeKind {
     fn paged_block_indices_mut(layer: &mut Self::Layer) -> &mut Vec<u32>;
 
     /// Ensure a contiguous cache has physical room for `required_capacity`
-    /// KV positions. Paged caches and fixed-size cache dtypes may no-op.
+    /// KV positions. Copies are encoded on the caller's retained context;
+    /// the caller must observe it before exposing the new capacity as ready.
+    /// Paged caches and fixed-size cache dtypes may no-op.
     fn ensure_contig_capacity(
         _ctx: &mut B::Context,
         _layer: &mut Self::Layer,
@@ -165,10 +170,7 @@ impl<B: Backend + crate::backend::BackendPagedKv> KvLayer<B> for KvFp16 {
         head_dim: usize,
     ) -> Self::Layer {
         let block_table = B::alloc_typed(crate::backend::Dtype::U32, max_blocks_per_seq);
-        let mut context_lens = B::alloc_typed(crate::backend::Dtype::U32, 1);
-        let mut bt_ctx = B::new_context();
-        B::write_typed::<u32>(&mut bt_ctx, &mut context_lens, &[0u32]);
-        B::sync(&mut bt_ctx);
+        let context_lens = B::alloc_typed(crate::backend::Dtype::U32, 1);
         KvCache {
             k: B::alloc(1),
             v: B::alloc(1),
@@ -259,8 +261,11 @@ impl<B: Backend + crate::backend::BackendPagedKv> KvLayer<B> for KvFp16 {
                 B::copy_slice(ctx, &layer.k, old_offset, &mut new_k, new_offset, copy_len);
                 B::copy_slice(ctx, &layer.v, old_offset, &mut new_v, new_offset, copy_len);
             }
-            B::sync(ctx);
         }
+        // CUDA buffers free on their ordered allocation stream; Metal's
+        // command buffer retains its referenced buffers. Keep those existing
+        // RAII guarantees and let the caller observe the entire preparation,
+        // rather than hiding a separate synchronization inside this copy.
         layer.k = new_k;
         layer.v = new_v;
         layer.capacity = required_capacity;

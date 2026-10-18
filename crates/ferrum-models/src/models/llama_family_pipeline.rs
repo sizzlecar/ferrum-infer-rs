@@ -998,6 +998,32 @@ where
         Ok(ModelKvReservation::Reserved(None))
     }
 
+    fn prepare_token_kv(
+        &mut self,
+        cache_id: &str,
+        capacity_hint: usize,
+        prompt_tokens: usize,
+    ) -> Result<crate::common::llm::ModelKvReservation> {
+        use crate::common::llm::ModelKvReservation;
+        if self.stages.is_empty() || self.stages.len() != self.placement.stages().len() {
+            return Err(FerrumError::request_validation(
+                "token preparation requires a complete layer-stage placement",
+            ));
+        }
+        for (index, stage) in self.stages.iter_mut().enumerate() {
+            let result =
+                B::with_device_ordinal(self.placement.stage(index).backend_device_ordinal, || {
+                    stage.prepare_token_kv(cache_id, capacity_hint, prompt_tokens)
+                })?;
+            if matches!(result, ModelKvReservation::CapacityDeferred(_)) {
+                // The rejecting stage supplies its actual allocator evidence.
+                // Earlier stage owners remain reachable for the same close.
+                return Ok(result);
+            }
+        }
+        Ok(ModelKvReservation::Reserved(None))
+    }
+
     fn cache_metrics_snapshot(&self) -> Option<serde_json::Value> {
         let stage_bridge = self.placement.stage_bridge();
         let pipeline_mode = self.pipeline_mode();
@@ -1408,6 +1434,89 @@ mod tests {
             ),
             ModelTokenOutcome::NotSubmitted(_)
         ));
+    }
+
+    #[test]
+    fn pipeline_token_preparation_later_stage_capacity_keeps_exact_stage_owners() {
+        use crate::common::llm::ModelKvReservation;
+        let (_, mut pipeline) = build_full_and_pipeline();
+        for stage in &mut pipeline.stages {
+            stage.runtime_env.metal_paged_kv = Some(true);
+            stage.runtime_env.prefix_cache = false;
+            stage.runtime_env.kv_capacity = Some(16);
+            stage.runtime_env.kv_max_blocks = Some(1);
+            stage.runtime_env.paged_max_seqs = 2;
+        }
+        assert!(matches!(
+            pipeline.stages[1]
+                .prepare_token_kv("occupied", 16, 1)
+                .unwrap(),
+            ModelKvReservation::Reserved(_),
+        ));
+        let occupied = pipeline.stages[1].kv_caches["occupied"][0]
+            .paged_block_indices
+            .clone();
+        let ModelKvReservation::CapacityDeferred(rejected) =
+            pipeline.prepare_token_kv("candidate", 16, 1).unwrap()
+        else {
+            panic!("the second stage's real pool is occupied");
+        };
+        assert_eq!(rejected.snapshot().total_blocks, 1);
+        assert_eq!(rejected.snapshot().free_blocks, 0);
+        assert_eq!(
+            pipeline.stages[0].kv_caches["candidate"][0]
+                .paged_block_indices
+                .len(),
+            1
+        );
+        assert!(pipeline.stages[1].kv_caches["candidate"]
+            .iter()
+            .all(|cache| cache.paged_block_indices.is_empty()));
+        pipeline.close_token_sequence("candidate").unwrap();
+        assert!(pipeline
+            .stages
+            .iter()
+            .all(|stage| !stage.kv_caches.contains_key("candidate")));
+        assert_eq!(
+            pipeline.stages[0]
+                .paged_block_alloc
+                .as_ref()
+                .unwrap()
+                .lock()
+                .unwrap()
+                .free_count(),
+            1
+        );
+        assert_eq!(
+            pipeline.stages[1]
+                .paged_block_alloc
+                .as_ref()
+                .unwrap()
+                .lock()
+                .unwrap()
+                .free_count(),
+            0
+        );
+        assert!(pipeline.stages[1].kv_caches["occupied"]
+            .iter()
+            .all(|cache| cache.len == 0 && cache.paged_block_indices == occupied));
+        pipeline.stages[1].close_token_sequence("occupied").unwrap();
+        assert!(matches!(
+            pipeline.prepare_token_kv("retry", 16, 1).unwrap(),
+            ModelKvReservation::Reserved(_)
+        ));
+        pipeline.close_token_sequence("retry").unwrap();
+        assert!(pipeline.stages.iter().all(|stage| {
+            stage.kv_caches.is_empty()
+                && stage
+                    .paged_block_alloc
+                    .as_ref()
+                    .unwrap()
+                    .lock()
+                    .unwrap()
+                    .free_count()
+                    == 1
+        }));
     }
 
     #[test]

@@ -830,6 +830,16 @@ impl Backend for MetalBackend {
     fn observe_completion(ctx: &mut Self::Context) -> crate::backend::BackendCompletion {
         ctx.observe_completion()
     }
+
+    fn preparation_is_host_only(ctx: &Self::Context) -> bool {
+        // Metal allocation and write_typed use shared host memory. Any real
+        // encode, unresolved command or previous completion invalidates this
+        // pristine-only proof; ordinary empty checked_sync remains an error.
+        ctx.cmd.is_none()
+            && ctx.encoder.is_none()
+            && ctx.submitted.is_none()
+            && ctx.last_completion.is_none()
+    }
     fn sync_before_host_readback(ctx: &mut Self::Context) {
         Self::sync(ctx);
     }

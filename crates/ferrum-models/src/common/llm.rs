@@ -156,6 +156,24 @@ pub trait DecoderOnlyLLM: Send + Sync {
         let _ = (cache_id, capacity_hint);
     }
 
+    /// Prepare the incarnation's storage and reserve its initial prompt under
+    /// the model's actual ownership boundary. Device models override this to
+    /// use one retained context for both operations. An error does not prove
+    /// quiescence: the caller must close through this same model owner.
+    fn prepare_token_kv(
+        &mut self,
+        cache_id: &str,
+        capacity_hint: usize,
+        prompt_tokens: usize,
+    ) -> Result<ModelKvReservation> {
+        self.prepare_kv_capacity(cache_id, capacity_hint);
+        self.reserve_token_kv_slots(&[KvSlotRequest {
+            cache_id: cache_id.to_owned(),
+            target_len: prompt_tokens,
+            admission_target_len: Some(prompt_tokens),
+        }])
+    }
+
     /// Per-cache KV capacity in tokens — the maximum sequence length any
     /// single `cache_id` can grow to before `prefill` / `decode` would
     /// overflow the pre-allocated K/V buffers.

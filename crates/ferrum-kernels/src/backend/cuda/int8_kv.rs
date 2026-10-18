@@ -239,10 +239,9 @@ impl crate::backend::KvCacheQuant<CudaBackend, crate::backend::KvInt8> {
         let scale_count = pool_tokens * num_kv_heads;
         let block_table =
             <CudaBackend as Backend>::alloc_typed(crate::backend::Dtype::U32, max_blocks_per_seq);
-        let mut context_lens = <CudaBackend as Backend>::alloc_typed(crate::backend::Dtype::U32, 1);
-        let mut bt_ctx = <CudaBackend as Backend>::new_context();
-        <CudaBackend as Backend>::write_typed::<u32>(&mut bt_ctx, &mut context_lens, &[0u32]);
-        <CudaBackend as Backend>::sync(&mut bt_ctx);
+        // The caller initializes tables on its preparation context and observes
+        // that context before publishing the cache as ready.
+        let context_lens = <CudaBackend as Backend>::alloc_typed(crate::backend::Dtype::U32, 1);
 
         // Re-cast typed u32 buffer to the trait's Buffer (FP16) — same
         // pattern the FP16 paged path uses for block_table/context_lens
