@@ -536,12 +536,15 @@ impl TensorOps for CandleTensorOps {
 // ============================================================================
 
 fn get_candle_tensor(tensor: &TensorRef) -> Result<&candle_core::Tensor> {
-    // MVP: use type_id check since as_any not in TensorLike trait yet
-    let concrete_ref: &CandleTensor = unsafe {
-        // This is safe if we always create tensors through this backend
-        &*(Arc::as_ptr(tensor) as *const CandleTensor)
-    };
-    Ok(&concrete_ref.inner)
+    tensor
+        .as_any()
+        .downcast_ref::<CandleTensor>()
+        .map(CandleTensor::inner)
+        .ok_or_else(|| {
+            ferrum_types::FerrumError::backend(
+                "Candle tensor factory and operations require an engine CandleTensor; foreign TensorLike implementations are not supported",
+            )
+        })
 }
 
 fn ferrum_dtype_to_candle(dtype: DataType) -> Result<candle_core::DType> {
@@ -707,6 +710,99 @@ mod tests {
 
         let result = ops.matmul(&a, &b).unwrap();
         assert_eq!(result.shape(), &[2, 2]);
+        assert_eq!(
+            result.reshape(&[4]).unwrap().to_vec_f32().unwrap(),
+            vec![1.0, 2.0, 3.0, 4.0]
+        );
+    }
+
+    #[test]
+    fn checked_candle_access_preserves_factory_and_ops_values() {
+        let factory = CandleTensorFactory::new(Device::CPU);
+        let ops = CandleTensorOps;
+        let tensor = factory
+            .from_slice(
+                &[-2.0, 3.0, 4.0, -5.0],
+                &[2, 2],
+                DataType::FP32,
+                Device::CPU,
+            )
+            .unwrap();
+
+        let row = factory.narrow(&tensor, 0, 1, 1).unwrap();
+        assert_eq!(row.shape(), &[1, 2]);
+        assert_eq!(row.to_vec_f32().unwrap(), vec![4.0, -5.0]);
+        let zeros = factory.zeros_like(&tensor).unwrap();
+        assert_eq!(zeros.shape(), tensor.shape());
+        assert_eq!(zeros.dtype(), tensor.dtype());
+        assert_eq!(zeros.device(), tensor.device());
+        assert_eq!(
+            zeros.reshape(&[4]).unwrap().to_vec_f32().unwrap(),
+            vec![0.0; 4]
+        );
+
+        let relu = ops.relu(&tensor).unwrap();
+        assert_eq!(
+            relu.reshape(&[4]).unwrap().to_vec_f32().unwrap(),
+            vec![0.0, 3.0, 4.0, 0.0]
+        );
+        let doubled = ops.add(&tensor, &tensor).unwrap();
+        assert_eq!(
+            doubled.reshape(&[4]).unwrap().to_vec_f32().unwrap(),
+            vec![-4.0, 6.0, 8.0, -10.0]
+        );
+        assert_eq!(
+            tensor.reshape(&[4]).unwrap().to_vec_f32().unwrap(),
+            vec![-2.0, 3.0, 4.0, -5.0]
+        );
+    }
+
+    fn assert_foreign_tensor_rejected(result: Result<TensorRef>) {
+        match result {
+            Err(ferrum_types::FerrumError::Backend { message }) => {
+                assert!(message.contains("require an engine CandleTensor"));
+                assert!(message.contains("foreign TensorLike"));
+            }
+            other => panic!("expected a foreign tensor type error, got {other:?}"),
+        }
+    }
+
+    fn assert_factory_and_ops_reject_foreign_tensor(foreign: TensorRef) {
+        let factory = CandleTensorFactory::new(Device::CPU);
+        let ops = CandleTensorOps;
+        let valid = factory
+            .from_slice(&[1.0, 2.0], &[2], DataType::FP32, Device::CPU)
+            .unwrap();
+
+        // These objects deliberately share shape, dtype and device. Only the
+        // concrete type permits access to the engine wrapper's inner tensor.
+        assert_eq!(foreign.shape(), valid.shape());
+        assert_eq!(foreign.dtype(), valid.dtype());
+        assert_eq!(foreign.device(), valid.device());
+        assert_foreign_tensor_rejected(factory.narrow(&foreign, 0, 0, 1));
+        assert_foreign_tensor_rejected(factory.zeros_like(&foreign));
+        assert_foreign_tensor_rejected(ops.relu(&foreign));
+        assert_foreign_tensor_rejected(ops.add(&foreign, &valid));
+        assert_foreign_tensor_rejected(ops.add(&valid, &foreign));
+        assert_foreign_tensor_rejected(ops.concat(&[&valid, &foreign], 0));
+        assert_foreign_tensor_rejected(ops.layer_norm(&valid, &valid, Some(&foreign), 1e-5));
+        assert_eq!(foreign.to_vec_f32().unwrap(), vec![3.0, -4.0]);
+        assert_eq!(valid.to_vec_f32().unwrap(), vec![1.0, 2.0]);
+    }
+
+    #[test]
+    fn checked_candle_access_rejects_foreign_tensor_layout() {
+        let foreign = ferrum_testkit::MockTensor::from_f32(vec![3.0, -4.0], &[2]).into_ref();
+        assert_factory_and_ops_reject_foreign_tensor(foreign);
+    }
+
+    #[test]
+    fn checked_candle_access_rejects_models_candle_wrapper() {
+        let inner =
+            candle_core::Tensor::from_vec(vec![3.0_f32, -4.0], 2, &candle_core::Device::Cpu)
+                .unwrap();
+        let foreign: TensorRef = Arc::new(ferrum_models::CandleTensorWrapper::new(inner));
+        assert_factory_and_ops_reject_foreign_tensor(foreign);
     }
 
     #[test]
