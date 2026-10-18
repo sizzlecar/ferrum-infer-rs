@@ -631,6 +631,16 @@ impl EngineInner {
             .await
     }
 
+    #[cfg(test)]
+    pub(in crate::continuous_engine) async fn complete_request_for_test(
+        &self,
+        request_id: &RequestId,
+        finish_reason: FinishReason,
+    ) -> Result<()> {
+        self.complete_request_inner(request_id, finish_reason, None)
+            .await
+    }
+
     async fn complete_request_inner(
         &self,
         request_id: &RequestId,
@@ -664,18 +674,22 @@ impl EngineInner {
             self.send_stream_text(request_id, None, Some(finish_reason))
                 .await;
         }
+        // A terminal failure is not permission to abandon the other owners.
+        // Keep the first control-plane error, while independently closing the
+        // resources and client channels whose disposition is still known.
+        let mut completion_error = None;
         let (
-            response,
+            mut response,
             stream_sender,
             response_sender,
             completion_resources,
-            terminal_error,
+            mut terminal_error,
             terminal_token_trace,
         ) = {
             let mut sequences = self.sequences.write();
             if let Some(mut seq) = sequences.remove(request_id) {
-                let terminal_error = explicit_terminal_error.take();
-                let finish_reason = if terminal_error.is_some() {
+                let mut terminal_error = explicit_terminal_error.take();
+                let mut finish_reason = if terminal_error.is_some() {
                     FinishReason::Error
                 } else {
                     finish_reason
@@ -694,7 +708,16 @@ impl EngineInner {
                     )
                 });
                 let prompt_token_count = seq.input_tokens.len();
-                let execution_evidence = seq.take_execution_evidence()?;
+                let execution_evidence = match seq.take_execution_evidence() {
+                    Ok(evidence) => evidence,
+                    Err(error) => {
+                        warn!(request_id = %request_id, error = %error, "Request completion evidence failed");
+                        terminal_error.get_or_insert_with(|| error.clone());
+                        completion_error = Some(error);
+                        finish_reason = FinishReason::Error;
+                        None
+                    }
+                };
 
                 // TPOT histogram (PLAYBOOK § 7 definition):
                 //   tpot = (e2e − ttft) / (output_tokens − 1)
@@ -718,7 +741,11 @@ impl EngineInner {
                     latency_ms: seq.start_time.elapsed().as_millis() as u64,
                     created_at: chrono::Utc::now(),
                     metadata: HashMap::new(),
-                    api_response,
+                    api_response: if terminal_error.is_none() {
+                        api_response
+                    } else {
+                        None
+                    },
                     execution_evidence,
                 };
 
@@ -735,37 +762,51 @@ impl EngineInner {
                 return Ok(());
             }
         };
-        self.write_sequence_terminal_token_trace(
-            request_id,
-            "completed",
-            Some(response.finish_reason),
-            terminal_token_trace.as_ref(),
-        );
-
         if self.model_executor.execution_resource_authority()
             == ExecutionResourceAuthority::PlanRuntime
         {
             self.model_executor.cancel_prefill_admission(request_id);
         }
 
-        let finish_reason = response.finish_reason;
-        if finish_reason == FinishReason::Error {
+        if response.finish_reason == FinishReason::Error {
             self.release_sequence_physical_resources(request_id, completion_resources.physical)
                 .await;
         } else {
-            self.complete_sequence_physical_resources(
-                request_id,
-                completion_resources.physical,
-                &response.usage,
-            )
-            .await?;
+            if let Err(error) = self
+                .complete_sequence_physical_resources(
+                    request_id,
+                    completion_resources.physical,
+                    &response.usage,
+                )
+                .await
+            {
+                // complete_cache owns the disposition of its native state.
+                // In particular, an error must not trigger a second generic
+                // release that could free state still retained in quarantine.
+                warn!(request_id = %request_id, error = %error, "Model completion failed");
+                terminal_error.get_or_insert_with(|| error.clone());
+                completion_error.get_or_insert(error);
+                response.finish_reason = FinishReason::Error;
+                response.api_response = None;
+            }
         }
 
-        let scheduler_complete = self.scheduler.complete(request_id.clone(), &response).await;
+        if let Err(error) = self.scheduler.complete(request_id.clone(), &response).await {
+            warn!(request_id = %request_id, error = %error, "Scheduler completion failed");
+            terminal_error.get_or_insert_with(|| error.clone());
+            completion_error.get_or_insert(error);
+            response.finish_reason = FinishReason::Error;
+            response.api_response = None;
+        }
         if let Some(request_slot) = completion_resources.request_slot {
             request_slot.close(self);
         }
-        scheduler_complete?;
+        self.write_sequence_terminal_token_trace(
+            request_id,
+            "completed",
+            Some(response.finish_reason),
+            terminal_token_trace.as_ref(),
+        );
 
         if let Some(tx) = response_sender {
             let response_result = terminal_error
@@ -782,7 +823,7 @@ impl EngineInner {
                     request_id: request_id.clone(),
                     text: String::new(),
                     token: None,
-                    finish_reason: Some(finish_reason),
+                    finish_reason: Some(response.finish_reason),
                     usage: Some(response.usage.clone()),
                     created_at: chrono::Utc::now(),
                     metadata: HashMap::new(),
@@ -797,10 +838,10 @@ impl EngineInner {
             "Request {} completed: {} tokens, {:?}",
             request_id,
             response.tokens.len(),
-            finish_reason
+            response.finish_reason
         );
 
-        Ok(())
+        completion_error.map_or(Ok(()), Err)
     }
 }
 

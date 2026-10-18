@@ -2394,15 +2394,29 @@ impl EngineInner {
                 usage.prompt_tokens,
                 usage.completion_tokens,
             );
-            let result = match completion {
-                Ok(completion) => self.model_executor.complete_cache(completion).await,
+            match completion {
+                Ok(completion) => match self.model_executor.complete_cache(completion).await {
+                    Ok(()) => {
+                        self.trace_model_cache_ref_release(request_id);
+                        Ok(())
+                    }
+                    Err(error) => {
+                        self.trace_resource_release_failure(
+                            request_id,
+                            "model_cache_ref",
+                            "engine_model_cache_completion_failed",
+                            None,
+                            error.to_string(),
+                        );
+                        Err(error)
+                    }
+                },
                 Err(error) => {
                     self.model_executor.release_cache(&cache_id);
+                    self.trace_model_cache_ref_release(request_id);
                     Err(error)
                 }
-            };
-            self.trace_model_cache_ref_release(request_id);
-            result
+            }
         } else {
             Ok(())
         };
