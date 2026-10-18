@@ -21,6 +21,9 @@ pub enum ModelTokenWork<'a> {
 #[derive(Debug)]
 pub enum ModelTokenOutcome<T = Vec<f32>> {
     NotSubmitted(FerrumError),
+    /// Actual allocator fit rejection before token execution. The original
+    /// model KV frontier remains usable; this observation is not a reservation.
+    CapacityDeferred(ferrum_execution::token_execution::TokenAdmissionCapacityDeferral),
     /// The implementation observed synchronous completion (or an actual
     /// terminal failure). Logit validation is a later product operation.
     Terminal(Result<T>),

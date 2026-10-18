@@ -5,6 +5,7 @@
 //! and dependency-free to avoid circular dependencies.
 
 pub mod auto_config;
+pub mod capacity;
 pub mod config;
 pub mod devices;
 pub mod errors;
@@ -27,6 +28,7 @@ pub mod startup_memory;
 
 // Re-export commonly used types
 pub use auto_config::*;
+pub use capacity::AllocatorCapacityDomain;
 pub use config::*;
 pub use devices::*;
 pub use errors::*;

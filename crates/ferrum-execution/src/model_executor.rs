@@ -2185,6 +2185,10 @@ impl ExecutorRequestStateDeferral {
 #[serde(tag = "reason", content = "evidence", rename_all = "snake_case")]
 pub enum ExecutorExecutionDeferral {
     Capacity(ExecutorExecutionCapacityDeferral),
+    /// A real model-owned KV block shortfall without native coordinator
+    /// generations. This observation is neither a reservation nor a release
+    /// capability; the original allocator must approve any later retry.
+    AllocatorCapacity(crate::token_execution::TokenAdmissionCapacityDeferral),
     RequestState(ExecutorRequestStateDeferral),
 }
 
@@ -2192,20 +2196,32 @@ impl ExecutorExecutionDeferral {
     pub const fn stage(&self) -> ExecutorExecutionCapacityStage {
         match self {
             Self::Capacity(deferral) => deferral.stage(),
+            Self::AllocatorCapacity(_) => ExecutorExecutionCapacityStage::SequenceExtension,
             Self::RequestState(deferral) => deferral.stage(),
         }
     }
 
+    /// Native coordinator evidence only. Allocator observations have no
+    /// synthetic native source, wait condition or epoch.
     pub const fn as_capacity(&self) -> Option<&ExecutorExecutionCapacityDeferral> {
         match self {
             Self::Capacity(deferral) => Some(deferral),
-            Self::RequestState(_) => None,
+            Self::AllocatorCapacity(_) | Self::RequestState(_) => None,
+        }
+    }
+
+    pub const fn as_allocator_capacity(
+        &self,
+    ) -> Option<&crate::token_execution::TokenAdmissionCapacityDeferral> {
+        match self {
+            Self::AllocatorCapacity(deferral) => Some(deferral),
+            Self::Capacity(_) | Self::RequestState(_) => None,
         }
     }
 
     pub const fn as_request_state(&self) -> Option<&ExecutorRequestStateDeferral> {
         match self {
-            Self::Capacity(_) => None,
+            Self::Capacity(_) | Self::AllocatorCapacity(_) => None,
             Self::RequestState(deferral) => Some(deferral),
         }
     }
@@ -2220,6 +2236,12 @@ impl From<ExecutorExecutionCapacityDeferral> for ExecutorExecutionDeferral {
 impl From<ExecutorRequestStateDeferral> for ExecutorExecutionDeferral {
     fn from(deferral: ExecutorRequestStateDeferral) -> Self {
         Self::RequestState(deferral)
+    }
+}
+
+impl From<crate::token_execution::TokenAdmissionCapacityDeferral> for ExecutorExecutionDeferral {
+    fn from(deferral: crate::token_execution::TokenAdmissionCapacityDeferral) -> Self {
+        Self::AllocatorCapacity(deferral)
     }
 }
 
@@ -3048,6 +3070,21 @@ pub trait ModelExecutor: Send + Sync {
     ) -> Result<bool> {
         sources.clear();
         Ok(false)
+    }
+
+    /// Observe the real allocator behind a typed capacity shortfall. The
+    /// blocked frontier must still identify the original live owner. External
+    /// candidates are distinct exact incarnations, including retained closes;
+    /// missing already-retired candidates contribute no resources. `None`
+    /// means this implementation cannot observe the specified physical domain.
+    /// Only the original close protocol can establish actual release.
+    fn observe_token_allocator_reclaim(
+        &self,
+        _blocked: &crate::token_execution::ExecutionFrontier,
+        _domain: &ferrum_types::AllocatorCapacityDomain,
+        _candidates: &[crate::token_execution::ExecutorSequence],
+    ) -> Result<Option<crate::token_execution::TokenAllocatorReclaim>> {
+        Ok(None)
     }
 
     /// Retire one exact request-scoped runtime authority for recompute.

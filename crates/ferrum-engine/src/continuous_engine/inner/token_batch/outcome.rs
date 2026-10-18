@@ -28,8 +28,10 @@ impl EngineInner {
         works: &[ExecutionWork<'_>],
         outcome: ExecutionBatchOutcome,
         completed_at: Option<Instant>,
+        deferred: &mut Vec<TokenDeferredGroup>,
     ) -> Result<()> {
         let vocabulary_size = self.model_executor.info().vocab_size;
+        let validated_interruption = matches!(&outcome, ExecutionBatchOutcome::Interrupted(_));
         let malformed = match outcome {
             ExecutionBatchOutcome::Completed(batch) => {
                 let error = if batch.completions().len() != inputs.len() {
@@ -63,9 +65,16 @@ impl EngineInner {
             }
             ExecutionBatchOutcome::Interrupted(batch) => {
                 let parts = batch.into_parts();
-                let error = parts.2.first().cloned().unwrap_or_else(|| {
-                    FerrumError::internal("interrupted token batch omitted its failure cause")
-                });
+                let error = parts
+                    .2
+                    .iter()
+                    .find_map(ExecutionInterruptionCause::as_error)
+                    .cloned()
+                    .unwrap_or_else(|| {
+                        FerrumError::internal(
+                            "interrupted token batch has an invalid participant contract",
+                        )
+                    });
                 ExecutionContractViolation::new(error, parts)
             }
             ExecutionBatchOutcome::ContractViolation(violation) => violation,
@@ -87,7 +96,8 @@ impl EngineInner {
         // A foreign or otherwise unassignable result may leave every requested
         // peer healthy. Still report the original failure independently; it is
         // not permission to fail or replay those peers.
-        warn!(
+        if !validated_interruption || causes.iter().any(|cause| cause.as_error().is_some()) {
+            warn!(
             error = %error,
             completed = completed.len(),
             remaining = remaining.len(),
@@ -95,7 +105,8 @@ impl EngineInner {
             rejected_participants = rejected_participants.len(),
             unassigned_products = unassigned_products.len(),
             "token batch required failure reconciliation"
-        );
+            );
+        }
         // The error path needs a cohort map. The ordered completed fast path
         // above does not allocate this table or clone any sampling product.
         let mut claims = vec![0usize; inputs.len()];
@@ -129,6 +140,7 @@ impl EngineInner {
         }
         let mut accepted = Vec::with_capacity(completed.len());
         let mut succeeded = vec![false; inputs.len()];
+        let mut deferred_indices = vec![false; inputs.len()];
         let mut failures = vec![None; inputs.len()];
         for completion in completed {
             if let Some(index) = cohort_index(inputs, completion.next_frontier().sequence()) {
@@ -151,13 +163,40 @@ impl EngineInner {
             .map(|_| None)
             .collect::<Vec<Option<ExecutionCloseOutcome>>>();
         for participant in remaining {
-            let (index, sequence, _, continuation, cause_index) = participant.into_parts();
+            let (index, sequence, progress, continuation, cause_index) = participant.into_parts();
             let actual_index = cohort_index(inputs, &sequence);
             let continuation_index = cohort_index(inputs, continuation_sequence(&continuation));
             let matching =
                 actual_index == Some(index) && continuation_sequence(&continuation) == &sequence;
+            if validated_interruption
+                && matching
+                && claims[index] == 1
+                && matches!(progress, ExecutionProgress::NotSubmitted { .. })
+                && matches!(&continuation, ContinuationDisposition::Retryable(frontier)
+                    if frontier == &inputs[index].frontier && frontier.sequence().observed_end().is_none())
+            {
+                if let Some(ExecutionInterruptionCause::Deferred(deferral)) =
+                    causes.get(cause_index)
+                {
+                    deferred_indices[index] = true;
+                    if let Some(group) = deferred
+                        .iter_mut()
+                        .find(|group| group.cause_index == cause_index)
+                    {
+                        group.input_indices.push(index);
+                    } else {
+                        deferred.push(TokenDeferredGroup {
+                            cause_index,
+                            input_indices: vec![index],
+                            deferral: deferral.clone(),
+                        });
+                    }
+                    continue;
+                }
+            }
             let cause = causes
                 .get(cause_index)
+                .and_then(ExecutionInterruptionCause::as_error)
                 .cloned()
                 .unwrap_or_else(|| error.clone());
             if let Some(actual_index) = actual_index {
@@ -178,6 +217,7 @@ impl EngineInner {
         for (index, _, continuation, cause_index) in rejected_participants {
             let cause = causes
                 .get(cause_index)
+                .and_then(ExecutionInterruptionCause::as_error)
                 .cloned()
                 .unwrap_or_else(|| error.clone());
             if let Some(actual_index) = cohort_index(inputs, continuation_sequence(&continuation)) {
@@ -192,7 +232,7 @@ impl EngineInner {
         // so cancelling the caller cannot drop the rest of this batch's Helds.
         let mut effects = self.commit_token_completions(inputs, accepted, completed_at);
         for (index, input) in inputs.iter().enumerate() {
-            if !succeeded[index] {
+            if !succeeded[index] && !deferred_indices[index] {
                 effects.failed.push((
                     input.request_id.clone(),
                     failures[index].take().unwrap_or_else(|| error.clone()),

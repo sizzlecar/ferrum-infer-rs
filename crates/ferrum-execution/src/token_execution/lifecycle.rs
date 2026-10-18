@@ -6,6 +6,7 @@
 use std::{fmt, future::Future, pin::Pin};
 
 use ferrum_interfaces::adapter::LoraAdapterSelection;
+pub use ferrum_types::AllocatorCapacityDomain;
 use ferrum_types::Result;
 
 use super::{
@@ -48,16 +49,35 @@ pub enum TokenAdmissionOutcome {
     PermanentRejected(ferrum_runtime::AdmissionRejected),
 }
 
-#[derive(Debug, Clone)]
+/// An actual allocator's fit rejection, used both at admission and when an
+/// existing sequence needs more KV blocks. Serialization records diagnostics;
+/// construction still requires the checked shortfall below. The domain binds
+/// the observation to its allocator, without granting native permissions.
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct TokenAdmissionCapacityDeferral {
+    domain: AllocatorCapacityDomain,
     required_blocks: usize,
     snapshot: crate::model_executor::KvSlotCapacitySnapshot,
 }
 
+/// Read-only, pressure-path observation of one physical allocator. Candidate
+/// indices refer to the caller's exact external incarnations; they never name
+/// the blocked owner. A contributor may release only a shared reference by
+/// itself. `reclaimable_blocks` counts blocks freed by the complete candidate
+/// set, once, after all its real owners reach Ended. This grants neither a
+/// reservation nor permission to release an incarnation.
+#[derive(Debug, Clone)]
+pub struct TokenAllocatorReclaim {
+    pub snapshot: crate::model_executor::KvSlotCapacitySnapshot,
+    pub reclaimable_blocks: usize,
+    pub contributing_candidates: Vec<usize>,
+}
+
 impl TokenAdmissionCapacityDeferral {
-    /// Called by the actual model owner after its allocator rejected admission.
+    /// Called by the actual model owner after its allocator rejected growth.
     /// Impossible total-capacity requests must fail, rather than wait forever.
     pub fn new(
+        domain: AllocatorCapacityDomain,
         required_blocks: usize,
         snapshot: crate::model_executor::KvSlotCapacitySnapshot,
     ) -> Result<Self> {
@@ -71,9 +91,14 @@ impl TokenAdmissionCapacityDeferral {
             ));
         }
         Ok(Self {
+            domain,
             required_blocks,
             snapshot,
         })
+    }
+
+    pub fn domain(&self) -> &AllocatorCapacityDomain {
+        &self.domain
     }
 
     pub fn required_blocks(&self) -> usize {
@@ -352,17 +377,20 @@ mod tests {
 
     #[test]
     fn physical_capacity_wait_requires_a_shortfall_that_release_can_resolve() {
+        let domain = AllocatorCapacityDomain::new();
         let snapshot = crate::model_executor::KvSlotCapacitySnapshot {
             block_size: 16,
             total_blocks: 8,
             free_blocks: 2,
         };
-        let wait = TokenAdmissionCapacityDeferral::new(3, snapshot.clone()).unwrap();
+        let wait =
+            TokenAdmissionCapacityDeferral::new(domain.clone(), 3, snapshot.clone()).unwrap();
+        assert_eq!(wait.domain(), &domain);
         assert_eq!(wait.required_blocks(), 3);
         assert_eq!(wait.snapshot(), &snapshot);
         // Neither an already-fitting request nor one larger than the entire
         // physical pool can be made runnable by waiting for another release.
-        assert!(TokenAdmissionCapacityDeferral::new(2, snapshot.clone()).is_err());
-        assert!(TokenAdmissionCapacityDeferral::new(9, snapshot).is_err());
+        assert!(TokenAdmissionCapacityDeferral::new(domain.clone(), 2, snapshot.clone()).is_err());
+        assert!(TokenAdmissionCapacityDeferral::new(domain, 9, snapshot).is_err());
     }
 }

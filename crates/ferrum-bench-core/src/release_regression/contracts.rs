@@ -182,11 +182,11 @@ pub fn contract_groups() -> Vec<ContractGroup> {
         // CPU tiny forward and real paged-manager rollback. The tiny engine's
         // allocation handles are mocks; this does not certify GPU cache arithmetic.
         ("kv-isolation", KvIsolation, all.clone(), vec![tiny("tiny_stack_concurrent_sessions_isolated")]),
-        ("kv-release", KvRelease, all.clone(), vec![kv("failed_allocate_rolls_back_partial_blocks"), kv("failed_extend_rolls_back_partial_blocks_and_handle_table"), engine("process_batch_unified_capacity_defer_releases_existing_kv")]),
+        ("kv-release", KvRelease, all.clone(), vec![kv("failed_allocate_rolls_back_partial_blocks"), kv("failed_extend_rolls_back_partial_blocks_and_handle_table"), lib("ferrum-engine", "continuous_engine::execution_close::tests::execution_close_real_cpu_held_terminal_preserves_error_and_releases_once"), lib("ferrum-engine", "continuous_engine::execution_close::tests::execution_close_recompute_waits_for_ended_before_requeue_and_release")]),
         // Supported preemption discards physical KV and replays the preserved
         // token history. Pair its scheduler transition with real CPU KV/logit
         // equivalence; this does not certify GPU swapping or persistence.
-        ("kv-resume", KvResume, all.clone(), vec![engine("plan_runtime_batch_decode_capacity_deferral_recomputes_a_blocked_progress_victim"), engine("cpu_kv_recompute_matches_uninterrupted_logits_and_preserves_peer")]),
+        ("kv-resume", KvResume, all.clone(), vec![engine("token_capacity_tests::token_capacity_execution_pressure_preserves_root_width_across_recursive_split_and_yield"), engine("cpu_kv_recompute_matches_uninterrupted_logits_and_preserves_peer")]),
         // Real files and production adapters, with typed/stub execution input.
         // These cover sink lifecycle, identity/HTTP correlation and error
         // propagation; they are not real-model or accelerator profile evidence.

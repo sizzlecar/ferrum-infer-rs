@@ -91,6 +91,9 @@ pub trait DecoderOnlyLLM: Send + Sync {
             } else {
                 match self.execute_token_work(input.cache_id, input.work) {
                     ModelTokenOutcome::NotSubmitted(error) => ModelTokenOutcome::NotSubmitted(error),
+                    ModelTokenOutcome::CapacityDeferred(deferred) => {
+                        ModelTokenOutcome::CapacityDeferred(deferred)
+                    }
                     ModelTokenOutcome::Held(error) => {
                         held = true;
                         ModelTokenOutcome::Held(error)
@@ -272,6 +275,19 @@ pub trait DecoderOnlyLLM: Send + Sync {
     /// Snapshot model-owned paged-KV capacity without allocating slots.
     fn kv_slot_capacity_snapshot(&self) -> Option<KvSlotCapacitySnapshot> {
         None
+    }
+
+    /// Observe joint reclaimability in one actual allocator without releasing
+    /// any cache. The executor resolves exact incarnations to these cache ids
+    /// under its existing ownership guard. `None` means this implementation
+    /// does not identify the requested domain, not proof of zero reclaimability.
+    fn observe_token_allocator_reclaim(
+        &self,
+        _blocked_cache_id: &str,
+        _domain: &ferrum_execution::token_execution::AllocatorCapacityDomain,
+        _candidates: &[&str],
+    ) -> Result<Option<ferrum_execution::token_execution::TokenAllocatorReclaim>> {
+        Ok(None)
     }
 
     /// Recurrent-state allocation spec for state-space or hybrid models.

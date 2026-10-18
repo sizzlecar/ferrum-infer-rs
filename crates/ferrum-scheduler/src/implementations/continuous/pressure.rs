@@ -5,10 +5,15 @@
 //! the affected exact sources are made here, independent of the executor's
 //! current prefill/decode work kind.
 
+#[cfg(test)]
+mod allocator_tests;
+mod condition;
 mod policy;
 
-use ferrum_runtime::{
-    CapacityAvailabilitySource, CapacityWaitCondition, LogicalAdmissionCoordinatorId,
+pub use condition::PressureWaitCondition;
+use condition::{
+    is_request_release_source, observed_advanced, observed_map, same_source_topology,
+    waits_overlap, PressureWaitDomain, PressureWaitSource,
 };
 use ferrum_types::{Priority, RequestId};
 use policy::{FairPressureSelectionPolicy, PressureSelectionPolicy};
@@ -219,6 +224,7 @@ pub enum PressureTransitionKind {
     YieldPlanned,
     YieldAborted,
     ReleaseFenceArmed,
+    ReleaseObservationFailed,
     ReleaseFenceCompleted,
     FrontierResumable,
     OwnerAdmissionPending,
@@ -278,11 +284,11 @@ pub(crate) struct PressureCandidate {
     pub(crate) progress: LogicalWorkGeneration,
     pub(crate) recompute_cost: usize,
     pub(crate) advances_wait_source: bool,
-    pub(crate) blocked_on: Option<CapacityWaitCondition>,
+    pub(crate) blocked_on: Option<PressureWaitCondition>,
 }
 
 impl PressureCandidate {
-    fn overlaps(&self, condition: &CapacityWaitCondition) -> bool {
+    fn overlaps(&self, condition: &PressureWaitCondition) -> bool {
         self.blocked_on
             .as_ref()
             .is_some_and(|blocked| waits_overlap(blocked, condition))
@@ -315,22 +321,23 @@ struct PressureParticipant {
 
 #[derive(Debug)]
 struct PressureEpisode {
-    coordinator_id: LogicalAdmissionCoordinatorId,
+    wait_domain: PressureWaitDomain,
     state: PressureEpisodeState,
-    observed: BTreeMap<CapacityAvailabilitySource, u64>,
+    observed: BTreeMap<PressureWaitSource, u64>,
     participants: HashMap<RequestId, PressureParticipant>,
     progress_owner: Option<RequestId>,
     last_transaction_victim: Option<RequestId>,
     owner_progress_baseline: LogicalWorkGeneration,
     owner_admission_pending_ordinal: Option<PressureTransitionOrdinal>,
     handoff_generation: u64,
-    last_release_condition: Option<CapacityWaitCondition>,
+    last_release_condition: Option<PressureWaitCondition>,
+    release_observation_failed: bool,
 }
 
 impl PressureEpisode {
-    fn new(condition: &CapacityWaitCondition) -> PressureEpisode {
+    fn new(condition: &PressureWaitCondition) -> PressureEpisode {
         Self {
-            coordinator_id: condition.coordinator_id(),
+            wait_domain: condition.wait_domain(),
             state: PressureEpisodeState::Open,
             observed: observed_map(condition),
             participants: HashMap::new(),
@@ -340,6 +347,7 @@ impl PressureEpisode {
             owner_admission_pending_ordinal: None,
             handoff_generation: 0,
             last_release_condition: None,
+            release_observation_failed: false,
         }
     }
 
@@ -379,7 +387,7 @@ pub struct PressureYieldTransaction {
     rotated_from_progress_baseline: Option<LogicalWorkGeneration>,
     rotated_from_progress_current: Option<LogicalWorkGeneration>,
     planned_ordinal: PressureTransitionOrdinal,
-    wait_condition: CapacityWaitCondition,
+    wait_condition: PressureWaitCondition,
 }
 
 /// Strategy selected at an authoritative execution-capacity boundary.
@@ -477,7 +485,7 @@ impl PressureYieldTransaction {
         self.planned_ordinal
     }
 
-    pub fn wait_condition(&self) -> &CapacityWaitCondition {
+    pub fn wait_condition(&self) -> &PressureWaitCondition {
         &self.wait_condition
     }
 }
@@ -495,6 +503,7 @@ pub(crate) enum PressureDecision {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PressureInvariantViolationClass {
+    ReleaseObservationFailed,
     NoReleasableFrontier,
     OwnerRecomputeBlocked,
     YieldDidNotAdvanceSource,
@@ -555,8 +564,8 @@ pub(crate) enum PressureHoldStatus {
         progress_current: LogicalWorkGeneration,
         reason: PressureHoldReleaseReason,
         ordinal: PressureTransitionOrdinal,
-        previous_wait_condition: Option<CapacityWaitCondition>,
-        current_wait_condition: Option<CapacityWaitCondition>,
+        previous_wait_condition: Option<PressureWaitCondition>,
+        current_wait_condition: Option<PressureWaitCondition>,
     },
 }
 
@@ -568,8 +577,8 @@ struct ReleasedHold {
     progress_current: LogicalWorkGeneration,
     reason: PressureHoldReleaseReason,
     ordinal: PressureTransitionOrdinal,
-    previous_wait_condition: Option<CapacityWaitCondition>,
-    current_wait_condition: Option<CapacityWaitCondition>,
+    previous_wait_condition: Option<PressureWaitCondition>,
+    current_wait_condition: Option<PressureWaitCondition>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
@@ -661,14 +670,11 @@ pub(crate) struct PressureCoordinator {
     next_episode_id: u64,
     next_transition_ordinal: u64,
     episodes: HashMap<PressureEpisodeId, PressureEpisode>,
-    source_index: HashMap<
-        (LogicalAdmissionCoordinatorId, CapacityAvailabilitySource),
-        BTreeSet<PressureEpisodeId>,
-    >,
+    source_index: HashMap<(PressureWaitDomain, PressureWaitSource), BTreeSet<PressureEpisodeId>>,
     request_index: HashMap<RequestId, PressureEpisodeId>,
     deferred_bridge_observations: HashMap<
         (PressureEpisodeId, PressureEpisodeId),
-        (PressureEpisodeId, BTreeMap<CapacityAvailabilitySource, u64>),
+        (PressureEpisodeId, BTreeMap<PressureWaitSource, u64>),
     >,
     released_holds: HashMap<RequestId, ReleasedHold>,
     journal: VecDeque<PressureTransition>,
@@ -729,8 +735,29 @@ impl PressureCoordinator {
     pub(crate) fn plan_failure(
         &mut self,
         request_ids: &[RequestId],
-        condition: &CapacityWaitCondition,
+        condition: &PressureWaitCondition,
         candidates: &[PressureCandidate],
+    ) -> Result<PressureDecision, PressureCoordinatorError> {
+        self.plan_failure_observed(request_ids, condition, candidates, false)
+    }
+
+    /// A contributing external close is retained by its actual execution
+    /// owner. It is a progress witness, not a made-up scheduler participant.
+    pub(crate) fn plan_failure_with_pending_release(
+        &mut self,
+        request_ids: &[RequestId],
+        condition: &PressureWaitCondition,
+        candidates: &[PressureCandidate],
+    ) -> Result<PressureDecision, PressureCoordinatorError> {
+        self.plan_failure_observed(request_ids, condition, candidates, true)
+    }
+
+    fn plan_failure_observed(
+        &mut self,
+        request_ids: &[RequestId],
+        condition: &PressureWaitCondition,
+        candidates: &[PressureCandidate],
+        pending_external_release: bool,
     ) -> Result<PressureDecision, PressureCoordinatorError> {
         let original_requested = request_ids.iter().cloned().collect::<HashSet<_>>();
         let deferred_count = original_requested.len();
@@ -738,6 +765,38 @@ impl PressureCoordinator {
             .stats
             .candidate_scans
             .saturating_add(u64::try_from(candidates.len()).unwrap_or(u64::MAX));
+
+        // Retaining an unproved physical fence is not a promise of another
+        // release notification. Fail this exact pressure domain instead of
+        // parking new work behind an observer that has already failed.
+        let mut existing = self.indexed_episode_ids(condition);
+        existing.extend(request_ids.iter().filter_map(|id| {
+            let episode_id = *self.request_index.get(id)?;
+            let episode = self.episodes.get(&episode_id)?;
+            (episode.wait_domain == condition.wait_domain()
+                && episode
+                    .participants
+                    .get(id)
+                    .is_some_and(|participant| participant.state != ParticipantState::Terminal))
+            .then_some(episode_id)
+        }));
+        if let Some(episode_id) = existing.into_iter().find(|id| {
+            self.episodes
+                .get(id)
+                .is_some_and(|episode| episode.release_observation_failed)
+        }) {
+            return Ok(PressureDecision::InvariantViolation(
+                PressureInvariantViolation {
+                    episode_id,
+                    class: PressureInvariantViolationClass::ReleaseObservationFailed,
+                    blocked_frontiers: self.episodes[&episode_id]
+                        .participants
+                        .values()
+                        .filter(|participant| participant.state != ParticipantState::Terminal)
+                        .count(),
+                },
+            ));
+        }
 
         let resolution = self.find_or_open_episode_for(condition, request_ids, candidates)?;
         let mut cycle_break_candidates = Vec::new();
@@ -824,6 +883,29 @@ impl PressureCoordinator {
                 episode_id,
                 count: deferred_count,
             });
+        }
+
+        if condition.as_allocator().is_some() {
+            let episode = &self.episodes[&episode_id];
+            if let Some(owner) = episode
+                .progress_owner
+                .as_ref()
+                .filter(|owner| request_ids.first() != Some(*owner))
+            {
+                // A committed owner may coexist with a remaining participant's
+                // fresh probe. That participant can wait for this exact live
+                // contributor, but cannot replace the owner of existing holds.
+                let progressed_owner = episode.participants.get(owner).is_some_and(|participant| {
+                    participant.progress > episode.owner_progress_baseline
+                });
+                let runnable_owner = candidates.iter().any(|candidate| {
+                    &candidate.request_id == owner
+                        && self.candidate_is_runnable_progress_witness(candidate)
+                });
+                if !progressed_owner || !runnable_owner {
+                    return Err(PressureCoordinatorError::OverlappingPendingEpisodes);
+                }
+            }
         }
 
         if previous_state == PressureEpisodeState::Resumable {
@@ -931,7 +1013,7 @@ impl PressureCoordinator {
             !requested.contains(&candidate.request_id)
                 && self.candidate_is_runnable_progress_witness(candidate)
         });
-        if runnable_peer {
+        if runnable_peer || pending_external_release {
             return Ok(PressureDecision::Deferred {
                 episode_id,
                 count: deferred_count,
@@ -939,7 +1021,18 @@ impl PressureCoordinator {
         }
 
         let owner_id = self.episodes.get(&episode_id).and_then(|episode| {
-            if cycle_break {
+            if condition.as_allocator().is_some() {
+                // Allocator release contributors are observed relative to the
+                // exact blocked owner, which is excluded from their closure.
+                // Reusing another episode owner's query would invert cause
+                // and victim when two peers fail successively in one pool.
+                request_ids
+                    .first()
+                    .filter(|request_id| {
+                        request_ids.len() == 1 && episode.participants.contains_key(*request_id)
+                    })
+                    .cloned()
+            } else if cycle_break {
                 self.selection_policy
                     .select_cycle_break_progress_owner(episode, &requested)
             } else {
@@ -1129,12 +1222,17 @@ impl PressureCoordinator {
     pub(crate) fn complete_release_fence(
         &mut self,
         transaction: &PressureYieldTransaction,
-        progress_owner_wait_condition: Option<&CapacityWaitCondition>,
+        progress_owner_wait_condition: Option<&PressureWaitCondition>,
     ) -> Result<
         (PressureTransitionOrdinal, PressureReleaseFenceDisposition),
         PressureCoordinatorError,
     > {
         self.validate_transaction(transaction, PressureEpisodeState::AwaitReleaseFence)?;
+        if progress_owner_wait_condition.is_some_and(|current| {
+            current.wait_domain() != transaction.wait_condition().wait_domain()
+        }) {
+            return Err(PressureCoordinatorError::OverlappingPendingEpisodes);
+        }
         let release_ordinal = self.record_transition(
             transaction.episode_id,
             PressureTransitionKind::ReleaseFenceCompleted,
@@ -1171,6 +1269,7 @@ impl PressureCoordinator {
                 .episodes
                 .get_mut(&transaction.episode_id)
                 .expect("validated pressure episode remains registered");
+            episode.release_observation_failed = false;
             if transaction.kind == PressureYieldKind::PeerHandoff || !retained_peer_hold {
                 if let Some(victim) = episode.participants.get_mut(&transaction.victim_request_id) {
                     if victim.state != ParticipantState::Terminal {
@@ -1248,16 +1347,7 @@ impl PressureCoordinator {
                     episode.observed.insert(*source, *epoch);
                 }
             }
-            for source in current_wait_condition
-                .observed()
-                .iter()
-                .filter(|source| is_request_release_source(source.source()))
-            {
-                self.source_index
-                    .entry((current_wait_condition.coordinator_id(), source.source()))
-                    .or_default()
-                    .insert(transaction.episode_id);
-            }
+            self.index_condition_sources(&current_wait_condition, transaction.episode_id);
             self.record_transition(
                 transaction.episode_id,
                 PressureTransitionKind::FrontierRetargeted,
@@ -1277,6 +1367,46 @@ impl PressureCoordinator {
             release_ordinal,
             PressureReleaseFenceDisposition::Resumable(resume_ordinal),
         ))
+    }
+
+    pub(crate) fn mark_release_observation_failed(
+        &mut self,
+        transaction: &PressureYieldTransaction,
+    ) -> Result<bool, PressureCoordinatorError> {
+        self.validate_transaction(transaction, PressureEpisodeState::AwaitReleaseFence)?;
+        let episode = self
+            .episodes
+            .get_mut(&transaction.episode_id)
+            .expect("validated pressure episode remains registered");
+        if episode.release_observation_failed {
+            return Ok(false);
+        }
+        episode.release_observation_failed = true;
+        self.record_transition(
+            transaction.episode_id,
+            PressureTransitionKind::ReleaseObservationFailed,
+            Some(transaction.victim_request_id.clone()),
+            Some(transaction.progress_owner_id.clone()),
+            PressureEpisodeState::AwaitReleaseFence,
+        )?;
+        Ok(true)
+    }
+
+    pub(crate) fn release_transaction_requests(
+        &self,
+        transaction: &PressureYieldTransaction,
+    ) -> Result<Vec<RequestId>, PressureCoordinatorError> {
+        self.validate_transaction(transaction, PressureEpisodeState::AwaitReleaseFence)?;
+        Ok(self.episodes[&transaction.episode_id]
+            .participants
+            .values()
+            .filter(|participant| {
+                participant.state != ParticipantState::Terminal
+                    && self.request_index.get(&participant.request_id)
+                        == Some(&transaction.episode_id)
+            })
+            .map(|participant| participant.request_id.clone())
+            .collect())
     }
 
     pub(crate) fn abort_yield(
@@ -1406,6 +1536,10 @@ impl PressureCoordinator {
                 participant.state = ParticipantState::Terminal;
                 participant.held_since_ordinal = None;
             }
+            // The original transaction retains its terminal participant.
+            // A replacement product with the same RequestId must not inherit
+            // that old episode through the live-request index.
+            self.request_index.remove(request_id);
             return Ok(Some(ordinal));
         }
         if is_owner {
@@ -1533,7 +1667,7 @@ impl PressureCoordinator {
         .map(Some)
     }
 
-    pub(crate) fn has_pending_release_for(&self, condition: &CapacityWaitCondition) -> bool {
+    pub(crate) fn has_pending_release_for(&self, condition: &PressureWaitCondition) -> bool {
         self.indexed_episode_ids(condition)
             .into_iter()
             .filter_map(|episode_id| self.episodes.get(&episode_id))
@@ -1545,9 +1679,41 @@ impl PressureCoordinator {
             })
     }
 
+    /// A release wake belongs first to the episode's accepted progress owner.
+    /// Preserve other active participants' original observations until that
+    /// owner commits progress (or terminates), without inventing a new epoch.
+    pub(crate) fn allocator_retry_owner(
+        &self,
+        request_id: &RequestId,
+        domain: &ferrum_types::AllocatorCapacityDomain,
+    ) -> Option<&RequestId> {
+        let episode = self.episodes.get(self.request_index.get(request_id)?)?;
+        if !matches!(&episode.wait_domain, PressureWaitDomain::Allocator(owner) if owner == domain)
+        {
+            return None;
+        }
+        let owner = episode.progress_owner.as_ref()?;
+        if owner == request_id {
+            return None;
+        }
+        let participant = episode.participants.get(request_id)?;
+        if participant.state == ParticipantState::Terminal {
+            return None;
+        }
+        let pending = matches!(
+            episode.state,
+            PressureEpisodeState::YieldPlanned | PressureEpisodeState::AwaitReleaseFence
+        );
+        let progressed = episode
+            .participants
+            .get(owner)
+            .is_some_and(|participant| participant.progress > episode.owner_progress_baseline);
+        (pending || episode.release_observation_failed || !progressed).then_some(owner)
+    }
+
     pub(crate) fn all_blocked_without_release_for(
         &self,
-        condition: &CapacityWaitCondition,
+        condition: &PressureWaitCondition,
     ) -> bool {
         let episode_ids = self.indexed_episode_ids(condition);
         if episode_ids.is_empty() {
@@ -1586,7 +1752,7 @@ impl PressureCoordinator {
 
     fn find_or_open_episode_for(
         &mut self,
-        condition: &CapacityWaitCondition,
+        condition: &PressureWaitCondition,
         request_ids: &[RequestId],
         candidates: &[PressureCandidate],
     ) -> Result<PressureEpisodeResolution, PressureCoordinatorError> {
@@ -1602,7 +1768,7 @@ impl PressureCoordinator {
             let same_coordinator = existing.iter().all(|episode_id| {
                 self.episodes
                     .get(episode_id)
-                    .is_some_and(|episode| episode.coordinator_id == condition.coordinator_id())
+                    .is_some_and(|episode| episode.wait_domain == condition.wait_domain())
             });
             if !same_coordinator {
                 return Err(PressureCoordinatorError::OverlappingPendingEpisodes);
@@ -1664,7 +1830,7 @@ impl PressureCoordinator {
                 .episodes
                 .get(&id)
                 .ok_or(PressureCoordinatorError::UnknownEpisode(id))?;
-            if episode.coordinator_id != condition.coordinator_id() {
+            if episode.wait_domain != condition.wait_domain() {
                 return Err(PressureCoordinatorError::OverlappingPendingEpisodes);
             }
             self.index_condition_sources(condition, id);
@@ -1692,30 +1858,25 @@ impl PressureCoordinator {
 
     fn index_condition_sources(
         &mut self,
-        condition: &CapacityWaitCondition,
+        condition: &PressureWaitCondition,
         episode_id: PressureEpisodeId,
     ) {
-        for source in condition
-            .observed()
-            .iter()
-            .filter(|source| is_request_release_source(source.source()))
+        for source in observed_map(condition)
+            .into_keys()
+            .filter(|source| is_request_release_source(*source))
         {
             self.source_index
-                .entry((condition.coordinator_id(), source.source()))
+                .entry((condition.wait_domain(), source))
                 .or_default()
                 .insert(episode_id);
         }
     }
 
-    fn indexed_episode_ids(&self, condition: &CapacityWaitCondition) -> Vec<PressureEpisodeId> {
-        let mut episode_ids = condition
-            .observed()
-            .iter()
-            .filter(|observed| is_request_release_source(observed.source()))
-            .filter_map(|observed| {
-                self.source_index
-                    .get(&(condition.coordinator_id(), observed.source()))
-            })
+    fn indexed_episode_ids(&self, condition: &PressureWaitCondition) -> Vec<PressureEpisodeId> {
+        let mut episode_ids = observed_map(condition)
+            .into_keys()
+            .filter(|source| is_request_release_source(*source))
+            .filter_map(|source| self.source_index.get(&(condition.wait_domain(), source)))
             .flat_map(|episode_ids| episode_ids.iter().copied())
             .filter(|episode_id| self.episodes.contains_key(episode_id))
             .collect::<Vec<_>>();
@@ -1760,7 +1921,7 @@ impl PressureCoordinator {
                 dominant.is_mergeable_open() || dominant.state == PressureEpisodeState::Resumable
             );
             debug_assert!(absorbed.is_mergeable_open());
-            debug_assert_eq!(dominant.coordinator_id, absorbed.coordinator_id);
+            debug_assert_eq!(dominant.wait_domain, absorbed.wait_domain);
             let dominant_state = dominant.state;
 
             for (source, epoch) in absorbed.observed {
@@ -1878,7 +2039,7 @@ impl PressureCoordinator {
 
     fn bridge_cycle_break_episode(
         &self,
-        condition: &CapacityWaitCondition,
+        condition: &PressureWaitCondition,
         episode_ids: &[PressureEpisodeId],
         request_ids: &[RequestId],
         candidates: &[PressureCandidate],
@@ -1944,7 +2105,7 @@ impl PressureCoordinator {
 
     fn record_deferred_bridge(
         &mut self,
-        condition: &CapacityWaitCondition,
+        condition: &PressureWaitCondition,
         request_ids: &[RequestId],
         episode_ids: &[PressureEpisodeId],
         progress_witness: PressureEpisodeId,
@@ -2118,67 +2279,23 @@ impl PressureCoordinator {
     }
 }
 
-/// Sources whose availability can be advanced by yielding one live request.
-///
-/// Device-budget generations remain part of the exact retry predicate, but a
-/// request yield only returns logical pool extents; it does not shrink the
-/// plan-owned backing pool or release process-wide device claims. Treating a
-/// shared device-budget source as episode causality can therefore pair a
-/// victim with an owner whose blocked domain the victim cannot advance.
-fn is_request_release_source(source: CapacityAvailabilitySource) -> bool {
-    matches!(
-        source,
-        CapacityAvailabilitySource::Domain(_) | CapacityAvailabilitySource::ActiveSequenceSlots
-    )
-}
-
-fn waits_overlap(left: &CapacityWaitCondition, right: &CapacityWaitCondition) -> bool {
-    left.coordinator_id() == right.coordinator_id()
-        && left.observed().iter().any(|left_source| {
-            is_request_release_source(left_source.source())
-                && right.observed().iter().any(|right_source| {
-                    is_request_release_source(right_source.source())
-                        && left_source.source() == right_source.source()
-                })
-        })
-}
-
-fn observed_map(condition: &CapacityWaitCondition) -> BTreeMap<CapacityAvailabilitySource, u64> {
-    condition
-        .observed()
-        .iter()
-        .map(|entry| (entry.source(), entry.epoch()))
-        .collect()
-}
-
-fn same_source_topology(left: &CapacityWaitCondition, right: &CapacityWaitCondition) -> bool {
-    left.coordinator_id() == right.coordinator_id()
-        && left.observed().len() == right.observed().len()
-        && left
-            .observed()
-            .iter()
-            .zip(right.observed())
-            .all(|(left, right)| left.source() == right.source())
-}
-
-fn observed_advanced(
-    prior: &BTreeMap<CapacityAvailabilitySource, u64>,
-    current: &BTreeMap<CapacityAvailabilitySource, u64>,
-) -> bool {
-    prior.iter().any(|(source, epoch)| {
-        current
-            .get(source)
-            .is_some_and(|current_epoch| current_epoch > epoch)
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ferrum_runtime::{CapacityAvailabilityEpoch, CapacityDomainId};
+    use ferrum_runtime::{
+        CapacityAvailabilityEpoch, CapacityAvailabilitySource, CapacityDomainId,
+        CapacityWaitCondition,
+    };
 
-    fn condition(epoch: u64) -> CapacityWaitCondition {
-        CapacityWaitCondition::from_observation(
+    fn native_condition(
+        coordinator_id: u64,
+        observed: Vec<CapacityAvailabilityEpoch>,
+    ) -> Result<PressureWaitCondition, ferrum_runtime::VNextError> {
+        CapacityWaitCondition::from_observation(coordinator_id, observed).map(Into::into)
+    }
+
+    fn condition(epoch: u64) -> PressureWaitCondition {
+        native_condition(
             41,
             vec![CapacityAvailabilityEpoch::new(
                 CapacityAvailabilitySource::Domain(CapacityDomainId::new(4).unwrap()),
@@ -2194,7 +2311,7 @@ mod tests {
         work_kind: LogicalWorkKind,
         progress: u64,
         advances_wait_source: bool,
-        blocked_on: Option<CapacityWaitCondition>,
+        blocked_on: Option<PressureWaitCondition>,
     ) -> PressureCandidate {
         PressureCandidate {
             request_id: request_id.clone(),
@@ -2209,7 +2326,7 @@ mod tests {
 
     fn make_resumable_episode(
         coordinator: &mut PressureCoordinator,
-        wait: &CapacityWaitCondition,
+        wait: &PressureWaitCondition,
         owner: &RequestId,
         victim: &RequestId,
         progress: u64,
@@ -2286,7 +2403,7 @@ mod tests {
         let source_a = CapacityAvailabilitySource::Domain(CapacityDomainId::new(4).unwrap());
         let source_b = CapacityAvailabilitySource::ActiveSequenceSlots;
         let condition_for = |sources: &[(CapacityAvailabilitySource, u64)]| {
-            CapacityWaitCondition::from_observation(
+            native_condition(
                 41,
                 sources
                     .iter()
@@ -2324,7 +2441,7 @@ mod tests {
     #[test]
     fn shared_device_budget_does_not_join_disjoint_release_domains() {
         let wait_for = |domain: u32| {
-            CapacityWaitCondition::from_observation(
+            native_condition(
                 41,
                 vec![
                     CapacityAvailabilityEpoch::new(
@@ -2372,7 +2489,7 @@ mod tests {
         let source_a = CapacityAvailabilitySource::Domain(CapacityDomainId::new(4).unwrap());
         let source_b = CapacityAvailabilitySource::ActiveSequenceSlots;
         let condition_for = |sources: &[(CapacityAvailabilitySource, u64)]| {
-            CapacityWaitCondition::from_observation(
+            native_condition(
                 41,
                 sources
                     .iter()
@@ -2448,7 +2565,7 @@ mod tests {
         let request_a = RequestId::new();
         let request_b = RequestId::new();
         let source_a = condition(1);
-        let source_b = CapacityWaitCondition::from_observation(
+        let source_b = native_condition(
             41,
             vec![CapacityAvailabilityEpoch::new(
                 CapacityAvailabilitySource::ActiveSequenceSlots,
@@ -2457,7 +2574,7 @@ mod tests {
             .unwrap()],
         )
         .unwrap();
-        let source_x = CapacityWaitCondition::from_observation(
+        let source_x = native_condition(
             41,
             vec![CapacityAvailabilityEpoch::new(
                 CapacityAvailabilitySource::Domain(CapacityDomainId::new(8).unwrap()),
@@ -2524,7 +2641,7 @@ mod tests {
         let source_a = CapacityAvailabilitySource::Domain(CapacityDomainId::new(4).unwrap());
         let source_b = CapacityAvailabilitySource::ActiveSequenceSlots;
         let condition_for = |sources: &[(CapacityAvailabilitySource, u64)]| {
-            CapacityWaitCondition::from_observation(
+            native_condition(
                 41,
                 sources
                     .iter()
@@ -2662,7 +2779,7 @@ mod tests {
         let source_a = CapacityAvailabilitySource::Domain(CapacityDomainId::new(4).unwrap());
         let source_b = CapacityAvailabilitySource::ActiveSequenceSlots;
         let condition_for = |source, epoch| {
-            CapacityWaitCondition::from_observation(
+            native_condition(
                 41,
                 vec![CapacityAvailabilityEpoch::new(source, epoch).unwrap()],
             )
@@ -2767,7 +2884,7 @@ mod tests {
                 .1,
             PressureReleaseFenceDisposition::Resumable(_)
         ));
-        let source_b_key = (only_b.coordinator_id(), source_b);
+        let source_b_key = (only_b.wait_domain(), PressureWaitSource::Native(source_b));
         assert!(coordinator.source_index[&source_b_key]
             .iter()
             .copied()
@@ -2800,7 +2917,7 @@ mod tests {
         let source_a = CapacityAvailabilitySource::Domain(CapacityDomainId::new(4).unwrap());
         let source_b = CapacityAvailabilitySource::ActiveSequenceSlots;
         let condition_for = |source, epoch| {
-            CapacityWaitCondition::from_observation(
+            native_condition(
                 41,
                 vec![CapacityAvailabilityEpoch::new(source, epoch).unwrap()],
             )
@@ -2866,7 +2983,7 @@ mod tests {
                 .1,
             PressureReleaseFenceDisposition::Resumable(_)
         ));
-        let source_b_key = (only_b.coordinator_id(), source_b);
+        let source_b_key = (only_b.wait_domain(), PressureWaitSource::Native(source_b));
         assert_eq!(coordinator.source_index[&source_b_key].len(), 2);
 
         coordinator
@@ -2890,7 +3007,7 @@ mod tests {
         let source_a = CapacityAvailabilitySource::Domain(CapacityDomainId::new(4).unwrap());
         let source_b = CapacityAvailabilitySource::ActiveSequenceSlots;
         let condition_for = |sources: &[(CapacityAvailabilitySource, u64)]| {
-            CapacityWaitCondition::from_observation(
+            native_condition(
                 41,
                 sources
                     .iter()
@@ -3061,7 +3178,7 @@ mod tests {
         let source_a = CapacityAvailabilitySource::Domain(CapacityDomainId::new(4).unwrap());
         let source_b = CapacityAvailabilitySource::ActiveSequenceSlots;
         let condition_for = |sources: &[(CapacityAvailabilitySource, u64)]| {
-            CapacityWaitCondition::from_observation(
+            native_condition(
                 41,
                 sources
                     .iter()
@@ -3124,7 +3241,7 @@ mod tests {
         let source_b = CapacityAvailabilitySource::ActiveSequenceSlots;
         let source_x = CapacityAvailabilitySource::Domain(CapacityDomainId::new(8).unwrap());
         let condition_for = |sources: &[(CapacityAvailabilitySource, u64)]| {
-            CapacityWaitCondition::from_observation(
+            native_condition(
                 41,
                 sources
                     .iter()
@@ -3232,7 +3349,7 @@ mod tests {
         let source_a = CapacityAvailabilitySource::Domain(CapacityDomainId::new(4).unwrap());
         let source_b = CapacityAvailabilitySource::ActiveSequenceSlots;
         let condition_for = |sources: &[(CapacityAvailabilitySource, u64)]| {
-            CapacityWaitCondition::from_observation(
+            native_condition(
                 41,
                 sources
                     .iter()
@@ -3274,7 +3391,7 @@ mod tests {
         let source_a = CapacityAvailabilitySource::Domain(CapacityDomainId::new(4).unwrap());
         let source_b = CapacityAvailabilitySource::ActiveSequenceSlots;
         let condition_for = |sources: &[(CapacityAvailabilitySource, u64)]| {
-            CapacityWaitCondition::from_observation(
+            native_condition(
                 41,
                 sources
                     .iter()
@@ -3369,7 +3486,7 @@ mod tests {
     fn one_frontier_joins_disjoint_sources_to_its_existing_episode() {
         let request_id = RequestId::new();
         let source_a = condition(1);
-        let source_b = CapacityWaitCondition::from_observation(
+        let source_b = native_condition(
             41,
             vec![CapacityAvailabilityEpoch::new(
                 CapacityAvailabilitySource::ActiveSequenceSlots,
@@ -4002,7 +4119,7 @@ mod tests {
     #[test]
     fn release_fence_keeps_peer_held_when_owner_wait_source_retargets() {
         let wait_for = |domain: u32, domain_epoch: u64| {
-            CapacityWaitCondition::from_observation(
+            native_condition(
                 41,
                 vec![
                     CapacityAvailabilityEpoch::new(
@@ -4211,7 +4328,7 @@ mod tests {
         let owner = RequestId::new();
         let victim = RequestId::new();
         let wait_for = |domain: u32, domain_epoch: u64| {
-            CapacityWaitCondition::from_observation(
+            native_condition(
                 41,
                 vec![
                     CapacityAvailabilityEpoch::new(

@@ -648,7 +648,7 @@ impl EngineInner {
             .await
     }
 
-    pub(super) async fn complete_request_with_error(
+    pub(in crate::continuous_engine) async fn complete_request_with_error(
         &self,
         request_id: &RequestId,
         error: FerrumError,
@@ -728,8 +728,8 @@ impl EngineInner {
         let mut completion_error = None;
         let (
             mut response,
-            stream_sender,
-            response_sender,
+            mut stream_sender,
+            mut response_sender,
             completion_resources,
             mut terminal_error,
             terminal_token_trace,
@@ -863,6 +863,27 @@ impl EngineInner {
                 return Ok(());
             }
         };
+        // This error is already final for the client, independently of the
+        // physical close result. Transfer publication before the first await:
+        // cancellation must not drop the only senders after removing Sequence.
+        if let Some(error) = terminal_error.as_ref() {
+            if let Some(tx) = response_sender.take() {
+                let _ = tx.send(Err(error.clone()));
+            }
+            if let Some(tx) = stream_sender.take() {
+                match tx.try_send(Err(error.clone())) {
+                    Ok(()) | Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {}
+                    Err(tokio::sync::mpsc::error::TrySendError::Full(terminal)) => {
+                        // One bounded terminal delivery, only on the error
+                        // path. The close registry retains all physical owners;
+                        // this task owns only the client channel and its error.
+                        drop(tokio::spawn(async move {
+                            let _ = tx.send(terminal).await;
+                        }));
+                    }
+                }
+            }
+        }
         // Physical closure may remain held after logical completion. Awaiting
         // the initial result cannot cancel the registry's independent owner.
         if let Some(ticket) = token_close {
@@ -940,3 +961,6 @@ fn finish_reason_trace_name(reason: FinishReason) -> &'static str {
         FinishReason::ContentFilter => "content_filter",
     }
 }
+
+#[cfg(test)]
+mod cold_error_tests;

@@ -332,6 +332,74 @@ impl EngineInner {
             })
         };
         match observation {
+            ExecutorAdmissionQueueObservation::AllocatorCapacityWaitingForOwner {
+                request_id,
+                domain,
+                progress_owner_id,
+                observed_release_epoch,
+                current_release_epoch,
+            } => self.write_executor_scheduler_profile_event(
+                &request_id,
+                "execution.allocator_capacity_wait",
+                ProfileEventKind::Instant,
+                ProfileStatus::Ok,
+                None,
+                BTreeMap::from([
+                    (
+                        "decision".to_string(),
+                        serde_json::json!("waiting_for_owner"),
+                    ),
+                    ("probe_performed".to_string(), serde_json::json!(false)),
+                ]),
+                BTreeMap::from([(
+                    "deferral_evidence".to_string(),
+                    serde_json::json!({
+                        "allocator_domain": domain,
+                        "progress_owner_id": progress_owner_id,
+                        "observed_release_epoch": observed_release_epoch,
+                        "current_release_epoch": current_release_epoch,
+                    }),
+                )]),
+                None,
+            ),
+            ExecutorAdmissionQueueObservation::AllocatorCapacitySkippedUnchanged {
+                request_id,
+                domain,
+                observed_release_epoch,
+                current_release_epoch,
+            }
+            | ExecutorAdmissionQueueObservation::AllocatorCapacityResumed {
+                request_id,
+                domain,
+                observed_release_epoch,
+                current_release_epoch,
+            } => self.write_executor_scheduler_profile_event(
+                &request_id,
+                "execution.allocator_capacity_wait",
+                ProfileEventKind::Instant,
+                ProfileStatus::Ok,
+                None,
+                BTreeMap::from([
+                    (
+                        "decision".to_string(),
+                        serde_json::json!(if current_release_epoch > observed_release_epoch {
+                            "release_observed"
+                        } else {
+                            "skipped_unchanged"
+                        }),
+                    ),
+                    ("probe_performed".to_string(), serde_json::json!(false)),
+                ]),
+                BTreeMap::from([(
+                    "deferral_evidence".to_string(),
+                    serde_json::json!({
+                        "allocator_domain": domain,
+                        "observed_release_epoch": observed_release_epoch,
+                        "current_release_epoch": current_release_epoch,
+                    }),
+                )]),
+                None,
+            ),
             ExecutorAdmissionQueueObservation::PressureHoldReleased {
                 episode_id,
                 transition_ordinal,
@@ -1093,7 +1161,12 @@ impl EngineInner {
         let lock_wait_start = Instant::now();
         let iteration_guard = self.iteration_lock.lock().await;
         self.record_iteration_lock_wait(lock_wait_start.elapsed());
-        self.drain_execution_closes()?;
+        let close_error = self.drain_execution_closes().err();
+        let failure_completion = self.complete_failed_execution_recomputes().await;
+        if let Some(error) = close_error {
+            return Err(error);
+        }
+        failure_completion?;
         self.cancel_abandoned_requests().await?;
         self.complete_execution_readiness_failures().await?;
         self.prepare_prefix_rendezvous()?;
@@ -1259,7 +1332,9 @@ impl EngineInner {
                             })?;
                         return Ok(EngineIterationOutcome::CapacityBlocked(registration));
                     }
-                    if self.scheduler.all_active_execution_readiness_blocked() {
+                    if self.scheduler.all_active_execution_readiness_blocked()
+                        || self.scheduler.all_active_allocator_capacity_blocked()
+                    {
                         return Ok(EngineIterationOutcome::Idle);
                     }
                 }

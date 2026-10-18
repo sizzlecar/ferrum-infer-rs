@@ -402,7 +402,11 @@ pub(super) async fn execute(
             }),
             Vec::new(),
         ),
-        Err(error) => (Vec::new(), None, vec![error]),
+        Err(error) => (
+            Vec::new(),
+            None,
+            vec![ExecutionInterruptionCause::Error(error)],
+        ),
     };
     let mut completed = Vec::new();
     for row in rows {
@@ -454,9 +458,7 @@ pub(super) async fn execute(
             .unwrap_or_else(|rejected| rejected.into_outcome()));
     }
     if causes.is_empty() {
-        causes.push(FerrumError::backend(
-            "controlled model result was not publishable",
-        ));
+        causes.push(FerrumError::backend("controlled model result was not publishable").into());
     }
     let mut remaining = Vec::new();
     for (index, input) in work.iter().enumerate() {

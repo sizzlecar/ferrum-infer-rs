@@ -12,14 +12,21 @@ use ferrum_execution::token_execution::{
 use ferrum_kv::{PagedKvCacheConfig, PagedKvCacheManager};
 use ferrum_models::test_support::{tiny_llama_executor, TinyLlamaConfig, TinyTokenizer};
 
+#[path = "tests/allocator_tests.rs"]
+mod allocator_tests;
+
 struct ProtocolExecutor {
     metadata: Arc<dyn ModelExecutor>,
     issuer: ExecutorSequenceIssuer,
     closed: Mutex<Vec<ExecutorSequence>>,
+    allocator: Mutex<Option<allocator_tests::AllocatorState>>,
 }
 
 impl ProtocolExecutor {
     fn close(&self, sequence: &ExecutorSequence) -> Result<ExecutionCloseOutcome> {
+        if let Some(allocator) = self.allocator.lock().as_mut() {
+            allocator.release(sequence)?;
+        }
         self.closed.lock().push(sequence.clone());
         Ok(ExecutionCloseOutcome::ended(self.issuer.ended(sequence)?))
     }
@@ -52,6 +59,19 @@ impl ModelExecutor for ProtocolExecutor {
     fn cancel_tokens(&self, sequence: &ExecutorSequence) -> Result<ExecutionCloseOutcome> {
         self.close(sequence)
     }
+    fn observe_token_allocator_reclaim(
+        &self,
+        blocked: &ExecutionFrontier,
+        domain: &ferrum_types::AllocatorCapacityDomain,
+        candidates: &[ExecutorSequence],
+    ) -> Result<Option<ferrum_execution::token_execution::TokenAllocatorReclaim>> {
+        self.allocator
+            .lock()
+            .as_ref()
+            .map_or(Ok(None), |allocator| {
+                allocator.observe(blocked, domain, candidates)
+            })
+    }
 }
 
 async fn fixture() -> (
@@ -74,6 +94,7 @@ async fn fixture_with_request_count(
         metadata: tiny_llama_executor(&cfg),
         issuer: ExecutorSequenceIssuer::new(),
         closed: Mutex::new(Vec::new()),
+        allocator: Mutex::new(None),
     });
     let config = EngineConfig::default();
     let scheduler = Arc::new(ContinuousBatchScheduler::new(config.scheduler.clone()));
@@ -225,11 +246,11 @@ async fn token_outcome_wrong_index_held_conflicts_only_with_its_actual_incarnati
         let outcome = rejected.into_outcome((
             completions(&scope),
             Vec::new(),
-            vec![FerrumError::backend("conflicting actual incarnation")],
+            vec![FerrumError::backend("conflicting actual incarnation").into()],
         ));
         assert!(engine
             .inner
-            .consume_token_outcome(&selected, &works, outcome, None)
+            .consume_token_outcome(&selected, &works, outcome, None, &mut Vec::new())
             .await
             .is_err());
         engine.inner.execution_closes.join_observers().await;
@@ -283,11 +304,11 @@ async fn token_outcome_foreign_held_does_not_poison_the_declared_healthy_peer() 
     let outcome = rejected.into_outcome((
         completions(&scope),
         Vec::new(),
-        vec![FerrumError::backend("foreign producer observation")],
+        vec![FerrumError::backend("foreign producer observation").into()],
     ));
     engine
         .inner
-        .consume_token_outcome(&selected, &works, outcome, None)
+        .consume_token_outcome(&selected, &works, outcome, None, &mut Vec::new())
         .await
         .unwrap();
     for input in &inputs {
@@ -343,7 +364,7 @@ async fn token_outcome_foreign_completion_does_not_claim_a_healthy_index() {
     ));
     engine
         .inner
-        .consume_token_outcome(&selected, &works, outcome, None)
+        .consume_token_outcome(&selected, &works, outcome, None, &mut Vec::new())
         .await
         .unwrap();
     for input in &inputs {
@@ -382,13 +403,11 @@ async fn token_outcome_foreign_retryable_preserves_another_live_split_request() 
     let outcome = rejected.into_outcome((
         completions(&scope),
         Vec::new(),
-        vec![FerrumError::backend(
-            "retryable belongs to another live split",
-        )],
+        vec![FerrumError::backend("retryable belongs to another live split").into()],
     ));
     engine
         .inner
-        .consume_token_outcome(&selected, &works, outcome, None)
+        .consume_token_outcome(&selected, &works, outcome, None, &mut Vec::new())
         .await
         .unwrap();
 
@@ -431,10 +450,216 @@ async fn token_outcome_foreign_retryable_preserves_another_live_split_request() 
     let outcome = pending_scope.completed(vec![completion]).unwrap();
     engine
         .inner
-        .consume_token_outcome(&[pending], &pending_work, outcome, None)
+        .consume_token_outcome(&[pending], &pending_work, outcome, None, &mut Vec::new())
         .await
         .unwrap();
     assert_healthy(&engine, pending);
     assert!(executor.closed.lock().is_empty());
     assert_eq!(engine.inner.execution_closes.unreclaimed_count(), 0);
+}
+
+#[tokio::test]
+async fn token_outcome_keeps_deferred_subcohort_after_peer_close_and_commit() {
+    let (engine, executor, inputs) = fixture_with_request_count(4).await;
+    let selected = inputs.iter().collect::<Vec<_>>();
+    let works = inputs
+        .iter()
+        .map(TokenBatchInput::as_work)
+        .collect::<Result<Vec<_>>>()
+        .unwrap();
+    let scope = executor
+        .issuer
+        .batch(&works, executor.info().vocab_size)
+        .unwrap();
+    let successful = scope
+        .completion(
+            1,
+            ExecutedTokenWork::Prefill {
+                chunk: PrefillChunk::new(0, 1, 2).unwrap(),
+                capacity_probe_count: 1,
+            },
+            ExecutionProduct::Intermediate,
+        )
+        .unwrap();
+    let closed = scope
+        .participant(
+            0,
+            ExecutionProgress::NotSubmitted {
+                stage: NoSubmissionStage::Preparation,
+            },
+            ContinuationDisposition::Ended(
+                executor
+                    .issuer
+                    .ended(inputs[0].frontier.sequence())
+                    .unwrap(),
+            ),
+            0,
+        )
+        .unwrap();
+    let mut remaining = vec![closed];
+    for (index, input) in inputs.iter().enumerate().skip(2) {
+        remaining.push(
+            scope
+                .participant(
+                    index,
+                    ExecutionProgress::NotSubmitted {
+                        stage: NoSubmissionStage::Preparation,
+                    },
+                    ContinuationDisposition::Retryable(input.frontier.clone()),
+                    1,
+                )
+                .unwrap(),
+        );
+    }
+    let shortfall = TokenAdmissionCapacityDeferral::new(
+        ferrum_types::AllocatorCapacityDomain::new(),
+        2,
+        ferrum_execution::model_executor::KvSlotCapacitySnapshot {
+            block_size: 16,
+            total_blocks: 4,
+            free_blocks: 1,
+        },
+    )
+    .unwrap();
+    let outcome = scope
+        .interrupted(
+            vec![successful],
+            remaining,
+            vec![
+                FerrumError::backend("peer closed before dispatch").into(),
+                ExecutorExecutionDeferral::AllocatorCapacity(shortfall).into(),
+            ],
+        )
+        .unwrap();
+    let mut deferred = Vec::new();
+    // Publishing the real peer failure may fail the operation. The independent
+    // completed product and retryable subcohort must survive that error.
+    let _ = engine
+        .inner
+        .consume_token_outcome(&selected, &works, outcome, None, &mut deferred)
+        .await;
+    assert_healthy(&engine, &inputs[1]);
+    assert_eq!(deferred.len(), 1);
+    let group = deferred.pop().unwrap();
+    assert_eq!(group.input_indices, vec![2, 3]);
+    for input in &inputs[2..] {
+        let sequences = engine.inner.sequences.read();
+        let state = &sequences[&input.request_id];
+        assert_eq!(state.execution_frontier.as_ref(), Some(&input.frontier));
+        assert_eq!(state.prefill_tokens_processed, 0);
+        assert!(state.execution_close.is_none());
+        assert!(input.frontier.sequence().observed_end().is_none());
+    }
+    let deferred_inputs = group
+        .input_indices
+        .iter()
+        .map(|&i| selected[i])
+        .collect::<Vec<_>>();
+    let splits = engine
+        .inner
+        .handle_token_deferral(
+            &deferred_inputs,
+            NoSubmissionReason::Deferred(group.deferral),
+            &mut None,
+            engine.inner.scheduler.confirmed_capacity_release_epoch(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(splits, vec![vec![0], vec![1]]);
+    for split in splits {
+        let input = deferred_inputs[split[0]];
+        let retry_work = [input.as_work().unwrap()];
+        let retry_scope = executor
+            .issuer
+            .batch(&retry_work, executor.info().vocab_size)
+            .unwrap();
+        let completion = retry_scope
+            .completion(
+                0,
+                ExecutedTokenWork::Prefill {
+                    chunk: PrefillChunk::new(0, 1, 2).unwrap(),
+                    capacity_probe_count: 1,
+                },
+                ExecutionProduct::Intermediate,
+            )
+            .unwrap();
+        let result = retry_scope.completed(vec![completion]).unwrap();
+        engine
+            .inner
+            .consume_token_outcome(&[input], &retry_work, result, None, &mut Vec::new())
+            .await
+            .unwrap();
+        assert_healthy(&engine, input);
+    }
+    assert_healthy(&engine, &inputs[1]);
+    assert!(executor
+        .closed
+        .lock()
+        .iter()
+        .all(|closed| closed == inputs[0].frontier.sequence()));
+}
+
+#[tokio::test]
+async fn token_outcome_contract_violation_never_grants_capacity_retry() {
+    let (engine, executor, inputs) = fixture().await;
+    let selected = inputs.iter().collect::<Vec<_>>();
+    let works = inputs
+        .iter()
+        .map(TokenBatchInput::as_work)
+        .collect::<Result<Vec<_>>>()
+        .unwrap();
+    let scope = executor
+        .issuer
+        .batch(&works, executor.info().vocab_size)
+        .unwrap();
+    let remaining = inputs
+        .iter()
+        .enumerate()
+        .map(|(index, input)| {
+            scope
+                .participant(
+                    index,
+                    ExecutionProgress::NotSubmitted {
+                        stage: NoSubmissionStage::Preparation,
+                    },
+                    ContinuationDisposition::Retryable(input.frontier.clone()),
+                    0,
+                )
+                .unwrap()
+        })
+        .collect();
+    let shortfall = TokenAdmissionCapacityDeferral::new(
+        ferrum_types::AllocatorCapacityDomain::new(),
+        1,
+        ferrum_execution::model_executor::KvSlotCapacitySnapshot {
+            block_size: 16,
+            total_blocks: 2,
+            free_blocks: 0,
+        },
+    )
+    .unwrap();
+    let outcome = ExecutionBatchOutcome::ContractViolation(ExecutionContractViolation::new(
+        FerrumError::internal("producer rejected its own batch contract"),
+        (
+            Vec::new(),
+            remaining,
+            vec![ExecutorExecutionDeferral::AllocatorCapacity(shortfall).into()],
+        ),
+    ));
+    let mut deferred = Vec::new();
+    let _ = engine
+        .inner
+        .consume_token_outcome(&selected, &works, outcome, None, &mut deferred)
+        .await;
+    assert!(deferred.is_empty());
+    engine.inner.execution_closes.join_observers().await;
+    engine.inner.drain_execution_closes().unwrap();
+    for input in &inputs {
+        assert!(input.frontier.sequence().observed_end().is_some());
+        assert!(!engine
+            .inner
+            .sequences
+            .read()
+            .contains_key(&input.request_id));
+    }
 }

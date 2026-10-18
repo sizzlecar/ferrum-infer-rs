@@ -54,9 +54,14 @@ fn retain_rejected_products(
         ExecutionBatchOutcome::ContractViolation(violation) => violation,
         ExecutionBatchOutcome::Interrupted(interruption) => {
             let parts = interruption.into_parts();
-            let error = parts.2.first().cloned().unwrap_or_else(|| {
-                FerrumError::backend("native token results violated their participant contract")
-            });
+            let error = parts
+                .2
+                .iter()
+                .find_map(ExecutionInterruptionCause::as_error)
+                .cloned()
+                .unwrap_or_else(|| {
+                    FerrumError::backend("native token results violated their participant contract")
+                });
             ExecutionContractViolation::new(error, parts)
         }
         ExecutionBatchOutcome::Completed(completed) => ExecutionContractViolation::new(
@@ -391,7 +396,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         progress: &WaveProgress,
     ) -> ExecutionBatchOutcome {
         let mut remaining = Vec::with_capacity(inputs.len().saturating_sub(completed.len()));
-        let mut causes = vec![error];
+        let mut causes = vec![ExecutionInterruptionCause::Error(error)];
         let mut violation: Option<ExecutionContractViolation> = None;
         for (canonical, sequence) in sequences.iter().enumerate() {
             let index = indices[canonical];
@@ -413,7 +418,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                             (Vec::new(), Vec::new(), Vec::new()),
                         )
                     });
-                    causes.push(error);
+                    causes.push(error.into());
                     // The original registry/reaper still owns this sequence;
                     // a broken identity contract grants no release permission.
                     continue;
@@ -422,7 +427,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             self.sequences.lock().remove_ended_exact(sequence);
             let ended = matches!(&close.disposition, ExecutionCloseDisposition::Ended(_));
             if let Some(error) = close.error {
-                causes.push(error);
+                causes.push(error.into());
             }
             let range = match actual[canonical].range() {
                 Ok(range) => range,
@@ -452,7 +457,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                         continuation,
                         0,
                     ));
-                    causes.push(error);
+                    causes.push(error.into());
                     continue;
                 }
             };
@@ -520,7 +525,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                         )
                     });
                     broken.rejected_participants.push(parts);
-                    causes.push(error);
+                    causes.push(error.into());
                 }
             }
         }

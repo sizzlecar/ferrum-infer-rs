@@ -6837,6 +6837,13 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             ExecutorExecutionDeferral::Capacity(deferral) => {
                 Self::execution_capacity_error(deferral)
             }
+            ExecutorExecutionDeferral::AllocatorCapacity(deferral) => {
+                FerrumError::resource_exhausted(format!(
+                    "KV allocator requires {} blocks with {} available",
+                    deferral.required_blocks(),
+                    deferral.snapshot().free_blocks,
+                ))
+            }
             ExecutorExecutionDeferral::RequestState(deferral) => {
                 FerrumError::resource_exhausted(format!(
                     "vNext {:?} is waiting for Request-state hazards: {:?}",

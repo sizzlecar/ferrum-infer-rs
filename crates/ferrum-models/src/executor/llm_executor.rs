@@ -298,6 +298,15 @@ impl LlmExecutor {
 
 #[async_trait::async_trait]
 impl ModelExecutor for LlmExecutor {
+    fn observe_token_allocator_reclaim(
+        &self,
+        blocked: &ferrum_execution::token_execution::ExecutionFrontier,
+        domain: &ferrum_types::AllocatorCapacityDomain,
+        candidates: &[ferrum_execution::token_execution::ExecutorSequence],
+    ) -> Result<Option<ferrum_execution::token_execution::TokenAllocatorReclaim>> {
+        self.observe_allocator_reclaim(blocked, domain, candidates)
+    }
+
     async fn admit_tokens(
         &self,
         input: ferrum_execution::token_execution::ExecutionAdmission<'_>,

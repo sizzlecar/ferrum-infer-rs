@@ -122,6 +122,8 @@ pub struct BlockAllocation {
 /// Block pool for managing memory blocks
 #[derive(Debug)]
 pub struct BlockPool {
+    /// Stable observation identity of this physical pool, without release authority.
+    capacity_domain: ferrum_types::AllocatorCapacityDomain,
     /// Device type
     device: Device,
     /// Block size in tokens
@@ -145,6 +147,10 @@ pub struct BlockPool {
 }
 
 impl BlockPool {
+    pub fn capacity_domain(&self) -> &ferrum_types::AllocatorCapacityDomain {
+        &self.capacity_domain
+    }
+
     /// Create new block pool (blocks have no tensor storage).
     pub fn new(
         device: Device,
@@ -196,6 +202,7 @@ impl BlockPool {
         );
 
         Ok(Self {
+            capacity_domain: ferrum_types::AllocatorCapacityDomain::new(),
             device,
             block_size,
             data_type,

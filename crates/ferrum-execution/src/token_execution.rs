@@ -21,6 +21,9 @@ use crate::model_executor::{
 mod lifecycle;
 pub use lifecycle::*;
 
+#[cfg(test)]
+mod deferral_tests;
+
 #[derive(Debug)]
 struct IssuerIdentity {
     next_identity: AtomicU64,
@@ -598,12 +601,50 @@ impl InterruptedParticipant {
     }
 }
 
-/// Cold-path ownership of accumulated products and a complete failure ledger.
+/// Cold-path ownership of accumulated products and a complete interruption
+/// ledger. Unsubmitted deferred peers do not erase already committed work.
 #[derive(Debug)]
 pub struct BatchInterruption {
     completed: Vec<ExecutionCompletion>,
     remaining: Vec<InterruptedParticipant>,
-    causes: Vec<FerrumError>,
+    causes: Vec<ExecutionInterruptionCause>,
+}
+
+/// One reason for an interrupted participant. A capacity/readiness deferral
+/// remains typed instead of being inferred from a model error's text. The
+/// existing participant cause index is the sole association with this ledger.
+#[derive(Debug, Clone)]
+pub enum ExecutionInterruptionCause {
+    Error(FerrumError),
+    Deferred(ExecutorExecutionDeferral),
+}
+
+impl ExecutionInterruptionCause {
+    pub fn as_error(&self) -> Option<&FerrumError> {
+        match self {
+            Self::Error(error) => Some(error),
+            Self::Deferred(_) => None,
+        }
+    }
+
+    pub fn as_deferral(&self) -> Option<&ExecutorExecutionDeferral> {
+        match self {
+            Self::Deferred(deferral) => Some(deferral),
+            Self::Error(_) => None,
+        }
+    }
+}
+
+impl From<FerrumError> for ExecutionInterruptionCause {
+    fn from(error: FerrumError) -> Self {
+        Self::Error(error)
+    }
+}
+
+impl From<ExecutorExecutionDeferral> for ExecutionInterruptionCause {
+    fn from(deferral: ExecutorExecutionDeferral) -> Self {
+        Self::Deferred(deferral)
+    }
 }
 
 impl BatchInterruption {
@@ -615,7 +656,7 @@ impl BatchInterruption {
         &self.remaining
     }
 
-    pub fn causes(&self) -> &[FerrumError] {
+    pub fn causes(&self) -> &[ExecutionInterruptionCause] {
         &self.causes
     }
 
@@ -627,7 +668,7 @@ impl BatchInterruption {
 pub type InterruptionParts = (
     Vec<ExecutionCompletion>,
     Vec<InterruptedParticipant>,
-    Vec<FerrumError>,
+    Vec<ExecutionInterruptionCause>,
 );
 
 #[derive(Debug)]
@@ -650,7 +691,7 @@ pub struct ExecutionContractViolation {
     pub error: FerrumError,
     pub completed: Vec<ExecutionCompletion>,
     pub remaining: Vec<InterruptedParticipant>,
-    pub causes: Vec<FerrumError>,
+    pub causes: Vec<ExecutionInterruptionCause>,
     pub rejected_completions: Vec<CompletionParts>,
     pub rejected_participants: Vec<ParticipantParts>,
     /// Extra or unassignable rows from a malformed model result. They have no
@@ -916,11 +957,16 @@ impl ExecutionBatch<'_> {
         ExecutionBatchOutcome::NotSubmitted(BatchNotSubmitted { reason })
     }
 
+    /// Merge exact participant reports without discarding committed products.
+    /// A typed deferral is accepted only for unsubmitted work retaining its
+    /// original frontier and no known terminal fact. The implementation still
+    /// establishes actual liveness under its own sequence/allocator guard;
+    /// this contract does not manufacture resource or retry authority.
     pub fn interrupted(
         &self,
         completed: Vec<ExecutionCompletion>,
         remaining: Vec<InterruptedParticipant>,
-        causes: Vec<FerrumError>,
+        causes: Vec<ExecutionInterruptionCause>,
     ) -> std::result::Result<ExecutionBatchOutcome, RejectedBatch<InterruptionParts>> {
         let check = (|| {
             if remaining.is_empty()
@@ -934,13 +980,33 @@ impl ExecutionBatch<'_> {
                 self.validate_completion_scope(completion)?;
             }
             for participant in &remaining {
+                let input = self.input(participant.input_index)?;
                 if participant.batch_identity != self.identity
-                    || &participant.sequence != self.input(participant.input_index)?.sequence()
+                    || &participant.sequence != input.sequence()
                     || participant.cause_index >= causes.len()
                 {
                     return Err(invalid(
                         "invalid interrupted participant scope or cause index",
                     ));
+                }
+                if matches!(
+                    &causes[participant.cause_index],
+                    ExecutionInterruptionCause::Deferred(_)
+                ) {
+                    let ContinuationDisposition::Retryable(frontier) = &participant.continuation
+                    else {
+                        return Err(invalid(
+                            "execution deferral requires the original retryable frontier",
+                        ));
+                    };
+                    if !matches!(participant.progress, ExecutionProgress::NotSubmitted { .. })
+                        || frontier != input.expected_frontier
+                        || frontier.sequence().observed_end().is_some()
+                    {
+                        return Err(invalid(
+                            "execution deferral requires zero submission and an unchanged live frontier",
+                        ));
+                    }
                 }
             }
             let mut successes = completed.iter().peekable();
@@ -1262,7 +1328,7 @@ mod tests {
             )
             .unwrap();
         let ExecutionBatchOutcome::Interrupted(recovered) = incomplete
-            .interrupted(retained, vec![missing], vec![error])
+            .interrupted(retained, vec![missing], vec![error.into()])
             .unwrap()
         else {
             panic!("expected preserved interruption");
@@ -1318,7 +1384,7 @@ mod tests {
             .interrupted(
                 vec![completed],
                 vec![failed, untouched],
-                vec![FerrumError::backend("readback failed")],
+                vec![FerrumError::backend("readback failed").into()],
             )
             .unwrap()
         else {
@@ -1370,7 +1436,7 @@ mod tests {
             .interrupted(
                 vec![],
                 vec![participant],
-                vec![FerrumError::backend("pending")]
+                vec![FerrumError::backend("pending").into()]
             )
             .is_ok());
     }
@@ -1472,7 +1538,7 @@ mod tests {
             .interrupted(
                 vec![completed],
                 vec![duplicate],
-                vec![FerrumError::backend("failed")],
+                vec![FerrumError::backend("failed").into()],
             )
             .unwrap_err();
         let (_, (completed, remaining, causes)) = error.into_parts();
@@ -1494,7 +1560,7 @@ mod tests {
             .interrupted(
                 vec![],
                 vec![bad_cause],
-                vec![FerrumError::backend("only cause")]
+                vec![FerrumError::backend("only cause").into()]
             )
             .is_err());
     }
@@ -1557,7 +1623,7 @@ mod tests {
         let ExecutionBatchOutcome::ContractViolation(violation) = error.into_outcome((
             Vec::new(),
             Vec::new(),
-            vec![FerrumError::backend("original failure")],
+            vec![FerrumError::backend("original failure").into()],
         )) else {
             panic!("invalid metadata cannot discard actual recovery")
         };

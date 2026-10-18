@@ -13,7 +13,7 @@ impl TokenWorkerState {
         let mut remaining = Vec::with_capacity(inputs.len());
         let mut rejected_participants = Vec::new();
         let mut violation = None;
-        let mut causes = vec![error.clone()];
+        let mut causes = vec![ExecutionInterruptionCause::Error(error.clone())];
         for (index, input) in inputs.iter().enumerate() {
             let close = {
                 let mut sequences = self.sequences.lock();
@@ -50,7 +50,7 @@ impl TokenWorkerState {
                 },
                 Err(error) => {
                     violation.get_or_insert_with(|| error.clone());
-                    causes.push(error);
+                    causes.push(error.into());
                     continue;
                 }
             };
@@ -144,10 +144,29 @@ impl TokenWorkerState {
         let mut rows: Vec<Option<ModelTokenOutcome<ModelTokenProduct>>> =
             std::iter::repeat_with(|| None).take(inputs.len()).collect();
         let mut unassigned_products = Vec::new();
-        let mut unattributed_errors = Vec::new();
+        let mut unattributed_causes: Vec<ExecutionInterruptionCause> = Vec::new();
         let mut violation = None;
+        let mut cohort_capacity = false;
         let physical_rows = match physical {
             ModelTokenBatchOutcome::Serial(rows) => rows,
+            ModelTokenBatchOutcome::Cohort(ModelTokenOutcome::CapacityDeferred(deferred)) => {
+                let sequences = self.sequences.lock();
+                if selected.len() == inputs.len()
+                    && inputs.iter().all(|input| {
+                        self.retryable_capacity_frontier(&sequences, input, owned.claim)
+                    })
+                {
+                    return Ok(scope.not_submitted(NoSubmissionReason::Deferred(deferred.into())));
+                }
+                // A cancelled member can make this a partial outcome even
+                // though the selected physical cohort did not execute. Keep
+                // its single fit rejection associated with the whole subgroup.
+                cohort_capacity = true;
+                selected
+                    .iter()
+                    .map(|_| ModelTokenOutcome::CapacityDeferred(deferred.clone()))
+                    .collect()
+            }
             ModelTokenBatchOutcome::Cohort(ModelTokenOutcome::Terminal(Ok(products))) => products
                 .into_iter()
                 .map(|product| ModelTokenOutcome::Terminal(Ok(product)))
@@ -182,7 +201,9 @@ impl TokenWorkerState {
                     ),
                     ModelTokenOutcome::NotSubmitted(error)
                     | ModelTokenOutcome::Terminal(Err(error))
-                    | ModelTokenOutcome::Held(error) => unattributed_errors.push(error),
+                    | ModelTokenOutcome::Held(error) => unattributed_causes.push(error.into()),
+                    ModelTokenOutcome::CapacityDeferred(deferred) => unattributed_causes
+                        .push(ExecutionInterruptionCause::Deferred(deferred.into())),
                 }
             } else if let Some(&index) = selected.get(offset) {
                 rows[index] = Some(row);
@@ -191,7 +212,8 @@ impl TokenWorkerState {
 
         let mut completed = Vec::with_capacity(inputs.len());
         let mut remaining = Vec::new();
-        let mut causes = unattributed_errors;
+        let mut causes = unattributed_causes;
+        let mut cohort_capacity_cause = None;
         let mut rejected_completions = Vec::new();
         let mut rejected_participants = Vec::new();
         for (index, input) in inputs.iter().enumerate() {
@@ -218,6 +240,56 @@ impl TokenWorkerState {
                 }
             });
             let (mut progress, error, retain_operation_error) = match row {
+                ModelTokenOutcome::CapacityDeferred(deferred) => {
+                    let sequences = self.sequences.lock();
+                    if self.retryable_capacity_frontier(&sequences, input, owned.claim) {
+                        let cause_index = match cohort_capacity_cause.filter(|_| cohort_capacity) {
+                            Some(index) => index,
+                            None => {
+                                let index = causes.len();
+                                causes.push(ExecutionInterruptionCause::Deferred(deferred.into()));
+                                if cohort_capacity {
+                                    cohort_capacity_cause = Some(index);
+                                }
+                                index
+                            }
+                        };
+                        match scope.participant(
+                            index,
+                            ExecutionProgress::NotSubmitted {
+                                stage: NoSubmissionStage::BeforeSubmit,
+                            },
+                            ContinuationDisposition::Retryable(input.expected_frontier().clone()),
+                            cause_index,
+                        ) {
+                            Ok(participant) => remaining.push(participant),
+                            Err(rejected) => {
+                                let (error, participant) = rejected.into_parts();
+                                violation.get_or_insert(error);
+                                rejected_participants.push(participant);
+                            }
+                        }
+                        continue;
+                    }
+                    // Cancellation after the fit check does not authorize a
+                    // retry, nor turn that ordinary cancellation into a device
+                    // error. An unexpected live-frontier mismatch remains an
+                    // actual contract failure with its original owner.
+                    let cancelled = input.sequence().observed_end().is_some()
+                        || sequences
+                            .live
+                            .get(input.sequence())
+                            .is_some_and(|entry| entry.closing);
+                    (
+                        ExecutionProgress::NotSubmitted {
+                            stage: NoSubmissionStage::BeforeSubmit,
+                        },
+                        FerrumError::request_validation(
+                            "capacity-deferred participant no longer has a retryable frontier",
+                        ),
+                        !cancelled,
+                    )
+                }
                 ModelTokenOutcome::Terminal(Ok(product)) => {
                     let product =
                         product.map_or(ExecutionProduct::Intermediate, ExecutionProduct::Sampling);
@@ -290,7 +362,7 @@ impl TokenWorkerState {
                 ),
             };
             let cause_index = causes.len();
-            causes.push(error.clone());
+            causes.push(error.clone().into());
             let close = {
                 let mut sequences = self.sequences.lock();
                 if let Some(entry) = sequences.live.get_mut(input.sequence()) {
@@ -330,7 +402,7 @@ impl TokenWorkerState {
                 },
                 Err(error) => {
                     violation.get_or_insert(error.clone());
-                    causes.push(error);
+                    causes.push(error.into());
                     continue;
                 }
             };
@@ -362,5 +434,23 @@ impl TokenWorkerState {
                 .interrupted(completed, remaining, causes)
                 .unwrap_or_else(|rejected| rejected.into_outcome())
         })
+    }
+
+    fn retryable_capacity_frontier(
+        &self,
+        sequences: &TokenSequences,
+        input: &ExecutionWork<'_>,
+        claim: u64,
+    ) -> bool {
+        input.sequence().observed_end().is_none()
+            && sequences.live.get(input.sequence()).is_some_and(|entry| {
+                entry.validate_work(input).is_ok()
+                    && entry.device.as_ref().is_some_and(|device| {
+                        device.claim == Some(claim)
+                            && device.prepared
+                            && device.published
+                            && !device.needs_recovery
+                    })
+            })
     }
 }

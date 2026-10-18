@@ -347,11 +347,15 @@ async fn real_cpu_mixed_work_beyond_compiled_token_bound_fails_and_releases_part
     };
     assert!(interruption.completed().is_empty());
     assert_eq!(interruption.remaining().len(), inputs.len());
-    assert!(interruption.causes().iter().any(|error| matches!(
-        error,
-        FerrumError::Backend { message }
-            if message.contains("exceeds its bounded resource formula")
-    )));
+    assert!(interruption
+        .causes()
+        .iter()
+        .filter_map(ExecutionInterruptionCause::as_error)
+        .any(|error| matches!(
+            error,
+            FerrumError::Backend { message }
+                if message.contains("exceeds its bounded resource formula")
+        )));
     let (_, remaining, causes) = interruption.into_parts();
     for (index, participant) in remaining.into_iter().enumerate() {
         let (actual_index, sequence, progress, continuation, cause_index) =

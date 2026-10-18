@@ -66,6 +66,7 @@ use crate::common::paged_pool::block_hash_chain;
 use crate::common::{DecoderOnlyLLM, LlmRuntimeConfig};
 use crate::lora::{load_runtime_lora_adapter, ActiveLoraAdapter, RuntimeLoraAdapter};
 
+mod allocator_reclaim;
 pub(super) mod device_execution;
 use device_execution::{DeviceFrameResult, FrameLayout, LlamaExecutionFrame};
 
@@ -2585,6 +2586,11 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
             }
             return Ok(ModelKvReservation::CapacityDeferred(
                 ferrum_execution::token_execution::TokenAdmissionCapacityDeferral::new(
+                    alloc_arc
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .capacity_domain()
+                        .clone(),
                     total_admission_new_blocks,
                     KvSlotCapacitySnapshot {
                         block_size,
@@ -2678,7 +2684,11 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
             return 0;
         }
 
-        let token_ids: Vec<ferrum_types::TokenId> = tokens
+        // Final logits require at least one freshly computed token. Acquire
+        // only complete blocks strictly before that suffix: backing up the
+        // logical length after acquisition would leave the recomputed suffix
+        // pointing at another sequence's shared physical block.
+        let token_ids: Vec<ferrum_types::TokenId> = tokens[..tokens.len().saturating_sub(1)]
             .iter()
             .map(|&token| ferrum_types::TokenId::new(token))
             .collect();
@@ -4066,22 +4076,11 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
             .and_then(|layers| layers.first())
             .map(K::len)
             .unwrap_or(0);
-        let mut cached_prefix_tokens = if self.runtime_env.prefix_cache && cache_len_before == 0 {
+        let cached_prefix_tokens = if self.runtime_env.prefix_cache && cache_len_before == 0 {
             self.try_acquire_prefix_cache(&mut frame.context, cache_id, tokens)
         } else {
             0
         };
-        if cached_prefix_tokens >= tokens.len() {
-            let block_size = self
-                .kv_caches
-                .get(cache_id)
-                .and_then(|layers| layers.first())
-                .map(K::block_size)
-                .unwrap_or(16);
-            cached_prefix_tokens = cached_prefix_tokens
-                .saturating_sub(block_size)
-                .min(tokens.len() - 1);
-        }
         if self.runtime_env.prefix_cache && cache_len_before == 0 {
             self.record_prefix_cache_probe(cached_prefix_tokens);
         }
@@ -4493,13 +4492,9 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         // computation has started at this boundary.
         match self.reserve_paged_token_kv_slots(requests) {
             Ok(ModelKvReservation::Reserved(_)) => ModelTokenOutcome::Terminal(Ok(())),
-            Ok(ModelKvReservation::CapacityDeferred(deferred)) => ModelTokenOutcome::NotSubmitted(
-                ferrum_types::FerrumError::resource_exhausted(format!(
-                    "paged token work requires {} blocks with {} available",
-                    deferred.required_blocks(),
-                    deferred.snapshot().free_blocks,
-                )),
-            ),
+            Ok(ModelKvReservation::CapacityDeferred(deferred)) => {
+                ModelTokenOutcome::CapacityDeferred(deferred)
+            }
             Err(error) if self.pending_device_frame.is_some() => ModelTokenOutcome::Held(error),
             Err(error) => ModelTokenOutcome::NotSubmitted(error),
         }
@@ -4524,6 +4519,9 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
             admission_target_len: None,
         }]) {
             ModelTokenOutcome::Terminal(Ok(())) => {}
+            ModelTokenOutcome::CapacityDeferred(deferred) => {
+                return ModelTokenOutcome::CapacityDeferred(deferred)
+            }
             ModelTokenOutcome::NotSubmitted(error) => {
                 return ModelTokenOutcome::NotSubmitted(error)
             }
@@ -4561,6 +4559,9 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
                 ))
             } else {
                 match self.execute_managed_token_work(input.cache_id, input.work) {
+                    ModelTokenOutcome::CapacityDeferred(deferred) => {
+                        ModelTokenOutcome::CapacityDeferred(deferred)
+                    }
                     ModelTokenOutcome::Terminal(result) => {
                         ModelTokenOutcome::Terminal(result.map(|logits| {
                             input
@@ -5363,6 +5364,15 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
 
 // FP16 DecoderOnlyLLM impl — full path with batched + unified-forward overrides.
 impl<B: MoeLlmBackend> DecoderOnlyLLM for LlamaFamilyModel<B, KvFp16> {
+    fn observe_token_allocator_reclaim(
+        &self,
+        blocked_cache_id: &str,
+        domain: &ferrum_execution::token_execution::AllocatorCapacityDomain,
+        candidates: &[&str],
+    ) -> Result<Option<ferrum_execution::token_execution::TokenAllocatorReclaim>> {
+        self.observe_paged_allocator_reclaim(blocked_cache_id, domain, candidates)
+    }
+
     fn config(&self) -> &LlmRuntimeConfig {
         &self.runtime_cfg
     }
@@ -5667,6 +5677,15 @@ impl<B: MoeLlmBackend> DecoderOnlyLLM for LlamaFamilyModel<B, KvFp16> {
 // (default trait impl falls back to per-item decode). PR D will add INT8
 // batched paths once the kernels stabilize.
 impl<B: MoeLlmBackend + BackendInt8KvOps> DecoderOnlyLLM for LlamaFamilyModel<B, KvInt8> {
+    fn observe_token_allocator_reclaim(
+        &self,
+        blocked_cache_id: &str,
+        domain: &ferrum_execution::token_execution::AllocatorCapacityDomain,
+        candidates: &[&str],
+    ) -> Result<Option<ferrum_execution::token_execution::TokenAllocatorReclaim>> {
+        self.observe_paged_allocator_reclaim(blocked_cache_id, domain, candidates)
+    }
+
     fn config(&self) -> &LlmRuntimeConfig {
         &self.runtime_cfg
     }
@@ -5949,6 +5968,15 @@ mod lora_tests;
 
 #[cfg(all(test, feature = "cuda"))]
 mod int8_shared_pool_tests;
+
+#[cfg(all(
+    test,
+    any(
+        feature = "cuda",
+        all(feature = "metal", any(target_os = "macos", target_os = "ios"))
+    )
+))]
+mod prefix_cache_tests;
 
 #[cfg(test)]
 mod tests {

@@ -17,6 +17,13 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio::sync::oneshot;
 
+mod capacity;
+#[cfg(any(
+    feature = "cuda",
+    all(feature = "metal", any(target_os = "macos", target_os = "ios"))
+))]
+mod gpu_capacity;
+
 struct Gate {
     entered: oneshot::Sender<()>,
     release: mpsc::Receiver<()>,
@@ -74,6 +81,16 @@ impl<B: MoeLlmBackend> DecoderOnlyLLM for ManagedModel<B> {
         prompt: usize,
     ) -> Result<ModelKvReservation> {
         self.model.lock().prepare_token_kv(id, capacity, prompt)
+    }
+    fn observe_token_allocator_reclaim(
+        &self,
+        blocked: &str,
+        domain: &AllocatorCapacityDomain,
+        candidates: &[&str],
+    ) -> Result<Option<TokenAllocatorReclaim>> {
+        self.model
+            .lock()
+            .observe_token_allocator_reclaim(blocked, domain, candidates)
     }
     fn execute_token_batch(&mut self, inputs: &[ModelTokenInput<'_>]) -> ModelTokenBatchOutcome {
         if let Some(gate) = self.control.gate.lock().take() {

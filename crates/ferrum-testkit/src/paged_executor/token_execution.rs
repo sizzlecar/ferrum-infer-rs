@@ -95,6 +95,7 @@ impl PagedAttentionExecutor {
         if required_blocks > free_blocks {
             return Ok(TokenAdmissionOutcome::CapacityDeferred(
                 TokenAdmissionCapacityDeferral::new(
+                    pool.capacity_domain().clone(),
                     required_blocks,
                     KvSlotCapacitySnapshot {
                         free_blocks,
@@ -298,7 +299,7 @@ impl PagedAttentionExecutor {
                 }
                 Err(error) => {
                     let cause_index = causes.len();
-                    causes.push(error);
+                    causes.push(error.into());
                     let continuation = match self
                         .kv_manager
                         .deallocate_handle_sync(&entry.request, &entry.cache)

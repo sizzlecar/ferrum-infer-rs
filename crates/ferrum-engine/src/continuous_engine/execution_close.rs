@@ -16,6 +16,15 @@ pub(super) struct RecomputeClose {
     attempted_width: usize,
     observed_free_blocks: Option<usize>,
     readiness: ExecutionReadinessWake,
+    failure_targets: std::collections::VecDeque<RecomputeFailureTarget>,
+    failure_error: Option<FerrumError>,
+    failure_marked: bool,
+}
+
+#[derive(Clone)]
+struct RecomputeFailureTarget {
+    key: ferrum_scheduler::implementations::continuous::PrefixRequestKey,
+    frontier: Option<ExecutionFrontier>,
 }
 
 enum ClosePurpose {
@@ -29,6 +38,28 @@ enum ClosePurpose {
 impl Default for ClosePurpose {
     fn default() -> Self {
         Self::Finalize { recompute: None }
+    }
+}
+
+impl ClosePurpose {
+    fn recompute(&self) -> Option<&RecomputeClose> {
+        match self {
+            Self::Recompute(recompute)
+            | Self::Finalize {
+                recompute: Some(recompute),
+            } => Some(recompute),
+            _ => None,
+        }
+    }
+
+    fn recompute_mut(&mut self) -> Option<&mut RecomputeClose> {
+        match self {
+            Self::Recompute(recompute)
+            | Self::Finalize {
+                recompute: Some(recompute),
+            } => Some(recompute),
+            _ => None,
+        }
     }
 }
 
@@ -61,6 +92,21 @@ struct CloseEntry {
 }
 
 impl CloseEntry {
+    fn observe(&mut self, observation: CloseObservation) {
+        if let CloseObservation::Unproved(error) = &observation {
+            if let Some(recompute) = self.purpose.recompute_mut() {
+                recompute.failure_error.get_or_insert_with(|| error.clone());
+            }
+        }
+        self.observation = observation;
+    }
+
+    fn has_pending_product_failure(&self) -> bool {
+        self.purpose.recompute().is_some_and(|recompute| {
+            recompute.failure_error.is_some() && !recompute.failure_targets.is_empty()
+        })
+    }
+
     fn publish_initial(&mut self, result: Result<()>) {
         if self.initial_result.is_none() {
             for waiter in self.initial_waiters.drain(..) {
@@ -136,6 +182,20 @@ impl ExecutionCloseTicket {
 }
 
 impl ExecutionCloseRegistry {
+    /// Cold pressure observation of original in-flight close owners. An
+    /// unproved failed close is not a promise of a future release wake.
+    pub(super) fn pending_incarnations(&self) -> Vec<(RequestId, ExecutorSequence)> {
+        self.state
+            .lock()
+            .entries
+            .iter()
+            .filter_map(|(sequence, entry)| {
+                matches!(entry.observation, CloseObservation::Pending)
+                    .then(|| (entry.request_id.clone(), sequence.clone()))
+            })
+            .collect()
+    }
+
     pub(super) fn contains_incarnation(&self, sequence: &ExecutorSequence) -> bool {
         self.state.lock().entries.contains_key(sequence)
     }
@@ -372,7 +432,7 @@ impl ExecutionCloseRegistry {
                     .entries
                     .get_mut(&task_sequence)
                     .expect("close observer retains its registered incarnation");
-                entry.observation = observation;
+                entry.observe(observation);
                 let initial_result = entry
                     .operation_error
                     .clone()
@@ -413,10 +473,11 @@ impl ExecutionCloseRegistry {
                         let error = FerrumError::internal(format!(
                             "execution close task did not establish closure: {error}"
                         ));
-                        entry.observation = match sequence.observed_end() {
+                        let observation = match sequence.observed_end() {
                             Some(ended) => CloseObservation::Ended(ended, Some(error.clone())),
                             None => CloseObservation::Unproved(error.clone()),
                         };
+                        entry.observe(observation);
                         entry.publish_initial(Err(error));
                     }
                 }
@@ -424,8 +485,26 @@ impl ExecutionCloseRegistry {
         }
     }
 
-    fn take_ended_and_errors(&self) -> (Vec<CloseEntry>, Vec<FerrumError>) {
+    fn take_ended_and_errors(
+        &self,
+        scheduler: &ContinuousBatchScheduler,
+    ) -> (Vec<CloseEntry>, Vec<FerrumError>, bool) {
         let mut state = self.state.lock();
+        let mut errors = Vec::new();
+        for entry in state.entries.values_mut() {
+            if let Some(recompute) = entry.purpose.recompute_mut() {
+                if recompute.failure_error.is_some() && !recompute.failure_marked {
+                    // A failed observer retains its fence. Record that it is
+                    // no longer a future release witness for new pressure.
+                    if let Err(error) =
+                        scheduler.mark_execution_capacity_yield_unproved(&recompute.transaction)
+                    {
+                        errors.push(error);
+                    }
+                    recompute.failure_marked = true;
+                }
+            }
+        }
         // A failed observer is not a terminal proof. If the original executor
         // subsequently publishes its actual end, consume that fact without
         // erasing the observer's error or issuing another physical close.
@@ -440,10 +519,12 @@ impl ExecutionCloseRegistry {
             .entries
             .iter()
             .filter_map(|(sequence, entry)| {
-                matches!(entry.observation, CloseObservation::Ended(..)).then(|| sequence.clone())
+                (matches!(entry.observation, CloseObservation::Ended(..))
+                    && !entry.has_pending_product_failure())
+                .then(|| sequence.clone())
             })
             .collect::<Vec<_>>();
-        let mut errors = Vec::new();
+        let mut newly_unproved = false;
         let CloseState { entries, rejected } = &mut *state;
         for entry in entries.values_mut().chain(rejected.iter_mut()) {
             for outcome in &entry.additional_observations[entry.additional_errors_reported..] {
@@ -464,6 +545,7 @@ impl ExecutionCloseRegistry {
                     &entry.observation
                 {
                     errors.push(error.clone());
+                    newly_unproved |= matches!(entry.observation, CloseObservation::Unproved(_));
                     entry.observation_error_reported = true;
                 }
             }
@@ -472,7 +554,42 @@ impl ExecutionCloseRegistry {
             .into_iter()
             .map(|sequence| state.entries.remove(&sequence).unwrap())
             .collect();
-        (ended, errors)
+        (ended, errors, newly_unproved)
+    }
+
+    fn next_recompute_failure(
+        &self,
+    ) -> Option<(ExecutorSequence, RecomputeFailureTarget, FerrumError)> {
+        let state = self.state.lock();
+        state.entries.iter().find_map(|(sequence, entry)| {
+            let recompute = entry.purpose.recompute()?;
+            Some((
+                sequence.clone(),
+                recompute.failure_targets.front()?.clone(),
+                recompute.failure_error.as_ref()?.clone(),
+            ))
+        })
+    }
+
+    fn acknowledge_recompute_failure(
+        &self,
+        sequence: &ExecutorSequence,
+        key: &ferrum_scheduler::implementations::continuous::PrefixRequestKey,
+    ) {
+        let mut state = self.state.lock();
+        if let Some(recompute) = state
+            .entries
+            .get_mut(sequence)
+            .and_then(|entry| entry.purpose.recompute_mut())
+        {
+            if recompute
+                .failure_targets
+                .front()
+                .is_some_and(|target| &target.key == key)
+            {
+                recompute.failure_targets.pop_front();
+            }
+        }
     }
 
     pub(super) fn unreclaimed_count(&self) -> usize {
@@ -584,7 +701,8 @@ impl EngineInner {
         // frontier/slot handoff. A completion must register its original
         // incarnation while holding this same outer lock, before awaiting.
         let mut sequences = self.sequences.write();
-        let (ended, mut errors) = self.execution_closes.take_ended_and_errors();
+        let (ended, mut errors, newly_unproved) =
+            self.execution_closes.take_ended_and_errors(&self.scheduler);
         for mut entry in ended {
             let CloseObservation::Ended(ended, _) = &entry.observation else {
                 unreachable!("only checked terminal entries are removed")
@@ -639,6 +757,12 @@ impl EngineInner {
             }
         }
         drop(sequences);
+        if newly_unproved && self.scheduler.invalidate_allocator_capacity_waits() {
+            // Losing a pending release witness is not a physical release.
+            // Re-probe the allocator and re-evaluate actual contributors;
+            // keep the failed close owner and all original fences retained.
+            self.work_notify.notify_one();
+        }
         for error in &errors {
             warn!(error = %error, "execution close reported failure; unproved owners remain retained");
         }

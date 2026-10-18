@@ -5,7 +5,8 @@ use ferrum_execution::{
     model_executor::PrefillChunk,
     token_execution::{
         ContinuationDisposition, ExecutionBatchOutcome, ExecutionCloseOutcome,
-        ExecutionContractViolation, ExecutionFrontier, ExecutionWork, NoSubmissionReason,
+        ExecutionContractViolation, ExecutionFrontier, ExecutionInterruptionCause,
+        ExecutionProgress, ExecutionWork, NoSubmissionReason, TokenAdmissionCapacityDeferral,
         TokenWork,
     },
 };
@@ -50,6 +51,14 @@ struct PreparedTokenBatch {
 struct TokenBatchEffects {
     ready: Vec<(RequestId, TokenId)>,
     failed: Vec<(RequestId, FerrumError)>,
+}
+
+/// Cold-path groups of unchanged work. Indices refer only to the current
+/// selected cohort; completed peers never enter the retry stack.
+struct TokenDeferredGroup {
+    cause_index: usize,
+    input_indices: Vec<usize>,
+    deferral: ExecutorExecutionDeferral,
 }
 
 impl EngineInner {
@@ -225,6 +234,9 @@ impl EngineInner {
                 .profile_detail
                 .captures_engine_token_timing()
                 .then(Instant::now);
+            // A close may complete while numerical work is in flight. Keep
+            // the pre-attempt epoch so installing a later wait cannot lose it.
+            let observed_release_epoch = self.scheduler.confirmed_capacity_release_epoch();
             let outcome = self.model_executor.execute_tokens(&works).await;
             let completed_at = started_at.map(|_| Instant::now());
             // An ordinary error is never a reason to replay the whole cohort.
@@ -253,6 +265,7 @@ impl EngineInner {
                         &selected,
                         not_submitted.into_reason(),
                         &mut capacity_pressure_root_width,
+                        observed_release_epoch,
                     )
                     .await;
                 match retry {
@@ -300,8 +313,9 @@ impl EngineInner {
                     }
                 }
             }
+            let mut deferred = Vec::new();
             match self
-                .consume_token_outcome(&selected, &works, outcome, completed_at)
+                .consume_token_outcome(&selected, &works, outcome, completed_at, &mut deferred)
                 .await
             {
                 Ok(()) => {
@@ -312,6 +326,43 @@ impl EngineInner {
                         decode_root_eligible = false;
                     }
                     first_error.get_or_insert(error);
+                }
+            }
+            for group in deferred {
+                decode_root_eligible = false;
+                let deferred_inputs = group
+                    .input_indices
+                    .iter()
+                    .map(|&index| selected[index])
+                    .collect::<Vec<_>>();
+                match self
+                    .handle_token_deferral(
+                        &deferred_inputs,
+                        NoSubmissionReason::Deferred(group.deferral),
+                        &mut capacity_pressure_root_width,
+                        observed_release_epoch,
+                    )
+                    .await
+                {
+                    Ok(groups) => {
+                        for retry in groups.into_iter().rev() {
+                            pending.push(
+                                retry
+                                    .into_iter()
+                                    .map(|local| indices[group.input_indices[local]])
+                                    .collect(),
+                            );
+                        }
+                    }
+                    Err(error) => {
+                        for input in deferred_inputs {
+                            if let Err(close_error) =
+                                self.fail_token_input(input, error.clone(), None).await
+                            {
+                                first_error.get_or_insert(close_error);
+                            }
+                        }
+                    }
                 }
             }
         }

@@ -10,6 +10,9 @@ use ferrum_kv::{PagedKvCacheConfig, PagedKvCacheManager};
 use ferrum_models::test_support::{tiny_llama_executor, TinyLlamaConfig, TinyTokenizer};
 use std::sync::atomic::{AtomicU64, AtomicUsize};
 
+#[path = "tests/recompute_failure.rs"]
+mod recompute_failure;
+
 struct CloseProbe {
     inner: Arc<dyn ModelExecutor>,
     issuer: ExecutorSequenceIssuer,
@@ -18,11 +21,18 @@ struct CloseProbe {
     initial_error: bool,
     end_then_error: AtomicBool,
     capacity_epoch: AtomicU64,
+    immediate_ends: Mutex<std::collections::HashSet<ExecutorSequence>>,
+    retained_cpu_model: Mutex<
+        Option<ferrum_models::models::LlamaFamilyModel<ferrum_kernels::backend::cpu::CpuBackend>>,
+    >,
 }
 
 impl CloseProbe {
     fn close(&self, sequence: &ExecutorSequence) -> Result<ExecutionCloseOutcome> {
         self.calls.fetch_add(1, Ordering::SeqCst);
+        if self.immediate_ends.lock().remove(sequence) {
+            return Ok(ExecutionCloseOutcome::ended(self.issuer.ended(sequence)?));
+        }
         if self.end_then_error.swap(false, Ordering::SeqCst) {
             self.issuer.ended(sequence)?;
             return Err(FerrumError::backend(
@@ -132,6 +142,8 @@ fn fixture_with_inner(
         initial_error,
         end_then_error: AtomicBool::new(false),
         capacity_epoch: AtomicU64::new(1),
+        immediate_ends: Mutex::new(std::collections::HashSet::new()),
+        retained_cpu_model: Mutex::new(None),
     });
     let sequence = executor.issuer.issue_sequence().unwrap();
     let config = EngineConfig::default();

@@ -12,6 +12,19 @@ impl EngineInner {
     ) -> Result<ExecutionCloseTicket> {
         let request_id = transaction.victim_request_id().clone();
         let mut sequences = self.sequences.write();
+        let failure_targets = self
+            .scheduler
+            .execution_capacity_yield_requests(&transaction)?
+            .into_iter()
+            .filter_map(|key| {
+                sequences
+                    .get(key.request_id())
+                    .map(|sequence| RecomputeFailureTarget {
+                        key,
+                        frontier: sequence.execution_frontier.clone(),
+                    })
+            })
+            .collect();
         let sequence = sequences
             .get_mut(&request_id)
             .ok_or_else(|| FerrumError::internal("capacity yield lost its outer request"))?;
@@ -47,9 +60,60 @@ impl EngineInner {
                 attempted_width,
                 observed_free_blocks,
                 readiness,
+                failure_targets,
+                failure_error: None,
+                failure_marked: false,
             }),
             Arc::clone(&self.work_notify),
         )
+    }
+
+    /// Product failures remain attached to the original close entry until
+    /// each exact request has handed off its terminal obligations. Cancelling
+    /// this future cannot discard the not-yet-notified peers.
+    pub(in crate::continuous_engine) async fn complete_failed_execution_recomputes(
+        &self,
+    ) -> Result<()> {
+        let mut first_error = None;
+        let mut handled = false;
+        while let Some((closing, target, error)) = self.execution_closes.next_recompute_failure() {
+            handled = true;
+            let current = {
+                let sequences = self.sequences.read();
+                self.scheduler
+                    .execution_capacity_request_is_current(&target.key)
+                    && sequences
+                        .get(target.key.request_id())
+                        .is_some_and(|sequence| {
+                            sequence.execution_frontier.as_ref() == target.frontier.as_ref()
+                        })
+            };
+            if current {
+                let result = match &target.frontier {
+                    Some(frontier) => {
+                        self.fail_token_frontier(target.key.request_id(), frontier, error, None)
+                            .await
+                    }
+                    None => {
+                        self.complete_request_with_error(target.key.request_id(), error)
+                            .await
+                    }
+                };
+                if let Err(error) = result {
+                    first_error.get_or_insert(error);
+                }
+            }
+            // No await separates completed handoff and notification removal.
+            // A stale key is acknowledged without touching its replacement.
+            self.execution_closes
+                .acknowledge_recompute_failure(&closing, &target.key);
+        }
+        if handled {
+            if let Err(error) = self.drain_execution_closes() {
+                first_error.get_or_insert(error);
+            }
+        }
+        first_error.map_or(Ok(()), Err)
     }
 
     pub(super) fn finish_execution_recompute(
@@ -66,6 +130,9 @@ impl EngineInner {
             attempted_width,
             observed_free_blocks,
             readiness,
+            failure_targets: _,
+            failure_error: _,
+            failure_marked: _,
         } = recompute;
         let reject_recompute = |error: FerrumError| {
             readiness.cancel();
@@ -129,21 +196,28 @@ impl EngineInner {
         // untouched; a later admission rebuilds the complete causal context.
         readiness.mark_ready();
 
-        let mut availability = Vec::new();
-        let source_progress = self
-            .model_executor
-            .write_execution_capacity_snapshot(&mut availability)
-            .and_then(|epochs| {
-                if epochs.is_none() {
-                    return Err(FerrumError::internal(
-                        "capacity yield lost its native source evidence",
-                    ));
-                }
-                transaction
-                    .wait_condition()
-                    .changed_since(&availability)
-                    .map_err(|error| FerrumError::internal(error.to_string()))
-            });
+        let source_progress = if let Some(condition) = transaction.wait_condition().as_native() {
+            let mut availability = Vec::new();
+            self.model_executor
+                .write_execution_capacity_snapshot(&mut availability)
+                .and_then(|epochs| {
+                    if epochs.is_none() {
+                        return Err(FerrumError::internal(
+                            "capacity yield lost its native source evidence",
+                        ));
+                    }
+                    condition
+                        .changed_since(&availability)
+                        .map_err(|error| FerrumError::internal(error.to_string()))
+                })
+        } else {
+            // The allocator query selected this exact reference owner. Its
+            // real Ended above proves withdrawal, including a shared block
+            // that still has another contributor. Preserve the same pressure
+            // hold until the blocked owner progresses; only a fresh allocator
+            // reservation can establish that enough blocks are now free.
+            Ok(true)
+        };
         match source_progress {
             Ok(true) => match self.scheduler.complete_execution_capacity_yield(
                 &transaction,

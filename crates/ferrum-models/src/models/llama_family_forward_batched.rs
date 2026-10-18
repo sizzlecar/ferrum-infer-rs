@@ -3623,6 +3623,11 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
             .collect();
         match self.prepare_managed_token_capacity(&requests) {
             ModelTokenOutcome::Terminal(Ok(())) => {}
+            ModelTokenOutcome::CapacityDeferred(deferred) => {
+                return ModelTokenBatchOutcome::Cohort(ModelTokenOutcome::CapacityDeferred(
+                    deferred,
+                ));
+            }
             ModelTokenOutcome::NotSubmitted(error) | ModelTokenOutcome::Terminal(Err(error)) => {
                 return ModelTokenBatchOutcome::Cohort(ModelTokenOutcome::NotSubmitted(error));
             }

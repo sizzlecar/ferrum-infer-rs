@@ -292,7 +292,13 @@ async fn native_tokens_cpu_bad_middle_product_preserves_both_successful_peers() 
     assert_eq!(violation.remaining.len(), 1);
     assert_eq!(violation.rejected_completions.len(), 1);
     assert!(violation.unassigned_products.is_empty());
-    assert_eq!(violation.error.to_string(), violation.causes[0].to_string());
+    assert_eq!(
+        violation.error.to_string(),
+        violation.causes[0]
+            .as_error()
+            .expect("real model failure")
+            .to_string()
+    );
     let failed = &violation.remaining[0];
     assert_eq!(failed.input_index(), violation.rejected_completions[0].0);
     assert!(matches!(

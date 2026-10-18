@@ -7,6 +7,8 @@
 
 use std::collections::HashMap;
 
+mod capacity;
+
 use ferrum_execution::model_executor::ExecutorSamplingOutput;
 use ferrum_execution::token_execution::*;
 
@@ -275,13 +277,12 @@ impl LlmExecutor {
                     ))
                 }
             };
-            let preparation = catch_host_execution(|| -> Result<()> {
-                model.reserve_kv_slots(&[KvSlotRequest {
+            let preparation = catch_host_execution(|| {
+                model.reserve_token_kv_slots(&[KvSlotRequest {
                     cache_id: entry.cache_id.clone(),
                     target_len: range.end(),
                     admission_target_len: Some(entry.prompt.len().max(range.end())),
-                }])?;
-                Ok(())
+                }])
             })
             .and_then(|result| result);
             let actual = match input.work() {
@@ -293,7 +294,10 @@ impl LlmExecutor {
             };
             let outcome = match preparation {
                 Err(error) => ModelTokenOutcome::NotSubmitted(error),
-                Ok(()) => {
+                Ok(ModelKvReservation::CapacityDeferred(deferred)) => {
+                    ModelTokenOutcome::CapacityDeferred(deferred)
+                }
+                Ok(ModelKvReservation::Reserved(_)) => {
                     let work = match input.work() {
                         TokenWork::Prefill(chunk) => ModelTokenWork::Prefill {
                             tokens: &entry.prompt[chunk.range()],
@@ -308,6 +312,33 @@ impl LlmExecutor {
                 }
             };
             let (progress, error) = match outcome {
+                ModelTokenOutcome::CapacityDeferred(deferred) => {
+                    // Both original registry and model guards still cover the
+                    // validated frontier. No close or token work occurred for
+                    // this member; earlier serial products remain committed.
+                    let cause_index = causes.len();
+                    causes.push(ExecutionInterruptionCause::Deferred(deferred.into()));
+                    match batch.participant(
+                        index,
+                        ExecutionProgress::NotSubmitted {
+                            stage: NoSubmissionStage::BeforeSubmit,
+                        },
+                        ContinuationDisposition::Retryable(entry.frontier.clone()),
+                        cause_index,
+                    ) {
+                        Ok(participant) => remaining.push(participant),
+                        Err(rejected) => {
+                            let mut outcome = rejected.into_outcome((completed, remaining, causes));
+                            if let ExecutionBatchOutcome::ContractViolation(violation) =
+                                &mut outcome
+                            {
+                                violation.rejected_completions = rejected_completions;
+                            }
+                            return Ok(outcome);
+                        }
+                    }
+                    continue;
+                }
                 ModelTokenOutcome::NotSubmitted(error) => (
                     // Zero execution of this call does not prove the original
                     // frontier is usable (a model KV precheck may disagree).
@@ -362,12 +393,12 @@ impl LlmExecutor {
                 }
             };
             let cause_index = causes.len();
-            causes.push(error);
+            causes.push(error.into());
             let continuation =
                 match self.close_token_locked(&mut sequences, &mut **model, input.sequence()) {
                     Ok(close) => {
                         if let Some(error) = close.error {
-                            causes.push(error);
+                            causes.push(error.into());
                         }
                         match close.disposition {
                             ExecutionCloseDisposition::Ended(ended) => {
@@ -467,7 +498,7 @@ fn contract_violation(
     error: FerrumError,
     completed: Vec<ExecutionCompletion>,
     remaining: Vec<InterruptedParticipant>,
-    causes: Vec<FerrumError>,
+    causes: Vec<ExecutionInterruptionCause>,
     rejected_completions: Vec<CompletionParts>,
 ) -> ExecutionBatchOutcome {
     ExecutionBatchOutcome::ContractViolation(ExecutionContractViolation {
