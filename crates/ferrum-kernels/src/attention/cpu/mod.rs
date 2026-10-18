@@ -7,8 +7,6 @@
 
 #![allow(dead_code)]
 
-pub mod transformer;
-
 use crate::attention::AttentionParams;
 
 // ── BLAS binding ────────────────────────────────────────────────────��───

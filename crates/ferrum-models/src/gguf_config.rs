@@ -11,9 +11,8 @@
 //! type means downstream model construction (`LlamaFamilyModel::load`) is
 //! unchanged regardless of source format.
 //!
-//! Phase 1C scope: dense Llama-family architectures (qwen3 / qwen2 / llama /
-//! mistral / tinyllama). MoE-specific fields (`expert_count`, `expert_used_count`)
-//! are deferred to Phase 2 alongside the MoE runtime.
+//! The dense constructor accepts only the architectures implemented by the
+//! Llama-family runtime. MoE metadata uses its separate config constructor.
 //!
 //! Architecture-specific notes:
 //!   - **qwen3**: has QK-norm by convention; rope_theta default 1e6.
@@ -32,6 +31,16 @@ use crate::moe_config::Qwen3MoeConfig;
 /// them with a pointer to the appropriate MoE constructor rather than
 /// silently lowering them to a dense config.
 const KNOWN_MOE_ARCHS: &[&str] = &["qwen3moe", "mixtral", "deepseek2"];
+
+/// Shared eligibility check for the public dense config and product loader.
+pub(crate) fn validate_dense_gguf_architecture(arch: &str) -> Result<()> {
+    match arch {
+        "qwen" | "qwen2" | "qwen3" | "llama" | "mistral" | "gemma3" => Ok(()),
+        _ => Err(FerrumError::unsupported(format!(
+            "GGUF architecture '{arch}' is not supported by the dense Llama-family runtime"
+        ))),
+    }
+}
 
 impl LlamaFamilyConfig {
     /// Parse a `LlamaFamilyConfig` out of a GGUF file's metadata.
@@ -52,6 +61,7 @@ impl LlamaFamilyConfig {
                 "GGUF arch '{arch}' is MoE — use Qwen3MoeConfig::from_gguf or the matching MoE config builder, not LlamaFamilyConfig::from_gguf"
             )));
         }
+        validate_dense_gguf_architecture(&arch)?;
 
         let block_count = read_u32(gguf, &format!("{arch}.block_count"))? as usize;
         let hidden_size = read_u32(gguf, &format!("{arch}.embedding_length"))? as usize;
