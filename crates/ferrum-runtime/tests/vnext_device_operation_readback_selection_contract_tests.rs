@@ -214,6 +214,10 @@ fn selected_terminal_wait_reads_one_exact_range_per_participant_and_retires_once
         .handle
         .wait_with_readback_selection(selection(2, vec![1, 0]))
         .is_err());
+    let expected_completion = receipt.completion().clone();
+    let completion = receipt.into_completion();
+    assert_eq!(completion, expected_completion);
+    assert_eq!(completion.submission(), submitted.handle.receipt());
     submitted.finish();
 }
 

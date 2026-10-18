@@ -3463,6 +3463,12 @@ impl CompletionReadbackBatchReceipt {
         &self.completion
     }
 
+    /// Keep the original terminal proof while releasing readback outputs and
+    /// timing data. No new completion or execution authority is issued.
+    pub fn into_completion(self) -> OperationCompletionReceipt {
+        self.completion
+    }
+
     pub fn dispositions(&self) -> &[CompletionReadbackDisposition] {
         &self.dispositions
     }
