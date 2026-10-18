@@ -67,10 +67,6 @@ pub struct ServeCommand {
     #[arg(short, long)]
     pub port: Option<u16>,
 
-    /// Number of TTS concurrent slots (default: 2)
-    #[arg(long, default_value = "2")]
-    pub tts_slots: usize,
-
     /// Backend: auto, cpu, metal, cuda.
     #[arg(long, default_value = "auto")]
     pub backend: String,
@@ -445,7 +441,6 @@ async fn execute_with_compatibility(
         disable_thinking,
         host,
         port,
-        tts_slots,
         backend,
         numerical_profile,
         gpu_devices,
@@ -809,7 +804,7 @@ async fn execute_with_compatibility(
             RuntimeConfigSnapshot::from_entries(non_env_runtime_entries).entries;
     }
 
-    // Detect architecture to choose engine type. For GGUF we skip
+    // Read architecture capabilities for the language engine. For GGUF we skip
     // ConfigManager::load_from_path (which expects HF safetensors layout)
     // and route directly to the continuous-batching LLM engine — the
     // engine's LlmExecutorFactory uses WeightFormat::detect() to route GGUF.
@@ -1078,27 +1073,15 @@ async fn execute_with_compatibility(
             )
         })
         .collect();
-    let served_model_kind = match arch_for_dispatch {
-        Some(ferrum_models::Architecture::Clip) => ServedModelKind::Embedding,
-        Some(ferrum_models::Architecture::Whisper) => ServedModelKind::Transcription,
-        Some(ferrum_models::Architecture::Qwen3TTS) => ServedModelKind::Speech,
-        _ => ServedModelKind::Llm,
-    };
-    validate_served_model_kv_dtype(served_model_kind, product_engine_config.kv_cache.dtype)?;
     if vnext_checkpoint.teacher_token_file.is_some() {
         return Err(FerrumError::unsupported(
             "vNext checkpoint teacher forcing is supported only by one-shot ferrum run",
         ));
     }
     let vnext_checkpoint_capture = vnext_checkpoint.to_config()?;
-    if vnext_checkpoint_capture.is_some() && served_model_kind != ServedModelKind::Llm {
-        return Err(FerrumError::unsupported(
-            "vNext checkpoint capture is only supported for causal language models",
-        ));
-    }
     let served_model_registry = ServedModelRegistry::try_new(
         model_id.clone(),
-        served_model_kind,
+        ServedModelKind::Llm,
         served_model_names,
         lora_server_models,
     )
@@ -1108,136 +1091,57 @@ async fn execute_with_compatibility(
     let mut resolved_execution_metrics = None;
     let mut cache_allocated_status = None;
     let server_result: Result<_> = async {
-        Ok(match arch_for_dispatch {
-            Some(ferrum_models::Architecture::Clip) => {
-                println!("{}", "Initializing CLIP embedding engine...".dimmed());
-                let candle_device = candle_core::Device::Cpu;
-                let executor = ferrum_models::ClipModelExecutor::from_path(
-                    &source.local_path.to_string_lossy(),
-                    candle_device,
-                    candle_core::DType::F32,
-                )?;
-                let tokenizer = crate::commands::embed::load_tokenizer(&source.local_path)?;
-                let mut engine_config = product_engine_config;
-                engine_config.sampling.default_params =
-                    ferrum_server::default_chat_sampling_params();
-                engine_config.backend.device = device;
-                if let Some(selection) = &gpu_selection {
-                    selection.insert_backend_options(&mut engine_config.backend.backend_options);
+        println!(
+            "{}",
+            "Initializing engine (continuous batching)...".dimmed()
+        );
+        let mut engine_config = product_engine_config;
+        engine_config.kv_cache.cache_type = serve_kv_cache_type_for_device(&device);
+        engine_config.backend.device = device;
+        engine_config.scheduler.policy = ferrum_types::SchedulingPolicy::ContinuousBatch;
+        engine_config
+            .apply_runtime_config_snapshot(&startup_auto_config.runtime_config)
+            .map_err(ferrum_types::FerrumError::config)?;
+        engine_config.runtime.vnext_checkpoint_capture = vnext_checkpoint_capture;
+        engine_config.runtime.startup_memory_request = startup_memory_request;
+        engine_config.backend.backend_options.insert(
+            "model_path".to_string(),
+            serde_json::Value::String(engine_model_path.clone()),
+        );
+        if let Some(selection) = &gpu_selection {
+            selection.insert_backend_options(&mut engine_config.backend.backend_options);
+        }
+        crate::layer_split_pipeline::insert_backend_option_from_runtime(
+            &startup_auto_config.runtime_config,
+            &mut engine_config.backend.backend_options,
+        )?;
+        if let Some(draft_path) = engine_spec_draft_path.as_ref() {
+            engine_config.backend.backend_options.insert(
+                "spec_draft".to_string(),
+                serde_json::Value::String(draft_path.clone()),
+            );
+            engine_config.backend.backend_options.insert(
+                "spec_n".to_string(),
+                serde_json::Value::Number(serde_json::Number::from(spec_tokens)),
+            );
+        }
+        super::run::apply_kv_dtype_override(&mut engine_config, effective_kv_dtype)?;
+        let engine: Arc<dyn ferrum_engine::LlmInferenceEngine + Send + Sync> =
+            Arc::from(match (defined_model, model_sources) {
+                (Some(prepared), _) => {
+                    ferrum_engine::create_defined_product_engine(engine_config, prepared).await?
                 }
-                let engine: Arc<dyn ferrum_engine::EmbedEngine + Send + Sync> = Arc::new(
-                    ferrum_engine::embedding_engine::EmbeddingEngine::new(executor, engine_config)
-                        .with_tokenizer(tokenizer),
-                );
-                AxumServer::from_embed(engine)
-            }
-            Some(ferrum_models::Architecture::Whisper) => {
-                println!("{}", "Initializing Whisper ASR engine...".dimmed());
-                let candle_device = to_candle_device(&device)?;
-                let executor = ferrum_models::WhisperModelExecutor::from_path(
-                    &source.local_path.to_string_lossy(),
-                    candle_device,
-                    candle_core::DType::F32,
-                )?;
-                let mut engine_config = product_engine_config;
-                engine_config.backend.device = device;
-                if let Some(selection) = &gpu_selection {
-                    selection.insert_backend_options(&mut engine_config.backend.backend_options);
+                (None, Some(sources)) => {
+                    ferrum_engine::create_product_engine(engine_config, sources).await?
                 }
-                let engine: Arc<dyn ferrum_engine::TranscribeEngine + Send + Sync> = Arc::new(
-                    ferrum_engine::transcription_engine::TranscriptionEngine::new(
-                        executor,
-                        engine_config,
-                    ),
-                );
-                AxumServer::from_transcribe(engine)
-            }
-            Some(ferrum_models::Architecture::Qwen3TTS) => {
-                let n_slots = tts_slots.max(1);
-                println!(
-                    "{} ({} slot{})",
-                    "Initializing Qwen3-TTS engine...".dimmed(),
-                    n_slots,
-                    if n_slots > 1 { "s" } else { "" }
-                );
-                let model_path = source.local_path.to_string_lossy().to_string();
-                let mut executors = Vec::with_capacity(n_slots);
-                for i in 0..n_slots {
-                    let candle_device = to_candle_device(&device)?;
-                    let executor = ferrum_models::TtsModelExecutor::from_path(
-                        &model_path,
-                        candle_device,
-                        candle_core::DType::F32,
-                    )?;
-                    if i == 0 {
-                        println!("  Slot 0 loaded");
-                    } else {
-                        println!("  Slot {} loaded", i);
-                    }
-                    executors.push(executor);
-                }
-                let engine: Arc<dyn ferrum_engine::TtsEngine + Send + Sync> =
-                    Arc::new(ferrum_engine::tts_engine::TtsService::new_multi(
-                        executors,
-                        ferrum_types::ModelId(model_id.clone()),
-                    ));
-                AxumServer::from_tts(engine)
-            }
-            _ => {
-                println!(
-                    "{}",
-                    "Initializing engine (continuous batching)...".dimmed()
-                );
-                let mut engine_config = product_engine_config;
-                engine_config.kv_cache.cache_type = serve_kv_cache_type_for_device(&device);
-                engine_config.backend.device = device;
-                engine_config.scheduler.policy = ferrum_types::SchedulingPolicy::ContinuousBatch;
-                engine_config
-                    .apply_runtime_config_snapshot(&startup_auto_config.runtime_config)
-                    .map_err(ferrum_types::FerrumError::config)?;
-                engine_config.runtime.vnext_checkpoint_capture = vnext_checkpoint_capture;
-                engine_config.runtime.startup_memory_request = startup_memory_request;
-                engine_config.backend.backend_options.insert(
-                    "model_path".to_string(),
-                    serde_json::Value::String(engine_model_path.clone()),
-                );
-                if let Some(selection) = &gpu_selection {
-                    selection.insert_backend_options(&mut engine_config.backend.backend_options);
-                }
-                crate::layer_split_pipeline::insert_backend_option_from_runtime(
-                    &startup_auto_config.runtime_config,
-                    &mut engine_config.backend.backend_options,
-                )?;
-                if let Some(draft_path) = engine_spec_draft_path.as_ref() {
-                    engine_config.backend.backend_options.insert(
-                        "spec_draft".to_string(),
-                        serde_json::Value::String(draft_path.clone()),
-                    );
-                    engine_config.backend.backend_options.insert(
-                        "spec_n".to_string(),
-                        serde_json::Value::Number(serde_json::Number::from(spec_tokens)),
-                    );
-                }
-                super::run::apply_kv_dtype_override(&mut engine_config, effective_kv_dtype)?;
-                let engine: Arc<dyn ferrum_engine::LlmInferenceEngine + Send + Sync> =
-                    Arc::from(match (defined_model, model_sources) {
-                        (Some(prepared), _) => {
-                            ferrum_engine::create_defined_product_engine(engine_config, prepared)
-                                .await?
-                        }
-                        (None, Some(sources)) => {
-                            ferrum_engine::create_product_engine(engine_config, sources).await?
-                        }
-                        (None, None) => ferrum_engine::create_default_engine(engine_config).await?,
-                    });
-                crate::startup::apply_engine_plan(&mut startup_auto_config, engine.config());
-                resolved_execution_metrics = engine.cache_metrics_snapshot();
-                if product_memory_enabled {
-                    cache_allocated_status = Some(engine.status().await);
-                }
-                AxumServer::from_llm(engine).with_prompt_template(model_chat_template)
-            }
-        })
+                (None, None) => ferrum_engine::create_default_engine(engine_config).await?,
+            });
+        crate::startup::apply_engine_plan(&mut startup_auto_config, engine.config());
+        resolved_execution_metrics = engine.cache_metrics_snapshot();
+        if product_memory_enabled {
+            cache_allocated_status = Some(engine.status().await);
+        }
+        Ok(AxumServer::from_llm(engine).with_prompt_template(model_chat_template))
     }
     .await;
     let server = match server_result {
@@ -1970,19 +1874,6 @@ fn resolve_effective_kv_dtype<'a>(
     config_file_value: Option<&'a str>,
 ) -> Option<&'a str> {
     cli_arg.or(env_value).or(config_file_value)
-}
-
-fn validate_served_model_kv_dtype(
-    kind: ServedModelKind,
-    dtype: ferrum_types::KvCacheDtype,
-) -> Result<()> {
-    if kind != ServedModelKind::Llm && dtype != ferrum_types::KvCacheDtype::Fp16 {
-        return Err(FerrumError::unsupported(format!(
-            "KV storage overrides require a causal language executor; {kind:?} serving does not support KV dtype {}",
-            dtype.as_str()
-        )));
-    }
-    Ok(())
 }
 
 fn push_cli_runtime_entry(entries: &mut Vec<RuntimeConfigEntry>, key: &str, value: Option<&str>) {
@@ -2728,24 +2619,6 @@ impl RuntimePresetInferenceRule {
 // HF cache walk + format detection have a single source of truth across
 // `run` / `serve` / `bench`. Use `crate::source_resolver::find_cached_model`
 // / `crate::source_resolver::detect_format` directly.
-
-fn to_candle_device(device: &ferrum_types::Device) -> ferrum_types::Result<candle_core::Device> {
-    match device {
-        #[cfg(all(target_os = "macos", feature = "metal"))]
-        ferrum_types::Device::Metal => candle_core::Device::new_metal(0)
-            .map_err(|error| ferrum_types::FerrumError::device(error.to_string())),
-        #[cfg(feature = "candle-cuda-compat")]
-        ferrum_types::Device::CUDA(id) => candle_core::Device::new_cuda(*id as usize)
-            .map_err(|error| ferrum_types::FerrumError::device(error.to_string())),
-        ferrum_types::Device::CUDA(_) => Err(ferrum_types::FerrumError::unsupported(
-            "this Candle-backed server architecture requires the candle-cuda-compat feature",
-        )),
-        ferrum_types::Device::ROCm(_) => Err(ferrum_types::FerrumError::unsupported(
-            "ROCm is not supported",
-        )),
-        _ => Ok(candle_core::Device::Cpu),
-    }
-}
 
 #[cfg(test)]
 mod tests {
@@ -4399,35 +4272,6 @@ mod tests {
             Some("fp16")
         );
         assert_eq!(resolve_effective_kv_dtype(None, None, None), None);
-    }
-
-    #[test]
-    fn non_language_serving_rejects_kv_overrides_from_every_source() {
-        use ferrum_types::KvCacheDtype;
-        for kind in [
-            ServedModelKind::Embedding,
-            ServedModelKind::Transcription,
-            ServedModelKind::Speech,
-        ] {
-            validate_served_model_kv_dtype(kind, KvCacheDtype::Fp16).unwrap();
-            for sources in [
-                (Some("int8"), Some("fp16"), Some("fp16")),
-                (None, Some("int8"), Some("fp16")),
-                (None, None, Some("int8")),
-            ] {
-                let mut engine = ferrum_types::EngineConfig::default();
-                super::super::run::apply_kv_dtype_override(
-                    &mut engine,
-                    resolve_effective_kv_dtype(sources.0, sources.1, sources.2),
-                )
-                .unwrap();
-                let error =
-                    validate_served_model_kv_dtype(kind, engine.kv_cache.dtype).unwrap_err();
-                assert!(error.to_string().contains("does not support KV dtype int8"));
-            }
-        }
-        // The language executor validates its actual family/backend later.
-        validate_served_model_kv_dtype(ServedModelKind::Llm, KvCacheDtype::Int8).unwrap();
     }
 
     #[test]

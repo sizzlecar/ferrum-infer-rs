@@ -36,10 +36,6 @@ fn from_definition_with_weight_bytes_inner(
         Architecture::Mistral => "mistral",
         Architecture::Phi => "phi",
         Architecture::GPT2 => "gpt2",
-        Architecture::Bert => "bert",
-        Architecture::Clip => "clip",
-        Architecture::Whisper => "whisper",
-        Architecture::Qwen3TTS => "qwen3_tts",
         Architecture::Unknown => "unknown",
     }
     .to_owned();

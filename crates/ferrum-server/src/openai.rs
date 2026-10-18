@@ -643,80 +643,6 @@ pub struct ModelPermission {
     pub is_blocking: bool,
 }
 
-// ======================== Embeddings API ========================
-
-/// Embeddings request (OpenAI-compatible, extended for images)
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct EmbeddingsRequest {
-    /// Model identifier
-    pub model: String,
-
-    /// Input to embed — text string, array of strings, or objects with text/image fields
-    pub input: EmbeddingInput,
-
-    /// Encoding format: "float" (default) or "base64"
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub encoding_format: Option<String>,
-}
-
-/// Polymorphic embedding input.
-/// Supports: single string, array of strings, single object, array of objects.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(untagged)]
-pub enum EmbeddingInput {
-    /// Single text string (OpenAI standard)
-    Single(String),
-    /// Batch of text strings (OpenAI standard)
-    Batch(Vec<String>),
-    /// Single multimodal item (Jina-style extension)
-    SingleObject(EmbeddingItem),
-    /// Batch of multimodal items
-    BatchObjects(Vec<EmbeddingItem>),
-}
-
-/// A single embedding input item — text or image.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct EmbeddingItem {
-    /// Text to embed
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub text: Option<String>,
-    /// Image: file path or base64 data URI
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub image: Option<String>,
-}
-
-/// Embeddings response (OpenAI-compatible)
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct EmbeddingsResponse {
-    pub object: String,
-    pub data: Vec<EmbeddingData>,
-    pub model: String,
-    pub usage: EmbeddingUsage,
-}
-
-/// Single embedding result
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct EmbeddingData {
-    pub object: String,
-    pub embedding: Vec<f32>,
-    pub index: usize,
-}
-
-/// Token usage for embeddings
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct EmbeddingUsage {
-    pub prompt_tokens: u32,
-    pub total_tokens: u32,
-}
-
-// ======================== Audio Transcription API ========================
-
-/// Transcription response (OpenAI-compatible)
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TranscriptionResponse {
-    pub text: String,
-}
-
 // ======================== Error types ========================
 
 /// OpenAI API error
@@ -788,46 +714,6 @@ impl SseEvent {
         result.push_str(&format!("data: {}\n\n", self.data));
         result
     }
-}
-
-/// TTS speech request (OpenAI compatible /v1/audio/speech)
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SpeechRequest {
-    /// Model name (e.g., "qwen3-tts", "tts-1")
-    #[serde(default = "default_tts_model")]
-    pub model: String,
-
-    /// Text to synthesize
-    pub input: String,
-
-    /// Voice preset (ignored for now — uses default speaker)
-    #[serde(default = "default_voice")]
-    pub voice: String,
-
-    /// Response format: "wav", "pcm" (default: "wav")
-    #[serde(default = "default_audio_format")]
-    pub response_format: String,
-
-    /// Language hint: "auto", "chinese", "english"
-    #[serde(default = "default_language")]
-    pub language: String,
-
-    /// Enable streaming (chunked transfer)
-    #[serde(default)]
-    pub stream: bool,
-}
-
-fn default_tts_model() -> String {
-    "qwen3-tts".to_string()
-}
-fn default_voice() -> String {
-    "default".to_string()
-}
-fn default_audio_format() -> String {
-    "wav".to_string()
-}
-fn default_language() -> String {
-    "auto".to_string()
 }
 
 #[cfg(test)]

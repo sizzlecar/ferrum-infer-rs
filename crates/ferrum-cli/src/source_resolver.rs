@@ -192,16 +192,6 @@ pub fn resolve_model_alias(name: &str) -> String {
         }
         "llama3.2:1b" => "meta-llama/Llama-3.2-1B-Instruct".to_string(),
         "llama3.2:3b" => "meta-llama/Llama-3.2-3B-Instruct".to_string(),
-        "whisper-tiny" | "whisper:tiny" => "openai/whisper-tiny".to_string(),
-        "whisper-base" | "whisper:base" => "openai/whisper-base".to_string(),
-        "whisper-small" | "whisper:small" => "openai/whisper-small".to_string(),
-        "whisper-medium" | "whisper:medium" => "openai/whisper-medium".to_string(),
-        "whisper-large-v3" | "whisper:large-v3" => "openai/whisper-large-v3".to_string(),
-        "whisper-turbo" | "whisper:turbo" | "whisper-large-v3-turbo" => {
-            "openai/whisper-large-v3-turbo".to_string()
-        }
-        "qwen3-tts" | "tts" | "tts:0.6b" => "Qwen/Qwen3-TTS-12Hz-0.6B-Base".to_string(),
-        "tts:1.7b" | "qwen3-tts:1.7b" => "Qwen/Qwen3-TTS-12Hz-1.7B-Base".to_string(),
         _ => name.to_string(),
     }
 }

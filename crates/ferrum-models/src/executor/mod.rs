@@ -1,31 +1,22 @@
 //! Model executor implementations.
 //!
 //! Decoder-only LLMs go through `LlmExecutor` (wrapping any
-//! `Box<dyn DecoderOnlyLLM>`). Per-modality executors (Bert / Clip / Whisper /
-//! Tts) remain separate — they have different forward contracts that don't
-//! fit the prefill/decode interface.
+//! `Box<dyn DecoderOnlyLLM>`) or the registered plan runtime. Future task
+//! families must use their own execution contracts, without dummy KV caches.
 
-pub mod bert_executor;
-pub mod clip_executor;
 pub mod common;
 pub mod llm_executor;
 pub mod stub_executor;
-pub mod tts_executor;
 mod vnext_checkpoint;
 mod vnext_completion_worker;
 pub mod vnext_executor;
 mod vnext_timing;
-pub mod whisper_executor;
 
-pub use bert_executor::BertModelExecutor;
-pub use clip_executor::ClipModelExecutor;
 pub use llm_executor::LlmExecutor;
 pub use stub_executor::StubModelExecutor;
-pub use tts_executor::TtsModelExecutor;
 pub use vnext_executor::{
     VNextCompiledModel, VNextDeterminismExecutionMode, VNextDeterminismExecutionSpec,
     VNextDeterminismInitialState, VNextDeterminismParticipantSpec, VNextDeterminismPhase,
     VNextDeterminismWorkspacePoison, VNextExecutorConfig, VNextModelCompilationError,
     VNextModelExecutor, VNextRuntimeComposition, MAX_VNEXT_DETERMINISM_PARTICIPANTS,
 };
-pub use whisper_executor::WhisperModelExecutor;

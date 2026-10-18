@@ -33,10 +33,6 @@ pub enum Architecture {
     Mistral,
     Phi,
     GPT2,
-    Bert,
-    Clip,
-    Whisper,
-    Qwen3TTS,
     Unknown,
 }
 
@@ -53,16 +49,31 @@ impl Architecture {
             "mistral" | "mistralforcausallm" => Architecture::Mistral,
             "phi" | "phiforcausallm" => Architecture::Phi,
             "gpt2" | "gpt2lmheadmodel" => Architecture::GPT2,
-            "bert" | "bertmodel" | "bertformaskedlm" | "bertforsequenceclassification" => {
-                Architecture::Bert
-            }
-            "clip" | "clipmodel" => Architecture::Clip,
-            "chinese_clip" | "chineseclipmodel" => Architecture::Clip,
-            "siglip" | "siglipmodel" => Architecture::Clip,
-            "whisper" | "whisperforconditionalgeneration" => Architecture::Whisper,
-            "qwen3_tts" | "qwen3ttsforconditionalgeneration" => Architecture::Qwen3TTS,
             _ => Architecture::Unknown,
         }
+    }
+
+    /// Former task families must fail explicitly rather than enter a decoder
+    /// fallback. Unknown labels for independently registered families are not
+    /// classified here.
+    pub(crate) fn is_retired_task_label(label: &str) -> bool {
+        matches!(
+            label.to_ascii_lowercase().as_str(),
+            "bert"
+                | "bertmodel"
+                | "bertformaskedlm"
+                | "bertforsequenceclassification"
+                | "clip"
+                | "clipmodel"
+                | "chinese_clip"
+                | "chineseclipmodel"
+                | "siglip"
+                | "siglipmodel"
+                | "whisper"
+                | "whisperforconditionalgeneration"
+                | "qwen3_tts"
+                | "qwen3ttsforconditionalgeneration"
+        )
     }
 }
 
@@ -126,15 +137,6 @@ impl DefaultModelRegistry {
         registry.register_alias("mistral-7b", "mistralai/Mistral-7B-v0.1");
         registry.register_alias("mistral-7b-instruct", "mistralai/Mistral-7B-Instruct-v0.2");
         registry.register_alias("phi3-mini", "microsoft/Phi-3-mini-4k-instruct");
-
-        // Whisper ASR models
-        registry.register_alias("whisper-tiny", "openai/whisper-tiny");
-        registry.register_alias("whisper-base", "openai/whisper-base");
-        registry.register_alias("whisper-small", "openai/whisper-small");
-        registry.register_alias("whisper-medium", "openai/whisper-medium");
-        registry.register_alias("whisper-large-v3", "openai/whisper-large-v3");
-        registry.register_alias("whisper-turbo", "openai/whisper-large-v3-turbo");
-        registry.register_alias("whisper-large-v3-turbo", "openai/whisper-large-v3-turbo");
 
         registry
     }

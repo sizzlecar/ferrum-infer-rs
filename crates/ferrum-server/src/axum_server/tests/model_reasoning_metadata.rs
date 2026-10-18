@@ -174,7 +174,6 @@ async fn output_reasoning_alone_does_not_advertise_a_switch() {
 #[tokio::test]
 async fn unrelated_or_unloaded_registry_entries_do_not_inherit_llm_controls() {
     for (kind, engine_id, loaded) in [
-        (ServedModelKind::Embedding, "stub-model", true),
         (ServedModelKind::Llm, "other-model", true),
         (ServedModelKind::Llm, "stub-model", false),
     ] {

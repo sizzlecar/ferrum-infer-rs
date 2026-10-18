@@ -130,12 +130,34 @@ fn cli_help_lists_commands() {
 #[test]
 fn subcommand_help_smoke() {
     let workspace = TempDirGuard::new("help-subcommands");
-    for sub in ["run", "embed", "serve", "pull", "list", "stop", "doctor"] {
+    for sub in ["run", "serve", "pull", "list", "stop", "doctor"] {
         let mut cmd = base_cmd(workspace.path());
         cmd.arg(sub).arg("--help");
         let output = run(&mut cmd);
         assert!(output.status.success(), "{sub} --help should succeed");
     }
+}
+
+#[test]
+fn retired_modal_commands_and_options_are_rejected() {
+    let workspace = TempDirGuard::new("retired-modal-commands");
+    for sub in ["embed", "e", "transcribe", "t", "tts"] {
+        let mut cmd = base_cmd(workspace.path());
+        cmd.arg(sub);
+        let output = run(&mut cmd);
+        assert!(!output.status.success(), "{sub} must not start a task");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("unrecognized subcommand"),
+            "{sub} must be rejected by command parsing"
+        );
+    }
+
+    let mut cmd = base_cmd(workspace.path());
+    cmd.args(["serve", "--tts-slots", "2"]);
+    let output = run(&mut cmd);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("unexpected argument") && stderr.contains("--tts-slots"));
 }
 
 #[test]
