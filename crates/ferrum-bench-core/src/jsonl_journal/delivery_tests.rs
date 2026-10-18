@@ -150,6 +150,207 @@ fn try_delivery_full_and_gate_busy_return_without_poisoning_the_journal() {
     let _ = std::fs::remove_file(path);
 }
 
+fn concurrent_measurement(retire_during_measurement: bool) {
+    let path = path("concurrent-measurement");
+    let owner =
+        JsonlJournalOwner::open(&path, JsonlJournalOpenMode::Truncate, Default::default()).unwrap();
+    let mut measured_scope = owner.producer_scope().unwrap();
+    let mut peer_scope = owner.producer_scope().unwrap();
+    let measured = measured_scope.producer::<GatedEvent>();
+    let peer = peer_scope.producer::<serde_json::Value>();
+    let gate = Arc::new(BlockingGate::default());
+    let release = ReleaseGate(gate.clone());
+    let pending_gate = gate.clone();
+    let measuring = thread::spawn(move || {
+        measured.try_enqueue_batch(vec![
+            gated(&pending_gate, false),
+            gated(&pending_gate, false),
+        ])
+    });
+    gate.wait();
+    // The original batch has not published anything. A real peer publication
+    // and its FIFO flush must complete while that batch's Serialize is held.
+    let sending = peer.clone();
+    let peer_receipt = nonblocking(move || {
+        sending.try_enqueue(serde_json::json!({"peer": 1})).unwrap();
+        sending.flush()
+    });
+    peer_receipt.result().unwrap();
+    assert_eq!(
+        (
+            peer_receipt.cut.accepted,
+            peer_receipt.flushed,
+            peer_receipt.cut.dropped
+        ),
+        (1, 1, 0)
+    );
+    assert_eq!(peer.delivery_stats().pending_payload_bytes, 0);
+    let (mut owner, extra_scope) = nonblocking(move || {
+        let scope = owner.producer_scope().unwrap();
+        (owner, scope)
+    });
+    let extra_receipt = nonblocking(move || {
+        let mut scope = extra_scope;
+        scope.finish()
+    });
+    extra_receipt.result().unwrap();
+    assert!(extra_receipt.scope_retired);
+    assert_eq!(extra_receipt.cut.accepted, 1);
+
+    let retired_receipt = if retire_during_measurement {
+        let (scope, receipt) = nonblocking(move || {
+            let receipt = measured_scope.finish();
+            (measured_scope, receipt)
+        });
+        measured_scope = scope;
+        receipt.result().unwrap();
+        assert!(receipt.scope_retired && receipt.barrier_observed);
+        Some(receipt)
+    } else {
+        None
+    };
+    drop(release);
+    let result = measuring.join().unwrap();
+    if let Some(receipt) = retired_receipt {
+        assert_eq!(result.unwrap_err().kind(), JsonlJournalErrorKind::Closed);
+        assert_eq!(
+            (receipt.cut.accepted, receipt.cut.dropped, receipt.flushed),
+            (1, 0, 1)
+        );
+        assert_eq!(
+            measured_scope.finish(),
+            receipt,
+            "a late rejected batch cannot move the retired scope's cut"
+        );
+        assert_eq!(
+            (
+                peer.delivery_stats().accepted,
+                peer.delivery_stats().dropped
+            ),
+            (1, 2)
+        );
+    } else {
+        result.unwrap();
+        let receipt = measured_scope.finish();
+        receipt.result().unwrap();
+        assert_eq!(
+            (receipt.cut.accepted, receipt.cut.dropped, receipt.flushed),
+            (3, 0, 3)
+        );
+    }
+    peer_scope.finish().result().unwrap();
+    let final_receipt = owner.close().unwrap();
+    final_receipt.result().unwrap();
+    assert!(final_receipt.worker_joined);
+    let stats = peer.delivery_stats();
+    assert_eq!(stats.pending_payload_bytes, 0);
+    assert_eq!(stats.failed, 0);
+    assert_eq!(stats.accepted, stats.flushed);
+    assert_eq!(stats.unbounded_accepted, 0);
+    let records: Vec<serde_json::Value> = std::fs::read_to_string(&path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(records[0], serde_json::json!({"peer":1}));
+    assert_eq!(records.len(), if retire_during_measurement { 1 } else { 3 });
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn try_delivery_measurement_does_not_hold_peer_publication_or_scope_barriers() {
+    concurrent_measurement(false);
+}
+
+#[test]
+fn try_delivery_scope_retired_during_measurement_rejects_whole_batch_and_returns_credit() {
+    concurrent_measurement(true);
+}
+
+#[test]
+fn try_delivery_measurement_cannot_publish_after_close_into_a_reopened_epoch() {
+    let path = path("measurement-reopened");
+    let owner =
+        JsonlJournalOwner::open(&path, JsonlJournalOpenMode::Truncate, Default::default()).unwrap();
+    let scope = owner.producer_scope().unwrap();
+    let old = scope.producer::<serde_json::Value>();
+    old.try_enqueue(serde_json::json!({"epoch": "old"}))
+        .unwrap();
+    old.flush().result().unwrap();
+    let measured = scope.producer::<GatedEvent>();
+    let gate = Arc::new(BlockingGate::default());
+    let release = ReleaseGate(gate.clone());
+    let pending_gate = gate.clone();
+    let measuring = thread::spawn(move || measured.try_enqueue(gated(&pending_gate, false)));
+    gate.wait();
+
+    let (mut owner, mut scope, scope_receipt, final_receipt) = nonblocking(move || {
+        let mut scope = scope;
+        let scope_receipt = scope.finish();
+        let mut owner = owner;
+        let final_receipt = owner.close().unwrap();
+        (owner, scope, scope_receipt, final_receipt)
+    });
+    scope_receipt.result().unwrap();
+    final_receipt.result().unwrap();
+    assert!(scope_receipt.scope_retired && scope_receipt.barrier_observed);
+    assert!(final_receipt.worker_joined);
+    assert_eq!(
+        (
+            final_receipt.flush.cut.accepted,
+            final_receipt.flush.cut.dropped
+        ),
+        (1, 0)
+    );
+
+    let mut reopened =
+        JsonlJournalOwner::open(&path, JsonlJournalOpenMode::Truncate, Default::default()).unwrap();
+    let mut new_scope = reopened.producer_scope().unwrap();
+    let current = new_scope.producer::<serde_json::Value>();
+    assert!(!Arc::ptr_eq(&old.inner, &current.inner));
+    current
+        .try_enqueue(serde_json::json!({"epoch": "new"}))
+        .unwrap();
+    current.flush().result().unwrap();
+    drop(release);
+    assert_eq!(
+        measuring.join().unwrap().unwrap_err().kind(),
+        JsonlJournalErrorKind::Closed
+    );
+    assert_eq!(scope.finish(), scope_receipt);
+    assert_eq!(
+        owner.close().unwrap(),
+        final_receipt,
+        "late rejection cannot rewrite final evidence"
+    );
+    let old_stats = old.delivery_stats();
+    assert_eq!(
+        (old_stats.accepted, old_stats.flushed, old_stats.dropped),
+        (1, 1, 1)
+    );
+    assert_eq!(old_stats.pending_payload_bytes, 0);
+    new_scope.finish().result().unwrap();
+    let new_final = reopened.close().unwrap();
+    new_final.result().unwrap();
+    assert!(new_final.worker_joined);
+    assert_eq!(
+        (
+            new_final.flush.cut.accepted,
+            new_final.flush.cut.dropped,
+            new_final.flush.flushed
+        ),
+        (1, 0, 1)
+    );
+    assert_eq!(new_final.stats.pending_payload_bytes, 0);
+    let records: Vec<serde_json::Value> = std::fs::read_to_string(&path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(records, vec![serde_json::json!({"epoch": "new"})]);
+    let _ = std::fs::remove_file(path);
+}
+
 #[test]
 fn try_delivery_payload_credit_covers_the_active_job_and_releases_after_write() {
     let path = path("active-credit");

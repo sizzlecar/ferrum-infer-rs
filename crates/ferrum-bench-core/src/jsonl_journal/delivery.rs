@@ -37,6 +37,9 @@ pub enum JsonlJournalWorkerState {
 /// `failed` counts accepted jobs lost before a successful buffered write; later
 /// flush failures are reported by `failure_kind`, even when `failed` is zero.
 /// Neither flush nor close erases dropped records or proves artifact completeness.
+/// Payload credit also covers prepared jobs awaiting the publication gate. A
+/// worker join does not prove those jobs or old producer references were dropped.
+/// Their later rejection may change these live counters, never a fixed receipt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct JsonlJournalDeliveryStats {
     pub accepted: u64,
@@ -369,7 +372,7 @@ impl<T: Serialize + Send + 'static> JsonlJournal<T> {
     /// Never waits on a journal lock, queue, byte budget or disk. The bounded
     /// serde measurement runs on the caller, so custom Serialize must not block.
     pub fn try_enqueue(&self, event: T) -> Result<(), JsonlJournalError> {
-        let (_guard, bytes) = self.prepare_try(std::slice::from_ref(&event))?;
+        let bytes = self.measure_payload(std::slice::from_ref(&event))?;
         let job = BoundedJob::new(
             Box::new(move |writer| writer.record(&event)),
             bytes,
@@ -378,7 +381,7 @@ impl<T: Serialize + Send + 'static> JsonlJournal<T> {
             &self.inner.delivery,
         )
         .inspect_err(|_| self.inner.delivery.reject(1))?;
-        self.send_try(job)
+        self.publish_try(job)
     }
 
     /// One atomic delivery command: a failed batch is never partially encoded
@@ -387,7 +390,7 @@ impl<T: Serialize + Send + 'static> JsonlJournal<T> {
         if events.is_empty() {
             return Ok(());
         }
-        let (_guard, bytes) = self.prepare_try(&events)?;
+        let bytes = self.measure_payload(&events)?;
         let records = events.len();
         let job = BoundedJob::new(
             Box::new(move |writer| {
@@ -402,13 +405,45 @@ impl<T: Serialize + Send + 'static> JsonlJournal<T> {
             &self.inner.delivery,
         )
         .inspect_err(|_| self.inner.delivery.reject(records))?;
-        self.send_try(job)
+        self.publish_try(job)
     }
 
-    fn prepare_try<'a>(
-        &'a self,
-        events: &[T],
-    ) -> Result<(MutexGuard<'a, PublicationState>, usize), JsonlJournalError> {
+    fn measure_payload(&self, events: &[T]) -> Result<usize, JsonlJournalError> {
+        let result = (|| {
+            // A cheap early rejection, not authorization. Measurement and
+            // payload/credit construction never hold the publication gate.
+            self.inner.check_publication(&self.scope)?;
+            if events.len() > self.inner.config.max_batch_records {
+                return Err(error(
+                    JsonlJournalErrorKind::Limit,
+                    "JSONL batch has too many records",
+                ));
+            }
+            let mut measure = PayloadWriter::new(self.inner.config, None);
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                for event in events {
+                    measure.record(event)?;
+                }
+                Ok::<_, JsonlJournalError>(())
+            }))
+            .map_err(|_| {
+                error(
+                    JsonlJournalErrorKind::Panic,
+                    "JSONL measurement serializer panicked",
+                )
+            })??;
+            Ok(measure.count)
+        })();
+        if result.is_err() {
+            self.inner.delivery.reject(events.len());
+        }
+        result
+    }
+
+    fn publication_gate(
+        &self,
+        records: usize,
+    ) -> Result<MutexGuard<'_, PublicationState>, JsonlJournalError> {
         let result = (|| {
             if self.inner.closed.load(Ordering::Acquire) {
                 return Err(error(
@@ -434,32 +469,22 @@ impl<T: Serialize + Send + 'static> JsonlJournal<T> {
                     "JSONL journal is closed",
                 ));
             }
+            // Scope retirement, final close, or worker failure may have
+            // happened during measurement. Only this gate grants publication.
             self.inner.check_publication(&self.scope)?;
-            if events.len() > self.inner.config.max_batch_records {
-                return Err(error(
-                    JsonlJournalErrorKind::Limit,
-                    "JSONL batch has too many records",
-                ));
-            }
-            let mut measure = PayloadWriter::new(self.inner.config, None);
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                for event in events {
-                    measure.record(event)?;
-                }
-                Ok::<_, JsonlJournalError>(())
-            }))
-            .map_err(|_| {
-                error(
-                    JsonlJournalErrorKind::Panic,
-                    "JSONL measurement serializer panicked",
-                )
-            })??;
-            Ok((guard, measure.count))
+            Ok(guard)
         })();
         if result.is_err() {
-            self.inner.delivery.reject(events.len());
+            self.inner.delivery.reject(records);
         }
         result
+    }
+
+    fn publish_try(&self, job: BoundedJob) -> Result<(), JsonlJournalError> {
+        // Payload measurement and job allocation precede this critical section.
+        // Acceptance and enqueue stay inside it so FIFO cuts remain exact.
+        let _guard = self.publication_gate(job.records)?;
+        self.send_try(job)
     }
 
     fn send_try(&self, mut job: BoundedJob) -> Result<(), JsonlJournalError> {
