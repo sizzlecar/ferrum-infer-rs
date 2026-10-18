@@ -1,5 +1,5 @@
 use super::*;
-use ferrum_interfaces::vnext::{NumericalExecutionPolicy, TypedFamilyRegistration};
+use ferrum_runtime::{NumericalExecutionPolicy, TypedFamilyRegistration};
 
 fn source() -> Qwen35FamilyConfig {
     let mut config = super::super::q8act_attention_tests::source();
@@ -233,7 +233,7 @@ fn q6_f16_profile_rejects_substituted_body_and_missing_head_contract() {
         .iter_mut()
         .find(|op| {
             op.operation_id.as_str()
-                == ferrum_interfaces::vnext::LAST_TOKEN_DENSE_LINEAR_Q6_MMQ_F32_OPERATION_ID
+                == ferrum_runtime::LAST_TOKEN_DENSE_LINEAR_Q6_MMQ_F32_OPERATION_ID
         })
         .unwrap()
         .staged_arithmetic = None;

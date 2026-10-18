@@ -4,7 +4,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use ferrum_interfaces::ModelExecutor;
+use ferrum_execution::ModelExecutor;
 use ferrum_models::vnext::ProductionModelSourceBundle;
 use ferrum_models::{ConfigManager, LlmExecutor, ModelDefinition};
 use ferrum_types::{ModelInfo, Result};
@@ -35,9 +35,9 @@ pub(super) fn bind_executor(
 mod tests {
     use super::*;
     use crate::registry::{ComponentConfig, ComponentFactory, LlmExecutorFactory};
-    use ferrum_interfaces::model_executor::PrefillInput;
-    use ferrum_interfaces::vnext::{ModelSourceKind, OriginalModelSource, OriginalModelSources};
+    use ferrum_execution::model_executor::PrefillInput;
     use ferrum_models::vnext::ProductionWeightArtifact;
+    use ferrum_runtime::{ModelSourceKind, OriginalModelSource, OriginalModelSources};
     use ferrum_types::{Device, EngineConfig};
     use safetensors::tensor::{serialize_to_file, Dtype, TensorView};
     use serde_json::json;

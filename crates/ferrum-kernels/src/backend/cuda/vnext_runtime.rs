@@ -22,7 +22,7 @@ use cudarc::driver::{
 use cudarc::driver::{CudaFunction, LaunchConfig, PushKernelArg};
 #[cfg(feature = "vllm-marlin")]
 use cudarc::nvrtc::Ptx;
-use ferrum_interfaces::vnext::{
+use ferrum_runtime::{
     BufferDescriptor, CapabilityId, CopyRegion, DefinitelyNotSubmitted, DeviceBatchingForm,
     DeviceBufferRetention, DeviceClass, DeviceCommandBatch, DeviceCommandEntry,
     DeviceCommandLogicalWork, DeviceCommandPhase, DeviceComputePathRequirement, DeviceDescriptor,
@@ -2484,7 +2484,7 @@ fn validate_fence_dependencies(
 }
 
 fn cuda_submission_attribution(
-    command_phases: &[ferrum_interfaces::vnext::DeviceCommandPhase],
+    command_phases: &[ferrum_runtime::DeviceCommandPhase],
     command_node_indices: &[Option<u32>],
     commands: &[CudaDeviceCommand],
     execution_paths: &[DeviceExecutionPath],
@@ -2567,12 +2567,12 @@ fn cuda_submission_attribution(
 
 fn validate_conditional_dependency(
     command: &CudaDeviceCommand,
-    phase: ferrum_interfaces::vnext::DeviceCommandPhase,
+    phase: ferrum_runtime::DeviceCommandPhase,
     node_index: Option<u32>,
     execution_path: DeviceExecutionPath,
     graph_nodes: Option<u64>,
 ) -> Result<(), CudaDeviceRuntimeError> {
-    use ferrum_interfaces::vnext::DeviceCommandPhase;
+    use ferrum_runtime::DeviceCommandPhase;
     if phase != DeviceCommandPhase::DynamicBinding
         || node_index.is_some()
         || execution_path != DeviceExecutionPath::Eager
@@ -2599,7 +2599,7 @@ fn validate_conditional_dependency(
 /// Validate encoded metadata before any enqueue. A conditional declaration
 /// authorizes its eager dependency, but does not claim that a scan occurred.
 fn validate_cuda_submission_attribution(
-    phases: &[ferrum_interfaces::vnext::DeviceCommandPhase],
+    phases: &[ferrum_runtime::DeviceCommandPhase],
     node_indices: &[Option<u32>],
     commands: &[CudaDeviceCommand],
     paths: &[DeviceExecutionPath],
@@ -3077,9 +3077,9 @@ pub struct CudaDeviceRuntime {
     program_binding_upload_counters: Arc<ProgramBindingUploadCounters>,
     binding_scatter: Option<binding_scatter::BindingScatter>,
     input_upload_scatter: binding_scatter::BindingScatter,
-    segment_binding_oracle: ferrum_interfaces::vnext::SegmentBindingOracleMode,
+    segment_binding_oracle: ferrum_runtime::SegmentBindingOracleMode,
     segment_binding_oracle_audited_nodes: AtomicU64,
-    segment_binding_owner_view_mode: ferrum_interfaces::vnext::SegmentBindingOwnerViewMode,
+    segment_binding_owner_view_mode: ferrum_runtime::SegmentBindingOwnerViewMode,
     segment_binding_indexed_encodes: AtomicU64,
     physical_segment_binding_encodes: AtomicU64,
     resident_decode_program_encodes: AtomicU64,
@@ -3163,12 +3163,14 @@ impl CudaDeviceRuntime {
         let major = context.attribute(cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR)
             .map_err(|error| CudaDeviceRuntimeError::driver("MMA compute capability", error))?;
         if major < 8 || !super::vnext_ops::rn_fragment_mma_compiled() {
-            config.capabilities.retain(|capability| capability.as_str() != ferrum_interfaces::vnext::DENSE_SWIGLU_GGUF_RN_F16_FRAGMENT_M1_TO8_CAPABILITY_ID);
+            config.capabilities.retain(|capability| {
+                capability.as_str()
+                    != ferrum_runtime::DENSE_SWIGLU_GGUF_RN_F16_FRAGMENT_M1_TO8_CAPABILITY_ID
+            });
         }
         let minor = context.attribute(cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR)
             .map_err(|error| CudaDeviceRuntimeError::driver("DP4A compute capability", error))?;
-        let q6_head_capability =
-            ferrum_interfaces::vnext::LAST_TOKEN_DENSE_LINEAR_Q6_MMQ_F32_CAPABILITY_ID;
+        let q6_head_capability = ferrum_runtime::LAST_TOKEN_DENSE_LINEAR_Q6_MMQ_F32_CAPABILITY_ID;
         if major >= 8 && matches!(purpose, CudaRuntimePurpose::NativeCatalogDeclaration) {
             config.capabilities.insert(
                 CapabilityId::new(q6_head_capability)
@@ -3180,24 +3182,24 @@ impl CudaDeviceRuntime {
                 .retain(|cap| cap.as_str() != q6_head_capability);
         }
         for profile in [
-            ferrum_interfaces::vnext::UpstreamMarkerV2Profile::SwiGlu,
-            ferrum_interfaces::vnext::UpstreamMarkerV2Profile::GatedDelta,
-            ferrum_interfaces::vnext::UpstreamMarkerV2Profile::Causal,
-            ferrum_interfaces::vnext::UpstreamMarkerV2Profile::SwiGluPrefill,
-            ferrum_interfaces::vnext::UpstreamMarkerV2Profile::SwiGluG32MmqPrefill,
-            ferrum_interfaces::vnext::UpstreamMarkerV2Profile::GatedDeltaPrefill,
-            ferrum_interfaces::vnext::UpstreamMarkerV2Profile::GatedDeltaG32MmqPrefill,
-            ferrum_interfaces::vnext::UpstreamMarkerV2Profile::CausalPrefill,
-            ferrum_interfaces::vnext::UpstreamMarkerV2Profile::CausalG32MmqPrefill,
-            ferrum_interfaces::vnext::UpstreamMarkerV2Profile::SwiGluExtraPrefill,
-            ferrum_interfaces::vnext::UpstreamMarkerV2Profile::GatedDeltaExtraPrefill,
-            ferrum_interfaces::vnext::UpstreamMarkerV2Profile::CausalExtraPrefill,
-            ferrum_interfaces::vnext::UpstreamMarkerV2Profile::SwiGluExtraLargePrefill,
-            ferrum_interfaces::vnext::UpstreamMarkerV2Profile::SwiGluExtraAllRows,
-            ferrum_interfaces::vnext::UpstreamMarkerV2Profile::GatedDeltaExtraLargePrefill,
-            ferrum_interfaces::vnext::UpstreamMarkerV2Profile::GatedDeltaExtraAllRows,
-            ferrum_interfaces::vnext::UpstreamMarkerV2Profile::CausalExtraLargePrefill,
-            ferrum_interfaces::vnext::UpstreamMarkerV2Profile::CausalExtraAllRows,
+            ferrum_runtime::UpstreamMarkerV2Profile::SwiGlu,
+            ferrum_runtime::UpstreamMarkerV2Profile::GatedDelta,
+            ferrum_runtime::UpstreamMarkerV2Profile::Causal,
+            ferrum_runtime::UpstreamMarkerV2Profile::SwiGluPrefill,
+            ferrum_runtime::UpstreamMarkerV2Profile::SwiGluG32MmqPrefill,
+            ferrum_runtime::UpstreamMarkerV2Profile::GatedDeltaPrefill,
+            ferrum_runtime::UpstreamMarkerV2Profile::GatedDeltaG32MmqPrefill,
+            ferrum_runtime::UpstreamMarkerV2Profile::CausalPrefill,
+            ferrum_runtime::UpstreamMarkerV2Profile::CausalG32MmqPrefill,
+            ferrum_runtime::UpstreamMarkerV2Profile::SwiGluExtraPrefill,
+            ferrum_runtime::UpstreamMarkerV2Profile::GatedDeltaExtraPrefill,
+            ferrum_runtime::UpstreamMarkerV2Profile::CausalExtraPrefill,
+            ferrum_runtime::UpstreamMarkerV2Profile::SwiGluExtraLargePrefill,
+            ferrum_runtime::UpstreamMarkerV2Profile::SwiGluExtraAllRows,
+            ferrum_runtime::UpstreamMarkerV2Profile::GatedDeltaExtraLargePrefill,
+            ferrum_runtime::UpstreamMarkerV2Profile::GatedDeltaExtraAllRows,
+            ferrum_runtime::UpstreamMarkerV2Profile::CausalExtraLargePrefill,
+            ferrum_runtime::UpstreamMarkerV2Profile::CausalExtraAllRows,
         ] {
             if major >= 8 && matches!(purpose, CudaRuntimePurpose::NativeCatalogDeclaration) {
                 config.capabilities.insert(
@@ -3212,7 +3214,7 @@ impl CudaDeviceRuntime {
                     && !super::vnext_ops::upstream_extra_profile_compiled(profile.extra_prefill()))
                 || (profile.hybrid()
                     && !super::vnext_ops::q8act_g32_profile_compiled(
-                        ferrum_interfaces::vnext::Q8ActSwiGluProfile::Q4KQ5KIq4Xs,
+                        ferrum_runtime::Q8ActSwiGluProfile::Q4KQ5KIq4Xs,
                     ))
             {
                 config
@@ -3221,8 +3223,8 @@ impl CudaDeviceRuntime {
             }
         }
         for profile in [
-            ferrum_interfaces::vnext::Q8ActSwiGluProfile::Iq4Xs,
-            ferrum_interfaces::vnext::Q8ActSwiGluProfile::Q4KQ5KIq4Xs,
+            ferrum_runtime::Q8ActSwiGluProfile::Iq4Xs,
+            ferrum_runtime::Q8ActSwiGluProfile::Q4KQ5KIq4Xs,
         ] {
             if major * 10 + minor < 61 || !super::vnext_ops::q8act_g32_profile_compiled(profile) {
                 config
@@ -3234,12 +3236,12 @@ impl CudaDeviceRuntime {
         // fences. Per-slice implicit events would create a second authority.
         if major * 10 + minor < 61
             || !super::vnext_ops::q8act_g32_profile_compiled(
-                ferrum_interfaces::vnext::Q8ActSwiGluProfile::Q4KQ5KIq4Xs,
+                ferrum_runtime::Q8ActSwiGluProfile::Q4KQ5KIq4Xs,
             )
         {
             for profile in [
-                ferrum_interfaces::vnext::Q8ActAttentionProfile::GatedDelta,
-                ferrum_interfaces::vnext::Q8ActAttentionProfile::Causal,
+                ferrum_runtime::Q8ActAttentionProfile::GatedDelta,
+                ferrum_runtime::Q8ActAttentionProfile::Causal,
             ] {
                 config
                     .capabilities
@@ -3293,10 +3295,9 @@ impl CudaDeviceRuntime {
             program_binding_upload_counters: Arc::new(ProgramBindingUploadCounters::default()),
             binding_scatter,
             input_upload_scatter,
-            segment_binding_oracle: ferrum_interfaces::vnext::SegmentBindingOracleMode::Disabled,
+            segment_binding_oracle: ferrum_runtime::SegmentBindingOracleMode::Disabled,
             segment_binding_oracle_audited_nodes: AtomicU64::new(0),
-            segment_binding_owner_view_mode:
-                ferrum_interfaces::vnext::SegmentBindingOwnerViewMode::Legacy,
+            segment_binding_owner_view_mode: ferrum_runtime::SegmentBindingOwnerViewMode::Legacy,
             segment_binding_indexed_encodes: AtomicU64::new(0),
             physical_segment_binding_encodes: AtomicU64::new(0),
             resident_decode_program_encodes: AtomicU64::new(0),
@@ -3325,7 +3326,7 @@ impl CudaDeviceRuntime {
     /// Constructor-only diagnostic selection, before any runtime owner is shared.
     pub fn with_segment_binding_oracle(
         mut self,
-        mode: ferrum_interfaces::vnext::SegmentBindingOracleMode,
+        mode: ferrum_runtime::SegmentBindingOracleMode,
     ) -> Self {
         self.segment_binding_oracle = mode;
         self
@@ -3340,7 +3341,7 @@ impl CudaDeviceRuntime {
     /// Explicit diagnostic selection; ordinary construction remains Legacy.
     pub fn with_segment_binding_owner_view_mode(
         mut self,
-        mode: ferrum_interfaces::vnext::SegmentBindingOwnerViewMode,
+        mode: ferrum_runtime::SegmentBindingOwnerViewMode,
     ) -> Self {
         self.segment_binding_owner_view_mode = mode;
         self
@@ -3426,8 +3427,7 @@ impl CudaDeviceRuntime {
     }
 
     pub(super) fn q4_shared_weight_decode_counter(&self) -> Option<Arc<AtomicU64>> {
-        (self.segment_binding_oracle
-            == ferrum_interfaces::vnext::SegmentBindingOracleMode::CompareReference)
+        (self.segment_binding_oracle == ferrum_runtime::SegmentBindingOracleMode::CompareReference)
             .then(|| self.q4_shared_weight_decode_encodes.clone())
     }
 
@@ -3479,8 +3479,7 @@ impl CudaDeviceRuntime {
     }
 
     pub(super) fn q5_shared_weight_decode_counter(&self) -> Option<Arc<AtomicU64>> {
-        (self.segment_binding_oracle
-            == ferrum_interfaces::vnext::SegmentBindingOracleMode::CompareReference)
+        (self.segment_binding_oracle == ferrum_runtime::SegmentBindingOracleMode::CompareReference)
             .then(|| self.q5_shared_weight_decode_encodes.clone())
     }
 
@@ -4524,7 +4523,7 @@ impl DeviceRuntime for CudaDeviceRuntime {
 
     fn allocate(
         &self,
-        permit: ferrum_interfaces::vnext::DeviceAllocationPermit<'_>,
+        permit: ferrum_runtime::DeviceAllocationPermit<'_>,
     ) -> Result<Self::Buffer, Self::Error> {
         let request = permit.into_request();
         let extra_alignment = request
@@ -4572,10 +4571,10 @@ impl DeviceRuntime for CudaDeviceRuntime {
 
     fn immutable_runtime_metadata(
         &self,
-    ) -> Option<ferrum_interfaces::vnext::ImmutableRuntimeMetadata<'_, Self>> {
+    ) -> Option<ferrum_runtime::ImmutableRuntimeMetadata<'_, Self>> {
         // The descriptor is installed once by the runtime constructor. Stream,
         // allocator, quarantine and graph-cache state are not this capability.
-        Some(ferrum_interfaces::vnext::ImmutableRuntimeMetadata::declare(
+        Some(ferrum_runtime::ImmutableRuntimeMetadata::declare(
             self,
             &self.descriptor,
         ))
@@ -4584,13 +4583,13 @@ impl DeviceRuntime for CudaDeviceRuntime {
     fn immutable_buffer_metadata<'a>(
         &'a self,
         buffer: &'a Self::Buffer,
-    ) -> Option<ferrum_interfaces::vnext::ImmutableBufferMetadata<'a, Self>> {
+    ) -> Option<ferrum_runtime::ImmutableBufferMetadata<'a, Self>> {
         if buffer.runtime_instance != self.runtime_instance {
             return None;
         }
         // The exact facade owns an immutable descriptor and allocation Arc.
         // This does not certify a pool's current chunk, lease or logical window.
-        Some(ferrum_interfaces::vnext::ImmutableBufferMetadata::declare(
+        Some(ferrum_runtime::ImmutableBufferMetadata::declare(
             self,
             buffer,
             &buffer.descriptor,
@@ -4719,9 +4718,8 @@ impl DeviceRuntime for CudaDeviceRuntime {
     fn reusable_execution_entry_identity(
         &self,
         stream: &Self::Stream,
-        program: &ferrum_interfaces::vnext::DeviceReusableExecutionProgramId,
-    ) -> Result<Option<ferrum_interfaces::vnext::DeviceReusableExecutionEntryIdentity>, Self::Error>
-    {
+        program: &ferrum_runtime::DeviceReusableExecutionProgramId,
+    ) -> Result<Option<ferrum_runtime::DeviceReusableExecutionEntryIdentity>, Self::Error> {
         self.validate_stream(stream)?;
         if !stream.state.is_quiescent() {
             return Err(CudaDeviceRuntimeError::contract(
@@ -4733,13 +4731,11 @@ impl DeviceRuntime for CudaDeviceRuntime {
 
     fn encode_segment_bindings(
         &self,
-        patch: ferrum_interfaces::vnext::PreparedSegmentBindingPatch<'_, Self::Buffer>,
-    ) -> Result<
-        Option<Vec<ferrum_interfaces::vnext::EncodedSegmentBindingNode<Self::Command>>>,
-        Self::Error,
-    > {
-        let indexed = patch.owner_view_mode()
-            == ferrum_interfaces::vnext::SegmentBindingOwnerViewMode::Indexed;
+        patch: ferrum_runtime::PreparedSegmentBindingPatch<'_, Self::Buffer>,
+    ) -> Result<Option<Vec<ferrum_runtime::EncodedSegmentBindingNode<Self::Command>>>, Self::Error>
+    {
+        let indexed =
+            patch.owner_view_mode() == ferrum_runtime::SegmentBindingOwnerViewMode::Indexed;
         let encoded = super::vnext_ops::encode_segment_bindings(patch)?;
         if indexed && encoded.is_some() {
             self.segment_binding_indexed_encodes
@@ -4753,10 +4749,10 @@ impl DeviceRuntime for CudaDeviceRuntime {
 
     fn compile_segment_binding_program(
         &self,
-        declarations: &[(u32, &ferrum_interfaces::vnext::SegmentBindingDeclaration)],
+        declarations: &[(u32, &ferrum_runtime::SegmentBindingDeclaration)],
     ) -> Result<Option<Arc<dyn std::any::Any + Send + Sync>>, Self::Error> {
         if self.segment_binding_owner_view_mode
-            != ferrum_interfaces::vnext::SegmentBindingOwnerViewMode::Indexed
+            != ferrum_runtime::SegmentBindingOwnerViewMode::Indexed
             || self.program_binding_upload_strategy != ProgramBindingUploadStrategy::CompactScatter
             || self.binding_scatter.is_none()
         {
@@ -4768,13 +4764,11 @@ impl DeviceRuntime for CudaDeviceRuntime {
     fn encode_compiled_segment_bindings(
         &self,
         program: &(dyn std::any::Any + Send + Sync),
-        frame: &mut ferrum_interfaces::vnext::PreparedSegmentBindingFrame<'_, Self::Buffer>,
-    ) -> Result<
-        Option<ferrum_interfaces::vnext::EncodedSegmentBindingProgram<Self::Command>>,
-        Self::Error,
-    > {
+        frame: &mut ferrum_runtime::PreparedSegmentBindingFrame<'_, Self::Buffer>,
+    ) -> Result<Option<ferrum_runtime::EncodedSegmentBindingProgram<Self::Command>>, Self::Error>
+    {
         if self.segment_binding_owner_view_mode
-            != ferrum_interfaces::vnext::SegmentBindingOwnerViewMode::Indexed
+            != ferrum_runtime::SegmentBindingOwnerViewMode::Indexed
             || self.program_binding_upload_strategy != ProgramBindingUploadStrategy::CompactScatter
         {
             return Err(CudaDeviceRuntimeError::contract(
@@ -4798,18 +4792,15 @@ impl DeviceRuntime for CudaDeviceRuntime {
                 value.checked_add(1)
             })
             .map_err(|_| CudaDeviceRuntimeError::contract("indexed segment count exhausted"))?;
-        Ok(Some(
-            ferrum_interfaces::vnext::EncodedSegmentBindingProgram {
-                nodes,
-                program_bindings: vec![command],
-                program_binding_nodes,
-            },
-        ))
+        Ok(Some(ferrum_runtime::EncodedSegmentBindingProgram {
+            nodes,
+            program_bindings: vec![command],
+            program_binding_nodes,
+        }))
     }
 
     fn supports_physical_segment_bindings(&self) -> bool {
-        self.segment_binding_owner_view_mode
-            == ferrum_interfaces::vnext::SegmentBindingOwnerViewMode::Indexed
+        self.segment_binding_owner_view_mode == ferrum_runtime::SegmentBindingOwnerViewMode::Indexed
             && self.program_binding_upload_strategy == ProgramBindingUploadStrategy::CompactScatter
             && self.binding_scatter.is_some()
     }
@@ -4817,7 +4808,7 @@ impl DeviceRuntime for CudaDeviceRuntime {
     fn compile_resident_decode_program(
         &self,
         program: &(dyn std::any::Any + Send + Sync),
-        wave: &ferrum_interfaces::vnext::PreparedPhysicalSegmentWave<'_, Self::Buffer>,
+        wave: &ferrum_runtime::PreparedPhysicalSegmentWave<'_, Self::Buffer>,
     ) -> Result<Option<Arc<dyn std::any::Any + Send + Sync>>, Self::Error> {
         if !self.supports_physical_segment_bindings() {
             return Ok(None);
@@ -4831,7 +4822,7 @@ impl DeviceRuntime for CudaDeviceRuntime {
     fn refresh_resident_decode_program(
         &self,
         previous: &(dyn std::any::Any + Send + Sync),
-        refresh: &ferrum_interfaces::vnext::DeviceResidentDecodeRefresh<'_, Self::Buffer>,
+        refresh: &ferrum_runtime::DeviceResidentDecodeRefresh<'_, Self::Buffer>,
     ) -> Result<Option<Arc<dyn std::any::Any + Send + Sync>>, Self::Error> {
         if !self.supports_physical_segment_bindings() {
             return Ok(None);
@@ -4850,11 +4841,9 @@ impl DeviceRuntime for CudaDeviceRuntime {
     fn encode_resident_decode_program(
         &self,
         program: &(dyn std::any::Any + Send + Sync),
-        request: &mut ferrum_interfaces::vnext::DeviceResidentDecodeRequest<'_>,
-    ) -> Result<
-        Option<ferrum_interfaces::vnext::DeviceEncodedResidentDecode<Self::Command>>,
-        Self::Error,
-    > {
+        request: &mut ferrum_runtime::DeviceResidentDecodeRequest<'_>,
+    ) -> Result<Option<ferrum_runtime::DeviceEncodedResidentDecode<Self::Command>>, Self::Error>
+    {
         if !self.supports_physical_segment_bindings() {
             return Ok(None);
         }
@@ -4869,7 +4858,7 @@ impl DeviceRuntime for CudaDeviceRuntime {
 
     fn compile_sequence_physical_bindings(
         &self,
-        table: &ferrum_interfaces::vnext::SequencePhysicalBindingTable<Self::Buffer>,
+        table: &ferrum_runtime::SequencePhysicalBindingTable<Self::Buffer>,
     ) -> Result<Option<Arc<dyn std::any::Any + Send + Sync>>, Self::Error> {
         if !self.supports_physical_segment_bindings() {
             return Ok(None);
@@ -4890,11 +4879,9 @@ impl DeviceRuntime for CudaDeviceRuntime {
     fn encode_physical_segment_bindings(
         &self,
         program: &(dyn std::any::Any + Send + Sync),
-        wave: &mut ferrum_interfaces::vnext::PreparedPhysicalSegmentWave<'_, Self::Buffer>,
-    ) -> Result<
-        Option<ferrum_interfaces::vnext::EncodedSegmentBindingProgram<Self::Command>>,
-        Self::Error,
-    > {
+        wave: &mut ferrum_runtime::PreparedPhysicalSegmentWave<'_, Self::Buffer>,
+    ) -> Result<Option<ferrum_runtime::EncodedSegmentBindingProgram<Self::Command>>, Self::Error>
+    {
         if !self.supports_physical_segment_bindings() {
             return Err(CudaDeviceRuntimeError::contract(
                 "physical segment runtime configuration changed",
@@ -4922,33 +4909,27 @@ impl DeviceRuntime for CudaDeviceRuntime {
                 value.checked_add(1)
             })
             .map_err(|_| CudaDeviceRuntimeError::contract("physical segment count exhausted"))?;
-        Ok(Some(
-            ferrum_interfaces::vnext::EncodedSegmentBindingProgram {
-                nodes,
-                program_bindings: vec![command],
-                program_binding_nodes,
-            },
-        ))
+        Ok(Some(ferrum_runtime::EncodedSegmentBindingProgram {
+            nodes,
+            program_bindings: vec![command],
+            program_binding_nodes,
+        }))
     }
 
-    fn segment_binding_owner_view_mode(
-        &self,
-    ) -> ferrum_interfaces::vnext::SegmentBindingOwnerViewMode {
+    fn segment_binding_owner_view_mode(&self) -> ferrum_runtime::SegmentBindingOwnerViewMode {
         self.segment_binding_owner_view_mode
     }
 
-    fn segment_binding_oracle_mode(&self) -> ferrum_interfaces::vnext::SegmentBindingOracleMode {
+    fn segment_binding_oracle_mode(&self) -> ferrum_runtime::SegmentBindingOracleMode {
         self.segment_binding_oracle
     }
 
     fn compare_segment_binding_reference(
         &self,
-        actual: ferrum_interfaces::vnext::SegmentBindingOracleCommands<'_, Self::Command>,
-        reference: ferrum_interfaces::vnext::SegmentBindingOracleCommands<'_, Self::Command>,
+        actual: ferrum_runtime::SegmentBindingOracleCommands<'_, Self::Command>,
+        reference: ferrum_runtime::SegmentBindingOracleCommands<'_, Self::Command>,
     ) -> Result<Option<()>, Self::Error> {
-        if self.segment_binding_oracle
-            == ferrum_interfaces::vnext::SegmentBindingOracleMode::Disabled
-        {
+        if self.segment_binding_oracle == ferrum_runtime::SegmentBindingOracleMode::Disabled {
             return Ok(None);
         }
         segment_oracle::compare(actual, reference)?;
@@ -4966,13 +4947,11 @@ impl DeviceRuntime for CudaDeviceRuntime {
         program_binding_nodes: &[u32],
         nodes: &[(
             u32,
-            ferrum_interfaces::vnext::SegmentBindingOracleCommands<'_, Self::Command>,
-            ferrum_interfaces::vnext::SegmentBindingOracleCommands<'_, Self::Command>,
+            ferrum_runtime::SegmentBindingOracleCommands<'_, Self::Command>,
+            ferrum_runtime::SegmentBindingOracleCommands<'_, Self::Command>,
         )],
     ) -> Result<Option<()>, Self::Error> {
-        if self.segment_binding_oracle
-            == ferrum_interfaces::vnext::SegmentBindingOracleMode::Disabled
-        {
+        if self.segment_binding_oracle == ferrum_runtime::SegmentBindingOracleMode::Disabled {
             return Ok(None);
         }
         segment_oracle::compare_program(program_bindings, program_binding_nodes, nodes)?;
@@ -6011,11 +5990,9 @@ impl DeviceRuntime for CudaDeviceRuntime {
     fn prepare_terminal_u32_readbacks(
         &self,
         stream: &mut Self::Stream,
-        request: ferrum_interfaces::vnext::DeviceScalarU32ReadbackBatch<'_, Self::Buffer>,
-    ) -> Result<
-        Option<ferrum_interfaces::vnext::DevicePreparedTerminalReadback<Self::Command>>,
-        Self::Error,
-    > {
+        request: ferrum_runtime::DeviceScalarU32ReadbackBatch<'_, Self::Buffer>,
+    ) -> Result<Option<ferrum_runtime::DevicePreparedTerminalReadback<Self::Command>>, Self::Error>
+    {
         terminal_readback::prepare(self, stream, request)
     }
 
@@ -6122,7 +6099,7 @@ mod tests {
     };
     #[cfg(feature = "vllm-marlin")]
     use cudarc::driver::DevicePtrMut;
-    use ferrum_interfaces::vnext::DeviceCommandPhase;
+    use ferrum_runtime::DeviceCommandPhase;
 
     #[test]
     #[ignore = "requires an actual CUDA device"]

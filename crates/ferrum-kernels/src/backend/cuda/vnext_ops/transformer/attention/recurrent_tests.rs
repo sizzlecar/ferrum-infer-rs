@@ -2,7 +2,7 @@
 use super::super::test_support::Guarded;
 use super::*;
 use crate::backend::cuda::vnext_ops::cuda_vnext_runtime_config;
-use ferrum_interfaces::vnext::DeviceId;
+use ferrum_runtime::DeviceId;
 use ferrum_types::AttentionExecutionPolicy;
 use half::f16;
 fn assert_close(actual: &[f32], expected: &[f64], stage: &str) {

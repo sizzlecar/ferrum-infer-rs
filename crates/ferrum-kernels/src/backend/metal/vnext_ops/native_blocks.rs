@@ -1,7 +1,7 @@
 use std::ffi::c_void;
 use std::fmt::Write;
 
-use ferrum_interfaces::vnext::ElementType;
+use ferrum_runtime::ElementType;
 
 use metal::{
     CompileOptions, ComputeCommandEncoderRef, ComputePipelineState, Device, FunctionConstantValues,

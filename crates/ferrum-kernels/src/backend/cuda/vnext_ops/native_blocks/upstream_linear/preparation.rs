@@ -1,6 +1,6 @@
 //! Encoding-local metadata ownership. Both purposes validate the same wave;
 //! only a binding-only strict fallback can omit an unconsumed replay digest.
-use ferrum_interfaces::vnext::{
+use ferrum_runtime::{
     PreparedProjectionNumerics, PreparedUpstreamProjectionRoute, PreparedUpstreamProjectionWave,
     UpstreamNativePlanFacts, UpstreamProjectionWaveFacts,
 };

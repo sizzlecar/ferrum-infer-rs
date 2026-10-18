@@ -2,7 +2,7 @@
 
 use std::ffi::c_void;
 
-use ferrum_interfaces::vnext::{
+use ferrum_runtime::{
     DynamicStorageRequirement, ElementType, OperationProviderDescriptor, OperationResourceEstimate,
     OperationResourceEstimateRequest, PhysicalWeightLayout, ProviderWorkspaceRequirement,
     ProviderWorkspaceReusePolicy, ProviderWorkspaceScope, ProviderWorkspaceSizeFormula,

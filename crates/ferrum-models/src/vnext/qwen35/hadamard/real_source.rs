@@ -1,7 +1,7 @@
 //! Optional local-source validation; no device allocation or model inference.
 
 use super::*;
-use ferrum_interfaces::vnext::{ModelSourceKind, OriginalModelSource, OriginalModelSources};
+use ferrum_runtime::{ModelSourceKind, OriginalModelSource, OriginalModelSources};
 
 #[test]
 #[ignore = "requires local Hadamard GGUF and matching semantic/tokenizer source directories"]

@@ -16,15 +16,15 @@ use std::sync::{Arc, OnceLock};
 use parking_lot::{Mutex, MutexGuard};
 use tracing::debug;
 
-use ferrum_interfaces::{
-    adapter::AdapterExecutionSupport,
+use ferrum_execution::{
     model_executor::{
         AttentionType, DecodeInput, DecodeOutput, ExecutorCapabilities, ExecutorStatus,
         KvSlotCapacitySnapshot, KvSlotRequest, KvSlotReservation, LogitsReturnPolicy,
         MemoryRequirements, PrefillInput, PrefillOutput, UnifiedBatch,
     },
-    ModelExecutor, RecurrentStateSpec,
+    ModelExecutor,
 };
+use ferrum_interfaces::{adapter::AdapterExecutionSupport, RecurrentStateSpec};
 use ferrum_types::{DataType, FerrumError, ModelInfo, RequestId, Result, TokenId};
 
 use crate::common::DecoderOnlyLLM;
@@ -287,7 +287,7 @@ impl ModelExecutor for LlmExecutor {
         &self.info
     }
 
-    fn bound_resolved_sources(&self) -> Option<&ferrum_interfaces::vnext::ResolvedModelSources> {
+    fn bound_resolved_sources(&self) -> Option<&ferrum_runtime::ResolvedModelSources> {
         self.bound_sources
             .as_deref()
             .map(ProductionModelSourceBundle::resolved_sources)
@@ -644,8 +644,8 @@ impl ModelExecutor for LlmExecutor {
 
     async fn forward_verify(
         &self,
-        inputs: &[ferrum_interfaces::model_executor::DecodeInput],
-    ) -> Result<Vec<ferrum_interfaces::model_executor::DecodeOutput>> {
+        inputs: &[ferrum_execution::model_executor::DecodeInput],
+    ) -> Result<Vec<ferrum_execution::model_executor::DecodeOutput>> {
         if inputs.is_empty() {
             return Ok(Vec::new());
         }
@@ -730,7 +730,7 @@ impl ModelExecutor for LlmExecutor {
                 start_seq + i + 1,
                 cache_id.clone(),
             ));
-            outputs.push(ferrum_interfaces::model_executor::DecodeOutput::new(
+            outputs.push(ferrum_execution::model_executor::DecodeOutput::new(
                 logits_ref, handle,
             ));
         }
@@ -1175,9 +1175,10 @@ impl ModelExecutor for LlmExecutor {
                     .iter()
                     .map(|&i| batch.items[i].logits_policy.clone())
                     .collect();
-                if policies.iter().any(
-                    ferrum_interfaces::model_executor::LogitsReturnPolicy::requires_full_logits,
-                ) {
+                if policies
+                    .iter()
+                    .any(ferrum_execution::model_executor::LogitsReturnPolicy::requires_full_logits)
+                {
                     model.decode_batch_with_full_logits(&tuples, true)
                 } else {
                     model.decode_batch_with_logits_policy(&tuples, &policies)
@@ -1253,7 +1254,7 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
 
-    use ferrum_interfaces::model_executor::{DecodeInput, PrefillInput, UnifiedBatchItem};
+    use ferrum_execution::model_executor::{DecodeInput, PrefillInput, UnifiedBatchItem};
     use ferrum_interfaces::KvCacheHandle;
     use ferrum_testkit::MockTensor;
     use ferrum_types::{Device, ModelId, ModelType};
@@ -1454,14 +1455,12 @@ mod tests {
         fn unified_forward_with_logits_policy(
             &mut self,
             items: &[(String, Vec<u32>, usize, bool)],
-            policies: &[ferrum_interfaces::model_executor::LogitsReturnPolicy],
+            policies: &[ferrum_execution::model_executor::LogitsReturnPolicy],
         ) -> std::result::Result<Vec<Option<Vec<f32>>>, FerrumError> {
             self.calls.lock().unified_forward_policy_requires_full.push(
                 policies
                     .iter()
-                    .map(
-                        ferrum_interfaces::model_executor::LogitsReturnPolicy::requires_full_logits,
-                    )
+                    .map(ferrum_execution::model_executor::LogitsReturnPolicy::requires_full_logits)
                     .collect(),
             );
             self.unified_forward(items)
@@ -1914,7 +1913,7 @@ mod tests {
             pos_offset: 3,
             is_final_chunk: true,
             metadata: HashMap::new(),
-            logits_policy: ferrum_interfaces::model_executor::LogitsReturnPolicy::GreedyArgmax {
+            logits_policy: ferrum_execution::model_executor::LogitsReturnPolicy::GreedyArgmax {
                 token_mask: None,
                 repetition_penalty: None,
             },
@@ -1945,7 +1944,7 @@ mod tests {
             pos_offset: 0,
             is_final_chunk: true,
             metadata: HashMap::new(),
-            logits_policy: ferrum_interfaces::model_executor::LogitsReturnPolicy::GreedyArgmax {
+            logits_policy: ferrum_execution::model_executor::LogitsReturnPolicy::GreedyArgmax {
                 token_mask: None,
                 repetition_penalty: None,
             },
@@ -1967,7 +1966,7 @@ mod tests {
     fn unified_decode_forwards_mixed_fresh_prefill_and_decode_to_unified_model() {
         let calls = Arc::new(Mutex::new(RecordingCalls::default()));
         let executor = recording_executor(calls.clone());
-        let greedy = ferrum_interfaces::model_executor::LogitsReturnPolicy::GreedyArgmax {
+        let greedy = ferrum_execution::model_executor::LogitsReturnPolicy::GreedyArgmax {
             token_mask: None,
             repetition_penalty: None,
         };
@@ -2024,7 +2023,7 @@ mod tests {
             test_kv_handle("decode-cache", 3),
         )
         .with_logits_policy(
-            ferrum_interfaces::model_executor::LogitsReturnPolicy::GreedyArgmax {
+            ferrum_execution::model_executor::LogitsReturnPolicy::GreedyArgmax {
                 token_mask: None,
                 repetition_penalty: None,
             },

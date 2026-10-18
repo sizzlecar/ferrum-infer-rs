@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 use std::ffi::c_void;
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use ferrum_interfaces::vnext::{
+use ferrum_runtime::{
     causal_paged_attention_contract, causal_paged_attention_f32_master_contract,
     causal_paged_attention_f32_master_int8_kv_contract, causal_paged_attention_int8_kv_contract,
     AttributeId, BatchedOperationInvocation, CheckpointBoundaryConstraint,
@@ -2811,7 +2811,7 @@ fn align_up(bytes: u64, alignment: u64) -> Result<u64, String> {
 #[cfg(test)]
 mod shape_tests {
     use super::*;
-    use ferrum_interfaces::vnext::CanonicalRational;
+    use ferrum_runtime::CanonicalRational;
 
     fn qwen35_4b_attributes() -> BTreeMap<AttributeId, SemanticValue> {
         BTreeMap::from([

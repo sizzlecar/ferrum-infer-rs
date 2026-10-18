@@ -1,7 +1,7 @@
 //! Explicit dual-representation RN-F16 FFN. Physical M=1..8 uses fragment MMA;
 //! larger M keeps the original dense GemmEx sequence and every F16 stage point.
 use super::*;
-use ferrum_interfaces::vnext::{
+use ferrum_runtime::{
     dense_swiglu_gguf_rn_f16_fragment_m1to8_contract, CheckpointBoundaryConstraint,
     CheckpointInputDependency, CheckpointPartitionNumerics, ProviderCheckpointCapability,
     ProviderCheckpointContract, RnF16FragmentPlanV1, RnF16FragmentSourceFormatV1,
@@ -80,8 +80,7 @@ impl CudaRnFragmentSwiGluProvider {
             .into_iter()
             .map(|format| {
                 let encoding = RnF16FragmentPlanV1::new(format, 1, 256)?.packed_encoding();
-                let ferrum_interfaces::vnext::WeightEncoding::BlockQuantized(spec) = encoding
-                else {
+                let ferrum_runtime::WeightEncoding::BlockQuantized(spec) = encoding else {
                     unreachable!()
                 };
                 Ok(spec.format_id)

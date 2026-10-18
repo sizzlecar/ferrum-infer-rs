@@ -1,7 +1,7 @@
 //! Real Engine iteration/admission/restore publication with a CPU-only executor.
 //! Native numerical copy correctness remains a backend/runtime test obligation.
 use super::*;
-use ferrum_interfaces::model_executor::{
+use ferrum_execution::model_executor::{
     PlanRuntimePrefixRestoreInput, PlanRuntimePrefixRestoreOutcome, PlanRuntimePrefixRestoreOutput,
     PrefixCaptureBoundary, PrefixCaptureLease, PrefixCaptureRequest, PrefixCaptureStatus,
 };
@@ -78,7 +78,7 @@ impl CaptureState {
     pub(super) fn boundary(
         &self,
         input: PrefixCaptureBoundary<'_>,
-    ) -> Option<ferrum_interfaces::model_executor::PrefixCapturePlan> {
+    ) -> Option<ferrum_execution::model_executor::PrefixCapturePlan> {
         let boundary = input
             .follower_prompt_tokens
             .iter()
@@ -87,9 +87,9 @@ impl CaptureState {
             .map(|length| length.saturating_sub(1))
             .fold(input.common_prefix_tokens, usize::min);
         (boundary > input.processed_tokens && !input.follower_prompt_tokens.is_empty()).then_some(
-            ferrum_interfaces::model_executor::PrefixCapturePlan {
+            ferrum_execution::model_executor::PrefixCapturePlan {
                 boundary,
-                span: ferrum_interfaces::vnext::CheckpointTokenSpanConstraint::any_positive(),
+                span: ferrum_runtime::CheckpointTokenSpanConstraint::any_positive(),
             },
         )
     }

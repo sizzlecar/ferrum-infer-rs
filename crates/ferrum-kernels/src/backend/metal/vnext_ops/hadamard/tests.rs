@@ -1,7 +1,7 @@
 use super::*;
 use std::num::NonZeroU32;
 
-use ferrum_interfaces::vnext::{
+use ferrum_runtime::{
     GroupedFeatureTranspose as ContractTranspose, HadamardApplication, HadamardSigns,
     HadamardTransformSpec, PhysicalWeightComponentBinding, WeightId,
 };

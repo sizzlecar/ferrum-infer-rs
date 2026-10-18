@@ -16,7 +16,7 @@ use std::sync::{Arc, OnceLock};
 use cudarc::cublas::CudaBlas;
 use cudarc::driver::sys;
 use cudarc::driver::{CudaContext, CudaStream};
-use ferrum_interfaces::vnext::{
+use ferrum_runtime::{
     DeviceCommandPhase, DeviceComputePathRequirement, DeviceEnqueueStage,
     DeviceReplayedLogicalCommandAttribution, DeviceReusableAddressScope,
     DeviceReusableExecutionCapture, DeviceReusableExecutionEntryIdentity,

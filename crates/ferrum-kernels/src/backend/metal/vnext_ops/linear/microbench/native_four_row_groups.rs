@@ -6,7 +6,7 @@
 
 use super::*;
 use crate::backend::metal::vnext_ops::MetalVNextComposition;
-use ferrum_interfaces::vnext::{BufferRequest, BufferUsage, DeviceId, ResourceId};
+use ferrum_runtime::{BufferRequest, BufferUsage, DeviceId, ResourceId};
 use metal::objc::rc::autoreleasepool;
 
 const ROWS: usize = 8;

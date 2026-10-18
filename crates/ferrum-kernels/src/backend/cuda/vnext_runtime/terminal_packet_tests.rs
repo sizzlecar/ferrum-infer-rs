@@ -5,7 +5,7 @@
 use super::*;
 use cudarc::driver::{CudaFunction, LaunchConfig, PushKernelArg};
 use cudarc::nvrtc::Ptx;
-use ferrum_interfaces::vnext::{BufferUsage, ResourceId};
+use ferrum_runtime::{BufferUsage, ResourceId};
 use serde_json::json;
 use std::sync::Weak;
 

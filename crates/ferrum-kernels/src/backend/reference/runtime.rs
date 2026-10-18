@@ -5,7 +5,7 @@ use std::ops::Range;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use ferrum_interfaces::vnext::{
+use ferrum_runtime::{
     BufferDescriptor, CapabilityId, CopyRegion, DefinitelyNotSubmitted, DeviceAllocationPermit,
     DeviceBatchingForm, DeviceBufferRetention, DeviceClass, DeviceCommandBatch,
     DeviceCommandLogicalWork, DeviceCommandPhase, DeviceComputePathRequirement, DeviceDescriptor,
@@ -939,7 +939,7 @@ fn validate_submission_requirements(
 mod tests {
     use super::*;
     use crate::backend::reference::composition::reference_vnext_runtime_config;
-    use ferrum_interfaces::vnext::{BufferUsage, DeviceId, ResourceId};
+    use ferrum_runtime::{BufferUsage, DeviceId, ResourceId};
 
     fn config() -> ReferenceDeviceRuntimeConfig {
         reference_vnext_runtime_config(

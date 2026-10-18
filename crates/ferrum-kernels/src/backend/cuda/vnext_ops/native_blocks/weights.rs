@@ -2,7 +2,7 @@
 
 use std::collections::BTreeMap;
 
-use ferrum_interfaces::vnext::{
+use ferrum_runtime::{
     ElementType, HadamardSigns, HadamardTransformSpec, OperationInvocation, PhysicalStorageLayout,
     PhysicalWeightLayout, PhysicalWeightPadding, ResolvedValueBinding, ResolvedWeightBinding,
     ResolvedWeightComponentLayout, WeightEncoding, WeightId,
@@ -80,9 +80,7 @@ pub(in crate::backend::cuda::vnext_ops) fn key(
                 key = key.bytes(signs.component_id.as_str().as_bytes());
             }
             match spec.application {
-                ferrum_interfaces::vnext::HadamardApplication::BeforeMatmul {
-                    input_permutation,
-                } => {
+                ferrum_runtime::HadamardApplication::BeforeMatmul { input_permutation } => {
                     key = key.u32(1);
                     if let Some(p) = input_permutation {
                         key = key
@@ -93,7 +91,7 @@ pub(in crate::backend::cuda::vnext_ops) fn key(
                         key = key.u64(0).u64(0).u64(0);
                     }
                 }
-                ferrum_interfaces::vnext::HadamardApplication::AfterEmbeddingLookup => {
+                ferrum_runtime::HadamardApplication::AfterEmbeddingLookup => {
                     key = key.u32(2);
                 }
             }

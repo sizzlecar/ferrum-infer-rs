@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use ferrum_interfaces::vnext::{
+use ferrum_runtime::{
     AttributeId, CanonicalRational, ContractVersion, ElementType, FamilyNumericalProfiles,
     ModelFamilyId, ModelProgram, NodeId, NumericalExecutionProfile, OperationId, ProgramBlock,
     ProgramNode, ProgramNodeWorkSpec, ProgramTensorSpec, ProgramValueId, ResolvedTensorLayout,
@@ -415,7 +415,7 @@ fn attribute(
 #[cfg(test)]
 mod kv_storage_tests {
     use super::*;
-    use ferrum_interfaces::vnext::{KvStorageFormat, NumericalExecutionPolicy};
+    use ferrum_runtime::{KvStorageFormat, NumericalExecutionPolicy};
 
     #[test]
     fn int8_kv_rejects_unimplemented_vnorm_hybrid_attention() {

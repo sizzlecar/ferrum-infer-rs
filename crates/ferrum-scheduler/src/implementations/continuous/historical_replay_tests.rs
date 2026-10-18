@@ -1,7 +1,7 @@
 use super::*;
 
-use ferrum_interfaces::model_executor::ExecutorPrefillAdmissionReceipt;
-use ferrum_interfaces::vnext::{CapacityDomainId, DeferredAction};
+use ferrum_execution::model_executor::ExecutorPrefillAdmissionReceipt;
+use ferrum_runtime::{CapacityDomainId, DeferredAction};
 use ferrum_types::{ModelId, SamplingParams};
 use serde::Deserialize;
 

@@ -7,8 +7,8 @@ use cudarc::cublas::CudaBlas;
 use cudarc::driver::{CudaFunction, CudaStream, LaunchConfig, PushKernelArg};
 use cudarc::nvrtc::Ptx;
 #[cfg(feature = "vllm-marlin")]
-use ferrum_interfaces::vnext::PhysicalWeightLayout;
-use ferrum_interfaces::vnext::{
+use ferrum_runtime::PhysicalWeightLayout;
+use ferrum_runtime::{
     AttributeId, BatchedOperationInvocation, CapabilityId, CheckpointBoundaryConstraint,
     CheckpointCompletedInputCapture, CheckpointInputDependency, CheckpointPartitionNumerics,
     ContractVersion, DeviceBatchingForm, DeviceReusableExecutionTopologyFingerprint, DeviceRuntime,
@@ -70,7 +70,7 @@ pub(in crate::backend::cuda::vnext_ops) mod segment_bindings;
 use super::q8act_attention::PreparedAttentionProjections;
 use crate::backend::cuda::vnext_ops::native_blocks::q8act::Q8ActKernels;
 use crate::backend::cuda::vnext_ops::native_blocks::{weights, CudaNativeBlockKernels};
-use ferrum_interfaces::vnext::{ProjectionRole, Q8ActAttentionProfile};
+use ferrum_runtime::{ProjectionRole, Q8ActAttentionProfile};
 use precision::AttentionPrecision;
 const PREPARE_FUNCTION: &str =
     "linear_attention_prepare_varlen_packed_qkvzba_f16_params_f32_state_f16_z_f16_indirect";
@@ -353,7 +353,7 @@ impl CudaGatedDeltaRecurrentAttentionProvider {
                 .fingerprint()
                 .map_err(contract_error)?,
             provider_fingerprint,
-            ferrum_interfaces::vnext::ProviderExecutionSemantics::bitwise_eager_and_replay(),
+            ferrum_runtime::ProviderExecutionSemantics::bitwise_eager_and_replay(),
             contract.descriptor().version,
             runtime.descriptor().id.clone(),
             provider_capabilities,
@@ -623,11 +623,11 @@ impl OperationResourceEstimator for CudaGatedDeltaRecurrentAttentionProvider {
 }
 
 impl OperationProvider<CudaDeviceRuntime> for CudaGatedDeltaRecurrentAttentionProvider {
-    fn reusable_binding_resources(&self) -> ferrum_interfaces::vnext::ReusableBindingResources {
+    fn reusable_binding_resources(&self) -> ferrum_runtime::ReusableBindingResources {
         if self.precision.upstream() {
-            ferrum_interfaces::vnext::ReusableBindingResources::All
+            ferrum_runtime::ReusableBindingResources::All
         } else {
-            ferrum_interfaces::vnext::ReusableBindingResources::RequestStateAndBinding
+            ferrum_runtime::ReusableBindingResources::RequestStateAndBinding
         }
     }
 
@@ -698,7 +698,7 @@ impl OperationProvider<CudaDeviceRuntime> for CudaGatedDeltaRecurrentAttentionPr
     ) -> Result<
         (
             EncodedDeviceOperation<CudaDeviceCommand>,
-            Option<ferrum_interfaces::vnext::SegmentBindingDeclaration>,
+            Option<ferrum_runtime::SegmentBindingDeclaration>,
         ),
         OperationFailure,
     > {
@@ -1653,7 +1653,7 @@ fn encode_attention(
     #[cfg(feature = "vllm-marlin")] projection_runtime: MarlinProjectionRuntime,
     invocation: BatchedOperationInvocation<'_, CudaDeviceBuffer>,
     target: EncodingTarget,
-    segment_declaration: Option<&mut Option<ferrum_interfaces::vnext::SegmentBindingDeclaration>>,
+    segment_declaration: Option<&mut Option<ferrum_runtime::SegmentBindingDeclaration>>,
 ) -> Result<Encoding<CudaDeviceCommand>, String> {
     let mut segment_validations = segment_declaration.as_ref().map(|_| Vec::new());
     if invocation.participants().is_empty()
@@ -4300,7 +4300,7 @@ mod recurrent_tests;
 mod tests {
     use super::*;
     #[cfg(feature = "vllm-marlin")]
-    use ferrum_interfaces::vnext::{CompositeWeightPart, WeightId};
+    use ferrum_runtime::{CompositeWeightPart, WeightId};
 
     pub(super) fn test_shape() -> AttentionShape {
         AttentionShape {

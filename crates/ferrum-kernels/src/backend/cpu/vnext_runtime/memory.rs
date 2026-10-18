@@ -4,7 +4,7 @@ use std::ptr::NonNull;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use ferrum_interfaces::vnext::{BufferDescriptor, DeviceBufferRetention, ElementType};
+use ferrum_runtime::{BufferDescriptor, DeviceBufferRetention, ElementType};
 
 use super::CpuRuntimeError;
 

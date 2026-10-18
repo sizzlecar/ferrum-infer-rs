@@ -3,8 +3,8 @@
 
 use std::collections::BTreeSet;
 
-use ferrum_interfaces::model_executor::TypedSequenceStateMemory;
-use ferrum_interfaces::vnext::{KvStateStorage, StateCapacityDemand, StateLifetime, StateSpec};
+use ferrum_execution::model_executor::TypedSequenceStateMemory;
+use ferrum_runtime::{KvStateStorage, StateCapacityDemand, StateLifetime, StateSpec};
 use ferrum_types::{FerrumError, Result};
 
 pub(super) fn logical_sequence_state_memory(
@@ -56,7 +56,7 @@ pub(super) fn logical_sequence_state_memory(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ferrum_interfaces::vnext::{
+    use ferrum_runtime::{
         ElementType, ProgramTensorSpec, ProgramValueId, ResolvedTensorLayout,
         StateCheckpointCapability, StateId, StateInitialization,
     };

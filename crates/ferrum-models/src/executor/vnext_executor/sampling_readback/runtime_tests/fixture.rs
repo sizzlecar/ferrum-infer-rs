@@ -1,8 +1,8 @@
 //! A tiny language program using the production compiler, providers and terminal worker.
 use super::*;
 use crate::vnext::{CausalLanguageModelDescriptor, ProductionModelSourceBundle};
-use ferrum_interfaces::vnext::*;
 use ferrum_quantization::SafetensorsArchive;
+use ferrum_runtime::*;
 use half::f16;
 use safetensors::tensor::{serialize_to_file, Dtype, TensorView};
 use serde_json::{json, Value};

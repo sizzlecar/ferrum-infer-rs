@@ -8,14 +8,14 @@ use std::borrow::Cow;
 use std::path::Path;
 
 #[cfg(test)]
-use ferrum_interfaces::vnext::QuantizationGrouping;
-use ferrum_interfaces::vnext::{
+use ferrum_kernels::marlin_repack::repack_gptq_to_marlin;
+use ferrum_kernels::marlin_repack::{repack_gptq_to_marlin_bytes_into, repack_scales_to_marlin};
+#[cfg(test)]
+use ferrum_runtime::QuantizationGrouping;
+use ferrum_runtime::{
     ElementType, QuantizationSpec, VNextError, WeightComponentPayload, WeightComponentRole,
     WeightComponentSource, WeightComponentSpec, WeightEncoding,
 };
-#[cfg(test)]
-use ferrum_kernels::marlin_repack::repack_gptq_to_marlin;
-use ferrum_kernels::marlin_repack::{repack_gptq_to_marlin_bytes_into, repack_scales_to_marlin};
 use ferrum_types::Result;
 use half::f16;
 use safetensors::Dtype;
@@ -701,7 +701,7 @@ fn invalid_component(component: &WeightComponentSpec, reason: impl AsRef<str>) -
 mod tests {
     use std::collections::BTreeMap;
 
-    use ferrum_interfaces::vnext::{QuantizationFormatId, QuantizationPacking, WeightId};
+    use ferrum_runtime::{QuantizationFormatId, QuantizationPacking, WeightId};
     use safetensors::tensor::{serialize_to_file, TensorView};
     use tempfile::tempdir;
 

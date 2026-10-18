@@ -8,7 +8,7 @@ use crate::backend::cuda::vnext_replay::CudaCommandReplayKeyBuilder;
 use crate::backend::cuda::vnext_runtime::{
     CudaBufferRegion, CudaDeviceBuffer, CudaDeviceRuntimeError,
 };
-use ferrum_interfaces::vnext::{
+use ferrum_runtime::{
     BatchedOperationInvocation, PreparedProjection, PreparedProjectionNumerics, ProjectionRole,
     Q8ActAttentionProfile, Q8ActSwiGluProfile, ResolvedValueBinding, ResolvedValueRole,
 };
@@ -115,7 +115,7 @@ impl<'a> PreparedAttentionProjections<'a> {
     }
     pub fn persistent_requirement(
         &self,
-    ) -> Result<Option<ferrum_interfaces::vnext::ProviderWorkspaceRequirement>, String> {
+    ) -> Result<Option<ferrum_runtime::ProviderWorkspaceRequirement>, String> {
         self.upstream_persistent_requirement()
     }
     pub fn fixed_bytes(&self) -> u64 {

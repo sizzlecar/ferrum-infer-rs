@@ -148,9 +148,9 @@ pub(super) fn prepare_regions(
 pub(super) fn prepare(
     runtime: &CudaDeviceRuntime,
     stream: &mut CudaDeviceStream,
-    request: ferrum_interfaces::vnext::DeviceScalarU32ReadbackBatch<'_, CudaDeviceBuffer>,
+    request: ferrum_runtime::DeviceScalarU32ReadbackBatch<'_, CudaDeviceBuffer>,
 ) -> Result<
-    Option<ferrum_interfaces::vnext::DevicePreparedTerminalReadback<CudaDeviceCommand>>,
+    Option<ferrum_runtime::DevicePreparedTerminalReadback<CudaDeviceCommand>>,
     CudaDeviceRuntimeError,
 > {
     let mut regions = Vec::with_capacity(request.sources().len());
@@ -179,7 +179,7 @@ pub(super) fn prepare(
     }
     Ok(
         prepare_regions(runtime, stream, regions)?.map(|(command, payload)| {
-            ferrum_interfaces::vnext::DevicePreparedTerminalReadback::new(command, payload)
+            ferrum_runtime::DevicePreparedTerminalReadback::new(command, payload)
         }),
     )
 }

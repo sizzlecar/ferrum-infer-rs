@@ -109,7 +109,7 @@ impl EngineInner {
         let prefill_output = if let Some(csz) = chunk_size {
             let mut current_kv = kv_handle;
             let mut current_recurrent_state = initial_recurrent_state.clone();
-            let mut final_output: Option<ferrum_interfaces::model_executor::PrefillOutput> = None;
+            let mut final_output: Option<ferrum_execution::model_executor::PrefillOutput> = None;
             let mut processed = 0usize;
             while processed < num_tokens {
                 let end = (processed + csz).min(num_tokens);
@@ -125,7 +125,7 @@ impl EngineInner {
                         return Err(e);
                     }
                 };
-                let mut input = ferrum_interfaces::model_executor::PrefillInput::new(chunk_tensor)
+                let mut input = ferrum_execution::model_executor::PrefillInput::new(chunk_tensor)
                     .with_kv_cache(current_kv.clone())
                     .with_metadata(request_metadata.clone());
                 if let Some(state) = current_recurrent_state.clone() {
@@ -175,7 +175,7 @@ impl EngineInner {
                     }
                 }
             };
-            let prefill_input = ferrum_interfaces::model_executor::PrefillInput::new(input_tensor)
+            let prefill_input = ferrum_execution::model_executor::PrefillInput::new(input_tensor)
                 .with_kv_cache(kv_handle)
                 .with_metadata(request_metadata);
             let prefill_input = if let Some(state) = initial_recurrent_state.clone() {
@@ -272,9 +272,9 @@ impl EngineInner {
     fn plan_prompt_tail_prefill_chunk(
         &self,
         request_id: &RequestId,
-        chunk: ferrum_interfaces::model_executor::PrefillChunk,
+        chunk: ferrum_execution::model_executor::PrefillChunk,
         original_prompt: bool,
-    ) -> Result<ferrum_interfaces::model_executor::PrefillChunk> {
+    ) -> Result<ferrum_execution::model_executor::PrefillChunk> {
         if !original_prompt {
             return Ok(chunk);
         }
@@ -293,7 +293,7 @@ impl EngineInner {
         if plan.boundary == chunk.end() {
             return Ok(chunk);
         }
-        let planned = ferrum_interfaces::model_executor::PrefillChunk::new(
+        let planned = ferrum_execution::model_executor::PrefillChunk::new(
             chunk.tokens_processed(),
             span.expect("validated positive capture span"),
             chunk.total_prompt_tokens(),
@@ -335,7 +335,7 @@ impl EngineInner {
         &self,
         scheduled: &ferrum_interfaces::scheduler::ScheduledRequest,
     ) -> Result<Option<PlanRuntimePrefillInput>> {
-        use ferrum_interfaces::model_executor::PrefillChunk;
+        use ferrum_execution::model_executor::PrefillChunk;
 
         let request_id = &scheduled.request.id;
 
@@ -529,8 +529,8 @@ impl EngineInner {
         &self,
         request_id: &RequestId,
         input_token_count: usize,
-        planned_chunk: ferrum_interfaces::model_executor::PrefillChunk,
-        completion: ferrum_interfaces::model_executor::PlanRuntimePrefillCompletion,
+        planned_chunk: ferrum_execution::model_executor::PrefillChunk,
+        completion: ferrum_execution::model_executor::PlanRuntimePrefillCompletion,
     ) -> Result<()> {
         if let Err(error) = completion.validate_for(
             request_id,
@@ -681,7 +681,7 @@ impl EngineInner {
     fn trace_plan_runtime_prefill_completion(
         &self,
         request_id: &RequestId,
-        chunk: ferrum_interfaces::model_executor::PrefillChunk,
+        chunk: ferrum_execution::model_executor::PrefillChunk,
     ) {
         if self.scheduler_trace_jsonl.is_none() {
             return;
@@ -717,7 +717,7 @@ impl EngineInner {
 
     fn discard_plan_runtime_prefill_completion(
         &self,
-        completion: ferrum_interfaces::model_executor::PlanRuntimePrefillCompletion,
+        completion: ferrum_execution::model_executor::PlanRuntimePrefillCompletion,
     ) -> Result<()> {
         let (output, _, _, _) = completion.into_parts();
         let (authority, _) = output.into_parts();
@@ -727,7 +727,7 @@ impl EngineInner {
     pub(super) fn discard_plan_runtime_prefill_completions(
         &self,
         completions: impl IntoIterator<
-            Item = ferrum_interfaces::model_executor::PlanRuntimePrefillCompletion,
+            Item = ferrum_execution::model_executor::PlanRuntimePrefillCompletion,
         >,
     ) -> Result<()> {
         let mut failures = Vec::new();
@@ -755,7 +755,7 @@ impl EngineInner {
         &self,
         scheduled: &[&ferrum_interfaces::scheduler::ScheduledRequest],
     ) -> Result<PlanRuntimeBatchPrefillDisposition> {
-        use ferrum_interfaces::model_executor::PrefillChunk;
+        use ferrum_execution::model_executor::PrefillChunk;
 
         struct Work {
             request_id: RequestId,
@@ -949,7 +949,7 @@ impl EngineInner {
     /// multi-call semantics that the batched path doesn't model yet.
     /// Phase 2 will lift this restriction.
     pub(super) async fn run_batch_prefill(&self, request_ids: &[RequestId]) -> Result<()> {
-        use ferrum_interfaces::model_executor::PrefillInput;
+        use ferrum_execution::model_executor::PrefillInput;
 
         if request_ids.is_empty() {
             return Ok(());

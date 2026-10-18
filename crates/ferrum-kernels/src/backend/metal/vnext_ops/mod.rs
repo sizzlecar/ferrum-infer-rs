@@ -3,7 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
-use ferrum_interfaces::vnext::{
+use ferrum_runtime::{
     causal_paged_attention_contract, causal_paged_attention_f32_master_contract,
     causal_paged_attention_f32_master_int8_kv_contract, causal_paged_attention_int8_kv_contract,
     dense_linear_contract, dense_swiglu_contract, gated_delta_recurrent_attention_contract,
@@ -400,7 +400,7 @@ pub(crate) fn provider_descriptor(
             .fingerprint()
             .map_err(contract_error)?,
         provider_fingerprint,
-        ferrum_interfaces::vnext::ProviderExecutionSemantics::bitwise_eager_only(),
+        ferrum_runtime::ProviderExecutionSemantics::bitwise_eager_only(),
         contract.descriptor().version,
         runtime.descriptor().id.clone(),
         BTreeSet::from([capability]),
@@ -815,7 +815,7 @@ pub(crate) fn implementation_fingerprint(parts: &[&[u8]]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ferrum_interfaces::vnext::{
+    use ferrum_runtime::{
         OperationId, CAUSAL_PAGED_ATTENTION_F32_MASTER_OPERATION_ID,
         CAUSAL_PAGED_ATTENTION_OPERATION_ID, DENSE_LINEAR_OPERATION_ID, DENSE_SWIGLU_OPERATION_ID,
         GATED_DELTA_RECURRENT_ATTENTION_F32_MASTER_OPERATION_ID,
@@ -861,8 +861,8 @@ mod tests {
             LAST_TOKEN_MASKED_ARGMAX_F32_OPERATION_ID,
             GATED_DELTA_RECURRENT_ATTENTION_F32_MASTER_OPERATION_ID,
             CAUSAL_PAGED_ATTENTION_F32_MASTER_OPERATION_ID,
-            ferrum_interfaces::vnext::CAUSAL_PAGED_ATTENTION_INT8_KV_OPERATION_ID,
-            ferrum_interfaces::vnext::CAUSAL_PAGED_ATTENTION_F32_MASTER_INT8_KV_OPERATION_ID,
+            ferrum_runtime::CAUSAL_PAGED_ATTENTION_INT8_KV_OPERATION_ID,
+            ferrum_runtime::CAUSAL_PAGED_ATTENTION_F32_MASTER_INT8_KV_OPERATION_ID,
         ] {
             assert_eq!(
                 composition

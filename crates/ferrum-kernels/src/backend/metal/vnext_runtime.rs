@@ -19,7 +19,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::Instant;
 
-use ferrum_interfaces::vnext::{
+use ferrum_runtime::{
     BufferDescriptor, BufferRequest, BufferUsage, CapabilityId, CopyRegion, DefinitelyNotSubmitted,
     DeviceBatchingForm, DeviceBufferRetention, DeviceClass, DeviceCommandBatch,
     DeviceCommandLogicalWork, DeviceCommandPhase, DeviceComputePathRequirement, DeviceDescriptor,
@@ -2325,7 +2325,7 @@ impl DeviceRuntime for MetalDeviceRuntime {
 
     fn allocate(
         &self,
-        permit: ferrum_interfaces::vnext::DeviceAllocationPermit<'_>,
+        permit: ferrum_runtime::DeviceAllocationPermit<'_>,
     ) -> Result<Self::Buffer, Self::Error> {
         self.allocate_request(permit.into_request())
     }
@@ -2706,7 +2706,7 @@ mod counter_diagnostic;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ferrum_interfaces::vnext::{
+    use ferrum_runtime::{
         BufferUsage, DynamicStorageAllocator, DynamicStorageView, ResourceId, StableHostMemory,
         WeightComponentRole, WeightComponentSpec, WeightEncoding, WeightId,
     };

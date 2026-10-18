@@ -3,7 +3,7 @@
 use super::super::test_support::Guarded;
 use super::*;
 use crate::backend::cuda::vnext_ops::cuda_vnext_runtime_config;
-use ferrum_interfaces::vnext::DeviceId;
+use ferrum_runtime::DeviceId;
 use half::f16;
 
 fn shape(width: u64) -> CausalAttentionShape {
@@ -107,9 +107,8 @@ fn int8_kv_geometry_counts_independent_scales_and_rejects_native() {
             .cloned()
             .collect::<std::collections::BTreeSet<_>>(),
         std::collections::BTreeSet::from([
-            ferrum_interfaces::vnext::CAUSAL_PAGED_ATTENTION_INT8_KV_OPERATION_ID.to_owned(),
-            ferrum_interfaces::vnext::CAUSAL_PAGED_ATTENTION_F32_MASTER_INT8_KV_OPERATION_ID
-                .to_owned(),
+            ferrum_runtime::CAUSAL_PAGED_ATTENTION_INT8_KV_OPERATION_ID.to_owned(),
+            ferrum_runtime::CAUSAL_PAGED_ATTENTION_F32_MASTER_INT8_KV_OPERATION_ID.to_owned(),
         ])
     );
     let shape = shape(128);

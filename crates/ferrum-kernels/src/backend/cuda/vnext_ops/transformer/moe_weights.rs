@@ -5,7 +5,7 @@
 
 use std::collections::BTreeMap;
 
-use ferrum_interfaces::vnext::{
+use ferrum_runtime::{
     ElementType, OperationInvocation, PhysicalStorageLayout, PhysicalWeightLayout,
     PhysicalWeightPadding, QuantizationGrouping, QuantizationPacking, ResolvedValueBinding,
     ResolvedWeightBinding, ResolvedWeightComponentLayout, WeightComponentRole, WeightEncoding,
@@ -1240,7 +1240,7 @@ fn expert_stride_bytes(label: &str, length_bytes: u64, expert_count: u64) -> Res
 fn retain_component_region(
     participant: &OperationInvocation<'_, CudaDeviceBuffer>,
     component_id: &WeightId,
-    stored: &ferrum_interfaces::vnext::ResolvedStorageComponent,
+    stored: &ferrum_runtime::ResolvedStorageComponent,
     expected_element_type: ElementType,
     expected_length_bytes: u64,
     expert_stride_bytes: u64,
@@ -1324,7 +1324,7 @@ fn validate_region_alignment(
 mod tests {
     use super::*;
     use crate::marlin_fp8_materializer::MARLIN_FP8_WEIGHT_FORMAT_ID;
-    use ferrum_interfaces::vnext::{
+    use ferrum_runtime::{
         ContractVersion, PhysicalWeightComponentBinding, QuantizationFormatId, QuantizationSpec,
         WeightComponentSpec, WeightFormatId, WeightLayoutId, WeightSchema, WeightTensorSpec,
     };

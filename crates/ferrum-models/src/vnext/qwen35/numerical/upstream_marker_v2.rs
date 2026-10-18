@@ -1,7 +1,7 @@
 //! Explicit upstream projection policy shared by run/serve family lowering.
 //! Source eligibility is a declaration, not backend or output-quality approval.
 use super::*;
-use ferrum_interfaces::vnext::UpstreamMarkerV2Profile;
+use ferrum_runtime::UpstreamMarkerV2Profile;
 
 #[cfg(test)]
 mod tests;

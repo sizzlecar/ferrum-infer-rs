@@ -7,7 +7,7 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use ferrum_interfaces::vnext::{
+use ferrum_runtime::{
     BufferDescriptor, CopyRegion, DefinitelyNotSubmitted, DeviceAllocationPermit, DeviceClass,
     DeviceCommandBatch, DeviceCommandPhase, DeviceComputePathRequirement, DeviceDescriptor,
     DeviceErrorReport, DeviceRuntime, DeviceSubmissionAttribution, DeviceTerminal,

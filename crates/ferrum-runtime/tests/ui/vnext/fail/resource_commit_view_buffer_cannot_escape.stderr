@@ -1,0 +1,7 @@
+error: lifetime may not live long enough
+ --> tests/ui/vnext/fail/resource_commit_view_buffer_cannot_escape.rs:4:5
+  |
+3 | fn escape<'a>(view: &'a ResourceCommitView<'a, Vec<u8>>) -> &'static Vec<u8> {
+  |           -- lifetime `'a` defined here
+4 |     view.buffer()
+  |     ^^^^^^^^^^^^^ returning this value requires that `'a` must outlive `'static`

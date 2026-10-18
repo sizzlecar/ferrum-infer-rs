@@ -10,7 +10,7 @@ use crate::backend::cuda::vnext_ops::native_blocks::{
 use crate::backend::cuda::vnext_runtime::CudaDeviceCommand;
 use crate::native_ops::upstream_linear::DeviceSpan;
 use cudarc::driver::{CudaContext, CudaStream};
-use ferrum_interfaces::vnext::{
+use ferrum_runtime::{
     CompositeNumericalArithmetic, DynamicStorageRequirement, ElementType,
     EncodedRetainedPlanDependency, OperationInvocation, ProviderWorkspaceRequirement,
     ProviderWorkspaceReusePolicy, ProviderWorkspaceScope, UpstreamMarkerV2Profile,
@@ -85,7 +85,7 @@ impl Runtime {
         if invocation.participant_token_ranges().len() != invocation.participants().len() {
             return Err("hybrid binding participant coverage mismatch".into());
         }
-        if !ferrum_interfaces::vnext::G32MmqPrefillPolicy::g32_partition(
+        if !ferrum_runtime::G32MmqPrefillPolicy::g32_partition(
             invocation.work_shape().immediate_tokens(),
             invocation
                 .participant_token_ranges()

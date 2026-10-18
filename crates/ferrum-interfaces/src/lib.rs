@@ -1,11 +1,9 @@
 //! Core interface definitions for the Ferrum inference framework
 //!
-//! This crate carries the stable, GPU-free trait contracts shared across
-//! the workspace: model execution, scheduling, KV cache management,
-//! tokenization, sampling, and the lifecycle/modality engine traits.
-//! Hardware backends live in `ferrum-kernels` (the `Backend<B>` trait
-//! and its supertraits); only types that compile without GPU features
-//! belong here.
+//! Foundation ports for scheduling, KV cache management, tokenization,
+//! sampling, tensors, and inference entrypoints. Runtime authorization lives
+//! in `ferrum-runtime`; product execution contracts live in `ferrum-execution`.
+//! This crate does not depend on either upper layer or concrete backends.
 
 #![allow(async_fn_in_trait)]
 
@@ -16,18 +14,11 @@ pub mod adapter;
 pub mod engine;
 pub mod kv_cache;
 pub mod kv_dtype;
-pub mod model_executor;
 pub mod recurrent_state;
 pub mod sampler;
 pub mod scheduler;
 pub mod tensor;
 pub mod tokenizer;
-#[allow(
-    dead_code,
-    unused_imports,
-    reason = "reviewed vNext contracts stay isolated and byte-stable until the product runtime migration"
-)]
-pub mod vnext;
 
 // Re-export core traits and important types
 pub use engine::InferenceEngine;
@@ -35,16 +26,6 @@ pub use kv_cache::{
     AllocationRequest, BlockTable, CacheHandleStats, KvCacheHandle, KvCacheManager,
 };
 pub use kv_dtype::{KvBf16, KvDtypeKind, KvFp16, KvFp8, KvInt8};
-pub use model_executor::{
-    DecodeInput, DecodeOutput, ExecutorAdmissionEpochs, ExecutorPrefillAdmission,
-    ExecutorPrefillAdmissionDecision, ExecutorPrefillAdmissionReceipt,
-    ExecutorPrefillMaintenanceBlocker, ExecutorPrefillMaintenanceDeferral,
-    ExecutorPrefillMaintenanceOutcome, ExecutorPrefillMaintenanceStage, ExecutorSamplingOutput,
-    ModelExecutor, PlanRuntimeBatchDecodeOutcome, PlanRuntimeBatchPrefillOutcome,
-    PlanRuntimeDecodeInput, PlanRuntimeDecodeOutput, PlanRuntimePrefillAuthority,
-    PlanRuntimePrefillCompletion, PlanRuntimePrefillInput, PlanRuntimePrefillOutcome,
-    PlanRuntimePrefillOutput, PlanRuntimePrefillProduct, PrefillInput, PrefillOutput,
-};
 pub use recurrent_state::{
     RecurrentStateHandle, RecurrentStateHandleStats, RecurrentStateManager,
     RecurrentStateManagerStats, RecurrentStateResumePolicy, RecurrentStateSpec,

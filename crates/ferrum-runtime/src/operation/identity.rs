@@ -1,0 +1,1430 @@
+use ferrum_types::InvocationPreparationStrategy;
+use serde::{ser::SerializeSeq, Serialize, Serializer};
+use std::collections::BTreeSet;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
+
+use super::super::{
+    BatchInvocationId, BatchStepId, DeviceId, ExecutionIdentityEnvelope, ExecutionLaneId, NodeId,
+    OperationId, ParticipantNodeKey, PlanHash, PlanId, ProviderId, VNextError,
+};
+use super::compiled_identity::{
+    CompiledSubmissionWaveIdentity, SubmissionWaveParticipantIdentitySeed,
+};
+use super::foundation::{canonical_operation_fingerprint, canonical_sha256, invalid_operation};
+use super::ProviderExecutionSemantics;
+
+#[derive(Debug, PartialEq, Eq, Serialize)]
+struct BatchOperationParticipantIdentityData {
+    participant_index: u32,
+    node_key: ParticipantNodeKey,
+    identity: ExecutionIdentityEnvelope,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BatchOperationParticipantIdentity {
+    data: Arc<BatchOperationParticipantIdentityData>,
+}
+
+impl Serialize for BatchOperationParticipantIdentity {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        self.data.as_ref().serialize(serializer)
+    }
+}
+
+impl BatchOperationParticipantIdentity {
+    pub(super) fn new(
+        participant_index: u32,
+        node_key: ParticipantNodeKey,
+        identity: ExecutionIdentityEnvelope,
+    ) -> Self {
+        Self {
+            data: Arc::new(BatchOperationParticipantIdentityData {
+                participant_index,
+                node_key,
+                identity,
+            }),
+        }
+    }
+
+    pub fn participant_index(&self) -> u32 {
+        self.data.participant_index
+    }
+
+    pub fn node_key(&self) -> &ParticipantNodeKey {
+        &self.data.node_key
+    }
+
+    pub fn identity(&self) -> &ExecutionIdentityEnvelope {
+        &self.data.identity
+    }
+}
+
+/// One immutable-plan node inside a physical command batch. Participant
+/// identities stay node-local even when several nodes share one submission.
+#[derive(Debug, Clone)]
+pub struct BatchOperationNodeIdentity {
+    node_index: u32,
+    node_id: NodeId,
+    operation_id: OperationId,
+    provider_id: ProviderId,
+    provider_implementation_fingerprint: String,
+    provider_execution_semantics: ProviderExecutionSemantics,
+    work_shape_fingerprint: String,
+    participants: Vec<BatchOperationParticipantIdentity>,
+    fingerprint: OnceLock<String>,
+}
+
+impl PartialEq for BatchOperationNodeIdentity {
+    fn eq(&self, other: &Self) -> bool {
+        self.node_index == other.node_index
+            && self.node_id == other.node_id
+            && self.operation_id == other.operation_id
+            && self.provider_id == other.provider_id
+            && self.provider_implementation_fingerprint == other.provider_implementation_fingerprint
+            && self.provider_execution_semantics == other.provider_execution_semantics
+            && self.work_shape_fingerprint == other.work_shape_fingerprint
+            && self.participants == other.participants
+    }
+}
+
+impl Eq for BatchOperationNodeIdentity {}
+
+impl Serialize for BatchOperationNodeIdentity {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        // Preserve the public wire representation, including field order. A
+        // fingerprint is evidence derived from these immutable fields, not
+        // additional dispatch authority or mutable identity state.
+        #[derive(Serialize)]
+        #[serde(rename = "BatchOperationNodeIdentity")]
+        struct Wire<'a> {
+            node_index: u32,
+            node_id: &'a NodeId,
+            operation_id: &'a OperationId,
+            provider_id: &'a ProviderId,
+            provider_implementation_fingerprint: &'a str,
+            provider_execution_semantics: ProviderExecutionSemantics,
+            work_shape_fingerprint: &'a str,
+            participants: &'a [BatchOperationParticipantIdentity],
+            fingerprint: &'a str,
+        }
+        Wire {
+            node_index: self.node_index,
+            node_id: &self.node_id,
+            operation_id: &self.operation_id,
+            provider_id: &self.provider_id,
+            provider_implementation_fingerprint: &self.provider_implementation_fingerprint,
+            provider_execution_semantics: self.provider_execution_semantics,
+            work_shape_fingerprint: &self.work_shape_fingerprint,
+            participants: &self.participants,
+            fingerprint: self.fingerprint(),
+        }
+        .serialize(serializer)
+    }
+}
+
+impl BatchOperationNodeIdentity {
+    pub(super) fn from_validated(
+        node_index: u32,
+        node_id: NodeId,
+        operation_id: OperationId,
+        provider_id: ProviderId,
+        provider_implementation_fingerprint: String,
+        provider_execution_semantics: ProviderExecutionSemantics,
+        work_shape_fingerprint: String,
+        participants: Vec<BatchOperationParticipantIdentity>,
+    ) -> Result<Self, VNextError> {
+        let participant_start = participants
+            .first()
+            .map(BatchOperationParticipantIdentity::participant_index);
+        if participants.is_empty()
+            || participants.iter().enumerate().any(|(index, participant)| {
+                let identity = participant.identity().projection();
+                participant_start.and_then(|start| start.checked_add(index as u32))
+                    != Some(participant.participant_index())
+                    || participant.node_key().node_id() != &node_id
+                    || identity.frame_id != Some(participant.node_key().frame_id())
+                    || identity.node_id != Some(&node_id)
+                    || identity.operation_id != Some(&operation_id)
+                    || identity.provider_id != Some(&provider_id)
+            })
+            || participants
+                .windows(2)
+                .any(|pair| pair[0].node_key() >= pair[1].node_key())
+            || !canonical_sha256(&provider_implementation_fingerprint)
+            || !canonical_sha256(&work_shape_fingerprint)
+        {
+            return Err(invalid_operation(
+                "batch node identity is empty, non-canonical, or differs from its participant projections",
+            ));
+        }
+        Ok(Self {
+            node_index,
+            node_id,
+            operation_id,
+            provider_id,
+            provider_implementation_fingerprint,
+            provider_execution_semantics,
+            work_shape_fingerprint,
+            participants,
+            fingerprint: OnceLock::new(),
+        })
+    }
+
+    fn calculate_fingerprint(&self) -> String {
+        #[derive(Serialize)]
+        struct FingerprintInput<'a> {
+            domain: &'static str,
+            node_index: u32,
+            node_id: &'a NodeId,
+            operation_id: &'a OperationId,
+            provider_id: &'a ProviderId,
+            provider_implementation_fingerprint: &'a str,
+            provider_execution_semantics: ProviderExecutionSemantics,
+            work_shape_fingerprint: &'a str,
+            participants: &'a [BatchOperationParticipantIdentity],
+        }
+        canonical_operation_fingerprint(
+            &FingerprintInput {
+                domain: "ferrum.runtime-vnext.batch-operation-node-identity.v2",
+                node_index: self.node_index,
+                node_id: &self.node_id,
+                operation_id: &self.operation_id,
+                provider_id: &self.provider_id,
+                provider_implementation_fingerprint: &self.provider_implementation_fingerprint,
+                provider_execution_semantics: self.provider_execution_semantics,
+                work_shape_fingerprint: &self.work_shape_fingerprint,
+                participants: &self.participants,
+            },
+            "batch node identity encode failed",
+        )
+        // This private schema consists solely of integers, strings, fixed
+        // enums and typed participant envelopes; the SHA writer cannot fail.
+        // All identity validation still happens in from_validated, before a
+        // caller can dispatch or request this derived evidence.
+        .expect("validated node identity has infallible canonical serialization")
+    }
+
+    pub const fn node_index(&self) -> u32 {
+        self.node_index
+    }
+
+    pub fn node_id(&self) -> &NodeId {
+        &self.node_id
+    }
+
+    pub fn operation_id(&self) -> &OperationId {
+        &self.operation_id
+    }
+
+    pub fn provider_id(&self) -> &ProviderId {
+        &self.provider_id
+    }
+
+    pub fn provider_implementation_fingerprint(&self) -> &str {
+        &self.provider_implementation_fingerprint
+    }
+
+    pub const fn provider_execution_semantics(&self) -> ProviderExecutionSemantics {
+        self.provider_execution_semantics
+    }
+
+    pub fn work_shape_fingerprint(&self) -> &str {
+        &self.work_shape_fingerprint
+    }
+
+    pub fn participants(&self) -> &[BatchOperationParticipantIdentity] {
+        &self.participants
+    }
+
+    pub fn fingerprint(&self) -> &str {
+        self.fingerprint
+            .get_or_init(|| self.calculate_fingerprint())
+    }
+
+    pub(super) fn contains_identity(&self, identity: &ExecutionIdentityEnvelope) -> bool {
+        self.participants
+            .iter()
+            .any(|participant| participant.identity() == identity)
+    }
+}
+
+/// One physical command-batch attempt identity. It may contain one operation
+/// or the entire immutable-plan wave, but it always maps to one submit/fence.
+#[derive(Debug)]
+struct BatchOperationIdentityData {
+    batch_step_id: BatchStepId,
+    batch_invocation_id: BatchInvocationId,
+    plan_id: PlanId,
+    plan_hash: PlanHash,
+    device_id: DeviceId,
+    runtime_implementation_fingerprint: String,
+    lane_id: ExecutionLaneId,
+    claimed_backing_fingerprint: String,
+    nodes: OnceLock<Vec<BatchOperationNodeIdentity>>,
+    participants: OnceLock<Vec<BatchOperationParticipantIdentity>>,
+    deferred_recipe: Option<DeferredBatchOperationIdentityRecipe>,
+    fingerprint: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct BatchOperationIdentity {
+    data: Arc<BatchOperationIdentityData>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct BatchOperationIdentityMaterializationSnapshot {
+    logical_nodes: u32,
+    materialized_nodes: u32,
+    full_participant_projection: bool,
+}
+
+impl BatchOperationIdentityMaterializationSnapshot {
+    pub const fn logical_nodes(self) -> u32 {
+        self.logical_nodes
+    }
+
+    pub const fn materialized_nodes(self) -> u32 {
+        self.materialized_nodes
+    }
+
+    pub const fn full_participant_projection(self) -> bool {
+        self.full_participant_projection
+    }
+}
+
+impl PartialEq for BatchOperationIdentity {
+    fn eq(&self, other: &Self) -> bool {
+        self.data.batch_step_id == other.data.batch_step_id
+            && self.data.batch_invocation_id == other.data.batch_invocation_id
+            && self.data.plan_id == other.data.plan_id
+            && self.data.plan_hash == other.data.plan_hash
+            && self.data.device_id == other.data.device_id
+            && self.data.runtime_implementation_fingerprint
+                == other.data.runtime_implementation_fingerprint
+            && self.data.lane_id == other.data.lane_id
+            && self.data.claimed_backing_fingerprint == other.data.claimed_backing_fingerprint
+            && self.data.fingerprint == other.data.fingerprint
+    }
+}
+
+impl Eq for BatchOperationIdentity {}
+
+impl Serialize for BatchOperationIdentity {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        #[derive(Serialize)]
+        struct Wire<'a> {
+            batch_step_id: BatchStepId,
+            batch_invocation_id: BatchInvocationId,
+            plan_id: &'a PlanId,
+            plan_hash: &'a PlanHash,
+            device_id: &'a DeviceId,
+            runtime_implementation_fingerprint: &'a str,
+            lane_id: ExecutionLaneId,
+            claimed_backing_fingerprint: &'a str,
+            nodes: &'a [BatchOperationNodeIdentity],
+            participants: &'a [BatchOperationParticipantIdentity],
+            fingerprint: &'a str,
+        }
+
+        Wire {
+            batch_step_id: self.data.batch_step_id,
+            batch_invocation_id: self.data.batch_invocation_id,
+            plan_id: &self.data.plan_id,
+            plan_hash: &self.data.plan_hash,
+            device_id: &self.data.device_id,
+            runtime_implementation_fingerprint: &self.data.runtime_implementation_fingerprint,
+            lane_id: self.data.lane_id,
+            claimed_backing_fingerprint: &self.data.claimed_backing_fingerprint,
+            nodes: self.nodes(),
+            participants: self.participants(),
+            fingerprint: &self.data.fingerprint,
+        }
+        .serialize(serializer)
+    }
+}
+
+struct BatchOperationNodeFingerprints<'a>(&'a [BatchOperationNodeIdentity]);
+
+impl Serialize for BatchOperationNodeFingerprints<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut sequence = serializer.serialize_seq(Some(self.0.len()))?;
+        for node in self.0 {
+            sequence.serialize_element(node.fingerprint())?;
+        }
+        sequence.end()
+    }
+}
+
+impl BatchOperationIdentity {
+    #[allow(clippy::too_many_arguments)]
+    fn from_deferred_validated(
+        batch_step_id: BatchStepId,
+        batch_invocation_id: BatchInvocationId,
+        plan_id: PlanId,
+        plan_hash: PlanHash,
+        device_id: DeviceId,
+        runtime_implementation_fingerprint: String,
+        lane_id: ExecutionLaneId,
+        claimed_backing_fingerprint: String,
+        deferred_recipe: DeferredBatchOperationIdentityRecipe,
+        fingerprint: String,
+    ) -> Self {
+        Self {
+            data: Arc::new(BatchOperationIdentityData {
+                batch_step_id,
+                batch_invocation_id,
+                plan_id,
+                plan_hash,
+                device_id,
+                runtime_implementation_fingerprint,
+                lane_id,
+                claimed_backing_fingerprint,
+                nodes: OnceLock::new(),
+                participants: OnceLock::new(),
+                deferred_recipe: Some(deferred_recipe),
+                fingerprint,
+            }),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn from_validated(
+        batch_step_id: BatchStepId,
+        batch_invocation_id: BatchInvocationId,
+        plan_id: PlanId,
+        plan_hash: PlanHash,
+        device_id: DeviceId,
+        runtime_implementation_fingerprint: String,
+        lane_id: ExecutionLaneId,
+        claimed_backing_fingerprint: String,
+        nodes: Vec<BatchOperationNodeIdentity>,
+    ) -> Result<Self, VNextError> {
+        if nodes.is_empty()
+            || nodes.iter().enumerate().any(|(index, node)| {
+                node.node_index as usize != index
+                    || node.participants.iter().any(|participant| {
+                        participant.identity().parts().plan_id.as_ref() != Some(&plan_id)
+                            || participant.identity().parts().plan_hash.as_ref() != Some(&plan_hash)
+                            || participant.identity().parts().device_id.as_ref() != Some(&device_id)
+                            || participant
+                                .identity()
+                                .parts()
+                                .runtime_implementation_fingerprint
+                                .as_deref()
+                                != Some(runtime_implementation_fingerprint.as_str())
+                    })
+            })
+            || nodes
+                .iter()
+                .map(BatchOperationNodeIdentity::node_id)
+                .collect::<BTreeSet<_>>()
+                .len()
+                != nodes.len()
+            || !canonical_sha256(&runtime_implementation_fingerprint)
+            || !canonical_sha256(&claimed_backing_fingerprint)
+        {
+            return Err(invalid_operation(
+                "physical batch identity is empty, non-canonical, or differs from its plan/runtime projections",
+            ));
+        }
+        let participants = nodes
+            .iter()
+            .flat_map(|node| node.participants.iter().cloned())
+            .collect::<Vec<_>>();
+        if participants
+            .iter()
+            .enumerate()
+            .any(|(index, participant)| participant.participant_index() as usize != index)
+        {
+            return Err(invalid_operation(
+                "physical batch participant indices are not globally contiguous",
+            ));
+        }
+        #[derive(Serialize)]
+        struct FingerprintInput<'a> {
+            domain: &'static str,
+            batch_step_id: BatchStepId,
+            batch_invocation_id: BatchInvocationId,
+            plan_id: &'a PlanId,
+            plan_hash: &'a PlanHash,
+            device_id: &'a DeviceId,
+            runtime_implementation_fingerprint: &'a str,
+            lane_id: ExecutionLaneId,
+            claimed_backing_fingerprint: &'a str,
+            node_fingerprints: BatchOperationNodeFingerprints<'a>,
+        }
+        let fingerprint = canonical_operation_fingerprint(
+            &FingerprintInput {
+                domain: "ferrum.runtime-vnext.physical-command-batch-identity.v2",
+                batch_step_id,
+                batch_invocation_id,
+                plan_id: &plan_id,
+                plan_hash: &plan_hash,
+                device_id: &device_id,
+                runtime_implementation_fingerprint: &runtime_implementation_fingerprint,
+                lane_id,
+                claimed_backing_fingerprint: &claimed_backing_fingerprint,
+                node_fingerprints: BatchOperationNodeFingerprints(&nodes),
+            },
+            "physical batch identity encode failed",
+        )?;
+        Ok(Self {
+            data: Arc::new(BatchOperationIdentityData {
+                batch_step_id,
+                batch_invocation_id,
+                plan_id,
+                plan_hash,
+                device_id,
+                runtime_implementation_fingerprint,
+                lane_id,
+                claimed_backing_fingerprint,
+                nodes: OnceLock::from(nodes),
+                participants: OnceLock::from(participants),
+                deferred_recipe: None,
+                fingerprint,
+            }),
+        })
+    }
+
+    pub fn batch_step_id(&self) -> BatchStepId {
+        self.data.batch_step_id
+    }
+
+    pub fn batch_invocation_id(&self) -> BatchInvocationId {
+        self.data.batch_invocation_id
+    }
+
+    pub fn plan_id(&self) -> &PlanId {
+        &self.data.plan_id
+    }
+
+    pub fn plan_hash(&self) -> &PlanHash {
+        &self.data.plan_hash
+    }
+
+    pub fn device_id(&self) -> &DeviceId {
+        &self.data.device_id
+    }
+
+    pub fn runtime_implementation_fingerprint(&self) -> &str {
+        &self.data.runtime_implementation_fingerprint
+    }
+
+    pub fn lane_id(&self) -> ExecutionLaneId {
+        self.data.lane_id
+    }
+
+    pub fn claimed_backing_fingerprint(&self) -> &str {
+        &self.data.claimed_backing_fingerprint
+    }
+
+    pub fn node_count(&self) -> usize {
+        self.data.nodes.get().map_or_else(
+            || {
+                self.data
+                    .deferred_recipe
+                    .as_ref()
+                    .map_or(0, |recipe| recipe.topology.node_count())
+            },
+            Vec::len,
+        )
+    }
+
+    fn materialized_node_count(&self) -> usize {
+        self.data.nodes.get().map_or_else(
+            || {
+                self.data.deferred_recipe.as_ref().map_or(0, |recipe| {
+                    recipe
+                        .node_identities
+                        .get()
+                        .into_iter()
+                        .flat_map(|slots| slots.iter())
+                        .filter(|identity| identity.get().is_some())
+                        .count()
+                })
+            },
+            Vec::len,
+        )
+    }
+
+    pub fn materialization_snapshot(&self) -> BatchOperationIdentityMaterializationSnapshot {
+        BatchOperationIdentityMaterializationSnapshot {
+            logical_nodes: u32::try_from(self.node_count())
+                .expect("validated physical batch node count fits u32"),
+            materialized_nodes: u32::try_from(self.materialized_node_count())
+                .expect("materialized physical batch node count fits u32"),
+            full_participant_projection: self.data.participants.get().is_some(),
+        }
+    }
+
+    pub fn node_participant_count(&self, node_index: usize) -> Option<usize> {
+        if let Some(nodes) = self.data.nodes.get() {
+            return nodes.get(node_index).map(|node| node.participants().len());
+        }
+        let recipe = self.data.deferred_recipe.as_ref()?;
+        (node_index < recipe.topology.node_count())
+            .then_some(recipe.participant_seeds.as_slice().len())
+    }
+
+    pub fn node_id_at(&self, node_index: usize) -> Option<&NodeId> {
+        if let Some(nodes) = self.data.nodes.get() {
+            return nodes
+                .get(node_index)
+                .map(BatchOperationNodeIdentity::node_id);
+        }
+        self.data
+            .deferred_recipe
+            .as_ref()?
+            .topology
+            .node_id_at(node_index)
+    }
+
+    pub fn operation_id_at(&self, node_index: usize) -> Option<&OperationId> {
+        if let Some(nodes) = self.data.nodes.get() {
+            return nodes
+                .get(node_index)
+                .map(BatchOperationNodeIdentity::operation_id);
+        }
+        self.data
+            .deferred_recipe
+            .as_ref()?
+            .topology
+            .operation_id_at(node_index)
+    }
+
+    pub fn provider_id_at(&self, node_index: usize) -> Option<&ProviderId> {
+        if let Some(nodes) = self.data.nodes.get() {
+            return nodes
+                .get(node_index)
+                .map(BatchOperationNodeIdentity::provider_id);
+        }
+        self.data
+            .deferred_recipe
+            .as_ref()?
+            .topology
+            .provider_id_at(node_index)
+    }
+
+    pub fn work_shape_fingerprint_at(&self, node_index: usize) -> Option<&str> {
+        if let Some(nodes) = self.data.nodes.get() {
+            return nodes
+                .get(node_index)
+                .map(BatchOperationNodeIdentity::work_shape_fingerprint);
+        }
+        let recipe = self.data.deferred_recipe.as_ref()?;
+        (node_index < recipe.topology.node_count()).then_some(recipe.work_shape_fingerprint())
+    }
+
+    pub fn node_index(&self, node_id: &NodeId) -> Option<usize> {
+        if let Some(nodes) = self.data.nodes.get() {
+            return nodes.iter().position(|node| node.node_id() == node_id);
+        }
+        self.data
+            .deferred_recipe
+            .as_ref()?
+            .topology
+            .node_index(node_id)
+    }
+
+    pub(crate) fn operation_identity_at(
+        &self,
+        node_index: usize,
+        participant: usize,
+    ) -> Result<ExecutionIdentityEnvelope, VNextError> {
+        if self.preparation_strategy() != InvocationPreparationStrategy::ResidentDecodeProgram {
+            return self
+                .materialize_node(node_index)?
+                .participants()
+                .get(participant)
+                .map(|p| p.identity().clone())
+                .ok_or_else(|| invalid_operation("operation identity participant is absent"));
+        }
+        let recipe = self
+            .data
+            .deferred_recipe
+            .as_ref()
+            .ok_or_else(|| invalid_operation("resident identity recipe is absent"))?;
+        let ParticipantIdentitySeeds::Projected(seeds) = &recipe.participant_seeds else {
+            return Err(invalid_operation(
+                "resident identity lacks projected participants",
+            ));
+        };
+        let seed = seeds
+            .get(participant)
+            .ok_or_else(|| invalid_operation("resident identity participant is absent"))?;
+        let counts = recipe
+            .projection_counts
+            .as_ref()
+            .expect("resident projected counters");
+        let identity = seed
+            .projected_identity(
+                seeds,
+                participant,
+                &recipe.topology,
+                node_index,
+                &counts.materializations,
+            )
+            .ok_or_else(|| invalid_operation("resident identity node is absent"))?;
+        counts.projected_identities.fetch_add(1, Ordering::Relaxed);
+        Ok(identity)
+    }
+
+    pub(crate) fn materialize_node(
+        &self,
+        node_index: usize,
+    ) -> Result<&BatchOperationNodeIdentity, VNextError> {
+        if let Some(nodes) = self.data.nodes.get() {
+            return nodes
+                .get(node_index)
+                .ok_or_else(|| invalid_operation("physical batch node index is out of bounds"));
+        }
+        let recipe = self.data.deferred_recipe.as_ref().ok_or_else(|| {
+            invalid_operation("physical batch has neither materialized nodes nor a compiled recipe")
+        })?;
+        let slots = recipe.node_identities.get_or_init(|| {
+            std::iter::repeat_with(OnceLock::new)
+                .take(recipe.topology.node_count())
+                .collect::<Vec<_>>()
+                .into_boxed_slice()
+        });
+        let slot = slots.get(node_index).ok_or_else(|| {
+            invalid_operation("compiled physical batch node index is out of bounds")
+        })?;
+        if let Some(identity) = slot.get() {
+            return Ok(identity);
+        }
+        let identity = recipe.materialize_node(node_index)?;
+        if slot.set(identity).is_ok() {
+            if let Some(counts) = &recipe.projection_counts {
+                counts.projected_identities.fetch_add(
+                    recipe.participant_seeds.as_slice().len() as u64,
+                    Ordering::Relaxed,
+                );
+            }
+        }
+        slot.get().ok_or_else(|| {
+            invalid_operation("compiled physical batch node identity publication failed")
+        })
+    }
+
+    /// Cumulative preparation for this fresh wave. Full reports zero projection work.
+    /// This does not count observations that occur after the snapshot is taken.
+    pub fn preparation_snapshot(&self) -> super::InvocationPreparationStats {
+        self.data
+            .deferred_recipe
+            .as_ref()
+            .and_then(|recipe| recipe.projection_counts.as_ref())
+            .map_or_else(Default::default, |counts| {
+                super::InvocationPreparationStats {
+                    projected_identities: counts.projected_identities.load(Ordering::Relaxed),
+                    parts_materialized: counts.materializations.load(Ordering::Relaxed),
+                    segment_hits: counts
+                        .segment
+                        .as_ref()
+                        .map_or(0, |s| s.hits.load(Ordering::Relaxed)),
+                    segment_misses: counts
+                        .segment
+                        .as_ref()
+                        .map_or(0, |s| s.misses.load(Ordering::Relaxed)),
+                    segment_encoded_nodes: counts
+                        .segment
+                        .as_ref()
+                        .map_or(0, |s| s.encoded_nodes.load(Ordering::Relaxed)),
+                    segment_dynamic_resource_requests: counts
+                        .segment
+                        .as_ref()
+                        .map_or(0, |s| s.dynamic_resource_requests.load(Ordering::Relaxed)),
+                    segment_unique_physical_buffers: counts
+                        .segment
+                        .as_ref()
+                        .map_or(0, |s| s.unique_physical_buffers.load(Ordering::Relaxed)),
+                    segment_no_resident_program: counts
+                        .segment
+                        .as_ref()
+                        .map_or(0, |s| s.no_resident_program.load(Ordering::Relaxed)),
+                    segment_no_cached_recipe: counts
+                        .segment
+                        .as_ref()
+                        .map_or(0, |s| s.no_cached_recipe.load(Ordering::Relaxed)),
+                    segment_immutable_capability_unavailable: counts
+                        .segment
+                        .as_ref()
+                        .map_or(0, |s| {
+                            s.immutable_capability_unavailable.load(Ordering::Relaxed)
+                        }),
+                    segment_unsupported_encoder: counts
+                        .segment
+                        .as_ref()
+                        .map_or(0, |s| s.unsupported_encoder.load(Ordering::Relaxed)),
+                    segment_incomplete_declarations: counts
+                        .segment
+                        .as_ref()
+                        .map_or(0, |s| s.incomplete_declarations.load(Ordering::Relaxed)),
+                }
+            })
+    }
+
+    /// A hit records a successful complete segment preparation/encoding, not
+    /// submission or GPU completion. Cold/unsupported fallbacks record misses.
+    pub(super) fn record_segment_preparation(
+        &self,
+        hit: bool,
+        nodes: u64,
+        resources: u64,
+        buffers: u64,
+    ) {
+        let Some(counts) = self
+            .data
+            .deferred_recipe
+            .as_ref()
+            .and_then(|recipe| recipe.projection_counts.as_ref())
+            .and_then(|counts| counts.segment.as_ref())
+        else {
+            return;
+        };
+        let add = |counter: &AtomicU64, value| {
+            let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                Some(current.saturating_add(value))
+            });
+        };
+        add(if hit { &counts.hits } else { &counts.misses }, 1);
+        if hit {
+            add(&counts.encoded_nodes, nodes);
+            add(&counts.dynamic_resource_requests, resources);
+            add(&counts.unique_physical_buffers, buffers);
+        }
+    }
+
+    pub(super) fn record_segment_miss_reason(
+        &self,
+        reason: super::preparation::SegmentPreparationMissReason,
+    ) {
+        use super::preparation::SegmentPreparationMissReason as Reason;
+        let Some(counts) = self
+            .data
+            .deferred_recipe
+            .as_ref()
+            .and_then(|recipe| recipe.projection_counts.as_ref())
+            .and_then(|counts| counts.segment.as_ref())
+        else {
+            return;
+        };
+        let counter = match reason {
+            Reason::NoResidentProgram => &counts.no_resident_program,
+            Reason::NoCachedRecipe => &counts.no_cached_recipe,
+            Reason::ImmutableCapabilityUnavailable => &counts.immutable_capability_unavailable,
+            Reason::UnsupportedEncoder => &counts.unsupported_encoder,
+            Reason::IncompleteDeclarations => &counts.incomplete_declarations,
+        };
+        let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            Some(current.saturating_add(1))
+        });
+    }
+
+    pub(super) fn preparation_strategy(&self) -> InvocationPreparationStrategy {
+        self.data
+            .deferred_recipe
+            .as_ref()
+            .map_or(InvocationPreparationStrategy::Full, |recipe| {
+                recipe.strategy
+            })
+    }
+
+    pub fn nodes(&self) -> &[BatchOperationNodeIdentity] {
+        self.data.nodes.get_or_init(|| {
+            (0..self.node_count())
+                .map(|node_index| {
+                    self.materialize_node(node_index)
+                        .expect("validated compiled physical batch node must materialize")
+                        .clone()
+                })
+                .collect()
+        })
+    }
+
+    pub fn single_node(&self) -> Option<&BatchOperationNodeIdentity> {
+        (self.node_count() == 1).then(|| {
+            self.materialize_node(0)
+                .expect("validated single-node physical batch must materialize")
+        })
+    }
+
+    pub fn participants(&self) -> &[BatchOperationParticipantIdentity] {
+        self.data.participants.get_or_init(|| {
+            self.nodes()
+                .iter()
+                .flat_map(|node| node.participants().iter().cloned())
+                .collect()
+        })
+    }
+
+    pub fn fingerprint(&self) -> &str {
+        &self.data.fingerprint
+    }
+
+    pub(super) fn contains_identity(&self, identity: &ExecutionIdentityEnvelope) -> bool {
+        self.participants()
+            .iter()
+            .any(|participant| participant.identity() == identity)
+    }
+}
+
+#[derive(Debug)]
+struct DeferredBatchOperationIdentityRecipe {
+    strategy: InvocationPreparationStrategy,
+    topology: CompiledSubmissionWaveIdentity,
+    work_shape_fingerprint: String,
+    participant_seeds: ParticipantIdentitySeeds,
+    projection_counts: Option<IdentityProjectionCounts>,
+    node_identities: OnceLock<Box<[OnceLock<BatchOperationNodeIdentity>]>>,
+}
+
+#[derive(Debug)]
+enum ParticipantIdentitySeeds {
+    Full(Vec<SubmissionWaveParticipantIdentitySeed>),
+    Projected(Arc<[SubmissionWaveParticipantIdentitySeed]>),
+}
+impl ParticipantIdentitySeeds {
+    fn as_slice(&self) -> &[SubmissionWaveParticipantIdentitySeed] {
+        match self {
+            Self::Full(seeds) => seeds,
+            Self::Projected(seeds) => seeds,
+        }
+    }
+}
+#[derive(Debug)]
+struct IdentityProjectionCounts {
+    projected_identities: AtomicU64,
+    materializations: Arc<AtomicU64>,
+    segment: Option<Box<SegmentPreparationCounts>>,
+}
+#[derive(Debug, Default)]
+struct SegmentPreparationCounts {
+    hits: AtomicU64,
+    misses: AtomicU64,
+    encoded_nodes: AtomicU64,
+    dynamic_resource_requests: AtomicU64,
+    unique_physical_buffers: AtomicU64,
+    no_resident_program: AtomicU64,
+    no_cached_recipe: AtomicU64,
+    immutable_capability_unavailable: AtomicU64,
+    unsupported_encoder: AtomicU64,
+    incomplete_declarations: AtomicU64,
+}
+impl DeferredBatchOperationIdentityRecipe {
+    fn work_shape_fingerprint(&self) -> &str {
+        &self.work_shape_fingerprint
+    }
+
+    fn materialize_node(
+        &self,
+        node_index: usize,
+    ) -> Result<BatchOperationNodeIdentity, VNextError> {
+        let node = self
+            .topology
+            .node_at(node_index)
+            .ok_or_else(|| invalid_operation("compiled wave node index is out of bounds"))?;
+        let participant_start = node_index
+            .checked_mul(self.participant_seeds.as_slice().len())
+            .and_then(|value| u32::try_from(value).ok())
+            .ok_or_else(|| {
+                invalid_operation("compiled wave participant index space exceeds u32")
+            })?;
+        let participants = self
+            .participant_seeds
+            .as_slice()
+            .iter()
+            .enumerate()
+            .map(|(local_index, seed)| {
+                let local_index = u32::try_from(local_index)
+                    .expect("compiled wave participant count was validated");
+                let frame = seed.frame();
+                let identity = match &self.participant_seeds {
+                    ParticipantIdentitySeeds::Full(_) => {
+                        seed.operation_identity(&self.topology, node_index)
+                    }
+                    ParticipantIdentitySeeds::Projected(seeds) => seed.projected_identity(
+                        seeds,
+                        local_index as usize,
+                        &self.topology,
+                        node_index,
+                        &self
+                            .projection_counts
+                            .as_ref()
+                            .expect("projected seeds have counters")
+                            .materializations,
+                    ),
+                }
+                .ok_or_else(|| invalid_operation("compiled wave node identity disappeared"))?;
+                Ok(BatchOperationParticipantIdentity::new(
+                    participant_start
+                        .checked_add(local_index)
+                        .expect("compiled wave participant index was validated"),
+                    ParticipantNodeKey::new(
+                        frame.participant(),
+                        frame.frame_id(),
+                        node.node_id().clone(),
+                    ),
+                    identity,
+                ))
+            })
+            .collect::<Result<Vec<_>, VNextError>>()?;
+        BatchOperationNodeIdentity::from_validated(
+            node.node_index(),
+            node.node_id().clone(),
+            node.operation_id().clone(),
+            node.provider_id().clone(),
+            node.provider_implementation_fingerprint().to_owned(),
+            node.provider_execution_semantics(),
+            self.work_shape_fingerprint.clone(),
+            participants,
+        )
+    }
+}
+
+impl BatchOperationIdentity {
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn from_compiled_wave(
+        topology: CompiledSubmissionWaveIdentity,
+        batch_step_id: BatchStepId,
+        batch_invocation_id: BatchInvocationId,
+        claimed_backing_fingerprint: String,
+        work_shape_fingerprint: String,
+        participant_seeds: Vec<SubmissionWaveParticipantIdentitySeed>,
+        strategy: InvocationPreparationStrategy,
+    ) -> Result<Self, VNextError> {
+        let participant_count = participant_seeds.len();
+        let participant_projection_count = topology
+            .node_count()
+            .checked_mul(participant_count)
+            .and_then(|count| u32::try_from(count).ok());
+        if topology.node_count() == 0
+            || participant_count == 0
+            || participant_projection_count.is_none()
+            || participant_seeds.windows(2).any(|pair| {
+                let left = pair[0].frame().participant();
+                let right = pair[1].frame().participant();
+                (
+                    left.sequence_authority().sparse_id(),
+                    left.sequence_authority().generation(),
+                    left.request_authority().sparse_id(),
+                    left.request_authority().generation(),
+                ) >= (
+                    right.sequence_authority().sparse_id(),
+                    right.sequence_authority().generation(),
+                    right.request_authority().sparse_id(),
+                    right.request_authority().generation(),
+                )
+            })
+            || participant_seeds.iter().any(|seed| {
+                seed.runtime_implementation_fingerprint()
+                    != topology.runtime_implementation_fingerprint()
+            })
+            || !canonical_sha256(&claimed_backing_fingerprint)
+            || !canonical_sha256(&work_shape_fingerprint)
+        {
+            return Err(invalid_operation(
+                "compiled physical batch identity is empty, non-canonical, or exceeds its participant index space",
+            ));
+        }
+        #[derive(Serialize)]
+        struct FingerprintInput<'a> {
+            domain: &'static str,
+            batch_step_id: BatchStepId,
+            batch_invocation_id: BatchInvocationId,
+            topology_fingerprint: &'a str,
+            claimed_backing_fingerprint: &'a str,
+            work_shape_fingerprint: &'a str,
+            participant_seeds: &'a [SubmissionWaveParticipantIdentitySeed],
+        }
+        let fingerprint = canonical_operation_fingerprint(
+            &FingerprintInput {
+                domain: "ferrum.runtime-vnext.compiled-physical-command-batch-identity.v1",
+                batch_step_id,
+                batch_invocation_id,
+                topology_fingerprint: topology.fingerprint(),
+                claimed_backing_fingerprint: &claimed_backing_fingerprint,
+                work_shape_fingerprint: &work_shape_fingerprint,
+                participant_seeds: &participant_seeds,
+            },
+            "compiled physical batch identity encode failed",
+        )?;
+        if strategy.uses_identity_projection() {
+            for seed in &participant_seeds {
+                seed.operation_identity(&topology, 0).ok_or_else(|| {
+                    invalid_operation("compiled participant seed has no first node")
+                })?;
+            }
+        }
+        let node_identities = OnceLock::new();
+        if strategy != InvocationPreparationStrategy::ResidentDecodeProgram {
+            let _ = node_identities.set(
+                std::iter::repeat_with(OnceLock::new)
+                    .take(topology.node_count())
+                    .collect::<Vec<_>>()
+                    .into_boxed_slice(),
+            );
+        }
+        let plan_id = topology.plan_id().clone();
+        let plan_hash = topology.plan_hash().clone();
+        let device_id = topology.device_id().clone();
+        let runtime_implementation_fingerprint =
+            topology.runtime_implementation_fingerprint().to_owned();
+        let lane_id = topology.lane_id();
+        Ok(Self::from_deferred_validated(
+            batch_step_id,
+            batch_invocation_id,
+            plan_id,
+            plan_hash,
+            device_id,
+            runtime_implementation_fingerprint,
+            lane_id,
+            claimed_backing_fingerprint,
+            DeferredBatchOperationIdentityRecipe {
+                strategy,
+                topology,
+                work_shape_fingerprint,
+                participant_seeds: match strategy {
+                    InvocationPreparationStrategy::Full => {
+                        ParticipantIdentitySeeds::Full(participant_seeds)
+                    }
+                    InvocationPreparationStrategy::IdentityProjection
+                    | InvocationPreparationStrategy::DecodeSegment
+                    | InvocationPreparationStrategy::DecodeSegmentProgram
+                    | InvocationPreparationStrategy::ResidentDecodeProgram => {
+                        ParticipantIdentitySeeds::Projected(participant_seeds.into())
+                    }
+                },
+                projection_counts: strategy.uses_identity_projection().then(|| {
+                    IdentityProjectionCounts {
+                        projected_identities: AtomicU64::new(0),
+                        materializations: Arc::new(AtomicU64::new(0)),
+                        segment: strategy
+                            .uses_decode_segment()
+                            .then(|| Box::new(SegmentPreparationCounts::default())),
+                    }
+                }),
+                node_identities,
+            },
+            fingerprint,
+        ))
+    }
+}
+
+#[cfg(test)]
+impl BatchOperationIdentity {
+    /// Resource unit fixtures do not construct an executable provider catalog.
+    /// Derive their completion identity from an actual prepared wave and its
+    /// plan nodes; this never issues a successful completion seal.
+    pub(crate) fn test_only_for_wave<R: crate::DeviceRuntime>(
+        wave: &crate::PreparedStepSubmissionWave<R>,
+        plan_nodes: &[crate::PlanNode],
+        active: &[crate::TrustedActiveSequenceBinding],
+    ) -> Result<Self, VNextError> {
+        let resources = wave
+            .nodes()
+            .iter()
+            .enumerate()
+            .map(|(node_index, prepared)| {
+                let node = plan_nodes
+                    .get(prepared.plan_node_index())
+                    .ok_or_else(|| invalid_operation("test wave plan node is absent"))?;
+                Ok((
+                    super::invocation::OperationInvocationResources::Wave { wave, node_index },
+                    node,
+                ))
+            })
+            .collect::<Result<Vec<_>, VNextError>>()?;
+        Self::test_only_for_resources(&resources, active)
+    }
+
+    pub(crate) fn test_only_for_invocation<R: crate::DeviceRuntime>(
+        invocation: &crate::InvocationResourceLease<R>,
+        node: &crate::PlanNode,
+        active: &[crate::TrustedActiveSequenceBinding],
+    ) -> Result<Self, VNextError> {
+        Self::test_only_for_resources(
+            &[(
+                super::invocation::OperationInvocationResources::Invocation(invocation),
+                node,
+            )],
+            active,
+        )
+    }
+
+    // Uses real fresh resident authority; only the provider-catalog identity
+    // fixture is abbreviated. Success still comes from the tracked runtime fence.
+    pub(crate) fn test_only_for_resident<R: crate::DeviceRuntime>(
+        use_: &crate::ResidentDecodeUse<R>,
+        plan_nodes: &[crate::PlanNode],
+        active: &[crate::TrustedActiveSequenceBinding],
+    ) -> Result<Self, VNextError> {
+        use crate::{ExecutionIdentityParts, NodeInvocationId, SpanId, EXECUTION_IDENTITY_VERSION};
+        if plan_nodes.len() != use_.node_count() || plan_nodes.is_empty() {
+            return Err(invalid_operation("test resident plan nodes differ"));
+        }
+        let plan = use_.plan_evidence();
+        let frames = use_.participant_frames();
+        let mut nodes = Vec::new();
+        let mut participant_index = 0_u32;
+        for (index, node) in plan_nodes.iter().enumerate() {
+            if active.len() != frames.len() {
+                return Err(invalid_operation("test resident participants differ"));
+            }
+            let mut participants = Vec::new();
+            for (binding, frame) in active.iter().zip(frames.iter().copied()) {
+                if binding.sequence_authority() != frame.participant().sequence_authority()
+                    || binding.plan().plan_hash() != plan.plan_hash()
+                {
+                    return Err(invalid_operation("test wave active binding differs"));
+                }
+                let invocation = NodeInvocationId::try_from(index as u64 + 1)?;
+                let identity = ExecutionIdentityEnvelope::new(ExecutionIdentityParts {
+                    version: EXECUTION_IDENTITY_VERSION,
+                    run_id: binding.run_id().clone(),
+                    request_id: binding.request_id().clone(),
+                    sequence: u64::from(participant_index) + 1,
+                    plan_id: Some(plan.plan_id().clone()),
+                    plan_hash: Some(plan.plan_hash().clone()),
+                    frame_id: Some(frame.frame_id()),
+                    node_invocation_id: Some(invocation),
+                    node_id: Some(node.id().clone()),
+                    operation_id: Some(node.operation_id().clone()),
+                    provider_id: Some(node.selection().selected_provider().clone()),
+                    device_id: Some(plan.device_id().clone()),
+                    resource_pool_id: None,
+                    resource_pool_identity_fingerprint: None,
+                    provisioning_run_id: None,
+                    provisioning_request_id: None,
+                    transaction_id: None,
+                    active_sequence_slot: Some(binding.sequence_authority().sparse_id()),
+                    admission_generation: Some(binding.sequence_authority().generation()),
+                    activation_epoch: Some(binding.activation_epoch()),
+                    runtime_implementation_fingerprint: Some(
+                        plan.runtime_implementation_fingerprint().to_owned(),
+                    ),
+                    active_sequence_fingerprint: Some(binding.fingerprint().to_owned()),
+                    completed_sequence_fingerprint: None,
+                    aborted_sequence_fingerprint: None,
+                    resource_id: None,
+                    resource_generation: None,
+                    resource_batch_fingerprint: None,
+                    span_id: SpanId::new(format!(
+                        "test/completion/{}/{participant_index}",
+                        use_.batch_invocation_id().get()
+                    ))?,
+                    parent_span_id: None,
+                    async_links: Vec::new(),
+                })?;
+                participants.push(BatchOperationParticipantIdentity::new(
+                    participant_index,
+                    ParticipantNodeKey::new(
+                        frame.participant(),
+                        frame.frame_id(),
+                        node.id().clone(),
+                    ),
+                    identity,
+                ));
+                participant_index += 1;
+            }
+            nodes.push(BatchOperationNodeIdentity::from_validated(
+                index as u32,
+                node.id().clone(),
+                node.operation_id().clone(),
+                node.selection().selected_provider().clone(),
+                node.provider_implementation_fingerprint().to_owned(),
+                node.provider_execution_semantics(),
+                use_.work_shape().fingerprint().to_owned(),
+                participants,
+            )?);
+        }
+        Self::from_validated(
+            use_.batch_step_id(),
+            use_.batch_invocation_id(),
+            plan.plan_id().clone(),
+            plan.plan_hash().clone(),
+            plan.device_id().clone(),
+            plan.runtime_implementation_fingerprint().to_owned(),
+            use_.execution_lane_id(),
+            use_.fingerprint().to_owned(),
+            nodes,
+        )
+    }
+
+    fn test_only_for_resources<R: crate::DeviceRuntime>(
+        resources: &[(
+            super::invocation::OperationInvocationResources<'_, R>,
+            &crate::PlanNode,
+        )],
+        active: &[crate::TrustedActiveSequenceBinding],
+    ) -> Result<Self, VNextError> {
+        use crate::{ExecutionIdentityParts, NodeInvocationId, SpanId, EXECUTION_IDENTITY_VERSION};
+        let first = resources
+            .first()
+            .ok_or_else(|| invalid_operation("test operation resources are empty"))?
+            .0;
+        let plan = first.step_resources().plan_evidence();
+        let mut nodes = Vec::new();
+        let mut participant_index = 0_u32;
+        for (index, (prepared, node)) in resources.iter().enumerate() {
+            if prepared.node_id()? != node.id()
+                || active.len() != prepared.participant_frames()?.len()
+            {
+                return Err(invalid_operation("test wave nodes or participants differ"));
+            }
+            let mut participants = Vec::new();
+            for (binding, frame) in active.iter().zip(prepared.participant_frames()?) {
+                if binding.sequence_authority() != frame.participant().sequence_authority()
+                    || binding.plan().plan_hash() != plan.plan_hash()
+                {
+                    return Err(invalid_operation("test wave active binding differs"));
+                }
+                let invocation = NodeInvocationId::try_from(index as u64 + 1)?;
+                let identity = ExecutionIdentityEnvelope::new(ExecutionIdentityParts {
+                    version: EXECUTION_IDENTITY_VERSION,
+                    run_id: binding.run_id().clone(),
+                    request_id: binding.request_id().clone(),
+                    sequence: u64::from(participant_index) + 1,
+                    plan_id: Some(plan.plan_id().clone()),
+                    plan_hash: Some(plan.plan_hash().clone()),
+                    frame_id: Some(frame.frame_id()),
+                    node_invocation_id: Some(invocation),
+                    node_id: Some(node.id().clone()),
+                    operation_id: Some(node.operation_id().clone()),
+                    provider_id: Some(node.selection().selected_provider().clone()),
+                    device_id: Some(plan.device_id().clone()),
+                    resource_pool_id: None,
+                    resource_pool_identity_fingerprint: None,
+                    provisioning_run_id: None,
+                    provisioning_request_id: None,
+                    transaction_id: None,
+                    active_sequence_slot: Some(binding.sequence_authority().sparse_id()),
+                    admission_generation: Some(binding.sequence_authority().generation()),
+                    activation_epoch: Some(binding.activation_epoch()),
+                    runtime_implementation_fingerprint: Some(
+                        plan.runtime_implementation_fingerprint().to_owned(),
+                    ),
+                    active_sequence_fingerprint: Some(binding.fingerprint().to_owned()),
+                    completed_sequence_fingerprint: None,
+                    aborted_sequence_fingerprint: None,
+                    resource_id: None,
+                    resource_generation: None,
+                    resource_batch_fingerprint: None,
+                    span_id: SpanId::new(format!(
+                        "test/completion/{}/{participant_index}",
+                        first.batch_invocation_id().get()
+                    ))?,
+                    parent_span_id: None,
+                    async_links: Vec::new(),
+                })?;
+                participants.push(BatchOperationParticipantIdentity::new(
+                    participant_index,
+                    ParticipantNodeKey::new(
+                        frame.participant(),
+                        frame.frame_id(),
+                        node.id().clone(),
+                    ),
+                    identity,
+                ));
+                participant_index += 1;
+            }
+            nodes.push(BatchOperationNodeIdentity::from_validated(
+                index as u32,
+                node.id().clone(),
+                node.operation_id().clone(),
+                node.selection().selected_provider().clone(),
+                node.provider_implementation_fingerprint().to_owned(),
+                node.provider_execution_semantics(),
+                prepared.work_shape()?.fingerprint().to_owned(),
+                participants,
+            )?);
+        }
+        Self::from_validated(
+            first.batch_step_id(),
+            first.batch_invocation_id(),
+            plan.plan_id().clone(),
+            plan.plan_hash().clone(),
+            plan.device_id().clone(),
+            plan.runtime_implementation_fingerprint().to_owned(),
+            first.step_resources().execution_lane().id(),
+            first.backing_fingerprint().to_owned(),
+            nodes,
+        )
+    }
+}
+
+#[cfg(test)]
+mod batch_operation_identity_fingerprint_tests {
+    use super::{
+        canonical_operation_fingerprint, BatchOperationNodeFingerprints,
+        BatchOperationNodeIdentity, NodeId, OperationId, ProviderExecutionSemantics, ProviderId,
+        Serialize,
+    };
+    use sha2::{Digest, Sha256};
+
+    fn fingerprint_node(index: u32, marker: char) -> BatchOperationNodeIdentity {
+        BatchOperationNodeIdentity {
+            node_index: index,
+            node_id: NodeId::new(format!("node.{index}")).unwrap(),
+            operation_id: OperationId::new(format!("operation.{index}")).unwrap(),
+            provider_id: ProviderId::new(format!("provider.{index}")).unwrap(),
+            provider_implementation_fingerprint: std::iter::repeat_n(marker, 64).collect(),
+            provider_execution_semantics: ProviderExecutionSemantics::bitwise_eager_and_replay(),
+            work_shape_fingerprint: std::iter::repeat_n(marker, 64).collect(),
+            participants: Vec::new(),
+            fingerprint: std::sync::OnceLock::from(
+                std::iter::repeat_n(marker, 64).collect::<String>(),
+            ),
+        }
+    }
+
+    #[test]
+    fn streaming_fingerprint_matches_canonical_json_digest() {
+        #[derive(Serialize)]
+        struct Input<'a> {
+            domain: &'static str,
+            value: &'a str,
+        }
+
+        let input = Input {
+            domain: "ferrum.runtime-vnext.test",
+            value: "evidence",
+        };
+        let expected = format!("{:x}", Sha256::digest(serde_json::to_vec(&input).unwrap()));
+
+        assert_eq!(
+            canonical_operation_fingerprint(&input, "test fingerprint").unwrap(),
+            expected
+        );
+    }
+
+    #[test]
+    fn batch_fingerprint_projection_contains_only_validated_node_digests() {
+        let first = std::iter::repeat_n('a', 64).collect::<String>();
+        let second = std::iter::repeat_n('b', 64).collect::<String>();
+        let nodes = [fingerprint_node(0, 'a'), fingerprint_node(1, 'b')];
+
+        let encoded = serde_json::to_string(&BatchOperationNodeFingerprints(&nodes)).unwrap();
+
+        assert_eq!(encoded, format!("[\"{first}\",\"{second}\"]"));
+        assert!(!encoded.contains("node.0"));
+        assert!(!encoded.contains("operation.0"));
+        assert!(!encoded.contains("participants"));
+    }
+}
+
+#[cfg(test)]
+mod lazy_fingerprint_tests;

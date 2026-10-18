@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex, Weak};
 
 use super::super::CudaNativeBlockKernels;
 use cudarc::driver::{CudaEvent, CudaStream};
-use ferrum_interfaces::vnext::{DeviceNativeOperationId, ElementType};
+use ferrum_runtime::{DeviceNativeOperationId, ElementType};
 
 use super::native_plan::PreparedProjectionNative;
 use crate::backend::cuda::vnext_runtime::{
@@ -298,20 +298,20 @@ impl WeightValidation {
     /// request binding slots and runs before every consuming wave, including replay.
     pub fn retained_dependency(
         self: &Arc<Self>,
-        invocation: &ferrum_interfaces::vnext::BatchedOperationInvocation<
+        invocation: &ferrum_runtime::BatchedOperationInvocation<
             '_,
             crate::backend::cuda::vnext_runtime::CudaDeviceBuffer,
         >,
         input_ordinal: u32,
-        component_id: &ferrum_interfaces::vnext::WeightId,
+        component_id: &ferrum_runtime::WeightId,
         persistent_offset_bytes: u64,
     ) -> Result<
-        ferrum_interfaces::vnext::EncodedRetainedPlanDependency<CudaDeviceCommand>,
+        ferrum_runtime::EncodedRetainedPlanDependency<CudaDeviceCommand>,
         CudaDeviceRuntimeError,
     > {
         let identity = self.identity.declaration_identity();
         let authority = invocation
-            .retained_plan_dependency(ferrum_interfaces::vnext::RetainedPlanDependencySpec {
+            .retained_plan_dependency(ferrum_runtime::RetainedPlanDependencySpec {
                 input_ordinal,
                 component_id,
                 source_offset_bytes: 0,
@@ -328,10 +328,10 @@ impl WeightValidation {
     pub(in crate::backend::cuda::vnext_ops) fn segment_declaration(
         self: &Arc<Self>,
         input_ordinal: u32,
-        component_id: &ferrum_interfaces::vnext::WeightId,
+        component_id: &ferrum_runtime::WeightId,
         persistent_offset_bytes: u64,
     ) -> crate::backend::cuda::vnext_ops::transformer::segment_bindings::ValidationRecipe {
-        use ferrum_interfaces::vnext::SegmentBindingDependency;
+        use ferrum_runtime::SegmentBindingDependency;
         crate::backend::cuda::vnext_ops::transformer::segment_bindings::ValidationRecipe {
             state: self.clone(),
             declaration: SegmentBindingDependency {

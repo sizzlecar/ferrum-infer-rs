@@ -20,14 +20,14 @@ impl TokenPrecision {
     pub(super) fn embedding_operation(self) -> &'static str {
         match self {
             Self::F16 => TOKEN_EMBEDDING_OPERATION_ID,
-            Self::F32 => ferrum_interfaces::vnext::TOKEN_EMBEDDING_F32_MASTER_OPERATION_ID,
+            Self::F32 => ferrum_runtime::TOKEN_EMBEDDING_F32_MASTER_OPERATION_ID,
         }
     }
 
     pub(super) fn projection_operation(self) -> &'static str {
         match self {
             Self::F16 => LAST_TOKEN_DENSE_LINEAR_OPERATION_ID,
-            Self::F32 => ferrum_interfaces::vnext::LAST_TOKEN_DENSE_LINEAR_F32_OPERATION_ID,
+            Self::F32 => ferrum_runtime::LAST_TOKEN_DENSE_LINEAR_F32_OPERATION_ID,
         }
     }
 }
@@ -97,7 +97,7 @@ pub(super) fn requires_native(
                 && value.weight().is_some_and(|weight| {
                     !matches!(
                         weight.physical_layout(),
-                        ferrum_interfaces::vnext::PhysicalWeightLayout::Dense { .. }
+                        ferrum_runtime::PhysicalWeightLayout::Dense { .. }
                     )
                 })
         })

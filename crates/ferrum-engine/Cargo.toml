@@ -8,6 +8,8 @@ description = "Model orchestration engine for Ferrum LLM inference"
 readme = "../../README.md"
 
 [dependencies]
+ferrum-runtime = { workspace = true }
+ferrum-execution = { workspace = true }
 # Core dependencies - New architecture
 ferrum-types = { workspace = true }
 ferrum-interfaces = { workspace = true }

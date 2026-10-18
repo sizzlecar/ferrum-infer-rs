@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use cudarc::driver::{CudaFunction, LaunchConfig, PushKernelArg};
 use cudarc::nvrtc::Ptx;
-use ferrum_interfaces::vnext::{
+use ferrum_runtime::{
     causal_paged_attention_contract, constant_scale_contract, dense_geglu_tanh_contract,
     dense_linear_contract, dense_swiglu_contract, gated_delta_recurrent_attention_contract,
     gpt_oss_causal_paged_attention_contract, hybrid_vnorm_causal_paged_attention_contract,
@@ -42,7 +42,7 @@ use ferrum_interfaces::vnext::{
     TOKEN_EMBEDDING_F16_CAPABILITY_ID, TOKEN_EMBEDDING_OPERATION_ID,
 };
 #[cfg(feature = "vllm-moe-marlin")]
-use ferrum_interfaces::vnext::{
+use ferrum_runtime::{
     gpt_oss_routed_clamped_swiglu_moe_contract, routed_shared_swiglu_moe_contract,
     routed_swiglu_moe_contract, GPT_OSS_ROUTED_CLAMPED_SWIGLU_MOE_MXFP4_BF16_CAPABILITY_ID,
     ROUTED_SHARED_SWIGLU_MOE_F16_CAPABILITY_ID, ROUTED_SWIGLU_MOE_F16_CAPABILITY_ID,
@@ -67,7 +67,7 @@ mod q6_head;
 pub use q6_head::CudaQ6MmqF32LastTokenProvider;
 mod selection;
 mod transformer;
-use ferrum_interfaces::vnext::{
+use ferrum_runtime::{
     causal_paged_attention_f32_master_contract, causal_paged_attention_f32_master_int8_kv_contract,
     causal_paged_attention_int8_kv_contract, gated_delta_recurrent_attention_f32_master_contract,
     last_token_dense_linear_f32_contract, token_embedding_f32_master_contract,
@@ -107,33 +107,33 @@ const MAXIMUM_TOKENS_PER_LAUNCH: u64 = u16::MAX as u64;
 pub(super) const VNEXT_KV_PAGE_BYTES: u64 = 64 * 1024;
 
 pub(crate) fn encode_segment_bindings(
-    patch: ferrum_interfaces::vnext::PreparedSegmentBindingPatch<'_, CudaDeviceBuffer>,
+    patch: ferrum_runtime::PreparedSegmentBindingPatch<'_, CudaDeviceBuffer>,
 ) -> Result<
-    Option<Vec<ferrum_interfaces::vnext::EncodedSegmentBindingNode<CudaDeviceCommand>>>,
+    Option<Vec<ferrum_runtime::EncodedSegmentBindingNode<CudaDeviceCommand>>>,
     CudaDeviceRuntimeError,
 > {
     transformer::segment_bindings::encode(patch)
 }
 
 pub(crate) fn compile_segment_binding_program(
-    declarations: &[(u32, &ferrum_interfaces::vnext::SegmentBindingDeclaration)],
+    declarations: &[(u32, &ferrum_runtime::SegmentBindingDeclaration)],
 ) -> Result<Option<Arc<dyn std::any::Any + Send + Sync>>, CudaDeviceRuntimeError> {
     transformer::segment_bindings::compile_program(declarations)
 }
 
 pub(crate) fn compile_resident_decode_parts(
     program: &(dyn std::any::Any + Send + Sync),
-    wave: &ferrum_interfaces::vnext::PreparedPhysicalSegmentWave<'_, CudaDeviceBuffer>,
+    wave: &ferrum_runtime::PreparedPhysicalSegmentWave<'_, CudaDeviceBuffer>,
 ) -> Result<Option<super::vnext_runtime::ResidentColdParts>, CudaDeviceRuntimeError> {
     transformer::segment_bindings::compile_resident_program(program, wave)
 }
 
 pub(crate) fn encode_compiled_segment_bindings(
     program: &(dyn std::any::Any + Send + Sync),
-    frame: &mut ferrum_interfaces::vnext::PreparedSegmentBindingFrame<'_, CudaDeviceBuffer>,
+    frame: &mut ferrum_runtime::PreparedSegmentBindingFrame<'_, CudaDeviceBuffer>,
 ) -> Result<
     (
-        Vec<ferrum_interfaces::vnext::EncodedSegmentBindingNode<CudaDeviceCommand>>,
+        Vec<ferrum_runtime::EncodedSegmentBindingNode<CudaDeviceCommand>>,
         super::vnext_runtime::CudaBindingProgramSink,
         Arc<super::vnext_runtime::CudaSegmentOwnerTable>,
     ),
@@ -144,10 +144,10 @@ pub(crate) fn encode_compiled_segment_bindings(
 
 pub(crate) fn encode_physical_segment_bindings(
     program: &(dyn std::any::Any + Send + Sync),
-    wave: &mut ferrum_interfaces::vnext::PreparedPhysicalSegmentWave<'_, CudaDeviceBuffer>,
+    wave: &mut ferrum_runtime::PreparedPhysicalSegmentWave<'_, CudaDeviceBuffer>,
 ) -> Result<
     (
-        Vec<ferrum_interfaces::vnext::EncodedSegmentBindingNode<CudaDeviceCommand>>,
+        Vec<ferrum_runtime::EncodedSegmentBindingNode<CudaDeviceCommand>>,
         super::vnext_runtime::CudaBindingProgramSink,
         Arc<super::vnext_runtime::CudaSegmentOwnerTable>,
     ),
@@ -313,9 +313,7 @@ pub(crate) fn q8act_g32_compiled() -> bool {
     native_blocks::q8act::compiled(crate::ptx::VNEXT_GGUF)
 }
 
-pub(crate) fn q8act_g32_profile_compiled(
-    profile: ferrum_interfaces::vnext::Q8ActSwiGluProfile,
-) -> bool {
+pub(crate) fn q8act_g32_profile_compiled(profile: ferrum_runtime::Q8ActSwiGluProfile) -> bool {
     native_blocks::q8act::compiled_for_profile(crate::ptx::VNEXT_GGUF, profile)
 }
 
@@ -729,10 +727,10 @@ pub fn cuda_vnext_capabilities() -> Result<BTreeSet<CapabilityId>, VNextError> {
         RMS_NORM_F32_CAPABILITY_ID,
         DENSE_LINEAR_F16_CAPABILITY_ID,
         DENSE_SWIGLU_F16_CAPABILITY_ID,
-        ferrum_interfaces::vnext::DENSE_SWIGLU_GGUF_RN_F16_FRAGMENT_M1_TO8_CAPABILITY_ID,
+        ferrum_runtime::DENSE_SWIGLU_GGUF_RN_F16_FRAGMENT_M1_TO8_CAPABILITY_ID,
         crate::gguf_rn_fragment_materializer::GGUF_RN_FRAGMENT_CAPABILITY_ID,
-        ferrum_interfaces::vnext::GATED_DELTA_RECURRENT_ATTENTION_F32_MASTER_GGUF_F16_PROJECTIONS_CAPABILITY_ID,
-        ferrum_interfaces::vnext::CAUSAL_PAGED_ATTENTION_F32_MASTER_GGUF_F16_PROJECTIONS_CAPABILITY_ID,
+        ferrum_runtime::GATED_DELTA_RECURRENT_ATTENTION_F32_MASTER_GGUF_F16_PROJECTIONS_CAPABILITY_ID,
+        ferrum_runtime::CAUSAL_PAGED_ATTENTION_F32_MASTER_GGUF_F16_PROJECTIONS_CAPABILITY_ID,
         DENSE_GEGLU_TANH_F16_CAPABILITY_ID,
         CONSTANT_SCALE_F16_CAPABILITY_ID,
         LOGIT_SOFTCAP_F16_CAPABILITY_ID,
@@ -790,63 +788,64 @@ pub fn cuda_vnext_capabilities() -> Result<BTreeSet<CapabilityId>, VNextError> {
     let mut capabilities = capabilities;
     if q6_mmq_f32_compiled() {
         capabilities.insert(CapabilityId::new(
-            ferrum_interfaces::vnext::LAST_TOKEN_DENSE_LINEAR_Q6_MMQ_F32_CAPABILITY_ID,
+            ferrum_runtime::LAST_TOKEN_DENSE_LINEAR_Q6_MMQ_F32_CAPABILITY_ID,
         )?);
     }
     for profile in [
-        ferrum_interfaces::vnext::Q8ActSwiGluProfile::Iq4Xs,
-        ferrum_interfaces::vnext::Q8ActSwiGluProfile::Q4KQ5KIq4Xs,
+        ferrum_runtime::Q8ActSwiGluProfile::Iq4Xs,
+        ferrum_runtime::Q8ActSwiGluProfile::Q4KQ5KIq4Xs,
     ] {
         if q8act_g32_profile_compiled(profile) {
             capabilities.insert(CapabilityId::new(profile.capability_id())?);
         }
     }
-    if q8act_g32_profile_compiled(ferrum_interfaces::vnext::Q8ActSwiGluProfile::Q4KQ5KIq4Xs) {
+    if q8act_g32_profile_compiled(ferrum_runtime::Q8ActSwiGluProfile::Q4KQ5KIq4Xs) {
         for profile in [
-            ferrum_interfaces::vnext::Q8ActAttentionProfile::GatedDelta,
-            ferrum_interfaces::vnext::Q8ActAttentionProfile::Causal,
+            ferrum_runtime::Q8ActAttentionProfile::GatedDelta,
+            ferrum_runtime::Q8ActAttentionProfile::Causal,
         ] {
             capabilities.insert(CapabilityId::new(profile.capability_id())?);
         }
     }
     if upstream_marker_v2_compiled() {
         for profile in [
-            ferrum_interfaces::vnext::UpstreamMarkerV2Profile::SwiGlu,
-            ferrum_interfaces::vnext::UpstreamMarkerV2Profile::GatedDelta,
-            ferrum_interfaces::vnext::UpstreamMarkerV2Profile::Causal,
-            ferrum_interfaces::vnext::UpstreamMarkerV2Profile::SwiGluPrefill,
-            ferrum_interfaces::vnext::UpstreamMarkerV2Profile::SwiGluG32MmqPrefill,
-            ferrum_interfaces::vnext::UpstreamMarkerV2Profile::GatedDeltaPrefill,
-            ferrum_interfaces::vnext::UpstreamMarkerV2Profile::GatedDeltaG32MmqPrefill,
-            ferrum_interfaces::vnext::UpstreamMarkerV2Profile::CausalPrefill,
-            ferrum_interfaces::vnext::UpstreamMarkerV2Profile::CausalG32MmqPrefill,
-            ferrum_interfaces::vnext::UpstreamMarkerV2Profile::SwiGluExtraPrefill,
-            ferrum_interfaces::vnext::UpstreamMarkerV2Profile::GatedDeltaExtraPrefill,
-            ferrum_interfaces::vnext::UpstreamMarkerV2Profile::CausalExtraPrefill,
-            ferrum_interfaces::vnext::UpstreamMarkerV2Profile::SwiGluExtraLargePrefill,
-            ferrum_interfaces::vnext::UpstreamMarkerV2Profile::SwiGluExtraAllRows,
-            ferrum_interfaces::vnext::UpstreamMarkerV2Profile::SwiGluQ6F16,
-            ferrum_interfaces::vnext::UpstreamMarkerV2Profile::GatedDeltaExtraLargePrefill,
-            ferrum_interfaces::vnext::UpstreamMarkerV2Profile::GatedDeltaExtraAllRows,
-            ferrum_interfaces::vnext::UpstreamMarkerV2Profile::GatedDeltaQ6F16,
-            ferrum_interfaces::vnext::UpstreamMarkerV2Profile::CausalExtraLargePrefill,
-            ferrum_interfaces::vnext::UpstreamMarkerV2Profile::CausalExtraAllRows,
-            ferrum_interfaces::vnext::UpstreamMarkerV2Profile::CausalQ6F16,
+            ferrum_runtime::UpstreamMarkerV2Profile::SwiGlu,
+            ferrum_runtime::UpstreamMarkerV2Profile::GatedDelta,
+            ferrum_runtime::UpstreamMarkerV2Profile::Causal,
+            ferrum_runtime::UpstreamMarkerV2Profile::SwiGluPrefill,
+            ferrum_runtime::UpstreamMarkerV2Profile::SwiGluG32MmqPrefill,
+            ferrum_runtime::UpstreamMarkerV2Profile::GatedDeltaPrefill,
+            ferrum_runtime::UpstreamMarkerV2Profile::GatedDeltaG32MmqPrefill,
+            ferrum_runtime::UpstreamMarkerV2Profile::CausalPrefill,
+            ferrum_runtime::UpstreamMarkerV2Profile::CausalG32MmqPrefill,
+            ferrum_runtime::UpstreamMarkerV2Profile::SwiGluExtraPrefill,
+            ferrum_runtime::UpstreamMarkerV2Profile::GatedDeltaExtraPrefill,
+            ferrum_runtime::UpstreamMarkerV2Profile::CausalExtraPrefill,
+            ferrum_runtime::UpstreamMarkerV2Profile::SwiGluExtraLargePrefill,
+            ferrum_runtime::UpstreamMarkerV2Profile::SwiGluExtraAllRows,
+            ferrum_runtime::UpstreamMarkerV2Profile::SwiGluQ6F16,
+            ferrum_runtime::UpstreamMarkerV2Profile::GatedDeltaExtraLargePrefill,
+            ferrum_runtime::UpstreamMarkerV2Profile::GatedDeltaExtraAllRows,
+            ferrum_runtime::UpstreamMarkerV2Profile::GatedDeltaQ6F16,
+            ferrum_runtime::UpstreamMarkerV2Profile::CausalExtraLargePrefill,
+            ferrum_runtime::UpstreamMarkerV2Profile::CausalExtraAllRows,
+            ferrum_runtime::UpstreamMarkerV2Profile::CausalQ6F16,
         ] {
             if upstream_profile_compiled(profile.prefill() || profile.hybrid())
                 && (!profile.extra() || upstream_extra_profile_compiled(profile.extra_prefill()))
                 && (!profile.q6_f16() || upstream_q6_f16_profile_compiled())
                 && (!profile.hybrid()
-                    || q8act_g32_profile_compiled(
-                        ferrum_interfaces::vnext::Q8ActSwiGluProfile::Q4KQ5KIq4Xs,
-                    ))
+                    || q8act_g32_profile_compiled(ferrum_runtime::Q8ActSwiGluProfile::Q4KQ5KIq4Xs))
             {
                 capabilities.insert(CapabilityId::new(profile.capability_id())?);
             }
         }
     }
     if !rn_fragment_mma_compiled() {
-        capabilities.retain(|capability| capability.as_str() != ferrum_interfaces::vnext::DENSE_SWIGLU_GGUF_RN_F16_FRAGMENT_M1_TO8_CAPABILITY_ID);
+        capabilities.retain(|capability| {
+            capability.as_str()
+                != ferrum_runtime::DENSE_SWIGLU_GGUF_RN_F16_FRAGMENT_M1_TO8_CAPABILITY_ID
+        });
     }
     Ok(capabilities)
 }
@@ -963,7 +962,7 @@ mod block_fp8_exact_materializer_tests {
                 .expect("live block-FP8 materializer");
         assert_eq!(
             materializer.descriptor().fidelity(),
-            ferrum_interfaces::vnext::WeightMaterializationFidelity::Exact
+            ferrum_runtime::WeightMaterializationFidelity::Exact
         );
         let selection = WeightMaterializerSelection::exact(
             WeightMaterializerId::new(
@@ -989,8 +988,8 @@ fn cuda_operation_contracts(
         Box::new(rms_norm_f32_to_f16_contract().map_err(contract_error)?),
         Box::new(rms_norm_f32_contract().map_err(contract_error)?),
         Box::new(dense_linear_contract().map_err(contract_error)?),
-        Box::new(ferrum_interfaces::vnext::gated_delta_recurrent_attention_f32_master_gguf_f16_projections_contract().map_err(contract_error)?),
-        Box::new(ferrum_interfaces::vnext::causal_paged_attention_f32_master_gguf_f16_projections_contract().map_err(contract_error)?),
+        Box::new(ferrum_runtime::gated_delta_recurrent_attention_f32_master_gguf_f16_projections_contract().map_err(contract_error)?),
+        Box::new(ferrum_runtime::causal_paged_attention_f32_master_gguf_f16_projections_contract().map_err(contract_error)?),
         Box::new(dense_swiglu_contract().map_err(contract_error)?),
         Box::new(dense_geglu_tanh_contract().map_err(contract_error)?),
         Box::new(constant_scale_contract().map_err(contract_error)?),
@@ -1130,37 +1129,40 @@ pub fn cuda_vnext_operation_registry(
         providers
     };
     let mut providers = providers;
-    if runtime.descriptor().capabilities.iter().any(|cap| {
-        cap.as_str() == ferrum_interfaces::vnext::LAST_TOKEN_DENSE_LINEAR_Q6_MMQ_F32_CAPABILITY_ID
-    }) {
+    if runtime
+        .descriptor()
+        .capabilities
+        .iter()
+        .any(|cap| cap.as_str() == ferrum_runtime::LAST_TOKEN_DENSE_LINEAR_Q6_MMQ_F32_CAPABILITY_ID)
+    {
         contracts.push(Box::new(
-            ferrum_interfaces::vnext::last_token_dense_linear_q6_mmq_f32_contract()
+            ferrum_runtime::last_token_dense_linear_q6_mmq_f32_contract()
                 .map_err(contract_error)?,
         ));
         providers.push(Box::new(CudaQ6MmqF32LastTokenProvider::new(runtime)?));
     }
     for profile in [
-        ferrum_interfaces::vnext::UpstreamMarkerV2Profile::SwiGlu,
-        ferrum_interfaces::vnext::UpstreamMarkerV2Profile::GatedDelta,
-        ferrum_interfaces::vnext::UpstreamMarkerV2Profile::Causal,
-        ferrum_interfaces::vnext::UpstreamMarkerV2Profile::SwiGluPrefill,
-        ferrum_interfaces::vnext::UpstreamMarkerV2Profile::SwiGluG32MmqPrefill,
-        ferrum_interfaces::vnext::UpstreamMarkerV2Profile::GatedDeltaPrefill,
-        ferrum_interfaces::vnext::UpstreamMarkerV2Profile::GatedDeltaG32MmqPrefill,
-        ferrum_interfaces::vnext::UpstreamMarkerV2Profile::CausalPrefill,
-        ferrum_interfaces::vnext::UpstreamMarkerV2Profile::CausalG32MmqPrefill,
-        ferrum_interfaces::vnext::UpstreamMarkerV2Profile::SwiGluExtraPrefill,
-        ferrum_interfaces::vnext::UpstreamMarkerV2Profile::GatedDeltaExtraPrefill,
-        ferrum_interfaces::vnext::UpstreamMarkerV2Profile::CausalExtraPrefill,
-        ferrum_interfaces::vnext::UpstreamMarkerV2Profile::SwiGluExtraLargePrefill,
-        ferrum_interfaces::vnext::UpstreamMarkerV2Profile::SwiGluExtraAllRows,
-        ferrum_interfaces::vnext::UpstreamMarkerV2Profile::SwiGluQ6F16,
-        ferrum_interfaces::vnext::UpstreamMarkerV2Profile::GatedDeltaExtraLargePrefill,
-        ferrum_interfaces::vnext::UpstreamMarkerV2Profile::GatedDeltaExtraAllRows,
-        ferrum_interfaces::vnext::UpstreamMarkerV2Profile::GatedDeltaQ6F16,
-        ferrum_interfaces::vnext::UpstreamMarkerV2Profile::CausalExtraLargePrefill,
-        ferrum_interfaces::vnext::UpstreamMarkerV2Profile::CausalExtraAllRows,
-        ferrum_interfaces::vnext::UpstreamMarkerV2Profile::CausalQ6F16,
+        ferrum_runtime::UpstreamMarkerV2Profile::SwiGlu,
+        ferrum_runtime::UpstreamMarkerV2Profile::GatedDelta,
+        ferrum_runtime::UpstreamMarkerV2Profile::Causal,
+        ferrum_runtime::UpstreamMarkerV2Profile::SwiGluPrefill,
+        ferrum_runtime::UpstreamMarkerV2Profile::SwiGluG32MmqPrefill,
+        ferrum_runtime::UpstreamMarkerV2Profile::GatedDeltaPrefill,
+        ferrum_runtime::UpstreamMarkerV2Profile::GatedDeltaG32MmqPrefill,
+        ferrum_runtime::UpstreamMarkerV2Profile::CausalPrefill,
+        ferrum_runtime::UpstreamMarkerV2Profile::CausalG32MmqPrefill,
+        ferrum_runtime::UpstreamMarkerV2Profile::SwiGluExtraPrefill,
+        ferrum_runtime::UpstreamMarkerV2Profile::GatedDeltaExtraPrefill,
+        ferrum_runtime::UpstreamMarkerV2Profile::CausalExtraPrefill,
+        ferrum_runtime::UpstreamMarkerV2Profile::SwiGluExtraLargePrefill,
+        ferrum_runtime::UpstreamMarkerV2Profile::SwiGluExtraAllRows,
+        ferrum_runtime::UpstreamMarkerV2Profile::SwiGluQ6F16,
+        ferrum_runtime::UpstreamMarkerV2Profile::GatedDeltaExtraLargePrefill,
+        ferrum_runtime::UpstreamMarkerV2Profile::GatedDeltaExtraAllRows,
+        ferrum_runtime::UpstreamMarkerV2Profile::GatedDeltaQ6F16,
+        ferrum_runtime::UpstreamMarkerV2Profile::CausalExtraLargePrefill,
+        ferrum_runtime::UpstreamMarkerV2Profile::CausalExtraAllRows,
+        ferrum_runtime::UpstreamMarkerV2Profile::CausalQ6F16,
     ] {
         if runtime
             .descriptor()
@@ -1170,59 +1172,59 @@ pub fn cuda_vnext_operation_registry(
         {
             contracts.push(Box::new(profile.contract().map_err(contract_error)?));
             match profile {
-                ferrum_interfaces::vnext::UpstreamMarkerV2Profile::GatedDeltaQ6F16 => {
+                ferrum_runtime::UpstreamMarkerV2Profile::GatedDeltaQ6F16 => {
                     providers.push(Box::new(transformer::CudaGatedDeltaRecurrentAttentionProvider::new_upstream_q6_f16(runtime)?))
                 }
-                ferrum_interfaces::vnext::UpstreamMarkerV2Profile::GatedDeltaExtraAllRows => {
+                ferrum_runtime::UpstreamMarkerV2Profile::GatedDeltaExtraAllRows => {
                     providers.push(Box::new(
                         transformer::CudaGatedDeltaRecurrentAttentionProvider::new_upstream_extra_all_rows(runtime)?,
                     ))
                 }
-                ferrum_interfaces::vnext::UpstreamMarkerV2Profile::GatedDeltaExtraLargePrefill => {
+                ferrum_runtime::UpstreamMarkerV2Profile::GatedDeltaExtraLargePrefill => {
                     providers.push(Box::new(
                         transformer::CudaGatedDeltaRecurrentAttentionProvider::new_upstream_extra_prefill(runtime)?,
                     ))
                 }
-                ferrum_interfaces::vnext::UpstreamMarkerV2Profile::GatedDeltaExtraPrefill => {
+                ferrum_runtime::UpstreamMarkerV2Profile::GatedDeltaExtraPrefill => {
                     providers.push(Box::new(
                         transformer::CudaGatedDeltaRecurrentAttentionProvider::new_upstream_extra(
                             runtime,
                         )?,
                     ))
                 }
-                ferrum_interfaces::vnext::UpstreamMarkerV2Profile::GatedDeltaG32MmqPrefill => {
+                ferrum_runtime::UpstreamMarkerV2Profile::GatedDeltaG32MmqPrefill => {
                     providers.push(Box::new(
                         transformer::CudaGatedDeltaRecurrentAttentionProvider::new_g32_mmq_prefill(
                             runtime,
                         )?,
                     ))
                 }
-                ferrum_interfaces::vnext::UpstreamMarkerV2Profile::SwiGlu
-                | ferrum_interfaces::vnext::UpstreamMarkerV2Profile::SwiGluPrefill
-                | ferrum_interfaces::vnext::UpstreamMarkerV2Profile::SwiGluG32MmqPrefill
-                | ferrum_interfaces::vnext::UpstreamMarkerV2Profile::SwiGluExtraPrefill
-                | ferrum_interfaces::vnext::UpstreamMarkerV2Profile::SwiGluExtraLargePrefill
-                | ferrum_interfaces::vnext::UpstreamMarkerV2Profile::SwiGluExtraAllRows
-                | ferrum_interfaces::vnext::UpstreamMarkerV2Profile::SwiGluQ6F16 => {
+                ferrum_runtime::UpstreamMarkerV2Profile::SwiGlu
+                | ferrum_runtime::UpstreamMarkerV2Profile::SwiGluPrefill
+                | ferrum_runtime::UpstreamMarkerV2Profile::SwiGluG32MmqPrefill
+                | ferrum_runtime::UpstreamMarkerV2Profile::SwiGluExtraPrefill
+                | ferrum_runtime::UpstreamMarkerV2Profile::SwiGluExtraLargePrefill
+                | ferrum_runtime::UpstreamMarkerV2Profile::SwiGluExtraAllRows
+                | ferrum_runtime::UpstreamMarkerV2Profile::SwiGluQ6F16 => {
                     providers.push(Box::new(transformer::CudaUpstreamSwiGluProvider::new(
                         runtime, profile,
                     )?))
                 }
-                ferrum_interfaces::vnext::UpstreamMarkerV2Profile::GatedDelta
-                | ferrum_interfaces::vnext::UpstreamMarkerV2Profile::GatedDeltaPrefill => providers
+                ferrum_runtime::UpstreamMarkerV2Profile::GatedDelta
+                | ferrum_runtime::UpstreamMarkerV2Profile::GatedDeltaPrefill => providers
                     .push(Box::new(
                         transformer::CudaGatedDeltaRecurrentAttentionProvider::new_upstream(
                             runtime,
                             profile.prefill(),
                         )?,
                     )),
-                ferrum_interfaces::vnext::UpstreamMarkerV2Profile::Causal
-                | ferrum_interfaces::vnext::UpstreamMarkerV2Profile::CausalPrefill
-                | ferrum_interfaces::vnext::UpstreamMarkerV2Profile::CausalG32MmqPrefill
-                | ferrum_interfaces::vnext::UpstreamMarkerV2Profile::CausalExtraPrefill
-                | ferrum_interfaces::vnext::UpstreamMarkerV2Profile::CausalExtraLargePrefill
-                | ferrum_interfaces::vnext::UpstreamMarkerV2Profile::CausalExtraAllRows
-                | ferrum_interfaces::vnext::UpstreamMarkerV2Profile::CausalQ6F16 => {
+                ferrum_runtime::UpstreamMarkerV2Profile::Causal
+                | ferrum_runtime::UpstreamMarkerV2Profile::CausalPrefill
+                | ferrum_runtime::UpstreamMarkerV2Profile::CausalG32MmqPrefill
+                | ferrum_runtime::UpstreamMarkerV2Profile::CausalExtraPrefill
+                | ferrum_runtime::UpstreamMarkerV2Profile::CausalExtraLargePrefill
+                | ferrum_runtime::UpstreamMarkerV2Profile::CausalExtraAllRows
+                | ferrum_runtime::UpstreamMarkerV2Profile::CausalQ6F16 => {
                     providers.push(Box::new(
                         transformer::CudaCausalPagedAttentionProvider::new_upstream(
                             runtime,
@@ -1235,8 +1237,8 @@ pub fn cuda_vnext_operation_registry(
         }
     }
     for profile in [
-        ferrum_interfaces::vnext::Q8ActAttentionProfile::GatedDelta,
-        ferrum_interfaces::vnext::Q8ActAttentionProfile::Causal,
+        ferrum_runtime::Q8ActAttentionProfile::GatedDelta,
+        ferrum_runtime::Q8ActAttentionProfile::Causal,
     ] {
         if runtime
             .descriptor()
@@ -1246,23 +1248,21 @@ pub fn cuda_vnext_operation_registry(
         {
             contracts.push(Box::new(profile.contract().map_err(contract_error)?));
             match profile {
-                ferrum_interfaces::vnext::Q8ActAttentionProfile::GatedDelta => {
-                    providers.push(Box::new(
-                        transformer::CudaGatedDeltaRecurrentAttentionProvider::new_q8act(runtime)?,
-                    ))
-                }
-                ferrum_interfaces::vnext::Q8ActAttentionProfile::Causal => providers.push(
-                    Box::new(transformer::CudaCausalPagedAttentionProvider::new_q8act(
+                ferrum_runtime::Q8ActAttentionProfile::GatedDelta => providers.push(Box::new(
+                    transformer::CudaGatedDeltaRecurrentAttentionProvider::new_q8act(runtime)?,
+                )),
+                ferrum_runtime::Q8ActAttentionProfile::Causal => providers.push(Box::new(
+                    transformer::CudaCausalPagedAttentionProvider::new_q8act(
                         runtime,
                         runtime.attention_execution_policy(),
-                    )?),
-                ),
+                    )?,
+                )),
             }
         }
     }
     for profile in [
-        ferrum_interfaces::vnext::Q8ActSwiGluProfile::Iq4Xs,
-        ferrum_interfaces::vnext::Q8ActSwiGluProfile::Q4KQ5KIq4Xs,
+        ferrum_runtime::Q8ActSwiGluProfile::Iq4Xs,
+        ferrum_runtime::Q8ActSwiGluProfile::Q4KQ5KIq4Xs,
     ] {
         if runtime
             .descriptor()
@@ -1278,10 +1278,10 @@ pub fn cuda_vnext_operation_registry(
     }
     if runtime.descriptor().capabilities.iter().any(|capability| {
         capability.as_str()
-            == ferrum_interfaces::vnext::DENSE_SWIGLU_GGUF_RN_F16_FRAGMENT_M1_TO8_CAPABILITY_ID
+            == ferrum_runtime::DENSE_SWIGLU_GGUF_RN_F16_FRAGMENT_M1_TO8_CAPABILITY_ID
     }) {
         contracts.push(Box::new(
-            ferrum_interfaces::vnext::dense_swiglu_gguf_rn_f16_fragment_m1to8_contract()
+            ferrum_runtime::dense_swiglu_gguf_rn_f16_fragment_m1to8_contract()
                 .map_err(contract_error)?,
         ));
         providers.push(Box::new(transformer::CudaRnFragmentSwiGluProvider::new(
@@ -1314,8 +1314,8 @@ impl CudaVNextComposition {
         requested_attention_policy: AttentionExecutionPolicy,
         purpose: CudaCompositionPurpose,
         upload_strategy: ProgramBindingUploadStrategy,
-        oracle: ferrum_interfaces::vnext::SegmentBindingOracleMode,
-        owner_view_mode: ferrum_interfaces::vnext::SegmentBindingOwnerViewMode,
+        oracle: ferrum_runtime::SegmentBindingOracleMode,
+        owner_view_mode: ferrum_runtime::SegmentBindingOwnerViewMode,
         causal_decode_preparation: ferrum_types::CausalDecodePreparationMode,
         causal_decode_attention_grouping: ferrum_types::CausalDecodeAttentionGrouping,
         q4_mmvq_weight_decode: ferrum_types::Q4MmvqWeightDecode,
@@ -1539,7 +1539,7 @@ impl CudaVNextComposition {
             device_id,
             requested_attention_policy,
             upload_strategy,
-            ferrum_interfaces::vnext::SegmentBindingOracleMode::Disabled,
+            ferrum_runtime::SegmentBindingOracleMode::Disabled,
         )
     }
 
@@ -1549,7 +1549,7 @@ impl CudaVNextComposition {
         device_id: DeviceId,
         requested_attention_policy: AttentionExecutionPolicy,
         upload_strategy: ProgramBindingUploadStrategy,
-        oracle: ferrum_interfaces::vnext::SegmentBindingOracleMode,
+        oracle: ferrum_runtime::SegmentBindingOracleMode,
     ) -> Result<Self, CudaDeviceRuntimeError> {
         Self::create_with_segment_binding_owner_view_mode(
             ordinal,
@@ -1557,7 +1557,7 @@ impl CudaVNextComposition {
             requested_attention_policy,
             upload_strategy,
             oracle,
-            ferrum_interfaces::vnext::SegmentBindingOwnerViewMode::Legacy,
+            ferrum_runtime::SegmentBindingOwnerViewMode::Legacy,
         )
     }
 
@@ -1567,8 +1567,8 @@ impl CudaVNextComposition {
         device_id: DeviceId,
         requested_attention_policy: AttentionExecutionPolicy,
         upload_strategy: ProgramBindingUploadStrategy,
-        oracle: ferrum_interfaces::vnext::SegmentBindingOracleMode,
-        owner_view_mode: ferrum_interfaces::vnext::SegmentBindingOwnerViewMode,
+        oracle: ferrum_runtime::SegmentBindingOracleMode,
+        owner_view_mode: ferrum_runtime::SegmentBindingOwnerViewMode,
     ) -> Result<Self, CudaDeviceRuntimeError> {
         Self::create_with_causal_decode_preparation_mode(
             ordinal,
@@ -1587,8 +1587,8 @@ impl CudaVNextComposition {
         device_id: DeviceId,
         requested_attention_policy: AttentionExecutionPolicy,
         upload_strategy: ProgramBindingUploadStrategy,
-        oracle: ferrum_interfaces::vnext::SegmentBindingOracleMode,
-        owner_view_mode: ferrum_interfaces::vnext::SegmentBindingOwnerViewMode,
+        oracle: ferrum_runtime::SegmentBindingOracleMode,
+        owner_view_mode: ferrum_runtime::SegmentBindingOwnerViewMode,
         causal_decode_preparation: ferrum_types::CausalDecodePreparationMode,
     ) -> Result<Self, CudaDeviceRuntimeError> {
         Self::create_with_causal_decode_attention_grouping(
@@ -1610,8 +1610,8 @@ impl CudaVNextComposition {
         device_id: DeviceId,
         requested_attention_policy: AttentionExecutionPolicy,
         upload_strategy: ProgramBindingUploadStrategy,
-        oracle: ferrum_interfaces::vnext::SegmentBindingOracleMode,
-        owner_view_mode: ferrum_interfaces::vnext::SegmentBindingOwnerViewMode,
+        oracle: ferrum_runtime::SegmentBindingOracleMode,
+        owner_view_mode: ferrum_runtime::SegmentBindingOwnerViewMode,
         causal_decode_preparation: ferrum_types::CausalDecodePreparationMode,
         causal_decode_attention_grouping: ferrum_types::CausalDecodeAttentionGrouping,
     ) -> Result<Self, CudaDeviceRuntimeError> {
@@ -1635,8 +1635,8 @@ impl CudaVNextComposition {
         device_id: DeviceId,
         requested_attention_policy: AttentionExecutionPolicy,
         upload_strategy: ProgramBindingUploadStrategy,
-        oracle: ferrum_interfaces::vnext::SegmentBindingOracleMode,
-        owner_view_mode: ferrum_interfaces::vnext::SegmentBindingOwnerViewMode,
+        oracle: ferrum_runtime::SegmentBindingOracleMode,
+        owner_view_mode: ferrum_runtime::SegmentBindingOwnerViewMode,
         causal_decode_preparation: ferrum_types::CausalDecodePreparationMode,
         causal_decode_attention_grouping: ferrum_types::CausalDecodeAttentionGrouping,
         q4_mmvq_weight_decode: ferrum_types::Q4MmvqWeightDecode,
@@ -1661,8 +1661,8 @@ impl CudaVNextComposition {
         device_id: DeviceId,
         requested_attention_policy: AttentionExecutionPolicy,
         upload_strategy: ProgramBindingUploadStrategy,
-        oracle: ferrum_interfaces::vnext::SegmentBindingOracleMode,
-        owner_view_mode: ferrum_interfaces::vnext::SegmentBindingOwnerViewMode,
+        oracle: ferrum_runtime::SegmentBindingOracleMode,
+        owner_view_mode: ferrum_runtime::SegmentBindingOwnerViewMode,
         causal_decode_preparation: ferrum_types::CausalDecodePreparationMode,
         causal_decode_attention_grouping: ferrum_types::CausalDecodeAttentionGrouping,
         q4_mmvq_weight_decode: ferrum_types::Q4MmvqWeightDecode,
@@ -1689,8 +1689,8 @@ impl CudaVNextComposition {
         device_id: DeviceId,
         requested_attention_policy: AttentionExecutionPolicy,
         upload_strategy: ProgramBindingUploadStrategy,
-        oracle: ferrum_interfaces::vnext::SegmentBindingOracleMode,
-        owner_view_mode: ferrum_interfaces::vnext::SegmentBindingOwnerViewMode,
+        oracle: ferrum_runtime::SegmentBindingOracleMode,
+        owner_view_mode: ferrum_runtime::SegmentBindingOwnerViewMode,
         causal_decode_preparation: ferrum_types::CausalDecodePreparationMode,
         causal_decode_attention_grouping: ferrum_types::CausalDecodeAttentionGrouping,
         q4_mmvq_weight_decode: ferrum_types::Q4MmvqWeightDecode,
@@ -1719,8 +1719,8 @@ impl CudaVNextComposition {
         device_id: DeviceId,
         requested_attention_policy: AttentionExecutionPolicy,
         upload_strategy: ProgramBindingUploadStrategy,
-        oracle: ferrum_interfaces::vnext::SegmentBindingOracleMode,
-        owner_view_mode: ferrum_interfaces::vnext::SegmentBindingOwnerViewMode,
+        oracle: ferrum_runtime::SegmentBindingOracleMode,
+        owner_view_mode: ferrum_runtime::SegmentBindingOwnerViewMode,
         causal_decode_preparation: ferrum_types::CausalDecodePreparationMode,
         causal_decode_attention_grouping: ferrum_types::CausalDecodeAttentionGrouping,
         q4_mmvq_weight_decode: ferrum_types::Q4MmvqWeightDecode,
@@ -1750,8 +1750,8 @@ impl CudaVNextComposition {
         device_id: DeviceId,
         requested_attention_policy: AttentionExecutionPolicy,
         upload_strategy: ProgramBindingUploadStrategy,
-        oracle: ferrum_interfaces::vnext::SegmentBindingOracleMode,
-        owner_view_mode: ferrum_interfaces::vnext::SegmentBindingOwnerViewMode,
+        oracle: ferrum_runtime::SegmentBindingOracleMode,
+        owner_view_mode: ferrum_runtime::SegmentBindingOwnerViewMode,
         causal_decode_preparation: ferrum_types::CausalDecodePreparationMode,
         causal_decode_attention_grouping: ferrum_types::CausalDecodeAttentionGrouping,
         q4_mmvq_weight_decode: ferrum_types::Q4MmvqWeightDecode,
@@ -2010,8 +2010,8 @@ pub fn cuda_validated_native_operator_catalog_input_with_causal_decode_kv_reuse(
         requested_attention_policy,
         CudaCompositionPurpose::Execution,
         ProgramBindingUploadStrategy::Sparse,
-        ferrum_interfaces::vnext::SegmentBindingOracleMode::Disabled,
-        ferrum_interfaces::vnext::SegmentBindingOwnerViewMode::Legacy,
+        ferrum_runtime::SegmentBindingOracleMode::Disabled,
+        ferrum_runtime::SegmentBindingOwnerViewMode::Legacy,
         causal_decode_preparation,
         causal_decode_attention_grouping,
         q4_mmvq_weight_decode,
@@ -2183,8 +2183,8 @@ pub fn cuda_native_operator_catalog_input_with_causal_decode_kv_reuse(
         requested_attention_policy,
         CudaCompositionPurpose::NativeCatalogDeclaration,
         ProgramBindingUploadStrategy::Sparse,
-        ferrum_interfaces::vnext::SegmentBindingOracleMode::Disabled,
-        ferrum_interfaces::vnext::SegmentBindingOwnerViewMode::Legacy,
+        ferrum_runtime::SegmentBindingOracleMode::Disabled,
+        ferrum_runtime::SegmentBindingOwnerViewMode::Legacy,
         causal_decode_preparation,
         causal_decode_attention_grouping,
         q4_mmvq_weight_decode,
@@ -2871,7 +2871,7 @@ fn last_token_uses_dense_f16(precision: TokenPrecision, values: &[ResolvedValueB
                 && value.weight().is_some_and(|weight| {
                     !matches!(
                         weight.physical_layout(),
-                        ferrum_interfaces::vnext::PhysicalWeightLayout::Dense { .. }
+                        ferrum_runtime::PhysicalWeightLayout::Dense { .. }
                     )
                 })
         })
@@ -3772,7 +3772,7 @@ fn contiguous_bindings() -> Vec<ProviderStorageBindingRequirement> {
 }
 
 fn provider_failure(
-    identity: ferrum_interfaces::vnext::ExecutionIdentityEnvelope,
+    identity: ferrum_runtime::ExecutionIdentityEnvelope,
     stage: &'static str,
     message: String,
 ) -> OperationFailure {

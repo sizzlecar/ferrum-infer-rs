@@ -1,5 +1,5 @@
 use super::*;
-use ferrum_interfaces::model_executor::TokenSelectionMask;
+use ferrum_execution::model_executor::TokenSelectionMask;
 use ferrum_testkit::MockKvCacheHandle;
 
 fn prefill(request_id: RequestId, chunk: PrefillChunk) -> PlanRuntimePrefillInput {

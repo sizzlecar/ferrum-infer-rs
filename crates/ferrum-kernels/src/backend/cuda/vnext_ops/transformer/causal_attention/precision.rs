@@ -1,6 +1,6 @@
 //! Hidden-state ABI selection is independent of attention semantics and weights.
 use super::CausalAttentionSemantics;
-use ferrum_interfaces::vnext::ElementType;
+use ferrum_runtime::ElementType;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum CausalPrecision {

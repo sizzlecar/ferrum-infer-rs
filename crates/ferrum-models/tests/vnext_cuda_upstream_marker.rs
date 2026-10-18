@@ -1,7 +1,7 @@
 //! MarkerV2 graph fixture. CPU schema tests do not qualify the native artifact;
 //! ignored CUDA gates use actual providers, admitted flags and real state.
 
-use ferrum_interfaces::vnext::*;
+use ferrum_runtime::*;
 use half::f16;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;

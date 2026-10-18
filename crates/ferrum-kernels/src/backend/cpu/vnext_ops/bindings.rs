@@ -1,5 +1,5 @@
 use super::super::vnext_runtime::{CpuBufferRegion, CpuDeviceBuffer, CpuRuntimeError};
-use ferrum_interfaces::vnext::{
+use ferrum_runtime::{
     BatchedOperationInvocation, ElementType, NodeWorkContract, OperationBufferStorageKind,
     OperationBufferView, OperationInvocation, ResolvedTensorLayout, ResolvedValueBinding,
     ResolvedValueRole, ResourceId,

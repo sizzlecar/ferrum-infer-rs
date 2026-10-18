@@ -2,7 +2,7 @@
 
 use super::*;
 use crate::backend::metal::vnext_ops::MetalVNextComposition;
-use ferrum_interfaces::vnext::{BufferRequest, BufferUsage, DeviceId, ResourceId};
+use ferrum_runtime::{BufferRequest, BufferUsage, DeviceId, ResourceId};
 use half::f16;
 use metal::{CommandQueueRef, MTLCommandBufferStatus};
 

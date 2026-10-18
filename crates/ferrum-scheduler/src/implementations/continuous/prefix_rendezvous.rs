@@ -1,6 +1,6 @@
 //! Logical prefix dependencies before admission. No resource authority lives here.
 use super::*;
-use ferrum_interfaces::model_executor::PrefixCapturePlan;
+use ferrum_execution::model_executor::PrefixCapturePlan;
 use std::sync::Weak;
 
 #[derive(Clone, Debug)]
@@ -35,7 +35,7 @@ pub struct PrefixRendezvousCandidate {
 #[derive(Debug)]
 struct Dependency {
     boundary: usize,
-    span: ferrum_interfaces::vnext::CheckpointTokenSpanConstraint,
+    span: ferrum_runtime::CheckpointTokenSpanConstraint,
     pending: AtomicBool,
 }
 

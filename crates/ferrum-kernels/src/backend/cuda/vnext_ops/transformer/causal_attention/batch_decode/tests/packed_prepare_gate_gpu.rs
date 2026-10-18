@@ -8,7 +8,7 @@ use cudarc::driver::{
     sys::{CUgraphInstantiate_flags, CUstreamCaptureMode},
     CudaSlice, DevicePtr,
 };
-use ferrum_interfaces::vnext::DeviceId;
+use ferrum_runtime::DeviceId;
 use half::f16;
 
 const GUARD_WORDS: usize = 8;

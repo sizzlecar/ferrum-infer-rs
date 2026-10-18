@@ -12,7 +12,7 @@ use std::sync::Arc;
 use cudarc::cublas::CudaBlas;
 use cudarc::driver::{CudaFunction, CudaStream, LaunchConfig, PushKernelArg};
 use cudarc::nvrtc::Ptx;
-use ferrum_interfaces::vnext::{
+use ferrum_runtime::{
     gpt_oss_causal_paged_attention_contract, AttributeId, BatchedOperationInvocation, CapabilityId,
     ContractVersion, DeviceBatchingForm, DeviceReusableExecutionTopologyFingerprint, DeviceRuntime,
     DynamicStorageAllocator, DynamicStorageProfile, DynamicStorageRequirement, DynamicStorageView,
@@ -109,7 +109,7 @@ impl CudaGptOssCausalPagedAttentionProvider {
                 .fingerprint()
                 .map_err(contract_error)?,
             provider_fingerprint,
-            ferrum_interfaces::vnext::ProviderExecutionSemantics::bitwise_eager_and_replay(),
+            ferrum_runtime::ProviderExecutionSemantics::bitwise_eager_and_replay(),
             contract.descriptor().version,
             runtime.descriptor().id.clone(),
             BTreeSet::from([capability]),
@@ -2005,7 +2005,7 @@ fn invalid_plan(reason: impl Into<String>) -> VNextError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ferrum_interfaces::vnext::CanonicalRational;
+    use ferrum_runtime::CanonicalRational;
 
     fn rational(numerator: i64, denominator: u64) -> SemanticValue {
         SemanticValue::Rational(CanonicalRational::new(numerator, denominator).unwrap())

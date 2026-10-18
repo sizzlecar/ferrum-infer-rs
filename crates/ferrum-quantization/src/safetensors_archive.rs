@@ -4,7 +4,7 @@ use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use ferrum_interfaces::vnext::{
+use ferrum_runtime::{
     CanonicalRational, ElementType, RetainedHostMemoryRegion, StableHostMemory, VNextError,
     WeightComponentPayload, WeightComponentSource, WeightComponentSpec, WeightEncoding,
 };

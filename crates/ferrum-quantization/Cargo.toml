@@ -8,6 +8,7 @@ description = "Weight-format abstraction (Dense / GPTQ / AWQ / GGUF) for Ferrum 
 readme = "../../README.md"
 
 [dependencies]
+ferrum-runtime = { workspace = true }
 ferrum-types = { workspace = true }
 ferrum-interfaces = { workspace = true }
 ferrum-kernels = { workspace = true }

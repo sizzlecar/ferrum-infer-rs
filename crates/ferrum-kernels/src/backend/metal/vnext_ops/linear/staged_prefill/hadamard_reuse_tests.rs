@@ -1,7 +1,7 @@
 use super::tests::{bytes, overwrite, region};
 use super::*;
 use crate::backend::metal::vnext_ops::MetalVNextComposition;
-use ferrum_interfaces::vnext::DeviceId;
+use ferrum_runtime::DeviceId;
 use half::f16;
 use metal::MTLCommandBufferStatus;
 

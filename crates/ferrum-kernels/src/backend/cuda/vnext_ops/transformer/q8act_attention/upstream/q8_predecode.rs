@@ -2,7 +2,7 @@
 
 use super::{add, flag_bytes, mul, weights, PreparedProjectionNumerics};
 use crate::gguf_blocks::GgufBlockFormat;
-use ferrum_interfaces::vnext::WeightEncoding;
+use ferrum_runtime::WeightEncoding;
 use ferrum_types::Q8ProjectionWeightPreparation;
 
 /// This policy is about a physical leaf, including leaves of fused projections.

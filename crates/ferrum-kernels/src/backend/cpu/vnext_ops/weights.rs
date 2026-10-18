@@ -1,7 +1,7 @@
 use super::super::vnext_runtime::{CpuBufferRegion, CpuDeviceBuffer, CpuRuntimeError};
 use super::bindings::physical_region;
 use super::matrix::CpuMatrixFormat;
-use ferrum_interfaces::vnext::{
+use ferrum_runtime::{
     ElementType, OperationInvocation, PhysicalWeightLayout, PhysicalWeightPadding,
     ResolvedValueBinding, ResolvedWeightComponentLayout, WeightEncoding, WeightId,
 };

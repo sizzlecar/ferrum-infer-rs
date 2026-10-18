@@ -1,7 +1,7 @@
 //! Optional first-request prefix handoff. Scheduler holds are logical; native
 //! checkpoint leases alone own retained state through the existing ledger.
 use super::*;
-use ferrum_interfaces::model_executor::{
+use ferrum_execution::model_executor::{
     PrefixCaptureBoundary, PrefixCaptureLease, PrefixCaptureRequest, PrefixCaptureStatus,
 };
 use ferrum_scheduler::implementations::continuous::{PrefixRendezvousHold, PrefixRequestKey};

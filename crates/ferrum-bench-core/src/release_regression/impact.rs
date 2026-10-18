@@ -516,7 +516,7 @@ fn classify(path: &str) -> Option<(Vec<ChangeArea>, &'static str)> {
         return classify_bench_core(relative);
     }
     let (areas, reason) = match component {
-        "ferrum-types" | "ferrum-interfaces" => (
+        "ferrum-types" | "ferrum-interfaces" | "ferrum-runtime" | "ferrum-execution" => (
             ALL_AREAS.to_vec(),
             "shared contracts feed loading, request conversion, execution and validation",
         ),
@@ -587,6 +587,8 @@ fn known_component(component: &str) -> bool {
         component,
         "ferrum-types"
             | "ferrum-interfaces"
+            | "ferrum-runtime"
+            | "ferrum-execution"
             | "ferrum-engine"
             | "ferrum-sampler"
             | "ferrum-tokenizer"
@@ -1052,6 +1054,9 @@ mod tests {
     fn shared_contracts_and_engine_expand_interacting_behaviors() {
         for path in [
             "crates/ferrum-types/src/sampling.rs",
+            "crates/ferrum-interfaces/src/tokenizer.rs",
+            "crates/ferrum-runtime/src/resource.rs",
+            "crates/ferrum-execution/src/model_executor.rs",
             "crates/ferrum-engine/src/continuous_engine.rs",
         ] {
             let impact = analyze_paths([path]);

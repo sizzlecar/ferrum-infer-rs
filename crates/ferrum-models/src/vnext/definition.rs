@@ -3,7 +3,7 @@
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
-use ferrum_interfaces::vnext::{
+use ferrum_runtime::{
     ModelFamilyDefinition, ModelFamilyRegistration, NumericalExecutionPolicy, NumericalProfileId,
     StateCapacityDemand, StateLifetime, WeightComponentSource,
 };
@@ -67,7 +67,7 @@ impl DefinedProductionModel {
         &self,
         requested_model: impl Into<String>,
         resolved_model: impl Into<String>,
-    ) -> Result<ferrum_interfaces::vnext::ProductModelSourceIdentity> {
+    ) -> Result<ferrum_runtime::ProductModelSourceIdentity> {
         let template = &self.definition.metadata().template;
         self.sources.product_source_identity(
             requested_model,

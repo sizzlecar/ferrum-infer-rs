@@ -1,7 +1,7 @@
 //! Explicit SwiGLU provider; the retained plan is the sole leaf-route authority.
 use super::super::native_blocks::q8act::{self, Q8ActKernels};
 use super::*;
-use ferrum_interfaces::vnext::{PreparedProjectionNumerics, Q8ActSwiGluProfile};
+use ferrum_runtime::{PreparedProjectionNumerics, Q8ActSwiGluProfile};
 
 pub(in crate::backend::cuda::vnext_ops) struct CudaQ8ActSwiGluProvider {
     descriptor: OperationProviderDescriptor,

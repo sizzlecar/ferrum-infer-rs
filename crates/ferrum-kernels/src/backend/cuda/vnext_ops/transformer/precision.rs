@@ -1,6 +1,6 @@
 //! Declared activation types for dense normalization and residual providers.
 
-use ferrum_interfaces::vnext::{
+use ferrum_runtime::{
     residual_add_contract, residual_add_f32_f16_contract, rms_norm_contract, rms_norm_f32_contract,
     rms_norm_f32_to_f16_contract, ElementType, StandardOperationContract, VNextError,
     RESIDUAL_ADD_F16_CAPABILITY_ID, RESIDUAL_ADD_F32_F16_CAPABILITY_ID,

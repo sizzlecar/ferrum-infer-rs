@@ -6,7 +6,7 @@ use cudarc::driver::{
     sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT, CudaFunction,
 };
 use cudarc::nvrtc::Ptx;
-use ferrum_interfaces::vnext::{
+use ferrum_runtime::{
     routed_shared_swiglu_moe_contract, AttributeId, BatchedOperationInvocation, CapabilityId,
     ContractVersion, DeviceBatchingForm, DeviceRuntime, DynamicStorageRequirement, ElementType,
     EncodedDeviceOperation, OperationContract, OperationFailure, OperationProvider,
@@ -330,7 +330,7 @@ impl CudaRoutedSharedSwiGluMoeProvider {
                 .fingerprint()
                 .map_err(contract_error)?,
             provider_fingerprint,
-            ferrum_interfaces::vnext::ProviderExecutionSemantics::bitwise_eager_and_replay(),
+            ferrum_runtime::ProviderExecutionSemantics::bitwise_eager_and_replay(),
             contract.descriptor().version,
             runtime.descriptor().id.clone(),
             required_capabilities,
@@ -1148,18 +1148,17 @@ fn resolve_shared_marlin_weight_for_kind(
     logical_dimensions: &[u64],
     provider_kind: MoeProviderKind,
 ) -> Result<CudaMarlinMoeWeight, String> {
-    let resolve =
-        |participant: &ferrum_interfaces::vnext::OperationInvocation<'_, CudaDeviceBuffer>| {
-            let binding = binding(participant.bindings(), ResolvedValueRole::Input, ordinal)?;
-            match provider_kind {
-                MoeProviderKind::GptqMarlin => {
-                    resolve_gptq_marlin_moe_weight(participant, binding, logical_dimensions)
-                }
-                MoeProviderKind::MarlinFp8 => {
-                    resolve_marlin_fp8_moe_weight(participant, binding, logical_dimensions)
-                }
+    let resolve = |participant: &ferrum_runtime::OperationInvocation<'_, CudaDeviceBuffer>| {
+        let binding = binding(participant.bindings(), ResolvedValueRole::Input, ordinal)?;
+        match provider_kind {
+            MoeProviderKind::GptqMarlin => {
+                resolve_gptq_marlin_moe_weight(participant, binding, logical_dimensions)
             }
-        };
+            MoeProviderKind::MarlinFp8 => {
+                resolve_marlin_fp8_moe_weight(participant, binding, logical_dimensions)
+            }
+        }
+    };
     let first = &invocation.participants()[0];
     let resolved = resolve(first)?;
     for participant in &invocation.participants()[1..] {

@@ -1,5 +1,5 @@
 use super::*;
-use ferrum_interfaces::model_executor::PlanRuntimeMixedBatchOutcome;
+use ferrum_execution::model_executor::PlanRuntimeMixedBatchOutcome;
 
 pub(in crate::continuous_engine) enum MixedBatchDisposition {
     Completed,

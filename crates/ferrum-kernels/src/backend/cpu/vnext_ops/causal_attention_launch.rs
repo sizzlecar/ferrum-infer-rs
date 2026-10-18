@@ -1,4 +1,4 @@
-use ferrum_interfaces::vnext::{BatchedOperationInvocation, ElementType, ResolvedValueRole};
+use ferrum_runtime::{BatchedOperationInvocation, ElementType, ResolvedValueRole};
 
 use super::super::vnext_runtime::{
     CpuBufferRegion, CpuDeviceBuffer, CpuRegionSet, CpuRuntimeError,

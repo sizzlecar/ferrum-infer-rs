@@ -145,7 +145,7 @@ impl EngineInner {
     pub(super) fn validate_plan_runtime_decode_outputs(
         &self,
         inputs: &[PlanRuntimeDecodeInput],
-        outputs: &[ferrum_interfaces::model_executor::PlanRuntimeDecodeOutput],
+        outputs: &[ferrum_execution::model_executor::PlanRuntimeDecodeOutput],
     ) -> Result<()> {
         if outputs.len() != inputs.len() {
             return Err(FerrumError::internal(format!(
@@ -172,7 +172,7 @@ impl EngineInner {
     pub(super) async fn commit_plan_runtime_decode_outputs(
         &self,
         rids: &[RequestId],
-        outputs: Vec<ferrum_interfaces::model_executor::PlanRuntimeDecodeOutput>,
+        outputs: Vec<ferrum_execution::model_executor::PlanRuntimeDecodeOutput>,
         postprocess_started_at: Option<Instant>,
     ) -> Result<()> {
         for (rid, output) in rids.iter().zip(outputs) {
@@ -604,7 +604,7 @@ impl EngineInner {
     /// a real unified forward (Step 5), the same call benefits from the
     /// chunked-prefill kernel work without further engine changes.
     pub(super) async fn run_batch_decode(&self, request_ids: &[RequestId]) -> Result<()> {
-        use ferrum_interfaces::model_executor::{UnifiedBatch, UnifiedBatchItem};
+        use ferrum_execution::model_executor::{UnifiedBatch, UnifiedBatchItem};
 
         let mut rids: Vec<RequestId> = Vec::new();
 
@@ -802,7 +802,7 @@ impl EngineInner {
                 .ok_or_else(|| FerrumError::internal("No KV cache"))?;
             let tensor = self.tokens_to_tensor(&[resources.last_token.get()])?;
             let input =
-                ferrum_interfaces::model_executor::DecodeInput::new(tensor, resources.kv_cache)
+                ferrum_execution::model_executor::DecodeInput::new(tensor, resources.kv_cache)
                     .with_request_id(request_id.clone())
                     .with_metadata(seq.model_decode_metadata())
                     .with_logits_policy(seq.model_decode_logits_policy());

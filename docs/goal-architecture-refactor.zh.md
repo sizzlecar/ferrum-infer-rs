@@ -1,8 +1,8 @@
 # Goal：统一执行架构，为 SLO 优化建立可靠基础
 
-**状态：目标已激活，R0 实施中。** 工作分支：`refactor/execution-architecture-20261018`，从 2026-10-18 的干净 `main`（`c2be4c67`）开始。首个 checkpoint 退役独立 embedding/ASR/TTS 链路；原工作区未合并的旧 SLO 实现不作为代码基底。
+**状态：目标已激活，R0 已合并，R1 实施中。** 工作分支：`refactor/execution-architecture-20261018`，从 2026-10-18 的干净 `main`（`c2be4c67`）开始。首个 checkpoint 退役独立 embedding/ASR/TTS 链路；原工作区未合并的旧 SLO 实现不作为代码基底。
 
-R0 五批清理与正确性修复已合并（PR #429–#433），必需 CI 全过；包含旧 MoE/Candle 清理、LoRA 隔离、统一来源绑定及 GGUF/SafeTensors bias 数值回归。当前清退旧缓存、独立调度/模拟执行器、实验性投机解码及无实现文本注册，正在定向验证。R1 尚未开始；原始证据留在仓库外交接目录，没有新增性能或 SLO 达标声明。
+R0 六批清理与正确性修复已合并（PR #429–#434），必需 CI 全过。R1 首批分离 runtime 与产品执行契约，随后迁移泛型驱动；尚未完成核心控制流统一。原始证据留在仓库外交接目录，没有新增性能或 SLO 达标声明。
 
 ## 1. 目标与第一原则
 
@@ -73,8 +73,8 @@ MoE API 迁移：移除旧 `Qwen3MoeModel`、`Qwen3MoeConfig`、`Qwen3MoeLayer` 
 |---|---|---|
 | `ferrum-types` | 通用值类型、配置声明、能力与数值描述 | 自动调优策略、运行时全局变量、SLO 拟合逻辑 |
 | `ferrum-interfaces` | 不依赖执行实现的基础端口与公共语义，例如 tokenizer、sampler、模型描述 | 资源池实现、具体 runtime 授权、产品默认选择 |
-| `ferrum-runtime`（拟新增） | 计划准备、资源授权、提交/完成/退休、设备执行端口、复用与失效、实例上下文 | 请求 SLO 目标、统计特征、模型名称策略 |
-| `ferrum-execution`（拟新增） | 建立在 runtime 授权之上的产品执行契约、泛型执行驱动、结果/延期/取消协议；契约与驱动分模块 | 第二套资源运行时、具体模型/后端装配、训练器、HTTP 协议 |
+| `ferrum-runtime` | 计划准备、资源授权、提交/完成/退休、设备执行端口、复用与失效、实例上下文 | 请求 SLO 目标、统计特征、模型名称策略 |
+| `ferrum-execution` | 建立在 runtime 授权之上的产品执行契约、泛型执行驱动、结果/延期/取消协议；契约与驱动分模块 | 第二套资源运行时、具体模型/后端装配、训练器、HTTP 协议 |
 | `ferrum-models` / `ferrum-kernels` | 模型语义与计划生成；CPU/Metal/CUDA 的具体执行、布局和数值能力 | 校准样本目录、训练 schema、SLO 拒单策略 |
 | `ferrum-engine` | 请求生命周期协调、采样、执行事务、输出额度与取消 | 重复的物理资源账本、训练器、HTTP 协议拼装 |
 | `ferrum-scheduler` | 队列、批组成、资源/时间准入策略；成本估计的消费接口 | KV/graph 的直接所有权、输出传输、后台模型发布状态机 |
@@ -83,7 +83,9 @@ MoE API 迁移：移除旧 `Qwen3MoeModel`、`Qwen3MoeConfig`、`Qwen3MoeLayer` 
 | 产品装配层与 `ferrum-server` | 统一配置解析、能力选择；HTTP/SSE 协议与传输 | 另起一套执行与缓存状态机 |
 | benchmark / devtools | 工作负载驱动、客户端测量、profile 存档、发布检查 | 成为生产 kernels/runtime 的普通依赖 |
 
-依赖方向（箭头指向被依赖者）：`engine → scheduler → execution → runtime → interfaces → types`，Engine 也直接消费 execution；execution 不反向依赖 scheduler。kernels 实现 runtime 的设备端口，models 提供语义/权重和合法执行实现；execution/runtime 不反向依赖 models 或具体 kernels。基础 interfaces 不重导出依赖自己的上层 crate。SLO 组件消费只读执行事实，发布策略快照；数据面不反向依赖 SLO 实现。新 crate 名称可在 R1 调整，但上述责任和依赖关系必须落地，同时更新 workspace membership 和发布依赖顺序。
+依赖方向（箭头指向被依赖者）：`engine → scheduler → execution → {runtime, interfaces} → types`，Engine 也直接消费 execution；execution 不反向依赖 scheduler。runtime 当前不需要依赖 interfaces。kernels 实现 runtime 的设备端口，models 提供语义/权重和合法执行实现；execution/runtime 不反向依赖 models 或具体 kernels。基础 interfaces 不重导出依赖自己的上层 crate。SLO 组件消费只读执行事实，发布策略快照；数据面不反向依赖 SLO 实现。上述责任和依赖关系必须落地，同时更新 workspace membership 和发布依赖顺序。
+
+R1 首批 Rust API 迁移：原 `ferrum_interfaces::vnext::*` 改为 `ferrum_runtime::*`，原 `model_executor` 与 `ModelExecutor` 改由 `ferrum_execution` 导出。产品 prefix 观测使用其 `ProductExecutionEventSink`；同一实例可向上转型为 runtime sink，不增加队列或放宽事件授权。基础 interfaces 不保留向上重导出。此批只拆契约依赖；泛型驱动迁移与单一执行协议仍待完成。
 
 产品装配层组合模型准备结果、具体设备 runtime 与泛型驱动。迁移 `VNextModelExecutor<R>` 时同时解开其对 `PreparedProductionModel` 的依赖，将中立准备输入与编译结果归到正确层，并保留 source/registry/初始化身份校验；不能整文件搬迁后让 execution 再引用 models。泛型驱动本身已后端中立，不能将这项整理描述成新消除的具体 GPU 绑定。量化格式描述/解析与设备执行也按此分层，不能经 quantization 引回 kernels 依赖环。
 

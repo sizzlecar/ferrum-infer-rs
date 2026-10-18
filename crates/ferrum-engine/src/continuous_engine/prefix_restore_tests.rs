@@ -1,16 +1,16 @@
 //! Engine publication tests. Native copy/numerical correctness is exercised
 //! by the runtime tests; this fixture detects scheduling and ownership errors.
 use super::*;
-use ferrum_interfaces::model_executor::{
+use ferrum_execution::model_executor::{
     PlanRuntimePrefixRestoreInput, PlanRuntimePrefixRestoreOutcome, PlanRuntimePrefixRestoreOutput,
 };
 
 #[test]
 fn prefix_restore_decisions_reach_run_and_serve_journals_with_capacity_evidence() {
-    use ferrum_interfaces::model_executor::{
+    use ferrum_execution::model_executor::{
         PrefixRestoreDecision, PrefixRestoreObservation, PrefixRestoreSource,
     };
-    use ferrum_interfaces::vnext::{
+    use ferrum_runtime::{
         CapacityAvailabilityEpoch, CapacityAvailabilitySource, CapacityWaitCondition,
     };
     use std::num::NonZeroU64;

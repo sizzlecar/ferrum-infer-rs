@@ -4,7 +4,7 @@ use super::*;
 pub(super) fn encode(
     provider: &CudaQ6MmqF32LastTokenProvider,
     invocation: BatchedOperationInvocation<'_, CudaDeviceBuffer>,
-    segment_declaration: Option<&mut Option<ferrum_interfaces::vnext::SegmentBindingDeclaration>>,
+    segment_declaration: Option<&mut Option<ferrum_runtime::SegmentBindingDeclaration>>,
 ) -> Result<EncodedDeviceOperation<CudaDeviceCommand>, String> {
     let mut segment_validations = segment_declaration.as_ref().map(|_| Vec::new());
     let precision = TokenPrecision::F32;

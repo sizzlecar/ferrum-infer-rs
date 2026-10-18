@@ -5,7 +5,7 @@ use crate::backend::cuda::vnext_runtime::CudaDeviceRuntimeError;
 use crate::gguf_blocks::GgufBlockFormat;
 use cudarc::driver::{CudaContext, CudaFunction, CudaStream, LaunchConfig, PushKernelArg};
 use cudarc::nvrtc::Ptx;
-use ferrum_interfaces::vnext::{
+use ferrum_runtime::{
     ElementType, PreparedProjection, PreparedProjectionNumerics, Q8ActSwiGluProfile, WeightEncoding,
 };
 use std::sync::Arc;

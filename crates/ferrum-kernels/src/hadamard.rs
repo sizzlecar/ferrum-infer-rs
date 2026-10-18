@@ -4,7 +4,7 @@
 //! below are also checked against the direct Walsh matrix, independently of
 //! the butterfly scheduling used by device kernels.
 
-use ferrum_interfaces::vnext::{HadamardApplication, HadamardSigns, HadamardTransformSpec};
+use ferrum_runtime::{HadamardApplication, HadamardSigns, HadamardTransformSpec};
 
 pub(crate) fn apply_reference(
     input: &[f32],
@@ -87,14 +87,14 @@ pub(crate) fn apply_reference(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ferrum_interfaces::vnext::{GroupedFeatureTranspose, PhysicalWeightComponentBinding};
+    use ferrum_runtime::{GroupedFeatureTranspose, PhysicalWeightComponentBinding};
 
     fn spec(block: u32, signed: bool, inverse: bool) -> HadamardTransformSpec {
         HadamardTransformSpec {
             block_size: block.try_into().unwrap(),
             signs: if signed {
                 HadamardSigns::Explicit(PhysicalWeightComponentBinding::exact_contiguous(
-                    ferrum_interfaces::vnext::WeightId::new("test.signs").unwrap(),
+                    ferrum_runtime::WeightId::new("test.signs").unwrap(),
                 ))
             } else {
                 HadamardSigns::Identity

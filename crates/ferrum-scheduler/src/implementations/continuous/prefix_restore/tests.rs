@@ -1,7 +1,7 @@
 use super::*;
 use crate::vnext::{AdmissionProbeOutcome, AdmissionWakeEpochs, AdmissionWakeSnapshot};
 use crate::{BatchHint, Scheduler};
-use ferrum_interfaces::model_executor::ExecutorPrefillAdmissionReceipt;
+use ferrum_execution::model_executor::ExecutorPrefillAdmissionReceipt;
 use ferrum_types::{InferenceRequest, SchedulerConfig, PROMPT_TOKENS_METADATA_KEY};
 use std::num::NonZeroU64;
 use std::sync::atomic::Ordering;
@@ -371,12 +371,12 @@ fn restore_capacity(
     epoch: u64,
 ) -> (
     ExecutorExecutionCapacityDeferral,
-    Vec<ferrum_interfaces::vnext::CapacityAvailabilityEpoch>,
+    Vec<ferrum_runtime::CapacityAvailabilityEpoch>,
 ) {
-    use ferrum_interfaces::model_executor::{
+    use ferrum_execution::model_executor::{
         ExecutorAdmissionEpochs, ExecutorExecutionCapacityStage,
     };
-    use ferrum_interfaces::vnext::{
+    use ferrum_runtime::{
         CapacityAvailabilityEpoch, CapacityAvailabilitySource, CapacityWaitCondition,
         DeviceCapacityPressure, DeviceCapacityPressureScope,
     };
@@ -409,13 +409,13 @@ fn releasers(ids: &[RequestId]) -> ExecutionCapacityReleaseSnapshot {
     ExecutionCapacityReleaseSnapshot::new(ids.iter().cloned().map(|id| {
         (
             id,
-            vec![ferrum_interfaces::vnext::CapacityAvailabilitySource::PlanDeviceBudget],
+            vec![ferrum_runtime::CapacityAvailabilitySource::PlanDeviceBudget],
         )
     }))
 }
 
 fn capacity_wake(
-    availability: &[ferrum_interfaces::vnext::CapacityAvailabilityEpoch],
+    availability: &[ferrum_runtime::CapacityAvailabilityEpoch],
 ) -> AdmissionWakeSnapshot<'_> {
     AdmissionWakeSnapshot::new(
         AdmissionWakeEpochs::new(NonZeroU64::new(1).unwrap(), 1, 1, 0),

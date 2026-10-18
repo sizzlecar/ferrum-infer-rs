@@ -10,7 +10,7 @@ use std::ops::Range;
 #[cfg(any(feature = "cuda", test))]
 pub(crate) mod warmup;
 
-use ferrum_interfaces::vnext::{
+use ferrum_runtime::{
     DeviceCommandPhase, DeviceReusableExecutionPlan, DeviceReusableExecutionPreparation,
 };
 
@@ -285,15 +285,13 @@ impl ReusableExecutionPreparationTracker {
 
 #[cfg(test)]
 mod tests {
-    use ferrum_interfaces::vnext::DeviceCommandPhase;
+    use ferrum_runtime::DeviceCommandPhase;
 
     use super::{
         discover_reusable_segments, plan_bounded_reusable_execution,
         ReusableExecutionPreparationTracker,
     };
-    use ferrum_interfaces::vnext::{
-        DeviceReusableExecutionPlan, DeviceReusableExecutionPreparationState,
-    };
+    use ferrum_runtime::{DeviceReusableExecutionPlan, DeviceReusableExecutionPreparationState};
 
     #[test]
     fn segment_discovery_splits_every_eager_barrier_and_unkeyed_compute() {

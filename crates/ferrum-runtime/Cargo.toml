@@ -1,0 +1,23 @@
+[package]
+name = "ferrum-runtime"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Backend-neutral execution and resource contracts for Ferrum"
+readme = "../../README.md"
+
+[dependencies]
+ferrum-types = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = "0.10"
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+trybuild = "1.0"
+syn = { version = "2", features = ["full", "visit"] }
+proc-macro2 = "1"

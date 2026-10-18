@@ -3,7 +3,7 @@
 
 use std::collections::BTreeMap;
 
-use ferrum_interfaces::vnext::{
+use ferrum_runtime::{
     AttributeId, GatedDeltaDecayParameterization, GatedDeltaValueHeadMapping, SemanticValue,
 };
 use rayon::prelude::*;

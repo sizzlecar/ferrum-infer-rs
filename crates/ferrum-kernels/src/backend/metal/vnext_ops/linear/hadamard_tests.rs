@@ -1,6 +1,6 @@
 use super::*;
 use crate::backend::metal::vnext_ops::MetalVNextComposition;
-use ferrum_interfaces::vnext::{
+use ferrum_runtime::{
     BufferRequest, BufferUsage, DeviceId, HadamardApplication, HadamardSigns,
     HadamardTransformSpec, PhysicalWeightComponentBinding, ResourceId, WeightId,
 };

@@ -8,6 +8,7 @@ description = "Unified compute kernels (CUDA/Metal/CPU) and model runner for Fer
 readme = "../../README.md"
 
 [dependencies]
+ferrum-runtime = { workspace = true }
 ferrum-types = { workspace = true }
 ferrum-interfaces = { workspace = true }
 ferrum-native-ops = { workspace = true }

@@ -1,15 +1,15 @@
 use super::*;
-use ferrum_interfaces::model_executor::PrefixRestoreObservation;
+use ferrum_execution::model_executor::PrefixRestoreObservation;
 
 pub(super) struct PrefixRestoreObserver {
-    sink: Option<Arc<dyn ExecutionEventSink>>,
+    sink: Option<Arc<dyn ProductExecutionEventSink>>,
     request_id: RequestId,
     source: PrefixRestoreSource,
 }
 
 impl PrefixRestoreObserver {
     pub(super) fn new(
-        sink: Option<Arc<dyn ExecutionEventSink>>,
+        sink: Option<Arc<dyn ProductExecutionEventSink>>,
         request_id: RequestId,
         source: PrefixRestoreSource,
     ) -> Self {
@@ -85,6 +85,15 @@ mod tests {
         fn is_enabled(&self, _: ExecutionEventKind) -> bool {
             false
         }
+        fn record(
+            &self,
+            _: EventEmissionPermit,
+        ) -> std::result::Result<(), ExecutionEventSinkError> {
+            panic!("prefix decisions must not manufacture execution cursor events")
+        }
+    }
+
+    impl ProductExecutionEventSink for Sink {
         fn records_prefix_restore_decisions(&self) -> bool {
             self.enabled
         }
@@ -100,12 +109,6 @@ mod tests {
             } else {
                 Ok(())
             }
-        }
-        fn record(
-            &self,
-            _: EventEmissionPermit,
-        ) -> std::result::Result<(), ExecutionEventSinkError> {
-            panic!("prefix decisions must not manufacture execution cursor events")
         }
     }
 

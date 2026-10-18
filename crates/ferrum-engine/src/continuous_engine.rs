@@ -13,10 +13,7 @@ use async_trait::async_trait;
 use ferrum_bench_core::{
     global_profile, profile_fields_from_json, JsonlJournal, JsonlJournalError,
 };
-use ferrum_interfaces::{
-    adapter::AdapterExecutionSupport,
-    engine::{InferenceEngine, LlmInferenceEngine},
-    kv_cache::AllocationRequest,
+use ferrum_execution::{
     model_executor::{
         ExecutionResourceAuthority, ExecutorAdmissionEpochs, ExecutorCapacityWaitRegistration,
         ExecutorExecutionCapacityDeferral, ExecutorExecutionCapacityPreemption,
@@ -29,19 +26,25 @@ use ferrum_interfaces::{
         PlanRuntimePrefillInput, PlanRuntimePrefillOutcome, PlanRuntimePrefillProduct,
         TokenSelectionMask,
     },
+    ModelExecutor, ProductExecutionEventSink,
+};
+use ferrum_interfaces::{
+    adapter::AdapterExecutionSupport,
+    engine::{InferenceEngine, LlmInferenceEngine},
+    kv_cache::AllocationRequest,
     sampler::{SamplingConfig as TokenSamplingPlan, SamplingRng},
-    vnext::{
-        AdmissionDeferred, AdmissionRejected, BoundDeviceSubmissionAttribution,
-        BoundExecutionResourceMaintenance, CapacityAvailabilityEpoch, DeferredAction,
-        DeviceCapacityPressureScope, DeviceExecutionSpanKind, DeviceExecutionSpanMeasurement,
-        DeviceSubmissionExecutionSpan, DeviceSubmissionExecutionTiming, DeviceTimingMeasurement,
-        DeviceTimingUnavailableReason, EventBatchEmissionPermit, EventEmissionPermit,
-        ExecutionEvent, ExecutionEventCapturePolicy, ExecutionEventDetail,
-        ExecutionEventKind as VNextExecutionEventKind, ExecutionEventSink, ExecutionEventSinkError,
-        OperationCompletionReceipt,
-    },
-    KvCacheHandle, KvCacheManager, ModelExecutor, RecurrentStateHandle, RecurrentStateManager,
-    Sampler, SchedulerInterface as Scheduler, TensorFactory, TensorRef, Tokenizer,
+    KvCacheHandle, KvCacheManager, RecurrentStateHandle, RecurrentStateManager, Sampler,
+    SchedulerInterface as Scheduler, TensorFactory, TensorRef, Tokenizer,
+};
+use ferrum_runtime::{
+    AdmissionDeferred, AdmissionRejected, BoundDeviceSubmissionAttribution,
+    BoundExecutionResourceMaintenance, CapacityAvailabilityEpoch, DeferredAction,
+    DeviceCapacityPressureScope, DeviceExecutionSpanKind, DeviceExecutionSpanMeasurement,
+    DeviceSubmissionExecutionSpan, DeviceSubmissionExecutionTiming, DeviceTimingMeasurement,
+    DeviceTimingUnavailableReason, EventBatchEmissionPermit, EventEmissionPermit, ExecutionEvent,
+    ExecutionEventCapturePolicy, ExecutionEventDetail,
+    ExecutionEventKind as VNextExecutionEventKind, ExecutionEventSink, ExecutionEventSinkError,
+    OperationCompletionReceipt,
 };
 use ferrum_sampler::structured_output::{StructuredOutputFactory, StructuredOutputProcessor};
 use ferrum_scheduler::implementations::{
@@ -2747,7 +2750,7 @@ impl ContinuousBatchEngine {
                 execution_profile_journals.push(journal.clone());
             }
         }
-        let execution_sink: Option<Arc<dyn ExecutionEventSink>> =
+        let execution_sink: Option<Arc<dyn ProductExecutionEventSink>> =
             if !execution_profile_journals.is_empty() {
                 Some(Arc::new(VNextProfileExecutionEventSink::with_journals(
                     execution_profile_journals,

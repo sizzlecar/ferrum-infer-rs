@@ -1,5 +1,5 @@
 use super::*;
-use ferrum_interfaces::vnext::{DeviceTimingMode, ExecutionEventSinkEnablement};
+use ferrum_runtime::{DeviceTimingMode, ExecutionEventSinkEnablement};
 
 #[test]
 fn basic_metrics_only_attaches_to_target_without_journals() {

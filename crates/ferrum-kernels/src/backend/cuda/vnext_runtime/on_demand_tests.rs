@@ -7,7 +7,7 @@ use crate::backend::cuda::vnext_replay::{
 };
 use cudarc::driver::{sys, CudaSlice, DevicePtr, LaunchConfig, PushKernelArg};
 use cudarc::nvrtc::Ptx;
-use ferrum_interfaces::vnext::{
+use ferrum_runtime::{
     DeviceReusableExecutionCapture, DeviceReusableExecutionPreparationState,
     DeviceReusableExecutionProgramId, ExecutionLane, PlanHash, ReusableExecutionBucketSpec,
     ReusableExecutionCapacity, ReusableExecutionClassId,
@@ -264,7 +264,7 @@ fn on_demand_logical_catalog_is_bounded_and_stale_references_miss_before_launch(
                 &nodes,
                 &commands,
                 &preparation,
-                &ferrum_interfaces::vnext::DisabledDeviceSubmissionTimingSink,
+                &ferrum_runtime::DisabledDeviceSubmissionTimingSink,
             )
             .unwrap();
         let catalog = h.cache.catalog().unwrap();
@@ -319,7 +319,7 @@ fn on_demand_forced_eager_preserves_resident_program_and_recipe_for_replay() {
     let commands = [h.command(1, false)];
     let phases = [DeviceCommandPhase::Compute];
     let nodes = [Some(0)];
-    let sink = ferrum_interfaces::vnext::DisabledDeviceSubmissionTimingSink;
+    let sink = ferrum_runtime::DisabledDeviceSubmissionTimingSink;
     let candidates = cuda_executable_candidates(&phases, &commands, Some(&nodes), &[]).unwrap();
     let preparation = h
         .cache

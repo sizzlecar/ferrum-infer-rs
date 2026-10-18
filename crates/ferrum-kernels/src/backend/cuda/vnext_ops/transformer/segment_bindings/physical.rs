@@ -3,7 +3,7 @@ use super::*;
 use crate::backend::cuda::vnext_runtime::{
     CudaBindingProgramSink, CudaPhysicalOwnerBuilder, CudaPhysicalRowWindow,
 };
-use ferrum_interfaces::vnext::{
+use ferrum_runtime::{
     OperationBufferStorageKind, PreparedPhysicalSegmentNodeView, PreparedPhysicalSegmentWave,
 };
 

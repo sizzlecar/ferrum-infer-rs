@@ -20,13 +20,10 @@ use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::atomic::AtomicU64;
 
-use ferrum_interfaces::{
-    kv_dtype::{KvDtypeKind, KvFp16, KvInt8},
-    model_executor::{
-        KvSlotAllocation, KvSlotCapacitySnapshot, KvSlotRequest, KvSlotReservation,
-        LogitsReturnPolicy,
-    },
+use ferrum_execution::model_executor::{
+    KvSlotAllocation, KvSlotCapacitySnapshot, KvSlotRequest, KvSlotReservation, LogitsReturnPolicy,
 };
+use ferrum_interfaces::kv_dtype::{KvDtypeKind, KvFp16, KvInt8};
 use ferrum_kernels::backend::{
     Backend, BackendGraph, BackendInt8KvOps, BackendMoeFused, BackendPagedKv, BackendQuantGguf,
     BackendQuantMarlin, KvCache, KvLayer, LlmBackend, MoeLlmBackend, QuantLlmBackend,
@@ -1497,7 +1494,7 @@ impl<B: QuantLlmBackend + BackendMoeFused> LlamaFamilyScratch<B> {
     pub(crate) fn ensure_argmax_token_mask(
         &mut self,
         ctx: &mut B::Context,
-        mask: &ferrum_interfaces::model_executor::TokenSelectionMask,
+        mask: &ferrum_execution::model_executor::TokenSelectionMask,
     ) -> &B::Buffer {
         let needs_upload = self.argmax_token_mask_fingerprint != Some(mask.fingerprint)
             || self.argmax_token_mask_len != mask.len();
@@ -1520,7 +1517,7 @@ impl<B: QuantLlmBackend + BackendMoeFused> LlamaFamilyScratch<B> {
     pub(crate) fn upload_argmax_repetition_penalties(
         &mut self,
         ctx: &mut B::Context,
-        penalties: &[Option<&ferrum_interfaces::model_executor::GreedyRepetitionPenalty>],
+        penalties: &[Option<&ferrum_execution::model_executor::GreedyRepetitionPenalty>],
     ) -> usize {
         let mut offsets = Vec::with_capacity(penalties.len() + 1);
         let mut token_ids = Vec::new();
@@ -5795,7 +5792,7 @@ mod tests {
         ]);
 
         let first = model
-            .reserve_paged_kv_slots(&[ferrum_interfaces::model_executor::KvSlotRequest {
+            .reserve_paged_kv_slots(&[ferrum_execution::model_executor::KvSlotRequest {
                 cache_id: "seq-a".to_string(),
                 target_len: 17,
                 admission_target_len: None,
@@ -5814,7 +5811,7 @@ mod tests {
             .all(|cache| cache.paged_block_indices == vec![0, 1]));
 
         let idempotent = model
-            .reserve_paged_kv_slots(&[ferrum_interfaces::model_executor::KvSlotRequest {
+            .reserve_paged_kv_slots(&[ferrum_execution::model_executor::KvSlotRequest {
                 cache_id: "seq-a".to_string(),
                 target_len: 17,
                 admission_target_len: None,
@@ -5826,7 +5823,7 @@ mod tests {
         assert_eq!(idempotent.free_blocks_after, 1);
 
         let err = model
-            .reserve_paged_kv_slots(&[ferrum_interfaces::model_executor::KvSlotRequest {
+            .reserve_paged_kv_slots(&[ferrum_execution::model_executor::KvSlotRequest {
                 cache_id: "seq-b".to_string(),
                 target_len: 33,
                 admission_target_len: None,
@@ -5868,7 +5865,7 @@ mod tests {
         ]);
 
         let err = model
-            .reserve_paged_kv_slots(&[ferrum_interfaces::model_executor::KvSlotRequest {
+            .reserve_paged_kv_slots(&[ferrum_execution::model_executor::KvSlotRequest {
                 cache_id: "seq-a".to_string(),
                 target_len: 1,
                 admission_target_len: Some(33),

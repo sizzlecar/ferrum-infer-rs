@@ -163,8 +163,8 @@ impl KvCacheHandle for GenericKvCacheHandle {
 // ======================== Default Executor Status ========================
 
 /// Default executor status (all executors return the same thing).
-pub fn default_executor_status() -> ferrum_interfaces::model_executor::ExecutorStatus {
-    use ferrum_interfaces::model_executor::*;
+pub fn default_executor_status() -> ferrum_execution::model_executor::ExecutorStatus {
+    use ferrum_execution::model_executor::*;
     ExecutorStatus {
         state: ExecutorState::Ready,
         is_ready: true,
@@ -274,7 +274,7 @@ mod tests {
         assert!(status.is_ready);
         assert_eq!(
             status.state,
-            ferrum_interfaces::model_executor::ExecutorState::Ready
+            ferrum_execution::model_executor::ExecutorState::Ready
         );
     }
 }

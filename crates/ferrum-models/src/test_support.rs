@@ -13,9 +13,10 @@
 
 use std::sync::Arc;
 
+use ferrum_execution::ModelExecutor;
 use ferrum_interfaces::kv_dtype::KvFp16;
 use ferrum_interfaces::tokenizer::{TokenizerInfo, TokenizerType};
-use ferrum_interfaces::{ModelExecutor, Tokenizer};
+use ferrum_interfaces::Tokenizer;
 use ferrum_kernels::backend::{cpu::CpuBackend, Backend};
 use ferrum_quantization::{DenseLinear, QuantConfig, WeightLoader};
 use ferrum_types::{

@@ -10,7 +10,7 @@ use cudarc::driver::{
     sys::{CUgraphInstantiate_flags, CUstreamCaptureMode},
     DevicePtr,
 };
-use ferrum_interfaces::vnext::DeviceId;
+use ferrum_runtime::DeviceId;
 use half::f16;
 
 #[test]

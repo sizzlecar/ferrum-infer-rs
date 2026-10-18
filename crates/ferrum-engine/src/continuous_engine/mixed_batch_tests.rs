@@ -1,5 +1,5 @@
 use super::*;
-use ferrum_interfaces::model_executor::PlanRuntimeMixedBatchOutcome;
+use ferrum_execution::model_executor::PlanRuntimeMixedBatchOutcome;
 
 #[derive(Clone, Copy)]
 pub(super) enum MixedBehavior {
@@ -23,16 +23,14 @@ impl PlanRuntimeBatchDecodeTestExecutor {
         };
         match behavior {
             MixedBehavior::NotSubmitted => {
-                let observed = ferrum_interfaces::vnext::CapacityAvailabilityEpoch::new(
-                    ferrum_interfaces::vnext::CapacityAvailabilitySource::ActiveSequenceSlots,
+                let observed = ferrum_runtime::CapacityAvailabilityEpoch::new(
+                    ferrum_runtime::CapacityAvailabilitySource::ActiveSequenceSlots,
                     1,
                 )
                 .unwrap();
-                let wait = ferrum_interfaces::vnext::CapacityWaitCondition::from_observation(
-                    47,
-                    vec![observed],
-                )
-                .unwrap();
+                let wait =
+                    ferrum_runtime::CapacityWaitCondition::from_observation(47, vec![observed])
+                        .unwrap();
                 return Ok(PlanRuntimeMixedBatchOutcome::NotSubmitted(
                     test_execution_capacity_deferral(
                         ExecutorAdmissionEpochs::new(std::num::NonZeroU64::new(47).unwrap(), 0, 0),

@@ -13,7 +13,7 @@ use cudarc::driver::{
     LaunchConfig, PushKernelArg,
 };
 use cudarc::nvrtc::Ptx;
-use ferrum_interfaces::vnext::{
+use ferrum_runtime::{
     gpt_oss_routed_clamped_swiglu_moe_contract, AttributeId, BatchedOperationInvocation,
     CanonicalRational, CapabilityId, ContractVersion, DeviceBatchingForm, DeviceRuntime,
     DynamicStorageRequirement, ElementType, EncodedDeviceOperation, OperationContract,
@@ -451,7 +451,7 @@ impl CudaGptOssRoutedClampedSwiGluMoeProvider {
                 .fingerprint()
                 .map_err(contract_error)?,
             provider_fingerprint,
-            ferrum_interfaces::vnext::ProviderExecutionSemantics::bitwise_eager_and_replay(),
+            ferrum_runtime::ProviderExecutionSemantics::bitwise_eager_and_replay(),
             contract.descriptor().version,
             runtime.descriptor().id.clone(),
             BTreeSet::from([capability]),

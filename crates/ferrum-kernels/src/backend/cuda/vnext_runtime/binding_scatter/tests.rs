@@ -3,7 +3,7 @@
 
 use super::super::{CudaCommandExecutable, CudaDeviceRuntime};
 use super::*;
-use ferrum_interfaces::vnext::{DeviceId, DeviceRuntime};
+use ferrum_runtime::{DeviceId, DeviceRuntime};
 use ferrum_types::AttentionExecutionPolicy;
 
 const CANARY: u8 = 0xd3;

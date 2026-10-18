@@ -2,7 +2,7 @@
 //! The core grants a fresh logical window before these pre-sliced rows are used.
 use super::segment_owners::CudaRegionView;
 use super::*;
-use ferrum_interfaces::vnext::{DynamicStorageView, SequencePhysicalBindingTable};
+use ferrum_runtime::{DynamicStorageView, SequencePhysicalBindingTable};
 use std::collections::HashMap;
 
 pub(crate) struct CudaSequencePhysicalTable {

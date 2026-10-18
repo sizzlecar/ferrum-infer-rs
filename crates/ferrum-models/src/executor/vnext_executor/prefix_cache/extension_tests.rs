@@ -1,8 +1,8 @@
 use super::*;
 use checkpoint_fixture::{Fixture, Spec};
-use ferrum_interfaces::vnext::*;
+use ferrum_runtime::*;
 
-#[path = "../../../../../ferrum-interfaces/tests/vnext_resource_contract/support.rs"]
+#[path = "../../../../../ferrum-runtime/tests/vnext_resource_contract/support.rs"]
 mod resource_fixture;
 
 #[test]

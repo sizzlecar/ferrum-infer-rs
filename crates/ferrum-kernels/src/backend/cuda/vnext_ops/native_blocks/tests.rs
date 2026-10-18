@@ -91,14 +91,13 @@ fn native_block_decoding_matches_shared_ggml_oracle_on_cuda() {
 
 trait Scalar: DeviceRepr + ValidAsZeroBits + Copy + std::fmt::Debug {
     const ROUNDING: f64;
-    const ELEMENT_TYPE: ferrum_interfaces::vnext::ElementType;
+    const ELEMENT_TYPE: ferrum_runtime::ElementType;
     fn from_f32(value: f32) -> Self;
     fn as_f32(self) -> f32;
 }
 impl Scalar for f32 {
     const ROUNDING: f64 = f32::EPSILON as f64;
-    const ELEMENT_TYPE: ferrum_interfaces::vnext::ElementType =
-        ferrum_interfaces::vnext::ElementType::F32;
+    const ELEMENT_TYPE: ferrum_runtime::ElementType = ferrum_runtime::ElementType::F32;
     fn from_f32(value: f32) -> Self {
         value
     }
@@ -108,8 +107,7 @@ impl Scalar for f32 {
 }
 impl Scalar for f16 {
     const ROUNDING: f64 = 0.0009765625;
-    const ELEMENT_TYPE: ferrum_interfaces::vnext::ElementType =
-        ferrum_interfaces::vnext::ElementType::F16;
+    const ELEMENT_TYPE: ferrum_runtime::ElementType = ferrum_runtime::ElementType::F16;
     fn from_f32(value: f32) -> Self {
         f16::from_f32(value)
     }
@@ -296,12 +294,12 @@ fn native_block_embeddings_preserve_f16_and_f32_activations_on_cuda() {
 #[test]
 #[ignore = "requires an actual CUDA device"]
 fn native_matrix_launcher_preserves_mixed_dense_and_block_partitions() {
-    use ferrum_interfaces::vnext::ElementType;
+    use ferrum_runtime::ElementType;
     mixed_matrix::<f16>(ElementType::F16);
     mixed_matrix::<f32>(ElementType::F32);
 }
 
-fn mixed_matrix<T: Scalar>(activation: ferrum_interfaces::vnext::ElementType) {
+fn mixed_matrix<T: Scalar>(activation: ferrum_runtime::ElementType) {
     for (format, columns) in [
         (GgufBlockFormat::Iq4Xs, 512),
         (GgufBlockFormat::Pq2_0, 384),
@@ -315,13 +313,13 @@ fn mixed_matrix<T: Scalar>(activation: ferrum_interfaces::vnext::ElementType) {
 }
 
 fn mixed_matrix_rows<T: Scalar>(
-    activation: ferrum_interfaces::vnext::ElementType,
+    activation: ferrum_runtime::ElementType,
     format: GgufBlockFormat,
     columns: usize,
     rows: usize,
 ) {
     use cudarc::driver::{DevicePtr, DevicePtrMut};
-    use ferrum_interfaces::vnext::WeightId;
+    use ferrum_runtime::WeightId;
     use weights::{MatrixFormat, MatrixPart};
     let context = CudaContext::new(0).expect("native matrix conformance requires CUDA");
     let kernels = CudaNativeBlockKernels::load(&context).unwrap();

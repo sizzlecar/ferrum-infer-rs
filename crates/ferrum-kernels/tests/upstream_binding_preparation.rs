@@ -2,7 +2,7 @@
 #[path = "../src/backend/cuda/vnext_ops/native_blocks/upstream_linear/preparation.rs"]
 mod preparation;
 
-use ferrum_interfaces::vnext::*;
+use ferrum_runtime::*;
 use preparation::ProjectionPreparation::{BindingsOnly, Full};
 use std::borrow::Cow;
 

@@ -11,9 +11,8 @@
 //! - Easy testing with mock components
 
 use async_trait::async_trait;
-use ferrum_interfaces::{
-    KvCacheManager, ModelExecutor, Sampler, SchedulerInterface as Scheduler, Tokenizer,
-};
+use ferrum_execution::ModelExecutor;
+use ferrum_interfaces::{KvCacheManager, Sampler, SchedulerInterface as Scheduler, Tokenizer};
 use ferrum_models::vnext::{DefinedProductionModel, ProductionModelSourceBundle};
 use ferrum_types::{Device, EngineConfig, FerrumError, Result};
 use parking_lot::RwLock;
@@ -1147,7 +1146,7 @@ fn validate_causal_decode_preparation_mode(
             .iter()
             .any(|capability| {
                 capability.as_str()
-                    == ferrum_interfaces::vnext::DEVICE_NATIVE_ADAPTIVE_ATTENTION_CAPABILITY_ID
+                    == ferrum_runtime::DEVICE_NATIVE_ADAPTIVE_ATTENTION_CAPABILITY_ID
             });
     #[cfg(not(feature = "cuda"))]
     let native_adaptive_supported = false;
@@ -1236,7 +1235,7 @@ fn validate_q8_projection_weight_preparation(
 fn validate_registered_vnext_backend(
     kind: ferrum_models::vnext::ProductionExecutionKind,
     device: &Device,
-    external_metadata_id: &ferrum_interfaces::vnext::ExternalModelMetadataId,
+    external_metadata_id: &ferrum_runtime::ExternalModelMetadataId,
 ) -> Result<()> {
     use ferrum_models::vnext::ProductionExecutionKind;
 
@@ -1327,7 +1326,7 @@ fn create_registered_vnext_executor(
                     backend = "cuda",
                     "Resolving a defined model against the actual vNext runtime"
                 );
-                let device_id = ferrum_interfaces::vnext::DeviceId::new(format!(
+                let device_id = ferrum_runtime::DeviceId::new(format!(
                     "device.cuda.{ordinal}"
                 ))
                 .map_err(|error| FerrumError::device(error.to_string()))?;
@@ -1340,7 +1339,7 @@ fn create_registered_vnext_executor(
                             config.engine_config.kv_cache.dtype,
                         )?,
                         config.engine_config.runtime.program_binding_upload_strategy,
-                        ferrum_interfaces::vnext::SegmentBindingOracleMode::Disabled,
+                        ferrum_runtime::SegmentBindingOracleMode::Disabled,
                         config.engine_config.runtime.segment_binding_owner_view_mode,
                         config.engine_config.runtime.causal_decode_preparation_mode,
                         config.engine_config.runtime.causal_decode_attention_grouping,
@@ -1408,7 +1407,7 @@ fn create_registered_vnext_executor(
                 backend = "metal",
                 "Resolving a defined model against the actual vNext runtime"
             );
-            let device_id = ferrum_interfaces::vnext::DeviceId::new("device.metal.0")
+            let device_id = ferrum_runtime::DeviceId::new("device.metal.0")
                 .map_err(|error| FerrumError::device(error.to_string()))?;
             let composition =
                 ferrum_kernels::backend::metal::vnext_ops::MetalVNextComposition::create(
@@ -1425,7 +1424,7 @@ fn create_registered_vnext_executor(
                 catalog,
             ) = composition.into_parts();
             let weight_materializer_selection =
-                ferrum_interfaces::vnext::WeightMaterializerSelection::exact(
+                ferrum_runtime::WeightMaterializerSelection::exact(
                     weight_materializer_id,
                 );
             let executor = crate::product_composition::create_vnext_executor(
@@ -1448,13 +1447,13 @@ fn create_registered_vnext_executor(
             Ok(Arc::new(executor))
         }
         (ProductionExecutionKind::CausalLanguage, Device::CPU) => {
-            let device_id = ferrum_interfaces::vnext::DeviceId::new("device.cpu.0")
+            let device_id = ferrum_runtime::DeviceId::new("device.cpu.0")
                 .map_err(|error| FerrumError::device(error.to_string()))?;
             let composition = ferrum_kernels::backend::cpu::vnext_ops::CpuVNextComposition::for_host(device_id)
                 .map_err(|error| FerrumError::device(format!("create vNext CPU runtime: {error}")))?;
             let (runtime, operation_registry, weight_materializers, weight_materializer_id, catalog) = composition.into_parts()
                 .map_err(|error| FerrumError::config(error.to_string()))?;
-            let selection = ferrum_interfaces::vnext::WeightMaterializerSelection::exact(weight_materializer_id);
+            let selection = ferrum_runtime::WeightMaterializerSelection::exact(weight_materializer_id);
             info!(
                 external_metadata_id = %registration.external_metadata_id(),
                 family_id = %prepared.definition().family_id(),
@@ -2151,8 +2150,7 @@ pub(crate) mod tests {
                 .unwrap()
                 .iter()
                 .any(|cap| {
-                    cap.as_str()
-                        == ferrum_interfaces::vnext::DEVICE_NATIVE_ADAPTIVE_ATTENTION_CAPABILITY_ID
+                    cap.as_str() == ferrum_runtime::DEVICE_NATIVE_ADAPTIVE_ATTENTION_CAPABILITY_ID
                 });
             assert_eq!(
                 validate_causal_decode_preparation_mode(&config, true).is_ok(),
@@ -2306,7 +2304,7 @@ pub(crate) mod tests {
                 .iter()
                 .any(|capability| {
                     capability.as_str()
-                        == ferrum_interfaces::vnext::DEVICE_NATIVE_ADAPTIVE_ATTENTION_CAPABILITY_ID
+                        == ferrum_runtime::DEVICE_NATIVE_ADAPTIVE_ATTENTION_CAPABILITY_ID
                 })
                 && cfg!(feature = "cuda-indexed-causal-attention");
             #[cfg(not(feature = "cuda"))]
@@ -2718,11 +2716,11 @@ pub(crate) mod tests {
 
     #[test]
     fn optional_layout_compilation_drops_trial_before_one_terminal_initialization() {
-        use ferrum_interfaces::vnext::{DeviceId, ExecutablePlanView, WeightMaterializerSelection};
         use ferrum_kernels::backend::cpu::vnext_ops::CpuVNextComposition;
         use ferrum_models::{
             VNextExecutorConfig, VNextModelCompilationError, VNextRuntimeComposition,
         };
+        use ferrum_runtime::{DeviceId, ExecutablePlanView, WeightMaterializerSelection};
 
         let dir = write_qwen35_fixture_model_dir();
         // Compilation needs source identity, not a tokenizer execution fixture.
@@ -2831,10 +2829,10 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn startup_memory_real_cpu_plan_fits_before_upload_and_reaches_engine_config() {
-        use ferrum_interfaces::vnext::{
+        use ferrum_kernels::backend::cpu::vnext_ops::CpuVNextComposition;
+        use ferrum_runtime::{
             AllocationLifetime, DeviceId, DynamicResourceDemand, WeightMaterializerSelection,
         };
-        use ferrum_kernels::backend::cpu::vnext_ops::CpuVNextComposition;
         use ferrum_types::{DeviceMemorySnapshot, StartupMemoryRequest};
 
         let dir = write_qwen35_fixture_model_dir();
@@ -3046,7 +3044,7 @@ pub(crate) mod tests {
         validate_registered_vnext_backend(
             ferrum_models::vnext::ProductionExecutionKind::CausalLanguage,
             &Device::CPU,
-            &ferrum_interfaces::vnext::ExternalModelMetadataId::new(
+            &ferrum_runtime::ExternalModelMetadataId::new(
                 ferrum_models::vnext::qwen35::EXTERNAL_METADATA_ID,
             )
             .unwrap(),
@@ -3095,8 +3093,8 @@ pub(crate) mod tests {
         assert_eq!(source.tensor_count(), 1);
         assert_eq!(source.tensor_info(name).unwrap().dimensions, [2]);
         drop(source);
-        let original = ferrum_interfaces::vnext::OriginalModelSource {
-            kind: ferrum_interfaces::vnext::ModelSourceKind::LocalDirectory,
+        let original = ferrum_runtime::OriginalModelSource {
+            kind: ferrum_runtime::ModelSourceKind::LocalDirectory,
             location: dir.display().to_string(),
             requested_revision: None,
         };
@@ -3105,11 +3103,11 @@ pub(crate) mod tests {
                 &dir,
                 &dir,
                 ferrum_models::vnext::ProductionWeightArtifact::gguf_file(&gguf),
-                ferrum_interfaces::vnext::OriginalModelSources {
+                ferrum_runtime::OriginalModelSources {
                     semantic: original.clone(),
                     tokenizer: original.clone(),
-                    weights: ferrum_interfaces::vnext::OriginalModelSource {
-                        kind: ferrum_interfaces::vnext::ModelSourceKind::LocalFile,
+                    weights: ferrum_runtime::OriginalModelSource {
+                        kind: ferrum_runtime::ModelSourceKind::LocalFile,
                         location: gguf.display().to_string(),
                         requested_revision: None,
                     },

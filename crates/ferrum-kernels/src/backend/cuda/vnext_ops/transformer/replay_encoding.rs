@@ -1,7 +1,7 @@
 //! Private result of the shared checked provider encoder. A replay request must
 //! return bindings before constructing resident compute; it cannot silently
 //! fall back to building and discarding a compute command.
-use ferrum_interfaces::vnext::{EncodedDeviceOperation, EncodedReusableExecutionBindings};
+use ferrum_runtime::{EncodedDeviceOperation, EncodedReusableExecutionBindings};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum EncodingTarget {

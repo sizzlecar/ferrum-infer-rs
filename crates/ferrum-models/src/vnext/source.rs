@@ -4,7 +4,7 @@ use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use ferrum_interfaces::vnext::{
+use ferrum_runtime::{
     ExternalModelMetadataId, FileFingerprint, ModelArtifactSourceRole, ModelSourceKind,
     OriginalModelSource, OriginalModelSources, ProductModelArtifactBinding,
     ProductModelSourceIdentity, ResolvedModelSource, ResolvedModelSources,

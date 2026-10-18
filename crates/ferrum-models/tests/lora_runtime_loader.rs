@@ -130,7 +130,7 @@ fn runtime_lora_apply_projection_adds_scaled_delta() {
 #[cfg(feature = "test-support")]
 mod execution {
     use super::*;
-    use ferrum_interfaces::model_executor::{
+    use ferrum_execution::model_executor::{
         DecodeInput, PrefillInput, UnifiedBatch, UnifiedBatchItem,
     };
     use ferrum_models::executor::common;

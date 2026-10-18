@@ -9,10 +9,9 @@
 //! - Validation before engine creation
 
 use crate::registry::{ComponentConfig, ComponentRegistry};
+use ferrum_execution::ModelExecutor;
 use ferrum_interfaces::engine::{InferenceEngine, LlmInferenceEngine};
-use ferrum_interfaces::{
-    KvCacheManager, ModelExecutor, RecurrentStateManager, Sampler, TensorFactory, Tokenizer,
-};
+use ferrum_interfaces::{KvCacheManager, RecurrentStateManager, Sampler, TensorFactory, Tokenizer};
 use ferrum_models::vnext::{DefinedProductionModel, ProductionModelSourceBundle};
 use ferrum_types::{EngineConfig, FerrumError, Result};
 use std::sync::Arc;
@@ -341,7 +340,7 @@ impl EngineBuilder {
         let execution_resource_authority = executor.execution_resource_authority();
 
         let (kv_cache, recurrent_state_manager) = match execution_resource_authority {
-            ferrum_interfaces::model_executor::ExecutionResourceAuthority::PlanRuntime => {
+            ferrum_execution::model_executor::ExecutionResourceAuthority::PlanRuntime => {
                 if explicit_kv_cache_override || custom_kv_cache.is_some() {
                     return Err(FerrumError::config(
                         "plan runtime cannot be combined with a legacy engine KV-cache override",
@@ -359,7 +358,7 @@ impl EngineBuilder {
                 }
                 (None, None)
             }
-            ferrum_interfaces::model_executor::ExecutionResourceAuthority::LegacyEngine => {
+            ferrum_execution::model_executor::ExecutionResourceAuthority::LegacyEngine => {
                 let kv_cache = if let Some(kv_cache) = custom_kv_cache {
                     debug!("Using custom KV cache");
                     kv_cache
@@ -392,7 +391,7 @@ impl EngineBuilder {
         // Construct the unpublished engine shell first so its typed profile
         // sink is attached before executor startup emits warmup/capture events.
         let engine = match execution_resource_authority {
-            ferrum_interfaces::model_executor::ExecutionResourceAuthority::PlanRuntime => {
+            ferrum_execution::model_executor::ExecutionResourceAuthority::PlanRuntime => {
                 crate::ContinuousBatchEngine::new_plan_runtime(
                     config,
                     cb_scheduler,
@@ -402,7 +401,7 @@ impl EngineBuilder {
                     tensor_factory,
                 )?
             }
-            ferrum_interfaces::model_executor::ExecutionResourceAuthority::LegacyEngine => {
+            ferrum_execution::model_executor::ExecutionResourceAuthority::LegacyEngine => {
                 let kv_cache = kv_cache.ok_or_else(|| {
                     FerrumError::internal("legacy-engine composition lost its KV-cache manager")
                 })?;
@@ -536,15 +535,16 @@ pub async fn create_defined_product_engine(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ferrum_execution::model_executor::{
+        DecodeInput, DecodeOutput, ExecutionResourceAuthority, ExecutorCapabilities,
+        ExecutorStatus, PlanRuntimeResourceSnapshot, PrefillInput, PrefillOutput,
+    };
+    use ferrum_execution::ProductExecutionEventSink;
     use ferrum_interfaces::{
-        model_executor::{
-            DecodeInput, DecodeOutput, ExecutionResourceAuthority, ExecutorCapabilities,
-            ExecutorStatus, PlanRuntimeResourceSnapshot, PrefillInput, PrefillOutput,
-        },
-        vnext::ExecutionEventSink,
         RecurrentStateHandle, RecurrentStateManager, RecurrentStateManagerStats,
         RecurrentStateSpec, RecurrentStateTensorSpec,
     };
+    use ferrum_runtime::ExecutionEventSink;
     use ferrum_types::{DataType, Device, RequestId};
     use std::sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -566,7 +566,7 @@ mod tests {
 
     struct ProfileStartupProbeExecutor {
         inner: ferrum_testkit::MockModelExecutor,
-        event_sink: Mutex<Option<Arc<dyn ExecutionEventSink>>>,
+        event_sink: Mutex<Option<Arc<dyn ProductExecutionEventSink>>>,
         saw_sink_during_startup: Arc<AtomicBool>,
     }
 
@@ -608,7 +608,7 @@ mod tests {
         }
 
         async fn prepare_startup(&self) -> Result<()> {
-            use ferrum_interfaces::vnext::{ExecutionEventEmitter, TrustedExecutionEventContext};
+            use ferrum_runtime::{ExecutionEventEmitter, TrustedExecutionEventContext};
 
             let sink = self
                 .event_sink
@@ -621,7 +621,8 @@ mod tests {
                 return Ok(());
             };
             let (run_id, request_id, event) = startup_profile_test_event();
-            ExecutionEventEmitter::from_shared(sink, run_id.clone(), request_id.clone())
+            let runtime_sink: Arc<dyn ExecutionEventSink> = sink;
+            ExecutionEventEmitter::from_shared(runtime_sink, run_id.clone(), request_id.clone())
                 .emit(
                     event,
                     &TrustedExecutionEventContext::pre_plan(&run_id, &request_id),
@@ -631,7 +632,7 @@ mod tests {
                 })
         }
 
-        fn attach_execution_event_sink(&self, sink: Arc<dyn ExecutionEventSink>) {
+        fn attach_execution_event_sink(&self, sink: Arc<dyn ProductExecutionEventSink>) {
             *self
                 .event_sink
                 .lock()
@@ -656,11 +657,11 @@ mod tests {
     }
 
     fn startup_profile_test_event() -> (
-        ferrum_interfaces::vnext::RunId,
-        ferrum_interfaces::vnext::RequestIdentity,
-        ferrum_interfaces::vnext::ExecutionEvent,
+        ferrum_runtime::RunId,
+        ferrum_runtime::RequestIdentity,
+        ferrum_runtime::ExecutionEvent,
     ) {
-        use ferrum_interfaces::vnext::{
+        use ferrum_runtime::{
             ExecutionEvent, ExecutionEventDetail, ExecutionEventKind, ExecutionIdentityEnvelope,
             ExecutionIdentityParts, ExecutionPhase, MonotonicTimestamp, RequestIdentity, RunId,
             SpanId, EXECUTION_IDENTITY_VERSION,
@@ -876,8 +877,8 @@ mod tests {
         .unwrap();
         std::fs::write(root.join("tokenizer.json"), br#"{"version":"1.0"}"#).unwrap();
         std::fs::write(root.join("model.safetensors"), b"fixture").unwrap();
-        let original = ferrum_interfaces::vnext::OriginalModelSource {
-            kind: ferrum_interfaces::vnext::ModelSourceKind::LocalDirectory,
+        let original = ferrum_runtime::OriginalModelSource {
+            kind: ferrum_runtime::ModelSourceKind::LocalDirectory,
             location: root.display().to_string(),
             requested_revision: None,
         };
@@ -886,7 +887,7 @@ mod tests {
                 &root,
                 &root,
                 ferrum_models::vnext::ProductionWeightArtifact::safetensors_directory(&root),
-                ferrum_interfaces::vnext::OriginalModelSources {
+                ferrum_runtime::OriginalModelSources {
                     semantic: original.clone(),
                     tokenizer: original.clone(),
                     weights: original,

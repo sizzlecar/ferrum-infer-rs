@@ -61,7 +61,7 @@ pub use source::{
 pub use tensor_wrapper::CandleTensorWrapper;
 pub use tokenizer::{TokenizerFactory, TokenizerHandle};
 
-pub use ferrum_interfaces::ModelExecutor;
+pub use ferrum_execution::ModelExecutor;
 pub use ferrum_types::{
     Activation, AttentionConfig, ModelConfig, ModelInfo, ModelType, NormType, Result, RopeScaling,
 };

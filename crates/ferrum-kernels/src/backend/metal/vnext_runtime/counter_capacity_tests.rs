@@ -1,7 +1,7 @@
 //! Model-free boundary tests for physical encoder timestamp capacity.
 
 use super::*;
-use ferrum_interfaces::vnext::{DynamicStorageAllocator, DynamicStorageView, ResourceId};
+use ferrum_runtime::{DynamicStorageAllocator, DynamicStorageView, ResourceId};
 use metal::objc::rc::autoreleasepool;
 
 // Counter tests share driver resources. Keep their fixture lifetimes and

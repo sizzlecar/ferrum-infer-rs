@@ -2,7 +2,7 @@
 //! read from fresh segment facts, never retained from the cold decode wave.
 use super::super::segment_bindings::{self as segment, DynamicRecipe, ValidationRecipe};
 use super::*;
-use ferrum_interfaces::vnext::{
+use ferrum_runtime::{
     PreparedSegmentBindingNode, SegmentBindingDeclaration, SegmentBindingRegionExtent,
     SegmentBindingRegionRequest, SegmentBindingRegionSelector,
 };
@@ -25,7 +25,7 @@ impl CausalRecipe {
 /// Freeze all Core-authorized physical capacity; each use still supplies its
 /// exact logical frontier. A true append refresh seals the new owned capacity.
 pub(crate) fn resident_control_rules(
-    node: &ferrum_interfaces::vnext::PreparedPhysicalSegmentNodeView<'_, '_, CudaDeviceBuffer>,
+    node: &ferrum_runtime::PreparedPhysicalSegmentNodeView<'_, '_, CudaDeviceBuffer>,
     recipe: &CausalRecipe,
 ) -> Result<
     Option<Vec<crate::backend::cuda::vnext_runtime::ResidentControlRule>>,
@@ -622,7 +622,7 @@ pub(in crate::backend::cuda::vnext_ops) fn prepare_indexed(
 }
 
 fn program_pages(
-    node: &ferrum_interfaces::vnext::PreparedSegmentBindingNodeView<'_, '_, CudaDeviceBuffer>,
+    node: &ferrum_runtime::PreparedSegmentBindingNodeView<'_, '_, CudaDeviceBuffer>,
     participant: usize,
     declaration: usize,
     expected: u64,
@@ -685,7 +685,7 @@ fn program_pages(
 }
 
 pub(in crate::backend::cuda::vnext_ops) fn write_program(
-    node: &ferrum_interfaces::vnext::PreparedSegmentBindingNodeView<'_, '_, CudaDeviceBuffer>,
+    node: &ferrum_runtime::PreparedSegmentBindingNodeView<'_, '_, CudaDeviceBuffer>,
     recipe: &CausalRecipe,
     owners: &mut crate::backend::cuda::vnext_runtime::CudaSegmentOwnerBuilder<'_>,
     sink: &mut crate::backend::cuda::vnext_runtime::CudaBindingProgramSink,
@@ -834,7 +834,7 @@ pub(in crate::backend::cuda::vnext_ops) fn write_program(
 }
 
 pub(in crate::backend::cuda::vnext_ops) fn write_physical_program(
-    node: &ferrum_interfaces::vnext::PreparedPhysicalSegmentNodeView<'_, '_, CudaDeviceBuffer>,
+    node: &ferrum_runtime::PreparedPhysicalSegmentNodeView<'_, '_, CudaDeviceBuffer>,
     recipe: &CausalRecipe,
     owners: &mut crate::backend::cuda::vnext_runtime::CudaPhysicalOwnerBuilder,
     sink: &mut crate::backend::cuda::vnext_runtime::CudaBindingProgramSink,
@@ -843,7 +843,7 @@ pub(in crate::backend::cuda::vnext_ops) fn write_physical_program(
 }
 
 pub(crate) fn write_resident_physical_program(
-    node: &ferrum_interfaces::vnext::PreparedPhysicalSegmentNodeView<'_, '_, CudaDeviceBuffer>,
+    node: &ferrum_runtime::PreparedPhysicalSegmentNodeView<'_, '_, CudaDeviceBuffer>,
     recipe: &CausalRecipe,
     owners: &mut crate::backend::cuda::vnext_runtime::CudaPhysicalOwnerBuilder,
     sink: &mut crate::backend::cuda::vnext_runtime::CudaBindingProgramSink,
@@ -852,7 +852,7 @@ pub(crate) fn write_resident_physical_program(
 }
 
 fn write_physical_program_inner(
-    node: &ferrum_interfaces::vnext::PreparedPhysicalSegmentNodeView<'_, '_, CudaDeviceBuffer>,
+    node: &ferrum_runtime::PreparedPhysicalSegmentNodeView<'_, '_, CudaDeviceBuffer>,
     recipe: &CausalRecipe,
     owners: &mut crate::backend::cuda::vnext_runtime::CudaPhysicalOwnerBuilder,
     sink: &mut crate::backend::cuda::vnext_runtime::CudaBindingProgramSink,

@@ -10,13 +10,14 @@
 
 use crate::tensor::MockTensor;
 use async_trait::async_trait;
-use ferrum_interfaces::{
+use ferrum_execution::{
     model_executor::{
         AttentionType, DecodeInput, DecodeOutput, ExecutorCapabilities, ExecutorMemoryUsage,
         ExecutorState, ExecutorStatus, MemoryRequirements, PrefillInput, PrefillOutput,
     },
-    KvCacheHandle, KvCacheManager, ModelExecutor,
+    ModelExecutor,
 };
+use ferrum_interfaces::{KvCacheHandle, KvCacheManager};
 use ferrum_kv::attention::paged_attention;
 use ferrum_kv::managers::paged::{PagedKvCacheHandle, PagedKvCacheManager};
 use ferrum_types::{DataType, Device, FerrumError, ModelInfo, ModelType, RequestId, Result};

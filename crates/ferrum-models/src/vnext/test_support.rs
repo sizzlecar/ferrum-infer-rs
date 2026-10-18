@@ -1,7 +1,7 @@
 //! Metadata-only helpers for existing family fixtures. These deliberately do
 //! not claim device compatibility; compiler/runtime tests supply real catalogs.
 
-use ferrum_interfaces::vnext::{
+use ferrum_runtime::{
     ModelFamilyRegistration, NumericalExecutionPolicy, PreparedModelFamily, VNextError,
 };
 

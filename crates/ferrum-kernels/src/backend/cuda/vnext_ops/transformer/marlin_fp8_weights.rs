@@ -2,7 +2,7 @@
 
 use std::collections::BTreeMap;
 
-use ferrum_interfaces::vnext::{
+use ferrum_runtime::{
     ElementType, OperationInvocation, PhysicalStorageLayout, PhysicalWeightLayout,
     PhysicalWeightPadding, QuantizationGrouping, QuantizationPacking, ResolvedStorageComponent,
     ResolvedValueBinding, ResolvedWeightBinding, ResolvedWeightComponentLayout,
@@ -488,7 +488,7 @@ fn retain_component_region(
 mod tests {
     use super::*;
     use crate::marlin_fp8_materializer::MARLIN_FP8_WEIGHT_FORMAT_ID;
-    use ferrum_interfaces::vnext::{
+    use ferrum_runtime::{
         CompositeWeightPart, ContractVersion, PhysicalWeightComponentBinding, QuantizationFormatId,
         QuantizationSpec, ResourceId, WeightComponentSpec, WeightFormatId, WeightLayoutId,
         WeightSchema, WeightTensorSpec,

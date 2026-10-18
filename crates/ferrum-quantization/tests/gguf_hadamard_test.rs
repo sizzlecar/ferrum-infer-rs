@@ -2,14 +2,14 @@ use std::collections::BTreeMap;
 use std::io::{Cursor, Write};
 
 use candle_core::quantized::gguf_file::{Content, Value};
-use ferrum_interfaces::vnext::{
-    ContractVersion, ElementType, PhysicalWeightLayout, WeightComponentRole, WeightComponentSource,
-    WeightComponentSpec, WeightEncoding, WeightSchema, WeightTensorSpec,
-};
 use ferrum_quantization::gguf::source::{hadamard_sign_component, hadamard_transform_spec};
 use ferrum_quantization::gguf::{
     GgufFile, GgufHadamardDirection, GgufHadamardGdnPermutation, GgufHadamardSigns, GgufInventory,
     GgufModelMetadata, GgufWeightComponentSource, NativeGgufFile,
+};
+use ferrum_runtime::{
+    ContractVersion, ElementType, PhysicalWeightLayout, WeightComponentRole, WeightComponentSource,
+    WeightComponentSpec, WeightEncoding, WeightSchema, WeightTensorSpec,
 };
 
 fn metadata() -> BTreeMap<String, Value> {
@@ -437,8 +437,7 @@ fn source_schema(native: &NativeGgufFile) -> WeightSchema {
     for (index, name) in native.tensor_names().enumerate() {
         let info = native.tensor_info(name).unwrap();
         assert_eq!(info.ggml_type, 0);
-        let id: ferrum_interfaces::vnext::WeightId =
-            format!("component.values.{index}").try_into().unwrap();
+        let id: ferrum_runtime::WeightId = format!("component.values.{index}").try_into().unwrap();
         let mut layout = PhysicalWeightLayout::Dense {
             component_id: id.clone(),
         };
@@ -555,7 +554,7 @@ fn source_binding_rejects_omitted_transforms_wrong_direction_and_changed_sign_id
     else {
         unreachable!()
     };
-    transform.application = ferrum_interfaces::vnext::HadamardApplication::AfterEmbeddingLookup;
+    transform.application = ferrum_runtime::HadamardApplication::AfterEmbeddingLookup;
     assert!(GgufWeightComponentSource::open_with_schema(
         artifact.path(),
         &wrong_direction,

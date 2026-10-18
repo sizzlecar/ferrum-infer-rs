@@ -40,9 +40,9 @@ name = "reference_quality"
 path = "src/bin/reference_quality.rs"
 
 [dependencies]
+ferrum-runtime = { workspace = true }
 anyhow = { workspace = true }
 ferrum-bench-core = { workspace = true }
-ferrum-interfaces = { workspace = true }
 ferrum-types = { workspace = true }
 serde = { workspace = true }
 # Reconstruct exact tool-result wire text from persisted IEEE-754 values.
@@ -62,3 +62,6 @@ futures = { workspace = true }
 tokio-stream = { workspace = true }
 zip = { version = "7.2.0", default-features = false, features = ["deflate-flate2"] }
 flate2 = "1"
+
+[dev-dependencies]
+syn = { version = "2", features = ["full"] }

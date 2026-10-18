@@ -8,7 +8,7 @@
 
 use std::path::Path;
 
-use ferrum_interfaces::vnext::{
+use ferrum_runtime::{
     ElementType, QuantizationPacking, QuantizationSpec, VNextError, WeightComponentPayload,
     WeightComponentRole, WeightComponentSource, WeightComponentSpec, WeightEncoding,
 };
@@ -183,7 +183,7 @@ fn invalid_component(component: &WeightComponentSpec, reason: impl AsRef<str>) -
 mod tests {
     use std::collections::BTreeMap;
 
-    use ferrum_interfaces::vnext::{QuantizationFormatId, QuantizationGrouping, WeightId};
+    use ferrum_runtime::{QuantizationFormatId, QuantizationGrouping, WeightId};
     use safetensors::tensor::{serialize_to_file, TensorView};
     use tempfile::tempdir;
 

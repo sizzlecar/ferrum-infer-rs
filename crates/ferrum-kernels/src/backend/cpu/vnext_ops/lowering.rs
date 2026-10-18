@@ -1,4 +1,4 @@
-use ferrum_interfaces::vnext::{
+use ferrum_runtime::{
     BatchedOperationInvocation, DeviceBatchingForm, ElementType, EncodedDeviceOperation,
     NodeWorkContract, ResolvedValueRole, SemanticValue,
 };

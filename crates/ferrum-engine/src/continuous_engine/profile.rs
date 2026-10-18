@@ -4,25 +4,27 @@ use super::*;
 pub(super) struct MetricsOnlyExecutionEventSink;
 
 impl ExecutionEventSink for MetricsOnlyExecutionEventSink {
-    fn enablement(&self) -> ferrum_interfaces::vnext::ExecutionEventSinkEnablement {
-        ferrum_interfaces::vnext::ExecutionEventSinkEnablement::None
+    fn enablement(&self) -> ferrum_runtime::ExecutionEventSinkEnablement {
+        ferrum_runtime::ExecutionEventSinkEnablement::None
     }
 
     fn is_enabled(&self, _kind: VNextExecutionEventKind) -> bool {
         false
     }
 
-    fn device_timing_mode(&self) -> ferrum_interfaces::vnext::DeviceTimingMode {
-        ferrum_interfaces::vnext::DeviceTimingMode::Completion
+    fn device_timing_mode(&self) -> ferrum_runtime::DeviceTimingMode {
+        ferrum_runtime::DeviceTimingMode::Completion
     }
 
     fn record(
         &self,
-        _permit: ferrum_interfaces::vnext::EventEmissionPermit,
+        _permit: ferrum_runtime::EventEmissionPermit,
     ) -> std::result::Result<(), ExecutionEventSinkError> {
         Ok(())
     }
 }
+
+impl ProductExecutionEventSink for MetricsOnlyExecutionEventSink {}
 
 fn vnext_execution_event_name(kind: VNextExecutionEventKind) -> &'static str {
     match kind {
@@ -1652,32 +1654,26 @@ impl VNextProfileExecutionEventSink {
 }
 
 impl ExecutionEventSink for VNextProfileExecutionEventSink {
-    fn enablement(&self) -> ferrum_interfaces::vnext::ExecutionEventSinkEnablement {
-        ferrum_interfaces::vnext::ExecutionEventSinkEnablement::All
+    fn enablement(&self) -> ferrum_runtime::ExecutionEventSinkEnablement {
+        ferrum_runtime::ExecutionEventSinkEnablement::All
     }
 
     fn is_enabled(&self, _kind: VNextExecutionEventKind) -> bool {
         true
     }
 
-    fn device_timing_mode(&self) -> ferrum_interfaces::vnext::DeviceTimingMode {
+    fn device_timing_mode(&self) -> ferrum_runtime::DeviceTimingMode {
         match self.context.profile_detail {
             ObservabilityProfileDetail::Off
             | ObservabilityProfileDetail::Resource
-            | ObservabilityProfileDetail::Latency => {
-                ferrum_interfaces::vnext::DeviceTimingMode::Off
-            }
+            | ObservabilityProfileDetail::Latency => ferrum_runtime::DeviceTimingMode::Off,
             ObservabilityProfileDetail::Basic | ObservabilityProfileDetail::Debug => {
-                ferrum_interfaces::vnext::DeviceTimingMode::Completion
+                ferrum_runtime::DeviceTimingMode::Completion
             }
-            ObservabilityProfileDetail::Replay => {
-                ferrum_interfaces::vnext::DeviceTimingMode::Replay
-            }
-            ObservabilityProfileDetail::Verify => {
-                ferrum_interfaces::vnext::DeviceTimingMode::Verification
-            }
+            ObservabilityProfileDetail::Replay => ferrum_runtime::DeviceTimingMode::Replay,
+            ObservabilityProfileDetail::Verify => ferrum_runtime::DeviceTimingMode::Verification,
             ObservabilityProfileDetail::Kernel | ObservabilityProfileDetail::Full => {
-                ferrum_interfaces::vnext::DeviceTimingMode::Kernel
+                ferrum_runtime::DeviceTimingMode::Kernel
             }
         }
     }
@@ -1733,13 +1729,34 @@ impl ExecutionEventSink for VNextProfileExecutionEventSink {
         self.enqueue_profile_batch(vec![event])
     }
 
+    fn record(
+        &self,
+        permit: EventEmissionPermit,
+    ) -> std::result::Result<(), ExecutionEventSinkError> {
+        let event = DeferredVNextProfileEvent {
+            event: permit.into_event(),
+            timestamp: chrono::Utc::now(),
+            context: Arc::clone(&self.context),
+        };
+        self.enqueue_deferred_event(event)
+    }
+
+    fn record_batch(
+        &self,
+        permit: EventBatchEmissionPermit,
+    ) -> std::result::Result<(), ExecutionEventSinkError> {
+        self.enqueue_events(permit.into_events())
+    }
+}
+
+impl ProductExecutionEventSink for VNextProfileExecutionEventSink {
     fn records_prefix_restore_decisions(&self) -> bool {
         true
     }
 
     fn record_prefix_restore_decision(
         &self,
-        observation: &ferrum_interfaces::model_executor::PrefixRestoreObservation<'_>,
+        observation: &ferrum_execution::model_executor::PrefixRestoreObservation<'_>,
     ) -> std::result::Result<(), ExecutionEventSinkError> {
         let timestamp = chrono::Utc::now();
         let timestamp_nanos = timestamp
@@ -1796,25 +1813,6 @@ impl ExecutionEventSink for VNextProfileExecutionEventSink {
             .validate()
             .map_err(|error| ExecutionEventSinkError::new(error.to_string()))?;
         self.enqueue_profile_batch(vec![event])
-    }
-
-    fn record(
-        &self,
-        permit: EventEmissionPermit,
-    ) -> std::result::Result<(), ExecutionEventSinkError> {
-        let event = DeferredVNextProfileEvent {
-            event: permit.into_event(),
-            timestamp: chrono::Utc::now(),
-            context: Arc::clone(&self.context),
-        };
-        self.enqueue_deferred_event(event)
-    }
-
-    fn record_batch(
-        &self,
-        permit: EventBatchEmissionPermit,
-    ) -> std::result::Result<(), ExecutionEventSinkError> {
-        self.enqueue_events(permit.into_events())
     }
 }
 

@@ -3,7 +3,7 @@ use super::native_blocks::{upstream_linear::WeightValidationRegistry, weights};
 use super::*;
 use crate::native_ops::upstream_linear::{Device, DeviceSpan};
 use crate::native_ops::upstream_q6_f32_linear::PreparedQ6F32Linear;
-use ferrum_interfaces::vnext::{
+use ferrum_runtime::{
     Q6MmqF32Policy, Q6MmqF32Route, LAST_TOKEN_DENSE_LINEAR_Q6_MMQ_F32_CAPABILITY_ID as CAPABILITY,
     LAST_TOKEN_DENSE_LINEAR_Q6_MMQ_F32_OPERATION_ID as OPERATION,
 };
@@ -40,7 +40,7 @@ impl CudaQ6MmqF32LastTokenProvider {
             )?)
             .map_err(|e| CudaDeviceRuntimeError::contract(e.to_string()))?,
         };
-        let contract = ferrum_interfaces::vnext::last_token_dense_linear_q6_mmq_f32_contract()
+        let contract = ferrum_runtime::last_token_dense_linear_q6_mmq_f32_contract()
             .map_err(contract_error)?;
         let descriptor = native_io::descriptor_with_fingerprint(
             runtime,
@@ -171,7 +171,7 @@ impl OperationResourceEstimator for CudaQ6MmqF32LastTokenProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ferrum_interfaces::vnext::{ResourceWorkShape, TokenSpanWork};
+    use ferrum_runtime::{ResourceWorkShape, TokenSpanWork};
 
     fn work() -> ResourceWorkShape {
         ResourceWorkShape::from_token_spans(vec![
@@ -232,7 +232,7 @@ impl OperationProvider<CudaDeviceRuntime> for CudaQ6MmqF32LastTokenProvider {
     ) -> Result<
         (
             EncodedDeviceOperation<CudaDeviceCommand>,
-            Option<ferrum_interfaces::vnext::SegmentBindingDeclaration>,
+            Option<ferrum_runtime::SegmentBindingDeclaration>,
         ),
         OperationFailure,
     > {
@@ -245,12 +245,10 @@ impl OperationProvider<CudaDeviceRuntime> for CudaQ6MmqF32LastTokenProvider {
     fn encode_reusable_execution_bindings(
         &self,
         invocation: BatchedOperationInvocation<'_, CudaDeviceBuffer>,
-    ) -> Result<
-        ferrum_interfaces::vnext::EncodedReusableExecutionBindings<CudaDeviceCommand>,
-        OperationFailure,
-    > {
+    ) -> Result<ferrum_runtime::EncodedReusableExecutionBindings<CudaDeviceCommand>, OperationFailure>
+    {
         self.encode_selected(invocation)
-            .map(ferrum_interfaces::vnext::EncodedReusableExecutionBindings::from_operation)
+            .map(ferrum_runtime::EncodedReusableExecutionBindings::from_operation)
     }
 }
 pub(super) fn fingerprint() -> String {
@@ -273,7 +271,7 @@ pub(super) fn fingerprint() -> String {
         )),
         include_bytes!(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../ferrum-interfaces/src/vnext/numerical/q6_mmq_f32.rs"
+            "/../ferrum-runtime/src/numerical/q6_mmq_f32.rs"
         )),
         include_bytes!(concat!(
             env!("CARGO_MANIFEST_DIR"),

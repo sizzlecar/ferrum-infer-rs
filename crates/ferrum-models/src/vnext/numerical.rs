@@ -3,7 +3,7 @@
 
 use std::collections::BTreeMap;
 
-use ferrum_interfaces::vnext::{
+use ferrum_runtime::{
     ContractVersion, ElementType, FamilyNumericalProfiles, KvStateStorage, ModelFamilyId,
     NumericalExecutionProfile, NumericalOperationContract, NumericalProfileId, OperationId,
     ProgramTensorSpec, ProgramValueId, ResolvedTensorLayout, StateCapacityDemand,

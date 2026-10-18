@@ -1,5 +1,5 @@
 use super::*;
-use ferrum_interfaces::vnext::{
+use ferrum_runtime::{
     NumericalArithmeticStage, NumericalExecutionPolicy, ProjectionBlockFormat,
     TypedFamilyRegistration, UpstreamProjectionArithmetic,
 };

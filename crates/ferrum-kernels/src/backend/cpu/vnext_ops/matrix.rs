@@ -1,4 +1,4 @@
-use ferrum_interfaces::vnext::WeightEncoding;
+use ferrum_runtime::WeightEncoding;
 use rayon::prelude::*;
 
 use super::super::vnext_runtime::CpuRuntimeError;

@@ -4,7 +4,7 @@ use std::time::Duration;
 #[cfg(feature = "cuda")]
 use std::time::Instant;
 
-use ferrum_interfaces::vnext::{DeviceEnqueueStage, DeviceSubmissionTimingSink};
+use ferrum_runtime::{DeviceEnqueueStage, DeviceSubmissionTimingSink};
 
 #[cfg(feature = "cuda")]
 pub(crate) fn measure<S: DeviceSubmissionTimingSink, T>(
@@ -87,7 +87,7 @@ fn measure_with_clock<S: DeviceSubmissionTimingSink, C: Clock, T>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ferrum_interfaces::vnext::{DeviceSubmissionStage, DisabledDeviceSubmissionTimingSink};
+    use ferrum_runtime::{DeviceSubmissionStage, DisabledDeviceSubmissionTimingSink};
     use std::collections::VecDeque;
     use std::sync::Mutex;
 

@@ -1,5 +1,5 @@
 use super::*;
-use ferrum_interfaces::vnext::{ResourceWorkShape, TokenSpanWork};
+use ferrum_runtime::{ResourceWorkShape, TokenSpanWork};
 
 fn weight() -> LastTokenByteSpan {
     LastTokenByteSpan {

@@ -1,6 +1,6 @@
 use super::*;
 use crate::gguf_blocks::GgufBlockFormat;
-use ferrum_interfaces::vnext::{
+use ferrum_runtime::{
     AliasPolicy, BlockQuantizationSpec, BufferUsage, CompositeWeightPart, ContractVersion,
     PhysicalStorageLayout, PhysicalWeightComponentBinding, PhysicalWeightLayout,
     PhysicalWeightPadding, ProgramValueId, QuantizationFormatId, ResolvedStorageComponent,

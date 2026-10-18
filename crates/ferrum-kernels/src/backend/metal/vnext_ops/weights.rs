@@ -3,7 +3,7 @@
 //! Providers consume this representation instead of guessing a physical ABI
 //! from a model name, source file, component ordering, or byte length.
 
-use ferrum_interfaces::vnext::{
+use ferrum_runtime::{
     AxisWeightComponent, BlockQuantizationSpec, CompositeWeightPart, ElementType,
     HadamardApplication, HadamardSigns, OperationInvocation, PhysicalWeightLayout,
     PhysicalWeightPadding, ResolvedValueBinding, ResolvedWeightBinding,
@@ -435,7 +435,7 @@ mod tests {
     use std::num::NonZeroU32;
 
     use super::*;
-    use ferrum_interfaces::vnext::{
+    use ferrum_runtime::{
         BlockQuantizationSpec, CompositeWeightPart, ContractVersion, HadamardTransformSpec,
         ModelFamilyId, PhysicalStorageLayout, PhysicalWeightComponentBinding, QuantizationFormatId,
         QuantizationGrouping, QuantizationPacking, QuantizationSpec, WeightComponentRole,

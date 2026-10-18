@@ -1,0 +1,17 @@
+[package]
+name = "ferrum-execution"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Product execution contracts for the Ferrum inference runtime"
+readme = "../../README.md"
+
+[dependencies]
+ferrum-types = { workspace = true }
+ferrum-interfaces = { workspace = true }
+ferrum-runtime = { workspace = true }
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }

@@ -1,10 +1,6 @@
 use super::*;
 use crate::recurrent_state::{InMemoryRecurrentStateConfig, InMemoryRecurrentStateManager};
-use ferrum_interfaces::kv_cache::{
-    AllocationRequest, CacheGcStats, CacheManagerStats, MemoryPressure,
-};
-use ferrum_interfaces::tokenizer::{TokenizerInfo, TokenizerType};
-use ferrum_interfaces::{
+use ferrum_execution::{
     model_executor::{
         DecodeInput, DecodeOutput, ExecutorAdmissionEpochs, ExecutorBatchDecodeOutcome,
         ExecutorBatchPrefillOutcome, ExecutorCapabilities, ExecutorCapacityWaitRegistration,
@@ -20,7 +16,14 @@ use ferrum_interfaces::{
         PlanRuntimePrefillOutcome, PlanRuntimePrefillOutput, PlanRuntimeResourceSnapshot,
         PrefillChunk, PrefillInput, PrefillOutput, UnifiedBatch,
     },
-    KvCacheHandle, KvCacheManager, ModelExecutor, RecurrentStateManager, RecurrentStateSpec,
+    ModelExecutor,
+};
+use ferrum_interfaces::kv_cache::{
+    AllocationRequest, CacheGcStats, CacheManagerStats, MemoryPressure,
+};
+use ferrum_interfaces::tokenizer::{TokenizerInfo, TokenizerType};
+use ferrum_interfaces::{
+    KvCacheHandle, KvCacheManager, RecurrentStateManager, RecurrentStateSpec,
     RecurrentStateTensorSpec, TensorRef,
 };
 use ferrum_models::{DecoderOnlyLLM, LlmExecutor, LlmRuntimeConfig};
@@ -49,11 +52,11 @@ mod prefix_prompt_tail_tests;
 
 fn test_execution_capacity_deferral(
     observed: ExecutorAdmissionEpochs,
-    wait_condition: ferrum_interfaces::vnext::CapacityWaitCondition,
+    wait_condition: ferrum_runtime::CapacityWaitCondition,
     stage: ExecutorExecutionCapacityStage,
 ) -> ExecutorExecutionCapacityDeferral {
-    let pressure = ferrum_interfaces::vnext::DeviceCapacityPressure::new(
-        ferrum_interfaces::vnext::DeviceCapacityPressureScope::PlanBudget,
+    let pressure = ferrum_runtime::DeviceCapacityPressure::new(
+        ferrum_runtime::DeviceCapacityPressureScope::PlanBudget,
         "device.test-execution-capacity".to_owned(),
         1,
         1,
@@ -73,7 +76,7 @@ fn test_execution_capacity_deferral(
 
 struct PlanRuntimeAdmissionTestExecutor {
     inner: MockModelExecutor,
-    event_sink: std::sync::Mutex<Option<Arc<dyn ExecutionEventSink>>>,
+    event_sink: std::sync::Mutex<Option<Arc<dyn ProductExecutionEventSink>>>,
     retained: std::sync::Mutex<HashSet<RequestId>>,
     admission_accounting: std::sync::Mutex<Vec<(RequestId, usize, usize, usize)>>,
     completions: std::sync::Mutex<Vec<ExecutorSequenceCompletion>>,
@@ -142,16 +145,16 @@ impl PlanRuntimeChunkedPrefillTestExecutor {
         )
     }
 
-    fn availability(&self) -> ferrum_interfaces::vnext::CapacityAvailabilityEpoch {
-        ferrum_interfaces::vnext::CapacityAvailabilityEpoch::new(
-            ferrum_interfaces::vnext::CapacityAvailabilitySource::ActiveSequenceSlots,
+    fn availability(&self) -> ferrum_runtime::CapacityAvailabilityEpoch {
+        ferrum_runtime::CapacityAvailabilityEpoch::new(
+            ferrum_runtime::CapacityAvailabilitySource::ActiveSequenceSlots,
             self.release_epoch.load(Ordering::Acquire) + 1,
         )
         .unwrap()
     }
 
-    fn wait_condition(&self) -> ferrum_interfaces::vnext::CapacityWaitCondition {
-        ferrum_interfaces::vnext::CapacityWaitCondition::from_observation(
+    fn wait_condition(&self) -> ferrum_runtime::CapacityWaitCondition {
+        ferrum_runtime::CapacityWaitCondition::from_observation(
             Self::COORDINATOR_ID,
             vec![self.availability()],
         )
@@ -271,16 +274,16 @@ impl ModelExecutor for PlanRuntimeChunkedPrefillTestExecutor {
     fn plan_prompt_tail_capture_boundary(
         &self,
         chunk: PrefillChunk,
-    ) -> Option<ferrum_interfaces::model_executor::PrefixCapturePlan> {
+    ) -> Option<ferrum_execution::model_executor::PrefixCapturePlan> {
         let boundary = chunk
             .total_prompt_tokens()
             .checked_sub(self.prompt_tail_reserve?)?;
         if boundary <= chunk.tokens_processed() || boundary > chunk.end() {
             return None;
         }
-        Some(ferrum_interfaces::model_executor::PrefixCapturePlan {
+        Some(ferrum_execution::model_executor::PrefixCapturePlan {
             boundary,
-            span: ferrum_interfaces::vnext::CheckpointTokenSpanConstraint::any_positive(),
+            span: ferrum_runtime::CheckpointTokenSpanConstraint::any_positive(),
         })
     }
 
@@ -298,15 +301,15 @@ impl ModelExecutor for PlanRuntimeChunkedPrefillTestExecutor {
 
     fn plan_prefix_capture_boundary(
         &self,
-        input: ferrum_interfaces::model_executor::PrefixCaptureBoundary<'_>,
-    ) -> Option<ferrum_interfaces::model_executor::PrefixCapturePlan> {
+        input: ferrum_execution::model_executor::PrefixCaptureBoundary<'_>,
+    ) -> Option<ferrum_execution::model_executor::PrefixCapturePlan> {
         self.rendezvous.as_ref()?.boundary(input)
     }
 
     fn retain_prefix_capture_interest(
         &self,
-        input: ferrum_interfaces::model_executor::PrefixCaptureRequest<'_>,
-    ) -> Result<Option<Arc<dyn ferrum_interfaces::model_executor::PrefixCaptureLease>>> {
+        input: ferrum_execution::model_executor::PrefixCaptureRequest<'_>,
+    ) -> Result<Option<Arc<dyn ferrum_execution::model_executor::PrefixCaptureLease>>> {
         assert!(self
             .retained
             .lock()
@@ -323,8 +326,8 @@ impl ModelExecutor for PlanRuntimeChunkedPrefillTestExecutor {
 
     async fn try_restore_plan_runtime_prefix(
         &self,
-        input: ferrum_interfaces::model_executor::PlanRuntimePrefixRestoreInput<'_>,
-    ) -> Result<ferrum_interfaces::model_executor::PlanRuntimePrefixRestoreOutcome> {
+        input: ferrum_execution::model_executor::PlanRuntimePrefixRestoreInput<'_>,
+    ) -> Result<ferrum_execution::model_executor::PlanRuntimePrefixRestoreOutcome> {
         assert!(self.retained.lock().unwrap().contains(input.request_id));
         if let Some(state) = &self.prefix_retry {
             return state.restore(input, self.epochs(), self.wait_condition());
@@ -345,7 +348,7 @@ impl ModelExecutor for PlanRuntimeChunkedPrefillTestExecutor {
 
     fn write_execution_capacity_snapshot(
         &self,
-        availability: &mut Vec<ferrum_interfaces::vnext::CapacityAvailabilityEpoch>,
+        availability: &mut Vec<ferrum_runtime::CapacityAvailabilityEpoch>,
     ) -> Result<Option<ExecutorAdmissionEpochs>> {
         availability.clear();
         availability.push(self.availability());
@@ -355,7 +358,7 @@ impl ModelExecutor for PlanRuntimeChunkedPrefillTestExecutor {
     fn write_execution_capacity_release_sources(
         &self,
         preemption: &ExecutorExecutionCapacityPreemption,
-        sources: &mut Vec<ferrum_interfaces::vnext::CapacityAvailabilitySource>,
+        sources: &mut Vec<ferrum_runtime::CapacityAvailabilitySource>,
     ) -> Result<bool> {
         sources.clear();
         if self
@@ -363,7 +366,7 @@ impl ModelExecutor for PlanRuntimeChunkedPrefillTestExecutor {
             .as_ref()
             .is_some_and(|state| state.release_capable(preemption.request_id()))
         {
-            sources.push(ferrum_interfaces::vnext::CapacityAvailabilitySource::ActiveSequenceSlots);
+            sources.push(ferrum_runtime::CapacityAvailabilitySource::ActiveSequenceSlots);
             return Ok(true);
         }
         Ok(false)
@@ -371,7 +374,7 @@ impl ModelExecutor for PlanRuntimeChunkedPrefillTestExecutor {
 
     fn register_execution_capacity_waiter(
         &self,
-        observed: &ferrum_interfaces::vnext::CapacityWaitCondition,
+        observed: &ferrum_runtime::CapacityWaitCondition,
     ) -> Result<Option<ExecutorCapacityWaitRegistration>> {
         if observed.coordinator_id().get() != Self::COORDINATOR_ID {
             return Err(FerrumError::internal(
@@ -420,11 +423,20 @@ impl ModelExecutor for PlanRuntimeChunkedPrefillTestExecutor {
         if let Some(state) = &self.rendezvous {
             if state.defer_admission_once() {
                 return Ok(ExecutorPrefillAdmissionDecision::MaintenanceDeferred(
-                    ExecutorPrefillMaintenanceDeferral::new(input.request_id.clone(), self.epochs(), self.wait_condition(),
+                    ExecutorPrefillMaintenanceDeferral::new(
+                        input.request_id.clone(),
+                        self.epochs(),
+                        self.wait_condition(),
                         ExecutorPrefillMaintenanceStage::PhysicalBacking,
-                        vec![ExecutorPrefillMaintenanceBlocker::Capacity { domain_id: Some(1),
-                            kind: ferrum_interfaces::vnext::CapacityShortfallKind::BackingGrowthRequired,
-                            requested: 4096, available: 0, current_total: 0, maximum_total: 8192 }])?,
+                        vec![ExecutorPrefillMaintenanceBlocker::Capacity {
+                            domain_id: Some(1),
+                            kind: ferrum_runtime::CapacityShortfallKind::BackingGrowthRequired,
+                            requested: 4096,
+                            available: 0,
+                            current_total: 0,
+                            maximum_total: 8192,
+                        }],
+                    )?,
                 ));
             }
             state.admitted(input.request_id);
@@ -457,8 +469,8 @@ impl ModelExecutor for PlanRuntimeChunkedPrefillTestExecutor {
             return Ok(ExecutorPrefillMaintenanceOutcome::WaitForRelease {
                 current: self.epochs(),
                 wait_condition: self.wait_condition(),
-                pressure: ferrum_interfaces::vnext::DeviceCapacityPressure::new(
-                    ferrum_interfaces::vnext::DeviceCapacityPressureScope::PlanBudget,
+                pressure: ferrum_runtime::DeviceCapacityPressure::new(
+                    ferrum_runtime::DeviceCapacityPressureScope::PlanBudget,
                     "device.prefix-fixture".to_owned(),
                     4096,
                     4096,
@@ -616,7 +628,7 @@ impl ModelExecutor for PlanRuntimeBatchDecodeTestExecutor {
         &self,
         prefills: &[PlanRuntimePrefillInput],
         decodes: &[PlanRuntimeDecodeInput],
-    ) -> Result<ferrum_interfaces::model_executor::PlanRuntimeMixedBatchOutcome> {
+    ) -> Result<ferrum_execution::model_executor::PlanRuntimeMixedBatchOutcome> {
         self.mock_mixed_batch(prefills, decodes).await
     }
 
@@ -642,12 +654,12 @@ impl ModelExecutor for PlanRuntimeBatchDecodeTestExecutor {
 
     fn write_execution_capacity_snapshot(
         &self,
-        availability: &mut Vec<ferrum_interfaces::vnext::CapacityAvailabilityEpoch>,
+        availability: &mut Vec<ferrum_runtime::CapacityAvailabilityEpoch>,
     ) -> Result<Option<ExecutorAdmissionEpochs>> {
         availability.clear();
         availability.push(
-            ferrum_interfaces::vnext::CapacityAvailabilityEpoch::new(
-                ferrum_interfaces::vnext::CapacityAvailabilitySource::ActiveSequenceSlots,
+            ferrum_runtime::CapacityAvailabilityEpoch::new(
+                ferrum_runtime::CapacityAvailabilitySource::ActiveSequenceSlots,
                 self.released_cache_count.load(Ordering::Acquire) + 1,
             )
             .map_err(|error| FerrumError::internal(error.to_string()))?,
@@ -658,10 +670,10 @@ impl ModelExecutor for PlanRuntimeBatchDecodeTestExecutor {
     fn write_execution_capacity_release_sources(
         &self,
         _preemption: &ExecutorExecutionCapacityPreemption,
-        sources: &mut Vec<ferrum_interfaces::vnext::CapacityAvailabilitySource>,
+        sources: &mut Vec<ferrum_runtime::CapacityAvailabilitySource>,
     ) -> Result<bool> {
         sources.clear();
-        sources.push(ferrum_interfaces::vnext::CapacityAvailabilitySource::ActiveSequenceSlots);
+        sources.push(ferrum_runtime::CapacityAvailabilitySource::ActiveSequenceSlots);
         Ok(true)
     }
 
@@ -793,11 +805,11 @@ impl ModelExecutor for PlanRuntimeBatchDecodeTestExecutor {
                 .await
                 .map(ExecutorBatchDecodeOutcome::Completed);
         }
-        let source = ferrum_interfaces::vnext::CapacityAvailabilitySource::ActiveSequenceSlots;
-        let observed = ferrum_interfaces::vnext::CapacityAvailabilityEpoch::new(source, 1)
+        let source = ferrum_runtime::CapacityAvailabilitySource::ActiveSequenceSlots;
+        let observed = ferrum_runtime::CapacityAvailabilityEpoch::new(source, 1)
             .map_err(|error| FerrumError::internal(error.to_string()))?;
         let wait_condition =
-            ferrum_interfaces::vnext::CapacityWaitCondition::from_observation(47, vec![observed])
+            ferrum_runtime::CapacityWaitCondition::from_observation(47, vec![observed])
                 .map_err(|error| FerrumError::internal(error.to_string()))?;
         Ok(ExecutorBatchDecodeOutcome::Deferred(
             test_execution_capacity_deferral(
@@ -886,11 +898,11 @@ impl ModelExecutor for PlanRuntimeBatchDecodeTestExecutor {
             return Ok(PlanRuntimeBatchDecodeOutcome::Completed(outputs));
         }
 
-        let source = ferrum_interfaces::vnext::CapacityAvailabilitySource::ActiveSequenceSlots;
-        let observed = ferrum_interfaces::vnext::CapacityAvailabilityEpoch::new(source, 1)
+        let source = ferrum_runtime::CapacityAvailabilitySource::ActiveSequenceSlots;
+        let observed = ferrum_runtime::CapacityAvailabilityEpoch::new(source, 1)
             .map_err(|error| FerrumError::internal(error.to_string()))?;
         let wait_condition =
-            ferrum_interfaces::vnext::CapacityWaitCondition::from_observation(47, vec![observed])
+            ferrum_runtime::CapacityWaitCondition::from_observation(47, vec![observed])
                 .map_err(|error| FerrumError::internal(error.to_string()))?;
         Ok(PlanRuntimeBatchDecodeOutcome::Deferred(
             test_execution_capacity_deferral(
@@ -974,12 +986,12 @@ impl PlanRuntimeAdmissionTestExecutor {
         )
     }
 
-    fn capacity_wait_condition(&self) -> ferrum_interfaces::vnext::CapacityWaitCondition {
-        ferrum_interfaces::vnext::CapacityWaitCondition::from_observation(
+    fn capacity_wait_condition(&self) -> ferrum_runtime::CapacityWaitCondition {
+        ferrum_runtime::CapacityWaitCondition::from_observation(
             41,
-            vec![ferrum_interfaces::vnext::CapacityAvailabilityEpoch::new(
-                ferrum_interfaces::vnext::CapacityAvailabilitySource::Domain(
-                    ferrum_interfaces::vnext::CapacityDomainId::new(1).unwrap(),
+            vec![ferrum_runtime::CapacityAvailabilityEpoch::new(
+                ferrum_runtime::CapacityAvailabilitySource::Domain(
+                    ferrum_runtime::CapacityDomainId::new(1).unwrap(),
                 ),
                 self.capacity_epoch.load(Ordering::Acquire) + 1,
             )
@@ -991,7 +1003,7 @@ impl PlanRuntimeAdmissionTestExecutor {
 
 #[async_trait::async_trait]
 impl ModelExecutor for PlanRuntimeAdmissionTestExecutor {
-    fn attach_execution_event_sink(&self, sink: Arc<dyn ExecutionEventSink>) {
+    fn attach_execution_event_sink(&self, sink: Arc<dyn ProductExecutionEventSink>) {
         *self.event_sink.lock().unwrap() = Some(sink);
     }
 
@@ -1013,7 +1025,7 @@ impl ModelExecutor for PlanRuntimeAdmissionTestExecutor {
 
     fn write_execution_capacity_snapshot(
         &self,
-        availability: &mut Vec<ferrum_interfaces::vnext::CapacityAvailabilityEpoch>,
+        availability: &mut Vec<ferrum_runtime::CapacityAvailabilityEpoch>,
     ) -> Result<Option<ExecutorAdmissionEpochs>> {
         availability.clear();
         availability.extend_from_slice(self.capacity_wait_condition().observed());
@@ -1059,8 +1071,7 @@ impl ModelExecutor for PlanRuntimeAdmissionTestExecutor {
                     ExecutorPrefillMaintenanceStage::PhysicalBacking,
                     vec![ExecutorPrefillMaintenanceBlocker::Capacity {
                         domain_id: Some(1),
-                        kind:
-                            ferrum_interfaces::vnext::CapacityShortfallKind::BackingGrowthRequired,
+                        kind: ferrum_runtime::CapacityShortfallKind::BackingGrowthRequired,
                         requested: 4096,
                         available: 0,
                         current_total: 0,
@@ -1304,12 +1315,12 @@ impl PlanRuntimeMaintenanceTestExecutor {
         )
     }
 
-    fn wait_condition(&self) -> ferrum_interfaces::vnext::CapacityWaitCondition {
-        ferrum_interfaces::vnext::CapacityWaitCondition::from_observation(
+    fn wait_condition(&self) -> ferrum_runtime::CapacityWaitCondition {
+        ferrum_runtime::CapacityWaitCondition::from_observation(
             43,
-            vec![ferrum_interfaces::vnext::CapacityAvailabilityEpoch::new(
-                ferrum_interfaces::vnext::CapacityAvailabilitySource::Domain(
-                    ferrum_interfaces::vnext::CapacityDomainId::new(1).unwrap(),
+            vec![ferrum_runtime::CapacityAvailabilityEpoch::new(
+                ferrum_runtime::CapacityAvailabilitySource::Domain(
+                    ferrum_runtime::CapacityDomainId::new(1).unwrap(),
                 ),
                 self.release_epoch
                     .load(Ordering::Acquire)
@@ -1343,7 +1354,7 @@ impl ModelExecutor for PlanRuntimeMaintenanceTestExecutor {
 
     fn write_execution_capacity_snapshot(
         &self,
-        availability: &mut Vec<ferrum_interfaces::vnext::CapacityAvailabilityEpoch>,
+        availability: &mut Vec<ferrum_runtime::CapacityAvailabilityEpoch>,
     ) -> Result<Option<ExecutorAdmissionEpochs>> {
         availability.clear();
         availability.extend_from_slice(self.wait_condition().observed());
@@ -1352,15 +1363,15 @@ impl ModelExecutor for PlanRuntimeMaintenanceTestExecutor {
 
     fn register_execution_capacity_waiter(
         &self,
-        observed: &ferrum_interfaces::vnext::CapacityWaitCondition,
+        observed: &ferrum_runtime::CapacityWaitCondition,
     ) -> Result<Option<ExecutorCapacityWaitRegistration>> {
         if observed.coordinator_id().get() != 43 {
             return Err(FerrumError::internal(
                 "test capacity waiter received a foreign coordinator",
             ));
         }
-        let expected_source = ferrum_interfaces::vnext::CapacityAvailabilitySource::Domain(
-            ferrum_interfaces::vnext::CapacityDomainId::new(1).unwrap(),
+        let expected_source = ferrum_runtime::CapacityAvailabilitySource::Domain(
+            ferrum_runtime::CapacityDomainId::new(1).unwrap(),
         );
         if observed
             .observed()
@@ -1433,8 +1444,7 @@ impl ModelExecutor for PlanRuntimeMaintenanceTestExecutor {
                     ExecutorPrefillMaintenanceStage::LogicalCapacity,
                     vec![ExecutorPrefillMaintenanceBlocker::Capacity {
                         domain_id: Some(1),
-                        kind:
-                            ferrum_interfaces::vnext::CapacityShortfallKind::BackingGrowthRequired,
+                        kind: ferrum_runtime::CapacityShortfallKind::BackingGrowthRequired,
                         requested: 4096,
                         available: 0,
                         current_total: 0,
@@ -1495,8 +1505,8 @@ impl ModelExecutor for PlanRuntimeMaintenanceTestExecutor {
                 Ok(ExecutorPrefillMaintenanceOutcome::WaitForRelease {
                     current: self.epochs(),
                     wait_condition: self.wait_condition(),
-                    pressure: ferrum_interfaces::vnext::DeviceCapacityPressure::new(
-                        ferrum_interfaces::vnext::DeviceCapacityPressureScope::PlanBudget,
+                    pressure: ferrum_runtime::DeviceCapacityPressure::new(
+                        ferrum_runtime::DeviceCapacityPressureScope::PlanBudget,
                         "device.test-capacity-pressure".to_owned(),
                         4096,
                         4096,
@@ -2428,7 +2438,7 @@ struct CapturedUnifiedItem {
     pos_offset: usize,
     is_final_chunk: bool,
     admission_target_len: Option<usize>,
-    logits_policy: ferrum_interfaces::model_executor::LogitsReturnPolicy,
+    logits_policy: ferrum_execution::model_executor::LogitsReturnPolicy,
 }
 
 struct CapturingUnifiedExecutor {
@@ -2615,8 +2625,8 @@ impl ModelExecutor for FailingUnifiedReserveExecutor {
 
     fn reserve_kv_slots(
         &self,
-        _requests: &[ferrum_interfaces::model_executor::KvSlotRequest],
-    ) -> Result<Option<ferrum_interfaces::model_executor::KvSlotReservation>> {
+        _requests: &[ferrum_execution::model_executor::KvSlotRequest],
+    ) -> Result<Option<ferrum_execution::model_executor::KvSlotReservation>> {
         Err(FerrumError::resource_exhausted(
             "synthetic unified reserve failure",
         ))
@@ -2663,8 +2673,8 @@ impl ModelExecutor for StructuredPressureOnceUnifiedReserveExecutor {
 
     fn reserve_kv_slots(
         &self,
-        _requests: &[ferrum_interfaces::model_executor::KvSlotRequest],
-    ) -> Result<Option<ferrum_interfaces::model_executor::KvSlotReservation>> {
+        _requests: &[ferrum_execution::model_executor::KvSlotRequest],
+    ) -> Result<Option<ferrum_execution::model_executor::KvSlotReservation>> {
         if self
             .remaining_failures
             .fetch_update(
@@ -3247,7 +3257,7 @@ async fn process_batch_unified_forwards_prefill_logits_policy() {
     assert_eq!(item.q_len, 1);
     assert_eq!(item.pos_offset, 0);
     assert!(item.is_final_chunk);
-    let ferrum_interfaces::model_executor::LogitsReturnPolicy::GreedyArgmax {
+    let ferrum_execution::model_executor::LogitsReturnPolicy::GreedyArgmax {
         token_mask: Some(mask),
         repetition_penalty: None,
     } = &item.logits_policy
@@ -3982,14 +3992,10 @@ async fn plan_runtime_lone_decode_self_recompute_releases_exact_cache_before_req
     let (request_ids, initial_tokens, _cache_ids) =
         install_plan_runtime_decode_frontiers(&engine, &scheduler, tokenizer, &["test"]).await;
     let request_id = request_ids[0].clone();
-    let source = ferrum_interfaces::vnext::CapacityAvailabilitySource::ActiveSequenceSlots;
-    let availability =
-        [ferrum_interfaces::vnext::CapacityAvailabilityEpoch::new(source, 1).unwrap()];
-    let condition = ferrum_interfaces::vnext::CapacityWaitCondition::from_observation(
-        47,
-        availability.to_vec(),
-    )
-    .unwrap();
+    let source = ferrum_runtime::CapacityAvailabilitySource::ActiveSequenceSlots;
+    let availability = [ferrum_runtime::CapacityAvailabilityEpoch::new(source, 1).unwrap()];
+    let condition =
+        ferrum_runtime::CapacityWaitCondition::from_observation(47, availability.to_vec()).unwrap();
     let wake = AdmissionWakeEpochs::new(std::num::NonZeroU64::new(47).unwrap(), 0, 0, 0);
     let deferral = AdmissionDeferral::new(DeferredAction::WaitForRelease, wake, condition);
     let release_snapshot = engine.inner.execution_capacity_release_snapshot().unwrap();
@@ -4070,14 +4076,11 @@ async fn plan_runtime_pressure_rotates_progressed_owner_after_two_physical_relea
     );
     let (request_ids, initial_tokens, _) =
         install_plan_runtime_decode_cohort(&engine, &scheduler, tokenizer).await;
-    let source = ferrum_interfaces::vnext::CapacityAvailabilitySource::ActiveSequenceSlots;
-    let first_availability =
-        ferrum_interfaces::vnext::CapacityAvailabilityEpoch::new(source, 1).unwrap();
-    let first_condition = ferrum_interfaces::vnext::CapacityWaitCondition::from_observation(
-        47,
-        vec![first_availability],
-    )
-    .unwrap();
+    let source = ferrum_runtime::CapacityAvailabilitySource::ActiveSequenceSlots;
+    let first_availability = ferrum_runtime::CapacityAvailabilityEpoch::new(source, 1).unwrap();
+    let first_condition =
+        ferrum_runtime::CapacityWaitCondition::from_observation(47, vec![first_availability])
+            .unwrap();
     let first_deferral = AdmissionDeferral::new(
         DeferredAction::WaitForRelease,
         AdmissionWakeEpochs::new(std::num::NonZeroU64::new(47).unwrap(), 0, 0, 0),
@@ -4110,13 +4113,10 @@ async fn plan_runtime_pressure_rotates_progressed_owner_after_two_physical_relea
     assert_eq!(executor.released_cache_count.load(Ordering::Acquire), 1);
     scheduler.update_decode_progress(&progress_owner_id, 1);
 
-    let second_availability =
-        ferrum_interfaces::vnext::CapacityAvailabilityEpoch::new(source, 2).unwrap();
-    let second_condition = ferrum_interfaces::vnext::CapacityWaitCondition::from_observation(
-        47,
-        vec![second_availability],
-    )
-    .unwrap();
+    let second_availability = ferrum_runtime::CapacityAvailabilityEpoch::new(source, 2).unwrap();
+    let second_condition =
+        ferrum_runtime::CapacityWaitCondition::from_observation(47, vec![second_availability])
+            .unwrap();
     let second_deferral = AdmissionDeferral::new(
         DeferredAction::WaitForRelease,
         AdmissionWakeEpochs::new(std::num::NonZeroU64::new(47).unwrap(), 1, 0, 0),
@@ -6889,9 +6889,9 @@ async fn scheduler_trace_jsonl_resource_events_balance_successful_infer() {
 }
 
 fn vnext_profile_test_event() -> (
-    ferrum_interfaces::vnext::RunId,
-    ferrum_interfaces::vnext::RequestIdentity,
-    ferrum_interfaces::vnext::ExecutionEvent,
+    ferrum_runtime::RunId,
+    ferrum_runtime::RequestIdentity,
+    ferrum_runtime::ExecutionEvent,
 ) {
     vnext_profile_test_event_for_request("request.vnext.engine-profile-test")
 }
@@ -6899,11 +6899,11 @@ fn vnext_profile_test_event() -> (
 fn vnext_profile_test_event_for_request(
     request_identity: &str,
 ) -> (
-    ferrum_interfaces::vnext::RunId,
-    ferrum_interfaces::vnext::RequestIdentity,
-    ferrum_interfaces::vnext::ExecutionEvent,
+    ferrum_runtime::RunId,
+    ferrum_runtime::RequestIdentity,
+    ferrum_runtime::ExecutionEvent,
 ) {
-    use ferrum_interfaces::vnext::{
+    use ferrum_runtime::{
         ExecutionEvent, ExecutionEventDetail, ExecutionEventKind, ExecutionIdentityEnvelope,
         ExecutionIdentityParts, ExecutionPhase, MonotonicTimestamp, RequestIdentity, RunId, SpanId,
         EXECUTION_IDENTITY_VERSION,
@@ -6960,8 +6960,8 @@ fn vnext_profile_test_event_for_request(
     (run_id, request_id, event)
 }
 
-fn vnext_profile_test_operation_event() -> ferrum_interfaces::vnext::ExecutionEvent {
-    use ferrum_interfaces::vnext::{
+fn vnext_profile_test_operation_event() -> ferrum_runtime::ExecutionEvent {
+    use ferrum_runtime::{
         DeviceId, ExecutionEvent, ExecutionEventDetail, ExecutionEventKind, ExecutionFrameId,
         ExecutionIdentityEnvelope, ExecutionIdentityParts, ExecutionPhase, MonotonicTimestamp,
         NodeId, NodeInvocationId, OperationId, PlanHash, PlanId, ProviderId, RequestIdentity,
@@ -7019,9 +7019,9 @@ fn vnext_profile_test_operation_event() -> ferrum_interfaces::vnext::ExecutionEv
 }
 
 fn vnext_profile_test_node_event(
-    kind: ferrum_interfaces::vnext::ExecutionEventKind,
-) -> ferrum_interfaces::vnext::ExecutionEvent {
-    use ferrum_interfaces::vnext::{
+    kind: ferrum_runtime::ExecutionEventKind,
+) -> ferrum_runtime::ExecutionEvent {
+    use ferrum_runtime::{
         ExecutionEvent, ExecutionEventDetail, ExecutionEventKind, ExecutionIdentityEnvelope,
         ExecutionPhase, MonotonicTimestamp, SpanId,
     };
@@ -7055,8 +7055,8 @@ fn vnext_profile_test_node_event(
     .unwrap()
 }
 
-fn vnext_profile_test_resource_failure_event() -> ferrum_interfaces::vnext::ExecutionEvent {
-    use ferrum_interfaces::vnext::{
+fn vnext_profile_test_resource_failure_event() -> ferrum_runtime::ExecutionEvent {
+    use ferrum_runtime::{
         ExecutionEvent, ExecutionEventDetail, ExecutionEventKind, ExecutionIdentityEnvelope,
         ExecutionPhase, FailureDomain, FailureEnvelope, IdentifiedFailure, MonotonicTimestamp,
         SpanId,
@@ -7111,7 +7111,7 @@ fn vnext_profile_preserves_the_complete_canonical_execution_identity() {
 
     assert_eq!(
         profile.attributes["execution_identity_version"],
-        ferrum_interfaces::vnext::EXECUTION_IDENTITY_VERSION.to_string()
+        ferrum_runtime::EXECUTION_IDENTITY_VERSION.to_string()
     );
     assert_eq!(profile.attributes["resource_pool_id"], "resource-pool:7");
     assert_eq!(profile.attributes["active_sequence_slot"], 1);
@@ -7133,7 +7133,7 @@ fn vnext_profile_preserves_the_complete_canonical_execution_identity() {
 
 #[test]
 fn basic_vnext_profile_serializes_identity_once_and_stays_within_request_budget() {
-    use ferrum_interfaces::vnext::ExecutionEventKind;
+    use ferrum_runtime::ExecutionEventKind;
 
     const NODES_PER_REQUEST: usize = 132;
     const LIFECYCLE_EVENTS_PER_REQUEST: usize = 6;
@@ -7156,7 +7156,7 @@ fn basic_vnext_profile_serializes_identity_once_and_stays_within_request_budget(
     assert!(!operation.attributes.contains_key("backend_type"));
     assert_eq!(
         operation.attributes["execution_identity_version"],
-        ferrum_interfaces::vnext::EXECUTION_IDENTITY_VERSION.to_string()
+        ferrum_runtime::EXECUTION_IDENTITY_VERSION.to_string()
     );
     assert_eq!(operation.request_id, "request.vnext.engine-profile-test");
     assert_eq!(operation.shape["execution_sequence"], 3);
@@ -7305,7 +7305,7 @@ fn vnext_profile_preserves_real_resource_failure_evidence() {
 
 #[test]
 fn vnext_execution_events_use_the_canonical_scheduler_trace_schema() {
-    use ferrum_interfaces::vnext::{ExecutionEventEmitter, TrustedExecutionEventContext};
+    use ferrum_runtime::{ExecutionEventEmitter, TrustedExecutionEventContext};
 
     let trace_path = resource_trace_temp_path("vnext-execution-event");
     let _ = std::fs::remove_file(&trace_path);
@@ -7319,7 +7319,7 @@ fn vnext_execution_events_use_the_canonical_scheduler_trace_schema() {
     );
     assert_eq!(
         sink.device_timing_mode(),
-        ferrum_interfaces::vnext::DeviceTimingMode::Off
+        ferrum_runtime::DeviceTimingMode::Off
     );
     assert_eq!(sink.capture_policy().as_str(), "first_frame_per_request");
     let (run_id, request_id, event) = vnext_profile_test_event();
@@ -7407,19 +7407,19 @@ fn staged_vnext_profiles_separate_resource_latency_and_kernel_costs() {
         (
             ObservabilityProfileDetail::Resource,
             ExecutionEventCapturePolicy::AllFrames,
-            ferrum_interfaces::vnext::DeviceTimingMode::Off,
+            ferrum_runtime::DeviceTimingMode::Off,
             false,
         ),
         (
             ObservabilityProfileDetail::Latency,
             ExecutionEventCapturePolicy::FirstFramePerRequest,
-            ferrum_interfaces::vnext::DeviceTimingMode::Off,
+            ferrum_runtime::DeviceTimingMode::Off,
             false,
         ),
         (
             ObservabilityProfileDetail::Kernel,
             ExecutionEventCapturePolicy::AllFrames,
-            ferrum_interfaces::vnext::DeviceTimingMode::Kernel,
+            ferrum_runtime::DeviceTimingMode::Kernel,
             true,
         ),
     ];
@@ -7512,7 +7512,7 @@ fn sequence_engine_timing_is_opt_in_and_matches_committed_tokens() {
 
 #[test]
 fn vnext_profile_marks_only_failure_observed_as_blocking_first_failure() {
-    use ferrum_interfaces::vnext::{
+    use ferrum_runtime::{
         ExecutionEvent, ExecutionEventDetail, ExecutionEventKind, ExecutionIdentityEnvelope,
         ExecutionPhase, FailureDomain, FailureEnvelope, IdentifiedFailure, MonotonicTimestamp,
     };
@@ -7651,7 +7651,7 @@ fn full_vnext_profile_enables_kernel_attribution_and_all_frames() {
     );
     assert_eq!(
         sink.device_timing_mode(),
-        ferrum_interfaces::vnext::DeviceTimingMode::Kernel
+        ferrum_runtime::DeviceTimingMode::Kernel
     );
     let (_, _, accepted) = vnext_profile_test_event();
     let profile = sink.profile_event(&accepted).unwrap();
@@ -7685,7 +7685,7 @@ fn replay_vnext_profile_preserves_physical_timing_without_kernel_attribution() {
     );
     assert_eq!(
         sink.device_timing_mode(),
-        ferrum_interfaces::vnext::DeviceTimingMode::Replay
+        ferrum_runtime::DeviceTimingMode::Replay
     );
     assert!(sink
         .device_timing_mode()
@@ -7713,7 +7713,7 @@ fn verification_vnext_profile_requires_eager_kernel_attribution() {
     );
     assert_eq!(
         sink.device_timing_mode(),
-        ferrum_interfaces::vnext::DeviceTimingMode::Verification
+        ferrum_runtime::DeviceTimingMode::Verification
     );
     assert!(sink.device_timing_mode().kernel_attribution_enabled());
     assert!(!sink
@@ -7727,7 +7727,7 @@ fn verification_vnext_profile_requires_eager_kernel_attribution() {
 
 #[test]
 fn replay_device_timing_is_owned_once_by_its_physical_span() {
-    use ferrum_interfaces::vnext::{DeviceExecutionInterval, DeviceExecutionIntervalKind};
+    use ferrum_runtime::{DeviceExecutionInterval, DeviceExecutionIntervalKind};
 
     let eager = DeviceSubmissionExecutionSpan::measured(
         0,

@@ -14,7 +14,7 @@ use std::sync::Arc;
 const VOCAB: usize = 1000;
 
 fn make_engine_with_executor(
-    executor: Arc<dyn ferrum_interfaces::ModelExecutor>,
+    executor: Arc<dyn ferrum_execution::ModelExecutor>,
 ) -> ContinuousBatchEngine {
     let config = ferrum_types::EngineConfig::default();
     let scheduler = Arc::new(ContinuousBatchScheduler::new(SchedulerConfig::default()));

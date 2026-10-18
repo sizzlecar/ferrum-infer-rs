@@ -5,7 +5,14 @@
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
-use ferrum_interfaces::vnext::{
+use ferrum_models::vnext::{
+    DefinedProductionModel, PreparedProductionModel, ProductionModelFamilyRegistry,
+};
+use ferrum_models::{
+    VNextCompiledModel, VNextExecutorConfig, VNextModelCompilationError, VNextModelExecutor,
+    VNextRuntimeComposition,
+};
+use ferrum_runtime::{
     CapabilityCatalog, ContractVersion, DeviceRuntime, EngineSelection, ExecutablePlanView,
     ModelArtifactSourceRole, ModelConfigFingerprint, NumericalProfileRejection,
     NumericalProfileRejectionStage, NumericalProfileResolution, OperationRuntimeRegistry,
@@ -16,13 +23,6 @@ use ferrum_interfaces::vnext::{
     SpecialTokenRole, StopPolicy, StopTokenCollisionPolicy, StructuredOutputPolicy,
     TokenizerDescriptor, TokenizerId, TriStatePolicy, WeightMaterializerRegistry,
     WeightMaterializerSelection, JSON_RESOLUTION_SOURCE_PARSER,
-};
-use ferrum_models::vnext::{
-    DefinedProductionModel, PreparedProductionModel, ProductionModelFamilyRegistry,
-};
-use ferrum_models::{
-    VNextCompiledModel, VNextExecutorConfig, VNextModelCompilationError, VNextModelExecutor,
-    VNextRuntimeComposition,
 };
 use ferrum_types::{EngineConfig, FerrumError, ModelInfo, ResponseFormat, Result, SamplingParams};
 use serde_json::{json, Map, Value};
@@ -59,10 +59,10 @@ pub(crate) fn create_vnext_executor<R: DeviceRuntime>(
     weight_materializers: WeightMaterializerRegistry,
     catalog: CapabilityCatalog,
     select_materializer: impl Fn(
-        &ferrum_interfaces::vnext::PreparedModelFamily,
+        &ferrum_runtime::PreparedModelFamily,
     ) -> std::result::Result<
         WeightMaterializerSelection,
-        ferrum_interfaces::vnext::VNextError,
+        ferrum_runtime::VNextError,
     >,
     q8_predecoded_composition: Option<&mut dyn FnMut() -> Result<VNextRuntimeComposition<R>>>,
 ) -> Result<VNextModelExecutor<R>> {
@@ -88,10 +88,10 @@ pub(crate) fn create_vnext_executor_with_configuration<R: DeviceRuntime>(
     weight_materializers: WeightMaterializerRegistry,
     catalog: CapabilityCatalog,
     select_materializer: impl Fn(
-        &ferrum_interfaces::vnext::PreparedModelFamily,
+        &ferrum_runtime::PreparedModelFamily,
     ) -> std::result::Result<
         WeightMaterializerSelection,
-        ferrum_interfaces::vnext::VNextError,
+        ferrum_runtime::VNextError,
     >,
     mut q8_predecoded_composition: Option<&mut dyn FnMut() -> Result<VNextRuntimeComposition<R>>>,
     executor_config: impl Fn(&EngineConfig, &ModelInfo, &R) -> Result<VNextExecutorConfig>,
@@ -146,20 +146,14 @@ pub(crate) fn create_vnext_executor_with_configuration<R: DeviceRuntime>(
             ));
         }
         if engine.runtime.q4_mmvq_weight_decode == ferrum_types::Q4MmvqWeightDecode::SharedM4M8
-            && !profile_has_shared_m4_m8_route(
-                profile,
-                ferrum_interfaces::vnext::ProjectionBlockFormat::Q4K,
-            )
+            && !profile_has_shared_m4_m8_route(profile, ferrum_runtime::ProjectionBlockFormat::Q4K)
         {
             return Err(FerrumError::unsupported(
                 "shared-m4-m8 Q4 weight decode requires a selected causal, GDN or SwiGLU numerical profile declaring Q4_K Columns M4 or M8 MarkerV2 MMVQ",
             ));
         }
         if engine.runtime.q5_mmvq_weight_decode == ferrum_types::Q5MmvqWeightDecode::SharedM4M8
-            && !profile_has_shared_m4_m8_route(
-                profile,
-                ferrum_interfaces::vnext::ProjectionBlockFormat::Q5K,
-            )
+            && !profile_has_shared_m4_m8_route(profile, ferrum_runtime::ProjectionBlockFormat::Q5K)
         {
             return Err(FerrumError::unsupported(
                 "shared-m4-m8 Q5 weight decode requires a selected causal, GDN or SwiGLU numerical profile declaring Q5_K Columns M4 or M8 MarkerV2 MMVQ",
@@ -442,7 +436,7 @@ pub(crate) fn create_vnext_executor_with_configuration<R: DeviceRuntime>(
 
 fn q8_auto_preparation_eligible(
     engine: &EngineConfig,
-    profile: &ferrum_interfaces::vnext::NumericalExecutionProfile,
+    profile: &ferrum_runtime::NumericalExecutionProfile,
     runtime_ordinal: u32,
     probe: impl FnOnce(
         usize,
@@ -542,16 +536,16 @@ fn probe_auto_cuda_attributes(
 /// their complete live provider bindings, including nonselected providers.
 fn auto_numerical_profile_rejection(
     requested: &ferrum_types::NumericalExecutionPolicy,
-    profile: &ferrum_interfaces::vnext::NumericalExecutionProfile,
+    profile: &ferrum_runtime::NumericalExecutionProfile,
     device: &ferrum_types::Device,
     runtime_ordinal: u32,
-    capabilities: &BTreeSet<ferrum_interfaces::vnext::CapabilityId>,
+    capabilities: &BTreeSet<ferrum_runtime::CapabilityId>,
     probe: impl FnOnce(
         usize,
     )
         -> std::result::Result<ferrum_kernels::backend::CudaDeviceAttributes, String>,
 ) -> Option<NumericalProfileRejection> {
-    use ferrum_interfaces::vnext::{
+    use ferrum_runtime::{
         UpstreamMarkerV2Profile as Profile, LAST_TOKEN_DENSE_LINEAR_Q6_MMQ_F32_CAPABILITY_ID,
     };
     if !matches!(requested, ferrum_types::NumericalExecutionPolicy::Auto) {
@@ -622,9 +616,9 @@ fn auto_numerical_profile_rejection(
 }
 
 fn composite_supports_q8_preparation(
-    arithmetic: &ferrum_interfaces::vnext::CompositeNumericalArithmetic,
+    arithmetic: &ferrum_runtime::CompositeNumericalArithmetic,
 ) -> bool {
-    use ferrum_interfaces::vnext::UpstreamMarkerV2Profile as Profile;
+    use ferrum_runtime::UpstreamMarkerV2Profile as Profile;
     // Match declared numerical contracts, not names of models or tensors.
     // The provider separately decides whether any physical leaf is eligible.
     [
@@ -645,9 +639,7 @@ fn composite_supports_q8_preparation(
     .any(|profile| profile.arithmetic() == *arithmetic)
 }
 
-fn profile_has_shared_m8_q4_route(
-    profile: &ferrum_interfaces::vnext::NumericalExecutionProfile,
-) -> bool {
+fn profile_has_shared_m8_q4_route(profile: &ferrum_runtime::NumericalExecutionProfile) -> bool {
     profile
         .operations
         .iter()
@@ -656,17 +648,12 @@ fn profile_has_shared_m8_q4_route(
 }
 
 fn composite_has_shared_m8_q4_route(
-    arithmetic: &ferrum_interfaces::vnext::CompositeNumericalArithmetic,
+    arithmetic: &ferrum_runtime::CompositeNumericalArithmetic,
 ) -> bool {
-    composite_has_shared_m8_route(
-        arithmetic,
-        ferrum_interfaces::vnext::ProjectionBlockFormat::Q4K,
-    )
+    composite_has_shared_m8_route(arithmetic, ferrum_runtime::ProjectionBlockFormat::Q4K)
 }
 
-fn profile_has_shared_m8_q5_route(
-    profile: &ferrum_interfaces::vnext::NumericalExecutionProfile,
-) -> bool {
+fn profile_has_shared_m8_q5_route(profile: &ferrum_runtime::NumericalExecutionProfile) -> bool {
     profile
         .operations
         .iter()
@@ -675,19 +662,16 @@ fn profile_has_shared_m8_q5_route(
 }
 
 fn composite_has_shared_m8_q5_route(
-    arithmetic: &ferrum_interfaces::vnext::CompositeNumericalArithmetic,
+    arithmetic: &ferrum_runtime::CompositeNumericalArithmetic,
 ) -> bool {
-    composite_has_shared_m8_route(
-        arithmetic,
-        ferrum_interfaces::vnext::ProjectionBlockFormat::Q5K,
-    )
+    composite_has_shared_m8_route(arithmetic, ferrum_runtime::ProjectionBlockFormat::Q5K)
 }
 
 fn composite_has_shared_m8_route(
-    arithmetic: &ferrum_interfaces::vnext::CompositeNumericalArithmetic,
-    format: ferrum_interfaces::vnext::ProjectionBlockFormat,
+    arithmetic: &ferrum_runtime::CompositeNumericalArithmetic,
+    format: ferrum_runtime::ProjectionBlockFormat,
 ) -> bool {
-    use ferrum_interfaces::vnext::{
+    use ferrum_runtime::{
         NumericalArithmeticStage, CAUSAL_PAGED_ATTENTION_F32_MASTER_OPERATION_ID,
         GATED_DELTA_RECURRENT_ATTENTION_F32_MASTER_OPERATION_ID,
     };
@@ -710,18 +694,16 @@ fn composite_has_shared_m8_route(
         })
 }
 
-fn route_supports_shared_m8(
-    route: &ferrum_interfaces::vnext::UpstreamProjectionRouteDeclaration,
-) -> bool {
-    use ferrum_interfaces::vnext::{UpstreamProjectionArithmetic, UpstreamProjectionLayout};
+fn route_supports_shared_m8(route: &ferrum_runtime::UpstreamProjectionRouteDeclaration) -> bool {
+    use ferrum_runtime::{UpstreamProjectionArithmetic, UpstreamProjectionLayout};
     route.arithmetic == UpstreamProjectionArithmetic::MmvqQ8_1MarkerV2
         && route.layout == UpstreamProjectionLayout::Columns
         && route.contains_rows(8)
 }
 
 fn profile_has_shared_m4_m8_route(
-    profile: &ferrum_interfaces::vnext::NumericalExecutionProfile,
-    format: ferrum_interfaces::vnext::ProjectionBlockFormat,
+    profile: &ferrum_runtime::NumericalExecutionProfile,
+    format: ferrum_runtime::ProjectionBlockFormat,
 ) -> bool {
     profile
         .operations
@@ -731,10 +713,10 @@ fn profile_has_shared_m4_m8_route(
 }
 
 fn composite_has_shared_m4_m8_route(
-    arithmetic: &ferrum_interfaces::vnext::CompositeNumericalArithmetic,
-    format: ferrum_interfaces::vnext::ProjectionBlockFormat,
+    arithmetic: &ferrum_runtime::CompositeNumericalArithmetic,
+    format: ferrum_runtime::ProjectionBlockFormat,
 ) -> bool {
-    use ferrum_interfaces::vnext::{
+    use ferrum_runtime::{
         NumericalArithmeticStage, UpstreamProjectionArithmetic, UpstreamProjectionLayout,
         CAUSAL_PAGED_ATTENTION_F32_MASTER_OPERATION_ID, DENSE_SWIGLU_OPERATION_ID,
         GATED_DELTA_RECURRENT_ATTENTION_F32_MASTER_OPERATION_ID,
@@ -1146,8 +1128,8 @@ const fn decision_source_name(source: ResolutionDecisionSource) -> &'static str 
 mod tests {
     use super::*;
 
-    fn q6_auto_profile() -> ferrum_interfaces::vnext::NumericalExecutionProfile {
-        use ferrum_interfaces::vnext::{
+    fn q6_auto_profile() -> ferrum_runtime::NumericalExecutionProfile {
+        use ferrum_runtime::{
             ElementType, ModelFamilyId, NumericalExecutionProfile, NumericalOperationContract,
             NumericalProfileId, OperationId, ProgramValueId, Q6MmqF32Policy,
             UpstreamMarkerV2Profile as Profile, LAST_TOKEN_DENSE_LINEAR_Q6_MMQ_F32_OPERATION_ID,
@@ -1191,8 +1173,8 @@ mod tests {
         profile
     }
 
-    fn q6_auto_capabilities() -> BTreeSet<ferrum_interfaces::vnext::CapabilityId> {
-        use ferrum_interfaces::vnext::{
+    fn q6_auto_capabilities() -> BTreeSet<ferrum_runtime::CapabilityId> {
+        use ferrum_runtime::{
             CapabilityId, UpstreamMarkerV2Profile as Profile,
             LAST_TOKEN_DENSE_LINEAR_Q6_MMQ_F32_CAPABILITY_ID,
         };
@@ -1524,19 +1506,18 @@ mod tests {
         )
         .is_none());
         let mut strict = profile;
-        strict.id =
-            ferrum_interfaces::vnext::NumericalProfileId::new("numerical.test.strict").unwrap();
+        strict.id = ferrum_runtime::NumericalProfileId::new("numerical.test.strict").unwrap();
         strict
             .operations
             .retain(|operation| operation.composite_arithmetic.is_none());
         let head = &mut strict.operations[0];
-        head.operation_id = ferrum_interfaces::vnext::OperationId::new(
-            ferrum_interfaces::vnext::LAST_TOKEN_DENSE_LINEAR_F32_OPERATION_ID,
+        head.operation_id = ferrum_runtime::OperationId::new(
+            ferrum_runtime::LAST_TOKEN_DENSE_LINEAR_F32_OPERATION_ID,
         )
         .unwrap();
         head.staged_arithmetic = None;
-        head.multiplication_type = Some(ferrum_interfaces::vnext::ElementType::F32);
-        head.accumulation_type = Some(ferrum_interfaces::vnext::ElementType::F32);
+        head.multiplication_type = Some(ferrum_runtime::ElementType::F32);
+        head.accumulation_type = Some(ferrum_runtime::ElementType::F32);
         strict.validate().unwrap();
         assert!(auto_numerical_profile_rejection(
             &ferrum_types::NumericalExecutionPolicy::Auto,
@@ -1551,7 +1532,7 @@ mod tests {
 
     #[test]
     fn q8_projection_weight_preparation_requires_wired_attention_numerics() {
-        use ferrum_interfaces::vnext::{
+        use ferrum_runtime::{
             OperationId, UpstreamMarkerV2Profile as Profile, DENSE_SWIGLU_OPERATION_ID,
         };
         for profile in [
@@ -1628,7 +1609,7 @@ mod tests {
     }
     #[test]
     fn shared_m8_q4_requires_original_marker_mmvq_columns_and_declared_eight_rows() {
-        use ferrum_interfaces::vnext::{
+        use ferrum_runtime::{
             UpstreamProjectionArithmetic as Arithmetic, UpstreamProjectionLayout as Layout,
             UpstreamProjectionRouteDeclaration,
         };
@@ -1658,7 +1639,7 @@ mod tests {
 
     #[test]
     fn shared_m8_q4_requires_a_supported_attention_contract_with_original_mmvq() {
-        use ferrum_interfaces::vnext::{
+        use ferrum_runtime::{
             OperationId, UpstreamMarkerV2Profile as Profile, DENSE_SWIGLU_OPERATION_ID,
         };
         // Extended formats retain the independently declared original Q4 route.
@@ -1691,7 +1672,7 @@ mod tests {
 
     #[test]
     fn shared_m8_q5_requires_a_supported_attention_contract_with_original_mmvq() {
-        use ferrum_interfaces::vnext::{
+        use ferrum_runtime::{
             OperationId, UpstreamMarkerV2Profile as Profile, DENSE_SWIGLU_OPERATION_ID,
         };
         // Extended formats retain the independently declared original Q5 route.
@@ -1718,7 +1699,7 @@ mod tests {
         for projection in &mut q4_only.projections {
             projection
                 .leaves
-                .retain(|leaf| leaf.format != ferrum_interfaces::vnext::ProjectionBlockFormat::Q5K);
+                .retain(|leaf| leaf.format != ferrum_runtime::ProjectionBlockFormat::Q5K);
         }
         assert!(composite_has_shared_m8_q4_route(&q4_only));
         assert!(!composite_has_shared_m8_q5_route(&q4_only));
@@ -1732,7 +1713,7 @@ mod tests {
 
     #[test]
     fn shared_m4_m8_accepts_wired_attention_and_swiglu_routes_only() {
-        use ferrum_interfaces::vnext::{
+        use ferrum_runtime::{
             NumericalArithmeticStage, OperationId, ProjectionBlockFormat as Format,
             UpstreamMarkerV2Profile as Profile, UpstreamProjectionArithmetic as Arithmetic,
             UpstreamProjectionLayout as Layout,

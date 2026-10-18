@@ -8,6 +8,8 @@ description = "Request scheduling for Ferrum LLM inference engine"
 readme = "../../README.md"
 
 [dependencies]
+ferrum-runtime = { workspace = true }
+ferrum-execution = { workspace = true }
 # Core dependencies - New architecture
 ferrum-types = { workspace = true }
 ferrum-interfaces = { workspace = true }

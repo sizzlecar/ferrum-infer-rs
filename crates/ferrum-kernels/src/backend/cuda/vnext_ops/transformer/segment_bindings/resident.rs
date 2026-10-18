@@ -3,7 +3,7 @@ use super::*;
 use crate::backend::cuda::vnext_runtime::{
     CudaBindingProgramSink, CudaPhysicalOwnerBuilder, ResidentColdParts,
 };
-use ferrum_interfaces::vnext::PreparedPhysicalSegmentWave;
+use ferrum_runtime::PreparedPhysicalSegmentWave;
 
 pub(crate) fn compile(
     program: &(dyn std::any::Any + Send + Sync),
