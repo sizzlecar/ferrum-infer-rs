@@ -1,7 +1,7 @@
 use super::*;
 use ferrum_runtime::DeferredAction;
 
-fn response(request_id: &RequestId) -> InferenceResponse {
+pub(super) fn response(request_id: &RequestId) -> InferenceResponse {
     InferenceResponse {
         request_id: request_id.clone(),
         text: String::new(),

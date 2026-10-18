@@ -15,6 +15,10 @@ pub use prefix_rendezvous::{PrefixRendezvousCandidate, PrefixRendezvousHold, Pre
 mod pressure;
 mod slo;
 pub use slo::SchedulerSloSnapshot;
+mod token_admission;
+pub use token_admission::{
+    TokenAdmissionAccepted, TokenAdmissionApply, TokenAdmissionCandidate, TokenAdmissionRound,
+};
 
 #[cfg(test)]
 mod historical_replay_tests;
@@ -956,6 +960,7 @@ impl ContinuousBatchScheduler {
             Ok(())
         } else {
             // Try removing from prefill queue
+            drop(decode_queue);
             let mut prefill_queue = self.prefill_queue.write();
             if let Some(pos) = prefill_queue
                 .iter()
@@ -1531,6 +1536,9 @@ impl ContinuousBatchScheduler {
         empty_retry_epoch: Option<u64>,
     ) -> bool {
         let mut waiting_queue = self.waiting_queue.write();
+        if waiting_queue.scan_active() {
+            return false;
+        }
         let mut prefill_queue = self.prefill_queue.write();
         let mut request_index = self.request_index.write();
 
@@ -1600,10 +1608,12 @@ impl ContinuousBatchScheduler {
         self.total_wait_time_us
             .fetch_add(wait_us, Ordering::Relaxed);
         self.admitted_counter.fetch_add(1, Ordering::Relaxed);
+        let mut prefill = self.prefill_queue.write();
         self.request_index
             .write()
             .insert(request_id.clone(), RequestPhase::Prefilling);
-        self.prefill_queue.write().push_back(request);
+        prefill.push_back(request);
+        drop(prefill);
         self.consume_pressure_hold(&request_id);
         debug!("Typed admission promoted request {} to prefill", request_id);
     }
@@ -1643,129 +1653,10 @@ impl ContinuousBatchScheduler {
                 "dynamic admission requires a typed wake/probe mode",
             ));
         };
-        let wake = *wake;
-        self.dynamic_admission_ticks.fetch_add(1, Ordering::Relaxed);
-        let mut waiting = self.waiting_queue.write();
-        let maximum_probes = waiting.len().min(maximum_probes);
-        let mut events = self.dynamic_admission_events.lock();
-        let observer = std::cell::RefCell::new(observer);
-        let receipt = waiting
-            .schedule_with_capacity_observed(
-                wake,
-                self.capacity_release_epoch.load(Ordering::Acquire),
-                maximum_probes,
-                maximum_admissions,
-                &mut events,
-                |request, ticket| {
-                    if request.prefix_rendezvous.held() {
-                        return AdmissionQueueEligibility::Held;
-                    }
-                    let request_id = &request.inner.request.id;
-                    if !self.pressure_active.load(Ordering::Acquire) {
-                        return AdmissionQueueEligibility::Eligible;
-                    }
-                    let hold_status = {
-                        let coordinator = self.pressure_coordinator.lock();
-                        coordinator.hold_status(request_id)
-                    };
-                    match hold_status {
-                        PressureHoldStatus::Held { .. } => AdmissionQueueEligibility::Held,
-                        PressureHoldStatus::OwnerAdmissionEligible { .. } => {
-                            AdmissionQueueEligibility::Eligible
-                        }
-                        PressureHoldStatus::Released {
-                            episode_id,
-                            progress_owner_id,
-                            progress_baseline,
-                            progress_current,
-                            reason,
-                            ordinal,
-                            previous_wait_condition,
-                            current_wait_condition,
-                        } => {
-                            {
-                                let mut coordinator = self.pressure_coordinator.lock();
-                                if let Err(error) = coordinator.consume_released_hold(request_id) {
-                                    warn!(
-                                        request_id = %request_id,
-                                        error = %error,
-                                        "Pressure coordinator rejected terminal hold release"
-                                    );
-                                    return AdmissionQueueEligibility::Held;
-                                }
-                                self.pressure_active
-                                    .store(coordinator.has_records(), Ordering::Release);
-                            }
-                            if let Some(observer) = observer.borrow_mut().as_deref_mut() {
-                                observer(ExecutorAdmissionQueueObservation::PressureHoldReleased {
-                                    episode_id,
-                                    transition_ordinal: ordinal,
-                                    request_id: request_id.clone(),
-                                    progress_owner_id,
-                                    progress_baseline,
-                                    progress_current,
-                                    reason,
-                                    previous_wait_condition,
-                                    current_wait_condition,
-                                    ticket: ticket.get(),
-                                });
-                            }
-                            AdmissionQueueEligibility::Eligible
-                        }
-                        PressureHoldStatus::None => AdmissionQueueEligibility::Eligible,
-                    }
-                },
-                |_request, _ticket| {},
-                |request, ticket, deferral| {
-                    if let Some(observer) = observer.borrow_mut().as_deref_mut() {
-                        observer(ExecutorAdmissionQueueObservation::SkippedUnchanged {
-                            request_id: request.inner.request.id.clone(),
-                            ticket: ticket.get(),
-                            deferral: deferral.clone(),
-                            current: wake
-                                .expect("native deferral has an actual snapshot")
-                                .epochs(),
-                        });
-                    }
-                },
-                |request| probe(&request.inner.request),
-            )
-            .map_err(|error| FerrumError::scheduler(error.to_string()))?;
-        drop(waiting);
-
-        self.dynamic_admission_probes
-            .fetch_add(receipt.probed() as u64, Ordering::Relaxed);
-        self.dynamic_admission_skipped_unchanged
-            .fetch_add(receipt.skipped_unchanged() as u64, Ordering::Relaxed);
-        self.dynamic_admission_deferred
-            .fetch_add(receipt.deferred() as u64, Ordering::Relaxed);
-        self.dynamic_backing_growth_requested
-            .fetch_add(receipt.backing_growth_requested() as u64, Ordering::Relaxed);
-
-        for event in events.drain(..) {
-            match event {
-                AdmissionQueueEvent::Admitted {
-                    request, admission, ..
-                } => self.promote_admitted_request(request, &admission),
-                AdmissionQueueEvent::PermanentRejected {
-                    request, rejection, ..
-                } => self.fail_typed_admission(
-                    request,
-                    FerrumError::request_validation(format!(
-                        "request cannot fit the vNext runtime: {rejection:?}"
-                    )),
-                ),
-                AdmissionQueueEvent::Faulted { request, error, .. } => {
-                    self.fail_typed_admission(request, error)
-                }
-                AdmissionQueueEvent::ContractFaulted { request, error, .. } => {
-                    self.fail_typed_admission(request, FerrumError::scheduler(error.to_string()))
-                }
-                AdmissionQueueEvent::PreemptionRequested { .. } => {}
-                AdmissionQueueEvent::BackingGrowthRequested { .. } => {}
-            }
-        }
-        Ok(receipt)
+        let round = self.begin_admission_round(maximum_probes, maximum_admissions, *wake)?;
+        let mut ignore_observation = |_| {};
+        let observer = observer.as_deref_mut().unwrap_or(&mut ignore_observation);
+        round.run_sync(*probe, observer)
     }
 
     pub fn take_admission_failures(&self) -> Vec<(RequestId, FerrumError)> {
@@ -1914,26 +1805,8 @@ impl ContinuousBatchScheduler {
         probe: &mut dyn FnMut(&InferenceRequest) -> ExecutorAdmissionProbeOutcome,
         observer: &mut dyn FnMut(ExecutorAdmissionQueueObservation),
     ) -> Result<AdmissionTickReceipt> {
-        let active_capacity = self
-            .config
-            .max_running_requests
-            .saturating_sub(self.active_count());
-        let decode_capacity = self
-            .cb_config
-            .max_decode_batch
-            .saturating_sub(self.decoding_count());
-        let available_slots = active_capacity.min(decode_capacity);
-        let available_slots = self
-            .capacity_backpressure_admit_limit()
-            .map(|limit| available_slots.min(limit))
-            .unwrap_or(available_slots)
-            .min(maximum_admissions);
-        let mut mode = WaitingAdmissionMode::Dynamic {
-            wake,
-            probe,
-            observer: Some(observer),
-        };
-        self.admit_waiting_dynamically(available_slots, available_slots, &mut mode)
+        self.begin_token_admission(maximum_admissions, wake)?
+            .run_sync(probe, observer)
     }
 
     /// Maximum waiting-prefix width that can join the next fill-first prefill
@@ -2782,8 +2655,9 @@ impl ContinuousBatchScheduler {
     /// would make `next_batch` schedule the same un-runnable work every
     /// iteration, which can starve decode and spin the scheduler.
     pub fn defer_prefill_to_waiting(&self, request_id: &RequestId) -> bool {
-        let mut prefill_queue = self.prefill_queue.write();
         let mut waiting_queue = self.waiting_queue.write();
+        let mut prefill_queue = self.prefill_queue.write();
+        let has_decode = !self.decode_queue.read().requests.is_empty();
         let mut request_index = self.request_index.write();
         let attempted_prefill_width = prefill_queue.len();
 
@@ -2805,7 +2679,7 @@ impl ContinuousBatchScheduler {
                 .capacity_release_epoch
                 .load(Ordering::Relaxed)
                 .saturating_add(1);
-            if !self.decode_queue.read().requests.is_empty() {
+            if has_decode {
                 req.capacity_deferred_mixed_attempt_epoch =
                     Some(self.capacity_mixed_recompute_epoch.load(Ordering::Relaxed));
             }
@@ -3123,8 +2997,8 @@ impl ContinuousBatchScheduler {
         attempted_decode_width: usize,
         observed_free_blocks: Option<usize>,
     ) -> bool {
-        let mut decode_queue = self.decode_queue.write();
         let mut waiting_queue = self.waiting_queue.write();
+        let mut decode_queue = self.decode_queue.write();
         let mut request_index = self.request_index.write();
 
         if let Some(mut req) = decode_queue.remove(request_id) {
@@ -4501,6 +4375,13 @@ impl Scheduler for ContinuousBatchScheduler {
         // Add to waiting queue
         let mut waiting_queue = self.waiting_queue.write();
         let mut request_index = self.request_index.write();
+        // Selection can now await outside this lock. Enforce the queue bound
+        // here as well, so concurrent submissions cannot both consume its last slot.
+        if waiting_queue.len() >= self.config.max_waiting_requests {
+            return Err(FerrumError::scheduler(
+                "Queue is full, cannot accept more requests",
+            ));
+        }
         if request_index.contains_key(&request_id) {
             return Err(FerrumError::scheduler(format!(
                 "Request {request_id} is already tracked by the scheduler"
@@ -4740,6 +4621,7 @@ mod tests {
     mod active_decode_budget;
     mod capacity_release;
     mod slo_policy;
+    mod token_admission;
 
     fn create_test_request(priority: Priority) -> InferenceRequest {
         InferenceRequest {

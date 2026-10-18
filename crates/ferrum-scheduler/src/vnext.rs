@@ -14,6 +14,9 @@ use ferrum_runtime::{
     DeferredAction, DynamicBackingDeferred, LogicalAdmissionCoordinatorId,
 };
 
+mod admission_scan;
+pub(crate) use admission_scan::{AdmissionQueueScan, QueueProbeApplication};
+
 /// Typed product policy for waiting-request bypass fairness.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DynamicAdmissionQueuePolicy {
@@ -320,6 +323,7 @@ impl AdmissionTickReceipt {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DynamicAdmissionQueueError {
     InvalidPolicy(&'static str),
+    InvalidScan(&'static str),
     IdentityExhausted,
     DuplicateTicket(WaitingAdmissionTicket),
     ForeignCoordinator {
@@ -338,6 +342,7 @@ impl fmt::Display for DynamicAdmissionQueueError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::InvalidPolicy(reason) => write!(formatter, "invalid admission policy: {reason}"),
+            Self::InvalidScan(reason) => write!(formatter, "invalid admission scan: {reason}"),
             Self::IdentityExhausted => {
                 formatter.write_str("waiting admission identity space is exhausted")
             }
@@ -371,6 +376,8 @@ struct WaitingEntry<T> {
     release_deferred_at: Option<u64>,
     relevant_bypass_events: u64,
     fairness_opportunity: bool,
+    scan_seen: u64,
+    in_flight: Option<NonZeroU64>,
 }
 
 /// Plan-local waiting queue with bounded probing and release-epoch fairness.
@@ -381,6 +388,8 @@ pub struct DynamicAdmissionQueue<T> {
     waiting: VecDeque<WaitingEntry<T>>,
     next_ticket: Option<NonZeroU64>,
     last_wake: Option<AdmissionWakeEpochs>,
+    next_scan: Option<NonZeroU64>,
+    active_scan: Option<NonZeroU64>,
 }
 
 impl<T> DynamicAdmissionQueue<T> {
@@ -394,6 +403,8 @@ impl<T> DynamicAdmissionQueue<T> {
             waiting: VecDeque::with_capacity(capacity),
             next_ticket: NonZeroU64::new(1),
             last_wake: None,
+            next_scan: NonZeroU64::new(1),
+            active_scan: None,
         }
     }
 
@@ -553,6 +564,8 @@ impl<T> DynamicAdmissionQueue<T> {
             release_deferred_at: None,
             relevant_bypass_events: 0,
             fairness_opportunity: false,
+            scan_seen: self.active_scan.map_or(0, NonZeroU64::get),
+            in_flight: None,
         });
         Ok(())
     }
@@ -573,6 +586,8 @@ impl<T> DynamicAdmissionQueue<T> {
             release_deferred_at: None,
             relevant_bypass_events: 0,
             fairness_opportunity: false,
+            scan_seen: self.active_scan.map_or(0, NonZeroU64::get),
+            in_flight: None,
         });
         Ok(ticket)
     }
@@ -765,274 +780,38 @@ impl<T> DynamicAdmissionQueue<T> {
         mut probe: impl FnMut(&mut T) -> AdmissionProbeOutcome<A, R, E>,
     ) -> Result<AdmissionTickReceipt, DynamicAdmissionQueueError> {
         events.clear();
-        if let Some(wake) = wake {
-            self.validate_wake(wake.epochs())?;
-            self.last_wake = Some(wake.epochs());
+        let mut scan = self.begin_scan(wake, release_epoch, maximum_probes, maximum_admissions)?;
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            while let Some(ticket) = self.next_scan_candidate(
+                &mut scan,
+                events,
+                &mut eligibility,
+                &mut observe_held,
+                &mut observe_skipped_unchanged,
+            )? {
+                let outcome = probe(
+                    self.request_mut(ticket)
+                        .expect("selected request stays queued"),
+                );
+                match self.apply_scan_probe(&mut scan, ticket, outcome, events) {
+                    QueueProbeApplication::Applied => {}
+                    QueueProbeApplication::Unapplied { error, .. } => {
+                        return Err(error.unwrap_or(DynamicAdmissionQueueError::InvalidScan(
+                            "synchronous selected request disappeared",
+                        )));
+                    }
+                }
+            }
+            Ok(())
+        }));
+        let receipt = self.finish_scan(scan);
+        match result {
+            Ok(result) => {
+                result?;
+                receipt
+            }
+            Err(panic) => std::panic::resume_unwind(panic),
         }
-
-        let initial_len = self.waiting.len();
-        let mut receipt = AdmissionTickReceipt {
-            probed: 0,
-            held: 0,
-            skipped_unchanged: 0,
-            admitted: 0,
-            deferred: 0,
-            permanent_rejected: 0,
-            faulted: 0,
-            preemption_requested: 0,
-            backing_growth_requested: 0,
-            waiting_after: 0,
-            fairness_barrier: None,
-        };
-        let mut admission_closed = maximum_probes == 0 || maximum_admissions == 0;
-        let mut maximum_admitted_ticket: Option<WaitingAdmissionTicket> = None;
-
-        for _ in 0..initial_len {
-            let mut entry = self
-                .waiting
-                .pop_front()
-                .expect("initial waiting length remains exact during one queue scan");
-            if eligibility(&mut entry.request, entry.ticket) == AdmissionQueueEligibility::Held {
-                receipt.held += 1;
-                observe_held(&entry.request, entry.ticket);
-                entry.fairness_opportunity = false;
-                self.waiting.push_back(entry);
-                continue;
-            }
-            let first_probe = entry.deferral.is_none() && entry.release_deferred_at.is_none();
-            entry.fairness_opportunity = false;
-            let aged = entry.relevant_bypass_events >= self.policy.max_relevant_bypass_events;
-            if admission_closed
-                || receipt.probed >= maximum_probes
-                || receipt.admitted >= maximum_admissions
-            {
-                if aged && receipt.fairness_barrier.is_none() {
-                    receipt.fairness_barrier = Some(entry.ticket);
-                }
-                self.waiting.push_back(entry);
-                continue;
-            }
-
-            if let Some(observed) = entry.release_deferred_at {
-                if release_epoch <= observed {
-                    receipt.skipped_unchanged += 1;
-                    if aged {
-                        receipt.fairness_barrier = Some(entry.ticket);
-                        admission_closed = true;
-                    }
-                    self.waiting.push_back(entry);
-                    continue;
-                }
-                entry.fairness_opportunity = true;
-            }
-            if let Some(deferral) = entry.deferral.as_ref() {
-                let Some(wake) = wake else {
-                    receipt.faulted += 1;
-                    events.push(AdmissionQueueEvent::ContractFaulted {
-                        ticket: entry.ticket,
-                        request: entry.request,
-                        error: DynamicAdmissionQueueError::InvalidWakeCondition(
-                            "native deferral requires its actual capacity snapshot".into(),
-                        ),
-                    });
-                    continue;
-                };
-                let wake_epochs = wake.epochs();
-
-                let contract_error =
-                    if deferral.observed.coordinator_id != wake_epochs.coordinator_id {
-                        Some(DynamicAdmissionQueueError::ForeignCoordinator {
-                            expected: wake_epochs.coordinator_id.get(),
-                            actual: deferral.observed.coordinator_id.get(),
-                        })
-                    } else if deferral.wait_condition.coordinator_id().get()
-                        != wake_epochs.coordinator_id.get()
-                    {
-                        Some(DynamicAdmissionQueueError::ForeignCoordinator {
-                            expected: wake_epochs.coordinator_id.get(),
-                            actual: deferral.wait_condition.coordinator_id().get(),
-                        })
-                    } else if !wake_epochs.is_monotonic_after(deferral.observed) {
-                        Some(DynamicAdmissionQueueError::EpochRegression)
-                    } else {
-                        deferral
-                            .wait_condition
-                            .changed_since(wake.availability())
-                            .err()
-                            .map(|error| {
-                                DynamicAdmissionQueueError::InvalidWakeCondition(error.to_string())
-                            })
-                    };
-                if let Some(error) = contract_error {
-                    receipt.faulted += 1;
-                    events.push(AdmissionQueueEvent::ContractFaulted {
-                        ticket: entry.ticket,
-                        request: entry.request,
-                        error,
-                    });
-                    continue;
-                }
-            }
-            if let Some(deferral) = entry.deferral.as_mut() {
-                let wake = wake.expect("native deferral snapshot was validated");
-                let wake_epochs = wake.epochs();
-                let policy_changed = wake_epochs.policy_epoch > deferral.observed.policy_epoch;
-                let audit_changed = wake_epochs.release_epoch > deferral.observed.release_epoch
-                    || wake_epochs.capacity_epoch > deferral.observed.capacity_epoch;
-                let availability_changed = deferral
-                    .wait_condition
-                    .changed_since(wake.availability())
-                    .expect("existing deferral was validated before retry selection");
-                if !policy_changed && !availability_changed {
-                    if audit_changed {
-                        deferral.refresh_observed(wake_epochs);
-                    }
-                    receipt.skipped_unchanged += 1;
-                    observe_skipped_unchanged(&entry.request, entry.ticket, deferral);
-                    if aged {
-                        receipt.fairness_barrier = Some(entry.ticket);
-                        admission_closed = true;
-                    }
-                    self.waiting.push_back(entry);
-                    continue;
-                }
-                entry.fairness_opportunity = availability_changed;
-            }
-
-            entry.fairness_opportunity |= first_probe;
-            receipt.probed += 1;
-            match probe(&mut entry.request) {
-                AdmissionProbeOutcome::Admitted(admission) => {
-                    receipt.admitted += 1;
-                    maximum_admitted_ticket = Some(
-                        maximum_admitted_ticket
-                            .map_or(entry.ticket, |current| current.max(entry.ticket)),
-                    );
-                    events.push(AdmissionQueueEvent::Admitted {
-                        ticket: entry.ticket,
-                        request: entry.request,
-                        admission,
-                    });
-                }
-                AdmissionProbeOutcome::PermanentRejected(rejection) => {
-                    receipt.permanent_rejected += 1;
-                    events.push(AdmissionQueueEvent::PermanentRejected {
-                        ticket: entry.ticket,
-                        request: entry.request,
-                        rejection,
-                    });
-                }
-                AdmissionProbeOutcome::Faulted(error) => {
-                    receipt.faulted += 1;
-                    events.push(AdmissionQueueEvent::Faulted {
-                        ticket: entry.ticket,
-                        request: entry.request,
-                        error,
-                    });
-                }
-                AdmissionProbeOutcome::CapacityDeferred => {
-                    entry.deferral = None;
-                    entry.release_deferred_at = Some(release_epoch);
-                    receipt.deferred += 1;
-                    if aged {
-                        receipt.fairness_barrier = Some(entry.ticket);
-                        admission_closed = true;
-                    }
-                    self.waiting.push_back(entry);
-                }
-                AdmissionProbeOutcome::Deferred(deferral) => {
-                    let Some(wake) = wake else {
-                        receipt.faulted += 1;
-                        events.push(AdmissionQueueEvent::ContractFaulted {
-                            ticket: entry.ticket,
-                            request: entry.request,
-                            error: DynamicAdmissionQueueError::InvalidWakeCondition(
-                                "native deferral requires its actual capacity snapshot".into(),
-                            ),
-                        });
-                        continue;
-                    };
-                    let wake_epochs = wake.epochs();
-
-                    let contract_error = if deferral.observed.coordinator_id
-                        != wake_epochs.coordinator_id
-                    {
-                        Some(DynamicAdmissionQueueError::ForeignCoordinator {
-                            expected: wake_epochs.coordinator_id.get(),
-                            actual: deferral.observed.coordinator_id.get(),
-                        })
-                    } else if deferral.wait_condition.coordinator_id().get()
-                        != wake_epochs.coordinator_id.get()
-                    {
-                        Some(DynamicAdmissionQueueError::ForeignCoordinator {
-                            expected: wake_epochs.coordinator_id.get(),
-                            actual: deferral.wait_condition.coordinator_id().get(),
-                        })
-                    } else {
-                        deferral
-                            .wait_condition
-                            .validate_sources_present(wake.availability())
-                            .err()
-                            .map(|error| {
-                                DynamicAdmissionQueueError::InvalidWakeCondition(error.to_string())
-                            })
-                    };
-                    if let Some(error) = contract_error {
-                        receipt.faulted += 1;
-                        events.push(AdmissionQueueEvent::ContractFaulted {
-                            ticket: entry.ticket,
-                            request: entry.request,
-                            error,
-                        });
-                        continue;
-                    }
-                    let action = deferral.action;
-                    entry.deferral = Some(deferral.clone());
-                    entry.release_deferred_at = None;
-                    receipt.deferred += 1;
-                    if action == DeferredAction::PreemptAndRecompute {
-                        receipt.preemption_requested += 1;
-                        events.push(AdmissionQueueEvent::PreemptionRequested {
-                            ticket: entry.ticket,
-                            deferral,
-                        });
-                    } else if action == DeferredAction::AwaitBackingGrowth {
-                        receipt.backing_growth_requested += 1;
-                        events.push(AdmissionQueueEvent::BackingGrowthRequested {
-                            ticket: entry.ticket,
-                            deferral,
-                        });
-                    }
-                    if aged {
-                        receipt.fairness_barrier = Some(entry.ticket);
-                        admission_closed = true;
-                    }
-                    self.waiting.push_back(entry);
-                }
-            }
-        }
-
-        for entry in &mut self.waiting {
-            if maximum_admitted_ticket.is_some_and(|admitted| entry.ticket < admitted)
-                && (entry.deferral.is_some() || entry.release_deferred_at.is_some())
-                && entry.fairness_opportunity
-            {
-                entry.relevant_bypass_events = entry.relevant_bypass_events.saturating_add(1);
-            }
-            entry.fairness_opportunity = false;
-        }
-        if receipt.fairness_barrier.is_none() {
-            receipt.fairness_barrier = self
-                .waiting
-                .iter()
-                .find(|entry| {
-                    (entry.deferral.is_some() || entry.release_deferred_at.is_some())
-                        && entry.relevant_bypass_events >= self.policy.max_relevant_bypass_events
-                })
-                .map(|entry| entry.ticket);
-        }
-        receipt.waiting_after = self.waiting.len();
-        Ok(receipt)
     }
 }
 
