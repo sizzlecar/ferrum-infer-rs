@@ -135,9 +135,14 @@ impl SequenceState {
             text.truncate(end);
         } else if let (Some(reason), Some(&last)) = (terminal, self.generated_tokens.last()) {
             // A tokenizer may retain a model terminal even with skip_special.
-            // Keep Harmony's typed terminators, but hide ordinary EOS/stop IDs.
+            // Wire terminators belong to the generated text independently of
+            // the later client outcome. Keep other finish-reason semantics.
             if self.stop_token_ids.contains(&last.get())
-                && !self.should_stream_generated_token(Some(tokenizer), last, Some(reason))
+                && matches!(
+                    reason,
+                    FinishReason::Stop | FinishReason::EOS | FinishReason::Error
+                )
+                && !self.is_declared_wire_terminator(Some(tokenizer), last)
             {
                 text = tokenizer.decode(
                     &self.generated_tokens[..self.generated_tokens.len() - 1],
@@ -394,7 +399,9 @@ impl EngineInner {
         {
             let mut state = handle.lock();
             if let Some(seq) = state.as_mut().filter(|_| self.sequences.is_current(handle)) {
-                self.send_stream_text_locked(handle.request_id(), seq, Some(token), None);
+                // Incremental decoding can still be retried from the complete
+                // history. Terminal decoding below must report its failure.
+                let _ = self.send_stream_text_locked(handle.request_id(), seq, Some(token), None);
             }
         }
         tokio::task::yield_now().await;
@@ -406,7 +413,7 @@ impl EngineInner {
         seq: &mut SequenceState,
         token: Option<TokenId>,
         terminal: Option<FinishReason>,
-    ) {
+    ) -> Result<()> {
         // Decode the full generated-token history (skip_special=true matches
         // the final-response decode in `complete_request`) and emit only
         // the delta that hasn't been streamed yet. Per-token decode is
@@ -424,34 +431,29 @@ impl EngineInner {
         // prefixes are held until they match, diverge, or generation ends.
         let (ttft_s, itl_s, first_emit_prof) = {
             let sender = seq.stream_sender.clone();
-            let Ok(mut full) = self.tokenizer.decode(&seq.generated_tokens, true) else {
-                return;
-            };
+            let mut full = self.tokenizer.decode(&seq.generated_tokens, true)?;
             let incomplete_utf8 = full.ends_with('\u{FFFD}');
             if incomplete_utf8 && terminal.is_none() {
                 // Partial multi-byte UTF-8 at the tail; wait for the next
                 // token. Do NOT advance streamed_text_len so the bytes get
                 // re-considered once the sequence completes.
-                return;
+                return Ok(());
             }
             if !incomplete_utf8 {
                 seq.decoded_text_len = full.len();
             }
             let visible = if terminal.is_some() {
-                let Ok(text) = seq.decoded_output_text(self.tokenizer.as_ref(), terminal) else {
-                    return;
-                };
-                text
+                seq.decoded_output_text(self.tokenizer.as_ref(), terminal)?
             } else {
                 let end = seq.visible_text_end(&full, false);
                 full.truncate(end);
                 full
             };
             if visible.ends_with('\u{FFFD}') {
-                return;
+                return Ok(());
             }
             let Some(delta) = visible.get(seq.streamed_text_len..) else {
-                return;
+                return Ok(());
             };
             let delta = delta.to_string();
             let range = seq.streamed_text_len..visible.len();
@@ -471,7 +473,7 @@ impl EngineInner {
                     if let Err(error) = sender.publish_text(self, chunk, range, terminal) {
                         sender.record_failure(error);
                         self.work_notify.notify_one();
-                        return;
+                        return Ok(());
                     }
                 }
             }
@@ -540,6 +542,7 @@ impl EngineInner {
                 );
             }
         }
+        Ok(())
     }
 
     pub(in crate::continuous_engine) fn rebuild_output_span(
@@ -916,8 +919,14 @@ impl EngineInner {
                         )
                 });
             }
+            let mut completion_error = None;
             if explicit_terminal_error.is_none() && finish_reason != FinishReason::Error {
-                self.send_stream_text_locked(request_id, seq, None, Some(finish_reason));
+                if let Err(error) =
+                    self.send_stream_text_locked(request_id, seq, None, Some(finish_reason))
+                {
+                    explicit_terminal_error = Some(error.clone());
+                    completion_error = Some(error);
+                }
             }
             self.handoff_request_completion_locked(
                 handle,
@@ -925,6 +934,7 @@ impl EngineInner {
                 finish_reason,
                 explicit_terminal_error,
                 terminal_error_is_delivery,
+                completion_error,
                 expected,
                 classified_api_response,
             )
@@ -1039,6 +1049,7 @@ impl EngineInner {
         finish_reason: FinishReason,
         mut explicit_terminal_error: Option<FerrumError>,
         terminal_error_is_delivery: bool,
+        mut completion_error: Option<FerrumError>,
         expected: CompletionExpectation<'_>,
         mut classified_api_response: Option<ferrum_types::ApiResponse>,
     ) -> Option<CompletionHandoff> {
@@ -1046,7 +1057,6 @@ impl EngineInner {
         // A terminal failure is not permission to abandon the other owners.
         // Keep the first control-plane error, while independently closing the
         // resources and client channels whose disposition is still known.
-        let mut completion_error = None;
         let (
             response,
             stream_sender,
@@ -1066,9 +1076,20 @@ impl EngineInner {
                     finish_reason
                 };
                 let terminal_token_trace = self.capture_sequence_terminal_token_trace(seq);
-                let text = seq
+                let text = match seq
                     .decoded_output_text(self.tokenizer.as_ref(), Some(finish_reason))
-                    .unwrap_or_default();
+                {
+                    Ok(text) => text,
+                    Err(error) => {
+                        warn!(request_id = %request_id, error = %error, "Request completion decoding failed");
+                        terminal_error.get_or_insert_with(|| error.clone());
+                        completion_error.get_or_insert(error);
+                        finish_reason = FinishReason::Error;
+                        // This failed DTO is only used for accounting/closure;
+                        // both client channels receive the retained error.
+                        String::new()
+                    }
+                };
                 let api_response = classified_api_response.take().or_else(|| {
                     // Declared native chat uses the same output projection as
                     // HTTP streaming; an authoritative grammar result wins.
@@ -1084,7 +1105,7 @@ impl EngineInner {
                     Err(error) => {
                         warn!(request_id = %request_id, error = %error, "Request completion evidence failed");
                         terminal_error.get_or_insert_with(|| error.clone());
-                        completion_error = Some(error);
+                        completion_error.get_or_insert(error);
                         finish_reason = FinishReason::Error;
                         None
                     }
@@ -1243,6 +1264,7 @@ impl EngineInner {
                         "engine shut down before request completion",
                     )),
                     false,
+                    None,
                     CompletionExpectation::Current,
                     None,
                 )

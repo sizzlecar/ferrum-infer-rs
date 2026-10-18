@@ -1034,6 +1034,23 @@ impl SequenceState {
         None
     }
 
+    /// A declared wire terminator remains part of generated text even when
+    /// completion later reports an error. This does not authorize publication.
+    pub(in crate::continuous_engine) fn is_declared_wire_terminator(
+        &self,
+        tokenizer: Option<&(dyn Tokenizer + Send + Sync)>,
+        token: TokenId,
+    ) -> bool {
+        self.sampling_params.model_output_protocol
+            == ferrum_types::ModelOutputProtocol::HarmonyGptOss
+            && tokenizer.is_some_and(|tokenizer| {
+                ["<|call|>", "<|return|>"]
+                    .into_iter()
+                    .filter_map(|marker| tokenizer.token_id(marker))
+                    .any(|terminal| terminal == token)
+            })
+    }
+
     /// Return whether the just-committed token belongs in the incremental
     /// response stream.
     ///
@@ -1050,14 +1067,10 @@ impl SequenceState {
         match stop_reason {
             Some(FinishReason::Error) => false,
             Some(FinishReason::Stop | FinishReason::EOS) => {
-                self.sampling_params.model_output_protocol
-                    == ferrum_types::ModelOutputProtocol::HarmonyGptOss
-                    && (tokenizer.is_some_and(|tokenizer| {
-                        ["<|call|>", "<|return|>"]
-                            .into_iter()
-                            .filter_map(|marker| tokenizer.token_id(marker))
-                            .any(|terminal| terminal == token)
-                    }) || (stop_reason == Some(FinishReason::EOS)
+                self.is_declared_wire_terminator(tokenizer, token)
+                    || (self.sampling_params.model_output_protocol
+                        == ferrum_types::ModelOutputProtocol::HarmonyGptOss
+                        && stop_reason == Some(FinishReason::EOS)
                         && !self.stop_token_ids.contains(&token.get())
                         && self
                             .structured_output_processor
@@ -1069,7 +1082,7 @@ impl SequenceState {
                                         &self.stop_token_ids,
                                     )
                                     .unwrap_or(false)
-                            })))
+                            }))
             }
             _ => true,
         }

@@ -40,6 +40,8 @@ mod prefix_restore_deferred_tests;
 #[path = "prefix_restore_tests.rs"]
 mod prefix_restore_tests;
 
+#[path = "completion_decode_tests.rs"]
+mod completion_decode_tests;
 #[path = "managed_driver_tests.rs"]
 mod managed_driver_tests;
 #[path = "metrics_only_tests.rs"]

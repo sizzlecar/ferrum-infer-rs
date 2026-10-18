@@ -90,6 +90,15 @@ pub(super) struct CloseGate {
     cancels: AtomicUsize,
 }
 
+impl CloseGate {
+    pub(super) fn close_call_counts(&self) -> (usize, usize) {
+        (
+            self.finishes.load(Ordering::SeqCst),
+            self.cancels.load(Ordering::SeqCst),
+        )
+    }
+}
+
 #[async_trait::async_trait]
 impl ModelExecutor for CloseGate {
     fn info(&self) -> &ferrum_types::ModelInfo {
@@ -184,6 +193,17 @@ pub(super) fn observed_cpu_model() -> (
 }
 
 pub(super) async fn fixture(delayed: bool, publication_error: bool) -> Fixture {
+    fixture_with_tokenizer(delayed, publication_error, |vocab| {
+        Arc::new(TinyTokenizer::new(vocab))
+    })
+    .await
+}
+
+pub(super) async fn fixture_with_tokenizer(
+    delayed: bool,
+    publication_error: bool,
+    make_tokenizer: impl FnOnce(usize) -> Arc<dyn Tokenizer>,
+) -> Fixture {
     let (inner, model, cfg) = observed_cpu_model();
     let (gate, receiver) = tokio::sync::oneshot::channel();
     let (started_sender, started) = tokio::sync::oneshot::channel();
@@ -202,7 +222,7 @@ pub(super) async fn fixture(delayed: bool, publication_error: bool) -> Fixture {
     config.backend.device = Device::CPU;
     config.runtime.scheduler_trace_jsonl = Some(trace.path().join("trace.jsonl"));
     let scheduler = Arc::new(ContinuousBatchScheduler::new(config.scheduler.clone()));
-    let tokenizer = Arc::new(TinyTokenizer::new(cfg.vocab_size));
+    let tokenizer = make_tokenizer(cfg.vocab_size);
     let kv = Arc::new(
         PagedKvCacheManager::new(
             Device::CPU,

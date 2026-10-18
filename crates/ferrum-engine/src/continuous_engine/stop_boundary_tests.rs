@@ -209,6 +209,228 @@ async fn output_stop_prefix_flush_preserves_two_pending_spans_before_terminal() 
     assert_eq!(engine.inner.output_budget.usage().queued_bytes, 0);
 }
 
+async fn harmony_pending_terminal_preserves_published_range(marker: &str) {
+    use ferrum_execution::token_execution::{ExecutionProduct, TokenWork};
+
+    let mut tokenizer = PolicyTokenizer::new(128, &[("test", 5), (marker, 7)]);
+    tokenizer.special.extra_eos_tokens = vec![TokenId::new(7)];
+    let tokenizer: Arc<dyn Tokenizer + Send + Sync> = Arc::new(tokenizer);
+    let executor = Arc::new(StopBoundaryExecutor::with_token_sequence(128, vec![7]));
+    let config = EngineConfig::default();
+    let scheduler = Arc::new(ContinuousBatchScheduler::new(config.scheduler.clone()));
+    let engine = ContinuousBatchEngine::new(
+        config,
+        scheduler.clone(),
+        tokenizer.clone(),
+        Arc::new(crate::registry::GreedySampler),
+        Arc::new(MockKvCacheManager::new(256)),
+        executor.clone(),
+        Arc::new(MockTensorFactory),
+    )
+    .unwrap();
+    let mut request = policy_request();
+    request.stream = true;
+    request.sampling_params.model_output_protocol =
+        ferrum_types::ModelOutputProtocol::HarmonyGptOss;
+    let request_id = request.id.clone();
+    let prompt = tokenizer.encode(&request.prompt, true).unwrap();
+    scheduler.submit_request(request.clone()).unwrap();
+    let scheduled = scheduler
+        .next_batch(ferrum_interfaces::BatchHint::simple(1))
+        .await
+        .unwrap();
+    assert_eq!(scheduled.requests.len(), 1);
+
+    // Use the existing controlled executor's actual token admission and
+    // sampling product. This is a protocol/publication regression, not a
+    // numerical model or native-failure fixture.
+    let TokenAdmissionOutcome::Admitted(start) = executor
+        .admit_tokens(ExecutionAdmission {
+            context: ExecutorPrefillAdmission::for_product_request(
+                &request_id,
+                &prompt,
+                executor.info().max_sequence_length,
+                prompt.len(),
+                0,
+            )
+            .unwrap(),
+            adapter: None,
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("controlled token admission must succeed")
+    };
+    let policy = ferrum_execution::model_executor::LogitsReturnPolicy::FullLogits;
+    let work = ExecutionWork::new(
+        &start,
+        TokenWork::Prefill(PrefillChunk::new(0, prompt.len(), prompt.len()).unwrap()),
+        &policy,
+    )
+    .unwrap();
+    let ExecutionBatchOutcome::Completed(completed) =
+        executor.execute_tokens(&[work]).await.unwrap()
+    else {
+        panic!("controlled prefill must complete")
+    };
+    let mut completed = completed.into_completions();
+    assert_eq!(completed.len(), 1);
+    let (_, frontier, _, product) = completed.pop().unwrap().into_parts();
+    let ExecutionProduct::Sampling(ExecutorSamplingOutput::FullLogits(mut logits)) = product else {
+        panic!("controlled prefill must preserve its sampling product")
+    };
+    let identity = frontier.sequence().clone();
+    let mut state = SequenceState::new_with_tokenizer_and_model_vocab_size(
+        request,
+        prompt.clone(),
+        Some(tokenizer.clone()),
+        Some(executor.info().vocab_size),
+    );
+    let token = state
+        .sample_and_commit_with_processors_and_tokenizer(&mut logits, Some(tokenizer.as_ref()))
+        .unwrap();
+    assert_eq!(token, TokenId::new(7));
+    assert_eq!(
+        state.stop_reason(Some(tokenizer.as_ref())),
+        Some(FinishReason::EOS)
+    );
+    assert!(state.should_stream_generated_token(
+        Some(tokenizer.as_ref()),
+        token,
+        Some(FinishReason::EOS),
+    ));
+    state.execution_frontier = Some(frontier);
+    state.prefill_complete = true;
+    state.prefill_tokens_processed = prompt.len();
+    scheduler.mark_prefill_complete(&request_id, prompt.len());
+    let (response_sender, mut response) = tokio::sync::oneshot::channel();
+    let (sender, mut receiver) = engine.inner.output_channel(request_id.clone(), 1).unwrap();
+    state.response_sender = Some(response_sender);
+    state.stream_sender = Some(sender.clone());
+    let mut slot = RequestSlotLease::open(&engine.inner, request_id.clone());
+    slot.admit(&engine.inner);
+    state.request_slot = Some(slot);
+    assert!(engine
+        .inner
+        .sequences
+        .insert(request_id.clone(), state)
+        .is_none());
+    let handle = engine.inner.sequences.get(&request_id).unwrap();
+    sender.bind_sequence(Arc::downgrade(&handle));
+
+    // Hold every real queued-byte permit before publication. A full mpsc
+    // channel alone is insufficient: its pending span may already be charged.
+    let blocker = engine.inner.output_budget.try_open_session().unwrap();
+    let held = blocker
+        .reserve_queued(blocker.config().queued_bytes_total)
+        .await
+        .unwrap();
+    engine.inner.send_stream_update(&request_id, token).await;
+    assert_eq!(
+        handle.lock().as_ref().unwrap().streamed_text_len,
+        marker.len()
+    );
+    assert_eq!(
+        engine.inner.output_budget.usage().queued_bytes,
+        held.bytes()
+    );
+    assert!(matches!(
+        receiver.try_recv(),
+        Err(mpsc::error::TryRecvError::Empty)
+    ));
+    assert!(sender.failure().is_none());
+    assert!(
+        scheduler
+            .next_batch(ferrum_interfaces::BatchHint::simple(1))
+            .await
+            .is_none(),
+        "the published, uncharged span must actually pause this request"
+    );
+
+    let original = FerrumError::request_validation("explicit failure after Harmony publication");
+    engine
+        .inner
+        .complete_request_exact_frontier_detached(
+            &handle,
+            &identity,
+            FinishReason::EOS,
+            Some(original.clone()),
+        )
+        .unwrap();
+    let client_error = response.try_recv().unwrap().unwrap_err();
+    assert!(matches!(
+        client_error,
+        FerrumError::RequestValidation { .. }
+    ));
+    assert_eq!(client_error.to_string(), original.to_string());
+    assert!(handle.lock().is_none());
+    assert!(engine.inner.sequences.is_empty());
+    assert_eq!(
+        sender.completed_text(0..marker.len()).unwrap().as_deref(),
+        Some(marker)
+    );
+    assert_eq!(
+        engine.inner.output_budget.usage().queued_bytes,
+        held.bytes()
+    );
+    assert!(matches!(
+        receiver.try_recv(),
+        Err(mpsc::error::TryRecvError::Empty)
+    ));
+
+    drop(held);
+    drop(blocker);
+    let chunk = tokio::time::timeout(Duration::from_secs(2), receiver.recv())
+        .await
+        .expect("the original published span must rebuild after credit returns")
+        .unwrap()
+        .unwrap();
+    assert_eq!(chunk.chunk().request_id, request_id);
+    assert_eq!(chunk.chunk().text, marker);
+    assert_eq!(chunk.chunk().token, Some(token));
+    assert!(chunk.chunk().finish_reason.is_none());
+    assert!(chunk.chunk().usage.is_none());
+    let stream_error = tokio::time::timeout(Duration::from_secs(2), receiver.recv())
+        .await
+        .expect("the original error follows the previously published marker")
+        .unwrap()
+        .unwrap_err();
+    assert!(matches!(
+        stream_error,
+        FerrumError::RequestValidation { .. }
+    ));
+    assert_eq!(stream_error.to_string(), original.to_string());
+    engine.inner.output_tasks.join_current().await;
+    engine.inner.execution_closes.join_observers().await;
+    engine.inner.drain_execution_closes().unwrap();
+    assert!(identity.observed_end().is_some());
+    assert!(
+        sender.failure().is_none(),
+        "no secondary span-projection error"
+    );
+    assert!(engine.inner.output_tasks.take_control_error().is_none());
+    drop(sender);
+    assert!(
+        receiver.recv().await.is_none(),
+        "an error must not gain a successful terminal"
+    );
+    engine.shutdown().await.unwrap();
+    assert_eq!(engine.inner.execution_closes.unreclaimed_count(), 0);
+    drop(chunk);
+    assert_eq!(engine.inner.output_budget.usage().queued_bytes, 0);
+    assert_eq!(engine.inner.output_budget.usage().sessions, 0);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn harmony_pending_call_marker_survives_explicit_completion_error() {
+    harmony_pending_terminal_preserves_published_range("<|call|>").await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn harmony_pending_return_marker_survives_explicit_completion_error() {
+    harmony_pending_terminal_preserves_published_range("<|return|>").await;
+}
+
 async fn stop_boundary_outputs(
     pieces: &[&str],
     stops: &[&str],
