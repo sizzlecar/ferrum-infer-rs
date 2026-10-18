@@ -5,9 +5,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use ferrum_interfaces::vnext::{
-    FileFingerprint, ModelArtifactSourceRole, ModelSourceKind, OriginalModelSource,
-    OriginalModelSources, ProductModelArtifactBinding, ProductModelSourceIdentity,
-    ResolvedModelSource, ResolvedModelSources,
+    ExternalModelMetadataId, FileFingerprint, ModelArtifactSourceRole, ModelSourceKind,
+    OriginalModelSource, OriginalModelSources, ProductModelArtifactBinding,
+    ProductModelSourceIdentity, ResolvedModelSource, ResolvedModelSources,
 };
 use ferrum_types::{FerrumError, Result};
 use sha2::{Digest, Sha256};
@@ -139,10 +139,39 @@ impl ProductionModelSourceBundle {
     ) -> Result<Self> {
         let semantic_root = canonical_directory(semantic_root.as_ref(), "semantic source")?;
         let config_json = read_required_file(&semantic_root.join("config.json"))?;
+        let semantic_architecture = declared_architecture(&config_json, "semantic config.json")?;
         semantic_preflight(&config_json)?;
 
         let tokenizer_root = canonical_directory(tokenizer_root.as_ref(), "tokenizer source")?;
         let weights = normalize_weight_artifact(weights)?;
+        let weight_config_json = match &weights {
+            ProductionWeightArtifact::SafetensorsDirectory(root) if root == &semantic_root => {
+                // Both roles describe the same file. Keep the semantic bytes
+                // already validated, even if the path changed during preflight.
+                Some(Arc::clone(&config_json))
+            }
+            ProductionWeightArtifact::SafetensorsDirectory(root) => {
+                read_optional_file(&root.join("config.json"))?
+            }
+            ProductionWeightArtifact::GgufFile(_) => None,
+        };
+        if let Some(raw) = weight_config_json.as_deref() {
+            if let Some(physical_architecture) = declared_architecture(raw, "weight config.json")? {
+                match semantic_architecture.as_ref() {
+                    Some(semantic) if semantic == &physical_architecture => {}
+                    Some(semantic) => {
+                        return Err(FerrumError::model(format!(
+                            "weight architecture {physical_architecture} does not match semantic architecture {semantic}"
+                        )));
+                    }
+                    None => {
+                        return Err(FerrumError::model(format!(
+                            "weight architecture {physical_architecture} requires a matching semantic architectures declaration"
+                        )));
+                    }
+                }
+            }
+        }
 
         let semantic_files = vec![fingerprint_loaded_file("config.json", &config_json)?];
         let tokenizer_files = fingerprint_named_files(
@@ -150,14 +179,7 @@ impl ProductionModelSourceBundle {
             TOKENIZER_REQUIRED_FILES,
             TOKENIZER_OPTIONAL_FILES,
         )?;
-        let weight_files = fingerprint_weight_artifact(&weights)?;
-
-        let weight_config_json = match &weights {
-            ProductionWeightArtifact::SafetensorsDirectory(root) => {
-                read_optional_file(&root.join("config.json"))?
-            }
-            ProductionWeightArtifact::GgufFile(_) => None,
-        };
+        let weight_files = fingerprint_weight_artifact(&weights, weight_config_json.as_deref())?;
         let tokenizer_json = read_required_file(&tokenizer_root.join("tokenizer.json"))?;
         let tokenizer_config_json =
             read_optional_file(&tokenizer_root.join("tokenizer_config.json"))?;
@@ -345,6 +367,22 @@ impl ProductionModelSourceBundle {
     }
 }
 
+/// Optional declarations still carry a strict single external identity. This
+/// does not select a built-in model family: custom executors may use other IDs,
+/// and a physical quantization-only config need not repeat semantic metadata.
+fn declared_architecture(raw: &[u8], source: &str) -> Result<Option<ExternalModelMetadataId>> {
+    let config: serde_json::Value = serde_json::from_slice(raw)
+        .map_err(|error| FerrumError::model(format!("parse {source}: {error}")))?;
+    let object = config
+        .as_object()
+        .ok_or_else(|| FerrumError::model(format!("{source} root is not an object")))?;
+    if object.contains_key("architectures") {
+        super::external_metadata_id_from_bytes(raw, source).map(Some)
+    } else {
+        Ok(None)
+    }
+}
+
 fn canonical_directory(path: &Path, kind: &str) -> Result<PathBuf> {
     if !path.is_dir() {
         return Err(FerrumError::model(format!(
@@ -406,6 +444,7 @@ fn fingerprint_named_files(
 
 fn fingerprint_weight_artifact(
     artifact: &ProductionWeightArtifact,
+    retained_config: Option<&[u8]>,
 ) -> Result<Vec<FileFingerprint>> {
     match artifact {
         ProductionWeightArtifact::GgufFile(path) => {
@@ -441,8 +480,7 @@ fn fingerprint_weight_artifact(
                     let name = path.file_name()?.to_str()?.to_owned();
                     (path.is_file()
                         && (name.ends_with(".safetensors")
-                            || name == "model.safetensors.index.json"
-                            || name == "config.json"))
+                            || name == "model.safetensors.index.json"))
                         .then_some(name)
                 })
                 .collect::<Vec<_>>();
@@ -456,10 +494,15 @@ fn fingerprint_weight_artifact(
                     root.display()
                 )));
             }
-            relative_paths
+            let mut files = relative_paths
                 .iter()
                 .map(|path| fingerprint_file(root, path))
-                .collect()
+                .collect::<Result<Vec<_>>>()?;
+            if let Some(config) = retained_config {
+                files.push(fingerprint_loaded_file("config.json", config)?);
+            }
+            files.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
+            Ok(files)
         }
     }
 }
@@ -667,6 +710,10 @@ fn portable_relative_path(path: &str) -> bool {
             .split('/')
             .all(|component| !matches!(component, "" | "." | ".."))
 }
+
+#[cfg(test)]
+#[path = "source_identity_tests.rs"]
+mod identity_tests;
 
 #[cfg(test)]
 mod tests {

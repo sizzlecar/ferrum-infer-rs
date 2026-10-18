@@ -19,6 +19,8 @@ use ferrum_types::{EngineConfig, FerrumError, Result};
 use std::sync::Arc;
 use tracing::{debug, info};
 
+mod source_binding;
+
 // Engine-build composition knobs (FERRUM_MODEL_PATH / FERRUM_SPEC_DRAFT /
 // FERRUM_SPEC_N) are no longer read from the environment here. The CLI
 // composition root captures them via `RuntimeConfigSnapshot::capture_current()`
@@ -346,6 +348,12 @@ impl EngineBuilder {
                 }
             }
         };
+        source_binding::validate(
+            &config,
+            component_config.model_sources.as_ref(),
+            component_config.defined_model.as_ref(),
+            executor.as_ref(),
+        )?;
         if let Some(plan) = executor.startup_memory_plan() {
             plan.apply_to_engine_config(&mut config)
                 .map_err(FerrumError::config)?;

@@ -23,6 +23,10 @@ use tracing::{debug, info};
 
 pub use ferrum_interfaces::sampler::GreedySampler;
 
+mod legacy_sources;
+#[cfg(test)]
+mod source_binding_tests;
+
 // ============================================================================
 // Core Types
 // ============================================================================
@@ -72,6 +76,11 @@ impl ComponentConfig {
         model_sources: Option<Arc<ProductionModelSourceBundle>>,
         defined_model: Option<Arc<DefinedProductionModel>>,
     ) -> Self {
+        let model_sources = model_sources.or_else(|| {
+            defined_model
+                .as_ref()
+                .map(|defined| Arc::clone(defined.sources()))
+        });
         Self {
             engine_config: config.clone(),
             device: config.backend.device.clone(),
@@ -1552,6 +1561,18 @@ impl ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>> for LlmExecutorFacto
     ) -> Result<Arc<dyn ModelExecutor + Send + Sync>> {
         use ferrum_models::weight_format::WeightFormat;
 
+        if let Some(defined) = &config.defined_model {
+            if !config
+                .model_sources
+                .as_ref()
+                .is_some_and(|sources| Arc::ptr_eq(defined.sources(), sources))
+            {
+                return Err(FerrumError::model(
+                    "defined product model and component sources do not share one source lease",
+                ));
+            }
+        }
+
         validate_causal_decode_preparation_mode(config, true)?;
 
         validate_segment_binding_owner_view_mode(config, true)?;
@@ -1667,21 +1688,35 @@ impl ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>> for LlmExecutorFacto
                 config.engine_config.kv_cache.dtype,
                 "legacy GGUF loader",
             )?;
-            let (llm, model_info) = ferrum_models::gguf_engine_loader::load_gguf_decoder_with_info(
-                path,
-                &config.device,
-                config.engine_config.model.model_id.clone(),
-            )?;
-            return Ok(Arc::new(ferrum_models::LlmExecutor::new(llm, model_info)));
+            let (llm, model_info) = match model_sources.as_deref() {
+                Some(sources) => {
+                    ferrum_models::gguf_engine_loader::load_gguf_decoder_from_sources_with_info(
+                        sources,
+                        &config.device,
+                        config.engine_config.model.model_id.clone(),
+                    )?
+                }
+                None => ferrum_models::gguf_engine_loader::load_gguf_decoder_with_info(
+                    path,
+                    &config.device,
+                    config.engine_config.model.model_id.clone(),
+                )?,
+            };
+            return Ok(legacy_sources::bind_executor(
+                llm,
+                model_info,
+                model_sources,
+            ));
         }
 
         // Explicitly registered legacy safetensors and the diagnostic CPU
         // reference path continue through the old registry until each family
         // migration deletes its legacy row and architecture branch together.
-        let mut config_manager = ferrum_models::ConfigManager::new();
-        let model_def = config_manager
-            .load_from_path(std::path::Path::new(&model_path))
-            .await?;
+        let model_def = legacy_sources::load_definition(
+            std::path::Path::new(&model_path),
+            model_sources.as_deref(),
+        )
+        .await?;
 
         info!(
             "  Architecture: {:?}, Layers: {}, Vocab: {}",
@@ -1899,7 +1934,11 @@ impl ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>> for LlmExecutorFacto
                         }
                     };
 
-                Ok(Arc::new(ferrum_models::LlmExecutor::new(llm, model_info)))
+                Ok(legacy_sources::bind_executor(
+                    llm,
+                    model_info,
+                    model_sources,
+                ))
             }
             _ => Err(FerrumError::model(format!(
                 "Architecture {:?} not supported",
@@ -2045,7 +2084,7 @@ pub fn set_global_registry(registry: Arc<ComponentRegistry>) -> Result<()> {
 // ============================================================================
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use safetensors::tensor::{serialize_to_file, Dtype, TensorView};
     use std::path::{Path, PathBuf};
@@ -2782,7 +2821,7 @@ mod tests {
         .unwrap();
     }
 
-    fn write_qwen35_fixture_model_dir() -> PathBuf {
+    pub(crate) fn write_qwen35_fixture_model_dir() -> PathBuf {
         let dir = unique_test_dir("qwen35-vnext-route");
         write_qwen35_fixture_config(&dir);
         write_qwen35_fixture_safetensors(&dir);

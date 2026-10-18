@@ -29,6 +29,7 @@ use ferrum_types::{DataType, FerrumError, ModelInfo, RequestId, Result, TokenId}
 
 use crate::common::DecoderOnlyLLM;
 use crate::lora::ActiveLoraAdapter;
+use crate::vnext::ProductionModelSourceBundle;
 
 use super::common::{self, GenericKvCacheHandle};
 
@@ -184,7 +185,7 @@ pub struct LlmExecutor {
     model: Mutex<Box<dyn DecoderOnlyLLM>>,
     adapter_support: AdapterExecutionSupport,
     info: ModelInfo,
-    vnext_model: Option<Arc<crate::vnext::PreparedProductionModel>>,
+    bound_sources: Option<Arc<ProductionModelSourceBundle>>,
     next_cache_id: AtomicU64,
     total_model_lock_wait_us: AtomicU64,
     model_lock_wait_samples: AtomicU64,
@@ -192,40 +193,33 @@ pub struct LlmExecutor {
 
 impl LlmExecutor {
     pub fn new(model: Box<dyn DecoderOnlyLLM>, info: ModelInfo) -> Self {
-        Self::new_with_optional_vnext_model(model, info, None)
+        Self::new_with_optional_model_sources(model, info, None)
     }
 
-    pub fn new_with_vnext_model(
+    /// Retains the exact product sources used to construct the model.
+    pub fn new_with_model_sources(
         model: Box<dyn DecoderOnlyLLM>,
         info: ModelInfo,
-        vnext_model: Arc<crate::vnext::PreparedProductionModel>,
+        sources: Arc<ProductionModelSourceBundle>,
     ) -> Self {
-        Self::new_with_optional_vnext_model(model, info, Some(vnext_model))
+        Self::new_with_optional_model_sources(model, info, Some(sources))
     }
 
-    fn new_with_optional_vnext_model(
+    fn new_with_optional_model_sources(
         model: Box<dyn DecoderOnlyLLM>,
         info: ModelInfo,
-        vnext_model: Option<Arc<crate::vnext::PreparedProductionModel>>,
+        bound_sources: Option<Arc<ProductionModelSourceBundle>>,
     ) -> Self {
         let adapter_support = model.adapter_execution_support();
         Self {
             model: Mutex::new(model),
             adapter_support,
             info,
-            vnext_model,
+            bound_sources,
             next_cache_id: AtomicU64::new(0),
             total_model_lock_wait_us: AtomicU64::new(0),
             model_lock_wait_samples: AtomicU64::new(0),
         }
-    }
-
-    pub fn vnext_model(&self) -> Option<&Arc<crate::vnext::PreparedProductionModel>> {
-        self.vnext_model.as_ref()
-    }
-
-    pub fn vnext_family(&self) -> Option<&ferrum_interfaces::vnext::PreparedModelFamily> {
-        self.vnext_model.as_deref().map(|model| model.family())
     }
 
     fn lock_model(&self) -> MutexGuard<'_, Box<dyn DecoderOnlyLLM>> {
@@ -291,6 +285,12 @@ impl LlmExecutor {
 impl ModelExecutor for LlmExecutor {
     fn info(&self) -> &ModelInfo {
         &self.info
+    }
+
+    fn bound_resolved_sources(&self) -> Option<&ferrum_interfaces::vnext::ResolvedModelSources> {
+        self.bound_sources
+            .as_deref()
+            .map(ProductionModelSourceBundle::resolved_sources)
     }
 
     fn adapter_execution_support(&self) -> AdapterExecutionSupport {
@@ -1534,6 +1534,39 @@ mod tests {
 
     fn recording_executor(calls: Arc<Mutex<RecordingCalls>>) -> LlmExecutor {
         LlmExecutor::new(Box::new(RecordingLlm::new(calls)), test_model_info())
+    }
+
+    #[test]
+    fn llm_executor_reports_retained_model_sources_without_a_runtime_plan() {
+        let calls = Arc::new(Mutex::new(RecordingCalls::default()));
+        let unbound = recording_executor(calls.clone());
+        assert!(unbound.bound_resolved_sources().is_none());
+
+        // This fixture exercises the source lease, not weight loading.
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("config.json"), b"{}").unwrap();
+        std::fs::write(root.path().join("tokenizer.json"), b"{}").unwrap();
+        std::fs::write(root.path().join("model.safetensors"), b"fixture-weights").unwrap();
+        let sources =
+            Arc::new(ProductionModelSourceBundle::open_colocated_safetensors(root.path()).unwrap());
+        let retained = Arc::downgrade(&sources);
+        let executor = LlmExecutor::new_with_model_sources(
+            Box::new(RecordingLlm::new(calls)),
+            test_model_info(),
+            sources,
+        );
+        let retained = retained
+            .upgrade()
+            .expect("executor retains its source bundle");
+        assert!(std::ptr::eq(
+            executor.bound_resolved_sources().unwrap(),
+            retained.resolved_sources(),
+        ));
+        assert!(executor.resolved_model_plan().is_none());
+        assert_eq!(
+            executor.execution_resource_authority(),
+            ferrum_types::ExecutionResourceAuthority::LegacyEngine,
+        );
     }
 
     fn recording_executor_with_unified_unsupported(
