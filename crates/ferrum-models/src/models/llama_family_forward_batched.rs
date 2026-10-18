@@ -8,10 +8,10 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use ferrum_interfaces::{
-    kv_dtype::KvFp16,
-    model_executor::{GreedyRepetitionPenalty, LogitsReturnPolicy, TokenSelectionMask},
+use ferrum_execution::model_executor::{
+    GreedyRepetitionPenalty, LogitsReturnPolicy, TokenSelectionMask,
 };
+use ferrum_interfaces::kv_dtype::KvFp16;
 use ferrum_kernels::backend::{
     Backend, BackendGraph, BackendMoeFused, BackendPagedKv, BackendQuantGguf, BackendQuantMarlin,
     KvCache, MoeLlmBackend, MAX_LAYERS_FOR_GRAPH,
@@ -532,7 +532,7 @@ mod tests {
         UnifiedGraphCaptureScope, BATCHED_DEVICE_SHADOW_GRAPH_KEY_BIT,
         UNIFIED_GRAPH_MAX_CACHED_KEYS,
     };
-    use ferrum_interfaces::model_executor::{
+    use ferrum_execution::model_executor::{
         GreedyRepetitionPenalty, LogitsReturnPolicy, TokenSelectionMask,
     };
 

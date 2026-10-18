@@ -1,7 +1,7 @@
 //! Closed recurrent-state address rule consumed by the whole-segment encoder.
 use super::super::segment_bindings::{self as segment, DynamicRecipe, ValidationRecipe};
 use super::*;
-use ferrum_interfaces::vnext::{
+use ferrum_runtime::{
     PreparedSegmentBindingNode, SegmentBindingDeclaration, SegmentBindingRegionExtent,
     SegmentBindingRegionRequest, SegmentBindingRegionSelector,
 };
@@ -14,7 +14,7 @@ pub(in crate::backend::cuda::vnext_ops) struct GatedDeltaRecipe {
 }
 
 pub(in crate::backend::cuda::vnext_ops) fn write_program(
-    node: &ferrum_interfaces::vnext::PreparedSegmentBindingNodeView<'_, '_, CudaDeviceBuffer>,
+    node: &ferrum_runtime::PreparedSegmentBindingNodeView<'_, '_, CudaDeviceBuffer>,
     recipe: &GatedDeltaRecipe,
     owners: &mut crate::backend::cuda::vnext_runtime::CudaSegmentOwnerBuilder<'_>,
     sink: &mut crate::backend::cuda::vnext_runtime::CudaBindingProgramSink,
@@ -64,7 +64,7 @@ pub(in crate::backend::cuda::vnext_ops) fn write_program(
 }
 
 pub(in crate::backend::cuda::vnext_ops) fn write_physical_program(
-    node: &ferrum_interfaces::vnext::PreparedPhysicalSegmentNodeView<'_, '_, CudaDeviceBuffer>,
+    node: &ferrum_runtime::PreparedPhysicalSegmentNodeView<'_, '_, CudaDeviceBuffer>,
     recipe: &GatedDeltaRecipe,
     owners: &mut crate::backend::cuda::vnext_runtime::CudaPhysicalOwnerBuilder,
     sink: &mut crate::backend::cuda::vnext_runtime::CudaBindingProgramSink,

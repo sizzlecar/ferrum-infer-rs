@@ -13,8 +13,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use ferrum_interfaces::kv_cache::{BlockTable, CacheHandleStats};
-use ferrum_interfaces::model_executor::{
+use ferrum_execution::model_executor::{
     AttentionType, DecodeInput, DecodeOutput, ExecutionResourceAuthority, ExecutorAdmissionEpochs,
     ExecutorBatchDecodeOutcome, ExecutorBatchPrefillOutcome, ExecutorCapabilities,
     ExecutorCapacityWaitRegistration, ExecutorExecutionCapacityDeferral,
@@ -34,8 +33,10 @@ use ferrum_interfaces::model_executor::{
     PrefillChunk, PrefillInput, PrefillOutput, PrefixCaptureBoundary, PrefixCaptureLease,
     PrefixCapturePlan, PrefixCaptureRequest, TypedSequenceStateMemory,
 };
-use ferrum_interfaces::vnext::*;
-use ferrum_interfaces::{KvCacheHandle, ModelExecutor, TensorRef};
+use ferrum_execution::{ModelExecutor, ProductExecutionEventSink};
+use ferrum_interfaces::kv_cache::{BlockTable, CacheHandleStats};
+use ferrum_interfaces::{KvCacheHandle, TensorRef};
+use ferrum_runtime::*;
 use ferrum_types::{
     AttentionExecutionPolicy, Device, EngineConfig, ExecutorAdmissionLimits, FerrumError,
     InvocationPreparationStrategy, ModelInfo, ObservabilityProfileDetail, ProfileEntrypoint,
@@ -4790,7 +4791,7 @@ pub struct VNextModelExecutor<R: DeviceRuntime> {
     prefix_cache: Mutex<prefix_cache::PrefixIndex<SequenceCheckpoint<R>>>,
     prefix_capture_identity: Arc<()>,
     product_token_mask_residency: Mutex<VNextProductTokenMaskResidency>,
-    event_sink: RwLock<Option<Arc<dyn ExecutionEventSink>>>,
+    event_sink: RwLock<Option<Arc<dyn ProductExecutionEventSink>>>,
     device_timing_mode: AtomicU8,
     diagnostic_fault: Option<VNextDiagnosticFault>,
     diagnostic_fault_armed: AtomicBool,
@@ -6636,13 +6637,16 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         let Some(sink) = self.event_sink.read().clone() else {
             return Ok(None);
         };
-        if sink.enablement() == ferrum_interfaces::vnext::ExecutionEventSinkEnablement::None {
+        if sink.enablement() == ferrum_runtime::ExecutionEventSinkEnablement::None {
             // Timing is configured independently when the sink is attached. A
             // metrics-only observer needs no transactional event cursor or payloads.
             return Ok(None);
         }
+        // Preserve the same sink allocation and queue; the runtime only sees
+        // the lower execution-event contract, without product prefix decisions.
+        let runtime_sink: Arc<dyn ExecutionEventSink> = sink;
         VNextExecutionJournal::open(
-            sink,
+            runtime_sink,
             self.resolved_plan.execution_plan(),
             Arc::clone(active),
             request_origin,
@@ -10476,7 +10480,7 @@ impl<R: DeviceRuntime> ModelExecutor for VNextModelExecutor<R> {
         self.startup_memory_plan.as_ref()
     }
 
-    fn attach_execution_event_sink(&self, sink: Arc<dyn ExecutionEventSink>) {
+    fn attach_execution_event_sink(&self, sink: Arc<dyn ProductExecutionEventSink>) {
         self.device_timing_mode
             .store(sink.device_timing_mode() as u8, Ordering::Release);
         *self.event_sink.write() = Some(sink);
@@ -10491,7 +10495,7 @@ impl<R: DeviceRuntime> ModelExecutor for VNextModelExecutor<R> {
 
     fn write_execution_capacity_snapshot(
         &self,
-        availability: &mut Vec<ferrum_interfaces::vnext::CapacityAvailabilityEpoch>,
+        availability: &mut Vec<ferrum_runtime::CapacityAvailabilityEpoch>,
     ) -> Result<Option<ExecutorAdmissionEpochs>> {
         self.plan_resources
             .write_dynamic_capacity_availability(availability)
@@ -11107,11 +11111,11 @@ mod tests {
         VNextWaveTimingSink, MAX_PRODUCT_TOKEN_MASK_SLOT_CACHE_ENTRIES,
         MAX_REUSABLE_EXECUTION_CATALOG_MISS_KEYS,
     };
-    use ferrum_interfaces::model_executor::{
+    use ferrum_execution::model_executor::{
         ExecutorSamplingOutput, ExecutorSequenceCompletion, GreedyRepetitionPenalty,
         LogitsReturnPolicy, PrefillChunk, TokenSelectionMask,
     };
-    use ferrum_interfaces::vnext::{
+    use ferrum_runtime::{
         CompletionReadbackBatchObservation, DeviceComputePathRequirement, DeviceExecutionInterval,
         DeviceExecutionIntervalKind, DeviceExecutionSpanKind, DeviceReusableExecutionObservation,
         DeviceReusableExecutionPlan, DeviceReusableExecutionPreparation,
@@ -11560,7 +11564,7 @@ mod tests {
         assert_eq!(plan.device_plan.maximum_executables(), 32 * 7);
         assert_eq!(
             plan.device_plan.catalog_lifetime(),
-            ferrum_interfaces::vnext::ReusableExecutionCatalogLifetime::OnDemandBounded
+            ferrum_runtime::ReusableExecutionCatalogLifetime::OnDemandBounded
         );
         assert_eq!(plan.program_policy.replay_validation_passes(), 0);
         assert!(resolve_test_reusable_startup_plan(
@@ -11761,7 +11765,7 @@ mod tests {
 
     #[test]
     fn wave_timing_enqueue_calls_preserve_cpu_availability_phase_and_reset() {
-        use ferrum_interfaces::vnext::{DeviceEnqueueStage, DeviceSubmissionStage};
+        use ferrum_runtime::{DeviceEnqueueStage, DeviceSubmissionStage};
 
         let aggregate = VNextWaveTimingMetrics::default();
         let decode = VNextWaveTimingMetrics::default();
@@ -12159,7 +12163,7 @@ mod tests {
     #[test]
     fn completion_readback_policy_declares_only_canonical_greedy_scalar_batches() {
         use super::{ElementType, VNextTerminalReadbacks};
-        use ferrum_interfaces::vnext::{
+        use ferrum_runtime::{
             CompletionReadbackBatchRequest, CompletionReadbackCollectionRequest,
             CompletionReadbackRequest, CompletionReadbackSelectionRequest, HostTransferLayout,
             NodeId, ResourceId,

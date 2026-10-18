@@ -1,13 +1,13 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use ferrum_interfaces::vnext::{
+use ferrum_quantization::{SafetensorsArchive, COMPRESSED_TENSORS_MARLIN_INT4_SYMMETRIC_FORMAT_ID};
+use ferrum_runtime::{
     CanonicalRational, ContractVersion, ElementType, PhysicalWeightComponentBinding,
     PhysicalWeightLayout, PhysicalWeightPadding, ProgramValueId, QuantizationFormatId,
     QuantizationGrouping, QuantizationPacking, QuantizationSpec, VNextError, WeightComponentRole,
     WeightComponentSpec, WeightEncoding, WeightFormatId, WeightId, WeightLayoutId, WeightSchema,
     WeightTensorSpec,
 };
-use ferrum_quantization::{SafetensorsArchive, COMPRESSED_TENSORS_MARLIN_INT4_SYMMETRIC_FORMAT_ID};
 use half::bf16;
 use safetensors::Dtype;
 use serde::{Deserialize, Serialize};
@@ -764,7 +764,7 @@ fn quantized_weight_count(semantic: &Gemma4SemanticConfig) -> Result<u64, String
 mod tests {
     use std::collections::HashMap;
 
-    use ferrum_interfaces::vnext::ModelFamilyId;
+    use ferrum_runtime::ModelFamilyId;
     use safetensors::tensor::{serialize_to_file, TensorView};
 
     use super::super::config::tiny_semantic_config;
@@ -924,7 +924,7 @@ mod tests {
             assert_eq!(scale.id.as_str(), format!("node.layer.{layer_index}.scale"));
             assert_eq!(
                 scale.operation_id.as_str(),
-                ferrum_interfaces::vnext::CONSTANT_SCALE_OPERATION_ID
+                ferrum_runtime::CONSTANT_SCALE_OPERATION_ID
             );
             assert_eq!(scale.inputs, nodes[residual_index].outputs);
             assert_eq!(
@@ -933,9 +933,7 @@ mod tests {
                     .iter()
                     .find(|(id, _)| id.as_str() == "scale")
                     .map(|(_, value)| value),
-                Some(&ferrum_interfaces::vnext::SemanticValue::Rational(
-                    expected_scale
-                ))
+                Some(&ferrum_runtime::SemanticValue::Rational(expected_scale))
             );
         }
     }

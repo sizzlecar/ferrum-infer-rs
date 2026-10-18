@@ -7,7 +7,7 @@ use super::super::native_blocks::{
     weights, CudaNativeBlockKernels,
 };
 use super::*;
-use ferrum_interfaces::vnext::{
+use ferrum_runtime::{
     EncodedReusableExecutionBindings, PreparedProjectionNumerics, UpstreamMarkerV2Profile,
     UpstreamScratchEstimate,
 };
@@ -21,7 +21,7 @@ pub(in crate::backend::cuda::vnext_ops) struct CudaUpstreamSwiGluProvider {
     g32: Option<Q8ActKernels>,
     plans: Arc<UpstreamPlanFactory>,
     validation: Arc<WeightValidationRegistry>,
-    arithmetic: ferrum_interfaces::vnext::CompositeNumericalArithmetic,
+    arithmetic: ferrum_runtime::CompositeNumericalArithmetic,
     silu: CudaFunction,
     scratch: Mutex<BTreeMap<String, UpstreamScratchEstimate>>,
 }
@@ -339,7 +339,7 @@ impl OperationProvider<CudaDeviceRuntime> for CudaUpstreamSwiGluProvider {
     ) -> Result<
         (
             EncodedDeviceOperation<CudaDeviceCommand>,
-            Option<ferrum_interfaces::vnext::SegmentBindingDeclaration>,
+            Option<ferrum_runtime::SegmentBindingDeclaration>,
         ),
         OperationFailure,
     > {

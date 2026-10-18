@@ -2,9 +2,7 @@
 //! 48-layer recurrent subgraph; no claim about full-model launch cost is made.
 use super::*;
 use cudarc::driver::sys::{self, CUevent_flags};
-use ferrum_interfaces::vnext::{
-    DeviceEnqueueStage, DeviceSubmissionStage, DeviceSubmissionTimingSink,
-};
+use ferrum_runtime::{DeviceEnqueueStage, DeviceSubmissionStage, DeviceSubmissionTimingSink};
 use std::{
     sync::Mutex,
     time::{Duration, Instant},

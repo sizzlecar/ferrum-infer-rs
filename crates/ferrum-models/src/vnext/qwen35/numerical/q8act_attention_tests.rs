@@ -1,5 +1,5 @@
 use super::*;
-use ferrum_interfaces::vnext::{NumericalExecutionPolicy, TypedFamilyRegistration};
+use ferrum_runtime::{NumericalExecutionPolicy, TypedFamilyRegistration};
 
 pub(super) fn source() -> Qwen35FamilyConfig {
     let mut config = super::super::tests::test_dense_gguf_config();

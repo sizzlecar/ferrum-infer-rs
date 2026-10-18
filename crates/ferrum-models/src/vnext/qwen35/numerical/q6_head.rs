@@ -1,6 +1,6 @@
 //! Explicit head-only replacement on the unchanged AA body profile.
 use super::*;
-use ferrum_interfaces::vnext::{Q6MmqF32Policy, LAST_TOKEN_DENSE_LINEAR_Q6_MMQ_F32_OPERATION_ID};
+use ferrum_runtime::{Q6MmqF32Policy, LAST_TOKEN_DENSE_LINEAR_Q6_MMQ_F32_OPERATION_ID};
 
 #[cfg(test)]
 mod tests;

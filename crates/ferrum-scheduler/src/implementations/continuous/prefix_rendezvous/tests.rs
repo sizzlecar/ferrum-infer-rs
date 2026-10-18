@@ -3,7 +3,7 @@ use super::*;
 fn plan(boundary: usize) -> PrefixCapturePlan {
     PrefixCapturePlan {
         boundary,
-        span: ferrum_interfaces::vnext::CheckpointTokenSpanConstraint::any_positive(),
+        span: ferrum_runtime::CheckpointTokenSpanConstraint::any_positive(),
     }
 }
 
@@ -161,7 +161,7 @@ async fn prefix_capture_span_alignment_is_preserved_across_shorter_scheduler_chu
     });
     let source = scheduler.submit(request()).await.unwrap();
     let follower = scheduler.submit(request()).await.unwrap();
-    let span = ferrum_interfaces::vnext::CheckpointTokenSpanConstraint::new(
+    let span = ferrum_runtime::CheckpointTokenSpanConstraint::new(
         NonZeroU64::new(2).unwrap(),
         NonZeroU64::new(2).unwrap(),
     )
@@ -207,7 +207,7 @@ async fn mixed_decode_budget_below_legal_span_releases_prefix_wait_without_borro
     scheduler.mark_prefill_complete(&decode, 13);
     let source = scheduler.submit(request()).await.unwrap();
     let follower = scheduler.submit(request()).await.unwrap();
-    let span = ferrum_interfaces::vnext::CheckpointTokenSpanConstraint::new(
+    let span = ferrum_runtime::CheckpointTokenSpanConstraint::new(
         NonZeroU64::new(4).unwrap(),
         NonZeroU64::new(4).unwrap(),
     )

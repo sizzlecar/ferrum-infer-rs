@@ -17,6 +17,7 @@ name = "ferrum-launcher"
 path = "src/bin/ferrum-launcher.rs"
 
 [dependencies]
+ferrum-runtime = { workspace = true }
 # Core dependencies
 ferrum-types = { workspace = true }
 ferrum-interfaces = { workspace = true }

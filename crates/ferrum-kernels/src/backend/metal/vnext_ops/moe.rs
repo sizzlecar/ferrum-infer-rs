@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 use std::ffi::c_void;
 use std::sync::Arc;
 
-use ferrum_interfaces::vnext::{
+use ferrum_runtime::{
     routed_shared_swiglu_moe_contract, routed_swiglu_moe_contract, AttributeId,
     BatchedOperationInvocation, CheckpointBoundaryConstraint, CheckpointCompletedInputCapture,
     CheckpointInputDependency, CheckpointPartitionNumerics, DeviceBatchingForm,
@@ -2237,7 +2237,7 @@ mod tests {
     use super::*;
     use candle_core::quantized::{GgmlDType, QTensor};
     use candle_core::{Device as CandleDevice, Tensor};
-    use ferrum_interfaces::vnext::{
+    use ferrum_runtime::{
         DeviceId, OperationContract, OperationId, ResourcePresenceRequirement, TensorAccess,
     };
     use half::f16;

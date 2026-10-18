@@ -4,12 +4,12 @@ use std::collections::BTreeSet;
 use std::path::Path;
 use std::sync::Arc;
 
-use ferrum_interfaces::vnext::{
+use ferrum_quantization::{Mxfp4SafetensorsSource, SafetensorsArchive};
+use ferrum_runtime::{
     ExternalModelMetadataId, FamilyNumericalProfiles, ModelFamilyId, ModelFamilyProvider,
     ModelFamilyRegistration, ModelProgram, ModelSemanticMetadata, NumericalExecutionProfile,
     TypedFamilyRegistration, VNextError, WeightComponentSource, WeightSchema,
 };
-use ferrum_quantization::{Mxfp4SafetensorsSource, SafetensorsArchive};
 use ferrum_types::{DataType, ModelOutputProtocol, ReasoningEffort, ReasoningEffortSupport};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -310,7 +310,7 @@ fn invalid_config(field: impl Into<String>, reason: impl Into<String>) -> VNextE
 #[cfg(test)]
 mod tests {
     use crate::vnext::test_support::PrepareFamilyFixture;
-    use ferrum_interfaces::vnext::{
+    use ferrum_runtime::{
         SpecialTokenCollision, SpecialTokenCollisionPolicy, SpecialTokenMetadata, SpecialTokenRole,
         TemplateMetadata, MAX_PREPARED_MODEL_FAMILY_WIRE_BYTES,
     };
@@ -365,7 +365,7 @@ mod tests {
 
     #[test]
     fn int8_kv_rejects_unimplemented_sink_window_yarn_attention() {
-        use ferrum_interfaces::vnext::{KvStorageFormat, NumericalExecutionPolicy};
+        use ferrum_runtime::{KvStorageFormat, NumericalExecutionPolicy};
         let profiles = program::numerical_profiles(
             &ModelFamilyId::new(FAMILY_ID).unwrap(),
             &tiny_config().semantic,

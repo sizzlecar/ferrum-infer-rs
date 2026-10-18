@@ -3,7 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroU32;
 
-use ferrum_interfaces::vnext::{
+use ferrum_runtime::{
     ElementType, GroupedFeatureTranspose, HadamardApplication, HadamardSigns,
     HadamardTransformSpec, ModelFamilyId, PhysicalWeightComponentBinding, PhysicalWeightLayout,
     VNextError, WeightComponentRole, WeightComponentSpec, WeightEncoding, WeightId, WeightSchema,

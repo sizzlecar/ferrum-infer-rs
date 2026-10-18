@@ -4,7 +4,7 @@ use super::*;
 use std::future::{pending, Future};
 use std::task::{Context, Waker};
 
-#[path = "../../../../../ferrum-interfaces/tests/vnext_resource_contract/support.rs"]
+#[path = "../../../../../ferrum-runtime/tests/vnext_resource_contract/support.rs"]
 mod resource_support;
 use resource_support::{admit_logical_sequence, close_plan_runtime, TestRuntime};
 

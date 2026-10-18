@@ -3,6 +3,8 @@ members = [
     # New refactored crates
     "crates/ferrum-types",
     "crates/ferrum-interfaces",
+    "crates/ferrum-runtime",
+    "crates/ferrum-execution",
     
     # Implementation crates
     "crates/ferrum-scheduler",
@@ -116,6 +118,8 @@ candle-metal-kernels = "0.9.2"
 # Internal crates - New refactored crates
 ferrum-types = { path = "crates/ferrum-types", version = "0.13.0" }
 ferrum-interfaces = { path = "crates/ferrum-interfaces", version = "0.13.0" }
+ferrum-runtime = { path = "crates/ferrum-runtime", version = "0.13.0" }
+ferrum-execution = { path = "crates/ferrum-execution", version = "0.13.0" }
 
 # Internal crates - Implementation crates
 ferrum-scheduler = { path = "crates/ferrum-scheduler", version = "0.13.0" }

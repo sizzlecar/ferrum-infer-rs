@@ -1,8 +1,8 @@
 use super::*;
 
-#[path = "../../../../../ferrum-interfaces/tests/vnext_sequence_checkpoint_contract/fixture.rs"]
+#[path = "../../../../../ferrum-runtime/tests/vnext_sequence_checkpoint_contract/fixture.rs"]
 mod checkpoint_fixture;
-#[path = "../../../../../ferrum-interfaces/tests/vnext_core_contract/mod.rs"]
+#[path = "../../../../../ferrum-runtime/tests/vnext_core_contract/mod.rs"]
 mod vnext_core_contract;
 
 #[path = "completion_guard_tests.rs"]
@@ -32,7 +32,7 @@ mod restore_selection_tests;
 #[test]
 fn rendezvous_boundary_uses_actual_span_and_all_follower_suffix_constraints() {
     use checkpoint_fixture::{Fixture, Spec};
-    use ferrum_interfaces::model_executor::PrefixCaptureBoundary;
+    use ferrum_execution::model_executor::PrefixCaptureBoundary;
     let span = CheckpointTokenSpanConstraint::new(
         std::num::NonZeroU64::new(4).unwrap(),
         std::num::NonZeroU64::new(4).unwrap(),

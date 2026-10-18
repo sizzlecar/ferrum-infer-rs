@@ -8,7 +8,7 @@ impl EngineInner {
         batch: &ferrum_interfaces::BatchPlan,
     ) -> Result<()> {
         if self.model_executor.execution_resource_authority()
-            == ferrum_interfaces::model_executor::ExecutionResourceAuthority::PlanRuntime
+            == ferrum_execution::model_executor::ExecutionResourceAuthority::PlanRuntime
         {
             return self.process_batch_plan_runtime(batch).await;
         }
@@ -287,7 +287,7 @@ impl EngineInner {
     /// model lock. Models with native unified forward can co-batch
     /// prefill and decode work.
     async fn process_batch_unified(&self, batch: &ferrum_interfaces::BatchPlan) -> Result<()> {
-        use ferrum_interfaces::model_executor::{
+        use ferrum_execution::model_executor::{
             LogitsReturnPolicy, UnifiedBatch, UnifiedBatchItem,
         };
         use ferrum_interfaces::KvCacheHandle;

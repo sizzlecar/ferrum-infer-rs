@@ -7,13 +7,13 @@ use std::collections::BTreeSet;
 use std::path::Path;
 use std::sync::Arc;
 
-use ferrum_interfaces::vnext::{
+use ferrum_quantization::{
+    GgufWeightComponentSource, GptqMarlinSafetensorsSource, SafetensorsArchive,
+};
+use ferrum_runtime::{
     ExternalModelMetadataId, FamilyNumericalProfiles, ModelFamilyId, ModelFamilyProvider,
     ModelFamilyRegistration, ModelProgram, ModelSemanticMetadata, NumericalExecutionProfile,
     PreparedModelFamily, TypedFamilyRegistration, VNextError, WeightComponentSource, WeightSchema,
-};
-use ferrum_quantization::{
-    GgufWeightComponentSource, GptqMarlinSafetensorsSource, SafetensorsArchive,
 };
 use ferrum_types::DataType;
 use serde::{Deserialize, Serialize};
@@ -303,7 +303,7 @@ mod tests {
     use crate::vnext::test_support::PrepareFamilyFixture;
     use std::collections::BTreeSet;
 
-    use ferrum_interfaces::vnext::{
+    use ferrum_runtime::{
         CanonicalRational, SpecialTokenCollisionPolicy, SpecialTokenMetadata, TemplateMetadata,
         MAX_PREPARED_MODEL_FAMILY_WIRE_BYTES,
     };
@@ -354,7 +354,7 @@ mod tests {
 
     #[test]
     fn int8_kv_profile_prepares_every_standard_causal_layer_with_scales() {
-        use ferrum_interfaces::vnext::{
+        use ferrum_runtime::{
             ElementType, KvStorageFormat, NumericalExecutionPolicy,
             CAUSAL_PAGED_ATTENTION_INT8_KV_OPERATION_ID,
         };

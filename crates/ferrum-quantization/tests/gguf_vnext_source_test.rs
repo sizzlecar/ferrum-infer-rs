@@ -3,11 +3,11 @@ use std::io::{Cursor, Write};
 use candle_core::quantized::gguf_file::{self, Value};
 use candle_core::quantized::{GgmlDType, QTensor};
 use candle_core::{Device, Tensor};
-use ferrum_interfaces::vnext::{
+use ferrum_quantization::GgufWeightComponentSource;
+use ferrum_runtime::{
     BlockQuantizationSpec, ElementType, WeightComponentRole, WeightComponentSource,
     WeightComponentSpec, WeightEncoding, WeightId,
 };
-use ferrum_quantization::GgufWeightComponentSource;
 use half::f16;
 
 struct NativeTensorFixture<'a> {

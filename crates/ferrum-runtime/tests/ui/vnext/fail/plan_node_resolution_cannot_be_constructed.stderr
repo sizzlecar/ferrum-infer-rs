@@ -1,0 +1,22 @@
+error[E0599]: no function or associated item named `new` found for struct `ferrum_runtime::PlanNodeResolution` in the current scope
+ --> tests/ui/vnext/fail/plan_node_resolution_cannot_be_constructed.rs:5:33
+  |
+5 |     let _ = PlanNodeResolution::new(
+  |                                 ^^^ function or associated item not found in `ferrum_runtime::PlanNodeResolution`
+  |
+note: if you're trying to build a new `ferrum_runtime::PlanNodeResolution`, consider using `ferrum_runtime::execution::resolution::<impl ferrum_runtime::PlanNodeResolution>::resolve` which returns `Result<ferrum_runtime::PlanNodeResolution, VNextError>`
+ --> src/execution/resolution.rs
+  |
+  | /     pub fn resolve<P: RuntimePolicy>(
+  | |         family: &PreparedModelFamily,
+  | |         catalog: &CapabilityCatalog,
+  | |         policy: &P,
+... |
+  | |         preferred_provider: Option<ProviderId>,
+  | |     ) -> Result<Self, VNextError> {
+  | |_________________________________^
+help: there is a method `ne` with a similar name, but with different arguments
+ --> $RUST/core/src/cmp.rs
+  |
+  |     fn ne(&self, other: &Rhs) -> bool {
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

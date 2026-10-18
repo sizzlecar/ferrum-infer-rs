@@ -1,6 +1,6 @@
 //! Optional restore waits must preserve progress and exact checkpoint ownership.
 use super::*;
-use ferrum_interfaces::model_executor::{
+use ferrum_execution::model_executor::{
     PlanRuntimePrefixRestoreDeferral, PlanRuntimePrefixRestoreInput,
     PlanRuntimePrefixRestoreOutcome, PlanRuntimePrefixRestoreOutput, PrefixCaptureLease,
     PrefixCaptureStatus, PrefixRestoreSource,
@@ -49,7 +49,7 @@ impl RestoreState {
         self: &Arc<Self>,
         input: PlanRuntimePrefixRestoreInput<'_>,
         epochs: ExecutorAdmissionEpochs,
-        wait: ferrum_interfaces::vnext::CapacityWaitCondition,
+        wait: ferrum_runtime::CapacityWaitCondition,
     ) -> Result<PlanRuntimePrefixRestoreOutcome> {
         if !self.targets.lock().contains(input.request_id) {
             return Ok(PlanRuntimePrefixRestoreOutcome::Unavailable);

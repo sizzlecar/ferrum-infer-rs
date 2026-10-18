@@ -1,10 +1,10 @@
-use ferrum_interfaces::vnext::{
+use ferrum_quantization::{SafetensorsArchive, MXFP4_E2M1_E8M0_SOURCE_FORMAT_ID};
+use ferrum_runtime::{
     ContractVersion, ElementType, PhysicalWeightComponentBinding, PhysicalWeightLayout,
     PhysicalWeightPadding, ProgramValueId, QuantizationFormatId, QuantizationGrouping,
     QuantizationPacking, QuantizationSpec, VNextError, WeightComponentRole, WeightComponentSpec,
     WeightEncoding, WeightFormatId, WeightId, WeightLayoutId, WeightSchema, WeightTensorSpec,
 };
-use ferrum_quantization::{SafetensorsArchive, MXFP4_E2M1_E8M0_SOURCE_FORMAT_ID};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -689,7 +689,7 @@ mod tests {
     use std::io::Write;
     use std::path::{Path, PathBuf};
 
-    use ferrum_interfaces::vnext::{ModelFamilyId, PhysicalWeightLayout};
+    use ferrum_runtime::{ModelFamilyId, PhysicalWeightLayout};
     use half::bf16;
     use safetensors::tensor::{serialize_to_file, Dtype, TensorView, View};
     use serde_json::Value;

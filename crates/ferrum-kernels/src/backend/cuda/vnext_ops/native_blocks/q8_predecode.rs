@@ -1,6 +1,6 @@
 //! Checked CUDA views for the exact cold Q8 coefficient representation.
 use super::*;
-use ferrum_interfaces::vnext::ElementType;
+use ferrum_runtime::ElementType;
 
 pub(super) fn q8_f32_bytes(k: u32, n: u32) -> Result<(u64, u64), CudaDeviceRuntimeError> {
     if k == 0 || k % 32 != 0 || n == 0 {

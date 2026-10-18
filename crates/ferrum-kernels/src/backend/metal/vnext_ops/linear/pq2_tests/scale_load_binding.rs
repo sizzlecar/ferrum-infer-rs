@@ -1,7 +1,7 @@
 //! Bind real retained weight slices, then execute the shared production path.
 use super::*;
 use crate::backend::metal::vnext_ops::MetalVNextComposition;
-use ferrum_interfaces::vnext::{BufferRequest, BufferUsage, DeviceId, ResourceId};
+use ferrum_runtime::{BufferRequest, BufferUsage, DeviceId, ResourceId};
 
 fn region(
     runtime: &MetalDeviceRuntime,

@@ -5,7 +5,7 @@ use crate::backend::cuda::vnext_runtime::{
     CudaBufferRegion, CudaDeviceBuffer, CudaDeviceCommand, CudaDeviceRuntimeError,
     CudaProgramBindingWrite, CudaSegmentOwnerBuilder, CudaSegmentOwnerTable, CudaSegmentRange,
 };
-use ferrum_interfaces::vnext::{
+use ferrum_runtime::{
     DeviceBatchingForm, ElementType, EncodedReusableExecutionBindings, EncodedSegmentBindingNode,
     PreparedSegmentBindingNode, PreparedSegmentBindingPatch, ProgramBindingNodeBinding,
     ResolvedValueRole, SegmentBindingDeclaration, SegmentBindingDependency,
@@ -88,7 +88,7 @@ pub(crate) fn compile_program(
 
 pub(crate) fn encode_program(
     program: &(dyn std::any::Any + Send + Sync),
-    frame: &mut ferrum_interfaces::vnext::PreparedSegmentBindingFrame<'_, CudaDeviceBuffer>,
+    frame: &mut ferrum_runtime::PreparedSegmentBindingFrame<'_, CudaDeviceBuffer>,
 ) -> Result<
     (
         Vec<EncodedSegmentBindingNode<CudaDeviceCommand>>,
@@ -483,7 +483,7 @@ fn encode_legacy(
 }
 
 pub(in crate::backend::cuda::vnext_ops) fn shared_program_region(
-    node: &ferrum_interfaces::vnext::PreparedSegmentBindingNodeView<'_, '_, CudaDeviceBuffer>,
+    node: &ferrum_runtime::PreparedSegmentBindingNodeView<'_, '_, CudaDeviceBuffer>,
     region: usize,
 ) -> Result<CudaBufferRegion, String> {
     let first_view = node.region(0, region).map_err(|e| e.to_string())?;
@@ -529,7 +529,7 @@ pub(in crate::backend::cuda::vnext_ops) fn shared_program_region(
 }
 
 pub(in crate::backend::cuda::vnext_ops) fn program_contiguous_region(
-    node: &ferrum_interfaces::vnext::PreparedSegmentBindingNodeView<'_, '_, CudaDeviceBuffer>,
+    node: &ferrum_runtime::PreparedSegmentBindingNodeView<'_, '_, CudaDeviceBuffer>,
     participant: usize,
     region: usize,
     owners: &mut CudaSegmentOwnerBuilder<'_>,

@@ -1,7 +1,7 @@
 //! Capacity-driven waiting admission for the vNext execution runtime.
 //!
 //! This queue owns policy only. Physical and logical capacity remain owned by
-//! `ferrum-interfaces`; callers probe those authorities and feed the typed
+//! `ferrum-runtime`; callers probe those authorities and feed the typed
 //! result back here. A deferred request stays queued and is not probed again
 //! until release, capacity, or product-policy evidence changes.
 
@@ -9,7 +9,7 @@ use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
 use std::num::NonZeroU64;
 
-use ferrum_interfaces::vnext::{
+use ferrum_runtime::{
     AdmissionDeferred, CapacityAvailabilityEpoch, CapacityEpochs, CapacityWaitCondition,
     DeferredAction, DynamicBackingDeferred, LogicalAdmissionCoordinatorId,
 };
@@ -944,7 +944,7 @@ impl<T> DynamicAdmissionQueue<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ferrum_interfaces::vnext::{CapacityAvailabilitySource, CapacityWaitCondition};
+    use ferrum_runtime::{CapacityAvailabilitySource, CapacityWaitCondition};
 
     #[derive(Clone, Copy)]
     struct TestWake {
@@ -1016,9 +1016,8 @@ mod tests {
     #[test]
     fn passive_wait_condition_unions_sources_and_keeps_oldest_generation() {
         let source = CapacityAvailabilitySource::ActiveSequenceSlots;
-        let domain = CapacityAvailabilitySource::Domain(
-            ferrum_interfaces::vnext::CapacityDomainId::new(1).unwrap(),
-        );
+        let domain =
+            CapacityAvailabilitySource::Domain(ferrum_runtime::CapacityDomainId::new(1).unwrap());
         let observed = wake_for(7, 0, 0, 0).epochs();
         let mut queue = DynamicAdmissionQueue::new(DynamicAdmissionQueuePolicy::default());
         queue.enqueue(1_u64).unwrap();
@@ -1153,9 +1152,8 @@ mod tests {
         let mut queue = DynamicAdmissionQueue::new(DynamicAdmissionQueuePolicy::default());
         queue.enqueue(1_u64).unwrap();
         queue.enqueue(2_u64).unwrap();
-        let domain_source = CapacityAvailabilitySource::Domain(
-            ferrum_interfaces::vnext::CapacityDomainId::new(1).unwrap(),
-        );
+        let domain_source =
+            CapacityAvailabilitySource::Domain(ferrum_runtime::CapacityDomainId::new(1).unwrap());
         queue.waiting[1].deferral = Some(AdmissionDeferral::new(
             DeferredAction::WaitForRelease,
             wake(0, 0, 0).epochs(),
@@ -1192,9 +1190,8 @@ mod tests {
         let mut queue = DynamicAdmissionQueue::new(DynamicAdmissionQueuePolicy::default());
         queue.enqueue(1_u64).unwrap();
         queue.enqueue(2_u64).unwrap();
-        let domain_source = CapacityAvailabilitySource::Domain(
-            ferrum_interfaces::vnext::CapacityDomainId::new(1).unwrap(),
-        );
+        let domain_source =
+            CapacityAvailabilitySource::Domain(ferrum_runtime::CapacityDomainId::new(1).unwrap());
         let malformed = AdmissionDeferral::new(
             DeferredAction::WaitForRelease,
             wake(0, 0, 0).epochs(),
@@ -1230,12 +1227,10 @@ mod tests {
     #[test]
     fn unrelated_capacity_source_change_refreshes_audit_without_probing() {
         let coordinator_id = NonZeroU64::new(7).unwrap();
-        let domain_1 = CapacityAvailabilitySource::Domain(
-            ferrum_interfaces::vnext::CapacityDomainId::new(1).unwrap(),
-        );
-        let domain_2 = CapacityAvailabilitySource::Domain(
-            ferrum_interfaces::vnext::CapacityDomainId::new(2).unwrap(),
-        );
+        let domain_1 =
+            CapacityAvailabilitySource::Domain(ferrum_runtime::CapacityDomainId::new(1).unwrap());
+        let domain_2 =
+            CapacityAvailabilitySource::Domain(ferrum_runtime::CapacityDomainId::new(2).unwrap());
         let initial_epochs = AdmissionWakeEpochs::new(coordinator_id, 0, 0, 0);
         let initial_availability = [
             CapacityAvailabilityEpoch::new(domain_1, 1).unwrap(),
@@ -1311,12 +1306,10 @@ mod tests {
     #[test]
     fn unrelated_release_events_do_not_age_the_fairness_barrier() {
         let coordinator_id = NonZeroU64::new(7).unwrap();
-        let domain_1 = CapacityAvailabilitySource::Domain(
-            ferrum_interfaces::vnext::CapacityDomainId::new(1).unwrap(),
-        );
-        let domain_2 = CapacityAvailabilitySource::Domain(
-            ferrum_interfaces::vnext::CapacityDomainId::new(2).unwrap(),
-        );
+        let domain_1 =
+            CapacityAvailabilitySource::Domain(ferrum_runtime::CapacityDomainId::new(1).unwrap());
+        let domain_2 =
+            CapacityAvailabilitySource::Domain(ferrum_runtime::CapacityDomainId::new(2).unwrap());
         let initial_epochs = AdmissionWakeEpochs::new(coordinator_id, 0, 0, 0);
         let initial_availability = [
             CapacityAvailabilityEpoch::new(domain_1, 1).unwrap(),

@@ -1,6 +1,6 @@
 //! Explicit same-wave host encoding comparison; never calls a CUDA enqueue.
 use super::*;
-use ferrum_interfaces::vnext::SegmentBindingOracleCommands;
+use ferrum_runtime::SegmentBindingOracleCommands;
 
 mod packet;
 

@@ -1,16 +1,16 @@
 //! Real CPU executor coverage for heterogeneous product frontiers.
 
 use super::*;
-use ferrum_interfaces::model_executor::{
+use ferrum_execution::model_executor::{
     ExecutorPrefillAdmission, ExecutorPrefillAdmissionDecision, ExecutorPrefillMaintenanceOutcome,
     ExecutorSamplingOutput, PlanRuntimeBatchDecodeOutcome, PlanRuntimeDecodeInput,
     PlanRuntimeDecodeOutput, PlanRuntimeMixedBatchOutcome, PlanRuntimePrefillCompletion,
     PlanRuntimePrefillInput, PlanRuntimePrefillOutcome, PlanRuntimePrefillProduct, PrefillChunk,
 };
-use ferrum_interfaces::vnext::{DeviceId, WeightMaterializerSelection};
 use ferrum_kernels::backend::cpu::vnext_ops::CpuVNextComposition;
 use ferrum_kernels::backend::cpu::vnext_runtime::CpuDeviceRuntime;
 use ferrum_models::VNextModelExecutor;
+use ferrum_runtime::{DeviceId, WeightMaterializerSelection};
 use ferrum_types::{RequestId, TokenId};
 
 mod greedy_readback;

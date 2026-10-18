@@ -1,7 +1,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use ferrum_interfaces::vnext::{
+use ferrum_runtime::{
     ElementType, RetainedHostMemoryRegion, StableHostMemory, VNextError, WeightComponentPayload,
     WeightComponentRole, WeightComponentSource, WeightComponentSpec, WeightEncoding, WeightSchema,
 };

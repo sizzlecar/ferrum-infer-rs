@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use cudarc::driver::{sys::CUdevice_attribute::*, CudaContext, CudaStream};
-use ferrum_interfaces::vnext::{
+use ferrum_runtime::{
     PreparedProjectionNumerics, PreparedUpstreamProjectionRoute, PreparedUpstreamProjectionWave,
     ProjectionBlockFormat, UpstreamNativeGeometry, UpstreamNativePlanFacts,
     UpstreamProjectionArithmetic, UpstreamProjectionLayout, UpstreamProjectionWaveFacts,
@@ -67,8 +67,8 @@ pub(crate) fn q6_f16_compiled() -> bool {
 /// Retained matrix validation follows this explicit profile's format family;
 /// the original G32 validator remains restricted to its own three formats.
 pub(in crate::backend::cuda::vnext_ops) fn validate_parts(
-    profile: ferrum_interfaces::vnext::UpstreamMarkerV2Profile,
-    projection: &ferrum_interfaces::vnext::PreparedProjection,
+    profile: ferrum_runtime::UpstreamMarkerV2Profile,
+    projection: &ferrum_runtime::PreparedProjection,
     parts: &[super::weights::MatrixPart],
 ) -> Result<(), String> {
     use crate::gguf_blocks::GgufBlockFormat as Block;
@@ -327,9 +327,7 @@ impl UpstreamPlanFactory {
         let mut maximum = UpstreamScratchEstimate::default();
         for projection in prepared.projections() {
             for leaf in projection.leaves().iter().filter(|leaf| leaf.is_staged()) {
-                let ferrum_interfaces::vnext::WeightEncoding::BlockQuantized(spec) =
-                    leaf.encoding()
-                else {
+                let ferrum_runtime::WeightEncoding::BlockQuantized(spec) = leaf.encoding() else {
                     return Err("staged upstream leaf is not block quantized".into());
                 };
                 let k = projection.input_features();
@@ -465,8 +463,7 @@ impl UpstreamPlanFactory {
             .find(|declaration| declaration.role == facts.role)
             .ok_or("missing projection declaration")?;
         let policy = declaration.leaves.iter().find_map(|candidate| {
-            let ferrum_interfaces::vnext::WeightEncoding::BlockQuantized(spec) = leaf.encoding()
-            else {
+            let ferrum_runtime::WeightEncoding::BlockQuantized(spec) = leaf.encoding() else {
                 return None;
             };
             let expected = block_format(candidate.format);

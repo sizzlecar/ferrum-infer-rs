@@ -1,6 +1,6 @@
 use super::*;
 use cudarc::driver::{DevicePtr, DevicePtrMut};
-use ferrum_interfaces::vnext::{GroupedFeatureTranspose, PhysicalWeightComponentBinding, WeightId};
+use ferrum_runtime::{GroupedFeatureTranspose, PhysicalWeightComponentBinding, WeightId};
 use half::f16;
 use std::num::NonZeroU32;
 

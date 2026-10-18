@@ -4,7 +4,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-use ferrum_interfaces::vnext::{
+use ferrum_runtime::{
     CompletionReadbackBatchRequest, CompletionReadbackOutput, ExecutionPlan, HostTransferLayout,
     ProgramPlanCompileOptions, ProgramValueId, ResourceWorkShape, RetainedCompletionValue, RunId,
     TokenSpanWork,

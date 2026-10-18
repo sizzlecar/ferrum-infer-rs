@@ -5,7 +5,7 @@ use crate::backend::cuda::vnext_ops::native_blocks::upstream_linear::{
     PreparedUpstreamLeaf, WeightValidation,
 };
 use crate::native_ops::upstream_linear::DeviceSpan;
-use ferrum_interfaces::vnext::{
+use ferrum_runtime::{
     EncodedRetainedPlanDependency, EncodedReusableExecutionBindings, ProjectionRole,
     UpstreamProjectionLayout, UpstreamProjectionWaveFacts,
 };
@@ -33,7 +33,7 @@ pub(super) fn encode(
     provider: &CudaUpstreamSwiGluProvider,
     invocation: BatchedOperationInvocation<'_, CudaDeviceBuffer>,
     target: EncodingTarget,
-    segment_declaration: Option<&mut Option<ferrum_interfaces::vnext::SegmentBindingDeclaration>>,
+    segment_declaration: Option<&mut Option<ferrum_runtime::SegmentBindingDeclaration>>,
 ) -> Result<Encoding<CudaDeviceCommand>, String> {
     let mut segment_validations = segment_declaration.as_ref().map(|_| Vec::new());
     ensure_invocation(&invocation, provider.profile.operation_id())?;
@@ -518,7 +518,7 @@ fn prepare_leaves(
 fn launch_leaves(
     g32: Option<(
         &Option<Q8ActKernels>,
-        &ferrum_interfaces::vnext::PreparedProjection,
+        &ferrum_runtime::PreparedProjection,
         &[weights::MatrixPart],
     )>,
     kernels: &CudaNativeBlockKernels,

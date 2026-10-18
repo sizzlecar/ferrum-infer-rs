@@ -1874,7 +1874,7 @@ fn effective_served_model_names(
 
 pub(crate) fn write_startup_config_artifacts(
     auto_config: &ResolvedFerrumConfig,
-    resolution_evidence: Option<&ferrum_interfaces::vnext::ProductModelSourceIdentity>,
+    resolution_evidence: Option<&ferrum_runtime::ProductModelSourceIdentity>,
     numerical_execution: &ferrum_types::NumericalExecutionPolicy,
     effective_config_json: Option<&std::path::Path>,
     decision_trace_jsonl: Option<&std::path::Path>,
@@ -1893,7 +1893,7 @@ pub(crate) fn write_startup_config_artifacts(
 /// These diagnostics do not certify that the preliminary memory limits fit.
 pub(crate) fn write_failed_startup_config_artifacts(
     auto_config: &ResolvedFerrumConfig,
-    resolution_evidence: Option<&ferrum_interfaces::vnext::ProductModelSourceIdentity>,
+    resolution_evidence: Option<&ferrum_runtime::ProductModelSourceIdentity>,
     numerical_execution: &ferrum_types::NumericalExecutionPolicy,
     effective_config_json: Option<&std::path::Path>,
     decision_trace_jsonl: Option<&std::path::Path>,
@@ -1920,7 +1920,7 @@ pub(crate) fn write_failed_startup_config_artifacts(
 
 fn write_startup_config_artifacts_with_failure(
     auto_config: &ResolvedFerrumConfig,
-    resolution_evidence: Option<&ferrum_interfaces::vnext::ProductModelSourceIdentity>,
+    resolution_evidence: Option<&ferrum_runtime::ProductModelSourceIdentity>,
     numerical_execution: &ferrum_types::NumericalExecutionPolicy,
     effective_config_json: Option<&std::path::Path>,
     decision_trace_jsonl: Option<&std::path::Path>,

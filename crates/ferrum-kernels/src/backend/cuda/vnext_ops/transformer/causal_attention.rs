@@ -6,7 +6,7 @@ use std::sync::Arc;
 use cudarc::cublas::CudaBlas;
 use cudarc::driver::{CudaFunction, CudaStream, LaunchConfig, PushKernelArg};
 use cudarc::nvrtc::Ptx;
-use ferrum_interfaces::vnext::{
+use ferrum_runtime::{
     causal_paged_attention_contract, AllocationLifetime, AttributeId, BatchedOperationInvocation,
     CapabilityId, ContractVersion, DeviceBatchingForm, DeviceReusableExecutionTopologyFingerprint,
     DeviceRuntime, DynamicStorageAllocator, DynamicStorageProfile, DynamicStorageRequirement,
@@ -88,7 +88,7 @@ use super::native_matrix;
 use super::q8act_attention::PreparedAttentionProjections;
 use crate::backend::cuda::vnext_ops::native_blocks::q8act::{PackedActivation, Q8ActKernels};
 use crate::backend::cuda::vnext_ops::native_blocks::{weights, CudaNativeBlockKernels};
-use ferrum_interfaces::vnext::{
+use ferrum_runtime::{
     causal_paged_attention_f32_master_contract, causal_paged_attention_f32_master_int8_kv_contract,
     causal_paged_attention_int8_kv_contract, CheckpointBoundaryConstraint,
     CheckpointCompletedInputCapture, CheckpointInputDependency, CheckpointPartitionNumerics,
@@ -97,7 +97,7 @@ use ferrum_interfaces::vnext::{
     CAUSAL_PAGED_ATTENTION_F32_MASTER_INT8_KV_CAPABILITY_ID,
     CAUSAL_PAGED_ATTENTION_INT8_KV_CAPABILITY_ID,
 };
-use ferrum_interfaces::vnext::{ProjectionRole, Q8ActAttentionProfile};
+use ferrum_runtime::{ProjectionRole, Q8ActAttentionProfile};
 use precision::CausalPrecision;
 const PREPARE_FUNCTION: &str = "vnext_causal_prepare_f16";
 const ATTENTION_FUNCTION: &str = "vnext_causal_attention_f16";
@@ -235,18 +235,18 @@ struct CausalAttentionFunctions {
 impl CudaCausalPagedAttentionProvider {
     pub(in crate::backend::cuda::vnext_ops) fn new_upstream(
         runtime: &CudaDeviceRuntime,
-        profile: ferrum_interfaces::vnext::UpstreamMarkerV2Profile,
+        profile: ferrum_runtime::UpstreamMarkerV2Profile,
         attention_policy: AttentionExecutionPolicy,
     ) -> Result<Self, CudaDeviceRuntimeError> {
         if !matches!(
             profile,
-            ferrum_interfaces::vnext::UpstreamMarkerV2Profile::Causal
-                | ferrum_interfaces::vnext::UpstreamMarkerV2Profile::CausalPrefill
-                | ferrum_interfaces::vnext::UpstreamMarkerV2Profile::CausalG32MmqPrefill
-                | ferrum_interfaces::vnext::UpstreamMarkerV2Profile::CausalExtraPrefill
-                | ferrum_interfaces::vnext::UpstreamMarkerV2Profile::CausalExtraLargePrefill
-                | ferrum_interfaces::vnext::UpstreamMarkerV2Profile::CausalExtraAllRows
-                | ferrum_interfaces::vnext::UpstreamMarkerV2Profile::CausalQ6F16
+            ferrum_runtime::UpstreamMarkerV2Profile::Causal
+                | ferrum_runtime::UpstreamMarkerV2Profile::CausalPrefill
+                | ferrum_runtime::UpstreamMarkerV2Profile::CausalG32MmqPrefill
+                | ferrum_runtime::UpstreamMarkerV2Profile::CausalExtraPrefill
+                | ferrum_runtime::UpstreamMarkerV2Profile::CausalExtraLargePrefill
+                | ferrum_runtime::UpstreamMarkerV2Profile::CausalExtraAllRows
+                | ferrum_runtime::UpstreamMarkerV2Profile::CausalQ6F16
         ) {
             return Err(CudaDeviceRuntimeError::contract("not a causal profile"));
         }
@@ -344,13 +344,14 @@ impl CudaCausalPagedAttentionProvider {
         runtime: &CudaDeviceRuntime,
         attention_policy: AttentionExecutionPolicy,
     ) -> Result<Self, CudaDeviceRuntimeError> {
-        let contract = ferrum_interfaces::vnext::causal_paged_attention_f32_master_gguf_f16_projections_contract()
-            .map_err(contract_error)?;
+        let contract =
+            ferrum_runtime::causal_paged_attention_f32_master_gguf_f16_projections_contract()
+                .map_err(contract_error)?;
         Self::new_for_contract(
             runtime,
             attention_policy,
             &contract,
-            ferrum_interfaces::vnext::CAUSAL_PAGED_ATTENTION_F32_MASTER_GGUF_F16_PROJECTIONS_CAPABILITY_ID,
+            ferrum_runtime::CAUSAL_PAGED_ATTENTION_F32_MASTER_GGUF_F16_PROJECTIONS_CAPABILITY_ID,
             CausalAttentionSemantics::Standard,
             CausalPrecision::F32Master,
         )
@@ -412,13 +413,13 @@ impl CudaCausalPagedAttentionProvider {
         let q8act =
             contract.descriptor().id.as_str() == Q8ActAttentionProfile::Causal.operation_id();
         let upstream_profile = [
-            ferrum_interfaces::vnext::UpstreamMarkerV2Profile::Causal,
-            ferrum_interfaces::vnext::UpstreamMarkerV2Profile::CausalPrefill,
-            ferrum_interfaces::vnext::UpstreamMarkerV2Profile::CausalG32MmqPrefill,
-            ferrum_interfaces::vnext::UpstreamMarkerV2Profile::CausalExtraPrefill,
-            ferrum_interfaces::vnext::UpstreamMarkerV2Profile::CausalExtraLargePrefill,
-            ferrum_interfaces::vnext::UpstreamMarkerV2Profile::CausalExtraAllRows,
-            ferrum_interfaces::vnext::UpstreamMarkerV2Profile::CausalQ6F16,
+            ferrum_runtime::UpstreamMarkerV2Profile::Causal,
+            ferrum_runtime::UpstreamMarkerV2Profile::CausalPrefill,
+            ferrum_runtime::UpstreamMarkerV2Profile::CausalG32MmqPrefill,
+            ferrum_runtime::UpstreamMarkerV2Profile::CausalExtraPrefill,
+            ferrum_runtime::UpstreamMarkerV2Profile::CausalExtraLargePrefill,
+            ferrum_runtime::UpstreamMarkerV2Profile::CausalExtraAllRows,
+            ferrum_runtime::UpstreamMarkerV2Profile::CausalQ6F16,
         ]
         .into_iter()
         .find(|profile| profile.operation_id() == contract.descriptor().id.as_str());
@@ -682,7 +683,7 @@ impl CudaCausalPagedAttentionProvider {
                 .fingerprint()
                 .map_err(contract_error)?,
             provider_fingerprint,
-            ferrum_interfaces::vnext::ProviderExecutionSemantics::bitwise_eager_and_replay(),
+            ferrum_runtime::ProviderExecutionSemantics::bitwise_eager_and_replay(),
             contract.descriptor().version,
             runtime.descriptor().id.clone(),
             provider_capabilities,
@@ -1040,11 +1041,11 @@ impl OperationResourceEstimator for CudaCausalPagedAttentionProvider {
 }
 
 impl OperationProvider<CudaDeviceRuntime> for CudaCausalPagedAttentionProvider {
-    fn reusable_binding_resources(&self) -> ferrum_interfaces::vnext::ReusableBindingResources {
+    fn reusable_binding_resources(&self) -> ferrum_runtime::ReusableBindingResources {
         if self.upstream {
-            ferrum_interfaces::vnext::ReusableBindingResources::All
+            ferrum_runtime::ReusableBindingResources::All
         } else {
-            ferrum_interfaces::vnext::ReusableBindingResources::RequestStateAndBinding
+            ferrum_runtime::ReusableBindingResources::RequestStateAndBinding
         }
     }
 
@@ -1133,7 +1134,7 @@ impl OperationProvider<CudaDeviceRuntime> for CudaCausalPagedAttentionProvider {
     ) -> Result<
         (
             EncodedDeviceOperation<CudaDeviceCommand>,
-            Option<ferrum_interfaces::vnext::SegmentBindingDeclaration>,
+            Option<ferrum_runtime::SegmentBindingDeclaration>,
         ),
         OperationFailure,
     > {
@@ -2671,7 +2672,7 @@ fn encode_attention(
     #[cfg(feature = "vllm-marlin")] projection_runtime: MarlinProjectionRuntime,
     invocation: BatchedOperationInvocation<'_, CudaDeviceBuffer>,
     target: EncodingTarget,
-    segment_declaration: Option<&mut Option<ferrum_interfaces::vnext::SegmentBindingDeclaration>>,
+    segment_declaration: Option<&mut Option<ferrum_runtime::SegmentBindingDeclaration>>,
 ) -> Result<Encoding<CudaDeviceCommand>, String> {
     let mut segment_validations = segment_declaration.as_ref().map(|_| Vec::new());
     if invocation.participants().is_empty() || invocation.operation().id.as_str() != operation_id {
@@ -5721,7 +5722,7 @@ fn invalid_plan(reason: impl Into<String>) -> VNextError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ferrum_interfaces::vnext::CanonicalRational;
+    use ferrum_runtime::CanonicalRational;
 
     #[cfg(feature = "cuda-indexed-causal-attention")]
     #[test]

@@ -3,8 +3,8 @@ use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::Path;
 
-use ferrum_interfaces::vnext::DeviceId;
 use ferrum_kernels::backend::cuda::vnext_ops::cuda_native_operator_catalog_input_with_causal_decode_kv_reuse;
+use ferrum_runtime::DeviceId;
 use ferrum_types::{
     AttentionExecutionPolicy, CausalDecodeAttentionGrouping, CausalDecodeKvReuse,
     CausalDecodePreparationMode, Q4MmvqWeightDecode, Q5MmvqWeightDecode,

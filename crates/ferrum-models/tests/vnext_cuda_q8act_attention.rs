@@ -2,11 +2,11 @@
 //! Real provider gate for the explicit attention-Q8 policy, never a checkpoint
 //! qualification substitute or an Auto-policy mutation.
 
-use ferrum_interfaces::vnext::*;
 use ferrum_kernels::backend::cuda::{
     vnext_ops::{cuda_weight_materializer_selection, CudaVNextComposition},
     vnext_runtime::CudaDeviceRuntime,
 };
+use ferrum_runtime::*;
 use half::f16;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;

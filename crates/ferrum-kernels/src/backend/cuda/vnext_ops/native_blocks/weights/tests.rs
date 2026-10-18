@@ -1,5 +1,5 @@
 use super::*;
-use ferrum_interfaces::vnext::{
+use ferrum_runtime::{
     BlockQuantizationSpec, CompositeWeightPart, ContractVersion, PhysicalWeightComponentBinding,
     QuantizationFormatId, WeightComponentRole, WeightComponentSpec, WeightFormatId, WeightLayoutId,
     WeightSchema, WeightTensorSpec,
@@ -111,7 +111,7 @@ fn mixed_composite_maps_component_identity_to_complete_logical_rows() {
 
 #[test]
 fn hadamard_parts_keep_shared_sign_identity_and_independent_projection_transforms() {
-    use ferrum_interfaces::vnext::{
+    use ferrum_runtime::{
         GroupedFeatureTranspose, HadamardApplication, HadamardSigns, HadamardTransformSpec,
     };
     use std::num::NonZeroU32;

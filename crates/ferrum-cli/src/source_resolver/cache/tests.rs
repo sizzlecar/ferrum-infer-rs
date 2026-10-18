@@ -521,16 +521,13 @@ async fn tokenizer_override_preserves_the_pinned_repository_for_unchanged_roles(
     let sources = product.model_sources.unwrap();
     let originals = sources.original_sources();
     for retained in [&originals.semantic, &originals.weights] {
-        assert_eq!(
-            retained.kind,
-            ferrum_interfaces::vnext::ModelSourceKind::Repository
-        );
+        assert_eq!(retained.kind, ferrum_runtime::ModelSourceKind::Repository);
         assert_eq!(retained.location, REPO);
         assert_eq!(retained.requested_revision.as_deref(), Some(CURRENT));
     }
     assert_eq!(
         originals.tokenizer.kind,
-        ferrum_interfaces::vnext::ModelSourceKind::LocalDirectory
+        ferrum_runtime::ModelSourceKind::LocalDirectory
     );
     assert_eq!(
         originals.tokenizer.location,

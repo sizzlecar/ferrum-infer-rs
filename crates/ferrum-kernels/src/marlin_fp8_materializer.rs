@@ -7,7 +7,7 @@
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 
-use ferrum_interfaces::vnext::{
+use ferrum_runtime::{
     CapabilityId, ContractVersion, DeviceDescriptor, ElementType, PhysicalStorageLayout,
     PhysicalWeightComponentBinding, PhysicalWeightLayout, PhysicalWeightPadding,
     PreparedModelFamily, QuantizationFormatId, QuantizationGrouping, QuantizationPacking,
@@ -1175,7 +1175,7 @@ fn replace_block_fp8_leaves(
         PhysicalWeightLayout::Composite { parts } => PhysicalWeightLayout::Composite {
             parts: parts
                 .iter()
-                .map(|part| ferrum_interfaces::vnext::CompositeWeightPart {
+                .map(|part| ferrum_runtime::CompositeWeightPart {
                     layout: Box::new(replace_block_fp8_leaves(&part.layout, candidate_by_source)),
                     logical_offsets: part.logical_offsets.clone(),
                     extents: part.extents.clone(),
@@ -1895,7 +1895,7 @@ mod tests {
         let dense_id = WeightId::new("component.test.dense").unwrap();
         let original = PhysicalWeightLayout::Composite {
             parts: vec![
-                ferrum_interfaces::vnext::CompositeWeightPart {
+                ferrum_runtime::CompositeWeightPart {
                     layout: Box::new(PhysicalWeightLayout::QuantizedBlockGrid {
                         packed_values: PhysicalWeightComponentBinding::exact_contiguous(
                             values.id.clone(),
@@ -1909,7 +1909,7 @@ mod tests {
                     logical_offsets: vec![0, 0],
                     extents: vec![256, 128],
                 },
-                ferrum_interfaces::vnext::CompositeWeightPart {
+                ferrum_runtime::CompositeWeightPart {
                     layout: Box::new(PhysicalWeightLayout::Dense {
                         component_id: dense_id.clone(),
                     }),

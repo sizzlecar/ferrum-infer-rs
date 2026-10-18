@@ -8,7 +8,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use ferrum_interfaces::vnext::{
+use ferrum_runtime::{
     CapabilityId, ContractVersion, DeviceDescriptor, ElementType, ModelFamilyId,
     PhysicalStorageLayout, PhysicalWeightComponentBinding, PhysicalWeightLayout,
     PhysicalWeightPadding, PreparedModelFamily, QuantizationFormatId, QuantizationGrouping,
@@ -1070,7 +1070,7 @@ fn invalid_plan(reason: impl Into<String>) -> VNextError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ferrum_interfaces::vnext::{WeightComponentPayload, WeightTensorSpec};
+    use ferrum_runtime::{WeightComponentPayload, WeightTensorSpec};
 
     fn family_id() -> ModelFamilyId {
         ModelFamilyId::new("family.test.gpt-oss-mxfp4").unwrap()

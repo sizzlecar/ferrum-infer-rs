@@ -2,7 +2,7 @@ use super::super::super::test_support::Guarded;
 use super::*;
 use crate::gguf_blocks::{fixtures::oracle_blocks, GgufBlockFormat};
 use cudarc::driver::CudaContext;
-use ferrum_interfaces::vnext::WeightId;
+use ferrum_runtime::WeightId;
 use half::f16;
 use weights::{MatrixFormat, MatrixPart};
 

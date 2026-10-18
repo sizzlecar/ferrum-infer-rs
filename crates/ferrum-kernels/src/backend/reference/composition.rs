@@ -1,7 +1,7 @@
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
-use ferrum_interfaces::vnext::{
+use ferrum_runtime::{
     dense_linear_contract, CapabilityCatalog, CapabilityId, ContractVersion, DeviceClass,
     DeviceDescriptor, DeviceId, DeviceRuntime, DynamicStorageAllocator, DynamicStorageProfile,
     DynamicStorageView, EngineProviderDescriptor, OperationContract, OperationProvider,

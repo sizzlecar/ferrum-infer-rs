@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use ferrum_interfaces::vnext::{
+use ferrum_runtime::{
     AttributeId, CanonicalRational, ContractVersion, ElementType, FamilyNumericalProfiles,
     KvStorageFormat, ModelFamilyId, ModelProgram, NodeId, NumericalExecutionProfile, OperationId,
     ProgramBlock, ProgramNode, ProgramNodeWorkSpec, ProgramTensorSpec, ProgramValueId,

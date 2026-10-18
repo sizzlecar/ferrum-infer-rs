@@ -1,6 +1,6 @@
 use std::collections::BTreeSet;
 
-use ferrum_interfaces::vnext::CanonicalRational;
+use ferrum_runtime::CanonicalRational;
 use half::bf16;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};

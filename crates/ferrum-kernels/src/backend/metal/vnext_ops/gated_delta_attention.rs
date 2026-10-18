@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 use std::ffi::c_void;
 use std::sync::Arc;
 
-use ferrum_interfaces::vnext::{
+use ferrum_runtime::{
     gated_delta_recurrent_attention_contract, gated_delta_recurrent_attention_f32_master_contract,
     AttributeId, BatchedOperationInvocation, CheckpointBoundaryConstraint,
     CheckpointCompletedInputCapture, CheckpointInputDependency, CheckpointPartitionNumerics,

@@ -1,13 +1,14 @@
 //! Stub model executor for MVP testing and development
 
 use async_trait::async_trait;
-use ferrum_interfaces::{
+use ferrum_execution::{
     model_executor::{
         AttentionType, DecodeInput, DecodeOutput, ExecutorCapabilities, ExecutorMemoryUsage,
         ExecutorState, ExecutorStatus, MemoryRequirements, PrefillInput, PrefillOutput,
     },
-    BlockTable, KvCacheHandle, ModelExecutor, TensorFactory,
+    ModelExecutor,
 };
+use ferrum_interfaces::{BlockTable, KvCacheHandle, TensorFactory};
 use ferrum_types::{DataType, Device, ModelInfo, ModelType, Result};
 use std::sync::Arc;
 use tracing::debug;

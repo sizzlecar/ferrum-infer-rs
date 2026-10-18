@@ -1,7 +1,7 @@
 //! Real admitted head dispatch, independently known representable inputs, and
 //! actual CUDA replay. General quantization error is covered by the primitive
 //! actual-pack/F64 fixture, not inferred from these exactly representable rows.
-use ferrum_interfaces::vnext::*;
+use ferrum_runtime::*;
 use half::f16;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;

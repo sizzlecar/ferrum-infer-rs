@@ -3,7 +3,7 @@
 use std::ffi::c_void;
 use std::sync::Arc;
 
-use ferrum_interfaces::vnext::{
+use ferrum_runtime::{
     last_token_masked_argmax_contract, last_token_masked_argmax_f32_contract,
     residual_add_contract, residual_add_f32_f16_contract, rms_norm_contract, rms_norm_f32_contract,
     rms_norm_f32_to_f16_contract, token_embedding_contract, token_embedding_f32_master_contract,
@@ -1054,9 +1054,9 @@ fn embedding_weight_format(
 }
 
 fn validate_embedding_signature(
-    token_ids: &ferrum_interfaces::vnext::ResolvedValueBinding,
-    table: &ferrum_interfaces::vnext::ResolvedValueBinding,
-    output: &ferrum_interfaces::vnext::ResolvedValueBinding,
+    token_ids: &ferrum_runtime::ResolvedValueBinding,
+    table: &ferrum_runtime::ResolvedValueBinding,
+    output: &ferrum_runtime::ResolvedValueBinding,
     vocabulary_size: u64,
     hidden_size: u64,
     output_type: ElementType,
@@ -1070,15 +1070,15 @@ fn validate_embedding_signature(
         || output.tensor().dimensions() != [token_dimensions[0], hidden_size]
         || !matches!(
             token_ids.tensor().layout(),
-            ferrum_interfaces::vnext::ResolvedTensorLayout::Contiguous
+            ferrum_runtime::ResolvedTensorLayout::Contiguous
         )
         || !matches!(
             table.tensor().layout(),
-            ferrum_interfaces::vnext::ResolvedTensorLayout::Contiguous
+            ferrum_runtime::ResolvedTensorLayout::Contiguous
         )
         || !matches!(
             output.tensor().layout(),
-            ferrum_interfaces::vnext::ResolvedTensorLayout::Contiguous
+            ferrum_runtime::ResolvedTensorLayout::Contiguous
         )
     {
         return Err("Metal token embedding invocation differs from its signature".to_owned());
@@ -1204,9 +1204,9 @@ fn encode_rms_norm_typed(
 }
 
 fn valid_rms_norm(
-    input: &ferrum_interfaces::vnext::ResolvedValueBinding,
-    weight: &ferrum_interfaces::vnext::ResolvedValueBinding,
-    output: &ferrum_interfaces::vnext::ResolvedValueBinding,
+    input: &ferrum_runtime::ResolvedValueBinding,
+    weight: &ferrum_runtime::ResolvedValueBinding,
+    output: &ferrum_runtime::ResolvedValueBinding,
     hidden_size: u64,
     input_type: ElementType,
     output_type: ElementType,
@@ -1338,9 +1338,9 @@ fn encode_residual_add_typed(
 }
 
 fn valid_residual_add(
-    left: &ferrum_interfaces::vnext::ResolvedValueBinding,
-    right: &ferrum_interfaces::vnext::ResolvedValueBinding,
-    output: &ferrum_interfaces::vnext::ResolvedValueBinding,
+    left: &ferrum_runtime::ResolvedValueBinding,
+    right: &ferrum_runtime::ResolvedValueBinding,
+    output: &ferrum_runtime::ResolvedValueBinding,
     hidden_size: u64,
     left_type: ElementType,
     right_type: ElementType,

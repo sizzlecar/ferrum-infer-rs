@@ -1,5 +1,5 @@
 use anyhow::{ensure, Context, Result};
-use ferrum_interfaces::vnext::TokenSpanWork;
+use ferrum_runtime::TokenSpanWork;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::{collections::BTreeSet, fs, path::Path};

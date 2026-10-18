@@ -1,7 +1,7 @@
 //! Exact physical matrix partitions; projections allocate no expanded weights.
 use super::*;
 use crate::backend::cuda::vnext_ops::native_blocks::{weights, CudaNativeBlockKernels};
-use ferrum_interfaces::vnext::PhysicalWeightLayout;
+use ferrum_runtime::PhysicalWeightLayout;
 use std::sync::Arc;
 
 pub(super) const MAX_ROWS: u64 = u16::MAX as u64;

@@ -1,7 +1,7 @@
 use super::*;
 use crate::backend::metal::vnext_ops::linear::microbench::{weights, Shape};
 use crate::backend::metal::vnext_ops::MetalVNextComposition;
-use ferrum_interfaces::vnext::{
+use ferrum_runtime::{
     AliasPolicy, BlockQuantizationSpec, BufferRequest, BufferUsage, CompositeWeightPart,
     ContractVersion, DeviceId, OperationContract, PhysicalWeightComponentBinding, ProgramValueId,
     QuantizationFormatId, ResolvedStorageComponent, ResolvedTensorSpec, ResolvedValueStorage,

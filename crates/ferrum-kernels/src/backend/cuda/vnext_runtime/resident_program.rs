@@ -1,7 +1,7 @@
 //! Cold packet lowering and fresh scalar patching for a complete resident use.
 //! Graph ownership remains in the stream cache. No old Step/Wave is retained.
 use super::*;
-use ferrum_interfaces::vnext::{
+use ferrum_runtime::{
     BatchWorkShape, DeviceEncodedResidentDecode, DeviceResidentDecodeRefresh,
     DeviceResidentDecodeRequest, RetainedPlanDependencyIdentity,
 };

@@ -1,9 +1,9 @@
 #![cfg(all(feature = "metal", target_os = "macos"))]
 
-use ferrum_interfaces::vnext::*;
 use ferrum_kernels::backend::metal::{
     vnext_ops::MetalVNextComposition, vnext_runtime::MetalDeviceRuntime,
 };
+use ferrum_runtime::*;
 use half::f16;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;

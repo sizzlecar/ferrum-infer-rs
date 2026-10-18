@@ -4,12 +4,9 @@
 //! the executor's complete runtime policy. Source-independent custom executors
 //! retain the existing extension path.
 
-use ferrum_interfaces::{
-    model_executor::ExecutionResourceAuthority,
-    vnext::{ModelArtifactSourceRole, ResolvedModelPlan},
-    ModelExecutor,
-};
+use ferrum_execution::{model_executor::ExecutionResourceAuthority, ModelExecutor};
 use ferrum_models::vnext::{DefinedProductionModel, ProductionModelSourceBundle};
+use ferrum_runtime::{ModelArtifactSourceRole, ResolvedModelPlan};
 use ferrum_types::{EngineConfig, FerrumError, NumericalExecutionPolicy, Result};
 use std::sync::Arc;
 

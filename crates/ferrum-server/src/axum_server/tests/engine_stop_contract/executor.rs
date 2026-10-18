@@ -1,7 +1,7 @@
 //! Only model logits and opaque cache storage are simulated. Stop detection,
 //! sampling, finish reasons, and response chunks belong to the production engine.
 use super::*;
-use ferrum_interfaces::{
+use ferrum_execution::{
     model_executor::{
         DecodeInput, DecodeOutput, ExecutionResourceAuthority, ExecutorAdmissionEpochs,
         ExecutorCapabilities, ExecutorPrefillAdmission, ExecutorPrefillAdmissionDecision,
@@ -11,8 +11,9 @@ use ferrum_interfaces::{
         PlanRuntimePrefillOutcome, PlanRuntimePrefillOutput, PlanRuntimeResourceSnapshot,
         PrefillInput, PrefillOutput,
     },
-    KvCacheHandle, ModelExecutor,
+    ModelExecutor,
 };
+use ferrum_interfaces::KvCacheHandle;
 use ferrum_testkit::{MockKvCacheHandle, MockModelExecutor};
 use ferrum_types::{ExecutorAdmissionLimits, ModelInfo, RequestId, Result};
 use std::{collections::HashSet, num::NonZeroU64, sync::atomic::AtomicU64};

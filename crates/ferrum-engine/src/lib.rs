@@ -58,10 +58,11 @@ pub mod tensor_factory;
 pub mod vnext_determinism;
 
 // Re-exports of interfaces
+pub use ferrum_execution::ModelExecutor;
 pub use ferrum_interfaces::engine::LlmInferenceEngine;
 pub use ferrum_interfaces::{
-    IncrementalTokenizer, InferenceEngine as InferenceEngineInterface, KvCacheManager,
-    ModelExecutor, Sampler, SchedulerInterface as Scheduler, Tokenizer,
+    IncrementalTokenizer, InferenceEngine as InferenceEngineInterface, KvCacheManager, Sampler,
+    SchedulerInterface as Scheduler, Tokenizer,
 };
 
 pub use ferrum_types::{

@@ -48,13 +48,13 @@ pub fn first_success_model_help(command: &str) -> String {
 use std::sync::Arc;
 
 use clap::Args;
-use ferrum_interfaces::vnext::{
-    ModelSourceKind, OriginalModelSource, OriginalModelSources, ProductModelSourceIdentity,
-};
 use ferrum_models::source::{ModelFormat, ResolvedModelSource};
 use ferrum_models::vnext::{
     huggingface_snapshot_identity, open_registered_product_sources, ProductionModelSourceBundle,
     ProductionWeightArtifact,
+};
+use ferrum_runtime::{
+    ModelSourceKind, OriginalModelSource, OriginalModelSources, ProductModelSourceIdentity,
 };
 use ferrum_server::chat_template::ModelChatTemplate;
 use ferrum_types::{
@@ -2057,7 +2057,7 @@ mod tests {
         assert_eq!(sources.weights().path(), weights.canonicalize().unwrap());
         assert!(sources
             .fingerprint(
-                ferrum_interfaces::vnext::ModelArtifactSourceRole::Weights,
+                ferrum_runtime::ModelArtifactSourceRole::Weights,
                 "config.json",
             )
             .is_some());

@@ -9,7 +9,6 @@
 
 use cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT;
 use cudarc::driver::{CudaContext, CudaSlice, DevicePtr, DevicePtrMut};
-use ferrum_interfaces::vnext::{CanonicalRational, ContractVersion, WeightMaterializationFidelity};
 use ferrum_kernels::marlin_fp8_materializer::{
     block_fp8_to_marlin_fp8_weight_materializer, BLOCK_FP8_TO_MARLIN_FP8_WEIGHT_MATERIALIZER_ID,
     MARLIN_FP8_GROUP128_QUANTIZATION_FORMAT_ID, MARLIN_FP8_GROUP128_WEIGHT_FORMAT_ID,
@@ -25,6 +24,7 @@ use ferrum_kernels::vllm_marlin::{
     launch_marlin_mm_f16_weight, MarlinF16WeightType, MarlinMmBuffers, MarlinMmExecution,
     MarlinMmF16WeightRequest, MarlinMmProblem,
 };
+use ferrum_runtime::{CanonicalRational, ContractVersion, WeightMaterializationFidelity};
 use half::{bf16, f16};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;

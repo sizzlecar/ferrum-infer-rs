@@ -1,7 +1,7 @@
 //! EngineInner iteration and request-processing implementation.
 
 use super::*;
-use ferrum_interfaces::vnext::DynamicBackingPressure;
+use ferrum_runtime::DynamicBackingPressure;
 
 mod batch;
 mod completion;
@@ -97,7 +97,7 @@ fn parse_usize_prefix(input: &str) -> Option<(usize, &str)> {
 }
 
 pub(super) fn kv_slot_requests_for_unified_batch(
-    batch: &ferrum_interfaces::model_executor::UnifiedBatch,
+    batch: &ferrum_execution::model_executor::UnifiedBatch,
 ) -> Vec<KvSlotRequest> {
     batch
         .items

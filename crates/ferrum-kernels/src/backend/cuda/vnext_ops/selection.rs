@@ -2,7 +2,7 @@
 
 use super::*;
 use cudarc::driver::{CudaContext, CudaStream, DeviceRepr};
-use ferrum_interfaces::vnext::{
+use ferrum_runtime::{
     last_token_masked_argmax_f32_contract, StandardOperationContract,
     LAST_TOKEN_MASKED_ARGMAX_F32_CAPABILITY_ID, LAST_TOKEN_MASKED_ARGMAX_F32_OPERATION_ID,
 };

@@ -1,6 +1,6 @@
 //! Dual physical components remain distinct from native GGUF and plain Dense.
 use super::*;
-use ferrum_interfaces::vnext::{
+use ferrum_runtime::{
     PhysicalStorageLayout, PhysicalWeightLayout, PhysicalWeightPadding, WeightComponentRole,
     WeightEncoding, WeightId,
 };
@@ -37,7 +37,7 @@ pub(super) fn validate(value: &ResolvedValueBinding) -> Result<RnF16FragmentPlan
             &dense_values.component_id,
             WeightComponentRole::Values,
             value.tensor().dimensions(),
-            ferrum_interfaces::vnext::WeightEncoding::Dense {
+            ferrum_runtime::WeightEncoding::Dense {
                 element_type: ElementType::F16,
             },
             plan.dense_bytes(),

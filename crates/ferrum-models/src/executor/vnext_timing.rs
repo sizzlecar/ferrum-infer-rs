@@ -1,7 +1,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use ferrum_interfaces::vnext::StaticInitializationReceipt;
+use ferrum_runtime::StaticInitializationReceipt;
 
 pub(super) struct StartupPhaseTimer {
     phase: &'static str,

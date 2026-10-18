@@ -1,7 +1,7 @@
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
-use ferrum_interfaces::vnext::*;
+use ferrum_runtime::*;
 use sha2::{Digest, Sha256};
 
 use super::super::vnext_runtime::{CpuDeviceRuntime, CpuRuntimeError};

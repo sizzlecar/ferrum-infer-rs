@@ -41,11 +41,11 @@ use crate::{
     ScheduledRequest, Scheduler,
 };
 use async_trait::async_trait;
-use ferrum_interfaces::model_executor::{
+use ferrum_execution::model_executor::{
     ExecutorExecutionMaintenanceRetry, ExecutorPrefillAdmissionReceipt,
 };
 use ferrum_interfaces::scheduler::{PreparedPrefixRestore, SchedulerMetrics};
-use ferrum_interfaces::vnext::{
+use ferrum_runtime::{
     AdmissionRejected, CapacityAvailabilityEpoch, CapacityAvailabilitySource, CapacityWaitCondition,
 };
 use ferrum_types::{
@@ -1017,7 +1017,7 @@ impl ContinuousBatchScheduler {
     /// work deliberately return `None` so the engine keeps driving iterations.
     pub fn passive_capacity_wait_condition(
         &self,
-    ) -> Result<Option<ferrum_interfaces::vnext::CapacityWaitCondition>> {
+    ) -> Result<Option<ferrum_runtime::CapacityWaitCondition>> {
         let mut conditions = Vec::new();
         {
             let prefill = self.prefill_queue.read();
@@ -1097,11 +1097,11 @@ impl ContinuousBatchScheduler {
         let observed = observed_by_source
             .into_iter()
             .map(|(source, epoch)| {
-                ferrum_interfaces::vnext::CapacityAvailabilityEpoch::new(source, epoch)
+                ferrum_runtime::CapacityAvailabilityEpoch::new(source, epoch)
                     .map_err(|error| FerrumError::scheduler(error.to_string()))
             })
             .collect::<Result<Vec<_>>>()?;
-        let condition = ferrum_interfaces::vnext::CapacityWaitCondition::new(coordinator, observed)
+        let condition = ferrum_runtime::CapacityWaitCondition::new(coordinator, observed)
             .map_err(|error| FerrumError::scheduler(error.to_string()))?;
         let pressure = self.pressure_coordinator.lock();
         if pressure.has_pending_release_for(&condition) {
@@ -1633,7 +1633,7 @@ impl ContinuousBatchScheduler {
         &self,
         request_id: &RequestId,
         observed: AdmissionWakeEpochs,
-        wait_condition: ferrum_interfaces::vnext::CapacityWaitCondition,
+        wait_condition: ferrum_runtime::CapacityWaitCondition,
     ) -> Result<bool> {
         self.waiting_queue
             .write()
@@ -2260,7 +2260,7 @@ impl ContinuousBatchScheduler {
         deferral: AdmissionDeferral,
         release_snapshot: &ExecutionCapacityReleaseSnapshot,
     ) -> Result<ExecutionCapacityAction> {
-        if deferral.action() != ferrum_interfaces::vnext::DeferredAction::WaitForRelease {
+        if deferral.action() != ferrum_runtime::DeferredAction::WaitForRelease {
             return Err(FerrumError::scheduler(
                 "active execution-capacity deferral must wait for release",
             ));
@@ -4969,7 +4969,7 @@ mod tests {
 
     #[tokio::test]
     async fn typed_dynamic_admission_defers_without_blocking_decode_or_smaller_work() {
-        use ferrum_interfaces::vnext::{
+        use ferrum_runtime::{
             CapacityAvailabilityEpoch, CapacityAvailabilitySource, CapacityWaitCondition,
             DeferredAction,
         };
@@ -5093,7 +5093,7 @@ mod tests {
 
     #[tokio::test]
     async fn open_pressure_episode_closes_after_resumed_decode_commits_progress() {
-        use ferrum_interfaces::vnext::{
+        use ferrum_runtime::{
             CapacityAvailabilityEpoch, CapacityAvailabilitySource, CapacityDomainId,
             CapacityWaitCondition, DeferredAction,
         };
@@ -5222,7 +5222,7 @@ mod tests {
     }
 
     async fn collect_cross_phase_pressure_replay() -> SchedulerReplayProjection {
-        use ferrum_interfaces::vnext::{
+        use ferrum_runtime::{
             CapacityAvailabilityEpoch, CapacityAvailabilitySource, CapacityWaitCondition,
             DeferredAction,
         };
@@ -5777,7 +5777,7 @@ mod tests {
 
     #[tokio::test]
     async fn disjoint_release_footprints_self_recompute_without_stranded_episode() {
-        use ferrum_interfaces::vnext::{
+        use ferrum_runtime::{
             CapacityAvailabilityEpoch, CapacityAvailabilitySource, CapacityDomainId,
             CapacityWaitCondition, DeferredAction,
         };
@@ -5891,7 +5891,7 @@ mod tests {
 
     #[tokio::test]
     async fn release_fence_preserves_stable_owner_across_retargeted_condition() {
-        use ferrum_interfaces::vnext::{
+        use ferrum_runtime::{
             CapacityAvailabilityEpoch, CapacityAvailabilitySource, CapacityDomainId,
             CapacityWaitCondition, DeferredAction,
         };
@@ -6020,7 +6020,7 @@ mod tests {
 
     #[tokio::test]
     async fn pressure_yield_releases_after_phase_independent_owner_terminal() {
-        use ferrum_interfaces::vnext::{
+        use ferrum_runtime::{
             CapacityAvailabilityEpoch, CapacityAvailabilitySource, CapacityWaitCondition,
             DeferredAction,
         };
@@ -6121,7 +6121,7 @@ mod tests {
 
     #[tokio::test]
     async fn lone_active_decode_capacity_deferral_self_recomputes_to_release_its_source() {
-        use ferrum_interfaces::vnext::{
+        use ferrum_runtime::{
             CapacityAvailabilityEpoch, CapacityAvailabilitySource, CapacityWaitCondition,
             DeferredAction,
         };
@@ -6191,7 +6191,7 @@ mod tests {
 
     #[tokio::test]
     async fn active_prefill_capacity_deferral_retries_the_exact_chunk_after_source_change() {
-        use ferrum_interfaces::vnext::{
+        use ferrum_runtime::{
             CapacityAvailabilityEpoch, CapacityAvailabilitySource, CapacityWaitCondition,
             DeferredAction,
         };
@@ -6302,7 +6302,7 @@ mod tests {
 
     #[tokio::test]
     async fn partial_prefill_completion_limits_the_next_scheduled_frontier() {
-        use ferrum_interfaces::vnext::{CapacityAvailabilityEpoch, CapacityAvailabilitySource};
+        use ferrum_runtime::{CapacityAvailabilityEpoch, CapacityAvailabilitySource};
         use std::num::NonZeroU64;
 
         let scheduler = ContinuousBatchScheduler::new(SchedulerConfig {
@@ -6360,7 +6360,7 @@ mod tests {
 
     #[tokio::test]
     async fn typed_wait_for_release_does_not_make_prefill_first_starve_decode() {
-        use ferrum_interfaces::vnext::{
+        use ferrum_runtime::{
             CapacityAvailabilityEpoch, CapacityAvailabilitySource, CapacityWaitCondition,
             DeferredAction,
         };

@@ -4,7 +4,7 @@
 //! Layouts and IQ codebooks follow ggml/src/ggml-common.h and ggml-quants.c.
 //! Copyright (c) 2023-2026 The ggml authors. See LICENSE.ggml for the MIT license.
 
-use ferrum_interfaces::vnext::BlockQuantizationSpec;
+use ferrum_runtime::BlockQuantizationSpec;
 use half::f16;
 
 mod iq3s_grid;

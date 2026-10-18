@@ -274,7 +274,7 @@ impl<T: Scalar> Fixture<T> {
         stream: &Arc<CudaStream>,
         kernels: &CudaNativeBlockKernels,
     ) {
-        use ferrum_interfaces::vnext::WeightId;
+        use ferrum_runtime::WeightId;
         stream
             .memcpy_htod(&self.output_initial, &mut self.output_gpu)
             .unwrap();

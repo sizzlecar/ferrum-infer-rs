@@ -1,4 +1,4 @@
-use ferrum_interfaces::vnext::{
+use ferrum_runtime::{
     DeviceBatchingForm, DeviceCommandLogicalWork, DeviceCommandPhase, DeviceExecutionPath,
     DeviceNativeOperationId, DeviceNativeWorkAttribution,
 };

@@ -8,9 +8,9 @@ use super::{
     ExecutionMaintenanceRetryTicket, LogicalWorkGeneration, RequestPhase, WaitingAdmissionMode,
     WaitingAdmissionTicket, EXECUTION_READINESS_FAILED, EXECUTION_READINESS_PENDING,
 };
-use ferrum_interfaces::model_executor::ExecutorExecutionCapacityDeferral;
+use ferrum_execution::model_executor::ExecutorExecutionCapacityDeferral;
 use ferrum_interfaces::scheduler::PreparedPrefixRestore;
-use ferrum_interfaces::vnext::DeferredAction;
+use ferrum_runtime::DeferredAction;
 use ferrum_types::{FerrumError, RequestId, RequestState, Result};
 use std::sync::atomic::Ordering;
 

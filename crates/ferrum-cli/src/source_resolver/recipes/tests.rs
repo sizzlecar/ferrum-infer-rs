@@ -3,7 +3,7 @@ use crate::source_resolver::{
     gguf_repository::tests::write_iq_fixture, resolve_gguf_alias, resolve_model_alias,
     resolve_model_source, resolve_model_source_with_product_sources, DownloadPolicy,
 };
-use ferrum_interfaces::vnext::ModelSourceKind;
+use ferrum_runtime::ModelSourceKind;
 use std::path::{Path, PathBuf};
 
 fn snapshot(cache: &Path, selector: &str) -> PathBuf {

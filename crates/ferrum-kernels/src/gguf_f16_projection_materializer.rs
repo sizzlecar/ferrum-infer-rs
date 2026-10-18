@@ -2,7 +2,7 @@
 //! the mathematical change; model/tensor names never do. This materializer does
 //! not authorize serving quality or manufacture device cost evidence.
 
-use ferrum_interfaces::vnext::*;
+use ferrum_runtime::*;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 

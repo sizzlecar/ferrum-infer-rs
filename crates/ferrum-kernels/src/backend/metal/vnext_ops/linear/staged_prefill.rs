@@ -2,7 +2,7 @@
 //! The planner owns all backing; no materialized weights survive as model state.
 
 use super::*;
-use ferrum_interfaces::vnext::{
+use ferrum_runtime::{
     PhysicalStorageLayout, PhysicalWeightLayout, ResolvedValueBinding, ResolvedWeightBinding,
 };
 

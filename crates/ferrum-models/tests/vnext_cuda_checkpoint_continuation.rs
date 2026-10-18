@@ -1,10 +1,10 @@
 #![cfg(feature = "cuda")]
 
-use ferrum_interfaces::vnext::*;
 use ferrum_kernels::backend::cuda::{
     vnext_ops::{cuda_weight_materializer_selection, CudaVNextComposition},
     vnext_runtime::CudaDeviceRuntime,
 };
+use ferrum_runtime::*;
 use half::f16;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;

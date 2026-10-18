@@ -5,12 +5,10 @@
 //! `LlmExecutor` (living in `ferrum-engine`) holds a `Box<dyn DecoderOnlyLLM>`
 //! and adapts it to the `ModelExecutor` trait that the scheduler calls.
 
-use ferrum_interfaces::{
-    model_executor::{
-        KvSlotCapacitySnapshot, KvSlotRequest, KvSlotReservation, LogitsReturnPolicy,
-    },
-    RecurrentStateSpec,
+use ferrum_execution::model_executor::{
+    KvSlotCapacitySnapshot, KvSlotRequest, KvSlotReservation, LogitsReturnPolicy,
 };
+use ferrum_interfaces::RecurrentStateSpec;
 use ferrum_types::{RequestId, Result, TokenId};
 
 /// Runtime configuration every decoder-only LLM must expose.

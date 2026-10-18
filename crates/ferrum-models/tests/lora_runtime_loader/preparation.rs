@@ -1,10 +1,10 @@
 use super::execution::{metadata, model_adapter, tokens};
 use super::*;
-use ferrum_interfaces::adapter::AdapterExecutionSupport;
-use ferrum_interfaces::model_executor::{
+use ferrum_execution::model_executor::{
     DecodeInput, KvSlotRequest, KvSlotReservation, PrefillInput, UnifiedBatch, UnifiedBatchItem,
 };
-use ferrum_interfaces::ModelExecutor;
+use ferrum_execution::ModelExecutor;
+use ferrum_interfaces::adapter::AdapterExecutionSupport;
 use ferrum_models::common::{DecoderOnlyLLM, LlmRuntimeConfig};
 use ferrum_models::models::LlamaFamilyModel;
 use ferrum_models::test_support::{tiny_llama_model, tiny_model_info, TinyLlamaConfig};

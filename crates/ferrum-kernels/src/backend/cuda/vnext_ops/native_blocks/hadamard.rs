@@ -2,9 +2,7 @@
 
 use super::*;
 use cudarc::driver::CudaModule;
-use ferrum_interfaces::vnext::{
-    ElementType, HadamardApplication, HadamardSigns, HadamardTransformSpec,
-};
+use ferrum_runtime::{ElementType, HadamardApplication, HadamardSigns, HadamardTransformSpec};
 
 // 32 KiB fits the default per-block shared-memory limit of supported CUDA
 // devices. Larger declarations fail during planning, before any allocation.
@@ -25,17 +23,17 @@ pub(in crate::backend::cuda::vnext_ops) fn validate(
 }
 
 pub(in crate::backend::cuda::vnext_ops) fn workspace_bytes_per_token(
-    bindings: &[ferrum_interfaces::vnext::ResolvedValueBinding],
+    bindings: &[ferrum_runtime::ResolvedValueBinding],
 ) -> Result<u64, String> {
     bindings
         .iter()
         .filter_map(|binding| binding.weight().map(|weight| (binding, weight)))
         .try_fold(0_u64, |maximum, (binding, weight)| {
             fn width(
-                layout: &ferrum_interfaces::vnext::PhysicalWeightLayout,
+                layout: &ferrum_runtime::PhysicalWeightLayout,
                 dimensions: &[u64],
             ) -> Result<u64, String> {
-                use ferrum_interfaces::vnext::PhysicalWeightLayout;
+                use ferrum_runtime::PhysicalWeightLayout;
                 match layout {
                     PhysicalWeightLayout::Hadamard { transform, .. } => {
                         let width = *dimensions
@@ -62,12 +60,9 @@ pub(in crate::backend::cuda::vnext_ops) fn workspace_bytes_per_token(
 }
 
 pub(in crate::backend::cuda::vnext_ops) fn token_workspace(
-    values: &[ferrum_interfaces::vnext::ResolvedValueBinding],
-) -> Result<
-    Option<ferrum_interfaces::vnext::ProviderWorkspaceRequirement>,
-    ferrum_interfaces::vnext::VNextError,
-> {
-    use ferrum_interfaces::vnext::*;
+    values: &[ferrum_runtime::ResolvedValueBinding],
+) -> Result<Option<ferrum_runtime::ProviderWorkspaceRequirement>, ferrum_runtime::VNextError> {
+    use ferrum_runtime::*;
     let bytes = workspace_bytes_per_token(values)
         .map_err(|reason| VNextError::InvalidExecutionPlan { reason })?;
     (bytes > 0)
@@ -84,10 +79,7 @@ pub(in crate::backend::cuda::vnext_ops) fn token_workspace(
 }
 
 pub(in crate::backend::cuda::vnext_ops) fn retain_workspace(
-    invocation: &ferrum_interfaces::vnext::BatchedOperationInvocation<
-        '_,
-        super::super::CudaDeviceBuffer,
-    >,
+    invocation: &ferrum_runtime::BatchedOperationInvocation<'_, super::super::CudaDeviceBuffer>,
     regions: &mut Vec<super::super::CudaBufferRegion>,
 ) -> Result<Option<usize>, String> {
     let bytes = workspace_bytes_per_token(invocation.participants()[0].bindings())?

@@ -8,7 +8,7 @@ use std::io::Cursor;
 use std::path::Path;
 
 use candle_core::{Error, Result};
-use ferrum_interfaces::vnext::{BlockQuantizationSpec, ElementType, WeightEncoding};
+use ferrum_runtime::{BlockQuantizationSpec, ElementType, WeightEncoding};
 use memmap2::Mmap;
 
 use super::inventory::{block_abi, GgufInventory};

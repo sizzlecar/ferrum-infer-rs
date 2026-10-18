@@ -1,4 +1,4 @@
-use ferrum_interfaces::vnext::ElementType;
+use ferrum_runtime::ElementType;
 use half::f16;
 
 use super::super::vnext_runtime::CpuRuntimeError;

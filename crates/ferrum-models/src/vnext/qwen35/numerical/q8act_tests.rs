@@ -1,5 +1,5 @@
 use super::*;
-use ferrum_interfaces::vnext::{NumericalExecutionPolicy, TypedFamilyRegistration};
+use ferrum_runtime::{NumericalExecutionPolicy, TypedFamilyRegistration};
 
 fn source() -> Qwen35FamilyConfig {
     let mut config = super::super::tests::test_dense_gguf_config();
@@ -69,8 +69,7 @@ fn q8act_ffn_require_preserves_auto_state_boundaries_and_non_ffn_operations() {
         .operations
         .iter_mut()
         .find(|op| {
-            op.operation_id.as_str()
-                == ferrum_interfaces::vnext::DENSE_SWIGLU_IQ4XS_Q8ACT_G32_OPERATION_ID
+            op.operation_id.as_str() == ferrum_runtime::DENSE_SWIGLU_IQ4XS_Q8ACT_G32_OPERATION_ID
         })
         .unwrap();
     *candidate_operation = strict

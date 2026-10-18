@@ -1,8 +1,6 @@
 use super::checkpoint_fixture::{Fixture, Spec};
 use super::*;
-use ferrum_interfaces::vnext::{
-    CheckpointBoundaryConstraint, CheckpointTokenSpanConstraint, ProviderId,
-};
+use ferrum_runtime::{CheckpointBoundaryConstraint, CheckpointTokenSpanConstraint, ProviderId};
 use std::num::NonZeroU64;
 
 fn fixture(dependency: CheckpointInputDependency, alignment: u64) -> Fixture {

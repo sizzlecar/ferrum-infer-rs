@@ -6,7 +6,7 @@
 //! measurements explicitly and never replace them with zero durations.
 
 use super::*;
-use ferrum_interfaces::vnext::{DynamicStorageAllocator, DynamicStorageView, ResourceId};
+use ferrum_runtime::{DynamicStorageAllocator, DynamicStorageView, ResourceId};
 use metal::objc::rc::autoreleasepool;
 
 #[derive(Clone, Copy, Debug)]

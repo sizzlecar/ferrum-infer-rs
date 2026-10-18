@@ -89,14 +89,14 @@ pub fn contract_groups() -> Vec<ContractGroup> {
     };
     let numerical_profile = |name: &str| {
         integration(
-            "ferrum-interfaces",
+            "ferrum-runtime",
             "vnext_numerical_profile_contract_tests",
             name,
         )
     };
     let compiler = |name: &str| {
         integration(
-            "ferrum-interfaces",
+            "ferrum-runtime",
             "vnext_program_plan_compiler_contract_tests",
             name,
         )
@@ -132,7 +132,7 @@ pub fn contract_groups() -> Vec<ContractGroup> {
             compiler("quantized_binding_still_requires_its_format_and_abi_before_allocation"),
             compiler("compilation_reports_the_exact_tensor_binding_on_signature_mismatch"),
             numerical_profile("compiler::missing_tail_rejects_whole_candidate_and_explicit_request_cannot_fall_back"),
-            integration("ferrum-interfaces", "vnext_weight_layout_contract_tests", "physical_weight_layout_tree_rejects_invalid_shape_reuse_padding_overflow_and_limits"),
+            integration("ferrum-runtime", "vnext_weight_layout_contract_tests", "physical_weight_layout_tree_rejects_invalid_shape_reuse_padding_overflow_and_limits"),
         ]),
         ("source-closure", SourceClosure, all.clone(), vec![download("indexed_fresh_download_fetches_only_referenced_shards_and_sidecars"), download("fresh_download_preserves_standalone_chat_template_in_source_bundle")]),
         ("source-revision", SourceRevision, all.clone(), vec![

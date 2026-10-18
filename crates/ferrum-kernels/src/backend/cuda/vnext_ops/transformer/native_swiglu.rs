@@ -3,7 +3,7 @@
 use super::super::native_blocks::q8act::{self, Q8ActKernels};
 use super::super::native_blocks::{weights, CudaNativeBlockKernels};
 use super::*;
-use ferrum_interfaces::vnext::{PreparedProjectionNumerics, ProjectionRole};
+use ferrum_runtime::{PreparedProjectionNumerics, ProjectionRole};
 
 pub(super) fn uses_native(values: &[ResolvedValueBinding]) -> bool {
     values.iter().any(|value| {
@@ -12,7 +12,7 @@ pub(super) fn uses_native(values: &[ResolvedValueBinding]) -> bool {
             && value.weight().is_some_and(|weight| {
                 !matches!(
                     weight.physical_layout(),
-                    ferrum_interfaces::vnext::PhysicalWeightLayout::Dense { .. }
+                    ferrum_runtime::PhysicalWeightLayout::Dense { .. }
                 ) && weights::matrix_parts(weight, value.tensor().dimensions()).is_ok()
             })
     })

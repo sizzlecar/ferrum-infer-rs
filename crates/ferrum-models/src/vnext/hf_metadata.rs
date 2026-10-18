@@ -2,7 +2,7 @@
 
 use std::collections::BTreeSet;
 
-use ferrum_interfaces::vnext::{
+use ferrum_runtime::{
     ModelSemanticMetadata, SpecialTokenCollision, SpecialTokenCollisionPolicy,
     SpecialTokenMetadata, SpecialTokenRole, TemplateMetadata,
 };

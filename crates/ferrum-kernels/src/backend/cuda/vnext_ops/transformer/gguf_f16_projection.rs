@@ -2,7 +2,7 @@
 //! This validates already approved/materialized weights; it never grants
 //! materialization authority or attaches native cost evidence to vendor GEMM.
 use super::*;
-use ferrum_interfaces::vnext::{
+use ferrum_runtime::{
     gguf_f16_projection_role_v1, OperationId, PhysicalWeightLayout, WeightEncoding,
 };
 

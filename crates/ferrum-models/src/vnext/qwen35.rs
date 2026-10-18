@@ -9,7 +9,15 @@ use std::num::NonZeroU32;
 use std::path::Path;
 use std::sync::Arc;
 
-use ferrum_interfaces::vnext::{
+#[cfg(test)]
+use ferrum_quantization::gguf::{block_quantization_format, GgmlDType};
+use ferrum_quantization::gguf::{ferrum_to_gguf_with_arch, GgufHadamard, NativeGgufFile};
+use ferrum_quantization::{
+    BlockFp8SafetensorsSource, CompressedTensorsMarlinSafetensorsSource, GgufWeightComponentSource,
+    GptqMarlinSafetensorsSource, SafetensorsArchive, BLOCK_FP8_E4M3_SOURCE_FORMAT_ID,
+    COMPRESSED_TENSORS_MARLIN_INT4_FORMAT_ID, GPTQ_MARLIN_INT4_FORMAT_ID,
+};
+use ferrum_runtime::{
     AttributeId, BlockQuantizationSpec, CanonicalRational, CompositeWeightPart, ContractVersion,
     ElementType, ExternalModelMetadataId, FamilyNumericalProfiles, GatedDeltaDecayParameterization,
     GatedDeltaValueHeadMapping, KvStorageFormat, ModelFamilyId, ModelFamilyProvider,
@@ -36,14 +44,6 @@ use ferrum_interfaces::vnext::{
     RESIDUAL_ADD_OPERATION_ID, RMS_NORM_F32_OPERATION_ID, RMS_NORM_F32_TO_F16_OPERATION_ID,
     RMS_NORM_OPERATION_ID, ROUTED_SHARED_SWIGLU_MOE_OPERATION_ID,
     TOKEN_EMBEDDING_F32_MASTER_OPERATION_ID, TOKEN_EMBEDDING_OPERATION_ID,
-};
-#[cfg(test)]
-use ferrum_quantization::gguf::{block_quantization_format, GgmlDType};
-use ferrum_quantization::gguf::{ferrum_to_gguf_with_arch, GgufHadamard, NativeGgufFile};
-use ferrum_quantization::{
-    BlockFp8SafetensorsSource, CompressedTensorsMarlinSafetensorsSource, GgufWeightComponentSource,
-    GptqMarlinSafetensorsSource, SafetensorsArchive, BLOCK_FP8_E4M3_SOURCE_FORMAT_ID,
-    COMPRESSED_TENSORS_MARLIN_INT4_FORMAT_ID, GPTQ_MARLIN_INT4_FORMAT_ID,
 };
 use ferrum_types::DataType;
 use serde::{Deserialize, Serialize};
@@ -351,7 +351,7 @@ impl Qwen35OperationProfile {
 
     const F32_MASTER_FFN_IQ4XS_Q8ACT_G32: Self = Self {
         dense_feed_forward: OperationSelection::new(
-            ferrum_interfaces::vnext::DENSE_SWIGLU_IQ4XS_Q8ACT_G32_OPERATION_ID,
+            ferrum_runtime::DENSE_SWIGLU_IQ4XS_Q8ACT_G32_OPERATION_ID,
             1,
             0,
         ),
@@ -360,7 +360,7 @@ impl Qwen35OperationProfile {
 
     const F32_MASTER_FFN_Q4K_Q5K_IQ4XS_Q8ACT_G32: Self = Self {
         dense_feed_forward: OperationSelection::new(
-            ferrum_interfaces::vnext::DENSE_SWIGLU_Q4K_Q5K_IQ4XS_Q8ACT_G32_OPERATION_ID,
+            ferrum_runtime::DENSE_SWIGLU_Q4K_Q5K_IQ4XS_Q8ACT_G32_OPERATION_ID,
             1,
             0,
         ),
@@ -369,46 +369,46 @@ impl Qwen35OperationProfile {
 
     const F32_MASTER_FFN_ATTENTION_Q4K_Q5K_IQ4XS_Q8ACT_G32: Self = Self {
         linear_attention: OperationSelection::new(
-            ferrum_interfaces::vnext::GATED_DELTA_RECURRENT_ATTENTION_F32_MASTER_Q4K_Q5K_IQ4XS_Q8ACT_G32_OPERATION_ID, 1, 0),
+            ferrum_runtime::GATED_DELTA_RECURRENT_ATTENTION_F32_MASTER_Q4K_Q5K_IQ4XS_Q8ACT_G32_OPERATION_ID, 1, 0),
         causal_attention: OperationSelection::new(
-            ferrum_interfaces::vnext::CAUSAL_PAGED_ATTENTION_F32_MASTER_Q4K_Q5K_IQ4XS_Q8ACT_G32_OPERATION_ID, 1, 0),
+            ferrum_runtime::CAUSAL_PAGED_ATTENTION_F32_MASTER_Q4K_Q5K_IQ4XS_Q8ACT_G32_OPERATION_ID, 1, 0),
         ..Self::F32_MASTER_FFN_Q4K_Q5K_IQ4XS_Q8ACT_G32
     };
 
     const F32_MASTER_UPSTREAM_MARKER_V2: Self = Self {
-        dense_feed_forward: OperationSelection::new(ferrum_interfaces::vnext::DENSE_SWIGLU_Q4K_Q5K_IQ4XS_UPSTREAM_MARKER_V2_OPERATION_ID,1,0),
-        linear_attention: OperationSelection::new(ferrum_interfaces::vnext::GATED_DELTA_RECURRENT_ATTENTION_F32_MASTER_Q4K_Q5K_IQ4XS_UPSTREAM_MARKER_V2_OPERATION_ID,1,0),
-        causal_attention: OperationSelection::new(ferrum_interfaces::vnext::CAUSAL_PAGED_ATTENTION_F32_MASTER_Q4K_Q5K_IQ4XS_UPSTREAM_MARKER_V2_OPERATION_ID,1,0),
+        dense_feed_forward: OperationSelection::new(ferrum_runtime::DENSE_SWIGLU_Q4K_Q5K_IQ4XS_UPSTREAM_MARKER_V2_OPERATION_ID,1,0),
+        linear_attention: OperationSelection::new(ferrum_runtime::GATED_DELTA_RECURRENT_ATTENTION_F32_MASTER_Q4K_Q5K_IQ4XS_UPSTREAM_MARKER_V2_OPERATION_ID,1,0),
+        causal_attention: OperationSelection::new(ferrum_runtime::CAUSAL_PAGED_ATTENTION_F32_MASTER_Q4K_Q5K_IQ4XS_UPSTREAM_MARKER_V2_OPERATION_ID,1,0),
         ..Self::F32_MASTER
     };
     const F32_MASTER_UPSTREAM_MARKER_V2_PREFILL: Self = Self {
-        dense_feed_forward: OperationSelection::new(ferrum_interfaces::vnext::DENSE_SWIGLU_Q4K_Q5K_IQ4XS_UPSTREAM_MARKER_V2_PREFILL_OPERATION_ID,1,0),
-        linear_attention: OperationSelection::new(ferrum_interfaces::vnext::GATED_DELTA_RECURRENT_ATTENTION_F32_MASTER_Q4K_Q5K_IQ4XS_UPSTREAM_MARKER_V2_PREFILL_OPERATION_ID,1,0),
-        causal_attention: OperationSelection::new(ferrum_interfaces::vnext::CAUSAL_PAGED_ATTENTION_F32_MASTER_Q4K_Q5K_IQ4XS_UPSTREAM_MARKER_V2_PREFILL_OPERATION_ID,1,0),
+        dense_feed_forward: OperationSelection::new(ferrum_runtime::DENSE_SWIGLU_Q4K_Q5K_IQ4XS_UPSTREAM_MARKER_V2_PREFILL_OPERATION_ID,1,0),
+        linear_attention: OperationSelection::new(ferrum_runtime::GATED_DELTA_RECURRENT_ATTENTION_F32_MASTER_Q4K_Q5K_IQ4XS_UPSTREAM_MARKER_V2_PREFILL_OPERATION_ID,1,0),
+        causal_attention: OperationSelection::new(ferrum_runtime::CAUSAL_PAGED_ATTENTION_F32_MASTER_Q4K_Q5K_IQ4XS_UPSTREAM_MARKER_V2_PREFILL_OPERATION_ID,1,0),
         ..Self::F32_MASTER
     };
     const F32_MASTER_UPSTREAM_EXTRA_MARKER_V2_PREFILL: Self = Self {
-        dense_feed_forward: OperationSelection::new(ferrum_interfaces::vnext::DENSE_SWIGLU_Q3K_Q4K_Q5K_IQ3S_IQ4NL_IQ4XS_UPSTREAM_MARKER_V2_PREFILL_OPERATION_ID,1,0),
-        linear_attention: OperationSelection::new(ferrum_interfaces::vnext::GATED_DELTA_RECURRENT_ATTENTION_F32_MASTER_Q3K_Q4K_Q5K_IQ3S_IQ4NL_IQ4XS_UPSTREAM_MARKER_V2_PREFILL_OPERATION_ID,1,0),
-        causal_attention: OperationSelection::new(ferrum_interfaces::vnext::CAUSAL_PAGED_ATTENTION_F32_MASTER_Q3K_Q4K_Q5K_IQ3S_IQ4NL_IQ4XS_UPSTREAM_MARKER_V2_PREFILL_OPERATION_ID,1,0),
+        dense_feed_forward: OperationSelection::new(ferrum_runtime::DENSE_SWIGLU_Q3K_Q4K_Q5K_IQ3S_IQ4NL_IQ4XS_UPSTREAM_MARKER_V2_PREFILL_OPERATION_ID,1,0),
+        linear_attention: OperationSelection::new(ferrum_runtime::GATED_DELTA_RECURRENT_ATTENTION_F32_MASTER_Q3K_Q4K_Q5K_IQ3S_IQ4NL_IQ4XS_UPSTREAM_MARKER_V2_PREFILL_OPERATION_ID,1,0),
+        causal_attention: OperationSelection::new(ferrum_runtime::CAUSAL_PAGED_ATTENTION_F32_MASTER_Q3K_Q4K_Q5K_IQ3S_IQ4NL_IQ4XS_UPSTREAM_MARKER_V2_PREFILL_OPERATION_ID,1,0),
         ..Self::F32_MASTER
     };
     const F32_MASTER_UPSTREAM_MARKER_V2_EXTRA_PREFILL: Self = Self {
-        dense_feed_forward: OperationSelection::new(ferrum_interfaces::vnext::DENSE_SWIGLU_Q3K_Q4K_Q5K_IQ3S_IQ4NL_IQ4XS_UPSTREAM_MARKER_V2_EXTRA_PREFILL_OPERATION_ID,1,0),
-        linear_attention: OperationSelection::new(ferrum_interfaces::vnext::GATED_DELTA_RECURRENT_ATTENTION_F32_MASTER_Q3K_Q4K_Q5K_IQ3S_IQ4NL_IQ4XS_UPSTREAM_MARKER_V2_EXTRA_PREFILL_OPERATION_ID,1,0),
-        causal_attention: OperationSelection::new(ferrum_interfaces::vnext::CAUSAL_PAGED_ATTENTION_F32_MASTER_Q3K_Q4K_Q5K_IQ3S_IQ4NL_IQ4XS_UPSTREAM_MARKER_V2_EXTRA_PREFILL_OPERATION_ID,1,0),
+        dense_feed_forward: OperationSelection::new(ferrum_runtime::DENSE_SWIGLU_Q3K_Q4K_Q5K_IQ3S_IQ4NL_IQ4XS_UPSTREAM_MARKER_V2_EXTRA_PREFILL_OPERATION_ID,1,0),
+        linear_attention: OperationSelection::new(ferrum_runtime::GATED_DELTA_RECURRENT_ATTENTION_F32_MASTER_Q3K_Q4K_Q5K_IQ3S_IQ4NL_IQ4XS_UPSTREAM_MARKER_V2_EXTRA_PREFILL_OPERATION_ID,1,0),
+        causal_attention: OperationSelection::new(ferrum_runtime::CAUSAL_PAGED_ATTENTION_F32_MASTER_Q3K_Q4K_Q5K_IQ3S_IQ4NL_IQ4XS_UPSTREAM_MARKER_V2_EXTRA_PREFILL_OPERATION_ID,1,0),
         ..Self::F32_MASTER
     };
     const F32_MASTER_UPSTREAM_MARKER_V2_EXTRA_ALL_ROWS: Self = Self {
-        dense_feed_forward: OperationSelection::new(ferrum_interfaces::vnext::DENSE_SWIGLU_Q3K_Q4K_Q5K_IQ3S_IQ4NL_IQ4XS_UPSTREAM_MARKER_V2_EXTRA_ALL_ROWS_OPERATION_ID,1,0),
-        linear_attention: OperationSelection::new(ferrum_interfaces::vnext::GATED_DELTA_RECURRENT_ATTENTION_F32_MASTER_Q3K_Q4K_Q5K_IQ3S_IQ4NL_IQ4XS_UPSTREAM_MARKER_V2_EXTRA_ALL_ROWS_OPERATION_ID,1,0),
-        causal_attention: OperationSelection::new(ferrum_interfaces::vnext::CAUSAL_PAGED_ATTENTION_F32_MASTER_Q3K_Q4K_Q5K_IQ3S_IQ4NL_IQ4XS_UPSTREAM_MARKER_V2_EXTRA_ALL_ROWS_OPERATION_ID,1,0),
+        dense_feed_forward: OperationSelection::new(ferrum_runtime::DENSE_SWIGLU_Q3K_Q4K_Q5K_IQ3S_IQ4NL_IQ4XS_UPSTREAM_MARKER_V2_EXTRA_ALL_ROWS_OPERATION_ID,1,0),
+        linear_attention: OperationSelection::new(ferrum_runtime::GATED_DELTA_RECURRENT_ATTENTION_F32_MASTER_Q3K_Q4K_Q5K_IQ3S_IQ4NL_IQ4XS_UPSTREAM_MARKER_V2_EXTRA_ALL_ROWS_OPERATION_ID,1,0),
+        causal_attention: OperationSelection::new(ferrum_runtime::CAUSAL_PAGED_ATTENTION_F32_MASTER_Q3K_Q4K_Q5K_IQ3S_IQ4NL_IQ4XS_UPSTREAM_MARKER_V2_EXTRA_ALL_ROWS_OPERATION_ID,1,0),
         ..Self::F32_MASTER
     };
 
     const F32_MASTER_GGUF_Q8_HEAD_V1: Self = Self {
         logits: OperationSelection::new(
-            ferrum_interfaces::vnext::LAST_TOKEN_DENSE_LINEAR_Q6_MMQ_F32_OPERATION_ID,
+            ferrum_runtime::LAST_TOKEN_DENSE_LINEAR_Q6_MMQ_F32_OPERATION_ID,
             1,
             0,
         ),
@@ -416,16 +416,16 @@ impl Qwen35OperationProfile {
     };
 
     const F32_MASTER_Q6_HEAD_Q6_F16_MMQ_V1: Self = Self {
-        dense_feed_forward: OperationSelection::new(ferrum_interfaces::vnext::DENSE_SWIGLU_Q6_F16_MARKER_V1_OPERATION_ID, 1, 0),
-        linear_attention: OperationSelection::new(ferrum_interfaces::vnext::GATED_DELTA_RECURRENT_ATTENTION_F32_MASTER_Q6_F16_MARKER_V1_OPERATION_ID, 1, 0),
-        causal_attention: OperationSelection::new(ferrum_interfaces::vnext::CAUSAL_PAGED_ATTENTION_F32_MASTER_Q6_F16_MARKER_V1_OPERATION_ID, 1, 0),
+        dense_feed_forward: OperationSelection::new(ferrum_runtime::DENSE_SWIGLU_Q6_F16_MARKER_V1_OPERATION_ID, 1, 0),
+        linear_attention: OperationSelection::new(ferrum_runtime::GATED_DELTA_RECURRENT_ATTENTION_F32_MASTER_Q6_F16_MARKER_V1_OPERATION_ID, 1, 0),
+        causal_attention: OperationSelection::new(ferrum_runtime::CAUSAL_PAGED_ATTENTION_F32_MASTER_Q6_F16_MARKER_V1_OPERATION_ID, 1, 0),
         ..Self::F32_MASTER_GGUF_Q8_HEAD_V1
     };
 
     const F32_MASTER_G32_MMQ_PREFILL_MARKER_V1: Self = Self {
-        dense_feed_forward: OperationSelection::new(ferrum_interfaces::vnext::DENSE_SWIGLU_Q4K_Q5K_IQ4XS_G32_MMQ_PREFILL_MARKER_V1_OPERATION_ID,1,0),
-        linear_attention: OperationSelection::new(ferrum_interfaces::vnext::GATED_DELTA_RECURRENT_ATTENTION_F32_MASTER_Q4K_Q5K_IQ4XS_G32_MMQ_PREFILL_MARKER_V1_OPERATION_ID,1,0),
-        causal_attention: OperationSelection::new(ferrum_interfaces::vnext::CAUSAL_PAGED_ATTENTION_F32_MASTER_Q4K_Q5K_IQ4XS_G32_MMQ_PREFILL_MARKER_V1_OPERATION_ID,1,0),
+        dense_feed_forward: OperationSelection::new(ferrum_runtime::DENSE_SWIGLU_Q4K_Q5K_IQ4XS_G32_MMQ_PREFILL_MARKER_V1_OPERATION_ID,1,0),
+        linear_attention: OperationSelection::new(ferrum_runtime::GATED_DELTA_RECURRENT_ATTENTION_F32_MASTER_Q4K_Q5K_IQ4XS_G32_MMQ_PREFILL_MARKER_V1_OPERATION_ID,1,0),
+        causal_attention: OperationSelection::new(ferrum_runtime::CAUSAL_PAGED_ATTENTION_F32_MASTER_Q4K_Q5K_IQ4XS_G32_MMQ_PREFILL_MARKER_V1_OPERATION_ID,1,0),
         ..Self::F32_MASTER
     };
 
@@ -4697,7 +4697,11 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::*;
-    use ferrum_interfaces::vnext::{
+    use ferrum_kernels::marlin_fp8_materializer::{
+        block_fp8_to_marlin_fp8_weight_materializer, MARLIN_FP8_GROUP128_QUANTIZATION_FORMAT_ID,
+    };
+    use ferrum_quantization::SafetensorsTensor;
+    use ferrum_runtime::{
         causal_paged_attention_contract, dense_swiglu_contract,
         gated_delta_recurrent_attention_contract, last_token_dense_linear_contract,
         routed_shared_swiglu_moe_contract, DeviceClass, DeviceDescriptor, DeviceId,
@@ -4706,10 +4710,6 @@ mod tests {
         OriginalModelSources, PhysicalStorageLayout, PhysicalWeightComponentBinding,
         WeightComponentSource, WeightMaterializationFidelity,
     };
-    use ferrum_kernels::marlin_fp8_materializer::{
-        block_fp8_to_marlin_fp8_weight_materializer, MARLIN_FP8_GROUP128_QUANTIZATION_FORMAT_ID,
-    };
-    use ferrum_quantization::SafetensorsTensor;
     use half::{bf16, f16};
     use memmap2::Mmap;
     use safetensors::tensor::{serialize_to_file, Dtype, TensorView, View};
@@ -8360,7 +8360,7 @@ mod tests {
 
     #[test]
     fn int8_kv_profiles_preserve_recurrent_state_and_close_the_attention_program() {
-        use ferrum_interfaces::vnext::NumericalExecutionPolicy;
+        use ferrum_runtime::NumericalExecutionPolicy;
         let registration = TypedFamilyRegistration::new(Qwen35FamilyProvider::new().unwrap());
         for config in [
             test_config(),
@@ -8428,7 +8428,7 @@ mod tests {
 
     #[test]
     fn same_native_quantized_source_prepares_explicit_f16_and_f32_master_graphs() {
-        use ferrum_interfaces::vnext::{NumericalExecutionPolicy, NumericalProfileId};
+        use ferrum_runtime::{NumericalExecutionPolicy, NumericalProfileId};
         let registration = TypedFamilyRegistration::new(Qwen35FamilyProvider::new().unwrap());
         let mut config = test_dense_gguf_config();
         for weight in config
@@ -8511,7 +8511,7 @@ mod tests {
 
     #[test]
     fn container_alone_does_not_change_the_numerical_contract() {
-        use ferrum_interfaces::vnext::NumericalExecutionPolicy;
+        use ferrum_runtime::NumericalExecutionPolicy;
         let registration = TypedFamilyRegistration::new(Qwen35FamilyProvider::new().unwrap());
         for abi in [
             RecurrentWeightAbi::LogRateGrouped,
@@ -8763,7 +8763,7 @@ mod tests {
         // Verify state semantics against their actual consuming operation;
         // selected backend/storage support is established by plan validation.
         for state in prepared.program().states() {
-            use ferrum_interfaces::vnext::{
+            use ferrum_runtime::{
                 CheckpointInputDependency, StateCheckpointCapability, StateCheckpointContents,
             };
             let owners = prepared.program().blocks()[0]
@@ -9351,7 +9351,7 @@ mod tests {
             .unwrap(),
         );
         let defined = define_from_sources(sources).unwrap();
-        let policy = ferrum_interfaces::vnext::NumericalExecutionPolicy::Auto;
+        let policy = ferrum_runtime::NumericalExecutionPolicy::Auto;
         let startup = defined
             .model_capabilities(&policy, KvStorageFormat::F16)
             .unwrap();

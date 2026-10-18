@@ -121,7 +121,7 @@ impl ProductReadbackModes {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ferrum_interfaces::model_executor::{GreedyRepetitionPenalty, TokenSelectionMask};
+    use ferrum_execution::model_executor::{GreedyRepetitionPenalty, TokenSelectionMask};
 
     fn greedy() -> VNextParticipantOutputRole {
         VNextParticipantOutputRole::Decode(LogitsReturnPolicy::GreedyArgmax {

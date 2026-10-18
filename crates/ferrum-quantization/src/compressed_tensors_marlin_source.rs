@@ -8,13 +8,13 @@
 use std::borrow::Cow;
 use std::path::Path;
 
-use ferrum_interfaces::vnext::{
-    ElementType, QuantizationSpec, VNextError, WeightComponentPayload, WeightComponentRole,
-    WeightComponentSource, WeightComponentSpec, WeightEncoding,
-};
 use ferrum_kernels::marlin_repack::{
     repack_compressed_tensors_zero_points_to_marlin, repack_gptq_to_marlin_bytes_into,
     repack_scales_to_marlin,
+};
+use ferrum_runtime::{
+    ElementType, QuantizationSpec, VNextError, WeightComponentPayload, WeightComponentRole,
+    WeightComponentSource, WeightComponentSpec, WeightEncoding,
 };
 use ferrum_types::Result;
 use half::f16;
@@ -372,7 +372,7 @@ fn validate_quantization(
         COMPRESSED_TENSORS_MARLIN_INT4_SYMMETRIC_FORMAT_ID
             if quantization.bits_per_weight == 4
                 && group_size == 32
-                && quantization.packing == ferrum_interfaces::vnext::QuantizationPacking::Tiled
+                && quantization.packing == ferrum_runtime::QuantizationPacking::Tiled
                 && quantization.scale_type == ElementType::F16
                 && quantization.zero_point_type.is_none() =>
         {
@@ -497,7 +497,7 @@ fn invalid_component(component: &WeightComponentSpec, reason: impl AsRef<str>) -
 mod tests {
     use std::collections::BTreeMap;
 
-    use ferrum_interfaces::vnext::{
+    use ferrum_runtime::{
         QuantizationFormatId, QuantizationGrouping, QuantizationPacking, WeightId,
     };
     use half::bf16;

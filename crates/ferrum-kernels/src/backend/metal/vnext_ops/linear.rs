@@ -4,7 +4,7 @@ use std::ffi::c_void;
 use std::ops::Range;
 use std::sync::Arc;
 
-use ferrum_interfaces::vnext::{
+use ferrum_runtime::{
     dense_linear_contract, dense_swiglu_contract, last_token_dense_linear_contract,
     last_token_dense_linear_f32_contract, BatchedOperationInvocation, CheckpointBoundaryConstraint,
     CheckpointCompletedInputCapture, CheckpointInputDependency, CheckpointPartitionNumerics,
@@ -925,7 +925,7 @@ impl OperationProvider<MetalDeviceRuntime> for MetalLastTokenDenseLinearProvider
 
 fn linear_provider_descriptor(
     runtime: &MetalDeviceRuntime,
-    contract: &dyn ferrum_interfaces::vnext::OperationContract,
+    contract: &dyn ferrum_runtime::OperationContract,
     provider_id: &str,
     capability_id: &str,
     estimator_id: &str,
@@ -2648,7 +2648,7 @@ pub(super) fn same_resolved_weight(
 }
 
 fn validate_dense_linear_participant(
-    participant: &ferrum_interfaces::vnext::OperationInvocation<'_, MetalDeviceBuffer>,
+    participant: &ferrum_runtime::OperationInvocation<'_, MetalDeviceBuffer>,
     in_features: u64,
     out_features: u64,
 ) -> Result<(), String> {
@@ -2670,7 +2670,7 @@ fn validate_dense_linear_participant(
 }
 
 fn validate_last_token_participant(
-    participant: &ferrum_interfaces::vnext::OperationInvocation<'_, MetalDeviceBuffer>,
+    participant: &ferrum_runtime::OperationInvocation<'_, MetalDeviceBuffer>,
     hidden_size: u64,
     out_features: u64,
     activation_type: ElementType,
@@ -2696,7 +2696,7 @@ fn validate_last_token_participant(
 }
 
 fn validate_swiglu_participant(
-    participant: &ferrum_interfaces::vnext::OperationInvocation<'_, MetalDeviceBuffer>,
+    participant: &ferrum_runtime::OperationInvocation<'_, MetalDeviceBuffer>,
     hidden_size: u64,
     intermediate_size: u64,
 ) -> Result<(), String> {

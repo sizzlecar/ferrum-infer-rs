@@ -2,7 +2,7 @@
 use super::super::test_support::Guarded;
 use super::*;
 use crate::backend::cuda::vnext_ops::cuda_vnext_runtime_config;
-use ferrum_interfaces::vnext::DeviceId;
+use ferrum_runtime::DeviceId;
 use half::f16;
 
 fn runtime() -> CudaDeviceRuntime {

@@ -1,14 +1,12 @@
 use super::*;
 use crate::builder::EngineBuilder;
-use ferrum_interfaces::{
-    model_executor::{
-        DecodeInput, DecodeOutput, ExecutorCapabilities, ExecutorStatus,
-        PlanRuntimeResourceSnapshot, PrefillInput, PrefillOutput,
-    },
-    vnext::{
-        DeviceId, ModelSourceKind, OriginalModelSource, OriginalModelSources, ResolvedModelSources,
-        WeightMaterializerSelection,
-    },
+use ferrum_execution::model_executor::{
+    DecodeInput, DecodeOutput, ExecutorCapabilities, ExecutorStatus, PlanRuntimeResourceSnapshot,
+    PrefillInput, PrefillOutput,
+};
+use ferrum_runtime::{
+    DeviceId, ModelSourceKind, OriginalModelSource, OriginalModelSources, ResolvedModelSources,
+    WeightMaterializerSelection,
 };
 use ferrum_types::{Device, ExecutorAdmissionLimits, ModelInfo};
 use std::{

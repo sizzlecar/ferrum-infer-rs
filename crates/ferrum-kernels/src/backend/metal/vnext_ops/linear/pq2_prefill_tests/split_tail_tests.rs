@@ -4,7 +4,7 @@
 use super::vector_input_tests::{read, region};
 use super::*;
 use crate::backend::metal::vnext_ops::MetalVNextComposition;
-use ferrum_interfaces::vnext::DeviceId;
+use ferrum_runtime::DeviceId;
 
 const WORKSPACE_OFFSET: u64 = 16;
 

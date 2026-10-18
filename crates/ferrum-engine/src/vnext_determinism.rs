@@ -4,15 +4,15 @@
 //! Diagnostic code can inspect the resolved plan and live capability catalog,
 //! while execution resources remain private to the executor.
 
-use ferrum_interfaces::vnext::{
-    CapabilityCatalog, DeviceId, ResolvedModelPlan, SubmissionWaveDeterminismEvidence,
-};
-use ferrum_interfaces::ModelExecutor;
+use ferrum_execution::ModelExecutor;
 use ferrum_kernels::backend::cuda::{
     vnext_ops::CudaVNextComposition, vnext_runtime::CudaDeviceRuntime,
 };
 use ferrum_models::vnext::DefinedProductionModel;
 use ferrum_models::{VNextDeterminismExecutionSpec, VNextExecutorConfig, VNextModelExecutor};
+use ferrum_runtime::{
+    CapabilityCatalog, DeviceId, ResolvedModelPlan, SubmissionWaveDeterminismEvidence,
+};
 use ferrum_types::{EngineConfig, FerrumError, Result};
 
 pub struct CudaVNextDeterminismCollector {

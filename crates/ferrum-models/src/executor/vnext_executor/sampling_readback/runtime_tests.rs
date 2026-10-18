@@ -1,5 +1,5 @@
 use super::*;
-use ferrum_interfaces::model_executor::{GreedyRepetitionPenalty, TokenSelectionMask};
+use ferrum_execution::model_executor::{GreedyRepetitionPenalty, TokenSelectionMask};
 use ferrum_interfaces::sampler::{
     GreedySampler, LogitsProcessor, RepetitionPenaltyProcessor, Sampler, SamplingContext,
     SamplingRng,

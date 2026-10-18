@@ -3,7 +3,7 @@ use super::tests::matrix;
 use super::*;
 use crate::gguf_blocks::GgufBlockFormat;
 use cudarc::driver::CudaContext;
-use ferrum_interfaces::vnext::*;
+use ferrum_runtime::*;
 use half::f16;
 use weights::{MatrixFormat, MatrixPart};
 

@@ -1,7 +1,7 @@
 use std::collections::BTreeSet;
 use std::sync::Barrier;
 
-use ferrum_interfaces::vnext::{
+use ferrum_runtime::{
     BufferUsage, DeviceBatchingForm, DeviceId, DynamicStorageAllocator, DynamicStorageProfile,
     DynamicStorageView, ElementType, ResourceId,
 };

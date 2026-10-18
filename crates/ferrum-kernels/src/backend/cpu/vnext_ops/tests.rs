@@ -4,7 +4,7 @@ use crate::gguf_blocks::{
     fixtures::{oracle_blocks, FORMATS},
     GgufBlockFormat,
 };
-use ferrum_interfaces::vnext::{BlockQuantizationSpec, ElementType, WeightEncoding};
+use ferrum_runtime::{BlockQuantizationSpec, ElementType, WeightEncoding};
 use half::f16;
 
 pub(super) fn encoded(values: &[f32], dtype: CpuFloat) -> Vec<u8> {

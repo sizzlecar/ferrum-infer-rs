@@ -1,8 +1,6 @@
 use std::sync::Arc;
 
-use ferrum_interfaces::vnext::{
-    AdmittedRequestResources, DeviceRuntime, RequestIdentity, SequenceSession,
-};
+use ferrum_runtime::{AdmittedRequestResources, DeviceRuntime, RequestIdentity, SequenceSession};
 use ferrum_types::{FerrumError, RequestId, Result};
 
 /// Product identity and exact core Request authority shared by every child

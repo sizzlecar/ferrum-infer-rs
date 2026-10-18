@@ -343,9 +343,8 @@ fn verify_options_with_execution_capacity(
             .iter()
             .find(|node| node.id().as_str() == "node.attention")
             .unwrap();
-        let ferrum_interfaces::vnext::ProviderWorkspaceSizeFormula::ActualSequences {
-            bytes_per_sequence,
-        } = node.provider_resources().binding().unwrap().size_formula()
+        let ferrum_runtime::ProviderWorkspaceSizeFormula::ActualSequences { bytes_per_sequence } =
+            node.provider_resources().binding().unwrap().size_formula()
         else {
             panic!("causal binding must declare its actual per-sequence row stride");
         };

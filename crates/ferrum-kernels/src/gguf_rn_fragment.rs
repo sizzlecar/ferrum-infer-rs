@@ -2,7 +2,7 @@
 //! Layout is shared with the qualified CUDA diagnostic: N16/K32 metadata and
 //! two warp fragments. This function grants no loading or execution authority.
 use crate::gguf_blocks::GgufBlockFormat;
-use ferrum_interfaces::vnext::{RnF16FragmentPlanV1, RnF16FragmentSourceFormatV1, VNextError};
+use ferrum_runtime::{RnF16FragmentPlanV1, RnF16FragmentSourceFormatV1, VNextError};
 use half::f16;
 
 #[cfg(test)]

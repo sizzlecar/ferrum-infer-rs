@@ -76,7 +76,7 @@ fn native_projection_packing_requires_exact_physical_rows_and_nonaliasing() {
 
 #[test]
 fn native_projection_packing_preserves_capacity_and_transform_fallback() {
-    use ferrum_interfaces::vnext::{
+    use ferrum_runtime::{
         HadamardApplication, HadamardSigns, HadamardTransformSpec, PhysicalWeightComponentBinding,
     };
     let table = part(MatrixFormat::DenseF16, 11, 33);

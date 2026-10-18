@@ -8,7 +8,7 @@ mod active_coverage;
 use active_coverage::{active_prefix_inputs, ActivePrefixInput, CaptureEviction};
 pub(super) mod rendezvous;
 mod restore_observation;
-use ferrum_interfaces::model_executor::{PrefixRestoreDecision, PrefixRestoreSource};
+use ferrum_execution::model_executor::{PrefixRestoreDecision, PrefixRestoreSource};
 use restore_observation::PrefixRestoreObserver;
 
 fn prefix_restore_extension_work(token_prefix: &[u32]) -> Result<ResourceWorkShape> {

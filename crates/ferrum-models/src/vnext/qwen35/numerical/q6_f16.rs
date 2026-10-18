@@ -1,6 +1,6 @@
 //! Explicit Q6 F16 projection arithmetic with physical-leaf geometry selection.
 use super::*;
-use ferrum_interfaces::vnext::UpstreamMarkerV2Profile;
+use ferrum_runtime::UpstreamMarkerV2Profile;
 
 #[cfg(test)]
 mod tests;

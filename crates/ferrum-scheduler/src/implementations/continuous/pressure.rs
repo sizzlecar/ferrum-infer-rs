@@ -7,7 +7,7 @@
 
 mod policy;
 
-use ferrum_interfaces::vnext::{
+use ferrum_runtime::{
     CapacityAvailabilitySource, CapacityWaitCondition, LogicalAdmissionCoordinatorId,
 };
 use ferrum_types::{Priority, RequestId};
@@ -2175,7 +2175,7 @@ fn observed_advanced(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ferrum_interfaces::vnext::{CapacityAvailabilityEpoch, CapacityDomainId};
+    use ferrum_runtime::{CapacityAvailabilityEpoch, CapacityDomainId};
 
     fn condition(epoch: u64) -> CapacityWaitCondition {
         CapacityWaitCondition::from_observation(

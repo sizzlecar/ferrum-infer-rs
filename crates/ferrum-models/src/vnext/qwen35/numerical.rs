@@ -3,7 +3,7 @@
 //! explicit profile controls the graph and never changes source tensor bytes.
 
 use super::*;
-use ferrum_interfaces::vnext::{
+use ferrum_runtime::{
     CheckpointInputDependency, DeclaredProjectionArithmetic, KvStateStorage, KvStorageFormat,
     NumericalOperationContract, NumericalProfileId, ProjectionRole, Q8ActAttentionProfile,
     Q8ActSwiGluProfile, StateCheckpointCapability, StateCheckpointContents,
@@ -365,25 +365,24 @@ pub(super) fn gguf_rn_f16_fragment_eligible(
     if !gguf_f16_projections_eligible(config, text) {
         return false;
     }
-    let classify =
-        |weight: &FamilyWeight| -> Option<ferrum_interfaces::vnext::RnF16FragmentSourceFormatV1> {
-            use ferrum_interfaces::vnext::{RnF16FragmentPlanV1, RnF16FragmentSourceFormatV1};
-            let FamilyWeightSourceEncoding::BlockQuantized(spec) = &weight.source_encoding else {
-                return None;
-            };
-            let format = match (
-                spec.format_id.as_str(),
-                spec.logical_values_per_block,
-                spec.bytes_per_block,
-            ) {
-                ("quantization.gguf.q4-k", 256, 144) => RnF16FragmentSourceFormatV1::Q4K,
-                ("quantization.gguf.q5-k", 256, 176) => RnF16FragmentSourceFormatV1::Q5K,
-                ("quantization.gguf.q6-k", 256, 210) => RnF16FragmentSourceFormatV1::Q6K,
-                _ => return None,
-            };
-            RnF16FragmentPlanV1::from_dimensions(format, &weight.dimensions).ok()?;
-            Some(format)
+    let classify = |weight: &FamilyWeight| -> Option<ferrum_runtime::RnF16FragmentSourceFormatV1> {
+        use ferrum_runtime::{RnF16FragmentPlanV1, RnF16FragmentSourceFormatV1};
+        let FamilyWeightSourceEncoding::BlockQuantized(spec) = &weight.source_encoding else {
+            return None;
         };
+        let format = match (
+            spec.format_id.as_str(),
+            spec.logical_values_per_block,
+            spec.bytes_per_block,
+        ) {
+            ("quantization.gguf.q4-k", 256, 144) => RnF16FragmentSourceFormatV1::Q4K,
+            ("quantization.gguf.q5-k", 256, 176) => RnF16FragmentSourceFormatV1::Q5K,
+            ("quantization.gguf.q6-k", 256, 210) => RnF16FragmentSourceFormatV1::Q6K,
+            _ => return None,
+        };
+        RnF16FragmentPlanV1::from_dimensions(format, &weight.dimensions).ok()?;
+        Some(format)
+    };
     (0..text.num_hidden_layers).all(|layer| {
         let find = |role| {
             config
@@ -408,7 +407,7 @@ pub(super) fn gguf_rn_f16_fragment_eligible(
                 return false;
             };
             *n = joined;
-            ferrum_interfaces::vnext::RnF16FragmentPlanV1::from_dimensions(format, &whole).is_ok()
+            ferrum_runtime::RnF16FragmentPlanV1::from_dimensions(format, &whole).is_ok()
         }) && classify(down).is_some()
     })
 }

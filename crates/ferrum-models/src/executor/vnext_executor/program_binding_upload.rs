@@ -1,4 +1,4 @@
-use ferrum_interfaces::vnext::DeviceProgramBindingUploadSnapshot;
+use ferrum_runtime::DeviceProgramBindingUploadSnapshot;
 use parking_lot::Mutex;
 
 /// A measurement baseline, never a reset of the possibly shared runtime.

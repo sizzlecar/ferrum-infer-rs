@@ -1,7 +1,7 @@
 //! Submission-local ownership for fresh segment ranges. Indices never identify
 //! an owner outside the current core patch, and a table never grants a range.
 use super::*;
-use ferrum_interfaces::vnext::{SegmentBindingOwnerIndex, SegmentBindingOwnerView};
+use ferrum_runtime::{SegmentBindingOwnerIndex, SegmentBindingOwnerView};
 
 #[derive(Clone, Copy)]
 pub(crate) struct CudaRegionView<'a> {

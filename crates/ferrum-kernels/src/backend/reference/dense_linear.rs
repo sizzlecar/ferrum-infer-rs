@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use ferrum_interfaces::vnext::{
+use ferrum_runtime::{
     dense_linear_contract, AttributeId, BatchedOperationInvocation, CapabilityId, ContractVersion,
     DeviceBatchingForm, DeviceRuntime, DynamicStorageRequirement, ElementType,
     EncodedDeviceOperation, ExecutionIdentityEnvelope, OperationContract, OperationFailure,
@@ -229,7 +229,7 @@ fn encode_dense_linear(
 }
 
 fn validate_participant_signature(
-    participant: &ferrum_interfaces::vnext::OperationInvocation<'_, ReferenceDeviceBuffer>,
+    participant: &ferrum_runtime::OperationInvocation<'_, ReferenceDeviceBuffer>,
     in_features: usize,
     out_features: usize,
 ) -> Result<(), String> {
@@ -294,7 +294,7 @@ fn reference_launch(
 }
 
 fn contiguous_region(
-    participant: &ferrum_interfaces::vnext::OperationInvocation<'_, ReferenceDeviceBuffer>,
+    participant: &ferrum_runtime::OperationInvocation<'_, ReferenceDeviceBuffer>,
     binding: &ResolvedValueBinding,
 ) -> Result<super::runtime::ReferenceBufferRegion, String> {
     let [component] = binding.storage().components() else {
@@ -325,7 +325,7 @@ fn contiguous_region(
 }
 
 fn contiguous_token_region(
-    participant: &ferrum_interfaces::vnext::OperationInvocation<'_, ReferenceDeviceBuffer>,
+    participant: &ferrum_runtime::OperationInvocation<'_, ReferenceDeviceBuffer>,
     binding: &ResolvedValueBinding,
     element_type: ElementType,
     token_start: u64,
@@ -380,7 +380,7 @@ fn contiguous_token_region(
 }
 
 fn contiguous_region_range(
-    participant: &ferrum_interfaces::vnext::OperationInvocation<'_, ReferenceDeviceBuffer>,
+    participant: &ferrum_runtime::OperationInvocation<'_, ReferenceDeviceBuffer>,
     binding: &ResolvedValueBinding,
     element_type: ElementType,
     logical_offset_bytes: u64,

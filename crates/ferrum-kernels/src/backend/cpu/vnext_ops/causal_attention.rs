@@ -1,7 +1,7 @@
 //! Causal attention over an admitted paged KV prefix. F16 query/KV and
 //! F32 softmax accumulation follow the operation's declared boundaries.
 
-use ferrum_interfaces::vnext::{
+use ferrum_runtime::{
     AttributeId, DynamicStorageAllocator, DynamicStorageProfile, DynamicStorageView, SemanticValue,
     VNextError,
 };

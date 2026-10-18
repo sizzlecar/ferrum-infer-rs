@@ -2,7 +2,7 @@ use super::*;
 use candle_core::quantized::gguf_file::{self, Value};
 use candle_core::quantized::{GgmlDType, QTensor};
 use candle_core::Tensor;
-use ferrum_interfaces::vnext::{ModelSourceKind, OriginalModelSource, OriginalModelSources};
+use ferrum_runtime::{ModelSourceKind, OriginalModelSource, OriginalModelSources};
 use std::io::Cursor;
 
 fn semantic(architecture: &str) -> serde_json::Value {

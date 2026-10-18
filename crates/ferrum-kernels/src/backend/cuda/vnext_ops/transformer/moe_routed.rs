@@ -3,7 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT;
-use ferrum_interfaces::vnext::{
+use ferrum_runtime::{
     routed_swiglu_moe_contract, AttributeId, BatchedOperationInvocation, CapabilityId,
     ContractVersion, DeviceBatchingForm, DeviceRuntime, DynamicStorageRequirement, ElementType,
     EncodedDeviceOperation, OperationContract, OperationFailure, OperationProvider,
@@ -153,7 +153,7 @@ impl CudaRoutedSwiGluMoeProvider {
                 .fingerprint()
                 .map_err(super::contract_error)?,
             provider_fingerprint,
-            ferrum_interfaces::vnext::ProviderExecutionSemantics::bitwise_eager_and_replay(),
+            ferrum_runtime::ProviderExecutionSemantics::bitwise_eager_and_replay(),
             contract.descriptor().version,
             runtime.descriptor().id.clone(),
             BTreeSet::from([capability]),

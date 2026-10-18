@@ -1,6 +1,6 @@
 use std::collections::BTreeSet;
 
-use ferrum_interfaces::vnext::*;
+use ferrum_runtime::*;
 
 use super::super::vnext_runtime::{
     CpuDeviceBuffer, CpuDeviceCommand, CpuDeviceRuntime, CpuRuntimeError,

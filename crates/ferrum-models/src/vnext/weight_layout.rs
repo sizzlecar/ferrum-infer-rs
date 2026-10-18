@@ -1,6 +1,6 @@
 //! Shared physical-to-logical weight layout compiler for model packages.
 
-use ferrum_interfaces::vnext::{
+use ferrum_runtime::{
     PhysicalStorageLayout, PhysicalWeightComponentBinding, PhysicalWeightLayout,
     PhysicalWeightPadding, VNextError, WeightId,
 };

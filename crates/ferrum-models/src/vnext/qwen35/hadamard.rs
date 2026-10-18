@@ -179,7 +179,7 @@ fn wrap_leaves(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ferrum_interfaces::vnext::{HadamardApplication, NumericalExecutionPolicy};
+    use ferrum_runtime::{HadamardApplication, NumericalExecutionPolicy};
 
     fn config() -> Qwen35FamilyConfig {
         let mut config = super::super::tests::test_dense_gguf_config();

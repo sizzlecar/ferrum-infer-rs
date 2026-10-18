@@ -1,5 +1,5 @@
 use super::*;
-use ferrum_interfaces::model_executor::{
+use ferrum_execution::model_executor::{
     GreedyRepetitionPenalty, LogitsReturnPolicy, TokenSelectionMask,
 };
 

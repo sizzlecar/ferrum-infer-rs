@@ -6,7 +6,7 @@
 use crate::kv_cache::MockKvCacheHandle;
 use crate::tensor::MockTensor;
 use async_trait::async_trait;
-use ferrum_interfaces::{
+use ferrum_execution::{
     model_executor::{
         AttentionType, DecodeInput, DecodeOutput, ExecutorCapabilities, ExecutorMemoryUsage,
         ExecutorState, ExecutorStatus, MemoryRequirements, PrefillInput, PrefillOutput,

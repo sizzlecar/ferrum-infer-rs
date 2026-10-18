@@ -13,8 +13,8 @@ use cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_
 use cudarc::driver::{CudaFunction, CudaStream, LaunchConfig, PushKernelArg};
 use cudarc::nvrtc::Ptx;
 #[cfg(feature = "vllm-marlin")]
-use ferrum_interfaces::vnext::PhysicalWeightLayout;
-use ferrum_interfaces::vnext::{
+use ferrum_runtime::PhysicalWeightLayout;
+use ferrum_runtime::{
     constant_scale_contract, dense_geglu_tanh_contract, dense_linear_contract,
     dense_swiglu_contract, logit_softcap_contract, AttributeId, BatchedOperationInvocation,
     CanonicalRational, CapabilityId, ContractVersion, DeviceBatchingForm, DeviceRuntime,
@@ -378,7 +378,7 @@ impl OperationProvider<CudaDeviceRuntime> for CudaDenseLinearProvider {
                     && binding.weight().is_some_and(|weight| {
                         !matches!(
                             weight.physical_layout(),
-                            ferrum_interfaces::vnext::PhysicalWeightLayout::Dense { .. }
+                            ferrum_runtime::PhysicalWeightLayout::Dense { .. }
                         )
                     })
             })
@@ -447,7 +447,7 @@ impl CudaMarlinFp8DenseLinearProvider {
                 .fingerprint()
                 .map_err(contract_error)?,
             provider_fingerprint,
-            ferrum_interfaces::vnext::ProviderExecutionSemantics::bitwise_eager_and_replay(),
+            ferrum_runtime::ProviderExecutionSemantics::bitwise_eager_and_replay(),
             contract.descriptor().version,
             runtime.descriptor().id.clone(),
             BTreeSet::from([operation_capability, marlin_capability]),
@@ -1335,7 +1335,7 @@ pub(super) fn provider_descriptor_with_formats(
             .fingerprint()
             .map_err(contract_error)?,
         provider_fingerprint,
-        ferrum_interfaces::vnext::ProviderExecutionSemantics::bitwise_eager_and_replay(),
+        ferrum_runtime::ProviderExecutionSemantics::bitwise_eager_and_replay(),
         contract.descriptor().version,
         runtime.descriptor().id.clone(),
         BTreeSet::from([capability]),
@@ -1399,7 +1399,7 @@ fn marlin_swiglu_provider_descriptor(
             .fingerprint()
             .map_err(contract_error)?,
         provider_fingerprint,
-        ferrum_interfaces::vnext::ProviderExecutionSemantics::bitwise_eager_and_replay(),
+        ferrum_runtime::ProviderExecutionSemantics::bitwise_eager_and_replay(),
         contract.descriptor().version,
         runtime.descriptor().id.clone(),
         BTreeSet::from([
@@ -1460,7 +1460,7 @@ fn marlin_geglu_provider_descriptor(
             .fingerprint()
             .map_err(contract_error)?,
         provider_fingerprint,
-        ferrum_interfaces::vnext::ProviderExecutionSemantics::bitwise_eager_and_replay(),
+        ferrum_runtime::ProviderExecutionSemantics::bitwise_eager_and_replay(),
         contract.descriptor().version,
         runtime.descriptor().id.clone(),
         BTreeSet::from([operation_capability, marlin_capability]),
@@ -2564,7 +2564,7 @@ mod gemma_simple_ops_tests {
         dense_geglu_projection_for_formats, dense_geglu_scratch_layout,
         logit_softcap_dimensions_match, DenseGeGluProjection,
     };
-    use ferrum_interfaces::vnext::QuantizationFormatId;
+    use ferrum_runtime::QuantizationFormatId;
     use std::collections::BTreeSet;
 
     #[test]
@@ -2644,7 +2644,7 @@ mod dense_geglu_marlin_tests {
         marlin_swiglu_scratch_layout, DenseGeGluProjection, MarlinProjectionRuntime,
         COMPRESSED_TENSORS_MARLIN_SYMMETRIC_QUANTIZATION_FORMAT_ID, VALUE_ALIGNMENT_BYTES,
     };
-    use ferrum_interfaces::vnext::QuantizationFormatId;
+    use ferrum_runtime::QuantizationFormatId;
     use std::collections::BTreeSet;
 
     fn formats(values: &[&str]) -> BTreeSet<QuantizationFormatId> {
@@ -2761,7 +2761,7 @@ mod dense_swiglu_marlin_tests {
         COMPRESSED_TENSORS_MARLIN_QUANTIZATION_FORMAT_ID,
         MARLIN_FP8_GROUP128_QUANTIZATION_FORMAT_ID, MARLIN_FP8_QUANTIZATION_FORMAT_ID,
     };
-    use ferrum_interfaces::vnext::{
+    use ferrum_runtime::{
         CompositeWeightPart, PhysicalWeightComponentBinding, PhysicalWeightPadding,
         QuantizationFormatId, WeightId,
     };
@@ -2930,7 +2930,7 @@ fn push_shared_compressed_tensors_weight(
             let weight = value.weight().ok_or_else(|| {
                 format!("compressed-tensors SwiGLU input {ordinal} has no weight layout")
             })?;
-            let ferrum_interfaces::vnext::PhysicalWeightLayout::Composite { parts } =
+            let ferrum_runtime::PhysicalWeightLayout::Composite { parts } =
                 weight.physical_layout()
             else {
                 return Err(format!(
@@ -4694,7 +4694,7 @@ fn invalid_plan(reason: impl Into<String>) -> VNextError {
 }
 
 fn provider_failure(
-    identity: ferrum_interfaces::vnext::ExecutionIdentityEnvelope,
+    identity: ferrum_runtime::ExecutionIdentityEnvelope,
     stage: &str,
     message: String,
 ) -> OperationFailure {

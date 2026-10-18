@@ -4,7 +4,7 @@
 
 use std::sync::Mutex;
 
-use ferrum_interfaces::vnext::DeviceProgramBindingUploadSnapshot;
+use ferrum_runtime::DeviceProgramBindingUploadSnapshot;
 
 #[derive(Default)]
 pub(crate) struct ProgramBindingUploadCounters(Mutex<DeviceProgramBindingUploadSnapshot>);

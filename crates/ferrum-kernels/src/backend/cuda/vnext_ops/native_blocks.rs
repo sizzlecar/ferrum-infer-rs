@@ -81,11 +81,11 @@ impl CudaNativeBlockKernels {
         part: &weights::MatrixPart,
         rows: u32,
         output_stride: u32,
-        activation: ferrum_interfaces::vnext::ElementType,
+        activation: ferrum_runtime::ElementType,
         signs: u64,
         scratch: u64,
     ) -> Result<(), CudaDeviceRuntimeError> {
-        use ferrum_interfaces::vnext::{ElementType, HadamardApplication};
+        use ferrum_runtime::{ElementType, HadamardApplication};
         let (input, input_type) = if let Some(spec) = &part.transform {
             if !matches!(spec.application, HadamardApplication::BeforeMatmul { .. }) || scratch == 0
             {
@@ -130,11 +130,11 @@ impl CudaNativeBlockKernels {
         output: u64,
         part: &weights::MatrixPart,
         count: u32,
-        activation: ferrum_interfaces::vnext::ElementType,
+        activation: ferrum_runtime::ElementType,
         signs: u64,
         scratch: u64,
     ) -> Result<(), CudaDeviceRuntimeError> {
-        use ferrum_interfaces::vnext::{ElementType, HadamardApplication};
+        use ferrum_runtime::{ElementType, HadamardApplication};
         if let Some(spec) = &part.transform {
             if !matches!(spec.application, HadamardApplication::AfterEmbeddingLookup)
                 || scratch == 0
@@ -232,9 +232,9 @@ impl CudaNativeBlockKernels {
         output: u64,
         part: &weights::MatrixPart,
         count: u32,
-        activation: ferrum_interfaces::vnext::ElementType,
+        activation: ferrum_runtime::ElementType,
     ) -> Result<(), CudaDeviceRuntimeError> {
-        use ferrum_interfaces::vnext::ElementType;
+        use ferrum_runtime::ElementType;
         let elements = embedding_elements(part, count)?;
         let function = match activation {
             ElementType::F16 => &self.embedding_f16,
@@ -268,7 +268,7 @@ impl CudaNativeBlockKernels {
         part: &weights::MatrixPart,
         rows: u32,
         output_stride: u32,
-        activation: ferrum_interfaces::vnext::ElementType,
+        activation: ferrum_runtime::ElementType,
     ) -> Result<(), CudaDeviceRuntimeError> {
         self.linear_with_precision(
             stream,
@@ -293,10 +293,10 @@ impl CudaNativeBlockKernels {
         part: &weights::MatrixPart,
         rows: u32,
         output_stride: u32,
-        input_type: ferrum_interfaces::vnext::ElementType,
-        output_type: ferrum_interfaces::vnext::ElementType,
+        input_type: ferrum_runtime::ElementType,
+        output_type: ferrum_runtime::ElementType,
     ) -> Result<(), CudaDeviceRuntimeError> {
-        use ferrum_interfaces::vnext::ElementType;
+        use ferrum_runtime::ElementType;
         if rows == 0
             || rows > u16::MAX as u32
             || part

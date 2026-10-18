@@ -6,7 +6,7 @@ use std::num::{NonZeroU64, NonZeroUsize};
 use std::path::Path;
 use std::sync::Arc;
 
-use ferrum_interfaces::vnext::{
+use ferrum_runtime::{
     AttributeId, ElementType, ExternalModelMetadataId, ModelFamilyRegistration,
     ModelFamilyRegistry, ModelSourceKind, OriginalModelSource, OriginalModelSources,
     PreparedModelFamily, ProgramNode, SemanticValue, StateCapacityDemand, StateLifetime,
@@ -441,7 +441,7 @@ impl PreparedProductionModel {
         &self,
         requested_model: impl Into<String>,
         resolved_model: impl Into<String>,
-    ) -> ferrum_types::Result<ferrum_interfaces::vnext::ProductModelSourceIdentity> {
+    ) -> ferrum_types::Result<ferrum_runtime::ProductModelSourceIdentity> {
         let template = &self.family.metadata().template;
         self.sources.product_source_identity(
             requested_model,

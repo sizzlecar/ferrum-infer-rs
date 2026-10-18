@@ -1,0 +1,493 @@
+//! Local projection arithmetic inside an otherwise unchanged strict operation.
+//!
+//! These are declarations, not provider registrations or evidence that a leaf
+//! was executed. Schema 1 binds SwiGLU and gated-delta projection ports;
+//! schema 2 binds the F32-master causal attention projection ports.
+//! Nonlinearities, normalization, recurrent state, residuals
+//! and conversions outside those ports retain the referenced base semantics.
+
+use std::collections::BTreeSet;
+
+use serde::{Deserialize, Serialize};
+
+use super::{AffineMinCorrection, NumericalArithmeticStage, StagedNumericalArithmetic};
+use crate::{
+    causal_paged_attention_f32_master_contract, dense_swiglu_contract,
+    gated_delta_recurrent_attention_f32_master_contract, BlockQuantizationSpec, ContractVersion,
+    ElementType, OperationContract, OperationId, StandardOperationContract,
+    CAUSAL_PAGED_ATTENTION_F32_MASTER_OPERATION_ID, DENSE_SWIGLU_OPERATION_ID,
+    GATED_DELTA_RECURRENT_ATTENTION_F32_MASTER_OPERATION_ID,
+};
+
+pub const COMPOSITE_NUMERICAL_ARITHMETIC_SCHEMA_VERSION: u32 = 1;
+/// A separate version for causal projection roles; schema 1 retains its
+/// original set of accepted bases and ports.
+pub const COMPOSITE_NUMERICAL_ARITHMETIC_SCHEMA_VERSION_V2: u32 = 2;
+/// Explicit per-wave upstream routes; old composite schemas do not accept them.
+pub const COMPOSITE_NUMERICAL_ARITHMETIC_SCHEMA_VERSION_UPSTREAM: u32 = 3;
+pub const COMPOSITE_NUMERICAL_ARITHMETIC_SCHEMA_VERSION_G32_MMQ: u32 = 4;
+/// Separate upstream extra-format ABIs; legacy schemas retain their closed set.
+pub const COMPOSITE_NUMERICAL_ARITHMETIC_SCHEMA_VERSION_UPSTREAM_EXTRA: u32 = 5;
+/// Six-format upstream with explicitly qualified extra-format MMQ prefill.
+/// Schema 6 is reserved for the independent k8 hybrid candidate.
+pub const COMPOSITE_NUMERICAL_ARITHMETIC_SCHEMA_VERSION_UPSTREAM_EXTRA_PREFILL: u32 = 7;
+/// Additional Q6 F16 leaves; all inherited leaves retain their own schemas.
+pub const COMPOSITE_NUMERICAL_ARITHMETIC_SCHEMA_VERSION_UPSTREAM_Q6_F16: u32 = 9;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StrictNumericalOperation {
+    pub operation_id: OperationId,
+    pub version: ContractVersion,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProjectionRole {
+    SwiGluGateUp,
+    SwiGluDown,
+    GatedDeltaInput,
+    GatedDeltaOutput,
+    CausalQuery,
+    CausalKey,
+    CausalValue,
+    CausalOutput,
+}
+
+/// Logical K/N eligibility is independent of token count, concurrency, device
+/// and provider. Numerical policy cannot silently switch with batch size.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProjectionShapeEligibility {
+    pub minimum_input_features: u64,
+    pub minimum_output_features: u64,
+    pub input_features_multiple: u32,
+}
+
+/// Exact opaque block ABIs, not a container name or a generic INT4 label.
+/// Schema 1 only declares untransformed weights in these formats. Any other
+/// valid format or transformed weight retains the strict base arithmetic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProjectionBlockFormat {
+    Q4K,
+    Q5K,
+    Iq4Xs,
+    Q3K,
+    Iq3S,
+    Iq4Nl,
+    Q6K,
+}
+
+impl ProjectionBlockFormat {
+    pub const fn is_extra(self) -> bool {
+        matches!(self, Self::Q3K | Self::Iq3S | Self::Iq4Nl)
+    }
+    pub(super) fn abi(self) -> (&'static str, u32, u32) {
+        match self {
+            Self::Q4K => ("quantization.gguf.q4-k", 256, 144),
+            Self::Q5K => ("quantization.gguf.q5-k", 256, 176),
+            Self::Iq4Xs => ("quantization.gguf.iq4-xs", 256, 136),
+            Self::Q3K => ("quantization.gguf.q3-k", 256, 110),
+            Self::Iq3S => ("quantization.gguf.iq3-s", 256, 110),
+            Self::Iq4Nl => ("quantization.gguf.iq4-nl", 32, 18),
+            Self::Q6K => ("quantization.gguf.q6-k", 256, 210),
+        }
+    }
+
+    fn matches(self, block: &BlockQuantizationSpec) -> bool {
+        let (id, values, bytes) = self.abi();
+        block.format_id.as_str() == id
+            && block.logical_values_per_block == values
+            && block.bytes_per_block == bytes
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct QuantizedProjectionLeafContract {
+    pub format: ProjectionBlockFormat,
+    pub shape: ProjectionShapeEligibility,
+    pub arithmetic: StagedNumericalArithmetic,
+}
+
+/// An explicit fallback is required even when all currently observed weights
+/// qualify. It is part of the fingerprint, not a provider's private heuristic.
+/// Only declared ineligibility permits this fallback. Missing support for an
+/// eligible staged leaf is a qualification failure, not permission to change
+/// its arithmetic. The strict base itself still needs a qualified provider.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum StrictProjectionFallback {
+    RetainBaseArithmetic {},
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProjectionArithmeticOverride {
+    pub role: ProjectionRole,
+    /// Ordinal in the referenced standard operation's input signature.
+    pub weight_input_ordinal: u32,
+    /// Internal projection ports, not necessarily the fused operation's ports.
+    pub activation_input_type: ElementType,
+    pub activation_output_type: ElementType,
+    pub leaves: Vec<QuantizedProjectionLeafContract>,
+    pub fallback: StrictProjectionFallback,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CompositeNumericalArithmetic {
+    pub schema_version: u32,
+    pub strict_base: StrictNumericalOperation,
+    /// Roles omitted here keep their base arithmetic, as does all non-projection
+    /// work. A packed weight's physical matrix parts are evaluated separately.
+    pub projections: Vec<ProjectionArithmeticOverride>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StrictProjectionReason {
+    UnmodifiedProjection,
+    TransformedWeight,
+    FormatNotDeclared,
+    ShapeNotDeclared,
+}
+
+/// The contract's answer for supplied static facts. This does not resolve a
+/// provider, inspect real weights, or attest that an execution used these stages.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DeclaredProjectionArithmetic<'a> {
+    Staged(&'a StagedNumericalArithmetic),
+    StrictBase(StrictProjectionReason),
+}
+
+impl CompositeNumericalArithmetic {
+    pub(super) fn base_contract(&self) -> Result<StandardOperationContract, String> {
+        let contract = match (self.schema_version, self.strict_base.operation_id.as_str()) {
+            (
+                COMPOSITE_NUMERICAL_ARITHMETIC_SCHEMA_VERSION_UPSTREAM
+                | COMPOSITE_NUMERICAL_ARITHMETIC_SCHEMA_VERSION_UPSTREAM_EXTRA
+                | COMPOSITE_NUMERICAL_ARITHMETIC_SCHEMA_VERSION_UPSTREAM_EXTRA_PREFILL
+                | COMPOSITE_NUMERICAL_ARITHMETIC_SCHEMA_VERSION_UPSTREAM_Q6_F16
+                | COMPOSITE_NUMERICAL_ARITHMETIC_SCHEMA_VERSION_G32_MMQ,
+                DENSE_SWIGLU_OPERATION_ID,
+            ) => dense_swiglu_contract(),
+            (
+                COMPOSITE_NUMERICAL_ARITHMETIC_SCHEMA_VERSION_UPSTREAM
+                | COMPOSITE_NUMERICAL_ARITHMETIC_SCHEMA_VERSION_UPSTREAM_EXTRA
+                | COMPOSITE_NUMERICAL_ARITHMETIC_SCHEMA_VERSION_UPSTREAM_EXTRA_PREFILL
+                | COMPOSITE_NUMERICAL_ARITHMETIC_SCHEMA_VERSION_UPSTREAM_Q6_F16
+                | COMPOSITE_NUMERICAL_ARITHMETIC_SCHEMA_VERSION_G32_MMQ,
+                GATED_DELTA_RECURRENT_ATTENTION_F32_MASTER_OPERATION_ID,
+            ) => gated_delta_recurrent_attention_f32_master_contract(),
+            (
+                COMPOSITE_NUMERICAL_ARITHMETIC_SCHEMA_VERSION_UPSTREAM
+                | COMPOSITE_NUMERICAL_ARITHMETIC_SCHEMA_VERSION_UPSTREAM_EXTRA
+                | COMPOSITE_NUMERICAL_ARITHMETIC_SCHEMA_VERSION_UPSTREAM_EXTRA_PREFILL
+                | COMPOSITE_NUMERICAL_ARITHMETIC_SCHEMA_VERSION_UPSTREAM_Q6_F16
+                | COMPOSITE_NUMERICAL_ARITHMETIC_SCHEMA_VERSION_G32_MMQ,
+                CAUSAL_PAGED_ATTENTION_F32_MASTER_OPERATION_ID,
+            ) => causal_paged_attention_f32_master_contract(),
+            (COMPOSITE_NUMERICAL_ARITHMETIC_SCHEMA_VERSION, DENSE_SWIGLU_OPERATION_ID) => {
+                dense_swiglu_contract()
+            }
+            (
+                COMPOSITE_NUMERICAL_ARITHMETIC_SCHEMA_VERSION,
+                GATED_DELTA_RECURRENT_ATTENTION_F32_MASTER_OPERATION_ID,
+            ) => gated_delta_recurrent_attention_f32_master_contract(),
+            (
+                COMPOSITE_NUMERICAL_ARITHMETIC_SCHEMA_VERSION_V2,
+                CAUSAL_PAGED_ATTENTION_F32_MASTER_OPERATION_ID,
+            ) => causal_paged_attention_f32_master_contract(),
+            _ => return Err("composite schema requires its supported standard strict base".into()),
+        }
+        .map_err(|error| error.to_string())?;
+        if contract.descriptor().version != self.strict_base.version {
+            return Err(
+                "composite strict base must match the exact standard operation version".into(),
+            );
+        }
+        Ok(contract)
+    }
+
+    fn role_port(&self, role: ProjectionRole) -> Result<(u32, usize), String> {
+        match (self.strict_base.operation_id.as_str(), role) {
+            (DENSE_SWIGLU_OPERATION_ID, ProjectionRole::SwiGluGateUp) => Ok((1, 3)),
+            (DENSE_SWIGLU_OPERATION_ID, ProjectionRole::SwiGluDown) => Ok((2, 2)),
+            (
+                GATED_DELTA_RECURRENT_ATTENTION_F32_MASTER_OPERATION_ID,
+                ProjectionRole::GatedDeltaInput,
+            ) => Ok((2, 2)),
+            (
+                GATED_DELTA_RECURRENT_ATTENTION_F32_MASTER_OPERATION_ID,
+                ProjectionRole::GatedDeltaOutput,
+            ) => Ok((7, 2)),
+            (CAUSAL_PAGED_ATTENTION_F32_MASTER_OPERATION_ID, ProjectionRole::CausalQuery) => {
+                Ok((2, 2))
+            }
+            (CAUSAL_PAGED_ATTENTION_F32_MASTER_OPERATION_ID, ProjectionRole::CausalKey) => {
+                Ok((3, 2))
+            }
+            (CAUSAL_PAGED_ATTENTION_F32_MASTER_OPERATION_ID, ProjectionRole::CausalValue) => {
+                Ok((4, 2))
+            }
+            (CAUSAL_PAGED_ATTENTION_F32_MASTER_OPERATION_ID, ProjectionRole::CausalOutput) => {
+                Ok((5, 2))
+            }
+            _ => Err("projection role does not belong to the declared strict base".into()),
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        if !matches!(
+            self.schema_version,
+            COMPOSITE_NUMERICAL_ARITHMETIC_SCHEMA_VERSION
+                | COMPOSITE_NUMERICAL_ARITHMETIC_SCHEMA_VERSION_V2
+                | COMPOSITE_NUMERICAL_ARITHMETIC_SCHEMA_VERSION_UPSTREAM
+                | COMPOSITE_NUMERICAL_ARITHMETIC_SCHEMA_VERSION_G32_MMQ
+                | COMPOSITE_NUMERICAL_ARITHMETIC_SCHEMA_VERSION_UPSTREAM_EXTRA
+                | COMPOSITE_NUMERICAL_ARITHMETIC_SCHEMA_VERSION_UPSTREAM_EXTRA_PREFILL
+                | COMPOSITE_NUMERICAL_ARITHMETIC_SCHEMA_VERSION_UPSTREAM_Q6_F16
+        ) {
+            return Err(
+                "unsupported composite arithmetic schema version; explicit migration required"
+                    .into(),
+            );
+        }
+        let base = self.base_contract()?;
+        if self.projections.is_empty() {
+            return Err(
+                "composite arithmetic must declare at least one projection override".into(),
+            );
+        }
+        let mut roles = BTreeSet::new();
+        let mut slots = BTreeSet::new();
+        let mut has_q6_f16 = false;
+        for projection in &self.projections {
+            let (slot, rank) = self.role_port(projection.role)?;
+            if !roles.insert(projection.role) || !slots.insert(projection.weight_input_ordinal) {
+                return Err("projection roles and weight input ordinals must be unique".into());
+            }
+            let weight = base
+                .descriptor()
+                .inputs
+                .get(slot as usize)
+                .ok_or("standard base is missing the declared projection weight port")?;
+            if projection.weight_input_ordinal != slot
+                || weight.dimensions().len() != rank
+                || weight.element_types() != &BTreeSet::from([ElementType::F16])
+            {
+                return Err(
+                    "projection weight input ordinal disagrees with the standard base signature"
+                        .into(),
+                );
+            }
+            // Every supported base rounds both internal linear boundaries to
+            // F16. Attention's surrounding hidden/state path remains F32.
+            if projection.activation_input_type != ElementType::F16
+                || projection.activation_output_type != ElementType::F16
+                || projection.leaves.is_empty()
+            {
+                return Err(
+                    "projection overrides require F16 internal ports and nonempty leaves".into(),
+                );
+            }
+            let mut formats = BTreeSet::new();
+            for leaf in &projection.leaves {
+                if leaf.format == ProjectionBlockFormat::Q6K {
+                    if self.schema_version
+                        != COMPOSITE_NUMERICAL_ARITHMETIC_SCHEMA_VERSION_UPSTREAM_Q6_F16
+                        || leaf.arithmetic.schema_version
+                            != super::NUMERICAL_ARITHMETIC_SCHEMA_VERSION_UPSTREAM_Q6_F16
+                    {
+                        return Err(
+                            "Q6 F16 leaf requires its independent composite/staged schemas".into(),
+                        );
+                    }
+                    has_q6_f16 = true;
+                }
+                if leaf.format.is_extra()
+                    && !matches!(
+                        self.schema_version,
+                        COMPOSITE_NUMERICAL_ARITHMETIC_SCHEMA_VERSION_UPSTREAM_EXTRA
+                            | COMPOSITE_NUMERICAL_ARITHMETIC_SCHEMA_VERSION_UPSTREAM_EXTRA_PREFILL
+                            | COMPOSITE_NUMERICAL_ARITHMETIC_SCHEMA_VERSION_UPSTREAM_Q6_F16
+                    )
+                {
+                    return Err(
+                        "extra weight formats require the separate upstream-extra schema".into(),
+                    );
+                }
+                if !formats.insert(leaf.format) {
+                    return Err(
+                        "a projection cannot declare competing leaves for the same block format"
+                            .into(),
+                    );
+                }
+                leaf.arithmetic.validate()?;
+                if self.schema_version == COMPOSITE_NUMERICAL_ARITHMETIC_SCHEMA_VERSION_G32_MMQ {
+                    let policy = leaf
+                        .arithmetic
+                        .g32_mmq_policy()
+                        .ok_or("hybrid composite requires its closed hybrid leaf arithmetic")?;
+                    if policy.format != leaf.format
+                        || leaf.shape.minimum_input_features != 256
+                        || leaf.shape.minimum_output_features != 1
+                        || leaf.shape.input_features_multiple != 256
+                    {
+                        return Err(
+                            "hybrid leaf format/shape differs from the exact G32/MMQ contract"
+                                .into(),
+                        );
+                    }
+                    continue;
+                }
+                if matches!(
+                    self.schema_version,
+                    COMPOSITE_NUMERICAL_ARITHMETIC_SCHEMA_VERSION_UPSTREAM
+                        | COMPOSITE_NUMERICAL_ARITHMETIC_SCHEMA_VERSION_UPSTREAM_EXTRA
+                        | COMPOSITE_NUMERICAL_ARITHMETIC_SCHEMA_VERSION_UPSTREAM_EXTRA_PREFILL
+                        | COMPOSITE_NUMERICAL_ARITHMETIC_SCHEMA_VERSION_UPSTREAM_Q6_F16
+                ) {
+                    let [NumericalArithmeticStage::UpstreamProjection { policy }] =
+                        leaf.arithmetic.stages.as_slice()
+                    else {
+                        return Err("upstream composite leaves require upstream arithmetic".into());
+                    };
+                    if leaf.format.is_extra()
+                        && (leaf.arithmetic.schema_version
+                            == super::NUMERICAL_ARITHMETIC_SCHEMA_VERSION_UPSTREAM_EXTRA_PREFILL)
+                            != matches!(
+                                self.schema_version,
+                                COMPOSITE_NUMERICAL_ARITHMETIC_SCHEMA_VERSION_UPSTREAM_EXTRA_PREFILL
+                                    | COMPOSITE_NUMERICAL_ARITHMETIC_SCHEMA_VERSION_UPSTREAM_Q6_F16
+                            )
+                    {
+                        return Err(
+                            "extra prefill leaf requires its separate composite schema".into()
+                        );
+                    }
+                    if policy.format != leaf.format
+                        || leaf.shape.minimum_input_features == 0
+                        || leaf.shape.minimum_output_features == 0
+                        || leaf.shape.input_features_multiple == 0
+                        || leaf.shape.input_features_multiple % leaf.format.abi().1 != 0
+                        || (leaf.format.is_extra()
+                            && (leaf.shape.minimum_input_features < 256
+                                || leaf.shape.input_features_multiple % 256 != 0))
+                    {
+                        return Err("upstream leaf format or complete-block shape differs from its projection".into());
+                    }
+                    continue;
+                }
+                if leaf.arithmetic.schema_version != super::NUMERICAL_ARITHMETIC_SCHEMA_VERSION {
+                    return Err("legacy composite schemas require legacy staged arithmetic".into());
+                }
+                let NumericalArithmeticStage::IntegerDot {
+                    values_per_partial, ..
+                } = &leaf.arithmetic.stages[1]
+                else {
+                    unreachable!("validated staged schema")
+                };
+                // All supported ABIs change scale (and Q4_K/Q5_K minimum) every
+                // 32 values. One integer partial cannot cross coefficients
+                // before its single rescale/min-correction stage.
+                if *values_per_partial > 32 || 32 % *values_per_partial != 0 {
+                    return Err("projection integer partials must divide each 32-value weight coefficient group".into());
+                }
+                let NumericalArithmeticStage::ActivationQuantization {
+                    input_type,
+                    group_values,
+                    ..
+                } = &leaf.arithmetic.stages[0]
+                else {
+                    unreachable!("validated staged schema")
+                };
+                if *input_type != projection.activation_input_type
+                    || leaf.arithmetic.output_type() != Some(projection.activation_output_type)
+                {
+                    return Err(
+                        "leaf quantization/store dtype differs from its internal projection ports"
+                            .into(),
+                    );
+                }
+                let multiple = leaf.shape.input_features_multiple;
+                if leaf.shape.minimum_input_features == 0
+                    || leaf.shape.minimum_output_features == 0
+                    || multiple == 0
+                    || multiple % leaf.format.abi().1 != 0
+                    || multiple % *group_values != 0
+                {
+                    return Err("projection shape must declare positive extents and complete weight/activation groups".into());
+                }
+                let NumericalArithmeticStage::Rescale { min_correction, .. } =
+                    &leaf.arithmetic.stages[2]
+                else {
+                    unreachable!("validated staged schema")
+                };
+                let valid_min = matches!(
+                    (leaf.format, min_correction),
+                    (
+                        ProjectionBlockFormat::Q4K | ProjectionBlockFormat::Q5K,
+                        AffineMinCorrection::QuantizedPartialSum { .. }
+                    ) | (ProjectionBlockFormat::Iq4Xs, AffineMinCorrection::None {})
+                );
+                if !valid_min {
+                    return Err(
+                        "leaf affine minimum policy disagrees with its declared block format"
+                            .into(),
+                    );
+                }
+            }
+        }
+        if self.schema_version == COMPOSITE_NUMERICAL_ARITHMETIC_SCHEMA_VERSION_UPSTREAM_Q6_F16
+            && !has_q6_f16
+        {
+            return Err("Q6 F16 composite requires an explicit Q6 F16 leaf".into());
+        }
+        Ok(())
+    }
+
+    /// Evaluate only declared eligibility. `input_features`/`output_features`
+    /// describe one physical matrix part, including parts of packed weights.
+    /// No token-count heuristic or implicit dense/dequantized conversion exists.
+    pub fn declared_projection_arithmetic(
+        &self,
+        role: ProjectionRole,
+        block: Option<&BlockQuantizationSpec>,
+        input_features: u64,
+        output_features: u64,
+        has_weight_transform: bool,
+    ) -> Result<DeclaredProjectionArithmetic<'_>, String> {
+        self.validate()?;
+        self.role_port(role)?;
+        if input_features == 0 || output_features == 0 {
+            return Err("projection facts must describe a nonempty matrix".into());
+        }
+        if let Some(block) = block {
+            block.validate().map_err(|error| error.to_string())?;
+        }
+        let strict = DeclaredProjectionArithmetic::StrictBase;
+        let Some(projection) = self.projections.iter().find(|p| p.role == role) else {
+            return Ok(strict(StrictProjectionReason::UnmodifiedProjection));
+        };
+        if has_weight_transform {
+            return Ok(strict(StrictProjectionReason::TransformedWeight));
+        }
+        let Some(leaf) = projection
+            .leaves
+            .iter()
+            .find(|leaf| block.is_some_and(|b| leaf.format.matches(b)))
+        else {
+            return Ok(strict(StrictProjectionReason::FormatNotDeclared));
+        };
+        if input_features < leaf.shape.minimum_input_features
+            || output_features < leaf.shape.minimum_output_features
+            || input_features % u64::from(leaf.shape.input_features_multiple) != 0
+        {
+            return Ok(strict(StrictProjectionReason::ShapeNotDeclared));
+        }
+        Ok(DeclaredProjectionArithmetic::Staged(&leaf.arithmetic))
+    }
+}

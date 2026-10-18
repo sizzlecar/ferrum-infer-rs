@@ -1,5 +1,5 @@
 use super::*;
-use ferrum_interfaces::vnext::TokenSpanWork;
+use ferrum_runtime::TokenSpanWork;
 
 fn response(probabilities: &[f64]) -> Value {
     json!({"truncated":false,"tokens_evaluated":3,"tokens_predicted":1,

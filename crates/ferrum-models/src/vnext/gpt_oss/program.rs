@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use ferrum_interfaces::vnext::{
+use ferrum_runtime::{
     AttributeId, CanonicalRational, ContractVersion, ElementType, FamilyNumericalProfiles,
     ModelFamilyId, ModelProgram, NodeId, NumericalExecutionProfile, OperationId, ProgramBlock,
     ProgramNode, ProgramNodeWorkSpec, ProgramTensorSpec, ProgramValueId, ResolvedTensorLayout,
@@ -355,7 +355,7 @@ fn attribute(
 
 #[cfg(test)]
 mod tests {
-    use ferrum_interfaces::vnext::{
+    use ferrum_runtime::{
         AttributeId, ModelFamilyId, SemanticValue, GPT_OSS_CAUSAL_PAGED_ATTENTION_OPERATION_ID,
         GPT_OSS_ROUTED_CLAMPED_SWIGLU_MOE_OPERATION_ID,
     };

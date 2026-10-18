@@ -319,15 +319,15 @@ mod cuda {
     use ferrum_engine::vnext_determinism::{
         create_cuda_vnext_determinism_collector, CudaVNextDeterminismCollector,
     };
-    use ferrum_interfaces::vnext::{
+    use ferrum_models::vnext::{
+        open_registered_colocated_safetensors, resolve_registered_model_from_sources,
+        DefinedProductionModel,
+    };
+    use ferrum_runtime::{
         CapabilityCatalog, ContractVersion, ExecutionDeterminismEvidenceDenominator,
         ExecutionDeterminismProviderCoverage, ProviderReplayEquivalence, ResolvedModelPlan,
         SubmissionWaveDeterminismArtifactExecution, SubmissionWaveDeterminismArtifactWitness,
         VNextError,
-    };
-    use ferrum_models::vnext::{
-        open_registered_colocated_safetensors, resolve_registered_model_from_sources,
-        DefinedProductionModel,
     };
     use ferrum_types::{Device, EngineConfig, ModelId};
     use serde::{Deserialize, Serialize};
@@ -457,7 +457,7 @@ mod cuda {
         initial_state_kind: &'a str,
         workspace_poison: &'a str,
         initialization_identity:
-            &'a ferrum_interfaces::vnext::SubmissionWaveDeterminismArtifactInitializationIdentity,
+            &'a ferrum_runtime::SubmissionWaveDeterminismArtifactInitializationIdentity,
         execution_count: usize,
         comparison_count: usize,
         canonical_witness_count: usize,

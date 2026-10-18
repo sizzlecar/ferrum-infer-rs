@@ -1,13 +1,13 @@
-use ferrum_interfaces::vnext::{
+use ferrum_quantization::gguf::ferrum_to_gguf_with_arch;
+use ferrum_quantization::{
+    GgufWeightComponentSource, SafetensorsArchive, GPTQ_MARLIN_INT4_FORMAT_ID,
+};
+use ferrum_runtime::{
     BlockQuantizationSpec, CompositeWeightPart, ContractVersion, ElementType,
     PhysicalWeightComponentBinding, PhysicalWeightLayout, PhysicalWeightPadding, ProgramValueId,
     QuantizationFormatId, QuantizationGrouping, QuantizationPacking, QuantizationSpec, VNextError,
     WeightComponentRole, WeightComponentSpec, WeightEncoding, WeightFormatId, WeightId,
     WeightLayoutId, WeightSchema, WeightTensorSpec,
-};
-use ferrum_quantization::gguf::ferrum_to_gguf_with_arch;
-use ferrum_quantization::{
-    GgufWeightComponentSource, SafetensorsArchive, GPTQ_MARLIN_INT4_FORMAT_ID,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -1422,9 +1422,7 @@ fn hash_header(hasher: &mut Sha256, name: &str, element_type: ElementType, dimen
 mod tests {
     use std::collections::{BTreeMap, BTreeSet};
 
-    use ferrum_interfaces::vnext::{
-        CanonicalRational, ModelFamilyId, ROUTED_SWIGLU_MOE_OPERATION_ID,
-    };
+    use ferrum_runtime::{CanonicalRational, ModelFamilyId, ROUTED_SWIGLU_MOE_OPERATION_ID};
     use half::f16;
     use safetensors::tensor::{serialize_to_file, Dtype, TensorView};
 
@@ -1951,7 +1949,7 @@ mod tests {
 
     fn assert_product_preparation(quantized_router: bool) {
         use crate::vnext::{resolve_registered_model_from_sources, ProductionModelSourceBundle};
-        use ferrum_interfaces::vnext::ModelArtifactSourceRole;
+        use ferrum_runtime::ModelArtifactSourceRole;
         use std::{fs, sync::Arc};
         let mut semantic = fixture_semantics();
         let routers = if quantized_router {
@@ -2070,19 +2068,18 @@ mod tests {
             .iter()
             .flat_map(|block| &block.nodes)
             .find(|node| {
-                node.operation_id.as_str()
-                    == ferrum_interfaces::vnext::LAST_TOKEN_MASKED_ARGMAX_OPERATION_ID
+                node.operation_id.as_str() == ferrum_runtime::LAST_TOKEN_MASKED_ARGMAX_OPERATION_ID
             })
             .expect("fixture program must contain typed greedy selection");
         assert_eq!(
             greedy.required_version,
-            ferrum_interfaces::vnext::ContractVersion::new(3, 0)
+            ferrum_runtime::ContractVersion::new(3, 0)
         );
         assert_eq!(
             greedy
                 .inputs
                 .iter()
-                .map(ferrum_interfaces::vnext::ProgramValueId::as_str)
+                .map(ferrum_runtime::ProgramValueId::as_str)
                 .collect::<Vec<_>>(),
             [
                 "value.output.logits",
@@ -2096,7 +2093,7 @@ mod tests {
             program
                 .outputs()
                 .iter()
-                .map(ferrum_interfaces::vnext::ProgramValueId::as_str)
+                .map(ferrum_runtime::ProgramValueId::as_str)
                 .collect::<Vec<_>>(),
             ["value.output.logits", "value.output.greedy_token"]
         );
