@@ -2,11 +2,10 @@
 
 use super::*;
 use ferrum_execution::model_executor::{
-    ExecutorPrefillAdmission, ExecutorPrefillAdmissionDecision, ExecutorPrefillMaintenanceOutcome,
-    ExecutorSamplingOutput, PlanRuntimeBatchDecodeOutcome, PlanRuntimeDecodeInput,
-    PlanRuntimeDecodeOutput, PlanRuntimeMixedBatchOutcome, PlanRuntimePrefillCompletion,
-    PlanRuntimePrefillInput, PlanRuntimePrefillOutcome, PlanRuntimePrefillProduct, PrefillChunk,
+    ExecutorPrefillAdmission, ExecutorPrefillMaintenanceOutcome, ExecutorSamplingOutput,
+    LogitsReturnPolicy, PrefillChunk,
 };
+use ferrum_execution::token_execution::*;
 use ferrum_kernels::backend::cpu::vnext_ops::CpuVNextComposition;
 use ferrum_kernels::backend::cpu::vnext_runtime::CpuDeviceRuntime;
 use ferrum_models::VNextModelExecutor;
@@ -55,23 +54,29 @@ impl CpuFixture {
         }
     }
 
-    fn admit(&self, input: &PlanRuntimePrefillInput) {
-        loop {
-            let admission = ExecutorPrefillAdmission::for_product_request(
-                &input.request_id,
-                &input.input_tokens,
-                input.maximum_sequence_tokens,
-                input.input_tokens.len(),
+    async fn admit(&self, tokens: &[u32]) -> ExecutionFrontier {
+        let request_id = RequestId::new();
+        let tokens: Vec<_> = tokens.iter().copied().map(TokenId::new).collect();
+        let input = ExecutionAdmission {
+            context: ExecutorPrefillAdmission::for_product_request(
+                &request_id,
+                &tokens,
+                16,
+                tokens.len(),
                 0,
             )
-            .unwrap();
-            match self.executor.try_admit_prefill(admission).unwrap() {
-                ExecutorPrefillAdmissionDecision::Admitted(_) => return,
-                ExecutorPrefillAdmissionDecision::MaintenanceDeferred(_) => {
+            .unwrap(),
+            adapter: None,
+        };
+        loop {
+            match self.executor.admit_tokens(input).await.unwrap() {
+                TokenAdmissionOutcome::Admitted(frontier) => {
+                    assert_eq!(frontier.consumed_tokens(), 0);
+                    return frontier;
+                }
+                TokenAdmissionOutcome::MaintenanceDeferred(_) => {
                     assert!(matches!(
-                        self.executor
-                            .maintain_prefill_backing(&input.request_id)
-                            .unwrap(),
+                        self.executor.maintain_prefill_backing(&request_id).unwrap(),
                         ExecutorPrefillMaintenanceOutcome::Maintained { .. }
                             | ExecutorPrefillMaintenanceOutcome::RetryAdmission { .. }
                     ));
@@ -81,29 +86,66 @@ impl CpuFixture {
         }
     }
 
-    async fn prefill(&self, input: &PlanRuntimePrefillInput) -> PlanRuntimePrefillCompletion {
-        match self
-            .executor
-            .plan_runtime_prefill_with_capacity(input)
-            .await
-            .unwrap()
-        {
-            PlanRuntimePrefillOutcome::Completed(output) => output,
-            PlanRuntimePrefillOutcome::Deferred(deferral) => {
-                panic!("tiny CPU prefill was deferred: {deferral:?}")
-            }
+    async fn execute(&self, inputs: &[ExecutionWork<'_>]) -> Vec<ExecutionCompletion> {
+        let outcome = self.executor.execute_tokens(inputs).await.unwrap();
+        let ExecutionBatchOutcome::Completed(batch) = outcome else {
+            panic!("tiny CPU work did not complete: {outcome:?}");
+        };
+        let completed = batch.into_completions();
+        assert_eq!(completed.len(), inputs.len());
+        for (index, (output, input)) in completed.iter().zip(inputs).enumerate() {
+            output
+                .validate_for(index, input, self.executor.info().vocab_size)
+                .unwrap();
         }
+        completed
     }
 
-    async fn seed_decode(&self, tokens: &[u32]) -> PlanRuntimeDecodeInput {
-        let input = prompt(tokens, tokens.len());
-        self.admit(&input);
-        let output = self.prefill(&input).await;
-        PlanRuntimeDecodeInput::new(
-            input.request_id,
-            TokenId::new(1),
-            Arc::clone(output.output().kv_cache()),
+    async fn prefill(
+        &self,
+        frontier: &ExecutionFrontier,
+        chunk: PrefillChunk,
+    ) -> ExecutionCompletion {
+        self.execute(&[ExecutionWork::new(
+            frontier,
+            TokenWork::Prefill(chunk),
+            &LogitsReturnPolicy::FullLogits,
         )
+        .unwrap()])
+            .await
+            .pop()
+            .unwrap()
+    }
+
+    async fn seed_decode(&self, tokens: &[u32]) -> ExecutionFrontier {
+        let frontier = self.admit(tokens).await;
+        self.prefill(
+            &frontier,
+            PrefillChunk::new(0, tokens.len(), tokens.len()).unwrap(),
+        )
+        .await
+        .next_frontier()
+        .clone()
+    }
+
+    async fn close(&self, frontier: &ExecutionFrontier) {
+        let closed = self.executor.cancel_tokens(frontier.sequence()).unwrap();
+        assert!(closed.error.is_none(), "{:?}", closed.error);
+        let ended = match closed.disposition {
+            ExecutionCloseDisposition::Ended(ended) => ended,
+            ExecutionCloseDisposition::Held(held) => {
+                let terminal = held.wait().await.unwrap();
+                assert!(terminal.error.is_none(), "{:?}", terminal.error);
+                terminal.ended
+            }
+        };
+        assert_eq!(ended.sequence(), frontier.sequence());
+    }
+
+    fn assert_no_live_sequences(&self) {
+        let snapshot = self.executor.cache_metrics_snapshot().unwrap();
+        assert_eq!(snapshot["active_sequences"], 0);
+        assert_eq!(snapshot["pending_sequences"], 0);
     }
 
     fn submissions(&self) -> u64 {
@@ -119,14 +161,27 @@ impl Drop for CpuFixture {
     }
 }
 
-fn prompt(tokens: &[u32], chunk_tokens: usize) -> PlanRuntimePrefillInput {
-    PlanRuntimePrefillInput::new(
-        RequestId::new(),
-        tokens.iter().copied().map(TokenId::new).collect::<Vec<_>>(),
-        16,
-        PrefillChunk::new(0, chunk_tokens, tokens.len()).unwrap(),
+fn decode_work<'a>(
+    frontier: &'a ExecutionFrontier,
+    token: u32,
+    policy: &'a LogitsReturnPolicy,
+) -> ExecutionWork<'a> {
+    ExecutionWork::new(
+        frontier,
+        TokenWork::Decode {
+            token: TokenId::new(token),
+            position: frontier.consumed_tokens(),
+        },
+        policy,
     )
     .unwrap()
+}
+
+fn sampling(output: &ExecutionCompletion) -> &ExecutorSamplingOutput {
+    let ExecutionProduct::Sampling(sampling) = output.product() else {
+        panic!("expected a sampleable product: {output:?}");
+    };
+    sampling
 }
 
 fn assert_logits_close(actual: &[f32], expected: &[f32]) {
@@ -139,45 +194,46 @@ fn assert_logits_close(actual: &[f32], expected: &[f32]) {
     );
 }
 
-fn assert_prefill_matches(
-    actual: &PlanRuntimePrefillCompletion,
-    expected: &PlanRuntimePrefillCompletion,
-) {
-    assert_eq!(actual.completed_chunk(), expected.completed_chunk());
+fn assert_prefill_matches(actual: &ExecutionCompletion, expected: &ExecutionCompletion) {
+    let (
+        ExecutedTokenWork::Prefill {
+            chunk: actual_chunk,
+            ..
+        },
+        ExecutedTokenWork::Prefill {
+            chunk: expected_chunk,
+            ..
+        },
+    ) = (actual.executed(), expected.executed())
+    else {
+        panic!("expected prefill completions");
+    };
+    assert_eq!(actual_chunk, expected_chunk);
     assert_eq!(
-        actual.output().committed_tokens(),
-        expected.output().committed_tokens()
+        actual.next_frontier().consumed_tokens(),
+        expected.next_frontier().consumed_tokens()
     );
-    match (actual.output().product(), expected.output().product()) {
-        (PlanRuntimePrefillProduct::Intermediate, PlanRuntimePrefillProduct::Intermediate) => {}
+    match (actual.product(), expected.product()) {
+        (ExecutionProduct::Intermediate, ExecutionProduct::Intermediate) => {}
         (
-            PlanRuntimePrefillProduct::FinalLogits(actual),
-            PlanRuntimePrefillProduct::FinalLogits(expected),
+            ExecutionProduct::Sampling(ExecutorSamplingOutput::FullLogits(actual)),
+            ExecutionProduct::Sampling(ExecutorSamplingOutput::FullLogits(expected)),
         ) => assert_logits_close(actual, expected),
         other => panic!("mixed and split prefill product kinds differ: {other:?}"),
     }
 }
 
-async fn split_decode(
-    fixture: &CpuFixture,
-    inputs: &[PlanRuntimeDecodeInput],
-) -> Vec<PlanRuntimeDecodeOutput> {
-    match fixture
-        .executor
-        .plan_runtime_batch_decode_with_capacity(inputs)
-        .await
-        .unwrap()
-    {
-        PlanRuntimeBatchDecodeOutcome::Completed(outputs) => outputs,
-        PlanRuntimeBatchDecodeOutcome::Deferred(deferral) => {
-            panic!("tiny CPU decode was deferred: {deferral:?}")
-        }
-    }
-}
-
-fn assert_decode_matches(actual: &PlanRuntimeDecodeOutput, expected: &PlanRuntimeDecodeOutput) {
-    assert_eq!(actual.kv_cache.num_tokens(), expected.kv_cache.num_tokens());
-    match (&actual.sampling_output, &expected.sampling_output) {
+fn assert_decode_matches(actual: &ExecutionCompletion, expected: &ExecutionCompletion) {
+    assert!(matches!(
+        actual.executed(),
+        ExecutedTokenWork::Decode { .. }
+    ));
+    assert_eq!(actual.executed(), expected.executed());
+    assert_eq!(
+        actual.next_frontier().consumed_tokens(),
+        expected.next_frontier().consumed_tokens()
+    );
+    match (sampling(actual), sampling(expected)) {
         (
             ExecutorSamplingOutput::FullLogits(actual),
             ExecutorSamplingOutput::FullLogits(expected),
@@ -191,174 +247,156 @@ async fn real_cpu_mixed_prefill_decode_matches_split_through_final_and_intermedi
     let mixed = CpuFixture::new(8).await;
     let split = CpuFixture::new(8).await;
     let mixed_decode = mixed.seed_decode(&[0, 1]).await;
-    let split_decode_input = split.seed_decode(&[0, 1]).await;
-    let mixed_prefills = [prompt(&[1, 0, 1, 2], 2), prompt(&[2, 1], 2)];
-    let split_prefills = [prompt(&[1, 0, 1, 2], 2), prompt(&[2, 1], 2)];
-    for input in &mixed_prefills {
-        mixed.admit(input);
-    }
-    for input in &split_prefills {
-        split.admit(input);
-    }
-    let before = mixed.submissions();
-    let (prefills, decodes) = match mixed
-        .executor
-        .plan_runtime_mixed_batch_with_capacity(
-            &mixed_prefills,
-            std::slice::from_ref(&mixed_decode),
-        )
-        .await
-        .unwrap()
-    {
-        PlanRuntimeMixedBatchOutcome::Completed { prefills, decodes } => (prefills, decodes),
-        _ => panic!("tiny mixed wave did not execute"),
-    };
-    assert_eq!(mixed.submissions() - before, 1);
-    assert_eq!(prefills.len(), 2);
-    assert_eq!(decodes.len(), 1);
-    for (output, input) in prefills.iter().zip(&mixed_prefills) {
-        output
-            .validate_for(&input.request_id, input.chunk, 3)
-            .unwrap();
-    }
-    assert_eq!(
-        decodes[0].kv_cache.cache_id(),
-        mixed_decode.kv_cache.cache_id()
-    );
-    assert_eq!(decodes[0].kv_cache.num_tokens(), 3);
-    let expected_prefills = [
-        split.prefill(&split_prefills[0]).await,
-        split.prefill(&split_prefills[1]).await,
+    let split_decode = split.seed_decode(&[0, 1]).await;
+    let mixed_prefills = [mixed.admit(&[1, 0, 1, 2]).await, mixed.admit(&[2, 1]).await];
+    let split_prefills = [split.admit(&[1, 0, 1, 2]).await, split.admit(&[2, 1]).await];
+    let chunks = [
+        PrefillChunk::new(0, 2, 4).unwrap(),
+        PrefillChunk::new(0, 2, 2).unwrap(),
     ];
-    let expected_decodes = split_decode(&split, std::slice::from_ref(&split_decode_input)).await;
-    for (actual, expected) in prefills.iter().zip(&expected_prefills) {
+    let policy = LogitsReturnPolicy::FullLogits;
+    let before = mixed.submissions();
+    let first = mixed
+        .execute(&[
+            ExecutionWork::new(&mixed_prefills[0], TokenWork::Prefill(chunks[0]), &policy).unwrap(),
+            ExecutionWork::new(&mixed_prefills[1], TokenWork::Prefill(chunks[1]), &policy).unwrap(),
+            decode_work(&mixed_decode, 1, &policy),
+        ])
+        .await;
+    assert_eq!(mixed.submissions() - before, 1);
+    assert_eq!(first.len(), 3);
+    assert_eq!(first[2].next_frontier().consumed_tokens(), 3);
+    let expected_prefills = [
+        split.prefill(&split_prefills[0], chunks[0]).await,
+        split.prefill(&split_prefills[1], chunks[1]).await,
+    ];
+    let expected_decodes = split
+        .execute(&[decode_work(&split_decode, 1, &policy)])
+        .await;
+    for (actual, expected) in first[..2].iter().zip(&expected_prefills) {
         assert_prefill_matches(actual, expected);
     }
-    assert_decode_matches(&decodes[0], &expected_decodes[0]);
+    assert_decode_matches(&first[2], &expected_decodes[0]);
 
-    // The first request finishes its prefill, while the newly completed peer
-    // and incumbent both decode. Reverse their admission order in the input.
-    let mut mixed_tail = mixed_prefills[0].clone();
-    mixed_tail.chunk = PrefillChunk::new(2, 2, 4).unwrap();
-    let mut split_tail = split_prefills[0].clone();
-    split_tail.chunk = mixed_tail.chunk;
-    let mixed_next = [
-        PlanRuntimeDecodeInput::new(
-            mixed_prefills[1].request_id.clone(),
-            TokenId::new(0),
-            Arc::clone(prefills[1].output().kv_cache()),
-        ),
-        PlanRuntimeDecodeInput::new(
-            mixed_decode.request_id,
-            TokenId::new(2),
-            Arc::clone(&decodes[0].kv_cache),
-        ),
-    ];
-    let split_next = [
-        PlanRuntimeDecodeInput::new(
-            split_prefills[1].request_id.clone(),
-            TokenId::new(0),
-            Arc::clone(expected_prefills[1].output().kv_cache()),
-        ),
-        PlanRuntimeDecodeInput::new(
-            split_decode_input.request_id,
-            TokenId::new(2),
-            Arc::clone(&expected_decodes[0].kv_cache),
-        ),
-    ];
-    let (tail_outputs, next_outputs) = match mixed
-        .executor
-        .plan_runtime_mixed_batch_with_capacity(&[mixed_tail], &mixed_next)
-        .await
-        .unwrap()
-    {
-        PlanRuntimeMixedBatchOutcome::Completed { prefills, decodes } => (prefills, decodes),
-        _ => panic!("mixed continuation wave did not execute"),
-    };
-    let expected_tail = split.prefill(&split_tail).await;
-    let expected_next = split_decode(&split, &split_next).await;
-    assert_prefill_matches(&tail_outputs[0], &expected_tail);
-    for ((actual, expected), input) in next_outputs.iter().zip(&expected_next).zip(&mixed_next) {
+    // The first request finishes prefill while both peers decode. Product
+    // order reverses their admission order, and the protocol must preserve it.
+    let tail = PrefillChunk::new(2, 2, 4).unwrap();
+    let before = mixed.submissions();
+    let next = mixed
+        .execute(&[
+            ExecutionWork::new(first[0].next_frontier(), TokenWork::Prefill(tail), &policy)
+                .unwrap(),
+            decode_work(first[1].next_frontier(), 0, &policy),
+            decode_work(first[2].next_frontier(), 2, &policy),
+        ])
+        .await;
+    assert_eq!(mixed.submissions() - before, 1);
+    let expected_tail = split
+        .prefill(expected_prefills[0].next_frontier(), tail)
+        .await;
+    let expected_next = split
+        .execute(&[
+            decode_work(expected_prefills[1].next_frontier(), 0, &policy),
+            decode_work(expected_decodes[0].next_frontier(), 2, &policy),
+        ])
+        .await;
+    assert_prefill_matches(&next[0], &expected_tail);
+    for ((actual, expected), prior) in next[1..].iter().zip(&expected_next).zip(&first[1..]) {
         assert_decode_matches(actual, expected);
-        assert_eq!(actual.kv_cache.cache_id(), input.kv_cache.cache_id());
         assert_eq!(
-            actual.kv_cache.num_tokens(),
-            input.kv_cache.num_tokens() + 1
+            actual.next_frontier().sequence(),
+            prior.next_frontier().sequence()
+        );
+        assert_eq!(
+            actual.next_frontier().consumed_tokens(),
+            prior.next_frontier().consumed_tokens() + 1
         );
     }
-    for output in &next_outputs {
-        mixed.executor.release_cache(&output.kv_cache.cache_id());
+    for output in &next {
+        mixed.close(output.next_frontier()).await;
     }
-    mixed
-        .executor
-        .release_cache(&tail_outputs[0].output().kv_cache().cache_id());
+    split.close(expected_tail.next_frontier()).await;
     for output in &expected_next {
-        split.executor.release_cache(&output.kv_cache.cache_id());
+        split.close(output.next_frontier()).await;
     }
-    split
-        .executor
-        .release_cache(&expected_tail.output().kv_cache().cache_id());
-    assert_eq!(
-        mixed.executor.cache_metrics_snapshot().unwrap()["active_sequences"],
-        0
-    );
-    assert_eq!(
-        mixed.executor.cache_metrics_snapshot().unwrap()["pending_sequences"],
-        0
-    );
+    mixed.assert_no_live_sequences();
+    split.assert_no_live_sequences();
 }
 
 #[tokio::test]
 async fn real_cpu_mixed_work_beyond_compiled_token_bound_fails_and_releases_participants() {
     let fixture = CpuFixture::new(2).await;
     let decode = fixture.seed_decode(&[0]).await;
-    let prefill = prompt(&[1, 2], 2);
-    fixture.admit(&prefill);
-    let before = fixture.submissions();
-    // Each phase fits alone, but their combined work exceeds the immutable
-    // plan's two-token bound. This is a permanent error, not retryable pressure.
-    let outcome = fixture
-        .executor
-        .plan_runtime_mixed_batch_with_capacity(
-            std::slice::from_ref(&prefill),
-            std::slice::from_ref(&decode),
+    let prefill = fixture.admit(&[1, 2]).await;
+    let policy = LogitsReturnPolicy::FullLogits;
+    let inputs = [
+        ExecutionWork::new(
+            &prefill,
+            TokenWork::Prefill(PrefillChunk::new(0, 2, 2).unwrap()),
+            &policy,
         )
-        .await;
-    assert!(matches!(
-        outcome,
-        Err(FerrumError::Backend { ref message })
+        .unwrap(),
+        decode_work(&decode, 1, &policy),
+    ];
+    let before = fixture.submissions();
+    // Each phase fits alone, but the cohort exceeds the immutable two-token
+    // bound. Preserve the real per-participant interruption, not a bare error.
+    let outcome = fixture.executor.execute_tokens(&inputs).await.unwrap();
+    let ExecutionBatchOutcome::Interrupted(interruption) = outcome else {
+        panic!("bounded mixed work must interrupt its cohort: {outcome:?}");
+    };
+    assert!(interruption.completed().is_empty());
+    assert_eq!(interruption.remaining().len(), inputs.len());
+    assert!(interruption.causes().iter().any(|error| matches!(
+        error,
+        FerrumError::Backend { message }
             if message.contains("exceeds its bounded resource formula")
-    ));
+    )));
+    let (_, remaining, causes) = interruption.into_parts();
+    for (index, participant) in remaining.into_iter().enumerate() {
+        let (actual_index, sequence, progress, continuation, cause_index) =
+            participant.into_parts();
+        assert_eq!(actual_index, index);
+        assert_eq!(&sequence, inputs[index].sequence());
+        assert!(cause_index < causes.len());
+        assert_eq!(
+            progress,
+            ExecutionProgress::NotSubmitted {
+                stage: NoSubmissionStage::BeforeSubmit
+            }
+        );
+        let ended = match continuation {
+            ContinuationDisposition::Ended(ended) => ended,
+            ContinuationDisposition::Held(held) => {
+                let terminal = held.wait().await.unwrap();
+                assert!(terminal.error.is_none(), "{:?}", terminal.error);
+                terminal.ended
+            }
+            ContinuationDisposition::Retryable(_) => {
+                panic!("permanent plan bound is not retryable")
+            }
+        };
+        assert_eq!(ended.sequence(), &sequence);
+    }
     assert_eq!(fixture.submissions(), before);
-    assert_eq!(decode.kv_cache.num_tokens(), 1);
-    assert_eq!(
-        fixture.executor.cache_metrics_snapshot().unwrap()["active_sequences"],
-        0
-    );
-    assert_eq!(
-        fixture.executor.cache_metrics_snapshot().unwrap()["pending_sequences"],
-        0
-    );
-    // A permanent mixed error invalidates its product frontiers. The engine
-    // must never replay them through the split fallback.
-    assert!(fixture
-        .executor
-        .plan_runtime_batch_decode_with_capacity(std::slice::from_ref(&decode))
-        .await
-        .is_err());
-    assert!(fixture
-        .executor
-        .plan_runtime_prefill_with_capacity(&prefill)
-        .await
-        .is_err());
+    assert_eq!(decode.consumed_tokens(), 1);
+    fixture.assert_no_live_sequences();
+    // Neither original frontier can be replayed through a split fallback.
+    for input in &inputs {
+        assert!(fixture
+            .executor
+            .execute_tokens(std::slice::from_ref(input))
+            .await
+            .is_err());
+    }
     assert_eq!(fixture.submissions(), before);
 
-    // Failed participants released their physical and logical ownership: a
-    // fresh request can still complete under the same bounded plan.
+    // Real released ownership permits a fresh request under the same plan.
     let replacement = fixture.seed_decode(&[1, 2]).await;
-    let decoded = split_decode(&fixture, std::slice::from_ref(&replacement)).await;
-    assert_eq!(decoded[0].kv_cache.num_tokens(), 3);
-    fixture
-        .executor
-        .release_cache(&decoded[0].kv_cache.cache_id());
+    let decoded = fixture
+        .execute(&[decode_work(&replacement, 1, &policy)])
+        .await;
+    assert_eq!(decoded[0].next_frontier().consumed_tokens(), 3);
+    fixture.close(decoded[0].next_frontier()).await;
+    fixture.assert_no_live_sequences();
 }

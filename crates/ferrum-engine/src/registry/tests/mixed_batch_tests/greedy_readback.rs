@@ -1,7 +1,5 @@
 use super::*;
-use ferrum_execution::model_executor::{
-    GreedyRepetitionPenalty, LogitsReturnPolicy, TokenSelectionMask,
-};
+use ferrum_execution::model_executor::{GreedyRepetitionPenalty, TokenSelectionMask};
 
 /// Independent host oracle over the split executor's unprocessed logits.
 fn expected_token(logits: &[f32], policy: &LogitsReturnPolicy) -> TokenId {
@@ -55,11 +53,11 @@ async fn real_cpu_mixed_greedy_readback_preserves_masks_repetition_and_product_f
         .find(|output| output.as_str() == "value.output.logits")
         .expect("the Qwen fixture declares a logits output");
     let logits_element_bytes = family.numerical_profile().boundaries[logits_output].size_bytes();
-    let mut mixed_decodes = vec![
+    let mut mixed_decodes = [
         mixed.seed_decode(&[0, 1]).await,
         mixed.seed_decode(&[2, 0]).await,
     ];
-    let mut split_decodes = vec![
+    let mut split_decodes = [
         split.seed_decode(&[0, 1]).await,
         split.seed_decode(&[2, 0]).await,
     ];
@@ -76,62 +74,57 @@ async fn real_cpu_mixed_greedy_readback_preserves_masks_repetition_and_product_f
             repetition_penalty: Some(GreedyRepetitionPenalty::new(10.0, vec![2, 2])),
         },
     ];
-    let mut mixed_prefill = prompt(&[1, 0, 1, 2, 0, 1], 2);
-    let mut split_prefill = prompt(&[1, 0, 1, 2, 0, 1], 2);
-    mixed.admit(&mixed_prefill);
-    split.admit(&split_prefill);
+    let full = LogitsReturnPolicy::FullLogits;
+    let mut decode_tokens = [1, 1];
+    let mut mixed_prefill = mixed.admit(&[1, 0, 1, 2, 0, 1]).await;
+    let mut split_prefill = split.admit(&[1, 0, 1, 2, 0, 1]).await;
 
     for (chunk_index, force_host_decode) in [(0, false), (1, true), (2, false)] {
         let chunk = PrefillChunk::new(chunk_index * 2, 2, 6).unwrap();
-        mixed_prefill.chunk = chunk;
-        split_prefill.chunk = chunk;
-        for (index, input) in mixed_decodes.iter_mut().enumerate() {
-            input.logits_policy = if force_host_decode && index == 1 {
-                LogitsReturnPolicy::FullLogits
-            } else {
-                policies[index].clone()
-            };
-        }
-        let expected_prefill = split.prefill(&split_prefill).await;
-        let expected_decodes = split_decode(&split, &split_decodes).await;
+        let expected_prefill = split.prefill(&split_prefill, chunk).await;
+        let expected_decodes = split
+            .execute(&[
+                decode_work(&split_decodes[0], decode_tokens[0], &full),
+                decode_work(&split_decodes[1], decode_tokens[1], &full),
+            ])
+            .await;
         let before = mixed.executor.cache_metrics_snapshot().unwrap();
-        let (prefills, decodes) = match mixed
-            .executor
-            .plan_runtime_mixed_batch_with_capacity(
-                std::slice::from_ref(&mixed_prefill),
-                &mixed_decodes,
-            )
-            .await
-            .unwrap()
-        {
-            PlanRuntimeMixedBatchOutcome::Completed { prefills, decodes } => (prefills, decodes),
-            _ => panic!("tiny CPU mixed wave did not complete"),
+        let second_policy = if force_host_decode {
+            &full
+        } else {
+            &policies[1]
         };
-        assert_eq!(prefills.len(), 1);
-        assert_eq!(decodes.len(), mixed_decodes.len());
-        prefills[0]
-            .validate_for(&mixed_prefill.request_id, chunk, 3)
-            .unwrap();
-        assert_prefill_matches(&prefills[0], &expected_prefill);
-        assert_eq!(prefills[0].output().committed_tokens(), chunk.end());
+        let output = mixed
+            .execute(&[
+                ExecutionWork::new(&mixed_prefill, TokenWork::Prefill(chunk), &full).unwrap(),
+                decode_work(&mixed_decodes[0], decode_tokens[0], &policies[0]),
+                decode_work(&mixed_decodes[1], decode_tokens[1], second_policy),
+            ])
+            .await;
+        assert_eq!(output.len(), 3);
+        let prefill = &output[0];
+        let decodes = &output[1..];
+        assert_prefill_matches(prefill, &expected_prefill);
+        assert_eq!(prefill.next_frontier().consumed_tokens(), chunk.end());
         assert_eq!(
-            matches!(
-                prefills[0].output().product(),
-                PlanRuntimePrefillProduct::Intermediate
-            ),
+            matches!(prefill.product(), ExecutionProduct::Intermediate),
             !chunk.is_final(),
             "an internal readback must not become a sampled prefill product",
         );
 
         let greedy_readback = !chunk.is_final() && !force_host_decode;
         let after = mixed.executor.cache_metrics_snapshot().unwrap();
+        assert_eq!(
+            after["counters"]["submitted_waves"].as_u64().unwrap()
+                - before["counters"]["submitted_waves"].as_u64().unwrap(),
+            1
+        );
         let readback_bytes = after["counters"]["readback_bytes"].as_u64().unwrap()
             - before["counters"]["readback_bytes"].as_u64().unwrap();
         let participants = (mixed_decodes.len() + 1) as u64;
-        // The complete readback batch includes the internally discarded
-        // prefill participant: one U32 or one vocabulary row per member. The
-        // declared device logits dtype can differ from the host Vec<f32>:
-        // this CPU fixture reads F16 logits before converting them to F32.
+        // The complete readback includes the internally discarded prefill row:
+        // one U32 or one vocabulary row per member. The actual device logits
+        // dtype can differ from the host Vec<f32> (this fixture uses F16).
         assert_eq!(
             readback_bytes,
             participants
@@ -143,15 +136,15 @@ async fn real_cpu_mixed_greedy_readback_preserves_masks_repetition_and_product_f
         );
         for index in 0..decodes.len() {
             let ExecutorSamplingOutput::FullLogits(reference_logits) =
-                &expected_decodes[index].sampling_output
+                sampling(&expected_decodes[index])
             else {
                 panic!("split reference must retain unprocessed logits")
             };
             let token = expected_token(reference_logits, &policies[index]);
             if greedy_readback {
                 assert_eq!(
-                    decodes[index].sampling_output,
-                    ExecutorSamplingOutput::GreedyToken(token)
+                    sampling(&decodes[index]),
+                    &ExecutorSamplingOutput::GreedyToken(token)
                 );
                 if index == 1 {
                     let plain = LogitsReturnPolicy::GreedyArgmax {
@@ -168,42 +161,30 @@ async fn real_cpu_mixed_greedy_readback_preserves_masks_repetition_and_product_f
                 assert_decode_matches(&decodes[index], &expected_decodes[index]);
             }
             assert_eq!(
-                decodes[index].kv_cache.cache_id(),
-                mixed_decodes[index].kv_cache.cache_id()
+                decodes[index].next_frontier().sequence(),
+                mixed_decodes[index].sequence()
             );
             assert_eq!(
-                decodes[index].kv_cache.num_tokens(),
-                mixed_decodes[index].kv_cache.num_tokens() + 1
+                decodes[index].next_frontier().consumed_tokens(),
+                mixed_decodes[index].consumed_tokens() + 1
             );
-            mixed_decodes[index] = PlanRuntimeDecodeInput::new(
-                mixed_decodes[index].request_id.clone(),
-                token,
-                Arc::clone(&decodes[index].kv_cache),
-            );
-            split_decodes[index] = PlanRuntimeDecodeInput::new(
-                split_decodes[index].request_id.clone(),
-                token,
-                Arc::clone(&expected_decodes[index].kv_cache),
-            );
+            mixed_decodes[index] = decodes[index].next_frontier().clone();
+            split_decodes[index] = expected_decodes[index].next_frontier().clone();
+            decode_tokens[index] = token.get();
         }
+        mixed_prefill = prefill.next_frontier().clone();
+        split_prefill = expected_prefill.next_frontier().clone();
         if chunk.is_final() {
-            mixed
-                .executor
-                .release_cache(&prefills[0].output().kv_cache().cache_id());
-            split
-                .executor
-                .release_cache(&expected_prefill.output().kv_cache().cache_id());
+            mixed.close(&mixed_prefill).await;
+            split.close(&split_prefill).await;
         }
     }
-    for input in mixed_decodes {
-        mixed.executor.release_cache(&input.kv_cache.cache_id());
+    for frontier in &mixed_decodes {
+        mixed.close(frontier).await;
     }
-    for input in split_decodes {
-        split.executor.release_cache(&input.kv_cache.cache_id());
+    for frontier in &split_decodes {
+        split.close(frontier).await;
     }
-    for fixture in [&mixed, &split] {
-        let snapshot = fixture.executor.cache_metrics_snapshot().unwrap();
-        assert_eq!(snapshot["active_sequences"], 0);
-        assert_eq!(snapshot["pending_sequences"], 0);
-    }
+    mixed.assert_no_live_sequences();
+    split.assert_no_live_sequences();
 }
