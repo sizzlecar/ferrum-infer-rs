@@ -1,4 +1,5 @@
 use super::*;
+use crate::completion::StateTransferSweepEntry;
 use crate::{CompletionSweepEntry, CompletionSweepObservation, CompletionSweepReceipt};
 
 impl<R: DeviceRuntime> CompletionReaper<R> {
@@ -14,13 +15,24 @@ impl<R: DeviceRuntime> CompletionReaper<R> {
         &self,
         maximum_slots: usize,
     ) -> Result<CompletionSweepReceipt, VNextError> {
-        let mut receipt = self.poll_bounded(maximum_slots)?;
-        for entry in &mut receipt.state_transfers {
-            match self.recover_abandoned_state_transfer_slot(entry.slot_id) {
-                Ok(Some(observation)) => entry.observation = observation,
+        let mut receipt = CompletionSweepReceipt {
+            entries: Vec::new(),
+            state_transfers: Vec::new(),
+            retained_after: 0,
+            quarantined_after: 0,
+        };
+        // A generic poll consumes ordinary operation terminal receipts. Those
+        // still belong to their waiting readers, even when checkpoint cleanup
+        // shares the same worker and reaper.
+        for slot_id in self.bounded_slot_snapshot(maximum_slots)? {
+            match self.recover_abandoned_state_transfer_slot(slot_id) {
+                Ok(Some(observation)) => receipt.state_transfers.push(StateTransferSweepEntry {
+                    slot_id,
+                    observation,
+                }),
                 Ok(None) => {}
                 Err(error) => receipt.entries.push(CompletionSweepEntry {
-                    slot_id: entry.slot_id,
+                    slot_id,
                     observation: CompletionSweepObservation::Failed(error),
                 }),
             }

@@ -1,6 +1,84 @@
 use super::*;
 
 #[test]
+fn checkpoint_access_recovery_reclaims_only_abandoned_transfer_in_shared_reaper() {
+    let harness = prefix_harness(checkpoint_fixture::Spec::default());
+    let lane = harness.root.create_execution_lane().unwrap();
+    let reaper = CompletionReaper::new();
+    prove_prefix_source(&harness, &lane, &reaper);
+    let binding = harness.root.trusted_runtime_binding().unwrap();
+
+    let mut live = access_submitted(
+        reaper
+            .try_capture_sequence_checkpoint(
+                &harness.fixture.plan,
+                &binding,
+                Arc::clone(&harness.session),
+                Arc::clone(&lane),
+            )
+            .unwrap(),
+    );
+    // Publish the first real capture's result without consuming its handle.
+    // This also releases the source's read gate for the second capture.
+    assert_eq!(live.poll().unwrap(), NativeCheckpointObservation::Ready);
+    let abandoned = access_submitted(
+        reaper
+            .try_capture_sequence_checkpoint(
+                &harness.fixture.plan,
+                &binding,
+                Arc::clone(&harness.session),
+                Arc::clone(&lane),
+            )
+            .unwrap(),
+    );
+    assert_ne!(live.slot_id(), abandoned.slot_id());
+    assert_eq!(reaper.retained_count(), 2);
+    // No poll or take_result precedes abandonment: the recovery API itself
+    // must observe the second transfer, discard its result, and release it.
+    drop(abandoned);
+    let recovered = reaper.recover_abandoned_checkpoints(2).unwrap();
+    assert!(recovered.entries().is_empty());
+    assert_eq!(recovered.retained_after(), 1);
+    assert_eq!(recovered.quarantined_after(), 0);
+    assert_eq!(lane.in_flight_count(), 0);
+    assert_eq!(harness.runtime.synchronize_calls(), 0);
+
+    // A second bounded pass must still leave the live result with its sole
+    // consumer, rather than treat a ready transfer as abandoned work.
+    assert_eq!(
+        reaper
+            .recover_abandoned_checkpoints(1)
+            .unwrap()
+            .retained_after(),
+        1
+    );
+    assert_eq!(live.poll().unwrap(), NativeCheckpointObservation::Ready);
+    let Some(NativeCheckpointResult::Captured(checkpoint)) = live.take_result().unwrap() else {
+        panic!("checkpoint recovery must preserve the live capture result")
+    };
+    assert_eq!(checkpoint.token_prefix(), &[19]);
+    assert_eq!(checkpoint.full_input(), &[19, 31]);
+    assert_eq!(checkpoint.completed_tokens(), 1);
+    assert_eq!(reaper.retained_count(), 0);
+    assert!(live.take_result().is_err());
+    drop(live);
+    drop(checkpoint);
+    assert_checkpoint_budget_released(&harness);
+    // Reclaiming an abandoned read must not cancel the successful source.
+    assert_eq!(
+        reserve_capture(&harness.session)
+            .completed_boundary()
+            .unwrap()
+            .token_prefix(),
+        &[19]
+    );
+    drop(binding);
+    drop(reaper);
+    drop(lane);
+    harness.close();
+}
+
+#[test]
 fn checkpoint_access_abandoned_ready_capture_is_reclaimed_by_public_sweep() {
     let harness = prefix_harness(checkpoint_fixture::Spec::default());
     let lane = harness.root.create_execution_lane().unwrap();

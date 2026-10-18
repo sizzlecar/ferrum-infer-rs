@@ -173,6 +173,30 @@ fn selection(count: u32, choices: Vec<u32>) -> CompletionReadbackSelectionReques
 }
 
 #[test]
+fn checkpoint_recovery_preserves_live_operation_readback_ownership() {
+    let submitted = SubmittedWave::new(2);
+    let sweep = submitted.reaper.recover_abandoned_checkpoints(8).unwrap();
+    assert!(sweep.entries().is_empty());
+    assert_eq!(sweep.retained_after(), 1);
+    assert_eq!(submitted.lane.in_flight_count(), 1);
+    let receipt = match submitted
+        .handle
+        .wait_with_readback_selection(selection(2, vec![1, 0]))
+        .unwrap()
+    {
+        CompletionReadbackSelectionObservation::Terminal(receipt) => receipt,
+        other => panic!("live operation lost terminal ownership: {other:?}"),
+    };
+    assert_eq!(receipt.dispositions().len(), 2);
+    assert_eq!(
+        receipt.completion().submission(),
+        submitted.handle.receipt()
+    );
+    assert_eq!(submitted.reaper.retained_count(), 0);
+    submitted.finish();
+}
+
+#[test]
 fn selected_terminal_wait_reads_one_exact_range_per_participant_and_retires_once() {
     let submitted = SubmittedWave::new(2);
     submitted
