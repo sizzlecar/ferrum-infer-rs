@@ -201,6 +201,7 @@ pub struct DevConfig {
 
 /// Runtime knobs that can be sourced from the CLI config file.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct RuntimeCliConfig {
     /// Named startup/runtime preset. Presets provide product-owned default
     /// bundles and can still be overridden by explicit runtime keys below,
@@ -315,10 +316,6 @@ pub struct RuntimeCliConfig {
     /// `FERRUM_LAYER_SPLIT_PIPELINE_MODE`.
     #[serde(default)]
     pub layer_split_pipeline_mode: Option<String>,
-
-    /// MoE CUDA graph policy override, equivalent to `FERRUM_MOE_GRAPH`.
-    #[serde(default)]
-    pub moe_graph: Option<bool>,
 
     /// Legacy Llama/Gemma batched decode CUDA graph policy override,
     /// equivalent to `FERRUM_BATCHED_GRAPH`.
@@ -479,11 +476,6 @@ pub struct RuntimeCliConfig {
     /// Sequence fit gate used before prefill admission.
     #[serde(default)]
     pub sequence_fit_policy: Option<SequenceFitPolicy>,
-
-    /// Minimum MoE batch size for the batched expert path, equivalent to
-    /// `FERRUM_MOE_BATCH_THRESHOLD`.
-    #[serde(default)]
-    pub moe_batch_threshold: Option<usize>,
 }
 
 impl RuntimeCliConfig {
@@ -615,7 +607,6 @@ impl RuntimeCliConfig {
             "FERRUM_LAYER_SPLIT_PIPELINE_MODE",
             self.layer_split_pipeline_mode.as_deref(),
         );
-        push_bool_entry(&mut entries, "FERRUM_MOE_GRAPH", self.moe_graph);
         push_bool_entry(&mut entries, "FERRUM_BATCHED_GRAPH", self.batched_graph);
         push_bool_entry(
             &mut entries,
@@ -742,11 +733,6 @@ impl RuntimeCliConfig {
             "FERRUM_SEQUENCE_FIT_POLICY",
             self.sequence_fit_policy
                 .map(SequenceFitPolicy::as_runtime_value),
-        );
-        push_usize_entry(
-            &mut entries,
-            "FERRUM_MOE_BATCH_THRESHOLD",
-            self.moe_batch_threshold,
         );
         entries
     }
@@ -1008,6 +994,40 @@ impl Default for DevConfig {
 mod tests {
     use super::*;
     use clap::{Parser, Subcommand};
+
+    #[test]
+    fn runtime_config_rejects_retired_moe_and_unknown_fields() {
+        for (key, value) in [
+            ("moe_graph", "true"),
+            ("moe_graph", "false"),
+            ("moe_batch_threshold", "4"),
+            ("moe_batch_threshold", "0"),
+            ("unknown_runtime_option", "true"),
+        ] {
+            let error = toml::from_str::<CliConfig>(&format!("[runtime]\n{key} = {value}\n"))
+                .expect_err("unknown runtime options must not silently select another executor");
+            assert!(error.to_string().contains("unknown field"), "{error}");
+            assert!(error.to_string().contains(key), "{error}");
+        }
+
+        // Shared dispatch and ordinary execution controls remain supported.
+        let config: CliConfig = toml::from_str(
+            "[runtime]\nvllm_moe = true\nvllm_moe_pair_ids = false\nkv_capacity = 2048\n",
+        )
+        .unwrap();
+        assert_eq!(config.runtime.vllm_moe, Some(true));
+        assert_eq!(config.runtime.vllm_moe_pair_ids, Some(false));
+        assert_eq!(config.runtime.kv_capacity, Some(2048));
+        let restored: CliConfig = toml::from_str(&toml::to_string(&config).unwrap()).unwrap();
+        assert_eq!(
+            restored.runtime.runtime_config_entries(),
+            config.runtime.runtime_config_entries()
+        );
+        assert!(CliConfig::default()
+            .runtime
+            .runtime_config_entries()
+            .is_empty());
+    }
 
     #[derive(Parser)]
     struct NumericalCli {
@@ -1380,7 +1400,6 @@ mod tests {
             scheduler_active_decode_prefill_token_budget: Some(96),
             prefix_cache: Some(false),
             layer_split_pipeline_mode: Some("batch".to_string()),
-            moe_graph: Some(true),
             batched_graph: Some(true),
             reusable_execution: Some(false),
             reusable_execution_preparation: Some(
@@ -1420,7 +1439,6 @@ mod tests {
             ),
             max_model_len: Some(4096),
             sequence_fit_policy: Some(SequenceFitPolicy::FullInputMustFit),
-            moe_batch_threshold: Some(4),
             ..Default::default()
         };
         let entries = runtime.runtime_config_entries();
@@ -1504,7 +1522,6 @@ mod tests {
             "batch"
         );
         assert_eq!(entry("FERRUM_PREFIX_CACHE").effective_value, "0");
-        assert_eq!(entry("FERRUM_MOE_GRAPH").effective_value, "1");
         assert_eq!(entry("FERRUM_BATCHED_GRAPH").effective_value, "1");
         assert_eq!(entry("FERRUM_REUSABLE_EXECUTION").effective_value, "0");
         assert_eq!(
@@ -1583,7 +1600,6 @@ mod tests {
             entry("FERRUM_SEQUENCE_FIT_POLICY").effective_value,
             "full-input-must-fit"
         );
-        assert_eq!(entry("FERRUM_MOE_BATCH_THRESHOLD").effective_value, "4");
     }
 
     #[test]

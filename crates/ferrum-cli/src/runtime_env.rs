@@ -79,56 +79,6 @@ pub fn materialize_runtime_env_effective(snapshot: &RuntimeConfigSnapshot) -> Ve
     materialized
 }
 
-/// Default-OFF MoE CUDA graph policy for Qwen3-MoE startup profiles.
-///
-/// The returned entries are only values absent from `current`. This preserves
-/// explicit env/config overrides and lets callers keep source attribution when
-/// they later merge a full startup snapshot.
-pub fn moe_graph_default_entries(
-    current: &RuntimeConfigSnapshot,
-    source: RuntimeConfigSource,
-) -> Vec<RuntimeConfigEntry> {
-    let mut entries = Vec::new();
-    let moe_graph_enabled = match runtime_snapshot_value(current, "FERRUM_MOE_GRAPH") {
-        Some(value) => value == "1",
-        None => {
-            entries.push(RuntimeConfigEntry::new("FERRUM_MOE_GRAPH", "0", source));
-            false
-        }
-    };
-
-    if !moe_graph_enabled {
-        return entries;
-    }
-
-    #[cfg(feature = "vllm-moe-marlin")]
-    {
-        if runtime_snapshot_value(current, "FERRUM_VLLM_MOE").is_none() {
-            entries.push(RuntimeConfigEntry::new("FERRUM_VLLM_MOE", "1", source));
-        }
-        if runtime_snapshot_value(current, "FERRUM_VLLM_MOE_PAIR_IDS").is_none() {
-            entries.push(RuntimeConfigEntry::new(
-                "FERRUM_VLLM_MOE_PAIR_IDS",
-                "1",
-                source,
-            ));
-        }
-    }
-
-    entries
-}
-
-pub fn warn_if_moe_graph_needs_unbuilt_vllm_moe(_snapshot: &RuntimeConfigSnapshot) {
-    #[cfg(not(feature = "vllm-moe-marlin"))]
-    if runtime_snapshot_value(_snapshot, "FERRUM_MOE_GRAPH") == Some("1")
-        && runtime_snapshot_value(_snapshot, "FERRUM_VLLM_MOE") != Some("1")
-    {
-        eprintln!(
-            "[auto-size] MOE_GRAPH=1 requested, but vllm-moe-marlin is not built; graph capture requires FERRUM_VLLM_MOE=1"
-        );
-    }
-}
-
 pub fn runtime_snapshot_value<'a>(
     snapshot: &'a RuntimeConfigSnapshot,
     key: &str,
@@ -208,42 +158,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn moe_graph_defaults_add_missing_graph_default() {
-        let entries = moe_graph_default_entries(
-            &RuntimeConfigSnapshot::default(),
-            RuntimeConfigSource::Default,
-        );
-        let resolved = RuntimeConfigSnapshot::from_entries(entries);
-        let graph = runtime_snapshot_value(&resolved, "FERRUM_MOE_GRAPH");
-
-        assert_eq!(graph, Some("0"));
-        assert_eq!(resolved.entries.len(), 1);
-    }
-
-    #[test]
-    fn moe_graph_defaults_respect_forced_off_graph() {
-        let current = snapshot(&[("FERRUM_MOE_GRAPH", "0", RuntimeConfigSource::Env)]);
-        let entries = moe_graph_default_entries(&current, RuntimeConfigSource::Default);
-
-        assert!(entries.is_empty());
-    }
-
-    #[test]
-    fn moe_graph_defaults_complete_graph_enabled_snapshot() {
-        let current = snapshot(&[("FERRUM_MOE_GRAPH", "1", RuntimeConfigSource::ConfigFile)]);
-        let entries = moe_graph_default_entries(&current, RuntimeConfigSource::Default);
-        let resolved = RuntimeConfigSnapshot::from_entries(entries);
-
-        assert_eq!(runtime_snapshot_value(&resolved, "FERRUM_MOE_GRAPH"), None);
-        #[cfg(feature = "vllm-moe-marlin")]
-        assert_eq!(
-            runtime_snapshot_value(&resolved, "FERRUM_VLLM_MOE"),
-            Some("1")
-        );
-        #[cfg(not(feature = "vllm-moe-marlin"))]
-        assert!(resolved.entries.is_empty());
-    }
     #[test]
     fn q4_mmvq_weight_decode_provenance_is_never_materialized_as_environment() {
         let key = ferrum_types::Q4_MMVQ_WEIGHT_DECODE_CONFIG_KEY;

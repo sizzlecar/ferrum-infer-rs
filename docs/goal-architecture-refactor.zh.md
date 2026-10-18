@@ -41,6 +41,8 @@ R0 两批退役清理及 LoRA 隔离修复已合并（PR #429–#431），必需
 
 来源 API 迁移：移除 `LlmExecutor::new_with_vnext_model`、`vnext_model`、`vnext_family` 的未接线计划标签；实际使用产品来源的 legacy 构造器改用 `new_with_model_sources`，保留无来源的 `new`。配置了产品来源的自定义 executor 须通过 `bound_resolved_sources` 报告其实际来源；typed 实现还校验真实 plan。此报告是可信实现的组装一致性合同，不是执行授权或全部文件的原子快照。
 
+MoE API 迁移：移除旧 `Qwen3MoeModel`、`Qwen3MoeConfig`、`Qwen3MoeLayer` 和独立 `GgufRuntime`；通过产品来源注册入口使用保留的 typed MoE。旧 CPU MoE 整模型路径随之退役，CPU 路由/dispatch 数值参考不代表 typed CPU MoE 可运行。旧 MoE graph/batch 专属选项明确拒绝；`[runtime]` 未知字段及已有 `ferrum.toml` 的读取/解析错误会报错，缺少配置文件仍使用默认值。
+
 扩展点限于任务能力声明、可组合的注册/装配边界，以及未来按任务定义独立请求/结果的空间；**不新建无人使用的 Embed/ASR/TTS 引擎、空实现或插件框架来替代删除。** Candle、量化加载、通用算子等仍被文本 LLM 使用的依赖继续保留；独立 CLIP 处理链和未支持的聊天视觉输入不是同一件事，不能删掉主线已有的能力限制校验。
 
 ## 2. 问题与对应工作

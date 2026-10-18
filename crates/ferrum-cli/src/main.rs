@@ -82,17 +82,18 @@ async fn main() {
     }
 
     // Load the optional local configuration without creating files.
-    let (config, config_loaded) = match CliConfig::load("ferrum.toml").await {
-        Ok(config) => (config, true),
+    let config = match CliConfig::load("ferrum.toml").await {
+        Ok(config) => config,
         Err(e) => {
-            if cli.verbose {
-                eprintln!("{} Config: {}", "⚠️".yellow(), e);
-            }
-            (CliConfig::default(), false)
+            // A missing optional file already resolves to defaults in load().
+            // An explicit invalid configuration must never become a different
+            // execution policy by silently falling back to those defaults.
+            eprintln!("{} Config: {}", "Error:".red().bold(), e);
+            process::exit(1);
         }
     };
 
-    if let Err(e) = command_future(cli.command, config, config_loaded).await {
+    if let Err(e) = command_future(cli.command, config).await {
         eprintln!("{} {}", "Error:".red().bold(), e);
         process::exit(1);
     }
@@ -104,7 +105,6 @@ async fn main() {
 fn command_future(
     command: Commands,
     config: CliConfig,
-    config_loaded: bool,
 ) -> Pin<Box<dyn Future<Output = ferrum_types::Result<()>>>> {
     match command {
         Commands::Run(cmd) => Box::pin(run::execute(cmd, config)),
@@ -113,11 +113,8 @@ fn command_future(
         Commands::ReplayBundle(cmd) => Box::pin(replay_bundle::execute(cmd, config)),
         Commands::VnextDeterminism(cmd) => Box::pin(vnext_determinism::execute(cmd)),
         Commands::Serve(cmd) => Box::pin(async move {
-            let compatibility = if config_loaded {
-                ferrum_cli::config::load_interleaved_system_coalescing("ferrum.toml").await
-            } else {
-                Ok(true)
-            };
+            let compatibility =
+                ferrum_cli::config::load_interleaved_system_coalescing("ferrum.toml").await;
             match compatibility {
                 Ok(configured) => serve::execute_cli(cmd, config, configured).await,
                 Err(error) => Err(error),

@@ -5670,6 +5670,49 @@ mod tests {
     }
 
     #[test]
+    fn tiny_llama_kv_frontiers_release_and_reset_preserve_other_sequences() {
+        use crate::common::DecoderOnlyLLM;
+        use crate::test_support::{tiny_llama_model, TinyLlamaConfig};
+
+        let cfg = TinyLlamaConfig::default();
+        let mut model = tiny_llama_model(&cfg);
+        let mut reference = tiny_llama_model(&cfg);
+        for current in [&mut model, &mut reference] {
+            // Exercise real CPU forwards with its supported contiguous KV.
+            // Paged allocation/release has separate tests below.
+            current.runtime_env = LlamaFamilyRuntimeEnv::from_env_vars([
+                ("FERRUM_METAL_PAGED_KV", "0"),
+                ("FERRUM_KV_CAPACITY", "128"),
+                ("FERRUM_PREFIX_CACHE", "0"),
+            ]);
+        }
+        let first = model.prefill("seq-a", &[1, 2]);
+        assert_eq!(first.len(), cfg.vocab_size);
+        assert!(first.iter().all(|value| value.is_finite()));
+        assert_eq!(model.cache_len("seq-a"), 2);
+        let other = model.prefill("seq-b", &[3, 4, 5]);
+        assert_eq!(other, reference.prefill("seq-b", &[3, 4, 5]));
+        assert_eq!(model.cache_len("seq-b"), 3);
+        for pos in 2..5 {
+            let logits = model.decode("seq-a", 6, pos);
+            assert_eq!(logits.len(), cfg.vocab_size);
+            assert!(logits.iter().all(|value| value.is_finite()));
+            assert_eq!(model.cache_len("seq-a"), pos as usize + 1);
+            assert_eq!(model.cache_len("seq-b"), 3);
+        }
+        model.release("seq-a");
+        assert!(!model.kv_caches.contains_key("seq-a"));
+        assert_eq!(model.cache_len("seq-b"), 3);
+        assert_eq!(model.decode("seq-b", 7, 3), reference.decode("seq-b", 7, 3));
+        assert_eq!(model.cache_len("seq-b"), 4);
+        model.reset();
+        assert!(model.kv_caches.is_empty());
+        assert!(model.kv_free_pool.is_empty());
+        assert_eq!(model.prefill("seq-b", &[3, 4, 5]), other);
+        assert_eq!(model.cache_len("seq-b"), 3);
+    }
+
+    #[test]
     fn paged_kv_blocks_grow_on_demand_and_release_to_pool() {
         let mut cfg = test_llama_config(2, false);
         cfg.max_seq_len = 64;

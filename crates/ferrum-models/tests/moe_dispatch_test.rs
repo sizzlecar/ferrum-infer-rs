@@ -10,7 +10,9 @@ use candle_core::quantized::gguf_file::{self, Value};
 use candle_core::quantized::{GgmlDType, QTensor};
 use candle_core::{Device, Tensor};
 use ferrum_kernels::backend::cpu::CpuBackend;
+use ferrum_kernels::backend::Backend;
 use ferrum_models::moe::{moe_forward_cpu, route, ExpertStack, RouterOutput};
+use ferrum_quantization::gguf::GgufFile;
 
 fn silu(x: f32) -> f32 {
     x * (1.0 / (1.0 + (-x).exp()))
@@ -368,4 +370,65 @@ fn full_pipeline_synthesized_gguf_router_dispatch() {
     for (i, &v) in out.iter().enumerate() {
         assert!(v.is_finite(), "out[{i}] = {v} is not finite");
     }
+}
+
+#[test]
+fn top_k_one_with_strong_router_picks_dominant_expert() {
+    // Retain the independent numerical oracle from the retired model-layer
+    // wrapper, including real GGUF router and expert weight decoding.
+    let router = Tensor::from_vec(vec![-10.0_f32, 0.0, 10.0, 0.0], (2, 2), &Device::Cpu).unwrap();
+    let router = QTensor::quantize(&router, GgmlDType::F32).unwrap();
+    let expert = |scale| {
+        let weights = [vec![0.0; 4], scaled_identity_rows(2, scale)].concat();
+        let tensor = Tensor::from_vec(weights, (2, 2, 2), &Device::Cpu).unwrap();
+        QTensor::quantize(&tensor, GgmlDType::F32).unwrap()
+    };
+    let gate = expert(7.0);
+    let up = expert(7.0);
+    let down = expert(1.0);
+    let arch = Value::String("qwen3moe".into());
+    let mut file = tempfile::NamedTempFile::new().unwrap();
+    gguf_file::write(
+        file.as_file_mut(),
+        &[("general.architecture", &arch)],
+        &[
+            ("blk.0.ffn_gate_inp.weight", &router),
+            ("blk.0.ffn_gate_exps.weight", &gate),
+            ("blk.0.ffn_up_exps.weight", &up),
+            ("blk.0.ffn_down_exps.weight", &down),
+        ],
+    )
+    .unwrap();
+    file.flush().unwrap();
+    let gguf = GgufFile::open(file.path()).unwrap();
+    let experts = ExpertStack::<CpuBackend>::load_from_gguf(&gguf, 0, 2, 2, 2).unwrap();
+    let router_weights = gguf
+        .read_tensor("blk.0.ffn_gate_inp.weight", &Device::Cpu)
+        .unwrap()
+        .dequantize(&Device::Cpu)
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1::<f32>()
+        .unwrap();
+    let input = vec![1.0, 0.0];
+    let mut logits = vec![f32::NAN; 2];
+    CpuBackend::gemm(
+        &mut CpuBackend::new_context(),
+        &input,
+        &router_weights,
+        &mut logits,
+        1,
+        2,
+        2,
+    );
+    assert_eq!(logits, [-10.0, 10.0]);
+    let selection = route(&logits, 1, 2, 1, true);
+    assert_eq!(selection.expert_ids, [1]);
+    assert_eq!(selection.expert_weights, [1.0]);
+    let mut output = Vec::new();
+    moe_forward_cpu(&input, 1, 2, 2, 1, &selection, &experts, &mut output).unwrap();
+    assert_eq!(output.len(), 2);
+    assert!((output[0] - silu(7.0) * 7.0).abs() < 0.01);
+    assert!(output[1].abs() < 1e-3);
 }

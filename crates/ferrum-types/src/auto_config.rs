@@ -38,7 +38,6 @@ pub struct ModelCapabilities {
     pub estimated_weight_bytes: Option<u64>,
     pub recurrent_state_bytes_per_sequence: Option<u64>,
     pub supported_dtypes: Vec<String>,
-    pub graph_safe_moe: bool,
 }
 
 impl ModelCapabilities {
@@ -54,7 +53,6 @@ impl ModelCapabilities {
             estimated_weight_bytes: None,
             recurrent_state_bytes_per_sequence: None,
             supported_dtypes: vec!["fp16".to_string(), "fp32".to_string()],
-            graph_safe_moe: false,
         }
     }
 
@@ -78,7 +76,6 @@ impl ModelCapabilities {
             estimated_weight_bytes: Some(18 * GIB),
             recurrent_state_bytes_per_sequence: None,
             supported_dtypes: vec!["fp16".to_string()],
-            graph_safe_moe: false,
         }
     }
 
@@ -94,7 +91,6 @@ impl ModelCapabilities {
             estimated_weight_bytes: Some(39 * GIB),
             recurrent_state_bytes_per_sequence: None,
             supported_dtypes: vec!["fp16".to_string()],
-            graph_safe_moe: false,
         }
     }
 }
@@ -647,14 +643,7 @@ impl ResolvedFerrumConfig {
     }
 
     fn selected_graph_mode(&self) -> Option<String> {
-        let decode_graph = self.selected_string("decode_graph_policy");
-        if decode_graph
-            .as_deref()
-            .is_some_and(|mode| mode != "graph_disabled")
-        {
-            return decode_graph;
-        }
-        self.selected_string("moe_graph_policy")
+        self.selected_string("decode_graph_policy")
     }
 
     fn attention_execution_document(&self) -> serde_json::Value {
@@ -828,6 +817,9 @@ impl FerrumConfigBuilder {
     }
 
     pub fn resolve(self) -> Result<ResolvedFerrumConfig, AutoConfigError> {
+        if let Err((key, reason)) = self.runtime_config.validate_retired_options() {
+            return self.invalid(key, reason);
+        }
         let mut decisions = Vec::new();
         let cuda_backend = self.is_cuda_backend();
         let plan_runtime =
@@ -910,7 +902,6 @@ impl FerrumConfigBuilder {
             vllm_moe.value,
             AutoConfigSource::WorkloadPreset,
         )?;
-        let graph = self.bool_value("FERRUM_MOE_GRAPH", false, AutoConfigSource::WorkloadPreset)?;
         let batched_graph =
             self.bool_value("FERRUM_BATCHED_GRAPH", false, AutoConfigSource::Default)?;
         let reusable_execution = self.bool_value(
@@ -1038,12 +1029,7 @@ impl FerrumConfigBuilder {
                 fa2_direct_ffi.value,
             )?;
         }
-        self.validate_moe(
-            vllm_moe.value,
-            device_route.value,
-            pair_ids.value,
-            graph.value,
-        )?;
+        self.validate_moe(vllm_moe.value, device_route.value, pair_ids.value)?;
         self.validate_batched_graph(batched_graph.value)?;
         self.validate_unified_graph(
             unified_graph.value,
@@ -1203,7 +1189,6 @@ impl FerrumConfigBuilder {
             }
         }
         decisions.push(self.moe_decision(vllm_moe, device_route, pair_ids));
-        decisions.push(self.graph_decision(graph));
         decisions.push(self.reusable_execution_decision(reusable_execution));
         decisions.push(self.decode_graph_decision(
             batched_graph,
@@ -1779,7 +1764,6 @@ impl FerrumConfigBuilder {
         vllm_moe: bool,
         device_route: bool,
         pair_ids: bool,
-        graph: bool,
     ) -> Result<(), AutoConfigError> {
         if vllm_moe && !self.hardware.compiled_features.vllm_moe_marlin {
             return self.invalid("FERRUM_VLLM_MOE", "vLLM Marlin MoE is not compiled");
@@ -1797,28 +1781,6 @@ impl FerrumConfigBuilder {
             return self.invalid(
                 "FERRUM_VLLM_MOE_PAIR_IDS",
                 "pair-id routing requires vLLM MoE",
-            );
-        }
-        let graph_relevant = self.model.moe.is_some() || self.workload.is_m3_preset();
-        if graph && graph_relevant && !self.hardware.graph_support {
-            return self.invalid(
-                "FERRUM_MOE_GRAPH",
-                "hardware/backend does not support CUDA graph replay",
-            );
-        }
-        if graph && graph_relevant && !self.hardware.compiled_features.cuda_graph {
-            return self.invalid("FERRUM_MOE_GRAPH", "CUDA graph support is not compiled");
-        }
-        if graph && graph_relevant && !vllm_moe {
-            return self.invalid(
-                "FERRUM_MOE_GRAPH",
-                "graph decode requires the graph-clean vLLM MoE path",
-            );
-        }
-        if graph && graph_relevant && self.model.moe.is_some() && !self.model.graph_safe_moe {
-            return self.unsupported(
-                "moe_graph_policy",
-                "model MoE path is not marked graph-safe",
             );
         }
         Ok(())
@@ -2417,32 +2379,6 @@ impl FerrumConfigBuilder {
                 ],
             ),
             vec![RuntimeConfigEffect::Performance],
-        )
-    }
-
-    fn graph_decision(&self, graph: ResolvedValue<bool>) -> AutoConfigDecision {
-        let selected = if graph.value {
-            "graph_clean_decode"
-        } else {
-            "graph_disabled"
-        };
-        self.decision(
-            "moe_graph_policy",
-            selected,
-            graph.source,
-            graph.source_key,
-            ["graph_clean_decode", "graph_disabled"],
-            self.rejected_except(
-                selected,
-                [
-                    ("graph_clean_decode", "graph decode not selected"),
-                    ("graph_disabled", "graph decode selected"),
-                ],
-            ),
-            vec![
-                RuntimeConfigEffect::Performance,
-                RuntimeConfigEffect::Correctness,
-            ],
         )
     }
 
@@ -3672,7 +3608,6 @@ mod tests {
             estimated_weight_bytes: Some(24_419_939_760),
             recurrent_state_bytes_per_sequence: Some(65_863_680),
             supported_dtypes: vec!["fp16".to_string()],
-            graph_safe_moe: false,
         }
     }
 
@@ -3713,7 +3648,6 @@ mod tests {
             estimated_weight_bytes: Some(15 * GIB),
             recurrent_state_bytes_per_sequence: None,
             supported_dtypes: vec!["fp16".to_string()],
-            graph_safe_moe: false,
         }
     }
 
@@ -3758,6 +3692,36 @@ mod tests {
     }
 
     #[test]
+    fn retired_legacy_moe_controls_are_rejected_for_every_executor() {
+        for key in [
+            "FERRUM_MOE_GRAPH",
+            "FERRUM_MOE_BATCHED",
+            "FERRUM_MOE_BATCHED_DECODE",
+            "FERRUM_MOE_BATCH_THRESHOLD",
+            "FERRUM_MOE_BUCKETED",
+            "FERRUM_MOE_PREFILL_THRESHOLD",
+            "FERRUM_QWEN_UNIFIED_PREFILL",
+            "FERRUM_QWEN_UNIFIED_TRACE",
+        ] {
+            for value in ["0", "1"] {
+                for authority in [
+                    ExecutionResourceAuthority::LegacyEngine,
+                    ExecutionResourceAuthority::PlanRuntime,
+                ] {
+                    let error = FerrumConfigBuilder::new(snapshot(&[(key, value)]))
+                        .with_execution_resource_authority(authority)
+                        .resolve()
+                        .expect_err("removed legacy controls cannot silently apply to typed MoE");
+                    assert!(matches!(error,
+                        AutoConfigError::InvalidOverride { key: actual, reason }
+                        if actual == key && reason.contains("retired")
+                    ));
+                }
+            }
+        }
+    }
+
+    #[test]
     fn m3_preset_selects_current_safe_fast_path_without_fa2() {
         let resolved = m3(&[], CompiledKernelFeatures::m3_fast_path_without_fa2())
             .resolve()
@@ -3779,7 +3743,7 @@ mod tests {
             decisions["moe_implementation"],
             "vllm_marlin_moe_device_route_pair_ids"
         );
-        assert_eq!(decisions["moe_graph_policy"], "graph_disabled");
+        assert!(!decisions.contains_key("moe_graph_policy"));
         assert_eq!(decisions["decode_graph_policy"], "graph_disabled");
         assert_eq!(decisions["prefix_cache_policy"], "prefix_cache_disabled");
         assert_eq!(decisions["sampling_readback_path"], "gpu_greedy_argmax");
@@ -4858,7 +4822,7 @@ mod tests {
         );
         assert_eq!(decisions["attention_decode_backend"], "legacy_paged_decode");
         assert_eq!(decisions["moe_implementation"], "legacy_moe");
-        assert_eq!(decisions["moe_graph_policy"], "graph_disabled");
+        assert!(!decisions.contains_key("moe_graph_policy"));
         assert_eq!(decisions["sampling_readback_path"], "logits_readback");
     }
 
@@ -5358,27 +5322,6 @@ mod tests {
             max_model_len.source_key.as_deref(),
             Some("FERRUM_MAX_MODEL_LEN")
         );
-    }
-
-    #[test]
-    fn graph_enabled_with_graph_unsafe_moe_is_rejected() {
-        let mut model = ModelCapabilities::qwen3_30b_a3b_gptq_int4();
-        model.graph_safe_moe = false;
-        let err = FerrumConfigBuilder::new(snapshot(&[("FERRUM_MOE_GRAPH", "1")]))
-            .with_model_capabilities(model)
-            .with_hardware_capabilities(HardwareCapabilities::rtx4090_cuda(
-                CompiledKernelFeatures::m3_fast_path_without_fa2(),
-            ))
-            .with_workload_profile(WorkloadProfile::m3_qwen3_30b_a3b_int4())
-            .resolve()
-            .expect_err("graph unsafe MoE must fail");
-        assert!(matches!(
-            err,
-            AutoConfigError::UnsupportedCombination {
-                selection,
-                ..
-            } if selection == "moe_graph_policy"
-        ));
     }
 
     #[test]

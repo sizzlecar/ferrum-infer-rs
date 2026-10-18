@@ -156,7 +156,6 @@ impl DefinedProductionModel {
             estimated_weight_bytes: (weight_bytes > 0).then_some(weight_bytes),
             recurrent_state_bytes_per_sequence: (recurrent_bytes > 0).then_some(recurrent_bytes),
             supported_dtypes: supported_dtypes.into_iter().collect(),
-            graph_safe_moe: false,
         })
     }
 }

@@ -18,7 +18,6 @@ fn llama_8b(quantization: &str) -> ModelCapabilities {
         estimated_weight_bytes: Some(5 * GIB),
         recurrent_state_bytes_per_sequence: None,
         supported_dtypes: vec!["fp16".to_string(), "fp32".to_string()],
-        graph_safe_moe: false,
     }
 }
 
@@ -72,7 +71,6 @@ fn assert_common_contract(document: &Value, backend: &str, architecture: &str) {
 
     for name in [
         "attention_decode_backend",
-        "moe_graph_policy",
         "moe_implementation",
         "prefix_cache_policy",
     ] {

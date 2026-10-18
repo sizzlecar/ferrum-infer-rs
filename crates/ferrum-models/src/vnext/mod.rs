@@ -520,7 +520,6 @@ impl PreparedProductionModel {
             recurrent_state_bytes_per_sequence: (recurrent_state_bytes_per_sequence > 0)
                 .then_some(recurrent_state_bytes_per_sequence),
             supported_dtypes: supported_dtypes.into_iter().collect(),
-            graph_safe_moe: false,
         })
     }
 

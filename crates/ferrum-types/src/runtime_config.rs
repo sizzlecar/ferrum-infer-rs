@@ -45,6 +45,30 @@ pub struct RuntimeConfigSnapshot {
 }
 
 impl RuntimeConfigSnapshot {
+    /// Reject controls whose only executor has been retired. A forced-off
+    /// value is still an explicit unsupported option, not a retained feature.
+    pub(crate) fn validate_retired_options(&self) -> Result<(), (&str, &'static str)> {
+        for entry in &self.entries {
+            if matches!(
+                entry.key.as_str(),
+                "FERRUM_MOE_GRAPH"
+                    | "FERRUM_MOE_BATCHED"
+                    | "FERRUM_MOE_BATCHED_DECODE"
+                    | "FERRUM_MOE_BATCH_THRESHOLD"
+                    | "FERRUM_MOE_BUCKETED"
+                    | "FERRUM_MOE_PREFILL_THRESHOLD"
+                    | "FERRUM_QWEN_UNIFIED_PREFILL"
+                    | "FERRUM_QWEN_UNIFIED_TRACE"
+            ) {
+                return Err((
+                    entry.key.as_str(),
+                    "legacy Qwen3-MoE execution control has been retired; remove this option; typed MoE execution does not use it",
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// Capture all currently set `FERRUM_*` env overrides.
     pub fn capture_current() -> Self {
         Self::from_os_env_vars(std::env::vars_os())
@@ -433,7 +457,7 @@ mod tests {
             ("OTHER_ENV", "ignored"),
             ("FERRUM_FA2_NATIVE_ARTIFACT", "/tmp/libferrum_native_fa2.a"),
             ("FERRUM_PREFIX_CACHE", "1"),
-            ("FERRUM_MOE_GRAPH", "1"),
+            ("FERRUM_MOE_PROFILE", "1"),
             ("FERRUM_REUSABLE_EXECUTION", "1"),
         ]);
         let keys: Vec<_> = snapshot
@@ -445,7 +469,7 @@ mod tests {
             keys,
             vec![
                 "FERRUM_FA2_NATIVE_ARTIFACT",
-                "FERRUM_MOE_GRAPH",
+                "FERRUM_MOE_PROFILE",
                 "FERRUM_PREFIX_CACHE",
                 "FERRUM_REUSABLE_EXECUTION"
             ]
@@ -476,7 +500,7 @@ mod tests {
     fn upsert_preserves_non_env_source_and_stable_order() {
         let mut snapshot = RuntimeConfigSnapshot::from_env_vars([
             ("FERRUM_KV_DTYPE", "fp16"),
-            ("FERRUM_MOE_GRAPH", "1"),
+            ("FERRUM_PREFIX_CACHE", "1"),
         ]);
         snapshot.upsert("FERRUM_KV_DTYPE", "int8", RuntimeConfigSource::Cli);
         snapshot.upsert(
@@ -494,7 +518,7 @@ mod tests {
             keys,
             [
                 "FERRUM_KV_DTYPE",
-                "FERRUM_MOE_GRAPH",
+                "FERRUM_PREFIX_CACHE",
                 "FERRUM_PROFILE_JSONL"
             ]
         );

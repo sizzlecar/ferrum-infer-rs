@@ -110,7 +110,6 @@ rayon = "1.11"
 # ML Framework - official candle from crates.io
 candle-core = "0.9.2"
 candle-nn = "0.9.2"
-candle-transformers = "0.9.2"
 candle-flash-attn = "0.9.2"
 candle-metal-kernels = "0.9.2"
 

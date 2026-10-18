@@ -350,9 +350,6 @@ pub fn auto_size_runtime_entries(
     let kv_capacity_overridden = snapshot_value(&current, "FERRUM_KV_CAPACITY").is_some();
     // MAX_BATCHED_TOKENS already set above (it's independent of the KV pool
     // sizing logic, runs even when the user overrode KV_MAX_BLOCKS + SEQS).
-    // FERRUM_MOE_GRAPH is resolved as a typed CLI startup default and
-    // materialized outside the autosizer so it lands even when this function
-    // early-returns on full-override.
     if !kv_overridden {
         entries.push(RuntimeConfigEntry::new(
             "FERRUM_KV_MAX_BLOCKS",

@@ -1,6 +1,6 @@
 # DecoderUnifiedRunner — shared continuous-batching pipeline
 
-**Status**: design, 2026-05-13
+**Status**: historical proposal, 2026-05-13. The separate `Qwen3MoeModel` implementation is retired; its migration steps and performance targets below are historical, not current support or measured results. The current plan is the [execution architecture goal](goal-architecture-refactor.zh.md).
 **Why**: today's `LlamaFamilyModel::unified_forward_internal` is ~700 lines of model-specific code, but **~80% of it is the same scaffolding** every decoder needs (cu_seqlens setup, embedding, layer loop, final norm + lm_head, graph capture). Implementing `Qwen3MoeModel::unified_forward_internal` by copy-paste would duplicate this scaffolding. Future families (any new decoder-only LLM) would copy it again. This is an architectural failure.
 
 ## What's shared vs what's family-specific

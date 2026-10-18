@@ -449,8 +449,7 @@ impl ModelExecutor for LlmExecutor {
     /// call so launch / kernel-overhead is amortized across the cohort.
     ///
     /// Falls back to the trait default (serial per-item) when the model
-    /// returns `Err(unsupported)` from `unified_forward` — e.g. Qwen3MoeModel
-    /// today, until Phase 2 adds its native unified path.
+    /// returns `Err(unsupported)` from `unified_forward`.
     async fn batch_prefill(&self, inputs: &[PrefillInput]) -> Result<Vec<PrefillOutput>> {
         if inputs.is_empty() {
             return Ok(Vec::new());
