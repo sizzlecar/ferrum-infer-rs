@@ -381,9 +381,12 @@ impl LlmExecutor {
         {
             if input_tokens != entry.product_prompt_tokens
                 || output_tokens < entry.replayed_output_tokens
+                // The final output is sampled from the last consumed input;
+                // it does not itself occupy KV. Zero-output completion still
+                // retains the admitted prompt bound without subtracting it.
                 || input_tokens
-                    .checked_add(output_tokens)
-                    .is_none_or(|total| total > entry.maximum_tokens)
+                    .checked_add(output_tokens.saturating_sub(1))
+                    .is_none_or(|consumed| consumed > entry.maximum_tokens)
             {
                 return Err(FerrumError::request_validation(
                     "token completion usage differs from immutable admission",

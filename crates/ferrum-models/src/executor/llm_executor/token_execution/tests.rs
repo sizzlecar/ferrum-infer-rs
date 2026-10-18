@@ -268,6 +268,259 @@ async fn direct_tokens_real_llama_partial_final_decode_and_close() {
     assert!(executor.token_sequences.lock().live.is_empty());
 }
 
+#[tokio::test]
+async fn direct_tokens_real_llama_completion_accepts_last_output_at_physical_capacity() {
+    for output_tokens in [1, 3] {
+        let (executor, observation, config) = fixture(None);
+        let mut reference = model(&config);
+        let request = RequestId::new();
+        let prompt = [TokenId(1), TokenId(2), TokenId(3)];
+        let capacity = prompt.len() + output_tokens - 1;
+        let TokenAdmissionOutcome::Admitted(start) = executor
+            .admit_tokens(ExecutionAdmission {
+                context: ExecutorPrefillAdmission::for_product_request(
+                    &request,
+                    &prompt,
+                    capacity,
+                    prompt.len(),
+                    0,
+                )
+                .unwrap(),
+                adapter: None,
+            })
+            .unwrap()
+        else {
+            panic!("exact-capacity CPU admission must succeed");
+        };
+        let cache_id = executor.token_sequences.lock().live[start.sequence()]
+            .cache_id
+            .clone();
+        let mut result = prefill(&executor, &start, prompt.len(), prompt.len()).await;
+        assert_eq!(logits(&result), reference.prefill("reference", &[1, 2, 3]));
+        for generated in 1..output_tokens {
+            let token = TokenId((generated + 3) as u32);
+            let position = prompt.len() + generated - 1;
+            let policy = LogitsReturnPolicy::FullLogits;
+            let work = ExecutionWork::new(
+                result.next_frontier(),
+                TokenWork::Decode { token, position },
+                &policy,
+            )
+            .unwrap();
+            let ExecutionBatchOutcome::Completed(batch) =
+                executor.execute_tokens(&[work]).await.unwrap()
+            else {
+                panic!("CPU decode must complete");
+            };
+            result = batch.into_completions().pop().unwrap();
+            assert_eq!(
+                logits(&result),
+                reference.decode("reference", token.get(), position as u32)
+            );
+        }
+        assert_eq!(result.next_frontier().consumed_tokens(), capacity);
+        {
+            let state = observation.lock();
+            assert_eq!(state.forwards.len(), output_tokens);
+            assert!(state.model.kv_caches[&cache_id]
+                .iter()
+                .all(|layer| layer.len == capacity && layer.capacity == capacity));
+            assert!(state.releases.is_empty());
+        }
+        let closed = executor
+            .finish_tokens(
+                start.sequence(),
+                ExecutionEndReason::Completed {
+                    input_tokens: prompt.len(),
+                    output_tokens,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(closed.error.is_none());
+        assert!(
+            matches!(closed.disposition, ExecutionCloseDisposition::Ended(ref ended)
+            if ended.sequence() == start.sequence())
+        );
+        assert!(executor.token_sequences.lock().live.is_empty());
+        let state = observation.lock();
+        assert!(state.model.kv_caches.is_empty());
+        assert_eq!(
+            state.releases,
+            vec![(cache_id, vec![capacity; config.num_layers])]
+        );
+    }
+}
+
+#[tokio::test]
+async fn direct_tokens_real_llama_completion_rejects_excess_and_overflow_without_closing_owner() {
+    let (executor, observation, config) = fixture(None);
+    let mut reference = model(&config);
+    let request = RequestId::new();
+    let prompt = [TokenId(1), TokenId(2), TokenId(3)];
+    let capacity = 4;
+    let TokenAdmissionOutcome::Admitted(start) = executor
+        .admit_tokens(ExecutionAdmission {
+            context: ExecutorPrefillAdmission::for_product_request(
+                &request,
+                &prompt,
+                capacity,
+                prompt.len(),
+                0,
+            )
+            .unwrap(),
+            adapter: None,
+        })
+        .unwrap()
+    else {
+        panic!("CPU admission must succeed");
+    };
+    let cache_id = executor.token_sequences.lock().live[start.sequence()]
+        .cache_id
+        .clone();
+    let first = prefill(&executor, &start, prompt.len(), prompt.len()).await;
+    assert_eq!(logits(&first), reference.prefill("reference", &[1, 2, 3]));
+    for (input_tokens, output_tokens) in [(3, 3), (3, usize::MAX), (2, 1)] {
+        let error = executor
+            .finish_tokens(
+                start.sequence(),
+                ExecutionEndReason::Completed {
+                    input_tokens,
+                    output_tokens,
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, FerrumError::RequestValidation { ref message }
+            if message == "token completion usage differs from immutable admission")
+        );
+        assert!(start.sequence().observed_end().is_none());
+        {
+            let entries = executor.token_sequences.lock();
+            let entry = &entries.live[start.sequence()];
+            assert!(!entry.closing);
+            assert_eq!(&entry.frontier, first.next_frontier());
+        }
+        let state = observation.lock();
+        assert_eq!(state.forwards.len(), 1);
+        assert!(state.releases.is_empty());
+        assert!(state.model.kv_caches[&cache_id]
+            .iter()
+            .all(|layer| layer.len == 3));
+    }
+    let policy = LogitsReturnPolicy::FullLogits;
+    let work = ExecutionWork::new(
+        first.next_frontier(),
+        TokenWork::Decode {
+            token: TokenId(4),
+            position: 3,
+        },
+        &policy,
+    )
+    .unwrap();
+    let ExecutionBatchOutcome::Completed(batch) = executor.execute_tokens(&[work]).await.unwrap()
+    else {
+        panic!("the unchanged owner must remain executable");
+    };
+    assert_eq!(
+        logits(&batch.completions()[0]),
+        reference.decode("reference", 4, 3)
+    );
+    assert_eq!(
+        batch.completions()[0].next_frontier().consumed_tokens(),
+        capacity
+    );
+    let closed = executor
+        .finish_tokens(
+            start.sequence(),
+            ExecutionEndReason::Completed {
+                input_tokens: 3,
+                output_tokens: 2,
+            },
+        )
+        .await
+        .unwrap();
+    assert!(closed.error.is_none());
+    assert!(
+        matches!(closed.disposition, ExecutionCloseDisposition::Ended(ref ended)
+        if ended.sequence() == start.sequence())
+    );
+    assert!(executor.token_sequences.lock().live.is_empty());
+    let state = observation.lock();
+    assert!(state.model.kv_caches.is_empty());
+    assert_eq!(state.forwards.len(), 2);
+    assert_eq!(
+        state.releases,
+        vec![(cache_id, vec![capacity; config.num_layers])]
+    );
+}
+
+#[tokio::test]
+async fn direct_tokens_real_llama_completion_preserves_zero_output_and_replay_accounting() {
+    // Product usage is not an equality assertion about the physical frontier:
+    // recompute can already contain output tokens, and a caller can close after
+    // prefill without publishing a sampled output. Match the native contract.
+    for replayed in [0, 2] {
+        let (executor, observation, config) = fixture(None);
+        let request = RequestId::new();
+        let prompt = vec![TokenId(1); 2 + replayed];
+        let TokenAdmissionOutcome::Admitted(start) = executor
+            .admit_tokens(ExecutionAdmission {
+                context: ExecutorPrefillAdmission::for_product_request(
+                    &request,
+                    &prompt,
+                    prompt.len(),
+                    2,
+                    replayed,
+                )
+                .unwrap(),
+                adapter: None,
+            })
+            .unwrap()
+        else {
+            panic!("CPU replay admission must succeed");
+        };
+        let result = prefill(&executor, &start, prompt.len(), prompt.len()).await;
+        assert_eq!(result.next_frontier().consumed_tokens(), prompt.len());
+        if replayed > 0 {
+            assert!(executor
+                .finish_tokens(
+                    start.sequence(),
+                    ExecutionEndReason::Completed {
+                        input_tokens: 2,
+                        output_tokens: replayed - 1,
+                    }
+                )
+                .await
+                .is_err());
+            assert!(start.sequence().observed_end().is_none());
+            assert!(!executor.token_sequences.lock().live[start.sequence()].closing);
+            assert!(observation.lock().releases.is_empty());
+        }
+        let closed = executor
+            .finish_tokens(
+                start.sequence(),
+                ExecutionEndReason::Completed {
+                    input_tokens: 2,
+                    output_tokens: replayed,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(closed.error.is_none());
+        assert!(matches!(
+            closed.disposition,
+            ExecutionCloseDisposition::Ended(_)
+        ));
+        assert!(executor.token_sequences.lock().live.is_empty());
+        let state = observation.lock();
+        assert!(state.model.kv_caches.is_empty());
+        assert_eq!(state.releases.len(), 1);
+        assert_eq!(state.releases[0].1, vec![prompt.len(); config.num_layers]);
+    }
+}
+
 #[test]
 fn direct_tokens_real_llama_admission_reserves_actual_blocks_and_retries_after_release() {
     let (executor, observation, _) = fixture(None);
