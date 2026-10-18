@@ -10,6 +10,8 @@ pub(super) struct SequenceSettlement<R: DeviceRuntime> {
     pub(super) cancel_requested: bool,
     pub(super) terminal: Option<SequenceSessionTerminalReceipt>,
     held: Option<Arc<HeldCohort<R>>>,
+    terminal_waiters:
+        Vec<tokio::sync::oneshot::Sender<ferrum_execution::token_execution::ExecutionEnded>>,
 }
 
 impl<R: DeviceRuntime> Default for SequenceSettlement<R> {
@@ -19,6 +21,7 @@ impl<R: DeviceRuntime> Default for SequenceSettlement<R> {
             cancel_requested: false,
             terminal: None,
             held: None,
+            terminal_waiters: Vec::new(),
         }
     }
 }
@@ -195,6 +198,9 @@ pub(super) struct WaveFailure {
 }
 
 impl WaveFailure {
+    pub(super) fn into_parts(self) -> (FerrumError, WaveProgress) {
+        (self.error, self.progress)
+    }
     pub(super) fn not_submitted(error: FerrumError) -> Self {
         Self {
             error,
@@ -590,6 +596,8 @@ impl<R: DeviceRuntime> VNextSequenceRegistry<R> {
         if sequence.settlement.lock().terminal.is_none() {
             return;
         }
+        sequence.publish_token_terminal();
+        self.token_index.remove(&sequence.token_identity);
         if self
             .active
             .get(&sequence.cache_id)
@@ -609,6 +617,64 @@ impl<R: DeviceRuntime> VNextSequenceRegistry<R> {
 }
 
 impl<R: DeviceRuntime> VNextSequence<R> {
+    fn publish_token_terminal(&self) {
+        let mut settlement = self.settlement.lock();
+        self.publish_token_terminal_locked(&mut settlement);
+    }
+
+    fn publish_token_terminal_locked(&self, settlement: &mut SequenceSettlement<R>) {
+        if settlement.terminal.is_none() {
+            return;
+        }
+        // The issuer only names the authentic receipt already retained above.
+        if let Ok(ended) = self.token_issuer.ended(&self.token_identity) {
+            for waiter in settlement.terminal_waiters.drain(..) {
+                let _ = waiter.send(ended.clone());
+            }
+        }
+    }
+
+    pub(super) fn record_token_terminal(&self, receipt: SequenceSessionTerminalReceipt) {
+        let mut settlement = self.settlement.lock();
+        settlement.terminal = Some(receipt);
+        self.publish_token_terminal_locked(&mut settlement);
+    }
+
+    pub(super) fn token_close_observation(
+        &self,
+    ) -> Result<ferrum_execution::token_execution::ExecutionCloseOutcome> {
+        use ferrum_execution::token_execution::ExecutionCloseOutcome;
+        let mut settlement = self.settlement.lock();
+        if settlement.terminal.is_some() {
+            return self
+                .token_issuer
+                .ended(&self.token_identity)
+                .map(ExecutionCloseOutcome::ended);
+        }
+        // Reserved before admission publication; a cold close never needs a
+        // new identity allocation that could exhaust after model execution.
+        let key = self.token_recovery_key.clone();
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        settlement.terminal_waiters.push(sender);
+        self.token_issuer
+            .held(key, async move {
+                receiver.await.map_err(|_| {
+                    FerrumError::backend(
+                        "native terminal owner ended without publishing a terminal receipt",
+                    )
+                })
+            })
+            .map(ExecutionCloseOutcome::held)
+    }
+    pub(super) fn token_frontier_is_open(&self) -> bool {
+        let settlement = self.settlement.lock();
+        self.active.load(Ordering::Acquire)
+            && !settlement.closing
+            && !settlement.cancel_requested
+            && settlement.terminal.is_none()
+            && settlement.held.is_none()
+    }
+
     pub(super) fn begin_closing(&self) {
         self.active.store(false, Ordering::Release);
         self.settlement.lock().closing = true;
@@ -635,6 +701,7 @@ impl<R: DeviceRuntime> VNextSequence<R> {
             })
         })?;
         settlement.terminal = Some(receipt);
+        self.publish_token_terminal_locked(&mut settlement);
         Ok(())
     }
 }

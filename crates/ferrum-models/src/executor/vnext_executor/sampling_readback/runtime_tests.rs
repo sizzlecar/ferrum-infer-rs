@@ -9,6 +9,7 @@ use serde_json::json;
 
 mod fixture;
 mod lifecycle;
+mod token_execution;
 use fixture::{Fixture, FixtureOptions, VOCAB};
 
 fn cpu(

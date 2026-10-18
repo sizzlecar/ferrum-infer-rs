@@ -893,6 +893,84 @@ where
         &self.runtime_cfg
     }
 
+    fn supports_direct_token_execution(&self) -> bool {
+        B::host_execution_is_synchronous()
+    }
+
+    fn execute_token_work(
+        &mut self,
+        cache_id: &str,
+        work: crate::common::llm::ModelTokenWork<'_>,
+    ) -> crate::common::llm::ModelTokenOutcome {
+        use crate::common::llm::{catch_host_execution, ModelTokenOutcome, ModelTokenWork};
+        if !B::host_execution_is_synchronous() {
+            return ModelTokenOutcome::NotSubmitted(FerrumError::unsupported(
+                "device pipeline token execution requires retained stage submissions",
+            ));
+        }
+        let (position, count, tokens_valid) = match work {
+            ModelTokenWork::Prefill { tokens, position } => (
+                position,
+                tokens.len(),
+                tokens
+                    .iter()
+                    .all(|&token| (token as usize) < self.runtime_cfg.vocab_size),
+            ),
+            ModelTokenWork::Decode { token, position } => (
+                position as usize,
+                1,
+                (token as usize) < self.runtime_cfg.vocab_size,
+            ),
+        };
+        if self.stages.is_empty()
+            || self.stages.len() != self.placement.stages().len()
+            || count == 0
+            || !tokens_valid
+            || position
+                .checked_add(count)
+                .is_none_or(|end| end > self.kv_capacity() || end > u32::MAX as usize)
+            || self.stages.iter().any(|stage| {
+                stage
+                    .kv_caches
+                    .get(cache_id)
+                    .map_or(position != 0, |layers| {
+                        layers.iter().any(|cache| K::len(cache) != position)
+                    })
+            })
+        {
+            return ModelTokenOutcome::NotSubmitted(FerrumError::request_validation(
+                "token work has invalid shape, capacity, vocabulary or pipeline KV frontier",
+            ));
+        }
+        let result = catch_host_execution(|| match work {
+            ModelTokenWork::Prefill { tokens, .. } => self.prefill(cache_id, tokens),
+            ModelTokenWork::Decode { token, position } => self.decode(cache_id, token, position),
+        });
+        if result.is_err() {
+            for stage in &mut self.stages {
+                stage.recover_host_token_scratch();
+            }
+        }
+        ModelTokenOutcome::Terminal(result)
+    }
+
+    fn close_token_sequence(&mut self, cache_id: &str) -> Result<()> {
+        if !B::host_execution_is_synchronous() {
+            return Err(FerrumError::unsupported(
+                "device pipeline closure requires each actual stage submission",
+            ));
+        }
+        crate::common::llm::catch_host_execution(|| self.release(cache_id))
+    }
+
+    fn prepare_kv_capacity(&mut self, cache_id: &str, capacity_hint: usize) {
+        for (index, stage) in self.stages.iter_mut().enumerate() {
+            B::with_device_ordinal(self.placement.stage(index).backend_device_ordinal, || {
+                stage.ensure_kv_with_capacity_hint(cache_id, Some(capacity_hint));
+            });
+        }
+    }
+
     fn cache_metrics_snapshot(&self) -> Option<serde_json::Value> {
         let stage_bridge = self.placement.stage_bridge();
         let pipeline_mode = self.pipeline_mode();
@@ -1221,6 +1299,88 @@ mod tests {
             max_diff < 1e-5,
             "{label} logits diverged: max_diff={max_diff} expected={expected:?} actual={actual:?}"
         );
+    }
+
+    #[test]
+    fn pipeline_direct_tokens_validate_before_mutation_and_match_real_forward() {
+        use crate::common::llm::{ModelTokenOutcome, ModelTokenWork};
+        let (mut full, mut pipeline) = build_full_and_pipeline();
+        for stage in std::iter::once(&mut full).chain(pipeline.stages.iter_mut()) {
+            stage.runtime_env.metal_paged_kv = Some(false);
+            stage.runtime_env.prefix_cache = false;
+            stage.runtime_env.kv_capacity = Some(16);
+        }
+        for work in [
+            ModelTokenWork::Prefill {
+                tokens: &[],
+                position: 0,
+            },
+            ModelTokenWork::Prefill {
+                tokens: &[0],
+                position: usize::MAX,
+            },
+            ModelTokenWork::Prefill {
+                tokens: &[7],
+                position: 0,
+            },
+            ModelTokenWork::Decode {
+                token: 0,
+                position: 16,
+            },
+        ] {
+            assert!(matches!(
+                pipeline.execute_token_work("pipe", work),
+                ModelTokenOutcome::NotSubmitted(_)
+            ));
+            assert!(pipeline
+                .stages
+                .iter()
+                .all(|stage| stage.kv_caches.is_empty()));
+        }
+        let ModelTokenOutcome::Terminal(Ok(logits)) = pipeline.execute_token_work(
+            "pipe",
+            ModelTokenWork::Prefill {
+                tokens: &[0, 1],
+                position: 0,
+            },
+        ) else {
+            panic!("expected real terminal prefill")
+        };
+        assert_logits_close("direct prefill", &full.prefill("full", &[0, 1]), &logits);
+        assert!(pipeline
+            .stages
+            .iter()
+            .all(|stage| stage.cache_len("pipe") == 2));
+        let ModelTokenOutcome::Terminal(Ok(logits)) = pipeline.execute_token_work(
+            "pipe",
+            ModelTokenWork::Decode {
+                token: 2,
+                position: 2,
+            },
+        ) else {
+            panic!("expected real terminal decode")
+        };
+        assert_logits_close("direct decode", &full.decode("full", 2, 2), &logits);
+        assert!(pipeline
+            .stages
+            .iter()
+            .all(|stage| stage.cache_len("pipe") == 3));
+        pipeline.close_token_sequence("pipe").unwrap();
+        assert!(pipeline
+            .stages
+            .iter()
+            .all(|stage| stage.kv_caches.is_empty()));
+        pipeline.stages.clear();
+        assert!(matches!(
+            pipeline.execute_token_work(
+                "missing",
+                ModelTokenWork::Prefill {
+                    tokens: &[0],
+                    position: 0
+                }
+            ),
+            ModelTokenOutcome::NotSubmitted(_)
+        ));
     }
 
     #[test]

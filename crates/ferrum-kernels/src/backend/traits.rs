@@ -89,6 +89,21 @@ pub trait Backend: Send + Sync + Sized + 'static {
     /// CPU: no-op. Metal: commit + waitUntilCompleted. CUDA: stream sync.
     fn sync(ctx: &mut Self::Context);
 
+    /// True only when every operation completes on the calling host thread and
+    /// no device work can retain local buffers after an operation returns or
+    /// unwinds. This permits host model code to report terminal failures.
+    fn host_execution_is_synchronous() -> bool {
+        false
+    }
+
+    /// Observe completion on the actual execution context. Unsupported is not
+    /// evidence of quiescence; callers must retain that context and its owners.
+    fn try_sync(_ctx: &mut Self::Context) -> ferrum_types::Result<()> {
+        Err(ferrum_types::FerrumError::unsupported(
+            "backend has no checked synchronization implementation",
+        ))
+    }
+
     /// Whether the backend context is currently inside a graph-capture window.
     ///
     /// Synchronizing a CUDA stream while capture is active raises

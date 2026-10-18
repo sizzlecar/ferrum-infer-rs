@@ -11,6 +11,10 @@ use ferrum_execution::model_executor::{
 use ferrum_interfaces::RecurrentStateSpec;
 use ferrum_types::{RequestId, Result, TokenId};
 
+mod token;
+pub(crate) use token::catch_host_execution;
+pub use token::{ModelTokenOutcome, ModelTokenWork};
+
 /// Runtime configuration every decoder-only LLM must expose.
 ///
 /// This is the *execution-facing* config — the bare minimum the surrounding
@@ -43,6 +47,35 @@ pub struct LlmRuntimeConfig {
 pub trait DecoderOnlyLLM: Send + Sync {
     /// Runtime-facing configuration.
     fn config(&self) -> &LlmRuntimeConfig;
+
+    /// Whether this implementation provides the direct token lifecycle below.
+    /// This is an implementation contract, not a device-name inference. The
+    /// initial Llama implementation covers synchronous host execution; GPU
+    /// implementations must retain the actual submission context on failure.
+    fn supports_direct_token_execution(&self) -> bool {
+        false
+    }
+
+    /// Execute borrowed tokens directly in the model's numerical core. A
+    /// terminal outcome covers this participant only; it does not attest that
+    /// any later member of a batch ran or that its product was accepted.
+    fn execute_token_work(
+        &mut self,
+        _cache_id: &str,
+        _work: ModelTokenWork<'_>,
+    ) -> ModelTokenOutcome {
+        ModelTokenOutcome::NotSubmitted(ferrum_types::FerrumError::unsupported(
+            "model has not implemented direct token execution",
+        ))
+    }
+
+    /// Checked model-owned cache retirement. An error retains the cache and
+    /// cannot be converted into an ended sequence by the executor.
+    fn close_token_sequence(&mut self, _cache_id: &str) -> Result<()> {
+        Err(ferrum_types::FerrumError::unsupported(
+            "model has not implemented checked token closure",
+        ))
+    }
 
     /// Adapter execution implemented by this configured model instance.
     fn adapter_execution_support(&self) -> ferrum_interfaces::adapter::AdapterExecutionSupport {

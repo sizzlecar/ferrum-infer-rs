@@ -28,7 +28,12 @@ fn completion_sequence(
     )
     .unwrap();
     let active_binding = Arc::new(TrustedActiveSequenceBinding::from_session(&session).unwrap());
+    let token_issuer = ExecutorSequenceIssuer::new();
+    let token_identity = token_issuer.issue_sequence().unwrap();
     let sequence = Arc::new(VNextSequence {
+        token_recovery_key: token_issuer.recovery_key(&token_identity).unwrap(),
+        token_identity,
+        token_issuer,
         prefix_capture_interests: Mutex::new(Vec::new()),
         cache_id: suffix.to_owned(),
         request,

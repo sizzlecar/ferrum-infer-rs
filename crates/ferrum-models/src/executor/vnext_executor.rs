@@ -33,6 +33,9 @@ use ferrum_execution::model_executor::{
     PrefillChunk, PrefillInput, PrefillOutput, PrefixCaptureBoundary, PrefixCaptureLease,
     PrefixCapturePlan, PrefixCaptureRequest, TypedSequenceStateMemory,
 };
+use ferrum_execution::token_execution::{
+    ExecutionRecoveryKey, ExecutorSequence, ExecutorSequenceIssuer,
+};
 use ferrum_execution::{ModelExecutor, ProductExecutionEventSink};
 use ferrum_interfaces::kv_cache::{BlockTable, CacheHandleStats};
 use ferrum_interfaces::{KvCacheHandle, TensorRef};
@@ -81,6 +84,7 @@ mod sampling_readback;
 mod sequence_settlement;
 use sequence_settlement::{PreparedWaveGuard, RetiredWave, SequenceSettlement, WaveFailure};
 mod state_memory;
+mod token_execution;
 pub use determinism::{
     VNextDeterminismExecutionMode, VNextDeterminismExecutionSpec, VNextDeterminismInitialState,
     VNextDeterminismParticipantSpec, VNextDeterminismPhase, VNextDeterminismWorkspacePoison,
@@ -3770,6 +3774,9 @@ impl VNextExecutionJournal {
 }
 
 struct VNextSequence<R: DeviceRuntime> {
+    token_identity: ExecutorSequence,
+    token_recovery_key: ExecutionRecoveryKey,
+    token_issuer: ExecutorSequenceIssuer,
     prefix_capture_interests:
         Mutex<Vec<std::sync::Weak<prefix_cache::rendezvous::NativePrefixCapture<R>>>>,
     cache_id: String,
@@ -3876,10 +3883,12 @@ impl<R: DeviceRuntime> VNextSequence<R> {
                 self.request_id()
             )));
         }
-        self.session
+        let receipt = self
+            .session
             .try_abort_if_quiescent()
             .map_err(|error| FerrumError::backend(error.to_string()))?;
         self.active.store(false, Ordering::Release);
+        self.record_token_terminal(receipt);
         Ok(())
     }
 
@@ -3912,7 +3921,7 @@ impl<R: DeviceRuntime> VNextSequence<R> {
             .session
             .try_complete()
             .map_err(|error| FerrumError::backend(format!("vNext sequence completion: {error}")))?;
-        self.settlement.lock().terminal = Some(receipt.clone());
+        self.record_token_terminal(receipt.clone());
         if let Some(events) = &self.events {
             events
                 .lock()
@@ -3947,7 +3956,7 @@ impl<R: DeviceRuntime> VNextSequence<R> {
             .session
             .try_abort()
             .map_err(|error| FerrumError::backend(format!("vNext failure abort: {error}")))?;
-        self.settlement.lock().terminal = Some(receipt.clone());
+        self.record_token_terminal(receipt.clone());
         self.events
             .as_ref()
             .ok_or_else(|| {
@@ -4203,6 +4212,7 @@ struct VNextPrefillSlot<R: DeviceRuntime> {
     work_shape: ResourceWorkShape,
     cancelled: AtomicBool,
     state: Mutex<VNextPrefillSlotState<R>>,
+    admission: Mutex<Option<token_execution::AdmissionBinding>>,
 }
 
 impl<R: DeviceRuntime> VNextPrefillSlot<R> {
@@ -4212,6 +4222,7 @@ impl<R: DeviceRuntime> VNextPrefillSlot<R> {
             work_shape,
             cancelled: AtomicBool::new(false),
             state: Mutex::new(VNextPrefillSlotState::Probing),
+            admission: Mutex::new(None),
         })
     }
 }
@@ -4226,6 +4237,8 @@ impl<R: DeviceRuntime> Drop for VNextPrefillSlot<R> {
 struct VNextSequenceRegistry<R: DeviceRuntime> {
     prefills: HashMap<RequestId, Arc<VNextPrefillSlot<R>>>,
     active: HashMap<String, Arc<VNextSequence<R>>>,
+    // Identity lookup only; the existing prefill/active entries own resources.
+    token_index: HashMap<ExecutorSequence, Weak<VNextSequence<R>>>,
     recovery_wake: Option<Arc<super::vnext_completion_worker::VNextRecoveryWake>>,
 }
 
@@ -4234,6 +4247,7 @@ impl<R: DeviceRuntime> Default for VNextSequenceRegistry<R> {
         Self {
             prefills: HashMap::new(),
             active: HashMap::new(),
+            token_index: HashMap::new(),
             recovery_wake: None,
         }
     }
@@ -4662,6 +4676,7 @@ impl<R: DeviceRuntime> VNextSequenceRegistry<R> {
             slot.cancelled.store(true, Ordering::Release);
             drop(state);
             self.prefills.remove(request_id);
+            self.token_index.remove(&sequence.token_identity);
             return Ok(ExecutorExecutionCapacityPreemptionAuthority::RetainedPrefill);
         }
 
@@ -4691,6 +4706,7 @@ impl<R: DeviceRuntime> VNextSequenceRegistry<R> {
         }
         sequence.preempt_for_recompute()?;
         self.active.remove(preemption.cache_id());
+        self.token_index.remove(&sequence.token_identity);
         Ok(ExecutorExecutionCapacityPreemptionAuthority::ActiveSequence)
     }
 
@@ -4768,6 +4784,7 @@ impl<R: DeviceRuntime> Drop for VNextPrefillExecutionGuard<'_, R> {
 /// Backend-neutral executor over one concrete device runtime and operation
 /// registry. CUDA and Metal factories differ only in composition creation.
 pub struct VNextModelExecutor<R: DeviceRuntime> {
+    token_issuer: ExecutorSequenceIssuer,
     info: ModelInfo,
     resolved_plan: ResolvedModelPlan,
     capability_catalog: CapabilityCatalog,
@@ -5345,6 +5362,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             .reset_baseline(runtime.program_binding_upload_snapshot());
         Ok(Self {
             info,
+            token_issuer: ExecutorSequenceIssuer::new(),
             resolved_plan,
             capability_catalog: catalog,
             runtime,
@@ -6445,6 +6463,9 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 )
             }
             VNextPrefillProbeResolution::Ready(sequence) => {
+                sequences
+                    .token_index
+                    .insert(sequence.token_identity.clone(), Arc::downgrade(&sequence));
                 *state = VNextPrefillSlotState::Ready(sequence);
                 (
                     ExecutorPrefillAdmissionDecision::Admitted(ExecutorPrefillAdmissionReceipt {
@@ -6530,7 +6551,18 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 return Err(terminalize_unsubmitted_session(&session, error));
             }
         };
+        let token_identity = self
+            .token_issuer
+            .issue_sequence()
+            .map_err(|error| terminalize_unsubmitted_session(&session, error))?;
+        let token_recovery_key = self
+            .token_issuer
+            .recovery_key(&token_identity)
+            .map_err(|error| terminalize_unsubmitted_session(&session, error))?;
         let sequence = Arc::new(VNextSequence {
+            token_identity,
+            token_recovery_key,
+            token_issuer: self.token_issuer.clone(),
             prefix_capture_interests: Mutex::new(Vec::new()),
             cache_id: format!(
                 "vnext-cache-{request_id}-{}-{}",
@@ -10576,47 +10608,36 @@ impl<R: DeviceRuntime> ModelExecutor for VNextModelExecutor<R> {
         &self,
         input: ExecutorPrefillAdmission<'_>,
     ) -> Result<ExecutorPrefillAdmissionDecision> {
-        input.validate()?;
-        if input.maximum_sequence_tokens < input.input_tokens.len()
-            || input.maximum_sequence_tokens > self.maximum_model_tokens
-        {
-            return Err(FerrumError::request_validation(format!(
-                "request sequence ceiling {} must cover prompt {} and not exceed {}",
-                input.maximum_sequence_tokens,
-                input.input_tokens.len(),
-                self.maximum_model_tokens
-            )));
-        }
-        let tokens = input
-            .input_tokens
-            .iter()
-            .map(|token| token.get())
-            .collect::<Vec<_>>();
-        let span =
-            TokenSpanWork::from_token_ids_with_fit(&tokens, 0..1, input.maximum_sequence_tokens)
-                .map_err(|error| FerrumError::backend(error.to_string()))?;
-        let work = ResourceWorkShape::single(span.clone())
-            .map_err(|error| FerrumError::backend(error.to_string()))?;
-        let slot = self
-            .sequences
-            .lock()
-            .begin_prefill_probe(input.request_id, &work)?;
-        let resolution = match self.resolve_prefill_probe(
-            input.request_id,
-            input.request_origin,
-            input.maximum_sequence_tokens,
-            tokens,
-            input.product_prompt_tokens,
-            input.replayed_output_tokens,
-            work,
-        ) {
-            Ok(resolution) => resolution,
-            Err(error) => {
-                self.fail_prefill_probe(&slot);
-                return Err(error);
-            }
-        };
-        self.publish_prefill_probe(&slot, resolution)
+        self.admit_bound_prefill(input, false)
+    }
+
+    fn admit_tokens(
+        &self,
+        input: ferrum_execution::token_execution::ExecutionAdmission<'_>,
+    ) -> Result<ferrum_execution::token_execution::TokenAdmissionOutcome> {
+        self.admit_native_tokens(input)
+    }
+
+    async fn execute_tokens(
+        &self,
+        work: &[ferrum_execution::token_execution::ExecutionWork<'_>],
+    ) -> Result<ferrum_execution::token_execution::ExecutionBatchOutcome> {
+        self.execute_native_tokens(work).await
+    }
+
+    async fn finish_tokens(
+        &self,
+        sequence: &ExecutorSequence,
+        reason: ferrum_execution::token_execution::ExecutionEndReason,
+    ) -> Result<ferrum_execution::token_execution::ExecutionCloseOutcome> {
+        self.finish_native_tokens(sequence, reason).await
+    }
+
+    fn cancel_tokens(
+        &self,
+        sequence: &ExecutorSequence,
+    ) -> Result<ferrum_execution::token_execution::ExecutionCloseOutcome> {
+        self.cancel_native_tokens(sequence)
     }
 
     fn cancel_prefill_admission(&self, request_id: &RequestId) -> bool {

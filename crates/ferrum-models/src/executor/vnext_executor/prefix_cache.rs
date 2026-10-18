@@ -42,19 +42,19 @@ impl PrefixCacheMetrics {
             .fetch_add(retained_bytes, Ordering::Relaxed);
     }
 
-    fn acknowledge_restore(
+    fn acknowledge_restore<T>(
         &self,
         restored_tokens: usize,
-        acknowledge: impl FnOnce() -> Result<()>,
-    ) -> Result<()> {
+        acknowledge: impl FnOnce() -> Result<T>,
+    ) -> Result<T> {
         // This callback includes exact-target/cancellation checks and consumes
         // the native publication. Lookup, copy completion and a dropped output
         // do not establish a successfully published restore.
-        acknowledge()?;
+        let output = acknowledge()?;
         self.saved_prefill_tokens
             .fetch_add(restored_tokens as u64, Ordering::Relaxed);
         self.hits.fetch_add(1, Ordering::Relaxed);
-        Ok(())
+        Ok(output)
     }
 
     pub(super) fn reset(&self) {
@@ -758,7 +758,7 @@ struct RestoreAcknowledgement<R: DeviceRuntime> {
 }
 
 impl<R: DeviceRuntime> RestoreAcknowledgement<R> {
-    fn acknowledge(mut self) -> Result<()> {
+    fn acknowledge(mut self) -> Result<ferrum_execution::token_execution::ExecutionFrontier> {
         let state = self.slot.state.lock();
         if self.slot.cancelled.load(Ordering::Acquire)
             || !self.sequence.active.load(Ordering::Acquire)
@@ -789,14 +789,19 @@ impl<R: DeviceRuntime> RestoreAcknowledgement<R> {
                 "prefix restore publication names another target",
             ));
         }
-        self.sequence
-            .prefill_tokens_processed
-            .store(publication.completed_tokens(), Ordering::Release);
+        let completed_tokens = publication.completed_tokens();
         publication
             .acknowledge()
             .map_err(|error| FerrumError::backend(error.to_string()))?;
+        self.sequence
+            .prefill_tokens_processed
+            .store(completed_tokens, Ordering::Release);
+        let frontier = self
+            .sequence
+            .token_issuer
+            .frontier(&self.sequence.token_identity, completed_tokens)?;
         self.acknowledged = true;
-        Ok(())
+        Ok(frontier)
     }
 }
 
@@ -1402,11 +1407,12 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             acknowledged: false,
         };
         let metrics = Arc::clone(&self.metrics.prefix_cache);
-        PlanRuntimePrefixRestoreOutput::new(
+        PlanRuntimePrefixRestoreOutput::new_tokens(
             input.request_id.clone(),
             restored_tokens,
             tokens.len(),
             self.cache_handle(&sequence, restored_tokens),
+            sequence.token_identity.clone(),
             move || observer.acknowledge(&metrics, restored_tokens, || callback.acknowledge()),
         )
         .map(PlanRuntimePrefixRestoreOutcome::Restored)

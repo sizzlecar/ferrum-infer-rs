@@ -33,6 +33,8 @@ use crate::vnext::ProductionModelSourceBundle;
 
 use super::common::{self, GenericKvCacheHandle};
 
+mod token_execution;
+
 const KV_ADMISSION_TARGET_LEN_METADATA_KEY: &str = "ferrum_kv_admission_target_len";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -189,6 +191,8 @@ pub struct LlmExecutor {
     next_cache_id: AtomicU64,
     total_model_lock_wait_us: AtomicU64,
     model_lock_wait_samples: AtomicU64,
+    token_issuer: ferrum_execution::token_execution::ExecutorSequenceIssuer,
+    token_sequences: Mutex<token_execution::TokenSequences>,
 }
 
 impl LlmExecutor {
@@ -219,6 +223,8 @@ impl LlmExecutor {
             next_cache_id: AtomicU64::new(0),
             total_model_lock_wait_us: AtomicU64::new(0),
             model_lock_wait_samples: AtomicU64::new(0),
+            token_issuer: ferrum_execution::token_execution::ExecutorSequenceIssuer::new(),
+            token_sequences: Mutex::new(token_execution::TokenSequences::default()),
         }
     }
 
@@ -283,6 +289,38 @@ impl LlmExecutor {
 
 #[async_trait::async_trait]
 impl ModelExecutor for LlmExecutor {
+    fn admit_tokens(
+        &self,
+        input: ferrum_execution::token_execution::ExecutionAdmission<'_>,
+    ) -> Result<ferrum_execution::token_execution::TokenAdmissionOutcome> {
+        self.admit_token_sequence(input)
+    }
+
+    async fn execute_tokens(
+        &self,
+        work: &[ferrum_execution::token_execution::ExecutionWork<'_>],
+    ) -> Result<ferrum_execution::token_execution::ExecutionBatchOutcome> {
+        self.execute_token_batch(work)
+    }
+
+    async fn finish_tokens(
+        &self,
+        sequence: &ferrum_execution::token_execution::ExecutorSequence,
+        reason: ferrum_execution::token_execution::ExecutionEndReason,
+    ) -> Result<ferrum_execution::token_execution::ExecutionCloseOutcome> {
+        self.close_token_incarnation(sequence, reason)
+    }
+
+    fn cancel_tokens(
+        &self,
+        sequence: &ferrum_execution::token_execution::ExecutorSequence,
+    ) -> Result<ferrum_execution::token_execution::ExecutionCloseOutcome> {
+        self.close_token_incarnation(
+            sequence,
+            ferrum_execution::token_execution::ExecutionEndReason::Cancelled,
+        )
+    }
+
     fn info(&self) -> &ModelInfo {
         &self.info
     }

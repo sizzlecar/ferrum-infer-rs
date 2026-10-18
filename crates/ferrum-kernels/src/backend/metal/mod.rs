@@ -736,6 +736,10 @@ impl Backend for MetalBackend {
     fn sync(ctx: &mut Self::Context) {
         ctx.flush();
     }
+
+    fn try_sync(ctx: &mut Self::Context) -> Result<()> {
+        ctx.flush_checked()
+    }
     fn sync_before_host_readback(ctx: &mut Self::Context) {
         Self::sync(ctx);
     }

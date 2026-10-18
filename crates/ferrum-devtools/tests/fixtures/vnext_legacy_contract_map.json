@@ -4,7 +4,7 @@
   "source": {
     "g00a_checkpoint_id": "G00a",
     "category": "backend_trait_method",
-    "expected_method_count": 83
+    "expected_method_count": 85
   },
   "mappings": [
     {"legacy_trait":"Backend","legacy_method":"make_timer","classification":"versioned_operation","owner":"ExecutionEventSink + OperationContract","disposition":"Remove the timer factory from DeviceRuntime; G06 provider/backend spans use OperationContract profile-phase identity and G08D removes the legacy method."},
@@ -12,6 +12,8 @@
     {"legacy_trait":"Backend","legacy_method":"with_device_ordinal","classification":"stable_device_primitive","owner":"DeviceRuntime","disposition":"Replace the generic closure scope with typed DeviceRuntime device selection; G08D removes the non-object-safe legacy method."},
     {"legacy_trait":"Backend","legacy_method":"supports_device_ordinal_scope","classification":"stable_device_primitive","owner":"DeviceRuntime","disposition":"Represent device-ordinal scope as a typed DeviceRuntime capability; remove the independent boolean and let G08D delete the legacy method."},
     {"legacy_trait":"Backend","legacy_method":"sync","classification":"stable_device_primitive","owner":"DeviceRuntime","disposition":"Replace with typed DeviceRuntime command synchronization and domain-checked IdentifiedFailure carrying the exact execution identity; G08D removes the legacy method."},
+    {"legacy_trait":"Backend","legacy_method":"host_execution_is_synchronous","classification":"stable_device_primitive","owner":"DeviceRuntime","disposition":"Declare synchronous host completion as an execution capability, never infer it from a device name; device implementations retain submission owners until actual completion is observed, and the typed runtime migration removes this legacy probe."},
+    {"legacy_trait":"Backend","legacy_method":"try_sync","classification":"stable_device_primitive","owner":"DeviceRuntime","disposition":"Replace with checked completion observation on the actual owned runtime stream; synchronization errors or unsupported synchronization retain submission context and resources rather than attesting quiescence, and the typed runtime migration removes this legacy hook."},
     {"legacy_trait":"Backend","legacy_method":"graph_capture_in_flight","classification":"stable_device_primitive","owner":"DeviceRuntime","disposition":"Represent capture state as typed DeviceRuntime command state; G08D removes the legacy probe method."},
     {"legacy_trait":"Backend","legacy_method":"sync_before_host_readback","classification":"stable_device_primitive","owner":"DeviceRuntime","disposition":"Fold the readback ordering rule into typed DeviceRuntime copy/readback; G08D removes the legacy hook."},
     {"legacy_trait":"Backend","legacy_method":"activation_elem_size_bytes","classification":"stable_device_primitive","owner":"DeviceRuntime","disposition":"Read element width from the typed DeviceRuntime buffer descriptor; G08D removes the global activation-width method."},
@@ -92,7 +94,7 @@
     {"legacy_trait":"Backend","legacy_method":"from_weight_bytes","classification":"stable_device_primitive","owner":"DeviceRuntime","disposition":"Replace raw weight upload with typed DeviceRuntime allocation/copy after ModelFamilyProvider weight-schema validation; G08D removes the legacy convenience method."}
   ],
   "summary": {
-    "mapped": 83,
+    "mapped": 85,
     "unmapped": 0,
     "missing_owner": 0,
     "special_case": 0

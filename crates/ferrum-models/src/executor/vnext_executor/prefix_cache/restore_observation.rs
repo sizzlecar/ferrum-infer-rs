@@ -57,17 +57,17 @@ impl PrefixRestoreObserver {
         }
     }
 
-    pub(super) fn acknowledge(
+    pub(super) fn acknowledge<T>(
         &self,
         metrics: &PrefixCacheMetrics,
         restored_tokens: usize,
-        acknowledge: impl FnOnce() -> Result<()>,
-    ) -> Result<()> {
-        metrics.acknowledge_restore(restored_tokens, acknowledge)?;
+        acknowledge: impl FnOnce() -> Result<T>,
+    ) -> Result<T> {
+        let output = metrics.acknowledge_restore(restored_tokens, acknowledge)?;
         self.record(PrefixRestoreDecision::Restored {
             candidate_prefix_tokens: restored_tokens,
         });
-        Ok(())
+        Ok(output)
     }
 }
 

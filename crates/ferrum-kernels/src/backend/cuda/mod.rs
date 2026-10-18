@@ -873,6 +873,14 @@ impl Backend for CudaBackend {
         ctx.stream.synchronize().expect("CudaBackend: stream sync");
     }
 
+    fn try_sync(ctx: &mut Self::Context) -> ferrum_types::Result<()> {
+        ctx.stream.synchronize().map_err(|error| {
+            ferrum_types::FerrumError::backend(format!(
+                "CUDA stream synchronization failed: {error}"
+            ))
+        })
+    }
+
     fn graph_capture_in_flight(ctx: &Self::Context) -> bool {
         ctx.capture_in_flight
     }
