@@ -3,6 +3,7 @@
 use crate::kv_cache::MockKvCacheHandle;
 use crate::tensor::MockTensor;
 use async_trait::async_trait;
+use ferrum_execution::token_execution::*;
 use ferrum_execution::{
     model_executor::{
         AttentionType, DecodeInput, DecodeOutput, ExecutorCapabilities, ExecutorMemoryUsage,
@@ -16,6 +17,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+pub(crate) mod token_state;
+use token_state::TokenState;
+
 /// Mock model executor that simulates prefill/decode with configurable latency.
 /// No model weights, no GPU — pure async simulation.
 pub struct MockModelExecutor {
@@ -24,6 +28,7 @@ pub struct MockModelExecutor {
     decode_latency: Duration,
     prefill_count: AtomicU64,
     decode_count: AtomicU64,
+    tokens: TokenState,
 }
 
 impl MockModelExecutor {
@@ -50,6 +55,7 @@ impl MockModelExecutor {
             decode_latency,
             prefill_count: AtomicU64::new(0),
             decode_count: AtomicU64::new(0),
+            tokens: TokenState::default(),
         }
     }
 
@@ -69,6 +75,59 @@ impl MockModelExecutor {
 
 #[async_trait]
 impl ModelExecutor for MockModelExecutor {
+    fn admit_tokens(&self, input: ExecutionAdmission<'_>) -> Result<TokenAdmissionOutcome> {
+        self.tokens
+            .admit(input, self.info.max_sequence_length, self.info.vocab_size)
+    }
+
+    async fn execute_tokens(&self, work: &[ExecutionWork<'_>]) -> Result<ExecutionBatchOutcome> {
+        // No state is touched until the delay completes. Cancellation during
+        // this simulated latency therefore leaves the original frontier live.
+        let prefill = work
+            .iter()
+            .any(|input| matches!(input.work(), TokenWork::Prefill(_)));
+        let latency = if prefill {
+            self.prefill_latency
+        } else {
+            self.decode_latency
+        };
+        if !latency.is_zero() {
+            tokio::time::sleep(latency).await;
+        }
+        let outcome = self.tokens.execute(work, self.info.vocab_size, |_, _| {
+            let mut logits = vec![0.0; self.info.vocab_size];
+            if let Some(value) = logits.get_mut(42) {
+                *value = 1.0;
+            }
+            logits
+        })?;
+        if matches!(outcome, ExecutionBatchOutcome::Completed(_)) {
+            for input in work {
+                match input.work() {
+                    TokenWork::Prefill(_) => {
+                        self.prefill_count.fetch_add(1, Ordering::Relaxed);
+                    }
+                    TokenWork::Decode { .. } => {
+                        self.decode_count.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            }
+        }
+        Ok(outcome)
+    }
+
+    async fn finish_tokens(
+        &self,
+        sequence: &ExecutorSequence,
+        reason: ExecutionEndReason,
+    ) -> Result<ExecutionCloseOutcome> {
+        self.tokens.close(sequence, reason)
+    }
+
+    fn cancel_tokens(&self, sequence: &ExecutorSequence) -> Result<ExecutionCloseOutcome> {
+        self.tokens.close(sequence, ExecutionEndReason::Cancelled)
+    }
+
     fn info(&self) -> &ModelInfo {
         &self.info
     }

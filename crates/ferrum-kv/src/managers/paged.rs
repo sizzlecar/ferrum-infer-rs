@@ -409,6 +409,116 @@ impl PagedKvCacheManager {
         Self::new(device, config)
     }
 
+    /// Allocate and register a cache without asynchronous pressure collection.
+    /// Token admission uses this same manager-owned handle/metrics path after
+    /// checking its real block budget. The async entrypoint may run GC first.
+    pub fn allocate_sync(&self, request: &AllocationRequest) -> Result<Arc<dyn KvCacheHandle>> {
+        let mut handles = self.active_handles.write();
+        if handles.contains_key(&request.request_id) {
+            return Err(FerrumError::invalid_parameter(
+                "request already has a live paged cache",
+            ));
+        }
+        let handle = Arc::new(PagedKvCacheHandle::new(
+            request.request_id.clone(),
+            request.device.clone(),
+            self.config.block_size,
+            request.num_layers,
+            request.num_heads,
+            request.head_dim,
+        ));
+        let initial_blocks = handle.required_blocks(request.initial_tokens);
+        if initial_blocks > 0 {
+            self.allocate_blocks(&handle, initial_blocks)?;
+        }
+        handle.set_num_tokens(request.initial_tokens);
+        handles.insert(request.request_id.clone(), handle.clone());
+        let mut stats = self.stats.lock();
+        stats.active_caches += 1;
+        stats.allocation_count += 1;
+        Ok(handle)
+    }
+
+    /// Release the same registered owner as async deallocation. A failure keeps
+    /// the remaining blocks registered; successful blocks are removed from the
+    /// handle so a later attempt cannot free them twice.
+    pub fn deallocate_sync(&self, request_id: &RequestId) -> Result<()> {
+        let mut handles = self.active_handles.write();
+        self.deallocate_registered(&mut handles, request_id)
+    }
+
+    /// Access a particular registered allocation while preventing external
+    /// deallocation/replacement. The callback may use block/table operations,
+    /// but must not recursively register or deallocate a cache in this manager.
+    pub fn with_registered_handle<T>(
+        &self,
+        request_id: &RequestId,
+        expected: &Arc<dyn KvCacheHandle>,
+        access: impl FnOnce(&PagedKvCacheHandle) -> T,
+    ) -> Result<T> {
+        let handles = self.active_handles.read();
+        let handle = Self::require_registered_handle(&handles, request_id, expected)?;
+        Ok(access(handle))
+    }
+
+    /// Close only the exact registered allocation, under the same lock used
+    /// to validate it. Reusing RequestId never authorizes releasing its successor.
+    pub fn deallocate_handle_sync(
+        &self,
+        request_id: &RequestId,
+        expected: &Arc<dyn KvCacheHandle>,
+    ) -> Result<()> {
+        let mut handles = self.active_handles.write();
+        Self::require_registered_handle(&handles, request_id, expected)?;
+        self.deallocate_registered(&mut handles, request_id)
+    }
+
+    fn require_registered_handle<'a>(
+        handles: &'a HashMap<RequestId, Arc<PagedKvCacheHandle>>,
+        request_id: &RequestId,
+        expected: &Arc<dyn KvCacheHandle>,
+    ) -> Result<&'a PagedKvCacheHandle> {
+        let actual = handles.get(request_id).ok_or_else(|| {
+            FerrumError::request_validation("paged cache is no longer registered")
+        })?;
+        let expected = expected
+            .as_any()
+            .downcast_ref::<PagedKvCacheHandle>()
+            .ok_or_else(|| FerrumError::request_validation("foreign paged cache handle"))?;
+        if !std::ptr::eq(actual.as_ref(), expected) {
+            return Err(FerrumError::request_validation(
+                "paged cache registration belongs to another incarnation",
+            ));
+        }
+        Ok(actual.as_ref())
+    }
+
+    fn deallocate_registered(
+        &self,
+        handles: &mut HashMap<RequestId, Arc<PagedKvCacheHandle>>,
+        request_id: &RequestId,
+    ) -> Result<()> {
+        let Some(handle) = handles.get(request_id) else {
+            return Ok(());
+        };
+        if handle.ref_count() > 1 {
+            handle.remove_ref();
+            handles.remove(request_id);
+            return Ok(());
+        }
+        let blocks = handle.get_physical_blocks();
+        for (index, block_id) in blocks.into_iter().enumerate().rev() {
+            let block_id = PhysicalBlockId(block_id);
+            self.gpu_pool.deallocate(block_id)?;
+            self.block_to_request.write().remove(&block_id);
+            handle.truncate_blocks(index);
+        }
+        handles.remove(request_id);
+        let mut stats = self.stats.lock();
+        stats.active_caches = stats.active_caches.saturating_sub(1);
+        Ok(())
+    }
+
     /// Allocate blocks for a sequence
     pub fn allocate_blocks(
         &self,
@@ -720,37 +830,7 @@ impl KvCacheManager for PagedKvCacheManager {
             let _ = self.gc().await;
         }
 
-        // Create handle
-        let handle = Arc::new(PagedKvCacheHandle::new(
-            request.request_id.clone(),
-            request.device.clone(),
-            self.config.block_size,
-            request.num_layers,
-            request.num_heads,
-            request.head_dim,
-        ));
-
-        // Allocate initial blocks
-        let initial_blocks = handle.required_blocks(request.initial_tokens);
-        if initial_blocks > 0 {
-            self.allocate_blocks(&handle, initial_blocks)?;
-        }
-
-        handle.set_num_tokens(request.initial_tokens);
-
-        // Store handle
-        self.active_handles
-            .write()
-            .insert(request.request_id.clone(), handle.clone());
-
-        // Update stats
-        {
-            let mut stats = self.stats.lock();
-            stats.active_caches += 1;
-            stats.allocation_count += 1;
-        }
-
-        Ok(handle)
+        self.allocate_sync(request)
     }
 
     async fn extend(&self, handle: &mut dyn KvCacheHandle, additional_tokens: usize) -> Result<()> {
@@ -792,43 +872,7 @@ impl KvCacheManager for PagedKvCacheManager {
     async fn deallocate(&self, request_id: RequestId) -> Result<()> {
         debug!("Deallocating paged KV cache for request: {:?}", request_id);
 
-        let handle = self.active_handles.write().remove(&request_id);
-
-        if let Some(handle) = handle {
-            // Check reference count
-            if handle.ref_count() > 1 {
-                // Don't free blocks, just decrement ref count
-                handle.remove_ref();
-                debug!(
-                    "Decremented ref count for {}, remaining: {}",
-                    request_id,
-                    handle.ref_count()
-                );
-                return Ok(());
-            }
-
-            // Free all blocks
-            let block_ids: Vec<PhysicalBlockId> = handle
-                .get_physical_blocks()
-                .into_iter()
-                .map(PhysicalBlockId)
-                .collect();
-
-            for block_id in block_ids {
-                let _ = self.gpu_pool.deallocate(block_id);
-                self.block_to_request.write().remove(&block_id);
-            }
-
-            // Update stats
-            {
-                let mut stats = self.stats.lock();
-                if stats.active_caches > 0 {
-                    stats.active_caches -= 1;
-                }
-            }
-        }
-
-        Ok(())
+        self.deallocate_sync(&request_id)
     }
 
     fn can_allocate(&self, request: &AllocationRequest) -> bool {
@@ -931,6 +975,76 @@ mod tests {
             dtype: DataType::FP16,
             priority: ferrum_types::Priority::Normal,
         }
+    }
+
+    #[tokio::test]
+    async fn synchronous_admission_uses_the_same_registered_owner_and_release_metrics() {
+        let manager = PagedKvCacheManager::with_defaults(Device::CPU, 16, 4).unwrap();
+        let request = create_test_request();
+        let handle = manager.allocate_sync(&request).unwrap();
+        assert!(Arc::ptr_eq(
+            &handle,
+            &manager.get_handle(request.request_id.clone()).unwrap()
+        ));
+        assert_eq!(manager.stats().active_caches, 1);
+        assert_eq!(manager.gpu_pool().stats().allocated_blocks, 4);
+        assert!(
+            manager.allocate_sync(&request).is_err(),
+            "duplicate cannot replace the owner"
+        );
+        let other = create_test_request();
+        assert!(manager.allocate_sync(&other).is_err());
+        assert!(manager.get_handle(other.request_id).is_none());
+        assert_eq!(manager.stats().active_caches, 1);
+        manager
+            .deallocate(request.request_id.clone())
+            .await
+            .unwrap();
+        assert_eq!(manager.stats().active_caches, 0);
+        assert_eq!(manager.gpu_pool().stats().allocated_blocks, 0);
+        assert_eq!(handle.stats().blocks_allocated, 0);
+        manager.allocate(&request).await.unwrap();
+        manager.deallocate_sync(&request.request_id).unwrap();
+        assert_eq!(manager.stats().active_caches, 0);
+        assert_eq!(manager.gpu_pool().stats().allocated_blocks, 0);
+    }
+
+    #[test]
+    fn registered_handle_scope_excludes_replacement_and_rejects_stale_release() {
+        let manager = PagedKvCacheManager::with_defaults(Device::CPU, 16, 4).unwrap();
+        let request = create_test_request();
+        let old = manager.allocate_sync(&request).unwrap();
+        manager
+            .with_registered_handle(&request.request_id, &old, |handle| {
+                assert_eq!(handle.num_tokens(), request.initial_tokens);
+                assert!(
+                    manager.active_handles.try_write().is_none(),
+                    "the registration lock must cover the actual access callback"
+                );
+            })
+            .unwrap();
+        manager.deallocate_sync(&request.request_id).unwrap();
+        let replacement = manager.allocate_sync(&request).unwrap();
+        assert!(!Arc::ptr_eq(&old, &replacement));
+        assert!(manager
+            .with_registered_handle::<()>(&request.request_id, &old, |_| {
+                panic!("stale access must never invoke its physical callback");
+            })
+            .is_err());
+        assert!(manager
+            .deallocate_handle_sync(&request.request_id, &old)
+            .is_err());
+        assert!(Arc::ptr_eq(
+            &replacement,
+            &manager.get_handle(request.request_id.clone()).unwrap()
+        ));
+        assert_eq!(manager.stats().active_caches, 1);
+        assert_eq!(manager.gpu_pool().stats().allocated_blocks, 4);
+        manager
+            .deallocate_handle_sync(&request.request_id, &replacement)
+            .unwrap();
+        assert_eq!(manager.stats().active_caches, 0);
+        assert_eq!(manager.gpu_pool().stats().allocated_blocks, 0);
     }
 
     #[tokio::test]

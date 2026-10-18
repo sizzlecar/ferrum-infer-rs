@@ -25,6 +25,9 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
+mod token_execution;
+use token_execution::PagedTokenState;
+
 /// Configuration for the paged attention executor.
 #[derive(Debug, Clone)]
 pub struct PagedExecutorConfig {
@@ -66,6 +69,7 @@ pub struct PagedAttentionExecutor {
     kv_manager: Arc<PagedKvCacheManager>,
     prefill_count: AtomicU64,
     decode_count: AtomicU64,
+    tokens: PagedTokenState,
 }
 
 impl PagedAttentionExecutor {
@@ -93,6 +97,7 @@ impl PagedAttentionExecutor {
             kv_manager,
             prefill_count: AtomicU64::new(0),
             decode_count: AtomicU64::new(0),
+            tokens: PagedTokenState::default(),
         }
     }
 
@@ -143,6 +148,38 @@ impl PagedAttentionExecutor {
 
 #[async_trait]
 impl ModelExecutor for PagedAttentionExecutor {
+    fn admit_tokens(
+        &self,
+        input: ferrum_execution::token_execution::ExecutionAdmission<'_>,
+    ) -> Result<ferrum_execution::token_execution::TokenAdmissionOutcome> {
+        self.admit_token_sequence(input)
+    }
+
+    async fn execute_tokens(
+        &self,
+        work: &[ferrum_execution::token_execution::ExecutionWork<'_>],
+    ) -> Result<ferrum_execution::token_execution::ExecutionBatchOutcome> {
+        self.execute_token_work(work)
+    }
+
+    async fn finish_tokens(
+        &self,
+        sequence: &ferrum_execution::token_execution::ExecutorSequence,
+        reason: ferrum_execution::token_execution::ExecutionEndReason,
+    ) -> Result<ferrum_execution::token_execution::ExecutionCloseOutcome> {
+        self.close_token_sequence(sequence, reason)
+    }
+
+    fn cancel_tokens(
+        &self,
+        sequence: &ferrum_execution::token_execution::ExecutorSequence,
+    ) -> Result<ferrum_execution::token_execution::ExecutionCloseOutcome> {
+        self.close_token_sequence(
+            sequence,
+            ferrum_execution::token_execution::ExecutionEndReason::Cancelled,
+        )
+    }
+
     fn info(&self) -> &ModelInfo {
         &self.info
     }

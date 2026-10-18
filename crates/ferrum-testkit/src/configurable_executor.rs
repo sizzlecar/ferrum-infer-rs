@@ -3,9 +3,11 @@
 //! Unlike MockModelExecutor (always biases token 42), this executor can be configured
 //! to produce specific token sequences, emit EOS after N tokens, etc.
 
+use crate::executor::token_state::TokenState;
 use crate::kv_cache::MockKvCacheHandle;
 use crate::tensor::MockTensor;
 use async_trait::async_trait;
+use ferrum_execution::token_execution::*;
 use ferrum_execution::{
     model_executor::{
         AttentionType, DecodeInput, DecodeOutput, ExecutorCapabilities, ExecutorMemoryUsage,
@@ -28,6 +30,7 @@ pub struct ConfigurableModelExecutor {
     /// EOS token ID.
     eos_token: u32,
     decode_count: AtomicU64,
+    tokens: TokenState,
 }
 
 impl ConfigurableModelExecutor {
@@ -39,6 +42,7 @@ impl ConfigurableModelExecutor {
             eos_after: None,
             eos_token: 2, // common EOS
             decode_count: AtomicU64::new(0),
+            tokens: TokenState::default(),
         }
     }
 
@@ -50,6 +54,7 @@ impl ConfigurableModelExecutor {
             eos_after: Some(n),
             eos_token,
             decode_count: AtomicU64::new(0),
+            tokens: TokenState::default(),
         }
     }
 
@@ -79,6 +84,62 @@ impl ConfigurableModelExecutor {
 
 #[async_trait]
 impl ModelExecutor for ConfigurableModelExecutor {
+    fn admit_tokens(&self, input: ExecutionAdmission<'_>) -> Result<TokenAdmissionOutcome> {
+        if self.token_sequence.is_empty() {
+            return Err(ferrum_types::FerrumError::request_validation(
+                "empty configurable output sequence",
+            ));
+        }
+        self.tokens
+            .admit(input, self.info.max_sequence_length, self.info.vocab_size)
+    }
+
+    async fn execute_tokens(&self, work: &[ExecutionWork<'_>]) -> Result<ExecutionBatchOutcome> {
+        let outcome = self
+            .tokens
+            .execute(work, self.info.vocab_size, |work, prompt_len| {
+                // Decode scripts restart per incarnation, not per batch or executor.
+                // Final prefill emits sequence[0], preserving the original fixture.
+                let token = match work {
+                    TokenWork::Prefill(_) => self.token_sequence[0],
+                    TokenWork::Decode { position, .. } => {
+                        let step = position - prompt_len;
+                        if self.eos_after.is_some_and(|limit| step >= limit) {
+                            self.eos_token
+                        } else {
+                            self.token_sequence[step % self.token_sequence.len()]
+                        }
+                    }
+                };
+                let mut logits = vec![0.0; self.info.vocab_size];
+                if let Some(value) = logits.get_mut(token as usize) {
+                    *value = 10.0;
+                }
+                logits
+            })?;
+        if matches!(outcome, ExecutionBatchOutcome::Completed(_)) {
+            self.decode_count.fetch_add(
+                work.iter()
+                    .filter(|input| matches!(input.work(), TokenWork::Decode { .. }))
+                    .count() as u64,
+                Ordering::Relaxed,
+            );
+        }
+        Ok(outcome)
+    }
+
+    async fn finish_tokens(
+        &self,
+        sequence: &ExecutorSequence,
+        reason: ExecutionEndReason,
+    ) -> Result<ExecutionCloseOutcome> {
+        self.tokens.close(sequence, reason)
+    }
+
+    fn cancel_tokens(&self, sequence: &ExecutorSequence) -> Result<ExecutionCloseOutcome> {
+        self.tokens.close(sequence, ExecutionEndReason::Cancelled)
+    }
+
     fn info(&self) -> &ModelInfo {
         &self.info
     }
