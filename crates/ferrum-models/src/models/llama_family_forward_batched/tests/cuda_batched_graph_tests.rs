@@ -246,3 +246,83 @@ fn explicit_batched_graph_cuda_paged_replays_new_pages_and_cache_incarnations() 
     actual.close().unwrap();
     expected.close().unwrap();
 }
+
+#[test]
+#[ignore = "requires an actual CUDA device"]
+fn explicit_batched_graph_cuda_paged_uses_alternating_layer_rope() {
+    use crate::models::llama_family::llama_layer_attention_schedule;
+    use crate::test_support::numerical::assert_full_logits_qualification;
+    use ferrum_kernels::backend::cpu::CpuBackend;
+
+    let mut config = physical_batch_config();
+    config.num_layers = 2;
+    config.sliding_window = 32;
+    config.sliding_window_pattern = 2;
+    config.rope_local_theta = Some(100.0);
+    assert!(!llama_layer_attention_schedule(&config, 0).is_global_layer);
+    assert!(llama_layer_attention_schedule(&config, 1).is_global_layer);
+    // This isolates the actual local/global RoPE inputs. Every context remains
+    // below the local window; it does not qualify paged window truncation or
+    // the complete sandwich-norm Gemma architecture.
+    let loader = SyntheticLlamaLoader::new(config.clone());
+    let mut execution = LlamaExecutionConfig::default();
+    execution.options.metal_paged_kv = Some(true);
+    execution.options.cuda_graph = false;
+    execution.options.unified_graph = false;
+    execution.batched_graph = true;
+    execution.paged_max_seqs = 2;
+    let mut actual =
+        Model::new_with_execution_config(config.clone(), &loader, execution.clone()).unwrap();
+    execution.batched_graph = false;
+    let mut expected =
+        Model::new_with_execution_config(config.clone(), &loader, execution.clone()).unwrap();
+    execution.options.metal_paged_kv = Some(false);
+    let mut serial = LlamaFamilyModel::<CpuBackend>::new_with_execution_config(
+        config.clone(),
+        &loader,
+        execution,
+    )
+    .unwrap();
+    assert!(actual.rope_local.is_some());
+    assert!(expected.rope_local.is_some());
+    for (id, prompt) in [("local-a", [1, 2, 3]), ("local-b", [21, 22, 23])] {
+        let a = actual.prefill_internal(id, &prompt);
+        let e = expected.prefill_internal(id, &prompt);
+        let oracle = serial.prefill_internal(id, &prompt);
+        full_logits(&a, &e, &format!("layer-rope prefill {id}"));
+        assert_eq!(oracle.len(), 128);
+        assert_full_logits_qualification(&a, &oracle);
+        assert_full_logits_qualification(&e, &oracle);
+    }
+    assert!(actual.paged_pools.is_some());
+    assert!(serial.paged_pools.is_none());
+    for position in 3..10 {
+        let batch = batch(&["local-a", "local-b"], position, 40 + position);
+        let actual_rows = actual.decode_batch_internal_with_full_logits(&batch, true);
+        let expected_rows = expected.decode_batch_internal_with_full_logits(&batch, true);
+        assert_eq!(actual_rows.len(), batch.len());
+        assert_eq!(expected_rows.len(), batch.len());
+        for (row, (id, token, pos)) in batch.iter().enumerate() {
+            let oracle = serial.decode_internal(id, *token, *pos);
+            full_logits(
+                &actual_rows[row],
+                &expected_rows[row],
+                &format!("layer-rope decode row={row} batch={batch:?}"),
+            );
+            assert_eq!(oracle.len(), 128);
+            // Reuse the existing independent CPU/full-vocabulary envelope;
+            // graph/eager equivalence above keeps its original strict bound.
+            assert_full_logits_qualification(&actual_rows[row], &oracle);
+            assert_full_logits_qualification(&expected_rows[row], &oracle);
+            assert!(actual.kv_caches[id]
+                .iter()
+                .all(|cache| cache.len == *pos as usize + 1));
+            assert_eq!(serial.cache_len(id), *pos as usize + 1);
+        }
+    }
+    assert!(!actual.batched_graph_keys_seen.is_empty());
+    assert!(!actual.batched_graph_failed);
+    actual.close().unwrap();
+    expected.close().unwrap();
+    serial.close().unwrap();
+}

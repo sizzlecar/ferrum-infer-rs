@@ -1091,8 +1091,8 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
                         (i as u64) * qkv_stride_bytes,
                         q_norm_w,
                         k_norm_w,
-                        &self.rope.cos,
-                        &self.rope.sin,
+                        rope_cos,
+                        rope_sin,
                         self.scratch
                             .paged_batch_q
                             .as_mut()
