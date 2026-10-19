@@ -2041,3 +2041,168 @@ fn instance_context_stage_batch_final_readback_failure_keeps_frontier_and_owners
         }
     }
 }
+
+#[test]
+fn instance_context_pipeline_unresolved_stage_keeps_original_owner_until_recovery() {
+    use crate::common::llm::{ModelExecutionRecovery, ModelKvPreparation, ModelTokenCloseOutcome};
+    use crate::models::llama_family::LlamaFamilyLayerStageConfig;
+    use crate::models::llama_family_pipeline::{
+        LlamaFamilyPipelineModel, LlamaPipelineMode, LlamaPipelinePlacement,
+    };
+    let cfg = config();
+    let loader = SyntheticLlamaLoader::new(cfg.clone());
+    let execution = ferrum_types::LlamaExecutionConfig {
+        kv_capacity: Some(32),
+        options: ferrum_types::LlamaExecutionOptions {
+            metal_paged_kv: Some(false),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let mut stage0 = LlamaFamilyModel::<TrackedCpu, KvFp16>::new_layer_stage_with_execution_config(
+        cfg.clone(),
+        &loader,
+        LlamaFamilyLayerStageConfig::pipeline_stage(0..1, true, false),
+        execution.clone(),
+    )
+    .unwrap();
+    let mut stage1 = LlamaFamilyModel::<TrackedCpu, KvFp16>::new_layer_stage_with_execution_config(
+        cfg.clone(),
+        &loader,
+        LlamaFamilyLayerStageConfig::pipeline_stage(1..2, false, true),
+        execution.clone(),
+    )
+    .unwrap();
+    let first_identity = Arc::clone(&stage0.execution_context.as_ref().unwrap().identity);
+    let first_retired = Arc::clone(&stage0.execution_context.as_ref().unwrap().retired);
+    let context = stage1.execution_context.as_mut().unwrap();
+    let identity = Arc::clone(&context.identity);
+    let second_retired = Arc::clone(&context.retired);
+    let unresolved = Arc::clone(&context.unresolved);
+    let begins = Arc::clone(&context.begins);
+    let prompt: Arc<[u32]> = Arc::from([1, 2, 3]);
+    for stage in [&mut stage0, &mut stage1] {
+        stage
+            .prepare_pipeline_token_kv(ModelKvPreparation {
+                cache_id: "held",
+                capacity_hint: 8,
+                prompt: &prompt,
+                adapter: None,
+            })
+            .unwrap();
+    }
+    // Arm the existing backend's actual later-stage readback after preparation.
+    // The fixture proves custody, not successful CUDA graph mathematics.
+    stage1.execution_context.as_mut().unwrap().graph_fault =
+        Some(GraphFault::StageReadbackUnresolved);
+    let mut pipeline = LlamaFamilyPipelineModel::new_with_placement(
+        vec![stage0, stage1],
+        LlamaPipelinePlacement::unplaced(2).with_pipeline_mode(LlamaPipelineMode::Batch),
+    )
+    .unwrap();
+    let failure = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        pipeline.prefill("held", &prompt)
+    }));
+    assert!(failure.is_err());
+    let stage = &pipeline.stages()[1];
+    let frame = stage
+        .pending_device_frame
+        .as_ref()
+        .expect("original later-stage frame retained");
+    assert!(Arc::ptr_eq(&identity, &frame.context.identity));
+    assert!(stage.execution_context.is_none());
+    let original_residual = frame.residual.as_ref().unwrap().as_ptr();
+    let original_kv = stage.kv_caches["held"][0].k.as_ptr();
+    let begin_count = begins.load(Ordering::SeqCst);
+    assert!(matches!(
+        pipeline.recover_token_execution(),
+        ModelExecutionRecovery::Held { .. }
+    ));
+    assert!(matches!(
+        pipeline.close_token_execution("held"),
+        ModelTokenCloseOutcome::Held { .. }
+    ));
+    assert_eq!(
+        pipeline.stages()[1].kv_caches["held"][0].k.as_ptr(),
+        original_kv
+    );
+    assert!(Arc::ptr_eq(
+        &identity,
+        &pipeline.stages()[1]
+            .pending_device_frame
+            .as_ref()
+            .unwrap()
+            .context
+            .identity
+    ));
+    assert_eq!(
+        begins.load(Ordering::SeqCst),
+        begin_count,
+        "observation/close never re-encode"
+    );
+    unresolved.store(false, Ordering::SeqCst);
+    assert!(matches!(
+        pipeline.recover_token_execution(),
+        ModelExecutionRecovery::Quiescent { error: None }
+    ));
+    assert!(Arc::ptr_eq(
+        &identity,
+        &pipeline.stages()[1]
+            .execution_context
+            .as_ref()
+            .unwrap()
+            .identity
+    ));
+    assert!(Arc::ptr_eq(
+        &first_identity,
+        &pipeline.stages()[0]
+            .execution_context
+            .as_ref()
+            .unwrap()
+            .identity
+    ));
+    assert_eq!(
+        pipeline.stages()[1]
+            .scratch
+            .residual
+            .as_ref()
+            .unwrap()
+            .as_ptr(),
+        original_residual
+    );
+    assert!(matches!(
+        pipeline.close_token_execution("held"),
+        ModelTokenCloseOutcome::Ended { error: None }
+    ));
+    assert!(pipeline
+        .stages()
+        .iter()
+        .all(|stage| !stage.kv_caches.contains_key("held")));
+    pipeline
+        .prepare_token_kv(ModelKvPreparation {
+            cache_id: "peer",
+            capacity_hint: 8,
+            prompt: &prompt,
+            adapter: None,
+        })
+        .unwrap();
+    let actual = pipeline.prefill("peer", &prompt);
+    let mut reference =
+        LlamaFamilyModel::<CpuBackend, KvFp16>::new_with_execution_config(cfg, &loader, execution)
+            .unwrap();
+    let expected = reference.prefill_internal("reference", &prompt);
+    assert_eq!(actual.len(), expected.len());
+    for (&actual, &expected) in actual.iter().zip(&expected) {
+        assert!(actual.is_finite() && expected.is_finite());
+        assert!((actual - expected).abs() <= 1e-5 + 1e-5 * expected.abs());
+    }
+    pipeline.close_token_sequence("peer").unwrap();
+    assert!(matches!(
+        pipeline.retire_model(),
+        crate::common::llm::ModelRetirementOutcome::Retired { error: None }
+    ));
+    assert_eq!(first_retired.load(Ordering::SeqCst), 1);
+    assert_eq!(second_retired.load(Ordering::SeqCst), 1);
+    reference.release("reference");
+    reference.close().unwrap();
+}

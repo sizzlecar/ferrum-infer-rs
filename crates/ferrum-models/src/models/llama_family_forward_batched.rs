@@ -3758,11 +3758,11 @@ impl<B: MoeLlmBackend> LlamaPipelineStageBatchOps<B> for LlamaFamilyModel<B, KvF
         .into_legacy_result()
     }
 
-    fn logits_from_hidden_batch(
+    fn sampling_from_hidden_batch(
         &mut self,
         hidden: &PipelineHidden<B>,
         force_full_logits: bool,
-    ) -> Vec<Vec<f32>> {
+    ) -> Vec<ExecutorSamplingOutput> {
         let row_count = hidden.row_count();
         if row_count == 0 {
             return Vec::new();
@@ -3780,13 +3780,15 @@ impl<B: MoeLlmBackend> LlamaPipelineStageBatchOps<B> for LlamaFamilyModel<B, KvF
             return (0..row_count)
                 .map(|row| {
                     let start = row * h;
-                    self.logits_from_hidden(&hidden_slice[start..start + h])
+                    ExecutorSamplingOutput::FullLogits(
+                        self.logits_from_hidden(&hidden_slice[start..start + h]),
+                    )
                 })
                 .collect();
         }
 
         self.run_device_frame(|model, frame| {
-            model.logits_from_hidden_batch_in_frame(frame, hidden, force_full_logits)
+            model.sampling_from_hidden_batch_in_frame(frame, hidden, force_full_logits)
         })
         .into_legacy_result()
     }
@@ -3874,12 +3876,12 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
         (PipelineHidden::host(out, m, h), bridge_timing)
     }
 
-    fn logits_from_hidden_batch_in_frame(
+    fn sampling_from_hidden_batch_in_frame(
         &mut self,
         frame: &mut LlamaExecutionFrame<B>,
         hidden: &PipelineHidden<B>,
         force_full_logits: bool,
-    ) -> Vec<Vec<f32>> {
+    ) -> Vec<ExecutorSamplingOutput> {
         let row_count = hidden.row_count();
         let h = self.cfg.hidden_size;
         let vocab = self.cfg.vocab_size;
@@ -3924,13 +3926,18 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
         if greedy {
             let tokens = B::argmax_rows_f16(&mut ctx, &self.scratch.batch_logits, row_count, vocab)
                 .expect("argmax_rows_f16");
-            tokens.into_iter().map(|t| vec![t as f32]).collect()
+            tokens
+                .into_iter()
+                .map(|t| ExecutorSamplingOutput::GreedyToken(TokenId(t)))
+                .collect()
         } else {
             let quiescent = device_execution::checked_sync::<B>(ctx);
             let all = B::to_vec_in_context(ctx, &self.scratch.batch_logits, row_count * vocab);
             frame.completed = Some(quiescent);
             (0..row_count)
-                .map(|row| all[row * vocab..(row + 1) * vocab].to_vec())
+                .map(|row| {
+                    ExecutorSamplingOutput::FullLogits(all[row * vocab..(row + 1) * vocab].to_vec())
+                })
                 .collect()
         }
     }

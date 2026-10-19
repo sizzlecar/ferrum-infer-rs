@@ -759,3 +759,5 @@ async fn qualification_unwrapped_metal_backbone_and_partial_stage_remain_unsuppo
 
 #[cfg(feature = "cuda")]
 mod cuda;
+
+mod pipeline;

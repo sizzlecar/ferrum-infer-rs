@@ -41,6 +41,12 @@ fn model_frame_tests(backend: Backend) -> Vec<ContractTest> {
             "qualification_unwrapped_metal_backbone_and_partial_stage_remain_unsupported",
         ].into_iter().map(|test| format!("executor::llm_executor::token_execution::qualification_tests::{test}")));
     }
+    if backend == Backend::Metal {
+        tests.extend([
+            "qualification_pipeline_metal_batch_and_overlap_full_logits",
+            "qualification_pipeline_metal_later_stage_failure_and_cancellation",
+        ].into_iter().map(|test| format!("executor::llm_executor::token_execution::qualification_tests::pipeline::{test}")));
+    }
     if backend != Backend::Cpu {
         tests.extend([
             format!("lora::runtime_tests::{name}_lora_workspace_growth_matches_complete_outputs"),
@@ -62,6 +68,13 @@ fn model_frame_tests(backend: Backend) -> Vec<ContractTest> {
             "int8::qualification_unwrapped_cuda_int8_cancelled_close_waiter_joins_original_worker",
             "int8::qualification_unwrapped_cuda_int8_serial_page_crossing_keeps_completed_peer",
         ].into_iter().map(|test| format!("executor::llm_executor::token_execution::qualification_tests::cuda::{test}")));
+    }
+    if backend == Backend::Cuda {
+        tests.extend([
+            "qualification_pipeline_cuda_batch_and_overlap_full_logits",
+            "qualification_pipeline_cuda_later_stage_failure_and_cancellation",
+            "qualification_pipeline_cuda_int8_original_stage_owners",
+        ].into_iter().map(|test| format!("executor::llm_executor::token_execution::qualification_tests::pipeline::{test}")));
     }
     tests
         .into_iter()
@@ -718,6 +731,38 @@ mod tests {
         numerical.tests[0].binding.name =
             "models::llama_family_forward_batched::tests::physical_batch_logits_match_single_item_decode_on_cuda".into();
         assert!(verify_report(Backend::Cuda, &report).is_err());
+    }
+
+    #[test]
+    fn pipeline_receipts_require_the_original_stage_failure_execution() {
+        for backend in [Backend::Metal, Backend::Cuda] {
+            let name = format!(
+                "executor::llm_executor::token_execution::qualification_tests::pipeline::qualification_pipeline_{}_later_stage_failure_and_cancellation",
+                backend_name(backend),
+            );
+            let report = report_fixture(backend);
+            verify_report(backend, &report).unwrap();
+            let mut failed = report.clone();
+            failed
+                .execution
+                .groups
+                .iter_mut()
+                .flat_map(|group| &mut group.tests)
+                .find(|test| test.binding.name == name)
+                .expect("pipeline stage failure has its own execution receipt")
+                .execution
+                .as_mut()
+                .unwrap()
+                .exit_code = Some(1);
+            assert!(verify_report(backend, &failed).is_err());
+            let mut missing = report;
+            for group in &mut missing.execution.groups {
+                group.tests.retain(|test| test.binding.name != name);
+            }
+            // A passing single-model lifecycle does not prove the pipeline's
+            // aggregate stage recovery and original-owner retirement boundary.
+            assert!(verify_report(backend, &missing).is_err());
+        }
     }
 
     #[test]
