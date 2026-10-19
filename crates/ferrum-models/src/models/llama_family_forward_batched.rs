@@ -977,6 +977,14 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
         debug_assert!(m > 0);
         for (cid, _, _) in batch {
             self.ensure_kv_in_context(ctx, cid, None);
+            let target = self
+                .cache_len(cid)
+                .checked_add(1)
+                .expect("stage KV length overflow");
+            // Both layouts own capacity before a stage can encode a KV write.
+            // Paged window metadata is only one consumer of that storage.
+            self.ensure_paged_kv_capacity_for_cache_id(ctx, cid, target)
+                .expect("stage KV capacity");
         }
         self.ensure_scratch_in_context(ctx, m);
         let positions: Vec<u32> = batch.iter().map(|(_, _, p)| *p).collect();
@@ -1943,13 +1951,13 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
         logits_policies: Option<&[LogitsReturnPolicy]>,
     ) -> Result<Vec<Option<ExecutorSamplingOutput>>> {
         let prior_graph_failure = self.unified_graph_failed;
-        if prior_graph_failure {
-            // Stream recovery restores the original owner, not graph replay
-            // eligibility. Retire that owner's captured closure before reuse;
-            // an error leaves its maps/storage and the failure latch intact.
+        if self.unified_graph_retirement_pending {
+            // Completion recovery does not retire the original capture closure.
+            // Check it once, even if capture failed before publishing a key.
+            // On error, preserve both the original owners and this obligation.
             B::retire_graphs_for_storage_mutation(&mut frame.context)?;
             self.clear_graph_bookkeeping();
-            self.unified_graph_failed = true;
+            self.unified_graph_failed = prior_graph_failure;
         }
         // Snapshot cfg fields into Copy locals so we can take &mut self later
         // without a long-lived `&self.cfg` borrow conflicting.
@@ -2164,6 +2172,7 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
             // Cover fallible pre-launch synchronization, capture-body panics,
             // and successful launches whose terminal observation later fails.
             self.unified_graph_failed = true;
+            self.unified_graph_retirement_pending = true;
         }
         let mut graph_executed = false;
 
@@ -2229,8 +2238,10 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
                 }
                 Ok(false) => {
                     B::retire_graphs_for_storage_mutation(&mut ctx)?;
+                    // A missing native key submitted no graph. After checked
+                    // retirement this invocation runs eagerly and starts a new
+                    // warmup; it is not a permanent execution failure.
                     self.clear_graph_bookkeeping();
-                    self.unified_graph_failed = true;
                 }
                 Err(e) => {
                     self.unified_graph_failed = true;
@@ -2253,12 +2264,25 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
             }
         }
 
-        let capture_started = should_capture && B::graph_capture_in_flight(&ctx);
+        let mut capture_pending = should_capture;
+        macro_rules! require_unified_capture {
+            () => {
+                if !B::graph_capture_in_flight(&ctx) {
+                    std::panic::panic_any(ferrum_types::FerrumError::backend(
+                        "unified capture ended before graph installation",
+                    ));
+                }
+            };
+        }
+        if capture_pending {
+            require_unified_capture!();
+        }
         let mut layers_ready = did_pure_replay;
         let mut final_pack_ready = did_pure_replay && graph_scope.captures_final_pack();
         let mut lm_head_ready = did_pure_replay && graph_scope.captures_lm_head();
         macro_rules! finish_unified_graph_capture {
             () => {{
+                require_unified_capture!();
                 // SAFETY: cold construction checked projection/KV capture contracts.
                 // The private model/frame owns all bindings through checked retirement;
                 // storage mutation retires cached graphs before replacing dependencies.
@@ -2284,6 +2308,7 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
                     match unsafe { B::replay_graph(&mut ctx, graph_key) } {
                         Ok(true) => {
                             graph_executed = true;
+                            capture_pending = false;
                             layers_ready = true;
                             final_pack_ready = graph_scope.captures_final_pack();
                             lm_head_ready = graph_scope.captures_lm_head();
@@ -2304,19 +2329,12 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
         }
         if !did_pure_replay {
             run_unified_layers!();
-            if capture_started
-                && graph_scope == UnifiedGraphCaptureScope::LayersOnly
-                && B::graph_capture_in_flight(&ctx)
-            {
-                finish_unified_graph_capture!();
-            } else if !B::graph_capture_in_flight(&ctx) {
-                layers_ready = true;
-            }
-            if capture_started
-                && graph_scope == UnifiedGraphCaptureScope::LayersOnly
-                && !layers_ready
-            {
-                run_unified_layers!();
+            if capture_pending {
+                require_unified_capture!();
+                if graph_scope == UnifiedGraphCaptureScope::LayersOnly {
+                    finish_unified_graph_capture!();
+                }
+            } else {
                 layers_ready = true;
             }
         }
@@ -2384,65 +2402,28 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
 
         if !final_pack_ready {
             run_unified_final_pack!();
-            if capture_started
-                && graph_scope == UnifiedGraphCaptureScope::LmHeadEager
-                && B::graph_capture_in_flight(&ctx)
-            {
-                finish_unified_graph_capture!();
-            } else if !B::graph_capture_in_flight(&ctx) {
+            if capture_pending {
+                require_unified_capture!();
+                if graph_scope == UnifiedGraphCaptureScope::LmHeadEager {
+                    finish_unified_graph_capture!();
+                }
+            } else {
                 final_pack_ready = true;
             }
-        }
-        if capture_started
-            && graph_scope == UnifiedGraphCaptureScope::LmHeadEager
-            && !final_pack_ready
-        {
-            if !layers_ready {
-                run_unified_layers!();
-                layers_ready = true;
-            }
-            run_unified_final_pack!();
-            final_pack_ready = true;
         }
 
         if !lm_head_ready {
             run_unified_lm_head!();
-            if capture_started
-                && graph_scope == UnifiedGraphCaptureScope::Full
-                && B::graph_capture_in_flight(&ctx)
-            {
+            if capture_pending {
+                require_unified_capture!();
+                debug_assert_eq!(graph_scope, UnifiedGraphCaptureScope::Full);
                 finish_unified_graph_capture!();
-            } else if !B::graph_capture_in_flight(&ctx) {
+            } else {
                 lm_head_ready = true;
             }
         }
 
-        if capture_started && graph_scope == UnifiedGraphCaptureScope::Full && !lm_head_ready {
-            if !layers_ready {
-                run_unified_layers!();
-                layers_ready = true;
-            }
-            if !final_pack_ready {
-                run_unified_final_pack!();
-                final_pack_ready = true;
-            }
-            run_unified_lm_head!();
-            lm_head_ready = true;
-        }
-        if !final_pack_ready {
-            run_unified_final_pack!();
-            final_pack_ready = true;
-        }
-        if !lm_head_ready {
-            run_unified_lm_head!();
-            lm_head_ready = true;
-        }
-
-        if !layers_ready {
-            run_unified_layers!();
-            layers_ready = true;
-        }
-
+        debug_assert!(!capture_pending);
         debug_assert!(layers_ready);
         debug_assert!(final_pack_ready);
         debug_assert!(lm_head_ready);
@@ -2629,6 +2610,7 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
 
         if graph_executed {
             self.unified_graph_failed = false;
+            self.unified_graph_retirement_pending = false;
         }
         frame.completed = Some(quiescent);
 
@@ -3842,10 +3824,9 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
                 None,
             );
         }
-        self.bump_local_batched_decode_kv_lengths(batch);
-
         let quiescent = device_execution::checked_sync::<B>(ctx);
         let out = B::to_vec_in_context(ctx, &residual, m * h);
+        self.bump_local_batched_decode_kv_lengths(batch);
         frame.completed = Some(quiescent);
         PipelineHidden::host(out, m, h)
     }
@@ -3886,10 +3867,9 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
                 None,
             );
         }
-        self.bump_local_batched_decode_kv_lengths(batch);
-
         let quiescent = device_execution::checked_sync::<B>(ctx);
         let out = B::to_vec_in_context(ctx, &residual, m * h);
+        self.bump_local_batched_decode_kv_lengths(batch);
         frame.completed = Some(quiescent);
         (PipelineHidden::host(out, m, h), bridge_timing)
     }

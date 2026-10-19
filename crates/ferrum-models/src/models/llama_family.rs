@@ -1883,6 +1883,10 @@ pub struct LlamaFamilyModel<B: MoeLlmBackend, K: KvLayer<B> = KvFp16> {
     /// graph instead of thrashing a single slot.
     pub(crate) unified_graph_warmup: usize,
     pub(crate) unified_graph_failed: bool,
+    /// A capture/replay attempt has not yet reached successful readback or
+    /// checked retirement. This includes captures that never installed a key.
+    /// Failure eligibility stays separate after the original closure retires.
+    pub(crate) unified_graph_retirement_pending: bool,
     pub(crate) unified_graph_keys_seen:
         std::collections::HashMap<super::llama_family_forward_batched::UnifiedGraphShape, u64>,
     /// Monotonic IDs in the high-bit namespace, never a hash authorization.
@@ -2177,6 +2181,7 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
             batched_pointers_for: None,
             unified_graph_warmup: 0,
             unified_graph_failed: false,
+            unified_graph_retirement_pending: false,
             unified_graph_keys_seen: std::collections::HashMap::new(),
             unified_graph_next_key: 0,
             prefix_cache_hits: 0,
@@ -2256,6 +2261,7 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         self.unified_graph_keys_seen.clear();
         self.unified_graph_warmup = 0;
         self.unified_graph_failed = false;
+        self.unified_graph_retirement_pending = false;
     }
 
     fn resize_scratch_in_context(&mut self, ctx: &mut B::Context, tokens: usize) {
@@ -2280,6 +2286,7 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         self.unified_graph_keys_seen.clear();
         self.unified_graph_warmup = 0;
         self.unified_graph_failed = false;
+        self.unified_graph_retirement_pending = false;
         // Realloc wiped paged_batch_*. Re-enable using the dims
         // pinned at first ensure_kv. Without this, the next
         // `forward_layer_batched_decode` panics on

@@ -19,6 +19,8 @@ struct TrackedCpu;
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum GraphFault {
     BatchCaptureUnresolved,
+    StageReadback,
+    StageReadbackUnresolved,
     SecondLayer,
     SecondLayerUnresolved,
     EndCapture,
@@ -214,6 +216,20 @@ impl Backend for TrackedCpu {
     }
     fn to_vec(x: &Vec<f32>, n: usize) -> Vec<f32> {
         CpuBackend::to_vec(x, n)
+    }
+    fn to_vec_in_context(ctx: &mut Context, x: &Vec<f32>, n: usize) -> Vec<f32> {
+        if matches!(
+            ctx.graph_fault,
+            Some(GraphFault::StageReadback | GraphFault::StageReadbackUnresolved)
+        ) {
+            let unresolved = ctx.graph_fault == Some(GraphFault::StageReadbackUnresolved);
+            ctx.graph_fault = None;
+            ctx.unresolved.store(unresolved, Ordering::SeqCst);
+            std::panic::panic_any(FerrumError::backend(
+                "controlled stage final readback failure",
+            ));
+        }
+        CpuBackend::to_vec_in_context(&mut ctx.cpu, x, n)
     }
     fn alloc_in_context(ctx: &mut Context, n: usize) -> Vec<f32> {
         ctx.calls.fetch_add(1, Ordering::SeqCst);
@@ -1822,4 +1838,206 @@ fn instance_context_failed_batch_graph_must_retire_before_eager_reuse() {
     assert_eq!(model.execution_context.as_ref().unwrap().replay_attempts, 0);
     model.close().unwrap();
     reference.close().unwrap();
+}
+
+#[test]
+fn instance_context_stage_batch_grows_contiguous_storage_before_append() {
+    use crate::models::llama_family_pipeline::{LlamaPipelineStageBatchOps, PipelineHidden};
+
+    for from_hidden in [false, true] {
+        let loader = SyntheticLlamaLoader::new(config());
+        let mut execution = ferrum_types::LlamaExecutionConfig::default();
+        execution.prefix_cache = false;
+        execution.options.metal_paged_kv = Some(false);
+        execution.options.cuda_graph = false;
+        execution.batched_graph = false;
+        let mut actual = LlamaFamilyModel::<CpuBackend>::new_with_execution_config(
+            config(),
+            &loader,
+            execution.clone(),
+        )
+        .unwrap();
+        let mut reference =
+            LlamaFamilyModel::<CpuBackend>::new_with_execution_config(config(), &loader, execution)
+                .unwrap();
+        assert!(actual.supports_batched_decode);
+        for (id, token) in [("a", 1), ("b", 2)] {
+            actual.prepare_kv_capacity(id, 1);
+            reference.prepare_kv_capacity(id, 1);
+            assert_eq!(
+                actual.prefill_internal(id, &[token]),
+                reference.prefill_internal(id, &[token])
+            );
+            assert!(actual.kv_caches[id]
+                .iter()
+                .all(|cache| cache.capacity == 1 && cache.len == 1));
+        }
+        let batch = vec![("a".to_owned(), 3, 1), ("b".to_owned(), 4, 1)];
+        let h = config().hidden_size;
+        let input: Vec<_> = (0..2 * h).map(|i| (i as f32 - 11.0) * 0.03125).collect();
+        let actual_hidden = if from_hidden {
+            actual
+                .decode_stage_hidden_from_host_batch(
+                    &batch,
+                    &PipelineHidden::host(input.clone(), 2, h),
+                )
+                .0
+        } else {
+            actual.decode_stage_tokens_to_hidden_batch(&batch)
+        };
+        let expected: Vec<_> = batch
+            .iter()
+            .enumerate()
+            .flat_map(|(row, (id, token, position))| {
+                if from_hidden {
+                    reference
+                        .decode_stage_hidden_from_host_with_timing(
+                            id,
+                            &input[row * h..(row + 1) * h],
+                            *position,
+                        )
+                        .0
+                } else {
+                    reference.decode_stage_token_to_hidden(id, *token, *position)
+                }
+            })
+            .collect();
+        assert_eq!(actual_hidden.host_slice().len(), 2 * h);
+        for (&actual, &expected) in actual_hidden.host_slice().iter().zip(&expected) {
+            assert!(actual.is_finite() && expected.is_finite());
+            assert!((actual - expected).abs() <= 1e-5 + 1e-5 * expected.abs());
+        }
+        for id in ["a", "b"] {
+            assert!(actual.kv_caches[id]
+                .iter()
+                .all(|cache| cache.capacity >= 2 && cache.len == 2));
+        }
+        actual.close().unwrap();
+        reference.close().unwrap();
+    }
+}
+
+#[test]
+fn instance_context_stage_batch_final_readback_failure_keeps_frontier_and_owners() {
+    use crate::common::llm::{ModelExecutionRecovery, ModelTokenCloseOutcome};
+    use crate::models::llama_family_pipeline::{LlamaPipelineStageBatchOps, PipelineHidden};
+
+    for from_hidden in [false, true] {
+        for unresolved in [false, true] {
+            let (mut model, mut reference, batch) = prepared_batch_graph_fault_models();
+            let context = model.execution_context.as_mut().unwrap();
+            let identity = context.identity.clone();
+            let pending = context.unresolved.clone();
+            context.graph_fault = Some(if unresolved {
+                GraphFault::StageReadbackUnresolved
+            } else {
+                GraphFault::StageReadback
+            });
+            let original_kv: Vec<_> = ["a", "b"]
+                .into_iter()
+                .map(|id| {
+                    model.kv_caches[id]
+                        .iter()
+                        .map(|cache| (cache.k.as_ptr(), cache.v.as_ptr()))
+                        .collect::<Vec<_>>()
+                })
+                .collect();
+            let residual = model.scratch.residual.as_ref().unwrap().as_ptr();
+            let h = config().hidden_size;
+            let input: Vec<_> = (0..2 * h).map(|i| (i as f32 - 11.0) * 0.03125).collect();
+            let failure = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                if from_hidden {
+                    model
+                        .decode_stage_hidden_from_host_batch(
+                            &batch,
+                            &PipelineHidden::host(input.clone(), 2, h),
+                        )
+                        .0
+                } else {
+                    model.decode_stage_tokens_to_hidden_batch(&batch)
+                }
+            }))
+            .err()
+            .expect("the actual stage must reach the final readback fault");
+            assert!(panic_error(failure)
+                .to_string()
+                .contains("controlled stage final readback failure"));
+            let failed_frontiers: Vec<_> = ["a", "b"]
+                .into_iter()
+                .map(|id| {
+                    model.kv_caches[id]
+                        .iter()
+                        .map(|cache| cache.len)
+                        .collect::<Vec<_>>()
+                })
+                .collect();
+            if unresolved {
+                let frame = model
+                    .pending_device_frame
+                    .as_ref()
+                    .expect("original stage frame retained");
+                assert!(Arc::ptr_eq(&identity, &frame.context.identity));
+                assert_eq!(frame.residual.as_ref().unwrap().as_ptr(), residual);
+                assert!(model.execution_context.is_none());
+                assert!(model.scratch.residual.is_none());
+                assert!(matches!(
+                    model.close_managed_token_cache("a"),
+                    ModelTokenCloseOutcome::Held { .. }
+                ));
+                pending.store(false, Ordering::SeqCst);
+                assert!(matches!(
+                    model.recover_token_frame(),
+                    ModelExecutionRecovery::Quiescent { error: None }
+                ));
+            } else {
+                assert!(model.pending_device_frame.is_none());
+            }
+            assert!(failed_frontiers.iter().flatten().all(|length| *length == 3));
+            assert!(Arc::ptr_eq(
+                &identity,
+                &model.execution_context.as_ref().unwrap().identity
+            ));
+            assert_eq!(model.scratch.residual.as_ref().unwrap().as_ptr(), residual);
+            assert_eq!(
+                original_kv,
+                ["a", "b"]
+                    .into_iter()
+                    .map(|id| {
+                        model.kv_caches[id]
+                            .iter()
+                            .map(|cache| (cache.k.as_ptr(), cache.v.as_ptr()))
+                            .collect::<Vec<_>>()
+                    })
+                    .collect::<Vec<_>>()
+            );
+            let (actual, expected) = if from_hidden {
+                (
+                    model
+                        .decode_stage_hidden_from_host_batch(
+                            &batch,
+                            &PipelineHidden::host(input.clone(), 2, h),
+                        )
+                        .0,
+                    reference
+                        .decode_stage_hidden_from_host_batch(
+                            &batch,
+                            &PipelineHidden::host(input, 2, h),
+                        )
+                        .0,
+                )
+            } else {
+                (
+                    model.decode_stage_tokens_to_hidden_batch(&batch),
+                    reference.decode_stage_tokens_to_hidden_batch(&batch),
+                )
+            };
+            assert_eq!(actual.host_slice(), expected.host_slice());
+            assert!(actual.host_slice().iter().all(|value| value.is_finite()));
+            for id in ["a", "b"] {
+                assert!(model.kv_caches[id].iter().all(|cache| cache.len == 4));
+            }
+            model.close().unwrap();
+            reference.close().unwrap();
+        }
+    }
 }

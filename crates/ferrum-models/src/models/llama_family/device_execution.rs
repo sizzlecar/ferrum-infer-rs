@@ -497,6 +497,7 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
             model.unified_graph_keys_seen.clear();
             model.unified_graph_warmup = 0;
             model.unified_graph_failed = false;
+            model.unified_graph_retirement_pending = false;
             model.prepared_prefixes.clear();
             model.kv_caches.clear();
             model.kv_free_pool.clear();

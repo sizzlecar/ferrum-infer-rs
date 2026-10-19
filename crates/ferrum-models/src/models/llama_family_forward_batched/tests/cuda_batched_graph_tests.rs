@@ -11,20 +11,26 @@ type Model = LlamaFamilyModel<CudaBackend>;
 #[test]
 #[ignore = "requires an actual CUDA device"]
 fn unified_graph_cuda_capture_panic_retires_before_eager_recovery() {
-    unified_graph_failure_recovery(true);
+    unified_graph_failure_recovery(true, false);
 }
 
 #[test]
 #[ignore = "requires an actual CUDA device"]
 fn unified_graph_cuda_replay_then_head_panic_keeps_original_frontier() {
-    unified_graph_failure_recovery(false);
+    unified_graph_failure_recovery(false, false);
+}
+
+#[test]
+#[ignore = "requires an actual CUDA device"]
+fn unified_graph_cuda_lost_capture_never_publishes_recorded_work() {
+    unified_graph_failure_recovery(true, true);
 }
 
 // Fault only a host boundary around the original CUDA head. No successful
 // graph, completion status, or numerical operation is simulated by this test.
-fn unified_graph_failure_recovery(during_capture: bool) {
+fn unified_graph_failure_recovery(during_capture: bool, abort_capture: bool) {
     use cudarc::driver::DevicePtr;
-    use ferrum_kernels::backend::Backend;
+    use ferrum_kernels::backend::{Backend, BackendGraph};
     use ferrum_kernels::{Linear, LinearMetadata, LoadedLinear};
     use std::sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -35,6 +41,7 @@ fn unified_graph_failure_recovery(during_capture: bool) {
         armed: AtomicBool,
         fired: AtomicUsize,
         during_capture: bool,
+        abort_capture: bool,
     }
     struct Head {
         original: LoadedLinear<CudaBackend>,
@@ -62,9 +69,16 @@ fn unified_graph_failure_recovery(during_capture: bool) {
                 && self.fault.armed.swap(false, Ordering::SeqCst)
             {
                 self.fault.fired.fetch_add(1, Ordering::SeqCst);
-                std::panic::panic_any(ferrum_types::FerrumError::backend(
-                    "controlled unified head failure after original CUDA encoding",
-                ));
+                if self.fault.abort_capture {
+                    // End the real recording without executing its prefix, but
+                    // return normally so only the model's lost-capture guard
+                    // can reject the unexecuted result.
+                    CudaBackend::abort_graph_capture(ctx).unwrap();
+                } else {
+                    std::panic::panic_any(ferrum_types::FerrumError::backend(
+                        "controlled unified head failure after original CUDA encoding",
+                    ));
+                }
             }
         }
     }
@@ -91,12 +105,14 @@ fn unified_graph_failure_recovery(during_capture: bool) {
         armed: AtomicBool::new(false),
         fired: AtomicUsize::new(0),
         during_capture,
+        abort_capture,
     });
     let original = model.lm_head.take().unwrap();
     assert!(original.is_capture_stable());
     // SAFETY: the wrapper owns the unchanged capture-qualified projection.
-    // The only injected capture-side effect is a one-shot panic, so that
-    // recording cannot install a graph. Successful recordings contain exactly
+    // The only injected capture-side effect is a one-shot panic or native
+    // capture cancellation, so that recording cannot install a graph.
+    // Successful recordings contain exactly
     // the original CUDA operations. The second case leaves the head outside
     // capture entirely. Neither case relies on replaying a host side effect.
     model.lm_head = Some(unsafe {
@@ -160,6 +176,7 @@ fn unified_graph_failure_recovery(during_capture: bool) {
     // context and must not replay the failed numerical invocation.
     assert!(model.recover_device_frame().unwrap());
     let failed_latch = model.unified_graph_failed;
+    let failed_retirement_pending = model.unified_graph_retirement_pending;
     let failed_len = model.cache_len(id);
     let failed_warmup = model.unified_graph_warmup;
     let failed_keys = model.unified_graph_keys_seen.len();
@@ -184,12 +201,43 @@ fn unified_graph_failure_recovery(during_capture: bool) {
         one(&mut model, peer, prompt.clone(), 0),
         one(&mut reference, peer, prompt, 0),
     ));
+    let retired_after_first_peer = !model.unified_graph_retirement_pending;
+    // Install another real graph on the same original context after the
+    // failed unified closure has retired. Its unchanged model scratch owner
+    // remains alive through checked close. Later disabled unified calls must
+    // not repeatedly clear this unrelated native graph.
+    const PEER_GRAPH_KEY: u64 = u64::MAX - 1;
+    model
+        .run_device_frame(|model, frame| {
+            let buffer = model.scratch.unified_residual.as_mut().unwrap();
+            let len = model.cfg.hidden_size;
+            CudaBackend::scale_inplace(&mut frame.context, buffer, 1.0, len);
+            CudaBackend::observe_completion(&mut frame.context)
+                .into_result()
+                .unwrap();
+            // SAFETY: the unchanged model owns this exact scratch allocation;
+            // the test never grows it and original model close retires all graphs.
+            unsafe {
+                CudaBackend::begin_graph_capture(&mut frame.context).unwrap();
+                CudaBackend::scale_inplace(&mut frame.context, buffer, 1.0, len);
+                CudaBackend::end_graph_capture(&mut frame.context, PEER_GRAPH_KEY).unwrap();
+                assert!(CudaBackend::replay_graph(&mut frame.context, PEER_GRAPH_KEY).unwrap());
+            }
+        })
+        .into_legacy_result();
     for position in 9..13 {
         outputs.push((
             one(&mut model, peer, vec![position as u32 + 21], position),
             one(&mut reference, peer, vec![position as u32 + 21], position),
         ));
     }
+    let peer_graph_survived = model
+        .run_device_frame(|_, frame| {
+            // SAFETY: same original buffer/context closure as the capture above.
+            unsafe { CudaBackend::replay_graph(&mut frame.context, PEER_GRAPH_KEY).unwrap() }
+        })
+        .into_legacy_result();
+    let eager_warmup = model.unified_graph_warmup;
     let still_disabled = model.unified_graph_failed;
     let retired_keys = model.unified_graph_keys_seen.is_empty();
     let original_len_after_peer = model.cache_len(id);
@@ -202,13 +250,25 @@ fn unified_graph_failure_recovery(during_capture: bool) {
     }
 
     let failure = failed.expect_err("the armed original CUDA head must fail");
+    let expected_error = if abort_capture {
+        "unified capture ended before graph installation"
+    } else {
+        "controlled unified head failure"
+    };
     assert!(failure
         .downcast_ref::<ferrum_types::FerrumError>()
-        .is_some_and(|error| error
-            .to_string()
-            .contains("controlled unified head failure")));
+        .is_some_and(|error| error.to_string().contains(expected_error)));
     assert_eq!(fault.fired.load(Ordering::SeqCst), 1);
     assert!(failed_latch && still_disabled && retired_keys);
+    assert!(failed_retirement_pending && retired_after_first_peer);
+    assert!(
+        peer_graph_survived,
+        "retired failure must not evict another native graph"
+    );
+    assert_eq!(
+        eager_warmup, 5,
+        "only the first recovery retires and resets warmup"
+    );
     assert_eq!(
         (failed_len, original_len_after_peer),
         (prior_len, prior_len)
@@ -938,5 +998,262 @@ fn unified_graph_cuda_uses_canonical_split_policy_for_capture_identity() {
         );
         assert_full_logits_qualification(&expected, &reference);
         assert_full_logits_qualification(&actual, &reference);
+    }
+}
+
+#[test]
+#[ignore = "requires an actual CUDA device"]
+fn stage_batch_cuda_full_attention_reserves_next_physical_page() {
+    stage_batch_capacity_boundary(true);
+}
+
+#[test]
+#[ignore = "requires an actual CUDA device"]
+fn stage_batch_cuda_contiguous_grows_before_append() {
+    stage_batch_capacity_boundary(false);
+}
+
+fn stage_batch_capacity_boundary(paged: bool) {
+    use crate::models::llama_family_pipeline::{LlamaPipelineStageBatchOps, PipelineHidden};
+    use crate::test_support::numerical::assert_full_logits_qualification;
+
+    for from_hidden in [false, true] {
+        let mut config = physical_batch_config();
+        config.num_layers = 2;
+        config.sliding_window = 0;
+        config.max_seq_len = 32;
+        let h = config.hidden_size;
+        let loader = SyntheticLlamaLoader::new(config.clone());
+        let mut execution = LlamaExecutionConfig::default();
+        execution.prefix_cache = false;
+        execution.options.metal_paged_kv = Some(paged);
+        execution.paged_max_seqs = 2;
+        execution.kv_capacity = Some(32);
+        execution.options.cuda_graph = false;
+        execution.options.unified_graph = false;
+        execution.batched_graph = false;
+        let mut actual =
+            Model::new_with_execution_config(config.clone(), &loader, execution.clone()).unwrap();
+        execution.options.metal_paged_kv = Some(false);
+        let mut reference = Model::new_with_execution_config(config, &loader, execution).unwrap();
+        assert!(actual.supports_batched_decode && reference.supports_batched_decode);
+        for (row, id) in ["a", "b"].into_iter().enumerate() {
+            let prompt: Vec<_> = (0..16).map(|index| 1 + row as u32 * 20 + index).collect();
+            actual.prepare_kv_capacity(id, 16);
+            reference.prepare_kv_capacity(id, 32);
+            assert_full_logits_qualification(
+                &actual.prefill_internal(id, &prompt),
+                &reference.prefill_internal(id, &prompt),
+            );
+            for cache in &actual.kv_caches[id] {
+                assert_eq!(cache.len, 16);
+                if paged {
+                    assert_eq!(cache.paged_block_indices.len(), 1);
+                } else {
+                    assert_eq!(cache.capacity, 16);
+                }
+            }
+        }
+        assert_eq!(actual.paged_pools.is_some(), paged);
+        let mut records = Vec::new();
+        for position in 16..18 {
+            let batch = batch(&["a", "b"], position, 40 + position);
+            let input: Vec<_> = (0..2 * h)
+                .map(|i| ((i % 29) as f32 - 11.0) * 0.03125)
+                .collect();
+            let (actual_hidden, expected_hidden) = if from_hidden {
+                (
+                    actual
+                        .decode_stage_hidden_from_host_batch(
+                            &batch,
+                            &PipelineHidden::host(input.clone(), 2, h),
+                        )
+                        .0,
+                    reference
+                        .decode_stage_hidden_from_host_batch(
+                            &batch,
+                            &PipelineHidden::host(input, 2, h),
+                        )
+                        .0,
+                )
+            } else {
+                (
+                    actual.decode_stage_tokens_to_hidden_batch(&batch),
+                    reference.decode_stage_tokens_to_hidden_batch(&batch),
+                )
+            };
+            records.push((
+                actual.logits_from_hidden_batch(&actual_hidden, true),
+                reference.logits_from_hidden_batch(&expected_hidden, true),
+            ));
+            for id in ["a", "b"] {
+                for cache in &actual.kv_caches[id] {
+                    assert_eq!(cache.len, position as usize + 1);
+                    if paged {
+                        assert_eq!(cache.paged_block_indices.len(), 2);
+                    } else {
+                        assert!(cache.capacity >= position as usize + 1);
+                    }
+                }
+            }
+            if paged {
+                let owned: Vec<_> = ["a", "b"]
+                    .into_iter()
+                    .flat_map(|id| actual.kv_caches[id][0].paged_block_indices.iter().copied())
+                    .collect();
+                assert_eq!(
+                    owned
+                        .iter()
+                        .copied()
+                        .collect::<std::collections::HashSet<_>>()
+                        .len(),
+                    owned.len()
+                );
+            }
+        }
+        actual.close().unwrap();
+        reference.close().unwrap();
+        for (actual_rows, expected_rows) in records {
+            assert_eq!(actual_rows.len(), 2);
+            for (actual, expected) in actual_rows.iter().zip(expected_rows) {
+                assert_eq!(actual.len(), 128);
+                assert_full_logits_qualification(actual, &expected);
+            }
+        }
+    }
+}
+
+/// Native eviction is a cache miss, not a failed graph execution. Exercise all
+/// three supported capture scopes because their readiness boundaries differ.
+#[test]
+#[ignore = "requires an actual CUDA device"]
+fn unified_graph_cuda_native_cache_miss_rewarms_each_capture_scope() {
+    use crate::test_support::numerical::assert_full_logits_qualification;
+    use ferrum_kernels::backend::{cpu::CpuBackend, BackendGraph};
+
+    for (scope, layers_only, head_eager) in [
+        ("full", false, false),
+        ("layers", true, false),
+        ("final-pack", false, true),
+    ] {
+        let config = physical_batch_config();
+        let loader = SyntheticLlamaLoader::new(config.clone());
+        let mut execution = LlamaExecutionConfig::default();
+        execution.options.metal_paged_kv = Some(true);
+        execution.options.unified_graph = true;
+        execution.options.unified_graph_layers_only = layers_only;
+        execution.options.unified_graph_lm_head_eager = head_eager;
+        execution.options.cuda_graph = false;
+        execution.batched_graph = false;
+        execution.prefix_cache = false;
+        execution.backend_context.cuda.split_k_attn = Some(false);
+        execution.paged_max_seqs = 1;
+        execution.kv_capacity = Some(32);
+        let mut model =
+            Model::new_with_execution_config(config.clone(), &loader, execution.clone()).unwrap();
+        execution.options.unified_graph = false;
+        let mut reference =
+            Model::new_with_execution_config(config.clone(), &loader, execution.clone()).unwrap();
+        execution.options.metal_paged_kv = Some(false);
+        let mut cpu =
+            LlamaFamilyModel::<CpuBackend>::new_with_execution_config(config, &loader, execution)
+                .unwrap();
+        let id = "native-eviction-original";
+        let one = |model: &mut Model, tokens: Vec<u32>, position| {
+            let mut rows = model
+                .unified_forward(&[(id.to_owned(), tokens, position, true)])
+                .unwrap();
+            assert_eq!(rows.len(), 1);
+            rows.remove(0).unwrap()
+        };
+        let prompt: Vec<u32> = (1..=17).collect();
+        let mut records = vec![(
+            17,
+            one(&mut model, prompt.clone(), 0),
+            one(&mut reference, prompt.clone(), 0),
+            cpu.prefill_internal(id, &prompt),
+        )];
+        for position in 17..20 {
+            let token = position as u32 + 1;
+            records.push((
+                position + 1,
+                one(&mut model, vec![token], position),
+                one(&mut reference, vec![token], position),
+                cpu.decode_internal(id, token, position as u32),
+            ));
+        }
+        assert_eq!(model.unified_graph_keys_seen.len(), 1);
+        let original_key = *model.unified_graph_keys_seen.values().next().unwrap();
+        // Evict only the real native cache. Keep the model's same shape/key
+        // belief so its next public call must observe Ok(false), not bypass it.
+        model
+            .run_preparation_frame(|_, frame| {
+                CudaBackend::reset_graph(&mut frame.context, original_key);
+            })
+            .into_legacy_result();
+        assert!(model
+            .unified_graph_keys_seen
+            .values()
+            .any(|key| *key == original_key));
+        let mut states = Vec::new();
+        for position in 20..25 {
+            let token = position as u32 + 1;
+            records.push((
+                position + 1,
+                one(&mut model, vec![token], position),
+                one(&mut reference, vec![token], position),
+                cpu.decode_internal(id, token, position as u32),
+            ));
+            states.push((
+                position + 1,
+                model.unified_graph_failed,
+                model.unified_graph_retirement_pending,
+                model.unified_graph_warmup,
+                model
+                    .unified_graph_keys_seen
+                    .values()
+                    .copied()
+                    .collect::<Vec<_>>(),
+            ));
+        }
+        let lengths = (
+            model.cache_len(id),
+            reference.cache_len(id),
+            cpu.cache_len(id),
+        );
+        model.close().unwrap();
+        reference.close().unwrap();
+        cpu.close().unwrap();
+
+        assert_eq!(lengths, (25, 25, 25), "scope {scope}");
+        assert!(
+            states.iter().all(|state| !state.1 && !state.2),
+            "scope {scope}"
+        );
+        assert_eq!(states[0].3, 1, "safe miss starts fresh warmup: {scope}");
+        assert!(states[0].4.is_empty(), "old native key is retired: {scope}");
+        assert_eq!(
+            states[3].4.len(),
+            1,
+            "recapture after eager warmup: {scope}"
+        );
+        assert_ne!(states[3].4[0], original_key, "new native identity: {scope}");
+        assert_eq!(
+            states[4].4, states[3].4,
+            "same shape reuses new graph: {scope}"
+        );
+        assert_eq!(
+            states[4].3, states[3].3,
+            "native replay skips eager warmup: {scope}"
+        );
+        for (length, actual, expected, reference) in records {
+            full_logits(
+                &actual,
+                &expected,
+                &format!("native cache miss scope={scope} len={length}"),
+            );
+            assert_full_logits_qualification(&expected, &reference);
+            assert_full_logits_qualification(&actual, &reference);
+        }
     }
 }
