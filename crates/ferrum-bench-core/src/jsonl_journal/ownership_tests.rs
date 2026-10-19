@@ -129,7 +129,7 @@ fn journal_scope_receipt_keeps_enqueue_cut_when_peer_has_later_pending_work_and_
     let second = pb.clone();
     let next_gate = second_gate.clone();
     nonblocking(move || {
-        let gate = second.inner.send_gate.lock().unwrap();
+        let gate = second.inner.send_gate.write().unwrap();
         drop(gate);
         second.try_enqueue(gated(&next_gate, true))
     })

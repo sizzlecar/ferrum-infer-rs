@@ -121,7 +121,7 @@ fn try_delivery_full_and_gate_busy_return_without_poisoning_the_journal() {
     );
     worker.join().unwrap();
     assert_eq!(journal.delivery_stats().pending_payload_bytes, bytes);
-    let held_gate = journal.inner.send_gate.lock().unwrap();
+    let held_gate = journal.inner.send_gate.write().unwrap();
     let send = journal.clone();
     assert_eq!(
         nonblocking(move || send.try_enqueue(serde_json::json!({"ordinal": 3})))
@@ -675,7 +675,7 @@ pub(super) fn readonly_journal<T: Serialize + Send + 'static>(
         inner: Arc::new(JsonlJournalInner {
             path: path.to_path_buf(),
             sender,
-            send_gate: Mutex::new(PublicationState::default()),
+            send_gate: RwLock::new(PublicationState::default()),
             worker: Mutex::new(Some(worker)),
             failure,
             closed: AtomicBool::new(false),
@@ -759,7 +759,10 @@ fn journal_producer_poison_still_drains_and_joins_on_close_or_unwind() {
             crashing.try_enqueue(PanickingDropEvent)
         }));
         assert!(rejected.is_err());
-        assert!(journal.inner.send_gate.is_poisoned());
+        assert_eq!(
+            journal.inner.failure.current().unwrap().kind(),
+            JsonlJournalErrorKind::Panic
+        );
         assert_eq!(
             journal
                 .try_enqueue(serde_json::json!({"later": true}))
@@ -791,7 +794,10 @@ fn journal_producer_poison_still_drains_and_joins_on_close_or_unwind() {
             if explicit_close {
                 let error = journal.close().unwrap().result().unwrap_err();
                 assert_eq!(error.kind(), JsonlJournalErrorKind::Panic);
-                assert!(journal.producer.inner.send_gate.is_poisoned());
+                assert_eq!(
+                    journal.producer.inner.failure.current().unwrap().kind(),
+                    JsonlJournalErrorKind::Panic
+                );
                 assert!(journal.producer.inner.worker.lock().unwrap().is_none());
                 drop(journal);
             } else {
@@ -1027,7 +1033,10 @@ fn journal_reopen_waits_for_real_close_join_before_starting_another_epoch() {
                 crashing.try_enqueue(PanickingDropEvent)
             }))
             .is_err());
-            assert!(journal.producer.inner.send_gate.is_poisoned());
+            assert_eq!(
+                journal.producer.inner.failure.current().unwrap().kind(),
+                JsonlJournalErrorKind::Panic
+            );
         }
         let OwnedJsonlJournal {
             producer: journal,
@@ -1085,7 +1094,10 @@ fn journal_reopen_waits_for_real_close_join_before_starting_another_epoch() {
                 result.unwrap().result().unwrap_err().kind(),
                 JsonlJournalErrorKind::Panic
             );
-            assert!(journal.inner.send_gate.is_poisoned());
+            assert_eq!(
+                journal.inner.failure.current().unwrap().kind(),
+                JsonlJournalErrorKind::Panic
+            );
         } else {
             result.unwrap().result().unwrap();
         }
@@ -1140,7 +1152,10 @@ fn journal_reopen_waits_for_real_close_join_before_starting_another_epoch() {
             std::fs::read_to_string(&path).unwrap(),
             "{\"new_epoch\":true}\n"
         );
-        assert_eq!(journal.inner.send_gate.is_poisoned(), poison_producer);
+        assert_eq!(
+            journal.inner.failure.current().map(|error| error.kind()),
+            poison_producer.then_some(JsonlJournalErrorKind::Panic)
+        );
         drop(next);
         drop(blocking);
         drop(journal);

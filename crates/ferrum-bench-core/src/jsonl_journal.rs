@@ -8,7 +8,7 @@ use std::path::Component;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, RecvTimeoutError, SyncSender};
-use std::sync::{Arc, Mutex, OnceLock, Weak};
+use std::sync::{Arc, Mutex, OnceLock, RwLock, RwLockReadGuard, Weak};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -27,6 +27,8 @@ mod budget_tests;
 mod delivery_tests;
 #[cfg(test)]
 mod ownership_tests;
+#[cfg(test)]
+mod publication_tests;
 
 type JournalRegistry = HashMap<PathBuf, Weak<JsonlJournalInner>>;
 static JSONL_JOURNAL_REGISTRY: OnceLock<Mutex<JournalRegistry>> = OnceLock::new();
@@ -216,12 +218,48 @@ enum JournalCommand {
 struct JsonlJournalInner {
     path: PathBuf,
     sender: SyncSender<JournalCommand>,
-    send_gate: Mutex<PublicationState>,
+    // Producers share a permit through acceptance and enqueue/rollback. Cold
+    // barriers take the exclusive permit, so their cut cannot include a
+    // partially published job without rejecting healthy peer producers.
+    send_gate: RwLock<PublicationState>,
     worker: Mutex<Option<JoinHandle<()>>>,
     failure: Arc<JournalFailure>,
     closed: AtomicBool,
     config: JsonlJournalConfig,
     delivery: Arc<DeliveryState>,
+}
+
+struct PublicationPermit<'a> {
+    _gate: RwLockReadGuard<'a, PublicationState>,
+    inner: &'a JsonlJournalInner,
+    was_panicking: bool,
+}
+
+impl<'a> PublicationPermit<'a> {
+    fn new(inner: &'a JsonlJournalInner, gate: RwLockReadGuard<'a, PublicationState>) -> Self {
+        Self {
+            _gate: gate,
+            inner,
+            was_panicking: thread::panicking(),
+        }
+    }
+}
+
+impl Drop for PublicationPermit<'_> {
+    fn drop(&mut self) {
+        // A read guard does not poison std::sync::RwLock on unwind. Preserve
+        // the same publication-contract failure before releasing the permit;
+        // cleanup must still drain and join the original worker.
+        if !self.was_panicking && thread::panicking() {
+            self.inner.failure.record(JsonlJournalError::with_kind(
+                JsonlJournalErrorKind::Panic,
+                format!(
+                    "JSONL journal {} producer panicked during publication",
+                    self.inner.path.display()
+                ),
+            ));
+        }
+    }
 }
 
 impl JsonlJournalInner {
@@ -240,10 +278,11 @@ impl JsonlJournalInner {
         command: JournalCommand,
         records: usize,
     ) -> Result<(), JsonlJournalError> {
-        let _send_guard = self
+        let gate = self
             .send_gate
-            .lock()
+            .read()
             .map_err(|_| self.record_poison("publication gate"))?;
+        let _send_guard = PublicationPermit::new(self, gate);
         self.check_publication(scope)?;
         self.sender
             .send(command)
@@ -275,8 +314,8 @@ impl JsonlJournalInner {
         })
     }
 
-    fn cleanup_gate(&self) -> std::sync::MutexGuard<'_, PublicationState> {
-        match self.send_gate.lock() {
+    fn cleanup_gate(&self) -> std::sync::RwLockWriteGuard<'_, PublicationState> {
+        match self.send_gate.write() {
             Ok(guard) => guard,
             Err(poisoned) => {
                 self.record_poison("publication gate");
@@ -346,7 +385,7 @@ impl JsonlJournalInner {
         };
         // close_and_join owns this gate from closed=true through the actual
         // JoinHandle::join. Do not wait while holding the global path registry.
-        let _send_guard = match self.send_gate.try_lock() {
+        let _send_guard = match self.send_gate.try_write() {
             Ok(guard) => guard,
             Err(std::sync::TryLockError::WouldBlock) => return Err(closing()),
             Err(std::sync::TryLockError::Poisoned(poisoned)) => {
@@ -558,7 +597,7 @@ fn open_shared_inner(
     let inner = Arc::new(JsonlJournalInner {
         path: path.clone(),
         sender,
-        send_gate: Mutex::new(PublicationState::default()),
+        send_gate: RwLock::new(PublicationState::default()),
         worker: Mutex::new(Some(worker)),
         failure,
         closed: AtomicBool::new(false),
@@ -628,7 +667,7 @@ where
     }
 
     pub fn flush(&self) -> JsonlFlushReceipt {
-        let gate = match self.inner.send_gate.lock() {
+        let gate = match self.inner.send_gate.write() {
             Ok(gate) => gate,
             Err(_) => {
                 return JsonlFlushReceipt::rejected(

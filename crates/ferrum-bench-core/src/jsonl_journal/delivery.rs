@@ -1,13 +1,13 @@
 //! Bounded, nonwaiting production delivery on the original ordered writer.
 use super::{
     JournalCommand, JsonlJournal, JsonlJournalConfig, JsonlJournalError, JsonlPublicationCut,
-    PublicationState,
+    PublicationPermit,
 };
 use serde::Serialize;
 use std::io::{self, Write};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::TrySendError;
-use std::sync::{Arc, MutexGuard, TryLockError};
+use std::sync::{Arc, TryLockError};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum JsonlJournalErrorKind {
@@ -440,10 +440,7 @@ impl<T: Serialize + Send + 'static> JsonlJournal<T> {
         result
     }
 
-    fn publication_gate(
-        &self,
-        records: usize,
-    ) -> Result<MutexGuard<'_, PublicationState>, JsonlJournalError> {
+    fn publication_gate(&self, records: usize) -> Result<PublicationPermit<'_>, JsonlJournalError> {
         let result = (|| {
             if self.inner.closed.load(Ordering::Acquire) {
                 return Err(error(
@@ -451,7 +448,7 @@ impl<T: Serialize + Send + 'static> JsonlJournal<T> {
                     "JSONL journal is closed",
                 ));
             }
-            let guard = match self.inner.send_gate.try_lock() {
+            let guard = match self.inner.send_gate.try_read() {
                 Ok(guard) => guard,
                 Err(TryLockError::WouldBlock) => {
                     return Err(error(
@@ -463,6 +460,7 @@ impl<T: Serialize + Send + 'static> JsonlJournal<T> {
                     return Err(self.inner.record_poison("publication gate"))
                 }
             };
+            let permit = PublicationPermit::new(&self.inner, guard);
             if self.inner.closed.load(Ordering::Acquire) {
                 return Err(error(
                     JsonlJournalErrorKind::Closed,
@@ -472,7 +470,7 @@ impl<T: Serialize + Send + 'static> JsonlJournal<T> {
             // Scope retirement, final close, or worker failure may have
             // happened during measurement. Only this gate grants publication.
             self.inner.check_publication(&self.scope)?;
-            Ok(guard)
+            Ok(permit)
         })();
         if result.is_err() {
             self.inner.delivery.reject(records);

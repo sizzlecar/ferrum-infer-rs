@@ -116,7 +116,7 @@ impl JsonlJournalOwner {
         let mut gate = self
             .inner
             .send_gate
-            .lock()
+            .write()
             .map_err(|_| self.inner.record_poison("publication gate"))?;
         if self.inner.closed.load(Ordering::Acquire) {
             return Err(JsonlJournalError::with_kind(
