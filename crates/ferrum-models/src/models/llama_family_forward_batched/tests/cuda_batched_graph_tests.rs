@@ -8,6 +8,235 @@ use ferrum_types::LlamaExecutionConfig;
 
 type Model = LlamaFamilyModel<CudaBackend>;
 
+#[test]
+#[ignore = "requires an actual CUDA device"]
+fn unified_graph_cuda_capture_panic_retires_before_eager_recovery() {
+    unified_graph_failure_recovery(true);
+}
+
+#[test]
+#[ignore = "requires an actual CUDA device"]
+fn unified_graph_cuda_replay_then_head_panic_keeps_original_frontier() {
+    unified_graph_failure_recovery(false);
+}
+
+// Fault only a host boundary around the original CUDA head. No successful
+// graph, completion status, or numerical operation is simulated by this test.
+fn unified_graph_failure_recovery(during_capture: bool) {
+    use cudarc::driver::DevicePtr;
+    use ferrum_kernels::backend::Backend;
+    use ferrum_kernels::{Linear, LinearMetadata, LoadedLinear};
+    use std::sync::{
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        Arc,
+    };
+
+    struct Fault {
+        armed: AtomicBool,
+        fired: AtomicUsize,
+        during_capture: bool,
+    }
+    struct Head {
+        original: LoadedLinear<CudaBackend>,
+        fault: Arc<Fault>,
+    }
+    impl Linear<CudaBackend> for Head {
+        fn in_features(&self) -> usize {
+            self.original.in_features()
+        }
+        fn out_features(&self) -> usize {
+            self.original.out_features()
+        }
+        fn metadata(&self) -> LinearMetadata {
+            self.original.metadata()
+        }
+        fn forward(
+            &self,
+            ctx: &mut <CudaBackend as Backend>::Context,
+            input: &<CudaBackend as Backend>::Buffer,
+            output: &mut <CudaBackend as Backend>::Buffer,
+            rows: usize,
+        ) {
+            self.original.forward(ctx, input, output, rows);
+            if CudaBackend::graph_capture_in_flight(ctx) == self.fault.during_capture
+                && self.fault.armed.swap(false, Ordering::SeqCst)
+            {
+                self.fault.fired.fetch_add(1, Ordering::SeqCst);
+                std::panic::panic_any(ferrum_types::FerrumError::backend(
+                    "controlled unified head failure after original CUDA encoding",
+                ));
+            }
+        }
+    }
+
+    let config = physical_batch_config();
+    let loader = SyntheticLlamaLoader::new(config.clone());
+    let mut execution = LlamaExecutionConfig::default();
+    execution.options.metal_paged_kv = Some(true);
+    execution.options.unified_graph = true;
+    // In the second case the graph really executes before the eager head
+    // fails. A successful captured head would bypass a host fault wrapper.
+    execution.options.unified_graph_lm_head_eager = !during_capture;
+    execution.options.cuda_graph = false;
+    execution.batched_graph = false;
+    execution.prefix_cache = false;
+    execution.backend_context.cuda.split_k_attn = Some(false);
+    execution.paged_max_seqs = 2;
+    execution.kv_capacity = Some(32);
+    let mut model =
+        Model::new_with_execution_config(config.clone(), &loader, execution.clone()).unwrap();
+    execution.options.unified_graph = false;
+    let mut reference = Model::new_with_execution_config(config, &loader, execution).unwrap();
+    let fault = Arc::new(Fault {
+        armed: AtomicBool::new(false),
+        fired: AtomicUsize::new(0),
+        during_capture,
+    });
+    let original = model.lm_head.take().unwrap();
+    assert!(original.is_capture_stable());
+    // SAFETY: the wrapper owns the unchanged capture-qualified projection.
+    // The only injected capture-side effect is a one-shot panic, so that
+    // recording cannot install a graph. Successful recordings contain exactly
+    // the original CUDA operations. The second case leaves the head outside
+    // capture entirely. Neither case relies on replaying a host side effect.
+    model.lm_head = Some(unsafe {
+        LoadedLinear::new_capture_stable(Box::new(Head {
+            original,
+            fault: Arc::clone(&fault),
+        }))
+    });
+
+    let one = |model: &mut Model, id: &str, tokens: Vec<u32>, position| {
+        let mut rows = model
+            .unified_forward(&[(id.to_owned(), tokens, position, true)])
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        rows.remove(0).expect("full logits for final unified row")
+    };
+    let mut outputs = Vec::new();
+    let id = "unified-failed-original";
+    let prompt = vec![1, 2, 3, 4, 5, 6, 7, 8, 9];
+    outputs.push((
+        one(&mut model, id, prompt.clone(), 0),
+        one(&mut reference, id, prompt, 0),
+    ));
+    for position in 9..11 {
+        outputs.push((
+            one(&mut model, id, vec![position as u32 + 1], position),
+            one(&mut reference, id, vec![position as u32 + 1], position),
+        ));
+    }
+    // First three public calls warm up. Length 12 captures bucket 16, and
+    // length 13 uses that same native graph in the second arm.
+    if !during_capture {
+        outputs.push((
+            one(&mut model, id, vec![12], 11),
+            one(&mut reference, id, vec![12], 11),
+        ));
+        assert!(!model.unified_graph_keys_seen.is_empty());
+    }
+    let prior_len = model.cache_len(id);
+    let prior_warmup = model.unified_graph_warmup;
+    let pointer = |model: &Model| {
+        let buffer = model.scratch.unified_residual.as_ref().unwrap().as_f16();
+        let (address, _record) = buffer.device_ptr(buffer.stream());
+        address
+    };
+    let prior_scratch = pointer(&model);
+    let stream = Arc::clone(
+        model
+            .scratch
+            .unified_residual
+            .as_ref()
+            .unwrap()
+            .as_f16()
+            .stream(),
+    );
+    fault.armed.store(true, Ordering::SeqCst);
+    let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        one(&mut model, id, vec![prior_len as u32 + 1], prior_len)
+    }));
+    // Use the existing recovery boundary; it only observes the original
+    // context and must not replay the failed numerical invocation.
+    assert!(model.recover_device_frame().unwrap());
+    let failed_latch = model.unified_graph_failed;
+    let failed_len = model.cache_len(id);
+    let failed_warmup = model.unified_graph_warmup;
+    let failed_keys = model.unified_graph_keys_seen.len();
+    let recovered_scratch = pointer(&model);
+    let same_stream = Arc::ptr_eq(
+        &stream,
+        model
+            .scratch
+            .unified_residual
+            .as_ref()
+            .unwrap()
+            .as_f16()
+            .stream(),
+    );
+    drop(stream);
+
+    // A different live cache must remain usable. Five real calls exceed the
+    // warmup threshold: a cleared failure latch would capture again here.
+    let peer = "unified-healthy-peer";
+    let prompt = vec![21, 22, 23, 24, 25, 26, 27, 28, 29];
+    outputs.push((
+        one(&mut model, peer, prompt.clone(), 0),
+        one(&mut reference, peer, prompt, 0),
+    ));
+    for position in 9..13 {
+        outputs.push((
+            one(&mut model, peer, vec![position as u32 + 21], position),
+            one(&mut reference, peer, vec![position as u32 + 21], position),
+        ));
+    }
+    let still_disabled = model.unified_graph_failed;
+    let retired_keys = model.unified_graph_keys_seen.is_empty();
+    let original_len_after_peer = model.cache_len(id);
+    let peer_len = model.cache_len(peer);
+    for owned in [&mut model, &mut reference] {
+        owned.release(id);
+        owned.release(peer);
+        assert!(owned.kv_caches.is_empty());
+        owned.close().unwrap();
+    }
+
+    let failure = failed.expect_err("the armed original CUDA head must fail");
+    assert!(failure
+        .downcast_ref::<ferrum_types::FerrumError>()
+        .is_some_and(|error| error
+            .to_string()
+            .contains("controlled unified head failure")));
+    assert_eq!(fault.fired.load(Ordering::SeqCst), 1);
+    assert!(failed_latch && still_disabled && retired_keys);
+    assert_eq!(
+        (failed_len, original_len_after_peer),
+        (prior_len, prior_len)
+    );
+    assert_eq!(peer_len, 13);
+    assert_eq!(prior_scratch, recovered_scratch);
+    assert!(same_stream);
+    if during_capture {
+        assert_eq!(failed_keys, 0, "aborted capture cannot publish a graph");
+    } else {
+        assert!(
+            failed_keys > 0,
+            "the original installed graph remains owned"
+        );
+        assert_eq!(
+            failed_warmup, prior_warmup,
+            "failure followed a real replay"
+        );
+    }
+    for (index, (actual, expected)) in outputs.into_iter().enumerate() {
+        full_logits(
+            &actual,
+            &expected,
+            &format!("unified failure recovery row {index}"),
+        );
+    }
+}
+
 /// A new unified graph shape must prepare its actual split-K workspace before
 /// capture. The native split count changes from two to four at length 385.
 #[test]

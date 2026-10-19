@@ -1942,6 +1942,15 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
         items: &[(String, Vec<u32>, usize, bool)],
         logits_policies: Option<&[LogitsReturnPolicy]>,
     ) -> Result<Vec<Option<ExecutorSamplingOutput>>> {
+        let prior_graph_failure = self.unified_graph_failed;
+        if prior_graph_failure {
+            // Stream recovery restores the original owner, not graph replay
+            // eligibility. Retire that owner's captured closure before reuse;
+            // an error leaves its maps/storage and the failure latch intact.
+            B::retire_graphs_for_storage_mutation(&mut frame.context)?;
+            self.clear_graph_bookkeeping();
+            self.unified_graph_failed = true;
+        }
         // Snapshot cfg fields into Copy locals so we can take &mut self later
         // without a long-lived `&self.cfg` borrow conflicting.
         let h = self.cfg.hidden_size;
@@ -2024,6 +2033,7 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
         );
         if unified_scratch_rebuilt {
             self.clear_graph_bookkeeping();
+            self.unified_graph_failed = prior_graph_failure;
         }
 
         let use_device_residual_shadow =
@@ -2109,7 +2119,7 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
         // Bench (RTX 4090, Llama-3.1-8B GPTQ-INT4, c=16):
         //   varlen-only:     680 tok/s, TPOT 19.3 ms
         //   varlen + graph:  714 tok/s, TPOT 18.3 ms  (+5% / -5%)
-        let graph_enabled = self.batched_cfg.unified_graph;
+        let graph_enabled = self.batched_cfg.unified_graph && !self.unified_graph_failed;
         let graph_scope = UnifiedGraphCaptureScope::from_config(&self.batched_cfg);
         let graph_shape = if graph_enabled {
             // The original backend selects the actual route, validates native
@@ -2138,6 +2148,24 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
         let cache_has_key = cached_key.is_some();
         let graph_key =
             cached_key.unwrap_or_else(|| next_unified_graph_key(self.unified_graph_next_key));
+
+        const UNIFIED_GRAPH_WARMUP: usize = 3;
+        let should_capture = graph_enabled
+            && !cache_has_key
+            && self.unified_graph_warmup >= UNIFIED_GRAPH_WARMUP
+            && unified_graph_capture_skip_reason(
+                m_total,
+                num_seqs,
+                self.unified_graph_keys_seen.len(),
+            )
+            .is_none();
+        let should_replay = graph_enabled && cache_has_key;
+        if should_capture || should_replay {
+            // Cover fallible pre-launch synchronization, capture-body panics,
+            // and successful launches whose terminal observation later fails.
+            self.unified_graph_failed = true;
+        }
+        let mut graph_executed = false;
 
         // Pre-grow the marlin gather scratch slot to the worst-case
         // size for THIS call's matmul shapes. Done eagerly BEFORE
@@ -2190,15 +2218,20 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
         }
 
         let mut did_pure_replay = false;
-        if graph_enabled && cache_has_key && !self.unified_graph_failed {
+        if should_replay {
             // SAFETY: cold construction checked projection/KV capture contracts.
             // The private model/frame owns all bindings through checked retirement;
             // storage mutation retires cached graphs before replacing dependencies.
             match unsafe { B::replay_graph(&mut ctx, graph_key) } {
                 Ok(true) => {
                     did_pure_replay = true;
+                    graph_executed = true;
                 }
-                Ok(false) => {}
+                Ok(false) => {
+                    B::retire_graphs_for_storage_mutation(&mut ctx)?;
+                    self.clear_graph_bookkeeping();
+                    self.unified_graph_failed = true;
+                }
                 Err(e) => {
                     self.unified_graph_failed = true;
                     std::panic::panic_any(e);
@@ -2206,22 +2239,6 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
             }
         }
 
-        const UNIFIED_GRAPH_WARMUP: usize = 3;
-        let should_consider_capture = graph_enabled
-            && !self.unified_graph_failed
-            && !cache_has_key
-            && self.unified_graph_warmup >= UNIFIED_GRAPH_WARMUP
-            && !did_pure_replay;
-        let capture_skip_reason = should_consider_capture
-            .then(|| {
-                unified_graph_capture_skip_reason(
-                    m_total,
-                    num_seqs,
-                    self.unified_graph_keys_seen.len(),
-                )
-            })
-            .flatten();
-        let should_capture = should_consider_capture && capture_skip_reason.is_none();
         if !did_pure_replay {
             self.unified_graph_warmup += 1;
         }
@@ -2266,6 +2283,7 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
                     // storage mutation retires cached graphs before replacing dependencies.
                     match unsafe { B::replay_graph(&mut ctx, graph_key) } {
                         Ok(true) => {
+                            graph_executed = true;
                             layers_ready = true;
                             final_pack_ready = graph_scope.captures_final_pack();
                             lm_head_ready = graph_scope.captures_lm_head();
@@ -2592,6 +2610,10 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
             }
         }
 
+        // Argmax can encode work after the first logits-ready observation.
+        // Obtain its actual terminal proof before committing any host frontier.
+        let quiescent = quiescent.unwrap_or_else(|| device_execution::checked_sync::<B>(&mut ctx));
+
         // Bump cache.len for each item (we wrote q_lens[i] tokens into seq i's
         // KV pool inside the layer loop). Centralised post-loop bump matches
         // the pattern in decode_batch_internal.
@@ -2605,11 +2627,10 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
             }
         }
 
-        // A successful argmax includes additional device work after the first
-        // full-logits readiness observation. Retain this same context until
-        // that work has also actually completed.
-        frame.completed =
-            Some(quiescent.unwrap_or_else(|| device_execution::checked_sync::<B>(&mut ctx)));
+        if graph_executed {
+            self.unified_graph_failed = false;
+        }
+        frame.completed = Some(quiescent);
 
         Ok(out)
     }
