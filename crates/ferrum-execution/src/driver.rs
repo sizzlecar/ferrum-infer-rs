@@ -49,6 +49,7 @@ use tokio::sync::Mutex as AsyncMutex;
 
 mod checkpoint;
 mod completion_worker;
+mod retained_output_capture;
 mod timing;
 
 use self::{
@@ -92,6 +93,7 @@ pub use determinism::{
     MAX_DETERMINISM_PARTICIPANTS,
 };
 use request::{terminalize_unsubmitted_session, VNextRequestRoot};
+use retained_output_capture::RetainedOutputCapture;
 use sampling_readback::ProductReadbackModes;
 
 const POLICY_ID: &str = "policy.ferrum.product.vnext.default";
@@ -568,6 +570,7 @@ pub struct ProgramExecutorConfig {
     pub reusable_execution_prefill_chunks: Vec<PrefillChunk>,
     reusable_execution_capture_resolution: Option<VNextReusableExecutionCaptureResolution>,
     pub diagnostic_fault: Option<VNextDiagnosticFault>,
+    pub diagnostic_output_capture: Option<ferrum_types::RetainedOutputCaptureConfig>,
     plan_observation: VNextPlanObservationPolicy,
 }
 
@@ -830,6 +833,7 @@ impl ProgramExecutorConfig {
             reusable_execution_prefill_chunks,
             reusable_execution_capture_resolution,
             diagnostic_fault,
+            diagnostic_output_capture: engine.runtime.diagnostic_output_capture.clone(),
             plan_observation,
         })
     }
@@ -4519,6 +4523,7 @@ pub struct ProgramExecutor<R: DeviceRuntime> {
     program_fingerprint: String,
     static_provider_attribution: Option<StaticProviderAttributionWitness>,
     checkpoint_capture: Option<VNextCheckpointCapture>,
+    retained_output_capture: Option<Arc<RetainedOutputCapture>>,
     static_bytes: u64,
     sequence_state_memory: TypedSequenceStateMemory,
     device_reusable_execution_enabled: bool,
@@ -5067,6 +5072,10 @@ impl<R: DeviceRuntime> ProgramExecutor<R> {
             .transpose()?;
 
         let metrics = VNextExecutorMetrics::default();
+        let retained_output_capture = config
+            .diagnostic_output_capture
+            .map(|config| RetainedOutputCapture::new(config).map(Arc::new))
+            .transpose()?;
         metrics
             .program_binding_upload
             .reset_baseline(runtime.program_binding_upload_snapshot());
@@ -5096,6 +5105,7 @@ impl<R: DeviceRuntime> ProgramExecutor<R> {
             program_fingerprint,
             static_provider_attribution,
             checkpoint_capture,
+            retained_output_capture,
             static_bytes,
             sequence_state_memory,
             device_reusable_execution_enabled: config.device_reusable_execution_enabled,
@@ -7943,6 +7953,20 @@ impl<R: DeviceRuntime> ProgramExecutor<R> {
         let readbacks = self
             .prepare_terminal_readbacks(participants, capture_claim, &output_modes)
             .map_err(|error| guard.fail(error))?;
+        // This optional observation never changes the product mode, terminal
+        // packet, execution plan, or resident/replay eligibility.
+        let mut row_capture = self.retained_output_capture.as_ref().and_then(|capture| {
+            capture.try_claim(participants, &output_modes, &readbacks, &self.io)
+        });
+        let extra_request = if output_modes.uniform() == Some(VNextProductOutputMode::GreedyToken) {
+            row_capture
+                .as_mut()
+                .and_then(|capture| capture.extra_request(self.resolved_plan.execution_plan()))
+        } else {
+            None
+        };
+        let extra_output = extra_request.as_ref().map(|_| Arc::new(Mutex::new(None)));
+        let worker_extra_output = extra_output.clone();
         if let Some(request) = output_modes.uniform().and_then(|mode| {
             readbacks.terminal_packet_request(
                 self.completion_readback_policy,
@@ -7984,6 +8008,9 @@ impl<R: DeviceRuntime> ProgramExecutor<R> {
                         )
                     }),
             );
+            if let Some(capture) = &mut row_capture {
+                capture.observe_prepared_dispatch(&wave);
+            }
             let dispatch = self.dispatch_prepared_wave(
                 participants,
                 wave,
@@ -8059,6 +8086,9 @@ impl<R: DeviceRuntime> ProgramExecutor<R> {
                 completion,
                 observation,
             } => {
+                if let Some(capture) = &mut row_capture {
+                    capture.observe_submission(completion.receipt(), &observation);
+                }
                 guard.observe_submission(&completion);
                 guard.set_submission_observation(
                     observation_sink.clone(),
@@ -8105,6 +8135,9 @@ impl<R: DeviceRuntime> ProgramExecutor<R> {
                 completion,
                 observation,
             } => {
+                if let Some(capture) = &mut row_capture {
+                    capture.observe_submission(completion.receipt(), &observation);
+                }
                 guard.observe_submission(&completion);
                 guard.set_submission_observation(
                     observation_sink.clone(),
@@ -8195,14 +8228,24 @@ impl<R: DeviceRuntime> ProgramExecutor<R> {
             let _phase_timing = phase_timing.completion_round_trip.start();
             self.completion_worker
                 .execute(VNextCompletionTaskKind::WaveReadback, move || {
-                    let observation = match readbacks {
-                        VNextTerminalReadbacks::Batch(request) => {
+                    let observation = match (readbacks, extra_request) {
+                        (VNextTerminalReadbacks::Batch(request), Some(extra)) => completion
+                            .wait_with_readbacks_and_extra(request, extra)
+                            .map(|observation| {
+                                retained_output_capture::split_extra_observation(
+                                    observation,
+                                    worker_extra_output
+                                        .as_ref()
+                                        .expect("extra readback has a host receipt slot"),
+                                )
+                            }),
+                        (VNextTerminalReadbacks::Batch(request), None) => {
                             completion.wait_with_readbacks(request)
                         }
-                        VNextTerminalReadbacks::Collection(request) => {
+                        (VNextTerminalReadbacks::Collection(request), _) => {
                             completion.wait_with_readback_collection(request)
                         }
-                        VNextTerminalReadbacks::Selection(request) => {
+                        (VNextTerminalReadbacks::Selection(request), _) => {
                             completion.wait_with_readback_selection(request)
                         }
                     };
@@ -8239,6 +8282,25 @@ impl<R: DeviceRuntime> ProgramExecutor<R> {
         self.refresh_on_demand_reusable_execution_catalog()
             .map_err(|error| guard.fail(error))?;
         let receipt = guard.readbacks();
+        let extra_receipt = extra_output
+            .as_ref()
+            .and_then(|output| output.lock().take());
+        if let Some(extra) = &extra_receipt {
+            if !matches!(
+                extra.disposition(),
+                CompletionReadbackDisposition::Succeeded(_)
+            ) {
+                let message = format!("retained output readback failed: {:?}", extra.disposition());
+                if let Some(capture) = &mut row_capture {
+                    capture.fail("readback_failed", &message);
+                }
+                // An extra GPU read may have failed the original lane. Retain
+                // its original terminal evidence and use the existing failure
+                // boundary; primary bytes alone never authorize continuation.
+                token_mask_residency.invalidate_before_slot_release();
+                return Err(guard.fail(FerrumError::backend(message)));
+            }
+        }
         self.metrics.device_timing.record(receipt);
         self.metrics.device_timing_for(kind).record(receipt);
         if !diagnostic_failure_requested {
@@ -8458,6 +8520,9 @@ impl<R: DeviceRuntime> ProgramExecutor<R> {
                 return Err(guard.fail(error));
             }
         };
+        if let Some(capture) = &mut row_capture {
+            capture.finish(receipt, extra_receipt.as_ref(), &logits);
+        }
         if let (Some(capture_claim), Some(capture)) =
             (capture_claim, self.checkpoint_capture.as_ref())
         {

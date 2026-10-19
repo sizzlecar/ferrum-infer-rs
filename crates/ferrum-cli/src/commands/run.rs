@@ -931,6 +931,9 @@ pub struct RunCommand {
 
     #[command(flatten)]
     pub vnext_checkpoint: crate::commands::vnext_checkpoint::VNextCheckpointArgs,
+    #[command(flatten)]
+    pub diagnostic_output_capture:
+        crate::commands::diagnostic_output_capture::DiagnosticOutputCaptureArgs,
 
     /// Write product observability profile events to this JSONL path.
     #[arg(long, value_name = "PATH")]
@@ -1233,6 +1236,7 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
         .as_ref()
         .and_then(|capture| capture.teacher_forcing.clone());
     engine_config.runtime.vnext_checkpoint_capture = vnext_checkpoint_capture;
+    engine_config.runtime.diagnostic_output_capture = cmd.diagnostic_output_capture.to_config()?;
     if runtime_config_bool(&startup_auto_config.runtime_config, "FERRUM_PAGED_KV")
         .or_else(|| {
             runtime_config_bool(&startup_auto_config.runtime_config, "FERRUM_METAL_PAGED_KV")
@@ -3400,6 +3404,7 @@ mod tests {
             decision_trace_jsonl: None,
             observability_vertical_slice_out: None,
             vnext_checkpoint: Default::default(),
+            diagnostic_output_capture: Default::default(),
             profile_jsonl: None,
             profile_detail: crate::observability_product::ProfileDetailArg::Off,
             vnext_diagnostic_fault: None,

@@ -306,6 +306,9 @@ pub struct ServeCommand {
 
     #[command(flatten)]
     pub vnext_checkpoint: crate::commands::vnext_checkpoint::VNextCheckpointArgs,
+    #[command(flatten)]
+    pub diagnostic_output_capture:
+        crate::commands::diagnostic_output_capture::DiagnosticOutputCaptureArgs,
 
     /// Write standard product profile events to this JSONL path.
     #[arg(long, value_name = "PATH")]
@@ -520,6 +523,7 @@ async fn run_serve_lifecycle(
         decision_trace_jsonl,
         observability_vertical_slice_out,
         vnext_checkpoint,
+        diagnostic_output_capture,
         profile_jsonl,
         profile_detail,
         vnext_diagnostic_fault,
@@ -1052,6 +1056,7 @@ async fn run_serve_lifecycle(
         ));
     }
     let vnext_checkpoint_capture = vnext_checkpoint.to_config()?;
+    let diagnostic_output_capture = diagnostic_output_capture.to_config()?;
     let served_model_registry = ServedModelRegistry::try_new(
         model_id.clone(),
         ServedModelKind::Llm,
@@ -1078,6 +1083,7 @@ async fn run_serve_lifecycle(
             .apply_runtime_config_snapshot(&startup_auto_config.runtime_config)
             .map_err(ferrum_types::FerrumError::config)?;
         engine_config.runtime.vnext_checkpoint_capture = vnext_checkpoint_capture;
+        engine_config.runtime.diagnostic_output_capture = diagnostic_output_capture;
         engine_config.runtime.startup_memory_request = startup_memory_request;
         engine_config.backend.backend_options.insert(
             "model_path".to_string(),

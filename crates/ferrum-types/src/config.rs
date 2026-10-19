@@ -637,6 +637,45 @@ impl VNextDiagnosticFault {
     }
 }
 
+/// One observed output row from an unchanged execution and consumed history.
+/// This diagnostic does not retain new values or select an execution policy.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RetainedOutputCaptureConfig {
+    pub output_dir: PathBuf,
+    pub prompt_token_count: usize,
+    pub prompt_token_sha256: String,
+    pub source_span: std::ops::Range<u64>,
+    pub consumed_history_sha256: String,
+    pub maximum_readback_bytes: u64,
+}
+
+impl RetainedOutputCaptureConfig {
+    pub const MAXIMUM_READBACK_BYTES: u64 = 1024 * 1024;
+
+    pub fn validate(&self) -> Result<(), String> {
+        let digest = |value: &str| {
+            value.len() == 64
+                && value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        };
+        if self.output_dir.as_os_str().is_empty()
+            || self.prompt_token_count == 0
+            || !digest(&self.prompt_token_sha256)
+            || !digest(&self.consumed_history_sha256)
+            || self.source_span.start.checked_add(1) != Some(self.source_span.end)
+            || self.source_span.end <= self.prompt_token_count as u64
+            || usize::try_from(self.source_span.end).is_err()
+            || self.maximum_readback_bytes == 0
+            || self.maximum_readback_bytes > Self::MAXIMUM_READBACK_BYTES
+        {
+            return Err("output capture requires a directory, lowercase SHA256 digests, one decode token after the prompt, and a 1..=1MiB readback budget".into());
+        }
+        Ok(())
+    }
+}
+
 /// Explicit diagnostic capture of semantic vNext activations. Product paths
 /// leave this unset; release tooling must supply a dedicated empty directory.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -789,6 +828,9 @@ pub struct RuntimeKnobs {
     pub tp: Option<usize>,
     #[serde(default)]
     pub vnext_checkpoint_capture: Option<VNextCheckpointCaptureConfig>,
+    /// Read one already-retained output without changing execution selection.
+    #[serde(default)]
+    pub diagnostic_output_capture: Option<RetainedOutputCaptureConfig>,
     #[serde(default)]
     pub vnext_diagnostic_fault: Option<VNextDiagnosticFault>,
 }
