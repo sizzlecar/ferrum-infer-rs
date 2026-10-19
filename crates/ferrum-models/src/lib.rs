@@ -41,9 +41,9 @@ pub use executor::{LlmExecutor, StubModelExecutor};
 pub use hf_download::HfDownloader;
 pub use loader::SafeTensorsLoader;
 pub use lora::{
-    default_lora_model_id, load_runtime_lora_adapter, load_startup_lora_adapter,
-    load_startup_lora_adapters, render_lora_model_id, ActiveLoraAdapter, LoraAdapterConfig,
-    RuntimeLoraAdapter, StartupLoraAdapter, StartupLoraSpec,
+    default_lora_model_id, load_startup_lora_adapter, load_startup_lora_adapters,
+    render_lora_model_id, ActiveLoraAdapter, LoraAdapterConfig, StartupLoraAdapter,
+    StartupLoraSpec,
 };
 pub use registry::{
     Architecture, DefaultModelRegistry, ModelAlias, ModelDiscoveryEntry, ModelFormatType,

@@ -53,6 +53,20 @@ pub trait BackendGraph: Backend {
         Err(FerrumError::unsupported("graph capture not supported"))
     }
 
+    /// Discard a capture after encoding failed, without executing its prefix.
+    /// This is an explicit failure boundary, not a completion observation.
+    /// The original context and captured storage must remain owned until a
+    /// subsequent completion observation proves retirement is safe.
+    fn abort_graph_capture(ctx: &mut Self::Context) -> Result<()> {
+        if Self::graph_capture_in_flight(ctx) {
+            Err(FerrumError::unsupported(
+                "graph capture cancellation not supported",
+            ))
+        } else {
+            Ok(())
+        }
+    }
+
     /// Replay the captured graph for `_key`. Returns `Ok(false)` if no
     /// graph is cached for that key; caller should run eager.
     fn replay_graph(_ctx: &mut Self::Context, _key: u64) -> Result<bool> {

@@ -23,6 +23,8 @@ struct Context {
     begins: Arc<AtomicUsize>,
     retired: Arc<AtomicUsize>,
     storage_retirement_blocked: Arc<AtomicBool>,
+    // Armed only by the LoRA allocation-failure test on its original context.
+    successful_allocations_before_failure: Option<usize>,
 }
 struct Timer;
 impl BackendTimer<TrackedCpu> for Timer {
@@ -66,6 +68,7 @@ impl Backend for TrackedCpu {
             begins: Arc::new(AtomicUsize::new(0)),
             retired: Arc::new(AtomicUsize::new(0)),
             storage_retirement_blocked: Arc::new(AtomicBool::new(false)),
+            successful_allocations_before_failure: None,
         }
     }
     fn host_execution_is_synchronous() -> bool {
@@ -113,6 +116,16 @@ impl Backend for TrackedCpu {
     }
     fn alloc_in_context(ctx: &mut Context, n: usize) -> Vec<f32> {
         ctx.calls.fetch_add(1, Ordering::SeqCst);
+        if let Some(remaining) = ctx.successful_allocations_before_failure {
+            if remaining == 0 {
+                ctx.successful_allocations_before_failure = None;
+                ctx.unresolved.store(true, Ordering::SeqCst);
+                std::panic::panic_any(FerrumError::backend(
+                    "controlled second LoRA workspace allocation failure",
+                ));
+            }
+            ctx.successful_allocations_before_failure = Some(remaining - 1);
+        }
         Self::alloc(n)
     }
     fn alloc_typed_in_context(ctx: &mut Context, dtype: Dtype, n: usize) -> Vec<f32> {
@@ -233,6 +246,16 @@ impl Backend for TrackedCpu {
     fn scale_inplace(ctx: &mut Self::Context, buf: &mut Self::Buffer, scale: f32, len: usize) {
         ctx.calls.fetch_add(1, Ordering::SeqCst);
         CpuBackend::scale_inplace(&mut (), buf, scale, len)
+    }
+    fn scaled_add_inplace(
+        ctx: &mut Self::Context,
+        dst: &mut Self::Buffer,
+        src: &Self::Buffer,
+        scale: f32,
+        len: usize,
+    ) {
+        ctx.calls.fetch_add(1, Ordering::SeqCst);
+        CpuBackend::scaled_add_inplace(&mut (), dst, src, scale, len)
     }
     fn qk_norm_rope(
         ctx: &mut Self::Context,
@@ -544,6 +567,177 @@ fn instance_context_reuses_original_owner_after_growth_and_peer_close() {
         DeviceFrameResult::Rejected(_)
     ));
     drop(first);
+    assert_eq!(retired.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn lora_instance_workspace_second_allocation_failure_retains_original_owner() {
+    use crate::lora::workspace_tests::buffers;
+    use crate::models::llama_family::lora_tests::adapter_fixture;
+
+    let cfg = config();
+    let (_directory, adapter) = adapter_fixture(cfg.hidden_size);
+    let mut model = tracked_model();
+    let mut reference =
+        LlamaFamilyModel::<CpuBackend>::new(cfg.clone(), &SyntheticLlamaLoader::new(cfg.clone()))
+            .unwrap();
+    model
+        .set_lora_adapter_for_cache("adapted", Some(adapter.clone()))
+        .unwrap();
+    reference
+        .set_lora_adapter_for_cache("adapted", Some(adapter))
+        .unwrap();
+    // Pregrow unrelated model scratch before arming the fault. The next
+    // two allocations in a real prefill are exactly the LoRA pair's growth.
+    model.ensure_scratch(2);
+    assert_eq!(
+        model.prefill_internal("adapted", &[1]),
+        reference.prefill_internal("adapted", &[1]),
+    );
+    assert_eq!(
+        model.lora_workspace.capacities_for_test(),
+        (1, cfg.hidden_size)
+    );
+    let (rank, delta) = buffers(&model.lora_workspace);
+    let old_rank = rank.unwrap().as_ptr();
+    let old_delta = delta.unwrap().as_ptr();
+    let old_delta_values = delta.unwrap().clone();
+    let cache = model.kv_caches["adapted"][0].k.as_ptr();
+    let original_scratch = model.scratch.residual.as_ref().unwrap().as_ptr();
+    let context = model.execution_context.as_ref().unwrap();
+    let owner = Arc::clone(&context.identity);
+    let unresolved = Arc::clone(&context.unresolved);
+    let calls = Arc::clone(&context.calls);
+    let begins = Arc::clone(&context.begins);
+    let retired = Arc::clone(&context.retired);
+
+    // If an assertion fails while the controlled observation is unresolved,
+    // reset only the test fault before the model's real checked Drop runs.
+    struct ClearFault(Arc<AtomicBool>);
+    impl Drop for ClearFault {
+        fn drop(&mut self) {
+            self.0.store(false, Ordering::SeqCst);
+        }
+    }
+    let _clear_fault = ClearFault(Arc::clone(&unresolved));
+    let calls_before = calls.load(Ordering::SeqCst);
+    let begins_before = begins.load(Ordering::SeqCst);
+    model
+        .execution_context
+        .as_mut()
+        .unwrap()
+        .successful_allocations_before_failure = Some(1);
+    let result =
+        model.run_device_frame(|model, frame| model.prefill_in_frame(frame, "adapted", &[2, 3]));
+    let DeviceFrameResult::Held(error) = result else {
+        panic!("the failed second allocation must retain the original frame");
+    };
+    assert!(matches!(error, FerrumError::Backend { .. }));
+    assert!(error
+        .to_string()
+        .contains("controlled second LoRA workspace allocation failure"));
+    assert_eq!(calls.load(Ordering::SeqCst), calls_before + 2);
+    assert_eq!(begins.load(Ordering::SeqCst), begins_before + 1);
+    assert!(unresolved.load(Ordering::SeqCst));
+    assert!(model.execution_context.is_none());
+    assert!(Arc::ptr_eq(
+        &owner,
+        &model
+            .pending_device_frame
+            .as_ref()
+            .unwrap()
+            .context
+            .identity
+    ));
+    assert_eq!(
+        model.lora_workspace.capacities_for_test(),
+        (2, cfg.hidden_size)
+    );
+    let (rank, delta) = buffers(&model.lora_workspace);
+    let retained_rank = rank.unwrap().as_ptr();
+    assert_ne!(retained_rank, old_rank);
+    assert_eq!(rank.unwrap().len(), 2);
+    assert_eq!(delta.unwrap().as_ptr(), old_delta);
+    assert_eq!(delta.unwrap(), &old_delta_values);
+    assert_eq!(model.cache_len("adapted"), 1);
+    assert_eq!(model.kv_caches["adapted"][0].k.as_ptr(), cache);
+    assert_eq!(
+        model.scratch.residual.as_ref().unwrap().as_ptr(),
+        original_scratch
+    );
+    assert_eq!(model.lora_adapters.len(), 1);
+    assert_eq!(retired.load(Ordering::SeqCst), 0);
+
+    assert!(matches!(
+        model.run_device_frame(|_, _| -> () { panic!("a Held model must reject new work") }),
+        DeviceFrameResult::Rejected(_)
+    ));
+    assert!(model.close().is_err());
+    assert!(Arc::ptr_eq(
+        &owner,
+        &model
+            .pending_device_frame
+            .as_ref()
+            .unwrap()
+            .context
+            .identity
+    ));
+    assert_eq!(begins.load(Ordering::SeqCst), begins_before + 1);
+    assert_eq!(calls.load(Ordering::SeqCst), calls_before + 2);
+    assert_eq!(retired.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        buffers(&model.lora_workspace).0.unwrap().as_ptr(),
+        retained_rank
+    );
+    assert_eq!(
+        buffers(&model.lora_workspace).1.unwrap().as_ptr(),
+        old_delta
+    );
+
+    unresolved.store(false, Ordering::SeqCst);
+    assert!(model.recover_device_frame().unwrap());
+    assert!(model.pending_device_frame.is_none());
+    assert!(Arc::ptr_eq(
+        &owner,
+        &model.execution_context.as_ref().unwrap().identity
+    ));
+    assert_eq!(
+        buffers(&model.lora_workspace).0.unwrap().as_ptr(),
+        retained_rank
+    );
+    assert_eq!(
+        buffers(&model.lora_workspace).1.unwrap().as_ptr(),
+        old_delta
+    );
+    // The interrupted preparation ran no token math; completing the same
+    // original cache now must match an independent complete CPU execution.
+    let logits = model.prefill_internal("adapted", &[2, 3]);
+    let expected = reference.prefill_internal("adapted", &[2, 3]);
+    assert_eq!(logits.len(), cfg.vocab_size);
+    assert!(logits.iter().all(|value| value.is_finite()));
+    assert_eq!(logits, expected);
+    assert_eq!(model.cache_len("adapted"), 3);
+    assert_eq!(
+        model.lora_workspace.capacities_for_test(),
+        (2, 2 * cfg.hidden_size)
+    );
+    assert_eq!(
+        buffers(&model.lora_workspace).0.unwrap().as_ptr(),
+        retained_rank
+    );
+    assert_ne!(
+        buffers(&model.lora_workspace).1.unwrap().as_ptr(),
+        old_delta
+    );
+    let logits = model.decode_internal("adapted", 4, 3);
+    assert_eq!(logits.len(), cfg.vocab_size);
+    assert_eq!(logits, reference.decode_internal("adapted", 4, 3));
+    assert!(Arc::ptr_eq(
+        &owner,
+        &model.execution_context.as_ref().unwrap().identity
+    ));
+    model.close().unwrap();
+    reference.close().unwrap();
     assert_eq!(retired.load(Ordering::SeqCst), 1);
 }
 

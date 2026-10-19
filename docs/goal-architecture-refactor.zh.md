@@ -2,7 +2,7 @@
 
 **状态：目标已激活，R0 已合并，R1 验收、R2 收敛与 R3 配置迁移中。** 工作分支：`refactor/execution-architecture-20261018`，从 2026-10-18 的干净 `main`（`c2be4c67`）开始。首个 checkpoint 退役独立 embedding/ASR/TTS 链路；原工作区未合并的旧 SLO 实现不作为代码基底。
 
-R0 六批清理与正确性修复已合并（PR #429–#434）。R1 已分离 runtime 与产品执行契约，统一 token 提交，退出旧 Tensor 控制流。R2 已统一驱动、关闭与输出生命周期，隔离观测故障，退役全局 profiler。R3 已将构造配置、CUDA graph/stream 与动态缓冲区归到原实例，完成相关 CPU/Metal/CUDA 定向验证；后端全局策略、Metal 共享资源边界及低层公开入口仍待收敛。默认 GPTQ Marlin 的 SM120 非法指令在改前提交同样复现，尚未修复。GGUF C8 数值原因与默认性能验收仍开放。R1 验收、R2–R5 未完成；原始证据留在仓库外，没有新增性能或 SLO 达标声明。
+R0 六批清理与正确性修复已合并（PR #429–#434）。R1 已分离 runtime 与产品执行契约，统一 token 提交，退出旧 Tensor 控制流。R2 已统一驱动、关闭与输出生命周期，隔离观测故障，退役全局 profiler。R3 已将构造配置、CUDA graph/stream、QKV 暂存与 LoRA 工作区归到原实例，收拢 LoRA 裸执行入口，并验证捕获失败后的显式取消与恢复；相关 CPU/Metal/CUDA 定向验证通过。后端全局策略、Metal 共享资源边界及其余低层入口仍待收敛。默认 GPTQ Marlin 的 SM120 非法指令在改前提交同样复现，暂留收尾处理。GGUF C8 数值原因与默认性能验收仍开放。R1 验收、R2–R5 未完成；原始证据留在仓库外，没有新增性能或 SLO 达标声明。
 
 ## 1. 目标与第一原则
 
@@ -52,6 +52,8 @@ MoE API 迁移：移除旧 `Qwen3MoeModel`、`Qwen3MoeConfig`、`Qwen3MoeLayer` 
 旧执行 API 迁移：移除独立 FIFO/Priority、pipeline/模拟 parallel、speculative 驱动及 whole-prompt 缓存 API；Engine 使用连续批处理配置，普通 prefix 使用原有 `FERRUM_PREFIX_CACHE`/CLI 选项。旧 speculative/whole-prompt 参数、退役配置字段和策略名称明确拒绝，不能静默转成默认行为；原生 checkpoint、请求优先级、真实 layer-split/chunked prefill 和显式自定义注册保留。`GenericKvCacheHandle::clone_handle` 拒绝没有物理 fork 的复制；Phi/GPT2 不再被内建注册为可执行家族，通用元数据识别和下载不受此限制。
 
 扩展点限于任务能力声明、可组合的注册/装配边界，以及未来按任务定义独立请求/结果的空间；**不新建无人使用的 Embed/ASR/TTS 引擎、空实现或插件框架来替代删除。** Candle、量化加载、通用算子等仍被文本 LLM 使用的依赖继续保留；独立 CLIP 处理链和未支持的聊天视觉输入不是同一件事，不能删掉主线已有的能力限制校验。
+
+LoRA API 迁移：退役公开的 `RuntimeLoraAdapter` / `load_runtime_lora_adapter` 裸执行入口，保留 startup metadata 与模型级 preload/set 接口。权重和元数据不可变，可变工作区由原模型实例持有，按当前 adapter 的 rank、输出宽度和实际行数准备，随未决执行保活。
 
 ## 2. 问题与对应工作
 

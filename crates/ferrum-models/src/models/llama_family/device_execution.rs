@@ -300,6 +300,21 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         let result =
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| encode(self, &mut frame)))
                 .map_err(panic_error);
+        if result.is_err() {
+            // Encoding failure may leave a partially recorded graph. Explicitly
+            // discard it before observing the original stream; ordinary
+            // completion observation must never silently cancel a capture.
+            // Third-party hooks can panic too: keep every frame owner outside
+            // this boundary and retain the original encoding error.
+            let cancellation = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                B::abort_graph_capture(&mut frame.context)
+            }))
+            .map_err(panic_error)
+            .and_then(|result| result);
+            if let Err(error) = cancellation {
+                tracing::error!(%error, "graph cancellation after encoding failure failed");
+            }
+        }
         match frame.observe() {
             FrameObservation::Terminal { owners, error } => {
                 self.execution_context = Some(owners.restore(&mut self.scratch));

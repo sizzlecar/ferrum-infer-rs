@@ -34,6 +34,15 @@ fn model_frame_tests(backend: Backend) -> Vec<ContractTest> {
     if backend == Backend::Metal {
         tests.push("models::llama_family::device_execution::preparation_tests::preparation_frame_real_metal_pending_context_blocks_allocation".into());
     }
+    if backend != Backend::Cpu {
+        tests.extend([
+            format!("lora::runtime_tests::{name}_lora_workspace_growth_matches_complete_outputs"),
+            format!("models::llama_family::lora_tests::instance_workspace::{name}_lora_instance_workspace_interleaves_adapters_and_survives_peer_close"),
+        ]);
+    }
+    if backend == Backend::Cuda {
+        tests.push("models::llama_family::device_execution::tests::model_frame_cancels_failed_cuda_capture_without_executing_prefix".into());
+    }
     tests
         .into_iter()
         .map(|name| ContractTest {
@@ -162,6 +171,20 @@ pub fn contract_groups(backend: Backend) -> Vec<ContractGroup> {
             );
         }
         if backend == Backend::Cuda {
+            tests.extend(
+                [
+                    "qkv_capture_reuses_original_scratch_and_replays_after_eager_growth",
+                    "qkv_unprepared_capture_failure_discards_prefix_and_reuses_original_context",
+                    "invalidated_capture_is_confirmed_ended_before_original_context_reuse",
+                ]
+                .into_iter()
+                .map(|name| ContractTest {
+                    package: "ferrum-kernels".into(),
+                    target: "ferrum_kernels".into(),
+                    kind: "lib".into(),
+                    name: format!("backend::cuda::qkv::tests::{name}"),
+                }),
+            );
             tests.extend([
                 ContractTest {
                     package: "ferrum-kernels".into(),

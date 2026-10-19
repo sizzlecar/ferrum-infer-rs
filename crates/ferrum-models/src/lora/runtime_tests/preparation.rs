@@ -2,16 +2,16 @@ use super::execution::{
     admit, decode, finish, logits, model_adapter, prefill, selection, try_admit,
 };
 use super::*;
+use crate::common::llm::{
+    ModelKvPreparation, ModelKvReservation, ModelTokenInput, ModelTokenOutcome, ModelTokenProduct,
+};
+use crate::common::{DecoderOnlyLLM, LlmRuntimeConfig};
+use crate::models::LlamaFamilyModel;
+use crate::test_support::{tiny_llama_model, tiny_model_info, TinyLlamaConfig};
+use crate::LlmExecutor;
 use ferrum_execution::model_executor::{KvSlotRequest, KvSlotReservation};
 use ferrum_execution::token_execution::ExecutionProduct;
 use ferrum_interfaces::adapter::{AdapterExecutionSupport, LoraAdapterSelection};
-use ferrum_models::common::llm::{
-    ModelKvPreparation, ModelKvReservation, ModelTokenInput, ModelTokenOutcome, ModelTokenProduct,
-};
-use ferrum_models::common::{DecoderOnlyLLM, LlmRuntimeConfig};
-use ferrum_models::models::LlamaFamilyModel;
-use ferrum_models::test_support::{tiny_llama_model, tiny_model_info, TinyLlamaConfig};
-use ferrum_models::LlmExecutor;
 use ferrum_types::{FerrumError, RequestId, Result};
 use parking_lot::Mutex;
 use std::sync::Arc;
@@ -355,8 +355,7 @@ fn lora_direct_paged_preparation_commits_binding_only_after_reservation() {
         name: "delta".to_owned(),
         path: directory.path().to_path_buf(),
     };
-    let mut model =
-        ferrum_models::test_support::tiny_llama_model_with_execution_config(&cfg, execution);
+    let mut model = crate::test_support::tiny_llama_model_with_execution_config(&cfg, execution);
     model.preload_lora_adapter(&adapter).unwrap();
     let prompt: Arc<[u32]> = vec![0; 16].into();
     let two_blocks: Arc<[u32]> = vec![0; 32].into();

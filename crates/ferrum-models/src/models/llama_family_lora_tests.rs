@@ -9,7 +9,10 @@ use crate::common::DecoderOnlyLLM;
 use crate::lora::{ActiveLoraAdapter, LoraAdapterConfig};
 use crate::test_support::{tiny_llama_model, TinyLlamaConfig};
 
-fn adapter_fixture(width: usize) -> (TempDir, ActiveLoraAdapter) {
+#[path = "llama_family_lora_tests/instance_workspace.rs"]
+mod instance_workspace;
+
+pub(super) fn adapter_fixture(width: usize) -> (TempDir, ActiveLoraAdapter) {
     let directory = TempDir::new().unwrap();
     let config = LoraAdapterConfig {
         r: 1,
@@ -146,14 +149,7 @@ fn lora_workspace_prepares_only_bound_adapter_and_current_rows() {
         model.prefill("base", &[0, 1, 2, 3, 4, 5]),
         reference.prefill("base", &[0, 1, 2, 3, 4, 5])
     );
-    assert_eq!(
-        model.lora_adapters[&first.name].workspace_rows_for_test(),
-        0
-    );
-    assert_eq!(
-        model.lora_adapters[&second.name].workspace_rows_for_test(),
-        0
-    );
+    assert_eq!(model.lora_workspace.capacities_for_test(), (0, 0));
 
     model
         .set_lora_adapter_for_cache("adapted", Some(first.clone()))
@@ -167,12 +163,8 @@ fn lora_workspace_prepares_only_bound_adapter_and_current_rows() {
             reference.prefill("adapted", chunk)
         );
         assert_eq!(
-            model.lora_adapters[&first.name].workspace_rows_for_test(),
-            2
-        );
-        assert_eq!(
-            model.lora_adapters[&second.name].workspace_rows_for_test(),
-            0
+            model.lora_workspace.capacities_for_test(),
+            (2, 2 * cfg.hidden_size)
         );
     }
     assert_eq!(model.cache_len("adapted"), 4);
@@ -181,8 +173,8 @@ fn lora_workspace_prepares_only_bound_adapter_and_current_rows() {
         reference.decode("adapted", 4, 4)
     );
     assert_eq!(
-        model.lora_adapters[&first.name].workspace_rows_for_test(),
-        2
+        model.lora_workspace.capacities_for_test(),
+        (2, 2 * cfg.hidden_size)
     );
     assert_eq!(
         model.prefill("adapted", &[5, 6, 7]),
@@ -190,12 +182,8 @@ fn lora_workspace_prepares_only_bound_adapter_and_current_rows() {
     );
     assert_eq!(model.cache_len("adapted"), 8);
     assert_eq!(
-        model.lora_adapters[&first.name].workspace_rows_for_test(),
-        3
-    );
-    assert_eq!(
-        model.lora_adapters[&second.name].workspace_rows_for_test(),
-        0
+        model.lora_workspace.capacities_for_test(),
+        (3, 3 * cfg.hidden_size)
     );
     model.release("base");
     model.release("adapted");

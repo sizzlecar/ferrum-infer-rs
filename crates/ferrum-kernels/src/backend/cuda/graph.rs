@@ -249,6 +249,46 @@ impl BackendGraph for CudaBackend {
         }
     }
 
+    fn abort_graph_capture(ctx: &mut Self::Context) -> Result<()> {
+        use cudarc::driver::sys;
+        if !ctx.capture_in_flight {
+            return Ok(());
+        }
+        ctx.ctx.bind_to_thread().map_err(|error| {
+            FerrumError::backend(format!("bind before capture cancellation: {error}"))
+        })?;
+        let mut graph = std::ptr::null_mut();
+        let ended = unsafe { sys::cuStreamEndCapture(ctx.stream.cu_stream(), &mut graph) };
+        if !graph.is_null() {
+            // A successful capture prefix is deliberately never instantiated
+            // or replayed. Even an error may return an owned handle: preserve
+            // it until capture status and real completion permit cleanup.
+            ctx.graph_leases
+                .retain(Arc::new(GraphSlotRaw::new(graph, ctx.stream.clone())));
+        }
+        let mut status = sys::CUstreamCaptureStatus::CU_STREAM_CAPTURE_STATUS_ACTIVE;
+        let queried = unsafe { sys::cuStreamIsCapturing(ctx.stream.cu_stream(), &mut status) };
+        if queried != sys::CUresult::CUDA_SUCCESS
+            || status != sys::CUstreamCaptureStatus::CU_STREAM_CAPTURE_STATUS_NONE
+        {
+            return Err(FerrumError::backend(format!(
+                "CUDA capture cancellation remains unresolved: end={ended:?}, query={queried:?}, status={status:?}",
+            )));
+        }
+        // EndCapture can report an invalidated capture while still ending it.
+        // Only this real query proves that subsequent completion observation
+        // is legal; cancellation alone does not prove stream quiescence.
+        ctx.capture_in_flight = false;
+        ctx.completion_observed = false;
+        ctx.use_dev_state = false;
+        if ended != sys::CUresult::CUDA_SUCCESS {
+            return Err(FerrumError::backend(format!(
+                "CUDA capture ended during cancellation with error: {ended:?}",
+            )));
+        }
+        Ok(())
+    }
+
     fn reset_all_graphs(ctx: &mut Self::Context) {
         for (_, previous) in ctx.graph_cache.drain() {
             ctx.graph_leases.retain(previous);

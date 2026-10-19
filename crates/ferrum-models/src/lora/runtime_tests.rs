@@ -1,6 +1,7 @@
+use crate::lora::{load_runtime_lora_adapter, RuntimeLoraWorkspace};
+use crate::{ActiveLoraAdapter, LoraAdapterConfig};
 use ferrum_kernels::backend::cpu::CpuBackend;
 use ferrum_kernels::backend::{Backend, BackendCompletion};
-use ferrum_models::{load_runtime_lora_adapter, ActiveLoraAdapter, LoraAdapterConfig};
 use safetensors::tensor::{serialize_to_file, Dtype, TensorView};
 use std::collections::HashMap;
 use tempfile::TempDir;
@@ -23,14 +24,17 @@ fn write_adapter(
         serde_json::to_vec_pretty(config).unwrap(),
     )
     .unwrap();
+    let encoded_bytes: Vec<Vec<u8>> = tensors
+        .iter()
+        .map(|(_, _, values)| f32_bytes(values))
+        .collect();
     let encoded: Vec<(String, TensorView<'_>)> = tensors
         .iter()
-        .map(|(name, shape, values)| {
-            let bytes = f32_bytes(values);
-            let leaked: &'static [u8] = Box::leak(bytes.into_boxed_slice());
+        .zip(&encoded_bytes)
+        .map(|((name, shape, _), bytes)| {
             (
                 (*name).to_string(),
-                TensorView::new(Dtype::F32, shape.clone(), leaked).unwrap(),
+                TensorView::new(Dtype::F32, shape.clone(), bytes).unwrap(),
             )
         })
         .collect();
@@ -115,6 +119,9 @@ fn lora_workspace_growth_matches_complete_outputs<B: Backend>() {
         ],
     );
     let mut ctx = B::new_context();
+    let mut workspace = RuntimeLoraWorkspace::<B>::default();
+    let mut input = None;
+    let mut out = None;
     B::begin_execution(&mut ctx).unwrap();
     let adapter = load_runtime_lora_adapter::<B>(
         &mut ctx,
@@ -124,6 +131,9 @@ fn lora_workspace_growth_matches_complete_outputs<B: Backend>() {
         },
     )
     .unwrap();
+    // Every device owner precedes this guard, so an allocation/encoding error
+    // retires this original context before the payload can unwind.
+    let mut retirement = crate::common::construction::ConstructionContext::<B>::new(&mut ctx);
 
     let inputs = [1.0, 2.0, 3.0, -2.0, 0.5, 7.0];
     let initial = [10.0, 20.0, 30.0, 40.0, 1.0, 2.0, 3.0, 4.0];
@@ -133,25 +143,46 @@ fn lora_workspace_growth_matches_complete_outputs<B: Backend>() {
     let expected = [13.0, 26.0, 39.0, 40.0, -5.0, 3.5, -1.5, 4.0];
     for rows in [1, 2] {
         if rows > 1 {
-            B::begin_execution(&mut ctx).unwrap();
+            B::begin_execution(retirement.context).unwrap();
         }
-        adapter.prepare_workspace(&mut ctx, rows).unwrap();
-        let input = B::from_slice_in_context(&mut ctx, &inputs[..rows * 3]);
-        let mut out = B::from_slice_in_context(&mut ctx, &initial[..rows * 4]);
+        workspace
+            .prepare(retirement.context, &adapter, rows)
+            .unwrap();
+        input = Some(B::from_slice_in_context(
+            retirement.context,
+            &inputs[..rows * 3],
+        ));
+        out = Some(B::from_slice_in_context(
+            retirement.context,
+            &initial[..rows * 4],
+        ));
         let applied = adapter
-            .apply_projection(&mut ctx, 7, "qkv_proj", &input, &mut out, rows)
+            .apply_projection(
+                retirement.context,
+                &mut workspace,
+                7,
+                "qkv_proj",
+                input.as_ref().unwrap(),
+                out.as_mut().unwrap(),
+                rows,
+            )
             .unwrap();
         // Observe once after both GEMMs and the scaled addition. Keep all
-        // inputs, outputs and adapter workspace alive through this boundary.
+        // inputs, outputs and this context's workspace alive through this boundary.
         assert!(matches!(
-            B::observe_completion(&mut ctx),
+            B::observe_completion(retirement.context),
             BackendCompletion::Succeeded
         ));
-        let actual = B::to_vec_in_context(&mut ctx, &out, rows * 4);
+        let actual = B::to_vec_in_context(retirement.context, out.as_ref().unwrap(), rows * 4);
         assert_eq!(applied, 1);
         assert_eq!(actual, expected[..rows * 4]);
     }
-    B::retire_context(&mut ctx).unwrap();
+    B::retire_context(retirement.context).unwrap();
+    retirement.transfer();
+    drop(retirement);
+    drop(out);
+    drop(input);
+    drop(workspace);
     drop(adapter);
     drop(ctx);
 }
@@ -176,16 +207,15 @@ fn cuda_lora_workspace_growth_matches_complete_outputs() {
     lora_workspace_growth_matches_complete_outputs::<ferrum_kernels::backend::cuda::CudaBackend>();
 }
 
-#[cfg(feature = "test-support")]
 mod execution {
     use super::*;
+    use crate::test_support::{tiny_llama_executor, TinyLlamaConfig};
     use ferrum_execution::model_executor::{
         ExecutorPrefillAdmission, ExecutorSamplingOutput, LogitsReturnPolicy, PrefillChunk,
     };
     use ferrum_execution::token_execution::*;
     use ferrum_execution::ModelExecutor;
     use ferrum_interfaces::adapter::LoraAdapterSelection;
-    use ferrum_models::test_support::{tiny_llama_executor, TinyLlamaConfig};
     use ferrum_types::{FerrumError, RequestId, Result, TokenId};
 
     pub(super) fn selection(path: &std::path::Path) -> LoraAdapterSelection<'_> {
@@ -450,6 +480,4 @@ mod execution {
     }
 }
 
-#[cfg(feature = "test-support")]
-#[path = "lora_runtime_loader/preparation.rs"]
 mod preparation;

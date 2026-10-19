@@ -52,6 +52,7 @@ pub mod int8_kv;
 pub mod linear_attention;
 pub mod moe;
 pub mod paged;
+mod qkv;
 pub mod quant;
 
 // Audit #9: CUDA-only kernels moved from crate-root to backend/cuda/.
@@ -263,6 +264,7 @@ pub struct CudaState {
     decode_state: DecodeStateBufs,
     batched_scratch: BatchedScratchSlot,
     argmax_out: Option<CudaSlice<i32>>,
+    qkv_scratch: qkv::QkvScratch,
     #[cfg(feature = "vllm-moe-marlin")]
     vllm_moe_c_tmp: Option<CudaSlice<f32>>,
     #[cfg(feature = "marlin")]
@@ -615,6 +617,7 @@ impl Backend for CudaBackend {
             decode_state,
             batched_scratch,
             argmax_out: None,
+            qkv_scratch: qkv::QkvScratch::default(),
             #[cfg(feature = "vllm-moe-marlin")]
             vllm_moe_c_tmp: None,
             #[cfg(feature = "marlin")]
@@ -2678,26 +2681,7 @@ impl Backend for CudaBackend {
         kv_dim: usize,
     ) {
         let func = ctx.func("split_qkv", ptx::SPLIT_QKV, "split_qkv_f16");
-        let tokens_i32 = tokens as i32;
-        let q_dim_i32 = q_dim as i32;
-        let kv_dim_i32 = kv_dim as i32;
-        let stream = ctx.stream.clone();
-        let mut b = stream.launch_builder(&func);
-        b.arg(qkv);
-        b.arg(q);
-        b.arg(k);
-        b.arg(v);
-        b.arg(&tokens_i32);
-        b.arg(&q_dim_i32);
-        b.arg(&kv_dim_i32);
-        unsafe {
-            b.launch(LaunchConfig {
-                grid_dim: (tokens as u32, 1, 1),
-                block_dim: (256, 1, 1),
-                shared_mem_bytes: 0,
-            })
-        }
-        .expect("split_qkv launch");
+        qkv::launch_split_qkv(&ctx.stream, &func, qkv, q, k, v, tokens, q_dim, kv_dim);
     }
 
     fn fused_silu_mul_split(
@@ -3059,37 +3043,22 @@ impl Backend for CudaBackend {
             "qk_norm_rope_transpose_f16"
         };
         let func = ctx.func("qk_norm_rope", ptx::QK_NORM_ROPE, fn_name);
-        let tokens_i32 = tokens as i32;
-        let heads_i32 = heads as i32;
-        let head_dim_i32 = head_dim as i32;
-        let pos_offset_i32 = pos_offset as i32;
-        let stream = ctx.stream.clone();
-        let dec_guard = use_dyn.then_some(&ctx.decode_state);
-        let mut b = stream.launch_builder(&func);
-        b.arg(input);
-        b.arg(norm_w);
-        b.arg(cos);
-        b.arg(sin);
-        b.arg(output);
-        b.arg(&tokens_i32);
-        b.arg(&heads_i32);
-        b.arg(&head_dim_i32);
-        if use_dyn {
-            let bufs = dec_guard.as_ref().unwrap();
-            b.arg(&bufs.pos);
-        } else {
-            b.arg(&pos_offset_i32);
-        }
-        b.arg(&eps);
-        b.arg(&mode);
-        unsafe {
-            b.launch(LaunchConfig {
-                grid_dim: (tokens as u32, heads as u32, 1),
-                block_dim: (32, 1, 1),
-                shared_mem_bytes: 0,
-            })
-        }
-        .expect("qk_norm_rope launch");
+        qkv::launch_qk_norm_rope(
+            &ctx.stream,
+            &func,
+            use_dyn.then_some(&ctx.decode_state.pos),
+            input,
+            norm_w,
+            cos,
+            sin,
+            output,
+            tokens,
+            heads,
+            head_dim,
+            pos_offset,
+            eps,
+            mode,
+        );
     }
 
     fn qk_norm_rope_partial(
@@ -3410,10 +3379,9 @@ impl Backend for CudaBackend {
     /// Split QKV + qk-norm + RoPE into FP16 head-major scratch buffers.
     /// Implemented as a chain over the existing primitives: `split_qkv` →
     /// 3× `qk_norm_rope` (Q/K with their respective norms; V with mode=0).
-    /// Used by the INT8 KV path's `KvLayer<KvInt8>::paged_write` to
-    /// materialize FP16 K/V before quantizing into the INT8 paged pool.
-    /// FP16 paths use the fused `split_qkv_norm_rope_into_paged_cache`
-    /// directly and never hit this method.
+    /// Used by contiguous FP16 KV and the INT8 paged-write path. Token-major
+    /// temporaries belong to the original context, so eager warmup prepares
+    /// stable storage which capture and replay reuse without allocation.
     fn split_qkv_norm_rope(
         ctx: &mut Self::Context,
         qkv: &Self::Buffer,
@@ -3432,33 +3400,10 @@ impl Backend for CudaBackend {
         eps: f32,
         qk_mode: i32,
     ) -> Result<()> {
-        // Lazy scratch — split_qkv writes into per-token-major buffers.
-        // We allocate just-in-time; the caller's `q_out/k_out/v_out` are
-        // head-major after the chain.
-        let q_dim = q_heads * head_dim;
-        let kv_dim = kv_heads * head_dim;
-        let q_buf_size = tokens * q_dim;
-        let kv_buf_size = tokens * kv_dim;
-        let mut q_buf = <Self as Backend>::alloc_in_context(ctx, q_buf_size);
-        let mut k_buf = <Self as Backend>::alloc_in_context(ctx, kv_buf_size);
-        let mut v_buf = <Self as Backend>::alloc_in_context(ctx, kv_buf_size);
-        Self::split_qkv(
-            ctx, qkv, &mut q_buf, &mut k_buf, &mut v_buf, tokens, q_dim, kv_dim,
-        );
-        Self::qk_norm_rope(
-            ctx, &q_buf, q_norm_w, cos, sin, q_out, tokens, q_heads, head_dim, pos_offset, eps,
-            qk_mode,
-        );
-        Self::qk_norm_rope(
-            ctx, &k_buf, k_norm_w, cos, sin, k_out, tokens, kv_heads, head_dim, pos_offset, eps,
-            qk_mode,
-        );
-        // V: no norm + RoPE-only (qk_mode=0); pass q_norm_w as a dummy
-        // (kernel ignores it when mode=0).
-        Self::qk_norm_rope(
-            ctx, &v_buf, q_norm_w, cos, sin, v_out, tokens, kv_heads, head_dim, pos_offset, eps, 0,
-        );
-        Ok(())
+        qkv::split_qkv_norm_rope(
+            ctx, qkv, q_norm_w, k_norm_w, cos, sin, q_out, k_out, v_out, tokens, q_heads, kv_heads,
+            head_dim, pos_offset, eps, qk_mode,
+        )
     }
 
     fn kv_cache_append_head_major(

@@ -118,3 +118,122 @@ fn single_device_frame_restores_original_scratch_after_real_cuda_forward_failure
         usize::try_from(pointer).expect("CUDA allocation address must fit the host pointer width")
     });
 }
+
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "requires an actual CUDA device and model capture cancellation"]
+fn model_frame_cancels_failed_cuda_capture_without_executing_prefix() {
+    use cudarc::driver::DevicePtr;
+    use ferrum_kernels::backend::{cuda::CudaBackend, Backend, BackendGraph};
+    use std::sync::Arc;
+
+    let config = LlamaFamilyConfig {
+        hidden_size: 128,
+        intermediate_size: 256,
+        num_heads: 2,
+        num_kv_heads: 1,
+        head_dim: 64,
+        num_layers: 1,
+        vocab_size: 128,
+        max_seq_len: 32,
+        ..Default::default()
+    };
+    let loader = SyntheticLlamaLoader::new(config.clone());
+    let mut model = LlamaFamilyModel::<CudaBackend, KvFp16>::new(config.clone(), &loader).unwrap();
+    let mut reference = LlamaFamilyModel::<CudaBackend, KvFp16>::new(config, &loader).unwrap();
+    for current in [&mut model, &mut reference] {
+        current.runtime_env.metal_paged_kv = Some(false);
+        current.runtime_env.prefix_cache = false;
+        current.runtime_env.cuda_graph = false;
+        current.runtime_env.kv_capacity = Some(32);
+        current.ensure_scratch(3);
+    }
+    let expected_prefill = reference.prefill_internal("oracle", &[1, 2, 3]);
+    assert_eq!(
+        model.prefill_internal("warmup", &[1, 2, 3]),
+        expected_prefill
+    );
+    assert_eq!(expected_prefill.len(), 128);
+    assert!(expected_prefill.iter().all(|value| value.is_finite()));
+    model.release("warmup");
+
+    let count = 3 * model.cfg.hidden_size;
+    let sentinel = vec![0.5; count];
+    let prepared: DeviceFrameResult<()> = model.run_device_frame(|model, frame| {
+        frame
+            .take_scratch(&mut model.scratch, FrameLayout::Single, false)
+            .unwrap();
+        let residual = frame.residual.as_mut().unwrap();
+        // Load the real zero kernel eagerly; only its captured execution is
+        // under test below, not a first-use module load during capture.
+        CudaBackend::zero_buffer(&mut frame.context, residual, count).unwrap();
+        CudaBackend::write_f32_to_activation(&mut frame.context, residual, &sentinel);
+    });
+    assert!(matches!(prepared, DeviceFrameResult::Terminal(Ok(()))));
+    let original_context = model.execution_context.as_ref().unwrap();
+    let original_stream = Arc::as_ptr(&original_context.stream);
+    let original_buffer = model
+        .scratch
+        .residual
+        .as_ref()
+        .unwrap()
+        .as_f16()
+        .device_ptr(&original_context.stream)
+        .0;
+
+    let failed: DeviceFrameResult<()> = model.run_device_frame(|model, frame| {
+        frame
+            .take_scratch(&mut model.scratch, FrameLayout::Single, false)
+            .unwrap();
+        CudaBackend::begin_graph_capture(&mut frame.context).unwrap();
+        CudaBackend::zero_buffer(&mut frame.context, frame.residual.as_mut().unwrap(), count)
+            .unwrap();
+        // The model's real unwind boundary must cancel this recorded prefix.
+        // This test intentionally never calls abort_graph_capture itself.
+        std::panic::panic_any(FerrumError::backend("model capture prefix failure"));
+    });
+    let DeviceFrameResult::Terminal(Err(error)) = failed else {
+        panic!("cancelled model capture must preserve its terminal encoding error");
+    };
+    assert_eq!(
+        error.to_string(),
+        FerrumError::backend("model capture prefix failure").to_string()
+    );
+    assert!(model.pending_device_frame.is_none());
+    let context = model.execution_context.as_mut().unwrap();
+    assert_eq!(Arc::as_ptr(&context.stream), original_stream);
+    assert!(!CudaBackend::graph_capture_in_flight(context));
+    let residual = model.scratch.residual.as_ref().unwrap();
+    assert_eq!(
+        residual.as_f16().device_ptr(&context.stream).0,
+        original_buffer
+    );
+    assert_eq!(
+        CudaBackend::to_vec_in_context(context, residual, count),
+        sentinel
+    );
+
+    // The same model/context remains usable. Both complete logit vectors and
+    // real per-layer KV progress must agree with an independent model owner.
+    assert_eq!(
+        model.prefill_internal("after", &[1, 2, 3]),
+        expected_prefill
+    );
+    assert!(model.kv_caches["after"].iter().all(|cache| cache.len == 3));
+    let expected_decode = reference.decode_internal("oracle", 4, 3);
+    let actual_decode = model.decode_internal("after", 4, 3);
+    assert_eq!(actual_decode.len(), 128);
+    assert!(actual_decode.iter().all(|value| value.is_finite()));
+    assert_eq!(actual_decode, expected_decode);
+    assert!(model.kv_caches["after"].iter().all(|cache| cache.len == 4));
+    assert_eq!(
+        Arc::as_ptr(&model.execution_context.as_ref().unwrap().stream),
+        original_stream
+    );
+    model.release("after");
+    reference.release("oracle");
+    assert!(model.kv_caches.is_empty());
+    assert!(reference.kv_caches.is_empty());
+    model.close().unwrap();
+    reference.close().unwrap();
+}

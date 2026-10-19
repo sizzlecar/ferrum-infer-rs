@@ -38,7 +38,9 @@ use ferrum_quantization::{Linear, WeightLoader};
 use ferrum_types::{Activation, Result};
 
 use crate::common::{DecoderOnlyLLM, LlmRuntimeConfig};
-use crate::lora::{load_runtime_lora_adapter, ActiveLoraAdapter, RuntimeLoraAdapter};
+use crate::lora::{
+    load_runtime_lora_adapter, ActiveLoraAdapter, RuntimeLoraAdapter, RuntimeLoraWorkspace,
+};
 
 mod allocator_reclaim;
 pub(super) mod device_execution;
@@ -1939,6 +1941,9 @@ pub struct LlamaFamilyModel<B: MoeLlmBackend, K: KvLayer<B> = KvFp16> {
 
     // ── Startup LoRA runtime state ──────────────────────────────────────
     lora_adapters: HashMap<String, RuntimeLoraAdapter<B>>,
+    // Only this instance's original frame/context may prepare or borrow it.
+    // Pending execution retains the whole model, including this workspace.
+    lora_workspace: RuntimeLoraWorkspace<B>,
     lora_cache_adapters: HashMap<String, String>,
     lora_projection_applications: u64,
 }
@@ -2179,6 +2184,7 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
             prefix_cache_saved_prefill_tokens: 0,
             decode_batch_stats: LlamaDecodeBatchStats::default(),
             lora_adapters: HashMap::new(),
+            lora_workspace: RuntimeLoraWorkspace::default(),
             lora_cache_adapters: HashMap::new(),
             lora_projection_applications: 0,
         })
@@ -2980,23 +2986,24 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         self.lora_adapters.get(adapter_name)
     }
 
-    fn prepare_lora_workspace_for_cache(&self, ctx: &mut B::Context, cache_id: &str, rows: usize) {
+    fn prepare_lora_workspace_for_cache(
+        &mut self,
+        ctx: &mut B::Context,
+        cache_id: &str,
+        rows: usize,
+    ) {
         // Prepare only the adapter consumed by this invocation. The original
         // frame begins after its predecessor is terminal; LoRA is never
-        // captured, and apply_projection retains these buffers on the adapter.
-        if let Some(adapter) = self.active_lora_adapter_for_cache(cache_id) {
-            adapter
-                .prepare_workspace(ctx, rows)
+        // captured, and its scratch remains owned by this model instance.
+        if let Some(adapter) = self
+            .lora_cache_adapters
+            .get(cache_id)
+            .and_then(|name| self.lora_adapters.get(name))
+        {
+            self.lora_workspace
+                .prepare(ctx, adapter, rows)
                 .unwrap_or_else(|error| std::panic::panic_any(error));
         }
-    }
-
-    fn active_lora_adapter_ptr_for_cache(
-        &self,
-        cache_id: &str,
-    ) -> Option<*const RuntimeLoraAdapter<B>> {
-        self.active_lora_adapter_for_cache(cache_id)
-            .map(|adapter| adapter as *const RuntimeLoraAdapter<B>)
     }
 
     fn lora_metrics_snapshot_json(&self) -> serde_json::Value {
@@ -3225,12 +3232,15 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
             tokens * (q_dim + 2 * kv_dim),
             q_dim + 2 * kv_dim
         );
-        if let Some(adapter) = self.active_lora_adapter_ptr_for_cache(cache_id) {
-            // SAFETY: `lora_adapters` is not mutated during a forward pass;
-            // the pointer is used only for this immediate read-only call.
-            let applied = unsafe { &*adapter }
+        if let Some(adapter) = self
+            .lora_cache_adapters
+            .get(cache_id)
+            .and_then(|name| self.lora_adapters.get(name))
+        {
+            let applied = adapter
                 .apply_projection(
                     ctx,
+                    &mut self.lora_workspace,
                     source_li,
                     "qkv_proj",
                     &self.scratch.norm_out,
@@ -3541,11 +3551,15 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
                 .o_proj
                 .forward(ctx, attn_token_major, &mut self.scratch.o_proj_out, tokens);
         }
-        if let Some(adapter) = self.active_lora_adapter_ptr_for_cache(cache_id) {
-            // SAFETY: see qkv_proj LoRA application above.
-            let applied = unsafe { &*adapter }
+        if let Some(adapter) = self
+            .lora_cache_adapters
+            .get(cache_id)
+            .and_then(|name| self.lora_adapters.get(name))
+        {
+            let applied = adapter
                 .apply_projection(
                     ctx,
+                    &mut self.lora_workspace,
                     source_li,
                     "o_proj",
                     attn_token_major,
@@ -3726,13 +3740,14 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
                 &mut self.scratch.gate_up_out,
                 tokens,
             );
-            if let Some(adapter) =
-                cache_id.and_then(|cache_id| self.active_lora_adapter_ptr_for_cache(cache_id))
+            if let Some(adapter) = cache_id
+                .and_then(|cache_id| self.lora_cache_adapters.get(cache_id))
+                .and_then(|name| self.lora_adapters.get(name))
             {
-                // SAFETY: see qkv_proj LoRA application above.
-                let applied = unsafe { &*adapter }
+                let applied = adapter
                     .apply_projection(
                         ctx,
+                        &mut self.lora_workspace,
                         source_li,
                         "gate_up_proj",
                         &self.scratch.norm_out,
@@ -3783,13 +3798,14 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
                 &mut self.scratch.mlp_out,
                 tokens,
             );
-            if let Some(adapter) =
-                cache_id.and_then(|cache_id| self.active_lora_adapter_ptr_for_cache(cache_id))
+            if let Some(adapter) = cache_id
+                .and_then(|cache_id| self.lora_cache_adapters.get(cache_id))
+                .and_then(|name| self.lora_adapters.get(name))
             {
-                // SAFETY: see qkv_proj LoRA application above.
-                let applied = unsafe { &*adapter }
+                let applied = adapter
                     .apply_projection(
                         ctx,
+                        &mut self.lora_workspace,
                         source_li,
                         "down_proj",
                         &self.scratch.silu_out,

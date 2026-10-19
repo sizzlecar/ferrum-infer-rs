@@ -56,7 +56,7 @@ pub struct ActiveLoraAdapter {
     pub path: PathBuf,
 }
 
-pub struct RuntimeLoraLinear<B: Backend> {
+pub(crate) struct RuntimeLoraLinear<B: Backend> {
     pub layer_index: Option<usize>,
     pub target_module: String,
     pub in_features: usize,
@@ -67,88 +67,87 @@ pub struct RuntimeLoraLinear<B: Backend> {
     b: DenseLinear<B>,
 }
 
-pub struct RuntimeLoraAdapter<B: Backend> {
+/// Immutable adapter weights. Execution scratch belongs to the model instance
+/// that loaded these weights on its original context.
+pub(crate) struct RuntimeLoraAdapter<B: Backend> {
     pub name: String,
     pub path: PathBuf,
     pub config: LoraAdapterConfig,
     pub linears: Vec<RuntimeLoraLinear<B>>,
-    // One reusable pair for this adapter, shared by its sequential projections.
-    // Releasing the short mutex borrow does not release these device owners.
-    workspace: std::sync::Mutex<RuntimeLoraWorkspace<B>>,
+    // Frozen from validated tensor shapes at load time, not scanned per token.
+    max_output_features: usize,
 }
 
-struct RuntimeLoraWorkspace<B: Backend> {
+/// One reusable pair owned by a model execution instance, never by an adapter.
+/// Its buffers stay with that model while the original frame is Held.
+pub(crate) struct RuntimeLoraWorkspace<B: Backend> {
     low_rank: Option<B::Buffer>,
     delta: Option<B::Buffer>,
-    rows: usize,
+    rank_capacity: usize,
+    output_capacity: usize,
 }
 
-impl<B: Backend> RuntimeLoraAdapter<B> {
-    #[cfg(test)]
-    pub(crate) fn workspace_rows_for_test(&self) -> usize {
-        self.workspace
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .rows
-    }
-
-    /// Grow before encoding the invocation, after the previous invocation's
-    /// actual terminal observation. LoRA remains outside captured graphs.
-    pub fn prepare_workspace(&self, ctx: &mut B::Context, rows: usize) -> Result<()> {
-        let mut workspace = self.workspace.lock().unwrap_or_else(|p| p.into_inner());
-        if rows <= workspace.rows {
-            return Ok(());
+impl<B: Backend> Default for RuntimeLoraWorkspace<B> {
+    fn default() -> Self {
+        Self {
+            low_rank: None,
+            delta: None,
+            rank_capacity: 0,
+            output_capacity: 0,
         }
-        let rank = self
-            .linears
-            .iter()
-            .map(|linear| linear.rank)
-            .max()
-            .unwrap_or(0);
-        let width = self
-            .linears
-            .iter()
-            .map(|linear| linear.out_features)
-            .max()
-            .unwrap_or(0);
+    }
+}
+
+impl<B: Backend> RuntimeLoraWorkspace<B> {
+    /// The original model frame calls this once before numerical encoding,
+    /// after observing its predecessor's terminal state. LoRA is not captured.
+    /// Capacities count elements: switching adapters at the same row count can
+    /// require a larger rank or output allocation.
+    pub(crate) fn prepare(
+        &mut self,
+        ctx: &mut B::Context,
+        adapter: &RuntimeLoraAdapter<B>,
+        rows: usize,
+    ) -> Result<()> {
+        // Loading validates every tensor rank against this immutable config.
+        let rank = adapter.config.r;
+        let width = adapter.max_output_features;
         let rank_len = rows
             .checked_mul(rank)
             .ok_or_else(|| FerrumError::model("LoRA rank workspace overflow"))?;
         let delta_len = rows
             .checked_mul(width)
             .ok_or_else(|| FerrumError::model("LoRA output workspace overflow"))?;
-        // Publish each actual allocation into the original adapter before the
-        // next allocation can fail; a Held frame retains the whole model.
-        workspace.low_rank = Some(B::alloc_in_context(ctx, rank_len));
-        workspace.delta = Some(B::alloc_in_context(ctx, delta_len));
-        workspace.rows = rows;
+        // Publish each allocation into the original model's payload before
+        // the next can fail. The frame retains the whole model on Unresolved.
+        if rank_len > self.rank_capacity {
+            self.low_rank = Some(B::alloc_in_context(ctx, rank_len));
+            self.rank_capacity = rank_len;
+        }
+        if delta_len > self.output_capacity {
+            self.delta = Some(B::alloc_in_context(ctx, delta_len));
+            self.output_capacity = delta_len;
+        }
         Ok(())
     }
 
-    pub fn apply_projection(
+    #[cfg(test)]
+    pub(crate) fn capacities_for_test(&self) -> (usize, usize) {
+        (self.rank_capacity, self.output_capacity)
+    }
+}
+
+impl<B: Backend> RuntimeLoraAdapter<B> {
+    pub(crate) fn apply_projection(
         &self,
         ctx: &mut B::Context,
+        workspace: &mut RuntimeLoraWorkspace<B>,
         layer_index: usize,
         target_module: &str,
         input: &B::Buffer,
         out: &mut B::Buffer,
         m: usize,
     ) -> Result<usize> {
-        let mut workspace = self.workspace.lock().unwrap_or_else(|p| p.into_inner());
-        if m > workspace.rows {
-            return Err(FerrumError::model(
-                "LoRA workspace must be prepared before encoding",
-            ));
-        }
-        let RuntimeLoraWorkspace {
-            low_rank, delta, ..
-        } = &mut *workspace;
-        let low_rank = low_rank
-            .as_mut()
-            .ok_or_else(|| FerrumError::model("LoRA rank workspace absent"))?;
-        let delta = delta
-            .as_mut()
-            .ok_or_else(|| FerrumError::model("LoRA output workspace absent"))?;
         let mut applied = 0usize;
         for linear in self.linears.iter().filter(|linear| {
             linear.target_module == target_module
@@ -157,13 +156,32 @@ impl<B: Backend> RuntimeLoraAdapter<B> {
                     .map(|idx| idx == layer_index)
                     .unwrap_or(true)
         }) {
+            let rank_len = m
+                .checked_mul(linear.rank)
+                .ok_or_else(|| FerrumError::model("LoRA rank workspace overflow"))?;
+            let delta_len = m
+                .checked_mul(linear.out_features)
+                .ok_or_else(|| FerrumError::model("LoRA output workspace overflow"))?;
+            if rank_len > workspace.rank_capacity || delta_len > workspace.output_capacity {
+                return Err(FerrumError::model(
+                    "LoRA workspace must be prepared for the current adapter before encoding",
+                ));
+            }
+            let low_rank = workspace
+                .low_rank
+                .as_mut()
+                .ok_or_else(|| FerrumError::model("LoRA rank workspace absent"))?;
+            let delta = workspace
+                .delta
+                .as_mut()
+                .ok_or_else(|| FerrumError::model("LoRA output workspace absent"))?;
             linear.apply(ctx, input, out, low_rank, delta, m)?;
             applied += 1;
         }
         Ok(applied)
     }
 
-    pub fn supports_projection(
+    pub(crate) fn supports_projection(
         &self,
         layer_index: usize,
         target_module: &str,
@@ -305,7 +323,7 @@ pub fn load_startup_lora_adapters(
     Ok(out)
 }
 
-pub fn load_runtime_lora_adapter<B: Backend>(
+pub(crate) fn load_runtime_lora_adapter<B: Backend>(
     ctx: &mut B::Context,
     adapter: &ActiveLoraAdapter,
 ) -> Result<RuntimeLoraAdapter<B>> {
@@ -361,6 +379,11 @@ pub fn load_runtime_lora_adapter<B: Backend>(
         });
     }
 
+    let max_output_features = linears
+        .iter()
+        .map(|linear| linear.out_features)
+        .max()
+        .expect("startup validation requires at least one tensor pair");
     construction.transfer();
     drop(construction);
     Ok(RuntimeLoraAdapter {
@@ -368,11 +391,7 @@ pub fn load_runtime_lora_adapter<B: Backend>(
         path: adapter.path.clone(),
         config: startup.config,
         linears,
-        workspace: std::sync::Mutex::new(RuntimeLoraWorkspace {
-            low_rank: None,
-            delta: None,
-            rows: 0,
-        }),
+        max_output_features,
     })
 }
 
@@ -539,9 +558,18 @@ fn parse_lora_layer_index(name: &str) -> Option<usize> {
 }
 
 #[cfg(test)]
-mod workspace_tests {
+mod runtime_tests;
+
+#[cfg(test)]
+pub(crate) mod workspace_tests {
     use super::*;
     use ferrum_kernels::backend::cpu::CpuBackend;
+
+    pub(crate) fn buffers<B: Backend>(
+        workspace: &RuntimeLoraWorkspace<B>,
+    ) -> (Option<&B::Buffer>, Option<&B::Buffer>) {
+        (workspace.low_rank.as_ref(), workspace.delta.as_ref())
+    }
 
     #[test]
     fn lora_workspace_reuses_original_buffers_and_grows_before_encoding() {
@@ -575,21 +603,25 @@ mod workspace_tests {
                     2,
                 ),
             }],
-            workspace: std::sync::Mutex::new(RuntimeLoraWorkspace {
-                low_rank: None,
-                delta: None,
-                rows: 0,
-            }),
+            max_output_features: 2,
         };
+        let mut workspace = RuntimeLoraWorkspace::default();
         let input = vec![2.0, 3.0];
         let mut output = vec![0.0; 2];
         assert!(adapter
-            .apply_projection(&mut ctx, 0, "o_proj", &input, &mut output, 1)
+            .apply_projection(
+                &mut ctx,
+                &mut workspace,
+                0,
+                "o_proj",
+                &input,
+                &mut output,
+                1
+            )
             .is_err());
         assert_eq!(output, [0.0; 2]);
-        adapter.prepare_workspace(&mut ctx, 1).unwrap();
+        workspace.prepare(&mut ctx, &adapter, 1).unwrap();
         let pointers = {
-            let workspace = adapter.workspace.lock().unwrap();
             (
                 workspace.low_rank.as_ref().unwrap().as_ptr(),
                 workspace.delta.as_ref().unwrap().as_ptr(),
@@ -597,7 +629,15 @@ mod workspace_tests {
         };
         assert_eq!(
             adapter
-                .apply_projection(&mut ctx, 0, "o_proj", &input, &mut output, 1)
+                .apply_projection(
+                    &mut ctx,
+                    &mut workspace,
+                    0,
+                    "o_proj",
+                    &input,
+                    &mut output,
+                    1
+                )
                 .unwrap(),
             1
         );
@@ -605,9 +645,8 @@ mod workspace_tests {
         CpuBackend::observe_completion(&mut ctx)
             .into_result()
             .unwrap();
-        adapter.prepare_workspace(&mut ctx, 1).unwrap();
+        workspace.prepare(&mut ctx, &adapter, 1).unwrap();
         {
-            let workspace = adapter.workspace.lock().unwrap();
             assert_eq!(
                 pointers,
                 (
@@ -616,12 +655,20 @@ mod workspace_tests {
                 )
             );
         }
-        adapter.prepare_workspace(&mut ctx, 2).unwrap();
+        workspace.prepare(&mut ctx, &adapter, 2).unwrap();
         let input = vec![2.0, 3.0, 5.0, 7.0];
         let mut output = vec![0.0; 4];
         assert_eq!(
             adapter
-                .apply_projection(&mut ctx, 0, "o_proj", &input, &mut output, 2)
+                .apply_projection(
+                    &mut ctx,
+                    &mut workspace,
+                    0,
+                    "o_proj",
+                    &input,
+                    &mut output,
+                    2
+                )
                 .unwrap(),
             1
         );
@@ -629,8 +676,7 @@ mod workspace_tests {
             .into_result()
             .unwrap();
         assert_eq!(output, [4.0, 9.0, 9.5, 21.5]);
-        let workspace = adapter.workspace.lock().unwrap();
-        assert_eq!(workspace.rows, 2);
+        assert_eq!(workspace.capacities_for_test(), (4, 4));
         assert_eq!(workspace.low_rank.as_ref().unwrap().len(), 4);
         assert_eq!(workspace.delta.as_ref().unwrap().len(), 4);
     }
