@@ -3,6 +3,9 @@ use crate::cost_prediction::{
     CostPrediction, CostQuery, CostSnapshot, CostUnknownReason, CostWork, TimePlanningRound,
 };
 use ferrum_execution::execution_attempt::{AttemptPrefixRestore, AttemptWorkKind};
+use ferrum_execution::model_executor::PrefillShapePolicy;
+
+mod prefill_shape;
 use ferrum_types::{CostFallback, RequestIngressAnchor, SchedulerSloConfig, UnknownCostPolicy};
 
 struct Snapshot {
@@ -131,7 +134,8 @@ fn slo_snapshot_budget_changes_real_batch_and_respects_static_caps() {
             if static_budget.is_some() { 14 } else { 201 } * 16
         );
         let source = snapshot(7, Instant::now(), false);
-        let mut planning = TimePlanningRound::new(source.clone(), targets());
+        let mut planning =
+            TimePlanningRound::new(source.clone(), targets(), PrefillShapePolicy::Identity);
         let adapted = select(&sched, Some(&mut planning)).batch.unwrap();
         assert_eq!(
             adapted.resource_requirements.gpu_memory,
@@ -153,7 +157,8 @@ fn slo_snapshot_budget_changes_real_batch_and_respects_static_caps() {
         assert_eq!(stats.last_revision, Some(7));
         assert_eq!(stats.planning_rounds, 1);
         assert!(stats.selections.known_queries > 0);
-        let mut narrow_round = TimePlanningRound::new(source, targets());
+        let mut narrow_round =
+            TimePlanningRound::new(source, targets(), PrefillShapePolicy::Identity);
         let narrow = sched
             .next_batch_with_token_admissions(
                 BatchHint {
@@ -177,7 +182,7 @@ fn slo_one_snapshot_survives_admission_subrounds_and_final_selection() {
     let now = Instant::now();
     let old = snapshot(3, now, false);
     let published = snapshot(4, now, true);
-    let mut planning = TimePlanningRound::new(old.clone(), targets());
+    let mut planning = TimePlanningRound::new(old.clone(), targets(), PrefillShapePolicy::Identity);
     waiting(&sched, 32);
     admit(&sched, Some(&mut planning));
     // A source can publish here, but the already-owned planning round must
@@ -194,7 +199,8 @@ fn slo_one_snapshot_survives_admission_subrounds_and_final_selection() {
     );
     assert!(old.calls.lock().iter().all(|(revision, _)| *revision == 3));
     assert!(published.calls.lock().is_empty());
-    let mut next = TimePlanningRound::new(published.clone(), targets());
+    let mut next =
+        TimePlanningRound::new(published.clone(), targets(), PrefillShapePolicy::Identity);
     assert_eq!(
         select(&sched, Some(&mut next))
             .batch
@@ -226,7 +232,8 @@ fn slo_unknown_wait_uses_original_ingress_and_never_renews_deadline() {
         let source = snapshot(1, ingress.instant(), true);
         let epoch = sched.confirmed_capacity_release_epoch();
         for elapsed in [10, 75] {
-            let mut planning = TimePlanningRound::new(source.clone(), config);
+            let mut planning =
+                TimePlanningRound::new(source.clone(), config, PrefillShapePolicy::Identity);
             let mut round = sched.begin_token_admission(1, None).unwrap();
             assert!(round
                 .next_at(
@@ -247,7 +254,7 @@ fn slo_unknown_wait_uses_original_ingress_and_never_renews_deadline() {
             assert_eq!(sched.waiting_count(), 1);
             assert_eq!(sched.confirmed_capacity_release_epoch(), epoch);
         }
-        let mut planning = TimePlanningRound::new(source, config);
+        let mut planning = TimePlanningRound::new(source, config, PrefillShapePolicy::Identity);
         let mut round = sched.begin_token_admission(1, None).unwrap();
         let candidate = round
             .next_at(
@@ -297,6 +304,7 @@ fn slo_unknown_reject_uses_original_failure_without_executor_probe() {
             unknown_cost: UnknownCostPolicy::Reject,
             ..targets()
         },
+        PrefillShapePolicy::Identity,
     );
     let mut round = sched.begin_token_admission(1, None).unwrap();
     assert!(round
@@ -329,6 +337,7 @@ fn slo_stale_and_inexact_are_unknown_while_existing_decode_progresses() {
             unknown_cost: UnknownCostPolicy::Reject,
             ..targets()
         },
+        PrefillShapePolicy::Identity,
     );
     let batch = sched
         .create_iteration_batch_with_time(
@@ -351,7 +360,8 @@ fn slo_stale_and_inexact_are_unknown_while_existing_decode_progresses() {
     enqueue_waiting(&inexact_sched, create_test_request(Priority::Normal));
     admit(&inexact_sched, None);
     let source = snapshot(2, Instant::now(), false);
-    let mut inexact = TimePlanningRound::new(source.clone(), targets());
+    let mut inexact =
+        TimePlanningRound::new(source.clone(), targets(), PrefillShapePolicy::Identity);
     assert!(select(&inexact_sched, Some(&mut inexact)).batch.is_some());
     assert!(source.calls.lock().is_empty());
     assert!(inexact.statistics.static_fallbacks > 0);
@@ -366,7 +376,7 @@ fn slo_query_limit_is_checked_before_projection_and_preserves_decode() {
     let source = snapshot(1, Instant::now(), false);
     let mut config = targets();
     config.reference.max_participants = 1;
-    let mut planning = TimePlanningRound::new(source.clone(), config);
+    let mut planning = TimePlanningRound::new(source.clone(), config, PrefillShapePolicy::Identity);
     assert_eq!(
         select(&sched, Some(&mut planning))
             .batch
@@ -390,7 +400,9 @@ fn slo_projection_matches_prefill_and_decode_attempt_contexts_including_recomput
     sched.commit_prefix_restored(prepared, 120).unwrap();
     {
         let queue = sched.prefill_queue.read();
-        let (work, exact) = sched.cost_work(&queue[0], 8, false).unwrap();
+        let (work, exact) = sched
+            .cost_work(&queue[0], 8, false, PrefillShapePolicy::Identity)
+            .unwrap();
         assert!(exact);
         assert_eq!(
             (
@@ -411,7 +423,9 @@ fn slo_projection_matches_prefill_and_decode_attempt_contexts_including_recomput
     // update_decode_progress; prefill_context_len is input + generated count.
     {
         let queue = sched.decode_queue.read();
-        let (work, exact) = sched.cost_work(&queue.requests[&id], 1, true).unwrap();
+        let (work, exact) = sched
+            .cost_work(&queue.requests[&id], 1, true, PrefillShapePolicy::Identity)
+            .unwrap();
         assert!(exact);
         assert_eq!(
             (
@@ -425,7 +439,9 @@ fn slo_projection_matches_prefill_and_decode_attempt_contexts_including_recomput
     sched.update_decode_progress(&id, 2);
     {
         let queue = sched.decode_queue.read();
-        let (work, exact) = sched.cost_work(&queue.requests[&id], 1, true).unwrap();
+        let (work, exact) = sched
+            .cost_work(&queue.requests[&id], 1, true, PrefillShapePolicy::Identity)
+            .unwrap();
         assert!(exact);
         assert_eq!((work.requested.start(), work.context_tokens), (129, 130));
     }
@@ -433,19 +449,28 @@ fn slo_projection_matches_prefill_and_decode_attempt_contexts_including_recomput
     assert!(sched.promote_to_prefill_with_empty_retry(&id, None));
     {
         let queue = sched.prefill_queue.read();
-        assert!(!sched.cost_work(&queue[0], 1, false).unwrap().1);
+        assert!(
+            !sched
+                .cost_work(&queue[0], 1, false, PrefillShapePolicy::Identity)
+                .unwrap()
+                .1
+        );
     }
     sched.mark_prefill_complete(&id, 130);
     {
         let queue = sched.decode_queue.read();
-        let (work, exact) = sched.cost_work(&queue.requests[&id], 1, true).unwrap();
+        let (work, exact) = sched
+            .cost_work(&queue.requests[&id], 1, true, PrefillShapePolicy::Identity)
+            .unwrap();
         assert!(exact);
         assert_eq!((work.requested.start(), work.context_tokens), (130, 131));
     }
     sched.update_decode_progress(&id, 4);
     {
         let queue = sched.decode_queue.read();
-        let (work, exact) = sched.cost_work(&queue.requests[&id], 1, true).unwrap();
+        let (work, exact) = sched
+            .cost_work(&queue.requests[&id], 1, true, PrefillShapePolicy::Identity)
+            .unwrap();
         assert!(exact);
         assert_eq!((work.requested.start(), work.context_tokens), (131, 132));
     }
@@ -460,7 +485,12 @@ fn slo_projection_matches_prefill_and_decode_attempt_contexts_including_recomput
         .metadata
         .remove(PROMPT_TOKENS_METADATA_KEY);
     let queue = sched.decode_queue.read();
-    assert!(!sched.cost_work(&queue.requests[&id], 1, true).unwrap().1);
+    assert!(
+        !sched
+            .cost_work(&queue.requests[&id], 1, true, PrefillShapePolicy::Identity)
+            .unwrap()
+            .1
+    );
 }
 
 #[test]
@@ -495,7 +525,7 @@ fn slo_known_oversize_then_unknown_preserves_declared_policy_and_counts_final_sh
             config.ttft_ms = 50.0;
             config.itl_ms = 50.0;
             config.unknown_cost = policy;
-            let mut planning = TimePlanningRound::new(source, config);
+            let mut planning = TimePlanningRound::new(source, config, PrefillShapePolicy::Identity);
             let batch = sched
                 .create_iteration_batch_with_time(
                     hint(),
@@ -565,7 +595,11 @@ fn request_clock_ttft_priority_uses_ingress_and_excludes_recompute() {
             request.inner.started_at = Some(wall);
             request.inner.request.created_at = wall;
         }
-        let mut planning = TimePlanningRound::new(snapshot(1, ingress.instant(), false), targets());
+        let mut planning = TimePlanningRound::new(
+            snapshot(1, ingress.instant(), false),
+            targets(),
+            PrefillShapePolicy::Identity,
+        );
         sched.prioritize_ttft(
             &mut queue,
             ingress.instant() + Duration::from_millis(800),

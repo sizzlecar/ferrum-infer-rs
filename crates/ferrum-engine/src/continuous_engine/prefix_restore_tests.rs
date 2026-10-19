@@ -235,6 +235,124 @@ fn request() -> InferenceRequest {
 }
 
 #[tokio::test]
+async fn prefix_restore_time_planning_reprojects_current_frontier_with_original_snapshot() {
+    use super::cost_feedback_tests::{submit, Source};
+    use crate::continuous_engine::attempt_observation_tests::AttemptRecorder;
+    use ferrum_execution::execution_attempt::{AttemptPrefixRestore, ExecutionAttemptEligibility};
+    use ferrum_scheduler::cost_prediction::CostWork;
+
+    let mut config = EngineConfig::default();
+    config.runtime.profile_detail = ObservabilityProfileDetail::Off;
+    config.scheduler.max_running_requests = 1;
+    config.scheduler.slo = Some("ttft:1000,tpot:100,itl:100".parse().unwrap());
+    let state = Arc::new(RestoreState {
+        behavior: RestoreBehavior::Hit,
+        tokens: 2,
+        acknowledgements: AtomicU64::new(0),
+        cancellations: AtomicU64::new(0),
+    });
+    let mut implementation = PlanRuntimeChunkedPrefillTestExecutor::new(false);
+    implementation.prefix_restore = Some(state.clone());
+    implementation.prompt_tail_reserve = Some(2);
+    let observation = implementation.observer();
+    let recorder = Arc::new(AttemptRecorder::default());
+    let source = Source::new(true);
+    source.replace_after_load.store(true, Ordering::Release);
+    let tokenizer: Arc<dyn Tokenizer + Send + Sync> =
+        Arc::new(ferrum_testkit::MockTokenizer::new(128));
+    let engine = ContinuousBatchEngine::new_plan_runtime_observed(
+        config.clone(),
+        Arc::new(ContinuousBatchScheduler::new(config.scheduler)),
+        tokenizer.clone(),
+        Arc::new(ferrum_testkit::MockSampler),
+        ExecutorOwner::new(Box::new(implementation)),
+        Arc::new(MockTensorFactory),
+        None,
+        Some(recorder.clone()),
+        Some(source.clone()),
+    )
+    .unwrap();
+    let id = submit(&engine, &tokenizer, "one two three four").await;
+    let inner = engine.active_inner().unwrap();
+    inner.run_iteration().await.unwrap();
+    assert_eq!(source.load_count(), 1);
+    assert_eq!(
+        observation.shape_policy_reads.load(Ordering::Relaxed),
+        1,
+        "execution must borrow the policy already used before admission awaits"
+    );
+    assert_eq!(state.acknowledgements.load(Ordering::Relaxed), 1);
+    assert_eq!(state.cancellations.load(Ordering::Relaxed), 0);
+    let first_queries = source.take_work_queries();
+    assert!(!first_queries.is_empty());
+    assert!(first_queries.iter().all(|(revision, _)| *revision == 1));
+    assert!(first_queries.iter().any(|(_, work)| work.len() == 1
+        && work[0].requested.start() == 0
+        && work[0].requested.end() == 3));
+    let first = recorder.take();
+    assert_eq!(first.len(), 1);
+    assert_eq!(first[0].eligibility, ExecutionAttemptEligibility::Completed);
+    assert_eq!(first[0].participants.len(), 1);
+    let actual = &first[0].participants[0];
+    assert_eq!(actual.request_id, id);
+    assert_eq!(actual.requested.as_range(), 2..3);
+    assert_eq!(
+        actual.prefix_restore,
+        AttemptPrefixRestore::Restored { tokens: 2 }
+    );
+    let priced = CostWork {
+        kind: actual.kind,
+        requested: actual.requested,
+        context_tokens: actual.context_tokens,
+        prefix_restore: actual.prefix_restore,
+        internally_reused_tokens: actual.internally_reused_tokens,
+    };
+    assert!(
+        first_queries.iter().any(|(_, work)| work == &[priced]),
+        "the restored suffix must be reprojected and priced in the same snapshot"
+    );
+    let handle = inner.sequences.get(&id).unwrap();
+    let incarnation = {
+        let guard = handle.lock();
+        let sequence = guard.as_ref().unwrap();
+        let frontier = sequence.execution_frontier.as_ref().unwrap();
+        assert_eq!(frontier.consumed_tokens(), 3);
+        assert!(sequence.generated_tokens.is_empty());
+        let (restored, tokens) = sequence.confirmed_prefix_restore.as_ref().unwrap();
+        assert_eq!(restored, frontier.sequence());
+        assert_eq!(*tokens, 2);
+        frontier.sequence().clone()
+    };
+    inner.run_iteration().await.unwrap();
+    assert_eq!(source.load_count(), 2);
+    assert_eq!(observation.shape_policy_reads.load(Ordering::Relaxed), 2);
+    let second_queries = source.take_work_queries();
+    assert!(!second_queries.is_empty());
+    assert!(second_queries.iter().all(|(revision, _)| *revision == 2));
+    assert_eq!(
+        *observation.attempted_chunks.lock().unwrap(),
+        [
+            PrefillChunk::new(2, 1, 5).unwrap(),
+            PrefillChunk::new(3, 2, 5).unwrap(),
+        ]
+    );
+    {
+        let guard = handle.lock();
+        let sequence = guard.as_ref().unwrap();
+        let frontier = sequence.execution_frontier.as_ref().unwrap();
+        assert_eq!(frontier.sequence(), &incarnation);
+        assert_eq!(frontier.consumed_tokens(), 5);
+        assert_eq!(sequence.generated_tokens.len(), 1);
+    }
+    drop((handle, inner));
+    engine.shutdown().await.unwrap();
+    engine.wait_for_shutdown_completion().await.unwrap();
+    assert!(incarnation.observed_end().is_some());
+    assert!(observation.retained.lock().unwrap().is_empty());
+    assert!(observation.tokens.0.upgrade().is_none());
+}
+
+#[tokio::test]
 async fn prefix_restore_executes_only_suffix_and_samples_after_real_prefill() {
     let (engine, observation, state) = engine(RestoreBehavior::Hit, 3, None);
     let response = tokio::time::timeout(Duration::from_secs(2), engine.infer(request()))

@@ -1,9 +1,9 @@
-//! Real tiny CPU execution behind a deliberately invalid prompt-tail hook.
+//! Real tiny CPU execution with a deliberately stale scheduled prefill range.
 //! The replacement case exercises exact-incarnation protection, not a GPU path.
 
 use super::*;
 use ferrum_execution::model_executor::{
-    ExecutorCapabilities, ExecutorPrefillAdmission, ExecutorStatus, PrefixCapturePlan,
+    ExecutorCapabilities, ExecutorPrefillAdmission, ExecutorStatus,
 };
 use ferrum_execution::token_execution::{
     ExecutionAdmission, ExecutionCloseDisposition, ExecutionEndReason, ExecutorSequence,
@@ -12,30 +12,29 @@ use ferrum_execution::token_execution::{
 use ferrum_kv::{PagedKvCacheConfig, PagedKvCacheManager};
 use ferrum_models::test_support::{tiny_llama_executor_owned, TinyLlamaConfig, TinyTokenizer};
 
-struct InvalidTailExecutor {
+struct StalePrefillExecutor {
     inner: Arc<ExecutorScope>,
     owner: ExecutorOwner,
-    observation: Arc<InvalidTailObservation>,
+    observation: Arc<StalePrefillObservation>,
 }
 
-struct InvalidTailObservation {
+struct StalePrefillObservation {
     inner: crate::continuous_engine::token_completion_tests::ScopedExecutorObservation,
-    bad_hook: AtomicBool,
     executed: Mutex<Vec<ExecutorSequence>>,
     cancelled: Mutex<Vec<ExecutorSequence>>,
     healthy_at_close: Mutex<Option<(std::sync::Weak<EngineInner>, RequestId)>>,
     close_progress: Mutex<Vec<(usize, usize)>>,
 }
 
-impl std::ops::Deref for InvalidTailExecutor {
-    type Target = InvalidTailObservation;
+impl std::ops::Deref for StalePrefillExecutor {
+    type Target = StalePrefillObservation;
     fn deref(&self) -> &Self::Target {
         &self.observation
     }
 }
 
 #[async_trait::async_trait]
-impl ModelExecutor for InvalidTailExecutor {
+impl ModelExecutor for StalePrefillExecutor {
     fn begin_shutdown(
         self: Arc<Self>,
         permit: &ferrum_execution::ExecutorShutdownPermit,
@@ -54,7 +53,7 @@ impl ModelExecutor for InvalidTailExecutor {
             }
             Err(original) => ferrum_execution::ExecutorShutdownObserver::retained(
                 Arc::new(original),
-                FerrumError::internal("tail fixture has an unscoped owner"),
+                FerrumError::internal("preparation fixture has an unscoped owner"),
             ),
         }
     }
@@ -70,14 +69,8 @@ impl ModelExecutor for InvalidTailExecutor {
     async fn admit_tokens(&self, input: ExecutionAdmission<'_>) -> Result<TokenAdmissionOutcome> {
         self.inner.admit_tokens(input).await
     }
-    fn plan_prompt_tail_capture_boundary(&self, chunk: PrefillChunk) -> Option<PrefixCapturePlan> {
-        (self.bad_hook.load(Ordering::Relaxed) && chunk.total_prompt_tokens() == 3).then(|| {
-            PrefixCapturePlan {
-                // A capture boundary must precede the prompt's final token.
-                boundary: chunk.total_prompt_tokens(),
-                span: ferrum_runtime::CheckpointTokenSpanConstraint::any_positive(),
-            }
-        })
+    fn prefill_shape_policy(&self) -> PrefillShapePolicy {
+        self.inner.prefill_shape_policy()
     }
     async fn execute_tokens(&self, work: &[ExecutionWork<'_>]) -> Result<ExecutionBatchOutcome> {
         self.executed.lock().extend(
@@ -118,24 +111,23 @@ async fn fixture(
     prompt_lengths: &[usize],
 ) -> (
     ContinuousBatchEngine,
-    Arc<InvalidTailObservation>,
+    Arc<StalePrefillObservation>,
     ferrum_interfaces::BatchPlan,
     Vec<(RequestId, ExecutionFrontier)>,
 ) {
     let cfg = TinyLlamaConfig::default();
     let owner = ExecutorOwner::new(tiny_llama_executor_owned(&cfg));
     let inner = Arc::new(owner.scope().unwrap());
-    let executor = Arc::new(InvalidTailObservation {
+    let executor = Arc::new(StalePrefillObservation {
         inner: crate::continuous_engine::token_completion_tests::ScopedExecutorObservation::bound(
             &inner,
         ),
-        bad_hook: AtomicBool::new(true),
         executed: Mutex::new(Vec::new()),
         cancelled: Mutex::new(Vec::new()),
         healthy_at_close: Mutex::new(None),
         close_progress: Mutex::new(Vec::new()),
     });
-    let implementation = InvalidTailExecutor {
+    let implementation = StalePrefillExecutor {
         inner,
         owner,
         observation: Arc::clone(&executor),
@@ -233,10 +225,16 @@ async fn fixture(
 }
 
 #[tokio::test]
-async fn token_preparation_bad_tail_commits_healthy_cpu_peer_before_closing_failure() {
-    let (engine, executor, batch, identities) = fixture(&[3, 4]).await;
+async fn token_preparation_stale_range_commits_healthy_cpu_peer_before_closing_failure() {
+    let (engine, executor, mut batch, identities) = fixture(&[3, 4]).await;
     let (bad, bad_frontier) = &identities[0];
     let (healthy, healthy_frontier) = &identities[1];
+    batch
+        .requests
+        .iter_mut()
+        .find(|request| &request.request.id == bad)
+        .unwrap()
+        .tokens_processed = 1;
     *executor.healthy_at_close.lock() = Some((
         Arc::downgrade(&engine.active_inner().expect("engine execution is open")),
         healthy.clone(),
@@ -249,7 +247,7 @@ async fn token_preparation_bad_tail_commits_healthy_cpu_peer_before_closing_fail
         .unwrap_err();
     assert!(error
         .to_string()
-        .contains("invalid prompt-tail capture boundary"));
+        .contains("scheduler prefill position differs from the actual token frontier"));
     assert_eq!(
         *executor.executed.lock(),
         vec![healthy_frontier.sequence().clone()]
@@ -327,15 +325,47 @@ async fn token_preparation_bad_tail_commits_healthy_cpu_peer_before_closing_fail
 }
 
 #[tokio::test]
-async fn token_preparation_failure_preserves_same_request_replacement_incarnation() {
+async fn token_preparation_rejects_unprojected_priced_range_with_original_frontier() {
     let (engine, executor, batch, identities) = fixture(&[3]).await;
+    let inner = engine.active_inner().unwrap();
+    let error = inner
+        .process_batch_with_shape(
+            &batch,
+            PrefillShapePolicy::PromptTail(
+                ferrum_runtime::CheckpointBoundaryConstraint::any_positive(),
+            ),
+            true,
+        )
+        .await
+        .unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("selected prefill range differs from its projected execution shape"));
+    assert!(executor.executed.lock().is_empty());
+    inner.execution_closes.join_observers().await;
+    inner.output_tasks.join_current().await;
+    assert_eq!(
+        *executor.cancelled.lock(),
+        [identities[0].1.sequence().clone()]
+    );
+    assert!(identities[0].1.sequence().observed_end().is_some());
+    assert_eq!(inner.execution_closes.unreclaimed_count(), 0);
+    drop(inner);
+    engine.shutdown().await.unwrap();
+    engine.wait_for_shutdown_completion().await.unwrap();
+}
+
+#[tokio::test]
+async fn token_preparation_failure_preserves_same_request_replacement_incarnation() {
+    let (engine, executor, mut batch, identities) = fixture(&[3]).await;
+    batch.requests[0].tokens_processed = 1;
     let PreparedTokenBatch {
         inputs,
         mut failures,
     } = engine
         .active_inner()
         .expect("engine execution is open")
-        .prepare_token_batch(&batch);
+        .prepare_token_batch(&batch, PrefillShapePolicy::Identity, false);
     assert!(inputs.is_empty());
     assert_eq!(failures.len(), 1);
     let failure = failures.pop().unwrap();
@@ -430,7 +460,7 @@ async fn token_preparation_failure_preserves_same_request_replacement_incarnatio
         .unwrap()
         .request_slot
         .is_some());
-    executor.bad_hook.store(false, Ordering::Relaxed);
+    batch.requests[0].tokens_processed = 0;
     engine
         .active_inner()
         .expect("engine execution is open")

@@ -149,6 +149,13 @@ impl LlmExecutor {
 
 #[async_trait::async_trait]
 impl ModelExecutor for LlmExecutor {
+    fn prefill_shape_policy(&self) -> ferrum_execution::model_executor::PrefillShapePolicy {
+        // This executor submits the validated token range without a separate
+        // checkpoint-tail rewrite. Actual partial completion is reported by
+        // the execution result, independently of this planning rule.
+        ferrum_execution::model_executor::PrefillShapePolicy::Identity
+    }
+
     fn begin_shutdown(
         self: Arc<Self>,
         permit: &ferrum_execution::executor_lifecycle::ExecutorShutdownPermit,

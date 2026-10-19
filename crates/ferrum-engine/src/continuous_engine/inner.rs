@@ -1289,6 +1289,7 @@ impl EngineInner {
         // A planning iteration may contain multiple asynchronous admission
         // rounds. Keep one immutable prediction version across all of them;
         // prediction queries still use their current monotonic time.
+        let prefill_shape_policy = self.model_executor.prefill_shape_policy();
         let mut planning = self.config.scheduler.slo.map(|policy| {
             TimePlanningRound::new(
                 self.cost_snapshot_source
@@ -1296,6 +1297,7 @@ impl EngineInner {
                     .expect("feedback validated before startup")
                     .load(),
                 policy,
+                prefill_shape_policy,
             )
         });
         if self
@@ -1453,7 +1455,15 @@ impl EngineInner {
         // published while the device executes this wave.
         drop(iteration_guard);
         let process_t0 = Instant::now();
-        let r = self.process_batch(&batch).await;
+        let r = self
+            .process_batch_with_shape(
+                &batch,
+                prefill_shape_policy,
+                planning
+                    .as_ref()
+                    .is_some_and(|round| round.selection_is_exact(batch.size())),
+            )
+            .await;
         let process_elapsed = process_t0.elapsed();
         self.record_model_execution_time(process_elapsed);
         self.execute_executor_prefill_maintenance(prefill_maintenance.into_pending());

@@ -258,7 +258,6 @@ async fn fixture_observed(
             frontier,
             work: TokenWork::Prefill(PrefillChunk::new(0, 1, 2).unwrap()),
             logits_policy: LogitsReturnPolicy::FullLogits,
-            scheduled_tokens: 1,
             context_tokens: 2,
         });
     }

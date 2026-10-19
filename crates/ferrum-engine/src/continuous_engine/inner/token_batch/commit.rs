@@ -188,12 +188,18 @@ impl EngineInner {
             }
             match progress.executed {
                 ExecutedTokenWork::Prefill { chunk, .. } => {
+                    // A deliberate shape projection is planned work, not a
+                    // capacity-limited completion. Compare only with the work
+                    // actually submitted to this executor.
+                    let TokenWork::Prefill(requested) = input.work else {
+                        unreachable!("validated prefill completion has prefill input")
+                    };
                     let scheduler_result = self
                         .scheduler
                         .mark_prefill_chunk_processed_with_capacity_feedback(
                             &input.request_id,
                             input.context_tokens,
-                            input.scheduled_tokens,
+                            requested.tokens_to_process(),
                             chunk.tokens_to_process(),
                         );
                     let error = match scheduler_result {
@@ -224,6 +230,9 @@ impl EngineInner {
                         .increment(chunk.tokens_to_process() as u64);
                     if chunk.is_final() && progress.generated_tokens.is_some() {
                         counter!("ferrum.engine.prefills_total").increment(1);
+                        if scheduler_committed {
+                            self.scheduler.mark_first_token_emitted(&input.request_id);
+                        }
                     }
                     if scheduler_committed {
                         self.trace_plan_runtime_prefill_completion(&input.request_id, chunk);

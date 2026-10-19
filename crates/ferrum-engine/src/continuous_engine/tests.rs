@@ -219,6 +219,7 @@ struct PlanRuntimeChunkedPrefillTestExecutor {
     prefix_retry: Option<Arc<prefix_restore_deferred_tests::RestoreState>>,
     rendezvous: Option<Arc<prefix_rendezvous_tests::CaptureState>>,
     prompt_tail_reserve: Option<usize>,
+    releases_sequence_capacity: bool,
     observation: Arc<PlanRuntimeChunkedPrefillObservation>,
 }
 
@@ -233,6 +234,7 @@ struct PlanRuntimeChunkedPrefillObservation {
     capacity_wait_registrations: AtomicU64,
     capacity_signal: tokio::sync::watch::Sender<u64>,
     tail_batch_prefill_calls: AtomicU64,
+    shape_policy_reads: AtomicU64,
 }
 
 impl std::ops::Deref for PlanRuntimeChunkedPrefillTestExecutor {
@@ -276,6 +278,7 @@ impl PlanRuntimeChunkedPrefillTestExecutor {
             prefix_retry: None,
             rendezvous: None,
             prompt_tail_reserve: None,
+            releases_sequence_capacity: false,
             observation: Arc::new(PlanRuntimeChunkedPrefillObservation {
                 tokens: ControlledTokenObservation(Arc::downgrade(&tokens)),
                 retained: std::sync::Mutex::new(HashSet::new()),
@@ -287,6 +290,7 @@ impl PlanRuntimeChunkedPrefillTestExecutor {
                 capacity_wait_registrations: AtomicU64::new(0),
                 capacity_signal,
                 tail_batch_prefill_calls: AtomicU64::new(0),
+                shape_policy_reads: AtomicU64::new(0),
             }),
         }
     }
@@ -431,20 +435,23 @@ impl ModelExecutor for PlanRuntimeChunkedPrefillTestExecutor {
     ) -> Result<bool> {
         controlled_token_fixture::release_sources(self, &self.tokens, sequence, sources)
     }
-    fn plan_prompt_tail_capture_boundary(
-        &self,
-        chunk: PrefillChunk,
-    ) -> Option<ferrum_execution::model_executor::PrefixCapturePlan> {
-        let boundary = chunk
-            .total_prompt_tokens()
-            .checked_sub(self.prompt_tail_reserve?)?;
-        if boundary <= chunk.tokens_processed() || boundary > chunk.end() {
-            return None;
-        }
-        Some(ferrum_execution::model_executor::PrefixCapturePlan {
-            boundary,
-            span: ferrum_runtime::CheckpointTokenSpanConstraint::any_positive(),
-        })
+    fn prefill_shape_policy(&self) -> ferrum_execution::model_executor::PrefillShapePolicy {
+        use ferrum_execution::model_executor::PrefillShapePolicy;
+        self.shape_policy_reads.fetch_add(1, Ordering::Relaxed);
+        let Some(reserve) = self.prompt_tail_reserve else {
+            return PrefillShapePolicy::Identity;
+        };
+        PrefillShapePolicy::PromptTail(
+            ferrum_runtime::CheckpointBoundaryConstraint::new(
+                ferrum_runtime::CheckpointTokenSpanConstraint::any_positive(),
+                ferrum_runtime::CheckpointTokenSpanConstraint::new(
+                    std::num::NonZeroU64::new(reserve as u64).unwrap(),
+                    std::num::NonZeroU64::MIN,
+                )
+                .unwrap(),
+            )
+            .unwrap(),
+        )
     }
 
     fn info(&self) -> &ferrum_types::ModelInfo {
@@ -529,10 +536,11 @@ impl ModelExecutor for PlanRuntimeChunkedPrefillTestExecutor {
         sources: &mut Vec<ferrum_runtime::CapacityAvailabilitySource>,
     ) -> Result<bool> {
         sources.clear();
-        if self
-            .prefix_retry
-            .as_ref()
-            .is_some_and(|state| state.release_capable(preemption.request_id()))
+        if self.releases_sequence_capacity
+            || self
+                .prefix_retry
+                .as_ref()
+                .is_some_and(|state| state.release_capable(preemption.request_id()))
         {
             sources.push(ferrum_runtime::CapacityAvailabilitySource::ActiveSequenceSlots);
             return Ok(true);
@@ -867,6 +875,9 @@ impl PlanRuntimeAdmissionTestExecutor {
 
 #[async_trait::async_trait]
 impl ModelExecutor for PlanRuntimeAdmissionTestExecutor {
+    fn prefill_shape_policy(&self) -> ferrum_execution::model_executor::PrefillShapePolicy {
+        ferrum_execution::model_executor::PrefillShapePolicy::Identity
+    }
     fn begin_shutdown(
         self: Arc<Self>,
         permit: &ferrum_execution::executor_lifecycle::ExecutorShutdownPermit,

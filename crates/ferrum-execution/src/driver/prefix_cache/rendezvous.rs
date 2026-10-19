@@ -1,7 +1,7 @@
 use super::*;
 use crate::model_executor::{
-    PrefixCaptureBoundary, PrefixCaptureLease, PrefixCapturePlan, PrefixCaptureRequest,
-    PrefixCaptureStatus,
+    PrefillShapePolicy, PrefixCaptureBoundary, PrefixCaptureLease, PrefixCapturePlan,
+    PrefixCaptureRequest, PrefixCaptureStatus,
 };
 
 pub(in super::super) struct NativePrefixCapture<R: DeviceRuntime> {
@@ -73,21 +73,12 @@ pub(super) fn select_boundary(
     })
 }
 
-pub(super) fn select_prompt_tail_boundary(
-    layout: &SequenceCheckpointLayout,
-    chunk: PrefillChunk,
-) -> Option<PrefixCapturePlan> {
-    let boundary = layout.prompt_tail_boundary(
-        chunk.tokens_processed() as u64,
-        chunk.total_prompt_tokens() as u64,
-    )?;
-    if boundary > chunk.end() as u64 {
-        return None;
-    }
-    Some(PrefixCapturePlan {
-        boundary: usize::try_from(boundary).ok()?,
-        span: layout.capture_span_constraint(),
-    })
+pub(super) fn prefill_policy(plan: &ExecutionPlan) -> PrefillShapePolicy {
+    usable_layout(plan)
+        .filter(|layout| layout.input_dependency() == CheckpointInputDependency::ExactTokenPrefix)
+        .map_or(PrefillShapePolicy::Identity, |layout| {
+            PrefillShapePolicy::PromptTail(layout.boundary_constraint())
+        })
 }
 
 /// An already completed immutable source retained across target capacity
@@ -118,11 +109,8 @@ impl<R: DeviceRuntime> PrefixCaptureLease for RetainedRestoreCheckpoint<R> {
 }
 
 impl<R: DeviceRuntime> ProgramExecutor<R> {
-    pub(in super::super) fn prompt_tail_boundary(
-        &self,
-        chunk: PrefillChunk,
-    ) -> Option<PrefixCapturePlan> {
-        select_prompt_tail_boundary(usable_layout(self.resolved_plan.execution_plan())?, chunk)
+    pub(in super::super) fn compiled_prefill_shape_policy(&self) -> PrefillShapePolicy {
+        prefill_policy(self.resolved_plan.execution_plan())
     }
 
     pub(super) fn retain_restore_checkpoint(

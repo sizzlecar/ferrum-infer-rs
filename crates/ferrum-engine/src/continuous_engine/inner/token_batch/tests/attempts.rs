@@ -18,7 +18,6 @@ fn timing() -> Option<TokenExecutionTiming> {
 fn plan_full_prompt(inputs: &mut [TokenBatchInput]) {
     for input in inputs {
         input.work = TokenWork::Prefill(PrefillChunk::new(0, 2, 2).unwrap());
-        input.scheduled_tokens = 2;
     }
 }
 

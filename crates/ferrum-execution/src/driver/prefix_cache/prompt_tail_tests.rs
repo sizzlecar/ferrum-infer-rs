@@ -1,4 +1,5 @@
 use super::*;
+use crate::model_executor::PrefillShapePolicy;
 use checkpoint_fixture::{Fixture, Spec};
 use std::num::NonZeroU64;
 
@@ -60,23 +61,28 @@ fn prompt_tail_planner_only_splits_the_chunk_that_reaches_the_boundary() {
     })
     .unwrap();
     let layout = usable_layout(&fixture.plan).unwrap();
-    assert!(
-        rendezvous::select_prompt_tail_boundary(layout, PrefillChunk::new(0, 4, 13).unwrap())
-            .is_none()
+    let policy = rendezvous::prefill_policy(&fixture.plan);
+    assert_eq!(
+        policy,
+        PrefillShapePolicy::PromptTail(layout.boundary_constraint())
     );
+    let early = PrefillChunk::new(0, 4, 13).unwrap();
+    assert_eq!(policy.project(early, true).unwrap().chunk(), early);
     // The required suffix is four tokens, so the useful cut precedes the final
     // natural chunk rather than always subtracting one token from the prompt.
-    let plan =
-        rendezvous::select_prompt_tail_boundary(layout, PrefillChunk::new(8, 4, 13).unwrap())
-            .unwrap();
-    assert_eq!(plan.boundary, 9);
-    assert_eq!(plan.span, CheckpointTokenSpanConstraint::any_positive());
+    let plan = policy
+        .project(PrefillChunk::new(8, 4, 13).unwrap(), true)
+        .unwrap();
+    assert_eq!(plan.chunk(), PrefillChunk::new(8, 1, 13).unwrap());
+    assert!(plan.is_exact());
+    assert_eq!(
+        layout.capture_span_constraint(),
+        CheckpointTokenSpanConstraint::any_positive()
+    );
     let retired_tail = PrefillChunk::new(8, 1, 13).unwrap();
     assert_eq!(
-        rendezvous::select_prompt_tail_boundary(layout, retired_tail)
-            .unwrap()
-            .boundary,
-        9
+        policy.project(retired_tail, true).unwrap().chunk(),
+        retired_tail
     );
     assert!(
         !capture_candidate(retired_tail),
@@ -87,10 +93,8 @@ fn prompt_tail_planner_only_splits_the_chunk_that_reaches_the_boundary() {
         layout,
         PrefillChunk::new(9, 4, 13).unwrap()
     ));
-    assert!(
-        rendezvous::select_prompt_tail_boundary(layout, PrefillChunk::new(9, 4, 13).unwrap())
-            .is_none()
-    );
+    let suffix = PrefillChunk::new(9, 4, 13).unwrap();
+    assert_eq!(policy.project(suffix, true).unwrap().chunk(), suffix);
 }
 
 #[test]
@@ -114,9 +118,9 @@ fn prompt_tail_planner_requires_usable_prefix_capability() {
         },
     ] {
         let fixture = Fixture::build(spec).unwrap();
-        let plan = usable_layout(&fixture.plan).and_then(|layout| {
-            rendezvous::select_prompt_tail_boundary(layout, PrefillChunk::new(0, 8, 8).unwrap())
-        });
-        assert!(plan.is_none());
+        assert_eq!(
+            rendezvous::prefill_policy(&fixture.plan),
+            PrefillShapePolicy::Identity
+        );
     }
 }

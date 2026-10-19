@@ -5,6 +5,7 @@ use crate::cost_prediction::*;
 use ferrum_execution::execution_attempt::{
     AttemptPrefixRestore, AttemptWorkKind, ExecutionAttemptSummary,
 };
+use ferrum_execution::model_executor::{PrefillChunk, PrefillShapePolicy};
 use ferrum_execution::token_execution::ExecutionRange;
 use ferrum_types::{CostFallback, UnknownCostPolicy};
 
@@ -184,9 +185,10 @@ impl ContinuousBatchScheduler {
         request: &ContinuousBatchRequest,
         tokens: usize,
         decode: bool,
+        shape_policy: PrefillShapePolicy,
     ) -> Option<(CostWork, bool)> {
         let original_prompt = self.prompt_token_estimate(request);
-        let (start, context_tokens, exact) = if decode {
+        let (start, context_tokens, mut exact) = if decode {
             // Prefill samples the first output before the scheduler records a
             // decode count. Later counts include that first sampled token.
             // Engine's attempt context includes the current input token, while
@@ -216,7 +218,27 @@ impl ContinuousBatchScheduler {
                     && !(request.capacity_deferred_from_decode && request.prefill_tokens == 0),
             )
         };
-        let requested = ExecutionRange::new(start, tokens).ok()?;
+        let mut requested = ExecutionRange::new(start, tokens).ok()?;
+        exact &= decode || requested.end() <= context_tokens;
+        if !decode && exact {
+            // Recompute from the current queue frontier each time. A restore,
+            // re-admission or completed chunk can change this scope while the
+            // same immutable cost snapshot remains in use. An estimated prompt
+            // length cannot authorize projecting a checkpoint boundary.
+            // A capacity victim may still be an unsampled prefill. Queue
+            // re-entry is not evidence that its causal context has outputs.
+            let original_prompt = !request.slo_first_token_emitted;
+            let projected = shape_policy
+                .project(
+                    PrefillChunk::new(start, tokens, context_tokens).ok()?,
+                    original_prompt,
+                )
+                .ok()?;
+            let chunk = projected.chunk();
+            requested =
+                ExecutionRange::new(chunk.tokens_processed(), chunk.tokens_to_process()).ok()?;
+            exact &= projected.is_exact();
+        }
         let restored = request.prefix_restore.restored_tokens();
         Some((
             CostWork {
@@ -234,7 +256,7 @@ impl ContinuousBatchScheduler {
                 },
                 internally_reused_tokens: None,
             },
-            exact && (decode || requested.end() <= context_tokens),
+            exact,
         ))
     }
 
@@ -244,8 +266,10 @@ impl ContinuousBatchScheduler {
         planning: &mut TimePlanningRound,
         now: Instant,
     ) -> TimeDecision {
-        let tokens = self.remaining_prefill_tokens(request).max(1);
-        let prediction = self.cost_work(request, tokens, false).map_or(
+        let maximum = self.remaining_prefill_tokens(request).max(1);
+        let projected = self.cost_work(request, maximum, false, planning.prefill_shape_policy);
+        let tokens = projected.map_or(maximum, |(work, _)| work.requested.as_range().len());
+        let prediction = projected.map_or(
             CostPrediction::Unknown(CostUnknownReason::InexactWork),
             |(work, exact)| planning.predict(&[work], exact, now),
         );
@@ -264,7 +288,10 @@ impl ContinuousBatchScheduler {
         planning: &mut TimePlanningRound,
         now: Instant,
     ) -> TimeDecision {
-        let mut tokens = maximum;
+        let projected_maximum = self
+            .cost_work(request, maximum, false, planning.prefill_shape_policy)
+            .map_or(maximum, |(work, _)| work.requested.as_range().len());
+        let mut tokens = projected_maximum;
         let has_decode = planning
             .selected
             .iter()
@@ -280,7 +307,11 @@ impl ContinuousBatchScheduler {
         };
         let target = Duration::try_from_secs_f64(target_ms / 1000.0).unwrap_or(Duration::ZERO);
         loop {
-            let prediction = self.cost_work(request, tokens, false).map_or(
+            let projected = self.cost_work(request, tokens, false, planning.prefill_shape_policy);
+            // Halving starts from actual projected work, never an unexecuted
+            // nominal span beyond a checkpoint. Projection is idempotent.
+            tokens = projected.map_or(tokens, |(work, _)| work.requested.as_range().len());
+            let prediction = projected.map_or(
                 CostPrediction::Unknown(CostUnknownReason::InexactWork),
                 |(work, exact)| planning.candidate_prediction(work, exact, now),
             );
@@ -288,7 +319,7 @@ impl ContinuousBatchScheduler {
                 CostPrediction::Known {
                     upper_service_time, ..
                 } if upper_service_time <= target => {
-                    planning.statistics.shrunk_prefills += u64::from(tokens < maximum);
+                    planning.statistics.shrunk_prefills += u64::from(tokens < projected_maximum);
                     return TimeDecision::Allow(tokens);
                 }
                 CostPrediction::Known { .. } if tokens > 1 => {
@@ -303,7 +334,7 @@ impl ContinuousBatchScheduler {
                     // singleton's cost. Keep one-token progress; when peers
                     // already run, defer only this addition to their next turn.
                     if planning.selected.is_empty() && !planning.selected_over_limit {
-                        planning.statistics.shrunk_prefills += u64::from(maximum > 1);
+                        planning.statistics.shrunk_prefills += u64::from(projected_maximum > 1);
                         return TimeDecision::Allow(1);
                     }
                     planning.time_blocked = true;
@@ -315,7 +346,7 @@ impl ContinuousBatchScheduler {
                     // smaller combination's cost. Static fallback can defer
                     // this addition while its already-selected peers advance;
                     // explicit Reject/Wait retain their declared semantics.
-                    if tokens < maximum
+                    if tokens < projected_maximum
                         && !planning.selected.is_empty()
                         && matches!(
                             planning.config.unknown_cost,
@@ -327,7 +358,8 @@ impl ContinuousBatchScheduler {
                         return TimeDecision::Hold;
                     }
                     let decision = planning.unknown(reason, request, tokens, now);
-                    if matches!(decision, TimeDecision::Allow(allowed) if allowed < maximum) {
+                    if matches!(decision, TimeDecision::Allow(allowed) if allowed < projected_maximum)
+                    {
                         planning.statistics.shrunk_prefills += 1;
                     }
                     return decision;
@@ -352,7 +384,7 @@ impl ContinuousBatchScheduler {
             }
             let tokens = self.remaining_prefill_tokens(request).max(1);
             let estimate = self
-                .cost_work(request, tokens, false)
+                .cost_work(request, tokens, false, planning.prefill_shape_policy)
                 .and_then(
                     |(work, exact)| match planning.predict(&[work], exact, now) {
                         CostPrediction::Known {

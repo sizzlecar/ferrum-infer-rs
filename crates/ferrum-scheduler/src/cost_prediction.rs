@@ -2,6 +2,7 @@
 //! authorize execution nor certify client-visible latency percentiles.
 
 use ferrum_execution::execution_attempt::{AttemptPrefixRestore, AttemptWorkKind};
+use ferrum_execution::model_executor::PrefillShapePolicy;
 use ferrum_execution::token_execution::ExecutionRange;
 use ferrum_interfaces::BatchPlan;
 use ferrum_types::SchedulerSloConfig;
@@ -65,6 +66,7 @@ pub trait CostSnapshotSource: Send + Sync {
 pub struct TimePlanningRound {
     pub(crate) snapshot: Arc<dyn CostSnapshot>,
     pub(crate) config: SchedulerSloConfig,
+    pub(crate) prefill_shape_policy: PrefillShapePolicy,
     pub(crate) retry_at: Option<Instant>,
     pub(crate) time_blocked: bool,
     pub(crate) statistics: PlanningStatistics,
@@ -74,10 +76,15 @@ pub struct TimePlanningRound {
 }
 
 impl TimePlanningRound {
-    pub fn new(snapshot: Arc<dyn CostSnapshot>, config: SchedulerSloConfig) -> Self {
+    pub fn new(
+        snapshot: Arc<dyn CostSnapshot>,
+        config: SchedulerSloConfig,
+        prefill_shape_policy: PrefillShapePolicy,
+    ) -> Self {
         Self {
             snapshot,
             config,
+            prefill_shape_policy,
             retry_at: None,
             time_blocked: false,
             statistics: PlanningStatistics::default(),
@@ -95,6 +102,14 @@ impl TimePlanningRound {
     }
     pub fn time_blocked(&self) -> bool {
         self.time_blocked
+    }
+    /// Whether the complete selected batch was represented by exact projected
+    /// work. An incomplete or over-limit query cannot authorize range checks.
+    pub fn selection_is_exact(&self, selected_count: usize) -> bool {
+        selected_count > 0
+            && self.selected_exact
+            && !self.selected_over_limit
+            && self.selected.len() == selected_count
     }
 }
 

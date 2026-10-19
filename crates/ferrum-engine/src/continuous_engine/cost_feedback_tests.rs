@@ -4,7 +4,7 @@
 use super::*;
 use crate::continuous_engine::attempt_observation_tests::AttemptRecorder;
 use ferrum_scheduler::cost_prediction::{
-    CostPrediction, CostQuery, CostSnapshot, CostUnknownReason,
+    CostPrediction, CostQuery, CostSnapshot, CostUnknownReason, CostWork,
 };
 use tokio::sync::watch;
 
@@ -13,6 +13,7 @@ struct Snapshot {
     known: bool,
     created: Instant,
     queries: Arc<Mutex<Vec<u64>>>,
+    work_queries: Arc<Mutex<Vec<(u64, Vec<CostWork>)>>>,
     queried: Arc<Notify>,
 }
 
@@ -25,6 +26,9 @@ impl CostSnapshot for Snapshot {
         assert!(query.work_is_exact);
         assert!(!query.work.is_empty());
         self.queries.lock().push(self.revision);
+        self.work_queries
+            .lock()
+            .push((self.revision, query.work.to_vec()));
         self.queried.notify_one();
         if self.known {
             CostPrediction::Known {
@@ -39,19 +43,21 @@ impl CostSnapshot for Snapshot {
     }
 }
 
-struct Source {
+pub(super) struct Source {
     current: Mutex<Arc<dyn CostSnapshot>>,
     publication: Mutex<Option<watch::Sender<u64>>>,
     queries: Arc<Mutex<Vec<u64>>>,
+    work_queries: Arc<Mutex<Vec<(u64, Vec<CostWork>)>>>,
     queried: Arc<Notify>,
     loads: AtomicU64,
     subscriptions: AtomicU64,
-    replace_after_load: AtomicBool,
+    pub(super) replace_after_load: AtomicBool,
 }
 
 impl Source {
-    fn new(known: bool) -> Arc<Self> {
+    pub(super) fn new(known: bool) -> Arc<Self> {
         let queries = Arc::new(Mutex::new(Vec::new()));
+        let work_queries = Arc::new(Mutex::new(Vec::new()));
         let queried = Arc::new(Notify::new());
         let (publication, _) = watch::channel(1);
         Arc::new(Self {
@@ -60,15 +66,25 @@ impl Source {
                 known,
                 created: Instant::now(),
                 queries: Arc::clone(&queries),
+                work_queries: Arc::clone(&work_queries),
                 queried: queried.clone(),
             })),
             publication: Mutex::new(Some(publication)),
             queries,
+            work_queries,
             queried,
             loads: AtomicU64::new(0),
             subscriptions: AtomicU64::new(0),
             replace_after_load: AtomicBool::new(false),
         })
+    }
+
+    pub(super) fn take_work_queries(&self) -> Vec<(u64, Vec<CostWork>)> {
+        std::mem::take(&mut *self.work_queries.lock())
+    }
+
+    pub(super) fn load_count(&self) -> u64 {
+        self.loads.load(Ordering::Relaxed)
     }
 
     fn publish(&self, revision: u64, known: bool) {
@@ -77,6 +93,7 @@ impl Source {
             known,
             created: Instant::now(),
             queries: Arc::clone(&self.queries),
+            work_queries: Arc::clone(&self.work_queries),
             queried: self.queried.clone(),
         });
         if let Some(publication) = self.publication.lock().as_ref() {
@@ -146,7 +163,7 @@ fn engine(
     (engine, observation, tokenizer)
 }
 
-async fn submit(
+pub(super) async fn submit(
     engine: &ContinuousBatchEngine,
     tokenizer: &Arc<dyn Tokenizer + Send + Sync>,
     prompt: &str,

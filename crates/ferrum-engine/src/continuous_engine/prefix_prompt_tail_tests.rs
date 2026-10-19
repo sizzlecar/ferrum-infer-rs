@@ -4,7 +4,7 @@ use super::*;
 
 #[tokio::test]
 async fn prompt_tail_single_prefill_samples_only_after_the_remaining_suffix() {
-    for reserve in [None, Some(1), Some(2)] {
+    for reserve in [None, Some(1), Some(2), Some(4)] {
         let trace_path = resource_trace_temp_path("prompt-tail-planning");
         let mut config = EngineConfig::default();
         config.scheduler.max_running_requests = 1;
@@ -77,6 +77,415 @@ async fn prompt_tail_single_prefill_samples_only_after_the_remaining_suffix() {
         engine.shutdown().await.unwrap();
         std::fs::remove_file(trace_path).unwrap();
     }
+}
+
+#[tokio::test]
+async fn prompt_tail_time_planning_matches_submitted_ranges_without_capacity_feedback() {
+    use super::cost_feedback_tests::Source;
+    use crate::continuous_engine::attempt_observation_tests::AttemptRecorder;
+    use ferrum_execution::execution_attempt::ExecutionAttemptEligibility;
+    use ferrum_scheduler::cost_prediction::CostWork;
+
+    let mut baseline = None;
+    for enabled in [false, true] {
+        let mut config = EngineConfig::default();
+        config.runtime.profile_detail = ObservabilityProfileDetail::Off;
+        config.scheduler.max_running_requests = 1;
+        if enabled {
+            config.scheduler.slo = Some("ttft:1000,tpot:100,itl:100".parse().unwrap());
+        }
+        let source = Source::new(true);
+        let recorder = Arc::new(AttemptRecorder::default());
+        let scheduler = Arc::new(ContinuousBatchScheduler::new(config.scheduler.clone()));
+        let mut implementation = PlanRuntimeChunkedPrefillTestExecutor::new(false);
+        implementation.prompt_tail_reserve = Some(4);
+        let observation = implementation.observer();
+        let engine = ContinuousBatchEngine::new_plan_runtime_observed(
+            config,
+            scheduler.clone(),
+            Arc::new(ferrum_testkit::MockTokenizer::new(128)),
+            Arc::new(ferrum_testkit::MockSampler),
+            ExecutorOwner::new(Box::new(implementation)),
+            Arc::new(MockTensorFactory),
+            None,
+            Some(recorder.clone()),
+            enabled.then(|| source.clone() as Arc<dyn CostSnapshotSource>),
+        )
+        .unwrap();
+        let mut request = policy_request();
+        request.prompt = "one two three four".into();
+        request.sampling_params.max_tokens = 1;
+        let response = tokio::time::timeout(Duration::from_secs(2), engine.infer(request))
+            .await
+            .unwrap()
+            .unwrap();
+        let output = (
+            response.response().tokens.clone(),
+            response.response().text.clone(),
+            response.response().finish_reason.clone(),
+        );
+        if let Some(baseline) = &baseline {
+            assert_eq!(&output, baseline);
+        } else {
+            baseline = Some(output);
+        }
+        assert_eq!(
+            *observation.attempted_chunks.lock().unwrap(),
+            [
+                PrefillChunk::new(0, 1, 5).unwrap(),
+                PrefillChunk::new(1, 4, 5).unwrap(),
+            ],
+            "a planned one-token boundary must not impose a one-token capacity ceiling"
+        );
+        let summaries = recorder.take();
+        assert_eq!(summaries.len(), 2);
+        let actual = summaries
+            .iter()
+            .map(|summary| {
+                assert_eq!(summary.eligibility, ExecutionAttemptEligibility::Completed);
+                assert_eq!(summary.participants.len(), 1);
+                let participant = &summary.participants[0];
+                CostWork {
+                    kind: participant.kind,
+                    requested: participant.requested,
+                    context_tokens: participant.context_tokens,
+                    prefix_restore: participant.prefix_restore,
+                    internally_reused_tokens: participant.internally_reused_tokens,
+                }
+            })
+            .collect::<Vec<_>>();
+        let queries = source.take_work_queries();
+        if enabled {
+            assert!(source.load_count() >= 2);
+            // Admission candidates need not execute, but every actual selected
+            // shape must have been priced, including the unfragmented suffix.
+            for work in actual {
+                assert!(queries.iter().any(|(_, candidate)| candidate == &[work]));
+            }
+            for (_, candidate) in queries {
+                assert_eq!(candidate.len(), 1);
+                let range = candidate[0].requested;
+                assert!(
+                    (range.start() == 0 && range.end() == 1)
+                        || (range.start() == 1 && range.end() == 5)
+                );
+            }
+            assert_eq!(
+                serde_json::to_value(scheduler.slo_snapshot().unwrap()).unwrap()["shrunk_prefills"],
+                0
+            );
+        } else {
+            assert_eq!(source.load_count(), 0);
+            assert!(queries.is_empty());
+        }
+        assert_eq!(
+            observation
+                .capacity_wait_registrations
+                .load(Ordering::Relaxed),
+            0
+        );
+        engine.shutdown().await.unwrap();
+        engine.wait_for_shutdown_completion().await.unwrap();
+        assert!(observation.retained.lock().unwrap().is_empty());
+        assert!(observation.tokens.0.upgrade().is_none());
+    }
+}
+
+async fn yield_original_capacity_owner(
+    engine: &ContinuousBatchEngine,
+    observation: &PlanRuntimeChunkedPrefillObservation,
+    id: &RequestId,
+    progress_peer: Option<&RequestId>,
+) -> ExecutorSequence {
+    use ferrum_runtime::CapacityWaitCondition;
+    let inner = engine.active_inner().unwrap();
+    let original = observation.tokens.frontier_for_request(id).unwrap();
+    let mut availability = Vec::new();
+    let epochs = inner
+        .model_executor
+        .write_execution_capacity_snapshot(&mut availability)
+        .unwrap()
+        .unwrap();
+    let condition =
+        CapacityWaitCondition::from_observation(epochs.coordinator_id.get(), availability).unwrap();
+    let release = inner.execution_capacity_release_snapshot().unwrap();
+    let deferral = AdmissionDeferral::new(
+        DeferredAction::WaitForRelease,
+        AdmissionWakeEpochs::new(
+            epochs.coordinator_id,
+            epochs.release_epoch,
+            epochs.capacity_epoch,
+            0,
+        ),
+        condition,
+    );
+    if let Some(peer) = progress_peer {
+        assert_eq!(
+            engine.scheduler.trace_phase(peer),
+            Some(RequestPhase::Decoding)
+        );
+        assert_eq!(
+            engine
+                .scheduler
+                .defer_decode_for_execution_capacity(
+                    std::slice::from_ref(peer),
+                    deferral.clone(),
+                    &release,
+                )
+                .unwrap(),
+            ExecutionCapacityAction::Deferred { count: 1 }
+        );
+    }
+    let action = match engine.scheduler.trace_phase(id).unwrap() {
+        RequestPhase::Prefilling => engine
+            .scheduler
+            .defer_prefill_for_execution_capacity(id, deferral, &release),
+        RequestPhase::Decoding => engine.scheduler.defer_decode_for_execution_capacity(
+            std::slice::from_ref(id),
+            deferral,
+            &release,
+        ),
+        phase => panic!("capacity fixture requires an active phase, got {phase:?}"),
+    }
+    .unwrap();
+    let ExecutionCapacityAction::YieldPlanned { transaction } = action else {
+        panic!("the blocked source must yield its actual incarnation, got {action:?}");
+    };
+    assert_eq!(transaction.victim_request_id(), id);
+    assert_eq!(transaction.progress_owner_id(), progress_peer.unwrap_or(id));
+    engine
+        .scheduler
+        .arm_execution_capacity_yield(&transaction)
+        .unwrap();
+    let ticket = inner
+        .begin_execution_recompute(transaction, 1, None)
+        .unwrap();
+    ticket.initial_result().await.unwrap();
+    inner.execution_closes.join_observers().await;
+    assert!(original.sequence().observed_end().is_some());
+    // This controlled backend advances its original source only after the
+    // actual close observer confirms Ended. No unproved release is announced.
+    observation.publish_release();
+    inner.drain_execution_closes().unwrap();
+    if let Some(peer) = progress_peer {
+        // A prefill frontier is a peer victim, never a no-progress self
+        // recompute. Retire the actual progress owner before readmitting it.
+        let peer_sequence = observation.tokens.frontier_for_request(peer).unwrap();
+        inner
+            .complete_request_for_test(peer, FinishReason::Cancelled)
+            .await
+            .unwrap();
+        inner.output_tasks.join_current().await;
+        inner.execution_closes.join_observers().await;
+        inner.drain_execution_closes().unwrap();
+        assert!(peer_sequence.sequence().observed_end().is_some());
+        assert!(observation.tokens.frontier_for_request(peer).is_none());
+    }
+    assert_eq!(
+        engine.scheduler.trace_phase(id),
+        Some(RequestPhase::Waiting)
+    );
+    original.sequence().clone()
+}
+
+#[tokio::test]
+async fn prompt_tail_capacity_requeue_distinguishes_before_and_after_first_output() {
+    use super::cost_feedback_tests::{submit, Source};
+    use crate::continuous_engine::attempt_observation_tests::AttemptRecorder;
+
+    let mut config = EngineConfig::default();
+    config.runtime.profile_detail = ObservabilityProfileDetail::Off;
+    config.scheduler.max_running_requests = 2;
+    config.scheduler.prefill_step_chunk = Some(2);
+    config.scheduler.slo = Some("ttft:1000,tpot:100,itl:100".parse().unwrap());
+    let source = Source::new(true);
+    let recorder = Arc::new(AttemptRecorder::default());
+    let tokenizer: Arc<dyn Tokenizer + Send + Sync> =
+        Arc::new(ferrum_testkit::MockTokenizer::new(128));
+    let mut implementation = PlanRuntimeChunkedPrefillTestExecutor::new(false);
+    implementation.prompt_tail_reserve = Some(2);
+    implementation.releases_sequence_capacity = true;
+    let observation = implementation.observer();
+    let engine = ContinuousBatchEngine::new_plan_runtime_observed(
+        config.clone(),
+        Arc::new(ContinuousBatchScheduler::new(config.scheduler)),
+        tokenizer.clone(),
+        Arc::new(ferrum_testkit::MockSampler),
+        ExecutorOwner::new(Box::new(implementation)),
+        Arc::new(MockTensorFactory),
+        None,
+        Some(recorder.clone()),
+        Some(source.clone()),
+    )
+    .unwrap();
+    let id = submit(&engine, &tokenizer, "one two three four").await;
+    let peer = submit(&engine, &tokenizer, "peer").await;
+    let inner = engine.active_inner().unwrap();
+    inner.run_iteration().await.unwrap();
+    assert_eq!(
+        observation
+            .tokens
+            .frontier_for_request(&id)
+            .unwrap()
+            .consumed_tokens(),
+        2
+    );
+    assert!(inner
+        .sequences
+        .get(&id)
+        .unwrap()
+        .lock()
+        .as_ref()
+        .unwrap()
+        .generated_tokens
+        .is_empty());
+    assert_eq!(
+        inner
+            .sequences
+            .get(&peer)
+            .unwrap()
+            .lock()
+            .as_ref()
+            .unwrap()
+            .generated_tokens
+            .len(),
+        1
+    );
+    let original = yield_original_capacity_owner(&engine, &observation, &id, Some(&peer)).await;
+    {
+        let handle = inner.sequences.get(&id).unwrap();
+        let state = handle.lock();
+        let sequence = state.as_ref().unwrap();
+        assert!(sequence.execution_frontier.is_none());
+        assert!(sequence.generated_tokens.is_empty());
+        assert_eq!(sequence.prefill_tokens_processed, 0);
+    }
+    drop(source.take_work_queries());
+    drop(recorder.take());
+    inner.run_iteration().await.unwrap();
+    let replacement = observation.tokens.frontier_for_request(&id).unwrap();
+    assert_ne!(replacement.sequence(), &original);
+    assert_eq!(replacement.consumed_tokens(), 2);
+    assert!(replacement.sequence().observed_end().is_none());
+    assert!(
+        source.take_work_queries().is_empty(),
+        "the recompute without resolved scheduler context must remain Unknown"
+    );
+    let samples = recorder.take();
+    assert_eq!(samples.len(), 1);
+    assert_eq!(samples[0].participants[0].requested.as_range(), 0..2);
+    let statistics = serde_json::to_value(engine.scheduler.slo_snapshot().unwrap()).unwrap();
+    assert!(statistics["static_fallbacks"].as_u64().unwrap() > 0);
+    inner.run_iteration().await.unwrap();
+    let resumed = observation.tokens.frontier_for_request(&id).unwrap();
+    assert_eq!(resumed.sequence(), replacement.sequence());
+    assert_eq!(resumed.consumed_tokens(), 3);
+    assert!(
+        source
+            .take_work_queries()
+            .iter()
+            .any(|(_, work)| work.len() == 1 && work[0].requested.as_range() == (2..3)),
+        "resolved context after requeue still belongs to the unsampled original prompt"
+    );
+    inner.run_iteration().await.unwrap();
+    let final_frontier = observation.tokens.frontier_for_request(&id).unwrap();
+    assert_eq!(final_frontier.sequence(), replacement.sequence());
+    assert_eq!(final_frontier.consumed_tokens(), 5);
+    assert_eq!(
+        observation
+            .attempted_chunks
+            .lock()
+            .unwrap()
+            .iter()
+            .copied()
+            .filter(|chunk| chunk.total_prompt_tokens() == 5)
+            .collect::<Vec<_>>(),
+        [
+            PrefillChunk::new(0, 2, 5).unwrap(),
+            PrefillChunk::new(0, 2, 5).unwrap(),
+            PrefillChunk::new(2, 1, 5).unwrap(),
+            PrefillChunk::new(3, 2, 5).unwrap(),
+        ]
+    );
+    assert_eq!(
+        inner
+            .sequences
+            .get(&id)
+            .unwrap()
+            .lock()
+            .as_ref()
+            .unwrap()
+            .generated_tokens
+            .len(),
+        1
+    );
+
+    // A real decode commits a second generated token. After this owner's
+    // retirement, replaying P+G=7 is not an original prompt-tail candidate.
+    inner.run_iteration().await.unwrap();
+    assert_eq!(
+        inner
+            .sequences
+            .get(&id)
+            .unwrap()
+            .lock()
+            .as_ref()
+            .unwrap()
+            .generated_tokens
+            .len(),
+        2
+    );
+    let emitted_owner = yield_original_capacity_owner(&engine, &observation, &id, None).await;
+    assert_eq!(&emitted_owner, replacement.sequence());
+    drop(source.take_work_queries());
+    drop(recorder.take());
+    for expected in [2, 4, 6] {
+        inner.run_iteration().await.unwrap();
+        assert_eq!(
+            observation
+                .tokens
+                .frontier_for_request(&id)
+                .unwrap()
+                .consumed_tokens(),
+            expected
+        );
+    }
+    let replay = observation.tokens.frontier_for_request(&id).unwrap();
+    assert_ne!(replay.sequence(), &emitted_owner);
+    let queries = source.take_work_queries();
+    assert!(
+        queries.iter().any(|(_, work)| work.len() == 1
+            && work[0].context_tokens == 7
+            && work[0].requested.as_range() == (4..6)),
+        "actual prior output must prevent a spurious prompt-tail cut at token 5"
+    );
+    inner.run_iteration().await.unwrap();
+    inner.output_tasks.join_current().await;
+    inner.execution_closes.join_observers().await;
+    inner.drain_execution_closes().unwrap();
+    assert_eq!(
+        observation
+            .attempted_chunks
+            .lock()
+            .unwrap()
+            .iter()
+            .copied()
+            .filter(|chunk| chunk.total_prompt_tokens() == 7)
+            .collect::<Vec<_>>(),
+        [
+            PrefillChunk::new(0, 2, 7).unwrap(),
+            PrefillChunk::new(2, 2, 7).unwrap(),
+            PrefillChunk::new(4, 2, 7).unwrap(),
+            PrefillChunk::new(6, 1, 7).unwrap(),
+        ]
+    );
+    assert!(replay.sequence().observed_end().is_some());
+    drop(inner);
+    engine.shutdown().await.unwrap();
+    engine.wait_for_shutdown_completion().await.unwrap();
+    assert!(replacement.sequence().observed_end().is_some());
+    assert!(observation.tokens.0.upgrade().is_none());
+    assert!(observation.retained.lock().unwrap().is_empty());
 }
 
 #[tokio::test]

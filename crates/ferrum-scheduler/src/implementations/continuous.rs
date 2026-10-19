@@ -3749,7 +3749,12 @@ impl ContinuousBatchScheduler {
 
             if *total_tokens + prefill_chunk_tokens <= hint.max_tokens {
                 if let Some(round) = planning.as_deref_mut() {
-                    round.selected_work(self.cost_work(req, prefill_chunk_tokens, false));
+                    round.selected_work(self.cost_work(
+                        req,
+                        prefill_chunk_tokens,
+                        false,
+                        round.prefill_shape_policy,
+                    ));
                 }
                 let mut scheduled = req.inner.clone();
                 scheduled.tokens_processed = req.prefill_chunk_offset;
@@ -4071,7 +4076,7 @@ impl ContinuousBatchScheduler {
 
             let mut scheduled = req.inner.clone();
             if let Some(round) = planning.as_deref_mut() {
-                round.selected_work(self.cost_work(req, 1, true));
+                round.selected_work(self.cost_work(req, 1, true, round.prefill_shape_policy));
             }
             scheduled.tokens_processed = req.total_tokens();
             scheduled.tokens_to_process = Some(1);
@@ -4418,18 +4423,25 @@ impl ContinuousBatchScheduler {
 
         // Promote to decode
         self.promote_to_decode(request_id);
-        if self.config.slo.is_some() {
-            if let Some(request) = self.decode_queue.write().requests.get_mut(request_id) {
-                // Legacy chunked prefill may already have promoted the request;
-                // record the first output here, after sampling actually finished.
-                request.slo_first_token_emitted = true;
-            }
-        }
+        self.mark_first_token_emitted(request_id);
         if found {
             if let Some(progress) = progress {
                 self.record_pressure_frontier_progress(request_id, progress);
             }
             self.record_resource_progress();
+        }
+    }
+
+    /// Record a successfully committed output token after scheduler progress
+    /// publication. Final prefill work alone does not prove sampling succeeded.
+    /// The marker survives requeue and distinguishes original prompt replay
+    /// from a causal context that includes generated output.
+    pub fn mark_first_token_emitted(&self, request_id: &RequestId) {
+        if self.config.slo.is_none() {
+            return;
+        }
+        if let Some(request) = self.decode_queue.write().requests.get_mut(request_id) {
+            request.slo_first_token_emitted = true;
         }
     }
 

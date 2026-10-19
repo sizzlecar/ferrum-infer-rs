@@ -2,7 +2,7 @@
 
 use super::*;
 use ferrum_execution::{
-    model_executor::PrefillChunk,
+    model_executor::{PrefillChunk, PrefillShapePolicy},
     token_execution::{
         ContinuationDisposition, ExecutionBatchOutcome, ExecutionCloseOutcome,
         ExecutionContractViolation, ExecutionFrontier, ExecutionInterruptionCause,
@@ -28,7 +28,6 @@ struct TokenBatchInput {
     frontier: ExecutionFrontier,
     work: TokenWork,
     logits_policy: LogitsReturnPolicy,
-    scheduled_tokens: usize,
     context_tokens: usize,
 }
 
@@ -73,7 +72,12 @@ struct TokenDeferredGroup {
 }
 
 impl EngineInner {
-    fn prepare_token_batch(&self, batch: &ferrum_interfaces::BatchPlan) -> PreparedTokenBatch {
+    fn prepare_token_batch(
+        &self,
+        batch: &ferrum_interfaces::BatchPlan,
+        shape_policy: PrefillShapePolicy,
+        already_projected: bool,
+    ) -> PreparedTokenBatch {
         let mut inputs = Vec::with_capacity(batch.requests.len());
         let mut failures = Vec::new();
         for scheduled in &batch.requests {
@@ -152,9 +156,15 @@ impl EngineInner {
             };
             let prepared = prepared.and_then(|(context_tokens, generated_empty, work, policy)| {
                 let work = match work {
-                    TokenWork::Prefill(chunk) => TokenWork::Prefill(
-                        self.plan_prompt_tail_prefill_chunk(request_id, chunk, generated_empty)?,
-                    ),
+                    TokenWork::Prefill(chunk) => {
+                        TokenWork::Prefill(self.plan_prompt_tail_prefill_chunk(
+                            request_id,
+                            chunk,
+                            generated_empty,
+                            shape_policy,
+                            already_projected,
+                        )?)
+                    }
                     decode => decode,
                 };
                 Ok((context_tokens, work, policy))
@@ -168,7 +178,6 @@ impl EngineInner {
                     frontier,
                     work,
                     logits_policy,
-                    scheduled_tokens: scheduled.tokens_to_process.unwrap_or(1),
                     context_tokens,
                 }),
                 Err(error) => failures.push(TokenPreparationFailure {
@@ -185,8 +194,11 @@ impl EngineInner {
     pub(super) async fn process_token_batch(
         &self,
         batch: &ferrum_interfaces::BatchPlan,
+        shape_policy: PrefillShapePolicy,
+        already_projected: bool,
     ) -> Result<()> {
-        let PreparedTokenBatch { inputs, failures } = self.prepare_token_batch(batch);
+        let PreparedTokenBatch { inputs, failures } =
+            self.prepare_token_batch(batch, shape_policy, already_projected);
         let decode_root_width = inputs
             .iter()
             .filter(|input| matches!(input.work, TokenWork::Decode { .. }))

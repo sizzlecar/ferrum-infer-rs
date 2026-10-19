@@ -18,8 +18,10 @@ use std::{
     sync::Arc,
 };
 
+mod prefill_shape;
 mod prefix_capture;
 mod prefix_restore;
+pub use prefill_shape::{PrefillShapePlan, PrefillShapePolicy};
 pub use prefix_capture::{
     PrefixCaptureBoundary, PrefixCaptureLease, PrefixCapturePlan, PrefixCaptureRequest,
     PrefixCaptureStatus,
@@ -2057,13 +2059,13 @@ pub trait ModelExecutor: Send + Sync + 'static {
         ))
     }
 
-    /// Plan an optional prompt-tail checkpoint before a prefill chunk is
-    /// dispatched. The boundary must lie after this chunk's start and no later
-    /// than its end, leaving a legal suffix for logits. None preserves the chunk. Planning
-    /// grants no capacity or capture authority and does not report a failed
-    /// capacity probe; the caller dispatches the resulting chunk explicitly.
-    fn plan_prompt_tail_capture_boundary(&self, _chunk: PrefillChunk) -> Option<PrefixCapturePlan> {
-        None
+    /// Immutable product-range planning for this executor instance. Planning
+    /// never grants capacity, capture or submission authority. Both selection
+    /// and execution preparation use the same pure rule with current progress.
+    /// Unknown preserves the supplied chunk without qualifying it for exact
+    /// advance prediction; wrappers must explicitly forward their inner rule.
+    fn prefill_shape_policy(&self) -> PrefillShapePolicy {
+        PrefillShapePolicy::Unknown
     }
 
     /// Pure boundary planning for optional sharing. None leaves normal scheduling

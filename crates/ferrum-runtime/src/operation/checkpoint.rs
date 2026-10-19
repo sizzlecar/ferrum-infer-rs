@@ -8,6 +8,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 use super::super::{CheckpointInputDependency, ContractVersion, VNextError};
 use super::foundation::invalid_operation;
 
+mod boundary;
 mod state_port;
 pub use state_port::{ProviderCheckpointStateLayout, ProviderCheckpointStatePort};
 

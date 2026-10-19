@@ -1,11 +1,23 @@
 use super::*;
 
 impl EngineInner {
+    #[cfg(test)]
     pub(in crate::continuous_engine) async fn process_batch(
         &self,
         batch: &ferrum_interfaces::BatchPlan,
     ) -> Result<()> {
-        self.process_token_batch(batch).await
+        self.process_batch_with_shape(batch, self.model_executor.prefill_shape_policy(), false)
+            .await
+    }
+
+    pub(super) async fn process_batch_with_shape(
+        &self,
+        batch: &ferrum_interfaces::BatchPlan,
+        shape_policy: ferrum_execution::model_executor::PrefillShapePolicy,
+        already_projected: bool,
+    ) -> Result<()> {
+        self.process_token_batch(batch, shape_policy, already_projected)
+            .await
     }
 
     pub(in crate::continuous_engine) fn execution_capacity_release_snapshot(

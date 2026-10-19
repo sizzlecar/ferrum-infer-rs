@@ -87,7 +87,6 @@ pub(super) async fn commit_initial_products(
     let chunk = PrefillChunk::new(0, 2, 2).unwrap();
     for input in inputs.iter_mut() {
         input.work = TokenWork::Prefill(chunk);
-        input.scheduled_tokens = 2;
     }
     let works = inputs
         .iter()
@@ -144,7 +143,6 @@ pub(super) async fn commit_initial_products(
             token: TokenId(7),
             position: 2,
         };
-        input.scheduled_tokens = 1;
         input.context_tokens = 3;
         let mut slot = RequestSlotLease::open(
             &engine.active_inner().expect("engine execution is open"),

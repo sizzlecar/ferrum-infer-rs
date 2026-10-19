@@ -8941,8 +8941,8 @@ impl<R: DeviceRuntime> ModelExecutor for ProgramExecutor<R> {
         shutdown::begin(self, permit)
     }
 
-    fn plan_prompt_tail_capture_boundary(&self, chunk: PrefillChunk) -> Option<PrefixCapturePlan> {
-        self.prompt_tail_boundary(chunk)
+    fn prefill_shape_policy(&self) -> crate::model_executor::PrefillShapePolicy {
+        self.compiled_prefill_shape_policy()
     }
 
     fn plan_prefix_capture_boundary(

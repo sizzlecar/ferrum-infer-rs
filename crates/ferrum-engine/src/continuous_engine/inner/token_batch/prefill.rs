@@ -6,30 +6,20 @@ impl EngineInner {
         request_id: &RequestId,
         chunk: ferrum_execution::model_executor::PrefillChunk,
         original_prompt: bool,
+        policy: PrefillShapePolicy,
+        already_projected: bool,
     ) -> Result<ferrum_execution::model_executor::PrefillChunk> {
-        if !original_prompt {
-            return Ok(chunk);
-        }
-        let Some(plan) = self.model_executor.plan_prompt_tail_capture_boundary(chunk) else {
-            return Ok(chunk);
-        };
-        let span = plan.boundary.checked_sub(chunk.tokens_processed());
-        if plan.boundary >= chunk.total_prompt_tokens()
-            || plan.boundary > chunk.end()
-            || !span.is_some_and(|span| plan.span.permits(span as u64))
-        {
-            return Err(FerrumError::backend(
-                "invalid prompt-tail capture boundary for scheduled prefill",
+        let planned = policy.project(chunk, original_prompt)?.chunk();
+        // The same immutable policy priced this selected range. A second
+        // projection must not silently change work after time admission.
+        if already_projected && planned != chunk {
+            return Err(FerrumError::internal(
+                "selected prefill range differs from its projected execution shape",
             ));
         }
-        if plan.boundary == chunk.end() {
+        if planned == chunk {
             return Ok(chunk);
         }
-        let planned = ferrum_execution::model_executor::PrefillChunk::new(
-            chunk.tokens_processed(),
-            span.expect("validated positive capture span"),
-            chunk.total_prompt_tokens(),
-        )?;
         if self.scheduler_trace_jsonl.is_some() {
             self.write_executor_scheduler_profile_event(
                 request_id,
@@ -53,9 +43,15 @@ impl EngineInner {
                         ),
                         (
                             "capture_boundary".to_owned(),
-                            serde_json::json!(plan.boundary),
+                            serde_json::json!(planned.end()),
                         ),
-                        ("capture_span".to_owned(), serde_json::json!(plan.span)),
+                        (
+                            "capture_span".to_owned(),
+                            serde_json::json!(match policy {
+                                PrefillShapePolicy::PromptTail(boundary) => Some(boundary.prefix()),
+                                _ => None,
+                            }),
+                        ),
                     ]),
                     attributes: BTreeMap::new(),
                     error: None,
