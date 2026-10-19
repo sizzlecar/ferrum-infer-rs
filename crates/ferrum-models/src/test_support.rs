@@ -27,6 +27,9 @@ use crate::models::llama_family::LlamaFamilyConfig;
 use crate::models::LlamaFamilyModel;
 use crate::LlmExecutor;
 
+#[cfg(test)]
+pub(crate) mod numerical;
+
 /// Shape of a deterministic tiny LLaMA-family model.
 ///
 /// Defaults are larger than the op-parity micro config (vocab 7, hidden 4):

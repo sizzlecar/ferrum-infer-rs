@@ -113,8 +113,8 @@ env:
   CUDA_COMPUTE_CAP: 89
   # Build-time, content-addressed component. The staged ferrum binary links
   # these operators statically and performs no runtime download.
-  NATIVE_OPERATOR_SET_ARCHIVE_URL: https://github.com/sizzlecar/ferrum-infer-rs/releases/download/ferrum-native-cuda12.4-sm89-v7/native-operator-set-cuda12.4-sm89-v7.tar.zst
-  NATIVE_OPERATOR_SET_ARCHIVE_SHA256: 1d45382b13c19be9e58f284b853639394e4f884bc5a7357f706ab7e0b73a0709
+  NATIVE_OPERATOR_SET_ARCHIVE_URL: https://github.com/sizzlecar/ferrum-infer-rs/releases/download/ferrum-native-cuda12.4-sm89-v8/native-operator-set-cuda12.4-sm89-v8.tar.zst
+  NATIVE_OPERATOR_SET_ARCHIVE_SHA256: 977538d1f33e02adfef43e6648cf0749f07b15b238e0b240ad1e3bd338c37d60
 
 jobs:
   linux-x86_64-cuda-sm89:
@@ -176,7 +176,7 @@ jobs:
 
       - name: Materialize pinned CUDA native operator set
         run: |
-          archive="$RUNNER_TEMP/native-operator-set-cuda12.4-sm89-v7.tar.zst"
+          archive="$RUNNER_TEMP/native-operator-set-cuda12.4-sm89-v8.tar.zst"
           root="$RUNNER_TEMP/ferrum-native-operator-set"
           curl --fail --location --retry 5 --retry-all-errors \
             --output "$archive" "$NATIVE_OPERATOR_SET_ARCHIVE_URL"
@@ -290,8 +290,8 @@ jobs:
     env:
       CUDA_COMPUTE_CAP: 120
       # Content-addressed portable set; the archive must be published before staging.
-      NATIVE_OPERATOR_SET_ARCHIVE_URL: https://github.com/sizzlecar/ferrum-infer-rs/releases/download/ferrum-native-cuda12.8-sm120-v2/native-operator-set-cuda12.8-sm120-v2.tar.zst
-      NATIVE_OPERATOR_SET_ARCHIVE_SHA256: 0d72996ec5383d9f48f3cf1b64ba1ffadc1e471567e77b65a9072f813bf2d610
+      NATIVE_OPERATOR_SET_ARCHIVE_URL: https://github.com/sizzlecar/ferrum-infer-rs/releases/download/ferrum-native-cuda12.8-sm120-v3/native-operator-set-cuda12.8-sm120-v3.tar.zst
+      NATIVE_OPERATOR_SET_ARCHIVE_SHA256: f0e00ca8abcdd6fbc5d6885dd3d5958c9424fa9111e19abc14b8418dd2f0e18a
     timeout-minutes: 120
     container:
       image: nvidia/cuda:12.8.1-devel-ubuntu24.04@sha256:520292dbb4f755fd360766059e62956e9379485d9e073bbd2f6e3c20c270ed66
@@ -329,7 +329,7 @@ jobs:
             exit 1
           fi
           case "$NATIVE_OPERATOR_SET_ARCHIVE_URL" in
-            https://github.com/sizzlecar/ferrum-infer-rs/releases/download/ferrum-native-cuda12.8-sm120-v2/native-operator-set-cuda12.8-sm120-v2.tar.zst) ;;
+            https://github.com/sizzlecar/ferrum-infer-rs/releases/download/ferrum-native-cuda12.8-sm120-v3/native-operator-set-cuda12.8-sm120-v3.tar.zst) ;;
             *) echo 'Unexpected SM120 native archive source' >&2; exit 1;;
           esac
 
@@ -356,7 +356,7 @@ jobs:
 
       - name: Materialize pinned CUDA native operator set
         run: |
-          archive="$RUNNER_TEMP/native-operator-set-cuda12.8-sm120-v2.tar.zst"
+          archive="$RUNNER_TEMP/native-operator-set-cuda12.8-sm120-v3.tar.zst"
           root="$RUNNER_TEMP/ferrum-native-operator-set"
           curl --fail --location --retry 5 --retry-all-errors \
             --output "$archive" "$NATIVE_OPERATOR_SET_ARCHIVE_URL"
@@ -373,9 +373,9 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-          key: stage-rust1.91.0-linux-x86_64-cuda-sm120-cuda12.8-native-sm120-v2-cargo-${{ hashFiles('**/Cargo.lock') }}
+          key: stage-rust1.91.0-linux-x86_64-cuda-sm120-cuda12.8-native-sm120-v3-cargo-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
-            stage-rust1.91.0-linux-x86_64-cuda-sm120-cuda12.8-native-sm120-v2-cargo-
+            stage-rust1.91.0-linux-x86_64-cuda-sm120-cuda12.8-native-sm120-v3-cargo-
 
       - name: Build release metadata tool once
         run: cargo build --release --locked -p ferrum-bench-core --example release_candidate

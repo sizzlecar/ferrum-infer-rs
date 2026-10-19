@@ -379,8 +379,8 @@ jobs:
       CUDA_COMPUTE_CAP: "89"
       # Build-time, content-addressed component. The resulting ferrum binary
       # links these operators statically and performs no runtime download.
-      NATIVE_OPERATOR_SET_ARCHIVE_URL: https://github.com/sizzlecar/ferrum-infer-rs/releases/download/ferrum-native-cuda12.4-sm89-v7/native-operator-set-cuda12.4-sm89-v7.tar.zst
-      NATIVE_OPERATOR_SET_ARCHIVE_SHA256: 1d45382b13c19be9e58f284b853639394e4f884bc5a7357f706ab7e0b73a0709
+      NATIVE_OPERATOR_SET_ARCHIVE_URL: https://github.com/sizzlecar/ferrum-infer-rs/releases/download/ferrum-native-cuda12.4-sm89-v8/native-operator-set-cuda12.4-sm89-v8.tar.zst
+      NATIVE_OPERATOR_SET_ARCHIVE_SHA256: 977538d1f33e02adfef43e6648cf0749f07b15b238e0b240ad1e3bd338c37d60
     steps:
       - name: Install deps
         run: |
@@ -397,7 +397,7 @@ jobs:
 
       - name: Materialize pinned CUDA native operator set
         run: |
-          archive="$RUNNER_TEMP/native-operator-set-cuda12.4-sm89-v7.tar.zst"
+          archive="$RUNNER_TEMP/native-operator-set-cuda12.4-sm89-v8.tar.zst"
           root="$RUNNER_TEMP/ferrum-native-operator-set"
           curl --fail --location --retry 5 --retry-all-errors \
             --output "$archive" "$NATIVE_OPERATOR_SET_ARCHIVE_URL"
@@ -512,8 +512,8 @@ jobs:
         if: matrix.backend == 'cuda'
         timeout-minutes: 15
         env:
-          NATIVE_OPERATOR_SET_ARCHIVE_URL: https://github.com/sizzlecar/ferrum-infer-rs/releases/download/ferrum-native-cuda12.4-sm89-v7/native-operator-set-cuda12.4-sm89-v7.tar.zst
-          NATIVE_OPERATOR_SET_ARCHIVE_SHA256: 1d45382b13c19be9e58f284b853639394e4f884bc5a7357f706ab7e0b73a0709
+          NATIVE_OPERATOR_SET_ARCHIVE_URL: https://github.com/sizzlecar/ferrum-infer-rs/releases/download/ferrum-native-cuda12.4-sm89-v8/native-operator-set-cuda12.4-sm89-v8.tar.zst
+          NATIVE_OPERATOR_SET_ARCHIVE_SHA256: 977538d1f33e02adfef43e6648cf0749f07b15b238e0b240ad1e3bd338c37d60
         run: |
           # Persist verified bytes outside checkout and the per-job temp directory.
           cache_root="${RUNNER_TOOL_CACHE:?}/ferrum-native-operator-set"

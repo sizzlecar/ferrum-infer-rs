@@ -1401,9 +1401,13 @@ pub use crate::marlin_repack::{
 #[path = "../../../tests/compressed_tensors_marlin_eq/guards.rs"]
 mod test_guards;
 
-#[cfg(all(test, feature = "vllm-moe-marlin"))]
+#[cfg(all(test, feature = "marlin"))]
 #[path = "marlin/profile_retirement_tests.rs"]
 mod profile_retirement_tests;
+
+#[cfg(all(test, feature = "marlin"))]
+#[path = "marlin/override_retirement_tests.rs"]
+mod override_retirement_tests;
 
 #[cfg(test)]
 mod tests {
@@ -2309,6 +2313,15 @@ mod tests {
             let actual = stream
                 .clone_dtoh(&output_device)
                 .expect("download GPT-OSS MXFP4 output");
+            assert_eq!(
+                actual.len(),
+                reference.len(),
+                "{case_id} full output extent"
+            );
+            assert!(
+                reference.iter().all(|value| value.is_finite()),
+                "{case_id} finite source oracle"
+            );
             let mut reference_squared = 0.0_f64;
             let mut error_squared = 0.0_f64;
             let mut nan_count = 0_usize;
@@ -2828,6 +2841,15 @@ mod tests {
 
             let actual = output_device.read(&stream);
             workspace.read(&stream);
+            assert_eq!(
+                actual.len(),
+                reference.len(),
+                "{case_id} full output extent"
+            );
+            assert!(
+                reference.iter().all(|value| value.is_finite()),
+                "{case_id} finite CPU oracle"
+            );
             let mut reference_squared = 0.0_f64;
             let mut error_squared = 0.0_f64;
             let mut nan_count = 0_usize;

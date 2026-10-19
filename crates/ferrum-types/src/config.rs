@@ -1992,6 +1992,30 @@ mod tests {
     use crate::{RuntimeConfigEntry, RuntimeConfigSource};
 
     #[test]
+    fn retired_native_overrides_reject_before_mutating_engine_config() {
+        for key in [
+            "FERRUM_MARLIN_TILE",
+            "FERRUM_VLLM_MOE_THREAD_K",
+            "FERRUM_VLLM_MOE_THREAD_N",
+            "FERRUM_VLLM_MOE_BLOCKS_PER_SM",
+        ] {
+            for value in ["", "0", "-1", "128"] {
+                for source in [RuntimeConfigSource::Env, RuntimeConfigSource::ConfigFile] {
+                    let mut config = EngineConfig::default();
+                    let before = serde_json::to_value(&config).unwrap();
+                    let snapshot = RuntimeConfigSnapshot::from_entries([
+                        RuntimeConfigEntry::new("FERRUM_KV_CAPACITY", "1024", source),
+                        RuntimeConfigEntry::new(key, value, source),
+                    ]);
+                    let error = config.apply_runtime_config_snapshot(&snapshot).unwrap_err();
+                    assert!(error.contains(key) && error.contains("retired"), "{error}");
+                    assert_eq!(serde_json::to_value(&config).unwrap(), before);
+                }
+            }
+        }
+    }
+
+    #[test]
     fn retired_legacy_moe_controls_reject_before_mutating_engine_config() {
         for key in [
             "FERRUM_MOE_GRAPH",

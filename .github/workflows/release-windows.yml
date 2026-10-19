@@ -351,6 +351,11 @@ jobs:
             $operatorSource = $source
             $stage = 'lock-source'
             try {
+              if ($operator -eq 'marlin') {
+                $stage = 'materialize-source'
+                $operatorSource = Join-Path $work 'marlin-instance-policy-source'
+                & $builder materialize-source --spec 'native-operators/cuda/source-overlays/marlin-instance-policy.json' --base-source-root $source --override-source-root $env:GITHUB_WORKSPACE --out $operatorSource
+              }
               if ($operator -eq 'vllm-moe-marlin') {
                 $stage = 'materialize-source'
                 $operatorSource = Join-Path $work 'moe-profiler-free-source'

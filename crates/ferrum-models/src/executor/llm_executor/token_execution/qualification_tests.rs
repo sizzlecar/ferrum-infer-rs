@@ -115,20 +115,9 @@ fn compare_logits(completion: &ExecutionCompletion, expected: &[f32]) {
     };
     assert_eq!(actual.len(), VOCABULARY);
     assert_eq!(expected.len(), VOCABULARY);
-    let magnitude = expected
-        .iter()
-        .fold(0.0_f32, |max, value| max.max(value.abs()));
-    let mut maximum_error = 0.0_f32;
-    for (&actual, &expected) in actual.iter().zip(expected) {
-        assert!(actual.is_finite() && expected.is_finite());
-        maximum_error = maximum_error.max((actual - expected).abs());
-    }
     // Same full-vector envelope as the real managed numerical tests. The
     // independent CPU model supplies the oracle, never a returned GPU token.
-    assert!(
-        maximum_error <= 0.02 * magnitude.max(1e-6),
-        "full-logits error={maximum_error}, CPU magnitude={magnitude}"
-    );
+    crate::test_support::numerical::assert_full_logits_qualification(actual, expected);
 }
 
 async fn terminal(close: ExecutionCloseOutcome) -> ExecutionEnded {

@@ -3656,6 +3656,32 @@ mod tests {
     }
 
     #[test]
+    fn retired_native_overrides_are_rejected_for_every_executor() {
+        for key in [
+            "FERRUM_MARLIN_TILE",
+            "FERRUM_VLLM_MOE_THREAD_K",
+            "FERRUM_VLLM_MOE_THREAD_N",
+            "FERRUM_VLLM_MOE_BLOCKS_PER_SM",
+        ] {
+            for value in ["", "0", "-1", "128"] {
+                for authority in [
+                    ExecutionResourceAuthority::LegacyEngine,
+                    ExecutionResourceAuthority::PlanRuntime,
+                ] {
+                    let error = FerrumConfigBuilder::new(snapshot(&[(key, value)]))
+                        .with_execution_resource_authority(authority)
+                        .resolve()
+                        .expect_err("native overrides must not affect executor selection");
+                    assert!(matches!(error,
+                        AutoConfigError::InvalidOverride { key: actual, reason }
+                        if actual == key && reason.contains("retired")
+                    ));
+                }
+            }
+        }
+    }
+
+    #[test]
     fn retired_execution_controls_are_rejected_for_every_executor() {
         for key in [
             "FERRUM_WHOLE_PROMPT_PREFIX_CACHE",

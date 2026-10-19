@@ -30,6 +30,10 @@ impl RuntimeConfigSnapshot {
                 "FERRUM_METAL_CAPTURE" => Some(
                     "process-global Metal frame capture has been retired; use an explicit standalone GPU capture diagnostic",
                 ),
+                "FERRUM_MARLIN_TILE" | "FERRUM_VLLM_MOE_THREAD_K"
+                | "FERRUM_VLLM_MOE_THREAD_N" | "FERRUM_VLLM_MOE_BLOCKS_PER_SM" => Some(
+                    "process-global native tile overrides have been retired; remove this option to use the native operator's automatic selection",
+                ),
                 "FERRUM_PROFILE_COMMIT_SHA" | "FERRUM_PROFILE_ENV_HASH"
                 | "FERRUM_PROFILE_MODEL" | "FERRUM_PROFILE_CONCURRENCY"
                 | "FERRUM_PROFILE_RUNTIME_FLAGS_JSON" => Some(

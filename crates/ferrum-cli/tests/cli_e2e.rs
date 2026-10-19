@@ -247,9 +247,13 @@ fn retired_execution_environment_is_rejected_before_model_selection() {
         "FERRUM_WHOLE_PROMPT_PREFIX_CACHE",
         "FERRUM_SPEC_DRAFT",
         "FERRUM_SPEC_N",
+        "FERRUM_MARLIN_TILE",
+        "FERRUM_VLLM_MOE_THREAD_K",
+        "FERRUM_VLLM_MOE_THREAD_N",
+        "FERRUM_VLLM_MOE_BLOCKS_PER_SM",
     ];
     for key in keys {
-        for value in ["", "false", "0", "1"] {
+        for value in ["", "false", "0", "1", "-1"] {
             for command in ["run", "serve", "bench"] {
                 let mut cmd = base_cmd(workspace.path());
                 for removed in keys {

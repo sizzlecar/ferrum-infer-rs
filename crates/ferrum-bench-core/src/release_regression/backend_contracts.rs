@@ -305,8 +305,9 @@ pub fn contract_groups(backend: Backend) -> Vec<ContractGroup> {
     groups.extend(compatibility::groups(backend));
     if backend != Backend::Cpu {
         // Lifecycle recovery compares independent models at the same physical
-        // batch shape. Keep the original M=1/M=2 numerical obligation separate
-        // and mandatory, including when the lifecycle assertions pass.
+        // batch shape. Numerical qualification stays independently mandatory:
+        // CUDA checks each shape against the CPU full-vocabulary oracle;
+        // Metal retains its existing strict M=1/M=2 comparison.
         groups.push(ContractGroup {
             id: format!(
                 "backend-contract.{}.legacy-physical-batch-numerics",
@@ -318,10 +319,14 @@ pub fn contract_groups(backend: Backend) -> Vec<ContractGroup> {
                 package: "ferrum-models".into(),
                 target: "ferrum_models".into(),
                 kind: "lib".into(),
-                name: format!(
-                    "models::llama_family_forward_batched::tests::physical_batch_logits_match_single_item_decode_on_{}",
-                    backend_name(backend),
-                ),
+                name: if backend == Backend::Cuda {
+                    "models::llama_family_forward_batched::tests::physical_batch_and_single_logits_match_cpu_oracle_on_cuda".into()
+                } else {
+                    format!(
+                        "models::llama_family_forward_batched::tests::physical_batch_logits_match_single_item_decode_on_{}",
+                        backend_name(backend),
+                    )
+                },
             }],
         });
         // Shared legacy weight loading has its own numerical contract. These
@@ -682,6 +687,27 @@ mod tests {
     }
 
     #[test]
+    fn cuda_physical_batch_receipt_requires_the_cpu_oracle_execution() {
+        let mut report = report_fixture(Backend::Cuda);
+        verify_report(Backend::Cuda, &report).unwrap();
+        let numerical = report
+            .execution
+            .groups
+            .iter_mut()
+            .find(|group| group.id == "backend-contract.cuda.legacy-physical-batch-numerics")
+            .unwrap();
+        assert_eq!(
+            numerical.tests[0].binding.name,
+            "models::llama_family_forward_batched::tests::physical_batch_and_single_logits_match_cpu_oracle_on_cuda",
+        );
+        // Even a purported passing receipt for the former cross-GPU-shape
+        // comparison cannot substitute for the independent CPU-oracle test.
+        numerical.tests[0].binding.name =
+            "models::llama_family_forward_batched::tests::physical_batch_logits_match_single_item_decode_on_cuda".into();
+        assert!(verify_report(Backend::Cuda, &report).is_err());
+    }
+
+    #[test]
     fn device_reports_reject_missing_execution_and_cross_backend_substitution() {
         for backend in [Backend::Cpu, Backend::Metal, Backend::Cuda] {
             let report = report_fixture(backend);
@@ -907,6 +933,31 @@ mod tests {
                 .retain(|test| !test.binding.name.contains("::f16_tests::"));
         }
         assert!(verify_report(Backend::Cuda, &native_only).is_err());
+    }
+
+    #[test]
+    fn native_override_retirement_requires_each_actual_ffi_entrypoint() {
+        let report = report_fixture(Backend::Cuda);
+        assert!(verify_report(Backend::Cuda, &report).is_ok());
+        for required in [
+            "native_classic_dense_tile_retirement_preserves_cpu_reference",
+            "native_classic_fused_tile_retirement_preserves_cpu_reference",
+            "native_moe_f16_override_retirement_preserves_cpu_reference",
+            "native_moe_fp8_override_retirement_preserves_cpu_reference",
+            "native_moe_mxfp4_override_retirement_preserves_source_reference",
+            "native_moe_profile_retirement_ignores_environment_after_real_math",
+        ] {
+            let mut missing = report.clone();
+            for group in &mut missing.execution.groups {
+                group
+                    .tests
+                    .retain(|test| !test.binding.name.ends_with(required));
+            }
+            assert!(
+                verify_report(Backend::Cuda, &missing).is_err(),
+                "a receipt must not omit native FFI evidence for {required}",
+            );
+        }
     }
 
     #[test]
