@@ -1,8 +1,8 @@
 # Goal：统一执行架构，为 SLO 优化建立可靠基础
 
-**状态：目标已激活，R0 已合并，R4 最小闭环已验证；R1–R3 剩余边界与 R5 验收继续。** 工作分支：`refactor/execution-architecture-20261018`，从干净 `main`（`c2be4c67`）开始，PR #441 待合并；原工作区的旧 SLO 实现不作为代码基底。
+**状态：目标已激活，R0 已合并，R4 最小闭环已验证；当前进行 R5 数值、默认性能与最终检查。** 工作分支：`refactor/execution-architecture-20261018`，从干净 `main`（`c2be4c67`）开始，PR #441 待合并；原工作区的旧 SLO 实现不作为代码基底。
 
-R0 六批退役与修复已合并（PR #429–#434）。执行契约、runtime、受管驱动、输出额度和实例资源已分责，旧 Tensor 控制流及全局 profiler 已退出。独立 SLO 参考组件通过真实 CPU mixed 执行、故障回收和 Metal 前缀恢复组合验证；调度与实际提交共用合法形状投影。生产日志已移至 `ferrum-journal`，Engine/Server 不再普通依赖 benchmark 工具包。Engine 已移除未参与执行的 KV/recurrent 管理器，状态直接观察原 executor，未知内存不再伪报零值。剩余重点是低层资源入口及保留 CUDA 路径资格，随后完成默认质量/性能回归和主线合并。27B GGUF 数值差异、Metal counter 间歇失败及既有 SM120 经典 Marlin 非法指令仍须分别解释或修复。原始证据留在仓库外；当前不新增性能或 SLO 达标声明。
+R0 六批退役与修复已合并（PR #429–#434）。执行契约、runtime、受管驱动、输出额度和实例资源已分责，旧 Tensor 控制流及全局 profiler 已退出。独立 SLO 参考组件通过真实 CPU mixed 执行、故障回收和 Metal 前缀恢复组合验证；调度与实际提交共用合法形状投影。生产日志已移至 `ferrum-journal`，Engine/Server 不再普通依赖 benchmark 工具包。Engine 已移除未参与执行的 KV/recurrent 管理器，状态直接观察原 executor，未知内存不再伪报零值。冷构建失败、CUDA INT8 与同卡 pipeline 已补齐原所有者及实际验证；SM120 经典 Marlin 底层与 GPTQ 加载前向测试通过。剩余重点是 27B GGUF 未解释的并发输出差异、默认配置延迟回退、Metal counter 间歇失败与最终检查、主线合并。双物理 GPU 资格仍未实测。原始证据留在仓库外；当前不新增性能或 SLO 达标声明。
 
 ## 1. 目标与第一原则
 
@@ -53,9 +53,11 @@ CUDA 资源 API：`CudaState` 的设备、stream、BLAS 与捕获状态改为私
 
 Metal 映射 API：`register_gguf_mmap` 接收 `RetainedHostMemoryRegion`，不再接受独立 slice 与任意 keeper。零拷贝 buffer 的原生释放回调持有真实内存所有者，覆盖 Rust 权重提前释放及原生 buffer 克隆；residency 独立持有，避免引用环。量化加载与原生静态权重导入共享范围检查和构造器；整页范围不能证明时复制对应 tensor，尾部 tensor 的额外内存及默认性能仍须验收。
 
-模型执行资格改为 `ModelTokenExecutionMode::{Unsupported, InlineSynchronous, ManagedWorker}`，替代两个可矛盾的布尔值；执行器在构建时保存声明，准入、执行和关闭使用同一模式。后端单独声明保留原上下文的生命周期能力，不感知 token 业务。本次仅开放完整 Metal Llama FP16 KV 模型，CUDA legacy、设备 INT8 与 GPU pipeline 仍待各自验证。
+模型执行资格改为 `ModelTokenExecutionMode::{Unsupported, InlineSynchronous, ManagedWorker}`，替代两个可矛盾的布尔值；执行器在构建时保存声明，准入、执行和关闭使用同一模式。后端单独声明保留原上下文的生命周期能力，不感知 token 业务。Metal FP16、CUDA FP16/INT8 的原执行、故障和关闭已验证，CUDA INT8 的真实 `run` / `serve` 通过。pipeline 保留各 stage 原 context 与 worker，CPU、同卡独立 CUDA context 和 Metal 实例的数值、取消与关闭通过；不据此声明双物理 GPU 已验收。
 
 整执行器关闭 API：`ExecutorOwner` 消费原执行器，`ExecutorScope` 只授予使用权；自定义 Engine 分别通过 `with_owned_executor` 或 `with_custom_executor` 接入。最后一个实际作用域结束后，原 worker、模型与 plan 才能受检退休。`InferenceEngine::wait_for_shutdown_completion` 观察原关闭过程，不重新发起关闭；CLI、HTTP 与日志收尾共用此过程。失败仍保留原资源，已安全退休也不抹去先前错误。自定义实现须提供实际关闭证明，默认不把未实现的关闭视为成功。
+
+冷构建错误 API：factory 与 Builder 返回 `ExecutorBuildError`，分别保留原失败原因与可选清理观察端。失败的预留、分配及静态上传由原事务和原关闭服务继续处理；未知副作用不自动重放。调用方观察清理结果，不能将返回错误等同于资源已释放。
 
 Metal 同步失败会阻止后续编码和宿主访问；未决工作保留原提交，只有显式开始下一次执行才清除已终结的错误。直接模型的完整输出、取消及失败恢复验证通过；真实 Llama-3.1-8B Q4_K_M 的三轮 `run`、五次 HTTP/SSE 请求和服务正常退出通过。该结果不替代默认性能与其余模型/格式验收。
 
