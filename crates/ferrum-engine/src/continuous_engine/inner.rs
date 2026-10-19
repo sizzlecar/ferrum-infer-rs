@@ -968,17 +968,18 @@ impl EngineInner {
         &self,
         hint: &ferrum_interfaces::BatchHint,
         mut planning: Option<&mut TimePlanningRound>,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let Some(configured_target) = self.config.scheduler.prefill_first_until_active else {
-            return Ok(());
+            return Ok(false);
         };
         let target = configured_target
             .min(hint.max_batch_size)
             .min(self.config.scheduler.max_running_requests);
         if target <= 1 {
-            return Ok(());
+            return Ok(false);
         }
 
+        let mut progressed = false;
         for _ in 0..=target {
             let desired = self
                 .scheduler
@@ -986,20 +987,24 @@ impl EngineInner {
             if desired == 0 || self.scheduler.waiting_count() == 0 {
                 break;
             }
-            let (_, maintenance) = self
+            let (admitted, maintenance) = self
                 .prepare_dynamic_admission_round(desired, planning.as_deref_mut())
                 .await?;
             let maintenance =
                 PendingPrefillMaintenance::new(self.model_executor.as_ref().as_ref(), maintenance);
+            progressed |= admitted > 0;
             self.complete_typed_admission_failures().await?;
             if maintenance.is_empty() {
                 break;
             }
+            progressed = true;
             self.execute_executor_prefill_maintenance(maintenance.into_pending());
             self.complete_typed_admission_failures().await?;
         }
 
-        Ok(())
+        let active = self.scheduler.active_count();
+        let waiting = self.scheduler.waiting_count();
+        Ok(progressed && active > 0 && active < target && waiting == 0)
     }
 
     async fn complete_typed_admission_failures(&self) -> Result<()> {
@@ -1295,10 +1300,12 @@ impl EngineInner {
                 prefill_shape_policy,
             )
         });
-        // Execute ready work even below the fill-first target, keeping
-        // admission and selection on the same planning snapshot.
-        self.prepare_token_prefill_cohort(&hint, planning.as_mut())
-            .await?;
+        if self
+            .prepare_token_prefill_cohort(&hint, planning.as_mut())
+            .await?
+        {
+            return Ok(EngineIterationOutcome::Progressed);
+        }
         let (_, prefill_maintenance) = self
             .prepare_dynamic_admission_round(hint.max_batch_size, planning.as_mut())
             .await?;
