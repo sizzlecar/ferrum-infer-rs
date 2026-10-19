@@ -6,7 +6,7 @@
 use async_trait::async_trait;
 use ferrum_output::{InferenceOutput, InferenceStream};
 use ferrum_types::{
-    EngineConfig, ExecutionResourceAuthority, ExecutorAdmissionSnapshot, InferenceRequest, Result,
+    EngineConfig, ExecutionPlanningModel, ExecutorAdmissionSnapshot, InferenceRequest, Result,
 };
 
 /// Lifecycle / status methods shared by every engine kind.
@@ -81,12 +81,12 @@ pub trait LlmInferenceEngine: InferenceEngine {
         crate::adapter::AdapterExecutionSupport::Unsupported
     }
 
-    /// Authoritative owner of request-lifetime state and capacity. This is a
-    /// cheap capability query; it must not construct a metrics snapshot.
-    /// Plan-runtime engines supply native prefix observations even when their
-    /// selected plan cannot retain checkpoints.
-    fn execution_resource_authority(&self) -> ExecutionResourceAuthority {
-        ExecutionResourceAuthority::LegacyEngine
+    /// Cold planning and evidence contract of the original executor. This is
+    /// a cheap query and must not construct a metrics snapshot. It grants no
+    /// resource authority and does not prove a particular KV layout or prefix
+    /// restoration; those capabilities come from their actual owner ports.
+    fn execution_planning_model(&self) -> ExecutionPlanningModel {
+        ExecutionPlanningModel::ExecutorManaged
     }
 
     /// Effective per-request capacity in tokens, including input and output.

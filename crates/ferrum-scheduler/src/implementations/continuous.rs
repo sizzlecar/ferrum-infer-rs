@@ -9184,7 +9184,7 @@ mod tests {
         )
         .with_hardware_capabilities(hardware)
         .with_workload_profile(workload)
-        .with_execution_resource_authority(ferrum_types::ExecutionResourceAuthority::PlanRuntime)
+        .with_execution_planning_model(ferrum_types::ExecutionPlanningModel::CompiledPlan)
         .resolve()
         .unwrap();
         let mut engine = ferrum_types::EngineConfig::default();

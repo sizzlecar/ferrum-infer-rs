@@ -80,7 +80,7 @@ LoRA API 迁移：退役公开的 `RuntimeLoraAdapter` / `load_runtime_lora_adap
 | 问题 | 证据性质与范围 | 本轮必须形成的结果 |
 |---|---|---|
 | `interfaces::vnext` 包含计划编译、资源池、提交/完成状态机；与 `ModelExecutor` 相互引用 | 主线结构确认；编译成本未量化 | 契约与运行时实现分离，无环依赖 |
-| `ModelExecutor`、Engine 同时维护 legacy/PlanRuntime 路由；CLI 与公共 builder 的模型选择规则不一致 | 主线结构确认；legacy 仍承载生产能力 | 单一执行协议、统一构建入口、明确旧路径退出条件 |
+| 原 `ModelExecutor`、Engine 同时维护旧执行/计划运行时路由；CLI 与公共 builder 的模型选择规则不一致 | 历史基线；当前 Engine 统一消费 token 协议，保留不同执行实现的冷规划合同 | 保持统一构建与执行协议，保留能力和实际所有权验收，不以分类名代替迁移证据 |
 | legacy 批次出错后整批转逐请求重试，部分请求可能已经推进 KV 或输出 | 静态错误路径确认，待故障注入 | 按参与者记录提交结果，仅证明未提交的工作可重试 |
 | 完成结果在 executor、Engine、scheduler 之间多处手工发布/补偿 | 维护风险确认，不能据锁数量宣称死锁 | 具名提交事务、可收敛的取消与回收协议 |
 | 可选观测 I/O 与执行契约错误混在一起；诊断关闭时部分调用仍构造快照/JSON | 条件性路径确认；默认无 journal 不受其 I/O 错误影响 | 执行错误与观测降级分离，关闭诊断不构造诊断负载 |
@@ -127,13 +127,15 @@ R2 观测 API：`ExecutionEventSinkError` 区分 `Contract` 与 `Transport`；`d
 
 Engine 资源 API：统一构造器只接收配置、scheduler、tokenizer、sampler 和原 executor；显式日志 scope 使用 `new_with_journal_scopes`。移除未参与执行的 KV/recurrent manager 注入、注册工厂及 TensorFactory 参数。真实 KV/recurrent provider 仍归原执行所有者；Qwen3.5 保留模型内的张量形状与容量估计，退出无执行消费者的 request/slot allocation spec。旧 `recurrent_state_max_slots` 配置明确拒绝；物理块数不再作为 token 窗口回退。
 
-`ModelExecutor::memory_observation` 返回原所有者的 `MemoryObservation`。`Known` 保留原 JSON 对象，`Unknown` 为 `null`，CLI/HTTP 明确显示不可用，不伪报零用量或因此置为不健康。缺少必需的 PlanRuntime 资源快照仍是合同错误。设备字段来自实际 executor，统计限定在其声明的内存域；不代表进程总内存或关闭后的释放证明。
+`ModelExecutor::memory_observation` 返回原所有者的 `MemoryObservation`。`Known` 保留原 JSON 对象，`Unknown` 为 `null`，CLI/HTTP 明确显示不可用，不伪报零用量或因此置为不健康。缺少 CompiledPlan 必需的原 runtime 资源快照仍是合同错误。设备字段来自实际 executor，统计限定在其声明的内存域；不代表进程总内存或关闭后的释放证明。
+
+冷规划 API 迁移：`ExecutionResourceAuthority::{LegacyEngine, PlanRuntime}` 改为 `ExecutionPlanningModel::{ExecutorManaged, CompiledPlan}`，trait 查询改为 `execution_planning_model()`；配置 builder/字段使用 `with_execution_planning_model` / `execution_planning_model`，admission snapshot 使用 `planning_model()`。不保留旧 Rust 别名。前者由原执行实现管理资源，后者另外必须提供实际 compiled plan、来源一致性、admission/capacity 与资源观察合同；两者均使用原 token 执行和真实关闭协议。分类不授权分配/释放，不决定 KV 布局、prefix 恢复或内存用量。为保持已有 health、effective config、性能记录和文件摘要可读可比，wire 仍写出 `execution_resource_authority` / `resource_authority` 及 `legacy_engine` / `plan_runtime`；这些是历史兼容标签，不能解释成 Engine 拥有资源。schema、原 runtime entries、native plan/provider 指纹不因这次 Rust API 迁移改变。本片无算法或性能收益声明。
 
 执行事实由独立的 `ExecutionFactsCapture` 开关控制，不改变计时模式、程序身份或缓存资格。`ProfiledSubmissionHandle::into_parts()` 返回完成句柄与 `SubmissionObservation`；后者持有当前工作量、可选计时归因和设备事实，提交后错误保留有效附件。`TerminalExecutionFacts` 只借用原终态，不授予重试或释放权。CUDA Q6 执行与观测共用实际选择，原图保存无请求身份的投影模板，重放时绑定当前 token 范围；Off 捕获的图不回填模板，明确记为 `CachedTemplateUnavailable`。设备事实仅声明计算命令覆盖，不代表传输、初始化或每个 kernel 成功；缺失与未支持分别标记。产品投影经原有界日志队列交付，不用逻辑节点或 packed token 行数冒充物理矩阵。
 
 产品装配层组合模型准备结果、具体设备 runtime 与泛型驱动。迁移 `VNextModelExecutor<R>` 时同时解开其对 `PreparedProductionModel` 的依赖，将中立准备输入与编译结果归到正确层，并保留 source/registry/初始化身份校验；不能整文件搬迁后让 execution 再引用 models。泛型驱动本身已后端中立，不能将这项整理描述成新消除的具体 GPU 绑定。量化格式描述/解析与设备执行也按此分层，不能经 quantization 引回 kernels 依赖环。
 
-legacy Engine 的容量分配记录与模型自己的物理 KV 当前是两套账本，不等于已证明重复分配两份 GPU KV。统一后容量权威归执行 runtime，Engine/scheduler 只消费凭证与只读状态。`ferrum-kv` 的 testkit 使用和公共统计类型需迁移；没有剩余独立职责后删除 crate，不为维持旧测试保留生产双重记账。
+原 Engine 未参与实际执行的容量/KV/recurrent 账本及其注入接口已删除；这项历史问题不等于曾证明重复分配两份 GPU KV。真实资源由原执行所有者持有：模型执行保留原模型/context/worker，compiled-plan 执行保留原 runtime 资源域；Engine/scheduler 只消费凭证与只读状态。`ferrum-kv` 仍有 testkit 和测试依赖，需按实际剩余职责迁移后再删除；其 crate 名称存在不代表 Engine 仍维护生产双账本，亦不能为维持旧接口恢复第二套账本。
 
 公共契约的具体归属按依赖闭包决定。`PrefixRestoreObservation` 等当前借用带授权语义的 deferral，不能因名称像数据就下沉到 `types`：拆开只读观测表示与可操作的授权，或将完整授权契约放在正确边界；不得把私有字段/构造校验改成任意可伪造的快照来解环。
 
@@ -143,7 +145,7 @@ legacy Engine 的容量分配记录与模型自己的物理 KV 当前是两套�
 
 ### 4.1 一个执行协议，旧路径有终点
 
-构建时根据声明能力选择执行实现。Engine 的 batch/prefill/decode 主循环只面对统一协议，不持续判断资源属于 legacy 还是 PlanRuntime。CLI、`run`、`serve` 与公共 EngineBuilder 使用相同的来源解析和能力规则。
+构建时根据声明能力选择执行实现。Engine 的 batch/prefill/decode 主循环只面对统一协议，不按 executor-managed 或 compiled-plan 冷分类维护另一套控制流。CLI、`run`、`serve` 与公共 EngineBuilder 使用相同的来源解析和能力规则。
 
 迁移期间允许兼容 adapter，但它必须实现统一的提交、完成、取消和容量协议；旧算法可暂时留在 adapter 内，不能再维护平行的 Engine 调度/资源所有权。每个保留能力记录迁移去向与退出里程碑；退役项按 §1 删除。存在尚未覆盖的保留能力时，不能宣告旧架构退出完成。最终模型实现可以复用旧算子，但不再依赖两套执行协议之间的转换 adapter。
 

@@ -98,8 +98,8 @@ impl ModelExecutor for GatedExecutor {
     fn prefill_shape_policy(&self) -> PrefillShapePolicy {
         self.inner.prefill_shape_policy()
     }
-    fn execution_resource_authority(&self) -> ExecutionResourceAuthority {
-        self.inner.execution_resource_authority()
+    fn execution_planning_model(&self) -> ExecutionPlanningModel {
+        self.inner.execution_planning_model()
     }
     fn admission_limits(&self) -> Result<Option<ExecutorAdmissionLimits>> {
         self.inner.admission_limits()

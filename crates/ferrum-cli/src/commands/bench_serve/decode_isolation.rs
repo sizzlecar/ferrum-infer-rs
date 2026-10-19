@@ -86,7 +86,8 @@ struct HealthKvStorage {
 
 #[derive(Debug, Clone, Default, Deserialize)]
 struct HealthAdmission {
-    resource_authority: Option<ferrum_types::ExecutionResourceAuthority>,
+    #[serde(rename = "resource_authority")]
+    planning_model: Option<ferrum_types::ExecutionPlanningModel>,
     runtime_snapshot_available: Option<bool>,
     runtime_contract_error: Option<String>,
     effective_max_concurrent: Option<u32>,
@@ -112,7 +113,8 @@ struct HealthModelCapabilities {
 
 #[derive(Debug, Clone, Default, Deserialize)]
 struct HealthAutoAdmission {
-    resource_authority: Option<ferrum_types::ExecutionResourceAuthority>,
+    #[serde(rename = "resource_authority")]
+    planning_model: Option<ferrum_types::ExecutionPlanningModel>,
     kv_capacity_applies_to_selected_state_layout: Option<bool>,
     effective_max_concurrent: Option<u32>,
     maximum_active_sequences: Option<u32>,
@@ -250,15 +252,14 @@ fn resolve_capabilities(health: HealthResponse) -> Result<DecodeIsolationCapabil
             "decode-isolation /health omitted effective {field} capability"
         ))
     };
-    if health.admission.resource_authority
-        == Some(ferrum_types::ExecutionResourceAuthority::PlanRuntime)
-        || health.auto_config.admission.resource_authority
-            == Some(ferrum_types::ExecutionResourceAuthority::PlanRuntime)
+    if health.admission.planning_model == Some(ferrum_types::ExecutionPlanningModel::CompiledPlan)
+        || health.auto_config.admission.planning_model
+            == Some(ferrum_types::ExecutionPlanningModel::CompiledPlan)
     {
         if health.admission.runtime_snapshot_available != Some(true)
             || health.admission.runtime_contract_error.is_some()
-            || health.admission.resource_authority
-                != Some(ferrum_types::ExecutionResourceAuthority::PlanRuntime)
+            || health.admission.planning_model
+                != Some(ferrum_types::ExecutionPlanningModel::CompiledPlan)
         {
             return Err(missing("valid native runtime admission snapshot"));
         }

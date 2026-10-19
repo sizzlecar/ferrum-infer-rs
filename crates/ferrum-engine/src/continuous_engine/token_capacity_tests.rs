@@ -89,8 +89,8 @@ impl ModelExecutor for TokenCapacityExecutor {
     fn status(&self) -> ExecutorStatus {
         self.source.status()
     }
-    fn execution_resource_authority(&self) -> ExecutionResourceAuthority {
-        ExecutionResourceAuthority::PlanRuntime
+    fn execution_planning_model(&self) -> ExecutionPlanningModel {
+        ExecutionPlanningModel::CompiledPlan
     }
     fn plan_runtime_resource_snapshot(&self) -> Result<Option<PlanRuntimeResourceSnapshot>> {
         self.source.plan_runtime_resource_snapshot()

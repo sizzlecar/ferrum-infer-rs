@@ -543,8 +543,8 @@ fn llm_executor_reports_retained_model_sources_without_a_runtime_plan() {
     ));
     assert!(executor.resolved_model_plan().is_none());
     assert_eq!(
-        executor.execution_resource_authority(),
-        ferrum_types::ExecutionResourceAuthority::LegacyEngine,
+        executor.execution_planning_model(),
+        ferrum_types::ExecutionPlanningModel::ExecutorManaged,
     );
 }
 #[test]

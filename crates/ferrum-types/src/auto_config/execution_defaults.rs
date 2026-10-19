@@ -31,7 +31,7 @@ impl FerrumConfigBuilder {
         }
         let cuda_plan = self.is_cuda_backend()
             && self.hardware.compiled_features.cuda
-            && self.execution_resource_authority == ExecutionResourceAuthority::PlanRuntime;
+            && self.execution_planning_model == ExecutionPlanningModel::CompiledPlan;
         let upload = select!(
             "FERRUM_PROGRAM_BINDING_UPLOAD_STRATEGY",
             ProgramBindingUploadStrategy,

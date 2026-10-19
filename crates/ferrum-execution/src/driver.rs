@@ -14,7 +14,7 @@ use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::model_executor::{
-    AttentionType, ExecutionResourceAuthority, ExecutorAdmissionEpochs, ExecutorCapabilities,
+    AttentionType, ExecutionPlanningModel, ExecutorAdmissionEpochs, ExecutorCapabilities,
     ExecutorCapacityWaitRegistration, ExecutorExecutionCapacityDeferral,
     ExecutorExecutionCapacityPreemption, ExecutorExecutionCapacityPreemptionAuthority,
     ExecutorExecutionCapacityPreemptionReceipt, ExecutorExecutionCapacityStage,
@@ -9019,8 +9019,8 @@ impl<R: DeviceRuntime> ModelExecutor for ProgramExecutor<R> {
         }
     }
 
-    fn execution_resource_authority(&self) -> ExecutionResourceAuthority {
-        ExecutionResourceAuthority::PlanRuntime
+    fn execution_planning_model(&self) -> ExecutionPlanningModel {
+        ExecutionPlanningModel::CompiledPlan
     }
 
     fn admission_limits(&self) -> Result<Option<ExecutorAdmissionLimits>> {

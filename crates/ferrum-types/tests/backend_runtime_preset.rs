@@ -1,5 +1,5 @@
 use ferrum_types::{
-    CompiledKernelFeatures, ExecutionResourceAuthority, FerrumConfigBuilder, HardwareCapabilities,
+    CompiledKernelFeatures, ExecutionPlanningModel, FerrumConfigBuilder, HardwareCapabilities,
     ModelCapabilities, RuntimeConfigSnapshot, WorkloadProfile,
 };
 use serde_json::Value;
@@ -49,7 +49,7 @@ fn resolve(model: ModelCapabilities, hardware: HardwareCapabilities) -> Value {
         .with_model_capabilities(model)
         .with_hardware_capabilities(hardware)
         .with_workload_profile(workload)
-        .with_execution_resource_authority(ExecutionResourceAuthority::PlanRuntime)
+        .with_execution_planning_model(ExecutionPlanningModel::CompiledPlan)
         .resolve()
         .expect("runtime preset must resolve")
         .effective_config_document()

@@ -457,8 +457,8 @@ impl ModelExecutor for PlanRuntimeChunkedPrefillTestExecutor {
         self.inner.info()
     }
 
-    fn execution_resource_authority(&self) -> ExecutionResourceAuthority {
-        ExecutionResourceAuthority::PlanRuntime
+    fn execution_planning_model(&self) -> ExecutionPlanningModel {
+        ExecutionPlanningModel::CompiledPlan
     }
 
     fn supports_plan_runtime_prefix_restore(&self) -> bool {
@@ -744,8 +744,8 @@ impl ModelExecutor for PlanRuntimeBatchDecodeTestExecutor {
         self.inner.info()
     }
 
-    fn execution_resource_authority(&self) -> ExecutionResourceAuthority {
-        ExecutionResourceAuthority::PlanRuntime
+    fn execution_planning_model(&self) -> ExecutionPlanningModel {
+        ExecutionPlanningModel::CompiledPlan
     }
 
     fn plan_runtime_resource_snapshot(&self) -> Result<Option<PlanRuntimeResourceSnapshot>> {
@@ -916,8 +916,8 @@ impl ModelExecutor for PlanRuntimeAdmissionTestExecutor {
         self.inner.info()
     }
 
-    fn execution_resource_authority(&self) -> ExecutionResourceAuthority {
-        ExecutionResourceAuthority::PlanRuntime
+    fn execution_planning_model(&self) -> ExecutionPlanningModel {
+        ExecutionPlanningModel::CompiledPlan
     }
 
     fn plan_runtime_resource_snapshot(&self) -> Result<Option<PlanRuntimeResourceSnapshot>> {
@@ -1193,8 +1193,8 @@ impl ModelExecutor for PlanRuntimeMaintenanceTestExecutor {
         self.inner.info()
     }
 
-    fn execution_resource_authority(&self) -> ExecutionResourceAuthority {
-        ExecutionResourceAuthority::PlanRuntime
+    fn execution_planning_model(&self) -> ExecutionPlanningModel {
+        ExecutionPlanningModel::CompiledPlan
     }
 
     fn plan_runtime_resource_snapshot(&self) -> Result<Option<PlanRuntimeResourceSnapshot>> {
@@ -2469,7 +2469,7 @@ async fn owner_memory_unknown_preserves_engine_readiness_and_shutdown() {
 }
 
 #[test]
-fn public_engine_authority_reports_the_original_executor_capability() {
+fn public_engine_planning_model_reports_the_original_executor_contract() {
     let config = EngineConfig::default();
     let legacy = ContinuousBatchEngine::new(
         config.clone(),
@@ -2482,11 +2482,11 @@ fn public_engine_authority_reports_the_original_executor_capability() {
     let (native, _, _, _) =
         plan_runtime_batch_decode_test_engine(PlanRuntimeBatchDecodeBehavior::Exact);
     for (engine, expected) in [
-        (&legacy, ExecutionResourceAuthority::LegacyEngine),
-        (&native, ExecutionResourceAuthority::PlanRuntime),
+        (&legacy, ExecutionPlanningModel::ExecutorManaged),
+        (&native, ExecutionPlanningModel::CompiledPlan),
     ] {
         let engine: &dyn LlmInferenceEngine = engine;
-        assert_eq!(engine.execution_resource_authority(), expected);
+        assert_eq!(engine.execution_planning_model(), expected);
     }
 }
 

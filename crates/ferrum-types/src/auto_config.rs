@@ -5,7 +5,7 @@
 
 use crate::{
     is_sha256_digest, parse_bool_env_value, parse_usize_env_value, AttentionExecutionPolicy,
-    CompiledNativeOperatorIdentity, ExecutionResourceAuthority, RuntimeConfigEffect,
+    CompiledNativeOperatorIdentity, ExecutionPlanningModel, RuntimeConfigEffect,
     RuntimeConfigEntry, RuntimeConfigSnapshot, RuntimeConfigSource,
     CUDA_NATIVE_ADAPTIVE_V1_MAX_SEQUENCE_TOKENS,
 };
@@ -327,7 +327,7 @@ pub enum WorkloadPriority {
 
 /// Cold selection of the KV allocation layout used by the retained model.
 /// This is supplied by the model/backend selector, never inferred from the
-/// resource-authority tag. Unknown does not authorize a block-to-token limit.
+/// planning-model tag. Unknown does not authorize a block-to-token limit.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum SelectedKvCacheLayout {
@@ -352,8 +352,9 @@ impl SelectedKvCacheLayout {
 pub struct ResolvedFerrumConfig {
     pub schema_version: u32,
     pub preset: Option<String>,
-    #[serde(default)]
-    pub execution_resource_authority: ExecutionResourceAuthority,
+    // Retain the historical observation field for stored configs/reports.
+    #[serde(default, rename = "execution_resource_authority")]
+    pub execution_planning_model: ExecutionPlanningModel,
     #[serde(default)]
     pub selected_kv_cache_layout: SelectedKvCacheLayout,
     #[serde(default)]
@@ -516,7 +517,7 @@ impl ResolvedFerrumConfig {
             "preset": self.preset,
             "env_hash": self.runtime_env_hash(),
             "backend": backend.clone(),
-            "execution_resource_authority": self.execution_resource_authority,
+            "execution_resource_authority": self.execution_planning_model,
             "startup_memory_plan": self.startup_memory_plan,
             "requested_gpu_devices": requested_gpu_devices.clone(),
             "selected_gpu_devices": selected_gpu_devices.clone(),
@@ -572,7 +573,7 @@ impl ResolvedFerrumConfig {
             "source": "legacy_f16_geometry_estimate",
             "applies_to_selected_state_layout": false,
             "is_resident_usage": false,
-            "selected_state_evidence_source": if self.execution_resource_authority == ExecutionResourceAuthority::PlanRuntime { "executor.kv_storage.logical_sequence_state" } else { "legacy_runtime" },
+            "selected_state_evidence_source": if self.execution_planning_model == ExecutionPlanningModel::CompiledPlan { "executor.kv_storage.logical_sequence_state" } else { "legacy_runtime" },
             "vram_bytes": self.hardware_capabilities.vram_bytes,
             "estimated_weight_bytes": self.model_capabilities.estimated_weight_bytes,
             "kv_bytes_per_token": kv_bytes_per_token,
@@ -588,7 +589,7 @@ impl ResolvedFerrumConfig {
             "schema_version": 1,
             "backend": self.hardware_capabilities.backend,
             "model_architecture": self.model_capabilities.architecture,
-            "resource_authority": self.execution_resource_authority,
+            "resource_authority": self.execution_planning_model,
             "source": "startup_preflight",
             "scheduler_policy": scheduler_policy,
             "effective_max_concurrent": effective_max_concurrent,
@@ -654,10 +655,10 @@ impl ResolvedFerrumConfig {
         let requested_policy = self
             .requested_attention_policy
             .map(AttentionExecutionPolicy::as_runtime_value);
-        if self.execution_resource_authority != ExecutionResourceAuthority::PlanRuntime {
+        if self.execution_planning_model != ExecutionPlanningModel::CompiledPlan {
             return serde_json::json!({
                 "schema_version": 1,
-                "resource_authority": self.execution_resource_authority,
+                "resource_authority": self.execution_planning_model,
                 "requested_policy": null,
                 "compiled_policy": null,
                 "selection_scope": "legacy_runtime",
@@ -669,7 +670,7 @@ impl ResolvedFerrumConfig {
             compiled_policy == Some(AttentionExecutionPolicy::NativeAdaptive.as_runtime_value());
         serde_json::json!({
             "schema_version": 1,
-            "resource_authority": self.execution_resource_authority,
+            "resource_authority": self.execution_planning_model,
             "requested_policy": requested_policy,
             "compiled_policy": compiled_policy,
             "selection_scope": "per_invocation",
@@ -771,7 +772,7 @@ pub struct FerrumConfigBuilder {
     model: ModelCapabilities,
     hardware: HardwareCapabilities,
     workload: WorkloadProfile,
-    execution_resource_authority: ExecutionResourceAuthority,
+    execution_planning_model: ExecutionPlanningModel,
     selected_kv_cache_layout: SelectedKvCacheLayout,
 }
 
@@ -782,7 +783,7 @@ impl FerrumConfigBuilder {
             model: ModelCapabilities::unknown(),
             hardware: HardwareCapabilities::unknown(),
             workload: WorkloadProfile::default(),
-            execution_resource_authority: ExecutionResourceAuthority::LegacyEngine,
+            execution_planning_model: ExecutionPlanningModel::ExecutorManaged,
             selected_kv_cache_layout: SelectedKvCacheLayout::Unknown,
         }
     }
@@ -811,11 +812,8 @@ impl FerrumConfigBuilder {
         self
     }
 
-    pub fn with_execution_resource_authority(
-        mut self,
-        authority: ExecutionResourceAuthority,
-    ) -> Self {
-        self.execution_resource_authority = authority;
+    pub fn with_execution_planning_model(mut self, authority: ExecutionPlanningModel) -> Self {
+        self.execution_planning_model = authority;
         self
     }
 
@@ -836,7 +834,7 @@ impl FerrumConfigBuilder {
                 "paged block size must be positive",
             );
         }
-        if self.execution_resource_authority == ExecutionResourceAuthority::PlanRuntime
+        if self.execution_planning_model == ExecutionPlanningModel::CompiledPlan
             && self.selected_kv_cache_layout != SelectedKvCacheLayout::Unknown
         {
             return self.invalid(
@@ -846,8 +844,7 @@ impl FerrumConfigBuilder {
         }
         let mut decisions = Vec::new();
         let cuda_backend = self.is_cuda_backend();
-        let plan_runtime =
-            self.execution_resource_authority == ExecutionResourceAuthority::PlanRuntime;
+        let plan_runtime = self.execution_planning_model == ExecutionPlanningModel::CompiledPlan;
         if plan_runtime {
             for key in [
                 "FERRUM_USE_VLLM_PAGED_ATTN",
@@ -857,7 +854,7 @@ impl FerrumConfigBuilder {
                     return Err(AutoConfigError::InvalidOverride {
                         key: key.to_owned(),
                         reason: format!(
-                            "legacy attention control does not apply to PlanRuntime; use FERRUM_ATTENTION_POLICY=auto|portable|native-adaptive"
+                            "legacy attention control does not apply to CompiledPlan; use FERRUM_ATTENTION_POLICY=auto|portable|native-adaptive"
                         ),
                     });
                 }
@@ -1244,7 +1241,7 @@ impl FerrumConfigBuilder {
         Ok(ResolvedFerrumConfig {
             schema_version: 1,
             preset: self.workload.preset.clone(),
-            execution_resource_authority: self.execution_resource_authority,
+            execution_planning_model: self.execution_planning_model,
             selected_kv_cache_layout: self.selected_kv_cache_layout,
             requested_attention_policy: plan_attention
                 .as_ref()
@@ -1377,7 +1374,7 @@ impl FerrumConfigBuilder {
         &self,
         max_sequences: &ResolvedValue<usize>,
     ) -> Option<ResolvedValue<usize>> {
-        if self.execution_resource_authority != ExecutionResourceAuthority::PlanRuntime
+        if self.execution_planning_model != ExecutionPlanningModel::CompiledPlan
             || max_sequences.value <= 1
         {
             return None;
@@ -2434,7 +2431,7 @@ impl FerrumConfigBuilder {
                 })?
                 .unwrap_or_default();
             if !self.is_cuda_backend()
-                || self.execution_resource_authority != ExecutionResourceAuthority::PlanRuntime
+                || self.execution_planning_model != ExecutionPlanningModel::CompiledPlan
                 || owner_mode != crate::SegmentBindingOwnerViewMode::Indexed
                 || upload != crate::ProgramBindingUploadStrategy::CompactScatter
             {
@@ -2514,7 +2511,7 @@ impl FerrumConfigBuilder {
             ),
         };
         if mode == crate::SamplingReadbackMode::Participant
-            && self.execution_resource_authority != ExecutionResourceAuthority::PlanRuntime
+            && self.execution_planning_model != ExecutionPlanningModel::CompiledPlan
         {
             return Err(AutoConfigError::InvalidOverride {
                 key: key.to_owned(),
@@ -2558,7 +2555,7 @@ impl FerrumConfigBuilder {
         };
         if strategy != crate::ProgramBindingUploadStrategy::Sparse
             && (!self.is_cuda_backend()
-                || self.execution_resource_authority != ExecutionResourceAuthority::PlanRuntime)
+                || self.execution_planning_model != ExecutionPlanningModel::CompiledPlan)
         {
             return Err(AutoConfigError::InvalidOverride {
                 key: key.to_owned(),
@@ -2615,7 +2612,7 @@ impl FerrumConfigBuilder {
                 })?
                 .unwrap_or_default();
             if !self.is_cuda_backend()
-                || self.execution_resource_authority != ExecutionResourceAuthority::PlanRuntime
+                || self.execution_planning_model != ExecutionPlanningModel::CompiledPlan
                 || !preparation.uses_decode_segment()
             {
                 return Err(AutoConfigError::InvalidOverride {
@@ -2659,7 +2656,7 @@ impl FerrumConfigBuilder {
         };
         if mode == crate::CausalDecodePreparationMode::Packed
             && (!self.is_cuda_backend()
-                || self.execution_resource_authority != ExecutionResourceAuthority::PlanRuntime
+                || self.execution_planning_model != ExecutionPlanningModel::CompiledPlan
                 || !self.hardware.compiled_features.vllm_paged_attn
                 || compiled_attention != Some(AttentionExecutionPolicy::NativeAdaptive))
         {
@@ -2717,7 +2714,7 @@ impl FerrumConfigBuilder {
                 })?
                 .unwrap_or_default();
             if !self.is_cuda_backend()
-                || self.execution_resource_authority != ExecutionResourceAuthority::PlanRuntime
+                || self.execution_planning_model != ExecutionPlanningModel::CompiledPlan
                 || !self.hardware.compiled_features.vllm_paged_attn
                 || !self
                     .hardware
@@ -2778,7 +2775,7 @@ impl FerrumConfigBuilder {
                 .map_err(invalid)?
                 .unwrap_or_default();
             if !self.is_cuda_backend()
-                || self.execution_resource_authority != ExecutionResourceAuthority::PlanRuntime
+                || self.execution_planning_model != ExecutionPlanningModel::CompiledPlan
                 || preparation != crate::InvocationPreparationStrategy::ResidentDecodeProgram
             {
                 return Err(invalid(format!(
@@ -2872,7 +2869,7 @@ impl FerrumConfigBuilder {
             mode,
             crate::Q4MmvqWeightDecode::SharedM8 | crate::Q4MmvqWeightDecode::SharedM4M8
         ) && (!self.is_cuda_backend()
-            || self.execution_resource_authority != ExecutionResourceAuthority::PlanRuntime
+            || self.execution_planning_model != ExecutionPlanningModel::CompiledPlan
             || !self.hardware.compiled_features.cuda_q4_shared_weight_decode)
         {
             return Err(AutoConfigError::InvalidOverride {
@@ -2913,7 +2910,7 @@ impl FerrumConfigBuilder {
             mode,
             crate::Q5MmvqWeightDecode::SharedM8 | crate::Q5MmvqWeightDecode::SharedM4M8
         ) && (!self.is_cuda_backend()
-            || self.execution_resource_authority != ExecutionResourceAuthority::PlanRuntime
+            || self.execution_planning_model != ExecutionPlanningModel::CompiledPlan
             || !self.hardware.compiled_features.cuda_q5_shared_weight_decode)
         {
             return Err(AutoConfigError::InvalidOverride {
@@ -2956,7 +2953,7 @@ impl FerrumConfigBuilder {
         if mode == crate::Q8ProjectionWeightPreparation::PredecodedF32
             && (!self.is_cuda_backend()
                 || !self.hardware.compiled_features.cuda
-                || self.execution_resource_authority != ExecutionResourceAuthority::PlanRuntime)
+                || self.execution_planning_model != ExecutionPlanningModel::CompiledPlan)
         {
             return Err(AutoConfigError::InvalidOverride {
                 key: key.to_owned(),
@@ -3548,11 +3545,11 @@ mod tests {
         ] {
             for value in ["", "0", "-1", "128"] {
                 for authority in [
-                    ExecutionResourceAuthority::LegacyEngine,
-                    ExecutionResourceAuthority::PlanRuntime,
+                    ExecutionPlanningModel::ExecutorManaged,
+                    ExecutionPlanningModel::CompiledPlan,
                 ] {
                     let error = FerrumConfigBuilder::new(snapshot(&[(key, value)]))
-                        .with_execution_resource_authority(authority)
+                        .with_execution_planning_model(authority)
                         .resolve()
                         .expect_err("native overrides must not affect executor selection");
                     assert!(matches!(error,
@@ -3573,11 +3570,11 @@ mod tests {
         ] {
             for value in ["", "false", "0", "1"] {
                 for authority in [
-                    ExecutionResourceAuthority::LegacyEngine,
-                    ExecutionResourceAuthority::PlanRuntime,
+                    ExecutionPlanningModel::ExecutorManaged,
+                    ExecutionPlanningModel::CompiledPlan,
                 ] {
                     let error = FerrumConfigBuilder::new(snapshot(&[(key, value)]))
-                        .with_execution_resource_authority(authority)
+                        .with_execution_planning_model(authority)
                         .resolve()
                         .expect_err("retired controls must not select ordinary decoding");
                     assert!(matches!(error,
@@ -3614,11 +3611,11 @@ mod tests {
         ] {
             for value in ["0", "1"] {
                 for authority in [
-                    ExecutionResourceAuthority::LegacyEngine,
-                    ExecutionResourceAuthority::PlanRuntime,
+                    ExecutionPlanningModel::ExecutorManaged,
+                    ExecutionPlanningModel::CompiledPlan,
                 ] {
                     let error = FerrumConfigBuilder::new(snapshot(&[(key, value)]))
-                        .with_execution_resource_authority(authority)
+                        .with_execution_planning_model(authority)
                         .resolve()
                         .expect_err("removed legacy controls cannot silently apply to typed MoE");
                     assert!(matches!(error,
@@ -3799,8 +3796,8 @@ mod tests {
             qwen35_moe_gptq_int4_model(),
         ] {
             for authority in [
-                ExecutionResourceAuthority::LegacyEngine,
-                ExecutionResourceAuthority::PlanRuntime,
+                ExecutionPlanningModel::ExecutorManaged,
+                ExecutionPlanningModel::CompiledPlan,
             ] {
                 let hardware = HardwareCapabilities::rtx4090_cuda(
                     CompiledKernelFeatures::m3_fast_path_without_fa2(),
@@ -3812,7 +3809,7 @@ mod tests {
                         .with_model_capabilities(model.clone())
                         .with_hardware_capabilities(hardware)
                         .with_workload_profile(workload)
-                        .with_execution_resource_authority(authority)
+                        .with_execution_planning_model(authority)
                         .resolve()
                         .unwrap();
                 assert!(resolved
@@ -3857,8 +3854,8 @@ mod tests {
     #[test]
     fn auto_config_rejects_retired_recurrent_state_slots_for_each_authority() {
         for authority in [
-            ExecutionResourceAuthority::LegacyEngine,
-            ExecutionResourceAuthority::PlanRuntime,
+            ExecutionPlanningModel::ExecutorManaged,
+            ExecutionPlanningModel::CompiledPlan,
         ] {
             for value in ["", "0", "16", "32"] {
                 let hardware = HardwareCapabilities::rtx4090_cuda(
@@ -3872,7 +3869,7 @@ mod tests {
                 .with_model_capabilities(synthetic_tight_recurrent_state_model())
                 .with_hardware_capabilities(hardware)
                 .with_workload_profile(workload)
-                .with_execution_resource_authority(authority)
+                .with_execution_planning_model(authority)
                 .resolve()
                 .unwrap_err();
                 assert!(matches!(error,
@@ -3892,13 +3889,13 @@ mod tests {
             .with_model_capabilities(synthetic_tight_recurrent_state_model())
             .with_hardware_capabilities(hardware)
             .with_workload_profile(workload)
-            .with_execution_resource_authority(ExecutionResourceAuthority::PlanRuntime)
+            .with_execution_planning_model(ExecutionPlanningModel::CompiledPlan)
             .resolve()
             .unwrap();
 
         assert_eq!(
-            resolved.execution_resource_authority,
-            ExecutionResourceAuthority::PlanRuntime
+            resolved.execution_planning_model,
+            ExecutionPlanningModel::CompiledPlan
         );
         assert_eq!(
             resolved.requested_attention_policy,
@@ -3961,8 +3958,8 @@ mod tests {
             HardwareCapabilities::rtx4090_cuda(CompiledKernelFeatures::m3_fast_path_without_fa2());
         let model = synthetic_tight_recurrent_state_model();
         for authority in [
-            ExecutionResourceAuthority::PlanRuntime,
-            ExecutionResourceAuthority::LegacyEngine,
+            ExecutionPlanningModel::CompiledPlan,
+            ExecutionPlanningModel::ExecutorManaged,
         ] {
             let document = FerrumConfigBuilder::new(snapshot(&[
                 ("FERRUM_KV_DTYPE", "int8"),
@@ -3970,7 +3967,7 @@ mod tests {
             ]))
             .with_model_capabilities(model.clone())
             .with_hardware_capabilities(hardware.clone())
-            .with_execution_resource_authority(authority)
+            .with_execution_planning_model(authority)
             .resolve()
             .unwrap()
             .effective_config_document();
@@ -4007,7 +4004,7 @@ mod tests {
             assert_eq!(estimate["source"], "legacy_f16_geometry_estimate");
             assert_eq!(estimate["applies_to_selected_state_layout"], false);
             assert_eq!(estimate["is_resident_usage"], false);
-            if authority == ExecutionResourceAuthority::PlanRuntime {
+            if authority == ExecutionPlanningModel::CompiledPlan {
                 assert_eq!(
                     estimate["selected_state_evidence_source"],
                     "executor.kv_storage.logical_sequence_state"
@@ -4027,7 +4024,7 @@ mod tests {
             }
             FerrumConfigBuilder::new(snapshot(&entries))
                 .with_hardware_capabilities(hardware.clone())
-                .with_execution_resource_authority(ExecutionResourceAuthority::PlanRuntime)
+                .with_execution_planning_model(ExecutionPlanningModel::CompiledPlan)
                 .resolve()
         };
         for requested in [None, Some("auto"), Some("portable")] {
@@ -4219,7 +4216,7 @@ mod tests {
             let resolved = FerrumConfigBuilder::new(entries)
                 .with_hardware_capabilities(hardware.clone())
                 .with_model_capabilities(model.clone())
-                .with_execution_resource_authority(ExecutionResourceAuthority::PlanRuntime)
+                .with_execution_planning_model(ExecutionPlanningModel::CompiledPlan)
                 .resolve()
                 .unwrap();
             let mut engine = crate::EngineConfig::default();
@@ -4235,7 +4232,7 @@ mod tests {
         let invalid = FerrumConfigBuilder::new(snapshot(&[("FERRUM_MAX_MODEL_LEN", "131073")]))
             .with_hardware_capabilities(hardware)
             .with_model_capabilities(model)
-            .with_execution_resource_authority(ExecutionResourceAuthority::PlanRuntime)
+            .with_execution_planning_model(ExecutionPlanningModel::CompiledPlan)
             .resolve()
             .unwrap_err();
         assert!(
@@ -4256,7 +4253,7 @@ mod tests {
                 .with_model_capabilities(synthetic_tight_recurrent_state_model())
                 .with_hardware_capabilities(hardware.clone())
                 .with_workload_profile(workload.clone())
-                .with_execution_resource_authority(ExecutionResourceAuthority::PlanRuntime)
+                .with_execution_planning_model(ExecutionPlanningModel::CompiledPlan)
                 .resolve()
                 .unwrap_err();
             assert!(matches!(
@@ -4278,7 +4275,7 @@ mod tests {
             .with_model_capabilities(synthetic_tight_recurrent_state_model())
             .with_hardware_capabilities(hardware)
             .with_workload_profile(workload)
-            .with_execution_resource_authority(ExecutionResourceAuthority::PlanRuntime)
+            .with_execution_planning_model(ExecutionPlanningModel::CompiledPlan)
             .resolve()
             .unwrap();
 
@@ -5596,7 +5593,7 @@ mod tests {
 
     fn scheduler_resolution(
         backend: &str,
-        authority: ExecutionResourceAuthority,
+        authority: ExecutionPlanningModel,
         sequences: usize,
         runtime_config: RuntimeConfigSnapshot,
     ) -> ResolvedFerrumConfig {
@@ -5607,7 +5604,7 @@ mod tests {
         FerrumConfigBuilder::new(runtime_config)
             .with_hardware_capabilities(hardware)
             .with_workload_profile(workload)
-            .with_execution_resource_authority(authority)
+            .with_execution_planning_model(authority)
             .resolve()
             .unwrap()
     }
@@ -5640,12 +5637,8 @@ mod tests {
             let snapshot = value
                 .map(|value| snapshot_with_sources(&[(key, value, runtime_source)]))
                 .unwrap_or_default();
-            let resolved = scheduler_resolution(
-                "metal",
-                ExecutionResourceAuthority::PlanRuntime,
-                4,
-                snapshot,
-            );
+            let resolved =
+                scheduler_resolution("metal", ExecutionPlanningModel::CompiledPlan, 4, snapshot);
             let expected = value.unwrap_or("split");
             let entry = resolved
                 .runtime_config
@@ -5685,7 +5678,7 @@ mod tests {
         let key = "FERRUM_SAMPLING_READBACK_MODE";
         let baseline = scheduler_resolution(
             "cpu",
-            ExecutionResourceAuthority::PlanRuntime,
+            ExecutionPlanningModel::CompiledPlan,
             4,
             RuntimeConfigSnapshot::default(),
         );
@@ -5720,7 +5713,7 @@ mod tests {
                 .map(|v| snapshot_with_sources(&[(key, v, runtime_source)]))
                 .unwrap_or_default();
             let resolved =
-                scheduler_resolution("cpu", ExecutionResourceAuthority::PlanRuntime, 4, snapshot);
+                scheduler_resolution("cpu", ExecutionPlanningModel::CompiledPlan, 4, snapshot);
             let expected = value.unwrap_or("uniform");
             let entry = resolved
                 .runtime_config
@@ -5754,11 +5747,11 @@ mod tests {
             );
         }
         for (value, authority) in [
-            ("automatic", ExecutionResourceAuthority::PlanRuntime),
-            ("participant", ExecutionResourceAuthority::LegacyEngine),
+            ("automatic", ExecutionPlanningModel::CompiledPlan),
+            ("participant", ExecutionPlanningModel::ExecutorManaged),
         ] {
             let error = FerrumConfigBuilder::new(snapshot(&[(key, value)]))
-                .with_execution_resource_authority(authority)
+                .with_execution_planning_model(authority)
                 .resolve()
                 .unwrap_err();
             assert!(
@@ -5805,12 +5798,8 @@ mod tests {
             let snapshot = value
                 .map(|value| snapshot_with_sources(&[(key, value, runtime_source)]))
                 .unwrap_or_default();
-            let resolved = scheduler_resolution(
-                "metal",
-                ExecutionResourceAuthority::PlanRuntime,
-                4,
-                snapshot,
-            );
+            let resolved =
+                scheduler_resolution("metal", ExecutionPlanningModel::CompiledPlan, 4, snapshot);
             let expected = value.unwrap_or("full");
             let entry = resolved
                 .runtime_config
@@ -5891,7 +5880,7 @@ mod tests {
                 }
                 let resolved = scheduler_resolution(
                     "cuda",
-                    ExecutionResourceAuthority::PlanRuntime,
+                    ExecutionPlanningModel::CompiledPlan,
                     4,
                     RuntimeConfigSnapshot::from_entries(entries),
                 );
@@ -5945,35 +5934,35 @@ mod tests {
             for (backend, authority, owner, upload, supported) in [
                 (
                     "cuda",
-                    ExecutionResourceAuthority::PlanRuntime,
+                    ExecutionPlanningModel::CompiledPlan,
                     "indexed",
                     "compact-scatter",
                     true,
                 ),
                 (
                     "metal",
-                    ExecutionResourceAuthority::PlanRuntime,
+                    ExecutionPlanningModel::CompiledPlan,
                     "indexed",
                     "compact-scatter",
                     false,
                 ),
                 (
                     "cuda",
-                    ExecutionResourceAuthority::LegacyEngine,
+                    ExecutionPlanningModel::ExecutorManaged,
                     "indexed",
                     "compact-scatter",
                     false,
                 ),
                 (
                     "cuda",
-                    ExecutionResourceAuthority::PlanRuntime,
+                    ExecutionPlanningModel::CompiledPlan,
                     "legacy",
                     "compact-scatter",
                     false,
                 ),
                 (
                     "cuda",
-                    ExecutionResourceAuthority::PlanRuntime,
+                    ExecutionPlanningModel::CompiledPlan,
                     "indexed",
                     "sparse",
                     false,
@@ -5997,7 +5986,7 @@ mod tests {
                 hardware.compiled_features.cuda = backend == "cuda";
                 let result = FerrumConfigBuilder::new(entries)
                     .with_hardware_capabilities(hardware)
-                    .with_execution_resource_authority(authority)
+                    .with_execution_planning_model(authority)
                     .resolve();
                 if supported {
                     let resolved = result.unwrap();
@@ -6068,7 +6057,7 @@ mod tests {
                 let resolved =
                     FerrumConfigBuilder::new(RuntimeConfigSnapshot::from_entries(entries))
                         .with_hardware_capabilities(hardware)
-                        .with_execution_resource_authority(ExecutionResourceAuthority::PlanRuntime)
+                        .with_execution_planning_model(ExecutionPlanningModel::CompiledPlan)
                         .resolve()
                         .unwrap();
                 let expected = grouping.unwrap_or("fixed-execution-capacity");
@@ -6151,7 +6140,7 @@ mod tests {
             for (backend, authority, compiled, policy, kv, preparation, source) in [
                 (
                     "cuda",
-                    ExecutionResourceAuthority::PlanRuntime,
+                    ExecutionPlanningModel::CompiledPlan,
                     true,
                     "auto",
                     "fp16",
@@ -6160,7 +6149,7 @@ mod tests {
                 ),
                 (
                     "cpu",
-                    ExecutionResourceAuthority::PlanRuntime,
+                    ExecutionPlanningModel::CompiledPlan,
                     true,
                     "auto",
                     "fp16",
@@ -6169,7 +6158,7 @@ mod tests {
                 ),
                 (
                     "metal",
-                    ExecutionResourceAuthority::PlanRuntime,
+                    ExecutionPlanningModel::CompiledPlan,
                     true,
                     "auto",
                     "fp16",
@@ -6178,7 +6167,7 @@ mod tests {
                 ),
                 (
                     "cuda",
-                    ExecutionResourceAuthority::LegacyEngine,
+                    ExecutionPlanningModel::ExecutorManaged,
                     true,
                     "auto",
                     "fp16",
@@ -6187,7 +6176,7 @@ mod tests {
                 ),
                 (
                     "cuda",
-                    ExecutionResourceAuthority::PlanRuntime,
+                    ExecutionPlanningModel::CompiledPlan,
                     false,
                     "auto",
                     "fp16",
@@ -6196,7 +6185,7 @@ mod tests {
                 ),
                 (
                     "cuda",
-                    ExecutionResourceAuthority::PlanRuntime,
+                    ExecutionPlanningModel::CompiledPlan,
                     true,
                     "portable",
                     "fp16",
@@ -6205,7 +6194,7 @@ mod tests {
                 ),
                 (
                     "cuda",
-                    ExecutionResourceAuthority::PlanRuntime,
+                    ExecutionPlanningModel::CompiledPlan,
                     true,
                     "auto",
                     "int8",
@@ -6214,7 +6203,7 @@ mod tests {
                 ),
                 (
                     "cuda",
-                    ExecutionResourceAuthority::PlanRuntime,
+                    ExecutionPlanningModel::CompiledPlan,
                     true,
                     "auto",
                     "fp16",
@@ -6246,7 +6235,7 @@ mod tests {
                 hardware.supported_kv_dtypes = vec!["fp16".to_owned(), "int8".to_owned()];
                 let error = FerrumConfigBuilder::new(RuntimeConfigSnapshot::from_entries(entries))
                     .with_hardware_capabilities(hardware)
-                    .with_execution_resource_authority(authority)
+                    .with_execution_planning_model(authority)
                     .resolve()
                     .unwrap_err();
                 assert!(
@@ -6305,7 +6294,7 @@ mod tests {
             hardware.compiled_features.cuda_causal_gqa2 = compiled;
             let result = FerrumConfigBuilder::new(entries)
                 .with_hardware_capabilities(hardware)
-                .with_execution_resource_authority(ExecutionResourceAuthority::PlanRuntime)
+                .with_execution_planning_model(ExecutionPlanningModel::CompiledPlan)
                 .resolve();
             assert_eq!(result.is_ok(), supported, "{mode}/{grouping}: {result:?}");
             if let Ok(resolved) = result {
@@ -6364,7 +6353,7 @@ mod tests {
                 hardware.compiled_features.cuda_indexed_causal_attention = compiled;
                 let result = FerrumConfigBuilder::new(entries)
                     .with_hardware_capabilities(hardware)
-                    .with_execution_resource_authority(ExecutionResourceAuthority::PlanRuntime)
+                    .with_execution_planning_model(ExecutionPlanningModel::CompiledPlan)
                     .resolve();
                 if grouping != "contiguous" && !compiled {
                     assert!(
@@ -6419,9 +6408,7 @@ mod tests {
                     let resolved =
                         FerrumConfigBuilder::new(RuntimeConfigSnapshot::from_entries(entries))
                             .with_hardware_capabilities(hardware)
-                            .with_execution_resource_authority(
-                                ExecutionResourceAuthority::PlanRuntime,
-                            )
+                            .with_execution_planning_model(ExecutionPlanningModel::CompiledPlan)
                             .resolve()
                             .unwrap();
                     let expected = mode.unwrap_or("packed");
@@ -6481,7 +6468,7 @@ mod tests {
         for (backend, authority, compiled, policy, kv, source) in [
             (
                 "cuda",
-                ExecutionResourceAuthority::PlanRuntime,
+                ExecutionPlanningModel::CompiledPlan,
                 true,
                 "auto",
                 "fp16",
@@ -6489,7 +6476,7 @@ mod tests {
             ),
             (
                 "cpu",
-                ExecutionResourceAuthority::PlanRuntime,
+                ExecutionPlanningModel::CompiledPlan,
                 true,
                 "auto",
                 "fp16",
@@ -6497,7 +6484,7 @@ mod tests {
             ),
             (
                 "metal",
-                ExecutionResourceAuthority::PlanRuntime,
+                ExecutionPlanningModel::CompiledPlan,
                 true,
                 "auto",
                 "fp16",
@@ -6505,7 +6492,7 @@ mod tests {
             ),
             (
                 "cuda",
-                ExecutionResourceAuthority::LegacyEngine,
+                ExecutionPlanningModel::ExecutorManaged,
                 true,
                 "auto",
                 "fp16",
@@ -6513,7 +6500,7 @@ mod tests {
             ),
             (
                 "cuda",
-                ExecutionResourceAuthority::PlanRuntime,
+                ExecutionPlanningModel::CompiledPlan,
                 false,
                 "auto",
                 "fp16",
@@ -6521,7 +6508,7 @@ mod tests {
             ),
             (
                 "cuda",
-                ExecutionResourceAuthority::PlanRuntime,
+                ExecutionPlanningModel::CompiledPlan,
                 true,
                 "portable",
                 "fp16",
@@ -6529,7 +6516,7 @@ mod tests {
             ),
             (
                 "cuda",
-                ExecutionResourceAuthority::PlanRuntime,
+                ExecutionPlanningModel::CompiledPlan,
                 true,
                 "auto",
                 "int8",
@@ -6550,7 +6537,7 @@ mod tests {
             hardware.supported_kv_dtypes = vec!["fp16".to_owned(), "int8".to_owned()];
             let error = FerrumConfigBuilder::new(entries)
                 .with_hardware_capabilities(hardware)
-                .with_execution_resource_authority(authority)
+                .with_execution_planning_model(authority)
                 .resolve()
                 .unwrap_err();
             assert!(
@@ -6566,37 +6553,37 @@ mod tests {
         for (backend, authority, preparation, source) in [
             (
                 "cuda",
-                ExecutionResourceAuthority::PlanRuntime,
+                ExecutionPlanningModel::CompiledPlan,
                 "decode-segment",
                 RuntimeConfigSource::Env,
             ),
             (
                 "cpu",
-                ExecutionResourceAuthority::PlanRuntime,
+                ExecutionPlanningModel::CompiledPlan,
                 "decode-segment",
                 RuntimeConfigSource::Cli,
             ),
             (
                 "metal",
-                ExecutionResourceAuthority::PlanRuntime,
+                ExecutionPlanningModel::CompiledPlan,
                 "decode-segment",
                 RuntimeConfigSource::Cli,
             ),
             (
                 "cuda",
-                ExecutionResourceAuthority::LegacyEngine,
+                ExecutionPlanningModel::ExecutorManaged,
                 "decode-segment",
                 RuntimeConfigSource::Cli,
             ),
             (
                 "cuda",
-                ExecutionResourceAuthority::PlanRuntime,
+                ExecutionPlanningModel::CompiledPlan,
                 "full",
                 RuntimeConfigSource::Cli,
             ),
             (
                 "cuda",
-                ExecutionResourceAuthority::PlanRuntime,
+                ExecutionPlanningModel::CompiledPlan,
                 "identity-projection",
                 RuntimeConfigSource::Cli,
             ),
@@ -6613,7 +6600,7 @@ mod tests {
             hardware.backend = backend.to_owned();
             let error = FerrumConfigBuilder::new(snapshot)
                 .with_hardware_capabilities(hardware)
-                .with_execution_resource_authority(authority)
+                .with_execution_planning_model(authority)
                 .resolve()
                 .unwrap_err();
             assert!(
@@ -6623,7 +6610,7 @@ mod tests {
         for backend in ["cpu", "metal", "cuda"] {
             scheduler_resolution(
                 backend,
-                ExecutionResourceAuthority::LegacyEngine,
+                ExecutionPlanningModel::ExecutorManaged,
                 4,
                 RuntimeConfigSnapshot::default(),
             );
@@ -6644,7 +6631,7 @@ mod tests {
                     .unwrap_or_default();
                 let resolved = scheduler_resolution(
                     backend,
-                    ExecutionResourceAuthority::PlanRuntime,
+                    ExecutionPlanningModel::CompiledPlan,
                     4,
                     snapshot,
                 );
@@ -6720,7 +6707,7 @@ mod tests {
                 .map(|value| snapshot_with_sources(&[(key, value, runtime_source)]))
                 .unwrap_or_default();
             let resolved =
-                scheduler_resolution("cuda", ExecutionResourceAuthority::PlanRuntime, 4, snapshot);
+                scheduler_resolution("cuda", ExecutionPlanningModel::CompiledPlan, 4, snapshot);
             let expected = value.unwrap_or("sparse");
             let entry = resolved
                 .runtime_config
@@ -6758,16 +6745,16 @@ mod tests {
             matches!(error, AutoConfigError::InvalidOverride { key: actual, .. } if actual == key)
         );
         for (backend, authority) in [
-            ("cpu", ExecutionResourceAuthority::PlanRuntime),
-            ("metal", ExecutionResourceAuthority::PlanRuntime),
-            ("cuda", ExecutionResourceAuthority::LegacyEngine),
+            ("cpu", ExecutionPlanningModel::CompiledPlan),
+            ("metal", ExecutionPlanningModel::CompiledPlan),
+            ("cuda", ExecutionPlanningModel::ExecutorManaged),
         ] {
             let mut hardware = HardwareCapabilities::unknown();
             hardware.backend = backend.to_owned();
             for strategy in ["uniform-live-prefix", "compact-scatter"] {
                 let error = FerrumConfigBuilder::new(snapshot(&[(key, strategy)]))
                     .with_hardware_capabilities(hardware.clone())
-                    .with_execution_resource_authority(authority)
+                    .with_execution_planning_model(authority)
                     .resolve()
                     .unwrap_err();
                 assert!(
@@ -6793,7 +6780,7 @@ mod tests {
             ] {
                 let resolved = scheduler_resolution(
                     backend,
-                    ExecutionResourceAuthority::PlanRuntime,
+                    ExecutionPlanningModel::CompiledPlan,
                     4,
                     snapshot_with_sources(&[(key, value, runtime_source)]),
                 );
@@ -6835,7 +6822,7 @@ mod tests {
         for backend in ["cpu", "metal", "cuda"] {
             let resolved = scheduler_resolution(
                 backend,
-                ExecutionResourceAuthority::PlanRuntime,
+                ExecutionPlanningModel::CompiledPlan,
                 4,
                 snapshot(&[]),
             );
@@ -6880,7 +6867,7 @@ mod tests {
     fn metal_plan_active_prefill_default_reaches_engine_and_decision_trace() {
         let resolved = scheduler_resolution(
             "metal",
-            ExecutionResourceAuthority::PlanRuntime,
+            ExecutionPlanningModel::CompiledPlan,
             4,
             snapshot(&[]),
         );
@@ -6915,10 +6902,10 @@ mod tests {
     #[test]
     fn active_prefill_default_does_not_change_other_execution_paths() {
         for (backend, authority, sequences) in [
-            ("metal", ExecutionResourceAuthority::PlanRuntime, 1),
-            ("metal", ExecutionResourceAuthority::LegacyEngine, 4),
-            ("cpu", ExecutionResourceAuthority::PlanRuntime, 4),
-            ("cuda", ExecutionResourceAuthority::PlanRuntime, 4),
+            ("metal", ExecutionPlanningModel::CompiledPlan, 1),
+            ("metal", ExecutionPlanningModel::ExecutorManaged, 4),
+            ("cpu", ExecutionPlanningModel::CompiledPlan, 4),
+            ("cuda", ExecutionPlanningModel::CompiledPlan, 4),
         ] {
             let resolved = scheduler_resolution(backend, authority, sequences, snapshot(&[]));
             let mut engine = crate::EngineConfig::default();
@@ -6954,15 +6941,15 @@ mod tests {
             FerrumConfigBuilder::new(RuntimeConfigSnapshot::from_entries(entry))
                 .with_hardware_capabilities(hardware)
                 .with_workload_profile(workload)
-                .with_execution_resource_authority(authority)
+                .with_execution_planning_model(authority)
                 .resolve()
                 .unwrap()
         };
         for (authority, sequences, compiled_cuda, expected) in [
-            (ExecutionResourceAuthority::PlanRuntime, 4, true, Some(256)),
-            (ExecutionResourceAuthority::PlanRuntime, 1, true, None),
-            (ExecutionResourceAuthority::LegacyEngine, 4, true, None),
-            (ExecutionResourceAuthority::PlanRuntime, 4, false, None),
+            (ExecutionPlanningModel::CompiledPlan, 4, true, Some(256)),
+            (ExecutionPlanningModel::CompiledPlan, 1, true, None),
+            (ExecutionPlanningModel::ExecutorManaged, 4, true, None),
+            (ExecutionPlanningModel::CompiledPlan, 4, false, None),
         ] {
             let resolved = resolve(authority, sequences, compiled_cuda, None);
             let mut engine = crate::EngineConfig::default();
@@ -7004,7 +6991,7 @@ mod tests {
             ("32", RuntimeConfigSource::Default),
         ] {
             let resolved = resolve(
-                ExecutionResourceAuthority::PlanRuntime,
+                ExecutionPlanningModel::CompiledPlan,
                 4,
                 true,
                 Some(RuntimeConfigEntry::new(key, value, source)),
@@ -7052,7 +7039,7 @@ mod tests {
         ] {
             let resolved = scheduler_resolution(
                 "metal",
-                ExecutionResourceAuthority::PlanRuntime,
+                ExecutionPlanningModel::CompiledPlan,
                 4,
                 snapshot_with_sources(&[(
                     "FERRUM_ACTIVE_DECODE_PREFILL_CHUNK",
@@ -7101,7 +7088,7 @@ mod tests {
         ] {
             let resolved = scheduler_resolution(
                 "metal",
-                ExecutionResourceAuthority::PlanRuntime,
+                ExecutionPlanningModel::CompiledPlan,
                 4,
                 snapshot_with_sources(&[(key, value, RuntimeConfigSource::Cli)]),
             );
@@ -7317,6 +7304,37 @@ mod tests {
     }
 
     #[test]
+    fn execution_planning_model_preserves_resolved_config_wire_and_runtime_hash() {
+        for (planning_model, wire_label) in [
+            (ExecutionPlanningModel::ExecutorManaged, "legacy_engine"),
+            (ExecutionPlanningModel::CompiledPlan, "plan_runtime"),
+        ] {
+            let resolved = FerrumConfigBuilder::new(RuntimeConfigSnapshot::default())
+                .with_execution_planning_model(planning_model)
+                .resolve()
+                .unwrap();
+            let historical_wire = serde_json::to_value(&resolved).unwrap();
+            assert_eq!(historical_wire["execution_resource_authority"], wire_label);
+            assert!(historical_wire.get("execution_planning_model").is_none());
+            let reread: ResolvedFerrumConfig =
+                serde_json::from_value(historical_wire.clone()).unwrap();
+            assert_eq!(reread.execution_planning_model, planning_model);
+            assert_eq!(reread.runtime_config, resolved.runtime_config);
+            assert_eq!(reread.runtime_env_hash(), resolved.runtime_env_hash());
+            assert_eq!(serde_json::to_value(&reread).unwrap(), historical_wire);
+            let effective = reread.effective_config_document();
+            assert_eq!(effective["schema_version"], 1);
+            assert_eq!(effective["execution_resource_authority"], wire_label);
+            assert_eq!(effective["admission"]["resource_authority"], wire_label);
+            assert_eq!(
+                effective["attention_execution"]["resource_authority"],
+                wire_label
+            );
+            assert!(effective.get("execution_planning_model").is_none());
+        }
+    }
+
+    #[test]
     fn renders_effective_config_and_decision_trace_artifacts() {
         let resolved = m3(&[], CompiledKernelFeatures::m3_fast_path_without_fa2())
             .resolve()
@@ -7450,8 +7468,8 @@ mod tests {
         let key = crate::Q4_MMVQ_WEIGHT_DECODE_CONFIG_KEY;
         for backend in ["cpu", "metal", "cuda"] {
             for authority in [
-                ExecutionResourceAuthority::LegacyEngine,
-                ExecutionResourceAuthority::PlanRuntime,
+                ExecutionPlanningModel::ExecutorManaged,
+                ExecutionPlanningModel::CompiledPlan,
             ] {
                 for compiled in [false, true] {
                     for mode in ["baseline", "shared-m8", "shared-m4-m8"] {
@@ -7464,11 +7482,11 @@ mod tests {
                                 RuntimeConfigEntry::new(key, mode, RuntimeConfigSource::Cli),
                             ]))
                             .with_hardware_capabilities(hardware)
-                            .with_execution_resource_authority(authority);
+                            .with_execution_planning_model(authority);
                         let result = builder.resolve();
                         let supported = mode == "baseline"
                             || (backend == "cuda"
-                                && authority == ExecutionResourceAuthority::PlanRuntime
+                                && authority == ExecutionPlanningModel::CompiledPlan
                                 && compiled);
                         if supported {
                             let resolved = result.unwrap();
@@ -7508,7 +7526,7 @@ mod tests {
                 RuntimeConfigEntry::new(key, "shared-m8", source),
             ]))
             .with_hardware_capabilities(hardware)
-            .with_execution_resource_authority(ExecutionResourceAuthority::PlanRuntime)
+            .with_execution_planning_model(ExecutionPlanningModel::CompiledPlan)
             .resolve()
             .unwrap();
             let entry = resolved
@@ -7525,8 +7543,8 @@ mod tests {
         let key = crate::Q5_MMVQ_WEIGHT_DECODE_CONFIG_KEY;
         for backend in ["cpu", "metal", "cuda"] {
             for authority in [
-                ExecutionResourceAuthority::LegacyEngine,
-                ExecutionResourceAuthority::PlanRuntime,
+                ExecutionPlanningModel::ExecutorManaged,
+                ExecutionPlanningModel::CompiledPlan,
             ] {
                 for compiled in [false, true] {
                     for mode in ["baseline", "shared-m8", "shared-m4-m8"] {
@@ -7539,11 +7557,11 @@ mod tests {
                                 RuntimeConfigEntry::new(key, mode, RuntimeConfigSource::Cli),
                             ]))
                             .with_hardware_capabilities(hardware)
-                            .with_execution_resource_authority(authority);
+                            .with_execution_planning_model(authority);
                         let result = builder.resolve();
                         let supported = mode == "baseline"
                             || (backend == "cuda"
-                                && authority == ExecutionResourceAuthority::PlanRuntime
+                                && authority == ExecutionPlanningModel::CompiledPlan
                                 && compiled);
                         if supported {
                             let resolved = result.unwrap();
@@ -7583,7 +7601,7 @@ mod tests {
                 RuntimeConfigEntry::new(key, "shared-m8", source),
             ]))
             .with_hardware_capabilities(hardware)
-            .with_execution_resource_authority(ExecutionResourceAuthority::PlanRuntime)
+            .with_execution_planning_model(ExecutionPlanningModel::CompiledPlan)
             .resolve()
             .unwrap();
             let entry = resolved
@@ -7601,8 +7619,8 @@ mod tests {
         let key = crate::Q8_PROJECTION_WEIGHT_PREPARATION_CONFIG_KEY;
         for backend in ["cpu", "cuda"] {
             for authority in [
-                ExecutionResourceAuthority::LegacyEngine,
-                ExecutionResourceAuthority::PlanRuntime,
+                ExecutionPlanningModel::ExecutorManaged,
+                ExecutionPlanningModel::CompiledPlan,
             ] {
                 for compiled in [false, true] {
                     for mode in ["auto", "compressed", "predecoded-f32"] {
@@ -7614,12 +7632,12 @@ mod tests {
                                 RuntimeConfigEntry::new(key, mode, RuntimeConfigSource::Cli),
                             ]))
                             .with_hardware_capabilities(hardware)
-                            .with_execution_resource_authority(authority)
+                            .with_execution_planning_model(authority)
                             .resolve();
                         let supported = mode != "predecoded-f32"
                             || (backend == "cuda"
                                 && compiled
-                                && authority == ExecutionResourceAuthority::PlanRuntime);
+                                && authority == ExecutionPlanningModel::CompiledPlan);
                         if supported {
                             let resolved = result.unwrap();
                             let mut engine = crate::EngineConfig::default();
@@ -7739,42 +7757,48 @@ mod tests {
     #[test]
     fn sequence_backing_growth_requires_explicit_cuda_resident_execution() {
         let key = crate::SEQUENCE_BACKING_GROWTH_CONFIG_KEY;
-        use ExecutionResourceAuthority::{LegacyEngine, PlanRuntime};
+        use ExecutionPlanningModel::{CompiledPlan, ExecutorManaged};
         for (backend, authority, preparation, mode, supported) in [
-            ("cpu", PlanRuntime, "full", "exact", true),
+            ("cpu", CompiledPlan, "full", "exact", true),
             (
                 "cuda",
-                PlanRuntime,
+                CompiledPlan,
                 "resident-decode-program",
                 "paged-group4",
                 true,
             ),
-            ("cuda", PlanRuntime, "full", "paged-group4", false),
+            ("cuda", CompiledPlan, "full", "paged-group4", false),
             (
                 "cuda",
-                PlanRuntime,
+                CompiledPlan,
                 "resident-decode-program",
                 "paged-group4-grow-only",
                 true,
             ),
-            ("cuda", PlanRuntime, "full", "paged-group4-grow-only", false),
+            (
+                "cuda",
+                CompiledPlan,
+                "full",
+                "paged-group4-grow-only",
+                false,
+            ),
             (
                 "cpu",
-                PlanRuntime,
+                CompiledPlan,
                 "resident-decode-program",
                 "paged-group4-grow-only",
                 false,
             ),
             (
                 "metal",
-                PlanRuntime,
+                CompiledPlan,
                 "resident-decode-program",
                 "paged-group4-grow-only",
                 false,
             ),
             (
                 "cuda",
-                LegacyEngine,
+                ExecutorManaged,
                 "resident-decode-program",
                 "paged-group4-grow-only",
                 false,
@@ -7808,7 +7832,7 @@ mod tests {
             hardware.compiled_features.cuda = backend == "cuda";
             let builder = FerrumConfigBuilder::new(entries)
                 .with_hardware_capabilities(hardware)
-                .with_execution_resource_authority(authority);
+                .with_execution_planning_model(authority);
             assert_eq!(
                 builder.sequence_backing_growth_decision().is_ok(),
                 supported

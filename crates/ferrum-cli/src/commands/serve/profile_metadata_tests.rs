@@ -7,7 +7,7 @@ fn config() -> ResolvedFerrumConfig {
     startup_auto_config(
         HardwareCapabilities::unknown(),
         Some(ModelCapabilities::unknown()),
-        ferrum_types::ExecutionResourceAuthority::PlanRuntime,
+        ferrum_types::ExecutionPlanningModel::CompiledPlan,
         ferrum_types::SelectedKvCacheLayout::Unknown,
         None,
         None,

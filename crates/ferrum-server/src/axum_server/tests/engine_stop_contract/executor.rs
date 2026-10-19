@@ -2,7 +2,7 @@
 use super::*;
 use ferrum_execution::{
     model_executor::{
-        ExecutionResourceAuthority, ExecutorCapabilities, ExecutorSamplingOutput,
+        ExecutionPlanningModel, ExecutorCapabilities, ExecutorSamplingOutput,
         ExecutorSequenceCompletion, ExecutorStatus, PlanRuntimeResourceSnapshot,
     },
     token_execution::*,
@@ -206,8 +206,8 @@ impl ModelExecutor for ScriptedExecutor {
     }
     // The explicit composition fixture retains its declared limits. There are
     // no fake native epochs: actual token closure signals scheduler progress.
-    fn execution_resource_authority(&self) -> ExecutionResourceAuthority {
-        ExecutionResourceAuthority::PlanRuntime
+    fn execution_planning_model(&self) -> ExecutionPlanningModel {
+        ExecutionPlanningModel::CompiledPlan
     }
     fn admission_limits(&self) -> Result<Option<ExecutorAdmissionLimits>> {
         ExecutorAdmissionLimits::new(1, 256)

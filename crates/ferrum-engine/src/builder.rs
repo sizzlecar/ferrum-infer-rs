@@ -350,10 +350,10 @@ impl EngineBuilder {
             plan.apply_to_engine_config(&mut config)
                 .map_err(FerrumError::config)?;
         }
-        let execution_resource_authority = executor.execution_resource_authority();
+        let execution_planning_model = executor.execution_planning_model();
 
-        if execution_resource_authority
-            == ferrum_execution::model_executor::ExecutionResourceAuthority::PlanRuntime
+        if execution_planning_model
+            == ferrum_execution::model_executor::ExecutionPlanningModel::CompiledPlan
             && executor.resolved_model_plan().is_none()
         {
             return Err(FerrumError::config(
@@ -485,8 +485,7 @@ mod tests {
     use super::*;
     use ferrum_execution::executor_lifecycle::{ExecutorShutdownObserver, ExecutorShutdownPermit};
     use ferrum_execution::model_executor::{
-        ExecutionResourceAuthority, ExecutorCapabilities, ExecutorStatus,
-        PlanRuntimeResourceSnapshot,
+        ExecutionPlanningModel, ExecutorCapabilities, ExecutorStatus, PlanRuntimeResourceSnapshot,
     };
     use ferrum_execution::ProductExecutionEventSink;
     use ferrum_runtime::ExecutionEventSink;
@@ -693,8 +692,8 @@ mod tests {
             self.inner.info()
         }
 
-        fn execution_resource_authority(&self) -> ExecutionResourceAuthority {
-            ExecutionResourceAuthority::PlanRuntime
+        fn execution_planning_model(&self) -> ExecutionPlanningModel {
+            ExecutionPlanningModel::CompiledPlan
         }
 
         fn plan_runtime_resource_snapshot(&self) -> Result<Option<PlanRuntimeResourceSnapshot>> {

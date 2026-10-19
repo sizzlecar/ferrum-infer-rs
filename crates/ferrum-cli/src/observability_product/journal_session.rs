@@ -542,8 +542,8 @@ impl ferrum_interfaces::engine::LlmInferenceEngine for ProductEngineHandle {
     fn adapter_execution_support(&self) -> ferrum_interfaces::adapter::AdapterExecutionSupport {
         self.engine.adapter_execution_support()
     }
-    fn execution_resource_authority(&self) -> ferrum_types::ExecutionResourceAuthority {
-        self.engine.execution_resource_authority()
+    fn execution_planning_model(&self) -> ferrum_types::ExecutionPlanningModel {
+        self.engine.execution_planning_model()
     }
     fn context_capacity(&self) -> Option<usize> {
         self.engine.context_capacity()

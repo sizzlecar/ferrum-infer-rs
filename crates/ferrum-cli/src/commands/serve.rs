@@ -964,17 +964,17 @@ async fn run_serve_lifecycle(
     if let Some(selection) = &gpu_selection {
         startup_cli_runtime_entries.extend(selection.runtime_config_entries());
     }
-    let execution_resource_authority = if defined_model.is_some() {
-        ferrum_types::ExecutionResourceAuthority::PlanRuntime
+    let execution_planning_model = if defined_model.is_some() {
+        ferrum_types::ExecutionPlanningModel::CompiledPlan
     } else {
-        ferrum_types::ExecutionResourceAuthority::LegacyEngine
+        ferrum_types::ExecutionPlanningModel::ExecutorManaged
     };
     let mut runtime_config = merge_runtime_config_sources(
         non_env_runtime_entries,
         user_environment,
         startup_cli_runtime_entries,
     );
-    if execution_resource_authority == ferrum_types::ExecutionResourceAuthority::LegacyEngine {
+    if execution_planning_model == ferrum_types::ExecutionPlanningModel::ExecutorManaged {
         let entries = crate::gpu_mem_autosize::auto_size_runtime_entries(
             &source.local_path,
             gpu_memory_utilization,
@@ -987,7 +987,7 @@ async fn run_serve_lifecycle(
     }
     let startup_memory_request = crate::startup::memory_request(
         &device,
-        execution_resource_authority,
+        execution_planning_model,
         gpu_memory_utilization,
         &runtime_config,
     )?;
@@ -1003,7 +1003,7 @@ async fn run_serve_lifecycle(
         })
         .transpose()?;
     let selected_kv_cache_layout = crate::startup::selected_kv_cache_layout(
-        execution_resource_authority,
+        execution_planning_model,
         model_definition.as_ref(),
         Some(&source.local_path),
         &device,
@@ -1013,7 +1013,7 @@ async fn run_serve_lifecycle(
     let mut startup_auto_config = startup_auto_config(
         hardware,
         typed_model_capabilities,
-        execution_resource_authority,
+        execution_planning_model,
         selected_kv_cache_layout,
         arch_for_dispatch,
         model_definition.as_ref(),
@@ -1457,7 +1457,7 @@ fn parse_lora_specs(values: &[String]) -> Result<Vec<ferrum_models::StartupLoraS
 fn startup_auto_config(
     hardware: HardwareCapabilities,
     typed_model_capabilities: Option<ModelCapabilities>,
-    execution_resource_authority: ferrum_types::ExecutionResourceAuthority,
+    execution_planning_model: ferrum_types::ExecutionPlanningModel,
     selected_kv_cache_layout: ferrum_types::SelectedKvCacheLayout,
     architecture: Option<ferrum_models::Architecture>,
     model_definition: Option<&ferrum_models::ModelDefinition>,
@@ -1497,7 +1497,7 @@ fn startup_auto_config(
         model,
         hardware,
         workload,
-        execution_resource_authority,
+        execution_planning_model,
         selected_kv_cache_layout,
         crate::startup::StartupUsage::PersistentServing,
     )
@@ -3886,7 +3886,7 @@ mod tests {
             window.clone(),
         ]);
         let device = ferrum_types::Device::CPU;
-        let authority = ferrum_types::ExecutionResourceAuthority::LegacyEngine;
+        let authority = ferrum_types::ExecutionPlanningModel::ExecutorManaged;
         let mut engine = ferrum_types::EngineConfig::default();
         let layout = crate::startup::selected_kv_cache_layout(
             authority,
@@ -3933,7 +3933,7 @@ mod tests {
         let resolved = startup_auto_config(
             HardwareCapabilities::unknown(),
             Some(ModelCapabilities::unknown()),
-            ferrum_types::ExecutionResourceAuthority::PlanRuntime,
+            ferrum_types::ExecutionPlanningModel::CompiledPlan,
             ferrum_types::SelectedKvCacheLayout::Unknown,
             None,
             None,
@@ -4081,7 +4081,7 @@ mod tests {
             let resolved = startup_auto_config(
                 HardwareCapabilities::unknown(),
                 Some(ModelCapabilities::unknown()),
-                ferrum_types::ExecutionResourceAuthority::PlanRuntime,
+                ferrum_types::ExecutionPlanningModel::CompiledPlan,
                 ferrum_types::SelectedKvCacheLayout::Unknown,
                 None,
                 None,

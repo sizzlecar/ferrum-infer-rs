@@ -1158,12 +1158,12 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
         &effective_runtime_config,
         &mut engine_config.backend.backend_options,
     )?;
-    let execution_resource_authority = if defined_model.is_some() {
-        ferrum_types::ExecutionResourceAuthority::PlanRuntime
+    let execution_planning_model = if defined_model.is_some() {
+        ferrum_types::ExecutionPlanningModel::CompiledPlan
     } else {
-        ferrum_types::ExecutionResourceAuthority::LegacyEngine
+        ferrum_types::ExecutionPlanningModel::ExecutorManaged
     };
-    if execution_resource_authority == ferrum_types::ExecutionResourceAuthority::LegacyEngine {
+    if execution_planning_model == ferrum_types::ExecutionPlanningModel::ExecutorManaged {
         if let Some((profile, utilization)) =
             run_autosize_for_device(&device, cmd.gpu_memory_utilization)
         {
@@ -1198,13 +1198,13 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
         .transpose()?;
     let startup_memory_request = crate::startup::memory_request(
         &device,
-        execution_resource_authority,
+        execution_planning_model,
         cmd.gpu_memory_utilization,
         &effective_runtime_config,
     )?;
     let hardware = crate::startup::hardware_for_request(&device, startup_memory_request.as_ref());
     let selected_kv_cache_layout = crate::startup::selected_kv_cache_layout(
-        execution_resource_authority,
+        execution_planning_model,
         model_definition_for_config.as_ref(),
         Some(&source.local_path),
         &device,
@@ -1214,7 +1214,7 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
     let mut startup_auto_config = run_startup_auto_config(
         hardware,
         typed_model_capabilities,
-        execution_resource_authority,
+        execution_planning_model,
         selected_kv_cache_layout,
         model_definition_for_config.as_ref(),
         crate::commands::serve::model_weight_bytes_from_path(&source.local_path),
@@ -2928,7 +2928,7 @@ fn bool_cli_override(enable: bool, disable: bool) -> Option<bool> {
 fn run_startup_auto_config(
     hardware: ferrum_types::HardwareCapabilities,
     typed_model_capabilities: Option<ModelCapabilities>,
-    execution_resource_authority: ferrum_types::ExecutionResourceAuthority,
+    execution_planning_model: ferrum_types::ExecutionPlanningModel,
     selected_kv_cache_layout: ferrum_types::SelectedKvCacheLayout,
     model_definition: Option<&ferrum_models::ModelDefinition>,
     model_weight_bytes: Option<u64>,
@@ -2951,7 +2951,7 @@ fn run_startup_auto_config(
         model,
         hardware,
         workload,
-        execution_resource_authority,
+        execution_planning_model,
         selected_kv_cache_layout,
         crate::startup::StartupUsage::SingleRequest,
     )
@@ -3772,7 +3772,7 @@ mod tests {
             let resolved = run_startup_auto_config(
                 ferrum_types::HardwareCapabilities::unknown(),
                 Some(ModelCapabilities::unknown()),
-                ferrum_types::ExecutionResourceAuthority::PlanRuntime,
+                ferrum_types::ExecutionPlanningModel::CompiledPlan,
                 ferrum_types::SelectedKvCacheLayout::Unknown,
                 None,
                 None,
@@ -4210,7 +4210,7 @@ mod tests {
             window.clone(),
         ]);
         let device = ferrum_types::Device::CPU;
-        let authority = ferrum_types::ExecutionResourceAuthority::LegacyEngine;
+        let authority = ferrum_types::ExecutionPlanningModel::ExecutorManaged;
         let mut engine = ferrum_types::EngineConfig::default();
         let layout = crate::startup::selected_kv_cache_layout(
             authority,
@@ -4255,7 +4255,7 @@ mod tests {
         let resolved = run_startup_auto_config(
             crate::commands::serve::hardware_capabilities_for_device(&ferrum_types::Device::CPU),
             None,
-            ferrum_types::ExecutionResourceAuthority::LegacyEngine,
+            ferrum_types::ExecutionPlanningModel::ExecutorManaged,
             ferrum_types::SelectedKvCacheLayout::Unknown,
             None,
             None,
@@ -5048,7 +5048,7 @@ mod tests {
             RuntimeConfigSource::MemoryProfile,
         );
         let mut engine = ferrum_types::EngineConfig::default();
-        let authority = ferrum_types::ExecutionResourceAuthority::PlanRuntime;
+        let authority = ferrum_types::ExecutionPlanningModel::CompiledPlan;
         let mut capabilities = ModelCapabilities::unknown();
         capabilities.max_context_len = Some(262_144);
         let resolved = run_startup_auto_config(
@@ -5178,7 +5178,7 @@ mod tests {
         )]);
         let effective = requested.clone();
         let mut engine_config = ferrum_types::EngineConfig::default();
-        let authority = ferrum_types::ExecutionResourceAuthority::PlanRuntime;
+        let authority = ferrum_types::ExecutionPlanningModel::CompiledPlan;
         let mut capabilities = ModelCapabilities::unknown();
         capabilities.max_context_len = Some(32_768);
         let resolved = run_startup_auto_config(
@@ -5233,7 +5233,7 @@ mod tests {
         let mut resolved = run_startup_auto_config(
             crate::commands::serve::hardware_capabilities_for_device(&ferrum_types::Device::CPU),
             Some(model),
-            ferrum_types::ExecutionResourceAuthority::PlanRuntime,
+            ferrum_types::ExecutionPlanningModel::CompiledPlan,
             ferrum_types::SelectedKvCacheLayout::Unknown,
             None,
             None,
@@ -5402,7 +5402,7 @@ mod tests {
         let resolved = run_startup_auto_config(
             crate::commands::serve::hardware_capabilities_for_device(&ferrum_types::Device::CPU),
             None,
-            ferrum_types::ExecutionResourceAuthority::PlanRuntime,
+            ferrum_types::ExecutionPlanningModel::CompiledPlan,
             ferrum_types::SelectedKvCacheLayout::Unknown,
             None,
             None,

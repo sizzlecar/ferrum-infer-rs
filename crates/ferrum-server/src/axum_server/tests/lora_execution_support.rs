@@ -15,13 +15,13 @@ fn registry() -> ServedModelRegistry {
 }
 
 #[test]
-fn lora_registration_requires_execution_support_not_metrics_or_resource_authority() {
-    for resource_authority in [
-        ExecutionResourceAuthority::LegacyEngine,
-        ExecutionResourceAuthority::PlanRuntime,
+fn lora_registration_requires_execution_support_not_metrics_or_planning_model() {
+    for planning_model in [
+        ExecutionPlanningModel::ExecutorManaged,
+        ExecutionPlanningModel::CompiledPlan,
     ] {
         let engine = StubLlm {
-            resource_authority,
+            planning_model,
             ..StubLlm::with_lora_metrics("ok", json!({"enabled": true, "adapter_count": 1}))
         };
         let result = AxumServer::from_llm(Arc::new(engine))

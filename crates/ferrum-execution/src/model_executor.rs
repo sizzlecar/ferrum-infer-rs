@@ -520,7 +520,7 @@ impl ExecutorSequenceCompletion {
     }
 }
 
-pub use ferrum_types::ExecutionResourceAuthority;
+pub use ferrum_types::ExecutionPlanningModel;
 
 /// Request-scoped authority selected for a capacity-pressure preemption.
 ///
@@ -2091,14 +2091,14 @@ pub trait ModelExecutor: Send + Sync + 'static {
 
     /// Declares the resource planning model used by this implementation.
     /// Both variants execute and close through the same exact token sequence
-    /// protocol. `PlanRuntime` additionally exposes its immutable resolved plan
+    /// protocol. `CompiledPlan` additionally exposes its immutable resolved plan
     /// and shared runtime's capacity evidence; this tag grants no authority.
-    fn execution_resource_authority(&self) -> ExecutionResourceAuthority {
-        ExecutionResourceAuthority::LegacyEngine
+    fn execution_planning_model(&self) -> ExecutionPlanningModel {
+        ExecutionPlanningModel::ExecutorManaged
     }
 
     /// Immutable admission limits compiled into this executor's runtime plan.
-    /// A PlanRuntime executor must return `Some`. Other executors may leave
+    /// A CompiledPlan executor must return `Some`. Other executors may leave
     /// this unreported; the engine then reports its scheduler service limits,
     /// without claiming an independent physical or recurrent-state capacity.
     fn admission_limits(&self) -> Result<Option<ExecutorAdmissionLimits>> {
@@ -2107,8 +2107,8 @@ pub trait ModelExecutor: Send + Sync + 'static {
 
     /// Returns the immutable product plan that owns planning, provider
     /// selection, and resource authority for a plan-runtime executor.
-    /// Legacy executors return `None`; `PlanRuntime` executors must expose the
-    /// exact plan used for provisioning and dispatch.
+    /// Executor-managed implementations may return `None`; `CompiledPlan`
+    /// implementations must expose the exact plan used for provisioning and dispatch.
     fn resolved_model_plan(&self) -> Option<&ferrum_runtime::ResolvedModelPlan> {
         None
     }
@@ -2123,8 +2123,8 @@ pub trait ModelExecutor: Send + Sync + 'static {
     }
 
     /// Returns the authoritative memory breakdown for a shared plan runtime.
-    /// `LegacyEngine` executors return `None`; `PlanRuntime` executors must
-    /// return `Some` while they are ready.
+    /// Executor-managed implementations may return `None`; `CompiledPlan`
+    /// implementations must return `Some` while they are ready.
     fn plan_runtime_resource_snapshot(&self) -> Result<Option<PlanRuntimeResourceSnapshot>> {
         Ok(None)
     }
@@ -2141,9 +2141,9 @@ pub trait ModelExecutor: Send + Sync + 'static {
     /// required resource-accounting contract; Engine readiness reflects it.
     fn memory_observation(&self) -> Result<ferrum_types::MemoryObservation> {
         let Some(snapshot) = self.plan_runtime_resource_snapshot()? else {
-            if self.execution_resource_authority() == ExecutionResourceAuthority::PlanRuntime {
+            if self.execution_planning_model() == ExecutionPlanningModel::CompiledPlan {
                 return Err(FerrumError::internal(
-                    "PlanRuntime executor did not expose its required resource snapshot",
+                    "CompiledPlan executor did not expose its required resource snapshot",
                 ));
             }
             return Ok(ferrum_types::MemoryObservation::Unknown);
@@ -2176,21 +2176,21 @@ pub trait ModelExecutor: Send + Sync + 'static {
     }
 
     /// Device-aware limits selected from the exact compiled memory plan before
-    /// static model upload. Legacy executors do not provide this evidence.
+    /// static model upload. Executor-managed implementations may leave it unreported.
     fn startup_memory_plan(&self) -> Option<&ferrum_types::StartupMemoryPlan> {
         None
     }
 
     /// Installs the product-owned execution event sink before requests start.
     ///
-    /// Legacy executors have no typed execution journal and keep the default
-    /// no-op. Executors backed by the vNext runtime retain this sink with each
+    /// Implementations without typed execution events keep the default no-op.
+    /// Executors backed by the compiled runtime retain this sink with each
     /// admitted request so node/operation events share the product artifact.
     fn attach_execution_event_sink(&self, _sink: Arc<dyn crate::ProductExecutionEventSink>) {}
 
     /// Current plan-local capacity evidence for scheduler wake suppression.
-    /// Legacy-engine executors return `None`; an executor declaring
-    /// [`ExecutionResourceAuthority::PlanRuntime`] must return `Some`.
+    /// Executor-managed implementations may return `None`; an executor declaring
+    /// [`ExecutionPlanningModel::CompiledPlan`] must return `Some`.
     fn execution_capacity_epochs(&self) -> Result<Option<ExecutorAdmissionEpochs>> {
         Ok(None)
     }
@@ -2211,8 +2211,8 @@ pub trait ModelExecutor: Send + Sync + 'static {
     /// wait. The returned registration must remain alive until it is awaited or
     /// deliberately cancelled by being dropped.
     ///
-    /// Legacy-engine executors return `None`. An executor declaring
-    /// [`ExecutionResourceAuthority::PlanRuntime`] must return `Some` for a
+    /// Executor-managed implementations may return `None`. An executor declaring
+    /// [`ExecutionPlanningModel::CompiledPlan`] must return `Some` for a
     /// wait condition issued by its own admission coordinator.
     fn register_execution_capacity_waiter(
         &self,

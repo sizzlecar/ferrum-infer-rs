@@ -888,7 +888,7 @@ fn admission_health_json(
         "runtime_snapshot_available": runtime_snapshot.is_some(),
         "runtime_contract_error": runtime_error,
         "resource_authority": runtime_snapshot
-            .and_then(|snapshot| serde_json::to_value(snapshot.resource_authority()).ok())
+            .and_then(|snapshot| serde_json::to_value(snapshot.planning_model()).ok())
             .unwrap_or(serde_json::Value::Null),
         "effective_max_concurrent": effective_max_concurrent,
         "maximum_active_sequences": runtime_snapshot
@@ -5079,7 +5079,7 @@ mod tests {
     use ferrum_interfaces::engine::{InferenceEngine, LlmInferenceEngine};
     use ferrum_types::{
         has_unclosed_thinking_block, parse_reasoning_response_started_in_think, EngineConfig,
-        EngineMetrics, EngineStatus, EngineTokenTimingEvidence, ExecutionResourceAuthority,
+        EngineMetrics, EngineStatus, EngineTokenTimingEvidence, ExecutionPlanningModel,
         FinishReason, HealthStatus as EngineHealthStatus, InferenceRequest, InferenceResponse,
         MemoryUsage, ModelId, StreamChunk, TokenId, TokenUsage,
     };
@@ -5209,7 +5209,7 @@ mod tests {
         output_budget: ferrum_output::OutputBudget,
         config: EngineConfig,
         adapter_support: AdapterExecutionSupport,
-        resource_authority: ExecutionResourceAuthority,
+        planning_model: ExecutionPlanningModel,
         context_capacity: Option<usize>,
         text: String,
         stream_chunks: Option<Vec<String>>,
@@ -5235,7 +5235,7 @@ mod tests {
                 output_budget: ferrum_output::OutputBudget::new(config.output.clone()).unwrap(),
                 config,
                 adapter_support: AdapterExecutionSupport::Unsupported,
-                resource_authority: ExecutionResourceAuthority::LegacyEngine,
+                planning_model: ExecutionPlanningModel::ExecutorManaged,
                 text: text.to_string(),
                 context_capacity: None,
                 stream_chunks: None,
@@ -5675,8 +5675,8 @@ mod tests {
             self.adapter_support
         }
 
-        fn execution_resource_authority(&self) -> ExecutionResourceAuthority {
-            self.resource_authority
+        fn execution_planning_model(&self) -> ExecutionPlanningModel {
+            self.planning_model
         }
 
         fn context_capacity(&self) -> Option<usize> {
@@ -7470,7 +7470,7 @@ mod tests {
             version: "test".to_owned(),
         };
         let runtime = ferrum_types::ExecutorAdmissionSnapshot::new(
-            ferrum_types::ExecutionResourceAuthority::PlanRuntime,
+            ferrum_types::ExecutionPlanningModel::CompiledPlan,
             ferrum_types::ExecutorAdmissionLimits::new(32, 4096).unwrap(),
             2,
             7,
@@ -13398,11 +13398,11 @@ mod tests {
     #[tokio::test]
     async fn route_overlapping_prompts_without_owner_leave_prefix_metrics_unavailable() {
         for authority in [
-            ExecutionResourceAuthority::PlanRuntime,
-            ExecutionResourceAuthority::LegacyEngine,
+            ExecutionPlanningModel::CompiledPlan,
+            ExecutionPlanningModel::ExecutorManaged,
         ] {
             let engine = Arc::new(StubLlm {
-                resource_authority: authority,
+                planning_model: authority,
                 ..StubLlm::new("ok")
             });
             assert!(engine.cache_metrics_snapshot().is_none());

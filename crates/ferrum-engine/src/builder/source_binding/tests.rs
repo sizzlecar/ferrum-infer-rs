@@ -107,8 +107,8 @@ impl ModelExecutor for BindingProbe {
         self.inner.resolved_model_plan()
     }
 
-    fn execution_resource_authority(&self) -> ExecutionResourceAuthority {
-        self.inner.execution_resource_authority()
+    fn execution_planning_model(&self) -> ExecutionPlanningModel {
+        self.inner.execution_planning_model()
     }
 
     fn admission_limits(&self) -> Result<Option<ExecutorAdmissionLimits>> {

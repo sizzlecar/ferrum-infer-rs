@@ -17,7 +17,7 @@ use ferrum_execution::executor_lifecycle::{
 };
 use ferrum_execution::{
     model_executor::{
-        ExecutionResourceAuthority, ExecutorAdmissionEpochs, ExecutorCapacityWaitRegistration,
+        ExecutionPlanningModel, ExecutorAdmissionEpochs, ExecutorCapacityWaitRegistration,
         ExecutorExecutionCapacityStage, ExecutorExecutionDeferral, ExecutorPrefillAdmission,
         ExecutorPrefillAdmissionReceipt, ExecutorPrefillMaintenanceDeferral,
         ExecutorPrefillMaintenanceOutcome, ExecutorRequestOrigin, ExecutorRequestStateDeferral,
@@ -2166,7 +2166,7 @@ pub struct ContinuousBatchEngine {
     config: EngineConfig,
     scheduler: Arc<ContinuousBatchScheduler>,
     adapter_support: AdapterExecutionSupport,
-    resource_authority: ExecutionResourceAuthority,
+    planning_model: ExecutionPlanningModel,
     context_capacity: Option<usize>,
 }
 
@@ -2223,8 +2223,8 @@ impl ContinuousBatchEngine {
         let binding = model_executor.into_engine_executor()?;
         let owns_executor = binding.owner.is_some();
         let model_executor = binding.scope;
-        let executor_authority = model_executor.execution_resource_authority();
-        info!(?executor_authority, "Creating ContinuousBatchEngine");
+        let executor_planning_model = model_executor.execution_planning_model();
+        info!(?executor_planning_model, "Creating ContinuousBatchEngine");
         config.runtime.profile_journal.validate()?;
         let runtime_config = ContinuousEngineRuntimeConfig::from_engine_config(&config);
         let observation_health = ObservationHealth::default();
@@ -2338,7 +2338,7 @@ impl ContinuousBatchEngine {
             config: engine_config,
             scheduler: engine_scheduler,
             adapter_support,
-            resource_authority: executor_authority,
+            planning_model: executor_planning_model,
             context_capacity,
         })
     }
@@ -2412,8 +2412,8 @@ impl LlmInferenceEngine for ContinuousBatchEngine {
         self.adapter_support
     }
 
-    fn execution_resource_authority(&self) -> ExecutionResourceAuthority {
-        self.resource_authority
+    fn execution_planning_model(&self) -> ExecutionPlanningModel {
+        self.planning_model
     }
 
     fn context_capacity(&self) -> Option<usize> {
@@ -2663,12 +2663,12 @@ impl InferenceEngine for ContinuousBatchEngine {
     ) -> ferrum_types::Result<Option<ferrum_types::ExecutorAdmissionSnapshot>> {
         let inner = self.active_inner()?;
         let scheduler = inner.scheduler.admission_phase_counts();
-        let authority = inner.model_executor.execution_resource_authority();
+        let authority = inner.model_executor.execution_planning_model();
         let limits = match inner.model_executor.admission_limits()? {
             Some(limits) => limits,
-            None if authority == ExecutionResourceAuthority::PlanRuntime => {
+            None if authority == ExecutionPlanningModel::CompiledPlan => {
                 return Err(FerrumError::internal(
-                    "PlanRuntime executor did not expose its resolved admission limits",
+                    "CompiledPlan executor did not expose its resolved admission limits",
                 ));
             }
             None => ferrum_types::ExecutorAdmissionLimits::new(
