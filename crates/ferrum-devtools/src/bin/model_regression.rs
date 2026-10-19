@@ -52,7 +52,7 @@ struct Args {
     source_expectation: Option<ferrum_bench_core::release_regression::GgufSourceProfile>,
     #[arg(long, value_parser = ["cpu", "metal", "cuda"])]
     backend: String,
-    /// Explicit vNext causal KV storage, verified against the executing model plan.
+    /// Explicit KV storage, verified against the actual model or compiled plan.
     /// Prepared release tasks do not yet declare this independent selection.
     #[arg(long, value_enum, conflicts_with = "expected_task")]
     kv_dtype: Option<kv::KvDtype>,

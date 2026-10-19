@@ -2032,10 +2032,9 @@ fn write_startup_config_artifacts_with_failure(
     Ok(())
 }
 
-/// Replace requested-only startup evidence with the selected plan after the
-/// executor has compiled and initialized successfully. Both run and serve use
-/// this path; legacy executors without numerical evidence retain their requested
-/// numerical policy. Scheduler targets are recorded independently of the backend.
+/// Record actual executor selection after successful initialization. Both run
+/// and serve use this path. Model-owned KV facts keep their original source,
+/// separately from compiled-plan formats and numerical profiles.
 pub(crate) fn write_resolved_execution_config(
     path: Option<&std::path::Path>,
     executor_snapshot: Option<&serde_json::Value>,
@@ -2055,6 +2054,21 @@ pub(crate) fn write_resolved_execution_config(
         "scheduler".into(),
         serde_json::json!({"slo": scheduler_slo}),
     );
+    // These are observed from the instantiated model's snapshot, never inferred
+    // from requested runtime options. Keep the source and dtype vocabulary
+    // intact: a model-owned cache is not a resolved numerical plan.
+    object.remove("model_kv_storage");
+    if let Some(snapshot) = executor_snapshot {
+        if let (Some(source), Some(dtype)) = (
+            snapshot.get("source").and_then(serde_json::Value::as_str),
+            snapshot.get("kv_dtype").and_then(serde_json::Value::as_str),
+        ) {
+            object.insert(
+                "model_kv_storage".into(),
+                serde_json::json!({"source": source, "kv_dtype": dtype}),
+            );
+        }
+    }
     if let Some(snapshot) =
         executor_snapshot.filter(|value| value.get("numerical_execution").is_some())
     {
@@ -4170,6 +4184,47 @@ mod tests {
             serde_json::to_value(slo).unwrap()
         );
     }
+    #[test]
+    fn resolved_execution_config_records_model_kv_without_fabricating_plan_evidence() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("effective.json");
+        let original = serde_json::json!({
+            "numerical_execution": {"requested": "auto"},
+            "scheduler": {"slo": null},
+        });
+        std::fs::write(&path, serde_json::to_vec(&original).unwrap()).unwrap();
+        let snapshot = serde_json::json!({
+            "source": "llama-family-paged-block-prefix-cache",
+            "position": "real-kv-reuse",
+            "kv_dtype": "int8",
+            "hits": 0,
+        });
+        write_resolved_execution_config(Some(&path), Some(&snapshot), None).unwrap();
+        let observed: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(
+            observed["model_kv_storage"],
+            serde_json::json!({
+                "source": snapshot["source"], "kv_dtype": snapshot["kv_dtype"],
+            })
+        );
+        assert_eq!(
+            observed["numerical_execution"],
+            original["numerical_execution"]
+        );
+        assert!(observed.get("kv_storage").is_none());
+        assert!(observed["model_kv_storage"].get("requested").is_none());
+        assert!(observed["model_kv_storage"]
+            .get("numerical_profile")
+            .is_none());
+
+        // Missing actual model evidence cannot inherit the preceding snapshot.
+        write_resolved_execution_config(Some(&path), Some(&serde_json::json!({})), None).unwrap();
+        let missing: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(missing, original);
+    }
+
     #[test]
     fn q4_mmvq_weight_decode_serve_precedence_preserves_upload_policy() {
         use crate::commands::Q4MmvqWeightDecodeArg as Arg;
