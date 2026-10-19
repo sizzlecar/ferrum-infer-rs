@@ -136,6 +136,10 @@ fn resident_facts(post_submit_panic: bool) {
 }
 
 fn resident_facts_with_device(post_submit_panic: bool, capture_device: bool) {
+    resident_facts_with_extra(post_submit_panic, capture_device, false);
+}
+
+fn resident_facts_with_extra(post_submit_panic: bool, capture_device: bool, extra_readback: bool) {
     let bucket = ReusableExecutionBucketSpec::new(
         ReusableExecutionClassId::new("execution.resident-work-facts").unwrap(),
         ReusableExecutionCapacity::new(1, 1, 1).unwrap(),
@@ -302,8 +306,88 @@ fn resident_facts_with_device(post_submit_panic: bool, capture_device: bool) {
         } else {
             off_preparation = Some(preparation);
         }
-        let CompletionObservation::Terminal(completion) = handle.wait().unwrap() else {
-            panic!("actual resident fence must terminalize");
+        let completion = if extra_readback {
+            let descriptor = fixture
+                .plan
+                .payload()
+                .memory()
+                .dynamic_descriptors()
+                .iter()
+                .find(|descriptor| descriptor.base_resource_id() == &id("resource.output"))
+                .unwrap();
+            assert!(matches!(
+                descriptor.demand(),
+                crate::DynamicResourceDemand::Tokens {
+                    bytes_per_token: 4,
+                    ..
+                }
+            ));
+            let request = crate::CompletionReadbackRequest::new(
+                // Completion coordinates are participant-local; the original
+                // resident use maps them to this iteration's current packed row.
+                id("node.tail"),
+                0,
+                id("resource.output"),
+                0,
+                crate::HostTransferLayout::new(crate::ElementType::F32, 1).unwrap(),
+            )
+            .unwrap();
+            let extra =
+                crate::CompletionExtraReadbackRequest::new(&fixture.plan, request.clone(), 4)
+                    .unwrap();
+            let primary =
+                crate::CompletionReadbackBatchRequest::new(vec![request.clone()]).unwrap();
+            if start == 1 {
+                // The full source has four tokens, but this resident use owns
+                // only one immediate token. Reject a wider extra before wait.
+                let too_wide = crate::CompletionReadbackRequest::new(
+                    id("node.tail"),
+                    0,
+                    id("resource.output"),
+                    0,
+                    crate::HostTransferLayout::new(crate::ElementType::F32, 4).unwrap(),
+                )
+                .unwrap();
+                let too_wide =
+                    crate::CompletionExtraReadbackRequest::new(&fixture.plan, too_wide, 16)
+                        .unwrap();
+                let before = {
+                    let trace = fixture.runtime_trace.lock().unwrap();
+                    (trace.wait_fence_calls, trace.readback_calls)
+                };
+                assert!(matches!(
+                    handle.wait_with_readbacks_and_extra(primary.clone(), too_wide),
+                    Err(crate::VNextError::InvalidExecutionPlan { .. })
+                ));
+                let trace = fixture.runtime_trace.lock().unwrap();
+                assert_eq!((trace.wait_fence_calls, trace.readback_calls), before);
+                drop(trace);
+                assert_eq!(reaper.retained_count(), 1);
+                assert_eq!(lane.in_flight_count(), 1);
+            }
+            let crate::CompletionReadbackWithExtraObservation::Terminal(receipt) = handle
+                .wait_with_readbacks_and_extra(primary, extra)
+                .unwrap()
+            else {
+                panic!("resident extra readback must use its original terminal");
+            };
+            assert_eq!(receipt.primary().completion(), receipt.extra().completion());
+            for disposition in [
+                &receipt.primary().dispositions()[0],
+                receipt.extra().disposition(),
+            ] {
+                let crate::CompletionReadbackDisposition::Succeeded(output) = disposition else {
+                    panic!("resident output was not read: {disposition:?}");
+                };
+                assert_eq!(output.request(), &request);
+                assert_eq!(output.bytes(), &[0; 4]);
+            }
+            receipt.into_parts().0.into_completion()
+        } else {
+            let CompletionObservation::Terminal(completion) = handle.wait().unwrap() else {
+                panic!("actual resident fence must terminalize");
+            };
+            completion
         };
         assert_eq!(
             completion.disposition(),
@@ -392,6 +476,11 @@ fn resident_facts_with_device(post_submit_panic: bool, capture_device: bool) {
             vec![vec![1..2], vec![2..3], vec![3..4]]
         );
         assert_eq!(trace.submit_calls, 5);
+        if extra_readback {
+            assert_eq!(trace.wait_fence_calls, 5);
+            assert_eq!(trace.readback_calls, 6);
+            assert_eq!(trace.readback_lengths, vec![4; 6]);
+        }
         assert_eq!(trace.segment_program_encode_calls, cold_encodes);
         assert_eq!(trace.allocation_calls, cold_allocations);
     }
@@ -440,4 +529,9 @@ fn execution_work_facts_direct_resident_retains_post_submit_contract_terminal() 
 #[test]
 fn execution_device_facts_direct_resident_binds_current_rows_and_keeps_post_submit_owner() {
     resident_facts_with_device(true, true);
+}
+
+#[test]
+fn extra_readback_direct_resident_keeps_original_program_and_current_source_ranges() {
+    resident_facts_with_extra(false, false, true);
 }
