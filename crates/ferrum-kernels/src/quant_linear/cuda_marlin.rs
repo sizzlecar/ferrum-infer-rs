@@ -108,7 +108,7 @@ impl Linear<CudaBackend> for CudaMarlinLinear {
                                 crate::triton_ptx::w4a16_gptq_f16::PTX,
                                 crate::triton_w4a16::fn_name(),
                             );
-                            let stream = ctx.stream.clone();
+                            let stream = ctx.stream().clone();
                             crate::triton_w4a16::launch_w4a16_gptq_triton(
                                 &stream,
                                 &func,
@@ -145,7 +145,7 @@ impl Linear<CudaBackend> for CudaMarlinLinear {
                             crate::triton_ptx::w4a16_gptq_f16::PTX,
                             crate::triton_w4a16::fn_name(),
                         );
-                        let stream = ctx.stream.clone();
+                        let stream = ctx.stream().clone();
                         crate::triton_w4a16::launch_w4a16_gptq_triton(
                             &stream,
                             &func,
@@ -233,7 +233,7 @@ impl Linear<CudaBackend> for CudaMarlinStackedExpertLinear {
                          single-expert offset Marlin GEMM",
                     ))
                 } else {
-                    let stream = ctx.stream.clone();
+                    let stream = ctx.stream().clone();
                     crate::marlin::marlin_gemm_with_offset(
                         &stream,
                         input.as_f16(),

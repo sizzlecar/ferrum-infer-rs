@@ -64,32 +64,17 @@ pub(crate) mod ptx {
 // Re-exports preserve the historical `ferrum_kernels::foo::*` public
 // surface + internal `crate::foo::*` paths.
 //
-// Two files stay at the crate root for now because they would otherwise
-// collide with same-named files already under `backend/cuda/` (which
-// host the Backend-trait impls, not the kernel launchers):
-//   - `int8_kv.rs` (top-level launchers `launch_int8_paged_decode_*`)
-//   - `quant.rs`   (top-level `dequant_int4` legacy path)
+// `int8_kv.rs` keeps the plain-stream launchers at the crate root;
+// `backend/cuda/int8_kv.rs` hosts their Backend-trait integration.
 
 #[cfg(feature = "cuda")]
 pub mod int8_kv;
-#[cfg(all(feature = "cuda", feature = "candle-cuda-compat"))]
-pub mod quant;
 
 #[cfg(feature = "cuda")]
-pub use backend::cuda::{cublas, decode_buffers, gpu_paged_kv, marlin};
+pub use backend::cuda::{cublas, marlin};
 
 #[cfg(all(feature = "cuda", not(target_os = "windows")))]
 pub use backend::cuda::nccl_comm;
-
-#[cfg(all(feature = "cuda", feature = "candle-cuda-compat"))]
-pub use backend::cuda::{cuda_decode, cuda_graph, weight_store};
-
-#[cfg(all(
-    feature = "cuda",
-    feature = "candle-cuda-compat",
-    not(target_os = "windows")
-))]
-pub use backend::cuda::tp_decode;
 
 #[cfg(all(feature = "cuda", feature = "candle-cuda-compat"))]
 pub use backend::cuda::decode_attention::decode_attention;

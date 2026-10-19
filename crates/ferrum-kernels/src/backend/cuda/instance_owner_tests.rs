@@ -1,7 +1,7 @@
-//! Actual legacy CUDA instance ownership: graph keys and growing KV storage.
+//! Actual CUDA instance ownership: graph keys and growing KV storage.
 #![cfg(feature = "cuda")]
 
-use ferrum_kernels::backend::{
+use crate::backend::{
     cuda::{CudaBackend, CudaState},
     Backend, BackendCompletion, BackendGraph, CudaBuf, Dtype, KvCache, KvFp16, KvLayer,
 };

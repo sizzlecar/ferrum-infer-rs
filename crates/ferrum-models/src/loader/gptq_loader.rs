@@ -1,8 +1,8 @@
 //! GPTQ quantized model loader.
 //!
-//! Loads GPTQ INT4 weights from HuggingFace safetensors and provides:
-//! - Dequantized FP16 tensors for candle prefill (via VarBuilder)
-//! - Packed INT4 weights for CUDA runner decode (via GpuQuantWeight)
+//! Loads GPTQ INT4 weights from HuggingFace safetensors and dequantizes
+//! tensors for Candle consumers. Native packed-weight execution is provided
+//! by the backend-specific quantized linear implementations.
 
 use ferrum_types::{FerrumError, Result};
 use std::collections::HashMap;

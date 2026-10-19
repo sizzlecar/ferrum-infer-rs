@@ -278,7 +278,7 @@ impl BackendTimer<crate::backend::cuda::CudaBackend> for CudaTimer {
         use cudarc::driver::sys as cu;
         if let Some(evt) = self.start {
             unsafe {
-                let _ = cu::cuEventRecord(evt, ctx.stream.cu_stream());
+                let _ = cu::cuEventRecord(evt, ctx.stream().cu_stream());
             }
             self.recorded_start = true;
         }
@@ -288,7 +288,7 @@ impl BackendTimer<crate::backend::cuda::CudaBackend> for CudaTimer {
         use cudarc::driver::sys as cu;
         if let Some(evt) = self.end {
             unsafe {
-                let _ = cu::cuEventRecord(evt, ctx.stream.cu_stream());
+                let _ = cu::cuEventRecord(evt, ctx.stream().cu_stream());
             }
             self.recorded_end = true;
         }

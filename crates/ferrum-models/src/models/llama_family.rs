@@ -51,12 +51,8 @@ const DEFAULT_KV_CAPACITY: usize = 512;
 
 fn alloc_model_buffer<B: QuantLlmBackend + BackendMoeFused>(
     ctx: &mut B::Context,
-    label: &'static str,
     len: usize,
 ) -> B::Buffer {
-    let _ = label;
-    #[cfg(feature = "cuda")]
-    let _alloc_label = ferrum_kernels::backend::cuda::push_alloc_label(label);
     // On an allocator panic, observe before earlier fields in the enclosing
     // scratch construction can unwind. Successful allocation adds no sync.
     let mut construction = device_execution::ConstructionContext::<B>::new(ctx);
@@ -67,13 +63,9 @@ fn alloc_model_buffer<B: QuantLlmBackend + BackendMoeFused>(
 
 fn alloc_model_typed_buffer<B: QuantLlmBackend + BackendMoeFused>(
     ctx: &mut B::Context,
-    label: &'static str,
     dtype: ferrum_kernels::backend::Dtype,
     len: usize,
 ) -> B::Buffer {
-    let _ = label;
-    #[cfg(feature = "cuda")]
-    let _alloc_label = ferrum_kernels::backend::cuda::push_alloc_label(label);
     let mut construction = device_execution::ConstructionContext::<B>::new(ctx);
     let buffer = B::alloc_typed_in_context(construction.context, dtype, len);
     construction.transfer();
@@ -1295,94 +1287,44 @@ impl<B: QuantLlmBackend + BackendMoeFused> LlamaFamilyScratch<B> {
         let qkv_dim = q_dim + 2 * kv_dim;
         let t = max_tokens;
         Self {
-            residual: Some(alloc_model_buffer::<B>(
-                ctx,
-                "llama.scratch.residual",
-                t * h,
-            )),
-            norm_out: alloc_model_buffer::<B>(ctx, "llama.scratch.norm_out", t * h),
-            qkv_out: alloc_model_buffer::<B>(ctx, "llama.scratch.qkv_out", t * qkv_dim),
+            residual: Some(alloc_model_buffer::<B>(ctx, t * h)),
+            norm_out: alloc_model_buffer::<B>(ctx, t * h),
+            qkv_out: alloc_model_buffer::<B>(ctx, t * qkv_dim),
             sandwich_tmp: cfg
                 .sandwich_norms
-                .then(|| alloc_model_buffer::<B>(ctx, "llama.scratch.sandwich_tmp", t * h)),
+                .then(|| alloc_model_buffer::<B>(ctx, t * h)),
             residual_f32_shadow: (cfg.sandwich_norms && B::supports_device_f32_residual_shadow())
                 .then(|| {
-                    alloc_model_typed_buffer::<B>(
-                        ctx,
-                        "llama.scratch.residual_f32_shadow",
-                        ferrum_kernels::backend::Dtype::F32,
-                        t * h,
-                    )
+                    alloc_model_typed_buffer::<B>(ctx, ferrum_kernels::backend::Dtype::F32, t * h)
                 }),
             sandwich_branch_f32: (cfg.sandwich_norms && B::supports_device_f32_residual_shadow())
                 .then(|| {
-                    alloc_model_typed_buffer::<B>(
-                        ctx,
-                        "llama.scratch.sandwich_branch_f32",
-                        ferrum_kernels::backend::Dtype::F32,
-                        t * h,
-                    )
+                    alloc_model_typed_buffer::<B>(ctx, ferrum_kernels::backend::Dtype::F32, t * h)
                 }),
-            q_buf: alloc_model_buffer::<B>(ctx, "llama.scratch.q_buf", t * q_dim),
-            k_buf: alloc_model_buffer::<B>(ctx, "llama.scratch.k_buf", t * kv_dim),
-            v_buf: alloc_model_buffer::<B>(ctx, "llama.scratch.v_buf", t * kv_dim),
-            q_head_major: alloc_model_buffer::<B>(
-                ctx,
-                "llama.scratch.q_head_major",
-                cfg.num_heads * t * cfg.head_dim,
-            ),
-            k_head_major: alloc_model_buffer::<B>(
-                ctx,
-                "llama.scratch.k_head_major",
-                cfg.num_kv_heads * t * cfg.head_dim,
-            ),
-            v_head_major: alloc_model_buffer::<B>(
-                ctx,
-                "llama.scratch.v_head_major",
-                cfg.num_kv_heads * t * cfg.head_dim,
-            ),
-            attn_head_major_out: alloc_model_buffer::<B>(
-                ctx,
-                "llama.scratch.attn_head_major_out",
-                cfg.num_heads * t * cfg.head_dim,
-            ),
-            attn_flat: alloc_model_buffer::<B>(ctx, "llama.scratch.attn_flat", t * q_dim),
-            o_proj_out: alloc_model_buffer::<B>(ctx, "llama.scratch.o_proj_out", t * h),
-            gate_up_out: alloc_model_buffer::<B>(ctx, "llama.scratch.gate_up_out", t * 2 * im),
-            silu_out: alloc_model_buffer::<B>(ctx, "llama.scratch.silu_out", t * im),
-            mlp_out: alloc_model_buffer::<B>(ctx, "llama.scratch.mlp_out", t * h),
-            last_hidden: alloc_model_buffer::<B>(ctx, "llama.scratch.last_hidden", h),
-            last_normed: alloc_model_buffer::<B>(ctx, "llama.scratch.last_normed", h),
-            logits: alloc_model_buffer::<B>(ctx, "llama.scratch.logits", cfg.vocab_size),
-            q_single: alloc_model_buffer::<B>(ctx, "llama.scratch.q_single", q_dim),
-            k_single: alloc_model_buffer::<B>(ctx, "llama.scratch.k_single", kv_dim),
-            v_single: alloc_model_buffer::<B>(ctx, "llama.scratch.v_single", kv_dim),
-            q_head_major_single: alloc_model_buffer::<B>(
-                ctx,
-                "llama.scratch.q_head_major_single",
-                q_dim,
-            ),
-            k_head_major_single: alloc_model_buffer::<B>(
-                ctx,
-                "llama.scratch.k_head_major_single",
-                kv_dim,
-            ),
-            v_head_major_single: alloc_model_buffer::<B>(
-                ctx,
-                "llama.scratch.v_head_major_single",
-                kv_dim,
-            ),
-            attn_head_major_single: alloc_model_buffer::<B>(
-                ctx,
-                "llama.scratch.attn_head_major_single",
-                q_dim,
-            ),
-            attn_flat_single: alloc_model_buffer::<B>(ctx, "llama.scratch.attn_flat_single", q_dim),
-            batch_logits: alloc_model_buffer::<B>(
-                ctx,
-                "llama.scratch.batch_logits",
-                cfg.vocab_size,
-            ),
+            q_buf: alloc_model_buffer::<B>(ctx, t * q_dim),
+            k_buf: alloc_model_buffer::<B>(ctx, t * kv_dim),
+            v_buf: alloc_model_buffer::<B>(ctx, t * kv_dim),
+            q_head_major: alloc_model_buffer::<B>(ctx, cfg.num_heads * t * cfg.head_dim),
+            k_head_major: alloc_model_buffer::<B>(ctx, cfg.num_kv_heads * t * cfg.head_dim),
+            v_head_major: alloc_model_buffer::<B>(ctx, cfg.num_kv_heads * t * cfg.head_dim),
+            attn_head_major_out: alloc_model_buffer::<B>(ctx, cfg.num_heads * t * cfg.head_dim),
+            attn_flat: alloc_model_buffer::<B>(ctx, t * q_dim),
+            o_proj_out: alloc_model_buffer::<B>(ctx, t * h),
+            gate_up_out: alloc_model_buffer::<B>(ctx, t * 2 * im),
+            silu_out: alloc_model_buffer::<B>(ctx, t * im),
+            mlp_out: alloc_model_buffer::<B>(ctx, t * h),
+            last_hidden: alloc_model_buffer::<B>(ctx, h),
+            last_normed: alloc_model_buffer::<B>(ctx, h),
+            logits: alloc_model_buffer::<B>(ctx, cfg.vocab_size),
+            q_single: alloc_model_buffer::<B>(ctx, q_dim),
+            k_single: alloc_model_buffer::<B>(ctx, kv_dim),
+            v_single: alloc_model_buffer::<B>(ctx, kv_dim),
+            q_head_major_single: alloc_model_buffer::<B>(ctx, q_dim),
+            k_head_major_single: alloc_model_buffer::<B>(ctx, kv_dim),
+            v_head_major_single: alloc_model_buffer::<B>(ctx, kv_dim),
+            attn_head_major_single: alloc_model_buffer::<B>(ctx, q_dim),
+            attn_flat_single: alloc_model_buffer::<B>(ctx, q_dim),
+            batch_logits: alloc_model_buffer::<B>(ctx, cfg.vocab_size),
             batch_logits_capacity: 1,
             argmax_token_mask: None,
             argmax_token_mask_fingerprint: None,
@@ -1407,43 +1349,27 @@ impl<B: QuantLlmBackend + BackendMoeFused> LlamaFamilyScratch<B> {
             paged_max_seqs: 0,
             batch_positions: alloc_model_typed_buffer::<B>(
                 ctx,
-                "llama.scratch.batch_positions",
                 ferrum_kernels::backend::Dtype::U32,
                 t.max(1),
             ),
             batch_tokens: alloc_model_typed_buffer::<B>(
                 ctx,
-                "llama.scratch.batch_tokens",
                 ferrum_kernels::backend::Dtype::U32,
                 t.max(1),
             ),
             batch_kv_lens_pre: alloc_model_typed_buffer::<B>(
                 ctx,
-                "llama.scratch.batch_kv_lens_pre",
                 ferrum_kernels::backend::Dtype::U32,
                 t.max(1),
             ),
             batch_kv_lens_post: alloc_model_typed_buffer::<B>(
                 ctx,
-                "llama.scratch.batch_kv_lens_post",
                 ferrum_kernels::backend::Dtype::U32,
                 t.max(1),
             ),
-            q_normed_batched: alloc_model_buffer::<B>(
-                ctx,
-                "llama.scratch.q_normed_batched",
-                t * q_dim,
-            ),
-            k_normed_batched: alloc_model_buffer::<B>(
-                ctx,
-                "llama.scratch.k_normed_batched",
-                t * kv_dim,
-            ),
-            v_normed_batched: alloc_model_buffer::<B>(
-                ctx,
-                "llama.scratch.v_normed_batched",
-                t * kv_dim,
-            ),
+            q_normed_batched: alloc_model_buffer::<B>(ctx, t * q_dim),
+            k_normed_batched: alloc_model_buffer::<B>(ctx, t * kv_dim),
+            v_normed_batched: alloc_model_buffer::<B>(ctx, t * kv_dim),
             unified_capacity: 0,
             unified_residual: None,
             unified_norm_out: None,
@@ -1478,11 +1404,7 @@ impl<B: QuantLlmBackend + BackendMoeFused> LlamaFamilyScratch<B> {
         }
         B::retire_graphs_for_storage_mutation(ctx)
             .unwrap_or_else(|error| std::panic::panic_any(error));
-        self.batch_logits = alloc_model_buffer::<B>(
-            ctx,
-            "llama.scratch.batch_logits.grow",
-            rows * cfg.vocab_size,
-        );
+        self.batch_logits = alloc_model_buffer::<B>(ctx, rows * cfg.vocab_size);
         self.batch_logits_capacity = rows;
     }
 
@@ -1496,7 +1418,6 @@ impl<B: QuantLlmBackend + BackendMoeFused> LlamaFamilyScratch<B> {
         if needs_upload {
             let mut device_mask = alloc_model_typed_buffer::<B>(
                 ctx,
-                "llama.scratch.argmax_token_mask",
                 ferrum_kernels::backend::Dtype::I8,
                 mask.len().max(1),
             );
@@ -1542,7 +1463,6 @@ impl<B: QuantLlmBackend + BackendMoeFused> LlamaFamilyScratch<B> {
                 .unwrap_or(offsets_len);
             self.argmax_repetition_offsets = Some(alloc_model_typed_buffer::<B>(
                 ctx,
-                "llama.scratch.argmax_repetition_offsets",
                 ferrum_kernels::backend::Dtype::U32,
                 capacity,
             ));
@@ -1555,7 +1475,6 @@ impl<B: QuantLlmBackend + BackendMoeFused> LlamaFamilyScratch<B> {
                 .unwrap_or(token_ids_len);
             self.argmax_repetition_token_ids = Some(alloc_model_typed_buffer::<B>(
                 ctx,
-                "llama.scratch.argmax_repetition_token_ids",
                 ferrum_kernels::backend::Dtype::U32,
                 capacity,
             ));
@@ -1568,7 +1487,6 @@ impl<B: QuantLlmBackend + BackendMoeFused> LlamaFamilyScratch<B> {
                 .unwrap_or(penalties_len);
             self.argmax_repetition_penalties = Some(alloc_model_typed_buffer::<B>(
                 ctx,
-                "llama.scratch.argmax_repetition_penalties",
                 ferrum_kernels::backend::Dtype::F32,
                 capacity,
             ));
@@ -1616,11 +1534,7 @@ impl<B: QuantLlmBackend + BackendMoeFused> LlamaFamilyScratch<B> {
             return;
         }
         let capacity = rows.checked_next_power_of_two().unwrap_or(rows);
-        self.unified_argmax_logits = Some(alloc_model_buffer::<B>(
-            ctx,
-            "llama.scratch.unified_argmax_logits",
-            capacity * cfg.vocab_size,
-        ));
+        self.unified_argmax_logits = Some(alloc_model_buffer::<B>(ctx, capacity * cfg.vocab_size));
         self.unified_argmax_logits_capacity = capacity;
     }
 
@@ -1672,101 +1586,48 @@ impl<B: QuantLlmBackend + BackendMoeFused> LlamaFamilyScratch<B> {
         self.unified_silu_out = None;
         self.unified_mlp_out = None;
 
-        self.unified_residual = Some(alloc_model_buffer::<B>(
-            ctx,
-            "llama.unified.residual",
-            cap * h,
-        ));
-        self.unified_norm_out = Some(alloc_model_buffer::<B>(
-            ctx,
-            "llama.unified.norm_out",
-            cap * h,
-        ));
-        self.unified_qkv_out = Some(alloc_model_buffer::<B>(
-            ctx,
-            "llama.unified.qkv_out",
-            cap * qkv_dim,
-        ));
-        self.unified_packed_q = Some(alloc_model_buffer::<B>(
-            ctx,
-            "llama.unified.packed_q",
-            cap * q_dim,
-        ));
-        self.unified_attn_out = Some(alloc_model_buffer::<B>(
-            ctx,
-            "llama.unified.attn_out",
-            cap * q_dim,
-        ));
-        self.unified_o_proj_out = Some(alloc_model_buffer::<B>(
-            ctx,
-            "llama.unified.o_proj_out",
-            cap * h,
-        ));
+        self.unified_residual = Some(alloc_model_buffer::<B>(ctx, cap * h));
+        self.unified_norm_out = Some(alloc_model_buffer::<B>(ctx, cap * h));
+        self.unified_qkv_out = Some(alloc_model_buffer::<B>(ctx, cap * qkv_dim));
+        self.unified_packed_q = Some(alloc_model_buffer::<B>(ctx, cap * q_dim));
+        self.unified_attn_out = Some(alloc_model_buffer::<B>(ctx, cap * q_dim));
+        self.unified_o_proj_out = Some(alloc_model_buffer::<B>(ctx, cap * h));
         if cfg.sandwich_norms {
-            self.unified_sandwich_tmp = Some(alloc_model_buffer::<B>(
-                ctx,
-                "llama.unified.sandwich_tmp",
-                cap * h,
-            ));
+            self.unified_sandwich_tmp = Some(alloc_model_buffer::<B>(ctx, cap * h));
             if B::supports_device_f32_residual_shadow() {
                 self.unified_residual_f32_shadow = Some(alloc_model_typed_buffer::<B>(
                     ctx,
-                    "llama.unified.residual_f32_shadow",
                     ferrum_kernels::backend::Dtype::F32,
                     cap * h,
                 ));
                 self.unified_sandwich_branch_f32 = Some(alloc_model_typed_buffer::<B>(
                     ctx,
-                    "llama.unified.sandwich_branch_f32",
                     ferrum_kernels::backend::Dtype::F32,
                     cap * h,
                 ));
             }
         }
-        self.unified_gate_up_out = Some(alloc_model_buffer::<B>(
-            ctx,
-            "llama.unified.gate_up_out",
-            cap * 2 * im,
-        ));
-        self.unified_silu_out = Some(alloc_model_buffer::<B>(
-            ctx,
-            "llama.unified.silu_out",
-            cap * im,
-        ));
-        self.unified_mlp_out = Some(alloc_model_buffer::<B>(
-            ctx,
-            "llama.unified.mlp_out",
-            cap * h,
-        ));
+        self.unified_gate_up_out = Some(alloc_model_buffer::<B>(ctx, cap * 2 * im));
+        self.unified_silu_out = Some(alloc_model_buffer::<B>(ctx, cap * im));
+        self.unified_mlp_out = Some(alloc_model_buffer::<B>(ctx, cap * h));
         if self.unified_cu_seqlens_q.is_none() {
             self.unified_cu_seqlens_q = Some(alloc_model_typed_buffer::<B>(
                 ctx,
-                "llama.unified.cu_seqlens_q",
                 ferrum_kernels::backend::Dtype::U32,
                 max_seqs + 1,
             ));
             self.unified_pos_offsets = Some(alloc_model_typed_buffer::<B>(
                 ctx,
-                "llama.unified.pos_offsets",
                 ferrum_kernels::backend::Dtype::U32,
                 max_seqs,
             ));
             self.unified_block_tables = Some(alloc_model_typed_buffer::<B>(
                 ctx,
-                "llama.unified.block_tables",
                 ferrum_kernels::backend::Dtype::U32,
                 max_seqs * max_blocks_per_seq,
             ));
-            self.unified_packed_normed = Some(alloc_model_buffer::<B>(
-                ctx,
-                "llama.unified.packed_normed",
-                max_seqs * h,
-            ));
-            self.unified_packed_logits = Some(alloc_model_buffer::<B>(
-                ctx,
-                "llama.unified.packed_logits",
-                max_seqs * v,
-            ));
+            self.unified_packed_normed = Some(alloc_model_buffer::<B>(ctx, max_seqs * h));
+            self.unified_packed_logits = Some(alloc_model_buffer::<B>(ctx, max_seqs * v));
         }
         self.unified_capacity = cap;
         true
@@ -1786,25 +1647,15 @@ impl<B: QuantLlmBackend + BackendMoeFused> LlamaFamilyScratch<B> {
             return;
         }
         let q_dim = cfg.num_heads * cfg.head_dim;
-        self.paged_batch_q = Some(alloc_model_buffer::<B>(
-            ctx,
-            "llama.paged_batch.q",
-            max_seqs * q_dim,
-        ));
-        self.paged_batch_o = Some(alloc_model_buffer::<B>(
-            ctx,
-            "llama.paged_batch.o",
-            max_seqs * q_dim,
-        ));
+        self.paged_batch_q = Some(alloc_model_buffer::<B>(ctx, max_seqs * q_dim));
+        self.paged_batch_o = Some(alloc_model_buffer::<B>(ctx, max_seqs * q_dim));
         self.paged_batch_block_tables = Some(alloc_model_typed_buffer::<B>(
             ctx,
-            "llama.paged_batch.block_tables",
             ferrum_kernels::backend::Dtype::U32,
             max_seqs * max_blocks_per_seq,
         ));
         self.paged_batch_context_lens = Some(alloc_model_typed_buffer::<B>(
             ctx,
-            "llama.paged_batch.context_lens",
             ferrum_kernels::backend::Dtype::U32,
             max_seqs,
         ));
@@ -3227,9 +3078,6 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         // 2. Fused QKV projection (Linear dispatches to Dense/GPTQ/AWQ/GGUF)
 
         {
-            #[cfg(feature = "cuda")]
-            let _alloc_label =
-                ferrum_kernels::backend::cuda::push_alloc_label("llama.forward_layer.qkv_proj");
             layer.qkv_proj.forward(
                 ctx,
                 &self.scratch.norm_out,
@@ -3555,9 +3403,6 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
 
         // 8. O projection.
         {
-            #[cfg(feature = "cuda")]
-            let _alloc_label =
-                ferrum_kernels::backend::cuda::push_alloc_label("llama.forward_layer.o_proj");
             layer
                 .o_proj
                 .forward(ctx, attn_token_major, &mut self.scratch.o_proj_out, tokens);
@@ -3742,9 +3587,6 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
 
         // 10. Fused gate+up projection.
         {
-            #[cfg(feature = "cuda")]
-            let _alloc_label =
-                ferrum_kernels::backend::cuda::push_alloc_label("llama.forward_layer.gate_up_proj");
             layer.gate_up_proj.forward(
                 ctx,
                 &self.scratch.norm_out,
@@ -3800,9 +3642,6 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         nt!("act_mul", &self.scratch.silu_out, tokens * im, im);
         // 12. Down projection.
         {
-            #[cfg(feature = "cuda")]
-            let _alloc_label =
-                ferrum_kernels::backend::cuda::push_alloc_label("llama.forward_layer.down_proj");
             layer.down_proj.forward(
                 ctx,
                 &self.scratch.silu_out,
@@ -4039,9 +3878,6 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
             .as_ref()
             .expect("forward_verify called on backbone-only model (no lm_head)");
         {
-            #[cfg(feature = "cuda")]
-            let _alloc_label =
-                ferrum_kernels::backend::cuda::push_alloc_label("llama.forward_verify.lm_head");
             lm_head.forward(
                 &mut ctx,
                 &self.scratch.norm_out,
@@ -4280,9 +4116,6 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
             .as_ref()
             .expect("prefill_internal called on backbone-only model (no lm_head)");
         {
-            #[cfg(feature = "cuda")]
-            let _alloc_label =
-                ferrum_kernels::backend::cuda::push_alloc_label("llama.prefill.lm_head");
             lm_head.forward(
                 &mut ctx,
                 &self.scratch.last_normed,
@@ -4691,9 +4524,6 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
             .as_ref()
             .expect("decode_internal called on backbone-only model (no lm_head)");
         {
-            #[cfg(feature = "cuda")]
-            let _alloc_label =
-                ferrum_kernels::backend::cuda::push_alloc_label("llama.decode.lm_head");
             lm_head.forward(
                 &mut ctx,
                 &self.scratch.last_normed,
@@ -5030,9 +4860,6 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
             .as_ref()
             .expect("logits_from_hidden called on stage without lm_head");
         {
-            #[cfg(feature = "cuda")]
-            let _alloc_label =
-                ferrum_kernels::backend::cuda::push_alloc_label("llama.logits_from_hidden.lm_head");
             lm_head.forward(
                 &mut ctx,
                 &self.scratch.last_normed,

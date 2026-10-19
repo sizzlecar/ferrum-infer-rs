@@ -34,12 +34,12 @@ fn bench_paged_decode_attn() {
     let mut ctx =
         <CudaBackend as Backend>::new_context(&ferrum_types::BackendContextConfig::default())
             .unwrap();
-    let stream = ctx.stream.clone();
 
     // Q: [num_seqs, num_heads, head_dim] (q_len=1)
     let q_n = NUM_SEQS * NUM_HEADS * HEAD_DIM;
     let q_data: Vec<f32> = (0..q_n).map(|i| ((i as f32) * 0.0017).sin()).collect();
     let q = CudaBackend::from_slice_in_context(&mut ctx, &q_data);
+    let stream = q.as_f16().stream().clone();
 
     // KV pool: [total_blocks, num_kv_heads, block_size, head_dim] f16
     // total_blocks = num_seqs * max_blocks_per_seq (over-alloc)

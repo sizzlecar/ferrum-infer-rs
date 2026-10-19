@@ -482,9 +482,13 @@ fn prefix_admission_real_metal_reuses_before_reserving_and_publishes_chunks() {
 #[test]
 #[ignore = "requires an actual CUDA device"]
 fn prefix_admission_real_cuda_reuses_before_reserving_and_publishes_chunks() {
-    use ferrum_kernels::backend::{cuda::CudaBackend, Backend};
-    let context = CudaBackend::new_context(&ferrum_types::BackendContextConfig::default()).unwrap();
+    use ferrum_kernels::backend::cuda::CudaBackend;
     admission_and_chunks::<CudaBackend>(|buffer, count| {
-        context.stream.clone_dtoh(buffer.as_u32()).unwrap()[..count].to_vec()
+        buffer
+            .as_u32()
+            .stream()
+            .clone_dtoh(buffer.as_u32())
+            .unwrap()[..count]
+            .to_vec()
     });
 }

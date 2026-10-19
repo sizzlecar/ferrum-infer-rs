@@ -48,6 +48,8 @@ pub mod fa2_ffi;
 pub mod fa2_source;
 pub mod gated_delta_rule;
 pub mod graph;
+#[cfg(test)]
+mod instance_owner_tests;
 pub mod int8_kv;
 pub mod linear_attention;
 pub mod moe;
@@ -62,17 +64,11 @@ pub mod quant;
 // references keep working unchanged.
 pub mod cublas;
 #[cfg(feature = "candle-cuda-compat")]
-pub mod cuda_decode;
-#[cfg(feature = "candle-cuda-compat")]
-pub mod cuda_graph;
-#[cfg(feature = "candle-cuda-compat")]
 pub mod decode_attention;
-pub mod decode_buffers;
 #[cfg(feature = "candle-cuda-compat")]
 pub mod fused_add_rms_norm;
 #[cfg(feature = "candle-cuda-compat")]
 pub mod fused_silu_mul;
-pub mod gpu_paged_kv;
 pub mod marlin;
 #[cfg(not(target_os = "windows"))]
 pub mod nccl_comm;
@@ -82,14 +78,10 @@ pub mod residual_add;
 pub mod rms_norm;
 #[cfg(feature = "candle-cuda-compat")]
 pub mod rope;
-#[cfg(all(feature = "candle-cuda-compat", not(target_os = "windows")))]
-pub mod tp_decode;
 pub mod vnext_ops;
 mod vnext_replay;
 pub mod vnext_runtime;
 mod vnext_tool_correlation;
-#[cfg(feature = "candle-cuda-compat")]
-pub mod weight_store;
 
 // Triton kernels (only when the `triton-kernels` feature is also on —
 // `cuda` alone doesn't enable them).
@@ -172,10 +164,10 @@ pub struct CudaState {
     // Replaced scratch remains owned until no cached or in-flight graph can
     // reference it and actual completion has been observed. Growth is cold.
     captured_storage: Vec<Box<dyn Send + Sync>>,
-    pub ordinal: usize,
-    pub ctx: Arc<CudaContext>,
-    pub stream: Arc<CudaStream>,
-    pub blas: Arc<CudaBlas>,
+    ordinal: usize,
+    ctx: Arc<CudaContext>,
+    stream: Arc<CudaStream>,
+    blas: Arc<CudaBlas>,
     blas_resources: BlasSlot,
     modules: HashMap<&'static str, Arc<CudaModule>>,
     decode_state: DecodeStateBufs,
@@ -189,8 +181,8 @@ pub struct CudaState {
     split_k_scratch: Option<paged::SplitKScratch>,
     #[cfg(feature = "vllm-paged-attn-v2")]
     paged_attention_scratch: Option<vllm_paged_attn::PagedAttnScratch>,
-    pub use_dev_state: bool,
-    pub capture_in_flight: bool,
+    use_dev_state: bool,
+    capture_in_flight: bool,
     completion_observed: bool,
     /// Stable scratch buffers for batched-decode kernels that take per-item
     /// device-pointer arrays (flash_attn_batched, kv_cache_append_batched).
@@ -317,10 +309,15 @@ const MAX_GRAPH_SLOTS: usize = 2 * super::MAX_LAYERS_FOR_GRAPH;
 pub(super) const HOST_STAGING_TOTAL: usize = MAX_GRAPH_SLOTS * BATCHED_SCRATCH_CAP;
 
 impl CudaState {
+    /// Borrow the original execution stream for crate-owned math and timers.
+    pub(crate) fn stream(&self) -> &Arc<CudaStream> {
+        &self.stream
+    }
+
     /// Lazy-init the MoE stream pool on first access. Pool size is
     /// 4 by default; the original context's `moe_streams` policy fixes
     /// its size (1 selects serial expert dispatch).
-    pub fn moe_stream_pool(&mut self) -> &[Arc<CudaStream>] {
+    fn moe_stream_pool(&mut self) -> &[Arc<CudaStream>] {
         if self.moe_streams.is_none() {
             let n = self.configuration.moe.moe_streams;
             let mut pool = Vec::with_capacity(n);
@@ -341,7 +338,7 @@ impl CudaState {
     /// `moe_gemm_phase_batched` for cross-stream sync. The (entry,
     /// exits) tuple is stable across calls — events are only ever
     /// recorded / waited on, never destroyed (until `Drop`).
-    pub fn moe_sync_events(
+    fn moe_sync_events(
         &mut self,
     ) -> (
         cudarc::driver::sys::CUevent,
@@ -429,38 +426,6 @@ unsafe impl DeviceRepr for FlashAttnParams {}
 
 pub struct CudaBackend;
 
-thread_local! {
-    static CUDA_ALLOC_LABELS: std::cell::RefCell<Vec<&'static str>> =
-        std::cell::RefCell::new(Vec::new());
-}
-
-#[must_use]
-pub struct CudaAllocLabelGuard;
-
-pub fn push_alloc_label(label: &'static str) -> CudaAllocLabelGuard {
-    CUDA_ALLOC_LABELS.with(|labels| labels.borrow_mut().push(label));
-    CudaAllocLabelGuard
-}
-
-impl Drop for CudaAllocLabelGuard {
-    fn drop(&mut self) {
-        CUDA_ALLOC_LABELS.with(|labels| {
-            labels.borrow_mut().pop();
-        });
-    }
-}
-
-fn current_cuda_alloc_label() -> String {
-    CUDA_ALLOC_LABELS.with(|labels| {
-        let labels = labels.borrow();
-        if labels.is_empty() {
-            "label=<none>".to_string()
-        } else {
-            format!("label={}", labels.join(">"))
-        }
-    })
-}
-
 fn cuda_alloc_failed(
     op: &str,
     dtype: crate::backend::Dtype,
@@ -472,10 +437,9 @@ fn cuda_alloc_failed(
     let mem_info = cudarc::driver::result::mem_get_info()
         .map(|(free, total)| format!("free={free} total={total}"))
         .unwrap_or_else(|mem_err| format!("mem_get_info_failed={mem_err:?}"));
-    let alloc_label = current_cuda_alloc_label();
     let backtrace = std::backtrace::Backtrace::force_capture();
     panic!(
-        "{op} failed: dtype={dtype:?} elements={n} bytes={bytes} {mem_info} {alloc_label}: {err:?}\n{backtrace}"
+        "{op} failed: dtype={dtype:?} elements={n} bytes={bytes} {mem_info}: {err:?}\n{backtrace}"
     );
 }
 

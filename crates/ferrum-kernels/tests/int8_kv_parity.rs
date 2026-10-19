@@ -152,9 +152,8 @@ fn int8_kv_append_roundtrip() {
     let slot_mapping: Vec<i32> = (0..NUM_TOKENS).map(|i| (3 + i * 4) as i32).collect();
 
     let mut ctx = CudaBackend::new_context(&ferrum_types::BackendContextConfig::default()).unwrap();
-    let stream = ctx.stream.clone();
-
     let k_in_dev = CudaBackend::from_slice_in_context(&mut ctx, &k_in);
+    let stream = k_in_dev.as_f16().stream().clone();
     let v_in_dev = CudaBackend::from_slice_in_context(&mut ctx, &v_in);
     let mut k_pool: cudarc::driver::CudaSlice<i8> = stream
         .alloc_zeros::<i8>(POOL_TOKENS * NUM_KV_HEADS * HEAD_DIM)
@@ -326,9 +325,8 @@ fn int8_paged_decode_parity_vs_host_ref() {
     let (v_q, v_s) = quantize_token_per_head(&v_data, pool_tokens, NUM_KV_HEADS, HEAD_DIM);
 
     let mut ctx = CudaBackend::new_context(&ferrum_types::BackendContextConfig::default()).unwrap();
-    let stream = ctx.stream.clone();
-
     let q_dev = CudaBackend::from_slice_in_context(&mut ctx, &q_data);
+    let stream = q_dev.as_f16().stream().clone();
     let k_pool_i8 = stream.clone_htod(&k_q).unwrap();
     let v_pool_i8 = stream.clone_htod(&v_q).unwrap();
     let k_scales_h: Vec<f16> = k_s.iter().map(|x| f16::from_f32(*x)).collect();
@@ -472,9 +470,8 @@ fn int8_kv_append_then_decode_e2e() {
 
     // GPU path: append → decode.
     let mut ctx = CudaBackend::new_context(&ferrum_types::BackendContextConfig::default()).unwrap();
-    let stream = ctx.stream.clone();
-
     let q_dev = CudaBackend::from_slice_in_context(&mut ctx, &q_data);
+    let stream = q_dev.as_f16().stream().clone();
     let k_in_dev = CudaBackend::from_slice_in_context(&mut ctx, &k_in_data);
     let v_in_dev = CudaBackend::from_slice_in_context(&mut ctx, &v_in_data);
     let mut k_pool: cudarc::driver::CudaSlice<i8> = stream

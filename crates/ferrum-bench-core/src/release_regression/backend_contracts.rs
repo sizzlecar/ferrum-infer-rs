@@ -255,9 +255,9 @@ pub fn contract_groups(backend: Backend) -> Vec<ContractGroup> {
             tests.extend([
                 ContractTest {
                     package: "ferrum-kernels".into(),
-                    target: "cuda_instance_owner".into(),
-                    kind: "test".into(),
-                    name: "equal_graph_keys_remain_owned_across_peer_reset_and_retirement".into(),
+                    target: "ferrum_kernels".into(),
+                    kind: "lib".into(),
+                    name: "backend::cuda::instance_owner_tests::equal_graph_keys_remain_owned_across_peer_reset_and_retirement".into(),
                 },
                 ContractTest {
                     package: "ferrum-kernels".into(),

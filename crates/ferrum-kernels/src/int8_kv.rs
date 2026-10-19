@@ -3,8 +3,7 @@
 //! Two launchers:
 //!   - [`launch_int8_paged_decode_attention`]: read INT8 K/V (dequantized
 //!     on the fly via per-token per-kv-head FP16 scales), compute paged
-//!     decode attention. Mirrors [`crate::cuda_decode::launch_paged_decode_attention`]
-//!     for the FP16 path.
+//!     decode attention with the same causal visibility as the FP16 path.
 //!   - [`launch_int8_kv_cache_append`]: take FP16 K/V tokens, compute
 //!     per-token symmetric scale `s = max(|x|)/127`, write INT8 + scale
 //!     into the paged pool.

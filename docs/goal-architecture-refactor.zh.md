@@ -49,6 +49,8 @@ MoE API 迁移：移除旧 `Qwen3MoeModel`、`Qwen3MoeConfig`、`Qwen3MoeLayer` 
 
 Metal 队列 API：原 `MetalContext` 独占队列、命令与完成状态，只共享无队列的设备管线目录；量化管线按目录所属设备延迟初始化。移除公开裸派发、可替换的 `MetalBuf::raw_mut` 及具体量化 store/linear 构造面，使用 `Backend`、`Linear` 与 `StackedExpertGgufLinear` 契约。保留独立 attention 的 slice 入口及原标量算法，成功同步后才能读回；跨上下文传递 GPU 数据须先确认生产者完成。冷分配仍限定默认设备，不宣称任意设备或多 GPU 已验收。
 
+CUDA 资源 API：`CudaState` 的设备、stream、BLAS 与捕获状态改为私有，调用方通过 `CudaBackend` 和实例配置操作原上下文；MoE 辅助流和事件不再公开。退役没有产品调用的 `cuda_decode` / `tp_decode` / `cuda_graph`、专用 weight/decode/KV 容器及根 `quant` 模块，使用模型与统一 token 执行入口；保留底层量化、attention、INT8、Triton 和真实 layer split。移除 `push_alloc_label` 线程局部栈，分配失败仍报告操作、类型、容量及回溯；GGUF 加载诊断使用标准 `tracing`，不再扫描 `FERRUM_GGUF_LOAD_TRACE`。
+
 Metal 映射 API：`register_gguf_mmap` 接收 `RetainedHostMemoryRegion`，不再接受独立 slice 与任意 keeper。零拷贝 buffer 的原生释放回调持有真实内存所有者，覆盖 Rust 权重提前释放及原生 buffer 克隆；residency 独立持有，避免引用环。量化加载与原生静态权重导入共享范围检查和构造器；整页范围不能证明时复制对应 tensor，尾部 tensor 的额外内存及默认性能仍须验收。
 
 模型执行资格改为 `ModelTokenExecutionMode::{Unsupported, InlineSynchronous, ManagedWorker}`，替代两个可矛盾的布尔值；执行器在构建时保存声明，准入、执行和关闭使用同一模式。后端单独声明保留原上下文的生命周期能力，不感知 token 业务。本次仅开放完整 Metal Llama FP16 KV 模型，CUDA legacy、设备 INT8 与 GPU pipeline 仍待各自验证。

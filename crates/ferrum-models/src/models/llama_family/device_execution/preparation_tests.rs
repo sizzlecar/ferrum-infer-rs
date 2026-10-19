@@ -236,10 +236,14 @@ fn preparation_frame_real_metal_allocator_and_contiguous_growth() {
 #[test]
 #[ignore = "requires an actual CUDA device"]
 fn preparation_frame_real_cuda_allocator_and_contiguous_growth() {
-    use ferrum_kernels::backend::{cuda::CudaBackend, Backend};
-    let context = CudaBackend::new_context(&ferrum_types::BackendContextConfig::default()).unwrap();
+    use ferrum_kernels::backend::cuda::CudaBackend;
     real_preparation_preserves_allocator_and_numerical_state::<CudaBackend>(|buffer, count| {
-        context.stream.clone_dtoh(buffer.as_u32()).unwrap()[..count].to_vec()
+        buffer
+            .as_u32()
+            .stream()
+            .clone_dtoh(buffer.as_u32())
+            .unwrap()[..count]
+            .to_vec()
     });
 }
 

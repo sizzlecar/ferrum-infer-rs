@@ -94,7 +94,7 @@ impl MarlinExpertStack<CudaBackend> for CudaMarlinExpertStack {
         };
         #[cfg(not(feature = "triton-kernels"))]
         let mw: &crate::marlin::MarlinWeight = self.store.as_ref();
-        let stream = ctx.stream.clone();
+        let stream = ctx.stream().clone();
         let raw_stream = stream.cu_stream();
         let (ws_ptr, _g) = mw.workspace.device_ptr(&stream);
         let ws_len = mw.workspace.len();

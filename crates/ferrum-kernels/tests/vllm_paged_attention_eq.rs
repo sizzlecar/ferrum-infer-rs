@@ -164,7 +164,6 @@ impl Inputs {
 fn native_paged_attention_matches_cpu_with_permuted_blocks_and_partition_tail() {
     let mut context =
         CudaBackend::new_context(&ferrum_types::BackendContextConfig::default()).unwrap();
-    let stream = context.stream.clone();
     // These are the two separately compiled native head-size instantiations.
     // Reuse the owning context and its stream across scratch growth.
     for head_dim in [128, 256] {
@@ -173,7 +172,9 @@ fn native_paged_attention_matches_cpu_with_permuted_blocks_and_partition_tail() 
         let expected = inputs.cpu_reference();
         let (keys, values, table) = inputs.native_cache();
         let lengths: Vec<u32> = inputs.sequence_lengths.iter().map(|&n| n as u32).collect();
-        let query_device = stream.clone_htod(&inputs.queries).expect("upload queries");
+        let query_buffer = CudaBackend::from_slice_typed_in_context(&mut context, &inputs.queries);
+        let query_device = query_buffer.as_f16();
+        let stream = query_device.stream().clone();
         let key_device = stream.clone_htod(&keys).expect("upload packed keys");
         let value_device = stream.clone_htod(&values).expect("upload packed values");
         let table_device = stream.clone_htod(&table).expect("upload block table");
@@ -187,7 +188,7 @@ fn native_paged_attention_matches_cpu_with_permuted_blocks_and_partition_tail() 
         dispatch_paged_attention_v2(
             &mut context,
             &mut output_device,
-            &query_device,
+            query_device,
             &key_device,
             &value_device,
             &table_device,

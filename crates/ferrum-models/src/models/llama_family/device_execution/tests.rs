@@ -192,12 +192,10 @@ fn metal_frame_failure_before_first_encode_restores_owner_and_full_numerical_exe
 #[ignore = "requires an actual CUDA device"]
 fn single_device_frame_restores_original_scratch_after_real_cuda_forward_failure() {
     use cudarc::driver::DevicePtr;
-    use ferrum_kernels::backend::{cuda::CudaBackend, Backend};
+    use ferrum_kernels::backend::cuda::CudaBackend;
 
-    // Initialization failure is a failed selected test, never a skipped case.
-    let context = CudaBackend::new_context(&ferrum_types::BackendContextConfig::default()).unwrap();
     real_forward_unwind_restores_original_scratch::<CudaBackend>(|buffer| {
-        let (pointer, _record) = buffer.as_f16().device_ptr(&context.stream);
+        let (pointer, _record) = buffer.as_f16().device_ptr(buffer.as_f16().stream());
         usize::try_from(pointer).expect("CUDA allocation address must fit the host pointer width")
     });
 }
@@ -209,6 +207,21 @@ fn model_frame_cancels_failed_cuda_capture_without_executing_prefix() {
     use cudarc::driver::DevicePtr;
     use ferrum_kernels::backend::{cuda::CudaBackend, Backend, BackendGraph};
     use std::sync::Arc;
+
+    fn assert_original_stream(
+        context: &mut ferrum_kernels::backend::cuda::CudaState,
+        original_stream: &Arc<cudarc::driver::CudaStream>,
+    ) {
+        // An actual allocation through the recovered context must still use
+        // the original instance's stream. Inspect the existing buffer API,
+        // without opening a native-owner getter on the production context.
+        let probe = CudaBackend::alloc_in_context(context, 1);
+        assert!(Arc::ptr_eq(probe.as_f16().stream(), original_stream));
+        assert!(matches!(
+            CudaBackend::observe_completion(context),
+            ferrum_kernels::backend::BackendCompletion::Succeeded
+        ));
+    }
 
     let config = LlamaFamilyConfig {
         hidden_size: 128,
@@ -253,15 +266,21 @@ fn model_frame_cancels_failed_cuda_capture_without_executing_prefix() {
         CudaBackend::write_f32_to_activation(&mut frame.context, residual, &sentinel);
     });
     assert!(matches!(prepared, DeviceFrameResult::Terminal(Ok(()))));
-    let original_context = model.execution_context.as_ref().unwrap();
-    let original_stream = Arc::as_ptr(&original_context.stream);
+    let original_stream = model
+        .scratch
+        .residual
+        .as_ref()
+        .unwrap()
+        .as_f16()
+        .stream()
+        .clone();
     let original_buffer = model
         .scratch
         .residual
         .as_ref()
         .unwrap()
         .as_f16()
-        .device_ptr(&original_context.stream)
+        .device_ptr(&original_stream)
         .0;
 
     let failed: DeviceFrameResult<()> = model.run_device_frame(|model, frame| {
@@ -284,11 +303,11 @@ fn model_frame_cancels_failed_cuda_capture_without_executing_prefix() {
     );
     assert!(model.pending_device_frame.is_none());
     let context = model.execution_context.as_mut().unwrap();
-    assert_eq!(Arc::as_ptr(&context.stream), original_stream);
     assert!(!CudaBackend::graph_capture_in_flight(context));
+    assert_original_stream(context, &original_stream);
     let residual = model.scratch.residual.as_ref().unwrap();
     assert_eq!(
-        residual.as_f16().device_ptr(&context.stream).0,
+        residual.as_f16().device_ptr(&original_stream).0,
         original_buffer
     );
     assert_eq!(
@@ -309,10 +328,7 @@ fn model_frame_cancels_failed_cuda_capture_without_executing_prefix() {
     assert!(actual_decode.iter().all(|value| value.is_finite()));
     assert_eq!(actual_decode, expected_decode);
     assert!(model.kv_caches["after"].iter().all(|cache| cache.len == 4));
-    assert_eq!(
-        Arc::as_ptr(&model.execution_context.as_ref().unwrap().stream),
-        original_stream
-    );
+    assert_original_stream(model.execution_context.as_mut().unwrap(), &original_stream);
     model.release("after");
     reference.release("oracle");
     assert!(model.kv_caches.is_empty());

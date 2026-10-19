@@ -150,7 +150,7 @@ fn moe_pair_id_align_is_bitwise_stable_and_matches_reference() {
             )
             .expect("moe_align_block_size_pair_ids launch");
 
-        let stream = ctx.stream.clone();
+        let stream = sorted_dev.as_u32().stream().clone();
         let sorted_view = unsafe {
             sorted_dev
                 .transmute::<i32>(sorted_max)

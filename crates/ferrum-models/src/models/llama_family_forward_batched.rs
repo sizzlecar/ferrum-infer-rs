@@ -399,12 +399,9 @@ mod tests {
     #[ignore = "requires an actual CUDA device"]
     fn physical_batch_frame_preserves_real_cuda_logits_and_scratch_on_failure() {
         use cudarc::driver::DevicePtr;
-        use ferrum_kernels::backend::{cuda::CudaBackend, Backend};
-
-        let context =
-            CudaBackend::new_context(&ferrum_types::BackendContextConfig::default()).unwrap();
+        use ferrum_kernels::backend::cuda::CudaBackend;
         physical_batch_frame_retains_scratch::<CudaBackend>(|buffer| {
-            let (pointer, _record) = buffer.as_f16().device_ptr(&context.stream);
+            let (pointer, _record) = buffer.as_f16().device_ptr(buffer.as_f16().stream());
             usize::try_from(pointer)
                 .expect("CUDA allocation address must fit the host pointer width")
         });
@@ -749,9 +746,6 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
         // 2. qkv_proj (GEMM m=M): norm_out [M, H] → qkv_out [M, QKV]
 
         {
-            #[cfg(feature = "cuda")]
-            let _alloc_label =
-                ferrum_kernels::backend::cuda::push_alloc_label("llama.batched_layer.qkv_proj");
             layer
                 .qkv_proj
                 .forward(ctx, &self.scratch.norm_out, &mut self.scratch.qkv_out, m);
@@ -1393,9 +1387,6 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
         // 7. o_proj (GEMM m=M): attn_flat [M, Q] → o_proj_out [M, H]
 
         {
-            #[cfg(feature = "cuda")]
-            let _alloc_label =
-                ferrum_kernels::backend::cuda::push_alloc_label("llama.batched_layer.o_proj");
             layer.o_proj.forward(
                 ctx,
                 &self.scratch.attn_flat,
@@ -1863,10 +1854,6 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
                         .as_mut()
                         .expect("unified_packed_logits missing");
                     {
-                        #[cfg(feature = "cuda")]
-                        let _alloc_label = ferrum_kernels::backend::cuda::push_alloc_label(
-                            "llama.unified.lm_head",
-                        );
                         lm_head.forward(&mut ctx, packed_normed, packed_logits, num_sampled);
                     }
                 }
@@ -2191,9 +2178,6 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
                 .unified_qkv_out
                 .as_mut()
                 .expect("unified_qkv_out missing");
-            #[cfg(feature = "cuda")]
-            let _alloc_label =
-                ferrum_kernels::backend::cuda::push_alloc_label("llama.unified_layer.qkv_proj");
             layer.qkv_proj.forward(ctx, norm_out, qkv_out, m_total);
         };
 
@@ -2332,9 +2316,6 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
                 .unified_o_proj_out
                 .as_mut()
                 .expect("unified_o_proj_out missing");
-            #[cfg(feature = "cuda")]
-            let _alloc_label =
-                ferrum_kernels::backend::cuda::push_alloc_label("llama.unified_layer.o_proj");
             layer.o_proj.forward(ctx, attn_out, o_proj_out, m_total);
         };
 
@@ -2403,9 +2384,6 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
                 .unified_gate_up_out
                 .as_mut()
                 .expect("unified_gate_up_out missing");
-            #[cfg(feature = "cuda")]
-            let _alloc_label =
-                ferrum_kernels::backend::cuda::push_alloc_label("llama.unified_layer.gate_up_proj");
             layer
                 .gate_up_proj
                 .forward(ctx, norm_out, gate_up_out, m_total);
@@ -2443,9 +2421,6 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
                 .unified_mlp_out
                 .as_mut()
                 .expect("unified_mlp_out missing");
-            #[cfg(feature = "cuda")]
-            let _alloc_label =
-                ferrum_kernels::backend::cuda::push_alloc_label("llama.unified_layer.down_proj");
             layer.down_proj.forward(ctx, silu_out, mlp_out, m_total);
         };
 
@@ -2963,9 +2938,6 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
                 .expect("decode_batch_internal called on backbone-only model (no lm_head)");
 
             {
-                #[cfg(feature = "cuda")]
-                let _alloc_label =
-                    ferrum_kernels::backend::cuda::push_alloc_label("llama.batched.lm_head");
                 lm_head.forward(
                     &mut ctx,
                     &self.scratch.norm_out,
@@ -3292,9 +3264,6 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
             .as_ref()
             .expect("logits_from_hidden_batch called on stage without lm_head");
         {
-            #[cfg(feature = "cuda")]
-            let _alloc_label =
-                ferrum_kernels::backend::cuda::push_alloc_label("llama.logits_batch.lm_head");
             lm_head.forward(
                 &mut ctx,
                 &self.scratch.norm_out,
