@@ -464,7 +464,8 @@ async fn token_capacity_sequence_extension_pressure_does_not_cap_survivors_durin
     );
     let survivors = scheduler
         .next_batch_with_token_admissions(
-            ferrum_interfaces::BatchHint::simple(ids.len()),
+            scheduler
+                .prepare_token_batch_selection(ferrum_interfaces::BatchHint::simple(ids.len())),
             Some(wake),
             &mut |_| {},
             None,

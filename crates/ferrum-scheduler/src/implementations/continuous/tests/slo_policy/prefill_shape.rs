@@ -92,6 +92,7 @@ fn slo_prefill_shape_time_shrink_starts_from_projected_work() {
         .create_iteration_batch_with_time(
             hint(),
             WaitingAdmissionMode::Prepared {
+                initial_priority: None,
                 wake: None,
                 observer: &mut |_| {},
             },

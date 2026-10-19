@@ -324,7 +324,9 @@ async fn token_allocator_shared_peers_close_in_order_before_recompute_can_readmi
     let retry_batch = engine
         .scheduler
         .next_batch_with_token_admissions(
-            ferrum_interfaces::BatchHint::simple(3),
+            engine
+                .scheduler
+                .prepare_token_batch_selection(ferrum_interfaces::BatchHint::simple(3)),
             None,
             &mut |_| {},
             None,
@@ -441,7 +443,9 @@ async fn token_allocator_shared_peers_close_in_order_before_recompute_can_readmi
     let runnable = engine
         .scheduler
         .next_batch_with_token_admissions(
-            ferrum_interfaces::BatchHint::simple(3),
+            engine
+                .scheduler
+                .prepare_token_batch_selection(ferrum_interfaces::BatchHint::simple(3)),
             None,
             &mut |_| {},
             None,

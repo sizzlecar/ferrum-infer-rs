@@ -3595,6 +3595,106 @@ async fn plan_runtime_serial_backing_growth_converges_before_batch_submission() 
 }
 
 #[tokio::test]
+async fn fill_first_priority_precedes_general_admission_without_starving_decode() {
+    let mut config = EngineConfig::default();
+    config.kv_cache.max_blocks = 128;
+    config.scheduler.max_running_requests = 4;
+    config.scheduler.prefill_first_until_active = Some(4);
+    config.scheduler.prompt_token_estimate = true;
+    config.batching.max_batch_size = 4;
+    config.batching.max_num_batched_tokens = 2;
+    let scheduler = Arc::new(ContinuousBatchScheduler::new(config.scheduler.clone()));
+    let tokenizer: Arc<dyn Tokenizer + Send + Sync> = Arc::new(PolicyTokenizer::new(
+        128,
+        &[("test", 5), ("ok", 6), ("generated", 42)],
+    ));
+    let engine = ContinuousBatchEngine::new(
+        config,
+        Arc::clone(&scheduler),
+        Arc::clone(&tokenizer),
+        Arc::new(crate::registry::GreedySampler),
+        ExecutorOwner::new(Box::new(PlanRuntimeChunkedPrefillTestExecutor::new(false))),
+    )
+    .unwrap();
+
+    let mut incumbent = None;
+    for prompts in [vec!["test"], vec!["test ok", "ok test", "ok ok"]] {
+        for prompt in prompts {
+            let mut request = policy_request();
+            request.prompt = prompt.to_owned();
+            request.sampling_params.max_tokens = 8;
+            let tokens = tokenizer.encode(prompt, true).unwrap();
+            request.metadata.insert(
+                PROMPT_TOKENS_METADATA_KEY.to_owned(),
+                serde_json::json!(tokens.len()),
+            );
+            incumbent.get_or_insert_with(|| request.id.clone());
+            scheduler.submit(request.clone()).await.unwrap();
+            engine.active_inner().unwrap().sequences.insert(
+                request.id.clone(),
+                SequenceState::new_with_tokenizer_and_model_vocab_size(
+                    request,
+                    tokens,
+                    Some(Arc::clone(&tokenizer)),
+                    Some(128),
+                ),
+            );
+        }
+        if scheduler.decoding_count() == 0 {
+            for _ in 0..2 {
+                engine
+                    .active_inner()
+                    .unwrap()
+                    .run_iteration()
+                    .await
+                    .unwrap();
+                if scheduler.decoding_count() == 1 {
+                    break;
+                }
+            }
+            assert_eq!(scheduler.decoding_count(), 1);
+        }
+    }
+    let incumbent = incumbent.unwrap();
+    let generated = || {
+        let inner = engine.active_inner().unwrap();
+        let sequence = inner.sequences.get(&incumbent).unwrap();
+        let state = sequence.lock();
+        state.as_ref().unwrap().generated_tokens.len()
+    };
+    assert_eq!(generated(), 1);
+
+    engine
+        .active_inner()
+        .unwrap()
+        .run_iteration()
+        .await
+        .unwrap();
+    assert_eq!(scheduler.active_count(), 4);
+    assert_eq!(scheduler.waiting_count(), 0);
+    assert_eq!(scheduler.decoding_count(), 2);
+    assert_eq!(scheduler.prefilling_count(), 2);
+    assert_eq!(
+        generated(),
+        1,
+        "general admission must not overturn this iteration's fill-first priority"
+    );
+
+    engine
+        .active_inner()
+        .unwrap()
+        .run_iteration()
+        .await
+        .unwrap();
+    assert_eq!(
+        generated(),
+        2,
+        "the following iteration must resume decode at the active target"
+    );
+    engine.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn request_publication_lock_is_released_during_device_execution() {
     let mut config = EngineConfig::default();
     config.kv_cache.max_blocks = 128;

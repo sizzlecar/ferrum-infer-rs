@@ -604,11 +604,20 @@ type ExecutorAdmissionQueueEvent = AdmissionQueueEvent<
     FerrumError,
 >;
 
+/// This iteration's priority, captured before asynchronous general admission.
+/// It owns no execution authority or capacity: selection still checks the live
+/// queues, readiness, token budget and admission evidence.
+pub struct TokenBatchSelectionIntent {
+    hint: BatchHint,
+    skip_initial_decode: bool,
+}
+
 enum WaitingAdmissionMode<'a> {
     Legacy,
     Prepared {
         wake: Option<AdmissionWakeSnapshot<'a>>,
         observer: &'a mut dyn FnMut(ExecutorAdmissionQueueObservation),
+        initial_priority: Option<bool>,
     },
     Dynamic {
         wake: Option<AdmissionWakeSnapshot<'a>>,
@@ -618,6 +627,15 @@ enum WaitingAdmissionMode<'a> {
 }
 
 impl<'a> WaitingAdmissionMode<'a> {
+    fn initial_priority(&self) -> Option<bool> {
+        match self {
+            Self::Prepared {
+                initial_priority, ..
+            } => *initial_priority,
+            _ => None,
+        }
+    }
+
     fn wake(&self) -> Option<AdmissionWakeSnapshot<'a>> {
         match self {
             Self::Legacy => None,
@@ -1914,22 +1932,38 @@ impl ContinuousBatchScheduler {
             WaitingAdmissionMode::Prepared {
                 wake: Some(wake),
                 observer,
+                initial_priority: None,
             },
         )
+    }
+
+    /// Decide cold-cohort priority before general admission changes the active
+    /// population. This preserves the priority order of synchronous admission
+    /// without retaining scheduler locks across executor preparation.
+    pub fn prepare_token_batch_selection(&self, hint: BatchHint) -> TokenBatchSelectionIntent {
+        let skip_initial_decode = self.skip_decode_for_prefill_first(&hint);
+        TokenBatchSelectionIntent {
+            hint,
+            skip_initial_decode,
+        }
     }
 
     /// Select only work already admitted by the common token executor protocol.
     /// Native snapshots remain optional evidence, never manufactured for an executor.
     pub fn next_batch_with_token_admissions(
         &self,
-        hint: BatchHint,
+        intent: TokenBatchSelectionIntent,
         wake: Option<AdmissionWakeSnapshot<'_>>,
         observer: &mut dyn FnMut(ExecutorAdmissionQueueObservation),
         mut planning: Option<&mut TimePlanningRound>,
     ) -> Result<BatchSelection> {
         let batch = self.create_iteration_batch_with_time(
-            hint,
-            WaitingAdmissionMode::Prepared { wake, observer },
+            intent.hint,
+            WaitingAdmissionMode::Prepared {
+                wake,
+                observer,
+                initial_priority: Some(intent.skip_initial_decode),
+            },
             Instant::now(),
             planning.as_deref_mut(),
         )?;
@@ -4113,6 +4147,37 @@ impl ContinuousBatchScheduler {
         self.create_iteration_batch_with_time(hint, waiting_admission, now, None)
     }
 
+    fn skip_decode_for_prefill_first(&self, hint: &BatchHint) -> bool {
+        let prefill_first_target = self
+            .runtime_config
+            .prefill_first_until_active
+            .map(|target| {
+                target
+                    .min(hint.max_batch_size)
+                    .min(self.cb_config.max_decode_batch)
+            })
+            .unwrap_or(0);
+        let decoding_count = self.decoding_count();
+        let active_count = self.active_count();
+        let capacity_backpressure_active = self.capacity_backpressure_admit_limit().is_some();
+        let fill_first_initial_cohort_armed =
+            self.fill_first_initial_cohort_armed.load(Ordering::Acquire);
+        fill_first_initial_cohort_armed
+            && !(self.config.slo.is_some() && decoding_count > 0)
+            && !(self
+                .runtime_config
+                .active_decode_prefill_token_budget
+                .is_some()
+                && decoding_count > 0)
+            && (self.config.prefix_rendezvous_max_wait_ms.is_none()
+                || self.prefix_held_waiting_count() == 0)
+            && prefill_first_target > 0
+            && decoding_count < prefill_first_target
+            && active_count < prefill_first_target
+            && !(capacity_backpressure_active && decoding_count > 0)
+            && (self.prefilling_count() > 0 || self.waiting_count() > 0)
+    }
+
     fn create_iteration_batch_with_time(
         &self,
         hint: BatchHint,
@@ -4130,34 +4195,11 @@ impl ContinuousBatchScheduler {
         let mut batch_requests = Vec::new();
         let mut scheduled_request_ids = HashSet::new();
         let mut total_tokens = 0;
-        let prefill_first_target = self
-            .runtime_config
-            .prefill_first_until_active
-            .map(|target| {
-                target
-                    .min(hint.max_batch_size)
-                    .min(self.cb_config.max_decode_batch)
-            })
-            .unwrap_or(0);
-        let decoding_count = self.decoding_count();
-        let active_count = self.active_count();
-        let capacity_backpressure_active = self.capacity_backpressure_admit_limit().is_some();
         let fill_first_initial_cohort_armed =
             self.fill_first_initial_cohort_armed.load(Ordering::Acquire);
-        let skip_decode_for_prefill_first = fill_first_initial_cohort_armed
-            && !(self.config.slo.is_some() && decoding_count > 0)
-            && !(self
-                .runtime_config
-                .active_decode_prefill_token_budget
-                .is_some()
-                && decoding_count > 0)
-            && (self.config.prefix_rendezvous_max_wait_ms.is_none()
-                || self.prefix_held_waiting_count() == 0)
-            && prefill_first_target > 0
-            && decoding_count < prefill_first_target
-            && active_count < prefill_first_target
-            && !(capacity_backpressure_active && decoding_count > 0)
-            && (self.prefilling_count() > 0 || self.waiting_count() > 0);
+        let skip_decode_for_prefill_first = waiting_admission
+            .initial_priority()
+            .unwrap_or_else(|| self.skip_decode_for_prefill_first(&hint));
         // First, collect decode requests (they have priority). The opt-in
         // fill-first experiment skips decodes until the active decode cohort
         // reaches the requested target, reducing early mixed prefill+decode

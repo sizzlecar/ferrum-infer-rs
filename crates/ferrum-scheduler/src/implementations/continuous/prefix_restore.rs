@@ -363,6 +363,7 @@ impl ContinuousBatchScheduler {
         }
         let mut ignore = |_| {};
         let mut mode = WaitingAdmissionMode::Prepared {
+            initial_priority: None,
             wake: Some(wake),
             observer: &mut ignore,
         };

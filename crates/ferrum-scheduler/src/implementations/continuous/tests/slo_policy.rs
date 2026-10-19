@@ -116,7 +116,12 @@ fn select(
     planning: Option<&mut TimePlanningRound>,
 ) -> crate::cost_prediction::BatchSelection {
     scheduler
-        .next_batch_with_token_admissions(hint(), None, &mut |_| {}, planning)
+        .next_batch_with_token_admissions(
+            scheduler.prepare_token_batch_selection(hint()),
+            None,
+            &mut |_| {},
+            planning,
+        )
         .unwrap()
 }
 
@@ -161,10 +166,10 @@ fn slo_snapshot_budget_changes_real_batch_and_respects_static_caps() {
             TimePlanningRound::new(source, targets(), PrefillShapePolicy::Identity);
         let narrow = sched
             .next_batch_with_token_admissions(
-                BatchHint {
+                sched.prepare_token_batch_selection(BatchHint {
                     max_tokens: 7,
                     ..hint()
-                },
+                }),
                 None,
                 &mut |_| {},
                 Some(&mut narrow_round),
@@ -343,6 +348,7 @@ fn slo_stale_and_inexact_are_unknown_while_existing_decode_progresses() {
         .create_iteration_batch_with_time(
             hint(),
             WaitingAdmissionMode::Prepared {
+                initial_priority: None,
                 wake: None,
                 observer: &mut |_| {},
             },
@@ -530,6 +536,7 @@ fn slo_known_oversize_then_unknown_preserves_declared_policy_and_counts_final_sh
                 .create_iteration_batch_with_time(
                     hint(),
                     WaitingAdmissionMode::Prepared {
+                        initial_priority: None,
                         wake: None,
                         observer: &mut |_| {},
                     },

@@ -48,7 +48,12 @@ async fn allocator_capacity_wait_has_no_native_epoch_and_requires_confirmed_rele
         assert_eq!(prepared.admitted(), 1);
         assert_eq!(prepared.deferred(), 1);
         let batch = scheduler
-            .next_batch_with_token_admissions(BatchHint::simple(4), None, &mut |_| {}, None)
+            .next_batch_with_token_admissions(
+                scheduler.prepare_token_batch_selection(BatchHint::simple(4)),
+                None,
+                &mut |_| {},
+                None,
+            )
             .map(|selection| selection.batch)
             .unwrap()
             .unwrap();

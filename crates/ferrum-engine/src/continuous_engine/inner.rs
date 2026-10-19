@@ -1306,8 +1306,9 @@ impl EngineInner {
         {
             return Ok(EngineIterationOutcome::Progressed);
         }
+        let selection_intent = self.scheduler.prepare_token_batch_selection(hint);
         let (_, prefill_maintenance) = self
-            .prepare_dynamic_admission_round(hint.max_batch_size, planning.as_mut())
+            .prepare_dynamic_admission_round(hint_max_batch_size, planning.as_mut())
             .await?;
         let prefill_maintenance = PendingPrefillMaintenance::new(
             self.model_executor.as_ref().as_ref(),
@@ -1337,7 +1338,7 @@ impl EngineInner {
             });
             let mut observations = Vec::new();
             let scheduled = self.scheduler.next_batch_with_token_admissions(
-                hint,
+                selection_intent,
                 wake,
                 &mut |observation| observations.push(observation),
                 planning.as_mut(),

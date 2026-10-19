@@ -26,7 +26,12 @@ fn active_requests(count: usize, decode: bool) -> (ContinuousBatchScheduler, Vec
         .unwrap();
     assert_eq!(tick.admitted(), count);
     let first = scheduler
-        .next_batch_with_token_admissions(BatchHint::simple(count), None, &mut |_| {}, None)
+        .next_batch_with_token_admissions(
+            scheduler.prepare_token_batch_selection(BatchHint::simple(count)),
+            None,
+            &mut |_| {},
+            None,
+        )
         .map(|selection| selection.batch)
         .unwrap()
         .expect("admitted prefill must be runnable");
@@ -81,7 +86,7 @@ fn allocator_capacity_pending_close_parks_prefill_and_decode_until_confirmed_rel
         for _ in 0..2 {
             assert!(scheduler
                 .next_batch_with_token_admissions(
-                    BatchHint::simple(2),
+                    scheduler.prepare_token_batch_selection(BatchHint::simple(2)),
                     None,
                     &mut |event| events.push(event),
                     None
@@ -99,7 +104,7 @@ fn allocator_capacity_pending_close_parks_prefill_and_decode_until_confirmed_rel
         assert!(!scheduler.all_active_allocator_capacity_blocked());
         let resumed = scheduler
             .next_batch_with_token_admissions(
-                BatchHint::simple(2),
+                scheduler.prepare_token_batch_selection(BatchHint::simple(2)),
                 None,
                 &mut |event| events.push(event),
                 None,
@@ -136,7 +141,12 @@ fn allocator_capacity_release_during_execution_is_not_lost_at_deferral_installat
     );
     assert!(!scheduler.all_active_allocator_capacity_blocked());
     let batch = scheduler
-        .next_batch_with_token_admissions(BatchHint::simple(2), None, &mut |_| {}, None)
+        .next_batch_with_token_admissions(
+            scheduler.prepare_token_batch_selection(BatchHint::simple(2)),
+            None,
+            &mut |_| {},
+            None,
+        )
         .map(|selection| selection.batch)
         .unwrap()
         .unwrap();
@@ -158,7 +168,12 @@ fn allocator_capacity_failed_close_invalidates_wait_without_claiming_release() {
         );
         assert!(scheduler.all_active_allocator_capacity_blocked());
         assert!(scheduler
-            .next_batch_with_token_admissions(BatchHint::simple(1), None, &mut |_| {}, None)
+            .next_batch_with_token_admissions(
+                scheduler.prepare_token_batch_selection(BatchHint::simple(1)),
+                None,
+                &mut |_| {},
+                None
+            )
             .map(|selection| selection.batch)
             .unwrap()
             .is_none());
@@ -172,7 +187,12 @@ fn allocator_capacity_failed_close_invalidates_wait_without_claiming_release() {
         assert_eq!(scheduler.pressure_transition_journal(), journal);
         assert!(!scheduler.all_active_allocator_capacity_blocked());
         let batch = scheduler
-            .next_batch_with_token_admissions(BatchHint::simple(1), None, &mut |_| {}, None)
+            .next_batch_with_token_admissions(
+                scheduler.prepare_token_batch_selection(BatchHint::simple(1)),
+                None,
+                &mut |_| {},
+                None,
+            )
             .map(|selection| selection.batch)
             .unwrap()
             .expect("an invalidated external wait must permit re-probe");
@@ -241,7 +261,12 @@ fn allocator_capacity_invalidation_preserves_exact_fence_and_recompute_hold() {
         PressureHoldStatus::Held { .. },
     ));
     assert!(scheduler
-        .next_batch_with_token_admissions(BatchHint::simple(2), None, &mut |_| {}, None)
+        .next_batch_with_token_admissions(
+            scheduler.prepare_token_batch_selection(BatchHint::simple(2)),
+            None,
+            &mut |_| {},
+            None
+        )
         .map(|selection| selection.batch)
         .unwrap()
         .is_none());
@@ -269,7 +294,12 @@ fn allocator_capacity_invalidation_preserves_exact_fence_and_recompute_hold() {
         .unwrap();
     assert_eq!(tick.admitted(), 0);
     let batch = scheduler
-        .next_batch_with_token_admissions(BatchHint::simple(2), None, &mut |_| {}, None)
+        .next_batch_with_token_admissions(
+            scheduler.prepare_token_batch_selection(BatchHint::simple(2)),
+            None,
+            &mut |_| {},
+            None,
+        )
         .map(|selection| selection.batch)
         .unwrap()
         .unwrap();
@@ -309,7 +339,12 @@ fn allocator_capacity_without_a_contributor_fails_without_parking_or_cross_pool_
     assert!(!scheduler.all_active_allocator_capacity_blocked());
     assert_eq!(scheduler.trace_snapshot().pressure_active_episodes, 0);
     assert!(scheduler
-        .next_batch_with_token_admissions(BatchHint::simple(1), None, &mut |_| {}, None)
+        .next_batch_with_token_admissions(
+            scheduler.prepare_token_batch_selection(BatchHint::simple(1)),
+            None,
+            &mut |_| {},
+            None
+        )
         .map(|selection| selection.batch)
         .unwrap()
         .is_some());
@@ -365,7 +400,12 @@ fn allocator_capacity_joint_contributors_yield_in_order_without_readmitting_the_
     // Real cross-iteration selection must preserve the remaining contributor's
     // blocked state while only the accepted owner re-probes the released pool.
     let retry = scheduler
-        .next_batch_with_token_admissions(BatchHint::simple(3), None, &mut |_| {}, None)
+        .next_batch_with_token_admissions(
+            scheduler.prepare_token_batch_selection(BatchHint::simple(3)),
+            None,
+            &mut |_| {},
+            None,
+        )
         .map(|selection| selection.batch)
         .unwrap()
         .unwrap();
@@ -418,7 +458,12 @@ fn allocator_capacity_joint_contributors_yield_in_order_without_readmitting_the_
         .unwrap();
     assert_eq!(tick.admitted(), 0);
     let batch = scheduler
-        .next_batch_with_token_admissions(BatchHint::simple(3), None, &mut |_| {}, None)
+        .next_batch_with_token_admissions(
+            scheduler.prepare_token_batch_selection(BatchHint::simple(3)),
+            None,
+            &mut |_| {},
+            None,
+        )
         .map(|selection| selection.batch)
         .unwrap()
         .unwrap();
@@ -479,7 +524,7 @@ fn allocator_capacity_owner_progress_reopens_peer_without_fabricating_another_re
     let mut observations = Vec::new();
     let retry = scheduler
         .next_batch_with_token_admissions(
-            BatchHint::simple(3),
+            scheduler.prepare_token_batch_selection(BatchHint::simple(3)),
             None,
             &mut |event| observations.push(event),
             None,
@@ -498,7 +543,12 @@ fn allocator_capacity_owner_progress_reopens_peer_without_fabricating_another_re
     // exclusive re-probe. Keep the real release epoch at one.
     scheduler.update_decode_progress(owner, 2);
     let retry = scheduler
-        .next_batch_with_token_admissions(BatchHint::simple(3), None, &mut |_| {}, None)
+        .next_batch_with_token_admissions(
+            scheduler.prepare_token_batch_selection(BatchHint::simple(3)),
+            None,
+            &mut |_| {},
+            None,
+        )
         .map(|selection| selection.batch)
         .unwrap()
         .unwrap();
