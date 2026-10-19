@@ -14,7 +14,7 @@ This guide is for vLLM users who want to try Ferrum without changing their OpenA
 | `--max-model-len` | `--max-model-len` | Maps to `FERRUM_MAX_MODEL_LEN`. |
 | `--max-num-seqs` | `--max-num-seqs` | Maps to `FERRUM_PAGED_MAX_SEQS`. |
 | `--max-num-batched-tokens` | `--max-num-batched-tokens` | Maps to `FERRUM_MAX_BATCHED_TOKENS`. |
-| `--enable-prefix-caching` | `--enable-prefix-caching` / `--enable-prefix-cache` | Requests product prefix-cache behavior and observability. Unsafe engine-level KV prefix reuse is forced off and recorded in effective config until correctness gates prove it safe. |
+| `--enable-prefix-caching` | `--enable-prefix-caching` / `--enable-prefix-cache` | Requests prefix reuse from the execution owner when supported by the model and selected providers. See [cache controls and observations](../cache-product.md). |
 | `--no-enable-prefix-caching` | `--no-enable-prefix-caching` / `--disable-prefix-cache` | Disables product prefix cache and records `FERRUM_PREFIX_CACHE=0`. |
 | `--quantization gptq_marlin` | auto-detected | Ferrum auto-detects supported GPTQ / Marlin paths from model metadata. |
 | OpenAI `/v1/chat/completions` | supported | Non-streaming and streaming. |
@@ -119,4 +119,4 @@ Ferrum does not aim for full vLLM CLI or engine parity.
 - No vLLM internal engine API compatibility.
 - No claim that Ferrum's scheduler behavior is identical to vLLM.
 - Unknown vLLM flags are not accepted as no-op flags.
-- Prefix caching is exposed as a runtime flag here; G3 adds productized cache metrics and session-cache gates.
+- See [prefix and session cache](../cache-product.md) for supported controls, session behavior and execution-owner metrics.

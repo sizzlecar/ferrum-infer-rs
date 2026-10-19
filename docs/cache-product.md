@@ -1,8 +1,9 @@
 # Prefix and Session Cache Product Surface
 
-Ferrum exposes cache controls as explicit serving options. Defaults remain
-conservative: prefix cache is off unless enabled, and session cache is off unless
-a caller opts in.
+Compiled-plan serving requests prefix state retention by default within its
+runtime memory budget; actual reuse depends on the selected providers. Other
+execution paths default to prefix caching off. Explicit settings take precedence.
+Session cache remains opt-in.
 
 ## CLI Flags
 
