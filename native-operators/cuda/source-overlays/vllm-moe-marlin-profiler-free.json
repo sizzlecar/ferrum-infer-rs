@@ -26,7 +26,7 @@
       "base_sha256": "64cc641c31962b288d1bd70188aeea3c33dd334dd9cd7fb14d41b5a2fe7eeebc",
       "repository_override": {
         "path": "native-operators/cuda/vllm-moe-marlin-profiler-free/ops.cu",
-        "sha256": "915166e5ebcce8b90a2dc881e6f364dc8842655f589c8e21400b5ecab65eb45a"
+        "sha256": "98fd619a78e626f8c06a5f14d33d3d0b04078f63359124b08d22b5f2ca766911"
       }
     },
     {

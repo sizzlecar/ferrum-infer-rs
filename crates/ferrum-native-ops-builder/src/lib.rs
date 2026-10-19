@@ -3163,12 +3163,14 @@ mod canonical_input_tests {
             .join("../../native-operators/cuda/package-definitions/vllm-moe-marlin.json");
         let definition: NativeOperatorPackageDefinition = read_json(&path).unwrap();
         validate_package_definition(&definition).unwrap();
-        let mut old = definition.clone();
-        old.operator_abi_version = "1".into();
-        assert!(validate_package_definition(&old)
-            .unwrap_err()
-            .to_string()
-            .contains("operator ABI"));
+        for version in ["1", "2"] {
+            let mut old = definition.clone();
+            old.operator_abi_version = version.into();
+            assert!(validate_package_definition(&old)
+                .unwrap_err()
+                .to_string()
+                .contains("operator ABI"));
+        }
         for symbol in CudaNativeBuildUnit::VllmMoeMarlin.forbidden_exports() {
             let mut stale = definition.clone();
             stale.required_exports.push((*symbol).into());
@@ -3178,6 +3180,20 @@ mod canonical_input_tests {
                 .to_string()
                 .contains("forbidden export"));
         }
+    }
+
+    #[test]
+    fn marlin_ambient_policy_retirement_rejects_old_package_definition_contract() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../native-operators/cuda/package-definitions/marlin.json");
+        let definition: NativeOperatorPackageDefinition = read_json(&path).unwrap();
+        validate_package_definition(&definition).unwrap();
+        let mut old = definition.clone();
+        old.operator_abi_version = "1".into();
+        assert!(validate_package_definition(&old)
+            .unwrap_err()
+            .to_string()
+            .contains("operator ABI"));
     }
 
     #[test]
@@ -3398,7 +3414,10 @@ mod tests {
         NativeOperatorPackageSpec {
             schema_version: NATIVE_OPERATOR_PACKAGE_SPEC_SCHEMA_VERSION,
             operator: operator.to_string(),
-            operator_abi_version: "1".to_string(),
+            operator_abi_version: CudaNativeBuildUnit::from_artifact_operator(operator)
+                .and_then(CudaNativeBuildUnit::required_operator_abi_version)
+                .unwrap_or("1")
+                .to_string(),
             backend: NativeOperatorBackend::Cuda,
             compute_capabilities: vec!["sm_89".to_string()],
             operation_bindings: vec![NativeOperatorBinding {
@@ -3493,7 +3512,7 @@ mod tests {
         let mut definition = NativeOperatorPackageDefinition {
             schema_version: NATIVE_OPERATOR_PACKAGE_DEFINITION_SCHEMA_VERSION,
             operator: CudaNativeBuildUnit::Marlin.artifact_operator().to_string(),
-            operator_abi_version: "1".to_string(),
+            operator_abi_version: "2".to_string(),
             backend: NativeOperatorBackend::Cuda,
             compute_capabilities: vec!["sm_89".to_string()],
             provider_bindings: vec![NativeOperatorProviderBindingDefinition {
@@ -3555,7 +3574,7 @@ mod tests {
             &NativeOperatorPackageDefinition {
                 schema_version: NATIVE_OPERATOR_PACKAGE_DEFINITION_SCHEMA_VERSION,
                 operator: CudaNativeBuildUnit::Marlin.artifact_operator().to_string(),
-                operator_abi_version: "1".to_string(),
+                operator_abi_version: "2".to_string(),
                 backend: NativeOperatorBackend::Cuda,
                 compute_capabilities: vec!["sm_89".to_string()],
                 provider_bindings: vec![NativeOperatorProviderBindingDefinition {

@@ -7022,7 +7022,7 @@ mod tests {
         let package_spec = crate::NativeOperatorPackageSpec {
             schema_version: crate::NATIVE_OPERATOR_PACKAGE_SPEC_SCHEMA_VERSION,
             operator: CudaNativeBuildUnit::Marlin.artifact_operator().to_string(),
-            operator_abi_version: "1".to_string(),
+            operator_abi_version: "2".to_string(),
             backend: ferrum_types::NativeOperatorBackend::Cuda,
             compute_capabilities: vec!["sm_89".to_string()],
             operation_bindings: vec![ferrum_types::NativeOperatorBinding {

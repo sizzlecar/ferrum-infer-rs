@@ -24,7 +24,6 @@
 #endif
 
 #include "kernel.h"
-#include <cstdlib>
 // vendored for ferrum-infer-rs: original file pulled in core/registration.h
 // for the torch op binding (TORCH_LIBRARY_IMPL_EXPAND). We don't link torch.
 // #include "core/registration.h"
@@ -36,12 +35,6 @@
 // instead compile the whole template universe into ONE .cu (longer
 // compile time but simpler).
 #include "marlin_template.h"
-
-struct FerrumVllmMoeRuntimeEnv {
-  int force_thread_k;
-  int force_thread_n;
-  int force_blocks_per_sm;
-};
 
 // Keep this bound in sync with MARLIN_BLOCKS_PER_SM_BOUND in the typed Rust
 // workspace estimator. A larger launch would address beyond c_tmp.
@@ -60,39 +53,6 @@ enum FerrumVllmMoeStatusStage {
 static int ferrum_vllm_moe_status(int stage, cudaError_t status) {
   return (stage << FERRUM_VLLM_MOE_STATUS_STAGE_SHIFT) |
          (static_cast<int>(status) & 0xffff);
-}
-
-static const char* ferrum_env_value(const char* name) {
-  return std::getenv(name);
-}
-
-static int ferrum_env_int(const char* name, int default_value) {
-  if (const char* value = ferrum_env_value(name)) {
-    return std::atoi(value);
-  }
-  return default_value;
-}
-
-static const FerrumVllmMoeRuntimeEnv& ferrum_vllm_moe_runtime_env() {
-  static const FerrumVllmMoeRuntimeEnv env = [] {
-    int force_thread_k = ferrum_env_int("FERRUM_VLLM_MOE_THREAD_K", -1);
-    int force_thread_n = ferrum_env_int("FERRUM_VLLM_MOE_THREAD_N", -1);
-    if (force_thread_k <= 0 || force_thread_n <= 0) {
-      force_thread_k = -1;
-      force_thread_n = -1;
-    }
-
-    int force_blocks_per_sm =
-        ferrum_env_int("FERRUM_VLLM_MOE_BLOCKS_PER_SM", -1);
-    if (force_blocks_per_sm <= 0) force_blocks_per_sm = -1;
-
-    return FerrumVllmMoeRuntimeEnv{
-        force_thread_k,
-        force_thread_n,
-        force_blocks_per_sm,
-    };
-  }();
-  return env;
 }
 
 #define STATIC_ASSERT_SCALAR_TYPE_VALID(scalar_t)               \
@@ -836,7 +796,6 @@ extern "C" int ferrum_vllm_marlin_moe_f16(
         FERRUM_VLLM_MOE_STAGE_SM_COUNT,
         sms_status != cudaSuccess ? sms_status : cudaErrorInvalidDevice);
   }
-  const auto& ferrum_env = ferrum_vllm_moe_runtime_env();
   return MARLIN_NAMESPACE_NAME::marlin_mm<half>(
       A, B, C, C_tmp,
       /*b_bias=*/nullptr,
@@ -859,8 +818,7 @@ extern "C" int ferrum_vllm_marlin_moe_f16(
       /*is_k_full=*/true,
       /*has_zp=*/use_zp,
       num_groups, group_size, dev, stream,
-      ferrum_env.force_thread_k, ferrum_env.force_thread_n, sms,
-      ferrum_env.force_blocks_per_sm,
+      /*thread_k=*/-1, /*thread_n=*/-1, sms, /*blocks_per_sm=*/-1,
       use_atomic_add != 0, use_fp32_reduce != 0,
       /*is_zp_float=*/false);
 }
@@ -889,7 +847,6 @@ extern "C" int ferrum_vllm_marlin_moe_fp8_f16(
         FERRUM_VLLM_MOE_STAGE_SM_COUNT,
         sms_status != cudaSuccess ? sms_status : cudaErrorInvalidDevice);
   }
-  const auto& ferrum_env = ferrum_vllm_moe_runtime_env();
   const int num_groups = group_size == -1 ? 1 : prob_k / group_size;
   return MARLIN_NAMESPACE_NAME::marlin_mm<half>(
       A, B, C, C_tmp,
@@ -910,8 +867,7 @@ extern "C" int ferrum_vllm_marlin_moe_fp8_f16(
       /*has_act_order=*/false,
       /*is_k_full=*/true,
       /*has_zp=*/false, num_groups, group_size, dev, stream,
-      ferrum_env.force_thread_k,
-      ferrum_env.force_thread_n, sms, ferrum_env.force_blocks_per_sm,
+      /*thread_k=*/-1, /*thread_n=*/-1, sms, /*blocks_per_sm=*/-1,
       use_atomic_add != 0, use_fp32_reduce != 0,
       /*is_zp_float=*/false);
 }
@@ -941,7 +897,6 @@ extern "C" int ferrum_vllm_marlin_moe_mxfp4_bf16(
         FERRUM_VLLM_MOE_STAGE_SM_COUNT,
         sms_status != cudaSuccess ? sms_status : cudaErrorInvalidDevice);
   }
-  const auto& ferrum_env = ferrum_vllm_moe_runtime_env();
   const int num_groups = prob_k / group_size;
   return MARLIN_NAMESPACE_NAME::marlin_mm<nv_bfloat16>(
       A, B, C, C_tmp,
@@ -962,8 +917,7 @@ extern "C" int ferrum_vllm_marlin_moe_mxfp4_bf16(
       /*has_act_order=*/false,
       /*is_k_full=*/true,
       /*has_zp=*/false, num_groups, group_size, dev, stream,
-      ferrum_env.force_thread_k,
-      ferrum_env.force_thread_n, sms, ferrum_env.force_blocks_per_sm,
+      /*thread_k=*/-1, /*thread_n=*/-1, sms, /*blocks_per_sm=*/-1,
       use_atomic_add != 0, use_fp32_reduce != 0,
       /*is_zp_float=*/false);
 }

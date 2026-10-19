@@ -101,13 +101,20 @@ impl NativeOperatorResolveRequest {
         manifest_path: impl Into<PathBuf>,
         artifact_path: impl Into<PathBuf>,
     ) -> Self {
+        let operator = operator.into();
+        let operator_abi_version = (backend == NativeOperatorBackend::Cuda)
+            .then(|| CudaNativeBuildUnit::from_artifact_operator(&operator))
+            .flatten()
+            .and_then(CudaNativeBuildUnit::required_operator_abi_version)
+            .unwrap_or(DEFAULT_NATIVE_OPERATOR_ABI_VERSION)
+            .to_owned();
         Self {
-            operator: operator.into(),
+            operator,
             backend,
             compute_capability: None,
             manifest_path: manifest_path.into(),
             artifact_path: artifact_path.into(),
-            operator_abi_version: DEFAULT_NATIVE_OPERATOR_ABI_VERSION.to_string(),
+            operator_abi_version,
             ferrum_native_abi_version: FERRUM_NATIVE_ABI_VERSION.to_string(),
             g03_catalog_sha256: None,
             abi_contract_sha256: None,
@@ -964,7 +971,7 @@ mod tests {
             let host = NativeOperatorHostAbi::for_target("x86_64-pc-windows-msvc").unwrap();
             manifest.host_abi = Some(host.clone());
             manifest.operator = unit.artifact_operator().into();
-            manifest.operator_abi_version = "2".into();
+            manifest.operator_abi_version = "3".into();
             fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
             let request = NativeOperatorResolveRequest::new(
                 unit.artifact_operator(),
@@ -972,7 +979,7 @@ mod tests {
                 &manifest_path,
                 &artifact,
             )
-            .with_operator_abi_version("2")
+            .with_operator_abi_version("3")
             .with_host_abi(host);
             let result = NativeOperatorResolver.resolve(&request);
             match retired {
@@ -982,6 +989,89 @@ mod tests {
                         if export == *retired)),
                 None => {
                     result.unwrap();
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn request_defaults_to_the_known_cuda_operator_contract() {
+        for (operator, expected) in [
+            (CudaNativeBuildUnit::Marlin.artifact_operator(), "2"),
+            (CudaNativeBuildUnit::VllmMoeMarlin.artifact_operator(), "3"),
+            ("external.operator", DEFAULT_NATIVE_OPERATOR_ABI_VERSION),
+        ] {
+            let request = NativeOperatorResolveRequest::new(
+                operator,
+                NativeOperatorBackend::Cuda,
+                "manifest.json",
+                "native.a",
+            );
+            assert_eq!(request.operator_abi_version, expected);
+            assert_eq!(
+                request
+                    .with_operator_abi_version("custom")
+                    .operator_abi_version,
+                "custom"
+            );
+        }
+    }
+
+    #[test]
+    fn ambient_policy_retirement_rejects_old_operator_abi_with_valid_math_archive() {
+        for (unit, old_versions, current) in [
+            (CudaNativeBuildUnit::Marlin, &["1"][..], "2"),
+            (CudaNativeBuildUnit::VllmMoeMarlin, &["1", "2"][..], "3"),
+        ] {
+            let dir = temp_dir("ambient-policy-retirement");
+            let artifact = dir.path().join("native.lib");
+            let manifest_path = dir.path().join("manifest.json");
+            let mut exports = required_exports();
+            exports.extend(
+                unit.required_exports()
+                    .iter()
+                    .map(|symbol| (*symbol).to_owned()),
+            );
+            exports.sort();
+            let bytes = crate::coff::tests::native_library(
+                &exports.iter().map(String::as_str).collect::<Vec<_>>(),
+            );
+            fs::write(&artifact, &bytes).unwrap();
+            write_manifest(
+                &manifest_path,
+                digest_bytes(&bytes),
+                FERRUM_NATIVE_ABI_VERSION,
+                vec!["sm_89".into()],
+                exports,
+            );
+            let mut manifest: NativeOperatorManifest =
+                serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+            let host = NativeOperatorHostAbi::for_target("x86_64-pc-windows-msvc").unwrap();
+            manifest.host_abi = Some(host.clone());
+            manifest.operator = unit.artifact_operator().into();
+            for version in old_versions.iter().copied().chain(std::iter::once(current)) {
+                manifest.operator_abi_version = version.into();
+                fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+                let request = NativeOperatorResolveRequest::new(
+                    unit.artifact_operator(),
+                    NativeOperatorBackend::Cuda,
+                    &manifest_path,
+                    &artifact,
+                )
+                .with_host_abi(host.clone());
+                let result = NativeOperatorResolver.resolve(&request);
+                if version == current {
+                    result.unwrap();
+                } else {
+                    assert!(matches!(result,
+                        Err(NativeOperatorResolveError::ManifestInvalid(message))
+                            if message.contains("native operator ABI mismatch")));
+                    // An explicit old version cannot bypass the build-unit policy.
+                    let old_request = request.with_operator_abi_version(version);
+                    assert!(matches!(NativeOperatorResolver.resolve(&old_request),
+                        Err(NativeOperatorResolveError::BuildContract(
+                            CudaNativeBuildCoverageError::WrongOperatorAbi { expected, actual, .. }))
+                            if expected == current && actual == version));
                 }
             }
         }

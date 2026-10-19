@@ -66,11 +66,12 @@ impl CudaNativeBuildUnit {
             .find(|unit| unit.artifact_operator() == operator)
     }
 
-    /// Package contract revisions can retire exports without changing the
-    /// retained mathematical entrypoint signatures.
+    /// Package revisions can retire ambient policy or exports without changing
+    /// the retained mathematical entrypoint signatures.
     pub const fn required_operator_abi_version(self) -> Option<&'static str> {
         match self {
-            Self::VllmMoeMarlin => Some("2"),
+            Self::Marlin => Some("2"),
+            Self::VllmMoeMarlin => Some("3"),
             _ => None,
         }
     }
@@ -373,7 +374,7 @@ mod tests {
         let artifacts = [ArtifactView {
             operator: CudaNativeBuildUnit::VllmMoeMarlin.artifact_operator(),
             backend: NativeOperatorBackend::Cuda,
-            operator_abi_version: "2",
+            operator_abi_version: "3",
             exports: &exports,
         }];
 
@@ -400,7 +401,7 @@ mod tests {
         let artifacts = [ArtifactView {
             operator: CudaNativeBuildUnit::VllmMoeMarlin.artifact_operator(),
             backend: NativeOperatorBackend::Cuda,
-            operator_abi_version: "2",
+            operator_abi_version: "3",
             exports: &exports,
         }];
 
@@ -419,23 +420,25 @@ mod tests {
     fn moe_profiler_retirement_requires_new_abi_and_rejects_old_exports() {
         let unit = CudaNativeBuildUnit::VllmMoeMarlin;
         let symbols = exports(unit);
-        let old = [ArtifactView {
-            operator: unit.artifact_operator(),
-            backend: NativeOperatorBackend::Cuda,
-            operator_abi_version: "1",
-            exports: &symbols,
-        }];
-        assert!(matches!(
-            resolve_views(&old, [unit]),
-            Err(CudaNativeBuildCoverageError::WrongOperatorAbi { expected: "2", .. })
-        ));
+        for operator_abi_version in ["1", "2"] {
+            let old = [ArtifactView {
+                operator: unit.artifact_operator(),
+                backend: NativeOperatorBackend::Cuda,
+                operator_abi_version,
+                exports: &symbols,
+            }];
+            assert!(matches!(
+                resolve_views(&old, [unit]),
+                Err(CudaNativeBuildCoverageError::WrongOperatorAbi { expected: "3", .. })
+            ));
+        }
         for retired in unit.forbidden_exports() {
             let mut symbols = symbols.clone();
             symbols.push((*retired).to_owned());
             let artifact = [ArtifactView {
                 operator: unit.artifact_operator(),
                 backend: NativeOperatorBackend::Cuda,
-                operator_abi_version: "2",
+                operator_abi_version: "3",
                 exports: &symbols,
             }];
             assert!(matches!(resolve_views(&artifact, [unit]),
@@ -445,10 +448,27 @@ mod tests {
         let current = [ArtifactView {
             operator: unit.artifact_operator(),
             backend: NativeOperatorBackend::Cuda,
-            operator_abi_version: "2",
+            operator_abi_version: "3",
             exports: &symbols,
         }];
         assert!(resolve_views(&current, [unit]).is_ok());
+    }
+
+    #[test]
+    fn marlin_ambient_policy_retirement_rejects_old_abi_with_complete_math_exports() {
+        let unit = CudaNativeBuildUnit::Marlin;
+        let symbols = exports(unit);
+        let artifact = |operator_abi_version| ArtifactView {
+            operator: unit.artifact_operator(),
+            backend: NativeOperatorBackend::Cuda,
+            operator_abi_version,
+            exports: &symbols,
+        };
+        assert!(matches!(
+            resolve_views(&[artifact("1")], [unit]),
+            Err(CudaNativeBuildCoverageError::WrongOperatorAbi { expected: "2", .. })
+        ));
+        assert!(resolve_views(&[artifact("2")], [unit]).is_ok());
     }
     #[test]
     fn extra_artifact_cannot_be_satisfied_by_original_operator_or_symbols() {

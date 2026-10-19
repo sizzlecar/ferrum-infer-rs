@@ -2,9 +2,9 @@
   "schema_version": 3,
   "operator": "ferrum.cuda.marlin",
   "source_package": {
-    "kind": "ferrum-native-source-bundle",
-    "revision": "ferrum-native-cuda-v1+sha256.b5a82f9db0907a965594d0405a7fea065ff670dbe618832a4f0a1c64b186fed1",
-    "sha256": "deb4ad48578826772e6a5dccd4a5f4380f837c7e3181dd8e916c55d15e58f5d0"
+    "kind": "ferrum-native-source-overlay",
+    "revision": "ferrum-marlin-instance-policy-v2+sha256.e0fcec4d249d3a60f0b5a3c34f92a7f04cc506106a2340290278ce196320b424",
+    "sha256": "7ab0850eafa05b3cfb124e83bad4c2057a582ba3016a3b6fd1cae43dd654392d"
   },
   "upstream_sources": [
     {
@@ -16,7 +16,7 @@
   "translation_units": [
     {
       "path": "kernels/marlin_cuda_kernel.cu",
-      "sha256": "6aa1c7acf987bed6ed2659cda0d079392a2b0adf631779f26c0d99dfe0cd07b7"
+      "sha256": "3a64d2c4f408de1909bf0acce14dff975b18d34579059c1c8556039b3a1446b8"
     }
   ],
   "headers": [],
@@ -24,7 +24,7 @@
     {
       "translation_unit": "kernels/marlin_cuda_kernel.cu",
       "headers": [],
-      "closure_sha256": "ad63bccfd589a72897d3aa3505f12b9991cda93aeabc5ed9a2c3ccbff857ad83"
+      "closure_sha256": "45e98e2e3d0aa7d3dd149c3fe038c6e8aafaa6278897644a7368adaeb21d1bf9"
     }
   ],
   "include_dirs": [],

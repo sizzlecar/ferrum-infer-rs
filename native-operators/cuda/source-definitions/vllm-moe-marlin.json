@@ -2,7 +2,7 @@
   "schema_version": 3,
   "operator": "ferrum.cuda.vllm_moe_marlin",
   "source_package_kind": "ferrum-native-source-overlay",
-  "source_package_revision": "ferrum-vllm-moe-profiler-free-v2+sha256.a7b61168ae77a934e675be43e111dc2142d39dcc37d0bb6dd2aa87c99e4c37d2",
+  "source_package_revision": "ferrum-vllm-moe-instance-policy-v3+sha256.9b7499cd1a57ce7d49859a2aaa2a508bc0f7f5e0261b38c6dd1e80406ec8b83b",
   "upstream_sources": [
     {
       "repository": "https://github.com/vllm-project/vllm.git",
