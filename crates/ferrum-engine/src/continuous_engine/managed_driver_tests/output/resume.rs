@@ -23,7 +23,8 @@ async fn output_slow_stream_resumes_exact_text_tokens_and_terminal_once() {
         .unwrap()
         .unwrap();
     {
-        let sequences = &fixture.engine.inner.sequences;
+        let original = fixture.engine.active_inner().unwrap();
+        let sequences = &original.sequences;
         let slow_handle = sequences.get(&slow_id).unwrap();
         let slow_guard = slow_handle.lock();
         let slow = slow_guard.as_ref().unwrap();
@@ -51,7 +52,14 @@ async fn output_slow_stream_resumes_exact_text_tokens_and_terminal_once() {
         .tokens
         .iter()
         .copied()
-        .filter(|token| !fixture.engine.inner.tokenizer.is_special_token(*token))
+        .filter(|token| {
+            !fixture
+                .engine
+                .active_inner()
+                .unwrap()
+                .tokenizer
+                .is_special_token(*token)
+        })
         .collect();
     assert_eq!(tokens, visible);
     let terminals: Vec<_> = chunks
@@ -77,9 +85,9 @@ async fn output_slow_stream_resumes_exact_text_tokens_and_terminal_once() {
     assert_eq!(fixture.executor.maximum_in_flight.load(Ordering::SeqCst), 1);
     assert_eq!(fixture.executor.closes.load(Ordering::SeqCst), 2);
     assert!(fixture.executor.observed.lock().model.kv_caches.is_empty());
-    assert_eq!(fixture.engine.inner.execution_closes.unreclaimed_count(), 0);
-    assert_eq!(fixture.engine.inner.output_budget.usage().sessions, 1);
+    assert!(fixture.original_inner.upgrade().is_none());
+    assert_eq!(fixture.output_budget.usage().sessions, 1);
     drop(chunks);
-    assert_eq!(fixture.engine.inner.output_budget.usage().sessions, 0);
-    assert_eq!(fixture.engine.inner.output_budget.usage().queued_bytes, 0);
+    assert_eq!(fixture.output_budget.usage().sessions, 0);
+    assert_eq!(fixture.output_budget.usage().queued_bytes, 0);
 }

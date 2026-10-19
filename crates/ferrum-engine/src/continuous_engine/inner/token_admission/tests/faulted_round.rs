@@ -5,13 +5,35 @@ use ferrum_execution::model_executor::PrefillChunk;
 use ferrum_execution::token_execution::{ExecutionProduct, TokenWork};
 
 struct AdvancedThenGatedAdmission {
-    gate: Arc<AdmissionGate>,
+    gate: AdmissionGate,
     first_request: RequestId,
-    advanced: Mutex<Option<ExecutionFrontier>>,
+    advanced: Arc<Mutex<Option<ExecutionFrontier>>>,
 }
 
 #[async_trait::async_trait]
 impl ModelExecutor for AdvancedThenGatedAdmission {
+    fn begin_shutdown(
+        self: Arc<Self>,
+        permit: &ferrum_execution::ExecutorShutdownPermit,
+    ) -> ferrum_execution::ExecutorShutdownObserver {
+        if let Err(error) = permit.check(self.as_ref()) {
+            return ferrum_execution::ExecutorShutdownObserver::retained(Arc::new(self), error);
+        }
+        match Arc::try_unwrap(self) {
+            Ok(Self {
+                gate,
+                first_request,
+                advanced,
+            }) => {
+                drop((first_request, advanced));
+                gate.into_shutdown()
+            }
+            Err(original) => ferrum_execution::ExecutorShutdownObserver::retained(
+                Arc::new(original),
+                FerrumError::internal("advanced admission fixture has an unscoped owner"),
+            ),
+        }
+    }
     fn info(&self) -> &ferrum_types::ModelInfo {
         self.gate.info()
     }
@@ -33,7 +55,7 @@ impl ModelExecutor for AdvancedThenGatedAdmission {
             panic!("first request must obtain a real CPU admission");
         };
         let mut retained = PendingAdmission {
-            executor: self.gate.as_ref(),
+            executor: &self.gate,
             frontier: Some(start),
         };
         let policy = LogitsReturnPolicy::FullLogits;
@@ -86,7 +108,9 @@ impl ModelExecutor for AdvancedThenGatedAdmission {
 
 #[tokio::test]
 async fn token_admission_later_publish_error_retires_earlier_real_faulted_frontier() {
-    let (inner, model, cfg) = observed_cpu_model();
+    let (inner, model, cfg) = observed_cpu_model_owned();
+    let owner = ExecutorOwner::new(inner);
+    let inner = Arc::new(owner.scope().unwrap());
     let mut first_request = InferenceRequest::new("invalid initial frontier", "tiny-llama-test");
     first_request.sampling_params.max_tokens = 4;
     first_request.sampling_params.temperature = 0.0;
@@ -95,17 +119,22 @@ async fn token_admission_later_publish_error_retires_earlier_real_faulted_fronti
     second_request.sampling_params.temperature = 0.0;
     let (ready, ready_receiver) = oneshot::channel();
     let (resume, resume_receiver) = oneshot::channel();
-    let gate = Arc::new(AdmissionGate {
-        inner,
-        ready: Mutex::new(Some(ready)),
-        resume: Mutex::new(Some(resume_receiver)),
+    let gate_observation = Arc::new(AdmissionObservation {
         closed: Mutex::new(Vec::new()),
     });
-    let executor = Arc::new(AdvancedThenGatedAdmission {
-        gate: Arc::clone(&gate),
+    let gate = AdmissionGate {
+        inner,
+        owner,
+        observation: Arc::clone(&gate_observation),
+        ready: Mutex::new(Some(ready)),
+        resume: Mutex::new(Some(resume_receiver)),
+    };
+    let advanced = Arc::new(Mutex::new(None));
+    let executor = AdvancedThenGatedAdmission {
+        gate,
         first_request: first_request.id.clone(),
-        advanced: Mutex::new(None),
-    });
+        advanced: Arc::clone(&advanced),
+    };
     let trace = tempfile::tempdir().unwrap();
     let mut config = EngineConfig::default();
     config.backend.device = Device::CPU;
@@ -117,7 +146,7 @@ async fn token_admission_later_publish_error_retires_earlier_real_faulted_fronti
         Arc::new(TinyTokenizer::new(cfg.vocab_size)),
         Arc::new(crate::registry::GreedySampler),
         Arc::new(MockKvCacheManager::new(256)),
-        executor.clone(),
+        ExecutorOwner::new(Box::new(executor)),
         Arc::new(MockTensorFactory),
     )
     .unwrap();
@@ -135,7 +164,7 @@ async fn token_admission_later_publish_error_retires_earlier_real_faulted_fronti
     .await;
     let mut fixture = Fixture {
         engine,
-        executor: gate,
+        executor: gate_observation,
         model,
         request: first_request,
         response: first_response,
@@ -144,18 +173,32 @@ async fn token_admission_later_publish_error_retires_earlier_real_faulted_fronti
         trace,
         layers: cfg.num_layers,
     };
-    let engine_inner = Arc::clone(&fixture.engine.inner);
+    let engine_inner = Arc::clone(
+        &fixture
+            .engine
+            .active_inner()
+            .expect("engine execution is open"),
+    );
     let task = tokio::spawn(async move { engine_inner.prepare_dynamic_admission_round(2).await });
     let second_identity =
         tokio::time::timeout(Duration::from_secs(5), fixture.ready.take().unwrap())
             .await
             .expect("second admission must reach the explicit gate")
             .unwrap();
-    let first_frontier = executor.advanced.lock().clone().unwrap();
+    let first_frontier = advanced.lock().clone().unwrap();
     let first_identity = first_frontier.sequence().clone();
     {
-        assert!(fixture.engine.inner.sequences.index_is_unlocked());
-        let sequences = &fixture.engine.inner.sequences;
+        assert!(fixture
+            .engine
+            .active_inner()
+            .expect("engine execution is open")
+            .sequences
+            .index_is_unlocked());
+        let sequences = &fixture
+            .engine
+            .active_inner()
+            .expect("engine execution is open")
+            .sequences;
         let first_handle = sequences.get(&fixture.request.id).unwrap();
         let first_guard = first_handle.lock();
         let first = first_guard.as_ref().unwrap();
@@ -173,24 +216,17 @@ async fn token_admission_later_publish_error_retires_earlier_real_faulted_fronti
     }
     assert!(fixture
         .engine
-        .inner
+        .active_inner()
+        .expect("engine execution is open")
         .dynamic_admission_availability
         .try_lock()
         .is_some());
     assert_eq!(
-        fixture
-            .engine
-            .inner
-            .scheduler
-            .trace_phase(&fixture.request.id),
+        fixture.engine.scheduler.trace_phase(&fixture.request.id),
         Some(RequestPhase::AdmissionFailed)
     );
     assert_eq!(
-        fixture
-            .engine
-            .inner
-            .scheduler
-            .trace_phase(&second_request.id),
+        fixture.engine.scheduler.trace_phase(&second_request.id),
         Some(RequestPhase::Waiting)
     );
     assert!(matches!(
@@ -218,23 +254,21 @@ async fn token_admission_later_publish_error_retires_earlier_real_faulted_fronti
     // fails. The fresh result still belongs to its independent executor owner.
     let mut removed = fixture
         .engine
-        .inner
+        .active_inner()
+        .expect("engine execution is open")
         .sequences
         .take(&second_request.id)
         .unwrap();
     assert!(removed.execution_frontier.is_none());
-    removed
-        .request_slot
-        .take()
-        .unwrap()
-        .close(&fixture.engine.inner);
+    removed.request_slot.take().unwrap().close(
+        &fixture
+            .engine
+            .active_inner()
+            .expect("engine execution is open"),
+    );
     drop(removed);
     assert_eq!(
-        fixture
-            .engine
-            .inner
-            .scheduler
-            .trace_phase(&second_request.id),
+        fixture.engine.scheduler.trace_phase(&second_request.id),
         Some(RequestPhase::Waiting)
     );
     fixture.resume.take().unwrap().send(()).unwrap();
@@ -246,20 +280,34 @@ async fn token_admission_later_publish_error_retires_earlier_real_faulted_fronti
         result.is_err(),
         "second publication must report its missing outer"
     );
-    fixture.engine.inner.execution_closes.join_observers().await;
-    fixture.engine.inner.drain_execution_closes().unwrap();
+    fixture
+        .engine
+        .active_inner()
+        .expect("engine execution is open")
+        .execution_closes
+        .join_observers()
+        .await;
+    fixture
+        .engine
+        .active_inner()
+        .expect("engine execution is open")
+        .drain_execution_closes()
+        .unwrap();
 
     assert!(fixture.response.try_recv().unwrap().is_err());
-    assert!(fixture.engine.inner.sequences.is_empty());
     assert!(fixture
         .engine
-        .inner
+        .active_inner()
+        .expect("engine execution is open")
+        .sequences
+        .is_empty());
+    assert!(fixture
+        .engine
         .scheduler
         .trace_phase(&fixture.request.id)
         .is_none());
     assert!(fixture
         .engine
-        .inner
         .scheduler
         .trace_phase(&second_request.id)
         .is_none());
@@ -287,13 +335,20 @@ async fn token_admission_later_publish_error_retires_earlier_real_faulted_fronti
             vec![vec![0; fixture.layers], vec![1; fixture.layers]]
         );
     }
-    assert_eq!(fixture.engine.inner.execution_closes.unreclaimed_count(), 0);
+    assert_eq!(
+        fixture
+            .engine
+            .active_inner()
+            .expect("engine execution is open")
+            .execution_closes
+            .unreclaimed_count(),
+        0
+    );
     assert_eq!(slot_events(&fixture, ResourceAction::Release), 2);
     assert_eq!(slot_events(&fixture, ResourceAction::RequestClose), 2);
     assert_eq!(
         fixture
             .engine
-            .inner
             .scheduler
             .trace_snapshot()
             .capacity_release_epoch,

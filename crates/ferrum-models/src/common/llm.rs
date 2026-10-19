@@ -14,9 +14,9 @@ use ferrum_types::{RequestId, Result, TokenId};
 mod token;
 pub(crate) use token::catch_host_execution;
 pub use token::{
-    ModelExecutionRecovery, ModelKvPreparation, ModelKvReservation, ModelTokenBatchOutcome,
-    ModelTokenCloseOutcome, ModelTokenExecutionMode, ModelTokenInput, ModelTokenOutcome,
-    ModelTokenProduct, ModelTokenWork,
+    ModelExecutionRecovery, ModelKvPreparation, ModelKvReservation, ModelRetirementOutcome,
+    ModelTokenBatchOutcome, ModelTokenCloseOutcome, ModelTokenExecutionMode, ModelTokenInput,
+    ModelTokenOutcome, ModelTokenProduct, ModelTokenWork,
 };
 
 /// Runtime configuration every decoder-only LLM must expose.
@@ -121,6 +121,18 @@ pub trait DecoderOnlyLLM: Send + Sync {
                     ),
                 }
             }
+        }
+    }
+
+    /// Retire this exact model's original execution context and captured programs.
+    /// Request-cache closure is not proof of whole-model retirement. Implementations
+    /// must preserve their actual owners when returning Retained; callers may retry
+    /// observation/cleanup, never the numerical work.
+    fn retire_model(&mut self) -> ModelRetirementOutcome {
+        ModelRetirementOutcome::Retained {
+            error: ferrum_types::FerrumError::unsupported(
+                "model has not implemented checked whole-model retirement",
+            ),
         }
     }
 

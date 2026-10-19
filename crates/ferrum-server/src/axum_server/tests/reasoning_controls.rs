@@ -163,7 +163,7 @@ async fn infer_with_real_engine(
         .await
         .unwrap(),
     );
-    let executor = Arc::new(if steps.iter().all(|step| step.len() == 1) {
+    let executor = if steps.iter().all(|step| step.len() == 1) {
         ScriptedExecutor::new(
             tokenizer.vocab_size(),
             steps
@@ -185,22 +185,24 @@ async fn infer_with_real_engine(
                 })
                 .collect(),
         )
-    });
+    };
     let mut config = EngineConfig::default();
     config.model.model_id = ModelId::new("reasoning-contract");
     config.scheduler.max_running_requests = 1;
     config.batching.max_num_batched_tokens = 256;
+    let observation = executor.observer();
     let engine = Arc::new(
         ContinuousBatchEngine::new_plan_runtime(
             config.clone(),
             Arc::new(ContinuousBatchScheduler::new(config.scheduler)),
             tokenizer.clone(),
             Arc::new(GreedySampler),
-            executor.clone(),
+            ferrum_execution::ExecutorOwner::new(Box::new(executor)),
             Arc::new(MockTensorFactory),
         )
         .unwrap(),
     );
+    let executor = observation;
     let router = AxumServer::from_llm(engine.clone())
         .with_prompt_template(Some(template))
         .build_router()

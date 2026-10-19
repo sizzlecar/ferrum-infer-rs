@@ -25,7 +25,7 @@ fn make_engine_with_tokenizer(
     let scheduler = Arc::new(ContinuousBatchScheduler::new(SchedulerConfig::default()));
     let sampler = Arc::new(MockSampler);
     let kv_cache = Arc::new(MockKvCacheManager::new(1024));
-    let executor = Arc::new(MockModelExecutor::instant(VOCAB_SIZE));
+    let executor = MockModelExecutor::instant(VOCAB_SIZE);
     let tensor_factory = Arc::new(MockTensorFactory);
 
     ContinuousBatchEngine::new(
@@ -34,7 +34,7 @@ fn make_engine_with_tokenizer(
         tokenizer,
         sampler,
         kv_cache,
-        executor,
+        ferrum_execution::executor_lifecycle::ExecutorOwner::new(Box::new(executor)),
         tensor_factory,
     )
     .expect("legacy engine composition must match executor authority")
@@ -252,7 +252,7 @@ async fn kv_cache_allocated_and_deallocated() {
     let scheduler = Arc::new(ContinuousBatchScheduler::new(SchedulerConfig::default()));
     let tokenizer = Arc::new(MockTokenizer::new(VOCAB_SIZE));
     let sampler = Arc::new(MockSampler);
-    let executor = Arc::new(MockModelExecutor::instant(VOCAB_SIZE));
+    let executor = MockModelExecutor::instant(VOCAB_SIZE);
     let tensor_factory = Arc::new(MockTensorFactory);
 
     let engine = ContinuousBatchEngine::new(
@@ -261,7 +261,7 @@ async fn kv_cache_allocated_and_deallocated() {
         tokenizer,
         sampler,
         kv_cache.clone(),
-        executor,
+        ferrum_execution::executor_lifecycle::ExecutorOwner::new(Box::new(executor)),
         tensor_factory,
     )
     .expect("legacy engine composition must match executor authority");
@@ -278,7 +278,8 @@ async fn kv_cache_allocated_and_deallocated() {
 
 #[tokio::test]
 async fn mock_executor_tracks_operations() {
-    let executor = Arc::new(MockModelExecutor::instant(VOCAB_SIZE));
+    let executor = MockModelExecutor::instant(VOCAB_SIZE);
+    let observation = executor.observer();
     let config = ferrum_types::EngineConfig::default();
     let scheduler = Arc::new(ContinuousBatchScheduler::new(SchedulerConfig::default()));
     let tokenizer = Arc::new(MockTokenizer::new(VOCAB_SIZE));
@@ -292,20 +293,20 @@ async fn mock_executor_tracks_operations() {
         tokenizer,
         sampler,
         kv_cache,
-        executor.clone(),
+        ferrum_execution::executor_lifecycle::ExecutorOwner::new(Box::new(executor)),
         tensor_factory,
     )
     .expect("legacy engine composition must match executor authority");
 
-    assert_eq!(executor.prefill_count(), 0);
-    assert_eq!(executor.decode_count(), 0);
+    assert_eq!(observation.prefill_count(), 0);
+    assert_eq!(observation.decode_count(), 0);
 
     let request = make_request("Track ops");
     let _response = engine.infer(request).await.unwrap();
 
     // Should have done 1 prefill and max_tokens-1 decodes (first token comes from prefill)
-    assert_eq!(executor.prefill_count(), 1);
-    assert_eq!(executor.decode_count(), 4); // max_tokens=5, first from prefill
+    assert_eq!(observation.prefill_count(), 1);
+    assert_eq!(observation.decode_count(), 4); // max_tokens=5, first from prefill
 }
 
 #[tokio::test]
@@ -315,11 +316,11 @@ async fn engine_with_latency_still_completes() {
     let tokenizer = Arc::new(MockTokenizer::new(VOCAB_SIZE));
     let sampler = Arc::new(MockSampler);
     let kv_cache = Arc::new(MockKvCacheManager::new(1024));
-    let executor = Arc::new(MockModelExecutor::new(
+    let executor = MockModelExecutor::new(
         VOCAB_SIZE,
         Duration::from_millis(5),
         Duration::from_millis(2),
-    ));
+    );
     let tensor_factory = Arc::new(MockTensorFactory);
 
     let engine = ContinuousBatchEngine::new(
@@ -328,7 +329,7 @@ async fn engine_with_latency_still_completes() {
         tokenizer,
         sampler,
         kv_cache,
-        executor,
+        ferrum_execution::executor_lifecycle::ExecutorOwner::new(Box::new(executor)),
         tensor_factory,
     )
     .expect("legacy engine composition must match executor authority");
@@ -387,7 +388,7 @@ async fn concurrent_requests_deallocate_kv() {
     let scheduler = Arc::new(ContinuousBatchScheduler::new(SchedulerConfig::default()));
     let tokenizer = Arc::new(MockTokenizer::new(VOCAB_SIZE));
     let sampler = Arc::new(MockSampler);
-    let executor = Arc::new(MockModelExecutor::instant(VOCAB_SIZE));
+    let executor = MockModelExecutor::instant(VOCAB_SIZE);
     let tensor_factory = Arc::new(MockTensorFactory);
 
     let engine = Arc::new(
@@ -397,7 +398,7 @@ async fn concurrent_requests_deallocate_kv() {
             tokenizer,
             sampler,
             kv_cache.clone(),
-            executor,
+            ferrum_execution::executor_lifecycle::ExecutorOwner::new(Box::new(executor)),
             tensor_factory,
         )
         .expect("legacy engine composition must match executor authority"),
@@ -479,7 +480,8 @@ async fn concurrent_streams_all_complete() {
 #[ignore = "prefix cache defaults OFF; opt in with FERRUM_PREFIX_CACHE=1 + --ignored"]
 #[tokio::test]
 async fn prefix_cache_avoids_second_prefill() {
-    let executor = Arc::new(MockModelExecutor::instant(VOCAB_SIZE));
+    let executor = MockModelExecutor::instant(VOCAB_SIZE);
+    let observation = executor.observer();
     let config = ferrum_types::EngineConfig::default();
     let scheduler = Arc::new(ContinuousBatchScheduler::new(SchedulerConfig::default()));
     let tokenizer = Arc::new(MockTokenizer::new(VOCAB_SIZE));
@@ -493,7 +495,7 @@ async fn prefix_cache_avoids_second_prefill() {
         tokenizer,
         sampler,
         kv_cache,
-        executor.clone(),
+        ferrum_execution::executor_lifecycle::ExecutorOwner::new(Box::new(executor)),
         tensor_factory,
     )
     .expect("legacy engine composition must match executor authority");
@@ -501,13 +503,13 @@ async fn prefix_cache_avoids_second_prefill() {
     // First request — cache miss, runs real prefill
     let req1 = make_request("Identical prompt for prefix cache");
     let resp1 = engine.infer(req1).await.unwrap();
-    assert_eq!(executor.prefill_count(), 1);
+    assert_eq!(observation.prefill_count(), 1);
 
     // Second request with same prompt — should hit prefix cache, no executor prefill
     let req2 = make_request("Identical prompt for prefix cache");
     let resp2 = engine.infer(req2).await.unwrap();
     assert_eq!(
-        executor.prefill_count(),
+        observation.prefill_count(),
         1,
         "Prefix cache should skip second prefill"
     );

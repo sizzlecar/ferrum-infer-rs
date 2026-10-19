@@ -9,8 +9,12 @@
 use crate::resource_lifecycle::{
     ResourceLedgerTransition, ResourceLifecycleLedger, ResourceOwnerCloseSummary,
 };
+use crate::IntoEngineExecutor;
 use async_trait::async_trait;
 use ferrum_bench_core::{JsonlJournal, JsonlJournalError};
+use ferrum_execution::executor_lifecycle::{
+    ExecutorOwner, ExecutorScope, ExecutorShutdownObserver, ExecutorShutdownPhase,
+};
 use ferrum_execution::{
     model_executor::{
         ExecutionResourceAuthority, ExecutorAdmissionEpochs, ExecutorCapacityWaitRegistration,
@@ -1398,7 +1402,7 @@ struct EngineInner {
     // Retained for constructor API; sampling now uses per-request SamplingConfig
     sampler: Arc<dyn Sampler + Send + Sync>,
     resource_composition: EngineResourceComposition,
-    model_executor: Arc<dyn ModelExecutor + Send + Sync>,
+    model_executor: Arc<ExecutorScope>,
     sequences: SequenceRegistry,
     driver: Weak<ManagedDriver>,
     shutdown_notify: Arc<Notify>,
@@ -1415,7 +1419,7 @@ struct EngineInner {
     journal_scopes: Arc<Mutex<EngineJournals>>,
     observation_health: ObservationHealth,
     #[cfg(test)]
-    trace_payload_builds: AtomicU64,
+    trace_payload_builds: Arc<AtomicU64>,
     scheduler_trace_none_streak: AtomicU64,
     resource_lifecycle: Mutex<ResourceLifecycleLedger>,
     resource_trace_event_counter: AtomicU64,
@@ -2160,8 +2164,12 @@ mod inner;
 /// an internal `iteration_lock` serializes engine steps while allowing
 /// all pending requests to be processed in each iteration's batch.
 pub struct ContinuousBatchEngine {
-    inner: Arc<EngineInner>,
     driver: Arc<ManagedDriver>,
+    config: EngineConfig,
+    scheduler: Arc<ContinuousBatchScheduler>,
+    adapter_support: AdapterExecutionSupport,
+    resource_authority: ExecutionResourceAuthority,
+    context_capacity: Option<usize>,
 }
 
 impl ContinuousBatchEngine {
@@ -2171,7 +2179,7 @@ impl ContinuousBatchEngine {
         tokenizer: Arc<dyn Tokenizer + Send + Sync>,
         sampler: Arc<dyn Sampler + Send + Sync>,
         kv_cache: Arc<dyn KvCacheManager + Send + Sync>,
-        model_executor: Arc<dyn ModelExecutor + Send + Sync>,
+        model_executor: impl IntoEngineExecutor,
         tensor_factory: Arc<dyn TensorFactory>,
     ) -> Result<Self> {
         Self::new_with_recurrent_state_manager(
@@ -2195,7 +2203,7 @@ impl ContinuousBatchEngine {
         tokenizer: Arc<dyn Tokenizer + Send + Sync>,
         sampler: Arc<dyn Sampler + Send + Sync>,
         kv_cache: Arc<dyn KvCacheManager + Send + Sync>,
-        model_executor: Arc<dyn ModelExecutor + Send + Sync>,
+        model_executor: impl IntoEngineExecutor,
         tensor_factory: Arc<dyn TensorFactory>,
         recurrent_state_manager: Option<Arc<dyn RecurrentStateManager + Send + Sync>>,
     ) -> Result<Self> {
@@ -2219,7 +2227,7 @@ impl ContinuousBatchEngine {
         tokenizer: Arc<dyn Tokenizer + Send + Sync>,
         sampler: Arc<dyn Sampler + Send + Sync>,
         kv_cache: Arc<dyn KvCacheManager + Send + Sync>,
-        model_executor: Arc<dyn ModelExecutor + Send + Sync>,
+        model_executor: impl IntoEngineExecutor,
         tensor_factory: Arc<dyn TensorFactory>,
         recurrent_state_manager: Option<Arc<dyn RecurrentStateManager + Send + Sync>>,
         journal_scopes: Option<EngineJournalScopes>,
@@ -2248,7 +2256,7 @@ impl ContinuousBatchEngine {
         scheduler: Arc<ContinuousBatchScheduler>,
         tokenizer: Arc<dyn Tokenizer + Send + Sync>,
         sampler: Arc<dyn Sampler + Send + Sync>,
-        model_executor: Arc<dyn ModelExecutor + Send + Sync>,
+        model_executor: impl IntoEngineExecutor,
         tensor_factory: Arc<dyn TensorFactory>,
     ) -> Result<Self> {
         Self::new_plan_runtime_with_journal_scopes(
@@ -2267,7 +2275,7 @@ impl ContinuousBatchEngine {
         scheduler: Arc<ContinuousBatchScheduler>,
         tokenizer: Arc<dyn Tokenizer + Send + Sync>,
         sampler: Arc<dyn Sampler + Send + Sync>,
-        model_executor: Arc<dyn ModelExecutor + Send + Sync>,
+        model_executor: impl IntoEngineExecutor,
         tensor_factory: Arc<dyn TensorFactory>,
         journal_scopes: Option<EngineJournalScopes>,
     ) -> Result<Self> {
@@ -2290,10 +2298,13 @@ impl ContinuousBatchEngine {
         tokenizer: Arc<dyn Tokenizer + Send + Sync>,
         sampler: Arc<dyn Sampler + Send + Sync>,
         resource_composition: EngineResourceComposition,
-        model_executor: Arc<dyn ModelExecutor + Send + Sync>,
+        model_executor: impl IntoEngineExecutor,
         _tensor_factory: Arc<dyn TensorFactory>,
         journal_scopes: Option<EngineJournalScopes>,
     ) -> Result<Self> {
+        let binding = model_executor.into_engine_executor()?;
+        let owns_executor = binding.owner.is_some();
+        let model_executor = binding.scope;
         let executor_authority = model_executor.execution_resource_authority();
         if resource_composition.authority() != executor_authority {
             return Err(FerrumError::config(format!(
@@ -2345,73 +2356,110 @@ impl ContinuousBatchEngine {
                 &config,
             ))
         });
+        if !owns_executor && host_profile_sink.is_some() {
+            return Err(FerrumError::config(
+                "a shared executor scope cannot replace the assembly-owned execution event sink",
+            ));
+        }
         if let Some(sink) = &host_profile_sink {
             model_executor.attach_execution_event_sink(sink.clone());
-        } else if config.runtime.profile_detail == ObservabilityProfileDetail::Basic {
+        } else if owns_executor
+            && config.runtime.profile_detail == ObservabilityProfileDetail::Basic
+        {
             model_executor.attach_execution_event_sink(Arc::new(MetricsOnlyExecutionEventSink));
         }
 
         let driver = Arc::new(ManagedDriver::default());
+        *driver.final_owner.lock() = binding.owner;
         let output_budget = OutputBudget::new(config.output.clone())?;
+        let engine_config = config.clone();
+        let engine_scheduler = Arc::clone(&scheduler);
+        let adapter_support = model_executor.adapter_execution_support();
+        let context_capacity = effective_request_context_capacity(
+            &config,
+            &runtime_config,
+            model_executor.kv_capacity(),
+        );
+        let inner = Arc::new_cyclic(|self_weak| EngineInner {
+            self_weak: self_weak.clone(),
+            output_budget,
+            output_tasks: Arc::new(OutputTaskRegistry::default()),
+            config,
+            scheduler,
+            tokenizer,
+            structured_output_factory: OnceLock::new(),
+            sampler,
+            resource_composition,
+            model_executor,
+            sequences: SequenceRegistry::default(),
+            driver: Arc::downgrade(&driver),
+            shutdown_notify: Arc::new(Notify::new()),
+            iteration_lock: tokio::sync::Mutex::new(()),
+            work_notify: Arc::new(Notify::new()),
+            iteration_count: AtomicU64::new(0),
+            runtime_config,
+            scheduler_trace_jsonl,
+            host_profile_sink,
+            legacy_scheduler_trace_jsonl,
+            journal_scopes,
+            observation_health,
+            #[cfg(test)]
+            trace_payload_builds: Arc::new(AtomicU64::new(0)),
+            scheduler_trace_none_streak: AtomicU64::new(0),
+            resource_lifecycle: Mutex::new(ResourceLifecycleLedger::default()),
+            resource_trace_event_counter: AtomicU64::new(0),
+            dynamic_admission_availability: Mutex::new(Vec::with_capacity(16)),
+            execution_readiness_waiters: ExecutionReadinessWaitRegistry::new(),
+            execution_closes: ExecutionCloseRegistry::default(),
+            prefix_rendezvous: Mutex::new(Vec::new()),
+            prefix_restore_pending: Mutex::new(HashMap::new()),
+            total_prefill_tokens: AtomicU64::new(0),
+            total_decode_tokens: AtomicU64::new(0),
+            total_preemptions: AtomicU64::new(0),
+            prefix_cache_hits: AtomicU64::new(0),
+            total_iteration_lock_wait_us: AtomicU64::new(0),
+            iteration_lock_wait_samples: AtomicU64::new(0),
+            total_scheduling_time_us: AtomicU64::new(0),
+            scheduling_time_samples: AtomicU64::new(0),
+            total_model_execution_time_us: AtomicU64::new(0),
+            model_execution_time_samples: AtomicU64::new(0),
+        });
+        *driver.active.lock() = Some(inner);
         Ok(Self {
-            inner: Arc::new_cyclic(|self_weak| EngineInner {
-                self_weak: self_weak.clone(),
-                output_budget,
-                output_tasks: Arc::new(OutputTaskRegistry::default()),
-                config,
-                scheduler,
-                tokenizer,
-                structured_output_factory: OnceLock::new(),
-                sampler,
-                resource_composition,
-                model_executor,
-                sequences: SequenceRegistry::default(),
-                driver: Arc::downgrade(&driver),
-                shutdown_notify: Arc::new(Notify::new()),
-                iteration_lock: tokio::sync::Mutex::new(()),
-                work_notify: Arc::new(Notify::new()),
-                iteration_count: AtomicU64::new(0),
-                runtime_config,
-                scheduler_trace_jsonl,
-                host_profile_sink,
-                legacy_scheduler_trace_jsonl,
-                journal_scopes,
-                observation_health,
-                #[cfg(test)]
-                trace_payload_builds: AtomicU64::new(0),
-                scheduler_trace_none_streak: AtomicU64::new(0),
-                resource_lifecycle: Mutex::new(ResourceLifecycleLedger::default()),
-                resource_trace_event_counter: AtomicU64::new(0),
-                dynamic_admission_availability: Mutex::new(Vec::with_capacity(16)),
-                execution_readiness_waiters: ExecutionReadinessWaitRegistry::new(),
-                execution_closes: ExecutionCloseRegistry::default(),
-                prefix_rendezvous: Mutex::new(Vec::new()),
-                prefix_restore_pending: Mutex::new(HashMap::new()),
-                total_prefill_tokens: AtomicU64::new(0),
-                total_decode_tokens: AtomicU64::new(0),
-                total_preemptions: AtomicU64::new(0),
-                prefix_cache_hits: AtomicU64::new(0),
-                total_iteration_lock_wait_us: AtomicU64::new(0),
-                iteration_lock_wait_samples: AtomicU64::new(0),
-                total_scheduling_time_us: AtomicU64::new(0),
-                scheduling_time_samples: AtomicU64::new(0),
-                total_model_execution_time_us: AtomicU64::new(0),
-                model_execution_time_samples: AtomicU64::new(0),
-            }),
             driver,
+            config: engine_config,
+            scheduler: engine_scheduler,
+            adapter_support,
+            resource_authority: executor_authority,
+            context_capacity,
         })
+    }
+
+    fn active_inner(&self) -> Result<Arc<EngineInner>> {
+        self.driver.active.lock().clone().ok_or_else(|| {
+            FerrumError::scheduler("engine is closing and no longer accepts requests")
+        })
+    }
+
+    pub(crate) async fn prepare_startup(&self) -> Result<()> {
+        let inner = self.active_inner()?;
+        inner.model_executor.prepare_startup().await
     }
 
     /// Hit count since engine construction (prefix cache). Exposed for
     /// tests + /metrics endpoint; monotonic, Relaxed-ordered.
     pub fn prefix_cache_hits(&self) -> u64 {
-        self.inner.prefix_cache_hits.load(Ordering::Relaxed)
+        self.driver.active.lock().as_ref().map_or_else(
+            || self.driver.final_prefix_hits.load(Ordering::Relaxed),
+            |inner| inner.prefix_cache_hits.load(Ordering::Relaxed),
+        )
     }
 
     /// Start or observe the one managed iteration task. The returned observer
     /// has no abort authority. A closing engine cannot be restarted.
     pub fn start_loop(&self) -> Result<DriverObserver> {
-        self.driver.start(&self.inner)
+        let inner = self.active_inner()?;
+        self.driver.start(&inner)
     }
 
     async fn publish_request(
@@ -2419,19 +2467,20 @@ impl ContinuousBatchEngine {
         request: InferenceRequest,
         mut sequence: SequenceState,
     ) -> Result<()> {
+        let inner = self.active_inner()?;
         let request_id = request.id.clone();
-        let _iteration = self.inner.iteration_lock.lock().await;
-        self.driver.publish(&self.inner, || {
-            self.inner
+        let _iteration = inner.iteration_lock.lock().await;
+        self.driver.publish(&inner, || {
+            inner
                 .sequences
                 .publish(request_id.clone(), || {
                     // No cancellable await exists after opening the product slot.
                     // The same gate serializes this publication with shutdown.
                     sequence.request_slot =
-                        Some(RequestSlotLease::open(&self.inner, request_id.clone()));
-                    if let Err(error) = self.inner.scheduler.submit_request(request) {
+                        Some(RequestSlotLease::open(&inner, request_id.clone()));
+                    if let Err(error) = inner.scheduler.submit_request(request) {
                         if let Some(slot) = sequence.request_slot.take() {
-                            slot.reject(&self.inner, error.to_string());
+                            slot.reject(&inner, error.to_string());
                         }
                         return Err(error);
                     }
@@ -2439,12 +2488,12 @@ impl ContinuousBatchEngine {
                         .request_slot
                         .as_mut()
                         .expect("new publication owns its slot")
-                        .admit(&self.inner);
+                        .admit(&inner);
                     Ok(sequence)
                 })
                 .map(drop)
         })?;
-        self.inner.work_notify.notify_one();
+        inner.work_notify.notify_one();
         Ok(())
     }
 }
@@ -2452,42 +2501,39 @@ impl ContinuousBatchEngine {
 #[async_trait]
 impl LlmInferenceEngine for ContinuousBatchEngine {
     fn adapter_execution_support(&self) -> AdapterExecutionSupport {
-        self.inner.model_executor.adapter_execution_support()
+        self.adapter_support
     }
 
     fn execution_resource_authority(&self) -> ExecutionResourceAuthority {
-        self.inner.resource_composition.authority()
+        self.resource_authority
     }
 
     fn context_capacity(&self) -> Option<usize> {
-        effective_request_context_capacity(
-            &self.inner.config,
-            &self.inner.runtime_config,
-            self.inner.model_executor.kv_capacity(),
-        )
+        self.context_capacity
     }
 
     async fn infer(&self, mut request: InferenceRequest) -> Result<InferenceOutput> {
+        let inner = self.active_inner()?;
         let ingress = request.ensure_ingress(RequestIngressBoundary::EngineApi);
         self.adapter_execution_support()
             .validate_metadata(&request.metadata)?;
-        let session = self.inner.output_budget.try_open_session()?;
+        let session = inner.output_budget.try_open_session()?;
         counter!("ferrum.engine.requests_total").increment(1);
 
-        let input_tokens = self.inner.tokenizer.encode(&request.prompt, true)?;
+        let input_tokens = inner.tokenizer.encode(&request.prompt, true)?;
         clamp_default_max_tokens_to_context(
             &mut request,
             input_tokens.len(),
-            &self.inner.config,
-            &self.inner.runtime_config,
-            self.inner.model_executor.kv_capacity(),
+            &inner.config,
+            &inner.runtime_config,
+            inner.model_executor.kv_capacity(),
         );
         validate_request_context_budget(
             &request,
             input_tokens.len(),
-            &self.inner.config,
-            &self.inner.runtime_config,
-            self.inner.model_executor.kv_capacity(),
+            &inner.config,
+            &inner.runtime_config,
+            inner.model_executor.kv_capacity(),
         )?;
         request.metadata.insert(
             PROMPT_TOKENS_METADATA_KEY.to_string(),
@@ -2498,10 +2544,9 @@ impl LlmInferenceEngine for ContinuousBatchEngine {
         // respect to the iteration driver. Typed admission must never observe
         // one without the other.
         let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
-        let mut receiver_drop_wake =
-            ClientReceiverDropWake::new(Arc::clone(&self.inner.work_notify));
+        let mut receiver_drop_wake = ClientReceiverDropWake::new(Arc::clone(&inner.work_notify));
         let structured_factory = if request.requires_structured_output() {
-            Some(self.inner.structured_output_factory()?)
+            Some(inner.structured_output_factory()?)
         } else {
             None
         };
@@ -2509,8 +2554,8 @@ impl LlmInferenceEngine for ContinuousBatchEngine {
             SequenceState::try_new_with_tokenizer_model_vocab_and_structured_factory(
                 request.clone(),
                 input_tokens,
-                Some(self.inner.tokenizer.clone()),
-                Some(self.inner.model_executor.info().vocab_size),
+                Some(inner.tokenizer.clone()),
+                Some(inner.model_executor.info().vocab_size),
                 structured_factory.as_deref(),
                 session.clone(),
             )?;
@@ -2544,32 +2589,33 @@ impl LlmInferenceEngine for ContinuousBatchEngine {
     }
 
     async fn infer_stream(&self, mut request: InferenceRequest) -> Result<InferenceStream> {
+        let inner = self.active_inner()?;
         request.ensure_ingress(RequestIngressBoundary::EngineApi);
         self.adapter_execution_support()
             .validate_metadata(&request.metadata)?;
-        let session = self.inner.output_budget.try_open_session()?;
+        let session = inner.output_budget.try_open_session()?;
         let (tx, rx) = OutputSender::new(
-            self.inner.self_weak.clone(),
+            inner.self_weak.clone(),
             request.id.clone(),
             session.clone(),
-            self.inner.config.output.engine_queue_items,
+            inner.config.output.engine_queue_items,
         );
-        let receiver_drop_wake = ClientReceiverDropWake::new(Arc::clone(&self.inner.work_notify));
+        let receiver_drop_wake = ClientReceiverDropWake::new(Arc::clone(&inner.work_notify));
 
-        let input_tokens = self.inner.tokenizer.encode(&request.prompt, true)?;
+        let input_tokens = inner.tokenizer.encode(&request.prompt, true)?;
         clamp_default_max_tokens_to_context(
             &mut request,
             input_tokens.len(),
-            &self.inner.config,
-            &self.inner.runtime_config,
-            self.inner.model_executor.kv_capacity(),
+            &inner.config,
+            &inner.runtime_config,
+            inner.model_executor.kv_capacity(),
         );
         validate_request_context_budget(
             &request,
             input_tokens.len(),
-            &self.inner.config,
-            &self.inner.runtime_config,
-            self.inner.model_executor.kv_capacity(),
+            &inner.config,
+            &inner.runtime_config,
+            inner.model_executor.kv_capacity(),
         )?;
         request.metadata.insert(
             PROMPT_TOKENS_METADATA_KEY.to_string(),
@@ -2579,7 +2625,7 @@ impl LlmInferenceEngine for ContinuousBatchEngine {
         // Publish tokenized state and the scheduler item under the same
         // iteration boundary; see the non-streaming path above.
         let structured_factory = if request.requires_structured_output() {
-            Some(self.inner.structured_output_factory()?)
+            Some(inner.structured_output_factory()?)
         } else {
             None
         };
@@ -2587,8 +2633,8 @@ impl LlmInferenceEngine for ContinuousBatchEngine {
             SequenceState::try_new_with_tokenizer_model_vocab_and_structured_factory(
                 request.clone(),
                 input_tokens,
-                Some(self.inner.tokenizer.clone()),
-                Some(self.inner.model_executor.info().vocab_size),
+                Some(inner.tokenizer.clone()),
+                Some(inner.model_executor.info().vocab_size),
                 structured_factory.as_deref(),
                 session.clone(),
             )?;
@@ -2605,12 +2651,10 @@ impl LlmInferenceEngine for ContinuousBatchEngine {
     }
 }
 
-#[async_trait]
-impl InferenceEngine for ContinuousBatchEngine {
-    async fn status(&self) -> EngineStatus {
-        let metrics = self.inner.scheduler.metrics();
+impl EngineInner {
+    fn memory_snapshot(&self) -> (ferrum_types::MemoryUsage, bool) {
         let (total_bytes, used_bytes, cache_memory_bytes, resource_status_ready) =
-            match &self.inner.resource_composition {
+            match &self.resource_composition {
                 EngineResourceComposition::LegacyEngine { kv_cache, .. } => {
                     let kv_stats = kv_cache.stats();
                     (
@@ -2621,7 +2665,7 @@ impl InferenceEngine for ContinuousBatchEngine {
                     )
                 }
                 EngineResourceComposition::PlanRuntime => {
-                    match self.inner.model_executor.plan_runtime_resource_snapshot() {
+                    match self.model_executor.plan_runtime_resource_snapshot() {
                         Ok(Some(snapshot)) => {
                             let total_bytes = usize::try_from(snapshot.usable_capacity_bytes())
                                 .unwrap_or(usize::MAX);
@@ -2650,22 +2694,47 @@ impl InferenceEngine for ContinuousBatchEngine {
             total_bytes,
             used_bytes,
             free_bytes,
-            gpu_memory_bytes: self
-                .inner
-                .config
-                .backend
-                .device
-                .is_gpu()
-                .then_some(used_bytes),
-            cpu_memory_bytes: matches!(self.inner.config.backend.device, Device::CPU)
+            gpu_memory_bytes: self.config.backend.device.is_gpu().then_some(used_bytes),
+            cpu_memory_bytes: matches!(self.config.backend.device, Device::CPU)
                 .then_some(used_bytes),
             cache_memory_bytes,
             utilization_percent: 0.0,
         };
         memory_usage.calculate_utilization();
+        (memory_usage, resource_status_ready)
+    }
+}
+
+#[async_trait]
+impl InferenceEngine for ContinuousBatchEngine {
+    async fn status(&self) -> EngineStatus {
+        let Some(inner) = self.driver.active.lock().clone() else {
+            return EngineStatus {
+                is_ready: false,
+                loaded_models: Vec::new(),
+                active_requests: 0,
+                queued_requests: 0,
+                memory_usage: self.driver.final_memory.lock().clone().unwrap_or(
+                    ferrum_types::MemoryUsage {
+                        total_bytes: 0,
+                        used_bytes: 0,
+                        free_bytes: 0,
+                        gpu_memory_bytes: None,
+                        cpu_memory_bytes: None,
+                        cache_memory_bytes: 0,
+                        utilization_percent: 0.0,
+                    },
+                ),
+                uptime_seconds: 0,
+                last_heartbeat: chrono::Utc::now(),
+                version: env!("CARGO_PKG_VERSION").to_owned(),
+            };
+        };
+        let metrics = inner.scheduler.metrics();
+        let (memory_usage, resource_status_ready) = inner.memory_snapshot();
         EngineStatus {
             is_ready: resource_status_ready && self.driver.is_running(),
-            loaded_models: vec![self.inner.config.model.model_id.clone()],
+            loaded_models: vec![inner.config.model.model_id.clone()],
             active_requests: metrics.running_requests,
             queued_requests: metrics.waiting_requests,
             memory_usage,
@@ -2676,15 +2745,22 @@ impl InferenceEngine for ContinuousBatchEngine {
     }
 
     async fn shutdown(&self) -> Result<()> {
-        self.driver.shutdown(&self.inner)?.wait().await.result()
+        let observer = self.driver.shutdown_active()?;
+        observer.wait().await.result()
+    }
+
+    async fn wait_for_shutdown_completion(&self) -> Result<()> {
+        let observer = self.driver.shutdown_active()?;
+        let report = observer.wait().await;
+        report.wait_for_shutdown_completion().await
     }
 
     fn config(&self) -> &EngineConfig {
-        &self.inner.config
+        &self.config
     }
 
     fn metrics(&self) -> ferrum_types::EngineMetrics {
-        let sm = self.inner.scheduler.metrics();
+        let sm = self.scheduler.metrics();
         ferrum_types::EngineMetrics {
             total_requests: sm.completed_requests + sm.failed_requests,
             successful_requests: sm.completed_requests,
@@ -2702,41 +2778,47 @@ impl InferenceEngine for ContinuousBatchEngine {
             },
             resource_utilization: Default::default(),
             error_stats: Default::default(),
-            performance_breakdown: self.inner.performance_breakdown(),
+            performance_breakdown: self
+                .driver
+                .active
+                .lock()
+                .as_ref()
+                .map(|inner| inner.performance_breakdown())
+                .unwrap_or_else(|| self.driver.final_performance.lock().clone()),
         }
     }
 
     fn cache_metrics_snapshot(&self) -> Option<serde_json::Value> {
-        self.inner.model_executor.cache_metrics_snapshot()
+        let inner = self.driver.active.lock().clone()?;
+        inner.model_executor.cache_metrics_snapshot()
     }
 
     fn execution_attribution_snapshot(&self) -> Option<serde_json::Value> {
-        self.inner.model_executor.execution_attribution_snapshot()
+        let inner = self.driver.active.lock().clone()?;
+        inner.model_executor.execution_attribution_snapshot()
     }
 
     fn scheduler_slo_snapshot(&self) -> Option<serde_json::Value> {
-        serde_json::to_value(self.inner.scheduler.slo_snapshot()?).ok()
+        serde_json::to_value(self.scheduler.slo_snapshot()?).ok()
     }
 
     fn admission_snapshot(
         &self,
     ) -> ferrum_types::Result<Option<ferrum_types::ExecutorAdmissionSnapshot>> {
-        let scheduler = self.inner.scheduler.admission_phase_counts();
-        let authority = self.inner.resource_composition.authority();
+        let inner = self.active_inner()?;
+        let scheduler = inner.scheduler.admission_phase_counts();
+        let authority = inner.resource_composition.authority();
         let limits = match authority {
-            ExecutionResourceAuthority::PlanRuntime => self
-                .inner
-                .model_executor
-                .admission_limits()?
-                .ok_or_else(|| {
+            ExecutionResourceAuthority::PlanRuntime => {
+                inner.model_executor.admission_limits()?.ok_or_else(|| {
                     FerrumError::internal(
                         "PlanRuntime executor did not expose its resolved admission limits",
                     )
-                })?,
+                })?
+            }
             ExecutionResourceAuthority::LegacyEngine => {
-                let scheduler_limit = self.inner.config.scheduler.max_running_requests;
-                let maximum_active_sequences = self
-                    .inner
+                let scheduler_limit = inner.config.scheduler.max_running_requests;
+                let maximum_active_sequences = inner
                     .recurrent_state_manager()
                     .map(|manager| scheduler_limit.min(manager.stats().total_batch_slots))
                     .unwrap_or(scheduler_limit);
@@ -2744,9 +2826,9 @@ impl InferenceEngine for ContinuousBatchEngine {
                     u32::try_from(maximum_active_sequences).map_err(|_| {
                         FerrumError::internal("legacy admission sequence limit exceeds u32")
                     })?,
-                    u64::try_from(self.inner.config.batching.max_num_batched_tokens).map_err(
-                        |_| FerrumError::internal("legacy scheduled-token limit exceeds u64"),
-                    )?,
+                    u64::try_from(inner.config.batching.max_num_batched_tokens).map_err(|_| {
+                        FerrumError::internal("legacy scheduled-token limit exceeds u64")
+                    })?,
                 )
                 .map_err(|reason| {
                     FerrumError::internal(format!(
@@ -2776,7 +2858,8 @@ impl InferenceEngine for ContinuousBatchEngine {
     }
 
     fn lora_metrics_snapshot(&self) -> Option<serde_json::Value> {
-        self.inner.model_executor.lora_metrics_snapshot()
+        let inner = self.driver.active.lock().clone()?;
+        inner.model_executor.lora_metrics_snapshot()
     }
 
     async fn health_check(&self) -> ferrum_types::HealthStatus {
@@ -2792,15 +2875,21 @@ impl InferenceEngine for ContinuousBatchEngine {
     }
 }
 
+impl Drop for ContinuousBatchEngine {
+    fn drop(&mut self) {
+        // The managed task and executor owner survive a cancelled product builder.
+        let _ = self.driver.shutdown_active();
+    }
+}
+
 impl std::fmt::Debug for ContinuousBatchEngine {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ContinuousBatchEngine")
             .field("is_running", &self.driver.is_running())
             .field(
-                "iteration_count",
-                &self.inner.iteration_count.load(Ordering::SeqCst),
+                "active_requests",
+                &self.scheduler.metrics().running_requests,
             )
-            .field("active_sequences", &self.inner.sequences.len())
             .finish()
     }
 }
@@ -2814,3 +2903,7 @@ mod tests;
 
 #[cfg(test)]
 mod token_completion_tests;
+
+#[cfg(test)]
+#[path = "continuous_engine/executor_shutdown_tests.rs"]
+mod executor_shutdown_tests;

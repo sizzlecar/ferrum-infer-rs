@@ -5,6 +5,7 @@
 
 pub mod driver;
 mod event_sink;
+pub mod executor_lifecycle;
 pub mod model_executor;
 pub mod prepared_model;
 pub mod token_execution;
@@ -18,6 +19,10 @@ pub use driver::{
     MAX_DETERMINISM_PARTICIPANTS,
 };
 pub use event_sink::ProductExecutionEventSink;
+pub use executor_lifecycle::{
+    ExecutorOwner, ExecutorScope, ExecutorShutdownObserver, ExecutorShutdownPermit,
+    ExecutorShutdownPhase, ExecutorShutdownReport, ExecutorShutdownReporter,
+};
 pub use ferrum_runtime::{ExecutorRequestOrigin, PlanRuntimeResourceSnapshot};
 pub use model_executor::{
     ExecutorAdmissionEpochs, ExecutorPrefillAdmission, ExecutorPrefillAdmissionDecision,

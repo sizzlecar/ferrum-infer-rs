@@ -22,7 +22,10 @@ async fn execution_readiness_late_failure_preserves_exact_replacement() {
         Replacement::NewHandle,
     ] {
         let mut fixture = actual::fixture(false, false).await;
-        let inner = &fixture.engine.inner;
+        let inner = &fixture
+            .engine
+            .active_inner()
+            .expect("engine execution is open");
         let old_handle = inner.sequences.get(&fixture.request_id).unwrap();
         inner
             .scheduler

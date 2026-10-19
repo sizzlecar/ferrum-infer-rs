@@ -139,7 +139,7 @@ impl TokenWorkerState {
         let physical = if numerical.is_empty() {
             ModelTokenBatchOutcome::Serial(Vec::new())
         } else {
-            self.model.lock().execute_token_batch(&numerical)
+            lock_live_model(&self.model)?.execute_token_batch(&numerical)
         };
         let mut rows: Vec<Option<ModelTokenOutcome<ModelTokenProduct>>> =
             std::iter::repeat_with(|| None).take(inputs.len()).collect();

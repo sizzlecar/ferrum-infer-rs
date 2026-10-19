@@ -14,7 +14,7 @@ use std::sync::Arc;
 const VOCAB: usize = 1000;
 
 fn make_engine_with_executor(
-    executor: Arc<dyn ferrum_execution::ModelExecutor>,
+    executor: Box<dyn ferrum_execution::ModelExecutor>,
 ) -> ContinuousBatchEngine {
     let config = ferrum_types::EngineConfig::default();
     let scheduler = Arc::new(ContinuousBatchScheduler::new(SchedulerConfig::default()));
@@ -28,14 +28,14 @@ fn make_engine_with_executor(
         tokenizer,
         sampler,
         kv_cache,
-        executor,
+        ferrum_execution::executor_lifecycle::ExecutorOwner::new(executor),
         tensor_factory,
     )
     .expect("legacy engine composition must match executor authority")
 }
 
 fn make_engine() -> ContinuousBatchEngine {
-    make_engine_with_executor(Arc::new(MockModelExecutor::instant(VOCAB)))
+    make_engine_with_executor(Box::new(MockModelExecutor::instant(VOCAB)))
 }
 
 fn make_request(prompt: &str, max_tokens: usize) -> InferenceRequest {
@@ -112,7 +112,7 @@ async fn eos_token_stops_generation() {
     // Executor emits EOS (token 2) after 3 decode steps.
     // MockTokenizer's EOS may differ from token 2, so we check that generation
     // stops well before max_tokens (100), indicating some stop condition triggered.
-    let executor = Arc::new(ConfigurableModelExecutor::with_eos_after(VOCAB, 3, 2));
+    let executor = Box::new(ConfigurableModelExecutor::with_eos_after(VOCAB, 3, 2));
     let engine = make_engine_with_executor(executor);
 
     let mut req = make_request("Hello", 100);
@@ -135,7 +135,7 @@ async fn eos_token_stops_generation() {
 #[tokio::test]
 async fn configurable_executor_produces_expected_tokens() {
     // Executor cycles through tokens [10, 20, 30]
-    let executor = Arc::new(ConfigurableModelExecutor::with_token_sequence(
+    let executor = Box::new(ConfigurableModelExecutor::with_token_sequence(
         VOCAB,
         vec![10, 20, 30],
     ));

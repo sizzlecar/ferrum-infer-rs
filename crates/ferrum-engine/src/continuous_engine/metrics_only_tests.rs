@@ -14,20 +14,30 @@ fn basic_metrics_only_attaches_to_target_without_journals() {
             let mut config = EngineConfig::default();
             config.runtime.profile_detail = detail;
             config.runtime.profile_entrypoint = Some(entrypoint);
-            let target = Arc::new(PlanRuntimeAdmissionTestExecutor::new(128));
+            let implementation = PlanRuntimeAdmissionTestExecutor::new(128);
+            let target = implementation.observer();
+            let owner = ExecutorOwner::new(Box::new(implementation));
             let engine = ContinuousBatchEngine::new_with_resource_composition(
                 config.clone(),
                 Arc::new(ContinuousBatchScheduler::new(config.scheduler)),
                 Arc::new(ferrum_testkit::MockTokenizer::new(128)),
                 Arc::new(ferrum_testkit::MockSampler),
                 EngineResourceComposition::PlanRuntime,
-                target.clone(),
+                owner,
                 Arc::new(MockTensorFactory),
                 None,
             )
             .unwrap();
-            assert!(engine.inner.profile_trace_journal().is_none());
-            assert!(engine.inner.scheduler_trace_jsonl.is_none());
+            assert!(engine
+                .active_inner()
+                .expect("engine execution is open")
+                .profile_trace_journal()
+                .is_none());
+            assert!(engine
+                .active_inner()
+                .expect("engine execution is open")
+                .scheduler_trace_jsonl
+                .is_none());
             let attached = target.event_sink.lock().unwrap();
             if detail == ObservabilityProfileDetail::Off {
                 assert!(attached.is_none());
@@ -52,13 +62,15 @@ fn basic_with_artifact_keeps_event_sink_and_completion_timing() {
     let mut config = EngineConfig::default();
     config.runtime.profile_detail = ObservabilityProfileDetail::Basic;
     config.runtime.profile_jsonl = Some(path.clone());
-    let target = Arc::new(PlanRuntimeAdmissionTestExecutor::new(128));
+    let implementation = PlanRuntimeAdmissionTestExecutor::new(128);
+    let target = implementation.observer();
+    let owner = ExecutorOwner::new(Box::new(implementation));
     let engine = ContinuousBatchEngine::new_plan_runtime(
         config.clone(),
         Arc::new(ContinuousBatchScheduler::new(config.scheduler)),
         Arc::new(ferrum_testkit::MockTokenizer::new(128)),
         Arc::new(ferrum_testkit::MockSampler),
-        target.clone(),
+        owner,
         Arc::new(MockTensorFactory),
     )
     .unwrap();
@@ -69,7 +81,11 @@ fn basic_with_artifact_keeps_event_sink_and_completion_timing() {
         assert_eq!(sink.device_timing_mode(), DeviceTimingMode::Completion);
         assert!(sink.records_execution_resource_maintenance());
     }
-    assert!(engine.inner.profile_trace_journal().is_some());
+    assert!(engine
+        .active_inner()
+        .expect("engine execution is open")
+        .profile_trace_journal()
+        .is_some());
     drop(engine);
     drop(target);
     let _ = std::fs::remove_file(path);

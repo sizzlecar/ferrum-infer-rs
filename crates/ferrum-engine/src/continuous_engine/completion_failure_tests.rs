@@ -13,7 +13,11 @@ enum CompletionFault {
 async fn completion_failure_closes_known_owners(fault: CompletionFault) {
     let mut fixture = fixture(false, false).await;
     let (frontier, token, prompt) = {
-        let states = &fixture.engine.inner.sequences;
+        let states = &fixture
+            .engine
+            .active_inner()
+            .expect("engine execution is open")
+            .sequences;
         let state_handle = states.get(&fixture.request_id).unwrap();
         let state_guard = state_handle.lock();
         let state = state_guard.as_ref().unwrap();
@@ -28,7 +32,8 @@ async fn completion_failure_closes_known_owners(fault: CompletionFault) {
             // Real timing validation: two commit observations for one token.
             fixture
                 .engine
-                .inner
+                .active_inner()
+                .expect("engine execution is open")
                 .sequences
                 .get(&fixture.request_id)
                 .unwrap()
@@ -46,7 +51,6 @@ async fn completion_failure_closes_known_owners(fault: CompletionFault) {
         CompletionFault::Scheduler => {
             assert!(fixture
                 .engine
-                .inner
                 .scheduler
                 .cancel_request(fixture.request_id.clone())
                 .unwrap());
@@ -54,7 +58,8 @@ async fn completion_failure_closes_known_owners(fault: CompletionFault) {
     }
     let error = fixture
         .engine
-        .inner
+        .active_inner()
+        .expect("engine execution is open")
         .complete_request_for_test(&fixture.request_id, FinishReason::Length)
         .await
         .unwrap_err();
@@ -67,14 +72,12 @@ async fn completion_failure_closes_known_owners(fault: CompletionFault) {
     }
     assert!(!fixture
         .engine
-        .inner
+        .active_inner()
+        .expect("engine execution is open")
         .sequences
         .get(&fixture.request_id)
         .is_some());
-    assert_eq!(
-        fixture.engine.inner.scheduler.trace_snapshot().active_len,
-        0
-    );
+    assert_eq!(fixture.engine.scheduler.trace_snapshot().active_len, 0);
     assert_eq!(
         fixture
             .response
@@ -113,7 +116,15 @@ async fn completion_failure_closes_known_owners(fault: CompletionFault) {
         // executor, KV and request slot must remain owned. Continuing only in
         // this CPU fixture proves that no generic cleanup freed the model.
         assert!(fixture.identity.observed_end().is_none());
-        assert_eq!(fixture.engine.inner.execution_closes.unreclaimed_count(), 1);
+        assert_eq!(
+            fixture
+                .engine
+                .active_inner()
+                .expect("engine execution is open")
+                .execution_closes
+                .unreclaimed_count(),
+            1
+        );
         assert_eq!(slot_events(&fixture, ResourceAction::Release), 0);
         assert_eq!(fixture.model.lock().model.kv_caches.len(), 1);
         let policy = LogitsReturnPolicy::FullLogits;
@@ -170,7 +181,12 @@ async fn completion_failure_closes_known_owners(fault: CompletionFault) {
             closed.disposition,
             ExecutionCloseDisposition::Ended(_)
         ));
-        fixture.engine.inner.drain_execution_closes().unwrap();
+        fixture
+            .engine
+            .active_inner()
+            .expect("engine execution is open")
+            .drain_execution_closes()
+            .unwrap();
         assert_eq!(
             fixture.model.lock().releases,
             vec![vec![fixture.prompt_len + 1; fixture.layers]]
@@ -183,13 +199,20 @@ async fn completion_failure_closes_known_owners(fault: CompletionFault) {
     }
     assert!(fixture.identity.observed_end().is_some());
     assert!(fixture.model.lock().model.kv_caches.is_empty());
-    assert_eq!(fixture.engine.inner.execution_closes.unreclaimed_count(), 0);
+    assert_eq!(
+        fixture
+            .engine
+            .active_inner()
+            .expect("engine execution is open")
+            .execution_closes
+            .unreclaimed_count(),
+        0
+    );
     assert_eq!(slot_events(&fixture, ResourceAction::Release), 1);
     assert_eq!(slot_events(&fixture, ResourceAction::RequestClose), 1);
     assert_eq!(
         fixture
             .engine
-            .inner
             .scheduler
             .trace_snapshot()
             .capacity_release_epoch,
@@ -197,11 +220,17 @@ async fn completion_failure_closes_known_owners(fault: CompletionFault) {
     );
     fixture
         .engine
-        .inner
+        .active_inner()
+        .expect("engine execution is open")
         .complete_request_for_test(&fixture.request_id, FinishReason::Length)
         .await
         .unwrap();
-    fixture.engine.inner.drain_execution_closes().unwrap();
+    fixture
+        .engine
+        .active_inner()
+        .expect("engine execution is open")
+        .drain_execution_closes()
+        .unwrap();
     assert_eq!(
         fixture.executor.finishes.load(Ordering::SeqCst),
         usize::from(confirmation_failed)

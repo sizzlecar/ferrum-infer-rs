@@ -22,7 +22,7 @@ use tokenizers::{
 mod executor;
 mod structured;
 mod tools;
-use executor::ScriptedExecutor;
+use executor::{ScriptedExecutor, ScriptedObservation};
 
 const STOP: &str = "STOP";
 const ORDINARY_EOS: &str = "<|endoftext|>";
@@ -37,7 +37,7 @@ struct Observation {
     prompt_tokens: usize,
     generated_tokens: usize,
     decoded_inputs: Vec<String>,
-    executor: Arc<ScriptedExecutor>,
+    executor: Arc<ScriptedObservation>,
 }
 
 fn template(protocol: ModelOutputProtocol) -> ModelChatTemplate {
@@ -118,10 +118,7 @@ async fn request(
         .iter()
         .map(|piece| tokenizer.token_id(piece).unwrap())
         .collect();
-    let executor = Arc::new(ScriptedExecutor::new(
-        tokenizer.vocab_size(),
-        script.clone(),
-    ));
+    let executor = ScriptedExecutor::new(tokenizer.vocab_size(), script.clone());
     let response = request_with_executor(
         protocol,
         tokenizer,
@@ -142,7 +139,7 @@ async fn request(
 async fn request_with_executor(
     protocol: ModelOutputProtocol,
     tokenizer: Arc<HuggingFaceTokenizer>,
-    executor: Arc<ScriptedExecutor>,
+    executor: ScriptedExecutor,
     max_tokens: usize,
     stop: Option<&str>,
     stream: bool,
@@ -170,24 +167,26 @@ async fn request_with_executor(
 async fn request_with_wire(
     protocol: ModelOutputProtocol,
     tokenizer: Arc<HuggingFaceTokenizer>,
-    executor: Arc<ScriptedExecutor>,
+    executor: ScriptedExecutor,
     wire: Value,
 ) -> Observation {
     let mut config = EngineConfig::default();
     config.model.model_id = ModelId::new("protocol-contract");
     config.scheduler.max_running_requests = 1;
     config.batching.max_num_batched_tokens = 256;
+    let observation = executor.observer();
     let engine = Arc::new(
         ContinuousBatchEngine::new_plan_runtime(
             config.clone(),
             Arc::new(ContinuousBatchScheduler::new(config.scheduler)),
             tokenizer.clone(),
             Arc::new(GreedySampler),
-            executor.clone(),
+            ferrum_execution::ExecutorOwner::new(Box::new(executor)),
             Arc::new(MockTensorFactory),
         )
         .unwrap(),
     );
+    let executor = observation;
     let router = AxumServer::from_llm(engine.clone())
         .with_prompt_template(Some(template(protocol)))
         .build_router()

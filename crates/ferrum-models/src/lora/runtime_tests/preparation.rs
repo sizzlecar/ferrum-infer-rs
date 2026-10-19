@@ -32,6 +32,9 @@ struct ObservedLlama {
 }
 
 impl DecoderOnlyLLM for ObservedLlama {
+    fn retire_model(&mut self) -> crate::common::ModelRetirementOutcome {
+        self.state.lock().model.retire_model()
+    }
     fn config(&self) -> &LlmRuntimeConfig {
         &self.config
     }

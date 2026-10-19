@@ -22,14 +22,14 @@ fn make_engine() -> ContinuousBatchEngine {
     let sampler = Arc::new(MockSampler);
     let kv_cache = Arc::new(MockKvCacheManager::new(1024));
     let tensor_factory = Arc::new(MockTensorFactory);
-    let executor = Arc::new(ConfigurableModelExecutor::with_eos_after(VOCAB, 3, 2));
+    let executor = ConfigurableModelExecutor::with_eos_after(VOCAB, 3, 2);
     ContinuousBatchEngine::new(
         config,
         scheduler,
         tokenizer,
         sampler,
         kv_cache,
-        executor,
+        ferrum_execution::executor_lifecycle::ExecutorOwner::new(Box::new(executor)),
         tensor_factory,
     )
     .expect("legacy engine composition must match executor authority")

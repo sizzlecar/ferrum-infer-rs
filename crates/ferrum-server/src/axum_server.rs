@@ -172,9 +172,19 @@ struct AxumServerLifecycle {
     shutdown_notify: Notify,
     stopped_notify: Notify,
     stop_lock: tokio::sync::Mutex<()>,
+    engine_shutdown: tokio::sync::Mutex<LoadedEngineShutdown>,
+    engine_shutdown_error: Mutex<Option<ferrum_types::FerrumError>>,
     profile_detail: Mutex<Option<ferrum_types::ObservabilityProfileDetail>>,
     profile_delivery: Mutex<Option<Arc<HttpProfileDelivery>>>,
     profile_scopes: Mutex<Option<HttpJournalScopes>>,
+}
+
+#[derive(Default)]
+enum LoadedEngineShutdown {
+    #[default]
+    Idle,
+    Running(tokio::task::JoinHandle<ferrum_types::Result<()>>),
+    Finished(ferrum_types::Result<()>),
 }
 
 impl AxumServerLifecycle {
@@ -299,14 +309,55 @@ impl AxumServer {
         Ok(self)
     }
 
-    async fn shutdown_loaded_engines(&self) -> ferrum_types::Result<()> {
-        let mut first_error = None;
-        if let Some(engine) = &self.state.llm {
-            if let Err(error) = engine.shutdown().await {
-                first_error = Some(error);
+    async fn shutdown_loaded_engines(&self, wait_for_completion: bool) -> ferrum_types::Result<()> {
+        let first_result = {
+            let mut state = self.lifecycle.engine_shutdown.lock().await;
+            if matches!(*state, LoadedEngineShutdown::Idle) {
+                let engine = self.state.llm.clone();
+                *state = LoadedEngineShutdown::Running(tokio::spawn(async move {
+                    match engine {
+                        Some(engine) => engine.shutdown().await,
+                        None => Ok(()),
+                    }
+                }));
             }
+            if let LoadedEngineShutdown::Running(task) = &mut *state {
+                let result = task.await.unwrap_or_else(|error| {
+                    Err(Error::internal(format!(
+                        "loaded engine shutdown task failed: {error}"
+                    )))
+                });
+                *state = LoadedEngineShutdown::Finished(result);
+            }
+            let LoadedEngineShutdown::Finished(result) = &*state else {
+                unreachable!("joined original shutdown");
+            };
+            result.clone()
+        };
+        let settled = if wait_for_completion {
+            // Timeouts and earlier errors leave the original operation intact.
+            // Finish observes its terminal cleanup instead of starting it again.
+            match &self.state.llm {
+                Some(engine) => engine.wait_for_shutdown_completion().await,
+                None => Ok(()),
+            }
+        } else {
+            Ok(())
+        };
+        if wait_for_completion || first_result.is_ok() {
+            self.lifecycle
+                .engines_stopped
+                .store(true, Ordering::Release);
         }
-        first_error.map_or(Ok(()), Err)
+        let result = first_result.and(settled);
+        if let Err(error) = &result {
+            self.lifecycle
+                .engine_shutdown_error
+                .lock()
+                .unwrap()
+                .get_or_insert_with(|| error.clone());
+        }
+        result
     }
 
     /// Finish the original shutdown without abandoning its waits at a timeout.
@@ -321,17 +372,19 @@ impl AxumServer {
         info!("Stopping Axum server");
         self.lifecycle.request_shutdown();
 
-        let mut first_error = None;
+        let mut first_error = self.lifecycle.engine_shutdown_error.lock().unwrap().clone();
         if self.lifecycle.running.load(Ordering::Acquire) {
             if let Some(timeout) = timeout {
                 if tokio::time::timeout(timeout, self.lifecycle.wait_until_stopped())
                     .await
                     .is_err()
                 {
-                    first_error = Some(Error::internal(format!(
-                        "Axum server did not drain within {} ms",
-                        timeout.as_millis()
-                    )));
+                    first_error.get_or_insert_with(|| {
+                        Error::internal(format!(
+                            "Axum server did not drain within {} ms",
+                            timeout.as_millis()
+                        ))
+                    });
                 }
             } else {
                 self.lifecycle.wait_until_stopped().await;
@@ -341,7 +394,7 @@ impl AxumServer {
         if !self.lifecycle.engines_stopped.load(Ordering::Acquire) {
             let result = match timeout {
                 Some(timeout) => {
-                    match tokio::time::timeout(timeout, self.shutdown_loaded_engines()).await {
+                    match tokio::time::timeout(timeout, self.shutdown_loaded_engines(false)).await {
                         Ok(result) => result,
                         Err(_) => Err(Error::internal(format!(
                             "engine shutdown did not complete within {} ms",
@@ -349,7 +402,7 @@ impl AxumServer {
                         ))),
                     }
                 }
-                None => self.shutdown_loaded_engines().await,
+                None => self.shutdown_loaded_engines(true).await,
             };
             match result {
                 Ok(()) => self
@@ -5581,6 +5634,11 @@ mod tests {
             Ok(())
         }
 
+        async fn wait_for_shutdown_completion(&self) -> ferrum_types::Result<()> {
+            // This HTTP response fixture has no background execution owners.
+            Ok(())
+        }
+
         fn config(&self) -> &EngineConfig {
             &self.config
         }
@@ -5629,6 +5687,10 @@ mod tests {
             Ok(())
         }
 
+        async fn wait_for_shutdown_completion(&self) -> ferrum_types::Result<()> {
+            Ok(())
+        }
+
         fn config(&self) -> &EngineConfig {
             &self.config
         }
@@ -5666,6 +5728,10 @@ mod tests {
         }
 
         async fn shutdown(&self) -> ferrum_types::Result<()> {
+            Ok(())
+        }
+
+        async fn wait_for_shutdown_completion(&self) -> ferrum_types::Result<()> {
             Ok(())
         }
 

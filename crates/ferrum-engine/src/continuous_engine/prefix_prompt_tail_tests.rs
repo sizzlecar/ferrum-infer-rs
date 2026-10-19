@@ -12,16 +12,18 @@ async fn prompt_tail_single_prefill_samples_only_after_the_remaining_suffix() {
         let scheduler = Arc::new(ContinuousBatchScheduler::new(config.scheduler.clone()));
         let mut executor = PlanRuntimeChunkedPrefillTestExecutor::new(false);
         executor.prompt_tail_reserve = reserve;
-        let executor = Arc::new(executor);
+        let observation = executor.observer();
+        let executor = ExecutorOwner::new(Box::new(executor));
         let engine = ContinuousBatchEngine::new_plan_runtime(
             config,
             Arc::clone(&scheduler),
             Arc::new(ferrum_testkit::MockTokenizer::new(128)),
             Arc::new(ferrum_testkit::MockSampler),
-            executor.clone(),
+            executor,
             Arc::new(MockTensorFactory),
         )
         .unwrap();
+        let executor = observation;
         let mut request = policy_request();
         request.prompt = "one two three four".to_owned();
         request.sampling_params.max_tokens = 1;
@@ -86,16 +88,18 @@ async fn prompt_tail_batch_prefill_commits_each_boundary_before_sampling() {
         Arc::new(ferrum_testkit::MockTokenizer::new(128));
     let mut executor = PlanRuntimeChunkedPrefillTestExecutor::new(false);
     executor.prompt_tail_reserve = Some(2);
-    let executor = Arc::new(executor);
+    let observation = executor.observer();
+    let executor = ExecutorOwner::new(Box::new(executor));
     let engine = ContinuousBatchEngine::new_plan_runtime(
         config,
         Arc::clone(&scheduler),
         Arc::clone(&tokenizer),
         Arc::new(ferrum_testkit::MockSampler),
-        executor.clone(),
+        executor,
         Arc::new(MockTensorFactory),
     )
     .unwrap();
+    let executor = observation;
     let mut request_ids = Vec::new();
     for prompt in [
         "one two three four",
@@ -117,17 +121,26 @@ async fn prompt_tail_batch_prefill_commits_each_boundary_before_sampling() {
             Some(Arc::clone(&tokenizer)),
             Some(128),
         );
-        sequence.request_slot = Some(RequestSlotLease::open(&engine.inner, request.id.clone()));
+        sequence.request_slot = Some(RequestSlotLease::open(
+            &engine.active_inner().expect("engine execution is open"),
+            request.id.clone(),
+        ));
         request_ids.push(request.id.clone());
-        engine.inner.sequences.insert(request.id.clone(), sequence);
+        engine
+            .active_inner()
+            .expect("engine execution is open")
+            .sequences
+            .insert(request.id.clone(), sequence);
         assert!(
             engine
-                .inner
+                .active_inner()
+                .expect("engine execution is open")
                 .probe_executor_prefill_admission_for_test(&request)
                 .await
         );
         engine
-            .inner
+            .active_inner()
+            .expect("engine execution is open")
             .sequences
             .get(&request.id)
             .unwrap()
@@ -137,7 +150,7 @@ async fn prompt_tail_batch_prefill_commits_each_boundary_before_sampling() {
             .request_slot
             .as_mut()
             .unwrap()
-            .admit(&engine.inner);
+            .admit(&engine.active_inner().expect("engine execution is open"));
     }
 
     let first = scheduler
@@ -148,7 +161,10 @@ async fn prompt_tail_batch_prefill_commits_each_boundary_before_sampling() {
     let incarnations = request_ids
         .iter()
         .map(|id| {
-            let sequences = &engine.inner.sequences;
+            let sequences = &engine
+                .active_inner()
+                .expect("engine execution is open")
+                .sequences;
             let frontier = sequences
                 .get(id)
                 .unwrap()
@@ -162,10 +178,18 @@ async fn prompt_tail_batch_prefill_commits_each_boundary_before_sampling() {
             (id.clone(), frontier.sequence().clone())
         })
         .collect::<HashMap<_, _>>();
-    engine.inner.process_batch(&first).await.unwrap();
+    engine
+        .active_inner()
+        .expect("engine execution is open")
+        .process_batch(&first)
+        .await
+        .unwrap();
     assert_eq!(executor.tail_batch_prefill_calls.load(Ordering::Relaxed), 1);
     {
-        let sequences = &engine.inner.sequences;
+        let sequences = &engine
+            .active_inner()
+            .expect("engine execution is open")
+            .sequences;
         for id in &request_ids {
             let sequence_handle = sequences.get(id).unwrap();
             let sequence_guard = sequence_handle.lock();
@@ -188,10 +212,18 @@ async fn prompt_tail_batch_prefill_commits_each_boundary_before_sampling() {
         .await
         .unwrap();
     assert_eq!(last.requests.len(), 3);
-    engine.inner.process_batch(&last).await.unwrap();
+    engine
+        .active_inner()
+        .expect("engine execution is open")
+        .process_batch(&last)
+        .await
+        .unwrap();
     assert_eq!(executor.tail_batch_prefill_calls.load(Ordering::Relaxed), 2);
     {
-        let sequences = &engine.inner.sequences;
+        let sequences = &engine
+            .active_inner()
+            .expect("engine execution is open")
+            .sequences;
         for id in &request_ids {
             let sequence_handle = sequences.get(id).unwrap();
             let sequence_guard = sequence_handle.lock();
@@ -216,13 +248,30 @@ async fn prompt_tail_batch_prefill_commits_each_boundary_before_sampling() {
     );
     for id in &request_ids {
         engine
-            .inner
+            .active_inner()
+            .expect("engine execution is open")
             .complete_request_for_test(id, FinishReason::Error)
             .await
             .unwrap();
         assert!(incarnations[id].observed_end().is_some());
     }
-    engine.inner.execution_closes.join_observers().await;
-    engine.inner.drain_execution_closes().unwrap();
-    assert_eq!(engine.inner.execution_closes.unreclaimed_count(), 0);
+    engine
+        .active_inner()
+        .expect("engine execution is open")
+        .execution_closes
+        .join_observers()
+        .await;
+    engine
+        .active_inner()
+        .expect("engine execution is open")
+        .drain_execution_closes()
+        .unwrap();
+    assert_eq!(
+        engine
+            .active_inner()
+            .expect("engine execution is open")
+            .execution_closes
+            .unreclaimed_count(),
+        0
+    );
 }

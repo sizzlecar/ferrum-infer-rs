@@ -1,5 +1,6 @@
 //! Mock model executor with configurable latency for scheduling tests.
 
+use crate::executor_observation::{ExecutorCounters, ExecutorObservation};
 use async_trait::async_trait;
 use ferrum_execution::token_execution::*;
 use ferrum_execution::{
@@ -11,7 +12,8 @@ use ferrum_execution::{
 };
 use ferrum_types::{DataType, Device, ModelInfo, ModelType, Result};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
+use std::sync::Arc;
 use std::time::Duration;
 
 pub(crate) mod token_state;
@@ -23,12 +25,16 @@ pub struct MockModelExecutor {
     info: ModelInfo,
     prefill_latency: Duration,
     decode_latency: Duration,
-    prefill_count: AtomicU64,
-    decode_count: AtomicU64,
+    counters: Arc<ExecutorCounters>,
     tokens: TokenState,
 }
 
 impl MockModelExecutor {
+    /// Observe counts without retaining this executor or its resources.
+    pub fn observer(&self) -> ExecutorObservation {
+        ExecutorObservation::new(&self.counters)
+    }
+
     pub fn new(vocab_size: usize, prefill_latency: Duration, decode_latency: Duration) -> Self {
         let info = ModelInfo {
             model_id: "mock-model".into(),
@@ -50,8 +56,7 @@ impl MockModelExecutor {
             info,
             prefill_latency,
             decode_latency,
-            prefill_count: AtomicU64::new(0),
-            decode_count: AtomicU64::new(0),
+            counters: Arc::default(),
             tokens: TokenState::default(),
         }
     }
@@ -62,16 +67,23 @@ impl MockModelExecutor {
     }
 
     pub fn prefill_count(&self) -> u64 {
-        self.prefill_count.load(Ordering::Relaxed)
+        self.counters.prefill.load(Ordering::Relaxed)
     }
 
     pub fn decode_count(&self) -> u64 {
-        self.decode_count.load(Ordering::Relaxed)
+        self.counters.decode.load(Ordering::Relaxed)
     }
 }
 
 #[async_trait]
 impl ModelExecutor for MockModelExecutor {
+    fn begin_shutdown(
+        self: Arc<Self>,
+        permit: &ferrum_execution::executor_lifecycle::ExecutorShutdownPermit,
+    ) -> ferrum_execution::executor_lifecycle::ExecutorShutdownObserver {
+        crate::host_shutdown::begin(self, permit, |executor| executor.tokens.shutdown())
+    }
+
     async fn admit_tokens(&self, input: ExecutionAdmission<'_>) -> Result<TokenAdmissionOutcome> {
         self.tokens
             .admit(input, self.info.max_sequence_length, self.info.vocab_size)
@@ -102,10 +114,10 @@ impl ModelExecutor for MockModelExecutor {
             for input in work {
                 match input.work() {
                     TokenWork::Prefill(_) => {
-                        self.prefill_count.fetch_add(1, Ordering::Relaxed);
+                        self.counters.prefill.fetch_add(1, Ordering::Relaxed);
                     }
                     TokenWork::Decode { .. } => {
-                        self.decode_count.fetch_add(1, Ordering::Relaxed);
+                        self.counters.decode.fetch_add(1, Ordering::Relaxed);
                     }
                 }
             }
@@ -156,8 +168,8 @@ impl ModelExecutor for MockModelExecutor {
             state: ExecutorState::Ready,
             is_ready: true,
             current_batch_size: 0,
-            prefill_operations: self.prefill_count.load(Ordering::Relaxed),
-            decode_operations: self.decode_count.load(Ordering::Relaxed),
+            prefill_operations: self.counters.prefill.load(Ordering::Relaxed),
+            decode_operations: self.counters.decode.load(Ordering::Relaxed),
             avg_prefill_time_ms: self.prefill_latency.as_millis() as f64,
             avg_decode_time_ms: self.decode_latency.as_millis() as f64,
             memory_usage: ExecutorMemoryUsage {

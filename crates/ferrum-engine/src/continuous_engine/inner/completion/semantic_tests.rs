@@ -7,7 +7,8 @@ async fn envelope_failure(stream: bool) {
     let mut fixture = actual::fixture(false, false).await;
     let handle = fixture
         .engine
-        .inner
+        .active_inner()
+        .expect("engine execution is open")
         .sequences
         .get(&fixture.request_id)
         .unwrap();
@@ -24,7 +25,8 @@ async fn envelope_failure(stream: bool) {
             state.output_semantic.output_session().clone(),
             fixture
                 .engine
-                .inner
+                .active_inner()
+                .expect("engine execution is open")
                 .tokenizer
                 .decode(&state.generated_tokens, true)
                 .unwrap(),
@@ -40,7 +42,8 @@ async fn envelope_failure(stream: bool) {
             .unwrap();
         fixture
             .engine
-            .inner
+            .active_inner()
+            .expect("engine execution is open")
             .send_stream_update(&fixture.request_id, token)
             .await;
         assert!(matches!(
@@ -63,7 +66,8 @@ async fn envelope_failure(stream: bool) {
         let mut state = handle.lock();
         fixture
             .engine
-            .inner
+            .active_inner()
+            .expect("engine execution is open")
             .handoff_request_completion_locked(
                 &handle,
                 &mut state,
@@ -103,14 +107,12 @@ async fn envelope_failure(stream: bool) {
         handoff.rebuild_completed_text(0..text.len() + 1).is_err(),
         "an envelope error cannot hide a corrupt pending range"
     );
-    assert_eq!(
-        fixture.engine.inner.scheduler.metrics().completed_requests,
-        0
-    );
-    assert_eq!(fixture.engine.inner.scheduler.metrics().failed_requests, 1);
+    assert_eq!(fixture.engine.scheduler.metrics().completed_requests, 0);
+    assert_eq!(fixture.engine.scheduler.metrics().failed_requests, 1);
     let done = fixture
         .engine
-        .inner
+        .active_inner()
+        .expect("engine execution is open")
         .schedule_output_completion(&fixture.request_id, handoff)
         .unwrap();
     assert_eq!(
@@ -129,11 +131,18 @@ async fn envelope_failure(stream: bool) {
         .unwrap()
         .unwrap_err();
     assert_eq!(control.to_string(), error.to_string());
-    fixture.engine.inner.output_tasks.join_current().await;
+    fixture
+        .engine
+        .active_inner()
+        .expect("engine execution is open")
+        .output_tasks
+        .join_current()
+        .await;
     assert_eq!(
         fixture
             .engine
-            .inner
+            .active_inner()
+            .expect("engine execution is open")
             .output_tasks
             .take_control_error()
             .unwrap()
@@ -142,7 +151,8 @@ async fn envelope_failure(stream: bool) {
     );
     assert!(fixture
         .engine
-        .inner
+        .active_inner()
+        .expect("engine execution is open")
         .output_tasks
         .take_control_error()
         .is_none());
@@ -186,7 +196,8 @@ async fn exact_reserved_handoff(dual: bool) {
     let mut fixture = actual::fixture(false, false).await;
     let handle = fixture
         .engine
-        .inner
+        .active_inner()
+        .expect("engine execution is open")
         .sequences
         .get(&fixture.request_id)
         .unwrap();
@@ -200,7 +211,8 @@ async fn exact_reserved_handoff(dual: bool) {
             state.output_semantic.output_session().clone(),
             fixture
                 .engine
-                .inner
+                .active_inner()
+                .expect("engine execution is open")
                 .tokenizer
                 .decode(&state.generated_tokens, true)
                 .unwrap(),
@@ -213,7 +225,8 @@ async fn exact_reserved_handoff(dual: bool) {
         .unwrap();
     fixture
         .engine
-        .inner
+        .active_inner()
+        .expect("engine execution is open")
         .send_stream_update(&fixture.request_id, token)
         .await;
     assert!(matches!(
@@ -224,7 +237,8 @@ async fn exact_reserved_handoff(dual: bool) {
         let mut state = handle.lock();
         fixture
             .engine
-            .inner
+            .active_inner()
+            .expect("engine execution is open")
             .handoff_request_completion_locked(
                 &handle,
                 &mut state,
@@ -268,7 +282,8 @@ async fn exact_reserved_handoff(dual: bool) {
     );
     let done = fixture
         .engine
-        .inner
+        .active_inner()
+        .expect("engine execution is open")
         .schedule_output_completion(&fixture.request_id, handoff)
         .unwrap();
     drop(queued);
@@ -277,7 +292,13 @@ async fn exact_reserved_handoff(dual: bool) {
         .unwrap()
         .unwrap()
         .unwrap();
-    fixture.engine.inner.output_tasks.join_current().await;
+    fixture
+        .engine
+        .active_inner()
+        .expect("engine execution is open")
+        .output_tasks
+        .join_current()
+        .await;
     let output = if dual {
         Some(fixture.response.try_recv().unwrap().unwrap())
     } else {
@@ -309,14 +330,12 @@ async fn exact_reserved_handoff(dual: bool) {
     );
     assert!(fixture.stream.recv().await.is_none());
     assert_eq!(fixture.executor.close_call_counts(), (1, 0));
-    assert_eq!(
-        fixture.engine.inner.scheduler.metrics().completed_requests,
-        1
-    );
-    assert_eq!(fixture.engine.inner.scheduler.metrics().failed_requests, 0);
+    assert_eq!(fixture.engine.scheduler.metrics().completed_requests, 1);
+    assert_eq!(fixture.engine.scheduler.metrics().failed_requests, 0);
     assert!(fixture
         .engine
-        .inner
+        .active_inner()
+        .expect("engine execution is open")
         .output_tasks
         .take_control_error()
         .is_none());

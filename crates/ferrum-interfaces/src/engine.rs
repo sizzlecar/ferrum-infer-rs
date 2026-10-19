@@ -20,6 +20,15 @@ pub trait InferenceEngine: Send + Sync {
     /// Shutdown engine gracefully.
     async fn shutdown(&self) -> Result<()>;
 
+    /// Observe completion of the original shutdown, including its execution
+    /// owners and journal producer scopes. This must not start a second close.
+    ///
+    /// Unlike `shutdown`, which may report retained resources immediately,
+    /// this method returns only after cleanup is terminal. An error may still
+    /// report an earlier execution or cleanup failure. Cancelling this wait
+    /// must not cancel the original cleanup or release its custody.
+    async fn wait_for_shutdown_completion(&self) -> Result<()>;
+
     /// Get engine configuration.
     fn config(&self) -> &EngineConfig;
 

@@ -13,6 +13,7 @@ use ferrum_types::{DataType, Device, ModelInfo, ModelType, Result};
 use ferrum_types::{FerrumError, RequestId};
 use parking_lot::Mutex;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tracing::debug;
 
@@ -31,6 +32,7 @@ pub struct StubModelExecutor {
     info: ModelInfo,
     issuer: ExecutorSequenceIssuer,
     sequences: Mutex<HashMap<ExecutorSequence, StubSequence>>,
+    closing: AtomicBool,
 }
 
 impl StubModelExecutor {
@@ -58,6 +60,7 @@ impl StubModelExecutor {
             info,
             issuer: ExecutorSequenceIssuer::new(),
             sequences: Mutex::new(HashMap::new()),
+            closing: AtomicBool::new(false),
         }
     }
 
@@ -96,6 +99,35 @@ impl StubModelExecutor {
 
 #[async_trait]
 impl ModelExecutor for StubModelExecutor {
+    fn begin_shutdown(
+        self: Arc<Self>,
+        permit: &ferrum_execution::executor_lifecycle::ExecutorShutdownPermit,
+    ) -> ferrum_execution::executor_lifecycle::ExecutorShutdownObserver {
+        use ferrum_execution::executor_lifecycle::ExecutorShutdownObserver;
+        if let Err(error) = permit.check(self.as_ref()) {
+            return ExecutorShutdownObserver::retained(Arc::new(self), error);
+        }
+        let result = (|| {
+            let mut sequences = self.sequences.lock();
+            self.closing.store(true, Ordering::Release);
+            let original: Vec<_> = sequences.keys().cloned().collect();
+            for sequence in original {
+                self.issuer.ended(&sequence)?;
+                sequences.remove(&sequence);
+            }
+            Ok::<(), FerrumError>(())
+        })();
+        if let Err(error) = result {
+            return ExecutorShutdownObserver::retained(Arc::new(self), error);
+        }
+        // Every stored incarnation was synchronous host state. Publish only
+        // after its actual table and original executor have been released.
+        let (reporter, observer) = ExecutorShutdownObserver::channel(Arc::new(()));
+        drop(self);
+        reporter.retired(None);
+        observer
+    }
+
     async fn admit_tokens(&self, input: ExecutionAdmission<'_>) -> Result<TokenAdmissionOutcome> {
         input.validate()?;
         if input.adapter.is_some() {
@@ -114,6 +146,9 @@ impl ModelExecutor for StubModelExecutor {
             ));
         }
         let mut sequences = self.sequences.lock();
+        if self.closing.load(Ordering::Acquire) {
+            return Err(FerrumError::request_validation("stub executor is closing"));
+        }
         if sequences
             .values()
             .any(|entry| &entry.request == input.context.request_id)
@@ -140,6 +175,9 @@ impl ModelExecutor for StubModelExecutor {
     async fn execute_tokens(&self, work: &[ExecutionWork<'_>]) -> Result<ExecutionBatchOutcome> {
         let batch = self.issuer.batch(work, self.info.vocab_size)?;
         let mut sequences = self.sequences.lock();
+        if self.closing.load(Ordering::Acquire) {
+            return Err(FerrumError::request_validation("stub executor is closing"));
+        }
         for input in work {
             let entry = sequences
                 .get(input.sequence())
@@ -273,6 +311,40 @@ mod tests {
             panic!("stub synchronous owner must end");
         };
         assert_eq!(ended.sequence(), sequence);
+    }
+
+    #[tokio::test]
+    async fn stub_owned_shutdown_publishes_original_terminals_before_retirement() {
+        use ferrum_execution::executor_lifecycle::{ExecutorOwner, ExecutorShutdownPhase};
+        let owner = ExecutorOwner::new(Box::new(StubModelExecutor::new("close-stub", 16)));
+        let scope = owner.scope().unwrap();
+        let id = RequestId::new();
+        let prompt = [TokenId::new(1), TokenId::new(2)];
+        let TokenAdmissionOutcome::Admitted(frontier) = scope
+            .admit_tokens(ExecutionAdmission {
+                context: ExecutorPrefillAdmission::for_diagnostic(&id, &prompt, 4),
+                adapter: None,
+            })
+            .await
+            .unwrap()
+        else {
+            panic!("stub admission must succeed")
+        };
+        assert!(frontier.sequence().observed_end().is_none());
+        drop(scope);
+        let report = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            owner.begin_shutdown().wait(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(report.phase(), ExecutorShutdownPhase::Retired);
+        report.result().unwrap();
+        assert_eq!(
+            frontier.sequence().observed_end().unwrap().sequence(),
+            frontier.sequence()
+        );
+        assert!(owner.scope().is_err());
     }
 
     #[tokio::test]

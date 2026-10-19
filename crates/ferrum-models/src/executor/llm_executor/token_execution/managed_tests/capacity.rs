@@ -36,6 +36,24 @@ impl CapacityModel {
 }
 
 impl DecoderOnlyLLM for CapacityModel {
+    fn retire_model(&mut self) -> crate::common::ModelRetirementOutcome {
+        use crate::common::ModelRetirementOutcome;
+        match self.storage.lock().retire_model() {
+            ModelRetirementOutcome::Retained { error } => {
+                ModelRetirementOutcome::Retained { error }
+            }
+            ModelRetirementOutcome::Retired { error: first } => {
+                match self.numerical.lock().retire_model() {
+                    ModelRetirementOutcome::Retained { error } => {
+                        ModelRetirementOutcome::Retained { error }
+                    }
+                    ModelRetirementOutcome::Retired { error } => ModelRetirementOutcome::Retired {
+                        error: first.or(error),
+                    },
+                }
+            }
+        }
+    }
     fn config(&self) -> &LlmRuntimeConfig {
         &self.config
     }

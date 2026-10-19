@@ -74,7 +74,7 @@ impl PlanRuntimeBatchDecodeTestExecutor {
 
 type MixedFixture = (
     ContinuousBatchEngine,
-    Arc<PlanRuntimeBatchDecodeTestExecutor>,
+    Arc<PlanRuntimeBatchDecodeObservation>,
     ferrum_interfaces::BatchPlan,
     RequestId,
     RequestId,
@@ -94,12 +94,10 @@ async fn mixed_fixture_with_execution(
     final_prefill: bool,
     execution: Option<ferrum_types::PrefillDecodeExecution>,
 ) -> MixedFixture {
-    let executor = Arc::new(
-        PlanRuntimeBatchDecodeTestExecutor::with_capacity_stage_transition(
-            PlanRuntimeBatchDecodeBehavior::Exact,
-            ExecutorExecutionCapacityStage::StepAdmission,
-            None,
-        ),
+    let executor = PlanRuntimeBatchDecodeTestExecutor::with_capacity_stage_transition(
+        PlanRuntimeBatchDecodeBehavior::Exact,
+        ExecutorExecutionCapacityStage::StepAdmission,
+        None,
     );
     let mut config = plan_runtime_test_config(None);
     if let Some(execution) = execution {
@@ -115,9 +113,17 @@ async fn mixed_fixture_with_execution(
         .await
         .unwrap();
     assert_eq!(first.requests.len(), 1);
-    engine.inner.process_batch(&first).await.unwrap();
+    engine
+        .active_inner()
+        .expect("engine execution is open")
+        .process_batch(&first)
+        .await
+        .unwrap();
     {
-        let sequences = &engine.inner.sequences;
+        let sequences = &engine
+            .active_inner()
+            .expect("engine execution is open")
+            .sequences;
         let decode_handle = sequences.get(&decode_id).unwrap();
         let decode_guard = decode_handle.lock();
         let decode = decode_guard.as_ref().unwrap();
@@ -168,19 +174,34 @@ async fn install_mixed_request(
     let mut sequence = SequenceState::new_with_tokenizer_and_model_vocab_size(
         request.clone(),
         tokens,
-        Some(engine.inner.tokenizer.clone()),
+        Some(
+            engine
+                .active_inner()
+                .expect("engine execution is open")
+                .tokenizer
+                .clone(),
+        ),
         Some(64),
     );
-    sequence.request_slot = Some(RequestSlotLease::open(&engine.inner, request_id.clone()));
-    engine.inner.sequences.insert(request_id.clone(), sequence);
+    sequence.request_slot = Some(RequestSlotLease::open(
+        &engine.active_inner().expect("engine execution is open"),
+        request_id.clone(),
+    ));
+    engine
+        .active_inner()
+        .expect("engine execution is open")
+        .sequences
+        .insert(request_id.clone(), sequence);
     assert!(
         engine
-            .inner
+            .active_inner()
+            .expect("engine execution is open")
             .probe_executor_prefill_admission_for_test(&request)
             .await
     );
     engine
-        .inner
+        .active_inner()
+        .expect("engine execution is open")
         .sequences
         .get(&request_id)
         .unwrap()
@@ -190,7 +211,7 @@ async fn install_mixed_request(
         .request_slot
         .as_mut()
         .unwrap()
-        .admit(&engine.inner);
+        .admit(&engine.active_inner().expect("engine execution is open"));
     scheduler.submit(request).await.unwrap();
     request_id
 }
@@ -200,14 +221,31 @@ async fn close_mixed_requests(engine: &ContinuousBatchEngine, ids: &[&RequestId]
         // Explicit cancellation uses the same product close registry; do not
         // disarm leases or clear a fixture map to manufacture clean teardown.
         engine
-            .inner
+            .active_inner()
+            .expect("engine execution is open")
             .complete_request_for_test(id, FinishReason::Error)
             .await
             .unwrap();
     }
-    engine.inner.execution_closes.join_observers().await;
-    engine.inner.drain_execution_closes().unwrap();
-    assert_eq!(engine.inner.execution_closes.unreclaimed_count(), 0);
+    engine
+        .active_inner()
+        .expect("engine execution is open")
+        .execution_closes
+        .join_observers()
+        .await;
+    engine
+        .active_inner()
+        .expect("engine execution is open")
+        .drain_execution_closes()
+        .unwrap();
+    assert_eq!(
+        engine
+            .active_inner()
+            .expect("engine execution is open")
+            .execution_closes
+            .unreclaimed_count(),
+        0
+    );
 }
 
 #[tokio::test]
@@ -218,8 +256,16 @@ async fn mixed_batch_default_split_does_not_invoke_mixed_executor() {
         engine.config().batching.prefill_decode_execution,
         ferrum_types::PrefillDecodeExecution::Split
     );
-    engine.inner.process_batch(&batch).await.unwrap();
-    let sequences = &engine.inner.sequences;
+    engine
+        .active_inner()
+        .expect("engine execution is open")
+        .process_batch(&batch)
+        .await
+        .unwrap();
+    let sequences = &engine
+        .active_inner()
+        .expect("engine execution is open")
+        .sequences;
     assert_eq!(
         sequences
             .get(&prefill_id)
@@ -253,8 +299,16 @@ async fn mixed_batch_commits_both_phases_and_preserves_nonfinal_prefill() {
     for final_prefill in [false, true] {
         let (engine, executor, batch, prefill_id, decode_id) =
             mixed_fixture(Some(MixedBehavior::Exact), final_prefill).await;
-        engine.inner.process_batch(&batch).await.unwrap();
-        let sequences = &engine.inner.sequences;
+        engine
+            .active_inner()
+            .expect("engine execution is open")
+            .process_batch(&batch)
+            .await
+            .unwrap();
+        let sequences = &engine
+            .active_inner()
+            .expect("engine execution is open")
+            .sequences;
         let prefill_handle = sequences.get(&prefill_id).unwrap();
         let prefill_guard = prefill_handle.lock();
         let prefill = prefill_guard.as_ref().unwrap();
@@ -309,8 +363,16 @@ async fn mixed_batch_commits_both_phases_and_preserves_nonfinal_prefill() {
 async fn mixed_batch_zero_submission_falls_back_once() {
     for behavior in [None, Some(MixedBehavior::NotSubmitted)] {
         let (engine, executor, batch, prefill_id, decode_id) = mixed_fixture(behavior, true).await;
-        engine.inner.process_batch(&batch).await.unwrap();
-        let sequences = &engine.inner.sequences;
+        engine
+            .active_inner()
+            .expect("engine execution is open")
+            .process_batch(&batch)
+            .await
+            .unwrap();
+        let sequences = &engine
+            .active_inner()
+            .expect("engine execution is open")
+            .sequences;
         assert_eq!(
             sequences
                 .get(&prefill_id)
@@ -371,7 +433,8 @@ async fn mixed_batch_zero_submission_preserves_decode_scheduling_interval() {
     for behavior in [None, Some(MixedBehavior::NotSubmitted)] {
         let (engine, executor, batch, prefill_id, decode_id) = mixed_fixture(behavior, true).await;
         assert!(engine
-            .inner
+            .active_inner()
+            .expect("engine execution is open")
             .sequences
             .get(&decode_id)
             .unwrap()
@@ -379,12 +442,18 @@ async fn mixed_batch_zero_submission_preserves_decode_scheduling_interval() {
             .as_ref()
             .unwrap()
             .closes_pending_decode_scheduling());
-        engine.inner.process_batch(&batch).await.unwrap();
+        engine
+            .active_inner()
+            .expect("engine execution is open")
+            .process_batch(&batch)
+            .await
+            .unwrap();
         // A zero-submission mixed attempt is not a decode execution interval.
         // Its successful single-phase fallback records exactly one scheduling,
         // execution and postprocess span, then opens the next scheduling span.
         assert!(engine
-            .inner
+            .active_inner()
+            .expect("engine execution is open")
             .sequences
             .get(&decode_id)
             .unwrap()
@@ -393,7 +462,8 @@ async fn mixed_batch_zero_submission_preserves_decode_scheduling_interval() {
             .unwrap()
             .closes_pending_decode_scheduling());
         let evidence = engine
-            .inner
+            .active_inner()
+            .expect("engine execution is open")
             .sequences
             .get(&decode_id)
             .unwrap()
@@ -434,11 +504,27 @@ async fn mixed_batch_submitted_failure_never_replays() {
         mixed_fixture(Some(MixedBehavior::SubmittedError), true).await;
     let prefill = executor.token_frontier_for_request(&prefill_id).unwrap();
     let decode = executor.token_frontier_for_request(&decode_id).unwrap();
-    engine.inner.process_batch(&batch).await.unwrap();
-    engine.inner.execution_closes.join_observers().await;
-    engine.inner.output_tasks.join_current().await;
+    engine
+        .active_inner()
+        .expect("engine execution is open")
+        .process_batch(&batch)
+        .await
+        .unwrap();
+    engine
+        .active_inner()
+        .expect("engine execution is open")
+        .execution_closes
+        .join_observers()
+        .await;
+    engine
+        .active_inner()
+        .expect("engine execution is open")
+        .output_tasks
+        .join_current()
+        .await;
     let error = engine
-        .inner
+        .active_inner()
+        .expect("engine execution is open")
         .run_iteration()
         .await
         .err()
@@ -446,8 +532,18 @@ async fn mixed_batch_submitted_failure_never_replays() {
     assert!(error
         .to_string()
         .contains("mixed device failure after submission"));
-    assert!(!engine.inner.sequences.get(&prefill_id).is_some());
-    assert!(!engine.inner.sequences.get(&decode_id).is_some());
+    assert!(!engine
+        .active_inner()
+        .expect("engine execution is open")
+        .sequences
+        .get(&prefill_id)
+        .is_some());
+    assert!(!engine
+        .active_inner()
+        .expect("engine execution is open")
+        .sequences
+        .get(&decode_id)
+        .is_some());
     assert!(prefill.sequence().observed_end().is_some());
     assert!(decode.sequence().observed_end().is_some());
     assert!(executor.token_frontier_for_request(&prefill_id).is_none());
@@ -464,24 +560,48 @@ async fn mixed_batch_submitted_failure_terminates_peers_when_first_cleanup_fails
     let decode = executor.token_frontier_for_request(&decode_id).unwrap();
     // Simulate a scheduler/engine terminal-state disagreement for the first
     // participant. Its scheduler completion will fail after engine removal.
-    assert!(engine
-        .inner
-        .scheduler
-        .cancel(prefill_id.clone())
+    assert!(engine.scheduler.cancel(prefill_id.clone()).await.unwrap());
+    engine
+        .active_inner()
+        .expect("engine execution is open")
+        .process_batch(&batch)
         .await
-        .unwrap());
-    engine.inner.process_batch(&batch).await.unwrap();
-    engine.inner.execution_closes.join_observers().await;
-    engine.inner.output_tasks.join_current().await;
-    assert!(engine.inner.run_iteration().await.is_err());
-    assert!(!engine.inner.sequences.get(&prefill_id).is_some());
-    assert!(!engine.inner.sequences.get(&decode_id).is_some());
+        .unwrap();
+    engine
+        .active_inner()
+        .expect("engine execution is open")
+        .execution_closes
+        .join_observers()
+        .await;
+    engine
+        .active_inner()
+        .expect("engine execution is open")
+        .output_tasks
+        .join_current()
+        .await;
+    assert!(engine
+        .active_inner()
+        .expect("engine execution is open")
+        .run_iteration()
+        .await
+        .is_err());
+    assert!(!engine
+        .active_inner()
+        .expect("engine execution is open")
+        .sequences
+        .get(&prefill_id)
+        .is_some());
+    assert!(!engine
+        .active_inner()
+        .expect("engine execution is open")
+        .sequences
+        .get(&decode_id)
+        .is_some());
     assert!(prefill.sequence().observed_end().is_some());
     assert!(decode.sequence().observed_end().is_some());
     assert_eq!(executor.mixed_calls.load(Ordering::Relaxed), 1);
     assert_eq!(executor.batch_decode_calls.load(Ordering::Relaxed), 0);
     assert!(engine
-        .inner
         .scheduler
         .next_batch(ferrum_interfaces::BatchHint::simple(2))
         .await
@@ -495,11 +615,34 @@ async fn mixed_batch_rejects_invalid_phase_without_discarding_valid_peer() {
             mixed_fixture(Some(behavior), true).await;
         let prefill = executor.token_frontier_for_request(&prefill_id).unwrap();
         let decode = executor.token_frontier_for_request(&decode_id).unwrap();
-        engine.inner.process_batch(&batch).await.unwrap();
-        engine.inner.execution_closes.join_observers().await;
-        engine.inner.output_tasks.join_current().await;
-        assert!(engine.inner.run_iteration().await.is_err());
-        let sequences = &engine.inner.sequences;
+        engine
+            .active_inner()
+            .expect("engine execution is open")
+            .process_batch(&batch)
+            .await
+            .unwrap();
+        engine
+            .active_inner()
+            .expect("engine execution is open")
+            .execution_closes
+            .join_observers()
+            .await;
+        engine
+            .active_inner()
+            .expect("engine execution is open")
+            .output_tasks
+            .join_current()
+            .await;
+        assert!(engine
+            .active_inner()
+            .expect("engine execution is open")
+            .run_iteration()
+            .await
+            .is_err());
+        let sequences = &engine
+            .active_inner()
+            .expect("engine execution is open")
+            .sequences;
         let (
             healthy_id,
             healthy_before,

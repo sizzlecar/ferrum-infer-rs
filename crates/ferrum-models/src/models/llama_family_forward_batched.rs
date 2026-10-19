@@ -259,20 +259,16 @@ mod tests {
         unified_graph_capture_skip_reason, DecodeLogitsReturn, LlamaBatchedRuntimeConfig,
         BATCHED_DEVICE_SHADOW_GRAPH_KEY_BIT, UNIFIED_GRAPH_MAX_CACHED_KEYS,
     };
+    use crate::common::DecoderOnlyLLM;
+    use crate::models::llama_family::{LlamaFamilyConfig, LlamaFamilyModel};
+    use crate::test_support::SyntheticLlamaLoader;
     use ferrum_execution::model_executor::{
-        GreedyRepetitionPenalty, LogitsReturnPolicy, TokenSelectionMask,
+        ExecutorSamplingOutput, GreedyRepetitionPenalty, LogitsReturnPolicy, TokenSelectionMask,
     };
+    use ferrum_interfaces::kv_dtype::KvFp16;
+    use ferrum_kernels::backend::MoeLlmBackend;
 
-    fn physical_batch_frame_retains_scratch<B: ferrum_kernels::backend::MoeLlmBackend>(
-        identity: impl Fn(&B::Buffer) -> usize,
-    ) {
-        use super::super::llama_family::device_execution::DeviceFrameResult;
-        use crate::common::DecoderOnlyLLM;
-        use crate::models::llama_family::{LlamaFamilyConfig, LlamaFamilyModel};
-        use crate::test_support::SyntheticLlamaLoader;
-        use ferrum_execution::model_executor::ExecutorSamplingOutput;
-        use ferrum_interfaces::kv_dtype::KvFp16;
-
+    fn physical_batch_model<B: MoeLlmBackend>() -> LlamaFamilyModel<B, KvFp16> {
         let config = LlamaFamilyConfig {
             hidden_size: 128,
             intermediate_size: 256,
@@ -285,23 +281,60 @@ mod tests {
             ..Default::default()
         };
         let loader = SyntheticLlamaLoader::new(config.clone());
-        let mut model = LlamaFamilyModel::<B, KvFp16>::new(config.clone(), &loader).unwrap();
-        let mut reference = LlamaFamilyModel::<B, KvFp16>::new(config, &loader).unwrap();
-        for current in [&mut model, &mut reference] {
-            current.runtime_env.metal_paged_kv = Some(false);
-            current.runtime_env.prefix_cache = false;
-            current.runtime_env.cuda_graph = false;
-            current.runtime_env.kv_capacity = Some(32);
-            current.batched_cfg.batched_graph = false;
-            current.prefill_internal("a", &[1, 2, 3]);
-            current.prefill_internal("b", &[3, 2, 1]);
-        }
+        let mut model = LlamaFamilyModel::<B, KvFp16>::new(config, &loader).unwrap();
+        model.runtime_env.metal_paged_kv = Some(false);
+        model.runtime_env.prefix_cache = false;
+        model.runtime_env.cuda_graph = false;
+        model.runtime_env.kv_capacity = Some(32);
+        model.batched_cfg.batched_graph = false;
+        model.prefill_internal("a", &[1, 2, 3]);
+        model.prefill_internal("b", &[3, 2, 1]);
         assert!(model.supports_batched_decode);
+        model
+    }
+
+    fn physical_batch_full_logits<B: MoeLlmBackend>(
+        model: &mut LlamaFamilyModel<B, KvFp16>,
+        batch: &[(String, u32, u32)],
+    ) -> Vec<Vec<f32>> {
+        let outputs = model
+            .run_device_frame(|model, frame| {
+                model.decode_batch_in_frame(frame, batch, DecodeLogitsReturn::Full)
+            })
+            .into_legacy_result();
+        assert_eq!(outputs.len(), batch.len());
+        outputs
+            .into_iter()
+            .map(|output| match output {
+                ExecutorSamplingOutput::FullLogits(values) => values,
+                _ => panic!("full batch policy must preserve every logit"),
+            })
+            .collect()
+    }
+
+    fn assert_physical_batch_logits(actual: &[f32], expected: &[f32]) {
+        assert_eq!(actual.len(), expected.len());
+        for (index, (actual, expected)) in actual.iter().zip(expected).enumerate() {
+            assert!(actual.is_finite() && expected.is_finite());
+            assert!(
+                (actual - expected).abs() <= 1e-5 * (1.0 + expected.abs()),
+                "logit {index}: actual={actual}, expected={expected}",
+            );
+        }
+    }
+
+    fn physical_batch_frame_retains_scratch<B: MoeLlmBackend>(
+        identity: impl Fn(&B::Buffer) -> usize,
+    ) {
+        use super::super::llama_family::device_execution::DeviceFrameResult;
+
+        let mut model = physical_batch_model::<B>();
+        let mut reference = physical_batch_model::<B>();
         let batch = vec![("a".to_string(), 4, 3), ("b".to_string(), 5, 3)];
-        let expected: Vec<_> = batch
-            .iter()
-            .map(|(id, token, position)| reference.decode_internal(id, *token, *position))
-            .collect();
+        // Match the actual M=2 execution shape and keep this independent owner
+        // alive through the later peer decode. Cross-shape numerical agreement
+        // is a separate mandatory test below, with the original M=1 oracle.
+        let expected = physical_batch_full_logits(&mut reference, &batch);
         let original = identity(model.scratch.residual.as_ref().unwrap());
         let result: DeviceFrameResult<()> = model.run_device_frame(|model, frame| {
             let outputs = model.decode_batch_in_frame(frame, &batch, DecodeLogitsReturn::Full);
@@ -310,11 +343,7 @@ mod tests {
                 let ExecutorSamplingOutput::FullLogits(actual) = output else {
                     panic!("full batch policy must preserve every logit");
                 };
-                assert_eq!(actual.len(), expected.len());
-                for (actual, expected) in actual.iter().zip(expected) {
-                    assert!(actual.is_finite() && expected.is_finite());
-                    assert!((actual - expected).abs() <= 1e-5 * (1.0 + expected.abs()));
-                }
+                assert_physical_batch_logits(&actual, expected);
             }
             assert!(model.scratch.residual.is_none());
             assert_eq!(identity(frame.residual.as_ref().unwrap()), original);
@@ -366,16 +395,18 @@ mod tests {
             assert!(model.kv_caches[id].iter().all(|cache| cache.len == 4));
         }
         model.release("a");
+        reference.release("a");
         let actual_peer = model.decode_internal("b", 6, 4);
         let expected_peer = reference.decode_internal("b", 6, 4);
-        assert_eq!(actual_peer.len(), expected_peer.len());
-        for (actual, expected) in actual_peer.iter().zip(&expected_peer) {
-            assert!(actual.is_finite() && expected.is_finite());
-            assert!((actual - expected).abs() <= 1e-5 * (1.0 + expected.abs()));
-        }
+        assert_physical_batch_logits(&actual_peer, &expected_peer);
         assert!(model.kv_caches["b"].iter().all(|cache| cache.len == 5));
+        assert!(reference.kv_caches["b"].iter().all(|cache| cache.len == 5));
         model.release("b");
+        reference.release("b");
         assert!(model.kv_caches.is_empty());
+        assert!(reference.kv_caches.is_empty());
+        model.close().unwrap();
+        reference.close().unwrap();
     }
 
     #[test]
@@ -405,6 +436,108 @@ mod tests {
             usize::try_from(pointer)
                 .expect("CUDA allocation address must fit the host pointer width")
         });
+    }
+
+    fn physical_batch_and_single_logits<B: MoeLlmBackend>() -> (Vec<Vec<f32>>, Vec<Vec<f32>>) {
+        let mut batched = physical_batch_model::<B>();
+        let mut single = physical_batch_model::<B>();
+        let batch = [("a".to_string(), 4, 3), ("b".to_string(), 5, 3)];
+        let expected = batch
+            .iter()
+            .map(|(id, token, position)| single.decode_internal(id, *token, *position))
+            .collect();
+        let actual = physical_batch_full_logits(&mut batched, &batch);
+        for model in [&mut batched, &mut single] {
+            for id in ["a", "b"] {
+                assert!(model.kv_caches[id].iter().all(|cache| cache.len == 4));
+                model.release(id);
+            }
+            assert!(model.kv_caches.is_empty());
+            model.close().unwrap();
+        }
+        (actual, expected)
+    }
+
+    // Bounded failure context: inspect both complete rows before the unchanged
+    // numerical assertion stops at the first difference. CPU is diagnostic,
+    // not a replacement oracle or a tolerance for a GPU's M=1/M=2 difference.
+    fn log_physical_batch_difference(label: &str, actual: &[Vec<f32>], expected: &[Vec<f32>]) {
+        let argmax = |values: &[f32]| {
+            values
+                .iter()
+                .copied()
+                .enumerate()
+                .filter(|(_, value)| value.is_finite())
+                .max_by(|left, right| left.1.total_cmp(&right.1))
+        };
+        for (row, (actual, expected)) in actual.iter().zip(expected).enumerate() {
+            let mut first = None;
+            let (mut max_abs, mut error_sq, mut expected_sq) = (0.0_f64, 0.0_f64, 0.0_f64);
+            for (index, (&actual, &expected)) in actual.iter().zip(expected).enumerate() {
+                if first.is_none() && actual.to_bits() != expected.to_bits() {
+                    first = Some((index, actual, expected));
+                }
+                let difference = f64::from(actual) - f64::from(expected);
+                max_abs = max_abs.max(difference.abs());
+                error_sq += difference * difference;
+                expected_sq += f64::from(expected).powi(2);
+            }
+            let relative_l2 = if error_sq == 0.0 {
+                0.0
+            } else {
+                (error_sq / expected_sq).sqrt()
+            };
+            eprintln!(
+                "{label} row={row} lengths={}/{} first={first:?} max_abs={max_abs:.9e} relative_l2={relative_l2:.9e} argmax={:?}/{:?}",
+                actual.len(), expected.len(), argmax(actual), argmax(expected),
+            );
+        }
+    }
+
+    fn physical_batch_matches_single_item<B: MoeLlmBackend>() {
+        let (actual, expected) = physical_batch_and_single_logits::<B>();
+        assert_eq!(actual.len(), 2);
+        assert_eq!(expected.len(), 2);
+        if actual.iter().zip(&expected).any(|(actual, expected)| {
+            actual.len() != expected.len()
+                || actual.iter().zip(expected).any(|(actual, expected)| {
+                    !actual.is_finite()
+                        || !expected.is_finite()
+                        || (actual - expected).abs() > 1e-5 * (1.0 + expected.abs())
+                })
+        }) {
+            eprintln!(
+                "physical_batch_logits backend={}",
+                std::any::type_name::<B>()
+            );
+            log_physical_batch_difference("M2/M1", &actual, &expected);
+            let (cpu_batch, cpu_single) =
+                physical_batch_and_single_logits::<ferrum_kernels::backend::cpu::CpuBackend>();
+            log_physical_batch_difference("M2/CPU_M2", &actual, &cpu_batch);
+            log_physical_batch_difference("M1/CPU_M1", &expected, &cpu_single);
+        }
+        for (actual, expected) in actual.iter().zip(&expected) {
+            assert_physical_batch_logits(actual, expected);
+        }
+    }
+
+    #[test]
+    fn physical_batch_logits_match_single_item_decode_on_cpu() {
+        physical_batch_matches_single_item::<ferrum_kernels::backend::cpu::CpuBackend>();
+    }
+
+    #[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
+    #[test]
+    #[ignore = "requires an actual Metal device"]
+    fn physical_batch_logits_match_single_item_decode_on_metal() {
+        physical_batch_matches_single_item::<ferrum_kernels::backend::metal::MetalBackend>();
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "requires an actual CUDA device"]
+    fn physical_batch_logits_match_single_item_decode_on_cuda() {
+        physical_batch_matches_single_item::<ferrum_kernels::backend::cuda::CudaBackend>();
     }
 
     fn selection_failure_readback_observes_pending_work<

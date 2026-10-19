@@ -21,11 +21,11 @@ fn make_engine_with_latency(prefill_ms: u64, decode_ms: u64) -> ContinuousBatchE
     let tokenizer = Arc::new(MockTokenizer::new(VOCAB_SIZE));
     let sampler = Arc::new(MockSampler);
     let kv_cache = Arc::new(MockKvCacheManager::new(4096));
-    let executor = Arc::new(MockModelExecutor::new(
+    let executor = MockModelExecutor::new(
         VOCAB_SIZE,
         Duration::from_millis(prefill_ms),
         Duration::from_millis(decode_ms),
-    ));
+    );
     let tensor_factory = Arc::new(MockTensorFactory);
 
     ContinuousBatchEngine::new(
@@ -34,7 +34,7 @@ fn make_engine_with_latency(prefill_ms: u64, decode_ms: u64) -> ContinuousBatchE
         tokenizer,
         sampler,
         kv_cache,
-        executor,
+        ferrum_execution::executor_lifecycle::ExecutorOwner::new(Box::new(executor)),
         tensor_factory,
     )
     .expect("legacy engine composition must match executor authority")
@@ -199,7 +199,7 @@ async fn throughput_scaling() {
         let tokenizer = Arc::new(MockTokenizer::new(VOCAB_SIZE));
         let sampler = Arc::new(MockSampler);
         let kv_cache = Arc::new(MockKvCacheManager::new(4096));
-        let executor = Arc::new(MockModelExecutor::instant(VOCAB_SIZE));
+        let executor = MockModelExecutor::instant(VOCAB_SIZE);
         let tensor_factory = Arc::new(MockTensorFactory);
         ContinuousBatchEngine::new(
             config,
@@ -207,7 +207,7 @@ async fn throughput_scaling() {
             tokenizer,
             sampler,
             kv_cache,
-            executor,
+            ferrum_execution::executor_lifecycle::ExecutorOwner::new(Box::new(executor)),
             tensor_factory,
         )
         .expect("legacy engine composition must match executor authority")

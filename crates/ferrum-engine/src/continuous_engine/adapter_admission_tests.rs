@@ -44,25 +44,71 @@ impl Tokenizer for CountingTokenizer {
 
 // This probe tests admission and metadata transport, not adapter arithmetic.
 struct AdapterCapableExecutor {
-    inner: MockModelExecutor,
+    inner: ExecutorScope,
+    owner: ExecutorOwner,
     support: AdapterExecutionSupport,
+    observation: Arc<AdapterObservation>,
+}
+
+struct AdapterObservation {
+    inner: ferrum_testkit::ExecutorObservation,
     selections: Mutex<Vec<Option<(String, String)>>>,
     admitted: Mutex<Vec<ExecutorSequence>>,
 }
 
 impl AdapterCapableExecutor {
     fn new(support: AdapterExecutionSupport) -> Self {
-        Self {
-            inner: MockModelExecutor::instant(128),
-            support,
+        let inner = MockModelExecutor::instant(128);
+        let observation = Arc::new(AdapterObservation {
+            inner: inner.observer(),
             selections: Mutex::new(Vec::new()),
             admitted: Mutex::new(Vec::new()),
+        });
+        let owner = ExecutorOwner::new(Box::new(inner));
+        Self {
+            inner: owner.scope().unwrap(),
+            owner,
+            support,
+            observation,
         }
+    }
+    fn observer(&self) -> Arc<AdapterObservation> {
+        Arc::clone(&self.observation)
+    }
+}
+
+impl std::ops::Deref for AdapterCapableExecutor {
+    type Target = AdapterObservation;
+    fn deref(&self) -> &Self::Target {
+        &self.observation
     }
 }
 
 #[async_trait::async_trait]
 impl ModelExecutor for AdapterCapableExecutor {
+    fn begin_shutdown(
+        self: Arc<Self>,
+        permit: &ferrum_execution::ExecutorShutdownPermit,
+    ) -> ferrum_execution::ExecutorShutdownObserver {
+        if let Err(error) = permit.check(self.as_ref()) {
+            return ferrum_execution::ExecutorShutdownObserver::retained(Arc::new(self), error);
+        }
+        match Arc::try_unwrap(self) {
+            Ok(Self {
+                inner,
+                owner,
+                observation,
+                ..
+            }) => {
+                drop((inner, observation));
+                owner.begin_shutdown()
+            }
+            Err(original) => ferrum_execution::ExecutorShutdownObserver::retained(
+                Arc::new(original),
+                FerrumError::internal("adapter fixture has an unscoped owner"),
+            ),
+        }
+    }
     fn info(&self) -> &ferrum_types::ModelInfo {
         self.inner.info()
     }
@@ -133,7 +179,7 @@ impl ModelExecutor for AdapterCapableExecutor {
 }
 
 fn engine_with_executor(
-    executor: Arc<dyn ModelExecutor + Send + Sync>,
+    executor: Box<dyn ModelExecutor + Send + Sync>,
 ) -> (
     ContinuousBatchEngine,
     Arc<CountingTokenizer>,
@@ -146,7 +192,9 @@ fn engine_with_executor(
         encodes: AtomicU64::new(0),
     });
     let kv = Arc::new(MockKvCacheManager::new(256));
-    let engine = match executor.execution_resource_authority() {
+    let authority = executor.execution_resource_authority();
+    let executor = ExecutorOwner::new(executor);
+    let engine = match authority {
         ExecutionResourceAuthority::LegacyEngine => ContinuousBatchEngine::new(
             config,
             scheduler,
@@ -209,31 +257,62 @@ fn assert_no_admission(
     request_id: &RequestId,
 ) {
     assert_eq!(tokenizer.encodes.load(Ordering::Relaxed), 0);
-    assert!(engine.inner.sequences.is_empty());
-    assert_eq!(engine.inner.scheduler.waiting_count(), 0);
-    assert_eq!(engine.inner.scheduler.prefilling_count(), 0);
-    assert_eq!(engine.inner.scheduler.decoding_count(), 0);
-    assert_eq!(engine.inner.scheduler.trace_phase(request_id), None);
+    assert!(engine
+        .active_inner()
+        .expect("engine execution is open")
+        .sequences
+        .is_empty());
+    assert_eq!(engine.scheduler.waiting_count(), 0);
+    assert_eq!(engine.scheduler.prefilling_count(), 0);
+    assert_eq!(engine.scheduler.decoding_count(), 0);
+    assert_eq!(engine.scheduler.trace_phase(request_id), None);
     assert_eq!(kv.stats().allocation_count, 0);
     assert_eq!(kv.active_count(), 0);
-    assert_eq!(engine.inner.model_executor.status().prefill_operations, 0);
-    assert_eq!(engine.inner.model_executor.status().decode_operations, 0);
     assert_eq!(
         engine
-            .inner
+            .active_inner()
+            .expect("engine execution is open")
+            .model_executor
+            .status()
+            .prefill_operations,
+        0
+    );
+    assert_eq!(
+        engine
+            .active_inner()
+            .expect("engine execution is open")
+            .model_executor
+            .status()
+            .decode_operations,
+        0
+    );
+    assert_eq!(
+        engine
+            .active_inner()
+            .expect("engine execution is open")
             .resource_trace_event_counter
             .load(Ordering::Relaxed),
         0
     );
     assert_eq!(engine.driver.start_count(), 0);
-    assert_eq!(engine.inner.iteration_count.load(Ordering::Acquire), 0);
+    assert_eq!(
+        engine
+            .active_inner()
+            .expect("engine execution is open")
+            .iteration_count
+            .load(Ordering::Acquire),
+        0
+    );
 }
 
 #[tokio::test]
 async fn unsupported_adapter_requests_are_rejected_before_admission() {
-    let native = Arc::new(PlanRuntimeAdmissionTestExecutor::new(128));
-    let executors: [Arc<dyn ModelExecutor + Send + Sync>; 2] =
-        [Arc::new(MockModelExecutor::instant(128)), native.clone()];
+    let implementation = PlanRuntimeAdmissionTestExecutor::new(128);
+    let native = implementation.observer();
+    let executors: [Box<dyn ModelExecutor + Send + Sync>; 2] = [
+        Box::new(MockModelExecutor::instant(128)),
+        Box::new(implementation),
+    ];
     for executor in executors {
         let (engine, tokenizer, kv) = engine_with_executor(executor);
         assert_eq!(
@@ -256,11 +335,12 @@ async fn unsupported_adapter_requests_are_rejected_before_admission() {
 
 #[tokio::test]
 async fn malformed_adapter_requests_never_reach_tokenization() {
-    let capable = Arc::new(AdapterCapableExecutor::new(
-        AdapterExecutionSupport::PerSequenceLora,
-    ));
-    let executors: [Arc<dyn ModelExecutor + Send + Sync>; 2] =
-        [Arc::new(MockModelExecutor::instant(128)), capable.clone()];
+    let implementation = AdapterCapableExecutor::new(AdapterExecutionSupport::PerSequenceLora);
+    let capable = implementation.observer();
+    let executors: [Box<dyn ModelExecutor + Send + Sync>; 2] = [
+        Box::new(MockModelExecutor::instant(128)),
+        Box::new(implementation),
+    ];
     for executor in executors {
         let (engine, tokenizer, kv) = engine_with_executor(executor);
         for metadata in [
@@ -316,10 +396,9 @@ async fn execute_one_token(
 
 #[tokio::test]
 async fn adapter_support_is_forwarded_and_base_requests_still_execute() {
-    let capable = Arc::new(AdapterCapableExecutor::new(
-        AdapterExecutionSupport::PerSequenceLora,
-    ));
-    let (engine, _, _) = engine_with_executor(capable.clone());
+    let implementation = AdapterCapableExecutor::new(AdapterExecutionSupport::PerSequenceLora);
+    let capable = implementation.observer();
+    let (engine, _, _) = engine_with_executor(Box::new(implementation));
     let public: &dyn LlmInferenceEngine = &engine;
     assert_eq!(
         public.adapter_execution_support(),
@@ -345,10 +424,9 @@ async fn adapter_support_is_forwarded_and_base_requests_still_execute() {
         .all(|sequence| sequence.observed_end().is_some()));
     engine.shutdown().await.unwrap();
 
-    let executor = Arc::new(AdapterCapableExecutor::new(
-        AdapterExecutionSupport::Unsupported,
-    ));
-    let (base, _, _) = engine_with_executor(executor.clone());
+    let implementation = AdapterCapableExecutor::new(AdapterExecutionSupport::Unsupported);
+    let executor = implementation.observer();
+    let (base, _, _) = engine_with_executor(Box::new(implementation));
     for streaming in [false, true] {
         execute_one_token(&base, policy_request(), streaming).await;
     }

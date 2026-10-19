@@ -9,9 +9,49 @@ use ferrum_execution::token_execution::{
 };
 
 struct TokenCapacityExecutor {
-    source: Arc<PlanRuntimeBatchDecodeTestExecutor>,
+    source: PlanRuntimeBatchDecodeTestExecutor,
     issuer: ExecutorSequenceIssuer,
-    live: Mutex<HashMap<ExecutorSequence, ExecutionFrontier>>,
+    live: Arc<Mutex<HashMap<ExecutorSequence, ExecutionFrontier>>>,
+}
+
+struct TokenCapacityObservation {
+    source: Arc<PlanRuntimeBatchDecodeObservation>,
+    live: std::sync::Weak<Mutex<HashMap<ExecutorSequence, ExecutionFrontier>>>,
+}
+
+impl TokenCapacityObservation {
+    fn contains(&self, sequence: &ExecutorSequence) -> bool {
+        self.live
+            .upgrade()
+            .is_some_and(|live| live.lock().contains_key(sequence))
+    }
+}
+
+impl ObservedTestExecutor for TokenCapacityExecutor {
+    type Observation = TokenCapacityObservation;
+
+    fn observer(&self) -> Arc<Self::Observation> {
+        Arc::new(TokenCapacityObservation {
+            source: self.source.observer(),
+            live: Arc::downgrade(&self.live),
+        })
+    }
+
+    fn retire_fixture(&mut self) -> Result<()> {
+        let sequences = self.live.lock().keys().cloned().collect::<Vec<_>>();
+        for sequence in sequences {
+            let outcome = self.close(&sequence)?;
+            if let Some(error) = outcome.error {
+                return Err(error);
+            }
+            if sequence.observed_end().is_none() {
+                return Err(FerrumError::internal(
+                    "capacity fixture retained an unproved incarnation",
+                ));
+            }
+        }
+        self.source.retire_fixture()
+    }
 }
 
 impl TokenCapacityExecutor {
@@ -34,6 +74,12 @@ impl TokenCapacityExecutor {
 
 #[async_trait::async_trait]
 impl ModelExecutor for TokenCapacityExecutor {
+    fn begin_shutdown(
+        self: Arc<Self>,
+        permit: &ferrum_execution::executor_lifecycle::ExecutorShutdownPermit,
+    ) -> ferrum_execution::executor_lifecycle::ExecutorShutdownObserver {
+        begin_controlled_shutdown(self, permit)
+    }
     fn info(&self) -> &ferrum_types::ModelInfo {
         self.source.info()
     }
@@ -173,18 +219,16 @@ fn fixture(
 ) -> (
     ContinuousBatchEngine,
     Arc<ContinuousBatchScheduler>,
-    Arc<TokenCapacityExecutor>,
+    Arc<TokenCapacityObservation>,
 ) {
-    let source = Arc::new(
-        PlanRuntimeBatchDecodeTestExecutor::with_capacity_stage_transition(
-            behavior, stage, next_stage,
-        ),
+    let source = PlanRuntimeBatchDecodeTestExecutor::with_capacity_stage_transition(
+        behavior, stage, next_stage,
     );
-    let executor = Arc::new(TokenCapacityExecutor {
+    let executor = TokenCapacityExecutor {
         source,
         issuer: ExecutorSequenceIssuer::new(),
-        live: Mutex::new(HashMap::new()),
-    });
+        live: Arc::new(Mutex::new(HashMap::new())),
+    };
     let (engine, scheduler, executor, _) = plan_runtime_test_engine(
         plan_runtime_test_config(None),
         executor,
@@ -196,7 +240,7 @@ fn fixture(
 async fn install_decode_cohort(
     engine: &ContinuousBatchEngine,
     scheduler: &ContinuousBatchScheduler,
-    executor: &TokenCapacityExecutor,
+    executor: &TokenCapacityObservation,
 ) -> Vec<RequestId> {
     let mut ids = Vec::new();
     for _ in 0..8 {
@@ -206,7 +250,10 @@ async fn install_decode_cohort(
             .metadata
             .insert(PROMPT_TOKENS_METADATA_KEY.into(), serde_json::json!(1));
         let tokens = vec![TokenId(5)];
-        let admitted = executor
+        let admitted = engine
+            .active_inner()
+            .expect("engine execution is open")
+            .model_executor
             .admit_tokens(ExecutionAdmission {
                 context: ExecutorPrefillAdmission::for_product_request(
                     &request.id,
@@ -226,11 +273,21 @@ async fn install_decode_cohort(
         let mut state = SequenceState::new_with_tokenizer_and_model_vocab_size(
             request.clone(),
             tokens,
-            Some(engine.inner.tokenizer.clone()),
+            Some(
+                engine
+                    .active_inner()
+                    .expect("engine execution is open")
+                    .tokenizer
+                    .clone(),
+            ),
             Some(64),
         );
         state.execution_frontier = Some(frontier);
-        engine.inner.sequences.insert(request.id.clone(), state);
+        engine
+            .active_inner()
+            .expect("engine execution is open")
+            .sequences
+            .insert(request.id.clone(), state);
         scheduler.submit(request.clone()).await.unwrap();
         ids.push(request.id);
     }
@@ -239,9 +296,17 @@ async fn install_decode_cohort(
         .await
         .unwrap();
     assert_eq!(batch.requests.len(), ids.len());
-    engine.inner.process_batch(&batch).await.unwrap();
+    engine
+        .active_inner()
+        .expect("engine execution is open")
+        .process_batch(&batch)
+        .await
+        .unwrap();
     for id in &ids {
-        let sequences = &engine.inner.sequences;
+        let sequences = &engine
+            .active_inner()
+            .expect("engine execution is open")
+            .sequences;
         let state_handle = sequences.get(id).unwrap();
         let state_guard = state_handle.lock();
         let state = state_guard.as_ref().unwrap();
@@ -261,7 +326,6 @@ async fn install_decode_cohort(
 
 async fn run_decode_width(engine: &ContinuousBatchEngine, width: usize) {
     let batch = engine
-        .inner
         .scheduler
         .next_batch(ferrum_interfaces::BatchHint::simple(width))
         .await
@@ -269,7 +333,8 @@ async fn run_decode_width(engine: &ContinuousBatchEngine, width: usize) {
     assert_eq!(batch.requests.len(), width);
     assert!(batch.requests.iter().all(|request| {
         engine
-            .inner
+            .active_inner()
+            .expect("engine execution is open")
             .sequences
             .get(&request.request.id)
             .unwrap()
@@ -278,16 +343,24 @@ async fn run_decode_width(engine: &ContinuousBatchEngine, width: usize) {
             .unwrap()
             .prefill_complete
     }));
-    engine.inner.process_batch(&batch).await.unwrap();
+    engine
+        .active_inner()
+        .expect("engine execution is open")
+        .process_batch(&batch)
+        .await
+        .unwrap();
 }
 
 async fn close_auxiliary_incarnation(
     engine: &ContinuousBatchEngine,
-    executor: &TokenCapacityExecutor,
+    executor: &TokenCapacityObservation,
 ) {
     let request = policy_request();
     let tokens = [TokenId(5)];
-    let admitted = executor
+    let admitted = engine
+        .active_inner()
+        .expect("engine execution is open")
+        .model_executor
         .admit_tokens(ExecutionAdmission {
             context: ExecutorPrefillAdmission::for_product_request(&request.id, &tokens, 64, 1, 0)
                 .unwrap(),
@@ -298,24 +371,12 @@ async fn close_auxiliary_incarnation(
     let TokenAdmissionOutcome::Admitted(frontier) = admitted else {
         unreachable!()
     };
-    engine
-        .inner
-        .scheduler
-        .submit(request.clone())
-        .await
-        .unwrap();
-    assert!(engine
-        .inner
-        .scheduler
-        .cancel_request(request.id.clone())
-        .unwrap());
-    let before = engine
-        .inner
-        .scheduler
-        .trace_snapshot()
-        .capacity_release_epoch;
+    engine.scheduler.submit(request.clone()).await.unwrap();
+    assert!(engine.scheduler.cancel_request(request.id.clone()).unwrap());
+    let before = engine.scheduler.trace_snapshot().capacity_release_epoch;
     let ticket = engine
-        .inner
+        .active_inner()
+        .expect("engine execution is open")
         .begin_execution_close(
             request.id,
             frontier.sequence().clone(),
@@ -324,16 +385,21 @@ async fn close_auxiliary_incarnation(
         )
         .unwrap();
     ticket.initial_result().await.unwrap();
-    engine.inner.execution_closes.join_observers().await;
-    engine.inner.drain_execution_closes().unwrap();
+    engine
+        .active_inner()
+        .expect("engine execution is open")
+        .execution_closes
+        .join_observers()
+        .await;
+    engine
+        .active_inner()
+        .expect("engine execution is open")
+        .drain_execution_closes()
+        .unwrap();
     assert!(frontier.sequence().observed_end().is_some());
-    assert!(!executor.live.lock().contains_key(frontier.sequence()));
+    assert!(!executor.contains(frontier.sequence()));
     assert_eq!(
-        engine
-            .inner
-            .scheduler
-            .trace_snapshot()
-            .capacity_release_epoch,
+        engine.scheduler.trace_snapshot().capacity_release_epoch,
         before + 1
     );
 }
@@ -383,7 +449,10 @@ async fn token_capacity_sequence_extension_pressure_does_not_cap_survivors_durin
     assert_eq!(pressure.waiting_queue_len, 1);
     assert_eq!(pressure.decode_queue_len, ids.len() - 1);
     let mut availability = Vec::new();
-    let epochs = executor
+    let epochs = engine
+        .active_inner()
+        .expect("engine execution is open")
+        .model_executor
         .write_execution_capacity_snapshot(&mut availability)
         .unwrap()
         .unwrap();
@@ -407,7 +476,8 @@ async fn token_capacity_sequence_extension_pressure_does_not_cap_survivors_durin
     assert_eq!(survivors.requests.len(), ids.len() - 1);
     assert!(survivors.requests.iter().all(|scheduled| {
         engine
-            .inner
+            .active_inner()
+            .expect("engine execution is open")
             .sequences
             .get(&scheduled.request.id)
             .unwrap()

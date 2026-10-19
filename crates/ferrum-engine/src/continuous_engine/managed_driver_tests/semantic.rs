@@ -4,7 +4,7 @@ use super::*;
 #[tokio::test]
 async fn semantic_output_owner_outlives_completed_engine_until_last_clone_drop() {
     let mut fixture = fixture::Fixture::new();
-    let budget = fixture.engine.inner.output_budget.clone();
+    let budget = fixture.engine.active_inner().unwrap().output_budget.clone();
     let mut request = fixture.request();
     request.evidence_request.capture_prompt_token_ids = true;
     let request_id = request.id.clone();
@@ -16,7 +16,8 @@ async fn semantic_output_owner_outlives_completed_engine_until_last_clone_drop()
         .unwrap();
     let prompt = fixture
         .engine
-        .inner
+        .active_inner()
+        .unwrap()
         .sequences
         .get(&request_id)
         .unwrap()
@@ -41,7 +42,13 @@ async fn semantic_output_owner_outlives_completed_engine_until_last_clone_drop()
     );
     assert_eq!(evidence.output_token_ids, output.response().tokens);
     let cost = semantic_cost(output.response()).unwrap();
-    fixture.engine.inner.output_tasks.join_current().await;
+    fixture
+        .engine
+        .active_inner()
+        .unwrap()
+        .output_tasks
+        .join_current()
+        .await;
     fixture.engine.shutdown().await.unwrap();
     assert_eq!(fixture.executor.checked_outputs.load(Ordering::SeqCst), 4);
     assert_eq!(fixture.executor.closes.load(Ordering::SeqCst), 1);
@@ -49,7 +56,7 @@ async fn semantic_output_owner_outlives_completed_engine_until_last_clone_drop()
     assert_eq!(budget.usage().semantic_bytes, cost);
     assert_eq!(budget.usage().sessions, 1);
     let clone = output.clone();
-    let inner = Arc::downgrade(&fixture.engine.inner);
+    let inner = fixture.original_inner.clone();
     drop(output);
     drop(fixture.engine);
     assert!(inner.upgrade().is_none());
@@ -76,7 +83,8 @@ async fn semantic_quota_failure_keeps_real_progress_and_healthy_peer_without_rep
         .unwrap();
     let session = fixture
         .engine
-        .inner
+        .active_inner()
+        .unwrap()
         .sequences
         .get(&id)
         .unwrap()
@@ -107,9 +115,26 @@ async fn semantic_quota_failure_keeps_real_progress_and_healthy_peer_without_rep
     ));
     let healthy = healthy.unwrap();
     assert_eq!(healthy.response().tokens.len(), 4);
-    fixture.engine.inner.execution_closes.join_observers().await;
-    fixture.engine.inner.output_tasks.join_current().await;
-    fixture.engine.inner.drain_execution_closes().unwrap();
+    fixture
+        .engine
+        .active_inner()
+        .unwrap()
+        .execution_closes
+        .join_observers()
+        .await;
+    fixture
+        .engine
+        .active_inner()
+        .unwrap()
+        .output_tasks
+        .join_current()
+        .await;
+    fixture
+        .engine
+        .active_inner()
+        .unwrap()
+        .drain_execution_closes()
+        .unwrap();
     assert_eq!(
         fixture.executor.checked_outputs.load(Ordering::SeqCst),
         5,
@@ -117,11 +142,11 @@ async fn semantic_quota_failure_keeps_real_progress_and_healthy_peer_without_rep
     );
     assert_eq!(fixture.executor.closes.load(Ordering::SeqCst), 2);
     assert!(fixture.executor.observed.lock().model.kv_caches.is_empty());
-    assert!(fixture.engine.inner.sequences.is_empty());
+    assert!(fixture.engine.active_inner().unwrap().sequences.is_empty());
     drop(held);
     drop(session);
     drop(healthy);
     fixture.engine.shutdown().await.unwrap();
-    assert_eq!(fixture.engine.inner.output_budget.usage().semantic_bytes, 0);
-    assert_eq!(fixture.engine.inner.output_budget.usage().sessions, 0);
+    assert_eq!(fixture.output_budget.usage().semantic_bytes, 0);
+    assert_eq!(fixture.output_budget.usage().sessions, 0);
 }

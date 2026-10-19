@@ -35,6 +35,9 @@ struct ObservedModel {
 }
 
 impl DecoderOnlyLLM for ObservedModel {
+    fn retire_model(&mut self) -> crate::common::ModelRetirementOutcome {
+        self.state.lock().model.retire_model()
+    }
     fn config(&self) -> &LlmRuntimeConfig {
         &self.config
     }
@@ -285,7 +288,7 @@ fn direct_tokens_real_llama_default_batch_preserves_optional_products() {
     let expected = reference.prefill("reference", &[3]);
     let policy = LogitsReturnPolicy::FullLogits;
     let prompt: Arc<[u32]> = Arc::from([1, 2, 3]);
-    let mut actual = executor.lock_model();
+    let mut actual = executor.lock_model().unwrap();
     assert!(matches!(
         actual
             .prepare_token_kv(ModelKvPreparation {

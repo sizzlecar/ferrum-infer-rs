@@ -392,22 +392,43 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
     /// retirement keeps the model intact for recovery; a successful retirement
     /// makes the instance permanently unavailable for further execution.
     pub fn close(&mut self) -> Result<()> {
+        match self.retire_original_model() {
+            crate::common::llm::ModelRetirementOutcome::Retired { error } => {
+                error.map_or(Ok(()), Err)
+            }
+            crate::common::llm::ModelRetirementOutcome::Retained { error } => Err(error),
+        }
+    }
+
+    pub(super) fn retire_original_model(&mut self) -> crate::common::llm::ModelRetirementOutcome {
         use crate::common::llm::ModelExecutionRecovery;
+        use crate::common::llm::ModelRetirementOutcome;
         let prior_error = match self.recover_token_frame() {
-            ModelExecutionRecovery::Held { error } => return Err(error),
+            ModelExecutionRecovery::Held { error } => {
+                return ModelRetirementOutcome::Retained { error }
+            }
             ModelExecutionRecovery::Quiescent { error } => error,
         };
         let Some(context) = self.execution_context.as_mut() else {
-            return prior_error.map_or(Ok(()), Err);
+            return ModelRetirementOutcome::Retired { error: prior_error };
         };
         let retirement =
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| B::retire_context(context)))
                 .map_err(panic_error)
                 .and_then(|result| result);
-        retirement?;
+        if let Err(error) = retirement {
+            let error = if let Some(operation_error) = prior_error {
+                tracing::error!(%operation_error, cleanup_error = %error,
+                    "model execution and checked context retirement both failed");
+                operation_error
+            } else {
+                error
+            };
+            return ModelRetirementOutcome::Retained { error };
+        }
         // Graphs have retired before any captured model buffers can be freed.
         self.execution_context = None;
-        prior_error.map_or(Ok(()), Err)
+        ModelRetirementOutcome::Retired { error: prior_error }
     }
 
     pub(super) fn truncate_token_cache(&mut self, cache_id: &str, new_len: usize) {

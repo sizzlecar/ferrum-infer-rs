@@ -25,7 +25,8 @@ async fn output_slow_stream_pauses_only_its_request_and_shutdown_joins_delivery(
     assert_eq!(healthy.response().tokens.len(), 4);
     drop(healthy);
     {
-        let sequences = &fixture.engine.inner.sequences;
+        let original = fixture.engine.active_inner().unwrap();
+        let sequences = &original.sequences;
         let slow_handle = sequences
             .get(&slow_id)
             .expect("backpressure retains exact request");
@@ -52,8 +53,8 @@ async fn output_slow_stream_pauses_only_its_request_and_shutdown_joins_delivery(
         .unwrap();
     assert_eq!(fixture.executor.closes.load(Ordering::SeqCst), 2);
     assert!(fixture.executor.observed.lock().model.kv_caches.is_empty());
-    assert_eq!(fixture.engine.inner.execution_closes.unreclaimed_count(), 0);
-    assert_eq!(fixture.engine.inner.output_budget.usage().sessions, 1);
+    assert!(fixture.original_inner.upgrade().is_none());
+    assert_eq!(fixture.output_budget.usage().sessions, 1);
     let chunks = stream.collect::<Vec<_>>().await;
     assert_eq!(
         chunks.iter().filter(|item| item.is_err()).count(),
@@ -69,8 +70,8 @@ async fn output_slow_stream_pauses_only_its_request_and_shutdown_joins_delivery(
         "shutdown cannot turn interrupted delivery into successful DONE"
     );
     drop(chunks);
-    assert_eq!(fixture.engine.inner.output_budget.usage().sessions, 0);
-    assert_eq!(fixture.engine.inner.output_budget.usage().queued_bytes, 0);
+    assert_eq!(fixture.output_budget.usage().sessions, 0);
+    assert_eq!(fixture.output_budget.usage().queued_bytes, 0);
 }
 
 #[tokio::test]
@@ -97,20 +98,54 @@ async fn output_completed_unread_streams_retain_session_admission_until_drop() {
     tokio::time::timeout(Duration::from_secs(3), fixture.executor.wait_for_closes(1))
         .await
         .unwrap();
-    fixture.engine.inner.execution_closes.join_observers().await;
-    fixture.engine.inner.output_tasks.join_current().await;
-    fixture.engine.inner.drain_execution_closes().unwrap();
-    assert!(fixture.engine.inner.sequences.is_empty());
-    assert_eq!(fixture.engine.inner.output_budget.usage().sessions, 1);
+    fixture
+        .engine
+        .active_inner()
+        .unwrap()
+        .execution_closes
+        .join_observers()
+        .await;
+    fixture
+        .engine
+        .active_inner()
+        .unwrap()
+        .output_tasks
+        .join_current()
+        .await;
+    fixture
+        .engine
+        .active_inner()
+        .unwrap()
+        .drain_execution_closes()
+        .unwrap();
+    assert!(fixture.engine.active_inner().unwrap().sequences.is_empty());
+    assert_eq!(fixture.output_budget.usage().sessions, 1);
 
     let second = fixture.engine.infer_stream(second_request).await.unwrap();
     tokio::time::timeout(Duration::from_secs(3), fixture.executor.wait_for_closes(2))
         .await
         .unwrap();
-    fixture.engine.inner.execution_closes.join_observers().await;
-    fixture.engine.inner.output_tasks.join_current().await;
-    fixture.engine.inner.drain_execution_closes().unwrap();
-    assert_eq!(fixture.engine.inner.output_budget.usage().sessions, 2);
+    fixture
+        .engine
+        .active_inner()
+        .unwrap()
+        .execution_closes
+        .join_observers()
+        .await;
+    fixture
+        .engine
+        .active_inner()
+        .unwrap()
+        .output_tasks
+        .join_current()
+        .await;
+    fixture
+        .engine
+        .active_inner()
+        .unwrap()
+        .drain_execution_closes()
+        .unwrap();
+    assert_eq!(fixture.output_budget.usage().sessions, 2);
     let opened = fixture::slot_events(
         &fixture.engine,
         &fixture.trace.path().join("trace.jsonl"),
@@ -133,7 +168,7 @@ async fn output_completed_unread_streams_retain_session_admission_until_drop() {
         opened
     );
     drop(first);
-    assert_eq!(fixture.engine.inner.output_budget.usage().sessions, 1);
+    assert_eq!(fixture.output_budget.usage().sessions, 1);
     let third = fixture.engine.infer_stream(third_request).await.unwrap();
     let chunks = tokio::time::timeout(Duration::from_secs(3), third.collect::<Vec<_>>())
         .await
@@ -161,8 +196,8 @@ async fn output_completed_unread_streams_retain_session_admission_until_drop() {
     fixture.engine.shutdown().await.unwrap();
     assert_eq!(fixture.executor.checked_outputs.load(Ordering::SeqCst), 3);
     assert!(fixture.executor.observed.lock().model.kv_caches.is_empty());
-    assert_eq!(fixture.engine.inner.output_budget.usage().sessions, 0);
-    assert_eq!(fixture.engine.inner.output_budget.usage().queued_bytes, 0);
+    assert_eq!(fixture.output_budget.usage().sessions, 0);
+    assert_eq!(fixture.output_budget.usage().queued_bytes, 0);
 }
 
 #[path = "output/resume.rs"]

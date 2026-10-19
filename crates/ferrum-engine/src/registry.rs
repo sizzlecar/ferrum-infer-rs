@@ -11,6 +11,7 @@
 //! - Easy testing with mock components
 
 use async_trait::async_trait;
+use ferrum_execution::executor_lifecycle::ExecutorOwner;
 use ferrum_execution::ModelExecutor;
 use ferrum_interfaces::{KvCacheManager, Sampler, SchedulerInterface as Scheduler, Tokenizer};
 use ferrum_models::vnext::{DefinedProductionModel, ProductionModelSourceBundle};
@@ -157,8 +158,7 @@ pub struct ComponentRegistry {
         RwLock<HashMap<String, Arc<dyn ComponentFactory<Arc<dyn Scheduler + Send + Sync>>>>>,
     kv_cache_factories:
         RwLock<HashMap<String, Arc<dyn ComponentFactory<Arc<dyn KvCacheManager + Send + Sync>>>>>,
-    executor_factories:
-        RwLock<HashMap<String, Arc<dyn ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>>>>>,
+    executor_factories: RwLock<HashMap<String, Arc<dyn ComponentFactory<ExecutorOwner>>>>,
 }
 
 impl ComponentRegistry {
@@ -265,7 +265,7 @@ impl ComponentRegistry {
     pub fn register_executor_factory(
         &self,
         name: impl Into<String>,
-        factory: Arc<dyn ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>>>,
+        factory: Arc<dyn ComponentFactory<ExecutorOwner>>,
     ) {
         let name = name.into();
         debug!("Registering executor factory: {}", name);
@@ -312,7 +312,7 @@ impl ComponentRegistry {
     pub fn get_executor_factory(
         &self,
         name: &str,
-    ) -> Option<Arc<dyn ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>>>> {
+    ) -> Option<Arc<dyn ComponentFactory<ExecutorOwner>>> {
         self.executor_factories.read().get(name).cloned()
     }
 
@@ -418,7 +418,7 @@ impl ComponentRegistry {
         &self,
         name: &str,
         config: &ComponentConfig,
-    ) -> Result<Arc<dyn ModelExecutor + Send + Sync>> {
+    ) -> Result<ExecutorOwner> {
         let factory = self.get_executor_factory(name).ok_or_else(|| {
             FerrumError::model(format!(
                 "Executor '{}' not found. Available: {:?}",
@@ -773,11 +773,8 @@ impl ComponentFactory<Arc<dyn KvCacheManager + Send + Sync>> for PagedKvCacheFac
 pub struct StubExecutorFactory;
 
 #[async_trait]
-impl ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>> for StubExecutorFactory {
-    async fn create(
-        &self,
-        config: &ComponentConfig,
-    ) -> Result<Arc<dyn ModelExecutor + Send + Sync>> {
+impl ComponentFactory<ExecutorOwner> for StubExecutorFactory {
+    async fn create(&self, config: &ComponentConfig) -> Result<ExecutorOwner> {
         validate_causal_decode_preparation_mode(config, false)?;
         validate_segment_binding_owner_view_mode(config, false)?;
         validate_program_binding_upload_strategy(config, false)?;
@@ -801,7 +798,7 @@ impl ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>> for StubExecutorFact
             vocab_size,
         );
 
-        Ok(Arc::new(executor))
+        Ok(ExecutorOwner::new(Box::new(executor)))
     }
 
     fn metadata(&self) -> ComponentMetadata {
@@ -1285,7 +1282,7 @@ fn create_registered_program_executor(
     sources: Option<Arc<ProductionModelSourceBundle>>,
     defined_model: Option<Arc<DefinedProductionModel>>,
     registration: ferrum_models::vnext::RegisteredProductionModel,
-) -> Result<Arc<dyn ModelExecutor + Send + Sync>> {
+) -> Result<ExecutorOwner> {
     use ferrum_models::vnext::ProductionExecutionKind;
 
     validate_causal_decode_preparation_mode(config, true)?;
@@ -1398,7 +1395,7 @@ fn create_registered_program_executor(
                         .unwrap_or("missing"),
                     "Resolved product model plan is authoritative for vNext execution"
                 );
-                Ok(Arc::new(executor))
+                Ok(ExecutorOwner::new(Box::new(executor)))
             }
             #[cfg(not(feature = "cuda"))]
             {
@@ -1459,7 +1456,7 @@ fn create_registered_program_executor(
                     .unwrap_or("missing"),
                 "Resolved product model plan is authoritative for vNext execution"
             );
-            Ok(Arc::new(executor))
+            Ok(ExecutorOwner::new(Box::new(executor)))
         }
         (ProductionExecutionKind::CausalLanguage, Device::CPU) => {
             let device_id = ferrum_runtime::DeviceId::new("device.cpu.0")
@@ -1484,7 +1481,7 @@ fn create_registered_program_executor(
                 resolved_plan_fingerprint = executor.resolved_model_plan().map(|plan| plan.fingerprint()).unwrap_or("missing"),
                 "Resolved product model plan is authoritative for vNext execution"
             );
-            Ok(Arc::new(executor))
+            Ok(ExecutorOwner::new(Box::new(executor)))
         }
         (kind, device) => Err(FerrumError::unsupported(format!(
             "registered vNext model metadata {} requires a {kind:?} backend composition, but {device} is not registered",
@@ -1499,11 +1496,8 @@ fn create_registered_program_executor(
 pub type CandleExecutorFactory = LlmExecutorFactory;
 
 #[async_trait]
-impl ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>> for LlmExecutorFactory {
-    async fn create(
-        &self,
-        config: &ComponentConfig,
-    ) -> Result<Arc<dyn ModelExecutor + Send + Sync>> {
+impl ComponentFactory<ExecutorOwner> for LlmExecutorFactory {
+    async fn create(&self, config: &ComponentConfig) -> Result<ExecutorOwner> {
         use ferrum_models::weight_format::WeightFormat;
 
         if let Some(defined) = &config.defined_model {
@@ -2995,7 +2989,8 @@ pub(crate) mod tests {
         assert!(runtime.peak_resident_bytes() > 0);
         let engine = crate::EngineBuilder::new(config.clone())
             .with_defined_model(Arc::clone(&defined))
-            .with_custom_executor(Arc::new(executor))
+            .with_owned_executor(ExecutorOwner::new(Box::new(executor)))
+            .unwrap()
             .build()
             .await
             .unwrap();

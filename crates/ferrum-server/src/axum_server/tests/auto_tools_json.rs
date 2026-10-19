@@ -896,7 +896,7 @@ async fn infer_branches_with_stop(
     } else {
         envelope
     };
-    let executor = Arc::new(if prefer_tool.is_some() {
+    let executor = if prefer_tool.is_some() {
         ScriptedExecutor::from_steps(
             tokenizer.vocab_size(),
             vec![
@@ -915,7 +915,7 @@ async fn infer_branches_with_stop(
         assert!(script.len() > 1);
         script.push(tokenizer.token_id(EOS).unwrap());
         ScriptedExecutor::new(tokenizer.vocab_size(), script)
-    });
+    };
     let mut wire = endpoint.request(weather_schema(), stream);
     if let Some(stop) = stop {
         wire["stop"] = json!([stop]);
@@ -936,7 +936,7 @@ async fn infer_branches_with_stop(
 
 async fn run_branch_request(
     tokenizer: Arc<HuggingFaceTokenizer>,
-    executor: Arc<ScriptedExecutor>,
+    executor: ScriptedExecutor,
     template: ModelChatTemplate,
     endpoint: Endpoint,
     stream: bool,
@@ -948,17 +948,19 @@ async fn run_branch_request(
     config.model.model_id = ModelId::new("auto-tools-contract");
     config.scheduler.max_running_requests = 1;
     config.batching.max_num_batched_tokens = 256;
+    let observation = executor.observer();
     let engine = Arc::new(
         ContinuousBatchEngine::new_plan_runtime(
             config.clone(),
             Arc::new(ContinuousBatchScheduler::new(config.scheduler)),
             tokenizer.clone(),
             Arc::new(GreedySampler),
-            executor.clone(),
+            ferrum_execution::ExecutorOwner::new(Box::new(executor)),
             Arc::new(MockTensorFactory),
         )
         .unwrap(),
     );
+    let executor = observation;
     let router = AxumServer::from_llm(engine.clone())
         .with_prompt_template(Some(template))
         .build_router()
@@ -1193,8 +1195,7 @@ async fn forced_native_json_masks_bare_arguments_through_chat_and_responses() {
                     ]),
                     LogitStep::only(tokenizer.token_id(EOS).unwrap()),
                 ];
-                let executor =
-                    Arc::new(ScriptedExecutor::from_steps(tokenizer.vocab_size(), steps));
+                let executor = ScriptedExecutor::from_steps(tokenizer.vocab_size(), steps);
                 // Keep the strict final response format: required/named tools
                 // must own the complete native envelope instead of this schema.
                 let mut wire = endpoint.request(weather_schema(), stream);
@@ -1291,7 +1292,7 @@ async fn infer_json_script(
         ]);
     }
     steps.push(LogitStep::only(tokenizer.token_id(EOS).unwrap()));
-    let executor = Arc::new(ScriptedExecutor::from_steps(tokenizer.vocab_size(), steps));
+    let executor = ScriptedExecutor::from_steps(tokenizer.vocab_size(), steps);
     let selected = emitted.concat();
     let (answer, prefill) = run_branch_request(
         tokenizer, executor, template, endpoint, stream, wire, &selected, false,
@@ -1590,8 +1591,7 @@ async fn forced_native_tools_mask_bare_arguments_through_both_http_adapters() {
                     ])];
                     steps.extend(script.into_iter().map(LogitStep::only));
                     steps.push(LogitStep::only(tokenizer.token_id(EOS).unwrap()));
-                    let executor =
-                        Arc::new(ScriptedExecutor::from_steps(tokenizer.vocab_size(), steps));
+                    let executor = ScriptedExecutor::from_steps(tokenizer.vocab_size(), steps);
                     let mut wire = endpoint.request(weather_schema(), stream);
                     wire.as_object_mut().unwrap().remove("response_format");
                     wire.as_object_mut().unwrap().remove("text");

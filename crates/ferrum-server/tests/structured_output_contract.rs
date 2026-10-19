@@ -58,6 +58,11 @@ impl InferenceEngine for StubLlm {
         Ok(())
     }
 
+    async fn wait_for_shutdown_completion(&self) -> ferrum_types::Result<()> {
+        // No background execution or journal producers in this wire fixture.
+        Ok(())
+    }
+
     fn config(&self) -> &EngineConfig {
         &self.config
     }

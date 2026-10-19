@@ -121,10 +121,7 @@ async fn gated_request(streaming: bool, supplied: bool) {
     request.created_at =
         chrono::DateTime::from_timestamp(if supplied { 1 } else { 4_102_444_800 }, 0).unwrap();
     let id = request.id.clone();
-    let ingress_engine = ContinuousBatchEngine {
-        inner: Arc::clone(&fixture.engine.inner),
-        driver: Arc::clone(&fixture.engine.driver),
-    };
+    let ingress_engine = Arc::clone(&fixture.engine);
     gate.armed.store(true, Ordering::SeqCst);
     let inference = tokio::spawn(async move {
         if streaming {
@@ -166,7 +163,13 @@ async fn gated_request(streaming: bool, supplied: bool) {
         .await
         .unwrap()
         .unwrap();
-    assert!(fixture.engine.inner.sequences.get(&id).is_none());
+    assert!(fixture
+        .engine
+        .active_inner()
+        .unwrap()
+        .sequences
+        .get(&id)
+        .is_none());
     assert_eq!(fixture.executor.admissions.load(Ordering::SeqCst), 0);
     let encode_released = gate.release();
     // The existing fixture gate is after actual CPU logits and KV verification,
@@ -176,7 +179,13 @@ async fn gated_request(streaming: bool, supplied: bool) {
         .unwrap()
         .unwrap();
     let anchor = {
-        let handle = fixture.engine.inner.sequences.get(&id).unwrap();
+        let handle = fixture
+            .engine
+            .active_inner()
+            .unwrap()
+            .sequences
+            .get(&id)
+            .unwrap();
         let state = handle.lock();
         let sequence = state.as_ref().unwrap();
         let anchor = sequence.original_request.ingress.unwrap();
@@ -224,8 +233,7 @@ async fn gated_request(streaming: bool, supplied: bool) {
     fixture.engine.shutdown().await.unwrap();
     assert_eq!(fixture.executor.closes.load(Ordering::SeqCst), 1);
     assert!(fixture.executor.observed.lock().model.kv_caches.is_empty());
-    assert!(fixture.engine.inner.sequences.is_empty());
-    assert_eq!(fixture.engine.inner.execution_closes.unreclaimed_count(), 0);
+    assert!(fixture.original_inner.upgrade().is_none());
     assert_eq!(
         fixture::closed_slot_events(
             &fixture.trace.path().join("trace.jsonl"),
@@ -242,12 +250,12 @@ async fn request_clock_cpu_pause_quota_failure_closes_exact_admitted_owner_witho
     let mut fixture = closure::fixture(false, false).await;
     fixture
         .engine
-        .inner
         .scheduler
         .mark_prefill_complete(&fixture.request_id, fixture.prompt_len);
     let handle = fixture
         .engine
-        .inner
+        .active_inner()
+        .unwrap()
         .sequences
         .get(&fixture.request_id)
         .unwrap();
@@ -278,7 +286,6 @@ async fn request_clock_cpu_pause_quota_failure_closes_exact_admitted_owner_witho
     assert_eq!(frontier.sequence(), &fixture.identity);
     let batch = fixture
         .engine
-        .inner
         .scheduler
         .next_batch(ferrum_interfaces::BatchHint::simple(1))
         .await
@@ -286,32 +293,56 @@ async fn request_clock_cpu_pause_quota_failure_closes_exact_admitted_owner_witho
     assert_eq!(batch.requests.len(), 1);
     let error = fixture
         .engine
-        .inner
+        .active_inner()
+        .unwrap()
         .process_batch(&batch)
         .await
         .unwrap_err();
     assert!(matches!(error, FerrumError::ResourceExhausted { .. }));
-    fixture.engine.inner.execution_closes.join_observers().await;
-    fixture.engine.inner.output_tasks.join_current().await;
-    fixture.engine.inner.drain_execution_closes().unwrap();
+    fixture
+        .engine
+        .active_inner()
+        .unwrap()
+        .execution_closes
+        .join_observers()
+        .await;
+    fixture
+        .engine
+        .active_inner()
+        .unwrap()
+        .output_tasks
+        .join_current()
+        .await;
+    fixture
+        .engine
+        .active_inner()
+        .unwrap()
+        .drain_execution_closes()
+        .unwrap();
     let client_error = (&mut fixture.response).await.unwrap().unwrap_err();
     assert!(matches!(
         client_error,
         FerrumError::ResourceExhausted { .. }
     ));
     assert!(matches!(
-        fixture.engine.inner.output_tasks.take_control_error(),
+        fixture
+            .engine
+            .active_inner()
+            .unwrap()
+            .output_tasks
+            .take_control_error(),
         Some(FerrumError::ResourceExhausted { .. })
     ));
     assert!(fixture
         .engine
-        .inner
+        .active_inner()
+        .unwrap()
         .output_tasks
         .take_control_error()
         .is_none());
     assert_eq!(fixture.executor.close_call_counts(), (0, 1));
     closure::assert_closed_once(&fixture).await;
-    assert!(fixture.engine.inner.sequences.is_empty());
+    assert!(fixture.engine.active_inner().unwrap().sequences.is_empty());
     // Exact layer lengths at release prove no decode/replayed prefill occurred.
     assert_eq!(
         fixture.model.lock().releases,

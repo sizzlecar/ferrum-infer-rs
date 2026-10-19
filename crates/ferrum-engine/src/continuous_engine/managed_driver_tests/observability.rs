@@ -64,8 +64,16 @@ async fn actual_cpu_request(fixture: &fixture::Fixture) {
     assert_eq!(fixture.executor.checked_outputs.load(Ordering::SeqCst), 4);
     assert_eq!(fixture.executor.closes.load(Ordering::SeqCst), 1);
     assert!(fixture.executor.observed.lock().model.kv_caches.is_empty());
-    assert!(fixture.engine.inner.sequences.is_empty());
-    assert_eq!(fixture.engine.inner.execution_closes.unreclaimed_count(), 0);
+    assert!(fixture.engine.active_inner().unwrap().sequences.is_empty());
+    assert_eq!(
+        fixture
+            .engine
+            .active_inner()
+            .unwrap()
+            .execution_closes
+            .unreclaimed_count(),
+        0
+    );
 }
 
 async fn saturated_fanout(detail: ObservabilityProfileDetail) {
@@ -127,12 +135,23 @@ async fn saturated_fanout(detail: ObservabilityProfileDetail) {
     // Declared after the fixture: unwind releases the real writer before any
     // fixture/journal owner can synchronously join it.
     let mut release = ReleaseWriter(Some(release));
-    let blocked_profile = fixture.engine.inner.profile_trace_journal().unwrap();
-    let healthy = fixture.engine.inner.scheduler_trace_jsonl.clone().unwrap();
+    let blocked_profile = fixture
+        .engine
+        .active_inner()
+        .unwrap()
+        .profile_trace_journal()
+        .unwrap();
+    let healthy = fixture
+        .engine
+        .active_inner()
+        .unwrap()
+        .scheduler_trace_jsonl
+        .clone()
+        .unwrap();
     let sink = VNextProfileExecutionEventSink::with_journals(
         vec![blocked_profile.clone(), healthy.clone()],
         ProfileEntrypoint::Run,
-        &fixture.engine.inner.config,
+        &fixture.engine.config,
     );
     let (_, _, accepted) = vnext_profile_test_event();
     let error = sink.enqueue_events(vec![accepted.clone()]).unwrap_err();
@@ -159,12 +178,8 @@ async fn saturated_fanout(detail: ObservabilityProfileDetail) {
     // Full was temporary: the original destination can accept later events.
     sink.enqueue_events(vec![accepted]).unwrap();
     blocked_profile.flush().unwrap();
-    let inner = Arc::downgrade(&fixture.engine.inner);
-    let observer = fixture
-        .engine
-        .driver
-        .shutdown(&fixture.engine.inner)
-        .unwrap();
+    let inner = Arc::downgrade(&fixture.engine.active_inner().unwrap());
+    let observer = fixture.engine.driver.shutdown_active().unwrap();
     let report = tokio::time::timeout(Duration::from_secs(3), observer.wait())
         .await
         .unwrap();
@@ -220,26 +235,38 @@ async fn managed_observability_required_full_reports_loss_without_retaining_cpu_
 async fn closed_journal(detail: ObservabilityProfileDetail) {
     let fixture = fixture::Fixture::with_config(|config| config.runtime.profile_detail = detail);
     actual_cpu_request(&fixture).await;
-    let journal = fixture.engine.inner.scheduler_trace_jsonl.as_ref().unwrap();
+    let journal = fixture
+        .engine
+        .active_inner()
+        .unwrap()
+        .scheduler_trace_jsonl
+        .clone()
+        .unwrap();
     let path = journal.path().to_path_buf();
-    let closed = fixture.engine.inner.journal_scopes.lock().finish();
+    let closed = fixture
+        .engine
+        .active_inner()
+        .unwrap()
+        .journal_scopes
+        .lock()
+        .finish();
     assert!(closed.iter().all(|(delivery, error)| error.is_none()
         && delivery.final_receipt.as_ref().unwrap().worker_joined));
     let sink = VNextProfileExecutionEventSink::new(
         journal.clone(),
         ProfileEntrypoint::Run,
-        &fixture.engine.inner.config,
+        &fixture.engine.config,
     );
     let (_, _, accepted) = vnext_profile_test_event();
     let error = sink.enqueue_events(vec![accepted]).unwrap_err();
     assert_eq!(error.kind(), ExecutionEventSinkErrorKind::Transport);
-    fixture.engine.inner.report_observation_failure(error);
-    let inner = Arc::downgrade(&fixture.engine.inner);
-    let observer = fixture
+    fixture
         .engine
-        .driver
-        .shutdown(&fixture.engine.inner)
-        .unwrap();
+        .active_inner()
+        .unwrap()
+        .report_observation_failure(error);
+    let inner = Arc::downgrade(&fixture.engine.active_inner().unwrap());
+    let observer = fixture.engine.driver.shutdown_active().unwrap();
     let report = tokio::time::timeout(Duration::from_secs(3), observer.wait())
         .await
         .unwrap();
@@ -279,7 +306,8 @@ async fn managed_observability_worker_panic_is_contract_but_does_not_retain_clea
     actual_cpu_request(&fixture).await;
     let path = fixture
         .engine
-        .inner
+        .active_inner()
+        .unwrap()
         .scheduler_trace_jsonl
         .as_ref()
         .unwrap()
@@ -287,17 +315,18 @@ async fn managed_observability_worker_panic_is_contract_but_does_not_retain_clea
         .to_path_buf();
     let poison = fixture
         .engine
-        .inner
+        .active_inner()
+        .unwrap()
         .journal_scopes
         .lock()
         .producer::<PanicWriter>(&path)
         .unwrap();
     poison.enqueue(PanicWriter).unwrap();
-    let inner = Arc::downgrade(&fixture.engine.inner);
+    let inner = Arc::downgrade(&fixture.engine.active_inner().unwrap());
     let report = fixture
         .engine
         .driver
-        .shutdown(&fixture.engine.inner)
+        .shutdown_active()
         .unwrap()
         .wait()
         .await;
@@ -324,11 +353,17 @@ async fn managed_observability_contract_is_rejected_before_enqueue_even_when_opt
         config.runtime.profile_detail = ObservabilityProfileDetail::Basic
     });
     actual_cpu_request(&fixture).await;
-    let journal = fixture.engine.inner.scheduler_trace_jsonl.as_ref().unwrap();
+    let journal = fixture
+        .engine
+        .active_inner()
+        .unwrap()
+        .scheduler_trace_jsonl
+        .clone()
+        .unwrap();
     let sink = VNextProfileExecutionEventSink::new(
         journal.clone(),
         ProfileEntrypoint::Run,
-        &fixture.engine.inner.config,
+        &fixture.engine.config,
     );
     let (_, _, accepted) = vnext_profile_test_event();
     let mut invalid = sink.profile_event(&accepted).unwrap();
@@ -337,19 +372,23 @@ async fn managed_observability_contract_is_rejected_before_enqueue_even_when_opt
     let error = journal.enqueue(invalid).unwrap_err();
     assert_eq!(error.kind(), ExecutionEventSinkErrorKind::Contract);
     assert_eq!(journal.delivery_stats().accepted, before);
-    fixture.engine.inner.report_observation_failure(error);
+    fixture
+        .engine
+        .active_inner()
+        .unwrap()
+        .report_observation_failure(error);
     // This is the production control-consumption boundary, independent of
     // whether a stream is being read or a journal is being flushed.
-    let error = match fixture.engine.inner.run_iteration().await {
+    let error = match fixture.engine.active_inner().unwrap().run_iteration().await {
         Err(error) => error,
         Ok(_) => panic!("profile contract failure must reach the driver control boundary"),
     };
     assert!(error.to_string().contains("event_id"));
-    let inner = Arc::downgrade(&fixture.engine.inner);
+    let inner = Arc::downgrade(&fixture.engine.active_inner().unwrap());
     let report = fixture
         .engine
         .driver
-        .shutdown(&fixture.engine.inner)
+        .shutdown_active()
         .unwrap()
         .wait()
         .await;
@@ -374,12 +413,17 @@ async fn managed_observability_optional_open_failure_is_observable_and_cpu_conti
         config.runtime.profile_detail = ObservabilityProfileDetail::Basic;
         config.runtime.profile_jsonl = Some(invalid.clone());
     });
-    assert!(fixture.engine.inner.profile_trace_journal().is_none());
+    assert!(fixture
+        .engine
+        .active_inner()
+        .unwrap()
+        .profile_trace_journal()
+        .is_none());
     actual_cpu_request(&fixture).await;
     let report = fixture
         .engine
         .driver
-        .shutdown(&fixture.engine.inner)
+        .shutdown_active()
         .unwrap()
         .wait()
         .await;
@@ -481,14 +525,8 @@ async fn managed_journal_two_cpu_engines_retire_scopes_without_closing_shared_wr
         .try_enqueue(serde_json::json!({"phase":"startup"}))
         .unwrap();
     actual_cpu_request(&first).await;
-    let first_inner = Arc::downgrade(&first.engine.inner);
-    let report = first
-        .engine
-        .driver
-        .shutdown(&first.engine.inner)
-        .unwrap()
-        .wait()
-        .await;
+    let first_inner = Arc::downgrade(&first.engine.active_inner().unwrap());
+    let report = first.engine.driver.shutdown_active().unwrap().wait().await;
     report.result().unwrap();
     assert!(!report.retains_unproved_owners());
     assert_eq!(report.journal_deliveries().len(), 1);
@@ -508,13 +546,7 @@ async fn managed_journal_two_cpu_engines_retire_scopes_without_closing_shared_wr
     // Work after the first Engine shutdown uses the same actual writer and
     // still performs full CPU numerical/real-KV comparisons in the fixture.
     actual_cpu_request(&second).await;
-    let second_report = second
-        .engine
-        .driver
-        .shutdown(&second.engine.inner)
-        .unwrap()
-        .wait()
-        .await;
+    let second_report = second.engine.driver.shutdown_active().unwrap().wait().await;
     second_report.result().unwrap();
     assert!(
         second_report.journal_deliveries()[0]
@@ -572,7 +604,7 @@ async fn managed_journal_injected_open_failure_is_preserved_without_reopening() 
     let report = fixture
         .engine
         .driver
-        .shutdown(&fixture.engine.inner)
+        .shutdown_active()
         .unwrap()
         .wait()
         .await;
@@ -601,14 +633,15 @@ async fn managed_journal_strict_error_retires_injected_scope_before_final_close(
     actual_cpu_request(&fixture).await;
     fixture
         .engine
-        .inner
+        .active_inner()
+        .unwrap()
         .report_observation_failure(ExecutionEventSinkError::contract(
             "strict evidence rejected",
         ));
     let report = fixture
         .engine
         .driver
-        .shutdown(&fixture.engine.inner)
+        .shutdown_active()
         .unwrap()
         .wait()
         .await;

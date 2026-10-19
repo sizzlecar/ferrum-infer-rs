@@ -28,14 +28,16 @@ fn engine() -> ContinuousBatchEngine {
         Arc::new(MockTokenizer::new(VOCAB)),
         Arc::new(MockSampler),
         Arc::new(MockKvCacheManager::new(1024)),
-        Arc::new(MockModelExecutor::instant(VOCAB)),
+        ferrum_execution::executor_lifecycle::ExecutorOwner::new(Box::new(
+            MockModelExecutor::instant(VOCAB),
+        )),
         Arc::new(MockTensorFactory),
     )
     .expect("legacy engine composition must match executor authority")
 }
 
 fn engine_with_executor(
-    executor: Arc<MockModelExecutor>,
+    executor: MockModelExecutor,
 ) -> (ContinuousBatchEngine, Arc<MockKvCacheManager>) {
     let config = ferrum_types::EngineConfig::default();
     let kv = Arc::new(MockKvCacheManager::new(1024));
@@ -45,7 +47,7 @@ fn engine_with_executor(
         Arc::new(MockTokenizer::new(VOCAB)),
         Arc::new(MockSampler),
         kv.clone(),
-        executor,
+        ferrum_execution::executor_lifecycle::ExecutorOwner::new(Box::new(executor)),
         Arc::new(MockTensorFactory),
     )
     .expect("legacy engine composition must match executor authority");
@@ -63,26 +65,28 @@ fn req(prompt: &str, max_tokens: usize) -> InferenceRequest {
 
 #[tokio::test]
 async fn prefill_called_once_per_request() {
-    let executor = Arc::new(MockModelExecutor::instant(VOCAB));
-    let (eng, _) = engine_with_executor(executor.clone());
+    let executor = MockModelExecutor::instant(VOCAB);
+    let observation = executor.observer();
+    let (eng, _) = engine_with_executor(executor);
 
     let _ = eng.infer(req("test prompt", 5)).await.unwrap();
-    assert_eq!(executor.prefill_count(), 1);
-    assert!(executor.decode_count() >= 4); // at least max_tokens - 1 decodes
+    assert_eq!(observation.prefill_count(), 1);
+    assert!(observation.decode_count() >= 4); // at least max_tokens - 1 decodes
 }
 
 #[tokio::test]
 async fn decode_count_matches_generated_tokens() {
-    let executor = Arc::new(MockModelExecutor::instant(VOCAB));
-    let (eng, _) = engine_with_executor(executor.clone());
+    let executor = MockModelExecutor::instant(VOCAB);
+    let observation = executor.observer();
+    let (eng, _) = engine_with_executor(executor);
 
     let resp = eng.infer(req("hello", 10)).await.unwrap();
     // prefill produces 1 token, decode produces the rest
     let _total_tokens = resp.response().text.split_whitespace().count().max(1);
     assert!(
-        executor.decode_count() >= 9,
+        observation.decode_count() >= 9,
         "expected ≥9 decodes, got {}",
-        executor.decode_count()
+        observation.decode_count()
     );
 }
 
@@ -90,7 +94,7 @@ async fn decode_count_matches_generated_tokens() {
 
 #[tokio::test]
 async fn kv_cache_allocated_during_request() {
-    let executor = Arc::new(MockModelExecutor::instant(VOCAB));
+    let executor = MockModelExecutor::instant(VOCAB);
     let (eng, kv) = engine_with_executor(executor);
 
     assert_eq!(kv.active_count(), 0);
@@ -105,7 +109,7 @@ async fn kv_cache_allocated_during_request() {
 
 #[tokio::test]
 async fn kv_cache_freed_after_multiple_requests() {
-    let executor = Arc::new(MockModelExecutor::instant(VOCAB));
+    let executor = MockModelExecutor::instant(VOCAB);
     let (eng, kv) = engine_with_executor(executor);
 
     for i in 0..5 {

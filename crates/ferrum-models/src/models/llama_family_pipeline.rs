@@ -855,6 +855,32 @@ where
         }
     }
 
+    fn retire_model(&mut self) -> crate::common::llm::ModelRetirementOutcome {
+        use crate::common::llm::ModelRetirementOutcome;
+        let mut first_error = None;
+        let mut retained = false;
+        for stage in &mut self.stages {
+            match stage.retire_model() {
+                ModelRetirementOutcome::Retired { error } => {
+                    if first_error.is_none() {
+                        first_error = error;
+                    }
+                }
+                ModelRetirementOutcome::Retained { error } => {
+                    retained = true;
+                    first_error.get_or_insert(error);
+                }
+            }
+        }
+        if retained {
+            ModelRetirementOutcome::Retained {
+                error: first_error.expect("retained stage reports its error"),
+            }
+        } else {
+            ModelRetirementOutcome::Retired { error: first_error }
+        }
+    }
+
     fn execute_token_work(
         &mut self,
         input: &crate::common::llm::ModelTokenInput<'_>,

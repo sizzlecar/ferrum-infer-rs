@@ -68,6 +68,10 @@ impl RecordingLlm {
 }
 
 impl DecoderOnlyLLM for RecordingLlm {
+    fn retire_model(&mut self) -> crate::common::ModelRetirementOutcome {
+        // This fixture owns only synchronous host values and call history.
+        crate::common::ModelRetirementOutcome::Retired { error: None }
+    }
     fn config(&self) -> &crate::common::LlmRuntimeConfig {
         &self.config
     }
@@ -505,7 +509,11 @@ async fn lora_prefix_cache_instance_rejects_before_binding_or_prefill() {
     assert_eq!(metrics["active_cache_bindings"].as_u64(), Some(0));
     assert_eq!(metrics["adapter_count"].as_u64(), Some(0));
     assert_eq!(
-        executor.lock_model().cache_metrics_snapshot().unwrap()["enabled"],
+        executor
+            .lock_model()
+            .unwrap()
+            .cache_metrics_snapshot()
+            .unwrap()["enabled"],
         true
     );
     let base = admit(&executor, &prompt, cfg.max_seq_len).await;
@@ -600,6 +608,9 @@ fn cache_metrics_snapshot_includes_model_lock_wait_metrics() {
     let executor = recording_executor(calls);
 
     assert_eq!(executor.kv_capacity(), Some(16));
+    // Capacity is frozen metadata; acquire the original model through a real
+    // snapshot operation before checking accumulated lock measurements.
+    assert!(executor.cache_metrics_snapshot().is_some());
     let metrics = executor.cache_metrics_snapshot().unwrap();
 
     assert_eq!(metrics["position"], "recording-test-cache");

@@ -8,6 +8,8 @@
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use ferrum_engine::{ContinuousBatchEngine, LlmInferenceEngine};
+use ferrum_execution::ExecutorOwner;
+use ferrum_interfaces::InferenceEngine;
 use ferrum_scheduler::implementations::ContinuousBatchScheduler;
 use ferrum_testkit::{
     MockKvCacheManager, MockModelExecutor, MockSampler, MockTensorFactory, MockTokenizer,
@@ -34,7 +36,7 @@ fn make_engine() -> ContinuousBatchEngine {
     let tokenizer = Arc::new(MockTokenizer::new(VOCAB_SIZE));
     let sampler = Arc::new(MockSampler);
     let kv_cache = Arc::new(MockKvCacheManager::new(1024));
-    let executor = Arc::new(MockModelExecutor::instant(VOCAB_SIZE));
+    let executor = ExecutorOwner::new(Box::new(MockModelExecutor::instant(VOCAB_SIZE)));
     let tensor_factory = Arc::new(MockTensorFactory);
 
     ContinuousBatchEngine::new(
@@ -78,6 +80,7 @@ fn bench_single_request(c: &mut Criterion) {
                         engine.infer(req).await.unwrap()
                     })
                 });
+                rt.block_on(engine.shutdown()).unwrap();
             },
         );
     }
@@ -115,6 +118,7 @@ fn bench_concurrent_throughput(c: &mut Criterion) {
                         futures::future::join_all(handles).await
                     })
                 });
+                rt.block_on(engine.shutdown()).unwrap();
             },
         );
     }
@@ -140,6 +144,7 @@ fn bench_scheduling_overhead(c: &mut Criterion) {
                 engine.infer(req).await.unwrap()
             })
         });
+        rt.block_on(engine.shutdown()).unwrap();
     });
 
     // Sequential requests to measure per-request overhead
@@ -153,6 +158,7 @@ fn bench_scheduling_overhead(c: &mut Criterion) {
                 }
             })
         });
+        rt.block_on(engine.shutdown()).unwrap();
     });
 
     group.finish();

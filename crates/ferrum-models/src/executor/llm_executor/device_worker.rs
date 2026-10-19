@@ -14,6 +14,9 @@ use std::thread;
 use std::time::Duration;
 use tokio::sync::{oneshot, OwnedSemaphorePermit, Semaphore};
 
+mod shutdown;
+use shutdown::{WorkerExit, WorkerShutdown};
+
 const MAX_WORK: usize = 2;
 const INITIAL_DELAY: Duration = Duration::from_millis(1);
 const MAX_DELAY: Duration = Duration::from_millis(250);
@@ -109,6 +112,7 @@ pub(super) struct LlmDeviceWorker {
     wake: mpsc::SyncSender<()>,
     capacity: Arc<Semaphore>,
     state: Arc<TokenWorkerState>,
+    shutdown: Arc<WorkerShutdown>,
 }
 
 impl LlmDeviceWorker {
@@ -116,16 +120,29 @@ impl LlmDeviceWorker {
         let (commands, receiver) = mpsc::channel();
         let (wake, wakes) = mpsc::sync_channel(1);
         let owned_state = Arc::clone(&state);
-        thread::Builder::new()
+        let shutdown = WorkerShutdown::new(Arc::clone(&state));
+        let reporter = shutdown.reporter()?;
+        let handle = thread::Builder::new()
             .name("ferrum-llm-device".to_owned())
-            .spawn(move || run_worker(owned_state, receiver, wakes))
+            .spawn(move || run_worker(owned_state, receiver, wakes, reporter))
             .map_err(|e| FerrumError::backend(format!("cannot start model device worker: {e}")))?;
+        shutdown.install(handle);
         Ok(Self {
             commands,
             wake,
             capacity: Arc::new(Semaphore::new(MAX_WORK)),
             state,
+            shutdown,
         })
+    }
+
+    pub(super) fn begin_shutdown(
+        &self,
+    ) -> Result<ferrum_execution::executor_lifecycle::ExecutorShutdownObserver> {
+        self.capacity.close();
+        self.state.request_shutdown();
+        let _ = self.wake.try_send(());
+        self.shutdown.observe()
     }
 
     pub(super) async fn admit(
@@ -291,9 +308,11 @@ impl LlmDeviceWorker {
 
 impl Drop for LlmDeviceWorker {
     fn drop(&mut self) {
-        self.capacity.close();
-        self.state.request_shutdown();
-        let _ = self.wake.try_send(());
+        // Only wake/seal and start the one cold join observation. Neither
+        // device completion nor OS thread join is awaited by a destructor.
+        if let Err(error) = self.begin_shutdown() {
+            tracing::error!(%error, "model worker shutdown observation could not start");
+        }
     }
 }
 
@@ -301,12 +320,17 @@ fn run_worker(
     state: Arc<TokenWorkerState>,
     commands: mpsc::Receiver<Command>,
     wakes: mpsc::Receiver<()>,
-) {
+    reporter: ferrum_execution::executor_lifecycle::ExecutorShutdownReporter,
+) -> WorkerExit {
     let mut delay = INITIAL_DELAY;
     loop {
         // Observation of the same retained frame, never numerical replay.
         match catch_unwind(AssertUnwindSafe(|| state.recover_device_sequences())) {
-            Ok(true) => delay = INITIAL_DELAY,
+            Ok(true) => {
+                if !state.is_shutting_down() {
+                    delay = INITIAL_DELAY;
+                }
+            }
             Ok(false) => delay = (delay * 2).min(MAX_DELAY),
             Err(_) => {
                 state.record_device_worker_panic();
@@ -366,10 +390,33 @@ fn run_worker(
             Err(mpsc::TryRecvError::Empty) => {}
         }
         if state.shutdown_complete() {
-            break;
+            match state.retire_model() {
+                crate::common::ModelRetirementOutcome::Retired { error } => {
+                    return WorkerExit::Retired(error);
+                }
+                crate::common::ModelRetirementOutcome::Retained { error } => {
+                    reporter.retained(error.clone());
+                    delay = (delay * 2).min(MAX_DELAY);
+                    // A missing implementation cannot become qualified by
+                    // retrying. Keep its slot in observer custody and report
+                    // the failed closure, rather than spinning forever.
+                    if matches!(error, FerrumError::Unsupported { .. }) {
+                        return WorkerExit::Retained(error);
+                    }
+                }
+            }
+        } else if let Some(error) = state.shutdown_error() {
+            reporter.retained(error);
         }
         if state.has_device_recovery() {
-            let _ = wakes.recv_timeout(delay);
+            if matches!(
+                wakes.recv_timeout(delay),
+                Err(mpsc::RecvTimeoutError::Disconnected)
+            ) {
+                // A dropped caller does not cancel retained cleanup. A
+                // disconnected wake channel must not create a busy loop.
+                thread::park_timeout(delay);
+            }
         } else if wakes.recv().is_err() {
             state.request_shutdown();
         }

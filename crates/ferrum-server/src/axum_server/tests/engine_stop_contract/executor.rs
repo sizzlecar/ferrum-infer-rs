@@ -6,7 +6,7 @@ use ferrum_execution::{
         ExecutorSequenceCompletion, ExecutorStatus, PlanRuntimeResourceSnapshot,
     },
     token_execution::*,
-    ModelExecutor,
+    ExecutorShutdownObserver, ExecutorShutdownPermit, ModelExecutor,
 };
 use ferrum_testkit::MockModelExecutor;
 use ferrum_types::{ExecutorAdmissionLimits, ModelInfo, RequestId, Result};
@@ -36,9 +36,16 @@ pub(super) struct ScriptedExecutor {
     metadata: MockModelExecutor,
     script: Vec<LogitStep>,
     issuer: ExecutorSequenceIssuer,
+    active: Arc<Mutex<HashMap<ExecutorSequence, Cursor>>>,
+    observation: Arc<ScriptedObservation>,
+}
+
+/// Inspect results without keeping the executable or any live sequence alive.
+pub(super) struct ScriptedObservation {
     decoded_inputs: Mutex<Vec<TokenId>>,
     prefill_tokens: Mutex<Vec<TokenId>>,
-    active: Mutex<HashMap<ExecutorSequence, Cursor>>,
+    active: std::sync::Weak<Mutex<HashMap<ExecutorSequence, Cursor>>>,
+    active_at_retirement: Mutex<Option<usize>>,
     pub prompt_tokens: AtomicUsize,
     pub generated_tokens: AtomicUsize,
     completed: Mutex<Vec<ExecutorSequenceCompletion>>,
@@ -53,17 +60,26 @@ impl ScriptedExecutor {
     }
     pub fn from_steps(vocab_size: usize, steps: Vec<LogitStep>) -> Self {
         assert!(!steps.is_empty());
+        let active = Arc::new(Mutex::new(HashMap::new()));
+        let observation = Arc::new(ScriptedObservation {
+            decoded_inputs: Mutex::new(Vec::new()),
+            prefill_tokens: Mutex::new(Vec::new()),
+            active: Arc::downgrade(&active),
+            active_at_retirement: Mutex::new(None),
+            prompt_tokens: AtomicUsize::new(0),
+            generated_tokens: AtomicUsize::new(0),
+            completed: Mutex::new(Vec::new()),
+        });
         Self {
             metadata: MockModelExecutor::instant(vocab_size),
             script: steps,
             issuer: ExecutorSequenceIssuer::new(),
-            decoded_inputs: Mutex::new(Vec::new()),
-            prefill_tokens: Mutex::new(Vec::new()),
-            active: Mutex::new(HashMap::new()),
-            prompt_tokens: AtomicUsize::new(0),
-            generated_tokens: AtomicUsize::new(0),
-            completed: Mutex::new(Vec::new()),
+            active,
+            observation,
         }
+    }
+    pub fn observer(&self) -> Arc<ScriptedObservation> {
+        Arc::clone(&self.observation)
     }
     fn logits(&self, index: usize) -> Result<Vec<f32>> {
         let step = self.script.get(index).ok_or_else(|| {
@@ -76,31 +92,6 @@ impl ScriptedExecutor {
                 .ok_or_else(|| FerrumError::backend("script token outside vocabulary"))? = logit;
         }
         Ok(logits)
-    }
-    pub fn decoded_inputs(&self) -> Vec<TokenId> {
-        self.decoded_inputs.lock().unwrap().clone()
-    }
-    pub fn prefill_tokens(&self) -> Vec<TokenId> {
-        self.prefill_tokens.lock().unwrap().clone()
-    }
-    pub fn assert_released(&self) {
-        assert!(self.active.lock().unwrap().is_empty());
-    }
-    pub fn assert_completed(&self) {
-        let completed = self.completed.lock().unwrap();
-        assert_eq!(
-            completed.len(),
-            1,
-            "one request completed inside the engine"
-        );
-        assert_eq!(
-            completed[0].input_tokens(),
-            self.prompt_tokens.load(Ordering::Relaxed) as u64
-        );
-        assert_eq!(
-            completed[0].output_tokens(),
-            self.generated_tokens.load(Ordering::Relaxed) as u64
-        );
     }
     fn close(
         &self,
@@ -122,7 +113,8 @@ impl ScriptedExecutor {
         {
             assert_eq!(input_tokens, cursor.prompt.len());
             assert_eq!(output_tokens, cursor.next);
-            self.completed
+            self.observation
+                .completed
                 .lock()
                 .unwrap()
                 .push(ExecutorSequenceCompletion::new(
@@ -137,8 +129,72 @@ impl ScriptedExecutor {
     }
 }
 
+impl ScriptedObservation {
+    pub fn decoded_inputs(&self) -> Vec<TokenId> {
+        self.decoded_inputs.lock().unwrap().clone()
+    }
+    pub fn prefill_tokens(&self) -> Vec<TokenId> {
+        self.prefill_tokens.lock().unwrap().clone()
+    }
+    pub fn assert_released(&self) {
+        if let Some(active) = self.active.upgrade() {
+            assert!(active.lock().unwrap().is_empty());
+        } else {
+            assert_eq!(
+                *self.active_at_retirement.lock().unwrap(),
+                Some(0),
+                "request cleanup must finish before whole-executor retirement"
+            );
+        }
+    }
+    pub fn assert_completed(&self) {
+        let completed = self.completed.lock().unwrap();
+        assert_eq!(
+            completed.len(),
+            1,
+            "one request completed inside the engine"
+        );
+        assert_eq!(
+            completed[0].input_tokens(),
+            self.prompt_tokens.load(Ordering::Relaxed) as u64
+        );
+        assert_eq!(
+            completed[0].output_tokens(),
+            self.generated_tokens.load(Ordering::Relaxed) as u64
+        );
+    }
+}
+
 #[async_trait]
 impl ModelExecutor for ScriptedExecutor {
+    fn begin_shutdown(
+        self: Arc<Self>,
+        permit: &ExecutorShutdownPermit,
+    ) -> ExecutorShutdownObserver {
+        if let Err(error) = permit.check(self.as_ref()) {
+            return ExecutorShutdownObserver::retained(Arc::new(self), error);
+        }
+        let original = match Arc::try_unwrap(self) {
+            Ok(original) => original,
+            Err(original) => {
+                return ExecutorShutdownObserver::retained(
+                    Arc::new(original),
+                    FerrumError::internal("script executor still has live users"),
+                )
+            }
+        };
+        let sequences: Vec<_> = original.active.lock().unwrap().keys().cloned().collect();
+        *original.observation.active_at_retirement.lock().unwrap() = Some(sequences.len());
+        for sequence in sequences {
+            if let Err(error) = original.close(&sequence, ExecutionEndReason::Cancelled) {
+                return ExecutorShutdownObserver::retained(Arc::new(original), error);
+            }
+        }
+        let (reporter, observer) = ExecutorShutdownObserver::channel(original.observer());
+        drop(original);
+        reporter.retired(None);
+        observer
+    }
     fn info(&self) -> &ModelInfo {
         self.metadata.info()
     }
@@ -255,16 +311,21 @@ impl ModelExecutor for ScriptedExecutor {
             cursor.frontier = completion.next_frontier().clone();
             match input.work() {
                 TokenWork::Prefill(chunk) if chunk.is_final() => {
-                    *self.prefill_tokens.lock().unwrap() = cursor.prompt.to_vec();
-                    self.prompt_tokens
+                    *self.observation.prefill_tokens.lock().unwrap() = cursor.prompt.to_vec();
+                    self.observation
+                        .prompt_tokens
                         .store(cursor.prompt.len(), Ordering::Relaxed);
                 }
-                TokenWork::Decode { token, .. } => self.decoded_inputs.lock().unwrap().push(token),
+                TokenWork::Decode { token, .. } => {
+                    self.observation.decoded_inputs.lock().unwrap().push(token)
+                }
                 _ => {}
             }
             if matches!(completion.product(), ExecutionProduct::Sampling(_)) {
                 cursor.next += 1;
-                self.generated_tokens.fetch_add(1, Ordering::Relaxed);
+                self.observation
+                    .generated_tokens
+                    .fetch_add(1, Ordering::Relaxed);
             }
         }
         Ok(batch

@@ -18,7 +18,7 @@ fn make_engine_with_blocks(max_blocks: usize) -> ContinuousBatchEngine {
     let tokenizer = Arc::new(MockTokenizer::new(VOCAB));
     let sampler = Arc::new(MockSampler);
     let kv_cache = Arc::new(MockKvCacheManager::new(max_blocks));
-    let executor = Arc::new(MockModelExecutor::instant(VOCAB));
+    let executor = MockModelExecutor::instant(VOCAB);
     let tensor_factory = Arc::new(MockTensorFactory);
     ContinuousBatchEngine::new(
         config,
@@ -26,7 +26,7 @@ fn make_engine_with_blocks(max_blocks: usize) -> ContinuousBatchEngine {
         tokenizer,
         sampler,
         kv_cache,
-        executor,
+        ferrum_execution::executor_lifecycle::ExecutorOwner::new(Box::new(executor)),
         tensor_factory,
     )
     .expect("legacy engine composition must match executor authority")

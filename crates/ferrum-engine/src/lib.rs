@@ -47,6 +47,8 @@
 
 pub mod builder;
 pub mod continuous_engine;
+mod executor_binding;
+pub use executor_binding::{EngineExecutor, IntoEngineExecutor};
 pub(crate) mod layer_split;
 pub mod parallel;
 mod product_composition;

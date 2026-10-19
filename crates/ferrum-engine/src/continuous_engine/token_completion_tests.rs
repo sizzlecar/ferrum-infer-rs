@@ -3,6 +3,9 @@
 //! admission, full-vocabulary forward, KV and terminal identity stay real.
 
 use super::*;
+use ferrum_execution::executor_lifecycle::{
+    ExecutorOwner, ExecutorScope, ExecutorShutdownObserver, ExecutorShutdownPermit,
+};
 use ferrum_execution::model_executor::{
     ExecutorCapabilities, ExecutorStatus, KvSlotRequest, PrefillChunk,
 };
@@ -23,13 +26,95 @@ use std::sync::atomic::AtomicUsize;
 mod failure;
 
 pub(super) struct ModelObservation {
-    pub(super) model: LlamaFamilyModel<CpuBackend>,
+    pub(super) model: ModelSnapshot,
     pub(super) releases: Vec<Vec<usize>>,
 }
 
+#[derive(Default)]
+pub(super) struct ModelSnapshot {
+    pub(super) kv_caches: HashMap<String, Vec<LayerSnapshot>>,
+}
+
+pub(super) struct LayerSnapshot {
+    pub(super) len: usize,
+}
+
+/// Test observation can temporarily retain the original, accounted use scope,
+/// but never retains an unscoped implementation or final-close permission.
+pub(super) struct ScopedExecutorObservation {
+    scope: Mutex<Weak<ExecutorScope>>,
+}
+
+impl ScopedExecutorObservation {
+    pub(super) fn unbound() -> Self {
+        Self {
+            scope: Mutex::new(Weak::new()),
+        }
+    }
+    pub(super) fn bound(scope: &Arc<ExecutorScope>) -> Self {
+        let value = Self::unbound();
+        value.bind(scope);
+        value
+    }
+    pub(super) fn bind(&self, scope: &Arc<ExecutorScope>) {
+        *self.scope.lock() = Arc::downgrade(scope);
+    }
+    fn scope(&self) -> Result<Arc<ExecutorScope>> {
+        self.scope
+            .lock()
+            .upgrade()
+            .ok_or_else(|| FerrumError::request_validation("fixture executor scope has retired"))
+    }
+    pub(super) async fn admit_tokens(
+        &self,
+        input: ExecutionAdmission<'_>,
+    ) -> Result<TokenAdmissionOutcome> {
+        self.scope()?.admit_tokens(input).await
+    }
+    pub(super) async fn execute_tokens(
+        &self,
+        input: &[ExecutionWork<'_>],
+    ) -> Result<ExecutionBatchOutcome> {
+        self.scope()?.execute_tokens(input).await
+    }
+    pub(super) async fn finish_tokens(
+        &self,
+        sequence: &ExecutorSequence,
+        reason: ExecutionEndReason,
+    ) -> Result<ExecutionCloseOutcome> {
+        self.scope()?.finish_tokens(sequence, reason).await
+    }
+    pub(super) fn cancel_tokens(
+        &self,
+        sequence: &ExecutorSequence,
+    ) -> Result<ExecutionCloseOutcome> {
+        self.scope()?.cancel_tokens(sequence)
+    }
+}
+
 struct ObservedModel {
+    model: LlamaFamilyModel<CpuBackend>,
     state: Arc<Mutex<ModelObservation>>,
     config: LlmRuntimeConfig,
+}
+
+impl ObservedModel {
+    fn publish_snapshot(&self) {
+        self.state.lock().model.kv_caches = self
+            .model
+            .kv_caches
+            .iter()
+            .map(|(id, layers)| {
+                (
+                    id.clone(),
+                    layers
+                        .iter()
+                        .map(|layer| LayerSnapshot { len: layer.len })
+                        .collect(),
+                )
+            })
+            .collect();
+    }
 }
 
 impl DecoderOnlyLLM for ObservedModel {
@@ -40,23 +125,28 @@ impl DecoderOnlyLLM for ObservedModel {
         ferrum_models::ModelTokenExecutionMode::InlineSynchronous
     }
     fn prepare_token_kv(&mut self, request: ModelKvPreparation<'_>) -> Result<ModelKvReservation> {
-        self.state.lock().model.prepare_token_kv(request)
+        let result = self.model.prepare_token_kv(request);
+        self.publish_snapshot();
+        result
     }
     fn reserve_kv_slots(
         &mut self,
         requests: &[KvSlotRequest],
     ) -> Result<Option<ferrum_execution::model_executor::KvSlotReservation>> {
-        self.state.lock().model.reserve_kv_slots(requests)
+        let result = self.model.reserve_kv_slots(requests);
+        self.publish_snapshot();
+        result
     }
     fn execute_token_work(
         &mut self,
         input: &ModelTokenInput<'_>,
     ) -> ModelTokenOutcome<ModelTokenProduct> {
-        self.state.lock().model.execute_token_work(input)
+        let result = self.model.execute_token_work(input);
+        self.publish_snapshot();
+        result
     }
     fn close_token_sequence(&mut self, id: &str) -> Result<()> {
-        let mut state = self.state.lock();
-        let lengths = state
+        let lengths = self
             .model
             .kv_caches
             .get(id)
@@ -64,12 +154,19 @@ impl DecoderOnlyLLM for ObservedModel {
             .iter()
             .map(|layer| layer.len)
             .collect();
-        state.model.close_token_sequence(id)?;
-        state.releases.push(lengths);
+        self.model.close_token_sequence(id)?;
+        self.publish_snapshot();
+        self.state.lock().releases.push(lengths);
         Ok(())
     }
     fn release(&mut self, id: &str) {
-        self.state.lock().model.release(id);
+        self.model.release(id);
+        self.publish_snapshot();
+    }
+    fn retire_model(&mut self) -> ferrum_models::common::ModelRetirementOutcome {
+        let result = self.model.retire_model();
+        self.publish_snapshot();
+        result
     }
     fn prefill(&mut self, _: &str, _: &[u32]) -> Vec<f32> {
         panic!("test must use the direct token core")
@@ -80,7 +177,22 @@ impl DecoderOnlyLLM for ObservedModel {
 }
 
 pub(super) struct CloseGate {
-    inner: Arc<dyn ModelExecutor>,
+    inner: Arc<ExecutorScope>,
+    owner: ExecutorOwner,
+    observation: Arc<CloseGateObservation>,
+}
+
+impl std::ops::Deref for CloseGate {
+    type Target = CloseGateObservation;
+    fn deref(&self) -> &Self::Target {
+        &self.observation
+    }
+}
+
+pub(super) struct CloseGateObservation {
+    // These weak use-scope handles never retain a whole-model close authority.
+    inner: ScopedExecutorObservation,
+    execution: ScopedExecutorObservation,
     gate: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
     started: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
     publication_error: bool,
@@ -90,17 +202,59 @@ pub(super) struct CloseGate {
     cancels: AtomicUsize,
 }
 
-impl CloseGate {
+impl CloseGateObservation {
     pub(super) fn close_call_counts(&self) -> (usize, usize) {
         (
             self.finishes.load(Ordering::SeqCst),
             self.cancels.load(Ordering::SeqCst),
         )
     }
+
+    pub(super) async fn admit_tokens(
+        &self,
+        input: ExecutionAdmission<'_>,
+    ) -> Result<TokenAdmissionOutcome> {
+        self.execution.admit_tokens(input).await
+    }
+    pub(super) async fn execute_tokens(
+        &self,
+        input: &[ExecutionWork<'_>],
+    ) -> Result<ExecutionBatchOutcome> {
+        self.execution.execute_tokens(input).await
+    }
+    pub(super) fn cancel_tokens(
+        &self,
+        sequence: &ExecutorSequence,
+    ) -> Result<ExecutionCloseOutcome> {
+        self.execution.cancel_tokens(sequence)
+    }
 }
 
 #[async_trait::async_trait]
 impl ModelExecutor for CloseGate {
+    fn begin_shutdown(
+        self: Arc<Self>,
+        permit: &ExecutorShutdownPermit,
+    ) -> ExecutorShutdownObserver {
+        if let Err(error) = permit.check(self.as_ref()) {
+            return ExecutorShutdownObserver::retained(Arc::new(self), error);
+        }
+        match Arc::try_unwrap(self) {
+            Ok(Self {
+                inner,
+                owner,
+                observation,
+            }) => {
+                drop(inner);
+                drop(observation);
+                owner.begin_shutdown()
+            }
+            Err(original) => ExecutorShutdownObserver::retained(
+                Arc::new(original),
+                FerrumError::internal("close fixture still has an unscoped execution owner"),
+            ),
+        }
+    }
     fn info(&self) -> &ferrum_types::ModelInfo {
         self.inner.info()
     }
@@ -157,7 +311,8 @@ impl ModelExecutor for CloseGate {
 
 pub(super) struct Fixture {
     pub(super) engine: ContinuousBatchEngine,
-    pub(super) executor: Arc<CloseGate>,
+    pub(super) original_inner: Weak<EngineInner>,
+    pub(super) executor: Arc<CloseGateObservation>,
     pub(super) model: Arc<Mutex<ModelObservation>>,
     pub(super) identity: ExecutorSequence,
     pub(super) request_id: RequestId,
@@ -170,26 +325,27 @@ pub(super) struct Fixture {
     pub(super) layers: usize,
 }
 
-pub(super) fn observed_cpu_model() -> (
-    Arc<LlmExecutor>,
+pub(super) fn observed_cpu_model_owned() -> (
+    Box<LlmExecutor>,
     Arc<Mutex<ModelObservation>>,
     TinyLlamaConfig,
 ) {
     let cfg = TinyLlamaConfig::default();
     let model = tiny_llama_model(&cfg);
     let runtime_config = model.config().clone();
-    let model = Arc::new(Mutex::new(ModelObservation {
-        model,
+    let observation = Arc::new(Mutex::new(ModelObservation {
+        model: ModelSnapshot::default(),
         releases: Vec::new(),
     }));
-    let inner = Arc::new(LlmExecutor::new(
+    let inner = Box::new(LlmExecutor::new(
         Box::new(ObservedModel {
-            state: Arc::clone(&model),
+            model,
+            state: Arc::clone(&observation),
             config: runtime_config,
         }),
         tiny_model_info(&cfg),
     ));
-    (inner, model, cfg)
+    (inner, observation, cfg)
 }
 
 pub(super) async fn fixture(delayed: bool, publication_error: bool) -> Fixture {
@@ -204,11 +360,14 @@ pub(super) async fn fixture_with_tokenizer(
     publication_error: bool,
     make_tokenizer: impl FnOnce(usize) -> Arc<dyn Tokenizer>,
 ) -> Fixture {
-    let (inner, model, cfg) = observed_cpu_model();
+    let (inner, model, cfg) = observed_cpu_model_owned();
+    let owner = ExecutorOwner::new(inner);
+    let inner = Arc::new(owner.scope().unwrap());
     let (gate, receiver) = tokio::sync::oneshot::channel();
     let (started_sender, started) = tokio::sync::oneshot::channel();
-    let executor = Arc::new(CloseGate {
-        inner,
+    let executor = Arc::new(CloseGateObservation {
+        inner: ScopedExecutorObservation::bound(&inner),
+        execution: ScopedExecutorObservation::unbound(),
         gate: Mutex::new(delayed.then_some(receiver)),
         started: Mutex::new(Some(started_sender)),
         publication_error,
@@ -217,6 +376,11 @@ pub(super) async fn fixture_with_tokenizer(
         finishes: AtomicUsize::new(0),
         cancels: AtomicUsize::new(0),
     });
+    let owned_executor = ExecutorOwner::new(Box::new(CloseGate {
+        inner,
+        owner,
+        observation: Arc::clone(&executor),
+    }));
     let trace = tempfile::tempdir().unwrap();
     let mut config = EngineConfig::default();
     config.backend.device = Device::CPU;
@@ -245,10 +409,14 @@ pub(super) async fn fixture_with_tokenizer(
         tokenizer.clone(),
         Arc::new(crate::registry::GreedySampler),
         kv,
-        executor.clone(),
+        owned_executor,
         Arc::new(crate::tensor_factory::CandleTensorFactory::new(Device::CPU)),
     )
     .unwrap();
+    executor
+        .execution
+        .bind(&engine.active_inner().unwrap().model_executor);
+    let engine_inner = engine.active_inner().unwrap();
     let mut request = InferenceRequest::new("real token closure", "tiny-llama-test");
     request.sampling_params.max_tokens = 4;
     request.sampling_params.temperature = 0.0;
@@ -317,15 +485,16 @@ pub(super) async fn fixture_with_tokenizer(
     state.record_decode_ready();
     state.record_generated_token_commit();
     let (response_sender, response) = tokio::sync::oneshot::channel();
-    let (stream_sender, stream) = engine.inner.output_channel(request_id.clone(), 16).unwrap();
+    let (stream_sender, stream) = engine_inner.output_channel(request_id.clone(), 16).unwrap();
     state.response_sender = Some(response_sender);
     state.stream_sender = Some(stream_sender);
-    let mut slot = RequestSlotLease::open(&engine.inner, request_id.clone());
-    slot.admit(&engine.inner);
+    let mut slot = RequestSlotLease::open(&engine_inner, request_id.clone());
+    slot.admit(&engine_inner);
     state.request_slot = Some(slot);
-    engine.inner.sequences.insert(request_id.clone(), state);
+    engine_inner.sequences.insert(request_id.clone(), state);
     assert_eq!(model.lock().model.kv_caches.len(), 1);
     Fixture {
+        original_inner: Arc::downgrade(&engine_inner),
         engine,
         executor,
         model,
@@ -342,9 +511,11 @@ pub(super) async fn fixture_with_tokenizer(
 }
 
 pub(super) fn slot_events(fixture: &Fixture, action: ResourceAction) -> usize {
-    fixture
-        .engine
-        .inner
+    let inner = fixture
+        .original_inner
+        .upgrade()
+        .expect("original trace scope remains live");
+    inner
         .scheduler_trace_jsonl
         .as_ref()
         .unwrap()
@@ -360,9 +531,10 @@ pub(super) fn slot_events(fixture: &Fixture, action: ResourceAction) -> usize {
 }
 
 pub(super) async fn assert_closed_once(fixture: &Fixture) {
-    fixture.engine.inner.execution_closes.join_observers().await;
-    fixture.engine.inner.drain_execution_closes().unwrap();
-    assert_eq!(fixture.engine.inner.execution_closes.unreclaimed_count(), 0);
+    let inner = fixture.engine.active_inner().unwrap();
+    inner.execution_closes.join_observers().await;
+    inner.drain_execution_closes().unwrap();
+    assert_eq!(inner.execution_closes.unreclaimed_count(), 0);
     assert_eq!(
         fixture.identity.observed_end().unwrap().sequence(),
         &fixture.identity
@@ -377,22 +549,12 @@ pub(super) async fn assert_closed_once(fixture: &Fixture) {
     }
     assert_eq!(slot_events(fixture, ResourceAction::Release), 1);
     assert_eq!(slot_events(fixture, ResourceAction::RequestClose), 1);
-    assert_eq!(
-        fixture
-            .engine
-            .inner
-            .scheduler
-            .trace_snapshot()
-            .capacity_release_epoch,
-        1
-    );
-    fixture
-        .engine
-        .inner
+    assert_eq!(inner.scheduler.trace_snapshot().capacity_release_epoch, 1);
+    inner
         .complete_request_for_test(&fixture.request_id, FinishReason::Length)
         .await
         .unwrap();
-    fixture.engine.inner.drain_execution_closes().unwrap();
+    inner.drain_execution_closes().unwrap();
     assert_eq!(slot_events(fixture, ResourceAction::Release), 1);
     assert_eq!(fixture.model.lock().releases.len(), 1);
 }
@@ -400,27 +562,16 @@ pub(super) async fn assert_closed_once(fixture: &Fixture) {
 #[tokio::test]
 async fn token_completion_cpu_caller_cancel_preserves_actual_close_owner() {
     let mut fixture = fixture(true, false).await;
-    let mut completion = Box::pin(
-        fixture
-            .engine
-            .inner
-            .complete_request_for_test(&fixture.request_id, FinishReason::Length),
-    );
+    let inner = fixture.engine.active_inner().unwrap();
+    let mut completion =
+        Box::pin(inner.complete_request_for_test(&fixture.request_id, FinishReason::Length));
     tokio::select! {
         result = completion.as_mut() => panic!("completion escaped the blocked actual close: {result:?}"),
         started = &mut fixture.started => started.unwrap(),
     }
-    assert!(!fixture
-        .engine
-        .inner
-        .sequences
-        .get(&fixture.request_id)
-        .is_some());
-    assert_eq!(
-        fixture.engine.inner.scheduler.trace_snapshot().active_len,
-        0
-    );
-    assert_eq!(fixture.engine.inner.execution_closes.unreclaimed_count(), 1);
+    assert!(!inner.sequences.get(&fixture.request_id).is_some());
+    assert_eq!(inner.scheduler.trace_snapshot().active_len, 0);
+    assert_eq!(inner.execution_closes.unreclaimed_count(), 1);
     assert!(fixture.identity.observed_end().is_none());
     assert_eq!(fixture.model.lock().model.kv_caches.len(), 1);
     assert_eq!(slot_events(&fixture, ResourceAction::Release), 0);
@@ -434,9 +585,8 @@ async fn token_completion_cpu_caller_cancel_preserves_actual_close_owner() {
 #[tokio::test]
 async fn token_completion_cpu_real_ended_preserves_publication_error() {
     let mut fixture = fixture(false, true).await;
-    let error = fixture
-        .engine
-        .inner
+    let inner = fixture.engine.active_inner().unwrap();
+    let error = inner
         .complete_request_for_test(&fixture.request_id, FinishReason::Length)
         .await
         .unwrap_err();
@@ -474,15 +624,14 @@ async fn token_completion_cpu_real_ended_preserves_publication_error() {
 #[tokio::test]
 async fn token_completion_cpu_observed_close_is_consumed_without_reclosing() {
     let mut fixture = fixture(false, false).await;
+    let inner = fixture.engine.active_inner().unwrap();
     let outcome = fixture
         .executor
         .inner
         .cancel_tokens(&fixture.identity)
         .unwrap()
         .with_error(FerrumError::backend("original interrupted close error"));
-    fixture
-        .engine
-        .inner
+    inner
         .sequences
         .get(&fixture.request_id)
         .unwrap()
@@ -490,9 +639,7 @@ async fn token_completion_cpu_observed_close_is_consumed_without_reclosing() {
         .as_mut()
         .unwrap()
         .execution_close = Some(Box::new(Mutex::new(outcome)));
-    let error = fixture
-        .engine
-        .inner
+    let error = inner
         .complete_request_for_test(&fixture.request_id, FinishReason::Error)
         .await
         .unwrap_err();
@@ -516,8 +663,9 @@ async fn token_completion_cpu_observed_close_is_consumed_without_reclosing() {
 #[tokio::test]
 async fn token_completion_cpu_stale_failure_does_not_repeat_release_or_close_replacement() {
     let fixture = fixture(false, false).await;
+    let inner = fixture.engine.active_inner().unwrap();
     let (request, prompt, original) = {
-        let states = &fixture.engine.inner.sequences;
+        let states = &inner.sequences;
         let state_handle = states.get(&fixture.request_id).unwrap();
         let state_guard = state_handle.lock();
         let state = state_guard.as_ref().unwrap();
@@ -527,9 +675,7 @@ async fn token_completion_cpu_stale_failure_does_not_repeat_release_or_close_rep
             state.execution_frontier.clone().unwrap(),
         )
     };
-    fixture
-        .engine
-        .inner
+    inner
         .complete_request_for_test(&fixture.request_id, FinishReason::Length)
         .await
         .unwrap();
@@ -554,16 +700,8 @@ async fn token_completion_cpu_stale_failure_does_not_repeat_release_or_close_rep
         panic!("replacement must genuinely admit");
     };
     assert_ne!(start.sequence(), original.sequence());
-    fixture
-        .engine
-        .inner
-        .scheduler
-        .submit(request.clone())
-        .await
-        .unwrap();
-    let scheduled = fixture
-        .engine
-        .inner
+    inner.scheduler.submit(request.clone()).await.unwrap();
+    let scheduled = inner
         .scheduler
         .next_batch(ferrum_interfaces::BatchHint::simple(1))
         .await
@@ -605,7 +743,7 @@ async fn token_completion_cpu_stale_failure_does_not_repeat_release_or_close_rep
     let mut state = SequenceState::new_with_tokenizer_and_model_vocab_size(
         request,
         prompt.clone(),
-        Some(fixture.engine.inner.tokenizer.clone()),
+        Some(inner.tokenizer.clone()),
         Some(cfg.vocab_size),
     );
     state.execution_frontier = Some(replacement.clone());
@@ -614,18 +752,14 @@ async fn token_completion_cpu_stale_failure_does_not_repeat_release_or_close_rep
     state.generated_tokens.push(sampled);
     state.record_decode_ready();
     state.record_generated_token_commit();
-    let mut slot = RequestSlotLease::open(&fixture.engine.inner, fixture.request_id.clone());
-    slot.admit(&fixture.engine.inner);
+    let mut slot = RequestSlotLease::open(&inner, fixture.request_id.clone());
+    slot.admit(&inner);
     state.request_slot = Some(slot);
-    assert!(fixture
-        .engine
-        .inner
+    assert!(inner
         .sequences
         .insert(fixture.request_id.clone(), state)
         .is_none());
-    fixture
-        .engine
-        .inner
+    inner
         .scheduler
         .mark_prefill_complete(&fixture.request_id, prompt.len());
 
@@ -635,9 +769,7 @@ async fn token_completion_cpu_stale_failure_does_not_repeat_release_or_close_rep
             ExecutionCloseOutcome::ended(original.sequence().observed_end().unwrap())
                 .with_error(old_error.clone())
         });
-        let error = fixture
-            .engine
-            .inner
+        let error = inner
             .fail_token_frontier(&fixture.request_id, &original, old_error, outcome)
             .await
             .unwrap_err();
@@ -648,23 +780,15 @@ async fn token_completion_cpu_stale_failure_does_not_repeat_release_or_close_rep
             // validation. Its not-live error is preserved, not called success.
             assert!(error.to_string().contains("token incarnation is not live"));
         }
-        fixture.engine.inner.execution_closes.join_observers().await;
-        fixture.engine.inner.drain_execution_closes().unwrap();
-        assert_eq!(fixture.engine.inner.execution_closes.unreclaimed_count(), 0);
-        assert_eq!(
-            fixture
-                .engine
-                .inner
-                .scheduler
-                .trace_snapshot()
-                .capacity_release_epoch,
-            1
-        );
+        inner.execution_closes.join_observers().await;
+        inner.drain_execution_closes().unwrap();
+        assert_eq!(inner.execution_closes.unreclaimed_count(), 0);
+        assert_eq!(inner.scheduler.trace_snapshot().capacity_release_epoch, 1);
         assert_eq!(fixture.executor.cancels.load(Ordering::SeqCst), 1);
         assert_eq!(slot_events(&fixture, ResourceAction::Release), 1);
         assert_eq!(slot_events(&fixture, ResourceAction::RequestClose), 1);
         {
-            let states = &fixture.engine.inner.sequences;
+            let states = &inner.sequences;
             let state_handle = states.get(&fixture.request_id).unwrap();
             let state_guard = state_handle.lock();
             let state = state_guard.as_ref().unwrap();
@@ -712,7 +836,7 @@ async fn token_completion_cpu_stale_failure_does_not_repeat_release_or_close_rep
         &reference.decode("replacement-reference", sampled.get(), prompt.len() as u32)
     );
     {
-        let states = &fixture.engine.inner.sequences;
+        let states = &inner.sequences;
         let state_handle = states.get(&fixture.request_id).unwrap();
         let mut state_guard = state_handle.lock();
         let state = state_guard.as_mut().unwrap();
@@ -728,24 +852,14 @@ async fn token_completion_cpu_stale_failure_does_not_repeat_release_or_close_rep
         state.record_decode_ready();
         state.record_generated_token_commit();
     }
-    fixture
-        .engine
-        .inner
+    inner
         .complete_request_for_test(&fixture.request_id, FinishReason::Error)
         .await
         .unwrap();
-    fixture.engine.inner.execution_closes.join_observers().await;
-    fixture.engine.inner.drain_execution_closes().unwrap();
-    assert_eq!(fixture.engine.inner.execution_closes.unreclaimed_count(), 0);
-    assert_eq!(
-        fixture
-            .engine
-            .inner
-            .scheduler
-            .trace_snapshot()
-            .capacity_release_epoch,
-        2
-    );
+    inner.execution_closes.join_observers().await;
+    inner.drain_execution_closes().unwrap();
+    assert_eq!(inner.execution_closes.unreclaimed_count(), 0);
+    assert_eq!(inner.scheduler.trace_snapshot().capacity_release_epoch, 2);
     assert_eq!(slot_events(&fixture, ResourceAction::Release), 2);
     assert_eq!(slot_events(&fixture, ResourceAction::RequestClose), 2);
     assert!(replacement.sequence().observed_end().is_some());

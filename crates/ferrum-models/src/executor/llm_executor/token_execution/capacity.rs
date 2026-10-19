@@ -48,7 +48,7 @@ impl LlmExecutor {
             .iter()
             .map(|(_, id)| id.as_str())
             .collect::<Vec<_>>();
-        let mut observed = match self.lock_model().observe_token_allocator_reclaim(
+        let mut observed = match self.lock_model()?.observe_token_allocator_reclaim(
             &blocked_cache,
             domain,
             &cache_ids,

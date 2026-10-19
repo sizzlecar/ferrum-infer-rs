@@ -10,6 +10,8 @@
 pub mod bench;
 mod configurable_executor;
 mod executor;
+mod executor_observation;
+mod host_shutdown;
 mod kv_cache;
 pub mod op_diff;
 pub mod paged_executor;
@@ -19,6 +21,7 @@ mod tokenizer;
 
 pub use configurable_executor::ConfigurableModelExecutor;
 pub use executor::MockModelExecutor;
+pub use executor_observation::ExecutorObservation;
 pub use kv_cache::{MockKvCacheHandle, MockKvCacheManager};
 pub use paged_executor::{PagedAttentionExecutor, PagedExecutorConfig};
 pub use sampler::MockSampler;

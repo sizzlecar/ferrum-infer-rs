@@ -12,6 +12,7 @@ use std::sync::Arc;
 pub(crate) use crate::test_support::native_program as fixture;
 mod lifecycle;
 mod observability;
+mod shutdown;
 mod startup;
 mod token_execution;
 use fixture::{Fixture, FixtureOptions};
@@ -53,6 +54,60 @@ fn cpu_with_precision(
             nonfinite_token: nonfinite,
             ..FixtureOptions::default()
         },
+    )
+}
+
+#[cfg(feature = "cuda")]
+fn cuda(
+    mode: SamplingReadbackMode,
+    nonfinite: Option<usize>,
+    logits_type: ElementType,
+) -> Fixture<ferrum_kernels::backend::cuda::vnext_runtime::CudaDeviceRuntime> {
+    use ferrum_kernels::backend::cuda::vnext_ops::CudaVNextComposition;
+    let identity = if logits_type == ElementType::F16 {
+        "device.fixture.sampling-readback-f16"
+    } else {
+        "device.fixture.sampling-readback"
+    };
+    let (runtime, registry, materializers, catalog) = CudaVNextComposition::create(
+        0,
+        DeviceId::new(identity).unwrap(),
+        AttentionExecutionPolicy::Portable,
+    )
+    .unwrap()
+    .into_parts();
+    Fixture::new(
+        mode,
+        Device::CUDA(0),
+        runtime,
+        registry,
+        materializers,
+        catalog,
+        FixtureOptions {
+            logits_type,
+            nonfinite_token: nonfinite,
+            ..FixtureOptions::default()
+        },
+    )
+}
+
+#[cfg(feature = "metal")]
+fn metal(
+    mode: SamplingReadbackMode,
+) -> Fixture<ferrum_kernels::backend::metal::vnext_runtime::MetalDeviceRuntime> {
+    use ferrum_kernels::backend::metal::vnext_ops::MetalVNextComposition;
+    let (runtime, registry, materializers, _, catalog) =
+        MetalVNextComposition::create(DeviceId::new("device.fixture.sampling-readback").unwrap())
+            .unwrap()
+            .into_parts();
+    Fixture::new(
+        mode,
+        Device::Metal,
+        runtime,
+        registry,
+        materializers,
+        catalog,
+        FixtureOptions::default(),
     )
 }
 
@@ -117,29 +172,7 @@ async fn sampling_readback_cpu_f16_terminal_keeps_nonfinite_failure_request_loca
 #[tokio::test]
 #[ignore = "requires exclusive CUDA and real F32 language providers"]
 async fn sampling_readback_cuda_terminal_preserves_mixed_outputs_masks_order_and_bytes() {
-    use ferrum_kernels::backend::cuda::vnext_ops::CudaVNextComposition;
-    let make = |mode, nonfinite| {
-        let (runtime, registry, materializers, catalog) = CudaVNextComposition::create(
-            0,
-            DeviceId::new("device.fixture.sampling-readback").unwrap(),
-            AttentionExecutionPolicy::Portable,
-        )
-        .unwrap()
-        .into_parts();
-        Fixture::new(
-            mode,
-            Device::CUDA(0),
-            runtime,
-            registry,
-            materializers,
-            catalog,
-            FixtureOptions {
-                logits_type: ElementType::F32,
-                nonfinite_token: nonfinite,
-                ..FixtureOptions::default()
-            },
-        )
-    };
+    let make = |mode, nonfinite| cuda(mode, nonfinite, ElementType::F32);
     compare(
         make(SamplingReadbackMode::Uniform, None),
         make(SamplingReadbackMode::Participant, None),
@@ -156,29 +189,7 @@ async fn sampling_readback_cuda_terminal_preserves_mixed_outputs_masks_order_and
 #[tokio::test]
 #[ignore = "requires exclusive CUDA and real F16 language providers"]
 async fn sampling_readback_cuda_f16_terminal_preserves_mixed_outputs_and_failure_scope() {
-    use ferrum_kernels::backend::cuda::vnext_ops::CudaVNextComposition;
-    let make = |mode, nonfinite| {
-        let (runtime, registry, materializers, catalog) = CudaVNextComposition::create(
-            0,
-            DeviceId::new("device.fixture.sampling-readback-f16").unwrap(),
-            AttentionExecutionPolicy::Portable,
-        )
-        .unwrap()
-        .into_parts();
-        Fixture::new(
-            mode,
-            Device::CUDA(0),
-            runtime,
-            registry,
-            materializers,
-            catalog,
-            FixtureOptions {
-                logits_type: ElementType::F16,
-                nonfinite_token: nonfinite,
-                ..FixtureOptions::default()
-            },
-        )
-    };
+    let make = |mode, nonfinite| cuda(mode, nonfinite, ElementType::F16);
     compare(
         make(SamplingReadbackMode::Uniform, None),
         make(SamplingReadbackMode::Participant, None),

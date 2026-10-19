@@ -230,8 +230,14 @@ pub fn tiny_model_info(cfg: &TinyLlamaConfig) -> ModelInfo {
 /// Build a real [`ModelExecutor`] wrapping the tiny model — the seam the
 /// engine scheduler calls. Real forward, real KV, no mock.
 pub fn tiny_llama_executor(cfg: &TinyLlamaConfig) -> Arc<dyn ModelExecutor> {
+    Arc::from(tiny_llama_executor_owned(cfg))
+}
+
+/// Build the same real model without manufacturing a shared executor owner.
+/// Product lifecycle tests can transfer this value into `ExecutorOwner`.
+pub fn tiny_llama_executor_owned(cfg: &TinyLlamaConfig) -> Box<dyn ModelExecutor> {
     let model = tiny_llama_model(cfg);
-    Arc::new(LlmExecutor::new(Box::new(model), tiny_model_info(cfg)))
+    Box::new(LlmExecutor::new(Box::new(model), tiny_model_info(cfg)))
 }
 
 /// Build a [`TinyTokenizer`] whose vocab matches the model's.

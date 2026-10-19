@@ -24,6 +24,8 @@ struct Context {
     begins: Arc<AtomicUsize>,
     retired: Arc<AtomicUsize>,
     storage_retirement_blocked: Arc<AtomicBool>,
+    retirement_blocked: Arc<AtomicBool>,
+    terminal_error: Arc<AtomicBool>,
     // Armed only by the LoRA allocation-failure test on its original context.
     successful_allocations_before_failure: Option<usize>,
 }
@@ -70,6 +72,8 @@ impl Backend for TrackedCpu {
             begins: Arc::new(AtomicUsize::new(0)),
             retired: Arc::new(AtomicUsize::new(0)),
             storage_retirement_blocked: Arc::new(AtomicBool::new(false)),
+            retirement_blocked: Arc::new(AtomicBool::new(false)),
+            terminal_error: Arc::new(AtomicBool::new(false)),
             successful_allocations_before_failure: None,
         })
     }
@@ -92,12 +96,19 @@ impl Backend for TrackedCpu {
             BackendCompletion::Unresolved(FerrumError::backend(
                 "controlled original context remains unresolved",
             ))
+        } else if ctx.terminal_error.load(Ordering::SeqCst) {
+            BackendCompletion::Failed(FerrumError::backend("controlled original terminal failure"))
         } else {
             BackendCompletion::Succeeded
         }
     }
     fn retire_context(ctx: &mut Context) -> Result<()> {
-        Self::observe_completion(ctx).into_result()?;
+        if let BackendCompletion::Unresolved(error) = Self::observe_completion(ctx) {
+            return Err(error);
+        }
+        if ctx.retirement_blocked.load(Ordering::SeqCst) {
+            return Err(FerrumError::backend("controlled original cleanup failure"));
+        }
         ctx.retired.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
@@ -908,6 +919,104 @@ fn instance_context_unresolved_retains_original_owner_until_recovery() {
     assert_eq!(model.scratch.residual.as_ref().unwrap().as_ptr(), original);
     model.close().unwrap();
     assert_eq!(retired.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn instance_context_whole_retirement_preserves_failed_cleanup_owner_for_retry() {
+    use crate::common::ModelRetirementOutcome;
+    let mut model = tracked_model();
+    let loader = SyntheticLlamaLoader::new(config());
+    let mut reference = LlamaFamilyModel::<CpuBackend>::new(config(), &loader).unwrap();
+    let actual = model.prefill_internal("actual", &[1, 2, 3]);
+    let expected = reference.prefill_internal("reference", &[1, 2, 3]);
+    assert_eq!(actual.len(), expected.len());
+    for (actual, expected) in actual.into_iter().zip(expected) {
+        assert!(actual.is_finite() && expected.is_finite());
+        assert_eq!(actual, expected);
+    }
+    let context = model.execution_context.as_ref().unwrap();
+    let original = Arc::downgrade(&context.identity);
+    let retired = Arc::clone(&context.retired);
+    let blocked = Arc::clone(&context.retirement_blocked);
+    struct Restore(Arc<AtomicBool>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            self.0.store(false, Ordering::SeqCst);
+        }
+    }
+    let _restore = Restore(Arc::clone(&blocked));
+    blocked.store(true, Ordering::SeqCst);
+    let scratch = model.scratch.residual.as_ref().unwrap().as_ptr();
+    let ModelRetirementOutcome::Retained { error } = model.retire_model() else {
+        panic!("failed cleanup must retain original context")
+    };
+    assert!(error
+        .to_string()
+        .contains("controlled original cleanup failure"));
+    assert!(original.upgrade().is_some());
+    assert_eq!(retired.load(Ordering::SeqCst), 0);
+    assert_eq!(model.scratch.residual.as_ref().unwrap().as_ptr(), scratch);
+    blocked.store(false, Ordering::SeqCst);
+    assert!(matches!(
+        model.retire_model(),
+        ModelRetirementOutcome::Retired { error: None }
+    ));
+    assert!(model.execution_context.is_none());
+    assert!(original.upgrade().is_none());
+    assert_eq!(retired.load(Ordering::SeqCst), 1);
+    reference.close().unwrap();
+}
+
+#[test]
+fn instance_context_whole_retirement_reports_terminal_error_with_released_owner() {
+    use crate::common::ModelRetirementOutcome;
+    let mut model = tracked_model();
+    let context = model.execution_context.as_ref().unwrap();
+    let original = Arc::downgrade(&context.identity);
+    let unresolved = Arc::clone(&context.unresolved);
+    let terminal_error = Arc::clone(&context.terminal_error);
+    let retired = Arc::clone(&context.retired);
+    struct Restore(Arc<AtomicBool>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            self.0.store(false, Ordering::SeqCst);
+        }
+    }
+    let _restore = Restore(Arc::clone(&unresolved));
+    let result: DeviceFrameResult<()> = model.run_device_frame(|model, frame| {
+        frame
+            .take_scratch(&mut model.scratch, FrameLayout::Single, false)
+            .unwrap();
+        let residual = frame.residual.as_mut().unwrap();
+        TrackedCpu::write_f32_to_activation(&mut frame.context, residual, &[3.0; 16]);
+        TrackedCpu::scale_inplace(&mut frame.context, residual, 2.0, 16);
+        frame.context.unresolved.store(true, Ordering::SeqCst);
+        std::panic::panic_any(FerrumError::backend("controlled original encoded failure"));
+    });
+    assert!(matches!(result, DeviceFrameResult::Held(_)));
+    assert_eq!(
+        model
+            .pending_device_frame
+            .as_ref()
+            .unwrap()
+            .residual
+            .as_ref()
+            .unwrap(),
+        &[6.0; 16]
+    );
+    unresolved.store(false, Ordering::SeqCst);
+    terminal_error.store(true, Ordering::SeqCst);
+    let ModelRetirementOutcome::Retired { error: Some(error) } = model.retire_model() else {
+        panic!("terminal execution error must remain distinct from cleanup custody")
+    };
+    assert!(error
+        .to_string()
+        .contains("controlled original terminal failure"));
+    assert!(model.execution_context.is_none());
+    assert!(model.pending_device_frame.is_none());
+    assert!(original.upgrade().is_none());
+    assert_eq!(retired.load(Ordering::SeqCst), 1);
+    assert_eq!(model.scratch.residual.as_ref().unwrap(), &[6.0; 16]);
 }
 
 #[test]

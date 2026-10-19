@@ -13,8 +13,15 @@ fn attach_clients(
     OutputReceiver,
 ) {
     let (response, receiver) = tokio::sync::oneshot::channel();
-    let (stream, updates) = engine.inner.output_channel(request_id.clone(), 4).unwrap();
-    let sequences = &engine.inner.sequences;
+    let (stream, updates) = engine
+        .active_inner()
+        .expect("engine execution is open")
+        .output_channel(request_id.clone(), 4)
+        .unwrap();
+    let sequences = &engine
+        .active_inner()
+        .expect("engine execution is open")
+        .sequences;
     let sequence_handle = sequences.get(request_id).unwrap();
     let mut sequence_guard = sequence_handle.lock();
     let sequence = sequence_guard.as_mut().unwrap();
@@ -25,21 +32,15 @@ fn attach_clients(
 
 async fn install_controlled_request(
     engine: &ContinuousBatchEngine,
-    executor: &CloseProbe,
+    executor: &CloseProbeObservation,
 ) -> (RequestId, ExecutorSequence) {
     let mut request = InferenceRequest::new("peer", "tiny-llama-test");
     request
         .metadata
         .insert(PROMPT_TOKENS_METADATA_KEY.into(), serde_json::json!(1));
     let id = request.id.clone();
-    engine
-        .inner
-        .scheduler
-        .submit(request.clone())
-        .await
-        .unwrap();
+    engine.scheduler.submit(request.clone()).await.unwrap();
     let tick = engine
-        .inner
         .scheduler
         .prepare_token_admission_observed(
             1,
@@ -55,7 +56,7 @@ async fn install_controlled_request(
         )
         .unwrap();
     assert_eq!(tick.admitted(), 1);
-    engine.inner.scheduler.mark_prefill_complete(&id, 1);
+    engine.scheduler.mark_prefill_complete(&id, 1);
     let identity = executor.issuer.issue_sequence().unwrap();
     let mut state = SequenceState::new(request, vec![TokenId(1)]);
     state.execution_frontier = Some(executor.issuer.frontier(&identity, 1).unwrap());
@@ -63,10 +64,17 @@ async fn install_controlled_request(
     state.prefill_tokens_processed = 1;
     state.generated_tokens.push(TokenId(2));
     state.phase = RequestPhase::Decoding;
-    let mut slot = RequestSlotLease::open(&engine.inner, id.clone());
-    slot.admit(&engine.inner);
+    let mut slot = RequestSlotLease::open(
+        &engine.active_inner().expect("engine execution is open"),
+        id.clone(),
+    );
+    slot.admit(&engine.active_inner().expect("engine execution is open"));
     state.request_slot = Some(slot);
-    engine.inner.sequences.insert(id.clone(), state);
+    engine
+        .active_inner()
+        .expect("engine execution is open")
+        .sequences
+        .insert(id.clone(), state);
     (id, identity)
 }
 
@@ -95,7 +103,7 @@ async fn execution_close_late_recompute_failure_ends_products_but_retains_real_c
         let expected = tiny_llama_model(&cfg).prefill("reference", &[1]);
         assert_eq!(actual, expected);
         assert_eq!(actual.len(), cfg.vocab_size);
-        *executor.retained_cpu_model.lock() = Some(model);
+        *executor.retained_cpu_model().lock() = Some(model);
         let original =
             install_recompute_request(&engine, &executor, &identity, &request_id, slot).await;
         let mut clients = vec![attach_clients(&engine, &request_id)];
@@ -105,7 +113,6 @@ async fn execution_close_late_recompute_failure_ends_products_but_retains_real_c
             // constructs the same real two-request allocator handoff used by
             // the product pressure path, without claiming CPU paged attention.
             engine
-                .inner
                 .scheduler
                 .abort_execution_capacity_yield(&original, false, 1, None)
                 .unwrap();
@@ -122,7 +129,6 @@ async fn execution_close_late_recompute_failure_ends_products_but_retains_real_c
                     .unwrap();
                 assert!(matches!(
                     engine
-                        .inner
                         .scheduler
                         .defer_for_allocator_capacity(peer, domain.clone(), 0, &peer_pending,)
                         .unwrap(),
@@ -133,7 +139,6 @@ async fn execution_close_late_recompute_failure_ends_products_but_retains_real_c
                 .with_allocator(domain.clone(), owner.clone(), vec![prior.clone()], false)
                 .unwrap();
             let ExecutionCapacityAction::YieldPlanned { transaction: first } = engine
-                .inner
                 .scheduler
                 .defer_for_allocator_capacity(&owner, domain.clone(), 0, &first_release)
                 .unwrap()
@@ -142,17 +147,19 @@ async fn execution_close_late_recompute_failure_ends_products_but_retains_real_c
             };
             assert_eq!(first.victim_request_id(), &prior);
             assert!(!engine
-                .inner
+                .active_inner()
+                .expect("engine execution is open")
                 .execute_capacity_yield(&first, 3, None)
                 .await
                 .unwrap());
             prior_yields = 1;
             assert_eq!(
-                engine.inner.scheduler.trace_phase(&prior),
+                engine.scheduler.trace_phase(&prior),
                 Some(RequestPhase::Waiting)
             );
             assert!(engine
-                .inner
+                .active_inner()
+                .expect("engine execution is open")
                 .sequences
                 .get(&prior)
                 .unwrap()
@@ -162,7 +169,6 @@ async fn execution_close_late_recompute_failure_ends_products_but_retains_real_c
                 .execution_frontier
                 .is_none());
             let tick = engine
-                .inner
                 .scheduler
                 .prepare_token_admission_observed(
                     3,
@@ -181,7 +187,6 @@ async fn execution_close_late_recompute_failure_ends_products_but_retains_real_c
                 )
                 .unwrap();
             let ExecutionCapacityAction::YieldPlanned { transaction } = engine
-                .inner
                 .scheduler
                 .defer_for_allocator_capacity(&owner, domain, 1, &release)
                 .unwrap()
@@ -195,13 +200,14 @@ async fn execution_close_late_recompute_failure_ends_products_but_retains_real_c
             original
         };
         assert!(!engine
-            .inner
+            .active_inner()
+            .expect("engine execution is open")
             .execute_capacity_yield(&transaction, 2, None)
             .await
             .unwrap());
         assert_eq!(executor.calls.load(Ordering::SeqCst), 1 + prior_yields);
         assert_eq!(
-            engine.inner.scheduler.confirmed_capacity_release_epoch(),
+            engine.scheduler.confirmed_capacity_release_epoch(),
             prior_yields as u64
         );
         sender
@@ -209,12 +215,20 @@ async fn execution_close_late_recompute_failure_ends_products_but_retains_real_c
                 "late terminal observation failed",
             )))
             .unwrap();
-        engine.inner.execution_closes.join_observers().await;
+        engine
+            .active_inner()
+            .expect("engine execution is open")
+            .execution_closes
+            .join_observers()
+            .await;
         assert!(identity.observed_end().is_none());
-        assert!(engine.inner.drain_execution_closes().is_err());
+        assert!(engine
+            .active_inner()
+            .expect("engine execution is open")
+            .drain_execution_closes()
+            .is_err());
         assert_eq!(
             engine
-                .inner
                 .scheduler
                 .trace_snapshot()
                 .pressure_pending_release_fences,
@@ -222,22 +236,37 @@ async fn execution_close_late_recompute_failure_ends_products_but_retains_real_c
         );
         // The old entry keeps pending notifications even if this drain's
         // diagnostic error is consumed before the next iteration.
-        engine.inner.drain_execution_closes().unwrap();
         engine
-            .inner
+            .active_inner()
+            .expect("engine execution is open")
+            .drain_execution_closes()
+            .unwrap();
+        engine
+            .active_inner()
+            .expect("engine execution is open")
             .complete_failed_execution_recomputes()
             .await
             .unwrap();
         for (response, stream) in clients {
             assert_client_failed(response, stream).await;
         }
-        assert!(engine.inner.sequences.is_empty());
-        assert_eq!(engine.inner.scheduler.active_count(), 0);
-        assert_eq!(engine.inner.scheduler.waiting_count(), 0);
-        assert_eq!(engine.inner.execution_closes.unreclaimed_count(), 1);
+        assert!(engine
+            .active_inner()
+            .expect("engine execution is open")
+            .sequences
+            .is_empty());
+        assert_eq!(engine.scheduler.active_count(), 0);
+        assert_eq!(engine.scheduler.waiting_count(), 0);
         assert_eq!(
             engine
-                .inner
+                .active_inner()
+                .expect("engine execution is open")
+                .execution_closes
+                .unreclaimed_count(),
+            1
+        );
+        assert_eq!(
+            engine
                 .scheduler
                 .trace_snapshot()
                 .pressure_pending_release_fences,
@@ -247,7 +276,7 @@ async fn execution_close_late_recompute_failure_ends_products_but_retains_real_c
         // release notification. The failing owner still has no terminal fact.
         let prior_releases = prior_yields as u64 + u64::from(allocator);
         assert_eq!(
-            engine.inner.scheduler.confirmed_capacity_release_epoch(),
+            engine.scheduler.confirmed_capacity_release_epoch(),
             prior_releases
         );
         assert_eq!(
@@ -255,7 +284,8 @@ async fn execution_close_late_recompute_failure_ends_products_but_retains_real_c
             1 + prior_yields + usize::from(allocator)
         );
         {
-            let entries = engine.inner.execution_closes.state.lock();
+            let original_inner = engine.active_inner().expect("engine execution is open");
+            let entries = original_inner.execution_closes.state.lock();
             let entry = &entries.entries[&identity];
             assert!(entry.slot.as_ref().unwrap().armed);
             assert!(matches!(
@@ -266,7 +296,8 @@ async fn execution_close_late_recompute_failure_ends_products_but_retains_real_c
         // Real numerical continuation proves the test's original model KV was
         // retained through the failed observation and product termination.
         {
-            let mut owner = executor.retained_cpu_model.lock();
+            let original_model = executor.retained_cpu_model();
+            let mut owner = original_model.lock();
             let owner = owner.as_mut().unwrap();
             let actual = owner.decode("retained-owner", 2, 1);
             let mut reference = tiny_llama_model(&cfg);
@@ -281,25 +312,43 @@ async fn execution_close_late_recompute_failure_ends_products_but_retains_real_c
             assert!(owner.kv_caches.is_empty());
         }
         executor.issuer.ended(&identity).unwrap();
-        engine.inner.drain_execution_closes().unwrap();
-        assert_eq!(engine.inner.execution_closes.unreclaimed_count(), 0);
+        engine
+            .active_inner()
+            .expect("engine execution is open")
+            .drain_execution_closes()
+            .unwrap();
         assert_eq!(
             engine
-                .inner
+                .active_inner()
+                .expect("engine execution is open")
+                .execution_closes
+                .unreclaimed_count(),
+            0
+        );
+        assert_eq!(
+            engine
                 .scheduler
                 .trace_snapshot()
                 .pressure_pending_release_fences,
             0
         );
         assert_eq!(
-            engine.inner.scheduler.confirmed_capacity_release_epoch(),
+            engine.scheduler.confirmed_capacity_release_epoch(),
             prior_releases + 1
         );
-        engine.inner.drain_execution_closes().unwrap();
+        engine
+            .active_inner()
+            .expect("engine execution is open")
+            .drain_execution_closes()
+            .unwrap();
         assert_eq!(
-            engine.inner.scheduler.confirmed_capacity_release_epoch(),
+            engine.scheduler.confirmed_capacity_release_epoch(),
             prior_releases + 1
         );
-        assert!(engine.inner.sequences.is_empty());
+        assert!(engine
+            .active_inner()
+            .expect("engine execution is open")
+            .sequences
+            .is_empty());
     }
 }

@@ -6,16 +6,19 @@ use futures::StreamExt;
 // explicit closure now flow through the common token protocol. Fake logits
 // remain protocol fixtures, not model numerical evidence.
 struct StopBoundaryExecutor {
-    inner: ferrum_testkit::ConfigurableModelExecutor,
+    inner: ferrum_execution::ExecutorScope,
+    owner: ferrum_execution::ExecutorOwner,
     finish_signal: Mutex<Option<tokio::sync::oneshot::Sender<ExecutionEndReason>>>,
 }
 
 impl StopBoundaryExecutor {
     fn with_token_sequence(vocabulary: usize, tokens: Vec<u32>) -> Self {
+        let owner = ferrum_execution::ExecutorOwner::new(Box::new(
+            ferrum_testkit::ConfigurableModelExecutor::with_token_sequence(vocabulary, tokens),
+        ));
         Self {
-            inner: ferrum_testkit::ConfigurableModelExecutor::with_token_sequence(
-                vocabulary, tokens,
-            ),
+            inner: owner.scope().unwrap(),
+            owner,
             finish_signal: Mutex::new(None),
         }
     }
@@ -23,6 +26,25 @@ impl StopBoundaryExecutor {
 
 #[async_trait::async_trait]
 impl ModelExecutor for StopBoundaryExecutor {
+    fn begin_shutdown(
+        self: Arc<Self>,
+        permit: &ferrum_execution::ExecutorShutdownPermit,
+    ) -> ferrum_execution::ExecutorShutdownObserver {
+        if let Err(error) = permit.check(self.as_ref()) {
+            return ferrum_execution::ExecutorShutdownObserver::retained(Arc::new(self), error);
+        }
+        let original = match Arc::try_unwrap(self) {
+            Ok(original) => original,
+            Err(original) => {
+                return ferrum_execution::ExecutorShutdownObserver::retained(
+                    Arc::new(original),
+                    FerrumError::internal("stop fixture still has execution users"),
+                )
+            }
+        };
+        drop(original.inner);
+        original.owner.begin_shutdown()
+    }
     fn info(&self) -> &ferrum_types::ModelInfo {
         self.inner.info()
     }
@@ -112,7 +134,7 @@ fn stop_boundary_engine_with_options(
         tokenizer,
         Arc::new(crate::registry::GreedySampler),
         Arc::new(MockKvCacheManager::new(256)),
-        Arc::new(executor),
+        ferrum_execution::ExecutorOwner::new(Box::new(executor)),
         Arc::new(MockTensorFactory),
     )
     .unwrap()
@@ -151,7 +173,11 @@ async fn output_stop_prefix_flush_preserves_two_pending_spans_before_terminal() 
             output_tokens: 4
         }
     );
-    assert!(engine.inner.sequences.is_empty());
+    assert!(engine
+        .active_inner()
+        .expect("engine execution is open")
+        .sequences
+        .is_empty());
 
     let chunks = tokio::time::timeout(Duration::from_secs(2), stream.collect::<Vec<_>>())
         .await
@@ -202,11 +228,18 @@ async fn output_stop_prefix_flush_preserves_two_pending_spans_before_terminal() 
             TokenId::new(8)
         ]
     );
+    let (retired_inner, output_budget) = {
+        let inner = engine.active_inner().unwrap();
+        (Arc::downgrade(&inner), inner.output_budget.clone())
+    };
     engine.shutdown().await.unwrap();
-    assert_eq!(engine.inner.execution_closes.unreclaimed_count(), 0);
+    assert!(
+        retired_inner.upgrade().is_none(),
+        "no request or execution-close owner remains"
+    );
     drop(chunks);
-    assert_eq!(engine.inner.output_budget.usage().sessions, 0);
-    assert_eq!(engine.inner.output_budget.usage().queued_bytes, 0);
+    assert_eq!(output_budget.usage().sessions, 0);
+    assert_eq!(output_budget.usage().queued_bytes, 0);
 }
 
 async fn harmony_pending_terminal_preserves_published_range(marker: &str) {
@@ -215,7 +248,7 @@ async fn harmony_pending_terminal_preserves_published_range(marker: &str) {
     let mut tokenizer = PolicyTokenizer::new(128, &[("test", 5), (marker, 7)]);
     tokenizer.special.extra_eos_tokens = vec![TokenId::new(7)];
     let tokenizer: Arc<dyn Tokenizer + Send + Sync> = Arc::new(tokenizer);
-    let executor = Arc::new(StopBoundaryExecutor::with_token_sequence(128, vec![7]));
+    let executor = StopBoundaryExecutor::with_token_sequence(128, vec![7]);
     let config = EngineConfig::default();
     let scheduler = Arc::new(ContinuousBatchScheduler::new(config.scheduler.clone()));
     let engine = ContinuousBatchEngine::new(
@@ -224,7 +257,7 @@ async fn harmony_pending_terminal_preserves_published_range(marker: &str) {
         tokenizer.clone(),
         Arc::new(crate::registry::GreedySampler),
         Arc::new(MockKvCacheManager::new(256)),
-        executor.clone(),
+        ferrum_execution::ExecutorOwner::new(Box::new(executor)),
         Arc::new(MockTensorFactory),
     )
     .unwrap();
@@ -244,6 +277,8 @@ async fn harmony_pending_terminal_preserves_published_range(marker: &str) {
     // Use the existing controlled executor's actual token admission and
     // sampling product. This is a protocol/publication regression, not a
     // numerical model or native-failure fixture.
+    let execution_scope = engine.active_inner().unwrap();
+    let executor = execution_scope.model_executor.as_ref();
     let TokenAdmissionOutcome::Admitted(start) = executor
         .admit_tokens(ExecutionAdmission {
             context: ExecutorPrefillAdmission::for_product_request(
@@ -286,6 +321,7 @@ async fn harmony_pending_terminal_preserves_published_range(marker: &str) {
         Some(tokenizer.clone()),
         Some(executor.info().vocab_size),
     );
+    drop(execution_scope);
     let token = state
         .sample_and_commit_with_processors_and_tokenizer(&mut logits, Some(tokenizer.as_ref()))
         .unwrap();
@@ -304,34 +340,61 @@ async fn harmony_pending_terminal_preserves_published_range(marker: &str) {
     state.prefill_tokens_processed = prompt.len();
     scheduler.mark_prefill_complete(&request_id, prompt.len());
     let (response_sender, mut response) = tokio::sync::oneshot::channel();
-    let (sender, mut receiver) = engine.inner.output_channel(request_id.clone(), 1).unwrap();
+    let (sender, mut receiver) = engine
+        .active_inner()
+        .expect("engine execution is open")
+        .output_channel(request_id.clone(), 1)
+        .unwrap();
     state.response_sender = Some(response_sender);
     state.stream_sender = Some(sender.clone());
-    let mut slot = RequestSlotLease::open(&engine.inner, request_id.clone());
-    slot.admit(&engine.inner);
+    let mut slot = RequestSlotLease::open(
+        &engine.active_inner().expect("engine execution is open"),
+        request_id.clone(),
+    );
+    slot.admit(&engine.active_inner().expect("engine execution is open"));
     state.request_slot = Some(slot);
     assert!(engine
-        .inner
+        .active_inner()
+        .expect("engine execution is open")
         .sequences
         .insert(request_id.clone(), state)
         .is_none());
-    let handle = engine.inner.sequences.get(&request_id).unwrap();
+    let handle = engine
+        .active_inner()
+        .expect("engine execution is open")
+        .sequences
+        .get(&request_id)
+        .unwrap();
     sender.bind_sequence(Arc::downgrade(&handle));
 
     // Hold every real queued-byte permit before publication. A full mpsc
     // channel alone is insufficient: its pending span may already be charged.
-    let blocker = engine.inner.output_budget.try_open_session().unwrap();
+    let blocker = engine
+        .active_inner()
+        .expect("engine execution is open")
+        .output_budget
+        .try_open_session()
+        .unwrap();
     let held = blocker
         .reserve_queued(blocker.config().queued_bytes_total)
         .await
         .unwrap();
-    engine.inner.send_stream_update(&request_id, token).await;
+    engine
+        .active_inner()
+        .expect("engine execution is open")
+        .send_stream_update(&request_id, token)
+        .await;
     assert_eq!(
         handle.lock().as_ref().unwrap().streamed_text_len,
         marker.len()
     );
     assert_eq!(
-        engine.inner.output_budget.usage().queued_bytes,
+        engine
+            .active_inner()
+            .expect("engine execution is open")
+            .output_budget
+            .usage()
+            .queued_bytes,
         held.bytes()
     );
     assert!(matches!(
@@ -349,7 +412,8 @@ async fn harmony_pending_terminal_preserves_published_range(marker: &str) {
 
     let original = FerrumError::request_validation("explicit failure after Harmony publication");
     engine
-        .inner
+        .active_inner()
+        .expect("engine execution is open")
         .complete_request_exact_frontier_detached(
             &handle,
             &identity,
@@ -364,13 +428,22 @@ async fn harmony_pending_terminal_preserves_published_range(marker: &str) {
     ));
     assert_eq!(client_error.to_string(), original.to_string());
     assert!(handle.lock().is_none());
-    assert!(engine.inner.sequences.is_empty());
+    assert!(engine
+        .active_inner()
+        .expect("engine execution is open")
+        .sequences
+        .is_empty());
     assert_eq!(
         sender.completed_text(0..marker.len()).unwrap().as_deref(),
         Some(marker)
     );
     assert_eq!(
-        engine.inner.output_budget.usage().queued_bytes,
+        engine
+            .active_inner()
+            .expect("engine execution is open")
+            .output_budget
+            .usage()
+            .queued_bytes,
         held.bytes()
     );
     assert!(matches!(
@@ -400,25 +473,51 @@ async fn harmony_pending_terminal_preserves_published_range(marker: &str) {
         FerrumError::RequestValidation { .. }
     ));
     assert_eq!(stream_error.to_string(), original.to_string());
-    engine.inner.output_tasks.join_current().await;
-    engine.inner.execution_closes.join_observers().await;
-    engine.inner.drain_execution_closes().unwrap();
+    engine
+        .active_inner()
+        .expect("engine execution is open")
+        .output_tasks
+        .join_current()
+        .await;
+    engine
+        .active_inner()
+        .expect("engine execution is open")
+        .execution_closes
+        .join_observers()
+        .await;
+    engine
+        .active_inner()
+        .expect("engine execution is open")
+        .drain_execution_closes()
+        .unwrap();
     assert!(identity.observed_end().is_some());
     assert!(
         sender.failure().is_none(),
         "no secondary span-projection error"
     );
-    assert!(engine.inner.output_tasks.take_control_error().is_none());
+    assert!(engine
+        .active_inner()
+        .expect("engine execution is open")
+        .output_tasks
+        .take_control_error()
+        .is_none());
     drop(sender);
     assert!(
         receiver.recv().await.is_none(),
         "an error must not gain a successful terminal"
     );
+    let (retired_inner, output_budget) = {
+        let inner = engine.active_inner().unwrap();
+        (Arc::downgrade(&inner), inner.output_budget.clone())
+    };
     engine.shutdown().await.unwrap();
-    assert_eq!(engine.inner.execution_closes.unreclaimed_count(), 0);
+    assert!(
+        retired_inner.upgrade().is_none(),
+        "no request or execution-close owner remains"
+    );
     drop(chunk);
-    assert_eq!(engine.inner.output_budget.usage().queued_bytes, 0);
-    assert_eq!(engine.inner.output_budget.usage().sessions, 0);
+    assert_eq!(output_budget.usage().queued_bytes, 0);
+    assert_eq!(output_budget.usage().sessions, 0);
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -702,7 +801,9 @@ async fn stop_boundary_rejects_strict_json_truncated_inside_a_token() {
             tokenizer,
             Arc::new(crate::registry::GreedySampler),
             Arc::new(MockKvCacheManager::new(256)),
-            Arc::new(StopBoundaryExecutor::with_token_sequence(16, vec![7])),
+            ferrum_execution::ExecutorOwner::new(Box::new(
+                StopBoundaryExecutor::with_token_sequence(16, vec![7]),
+            )),
             Arc::new(MockTensorFactory),
         )
         .unwrap()

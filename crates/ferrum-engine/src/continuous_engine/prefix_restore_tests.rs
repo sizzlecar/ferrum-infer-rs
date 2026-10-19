@@ -171,7 +171,7 @@ fn engine(
     trace_path: Option<PathBuf>,
 ) -> (
     Arc<ContinuousBatchEngine>,
-    Arc<PlanRuntimeChunkedPrefillTestExecutor>,
+    Arc<PlanRuntimeChunkedPrefillObservation>,
     Arc<RestoreState>,
 ) {
     let mut config = EngineConfig::default();
@@ -186,18 +186,19 @@ fn engine(
     });
     let mut executor = PlanRuntimeChunkedPrefillTestExecutor::new(false);
     executor.prefix_restore = Some(Arc::clone(&state));
-    let executor = Arc::new(executor);
+    let observation = executor.observer();
+    let executor = ExecutorOwner::new(Box::new(executor));
     let scheduler = Arc::new(ContinuousBatchScheduler::new(config.scheduler.clone()));
     let engine = ContinuousBatchEngine::new_plan_runtime(
         config,
         scheduler,
         Arc::new(ferrum_testkit::MockTokenizer::new(128)),
         Arc::new(ferrum_testkit::MockSampler),
-        executor.clone(),
+        executor,
         Arc::new(MockTensorFactory),
     )
     .unwrap();
-    (Arc::new(engine), executor, state)
+    (Arc::new(engine), observation, state)
 }
 
 fn request() -> InferenceRequest {
@@ -209,7 +210,7 @@ fn request() -> InferenceRequest {
 
 #[tokio::test]
 async fn prefix_restore_executes_only_suffix_and_samples_after_real_prefill() {
-    let (engine, executor, state) = engine(RestoreBehavior::Hit, 3, None);
+    let (engine, observation, state) = engine(RestoreBehavior::Hit, 3, None);
     let response = tokio::time::timeout(Duration::from_secs(2), engine.infer(request()))
         .await
         .unwrap()
@@ -218,32 +219,60 @@ async fn prefix_restore_executes_only_suffix_and_samples_after_real_prefill() {
     assert_eq!(state.acknowledgements.load(Ordering::Relaxed), 1);
     assert_eq!(state.cancellations.load(Ordering::Relaxed), 0);
     assert_eq!(
-        *executor.attempted_chunks.lock().unwrap(),
+        *observation.attempted_chunks.lock().unwrap(),
         [PrefillChunk::new(3, 2, 5).unwrap()]
     );
-    assert_eq!(engine.inner.total_prefill_tokens.load(Ordering::Relaxed), 2);
-    assert_eq!(engine.inner.prefix_cache_hits.load(Ordering::Relaxed), 1);
-    assert!(executor.retained.lock().unwrap().is_empty());
+    assert_eq!(
+        engine
+            .active_inner()
+            .expect("engine execution is open")
+            .total_prefill_tokens
+            .load(Ordering::Relaxed),
+        2
+    );
+    assert_eq!(
+        engine
+            .active_inner()
+            .expect("engine execution is open")
+            .prefix_cache_hits
+            .load(Ordering::Relaxed),
+        1
+    );
+    assert!(observation.retained.lock().unwrap().is_empty());
     engine.shutdown().await.unwrap();
 }
 
 #[tokio::test]
 async fn prefix_restore_miss_preserves_all_cold_prefill_work() {
-    let (engine, executor, state) = engine(RestoreBehavior::Miss, 3, None);
+    let (engine, observation, state) = engine(RestoreBehavior::Miss, 3, None);
     tokio::time::timeout(Duration::from_secs(2), engine.infer(request()))
         .await
         .unwrap()
         .unwrap();
     assert_eq!(
-        *executor.attempted_chunks.lock().unwrap(),
+        *observation.attempted_chunks.lock().unwrap(),
         [
             PrefillChunk::new(0, 2, 5).unwrap(),
             PrefillChunk::new(2, 2, 5).unwrap(),
             PrefillChunk::new(4, 1, 5).unwrap(),
         ]
     );
-    assert_eq!(engine.inner.total_prefill_tokens.load(Ordering::Relaxed), 5);
-    assert_eq!(engine.inner.prefix_cache_hits.load(Ordering::Relaxed), 0);
+    assert_eq!(
+        engine
+            .active_inner()
+            .expect("engine execution is open")
+            .total_prefill_tokens
+            .load(Ordering::Relaxed),
+        5
+    );
+    assert_eq!(
+        engine
+            .active_inner()
+            .expect("engine execution is open")
+            .prefix_cache_hits
+            .load(Ordering::Relaxed),
+        0
+    );
     assert_eq!(state.acknowledgements.load(Ordering::Relaxed), 0);
     engine.shutdown().await.unwrap();
 }
@@ -256,20 +285,38 @@ async fn prefix_restore_rejects_foreign_full_or_cancelled_state_before_execution
         (RestoreBehavior::Hit, 5),
         (RestoreBehavior::FailedAcknowledgement, 3),
     ] {
-        let (engine, executor, state) = engine(behavior, tokens, None);
+        let (engine, observation, state) = engine(behavior, tokens, None);
         assert!(
             tokio::time::timeout(Duration::from_secs(2), engine.infer(request()))
                 .await
                 .expect("invalid restoration must finish cleanup")
                 .is_err()
         );
-        assert!(executor.attempted_chunks.lock().unwrap().is_empty());
-        assert!(executor.retained.lock().unwrap().is_empty());
+        assert!(observation.attempted_chunks.lock().unwrap().is_empty());
+        assert!(observation.retained.lock().unwrap().is_empty());
         assert_eq!(state.acknowledgements.load(Ordering::Relaxed), 0);
         assert_eq!(state.cancellations.load(Ordering::Relaxed), 1);
-        assert_eq!(engine.inner.total_prefill_tokens.load(Ordering::Relaxed), 0);
-        assert_eq!(engine.inner.prefix_cache_hits.load(Ordering::Relaxed), 0);
-        assert!(engine.inner.sequences.is_empty());
+        assert_eq!(
+            engine
+                .active_inner()
+                .expect("engine execution is open")
+                .total_prefill_tokens
+                .load(Ordering::Relaxed),
+            0
+        );
+        assert_eq!(
+            engine
+                .active_inner()
+                .expect("engine execution is open")
+                .prefix_cache_hits
+                .load(Ordering::Relaxed),
+            0
+        );
+        assert!(engine
+            .active_inner()
+            .expect("engine execution is open")
+            .sequences
+            .is_empty());
         engine.shutdown().await.unwrap();
     }
 }

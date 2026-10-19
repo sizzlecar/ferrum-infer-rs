@@ -29,7 +29,7 @@ struct TerminalObservation {
 }
 
 pub(in crate::executor::llm_executor) struct TokenWorkerState {
-    model: Arc<Mutex<Box<dyn DecoderOnlyLLM>>>,
+    model: ModelSlot,
     sequences: Arc<Mutex<TokenSequences>>,
     issuer: ExecutorSequenceIssuer,
     adapter_support: AdapterExecutionSupport,
@@ -37,6 +37,7 @@ pub(in crate::executor::llm_executor) struct TokenWorkerState {
     capacity: usize,
     next_claim: AtomicU64,
     shutdown: AtomicBool,
+    shutdown_error: Mutex<Option<FerrumError>>,
     #[cfg(test)]
     pub(super) admission_before_registry_lock:
         Mutex<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>>,
@@ -44,21 +45,16 @@ pub(in crate::executor::llm_executor) struct TokenWorkerState {
 
 impl TokenWorkerState {
     pub(super) fn new(executor: &LlmExecutor) -> Result<Self> {
-        let model = executor.lock_model();
-        if executor.token_execution_mode != ModelTokenExecutionMode::ManagedWorker {
-            return Err(FerrumError::unsupported(
-                "model has not qualified managed token execution",
-            ));
-        }
         Ok(Self {
             model: Arc::clone(&executor.model),
             sequences: Arc::clone(&executor.token_sequences),
             issuer: executor.token_issuer.clone(),
             adapter_support: executor.adapter_support,
-            vocabulary: model.config().vocab_size,
-            capacity: model.kv_capacity(),
+            vocabulary: executor.model_config.vocab_size,
+            capacity: executor.model_capacity,
             next_claim: AtomicU64::new(1),
             shutdown: AtomicBool::new(false),
+            shutdown_error: Mutex::new(None),
             #[cfg(test)]
             admission_before_registry_lock: Mutex::new(None),
         })
@@ -108,7 +104,7 @@ impl TokenWorkerState {
         // Shutdown marks existing entries while holding this same lock.
         // An earlier fast rejection check cannot exclude a shutdown that
         // finished its scan before this registration acquired the lock.
-        if self.shutdown.load(Ordering::Acquire) {
+        if sequences.closing || self.shutdown.load(Ordering::Acquire) {
             return Err(FerrumError::backend("model worker is closing"));
         }
         if sequences
@@ -177,7 +173,7 @@ impl TokenWorkerState {
             )
         };
         let result: Result<ModelKvReservation> = {
-            let mut model = self.model.lock();
+            let mut model = lock_live_model(&self.model)?;
             (|| {
                 if let Some(adapter) = &adapter {
                     model.preload_lora_adapter(adapter)?;
@@ -411,7 +407,9 @@ impl TokenWorkerState {
 
     pub(in crate::executor::llm_executor) fn request_shutdown(&self) {
         self.shutdown.store(true, Ordering::Release);
-        for entry in self.sequences.lock().live.values_mut() {
+        let mut sequences = self.sequences.lock();
+        sequences.closing = true;
+        for entry in sequences.live.values_mut() {
             entry.closing = true;
         }
     }
@@ -428,10 +426,62 @@ impl TokenWorkerState {
             }
         }
         self.request_shutdown();
+        self.record_shutdown_error(FerrumError::backend("model worker panicked"));
+    }
+
+    pub(in crate::executor::llm_executor) fn is_shutting_down(&self) -> bool {
+        self.shutdown.load(Ordering::Acquire)
     }
 
     pub(in crate::executor::llm_executor) fn shutdown_complete(&self) -> bool {
         self.shutdown.load(Ordering::Acquire) && self.sequences.lock().live.is_empty()
+    }
+
+    pub(in crate::executor::llm_executor) fn record_shutdown_error(&self, error: FerrumError) {
+        if self.shutdown.load(Ordering::Acquire) {
+            self.shutdown_error.lock().get_or_insert(error);
+        }
+    }
+
+    pub(in crate::executor::llm_executor) fn shutdown_error(&self) -> Option<FerrumError> {
+        self.shutdown_error.lock().clone()
+    }
+
+    pub(in crate::executor::llm_executor) fn retire_model(
+        &self,
+    ) -> crate::common::ModelRetirementOutcome {
+        use crate::common::ModelRetirementOutcome;
+        let mut slot = self.model.lock();
+        let Some(model) = slot.as_mut() else {
+            return ModelRetirementOutcome::Retired {
+                error: self.shutdown_error(),
+            };
+        };
+        let outcome = match catch_host_execution(|| model.retire_model()) {
+            Ok(outcome) => outcome,
+            Err(error) => ModelRetirementOutcome::Retained { error },
+        };
+        match outcome {
+            ModelRetirementOutcome::Retained { error } => {
+                self.record_shutdown_error(error.clone());
+                ModelRetirementOutcome::Retained { error }
+            }
+            ModelRetirementOutcome::Retired { error } => {
+                if let Some(error) = error {
+                    self.record_shutdown_error(error);
+                }
+                // The checked retirement fact precedes removal. A retained
+                // model is never replaced by a tombstone or dropped on Err.
+                let retired_model = slot.take();
+                drop(slot);
+                if let Err(error) = catch_host_execution(|| drop(retired_model)) {
+                    self.record_shutdown_error(error);
+                }
+                ModelRetirementOutcome::Retired {
+                    error: self.shutdown_error(),
+                }
+            }
+        }
     }
 
     pub(in crate::executor::llm_executor) fn has_device_recovery(&self) -> bool {
@@ -456,15 +506,23 @@ impl TokenWorkerState {
         if closing.is_empty() {
             return true;
         }
-        let mut model = self.model.lock();
+        let mut model = match lock_live_model(&self.model) {
+            Ok(model) => model,
+            Err(error) => {
+                self.record_shutdown_error(error);
+                return false;
+            }
+        };
         let terminal_error = match model.recover_token_execution() {
             ModelExecutionRecovery::Held { error } => {
+                self.record_shutdown_error(error.clone());
                 tracing::debug!(%error, "model frame remains held");
                 return false;
             }
             ModelExecutionRecovery::Quiescent { error } => error,
         };
         if let Some(error) = &terminal_error {
+            self.record_shutdown_error(error.clone());
             let mut sequences = self.sequences.lock();
             for (sequence, _) in &closing {
                 if let Some(device) = sequences
@@ -482,6 +540,7 @@ impl TokenWorkerState {
         for (sequence, cache_id) in closing {
             match model.close_token_execution(&cache_id) {
                 ModelTokenCloseOutcome::Held { error } => {
+                    self.record_shutdown_error(error.clone());
                     all_closed = false;
                     let mut sequences = self.sequences.lock();
                     if let Some(device) = sequences
@@ -494,6 +553,9 @@ impl TokenWorkerState {
                     }
                 }
                 ModelTokenCloseOutcome::Ended { error } => {
+                    if let Some(error) = &error {
+                        self.record_shutdown_error(error.clone());
+                    }
                     // Publish and notify while holding the same metadata lock;
                     // no waiter can be registered between Ended and removal.
                     let mut sequences = self.sequences.lock();
@@ -526,6 +588,7 @@ impl TokenWorkerState {
                             }
                         }
                         Err(error) => {
+                            self.record_shutdown_error(error.clone());
                             all_closed = false;
                             tracing::error!(%error, "model cache closed but terminal identity publication failed");
                         }

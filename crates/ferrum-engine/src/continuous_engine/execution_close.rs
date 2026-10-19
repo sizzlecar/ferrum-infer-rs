@@ -9,6 +9,7 @@ use ferrum_execution::token_execution::{
 };
 
 mod recompute;
+mod rejected;
 
 pub(super) struct RecomputeClose {
     request: Weak<SequenceHandle>,
@@ -80,7 +81,7 @@ struct CloseEntry {
     request_id: RequestId,
     slot: Option<RequestSlotLease>,
     // Retain the original executor independently of its close/wait future.
-    _executor: Arc<dyn ModelExecutor + Send + Sync>,
+    _executor: Arc<ExecutorScope>,
     recovery: Option<ExecutionRecoveryKey>,
     observation: CloseObservation,
     operation_error: Option<FerrumError>,
@@ -89,6 +90,8 @@ struct CloseEntry {
     // Invalid protocol output still owns its original observation future.
     // It cannot close the expected slot, and must not be discarded on rejection.
     retained_invalid_outcome: Option<ExecutionCloseOutcome>,
+    rejected_observation: Option<Arc<rejected::RejectedObservation>>,
+    rejected_observation_error_reported: bool,
     purpose: ClosePurpose,
     initial_result: Option<Result<()>>,
     initial_waiters: Vec<tokio::sync::oneshot::Sender<Result<()>>>,
@@ -145,7 +148,7 @@ impl Drop for CloseEntry {
                 request_id = %self.request_id,
                 admitted = self.slot.as_ref().is_some_and(|slot| slot.admitted),
                 terminal_proved,
-                invalid_observation_retained = self.retained_invalid_outcome.is_some(),
+                invalid_observation_retained = self.retained_invalid_outcome.is_some() || self.rejected_observation.is_some(),
                 "engine exited with an unconsumed execution-close obligation"
             );
         }
@@ -212,7 +215,7 @@ impl ExecutionCloseRegistry {
         request_id: RequestId,
         sequence: ExecutorSequence,
         slot: Option<RequestSlotLease>,
-        executor: Arc<dyn ModelExecutor + Send + Sync>,
+        executor: Arc<ExecutorScope>,
         start: CloseStart,
         purpose: ClosePurpose,
         work_notify: Arc<Notify>,
@@ -227,6 +230,8 @@ impl ExecutionCloseRegistry {
             operation_error_reported: false,
             observation_error_reported: false,
             retained_invalid_outcome: None,
+            rejected_observation: None,
+            rejected_observation_error_reported: false,
             purpose,
             initial_result: None,
             initial_waiters: Vec::new(),
@@ -254,7 +259,7 @@ impl ExecutionCloseRegistry {
                         entry.observation = CloseObservation::Unproved(error.clone());
                         entry.operation_error = outcome.error.clone();
                         entry.retained_invalid_outcome = Some(outcome);
-                        state.rejected.push(entry);
+                        state.reject(entry, Arc::clone(&work_notify));
                         work_notify.notify_one();
                         return Err(error);
                     }
@@ -281,7 +286,7 @@ impl ExecutionCloseRegistry {
                         );
                         entry.observation = CloseObservation::Unproved(error.clone());
                         entry.retained_invalid_outcome = Some(outcome);
-                        state.rejected.push(entry);
+                        state.reject(entry, Arc::clone(&work_notify));
                         work_notify.notify_one();
                         return Err(error);
                     }
@@ -320,7 +325,7 @@ impl ExecutionCloseRegistry {
                 entry.operation_error = outcome.error.clone();
                 entry.retained_invalid_outcome = Some(outcome);
             }
-            state.rejected.push(entry);
+            state.reject(entry, Arc::clone(&work_notify));
             work_notify.notify_one();
             return Err(error);
         }
@@ -371,24 +376,29 @@ impl ExecutionCloseRegistry {
                     // Keep the unexpected observation separately: a genuine
                     // Ended for the expected identity may still arrive, but
                     // consuming that slot must not drop this foreign Held.
-                    state.rejected.push(CloseEntry {
-                        request_id,
-                        slot: None,
-                        _executor: Arc::clone(&executor),
-                        recovery: None,
-                        observation: CloseObservation::Unproved(error.clone()),
-                        operation_error: None,
-                        operation_error_reported: false,
-                        observation_error_reported: false,
-                        retained_invalid_outcome: Some(outcome),
-                        purpose: ClosePurpose::default(),
-                        initial_result: None,
-                        initial_waiters: Vec::new(),
-                        additional_observations: Vec::new(),
-                        additional_errors_reported: 0,
-                        report_unreclaimed: true,
-                        task: None,
-                    });
+                    state.reject(
+                        CloseEntry {
+                            request_id,
+                            slot: None,
+                            _executor: Arc::clone(&executor),
+                            recovery: None,
+                            observation: CloseObservation::Unproved(error.clone()),
+                            operation_error: None,
+                            operation_error_reported: false,
+                            observation_error_reported: false,
+                            retained_invalid_outcome: Some(outcome),
+                            rejected_observation: None,
+                            rejected_observation_error_reported: false,
+                            purpose: ClosePurpose::default(),
+                            initial_result: None,
+                            initial_waiters: Vec::new(),
+                            additional_observations: Vec::new(),
+                            additional_errors_reported: 0,
+                            report_unreclaimed: true,
+                            task: None,
+                        },
+                        Arc::clone(&work_notify),
+                    );
                     return Err(error);
                 }
                 let initial_result = outcome.error.clone().map_or(Ok(()), Err);
@@ -563,6 +573,28 @@ impl ExecutionCloseRegistry {
                 }
             }
         }
+        // A rejected observer never gains a request identity or a capacity
+        // release obligation. Only its own terminal receipt ends its custody.
+        state.rejected.retain_mut(|entry| {
+            let (terminal, error) = entry
+                .rejected_observation
+                .as_ref()
+                .map(|observer| observer.snapshot())
+                .unwrap_or_default();
+            if !entry.rejected_observation_error_reported {
+                if let Some(error) = error {
+                    errors.push(error);
+                    entry.rejected_observation_error_reported = true;
+                }
+            }
+            if let Some(ended) = terminal.filter(|_| entry.slot.is_none()) {
+                entry.observation = CloseObservation::Ended(ended, None);
+                entry.report_unreclaimed = false;
+                false
+            } else {
+                true
+            }
+        });
         (ended, errors, newly_unproved)
     }
 
@@ -634,11 +666,8 @@ impl EngineInner {
         outcome: ExecutionCloseOutcome,
         error: FerrumError,
     ) {
-        self.execution_closes
-            .state
-            .lock()
-            .rejected
-            .push(CloseEntry {
+        self.execution_closes.state.lock().reject(
+            CloseEntry {
                 request_id,
                 slot: None,
                 _executor: Arc::clone(&self.model_executor),
@@ -648,6 +677,8 @@ impl EngineInner {
                 operation_error_reported: false,
                 observation_error_reported: false,
                 retained_invalid_outcome: Some(outcome),
+                rejected_observation: None,
+                rejected_observation_error_reported: false,
                 purpose: ClosePurpose::default(),
                 initial_result: None,
                 initial_waiters: Vec::new(),
@@ -655,7 +686,9 @@ impl EngineInner {
                 additional_errors_reported: 0,
                 report_unreclaimed: true,
                 task: None,
-            });
+            },
+            Arc::clone(&self.work_notify),
+        );
         self.work_notify.notify_one();
     }
 

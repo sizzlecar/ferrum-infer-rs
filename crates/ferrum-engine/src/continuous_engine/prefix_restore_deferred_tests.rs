@@ -129,7 +129,7 @@ impl RestoreState {
 
 fn engine() -> (
     ContinuousBatchEngine,
-    Arc<PlanRuntimeChunkedPrefillTestExecutor>,
+    Arc<PlanRuntimeChunkedPrefillObservation>,
     Arc<RestoreState>,
 ) {
     let mut config = EngineConfig::default();
@@ -138,18 +138,19 @@ fn engine() -> (
     let state = Arc::new(RestoreState::default());
     let mut executor = PlanRuntimeChunkedPrefillTestExecutor::new(false);
     executor.prefix_retry = Some(Arc::clone(&state));
-    let executor = Arc::new(executor);
+    let observation = executor.observer();
+    let executor = ExecutorOwner::new(Box::new(executor));
     let scheduler = Arc::new(ContinuousBatchScheduler::new(config.scheduler.clone()));
     let engine = ContinuousBatchEngine::new_plan_runtime(
         config,
         scheduler,
         Arc::new(ferrum_testkit::MockTokenizer::new(128)),
         Arc::new(ferrum_testkit::MockSampler),
-        executor.clone(),
+        executor,
         Arc::new(MockTensorFactory),
     )
     .unwrap();
-    (engine, executor, state)
+    (engine, observation, state)
 }
 
 async fn submit(
@@ -167,23 +168,43 @@ async fn submit(
     let mut sequence = SequenceState::new_with_tokenizer_and_model_vocab_size(
         request.clone(),
         tokens.iter().copied().map(TokenId::new).collect(),
-        Some(Arc::clone(&engine.inner.tokenizer)),
+        Some(Arc::clone(
+            &engine
+                .active_inner()
+                .expect("engine execution is open")
+                .tokenizer,
+        )),
         Some(128),
     );
     let (sender, receiver) = tokio::sync::oneshot::channel();
     sequence.response_sender = Some(sender);
-    assert!(engine.inner.sequences.insert(id, sequence).is_none());
-    engine.inner.scheduler.submit(request).await.unwrap();
+    assert!(engine
+        .active_inner()
+        .expect("engine execution is open")
+        .sequences
+        .insert(id, sequence)
+        .is_none());
+    engine.scheduler.submit(request).await.unwrap();
     receiver
 }
 
 async fn finish(engine: &ContinuousBatchEngine) {
     tokio::time::timeout(Duration::from_secs(2), async {
         for _ in 0..64 {
-            if engine.inner.sequences.is_empty() {
+            if engine
+                .active_inner()
+                .expect("engine execution is open")
+                .sequences
+                .is_empty()
+            {
                 return;
             }
-            engine.inner.run_iteration().await.unwrap();
+            engine
+                .active_inner()
+                .expect("engine execution is open")
+                .run_iteration()
+                .await
+                .unwrap();
         }
         panic!("optional prefix restore prevented runnable cold progress");
     })
@@ -196,7 +217,12 @@ async fn prime_peer(engine: &ContinuousBatchEngine, state: &RestoreState, peer: 
         if !state.computed_for(peer).is_empty() {
             return;
         }
-        engine.inner.run_iteration().await.unwrap();
+        engine
+            .active_inner()
+            .expect("engine execution is open")
+            .run_iteration()
+            .await
+            .unwrap();
     }
     panic!("peer must own actual prefill state before it can release capacity");
 }
@@ -210,7 +236,14 @@ async fn prefix_restore_capacity_without_releaser_falls_back_and_releases_checkp
     finish(&engine).await;
     assert!(response.await.unwrap().is_ok());
     assert_eq!(state.computed_for(&id)[0].tokens_processed(), 0);
-    assert_eq!(engine.inner.prefix_cache_hits.load(Ordering::Relaxed), 0);
+    assert_eq!(
+        engine
+            .active_inner()
+            .expect("engine execution is open")
+            .prefix_cache_hits
+            .load(Ordering::Relaxed),
+        0
+    );
     assert!(state.acknowledged.lock().is_empty());
     state.assert_unpinned();
     engine.shutdown().await.unwrap();
@@ -218,7 +251,7 @@ async fn prefix_restore_capacity_without_releaser_falls_back_and_releases_checkp
 
 #[tokio::test]
 async fn prefix_restore_capacity_retries_retained_source_before_any_cold_work() {
-    let (engine, executor, state) = engine();
+    let (engine, observation, state) = engine();
     let peer = RequestId::new();
     state.releasers.lock().insert(peer.clone());
     let peer_response = submit(&engine, peer.clone(), &[31; 21]).await;
@@ -226,8 +259,18 @@ async fn prefix_restore_capacity_retries_retained_source_before_any_cold_work() 
     let id = RequestId::new();
     state.targets.lock().insert(id.clone());
     let response = submit(&engine, id.clone(), &[11, 12, 13, 14, 15]).await;
-    engine.inner.run_iteration().await.unwrap();
-    engine.inner.run_iteration().await.unwrap();
+    engine
+        .active_inner()
+        .expect("engine execution is open")
+        .run_iteration()
+        .await
+        .unwrap();
+    engine
+        .active_inner()
+        .expect("engine execution is open")
+        .run_iteration()
+        .await
+        .unwrap();
     assert!(state.computed_for(&id).is_empty());
     assert_eq!(*state.attempts.lock(), [(id.clone(), false)]);
     assert!(state
@@ -237,7 +280,7 @@ async fn prefix_restore_capacity_retries_retained_source_before_any_cold_work() 
         .any(|lease| lease.upgrade().is_some()));
 
     state.ready.store(true, Ordering::Release);
-    executor.publish_release();
+    observation.publish_release();
     finish(&engine).await;
     assert!(response.await.unwrap().is_ok());
     assert!(peer_response.await.unwrap().is_ok());
@@ -256,7 +299,7 @@ async fn prefix_restore_capacity_retries_retained_source_before_any_cold_work() 
 
 #[tokio::test]
 async fn prefix_restore_cancelled_wait_cannot_leak_into_reused_request_id() {
-    let (engine, executor, state) = engine();
+    let (engine, observation, state) = engine();
     let peer = RequestId::new();
     state.releasers.lock().insert(peer.clone());
     let peer_response = submit(&engine, peer.clone(), &[31; 21]).await;
@@ -264,15 +307,30 @@ async fn prefix_restore_cancelled_wait_cannot_leak_into_reused_request_id() {
     let id = RequestId::new();
     state.targets.lock().insert(id.clone());
     let cancelled = submit(&engine, id.clone(), &[11, 12, 13, 14, 15]).await;
-    engine.inner.run_iteration().await.unwrap();
+    engine
+        .active_inner()
+        .expect("engine execution is open")
+        .run_iteration()
+        .await
+        .unwrap();
     assert!(state.computed_for(&id).is_empty());
     drop(cancelled);
-    engine.inner.run_iteration().await.unwrap();
-    assert!(!engine.inner.sequences.get(&id).is_some());
+    engine
+        .active_inner()
+        .expect("engine execution is open")
+        .run_iteration()
+        .await
+        .unwrap();
+    assert!(!engine
+        .active_inner()
+        .expect("engine execution is open")
+        .sequences
+        .get(&id)
+        .is_some());
     state.assert_unpinned();
 
     state.ready.store(true, Ordering::Release);
-    executor.publish_release();
+    observation.publish_release();
     let replacement = submit(&engine, id.clone(), &[81, 82, 83, 84, 85]).await;
     finish(&engine).await;
     assert!(replacement.await.unwrap().is_ok());

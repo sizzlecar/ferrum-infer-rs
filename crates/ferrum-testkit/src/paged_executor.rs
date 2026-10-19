@@ -8,6 +8,7 @@
 //! Uses identity projections (Q=K=V=input embedding) for deterministic,
 //! verifiable behavior without model weights.
 
+use crate::executor_observation::{ExecutorCounters, ExecutorObservation};
 use async_trait::async_trait;
 use ferrum_execution::{
     model_executor::{
@@ -21,7 +22,7 @@ use ferrum_kv::attention::paged_attention;
 use ferrum_kv::managers::paged::{PagedKvCacheHandle, PagedKvCacheManager};
 use ferrum_types::{DataType, Device, FerrumError, ModelInfo, ModelType, RequestId, Result};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 mod token_execution;
@@ -66,12 +67,16 @@ pub struct PagedAttentionExecutor {
     info: ModelInfo,
     /// Owns physical KV; token entries retain exact handles from this manager.
     kv_manager: Arc<PagedKvCacheManager>,
-    prefill_count: AtomicU64,
-    decode_count: AtomicU64,
+    counters: Arc<ExecutorCounters>,
     tokens: PagedTokenState,
 }
 
 impl PagedAttentionExecutor {
+    /// Observe counts without retaining this executor or its resources.
+    pub fn observer(&self) -> ExecutorObservation {
+        ExecutorObservation::new(&self.counters)
+    }
+
     pub fn new(config: PagedExecutorConfig, kv_manager: Arc<PagedKvCacheManager>) -> Self {
         let info = ModelInfo {
             model_id: "paged-test-model".into(),
@@ -94,18 +99,17 @@ impl PagedAttentionExecutor {
             config,
             info,
             kv_manager,
-            prefill_count: AtomicU64::new(0),
-            decode_count: AtomicU64::new(0),
+            counters: Arc::default(),
             tokens: PagedTokenState::default(),
         }
     }
 
     pub fn prefill_count(&self) -> u64 {
-        self.prefill_count.load(Ordering::Relaxed)
+        self.counters.prefill.load(Ordering::Relaxed)
     }
 
     pub fn decode_count(&self) -> u64 {
-        self.decode_count.load(Ordering::Relaxed)
+        self.counters.decode.load(Ordering::Relaxed)
     }
 
     /// Create an embedding vector from a token ID.
@@ -147,6 +151,13 @@ impl PagedAttentionExecutor {
 
 #[async_trait]
 impl ModelExecutor for PagedAttentionExecutor {
+    fn begin_shutdown(
+        self: Arc<Self>,
+        permit: &ferrum_execution::executor_lifecycle::ExecutorShutdownPermit,
+    ) -> ferrum_execution::executor_lifecycle::ExecutorShutdownObserver {
+        crate::host_shutdown::begin(self, permit, |executor| executor.shutdown_token_sequences())
+    }
+
     async fn admit_tokens(
         &self,
         input: ferrum_execution::token_execution::ExecutionAdmission<'_>,

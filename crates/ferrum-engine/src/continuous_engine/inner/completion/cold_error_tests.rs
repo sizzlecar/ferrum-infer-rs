@@ -2,7 +2,9 @@
 //! the real CPU model's close owner and the bounded stream's backpressure.
 
 use super::*;
-use crate::continuous_engine::token_completion_tests::{observed_cpu_model, ModelObservation};
+use crate::continuous_engine::token_completion_tests::{
+    observed_cpu_model_owned, ModelObservation,
+};
 use ferrum_execution::model_executor::PrefillChunk;
 use ferrum_execution::token_execution::{
     ExecutionBatchOutcome, ExecutionProduct, ExecutionWork, ExecutorSequence, TokenWork,
@@ -23,7 +25,7 @@ struct Fixture {
 }
 
 async fn fixture() -> Fixture {
-    let (executor, model, cfg) = observed_cpu_model();
+    let (executor, model, cfg) = observed_cpu_model_owned();
     let trace = tempfile::tempdir().unwrap();
     let mut config = EngineConfig::default();
     config.backend.device = Device::CPU;
@@ -52,10 +54,11 @@ async fn fixture() -> Fixture {
         tokenizer.clone(),
         Arc::new(crate::registry::GreedySampler),
         kv,
-        executor.clone(),
+        ExecutorOwner::new(executor),
         Arc::new(crate::tensor_factory::CandleTensorFactory::new(Device::CPU)),
     )
     .unwrap();
+    let executor = Arc::clone(&engine.active_inner().unwrap().model_executor);
     let prompt = [TokenId(1), TokenId(2)];
     let mut request = InferenceRequest::new("known terminal failure", "tiny-llama-test");
     request.sampling_params.max_tokens = 4;
@@ -117,7 +120,11 @@ async fn fixture() -> Fixture {
     sequence.prefill_complete = true;
     sequence.prefill_tokens_processed = prompt.len();
     let (response_sender, response) = tokio::sync::oneshot::channel();
-    let (stream_sender, stream) = engine.inner.output_channel(request_id.clone(), 1).unwrap();
+    let (stream_sender, stream) = engine
+        .active_inner()
+        .expect("engine execution is open")
+        .output_channel(request_id.clone(), 1)
+        .unwrap();
     stream_sender
         .send(Ok(StreamChunk {
             request_id: request_id.clone(),
@@ -134,10 +141,17 @@ async fn fixture() -> Fixture {
         .unwrap();
     sequence.response_sender = Some(response_sender);
     sequence.stream_sender = Some(stream_sender);
-    let mut slot = RequestSlotLease::open(&engine.inner, request_id.clone());
-    slot.admit(&engine.inner);
+    let mut slot = RequestSlotLease::open(
+        &engine.active_inner().expect("engine execution is open"),
+        request_id.clone(),
+    );
+    slot.admit(&engine.active_inner().expect("engine execution is open"));
     sequence.request_slot = Some(slot);
-    engine.inner.sequences.insert(request_id.clone(), sequence);
+    engine
+        .active_inner()
+        .expect("engine execution is open")
+        .sequences
+        .insert(request_id.clone(), sequence);
     Fixture {
         engine,
         model,
@@ -153,7 +167,8 @@ async fn fixture() -> Fixture {
 fn slot_releases(fixture: &Fixture) -> usize {
     fixture
         .engine
-        .inner
+        .active_inner()
+        .expect("engine execution is open")
         .scheduler_trace_jsonl
         .as_ref()
         .unwrap()
@@ -173,12 +188,9 @@ fn slot_releases(fixture: &Fixture) -> usize {
 async fn cancelled_error_publication(close_before_caller_drop: bool) {
     let mut fixture = fixture().await;
     let error = FerrumError::backend("original terminal execution failure");
-    let mut completion = Box::pin(
-        fixture
-            .engine
-            .inner
-            .complete_request_with_error(&fixture.request_id, error.clone()),
-    );
+    let original_inner = fixture.engine.active_inner().unwrap();
+    let mut completion =
+        Box::pin(original_inner.complete_request_with_error(&fixture.request_id, error.clone()));
     // Current-thread execution guarantees the newly spawned actual close has
     // not run before this poll returns Pending. No forged Held/Ended authority.
     let waker = futures::task::noop_waker();
@@ -188,11 +200,20 @@ async fn cancelled_error_publication(close_before_caller_drop: bool) {
     ));
     assert!(!fixture
         .engine
-        .inner
+        .active_inner()
+        .expect("engine execution is open")
         .sequences
         .get(&fixture.request_id)
         .is_some());
-    assert_eq!(fixture.engine.inner.execution_closes.unreclaimed_count(), 1);
+    assert_eq!(
+        fixture
+            .engine
+            .active_inner()
+            .expect("engine execution is open")
+            .execution_closes
+            .unreclaimed_count(),
+        1
+    );
     assert!(fixture.identity.observed_end().is_none());
     assert_eq!(fixture.model.lock().model.kv_caches.len(), 1);
     assert_eq!(slot_releases(&fixture), 0);
@@ -209,11 +230,18 @@ async fn cancelled_error_publication(close_before_caller_drop: bool) {
     if close_before_caller_drop {
         // Leave the channel full while the independent close actually ends.
         // Terminal stream delivery still cannot complete under backpressure.
-        fixture.engine.inner.execution_closes.join_observers().await;
+        fixture
+            .engine
+            .active_inner()
+            .expect("engine execution is open")
+            .execution_closes
+            .join_observers()
+            .await;
         assert!(fixture.identity.observed_end().is_some());
         assert_eq!(slot_releases(&fixture), 0);
     }
     drop(completion);
+    drop(original_inner);
     assert_eq!(
         fixture.stream.try_recv().unwrap().unwrap().chunk().text,
         "already visible"
@@ -226,13 +254,32 @@ async fn cancelled_error_publication(close_before_caller_drop: bool) {
     assert_eq!(terminal.to_string(), error.to_string());
     assert!(fixture.stream.recv().await.is_none());
 
-    fixture.engine.inner.execution_closes.join_observers().await;
-    fixture.engine.inner.drain_execution_closes().unwrap();
+    fixture
+        .engine
+        .active_inner()
+        .expect("engine execution is open")
+        .execution_closes
+        .join_observers()
+        .await;
+    fixture
+        .engine
+        .active_inner()
+        .expect("engine execution is open")
+        .drain_execution_closes()
+        .unwrap();
     assert_eq!(
         fixture.identity.observed_end().unwrap().sequence(),
         &fixture.identity
     );
-    assert_eq!(fixture.engine.inner.execution_closes.unreclaimed_count(), 0);
+    assert_eq!(
+        fixture
+            .engine
+            .active_inner()
+            .expect("engine execution is open")
+            .execution_closes
+            .unreclaimed_count(),
+        0
+    );
     {
         let model = fixture.model.lock();
         assert!(model.model.kv_caches.is_empty());
@@ -242,7 +289,6 @@ async fn cancelled_error_publication(close_before_caller_drop: bool) {
     assert_eq!(
         fixture
             .engine
-            .inner
             .scheduler
             .trace_snapshot()
             .capacity_release_epoch,
@@ -250,11 +296,17 @@ async fn cancelled_error_publication(close_before_caller_drop: bool) {
     );
     fixture
         .engine
-        .inner
+        .active_inner()
+        .expect("engine execution is open")
         .complete_request_with_error(&fixture.request_id, error)
         .await
         .unwrap();
-    fixture.engine.inner.drain_execution_closes().unwrap();
+    fixture
+        .engine
+        .active_inner()
+        .expect("engine execution is open")
+        .drain_execution_closes()
+        .unwrap();
     assert_eq!(slot_releases(&fixture), 1);
     assert_eq!(fixture.model.lock().releases.len(), 1);
 }

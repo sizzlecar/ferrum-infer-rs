@@ -988,7 +988,7 @@ impl EngineInner {
             }
             let (admitted, maintenance) = self.prepare_dynamic_admission_round(desired).await?;
             let maintenance =
-                PendingPrefillMaintenance::new(self.model_executor.as_ref(), maintenance);
+                PendingPrefillMaintenance::new(self.model_executor.as_ref().as_ref(), maintenance);
             progressed |= admitted > 0;
             self.complete_typed_admission_failures().await?;
             if maintenance.is_empty() {
@@ -1289,8 +1289,10 @@ impl EngineInner {
         let (_, prefill_maintenance) = self
             .prepare_dynamic_admission_round(hint.max_batch_size)
             .await?;
-        let prefill_maintenance =
-            PendingPrefillMaintenance::new(self.model_executor.as_ref(), prefill_maintenance);
+        let prefill_maintenance = PendingPrefillMaintenance::new(
+            self.model_executor.as_ref().as_ref(),
+            prefill_maintenance,
+        );
         self.complete_typed_admission_failures().await?;
         self.refresh_prefix_rendezvous()?;
         if self.model_executor.supports_plan_runtime_prefix_restore() {

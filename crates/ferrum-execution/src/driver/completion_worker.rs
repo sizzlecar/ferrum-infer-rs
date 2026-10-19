@@ -357,6 +357,37 @@ impl VNextCompletionWorker {
         self.counters.checkpoint_transfer.reset();
         true
     }
+
+    /// Final executor retirement runs on its own cold cleanup thread. Unlike
+    /// Drop, it must observe the accepted jobs and join this exact worker.
+    pub(super) fn stop_and_join(&mut self) -> Result<(), VNextCompletionWorkerError> {
+        self.recovery.request();
+        drop(self.sender.take());
+        if let Some(thread) = self.thread.take() {
+            thread
+                .join()
+                .map_err(|_| VNextCompletionWorkerError::TaskPanicked)?;
+        }
+        if self.pending_tasks() != 0 {
+            return Err(VNextCompletionWorkerError::ResultChannelClosed);
+        }
+        Ok(())
+    }
+
+    /// Continue the same registry/reaper recovery after its worker has joined.
+    /// There can no longer be a competing worker consuming these receipts.
+    pub(super) fn recover_after_join(&self) -> Result<(), VNextCompletionWorkerError> {
+        if self.thread.is_some() || self.sender.is_some() || self.pending_tasks() != 0 {
+            return Err(VNextCompletionWorkerError::ResultChannelClosed);
+        }
+        let failures = self.recovery.failed_recoveries.load(Ordering::Acquire);
+        self.recovery.request();
+        self.recovery.run_pending();
+        if self.recovery.failed_recoveries.load(Ordering::Acquire) != failures {
+            return Err(VNextCompletionWorkerError::TaskPanicked);
+        }
+        Ok(())
+    }
 }
 
 impl Drop for VNextCompletionWorker {

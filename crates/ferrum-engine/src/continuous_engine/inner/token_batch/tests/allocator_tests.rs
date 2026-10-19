@@ -13,6 +13,9 @@ pub(super) struct AllocatorState {
 }
 
 impl AllocatorState {
+    pub(super) fn fully_released(&self) -> bool {
+        self.owners.is_empty() && self.pool.free_count() == self.pool.capacity() as usize
+    }
     fn snapshot(&self) -> KvSlotCapacitySnapshot {
         KvSlotCapacitySnapshot {
             block_size: 16,
@@ -62,8 +65,9 @@ impl AllocatorState {
     }
 }
 
-fn rejection(executor: &ProtocolExecutor) -> NoSubmissionReason {
-    let state = executor.allocator.lock();
+fn rejection(executor: &ProtocolObservation) -> NoSubmissionReason {
+    let original_allocator = executor.allocator();
+    let state = original_allocator.lock();
     let state = state.as_ref().unwrap();
     NoSubmissionReason::Deferred(ExecutorExecutionDeferral::AllocatorCapacity(
         TokenAdmissionCapacityDeferral::new(
@@ -77,7 +81,7 @@ fn rejection(executor: &ProtocolExecutor) -> NoSubmissionReason {
 
 pub(super) async fn commit_initial_products(
     engine: &ContinuousBatchEngine,
-    executor: &ProtocolExecutor,
+    executor: &ProtocolObservation,
     inputs: &mut [TokenBatchInput],
 ) {
     let chunk = PrefillChunk::new(0, 2, 2).unwrap();
@@ -111,7 +115,8 @@ pub(super) async fn commit_initial_products(
         .collect();
     let mut deferred = Vec::new();
     engine
-        .inner
+        .active_inner()
+        .expect("engine execution is open")
         .consume_token_outcome(
             &inputs.iter().collect::<Vec<_>>(),
             &works,
@@ -124,7 +129,10 @@ pub(super) async fn commit_initial_products(
     assert!(deferred.is_empty());
     drop(works);
     for input in inputs {
-        let sequences = &engine.inner.sequences;
+        let sequences = &engine
+            .active_inner()
+            .expect("engine execution is open")
+            .sequences;
         let sequence_handle = sequences.get(&input.request_id).unwrap();
         let mut sequence_guard = sequence_handle.lock();
         let sequence = sequence_guard.as_mut().unwrap();
@@ -137,15 +145,21 @@ pub(super) async fn commit_initial_products(
         };
         input.scheduled_tokens = 1;
         input.context_tokens = 3;
-        let mut slot = RequestSlotLease::open(&engine.inner, input.request_id.clone());
-        slot.admit(&engine.inner);
+        let mut slot = RequestSlotLease::open(
+            &engine.active_inner().expect("engine execution is open"),
+            input.request_id.clone(),
+        );
+        slot.admit(&engine.active_inner().expect("engine execution is open"));
         sequence.request_slot = Some(slot);
     }
 }
 
 fn assert_waiting_owner(engine: &ContinuousBatchEngine, input: &TokenBatchInput) {
     assert!(input.frontier.sequence().observed_end().is_some());
-    let sequences = &engine.inner.sequences;
+    let sequences = &engine
+        .active_inner()
+        .expect("engine execution is open")
+        .sequences;
     let sequence_handle = sequences.get(&input.request_id).unwrap();
     let sequence_guard = sequence_handle.lock();
     let sequence = sequence_guard.as_ref().unwrap();
@@ -169,7 +183,6 @@ fn assert_waiting_owner(engine: &ContinuousBatchEngine, input: &TokenBatchInput)
 
 fn assert_no_peer_readmission(engine: &ContinuousBatchEngine) {
     let tick = engine
-        .inner
         .scheduler
         .prepare_token_admission_observed(
             3,
@@ -185,7 +198,6 @@ fn assert_no_peer_readmission(engine: &ContinuousBatchEngine) {
     assert_eq!(tick.probed(), 0);
     assert_eq!(tick.admitted(), 0);
     assert!(engine
-        .inner
         .scheduler
         .passive_capacity_wait_condition()
         .unwrap()
@@ -214,7 +226,7 @@ async fn token_allocator_shared_peers_close_in_order_before_recompute_can_readmi
     let shared_block = pool.allocate().unwrap();
     pool.acquire(shared_block);
     let domain = pool.capacity_domain().clone();
-    *executor.allocator.lock() = Some(AllocatorState {
+    *executor.allocator().lock() = Some(AllocatorState {
         pool,
         owners: HashMap::from([
             (inputs[0].frontier.sequence().clone(), vec![blocked_block]),
@@ -227,7 +239,10 @@ async fn token_allocator_shared_peers_close_in_order_before_recompute_can_readmi
         .map(|input| input.frontier.sequence().clone())
         .collect::<Vec<_>>();
     for peer in &peer_identities {
-        let solo = executor
+        let solo = engine
+            .active_inner()
+            .unwrap()
+            .model_executor
             .observe_token_allocator_reclaim(
                 &inputs[0].frontier,
                 &domain,
@@ -238,7 +253,10 @@ async fn token_allocator_shared_peers_close_in_order_before_recompute_can_readmi
         assert_eq!(solo.reclaimable_blocks, 0);
         assert!(solo.contributing_candidates.is_empty());
     }
-    let joint = executor
+    let joint = engine
+        .active_inner()
+        .unwrap()
+        .model_executor
         .observe_token_allocator_reclaim(&inputs[0].frontier, &domain, &peer_identities)
         .unwrap()
         .unwrap();
@@ -251,23 +269,34 @@ async fn token_allocator_shared_peers_close_in_order_before_recompute_can_readmi
     let mut root_width = None;
     for peer in &inputs[1..] {
         assert!(engine
-            .inner
+            .active_inner()
+            .expect("engine execution is open")
             .handle_token_deferral(&[peer], rejection(&executor), &mut root_width, 0,)
             .await
             .unwrap()
             .is_empty());
     }
     assert!(executor.closed.lock().is_empty());
-    assert_eq!(engine.inner.scheduler.confirmed_capacity_release_epoch(), 0);
+    assert_eq!(engine.scheduler.confirmed_capacity_release_epoch(), 0);
 
     assert!(engine
-        .inner
+        .active_inner()
+        .expect("engine execution is open")
         .handle_token_deferral(&[&inputs[0]], rejection(&executor), &mut root_width, 0,)
         .await
         .unwrap()
         .is_empty());
-    engine.inner.execution_closes.join_observers().await;
-    engine.inner.drain_execution_closes().unwrap();
+    engine
+        .active_inner()
+        .expect("engine execution is open")
+        .execution_closes
+        .join_observers()
+        .await;
+    engine
+        .active_inner()
+        .expect("engine execution is open")
+        .drain_execution_closes()
+        .unwrap();
     let first_identity = executor.closed.lock()[0].clone();
     let first = inputs[1..]
         .iter()
@@ -279,21 +308,21 @@ async fn token_allocator_shared_peers_close_in_order_before_recompute_can_readmi
         .unwrap();
     assert_eq!(executor.closed.lock().len(), 1);
     {
-        let state = executor.allocator.lock();
+        let original_allocator = executor.allocator();
+        let state = original_allocator.lock();
         let state = state.as_ref().unwrap();
         assert_eq!(state.pool.free_count(), 0);
         assert_eq!(state.pool.ref_count(shared_block), 1);
         assert_eq!(state.pool.ref_count(blocked_block), 1);
         assert!(!state.owners.contains_key(&first_identity));
     }
-    assert_eq!(engine.inner.scheduler.confirmed_capacity_release_epoch(), 1);
+    assert_eq!(engine.scheduler.confirmed_capacity_release_epoch(), 1);
     assert_waiting_owner(&engine, first);
     assert_no_peer_readmission(&engine);
     // Follow the actual next-iteration path before reporting another failed
     // fit. A release notification must not clear the remaining contributor's
     // block and let it compete with this episode's original progress owner.
     let retry_batch = engine
-        .inner
         .scheduler
         .next_batch_with_token_admissions(
             ferrum_interfaces::BatchHint::simple(3),
@@ -309,11 +338,14 @@ async fn token_allocator_shared_peers_close_in_order_before_recompute_can_readmi
     );
     assert_eq!(retry_batch.requests[0].request.id, inputs[0].request_id);
     assert_eq!(
-        engine.inner.scheduler.trace_phase(&remaining.request_id),
+        engine.scheduler.trace_phase(&remaining.request_id),
         Some(RequestPhase::Decoding)
     );
     {
-        let sequences = &engine.inner.sequences;
+        let sequences = &engine
+            .active_inner()
+            .expect("engine execution is open")
+            .sequences;
         let peer_handle = sequences.get(&remaining.request_id).unwrap();
         let peer_guard = peer_handle.lock();
         let peer = peer_guard.as_ref().unwrap();
@@ -322,11 +354,14 @@ async fn token_allocator_shared_peers_close_in_order_before_recompute_can_readmi
         assert!(remaining.frontier.sequence().observed_end().is_none());
     }
     assert_eq!(
-        engine.inner.scheduler.confirmed_capacity_release_epoch(),
+        engine.scheduler.confirmed_capacity_release_epoch(),
         1,
         "selecting a re-probe is not another physical release"
     );
-    let remaining_observation = executor
+    let remaining_observation = engine
+        .active_inner()
+        .unwrap()
+        .model_executor
         .observe_token_allocator_reclaim(&inputs[0].frontier, &domain, &peer_identities)
         .unwrap()
         .unwrap();
@@ -343,18 +378,28 @@ async fn token_allocator_shared_peers_close_in_order_before_recompute_can_readmi
     // authoritative fit check must select the remaining contributor.
     let before_second_release = rejection(&executor);
     assert!(engine
-        .inner
+        .active_inner()
+        .expect("engine execution is open")
         .handle_token_deferral(&[&inputs[0]], rejection(&executor), &mut root_width, 1,)
         .await
         .unwrap()
         .is_empty());
-    engine.inner.execution_closes.join_observers().await;
-    engine.inner.drain_execution_closes().unwrap();
+    engine
+        .active_inner()
+        .expect("engine execution is open")
+        .execution_closes
+        .join_observers()
+        .await;
+    engine
+        .active_inner()
+        .expect("engine execution is open")
+        .drain_execution_closes()
+        .unwrap();
     assert_eq!(
         executor.closed.lock().as_slice(),
         &[first_identity, remaining.frontier.sequence().clone()]
     );
-    assert_eq!(engine.inner.scheduler.confirmed_capacity_release_epoch(), 2);
+    assert_eq!(engine.scheduler.confirmed_capacity_release_epoch(), 2);
     assert_waiting_owner(&engine, first);
     assert_waiting_owner(&engine, remaining);
     assert_no_peer_readmission(&engine);
@@ -393,7 +438,6 @@ async fn token_allocator_shared_peers_close_in_order_before_recompute_can_readmi
         );
     }
     let runnable = engine
-        .inner
         .scheduler
         .next_batch_with_token_admissions(
             ferrum_interfaces::BatchHint::simple(3),
@@ -406,7 +450,8 @@ async fn token_allocator_shared_peers_close_in_order_before_recompute_can_readmi
     assert_eq!(runnable.requests[0].request.id, inputs[0].request_id);
     assert_eq!(
         engine
-            .inner
+            .active_inner()
+            .expect("engine execution is open")
             .handle_token_deferral(&[&inputs[0]], before_second_release, &mut root_width, 2,)
             .await
             .unwrap(),
@@ -414,7 +459,8 @@ async fn token_allocator_shared_peers_close_in_order_before_recompute_can_readmi
         "a fresh allocator query, not the close return, permits A's retry"
     );
     {
-        let mut state = executor.allocator.lock();
+        let original_allocator = executor.allocator();
+        let mut state = original_allocator.lock();
         let state = state.as_mut().unwrap();
         assert_eq!(state.pool.free_count(), 1);
         assert_eq!(state.pool.ref_count(shared_block), 0);
@@ -427,7 +473,7 @@ async fn token_allocator_shared_peers_close_in_order_before_recompute_can_readmi
             .extend(reserved);
     }
     assert_eq!(
-        engine.inner.scheduler.confirmed_capacity_release_epoch(),
+        engine.scheduler.confirmed_capacity_release_epoch(),
         2,
         "a successful allocation is not a release notification"
     );
@@ -447,7 +493,8 @@ async fn token_allocator_shared_peers_close_in_order_before_recompute_can_readmi
         .unwrap();
     let mut deferred = Vec::new();
     engine
-        .inner
+        .active_inner()
+        .expect("engine execution is open")
         .consume_token_outcome(
             &[&inputs[0]],
             &works,
@@ -459,7 +506,10 @@ async fn token_allocator_shared_peers_close_in_order_before_recompute_can_readmi
         .unwrap();
     assert!(deferred.is_empty());
     {
-        let sequences = &engine.inner.sequences;
+        let sequences = &engine
+            .active_inner()
+            .expect("engine execution is open")
+            .sequences;
         let owner_handle = sequences.get(&inputs[0].request_id).unwrap();
         let owner_guard = owner_handle.lock();
         let owner = owner_guard.as_ref().unwrap();
@@ -470,24 +520,37 @@ async fn token_allocator_shared_peers_close_in_order_before_recompute_can_readmi
     }
     assert_waiting_owner(&engine, first);
     assert_waiting_owner(&engine, remaining);
-    assert_eq!(engine.inner.scheduler.confirmed_capacity_release_epoch(), 2);
+    assert_eq!(engine.scheduler.confirmed_capacity_release_epoch(), 2);
     // A is still active and owns both blocks. The retired peers are waiting
     // for recompute, so terminate them through real client cancellation, not
     // active-work completion. Neither path may re-admit their old incarnations.
     engine
-        .inner
+        .active_inner()
+        .expect("engine execution is open")
         .complete_request_with_error(
             &inputs[0].request_id,
             FerrumError::request_validation("allocator test cleanup"),
         )
         .await
         .unwrap();
-    engine.inner.execution_closes.join_observers().await;
-    engine.inner.drain_execution_closes().unwrap();
-    assert_eq!(engine.inner.scheduler.confirmed_capacity_release_epoch(), 3);
-    assert_eq!(engine.inner.scheduler.waiting_count(), 2);
+    engine
+        .active_inner()
+        .expect("engine execution is open")
+        .execution_closes
+        .join_observers()
+        .await;
+    engine
+        .active_inner()
+        .expect("engine execution is open")
+        .drain_execution_closes()
+        .unwrap();
+    assert_eq!(engine.scheduler.confirmed_capacity_release_epoch(), 3);
+    assert_eq!(engine.scheduler.waiting_count(), 2);
     {
-        let sequences = &engine.inner.sequences;
+        let sequences = &engine
+            .active_inner()
+            .expect("engine execution is open")
+            .sequences;
         for input in &inputs[1..] {
             let (sender, receiver) = tokio::sync::oneshot::channel();
             drop(receiver);
@@ -498,17 +561,23 @@ async fn token_allocator_shared_peers_close_in_order_before_recompute_can_readmi
             assert!(sequence.client_receiver_closed());
         }
     }
-    engine.inner.cancel_abandoned_requests().await.unwrap();
-    assert_eq!(engine.inner.scheduler.waiting_count(), 0);
+    engine
+        .active_inner()
+        .expect("engine execution is open")
+        .cancel_abandoned_requests()
+        .await
+        .unwrap();
+    assert_eq!(engine.scheduler.waiting_count(), 0);
     assert_eq!(
-        engine.inner.scheduler.confirmed_capacity_release_epoch(),
+        engine.scheduler.confirmed_capacity_release_epoch(),
         3,
         "cancelling already-retired waiting peers is not a second physical release"
     );
     for input in &inputs {
-        assert_eq!(engine.inner.scheduler.trace_phase(&input.request_id), None);
+        assert_eq!(engine.scheduler.trace_phase(&input.request_id), None);
     }
-    let state = executor.allocator.lock();
+    let original_allocator = executor.allocator();
+    let state = original_allocator.lock();
     let state = state.as_ref().unwrap();
     assert!(state.owners.is_empty());
     assert_eq!(state.pool.free_count(), 2);
@@ -516,8 +585,19 @@ async fn token_allocator_shared_peers_close_in_order_before_recompute_can_readmi
     assert!(inputs
         .iter()
         .all(|input| input.frontier.sequence().observed_end().is_some()));
-    assert!(engine.inner.sequences.is_empty());
-    assert_eq!(engine.inner.execution_closes.unreclaimed_count(), 0);
+    assert!(engine
+        .active_inner()
+        .expect("engine execution is open")
+        .sequences
+        .is_empty());
+    assert_eq!(
+        engine
+            .active_inner()
+            .expect("engine execution is open")
+            .execution_closes
+            .unreclaimed_count(),
+        0
+    );
 }
 
 #[tokio::test]
@@ -525,13 +605,14 @@ async fn token_allocator_sole_owner_impossible_growth_errors_without_parking() {
     let (engine, executor, inputs) = fixture_with_request_count(1).await;
     let mut pool = BlockAllocator::new(2);
     let blocks = pool.allocate_n(2).unwrap();
-    *executor.allocator.lock() = Some(AllocatorState {
+    *executor.allocator().lock() = Some(AllocatorState {
         pool,
         owners: HashMap::from([(inputs[0].frontier.sequence().clone(), blocks)]),
     });
     let (sender, receiver) = tokio::sync::oneshot::channel();
     engine
-        .inner
+        .active_inner()
+        .expect("engine execution is open")
         .sequences
         .get(&inputs[0].request_id)
         .unwrap()
@@ -541,28 +622,23 @@ async fn token_allocator_sole_owner_impossible_growth_errors_without_parking() {
         .response_sender = Some(sender);
     let mut width = None;
     let error = engine
-        .inner
+        .active_inner()
+        .expect("engine execution is open")
         .handle_token_deferral(&[&inputs[0]], rejection(&executor), &mut width, 0)
         .await
         .unwrap_err();
     assert!(matches!(&error, FerrumError::ResourceExhausted { .. }));
-    assert!(!engine
-        .inner
-        .scheduler
-        .all_active_allocator_capacity_blocked());
+    assert!(!engine.scheduler.all_active_allocator_capacity_blocked());
     assert_eq!(
-        engine
-            .inner
-            .scheduler
-            .trace_snapshot()
-            .pressure_active_episodes,
+        engine.scheduler.trace_snapshot().pressure_active_episodes,
         0
     );
-    assert_eq!(engine.inner.scheduler.confirmed_capacity_release_epoch(), 0);
+    assert_eq!(engine.scheduler.confirmed_capacity_release_epoch(), 0);
     assert!(executor.closed.lock().is_empty());
     assert!(inputs[0].frontier.sequence().observed_end().is_none());
     engine
-        .inner
+        .active_inner()
+        .expect("engine execution is open")
         .complete_request_with_error(&inputs[0].request_id, error)
         .await
         .unwrap();
@@ -570,15 +646,36 @@ async fn token_allocator_sole_owner_impossible_growth_errors_without_parking() {
         receiver.await.unwrap(),
         Err(FerrumError::ResourceExhausted { .. })
     ));
-    engine.inner.execution_closes.join_observers().await;
-    engine.inner.drain_execution_closes().unwrap();
+    engine
+        .active_inner()
+        .expect("engine execution is open")
+        .execution_closes
+        .join_observers()
+        .await;
+    engine
+        .active_inner()
+        .expect("engine execution is open")
+        .drain_execution_closes()
+        .unwrap();
     assert!(inputs[0].frontier.sequence().observed_end().is_some());
     assert_eq!(executor.closed.lock().len(), 1);
-    let state = executor.allocator.lock();
+    let original_allocator = executor.allocator();
+    let state = original_allocator.lock();
     let state = state.as_ref().unwrap();
     assert_eq!(state.pool.free_count(), 2);
     assert!(state.owners.is_empty());
-    assert_eq!(engine.inner.scheduler.confirmed_capacity_release_epoch(), 1);
-    assert!(engine.inner.sequences.is_empty());
-    assert_eq!(engine.inner.execution_closes.unreclaimed_count(), 0);
+    assert_eq!(engine.scheduler.confirmed_capacity_release_epoch(), 1);
+    assert!(engine
+        .active_inner()
+        .expect("engine execution is open")
+        .sequences
+        .is_empty());
+    assert_eq!(
+        engine
+            .active_inner()
+            .expect("engine execution is open")
+            .execution_closes
+            .unreclaimed_count(),
+        0
+    );
 }

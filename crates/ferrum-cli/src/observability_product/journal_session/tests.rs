@@ -1,4 +1,278 @@
 use super::*;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+struct EngineRetirementState {
+    started: AtomicBool,
+    changed: tokio::sync::Notify,
+    shutdown_calls: AtomicUsize,
+    waits: AtomicUsize,
+    release: tokio::sync::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+}
+
+struct ScopedLifetimeEngine {
+    config: ferrum_types::EngineConfig,
+    scope: Mutex<Option<JsonlProducerScope>>,
+    state: Arc<EngineRetirementState>,
+    dropped: Option<tokio::sync::oneshot::Sender<()>>,
+}
+
+impl Drop for ScopedLifetimeEngine {
+    fn drop(&mut self) {
+        if let Some(dropped) = self.dropped.take() {
+            let _ = dropped.send(());
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl ferrum_interfaces::InferenceEngine for ScopedLifetimeEngine {
+    async fn status(&self) -> ferrum_types::EngineStatus {
+        panic!("lifecycle fixture does not execute inference")
+    }
+    async fn shutdown(&self) -> Result<()> {
+        self.state.shutdown_calls.fetch_add(1, Ordering::SeqCst);
+        Err(FerrumError::backend("original retained engine failure"))
+    }
+    async fn wait_for_shutdown_completion(&self) -> Result<()> {
+        self.state.waits.fetch_add(1, Ordering::SeqCst);
+        self.state.started.store(true, Ordering::SeqCst);
+        self.state.changed.notify_waiters();
+        if let Some(release) = self.state.release.lock().await.take() {
+            release
+                .await
+                .expect("test releases original retained custody");
+        }
+        let scope = self.scope.lock().unwrap().take();
+        if let Some(mut scope) = scope {
+            tokio::task::spawn_blocking(move || {
+                scope
+                    .producer::<Value>()
+                    .try_enqueue(json!({"actual_retirement_tail": true}))
+                    .unwrap();
+                scope.finish().result().unwrap();
+            })
+            .await
+            .unwrap();
+        }
+        Err(FerrumError::backend(
+            "historical error after actual retirement",
+        ))
+    }
+    fn config(&self) -> &ferrum_types::EngineConfig {
+        &self.config
+    }
+    fn metrics(&self) -> ferrum_types::EngineMetrics {
+        Default::default()
+    }
+    async fn health_check(&self) -> ferrum_types::HealthStatus {
+        ferrum_types::HealthStatus::healthy()
+    }
+}
+
+#[async_trait::async_trait]
+impl ferrum_interfaces::engine::LlmInferenceEngine for ScopedLifetimeEngine {
+    async fn infer(
+        &self,
+        _: ferrum_types::InferenceRequest,
+    ) -> Result<ferrum_output::InferenceOutput> {
+        Err(FerrumError::unsupported(
+            "lifecycle fixture has no inference",
+        ))
+    }
+    async fn infer_stream(
+        &self,
+        _: ferrum_types::InferenceRequest,
+    ) -> Result<ferrum_output::InferenceStream> {
+        Err(FerrumError::unsupported(
+            "lifecycle fixture has no inference",
+        ))
+    }
+}
+
+fn lifetime_fixture(
+    session: &Arc<ProductJournalSession>,
+) -> (
+    ProductEngineLifetime,
+    Arc<EngineRetirementState>,
+    tokio::sync::oneshot::Sender<()>,
+    tokio::sync::oneshot::Receiver<()>,
+) {
+    let scope = {
+        let routes = session.routes.lock().unwrap();
+        let Route::Ready(ready) = routes.values().next().unwrap() else {
+            panic!("original writer")
+        };
+        ready.owner.producer_scope().unwrap()
+    };
+    let (release, receiver) = tokio::sync::oneshot::channel();
+    let (dropped, drop_observer) = tokio::sync::oneshot::channel();
+    let state = Arc::new(EngineRetirementState {
+        started: AtomicBool::new(false),
+        changed: tokio::sync::Notify::new(),
+        shutdown_calls: AtomicUsize::new(0),
+        waits: AtomicUsize::new(0),
+        release: tokio::sync::Mutex::new(Some(receiver)),
+    });
+    let engine = ScopedLifetimeEngine {
+        config: Default::default(),
+        scope: Mutex::new(Some(scope)),
+        state: Arc::clone(&state),
+        dropped: Some(dropped),
+    };
+    (
+        ProductEngineLifetime::new(Box::new(engine), Arc::clone(session)),
+        state,
+        release,
+        drop_observer,
+    )
+}
+
+async fn wait_for_retirement_observation(state: &EngineRetirementState) {
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let changed = state.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if state.started.load(Ordering::SeqCst) {
+                return;
+            }
+            changed.await;
+        }
+    })
+    .await
+    .unwrap();
+}
+
+fn assert_original_writer_joined(session: &ProductJournalSession) {
+    assert!(session.is_closed());
+    let routes = session.routes.lock().unwrap();
+    let Route::Ready(ready) = routes.values().next().unwrap() else {
+        panic!("original writer")
+    };
+    let receipt = ready.final_receipt.as_ref().unwrap();
+    assert!(receipt.worker_joined);
+    receipt.result().unwrap();
+}
+
+#[tokio::test]
+async fn product_lifetime_retained_engine_preserves_writer_until_actual_scope_retirement() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("profile.jsonl");
+    let config = configuration(&path, ProfileDetailArg::Verify);
+    let session = ProductJournalSession::prepare(&config, &Default::default());
+    let (lifetime, state, release, _) = lifetime_fixture(&session);
+    let first = lifetime.shutdown().await.unwrap_err();
+    let mut finish = Box::pin(lifetime.finish());
+    assert!(futures::poll!(finish.as_mut()).is_pending());
+    wait_for_retirement_observation(&state).await;
+    assert!(!session.is_closed());
+    // The CLI scope has not been retired merely because the first Engine
+    // result is Err. Its original writer still accepts the actual tail.
+    session
+        .write(&event(&config, "while_engine_retained"), true, true, false)
+        .unwrap();
+    release.send(()).unwrap();
+    let error = tokio::time::timeout(std::time::Duration::from_secs(5), finish)
+        .await
+        .unwrap()
+        .unwrap_err();
+    assert_eq!(error.to_string(), first.to_string());
+    assert_original_writer_joined(&session);
+    assert_eq!(state.shutdown_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(state.waits.load(Ordering::SeqCst), 1);
+    let rows: Vec<Value> = fs::read_to_string(path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0]["phase"], "while_engine_retained");
+    assert_eq!(rows[1], json!({"actual_retirement_tail": true}));
+}
+
+#[tokio::test]
+async fn product_lifetime_cancelled_final_wait_keeps_original_writer_and_cleanup() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("profile.jsonl");
+    let config = configuration(&path, ProfileDetailArg::Verify);
+    let session = ProductJournalSession::prepare(&config, &Default::default());
+    let (lifetime, state, release, dropped) = lifetime_fixture(&session);
+    let mut finish = Box::pin(lifetime.finish());
+    assert!(futures::poll!(finish.as_mut()).is_pending());
+    // The first poll can still be joining the registered initial shutdown.
+    while !state.started.load(Ordering::SeqCst) {
+        tokio::select! {
+            result = finish.as_mut() => panic!("retained cleanup completed early: {result:?}"),
+            _ = wait_for_retirement_observation(&state) => {},
+        }
+    }
+    drop(finish);
+    drop(lifetime);
+    assert!(!session.is_closed());
+    session
+        .write(&event(&config, "after_waiter_cancelled"), true, true, false)
+        .unwrap();
+    release.send(()).unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), dropped)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_original_writer_joined(&session);
+    assert_eq!(state.shutdown_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(state.waits.load(Ordering::SeqCst), 1);
+    assert!(fs::read_to_string(path)
+        .unwrap()
+        .contains("actual_retirement_tail"));
+}
+
+#[tokio::test]
+async fn product_lifetime_server_handle_and_finish_share_original_shutdown_and_writer() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("profile.jsonl");
+    let config = configuration(&path, ProfileDetailArg::Verify);
+    let session = ProductJournalSession::prepare(&config, &Default::default());
+    let (lifetime, state, release, dropped) = lifetime_fixture(&session);
+    let server_engine = lifetime.engine();
+    let first = server_engine.shutdown().await.unwrap_err();
+    let mut server_wait = Box::pin(server_engine.wait_for_shutdown_completion());
+    assert!(futures::poll!(server_wait.as_mut()).is_pending());
+    wait_for_retirement_observation(&state).await;
+    drop(server_wait);
+    assert!(!session.is_closed());
+    session
+        .write(&event(&config, "server_wait_cancelled"), true, true, false)
+        .unwrap();
+
+    // The cancelled Server wait cannot cancel or replace the original
+    // completion observation. Product finalization joins it and its writer.
+    let mut finish = Box::pin(lifetime.finish());
+    assert!(futures::poll!(finish.as_mut()).is_pending());
+    assert_eq!(state.shutdown_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(state.waits.load(Ordering::SeqCst), 1);
+    release.send(()).unwrap();
+    let error = tokio::time::timeout(std::time::Duration::from_secs(5), finish)
+        .await
+        .unwrap()
+        .unwrap_err();
+    assert_eq!(error.to_string(), first.to_string());
+    assert_original_writer_joined(&session);
+    assert_eq!(state.shutdown_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(state.waits.load(Ordering::SeqCst), 1);
+    let rows: Vec<Value> = fs::read_to_string(path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0]["phase"], "server_wait_cancelled");
+    assert_eq!(rows[1], json!({"actual_retirement_tail": true}));
+    drop(server_engine);
+    drop(lifetime);
+    tokio::time::timeout(std::time::Duration::from_secs(5), dropped)
+        .await
+        .unwrap()
+        .unwrap();
+}
 
 fn configuration(path: &PathBuf, detail: ProfileDetailArg) -> ProductObservabilityConfig {
     ProductObservabilityConfig::new(

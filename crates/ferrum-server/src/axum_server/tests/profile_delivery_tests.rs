@@ -600,6 +600,9 @@ impl InferenceEngine for GatedStartLlm {
     async fn shutdown(&self) -> ferrum_types::Result<()> {
         self.inner.shutdown().await
     }
+    async fn wait_for_shutdown_completion(&self) -> ferrum_types::Result<()> {
+        self.inner.wait_for_shutdown_completion().await
+    }
     fn config(&self) -> &EngineConfig {
         self.inner.config()
     }
@@ -930,6 +933,77 @@ struct RetryShutdownLlm {
     journal: JsonlJournal<Value>,
     scope: Mutex<JsonlProducerScope>,
     shutdown_calls: std::sync::atomic::AtomicUsize,
+    shutdown_finished: tokio::sync::Notify,
+}
+
+#[tokio::test]
+async fn finish_stop_waits_for_retained_engine_producer_and_preserves_original_error() {
+    let path = unique_profile_jsonl("retained-engine");
+    let mut owner =
+        JsonlJournalOwner::open(&path, JsonlJournalOpenMode::Append, Default::default()).unwrap();
+    let scope = owner.producer_scope().unwrap();
+    let engine = Arc::new(RetryShutdownLlm {
+        inner: StubLlm::new("OK"),
+        journal: scope.producer(),
+        scope: Mutex::new(scope),
+        shutdown_calls: std::sync::atomic::AtomicUsize::new(0),
+        shutdown_finished: tokio::sync::Notify::new(),
+    });
+    let server = AxumServer::from_llm(engine.clone());
+    let mut finish = Box::pin(server.finish_stop());
+    assert!(futures::poll!(finish.as_mut()).is_pending());
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let started = engine.shutdown_finished.notified();
+            tokio::pin!(started);
+            started.as_mut().enable();
+            if engine.shutdown_calls.load(Ordering::Acquire) != 0 {
+                break;
+            }
+            started.await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(engine.shutdown_calls.load(Ordering::Acquire), 1);
+    assert!(!server.lifecycle.engines_stopped.load(Ordering::Acquire));
+    assert!(
+        owner.close().is_err(),
+        "original engine producer is still live"
+    );
+    engine
+        .journal
+        .try_enqueue(json!({"before_actual_retirement": true}))
+        .unwrap();
+
+    // The controlled producer's original explicit recovery releases its scope.
+    // Merely waiting in finish_stop must not invoke this second attempt itself.
+    engine.shutdown().await.unwrap();
+    let error = tokio::time::timeout(Duration::from_secs(2), finish)
+        .await
+        .unwrap()
+        .unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("controlled engine cleanup remains incomplete"));
+    assert!(server.lifecycle.engines_stopped.load(Ordering::Acquire));
+    let receipt = owner.close().unwrap();
+    assert!(receipt.worker_joined);
+    receipt.result().unwrap();
+    let records: Vec<Value> = fs::read_to_string(&path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(
+        records,
+        vec![
+            json!({"before_actual_retirement": true}),
+            json!({"engine_producer_finished": true})
+        ]
+    );
+    assert_eq!(engine.shutdown_calls.load(Ordering::Acquire), 2);
+    let _ = fs::remove_file(path);
 }
 #[async_trait]
 impl InferenceEngine for RetryShutdownLlm {
@@ -937,7 +1011,9 @@ impl InferenceEngine for RetryShutdownLlm {
         self.inner.status().await
     }
     async fn shutdown(&self) -> ferrum_types::Result<()> {
-        if self.shutdown_calls.fetch_add(1, Ordering::AcqRel) == 0 {
+        let attempt = self.shutdown_calls.fetch_add(1, Ordering::AcqRel);
+        self.shutdown_finished.notify_waiters();
+        if attempt == 0 {
             return Err(Error::internal(
                 "controlled engine cleanup remains incomplete",
             ));
@@ -946,12 +1022,26 @@ impl InferenceEngine for RetryShutdownLlm {
             .try_enqueue(json!({"engine_producer_finished":true}))
             .map_err(|error| Error::internal(error.to_string()))?;
         self.inner.shutdown().await?;
-        self.scope
+        let result = self
+            .scope
             .lock()
             .unwrap()
             .finish()
             .result()
-            .map_err(|error| Error::internal(error.to_string()))
+            .map_err(|error| Error::internal(error.to_string()));
+        self.shutdown_finished.notify_waiters();
+        result
+    }
+    async fn wait_for_shutdown_completion(&self) -> ferrum_types::Result<()> {
+        loop {
+            let notified = self.shutdown_finished.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.scope.lock().unwrap().is_retired() {
+                return self.inner.wait_for_shutdown_completion().await;
+            }
+            notified.await;
+        }
     }
     fn config(&self) -> &EngineConfig {
         self.inner.config()
@@ -980,7 +1070,7 @@ impl LlmInferenceEngine for RetryShutdownLlm {
 }
 
 #[tokio::test]
-async fn http_profile_delivery_engine_error_retains_live_producer_until_successful_retry() {
+async fn http_profile_delivery_engine_error_retains_live_producer_until_actual_retirement() {
     let path = unique_profile_jsonl("http-profile-shutdown-retry");
     let mut journal_owner =
         JsonlJournalOwner::open(&path, JsonlJournalOpenMode::Append, Default::default()).unwrap();
@@ -990,6 +1080,7 @@ async fn http_profile_delivery_engine_error_retains_live_producer_until_successf
         journal: engine_scope.producer(),
         scope: Mutex::new(engine_scope),
         shutdown_calls: std::sync::atomic::AtomicUsize::new(0),
+        shutdown_finished: tokio::sync::Notify::new(),
     });
     let server = AxumServer::from_state(
         AppState::default()
@@ -1040,7 +1131,12 @@ async fn http_profile_delivery_engine_error_retains_live_producer_until_successf
         .lines()
         .map(|line| serde_json::from_str::<Value>(line).unwrap())
         .any(|event| event["engine_still_produces_after_failed_shutdown"] == true));
-    server.stop(Duration::from_secs(2)).await.unwrap();
+    // Recovery belongs to the original controlled producer. Server finish
+    // observes its completion and must not issue another shutdown invocation.
+    engine.shutdown().await.unwrap();
+    let final_error = server.finish_stop().await.unwrap_err();
+    assert_eq!(final_error.to_string(), error.to_string());
+    assert!(server.lifecycle.engines_stopped.load(Ordering::Acquire));
     journal_owner.close().unwrap().result().unwrap();
     assert_closed(&server);
     assert_eq!(engine.shutdown_calls.load(Ordering::Acquire), 2);

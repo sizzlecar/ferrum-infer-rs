@@ -55,6 +55,8 @@ Metal 映射 API：`register_gguf_mmap` 接收 `RetainedHostMemoryRegion`，不�
 
 模型执行资格改为 `ModelTokenExecutionMode::{Unsupported, InlineSynchronous, ManagedWorker}`，替代两个可矛盾的布尔值；执行器在构建时保存声明，准入、执行和关闭使用同一模式。后端单独声明保留原上下文的生命周期能力，不感知 token 业务。本次仅开放完整 Metal Llama FP16 KV 模型，CUDA legacy、设备 INT8 与 GPU pipeline 仍待各自验证。
 
+整执行器关闭 API：`ExecutorOwner` 消费原执行器，`ExecutorScope` 只授予使用权；自定义 Engine 分别通过 `with_owned_executor` 或 `with_custom_executor` 接入。最后一个实际作用域结束后，原 worker、模型与 plan 才能受检退休。`InferenceEngine::wait_for_shutdown_completion` 观察原关闭过程，不重新发起关闭；CLI、HTTP 与日志收尾共用此过程。失败仍保留原资源，已安全退休也不抹去先前错误。自定义实现须提供实际关闭证明，默认不把未实现的关闭视为成功。
+
 Metal 同步失败会阻止后续编码和宿主访问；未决工作保留原提交，只有显式开始下一次执行才清除已终结的错误。直接模型的完整输出、取消及失败恢复验证通过；真实 Llama-3.1-8B Q4_K_M 的三轮 `run`、五次 HTTP/SSE 请求和服务正常退出通过。该结果不替代默认性能与其余模型/格式验收。
 
 配置 API 迁移：移除 `install_runtime_snapshot` / `active_runtime_snapshot`。Engine 在加载权重前固定 `LlamaExecutionConfig`，显式传入普通模型、GGUF 与 layer stage；库调用使用 `*_with_execution_config`，原构造器使用固定默认值。GPTQ loader 诊断通过 `NativeSafetensorsLoadOptions` 传入。batched graph / prefix 的布尔值统一按 Engine 语义解释，修正旧模型对 `true` / `false` 的不同解释；默认值与 `0/1` 行为保留。CLI 配置来源保留，模型专属选项不再写回进程环境；仍有真实消费者的后端配置桥随 GPU 所有权迁移退出，本片不代表全部运行状态已隔离。

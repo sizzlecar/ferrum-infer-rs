@@ -4,24 +4,48 @@ use ferrum_execution::{
     token_execution::ExecutorSequenceIssuer,
 };
 use ferrum_kv::{PagedKvCacheConfig, PagedKvCacheManager};
-use ferrum_models::test_support::{tiny_llama_executor, TinyLlamaConfig, TinyTokenizer};
+use ferrum_models::test_support::{tiny_llama_executor_owned, TinyLlamaConfig, TinyTokenizer};
 use std::sync::atomic::{AtomicU64, AtomicUsize};
 
 #[path = "tests/recompute_failure.rs"]
 mod recompute_failure;
 
+type RetainedCpuModel = Mutex<
+    Option<ferrum_models::models::LlamaFamilyModel<ferrum_kernels::backend::cpu::CpuBackend>>,
+>;
+
 struct CloseProbe {
-    inner: Arc<dyn ModelExecutor>,
-    issuer: ExecutorSequenceIssuer,
+    inner: Arc<ExecutorScope>,
+    owner: ExecutorOwner,
+    observation: Arc<CloseProbeObservation>,
     terminal: Mutex<Option<tokio::sync::oneshot::Receiver<Result<ExecutionTerminalOutcome>>>>,
-    calls: AtomicUsize,
     initial_error: bool,
+    retained_cpu_model: Arc<RetainedCpuModel>,
+}
+
+struct CloseProbeObservation {
+    inner: Arc<crate::continuous_engine::token_completion_tests::ScopedExecutorObservation>,
+    issuer: ExecutorSequenceIssuer,
+    calls: AtomicUsize,
     end_then_error: AtomicBool,
     capacity_epoch: AtomicU64,
     immediate_ends: Mutex<std::collections::HashSet<ExecutorSequence>>,
-    retained_cpu_model: Mutex<
-        Option<ferrum_models::models::LlamaFamilyModel<ferrum_kernels::backend::cpu::CpuBackend>>,
-    >,
+    retained_cpu_model: Weak<RetainedCpuModel>,
+}
+
+impl CloseProbeObservation {
+    fn retained_cpu_model(&self) -> Arc<RetainedCpuModel> {
+        self.retained_cpu_model
+            .upgrade()
+            .expect("original fixture owns retained model")
+    }
+}
+
+impl std::ops::Deref for CloseProbe {
+    type Target = CloseProbeObservation;
+    fn deref(&self) -> &Self::Target {
+        &self.observation
+    }
 }
 
 impl CloseProbe {
@@ -58,6 +82,52 @@ impl CloseProbe {
 
 #[async_trait::async_trait]
 impl ModelExecutor for CloseProbe {
+    fn begin_shutdown(
+        self: Arc<Self>,
+        permit: &ferrum_execution::ExecutorShutdownPermit,
+    ) -> ferrum_execution::ExecutorShutdownObserver {
+        if let Err(error) = permit.check(self.as_ref()) {
+            return ferrum_execution::ExecutorShutdownObserver::retained(Arc::new(self), error);
+        }
+        let original = match Arc::try_unwrap(self) {
+            Ok(original) => original,
+            Err(original) => {
+                return ferrum_execution::ExecutorShutdownObserver::retained(
+                    Arc::new(original),
+                    FerrumError::internal("close probe has an unscoped owner"),
+                )
+            }
+        };
+        let error = {
+            let mut retained = original.retained_cpu_model.lock();
+            let outcome = retained
+                .as_mut()
+                .map(ferrum_models::DecoderOnlyLLM::retire_model);
+            match outcome {
+                Some(ferrum_models::common::ModelRetirementOutcome::Retained { error }) => {
+                    Some(error)
+                }
+                Some(ferrum_models::common::ModelRetirementOutcome::Retired { error }) => {
+                    retained.take();
+                    error
+                }
+                None => None,
+            }
+        };
+        if let Some(error) = error {
+            return ferrum_execution::ExecutorShutdownObserver::retained(Arc::new(original), error);
+        }
+        let Self {
+            inner,
+            owner,
+            observation,
+            terminal,
+            retained_cpu_model,
+            ..
+        } = original;
+        drop((inner, observation, terminal, retained_cpu_model));
+        owner.begin_shutdown()
+    }
     fn info(&self) -> &ferrum_types::ModelInfo {
         self.inner.info()
     }
@@ -102,22 +172,23 @@ fn fixture(
     initial_error: bool,
 ) -> (
     ContinuousBatchEngine,
-    Arc<CloseProbe>,
+    Arc<CloseProbeObservation>,
     ExecutorSequence,
     RequestId,
     RequestSlotLease,
     tokio::sync::oneshot::Sender<Result<ExecutionTerminalOutcome>>,
 ) {
     let cfg = TinyLlamaConfig::default();
-    fixture_with_inner(initial_error, tiny_llama_executor(&cfg))
+    fixture_with_inner(initial_error, tiny_llama_executor_owned(&cfg), None)
 }
 
 fn fixture_with_inner(
     initial_error: bool,
-    inner: Arc<dyn ModelExecutor>,
+    inner: Box<dyn ModelExecutor>,
+    trace_path: Option<PathBuf>,
 ) -> (
     ContinuousBatchEngine,
-    Arc<CloseProbe>,
+    Arc<CloseProbeObservation>,
     ExecutorSequence,
     RequestId,
     RequestSlotLease,
@@ -125,19 +196,33 @@ fn fixture_with_inner(
 ) {
     let cfg = TinyLlamaConfig::default();
     let (sender, terminal) = tokio::sync::oneshot::channel();
-    let executor = Arc::new(CloseProbe {
-        inner,
+    let owner = ExecutorOwner::new(inner);
+    let inner = Arc::new(owner.scope().unwrap());
+    let retained_cpu_model = Arc::new(Mutex::new(None));
+    let executor = Arc::new(CloseProbeObservation {
+        inner: Arc::new(
+            crate::continuous_engine::token_completion_tests::ScopedExecutorObservation::bound(
+                &inner,
+            ),
+        ),
         issuer: ExecutorSequenceIssuer::new(),
-        terminal: Mutex::new(Some(terminal)),
         calls: AtomicUsize::new(0),
-        initial_error,
         end_then_error: AtomicBool::new(false),
         capacity_epoch: AtomicU64::new(1),
         immediate_ends: Mutex::new(std::collections::HashSet::new()),
-        retained_cpu_model: Mutex::new(None),
+        retained_cpu_model: Arc::downgrade(&retained_cpu_model),
     });
+    let implementation = CloseProbe {
+        inner,
+        owner,
+        observation: Arc::clone(&executor),
+        terminal: Mutex::new(Some(terminal)),
+        initial_error,
+        retained_cpu_model,
+    };
     let sequence = executor.issuer.issue_sequence().unwrap();
-    let config = EngineConfig::default();
+    let mut config = EngineConfig::default();
+    config.runtime.scheduler_trace_jsonl = trace_path;
     let scheduler = Arc::new(ContinuousBatchScheduler::new(config.scheduler.clone()));
     let kv = Arc::new(
         PagedKvCacheManager::new(
@@ -161,19 +246,22 @@ fn fixture_with_inner(
         Arc::new(TinyTokenizer::new(cfg.vocab_size)),
         Arc::new(crate::registry::GreedySampler),
         kv,
-        executor.clone(),
+        ExecutorOwner::new(Box::new(implementation)),
         Arc::new(crate::tensor_factory::CandleTensorFactory::new(Device::CPU)),
     )
     .unwrap();
     let request_id = RequestId::new();
-    let mut slot = RequestSlotLease::open(&engine.inner, request_id.clone());
-    slot.admit(&engine.inner);
+    let mut slot = RequestSlotLease::open(
+        &engine.active_inner().expect("engine execution is open"),
+        request_id.clone(),
+    );
+    slot.admit(&engine.active_inner().expect("engine execution is open"));
     (engine, executor, sequence, request_id, slot, sender)
 }
 
 async fn install_recompute_request(
     engine: &ContinuousBatchEngine,
-    executor: &CloseProbe,
+    executor: &CloseProbeObservation,
     identity: &ExecutorSequence,
     request_id: &RequestId,
     slot: RequestSlotLease,
@@ -186,20 +274,14 @@ async fn install_recompute_request(
     request
         .metadata
         .insert(PROMPT_TOKENS_METADATA_KEY.into(), serde_json::json!(1));
-    engine
-        .inner
-        .scheduler
-        .submit(request.clone())
-        .await
-        .unwrap();
+    engine.scheduler.submit(request.clone()).await.unwrap();
     let batch = engine
-        .inner
         .scheduler
         .next_batch(ferrum_interfaces::BatchHint::simple(1))
         .await
         .unwrap();
     assert_eq!(batch.requests.len(), 1);
-    engine.inner.scheduler.mark_prefill_complete(request_id, 1);
+    engine.scheduler.mark_prefill_complete(request_id, 1);
     let mut state = SequenceState::new(request, vec![TokenId(1)]);
     state.execution_frontier = Some(executor.issuer.frontier(identity, 1).unwrap());
     state.prefill_complete = true;
@@ -207,7 +289,11 @@ async fn install_recompute_request(
     state.generated_tokens.push(TokenId(2));
     state.phase = RequestPhase::Decoding;
     state.request_slot = Some(slot);
-    engine.inner.sequences.insert(request_id.clone(), state);
+    engine
+        .active_inner()
+        .expect("engine execution is open")
+        .sequences
+        .insert(request_id.clone(), state);
     let source = CapacityAvailabilitySource::ActiveSequenceSlots;
     let condition = CapacityWaitCondition::from_observation(
         41,
@@ -216,7 +302,6 @@ async fn install_recompute_request(
     .unwrap();
     let release = ExecutionCapacityReleaseSnapshot::new([(request_id.clone(), vec![source])]);
     let action = engine
-        .inner
         .scheduler
         .defer_decode_for_execution_capacity(
             std::slice::from_ref(request_id),
@@ -240,33 +325,28 @@ async fn execution_close_recompute_waits_for_ended_before_requeue_and_release() 
     let transaction =
         install_recompute_request(&engine, &executor, &identity, &request_id, slot).await;
     assert!(!engine
-        .inner
+        .active_inner()
+        .expect("engine execution is open")
         .execute_capacity_yield(&transaction, 1, None)
         .await
         .unwrap());
     assert_eq!(executor.calls.load(Ordering::SeqCst), 1);
     assert!(engine
-        .inner
+        .active_inner()
+        .expect("engine execution is open")
         .execution_closes
         .contains_incarnation(&identity));
     assert_eq!(
-        engine.inner.scheduler.trace_phase(&request_id),
+        engine.scheduler.trace_phase(&request_id),
         Some(RequestPhase::Decoding)
     );
-    assert!(engine
-        .inner
-        .scheduler
-        .all_active_execution_readiness_blocked());
-    assert_eq!(
-        engine
-            .inner
-            .scheduler
-            .trace_snapshot()
-            .capacity_release_epoch,
-        0
-    );
+    assert!(engine.scheduler.all_active_execution_readiness_blocked());
+    assert_eq!(engine.scheduler.trace_snapshot().capacity_release_epoch, 0);
     {
-        let sequences = &engine.inner.sequences;
+        let sequences = &engine
+            .active_inner()
+            .expect("engine execution is open")
+            .sequences;
         let sequence_handle = sequences.get(&request_id).unwrap();
         let sequence_guard = sequence_handle.lock();
         let sequence = sequence_guard.as_ref().unwrap();
@@ -283,26 +363,32 @@ async fn execution_close_recompute_waits_for_ended_before_requeue_and_release() 
             executor.issuer.ended(&identity).unwrap(),
         )))
         .unwrap();
-    engine.inner.execution_closes.join_observers().await;
-    engine.inner.drain_execution_closes().unwrap();
+    engine
+        .active_inner()
+        .expect("engine execution is open")
+        .execution_closes
+        .join_observers()
+        .await;
+    engine
+        .active_inner()
+        .expect("engine execution is open")
+        .drain_execution_closes()
+        .unwrap();
     assert!(!engine
-        .inner
+        .active_inner()
+        .expect("engine execution is open")
         .execution_closes
         .contains_incarnation(&identity));
     assert_eq!(
-        engine.inner.scheduler.trace_phase(&request_id),
+        engine.scheduler.trace_phase(&request_id),
         Some(RequestPhase::Waiting)
     );
-    assert_eq!(
-        engine
-            .inner
-            .scheduler
-            .trace_snapshot()
-            .capacity_release_epoch,
-        1
-    );
+    assert_eq!(engine.scheduler.trace_snapshot().capacity_release_epoch, 1);
     {
-        let sequences = &engine.inner.sequences;
+        let sequences = &engine
+            .active_inner()
+            .expect("engine execution is open")
+            .sequences;
         let sequence_handle = sequences.get(&request_id).unwrap();
         let sequence_guard = sequence_handle.lock();
         let sequence = sequence_guard.as_ref().unwrap();
@@ -312,22 +398,24 @@ async fn execution_close_recompute_waits_for_ended_before_requeue_and_release() 
         assert_eq!(sequence.prefill_tokens_processed, 0);
         assert_eq!(sequence.generated_tokens, vec![TokenId(2)]);
     }
-    engine.inner.drain_execution_closes().unwrap();
-    assert_eq!(
-        engine
-            .inner
-            .scheduler
-            .trace_snapshot()
-            .capacity_release_epoch,
-        1
-    );
-    assert!(engine
-        .inner
-        .scheduler
-        .cancel_request(request_id.clone())
-        .unwrap());
-    let mut sequence = engine.inner.sequences.take(&request_id).unwrap();
-    sequence.request_slot.take().unwrap().close(&engine.inner);
+    engine
+        .active_inner()
+        .expect("engine execution is open")
+        .drain_execution_closes()
+        .unwrap();
+    assert_eq!(engine.scheduler.trace_snapshot().capacity_release_epoch, 1);
+    assert!(engine.scheduler.cancel_request(request_id.clone()).unwrap());
+    let mut sequence = engine
+        .active_inner()
+        .expect("engine execution is open")
+        .sequences
+        .take(&request_id)
+        .unwrap();
+    sequence
+        .request_slot
+        .take()
+        .unwrap()
+        .close(&engine.active_inner().expect("engine execution is open"));
 }
 
 #[tokio::test]
@@ -339,51 +427,43 @@ async fn managed_driver_closing_does_not_revive_a_completed_recompute() {
     let transaction =
         install_recompute_request(&engine, &executor, &identity, &request_id, slot).await;
     assert!(!engine
-        .inner
+        .active_inner()
+        .expect("engine execution is open")
         .execute_capacity_yield(&transaction, 1, None)
         .await
         .unwrap());
     assert_eq!(executor.calls.load(Ordering::SeqCst), 1);
-    assert_eq!(
-        engine
-            .inner
-            .scheduler
-            .trace_snapshot()
-            .capacity_release_epoch,
-        0
-    );
+    assert_eq!(engine.scheduler.trace_snapshot().capacity_release_epoch, 0);
     executor.capacity_epoch.store(2, Ordering::Release);
     sender
         .send(Ok(ExecutionTerminalOutcome::ended(
             executor.issuer.ended(&identity).unwrap(),
         )))
         .unwrap();
-    engine.inner.execution_closes.join_observers().await;
-    let observer = engine.driver.shutdown(&engine.inner).unwrap();
-    engine.inner.drain_execution_closes().unwrap();
+    engine
+        .active_inner()
+        .expect("engine execution is open")
+        .execution_closes
+        .join_observers()
+        .await;
+    let original_inner = engine.active_inner().unwrap();
+    let released_inner = Arc::downgrade(&original_inner);
+    let observer = engine.driver.shutdown(&original_inner).unwrap();
+    original_inner.drain_execution_closes().unwrap();
     assert_ne!(
-        engine.inner.scheduler.trace_phase(&request_id),
+        engine.scheduler.trace_phase(&request_id),
         Some(RequestPhase::Waiting)
     );
-    assert_eq!(engine.inner.scheduler.waiting_count(), 0);
+    assert_eq!(engine.scheduler.waiting_count(), 0);
+    assert_eq!(engine.scheduler.trace_snapshot().capacity_release_epoch, 1);
+    drop(original_inner);
+    let report = observer.wait().await;
+    report.result().unwrap();
+    assert!(!report.retains_unproved_owners());
+    assert!(released_inner.upgrade().is_none());
+    assert_eq!(engine.scheduler.trace_phase(&request_id), None);
     assert_eq!(
-        engine
-            .inner
-            .scheduler
-            .trace_snapshot()
-            .capacity_release_epoch,
-        1
-    );
-    observer.wait().await.result().unwrap();
-    assert!(engine.inner.sequences.is_empty());
-    assert_eq!(engine.inner.scheduler.trace_phase(&request_id), None);
-    assert_eq!(engine.inner.execution_closes.unreclaimed_count(), 0);
-    assert_eq!(
-        engine
-            .inner
-            .scheduler
-            .trace_snapshot()
-            .capacity_release_epoch,
+        engine.scheduler.trace_snapshot().capacity_release_epoch,
         1,
         "consuming the old Ended during cleanup must not announce a second release"
     );
@@ -400,18 +480,12 @@ async fn execution_close_recompute_source_error_preserves_feedback_and_once_rele
     let transaction =
         install_recompute_request(&engine, &executor, &identity, &request_id, slot).await;
     assert!(!engine
-        .inner
+        .active_inner()
+        .expect("engine execution is open")
         .execute_capacity_yield(&transaction, 1, None)
         .await
         .unwrap());
-    assert_eq!(
-        engine
-            .inner
-            .scheduler
-            .trace_snapshot()
-            .capacity_release_epoch,
-        0
-    );
+    assert_eq!(engine.scheduler.trace_snapshot().capacity_release_epoch, 0);
 
     // The exact incarnation really ends, but its controlled capacity source
     // deliberately does not advance. Reconciliation must retain this error
@@ -421,25 +495,32 @@ async fn execution_close_recompute_source_error_preserves_feedback_and_once_rele
             executor.issuer.ended(&identity).unwrap(),
         )))
         .unwrap();
-    engine.inner.execution_closes.join_observers().await;
+    engine
+        .active_inner()
+        .expect("engine execution is open")
+        .execution_closes
+        .join_observers()
+        .await;
     let error = engine
-        .inner
+        .active_inner()
+        .expect("engine execution is open")
         .drain_execution_closes()
         .expect_err("unchanged source must be reported");
     assert!(error
         .to_string()
         .contains("did not advance the failed exact source"));
-    let snapshot = engine.inner.scheduler.trace_snapshot();
+    let snapshot = engine.scheduler.trace_snapshot();
     assert_eq!(snapshot.capacity_release_epoch, 1);
     assert_eq!(snapshot.decode_capacity_backpressure_admit_limit, Some(1));
     assert_eq!(snapshot.capacity_backpressure_admit_limit, Some(1));
     assert_eq!(snapshot.pressure_pending_release_fences, 0);
     assert_eq!(
-        engine.inner.scheduler.trace_phase(&request_id),
+        engine.scheduler.trace_phase(&request_id),
         Some(RequestPhase::Waiting)
     );
     assert!(engine
-        .inner
+        .active_inner()
+        .expect("engine execution is open")
         .sequences
         .get(&request_id)
         .unwrap()
@@ -449,23 +530,25 @@ async fn execution_close_recompute_source_error_preserves_feedback_and_once_rele
         .execution_frontier
         .is_none());
     assert_eq!(executor.calls.load(Ordering::SeqCst), 1);
-    engine.inner.drain_execution_closes().unwrap();
-    assert_eq!(
-        engine
-            .inner
-            .scheduler
-            .trace_snapshot()
-            .capacity_release_epoch,
-        1
-    );
+    engine
+        .active_inner()
+        .expect("engine execution is open")
+        .drain_execution_closes()
+        .unwrap();
+    assert_eq!(engine.scheduler.trace_snapshot().capacity_release_epoch, 1);
 
-    assert!(engine
-        .inner
-        .scheduler
-        .cancel_request(request_id.clone())
-        .unwrap());
-    let mut sequence = engine.inner.sequences.take(&request_id).unwrap();
-    sequence.request_slot.take().unwrap().close(&engine.inner);
+    assert!(engine.scheduler.cancel_request(request_id.clone()).unwrap());
+    let mut sequence = engine
+        .active_inner()
+        .expect("engine execution is open")
+        .sequences
+        .take(&request_id)
+        .unwrap();
+    sequence
+        .request_slot
+        .take()
+        .unwrap()
+        .close(&engine.active_inner().expect("engine execution is open"));
 }
 
 #[tokio::test]
@@ -478,7 +561,8 @@ async fn execution_close_recompute_cancel_while_held_does_not_revive_or_repeat_c
         let transaction =
             install_recompute_request(&engine, &executor, &identity, &request_id, slot).await;
         let yielded = engine
-            .inner
+            .active_inner()
+            .expect("engine execution is open")
             .execute_capacity_yield(&transaction, 1, None)
             .await;
         assert_eq!(yielded.is_err(), initial_error);
@@ -492,18 +576,25 @@ async fn execution_close_recompute_cancel_while_held_does_not_revive_or_repeat_c
                     executor.issuer.ended(&identity).unwrap(),
                 )))
                 .unwrap();
-            engine.inner.execution_closes.join_observers().await;
+            engine
+                .active_inner()
+                .expect("engine execution is open")
+                .execution_closes
+                .join_observers()
+                .await;
         }
-        assert!(engine
-            .inner
-            .scheduler
-            .cancel_request(request_id.clone())
-            .unwrap());
-        let mut state = engine.inner.sequences.take(&request_id).unwrap();
+        assert!(engine.scheduler.cancel_request(request_id.clone()).unwrap());
+        let mut state = engine
+            .active_inner()
+            .expect("engine execution is open")
+            .sequences
+            .take(&request_id)
+            .unwrap();
         let frontier = state.execution_frontier.take().unwrap();
         assert!(state.request_slot.is_none());
         let ticket = engine
-            .inner
+            .active_inner()
+            .expect("engine execution is open")
             .begin_execution_close(
                 request_id.clone(),
                 frontier.sequence().clone(),
@@ -517,14 +608,7 @@ async fn execution_close_recompute_cancel_while_held_does_not_revive_or_repeat_c
             assert!(error.to_string().contains("initial publication failure"));
         }
         assert_eq!(executor.calls.load(Ordering::SeqCst), 1);
-        assert_eq!(
-            engine
-                .inner
-                .scheduler
-                .trace_snapshot()
-                .capacity_release_epoch,
-            0
-        );
+        assert_eq!(engine.scheduler.trace_snapshot().capacity_release_epoch, 0);
         if let Some(sender) = sender {
             executor.capacity_epoch.store(2, Ordering::Release);
             sender
@@ -533,50 +617,57 @@ async fn execution_close_recompute_cancel_while_held_does_not_revive_or_repeat_c
                 )))
                 .unwrap();
         }
-        engine.inner.execution_closes.join_observers().await;
-        engine.inner.drain_execution_closes().unwrap();
-        assert_eq!(engine.inner.execution_closes.unreclaimed_count(), 0);
-        assert!(engine.inner.sequences.get(&request_id).is_none());
-        assert_eq!(engine.inner.scheduler.trace_phase(&request_id), None);
-        assert_eq!(engine.inner.scheduler.waiting_count(), 0);
+        engine
+            .active_inner()
+            .expect("engine execution is open")
+            .execution_closes
+            .join_observers()
+            .await;
+        engine
+            .active_inner()
+            .expect("engine execution is open")
+            .drain_execution_closes()
+            .unwrap();
         assert_eq!(
             engine
-                .inner
-                .scheduler
-                .trace_snapshot()
-                .capacity_release_epoch,
-            1
+                .active_inner()
+                .expect("engine execution is open")
+                .execution_closes
+                .unreclaimed_count(),
+            0
         );
+        assert!(engine
+            .active_inner()
+            .expect("engine execution is open")
+            .sequences
+            .get(&request_id)
+            .is_none());
+        assert_eq!(engine.scheduler.trace_phase(&request_id), None);
+        assert_eq!(engine.scheduler.waiting_count(), 0);
+        assert_eq!(engine.scheduler.trace_snapshot().capacity_release_epoch, 1);
         assert_eq!(
             engine
-                .inner
                 .scheduler
                 .trace_snapshot()
                 .pressure_pending_release_fences,
             0
         );
-        engine.inner.drain_execution_closes().unwrap();
-        assert_eq!(
-            engine
-                .inner
-                .scheduler
-                .trace_snapshot()
-                .capacity_release_epoch,
-            1
-        );
+        engine
+            .active_inner()
+            .expect("engine execution is open")
+            .drain_execution_closes()
+            .unwrap();
+        assert_eq!(engine.scheduler.trace_snapshot().capacity_release_epoch, 1);
     }
 }
 
 #[tokio::test]
 async fn execution_close_held_preserves_slot_until_exact_ended_and_notifies_once() {
     let (engine, executor, sequence, request_id, slot, sender) = fixture(false);
-    let epoch = engine
-        .inner
-        .scheduler
-        .trace_snapshot()
-        .capacity_release_epoch;
+    let epoch = engine.scheduler.trace_snapshot().capacity_release_epoch;
     let ticket = engine
-        .inner
+        .active_inner()
+        .expect("engine execution is open")
         .begin_execution_close(
             request_id,
             sequence.clone(),
@@ -585,18 +676,19 @@ async fn execution_close_held_preserves_slot_until_exact_ended_and_notifies_once
         )
         .unwrap();
     ticket.initial_result().await.unwrap();
-    engine.inner.drain_execution_closes().unwrap();
+    engine
+        .active_inner()
+        .expect("engine execution is open")
+        .drain_execution_closes()
+        .unwrap();
     assert_eq!(executor.calls.load(Ordering::SeqCst), 1);
     assert_eq!(
-        engine
-            .inner
-            .scheduler
-            .trace_snapshot()
-            .capacity_release_epoch,
+        engine.scheduler.trace_snapshot().capacity_release_epoch,
         epoch
     );
     {
-        let state = engine.inner.execution_closes.state.lock();
+        let original_inner = engine.active_inner().expect("engine execution is open");
+        let state = original_inner.execution_closes.state.lock();
         let entry = &state.entries[&sequence];
         assert!(entry.slot.as_ref().unwrap().armed);
         assert_eq!(entry.recovery.as_ref().unwrap().sequence(), &sequence);
@@ -606,31 +698,43 @@ async fn execution_close_held_preserves_slot_until_exact_ended_and_notifies_once
             executor.issuer.ended(&sequence).unwrap(),
         )))
         .unwrap();
-    engine.inner.execution_closes.join_observers().await;
-    engine.inner.drain_execution_closes().unwrap();
-    assert_eq!(engine.inner.execution_closes.unreclaimed_count(), 0);
+    engine
+        .active_inner()
+        .expect("engine execution is open")
+        .execution_closes
+        .join_observers()
+        .await;
+    engine
+        .active_inner()
+        .expect("engine execution is open")
+        .drain_execution_closes()
+        .unwrap();
     assert_eq!(
         engine
-            .inner
-            .scheduler
-            .trace_snapshot()
-            .capacity_release_epoch,
+            .active_inner()
+            .expect("engine execution is open")
+            .execution_closes
+            .unreclaimed_count(),
+        0
+    );
+    assert_eq!(
+        engine.scheduler.trace_snapshot().capacity_release_epoch,
         epoch + 1
     );
-    engine.inner.drain_execution_closes().unwrap();
+    engine
+        .active_inner()
+        .expect("engine execution is open")
+        .drain_execution_closes()
+        .unwrap();
     assert_eq!(
-        engine
-            .inner
-            .scheduler
-            .trace_snapshot()
-            .capacity_release_epoch,
+        engine.scheduler.trace_snapshot().capacity_release_epoch,
         epoch + 1
     );
 }
 
 #[tokio::test]
 async fn execution_close_real_cpu_held_terminal_preserves_error_and_releases_once() {
-    use super::super::token_completion_tests::observed_cpu_model;
+    use super::super::token_completion_tests::observed_cpu_model_owned;
     use ferrum_execution::model_executor::{
         ExecutorPrefillAdmission, ExecutorSamplingOutput, LogitsReturnPolicy, PrefillChunk,
     };
@@ -640,9 +744,10 @@ async fn execution_close_real_cpu_held_terminal_preserves_error_and_releases_onc
     };
     use ferrum_models::{test_support::tiny_llama_model, DecoderOnlyLLM};
 
-    let (inner, model, cfg) = observed_cpu_model();
+    let (inner, model, cfg) = observed_cpu_model_owned();
     let (engine, executor, sequence, request_id, slot, sender) =
-        fixture_with_inner(false, inner.clone());
+        fixture_with_inner(false, inner, None);
+    let inner = Arc::clone(&executor.inner);
     let prompt = [TokenId(1), TokenId(2), TokenId(3)];
     let TokenAdmissionOutcome::Admitted(frontier) = inner
         .admit_tokens(ExecutionAdmission {
@@ -709,7 +814,8 @@ async fn execution_close_real_cpu_held_terminal_preserves_error_and_releases_onc
         sender.send(Ok(terminal)).unwrap();
     });
     engine
-        .inner
+        .active_inner()
+        .expect("engine execution is open")
         .begin_execution_close(
             request_id,
             sequence.clone(),
@@ -733,24 +839,24 @@ async fn execution_close_real_cpu_held_terminal_preserves_error_and_releases_onc
         assert!(state.releases.is_empty());
     }
     {
-        let state = engine.inner.execution_closes.state.lock();
+        let original_inner = engine.active_inner().expect("engine execution is open");
+        let state = original_inner.execution_closes.state.lock();
         let entry = &state.entries[&sequence];
         assert!(matches!(entry.observation, CloseObservation::Pending));
         assert!(entry.slot.as_ref().unwrap().armed);
     }
-    assert_eq!(
-        engine
-            .inner
-            .scheduler
-            .trace_snapshot()
-            .capacity_release_epoch,
-        0
-    );
+    assert_eq!(engine.scheduler.trace_snapshot().capacity_release_epoch, 0);
     release.send(()).unwrap();
     closer.await.unwrap();
-    engine.inner.execution_closes.join_observers().await;
+    engine
+        .active_inner()
+        .expect("engine execution is open")
+        .execution_closes
+        .join_observers()
+        .await;
     {
-        let state = engine.inner.execution_closes.state.lock();
+        let original_inner = engine.active_inner().expect("engine execution is open");
+        let state = original_inner.execution_closes.state.lock();
         let entry = &state.entries[&sequence];
         assert!(entry.operation_error.is_none());
         let CloseObservation::Ended(ended, Some(FerrumError::Backend { message })) =
@@ -761,33 +867,34 @@ async fn execution_close_real_cpu_held_terminal_preserves_error_and_releases_onc
         assert_eq!(ended.sequence(), &sequence);
         assert!(message.contains("deferred post-close publication failure"));
     }
-    let error = engine.inner.drain_execution_closes().unwrap_err();
+    let error = engine
+        .active_inner()
+        .expect("engine execution is open")
+        .drain_execution_closes()
+        .unwrap_err();
     assert!(matches!(&error, FerrumError::Backend { message }
         if message.contains("deferred post-close publication failure")));
-    assert_eq!(engine.inner.execution_closes.unreclaimed_count(), 0);
     assert_eq!(
         engine
-            .inner
-            .scheduler
-            .trace_snapshot()
-            .capacity_release_epoch,
-        1
+            .active_inner()
+            .expect("engine execution is open")
+            .execution_closes
+            .unreclaimed_count(),
+        0
     );
+    assert_eq!(engine.scheduler.trace_snapshot().capacity_release_epoch, 1);
     assert_eq!(executor.calls.load(Ordering::SeqCst), 1);
     {
         let state = model.lock();
         assert!(state.model.kv_caches.is_empty());
         assert_eq!(state.releases, vec![vec![prompt.len(); cfg.num_layers]]);
     }
-    engine.inner.drain_execution_closes().unwrap();
-    assert_eq!(
-        engine
-            .inner
-            .scheduler
-            .trace_snapshot()
-            .capacity_release_epoch,
-        1
-    );
+    engine
+        .active_inner()
+        .expect("engine execution is open")
+        .drain_execution_closes()
+        .unwrap();
+    assert_eq!(engine.scheduler.trace_snapshot().capacity_release_epoch, 1);
     assert_eq!(executor.calls.load(Ordering::SeqCst), 1);
     assert_eq!(model.lock().releases.len(), 1);
 }
@@ -796,7 +903,8 @@ async fn execution_close_real_cpu_held_terminal_preserves_error_and_releases_onc
 async fn execution_close_dropped_ticket_and_join_do_not_cancel_owner() {
     let (engine, executor, sequence, request_id, slot, sender) = fixture(false);
     let ticket = engine
-        .inner
+        .active_inner()
+        .expect("engine execution is open")
         .begin_execution_close(
             request_id,
             sequence.clone(),
@@ -809,22 +917,35 @@ async fn execution_close_dropped_ticket_and_join_do_not_cancel_owner() {
         .unwrap();
     drop(ticket);
     {
-        let join = engine.inner.execution_closes.join_observers();
+        let original_inner = engine.active_inner().expect("engine execution is open");
+        let join = original_inner.execution_closes.join_observers();
         tokio::pin!(join);
         assert!(futures::poll!(&mut join).is_pending());
     }
-    assert_eq!(engine.inner.execution_closes.unreclaimed_count(), 1);
     assert_eq!(
         engine
-            .inner
-            .scheduler
-            .trace_snapshot()
-            .capacity_release_epoch,
-        0
+            .active_inner()
+            .expect("engine execution is open")
+            .execution_closes
+            .unreclaimed_count(),
+        1
     );
+    assert_eq!(engine.scheduler.trace_snapshot().capacity_release_epoch, 0);
     loop {
-        let notified = engine.inner.work_notify.notified();
-        if engine.inner.execution_closes.state.lock().entries[&sequence]
+        let notify = Arc::clone(
+            &engine
+                .active_inner()
+                .expect("engine execution is open")
+                .work_notify,
+        );
+        let notified = notify.notified();
+        if engine
+            .active_inner()
+            .expect("engine execution is open")
+            .execution_closes
+            .state
+            .lock()
+            .entries[&sequence]
             .recovery
             .is_some()
         {
@@ -842,9 +963,22 @@ async fn execution_close_dropped_ticket_and_join_do_not_cancel_owner() {
     // join cancellation removed only the JoinHandle; completion is stored in
     // the same retained record and still wakes the engine.
     loop {
-        let notified = engine.inner.work_notify.notified();
+        let notify = Arc::clone(
+            &engine
+                .active_inner()
+                .expect("engine execution is open")
+                .work_notify,
+        );
+        let notified = notify.notified();
         if matches!(
-            engine.inner.execution_closes.state.lock().entries[&sequence].observation,
+            engine
+                .active_inner()
+                .expect("engine execution is open")
+                .execution_closes
+                .state
+                .lock()
+                .entries[&sequence]
+                .observation,
             CloseObservation::Ended(..)
         ) {
             break;
@@ -853,23 +987,21 @@ async fn execution_close_dropped_ticket_and_join_do_not_cancel_owner() {
             .await
             .unwrap();
     }
-    engine.inner.drain_execution_closes().unwrap();
+    engine
+        .active_inner()
+        .expect("engine execution is open")
+        .drain_execution_closes()
+        .unwrap();
     assert_eq!(executor.calls.load(Ordering::SeqCst), 1);
-    assert_eq!(
-        engine
-            .inner
-            .scheduler
-            .trace_snapshot()
-            .capacity_release_epoch,
-        1
-    );
+    assert_eq!(engine.scheduler.trace_snapshot().capacity_release_epoch, 1);
 }
 
 #[tokio::test]
 async fn execution_close_keeps_initial_error_and_later_unproved_owner_on_shutdown() {
     let (engine, executor, sequence, request_id, slot, sender) = fixture(true);
     let ticket = engine
-        .inner
+        .active_inner()
+        .expect("engine execution is open")
         .begin_execution_close(
             request_id,
             sequence.clone(),
@@ -884,7 +1016,8 @@ async fn execution_close_keeps_initial_error_and_later_unproved_owner_on_shutdow
         .to_string()
         .contains("initial publication failure"));
     assert!(engine
-        .inner
+        .active_inner()
+        .expect("engine execution is open")
         .drain_execution_closes()
         .unwrap_err()
         .to_string()
@@ -892,39 +1025,59 @@ async fn execution_close_keeps_initial_error_and_later_unproved_owner_on_shutdow
     sender
         .send(Err(FerrumError::backend("terminal observation failed")))
         .unwrap();
-    engine.inner.execution_closes.join_observers().await;
+    engine
+        .active_inner()
+        .expect("engine execution is open")
+        .execution_closes
+        .join_observers()
+        .await;
     assert!(engine
-        .inner
+        .active_inner()
+        .expect("engine execution is open")
         .drain_execution_closes()
         .unwrap_err()
         .to_string()
         .contains("terminal observation failed"));
-    assert_eq!(engine.inner.execution_closes.unreclaimed_count(), 1);
+    assert_eq!(
+        engine
+            .active_inner()
+            .expect("engine execution is open")
+            .execution_closes
+            .unreclaimed_count(),
+        1
+    );
     assert!(
-        engine.inner.execution_closes.state.lock().entries[&sequence]
+        engine
+            .active_inner()
+            .expect("engine execution is open")
+            .execution_closes
+            .state
+            .lock()
+            .entries[&sequence]
             .slot
             .as_ref()
             .unwrap()
             .armed
     );
-    assert_eq!(
-        engine
-            .inner
-            .scheduler
-            .trace_snapshot()
-            .capacity_release_epoch,
-        0
-    );
+    assert_eq!(engine.scheduler.trace_snapshot().capacity_release_epoch, 0);
+    let retained_inner = Arc::downgrade(&engine.active_inner().unwrap());
     assert!(engine
         .shutdown()
         .await
         .unwrap_err()
         .to_string()
         .contains("unproved execution closures"));
-    assert_eq!(engine.inner.execution_closes.unreclaimed_count(), 1);
+    assert_eq!(
+        retained_inner
+            .upgrade()
+            .unwrap()
+            .execution_closes
+            .unreclaimed_count(),
+        1
+    );
     assert_eq!(executor.calls.load(Ordering::SeqCst), 1);
     // Explicit unreclaimed exit logs the retained obligation, never close/release.
-    let scheduler = Arc::clone(&engine.inner.scheduler);
+    let scheduler = Arc::clone(&engine.scheduler);
     drop(engine);
     assert_eq!(scheduler.trace_snapshot().capacity_release_epoch, 0);
 }
@@ -935,7 +1088,8 @@ async fn execution_close_observed_ended_avoids_reclosing_and_preserves_operation
     let observed = ExecutionCloseOutcome::ended(executor.issuer.ended(&sequence).unwrap())
         .with_error(FerrumError::backend("terminal publication failed"));
     let ticket = engine
-        .inner
+        .active_inner()
+        .expect("engine execution is open")
         .begin_observed_close(request_id, sequence, Some(slot), observed)
         .unwrap();
     assert!(ticket
@@ -944,23 +1098,29 @@ async fn execution_close_observed_ended_avoids_reclosing_and_preserves_operation
         .unwrap_err()
         .to_string()
         .contains("terminal publication failed"));
-    engine.inner.execution_closes.join_observers().await;
+    engine
+        .active_inner()
+        .expect("engine execution is open")
+        .execution_closes
+        .join_observers()
+        .await;
     assert!(engine
-        .inner
+        .active_inner()
+        .expect("engine execution is open")
         .drain_execution_closes()
         .unwrap_err()
         .to_string()
         .contains("terminal publication failed"));
     assert_eq!(executor.calls.load(Ordering::SeqCst), 0);
-    assert_eq!(engine.inner.execution_closes.unreclaimed_count(), 0);
     assert_eq!(
         engine
-            .inner
-            .scheduler
-            .trace_snapshot()
-            .capacity_release_epoch,
-        1
+            .active_inner()
+            .expect("engine execution is open")
+            .execution_closes
+            .unreclaimed_count(),
+        0
     );
+    assert_eq!(engine.scheduler.trace_snapshot().capacity_release_epoch, 1);
 }
 
 #[tokio::test]
@@ -969,7 +1129,8 @@ async fn execution_close_rejects_other_incarnation_without_freeing_original_slot
     let foreign = executor.issuer.issue_sequence().unwrap();
     let observed = ExecutionCloseOutcome::ended(executor.issuer.ended(&foreign).unwrap());
     let ticket = engine
-        .inner
+        .active_inner()
+        .expect("engine execution is open")
         .begin_observed_close(request_id, sequence.clone(), Some(slot), observed)
         .unwrap();
     assert!(ticket
@@ -978,24 +1139,32 @@ async fn execution_close_rejects_other_incarnation_without_freeing_original_slot
         .unwrap_err()
         .to_string()
         .contains("another incarnation"));
-    engine.inner.execution_closes.join_observers().await;
-    assert!(engine.inner.drain_execution_closes().is_err());
+    engine
+        .active_inner()
+        .expect("engine execution is open")
+        .execution_closes
+        .join_observers()
+        .await;
+    assert!(engine
+        .active_inner()
+        .expect("engine execution is open")
+        .drain_execution_closes()
+        .is_err());
     assert_eq!(executor.calls.load(Ordering::SeqCst), 0);
     assert!(
-        engine.inner.execution_closes.state.lock().entries[&sequence]
+        engine
+            .active_inner()
+            .expect("engine execution is open")
+            .execution_closes
+            .state
+            .lock()
+            .entries[&sequence]
             .slot
             .as_ref()
             .unwrap()
             .armed
     );
-    assert_eq!(
-        engine
-            .inner
-            .scheduler
-            .trace_snapshot()
-            .capacity_release_epoch,
-        0
-    );
+    assert_eq!(engine.scheduler.trace_snapshot().capacity_release_epoch, 0);
 }
 
 #[tokio::test]
@@ -1010,22 +1179,32 @@ async fn execution_close_published_end_still_runs_executor_close_validation() {
         let (engine, executor, sequence, request_id, slot, _sender) = fixture(false);
         drop(executor.issuer.ended(&sequence).unwrap());
         let ticket = engine
-            .inner
+            .active_inner()
+            .expect("engine execution is open")
             .begin_execution_close(request_id, sequence, Some(slot), reason)
             .unwrap();
         ticket.initial_result().await.unwrap();
-        engine.inner.execution_closes.join_observers().await;
-        engine.inner.drain_execution_closes().unwrap();
+        engine
+            .active_inner()
+            .expect("engine execution is open")
+            .execution_closes
+            .join_observers()
+            .await;
+        engine
+            .active_inner()
+            .expect("engine execution is open")
+            .drain_execution_closes()
+            .unwrap();
         assert_eq!(executor.calls.load(Ordering::SeqCst), 1);
-        assert_eq!(engine.inner.execution_closes.unreclaimed_count(), 0);
         assert_eq!(
             engine
-                .inner
-                .scheduler
-                .trace_snapshot()
-                .capacity_release_epoch,
-            1
+                .active_inner()
+                .expect("engine execution is open")
+                .execution_closes
+                .unreclaimed_count(),
+            0
         );
+        assert_eq!(engine.scheduler.trace_snapshot().capacity_release_epoch, 1);
     }
 }
 
@@ -1035,7 +1214,8 @@ async fn execution_close_retains_error_when_end_is_published_during_close() {
     assert!(sequence.observed_end().is_none());
     executor.end_then_error.store(true, Ordering::SeqCst);
     let ticket = engine
-        .inner
+        .active_inner()
+        .expect("engine execution is open")
         .begin_execution_close(
             request_id,
             sequence.clone(),
@@ -1049,31 +1229,38 @@ async fn execution_close_retains_error_when_end_is_published_during_close() {
         .unwrap_err()
         .to_string()
         .contains("failed after publishing actual terminal fact"));
-    engine.inner.execution_closes.join_observers().await;
+    engine
+        .active_inner()
+        .expect("engine execution is open")
+        .execution_closes
+        .join_observers()
+        .await;
     assert!(engine
-        .inner
+        .active_inner()
+        .expect("engine execution is open")
         .drain_execution_closes()
         .unwrap_err()
         .to_string()
         .contains("failed after publishing actual terminal fact"));
     assert!(sequence.observed_end().is_some());
     assert_eq!(executor.calls.load(Ordering::SeqCst), 1);
-    assert_eq!(engine.inner.execution_closes.unreclaimed_count(), 0);
     assert_eq!(
         engine
-            .inner
-            .scheduler
-            .trace_snapshot()
-            .capacity_release_epoch,
-        1
+            .active_inner()
+            .expect("engine execution is open")
+            .execution_closes
+            .unreclaimed_count(),
+        0
     );
+    assert_eq!(engine.scheduler.trace_snapshot().capacity_release_epoch, 1);
 }
 
 #[tokio::test]
 async fn execution_close_observer_error_does_not_erase_independently_published_end() {
     let (engine, executor, sequence, request_id, slot, sender) = fixture(true);
     let ticket = engine
-        .inner
+        .active_inner()
+        .expect("engine execution is open")
         .begin_execution_close(
             request_id,
             sequence.clone(),
@@ -1088,7 +1275,8 @@ async fn execution_close_observer_error_does_not_erase_independently_published_e
         .to_string()
         .contains("initial publication failure"));
     assert!(engine
-        .inner
+        .active_inner()
+        .expect("engine execution is open")
         .drain_execution_closes()
         .unwrap_err()
         .to_string()
@@ -1099,29 +1287,41 @@ async fn execution_close_observer_error_does_not_erase_independently_published_e
             "observer transport failed after terminal",
         )))
         .unwrap();
-    engine.inner.execution_closes.join_observers().await;
+    engine
+        .active_inner()
+        .expect("engine execution is open")
+        .execution_closes
+        .join_observers()
+        .await;
     assert!(engine
-        .inner
+        .active_inner()
+        .expect("engine execution is open")
         .drain_execution_closes()
         .unwrap_err()
         .to_string()
         .contains("observer transport failed after terminal"));
-    assert_eq!(engine.inner.execution_closes.unreclaimed_count(), 0);
     assert_eq!(
         engine
-            .inner
-            .scheduler
-            .trace_snapshot()
-            .capacity_release_epoch,
-        1
+            .active_inner()
+            .expect("engine execution is open")
+            .execution_closes
+            .unreclaimed_count(),
+        0
     );
+    assert_eq!(engine.scheduler.trace_snapshot().capacity_release_epoch, 1);
 }
 
 #[tokio::test]
 async fn execution_close_duplicate_retains_the_second_real_observer() {
-    let (engine, executor, sequence, request_id, slot, sender) = fixture(false);
+    let trace = tempfile::tempdir().unwrap();
+    let (engine, executor, sequence, request_id, slot, sender) = fixture_with_inner(
+        false,
+        tiny_llama_executor_owned(&TinyLlamaConfig::default()),
+        Some(trace.path().join("retained.jsonl")),
+    );
     let ticket = engine
-        .inner
+        .active_inner()
+        .expect("engine execution is open")
         .begin_execution_close(
             request_id.clone(),
             sequence.clone(),
@@ -1143,7 +1343,8 @@ async fn execution_close_duplicate_retains_the_second_real_observer() {
         )
         .unwrap();
     assert!(engine
-        .inner
+        .active_inner()
+        .expect("engine execution is open")
         .begin_observed_close(
             request_id,
             sequence.clone(),
@@ -1157,7 +1358,8 @@ async fn execution_close_duplicate_retains_the_second_real_observer() {
         "rejection must retain the incoming Held future"
     );
     assert!(engine
-        .inner
+        .active_inner()
+        .expect("engine execution is open")
         .drain_execution_closes()
         .unwrap_err()
         .to_string()
@@ -1167,24 +1369,36 @@ async fn execution_close_duplicate_retains_the_second_real_observer() {
             executor.issuer.ended(&sequence).unwrap(),
         )))
         .unwrap();
-    engine.inner.execution_closes.join_observers().await;
-    engine.inner.drain_execution_closes().unwrap();
+    engine
+        .active_inner()
+        .expect("engine execution is open")
+        .execution_closes
+        .join_observers()
+        .await;
+    engine
+        .active_inner()
+        .expect("engine execution is open")
+        .drain_execution_closes()
+        .unwrap();
     assert_eq!(executor.calls.load(Ordering::SeqCst), 1);
-    assert_eq!(engine.inner.execution_closes.unreclaimed_count(), 1);
     assert_eq!(
         engine
-            .inner
-            .scheduler
-            .trace_snapshot()
-            .capacity_release_epoch,
+            .active_inner()
+            .expect("engine execution is open")
+            .execution_closes
+            .unreclaimed_count(),
         1
     );
+    assert_eq!(engine.scheduler.trace_snapshot().capacity_release_epoch, 1);
     assert!(!second_sender.is_closed());
-    drop(engine);
-    assert!(
-        second_sender.is_closed(),
-        "only explicit unreclaimed registry exit drops the rejected observer"
-    );
+    crate::continuous_engine::executor_shutdown_tests::retire_rejected_observer_after_drop(
+        engine,
+        &executor.issuer,
+        &sequence,
+        second_sender,
+    )
+    .await;
+    assert_eq!(executor.calls.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]
@@ -1206,7 +1420,8 @@ async fn execution_close_foreign_held_survives_original_terminal_consumption() {
     // A separate real published fact permits only the original slot's release.
     drop(executor.issuer.ended(&sequence).unwrap());
     let ticket = engine
-        .inner
+        .active_inner()
+        .expect("engine execution is open")
         .begin_observed_close(
             request_id,
             sequence,
@@ -1221,25 +1436,39 @@ async fn execution_close_foreign_held_survives_original_terminal_consumption() {
         .unwrap_err()
         .to_string()
         .contains("foreign publication error"));
-    engine.inner.execution_closes.join_observers().await;
-    assert!(engine.inner.drain_execution_closes().is_err());
+    engine
+        .active_inner()
+        .expect("engine execution is open")
+        .execution_closes
+        .join_observers()
+        .await;
+    assert!(engine
+        .active_inner()
+        .expect("engine execution is open")
+        .drain_execution_closes()
+        .is_err());
     assert_eq!(executor.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(engine.scheduler.trace_snapshot().capacity_release_epoch, 1);
     assert_eq!(
         engine
-            .inner
-            .scheduler
-            .trace_snapshot()
-            .capacity_release_epoch,
+            .active_inner()
+            .expect("engine execution is open")
+            .execution_closes
+            .unreclaimed_count(),
         1
     );
-    assert_eq!(engine.inner.execution_closes.unreclaimed_count(), 1);
     assert!(
         !foreign_sender.is_closed(),
         "releasing the original slot cannot erase a foreign Held"
     );
     assert!(foreign.observed_end().is_none());
-    drop(engine);
-    assert!(foreign_sender.is_closed());
+    crate::continuous_engine::executor_shutdown_tests::retire_rejected_observer_after_drop(
+        engine,
+        &executor.issuer,
+        &foreign,
+        foreign_sender,
+    )
+    .await;
 }
 
 #[tokio::test]
@@ -1258,35 +1487,145 @@ async fn execution_close_wrong_request_slot_retains_incoming_observer() {
         )
         .unwrap();
     assert!(engine
-        .inner
+        .active_inner()
+        .expect("engine execution is open")
         .begin_observed_close(
             RequestId::new(),
-            sequence,
+            sequence.clone(),
             Some(slot),
             ExecutionCloseOutcome::held(held),
         )
         .is_err());
     assert!(!sender.is_closed());
     assert_eq!(executor.calls.load(Ordering::SeqCst), 0);
-    assert_eq!(engine.inner.execution_closes.unreclaimed_count(), 1);
-    assert!(engine.inner.drain_execution_closes().is_err());
     assert_eq!(
         engine
-            .inner
-            .scheduler
-            .trace_snapshot()
-            .capacity_release_epoch,
+            .active_inner()
+            .expect("engine execution is open")
+            .execution_closes
+            .unreclaimed_count(),
+        1
+    );
+    assert!(engine
+        .active_inner()
+        .expect("engine execution is open")
+        .drain_execution_closes()
+        .is_err());
+    assert_eq!(engine.scheduler.trace_snapshot().capacity_release_epoch, 0);
+    let (original, observation_task) = {
+        let inner = engine.active_inner().unwrap();
+        let task = inner.execution_closes.state.lock().rejected[0]
+            .task
+            .take()
+            .unwrap();
+        (Arc::downgrade(&inner), task)
+    };
+    let scheduler = Arc::clone(&engine.scheduler);
+    let observer = engine.driver.shutdown_active().unwrap();
+    let report = observer.wait().await;
+    assert!(report.retains_unproved_owners());
+    let completion = report.cleanup_completion();
+    drop((report, observer, engine));
+    assert!(!sender.is_closed());
+    assert!(original.upgrade().is_some());
+    sender
+        .send(Ok(ExecutionTerminalOutcome::ended(
+            executor.issuer.ended(&sequence).unwrap(),
+        )))
+        .unwrap();
+    observation_task.await.unwrap();
+    // The actual Held is finished, but the rejected request-to-slot binding
+    // still grants no authority to release that different request's slot.
+    assert!(!*completion.borrow());
+    let inner = original
+        .upgrade()
+        .expect("unproved slot retains original custody");
+    let state = inner.execution_closes.state.lock();
+    assert_eq!(state.rejected.len(), 1);
+    assert!(state.rejected[0].slot.as_ref().unwrap().armed);
+    assert!(state.rejected[0]
+        .rejected_observation
+        .as_ref()
+        .unwrap()
+        .terminal()
+        .is_some());
+    assert_eq!(scheduler.trace_snapshot().capacity_release_epoch, 0);
+}
+
+#[tokio::test]
+async fn execution_close_rejected_terminal_reports_its_error_before_retirement() {
+    let (engine, executor, sequence, request_id, slot, _unused) = fixture(false);
+    slot.close(&engine.active_inner().unwrap());
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    let held = executor
+        .issuer
+        .held(
+            executor.issuer.recovery_key(&sequence).unwrap(),
+            async move {
+                receiver
+                    .await
+                    .map_err(|_| FerrumError::internal("lost rejected terminal"))?
+            },
+        )
+        .unwrap();
+    engine
+        .active_inner()
+        .unwrap()
+        .retain_unassigned_execution_close(
+            request_id,
+            ExecutionCloseOutcome::held(held),
+            FerrumError::internal("unassigned protocol output"),
+        );
+    assert!(engine
+        .active_inner()
+        .unwrap()
+        .drain_execution_closes()
+        .unwrap_err()
+        .to_string()
+        .contains("unassigned protocol output"));
+    let task = engine
+        .active_inner()
+        .unwrap()
+        .execution_closes
+        .state
+        .lock()
+        .rejected[0]
+        .task
+        .take()
+        .unwrap();
+    sender
+        .send(Ok(ExecutionTerminalOutcome::ended(
+            executor.issuer.ended(&sequence).unwrap(),
+        )
+        .with_error(FerrumError::backend("rejected terminal error"))))
+        .unwrap();
+    task.await.unwrap();
+    assert!(engine
+        .active_inner()
+        .unwrap()
+        .drain_execution_closes()
+        .unwrap_err()
+        .to_string()
+        .contains("rejected terminal error"));
+    assert_eq!(
+        engine
+            .active_inner()
+            .unwrap()
+            .execution_closes
+            .unreclaimed_count(),
         0
     );
-    drop(engine);
-    assert!(sender.is_closed());
+    assert_eq!(engine.scheduler.trace_snapshot().capacity_release_epoch, 0);
+    assert_eq!(executor.calls.load(Ordering::SeqCst), 0);
+    engine.shutdown().await.unwrap();
 }
 
 #[tokio::test]
 async fn execution_close_unassigned_retains_observer_without_registering_foreign_identity() {
     let (engine, executor, sequence, request_id, slot, sender) = fixture(false);
     let ticket = engine
-        .inner
+        .active_inner()
+        .expect("engine execution is open")
         .begin_execution_close(
             request_id.clone(),
             sequence.clone(),
@@ -1308,14 +1647,18 @@ async fn execution_close_unassigned_retains_observer_without_registering_foreign
             },
         )
         .unwrap();
-    engine.inner.retain_unassigned_execution_close(
-        request_id,
-        ExecutionCloseOutcome::held(held)
-            .with_error(FerrumError::backend("unassigned publication error")),
-        FerrumError::internal("unassigned batch disposition"),
-    );
+    engine
+        .active_inner()
+        .expect("engine execution is open")
+        .retain_unassigned_execution_close(
+            request_id,
+            ExecutionCloseOutcome::held(held)
+                .with_error(FerrumError::backend("unassigned publication error")),
+            FerrumError::internal("unassigned batch disposition"),
+        );
     {
-        let state = engine.inner.execution_closes.state.lock();
+        let original_inner = engine.active_inner().expect("engine execution is open");
+        let state = original_inner.execution_closes.state.lock();
         assert_eq!(state.entries.len(), 1);
         assert!(state.entries.contains_key(&sequence));
         assert!(!state.entries.contains_key(&foreign));
@@ -1323,48 +1666,57 @@ async fn execution_close_unassigned_retains_observer_without_registering_foreign
         assert!(state.rejected[0].slot.is_none());
     }
     assert!(engine
-        .inner
+        .active_inner()
+        .expect("engine execution is open")
         .drain_execution_closes()
         .unwrap_err()
         .to_string()
         .contains("unassigned publication error"));
-    assert_eq!(
-        engine
-            .inner
-            .scheduler
-            .trace_snapshot()
-            .capacity_release_epoch,
-        0
-    );
+    assert_eq!(engine.scheduler.trace_snapshot().capacity_release_epoch, 0);
     assert!(!foreign_sender.is_closed());
     sender
         .send(Ok(ExecutionTerminalOutcome::ended(
             executor.issuer.ended(&sequence).unwrap(),
         )))
         .unwrap();
-    engine.inner.execution_closes.join_observers().await;
-    engine.inner.drain_execution_closes().unwrap();
+    engine
+        .active_inner()
+        .expect("engine execution is open")
+        .execution_closes
+        .join_observers()
+        .await;
+    engine
+        .active_inner()
+        .expect("engine execution is open")
+        .drain_execution_closes()
+        .unwrap();
+    assert_eq!(engine.scheduler.trace_snapshot().capacity_release_epoch, 1);
     assert_eq!(
         engine
-            .inner
-            .scheduler
-            .trace_snapshot()
-            .capacity_release_epoch,
+            .active_inner()
+            .expect("engine execution is open")
+            .execution_closes
+            .unreclaimed_count(),
         1
     );
-    assert_eq!(engine.inner.execution_closes.unreclaimed_count(), 1);
     assert_eq!(executor.calls.load(Ordering::SeqCst), 1);
     assert!(!foreign_sender.is_closed());
     assert!(foreign.observed_end().is_none());
-    drop(engine);
-    assert!(foreign_sender.is_closed());
+    crate::continuous_engine::executor_shutdown_tests::retire_rejected_observer_after_drop(
+        engine,
+        &executor.issuer,
+        &foreign,
+        foreign_sender,
+    )
+    .await;
 }
 
 #[tokio::test]
 async fn execution_close_detached_joins_held_without_downgrading_release_obligation() {
     let (engine, executor, sequence, request_id, slot, sender) = fixture(false);
     engine
-        .inner
+        .active_inner()
+        .expect("engine execution is open")
         .begin_execution_close(
             request_id.clone(),
             sequence.clone(),
@@ -1388,7 +1740,8 @@ async fn execution_close_detached_joins_held_without_downgrading_release_obligat
         )
         .unwrap();
     let ticket = engine
-        .inner
+        .active_inner()
+        .expect("engine execution is open")
         .begin_detached_execution_close(
             request_id,
             sequence.clone(),
@@ -1400,23 +1753,18 @@ async fn execution_close_detached_joins_held_without_downgrading_release_obligat
         .unwrap();
     ticket.initial_result().await.unwrap();
     assert!(engine
-        .inner
+        .active_inner()
+        .expect("engine execution is open")
         .drain_execution_closes()
         .unwrap_err()
         .to_string()
         .contains("detached observation error"));
     assert!(!additional_sender.is_closed());
     assert_eq!(executor.calls.load(Ordering::SeqCst), 1);
-    assert_eq!(
-        engine
-            .inner
-            .scheduler
-            .trace_snapshot()
-            .capacity_release_epoch,
-        0
-    );
+    assert_eq!(engine.scheduler.trace_snapshot().capacity_release_epoch, 0);
     {
-        let state = engine.inner.execution_closes.state.lock();
+        let original_inner = engine.active_inner().expect("engine execution is open");
+        let state = original_inner.execution_closes.state.lock();
         let entry = &state.entries[&sequence];
         assert!(matches!(entry.purpose, ClosePurpose::Finalize { .. }));
         assert!(entry.slot.as_ref().unwrap().armed);
@@ -1426,17 +1774,26 @@ async fn execution_close_detached_joins_held_without_downgrading_release_obligat
             executor.issuer.ended(&sequence).unwrap(),
         )))
         .unwrap();
-    engine.inner.execution_closes.join_observers().await;
-    engine.inner.drain_execution_closes().unwrap();
-    assert_eq!(engine.inner.execution_closes.unreclaimed_count(), 0);
+    engine
+        .active_inner()
+        .expect("engine execution is open")
+        .execution_closes
+        .join_observers()
+        .await;
+    engine
+        .active_inner()
+        .expect("engine execution is open")
+        .drain_execution_closes()
+        .unwrap();
     assert_eq!(
         engine
-            .inner
-            .scheduler
-            .trace_snapshot()
-            .capacity_release_epoch,
-        1
+            .active_inner()
+            .expect("engine execution is open")
+            .execution_closes
+            .unreclaimed_count(),
+        0
     );
+    assert_eq!(engine.scheduler.trace_snapshot().capacity_release_epoch, 1);
     // Only the same incarnation's actual terminal proof makes this secondary
     // observer dispensable; it was retained throughout Held.
     assert!(additional_sender.is_closed());
@@ -1448,58 +1805,78 @@ async fn execution_close_detached_held_and_fresh_slotless_release_have_distinct_
         let (engine, executor, sequence, request_id, slot, sender) = fixture(false);
         // The fixture slot is not transferred. The two paths intentionally
         // share slot=None, so a slot-presence heuristic cannot satisfy this test.
-        slot.close(&engine.inner);
+        slot.close(&engine.active_inner().expect("engine execution is open"));
         let ticket = if detached {
             engine
-                .inner
+                .active_inner()
+                .expect("engine execution is open")
                 .begin_detached_execution_close(request_id, sequence.clone(), None)
         } else {
             // A just-admitted physical owner that could not be installed into
             // the product retains its new release obligation without a slot.
-            engine.inner.begin_execution_close(
-                request_id,
-                sequence.clone(),
-                None,
-                ExecutionEndReason::Cancelled,
-            )
+            engine
+                .active_inner()
+                .expect("engine execution is open")
+                .begin_execution_close(
+                    request_id,
+                    sequence.clone(),
+                    None,
+                    ExecutionEndReason::Cancelled,
+                )
         }
         .unwrap();
         ticket.initial_result().await.unwrap();
-        engine.inner.drain_execution_closes().unwrap();
+        engine
+            .active_inner()
+            .expect("engine execution is open")
+            .drain_execution_closes()
+            .unwrap();
         assert!(!sender.is_closed());
         assert_eq!(executor.calls.load(Ordering::SeqCst), 1);
-        assert_eq!(engine.inner.execution_closes.unreclaimed_count(), 1);
         assert_eq!(
             engine
-                .inner
-                .scheduler
-                .trace_snapshot()
-                .capacity_release_epoch,
-            0
+                .active_inner()
+                .expect("engine execution is open")
+                .execution_closes
+                .unreclaimed_count(),
+            1
         );
+        assert_eq!(engine.scheduler.trace_snapshot().capacity_release_epoch, 0);
         sender
             .send(Ok(ExecutionTerminalOutcome::ended(
                 executor.issuer.ended(&sequence).unwrap(),
             )))
             .unwrap();
-        engine.inner.execution_closes.join_observers().await;
-        engine.inner.drain_execution_closes().unwrap();
-        assert_eq!(engine.inner.execution_closes.unreclaimed_count(), 0);
+        engine
+            .active_inner()
+            .expect("engine execution is open")
+            .execution_closes
+            .join_observers()
+            .await;
+        engine
+            .active_inner()
+            .expect("engine execution is open")
+            .drain_execution_closes()
+            .unwrap();
         assert_eq!(
             engine
-                .inner
-                .scheduler
-                .trace_snapshot()
-                .capacity_release_epoch,
+                .active_inner()
+                .expect("engine execution is open")
+                .execution_closes
+                .unreclaimed_count(),
+            0
+        );
+        assert_eq!(
+            engine.scheduler.trace_snapshot().capacity_release_epoch,
             if detached { 0 } else { 1 }
         );
-        engine.inner.drain_execution_closes().unwrap();
+        engine
+            .active_inner()
+            .expect("engine execution is open")
+            .drain_execution_closes()
+            .unwrap();
         assert_eq!(
-            engine
-                .inner
-                .scheduler
-                .trace_snapshot()
-                .capacity_release_epoch,
+            engine.scheduler.trace_snapshot().capacity_release_epoch,
             if detached { 0 } else { 1 }
         );
     }

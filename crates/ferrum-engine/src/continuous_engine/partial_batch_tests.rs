@@ -1,6 +1,10 @@
 //! Post-forward output failures must never replay an already consumed batch.
 
+use super::token_completion_tests::{LayerSnapshot, ModelSnapshot};
 use super::*;
+use ferrum_execution::executor_lifecycle::{
+    ExecutorOwner, ExecutorScope, ExecutorShutdownObserver, ExecutorShutdownPermit,
+};
 use ferrum_execution::model_executor::{
     ExecutorCapabilities, ExecutorSamplingOutput, ExecutorStatus, KvSlotRequest, KvSlotReservation,
 };
@@ -27,7 +31,7 @@ struct DecodeObservation {
 }
 
 struct Observation {
-    model: LlamaFamilyModel<CpuBackend>,
+    model: ModelSnapshot,
     prepared: Vec<String>,
     prefills: Vec<(String, Vec<f32>)>,
     decodes: Vec<DecodeObservation>,
@@ -57,8 +61,28 @@ impl Observation {
 // is delegated to the real model. Corrupt only the returned row after retaining
 // its full numerical output and actual per-layer KV lengths.
 struct ObservedLlama {
+    model: LlamaFamilyModel<CpuBackend>,
     state: Arc<Mutex<Observation>>,
     config: LlmRuntimeConfig,
+}
+
+impl ObservedLlama {
+    fn publish_snapshot(&self) {
+        self.state.lock().model.kv_caches = self
+            .model
+            .kv_caches
+            .iter()
+            .map(|(id, layers)| {
+                (
+                    id.clone(),
+                    layers
+                        .iter()
+                        .map(|layer| LayerSnapshot { len: layer.len })
+                        .collect(),
+                )
+            })
+            .collect();
+    }
 }
 
 impl DecoderOnlyLLM for ObservedLlama {
@@ -67,14 +91,14 @@ impl DecoderOnlyLLM for ObservedLlama {
     }
 
     fn adapter_execution_support(&self) -> ferrum_interfaces::adapter::AdapterExecutionSupport {
-        self.state.lock().model.adapter_execution_support()
+        self.model.adapter_execution_support()
     }
 
     fn preload_lora_adapter(
         &mut self,
         adapter: &ferrum_models::lora::ActiveLoraAdapter,
     ) -> Result<()> {
-        self.state.lock().model.preload_lora_adapter(adapter)
+        self.model.preload_lora_adapter(adapter)
     }
 
     fn set_lora_adapter_for_cache(
@@ -82,40 +106,44 @@ impl DecoderOnlyLLM for ObservedLlama {
         id: &str,
         adapter: Option<ferrum_models::lora::ActiveLoraAdapter>,
     ) -> Result<()> {
-        self.state
-            .lock()
-            .model
-            .set_lora_adapter_for_cache(id, adapter)
+        self.model.set_lora_adapter_for_cache(id, adapter)
     }
 
     fn prepare_token_kv(&mut self, request: ModelKvPreparation<'_>) -> Result<ModelKvReservation> {
-        let mut state = self.state.lock();
-        state.prepared.push(request.cache_id.to_owned());
-        state.model.prepare_token_kv(request)
+        self.state.lock().prepared.push(request.cache_id.to_owned());
+        let result = self.model.prepare_token_kv(request);
+        self.publish_snapshot();
+        result
     }
 
     fn reserve_kv_slots(
         &mut self,
         requests: &[KvSlotRequest],
     ) -> Result<Option<KvSlotReservation>> {
-        self.state.lock().model.reserve_kv_slots(requests)
+        let result = self.model.reserve_kv_slots(requests);
+        self.publish_snapshot();
+        result
     }
 
     fn reserve_token_kv_slots(&mut self, requests: &[KvSlotRequest]) -> Result<ModelKvReservation> {
-        self.state.lock().model.reserve_token_kv_slots(requests)
+        let result = self.model.reserve_token_kv_slots(requests);
+        self.publish_snapshot();
+        result
     }
 
     fn token_execution_mode(&self) -> ferrum_models::ModelTokenExecutionMode {
-        self.state.lock().model.token_execution_mode()
+        self.model.token_execution_mode()
     }
 
     fn execute_token_work(
         &mut self,
         input: &ModelTokenInput<'_>,
     ) -> ModelTokenOutcome<ModelTokenProduct> {
-        let mut state = self.state.lock();
         let id = input.cache_id;
-        let mut logits = match state.model.execute_token_work(input) {
+        let result = self.model.execute_token_work(input);
+        self.publish_snapshot();
+        let mut state = self.state.lock();
+        let mut logits = match result {
             ModelTokenOutcome::Terminal(Ok(Some(ExecutorSamplingOutput::FullLogits(logits)))) => {
                 logits
             }
@@ -150,11 +178,20 @@ impl DecoderOnlyLLM for ObservedLlama {
     }
 
     fn close_token_sequence(&mut self, id: &str) -> Result<()> {
-        let mut state = self.state.lock();
-        let lengths = state.lengths(id);
-        state.model.close_token_sequence(id)?;
-        state.released.push((id.into(), lengths));
+        let lengths = self.model.kv_caches[id]
+            .iter()
+            .map(|layer| layer.len)
+            .collect();
+        self.model.close_token_sequence(id)?;
+        self.publish_snapshot();
+        self.state.lock().released.push((id.into(), lengths));
         Ok(())
+    }
+
+    fn retire_model(&mut self) -> ferrum_models::common::ModelRetirementOutcome {
+        let result = self.model.retire_model();
+        self.publish_snapshot();
+        result
     }
 
     fn prefill(&mut self, _: &str, _: &[u32]) -> Vec<f32> {
@@ -176,17 +213,55 @@ enum FaultKind {
 }
 
 struct FaultAfterForward {
-    inner: LlmExecutor,
+    inner: ExecutorScope,
+    owner: ExecutorOwner,
     observed: Arc<Mutex<Observation>>,
-    caches: Mutex<HashMap<ExecutorSequence, String>>,
-    armed: AtomicBool,
-    injected: Mutex<Option<String>>,
+    control: Arc<FaultObservation>,
     fault: FaultKind,
     fault_index: usize,
 }
 
+struct FaultObservation {
+    caches: Mutex<HashMap<ExecutorSequence, String>>,
+    armed: AtomicBool,
+    injected: Mutex<Option<String>>,
+}
+
+impl std::ops::Deref for FaultAfterForward {
+    type Target = FaultObservation;
+    fn deref(&self) -> &Self::Target {
+        &self.control
+    }
+}
+
 #[async_trait::async_trait]
 impl ModelExecutor for FaultAfterForward {
+    fn begin_shutdown(
+        self: Arc<Self>,
+        permit: &ExecutorShutdownPermit,
+    ) -> ExecutorShutdownObserver {
+        if let Err(error) = permit.check(self.as_ref()) {
+            return ExecutorShutdownObserver::retained(Arc::new(self), error);
+        }
+        match Arc::try_unwrap(self) {
+            Ok(Self {
+                inner,
+                owner,
+                observed: _,
+                control: _,
+                fault: _,
+                fault_index: _,
+            }) => {
+                drop(inner);
+                owner.begin_shutdown()
+            }
+            Err(original) => ExecutorShutdownObserver::retained(
+                Arc::new(original),
+                FerrumError::internal("partial-batch fixture still has execution borrowers"),
+            ),
+        }
+    }
+
     fn info(&self) -> &ferrum_types::ModelInfo {
         self.inner.info()
     }
@@ -360,28 +435,34 @@ async fn assert_batch_fault(fault: FaultKind, fault_index: usize) {
     let model = tiny_llama_model(&cfg);
     let model_config = model.config().clone();
     let observed = Arc::new(Mutex::new(Observation {
-        model,
+        model: ModelSnapshot::default(),
         prepared: vec![],
         prefills: vec![],
         decodes: vec![],
         released: vec![],
         inject: None,
     }));
-    let executor = Arc::new(FaultAfterForward {
-        inner: LlmExecutor::new(
-            Box::new(ObservedLlama {
-                state: observed.clone(),
-                config: model_config,
-            }),
-            tiny_model_info(&cfg),
-        ),
-        observed: observed.clone(),
+    let owner = ExecutorOwner::new(Box::new(LlmExecutor::new(
+        Box::new(ObservedLlama {
+            model,
+            state: observed.clone(),
+            config: model_config,
+        }),
+        tiny_model_info(&cfg),
+    )));
+    let executor = Arc::new(FaultObservation {
         caches: Mutex::new(HashMap::new()),
         armed: AtomicBool::new(false),
         injected: Mutex::new(None),
+    });
+    let owned_executor = ExecutorOwner::new(Box::new(FaultAfterForward {
+        inner: owner.scope().unwrap(),
+        owner,
+        observed: observed.clone(),
+        control: Arc::clone(&executor),
         fault,
         fault_index,
-    });
+    }));
     let tokenizer = Arc::new(TinyTokenizer::new(cfg.vocab_size));
     let mut config = EngineConfig::default();
     config.backend.device = Device::CPU;
@@ -410,7 +491,7 @@ async fn assert_batch_fault(fault: FaultKind, fault_index: usize) {
         tokenizer.clone(),
         Arc::new(crate::registry::GreedySampler),
         allocations.clone(),
-        executor.clone(),
+        owned_executor,
         Arc::new(crate::tensor_factory::CandleTensorFactory::new(Device::CPU)),
     )
     .unwrap();
@@ -448,11 +529,22 @@ async fn assert_batch_fault(fault: FaultKind, fault_index: usize) {
             Some(tokenizer.clone()),
             Some(cfg.vocab_size),
         );
-        let (sender, receiver) = engine.inner.output_channel(request.id.clone(), 16).unwrap();
+        let (sender, receiver) = engine
+            .active_inner()
+            .expect("engine execution is open")
+            .output_channel(request.id.clone(), 16)
+            .unwrap();
         sequence.stream_sender = Some(sender);
-        sequence.request_slot = Some(RequestSlotLease::open(&engine.inner, request.id.clone()));
+        sequence.request_slot = Some(RequestSlotLease::open(
+            &engine.active_inner().expect("engine execution is open"),
+            request.id.clone(),
+        ));
         streams.insert(request.id.clone(), receiver);
-        engine.inner.sequences.insert(request.id.clone(), sequence);
+        engine
+            .active_inner()
+            .expect("engine execution is open")
+            .sequences
+            .insert(request.id.clone(), sequence);
         scheduler.submit(request).await.unwrap();
     }
     let prefill = scheduler
@@ -463,12 +555,14 @@ async fn assert_batch_fault(fault: FaultKind, fault_index: usize) {
     for scheduled in &prefill.requests {
         assert!(
             engine
-                .inner
+                .active_inner()
+                .expect("engine execution is open")
                 .probe_executor_prefill_admission_for_test(&scheduled.request)
                 .await
         );
         engine
-            .inner
+            .active_inner()
+            .expect("engine execution is open")
             .sequences
             .get(&scheduled.request.id)
             .unwrap()
@@ -478,9 +572,14 @@ async fn assert_batch_fault(fault: FaultKind, fault_index: usize) {
             .request_slot
             .as_mut()
             .unwrap()
-            .admit(&engine.inner);
+            .admit(&engine.active_inner().expect("engine execution is open"));
     }
-    engine.inner.process_batch(&prefill).await.unwrap();
+    engine
+        .active_inner()
+        .expect("engine execution is open")
+        .process_batch(&prefill)
+        .await
+        .unwrap();
     assert!(allocations.list_handles().is_empty());
     assert_eq!(allocations.stats().used_memory_bytes, 0);
     assert_eq!(observed.lock().model.kv_caches.len(), 3);
@@ -490,7 +589,8 @@ async fn assert_batch_fault(fault: FaultKind, fault_index: usize) {
     let mut identities = HashMap::new();
     for scheduled in &prefill.requests {
         let id = &scheduled.request.id;
-        let sequences = &engine.inner.sequences;
+        let original = engine.active_inner().expect("engine execution is open");
+        let sequences = &original.sequences;
         let sequence_handle = sequences.get(id).unwrap();
         let sequence_guard = sequence_handle.lock();
         let sequence = sequence_guard.as_ref().unwrap();
@@ -548,16 +648,38 @@ async fn assert_batch_fault(fault: FaultKind, fault_index: usize) {
     let mut failed_batch = scheduled_decode.clone();
     failed_batch.requests.truncate(2);
     executor.armed.store(true, Ordering::SeqCst);
-    let batch_result = engine.inner.process_batch(&failed_batch).await;
+    let batch_result = engine
+        .active_inner()
+        .expect("engine execution is open")
+        .process_batch(&failed_batch)
+        .await;
     // Product completion is managed separately from the iteration. The
     // original error is asserted on its client terminal below, not returned
     // synchronously by a now non-blocking whole-batch delivery operation.
     batch_result.unwrap();
-    engine.inner.output_tasks.join_current().await;
-    engine.inner.execution_closes.join_observers().await;
-    engine.inner.drain_execution_closes().unwrap();
+    engine
+        .active_inner()
+        .expect("engine execution is open")
+        .output_tasks
+        .join_current()
+        .await;
+    engine
+        .active_inner()
+        .expect("engine execution is open")
+        .execution_closes
+        .join_observers()
+        .await;
+    engine
+        .active_inner()
+        .expect("engine execution is open")
+        .drain_execution_closes()
+        .unwrap();
     assert_eq!(
-        engine.inner.total_decode_tokens.load(Ordering::Relaxed),
+        engine
+            .active_inner()
+            .expect("engine execution is open")
+            .total_decode_tokens
+            .load(Ordering::Relaxed),
         1,
         "the authentic healthy completion must survive each output fault"
     );
@@ -610,7 +732,8 @@ async fn assert_batch_fault(fault: FaultKind, fault_index: usize) {
         assert_eq!(actual_released, expected_released);
     }
     {
-        let sequences = &engine.inner.sequences;
+        let original = engine.active_inner().expect("engine execution is open");
+        let sequences = &original.sequences;
         let sequence_handle = sequences.get(&a).unwrap();
         let sequence_guard = sequence_handle.lock();
         let sequence = sequence_guard.as_ref().unwrap();
@@ -628,7 +751,8 @@ async fn assert_batch_fault(fault: FaultKind, fault_index: usize) {
     assert_eq!(
         update.chunk().token,
         engine
-            .inner
+            .active_inner()
+            .expect("engine execution is open")
             .sequences
             .get(&a)
             .unwrap()
@@ -663,7 +787,12 @@ async fn assert_batch_fault(fault: FaultKind, fault_index: usize) {
     peer_batch
         .requests
         .retain(|scheduled| scheduled.request.id == peer);
-    engine.inner.process_batch(&peer_batch).await.unwrap();
+    engine
+        .active_inner()
+        .expect("engine execution is open")
+        .process_batch(&peer_batch)
+        .await
+        .unwrap();
     {
         let state = observed.lock();
         let outputs: Vec<_> = state
@@ -677,7 +806,8 @@ async fn assert_batch_fault(fault: FaultKind, fault_index: usize) {
     }
     assert_eq!(
         engine
-            .inner
+            .active_inner()
+            .expect("engine execution is open")
             .sequences
             .get(&peer)
             .unwrap()
@@ -690,7 +820,8 @@ async fn assert_batch_fault(fault: FaultKind, fault_index: usize) {
     );
     assert_eq!(
         engine
-            .inner
+            .active_inner()
+            .expect("engine execution is open")
             .sequences
             .get(&peer)
             .unwrap()
@@ -726,7 +857,8 @@ async fn assert_batch_fault(fault: FaultKind, fault_index: usize) {
             assert_eq!(oracle.generated_tokens.len(), previous_outputs);
             let position = prompt_len + previous_outputs - 1;
             {
-                let sequences = &engine.inner.sequences;
+                let original = engine.active_inner().expect("engine execution is open");
+                let sequences = &original.sequences;
                 let sequence_handle = sequences.get(id).unwrap();
                 let sequence_guard = sequence_handle.lock();
                 let sequence = sequence_guard.as_ref().unwrap();
@@ -743,8 +875,18 @@ async fn assert_batch_fault(fault: FaultKind, fault_index: usize) {
             let token = sample_reference(oracle, &logits, &tokenizer);
             expected.insert(id.clone(), (position, logits, token));
         }
-        engine.inner.process_batch(&finish).await.unwrap();
-        engine.inner.output_tasks.join_current().await;
+        engine
+            .active_inner()
+            .expect("engine execution is open")
+            .process_batch(&finish)
+            .await
+            .unwrap();
+        engine
+            .active_inner()
+            .expect("engine execution is open")
+            .output_tasks
+            .join_current()
+            .await;
         for scheduled in &finish.requests {
             let id = &scheduled.request.id;
             let (cache_id, prompt_len, _) = &initial[id];
@@ -791,10 +933,16 @@ async fn assert_batch_fault(fault: FaultKind, fault_index: usize) {
                 let usage = terminal.usage.as_ref().unwrap();
                 assert_eq!(usage.prompt_tokens, *prompt_len);
                 assert_eq!(usage.completion_tokens, 4);
-                assert!(!engine.inner.sequences.get(id).is_some());
+                assert!(!engine
+                    .active_inner()
+                    .expect("engine execution is open")
+                    .sequences
+                    .get(id)
+                    .is_some());
                 assert!(identities[id].observed_end().is_some());
             } else {
-                let sequences = &engine.inner.sequences;
+                let original = engine.active_inner().expect("engine execution is open");
+                let sequences = &original.sequences;
                 assert_eq!(
                     sequences
                         .get(id)
@@ -822,9 +970,22 @@ async fn assert_batch_fault(fault: FaultKind, fault_index: usize) {
             }
         }
     }
-    engine.inner.execution_closes.join_observers().await;
-    engine.inner.drain_execution_closes().unwrap();
-    assert!(engine.inner.sequences.is_empty());
+    engine
+        .active_inner()
+        .expect("engine execution is open")
+        .execution_closes
+        .join_observers()
+        .await;
+    engine
+        .active_inner()
+        .expect("engine execution is open")
+        .drain_execution_closes()
+        .unwrap();
+    assert!(engine
+        .active_inner()
+        .expect("engine execution is open")
+        .sequences
+        .is_empty());
     assert!(observed.lock().model.kv_caches.is_empty());
     let mut released: Vec<_> = observed
         .lock()
@@ -842,11 +1003,25 @@ async fn assert_batch_fault(fault: FaultKind, fault_index: usize) {
     assert!(allocations.list_handles().is_empty());
     assert_eq!(allocations.stats().used_memory_bytes, 0);
     assert_eq!(scheduler.trace_snapshot().active_len, 0);
-    assert_eq!(engine.inner.execution_closes.unreclaimed_count(), 0);
+    assert_eq!(
+        engine
+            .active_inner()
+            .expect("engine execution is open")
+            .execution_closes
+            .unreclaimed_count(),
+        0
+    );
     assert!(identities
         .values()
         .all(|identity| identity.observed_end().is_some()));
-    assert_eq!(engine.inner.total_decode_tokens.load(Ordering::Relaxed), 6);
+    assert_eq!(
+        engine
+            .active_inner()
+            .expect("engine execution is open")
+            .total_decode_tokens
+            .load(Ordering::Relaxed),
+        6
+    );
     let state = observed.lock();
     assert_eq!(state.prepared.len(), 3);
     assert_eq!(state.prefills.len(), 3);
@@ -856,4 +1031,17 @@ async fn assert_batch_fault(fault: FaultKind, fault_index: usize) {
         "three forwards per survivor and one failed peer"
     );
     assert!(state.inject.is_none());
+    drop(state);
+    let original = Arc::downgrade(&engine.active_inner().expect("engine execution is open"));
+    let report = engine.driver.shutdown_active().unwrap().wait().await;
+    if let Err(error) = report.result() {
+        // A historical product error cannot prevent actual whole-model retirement.
+        assert_fault_cause(&error, fault);
+    }
+    assert!(!report.retains_unproved_owners());
+    assert_eq!(
+        report.executor_shutdown().unwrap().snapshot().phase(),
+        ferrum_execution::executor_lifecycle::ExecutorShutdownPhase::Retired
+    );
+    assert!(original.upgrade().is_none());
 }

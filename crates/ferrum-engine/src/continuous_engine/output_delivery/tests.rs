@@ -5,7 +5,8 @@ async fn completion_after_delivery_failure(panic: bool) {
     let mut fixture = actual::fixture(false, false).await;
     let sender = fixture
         .engine
-        .inner
+        .active_inner()
+        .expect("engine execution is open")
         .sequences
         .get(&fixture.request_id)
         .unwrap()
@@ -37,7 +38,13 @@ async fn completion_after_delivery_failure(panic: bool) {
         });
         state.outstanding = 1;
         sender
-            .start_locked(&fixture.engine.inner, &mut state)
+            .start_locked(
+                &fixture
+                    .engine
+                    .active_inner()
+                    .expect("engine execution is open"),
+                &mut state,
+            )
             .unwrap();
     }
     tokio::time::timeout(Duration::from_secs(3), observed)
@@ -55,14 +62,16 @@ async fn completion_after_delivery_failure(panic: bool) {
             if message == "output delivery panicked"));
         assert!(fixture
             .engine
-            .inner
+            .active_inner()
+            .expect("engine execution is open")
             .output_tasks
             .take_control_error()
             .is_none());
     } else {
         let control = fixture
             .engine
-            .inner
+            .active_inner()
+            .expect("engine execution is open")
             .output_tasks
             .take_control_error()
             .expect("actual invalid live span must reach the driver control path");
@@ -71,7 +80,8 @@ async fn completion_after_delivery_failure(panic: bool) {
         assert_eq!(control.to_string(), original.to_string());
         assert!(fixture
             .engine
-            .inner
+            .active_inner()
+            .expect("engine execution is open")
             .output_tasks
             .take_control_error()
             .is_none());
@@ -82,7 +92,8 @@ async fn completion_after_delivery_failure(panic: bool) {
         Duration::from_secs(3),
         fixture
             .engine
-            .inner
+            .active_inner()
+            .expect("engine execution is open")
             .complete_request_for_test(&fixture.request_id, FinishReason::Length),
     )
     .await
@@ -115,11 +126,18 @@ async fn completion_after_delivery_failure(panic: bool) {
         vec![vec![fixture.prompt_len; fixture.layers]]
     );
     resume.send(()).unwrap();
-    fixture.engine.inner.output_tasks.join_current().await;
+    fixture
+        .engine
+        .active_inner()
+        .expect("engine execution is open")
+        .output_tasks
+        .join_current()
+        .await;
     assert!(
         fixture
             .engine
-            .inner
+            .active_inner()
+            .expect("engine execution is open")
             .output_tasks
             .take_control_error()
             .is_none(),
@@ -151,20 +169,30 @@ async fn output_terminal_payload_budget_error_is_not_silent_eof() {
     })
     .unwrap();
     let (sender, mut receiver) = OutputSender::new(
-        fixture.engine.inner.self_weak.clone(),
+        fixture
+            .engine
+            .active_inner()
+            .expect("engine execution is open")
+            .self_weak
+            .clone(),
         fixture.request_id.clone(),
         budget.try_open_session().unwrap(),
         4,
     );
     {
-        let sequences = &fixture.engine.inner.sequences;
+        let sequences = &fixture
+            .engine
+            .active_inner()
+            .expect("engine execution is open")
+            .sequences;
         let sequence_handle = sequences.get(&fixture.request_id).unwrap();
         sender.bind_sequence(Arc::downgrade(&sequence_handle));
         let mut sequence_guard = sequence_handle.lock();
         let sequence = sequence_guard.as_mut().unwrap();
         sequence.streamed_text_len = fixture
             .engine
-            .inner
+            .active_inner()
+            .expect("engine execution is open")
             .tokenizer
             .decode(&sequence.generated_tokens, true)
             .unwrap()
@@ -176,7 +204,8 @@ async fn output_terminal_payload_budget_error_is_not_silent_eof() {
     }
     let error = fixture
         .engine
-        .inner
+        .active_inner()
+        .expect("engine execution is open")
         .complete_request_for_test(&fixture.request_id, FinishReason::Length)
         .await
         .unwrap_err();
@@ -231,11 +260,16 @@ async fn output_full_queue_does_not_hide_actual_close_control_error_from_driver(
     let mut fixture = actual::fixture(true, true).await;
     let (sender, mut receiver) = fixture
         .engine
-        .inner
+        .active_inner()
+        .expect("engine execution is open")
         .output_channel(fixture.request_id.clone(), 1)
         .unwrap();
     let token = {
-        let sequences = &fixture.engine.inner.sequences;
+        let sequences = &fixture
+            .engine
+            .active_inner()
+            .expect("engine execution is open")
+            .sequences;
         let sequence_handle = sequences.get(&fixture.request_id).unwrap();
         sender.bind_sequence(Arc::downgrade(&sequence_handle));
         let mut sequence_guard = sequence_handle.lock();
@@ -245,7 +279,8 @@ async fn output_full_queue_does_not_hide_actual_close_control_error_from_driver(
     };
     fixture
         .engine
-        .inner
+        .active_inner()
+        .expect("engine execution is open")
         .send_stream_update(&fixture.request_id, token)
         .await;
     assert_eq!(
@@ -255,7 +290,8 @@ async fn output_full_queue_does_not_hide_actual_close_control_error_from_driver(
     );
     fixture
         .engine
-        .inner
+        .active_inner()
+        .expect("engine execution is open")
         .complete_request_detached(&fixture.request_id, FinishReason::Length, None)
         .unwrap();
     tokio::time::timeout(Duration::from_secs(3), &mut fixture.started)
@@ -263,12 +299,19 @@ async fn output_full_queue_does_not_hide_actual_close_control_error_from_driver(
         .unwrap()
         .unwrap();
     fixture.gate.take().unwrap().send(()).unwrap();
-    fixture.engine.inner.execution_closes.join_observers().await;
+    fixture
+        .engine
+        .active_inner()
+        .expect("engine execution is open")
+        .execution_closes
+        .join_observers()
+        .await;
     // No client polling and no shutdown: the ordinary driver consumer sees
     // the actual close's failure independently of the full delivery queue.
     let error = fixture
         .engine
-        .inner
+        .active_inner()
+        .expect("engine execution is open")
         .run_iteration()
         .await
         .err()
@@ -290,12 +333,24 @@ async fn output_full_queue_does_not_hide_actual_close_control_error_from_driver(
         .unwrap_err()
         .to_string()
         .contains("actual close completed but publication failed"));
-    fixture.engine.inner.output_tasks.join_current().await;
+    fixture
+        .engine
+        .active_inner()
+        .expect("engine execution is open")
+        .output_tasks
+        .join_current()
+        .await;
     drop(sender);
     assert!(receiver.recv().await.is_none());
     // If the completion observer consumed the same initial error, its queued
     // control report must also use the production consumption path.
-    if let Err(error) = fixture.engine.inner.run_iteration().await {
+    if let Err(error) = fixture
+        .engine
+        .active_inner()
+        .expect("engine execution is open")
+        .run_iteration()
+        .await
+    {
         assert!(error
             .to_string()
             .contains("actual close completed but publication failed"));

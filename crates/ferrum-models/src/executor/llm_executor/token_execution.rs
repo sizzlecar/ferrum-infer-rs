@@ -22,6 +22,22 @@ use crate::common::llm::{
 #[derive(Default)]
 pub(super) struct TokenSequences {
     live: HashMap<ExecutorSequence, TokenSequence>,
+    /// Sealed under the same lock as every inline admission/work preflight.
+    /// Worker shutdown uses this same gate, including before it is first spawned.
+    closing: bool,
+}
+
+impl TokenSequences {
+    pub(super) fn seal(&mut self) {
+        self.closing = true;
+        for entry in self.live.values_mut() {
+            entry.closing = true;
+        }
+    }
+
+    pub(super) fn is_closing(&self) -> bool {
+        self.closing
+    }
 }
 
 struct TokenSequence {
@@ -121,6 +137,9 @@ impl LlmExecutor {
             ));
         }
         let mut sequences = self.token_sequences.lock();
+        if sequences.closing {
+            return Err(FerrumError::request_validation("model executor is closing"));
+        }
         if sequences
             .live
             .values()
@@ -130,7 +149,7 @@ impl LlmExecutor {
                 "request already has a live token incarnation",
             ));
         }
-        let mut model = self.lock_model();
+        let mut model = self.lock_model()?;
         let context = input.context;
         if context.maximum_sequence_tokens > model.kv_capacity()
             || context.maximum_sequence_tokens > u32::MAX as usize
@@ -243,6 +262,9 @@ impl LlmExecutor {
     ) -> Result<ExecutionBatchOutcome> {
         let batch = self.token_issuer.batch(inputs, self.info.vocab_size)?;
         let mut sequences = self.token_sequences.lock();
+        if sequences.closing {
+            return Err(FerrumError::request_validation("model executor is closing"));
+        }
         // Reject foreign, stale or malformed members across the whole input
         // before any reservation or numerical operation mutates the model.
         for input in inputs {
@@ -252,7 +274,7 @@ impl LlmExecutor {
                 .ok_or_else(|| FerrumError::request_validation("token incarnation is not live"))?
                 .validate_work(input)?;
         }
-        let mut model = self.lock_model();
+        let mut model = self.lock_model()?;
         let mut completed = Vec::with_capacity(inputs.len());
         let mut remaining = Vec::new();
         let mut causes = Vec::new();
@@ -462,7 +484,7 @@ impl LlmExecutor {
             .get(sequence)
             .ok_or_else(|| FerrumError::request_validation("token incarnation is not live"))?;
         entry.validate_close(reason)?;
-        self.close_token_locked(&mut sequences, &mut **self.lock_model(), sequence)
+        self.close_token_locked(&mut sequences, &mut **self.lock_model()?, sequence)
     }
 
     fn close_token_locked(

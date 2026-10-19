@@ -14,7 +14,7 @@ use std::sync::Arc;
 use ferrum_engine::{ContinuousBatchEngine, GreedySampler, LlmInferenceEngine, SequenceState};
 use ferrum_kernels::backend::{cpu::CpuBackend, BackendPagedKv};
 use ferrum_models::test_support::{
-    tiny_llama_executor, tiny_tokenizer, TinyLlamaConfig, TinyTokenizer,
+    tiny_llama_executor_owned, tiny_tokenizer, TinyLlamaConfig, TinyTokenizer,
 };
 use ferrum_scheduler::implementations::ContinuousBatchScheduler;
 use ferrum_testkit::{MockKvCacheManager, MockTensorFactory};
@@ -49,7 +49,7 @@ fn build_engine_with_tokenizer(
     let scheduler = Arc::new(ContinuousBatchScheduler::new(SchedulerConfig::default()));
     let sampler = Arc::new(GreedySampler);
     let kv_cache = Arc::new(MockKvCacheManager::new(kv_tokens));
-    let executor = tiny_llama_executor(&cfg);
+    let executor = tiny_llama_executor_owned(&cfg);
     let tensor_factory = Arc::new(MockTensorFactory);
 
     ContinuousBatchEngine::new(
@@ -58,7 +58,7 @@ fn build_engine_with_tokenizer(
         tokenizer,
         sampler,
         kv_cache,
-        executor,
+        ferrum_execution::executor_lifecycle::ExecutorOwner::new(executor),
         tensor_factory,
     )
     .expect("legacy engine composition must match executor authority")

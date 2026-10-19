@@ -7,7 +7,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
-use parking_lot::{Mutex, MutexGuard};
+use parking_lot::{MappedMutexGuard, Mutex, MutexGuard};
 
 use ferrum_execution::{
     model_executor::{
@@ -19,7 +19,7 @@ use ferrum_execution::{
 use ferrum_interfaces::{adapter::AdapterExecutionSupport, RecurrentStateSpec};
 use ferrum_types::{DataType, FerrumError, ModelInfo, RequestId, Result, TokenId};
 
-use crate::common::{DecoderOnlyLLM, ModelTokenExecutionMode};
+use crate::common::{DecoderOnlyLLM, LlmRuntimeConfig, ModelTokenExecutionMode};
 use crate::lora::ActiveLoraAdapter;
 use crate::vnext::ProductionModelSourceBundle;
 
@@ -28,11 +28,22 @@ use super::common;
 mod device_worker;
 mod token_execution;
 
+type ModelSlot = Arc<Mutex<Option<Box<dyn DecoderOnlyLLM>>>>;
+
+fn lock_live_model(
+    slot: &Mutex<Option<Box<dyn DecoderOnlyLLM>>>,
+) -> Result<MappedMutexGuard<'_, Box<dyn DecoderOnlyLLM>>> {
+    MutexGuard::try_map(slot.lock(), Option::as_mut)
+        .map_err(|_| FerrumError::request_validation("model executor has retired"))
+}
+
 pub struct LlmExecutor {
     // A submitted device task must be able to retain the actual model-owned
     // weights, KV and scratch independently of the awaiting caller/executor.
     // This changes ownership, not the single exclusive model lock per batch.
-    model: Arc<Mutex<Box<dyn DecoderOnlyLLM>>>,
+    model: ModelSlot,
+    model_config: LlmRuntimeConfig,
+    model_capacity: usize,
     adapter_support: AdapterExecutionSupport,
     info: ModelInfo,
     bound_sources: Option<Arc<ProductionModelSourceBundle>>,
@@ -66,8 +77,12 @@ impl LlmExecutor {
     ) -> Self {
         let adapter_support = model.adapter_execution_support();
         let token_execution_mode = model.token_execution_mode();
+        let model_config = model.config().clone();
+        let model_capacity = model.kv_capacity();
         Self {
-            model: Arc::new(Mutex::new(model)),
+            model: Arc::new(Mutex::new(Some(model))),
+            model_config,
+            model_capacity,
             adapter_support,
             info,
             bound_sources,
@@ -81,9 +96,9 @@ impl LlmExecutor {
         }
     }
 
-    fn lock_model(&self) -> MutexGuard<'_, Box<dyn DecoderOnlyLLM>> {
+    fn lock_model(&self) -> Result<MappedMutexGuard<'_, Box<dyn DecoderOnlyLLM>>> {
         let start = std::time::Instant::now();
-        let guard = self.model.lock();
+        let guard = lock_live_model(&self.model);
         self.record_model_lock_wait(start.elapsed());
         guard
     }
@@ -134,6 +149,28 @@ impl LlmExecutor {
 
 #[async_trait::async_trait]
 impl ModelExecutor for LlmExecutor {
+    fn begin_shutdown(
+        self: Arc<Self>,
+        permit: &ferrum_execution::executor_lifecycle::ExecutorShutdownPermit,
+    ) -> ferrum_execution::executor_lifecycle::ExecutorShutdownObserver {
+        if let Err(error) = permit.check(self.as_ref()) {
+            return ferrum_execution::executor_lifecycle::ExecutorShutdownObserver::retained(
+                Arc::new(self),
+                error,
+            );
+        }
+        self.token_sequences.lock().seal();
+        match self
+            .token_device_worker()
+            .and_then(device_worker::LlmDeviceWorker::begin_shutdown)
+        {
+            Ok(observer) => observer,
+            Err(error) => ferrum_execution::executor_lifecycle::ExecutorShutdownObserver::retained(
+                Arc::new(self),
+                error,
+            ),
+        }
+    }
     fn observe_token_allocator_reclaim(
         &self,
         blocked: &ferrum_execution::token_execution::ExecutionFrontier,
@@ -216,15 +253,18 @@ impl ModelExecutor for LlmExecutor {
     }
 
     fn kv_capacity(&self) -> Option<usize> {
-        Some(self.lock_model().kv_capacity())
+        Some(self.model_capacity)
     }
 
     fn reserve_kv_slots(&self, requests: &[KvSlotRequest]) -> Result<Option<KvSlotReservation>> {
-        self.lock_model().reserve_kv_slots(requests)
+        if self.token_sequences.lock().is_closing() {
+            return Err(FerrumError::request_validation("model executor is closing"));
+        }
+        self.lock_model()?.reserve_kv_slots(requests)
     }
 
     fn kv_slot_capacity_snapshot(&self) -> Option<KvSlotCapacitySnapshot> {
-        self.lock_model().kv_slot_capacity_snapshot()
+        self.lock_model().ok()?.kv_slot_capacity_snapshot()
     }
 
     fn recurrent_state_spec(
@@ -233,7 +273,7 @@ impl ModelExecutor for LlmExecutor {
         input_tokens: &[TokenId],
     ) -> Result<Option<RecurrentStateSpec>> {
         let mut spec = self
-            .lock_model()
+            .lock_model()?
             .recurrent_state_spec(request_id, input_tokens)?;
         if let Some(spec) = spec.as_mut() {
             spec.device = self.info.device.clone();
@@ -242,7 +282,7 @@ impl ModelExecutor for LlmExecutor {
     }
 
     fn capabilities(&self) -> ExecutorCapabilities {
-        let cfg = self.lock_model().config().clone();
+        let cfg = &self.model_config;
         ExecutorCapabilities {
             max_batch_size: 256,
             max_sequence_length: cfg.max_seq_len,
@@ -269,14 +309,17 @@ impl ModelExecutor for LlmExecutor {
     }
 
     fn cache_metrics_snapshot(&self) -> Option<serde_json::Value> {
-        let snapshot = self.lock_model().cache_metrics_snapshot()?;
+        let snapshot = self.lock_model().ok()?.cache_metrics_snapshot()?;
         Some(self.attach_model_lock_metrics(snapshot))
     }
 
     fn lora_metrics_snapshot(&self) -> Option<serde_json::Value> {
-        self.lock_model().lora_metrics_snapshot()
+        self.lock_model().ok()?.lora_metrics_snapshot()
     }
 }
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod shutdown_tests;

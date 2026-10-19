@@ -78,6 +78,7 @@ mod reusable_catalog;
 mod reusable_cold_path;
 mod sampling_readback;
 mod sequence_settlement;
+mod shutdown;
 mod terminal_facts;
 use sequence_settlement::{PreparedWaveGuard, RetiredWave, SequenceSettlement, WaveFailure};
 use terminal_facts::PendingSubmissionObservation;
@@ -8933,6 +8934,13 @@ impl<R: DeviceRuntime> ProgramExecutor<R> {
 
 #[async_trait::async_trait]
 impl<R: DeviceRuntime> ModelExecutor for ProgramExecutor<R> {
+    fn begin_shutdown(
+        self: Arc<Self>,
+        permit: &crate::executor_lifecycle::ExecutorShutdownPermit,
+    ) -> crate::executor_lifecycle::ExecutorShutdownObserver {
+        shutdown::begin(self, permit)
+    }
+
     fn plan_prompt_tail_capture_boundary(&self, chunk: PrefillChunk) -> Option<PrefixCapturePlan> {
         self.prompt_tail_boundary(chunk)
     }

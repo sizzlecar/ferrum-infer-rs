@@ -9,6 +9,9 @@
 //! - Validation before engine creation
 
 use crate::registry::{ComponentConfig, ComponentRegistry};
+use crate::{EngineExecutor, IntoEngineExecutor};
+use ferrum_execution::executor_lifecycle::{ExecutorOwner, ExecutorScope};
+#[cfg(test)]
 use ferrum_execution::ModelExecutor;
 use ferrum_interfaces::engine::{InferenceEngine, LlmInferenceEngine};
 use ferrum_interfaces::{KvCacheManager, RecurrentStateManager, Sampler, TensorFactory, Tokenizer};
@@ -51,7 +54,7 @@ pub struct EngineBuilder {
     /// Pre-created recurrent-state manager (skip factory)
     custom_recurrent_state_manager: Option<Arc<dyn RecurrentStateManager + Send + Sync>>,
     /// Pre-created executor (skip factory)
-    custom_executor: Option<Arc<dyn ModelExecutor + Send + Sync>>,
+    custom_executor: Option<EngineExecutor>,
 }
 
 impl EngineBuilder {
@@ -151,9 +154,19 @@ impl EngineBuilder {
     }
 
     /// Set a pre-created model executor
-    pub fn with_custom_executor(mut self, executor: Arc<dyn ModelExecutor + Send + Sync>) -> Self {
-        self.custom_executor = Some(executor);
+    pub fn with_custom_executor(mut self, executor: ExecutorScope) -> Self {
+        self.custom_executor = Some(
+            executor
+                .into_engine_executor()
+                .expect("existing scope is infallible"),
+        );
         self
+    }
+
+    /// Transfer final-close authority with a custom executor.
+    pub fn with_owned_executor(mut self, executor: ExecutorOwner) -> Result<Self> {
+        self.custom_executor = Some(executor.into_engine_executor()?);
+        Ok(self)
     }
 
     /// Determine which tokenizer to use based on config and overrides
@@ -319,7 +332,7 @@ impl EngineBuilder {
                 .create_executor(&executor_name, &component_config)
                 .await
             {
-                Ok(e) => e,
+                Ok(e) => e.into_engine_executor()?,
                 Err(err) => {
                     if has_model_path {
                         return Err(FerrumError::config(format!(
@@ -333,7 +346,10 @@ impl EngineBuilder {
                         executor_name,
                         err
                     );
-                    registry.create_executor("stub", &component_config).await?
+                    registry
+                        .create_executor("stub", &component_config)
+                        .await?
+                        .into_engine_executor()?
                 }
             }
         };
@@ -407,7 +423,7 @@ impl EngineBuilder {
                     cb_scheduler,
                     tokenizer,
                     sampler,
-                    Arc::clone(&executor),
+                    executor,
                     tensor_factory,
                     journal_scopes,
                 )?
@@ -422,7 +438,7 @@ impl EngineBuilder {
                     tokenizer,
                     sampler,
                     kv_cache,
-                    Arc::clone(&executor),
+                    executor,
                     tensor_factory,
                     recurrent_state_manager,
                     journal_scopes,
@@ -433,7 +449,7 @@ impl EngineBuilder {
         // This is the single product readiness boundary shared by `run` and
         // `serve`. The engine is not exposed until executor-owned compilation
         // and warmup complete, but those events now share the product trace.
-        let startup_result = executor.prepare_startup().await;
+        let startup_result = engine.prepare_startup().await;
         if let Err(startup_error) = startup_result {
             if let Err(shutdown_error) = engine.shutdown().await {
                 tracing::warn!(
@@ -547,6 +563,7 @@ pub async fn create_defined_product_engine(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ferrum_execution::executor_lifecycle::{ExecutorShutdownObserver, ExecutorShutdownPermit};
     use ferrum_execution::model_executor::{
         ExecutionResourceAuthority, ExecutorCapabilities, ExecutorStatus,
         PlanRuntimeResourceSnapshot,
@@ -584,6 +601,22 @@ mod tests {
 
     #[async_trait::async_trait]
     impl ModelExecutor for StartupProbeExecutor {
+        fn begin_shutdown(
+            self: Arc<Self>,
+            permit: &ExecutorShutdownPermit,
+        ) -> ExecutorShutdownObserver {
+            if let Err(error) = permit.check(self.as_ref()) {
+                return ExecutorShutdownObserver::retained(Arc::new(self), error);
+            }
+            match Arc::try_unwrap(self) {
+                Ok(original) => ExecutorOwner::new(Box::new(original.inner)).begin_shutdown(),
+                Err(original) => ExecutorShutdownObserver::retained(
+                    Arc::new(original),
+                    FerrumError::internal("startup probe still has execution borrowers"),
+                ),
+            }
+        }
+
         fn info(&self) -> &ferrum_types::ModelInfo {
             self.inner.info()
         }
@@ -607,6 +640,22 @@ mod tests {
 
     #[async_trait::async_trait]
     impl ModelExecutor for ProfileStartupProbeExecutor {
+        fn begin_shutdown(
+            self: Arc<Self>,
+            permit: &ExecutorShutdownPermit,
+        ) -> ExecutorShutdownObserver {
+            if let Err(error) = permit.check(self.as_ref()) {
+                return ExecutorShutdownObserver::retained(Arc::new(self), error);
+            }
+            match Arc::try_unwrap(self) {
+                Ok(original) => ExecutorOwner::new(Box::new(original.inner)).begin_shutdown(),
+                Err(original) => ExecutorShutdownObserver::retained(
+                    Arc::new(original),
+                    FerrumError::internal("profile probe still has execution borrowers"),
+                ),
+            }
+        }
+
         fn info(&self) -> &ferrum_types::ModelInfo {
             self.inner.info()
         }
@@ -712,6 +761,22 @@ mod tests {
 
     #[async_trait::async_trait]
     impl ModelExecutor for PlanRuntimeBuilderExecutor {
+        fn begin_shutdown(
+            self: Arc<Self>,
+            permit: &ExecutorShutdownPermit,
+        ) -> ExecutorShutdownObserver {
+            if let Err(error) = permit.check(self.as_ref()) {
+                return ExecutorShutdownObserver::retained(Arc::new(self), error);
+            }
+            match Arc::try_unwrap(self) {
+                Ok(original) => ExecutorOwner::new(Box::new(original.inner)).begin_shutdown(),
+                Err(original) => ExecutorShutdownObserver::retained(
+                    Arc::new(original),
+                    FerrumError::internal("plan probe still has execution borrowers"),
+                ),
+            }
+        }
+
         fn info(&self) -> &ferrum_types::ModelInfo {
             self.inner.info()
         }
@@ -1045,32 +1110,35 @@ mod tests {
     #[tokio::test]
     async fn startup_preparation_runs_once_and_blocks_engine_publication_on_failure() {
         let success_calls = Arc::new(AtomicUsize::new(0));
-        let success: Arc<dyn ModelExecutor + Send + Sync> = Arc::new(StartupProbeExecutor {
+        let success = ExecutorOwner::new(Box::new(StartupProbeExecutor {
             inner: ferrum_testkit::MockModelExecutor::instant(128),
             calls: Arc::clone(&success_calls),
             fail: false,
-        });
-        EngineBuilder::new(EngineConfig::default())
-            .with_custom_executor(success)
+        }));
+        let engine = EngineBuilder::new(EngineConfig::default())
+            .with_custom_executor(success.scope().unwrap())
             .build()
             .await
             .expect("successful startup preparation builds the engine");
         assert_eq!(success_calls.load(Ordering::Relaxed), 1);
+        engine.shutdown().await.unwrap();
+        success.begin_shutdown().wait().await.result().unwrap();
 
         let failure_calls = Arc::new(AtomicUsize::new(0));
-        let failure: Arc<dyn ModelExecutor + Send + Sync> = Arc::new(StartupProbeExecutor {
+        let failure = ExecutorOwner::new(Box::new(StartupProbeExecutor {
             inner: ferrum_testkit::MockModelExecutor::instant(128),
             calls: Arc::clone(&failure_calls),
             fail: true,
-        });
+        }));
         let error = EngineBuilder::new(EngineConfig::default())
-            .with_custom_executor(failure)
+            .with_custom_executor(failure.scope().unwrap())
             .build()
             .await
             .err()
             .expect("failed startup preparation must stop engine construction");
         assert!(error.to_string().contains("startup preparation rejected"));
         assert_eq!(failure_calls.load(Ordering::Relaxed), 1);
+        failure.begin_shutdown().wait().await.result().unwrap();
     }
 
     #[tokio::test]
@@ -1085,18 +1153,20 @@ mod tests {
         ));
         let _ = std::fs::remove_file(&trace_path);
         let saw_sink_during_startup = Arc::new(AtomicBool::new(false));
-        let executor: Arc<dyn ModelExecutor + Send + Sync> =
-            Arc::new(ProfileStartupProbeExecutor {
-                inner: ferrum_testkit::MockModelExecutor::instant(128),
-                event_sink: Mutex::new(None),
-                saw_sink_during_startup: Arc::clone(&saw_sink_during_startup),
-            });
+        let executor = ExecutorOwner::new(Box::new(ProfileStartupProbeExecutor {
+            inner: ferrum_testkit::MockModelExecutor::instant(128),
+            event_sink: Mutex::new(None),
+            saw_sink_during_startup: Arc::clone(&saw_sink_during_startup),
+        }));
         let mut config = EngineConfig::default();
         config.runtime.profile_jsonl = Some(trace_path.clone());
         config.runtime.profile_entrypoint = Some(ferrum_types::ProfileEntrypoint::Run);
 
+        // Product assembly owns the executor and may install its startup sink.
+        // A borrowed scope cannot replace another assembly's event sink.
         let engine = EngineBuilder::new(config)
-            .with_custom_executor(executor)
+            .with_owned_executor(executor)
+            .expect("original executor owner provides the product scope")
             .build()
             .await
             .expect("profile-enabled startup builds the engine");
@@ -1116,20 +1186,20 @@ mod tests {
     #[tokio::test]
     async fn product_without_profile_does_not_attach_execution_event_sink() {
         let saw_sink_during_startup = Arc::new(AtomicBool::new(false));
-        let executor: Arc<dyn ModelExecutor + Send + Sync> =
-            Arc::new(ProfileStartupProbeExecutor {
-                inner: ferrum_testkit::MockModelExecutor::instant(128),
-                event_sink: Mutex::new(None),
-                saw_sink_during_startup: Arc::clone(&saw_sink_during_startup),
-            });
+        let executor = ExecutorOwner::new(Box::new(ProfileStartupProbeExecutor {
+            inner: ferrum_testkit::MockModelExecutor::instant(128),
+            event_sink: Mutex::new(None),
+            saw_sink_during_startup: Arc::clone(&saw_sink_during_startup),
+        }));
 
         let engine = EngineBuilder::new(EngineConfig::default())
-            .with_custom_executor(executor)
+            .with_custom_executor(executor.scope().unwrap())
             .build()
             .await
             .expect("profile-disabled engine builds");
         assert!(!saw_sink_during_startup.load(Ordering::Acquire));
         engine.shutdown().await.unwrap();
+        executor.begin_shutdown().wait().await.result().unwrap();
     }
 
     #[tokio::test]
@@ -1142,12 +1212,12 @@ mod tests {
                 calls: Arc::clone(&calls),
             }),
         );
-        let executor: Arc<dyn ModelExecutor + Send + Sync> = Arc::new(PlanRuntimeBuilderExecutor {
+        let executor = ExecutorOwner::new(Box::new(PlanRuntimeBuilderExecutor {
             inner: ferrum_testkit::MockModelExecutor::instant(128),
-        });
+        }));
 
         let result = EngineBuilder::with_registry(EngineConfig::default(), registry)
-            .with_custom_executor(executor)
+            .with_custom_executor(executor.scope().unwrap())
             .build()
             .await;
 
@@ -1158,18 +1228,19 @@ mod tests {
             .to_string()
             .contains("authoritative ResolvedModelPlan"));
         assert_eq!(calls.load(Ordering::Relaxed), 0);
+        executor.begin_shutdown().wait().await.result().unwrap();
     }
 
     #[tokio::test]
     async fn plan_runtime_build_rejects_legacy_resource_override() {
-        let executor: Arc<dyn ModelExecutor + Send + Sync> = Arc::new(PlanRuntimeBuilderExecutor {
+        let executor = ExecutorOwner::new(Box::new(PlanRuntimeBuilderExecutor {
             inner: ferrum_testkit::MockModelExecutor::instant(128),
-        });
+        }));
         let kv_cache: Arc<dyn KvCacheManager + Send + Sync> =
             Arc::new(ferrum_testkit::MockKvCacheManager::new(8));
 
         let error = EngineBuilder::new(EngineConfig::default())
-            .with_custom_executor(executor)
+            .with_custom_executor(executor.scope().unwrap())
             .with_custom_kv_cache(kv_cache)
             .build()
             .await
@@ -1179,5 +1250,6 @@ mod tests {
         assert!(error
             .to_string()
             .contains("cannot be combined with a legacy engine KV-cache override"));
+        executor.begin_shutdown().wait().await.result().unwrap();
     }
 }

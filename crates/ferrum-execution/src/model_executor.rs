@@ -2006,7 +2006,7 @@ pub enum ExecutorPrefillAdmissionDecision {
 
 /// Core model executor trait focusing on tensor operations
 #[async_trait]
-pub trait ModelExecutor: Send + Sync {
+pub trait ModelExecutor: Send + Sync + 'static {
     /// Admit immutable token work using this executor's actual resource owner.
     /// Deferred probes do not issue an executable incarnation. An implementation
     /// that queues device preparation retains its actual resources independently
@@ -2370,10 +2370,20 @@ pub trait ModelExecutor: Send + Sync {
         Ok(())
     }
 
-    /// Shutdown executor gracefully
-    async fn shutdown(&mut self) -> Result<()> {
-        // Default no-op implementation
-        Ok(())
+    /// Begin final retirement under the original assembly owner's authority.
+    /// A per-engine request drain does not grant this permission. Implementations
+    /// must retain unresolved resources independently of an awaiting caller.
+    /// The owner transfers its last execution reference after all use scopes
+    /// end. Retry observes or wakes this same retirement; it must not rebuild
+    /// the executor, replay inference, or release an original owner twice.
+    fn begin_shutdown(
+        self: Arc<Self>,
+        permit: &crate::executor_lifecycle::ExecutorShutdownPermit,
+    ) -> crate::executor_lifecycle::ExecutorShutdownObserver {
+        let error = permit.check(self.as_ref()).err().unwrap_or_else(|| {
+            FerrumError::unsupported("executor has not implemented checked whole-model shutdown")
+        });
+        crate::executor_lifecycle::ExecutorShutdownObserver::retained(Arc::new(self), error)
     }
 }
 

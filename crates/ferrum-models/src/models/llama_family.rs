@@ -5216,6 +5216,10 @@ impl<B: MoeLlmBackend> DecoderOnlyLLM for LlamaFamilyModel<B, KvFp16> {
         self.recover_token_frame()
     }
 
+    fn retire_model(&mut self) -> crate::common::llm::ModelRetirementOutcome {
+        self.retire_original_model()
+    }
+
     fn close_token_sequence(&mut self, cache_id: &str) -> Result<()> {
         if !B::host_execution_is_synchronous() {
             return Err(ferrum_types::FerrumError::unsupported(
@@ -5427,6 +5431,10 @@ impl<B: MoeLlmBackend> DecoderOnlyLLM for LlamaFamilyModel<B, KvFp16> {
 // (default trait impl falls back to per-item decode). PR D will add INT8
 // batched paths once the kernels stabilize.
 impl<B: MoeLlmBackend + BackendInt8KvOps> DecoderOnlyLLM for LlamaFamilyModel<B, KvInt8> {
+    fn retire_model(&mut self) -> crate::common::llm::ModelRetirementOutcome {
+        self.retire_original_model()
+    }
+
     fn observe_token_allocator_reclaim(
         &self,
         blocked_cache_id: &str,

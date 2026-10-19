@@ -67,7 +67,8 @@ async fn request_clock_interrupted_retry_preserves_decode_scheduling_until_actua
     };
     let mut deferred = Vec::new();
     engine
-        .inner
+        .active_inner()
+        .expect("engine execution is open")
         .consume_token_outcome(&selected, &works, outcome, Some(first), &mut deferred)
         .await
         .unwrap();
@@ -95,7 +96,8 @@ async fn request_clock_interrupted_retry_preserves_decode_scheduling_until_actua
         completed_at: Instant::now(),
     };
     engine
-        .inner
+        .active_inner()
+        .expect("engine execution is open")
         .consume_token_outcome(
             &[&inputs[1]],
             &retry_works,
@@ -151,8 +153,10 @@ async fn request_clock_interrupted_retry_preserves_decode_scheduling_until_actua
         );
     }
     pool.free(&[allocated]);
-    engine.shutdown().await.unwrap();
+    let released_inner = Arc::downgrade(&engine.active_inner().unwrap());
+    let report = engine.driver.shutdown_active().unwrap().wait().await;
+    report.result().unwrap();
     assert_eq!(executor.closed.lock().len(), 2);
-    assert!(engine.inner.sequences.is_empty());
-    assert_eq!(engine.inner.execution_closes.unreclaimed_count(), 0);
+    assert!(!report.retains_unproved_owners());
+    assert!(released_inner.upgrade().is_none());
 }

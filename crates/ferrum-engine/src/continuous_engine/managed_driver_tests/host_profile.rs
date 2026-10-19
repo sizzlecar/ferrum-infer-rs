@@ -16,7 +16,13 @@ async fn instance_host_profile_keeps_original_clock_and_independent_cpu_engines(
     let second = fixture::Fixture::with_config(|config| configure(config, &second_path, "second"));
     second.executor.remove_execution_gate();
     for fixture in [&first, &second] {
-        let sink = fixture.engine.inner.host_profile_sink.as_ref().unwrap();
+        let sink = fixture
+            .engine
+            .active_inner()
+            .unwrap()
+            .host_profile_sink
+            .clone()
+            .unwrap();
         assert_eq!(
             sink.device_timing_mode(),
             ferrum_runtime::DeviceTimingMode::Off

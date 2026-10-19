@@ -5,4 +5,4 @@ pub mod decoder_unified;
 pub mod llm;
 pub mod paged_pool;
 
-pub use llm::{DecoderOnlyLLM, LlmRuntimeConfig, ModelTokenExecutionMode};
+pub use llm::{DecoderOnlyLLM, LlmRuntimeConfig, ModelRetirementOutcome, ModelTokenExecutionMode};

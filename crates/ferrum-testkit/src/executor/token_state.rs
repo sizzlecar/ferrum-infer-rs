@@ -78,6 +78,120 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn host_shutdown_counter_observer_does_not_retain_mock_or_configurable_tokens() {
+        use ferrum_execution::executor_lifecycle::{ExecutorOwner, ExecutorShutdownPhase};
+        let mock = MockModelExecutor::instant(64);
+        let observation = mock.observer();
+        let frontier = admit(&mock, &RequestId::new()).await;
+        let prefill = run(
+            &mock,
+            &frontier,
+            TokenWork::Prefill(PrefillChunk::new(0, 3, 3).unwrap()),
+        )
+        .await;
+        let decode = run(
+            &mock,
+            prefill.next_frontier(),
+            TokenWork::Decode {
+                token: TokenId::new(42),
+                position: 3,
+            },
+        )
+        .await;
+        assert_eq!(selected(&decode), 42);
+        let owner = ExecutorOwner::new(Box::new(mock));
+        let report = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            owner.begin_shutdown().wait(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(report.phase(), ExecutorShutdownPhase::Retired);
+        report.result().unwrap();
+        assert!(frontier.sequence().observed_end().is_some());
+        assert_eq!(observation.prefill_count(), 1);
+        assert_eq!(observation.decode_count(), 1);
+
+        let scripted = ConfigurableModelExecutor::with_token_sequence(64, vec![7, 9]);
+        let observation = scripted.observer();
+        let frontier = admit(&scripted, &RequestId::new()).await;
+        let prefill = run(
+            &scripted,
+            &frontier,
+            TokenWork::Prefill(PrefillChunk::new(0, 3, 3).unwrap()),
+        )
+        .await;
+        let decode = run(
+            &scripted,
+            prefill.next_frontier(),
+            TokenWork::Decode {
+                token: TokenId::new(7),
+                position: 3,
+            },
+        )
+        .await;
+        assert_eq!(selected(&decode), 7);
+        let owner = ExecutorOwner::new(Box::new(scripted));
+        let report = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            owner.begin_shutdown().wait(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(report.phase(), ExecutorShutdownPhase::Retired);
+        report.result().unwrap();
+        assert!(frontier.sequence().observed_end().is_some());
+        assert_eq!(observation.decode_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn host_shutdown_waits_for_actual_borrowed_work_scope_after_waiter_cancel() {
+        use ferrum_execution::executor_lifecycle::{ExecutorOwner, ExecutorShutdownPhase};
+        use std::future::Future;
+        use std::task::Poll;
+        use std::time::Duration;
+        let executor = MockModelExecutor::new(64, Duration::from_secs(60), Duration::ZERO);
+        let observation = executor.observer();
+        let frontier = admit(&executor, &RequestId::new()).await;
+        let owner = ExecutorOwner::new(Box::new(executor));
+        let scope = owner.scope().unwrap();
+        let work = [ExecutionWork::new(
+            &frontier,
+            TokenWork::Prefill(PrefillChunk::new(0, 3, 3).unwrap()),
+            &LogitsReturnPolicy::FullLogits,
+        )
+        .unwrap()];
+        let mut running = Box::pin(scope.execute_tokens(&work));
+        std::future::poll_fn(|cx| {
+            assert!(running.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        let closing = owner.begin_shutdown();
+        drop(owner);
+        assert_eq!(closing.snapshot().phase(), ExecutorShutdownPhase::Draining);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), closing.wait())
+                .await
+                .is_err()
+        );
+        assert!(frontier.sequence().observed_end().is_none());
+        drop(running);
+        drop(scope);
+        let report = tokio::time::timeout(Duration::from_secs(5), closing.wait())
+            .await
+            .unwrap();
+        assert_eq!(report.phase(), ExecutorShutdownPhase::Retired);
+        report.result().unwrap();
+        assert!(frontier.sequence().observed_end().is_some());
+        assert_eq!(
+            observation.prefill_count(),
+            0,
+            "cancelled latency never executed"
+        );
+    }
+
+    #[tokio::test]
     async fn token_fixture_chunks_and_script_positions_are_per_incarnation() {
         let executor = ConfigurableModelExecutor::with_token_sequence(64, vec![7, 9]);
         let a = admit(&executor, &RequestId::new()).await;
@@ -231,6 +345,20 @@ pub(crate) struct TokenState {
 }
 
 impl TokenState {
+    pub(crate) fn shutdown(&mut self) -> Result<()> {
+        let sequences = self.entries.get_mut().keys().cloned().collect::<Vec<_>>();
+        for sequence in sequences {
+            let outcome = self.close(&sequence, ExecutionEndReason::Cancelled)?;
+            if let Some(error) = outcome.error {
+                return Err(error);
+            }
+            if !matches!(outcome.disposition, ExecutionCloseDisposition::Ended(_)) {
+                return Err(FerrumError::internal("synthetic token owner remains live"));
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn admit(
         &self,
         input: ExecutionAdmission<'_>,

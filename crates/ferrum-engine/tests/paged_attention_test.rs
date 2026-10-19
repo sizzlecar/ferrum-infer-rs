@@ -43,7 +43,7 @@ fn make_engine() -> (ContinuousBatchEngine, Arc<PagedKvCacheManager>) {
 
     let kv_manager =
         Arc::new(PagedKvCacheManager::new(ferrum_types::Device::CPU, kv_config).unwrap());
-    let executor = Arc::new(PagedAttentionExecutor::new(exec_config, kv_manager.clone()));
+    let executor = PagedAttentionExecutor::new(exec_config, kv_manager.clone());
 
     let config = ferrum_types::EngineConfig::default();
     let scheduler = Arc::new(ContinuousBatchScheduler::new(SchedulerConfig::default()));
@@ -57,7 +57,7 @@ fn make_engine() -> (ContinuousBatchEngine, Arc<PagedKvCacheManager>) {
         tokenizer,
         sampler,
         kv_manager.clone(),
-        executor,
+        ferrum_execution::executor_lifecycle::ExecutorOwner::new(Box::new(executor)),
         tensor_factory,
     )
     .expect("legacy engine composition must match executor authority");
@@ -132,7 +132,8 @@ async fn paged_executor_tracks_operations() {
 
     let kv_manager =
         Arc::new(PagedKvCacheManager::new(ferrum_types::Device::CPU, kv_config).unwrap());
-    let executor = Arc::new(PagedAttentionExecutor::new(exec_config, kv_manager.clone()));
+    let executor = PagedAttentionExecutor::new(exec_config, kv_manager.clone());
+    let observation = executor.observer();
 
     let config = ferrum_types::EngineConfig::default();
     let scheduler = Arc::new(ContinuousBatchScheduler::new(SchedulerConfig::default()));
@@ -146,13 +147,13 @@ async fn paged_executor_tracks_operations() {
         tokenizer,
         sampler,
         kv_manager,
-        executor.clone(),
+        ferrum_execution::executor_lifecycle::ExecutorOwner::new(Box::new(executor)),
         tensor_factory,
     )
     .expect("legacy engine composition must match executor authority");
 
-    assert_eq!(executor.prefill_count(), 0);
-    assert_eq!(executor.decode_count(), 0);
+    assert_eq!(observation.prefill_count(), 0);
+    assert_eq!(observation.decode_count(), 0);
 
     let mut request = make_request("Track ops");
     // This test validates executor operation accounting, so make the
@@ -163,8 +164,8 @@ async fn paged_executor_tracks_operations() {
     let _response = engine.infer(request).await.unwrap();
 
     // Should have done 1 prefill and (max_tokens - 1) decodes
-    assert_eq!(executor.prefill_count(), 1);
-    assert_eq!(executor.decode_count(), 4); // max_tokens=5, first from prefill
+    assert_eq!(observation.prefill_count(), 1);
+    assert_eq!(observation.decode_count(), 4); // max_tokens=5, first from prefill
 }
 
 #[tokio::test]
@@ -221,7 +222,7 @@ fn make_tight_engine() -> (Arc<ContinuousBatchEngine>, Arc<PagedKvCacheManager>)
 
     let kv_manager =
         Arc::new(PagedKvCacheManager::new(ferrum_types::Device::CPU, kv_config).unwrap());
-    let executor = Arc::new(PagedAttentionExecutor::new(exec_config, kv_manager.clone()));
+    let executor = PagedAttentionExecutor::new(exec_config, kv_manager.clone());
 
     let config = ferrum_types::EngineConfig::default();
     let scheduler = Arc::new(ContinuousBatchScheduler::new(SchedulerConfig::default()));
@@ -236,7 +237,7 @@ fn make_tight_engine() -> (Arc<ContinuousBatchEngine>, Arc<PagedKvCacheManager>)
             tokenizer,
             sampler,
             kv_manager.clone(),
-            executor,
+            ferrum_execution::executor_lifecycle::ExecutorOwner::new(Box::new(executor)),
             tensor_factory,
         )
         .expect("legacy engine composition must match executor authority"),

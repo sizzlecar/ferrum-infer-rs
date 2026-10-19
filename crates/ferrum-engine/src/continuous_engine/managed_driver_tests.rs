@@ -29,7 +29,10 @@ async fn pending_once<F: Future>(mut future: Pin<&mut F>) {
 }
 
 fn actual_close_after_driver_exit(fixture: &closure::Fixture) {
-    assert_eq!(fixture.engine.inner.execution_closes.unreclaimed_count(), 0);
+    assert!(
+        fixture.original_inner.upgrade().is_none(),
+        "all original execution close custody is released"
+    );
     assert_eq!(
         fixture.identity.observed_end().unwrap().sequence(),
         &fixture.identity
@@ -53,7 +56,6 @@ fn actual_close_after_driver_exit(fixture: &closure::Fixture) {
     assert_eq!(
         fixture
             .engine
-            .inner
             .scheduler
             .trace_snapshot()
             .capacity_release_epoch,
@@ -82,7 +84,7 @@ async fn managed_driver_explicit_lazy_share_one_real_cpu_execution() {
     let third = fixture.engine.start_loop().unwrap();
     let mut inference = Box::pin(fixture.engine.infer(fixture.request()));
     pending_once(inference.as_mut()).await;
-    assert_eq!(fixture.engine.inner.sequences.len(), 2);
+    assert_eq!(fixture.engine.active_inner().unwrap().sequences.len(), 2);
     fixture.release.send(()).unwrap();
     let (response, chunks) = tokio::time::timeout(Duration::from_secs(3), async {
         tokio::join!(inference, stream.collect::<Vec<_>>())
@@ -106,7 +108,14 @@ async fn managed_driver_explicit_lazy_share_one_real_cpu_execution() {
         .tokens
         .iter()
         .copied()
-        .filter(|token| !fixture.engine.inner.tokenizer.is_special_token(*token))
+        .filter(|token| {
+            !fixture
+                .engine
+                .active_inner()
+                .unwrap()
+                .tokenizer
+                .is_special_token(*token)
+        })
         .collect();
     assert_eq!(stream_tokens, visible);
     assert_eq!(
@@ -138,12 +147,13 @@ async fn managed_driver_closing_wins_both_ingress_publications() {
     let fixture = fixture::Fixture::new();
     let recorder = metrics::ActiveRequests::default();
     let _recorder = ::metrics::set_default_local_recorder(&recorder);
-    let lock = fixture.engine.inner.iteration_lock.lock().await;
+    let locking_inner = fixture.engine.active_inner().unwrap();
+    let lock = locking_inner.iteration_lock.lock().await;
     let mut inference = Box::pin(fixture.engine.infer(fixture.request()));
     let mut streaming = Box::pin(fixture.engine.infer_stream(fixture.request()));
     pending_once(inference.as_mut()).await;
     pending_once(streaming.as_mut()).await;
-    assert!(fixture.engine.inner.sequences.is_empty());
+    assert!(fixture.engine.active_inner().unwrap().sequences.is_empty());
     assert_eq!(
         fixture::slot_events(
             &fixture.engine,
@@ -159,6 +169,7 @@ async fn managed_driver_closing_wins_both_ingress_publications() {
     pending_once(shutdown.as_mut()).await;
     assert!(fixture.engine.start_loop().is_err());
     drop(lock);
+    drop(locking_inner);
     assert!(inference.await.is_err());
     assert!(streaming.await.is_err());
     tokio::time::timeout(Duration::from_secs(2), shutdown)
@@ -167,8 +178,8 @@ async fn managed_driver_closing_wins_both_ingress_publications() {
         .unwrap();
     assert_eq!(fixture.executor.admissions.load(Ordering::SeqCst), 0);
     assert_eq!(fixture.executor.checked_outputs.load(Ordering::SeqCst), 0);
-    assert_eq!(fixture.engine.inner.scheduler.waiting_count(), 0);
-    assert!(fixture.engine.inner.sequences.is_empty());
+    assert_eq!(fixture.engine.scheduler.waiting_count(), 0);
+    assert!(fixture.original_inner.upgrade().is_none());
     assert_eq!(
         fixture::closed_slot_events(
             &fixture.trace.path().join("trace.jsonl"),
@@ -184,7 +195,8 @@ async fn managed_driver_cancel_before_publication_opens_no_slot() {
     let fixture = fixture::Fixture::new();
     let recorder = metrics::ActiveRequests::default();
     let _recorder = ::metrics::set_default_local_recorder(&recorder);
-    let lock = fixture.engine.inner.iteration_lock.lock().await;
+    let locking_inner = fixture.engine.active_inner().unwrap();
+    let lock = locking_inner.iteration_lock.lock().await;
     let mut inference = Box::pin(fixture.engine.infer(fixture.request()));
     let mut streaming = Box::pin(fixture.engine.infer_stream(fixture.request()));
     pending_once(inference.as_mut()).await;
@@ -192,6 +204,7 @@ async fn managed_driver_cancel_before_publication_opens_no_slot() {
     drop(inference);
     drop(streaming);
     drop(lock);
+    drop(locking_inner);
     assert_eq!(recorder.value(), 0.0);
     assert_eq!(
         fixture::slot_events(
@@ -236,15 +249,21 @@ async fn managed_driver_cancel_published_infer_balances_gauge_and_closes_real_kv
     let mut shutdown = Box::pin(fixture.engine.shutdown());
     pending_once(shutdown.as_mut()).await;
     assert!(fixture.engine.start_loop().is_err());
-    assert!(fixture.engine.inner.sequences.get(&id).is_some());
+    assert!(fixture
+        .original_inner
+        .upgrade()
+        .unwrap()
+        .sequences
+        .get(&id)
+        .is_some());
     fixture.release.send(()).unwrap();
     tokio::time::timeout(Duration::from_secs(2), shutdown)
         .await
         .unwrap()
         .unwrap();
     observer.wait().await.result().unwrap();
-    assert!(fixture.engine.inner.sequences.is_empty());
-    assert_eq!(fixture.engine.inner.scheduler.trace_phase(&id), None);
+    assert!(fixture.original_inner.upgrade().is_none());
+    assert_eq!(fixture.engine.scheduler.trace_phase(&id), None);
     assert!(fixture.executor.observed.lock().model.kv_caches.is_empty());
     assert_eq!(fixture.executor.closes.load(Ordering::SeqCst), 1);
     assert_eq!(fixture.executor.checked_outputs.load(Ordering::SeqCst), 1);
@@ -261,11 +280,9 @@ async fn managed_driver_cancel_published_infer_balances_gauge_and_closes_real_kv
 #[tokio::test]
 async fn managed_driver_dropped_shutdown_observer_preserves_actual_close_and_join() {
     let mut fixture = closure::fixture(true, false).await;
+    let completion_inner = fixture.engine.active_inner().unwrap();
     let mut completion = Box::pin(
-        fixture
-            .engine
-            .inner
-            .complete_request_for_test(&fixture.request_id, FinishReason::Length),
+        completion_inner.complete_request_for_test(&fixture.request_id, FinishReason::Length),
     );
     tokio::select! {
         biased;
@@ -273,7 +290,8 @@ async fn managed_driver_dropped_shutdown_observer_preserves_actual_close_and_joi
         started = &mut fixture.started => started.unwrap(),
     }
     drop(completion);
-    assert!(fixture.engine.inner.sequences.is_empty());
+    drop(completion_inner);
+    assert!(fixture.engine.active_inner().unwrap().sequences.is_empty());
     let observer = fixture.engine.start_loop().unwrap();
     let remaining_observer = observer.clone();
     let mut shutdown = Box::pin(fixture.engine.shutdown());
@@ -282,7 +300,15 @@ async fn managed_driver_dropped_shutdown_observer_preserves_actual_close_and_joi
     drop(observer);
     assert!(fixture.engine.start_loop().is_err());
     assert!(fixture.identity.observed_end().is_none());
-    assert_eq!(fixture.engine.inner.execution_closes.unreclaimed_count(), 1);
+    assert_eq!(
+        fixture
+            .original_inner
+            .upgrade()
+            .unwrap()
+            .execution_closes
+            .unreclaimed_count(),
+        1
+    );
     assert_eq!(closure::slot_events(&fixture, ResourceAction::Release), 0);
     assert_eq!(fixture.model.lock().model.kv_caches.len(), 1);
     fixture.gate.take().unwrap().send(()).unwrap();
@@ -337,7 +363,7 @@ async fn managed_driver_failed_report_retains_unproved_owner_without_control_cyc
         .panic_next_iteration
         .store(true, Ordering::SeqCst);
     let control = Arc::downgrade(&fixture.engine.driver);
-    let inner = Arc::downgrade(&fixture.engine.inner);
+    let inner = Arc::downgrade(&fixture.engine.active_inner().unwrap());
     let observer = fixture.engine.start_loop().unwrap();
     let report = tokio::time::timeout(Duration::from_secs(2), observer.wait())
         .await
@@ -353,14 +379,15 @@ async fn managed_driver_failed_report_retains_unproved_owner_without_control_cyc
         assert!(delivery.scope_receipt.is_none());
         assert!(delivery.final_receipt.is_none());
     }
-    fixture
-        .engine
-        .inner
+    let journal = fixture
+        .original_inner
+        .upgrade()
+        .unwrap()
         .scheduler_trace_jsonl
         .as_ref()
         .unwrap()
-        .flush()
-        .unwrap();
+        .clone();
+    journal.flush().unwrap();
     assert_eq!(
         fixture::closed_slot_events(
             &fixture.trace.path().join("trace.jsonl"),
@@ -369,17 +396,20 @@ async fn managed_driver_failed_report_retains_unproved_owner_without_control_cyc
         0
     );
     assert_eq!(fixture.model.lock().model.kv_caches.len(), 1);
+    let mut cleanup_completed = report.cleanup_completion();
     drop(observer);
     drop(fixture.engine);
+    drop(report);
     assert!(
         control.upgrade().is_none(),
         "failed report must not retain the driver control"
     );
     let retained = inner
         .upgrade()
-        .expect("report retains original unresolved custody");
+        .expect("original cleanup retains unresolved custody after all public observers drop");
     assert_eq!(retained.execution_closes.unreclaimed_count(), 1);
     assert!(fixture.identity.observed_end().is_none());
+    assert!(!journal.delivery_stats().worker_finished);
     // Resolve the same real CPU owner explicitly, never by dropping its report.
     fixture
         .executor
@@ -389,18 +419,37 @@ async fn managed_driver_failed_report_retains_unproved_owner_without_control_cyc
     assert!(
         matches!(result.disposition, ExecutionCloseDisposition::Ended(ref ended) if ended.sequence() == &fixture.identity)
     );
-    retained.drain_execution_closes().unwrap();
     assert!(fixture.model.lock().model.kv_caches.is_empty());
     assert_eq!(
         fixture.model.lock().releases,
         vec![vec![fixture.prompt_len; fixture.layers]]
     );
-    assert_eq!(retained.execution_closes.unreclaimed_count(), 0);
+    retained.work_notify.notify_one();
     drop(retained);
-    drop(report);
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if *cleanup_completed.borrow_and_update() {
+                break;
+            }
+            cleanup_completed
+                .changed()
+                .await
+                .expect("original cleanup must publish completion");
+        }
+    })
+    .await
+    .expect("original cleanup must retire the model and writer without public observers");
     assert!(
         inner.upgrade().is_none(),
         "the resolved custody has no permanent Arc cycle"
+    );
+    assert!(journal.delivery_stats().worker_finished);
+    assert_eq!(
+        fixture::closed_slot_events(
+            &fixture.trace.path().join("trace.jsonl"),
+            ResourceAction::Release
+        ),
+        1
     );
 }
 
@@ -408,7 +457,7 @@ async fn managed_driver_failed_report_retains_unproved_owner_without_control_cyc
 async fn managed_driver_clean_exit_releases_inner_without_observer_wait() {
     let mut fixture = fixture::Fixture::new();
     let observer = fixture.engine.start_loop().unwrap();
-    let inner = Arc::downgrade(&fixture.engine.inner);
+    let inner = Arc::downgrade(&fixture.engine.active_inner().unwrap());
     let control = Arc::downgrade(&fixture.engine.driver);
     let request = fixture.request();
     let mut inference = Box::pin(fixture.engine.infer(request));
@@ -430,22 +479,23 @@ async fn managed_driver_clean_exit_releases_inner_without_observer_wait() {
     let (dropped, executor_dropped) = tokio::sync::oneshot::channel();
     *fixture.executor.dropped.lock() = Some(dropped);
     // Request shutdown synchronously without polling any observer's wait.
-    drop(
-        fixture
-            .engine
-            .driver
-            .shutdown(&fixture.engine.inner)
-            .unwrap(),
-    );
+    drop(fixture.engine.driver.shutdown_active().unwrap());
     drop(fixture.engine);
     drop(fixture.executor);
-    // The drop signal comes from the actual model executor owned by Inner.
-    // On this current-thread runtime, its drop and task return finish before
-    // this test can resume; no timing sleep or join side effect is involved.
+    // The drop signal comes from the actual decorator owned by Inner. Its
+    // original model worker and journals still finish asynchronously; observe
+    // control release without joining the driver through its public observer.
     tokio::time::timeout(Duration::from_secs(2), executor_dropped)
         .await
         .expect("clean task must release its original Inner without wait")
         .unwrap();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while control.upgrade().is_some() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("original cleanup must release driver control without observer wait");
     assert!(inner.upgrade().is_none());
     assert!(control.upgrade().is_none());
     drop(observer);

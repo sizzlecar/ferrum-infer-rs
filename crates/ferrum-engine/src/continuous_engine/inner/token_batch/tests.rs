@@ -8,7 +8,7 @@ use ferrum_execution::token_execution::{
     ExecutorSequenceIssuer, LastKnownExecutionStage, NoSubmissionStage,
 };
 use ferrum_kv::{PagedKvCacheConfig, PagedKvCacheManager};
-use ferrum_models::test_support::{tiny_llama_executor, TinyLlamaConfig, TinyTokenizer};
+use ferrum_models::test_support::{tiny_llama_executor_owned, TinyLlamaConfig, TinyTokenizer};
 
 #[path = "tests/allocator_tests.rs"]
 mod allocator_tests;
@@ -16,10 +16,35 @@ mod allocator_tests;
 mod request_clock;
 
 struct ProtocolExecutor {
-    metadata: Arc<dyn ModelExecutor>,
+    metadata: ExecutorScope,
+    owner: ExecutorOwner,
+    observation: Arc<ProtocolObservation>,
+    allocator: Arc<Mutex<Option<allocator_tests::AllocatorState>>>,
+}
+
+struct ProtocolObservation {
+    info: ferrum_types::ModelInfo,
     issuer: ExecutorSequenceIssuer,
     closed: Mutex<Vec<ExecutorSequence>>,
-    allocator: Mutex<Option<allocator_tests::AllocatorState>>,
+    allocator: Weak<Mutex<Option<allocator_tests::AllocatorState>>>,
+}
+
+impl ProtocolObservation {
+    fn info(&self) -> &ferrum_types::ModelInfo {
+        &self.info
+    }
+    fn allocator(&self) -> Arc<Mutex<Option<allocator_tests::AllocatorState>>> {
+        self.allocator
+            .upgrade()
+            .expect("original protocol allocator is live")
+    }
+}
+
+impl std::ops::Deref for ProtocolExecutor {
+    type Target = ProtocolObservation;
+    fn deref(&self) -> &Self::Target {
+        &self.observation
+    }
 }
 
 impl ProtocolExecutor {
@@ -34,6 +59,43 @@ impl ProtocolExecutor {
 
 #[async_trait::async_trait]
 impl ModelExecutor for ProtocolExecutor {
+    fn begin_shutdown(
+        self: Arc<Self>,
+        permit: &ferrum_execution::ExecutorShutdownPermit,
+    ) -> ferrum_execution::ExecutorShutdownObserver {
+        if let Err(error) = permit.check(self.as_ref()) {
+            return ferrum_execution::ExecutorShutdownObserver::retained(Arc::new(self), error);
+        }
+        let original = match Arc::try_unwrap(self) {
+            Ok(original) => original,
+            Err(original) => {
+                return ferrum_execution::ExecutorShutdownObserver::retained(
+                    Arc::new(original),
+                    FerrumError::internal("protocol fixture has an unscoped owner"),
+                )
+            }
+        };
+        let released = original
+            .allocator
+            .lock()
+            .as_ref()
+            .is_none_or(allocator_tests::AllocatorState::fully_released);
+        if !released {
+            return ferrum_execution::ExecutorShutdownObserver::retained(
+                Arc::new(original),
+                FerrumError::internal("protocol allocator retains original token owners"),
+            );
+        }
+        original.allocator.lock().take();
+        let Self {
+            metadata,
+            owner,
+            observation,
+            allocator,
+        } = original;
+        drop((metadata, observation, allocator));
+        owner.begin_shutdown()
+    }
     fn info(&self) -> &ferrum_types::ModelInfo {
         self.metadata.info()
     }
@@ -70,7 +132,7 @@ impl ModelExecutor for ProtocolExecutor {
 
 async fn fixture() -> (
     ContinuousBatchEngine,
-    Arc<ProtocolExecutor>,
+    Arc<ProtocolObservation>,
     Vec<TokenBatchInput>,
 ) {
     fixture_with_request_count(2).await
@@ -80,7 +142,7 @@ async fn fixture_with_request_count(
     request_count: usize,
 ) -> (
     ContinuousBatchEngine,
-    Arc<ProtocolExecutor>,
+    Arc<ProtocolObservation>,
     Vec<TokenBatchInput>,
 ) {
     fixture_with_clock(request_count, false).await
@@ -91,16 +153,25 @@ async fn fixture_with_clock(
     capture_timing: bool,
 ) -> (
     ContinuousBatchEngine,
-    Arc<ProtocolExecutor>,
+    Arc<ProtocolObservation>,
     Vec<TokenBatchInput>,
 ) {
     let cfg = TinyLlamaConfig::default();
-    let executor = Arc::new(ProtocolExecutor {
-        metadata: tiny_llama_executor(&cfg),
+    let owner = ExecutorOwner::new(tiny_llama_executor_owned(&cfg));
+    let metadata = owner.scope().unwrap();
+    let allocator = Arc::new(Mutex::new(None));
+    let executor = Arc::new(ProtocolObservation {
+        info: metadata.info().clone(),
         issuer: ExecutorSequenceIssuer::new(),
         closed: Mutex::new(Vec::new()),
-        allocator: Mutex::new(None),
+        allocator: Arc::downgrade(&allocator),
     });
+    let implementation = ProtocolExecutor {
+        metadata,
+        owner,
+        observation: Arc::clone(&executor),
+        allocator,
+    };
     let mut config = EngineConfig::default();
     if capture_timing {
         config.runtime.profile_detail = ObservabilityProfileDetail::Latency;
@@ -129,7 +200,7 @@ async fn fixture_with_clock(
         tokenizer.clone(),
         Arc::new(crate::registry::GreedySampler),
         kv,
-        executor.clone(),
+        ExecutorOwner::new(Box::new(implementation)),
         Arc::new(crate::tensor_factory::CandleTensorFactory::new(Device::CPU)),
     )
     .unwrap();
@@ -152,10 +223,19 @@ async fn fixture_with_clock(
         );
         sequence.execution_frontier = Some(frontier.clone());
         sequence.phase = RequestPhase::Prefilling;
-        engine.inner.sequences.insert(request_id.clone(), sequence);
+        engine
+            .active_inner()
+            .expect("engine execution is open")
+            .sequences
+            .insert(request_id.clone(), sequence);
         scheduler.submit(request).await.unwrap();
         inputs.push(TokenBatchInput {
-            handle: engine.inner.sequences.get(&request_id).unwrap(),
+            handle: engine
+                .active_inner()
+                .expect("engine execution is open")
+                .sequences
+                .get(&request_id)
+                .unwrap(),
             request_id,
             frontier,
             work: TokenWork::Prefill(PrefillChunk::new(0, 1, 2).unwrap()),
@@ -212,7 +292,10 @@ fn held(
 }
 
 fn assert_healthy(engine: &ContinuousBatchEngine, input: &TokenBatchInput) {
-    let sequences = &engine.inner.sequences;
+    let sequences = &engine
+        .active_inner()
+        .expect("engine execution is open")
+        .sequences;
     let sequence_handle = sequences.get(&input.request_id).unwrap();
     let sequence_guard = sequence_handle.lock();
     let sequence = sequence_guard.as_ref().unwrap();
@@ -262,16 +345,28 @@ async fn token_outcome_wrong_index_held_conflicts_only_with_its_actual_incarnati
             ExecutionBatchOutcome::ContractViolation(_)
         ));
         engine
-            .inner
+            .active_inner()
+            .expect("engine execution is open")
             .consume_token_outcome(&selected, &works, outcome, None, &mut Vec::new())
             .await
             .unwrap();
-        engine.inner.execution_closes.join_observers().await;
-        engine.inner.output_tasks.join_current().await;
+        engine
+            .active_inner()
+            .expect("engine execution is open")
+            .execution_closes
+            .join_observers()
+            .await;
+        engine
+            .active_inner()
+            .expect("engine execution is open")
+            .output_tasks
+            .join_current()
+            .await;
         // Delivery no longer blocks the batch. The same production driver
         // consumer must still observe the asynchronous close/control failure.
         let error = engine
-            .inner
+            .active_inner()
+            .expect("engine execution is open")
             .run_iteration()
             .await
             .err()
@@ -280,20 +375,42 @@ async fn token_outcome_wrong_index_held_conflicts_only_with_its_actual_incarnati
             error.to_string(),
             FerrumError::backend("conflicting actual incarnation").to_string()
         );
-        engine.inner.drain_execution_closes().unwrap();
-        assert!(!engine.inner.sequences.get(&inputs[0].request_id).is_some());
+        engine
+            .active_inner()
+            .expect("engine execution is open")
+            .drain_execution_closes()
+            .unwrap();
+        assert!(!engine
+            .active_inner()
+            .expect("engine execution is open")
+            .sequences
+            .get(&inputs[0].request_id)
+            .is_some());
         assert_healthy(&engine, &inputs[1]);
         assert_eq!(
             executor.closed.lock().as_slice(),
             &[inputs[0].frontier.sequence().clone()]
         );
-        assert_eq!(engine.inner.execution_closes.unreclaimed_count(), 1);
+        assert_eq!(
+            engine
+                .active_inner()
+                .expect("engine execution is open")
+                .execution_closes
+                .unreclaimed_count(),
+            1
+        );
         assert!(
             !sender.is_closed(),
             "invalid index must not discard the actual Held"
         );
-        drop(engine);
-        assert!(sender.is_closed());
+        crate::continuous_engine::executor_shutdown_tests::retire_rejected_observer_after_drop(
+            engine,
+            &executor.issuer,
+            inputs[0].frontier.sequence(),
+            sender,
+        )
+        .await;
+        assert_eq!(executor.closed.lock().len(), 2);
     }
 }
 
@@ -329,7 +446,8 @@ async fn token_outcome_foreign_held_does_not_poison_the_declared_healthy_peer() 
         vec![FerrumError::backend("foreign producer observation").into()],
     ));
     engine
-        .inner
+        .active_inner()
+        .expect("engine execution is open")
         .consume_token_outcome(&selected, &works, outcome, None, &mut Vec::new())
         .await
         .unwrap();
@@ -337,11 +455,24 @@ async fn token_outcome_foreign_held_does_not_poison_the_declared_healthy_peer() 
         assert_healthy(&engine, input);
     }
     assert!(executor.closed.lock().is_empty());
-    assert_eq!(engine.inner.execution_closes.unreclaimed_count(), 1);
+    assert_eq!(
+        engine
+            .active_inner()
+            .expect("engine execution is open")
+            .execution_closes
+            .unreclaimed_count(),
+        1
+    );
     assert!(!sender.is_closed());
     assert!(foreign.observed_end().is_none());
-    drop(engine);
-    assert!(sender.is_closed());
+    crate::continuous_engine::executor_shutdown_tests::retire_rejected_observer_after_drop(
+        engine,
+        &executor.issuer,
+        &foreign,
+        sender,
+    )
+    .await;
+    assert_eq!(executor.closed.lock().len(), 2);
 }
 
 #[tokio::test]
@@ -385,7 +516,8 @@ async fn token_outcome_foreign_completion_does_not_claim_a_healthy_index() {
         (completed, Vec::new(), Vec::new()),
     ));
     engine
-        .inner
+        .active_inner()
+        .expect("engine execution is open")
         .consume_token_outcome(&selected, &works, outcome, None, &mut Vec::new())
         .await
         .unwrap();
@@ -428,7 +560,8 @@ async fn token_outcome_foreign_retryable_preserves_another_live_split_request() 
         vec![FerrumError::backend("retryable belongs to another live split").into()],
     ));
     engine
-        .inner
+        .active_inner()
+        .expect("engine execution is open")
         .consume_token_outcome(&selected, &works, outcome, None, &mut Vec::new())
         .await
         .unwrap();
@@ -437,7 +570,10 @@ async fn token_outcome_foreign_retryable_preserves_another_live_split_request() 
         assert_healthy(&engine, input);
     }
     {
-        let sequences = &engine.inner.sequences;
+        let sequences = &engine
+            .active_inner()
+            .expect("engine execution is open")
+            .sequences;
         let sequence_handle = sequences.get(&pending.request_id).unwrap();
         let sequence_guard = sequence_handle.lock();
         let sequence = sequence_guard.as_ref().unwrap();
@@ -452,7 +588,14 @@ async fn token_outcome_foreign_retryable_preserves_another_live_split_request() 
     }
     assert!(pending.frontier.sequence().observed_end().is_none());
     assert!(executor.closed.lock().is_empty());
-    assert_eq!(engine.inner.execution_closes.unreclaimed_count(), 0);
+    assert_eq!(
+        engine
+            .active_inner()
+            .expect("engine execution is open")
+            .execution_closes
+            .unreclaimed_count(),
+        0
+    );
 
     // The original pending frontier still participates in its own legal
     // product commit; no cancellation or invented Ended was applied to it.
@@ -473,13 +616,21 @@ async fn token_outcome_foreign_retryable_preserves_another_live_split_request() 
         .unwrap();
     let outcome = pending_scope.completed(vec![completion]).unwrap();
     engine
-        .inner
+        .active_inner()
+        .expect("engine execution is open")
         .consume_token_outcome(&[pending], &pending_work, outcome, None, &mut Vec::new())
         .await
         .unwrap();
     assert_healthy(&engine, pending);
     assert!(executor.closed.lock().is_empty());
-    assert_eq!(engine.inner.execution_closes.unreclaimed_count(), 0);
+    assert_eq!(
+        engine
+            .active_inner()
+            .expect("engine execution is open")
+            .execution_closes
+            .unreclaimed_count(),
+        0
+    );
 }
 
 #[tokio::test]
@@ -559,7 +710,8 @@ async fn token_outcome_keeps_deferred_subcohort_after_peer_close_and_commit() {
     // Publishing the real peer failure may fail the operation. The independent
     // completed product and retryable subcohort must survive that error.
     let _ = engine
-        .inner
+        .active_inner()
+        .expect("engine execution is open")
         .consume_token_outcome(&selected, &works, outcome, None, &mut deferred)
         .await;
     assert_healthy(&engine, &inputs[1]);
@@ -567,7 +719,10 @@ async fn token_outcome_keeps_deferred_subcohort_after_peer_close_and_commit() {
     let group = deferred.pop().unwrap();
     assert_eq!(group.input_indices, vec![2, 3]);
     for input in &inputs[2..] {
-        let sequences = &engine.inner.sequences;
+        let sequences = &engine
+            .active_inner()
+            .expect("engine execution is open")
+            .sequences;
         let state_handle = sequences.get(&input.request_id).unwrap();
         let state_guard = state_handle.lock();
         let state = state_guard.as_ref().unwrap();
@@ -582,12 +737,13 @@ async fn token_outcome_keeps_deferred_subcohort_after_peer_close_and_commit() {
         .map(|&i| selected[i])
         .collect::<Vec<_>>();
     let splits = engine
-        .inner
+        .active_inner()
+        .expect("engine execution is open")
         .handle_token_deferral(
             &deferred_inputs,
             NoSubmissionReason::Deferred(group.deferral),
             &mut None,
-            engine.inner.scheduler.confirmed_capacity_release_epoch(),
+            engine.scheduler.confirmed_capacity_release_epoch(),
         )
         .await
         .unwrap();
@@ -611,7 +767,8 @@ async fn token_outcome_keeps_deferred_subcohort_after_peer_close_and_commit() {
             .unwrap();
         let result = retry_scope.completed(vec![completion]).unwrap();
         engine
-            .inner
+            .active_inner()
+            .expect("engine execution is open")
             .consume_token_outcome(&[input], &retry_work, result, None, &mut Vec::new())
             .await
             .unwrap();
@@ -674,14 +831,29 @@ async fn token_outcome_contract_violation_never_grants_capacity_retry() {
     ));
     let mut deferred = Vec::new();
     let _ = engine
-        .inner
+        .active_inner()
+        .expect("engine execution is open")
         .consume_token_outcome(&selected, &works, outcome, None, &mut deferred)
         .await;
     assert!(deferred.is_empty());
-    engine.inner.execution_closes.join_observers().await;
-    engine.inner.drain_execution_closes().unwrap();
+    engine
+        .active_inner()
+        .expect("engine execution is open")
+        .execution_closes
+        .join_observers()
+        .await;
+    engine
+        .active_inner()
+        .expect("engine execution is open")
+        .drain_execution_closes()
+        .unwrap();
     for input in &inputs {
         assert!(input.frontier.sequence().observed_end().is_some());
-        assert!(!engine.inner.sequences.get(&input.request_id).is_some());
+        assert!(!engine
+            .active_inner()
+            .expect("engine execution is open")
+            .sequences
+            .get(&input.request_id)
+            .is_some());
     }
 }

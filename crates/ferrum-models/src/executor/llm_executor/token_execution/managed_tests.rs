@@ -60,6 +60,9 @@ struct ManagedModel<B: MoeLlmBackend> {
 }
 
 impl<B: MoeLlmBackend> DecoderOnlyLLM for ManagedModel<B> {
+    fn retire_model(&mut self) -> crate::common::ModelRetirementOutcome {
+        self.model.lock().retire_model()
+    }
     fn config(&self) -> &LlmRuntimeConfig {
         &self.config
     }

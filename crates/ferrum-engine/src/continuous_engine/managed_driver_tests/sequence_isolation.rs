@@ -134,10 +134,7 @@ async fn sequence_decoder_block_does_not_hold_publication_or_peer_close() {
     // blocked request's mutable state, after releasing its planning lock.
     let later_request = fixture.request();
     let later_id = later_request.id.clone();
-    let publication_engine = ContinuousBatchEngine {
-        inner: Arc::clone(&fixture.engine.inner),
-        driver: Arc::clone(&fixture.engine.driver),
-    };
+    let publication_engine = Arc::clone(&fixture.engine);
     let publication =
         tokio::spawn(async move { publication_engine.infer_stream(later_request).await });
     // Poll only a JoinHandle here. A regression that synchronously blocks a
@@ -148,8 +145,20 @@ async fn sequence_decoder_block_does_not_hold_publication_or_peer_close() {
         .expect("a decoder must not hold the global publication index")
         .unwrap()
         .unwrap();
-    assert!(fixture.engine.inner.sequences.get(&later_id).is_some());
-    assert!(fixture.engine.inner.sequences.get(&blocked_id).is_some());
+    assert!(fixture
+        .engine
+        .active_inner()
+        .unwrap()
+        .sequences
+        .get(&later_id)
+        .is_some());
+    assert!(fixture
+        .engine
+        .active_inner()
+        .unwrap()
+        .sequences
+        .get(&blocked_id)
+        .is_some());
     assert_eq!(
         fixture.executor.admissions.load(Ordering::SeqCst),
         2,
@@ -162,7 +171,7 @@ async fn sequence_decoder_block_does_not_hold_publication_or_peer_close() {
         .unwrap()
         .unwrap();
     assert!(!first.chunk().text.is_empty());
-    let close_inner = Arc::clone(&fixture.engine.inner);
+    let close_inner = Arc::clone(&fixture.engine.active_inner().unwrap());
     let close_id = peer_id.clone();
     let close = tokio::spawn(async move {
         close_inner
@@ -185,7 +194,13 @@ async fn sequence_decoder_block_does_not_hold_publication_or_peer_close() {
     );
     assert_eq!(fixture.executor.closes.load(Ordering::SeqCst), 1);
     assert_eq!(fixture.executor.observed.lock().model.kv_caches.len(), 1);
-    assert!(fixture.engine.inner.sequences.get(&peer_id).is_none());
+    assert!(fixture
+        .engine
+        .active_inner()
+        .unwrap()
+        .sequences
+        .get(&peer_id)
+        .is_none());
     assert_eq!(
         peer_chunks
             .iter()
@@ -263,7 +278,8 @@ async fn sequence_decoder_block_does_not_hold_publication_or_peer_close() {
         text(&peer_chunks),
         fixture
             .engine
-            .inner
+            .active_inner()
+            .unwrap()
             .tokenizer
             .decode(&tokens(&peer_chunks), true)
             .unwrap()
@@ -273,7 +289,7 @@ async fn sequence_decoder_block_does_not_hold_publication_or_peer_close() {
     assert_eq!(fixture.executor.maximum_in_flight.load(Ordering::SeqCst), 1);
     assert_eq!(fixture.executor.closes.load(Ordering::SeqCst), 3);
     assert!(fixture.executor.observed.lock().model.kv_caches.is_empty());
-    assert_eq!(fixture.engine.inner.execution_closes.unreclaimed_count(), 0);
+    assert!(fixture.original_inner.upgrade().is_none());
     assert_eq!(
         fixture::closed_slot_events(
             &fixture.trace.path().join("trace.jsonl"),
@@ -287,6 +303,6 @@ async fn sequence_decoder_block_does_not_hold_publication_or_peer_close() {
         later_chunks,
         release_on_failure,
     ));
-    assert_eq!(fixture.engine.inner.output_budget.usage().sessions, 0);
-    assert_eq!(fixture.engine.inner.output_budget.usage().queued_bytes, 0);
+    assert_eq!(fixture.output_budget.usage().sessions, 0);
+    assert_eq!(fixture.output_budget.usage().queued_bytes, 0);
 }

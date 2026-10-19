@@ -87,6 +87,15 @@ pub enum ModelExecutionRecovery {
     Held { error: FerrumError },
 }
 
+/// Whole-model retirement, after the original sequence owners have drained.
+/// A terminal operation error can coexist with successful resource retirement.
+/// Retained never authorizes dropping the original model/context or replaying work.
+#[derive(Debug, Clone)]
+pub enum ModelRetirementOutcome {
+    Retired { error: Option<FerrumError> },
+    Retained { error: FerrumError },
+}
+
 /// Only callers with an actual synchronous-host implementation may use this.
 /// A device enqueue panic cannot be made terminal by catching it here.
 pub(crate) fn catch_host_execution<T>(work: impl FnOnce() -> T) -> Result<T> {

@@ -26,6 +26,39 @@ pub(super) struct PagedTokenState {
 }
 
 impl PagedAttentionExecutor {
+    pub(super) fn shutdown_token_sequences(&mut self) -> Result<()> {
+        // This executor may share its manager with a peer. Release only exact
+        // handles in its original registry, never the manager's other entries.
+        let sequences = self
+            .tokens
+            .entries
+            .get_mut()
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut failure = None;
+        for sequence in sequences {
+            match self.close_token_sequence(&sequence, ExecutionEndReason::Cancelled) {
+                Ok(outcome) => {
+                    if let Some(error) = outcome.error {
+                        failure.get_or_insert(error);
+                    }
+                    if !matches!(outcome.disposition, ExecutionCloseDisposition::Ended(_)) {
+                        failure.get_or_insert_with(|| {
+                            FerrumError::backend(
+                                "paged host executor retains an unreleased physical cache",
+                            )
+                        });
+                    }
+                }
+                Err(error) => {
+                    failure.get_or_insert(error);
+                }
+            }
+        }
+        failure.map_or(Ok(()), Err)
+    }
+
     pub(super) fn admit_token_sequence(
         &self,
         input: ExecutionAdmission<'_>,
@@ -173,10 +206,10 @@ impl PagedAttentionExecutor {
         handle.set_num_tokens(range.end());
         match work {
             TokenWork::Prefill(_) => {
-                self.prefill_count.fetch_add(1, Ordering::Relaxed);
+                self.counters.prefill.fetch_add(1, Ordering::Relaxed);
             }
             TokenWork::Decode { .. } => {
-                self.decode_count.fetch_add(1, Ordering::Relaxed);
+                self.counters.decode.fetch_add(1, Ordering::Relaxed);
             }
         }
         if matches!(work, TokenWork::Prefill(chunk) if !chunk.is_final()) {
@@ -554,6 +587,87 @@ mod tests {
                 "logit {index}: {actual} differs from dense f64 reference {expected}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn host_shutdown_paged_releases_only_original_handles_and_preserves_live_peer() {
+        use ferrum_execution::executor_lifecycle::{ExecutorOwner, ExecutorShutdownPhase};
+        use std::time::Duration;
+        let (first, manager) = fixture();
+        let peer = PagedAttentionExecutor::new(first.config.clone(), manager.clone());
+        let first_observation = first.observer();
+        let peer_observation = peer.observer();
+        let first_id = RequestId::new();
+        let peer_id = RequestId::new();
+        let TokenAdmissionOutcome::Admitted(first_frontier) = admit(&first, &first_id, 4).await
+        else {
+            panic!("first admission");
+        };
+        let TokenAdmissionOutcome::Admitted(peer_frontier) = admit(&peer, &peer_id, 4).await else {
+            panic!("peer admission");
+        };
+        let first_prefill = run(
+            &first,
+            &first_frontier,
+            TokenWork::Prefill(PrefillChunk::new(0, 3, 3).unwrap()),
+        )
+        .await;
+        assert_dense_oracle(logits(&first_prefill), &[3, 4, 5], &first.config);
+        let peer_prefill = run(
+            &peer,
+            &peer_frontier,
+            TokenWork::Prefill(PrefillChunk::new(0, 3, 3).unwrap()),
+        )
+        .await;
+        assert_dense_oracle(logits(&peer_prefill), &[3, 4, 5], &peer.config);
+        let peer_handle = manager.get_handle(peer_id.clone()).unwrap();
+        assert_eq!(manager.stats().active_caches, 2);
+        assert_eq!(manager.gpu_pool().stats().allocated_blocks, 4);
+
+        let owner = ExecutorOwner::new(Box::new(first));
+        let report = tokio::time::timeout(Duration::from_secs(5), owner.begin_shutdown().wait())
+            .await
+            .unwrap();
+        assert_eq!(report.phase(), ExecutorShutdownPhase::Retired);
+        report.result().unwrap();
+        assert!(first_frontier.sequence().observed_end().is_some());
+        assert!(peer_frontier.sequence().observed_end().is_none());
+        assert!(manager.get_handle(first_id).is_none());
+        assert!(Arc::ptr_eq(
+            &peer_handle,
+            &manager.get_handle(peer_id.clone()).unwrap()
+        ));
+        assert_eq!(manager.stats().active_caches, 1);
+        assert_eq!(manager.gpu_pool().stats().allocated_blocks, 2);
+        let peer_decode = run(
+            &peer,
+            peer_prefill.next_frontier(),
+            TokenWork::Decode {
+                token: TokenId::new(6),
+                position: 3,
+            },
+        )
+        .await;
+        assert_dense_oracle(logits(&peer_decode), &[3, 4, 5, 6], &peer.config);
+        let peer_owner = ExecutorOwner::new(Box::new(peer));
+        let report =
+            tokio::time::timeout(Duration::from_secs(5), peer_owner.begin_shutdown().wait())
+                .await
+                .unwrap();
+        assert_eq!(report.phase(), ExecutorShutdownPhase::Retired);
+        report.result().unwrap();
+        assert!(peer_frontier.sequence().observed_end().is_some());
+        assert_eq!(manager.stats().active_caches, 0);
+        assert_eq!(manager.gpu_pool().stats().allocated_blocks, 0);
+        drop(peer_handle);
+        drop(owner);
+        drop(peer_owner);
+        let original_manager = Arc::downgrade(&manager);
+        drop(manager);
+        assert!(original_manager.upgrade().is_none());
+        assert_eq!(first_observation.prefill_count(), 1);
+        assert_eq!(peer_observation.prefill_count(), 1);
+        assert_eq!(peer_observation.decode_count(), 1);
     }
 
     #[tokio::test]

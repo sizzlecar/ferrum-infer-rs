@@ -2,10 +2,12 @@
 //! observation only after the real output and per-layer KV have been checked.
 
 use super::*;
+use ferrum_execution::executor_lifecycle::{
+    ExecutorOwner, ExecutorScope, ExecutorShutdownObserver, ExecutorShutdownPermit,
+};
 use ferrum_kernels::backend::cpu::CpuBackend;
 use ferrum_models::models::LlamaFamilyModel;
 use ferrum_models::test_support::{tiny_llama_model, TinyTokenizer};
-use ferrum_models::LlmExecutor;
 use std::sync::atomic::AtomicUsize;
 
 struct ReferenceSequence {
@@ -26,9 +28,24 @@ struct ExecutionGate {
 }
 
 pub(super) struct NumericalExecutor {
-    inner: Arc<LlmExecutor>,
-    pub(super) observed: Arc<Mutex<closure::ModelObservation>>,
+    inner: Arc<ExecutorScope>,
+    owner: ExecutorOwner,
     reference: Mutex<ReferenceState>,
+    observation: Arc<NumericalObservation>,
+    drop_signal: ExecutorDropSignal,
+    layers: usize,
+}
+
+impl std::ops::Deref for NumericalExecutor {
+    type Target = NumericalObservation;
+    fn deref(&self) -> &Self::Target {
+        &self.observation
+    }
+}
+
+pub(super) struct NumericalObservation {
+    pub(super) observed: Arc<Mutex<closure::ModelObservation>>,
+    info: ferrum_types::ModelInfo,
     gate: Mutex<Option<ExecutionGate>>,
     next_prefill: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     in_flight: AtomicUsize,
@@ -39,12 +56,12 @@ pub(super) struct NumericalExecutor {
     pub(super) checked_outputs: AtomicUsize,
     output_notify: Notify,
     pub(super) dropped: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
-    layers: usize,
 }
 
-impl Drop for NumericalExecutor {
+struct ExecutorDropSignal(Arc<NumericalObservation>);
+impl Drop for ExecutorDropSignal {
     fn drop(&mut self) {
-        if let Some(sender) = self.dropped.get_mut().take() {
+        if let Some(sender) = self.0.dropped.lock().take() {
             let _ = sender.send(());
         }
     }
@@ -60,6 +77,39 @@ impl Drop for Flight<'_> {
 
 #[async_trait::async_trait]
 impl ModelExecutor for NumericalExecutor {
+    fn begin_shutdown(
+        self: Arc<Self>,
+        permit: &ExecutorShutdownPermit,
+    ) -> ExecutorShutdownObserver {
+        if let Err(error) = permit.check(self.as_ref()) {
+            return ExecutorShutdownObserver::retained(Arc::new(self), error);
+        }
+        // The numerical oracle is another real CPU model, owned only here.
+        let reference_close = self.reference.lock().model.close();
+        if let Err(error) = reference_close {
+            return ExecutorShutdownObserver::retained(Arc::new(self), error);
+        }
+        match Arc::try_unwrap(self) {
+            Ok(Self {
+                inner,
+                owner,
+                reference,
+                observation,
+                drop_signal,
+                layers: _,
+            }) => {
+                drop(inner);
+                drop(reference);
+                drop(observation);
+                drop(drop_signal);
+                owner.begin_shutdown()
+            }
+            Err(original) => ExecutorShutdownObserver::retained(
+                Arc::new(original),
+                FerrumError::internal("numerical fixture still has an unscoped execution owner"),
+            ),
+        }
+    }
     fn info(&self) -> &ferrum_types::ModelInfo {
         self.inner.info()
     }
@@ -207,7 +257,10 @@ impl ModelExecutor for NumericalExecutor {
     }
 }
 
-impl NumericalExecutor {
+impl NumericalObservation {
+    pub(super) fn info(&self) -> &ferrum_types::ModelInfo {
+        &self.info
+    }
     pub(super) fn remove_execution_gate(&self) {
         self.gate.lock().take();
     }
@@ -239,7 +292,9 @@ impl NumericalExecutor {
             changed.await;
         }
     }
+}
 
+impl NumericalExecutor {
     fn check_close(&self, sequence: &ExecutorSequence, result: &ExecutionCloseOutcome) {
         let ExecutionCloseDisposition::Ended(ended) = &result.disposition else {
             panic!("the actual synchronous CPU close must prove terminal");
@@ -264,8 +319,10 @@ impl NumericalExecutor {
 }
 
 pub(super) struct Fixture {
-    pub(super) engine: ContinuousBatchEngine,
-    pub(super) executor: Arc<NumericalExecutor>,
+    pub(super) engine: Arc<ContinuousBatchEngine>,
+    pub(super) original_inner: Weak<EngineInner>,
+    pub(super) output_budget: OutputBudget,
+    pub(super) executor: Arc<NumericalObservation>,
     pub(super) reached: tokio::sync::oneshot::Receiver<()>,
     pub(super) release: tokio::sync::oneshot::Sender<()>,
     pub(super) trace: tempfile::TempDir,
@@ -303,16 +360,14 @@ impl Fixture {
         tokenizer: impl FnOnce(usize) -> Arc<dyn Tokenizer>,
         scopes: impl FnOnce(&EngineConfig) -> Option<EngineJournalScopes>,
     ) -> Self {
-        let (inner, observed, cfg) = closure::observed_cpu_model();
+        let (inner, observed, cfg) = closure::observed_cpu_model_owned();
+        let owner = ExecutorOwner::new(inner);
+        let inner = Arc::new(owner.scope().unwrap());
         let (reached_tx, reached) = tokio::sync::oneshot::channel();
         let (release, release_rx) = tokio::sync::oneshot::channel();
-        let executor = Arc::new(NumericalExecutor {
-            inner,
+        let executor = Arc::new(NumericalObservation {
+            info: inner.info().clone(),
             observed,
-            reference: Mutex::new(ReferenceState {
-                model: tiny_llama_model(&cfg),
-                sequences: HashMap::new(),
-            }),
             gate: Mutex::new(Some(ExecutionGate {
                 reached: reached_tx,
                 release: release_rx,
@@ -326,8 +381,18 @@ impl Fixture {
             checked_outputs: AtomicUsize::new(0),
             output_notify: Notify::new(),
             dropped: Mutex::new(None),
-            layers: cfg.num_layers,
         });
+        let owned_executor = ExecutorOwner::new(Box::new(NumericalExecutor {
+            inner,
+            owner,
+            reference: Mutex::new(ReferenceState {
+                model: tiny_llama_model(&cfg),
+                sequences: HashMap::new(),
+            }),
+            observation: Arc::clone(&executor),
+            drop_signal: ExecutorDropSignal(Arc::clone(&executor)),
+            layers: cfg.num_layers,
+        }));
         let trace = tempfile::tempdir().unwrap();
         let mut config = EngineConfig::default();
         config.backend.device = Device::CPU;
@@ -340,14 +405,18 @@ impl Fixture {
             tokenizer(cfg.vocab_size),
             Arc::new(crate::registry::GreedySampler),
             Arc::new(MockKvCacheManager::new(128)),
-            executor.clone(),
+            owned_executor,
             Arc::new(crate::tensor_factory::CandleTensorFactory::new(Device::CPU)),
             None,
             journal_scopes,
         )
         .unwrap();
+        let original_inner = Arc::downgrade(&engine.active_inner().unwrap());
+        let output_budget = engine.active_inner().unwrap().output_budget.clone();
         Self {
-            engine,
+            engine: Arc::new(engine),
+            original_inner,
+            output_budget,
             executor,
             reached,
             release,
@@ -373,7 +442,8 @@ pub(super) fn slot_events(
     action: ResourceAction,
 ) -> usize {
     engine
-        .inner
+        .active_inner()
+        .unwrap()
         .scheduler_trace_jsonl
         .as_ref()
         .unwrap()

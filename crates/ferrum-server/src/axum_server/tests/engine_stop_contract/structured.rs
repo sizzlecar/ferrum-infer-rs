@@ -44,7 +44,7 @@ async fn generate(protocol: ModelOutputProtocol, stream: bool, constrained: bool
     steps.push(LogitStep::only(token(CLOSE)));
     steps.push(LogitStep::only(token(terminal)));
     let max_tokens = steps.len() + 4;
-    let executor = Arc::new(ScriptedExecutor::from_steps(tokenizer.vocab_size(), steps));
+    let executor = ScriptedExecutor::from_steps(tokenizer.vocab_size(), steps);
     let format = if constrained {
         json!({
             "type": "json_schema",

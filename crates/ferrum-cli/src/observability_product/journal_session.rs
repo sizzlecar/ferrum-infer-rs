@@ -399,25 +399,153 @@ impl ProductJournalSession {
 /// The command's original engine and journals survive cancellation of a
 /// shutdown observer. No path lookup or second finalizer is used on an error.
 pub struct ProductEngineLifetime {
-    engine: Arc<dyn ferrum_engine::LlmInferenceEngine + Send + Sync>,
+    engine: Arc<ProductEngineHandle>,
     journals: Arc<ProductJournalSession>,
-    shutdown: tokio::sync::Mutex<EngineShutdown>,
+    finalization: tokio::sync::Mutex<EngineShutdown>,
     finished: std::sync::atomic::AtomicBool,
 }
 enum EngineShutdown {
     Idle,
     Running(tokio::task::JoinHandle<Result<()>>),
     Finished(Result<()>),
+    Unproved,
 }
+
+/// All product consumers share this one original shutdown and terminal wait.
+/// The handle delegates execution, but never exposes the unwrapped engine.
+struct ProductEngineHandle {
+    engine: Arc<dyn ferrum_engine::LlmInferenceEngine + Send + Sync>,
+    shutdown: tokio::sync::Mutex<EngineShutdown>,
+    completion: tokio::sync::Mutex<EngineShutdown>,
+}
+
+impl ProductEngineHandle {
+    async fn shutdown_once(&self) -> Result<()> {
+        let mut state = self.shutdown.lock().await;
+        if matches!(*state, EngineShutdown::Idle) {
+            let engine = Arc::clone(&self.engine);
+            *state = EngineShutdown::Running(tokio::spawn(async move { engine.shutdown().await }));
+        }
+        observe_engine_task(&mut state, "shutdown", false).await
+    }
+
+    async fn wait_for_original_completion(&self) -> Result<()> {
+        // A first retained result does not prove retirement. Preserve that
+        // result in shutdown, and observe the same original cleanup separately.
+        let _ = self.shutdown_once().await;
+        let mut state = self.completion.lock().await;
+        if matches!(*state, EngineShutdown::Idle) {
+            let engine = Arc::clone(&self.engine);
+            *state = EngineShutdown::Running(tokio::spawn(async move {
+                engine.wait_for_shutdown_completion().await
+            }));
+        }
+        observe_engine_task(&mut state, "completion observation", true).await
+    }
+}
+
+async fn observe_engine_task(
+    state: &mut EngineShutdown,
+    operation: &str,
+    terminal_proof_required: bool,
+) -> Result<()> {
+    if let EngineShutdown::Running(task) = state {
+        *state = match task.await {
+            Ok(result) => EngineShutdown::Finished(result),
+            Err(error) if terminal_proof_required => {
+                // A panicked observer did not return the required retirement
+                // proof. Keep the original engine and journals in the calling
+                // finalization task; never close the writer from this failure.
+                tracing::error!(%error, "original engine completion observation lost; cleanup remains unproved");
+                EngineShutdown::Unproved
+            }
+            Err(error) => EngineShutdown::Finished(Err(FerrumError::internal(format!(
+                "product engine {operation} task failed: {error}"
+            )))),
+        };
+    }
+    match state {
+        EngineShutdown::Finished(result) => result.clone(),
+        EngineShutdown::Unproved => std::future::pending().await,
+        _ => unreachable!("joined original engine lifecycle task"),
+    }
+}
+
+#[async_trait::async_trait]
+impl ferrum_interfaces::InferenceEngine for ProductEngineHandle {
+    async fn status(&self) -> ferrum_types::EngineStatus {
+        self.engine.status().await
+    }
+    async fn shutdown(&self) -> Result<()> {
+        self.shutdown_once().await
+    }
+    async fn wait_for_shutdown_completion(&self) -> Result<()> {
+        self.wait_for_original_completion().await
+    }
+    fn config(&self) -> &ferrum_types::EngineConfig {
+        self.engine.config()
+    }
+    fn metrics(&self) -> ferrum_types::EngineMetrics {
+        self.engine.metrics()
+    }
+    async fn health_check(&self) -> ferrum_types::HealthStatus {
+        self.engine.health_check().await
+    }
+    fn cache_metrics_snapshot(&self) -> Option<Value> {
+        self.engine.cache_metrics_snapshot()
+    }
+    fn execution_attribution_snapshot(&self) -> Option<Value> {
+        self.engine.execution_attribution_snapshot()
+    }
+    fn scheduler_slo_snapshot(&self) -> Option<Value> {
+        self.engine.scheduler_slo_snapshot()
+    }
+    fn admission_snapshot(&self) -> Result<Option<ferrum_types::ExecutorAdmissionSnapshot>> {
+        self.engine.admission_snapshot()
+    }
+    fn lora_metrics_snapshot(&self) -> Option<Value> {
+        self.engine.lora_metrics_snapshot()
+    }
+}
+
+#[async_trait::async_trait]
+impl ferrum_interfaces::engine::LlmInferenceEngine for ProductEngineHandle {
+    fn adapter_execution_support(&self) -> ferrum_interfaces::adapter::AdapterExecutionSupport {
+        self.engine.adapter_execution_support()
+    }
+    fn execution_resource_authority(&self) -> ferrum_types::ExecutionResourceAuthority {
+        self.engine.execution_resource_authority()
+    }
+    fn context_capacity(&self) -> Option<usize> {
+        self.engine.context_capacity()
+    }
+    async fn infer(
+        &self,
+        request: ferrum_types::InferenceRequest,
+    ) -> Result<ferrum_output::InferenceOutput> {
+        self.engine.infer(request).await
+    }
+    async fn infer_stream(
+        &self,
+        request: ferrum_types::InferenceRequest,
+    ) -> Result<ferrum_output::InferenceStream> {
+        self.engine.infer_stream(request).await
+    }
+}
+
 impl ProductEngineLifetime {
     pub fn new(
         engine: Box<dyn ferrum_engine::LlmInferenceEngine + Send + Sync>,
         journals: Arc<ProductJournalSession>,
     ) -> Self {
         Self {
-            engine: Arc::from(engine),
+            engine: Arc::new(ProductEngineHandle {
+                engine: Arc::from(engine),
+                shutdown: tokio::sync::Mutex::new(EngineShutdown::Idle),
+                completion: tokio::sync::Mutex::new(EngineShutdown::Idle),
+            }),
             journals,
-            shutdown: tokio::sync::Mutex::new(EngineShutdown::Idle),
+            finalization: tokio::sync::Mutex::new(EngineShutdown::Idle),
             finished: std::sync::atomic::AtomicBool::new(false),
         }
     }
@@ -425,38 +553,65 @@ impl ProductEngineLifetime {
         self.engine.clone()
     }
     pub async fn shutdown(&self) -> Result<()> {
-        let mut state = self.shutdown.lock().await;
-        if matches!(*state, EngineShutdown::Idle) {
-            let engine = self.engine.clone();
-            *state = EngineShutdown::Running(tokio::spawn(async move { engine.shutdown().await }));
-        }
-        if let EngineShutdown::Running(task) = &mut *state {
-            let result = task.await.unwrap_or_else(|error| {
-                Err(FerrumError::internal(format!(
-                    "product engine shutdown task failed: {error}"
-                )))
-            });
-            *state = EngineShutdown::Finished(result);
-        }
-        match &*state {
-            EngineShutdown::Finished(result) => result.clone(),
-            _ => unreachable!("joined engine shutdown"),
-        }
+        self.engine.shutdown_once().await
     }
     pub async fn finish(&self) -> Result<()> {
-        let engine = self.shutdown().await;
-        let journals = self.journals.finish().await;
-        self.finished.store(
-            self.journals.is_closed(),
-            std::sync::atomic::Ordering::Release,
-        );
-        if engine.is_err() {
-            if let Err(error) = &journals {
-                tracing::warn!(%error, "product journal cleanup failed after engine shutdown error");
-            }
+        let first_result = self.shutdown().await;
+        let mut finalization = self.finalization.lock().await;
+        if matches!(*finalization, EngineShutdown::Idle) {
+            let engine = Arc::clone(&self.engine);
+            let journals = Arc::clone(&self.journals);
+            // This is observation of the original Engine cleanup, not another
+            // shutdown invocation. The registered task keeps both authorities
+            // alive if its caller stops waiting while resources are Retained.
+            *finalization = EngineShutdown::Running(tokio::spawn(async move {
+                finish_original_cleanup(engine, journals, first_result).await
+            }));
         }
-        engine.and(journals)
+        if let EngineShutdown::Running(task) = &mut *finalization {
+            let result = task.await.unwrap_or_else(|error| {
+                Err(FerrumError::internal(format!(
+                    "product final cleanup observation failed: {error}"
+                )))
+            });
+            *finalization = EngineShutdown::Finished(result);
+        }
+        let result = match &*finalization {
+            EngineShutdown::Finished(result) => result.clone(),
+            _ => unreachable!("joined product finalization"),
+        };
+        let closed = self.journals.is_closed();
+        self.finished
+            .store(closed, std::sync::atomic::Ordering::Release);
+        if !closed {
+            // A genuine external producer refusal remains retryable through
+            // this same authority. Never reopen a path to manufacture success.
+            *finalization = EngineShutdown::Idle;
+        }
+        result
     }
+}
+
+async fn finish_original_cleanup(
+    engine: Arc<ProductEngineHandle>,
+    journals: Arc<ProductJournalSession>,
+    first_result: Result<()>,
+) -> Result<()> {
+    // Return, including Err, proves the original Engine and its producer
+    // scopes actually settled. A retained owner keeps this wait pending.
+    let settled = engine.wait_for_original_completion().await;
+    let journal_result = journals.finish().await;
+    if let Err(error) = &settled {
+        if first_result.is_err() {
+            tracing::warn!(%error, "original engine cleanup settled with an additional error");
+        }
+    }
+    if let Err(error) = &journal_result {
+        if first_result.is_err() || settled.is_err() {
+            tracing::warn!(%error, "product journal cleanup failed after engine shutdown error");
+        }
+    }
+    first_result.and(settled).and(journal_result)
 }
 impl std::ops::Deref for ProductEngineLifetime {
     type Target = dyn ferrum_engine::LlmInferenceEngine + Send + Sync;
@@ -469,24 +624,23 @@ impl Drop for ProductEngineLifetime {
         if self.finished.load(std::sync::atomic::Ordering::Acquire) {
             return;
         }
-        let state = std::mem::replace(self.shutdown.get_mut(), EngineShutdown::Idle);
+        let finalization = std::mem::replace(self.finalization.get_mut(), EngineShutdown::Idle);
         let engine = self.engine.clone();
         let journals = self.journals.clone();
         // Cold command cancellation only. An existing shutdown job is joined,
         // never replaced by a second invocation.
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
             runtime.spawn(async move {
-                let result = match state {
-                    EngineShutdown::Idle => engine.shutdown().await,
-                    EngineShutdown::Running(task) => task
-                        .await
-                        .unwrap_or_else(|e| Err(FerrumError::internal(e.to_string()))),
-                    EngineShutdown::Finished(result) => result,
-                };
-                if let Err(error) = result {
-                    tracing::warn!(%error, "cancelled product command engine cleanup failed");
+                if let EngineShutdown::Running(task) = finalization {
+                    match task.await {
+                        Ok(Err(error)) => tracing::warn!(%error, "cancelled product final cleanup reported an error"),
+                        Err(error) => tracing::warn!(%error, "cancelled product final cleanup observation failed"),
+                        Ok(Ok(())) => {},
+                    }
+                    return;
                 }
-                if let Err(error) = journals.finish().await {
+                let result = engine.shutdown_once().await;
+                if let Err(error) = finish_original_cleanup(engine, journals, result).await {
                     tracing::warn!(%error, "cancelled product command journal cleanup incomplete");
                 }
             });

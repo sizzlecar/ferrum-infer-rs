@@ -16,6 +16,9 @@ struct DriverTask {
     // A task-level panic must not discard the last product owner before its
     // JoinError is observed. EngineInner has only a Weak control reference.
     custody: Mutex<Option<Arc<EngineInner>>>,
+    journal_custody: Mutex<Option<Arc<Mutex<EngineJournals>>>>,
+    executor_shutdown: Mutex<Option<ExecutorShutdownObserver>>,
+    journal_policy: ferrum_runtime::ExecutionEventDeliveryPolicy,
 }
 
 enum JoinOwner {
@@ -41,8 +44,10 @@ pub struct DriverExitReport {
     telemetry_degradations: Vec<FerrumError>,
     journal_deliveries: Vec<DriverJournalDelivery>,
     optional_observation_failures: u64,
-    retained: Option<Arc<EngineInner>>,
+    retained: Option<Arc<RetainedInnerCleanup>>,
     cleanup_unproved: bool,
+    executor_shutdown: Option<ExecutorShutdownObserver>,
+    retained_journals: Option<Arc<Mutex<EngineJournals>>>,
 }
 
 /// Final facts from the original ordered journal, including earlier dropped records.
@@ -81,14 +86,58 @@ impl DriverExitReport {
         self.optional_observation_failures
     }
 
+    pub async fn wait_for_shutdown_completion(&self) -> Result<()> {
+        // No later observation can erase an unwind or an unreclaimed request
+        // owner. Do not turn its diagnostic error into permission to close the
+        // product's final journal owner.
+        let retained_result = if let Some(cleanup) = &self.retained {
+            cleanup.wait().await
+        } else if self.cleanup_unproved {
+            return std::future::pending().await;
+        } else {
+            Ok(())
+        };
+        if self
+            .retained_journals
+            .as_ref()
+            .is_some_and(|journals| journals.lock().has_unfinished_custody())
+        {
+            return std::future::pending().await;
+        }
+        self.result().and(retained_result)
+    }
+
+    #[cfg(test)]
+    pub(super) fn cleanup_completion(&self) -> tokio::sync::watch::Receiver<bool> {
+        self.retained
+            .as_ref()
+            .expect("retained cleanup service")
+            .completed
+            .subscribe()
+    }
+
+    pub fn executor_shutdown(&self) -> Option<&ExecutorShutdownObserver> {
+        self.executor_shutdown.as_ref()
+    }
+
+    /// Reobserve the same retained cleanup after its original owner publishes
+    /// new evidence; this never issues another physical request close.
+    pub fn retry_shutdown(&self) {
+        if let Some(cleanup) = &self.retained {
+            cleanup.retry.notify_one();
+        }
+    }
+
     pub fn retains_unproved_owners(&self) -> bool {
-        self.retained.as_ref().is_some_and(|inner| {
-            self.cleanup_unproved
-                || !inner.sequences.is_empty()
-                || inner.execution_closes.unreclaimed_count() != 0
-                || inner.execution_readiness_waiters.pending_count() != 0
-                || inner.journal_scopes.lock().has_unfinished_custody()
-        })
+        (self.cleanup_unproved && self.retained.is_none())
+            || self
+                .retained_journals
+                .as_ref()
+                .is_some_and(|journals| journals.lock().has_unfinished_custody())
+            || self
+                .retained
+                .as_ref()
+                .is_some_and(|cleanup| !*cleanup.completed.borrow())
     }
 }
 
@@ -122,14 +171,22 @@ impl DriverObserver {
                 errors: vec![FerrumError::internal(format!(
                     "managed engine task failed: {error}"
                 ))],
-                retained: self.task.custody.lock().take(),
+                retained: self
+                    .task
+                    .custody
+                    .lock()
+                    .take()
+                    .map(|inner| RetainedInnerCleanup::start(inner, None)),
                 telemetry_degradations: Vec::new(),
                 journal_deliveries: Vec::new(),
                 optional_observation_failures: 0,
                 cleanup_unproved: true,
+                executor_shutdown: None,
+                retained_journals: self.task.journal_custody.lock().take(),
             }),
         };
         self.task.custody.lock().take();
+        self.task.journal_custody.lock().take();
         *join = JoinOwner::Joined(Arc::clone(&report));
         report
     }
@@ -137,6 +194,11 @@ impl DriverObserver {
 
 #[derive(Default)]
 pub(super) struct ManagedDriver {
+    pub(super) active: Mutex<Option<Arc<EngineInner>>>,
+    pub(super) final_owner: Mutex<Option<ExecutorOwner>>,
+    pub(super) final_memory: Mutex<Option<ferrum_types::MemoryUsage>>,
+    pub(super) final_performance: Mutex<ferrum_types::PerformanceBreakdown>,
+    pub(super) final_prefix_hits: AtomicU64,
     state: Mutex<DriverState>,
     // Read-only, monotonic mirror: recompute queries this while holding
     // sequences, whereas publication holds gate -> sequences. Taking the
@@ -150,6 +212,22 @@ pub(super) struct ManagedDriver {
 }
 
 impl ManagedDriver {
+    pub(super) fn shutdown_active(self: &Arc<Self>) -> Result<DriverObserver> {
+        let active = self.active.lock().clone();
+        if let Some(inner) = active {
+            return self.shutdown(&inner);
+        }
+        let state = self.state.lock();
+        match &*state {
+            DriverState::Running(task)
+            | DriverState::Closing(task)
+            | DriverState::Finished(task) => Ok(DriverObserver {
+                task: Arc::clone(task),
+            }),
+            DriverState::Idle => Err(Self::admission_closed()),
+        }
+    }
+
     fn spawn_locked(
         self: &Arc<Self>,
         inner: &Arc<EngineInner>,
@@ -163,10 +241,23 @@ impl ManagedDriver {
         })?;
         let driver = Arc::clone(self);
         let task_inner = Arc::clone(inner);
-        let handle = runtime.spawn(async move { driver.run(task_inner, run_iterations).await });
+        let handle = runtime.spawn(async move {
+            match std::panic::AssertUnwindSafe(Arc::clone(&driver).run(task_inner, run_iterations))
+                .catch_unwind()
+                .await
+            {
+                Ok(report) => report,
+                Err(_) => driver.retain_failed_task(FerrumError::internal(
+                    "managed engine task panicked outside cleanup",
+                )),
+            }
+        });
         let task = Arc::new(DriverTask {
             join: tokio::sync::Mutex::new(JoinOwner::Task(handle)),
             custody: Mutex::new(Some(Arc::clone(inner))),
+            journal_custody: Mutex::new(Some(Arc::clone(&inner.journal_scopes))),
+            executor_shutdown: Mutex::new(None),
+            journal_policy: observation_delivery_policy(inner.config.runtime.profile_detail),
         });
         if !run_iterations {
             self.closing.store(true, Ordering::Release);
@@ -250,6 +341,9 @@ impl ManagedDriver {
     }
 
     fn mark_closing(&self) {
+        // New callers can no longer acquire an execution borrow. Existing
+        // callers and the driver retain their original Inner until they exit.
+        self.active.lock().take();
         let mut state = self.state.lock();
         self.closing.store(true, Ordering::Release);
         if let DriverState::Running(task) = &*state {
@@ -300,20 +394,90 @@ impl ManagedDriver {
                     (ShutdownCleanupReport::default(), true)
                 }
             };
-        errors.extend(cleanup.errors);
+        let mut cleanup = cleanup;
         let has_owners = !inner.sequences.is_empty()
             || inner.execution_closes.unreclaimed_count() != 0
-            || inner.execution_readiness_waiters.pending_count() != 0
-            || inner.journal_scopes.lock().has_unfinished_custody();
+            || inner.execution_readiness_waiters.pending_count() != 0;
+        *self.final_memory.lock() = Some(inner.memory_snapshot().0);
+        *self.final_performance.lock() = inner.performance_breakdown();
+        self.final_prefix_hits.store(
+            inner.prefix_cache_hits.load(Ordering::Relaxed),
+            Ordering::Relaxed,
+        );
+        let journals = Arc::clone(&inner.journal_scopes);
+        let policy = observation_delivery_policy(inner.config.runtime.profile_detail);
+        let mut retained = None;
+        let mut executor_shutdown = None;
+        if cleanup_unproved || has_owners {
+            // Transfer the task fallback before starting recovery: neither a
+            // report nor the completed task may keep an extra execution scope.
+            if let DriverState::Closing(task) | DriverState::Running(task) = &*self.state.lock() {
+                task.custody.lock().take();
+            }
+            retained = Some(RetainedInnerCleanup::start(
+                inner,
+                self.final_owner.lock().take(),
+            ));
+        } else {
+            // The task's panic fallback is another real execution borrow.
+            // Release it before waiting for the assembly's final close.
+            if let DriverState::Closing(task) | DriverState::Running(task) = &*self.state.lock() {
+                task.custody.lock().take();
+            }
+            drop(inner);
+            let owner = self.final_owner.lock().take();
+            if let Some(owner) = owner {
+                let observer = owner.begin_shutdown();
+                if let DriverState::Closing(task) | DriverState::Running(task) = &*self.state.lock()
+                {
+                    *task.executor_shutdown.lock() = Some(observer.clone());
+                }
+                let close = observer.wait().await;
+                if let Err(error) = close.result() {
+                    cleanup.errors.push(error);
+                }
+                executor_shutdown = Some(observer.clone());
+                if close.phase() != ExecutorShutdownPhase::Retired {
+                    retained = Some(RetainedInnerCleanup::start_journals(
+                        Arc::clone(&journals),
+                        policy,
+                        Some(owner),
+                        Some(observer),
+                    ));
+                    cleanup.journal_deliveries = journals.lock().pending_deliveries();
+                } else {
+                    finish_journals(&journals, policy, &mut cleanup).await;
+                }
+            } else {
+                // A shared Engine finishes only its own producer scope. Its
+                // external executor owner decides when all peer scopes end.
+                finish_journals(&journals, policy, &mut cleanup).await;
+            }
+        }
+        let retained_journals = journals
+            .lock()
+            .has_unfinished_custody()
+            .then(|| Arc::clone(&journals));
+        if retained.is_none() && retained_journals.is_some() {
+            // Model and request retirement are already proved; an unproved
+            // journal close still needs its own durable, retryable custody.
+            retained = Some(RetainedInnerCleanup::start_journals(
+                Arc::clone(&journals),
+                policy,
+                None,
+                None,
+            ));
+        }
+        errors.extend(cleanup.errors);
         let report = Arc::new(DriverExitReport {
-            // An evidence error does not mean GPU work is still live. A panic
-            // during cleanup, however, cannot be cleared by empty counters.
-            retained: (cleanup_unproved || has_owners).then(|| Arc::clone(&inner)),
+            retained,
             errors,
             telemetry_degradations: cleanup.telemetry_degradations,
             journal_deliveries: cleanup.journal_deliveries,
             optional_observation_failures: cleanup.optional_observation_failures,
             cleanup_unproved,
+            executor_shutdown,
+            retained_journals,
         });
         self.mark_finished();
         exit.armed = false;
@@ -323,7 +487,52 @@ impl ManagedDriver {
         // No await follows this transfer.
         if let DriverState::Finished(task) = &*self.state.lock() {
             task.custody.lock().take();
+            task.journal_custody.lock().take();
+            task.executor_shutdown.lock().take();
         }
+        report
+    }
+
+    fn retain_failed_task(&self, error: FerrumError) -> Arc<DriverExitReport> {
+        self.mark_closing();
+        let (inner, journals, executor_shutdown, policy) = match &*self.state.lock() {
+            DriverState::Running(task)
+            | DriverState::Closing(task)
+            | DriverState::Finished(task) => (
+                task.custody.lock().take(),
+                task.journal_custody.lock().take(),
+                task.executor_shutdown.lock().take(),
+                Some(task.journal_policy),
+            ),
+            DriverState::Idle => (None, None, None, None),
+        };
+        let owner = self.final_owner.lock().take();
+        let retained = if let Some(inner) = inner {
+            Some(RetainedInnerCleanup::start(inner, owner))
+        } else if let (Some(journals), Some(policy)) = (&journals, policy) {
+            Some(RetainedInnerCleanup::start_journals(
+                Arc::clone(journals),
+                policy,
+                owner,
+                executor_shutdown.clone(),
+            ))
+        } else {
+            None
+        };
+        let report = Arc::new(DriverExitReport {
+            errors: vec![error],
+            telemetry_degradations: Vec::new(),
+            journal_deliveries: journals
+                .as_ref()
+                .map(|journals| journals.lock().pending_deliveries())
+                .unwrap_or_default(),
+            optional_observation_failures: 0,
+            retained,
+            cleanup_unproved: true,
+            executor_shutdown,
+            retained_journals: journals,
+        });
+        self.mark_finished();
         report
     }
 
@@ -433,37 +642,172 @@ impl EngineInner {
             report.journal_deliveries = self.journal_scopes.lock().pending_deliveries();
             return report;
         }
-        let policy = observation_delivery_policy(self.config.runtime.profile_detail);
-        if !self.journal_scopes.lock().is_empty() {
-            let journals = Arc::clone(&self.journal_scopes);
-            match tokio::task::spawn_blocking(move || journals.lock().finish()).await {
-                Ok(results) => {
-                    for (delivery, error) in results {
-                        report.journal_deliveries.push(delivery);
-                        if let Some(error) = error {
-                            let failure = FerrumError::internal(format!(
-                                "execution observation close failed: {error}"
-                            ));
-                            if error.is_optional_transport(policy) {
-                                // One managed close and one result per deduplicated
-                                // destination: visible even to callers reading only result().
-                                warn!(error = %error, "optional execution journal scope finished with incomplete telemetry");
-                                report.telemetry_degradations.push(failure);
-                            } else {
-                                report.errors.push(failure);
-                            }
-                        }
+        report
+    }
+}
+
+/// The service owns the original Inner independently of all public reports.
+/// Its observation contains no execution scope, so a report cannot block final
+/// whole-model retirement once the original request obligations are consumed.
+struct RetainedInnerCleanup {
+    completed: tokio::sync::watch::Sender<bool>,
+    retry: Arc<Notify>,
+    error: Mutex<Option<FerrumError>>,
+}
+
+impl RetainedInnerCleanup {
+    fn start(inner: Arc<EngineInner>, owner: Option<ExecutorOwner>) -> Arc<Self> {
+        let (completed, _) = tokio::sync::watch::channel(false);
+        let cleanup = Arc::new(Self {
+            completed,
+            retry: Arc::clone(&inner.work_notify),
+            error: Mutex::new(None),
+        });
+        let service = Arc::clone(&cleanup);
+        tokio::spawn(async move {
+            loop {
+                // Enable before checking the original state; a terminal
+                // publication between the check and await preserves its wake.
+                let notified = inner.work_notify.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+                let result = std::panic::AssertUnwindSafe(inner.shutdown_cleanup())
+                    .catch_unwind()
+                    .await;
+                if let Ok(report) = result {
+                    if let Some(error) = report.errors.into_iter().next() {
+                        service.error.lock().get_or_insert(error);
                     }
+                    if inner.sequences.is_empty()
+                        && inner.execution_closes.unreclaimed_count() == 0
+                        && inner.execution_readiness_waiters.pending_count() == 0
+                    {
+                        break;
+                    }
+                } else {
+                    service.error.lock().get_or_insert_with(|| {
+                        FerrumError::internal("retained engine cleanup panicked")
+                    });
                 }
-                Err(error) => {
-                    let failure = FerrumError::internal(format!(
-                        "execution journal close task failed: {error}"
-                    ));
-                    // A task unwind is an unknown internal failure, not I/O.
-                    report.errors.push(failure);
+                notified.await;
+            }
+            let journals = Arc::clone(&inner.journal_scopes);
+            let policy = observation_delivery_policy(inner.config.runtime.profile_detail);
+            drop(inner);
+            service.finish(journals, policy, owner, None).await;
+        });
+        cleanup
+    }
+
+    fn start_journals(
+        journals: Arc<Mutex<EngineJournals>>,
+        policy: ferrum_runtime::ExecutionEventDeliveryPolicy,
+        owner: Option<ExecutorOwner>,
+        observer: Option<ExecutorShutdownObserver>,
+    ) -> Arc<Self> {
+        let (completed, _) = tokio::sync::watch::channel(false);
+        let cleanup = Arc::new(Self {
+            completed,
+            retry: Arc::new(Notify::new()),
+            error: Mutex::new(None),
+        });
+        let service = Arc::clone(&cleanup);
+        tokio::spawn(async move {
+            service.finish(journals, policy, owner, observer).await;
+        });
+        cleanup
+    }
+
+    async fn finish(
+        &self,
+        journals: Arc<Mutex<EngineJournals>>,
+        policy: ferrum_runtime::ExecutionEventDeliveryPolicy,
+        owner: Option<ExecutorOwner>,
+        observer: Option<ExecutorShutdownObserver>,
+    ) {
+        let observer = observer.or_else(|| owner.as_ref().map(ExecutorOwner::begin_shutdown));
+        if let Some(mut observer) = observer {
+            loop {
+                let notified = self.retry.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+                let report = observer.snapshot();
+                if let Some(error) = report.error() {
+                    self.error.lock().get_or_insert_with(|| error.clone());
+                }
+                if report.phase() == ExecutorShutdownPhase::Retired {
+                    break;
+                }
+                tokio::select! {
+                    _ = observer.changed() => {},
+                    _ = notified => observer.retry(),
                 }
             }
         }
-        report
+        drop(owner);
+        loop {
+            let notified = self.retry.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            let mut report = ShutdownCleanupReport::default();
+            finish_journals(&journals, policy, &mut report).await;
+            if let Some(error) = report.errors.into_iter().next() {
+                self.error.lock().get_or_insert(error);
+            }
+            if !journals.lock().has_unfinished_custody() {
+                break;
+            }
+            notified.await;
+        }
+        self.completed.send_replace(true);
+    }
+
+    async fn wait(&self) -> Result<()> {
+        let mut completed = self.completed.subscribe();
+        loop {
+            if *completed.borrow_and_update() {
+                break;
+            }
+            if completed.changed().await.is_err() {
+                return std::future::pending().await;
+            }
+        }
+        self.error.lock().clone().map_or(Ok(()), Err)
+    }
+}
+
+async fn finish_journals(
+    journals: &Arc<Mutex<EngineJournals>>,
+    policy: ferrum_runtime::ExecutionEventDeliveryPolicy,
+    report: &mut ShutdownCleanupReport,
+) {
+    if !journals.lock().is_empty() {
+        let journals = Arc::clone(journals);
+        match tokio::task::spawn_blocking(move || journals.lock().finish()).await {
+            Ok(results) => {
+                for (delivery, error) in results {
+                    report.journal_deliveries.push(delivery);
+                    if let Some(error) = error {
+                        let failure = FerrumError::internal(format!(
+                            "execution observation close failed: {error}"
+                        ));
+                        if error.is_optional_transport(policy) {
+                            // One managed close and one result per deduplicated
+                            // destination: visible even to callers reading only result().
+                            warn!(error = %error, "optional execution journal scope finished with incomplete telemetry");
+                            report.telemetry_degradations.push(failure);
+                        } else {
+                            report.errors.push(failure);
+                        }
+                    }
+                }
+            }
+            Err(error) => {
+                let failure =
+                    FerrumError::internal(format!("execution journal close task failed: {error}"));
+                // A task unwind is an unknown internal failure, not I/O.
+                report.errors.push(failure);
+            }
+        }
     }
 }

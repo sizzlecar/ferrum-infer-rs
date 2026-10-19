@@ -1,4 +1,5 @@
 use super::*;
+use ferrum_execution::executor_lifecycle::ExecutorOwner;
 use ferrum_execution::token_execution::{
     ExecutionAdmission, ExecutionBatchOutcome, ExecutionCloseOutcome, ExecutionEndReason,
     ExecutionFrontier, ExecutionWork, ExecutorSequence, TokenAdmissionOutcome,
@@ -26,6 +27,84 @@ use std::time::Duration;
 #[path = "controlled_token_fixture.rs"]
 mod controlled_token_fixture;
 use controlled_token_fixture::ControlledTokenState;
+
+struct ControlledTokenObservation(std::sync::Weak<ControlledTokenState>);
+
+impl ControlledTokenObservation {
+    fn frontier_for_request(&self, request: &RequestId) -> Option<ExecutionFrontier> {
+        self.0.upgrade()?.frontier_for_request(request)
+    }
+}
+
+trait ObservedTestExecutor: ModelExecutor {
+    type Observation;
+    fn observer(&self) -> Arc<Self::Observation>;
+    fn retire_fixture(&mut self) -> Result<()>;
+}
+
+fn begin_controlled_shutdown<E: ObservedTestExecutor>(
+    executor: Arc<E>,
+    permit: &ferrum_execution::executor_lifecycle::ExecutorShutdownPermit,
+) -> ferrum_execution::executor_lifecycle::ExecutorShutdownObserver {
+    use ferrum_execution::executor_lifecycle::{
+        ExecutorShutdownObserver, ExecutorShutdownReporter,
+    };
+    if let Err(error) = permit.check(executor.as_ref()) {
+        return ExecutorShutdownObserver::retained(Arc::new(executor), error);
+    }
+    let executor = match Arc::try_unwrap(executor) {
+        Ok(executor) => executor,
+        Err(original) => {
+            return ExecutorShutdownObserver::retained(
+                Arc::new(original),
+                FerrumError::internal(
+                    "controlled fixture still has an unscoped execution reference",
+                ),
+            )
+        }
+    };
+    enum Original<E> {
+        Live(E),
+        Dropping,
+        Retired,
+    }
+    fn advance<E: ObservedTestExecutor>(
+        original: &Mutex<Original<E>>,
+        reporter: &ExecutorShutdownReporter,
+    ) {
+        let mut original = original.lock();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<()> {
+            match &mut *original {
+                Original::Live(executor) => executor.retire_fixture()?,
+                Original::Dropping => {
+                    return Err(FerrumError::internal(
+                        "controlled fixture destruction unwound without a retirement receipt",
+                    ))
+                }
+                Original::Retired => return Ok(()),
+            }
+            drop(std::mem::replace(&mut *original, Original::Dropping));
+            *original = Original::Retired;
+            Ok(())
+        }));
+        match result {
+            Ok(Ok(())) => reporter.retired(None),
+            Ok(Err(error)) => reporter.retained(error),
+            Err(_) => reporter.retained(FerrumError::internal("controlled fixture close panicked")),
+        }
+    }
+    let original = Arc::new(Mutex::new(Original::Live(executor)));
+    let (reporter, observer) = ExecutorShutdownObserver::channel(original.clone());
+    let weak = Arc::downgrade(&original);
+    let retry_reporter = reporter.clone();
+    let observer = observer.with_retry(Arc::new(move || {
+        if let Some(original) = weak.upgrade() {
+            advance(&original, &retry_reporter);
+        }
+    }));
+    advance(&original, &reporter);
+    observer
+}
 
 #[path = "adapter_admission_tests.rs"]
 mod adapter_admission_tests;
@@ -82,11 +161,16 @@ fn test_execution_capacity_deferral(
 struct PlanRuntimeAdmissionTestExecutor {
     tokens: Arc<ControlledTokenState>,
     inner: MockModelExecutor,
+    maintenance_gated: bool,
+    observation: Arc<PlanRuntimeAdmissionObservation>,
+}
+
+struct PlanRuntimeAdmissionObservation {
+    tokens: ControlledTokenObservation,
     event_sink: std::sync::Mutex<Option<Arc<dyn ProductExecutionEventSink>>>,
     retained: std::sync::Mutex<HashSet<RequestId>>,
     admission_accounting: std::sync::Mutex<Vec<(RequestId, usize, usize, usize)>>,
     completions: std::sync::Mutex<Vec<ExecutorSequenceCompletion>>,
-    maintenance_gated: bool,
     available_admissions: AtomicU64,
     capacity_epoch: AtomicU64,
     admission_probes: AtomicU64,
@@ -97,9 +181,47 @@ struct PlanRuntimeAdmissionTestExecutor {
     fail_next_prefill_after_admission: AtomicBool,
 }
 
+impl std::ops::Deref for PlanRuntimeAdmissionTestExecutor {
+    type Target = PlanRuntimeAdmissionObservation;
+    fn deref(&self) -> &Self::Target {
+        &self.observation
+    }
+}
+
+impl ObservedTestExecutor for PlanRuntimeAdmissionTestExecutor {
+    type Observation = PlanRuntimeAdmissionObservation;
+    fn observer(&self) -> Arc<Self::Observation> {
+        Arc::clone(&self.observation)
+    }
+    fn retire_fixture(&mut self) -> Result<()> {
+        controlled_token_fixture::shutdown(self, &self.tokens)?;
+        let pending = self
+            .retained
+            .lock()
+            .unwrap()
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        for request in pending {
+            self.cancel_prefill_admission(&request);
+        }
+        drop(self.event_sink.lock().unwrap().take());
+        Ok(())
+    }
+}
+
 struct PlanRuntimeChunkedPrefillTestExecutor {
     tokens: Arc<ControlledTokenState>,
     inner: MockModelExecutor,
+    prefix_restore: Option<Arc<prefix_restore_tests::RestoreState>>,
+    prefix_retry: Option<Arc<prefix_restore_deferred_tests::RestoreState>>,
+    rendezvous: Option<Arc<prefix_rendezvous_tests::CaptureState>>,
+    prompt_tail_reserve: Option<usize>,
+    observation: Arc<PlanRuntimeChunkedPrefillObservation>,
+}
+
+struct PlanRuntimeChunkedPrefillObservation {
+    tokens: ControlledTokenObservation,
     retained: std::sync::Mutex<HashSet<RequestId>>,
     attempted_chunks: std::sync::Mutex<Vec<PrefillChunk>>,
     completed_chunks: AtomicU64,
@@ -108,11 +230,35 @@ struct PlanRuntimeChunkedPrefillTestExecutor {
     release_epoch: Arc<AtomicU64>,
     capacity_wait_registrations: AtomicU64,
     capacity_signal: tokio::sync::watch::Sender<u64>,
-    prefix_restore: Option<Arc<prefix_restore_tests::RestoreState>>,
-    prefix_retry: Option<Arc<prefix_restore_deferred_tests::RestoreState>>,
-    rendezvous: Option<Arc<prefix_rendezvous_tests::CaptureState>>,
-    prompt_tail_reserve: Option<usize>,
     tail_batch_prefill_calls: AtomicU64,
+}
+
+impl std::ops::Deref for PlanRuntimeChunkedPrefillTestExecutor {
+    type Target = PlanRuntimeChunkedPrefillObservation;
+    fn deref(&self) -> &Self::Target {
+        &self.observation
+    }
+}
+
+impl ObservedTestExecutor for PlanRuntimeChunkedPrefillTestExecutor {
+    type Observation = PlanRuntimeChunkedPrefillObservation;
+    fn observer(&self) -> Arc<Self::Observation> {
+        Arc::clone(&self.observation)
+    }
+    fn retire_fixture(&mut self) -> Result<()> {
+        controlled_token_fixture::shutdown(self, &self.tokens)?;
+        let pending = self
+            .retained
+            .lock()
+            .unwrap()
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        for request in pending {
+            self.cancel_prefill_admission(&request);
+        }
+        Ok(())
+    }
 }
 
 impl PlanRuntimeChunkedPrefillTestExecutor {
@@ -120,22 +266,26 @@ impl PlanRuntimeChunkedPrefillTestExecutor {
 
     fn new(defer_first_prefill: bool) -> Self {
         let (capacity_signal, _) = tokio::sync::watch::channel(0);
+        let tokens = Arc::new(ControlledTokenState::default());
         Self {
-            tokens: Arc::new(ControlledTokenState::default()),
+            tokens: Arc::clone(&tokens),
             inner: MockModelExecutor::instant(128),
-            retained: std::sync::Mutex::new(HashSet::new()),
-            attempted_chunks: std::sync::Mutex::new(Vec::new()),
-            completed_chunks: AtomicU64::new(0),
-            defer_next_prefill: AtomicBool::new(defer_first_prefill),
-            narrow_next_prefill: AtomicBool::new(false),
-            release_epoch: Arc::new(AtomicU64::new(0)),
-            capacity_wait_registrations: AtomicU64::new(0),
-            capacity_signal,
             prefix_restore: None,
             prefix_retry: None,
             rendezvous: None,
             prompt_tail_reserve: None,
-            tail_batch_prefill_calls: AtomicU64::new(0),
+            observation: Arc::new(PlanRuntimeChunkedPrefillObservation {
+                tokens: ControlledTokenObservation(Arc::downgrade(&tokens)),
+                retained: std::sync::Mutex::new(HashSet::new()),
+                attempted_chunks: std::sync::Mutex::new(Vec::new()),
+                completed_chunks: AtomicU64::new(0),
+                defer_next_prefill: AtomicBool::new(defer_first_prefill),
+                narrow_next_prefill: AtomicBool::new(false),
+                release_epoch: Arc::new(AtomicU64::new(0)),
+                capacity_wait_registrations: AtomicU64::new(0),
+                capacity_signal,
+                tail_batch_prefill_calls: AtomicU64::new(0),
+            }),
         }
     }
 
@@ -168,11 +318,6 @@ impl PlanRuntimeChunkedPrefillTestExecutor {
         )
         .unwrap()
     }
-
-    fn publish_release(&self) {
-        let epoch = self.release_epoch.fetch_add(1, Ordering::AcqRel) + 1;
-        self.capacity_signal.send_replace(epoch);
-    }
 }
 
 #[derive(Clone, Copy)]
@@ -188,6 +333,11 @@ struct PlanRuntimeBatchDecodeTestExecutor {
     behavior: PlanRuntimeBatchDecodeBehavior,
     capacity_stage: ExecutorExecutionCapacityStage,
     capacity_stage_after_first_call: Option<ExecutorExecutionCapacityStage>,
+    observation: Arc<PlanRuntimeBatchDecodeObservation>,
+}
+
+struct PlanRuntimeBatchDecodeObservation {
+    tokens: ControlledTokenObservation,
     decode_calls: AtomicU64,
     batch_decode_calls: AtomicU64,
     released_cache_count: AtomicU64,
@@ -195,26 +345,45 @@ struct PlanRuntimeBatchDecodeTestExecutor {
     mixed_calls: AtomicU64,
 }
 
-impl PlanRuntimeBatchDecodeTestExecutor {
-    fn token_frontier_for_request(&self, request: &RequestId) -> Option<ExecutionFrontier> {
-        self.tokens.frontier_for_request(request)
+impl std::ops::Deref for PlanRuntimeBatchDecodeTestExecutor {
+    type Target = PlanRuntimeBatchDecodeObservation;
+    fn deref(&self) -> &Self::Target {
+        &self.observation
     }
+}
+
+impl ObservedTestExecutor for PlanRuntimeBatchDecodeTestExecutor {
+    type Observation = PlanRuntimeBatchDecodeObservation;
+    fn observer(&self) -> Arc<Self::Observation> {
+        Arc::clone(&self.observation)
+    }
+    fn retire_fixture(&mut self) -> Result<()> {
+        controlled_token_fixture::shutdown(self, &self.tokens)?;
+        Ok(())
+    }
+}
+
+impl PlanRuntimeBatchDecodeTestExecutor {
     fn with_capacity_stage_transition(
         behavior: PlanRuntimeBatchDecodeBehavior,
         capacity_stage: ExecutorExecutionCapacityStage,
         capacity_stage_after_first_call: Option<ExecutorExecutionCapacityStage>,
     ) -> Self {
+        let tokens = Arc::new(ControlledTokenState::default());
         Self {
-            tokens: Arc::new(ControlledTokenState::default()),
+            tokens: Arc::clone(&tokens),
             inner: MockModelExecutor::instant(64),
             behavior,
             capacity_stage,
             capacity_stage_after_first_call,
-            decode_calls: AtomicU64::new(0),
-            batch_decode_calls: AtomicU64::new(0),
-            released_cache_count: AtomicU64::new(0),
-            mixed_behavior: std::sync::Mutex::new(None),
-            mixed_calls: AtomicU64::new(0),
+            observation: Arc::new(PlanRuntimeBatchDecodeObservation {
+                tokens: ControlledTokenObservation(Arc::downgrade(&tokens)),
+                decode_calls: AtomicU64::new(0),
+                batch_decode_calls: AtomicU64::new(0),
+                released_cache_count: AtomicU64::new(0),
+                mixed_behavior: std::sync::Mutex::new(None),
+                mixed_calls: AtomicU64::new(0),
+            }),
         }
     }
 
@@ -230,6 +399,13 @@ impl PlanRuntimeBatchDecodeTestExecutor {
 
 #[async_trait::async_trait]
 impl ModelExecutor for PlanRuntimeChunkedPrefillTestExecutor {
+    fn begin_shutdown(
+        self: Arc<Self>,
+        permit: &ferrum_execution::executor_lifecycle::ExecutorShutdownPermit,
+    ) -> ferrum_execution::executor_lifecycle::ExecutorShutdownObserver {
+        begin_controlled_shutdown(self, permit)
+    }
+
     async fn admit_tokens(&self, input: ExecutionAdmission<'_>) -> Result<TokenAdmissionOutcome> {
         controlled_token_fixture::admit(self, &self.tokens, input)
     }
@@ -489,6 +665,13 @@ impl ModelExecutor for PlanRuntimeChunkedPrefillTestExecutor {
 
 #[async_trait::async_trait]
 impl ModelExecutor for PlanRuntimeBatchDecodeTestExecutor {
+    fn begin_shutdown(
+        self: Arc<Self>,
+        permit: &ferrum_execution::executor_lifecycle::ExecutorShutdownPermit,
+    ) -> ferrum_execution::executor_lifecycle::ExecutorShutdownObserver {
+        begin_controlled_shutdown(self, permit)
+    }
+
     async fn admit_tokens(&self, input: ExecutionAdmission<'_>) -> Result<TokenAdmissionOutcome> {
         controlled_token_fixture::admit(self, &self.tokens, input)
     }
@@ -589,22 +772,26 @@ impl ModelExecutor for PlanRuntimeBatchDecodeTestExecutor {
 
 impl PlanRuntimeAdmissionTestExecutor {
     fn new(vocab_size: usize) -> Self {
+        let tokens = Arc::new(ControlledTokenState::default());
         Self {
-            tokens: Arc::new(ControlledTokenState::default()),
+            tokens: Arc::clone(&tokens),
             inner: MockModelExecutor::instant(vocab_size),
-            event_sink: std::sync::Mutex::new(None),
-            retained: std::sync::Mutex::new(HashSet::new()),
-            admission_accounting: std::sync::Mutex::new(Vec::new()),
-            completions: std::sync::Mutex::new(Vec::new()),
             maintenance_gated: false,
-            available_admissions: AtomicU64::new(0),
-            capacity_epoch: AtomicU64::new(0),
-            admission_probes: AtomicU64::new(0),
-            maintenance_calls: AtomicU64::new(0),
-            prefill_calls: AtomicU64::new(0),
-            batch_prefill_calls: AtomicU64::new(0),
-            defer_batch_prefill_once: AtomicBool::new(false),
-            fail_next_prefill_after_admission: AtomicBool::new(false),
+            observation: Arc::new(PlanRuntimeAdmissionObservation {
+                tokens: ControlledTokenObservation(Arc::downgrade(&tokens)),
+                event_sink: std::sync::Mutex::new(None),
+                retained: std::sync::Mutex::new(HashSet::new()),
+                admission_accounting: std::sync::Mutex::new(Vec::new()),
+                completions: std::sync::Mutex::new(Vec::new()),
+                available_admissions: AtomicU64::new(0),
+                capacity_epoch: AtomicU64::new(0),
+                admission_probes: AtomicU64::new(0),
+                maintenance_calls: AtomicU64::new(0),
+                prefill_calls: AtomicU64::new(0),
+                batch_prefill_calls: AtomicU64::new(0),
+                defer_batch_prefill_once: AtomicBool::new(false),
+                fail_next_prefill_after_admission: AtomicBool::new(false),
+            }),
         }
     }
 
@@ -663,6 +850,13 @@ impl PlanRuntimeAdmissionTestExecutor {
 
 #[async_trait::async_trait]
 impl ModelExecutor for PlanRuntimeAdmissionTestExecutor {
+    fn begin_shutdown(
+        self: Arc<Self>,
+        permit: &ferrum_execution::executor_lifecycle::ExecutorShutdownPermit,
+    ) -> ferrum_execution::executor_lifecycle::ExecutorShutdownObserver {
+        begin_controlled_shutdown(self, permit)
+    }
+
     async fn admit_tokens(&self, input: ExecutionAdmission<'_>) -> Result<TokenAdmissionOutcome> {
         controlled_token_fixture::admit(self, &self.tokens, input)
     }
@@ -833,6 +1027,12 @@ enum TestMaintenanceBehavior {
 struct PlanRuntimeMaintenanceTestExecutor {
     tokens: Arc<ControlledTokenState>,
     inner: MockModelExecutor,
+    maintenance_behavior: TestMaintenanceBehavior,
+    observation: Arc<PlanRuntimeMaintenanceObservation>,
+}
+
+struct PlanRuntimeMaintenanceObservation {
+    tokens: ControlledTokenObservation,
     retained: std::sync::Mutex<HashSet<RequestId>>,
     release_epoch: AtomicU64,
     capacity_epoch: AtomicU64,
@@ -841,8 +1041,35 @@ struct PlanRuntimeMaintenanceTestExecutor {
     capacity_wait_registrations: AtomicU64,
     prefill_calls: AtomicU64,
     call_order: std::sync::Mutex<Vec<&'static str>>,
-    maintenance_behavior: TestMaintenanceBehavior,
     capacity_signal: tokio::sync::watch::Sender<u64>,
+}
+
+impl std::ops::Deref for PlanRuntimeMaintenanceTestExecutor {
+    type Target = PlanRuntimeMaintenanceObservation;
+    fn deref(&self) -> &Self::Target {
+        &self.observation
+    }
+}
+
+impl ObservedTestExecutor for PlanRuntimeMaintenanceTestExecutor {
+    type Observation = PlanRuntimeMaintenanceObservation;
+    fn observer(&self) -> Arc<Self::Observation> {
+        Arc::clone(&self.observation)
+    }
+    fn retire_fixture(&mut self) -> Result<()> {
+        controlled_token_fixture::shutdown(self, &self.tokens)?;
+        let pending = self
+            .retained
+            .lock()
+            .unwrap()
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        for request in pending {
+            self.cancel_prefill_admission(&request);
+        }
+        Ok(())
+    }
 }
 
 impl PlanRuntimeMaintenanceTestExecutor {
@@ -852,25 +1079,24 @@ impl PlanRuntimeMaintenanceTestExecutor {
 
     fn with_behavior(vocab_size: usize, maintenance_behavior: TestMaintenanceBehavior) -> Self {
         let (capacity_signal, _) = tokio::sync::watch::channel(0);
+        let tokens = Arc::new(ControlledTokenState::default());
         Self {
-            tokens: Arc::new(ControlledTokenState::default()),
+            tokens: Arc::clone(&tokens),
             inner: MockModelExecutor::instant(vocab_size),
-            retained: std::sync::Mutex::new(HashSet::new()),
-            release_epoch: AtomicU64::new(0),
-            capacity_epoch: AtomicU64::new(0),
-            admission_probes: AtomicU64::new(0),
-            maintenance_calls: AtomicU64::new(0),
-            capacity_wait_registrations: AtomicU64::new(0),
-            prefill_calls: AtomicU64::new(0),
-            call_order: std::sync::Mutex::new(Vec::new()),
             maintenance_behavior,
-            capacity_signal,
+            observation: Arc::new(PlanRuntimeMaintenanceObservation {
+                tokens: ControlledTokenObservation(Arc::downgrade(&tokens)),
+                retained: std::sync::Mutex::new(HashSet::new()),
+                release_epoch: AtomicU64::new(0),
+                capacity_epoch: AtomicU64::new(0),
+                admission_probes: AtomicU64::new(0),
+                maintenance_calls: AtomicU64::new(0),
+                capacity_wait_registrations: AtomicU64::new(0),
+                prefill_calls: AtomicU64::new(0),
+                call_order: std::sync::Mutex::new(Vec::new()),
+                capacity_signal,
+            }),
         }
-    }
-
-    fn publish_release(&self) {
-        let release_epoch = self.release_epoch.fetch_add(1, Ordering::AcqRel) + 1;
-        self.capacity_signal.send_replace(release_epoch);
     }
 
     fn epochs(&self) -> ExecutorAdmissionEpochs {
@@ -902,6 +1128,13 @@ impl PlanRuntimeMaintenanceTestExecutor {
 
 #[async_trait::async_trait]
 impl ModelExecutor for PlanRuntimeMaintenanceTestExecutor {
+    fn begin_shutdown(
+        self: Arc<Self>,
+        permit: &ferrum_execution::executor_lifecycle::ExecutorShutdownPermit,
+    ) -> ferrum_execution::executor_lifecycle::ExecutorShutdownObserver {
+        begin_controlled_shutdown(self, permit)
+    }
+
     async fn admit_tokens(&self, input: ExecutionAdmission<'_>) -> Result<TokenAdmissionOutcome> {
         controlled_token_fixture::admit(self, &self.tokens, input)
     }
@@ -1738,7 +1971,11 @@ fn read_engine_profile_events(path: &Path) -> Vec<FerrumProfileEvent> {
 }
 
 fn flush_engine_profile_events(engine: &ContinuousBatchEngine) {
-    if let Some(journal) = &engine.inner.scheduler_trace_jsonl {
+    if let Some(journal) = &engine
+        .active_inner()
+        .expect("engine execution is open")
+        .scheduler_trace_jsonl
+    {
         journal.flush().expect("scheduler trace flush barrier");
     }
 }
@@ -1968,8 +2205,8 @@ fn performance_breakdown_reports_engine_timing_counters() {
     let kv_cache: Arc<dyn KvCacheManager + Send + Sync> =
         Arc::new(ferrum_testkit::MockKvCacheManager::new(256));
     let tensor_factory: Arc<dyn TensorFactory> = Arc::new(ferrum_testkit::MockTensorFactory);
-    let model_executor: Arc<dyn ModelExecutor + Send + Sync> =
-        Arc::new(ferrum_testkit::MockModelExecutor::instant(128));
+    let model_executor =
+        ExecutorOwner::new(Box::new(ferrum_testkit::MockModelExecutor::instant(128)));
     let engine = ContinuousBatchEngine::new(
         config,
         scheduler,
@@ -1982,22 +2219,28 @@ fn performance_breakdown_reports_engine_timing_counters() {
     .expect("legacy engine composition must match executor authority");
 
     engine
-        .inner
+        .active_inner()
+        .expect("engine execution is open")
         .record_scheduling_time(Duration::from_micros(1500));
     engine
-        .inner
+        .active_inner()
+        .expect("engine execution is open")
         .record_scheduling_time(Duration::from_micros(2500));
     engine
-        .inner
+        .active_inner()
+        .expect("engine execution is open")
         .record_model_execution_time(Duration::from_micros(10_000));
     engine
-        .inner
+        .active_inner()
+        .expect("engine execution is open")
         .record_model_execution_time(Duration::from_micros(14_000));
     engine
-        .inner
+        .active_inner()
+        .expect("engine execution is open")
         .record_iteration_lock_wait(Duration::from_micros(300));
     engine
-        .inner
+        .active_inner()
+        .expect("engine execution is open")
         .record_iteration_lock_wait(Duration::from_micros(700));
 
     let breakdown = engine.metrics().performance_breakdown;
@@ -2017,7 +2260,7 @@ fn test_continuous_engine_with_config(config: EngineConfig) -> ContinuousBatchEn
         scheduler,
         Arc::new(ferrum_testkit::MockTokenizer::new(128)),
         Arc::new(ferrum_testkit::MockSampler),
-        Arc::new(PlanRuntimeAdmissionTestExecutor::new(128)),
+        ExecutorOwner::new(Box::new(PlanRuntimeAdmissionTestExecutor::new(128))),
         Arc::new(MockTensorFactory),
     )
     .unwrap()
@@ -2039,8 +2282,16 @@ fn product_profile_path_constructs_a_vnext_execution_journal() {
 
     let engine = test_continuous_engine_with_config(config);
 
-    assert!(engine.inner.profile_trace_journal().is_some());
-    assert!(engine.inner.scheduler_trace_jsonl.is_none());
+    assert!(engine
+        .active_inner()
+        .expect("engine execution is open")
+        .profile_trace_journal()
+        .is_some());
+    assert!(engine
+        .active_inner()
+        .expect("engine execution is open")
+        .scheduler_trace_jsonl
+        .is_none());
     assert!(trace_path.exists());
     drop(engine);
     let _ = std::fs::remove_file(trace_path);
@@ -2059,12 +2310,25 @@ fn profile_journal_budget_reaches_profile_scheduler_and_legacy_writers() {
     config.runtime.scheduler_trace_jsonl = Some(paths[1].clone());
     config.runtime.legacy_scheduler_trace_jsonl = Some(paths[2].clone());
     let engine = test_continuous_engine_with_config(config);
-    assert!(engine.inner.profile_trace_journal().is_some());
-    assert!(engine.inner.scheduler_trace_jsonl.is_some());
-    assert!(engine.inner.legacy_scheduler_trace_jsonl.is_some());
+    assert!(engine
+        .active_inner()
+        .expect("engine execution is open")
+        .profile_trace_journal()
+        .is_some());
+    assert!(engine
+        .active_inner()
+        .expect("engine execution is open")
+        .scheduler_trace_jsonl
+        .is_some());
+    assert!(engine
+        .active_inner()
+        .expect("engine execution is open")
+        .legacy_scheduler_trace_jsonl
+        .is_some());
     for path in &paths {
         let original = engine
-            .inner
+            .active_inner()
+            .expect("engine execution is open")
             .journal_scopes
             .lock()
             .producer::<serde_json::Value>(path)
@@ -2086,9 +2350,17 @@ async fn idle_background_loop_parks_and_new_work_resumes_it() {
 
     let parked_iteration = tokio::time::timeout(Duration::from_secs(1), async {
         loop {
-            let before = engine.inner.iteration_count.load(Ordering::Acquire);
+            let before = engine
+                .active_inner()
+                .expect("engine execution is open")
+                .iteration_count
+                .load(Ordering::Acquire);
             tokio::time::sleep(Duration::from_millis(10)).await;
-            let after = engine.inner.iteration_count.load(Ordering::Acquire);
+            let after = engine
+                .active_inner()
+                .expect("engine execution is open")
+                .iteration_count
+                .load(Ordering::Acquire);
             if before == after {
                 break after;
             }
@@ -2098,7 +2370,11 @@ async fn idle_background_loop_parks_and_new_work_resumes_it() {
     .expect("background loop must reach its idle wait");
     tokio::time::sleep(Duration::from_millis(20)).await;
     assert_eq!(
-        engine.inner.iteration_count.load(Ordering::Acquire),
+        engine
+            .active_inner()
+            .expect("engine execution is open")
+            .iteration_count
+            .load(Ordering::Acquire),
         parked_iteration,
         "an idle engine must not poll for work"
     );
@@ -2109,7 +2385,14 @@ async fn idle_background_loop_parks_and_new_work_resumes_it() {
         .await
         .expect("new work must wake the parked background loop")
         .unwrap();
-    assert!(engine.inner.iteration_count.load(Ordering::Acquire) > parked_iteration);
+    assert!(
+        engine
+            .active_inner()
+            .expect("engine execution is open")
+            .iteration_count
+            .load(Ordering::Acquire)
+            > parked_iteration
+    );
     engine.shutdown().await.unwrap();
 }
 
@@ -2118,7 +2401,13 @@ async fn shutdown_wakes_an_idle_background_loop() {
     let engine = test_continuous_engine();
     let background = engine.start_loop().unwrap();
     tokio::time::timeout(Duration::from_secs(1), async {
-        while engine.inner.iteration_count.load(Ordering::Acquire) == 0 {
+        while engine
+            .active_inner()
+            .expect("engine execution is open")
+            .iteration_count
+            .load(Ordering::Acquire)
+            == 0
+        {
             tokio::task::yield_now().await;
         }
     })
@@ -2137,19 +2426,30 @@ async fn shutdown_wakes_an_idle_background_loop() {
 async fn shutdown_signal_retains_wakes_before_wait_registration() {
     let engine = test_continuous_engine();
 
-    let observer = engine.driver.shutdown(&engine.inner).unwrap();
+    let observer = engine
+        .driver
+        .shutdown(&engine.active_inner().expect("engine execution is open"))
+        .unwrap();
 
     assert!(engine.driver.is_closing());
     assert!(!engine.driver.is_running());
     tokio::time::timeout(
         Duration::from_millis(100),
-        engine.inner.shutdown_notify.notified(),
+        engine
+            .active_inner()
+            .expect("engine execution is open")
+            .shutdown_notify
+            .notified(),
     )
     .await
     .expect("shutdown wake must survive registration after the signal");
     tokio::time::timeout(
         Duration::from_millis(100),
-        engine.inner.work_notify.notified(),
+        engine
+            .active_inner()
+            .expect("engine execution is open")
+            .work_notify
+            .notified(),
     )
     .await
     .expect("work wake must survive registration after the signal");
@@ -2171,14 +2471,27 @@ async fn process_batch_rejects_a_scheduler_item_without_published_sequence_state
     };
 
     let error = engine
-        .inner
+        .active_inner()
+        .expect("engine execution is open")
         .process_batch(&batch)
         .await
         .expect_err("batch processing must not create a second tokenized request state");
 
     assert!(matches!(error, FerrumError::Internal { .. }));
-    assert!(engine.inner.sequences.get(&request_id).is_none());
-    assert_eq!(engine.inner.execution_closes.unreclaimed_count(), 0);
+    assert!(engine
+        .active_inner()
+        .expect("engine execution is open")
+        .sequences
+        .get(&request_id)
+        .is_none());
+    assert_eq!(
+        engine
+            .active_inner()
+            .expect("engine execution is open")
+            .execution_closes
+            .unreclaimed_count(),
+        0
+    );
 }
 
 #[test]
@@ -2190,8 +2503,7 @@ fn resource_composition_mismatch_is_a_configuration_error() {
     let sampler: Arc<dyn Sampler + Send + Sync> = Arc::new(ferrum_testkit::MockSampler);
     let tensor_factory: Arc<dyn TensorFactory> = Arc::new(MockTensorFactory);
 
-    let legacy_executor: Arc<dyn ModelExecutor + Send + Sync> =
-        Arc::new(MockModelExecutor::instant(128));
+    let legacy_executor = ExecutorOwner::new(Box::new(MockModelExecutor::instant(128)));
     let plan_runtime_error = ContinuousBatchEngine::new_plan_runtime(
         config.clone(),
         Arc::clone(&scheduler),
@@ -2207,8 +2519,8 @@ fn resource_composition_mismatch_is_a_configuration_error() {
         .contains("does not match executor authority"));
 
     let kv_cache: Arc<dyn KvCacheManager + Send + Sync> = Arc::new(MockKvCacheManager::new(128));
-    let plan_runtime_executor: Arc<dyn ModelExecutor + Send + Sync> =
-        Arc::new(PlanRuntimeAdmissionTestExecutor::new(128));
+    let plan_runtime_executor =
+        ExecutorOwner::new(Box::new(PlanRuntimeAdmissionTestExecutor::new(128)));
     let legacy_error = ContinuousBatchEngine::new(
         config,
         scheduler,
@@ -2234,7 +2546,7 @@ fn public_engine_authority_reports_validated_resource_composition() {
         Arc::new(ferrum_testkit::MockTokenizer::new(128)),
         Arc::new(ferrum_testkit::MockSampler),
         Arc::new(MockKvCacheManager::new(256)),
-        Arc::new(MockModelExecutor::instant(128)),
+        ExecutorOwner::new(Box::new(MockModelExecutor::instant(128))),
         Arc::new(MockTensorFactory),
     )
     .unwrap();
@@ -2254,7 +2566,7 @@ fn plan_runtime_batch_decode_test_engine(
 ) -> (
     ContinuousBatchEngine,
     Arc<ContinuousBatchScheduler>,
-    Arc<PlanRuntimeBatchDecodeTestExecutor>,
+    Arc<PlanRuntimeBatchDecodeObservation>,
     Arc<dyn Tokenizer + Send + Sync>,
 ) {
     plan_runtime_batch_decode_test_engine_with_trace(behavior, None)
@@ -2265,17 +2577,15 @@ fn plan_runtime_batch_decode_profile_test_engine(
 ) -> (
     ContinuousBatchEngine,
     Arc<ContinuousBatchScheduler>,
-    Arc<PlanRuntimeBatchDecodeTestExecutor>,
+    Arc<PlanRuntimeBatchDecodeObservation>,
     Arc<dyn Tokenizer + Send + Sync>,
 ) {
     let mut config = plan_runtime_test_config(None);
     config.runtime.profile_detail = profile_detail;
-    let executor = Arc::new(
-        PlanRuntimeBatchDecodeTestExecutor::with_capacity_stage_transition(
-            PlanRuntimeBatchDecodeBehavior::Exact,
-            ExecutorExecutionCapacityStage::StepAdmission,
-            None,
-        ),
+    let executor = PlanRuntimeBatchDecodeTestExecutor::with_capacity_stage_transition(
+        PlanRuntimeBatchDecodeBehavior::Exact,
+        ExecutorExecutionCapacityStage::StepAdmission,
+        None,
     );
     plan_runtime_test_engine(config, executor, Arc::new(MockTensorFactory))
 }
@@ -2286,7 +2596,7 @@ fn plan_runtime_batch_decode_test_engine_with_trace(
 ) -> (
     ContinuousBatchEngine,
     Arc<ContinuousBatchScheduler>,
-    Arc<PlanRuntimeBatchDecodeTestExecutor>,
+    Arc<PlanRuntimeBatchDecodeObservation>,
     Arc<dyn Tokenizer + Send + Sync>,
 ) {
     plan_runtime_batch_decode_test_engine_with_trace_and_factory(
@@ -2303,7 +2613,7 @@ fn plan_runtime_batch_decode_test_engine_with_trace_and_factory(
 ) -> (
     ContinuousBatchEngine,
     Arc<ContinuousBatchScheduler>,
-    Arc<PlanRuntimeBatchDecodeTestExecutor>,
+    Arc<PlanRuntimeBatchDecodeObservation>,
     Arc<dyn Tokenizer + Send + Sync>,
 ) {
     plan_runtime_batch_decode_test_engine_with_trace_factory_and_stage(
@@ -2324,15 +2634,13 @@ fn plan_runtime_batch_decode_test_engine_with_trace_factory_and_stage(
 ) -> (
     ContinuousBatchEngine,
     Arc<ContinuousBatchScheduler>,
-    Arc<PlanRuntimeBatchDecodeTestExecutor>,
+    Arc<PlanRuntimeBatchDecodeObservation>,
     Arc<dyn Tokenizer + Send + Sync>,
 ) {
-    let executor = Arc::new(
-        PlanRuntimeBatchDecodeTestExecutor::with_capacity_stage_transition(
-            behavior,
-            capacity_stage,
-            capacity_stage_after_first_call,
-        ),
+    let executor = PlanRuntimeBatchDecodeTestExecutor::with_capacity_stage_transition(
+        behavior,
+        capacity_stage,
+        capacity_stage_after_first_call,
     );
     plan_runtime_test_engine(
         plan_runtime_test_config(trace_path),
@@ -2349,16 +2657,18 @@ fn plan_runtime_test_config(trace_path: Option<PathBuf>) -> EngineConfig {
     config
 }
 
-fn plan_runtime_test_engine<E: ModelExecutor + 'static>(
+fn plan_runtime_test_engine<E: ObservedTestExecutor>(
     config: EngineConfig,
-    executor: Arc<E>,
+    executor: E,
     tensor_factory: Arc<dyn TensorFactory>,
 ) -> (
     ContinuousBatchEngine,
     Arc<ContinuousBatchScheduler>,
-    Arc<E>,
+    Arc<E::Observation>,
     Arc<dyn Tokenizer + Send + Sync>,
 ) {
+    let observation = executor.observer();
+    let executor_owner = ExecutorOwner::new(Box::new(executor));
     let scheduler = Arc::new(ContinuousBatchScheduler::new(config.scheduler.clone()));
     let tokenizer: Arc<dyn Tokenizer + Send + Sync> =
         Arc::new(PolicyTokenizer::new(64, &[("test", 5), ("ok", 6)]));
@@ -2368,11 +2678,11 @@ fn plan_runtime_test_engine<E: ModelExecutor + 'static>(
         scheduler.clone(),
         tokenizer.clone(),
         sampler,
-        executor.clone(),
+        executor_owner,
         tensor_factory,
     )
     .unwrap();
-    (engine, scheduler, executor, tokenizer)
+    (engine, scheduler, observation, tokenizer)
 }
 
 async fn install_plan_runtime_decode_cohort(
@@ -2406,7 +2716,8 @@ async fn install_plan_runtime_decode_frontiers(
             Some(64),
         );
         let TokenAdmissionOutcome::Admitted(frontier) = engine
-            .inner
+            .active_inner()
+            .expect("engine execution is open")
             .model_executor
             .admit_tokens(ExecutionAdmission {
                 context: ExecutorPrefillAdmission::for_product_request(
@@ -2426,7 +2737,11 @@ async fn install_plan_runtime_decode_frontiers(
         };
         sequence.execution_frontier = Some(frontier);
         ids.push(request.id.clone());
-        engine.inner.sequences.insert(request.id.clone(), sequence);
+        engine
+            .active_inner()
+            .expect("engine execution is open")
+            .sequences
+            .insert(request.id.clone(), sequence);
         scheduler.submit(request).await.unwrap();
     }
     let batch = scheduler
@@ -2434,8 +2749,16 @@ async fn install_plan_runtime_decode_frontiers(
         .await
         .unwrap();
     assert_eq!(batch.requests.len(), ids.len());
-    engine.inner.process_batch(&batch).await.unwrap();
-    let sequences = &engine.inner.sequences;
+    engine
+        .active_inner()
+        .expect("engine execution is open")
+        .process_batch(&batch)
+        .await
+        .unwrap();
+    let sequences = &engine
+        .active_inner()
+        .expect("engine execution is open")
+        .sequences;
     let initial = ids
         .iter()
         .map(|id| {
@@ -2488,7 +2811,8 @@ async fn install_profiled_plan_runtime_decode_frontier(
         Some(64),
     );
     let TokenAdmissionOutcome::Admitted(frontier) = engine
-        .inner
+        .active_inner()
+        .expect("engine execution is open")
         .model_executor
         .admit_tokens(ExecutionAdmission {
             context: ExecutorPrefillAdmission::for_product_request(
@@ -2507,14 +2831,23 @@ async fn install_profiled_plan_runtime_decode_frontier(
         panic!("controlled profile admission must succeed");
     };
     sequence.execution_frontier = Some(frontier);
-    engine.inner.sequences.insert(id.clone(), sequence);
+    engine
+        .active_inner()
+        .expect("engine execution is open")
+        .sequences
+        .insert(id.clone(), sequence);
     scheduler.submit(request).await.unwrap();
     let batch = scheduler
         .next_batch(ferrum_interfaces::BatchHint::simple(1))
         .await
         .unwrap();
     assert_eq!(batch.requests.len(), 1);
-    engine.inner.process_batch(&batch).await.unwrap();
+    engine
+        .active_inner()
+        .expect("engine execution is open")
+        .process_batch(&batch)
+        .await
+        .unwrap();
     id
 }
 
@@ -2526,7 +2859,10 @@ async fn token_lone_decode_self_recompute_releases_exact_incarnation_before_requ
         install_plan_runtime_decode_frontiers(&engine, &scheduler, tokenizer, &["test"]).await;
     let id = &ids[0];
     let mut availability = Vec::new();
-    let epochs = executor
+    let epochs = engine
+        .active_inner()
+        .expect("engine execution is open")
+        .model_executor
         .write_execution_capacity_snapshot(&mut availability)
         .unwrap()
         .unwrap();
@@ -2549,7 +2885,11 @@ async fn token_lone_decode_self_recompute_releases_exact_incarnation_before_requ
         .defer_decode_for_execution_capacity(
             &ids,
             deferral,
-            &engine.inner.execution_capacity_release_snapshot().unwrap(),
+            &engine
+                .active_inner()
+                .expect("engine execution is open")
+                .execution_capacity_release_snapshot()
+                .unwrap(),
         )
         .unwrap();
     let ExecutionCapacityAction::YieldPlanned { transaction } = action else {
@@ -2558,12 +2898,22 @@ async fn token_lone_decode_self_recompute_releases_exact_incarnation_before_requ
     assert_eq!(transaction.kind(), PressureYieldKind::SelfRecompute);
     assert_eq!(transaction.victim_request_id(), id);
     assert!(!engine
-        .inner
+        .active_inner()
+        .expect("engine execution is open")
         .execute_capacity_yield(&transaction, 1, None)
         .await
         .unwrap());
-    engine.inner.execution_closes.join_observers().await;
-    engine.inner.drain_execution_closes().unwrap();
+    engine
+        .active_inner()
+        .expect("engine execution is open")
+        .execution_closes
+        .join_observers()
+        .await;
+    engine
+        .active_inner()
+        .expect("engine execution is open")
+        .drain_execution_closes()
+        .unwrap();
     assert!(incarnations[0].observed_end().is_some());
     assert!(executor.token_frontier_for_request(id).is_none());
     assert_eq!(executor.released_cache_count.load(Ordering::Acquire), 1);
@@ -2572,7 +2922,10 @@ async fn token_lone_decode_self_recompute_releases_exact_incarnation_before_requ
     assert_eq!(trace.waiting_queue_len, 1);
     assert_eq!(trace.pressure_pending_release_fences, 0);
     assert_eq!(trace.capacity_release_epoch, 1);
-    let sequences = &engine.inner.sequences;
+    let sequences = &engine
+        .active_inner()
+        .expect("engine execution is open")
+        .sequences;
     let sequence_handle = sequences.get(id).unwrap();
     let sequence_guard = sequence_handle.lock();
     let sequence = sequence_guard.as_ref().unwrap();
@@ -2597,11 +2950,19 @@ async fn plan_runtime_batch_decode_process_batch_submits_one_cohort() {
         .await
         .expect("ready decode cohort");
 
-    engine.inner.process_batch(&decode_batch).await.unwrap();
+    engine
+        .active_inner()
+        .expect("engine execution is open")
+        .process_batch(&decode_batch)
+        .await
+        .unwrap();
 
     assert_eq!(executor.batch_decode_calls.load(Ordering::Relaxed), 1);
     assert_eq!(executor.decode_calls.load(Ordering::Relaxed), 0);
-    let sequences = &engine.inner.sequences;
+    let sequences = &engine
+        .active_inner()
+        .expect("engine execution is open")
+        .sequences;
     for ((request_id, initial_token), cache_id) in
         request_ids.iter().zip(initial_tokens).zip(cache_ids)
     {
@@ -2647,11 +3008,27 @@ async fn token_capacity_unproved_close_keeps_the_release_fence_and_original_owne
         .next_batch(ferrum_interfaces::BatchHint::simple(2))
         .await
         .unwrap();
-    engine.inner.process_batch(&batch).await.unwrap();
-    engine.inner.execution_closes.join_observers().await;
-    engine.inner.output_tasks.join_current().await;
+    engine
+        .active_inner()
+        .expect("engine execution is open")
+        .process_batch(&batch)
+        .await
+        .unwrap();
+    engine
+        .active_inner()
+        .expect("engine execution is open")
+        .execution_closes
+        .join_observers()
+        .await;
+    engine
+        .active_inner()
+        .expect("engine execution is open")
+        .output_tasks
+        .join_current()
+        .await;
     let error = engine
-        .inner
+        .active_inner()
+        .expect("engine execution is open")
         .run_iteration()
         .await
         .err()
@@ -2659,13 +3036,23 @@ async fn token_capacity_unproved_close_keeps_the_release_fence_and_original_owne
     assert!(error
         .to_string()
         .contains("synthetic request-scoped close failure"));
-    let _ = engine.inner.drain_execution_closes();
+    let _ = engine
+        .active_inner()
+        .expect("engine execution is open")
+        .drain_execution_closes();
     assert_eq!(executor.released_cache_count.load(Ordering::Acquire), 0);
     assert!(incarnations
         .iter()
         .all(|identity| identity.observed_end().is_none()));
     assert_eq!(scheduler.trace_snapshot().capacity_release_epoch, 0);
-    assert!(engine.inner.execution_closes.unreclaimed_count() > 0);
+    assert!(
+        engine
+            .active_inner()
+            .expect("engine execution is open")
+            .execution_closes
+            .unreclaimed_count()
+            > 0
+    );
     assert!(scheduler.trace_snapshot().pressure_pending_release_fences > 0);
 }
 
@@ -2685,11 +3072,17 @@ async fn plan_runtime_profile_records_only_explicit_decode_host_stages() {
             .next_batch(ferrum_interfaces::BatchHint::simple(1))
             .await
             .unwrap();
-        engine.inner.process_batch(&batch).await.unwrap();
+        engine
+            .active_inner()
+            .expect("engine execution is open")
+            .process_batch(&batch)
+            .await
+            .unwrap();
 
         assert_eq!(executor.batch_decode_calls.load(Ordering::Relaxed), 1);
         let timing = engine
-            .inner
+            .active_inner()
+            .expect("engine execution is open")
             .sequences
             .get(&request_id)
             .unwrap()
@@ -2755,14 +3148,18 @@ async fn plan_runtime_batch_decode_does_not_materialize_host_token_tensors() {
         .await
         .unwrap();
     engine
-        .inner
+        .active_inner()
+        .expect("engine execution is open")
         .process_batch(&batch)
         .await
         .expect("common decode must not call TensorFactory::from_slice");
 
     assert_eq!(executor.batch_decode_calls.load(Ordering::Relaxed), 1);
     assert_eq!(executor.decode_calls.load(Ordering::Relaxed), 0);
-    let sequences = &engine.inner.sequences;
+    let sequences = &engine
+        .active_inner()
+        .expect("engine execution is open")
+        .sequences;
     for request_id in request_ids {
         assert_eq!(
             sequences
@@ -2785,8 +3182,7 @@ async fn plan_runtime_status_separates_static_and_dynamic_memory() {
     let tokenizer: Arc<dyn Tokenizer + Send + Sync> =
         Arc::new(ferrum_testkit::MockTokenizer::new(128));
     let sampler: Arc<dyn Sampler + Send + Sync> = Arc::new(ferrum_testkit::MockSampler);
-    let executor: Arc<dyn ModelExecutor + Send + Sync> =
-        Arc::new(PlanRuntimeAdmissionTestExecutor::new(128));
+    let executor = ExecutorOwner::new(Box::new(PlanRuntimeAdmissionTestExecutor::new(128)));
     let tensor_factory: Arc<dyn TensorFactory> = Arc::new(MockTensorFactory);
     let engine = ContinuousBatchEngine::new_plan_runtime(
         config,
@@ -2815,14 +3211,17 @@ async fn plan_runtime_product_path_requires_typed_admission_before_prefill() {
     let tokenizer: Arc<dyn Tokenizer + Send + Sync> =
         Arc::new(ferrum_testkit::MockTokenizer::new(128));
     let sampler: Arc<dyn Sampler + Send + Sync> = Arc::new(ferrum_testkit::MockSampler);
-    let executor = Arc::new(PlanRuntimeAdmissionTestExecutor::new(128));
+    let executor = PlanRuntimeAdmissionTestExecutor::new(128);
+    let observation = executor.observer();
+    let executor_owner = ExecutorOwner::new(Box::new(executor));
+    let executor = observation;
     let tensor_factory: Arc<dyn TensorFactory> = Arc::new(FailingFromSliceTensorFactory);
     let engine = ContinuousBatchEngine::new_plan_runtime(
         config,
         Arc::clone(&scheduler),
         tokenizer,
         sampler,
-        executor.clone(),
+        executor_owner,
         tensor_factory,
     )
     .unwrap();
@@ -2867,15 +3266,17 @@ async fn plan_runtime_prefill_resource_failure_preserves_terminal_error_and_rele
     let tokenizer: Arc<dyn Tokenizer + Send + Sync> =
         Arc::new(ferrum_testkit::MockTokenizer::new(128));
     let sampler: Arc<dyn Sampler + Send + Sync> = Arc::new(ferrum_testkit::MockSampler);
-    let executor =
-        Arc::new(PlanRuntimeAdmissionTestExecutor::new_with_resource_prefill_failure(128));
+    let executor = PlanRuntimeAdmissionTestExecutor::new_with_resource_prefill_failure(128);
+    let observation = executor.observer();
+    let executor_owner = ExecutorOwner::new(Box::new(executor));
+    let executor = observation;
     let tensor_factory: Arc<dyn TensorFactory> = Arc::new(FailingFromSliceTensorFactory);
     let engine = ContinuousBatchEngine::new_plan_runtime(
         config,
         scheduler,
         tokenizer,
         sampler,
-        executor.clone(),
+        executor_owner,
         tensor_factory,
     )
     .unwrap();
@@ -2895,7 +3296,12 @@ async fn plan_runtime_prefill_resource_failure_preserves_terminal_error_and_rele
     assert!(error
         .to_string()
         .contains("typed diagnostic resource failure after prefill submission"));
-    assert!(!engine.inner.sequences.get(&request_id).is_some());
+    assert!(!engine
+        .active_inner()
+        .expect("engine execution is open")
+        .sequences
+        .get(&request_id)
+        .is_some());
     assert!(executor
         .retained
         .lock()
@@ -2912,14 +3318,17 @@ async fn plan_runtime_recompute_admission_preserves_product_usage_accounting() {
     let tokenizer: Arc<dyn Tokenizer + Send + Sync> =
         Arc::new(ferrum_testkit::MockTokenizer::new(128));
     let sampler: Arc<dyn Sampler + Send + Sync> = Arc::new(ferrum_testkit::MockSampler);
-    let executor = Arc::new(PlanRuntimeAdmissionTestExecutor::new(128));
+    let executor = PlanRuntimeAdmissionTestExecutor::new(128);
+    let observation = executor.observer();
+    let executor_owner = ExecutorOwner::new(Box::new(executor));
+    let executor = observation;
     let tensor_factory: Arc<dyn TensorFactory> = Arc::new(MockTensorFactory);
     let engine = ContinuousBatchEngine::new_plan_runtime(
         config,
         scheduler,
         tokenizer,
         sampler,
-        executor.clone(),
+        executor_owner,
         tensor_factory,
     )
     .unwrap();
@@ -2930,10 +3339,15 @@ async fn plan_runtime_recompute_admission_preserves_product_usage_accounting() {
         SequenceState::new(request.clone(), vec![TokenId::new(11), TokenId::new(12)]);
     sequence.generated_tokens.push(TokenId::new(13));
     sequence.phase = RequestPhase::Waiting;
-    engine.inner.sequences.insert(request_id.clone(), sequence);
+    engine
+        .active_inner()
+        .expect("engine execution is open")
+        .sequences
+        .insert(request_id.clone(), sequence);
 
     let admitted = engine
-        .inner
+        .active_inner()
+        .expect("engine execution is open")
         .probe_executor_prefill_admission_for_test(&request)
         .await;
 
@@ -2950,7 +3364,10 @@ async fn plan_runtime_recompute_admission_preserves_product_usage_accounting() {
         .tokens
         .frontier_for_request(&request_id)
         .expect("admitted identity");
-    let close = executor
+    let close = engine
+        .active_inner()
+        .expect("engine execution is open")
+        .model_executor
         .cancel_tokens(frontier.sequence())
         .expect("close exact admission");
     assert!(matches!(
@@ -2971,14 +3388,17 @@ async fn plan_runtime_prefill_cohort_uses_one_capacity_aware_batch() {
         &[("test", 5), ("ok", 6), ("generated", 42)],
     ));
     let sampler: Arc<dyn Sampler + Send + Sync> = Arc::new(crate::registry::GreedySampler);
-    let executor = Arc::new(PlanRuntimeAdmissionTestExecutor::new(128));
+    let executor = PlanRuntimeAdmissionTestExecutor::new(128);
+    let observation = executor.observer();
+    let executor_owner = ExecutorOwner::new(Box::new(executor));
+    let executor = observation;
     let tensor_factory: Arc<dyn TensorFactory> = Arc::new(FailingFromSliceTensorFactory);
     let engine = ContinuousBatchEngine::new_plan_runtime(
         config,
         Arc::clone(&scheduler),
         Arc::clone(&tokenizer),
         sampler,
-        executor.clone(),
+        executor_owner,
         tensor_factory,
     )
     .unwrap();
@@ -2999,7 +3419,10 @@ async fn plan_runtime_prefill_cohort_uses_one_capacity_aware_batch() {
             Some(Arc::clone(&tokenizer)),
             Some(128),
         );
-        let TokenAdmissionOutcome::Admitted(frontier) = executor
+        let TokenAdmissionOutcome::Admitted(frontier) = engine
+            .active_inner()
+            .expect("engine execution is open")
+            .model_executor
             .admit_tokens(ExecutionAdmission {
                 context: ExecutorPrefillAdmission::for_product_request(
                     &request.id,
@@ -3018,7 +3441,11 @@ async fn plan_runtime_prefill_cohort_uses_one_capacity_aware_batch() {
         };
         sequence.execution_frontier = Some(frontier);
         request_ids.push(request.id.clone());
-        engine.inner.sequences.insert(request.id.clone(), sequence);
+        engine
+            .active_inner()
+            .expect("engine execution is open")
+            .sequences
+            .insert(request.id.clone(), sequence);
     }
     let batch = scheduler
         .next_batch(ferrum_interfaces::BatchHint::simple(2))
@@ -3026,7 +3453,12 @@ async fn plan_runtime_prefill_cohort_uses_one_capacity_aware_batch() {
         .expect("two admitted prefills should form one scheduler cohort");
     assert_eq!(batch.requests.len(), 2);
 
-    engine.inner.process_batch(&batch).await.unwrap();
+    engine
+        .active_inner()
+        .expect("engine execution is open")
+        .process_batch(&batch)
+        .await
+        .unwrap();
 
     assert_eq!(executor.batch_prefill_calls.load(Ordering::Relaxed), 1);
     assert_eq!(executor.prefill_calls.load(Ordering::Relaxed), 0);
@@ -3035,7 +3467,10 @@ async fn plan_runtime_prefill_cohort_uses_one_capacity_aware_batch() {
         .lock()
         .expect("retained admission mutex poisoned")
         .is_empty());
-    let sequences = &engine.inner.sequences;
+    let sequences = &engine
+        .active_inner()
+        .expect("engine execution is open")
+        .sequences;
     let remaining_request_ids = sequences
         .snapshot()
         .iter()
@@ -3067,14 +3502,17 @@ async fn plan_runtime_batch_prefill_deferral_falls_back_without_failing_requests
         &[("test", 5), ("ok", 6), ("generated", 42)],
     ));
     let sampler: Arc<dyn Sampler + Send + Sync> = Arc::new(crate::registry::GreedySampler);
-    let executor = Arc::new(PlanRuntimeAdmissionTestExecutor::new_with_batch_prefill_deferral(128));
+    let executor = PlanRuntimeAdmissionTestExecutor::new_with_batch_prefill_deferral(128);
+    let observation = executor.observer();
+    let executor_owner = ExecutorOwner::new(Box::new(executor));
+    let executor = observation;
     let tensor_factory: Arc<dyn TensorFactory> = Arc::new(FailingFromSliceTensorFactory);
     let engine = ContinuousBatchEngine::new_plan_runtime(
         config,
         Arc::clone(&scheduler),
         Arc::clone(&tokenizer),
         sampler,
-        executor.clone(),
+        executor_owner,
         tensor_factory,
     )
     .unwrap();
@@ -3095,7 +3533,10 @@ async fn plan_runtime_batch_prefill_deferral_falls_back_without_failing_requests
             Some(Arc::clone(&tokenizer)),
             Some(128),
         );
-        let TokenAdmissionOutcome::Admitted(frontier) = executor
+        let TokenAdmissionOutcome::Admitted(frontier) = engine
+            .active_inner()
+            .expect("engine execution is open")
+            .model_executor
             .admit_tokens(ExecutionAdmission {
                 context: ExecutorPrefillAdmission::for_product_request(
                     &request.id,
@@ -3114,14 +3555,23 @@ async fn plan_runtime_batch_prefill_deferral_falls_back_without_failing_requests
         };
         sequence.execution_frontier = Some(frontier);
         request_ids.push(request.id.clone());
-        engine.inner.sequences.insert(request.id.clone(), sequence);
+        engine
+            .active_inner()
+            .expect("engine execution is open")
+            .sequences
+            .insert(request.id.clone(), sequence);
     }
     let batch = scheduler
         .next_batch(ferrum_interfaces::BatchHint::simple(2))
         .await
         .expect("two admitted prefills should form one scheduler cohort");
 
-    engine.inner.process_batch(&batch).await.unwrap();
+    engine
+        .active_inner()
+        .expect("engine execution is open")
+        .process_batch(&batch)
+        .await
+        .unwrap();
 
     assert_eq!(executor.batch_prefill_calls.load(Ordering::Relaxed), 1);
     assert_eq!(executor.prefill_calls.load(Ordering::Relaxed), 2);
@@ -3130,7 +3580,10 @@ async fn plan_runtime_batch_prefill_deferral_falls_back_without_failing_requests
         .lock()
         .expect("retained admission mutex poisoned")
         .is_empty());
-    let sequences = &engine.inner.sequences;
+    let sequences = &engine
+        .active_inner()
+        .expect("engine execution is open")
+        .sequences;
     for request_id in request_ids {
         let sequence_handle = sequences
             .get(&request_id)
@@ -3156,14 +3609,17 @@ async fn plan_runtime_serial_backing_growth_converges_before_batch_submission() 
         &[("test", 5), ("ok", 6), ("generated", 42)],
     ));
     let sampler: Arc<dyn Sampler + Send + Sync> = Arc::new(crate::registry::GreedySampler);
-    let executor = Arc::new(PlanRuntimeAdmissionTestExecutor::new_with_serial_backing_growth(128));
+    let executor = PlanRuntimeAdmissionTestExecutor::new_with_serial_backing_growth(128);
+    let observation = executor.observer();
+    let executor_owner = ExecutorOwner::new(Box::new(executor));
+    let executor = observation;
     let tensor_factory: Arc<dyn TensorFactory> = Arc::new(MockTensorFactory);
     let engine = ContinuousBatchEngine::new_plan_runtime(
         config,
         Arc::clone(&scheduler),
         Arc::clone(&tokenizer),
         sampler,
-        executor.clone(),
+        executor_owner,
         tensor_factory,
     )
     .unwrap();
@@ -3177,18 +3633,27 @@ async fn plan_runtime_serial_backing_growth_converges_before_batch_submission() 
             .insert(PROMPT_TOKENS_METADATA_KEY.to_string(), serde_json::json!(1));
         scheduler.submit(request.clone()).await.unwrap();
         let tokens = tokenizer.encode(&request.prompt, true).unwrap();
-        engine.inner.sequences.insert(
-            request.id.clone(),
-            SequenceState::new_with_tokenizer_and_model_vocab_size(
-                request,
-                tokens,
-                Some(Arc::clone(&tokenizer)),
-                Some(128),
-            ),
-        );
+        engine
+            .active_inner()
+            .expect("engine execution is open")
+            .sequences
+            .insert(
+                request.id.clone(),
+                SequenceState::new_with_tokenizer_and_model_vocab_size(
+                    request,
+                    tokens,
+                    Some(Arc::clone(&tokenizer)),
+                    Some(128),
+                ),
+            );
     }
 
-    engine.inner.run_iteration().await.unwrap();
+    engine
+        .active_inner()
+        .expect("engine execution is open")
+        .run_iteration()
+        .await
+        .unwrap();
 
     assert_eq!(executor.maintenance_calls.load(Ordering::Relaxed), 3);
     assert_eq!(executor.batch_prefill_calls.load(Ordering::Relaxed), 1);
@@ -3211,17 +3676,18 @@ async fn request_publication_lock_is_released_during_device_execution() {
     let tokenizer: Arc<dyn Tokenizer + Send + Sync> =
         Arc::new(PolicyTokenizer::new(128, &[("test", 5)]));
     let sampler: Arc<dyn Sampler + Send + Sync> = Arc::new(crate::registry::GreedySampler);
-    let executor = Arc::new(PlanRuntimeAdmissionTestExecutor::new_with_prefill_latency(
-        128,
-        Duration::from_millis(100),
-    ));
+    let executor =
+        PlanRuntimeAdmissionTestExecutor::new_with_prefill_latency(128, Duration::from_millis(100));
+    let observation = executor.observer();
+    let executor_owner = ExecutorOwner::new(Box::new(executor));
+    let executor = observation;
     let tensor_factory: Arc<dyn TensorFactory> = Arc::new(MockTensorFactory);
     let engine = ContinuousBatchEngine::new_plan_runtime(
         config,
         Arc::clone(&scheduler),
         Arc::clone(&tokenizer),
         sampler,
-        executor.clone(),
+        executor_owner,
         tensor_factory,
     )
     .unwrap();
@@ -3234,17 +3700,21 @@ async fn request_publication_lock_is_released_during_device_execution() {
         .insert(PROMPT_TOKENS_METADATA_KEY.to_string(), serde_json::json!(1));
     scheduler.submit(request.clone()).await.unwrap();
     let tokens = tokenizer.encode(&request.prompt, true).unwrap();
-    engine.inner.sequences.insert(
-        request.id.clone(),
-        SequenceState::new_with_tokenizer_and_model_vocab_size(
-            request,
-            tokens,
-            Some(tokenizer),
-            Some(128),
-        ),
-    );
+    engine
+        .active_inner()
+        .expect("engine execution is open")
+        .sequences
+        .insert(
+            request.id.clone(),
+            SequenceState::new_with_tokenizer_and_model_vocab_size(
+                request,
+                tokens,
+                Some(tokenizer),
+                Some(128),
+            ),
+        );
 
-    let inner = Arc::clone(&engine.inner);
+    let inner = Arc::clone(&engine.active_inner().expect("engine execution is open"));
     let iteration = tokio::spawn(async move { inner.run_iteration().await });
     tokio::time::timeout(Duration::from_millis(50), async {
         while executor.prefill_calls.load(Ordering::Acquire) == 0 {
@@ -3254,13 +3724,15 @@ async fn request_publication_lock_is_released_during_device_execution() {
     .await
     .expect("test prefill must enter device execution");
 
+    let publication_inner = engine.active_inner().expect("engine execution is open");
     let publication_guard = tokio::time::timeout(
         Duration::from_millis(20),
-        engine.inner.iteration_lock.lock(),
+        publication_inner.iteration_lock.lock(),
     )
     .await
     .expect("request publication must not wait for the device wave");
     drop(publication_guard);
+    drop(publication_inner);
     iteration.await.unwrap().unwrap();
 }
 
@@ -3274,7 +3746,10 @@ async fn plan_runtime_chunked_prefill_retries_exact_chunk_and_samples_only_final
     let tokenizer: Arc<dyn Tokenizer + Send + Sync> =
         Arc::new(ferrum_testkit::MockTokenizer::new(128));
     let sampler: Arc<dyn Sampler + Send + Sync> = Arc::new(ferrum_testkit::MockSampler);
-    let executor = Arc::new(PlanRuntimeChunkedPrefillTestExecutor::new(true));
+    let executor = PlanRuntimeChunkedPrefillTestExecutor::new(true);
+    let observation = executor.observer();
+    let executor_owner = ExecutorOwner::new(Box::new(executor));
+    let executor = observation;
     let tensor_factory: Arc<dyn TensorFactory> = Arc::new(MockTensorFactory);
     let engine = Arc::new(
         ContinuousBatchEngine::new_plan_runtime(
@@ -3282,7 +3757,7 @@ async fn plan_runtime_chunked_prefill_retries_exact_chunk_and_samples_only_final
             Arc::clone(&scheduler),
             tokenizer,
             sampler,
-            executor.clone(),
+            executor_owner,
             tensor_factory,
         )
         .unwrap(),
@@ -3310,7 +3785,10 @@ async fn plan_runtime_chunked_prefill_retries_exact_chunk_and_samples_only_final
         vec![PrefillChunk::new(0, 2, 5).unwrap()]
     );
     {
-        let sequences = &engine.inner.sequences;
+        let sequences = &engine
+            .active_inner()
+            .expect("engine execution is open")
+            .sequences;
         let sequence_handle = sequences
             .get(&request_id)
             .expect("deferred prefill retains engine sequence state");
@@ -3377,15 +3855,17 @@ async fn plan_runtime_partial_prefill_completion_commits_only_the_executor_prefi
     let tokenizer: Arc<dyn Tokenizer + Send + Sync> =
         Arc::new(ferrum_testkit::MockTokenizer::new(128));
     let sampler: Arc<dyn Sampler + Send + Sync> = Arc::new(ferrum_testkit::MockSampler);
-    let executor =
-        Arc::new(PlanRuntimeChunkedPrefillTestExecutor::new_with_partial_first_prefill());
+    let executor = PlanRuntimeChunkedPrefillTestExecutor::new_with_partial_first_prefill();
+    let observation = executor.observer();
+    let executor_owner = ExecutorOwner::new(Box::new(executor));
+    let executor = observation;
     let tensor_factory: Arc<dyn TensorFactory> = Arc::new(MockTensorFactory);
     let engine = ContinuousBatchEngine::new_plan_runtime(
         config,
         Arc::clone(&scheduler),
         tokenizer,
         sampler,
-        executor.clone(),
+        executor_owner,
         tensor_factory,
     )
     .unwrap();
@@ -3437,14 +3917,17 @@ async fn plan_runtime_one_token_prefill_without_external_releaser_fails_closed()
     let tokenizer: Arc<dyn Tokenizer + Send + Sync> =
         Arc::new(ferrum_testkit::MockTokenizer::new(128));
     let sampler: Arc<dyn Sampler + Send + Sync> = Arc::new(ferrum_testkit::MockSampler);
-    let executor = Arc::new(PlanRuntimeChunkedPrefillTestExecutor::new(true));
+    let executor = PlanRuntimeChunkedPrefillTestExecutor::new(true);
+    let observation = executor.observer();
+    let executor_owner = ExecutorOwner::new(Box::new(executor));
+    let executor = observation;
     let tensor_factory: Arc<dyn TensorFactory> = Arc::new(MockTensorFactory);
     let engine = ContinuousBatchEngine::new_plan_runtime(
         config,
         Arc::clone(&scheduler),
         tokenizer,
         sampler,
-        executor.clone(),
+        executor_owner,
         tensor_factory,
     )
     .unwrap();
@@ -3492,8 +3975,20 @@ async fn plan_runtime_one_token_prefill_without_external_releaser_fails_closed()
         .lock()
         .expect("chunked prefill retained mutex poisoned")
         .is_empty());
-    assert!(!engine.inner.sequences.get(&request_id).is_some());
-    assert_eq!(engine.inner.execution_closes.unreclaimed_count(), 0);
+    assert!(!engine
+        .active_inner()
+        .expect("engine execution is open")
+        .sequences
+        .get(&request_id)
+        .is_some());
+    assert_eq!(
+        engine
+            .active_inner()
+            .expect("engine execution is open")
+            .execution_closes
+            .unreclaimed_count(),
+        0
+    );
     assert_eq!(scheduler.active_count(), 0);
     assert_eq!(scheduler.waiting_count(), 0);
     engine.shutdown().await.unwrap();
@@ -3511,14 +4006,17 @@ async fn plan_runtime_backing_maintenance_advances_epoch_before_prefill() {
     let tokenizer: Arc<dyn Tokenizer + Send + Sync> =
         Arc::new(ferrum_testkit::MockTokenizer::new(128));
     let sampler: Arc<dyn Sampler + Send + Sync> = Arc::new(ferrum_testkit::MockSampler);
-    let executor = Arc::new(PlanRuntimeMaintenanceTestExecutor::new(128));
+    let executor = PlanRuntimeMaintenanceTestExecutor::new(128);
+    let observation = executor.observer();
+    let executor_owner = ExecutorOwner::new(Box::new(executor));
+    let executor = observation;
     let tensor_factory: Arc<dyn TensorFactory> = Arc::new(MockTensorFactory);
     let engine = ContinuousBatchEngine::new_plan_runtime(
         config,
         Arc::clone(&scheduler),
         tokenizer,
         sampler,
-        executor.clone(),
+        executor_owner,
         tensor_factory,
     )
     .unwrap();
@@ -3621,7 +4119,7 @@ async fn plan_runtime_backing_maintenance_advances_epoch_before_prefill() {
 fn plan_runtime_wait_for_release_engine() -> (
     Arc<ContinuousBatchEngine>,
     Arc<ContinuousBatchScheduler>,
-    Arc<PlanRuntimeMaintenanceTestExecutor>,
+    Arc<PlanRuntimeMaintenanceObservation>,
 ) {
     let mut config = EngineConfig::default();
     config.kv_cache.max_blocks = 128;
@@ -3629,10 +4127,13 @@ fn plan_runtime_wait_for_release_engine() -> (
     let tokenizer: Arc<dyn Tokenizer + Send + Sync> =
         Arc::new(ferrum_testkit::MockTokenizer::new(128));
     let sampler: Arc<dyn Sampler + Send + Sync> = Arc::new(ferrum_testkit::MockSampler);
-    let executor = Arc::new(PlanRuntimeMaintenanceTestExecutor::with_behavior(
+    let executor = PlanRuntimeMaintenanceTestExecutor::with_behavior(
         128,
         TestMaintenanceBehavior::WaitForRelease,
-    ));
+    );
+    let observation = executor.observer();
+    let executor_owner = ExecutorOwner::new(Box::new(executor));
+    let executor = observation;
     let tensor_factory: Arc<dyn TensorFactory> = Arc::new(MockTensorFactory);
     let engine = Arc::new(
         ContinuousBatchEngine::new_plan_runtime(
@@ -3640,7 +4141,7 @@ fn plan_runtime_wait_for_release_engine() -> (
             Arc::clone(&scheduler),
             tokenizer,
             sampler,
-            executor.clone(),
+            executor_owner,
             tensor_factory,
         )
         .unwrap(),
@@ -3648,7 +4149,7 @@ fn plan_runtime_wait_for_release_engine() -> (
     (engine, scheduler, executor)
 }
 
-async fn wait_for_capacity_wait(executor: &PlanRuntimeMaintenanceTestExecutor) {
+async fn wait_for_capacity_wait(executor: &PlanRuntimeMaintenanceObservation) {
     tokio::time::timeout(Duration::from_secs(1), async {
         while executor.maintenance_calls.load(Ordering::Acquire) == 0
             || executor.capacity_wait_registrations.load(Ordering::Acquire) == 0
@@ -3669,10 +4170,18 @@ async fn plan_runtime_capacity_pressure_waits_without_spinning_then_retries_on_r
     let inference = tokio::spawn(async move { infer_engine.infer(request).await });
 
     wait_for_capacity_wait(&executor).await;
-    let parked_iteration = engine.inner.iteration_count.load(Ordering::Acquire);
+    let parked_iteration = engine
+        .active_inner()
+        .expect("engine execution is open")
+        .iteration_count
+        .load(Ordering::Acquire);
     tokio::time::sleep(Duration::from_millis(20)).await;
     assert_eq!(
-        engine.inner.iteration_count.load(Ordering::Acquire),
+        engine
+            .active_inner()
+            .expect("engine execution is open")
+            .iteration_count
+            .load(Ordering::Acquire),
         parked_iteration,
         "a registered capacity wait must park the background loop"
     );
@@ -3712,17 +4221,34 @@ async fn plan_runtime_capacity_wait_wakes_and_cancels_when_stream_is_dropped() {
     let stream = engine.infer_stream(request).await.unwrap();
 
     wait_for_capacity_wait(&executor).await;
-    let parked_iteration = engine.inner.iteration_count.load(Ordering::Acquire);
+    let parked_iteration = engine
+        .active_inner()
+        .expect("engine execution is open")
+        .iteration_count
+        .load(Ordering::Acquire);
     drop(stream);
 
     tokio::time::timeout(Duration::from_secs(1), async {
-        while engine.inner.sequences.get(&request_id).is_some() {
+        while engine
+            .active_inner()
+            .expect("engine execution is open")
+            .sequences
+            .get(&request_id)
+            .is_some()
+        {
             tokio::task::yield_now().await;
         }
     })
     .await
     .expect("dropping the stream must wake cancellation without a capacity release");
-    assert!(engine.inner.iteration_count.load(Ordering::Acquire) > parked_iteration);
+    assert!(
+        engine
+            .active_inner()
+            .expect("engine execution is open")
+            .iteration_count
+            .load(Ordering::Acquire)
+            > parked_iteration
+    );
     assert_eq!(scheduler.trace_phase(&request_id), None);
     assert_eq!(scheduler.trace_snapshot().cancelled_total, 1);
     assert_eq!(scheduler.waiting_count(), 0);
@@ -3746,7 +4272,13 @@ async fn plan_runtime_capacity_wait_wakes_and_cancels_when_sync_future_is_aborte
         .is_cancelled());
 
     tokio::time::timeout(Duration::from_secs(1), async {
-        while engine.inner.sequences.get(&request_id).is_some() {
+        while engine
+            .active_inner()
+            .expect("engine execution is open")
+            .sequences
+            .get(&request_id)
+            .is_some()
+        {
             tokio::task::yield_now().await;
         }
     })
@@ -3766,10 +4298,13 @@ async fn plan_runtime_capacity_wait_accepts_new_work_and_shutdown_without_reprob
     let tokenizer: Arc<dyn Tokenizer + Send + Sync> =
         Arc::new(ferrum_testkit::MockTokenizer::new(128));
     let sampler: Arc<dyn Sampler + Send + Sync> = Arc::new(ferrum_testkit::MockSampler);
-    let executor = Arc::new(PlanRuntimeMaintenanceTestExecutor::with_behavior(
+    let executor = PlanRuntimeMaintenanceTestExecutor::with_behavior(
         128,
         TestMaintenanceBehavior::WaitForRelease,
-    ));
+    );
+    let observation = executor.observer();
+    let executor_owner = ExecutorOwner::new(Box::new(executor));
+    let executor = observation;
     let tensor_factory: Arc<dyn TensorFactory> = Arc::new(MockTensorFactory);
     let engine = Arc::new(
         ContinuousBatchEngine::new_plan_runtime(
@@ -3777,11 +4312,12 @@ async fn plan_runtime_capacity_wait_accepts_new_work_and_shutdown_without_reprob
             scheduler,
             tokenizer,
             sampler,
-            executor.clone(),
+            executor_owner,
             tensor_factory,
         )
         .unwrap(),
     );
+    let original_inner = Arc::downgrade(&engine.active_inner().expect("engine execution is open"));
     let background = engine.start_loop().unwrap();
 
     let mut first = policy_request();
@@ -3818,11 +4354,20 @@ async fn plan_runtime_capacity_wait_accepts_new_work_and_shutdown_without_reprob
     assert_eq!(executor.prefill_calls.load(Ordering::Acquire), 0);
 
     engine.shutdown().await.unwrap();
-    tokio::time::timeout(Duration::from_secs(1), background.wait())
+    let report = tokio::time::timeout(Duration::from_secs(1), background.wait())
         .await
-        .expect("shutdown must interrupt the capacity waiter")
+        .expect("shutdown must interrupt the capacity waiter");
+    report
         .result()
         .expect("capacity-waiting background loop must not panic");
+    assert_eq!(
+        report
+            .executor_shutdown()
+            .expect("standalone Engine closes its original executor")
+            .snapshot()
+            .phase(),
+        ferrum_execution::executor_lifecycle::ExecutorShutdownPhase::Retired,
+    );
     for task in [first_task, second_task] {
         assert!(tokio::time::timeout(Duration::from_secs(1), task)
             .await
@@ -3830,9 +4375,21 @@ async fn plan_runtime_capacity_wait_accepts_new_work_and_shutdown_without_reprob
             .expect("inference task must not panic")
             .is_err());
     }
-    assert!(engine.inner.sequences.is_empty());
-    assert_eq!(engine.inner.scheduler.waiting_count(), 0);
-    assert_eq!(engine.inner.scheduler.trace_snapshot().active_len, 0);
+    assert!(matches!(
+        engine.active_inner(),
+        Err(FerrumError::Scheduler { message }) if message.contains("engine is closing")
+    ));
+    assert!(
+        original_inner.upgrade().is_none(),
+        "the original sequence registry and Engine scope are retired"
+    );
+    assert!(
+        executor.tokens.0.upgrade().is_none(),
+        "observation must not keep the original executor token state alive"
+    );
+    assert!(executor.retained.lock().unwrap().is_empty());
+    assert_eq!(engine.scheduler.waiting_count(), 0);
+    assert_eq!(engine.scheduler.trace_snapshot().active_len, 0);
     assert_eq!(executor.admission_probes.load(Ordering::Acquire), 2);
     assert_eq!(executor.prefill_calls.load(Ordering::Acquire), 0);
 }
@@ -3845,17 +4402,20 @@ async fn plan_runtime_retry_admission_does_not_require_a_published_epoch() {
     let tokenizer: Arc<dyn Tokenizer + Send + Sync> =
         Arc::new(ferrum_testkit::MockTokenizer::new(128));
     let sampler: Arc<dyn Sampler + Send + Sync> = Arc::new(ferrum_testkit::MockSampler);
-    let executor = Arc::new(PlanRuntimeMaintenanceTestExecutor::with_behavior(
+    let executor = PlanRuntimeMaintenanceTestExecutor::with_behavior(
         128,
         TestMaintenanceBehavior::RetryAdmission,
-    ));
+    );
+    let observation = executor.observer();
+    let executor_owner = ExecutorOwner::new(Box::new(executor));
+    let executor = observation;
     let tensor_factory: Arc<dyn TensorFactory> = Arc::new(MockTensorFactory);
     let engine = ContinuousBatchEngine::new_plan_runtime(
         config,
         Arc::clone(&scheduler),
         tokenizer,
         sampler,
-        executor.clone(),
+        executor_owner,
         tensor_factory,
     )
     .unwrap();
@@ -3888,16 +4448,17 @@ async fn plan_runtime_invalid_maintenance_fails_waiting_request_without_retry_lo
         let tokenizer: Arc<dyn Tokenizer + Send + Sync> =
             Arc::new(ferrum_testkit::MockTokenizer::new(128));
         let sampler: Arc<dyn Sampler + Send + Sync> = Arc::new(ferrum_testkit::MockSampler);
-        let executor = Arc::new(PlanRuntimeMaintenanceTestExecutor::with_behavior(
-            128, behavior,
-        ));
+        let executor = PlanRuntimeMaintenanceTestExecutor::with_behavior(128, behavior);
+        let observation = executor.observer();
+        let executor_owner = ExecutorOwner::new(Box::new(executor));
+        let executor = observation;
         let tensor_factory: Arc<dyn TensorFactory> = Arc::new(MockTensorFactory);
         let engine = ContinuousBatchEngine::new_plan_runtime(
             config,
             Arc::clone(&scheduler),
             tokenizer,
             sampler,
-            executor.clone(),
+            executor_owner,
             tensor_factory,
         )
         .unwrap();
@@ -3927,8 +4488,20 @@ async fn plan_runtime_invalid_maintenance_fails_waiting_request_without_retry_lo
             0
         );
         assert!(executor.tokens.frontier_for_request(&request_id).is_none());
-        assert!(!engine.inner.sequences.get(&request_id).is_some());
-        assert_eq!(engine.inner.execution_closes.unreclaimed_count(), 0);
+        assert!(!engine
+            .active_inner()
+            .expect("engine execution is open")
+            .sequences
+            .get(&request_id)
+            .is_some());
+        assert_eq!(
+            engine
+                .active_inner()
+                .expect("engine execution is open")
+                .execution_closes
+                .unreclaimed_count(),
+            0
+        );
         assert_eq!(scheduler.active_count(), 0);
         assert_eq!(scheduler.waiting_count(), 0);
         assert_eq!(scheduler.trace_snapshot().dynamic_admission_failed, 1);
@@ -3945,7 +4518,10 @@ async fn plan_runtime_invalid_maintenance_fails_waiting_request_without_retry_lo
 #[should_panic(expected = "request slot lease dropped without explicit reject or close")]
 fn request_slot_lease_drop_without_consumption_panics_in_tests() {
     let engine = test_continuous_engine();
-    let _lease = RequestSlotLease::open(&engine.inner, RequestId::new());
+    let _lease = RequestSlotLease::open(
+        &engine.active_inner().expect("engine execution is open"),
+        RequestId::new(),
+    );
 }
 
 #[test]
@@ -3954,7 +4530,10 @@ fn sequence_state_drop_with_owned_request_slot_panics_in_tests() {
     let engine = test_continuous_engine();
     let request = policy_request();
     let mut sequence = SequenceState::new(request.clone(), vec![TokenId::new(1)]);
-    sequence.request_slot = Some(RequestSlotLease::open(&engine.inner, request.id));
+    sequence.request_slot = Some(RequestSlotLease::open(
+        &engine.active_inner().expect("engine execution is open"),
+        request.id,
+    ));
 }
 
 #[tokio::test]
@@ -3963,14 +4542,8 @@ async fn scheduler_trace_plan_stats_reports_request_details() {
     let request = policy_request();
     let request_id = request.id.clone();
 
-    engine
-        .inner
-        .scheduler
-        .submit(request.clone())
-        .await
-        .unwrap();
+    engine.scheduler.submit(request.clone()).await.unwrap();
     let batch = engine
-        .inner
         .scheduler
         .next_batch(ferrum_interfaces::BatchHint {
             max_batch_size: 4,
@@ -3993,11 +4566,17 @@ async fn scheduler_trace_plan_stats_reports_request_details() {
     );
     seq.prefill_tokens_processed = 1;
     {
-        let sequences = &engine.inner.sequences;
+        let sequences = &engine
+            .active_inner()
+            .expect("engine execution is open")
+            .sequences;
         sequences.insert(request_id.clone(), seq);
     }
 
-    let stats = engine.inner.scheduler_trace_plan_stats(&batch);
+    let stats = engine
+        .active_inner()
+        .expect("engine execution is open")
+        .scheduler_trace_plan_stats(&batch);
     assert_eq!(stats.batch_size, 1);
     assert_eq!(stats.prefill_items, 1);
     assert_eq!(stats.prefill_tokens, 4);
@@ -5242,9 +5821,16 @@ fn advertised_context_capacity_matches_the_request_admission_boundary() {
     validate_request_context_budget(
         &request,
         capacity - 1,
-        &engine.inner.config,
-        &engine.inner.runtime_config,
-        engine.inner.model_executor.kv_capacity(),
+        &engine.config,
+        &engine
+            .active_inner()
+            .expect("engine execution is open")
+            .runtime_config,
+        engine
+            .active_inner()
+            .expect("engine execution is open")
+            .model_executor
+            .kv_capacity(),
     )
     .expect("advertised capacity must be accepted");
     request.sampling_params.max_tokens = 2;
@@ -5252,9 +5838,9 @@ fn advertised_context_capacity_matches_the_request_admission_boundary() {
         validate_request_context_budget(
             &request,
             capacity - 1,
-            &engine.inner.config,
-            &engine.inner.runtime_config,
-            engine.inner.model_executor.kv_capacity(),
+            &engine.config,
+            &engine.active_inner().expect("engine execution is open").runtime_config,
+            engine.active_inner().expect("engine execution is open").model_executor.kv_capacity(),
         ),
         Err(FerrumError::ContextLengthExceeded { capacity: actual, .. }) if actual == capacity
     ));
@@ -5531,7 +6117,7 @@ async fn engine_status_reports_kv_cache_memory_from_manager_stats() {
         })
         .await
         .unwrap();
-    let executor: Arc<dyn ModelExecutor + Send + Sync> = Arc::new(MockModelExecutor::instant(64));
+    let executor = ExecutorOwner::new(Box::new(MockModelExecutor::instant(64)));
     let tensor_factory: Arc<dyn TensorFactory> = Arc::new(MockTensorFactory);
     let engine = ContinuousBatchEngine::new(
         config,
@@ -8485,3 +9071,23 @@ fn sample_masks_metadata_initial_token_text_only_before_first_generation() {
 }
 
 mod auto_tools_json;
+
+impl PlanRuntimeChunkedPrefillObservation {
+    fn publish_release(&self) {
+        let epoch = self.release_epoch.fetch_add(1, Ordering::AcqRel) + 1;
+        self.capacity_signal.send_replace(epoch);
+    }
+}
+
+impl PlanRuntimeMaintenanceObservation {
+    fn publish_release(&self) {
+        let release_epoch = self.release_epoch.fetch_add(1, Ordering::AcqRel) + 1;
+        self.capacity_signal.send_replace(release_epoch);
+    }
+}
+
+impl PlanRuntimeBatchDecodeObservation {
+    fn token_frontier_for_request(&self, request: &RequestId) -> Option<ExecutionFrontier> {
+        self.tokens.frontier_for_request(request)
+    }
+}

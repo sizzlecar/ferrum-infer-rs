@@ -342,6 +342,10 @@ impl InferenceEngine for ToolFeedbackLlm {
         self.base.shutdown().await
     }
 
+    async fn wait_for_shutdown_completion(&self) -> ferrum_types::Result<()> {
+        self.base.wait_for_shutdown_completion().await
+    }
+
     fn config(&self) -> &EngineConfig {
         self.base.config()
     }

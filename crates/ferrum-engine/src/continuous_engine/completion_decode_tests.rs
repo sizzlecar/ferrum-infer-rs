@@ -111,7 +111,8 @@ async fn decode_failure_closes_actual_cpu(once: bool) {
         .store(if once { 1 } else { usize::MAX }, Ordering::SeqCst);
     let error = fixture
         .engine
-        .inner
+        .active_inner()
+        .expect("engine execution is open")
         .complete_request_for_test(&fixture.request_id, FinishReason::Length)
         .await
         .unwrap_err();
@@ -120,7 +121,8 @@ async fn decode_failure_closes_actual_cpu(once: bool) {
     assert_tokenizer_error(
         &fixture
             .engine
-            .inner
+            .active_inner()
+            .expect("engine execution is open")
             .output_tasks
             .take_control_error()
             .unwrap(),
@@ -133,7 +135,8 @@ async fn decode_failure_closes_actual_cpu(once: bool) {
         // Recovery of the decoder cannot erase the earlier failed flush.
         assert!(fixture
             .engine
-            .inner
+            .active_inner()
+            .expect("engine execution is open")
             .tokenizer
             .decode(&[TokenId(3)], true)
             .is_ok());
@@ -162,7 +165,8 @@ async fn completion_terminal_decode_error_keeps_failed_close_owner_and_control_e
         .store(true, Ordering::SeqCst);
     fixture
         .engine
-        .inner
+        .active_inner()
+        .expect("engine execution is open")
         .complete_request_detached(&fixture.request_id, FinishReason::Length, None)
         .unwrap();
     // This current-thread test has not yielded. The synchronous handoff must
@@ -172,16 +176,30 @@ async fn completion_terminal_decode_error_keeps_failed_close_owner_and_control_e
     assert_tokenizer_error(
         &fixture
             .engine
-            .inner
+            .active_inner()
+            .expect("engine execution is open")
             .output_tasks
             .take_control_error()
             .unwrap(),
     );
-    fixture.engine.inner.output_tasks.join_current().await;
-    fixture.engine.inner.execution_closes.join_observers().await;
+    fixture
+        .engine
+        .active_inner()
+        .expect("engine execution is open")
+        .output_tasks
+        .join_current()
+        .await;
+    fixture
+        .engine
+        .active_inner()
+        .expect("engine execution is open")
+        .execution_closes
+        .join_observers()
+        .await;
     let close_error = fixture
         .engine
-        .inner
+        .active_inner()
+        .expect("engine execution is open")
         .output_tasks
         .take_control_error()
         .unwrap();
@@ -191,23 +209,28 @@ async fn completion_terminal_decode_error_keeps_failed_close_owner_and_control_e
     assert_eq!(fixture.executor.close_call_counts(), (0, 1));
     assert!(fixture
         .engine
-        .inner
+        .active_inner()
+        .expect("engine execution is open")
         .sequences
         .get(&fixture.request_id)
         .is_none());
     assert!(fixture.identity.observed_end().is_none());
-    assert_eq!(fixture.engine.inner.execution_closes.unreclaimed_count(), 1);
+    assert_eq!(
+        fixture
+            .engine
+            .active_inner()
+            .expect("engine execution is open")
+            .execution_closes
+            .unreclaimed_count(),
+        1
+    );
     assert_eq!(actual::slot_events(&fixture, ResourceAction::Release), 0);
     assert_eq!(
         actual::slot_events(&fixture, ResourceAction::RequestClose),
         0
     );
     assert_eq!(
-        fixture
-            .engine
-            .inner
-            .scheduler
-            .confirmed_capacity_release_epoch(),
+        fixture.engine.scheduler.confirmed_capacity_release_epoch(),
         0
     );
     {
@@ -246,7 +269,8 @@ async fn completion_terminal_decode_error_preserves_prior_client_error() {
     let original = FerrumError::request_validation("original explicit client failure");
     let control = fixture
         .engine
-        .inner
+        .active_inner()
+        .expect("engine execution is open")
         .complete_request_with_error(&fixture.request_id, original.clone())
         .await
         .unwrap_err();
@@ -257,7 +281,8 @@ async fn completion_terminal_decode_error_preserves_prior_client_error() {
     assert_tokenizer_error(
         &fixture
             .engine
-            .inner
+            .active_inner()
+            .expect("engine execution is open")
             .output_tasks
             .take_control_error()
             .unwrap(),
@@ -272,7 +297,8 @@ async fn pending_span_terminal_provenance(decode_fails: bool) {
     let (mut fixture, fault) = fixture().await;
     let handle = fixture
         .engine
-        .inner
+        .active_inner()
+        .expect("engine execution is open")
         .sequences
         .get(&fixture.request_id)
         .unwrap();
@@ -283,7 +309,8 @@ async fn pending_span_terminal_provenance(decode_fails: bool) {
             state.stream_sender.as_ref().unwrap().clone(),
             fixture
                 .engine
-                .inner
+                .active_inner()
+                .expect("engine execution is open")
                 .tokenizer
                 .decode(&state.generated_tokens, true)
                 .unwrap(),
@@ -301,7 +328,10 @@ async fn pending_span_terminal_provenance(decode_fails: bool) {
     // arm deliberately violates its byte range while keeping decoding valid.
     sender
         .publish_text(
-            &fixture.engine.inner,
+            &fixture
+                .engine
+                .active_inner()
+                .expect("engine execution is open"),
             StreamChunk {
                 request_id: fixture.request_id.clone(),
                 text,
@@ -328,7 +358,8 @@ async fn pending_span_terminal_provenance(decode_fails: bool) {
         FerrumError::request_validation("prior client failure must not conceal provenance");
     fixture
         .engine
-        .inner
+        .active_inner()
+        .expect("engine execution is open")
         .complete_request_detached(
             &fixture.request_id,
             FinishReason::Error,
@@ -356,7 +387,8 @@ async fn pending_span_terminal_provenance(decode_fails: bool) {
         // still blocked. Later delivery must not report that same failure again.
         let recorded = fixture
             .engine
-            .inner
+            .active_inner()
+            .expect("engine execution is open")
             .output_tasks
             .take_control_error()
             .unwrap();
@@ -364,15 +396,33 @@ async fn pending_span_terminal_provenance(decode_fails: bool) {
     } else {
         assert!(fixture
             .engine
-            .inner
+            .active_inner()
+            .expect("engine execution is open")
             .output_tasks
             .take_control_error()
             .is_none());
     }
     drop(held);
-    fixture.engine.inner.output_tasks.join_current().await;
-    fixture.engine.inner.execution_closes.join_observers().await;
-    fixture.engine.inner.drain_execution_closes().unwrap();
+    fixture
+        .engine
+        .active_inner()
+        .expect("engine execution is open")
+        .output_tasks
+        .join_current()
+        .await;
+    fixture
+        .engine
+        .active_inner()
+        .expect("engine execution is open")
+        .execution_closes
+        .join_observers()
+        .await;
+    fixture
+        .engine
+        .active_inner()
+        .expect("engine execution is open")
+        .drain_execution_closes()
+        .unwrap();
     assert_eq!(
         sender.failure().unwrap().to_string(),
         projection.to_string()
@@ -381,7 +431,8 @@ async fn pending_span_terminal_provenance(decode_fails: bool) {
         assert_eq!(
             fixture
                 .engine
-                .inner
+                .active_inner()
+                .expect("engine execution is open")
                 .output_tasks
                 .take_control_error()
                 .unwrap()
@@ -391,7 +442,8 @@ async fn pending_span_terminal_provenance(decode_fails: bool) {
     }
     assert!(fixture
         .engine
-        .inner
+        .active_inner()
+        .expect("engine execution is open")
         .output_tasks
         .take_control_error()
         .is_none());

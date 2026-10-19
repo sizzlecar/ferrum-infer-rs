@@ -4,7 +4,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use ferrum_execution::ModelExecutor;
+use ferrum_execution::executor_lifecycle::ExecutorOwner;
 use ferrum_models::vnext::ProductionModelSourceBundle;
 use ferrum_models::{ConfigManager, LlmExecutor, ModelDefinition};
 use ferrum_types::{ModelInfo, Result};
@@ -24,11 +24,11 @@ pub(super) fn bind_executor(
     model: Box<dyn ferrum_models::common::DecoderOnlyLLM>,
     info: ModelInfo,
     sources: Option<Arc<ProductionModelSourceBundle>>,
-) -> Arc<dyn ModelExecutor + Send + Sync> {
-    Arc::new(match sources {
+) -> ExecutorOwner {
+    ExecutorOwner::new(Box::new(match sources {
         Some(sources) => LlmExecutor::new_with_model_sources(model, info, sources),
         None => LlmExecutor::new(model, info),
-    })
+    }))
 }
 
 #[cfg(test)]
@@ -147,7 +147,8 @@ mod tests {
         engine.backend.device = Device::CPU;
         let component =
             ComponentConfig::from_engine_config_and_sources(&engine, Some(Arc::clone(&sources)));
-        let executor = LlmExecutorFactory.create(&component).await.unwrap();
+        let owner = LlmExecutorFactory.create(&component).await.unwrap();
+        let executor = owner.scope().unwrap();
         assert_eq!(executor.info().hidden_size, 8);
         assert_eq!(executor.info().num_layers, 1);
         assert_eq!(
@@ -194,6 +195,13 @@ mod tests {
             panic!("tiny CPU model must release its exact incarnation")
         };
         assert_eq!(ended.sequence(), frontier.sequence());
+        drop(executor);
+        let retired = owner.begin_shutdown().wait().await;
+        assert_eq!(
+            retired.phase(),
+            ferrum_execution::executor_lifecycle::ExecutorShutdownPhase::Retired
+        );
+        retired.result().unwrap();
     }
 
     #[tokio::test]

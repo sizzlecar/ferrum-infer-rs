@@ -575,7 +575,7 @@ impl<R: DeviceRuntime> VNextSequenceRegistry<R> {
             }
         }
     }
-    fn retained_sequences(&self) -> Vec<Arc<VNextSequence<R>>> {
+    pub(super) fn retained_sequences(&self) -> Vec<Arc<VNextSequence<R>>> {
         let mut sequences = self.active.values().cloned().collect::<Vec<_>>();
         for slot in self.prefills.values() {
             if let VNextPrefillSlotState::Ready(sequence)

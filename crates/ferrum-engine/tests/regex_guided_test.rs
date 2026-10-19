@@ -143,17 +143,15 @@ fn make_engine() -> ContinuousBatchEngine {
     // Bias '*' (42) heavily; emit STOP_TOKEN ('z' = 122) after 3 decode
     // steps. With the regex mask `[0-9]+`, '*' gets -INF and the greedy
     // sampler falls through to the smallest unmasked token = '0' (48).
-    let executor = Arc::new(ConfigurableModelExecutor::with_token_sequence(
-        VOCAB,
-        vec![42, 42, 42, STOP_TOKEN],
-    ));
+    let executor =
+        ConfigurableModelExecutor::with_token_sequence(VOCAB, vec![42, 42, 42, STOP_TOKEN]);
     ContinuousBatchEngine::new(
         config,
         scheduler,
         tokenizer,
         sampler,
         kv_cache,
-        executor,
+        ferrum_execution::executor_lifecycle::ExecutorOwner::new(Box::new(executor)),
         tensor_factory,
     )
     .expect("legacy engine composition must match executor authority")

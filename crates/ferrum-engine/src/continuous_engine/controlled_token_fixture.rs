@@ -154,6 +154,34 @@ pub(super) fn cancel(
         .ok_or_else(|| FerrumError::internal("fixture close has no exact retained incarnation"))
 }
 
+/// Retire every original host-only incarnation through its normal close hooks.
+pub(super) fn shutdown(
+    executor: &impl ControlledHooks,
+    state: &ControlledTokenState,
+) -> Result<()> {
+    let sequences = state.entries.lock().keys().cloned().collect::<Vec<_>>();
+    for sequence in sequences {
+        let outcome = cancel(executor, state, &sequence)?;
+        if let Some(error) = outcome.error {
+            return Err(error);
+        }
+        match outcome.disposition {
+            ExecutionCloseDisposition::Ended(ended) if ended.sequence() == &sequence => {}
+            _ => {
+                return Err(FerrumError::internal(
+                    "fixture shutdown did not retire its original incarnation",
+                ))
+            }
+        }
+    }
+    if !state.entries.lock().is_empty() {
+        return Err(FerrumError::internal(
+            "fixture shutdown retains live incarnations",
+        ));
+    }
+    Ok(())
+}
+
 pub(super) async fn finish(
     executor: &impl ControlledHooks,
     state: &ControlledTokenState,

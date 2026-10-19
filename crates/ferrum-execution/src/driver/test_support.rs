@@ -9,6 +9,7 @@ pub mod execution_facts;
 pub mod lifecycle;
 pub mod observability;
 pub mod sampling;
+pub mod shutdown;
 pub mod startup;
 pub mod token_execution;
 pub use super::prefix_cache::test_support as prefix;

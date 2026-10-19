@@ -431,7 +431,7 @@ impl EngineInner {
         let capture_trace = self.scheduler_trace_jsonl.is_some();
         let mut records = Vec::<ExecutorSchedulerTraceRecord>::new();
         let mut maintenance =
-            PendingPrefillMaintenance::new(self.model_executor.as_ref(), Vec::new());
+            PendingPrefillMaintenance::new(self.model_executor.as_ref().as_ref(), Vec::new());
         let mut prefix_pressure = false;
         let prepared = async {
             let mut round = self

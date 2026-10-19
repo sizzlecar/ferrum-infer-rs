@@ -123,6 +123,15 @@ pub fn contract_groups(backend: Backend) -> Vec<ContractGroup> {
             name: format!("{module}::{name}"),
         })
         .collect();
+    submission_tests.push(ContractTest {
+        package: "ferrum-models".into(),
+        target: "ferrum_models".into(),
+        kind: "lib".into(),
+        name: format!(
+            "executor::driver_contract_tests::sampling::shutdown::native_shutdown_{}_joins_cancelled_submission_after_waiter_drop",
+            backend_name(backend),
+        ),
+    });
     if backend == Backend::Cuda {
         submission_tests.push(ContractTest {
             package: "ferrum-kernels".into(),
@@ -295,6 +304,26 @@ pub fn contract_groups(backend: Backend) -> Vec<ContractGroup> {
     groups.extend(numerical::groups(backend));
     groups.extend(compatibility::groups(backend));
     if backend != Backend::Cpu {
+        // Lifecycle recovery compares independent models at the same physical
+        // batch shape. Keep the original M=1/M=2 numerical obligation separate
+        // and mandatory, including when the lifecycle assertions pass.
+        groups.push(ContractGroup {
+            id: format!(
+                "backend-contract.{}.legacy-physical-batch-numerics",
+                backend_name(backend),
+            ),
+            behavior: Behavior::KernelNumerics,
+            entrypoints: Vec::new(),
+            tests: vec![ContractTest {
+                package: "ferrum-models".into(),
+                target: "ferrum_models".into(),
+                kind: "lib".into(),
+                name: format!(
+                    "models::llama_family_forward_batched::tests::physical_batch_logits_match_single_item_decode_on_{}",
+                    backend_name(backend),
+                ),
+            }],
+        });
         // Shared legacy weight loading has its own numerical contract. These
         // checks do not establish qualification for a typed model plan.
         groups.push(ContractGroup {
@@ -618,6 +647,37 @@ mod tests {
                     })
                     .collect(),
             },
+        }
+    }
+
+    #[test]
+    fn legacy_lifecycle_receipt_cannot_replace_physical_batch_numerical_execution() {
+        for backend in [Backend::Metal, Backend::Cuda] {
+            let report = report_fixture(backend);
+            verify_report(backend, &report).unwrap();
+            let numerical_id = format!(
+                "backend-contract.{}.legacy-physical-batch-numerics",
+                backend_name(backend),
+            );
+            let mut failed = report.clone();
+            let execution = failed
+                .execution
+                .groups
+                .iter_mut()
+                .find(|group| group.id == numerical_id)
+                .unwrap()
+                .tests[0]
+                .execution
+                .as_mut()
+                .unwrap();
+            execution.exit_code = Some(1);
+            assert!(verify_report(backend, &failed).is_err());
+            let mut missing = report;
+            missing
+                .execution
+                .groups
+                .retain(|group| group.id != numerical_id);
+            assert!(verify_report(backend, &missing).is_err());
         }
     }
 

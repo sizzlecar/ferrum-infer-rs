@@ -4,6 +4,7 @@
 //! to produce specific token sequences, emit EOS after N tokens, etc.
 
 use crate::executor::token_state::TokenState;
+use crate::executor_observation::{ExecutorCounters, ExecutorObservation};
 use async_trait::async_trait;
 use ferrum_execution::token_execution::*;
 use ferrum_execution::{
@@ -15,7 +16,8 @@ use ferrum_execution::{
 };
 use ferrum_types::{DataType, Device, ModelInfo, ModelType, Result};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
+use std::sync::Arc;
 
 /// Model executor that produces a configurable sequence of tokens.
 pub struct ConfigurableModelExecutor {
@@ -26,11 +28,16 @@ pub struct ConfigurableModelExecutor {
     eos_after: Option<usize>,
     /// EOS token ID.
     eos_token: u32,
-    decode_count: AtomicU64,
+    counters: Arc<ExecutorCounters>,
     tokens: TokenState,
 }
 
 impl ConfigurableModelExecutor {
+    /// Observe counts without retaining this executor or its resources.
+    pub fn observer(&self) -> ExecutorObservation {
+        ExecutorObservation::new(&self.counters)
+    }
+
     /// Create executor that cycles through the given token sequence.
     pub fn with_token_sequence(vocab_size: usize, tokens: Vec<u32>) -> Self {
         Self {
@@ -38,7 +45,7 @@ impl ConfigurableModelExecutor {
             token_sequence: tokens,
             eos_after: None,
             eos_token: 2, // common EOS
-            decode_count: AtomicU64::new(0),
+            counters: Arc::default(),
             tokens: TokenState::default(),
         }
     }
@@ -50,7 +57,7 @@ impl ConfigurableModelExecutor {
             token_sequence: vec![42], // default token before EOS
             eos_after: Some(n),
             eos_token,
-            decode_count: AtomicU64::new(0),
+            counters: Arc::default(),
             tokens: TokenState::default(),
         }
     }
@@ -58,6 +65,13 @@ impl ConfigurableModelExecutor {
 
 #[async_trait]
 impl ModelExecutor for ConfigurableModelExecutor {
+    fn begin_shutdown(
+        self: Arc<Self>,
+        permit: &ferrum_execution::executor_lifecycle::ExecutorShutdownPermit,
+    ) -> ferrum_execution::executor_lifecycle::ExecutorShutdownObserver {
+        crate::host_shutdown::begin(self, permit, |executor| executor.tokens.shutdown())
+    }
+
     async fn admit_tokens(&self, input: ExecutionAdmission<'_>) -> Result<TokenAdmissionOutcome> {
         if self.token_sequence.is_empty() {
             return Err(ferrum_types::FerrumError::request_validation(
@@ -92,7 +106,7 @@ impl ModelExecutor for ConfigurableModelExecutor {
                 logits
             })?;
         if matches!(outcome, ExecutionBatchOutcome::Completed(_)) {
-            self.decode_count.fetch_add(
+            self.counters.decode.fetch_add(
                 work.iter()
                     .filter(|input| matches!(input.work(), TokenWork::Decode { .. }))
                     .count() as u64,
@@ -146,7 +160,7 @@ impl ModelExecutor for ConfigurableModelExecutor {
             is_ready: true,
             current_batch_size: 0,
             prefill_operations: 0,
-            decode_operations: self.decode_count.load(Ordering::Relaxed),
+            decode_operations: self.counters.decode.load(Ordering::Relaxed),
             avg_prefill_time_ms: 0.0,
             avg_decode_time_ms: 0.0,
             memory_usage: ExecutorMemoryUsage {

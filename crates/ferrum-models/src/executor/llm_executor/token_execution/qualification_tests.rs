@@ -148,7 +148,7 @@ async fn terminal(close: ExecutionCloseOutcome) -> ExecutionEnded {
 
 fn assert_all_slots_free(executor: &LlmExecutor, paged: bool) {
     assert!(executor.token_sequences.lock().live.is_empty());
-    let model = executor.model.lock();
+    let model = executor.lock_model().unwrap();
     match model.kv_slot_capacity_snapshot() {
         Some(snapshot) => {
             assert!(paged);
@@ -358,7 +358,7 @@ async fn qualification_unwrapped_metal_cancelled_delivery_closes_original_and_ke
         // Hold the real model mutex: the actual worker cannot perform work or
         // release KV until it is returned. No model wrapper overrides mode or
         // supplies a terminal observation. No guard crosses an await.
-        let model = executor.model.lock();
+        let model = executor.lock_model().unwrap();
         let before = model.kv_slot_capacity_snapshot().unwrap();
         assert_eq!(before.free_blocks, 2);
         let mut pending = Box::pin(executor.execute_tokens(&work));
@@ -389,6 +389,8 @@ async fn qualification_unwrapped_metal_cancelled_delivery_closes_original_and_ke
         executor
             .model
             .lock()
+            .as_ref()
+            .expect("qualified model is still live")
             .kv_slot_capacity_snapshot()
             .unwrap()
             .free_blocks,
@@ -598,6 +600,8 @@ mod encoded_failure {
             executor
                 .model
                 .lock()
+                .as_ref()
+                .expect("qualified model is still live")
                 .kv_slot_capacity_snapshot()
                 .unwrap()
                 .free_blocks,
@@ -743,6 +747,10 @@ async fn qualification_unwrapped_metal_backbone_and_partial_stage_remain_unsuppo
         ));
         assert!(executor.token_worker.get().is_none());
         assert!(executor.token_sequences.lock().live.is_empty());
-        assert!(executor.model.lock().kv_slot_capacity_snapshot().is_none());
+        assert!(executor
+            .lock_model()
+            .unwrap()
+            .kv_slot_capacity_snapshot()
+            .is_none());
     }
 }

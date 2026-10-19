@@ -12,9 +12,15 @@ async fn disabled_trace_skips_payloads_through_real_cpu_stream_and_completion() 
         config.runtime.batch_decode_prof = true;
     });
     fixture.executor.remove_execution_gate();
-    fixture.engine.inner.write_scheduler_trace_event(|| {
-        panic!("disabled legacy trace must not evaluate its payload")
-    });
+    let trace_payload_builds =
+        Arc::clone(&fixture.engine.active_inner().unwrap().trace_payload_builds);
+    fixture
+        .engine
+        .active_inner()
+        .unwrap()
+        .write_scheduler_trace_event(|| {
+            panic!("disabled legacy trace must not evaluate its payload")
+        });
     let stream = fixture
         .engine
         .infer_stream(fixture.request())
@@ -40,14 +46,7 @@ async fn disabled_trace_skips_payloads_through_real_cpu_stream_and_completion() 
     fixture.engine.shutdown().await.unwrap();
     assert_eq!(fixture.executor.closes.load(Ordering::SeqCst), 2);
     assert!(fixture.executor.observed.lock().model.kv_caches.is_empty());
-    assert_eq!(
-        fixture
-            .engine
-            .inner
-            .trace_payload_builds
-            .load(Ordering::Relaxed),
-        0
-    );
+    assert_eq!(trace_payload_builds.load(Ordering::Relaxed), 0);
 }
 
 #[tokio::test]
@@ -59,6 +58,8 @@ async fn enabled_trace_keeps_real_cpu_work_and_scheduler_fields() {
         config.runtime.profile_detail = ObservabilityProfileDetail::Full;
     });
     fixture.executor.remove_execution_gate();
+    let trace_payload_builds =
+        Arc::clone(&fixture.engine.active_inner().unwrap().trace_payload_builds);
     let response = tokio::time::timeout(
         Duration::from_secs(3),
         fixture.engine.infer(fixture.request()),
@@ -71,14 +72,7 @@ async fn enabled_trace_keeps_real_cpu_work_and_scheduler_fields() {
     fixture.engine.shutdown().await.unwrap();
     assert_eq!(fixture.executor.closes.load(Ordering::SeqCst), 1);
     assert!(fixture.executor.observed.lock().model.kv_caches.is_empty());
-    assert!(
-        fixture
-            .engine
-            .inner
-            .trace_payload_builds
-            .load(Ordering::Relaxed)
-            > 0
-    );
+    assert!(trace_payload_builds.load(Ordering::Relaxed) > 0);
     let events: Vec<serde_json::Value> = std::fs::read_to_string(path)
         .unwrap()
         .lines()

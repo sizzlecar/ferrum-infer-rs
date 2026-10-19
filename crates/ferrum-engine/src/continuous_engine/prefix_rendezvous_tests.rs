@@ -190,7 +190,7 @@ fn engine() -> (ContinuousBatchEngine, Arc<CaptureState>) {
         scheduler,
         Arc::new(ferrum_testkit::MockTokenizer::new(128)),
         Arc::new(ferrum_testkit::MockSampler),
-        Arc::new(executor),
+        ExecutorOwner::new(Box::new(executor)),
         Arc::new(MockTensorFactory),
     )
     .unwrap();
@@ -214,22 +214,41 @@ async fn submit(
     let mut sequence = SequenceState::new_with_tokenizer_and_model_vocab_size(
         request.clone(),
         tokens.iter().copied().map(TokenId::new).collect(),
-        Some(Arc::clone(&engine.inner.tokenizer)),
+        Some(Arc::clone(
+            &engine
+                .active_inner()
+                .expect("engine execution is open")
+                .tokenizer,
+        )),
         Some(128),
     );
     let (sender, receiver) = tokio::sync::oneshot::channel();
     sequence.response_sender = Some(sender);
-    engine.inner.sequences.insert(id.clone(), sequence);
-    engine.inner.scheduler.submit(request).await.unwrap();
+    engine
+        .active_inner()
+        .expect("engine execution is open")
+        .sequences
+        .insert(id.clone(), sequence);
+    engine.scheduler.submit(request).await.unwrap();
     (id, receiver)
 }
 
 async fn finish(engine: &ContinuousBatchEngine) {
     for _ in 0..32 {
-        if engine.inner.sequences.is_empty() {
+        if engine
+            .active_inner()
+            .expect("engine execution is open")
+            .sequences
+            .is_empty()
+        {
             return;
         }
-        engine.inner.run_iteration().await.unwrap();
+        engine
+            .active_inner()
+            .expect("engine execution is open")
+            .run_iteration()
+            .await
+            .unwrap();
     }
     panic!("bounded prefix fixture did not finish");
 }
@@ -283,7 +302,12 @@ async fn prefix_rendezvous_late_arrivals_share_a_boundary_after_the_retired_firs
     let (engine, state) = engine();
     let (source, source_rx) = submit(&engine, &[11, 12, 13, 14, 15, 16, 21]).await;
     for _ in 0..4 {
-        engine.inner.run_iteration().await.unwrap();
+        engine
+            .active_inner()
+            .expect("engine execution is open")
+            .run_iteration()
+            .await
+            .unwrap();
         if state
             .events
             .lock()
@@ -341,7 +365,12 @@ async fn prefix_rendezvous_cancelled_leader_releases_follower_and_unrelated_requ
     let (source, source_rx) = submit(&engine, &[11, 12, 13, 14, 21]).await;
     let (target, target_rx) = submit(&engine, &[11, 12, 13, 14, 22]).await;
     let (other, other_rx) = submit(&engine, &[61, 62, 63, 64, 65]).await;
-    engine.inner.run_iteration().await.unwrap();
+    engine
+        .active_inner()
+        .expect("engine execution is open")
+        .run_iteration()
+        .await
+        .unwrap();
     assert!(!state
         .events
         .lock()
@@ -365,13 +394,17 @@ async fn prefix_rendezvous_expiry_releases_optional_wait_once_without_failing_re
     let (engine, state) = engine();
     let (_source, source_rx) = submit(&engine, &[11, 12, 13, 14, 21]).await;
     let (target, target_rx) = submit(&engine, &[11, 12, 13, 14, 22]).await;
-    engine.inner.run_iteration().await.unwrap();
+    engine
+        .active_inner()
+        .expect("engine execution is open")
+        .run_iteration()
+        .await
+        .unwrap();
     assert!(!state
         .events
         .lock()
         .contains(&Event::Admitted(target.clone())));
     let wait = engine
-        .inner
         .config
         .scheduler
         .prefix_rendezvous_max_wait_ms
@@ -379,16 +412,19 @@ async fn prefix_rendezvous_expiry_releases_optional_wait_once_without_failing_re
     // Exercise the same timer future used by Idle/CapacityBlocked, without a
     // real wait or a spawned rendezvous task. Virtual Tokio time wakes it;
     // native lease expiry still uses the real monotonic clock below.
-    let mut wake = tokio_test::task::spawn(engine.inner.wait_for_prefix_deadline());
+    let inner = engine.active_inner().expect("engine execution is open");
+    let mut wake = tokio_test::task::spawn(inner.wait_for_prefix_deadline());
     tokio_test::assert_pending!(wake.poll());
     tokio::time::advance(Duration::from_millis(wait.get()) + Duration::from_secs(1)).await;
     tokio_test::assert_ready!(wake.poll());
     drop(wake);
+    drop(inner);
     engine
-        .inner
+        .active_inner()
+        .expect("engine execution is open")
         .refresh_prefix_rendezvous_at(Instant::now() + Duration::from_millis(wait.get()))
         .unwrap();
-    assert_eq!(engine.inner.scheduler.prefix_held_waiting_count(), 0);
+    assert_eq!(engine.scheduler.prefix_held_waiting_count(), 0);
     assert!(state
         .leases
         .lock()
@@ -411,25 +447,38 @@ async fn prefix_rendezvous_shutdown_drops_wait_and_pending_checkpoint_interest()
     let (engine, state) = engine();
     let (_source, source_rx) = submit(&engine, &[11, 12, 13, 14, 21]).await;
     let (_target, target_rx) = submit(&engine, &[11, 12, 13, 14, 22]).await;
-    engine.inner.run_iteration().await.unwrap();
-    assert_eq!(engine.inner.scheduler.prefix_held_waiting_count(), 1);
-    let mut wake = tokio_test::task::spawn(engine.inner.wait_for_prefix_deadline());
+    engine
+        .active_inner()
+        .expect("engine execution is open")
+        .run_iteration()
+        .await
+        .unwrap();
+    assert_eq!(engine.scheduler.prefix_held_waiting_count(), 1);
+    let inner = engine.active_inner().expect("engine execution is open");
+    let mut wake = tokio_test::task::spawn(inner.wait_for_prefix_deadline());
     tokio_test::assert_pending!(wake.poll());
     // select! cancels this borrowed future when another branch wins. It owns
     // neither a checkpoint pin nor an independently spawned timer task.
     drop(wake);
+    let retired_inner = Arc::downgrade(&inner);
+    drop(inner);
     engine.shutdown().await.unwrap();
-    assert_eq!(engine.inner.scheduler.prefix_held_waiting_count(), 0);
+    assert_eq!(engine.scheduler.prefix_held_waiting_count(), 0);
     assert!(state
         .leases
         .lock()
         .iter()
         .all(|lease| lease.upgrade().is_none()));
-    let mut absent = tokio_test::task::spawn(engine.inner.wait_for_prefix_deadline());
-    tokio_test::assert_pending!(absent.poll());
+    assert!(matches!(
+        engine.active_inner(),
+        Err(FerrumError::Scheduler { message })
+            if message.contains("engine is closing")
+    ));
+    assert!(retired_inner.upgrade().is_none());
+    let event_count = state.events.lock().len();
     tokio::time::advance(Duration::from_secs(60)).await;
-    tokio_test::assert_pending!(absent.poll());
-    drop(absent);
+    assert_eq!(state.events.lock().len(), event_count);
+    assert_eq!(engine.scheduler.prefix_held_waiting_count(), 0);
     drop((source_rx, target_rx));
 }
 
