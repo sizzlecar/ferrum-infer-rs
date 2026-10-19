@@ -1880,6 +1880,9 @@ fn benchmark_cell_id(index: usize, cell: Cell) -> String {
 
 pub async fn execute(cmd: BenchServeCommand, _cfg: CliConfig) -> Result<()> {
     validate_command(&cmd)?;
+    if sharegpt::export_pool_if_requested(&cmd)? {
+        return Ok(());
+    }
     let prepared_sharegpt = sharegpt::prepare(&cmd)?;
     let banner = if cmd.scenario == BenchServeWorkload::DecodeIsolation {
         format!(

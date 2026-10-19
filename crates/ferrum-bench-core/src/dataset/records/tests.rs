@@ -104,3 +104,44 @@ fn callback_failure_and_trailing_array_data_are_errors() {
     )
     .is_err());
 }
+
+#[test]
+fn sharegpt_raw_records_preserve_exact_numbers_and_source_indices() {
+    let record = r#"{ "id": "source", "large":18446744073709551617,"decimal":0.1234567890123456789012345,"same":1,"same":2 }"#;
+    for source in [
+        format!(" [ {record}, null ] \n"),
+        format!("\n{record}\ninvalid\nnull\n"),
+    ] {
+        let mut captured = Vec::new();
+        let receipt = visit_sharegpt_raw_records(
+            source.as_bytes(),
+            ShareGptReadLimits::default(),
+            |index, raw| {
+                captured.push((index, raw.map(str::to_owned)));
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(captured[0], (0, Some(record.to_owned())));
+        if receipt.source_format == "jsonl" {
+            assert_eq!(captured[1], (1, None));
+            assert_eq!(captured[2], (2, Some("null".into())));
+        } else {
+            assert_eq!(captured[1], (1, Some("null".into())));
+        }
+        assert_eq!(receipt.records, captured.len() as u64);
+        assert_eq!(
+            receipt.source_sha256,
+            format!("{:x}", Sha256::digest(source.as_bytes()))
+        );
+        assert_eq!(receipt.source_bytes, source.len() as u64);
+    }
+    let short = ShareGptReadLimits {
+        maximum_record_bytes: NonZeroUsize::new(8).unwrap(),
+        ..Default::default()
+    };
+    assert!(
+        visit_sharegpt_raw_records(format!("[{record}]").as_bytes(), short, |_, _| Ok(())).is_err()
+    );
+    assert!(visit_sharegpt_raw_records(record.as_bytes(), short, |_, _| Ok(())).is_err());
+}
