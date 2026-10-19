@@ -4045,6 +4045,9 @@ fn plan_runtime_wait_for_release_engine() -> (
 ) {
     let mut config = EngineConfig::default();
     config.kv_cache.max_blocks = 128;
+    config.scheduler.max_running_requests = 2;
+    config.scheduler.prefill_first_until_active = Some(2);
+    config.batching.max_batch_size = 2;
     let scheduler = Arc::new(ContinuousBatchScheduler::new(config.scheduler.clone()));
     let tokenizer: Arc<dyn Tokenizer + Send + Sync> =
         Arc::new(ferrum_testkit::MockTokenizer::new(128));

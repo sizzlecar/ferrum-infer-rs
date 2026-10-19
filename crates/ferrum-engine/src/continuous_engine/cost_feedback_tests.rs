@@ -148,6 +148,7 @@ fn engine(
         128,
         &[("test", 5), ("ok", 6), ("generated", 42)],
     ));
+    let feedback_enabled = config.scheduler.slo.is_some();
     let engine = ContinuousBatchEngine::new_observed(
         config.clone(),
         Arc::new(ContinuousBatchScheduler::new(config.scheduler)),
@@ -155,8 +156,8 @@ fn engine(
         Arc::new(crate::registry::GreedySampler),
         ExecutorOwner::new(Box::new(implementation)),
         None,
-        Some(Arc::new(AttemptRecorder::default())),
-        Some(source),
+        feedback_enabled.then(|| Arc::new(AttemptRecorder::default()) as Arc<_>),
+        feedback_enabled.then_some(source),
     )
     .unwrap();
     (engine, observation, tokenizer)
@@ -232,6 +233,64 @@ async fn cost_feedback_requires_both_inputs_and_keeps_default_off() {
     drop(inner);
     off.shutdown().await.unwrap();
     off.wait_for_shutdown_completion().await.unwrap();
+}
+
+#[tokio::test]
+async fn fill_first_ready_request_executes_without_waiting_for_target() {
+    for slo_enabled in [false, true] {
+        let mut config = EngineConfig::default();
+        config.scheduler.slo = slo_enabled.then(policy);
+        config.scheduler.max_running_requests = 2;
+        config.scheduler.prefill_first_until_active = Some(2);
+        config.batching.max_batch_size = 2;
+        config.batching.max_num_batched_tokens = 16;
+        let source = Source::new(true);
+        source.replace_after_load.store(true, Ordering::Release);
+        let (engine, executor, tokenizer) = engine(config, source.clone(), false);
+        let request = submit(&engine, &tokenizer, "test").await;
+
+        {
+            let inner = engine.active_inner().unwrap();
+            inner.run_iteration().await.unwrap();
+            let handle = inner.sequences.get(&request).unwrap();
+            let sequence = handle.lock();
+            let sequence = sequence.as_ref().unwrap();
+            assert!(
+                sequence.prefill_complete,
+                "ready work must execute in this iteration"
+            );
+            assert_eq!(sequence.generated_tokens, vec![TokenId(42)]);
+            let frontier = sequence.execution_frontier.as_ref().unwrap();
+            assert_eq!(frontier.consumed_tokens(), sequence.input_tokens.len());
+            assert_eq!(
+                frontier.sequence(),
+                executor
+                    .tokens
+                    .frontier_for_request(&request)
+                    .unwrap()
+                    .sequence()
+            );
+        }
+        assert_eq!(executor.maintenance_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(engine.scheduler.decoding_count(), 1);
+        assert_eq!(engine.scheduler.waiting_count(), 0);
+        if slo_enabled {
+            assert_eq!(source.load_count(), 1);
+            let queries = source.queries.lock();
+            assert!(
+                queries.len() >= 2,
+                "admission and selection must both query"
+            );
+            assert!(queries.iter().all(|revision| *revision == 1));
+            assert_eq!(source.current.lock().revision(), 2);
+        } else {
+            assert_eq!(source.load_count(), 0);
+        }
+        engine.shutdown().await.unwrap();
+        engine.wait_for_shutdown_completion().await.unwrap();
+        assert!(executor.retained.lock().unwrap().is_empty());
+        assert!(executor.tokens.0.upgrade().is_none());
+    }
 }
 
 #[tokio::test]
