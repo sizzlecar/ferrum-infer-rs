@@ -261,7 +261,10 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           jobs=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/attempts/$GITHUB_RUN_ATTEMPT/jobs?per_page=100")
-          job_id=$(jq -er '[.jobs[] | select(.name == "CPU (Linux)" or .name == "Quality / CPU (Linux)") | select(.status == "in_progress")] | if length == 1 then .[0].id else error("ambiguous CPU producer") end' <<< "$jobs")
+          # Identify the producer within this attempt. API status can lag the
+          # executing job; successful completion is checked by the consumer.
+          job_id=$(jq -er --argjson run "$GITHUB_RUN_ID" --argjson attempt "$GITHUB_RUN_ATTEMPT" \
+            '[.jobs[] | select(.name == "CPU (Linux)" or .name == "Quality / CPU (Linux)") | select(.run_id == $run and .run_attempt == $attempt)] | if length == 1 then .[0].id else error("missing or ambiguous CPU producer") end' <<< "$jobs")
           jq -n --argjson run_id "$GITHUB_RUN_ID" --argjson run_attempt "$GITHUB_RUN_ATTEMPT" \
             --arg head_sha "$GITHUB_SHA" --argjson job_id "$job_id" \
             '{schema_version:1,run_id:$run_id,run_attempt:$run_attempt,head_sha:$head_sha,job_id:$job_id}' \
@@ -293,8 +296,8 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           jobs=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/attempts/$GITHUB_RUN_ATTEMPT/jobs?per_page=100")
-          job_id=$(jq -er --arg suffix "CPU (Linux)" \
-            '[.jobs[] | select(.name | endswith($suffix)) | select(.status == "in_progress")] | if length == 1 then .[0].id else error("ambiguous producer job") end' <<< "$jobs")
+          job_id=$(jq -er --arg name "CPU (Linux)" --argjson run "$GITHUB_RUN_ID" --argjson attempt "$GITHUB_RUN_ATTEMPT" \
+            '[.jobs[] | select(.name == $name or .name == ("Quality / " + $name)) | select(.run_id == $run and .run_attempt == $attempt)] | if length == 1 then .[0].id else error("missing or ambiguous producer job") end' <<< "$jobs")
           mkdir -p "$RUNNER_TEMP/backend-numerics"
           jq -n --argjson run_id "$GITHUB_RUN_ID" --argjson run_attempt "$GITHUB_RUN_ATTEMPT" \
             --arg head_sha "$GITHUB_SHA" --argjson job_id "$job_id" \
@@ -619,8 +622,8 @@ jobs:
           BACKEND: ${{ matrix.backend }}
         run: |
           jobs=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/attempts/$GITHUB_RUN_ATTEMPT/jobs?per_page=100")
-          job_id=$(jq -er --arg suffix "GPU runtime ($BACKEND)" \
-            '[.jobs[] | select(.name | endswith($suffix)) | select(.status == "in_progress")] | if length == 1 then .[0].id else error("ambiguous producer job") end' <<< "$jobs")
+          job_id=$(jq -er --arg name "GPU runtime ($BACKEND)" --argjson run "$GITHUB_RUN_ID" --argjson attempt "$GITHUB_RUN_ATTEMPT" \
+            '[.jobs[] | select(.name == $name or .name == ("Quality / " + $name)) | select(.run_id == $run and .run_attempt == $attempt)] | if length == 1 then .[0].id else error("missing or ambiguous producer job") end' <<< "$jobs")
           mkdir -p "$RUNNER_TEMP/backend-numerics"
           jq -n --argjson run_id "$GITHUB_RUN_ID" --argjson run_attempt "$GITHUB_RUN_ATTEMPT" \
             --arg head_sha "$GITHUB_SHA" --argjson job_id "$job_id" \
