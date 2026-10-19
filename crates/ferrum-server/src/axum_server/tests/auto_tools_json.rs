@@ -3,7 +3,6 @@ use super::*;
 use ferrum_engine::ContinuousBatchEngine;
 use ferrum_interfaces::{sampler::GreedySampler, Tokenizer};
 use ferrum_scheduler::ContinuousBatchScheduler;
-use ferrum_testkit::MockTensorFactory;
 use ferrum_tokenizer::HuggingFaceTokenizer;
 use ferrum_types::FerrumError;
 use futures::FutureExt;
@@ -950,13 +949,12 @@ async fn run_branch_request(
     config.batching.max_num_batched_tokens = 256;
     let observation = executor.observer();
     let engine = Arc::new(
-        ContinuousBatchEngine::new_plan_runtime(
+        ContinuousBatchEngine::new(
             config.clone(),
             Arc::new(ContinuousBatchScheduler::new(config.scheduler)),
             tokenizer.clone(),
             Arc::new(GreedySampler),
             ferrum_execution::ExecutorOwner::new(Box::new(executor)),
-            Arc::new(MockTensorFactory),
         )
         .unwrap(),
     );

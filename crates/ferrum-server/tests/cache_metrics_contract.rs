@@ -53,7 +53,7 @@ impl InferenceEngine for StubLlm {
             loaded_models: vec![self.config.model.model_id.clone()],
             active_requests: 0,
             queued_requests: 0,
-            memory_usage: MemoryUsage {
+            memory_usage: ferrum_types::MemoryObservation::Known(MemoryUsage {
                 total_bytes: 0,
                 used_bytes: 0,
                 free_bytes: 0,
@@ -61,7 +61,7 @@ impl InferenceEngine for StubLlm {
                 cpu_memory_bytes: None,
                 cache_memory_bytes: 0,
                 utilization_percent: 0.0,
-            },
+            }),
             uptime_seconds: 0,
             last_heartbeat: chrono::Utc::now(),
             version: "test".to_string(),

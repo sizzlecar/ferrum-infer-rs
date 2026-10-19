@@ -158,7 +158,13 @@ impl ActualMemoryStageObservation {
     }
 
     pub fn with_engine_cache_status(mut self, status: &ferrum_types::EngineStatus) -> Self {
-        let memory = &status.memory_usage;
+        let Some(memory) = status.memory_usage.known() else {
+            self.attributes.insert(
+                "resource_memory_observation".to_owned(),
+                json!("unavailable"),
+            );
+            return self;
+        };
         let dynamic_capacity_bytes = memory.cache_memory_bytes.saturating_add(memory.free_bytes);
         self.attributes.extend([
             (
@@ -2202,7 +2208,7 @@ mod tests {
             loaded_models: vec![ferrum_types::ModelId::from("test-model")],
             active_requests: 0,
             queued_requests: 0,
-            memory_usage: ferrum_types::MemoryUsage {
+            memory_usage: ferrum_types::MemoryObservation::Known(ferrum_types::MemoryUsage {
                 total_bytes: 900,
                 used_bytes: 500,
                 free_bytes: 400,
@@ -2210,7 +2216,7 @@ mod tests {
                 cpu_memory_bytes: None,
                 cache_memory_bytes: 100,
                 utilization_percent: 500.0 / 9.0,
-            },
+            }),
             uptime_seconds: 0,
             last_heartbeat: chrono::Utc::now(),
             version: "test".to_string(),
@@ -2223,6 +2229,41 @@ mod tests {
         assert_eq!(observation.attributes["kv_cache_used_bytes"], 100);
         assert_eq!(observation.attributes["resource_total_bytes"], 900);
         assert_eq!(observation.attributes["resource_used_bytes"], 500);
+    }
+
+    #[test]
+    fn engine_cache_observation_unknown_does_not_fabricate_zero_bytes() {
+        let status = ferrum_types::EngineStatus {
+            is_ready: true,
+            loaded_models: Vec::new(),
+            active_requests: 0,
+            queued_requests: 0,
+            memory_usage: ferrum_types::MemoryObservation::Unknown,
+            uptime_seconds: 0,
+            last_heartbeat: chrono::Utc::now(),
+            version: "test".into(),
+        };
+        let observation = ActualMemoryStageObservation::new("test", "cache_allocated", None, None)
+            .with_engine_cache_status(&status);
+        assert_eq!(
+            observation.attributes["resource_memory_observation"],
+            "unavailable"
+        );
+        for key in [
+            "kv_cache_total_bytes",
+            "kv_cache_used_bytes",
+            "kv_cache_free_bytes",
+            "resource_total_bytes",
+            "resource_used_bytes",
+            "resource_free_bytes",
+            "cache_memory_bytes",
+        ] {
+            assert!(
+                !observation.attributes.contains_key(key),
+                "fabricated {key}"
+            );
+        }
+        assert!(status.is_ready);
     }
 
     #[test]

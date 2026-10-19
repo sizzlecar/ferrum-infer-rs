@@ -133,9 +133,7 @@ fn stop_boundary_engine_with_options(
         Arc::new(ContinuousBatchScheduler::new(config.scheduler)),
         tokenizer,
         Arc::new(crate::registry::GreedySampler),
-        Arc::new(MockKvCacheManager::new(256)),
         ferrum_execution::ExecutorOwner::new(Box::new(executor)),
-        Arc::new(MockTensorFactory),
     )
     .unwrap()
 }
@@ -256,9 +254,7 @@ async fn harmony_pending_terminal_preserves_published_range(marker: &str) {
         scheduler.clone(),
         tokenizer.clone(),
         Arc::new(crate::registry::GreedySampler),
-        Arc::new(MockKvCacheManager::new(256)),
         ferrum_execution::ExecutorOwner::new(Box::new(executor)),
-        Arc::new(MockTensorFactory),
     )
     .unwrap();
     let mut request = policy_request();
@@ -800,11 +796,9 @@ async fn stop_boundary_rejects_strict_json_truncated_inside_a_token() {
             Arc::new(ContinuousBatchScheduler::new(config.scheduler)),
             tokenizer,
             Arc::new(crate::registry::GreedySampler),
-            Arc::new(MockKvCacheManager::new(256)),
             ferrum_execution::ExecutorOwner::new(Box::new(
                 StopBoundaryExecutor::with_token_sequence(16, vec![7]),
             )),
-            Arc::new(MockTensorFactory),
         )
         .unwrap()
     };

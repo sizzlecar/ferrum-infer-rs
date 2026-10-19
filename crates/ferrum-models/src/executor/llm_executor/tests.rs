@@ -35,7 +35,6 @@ struct RecordingCalls {
 struct RecordingLlm {
     calls: Arc<Mutex<RecordingCalls>>,
     config: crate::common::LlmRuntimeConfig,
-    recurrent_state_spec: Option<RecurrentStateSpec>,
     worker: bool,
 }
 
@@ -51,18 +50,7 @@ impl RecordingLlm {
                 vocab_size: 4,
                 max_seq_len: 16,
             },
-            recurrent_state_spec: None,
             worker: false,
-        }
-    }
-
-    fn with_recurrent_state_spec(
-        calls: Arc<Mutex<RecordingCalls>>,
-        spec: RecurrentStateSpec,
-    ) -> Self {
-        Self {
-            recurrent_state_spec: Some(spec),
-            ..Self::new(calls)
         }
     }
 }
@@ -84,16 +72,6 @@ impl DecoderOnlyLLM for RecordingLlm {
     }
     fn recover_token_execution(&mut self) -> ModelExecutionRecovery {
         ModelExecutionRecovery::Quiescent { error: None }
-    }
-    fn recurrent_state_spec(
-        &self,
-        request_id: &RequestId,
-        _: &[TokenId],
-    ) -> Result<Option<RecurrentStateSpec>> {
-        Ok(self.recurrent_state_spec.clone().map(|mut spec| {
-            spec.request_id = request_id.clone();
-            spec
-        }))
     }
     fn prepare_kv_capacity(&mut self, cache_id: &str, capacity_hint: usize) {
         let mut calls = self.calls.lock();
@@ -568,39 +546,6 @@ fn llm_executor_reports_retained_model_sources_without_a_runtime_plan() {
         executor.execution_resource_authority(),
         ferrum_types::ExecutionResourceAuthority::LegacyEngine,
     );
-}
-#[test]
-fn llm_executor_delegates_recurrent_state_spec_and_sets_executor_device() {
-    let calls = Arc::new(Mutex::new(RecordingCalls::default()));
-    let spec = RecurrentStateSpec {
-        request_id: RequestId::new(),
-        num_layers: 1,
-        tensors: vec![ferrum_interfaces::RecurrentStateTensorSpec::new(
-            0,
-            "delta_state",
-            vec![1, 2, 3],
-            DataType::FP32,
-        )],
-        device: Device::CPU,
-        max_batch_slots: 1,
-    };
-    let mut info = test_model_info();
-    info.device = Device::CUDA(0);
-    let executor = LlmExecutor::new(
-        Box::new(RecordingLlm::with_recurrent_state_spec(calls, spec.clone())),
-        info,
-    );
-    let request_id = RequestId::new();
-
-    let actual = executor
-        .recurrent_state_spec(&request_id, &[TokenId::new(7)])
-        .expect("recurrent state spec should resolve")
-        .expect("recording model should expose recurrent state");
-
-    assert_eq!(actual.request_id, request_id);
-    assert_eq!(actual.device, Device::CUDA(0));
-    assert_eq!(actual.max_batch_slots, spec.max_batch_slots);
-    assert_eq!(actual.tensors, spec.tensors);
 }
 #[test]
 fn cache_metrics_snapshot_includes_model_lock_wait_metrics() {

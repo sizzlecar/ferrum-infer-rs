@@ -399,15 +399,12 @@ impl Fixture {
         config.runtime.scheduler_trace_jsonl = Some(trace.path().join("trace.jsonl"));
         configure(&mut config);
         let journal_scopes = scopes(&config);
-        let engine = ContinuousBatchEngine::new_with_recurrent_state_manager_and_journal_scopes(
+        let engine = ContinuousBatchEngine::new_with_journal_scopes(
             config.clone(),
             Arc::new(ContinuousBatchScheduler::new(config.scheduler)),
             tokenizer(cfg.vocab_size),
             Arc::new(crate::registry::GreedySampler),
-            Arc::new(MockKvCacheManager::new(128)),
             owned_executor,
-            Arc::new(crate::tensor_factory::CandleTensorFactory::new(Device::CPU)),
-            None,
             journal_scopes,
         )
         .unwrap();

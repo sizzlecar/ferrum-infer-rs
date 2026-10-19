@@ -2,11 +2,10 @@
 //! Runs on any platform — no GPU required.
 
 use ferrum_engine::{ContinuousBatchEngine, LlmInferenceEngine, Scheduler, Tokenizer};
+use ferrum_interfaces::InferenceEngine;
 use ferrum_output::InferenceOutput;
 use ferrum_scheduler::implementations::ContinuousBatchScheduler;
-use ferrum_testkit::{
-    MockKvCacheManager, MockModelExecutor, MockSampler, MockTensorFactory, MockTokenizer,
-};
+use ferrum_testkit::{MockModelExecutor, MockSampler, MockTokenizer};
 use ferrum_types::{InferenceRequest, SchedulerConfig, SpecialTokens, TokenId};
 use std::sync::Arc;
 use std::time::Duration;
@@ -24,18 +23,14 @@ fn make_engine_with_tokenizer(
     let config = ferrum_types::EngineConfig::default();
     let scheduler = Arc::new(ContinuousBatchScheduler::new(SchedulerConfig::default()));
     let sampler = Arc::new(MockSampler);
-    let kv_cache = Arc::new(MockKvCacheManager::new(1024));
     let executor = MockModelExecutor::instant(VOCAB_SIZE);
-    let tensor_factory = Arc::new(MockTensorFactory);
 
     ContinuousBatchEngine::new(
         config,
         scheduler,
         tokenizer,
         sampler,
-        kv_cache,
         ferrum_execution::executor_lifecycle::ExecutorOwner::new(Box::new(executor)),
-        tensor_factory,
     )
     .expect("legacy engine composition must match executor authority")
 }
@@ -246,34 +241,29 @@ async fn concurrent_submit_tracked_by_scheduler() {
 }
 
 #[tokio::test]
-async fn kv_cache_allocated_and_deallocated() {
-    let kv_cache = Arc::new(MockKvCacheManager::new(1024));
+async fn request_completion_retires_original_executor_on_shutdown() {
     let config = ferrum_types::EngineConfig::default();
     let scheduler = Arc::new(ContinuousBatchScheduler::new(SchedulerConfig::default()));
     let tokenizer = Arc::new(MockTokenizer::new(VOCAB_SIZE));
     let sampler = Arc::new(MockSampler);
     let executor = MockModelExecutor::instant(VOCAB_SIZE);
-    let tensor_factory = Arc::new(MockTensorFactory);
 
     let engine = ContinuousBatchEngine::new(
         config,
         scheduler,
         tokenizer,
         sampler,
-        kv_cache.clone(),
         ferrum_execution::executor_lifecycle::ExecutorOwner::new(Box::new(executor)),
-        tensor_factory,
     )
     .expect("legacy engine composition must match executor authority");
 
-    // Before: no active caches
-    assert_eq!(kv_cache.active_count(), 0);
+    assert_eq!(engine.status().await.active_requests, 0);
 
     let request = make_request("KV cache test");
     let _response = engine.infer(request).await.unwrap();
 
-    // After completion: cache should be deallocated
-    assert_eq!(kv_cache.active_count(), 0);
+    engine.shutdown().await.unwrap();
+    engine.wait_for_shutdown_completion().await.unwrap();
 }
 
 #[tokio::test]
@@ -284,17 +274,13 @@ async fn mock_executor_tracks_operations() {
     let scheduler = Arc::new(ContinuousBatchScheduler::new(SchedulerConfig::default()));
     let tokenizer = Arc::new(MockTokenizer::new(VOCAB_SIZE));
     let sampler = Arc::new(MockSampler);
-    let kv_cache = Arc::new(MockKvCacheManager::new(1024));
-    let tensor_factory = Arc::new(MockTensorFactory);
 
     let engine = ContinuousBatchEngine::new(
         config,
         scheduler,
         tokenizer,
         sampler,
-        kv_cache,
         ferrum_execution::executor_lifecycle::ExecutorOwner::new(Box::new(executor)),
-        tensor_factory,
     )
     .expect("legacy engine composition must match executor authority");
 
@@ -315,22 +301,18 @@ async fn engine_with_latency_still_completes() {
     let scheduler = Arc::new(ContinuousBatchScheduler::new(SchedulerConfig::default()));
     let tokenizer = Arc::new(MockTokenizer::new(VOCAB_SIZE));
     let sampler = Arc::new(MockSampler);
-    let kv_cache = Arc::new(MockKvCacheManager::new(1024));
     let executor = MockModelExecutor::new(
         VOCAB_SIZE,
         Duration::from_millis(5),
         Duration::from_millis(2),
     );
-    let tensor_factory = Arc::new(MockTensorFactory);
 
     let engine = ContinuousBatchEngine::new(
         config,
         scheduler,
         tokenizer,
         sampler,
-        kv_cache,
         ferrum_execution::executor_lifecycle::ExecutorOwner::new(Box::new(executor)),
-        tensor_factory,
     )
     .expect("legacy engine composition must match executor authority");
 
@@ -382,14 +364,12 @@ async fn concurrent_requests_all_complete() {
 }
 
 #[tokio::test]
-async fn concurrent_requests_deallocate_kv() {
-    let kv_cache = Arc::new(MockKvCacheManager::new(1024));
+async fn concurrent_requests_retire_original_executor_on_shutdown() {
     let config = ferrum_types::EngineConfig::default();
     let scheduler = Arc::new(ContinuousBatchScheduler::new(SchedulerConfig::default()));
     let tokenizer = Arc::new(MockTokenizer::new(VOCAB_SIZE));
     let sampler = Arc::new(MockSampler);
     let executor = MockModelExecutor::instant(VOCAB_SIZE);
-    let tensor_factory = Arc::new(MockTensorFactory);
 
     let engine = Arc::new(
         ContinuousBatchEngine::new(
@@ -397,14 +377,12 @@ async fn concurrent_requests_deallocate_kv() {
             scheduler,
             tokenizer,
             sampler,
-            kv_cache.clone(),
             ferrum_execution::executor_lifecycle::ExecutorOwner::new(Box::new(executor)),
-            tensor_factory,
         )
         .expect("legacy engine composition must match executor authority"),
     );
 
-    assert_eq!(kv_cache.active_count(), 0);
+    assert_eq!(engine.status().await.active_requests, 0);
 
     let mut handles = Vec::new();
     for i in 0..3 {
@@ -417,8 +395,8 @@ async fn concurrent_requests_deallocate_kv() {
 
     futures::future::join_all(handles).await;
 
-    // All KV caches should be deallocated after all requests complete
-    assert_eq!(kv_cache.active_count(), 0, "All KV caches should be freed");
+    engine.shutdown().await.unwrap();
+    engine.wait_for_shutdown_completion().await.unwrap();
 }
 
 #[tokio::test]
@@ -486,17 +464,13 @@ async fn prefix_cache_avoids_second_prefill() {
     let scheduler = Arc::new(ContinuousBatchScheduler::new(SchedulerConfig::default()));
     let tokenizer = Arc::new(MockTokenizer::new(VOCAB_SIZE));
     let sampler = Arc::new(MockSampler);
-    let kv_cache = Arc::new(MockKvCacheManager::new(1024));
-    let tensor_factory = Arc::new(MockTensorFactory);
 
     let engine = ContinuousBatchEngine::new(
         config,
         scheduler,
         tokenizer,
         sampler,
-        kv_cache,
         ferrum_execution::executor_lifecycle::ExecutorOwner::new(Box::new(executor)),
-        tensor_factory,
     )
     .expect("legacy engine composition must match executor authority");
 

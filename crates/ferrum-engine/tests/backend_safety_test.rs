@@ -4,16 +4,15 @@
 //! These tests run on CPU with mock components. They catch regressions
 //! that could be introduced when modifying CUDA/Metal code paths:
 //! - Executor prefill/decode contract
-//! - KV cache lifecycle (allocate → use → release)
+//! - Original executor lifecycle (request completion → whole close)
 //! - Streaming token delivery
 //! - Multi-sequence concurrent decode
 //! - Error handling and cleanup
 
 use ferrum_engine::{ContinuousBatchEngine, LlmInferenceEngine};
+use ferrum_interfaces::InferenceEngine;
 use ferrum_scheduler::implementations::ContinuousBatchScheduler;
-use ferrum_testkit::{
-    MockKvCacheManager, MockModelExecutor, MockSampler, MockTensorFactory, MockTokenizer,
-};
+use ferrum_testkit::{MockModelExecutor, MockSampler, MockTokenizer};
 use ferrum_types::{InferenceRequest, SchedulerConfig};
 use futures::StreamExt;
 use std::sync::Arc;
@@ -27,31 +26,24 @@ fn engine() -> ContinuousBatchEngine {
         Arc::new(ContinuousBatchScheduler::new(SchedulerConfig::default())),
         Arc::new(MockTokenizer::new(VOCAB)),
         Arc::new(MockSampler),
-        Arc::new(MockKvCacheManager::new(1024)),
         ferrum_execution::executor_lifecycle::ExecutorOwner::new(Box::new(
             MockModelExecutor::instant(VOCAB),
         )),
-        Arc::new(MockTensorFactory),
     )
     .expect("legacy engine composition must match executor authority")
 }
 
-fn engine_with_executor(
-    executor: MockModelExecutor,
-) -> (ContinuousBatchEngine, Arc<MockKvCacheManager>) {
+fn engine_with_executor(executor: MockModelExecutor) -> ContinuousBatchEngine {
     let config = ferrum_types::EngineConfig::default();
-    let kv = Arc::new(MockKvCacheManager::new(1024));
     let eng = ContinuousBatchEngine::new(
         config,
         Arc::new(ContinuousBatchScheduler::new(SchedulerConfig::default())),
         Arc::new(MockTokenizer::new(VOCAB)),
         Arc::new(MockSampler),
-        kv.clone(),
         ferrum_execution::executor_lifecycle::ExecutorOwner::new(Box::new(executor)),
-        Arc::new(MockTensorFactory),
     )
     .expect("legacy engine composition must match executor authority");
-    (eng, kv)
+    eng
 }
 
 fn req(prompt: &str, max_tokens: usize) -> InferenceRequest {
@@ -67,7 +59,7 @@ fn req(prompt: &str, max_tokens: usize) -> InferenceRequest {
 async fn prefill_called_once_per_request() {
     let executor = MockModelExecutor::instant(VOCAB);
     let observation = executor.observer();
-    let (eng, _) = engine_with_executor(executor);
+    let eng = engine_with_executor(executor);
 
     let _ = eng.infer(req("test prompt", 5)).await.unwrap();
     assert_eq!(observation.prefill_count(), 1);
@@ -78,7 +70,7 @@ async fn prefill_called_once_per_request() {
 async fn decode_count_matches_generated_tokens() {
     let executor = MockModelExecutor::instant(VOCAB);
     let observation = executor.observer();
-    let (eng, _) = engine_with_executor(executor);
+    let eng = engine_with_executor(executor);
 
     let resp = eng.infer(req("hello", 10)).await.unwrap();
     // prefill produces 1 token, decode produces the rest
@@ -90,32 +82,29 @@ async fn decode_count_matches_generated_tokens() {
     );
 }
 
-// ======================== KV Cache Lifecycle ========================
+// ======================== Original Executor Lifecycle ========================
 
 #[tokio::test]
-async fn kv_cache_allocated_during_request() {
+async fn original_executor_closes_after_request() {
     let executor = MockModelExecutor::instant(VOCAB);
-    let (eng, kv) = engine_with_executor(executor);
+    let eng = engine_with_executor(executor);
 
-    assert_eq!(kv.active_count(), 0);
+    assert_eq!(eng.status().await.active_requests, 0);
     let _ = eng.infer(req("test", 3)).await.unwrap();
-    // After completion, KV cache should be deallocated
-    assert_eq!(
-        kv.active_count(),
-        0,
-        "KV cache should be freed after request completes"
-    );
+    eng.shutdown().await.unwrap();
+    eng.wait_for_shutdown_completion().await.unwrap();
 }
 
 #[tokio::test]
-async fn kv_cache_freed_after_multiple_requests() {
+async fn original_executor_closes_after_multiple_requests() {
     let executor = MockModelExecutor::instant(VOCAB);
-    let (eng, kv) = engine_with_executor(executor);
+    let eng = engine_with_executor(executor);
 
     for i in 0..5 {
         let _ = eng.infer(req(&format!("prompt {i}"), 3)).await.unwrap();
     }
-    assert_eq!(kv.active_count(), 0, "all KV caches should be freed");
+    eng.shutdown().await.unwrap();
+    eng.wait_for_shutdown_completion().await.unwrap();
 }
 
 // ======================== Streaming ========================

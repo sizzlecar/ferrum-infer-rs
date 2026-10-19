@@ -4,10 +4,7 @@
 
 use ferrum_engine::{ContinuousBatchEngine, LlmInferenceEngine};
 use ferrum_scheduler::implementations::ContinuousBatchScheduler;
-use ferrum_testkit::{
-    ConfigurableModelExecutor, MockKvCacheManager, MockModelExecutor, MockSampler,
-    MockTensorFactory, MockTokenizer,
-};
+use ferrum_testkit::{ConfigurableModelExecutor, MockModelExecutor, MockSampler, MockTokenizer};
 use ferrum_types::{FinishReason, InferenceRequest, SchedulerConfig};
 use std::sync::Arc;
 
@@ -20,16 +17,13 @@ fn make_engine_with_executor(
     let scheduler = Arc::new(ContinuousBatchScheduler::new(SchedulerConfig::default()));
     let tokenizer = Arc::new(MockTokenizer::new(VOCAB));
     let sampler = Arc::new(MockSampler);
-    let kv_cache = Arc::new(MockKvCacheManager::new(1024));
-    let tensor_factory = Arc::new(MockTensorFactory);
+
     ContinuousBatchEngine::new(
         config,
         scheduler,
         tokenizer,
         sampler,
-        kv_cache,
         ferrum_execution::executor_lifecycle::ExecutorOwner::new(executor),
-        tensor_factory,
     )
     .expect("legacy engine composition must match executor authority")
 }

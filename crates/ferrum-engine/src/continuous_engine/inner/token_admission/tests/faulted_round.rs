@@ -145,9 +145,7 @@ async fn token_admission_later_publish_error_retires_earlier_real_faulted_fronti
         scheduler,
         Arc::new(TinyTokenizer::new(cfg.vocab_size)),
         Arc::new(crate::registry::GreedySampler),
-        Arc::new(MockKvCacheManager::new(256)),
         ExecutorOwner::new(Box::new(executor)),
-        Arc::new(MockTensorFactory),
     )
     .unwrap();
     let first_response = install_outer(

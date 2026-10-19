@@ -7,7 +7,6 @@ use ferrum_execution::token_execution::{
     ExecutedTokenWork, ExecutionCompletion, ExecutionProduct, ExecutionProgress,
     ExecutorSequenceIssuer, LastKnownExecutionStage, NoSubmissionStage,
 };
-use ferrum_kv::{PagedKvCacheConfig, PagedKvCacheManager};
 use ferrum_models::test_support::{tiny_llama_executor_owned, TinyLlamaConfig, TinyTokenizer};
 
 #[path = "tests/allocator_tests.rs"]
@@ -192,31 +191,12 @@ async fn fixture_observed(
     }
     let scheduler = Arc::new(ContinuousBatchScheduler::new(config.scheduler.clone()));
     let tokenizer = Arc::new(TinyTokenizer::new(cfg.vocab_size));
-    let kv = Arc::new(
-        PagedKvCacheManager::new(
-            Device::CPU,
-            PagedKvCacheConfig {
-                block_size: 16,
-                max_gpu_blocks: 16,
-                max_cpu_blocks: 0,
-                enable_swapping: false,
-                num_layers: cfg.num_layers,
-                num_heads: cfg.num_kv_heads,
-                head_dim: cfg.head_dim,
-                ..Default::default()
-            },
-        )
-        .unwrap(),
-    );
-    let engine = ContinuousBatchEngine::new_legacy_observed(
+    let engine = ContinuousBatchEngine::new_observed(
         config,
         scheduler.clone(),
         tokenizer.clone(),
         Arc::new(crate::registry::GreedySampler),
-        kv,
         ExecutorOwner::new(Box::new(implementation)),
-        Arc::new(crate::tensor_factory::CandleTensorFactory::new(Device::CPU)),
-        None,
         None,
         observer,
         None,

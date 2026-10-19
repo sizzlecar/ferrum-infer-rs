@@ -241,11 +241,6 @@ pub struct RuntimeCliConfig {
     #[serde(default)]
     pub paged_max_seqs: Option<usize>,
 
-    /// Generic recurrent-state slot-pool size, equivalent to
-    /// `FERRUM_RECURRENT_STATE_MAX_SLOTS`.
-    #[serde(default)]
-    pub recurrent_state_max_slots: Option<usize>,
-
     /// Attention provider-family policy for the plan runtime. Physical
     /// V1/V2/varlen selection remains adaptive inside the compiled provider.
     #[serde(default)]
@@ -461,11 +456,6 @@ impl RuntimeCliConfig {
         push_usize_entry(&mut entries, "FERRUM_KV_MAX_BLOCKS", self.kv_max_blocks);
         push_usize_entry(&mut entries, "FERRUM_KV_CAPACITY", self.kv_capacity);
         push_usize_entry(&mut entries, "FERRUM_PAGED_MAX_SEQS", self.paged_max_seqs);
-        push_usize_entry(
-            &mut entries,
-            "FERRUM_RECURRENT_STATE_MAX_SLOTS",
-            self.recurrent_state_max_slots,
-        );
         push_string_entry(
             &mut entries,
             "FERRUM_ATTENTION_POLICY",
@@ -1081,6 +1071,28 @@ mod tests {
     }
 
     #[test]
+    fn runtime_config_rejects_retired_recurrent_state_slots() {
+        for value in [0, 16] {
+            let error = toml::from_str::<CliConfig>(&format!(
+                "[runtime]\nrecurrent_state_max_slots = {value}\n"
+            ))
+            .unwrap_err();
+            assert!(error.to_string().contains("unknown field"), "{error}");
+            assert!(
+                error.to_string().contains("recurrent_state_max_slots"),
+                "{error}"
+            );
+        }
+        let config: CliConfig = toml::from_str(
+            "[runtime]\nkv_max_blocks = 123\nkv_capacity = 4096\npaged_max_seqs = 8\n",
+        )
+        .unwrap();
+        assert_eq!(config.runtime.kv_max_blocks, Some(123));
+        assert_eq!(config.runtime.kv_capacity, Some(4096));
+        assert_eq!(config.runtime.paged_max_seqs, Some(8));
+    }
+
+    #[test]
     fn runtime_config_rejects_retired_global_profiler_fields() {
         for key in [
             "decode_op_profile",
@@ -1510,7 +1522,6 @@ mod tests {
             kv_max_blocks: Some(4096),
             kv_capacity: Some(2048),
             paged_max_seqs: Some(64),
-            recurrent_state_max_slots: Some(16),
             attention_policy: Some(AttentionExecutionPolicy::NativeAdaptive),
             max_batched_tokens: Some(2048),
             prefill_decode_execution: Some(ferrum_types::PrefillDecodeExecution::Mixed),
@@ -1591,13 +1602,6 @@ mod tests {
         assert_eq!(entry("FERRUM_KV_MAX_BLOCKS").effective_value, "4096");
         assert_eq!(entry("FERRUM_KV_CAPACITY").effective_value, "2048");
         assert_eq!(entry("FERRUM_PAGED_MAX_SEQS").effective_value, "64");
-        assert_eq!(
-            entry("FERRUM_RECURRENT_STATE_MAX_SLOTS").effective_value,
-            "16"
-        );
-        assert!(entry("FERRUM_RECURRENT_STATE_MAX_SLOTS")
-            .affects
-            .contains(&RuntimeConfigEffect::Memory));
         assert_eq!(
             entry("FERRUM_ATTENTION_POLICY").effective_value,
             "native-adaptive"

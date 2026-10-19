@@ -6,7 +6,6 @@ use ferrum_interfaces::engine::LlmInferenceEngine;
 use ferrum_models::test_support::{
     tiny_llama_model_with_execution_config, tiny_model_info, tiny_tokenizer, TinyLlamaConfig,
 };
-use ferrum_testkit::MockKvCacheManager;
 use ferrum_types::{EngineConfig, InferenceRequest, LlamaExecutionConfig, SchedulerSloConfig};
 
 struct Capture {
@@ -87,7 +86,6 @@ async fn engine(
     let mut builder = EngineBuilder::new(config)
         .with_custom_tokenizer(tiny_tokenizer(cfg))
         .with_custom_sampler(Arc::new(ferrum_engine::registry::GreedySampler))
-        .with_custom_kv_cache(Arc::new(MockKvCacheManager::new(4096)))
         .with_custom_executor(executor.scope().unwrap());
     if let Some((owner, observer)) = feedback {
         builder = builder.with_execution_feedback(observer, owner.source());

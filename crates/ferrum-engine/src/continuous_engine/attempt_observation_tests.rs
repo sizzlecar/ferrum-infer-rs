@@ -7,7 +7,6 @@ use ferrum_execution::token_execution::ExecutedTokenWork;
 use ferrum_models::test_support::{
     tiny_llama_model_with_execution_config, tiny_model_info, tiny_tokenizer, TinyLlamaConfig,
 };
-use ferrum_testkit::MockKvCacheManager;
 
 pub(super) struct AttemptRecorder {
     pub(super) limits: ExecutionAttemptLimits,
@@ -86,7 +85,6 @@ async fn real_cpu_engine_config(
     let mut builder = crate::EngineBuilder::new(config)
         .with_custom_tokenizer(tiny_tokenizer(&cfg))
         .with_custom_sampler(Arc::new(crate::registry::GreedySampler))
-        .with_custom_kv_cache(Arc::new(MockKvCacheManager::new(4096)))
         .with_owned_executor(owner)
         .unwrap();
     if let Some(observer) = observer {

@@ -9,7 +9,6 @@ use ferrum_models::test_support::{
 };
 use ferrum_scheduler::cost_prediction::*;
 use ferrum_slo::{ReferenceEstimator, ReferenceEstimatorConfig};
-use ferrum_testkit::MockKvCacheManager;
 use ferrum_types::{
     EngineConfig, InferenceRequest, LlamaExecutionConfig, ObservabilityProfileDetail,
     SchedulerSloConfig,
@@ -78,7 +77,6 @@ async fn engine(
     let mut builder = EngineBuilder::new(config)
         .with_custom_tokenizer(tiny_tokenizer(cfg))
         .with_custom_sampler(Arc::new(ferrum_engine::registry::GreedySampler))
-        .with_custom_kv_cache(Arc::new(MockKvCacheManager::new(4096)))
         .with_custom_executor(owner.scope().unwrap());
     if let Some(observer) = observer {
         builder = if let Some(source) = source {

@@ -14,13 +14,12 @@ async fn prompt_tail_single_prefill_samples_only_after_the_remaining_suffix() {
         executor.prompt_tail_reserve = reserve;
         let observation = executor.observer();
         let executor = ExecutorOwner::new(Box::new(executor));
-        let engine = ContinuousBatchEngine::new_plan_runtime(
+        let engine = ContinuousBatchEngine::new(
             config,
             Arc::clone(&scheduler),
             Arc::new(ferrum_testkit::MockTokenizer::new(128)),
             Arc::new(ferrum_testkit::MockSampler),
             executor,
-            Arc::new(MockTensorFactory),
         )
         .unwrap();
         let executor = observation;
@@ -100,13 +99,12 @@ async fn prompt_tail_time_planning_matches_submitted_ranges_without_capacity_fee
         let mut implementation = PlanRuntimeChunkedPrefillTestExecutor::new(false);
         implementation.prompt_tail_reserve = Some(4);
         let observation = implementation.observer();
-        let engine = ContinuousBatchEngine::new_plan_runtime_observed(
+        let engine = ContinuousBatchEngine::new_observed(
             config,
             scheduler.clone(),
             Arc::new(ferrum_testkit::MockTokenizer::new(128)),
             Arc::new(ferrum_testkit::MockSampler),
             ExecutorOwner::new(Box::new(implementation)),
-            Arc::new(MockTensorFactory),
             None,
             Some(recorder.clone()),
             enabled.then(|| source.clone() as Arc<dyn CostSnapshotSource>),
@@ -306,13 +304,12 @@ async fn prompt_tail_capacity_requeue_distinguishes_before_and_after_first_outpu
     implementation.prompt_tail_reserve = Some(2);
     implementation.releases_sequence_capacity = true;
     let observation = implementation.observer();
-    let engine = ContinuousBatchEngine::new_plan_runtime_observed(
+    let engine = ContinuousBatchEngine::new_observed(
         config.clone(),
         Arc::new(ContinuousBatchScheduler::new(config.scheduler)),
         tokenizer.clone(),
         Arc::new(ferrum_testkit::MockSampler),
         ExecutorOwner::new(Box::new(implementation)),
-        Arc::new(MockTensorFactory),
         None,
         Some(recorder.clone()),
         Some(source.clone()),
@@ -499,13 +496,12 @@ async fn prompt_tail_batch_prefill_commits_each_boundary_before_sampling() {
     executor.prompt_tail_reserve = Some(2);
     let observation = executor.observer();
     let executor = ExecutorOwner::new(Box::new(executor));
-    let engine = ContinuousBatchEngine::new_plan_runtime(
+    let engine = ContinuousBatchEngine::new(
         config,
         Arc::clone(&scheduler),
         Arc::clone(&tokenizer),
         Arc::new(ferrum_testkit::MockSampler),
         executor,
-        Arc::new(MockTensorFactory),
     )
     .unwrap();
     let executor = observation;

@@ -9,7 +9,6 @@ use ferrum_execution::token_execution::{
     ExecutionAdmission, ExecutionCloseDisposition, ExecutionEndReason, ExecutorSequence,
     TokenAdmissionOutcome,
 };
-use ferrum_kv::{PagedKvCacheConfig, PagedKvCacheManager};
 use ferrum_models::test_support::{tiny_llama_executor_owned, TinyLlamaConfig, TinyTokenizer};
 
 struct StalePrefillExecutor {
@@ -135,30 +134,12 @@ async fn fixture(
     let config = EngineConfig::default();
     let scheduler = Arc::new(ContinuousBatchScheduler::new(config.scheduler.clone()));
     let tokenizer: Arc<dyn Tokenizer + Send + Sync> = Arc::new(TinyTokenizer::new(cfg.vocab_size));
-    let kv = Arc::new(
-        PagedKvCacheManager::new(
-            Device::CPU,
-            PagedKvCacheConfig {
-                block_size: 16,
-                max_gpu_blocks: 16,
-                max_cpu_blocks: 0,
-                enable_swapping: false,
-                num_layers: cfg.num_layers,
-                num_heads: cfg.num_kv_heads,
-                head_dim: cfg.head_dim,
-                ..Default::default()
-            },
-        )
-        .unwrap(),
-    );
     let engine = ContinuousBatchEngine::new(
         config,
         scheduler.clone(),
         tokenizer.clone(),
         Arc::new(crate::registry::GreedySampler),
-        kv,
         ExecutorOwner::new(Box::new(implementation)),
-        Arc::new(crate::tensor_factory::CandleTensorFactory::new(Device::CPU)),
     )
     .unwrap();
     let mut identities = Vec::new();

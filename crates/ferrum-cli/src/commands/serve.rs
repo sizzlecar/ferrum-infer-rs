@@ -3332,31 +3332,27 @@ mod tests {
     }
 
     #[test]
-    fn serve_runtime_snapshot_applies_recurrent_state_slots_to_engine_config() {
-        let config_entries = crate::config::RuntimeCliConfig {
-            recurrent_state_max_slots: Some(16),
-            ..Default::default()
+    fn serve_runtime_snapshot_rejects_retired_recurrent_state_slots() {
+        for value in ["0", "16"] {
+            let snapshot = merge_runtime_config_sources(
+                Vec::new(),
+                RuntimeConfigSnapshot::from_entries([RuntimeConfigEntry::new(
+                    "FERRUM_RECURRENT_STATE_MAX_SLOTS",
+                    value,
+                    RuntimeConfigSource::Env,
+                )]),
+                Vec::new(),
+            );
+            let mut engine_config = ferrum_types::EngineConfig::default();
+            let error = engine_config
+                .apply_runtime_config_snapshot(&snapshot)
+                .unwrap_err();
+            assert!(
+                error.contains("FERRUM_RECURRENT_STATE_MAX_SLOTS"),
+                "{error}"
+            );
+            assert!(error.contains("retired"), "{error}");
         }
-        .runtime_config_entries();
-        let snapshot = merge_runtime_config_sources(
-            config_entries,
-            RuntimeConfigSnapshot::default(),
-            Vec::new(),
-        );
-        let entry = snapshot
-            .entries
-            .iter()
-            .find(|entry| entry.key == "FERRUM_RECURRENT_STATE_MAX_SLOTS")
-            .expect("missing recurrent state slot entry");
-        let mut engine_config = ferrum_types::EngineConfig::default();
-
-        engine_config
-            .apply_runtime_config_snapshot(&snapshot)
-            .expect("serve runtime config should apply to engine config");
-
-        assert_eq!(entry.effective_value, "16");
-        assert_eq!(entry.source, RuntimeConfigSource::ConfigFile);
-        assert_eq!(engine_config.runtime.recurrent_state_max_slots, Some(16));
     }
 
     #[test]

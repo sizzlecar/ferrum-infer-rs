@@ -7,12 +7,46 @@
 
 use std::collections::BTreeSet;
 
-use ferrum_interfaces::{RecurrentStateSpec, RecurrentStateTensorSpec};
-use ferrum_types::{DataType, Device, RequestId};
+use ferrum_types::DataType;
 use serde_json::Value;
 
 pub const QWEN35_CONV_STATE_NAME: &str = "conv_state";
 pub const QWEN35_DELTA_STATE_NAME: &str = "delta_state";
+
+/// One Qwen3.5 recurrent tensor's static shape and storage dtype.
+///
+/// This describes one sequence's tensor shape; it carries no request, device,
+/// allocation, or admission authority.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Qwen35RecurrentStateTensorSpec {
+    pub layer_index: usize,
+    pub name: String,
+    pub shape: Vec<usize>,
+    pub dtype: DataType,
+}
+
+impl Qwen35RecurrentStateTensorSpec {
+    pub fn new(
+        layer_index: usize,
+        name: impl Into<String>,
+        shape: Vec<usize>,
+        dtype: DataType,
+    ) -> Self {
+        Self {
+            layer_index,
+            name: name.into(),
+            shape,
+            dtype,
+        }
+    }
+
+    pub fn checked_num_elements(&self) -> Option<usize> {
+        self.shape
+            .iter()
+            .copied()
+            .try_fold(1usize, usize::checked_mul)
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub enum Qwen35LayerType {
@@ -532,7 +566,7 @@ impl Qwen35TextConfig {
     pub fn recurrent_state_tensor_specs(
         &self,
         conv_state_dtype: DataType,
-    ) -> Result<Vec<RecurrentStateTensorSpec>, String> {
+    ) -> Result<Vec<Qwen35RecurrentStateTensorSpec>, String> {
         self.recurrent_state_tensor_specs_with_dtypes(Qwen35RecurrentStateDtypes::new(
             conv_state_dtype,
             self.mamba_ssm_dtype,
@@ -542,7 +576,7 @@ impl Qwen35TextConfig {
     pub fn recurrent_state_tensor_specs_with_dtypes(
         &self,
         dtypes: Qwen35RecurrentStateDtypes,
-    ) -> Result<Vec<RecurrentStateTensorSpec>, String> {
+    ) -> Result<Vec<Qwen35RecurrentStateTensorSpec>, String> {
         validate_recurrent_state_dtype("model/conv", dtypes.conv_state)?;
         validate_recurrent_state_dtype("model/delta", dtypes.delta_state)?;
         let conv_shape = self.recurrent_conv_state_shape()?;
@@ -559,13 +593,13 @@ impl Qwen35TextConfig {
             if kind != Qwen35LayerType::LinearAttention {
                 continue;
             }
-            specs.push(RecurrentStateTensorSpec::new(
+            specs.push(Qwen35RecurrentStateTensorSpec::new(
                 layer_index,
                 QWEN35_CONV_STATE_NAME,
                 conv_shape.clone(),
                 dtypes.conv_state,
             ));
-            specs.push(RecurrentStateTensorSpec::new(
+            specs.push(Qwen35RecurrentStateTensorSpec::new(
                 layer_index,
                 QWEN35_DELTA_STATE_NAME,
                 delta_shape.clone(),
@@ -623,40 +657,6 @@ impl Qwen35TextConfig {
                     .checked_add(tensor_bytes)
                     .ok_or_else(|| "Qwen3.5 recurrent state byte total overflows u64".to_string())
             })
-    }
-
-    pub fn to_recurrent_state_spec(
-        &self,
-        request_id: RequestId,
-        conv_state_dtype: DataType,
-        device: Device,
-        max_batch_slots: usize,
-    ) -> Result<RecurrentStateSpec, String> {
-        self.to_recurrent_state_spec_with_dtypes(
-            request_id,
-            Qwen35RecurrentStateDtypes::new(conv_state_dtype, self.mamba_ssm_dtype),
-            device,
-            max_batch_slots,
-        )
-    }
-
-    pub fn to_recurrent_state_spec_with_dtypes(
-        &self,
-        request_id: RequestId,
-        dtypes: Qwen35RecurrentStateDtypes,
-        device: Device,
-        max_batch_slots: usize,
-    ) -> Result<RecurrentStateSpec, String> {
-        if max_batch_slots == 0 {
-            return Err("max_batch_slots must be positive".to_string());
-        }
-        Ok(RecurrentStateSpec {
-            request_id,
-            num_layers: self.num_hidden_layers,
-            tensors: self.recurrent_state_tensor_specs_with_dtypes(dtypes)?,
-            device,
-            max_batch_slots,
-        })
     }
 
     fn validate(&self) -> Result<(), String> {

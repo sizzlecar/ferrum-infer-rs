@@ -739,7 +739,6 @@ pub struct RuntimeKnobs {
     /// Retain independent vNext sequence-state checkpoints across requests.
     #[serde(default)]
     pub prefix_state_cache_enabled: bool,
-    pub recurrent_state_max_slots: Option<usize>,
     pub attention_execution_policy: AttentionExecutionPolicy,
     /// Host invocation preparation policy; full preparation is the default.
     #[serde(default)]
@@ -900,12 +899,6 @@ impl EngineConfig {
         if let Some(value) = runtime_config_value(snapshot, "FERRUM_MAX_MODEL_LEN") {
             self.runtime.max_model_len = Some(parse_required_positive_usize(
                 "FERRUM_MAX_MODEL_LEN",
-                value,
-            )?);
-        }
-        if let Some(value) = runtime_config_value(snapshot, "FERRUM_RECURRENT_STATE_MAX_SLOTS") {
-            self.runtime.recurrent_state_max_slots = Some(parse_required_positive_usize(
-                "FERRUM_RECURRENT_STATE_MAX_SLOTS",
                 value,
             )?);
         }
@@ -2766,44 +2759,47 @@ mod tests {
     }
 
     #[test]
-    fn engine_config_applies_recurrent_state_max_slots_runtime_key() {
-        let mut config = EngineConfig::default();
-        let snapshot =
-            RuntimeConfigSnapshot::from_env_vars([("FERRUM_RECURRENT_STATE_MAX_SLOTS", "16")]);
-
-        config
-            .apply_runtime_config_snapshot(&snapshot)
-            .expect("runtime config should apply");
-
-        assert_eq!(config.runtime.recurrent_state_max_slots, Some(16));
+    fn engine_config_rejects_retired_recurrent_state_slots_before_mutation() {
+        for value in ["", "0", "16"] {
+            let mut config = EngineConfig::default();
+            let original = serde_json::to_value(&config).unwrap();
+            let snapshot = RuntimeConfigSnapshot::from_env_vars([
+                ("FERRUM_RECURRENT_STATE_MAX_SLOTS", value),
+                ("FERRUM_KV_MAX_BLOCKS", "123"),
+                ("FERRUM_PAGED_MAX_SEQS", "8"),
+            ]);
+            let error = config.apply_runtime_config_snapshot(&snapshot).unwrap_err();
+            assert!(
+                error.contains("FERRUM_RECURRENT_STATE_MAX_SLOTS"),
+                "{error}"
+            );
+            assert!(error.contains("retired"), "{error}");
+            assert_eq!(serde_json::to_value(&config).unwrap(), original);
+        }
     }
 
     #[test]
     fn engine_config_does_not_apply_removed_qwen35_slot_alias() {
         let mut config = EngineConfig::default();
+        let original = serde_json::to_value(&config).unwrap();
         let snapshot =
             RuntimeConfigSnapshot::from_env_vars([("FERRUM_QWEN35_LINEAR_STATE_MAX_SLOTS", "16")]);
-
-        config
-            .apply_runtime_config_snapshot(&snapshot)
-            .expect("runtime config should apply");
-
-        assert_eq!(config.runtime.recurrent_state_max_slots, None);
+        config.apply_runtime_config_snapshot(&snapshot).unwrap();
+        assert_eq!(serde_json::to_value(&config).unwrap(), original);
     }
 
     #[test]
-    fn engine_config_uses_generic_recurrent_state_slots_when_removed_alias_is_present() {
-        let mut config = EngineConfig::default();
-        let snapshot = RuntimeConfigSnapshot::from_env_vars([
-            ("FERRUM_RECURRENT_STATE_MAX_SLOTS", "8"),
-            ("FERRUM_QWEN35_LINEAR_STATE_MAX_SLOTS", "16"),
-        ]);
-
-        config
-            .apply_runtime_config_snapshot(&snapshot)
-            .expect("runtime config should apply");
-
-        assert_eq!(config.runtime.recurrent_state_max_slots, Some(8));
+    fn engine_config_rejects_retired_recurrent_state_slots_in_serialized_runtime() {
+        for value in [0, 16] {
+            let mut document = serde_json::to_value(EngineConfig::default()).unwrap();
+            document["runtime"]["recurrent_state_max_slots"] = serde_json::json!(value);
+            let error = serde_json::from_value::<EngineConfig>(document).unwrap_err();
+            assert!(error.to_string().contains("unknown field"), "{error}");
+            assert!(
+                error.to_string().contains("recurrent_state_max_slots"),
+                "{error}"
+            );
+        }
     }
 
     #[test]

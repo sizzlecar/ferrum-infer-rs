@@ -212,13 +212,12 @@ fn engine_observed(
     let observation = executor.observer();
     let executor = ExecutorOwner::new(Box::new(executor));
     let scheduler = Arc::new(ContinuousBatchScheduler::new(config.scheduler.clone()));
-    let engine = ContinuousBatchEngine::new_plan_runtime_observed(
+    let engine = ContinuousBatchEngine::new_observed(
         config,
         scheduler,
         Arc::new(ferrum_testkit::MockTokenizer::new(128)),
         Arc::new(ferrum_testkit::MockSampler),
         executor,
-        Arc::new(MockTensorFactory),
         None,
         observer,
         None,
@@ -260,13 +259,12 @@ async fn prefix_restore_time_planning_reprojects_current_frontier_with_original_
     source.replace_after_load.store(true, Ordering::Release);
     let tokenizer: Arc<dyn Tokenizer + Send + Sync> =
         Arc::new(ferrum_testkit::MockTokenizer::new(128));
-    let engine = ContinuousBatchEngine::new_plan_runtime_observed(
+    let engine = ContinuousBatchEngine::new_observed(
         config.clone(),
         Arc::new(ContinuousBatchScheduler::new(config.scheduler)),
         tokenizer.clone(),
         Arc::new(ferrum_testkit::MockSampler),
         ExecutorOwner::new(Box::new(implementation)),
-        Arc::new(MockTensorFactory),
         None,
         Some(recorder.clone()),
         Some(source.clone()),

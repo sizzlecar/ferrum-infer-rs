@@ -2,7 +2,7 @@
 
 **状态：目标已激活，R0 已合并，R4 最小闭环已验证；R1–R3 剩余边界与 R5 验收继续。** 工作分支：`refactor/execution-architecture-20261018`，从干净 `main`（`c2be4c67`）开始，PR #441 待合并；原工作区的旧 SLO 实现不作为代码基底。
 
-R0 六批退役与修复已合并（PR #429–#434）。执行契约、runtime、受管驱动、输出额度和实例资源已分责，旧 Tensor 控制流及全局 profiler 已退出。独立 SLO 参考组件通过真实 CPU mixed 执行、故障回收和 Metal 前缀恢复组合验证；调度与实际提交共用合法形状投影。生产日志已移至 `ferrum-journal`，Engine/Server 不再普通依赖 benchmark 工具包。剩余重点是 Engine 旧资源统计装配、低层资源入口及保留 CUDA 路径资格，随后完成默认质量/性能回归和主线合并。27B GGUF 数值差异、Metal counter 间歇失败及既有 SM120 经典 Marlin 非法指令仍须分别解释或修复。原始证据留在仓库外；当前不新增性能或 SLO 达标声明。
+R0 六批退役与修复已合并（PR #429–#434）。执行契约、runtime、受管驱动、输出额度和实例资源已分责，旧 Tensor 控制流及全局 profiler 已退出。独立 SLO 参考组件通过真实 CPU mixed 执行、故障回收和 Metal 前缀恢复组合验证；调度与实际提交共用合法形状投影。生产日志已移至 `ferrum-journal`，Engine/Server 不再普通依赖 benchmark 工具包。Engine 已移除未参与执行的 KV/recurrent 管理器，状态直接观察原 executor，未知内存不再伪报零值。剩余重点是低层资源入口及保留 CUDA 路径资格，随后完成默认质量/性能回归和主线合并。27B GGUF 数值差异、Metal counter 间歇失败及既有 SM120 经典 Marlin 非法指令仍须分别解释或修复。原始证据留在仓库外；当前不新增性能或 SLO 达标声明。
 
 ## 1. 目标与第一原则
 
@@ -120,6 +120,10 @@ R2 观测 API：`ExecutionEventSinkError` 区分 `Contract` 与 `Transport`；`d
 `JsonlJournal<T>` 只负责投递；`JsonlProducerScope` 结束组件投递，`JsonlJournalOwner` 在所有范围结束后关闭原 writer。库共享文件须显式注入独立 scope，工具独用 `OwnedJsonlJournal<T>`。flush/final receipt 分别保留固定前缀和真实 join 事实，调用方检查 `receipt.result()`；返回 receipt 不代表证据完整。
 
 日志 API 由 `ferrum-journal` 提供；HTTP benchmark correlation 的纯 wire 类型归 `ferrum-types`。`ferrum-bench-core` 为工具保留同类型重导出，只有一份 writer 与路径注册表；Engine/Server 直接依赖生产组件，CLI 的 benchmark 子命令保留工具依赖。
+
+Engine 资源 API：统一构造器只接收配置、scheduler、tokenizer、sampler 和原 executor；显式日志 scope 使用 `new_with_journal_scopes`。移除未参与执行的 KV/recurrent manager 注入、注册工厂及 TensorFactory 参数。真实 KV/recurrent provider 仍归原执行所有者；Qwen3.5 保留模型内的张量形状与容量估计，退出无执行消费者的 request/slot allocation spec。旧 `recurrent_state_max_slots` 配置明确拒绝；物理块数不再作为 token 窗口回退。
+
+`ModelExecutor::memory_observation` 返回原所有者的 `MemoryObservation`。`Known` 保留原 JSON 对象，`Unknown` 为 `null`，CLI/HTTP 明确显示不可用，不伪报零用量或因此置为不健康。缺少必需的 PlanRuntime 资源快照仍是合同错误。设备字段来自实际 executor，统计限定在其声明的内存域；不代表进程总内存或关闭后的释放证明。
 
 执行事实由独立的 `ExecutionFactsCapture` 开关控制，不改变计时模式、程序身份或缓存资格。`ProfiledSubmissionHandle::into_parts()` 返回完成句柄与 `SubmissionObservation`；后者持有当前工作量、可选计时归因和设备事实，提交后错误保留有效附件。`TerminalExecutionFacts` 只借用原终态，不授予重试或释放权。CUDA Q6 执行与观测共用实际选择，原图保存无请求身份的投影模板，重放时绑定当前 token 范围；Off 捕获的图不回填模板，明确记为 `CachedTemplateUnavailable`。设备事实仅声明计算命令覆盖，不代表传输、初始化或每个 kernel 成功；缺失与未支持分别标记。产品投影经原有界日志队列交付，不用逻辑节点或 packed token 行数冒充物理矩阵。
 

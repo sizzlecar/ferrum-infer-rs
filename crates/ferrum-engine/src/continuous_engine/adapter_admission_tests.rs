@@ -180,41 +180,23 @@ impl ModelExecutor for AdapterCapableExecutor {
 
 fn engine_with_executor(
     executor: Box<dyn ModelExecutor + Send + Sync>,
-) -> (
-    ContinuousBatchEngine,
-    Arc<CountingTokenizer>,
-    Arc<MockKvCacheManager>,
-) {
+) -> (ContinuousBatchEngine, Arc<CountingTokenizer>) {
     let config = EngineConfig::default();
     let scheduler = Arc::new(ContinuousBatchScheduler::new(config.scheduler.clone()));
     let tokenizer = Arc::new(CountingTokenizer {
         inner: MockTokenizer::new(128),
         encodes: AtomicU64::new(0),
     });
-    let kv = Arc::new(MockKvCacheManager::new(256));
-    let authority = executor.execution_resource_authority();
     let executor = ExecutorOwner::new(executor);
-    let engine = match authority {
-        ExecutionResourceAuthority::LegacyEngine => ContinuousBatchEngine::new(
-            config,
-            scheduler,
-            tokenizer.clone(),
-            Arc::new(ferrum_testkit::MockSampler),
-            kv.clone(),
-            executor,
-            Arc::new(MockTensorFactory),
-        ),
-        ExecutionResourceAuthority::PlanRuntime => ContinuousBatchEngine::new_plan_runtime(
-            config,
-            scheduler,
-            tokenizer.clone(),
-            Arc::new(ferrum_testkit::MockSampler),
-            executor,
-            Arc::new(MockTensorFactory),
-        ),
-    }
+    let engine = ContinuousBatchEngine::new(
+        config,
+        scheduler,
+        tokenizer.clone(),
+        Arc::new(ferrum_testkit::MockSampler),
+        executor,
+    )
     .unwrap();
-    (engine, tokenizer, kv)
+    (engine, tokenizer)
 }
 
 fn adapter_request() -> InferenceRequest {
@@ -253,7 +235,6 @@ async fn rejected_request(
 fn assert_no_admission(
     engine: &ContinuousBatchEngine,
     tokenizer: &CountingTokenizer,
-    kv: &MockKvCacheManager,
     request_id: &RequestId,
 ) {
     assert_eq!(tokenizer.encodes.load(Ordering::Relaxed), 0);
@@ -266,8 +247,6 @@ fn assert_no_admission(
     assert_eq!(engine.scheduler.prefilling_count(), 0);
     assert_eq!(engine.scheduler.decoding_count(), 0);
     assert_eq!(engine.scheduler.trace_phase(request_id), None);
-    assert_eq!(kv.stats().allocation_count, 0);
-    assert_eq!(kv.active_count(), 0);
     assert_eq!(
         engine
             .active_inner()
@@ -314,7 +293,7 @@ async fn unsupported_adapter_requests_are_rejected_before_admission() {
         Box::new(implementation),
     ];
     for executor in executors {
-        let (engine, tokenizer, kv) = engine_with_executor(executor);
+        let (engine, tokenizer) = engine_with_executor(executor);
         assert_eq!(
             engine.adapter_execution_support(),
             AdapterExecutionSupport::Unsupported
@@ -324,7 +303,7 @@ async fn unsupported_adapter_requests_are_rejected_before_admission() {
             let id = request.id.clone();
             let error = rejected_request(&engine, request, streaming).await;
             assert!(matches!(error, FerrumError::Unsupported { .. }));
-            assert_no_admission(&engine, &tokenizer, &kv, &id);
+            assert_no_admission(&engine, &tokenizer, &id);
         }
     }
     assert_eq!(native.admission_probes.load(Ordering::Relaxed), 0);
@@ -342,7 +321,7 @@ async fn malformed_adapter_requests_never_reach_tokenization() {
         Box::new(implementation),
     ];
     for executor in executors {
-        let (engine, tokenizer, kv) = engine_with_executor(executor);
+        let (engine, tokenizer) = engine_with_executor(executor);
         for metadata in [
             serde_json::json!({"ferrum_lora_adapter": "adapter-a"}),
             serde_json::json!({"ferrum_lora_path": "/adapters/a"}),
@@ -355,7 +334,7 @@ async fn malformed_adapter_requests_never_reach_tokenization() {
                 request.metadata = serde_json::from_value(metadata.clone()).unwrap();
                 let id = request.id.clone();
                 rejected_request(&engine, request, streaming).await;
-                assert_no_admission(&engine, &tokenizer, &kv, &id);
+                assert_no_admission(&engine, &tokenizer, &id);
             }
         }
     }
@@ -398,7 +377,7 @@ async fn execute_one_token(
 async fn adapter_support_is_forwarded_and_base_requests_still_execute() {
     let implementation = AdapterCapableExecutor::new(AdapterExecutionSupport::PerSequenceLora);
     let capable = implementation.observer();
-    let (engine, _, _) = engine_with_executor(Box::new(implementation));
+    let (engine, _) = engine_with_executor(Box::new(implementation));
     let public: &dyn LlmInferenceEngine = &engine;
     assert_eq!(
         public.adapter_execution_support(),
@@ -426,7 +405,7 @@ async fn adapter_support_is_forwarded_and_base_requests_still_execute() {
 
     let implementation = AdapterCapableExecutor::new(AdapterExecutionSupport::Unsupported);
     let executor = implementation.observer();
-    let (base, _, _) = engine_with_executor(Box::new(implementation));
+    let (base, _) = engine_with_executor(Box::new(implementation));
     for streaming in [false, true] {
         execute_one_token(&base, policy_request(), streaming).await;
     }

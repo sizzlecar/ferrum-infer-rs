@@ -14,7 +14,6 @@ pub mod adapter;
 pub mod engine;
 pub mod kv_cache;
 pub mod kv_dtype;
-pub mod recurrent_state;
 pub mod sampler;
 pub mod scheduler;
 pub mod tensor;
@@ -26,11 +25,6 @@ pub use kv_cache::{
     AllocationRequest, BlockTable, CacheHandleStats, KvCacheHandle, KvCacheManager,
 };
 pub use kv_dtype::{KvBf16, KvDtypeKind, KvFp16, KvFp8, KvInt8};
-pub use recurrent_state::{
-    RecurrentStateHandle, RecurrentStateHandleStats, RecurrentStateManager,
-    RecurrentStateManagerStats, RecurrentStateResumePolicy, RecurrentStateSpec,
-    RecurrentStateTensorSpec,
-};
 pub use sampler::{
     LogitsProcessor, Sampler, SamplingConfig, SamplingContext, SamplingRng,
     SAMPLING_RNG_ALGORITHM_ID,

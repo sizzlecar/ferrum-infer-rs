@@ -29,8 +29,7 @@ use ferrum_interfaces::{
     adapter::AdapterExecutionSupport,
     engine::{InferenceEngine, LlmInferenceEngine},
     sampler::{SamplingConfig as TokenSamplingPlan, SamplingRng},
-    KvCacheManager, RecurrentStateManager, Sampler, SchedulerInterface as Scheduler, TensorFactory,
-    Tokenizer,
+    Sampler, SchedulerInterface as Scheduler, Tokenizer,
 };
 use ferrum_journal::{JsonlJournal, JsonlJournalError};
 use ferrum_output::{
@@ -59,8 +58,10 @@ use ferrum_scheduler::implementations::{
 use ferrum_scheduler::vnext::{
     AdmissionDeferral, AdmissionProbeOutcome, AdmissionWakeEpochs, AdmissionWakeSnapshot,
 };
+#[cfg(test)]
+use ferrum_types::Device;
 use ferrum_types::{
-    Device, EngineConfig, EngineDecodeStage, EngineDecodeStageInterval, EngineStatus,
+    EngineConfig, EngineDecodeStage, EngineDecodeStageInterval, EngineStatus,
     EngineTokenTimingEvidence, FerrumError, FerrumProfileEvent, FinishReason,
     InferenceExecutionEvidence, InferenceRequest, InferenceResponse, ObservabilityProfileDetail,
     ProfileEntrypoint, ProfileError, ProfileEventKind, ProfileStatus, RequestId,
@@ -205,10 +206,9 @@ fn effective_request_context_capacity(
     runtime_config: &ContinuousEngineRuntimeConfig,
     executor_kv_capacity: Option<usize>,
 ) -> Option<usize> {
-    let kv_capacity = runtime_config
-        .kv_capacity
-        .or(executor_kv_capacity)
-        .or_else(|| (config.kv_cache.max_blocks > 0).then_some(config.kv_cache.max_blocks));
+    // Block counts describe a physical allocator, not a per-request token
+    // window. Only the declared token limit or original executor can supply it.
+    let kv_capacity = runtime_config.kv_capacity.or(executor_kv_capacity);
     let max_model_len = runtime_config.max_model_len.or_else(|| {
         config
             .model
@@ -1244,14 +1244,6 @@ pub(crate) fn validate_execution_feedback(
     Ok(())
 }
 
-enum EngineResourceComposition {
-    LegacyEngine {
-        kv_cache: Arc<dyn KvCacheManager + Send + Sync>,
-        recurrent_state_manager: Option<Arc<dyn RecurrentStateManager + Send + Sync>>,
-    },
-    PlanRuntime,
-}
-
 const MAX_EXECUTION_READINESS_WAITERS: usize = 64;
 
 struct ExecutionReadinessWaitTarget {
@@ -1394,25 +1386,6 @@ impl ExecutionReadinessWaitRegistry {
     }
 }
 
-impl EngineResourceComposition {
-    const fn authority(&self) -> ExecutionResourceAuthority {
-        match self {
-            Self::LegacyEngine { .. } => ExecutionResourceAuthority::LegacyEngine,
-            Self::PlanRuntime => ExecutionResourceAuthority::PlanRuntime,
-        }
-    }
-
-    fn recurrent_state_manager(&self) -> Option<&Arc<dyn RecurrentStateManager + Send + Sync>> {
-        match self {
-            Self::LegacyEngine {
-                recurrent_state_manager,
-                ..
-            } => recurrent_state_manager.as_ref(),
-            Self::PlanRuntime => None,
-        }
-    }
-}
-
 mod output_delivery;
 use output_delivery::{OutputReceiver, OutputSender, OutputTaskRegistry};
 
@@ -1429,7 +1402,6 @@ struct EngineInner {
     #[allow(dead_code)]
     // Retained for constructor API; sampling now uses per-request SamplingConfig
     sampler: Arc<dyn Sampler + Send + Sync>,
-    resource_composition: EngineResourceComposition,
     model_executor: Arc<ExecutorScope>,
     sequences: SequenceRegistry,
     driver: Weak<ManagedDriver>,
@@ -1556,10 +1528,6 @@ impl Stream for CancellationAwareResponseStream {
 }
 
 impl EngineInner {
-    fn recurrent_state_manager(&self) -> Option<&Arc<dyn RecurrentStateManager + Send + Sync>> {
-        self.resource_composition.recurrent_state_manager()
-    }
-
     fn record_iteration_lock_wait(&self, duration: Duration) {
         self.total_iteration_lock_wait_us
             .fetch_add(duration_to_us(duration), Ordering::Relaxed);
@@ -2203,74 +2171,32 @@ pub struct ContinuousBatchEngine {
 }
 
 impl ContinuousBatchEngine {
+    /// Build one engine over the executor's original resource owner.
     pub fn new(
         config: EngineConfig,
         scheduler: Arc<ContinuousBatchScheduler>,
         tokenizer: Arc<dyn Tokenizer + Send + Sync>,
         sampler: Arc<dyn Sampler + Send + Sync>,
-        kv_cache: Arc<dyn KvCacheManager + Send + Sync>,
         model_executor: impl IntoEngineExecutor,
-        tensor_factory: Arc<dyn TensorFactory>,
     ) -> Result<Self> {
-        Self::new_with_recurrent_state_manager(
-            config,
-            scheduler,
-            tokenizer,
-            sampler,
-            kv_cache,
-            model_executor,
-            tensor_factory,
-            None,
-        )
+        Self::new_with_journal_scopes(config, scheduler, tokenizer, sampler, model_executor, None)
     }
 
-    /// Build an engine with an optional recurrent-state manager for
-    /// state-space / hybrid models.
-    #[allow(clippy::too_many_arguments)]
-    pub fn new_with_recurrent_state_manager(
+    pub fn new_with_journal_scopes(
         config: EngineConfig,
         scheduler: Arc<ContinuousBatchScheduler>,
         tokenizer: Arc<dyn Tokenizer + Send + Sync>,
         sampler: Arc<dyn Sampler + Send + Sync>,
-        kv_cache: Arc<dyn KvCacheManager + Send + Sync>,
         model_executor: impl IntoEngineExecutor,
-        tensor_factory: Arc<dyn TensorFactory>,
-        recurrent_state_manager: Option<Arc<dyn RecurrentStateManager + Send + Sync>>,
-    ) -> Result<Self> {
-        Self::new_with_recurrent_state_manager_and_journal_scopes(
-            config,
-            scheduler,
-            tokenizer,
-            sampler,
-            kv_cache,
-            model_executor,
-            tensor_factory,
-            recurrent_state_manager,
-            None,
-        )
-    }
 
-    #[allow(clippy::too_many_arguments)]
-    pub fn new_with_recurrent_state_manager_and_journal_scopes(
-        config: EngineConfig,
-        scheduler: Arc<ContinuousBatchScheduler>,
-        tokenizer: Arc<dyn Tokenizer + Send + Sync>,
-        sampler: Arc<dyn Sampler + Send + Sync>,
-        kv_cache: Arc<dyn KvCacheManager + Send + Sync>,
-        model_executor: impl IntoEngineExecutor,
-        tensor_factory: Arc<dyn TensorFactory>,
-        recurrent_state_manager: Option<Arc<dyn RecurrentStateManager + Send + Sync>>,
         journal_scopes: Option<EngineJournalScopes>,
     ) -> Result<Self> {
-        Self::new_legacy_observed(
+        Self::new_observed(
             config,
             scheduler,
             tokenizer,
             sampler,
-            kv_cache,
             model_executor,
-            tensor_factory,
-            recurrent_state_manager,
             journal_scopes,
             None,
             None,
@@ -2278,116 +2204,13 @@ impl ContinuousBatchEngine {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn new_legacy_observed(
+    pub(crate) fn new_observed(
         config: EngineConfig,
         scheduler: Arc<ContinuousBatchScheduler>,
         tokenizer: Arc<dyn Tokenizer + Send + Sync>,
         sampler: Arc<dyn Sampler + Send + Sync>,
-        kv_cache: Arc<dyn KvCacheManager + Send + Sync>,
         model_executor: impl IntoEngineExecutor,
-        tensor_factory: Arc<dyn TensorFactory>,
-        recurrent_state_manager: Option<Arc<dyn RecurrentStateManager + Send + Sync>>,
-        journal_scopes: Option<EngineJournalScopes>,
-        execution_attempt_observer: Option<Arc<dyn ExecutionAttemptObserver>>,
-        cost_snapshot_source: Option<Arc<dyn CostSnapshotSource>>,
-    ) -> Result<Self> {
-        Self::new_with_resource_composition(
-            config,
-            scheduler,
-            tokenizer,
-            sampler,
-            EngineResourceComposition::LegacyEngine {
-                kv_cache,
-                recurrent_state_manager,
-            },
-            model_executor,
-            tensor_factory,
-            journal_scopes,
-            execution_attempt_observer,
-            cost_snapshot_source,
-        )
-    }
 
-    /// Build an engine bound to the shared plan runtime, which is the sole
-    /// owner of request-lifetime KV, recurrent state, and backing capacity.
-    /// The model executor adapts that runtime but does not own a second
-    /// resource manager; no legacy engine manager is created or retained.
-    pub fn new_plan_runtime(
-        config: EngineConfig,
-        scheduler: Arc<ContinuousBatchScheduler>,
-        tokenizer: Arc<dyn Tokenizer + Send + Sync>,
-        sampler: Arc<dyn Sampler + Send + Sync>,
-        model_executor: impl IntoEngineExecutor,
-        tensor_factory: Arc<dyn TensorFactory>,
-    ) -> Result<Self> {
-        Self::new_plan_runtime_with_journal_scopes(
-            config,
-            scheduler,
-            tokenizer,
-            sampler,
-            model_executor,
-            tensor_factory,
-            None,
-        )
-    }
-
-    pub fn new_plan_runtime_with_journal_scopes(
-        config: EngineConfig,
-        scheduler: Arc<ContinuousBatchScheduler>,
-        tokenizer: Arc<dyn Tokenizer + Send + Sync>,
-        sampler: Arc<dyn Sampler + Send + Sync>,
-        model_executor: impl IntoEngineExecutor,
-        tensor_factory: Arc<dyn TensorFactory>,
-        journal_scopes: Option<EngineJournalScopes>,
-    ) -> Result<Self> {
-        Self::new_plan_runtime_observed(
-            config,
-            scheduler,
-            tokenizer,
-            sampler,
-            model_executor,
-            tensor_factory,
-            journal_scopes,
-            None,
-            None,
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn new_plan_runtime_observed(
-        config: EngineConfig,
-        scheduler: Arc<ContinuousBatchScheduler>,
-        tokenizer: Arc<dyn Tokenizer + Send + Sync>,
-        sampler: Arc<dyn Sampler + Send + Sync>,
-        model_executor: impl IntoEngineExecutor,
-        tensor_factory: Arc<dyn TensorFactory>,
-        journal_scopes: Option<EngineJournalScopes>,
-        execution_attempt_observer: Option<Arc<dyn ExecutionAttemptObserver>>,
-        cost_snapshot_source: Option<Arc<dyn CostSnapshotSource>>,
-    ) -> Result<Self> {
-        Self::new_with_resource_composition(
-            config,
-            scheduler,
-            tokenizer,
-            sampler,
-            EngineResourceComposition::PlanRuntime,
-            model_executor,
-            tensor_factory,
-            journal_scopes,
-            execution_attempt_observer,
-            cost_snapshot_source,
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn new_with_resource_composition(
-        config: EngineConfig,
-        scheduler: Arc<ContinuousBatchScheduler>,
-        tokenizer: Arc<dyn Tokenizer + Send + Sync>,
-        sampler: Arc<dyn Sampler + Send + Sync>,
-        resource_composition: EngineResourceComposition,
-        model_executor: impl IntoEngineExecutor,
-        _tensor_factory: Arc<dyn TensorFactory>,
         journal_scopes: Option<EngineJournalScopes>,
         execution_attempt_observer: Option<Arc<dyn ExecutionAttemptObserver>>,
         cost_snapshot_source: Option<Arc<dyn CostSnapshotSource>>,
@@ -2401,18 +2224,7 @@ impl ContinuousBatchEngine {
         let owns_executor = binding.owner.is_some();
         let model_executor = binding.scope;
         let executor_authority = model_executor.execution_resource_authority();
-        if resource_composition.authority() != executor_authority {
-            return Err(FerrumError::config(format!(
-                "engine resource composition {:?} does not match executor authority {:?}",
-                resource_composition.authority(),
-                executor_authority
-            )));
-        }
-        let recurrent_state_manager = resource_composition.recurrent_state_manager().is_some();
-        info!(
-            ?executor_authority,
-            "Creating ContinuousBatchEngine (recurrent_state_manager={})", recurrent_state_manager
-        );
+        info!(?executor_authority, "Creating ContinuousBatchEngine");
         config.runtime.profile_journal.validate()?;
         let runtime_config = ContinuousEngineRuntimeConfig::from_engine_config(&config);
         let observation_health = ObservationHealth::default();
@@ -2484,7 +2296,6 @@ impl ContinuousBatchEngine {
             tokenizer,
             structured_output_factory: OnceLock::new(),
             sampler,
-            resource_composition,
             model_executor,
             sequences: SequenceRegistry::default(),
             driver: Arc::downgrade(&driver),
@@ -2749,56 +2560,14 @@ impl LlmInferenceEngine for ContinuousBatchEngine {
 }
 
 impl EngineInner {
-    fn memory_snapshot(&self) -> (ferrum_types::MemoryUsage, bool) {
-        let (total_bytes, used_bytes, cache_memory_bytes, resource_status_ready) =
-            match &self.resource_composition {
-                EngineResourceComposition::LegacyEngine { kv_cache, .. } => {
-                    let kv_stats = kv_cache.stats();
-                    (
-                        kv_stats.total_memory_bytes,
-                        kv_stats.used_memory_bytes,
-                        kv_stats.used_memory_bytes,
-                        true,
-                    )
-                }
-                EngineResourceComposition::PlanRuntime => {
-                    match self.model_executor.plan_runtime_resource_snapshot() {
-                        Ok(Some(snapshot)) => {
-                            let total_bytes = usize::try_from(snapshot.usable_capacity_bytes())
-                                .unwrap_or(usize::MAX);
-                            let used_bytes = snapshot
-                                .used_bytes()
-                                .ok()
-                                .and_then(|bytes| usize::try_from(bytes).ok())
-                                .unwrap_or(usize::MAX);
-                            let dynamic_used_bytes = usize::try_from(snapshot.dynamic_used_bytes())
-                                .unwrap_or(usize::MAX);
-                            (total_bytes, used_bytes, dynamic_used_bytes, true)
-                        }
-                        Ok(None) => {
-                            warn!("Plan runtime did not expose its required resource snapshot");
-                            (0, 0, 0, false)
-                        }
-                        Err(error) => {
-                            warn!(error = %error, "Plan-runtime resource snapshot failed");
-                            (0, 0, 0, false)
-                        }
-                    }
-                }
-            };
-        let free_bytes = total_bytes.saturating_sub(used_bytes);
-        let mut memory_usage = ferrum_types::MemoryUsage {
-            total_bytes,
-            used_bytes,
-            free_bytes,
-            gpu_memory_bytes: self.config.backend.device.is_gpu().then_some(used_bytes),
-            cpu_memory_bytes: matches!(self.config.backend.device, Device::CPU)
-                .then_some(used_bytes),
-            cache_memory_bytes,
-            utilization_percent: 0.0,
-        };
-        memory_usage.calculate_utilization();
-        (memory_usage, resource_status_ready)
+    fn memory_snapshot(&self) -> (ferrum_types::MemoryObservation, bool) {
+        match self.model_executor.memory_observation() {
+            Ok(observation) => (observation, true),
+            Err(error) => {
+                warn!(error = %error, "Executor resource observation failed");
+                (ferrum_types::MemoryObservation::Unknown, false)
+            }
+        }
     }
 }
 
@@ -2811,17 +2580,7 @@ impl InferenceEngine for ContinuousBatchEngine {
                 loaded_models: Vec::new(),
                 active_requests: 0,
                 queued_requests: 0,
-                memory_usage: self.driver.final_memory.lock().clone().unwrap_or(
-                    ferrum_types::MemoryUsage {
-                        total_bytes: 0,
-                        used_bytes: 0,
-                        free_bytes: 0,
-                        gpu_memory_bytes: None,
-                        cpu_memory_bytes: None,
-                        cache_memory_bytes: 0,
-                        utilization_percent: 0.0,
-                    },
-                ),
+                memory_usage: self.driver.final_memory.lock().clone().unwrap_or_default(),
                 uptime_seconds: 0,
                 last_heartbeat: chrono::Utc::now(),
                 version: env!("CARGO_PKG_VERSION").to_owned(),
@@ -2904,35 +2663,21 @@ impl InferenceEngine for ContinuousBatchEngine {
     ) -> ferrum_types::Result<Option<ferrum_types::ExecutorAdmissionSnapshot>> {
         let inner = self.active_inner()?;
         let scheduler = inner.scheduler.admission_phase_counts();
-        let authority = inner.resource_composition.authority();
-        let limits = match authority {
-            ExecutionResourceAuthority::PlanRuntime => {
-                inner.model_executor.admission_limits()?.ok_or_else(|| {
-                    FerrumError::internal(
-                        "PlanRuntime executor did not expose its resolved admission limits",
-                    )
-                })?
+        let authority = inner.model_executor.execution_resource_authority();
+        let limits = match inner.model_executor.admission_limits()? {
+            Some(limits) => limits,
+            None if authority == ExecutionResourceAuthority::PlanRuntime => {
+                return Err(FerrumError::internal(
+                    "PlanRuntime executor did not expose its resolved admission limits",
+                ));
             }
-            ExecutionResourceAuthority::LegacyEngine => {
-                let scheduler_limit = inner.config.scheduler.max_running_requests;
-                let maximum_active_sequences = inner
-                    .recurrent_state_manager()
-                    .map(|manager| scheduler_limit.min(manager.stats().total_batch_slots))
-                    .unwrap_or(scheduler_limit);
-                ferrum_types::ExecutorAdmissionLimits::new(
-                    u32::try_from(maximum_active_sequences).map_err(|_| {
-                        FerrumError::internal("legacy admission sequence limit exceeds u32")
-                    })?,
-                    u64::try_from(inner.config.batching.max_num_batched_tokens).map_err(|_| {
-                        FerrumError::internal("legacy scheduled-token limit exceeds u64")
-                    })?,
-                )
-                .map_err(|reason| {
-                    FerrumError::internal(format!(
-                        "legacy admission limits violated their typed contract: {reason}"
-                    ))
-                })?
-            }
+            None => ferrum_types::ExecutorAdmissionLimits::new(
+                u32::try_from(inner.config.scheduler.max_running_requests)
+                    .map_err(|_| FerrumError::internal("service sequence limit exceeds u32"))?,
+                u64::try_from(inner.config.batching.max_num_batched_tokens)
+                    .map_err(|_| FerrumError::internal("service token limit exceeds u64"))?,
+            )
+            .map_err(FerrumError::config)?,
         };
         ferrum_types::ExecutorAdmissionSnapshot::new(
             authority,

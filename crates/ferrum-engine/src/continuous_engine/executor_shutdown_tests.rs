@@ -1,6 +1,6 @@
 use super::*;
 use ferrum_models::test_support::{tiny_llama_executor_owned, tiny_tokenizer, TinyLlamaConfig};
-use ferrum_testkit::{MockKvCacheManager, MockSampler, MockTensorFactory};
+use ferrum_testkit::MockSampler;
 
 /// A rejected observer must outlive every public Engine handle, and its own
 /// terminal event must wake the original cleanup service without another request.
@@ -70,9 +70,7 @@ fn engine(executor: impl IntoEngineExecutor) -> ContinuousBatchEngine {
         Arc::new(ContinuousBatchScheduler::new(Default::default())),
         tiny_tokenizer(&config),
         Arc::new(MockSampler),
-        Arc::new(MockKvCacheManager::new(4096)),
         executor,
-        Arc::new(MockTensorFactory),
     )
     .unwrap()
 }

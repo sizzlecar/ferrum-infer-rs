@@ -318,7 +318,7 @@ async fn native_prefix_feedback_metal_learns_acknowledged_restore_and_retires_or
     });
     let tokenizer = Arc::new(FixtureTokenizer::new());
     assert_eq!(tokenizer.encode(&request().prompt, true).unwrap().len(), 5);
-    let engine = ContinuousBatchEngine::new_plan_runtime_observed(
+    let engine = ContinuousBatchEngine::new_observed(
         engine_config.clone(),
         Arc::new(ContinuousBatchScheduler::new(
             engine_config.scheduler.clone(),
@@ -326,8 +326,6 @@ async fn native_prefix_feedback_metal_learns_acknowledged_restore_and_retires_or
         tokenizer,
         Arc::new(crate::registry::GreedySampler),
         owner.scope().unwrap(),
-        // PlanRuntime owns all physical storage; this legacy argument is unused.
-        Arc::new(ferrum_testkit::MockTensorFactory),
         None,
         Some(attempts.clone()),
         Some(observed_source),

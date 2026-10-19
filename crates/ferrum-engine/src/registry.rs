@@ -13,7 +13,7 @@
 use async_trait::async_trait;
 use ferrum_execution::executor_lifecycle::ExecutorOwner;
 use ferrum_execution::ModelExecutor;
-use ferrum_interfaces::{KvCacheManager, Sampler, SchedulerInterface as Scheduler, Tokenizer};
+use ferrum_interfaces::{Sampler, SchedulerInterface as Scheduler, Tokenizer};
 use ferrum_models::vnext::{DefinedProductionModel, ProductionModelSourceBundle};
 use ferrum_types::{Device, EngineConfig, FerrumError, Result};
 use parking_lot::RwLock;
@@ -156,8 +156,6 @@ pub struct ComponentRegistry {
         RwLock<HashMap<String, Arc<dyn ComponentFactory<Arc<dyn Sampler + Send + Sync>>>>>,
     scheduler_factories:
         RwLock<HashMap<String, Arc<dyn ComponentFactory<Arc<dyn Scheduler + Send + Sync>>>>>,
-    kv_cache_factories:
-        RwLock<HashMap<String, Arc<dyn ComponentFactory<Arc<dyn KvCacheManager + Send + Sync>>>>>,
     executor_factories: RwLock<HashMap<String, Arc<dyn ComponentFactory<ExecutorOwner>>>>,
 }
 
@@ -168,7 +166,6 @@ impl ComponentRegistry {
             tokenizer_factories: RwLock::new(HashMap::new()),
             sampler_factories: RwLock::new(HashMap::new()),
             scheduler_factories: RwLock::new(HashMap::new()),
-            kv_cache_factories: RwLock::new(HashMap::new()),
             executor_factories: RwLock::new(HashMap::new()),
         }
     }
@@ -195,20 +192,15 @@ impl ComponentRegistry {
         // Scheduler factories
         self.register_scheduler_factory("continuous", Arc::new(ContinuousBatchSchedulerFactory));
 
-        // KV cache factories
-        self.register_kv_cache_factory("default", Arc::new(DefaultKvCacheFactory));
-        self.register_kv_cache_factory("paged", Arc::new(PagedKvCacheFactory));
-
         // Executor factories
         self.register_executor_factory("stub", Arc::new(StubExecutorFactory));
         self.register_executor_factory("llm", Arc::new(LlmExecutorFactory));
 
         debug!(
-            "Registered factories - tokenizers: {:?}, samplers: {:?}, schedulers: {:?}, kv_caches: {:?}, executors: {:?}",
+            "Registered factories - tokenizers: {:?}, samplers: {:?}, schedulers: {:?}, executors: {:?}",
             self.list_tokenizers(),
             self.list_samplers(),
             self.list_schedulers(),
-            self.list_kv_caches(),
             self.list_executors()
         );
     }
@@ -250,17 +242,6 @@ impl ComponentRegistry {
         self.scheduler_factories.write().insert(name, factory);
     }
 
-    /// Register a KV cache factory
-    pub fn register_kv_cache_factory(
-        &self,
-        name: impl Into<String>,
-        factory: Arc<dyn ComponentFactory<Arc<dyn KvCacheManager + Send + Sync>>>,
-    ) {
-        let name = name.into();
-        debug!("Registering KV cache factory: {}", name);
-        self.kv_cache_factories.write().insert(name, factory);
-    }
-
     /// Register a model executor factory
     pub fn register_executor_factory(
         &self,
@@ -300,14 +281,6 @@ impl ComponentRegistry {
         self.scheduler_factories.read().get(name).cloned()
     }
 
-    /// Get a KV cache factory by name
-    pub fn get_kv_cache_factory(
-        &self,
-        name: &str,
-    ) -> Option<Arc<dyn ComponentFactory<Arc<dyn KvCacheManager + Send + Sync>>>> {
-        self.kv_cache_factories.read().get(name).cloned()
-    }
-
     /// Get a model executor factory by name
     pub fn get_executor_factory(
         &self,
@@ -333,11 +306,6 @@ impl ComponentRegistry {
     /// List all registered scheduler names
     pub fn list_schedulers(&self) -> Vec<String> {
         self.scheduler_factories.read().keys().cloned().collect()
-    }
-
-    /// List all registered KV cache names
-    pub fn list_kv_caches(&self) -> Vec<String> {
-        self.kv_cache_factories.read().keys().cloned().collect()
     }
 
     /// List all registered executor names
@@ -397,22 +365,6 @@ impl ComponentRegistry {
         factory.create(config).await
     }
 
-    /// Create a KV cache manager by name
-    pub async fn create_kv_cache(
-        &self,
-        name: &str,
-        config: &ComponentConfig,
-    ) -> Result<Arc<dyn KvCacheManager + Send + Sync>> {
-        let factory = self.get_kv_cache_factory(name).ok_or_else(|| {
-            FerrumError::internal(format!(
-                "KV cache '{}' not found. Available: {:?}",
-                name,
-                self.list_kv_caches()
-            ))
-        })?;
-        factory.create(config).await
-    }
-
     /// Create a model executor by name
     pub async fn create_executor(
         &self,
@@ -442,7 +394,6 @@ impl std::fmt::Debug for ComponentRegistry {
             .field("tokenizers", &self.list_tokenizers())
             .field("samplers", &self.list_samplers())
             .field("schedulers", &self.list_schedulers())
-            .field("kv_caches", &self.list_kv_caches())
             .field("executors", &self.list_executors())
             .finish()
     }
@@ -458,9 +409,8 @@ impl std::fmt::Debug for ComponentRegistry {
 
 // CandleBackendFactory deleted in Phase: legacy `ComputeBackend` trait
 // gone; the registry's component graph never produced a runtime backend
-// (`_backend` in builder.rs was unused). The stub-executor factory now
-// constructs `CandleTensorFactory` directly when it needs to mint dummy
-// logits; everything else dispatches via `Backend<B>` in ferrum-kernels.
+// (`_backend` in builder.rs was unused). Executor implementations own their
+// backend resources and dispatch via `Backend<B>` in ferrum-kernels.
 
 // ----------------------------------------------------------------------------
 // Tokenizer Factories
@@ -673,93 +623,6 @@ impl ComponentFactory<Arc<dyn Scheduler + Send + Sync>> for ContinuousBatchSched
                 "preemption".to_string(),
                 "chunked_prefill".to_string(),
                 "iteration_level".to_string(),
-            ],
-        }
-    }
-}
-
-// ----------------------------------------------------------------------------
-// KV Cache Factories
-// ----------------------------------------------------------------------------
-
-/// Default KV cache factory
-pub struct DefaultKvCacheFactory;
-
-#[async_trait]
-impl ComponentFactory<Arc<dyn KvCacheManager + Send + Sync>> for DefaultKvCacheFactory {
-    async fn create(
-        &self,
-        config: &ComponentConfig,
-    ) -> Result<Arc<dyn KvCacheManager + Send + Sync>> {
-        let block_size = config.engine_config.kv_cache.block_size;
-        let max_blocks = config.engine_config.kv_cache.max_blocks;
-
-        info!(
-            "Creating default KV cache manager: device={:?}, block_size={}, max_blocks={}",
-            config.device, block_size, max_blocks
-        );
-
-        let manager = ferrum_kv::managers::DefaultKvCacheManager::new(
-            config.device.clone(),
-            block_size,
-            max_blocks,
-        )?;
-        Ok(Arc::new(manager))
-    }
-
-    fn metadata(&self) -> ComponentMetadata {
-        ComponentMetadata {
-            name: "default".to_string(),
-            version: "0.1.0".to_string(),
-            description: "Default contiguous KV cache manager".to_string(),
-            supported_devices: cpu_cuda_and_optional_metal_devices(),
-            capabilities: vec!["contiguous".to_string()],
-        }
-    }
-}
-
-/// Paged KV cache factory (for PagedAttention)
-pub struct PagedKvCacheFactory;
-
-#[async_trait]
-impl ComponentFactory<Arc<dyn KvCacheManager + Send + Sync>> for PagedKvCacheFactory {
-    async fn create(
-        &self,
-        config: &ComponentConfig,
-    ) -> Result<Arc<dyn KvCacheManager + Send + Sync>> {
-        let block_size = config.engine_config.kv_cache.block_size;
-        let max_blocks = config.engine_config.kv_cache.max_blocks;
-
-        info!(
-            "Creating paged KV cache manager: device={:?}, block_size={}, max_blocks={}",
-            config.device, block_size, max_blocks
-        );
-
-        // Use the PagedKvCacheManager for PagedAttention support
-        let paged_config = ferrum_kv::managers::PagedKvCacheConfig {
-            block_size,
-            max_gpu_blocks: max_blocks,
-            max_cpu_blocks: max_blocks / 2,
-            enable_cow: true,
-            enable_swapping: true,
-            ..Default::default()
-        };
-
-        let manager =
-            ferrum_kv::managers::PagedKvCacheManager::new(config.device.clone(), paged_config)?;
-        Ok(Arc::new(manager))
-    }
-
-    fn metadata(&self) -> ComponentMetadata {
-        ComponentMetadata {
-            name: "paged".to_string(),
-            version: "0.1.0".to_string(),
-            description: "Paged KV cache manager for PagedAttention".to_string(),
-            supported_devices: cpu_cuda_and_optional_metal_devices(),
-            capabilities: vec![
-                "paged".to_string(),
-                "copy_on_write".to_string(),
-                "swap".to_string(),
             ],
         }
     }

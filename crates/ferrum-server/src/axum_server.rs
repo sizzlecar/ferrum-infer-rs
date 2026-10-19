@@ -597,15 +597,7 @@ impl AppState {
             loaded_models: vec![],
             active_requests: 0,
             queued_requests: 0,
-            memory_usage: ferrum_types::MemoryUsage {
-                total_bytes: 0,
-                used_bytes: 0,
-                free_bytes: 0,
-                gpu_memory_bytes: None,
-                cpu_memory_bytes: None,
-                cache_memory_bytes: 0,
-                utilization_percent: 0.0,
-            },
+            memory_usage: ferrum_types::MemoryObservation::Unknown,
             uptime_seconds: 0,
             last_heartbeat: chrono::Utc::now(),
             version: env!("CARGO_PKG_VERSION").to_string(),
@@ -2164,7 +2156,7 @@ fn chat_resource_failure_diagnostics(
 ) -> serde_json::Value {
     let resource_kind = chat_resource_kind_for_failure(failure_kind);
     let memory = engine_status
-        .map(|status| &status.memory_usage)
+        .and_then(|status| status.memory_usage.known())
         .map(|memory| {
             let current = memory.used_bytes as i64;
             let high_water = current.max(0);
@@ -2184,22 +2176,20 @@ fn chat_resource_failure_diagnostics(
             serde_json::json!({
                 "scope": "serve_failure",
                 "backend": "engine_status",
-                "current_bytes": 0,
-                "high_water_bytes": 0,
-                "source": "not_collected"
+                "current_bytes": null,
+                "high_water_bytes": null,
+                "source": "unavailable"
             })
         });
     let capacity = chat_failure_capacity(resource_kind, admission_summary, engine_status, message);
     let needed = capacity
         .get("needed")
-        .and_then(|value| value.as_i64())
-        .unwrap_or(1)
-        .max(1);
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
     let capacity_value = capacity
         .get("capacity")
-        .and_then(|value| value.as_i64())
-        .unwrap_or(0)
-        .max(0);
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
     serde_json::json!({
         "schema_version": OBSERVABILITY_PROFILE_SCHEMA_VERSION,
         "entrypoint": "serve",
@@ -2240,19 +2230,26 @@ fn chat_failure_capacity(
     reason: &str,
 ) -> serde_json::Value {
     if resource_kind == "device_memory" {
-        let (needed, available, capacity) = engine_status
-            .map(|status| {
-                let memory = &status.memory_usage;
-                let used = memory.used_bytes as i64;
-                let available = memory.free_bytes as i64;
-                let capacity = memory.total_bytes as i64;
-                (
-                    used.saturating_add(1).max(1),
-                    available.max(0),
-                    capacity.max(0),
-                )
-            })
-            .unwrap_or((1, 0, 0));
+        let Some(memory) = engine_status.and_then(|status| status.memory_usage.known()) else {
+            return serde_json::json!({
+                "resource_kind": resource_kind,
+                "needed": null,
+                "available": null,
+                "capacity": null,
+                "source": "unavailable",
+                "reason": reason,
+            });
+        };
+        let (needed, available, capacity) = {
+            let used = memory.used_bytes as i64;
+            let available = memory.free_bytes as i64;
+            let capacity = memory.total_bytes as i64;
+            (
+                used.saturating_add(1).max(1),
+                available.max(0),
+                capacity.max(0),
+            )
+        };
         return serde_json::json!({
             "resource_kind": resource_kind,
             "needed": needed,
@@ -5614,7 +5611,7 @@ mod tests {
                 loaded_models: vec![self.config.model.model_id.clone()],
                 active_requests: 0,
                 queued_requests: 0,
-                memory_usage: MemoryUsage {
+                memory_usage: ferrum_types::MemoryObservation::Known(MemoryUsage {
                     total_bytes: 0,
                     used_bytes: 0,
                     free_bytes: 0,
@@ -5622,7 +5619,7 @@ mod tests {
                     cpu_memory_bytes: None,
                     cache_memory_bytes: 0,
                     utilization_percent: 0.0,
-                },
+                }),
                 uptime_seconds: 0,
                 last_heartbeat: chrono::Utc::now(),
                 version: "test".to_string(),
@@ -5668,7 +5665,7 @@ mod tests {
                 loaded_models: vec![self.config.model.model_id.clone()],
                 active_requests: 0,
                 queued_requests: 0,
-                memory_usage: MemoryUsage {
+                memory_usage: ferrum_types::MemoryObservation::Known(MemoryUsage {
                     total_bytes: 0,
                     used_bytes: 0,
                     free_bytes: 0,
@@ -5676,7 +5673,7 @@ mod tests {
                     cpu_memory_bytes: None,
                     cache_memory_bytes: 0,
                     utilization_percent: 0.0,
-                },
+                }),
                 uptime_seconds: 0,
                 last_heartbeat: chrono::Utc::now(),
                 version: "test".to_string(),
@@ -5712,7 +5709,7 @@ mod tests {
                 loaded_models: vec![self.config.model.model_id.clone()],
                 active_requests: 0,
                 queued_requests: 0,
-                memory_usage: MemoryUsage {
+                memory_usage: ferrum_types::MemoryObservation::Known(MemoryUsage {
                     total_bytes: 0,
                     used_bytes: 0,
                     free_bytes: 0,
@@ -5720,7 +5717,7 @@ mod tests {
                     cpu_memory_bytes: None,
                     cache_memory_bytes: 0,
                     utilization_percent: 0.0,
-                },
+                }),
                 uptime_seconds: 0,
                 last_heartbeat: chrono::Utc::now(),
                 version: "test".to_string(),
@@ -7528,13 +7525,46 @@ mod tests {
     }
 
     #[test]
+    fn unknown_owner_memory_is_not_zero_or_unhealthy() {
+        let status = EngineStatus {
+            is_ready: true,
+            loaded_models: Vec::new(),
+            active_requests: 0,
+            queued_requests: 0,
+            memory_usage: ferrum_types::MemoryObservation::Unknown,
+            uptime_seconds: 0,
+            last_heartbeat: chrono::Utc::now(),
+            version: "test".into(),
+        };
+        let diagnostic = chat_resource_failure_diagnostics(
+            "request",
+            "oom",
+            "execute",
+            "resource_exhausted",
+            "device allocation failed",
+            1,
+            None,
+            Some(&status),
+        );
+        let memory = &diagnostic["nearest_memory_snapshot"];
+        assert_eq!(memory["source"], "unavailable");
+        assert!(memory["current_bytes"].is_null());
+        assert!(memory["high_water_bytes"].is_null());
+        for key in ["needed", "available", "capacity"] {
+            assert!(diagnostic["capacity"][key].is_null(), "fabricated {key}");
+        }
+        assert!(status.is_ready);
+        assert!(serde_json::to_value(status).unwrap()["memory_usage"].is_null());
+    }
+
+    #[test]
     fn admission_health_prefers_runtime_authority_over_preflight_estimate() {
         let engine_status = EngineStatus {
             is_ready: true,
             loaded_models: Vec::new(),
             active_requests: 2,
             queued_requests: 1,
-            memory_usage: MemoryUsage {
+            memory_usage: ferrum_types::MemoryObservation::Known(MemoryUsage {
                 total_bytes: 0,
                 used_bytes: 0,
                 free_bytes: 0,
@@ -7542,7 +7572,7 @@ mod tests {
                 cpu_memory_bytes: None,
                 cache_memory_bytes: 0,
                 utilization_percent: 0.0,
-            },
+            }),
             uptime_seconds: 0,
             last_heartbeat: chrono::Utc::now(),
             version: "test".to_owned(),
@@ -7592,7 +7622,7 @@ mod tests {
             loaded_models: Vec::new(),
             active_requests: 32,
             queued_requests: 1,
-            memory_usage: MemoryUsage {
+            memory_usage: ferrum_types::MemoryObservation::Known(MemoryUsage {
                 total_bytes: 0,
                 used_bytes: 0,
                 free_bytes: 0,
@@ -7600,7 +7630,7 @@ mod tests {
                 cpu_memory_bytes: None,
                 cache_memory_bytes: 0,
                 utilization_percent: 0.0,
-            },
+            }),
             uptime_seconds: 0,
             last_heartbeat: chrono::Utc::now(),
             version: "test".to_owned(),

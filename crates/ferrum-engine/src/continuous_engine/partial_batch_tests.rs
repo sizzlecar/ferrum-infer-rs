@@ -10,7 +10,6 @@ use ferrum_execution::model_executor::{
 };
 use ferrum_execution::token_execution::*;
 use ferrum_kernels::backend::cpu::CpuBackend;
-use ferrum_kv::{PagedKvCacheConfig, PagedKvCacheManager};
 use ferrum_models::common::llm::{
     ModelKvPreparation, ModelKvReservation, ModelTokenInput, ModelTokenOutcome, ModelTokenProduct,
     ModelTokenWork,
@@ -467,32 +466,12 @@ async fn assert_batch_fault(fault: FaultKind, fault_index: usize) {
     let mut config = EngineConfig::default();
     config.backend.device = Device::CPU;
     let scheduler = Arc::new(ContinuousBatchScheduler::new(config.scheduler.clone()));
-    // Retained constructor dependency only: the token path must not create a
-    // duplicate Engine KV allocation beside the model's real physical cache.
-    let allocations = Arc::new(
-        PagedKvCacheManager::new(
-            Device::CPU,
-            PagedKvCacheConfig {
-                block_size: 16,
-                max_gpu_blocks: 32,
-                max_cpu_blocks: 0,
-                enable_swapping: false,
-                num_layers: cfg.num_layers,
-                num_heads: cfg.num_kv_heads,
-                head_dim: cfg.head_dim,
-                ..Default::default()
-            },
-        )
-        .unwrap(),
-    );
     let engine = ContinuousBatchEngine::new(
         config,
         scheduler.clone(),
         tokenizer.clone(),
         Arc::new(crate::registry::GreedySampler),
-        allocations.clone(),
         owned_executor,
-        Arc::new(crate::tensor_factory::CandleTensorFactory::new(Device::CPU)),
     )
     .unwrap();
     let mut streams = HashMap::new();
@@ -580,8 +559,6 @@ async fn assert_batch_fault(fault: FaultKind, fault_index: usize) {
         .process_batch(&prefill)
         .await
         .unwrap();
-    assert!(allocations.list_handles().is_empty());
-    assert_eq!(allocations.stats().used_memory_bytes, 0);
     assert_eq!(observed.lock().model.kv_caches.len(), 3);
 
     let mut reference = tiny_llama_model(&cfg);
@@ -769,7 +746,6 @@ async fn assert_batch_fault(fault: FaultKind, fault_index: usize) {
     assert!(identities[&b].observed_end().is_some());
     assert!(identities[&a].observed_end().is_none());
     assert!(identities[&peer].observed_end().is_none());
-    assert!(allocations.list_handles().is_empty());
     assert_eq!(scheduler.trace_phase(&b), None);
 
     let (peer_cache, peer_len, peer_tokens) = &initial[&peer];
@@ -1000,8 +976,6 @@ async fn assert_batch_fault(fault: FaultKind, fault_index: usize) {
         released, expected,
         "each physical model cache released exactly once"
     );
-    assert!(allocations.list_handles().is_empty());
-    assert_eq!(allocations.stats().used_memory_bytes, 0);
     assert_eq!(scheduler.trace_snapshot().active_len, 0);
     assert_eq!(
         engine

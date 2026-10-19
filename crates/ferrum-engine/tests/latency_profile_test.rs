@@ -6,9 +6,7 @@
 use ferrum_engine::{ContinuousBatchEngine, LlmInferenceEngine};
 use ferrum_output::InferenceOutput;
 use ferrum_scheduler::implementations::ContinuousBatchScheduler;
-use ferrum_testkit::{
-    MockKvCacheManager, MockModelExecutor, MockSampler, MockTensorFactory, MockTokenizer,
-};
+use ferrum_testkit::{MockModelExecutor, MockSampler, MockTokenizer};
 use ferrum_types::{InferenceRequest, SchedulerConfig};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -20,22 +18,18 @@ fn make_engine_with_latency(prefill_ms: u64, decode_ms: u64) -> ContinuousBatchE
     let scheduler = Arc::new(ContinuousBatchScheduler::new(SchedulerConfig::default()));
     let tokenizer = Arc::new(MockTokenizer::new(VOCAB_SIZE));
     let sampler = Arc::new(MockSampler);
-    let kv_cache = Arc::new(MockKvCacheManager::new(4096));
     let executor = MockModelExecutor::new(
         VOCAB_SIZE,
         Duration::from_millis(prefill_ms),
         Duration::from_millis(decode_ms),
     );
-    let tensor_factory = Arc::new(MockTensorFactory);
 
     ContinuousBatchEngine::new(
         config,
         scheduler,
         tokenizer,
         sampler,
-        kv_cache,
         ferrum_execution::executor_lifecycle::ExecutorOwner::new(Box::new(executor)),
-        tensor_factory,
     )
     .expect("legacy engine composition must match executor authority")
 }
@@ -198,17 +192,14 @@ async fn throughput_scaling() {
         let scheduler = Arc::new(ContinuousBatchScheduler::new(SchedulerConfig::default()));
         let tokenizer = Arc::new(MockTokenizer::new(VOCAB_SIZE));
         let sampler = Arc::new(MockSampler);
-        let kv_cache = Arc::new(MockKvCacheManager::new(4096));
         let executor = MockModelExecutor::instant(VOCAB_SIZE);
-        let tensor_factory = Arc::new(MockTensorFactory);
+
         ContinuousBatchEngine::new(
             config,
             scheduler,
             tokenizer,
             sampler,
-            kv_cache,
             ferrum_execution::executor_lifecycle::ExecutorOwner::new(Box::new(executor)),
-            tensor_factory,
         )
         .expect("legacy engine composition must match executor authority")
     });

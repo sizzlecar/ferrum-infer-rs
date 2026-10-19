@@ -3,7 +3,6 @@ use ferrum_execution::{
     model_executor::{ExecutorCapabilities, ExecutorStatus},
     token_execution::ExecutorSequenceIssuer,
 };
-use ferrum_kv::{PagedKvCacheConfig, PagedKvCacheManager};
 use ferrum_models::test_support::{tiny_llama_executor_owned, TinyLlamaConfig, TinyTokenizer};
 use std::sync::atomic::{AtomicU64, AtomicUsize};
 
@@ -224,30 +223,12 @@ fn fixture_with_inner(
     let mut config = EngineConfig::default();
     config.runtime.scheduler_trace_jsonl = trace_path;
     let scheduler = Arc::new(ContinuousBatchScheduler::new(config.scheduler.clone()));
-    let kv = Arc::new(
-        PagedKvCacheManager::new(
-            Device::CPU,
-            PagedKvCacheConfig {
-                block_size: 16,
-                max_gpu_blocks: 16,
-                max_cpu_blocks: 0,
-                enable_swapping: false,
-                num_layers: cfg.num_layers,
-                num_heads: cfg.num_kv_heads,
-                head_dim: cfg.head_dim,
-                ..Default::default()
-            },
-        )
-        .unwrap(),
-    );
     let engine = ContinuousBatchEngine::new(
         config,
         scheduler,
         Arc::new(TinyTokenizer::new(cfg.vocab_size)),
         Arc::new(crate::registry::GreedySampler),
-        kv,
         ExecutorOwner::new(Box::new(implementation)),
-        Arc::new(crate::tensor_factory::CandleTensorFactory::new(Device::CPU)),
     )
     .unwrap();
     let request_id = RequestId::new();

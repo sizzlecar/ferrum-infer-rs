@@ -229,11 +229,8 @@ fn fixture(
         issuer: ExecutorSequenceIssuer::new(),
         live: Arc::new(Mutex::new(HashMap::new())),
     };
-    let (engine, scheduler, executor, _) = plan_runtime_test_engine(
-        plan_runtime_test_config(None),
-        executor,
-        Arc::new(MockTensorFactory),
-    );
+    let (engine, scheduler, executor, _) =
+        plan_runtime_test_engine(plan_runtime_test_config(None), executor);
     (engine, scheduler, executor)
 }
 

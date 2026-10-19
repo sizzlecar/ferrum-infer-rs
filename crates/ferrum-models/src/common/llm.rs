@@ -8,8 +8,7 @@
 use ferrum_execution::model_executor::{
     KvSlotCapacitySnapshot, KvSlotRequest, KvSlotReservation, LogitsReturnPolicy,
 };
-use ferrum_interfaces::RecurrentStateSpec;
-use ferrum_types::{RequestId, Result, TokenId};
+use ferrum_types::Result;
 
 mod token;
 pub(crate) use token::catch_host_execution;
@@ -280,19 +279,6 @@ pub trait DecoderOnlyLLM: Send + Sync {
         _domain: &ferrum_execution::token_execution::AllocatorCapacityDomain,
         _candidates: &[&str],
     ) -> Result<Option<ferrum_execution::token_execution::TokenAllocatorReclaim>> {
-        Ok(None)
-    }
-
-    /// Recurrent-state allocation spec for state-space or hybrid models.
-    ///
-    /// Most decoder-only models are KV-only and return `None`. Models with
-    /// model-owned recurrent state can return a spec here so the engine can
-    /// apply admission/backpressure before dispatching a forward.
-    fn recurrent_state_spec(
-        &self,
-        _request_id: &RequestId,
-        _input_tokens: &[TokenId],
-    ) -> Result<Option<RecurrentStateSpec>> {
         Ok(None)
     }
 

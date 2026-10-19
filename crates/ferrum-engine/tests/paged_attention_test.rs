@@ -2,13 +2,12 @@
 //! Verifies end-to-end paged KV cache usage: block allocation, K/V storage,
 //! cross-block attention, and deallocation.
 
-use ferrum_engine::{ContinuousBatchEngine, KvCacheManager, LlmInferenceEngine};
+use ferrum_engine::{ContinuousBatchEngine, LlmInferenceEngine};
+use ferrum_interfaces::KvCacheManager;
 use ferrum_kv::managers::paged::{PagedKvCacheConfig, PagedKvCacheManager};
 use ferrum_output::InferenceOutput;
 use ferrum_scheduler::implementations::ContinuousBatchScheduler;
-use ferrum_testkit::{
-    MockSampler, MockTensorFactory, MockTokenizer, PagedAttentionExecutor, PagedExecutorConfig,
-};
+use ferrum_testkit::{MockSampler, MockTokenizer, PagedAttentionExecutor, PagedExecutorConfig};
 use ferrum_types::{InferenceRequest, SchedulerConfig};
 use std::sync::Arc;
 
@@ -49,16 +48,13 @@ fn make_engine() -> (ContinuousBatchEngine, Arc<PagedKvCacheManager>) {
     let scheduler = Arc::new(ContinuousBatchScheduler::new(SchedulerConfig::default()));
     let tokenizer = Arc::new(MockTokenizer::new(VOCAB_SIZE));
     let sampler = Arc::new(MockSampler);
-    let tensor_factory = Arc::new(MockTensorFactory);
 
     let engine = ContinuousBatchEngine::new(
         config,
         scheduler,
         tokenizer,
         sampler,
-        kv_manager.clone(),
         ferrum_execution::executor_lifecycle::ExecutorOwner::new(Box::new(executor)),
-        tensor_factory,
     )
     .expect("legacy engine composition must match executor authority");
 
@@ -139,16 +135,13 @@ async fn paged_executor_tracks_operations() {
     let scheduler = Arc::new(ContinuousBatchScheduler::new(SchedulerConfig::default()));
     let tokenizer = Arc::new(MockTokenizer::new(VOCAB_SIZE));
     let sampler = Arc::new(MockSampler);
-    let tensor_factory = Arc::new(MockTensorFactory);
 
     let engine = ContinuousBatchEngine::new(
         config,
         scheduler,
         tokenizer,
         sampler,
-        kv_manager,
         ferrum_execution::executor_lifecycle::ExecutorOwner::new(Box::new(executor)),
-        tensor_factory,
     )
     .expect("legacy engine composition must match executor authority");
 
@@ -228,7 +221,6 @@ fn make_tight_engine() -> (Arc<ContinuousBatchEngine>, Arc<PagedKvCacheManager>)
     let scheduler = Arc::new(ContinuousBatchScheduler::new(SchedulerConfig::default()));
     let tokenizer = Arc::new(MockTokenizer::new(VOCAB_SIZE));
     let sampler = Arc::new(MockSampler);
-    let tensor_factory = Arc::new(MockTensorFactory);
 
     let engine = Arc::new(
         ContinuousBatchEngine::new(
@@ -236,9 +228,7 @@ fn make_tight_engine() -> (Arc<ContinuousBatchEngine>, Arc<PagedKvCacheManager>)
             scheduler,
             tokenizer,
             sampler,
-            kv_manager.clone(),
             ferrum_execution::executor_lifecycle::ExecutorOwner::new(Box::new(executor)),
-            tensor_factory,
         )
         .expect("legacy engine composition must match executor authority"),
     );

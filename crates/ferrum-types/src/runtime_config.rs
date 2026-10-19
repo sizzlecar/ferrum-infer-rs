@@ -27,6 +27,9 @@ impl RuntimeConfigSnapshot {
                 "FERRUM_SPEC_DRAFT" | "FERRUM_SPEC_N" => Some(
                     "speculative decoding has been retired; remove this option",
                 ),
+                "FERRUM_RECURRENT_STATE_MAX_SLOTS" => Some(
+                    "the legacy recurrent-state slot control has been retired; remove this option; it does not configure a model-owned state pool",
+                ),
                 "FERRUM_METAL_CAPTURE" => Some(
                     "process-global Metal frame capture has been retired; use an explicit standalone GPU capture diagnostic",
                 ),

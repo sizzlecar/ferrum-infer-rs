@@ -16,8 +16,10 @@ use ferrum_execution::{
     },
     ModelExecutor,
 };
-use ferrum_interfaces::{adapter::AdapterExecutionSupport, RecurrentStateSpec};
-use ferrum_types::{DataType, FerrumError, ModelInfo, RequestId, Result, TokenId};
+use ferrum_interfaces::adapter::AdapterExecutionSupport;
+#[cfg(test)]
+use ferrum_types::TokenId;
+use ferrum_types::{DataType, FerrumError, ModelInfo, RequestId, Result};
 
 use crate::common::{DecoderOnlyLLM, LlmRuntimeConfig, ModelTokenExecutionMode};
 use crate::lora::ActiveLoraAdapter;
@@ -272,20 +274,6 @@ impl ModelExecutor for LlmExecutor {
 
     fn kv_slot_capacity_snapshot(&self) -> Option<KvSlotCapacitySnapshot> {
         self.lock_model().ok()?.kv_slot_capacity_snapshot()
-    }
-
-    fn recurrent_state_spec(
-        &self,
-        request_id: &RequestId,
-        input_tokens: &[TokenId],
-    ) -> Result<Option<RecurrentStateSpec>> {
-        let mut spec = self
-            .lock_model()?
-            .recurrent_state_spec(request_id, input_tokens)?;
-        if let Some(spec) = spec.as_mut() {
-            spec.device = self.info.device.clone();
-        }
-        Ok(spec)
     }
 
     fn capabilities(&self) -> ExecutorCapabilities {

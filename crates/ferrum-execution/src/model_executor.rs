@@ -4,7 +4,6 @@
 //! use one admission, execution and close protocol without tensor/cache adapters.
 
 use async_trait::async_trait;
-use ferrum_interfaces::RecurrentStateSpec;
 pub use ferrum_runtime::{ExecutorRequestOrigin, PlanRuntimeResourceSnapshot};
 use ferrum_types::{ExecutorAdmissionLimits, FerrumError, ModelInfo, RequestId, Result, TokenId};
 use serde::{Deserialize, Serialize};
@@ -2099,8 +2098,9 @@ pub trait ModelExecutor: Send + Sync + 'static {
     }
 
     /// Immutable admission limits compiled into this executor's runtime plan.
-    /// A PlanRuntime executor must return `Some`; legacy executors may defer to
-    /// the engine-owned scheduler and recurrent-state limits.
+    /// A PlanRuntime executor must return `Some`. Other executors may leave
+    /// this unreported; the engine then reports its scheduler service limits,
+    /// without claiming an independent physical or recurrent-state capacity.
     fn admission_limits(&self) -> Result<Option<ExecutorAdmissionLimits>> {
         Ok(None)
     }
@@ -2127,6 +2127,46 @@ pub trait ModelExecutor: Send + Sync + 'static {
     /// return `Some` while they are ready.
     fn plan_runtime_resource_snapshot(&self) -> Result<Option<PlanRuntimeResourceSnapshot>> {
         Ok(None)
+    }
+
+    /// Read-only memory accounting from the original execution owner.
+    ///
+    /// The default projects the original plan-runtime accounting domain. An
+    /// executor without that evidence reports Unknown, not fabricated zeros or
+    /// a separate cache manager. This observation grants no allocation/release
+    /// authority and does not imply that a completed close released all memory.
+    ///
+    /// Return Unknown for optional/unsupported metrics or a failed optional
+    /// measurement. Err is reserved for a violation of the original owner's
+    /// required resource-accounting contract; Engine readiness reflects it.
+    fn memory_observation(&self) -> Result<ferrum_types::MemoryObservation> {
+        let Some(snapshot) = self.plan_runtime_resource_snapshot()? else {
+            if self.execution_resource_authority() == ExecutionResourceAuthority::PlanRuntime {
+                return Err(FerrumError::internal(
+                    "PlanRuntime executor did not expose its required resource snapshot",
+                ));
+            }
+            return Ok(ferrum_types::MemoryObservation::Unknown);
+        };
+        snapshot.validate()?;
+        let bytes = |value: u64| {
+            usize::try_from(value)
+                .map_err(|_| FerrumError::internal("owner memory observation exceeds usize"))
+        };
+        let total_bytes = bytes(snapshot.usable_capacity_bytes())?;
+        let used_bytes = bytes(snapshot.used_bytes()?)?;
+        let mut usage = ferrum_types::MemoryUsage {
+            total_bytes,
+            used_bytes,
+            free_bytes: total_bytes.saturating_sub(used_bytes),
+            gpu_memory_bytes: self.info().device.is_gpu().then_some(used_bytes),
+            cpu_memory_bytes: matches!(self.info().device, ferrum_types::Device::CPU)
+                .then_some(used_bytes),
+            cache_memory_bytes: bytes(snapshot.dynamic_used_bytes())?,
+            utilization_percent: 0.0,
+        };
+        usage.calculate_utilization();
+        Ok(ferrum_types::MemoryObservation::Known(usage))
     }
 
     /// Per-request KV capacity in tokens when the executor owns a smaller
@@ -2306,20 +2346,6 @@ pub trait ModelExecutor: Send + Sync + 'static {
     /// Executors without model-owned paged KV return `None`.
     fn kv_slot_capacity_snapshot(&self) -> Option<KvSlotCapacitySnapshot> {
         None
-    }
-
-    /// Recurrent-state allocation spec for this request, when the model has
-    /// state-space or hybrid layers that need per-request recurrent state.
-    ///
-    /// Attention-only models return `None`. This describes storage, not an
-    /// allocation authority; the admitted sequence owner prepares and retains
-    /// recurrent state through the same token lifecycle as its KV state.
-    fn recurrent_state_spec(
-        &self,
-        _request_id: &RequestId,
-        _input_tokens: &[TokenId],
-    ) -> Result<Option<RecurrentStateSpec>> {
-        Ok(None)
     }
 
     /// Get executor capabilities

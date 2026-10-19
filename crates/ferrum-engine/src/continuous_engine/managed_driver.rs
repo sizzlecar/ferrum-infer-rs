@@ -196,7 +196,7 @@ impl DriverObserver {
 pub(super) struct ManagedDriver {
     pub(super) active: Mutex<Option<Arc<EngineInner>>>,
     pub(super) final_owner: Mutex<Option<ExecutorOwner>>,
-    pub(super) final_memory: Mutex<Option<ferrum_types::MemoryUsage>>,
+    pub(super) final_memory: Mutex<Option<ferrum_types::MemoryObservation>>,
     pub(super) final_performance: Mutex<ferrum_types::PerformanceBreakdown>,
     pub(super) final_prefix_hits: AtomicU64,
     state: Mutex<DriverState>,

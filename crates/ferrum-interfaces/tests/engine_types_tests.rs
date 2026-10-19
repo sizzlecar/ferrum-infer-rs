@@ -9,7 +9,7 @@ fn engine_status_serde_roundtrip() {
         loaded_models: vec![ModelId::from("m")],
         active_requests: 1,
         queued_requests: 0,
-        memory_usage: MemoryUsage {
+        memory_usage: ferrum_types::MemoryObservation::Known(MemoryUsage {
             total_bytes: 1_000,
             used_bytes: 100,
             free_bytes: 900,
@@ -17,7 +17,7 @@ fn engine_status_serde_roundtrip() {
             cpu_memory_bytes: Some(100),
             cache_memory_bytes: 0,
             utilization_percent: 10.0,
-        },
+        }),
         uptime_seconds: 5,
         last_heartbeat: chrono::Utc::now(),
         version: "0.1".into(),

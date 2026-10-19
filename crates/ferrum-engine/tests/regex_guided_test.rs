@@ -17,9 +17,7 @@ use async_trait::async_trait;
 use ferrum_engine::{ContinuousBatchEngine, LlmInferenceEngine};
 use ferrum_interfaces::tokenizer::{ChatMessage, Tokenizer, TokenizerInfo, TokenizerType};
 use ferrum_scheduler::implementations::ContinuousBatchScheduler;
-use ferrum_testkit::{
-    ConfigurableModelExecutor, MockKvCacheManager, MockSampler, MockTensorFactory,
-};
+use ferrum_testkit::{ConfigurableModelExecutor, MockSampler};
 use ferrum_types::{
     InferenceRequest, ResponseFormat, Result, SchedulerConfig, SpecialTokens, TokenId,
 };
@@ -138,8 +136,7 @@ fn make_engine() -> ContinuousBatchEngine {
     let scheduler = Arc::new(ContinuousBatchScheduler::new(SchedulerConfig::default()));
     let tokenizer = Arc::new(ByteTokenizer::new());
     let sampler = Arc::new(MockSampler);
-    let kv_cache = Arc::new(MockKvCacheManager::new(1024));
-    let tensor_factory = Arc::new(MockTensorFactory);
+
     // Bias '*' (42) heavily; emit STOP_TOKEN ('z' = 122) after 3 decode
     // steps. With the regex mask `[0-9]+`, '*' gets -INF and the greedy
     // sampler falls through to the smallest unmasked token = '0' (48).
@@ -150,9 +147,7 @@ fn make_engine() -> ContinuousBatchEngine {
         scheduler,
         tokenizer,
         sampler,
-        kv_cache,
         ferrum_execution::executor_lifecycle::ExecutorOwner::new(Box::new(executor)),
-        tensor_factory,
     )
     .expect("legacy engine composition must match executor authority")
 }

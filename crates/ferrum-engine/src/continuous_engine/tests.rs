@@ -16,12 +16,10 @@ use ferrum_execution::{
     },
     ModelExecutor,
 };
-use ferrum_interfaces::kv_cache::AllocationRequest;
 use ferrum_interfaces::tokenizer::{TokenizerInfo, TokenizerType};
-use ferrum_interfaces::{KvCacheManager, TensorRef};
 use ferrum_models::DecoderOnlyLLM;
-use ferrum_testkit::{MockKvCacheManager, MockModelExecutor, MockTensorFactory};
-use ferrum_types::{DataType, Priority};
+use ferrum_testkit::MockModelExecutor;
+use ferrum_types::Priority;
 use std::time::Duration;
 
 #[path = "controlled_token_fixture.rs"]
@@ -164,6 +162,7 @@ struct PlanRuntimeAdmissionTestExecutor {
     tokens: Arc<ControlledTokenState>,
     inner: MockModelExecutor,
     maintenance_gated: bool,
+    missing_resource_snapshot: bool,
     observation: Arc<PlanRuntimeAdmissionObservation>,
 }
 
@@ -802,6 +801,7 @@ impl PlanRuntimeAdmissionTestExecutor {
             tokens: Arc::clone(&tokens),
             inner: MockModelExecutor::instant(vocab_size),
             maintenance_gated: false,
+            missing_resource_snapshot: false,
             observation: Arc::new(PlanRuntimeAdmissionObservation {
                 tokens: ControlledTokenObservation(Arc::downgrade(&tokens)),
                 event_sink: std::sync::Mutex::new(None),
@@ -921,6 +921,9 @@ impl ModelExecutor for PlanRuntimeAdmissionTestExecutor {
     }
 
     fn plan_runtime_resource_snapshot(&self) -> Result<Option<PlanRuntimeResourceSnapshot>> {
+        if self.missing_resource_snapshot {
+            return Ok(None);
+        }
         PlanRuntimeResourceSnapshot::new(1_000, 900, 700, 700, 400, 300, 200, 0, 0).map(Some)
     }
 
@@ -2091,80 +2094,6 @@ fn assert_engine_resource_trace_balanced(path: &Path) -> Vec<ResourceTraceEvent>
     resources
 }
 
-struct FailingFromSliceTensorFactory;
-
-impl TensorFactory for FailingFromSliceTensorFactory {
-    fn empty(&self, shape: &[usize], dtype: DataType, device: Device) -> Result<TensorRef> {
-        MockTensorFactory.empty(shape, dtype, device)
-    }
-
-    fn zeros_like(&self, tensor: &TensorRef) -> Result<TensorRef> {
-        MockTensorFactory.zeros_like(tensor)
-    }
-
-    fn from_slice(
-        &self,
-        _data: &[f32],
-        _shape: &[usize],
-        _dtype: DataType,
-        _device: Device,
-    ) -> Result<TensorRef> {
-        Err(FerrumError::backend("synthetic tokens_to_tensor failure"))
-    }
-
-    fn to_device(&self, tensor: &TensorRef, device: Device) -> Result<TensorRef> {
-        MockTensorFactory.to_device(tensor, device)
-    }
-
-    fn narrow(
-        &self,
-        tensor: &TensorRef,
-        dim: usize,
-        start: usize,
-        length: usize,
-    ) -> Result<TensorRef> {
-        MockTensorFactory.narrow(tensor, dim, start, length)
-    }
-
-    fn reshape(&self, tensor: &TensorRef, shape: &[usize]) -> Result<TensorRef> {
-        MockTensorFactory.reshape(tensor, shape)
-    }
-
-    fn zeros(&self, shape: &[usize], dtype: DataType, device: &Device) -> Result<TensorRef> {
-        MockTensorFactory.zeros(shape, dtype, device)
-    }
-
-    fn ones(&self, shape: &[usize], dtype: DataType, device: &Device) -> Result<TensorRef> {
-        MockTensorFactory.ones(shape, dtype, device)
-    }
-
-    fn uniform(
-        &self,
-        shape: &[usize],
-        low: f32,
-        high: f32,
-        dtype: DataType,
-        device: &Device,
-    ) -> Result<TensorRef> {
-        MockTensorFactory.uniform(shape, low, high, dtype, device)
-    }
-
-    fn normal(
-        &self,
-        shape: &[usize],
-        mean: f32,
-        std: f32,
-        dtype: DataType,
-        device: &Device,
-    ) -> Result<TensorRef> {
-        MockTensorFactory.normal(shape, mean, std, dtype, device)
-    }
-
-    fn from_tensor(&self, tensor: &TensorRef, device: &Device) -> Result<TensorRef> {
-        MockTensorFactory.from_tensor(tensor, device)
-    }
-}
-
 #[test]
 fn continuous_engine_runtime_config_parses_env_snapshot() {
     let cfg = ContinuousEngineRuntimeConfig::from_env_vars(
@@ -2230,21 +2159,11 @@ fn performance_breakdown_reports_engine_timing_counters() {
     let tokenizer: Arc<dyn Tokenizer + Send + Sync> =
         Arc::new(ferrum_testkit::MockTokenizer::new(128));
     let sampler: Arc<dyn Sampler + Send + Sync> = Arc::new(ferrum_testkit::MockSampler);
-    let kv_cache: Arc<dyn KvCacheManager + Send + Sync> =
-        Arc::new(ferrum_testkit::MockKvCacheManager::new(256));
-    let tensor_factory: Arc<dyn TensorFactory> = Arc::new(ferrum_testkit::MockTensorFactory);
+
     let model_executor =
         ExecutorOwner::new(Box::new(ferrum_testkit::MockModelExecutor::instant(128)));
-    let engine = ContinuousBatchEngine::new(
-        config,
-        scheduler,
-        tokenizer,
-        sampler,
-        kv_cache,
-        model_executor,
-        tensor_factory,
-    )
-    .expect("legacy engine composition must match executor authority");
+    let engine = ContinuousBatchEngine::new(config, scheduler, tokenizer, sampler, model_executor)
+        .expect("legacy engine composition must match executor authority");
 
     engine
         .active_inner()
@@ -2283,13 +2202,12 @@ fn test_continuous_engine() -> ContinuousBatchEngine {
 
 fn test_continuous_engine_with_config(config: EngineConfig) -> ContinuousBatchEngine {
     let scheduler = Arc::new(ContinuousBatchScheduler::new(config.scheduler.clone()));
-    ContinuousBatchEngine::new_plan_runtime(
+    ContinuousBatchEngine::new(
         config,
         scheduler,
         Arc::new(ferrum_testkit::MockTokenizer::new(128)),
         Arc::new(ferrum_testkit::MockSampler),
         ExecutorOwner::new(Box::new(PlanRuntimeAdmissionTestExecutor::new(128))),
-        Arc::new(MockTensorFactory),
     )
     .unwrap()
 }
@@ -2522,60 +2440,43 @@ async fn process_batch_rejects_a_scheduler_item_without_published_sequence_state
     );
 }
 
-#[test]
-fn resource_composition_mismatch_is_a_configuration_error() {
-    let config = EngineConfig::default();
-    let scheduler = Arc::new(ContinuousBatchScheduler::new(config.scheduler.clone()));
-    let tokenizer: Arc<dyn Tokenizer + Send + Sync> =
-        Arc::new(ferrum_testkit::MockTokenizer::new(128));
-    let sampler: Arc<dyn Sampler + Send + Sync> = Arc::new(ferrum_testkit::MockSampler);
-    let tensor_factory: Arc<dyn TensorFactory> = Arc::new(MockTensorFactory);
-
-    let legacy_executor = ExecutorOwner::new(Box::new(MockModelExecutor::instant(128)));
-    let plan_runtime_error = ContinuousBatchEngine::new_plan_runtime(
-        config.clone(),
-        Arc::clone(&scheduler),
-        Arc::clone(&tokenizer),
-        Arc::clone(&sampler),
-        legacy_executor,
-        Arc::clone(&tensor_factory),
+#[tokio::test]
+async fn owner_memory_unknown_preserves_engine_readiness_and_shutdown() {
+    let engine = ContinuousBatchEngine::new(
+        EngineConfig::default(),
+        Arc::new(ContinuousBatchScheduler::new(Default::default())),
+        Arc::new(ferrum_testkit::MockTokenizer::new(128)),
+        Arc::new(ferrum_testkit::MockSampler),
+        ExecutorOwner::new(Box::new(MockModelExecutor::instant(128))),
     )
-    .err()
-    .expect("legacy executor must not enter a plan-runtime composition");
-    assert!(plan_runtime_error
-        .to_string()
-        .contains("does not match executor authority"));
-
-    let kv_cache: Arc<dyn KvCacheManager + Send + Sync> = Arc::new(MockKvCacheManager::new(128));
-    let plan_runtime_executor =
-        ExecutorOwner::new(Box::new(PlanRuntimeAdmissionTestExecutor::new(128)));
-    let legacy_error = ContinuousBatchEngine::new(
-        config,
-        scheduler,
-        tokenizer,
-        sampler,
-        kv_cache,
-        plan_runtime_executor,
-        tensor_factory,
-    )
-    .err()
-    .expect("plan-runtime executor must not enter a legacy composition");
-    assert!(legacy_error
-        .to_string()
-        .contains("does not match executor authority"));
+    .unwrap();
+    let observer = engine.start_loop().unwrap();
+    let status = engine.status().await;
+    assert!(status.is_ready);
+    assert!(matches!(
+        status.memory_usage,
+        ferrum_types::MemoryObservation::Unknown
+    ));
+    engine.shutdown().await.unwrap();
+    engine.wait_for_shutdown_completion().await.unwrap();
+    observer.wait().await.result().unwrap();
+    let status = engine.status().await;
+    assert!(!status.is_ready);
+    assert!(matches!(
+        status.memory_usage,
+        ferrum_types::MemoryObservation::Unknown
+    ));
 }
 
 #[test]
-fn public_engine_authority_reports_validated_resource_composition() {
+fn public_engine_authority_reports_the_original_executor_capability() {
     let config = EngineConfig::default();
     let legacy = ContinuousBatchEngine::new(
         config.clone(),
         Arc::new(ContinuousBatchScheduler::new(config.scheduler)),
         Arc::new(ferrum_testkit::MockTokenizer::new(128)),
         Arc::new(ferrum_testkit::MockSampler),
-        Arc::new(MockKvCacheManager::new(256)),
         ExecutorOwner::new(Box::new(MockModelExecutor::instant(128))),
-        Arc::new(MockTensorFactory),
     )
     .unwrap();
     let (native, _, _, _) =
@@ -2615,7 +2516,7 @@ fn plan_runtime_batch_decode_profile_test_engine(
         ExecutorExecutionCapacityStage::StepAdmission,
         None,
     );
-    plan_runtime_test_engine(config, executor, Arc::new(MockTensorFactory))
+    plan_runtime_test_engine(config, executor)
 }
 
 fn plan_runtime_batch_decode_test_engine_with_trace(
@@ -2627,36 +2528,18 @@ fn plan_runtime_batch_decode_test_engine_with_trace(
     Arc<PlanRuntimeBatchDecodeObservation>,
     Arc<dyn Tokenizer + Send + Sync>,
 ) {
-    plan_runtime_batch_decode_test_engine_with_trace_and_factory(
+    plan_runtime_batch_decode_test_engine_with_trace_and_stage(
         behavior,
         trace_path,
-        Arc::new(MockTensorFactory),
-    )
-}
-
-fn plan_runtime_batch_decode_test_engine_with_trace_and_factory(
-    behavior: PlanRuntimeBatchDecodeBehavior,
-    trace_path: Option<PathBuf>,
-    tensor_factory: Arc<dyn TensorFactory>,
-) -> (
-    ContinuousBatchEngine,
-    Arc<ContinuousBatchScheduler>,
-    Arc<PlanRuntimeBatchDecodeObservation>,
-    Arc<dyn Tokenizer + Send + Sync>,
-) {
-    plan_runtime_batch_decode_test_engine_with_trace_factory_and_stage(
-        behavior,
-        trace_path,
-        tensor_factory,
         ExecutorExecutionCapacityStage::StepAdmission,
         None,
     )
 }
 
-fn plan_runtime_batch_decode_test_engine_with_trace_factory_and_stage(
+fn plan_runtime_batch_decode_test_engine_with_trace_and_stage(
     behavior: PlanRuntimeBatchDecodeBehavior,
     trace_path: Option<PathBuf>,
-    tensor_factory: Arc<dyn TensorFactory>,
+
     capacity_stage: ExecutorExecutionCapacityStage,
     capacity_stage_after_first_call: Option<ExecutorExecutionCapacityStage>,
 ) -> (
@@ -2670,11 +2553,7 @@ fn plan_runtime_batch_decode_test_engine_with_trace_factory_and_stage(
         capacity_stage,
         capacity_stage_after_first_call,
     );
-    plan_runtime_test_engine(
-        plan_runtime_test_config(trace_path),
-        executor,
-        tensor_factory,
-    )
+    plan_runtime_test_engine(plan_runtime_test_config(trace_path), executor)
 }
 
 fn plan_runtime_test_config(trace_path: Option<PathBuf>) -> EngineConfig {
@@ -2688,20 +2567,19 @@ fn plan_runtime_test_config(trace_path: Option<PathBuf>) -> EngineConfig {
 fn plan_runtime_test_engine<E: ObservedTestExecutor>(
     config: EngineConfig,
     executor: E,
-    tensor_factory: Arc<dyn TensorFactory>,
 ) -> (
     ContinuousBatchEngine,
     Arc<ContinuousBatchScheduler>,
     Arc<E::Observation>,
     Arc<dyn Tokenizer + Send + Sync>,
 ) {
-    plan_runtime_test_engine_observed(config, executor, tensor_factory, None)
+    plan_runtime_test_engine_observed(config, executor, None)
 }
 
 fn plan_runtime_test_engine_observed<E: ObservedTestExecutor>(
     config: EngineConfig,
     executor: E,
-    tensor_factory: Arc<dyn TensorFactory>,
+
     observer: Option<Arc<dyn ExecutionAttemptObserver>>,
 ) -> (
     ContinuousBatchEngine,
@@ -2715,13 +2593,12 @@ fn plan_runtime_test_engine_observed<E: ObservedTestExecutor>(
     let tokenizer: Arc<dyn Tokenizer + Send + Sync> =
         Arc::new(PolicyTokenizer::new(64, &[("test", 5), ("ok", 6)]));
     let sampler: Arc<dyn Sampler + Send + Sync> = Arc::new(crate::registry::GreedySampler);
-    let engine = ContinuousBatchEngine::new_plan_runtime_observed(
+    let engine = ContinuousBatchEngine::new_observed(
         config,
         scheduler.clone(),
         tokenizer.clone(),
         sampler,
         executor_owner,
-        tensor_factory,
         None,
         observer,
         None,
@@ -3177,14 +3054,11 @@ async fn plan_runtime_profile_records_only_explicit_decode_host_stages() {
 }
 
 #[tokio::test]
-async fn plan_runtime_batch_decode_does_not_materialize_host_token_tensors() {
-    let tensor_factory: Arc<dyn TensorFactory> = Arc::new(FailingFromSliceTensorFactory);
-    let (engine, scheduler, executor, tokenizer) =
-        plan_runtime_batch_decode_test_engine_with_trace_and_factory(
-            PlanRuntimeBatchDecodeBehavior::Exact,
-            None,
-            tensor_factory,
-        );
+async fn plan_runtime_batch_decode_commits_original_executor_cohort() {
+    let (engine, scheduler, executor, tokenizer) = plan_runtime_batch_decode_test_engine_with_trace(
+        PlanRuntimeBatchDecodeBehavior::Exact,
+        None,
+    );
     let (request_ids, _, _) =
         install_plan_runtime_decode_cohort(&engine, &scheduler, tokenizer).await;
 
@@ -3197,7 +3071,7 @@ async fn plan_runtime_batch_decode_does_not_materialize_host_token_tensors() {
         .expect("engine execution is open")
         .process_batch(&batch)
         .await
-        .expect("common decode must not call TensorFactory::from_slice");
+        .expect("common token decode completes through the original executor");
 
     assert_eq!(executor.batch_decode_calls.load(Ordering::Relaxed), 1);
     assert_eq!(executor.decode_calls.load(Ordering::Relaxed), 0);
@@ -3221,31 +3095,57 @@ async fn plan_runtime_batch_decode_does_not_materialize_host_token_tensors() {
 }
 
 #[tokio::test]
+async fn owner_memory_missing_required_plan_snapshot_is_a_contract_error() {
+    let mut executor = PlanRuntimeAdmissionTestExecutor::new(128);
+    executor.missing_resource_snapshot = true;
+    let error = executor.memory_observation().unwrap_err();
+    assert!(error.to_string().contains("required resource snapshot"));
+    let engine = ContinuousBatchEngine::new(
+        EngineConfig::default(),
+        Arc::new(ContinuousBatchScheduler::new(Default::default())),
+        Arc::new(ferrum_testkit::MockTokenizer::new(128)),
+        Arc::new(ferrum_testkit::MockSampler),
+        ExecutorOwner::new(Box::new(executor)),
+    )
+    .unwrap();
+    let observer = engine.start_loop().unwrap();
+    let status = engine.status().await;
+    assert!(!status.is_ready);
+    assert!(matches!(
+        status.memory_usage,
+        ferrum_types::MemoryObservation::Unknown
+    ));
+    engine.shutdown().await.unwrap();
+    engine.wait_for_shutdown_completion().await.unwrap();
+    observer.wait().await.result().unwrap();
+}
+
+#[tokio::test]
 async fn plan_runtime_status_separates_static_and_dynamic_memory() {
-    let config = EngineConfig::default();
+    let mut config = EngineConfig::default();
+    // A configured device cannot relabel the actual owner's CPU accounting.
+    config.backend.device = Device::CUDA(0);
     let scheduler = Arc::new(ContinuousBatchScheduler::new(config.scheduler.clone()));
     let tokenizer: Arc<dyn Tokenizer + Send + Sync> =
         Arc::new(ferrum_testkit::MockTokenizer::new(128));
     let sampler: Arc<dyn Sampler + Send + Sync> = Arc::new(ferrum_testkit::MockSampler);
     let executor = ExecutorOwner::new(Box::new(PlanRuntimeAdmissionTestExecutor::new(128)));
-    let tensor_factory: Arc<dyn TensorFactory> = Arc::new(MockTensorFactory);
-    let engine = ContinuousBatchEngine::new_plan_runtime(
-        config,
-        scheduler,
-        tokenizer,
-        sampler,
-        executor,
-        tensor_factory,
-    )
-    .unwrap();
+
+    let engine =
+        ContinuousBatchEngine::new(config, scheduler, tokenizer, sampler, executor).unwrap();
 
     let status = engine.status().await;
 
-    assert_eq!(status.memory_usage.total_bytes, 900);
-    assert_eq!(status.memory_usage.used_bytes, 500);
-    assert_eq!(status.memory_usage.free_bytes, 400);
-    assert_eq!(status.memory_usage.cache_memory_bytes, 100);
-    assert!((status.memory_usage.utilization_percent - 55.555557).abs() < 0.001);
+    assert_eq!(status.memory_usage.known().unwrap().total_bytes, 900);
+    assert_eq!(status.memory_usage.known().unwrap().used_bytes, 500);
+    assert_eq!(status.memory_usage.known().unwrap().free_bytes, 400);
+    assert_eq!(status.memory_usage.known().unwrap().cache_memory_bytes, 100);
+    assert_eq!(
+        status.memory_usage.known().unwrap().cpu_memory_bytes,
+        Some(500)
+    );
+    assert_eq!(status.memory_usage.known().unwrap().gpu_memory_bytes, None);
+    assert!((status.memory_usage.known().unwrap().utilization_percent - 55.555557).abs() < 0.001);
 }
 
 #[tokio::test]
@@ -3260,14 +3160,13 @@ async fn plan_runtime_product_path_requires_typed_admission_before_prefill() {
     let observation = executor.observer();
     let executor_owner = ExecutorOwner::new(Box::new(executor));
     let executor = observation;
-    let tensor_factory: Arc<dyn TensorFactory> = Arc::new(FailingFromSliceTensorFactory);
-    let engine = ContinuousBatchEngine::new_plan_runtime(
+
+    let engine = ContinuousBatchEngine::new(
         config,
         Arc::clone(&scheduler),
         tokenizer,
         sampler,
         executor_owner,
-        tensor_factory,
     )
     .unwrap();
     let mut request = policy_request();
@@ -3315,16 +3214,9 @@ async fn plan_runtime_prefill_resource_failure_preserves_terminal_error_and_rele
     let observation = executor.observer();
     let executor_owner = ExecutorOwner::new(Box::new(executor));
     let executor = observation;
-    let tensor_factory: Arc<dyn TensorFactory> = Arc::new(FailingFromSliceTensorFactory);
-    let engine = ContinuousBatchEngine::new_plan_runtime(
-        config,
-        scheduler,
-        tokenizer,
-        sampler,
-        executor_owner,
-        tensor_factory,
-    )
-    .unwrap();
+
+    let engine =
+        ContinuousBatchEngine::new(config, scheduler, tokenizer, sampler, executor_owner).unwrap();
     let mut request = policy_request();
     request.sampling_params.max_tokens = 1;
     let request_id = request.id.clone();
@@ -3367,16 +3259,9 @@ async fn plan_runtime_recompute_admission_preserves_product_usage_accounting() {
     let observation = executor.observer();
     let executor_owner = ExecutorOwner::new(Box::new(executor));
     let executor = observation;
-    let tensor_factory: Arc<dyn TensorFactory> = Arc::new(MockTensorFactory);
-    let engine = ContinuousBatchEngine::new_plan_runtime(
-        config,
-        scheduler,
-        tokenizer,
-        sampler,
-        executor_owner,
-        tensor_factory,
-    )
-    .unwrap();
+
+    let engine =
+        ContinuousBatchEngine::new(config, scheduler, tokenizer, sampler, executor_owner).unwrap();
     let mut request = policy_request();
     request.sampling_params.max_tokens = 8;
     let request_id = request.id.clone();
@@ -3437,14 +3322,13 @@ async fn plan_runtime_prefill_cohort_uses_one_capacity_aware_batch() {
     let observation = executor.observer();
     let executor_owner = ExecutorOwner::new(Box::new(executor));
     let executor = observation;
-    let tensor_factory: Arc<dyn TensorFactory> = Arc::new(FailingFromSliceTensorFactory);
-    let engine = ContinuousBatchEngine::new_plan_runtime(
+
+    let engine = ContinuousBatchEngine::new(
         config,
         Arc::clone(&scheduler),
         Arc::clone(&tokenizer),
         sampler,
         executor_owner,
-        tensor_factory,
     )
     .unwrap();
 
@@ -3551,14 +3435,13 @@ async fn plan_runtime_batch_prefill_deferral_falls_back_without_failing_requests
     let observation = executor.observer();
     let executor_owner = ExecutorOwner::new(Box::new(executor));
     let executor = observation;
-    let tensor_factory: Arc<dyn TensorFactory> = Arc::new(FailingFromSliceTensorFactory);
-    let engine = ContinuousBatchEngine::new_plan_runtime(
+
+    let engine = ContinuousBatchEngine::new(
         config,
         Arc::clone(&scheduler),
         Arc::clone(&tokenizer),
         sampler,
         executor_owner,
-        tensor_factory,
     )
     .unwrap();
 
@@ -3658,14 +3541,13 @@ async fn plan_runtime_serial_backing_growth_converges_before_batch_submission() 
     let observation = executor.observer();
     let executor_owner = ExecutorOwner::new(Box::new(executor));
     let executor = observation;
-    let tensor_factory: Arc<dyn TensorFactory> = Arc::new(MockTensorFactory);
-    let engine = ContinuousBatchEngine::new_plan_runtime(
+
+    let engine = ContinuousBatchEngine::new(
         config,
         Arc::clone(&scheduler),
         Arc::clone(&tokenizer),
         sampler,
         executor_owner,
-        tensor_factory,
     )
     .unwrap();
 
@@ -3726,14 +3608,13 @@ async fn request_publication_lock_is_released_during_device_execution() {
     let observation = executor.observer();
     let executor_owner = ExecutorOwner::new(Box::new(executor));
     let executor = observation;
-    let tensor_factory: Arc<dyn TensorFactory> = Arc::new(MockTensorFactory);
-    let engine = ContinuousBatchEngine::new_plan_runtime(
+
+    let engine = ContinuousBatchEngine::new(
         config,
         Arc::clone(&scheduler),
         Arc::clone(&tokenizer),
         sampler,
         executor_owner,
-        tensor_factory,
     )
     .unwrap();
 
@@ -3795,15 +3676,14 @@ async fn plan_runtime_chunked_prefill_retries_exact_chunk_and_samples_only_final
     let observation = executor.observer();
     let executor_owner = ExecutorOwner::new(Box::new(executor));
     let executor = observation;
-    let tensor_factory: Arc<dyn TensorFactory> = Arc::new(MockTensorFactory);
+
     let engine = Arc::new(
-        ContinuousBatchEngine::new_plan_runtime(
+        ContinuousBatchEngine::new(
             config,
             Arc::clone(&scheduler),
             tokenizer,
             sampler,
             executor_owner,
-            tensor_factory,
         )
         .unwrap(),
     );
@@ -3904,14 +3784,13 @@ async fn plan_runtime_partial_prefill_completion_commits_only_the_executor_prefi
     let observation = executor.observer();
     let executor_owner = ExecutorOwner::new(Box::new(executor));
     let executor = observation;
-    let tensor_factory: Arc<dyn TensorFactory> = Arc::new(MockTensorFactory);
-    let engine = ContinuousBatchEngine::new_plan_runtime(
+
+    let engine = ContinuousBatchEngine::new(
         config,
         Arc::clone(&scheduler),
         tokenizer,
         sampler,
         executor_owner,
-        tensor_factory,
     )
     .unwrap();
     let mut request = policy_request();
@@ -3966,14 +3845,13 @@ async fn plan_runtime_one_token_prefill_without_external_releaser_fails_closed()
     let observation = executor.observer();
     let executor_owner = ExecutorOwner::new(Box::new(executor));
     let executor = observation;
-    let tensor_factory: Arc<dyn TensorFactory> = Arc::new(MockTensorFactory);
-    let engine = ContinuousBatchEngine::new_plan_runtime(
+
+    let engine = ContinuousBatchEngine::new(
         config,
         Arc::clone(&scheduler),
         tokenizer,
         sampler,
         executor_owner,
-        tensor_factory,
     )
     .unwrap();
     let mut request = policy_request();
@@ -4055,14 +3933,13 @@ async fn plan_runtime_backing_maintenance_advances_epoch_before_prefill() {
     let observation = executor.observer();
     let executor_owner = ExecutorOwner::new(Box::new(executor));
     let executor = observation;
-    let tensor_factory: Arc<dyn TensorFactory> = Arc::new(MockTensorFactory);
-    let engine = ContinuousBatchEngine::new_plan_runtime(
+
+    let engine = ContinuousBatchEngine::new(
         config,
         Arc::clone(&scheduler),
         tokenizer,
         sampler,
         executor_owner,
-        tensor_factory,
     )
     .unwrap();
     let mut request = policy_request();
@@ -4179,15 +4056,14 @@ fn plan_runtime_wait_for_release_engine() -> (
     let observation = executor.observer();
     let executor_owner = ExecutorOwner::new(Box::new(executor));
     let executor = observation;
-    let tensor_factory: Arc<dyn TensorFactory> = Arc::new(MockTensorFactory);
+
     let engine = Arc::new(
-        ContinuousBatchEngine::new_plan_runtime(
+        ContinuousBatchEngine::new(
             config,
             Arc::clone(&scheduler),
             tokenizer,
             sampler,
             executor_owner,
-            tensor_factory,
         )
         .unwrap(),
     );
@@ -4350,17 +4226,9 @@ async fn plan_runtime_capacity_wait_accepts_new_work_and_shutdown_without_reprob
     let observation = executor.observer();
     let executor_owner = ExecutorOwner::new(Box::new(executor));
     let executor = observation;
-    let tensor_factory: Arc<dyn TensorFactory> = Arc::new(MockTensorFactory);
+
     let engine = Arc::new(
-        ContinuousBatchEngine::new_plan_runtime(
-            config,
-            scheduler,
-            tokenizer,
-            sampler,
-            executor_owner,
-            tensor_factory,
-        )
-        .unwrap(),
+        ContinuousBatchEngine::new(config, scheduler, tokenizer, sampler, executor_owner).unwrap(),
     );
     let original_inner = Arc::downgrade(&engine.active_inner().expect("engine execution is open"));
     let background = engine.start_loop().unwrap();
@@ -4454,14 +4322,13 @@ async fn plan_runtime_retry_admission_does_not_require_a_published_epoch() {
     let observation = executor.observer();
     let executor_owner = ExecutorOwner::new(Box::new(executor));
     let executor = observation;
-    let tensor_factory: Arc<dyn TensorFactory> = Arc::new(MockTensorFactory);
-    let engine = ContinuousBatchEngine::new_plan_runtime(
+
+    let engine = ContinuousBatchEngine::new(
         config,
         Arc::clone(&scheduler),
         tokenizer,
         sampler,
         executor_owner,
-        tensor_factory,
     )
     .unwrap();
     let mut request = policy_request();
@@ -4497,14 +4364,13 @@ async fn plan_runtime_invalid_maintenance_fails_waiting_request_without_retry_lo
         let observation = executor.observer();
         let executor_owner = ExecutorOwner::new(Box::new(executor));
         let executor = observation;
-        let tensor_factory: Arc<dyn TensorFactory> = Arc::new(MockTensorFactory);
-        let engine = ContinuousBatchEngine::new_plan_runtime(
+
+        let engine = ContinuousBatchEngine::new(
             config,
             Arc::clone(&scheduler),
             tokenizer,
             sampler,
             executor_owner,
-            tensor_factory,
         )
         .unwrap();
         let mut request = policy_request();
@@ -5843,12 +5709,37 @@ fn vnext_profile_event_producer_cost_probe() {
 #[test]
 fn request_context_capacity_uses_executor_kv_capacity_when_smaller() {
     let mut config = EngineConfig::default();
-    config.kv_cache.max_blocks = 2048;
-    let runtime = ContinuousEngineRuntimeConfig::from_env_vars(None, Vec::<(&str, &str)>::new());
+    config.runtime.max_model_len = Some(2048);
+    let runtime = ContinuousEngineRuntimeConfig::from_engine_config(&config);
 
     assert_eq!(
         effective_request_context_capacity(&config, &runtime, Some(512)),
         Some(512)
+    );
+}
+
+#[test]
+fn request_context_capacity_does_not_treat_physical_blocks_as_tokens() {
+    let mut config = EngineConfig::default();
+    config.kv_cache.max_blocks = 64;
+    config.model.model_info = None;
+    config.runtime.kv_capacity = None;
+    config.runtime.max_model_len = Some(1024);
+    let runtime = ContinuousEngineRuntimeConfig::from_engine_config(&config);
+    assert_eq!(
+        effective_request_context_capacity(&config, &runtime, None),
+        Some(1024)
+    );
+    assert_eq!(
+        effective_request_context_capacity(&config, &runtime, Some(512)),
+        Some(512)
+    );
+
+    config.runtime.max_model_len = None;
+    let runtime = ContinuousEngineRuntimeConfig::from_engine_config(&config);
+    assert_eq!(
+        effective_request_context_capacity(&config, &runtime, None),
+        None
     );
 }
 
@@ -6138,55 +6029,6 @@ fn sequence_state_detects_closed_run_and_serve_receivers() {
     assert!(!serve_sequence.client_receiver_closed());
     drop(stream_receiver);
     assert!(serve_sequence.client_receiver_closed());
-}
-
-#[tokio::test]
-async fn engine_status_reports_kv_cache_memory_from_manager_stats() {
-    let mut config = EngineConfig::default();
-    config.kv_cache.max_blocks = 128;
-    let scheduler = Arc::new(ContinuousBatchScheduler::new(config.scheduler.clone()));
-    let tokenizer: Arc<dyn Tokenizer + Send + Sync> = Arc::new(PolicyTokenizer::new(64, &[]));
-    let sampler: Arc<dyn Sampler + Send + Sync> = Arc::new(crate::registry::GreedySampler);
-    let kv_cache = Arc::new(MockKvCacheManager::new(128));
-    kv_cache
-        .allocate(&AllocationRequest {
-            request_id: RequestId::new(),
-            initial_tokens: 17,
-            max_sequence_length: 32,
-            num_layers: 1,
-            num_heads: 1,
-            head_dim: 1,
-            device: Device::CPU,
-            dtype: DataType::FP16,
-            priority: Priority::Normal,
-        })
-        .await
-        .unwrap();
-    let executor = ExecutorOwner::new(Box::new(MockModelExecutor::instant(64)));
-    let tensor_factory: Arc<dyn TensorFactory> = Arc::new(MockTensorFactory);
-    let engine = ContinuousBatchEngine::new(
-        config,
-        scheduler,
-        tokenizer,
-        sampler,
-        kv_cache,
-        executor,
-        tensor_factory,
-    )
-    .expect("legacy engine composition must match executor authority");
-
-    let status = engine.status().await;
-
-    assert_eq!(status.memory_usage.total_bytes, 128 * 16 * 1024);
-    assert_eq!(status.memory_usage.used_bytes, 2 * 16 * 1024);
-    assert_eq!(status.memory_usage.cache_memory_bytes, 2 * 16 * 1024);
-    assert_eq!(
-        status.memory_usage.free_bytes,
-        status.memory_usage.total_bytes - status.memory_usage.used_bytes
-    );
-    assert_eq!(status.memory_usage.cpu_memory_bytes, Some(2 * 16 * 1024));
-    assert_eq!(status.memory_usage.gpu_memory_bytes, None);
-    assert!(status.memory_usage.utilization_percent > 0.0);
 }
 
 #[test]

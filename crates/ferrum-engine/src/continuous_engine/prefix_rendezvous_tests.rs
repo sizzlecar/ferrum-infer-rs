@@ -185,13 +185,12 @@ fn engine() -> (ContinuousBatchEngine, Arc<CaptureState>) {
     let mut executor = PlanRuntimeChunkedPrefillTestExecutor::new(false);
     executor.rendezvous = Some(Arc::clone(&state));
     let scheduler = Arc::new(ContinuousBatchScheduler::new(config.scheduler.clone()));
-    let engine = ContinuousBatchEngine::new_plan_runtime(
+    let engine = ContinuousBatchEngine::new(
         config,
         scheduler,
         Arc::new(ferrum_testkit::MockTokenizer::new(128)),
         Arc::new(ferrum_testkit::MockSampler),
         ExecutorOwner::new(Box::new(executor)),
-        Arc::new(MockTensorFactory),
     )
     .unwrap();
     (engine, state)

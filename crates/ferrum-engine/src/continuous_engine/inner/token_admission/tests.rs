@@ -10,7 +10,6 @@ use ferrum_execution::token_execution::{
     ExecutorSequence,
 };
 use ferrum_models::test_support::TinyTokenizer;
-use ferrum_testkit::{MockKvCacheManager, MockTensorFactory};
 use std::time::Duration;
 use tokio::sync::oneshot;
 
@@ -213,9 +212,7 @@ async fn fixture() -> Fixture {
         scheduler,
         Arc::new(TinyTokenizer::new(cfg.vocab_size)),
         Arc::new(crate::registry::GreedySampler),
-        Arc::new(MockKvCacheManager::new(256)),
         ExecutorOwner::new(Box::new(implementation)),
-        Arc::new(MockTensorFactory),
     )
     .unwrap();
     let mut request = InferenceRequest::new("original admission", "tiny-llama-test");

@@ -148,13 +148,12 @@ fn engine(
         128,
         &[("test", 5), ("ok", 6), ("generated", 42)],
     ));
-    let engine = ContinuousBatchEngine::new_plan_runtime_observed(
+    let engine = ContinuousBatchEngine::new_observed(
         config.clone(),
         Arc::new(ContinuousBatchScheduler::new(config.scheduler)),
         tokenizer.clone(),
         Arc::new(crate::registry::GreedySampler),
         ExecutorOwner::new(Box::new(implementation)),
-        Arc::new(MockTensorFactory),
         None,
         Some(Arc::new(AttemptRecorder::default())),
         Some(source),
@@ -226,7 +225,6 @@ async fn cost_feedback_requires_both_inputs_and_keeps_default_off() {
     let (off, _, _, _) = plan_runtime_test_engine(
         EngineConfig::default(),
         PlanRuntimeAdmissionTestExecutor::new(128),
-        Arc::new(MockTensorFactory),
     );
     let inner = off.active_inner().unwrap();
     assert!(inner.execution_attempt_observer.is_none());

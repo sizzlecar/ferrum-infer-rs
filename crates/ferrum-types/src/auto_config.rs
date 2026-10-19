@@ -482,12 +482,8 @@ impl ResolvedFerrumConfig {
         let selected_max_model_len = self.selected_usize("max_model_len");
         let selected_kv_capacity = self.runtime_usize("FERRUM_KV_CAPACITY");
         let selected_max_batched_tokens = self.selected_usize("max_batched_tokens");
-        let selected_recurrent_state_max_slots = self.selected_recurrent_state_max_slots();
-        let selected_admission_limit = effective_admission_limit(
-            self.execution_resource_authority,
-            selected_max_sequences,
-            selected_recurrent_state_max_slots,
-        );
+        // This is the declared protocol ceiling, not a model-state capacity estimate.
+        let selected_admission_limit = selected_max_sequences;
         let selected_attention_policy = self.selected_string("attention_execution_policy");
         let selected_attention_impl = self.selected_string("attention_decode_backend");
         serde_json::json!({
@@ -517,7 +513,6 @@ impl ResolvedFerrumConfig {
             "selected_kv_capacity": selected_kv_capacity,
             "selected_kv_capacity_source": "configured_token_limit",
             "selected_max_batched_tokens": selected_max_batched_tokens,
-            "selected_recurrent_state_max_slots": selected_recurrent_state_max_slots,
             "selected_admission_limit": selected_admission_limit,
             "entries": self.runtime_config.entries,
             "model_capabilities": self.model_capabilities,
@@ -530,20 +525,13 @@ impl ResolvedFerrumConfig {
 
     pub fn admission_summary_document(&self) -> serde_json::Value {
         let max_sequences = self.selected_usize("max_sequences");
-        let recurrent_state_max_slots = self.selected_recurrent_state_max_slots();
-        let effective_max_concurrent = effective_admission_limit(
-            self.execution_resource_authority,
-            max_sequences,
-            recurrent_state_max_slots,
-        );
+        let effective_max_concurrent = max_sequences;
         let kv_blocks = self.selected_usize("kv_block_count");
         let max_batched_tokens = self.selected_usize("max_batched_tokens");
         let max_model_len = self.selected_usize("max_model_len");
         let kv_capacity_tokens =
             kv_blocks.map(|blocks| blocks.saturating_mul(DEFAULT_KV_BLOCK_SIZE_TOKENS));
         let kv_bytes_per_token = kv_cache_bytes_per_token_for_model(&self.model_capabilities);
-        let recurrent_budget =
-            recurrent_state_budget_for(&self.model_capabilities, &self.hardware_capabilities);
         let scheduler_policy = self
             .selected_string("scheduler_admission_policy")
             .unwrap_or_else(|| "unknown".to_string());
@@ -556,15 +544,6 @@ impl ResolvedFerrumConfig {
             "estimated_weight_bytes": self.model_capabilities.estimated_weight_bytes,
             "kv_bytes_per_token": kv_bytes_per_token,
             "recurrent_state_bytes_per_sequence": self.model_capabilities.recurrent_state_bytes_per_sequence,
-            "recurrent_state_budget_bytes": recurrent_budget.map(|budget| budget.remaining_bytes),
-            "recurrent_state_budget_raw_slots": recurrent_budget.map(|budget| budget.raw_slots),
-            "recurrent_state_budget_max_slots": recurrent_budget.map(|budget| budget.floored_slots),
-            "recurrent_state_capacity_bytes": match (recurrent_state_max_slots, self.model_capabilities.recurrent_state_bytes_per_sequence) {
-                (Some(slots), Some(bytes_per_sequence)) => {
-                    (slots as u64).checked_mul(bytes_per_sequence)
-                }
-                _ => None,
-            },
             "kv_capacity_bytes": match (kv_capacity_tokens, kv_bytes_per_token) {
                 (Some(tokens), Some(bytes_per_token)) => {
                     (tokens as u64).checked_mul(bytes_per_token)
@@ -590,13 +569,6 @@ impl ResolvedFerrumConfig {
             "failed_requests_total": 0u64,
             "completed_requests_total": 0u64,
             "max_sequences": max_sequences,
-            "recurrent_state_max_slots": if self.execution_resource_authority == ExecutionResourceAuthority::LegacyEngine {
-                recurrent_state_max_slots
-            } else {
-                None
-            },
-            "legacy_recurrent_state_max_slots_estimate": recurrent_state_max_slots,
-            "legacy_recurrent_state_limit_applies": self.execution_resource_authority == ExecutionResourceAuthority::LegacyEngine,
             "kv_capacity_source": "legacy_block_preflight_estimate",
             "kv_capacity_applies_to_selected_state_layout": self.execution_resource_authority == ExecutionResourceAuthority::LegacyEngine,
             "kv_capacity_is_resident_usage": false,
@@ -635,11 +607,6 @@ impl ResolvedFerrumConfig {
             .iter()
             .find(|decision| decision.selection == selection)
             .map(|decision| decision.selected.clone())
-    }
-
-    fn selected_recurrent_state_max_slots(&self) -> Option<usize> {
-        self.selected_usize("recurrent_state_max_slots")
-            .or_else(|| self.runtime_usize("FERRUM_RECURRENT_STATE_MAX_SLOTS"))
     }
 
     fn selected_graph_mode(&self) -> Option<String> {
@@ -954,29 +921,6 @@ impl FerrumConfigBuilder {
                 max_sequences.value = max_sequences.value.min(batch.value.max(1));
             }
         }
-        if plan_runtime && self.entry("FERRUM_RECURRENT_STATE_MAX_SLOTS").is_some() {
-            return self.invalid(
-                "FERRUM_RECURRENT_STATE_MAX_SLOTS",
-                "legacy engine recurrent-state slots do not control the plan runtime; use max sequences as the protocol ceiling and let dynamic resource admission defer on live capacity",
-            );
-        }
-        let default_recurrent_state_max_slots = (!plan_runtime)
-            .then(|| self.default_recurrent_state_max_slots(&max_sequences))
-            .flatten();
-        let recurrent_state_max_slots = if default_recurrent_state_max_slots.is_some()
-            || self.entry("FERRUM_RECURRENT_STATE_MAX_SLOTS").is_some()
-        {
-            let default = default_recurrent_state_max_slots
-                .as_ref()
-                .unwrap_or(&max_sequences);
-            Some(self.usize_value(
-                "FERRUM_RECURRENT_STATE_MAX_SLOTS",
-                default.value,
-                default.source,
-            )?)
-        } else {
-            None
-        };
         let default_kv_blocks = self.default_kv_blocks(&max_sequences);
         let kv_blocks = self.usize_value(
             "FERRUM_KV_MAX_BLOCKS",
@@ -1034,7 +978,6 @@ impl FerrumConfigBuilder {
         self.validate_memory(
             kv_blocks.value,
             max_sequences.value,
-            recurrent_state_max_slots.as_ref().map(|slots| slots.value),
             max_batched_tokens.value,
             max_model_len.as_ref().map(|value| value.value),
         )?;
@@ -1173,15 +1116,6 @@ impl FerrumConfigBuilder {
                 );
             }
         }
-        if let Some(slots) = recurrent_state_max_slots.as_ref() {
-            if self.entry("FERRUM_RECURRENT_STATE_MAX_SLOTS").is_none() {
-                runtime_config.upsert(
-                    "FERRUM_RECURRENT_STATE_MAX_SLOTS",
-                    slots.value.to_string(),
-                    RuntimeConfigSource::MemoryProfile,
-                );
-            }
-        }
         decisions.push(self.moe_decision(vllm_moe));
         decisions.push(self.reusable_execution_decision(reusable_execution));
         decisions.push(self.decode_graph_decision(
@@ -1200,13 +1134,6 @@ impl FerrumConfigBuilder {
             max_sequences,
             RuntimeConfigEffect::Memory,
         ));
-        if let Some(slots) = recurrent_state_max_slots {
-            decisions.push(self.scalar_decision(
-                "recurrent_state_max_slots",
-                slots,
-                RuntimeConfigEffect::Memory,
-            ));
-        }
         decisions.push(self.scalar_decision(
             "max_batched_tokens",
             max_batched_tokens,
@@ -1454,32 +1381,6 @@ impl FerrumConfigBuilder {
             },
             source_key: None,
         }
-    }
-
-    fn default_recurrent_state_max_slots(
-        &self,
-        max_sequences: &ResolvedValue<usize>,
-    ) -> Option<ResolvedValue<usize>> {
-        let limit = self.recurrent_state_budget_max_slots()?;
-        let selected = max_sequences.value.min(limit.max(1));
-        Some(ResolvedValue {
-            value: selected.max(1),
-            source: if selected < max_sequences.value {
-                AutoConfigSource::MemoryProfile
-            } else {
-                max_sequences.source
-            },
-            source_key: None,
-        })
-    }
-
-    fn recurrent_state_budget_max_slots(&self) -> Option<usize> {
-        self.recurrent_state_budget()
-            .map(|budget| budget.floored_slots)
-    }
-
-    fn recurrent_state_budget(&self) -> Option<RecurrentStateBudget> {
-        recurrent_state_budget_for(&self.model, &self.hardware)
     }
 
     fn kv_cache_bytes_per_token(&self) -> Option<u64> {
@@ -1874,7 +1775,6 @@ impl FerrumConfigBuilder {
         &self,
         kv_blocks: usize,
         max_sequences: usize,
-        recurrent_state_max_slots: Option<usize>,
         max_batched_tokens: usize,
         requested_max_model_len: Option<usize>,
     ) -> Result<(), AutoConfigError> {
@@ -1883,30 +1783,6 @@ impl FerrumConfigBuilder {
         }
         if max_sequences == 0 {
             return self.invalid("FERRUM_PAGED_MAX_SEQS", "must be greater than zero");
-        }
-        if recurrent_state_max_slots == Some(0) {
-            return self.invalid(
-                "FERRUM_RECURRENT_STATE_MAX_SLOTS",
-                "must be greater than zero",
-            );
-        }
-        if self.execution_resource_authority == ExecutionResourceAuthority::LegacyEngine {
-            if let Some(limit) = self.recurrent_state_budget_max_slots() {
-                let recurrent_slots = recurrent_state_max_slots.unwrap_or(max_sequences);
-                if recurrent_slots > limit {
-                    let key = if self.entry("FERRUM_RECURRENT_STATE_MAX_SLOTS").is_some() {
-                        "FERRUM_RECURRENT_STATE_MAX_SLOTS"
-                    } else {
-                        "FERRUM_PAGED_MAX_SEQS"
-                    };
-                    return Err(AutoConfigError::InvalidOverride {
-                        key: key.to_string(),
-                        reason: format!(
-                            "recurrent-state slot pool exceeds the model/hardware memory budget: slots={recurrent_slots}, budget={limit}; use FERRUM_RECURRENT_STATE_MAX_SLOTS={limit}, lower --max-num-seqs, or a larger-memory GPU."
-                        ),
-                    });
-                }
-            }
         }
         if max_batched_tokens < max_sequences {
             return self.invalid(
@@ -3420,36 +3296,6 @@ struct ResolvedValue<T> {
     source_key: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct RecurrentStateBudget {
-    remaining_bytes: u64,
-    bytes_per_sequence: u64,
-    raw_slots: usize,
-    floored_slots: usize,
-}
-
-fn recurrent_state_budget_for(
-    model: &ModelCapabilities,
-    hardware: &HardwareCapabilities,
-) -> Option<RecurrentStateBudget> {
-    if !(hardware.backend.eq_ignore_ascii_case("cuda")
-        || hardware.backend.eq_ignore_ascii_case("metal"))
-    {
-        return None;
-    }
-    let bytes_per_sequence = model.recurrent_state_bytes_per_sequence?.max(1);
-    let vram_bytes = hardware.vram_bytes?;
-    let weight_bytes = model.estimated_weight_bytes?;
-    let remaining = vram_bytes.saturating_sub(weight_bytes);
-    let raw_slots = (remaining / bytes_per_sequence) as usize;
-    Some(RecurrentStateBudget {
-        remaining_bytes: remaining,
-        bytes_per_sequence,
-        raw_slots,
-        floored_slots: floor_power_of_two(raw_slots.max(1)),
-    })
-}
-
 fn parse_compute_capability(value: &str) -> Option<(u32, u32)> {
     let value = value.trim();
     if value.is_empty() {
@@ -3474,29 +3320,6 @@ fn default_gpu_devices_for_backend(backend: &str) -> Option<Vec<usize>> {
 
 fn ceil_div(value: usize, divisor: usize) -> usize {
     value.div_ceil(divisor)
-}
-
-fn effective_admission_limit(
-    authority: ExecutionResourceAuthority,
-    max_sequences: Option<usize>,
-    recurrent_state_max_slots: Option<usize>,
-) -> Option<usize> {
-    if authority == ExecutionResourceAuthority::PlanRuntime {
-        return max_sequences;
-    }
-    match (max_sequences, recurrent_state_max_slots) {
-        (Some(max_sequences), Some(recurrent_slots)) => Some(max_sequences.min(recurrent_slots)),
-        (Some(max_sequences), None) => Some(max_sequences),
-        (None, Some(recurrent_slots)) => Some(recurrent_slots),
-        (None, None) => None,
-    }
-}
-
-fn floor_power_of_two(value: usize) -> usize {
-    if value <= 1 {
-        return 1;
-    }
-    1usize << (usize::BITS - 1 - value.leading_zeros())
 }
 
 fn auto_config_source_from_runtime(source: RuntimeConfigSource) -> AutoConfigSource {
@@ -3910,175 +3733,94 @@ mod tests {
     }
 
     #[test]
-    fn recurrent_state_budget_caps_default_slots_without_model_vram_special_case() {
-        let hardware =
-            HardwareCapabilities::rtx4090_cuda(CompiledKernelFeatures::m3_fast_path_without_fa2());
-        let workload = WorkloadProfile::serving_default_for_hardware(&hardware);
-        let resolved = FerrumConfigBuilder::new(snapshot(&[("FERRUM_PAGED_MAX_SEQS", "32")]))
-            .with_model_capabilities(synthetic_tight_recurrent_state_model())
-            .with_hardware_capabilities(hardware)
-            .with_workload_profile(workload)
-            .resolve()
-            .unwrap();
-        let decision = |selection: &str| {
-            resolved
-                .decisions
-                .iter()
-                .find(|decision| decision.selection == selection)
-                .unwrap_or_else(|| panic!("missing decision {selection}"))
-        };
-
-        assert_eq!(decision("max_sequences").selected, "32");
-        assert_eq!(decision("recurrent_state_max_slots").selected, "16");
-        assert_eq!(
-            decision("recurrent_state_max_slots").source,
-            AutoConfigSource::MemoryProfile
-        );
-        let entry = resolved
-            .runtime_config
-            .entries
-            .iter()
-            .find(|entry| entry.key == "FERRUM_RECURRENT_STATE_MAX_SLOTS")
-            .expect("memory-profile recurrent slot cap should reach effective runtime config");
-        assert_eq!(entry.effective_value, "16");
-        assert_eq!(entry.source, RuntimeConfigSource::MemoryProfile);
-        let doc = resolved.effective_config_document();
-        assert_eq!(doc["selected_max_sequences"], serde_json::json!(32));
-        assert_eq!(
-            doc["selected_recurrent_state_max_slots"],
-            serde_json::json!(16)
-        );
-        assert_eq!(doc["selected_admission_limit"], serde_json::json!(16));
-        assert_eq!(
-            doc["admission"]["effective_max_concurrent"],
-            serde_json::json!(16)
-        );
-        assert_eq!(
-            doc["admission"]["recurrent_state_max_slots"],
-            serde_json::json!(16)
-        );
-        assert_eq!(
-            doc["admission"]["memory_estimate"]["recurrent_state_bytes_per_sequence"],
-            serde_json::json!(65_863_680u64)
-        );
-        assert_eq!(
-            doc["admission"]["memory_estimate"]["recurrent_state_budget_bytes"],
-            serde_json::json!(24u64 * GIB - 24_419_939_760u64)
-        );
-        assert_eq!(
-            doc["admission"]["memory_estimate"]["recurrent_state_budget_raw_slots"],
-            serde_json::json!(20)
-        );
-        assert_eq!(
-            doc["admission"]["memory_estimate"]["recurrent_state_budget_max_slots"],
-            serde_json::json!(16)
-        );
-        assert_eq!(
-            doc["admission"]["memory_estimate"]["recurrent_state_capacity_bytes"],
-            serde_json::json!(16u64 * 65_863_680u64)
-        );
-    }
-
-    #[test]
-    fn qwen35_fast_recurrent_state_budget_selects_default_slots_without_vram_special_case() {
-        let hardware =
-            HardwareCapabilities::rtx4090_cuda(CompiledKernelFeatures::m3_fast_path_without_fa2());
-        let workload = WorkloadProfile::serving_default_for_hardware(&hardware);
-        let resolved = FerrumConfigBuilder::new(snapshot(&[("FERRUM_PAGED_MAX_SEQS", "32")]))
-            .with_model_capabilities(qwen35_moe_gptq_int4_model())
-            .with_hardware_capabilities(hardware)
-            .with_workload_profile(workload)
-            .resolve()
-            .unwrap();
-        let decision = |selection: &str| {
-            resolved
-                .decisions
-                .iter()
-                .find(|decision| decision.selection == selection)
-                .unwrap_or_else(|| panic!("missing decision {selection}"))
-        };
-
-        assert_eq!(decision("max_sequences").selected, "32");
-        assert_eq!(decision("recurrent_state_max_slots").selected, "32");
-        assert_eq!(
-            decision("recurrent_state_max_slots").source,
-            AutoConfigSource::Env
-        );
-        let doc = resolved.effective_config_document();
-        assert_eq!(doc["selected_max_sequences"], serde_json::json!(32));
-        assert_eq!(
-            doc["selected_recurrent_state_max_slots"],
-            serde_json::json!(32)
-        );
-        assert_eq!(doc["selected_admission_limit"], serde_json::json!(32));
-        assert_eq!(
-            doc["admission"]["memory_estimate"]["recurrent_state_bytes_per_sequence"],
-            serde_json::json!(32_931_840u64)
-        );
-        assert_eq!(
-            doc["admission"]["memory_estimate"]["recurrent_state_budget_raw_slots"],
-            serde_json::json!(40)
-        );
-        assert_eq!(
-            doc["admission"]["memory_estimate"]["recurrent_state_budget_max_slots"],
-            serde_json::json!(32)
-        );
-        assert_eq!(
-            doc["admission"]["memory_estimate"]["recurrent_state_capacity_bytes"],
-            serde_json::json!(32u64 * 32_931_840u64)
-        );
-    }
-
-    #[test]
-    fn recurrent_state_budget_rejects_explicit_slot_pool_above_budget() {
-        let hardware =
-            HardwareCapabilities::rtx4090_cuda(CompiledKernelFeatures::m3_fast_path_without_fa2());
-        let workload = WorkloadProfile::serving_default_for_hardware(&hardware);
-        let err = FerrumConfigBuilder::new(snapshot(&[
-            ("FERRUM_PAGED_MAX_SEQS", "32"),
-            ("FERRUM_RECURRENT_STATE_MAX_SLOTS", "32"),
-        ]))
-        .with_model_capabilities(synthetic_tight_recurrent_state_model())
-        .with_hardware_capabilities(hardware)
-        .with_workload_profile(workload)
-        .resolve()
-        .unwrap_err();
-
-        match err {
-            AutoConfigError::InvalidOverride { key, reason } => {
-                assert_eq!(key, "FERRUM_RECURRENT_STATE_MAX_SLOTS");
-                assert!(
-                    reason.contains("recurrent-state slot pool exceeds"),
-                    "{reason}"
+    fn recurrent_state_estimate_does_not_create_a_slot_pool_or_admission_cap() {
+        for model in [
+            synthetic_tight_recurrent_state_model(),
+            qwen35_moe_gptq_int4_model(),
+        ] {
+            for authority in [
+                ExecutionResourceAuthority::LegacyEngine,
+                ExecutionResourceAuthority::PlanRuntime,
+            ] {
+                let hardware = HardwareCapabilities::rtx4090_cuda(
+                    CompiledKernelFeatures::m3_fast_path_without_fa2(),
                 );
-                assert!(
-                    reason.contains("FERRUM_RECURRENT_STATE_MAX_SLOTS=16"),
-                    "{reason}"
+                let workload = WorkloadProfile::serving_default_for_hardware(&hardware);
+                let expected_estimate = model.recurrent_state_bytes_per_sequence;
+                let resolved =
+                    FerrumConfigBuilder::new(snapshot(&[("FERRUM_PAGED_MAX_SEQS", "32")]))
+                        .with_model_capabilities(model.clone())
+                        .with_hardware_capabilities(hardware)
+                        .with_workload_profile(workload)
+                        .with_execution_resource_authority(authority)
+                        .resolve()
+                        .unwrap();
+                assert!(resolved
+                    .decisions
+                    .iter()
+                    .all(|decision| decision.selection != "recurrent_state_max_slots"));
+                assert!(resolved
+                    .runtime_config
+                    .entries
+                    .iter()
+                    .all(|entry| entry.key != "FERRUM_RECURRENT_STATE_MAX_SLOTS"));
+                let doc = resolved.effective_config_document();
+                assert_eq!(doc["selected_max_sequences"], 32);
+                assert_eq!(doc["selected_admission_limit"], 32);
+                assert_eq!(doc["admission"]["effective_max_concurrent"], 32);
+                assert!(doc.get("selected_recurrent_state_max_slots").is_none());
+                for key in [
+                    "recurrent_state_max_slots",
+                    "legacy_recurrent_state_max_slots_estimate",
+                    "legacy_recurrent_state_limit_applies",
+                ] {
+                    assert!(doc["admission"].get(key).is_none(), "{key}");
+                }
+                let memory = &doc["admission"]["memory_estimate"];
+                assert_eq!(
+                    memory["recurrent_state_bytes_per_sequence"],
+                    serde_json::json!(expected_estimate)
                 );
+                assert_eq!(memory["is_resident_usage"], false);
+                for key in [
+                    "recurrent_state_budget_bytes",
+                    "recurrent_state_budget_raw_slots",
+                    "recurrent_state_budget_max_slots",
+                    "recurrent_state_capacity_bytes",
+                ] {
+                    assert!(memory.get(key).is_none(), "{key}");
+                }
             }
-            other => panic!("unexpected error: {other:?}"),
         }
     }
 
     #[test]
-    fn effective_admission_limit_respects_resource_authority() {
-        let legacy = ExecutionResourceAuthority::LegacyEngine;
-        let plan = ExecutionResourceAuthority::PlanRuntime;
-        assert_eq!(
-            effective_admission_limit(legacy, Some(32), Some(16)),
-            Some(16)
-        );
-        assert_eq!(
-            effective_admission_limit(legacy, Some(16), Some(32)),
-            Some(16)
-        );
-        assert_eq!(effective_admission_limit(legacy, Some(32), None), Some(32));
-        assert_eq!(effective_admission_limit(legacy, None, Some(16)), Some(16));
-        assert_eq!(effective_admission_limit(legacy, None, None), None);
-        assert_eq!(
-            effective_admission_limit(plan, Some(32), Some(16)),
-            Some(32)
-        );
+    fn auto_config_rejects_retired_recurrent_state_slots_for_each_authority() {
+        for authority in [
+            ExecutionResourceAuthority::LegacyEngine,
+            ExecutionResourceAuthority::PlanRuntime,
+        ] {
+            for value in ["", "0", "16", "32"] {
+                let hardware = HardwareCapabilities::rtx4090_cuda(
+                    CompiledKernelFeatures::m3_fast_path_without_fa2(),
+                );
+                let workload = WorkloadProfile::serving_default_for_hardware(&hardware);
+                let error = FerrumConfigBuilder::new(snapshot(&[
+                    ("FERRUM_PAGED_MAX_SEQS", "32"),
+                    ("FERRUM_RECURRENT_STATE_MAX_SLOTS", value),
+                ]))
+                .with_model_capabilities(synthetic_tight_recurrent_state_model())
+                .with_hardware_capabilities(hardware)
+                .with_workload_profile(workload)
+                .with_execution_resource_authority(authority)
+                .resolve()
+                .unwrap_err();
+                assert!(matches!(error,
+                    AutoConfigError::InvalidOverride { key, reason }
+                    if key == "FERRUM_RECURRENT_STATE_MAX_SLOTS" && reason.contains("retired")
+                ));
+            }
+        }
     }
 
     #[test]
@@ -4148,10 +3890,9 @@ mod tests {
             document["admission"]["effective_max_concurrent"],
             serde_json::json!(32)
         );
-        assert_eq!(
-            document["admission"]["legacy_recurrent_state_limit_applies"],
-            serde_json::json!(false)
-        );
+        assert!(document["admission"]
+            .get("legacy_recurrent_state_limit_applies")
+            .is_none());
     }
 
     #[test]
@@ -4345,29 +4086,6 @@ mod tests {
     }
 
     #[test]
-    fn plan_runtime_rejects_legacy_recurrent_slot_override() {
-        let hardware =
-            HardwareCapabilities::rtx4090_cuda(CompiledKernelFeatures::m3_fast_path_without_fa2());
-        let workload = WorkloadProfile::serving_default_for_hardware(&hardware);
-        let error = FerrumConfigBuilder::new(snapshot(&[
-            ("FERRUM_PAGED_MAX_SEQS", "32"),
-            ("FERRUM_RECURRENT_STATE_MAX_SLOTS", "16"),
-        ]))
-        .with_model_capabilities(synthetic_tight_recurrent_state_model())
-        .with_hardware_capabilities(hardware)
-        .with_workload_profile(workload)
-        .with_execution_resource_authority(ExecutionResourceAuthority::PlanRuntime)
-        .resolve()
-        .unwrap_err();
-
-        assert!(matches!(
-            error,
-            AutoConfigError::InvalidOverride { key, .. }
-                if key == "FERRUM_RECURRENT_STATE_MAX_SLOTS"
-        ));
-    }
-
-    #[test]
     fn metal_plan_runtime_preflight_matches_portable_runtime_capability() {
         let mut hardware = HardwareCapabilities::unknown();
         hardware.backend = "metal".to_owned();
@@ -4395,39 +4113,7 @@ mod tests {
     }
 
     #[test]
-    fn explicit_recurrent_state_slot_cap_can_keep_scheduler_width_above_state_pool() {
-        let hardware =
-            HardwareCapabilities::rtx4090_cuda(CompiledKernelFeatures::m3_fast_path_without_fa2());
-        let workload = WorkloadProfile::serving_default_for_hardware(&hardware);
-        let resolved = FerrumConfigBuilder::new(snapshot(&[
-            ("FERRUM_PAGED_MAX_SEQS", "32"),
-            ("FERRUM_RECURRENT_STATE_MAX_SLOTS", "16"),
-        ]))
-        .with_model_capabilities(synthetic_tight_recurrent_state_model())
-        .with_hardware_capabilities(hardware)
-        .with_workload_profile(workload)
-        .resolve()
-        .unwrap();
-        let decision = |selection: &str| {
-            resolved
-                .decisions
-                .iter()
-                .find(|decision| decision.selection == selection)
-                .unwrap_or_else(|| panic!("missing decision {selection}"))
-        };
-        assert_eq!(decision("max_sequences").selected, "32");
-        assert_eq!(decision("recurrent_state_max_slots").selected, "16");
-        let entry = resolved
-            .runtime_config
-            .entries
-            .iter()
-            .find(|entry| entry.key == "FERRUM_RECURRENT_STATE_MAX_SLOTS")
-            .expect("recurrent-state slot cap should reach effective runtime config");
-        assert_eq!(entry.effective_value, "16");
-    }
-
-    #[test]
-    fn recurrent_state_budget_ignores_removed_qwen35_slot_alias() {
+    fn removed_qwen35_slot_alias_does_not_create_a_recurrent_slot_cap() {
         let hardware =
             HardwareCapabilities::rtx4090_cuda(CompiledKernelFeatures::m3_fast_path_without_fa2());
         let workload = WorkloadProfile::serving_default_for_hardware(&hardware);
@@ -4440,62 +4126,19 @@ mod tests {
         .with_workload_profile(workload)
         .resolve()
         .unwrap();
-        let decision = resolved
+        assert_eq!(
+            resolved.effective_config_document()["selected_admission_limit"],
+            32
+        );
+        assert!(resolved
             .decisions
             .iter()
-            .find(|decision| decision.selection == "recurrent_state_max_slots")
-            .expect("missing recurrent_state_max_slots decision");
-        assert_eq!(decision.selected, "16");
-        assert_eq!(decision.source, AutoConfigSource::MemoryProfile);
-        assert_eq!(decision.source_key, None);
+            .all(|decision| decision.selection != "recurrent_state_max_slots"));
         assert!(resolved
             .runtime_config
             .entries
             .iter()
-            .any(|entry| entry.key == "FERRUM_RECURRENT_STATE_MAX_SLOTS"
-                && entry.effective_value == "16"));
-    }
-
-    #[test]
-    fn recurrent_state_budget_rejects_zero_slot_pool() {
-        let hardware =
-            HardwareCapabilities::rtx4090_cuda(CompiledKernelFeatures::m3_fast_path_without_fa2());
-        let workload = WorkloadProfile::serving_default_for_hardware(&hardware);
-        let err = FerrumConfigBuilder::new(snapshot(&[
-            ("FERRUM_PAGED_MAX_SEQS", "16"),
-            ("FERRUM_RECURRENT_STATE_MAX_SLOTS", "0"),
-        ]))
-        .with_model_capabilities(synthetic_tight_recurrent_state_model())
-        .with_hardware_capabilities(hardware)
-        .with_workload_profile(workload)
-        .resolve()
-        .unwrap_err();
-
-        assert!(matches!(
-            err,
-            AutoConfigError::InvalidOverride { key, .. }
-                if key == "FERRUM_RECURRENT_STATE_MAX_SLOTS"
-        ));
-    }
-
-    #[test]
-    fn recurrent_state_budget_allows_c32_when_memory_budget_fits() {
-        let mut hardware =
-            HardwareCapabilities::rtx4090_cuda(CompiledKernelFeatures::m3_fast_path_without_fa2());
-        hardware.vram_bytes = Some(48 * GIB);
-        let workload = WorkloadProfile::serving_default_for_hardware(&hardware);
-        let resolved = FerrumConfigBuilder::new(snapshot(&[("FERRUM_PAGED_MAX_SEQS", "32")]))
-            .with_model_capabilities(synthetic_tight_recurrent_state_model())
-            .with_hardware_capabilities(hardware)
-            .with_workload_profile(workload)
-            .resolve()
-            .unwrap();
-        let max_sequences = resolved
-            .decisions
-            .iter()
-            .find(|decision| decision.selection == "max_sequences")
-            .unwrap();
-        assert_eq!(max_sequences.selected, "32");
+            .all(|entry| entry.key != "FERRUM_RECURRENT_STATE_MAX_SLOTS"));
     }
 
     #[test]

@@ -141,13 +141,12 @@ fn engine() -> (
     let observation = executor.observer();
     let executor = ExecutorOwner::new(Box::new(executor));
     let scheduler = Arc::new(ContinuousBatchScheduler::new(config.scheduler.clone()));
-    let engine = ContinuousBatchEngine::new_plan_runtime(
+    let engine = ContinuousBatchEngine::new(
         config,
         scheduler,
         Arc::new(ferrum_testkit::MockTokenizer::new(128)),
         Arc::new(ferrum_testkit::MockSampler),
         executor,
-        Arc::new(MockTensorFactory),
     )
     .unwrap();
     (engine, observation, state)

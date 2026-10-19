@@ -17,14 +17,12 @@ fn basic_metrics_only_attaches_to_target_without_journals() {
             let implementation = PlanRuntimeAdmissionTestExecutor::new(128);
             let target = implementation.observer();
             let owner = ExecutorOwner::new(Box::new(implementation));
-            let engine = ContinuousBatchEngine::new_with_resource_composition(
+            let engine = ContinuousBatchEngine::new_observed(
                 config.clone(),
                 Arc::new(ContinuousBatchScheduler::new(config.scheduler)),
                 Arc::new(ferrum_testkit::MockTokenizer::new(128)),
                 Arc::new(ferrum_testkit::MockSampler),
-                EngineResourceComposition::PlanRuntime,
                 owner,
-                Arc::new(MockTensorFactory),
                 None,
                 None,
                 None,
@@ -67,13 +65,12 @@ fn basic_with_artifact_keeps_event_sink_and_completion_timing() {
     let implementation = PlanRuntimeAdmissionTestExecutor::new(128);
     let target = implementation.observer();
     let owner = ExecutorOwner::new(Box::new(implementation));
-    let engine = ContinuousBatchEngine::new_plan_runtime(
+    let engine = ContinuousBatchEngine::new(
         config.clone(),
         Arc::new(ContinuousBatchScheduler::new(config.scheduler)),
         Arc::new(ferrum_testkit::MockTokenizer::new(128)),
         Arc::new(ferrum_testkit::MockSampler),
         owner,
-        Arc::new(MockTensorFactory),
     )
     .unwrap();
     {

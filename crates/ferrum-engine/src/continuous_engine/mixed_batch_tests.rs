@@ -117,7 +117,7 @@ async fn mixed_fixture_observed(
     }
     config.runtime.profile_detail = ferrum_types::ObservabilityProfileDetail::Latency;
     let (engine, scheduler, executor, _) =
-        plan_runtime_test_engine_observed(config, executor, Arc::new(MockTensorFactory), observer);
+        plan_runtime_test_engine_observed(config, executor, observer);
     *executor.mixed_behavior.lock().unwrap() = behavior;
     let decode_id = install_mixed_request(&engine, &scheduler, vec![TokenId::new(5)], true).await;
     let first = scheduler
