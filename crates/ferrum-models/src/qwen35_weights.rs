@@ -1313,27 +1313,39 @@ mod tests {
         assert!(planned.has_layer_tensor(3, "self_attn_q"));
         planned
             .load_global_linear(
-                &mut <CpuBackend as ferrum_kernels::backend::Backend>::new_context(),
+                &mut <CpuBackend as ferrum_kernels::backend::Backend>::new_context(
+                    &ferrum_types::BackendContextConfig::default(),
+                )
+                .unwrap(),
                 "lm_head",
             )
             .unwrap();
         planned
             .load_layer_linear(
-                &mut <CpuBackend as ferrum_kernels::backend::Backend>::new_context(),
+                &mut <CpuBackend as ferrum_kernels::backend::Backend>::new_context(
+                    &ferrum_types::BackendContextConfig::default(),
+                )
+                .unwrap(),
                 3,
                 "self_attn_q",
             )
             .unwrap();
         planned
             .load_layer_linear(
-                &mut <CpuBackend as ferrum_kernels::backend::Backend>::new_context(),
+                &mut <CpuBackend as ferrum_kernels::backend::Backend>::new_context(
+                    &ferrum_types::BackendContextConfig::default(),
+                )
+                .unwrap(),
                 0,
                 "moe_shared_expert_gate",
             )
             .unwrap();
         planned
             .load_layer_shared_expert_gate_up_linear(
-                &mut <CpuBackend as ferrum_kernels::backend::Backend>::new_context(),
+                &mut <CpuBackend as ferrum_kernels::backend::Backend>::new_context(
+                    &ferrum_types::BackendContextConfig::default(),
+                )
+                .unwrap(),
                 0,
             )
             .unwrap();
@@ -1663,7 +1675,10 @@ mod tests {
         assert_eq!(
             planned
                 .load_global_tensor(
-                    &mut <CpuBackend as ferrum_kernels::backend::Backend>::new_context(),
+                    &mut <CpuBackend as ferrum_kernels::backend::Backend>::new_context(
+                        &ferrum_types::BackendContextConfig::default()
+                    )
+                    .unwrap(),
                     "embed_tokens"
                 )
                 .unwrap(),
@@ -1672,7 +1687,10 @@ mod tests {
         assert!(planned.has_layer_tensor(0, "linear_attn_qkv"));
         let linear = planned
             .load_layer_linear(
-                &mut <CpuBackend as ferrum_kernels::backend::Backend>::new_context(),
+                &mut <CpuBackend as ferrum_kernels::backend::Backend>::new_context(
+                    &ferrum_types::BackendContextConfig::default(),
+                )
+                .unwrap(),
                 0,
                 "linear_attn_qkv",
             )
@@ -1685,7 +1703,10 @@ mod tests {
         );
         let err = planned
             .load_global_tensor(
-                &mut <CpuBackend as ferrum_kernels::backend::Backend>::new_context(),
+                &mut <CpuBackend as ferrum_kernels::backend::Backend>::new_context(
+                    &ferrum_types::BackendContextConfig::default(),
+                )
+                .unwrap(),
                 "lm_head",
             )
             .expect_err("tied lm_head is optional and absent");
@@ -1715,13 +1736,19 @@ mod tests {
 
         let qkvz = planned
             .load_layer_linear_attention_qkvz(
-                &mut <CpuBackend as ferrum_kernels::backend::Backend>::new_context(),
+                &mut <CpuBackend as ferrum_kernels::backend::Backend>::new_context(
+                    &ferrum_types::BackendContextConfig::default(),
+                )
+                .unwrap(),
                 0,
             )
             .unwrap();
         let ba = planned
             .load_layer_linear_attention_ba(
-                &mut <CpuBackend as ferrum_kernels::backend::Backend>::new_context(),
+                &mut <CpuBackend as ferrum_kernels::backend::Backend>::new_context(
+                    &ferrum_types::BackendContextConfig::default(),
+                )
+                .unwrap(),
                 0,
             )
             .unwrap();

@@ -42,14 +42,16 @@ fn gelu_tanh_mul_split_metal_matches_cpu() {
     gate_up[im + 1] = -3.0;
     gate_up[im + 2] = 0.5;
 
-    let mut mctx = <MetalBackend as Backend>::new_context();
+    let mut mctx =
+        <MetalBackend as Backend>::new_context(&Default::default()).expect("backend context");
     let mgu = <MetalBackend as Backend>::from_slice(&gate_up);
     let mut mout = <MetalBackend as Backend>::alloc(tokens * im);
     <MetalBackend as Backend>::fused_gelu_tanh_mul_split(&mut mctx, &mgu, &mut mout, tokens, im);
     <MetalBackend as Backend>::sync(&mut mctx);
     let metal = <MetalBackend as Backend>::to_vec(&mout, tokens * im);
 
-    let mut cctx = <CpuBackend as Backend>::new_context();
+    let mut cctx =
+        <CpuBackend as Backend>::new_context(&Default::default()).expect("backend context");
     let cgu = <CpuBackend as Backend>::from_slice(&gate_up);
     let mut cout = <CpuBackend as Backend>::alloc(tokens * im);
     <CpuBackend as Backend>::fused_gelu_tanh_mul_split(&mut cctx, &cgu, &mut cout, tokens, im);
@@ -83,7 +85,8 @@ fn qk_norm_rope_head_dim_256_metal_matches_cpu() {
     let run_qk = |metal: bool| -> Vec<f32> {
         macro_rules! go {
             ($B:ty) => {{
-                let mut ctx = <$B as Backend>::new_context();
+                let mut ctx =
+                    <$B as Backend>::new_context(&Default::default()).expect("backend context");
                 let inp = <$B as Backend>::from_slice(&input);
                 let w = <$B as Backend>::from_slice(&norm_w);
                 let c = <$B as Backend>::from_slice(&cos);
@@ -117,7 +120,8 @@ fn transpose_head_to_token_gemma3_shape_matches_cpu() {
 
     macro_rules! go {
         ($B:ty) => {{
-            let mut ctx = <$B as Backend>::new_context();
+            let mut ctx =
+                <$B as Backend>::new_context(&Default::default()).expect("backend context");
             let inp = <$B as Backend>::from_slice(&input);
             let mut out = <$B as Backend>::alloc(tokens * heads * head_dim);
             <$B as Backend>::transpose_head_to_token(
@@ -146,7 +150,8 @@ fn sliding_window_prefill_seq_below_window_matches_cpu() {
     let run = |metal: bool, window: usize| -> Vec<f32> {
         macro_rules! go {
             ($B:ty) => {{
-                let mut ctx = <$B as Backend>::new_context();
+                let mut ctx =
+                    <$B as Backend>::new_context(&Default::default()).expect("backend context");
                 let qb = <$B as Backend>::from_slice(&q);
                 let kb = <$B as Backend>::from_slice(&k);
                 let vb = <$B as Backend>::from_slice(&v);
@@ -202,7 +207,8 @@ fn flash_attention_gemma3_shape_matches_cpu() {
     let run = |metal: bool, window: usize| -> Vec<f32> {
         macro_rules! go {
             ($B:ty) => {{
-                let mut ctx = <$B as Backend>::new_context();
+                let mut ctx =
+                    <$B as Backend>::new_context(&Default::default()).expect("backend context");
                 let qb = <$B as Backend>::from_slice(&q);
                 let kb = <$B as Backend>::from_slice(&k);
                 let vb = <$B as Backend>::from_slice(&v);

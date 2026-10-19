@@ -83,7 +83,7 @@ fn assert_complete_outputs<B: Backend + BackendQuantMarlin>(
     let bias_shape = [rows];
     let fixture = fixture(name, &[rows, cols], biased.then_some(&bias_shape), dtype);
     let loader = NativeSafetensorsLoader::<B>::open(fixture.directory.path()).unwrap();
-    let mut context = B::new_context();
+    let mut context = B::new_context(&Default::default()).expect("backend context");
     let linear = loader.load_linear(&mut context, name).unwrap();
     assert_eq!(linear.in_features(), cols);
     assert_eq!(linear.out_features(), rows);
@@ -105,7 +105,8 @@ fn assert_complete_outputs<B: Backend + BackendQuantMarlin>(
     } else {
         DenseLinear::<CpuBackend>::from_rows(&fixture.weight, rows, cols)
     };
-    let mut reference_context = CpuBackend::new_context();
+    let mut reference_context =
+        CpuBackend::new_context(&Default::default()).expect("backend context");
     let mut separate = vec![f32::NAN; batch * rows];
     reference.forward(
         &mut reference_context,
@@ -174,7 +175,10 @@ fn direct_bias_rejects_wrong_length_or_rank() {
             let fixture = fixture(name, &[3, 4], Some(&shape), Dtype::F32);
             let loader =
                 NativeSafetensorsLoader::<CpuBackend>::open(fixture.directory.path()).unwrap();
-            let error = match loader.load_linear(&mut (), name) {
+            let error = match loader.load_linear(
+                &mut ferrum_kernels::backend::cpu::CpuContext::default(),
+                name,
+            ) {
                 Ok(_) => panic!("accepted bias shape {shape:?} for [3, 4] weight"),
                 Err(error) => error,
             };
@@ -221,7 +225,10 @@ fn fused_bias_rejects_wrong_length_or_rank() {
         for shape in [&[3][..], &[1, 2][..]] {
             let directory = invalid_fused_bias_fixture(parts, shape);
             let loader = NativeSafetensorsLoader::<CpuBackend>::open(directory.path()).unwrap();
-            let error = match loader.load_linear(&mut (), name) {
+            let error = match loader.load_linear(
+                &mut ferrum_kernels::backend::cpu::CpuContext::default(),
+                name,
+            ) {
                 Ok(_) => panic!("accepted {name} with invalid split bias {shape:?}"),
                 Err(error) => error,
             };
@@ -236,7 +243,7 @@ fn fused_bias_rejects_wrong_length_or_rank() {
 fn cuda_invalid_fused_bias_does_not_enter_device_allocation() {
     use ferrum_kernels::backend::{cuda::CudaBackend, BackendCompletion, BackendGraph};
 
-    let mut context = CudaBackend::new_context();
+    let mut context = CudaBackend::new_context(&Default::default()).expect("backend context");
     CudaBackend::begin_execution(&mut context).unwrap();
     let mut capture_output = CudaBackend::alloc_in_context(&mut context, 1);
     CudaBackend::observe_completion(&mut context)
@@ -301,11 +308,11 @@ fn interleaved_instances_preserve_loaded_weights<B: Backend + BackendQuantMarlin
     let name = "model.layers.0.self_attn.o_proj";
     let first = fixture(name, &[3, 4], Some(&[3]), Dtype::F16);
     let second = fixture(name, &[3, 4], None, Dtype::BF16);
-    let mut first_context = B::new_context();
+    let mut first_context = B::new_context(&Default::default()).expect("backend context");
     let first_loader = NativeSafetensorsLoader::<B>::open(first.directory.path()).unwrap();
     let first_linear = first_loader.load_linear(&mut first_context, name).unwrap();
     drop(first_loader);
-    let mut second_context = B::new_context();
+    let mut second_context = B::new_context(&Default::default()).expect("backend context");
     let second_loader = NativeSafetensorsLoader::<B>::open(second.directory.path()).unwrap();
     let second_linear = second_loader
         .load_linear(&mut second_context, name)

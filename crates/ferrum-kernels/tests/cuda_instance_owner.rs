@@ -76,18 +76,49 @@ impl Projection {
     }
 }
 
+fn check_pool(context: &mut CudaState, expected_streams: usize, seed: f32) {
+    let original_stream = context.stream.cu_stream();
+    let pool = context.moe_stream_pool();
+    assert_eq!(pool.len(), expected_streams);
+    for (index, stream) in pool.iter().enumerate() {
+        assert_ne!(stream.cu_stream(), original_stream);
+        let expected: Vec<_> = (0..19)
+            .map(|i| seed + index as f32 + i as f32 * 0.25)
+            .collect();
+        let actual = stream.clone_htod(&expected).unwrap();
+        stream.synchronize().unwrap();
+        assert_eq!(stream.clone_dtoh(&actual).unwrap(), expected);
+    }
+}
+
 #[test]
 #[ignore = "requires a real CUDA device and actual graph capture/replay"]
 fn equal_graph_keys_remain_owned_across_peer_reset_and_retirement() {
     const KEY: u64 = 8;
-    let mut first = CudaBackend::new_context();
+    let mut first_config = ferrum_types::BackendContextConfig::default();
+    first_config.moe.moe_streams = 1;
+    let mut first = CudaBackend::new_context(&first_config).unwrap();
+    check_pool(&mut first, 1, 3.0);
+    // Later changes to the caller's configuration cannot mutate the owner.
+    first_config.moe.moe_streams = 7;
+    assert_eq!(CudaBackend::context_config(&first).moe.moe_streams, 1);
     CudaBackend::begin_execution(&mut first).unwrap();
     let mut a = Projection::new(&mut first, 2.0);
     complete(&mut first);
     a.capture(&mut first, KEY);
 
-    // Construct B only after A has installed its real executable.
-    let mut second = CudaBackend::new_context();
+    // Construct B with different upload/sync and physical stream policies only
+    // after A has installed its real executable. Both numerical paths execute.
+    let mut second_config = ferrum_types::BackendContextConfig::default();
+    second_config.cuda.graph_skip_upload = true;
+    second_config.cuda.graph_skip_sync = true;
+    second_config.moe.moe_streams = 3;
+    let mut second = CudaBackend::new_context(&second_config).unwrap();
+    check_pool(&mut second, 3, -4.0);
+    assert!(!CudaBackend::context_config(&first).cuda.graph_skip_upload);
+    assert!(!CudaBackend::context_config(&first).cuda.graph_skip_sync);
+    assert!(CudaBackend::context_config(&second).cuda.graph_skip_upload);
+    assert!(CudaBackend::context_config(&second).cuda.graph_skip_sync);
     assert_eq!(first.ordinal, second.ordinal);
     assert!(!first.stream.cu_stream().is_null());
     assert!(!second.stream.cu_stream().is_null());
@@ -121,6 +152,7 @@ fn equal_graph_keys_remain_owned_across_peer_reset_and_retirement() {
     CudaBackend::retire_context(&mut second).unwrap();
     drop(b);
     drop(second);
+    check_pool(&mut first, 1, 11.0);
     a.replay_and_check(&mut first, KEY);
     CudaBackend::retire_context(&mut first).unwrap();
     drop(a);
@@ -184,8 +216,10 @@ fn check_cache(context: &mut CudaState, cache: &KvCache<CudaBackend>, seed: f32)
 #[test]
 #[ignore = "requires a real CUDA device and asynchronous multi-head KV growth"]
 fn contiguous_kv_growth_keeps_each_instances_original_rows() {
-    let mut first = CudaBackend::new_context();
-    let mut second = CudaBackend::new_context();
+    let mut first =
+        CudaBackend::new_context(&ferrum_types::BackendContextConfig::default()).unwrap();
+    let mut second =
+        CudaBackend::new_context(&ferrum_types::BackendContextConfig::default()).unwrap();
     assert_eq!(first.ordinal, second.ordinal);
     assert_ne!(first.stream.cu_stream(), second.stream.cu_stream());
     CudaBackend::begin_execution(&mut first).unwrap();

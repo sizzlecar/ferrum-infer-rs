@@ -13,7 +13,7 @@
 use cudarc::driver::{CudaSlice, CudaStream, DevicePtr, DevicePtrMut};
 use ferrum_types::{FerrumError, Result, CUDA_NATIVE_ADAPTIVE_V1_MAX_SEQUENCE_TOKENS};
 use half::f16;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 pub(crate) const VNEXT_VLLM_BLOCK_TOKENS: u64 = 16;
 pub(crate) const VNEXT_VLLM_PARTITION_TOKENS: u64 = CUDA_NATIVE_ADAPTIVE_V1_MAX_SEQUENCE_TOKENS;
@@ -1015,41 +1015,6 @@ struct PagedAttnCapacity {
     head_dim: usize,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct VllmPagedAttnRuntimeConfig {
-    v1_short: bool,
-}
-
-impl VllmPagedAttnRuntimeConfig {
-    fn from_env() -> Self {
-        Self::from_env_vars(std::env::vars())
-    }
-
-    fn from_env_vars<I, K, V>(vars: I) -> Self
-    where
-        I: IntoIterator<Item = (K, V)>,
-        K: AsRef<str>,
-        V: AsRef<str>,
-    {
-        let mut config = Self { v1_short: true };
-        for (name, value) in vars {
-            if name.as_ref() == "FERRUM_VLLM_PAGED_ATTN_V1_SHORT" {
-                config.v1_short = value.as_ref() != "0";
-            }
-        }
-        config
-    }
-}
-
-fn vllm_paged_attn_runtime_config() -> &'static VllmPagedAttnRuntimeConfig {
-    static CONFIG: OnceLock<VllmPagedAttnRuntimeConfig> = OnceLock::new();
-    CONFIG.get_or_init(VllmPagedAttnRuntimeConfig::from_env)
-}
-
-fn pa_v1_short_enabled() -> bool {
-    vllm_paged_attn_runtime_config().v1_short
-}
-
 fn ensure_pa_scratch(
     ctx: &mut super::CudaState,
     num_seqs: usize,
@@ -1139,7 +1104,8 @@ pub fn dispatch_paged_attention_v2(
     let scale = 1.0_f32 / (head_dim as f32).sqrt();
     let raw_stream = stream.cu_stream() as *mut std::ffi::c_void;
 
-    let use_v1_short = max_seq_len <= PARTITION_SIZE && pa_v1_short_enabled();
+    let use_v1_short =
+        max_seq_len <= PARTITION_SIZE && ctx.configuration.cuda.vllm_paged_attn_v1_short;
     if use_v1_short {
         unsafe {
             let (out_dp, _o_recs) = out.device_ptr_mut(stream);
@@ -1267,20 +1233,7 @@ pub fn dispatch_paged_attention_v2(
 
 #[cfg(test)]
 mod tests {
-    use super::{VllmPagedAttnRuntimeConfig, VnextAddressedPagedAttentionKernel};
-
-    #[test]
-    fn vllm_paged_attn_runtime_config_defaults_short_v1_on() {
-        let config = VllmPagedAttnRuntimeConfig::from_env_vars(std::iter::empty::<(&str, &str)>());
-        assert!(config.v1_short);
-    }
-
-    #[test]
-    fn vllm_paged_attn_runtime_config_parses_short_v1_opt_out() {
-        let config =
-            VllmPagedAttnRuntimeConfig::from_env_vars([("FERRUM_VLLM_PAGED_ATTN_V1_SHORT", "0")]);
-        assert!(!config.v1_short);
-    }
+    use super::VnextAddressedPagedAttentionKernel;
 
     #[test]
     fn vnext_addressed_dispatch_is_typed_and_env_independent() {

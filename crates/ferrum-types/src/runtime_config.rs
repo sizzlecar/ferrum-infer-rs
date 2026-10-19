@@ -27,6 +27,9 @@ impl RuntimeConfigSnapshot {
                 "FERRUM_SPEC_DRAFT" | "FERRUM_SPEC_N" => Some(
                     "speculative decoding has been retired; remove this option",
                 ),
+                "FERRUM_METAL_CAPTURE" => Some(
+                    "process-global Metal frame capture has been retired; use an explicit standalone GPU capture diagnostic",
+                ),
                 "FERRUM_PROFILE_COMMIT_SHA" | "FERRUM_PROFILE_ENV_HASH"
                 | "FERRUM_PROFILE_MODEL" | "FERRUM_PROFILE_CONCURRENCY"
                 | "FERRUM_PROFILE_RUNTIME_FLAGS_JSON" => Some(
@@ -564,6 +567,7 @@ mod retired_profiler_tests {
     #[test]
     fn retired_global_profile_controls_reject_even_disabled_values() {
         for key in [
+            "FERRUM_METAL_CAPTURE",
             "FERRUM_GRAPH_PROF",
             "FERRUM_MOE_DUMP",
             "FERRUM_MOE_DUMP_BATCH_X_TOPK",

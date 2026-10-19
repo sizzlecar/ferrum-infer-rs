@@ -47,8 +47,16 @@ fn from_dense_stacks_builds_correct_linear_count() {
     let up = vec![0.6_f32; n_experts * ffn * hidden];
     let down = vec![0.7_f32; n_experts * hidden * ffn];
 
-    let stack: ExpertStack<CpuBackend> =
-        ExpertStack::from_dense_stacks(&gate, &up, &down, n_experts, hidden, ffn).unwrap();
+    let stack: ExpertStack<CpuBackend> = ExpertStack::from_dense_stacks(
+        &mut CpuBackend::new_context(&ferrum_types::BackendContextConfig::default()).unwrap(),
+        &gate,
+        &up,
+        &down,
+        n_experts,
+        hidden,
+        ffn,
+    )
+    .unwrap();
     assert_eq!(stack.num_experts(), n_experts);
     for e in 0..n_experts {
         // gate_up Linear: out=2*ffn, in=hidden
@@ -68,7 +76,13 @@ fn from_dense_stacks_rejects_size_mismatch() {
     let good = vec![0.0_f32; n_experts * ffn * hidden];
     let bad_short = vec![0.0_f32; 4]; // wrong size
     let result = ExpertStack::<CpuBackend>::from_dense_stacks(
-        &bad_short, &good, &good, n_experts, hidden, ffn,
+        &mut CpuBackend::new_context(&ferrum_types::BackendContextConfig::default()).unwrap(),
+        &bad_short,
+        &good,
+        &good,
+        n_experts,
+        hidden,
+        ffn,
     );
     assert!(result.is_err());
     let err = result.err().unwrap().to_string();
@@ -97,9 +111,16 @@ fn moe_forward_single_expert_gives_that_experts_output() {
     up.extend_from_slice(&scaled_identity_rows(2, 2.0));
     down.extend_from_slice(&scaled_identity_rows(2, 2.0));
 
-    let stack =
-        ExpertStack::<CpuBackend>::from_dense_stacks(&gate, &up, &down, n_experts, hidden, ffn)
-            .unwrap();
+    let stack = ExpertStack::<CpuBackend>::from_dense_stacks(
+        &mut CpuBackend::new_context(&ferrum_types::BackendContextConfig::default()).unwrap(),
+        &gate,
+        &up,
+        &down,
+        n_experts,
+        hidden,
+        ffn,
+    )
+    .unwrap();
 
     let x = vec![1.0_f32, 0.0];
     let router = RouterOutput {
@@ -142,9 +163,16 @@ fn moe_forward_two_experts_combines_weighted() {
     up.extend_from_slice(&scaled_identity_rows(2, 2.0));
     down.extend_from_slice(&scaled_identity_rows(2, 2.0));
 
-    let stack =
-        ExpertStack::<CpuBackend>::from_dense_stacks(&gate, &up, &down, n_experts, hidden, ffn)
-            .unwrap();
+    let stack = ExpertStack::<CpuBackend>::from_dense_stacks(
+        &mut CpuBackend::new_context(&ferrum_types::BackendContextConfig::default()).unwrap(),
+        &gate,
+        &up,
+        &down,
+        n_experts,
+        hidden,
+        ffn,
+    )
+    .unwrap();
 
     let x = vec![1.0_f32, 0.0];
     let router = RouterOutput {
@@ -186,9 +214,16 @@ fn moe_forward_handles_batch_with_independent_routing() {
     up.extend_from_slice(&scaled_identity_rows(2, 2.0));
     down.extend_from_slice(&scaled_identity_rows(2, 2.0));
 
-    let stack =
-        ExpertStack::<CpuBackend>::from_dense_stacks(&gate, &up, &down, n_experts, hidden, ffn)
-            .unwrap();
+    let stack = ExpertStack::<CpuBackend>::from_dense_stacks(
+        &mut CpuBackend::new_context(&ferrum_types::BackendContextConfig::default()).unwrap(),
+        &gate,
+        &up,
+        &down,
+        n_experts,
+        hidden,
+        ffn,
+    )
+    .unwrap();
 
     // Token 0: x=[1, 0]; Token 1: x=[1, 0] (same input, different expert)
     let x = vec![1.0_f32, 0.0, 1.0, 0.0];
@@ -215,7 +250,13 @@ fn moe_forward_rejects_invalid_expert_id() {
 
     let zeros = vec![0.0_f32; n_experts * ffn * hidden];
     let stack = ExpertStack::<CpuBackend>::from_dense_stacks(
-        &zeros, &zeros, &zeros, n_experts, hidden, ffn,
+        &mut CpuBackend::new_context(&ferrum_types::BackendContextConfig::default()).unwrap(),
+        &zeros,
+        &zeros,
+        &zeros,
+        n_experts,
+        hidden,
+        ffn,
     )
     .unwrap();
 
@@ -238,7 +279,13 @@ fn moe_forward_rejects_shape_mismatch() {
     let n_experts = 2;
     let zeros = vec![0.0_f32; n_experts * ffn * hidden];
     let stack = ExpertStack::<CpuBackend>::from_dense_stacks(
-        &zeros, &zeros, &zeros, n_experts, hidden, ffn,
+        &mut CpuBackend::new_context(&ferrum_types::BackendContextConfig::default()).unwrap(),
+        &zeros,
+        &zeros,
+        &zeros,
+        n_experts,
+        hidden,
+        ffn,
     )
     .unwrap();
 
@@ -267,9 +314,16 @@ fn router_plus_dispatch_end_to_end_softmax_to_combine() {
     let gate = [&weights[..], &weights[..]].concat();
     let up = gate.clone();
     let down = gate.clone();
-    let stack =
-        ExpertStack::<CpuBackend>::from_dense_stacks(&gate, &up, &down, n_experts, hidden, ffn)
-            .unwrap();
+    let stack = ExpertStack::<CpuBackend>::from_dense_stacks(
+        &mut CpuBackend::new_context(&ferrum_types::BackendContextConfig::default()).unwrap(),
+        &gate,
+        &up,
+        &down,
+        n_experts,
+        hidden,
+        ffn,
+    )
+    .unwrap();
 
     // Router logits favour expert 0 strongly.
     let logits = vec![5.0_f32, 0.0];
@@ -331,8 +385,15 @@ fn expert_stack_loads_from_synthesized_gguf() {
     let ffn = 6;
     let tmp = build_minimal_moe_gguf(n_experts, hidden, ffn);
 
-    let stack: ExpertStack<CpuBackend> =
-        ExpertStack::open_and_load(tmp.path(), 0, n_experts, hidden, ffn).unwrap();
+    let stack: ExpertStack<CpuBackend> = ExpertStack::open_and_load(
+        &mut CpuBackend::new_context(&ferrum_types::BackendContextConfig::default()).unwrap(),
+        tmp.path(),
+        0,
+        n_experts,
+        hidden,
+        ffn,
+    )
+    .unwrap();
 
     assert_eq!(stack.num_experts(), n_experts);
     for e in 0..n_experts {
@@ -355,8 +416,15 @@ fn full_pipeline_synthesized_gguf_router_dispatch() {
     let top_k = 2;
 
     let tmp = build_minimal_moe_gguf(n_experts, hidden, ffn);
-    let stack: ExpertStack<CpuBackend> =
-        ExpertStack::open_and_load(tmp.path(), 0, n_experts, hidden, ffn).unwrap();
+    let stack: ExpertStack<CpuBackend> = ExpertStack::open_and_load(
+        &mut CpuBackend::new_context(&ferrum_types::BackendContextConfig::default()).unwrap(),
+        tmp.path(),
+        0,
+        n_experts,
+        hidden,
+        ffn,
+    )
+    .unwrap();
 
     // Random-ish logits; route with norm.
     let logits = vec![0.1_f32, 1.5, -0.3, 0.8];
@@ -401,7 +469,15 @@ fn top_k_one_with_strong_router_picks_dominant_expert() {
     .unwrap();
     file.flush().unwrap();
     let gguf = GgufFile::open(file.path()).unwrap();
-    let experts = ExpertStack::<CpuBackend>::load_from_gguf(&gguf, 0, 2, 2, 2).unwrap();
+    let experts = ExpertStack::<CpuBackend>::load_from_gguf(
+        &mut CpuBackend::new_context(&ferrum_types::BackendContextConfig::default()).unwrap(),
+        &gguf,
+        0,
+        2,
+        2,
+        2,
+    )
+    .unwrap();
     let router_weights = gguf
         .read_tensor("blk.0.ffn_gate_inp.weight", &Device::Cpu)
         .unwrap()
@@ -414,7 +490,7 @@ fn top_k_one_with_strong_router_picks_dominant_expert() {
     let input = vec![1.0, 0.0];
     let mut logits = vec![f32::NAN; 2];
     CpuBackend::gemm(
-        &mut CpuBackend::new_context(),
+        &mut CpuBackend::new_context(&ferrum_types::BackendContextConfig::default()).unwrap(),
         &input,
         &router_weights,
         &mut logits,

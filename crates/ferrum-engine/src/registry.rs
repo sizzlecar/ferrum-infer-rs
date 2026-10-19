@@ -941,10 +941,10 @@ where
     ferrum_models::models::LlamaFamilyModel<B, K>: ferrum_models::common::DecoderOnlyLLM,
     ferrum_models::models::LlamaFamilyPipelineModel<B, K>: ferrum_models::common::DecoderOnlyLLM,
 {
-    if llama_layer_split_plan.is_some() && !B::supports_device_ordinal_scope() {
+    if llama_layer_split_plan.is_some() && !B::supports_device_ordinal() {
         return Err(FerrumError::unsupported(
             "selected_distributed_strategy=layer_split requires a backend with \
-             device-scoped execution; refusing to silently use the default device",
+             explicit device ordinals; refusing to silently use the default device",
         ));
     }
     execution.validate().map_err(FerrumError::config)?;
@@ -969,14 +969,15 @@ where
                 "Loading Llama layer_split stage {idx} on backend device {:?}",
                 device_ordinal
             );
-            let stage = B::with_device_ordinal(device_ordinal, || {
-                ferrum_models::models::LlamaFamilyModel::<B, K>::new_layer_stage_with_execution_config(
-                    qcfg.clone(),
-                    &weight_loader,
-                    stage_config,
-                    execution.clone(),
-                )
-            })?;
+            let mut stage_execution = execution.clone();
+            stage_execution.backend_context.device_ordinal =
+                device_ordinal.expect("layer-split stages have explicit placement");
+            let stage = ferrum_models::models::LlamaFamilyModel::<B, K>::new_layer_stage_with_execution_config(
+                qcfg.clone(),
+                &weight_loader,
+                stage_config,
+                stage_execution,
+            )?;
             stages.push(stage);
         }
         Ok(Box::new(ferrum_models::models::LlamaFamilyPipelineModel::<
@@ -1627,7 +1628,10 @@ impl ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>> for LlmExecutorFacto
 
         // Freeze both model and loader options once, before any legacy weight
         // loading. Every stage receives this same instance value.
-        let legacy_execution = config.engine_config.llama_execution_config();
+        let mut legacy_execution = config.engine_config.llama_execution_config();
+        if let Device::CUDA(ordinal) | Device::ROCm(ordinal) = &config.device {
+            legacy_execution.backend_context.device_ordinal = *ordinal;
+        }
         let loader_options = ferrum_quantization::NativeSafetensorsLoadOptions {
             gptq_gidx_trace: config.engine_config.runtime.gptq_gidx_trace,
         };
@@ -1693,7 +1697,7 @@ impl ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>> for LlmExecutorFacto
                 // pre-Architecture-v2 CandleBackend and hasn't been ported
                 // to the Backend<B> trait stack. Reject explicitly so users
                 // don't get a silent single-GPU fallback.
-                let tp_size = config.engine_config.runtime.tp.unwrap_or(0);
+                let tp_size = legacy_execution.backend_context.collective.world_size;
                 if tp_size > 1 {
                     return Err(FerrumError::unsupported(
                         "FERRUM_TP>1 not supported on the Backend<B> path. \
@@ -1766,15 +1770,12 @@ impl ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>> for LlmExecutorFacto
                         (Device::Metal, KvCacheDtype::Fp16) => {
                             #[cfg(feature = "metal")]
                             {
-                                // FERRUM_METAL_DTYPE=f16 toggles fp16 weight storage
-                                // inside MetalBackend. Halves big-tensor RAM;
-                                // recommended for 4B+ models on 16 GB Macs.
-                                let dtype_hint = config
-                                    .engine_config
-                                    .runtime
-                                    .metal_dtype
-                                    .as_deref()
-                                    .unwrap_or("f32");
+                                let dtype_hint =
+                                    if legacy_execution.backend_context.metal.prefer_f16_weights {
+                                        "f16"
+                                    } else {
+                                        "f32"
+                                    };
                                 info!("  Backend: Metal (weights {}), KV: fp16", dtype_hint);
                                 build_llm::<ferrum_kernels::backend::metal::MetalBackend, KvFp16>(
                                     qcfg,
@@ -3382,7 +3383,7 @@ pub(crate) mod tests {
             Err(err) => err.to_string(),
         };
 
-        assert!(err.contains("device-scoped execution"));
+        assert!(err.contains("explicit device ordinals"));
         assert!(err.contains("refusing to silently use the default device"));
     }
 

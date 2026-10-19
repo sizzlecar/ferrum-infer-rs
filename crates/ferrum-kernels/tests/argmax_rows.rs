@@ -11,7 +11,7 @@ use half::f16;
 
 #[test]
 fn argmax_rows_f16_masked_skips_invalid_tokens() {
-    let mut ctx = CudaBackend::new_context();
+    let mut ctx = CudaBackend::new_context(&ferrum_types::BackendContextConfig::default()).unwrap();
     let logits = vec![
         f16::from_f32(1.0),
         f16::from_f32(9.0),
@@ -36,7 +36,7 @@ fn argmax_rows_f16_masked_skips_invalid_tokens() {
 
 #[test]
 fn argmax_rows_f16_masked_returns_sentinel_without_finite_valid_token() {
-    let mut ctx = CudaBackend::new_context();
+    let mut ctx = CudaBackend::new_context(&ferrum_types::BackendContextConfig::default()).unwrap();
     let logits = vec![
         f16::from_f32(9.0),
         f16::from_f32(f32::NAN),
@@ -54,7 +54,7 @@ fn argmax_rows_f16_masked_returns_sentinel_without_finite_valid_token() {
 
 #[test]
 fn argmax_rows_f16_sparse_repetition_penalty_selects_after_penalty() {
-    let mut ctx = CudaBackend::new_context();
+    let mut ctx = CudaBackend::new_context(&ferrum_types::BackendContextConfig::default()).unwrap();
     let mut logits_dev = CudaBackend::from_slice_typed_in_context::<f16>(
         &mut ctx,
         &[
@@ -94,7 +94,7 @@ fn argmax_rows_f16_sparse_repetition_penalty_selects_after_penalty() {
 
 #[test]
 fn argmax_rows_f16_sparse_repetition_penalty_respects_mask() {
-    let mut ctx = CudaBackend::new_context();
+    let mut ctx = CudaBackend::new_context(&ferrum_types::BackendContextConfig::default()).unwrap();
     let mut logits_dev = CudaBackend::from_slice_typed_in_context::<f16>(
         &mut ctx,
         &[

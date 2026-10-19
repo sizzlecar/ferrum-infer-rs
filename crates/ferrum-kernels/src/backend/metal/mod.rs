@@ -8,8 +8,8 @@
 //! The default policy:
 //!   - Activations (`alloc`, `from_slice`, scratch) are F32 — precision-
 //!     sensitive paths (norm / rope / attention) stay unchanged.
-//!   - Weights loaded via `from_weight_bytes` go F16 for tensors past a
-//!     size threshold when `FERRUM_METAL_DTYPE=f16` is set; otherwise
+//!   - Weights loaded through the original context go F16 for tensors past a
+//!     size threshold when its typed weight policy selects F16; otherwise
 //!     they stay F32.
 //!
 //! The same shape generalises: an INT8 / GPTQ variant would add another
@@ -40,6 +40,8 @@ pub mod vnext_runtime;
 
 #[cfg(test)]
 mod copy_slice_tests;
+#[cfg(test)]
+mod instance_config_tests;
 
 // GGUF k-quant kernels (Audit #9 moved here from kernels-crate top level).
 // Re-exported via `pub use backend::metal::{...}` in `crate::lib` so the
@@ -77,7 +79,7 @@ pub use quant::{
 use super::{AttnConfig, Backend, SrcDtype};
 use crate::attention::metal::pipelines::MetalPipelines;
 use crate::attention::AttentionParams;
-use ferrum_types::{FerrumError, Result};
+use ferrum_types::{BackendContextConfig, FerrumError, MetalBackendConfig, Result};
 use half::{bf16, f16};
 use metal::{Device, MTLResourceOptions, MTLSize};
 use std::ffi::c_void;
@@ -153,48 +155,14 @@ pub(crate) struct MetalState {
     /// Per-weight leases, rather than this registry, own each live mapping.
     mmaps: Mutex<Vec<Weak<MetalMmapEntry>>>,
 }
+// Resource sharing remains explicit: the device/queue, immutable pipelines and
+// weak mmap index are still shared. Execution policy is never stored here.
 static METAL_STATE: OnceLock<MetalState> = OnceLock::new();
 pub(crate) fn st() -> &'static MetalState {
     METAL_STATE.get_or_init(|| MetalState {
         pipes: MetalPipelines::new(&Device::system_default().unwrap()),
         mmaps: Mutex::new(Vec::new()),
     })
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct MetalRuntimeConfig {
-    mmap_trace: bool,
-    capture_path: Option<String>,
-    mtl_capture_enabled: bool,
-    prefer_f16_weights: bool,
-}
-
-fn metal_runtime_config() -> &'static MetalRuntimeConfig {
-    static CONFIG: OnceLock<MetalRuntimeConfig> = OnceLock::new();
-    CONFIG.get_or_init(|| {
-        let mut config = MetalRuntimeConfig {
-            mmap_trace: false,
-            capture_path: None,
-            mtl_capture_enabled: false,
-            prefer_f16_weights: false,
-        };
-        for (name, value) in std::env::vars() {
-            match name.as_str() {
-                "FERRUM_MMAP_TRACE" => config.mmap_trace = true,
-                "FERRUM_METAL_CAPTURE" => config.capture_path = Some(value),
-                "FERRUM_METAL_DTYPE" => {
-                    config.prefer_f16_weights = value.eq_ignore_ascii_case("f16")
-                }
-                "MTL_CAPTURE_ENABLED" => config.mtl_capture_enabled = true,
-                _ => {}
-            }
-        }
-        config
-    })
-}
-
-pub(crate) fn metal_mmap_trace_enabled() -> bool {
-    metal_runtime_config().mmap_trace
 }
 
 /// Register a host-memory region (typically the full mmap of a GGUF file)
@@ -217,10 +185,12 @@ pub(crate) fn metal_mmap_trace_enabled() -> bool {
 /// length so that's harmless.
 ///
 /// Returns a construction handle on success. Duplicate registration of the
-/// same live mapping shares the existing entry.
+/// same live mapping shares the existing entry. Diagnostics use the caller's
+/// explicit options even when another instance registered that mapping first.
 pub fn register_gguf_mmap(
     slice: &[u8],
     keeper: Arc<dyn std::any::Any + Send + Sync>,
+    options: &MetalBackendConfig,
 ) -> Result<MetalMmapRegistration> {
     const PAGE: usize = 16384;
     let base_addr = slice.as_ptr() as usize;
@@ -229,7 +199,7 @@ pub fn register_gguf_mmap(
             "register_gguf_mmap: base pointer 0x{base_addr:x} not page-aligned (need {PAGE})"
         )));
     }
-    let trace = metal_mmap_trace_enabled();
+    let trace = options.mmap_trace;
     if trace {
         eprintln!(
             "[mmap] register file at 0x{base_addr:x} len={} ({:.2} GB)",
@@ -343,57 +313,6 @@ mod mmap_lifetime_tests {
     }
 }
 
-// ── Frame capture ─────────────────────────────────────────────────────
-
-/// Begin a Metal frame capture if `FERRUM_METAL_CAPTURE` is set to an
-/// output path. The result is a `.gputrace` file you can open in Xcode
-/// to view per-kernel GPU timing, occupancy, instruction counts, etc.
-///
-/// Requirements:
-///   - The process must have been launched with `MTL_CAPTURE_ENABLED=1`
-///     in its environment (Metal silently rejects capture otherwise).
-///   - The output path must not exist already.
-///
-/// Returns `true` if a capture started, `false` if no env var set or
-/// capture failed (in which case stderr explains).
-pub fn maybe_begin_frame_capture() -> bool {
-    use metal::{CaptureDescriptor, CaptureManager, MTLCaptureDestination};
-    let Some(out_path) = metal_runtime_config().capture_path.as_deref() else {
-        return false;
-    };
-    if !metal_runtime_config().mtl_capture_enabled {
-        eprintln!(
-            "[capture] FERRUM_METAL_CAPTURE set but MTL_CAPTURE_ENABLED is not — Metal will reject. Re-launch with MTL_CAPTURE_ENABLED=1."
-        );
-        return false;
-    }
-    let mgr = CaptureManager::shared();
-    if !mgr.supports_destination(MTLCaptureDestination::GpuTraceDocument) {
-        eprintln!("[capture] device does not support GpuTraceDocument");
-        return false;
-    }
-    let desc = CaptureDescriptor::new();
-    desc.set_capture_device(&st().pipes.device);
-    desc.set_destination(MTLCaptureDestination::GpuTraceDocument);
-    desc.set_output_url(&out_path);
-    match mgr.start_capture(&desc) {
-        Ok(()) => {
-            eprintln!("[capture] started → {out_path}");
-            true
-        }
-        Err(e) => {
-            eprintln!("[capture] start_capture failed: {e}");
-            false
-        }
-    }
-}
-
-/// Stop the active frame capture and flush the `.gputrace` to disk.
-pub fn end_frame_capture() {
-    metal::CaptureManager::shared().stop_capture();
-    eprintln!("[capture] stopped — open .gputrace in Xcode");
-}
-
 // ── Dtype tag + tagged buffer ─────────────────────────────────────────
 
 /// Element storage type for a [`MetalBuf`]. Same shape generalises to INT8
@@ -464,8 +383,12 @@ unsafe impl Sync for MetalBuf {}
 
 /// Metal context — one in-flight command buffer that accumulates encodes
 /// across multiple `Backend` method calls. `sync()` commits + waits and
-/// drops the handle so the next call creates a fresh buffer.
+/// drops the handle so the next call creates a fresh buffer. Its policy is
+/// immutable; the underlying device and queue still belong to shared `st()`.
 pub struct MetalContext {
+    config: BackendContextConfig,
+    #[cfg(test)]
+    last_attention_kernel: Option<crate::attention::metal::pipelines::MetalAttentionKernel>,
     // Own the Objective-C objects. The command queue's lifetime does not make
     // an autoreleased command buffer or encoder a Rust 'static reference.
     cmd: Option<metal::CommandBuffer>,
@@ -697,7 +620,8 @@ mod checked_sync_tests {
     #[ignore = "requires an actual Metal device"]
     fn owned_command_buffer_survives_context_transfer_and_is_not_resubmitted() {
         let mut buffer = MetalBackend::from_slice(&[1.0, -2.0, 3.0, -4.0]);
-        let mut ctx = MetalBackend::new_context();
+        let mut ctx =
+            MetalBackend::new_context(&BackendContextConfig::default()).expect("Metal context");
         MetalBackend::scale_inplace(&mut ctx, &mut buffer, 2.0, 4);
         let original = &**ctx.cmd.as_ref().expect("actual encoded command")
             as *const metal::CommandBufferRef as usize;
@@ -722,6 +646,8 @@ mod checked_sync_tests {
     #[test]
     fn missing_submission_is_not_success() {
         let mut ctx = MetalContext {
+            config: BackendContextConfig::default(),
+            last_attention_kernel: None,
             cmd: None,
             encoder: None,
             submitted: None,
@@ -742,15 +668,8 @@ impl Drop for MetalContext {
     }
 }
 
-// ── Policy: should big weights land as f16? ───────────────────────────
-// Cached on first read so each tensor load doesn't re-parse env.
-
-fn prefer_f16_weights() -> bool {
-    metal_runtime_config().prefer_f16_weights
-}
-
 /// Element-count threshold above which a weight tensor goes to F16 storage
-/// (when `FERRUM_METAL_DTYPE=f16`). Tiny tensors (norm weights, biases) stay
+/// (when the context selects F16 weights). Tiny tensors (norm weights, biases) stay
 /// F32 so the existing f32 shaders continue to see f32 inputs.
 ///
 /// 1M elements = 4 MB as f32 / 2 MB as f16. Anything smaller saves little
@@ -814,13 +733,26 @@ impl Backend for MetalBackend {
     // GPTQ path (GGUF is the quant story on Metal). Adding GPTQ later
     // means impl-ing MarlinExpertStack<MetalBackend> + load_gptq_stacked.
 
-    fn new_context() -> Self::Context {
-        MetalContext {
+    fn new_context(config: &BackendContextConfig) -> Result<Self::Context> {
+        config.validate()?;
+        if config.device_ordinal != 0 {
+            return Err(FerrumError::unsupported(
+                "Metal's shared device boundary does not support device ordinal selection",
+            ));
+        }
+        Ok(MetalContext {
+            config: config.clone(),
+            #[cfg(test)]
+            last_attention_kernel: None,
             cmd: None,
             encoder: None,
             submitted: None,
             last_completion: None,
-        }
+        })
+    }
+
+    fn context_config(ctx: &Self::Context) -> &BackendContextConfig {
+        &ctx.config
     }
     fn sync(ctx: &mut Self::Context) {
         ctx.flush();
@@ -1029,9 +961,17 @@ impl Backend for MetalBackend {
         // the sticky one first so we don't have two open at once on the
         // same cmd buffer.
         ctx.compute_encoder_end();
+        let options = ctx.config.metal.clone();
         let cmd = ctx.cmd();
-        st().pipes
-            .flash_attn_v2(cmd, q, k, v, out, &p, cfg.kv_seq_stride);
+        let kernel = st()
+            .pipes
+            .flash_attn_v2(cmd, q, k, v, out, &p, cfg.kv_seq_stride, &options);
+        #[cfg(test)]
+        {
+            ctx.last_attention_kernel = Some(kernel);
+        }
+        #[cfg(not(test))]
+        let _ = kernel;
     }
 
     fn copy_slice(
@@ -1517,54 +1457,72 @@ impl Backend for MetalBackend {
         }
     }
 
+    /// Context-free compatibility construction uses the fixed F32 default.
+    /// Model weight loading uses `from_weight_bytes_in_context` below.
     fn from_weight_bytes(raw: &[u8], src_dtype: SrcDtype) -> Self::Buffer {
-        let n = raw.len() / src_dtype.bytes_per_elem();
-        let want_f16 = prefer_f16_weights() && n >= F16_MIN_ELEMS;
+        weight_bytes_with_options(raw, src_dtype, &MetalBackendConfig::default())
+    }
 
-        if !want_f16 {
-            // Default behaviour: materialise as f32, matches pre-refactor
-            // MetalBackend byte-for-byte.
-            let data = src_dtype.to_f32_vec(raw);
-            return MetalBuf {
-                raw: buffer_from_f32_slice(&data),
-                dtype: Dtype::F32,
-                n,
-            };
-        }
+    fn from_weight_bytes_in_context(
+        ctx: &mut Self::Context,
+        raw: &[u8],
+        src_dtype: SrcDtype,
+    ) -> Self::Buffer {
+        weight_bytes_with_options(raw, src_dtype, &ctx.config.metal)
+    }
+}
 
-        // f16 storage path — go directly from raw bytes where possible to
-        // avoid the transient 2× RAM spike.
-        match src_dtype {
-            SrcDtype::F16 => MetalBuf {
-                raw: buffer_from_f16_bytes(raw),
+fn weight_bytes_with_options(
+    raw: &[u8],
+    src_dtype: SrcDtype,
+    options: &MetalBackendConfig,
+) -> MetalBuf {
+    let n = raw.len() / src_dtype.bytes_per_elem();
+    let want_f16 = options.prefer_f16_weights && n >= F16_MIN_ELEMS;
+
+    if !want_f16 {
+        // Default behaviour: materialise as f32, matches pre-refactor
+        // MetalBackend byte-for-byte.
+        let data = src_dtype.to_f32_vec(raw);
+        return MetalBuf {
+            raw: buffer_from_f32_slice(&data),
+            dtype: Dtype::F32,
+            n,
+        };
+    }
+
+    // f16 storage path — go directly from raw bytes where possible to
+    // avoid the transient 2× RAM spike.
+    match src_dtype {
+        SrcDtype::F16 => MetalBuf {
+            raw: buffer_from_f16_bytes(raw),
+            dtype: Dtype::F16,
+            n,
+        },
+        SrcDtype::BF16 => {
+            // bf16 → f16 via f32. Loses magnitude range (bf16 has a
+            // broader exponent) but gains mantissa precision, which for
+            // typical weight magnitudes (|w| < 32) is a net upgrade.
+            let mut f16_bytes = vec![0u8; n * 2];
+            for i in 0..n {
+                let v = bf16::from_le_bytes([raw[i * 2], raw[i * 2 + 1]]).to_f32();
+                let h = f16::from_f32(v).to_le_bytes();
+                f16_bytes[i * 2] = h[0];
+                f16_bytes[i * 2 + 1] = h[1];
+            }
+            MetalBuf {
+                raw: buffer_from_f16_bytes(&f16_bytes),
                 dtype: Dtype::F16,
                 n,
-            },
-            SrcDtype::BF16 => {
-                // bf16 → f16 via f32. Loses magnitude range (bf16 has a
-                // broader exponent) but gains mantissa precision, which for
-                // typical weight magnitudes (|w| < 32) is a net upgrade.
-                let mut f16_bytes = vec![0u8; n * 2];
-                for i in 0..n {
-                    let v = bf16::from_le_bytes([raw[i * 2], raw[i * 2 + 1]]).to_f32();
-                    let h = f16::from_f32(v).to_le_bytes();
-                    f16_bytes[i * 2] = h[0];
-                    f16_bytes[i * 2 + 1] = h[1];
-                }
-                MetalBuf {
-                    raw: buffer_from_f16_bytes(&f16_bytes),
-                    dtype: Dtype::F16,
-                    n,
-                }
             }
-            SrcDtype::F32 => {
-                // f32 → f16 downcast. Halves storage.
-                let data = src_dtype.to_f32_vec(raw);
-                MetalBuf {
-                    raw: buffer_f16_from_f32(&data),
-                    dtype: Dtype::F16,
-                    n,
-                }
+        }
+        SrcDtype::F32 => {
+            // f32 → f16 downcast. Halves storage.
+            let data = src_dtype.to_f32_vec(raw);
+            MetalBuf {
+                raw: buffer_f16_from_f32(&data),
+                dtype: Dtype::F16,
+                n,
             }
         }
     }

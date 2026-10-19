@@ -66,7 +66,8 @@ fn recurrent_gated_delta_rule_cuda_matches_cpu_reference() {
     let out_len = tokens * value_heads * value_dim;
     let state_len = value_heads * value_dim * key_dim;
 
-    let mut cpu_ctx = CpuBackend::new_context();
+    let mut cpu_ctx =
+        CpuBackend::new_context(&ferrum_types::BackendContextConfig::default()).unwrap();
     let mut expected_out = vec![0.0; out_len];
     let mut expected_state = vec![0.0; state_len];
     CpuBackend::recurrent_gated_delta_rule_f32(
@@ -89,7 +90,8 @@ fn recurrent_gated_delta_rule_cuda_matches_cpu_reference() {
     )
     .unwrap();
 
-    let mut cuda_ctx = CudaBackend::new_context();
+    let mut cuda_ctx =
+        CudaBackend::new_context(&ferrum_types::BackendContextConfig::default()).unwrap();
     let q_dev = CudaBackend::from_slice_typed_in_context(&mut cuda_ctx, &query);
     let k_dev = CudaBackend::from_slice_typed_in_context(&mut cuda_ctx, &key);
     let v_dev = CudaBackend::from_slice_typed_in_context(&mut cuda_ctx, &value);
@@ -159,7 +161,8 @@ fn recurrent_gated_delta_rule_batch_cuda_matches_cpu_reference() {
         .map(|i| ((i as f32 % 23.0) - 11.0) * 0.03)
         .collect();
 
-    let mut cpu_ctx = CpuBackend::new_context();
+    let mut cpu_ctx =
+        CpuBackend::new_context(&ferrum_types::BackendContextConfig::default()).unwrap();
     let mut expected_out = vec![0.0; out_len];
     let mut expected_state = vec![0.0; state_len];
     CpuBackend::recurrent_gated_delta_rule_batch_f32(
@@ -182,7 +185,8 @@ fn recurrent_gated_delta_rule_batch_cuda_matches_cpu_reference() {
     )
     .unwrap();
 
-    let mut cuda_ctx = CudaBackend::new_context();
+    let mut cuda_ctx =
+        CudaBackend::new_context(&ferrum_types::BackendContextConfig::default()).unwrap();
     let q_dev = CudaBackend::from_slice_typed_in_context(&mut cuda_ctx, &query);
     let k_dev = CudaBackend::from_slice_typed_in_context(&mut cuda_ctx, &key);
     let v_dev = CudaBackend::from_slice_typed_in_context(&mut cuda_ctx, &value);
@@ -256,7 +260,8 @@ fn recurrent_gated_delta_rule_varlen_tiled_cuda_matches_cpu_reference() {
         .map(|i| ((i as f32 % 29.0) - 14.0) * 0.001)
         .collect();
 
-    let mut cpu_ctx = CpuBackend::new_context();
+    let mut cpu_ctx =
+        CpuBackend::new_context(&ferrum_types::BackendContextConfig::default()).unwrap();
     let mut expected_out = vec![0.0; value_len];
     let mut expected_state = vec![0.0; state_len];
     let cu_cpu = CpuBackend::from_slice_typed(&cu_seqlens);
@@ -282,7 +287,8 @@ fn recurrent_gated_delta_rule_varlen_tiled_cuda_matches_cpu_reference() {
     )
     .unwrap();
 
-    let mut cuda_ctx = CudaBackend::new_context();
+    let mut cuda_ctx =
+        CudaBackend::new_context(&ferrum_types::BackendContextConfig::default()).unwrap();
     let q_dev = CudaBackend::from_slice_typed_in_context(&mut cuda_ctx, &query);
     let k_dev = CudaBackend::from_slice_typed_in_context(&mut cuda_ctx, &key);
     let v_dev = CudaBackend::from_slice_typed_in_context(&mut cuda_ctx, &value);
@@ -347,7 +353,8 @@ fn packed_indexed_expected(
     let state_len = value_heads * value_dim * key_dim;
     let mut expected_out = vec![0.0; batch * value_total];
     let mut expected_slots = initial_slots.to_vec();
-    let mut cpu_ctx = CpuBackend::new_context();
+    let mut cpu_ctx =
+        CpuBackend::new_context(&ferrum_types::BackendContextConfig::default()).unwrap();
 
     for row in 0..batch {
         let slot = slot_indices[row] as usize;
@@ -438,7 +445,8 @@ fn recurrent_gated_delta_rule_batch_indexed_packed_cuda_matches_cpu_reference() 
         value_dim,
     );
 
-    let mut cuda_ctx = CudaBackend::new_context();
+    let mut cuda_ctx =
+        CudaBackend::new_context(&ferrum_types::BackendContextConfig::default()).unwrap();
     let mixed_dev = CudaBackend::from_slice_typed_in_context(&mut cuda_ctx, &mixed_qkv);
     let ba_dev = CudaBackend::from_slice_typed_in_context(&mut cuda_ctx, &ba_raw);
     let a_log_dev = CudaBackend::from_slice_typed_in_context(&mut cuda_ctx, &a_log);
@@ -521,7 +529,8 @@ fn recurrent_gated_delta_rule_batch_indexed_packed_cuda_accepts_f16_ba() {
         value_dim,
     );
 
-    let mut cuda_ctx = CudaBackend::new_context();
+    let mut cuda_ctx =
+        CudaBackend::new_context(&ferrum_types::BackendContextConfig::default()).unwrap();
     let mixed_dev = CudaBackend::from_slice_typed_in_context(&mut cuda_ctx, &mixed_qkv);
     let ba_dev = CudaBackend::from_slice_typed_in_context(&mut cuda_ctx, &to_f16_vec(&ba_raw_f32));
     let a_log_dev = CudaBackend::from_slice_typed_in_context(&mut cuda_ctx, &a_log);

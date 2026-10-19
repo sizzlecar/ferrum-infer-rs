@@ -114,6 +114,7 @@ impl LlamaExecutionOptions {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct LlamaExecutionConfig {
+    pub backend_context: crate::BackendContextConfig,
     pub kv_capacity: Option<usize>,
     pub paged_max_seqs: usize,
     pub prefix_cache: bool,
@@ -124,6 +125,7 @@ pub struct LlamaExecutionConfig {
 impl Default for LlamaExecutionConfig {
     fn default() -> Self {
         Self {
+            backend_context: crate::BackendContextConfig::default(),
             kv_capacity: None,
             paged_max_seqs: 32,
             prefix_cache: false,
@@ -135,6 +137,9 @@ impl Default for LlamaExecutionConfig {
 
 impl LlamaExecutionConfig {
     pub fn validate(&self) -> Result<(), String> {
+        self.backend_context
+            .validate()
+            .map_err(|error| error.to_string())?;
         if self.kv_capacity == Some(0)
             || self.options.kv_max_blocks == Some(0)
             || self.paged_max_seqs == 0

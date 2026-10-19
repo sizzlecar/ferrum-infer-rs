@@ -38,7 +38,7 @@ fn det_f32(seed: u64, n: usize) -> Vec<f32> {
 
 #[test]
 fn flash_attn_batched_matches_per_item() {
-    let mut ctx = CudaBackend::new_context();
+    let mut ctx = CudaBackend::new_context(&ferrum_types::BackendContextConfig::default()).unwrap();
 
     // Q: [m, NH, HD] item-major
     let q_h = det_f32(1, M * NH * HD);
@@ -169,7 +169,7 @@ fn flash_attn_batched_matches_per_item() {
 
 #[test]
 fn flash_attn_batched_sliding_window_one_selects_latest_v() {
-    let mut ctx = CudaBackend::new_context();
+    let mut ctx = CudaBackend::new_context(&ferrum_types::BackendContextConfig::default()).unwrap();
 
     let q_h = det_f32(100, M * NH * HD);
     let q_dev = CudaBackend::from_slice_in_context(&mut ctx, &q_h);

@@ -401,7 +401,8 @@ mod tests {
         use cudarc::driver::DevicePtr;
         use ferrum_kernels::backend::{cuda::CudaBackend, Backend};
 
-        let context = CudaBackend::new_context();
+        let context =
+            CudaBackend::new_context(&ferrum_types::BackendContextConfig::default()).unwrap();
         physical_batch_frame_retains_scratch::<CudaBackend>(|buffer| {
             let (pointer, _record) = buffer.as_f16().device_ptr(&context.stream);
             usize::try_from(pointer)
@@ -412,7 +413,7 @@ mod tests {
     fn selection_failure_readback_observes_pending_work<
         B: ferrum_kernels::backend::MoeLlmBackend,
     >() {
-        let mut context = B::new_context();
+        let mut context = B::new_context(&ferrum_types::BackendContextConfig::default()).unwrap();
         // Use the backend's activation dtype, including CUDA's F16 scale kernel.
         let mut logits = B::from_slice_in_context(&mut context, &[1.0f32, 2.0, 3.0, 4.0]);
         B::scale_inplace(&mut context, &mut logits, 1.0, 4);

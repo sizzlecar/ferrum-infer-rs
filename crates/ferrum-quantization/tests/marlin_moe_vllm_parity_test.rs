@@ -115,7 +115,8 @@ fn cuda_marlin_moe_vllm_vs_per_expert() {
     let qw_refs: Vec<&[i32]> = experts.iter().map(|e| e.qweight.as_slice()).collect();
     let sc_refs: Vec<&[f32]> = experts.iter().map(|e| e.scales.as_slice()).collect();
     let qz_refs: Vec<&[i32]> = experts.iter().map(|e| e.qzeros.as_slice()).collect();
-    let mut ctx = <CudaBackend as Backend>::new_context();
+    let mut ctx =
+        <CudaBackend as Backend>::new_context(&Default::default()).expect("backend context");
     let stacked = <CudaBackend as BackendQuantMarlin>::load_gptq_stacked_in_context(
         &mut ctx, &qw_refs, &sc_refs, &qz_refs, None, 4, gs, k, n_per,
     )

@@ -237,7 +237,7 @@ fn preparation_frame_real_metal_allocator_and_contiguous_growth() {
 #[ignore = "requires an actual CUDA device"]
 fn preparation_frame_real_cuda_allocator_and_contiguous_growth() {
     use ferrum_kernels::backend::{cuda::CudaBackend, Backend};
-    let context = CudaBackend::new_context();
+    let context = CudaBackend::new_context(&ferrum_types::BackendContextConfig::default()).unwrap();
     real_preparation_preserves_allocator_and_numerical_state::<CudaBackend>(|buffer, count| {
         context.stream.clone_dtoh(buffer.as_u32()).unwrap()[..count].to_vec()
     });
@@ -249,7 +249,8 @@ fn preparation_frame_real_cuda_allocator_and_contiguous_growth() {
 fn preparation_frame_real_metal_pending_context_blocks_allocation() {
     use ferrum_kernels::backend::{metal::MetalBackend, Backend};
     let mut model = model::<MetalBackend>(true);
-    let mut empty = MetalBackend::new_context();
+    let mut empty =
+        MetalBackend::new_context(&ferrum_types::BackendContextConfig::default()).unwrap();
     assert!(MetalBackend::preparation_is_host_only(&empty));
     assert!(MetalBackend::sync_checked(&mut empty).is_err());
     // Ordinary numerical observation cannot claim completion without a

@@ -2053,7 +2053,7 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
             )));
         }
 
-        let mut context = B::new_context();
+        let mut context = B::new_context(&execution.backend_context)?;
         // These are the actual partially built owners, declared before the
         // guard so failure observes the original context before their Drop.
         let mut partial = ModelConstruction::<B> {
@@ -2188,6 +2188,17 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
             lora_cache_adapters: HashMap::new(),
             lora_projection_applications: 0,
         })
+    }
+
+    pub(crate) fn backend_device_ordinal(&self) -> Option<usize> {
+        self.execution_context
+            .as_ref()
+            .or_else(|| {
+                self.pending_device_frame
+                    .as_ref()
+                    .map(|frame| &frame.context)
+            })
+            .map(|context| B::context_config(context).device_ordinal)
     }
 
     pub fn source_layer_range(&self) -> Range<usize> {
@@ -6149,7 +6160,8 @@ mod tests {
             4
         );
 
-        let mut ctx = CpuBackend::new_context();
+        let mut ctx =
+            CpuBackend::new_context(&ferrum_types::BackendContextConfig::default()).unwrap();
         model
             .ensure_paged_kv_capacity_for_cache_id(&mut ctx, "seq-a", 17)
             .unwrap();
@@ -6304,8 +6316,13 @@ mod tests {
         let cfg = test_llama_config(5, true);
         let loader = RecordingLoader::default();
 
-        let layers =
-            load_llama_family_layers(&mut CpuBackend::new_context(), &cfg, &loader, 2..4).unwrap();
+        let layers = load_llama_family_layers(
+            &mut CpuBackend::new_context(&ferrum_types::BackendContextConfig::default()).unwrap(),
+            &cfg,
+            &loader,
+            2..4,
+        )
+        .unwrap();
 
         assert_eq!(layers.len(), 2);
         assert!(layers.iter().all(|layer| layer.q_norm_w.is_some()));
@@ -6343,11 +6360,15 @@ mod tests {
         let cfg = test_llama_config(2, false);
         let loader = RecordingLoader::default();
 
-        let err =
-            match load_llama_family_layers(&mut CpuBackend::new_context(), &cfg, &loader, 1..3) {
-                Ok(_) => panic!("expected out-of-bounds layer range to fail"),
-                Err(err) => err,
-            };
+        let err = match load_llama_family_layers(
+            &mut CpuBackend::new_context(&ferrum_types::BackendContextConfig::default()).unwrap(),
+            &cfg,
+            &loader,
+            1..3,
+        ) {
+            Ok(_) => panic!("expected out-of-bounds layer range to fail"),
+            Err(err) => err,
+        };
 
         assert!(
             err.to_string().contains("outside model layer count"),
@@ -6558,14 +6579,21 @@ mod tests {
     #[test]
     fn prefill_scratch_keeps_batch_logits_lazy() {
         let cfg = test_llama_config(1, false);
-        let mut scratch =
-            LlamaFamilyScratch::<CpuBackend>::alloc(&mut CpuBackend::new_context(), &cfg, 128);
+        let mut scratch = LlamaFamilyScratch::<CpuBackend>::alloc(
+            &mut CpuBackend::new_context(&ferrum_types::BackendContextConfig::default()).unwrap(),
+            &cfg,
+            128,
+        );
 
         assert_eq!(scratch.max_tokens, 128);
         assert_eq!(scratch.batch_logits_capacity, 1);
         assert_eq!(scratch.batch_logits.len(), cfg.vocab_size);
 
-        scratch.ensure_batch_logits(&mut CpuBackend::new_context(), &cfg, 128);
+        scratch.ensure_batch_logits(
+            &mut CpuBackend::new_context(&ferrum_types::BackendContextConfig::default()).unwrap(),
+            &cfg,
+            128,
+        );
         assert_eq!(scratch.batch_logits_capacity, 128);
         assert_eq!(scratch.batch_logits.len(), 128 * cfg.vocab_size);
     }
@@ -6702,7 +6730,9 @@ mod tests {
     fn cpu_gelu_tanh_mul_split_matches_reference() {
         use ferrum_kernels::backend::cpu::CpuBackend;
         use ferrum_kernels::backend::Backend;
-        let mut ctx = <CpuBackend as Backend>::new_context();
+        let mut ctx =
+            <CpuBackend as Backend>::new_context(&ferrum_types::BackendContextConfig::default())
+                .unwrap();
         let im = 3usize;
         // one token: gate = [-1, 0.5, 2], up = [1, 2, 3]
         let gate_up = vec![-1.0f32, 0.5, 2.0, 1.0, 2.0, 3.0];
@@ -6721,7 +6751,9 @@ mod tests {
     fn cpu_scale_inplace_scales() {
         use ferrum_kernels::backend::cpu::CpuBackend;
         use ferrum_kernels::backend::Backend;
-        let mut ctx = <CpuBackend as Backend>::new_context();
+        let mut ctx =
+            <CpuBackend as Backend>::new_context(&ferrum_types::BackendContextConfig::default())
+                .unwrap();
         let mut buf = <CpuBackend as Backend>::from_slice(&[1.0f32, -2.0, 0.5]);
         <CpuBackend as Backend>::scale_inplace(&mut ctx, &mut buf, 33.9375, 3);
         let v = <CpuBackend as Backend>::to_vec(&buf, 3);

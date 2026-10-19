@@ -1,6 +1,7 @@
 use std::sync::Mutex;
 
 use ferrum_kernels::backend::cpu::CpuBackend;
+use ferrum_kernels::backend::Backend;
 use ferrum_quantization::{DenseLinear, Linear, QuantConfig, WeightLoader};
 use ferrum_types::{EngineConfig, LlamaExecutionConfig, Result, RuntimeConfigSnapshot};
 
@@ -18,10 +19,15 @@ type Model = LlamaFamilyModel<CpuBackend>;
 #[derive(Default)]
 struct FirstLoadLoader<'a> {
     first_load: Mutex<Option<Box<dyn FnOnce() + Send + 'a>>>,
+    contexts: Mutex<Vec<ferrum_types::BackendContextConfig>>,
 }
 
 impl FirstLoadLoader<'_> {
-    fn on_load(&self) {
+    fn on_load(&self, ctx: &<CpuBackend as Backend>::Context) {
+        self.contexts
+            .lock()
+            .unwrap()
+            .push(CpuBackend::context_config(ctx).clone());
         let callback = self.first_load.lock().unwrap().take();
         if let Some(callback) = callback {
             callback();
@@ -32,10 +38,10 @@ impl FirstLoadLoader<'_> {
 impl WeightLoader<CpuBackend> for FirstLoadLoader<'_> {
     fn load_tensor(
         &self,
-        _ctx: &mut <CpuBackend as ferrum_kernels::backend::Backend>::Context,
+        ctx: &mut <CpuBackend as ferrum_kernels::backend::Backend>::Context,
         _name: &str,
     ) -> Result<Vec<f32>> {
-        self.on_load();
+        self.on_load(ctx);
         Ok(vec![1.0])
     }
 
@@ -44,7 +50,7 @@ impl WeightLoader<CpuBackend> for FirstLoadLoader<'_> {
         ctx: &mut <CpuBackend as ferrum_kernels::backend::Backend>::Context,
         name: &str,
     ) -> Result<Box<dyn Linear<CpuBackend>>> {
-        self.on_load();
+        self.on_load(ctx);
         let rows = if name.ends_with("qkv_proj") {
             3
         } else if name.ends_with("gate_up_proj") {
@@ -97,6 +103,12 @@ fn configured_engine(capacity: usize, blocks: usize, max_seqs: usize, flags: boo
         ("FERRUM_UNIFIED_GRAPH_LM_HEAD_EAGER", flag.to_owned()),
         ("FERRUM_GREEDY_ARGMAX", flag.to_owned()),
         ("FERRUM_SPLIT_K_ATTN", flag.to_owned()),
+        ("FERRUM_VLLM_MOE", flag.to_owned()),
+        ("FERRUM_MOE_HOST_ROUTE", flag.to_owned()),
+        (
+            "FERRUM_METAL_DTYPE",
+            if flags { "f16" } else { "f32" }.to_owned(),
+        ),
         (
             "FERRUM_NAN_TRACE",
             if flags { "layer1" } else { "0" }.to_owned(),
@@ -117,6 +129,10 @@ fn configured_engine(capacity: usize, blocks: usize, max_seqs: usize, flags: boo
 }
 
 fn assert_frozen_config(model: &Model, expected: &LlamaExecutionConfig) {
+    assert_eq!(
+        CpuBackend::context_config(model.execution_context.as_ref().unwrap()),
+        &expected.backend_context
+    );
     assert_eq!(
         model.runtime_env,
         LlamaFamilyRuntimeEnv::from_execution_config(expected)
@@ -171,6 +187,7 @@ fn construction_keeps_instance_config_across_another_engine_apply_and_model_load
             .unwrap();
             *nested.lock().unwrap() = Some((model_b, execution_b));
         }))),
+        ..Default::default()
     };
     let mut model_a =
         Model::new_with_execution_config(tiny_config(), &loader, execution_a.clone()).unwrap();
@@ -180,6 +197,13 @@ fn construction_keeps_instance_config_across_another_engine_apply_and_model_load
         .take()
         .expect("first load interleaved");
 
+    assert!(!loader.contexts.lock().unwrap().is_empty());
+    assert!(loader
+        .contexts
+        .lock()
+        .unwrap()
+        .iter()
+        .all(|context| context == &execution_a.backend_context));
     assert_frozen_config(&model_a, &execution_a);
     assert_frozen_config(&model_b, &execution_b);
     assert_ne!(model_a.runtime_env, model_b.runtime_env);
@@ -235,6 +259,7 @@ fn layer_stages_keep_the_same_frozen_config_across_interleaved_construction() {
             .unwrap();
             *nested.lock().unwrap() = Some((stage_b, execution_b));
         }))),
+        ..Default::default()
     };
     let first = Model::new_layer_stage_with_execution_config(
         tiny_config(),
@@ -280,12 +305,19 @@ fn invalid_instance_capacity_is_rejected_before_any_weight_load() {
     let mut zero_blocks = LlamaExecutionConfig::default();
     zero_blocks.options.kv_max_blocks = Some(0);
     invalid.push(zero_blocks);
+    let mut zero_streams = LlamaExecutionConfig::default();
+    zero_streams.backend_context.moe.moe_streams = 0;
+    invalid.push(zero_streams);
+    let mut invalid_block = LlamaExecutionConfig::default();
+    invalid_block.backend_context.moe.moe_block_size = Some(12);
+    invalid.push(invalid_block);
     for execution in invalid {
         let reads = AtomicUsize::new(0);
         let loader = FirstLoadLoader {
             first_load: Mutex::new(Some(Box::new(|| {
                 reads.fetch_add(1, Ordering::Relaxed);
             }))),
+            ..Default::default()
         };
         for result in [
             Model::new_with_execution_config(tiny_config(), &loader, execution.clone()),

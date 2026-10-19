@@ -24,14 +24,14 @@ use ferrum_quantization::gguf::{GgufFile, GgufLinear};
 use ferrum_quantization::DenseLinear;
 
 /// Run a Linear and return the output vector.
-fn forward<B: Backend<Buffer = Vec<f32>, Context = ()>>(
+fn forward<B: Backend<Buffer = Vec<f32>, Context = ferrum_kernels::backend::cpu::CpuContext>>(
     linear: &dyn Linear<B>,
     input: &[f32],
     m: usize,
 ) -> Vec<f32> {
     let in_buf = input.to_vec();
     let mut out_buf = vec![0.0f32; m * linear.out_features()];
-    let mut ctx = ();
+    let mut ctx = B::new_context(&Default::default()).expect("CPU context");
     linear.forward(&mut ctx, &in_buf, &mut out_buf, m);
     out_buf
 }
@@ -190,7 +190,7 @@ mod metal_quant_leaf {
         let bytes = quantized.data().unwrap();
         // Unlike GgufLinear's dense reference path, this constructor preserves
         // the packed leaf and reaches metal_gemm_quant_dispatch directly.
-        let mut context = MetalBackend::new_context();
+        let mut context = MetalBackend::new_context(&Default::default()).expect("backend context");
         let linear = QuantLinear::<MetalBackend>::from_gguf_bytes_in_context(
             &mut context,
             kind,

@@ -7,7 +7,7 @@
 
 use ferrum_types::{RuntimeConfigEntry, RuntimeConfigSnapshot, RuntimeConfigSource};
 
-fn model_construction_is_typed_only(key: &str) -> bool {
+fn execution_config_is_typed_only(key: &str) -> bool {
     matches!(
         key,
         "FERRUM_KV_MAX_BLOCKS"
@@ -23,10 +23,42 @@ fn model_construction_is_typed_only(key: &str) -> bool {
             | "FERRUM_OP_DUMP"
             | "FERRUM_LAYER_DUMP"
             | "FERRUM_GPTQ_GIDX_TRACE"
+            | "FERRUM_CUDA_DEVICE"
+            | "FERRUM_CUDA_MAX_KV"
+            | "FERRUM_GRAPH_SKIP_UPLOAD"
+            | "FERRUM_GRAPH_SKIP_SYNC"
+            | "FERRUM_KV_CAPACITY"
+            | "FERRUM_PAGED_FLASH_SPLITS"
+            | "FERRUM_SPLIT_K_ATTN"
+            | "FERRUM_FA2_SOURCE"
+            | "FERRUM_FA2_DIRECT_FFI_SHIM"
+            | "FERRUM_PAGED_FLASH"
+            | "FERRUM_VLLM_PAGED_ATTN_V1_SHORT"
+            | "FERRUM_TRITON_INT4"
+            | "FERRUM_VLLM_MARLIN"
+            | "FERRUM_VLLM_MARLIN_SMS"
+            | "FERRUM_VLLM_ATOMIC_ADD"
+            | "FERRUM_VLLM_FP32_REDUCE"
+            | "FERRUM_MARLIN_SKIP_WS_ZERO"
+            | "FERRUM_VLLM_MOE"
+            | "FERRUM_VLLM_MOE_ZERO_WS"
+            | "FERRUM_VLLM_MOE_PAIR_IDS"
+            | "FERRUM_MOE_LOAD_TRACE"
+            | "FERRUM_MOE_BLOCK_SIZE"
+            | "FERRUM_MOE_LARGE_M_BLOCK_SIZE"
+            | "FERRUM_MOE_LARGE_M_MIN_PAIRS"
+            | "FERRUM_MOE_HOST_ROUTE"
+            | "FERRUM_MOE_STREAMS"
+            | "FERRUM_MOE_FUSED"
+            | "FERRUM_TP"
+            | "FERRUM_RANK"
+            | "FERRUM_METAL_DTYPE"
+            | "FERRUM_MMAP_TRACE"
+            | "FERRUM_FA_LEGACY"
+            | "FERRUM_FA_DECODE"
     )
-    // KV_CAPACITY and SPLIT_K_ATTN still have retained CUDA backend consumers;
-    // PREFIX_CACHE also has HTTP metadata compatibility. Their separate
-    // environment bridges retire with those consumers, not by dropping input.
+    // PREFIX_CACHE still has HTTP metadata compatibility; that separate
+    // bridge retires with the server consumer, not by dropping its input.
 }
 
 /// Reject retired controls before source resolution or device preparation.
@@ -69,7 +101,7 @@ pub fn push_cli_runtime_usize(
 pub fn materialize_runtime_env_defaults(entries: &[RuntimeConfigEntry]) -> Vec<String> {
     let mut materialized = Vec::new();
     for entry in entries {
-        if model_construction_is_typed_only(&entry.key)
+        if execution_config_is_typed_only(&entry.key)
             || entry.key == ferrum_types::SEGMENT_BINDING_OWNER_VIEW_MODE_CONFIG_KEY
             || entry.key == ferrum_types::CAUSAL_DECODE_PREPARATION_MODE_CONFIG_KEY
             || entry.key == ferrum_types::CAUSAL_DECODE_ATTENTION_GROUPING_CONFIG_KEY
@@ -92,7 +124,7 @@ pub fn materialize_runtime_env_defaults(entries: &[RuntimeConfigEntry]) -> Vec<S
 pub fn materialize_runtime_env_effective(snapshot: &RuntimeConfigSnapshot) -> Vec<String> {
     let mut materialized = Vec::new();
     for entry in &snapshot.entries {
-        if model_construction_is_typed_only(&entry.key)
+        if execution_config_is_typed_only(&entry.key)
             || entry.key == ferrum_types::SEGMENT_BINDING_OWNER_VIEW_MODE_CONFIG_KEY
             || entry.key == ferrum_types::CAUSAL_DECODE_PREPARATION_MODE_CONFIG_KEY
             || entry.key == ferrum_types::CAUSAL_DECODE_ATTENTION_GROUPING_CONFIG_KEY
@@ -167,6 +199,87 @@ mod tests {
                 engine.apply_runtime_config_snapshot(&current).unwrap();
                 assert_eq!(runtime_snapshot_value(&current, key), Some(value));
             }
+        }
+    }
+
+    #[test]
+    fn backend_instance_policy_is_resolved_without_process_mutation() {
+        let entries = [
+            ("FERRUM_CUDA_DEVICE", "2"),
+            ("FERRUM_CUDA_MAX_KV", "1536"),
+            ("FERRUM_GRAPH_SKIP_UPLOAD", "1"),
+            ("FERRUM_GRAPH_SKIP_SYNC", "1"),
+            ("FERRUM_KV_CAPACITY", "1536"),
+            ("FERRUM_PAGED_FLASH_SPLITS", "2"),
+            ("FERRUM_SPLIT_K_ATTN", "0"),
+            ("FERRUM_FA2_SOURCE", "1"),
+            ("FERRUM_FA2_DIRECT_FFI_SHIM", "/tmp/explicit-fa2.so"),
+            ("FERRUM_PAGED_FLASH", "0"),
+            ("FERRUM_VLLM_PAGED_ATTN_V1_SHORT", "0"),
+            ("FERRUM_TRITON_INT4", "1"),
+            ("FERRUM_VLLM_MARLIN", "1"),
+            ("FERRUM_VLLM_MARLIN_SMS", "64"),
+            ("FERRUM_VLLM_ATOMIC_ADD", "1"),
+            ("FERRUM_VLLM_FP32_REDUCE", "1"),
+            ("FERRUM_MARLIN_SKIP_WS_ZERO", "1"),
+            ("FERRUM_VLLM_MOE", "1"),
+            ("FERRUM_VLLM_MOE_ZERO_WS", "1"),
+            ("FERRUM_VLLM_MOE_PAIR_IDS", "1"),
+            ("FERRUM_MOE_LOAD_TRACE", "1"),
+            ("FERRUM_MOE_BLOCK_SIZE", "16"),
+            ("FERRUM_MOE_LARGE_M_BLOCK_SIZE", "32"),
+            ("FERRUM_MOE_LARGE_M_MIN_PAIRS", "2048"),
+            ("FERRUM_MOE_HOST_ROUTE", "1"),
+            ("FERRUM_MOE_STREAMS", "2"),
+            ("FERRUM_MOE_FUSED", "0"),
+            ("FERRUM_TP", "4"),
+            ("FERRUM_RANK", "1"),
+            ("FERRUM_METAL_DTYPE", "f16"),
+            ("FERRUM_MMAP_TRACE", "1"),
+            ("FERRUM_FA_LEGACY", "1"),
+            ("FERRUM_FA_DECODE", "0"),
+        ];
+        let original: Vec<_> = entries
+            .iter()
+            .map(|(key, _)| std::env::var_os(key))
+            .collect();
+        for source in [
+            RuntimeConfigSource::Default,
+            RuntimeConfigSource::ConfigFile,
+            RuntimeConfigSource::Cli,
+            RuntimeConfigSource::Env,
+        ] {
+            let current = RuntimeConfigSnapshot::from_entries(
+                entries
+                    .iter()
+                    .map(|(key, value)| RuntimeConfigEntry::new(*key, *value, source)),
+            );
+            assert!(materialize_runtime_env_defaults(&current.entries).is_empty());
+            assert!(materialize_runtime_env_effective(&current).is_empty());
+            let mut first = ferrum_types::EngineConfig::default();
+            first.backend.device = ferrum_types::Device::CUDA(2);
+            first.apply_runtime_config_snapshot(&current).unwrap();
+            let config = first.llama_execution_config().backend_context;
+            assert_eq!(config.device_ordinal, 2);
+            assert_eq!(config.cuda.kv_capacity, 1536);
+            assert!(config.cuda.graph_skip_upload);
+            assert!(config.moe.vllm_moe);
+            assert_eq!(config.moe.moe_streams, 2);
+            assert_eq!(config.collective.rank, 1);
+            assert!(config.metal.prefer_f16_weights);
+            assert!(!config.metal.allow_decode_widen);
+            let second = ferrum_types::EngineConfig::default().llama_execution_config();
+            assert_eq!(
+                second.backend_context,
+                ferrum_types::BackendContextConfig::default()
+            );
+            assert_eq!(
+                entries
+                    .iter()
+                    .map(|(key, _)| std::env::var_os(key))
+                    .collect::<Vec<_>>(),
+                original
+            );
         }
     }
 

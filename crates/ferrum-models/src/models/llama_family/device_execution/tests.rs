@@ -112,7 +112,7 @@ fn single_device_frame_restores_original_scratch_after_real_cuda_forward_failure
     use ferrum_kernels::backend::{cuda::CudaBackend, Backend};
 
     // Initialization failure is a failed selected test, never a skipped case.
-    let context = CudaBackend::new_context();
+    let context = CudaBackend::new_context(&ferrum_types::BackendContextConfig::default()).unwrap();
     real_forward_unwind_restores_original_scratch::<CudaBackend>(|buffer| {
         let (pointer, _record) = buffer.as_f16().device_ptr(&context.stream);
         usize::try_from(pointer).expect("CUDA allocation address must fit the host pointer width")

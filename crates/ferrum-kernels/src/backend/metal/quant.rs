@@ -2,16 +2,12 @@
 //! `BackendQuantGguf` impl. Extracted from the monolithic `metal.rs`
 //! (Audit #8 split mirror of the cuda/quant.rs layout).
 //!
-//! Public surface preserved via `pub use` in `super` (metal/mod.rs), so
-//! external `crate::backend::metal::{MetalQuantStore, ...}` paths keep
-//! working without changes.
+//! Cold helpers receive explicit policy; production trait calls use the
+//! original context. Context-free compatibility methods use fixed defaults.
 
-use super::{
-    add_registered_mmap_buffer, metal_mmap_trace_enabled, slice_is_in_registered_mmap, st,
-    MetalBackend,
-};
+use super::{add_registered_mmap_buffer, slice_is_in_registered_mmap, st, MetalBackend};
 use crate::backend::{Backend, GgufQuantType};
-use ferrum_types::{FerrumError, Result};
+use ferrum_types::{FerrumError, MetalBackendConfig, Result};
 use metal::MTLResourceOptions;
 use std::ffi::c_void;
 
@@ -126,9 +122,10 @@ unsafe impl Sync for MetalQuantStore {}
 /// residency set so Metal wires them during load instead of every dispatch.
 fn buffer_for_quant_bytes(
     bytes: &[u8],
+    options: &MetalBackendConfig,
 ) -> Result<(metal::Buffer, u64, Option<super::MetalMmapLease>)> {
     const PAGE: usize = 16384;
-    let trace = metal_mmap_trace_enabled();
+    let trace = options.mmap_trace;
     if slice_is_in_registered_mmap(bytes) {
         // Zero-copy: page-align the host range covering this tensor and
         // wrap it in an MTLBuffer. The lease returned below keeps the mmap
@@ -188,6 +185,7 @@ pub fn load_q4k_experts(
     num_experts: usize,
     n_rows: usize,
     n_cols: usize,
+    options: &MetalBackendConfig,
 ) -> Result<MetalQuantStore> {
     const QK_K: usize = 256;
     const BLOCK_BYTES: usize = 144;
@@ -203,7 +201,7 @@ pub fn load_q4k_experts(
             bytes.len()
         )));
     }
-    let (blocks, byte_offset, mmap_lease) = buffer_for_quant_bytes(bytes)?;
+    let (blocks, byte_offset, mmap_lease) = buffer_for_quant_bytes(bytes, options)?;
     Ok(MetalQuantStore::Q4KExperts {
         blocks,
         byte_offset,
@@ -221,6 +219,7 @@ pub fn load_q6k_experts(
     num_experts: usize,
     n_rows: usize,
     n_cols: usize,
+    options: &MetalBackendConfig,
 ) -> Result<MetalQuantStore> {
     const QK_K: usize = 256;
     const BLOCK_BYTES: usize = crate::q6_k_gemv::Q6_K_BLOCK_BYTES;
@@ -236,7 +235,7 @@ pub fn load_q6k_experts(
             bytes.len()
         )));
     }
-    let (blocks, byte_offset, mmap_lease) = buffer_for_quant_bytes(bytes)?;
+    let (blocks, byte_offset, mmap_lease) = buffer_for_quant_bytes(bytes, options)?;
     Ok(MetalQuantStore::Q6KExperts {
         blocks,
         byte_offset,
@@ -554,6 +553,7 @@ fn metal_load_quant_store_helper(
     bytes: &[u8],
     n_rows: usize,
     n_cols: usize,
+    options: &MetalBackendConfig,
 ) -> Result<MetalQuantStore> {
     const QK_K: usize = 256;
     match kind {
@@ -574,7 +574,7 @@ fn metal_load_quant_store_helper(
                     expected
                 )));
             }
-            let (blocks, byte_offset, mmap_lease) = buffer_for_quant_bytes(bytes)?;
+            let (blocks, byte_offset, mmap_lease) = buffer_for_quant_bytes(bytes, options)?;
             Ok(MetalQuantStore::Q4K {
                 blocks,
                 byte_offset,
@@ -601,7 +601,7 @@ fn metal_load_quant_store_helper(
                     expected
                 )));
             }
-            let (blocks, byte_offset, mmap_lease) = buffer_for_quant_bytes(bytes)?;
+            let (blocks, byte_offset, mmap_lease) = buffer_for_quant_bytes(bytes, options)?;
             Ok(MetalQuantStore::Q6K {
                 blocks,
                 byte_offset,
@@ -624,14 +624,25 @@ impl crate::backend::BackendQuantGguf for MetalBackend {
         n_rows: usize,
         n_cols: usize,
     ) -> Result<Box<dyn crate::Linear<Self> + Send + Sync>> {
-        let store = metal_load_quant_store_helper(kind, bytes, n_rows, n_cols)?;
-        // Phase 3e/3: dispatch via MetalGgufLinear::forward.
-        Ok(Box::new(crate::quant_linear::metal_gguf::MetalGgufLinear {
-            store,
-            in_features: n_cols,
-            out_features: n_rows,
-        }))
+        load_quant_with_options(kind, bytes, n_rows, n_cols, &MetalBackendConfig::default())
     }
+
+    fn load_quant_in_context(
+        ctx: &mut Self::Context,
+        kind: GgufQuantType,
+        bytes: &[u8],
+        n_rows: usize,
+        n_cols: usize,
+    ) -> Result<Box<dyn crate::Linear<Self> + Send + Sync>> {
+        load_quant_with_options(
+            kind,
+            bytes,
+            n_rows,
+            n_cols,
+            &Self::context_config(ctx).metal,
+        )
+    }
+
     fn load_quant_experts(
         kind: GgufQuantType,
         bytes: &[u8],
@@ -639,50 +650,117 @@ impl crate::backend::BackendQuantGguf for MetalBackend {
         n_rows: usize,
         n_cols: usize,
     ) -> Result<Box<dyn crate::StackedExpertGgufLinear<Self>>> {
-        let store = match kind {
-            GgufQuantType::Q4K => load_q4k_experts(bytes, num_experts, n_rows, n_cols)?,
-            GgufQuantType::Q6K => load_q6k_experts(bytes, num_experts, n_rows, n_cols)?,
-            other => {
-                return Err(FerrumError::unsupported(format!(
-                    "Metal load_quant_experts: {other:?} not implemented (only Q4K / Q6K)"
-                )));
-            }
-        };
-        Ok(Box::new(
-            crate::quant_linear::metal_gguf_moe::MetalStackedExpertGgufLinear::new(store)?,
-        ))
+        load_quant_experts_with_options(
+            kind,
+            bytes,
+            num_experts,
+            n_rows,
+            n_cols,
+            &MetalBackendConfig::default(),
+        )
     }
+
+    fn load_quant_experts_in_context(
+        ctx: &mut Self::Context,
+        kind: GgufQuantType,
+        bytes: &[u8],
+        num_experts: usize,
+        n_rows: usize,
+        n_cols: usize,
+    ) -> Result<Box<dyn crate::StackedExpertGgufLinear<Self>>> {
+        load_quant_experts_with_options(
+            kind,
+            bytes,
+            num_experts,
+            n_rows,
+            n_cols,
+            &Self::context_config(ctx).metal,
+        )
+    }
+
     fn load_quant_fused(
         parts: &[(GgufQuantType, &[u8], usize)],
         n_cols: usize,
     ) -> Result<Box<dyn crate::Linear<Self> + Send + Sync>> {
-        let mut sub_stores: Vec<MetalQuantStore> = Vec::with_capacity(parts.len());
-        let mut total_rows = 0;
-        for (kind, bytes, n_rows) in parts {
-            // Phase 3e/3: use the helper to get the raw QuantStore (the
-            // trait method now returns Box<dyn Linear>, which we can't
-            // unwrap into Fused).
-            let store = metal_load_quant_store_helper(*kind, bytes, *n_rows, n_cols)?;
-            // Only leaf (Q4K / Q6K) parts are valid; nested Fused isn't.
-            if matches!(store, MetalQuantStore::Fused { .. }) {
-                return Err(FerrumError::model(
-                    "Metal load_quant_fused: nested Fused not supported".to_string(),
-                ));
-            }
-            total_rows += n_rows;
-            sub_stores.push(store);
-        }
-        let fused = MetalQuantStore::Fused {
-            parts: sub_stores,
-            total_rows,
-            n_cols,
-        };
-        Ok(Box::new(crate::quant_linear::metal_gguf::MetalGgufLinear {
-            store: fused,
-            in_features: n_cols,
-            out_features: total_rows,
-        }))
+        load_quant_fused_with_options(parts, n_cols, &MetalBackendConfig::default())
     }
+
+    fn load_quant_fused_in_context(
+        ctx: &mut Self::Context,
+        parts: &[(GgufQuantType, &[u8], usize)],
+        n_cols: usize,
+    ) -> Result<Box<dyn crate::Linear<Self> + Send + Sync>> {
+        load_quant_fused_with_options(parts, n_cols, &Self::context_config(ctx).metal)
+    }
+}
+
+fn load_quant_with_options(
+    kind: GgufQuantType,
+    bytes: &[u8],
+    n_rows: usize,
+    n_cols: usize,
+    options: &MetalBackendConfig,
+) -> Result<Box<dyn crate::Linear<MetalBackend> + Send + Sync>> {
+    let store = metal_load_quant_store_helper(kind, bytes, n_rows, n_cols, options)?;
+    // Phase 3e/3: dispatch via MetalGgufLinear::forward.
+    Ok(Box::new(crate::quant_linear::metal_gguf::MetalGgufLinear {
+        store,
+        in_features: n_cols,
+        out_features: n_rows,
+    }))
+}
+fn load_quant_experts_with_options(
+    kind: GgufQuantType,
+    bytes: &[u8],
+    num_experts: usize,
+    n_rows: usize,
+    n_cols: usize,
+    options: &MetalBackendConfig,
+) -> Result<Box<dyn crate::StackedExpertGgufLinear<MetalBackend>>> {
+    let store = match kind {
+        GgufQuantType::Q4K => load_q4k_experts(bytes, num_experts, n_rows, n_cols, options)?,
+        GgufQuantType::Q6K => load_q6k_experts(bytes, num_experts, n_rows, n_cols, options)?,
+        other => {
+            return Err(FerrumError::unsupported(format!(
+                "Metal load_quant_experts: {other:?} not implemented (only Q4K / Q6K)"
+            )));
+        }
+    };
+    Ok(Box::new(
+        crate::quant_linear::metal_gguf_moe::MetalStackedExpertGgufLinear::new(store)?,
+    ))
+}
+fn load_quant_fused_with_options(
+    parts: &[(GgufQuantType, &[u8], usize)],
+    n_cols: usize,
+    options: &MetalBackendConfig,
+) -> Result<Box<dyn crate::Linear<MetalBackend> + Send + Sync>> {
+    let mut sub_stores: Vec<MetalQuantStore> = Vec::with_capacity(parts.len());
+    let mut total_rows = 0;
+    for (kind, bytes, n_rows) in parts {
+        // Phase 3e/3: use the helper to get the raw QuantStore (the
+        // trait method now returns Box<dyn Linear>, which we can't
+        // unwrap into Fused).
+        let store = metal_load_quant_store_helper(*kind, bytes, *n_rows, n_cols, options)?;
+        // Only leaf (Q4K / Q6K) parts are valid; nested Fused isn't.
+        if matches!(store, MetalQuantStore::Fused { .. }) {
+            return Err(FerrumError::model(
+                "Metal load_quant_fused: nested Fused not supported".to_string(),
+            ));
+        }
+        total_rows += n_rows;
+        sub_stores.push(store);
+    }
+    let fused = MetalQuantStore::Fused {
+        parts: sub_stores,
+        total_rows,
+        n_cols,
+    };
+    Ok(Box::new(crate::quant_linear::metal_gguf::MetalGgufLinear {
+        store: fused,
+        in_features: n_cols,
+        out_features: total_rows,
+    }))
 }
 
 // ── Free-fn matmul dispatcher (called by MetalGgufLinear::forward) ───

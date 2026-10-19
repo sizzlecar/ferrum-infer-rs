@@ -41,7 +41,7 @@ macro_rules! run_backend {
         let q = random_vec($self.q_elems(), -1.0, 1.0, $seed);
         let k = random_vec($self.kv_elems(), -1.0, 1.0, $seed.wrapping_add(1));
         let v = random_vec($self.kv_elems(), -1.0, 1.0, $seed.wrapping_add(2));
-        let mut ctx = <$B>::new_context();
+        let mut ctx = <$B>::new_context(&Default::default()).expect("backend context");
         let qb = <$B>::from_slice(&q);
         let kb = <$B>::from_slice(&k);
         let vb = <$B>::from_slice(&v);

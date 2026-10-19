@@ -14,51 +14,13 @@
 
 use std::sync::{
     atomic::{AtomicPtr, Ordering},
-    Arc, OnceLock,
+    Arc,
 };
 
 use ferrum_types::{FerrumError, Result};
 
 use super::CudaBackend;
 use crate::backend::{Backend, BackendGraph};
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct CudaGraphRuntimeConfig {
-    skip_upload: bool,
-    skip_sync: bool,
-}
-
-impl CudaGraphRuntimeConfig {
-    fn from_env() -> Self {
-        Self::from_env_vars(std::env::vars())
-    }
-
-    fn from_env_vars<I, K, V>(vars: I) -> Self
-    where
-        I: IntoIterator<Item = (K, V)>,
-        K: AsRef<str>,
-        V: AsRef<str>,
-    {
-        let mut config = Self {
-            skip_upload: false,
-            skip_sync: false,
-        };
-        for (name, value) in vars {
-            let value = value.as_ref();
-            match name.as_ref() {
-                "FERRUM_GRAPH_SKIP_UPLOAD" => config.skip_upload = value == "1",
-                "FERRUM_GRAPH_SKIP_SYNC" => config.skip_sync = value == "1",
-                _ => {}
-            }
-        }
-        config
-    }
-}
-
-fn cuda_graph_runtime_config() -> &'static CudaGraphRuntimeConfig {
-    static CONFIG: OnceLock<CudaGraphRuntimeConfig> = OnceLock::new();
-    CONFIG.get_or_init(CudaGraphRuntimeConfig::from_env)
-}
 
 fn captured_graph_summary(cu_graph: cudarc::driver::sys::CUgraph) -> String {
     use cudarc::driver::sys;
@@ -330,13 +292,13 @@ impl BackendGraph for CudaBackend {
                     "cached graph must have an executable"
                 );
                 ctx.completion_observed = false;
-                let runtime_config = cuda_graph_runtime_config();
+                let runtime_config = &ctx.configuration.cuda;
                 // Re-upload before each launch. Without it, c=4 throughput
                 // drops 257→178 tok/s (post-Phase-8 measurement). The
                 // graph instantiate-then-upload-once design didn't pan out
                 // empirically; keep the per-replay upload until we
                 // understand why removing it slows things down.
-                if !runtime_config.skip_upload {
+                if !runtime_config.graph_skip_upload {
                     let st_up = unsafe { sys::cuGraphUpload(executable, cu_stream) };
                     if st_up != sys::CUresult::CUDA_SUCCESS {
                         return Err(FerrumError::unsupported(format!(
@@ -348,7 +310,7 @@ impl BackendGraph for CudaBackend {
                 if st != sys::CUresult::CUDA_SUCCESS {
                     return Err(FerrumError::unsupported(format!("cuGraphLaunch: {st:?}")));
                 }
-                if !runtime_config.skip_sync {
+                if !runtime_config.graph_skip_sync {
                     let st_sync = unsafe { sys::cuStreamSynchronize(cu_stream) };
                     if st_sync != sys::CUresult::CUDA_SUCCESS {
                         return Err(FerrumError::unsupported(format!(
@@ -523,37 +485,14 @@ unsafe impl Sync for GraphSlotRaw {}
 
 #[cfg(test)]
 mod tests {
-    use super::CudaGraphRuntimeConfig;
-
-    #[test]
-    fn cuda_graph_runtime_config_parses_graph_knobs() {
-        let config = CudaGraphRuntimeConfig::from_env_vars([
-            ("FERRUM_GRAPH_SKIP_UPLOAD", "1"),
-            ("FERRUM_GRAPH_SKIP_SYNC", "1"),
-        ]);
-
-        assert!(config.skip_upload);
-        assert!(config.skip_sync);
-    }
-
-    #[test]
-    fn cuda_graph_runtime_config_keeps_default_replay_path() {
-        let config = CudaGraphRuntimeConfig::from_env_vars([
-            ("FERRUM_GRAPH_SKIP_UPLOAD", "true"),
-            ("FERRUM_GRAPH_SKIP_SYNC", "0"),
-        ]);
-
-        assert!(!config.skip_upload);
-        assert!(!config.skip_sync);
-    }
-
     #[test]
     #[ignore = "requires an actual CUDA device"]
     fn graph_eviction_keeps_the_actual_submitted_executable_alive() {
         use super::*;
         static NEXT_KEY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1 << 63);
         let key = NEXT_KEY.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let mut ctx = CudaBackend::new_context();
+        let mut ctx =
+            CudaBackend::new_context(&ferrum_types::BackendContextConfig::default()).unwrap();
         let mut buffer = CudaBackend::from_slice_in_context(&mut ctx, &[1.0, 2.0, 3.0, 4.0]);
         CudaBackend::begin_graph_capture(&mut ctx).unwrap();
         CudaBackend::zero_buffer(&mut ctx, &mut buffer, 4).unwrap();
@@ -590,7 +529,8 @@ mod tests {
     #[ignore = "requires an actual CUDA device and graph replay"]
     fn scratch_growth_keeps_captured_storage_until_graph_and_execution_retire() {
         use super::*;
-        let mut ctx = CudaBackend::new_context();
+        let mut ctx =
+            CudaBackend::new_context(&ferrum_types::BackendContextConfig::default()).unwrap();
         let stream = ctx.stream.clone();
         let expected = [11i32, 13, 17, 19];
         crate::backend::cuda::with_argmax_out(
@@ -652,7 +592,8 @@ mod tests {
     #[ignore = "requires an actual CUDA device and graph retirement"]
     fn terminal_graph_cleanup_failure_keeps_exact_handles_until_retry() {
         use super::*;
-        let mut ctx = CudaBackend::new_context();
+        let mut ctx =
+            CudaBackend::new_context(&ferrum_types::BackendContextConfig::default()).unwrap();
         let mut buffer = CudaBackend::from_slice_in_context(&mut ctx, &[3.0, 5.0, 7.0, 9.0]);
         CudaBackend::begin_graph_capture(&mut ctx).unwrap();
         CudaBackend::zero_buffer(&mut ctx, &mut buffer, 4).unwrap();
@@ -726,7 +667,8 @@ mod tests {
         const CHILD: &str = "FERRUM_TEST_CUDA_TERMINAL_CLEANUP_DROP_CHILD";
         if std::env::var_os(CHILD).is_some() {
             use super::*;
-            let mut ctx = CudaBackend::new_context();
+            let mut ctx =
+                CudaBackend::new_context(&ferrum_types::BackendContextConfig::default()).unwrap();
             let mut buffer = CudaBackend::from_slice_in_context(&mut ctx, &[1.0; 4]);
             CudaBackend::begin_graph_capture(&mut ctx).unwrap();
             CudaBackend::zero_buffer(&mut ctx, &mut buffer, 4).unwrap();
@@ -775,7 +717,8 @@ mod tests {
         use cudarc::driver::DevicePtr;
         use ferrum_interfaces::kv_dtype::KvFp16;
 
-        let mut ctx = CudaBackend::new_context();
+        let mut ctx =
+            CudaBackend::new_context(&ferrum_types::BackendContextConfig::default()).unwrap();
         let mut cache = <KvFp16 as KvLayer<CudaBackend>>::alloc_contig(&mut ctx, 2, 2, 2);
         let original_k = [1.0, 2.0, 3.0, 4.0, 11.0, 12.0, 13.0, 14.0];
         let short_v = [21.0, 22.0, 23.0, 24.0];

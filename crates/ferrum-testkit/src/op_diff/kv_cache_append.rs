@@ -30,7 +30,7 @@ macro_rules! run_backend {
         let cv = random_vec($self.cache_elems(), -1.0, 1.0, $seed.wrapping_add(1));
         let nk = random_vec($self.new_elems(), -2.0, 2.0, $seed.wrapping_add(2));
         let nv = random_vec($self.new_elems(), -2.0, 2.0, $seed.wrapping_add(3));
-        let mut ctx = <$B>::new_context();
+        let mut ctx = <$B>::new_context(&Default::default()).expect("backend context");
         let mut cache_k = <$B>::from_slice(&ck);
         let mut cache_v = <$B>::from_slice(&cv);
         let new_k = <$B>::from_slice(&nk);

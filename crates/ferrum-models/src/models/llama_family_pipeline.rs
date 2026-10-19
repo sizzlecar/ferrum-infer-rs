@@ -586,11 +586,25 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyPipelineModel<B, K> {
                 stages.len()
             )));
         }
-        if placement.has_explicit_device_ordinals() && !B::supports_device_ordinal_scope() {
+        if placement.has_explicit_device_ordinals() && !B::supports_device_ordinal() {
             return Err(FerrumError::unsupported(
                 "Llama layer-split pipeline requested explicit backend device ordinals, \
-                 but the selected backend does not support device-scoped execution",
+                 but the selected backend does not support explicit device ordinals",
             ));
+        }
+        for (index, stage) in stages.iter().enumerate() {
+            let actual = stage.backend_device_ordinal().ok_or_else(|| {
+                FerrumError::model("Llama pipeline stage has no live original context")
+            })?;
+            if placement
+                .stage(index)
+                .backend_device_ordinal
+                .is_some_and(|requested| requested != actual)
+            {
+                return Err(FerrumError::config(format!(
+                    "Llama pipeline stage {index} was constructed on device {actual}, different from its placement",
+                )));
+            }
         }
         if placement.pipeline_mode() == LlamaPipelineMode::Overlapped && placement.len() != 2 {
             return Err(FerrumError::model(
@@ -692,28 +706,20 @@ where
         let mut bridge_timing = LlamaStageHiddenBridgeTiming::default();
 
         let stage_t0 = std::time::Instant::now();
-        let mut hidden =
-            B::with_device_ordinal(self.placement.stage(0).backend_device_ordinal, || {
-                self.stages[0].decode_stage_tokens_to_hidden_batch(batch)
-            });
+        let mut hidden = self.stages[0].decode_stage_tokens_to_hidden_batch(batch);
         stage_us.push(elapsed_micros_u64(stage_t0));
         for idx in 1..self.stages.len() {
-            let device = self.placement.stage(idx).backend_device_ordinal;
             host_bridge_bytes = host_bridge_bytes.saturating_add(hidden.len_bytes());
             let stage_t0 = std::time::Instant::now();
-            let (next_hidden, stage_bridge_timing) = B::with_device_ordinal(device, || {
-                self.stages[idx].decode_stage_hidden_from_host_batch(batch, &hidden)
-            });
+            let (next_hidden, stage_bridge_timing) =
+                self.stages[idx].decode_stage_hidden_from_host_batch(batch, &hidden);
             hidden = next_hidden;
             bridge_timing = bridge_timing.add(stage_bridge_timing);
             stage_us.push(elapsed_micros_u64(stage_t0));
         }
         let last_idx = self.stages.len() - 1;
         let logits_t0 = std::time::Instant::now();
-        let logits = B::with_device_ordinal(
-            self.placement.stage(last_idx).backend_device_ordinal,
-            || self.stages[last_idx].logits_from_hidden_batch(&hidden, force_full_logits),
-        );
+        let logits = self.stages[last_idx].logits_from_hidden_batch(&hidden, force_full_logits);
         let logits_us = elapsed_micros_u64(logits_t0);
         let total_us = elapsed_micros_u64(total_t0);
         self.decode_stats.record(
@@ -750,8 +756,6 @@ where
         }
 
         let total_t0 = std::time::Instant::now();
-        let stage0_device = self.placement.stage(0).backend_device_ordinal;
-        let stage1_device = self.placement.stage(1).backend_device_ordinal;
         let (stage0_slice, stage1_slice) = self.stages.split_at_mut(1);
         let stage0 = &mut stage0_slice[0];
         let stage1 = &mut stage1_slice[0];
@@ -772,9 +776,7 @@ where
             let worker = scope.spawn(move || {
                 for (idx, chunk) in chunks.into_iter().enumerate() {
                     let stage_t0 = std::time::Instant::now();
-                    let hidden = B::with_device_ordinal(stage0_device, || {
-                        stage0.decode_stage_tokens_to_hidden_batch(&chunk)
-                    });
+                    let hidden = stage0.decode_stage_tokens_to_hidden_batch(&chunk);
                     let stage_us = elapsed_micros_u64(stage_t0);
                     if tx.send((idx, chunk, hidden, stage_us)).is_err() {
                         break;
@@ -790,16 +792,13 @@ where
                 host_bridge_bytes = host_bridge_bytes.saturating_add(hidden.len_bytes());
 
                 let stage_t0 = std::time::Instant::now();
-                let (hidden, stage_bridge_timing) = B::with_device_ordinal(stage1_device, || {
-                    stage1.decode_stage_hidden_from_host_batch(&chunk, &hidden)
-                });
+                let (hidden, stage_bridge_timing) =
+                    stage1.decode_stage_hidden_from_host_batch(&chunk, &hidden);
                 bridge_timing = bridge_timing.add(stage_bridge_timing);
                 stage1_us_total = stage1_us_total.saturating_add(elapsed_micros_u64(stage_t0));
 
                 let logits_t0 = std::time::Instant::now();
-                let logits = B::with_device_ordinal(stage1_device, || {
-                    stage1.logits_from_hidden_batch(&hidden, force_full_logits)
-                });
+                let logits = stage1.logits_from_hidden_batch(&hidden, force_full_logits);
                 logits_us_total = logits_us_total.saturating_add(elapsed_micros_u64(logits_t0));
                 ordered_logits[idx] = Some(logits);
             }
@@ -921,10 +920,8 @@ where
     }
 
     fn prepare_kv_capacity(&mut self, cache_id: &str, capacity_hint: usize) {
-        for (index, stage) in self.stages.iter_mut().enumerate() {
-            B::with_device_ordinal(self.placement.stage(index).backend_device_ordinal, || {
-                stage.ensure_kv_with_capacity_hint(cache_id, Some(capacity_hint));
-            });
+        for stage in &mut self.stages {
+            stage.ensure_kv_with_capacity_hint(cache_id, Some(capacity_hint));
         }
     }
 
@@ -938,11 +935,8 @@ where
                 "token reservation requires a complete layer-stage placement",
             ));
         }
-        for (index, stage) in self.stages.iter_mut().enumerate() {
-            let result =
-                B::with_device_ordinal(self.placement.stage(index).backend_device_ordinal, || {
-                    stage.reserve_token_kv_slots(requests)
-                })?;
+        for stage in &mut self.stages {
+            let result = stage.reserve_token_kv_slots(requests)?;
             if matches!(result, ModelKvReservation::CapacityDeferred(_)) {
                 // This is the actual rejecting stage's allocator observation,
                 // not a fabricated aggregate pool. Earlier reservations stay
@@ -965,14 +959,11 @@ where
                 "token preparation requires a complete layer-stage placement",
             ));
         }
-        for (index, stage) in self.stages.iter_mut().enumerate() {
-            let result =
-                B::with_device_ordinal(self.placement.stage(index).backend_device_ordinal, || {
-                    // Pipeline stage execution does not yet consume a common
-                    // prefix span. Preserve stage-owned KV without acquiring
-                    // independent shared-prefix spans per stage.
-                    stage.prepare_pipeline_token_kv(request)
-                })?;
+        for stage in &mut self.stages {
+            // Pipeline stage execution does not yet consume a common prefix
+            // span. Preserve stage-owned KV without acquiring independent
+            // shared-prefix spans per stage.
+            let result = stage.prepare_pipeline_token_kv(request)?;
             if matches!(result, ModelKvReservation::CapacityDeferred(_)) {
                 // The rejecting stage supplies its actual allocator evidence.
                 // Earlier stage owners remain reachable for the same close.
@@ -1002,12 +993,9 @@ where
     }
 
     fn prepare(&mut self, cache_id: &str, max_tokens: usize) {
-        for (idx, stage) in self.stages.iter_mut().enumerate() {
-            let device = self.placement.stage(idx).backend_device_ordinal;
-            B::with_device_ordinal(device, || {
-                stage.ensure_scratch(max_tokens);
-                stage.ensure_kv(cache_id);
-            });
+        for stage in &mut self.stages {
+            stage.ensure_scratch(max_tokens);
+            stage.ensure_kv(cache_id);
         }
     }
 
@@ -1023,26 +1011,18 @@ where
         assert!(!tokens.is_empty(), "pipeline prefill called with no tokens");
         let pos_offset = self.stages[0].cache_len(cache_id);
         let mut hidden =
-            B::with_device_ordinal(self.placement.stage(0).backend_device_ordinal, || {
-                self.stages[0].prefill_stage_tokens_to_hidden(cache_id, tokens, pos_offset)
-            });
+            self.stages[0].prefill_stage_tokens_to_hidden(cache_id, tokens, pos_offset);
         for idx in 1..self.stages.len() {
-            let device = self.placement.stage(idx).backend_device_ordinal;
-            hidden = B::with_device_ordinal(device, || {
-                self.stages[idx].prefill_stage_hidden_from_host(
-                    cache_id,
-                    &hidden,
-                    tokens.len(),
-                    pos_offset,
-                )
-            });
+            hidden = self.stages[idx].prefill_stage_hidden_from_host(
+                cache_id,
+                &hidden,
+                tokens.len(),
+                pos_offset,
+            );
         }
         let last_hidden = self.last_hidden_row(&hidden, tokens.len()).to_vec();
         let last_idx = self.stages.len() - 1;
-        B::with_device_ordinal(
-            self.placement.stage(last_idx).backend_device_ordinal,
-            || self.stages[last_idx].logits_from_hidden(&last_hidden),
-        )
+        self.stages[last_idx].logits_from_hidden(&last_hidden)
     }
 
     fn decode(&mut self, cache_id: &str, token: u32, pos: u32) -> Vec<f32> {
@@ -1052,28 +1032,20 @@ where
         let mut bridge_timing = LlamaStageHiddenBridgeTiming::default();
 
         let stage_t0 = std::time::Instant::now();
-        let mut hidden =
-            B::with_device_ordinal(self.placement.stage(0).backend_device_ordinal, || {
-                self.stages[0].decode_stage_token_to_hidden(cache_id, token, pos)
-            });
+        let mut hidden = self.stages[0].decode_stage_token_to_hidden(cache_id, token, pos);
         stage_us.push(elapsed_micros_u64(stage_t0));
         for idx in 1..self.stages.len() {
-            let device = self.placement.stage(idx).backend_device_ordinal;
             host_bridge_bytes = host_bridge_bytes.saturating_add(hidden.len() * size_of::<f32>());
             let stage_t0 = std::time::Instant::now();
-            let (next_hidden, stage_bridge_timing) = B::with_device_ordinal(device, || {
-                self.stages[idx].decode_stage_hidden_from_host_with_timing(cache_id, &hidden, pos)
-            });
+            let (next_hidden, stage_bridge_timing) =
+                self.stages[idx].decode_stage_hidden_from_host_with_timing(cache_id, &hidden, pos);
             hidden = next_hidden;
             bridge_timing = bridge_timing.add(stage_bridge_timing);
             stage_us.push(elapsed_micros_u64(stage_t0));
         }
         let last_idx = self.stages.len() - 1;
         let logits_t0 = std::time::Instant::now();
-        let logits = B::with_device_ordinal(
-            self.placement.stage(last_idx).backend_device_ordinal,
-            || self.stages[last_idx].logits_from_hidden(&hidden),
-        );
+        let logits = self.stages[last_idx].logits_from_hidden(&hidden);
         self.decode_stats.record(
             1,
             1,
@@ -1115,26 +1087,20 @@ where
     }
 
     fn release(&mut self, cache_id: &str) {
-        for (idx, stage) in self.stages.iter_mut().enumerate() {
-            B::with_device_ordinal(self.placement.stage(idx).backend_device_ordinal, || {
-                stage.release(cache_id);
-            });
+        for stage in &mut self.stages {
+            stage.release(cache_id);
         }
     }
 
     fn truncate_kv(&mut self, cache_id: &str, new_len: usize) {
-        for (idx, stage) in self.stages.iter_mut().enumerate() {
-            B::with_device_ordinal(self.placement.stage(idx).backend_device_ordinal, || {
-                stage.truncate_kv(cache_id, new_len);
-            });
+        for stage in &mut self.stages {
+            stage.truncate_kv(cache_id, new_len);
         }
     }
 
     fn reset(&mut self) {
-        for (idx, stage) in self.stages.iter_mut().enumerate() {
-            B::with_device_ordinal(self.placement.stage(idx).backend_device_ordinal, || {
-                stage.reset();
-            });
+        for stage in &mut self.stages {
+            stage.reset();
         }
     }
 }
@@ -1857,6 +1823,6 @@ mod tests {
             Err(err) => err.to_string(),
         };
 
-        assert!(err.contains("does not support device-scoped execution"));
+        assert!(err.contains("does not support explicit device ordinals"));
     }
 }

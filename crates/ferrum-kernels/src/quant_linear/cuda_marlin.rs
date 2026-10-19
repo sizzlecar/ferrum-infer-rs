@@ -242,6 +242,9 @@ impl Linear<CudaBackend> for CudaMarlinStackedExpertLinear {
                         m as i32,
                         self.expert_offset as i32,
                         self.expert_n as i32,
+                        <CudaBackend as crate::backend::Backend>::context_config(ctx)
+                            .cuda
+                            .marlin_skip_ws_zero,
                     )
                     .map_err(|e| FerrumError::model(format!("marlin offset gemm: {e}")))
                 }

@@ -162,7 +162,8 @@ impl Inputs {
 #[test]
 #[ignore = "requires a CUDA GPU and the vLLM paged-attention native artifact"]
 fn native_paged_attention_matches_cpu_with_permuted_blocks_and_partition_tail() {
-    let mut context = CudaBackend::new_context();
+    let mut context =
+        CudaBackend::new_context(&ferrum_types::BackendContextConfig::default()).unwrap();
     let stream = context.stream.clone();
     // These are the two separately compiled native head-size instantiations.
     // Reuse the owning context and its stream across scratch growth.

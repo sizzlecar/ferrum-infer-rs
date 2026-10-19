@@ -153,91 +153,6 @@ use half::f16;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct CudaBackendRuntimeEnv {
-    moe_streams: usize,
-    cuda_max_kv: Option<usize>,
-    cuda_device: usize,
-}
-
-impl CudaBackendRuntimeEnv {
-    fn from_env() -> Self {
-        Self::from_env_vars(std::env::vars())
-    }
-
-    fn from_env_vars<I, K, V>(vars: I) -> Self
-    where
-        I: IntoIterator<Item = (K, V)>,
-        K: AsRef<str>,
-        V: Into<String>,
-    {
-        let mut moe_streams = None;
-        let mut cuda_max_kv = None;
-        let mut cuda_device = None;
-
-        for (key, value) in vars {
-            let value = value.into();
-            match key.as_ref() {
-                "FERRUM_MOE_STREAMS" => moe_streams = value.parse::<usize>().ok(),
-                "FERRUM_CUDA_MAX_KV" => cuda_max_kv = value.parse::<usize>().ok(),
-                "FERRUM_CUDA_DEVICE" => cuda_device = value.parse::<usize>().ok(),
-                _ => {}
-            }
-        }
-
-        Self {
-            moe_streams: moe_streams.unwrap_or(4).max(1),
-            cuda_max_kv,
-            cuda_device: cuda_device.unwrap_or(0),
-        }
-    }
-}
-
-fn cuda_backend_runtime_env() -> &'static CudaBackendRuntimeEnv {
-    static CONFIG: std::sync::OnceLock<CudaBackendRuntimeEnv> = std::sync::OnceLock::new();
-    CONFIG.get_or_init(CudaBackendRuntimeEnv::from_env)
-}
-
-thread_local! {
-    static CUDA_DEVICE_SCOPE: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
-}
-
-struct CudaDeviceScopeGuard {
-    previous: Option<usize>,
-}
-
-impl CudaDeviceScopeGuard {
-    fn enter(ordinal: usize) -> Self {
-        let previous = CUDA_DEVICE_SCOPE.with(|scope| {
-            let previous = scope.get();
-            scope.set(Some(ordinal));
-            previous
-        });
-        Self { previous }
-    }
-}
-
-impl Drop for CudaDeviceScopeGuard {
-    fn drop(&mut self) {
-        CUDA_DEVICE_SCOPE.with(|scope| scope.set(self.previous));
-    }
-}
-
-pub(super) fn current_device_ordinal() -> usize {
-    CUDA_DEVICE_SCOPE
-        .with(|scope| scope.get())
-        .unwrap_or(cuda_backend_runtime_env().cuda_device)
-}
-
-fn with_cuda_device_ordinal<R>(device_ordinal: Option<usize>, body: impl FnOnce() -> R) -> R {
-    if let Some(ordinal) = device_ordinal {
-        let _guard = CudaDeviceScopeGuard::enter(ordinal);
-        body()
-    } else {
-        body()
-    }
-}
-
 // ────────────────────────────────────────────────────────────────────────
 // Context
 // ────────────────────────────────────────────────────────────────────────
@@ -249,6 +164,8 @@ fn with_cuda_device_ordinal<R>(device_ordinal: Option<usize>, body: impl FnOnce(
 /// launch on the instance's stream(s); completion observes the main stream
 /// and any auxiliary MoE streams before releasing execution leases.
 pub struct CudaState {
+    configuration: ferrum_types::BackendContextConfig,
+    fa2_shim: Option<fa2_ffi::Fa2Shim>,
     // Programs and in-flight leases retire before their captured resource closure.
     graph_cache: HashMap<u64, Arc<graph::GraphSlotRaw>>,
     graph_leases: graph::GraphLeases,
@@ -401,11 +318,11 @@ pub(super) const HOST_STAGING_TOTAL: usize = MAX_GRAPH_SLOTS * BATCHED_SCRATCH_C
 
 impl CudaState {
     /// Lazy-init the MoE stream pool on first access. Pool size is
-    /// 4 by default; override via FERRUM_MOE_STREAMS env (1 disables
-    /// multi-stream dispatch).
+    /// 4 by default; the original context's `moe_streams` policy fixes
+    /// its size (1 selects serial expert dispatch).
     pub fn moe_stream_pool(&mut self) -> &[Arc<CudaStream>] {
         if self.moe_streams.is_none() {
-            let n = cuda_backend_runtime_env().moe_streams;
+            let n = self.configuration.moe.moe_streams;
             let mut pool = Vec::with_capacity(n);
             for _ in 0..n {
                 let s = self
@@ -595,16 +512,58 @@ impl Backend for CudaBackend {
 
     // ── Lifecycle ────────────────────────────────────────────────────────
 
-    fn new_context() -> Self::Context {
-        let ordinal = current_device_ordinal();
-        let stream = fresh_stream(ordinal);
+    fn new_context(config: &ferrum_types::BackendContextConfig) -> Result<Self::Context> {
+        config.validate()?;
+        if config.collective.world_size != 1 {
+            return Err(FerrumError::unsupported(
+                "retained CUDA context has no multi-rank collective owner",
+            ));
+        }
+        #[cfg(not(feature = "triton-kernels"))]
+        if config.cuda.triton_int4 {
+            return Err(FerrumError::unsupported(
+                "triton_int4 requires the triton-kernels feature",
+            ));
+        }
+        #[cfg(not(feature = "vllm-marlin"))]
+        if config.cuda.vllm_marlin {
+            return Err(FerrumError::unsupported(
+                "vllm_marlin requires the vllm-marlin feature",
+            ));
+        }
+        #[cfg(not(feature = "vllm-moe-marlin"))]
+        if config.moe.vllm_moe {
+            return Err(FerrumError::unsupported(
+                "vllm_moe requires the vllm-moe-marlin feature",
+            ));
+        }
+        #[cfg(not(feature = "fa2-source"))]
+        if config.cuda.fa2_source {
+            return Err(FerrumError::unsupported(
+                "fa2_source requires the fa2-source feature",
+            ));
+        }
+        let fa2_shim = if config.cuda.fa2_source {
+            None
+        } else {
+            config
+                .cuda
+                .fa2_direct_ffi_shim
+                .as_deref()
+                .map(fa2_ffi::Fa2Shim::load)
+                .transpose()?
+        };
+        let ordinal = config.device_ordinal;
+        let stream = fresh_stream(ordinal)?;
         let ctx = stream.context().clone();
         let blas_resources = BlasSlot::new(&stream);
         let blas = blas_resources.blas.clone();
         let decode_state = DecodeStateBufs::new(&stream);
         let batched_scratch = BatchedScratchSlot::new(&stream);
 
-        Self::Context {
+        Ok(Self::Context {
+            configuration: config.clone(),
+            fa2_shim,
             ordinal,
             ctx,
             stream,
@@ -646,7 +605,11 @@ impl Backend for CudaBackend {
             moe_route_capacity: 0,
             paged_attn_out_tm: None,
             paged_attn_out_tm_capacity: 0,
-        }
+        })
+    }
+
+    fn context_config(ctx: &Self::Context) -> &ferrum_types::BackendContextConfig {
+        &ctx.configuration
     }
 
     fn begin_execution(ctx: &mut Self::Context) -> Result<()> {
@@ -681,11 +644,7 @@ impl Backend for CudaBackend {
         Self::from_slice_in_context(ctx, &src_dtype.to_f32_vec(raw))
     }
 
-    fn with_device_ordinal<R>(device_ordinal: Option<usize>, body: impl FnOnce() -> R) -> R {
-        with_cuda_device_ordinal(device_ordinal, body)
-    }
-
-    fn supports_device_ordinal_scope() -> bool {
+    fn supports_device_ordinal() -> bool {
         true
     }
 
@@ -1780,8 +1739,10 @@ impl Backend for CudaBackend {
             //   raise via FERRUM_CUDA_MAX_KV env (bumps dynamic shared beyond
             //   48 KB via CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES).
             const DECODE_MAX_KV_POS_DEFAULT: usize = 8192; // 32 KB
-            let env_cap = cuda_backend_runtime_env()
-                .cuda_max_kv
+            let env_cap = ctx
+                .configuration
+                .cuda
+                .max_kv
                 .unwrap_or(DECODE_MAX_KV_POS_DEFAULT);
             let max_kv_pos = capacity.min(env_cap as i32) as u32;
             let active_kv_pos = if cfg.sliding_window > 0 {
@@ -3822,19 +3783,20 @@ fn with_instance_readback<R>(ctx: &mut CudaState, body: impl FnOnce(&Arc<CudaStr
     body(&ctx.stream)
 }
 
-fn fresh_stream(ordinal: usize) -> Arc<CudaStream> {
+fn fresh_stream(ordinal: usize) -> Result<Arc<CudaStream>> {
     let context = CudaContext::new(ordinal)
-        .unwrap_or_else(|error| panic!("CudaBackend: context {ordinal}: {error}"));
+        .map_err(|error| FerrumError::backend(format!("CudaBackend context {ordinal}: {error}")))?;
     unsafe {
         context.disable_event_tracking();
     }
     context
         .new_stream()
-        .expect("CudaBackend: new instance stream")
+        .map_err(|error| FerrumError::backend(format!("CudaBackend new instance stream: {error}")))
 }
 
 fn standalone_allocation_stream() -> Arc<CudaStream> {
-    fresh_stream(current_device_ordinal())
+    fresh_stream(ferrum_types::BackendContextConfig::default().device_ordinal)
+        .expect("standalone default CUDA stream")
 }
 
 fn with_standalone_allocation<R>(f: impl FnOnce(&Arc<CudaStream>) -> R) -> R {
@@ -3973,49 +3935,3 @@ impl crate::backend::BackendKvDtype<crate::backend::KvFp16> for CudaBackend {
 
 #[cfg(test)]
 mod submission_tests;
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn cuda_backend_runtime_env_parses_values() {
-        let env = CudaBackendRuntimeEnv::from_env_vars([
-            ("FERRUM_MOE_STREAMS", "8"),
-            ("FERRUM_CUDA_MAX_KV", "16384"),
-            ("FERRUM_CUDA_DEVICE", "2"),
-        ]);
-
-        assert_eq!(env.moe_streams, 8);
-        assert_eq!(env.cuda_max_kv, Some(16384));
-        assert_eq!(env.cuda_device, 2);
-    }
-
-    #[test]
-    fn cuda_backend_runtime_env_defaults_invalid_values() {
-        let env = CudaBackendRuntimeEnv::from_env_vars([
-            ("FERRUM_MOE_STREAMS", "0"),
-            ("FERRUM_CUDA_MAX_KV", "invalid"),
-            ("FERRUM_CUDA_DEVICE", "invalid"),
-        ]);
-
-        assert_eq!(env.moe_streams, 1);
-        assert_eq!(env.cuda_max_kv, None);
-        assert_eq!(env.cuda_device, 0);
-    }
-
-    #[test]
-    fn cuda_device_scope_nests_and_restores() {
-        let default = current_device_ordinal();
-
-        with_cuda_device_ordinal(Some(1), || {
-            assert_eq!(current_device_ordinal(), 1);
-            with_cuda_device_ordinal(Some(2), || {
-                assert_eq!(current_device_ordinal(), 2);
-            });
-            assert_eq!(current_device_ordinal(), 1);
-        });
-
-        assert_eq!(current_device_ordinal(), default);
-    }
-}

@@ -36,7 +36,7 @@ impl OpUnderTest for ArgmaxRowsOp {
         use ferrum_kernels::backend::Backend;
 
         let (logits, _) = self.build_input(seed);
-        let mut ctx = CpuBackend::new_context();
+        let mut ctx = CpuBackend::new_context(&Default::default()).expect("backend context");
         let buf = CpuBackend::from_slice(&logits);
         let idx = CpuBackend::argmax_rows_f16(&mut ctx, &buf, self.m, self.n)
             .expect("cpu argmax_rows_f16");
@@ -49,7 +49,7 @@ impl OpUnderTest for ArgmaxRowsOp {
         use ferrum_kernels::backend::Backend;
 
         let (logits, _) = self.build_input(seed);
-        let mut ctx = MetalBackend::new_context();
+        let mut ctx = MetalBackend::new_context(&Default::default()).expect("backend context");
         let buf = MetalBackend::from_slice(&logits);
         let idx = MetalBackend::argmax_rows_f16(&mut ctx, &buf, self.m, self.n)
             .expect("metal argmax_rows_f16");
@@ -62,7 +62,7 @@ impl OpUnderTest for ArgmaxRowsOp {
         use ferrum_kernels::backend::Backend;
 
         let (logits, _) = self.build_input(seed);
-        let mut ctx = CudaBackend::new_context();
+        let mut ctx = CudaBackend::new_context(&Default::default()).expect("backend context");
         let buf = CudaBackend::from_slice(&logits);
         let idx = CudaBackend::argmax_rows_f16(&mut ctx, &buf, self.m, self.n)
             .expect("cuda argmax_rows_f16");

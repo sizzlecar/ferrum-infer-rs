@@ -26,9 +26,9 @@ pub const MAX_LAYERS_FOR_GRAPH: usize = 64;
 /// The core abstraction over CUDA / Metal / CPU.
 ///
 /// Key design: operations take a `&mut Self::Context` which accumulates work.
-///   - **CPU**: Context is `()` — ops execute immediately.
-///   - **Metal**: Context is a `CommandBuffer` — ops encode into it, flushed on `sync()`.
-///   - **CUDA**: Context is a `CudaStream` — ops launch on the stream, synced on `sync()`.
+///   - **CPU**: `CpuContext` retains immutable policy; ops execute immediately.
+///   - **Metal**: `MetalContext` owns policy and command-buffer completion state.
+///   - **CUDA**: `CudaState` owns policy, streams, reusable graphs, and scratch.
 ///
 /// `layer_forward` passes the context through all ops in a layer.
 /// `ModelRunner` calls `sync()` only when it needs results (e.g., reading logits).
@@ -36,7 +36,7 @@ pub trait Backend: Send + Sync + Sized + 'static {
     type Buffer: Send + Sync;
 
     /// Execution context that accumulates GPU work.
-    ///   - CPU: `()` (no-op, ops execute inline)
+    ///   - CPU: `CpuContext` (no-op, ops execute inline)
     ///   - Metal: wraps a CommandBuffer
     ///   - CUDA: wraps a CudaStream
     // Submitted contexts must be retainable by the model's recovery service,
@@ -67,8 +67,11 @@ pub trait Backend: Send + Sync + Sized + 'static {
     //   by `load_gptq`. Adding a new Marlin-capable backend is purely a
     //   new MarlinExpertStack<NewBackend> impl — no Backend trait edits.
 
-    /// Create a new execution context (begin accumulating work).
-    fn new_context() -> Self::Context;
+    /// Construct one execution owner from an explicit immutable policy.
+    fn new_context(config: &ferrum_types::BackendContextConfig) -> Result<Self::Context>;
+
+    /// The exact policy used for weight loading and execution on this owner.
+    fn context_config(ctx: &Self::Context) -> &ferrum_types::BackendContextConfig;
 
     /// Begin a new invocation on the same instance owner. Implementations must
     /// reject an unresolved previous invocation; persistent resources survive.
@@ -96,20 +99,8 @@ pub trait Backend: Send + Sync + Sized + 'static {
         drop(buffer);
     }
 
-    /// Run `body` while binding context-free backend operations to an
-    /// explicit device ordinal when the backend supports multi-device scopes.
-    ///
-    /// Most backends have no per-ordinal concept and use the default no-op
-    /// implementation. CUDA overrides this once its stream/context caches are
-    /// device-keyed, allowing layer-split stages to load and execute on their
-    /// selected GPU instead of relying on process-global defaults.
-    fn with_device_ordinal<R>(_device_ordinal: Option<usize>, body: impl FnOnce() -> R) -> R {
-        body()
-    }
-
-    /// Whether [`Self::with_device_ordinal`] actually switches backend
-    /// execution to the requested ordinal.
-    fn supports_device_ordinal_scope() -> bool {
+    /// Whether context construction supports explicit device placement.
+    fn supports_device_ordinal() -> bool {
         false
     }
 

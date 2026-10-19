@@ -4,7 +4,7 @@ use crate::common::DecoderOnlyLLM;
 use crate::models::llama_family::LlamaFamilyConfig;
 use crate::test_support::SyntheticLlamaLoader;
 use ferrum_interfaces::kv_dtype::KvFp16;
-use ferrum_kernels::backend::cpu::CpuBackend;
+use ferrum_kernels::backend::cpu::{CpuBackend, CpuContext};
 use ferrum_kernels::backend::timer::BackendTimer;
 use ferrum_kernels::backend::{
     AttnConfig, Backend, BackendGraph, BackendKvDtype, BackendPagedKv, BackendQuantGguf,
@@ -17,6 +17,7 @@ use std::sync::{
 
 struct TrackedCpu;
 struct Context {
+    cpu: CpuContext,
     identity: Arc<()>,
     unresolved: Arc<AtomicBool>,
     calls: Arc<AtomicUsize>,
@@ -60,8 +61,9 @@ impl Backend for TrackedCpu {
     fn make_timer() -> Timer {
         Timer
     }
-    fn new_context() -> Context {
-        Context {
+    fn new_context(config: &ferrum_types::BackendContextConfig) -> Result<Context> {
+        Ok(Context {
+            cpu: CpuBackend::new_context(config)?,
             identity: Arc::new(()),
             unresolved: Arc::new(AtomicBool::new(false)),
             calls: Arc::new(AtomicUsize::new(0)),
@@ -69,7 +71,10 @@ impl Backend for TrackedCpu {
             retired: Arc::new(AtomicUsize::new(0)),
             storage_retirement_blocked: Arc::new(AtomicBool::new(false)),
             successful_allocations_before_failure: None,
-        }
+        })
+    }
+    fn context_config(ctx: &Context) -> &ferrum_types::BackendContextConfig {
+        CpuBackend::context_config(&ctx.cpu)
     }
     fn host_execution_is_synchronous() -> bool {
         true
@@ -140,12 +145,12 @@ impl Backend for TrackedCpu {
         ctx.calls.fetch_add(1, Ordering::SeqCst);
         Self::from_slice_typed(x)
     }
-    fn zero_buffer(_ctx: &mut Self::Context, _buf: &mut Self::Buffer, _len: usize) -> Result<()> {
-        CpuBackend::zero_buffer(&mut (), _buf, _len)
+    fn zero_buffer(ctx: &mut Self::Context, _buf: &mut Self::Buffer, _len: usize) -> Result<()> {
+        CpuBackend::zero_buffer(&mut ctx.cpu, _buf, _len)
     }
     fn write_typed<T: HostDtype>(ctx: &mut Self::Context, dst: &mut Self::Buffer, data: &[T]) {
         ctx.calls.fetch_add(1, Ordering::SeqCst);
-        CpuBackend::write_typed(&mut (), dst, data)
+        CpuBackend::write_typed(&mut ctx.cpu, dst, data)
     }
     fn gemm(
         ctx: &mut Self::Context,
@@ -157,7 +162,7 @@ impl Backend for TrackedCpu {
         k: usize,
     ) {
         ctx.calls.fetch_add(1, Ordering::SeqCst);
-        CpuBackend::gemm(&mut (), a, b, out, m, n, k)
+        CpuBackend::gemm(&mut ctx.cpu, a, b, out, m, n, k)
     }
     fn rms_norm(
         ctx: &mut Self::Context,
@@ -169,7 +174,7 @@ impl Backend for TrackedCpu {
         dim: usize,
     ) {
         ctx.calls.fetch_add(1, Ordering::SeqCst);
-        CpuBackend::rms_norm(&mut (), x, w, eps, out, tokens, dim)
+        CpuBackend::rms_norm(&mut ctx.cpu, x, w, eps, out, tokens, dim)
     }
     fn fused_add_rms_norm(
         ctx: &mut Self::Context,
@@ -182,7 +187,7 @@ impl Backend for TrackedCpu {
         dim: usize,
     ) {
         ctx.calls.fetch_add(1, Ordering::SeqCst);
-        CpuBackend::fused_add_rms_norm(&mut (), residual, x, w, eps, out, tokens, dim)
+        CpuBackend::fused_add_rms_norm(&mut ctx.cpu, residual, x, w, eps, out, tokens, dim)
     }
     fn flash_attention(
         ctx: &mut Self::Context,
@@ -197,7 +202,18 @@ impl Backend for TrackedCpu {
         cfg: &AttnConfig,
     ) {
         ctx.calls.fetch_add(1, Ordering::SeqCst);
-        CpuBackend::flash_attention(&mut (), q, k, v, out, batch, q_len, kv_len, pos_offset, cfg)
+        CpuBackend::flash_attention(
+            &mut ctx.cpu,
+            q,
+            k,
+            v,
+            out,
+            batch,
+            q_len,
+            kv_len,
+            pos_offset,
+            cfg,
+        )
     }
     fn copy_slice(
         ctx: &mut Self::Context,
@@ -208,7 +224,7 @@ impl Backend for TrackedCpu {
         len: usize,
     ) {
         ctx.calls.fetch_add(1, Ordering::SeqCst);
-        CpuBackend::copy_slice(&mut (), src, src_offset, dst, dst_offset, len)
+        CpuBackend::copy_slice(&mut ctx.cpu, src, src_offset, dst, dst_offset, len)
     }
     fn embedding_lookup(
         ctx: &mut Self::Context,
@@ -218,7 +234,7 @@ impl Backend for TrackedCpu {
         dim: usize,
     ) {
         ctx.calls.fetch_add(1, Ordering::SeqCst);
-        CpuBackend::embedding_lookup(&mut (), table, ids, out, dim)
+        CpuBackend::embedding_lookup(&mut ctx.cpu, table, ids, out, dim)
     }
     fn split_qkv(
         ctx: &mut Self::Context,
@@ -231,7 +247,7 @@ impl Backend for TrackedCpu {
         kv_dim: usize,
     ) {
         ctx.calls.fetch_add(1, Ordering::SeqCst);
-        CpuBackend::split_qkv(&mut (), qkv, q, k, v, tokens, q_dim, kv_dim)
+        CpuBackend::split_qkv(&mut ctx.cpu, qkv, q, k, v, tokens, q_dim, kv_dim)
     }
     fn fused_silu_mul_split(
         ctx: &mut Self::Context,
@@ -241,11 +257,11 @@ impl Backend for TrackedCpu {
         im: usize,
     ) {
         ctx.calls.fetch_add(1, Ordering::SeqCst);
-        CpuBackend::fused_silu_mul_split(&mut (), gate_up, out, tokens, im)
+        CpuBackend::fused_silu_mul_split(&mut ctx.cpu, gate_up, out, tokens, im)
     }
     fn scale_inplace(ctx: &mut Self::Context, buf: &mut Self::Buffer, scale: f32, len: usize) {
         ctx.calls.fetch_add(1, Ordering::SeqCst);
-        CpuBackend::scale_inplace(&mut (), buf, scale, len)
+        CpuBackend::scale_inplace(&mut ctx.cpu, buf, scale, len)
     }
     fn scaled_add_inplace(
         ctx: &mut Self::Context,
@@ -255,7 +271,7 @@ impl Backend for TrackedCpu {
         len: usize,
     ) {
         ctx.calls.fetch_add(1, Ordering::SeqCst);
-        CpuBackend::scaled_add_inplace(&mut (), dst, src, scale, len)
+        CpuBackend::scaled_add_inplace(&mut ctx.cpu, dst, src, scale, len)
     }
     fn qk_norm_rope(
         ctx: &mut Self::Context,
@@ -273,7 +289,7 @@ impl Backend for TrackedCpu {
     ) {
         ctx.calls.fetch_add(1, Ordering::SeqCst);
         CpuBackend::qk_norm_rope(
-            &mut (),
+            &mut ctx.cpu,
             input,
             norm_w,
             cos,
@@ -307,7 +323,7 @@ impl Backend for TrackedCpu {
     ) -> Result<()> {
         ctx.calls.fetch_add(1, Ordering::SeqCst);
         CpuBackend::qk_norm_rope_partial(
-            &mut (),
+            &mut ctx.cpu,
             input,
             norm_w,
             cos,
@@ -326,7 +342,7 @@ impl Backend for TrackedCpu {
         )
     }
     fn split_qkv_norm_rope(
-        _ctx: &mut Self::Context,
+        ctx: &mut Self::Context,
         _qkv: &Self::Buffer,
         _q_norm_w: &Self::Buffer,
         _k_norm_w: &Self::Buffer,
@@ -344,7 +360,7 @@ impl Backend for TrackedCpu {
         _qk_mode: i32,
     ) -> Result<()> {
         CpuBackend::split_qkv_norm_rope(
-            &mut (),
+            &mut ctx.cpu,
             _qkv,
             _q_norm_w,
             _k_norm_w,
@@ -363,7 +379,7 @@ impl Backend for TrackedCpu {
         )
     }
     fn split_qkv_norm_rope_into_cache(
-        _ctx: &mut Self::Context,
+        ctx: &mut Self::Context,
         _qkv: &Self::Buffer,
         _q_norm_w: &Self::Buffer,
         _k_norm_w: &Self::Buffer,
@@ -383,7 +399,7 @@ impl Backend for TrackedCpu {
         _cache_capacity: usize,
     ) -> Result<()> {
         CpuBackend::split_qkv_norm_rope_into_cache(
-            &mut (),
+            &mut ctx.cpu,
             _qkv,
             _q_norm_w,
             _k_norm_w,
@@ -417,7 +433,7 @@ impl Backend for TrackedCpu {
     ) {
         ctx.calls.fetch_add(1, Ordering::SeqCst);
         CpuBackend::kv_cache_append_head_major(
-            &mut (),
+            &mut ctx.cpu,
             cache_k,
             cache_v,
             cache_len,
@@ -438,17 +454,17 @@ impl Backend for TrackedCpu {
         dim: usize,
     ) {
         ctx.calls.fetch_add(1, Ordering::SeqCst);
-        CpuBackend::transpose_head_to_token(&mut (), src, dst, tokens, heads, dim)
+        CpuBackend::transpose_head_to_token(&mut ctx.cpu, src, dst, tokens, heads, dim)
     }
     fn transpose_token_to_head(
-        _ctx: &mut Self::Context,
+        ctx: &mut Self::Context,
         _src: &Self::Buffer,
         _dst: &mut Self::Buffer,
         _tokens: usize,
         _heads: usize,
         _dim: usize,
     ) {
-        CpuBackend::transpose_token_to_head(&mut (), _src, _dst, _tokens, _heads, _dim)
+        CpuBackend::transpose_token_to_head(&mut ctx.cpu, _src, _dst, _tokens, _heads, _dim)
     }
     fn add_inplace(
         ctx: &mut Self::Context,
@@ -457,7 +473,7 @@ impl Backend for TrackedCpu {
         len: usize,
     ) {
         ctx.calls.fetch_add(1, Ordering::SeqCst);
-        CpuBackend::add_inplace(&mut (), residual, x, len)
+        CpuBackend::add_inplace(&mut ctx.cpu, residual, x, len)
     }
     fn add_bias(
         ctx: &mut Self::Context,
@@ -467,7 +483,7 @@ impl Backend for TrackedCpu {
         cols: usize,
     ) {
         ctx.calls.fetch_add(1, Ordering::SeqCst);
-        CpuBackend::add_bias(&mut (), data, bias, rows, cols)
+        CpuBackend::add_bias(&mut ctx.cpu, data, bias, rows, cols)
     }
     fn layer_norm(
         ctx: &mut Self::Context,
@@ -480,15 +496,15 @@ impl Backend for TrackedCpu {
         dim: usize,
     ) {
         ctx.calls.fetch_add(1, Ordering::SeqCst);
-        CpuBackend::layer_norm(&mut (), x, gamma, beta, eps, out, tokens, dim)
+        CpuBackend::layer_norm(&mut ctx.cpu, x, gamma, beta, eps, out, tokens, dim)
     }
     fn gelu(ctx: &mut Self::Context, x: &Self::Buffer, out: &mut Self::Buffer, len: usize) {
         ctx.calls.fetch_add(1, Ordering::SeqCst);
-        CpuBackend::gelu(&mut (), x, out, len)
+        CpuBackend::gelu(&mut ctx.cpu, x, out, len)
     }
     fn write_f32_to_activation(ctx: &mut Self::Context, dst: &mut Self::Buffer, data: &[f32]) {
         ctx.calls.fetch_add(1, Ordering::SeqCst);
-        CpuBackend::write_f32_to_activation(&mut (), dst, data)
+        CpuBackend::write_f32_to_activation(&mut ctx.cpu, dst, data)
     }
 }
 
@@ -514,9 +530,37 @@ fn tracked_model() -> LlamaFamilyModel<TrackedCpu, KvFp16> {
 
 #[test]
 fn instance_context_reuses_original_owner_after_growth_and_peer_close() {
-    let mut first = tracked_model();
-    let mut second = tracked_model();
     let loader = SyntheticLlamaLoader::new(config());
+    let mut first_execution = ferrum_types::LlamaExecutionConfig::default();
+    first_execution.backend_context.cuda.graph_skip_upload = true;
+    first_execution.backend_context.moe.moe_block_size = Some(8);
+    first_execution.backend_context.moe.moe_streams = 2;
+    let mut second_execution = ferrum_types::LlamaExecutionConfig::default();
+    second_execution.backend_context.cuda.graph_skip_sync = true;
+    second_execution.backend_context.moe.moe_block_size = Some(64);
+    second_execution.backend_context.moe.moe_streams = 6;
+    let first_config = first_execution.backend_context.clone();
+    let second_config = second_execution.backend_context.clone();
+    let mut first = LlamaFamilyModel::<TrackedCpu>::new_with_execution_config(
+        config(),
+        &loader,
+        first_execution,
+    )
+    .unwrap();
+    let mut second = LlamaFamilyModel::<TrackedCpu>::new_with_execution_config(
+        config(),
+        &loader,
+        second_execution,
+    )
+    .unwrap();
+    assert_eq!(
+        TrackedCpu::context_config(first.execution_context.as_ref().unwrap()),
+        &first_config
+    );
+    assert_eq!(
+        TrackedCpu::context_config(second.execution_context.as_ref().unwrap()),
+        &second_config
+    );
     let mut reference = LlamaFamilyModel::<CpuBackend>::new(config(), &loader).unwrap();
     let owner = first.execution_context.as_ref().unwrap().identity.clone();
     let calls = first.execution_context.as_ref().unwrap().calls.clone();
@@ -539,6 +583,14 @@ fn instance_context_reuses_original_owner_after_growth_and_peer_close() {
         &first.execution_context.as_ref().unwrap().identity
     ));
     assert_eq!(second.prefill_internal("second", &[1, 2, 3]), prefill);
+    assert_eq!(
+        TrackedCpu::context_config(first.execution_context.as_ref().unwrap()),
+        &first_config
+    );
+    assert_eq!(
+        TrackedCpu::context_config(second.execution_context.as_ref().unwrap()),
+        &second_config
+    );
     second.close().unwrap();
     drop(second);
     assert_eq!(
@@ -557,6 +609,10 @@ fn instance_context_reuses_original_owner_after_growth_and_peer_close() {
         &owner,
         &first.execution_context.as_ref().unwrap().identity
     ));
+    assert_eq!(
+        TrackedCpu::context_config(first.execution_context.as_ref().unwrap()),
+        &first_config
+    );
     assert!(begins.load(Ordering::SeqCst) > 1);
     assert_eq!(retired.load(Ordering::SeqCst), 0);
     first.close().unwrap();

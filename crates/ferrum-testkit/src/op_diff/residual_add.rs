@@ -26,7 +26,7 @@ impl OpUnderTest for ResidualAddOp {
         use ferrum_kernels::backend::Backend;
 
         let (residual, x) = self.build_input(seed);
-        let mut ctx = CpuBackend::new_context();
+        let mut ctx = CpuBackend::new_context(&Default::default()).expect("backend context");
         let mut residual_buf = CpuBackend::from_slice(&residual);
         let x_buf = CpuBackend::from_slice(&x);
         CpuBackend::add_inplace(&mut ctx, &mut residual_buf, &x_buf, self.len);
@@ -40,7 +40,7 @@ impl OpUnderTest for ResidualAddOp {
         use ferrum_kernels::backend::Backend;
 
         let (residual, x) = self.build_input(seed);
-        let mut ctx = MetalBackend::new_context();
+        let mut ctx = MetalBackend::new_context(&Default::default()).expect("backend context");
         let mut residual_buf = MetalBackend::from_slice(&residual);
         let x_buf = MetalBackend::from_slice(&x);
         MetalBackend::add_inplace(&mut ctx, &mut residual_buf, &x_buf, self.len);
@@ -54,7 +54,7 @@ impl OpUnderTest for ResidualAddOp {
         use ferrum_kernels::backend::Backend;
 
         let (residual, x) = self.build_input(seed);
-        let mut ctx = CudaBackend::new_context();
+        let mut ctx = CudaBackend::new_context(&Default::default()).expect("backend context");
         let mut residual_buf = CudaBackend::from_slice(&residual);
         let x_buf = CudaBackend::from_slice(&x);
         CudaBackend::add_inplace(&mut ctx, &mut residual_buf, &x_buf, self.len);

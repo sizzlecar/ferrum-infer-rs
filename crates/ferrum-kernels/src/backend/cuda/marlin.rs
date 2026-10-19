@@ -6,53 +6,9 @@
 //! Constraints: K % 128 == 0, N % 256 == 0, SM >= 8.0 (Ampere+).
 
 use cudarc::driver::{CudaSlice, CudaStream, DevicePtr};
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 use crate::backend::native_status::StagedNativeStatus;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct CudaMarlinRuntimeConfig {
-    skip_ws_zero: bool,
-}
-
-impl CudaMarlinRuntimeConfig {
-    fn from_env() -> Self {
-        Self::from_env_vars(std::env::vars())
-    }
-
-    fn from_env_vars<I, K, V>(vars: I) -> Self
-    where
-        I: IntoIterator<Item = (K, V)>,
-        K: AsRef<str>,
-        V: AsRef<str>,
-    {
-        let mut config = Self {
-            skip_ws_zero: false,
-        };
-        for (name, value) in vars {
-            match name.as_ref() {
-                "FERRUM_MARLIN_SKIP_WS_ZERO" => config.skip_ws_zero = value.as_ref() == "1",
-                _ => {}
-            }
-        }
-        config
-    }
-}
-
-fn cuda_marlin_runtime_config() -> &'static CudaMarlinRuntimeConfig {
-    static CONFIG: OnceLock<CudaMarlinRuntimeConfig> = OnceLock::new();
-    CONFIG.get_or_init(CudaMarlinRuntimeConfig::from_env)
-}
-
-/// Cached `FERRUM_MARLIN_SKIP_WS_ZERO=1` flag. Read once on first
-/// access, cheap for hot paths (called per Marlin GEMM dispatch).
-fn skip_ws_zero() -> bool {
-    cuda_marlin_runtime_config().skip_ws_zero
-}
-
-fn should_zero_workspace(config: &CudaMarlinRuntimeConfig) -> bool {
-    !config.skip_ws_zero
-}
 
 // FFI declaration for the Marlin CUDA kernel.
 // Only linked when the "marlin" feature is enabled (requires nvcc + SM >= 8.0).
@@ -243,6 +199,7 @@ pub fn marlin_gemm(
     weight: &MarlinWeight,
     output: &mut CudaSlice<half::f16>,
     m: i32,
+    skip_workspace_zero: bool,
 ) -> candle_core::Result<()> {
     let n = weight.n as i32;
 
@@ -258,7 +215,14 @@ pub fn marlin_gemm(
             let chunk = (m as usize - row).min(16);
             let a_view = input.slice(row * weight.k..(row + chunk) * weight.k);
             let mut c_view = output.slice_mut(row * weight.n..(row + chunk) * weight.n);
-            marlin_gemm_chunk(stream, &a_view, weight, &mut c_view, chunk as i32)?;
+            marlin_gemm_chunk(
+                stream,
+                &a_view,
+                weight,
+                &mut c_view,
+                chunk as i32,
+                skip_workspace_zero,
+            )?;
             row += chunk;
         }
         return Ok(());
@@ -269,15 +233,18 @@ pub fn marlin_gemm(
         weight,
         &mut output.slice_mut(..),
         m,
+        skip_workspace_zero,
     )
 }
 
+#[cfg(feature = "marlin")]
 fn marlin_gemm_chunk(
     stream: &Arc<CudaStream>,
     input: &cudarc::driver::CudaView<'_, half::f16>,
     weight: &MarlinWeight,
     output: &mut cudarc::driver::CudaViewMut<'_, half::f16>,
     m: i32,
+    skip_workspace_zero: bool,
 ) -> candle_core::Result<()> {
     let n = weight.n as i32;
     let k = weight.k as i32;
@@ -286,7 +253,7 @@ fn marlin_gemm_chunk(
 
     // Zero workspace on the runner's stream — Marlin uses it as mutex locks.
     // All operations (memset + kernel) on same stream → naturally ordered.
-    if should_zero_workspace(cuda_marlin_runtime_config()) {
+    if !skip_workspace_zero {
         let (ws_ptr, _guard) = weight.workspace.device_ptr(stream);
         unsafe {
             cudarc::driver::sys::cuMemsetD32Async(ws_ptr, 0, weight.workspace.len(), raw_stream);
@@ -311,7 +278,7 @@ fn marlin_gemm_chunk(
             k,
             ws_ptr as *mut _,
             weight.group_size,
-            0, // dev
+            stream.context().ordinal() as i32, // actual stream device
             raw_stream,
             -1, // auto thread_k
             -1, // auto thread_n
@@ -341,6 +308,7 @@ pub fn marlin_gemm(
     _weight: &MarlinWeight,
     _output: &mut CudaSlice<half::f16>,
     _m: i32,
+    _skip_workspace_zero: bool,
 ) -> candle_core::Result<()> {
     Err(candle_core::Error::Msg(
         "Marlin kernel not available (compile with --features marlin)".into(),
@@ -368,6 +336,7 @@ pub fn marlin_gemm_with_offset(
     m: i32,
     expert_offset: i32,
     expert_n: i32,
+    skip_workspace_zero: bool,
 ) -> candle_core::Result<()> {
     use cudarc::driver::DevicePtr;
     let n = expert_n;
@@ -401,7 +370,7 @@ pub fn marlin_gemm_with_offset(
     const MAX_PAR: usize = 16;
     let ws_per_expert = (n_per / 128).max(1) * MAX_PAR;
     let ws_offset_bytes = expert_idx * ws_per_expert * std::mem::size_of::<i32>();
-    if should_zero_workspace(cuda_marlin_runtime_config()) {
+    if !skip_workspace_zero {
         let (ws_ptr, _g) = weight.workspace.device_ptr(stream);
         unsafe {
             cudarc::driver::sys::cuMemsetD32Async(
@@ -440,7 +409,7 @@ pub fn marlin_gemm_with_offset(
             k,
             ws_ptr as *mut _,
             weight.group_size,
-            0,
+            stream.context().ordinal() as i32,
             raw_stream,
             -1,
             -1,
@@ -467,6 +436,7 @@ pub fn marlin_gemm_with_offset(
     _m: i32,
     _expert_offset: i32,
     _expert_n: i32,
+    _skip_workspace_zero: bool,
 ) -> candle_core::Result<()> {
     Err(candle_core::Error::Msg(
         "Marlin kernel not available (compile with --features marlin)".into(),
@@ -493,6 +463,7 @@ pub fn marlin_gemm_with_offset_strided(
     m: i32,
     expert_offset: i32,
     expert_n: i32,
+    skip_workspace_zero: bool,
 ) -> candle_core::Result<()> {
     use cudarc::driver::DevicePtr;
     let n = expert_n;
@@ -514,11 +485,10 @@ pub fn marlin_gemm_with_offset_strided(
     const MAX_PAR: usize = 16;
     let ws_per_expert = (n_per / 128).max(1) * MAX_PAR;
     let ws_offset_bytes = expert_idx * ws_per_expert * std::mem::size_of::<i32>();
-    // Skip per-call workspace zeroing if env says so. Caller is then
+    // Skip per-call workspace zeroing only when the explicit caller policy says so. Caller is then
     // responsible for bulk-zeroing the workspace before the batch
-    // (saves N-1 cuMemsetD32Async launches per phase). Cached on
-    // first access — std::env::var is too slow for the hot path.
-    if !skip_ws_zero() {
+    // (saves N-1 cuMemsetD32Async launches per phase).
+    if !skip_workspace_zero {
         let (ws_ptr, _g) = weight.workspace.device_ptr(stream);
         unsafe {
             cudarc::driver::sys::cuMemsetD32Async(
@@ -563,7 +533,7 @@ pub fn marlin_gemm_with_offset_strided(
             k,
             ws_ptr as *mut _,
             weight.group_size,
-            0,
+            stream.context().ordinal() as i32,
             raw_stream,
             -1,
             -1,
@@ -595,6 +565,7 @@ pub fn marlin_gemm_with_offset_strided(
     _m: i32,
     _expert_offset: i32,
     _expert_n: i32,
+    _skip_workspace_zero: bool,
 ) -> candle_core::Result<()> {
     Err(candle_core::Error::Msg(
         "Marlin kernel not available (compile with --features marlin)".into(),
@@ -696,7 +667,7 @@ pub fn marlin_gemm_moe(
             s_int4_per_expert,
             locks_i32_per_expert,
             weight.group_size,
-            0, // dev
+            stream.context().ordinal() as i32, // actual stream device
             raw_stream,
             -1,
             -1,
@@ -1439,9 +1410,8 @@ mod tests {
     #[cfg(feature = "vllm-moe-marlin")]
     use super::{launch_marlin_moe_mxfp4_bf16, launch_marlin_moe_vllm_raw};
     use super::{
-        marlin_moe_ffi_status, should_zero_workspace, CudaMarlinRuntimeConfig,
-        MarlinMoeF16WeightType, MarlinMoeMxfp4Bf16LaunchArgs, MarlinMoeMxfp4WeightType,
-        MarlinMoeRawLaunchArgs,
+        marlin_moe_ffi_status, MarlinMoeF16WeightType, MarlinMoeMxfp4Bf16LaunchArgs,
+        MarlinMoeMxfp4WeightType, MarlinMoeRawLaunchArgs,
     };
     #[cfg(feature = "vllm-moe-marlin")]
     use crate::marlin_repack::{prepare_block_fp8_weight_for_fp8_marlin, repack_gptq_to_marlin};
@@ -2892,28 +2862,5 @@ mod tests {
                 "{case_id} rel_err={relative_l2:.8} exceeds 0.05"
             );
         }
-    }
-
-    #[test]
-    fn cuda_marlin_runtime_config_parses_skip_ws_zero() {
-        let config = CudaMarlinRuntimeConfig::from_env_vars([("FERRUM_MARLIN_SKIP_WS_ZERO", "1")]);
-        assert!(config.skip_ws_zero);
-    }
-
-    #[test]
-    fn cuda_marlin_runtime_config_defaults_to_zero_workspace() {
-        let config =
-            CudaMarlinRuntimeConfig::from_env_vars([("FERRUM_MARLIN_SKIP_WS_ZERO", "true")]);
-        assert!(!config.skip_ws_zero);
-    }
-
-    #[test]
-    fn marlin_workspace_zeroing_follows_runtime_config() {
-        let default_config = CudaMarlinRuntimeConfig::from_env_vars(Vec::<(&str, &str)>::new());
-        assert!(should_zero_workspace(&default_config));
-
-        let skip_config =
-            CudaMarlinRuntimeConfig::from_env_vars([("FERRUM_MARLIN_SKIP_WS_ZERO", "1")]);
-        assert!(!should_zero_workspace(&skip_config));
     }
 }

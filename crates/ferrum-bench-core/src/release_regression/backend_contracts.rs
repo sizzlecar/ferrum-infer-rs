@@ -157,6 +157,20 @@ pub fn contract_groups(backend: Backend) -> Vec<ContractGroup> {
         if backend == Backend::Metal {
             tests.extend(
                 [
+                    "metal_instance_weight_policy_is_frozen_across_interleaved_loads_and_peer_retirement",
+                    "metal_instance_attention_routes_and_full_outputs_survive_interleaving_and_peer_retirement",
+                    "metal_query_tiled_partial_kv_tiles_match_cpu_without_padding",
+                ]
+                .into_iter()
+                .map(|name| ContractTest {
+                    package: "ferrum-kernels".into(),
+                    target: "ferrum_kernels".into(),
+                    kind: "lib".into(),
+                    name: format!("backend::metal::instance_config_tests::{name}"),
+                }),
+            );
+            tests.extend(
+                [
                     "copy_slice_real_metal_f32_preserves_offsets_and_canaries",
                     "copy_slice_real_metal_f16_preserves_offsets_and_canaries",
                     "copy_slice_real_metal_rejects_dtype_and_extent_errors_before_encoding",
@@ -186,6 +200,12 @@ pub fn contract_groups(backend: Backend) -> Vec<ContractGroup> {
                 }),
             );
             tests.extend([
+                ContractTest {
+                    package: "ferrum-kernels".into(),
+                    target: "cuda_instance_owner".into(),
+                    kind: "test".into(),
+                    name: "equal_graph_keys_remain_owned_across_peer_reset_and_retirement".into(),
+                },
                 ContractTest {
                     package: "ferrum-kernels".into(),
                     target: "ferrum_kernels".into(),

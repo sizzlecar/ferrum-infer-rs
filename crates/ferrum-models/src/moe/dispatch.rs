@@ -20,7 +20,6 @@
 //! — same kernel ferrum already uses for dense Llama-family models.
 
 use std::path::Path;
-use std::sync::OnceLock;
 
 use candle_core::quantized::GgmlDType;
 use candle_core::{Device, Result as CandleResult};
@@ -32,84 +31,9 @@ use ferrum_kernels::backend::{
 use ferrum_kernels::{Linear, StackedExpertGgufLinear};
 use ferrum_quantization::gguf::GgufFile;
 use ferrum_quantization::{DenseLinear, QuantLinear};
-use ferrum_types::{FerrumError, Result};
+use ferrum_types::{FerrumError, MoeExecutionConfig, Result};
 
 use crate::moe::router::RouterOutput;
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct MoeDispatchRuntimeConfig {
-    vllm_moe_zero_ws: bool,
-    vllm_moe_pair_ids: bool,
-    moe_load_trace: bool,
-    moe_block_size: Option<usize>,
-    moe_large_m_block_size: Option<usize>,
-    moe_large_m_min_pairs: usize,
-    vllm_moe: bool,
-    moe_host_route: bool,
-}
-
-impl Default for MoeDispatchRuntimeConfig {
-    fn default() -> Self {
-        Self {
-            vllm_moe_zero_ws: false,
-            vllm_moe_pair_ids: false,
-            moe_load_trace: false,
-            moe_block_size: None,
-            moe_large_m_block_size: None,
-            moe_large_m_min_pairs: 1024,
-            vllm_moe: false,
-            moe_host_route: false,
-        }
-    }
-}
-
-impl MoeDispatchRuntimeConfig {
-    fn from_env() -> Self {
-        Self::from_env_vars(std::env::vars())
-    }
-
-    fn from_env_vars<I, K, V>(vars: I) -> Self
-    where
-        I: IntoIterator<Item = (K, V)>,
-        K: AsRef<str>,
-        V: AsRef<str>,
-    {
-        let mut config = Self::default();
-        for (name, value) in vars {
-            let value = value.as_ref();
-            match name.as_ref() {
-                "FERRUM_VLLM_MOE_ZERO_WS" => config.vllm_moe_zero_ws = value == "1",
-                "FERRUM_VLLM_MOE_PAIR_IDS" => config.vllm_moe_pair_ids = value == "1",
-                "FERRUM_MOE_LOAD_TRACE" => config.moe_load_trace = true,
-                "FERRUM_MOE_BLOCK_SIZE" => {
-                    config.moe_block_size = parse_moe_block_size_value(value);
-                }
-                "FERRUM_MOE_LARGE_M_BLOCK_SIZE" => {
-                    config.moe_large_m_block_size = parse_moe_block_size_value(value);
-                }
-                "FERRUM_MOE_LARGE_M_MIN_PAIRS" => {
-                    config.moe_large_m_min_pairs = value.parse::<usize>().unwrap_or(1024);
-                }
-                "FERRUM_VLLM_MOE" => config.vllm_moe = value == "1",
-                "FERRUM_MOE_HOST_ROUTE" => config.moe_host_route = value == "1",
-                _ => {}
-            }
-        }
-        config
-    }
-}
-
-fn parse_moe_block_size_value(value: &str) -> Option<usize> {
-    value
-        .parse::<usize>()
-        .ok()
-        .filter(|bs| matches!(*bs, 8 | 16 | 32 | 48 | 64))
-}
-
-fn moe_dispatch_runtime_config() -> &'static MoeDispatchRuntimeConfig {
-    static CONFIG: OnceLock<MoeDispatchRuntimeConfig> = OnceLock::new();
-    CONFIG.get_or_init(MoeDispatchRuntimeConfig::from_env)
-}
 
 /// Per-layer expert weights, materialised as `[num_experts]`-long vectors
 /// of `Box<dyn Linear<B>>`. Each entry runs the corresponding expert's
@@ -600,6 +524,7 @@ impl<B: QuantLlmBackend + BackendMoeFused> ExpertStack<B> {
     ///   `down_stack`: `[num_experts * hidden * expert_inter]`
     /// Each per-expert slice is row-major in the natural Linear shape.
     pub fn from_dense_stacks(
+        ctx: &mut B::Context,
         gate_stack: &[f32],
         up_stack: &[f32],
         down_stack: &[f32],
@@ -636,7 +561,8 @@ impl<B: QuantLlmBackend + BackendMoeFused> ExpertStack<B> {
             let mut fused = Vec::with_capacity(2 * gate_up_per_expert);
             fused.extend_from_slice(g_slice);
             fused.extend_from_slice(u_slice);
-            gate_up.push(Box::new(DenseLinear::<B>::from_rows(
+            gate_up.push(Box::new(DenseLinear::<B>::from_rows_in_context(
+                ctx,
                 &fused,
                 2 * expert_intermediate,
                 hidden_size,
@@ -644,7 +570,8 @@ impl<B: QuantLlmBackend + BackendMoeFused> ExpertStack<B> {
 
             let d_off = e * down_per_expert;
             let d_slice = &down_stack[d_off..d_off + down_per_expert];
-            down.push(Box::new(DenseLinear::<B>::from_rows(
+            down.push(Box::new(DenseLinear::<B>::from_rows_in_context(
+                ctx,
                 d_slice,
                 hidden_size,
                 expert_intermediate,
@@ -681,27 +608,29 @@ impl<B: QuantLlmBackend + BackendMoeFused> ExpertStack<B> {
     /// The runtime dispatcher (`moe_forward<B>`) doesn't see which path
     /// was taken — it just calls `Linear::forward` per (token, expert).
     pub fn load_from_gguf(
+        ctx: &mut B::Context,
         gguf: &GgufFile,
         layer_idx: usize,
         num_experts: usize,
         hidden_size: usize,
         expert_intermediate: usize,
     ) -> Result<Self> {
-        let runtime_config = moe_dispatch_runtime_config();
+        let load_trace = B::context_config(ctx).moe.moe_load_trace;
         if let Some(quant) = Self::try_load_quantised(
+            ctx,
             gguf,
             layer_idx,
             num_experts,
             hidden_size,
             expert_intermediate,
         )? {
-            if runtime_config.moe_load_trace {
+            if load_trace {
                 eprintln!("[moe-load] layer {layer_idx} → quantised expert path");
             }
             return Ok(quant);
         }
 
-        if runtime_config.moe_load_trace {
+        if load_trace {
             eprintln!("[moe-load] layer {layer_idx} → eager fp32 dense fallback ⚠");
         }
 
@@ -724,6 +653,7 @@ impl<B: QuantLlmBackend + BackendMoeFused> ExpertStack<B> {
         // Eager-dense path leaves stacked variants as None — no MoE
         // fast path for synthesised / non-quantised expert tensors.
         Self::from_dense_stacks(
+            ctx,
             &gate,
             &up,
             &down,
@@ -739,6 +669,7 @@ impl<B: QuantLlmBackend + BackendMoeFused> ExpertStack<B> {
     /// then takes the eager-dequant fallback. Returns `Err` only on a
     /// genuine load failure (missing tensor, byte-count mismatch).
     fn try_load_quantised(
+        ctx: &mut B::Context,
         gguf: &GgufFile,
         layer_idx: usize,
         num_experts: usize,
@@ -821,7 +752,8 @@ impl<B: QuantLlmBackend + BackendMoeFused> ExpertStack<B> {
         // (that would double-allocate ~17 GB on a 32 GB Mac, which on
         // Qwen3-30B-A3B Q4_K_M sends the model into swap and tanks
         // both load and forward time).
-        let gate_stacked = B::load_quant_experts(
+        let gate_stacked = B::load_quant_experts_in_context(
+            ctx,
             gate_kind,
             gate_bytes,
             num_experts,
@@ -829,7 +761,8 @@ impl<B: QuantLlmBackend + BackendMoeFused> ExpertStack<B> {
             hidden_size,
         )
         .ok();
-        let up_stacked = B::load_quant_experts(
+        let up_stacked = B::load_quant_experts_in_context(
+            ctx,
             up_kind,
             up_bytes,
             num_experts,
@@ -837,7 +770,8 @@ impl<B: QuantLlmBackend + BackendMoeFused> ExpertStack<B> {
             hidden_size,
         )
         .ok();
-        let down_stacked = B::load_quant_experts(
+        let down_stacked = B::load_quant_experts_in_context(
+            ctx,
             down_kind,
             down_bytes,
             num_experts,
@@ -872,13 +806,15 @@ impl<B: QuantLlmBackend + BackendMoeFused> ExpertStack<B> {
                     (gate_kind, g_slice, expert_intermediate),
                     (up_kind, u_slice, expert_intermediate),
                 ];
-                let gate_up_e = match QuantLinear::<B>::from_gguf_fused(&parts, hidden_size) {
-                    Ok(q) => q,
-                    Err(_) => return Ok(None),
-                };
+                let gate_up_e =
+                    match QuantLinear::<B>::from_gguf_fused_in_context(ctx, &parts, hidden_size) {
+                        Ok(q) => q,
+                        Err(_) => return Ok(None),
+                    };
                 gate_up.push(Box::new(gate_up_e) as Box<dyn Linear<B>>);
 
-                let down_e = match QuantLinear::<B>::from_gguf_bytes(
+                let down_e = match QuantLinear::<B>::from_gguf_bytes_in_context(
+                    ctx,
                     down_kind,
                     d_slice,
                     hidden_size,
@@ -907,6 +843,7 @@ impl<B: QuantLlmBackend + BackendMoeFused> ExpertStack<B> {
     /// stays open inside this call only — for multi-layer loads use
     /// [`Self::load_from_gguf`] with a shared [`GgufFile`].
     pub fn open_and_load(
+        ctx: &mut B::Context,
         path: impl AsRef<Path>,
         layer_idx: usize,
         num_experts: usize,
@@ -915,6 +852,7 @@ impl<B: QuantLlmBackend + BackendMoeFused> ExpertStack<B> {
     ) -> Result<Self> {
         let gguf = GgufFile::open(path).map_err(candle_to_ferrum)?;
         Self::load_from_gguf(
+            ctx,
             &gguf,
             layer_idx,
             num_experts,
@@ -1115,23 +1053,8 @@ pub const MOE_BLOCK_SIZE_MAX: usize = 64;
 ///
 /// Device-routing path doesn't expose `plan` host-side; fall back to 16
 /// (no regression vs pre-PR behaviour).
-fn pick_moe_block_size(
-    plan: Option<&MoeBucketPlan>,
-    num_experts: usize,
-    use_device_route: bool,
-    total_pairs: usize,
-) -> usize {
-    pick_moe_block_size_with_config(
-        moe_dispatch_runtime_config(),
-        plan,
-        num_experts,
-        use_device_route,
-        total_pairs,
-    )
-}
-
 fn pick_moe_block_size_with_config(
-    config: &MoeDispatchRuntimeConfig,
+    config: &MoeExecutionConfig,
     plan: Option<&MoeBucketPlan>,
     num_experts: usize,
     use_device_route: bool,
@@ -1408,7 +1331,7 @@ pub fn moe_forward_bucketed<B: QuantLlmBackend + BackendMoeFused>(
         )));
     }
 
-    let runtime_config = moe_dispatch_runtime_config();
+    let runtime_config = &B::context_config(ctx).moe;
 
     // ── Device-route fast path (caller provides device_route scratch,
     //     vLLM MoE enabled, and host routing not forced) ──────────────
@@ -1446,6 +1369,7 @@ pub fn moe_forward_bucketed<B: QuantLlmBackend + BackendMoeFused>(
     // FERRUM_MOE_HOST_ROUTE=1 (opt-out).
     let use_device_route = device_route.is_some() && use_vllm_moe && !runtime_config.moe_host_route;
     let use_vllm_pair_ids = use_device_route && runtime_config.vllm_moe_pair_ids;
+    let zero_marlin_workspace = !use_vllm_moe || runtime_config.vllm_moe_zero_ws;
 
     // Run device-side routing kernels EARLY so `dr.packed_token_idx`
     // is available for the device-buffer gather (embedding_lookup_dev),
@@ -1565,7 +1489,6 @@ pub fn moe_forward_bucketed<B: QuantLlmBackend + BackendMoeFused>(
              with a compatible stacked weight loader",
         )
     })?;
-    let zero_marlin_workspace = !use_vllm_moe || runtime_config.vllm_moe_zero_ws;
     if zero_marlin_workspace {
         let _ = gu_store.zero_workspace(ctx);
     }
@@ -1603,7 +1526,7 @@ pub fn moe_forward_bucketed<B: QuantLlmBackend + BackendMoeFused>(
     // The caller's sorted-token scratch must account for this upper bound.
     let max_block_size: usize = 64;
     let moe_block_size: usize = pick_moe_block_size_with_config(
-        runtime_config,
+        &B::context_config(ctx).moe,
         plan,
         num_experts,
         use_device_route,
@@ -1868,31 +1791,55 @@ pub fn moe_forward_bucketed<B: QuantLlmBackend + BackendMoeFused>(
             top_k,
             hidden_size,
         )?;
-    } else {
-        let (pairs_ref, weights_ref);
-        let _pairs_owned;
-        let _weights_owned;
-        if let Some(ref dr) = dr_kept {
-            pairs_ref = &*dr.pairs_by_token;
-            weights_ref = &*dr.pair_weights;
-        } else {
-            let plan = plan.expect("plan is Some when host moe_combine runs");
-            _pairs_owned = B::from_slice_typed::<i32>(&plan.pairs_by_token);
-            _weights_owned = B::from_slice_typed::<f32>(&plan.pair_weights);
-            pairs_ref = &_pairs_owned;
-            weights_ref = &_weights_owned;
-        }
+    } else if let Some(ref dr) = dr_kept {
         B::moe_combine(
             ctx,
             down_packed,
-            pairs_ref,
-            weights_ref,
+            dr.pairs_by_token,
+            dr.pair_weights,
             out,
             batch,
             hidden_size,
             top_k,
             total_pairs,
         );
+    } else {
+        let plan = plan.expect("plan is Some when host moe_combine runs");
+        // These temporary uploads belong to the same submission as the
+        // combine. Even a second-upload or encode panic hands the first
+        // allocation to the original context before unwinding the model.
+        let mut pairs = None;
+        let mut weights = None;
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            pairs = Some(B::from_slice_typed_in_context::<i32>(
+                ctx,
+                &plan.pairs_by_token,
+            ));
+            weights = Some(B::from_slice_typed_in_context::<f32>(
+                ctx,
+                &plan.pair_weights,
+            ));
+            B::moe_combine(
+                ctx,
+                down_packed,
+                pairs.as_ref().expect("pairs uploaded"),
+                weights.as_ref().expect("weights uploaded"),
+                out,
+                batch,
+                hidden_size,
+                top_k,
+                total_pairs,
+            );
+        }));
+        if let Some(buffer) = pairs {
+            B::retain_buffer_until_completion(ctx, buffer);
+        }
+        if let Some(buffer) = weights {
+            B::retain_buffer_until_completion(ctx, buffer);
+        }
+        if let Err(panic) = result {
+            std::panic::resume_unwind(panic);
+        }
     }
 
     Ok(())
@@ -1946,7 +1893,8 @@ pub fn moe_forward_cpu(
     out.clear();
     out.resize(batch * hidden_size, 0.0);
 
-    let mut ctx = <CpuBackend as Backend>::new_context();
+    let mut ctx =
+        <CpuBackend as Backend>::new_context(&ferrum_types::BackendContextConfig::default())?;
     let mut x_b: Vec<f32> = vec![0.0; hidden_size];
     let mut gate_up_buf: Vec<f32> = vec![0.0; 2 * expert_intermediate];
     let mut silu_mul_buf: Vec<f32> = vec![0.0; expert_intermediate];
@@ -2065,7 +2013,8 @@ mod tests {
     use ferrum_kernels::backend::Backend;
     use ferrum_kernels::StackedExpertGgufLinear;
 
-    use super::{pick_moe_block_size_with_config, ExpertStack, MoeDispatchRuntimeConfig};
+    use super::{pick_moe_block_size_with_config, ExpertStack};
+    use ferrum_types::{BackendContextConfig, MoeExecutionConfig};
 
     struct FakeStackedGgufLinear {
         num_experts: usize,
@@ -2213,50 +2162,12 @@ mod tests {
     }
 
     #[test]
-    fn moe_dispatch_runtime_config_parses_m3_startup_knobs() {
-        let config = MoeDispatchRuntimeConfig::from_env_vars([
-            ("FERRUM_VLLM_MOE_ZERO_WS", "1"),
-            ("FERRUM_VLLM_MOE_PAIR_IDS", "1"),
-            ("FERRUM_MOE_LOAD_TRACE", ""),
-            ("FERRUM_MOE_BLOCK_SIZE", "8"),
-            ("FERRUM_MOE_LARGE_M_BLOCK_SIZE", "64"),
-            ("FERRUM_MOE_LARGE_M_MIN_PAIRS", "2048"),
-            ("FERRUM_VLLM_MOE", "1"),
-            ("FERRUM_MOE_HOST_ROUTE", "1"),
-        ]);
-        assert!(config.vllm_moe_zero_ws);
-        assert!(config.vllm_moe_pair_ids);
-        assert!(config.moe_load_trace);
-        assert_eq!(config.moe_block_size, Some(8));
-        assert_eq!(config.moe_large_m_block_size, Some(64));
-        assert_eq!(config.moe_large_m_min_pairs, 2048);
-        assert!(config.vllm_moe);
-        assert!(config.moe_host_route);
-    }
-
-    #[test]
-    fn moe_dispatch_runtime_config_bounds_invalid_block_values() {
-        let config = MoeDispatchRuntimeConfig::from_env_vars([
-            ("FERRUM_MOE_BLOCK_SIZE", "12"),
-            ("FERRUM_MOE_LARGE_M_BLOCK_SIZE", "128"),
-            ("FERRUM_MOE_LARGE_M_MIN_PAIRS", "bad"),
-            ("FERRUM_VLLM_MOE_ZERO_WS", "true"),
-            ("FERRUM_MOE_HOST_ROUTE", "0"),
-        ]);
-
-        assert_eq!(config.moe_block_size, None);
-        assert_eq!(config.moe_large_m_block_size, None);
-        assert_eq!(config.moe_large_m_min_pairs, 1024);
-        assert!(!config.vllm_moe_zero_ws);
-        assert!(!config.moe_host_route);
-    }
-
-    #[test]
     fn device_route_large_m_block_size_is_thresholded() {
-        let config = MoeDispatchRuntimeConfig::from_env_vars([
-            ("FERRUM_MOE_LARGE_M_BLOCK_SIZE", "64"),
-            ("FERRUM_MOE_LARGE_M_MIN_PAIRS", "1024"),
-        ]);
+        let config = MoeExecutionConfig {
+            moe_large_m_block_size: Some(64),
+            moe_large_m_min_pairs: 1024,
+            ..Default::default()
+        };
 
         assert_eq!(
             pick_moe_block_size_with_config(&config, None, 128, true, 256),
@@ -2269,16 +2180,70 @@ mod tests {
     }
 
     #[test]
-    fn global_moe_block_size_override_still_wins() {
-        let config = MoeDispatchRuntimeConfig::from_env_vars([
-            ("FERRUM_MOE_BLOCK_SIZE", "32"),
-            ("FERRUM_MOE_LARGE_M_BLOCK_SIZE", "64"),
-            ("FERRUM_MOE_LARGE_M_MIN_PAIRS", "1024"),
-        ]);
+    fn instance_moe_block_size_override_still_wins() {
+        let config = MoeExecutionConfig {
+            moe_block_size: Some(32),
+            moe_large_m_block_size: Some(64),
+            moe_large_m_min_pairs: 1024,
+            ..Default::default()
+        };
 
         assert_eq!(
             pick_moe_block_size_with_config(&config, None, 128, true, 2048),
             32
         );
+    }
+
+    #[test]
+    fn instance_moe_context_interleaving_preserves_dispatch_policy() {
+        let mut first_config = BackendContextConfig::default();
+        first_config.moe.moe_block_size = Some(8);
+        first_config.moe.vllm_moe = true;
+        let mut second_config = BackendContextConfig::default();
+        second_config.moe.moe_large_m_block_size = Some(64);
+        second_config.moe.moe_large_m_min_pairs = 1024;
+        second_config.moe.moe_host_route = true;
+        let mut first = CpuBackend::new_context(&first_config).unwrap();
+        let mut second = CpuBackend::new_context(&second_config).unwrap();
+        first_config.moe.moe_block_size = Some(32);
+        for _ in 0..2 {
+            assert_eq!(
+                pick_moe_block_size_with_config(
+                    &CpuBackend::context_config(&first).moe,
+                    None,
+                    128,
+                    true,
+                    2048
+                ),
+                8
+            );
+            assert_eq!(
+                pick_moe_block_size_with_config(
+                    &CpuBackend::context_config(&second).moe,
+                    None,
+                    128,
+                    true,
+                    2048
+                ),
+                64
+            );
+            assert!(CpuBackend::context_config(&first).moe.vllm_moe);
+            assert!(!CpuBackend::context_config(&first).moe.moe_host_route);
+            assert!(!CpuBackend::context_config(&second).moe.vllm_moe);
+            assert!(CpuBackend::context_config(&second).moe.moe_host_route);
+        }
+        CpuBackend::retire_context(&mut second).unwrap();
+        drop(second);
+        assert_eq!(
+            pick_moe_block_size_with_config(
+                &CpuBackend::context_config(&first).moe,
+                None,
+                128,
+                true,
+                2048
+            ),
+            8
+        );
+        CpuBackend::retire_context(&mut first).unwrap();
     }
 }

@@ -151,7 +151,7 @@ fn int8_kv_append_roundtrip() {
     // 3 + 4*i for i in 0..16 → max = 3 + 60 = 63.
     let slot_mapping: Vec<i32> = (0..NUM_TOKENS).map(|i| (3 + i * 4) as i32).collect();
 
-    let mut ctx = CudaBackend::new_context();
+    let mut ctx = CudaBackend::new_context(&ferrum_types::BackendContextConfig::default()).unwrap();
     let stream = ctx.stream.clone();
 
     let k_in_dev = CudaBackend::from_slice_in_context(&mut ctx, &k_in);
@@ -325,7 +325,7 @@ fn int8_paged_decode_parity_vs_host_ref() {
     let (k_q, k_s) = quantize_token_per_head(&k_data, pool_tokens, NUM_KV_HEADS, HEAD_DIM);
     let (v_q, v_s) = quantize_token_per_head(&v_data, pool_tokens, NUM_KV_HEADS, HEAD_DIM);
 
-    let mut ctx = CudaBackend::new_context();
+    let mut ctx = CudaBackend::new_context(&ferrum_types::BackendContextConfig::default()).unwrap();
     let stream = ctx.stream.clone();
 
     let q_dev = CudaBackend::from_slice_in_context(&mut ctx, &q_data);
@@ -471,7 +471,7 @@ fn int8_kv_append_then_decode_e2e() {
     );
 
     // GPU path: append → decode.
-    let mut ctx = CudaBackend::new_context();
+    let mut ctx = CudaBackend::new_context(&ferrum_types::BackendContextConfig::default()).unwrap();
     let stream = ctx.stream.clone();
 
     let q_dev = CudaBackend::from_slice_in_context(&mut ctx, &q_data);
@@ -623,7 +623,7 @@ fn kv_cache_quant_int8_e2e() {
         scale,
     );
 
-    let mut ctx = CudaBackend::new_context();
+    let mut ctx = CudaBackend::new_context(&ferrum_types::BackendContextConfig::default()).unwrap();
     // Drive the GPU side through the high-level KvCacheQuant cache.
     let mut cache: KvCacheQuant<CudaBackend, KvInt8> =
         KvCacheQuant::new_paged_cuda(&mut ctx, MAX_BLOCKS, BLOCK_SIZE, NUM_KV_HEADS, HEAD_DIM);
@@ -727,7 +727,7 @@ fn int8_shared_pool_nonzero_blocks_and_prefix_alias_match_host_reference() {
     const HD: usize = 64;
     const KV: usize = 2;
     const Q: usize = 4;
-    let mut ctx = CudaBackend::new_context();
+    let mut ctx = CudaBackend::new_context(&ferrum_types::BackendContextConfig::default()).unwrap();
     let mut pool = QuantizedPagedKvPool::<CudaBackend, KvInt8>::new_cuda(&mut ctx, 3, BS, KV, HD);
     let mut a = KvCacheQuant::<CudaBackend, KvInt8>::new_paged_cuda(&mut ctx, 2, BS, KV, HD);
     let mut b = KvCacheQuant::<CudaBackend, KvInt8>::new_paged_cuda(&mut ctx, 2, BS, KV, HD);
@@ -856,7 +856,7 @@ fn int8_multiquery_head_major_causal_prefix_matches_host_reference() {
     const PREFIX: usize = 13;
     const ROWS: usize = 7;
     const TOTAL: usize = PREFIX + ROWS;
-    let mut ctx = CudaBackend::new_context();
+    let mut ctx = CudaBackend::new_context(&ferrum_types::BackendContextConfig::default()).unwrap();
     let mut pool = QuantizedPagedKvPool::<CudaBackend, KvInt8>::new_cuda(&mut ctx, 4, BS, KV, HD);
     let mut cache = KvCacheQuant::<CudaBackend, KvInt8>::new_paged_cuda(&mut ctx, 2, BS, KV, HD);
     cache.paged_block_indices = vec![3, 1];

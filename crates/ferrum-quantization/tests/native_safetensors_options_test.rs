@@ -95,7 +95,8 @@ fn assert_loader_diagnostics(loader: &NativeSafetensorsLoader<CpuBackend>, enabl
             next_span: AtomicU64::new(1),
         };
         tracing::subscriber::with_default(subscriber, || {
-            let mut context = CpuBackend::new_context();
+            let mut context =
+                CpuBackend::new_context(&Default::default()).expect("backend context");
             let linear = loader.load_linear(&mut context, name).unwrap();
             let mut output = vec![f32::NAN; expected.len()];
             linear.forward(&mut context, &vec![1.0; 8], &mut output, 1);

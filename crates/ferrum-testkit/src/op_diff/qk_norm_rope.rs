@@ -66,7 +66,7 @@ impl OpUnderTest for QkNormRopeOp {
         use ferrum_kernels::backend::cpu::CpuBackend;
         use ferrum_kernels::backend::Backend;
         let (x, w, cos, sin) = self.build_input(seed);
-        let mut ctx = CpuBackend::new_context();
+        let mut ctx = CpuBackend::new_context(&Default::default()).expect("backend context");
         let x_buf = CpuBackend::from_slice(&x);
         let w_buf = CpuBackend::from_slice(&w);
         let cos_buf = CpuBackend::from_slice(&cos);
@@ -95,7 +95,7 @@ impl OpUnderTest for QkNormRopeOp {
         use ferrum_kernels::backend::metal::MetalBackend;
         use ferrum_kernels::backend::Backend;
         let (x, w, cos, sin) = self.build_input(seed);
-        let mut ctx = MetalBackend::new_context();
+        let mut ctx = MetalBackend::new_context(&Default::default()).expect("backend context");
         let x_buf = MetalBackend::from_slice(&x);
         let w_buf = MetalBackend::from_slice(&w);
         let cos_buf = MetalBackend::from_slice(&cos);
@@ -124,7 +124,7 @@ impl OpUnderTest for QkNormRopeOp {
         use ferrum_kernels::backend::cuda::CudaBackend;
         use ferrum_kernels::backend::Backend;
         let (x, w, cos, sin) = self.build_input(seed);
-        let mut ctx = CudaBackend::new_context();
+        let mut ctx = CudaBackend::new_context(&Default::default()).expect("backend context");
         let x_buf = CudaBackend::from_slice(&x);
         let w_buf = CudaBackend::from_slice(&w);
         let cos_buf = CudaBackend::from_slice(&cos);

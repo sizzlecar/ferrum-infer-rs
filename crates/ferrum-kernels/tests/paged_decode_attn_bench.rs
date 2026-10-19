@@ -31,7 +31,9 @@ fn bench_paged_decode_attn() {
     const N_ITERS: usize = 200;
     const N_WARMUP: usize = 20;
 
-    let mut ctx = <CudaBackend as Backend>::new_context();
+    let mut ctx =
+        <CudaBackend as Backend>::new_context(&ferrum_types::BackendContextConfig::default())
+            .unwrap();
     let stream = ctx.stream.clone();
 
     // Q: [num_seqs, num_heads, head_dim] (q_len=1)

@@ -259,6 +259,7 @@ fn load_open_gguf_decoder_with_info(
                 let mmap_registration = ferrum_kernels::backend::metal::register_gguf_mmap(
                     gguf_arc.mmap_bytes(),
                     gguf_arc.clone(),
+                    &execution.backend_context.metal,
                 )
                 .map_err(|e| FerrumError::model(format!("register_gguf_mmap: {e}")))?;
                 let loader = GgufLoader::<MetalBackend>::from_file(gguf_arc.clone());

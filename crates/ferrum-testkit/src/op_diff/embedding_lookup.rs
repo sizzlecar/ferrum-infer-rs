@@ -35,7 +35,7 @@ impl OpUnderTest for EmbeddingLookupOp {
         use ferrum_kernels::backend::Backend;
 
         let (table, ids) = self.build_input(seed);
-        let mut ctx = CpuBackend::new_context();
+        let mut ctx = CpuBackend::new_context(&Default::default()).expect("backend context");
         let table_buf = CpuBackend::from_slice(&table);
         let mut out = CpuBackend::alloc(self.tokens * self.dim);
         CpuBackend::embedding_lookup(&mut ctx, &table_buf, &ids, &mut out, self.dim);
@@ -49,7 +49,7 @@ impl OpUnderTest for EmbeddingLookupOp {
         use ferrum_kernels::backend::Backend;
 
         let (table, ids) = self.build_input(seed);
-        let mut ctx = MetalBackend::new_context();
+        let mut ctx = MetalBackend::new_context(&Default::default()).expect("backend context");
         let table_buf = MetalBackend::from_slice(&table);
         let mut out = MetalBackend::alloc(self.tokens * self.dim);
         MetalBackend::embedding_lookup(&mut ctx, &table_buf, &ids, &mut out, self.dim);
@@ -63,7 +63,7 @@ impl OpUnderTest for EmbeddingLookupOp {
         use ferrum_kernels::backend::Backend;
 
         let (table, ids) = self.build_input(seed);
-        let mut ctx = CudaBackend::new_context();
+        let mut ctx = CudaBackend::new_context(&Default::default()).expect("backend context");
         let table_buf = CudaBackend::from_slice(&table);
         let mut out = CudaBackend::alloc(self.tokens * self.dim);
         CudaBackend::embedding_lookup(&mut ctx, &table_buf, &ids, &mut out, self.dim);

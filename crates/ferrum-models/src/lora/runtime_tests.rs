@@ -72,7 +72,7 @@ fn runtime_lora_loader_materializes_projection_metadata() {
         ],
     );
 
-    let mut ctx = CpuBackend::new_context();
+    let mut ctx = CpuBackend::new_context(&ferrum_types::BackendContextConfig::default()).unwrap();
     let adapter = load_runtime_lora_adapter::<CpuBackend>(
         &mut ctx,
         &ActiveLoraAdapter {
@@ -118,7 +118,7 @@ fn lora_workspace_growth_matches_complete_outputs<B: Backend>() {
             ),
         ],
     );
-    let mut ctx = B::new_context();
+    let mut ctx = B::new_context(&ferrum_types::BackendContextConfig::default()).unwrap();
     let mut workspace = RuntimeLoraWorkspace::<B>::default();
     let mut input = None;
     let mut out = None;

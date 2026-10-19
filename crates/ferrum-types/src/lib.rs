@@ -5,6 +5,7 @@
 //! and dependency-free to avoid circular dependencies.
 
 pub mod auto_config;
+pub mod backend_context;
 pub mod capacity;
 pub mod config;
 pub mod devices;
@@ -31,6 +32,7 @@ pub mod startup_memory;
 
 // Re-export commonly used types
 pub use auto_config::*;
+pub use backend_context::*;
 pub use capacity::AllocatorCapacityDomain;
 pub use config::*;
 pub use devices::*;

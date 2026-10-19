@@ -111,7 +111,10 @@ fn load_tensor_returns_dequantized_values() {
 
     // attn_norm was vec_tensor(4, 0.6) → [0.60, 0.61, 0.62, 0.63]
     let raw = loader
-        .load_tensor(&mut (), "model.layers.0.input_layernorm.weight")
+        .load_tensor(
+            &mut ferrum_kernels::backend::cpu::CpuContext::default(),
+            "model.layers.0.input_layernorm.weight",
+        )
         .unwrap();
     assert_eq!(raw.len(), 4);
     let expected: Vec<f32> = (0..4).map(|i| 0.6 + (i as f32) * 0.01).collect();
@@ -119,7 +122,10 @@ fn load_tensor_returns_dequantized_values() {
 
     // embed table 8x4 = 32 elems, base 0.0 step 0.001
     let embed = loader
-        .load_tensor(&mut (), "model.embed_tokens.weight")
+        .load_tensor(
+            &mut ferrum_kernels::backend::cpu::CpuContext::default(),
+            "model.embed_tokens.weight",
+        )
         .unwrap();
     assert_eq!(embed.len(), 32);
     assert!((embed[0] - 0.0).abs() < 1e-6);
@@ -132,13 +138,19 @@ fn load_tensor_unknown_name_errors() {
     let loader = build_loader(&tmp);
 
     let err = loader
-        .load_tensor(&mut (), "model.layers.99.self_attn.q_proj.weight")
+        .load_tensor(
+            &mut ferrum_kernels::backend::cpu::CpuContext::default(),
+            "model.layers.99.self_attn.q_proj.weight",
+        )
         .unwrap_err()
         .to_string();
     assert!(err.contains("not present"), "error mentions missing: {err}");
 
     let err = loader
-        .load_tensor(&mut (), "nonsense.thing")
+        .load_tensor(
+            &mut ferrum_kernels::backend::cpu::CpuContext::default(),
+            "nonsense.thing",
+        )
         .unwrap_err()
         .to_string();
     assert!(err.contains("unrecognised") || err.contains("no GGUF mapping"));
@@ -150,18 +162,29 @@ fn load_linear_direct_path() {
     let loader = build_loader(&tmp);
 
     let o = loader
-        .load_linear(&mut (), "model.layers.0.self_attn.o_proj")
+        .load_linear(
+            &mut ferrum_kernels::backend::cpu::CpuContext::default(),
+            "model.layers.0.self_attn.o_proj",
+        )
         .unwrap();
     assert_eq!(o.in_features(), 4);
     assert_eq!(o.out_features(), 4);
 
     // lm_head is 8x4 (vocab=8, hidden=4)
-    let lm = loader.load_linear(&mut (), "lm_head").unwrap();
+    let lm = loader
+        .load_linear(
+            &mut ferrum_kernels::backend::cpu::CpuContext::default(),
+            "lm_head",
+        )
+        .unwrap();
     assert_eq!(lm.in_features(), 4);
     assert_eq!(lm.out_features(), 8);
 
     let down = loader
-        .load_linear(&mut (), "model.layers.0.mlp.down_proj")
+        .load_linear(
+            &mut ferrum_kernels::backend::cpu::CpuContext::default(),
+            "model.layers.0.mlp.down_proj",
+        )
         .unwrap();
     assert_eq!(down.in_features(), 8);
     assert_eq!(down.out_features(), 4);
@@ -173,7 +196,10 @@ fn load_linear_fuses_qkv() {
     let loader = build_loader(&tmp);
 
     let qkv = loader
-        .load_linear(&mut (), "model.layers.0.self_attn.qkv_proj")
+        .load_linear(
+            &mut ferrum_kernels::backend::cpu::CpuContext::default(),
+            "model.layers.0.self_attn.qkv_proj",
+        )
         .unwrap();
     // Each part is 4x4; fused = 12x4
     assert_eq!(qkv.in_features(), 4);
@@ -184,7 +210,8 @@ fn load_linear_fuses_qkv() {
     use ferrum_kernels::backend::Backend;
     let input: Vec<f32> = vec![1.0; 4];
     let mut out: Vec<f32> = vec![0.0; 12];
-    let mut ctx = <CpuBackend as Backend>::new_context();
+    let mut ctx =
+        <CpuBackend as Backend>::new_context(&Default::default()).expect("backend context");
     qkv.forward(&mut ctx, &input, &mut out, 1);
 
     // q ramp base 2.0, k base 3.0, v base 4.0; each row of 4 has step 0.001.
@@ -216,7 +243,10 @@ fn load_linear_fuses_gate_up() {
     let loader = build_loader(&tmp);
 
     let gu = loader
-        .load_linear(&mut (), "model.layers.0.mlp.gate_up_proj")
+        .load_linear(
+            &mut ferrum_kernels::backend::cpu::CpuContext::default(),
+            "model.layers.0.mlp.gate_up_proj",
+        )
         .unwrap();
     // gate (8x4) + up (8x4) → 16x4
     assert_eq!(gu.in_features(), 4);
@@ -228,7 +258,10 @@ fn load_linear_unknown_returns_err() {
     let tmp = build_full_layer_gguf();
     let loader = build_loader(&tmp);
 
-    let result = loader.load_linear(&mut (), "model.layers.0.unknown_proj");
+    let result = loader.load_linear(
+        &mut ferrum_kernels::backend::cpu::CpuContext::default(),
+        "model.layers.0.unknown_proj",
+    );
     assert!(result.is_err());
     let err = result.err().unwrap().to_string();
     assert!(
@@ -313,7 +346,7 @@ mod fused_bias {
     ) {
         let loader = GgufLoader::<B>::from_file(Arc::new(GgufFile::open(file.path()).unwrap()));
         let reference = build_loader(file);
-        let mut context = B::new_context();
+        let mut context = B::new_context(&Default::default()).expect("backend context");
         let fused = loader.load_linear(&mut context, fused_name).unwrap();
         let batch = 3;
         // The zero row isolates bias; the two signed rows exercise the full
@@ -336,7 +369,8 @@ mod fused_bias {
         fused.forward(&mut context, &device_input, &mut device_output, batch);
         synchronize(&mut context);
         let actual = B::to_vec_in_context(&mut context, &device_output, batch * total_rows);
-        let mut reference_context = CpuBackend::new_context();
+        let mut reference_context =
+            CpuBackend::new_context(&Default::default()).expect("backend context");
         let mut offset = 0;
         for part in parts {
             // CUDA's legacy backend has no standalone unbiased Q4K route.
@@ -517,13 +551,19 @@ mod fused_bias {
             );
             let loader = build_loader(&file);
             let error = loader
-                .load_linear(&mut (), "model.layers.0.self_attn.qkv_proj")
+                .load_linear(
+                    &mut ferrum_kernels::backend::cpu::CpuContext::default(),
+                    "model.layers.0.self_attn.qkv_proj",
+                )
                 .err()
                 .expect("malformed fused bias must fail during loading");
             assert!(error.to_string().contains("bias shape"), "{error}");
             assert!(error.to_string().contains("blk.0.attn_k.bias"), "{error}");
             assert!(loader
-                .load_linear(&mut (), "model.layers.0.self_attn.k_proj")
+                .load_linear(
+                    &mut ferrum_kernels::backend::cpu::CpuContext::default(),
+                    "model.layers.0.self_attn.k_proj"
+                )
                 .is_err());
         }
     }

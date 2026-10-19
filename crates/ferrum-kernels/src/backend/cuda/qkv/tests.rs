@@ -27,7 +27,8 @@ struct Fixture {
 
 impl Fixture {
     fn new() -> Self {
-        let mut ctx = CudaBackend::new_context();
+        let mut ctx =
+            CudaBackend::new_context(&ferrum_types::BackendContextConfig::default()).unwrap();
         let host_input: Vec<_> = (0..TOKENS * (Q_HEADS + 2 * KV_HEADS) * HEAD_DIM)
             .map(|i| ((i % 43) as f32 - 21.0) / 16.0)
             .collect();

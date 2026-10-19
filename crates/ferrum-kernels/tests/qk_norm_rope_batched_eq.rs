@@ -66,7 +66,7 @@ fn qkr_batched_matches_per_item_mode_1() {
 }
 
 fn run_eq(mode: i32, label: &str) {
-    let mut ctx = CudaBackend::new_context();
+    let mut ctx = CudaBackend::new_context(&ferrum_types::BackendContextConfig::default()).unwrap();
 
     // Inputs (deterministic random):
     //   input  [m, heads, head_dim] — same for both kernels

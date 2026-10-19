@@ -712,6 +712,8 @@ impl VNextTeacherForcingConfig {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RuntimeKnobs {
+    #[serde(default)]
+    pub backend_context: crate::BackendContextConfig,
     /// Retained Llama-family construction controls, never installed globally.
     #[serde(default)]
     pub llama: crate::LlamaExecutionOptions,
@@ -1071,6 +1073,19 @@ impl EngineConfig {
         }
 
         self.runtime.llama.apply_runtime_config_snapshot(snapshot);
+        // Validate the same effective policy that model construction will use.
+        // A rank-only snapshot must see an existing explicit TP setting, and
+        // all other legacy overrides keep the single projection precedence.
+        let mut backend_context = self.llama_execution_config().backend_context;
+        backend_context
+            .apply_runtime_config_snapshot(snapshot)
+            .map_err(|error| error.to_string())?;
+        self.runtime.backend_context = backend_context;
+        if runtime_config_value(snapshot, "FERRUM_CUDA_DEVICE").is_some()
+            && matches!(self.backend.device, Device::CUDA(_))
+        {
+            self.backend.device = Device::CUDA(self.runtime.backend_context.device_ordinal);
+        }
         if let Some(value) = runtime_config_value(snapshot, "FERRUM_GPTQ_GIDX_TRACE") {
             self.runtime.gptq_gidx_trace = value == "1";
         }
@@ -1079,7 +1094,26 @@ impl EngineConfig {
 
     /// Freeze model construction options before opening or loading weights.
     pub fn llama_execution_config(&self) -> crate::LlamaExecutionConfig {
+        let mut backend_context = self.runtime.backend_context.clone();
+        // Existing explicit product fields remain authoritative during cold
+        // assembly. The constructed backend reads only this frozen value.
+        // CPU/Metal have no ordinal and must not inherit a CUDA environment
+        // selection captured for another backend.
+        backend_context.device_ordinal = self.backend.device.index().unwrap_or(0);
+        if let Some(dtype) = &self.runtime.metal_dtype {
+            backend_context.metal.prefer_f16_weights = dtype.eq_ignore_ascii_case("f16");
+        }
+        if let Some(world_size) = self.runtime.tp {
+            backend_context.collective.world_size = world_size;
+        }
+        if let Some(capacity) = self.runtime.kv_capacity {
+            backend_context.cuda.kv_capacity = capacity;
+        }
+        if let Some(split_k) = self.runtime.llama.split_k_attn {
+            backend_context.cuda.split_k_attn = Some(split_k);
+        }
         crate::LlamaExecutionConfig {
+            backend_context,
             kv_capacity: self.runtime.kv_capacity,
             paged_max_seqs: self.scheduler.max_running_requests,
             prefix_cache: self.runtime.prefix_state_cache_enabled,

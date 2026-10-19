@@ -36,7 +36,7 @@ fn det_f32(seed: u64, n: usize) -> Vec<f32> {
 
 #[test]
 fn kv_append_batched_matches_per_item_head_major() {
-    let mut ctx = CudaBackend::new_context();
+    let mut ctx = CudaBackend::new_context(&ferrum_types::BackendContextConfig::default()).unwrap();
 
     // new_data = [m, NKV, HD] item-major (output of qk_norm_rope_batched
     // for K). Same source for both paths.

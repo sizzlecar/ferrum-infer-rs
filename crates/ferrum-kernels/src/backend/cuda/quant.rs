@@ -5,8 +5,7 @@
 //! Extracted from `cuda/mod.rs` (#8 Phase 3). Owns:
 //!
 //! - `GptqStoreCuda` enum + cfg-gated alias — chooses Marlin (default)
-//!   vs Triton-rs w4a16 store at runtime via `FERRUM_TRITON_INT4=1`.
-//! - `use_triton_int4()` / `use_vllm_moe()` env-var dispatch toggles.
+//!   vs Triton-rs w4a16 store from the original context's typed policy.
 //! - `MarlinGatherScratch` + `with_marlin_gather_scratch` +
 //!   `pregrow_marlin_gather_scratch` — instance staging for desc_act Marlin
 //!   (avoids per-call cudarc alloc that grew unboundedly).
@@ -22,7 +21,7 @@
 //! preserve the historical `crate::backend::cuda::*` paths used by
 //! `quant_linear::cuda_marlin` and parity tests.
 
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 use cudarc::driver::{
     CudaContext, CudaFunction, CudaModule, CudaSlice, CudaStream, DeviceRepr, LaunchConfig,
@@ -41,18 +40,15 @@ use crate::ptx;
 
 /// CUDA-side GPTQ weight, pre-loaded for one of two fused INT4×FP16 paths.
 ///
-/// Selected once per weight at load time (`load_gptq`) based on the
-/// `FERRUM_TRITON_INT4` env var:
-///   - unset / `0`: build `Marlin` (the existing default — Marlin's tile
+/// Selected once per weight at load time from `context.cuda.triton_int4`:
+///   - false: build `Marlin` (the existing default — Marlin's tile
 ///     repack runs on the CPU; inference uses the hand-tuned CUTLASS
 ///     kernel from IST-DASLab/marlin).
-///   - `1`: build `Triton` (port of vLLM's `triton_w4a16_gemm_kernel`,
+///   - true: build `Triton` (port of vLLM's `triton_w4a16_gemm_kernel`,
 ///     adapted to ferrum's on-disk GPTQ layout — no host-side repack).
 ///
-/// The two stores cannot coexist for the same layer (load-time gating),
-/// so a process-wide A/B comparison runs as two separate `bench`
-/// invocations. This avoids doubling VRAM and keeps the dispatch
-/// branchless on the hot path.
+/// Each instance loads one actual representation per layer. Different
+/// instances may select different representations without process state.
 #[cfg(feature = "triton-kernels")]
 pub enum GptqStoreCuda {
     Marlin(crate::marlin::MarlinWeight),
@@ -65,86 +61,6 @@ pub enum GptqStoreCuda {
 /// can stay shape-identical between the two cfgs.
 #[cfg(not(feature = "triton-kernels"))]
 pub type GptqStoreCuda = crate::marlin::MarlinWeight;
-
-/// Read `FERRUM_TRITON_INT4` once. Returns true iff `=1`. Anything else
-/// (unset, `0`, empty, garbage) → false.
-fn use_triton_int4() -> bool {
-    cuda_quant_runtime_config().triton_int4
-}
-
-/// Read `FERRUM_VLLM_MOE` once. Returns true iff `=1`. Selects the
-/// vLLM marlin_moe_wna16 native artifact path for stacked-MoE GPTQ INT4
-/// weights (load + dispatch pair must be enabled together).
-#[cfg(feature = "vllm-moe-marlin")]
-pub(crate) fn use_vllm_moe() -> bool {
-    cuda_quant_runtime_config().vllm_moe
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct CudaQuantRuntimeConfig {
-    triton_int4: bool,
-    vllm_moe: bool,
-    vllm_marlin: bool,
-    vllm_marlin_sms: i32,
-    vllm_atomic_add: bool,
-    vllm_fp32_reduce: bool,
-    moe_fused: bool,
-    moe_streams: usize,
-}
-
-impl CudaQuantRuntimeConfig {
-    fn from_env() -> Self {
-        Self::from_env_vars(std::env::vars())
-    }
-
-    fn from_env_vars<I, K, V>(vars: I) -> Self
-    where
-        I: IntoIterator<Item = (K, V)>,
-        K: AsRef<str>,
-        V: AsRef<str>,
-    {
-        let mut config = Self {
-            triton_int4: false,
-            vllm_moe: false,
-            vllm_marlin: false,
-            vllm_marlin_sms: 128,
-            vllm_atomic_add: false,
-            vllm_fp32_reduce: false,
-            moe_fused: true,
-            moe_streams: 4,
-        };
-
-        for (name, value) in vars {
-            let value = value.as_ref();
-            match name.as_ref() {
-                "FERRUM_TRITON_INT4" => config.triton_int4 = value == "1",
-                "FERRUM_VLLM_MOE" => config.vllm_moe = value == "1",
-                "FERRUM_VLLM_MARLIN" => config.vllm_marlin = value == "1",
-                "FERRUM_VLLM_MARLIN_SMS" => {
-                    if let Ok(sms) = value.parse::<i32>() {
-                        config.vllm_marlin_sms = sms;
-                    }
-                }
-                "FERRUM_VLLM_ATOMIC_ADD" => config.vllm_atomic_add = value == "1",
-                "FERRUM_VLLM_FP32_REDUCE" => config.vllm_fp32_reduce = value == "1",
-                "FERRUM_MOE_FUSED" => config.moe_fused = value != "0",
-                "FERRUM_MOE_STREAMS" => {
-                    if let Ok(streams) = value.parse::<usize>() {
-                        config.moe_streams = streams.max(1);
-                    }
-                }
-                _ => {}
-            }
-        }
-
-        config
-    }
-}
-
-fn cuda_quant_runtime_config() -> &'static CudaQuantRuntimeConfig {
-    static CONFIG: OnceLock<CudaQuantRuntimeConfig> = OnceLock::new();
-    CONFIG.get_or_init(CudaQuantRuntimeConfig::from_env)
-}
 
 fn marlin_qzeros_are_symmetric_code7(qzeros: &[i32]) -> bool {
     !qzeros.is_empty()
@@ -359,8 +275,13 @@ pub fn marlin_gemm_with_perm(
     out: &mut CudaSlice<f16>,
     m: usize,
 ) -> Result<()> {
-    let runtime_config = cuda_quant_runtime_config();
-    let use_vllm = runtime_config.vllm_marlin;
+    let use_vllm = ctx.configuration.cuda.vllm_marlin;
+    let skip_zero = ctx.configuration.cuda.marlin_skip_ws_zero;
+    let vllm_options = (
+        ctx.configuration.cuda.vllm_marlin_sms,
+        ctx.configuration.cuda.vllm_atomic_add,
+        ctx.configuration.cuda.vllm_fp32_reduce,
+    );
     if weight.vllm_moe {
         return Err(FerrumError::unsupported(
             "vLLM Marlin-MoE packed weight cannot be dispatched through dense Marlin GEMM",
@@ -392,16 +313,16 @@ pub fn marlin_gemm_with_perm(
             }
             .map_err(|e| FerrumError::model(format!("gather_columns launch: {e}")))?;
             if use_vllm {
-                return launch_vllm_marlin(&stream, a_gathered, weight, out, m);
+                return launch_vllm_marlin(&stream, a_gathered, weight, out, m, vllm_options);
             }
-            crate::marlin::marlin_gemm(&stream, a_gathered, weight, out, m as i32)
+            crate::marlin::marlin_gemm(&stream, a_gathered, weight, out, m as i32, skip_zero)
                 .map_err(|e| FerrumError::model(format!("marlin_gemm (perm): {e}")))
         })
     } else {
         if use_vllm {
-            return launch_vllm_marlin(&ctx.stream, a, weight, out, m);
+            return launch_vllm_marlin(&ctx.stream, a, weight, out, m, vllm_options);
         }
-        crate::marlin::marlin_gemm(&ctx.stream, a, weight, out, m as i32)
+        crate::marlin::marlin_gemm(&ctx.stream, a, weight, out, m as i32, skip_zero)
             .map_err(|e| FerrumError::model(format!("marlin_gemm: {e}")))
     }
 }
@@ -413,6 +334,7 @@ pub fn launch_vllm_marlin(
     weight: &crate::marlin::MarlinWeight,
     out: &mut CudaSlice<f16>,
     m: usize,
+    options: (i32, bool, bool),
 ) -> Result<()> {
     use cudarc::driver::DevicePtr;
     // Zero workspace (it's used as mutex locks in vLLM's marlin too).
@@ -433,12 +355,7 @@ pub fn launch_vllm_marlin(
     let k = weight.k as i32;
     let group_size = weight.group_size;
     let num_groups = if group_size > 0 { k / group_size } else { 1 };
-    // RTX 4090 = 128 SMs. TODO: query CudaDevice attribute.
-    let runtime_config = cuda_quant_runtime_config();
-    let sms = runtime_config.vllm_marlin_sms;
-    // vLLM perf knobs — try toggling via env to see if either helps.
-    let use_atomic_add = runtime_config.vllm_atomic_add;
-    let use_fp32_reduce = runtime_config.vllm_fp32_reduce;
+    let (sms, use_atomic_add, use_fp32_reduce) = options;
 
     unsafe {
         crate::vllm_marlin::launch_marlin_mm_f16_u4b8(
@@ -460,7 +377,7 @@ pub fn launch_vllm_marlin(
             true,  // is_k_full
             num_groups,
             group_size,
-            0, // dev
+            stream.context().ordinal() as i32, // actual stream device
             raw_stream as cudarc::driver::sys::CUstream,
             sms,
             use_atomic_add,
@@ -477,6 +394,7 @@ fn launch_vllm_marlin(
     _weight: &crate::marlin::MarlinWeight,
     _out: &mut CudaSlice<f16>,
     _m: usize,
+    _options: (i32, bool, bool),
 ) -> Result<()> {
     Err(FerrumError::model(
         "FERRUM_VLLM_MARLIN=1 set but binary not built with --features vllm-marlin",
@@ -508,7 +426,7 @@ impl BackendQuantMarlin for CudaBackend {
         k: usize,
         n: usize,
     ) -> Result<Box<dyn crate::Linear<Self> + Send + Sync>> {
-        let mut ctx = Self::new_context();
+        let mut ctx = Self::new_context(&ferrum_types::BackendContextConfig::default())?;
         let result = Self::load_gptq_in_context(
             &mut ctx, qweight, scales, qzeros, g_idx, bias_host, bits, group_size, k, n,
         );
@@ -555,7 +473,7 @@ impl BackendQuantMarlin for CudaBackend {
         // GPTQ tensor layout directly. Just upload the three tensors and
         // tag the store as Triton. No CPU-side repack.
         #[cfg(feature = "triton-kernels")]
-        if use_triton_int4() {
+        if ctx.configuration.cuda.triton_int4 {
             let stream = ctx.stream.clone();
             let scales_f16: Vec<f16> = scales.iter().map(|&x| f16::from_f32(x)).collect();
             let qweight_dev = stream
@@ -687,7 +605,7 @@ impl BackendQuantMarlin for CudaBackend {
         k: usize,
         n_per_expert: usize,
     ) -> Result<std::sync::Arc<dyn crate::MarlinExpertStack<Self>>> {
-        let mut ctx = Self::new_context();
+        let mut ctx = Self::new_context(&ferrum_types::BackendContextConfig::default())?;
         let result = Self::load_gptq_stacked_in_context(
             &mut ctx,
             qweights,
@@ -749,7 +667,7 @@ impl BackendQuantMarlin for CudaBackend {
         // zero-point bias. FERRUM_VLLM_MOE=1 remains an opt-in for
         // symmetric models; asymmetric stacks select vLLM automatically.
         #[cfg(feature = "vllm-moe-marlin")]
-        if use_vllm_moe() || needs_vllm_qzeros {
+        if ctx.configuration.moe.vllm_moe || needs_vllm_qzeros {
             let stream = ctx.stream.clone();
             let mw = crate::vllm_marlin::load_stacked_gptq_vllm_marlin(
                 &stream,
@@ -799,7 +717,7 @@ impl BackendQuantMarlin for CudaBackend {
         // Triton path: would need a stacked variant — not implemented.
         // Fall through to Marlin.
         #[cfg(feature = "triton-kernels")]
-        if use_triton_int4() {
+        if ctx.configuration.cuda.triton_int4 {
             return Err(FerrumError::unsupported(
                 "load_gptq_stacked: Triton w4a16 path not implemented; \
                  unset FERRUM_TRITON_INT4 to use Marlin",
@@ -967,10 +885,10 @@ pub(crate) fn moe_gemm_phase_batched_impl(
     // bucket ∈ {1, 2, 3, 4}) instead of N round-robin calls. At c=32
     // with ~100 active experts/layer this is 1-4 launches/layer
     // instead of 100. Bench: +25% c=32, +35% c=16, +48% c=8 over
-    // the multi-stream per-expert path. Set FERRUM_MOE_FUSED=0 to
-    // opt out (fall back to multi-stream pool).
-    let runtime_config = cuda_quant_runtime_config();
-    if runtime_config.moe_fused {
+    // the multi-stream per-expert path. The context's `moe_fused=false`
+    // selects the multi-stream pool.
+    let skip_zero = ctx.configuration.cuda.marlin_skip_ws_zero;
+    if ctx.configuration.moe.moe_fused {
         return moe_gemm_phase_fused_impl(
             ctx,
             input.as_f16(),
@@ -985,7 +903,7 @@ pub(crate) fn moe_gemm_phase_batched_impl(
     // n_streams=1: serial dispatch on the DEFAULT context stream
     // (avoids the cross-stream sync overhead and matches the
     // pre-multi-stream path bit-for-bit).
-    let n_streams = runtime_config.moe_streams;
+    let n_streams = ctx.configuration.moe.moe_streams;
     if n_streams == 1 {
         let default_stream = ctx.stream.clone();
         for (expert_idx, in_row_offset, out_row_offset, m) in dispatches {
@@ -999,6 +917,7 @@ pub(crate) fn moe_gemm_phase_batched_impl(
                 *m as i32,
                 (expert_idx * n_per_expert) as i32,
                 n_per_expert as i32,
+                skip_zero,
             )
             .map_err(|e| FerrumError::model(format!("marlin offset_strided: {e}")))?;
         }
@@ -1043,6 +962,7 @@ pub(crate) fn moe_gemm_phase_batched_impl(
             *m as i32,
             (expert_idx * n_per_expert) as i32,
             n_per_expert as i32,
+            skip_zero,
         )
         .map_err(|e| FerrumError::model(format!("marlin offset_strided: {e}")))?;
     }
@@ -1138,50 +1058,7 @@ impl BackendQuantGguf for CudaBackend {}
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        marlin_qzeros_are_symmetric_code7, reject_unsupported_marlin_qzeros, CudaQuantRuntimeConfig,
-    };
-
-    #[test]
-    fn cuda_quant_runtime_config_parses_marlin_and_moe_knobs() {
-        let config = CudaQuantRuntimeConfig::from_env_vars([
-            ("FERRUM_TRITON_INT4", "1"),
-            ("FERRUM_VLLM_MOE", "1"),
-            ("FERRUM_VLLM_MARLIN", "1"),
-            ("FERRUM_VLLM_MARLIN_SMS", "132"),
-            ("FERRUM_VLLM_ATOMIC_ADD", "1"),
-            ("FERRUM_VLLM_FP32_REDUCE", "1"),
-            ("FERRUM_MOE_FUSED", "0"),
-            ("FERRUM_MOE_STREAMS", "0"),
-        ]);
-
-        assert!(config.triton_int4);
-        assert!(config.vllm_moe);
-        assert!(config.vllm_marlin);
-        assert_eq!(config.vllm_marlin_sms, 132);
-        assert!(config.vllm_atomic_add);
-        assert!(config.vllm_fp32_reduce);
-        assert!(!config.moe_fused);
-        assert_eq!(config.moe_streams, 1);
-    }
-
-    #[test]
-    fn cuda_quant_runtime_config_keeps_existing_defaults() {
-        let config = CudaQuantRuntimeConfig::from_env_vars([
-            ("FERRUM_TRITON_INT4", "true"),
-            ("FERRUM_VLLM_MARLIN_SMS", "bad"),
-            ("FERRUM_MOE_STREAMS", "bad"),
-        ]);
-
-        assert!(!config.triton_int4);
-        assert!(!config.vllm_moe);
-        assert!(!config.vllm_marlin);
-        assert_eq!(config.vllm_marlin_sms, 128);
-        assert!(!config.vllm_atomic_add);
-        assert!(!config.vllm_fp32_reduce);
-        assert!(config.moe_fused);
-        assert_eq!(config.moe_streams, 4);
-    }
+    use super::{marlin_qzeros_are_symmetric_code7, reject_unsupported_marlin_qzeros};
 
     #[test]
     fn marlin_qzeros_must_be_symmetric_code7() {

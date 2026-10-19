@@ -1,32 +1,16 @@
 //! Metal compute pipeline cache and dispatch helpers.
 
+use ferrum_types::MetalBackendConfig;
 use metal::*;
 use std::collections::HashMap;
 use std::ffi::c_void;
-use std::sync::OnceLock;
 
+/// The actual numerical kernel selected for an attention dispatch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct MetalAttentionRuntimeConfig {
-    force_legacy: bool,
-    allow_decode_widen: bool,
-}
-
-fn metal_attention_runtime_config() -> &'static MetalAttentionRuntimeConfig {
-    static CONFIG: OnceLock<MetalAttentionRuntimeConfig> = OnceLock::new();
-    CONFIG.get_or_init(|| {
-        let mut config = MetalAttentionRuntimeConfig {
-            force_legacy: false,
-            allow_decode_widen: true,
-        };
-        for (name, value) in std::env::vars() {
-            match name.as_str() {
-                "FERRUM_FA_LEGACY" => config.force_legacy = value == "1",
-                "FERRUM_FA_DECODE" => config.allow_decode_widen = value != "0",
-                _ => {}
-            }
-        }
-        config
-    })
+pub enum MetalAttentionKernel {
+    QueryTiled,
+    DecodeWide,
+    Legacy,
 }
 
 pub struct MetalPipelines {
@@ -1050,7 +1034,8 @@ impl MetalPipelines {
         o: &Buffer,
         params: &crate::attention::AttentionParams,
         kv_seq_stride: usize,
-    ) {
+        options: &MetalBackendConfig,
+    ) -> MetalAttentionKernel {
         #[repr(C)]
         struct P {
             batch: i32,
@@ -1091,13 +1076,11 @@ impl MetalPipelines {
         //                                        scalar path used to give us)
         //   everything else                   → flash_attn_f32 (legacy scalar)
         //
-        // Override via `FERRUM_FA_LEGACY=1` to force the scalar path (debugging
-        // / numerical comparison). `FERRUM_FA_DECODE=0` disables the new
-        // decode kernel specifically while leaving Q-tiled prefill enabled.
+        // Policy comes from the original execution context, never the shared
+        // immutable pipeline cache or another model's first call.
         const Q_TILE_R: usize = 8;
-        let runtime_config = metal_attention_runtime_config();
-        let force_legacy = runtime_config.force_legacy;
-        let allow_decode_widen = runtime_config.allow_decode_widen;
+        let force_legacy = options.force_legacy_attention;
+        let allow_decode_widen = options.allow_decode_widen;
         let use_q_tiled = !force_legacy
             && params.head_dim == 128
             && params.sliding_window == 0
@@ -1160,9 +1143,16 @@ impl MetalPipelines {
             enc.dispatch_thread_groups(grid, tg);
         }
         enc.end_encoding();
+        if use_q_tiled {
+            MetalAttentionKernel::QueryTiled
+        } else if use_decode_widen {
+            MetalAttentionKernel::DecodeWide
+        } else {
+            MetalAttentionKernel::Legacy
+        }
     }
 
-    /// Run flash attention (legacy API, contiguous KV)
+    /// Run flash attention with explicit policy and contiguous KV.
     pub fn flash_attn(
         &self,
         cmd: &CommandBufferRef,
@@ -1171,8 +1161,9 @@ impl MetalPipelines {
         v: &Buffer,
         o: &Buffer,
         params: &crate::attention::AttentionParams,
-    ) {
-        self.flash_attn_v2(cmd, q, k, v, o, params, 0);
+        options: &MetalBackendConfig,
+    ) -> MetalAttentionKernel {
+        self.flash_attn_v2(cmd, q, k, v, o, params, 0, options)
     }
 
     /// Split fused QKV: qkv [tokens, q_dim + 2*kv_dim] → q, k, v separate buffers.

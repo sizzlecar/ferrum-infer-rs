@@ -327,8 +327,7 @@ mod tests {
     fn cpu_timer_basic() {
         let mut t = CpuTimer::new();
         assert_eq!(t.elapsed_ms(), 0.0);
-        // Construct a CpuBackend Context — which is unit.
-        let mut ctx: <crate::backend::cpu::CpuBackend as Backend>::Context = ();
+        let mut ctx = crate::backend::cpu::CpuBackend::new_context(&Default::default()).unwrap();
         BackendTimer::<crate::backend::cpu::CpuBackend>::record_start(&mut t, &mut ctx);
         std::thread::sleep(std::time::Duration::from_millis(2));
         BackendTimer::<crate::backend::cpu::CpuBackend>::record_end(&mut t, &mut ctx);

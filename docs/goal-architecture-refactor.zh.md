@@ -2,7 +2,7 @@
 
 **状态：目标已激活，R0 已合并，R1 验收、R2 收敛与 R3 配置迁移中。** 工作分支：`refactor/execution-architecture-20261018`，从 2026-10-18 的干净 `main`（`c2be4c67`）开始。首个 checkpoint 退役独立 embedding/ASR/TTS 链路；原工作区未合并的旧 SLO 实现不作为代码基底。
 
-R0 六批清理与正确性修复已合并（PR #429–#434）。R1 已分离 runtime 与产品执行契约，统一 token 提交，退出旧 Tensor 控制流。R2 已统一驱动、关闭与输出生命周期，隔离观测故障，退役全局 profiler。R3 已将构造配置、CUDA graph/stream、QKV 暂存与 LoRA 工作区归到原实例，收拢 LoRA 裸执行入口，并验证捕获失败后的显式取消与恢复；相关 CPU/Metal/CUDA 定向验证通过。后端全局策略、Metal 共享资源边界及其余低层入口仍待收敛。默认 GPTQ Marlin 的 SM120 非法指令在改前提交同样复现，暂留收尾处理。GGUF C8 数值原因与默认性能验收仍开放。R1 验收、R2–R5 未完成；原始证据留在仓库外，没有新增性能或 SLO 达标声明。
+R0 六批清理与正确性修复已合并（PR #429–#434）。R1 已分离 runtime 与产品执行契约，统一 token 提交，退出旧 Tensor 控制流。R2 已统一驱动、关闭与输出生命周期，隔离观测故障，退役全局 profiler；journal 并发发布共享许可，关闭保留独占截断与原 writer 的完成证据。R3 已将模型及后端策略、CUDA graph/stream、QKV 暂存与 LoRA 工作区归到原实例，收拢 LoRA 裸执行入口，并验证捕获失败后的显式取消与恢复；相关 CPU/Metal/CUDA 定向验证通过。Metal 共享资源边界、其余低层入口及诊断/native 环境选项仍待收敛。默认 GPTQ Marlin 的 SM120 非法指令在改前提交同样复现，暂留收尾处理。GGUF C8 数值原因与默认性能验收仍开放。R1 验收、R2–R5 未完成；原始证据留在仓库外，没有新增性能或 SLO 达标声明。
 
 ## 1. 目标与第一原则
 
@@ -44,6 +44,8 @@ R0 六批清理与正确性修复已合并（PR #429–#434）。R1 已分离 ru
 MoE API 迁移：移除旧 `Qwen3MoeModel`、`Qwen3MoeConfig`、`Qwen3MoeLayer` 和独立 `GgufRuntime`；通过产品来源注册入口使用保留的 typed MoE。旧 CPU MoE 整模型路径随之退役，CPU 路由/dispatch 数值参考不代表 typed CPU MoE 可运行。旧 MoE graph/batch 专属选项明确拒绝；`[runtime]` 未知字段及已有 `ferrum.toml` 的读取/解析错误会报错，缺少配置文件仍使用默认值。
 
 观测 API 迁移：移除 bench-core 全局 profile/trace writer、旧算子计数诊断与 native profile set/clear 导出；历史 `ProfileEvent` 解析保留。`run` / `serve` 显式指定日志路径时统一使用实例产品 schema，`Off` 仍不采集设备计时或计算事实。旧诊断配置明确拒绝；保留的 serve metadata 参数仅作为用户声明。MoE native 包升级至 operator ABI 2，数学入口签名不变；旧包须更换，不能仅删除 Rust 调用后继续链接旧 writer。
+
+后端配置 API：`Backend::new_context(&BackendContextConfig)` 返回可失败的原实例，`context_config` 提供加载与执行共享的不可变策略；移除设备选择 TLS，layer stage 显式绑定设备。库直接构造使用固定默认配置，CLI 仅在冷装配解析来源。Metal 共享设备/队列/mmap、独立 CUDA decode 诊断及 native TILE override 仍有单独边界，不据此宣称所有全局状态已消除。
 
 配置 API 迁移：移除 `install_runtime_snapshot` / `active_runtime_snapshot`。Engine 在加载权重前固定 `LlamaExecutionConfig`，显式传入普通模型、GGUF 与 layer stage；库调用使用 `*_with_execution_config`，原构造器使用固定默认值。GPTQ loader 诊断通过 `NativeSafetensorsLoadOptions` 传入。batched graph / prefix 的布尔值统一按 Engine 语义解释，修正旧模型对 `true` / `false` 的不同解释；默认值与 `0/1` 行为保留。CLI 配置来源保留，模型专属选项不再写回进程环境；仍有真实消费者的后端配置桥随 GPU 所有权迁移退出，本片不代表全部运行状态已隔离。
 

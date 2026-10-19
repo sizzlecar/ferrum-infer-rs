@@ -573,7 +573,8 @@ pub(crate) mod workspace_tests {
 
     #[test]
     fn lora_workspace_reuses_original_buffers_and_grows_before_encoding() {
-        let mut ctx = CpuBackend::new_context();
+        let mut ctx =
+            CpuBackend::new_context(&ferrum_types::BackendContextConfig::default()).unwrap();
         let adapter = RuntimeLoraAdapter::<CpuBackend> {
             name: "workspace".into(),
             path: PathBuf::new(),

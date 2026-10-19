@@ -2,8 +2,8 @@
 //!
 //! This is an opt-in bridge for benchmarking against the exact FA2 paged-KV
 //! runner that vLLM uses. The heavy Python/Torch extension dependencies stay
-//! outside Ferrum's normal link path: setting `FERRUM_FA2_DIRECT_FFI_SHIM`
-//! to a small C ABI `.so` enables the path, and this module resolves it with
+//! outside Ferrum's normal link path: an explicit context shim path
+//! selects a small C ABI `.so`, and this module resolves it with
 //! `dlopen` on Unix. This diagnostic shim is unavailable on other platforms.
 
 #[cfg(unix)]
@@ -38,7 +38,7 @@ pub(super) type Fa2PagedVarlenFn = unsafe extern "C" fn(
     err_buf_len: usize,
 ) -> c_int;
 
-struct Fa2Shim {
+pub(super) struct Fa2Shim {
     _handle: *mut c_void,
     paged_varlen: Fa2PagedVarlenFn,
 }
@@ -46,14 +46,13 @@ struct Fa2Shim {
 unsafe impl Send for Fa2Shim {}
 unsafe impl Sync for Fa2Shim {}
 
-static FA2_SHIM: std::sync::OnceLock<Result<Fa2Shim>> = std::sync::OnceLock::new();
-
 #[cfg(unix)]
 #[link(name = "dl")]
 extern "C" {
     fn dlopen(filename: *const c_char, flags: c_int) -> *mut c_void;
     fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
     fn dlerror() -> *const c_char;
+    fn dlclose(handle: *mut c_void) -> c_int;
 }
 
 #[cfg(unix)]
@@ -74,23 +73,9 @@ fn dl_error_string() -> String {
 }
 
 #[cfg(unix)]
-fn fa2_direct_ffi_shim_path_from_env() -> Option<String> {
-    std::env::vars()
-        .find(|(name, _)| name == "FERRUM_FA2_DIRECT_FFI_SHIM")
-        .map(|(_, value)| value)
-}
-
-#[cfg(unix)]
-fn load_fa2_shim() -> Result<Fa2Shim> {
-    let path = fa2_direct_ffi_shim_path_from_env().ok_or_else(|| {
-        FerrumError::unsupported(
-            "FA2 direct FFI requires FERRUM_FA2_DIRECT_FFI_SHIM=/path/libferrum_fa2_shim.so",
-        )
-    })?;
-    let c_path = CString::new(path.clone()).map_err(|_| {
-        FerrumError::model(format!(
-            "FERRUM_FA2_DIRECT_FFI_SHIM contains an interior NUL: {path:?}"
-        ))
+fn load_fa2_shim(path: &str) -> Result<Fa2Shim> {
+    let c_path = CString::new(path).map_err(|_| {
+        FerrumError::model(format!("FA2 shim path contains an interior NUL: {path:?}"))
     })?;
     let handle = unsafe { dlopen(c_path.as_ptr(), RTLD_NOW | RTLD_LOCAL) };
     if handle.is_null() {
@@ -103,9 +88,12 @@ fn load_fa2_shim() -> Result<Fa2Shim> {
     let sym_name = CString::new("ferrum_fa2_paged_varlen_fwd").unwrap();
     let sym = unsafe { dlsym(handle, sym_name.as_ptr()) };
     if sym.is_null() {
+        let detail = dl_error_string();
+        unsafe {
+            dlclose(handle);
+        }
         return Err(FerrumError::model(format!(
-            "dlsym(ferrum_fa2_paged_varlen_fwd) failed: {}",
-            dl_error_string()
+            "dlsym(ferrum_fa2_paged_varlen_fwd) failed: {detail}"
         )));
     }
     let paged_varlen = unsafe { std::mem::transmute::<*mut c_void, Fa2PagedVarlenFn>(sym) };
@@ -116,18 +104,27 @@ fn load_fa2_shim() -> Result<Fa2Shim> {
 }
 
 #[cfg(not(unix))]
-fn load_fa2_shim() -> Result<Fa2Shim> {
+fn load_fa2_shim(_path: &str) -> Result<Fa2Shim> {
     Err(FerrumError::unsupported(
         "FA2 direct FFI diagnostic shims require Unix",
     ))
 }
 
-fn fa2_shim() -> Result<&'static Fa2Shim> {
-    match FA2_SHIM.get_or_init(load_fa2_shim) {
-        Ok(shim) => Ok(shim),
-        Err(err) => Err(FerrumError::model(format!(
-            "FA2 direct FFI shim unavailable: {err}"
-        ))),
+impl Fa2Shim {
+    /// Load only the explicitly configured library for this context.
+    pub(super) fn load(path: &str) -> Result<Self> {
+        load_fa2_shim(path)
+    }
+}
+
+impl Drop for Fa2Shim {
+    fn drop(&mut self) {
+        // CudaState retires its original streams/graphs before dropping this
+        // library, whose code may be referenced by captured launches.
+        #[cfg(unix)]
+        unsafe {
+            dlclose(self._handle);
+        }
     }
 }
 
@@ -218,7 +215,8 @@ pub(super) unsafe fn call_paged_varlen_fn(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn paged_varlen_attention_fa2_ffi(
+pub(super) fn paged_varlen_attention_fa2_ffi(
+    shim: &Fa2Shim,
     stream: &Arc<CudaStream>,
     q: &CudaSlice<f16>,
     k_pool: &CudaSlice<f16>,
@@ -238,7 +236,6 @@ pub fn paged_varlen_attention_fa2_ffi(
     block_size: usize,
     max_blocks_per_seq: usize,
 ) -> Result<()> {
-    let shim = fa2_shim()?;
     unsafe {
         call_paged_varlen_fn(
             shim.paged_varlen,

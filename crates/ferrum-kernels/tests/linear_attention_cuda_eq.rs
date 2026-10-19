@@ -56,7 +56,8 @@ fn linear_attention_prepare_cuda_matches_cpu_reference() {
         .collect();
     let dt_bias: Vec<f32> = (0..value_heads).map(|i| -0.2 + i as f32 * 0.1).collect();
 
-    let mut cpu_ctx = CpuBackend::new_context();
+    let mut cpu_ctx =
+        CpuBackend::new_context(&ferrum_types::BackendContextConfig::default()).unwrap();
     let mut expected_q = vec![0.0; tokens * qk_total];
     let mut expected_k = vec![0.0; tokens * qk_total];
     let mut expected_v = vec![0.0; tokens * value_total];
@@ -85,7 +86,8 @@ fn linear_attention_prepare_cuda_matches_cpu_reference() {
     )
     .unwrap();
 
-    let mut cuda_ctx = CudaBackend::new_context();
+    let mut cuda_ctx =
+        CudaBackend::new_context(&ferrum_types::BackendContextConfig::default()).unwrap();
     let mixed_dev = CudaBackend::from_slice_typed_in_context(&mut cuda_ctx, &mixed_qkv_raw);
     let conv_dev = CudaBackend::from_slice_typed_in_context(&mut cuda_ctx, &conv_weight);
     let a_dev = CudaBackend::from_slice_typed_in_context(&mut cuda_ctx, &a_raw);
@@ -193,7 +195,8 @@ fn linear_attention_prepare_cuda_accepts_f16_inputs_and_writes_f32() {
     let a_log_expected = quantize_to_f16_f32(&a_log);
     let dt_bias_expected = quantize_to_f16_f32(&dt_bias);
 
-    let mut cpu_ctx = CpuBackend::new_context();
+    let mut cpu_ctx =
+        CpuBackend::new_context(&ferrum_types::BackendContextConfig::default()).unwrap();
     let mut expected_q = vec![0.0; tokens * qk_total];
     let mut expected_k = vec![0.0; tokens * qk_total];
     let mut expected_v = vec![0.0; tokens * value_total];
@@ -222,7 +225,8 @@ fn linear_attention_prepare_cuda_accepts_f16_inputs_and_writes_f32() {
     )
     .unwrap();
 
-    let mut cuda_ctx = CudaBackend::new_context();
+    let mut cuda_ctx =
+        CudaBackend::new_context(&ferrum_types::BackendContextConfig::default()).unwrap();
     let mixed_dev =
         CudaBackend::from_slice_typed_in_context(&mut cuda_ctx, &to_f16_vec(&mixed_qkv_raw));
     let conv_dev =
@@ -335,7 +339,8 @@ fn linear_attention_prepare_varlen_packed_cuda_matches_cpu_reference() {
     let cu_seqlens = vec![0u32, 3, 5];
     let token_seq_indices = vec![0u32, 0, 0, 1, 1];
 
-    let mut cpu_ctx = CpuBackend::new_context();
+    let mut cpu_ctx =
+        CpuBackend::new_context(&ferrum_types::BackendContextConfig::default()).unwrap();
     let mut expected_q = vec![0.0; total_tokens * qk_total];
     let mut expected_k = vec![0.0; total_tokens * qk_total];
     let mut expected_v = vec![0.0; total_tokens * value_total];
@@ -371,7 +376,8 @@ fn linear_attention_prepare_varlen_packed_cuda_matches_cpu_reference() {
     )
     .unwrap();
 
-    let mut cuda_ctx = CudaBackend::new_context();
+    let mut cuda_ctx =
+        CudaBackend::new_context(&ferrum_types::BackendContextConfig::default()).unwrap();
     let mixed_dev = CudaBackend::from_slice_typed_in_context(&mut cuda_ctx, &mixed_qkvz_raw);
     let ba_dev = CudaBackend::from_slice_typed_in_context(&mut cuda_ctx, &ba_raw);
     let conv_dev = CudaBackend::from_slice_typed_in_context(&mut cuda_ctx, &conv_weight);
@@ -498,7 +504,8 @@ fn linear_attention_decode_prepare_cuda_matches_cpu_reference() {
         .collect();
     let dt_bias: Vec<f32> = (0..value_heads).map(|i| -0.2 + i as f32 * 0.1).collect();
 
-    let mut cpu_ctx = CpuBackend::new_context();
+    let mut cpu_ctx =
+        CpuBackend::new_context(&ferrum_types::BackendContextConfig::default()).unwrap();
     let mut expected_q = vec![0.0; qk_total];
     let mut expected_k = vec![0.0; qk_total];
     let mut expected_v = vec![0.0; value_total];
@@ -529,7 +536,8 @@ fn linear_attention_decode_prepare_cuda_matches_cpu_reference() {
     )
     .unwrap();
 
-    let mut cuda_ctx = CudaBackend::new_context();
+    let mut cuda_ctx =
+        CudaBackend::new_context(&ferrum_types::BackendContextConfig::default()).unwrap();
     let mixed_dev = CudaBackend::from_slice_typed_in_context(&mut cuda_ctx, &mixed_qkv_raw);
     let conv_dev = CudaBackend::from_slice_typed_in_context(&mut cuda_ctx, &conv_weight);
     let conv_state_dev = CudaBackend::from_slice_typed_in_context(&mut cuda_ctx, &conv_state);
@@ -649,7 +657,8 @@ fn linear_attention_decode_prepare_cuda_accepts_f16_projection_inputs() {
     let a_log_expected = quantize_to_f16_f32(&a_log);
     let dt_bias_expected = quantize_to_f16_f32(&dt_bias);
 
-    let mut cpu_ctx = CpuBackend::new_context();
+    let mut cpu_ctx =
+        CpuBackend::new_context(&ferrum_types::BackendContextConfig::default()).unwrap();
     let mut expected_q = vec![0.0; qk_total];
     let mut expected_k = vec![0.0; qk_total];
     let mut expected_v = vec![0.0; value_total];
@@ -680,7 +689,8 @@ fn linear_attention_decode_prepare_cuda_accepts_f16_projection_inputs() {
     )
     .unwrap();
 
-    let mut cuda_ctx = CudaBackend::new_context();
+    let mut cuda_ctx =
+        CudaBackend::new_context(&ferrum_types::BackendContextConfig::default()).unwrap();
     let mixed_dev =
         CudaBackend::from_slice_typed_in_context(&mut cuda_ctx, &to_f16_vec(&mixed_qkv_raw));
     let conv_dev =
@@ -798,7 +808,8 @@ fn linear_attention_decode_prepare_batch_cuda_matches_cpu_reference() {
         .collect();
     let dt_bias: Vec<f32> = (0..value_heads).map(|i| -0.2 + i as f32 * 0.1).collect();
 
-    let mut cpu_ctx = CpuBackend::new_context();
+    let mut cpu_ctx =
+        CpuBackend::new_context(&ferrum_types::BackendContextConfig::default()).unwrap();
     let mut expected_q = vec![0.0; batch * qk_total];
     let mut expected_k = vec![0.0; batch * qk_total];
     let mut expected_v = vec![0.0; batch * value_total];
@@ -830,7 +841,8 @@ fn linear_attention_decode_prepare_batch_cuda_matches_cpu_reference() {
     )
     .unwrap();
 
-    let mut cuda_ctx = CudaBackend::new_context();
+    let mut cuda_ctx =
+        CudaBackend::new_context(&ferrum_types::BackendContextConfig::default()).unwrap();
     let mixed_dev = CudaBackend::from_slice_typed_in_context(&mut cuda_ctx, &mixed_qkv_raw);
     let conv_dev = CudaBackend::from_slice_typed_in_context(&mut cuda_ctx, &conv_weight);
     let conv_states_dev = CudaBackend::from_slice_typed_in_context(&mut cuda_ctx, &conv_states);
@@ -931,7 +943,8 @@ fn packed_qkvz_to_mixed_expected(
     let mut expected_mixed = vec![0.0; batch * conv_channels];
     let mut expected_z = vec![0.0; batch * value_total];
     let mut expected_slots = initial_slots.to_vec();
-    let mut cpu_ctx = CpuBackend::new_context();
+    let mut cpu_ctx =
+        CpuBackend::new_context(&ferrum_types::BackendContextConfig::default()).unwrap();
     let conv_weight = conv_weight.to_vec();
     let a_raw = vec![0.0; value_heads];
     let b_raw = vec![0.0; value_heads];
@@ -1032,7 +1045,8 @@ fn linear_attention_decode_prepare_batch_indexed_packed_to_mixed_cuda_matches_re
         conv_kernel,
     );
 
-    let mut cuda_ctx = CudaBackend::new_context();
+    let mut cuda_ctx =
+        CudaBackend::new_context(&ferrum_types::BackendContextConfig::default()).unwrap();
     let mixed_dev = CudaBackend::from_slice_typed_in_context(&mut cuda_ctx, &mixed_qkvz_raw);
     let conv_dev = CudaBackend::from_slice_typed_in_context(&mut cuda_ctx, &conv_weight);
     let mut state_dev = CudaBackend::from_slice_typed_in_context(&mut cuda_ctx, &initial_slots);
@@ -1117,7 +1131,8 @@ fn linear_attention_decode_prepare_batch_indexed_packed_to_mixed_cuda_accepts_f1
         conv_kernel,
     );
 
-    let mut cuda_ctx = CudaBackend::new_context();
+    let mut cuda_ctx =
+        CudaBackend::new_context(&ferrum_types::BackendContextConfig::default()).unwrap();
     let mixed_dev =
         CudaBackend::from_slice_typed_in_context(&mut cuda_ctx, &to_f16_vec(&mixed_qkvz_raw));
     let conv_dev =
@@ -1175,7 +1190,8 @@ fn gated_rms_norm_cuda_matches_cpu_reference() {
     let weight: Vec<f32> = (0..dim).map(|i| 0.5 + i as f32 * 0.25).collect();
     let eps = 1e-6;
 
-    let mut cpu_ctx = CpuBackend::new_context();
+    let mut cpu_ctx =
+        CpuBackend::new_context(&ferrum_types::BackendContextConfig::default()).unwrap();
     let mut expected = vec![0.0; len];
     CpuBackend::gated_rms_norm_f32(
         &mut cpu_ctx,
@@ -1190,7 +1206,8 @@ fn gated_rms_norm_cuda_matches_cpu_reference() {
     )
     .unwrap();
 
-    let mut cuda_ctx = CudaBackend::new_context();
+    let mut cuda_ctx =
+        CudaBackend::new_context(&ferrum_types::BackendContextConfig::default()).unwrap();
     let core_dev = CudaBackend::from_slice_typed_in_context(&mut cuda_ctx, &core);
     let z_dev = CudaBackend::from_slice_typed_in_context(&mut cuda_ctx, &z);
     let weight_dev = CudaBackend::from_slice_typed_in_context(&mut cuda_ctx, &weight);

@@ -92,7 +92,10 @@ fn moe_pair_id_align_is_bitwise_stable_and_matches_reference() {
         reference_align(&expert_ids_host, NUM_EXPERTS, BLOCK_SIZE);
 
     // GPU side
-    let mut ctx = <ferrum_kernels::backend::cuda::CudaBackend as Backend>::new_context();
+    let mut ctx = <ferrum_kernels::backend::cuda::CudaBackend as Backend>::new_context(
+        &ferrum_types::BackendContextConfig::default(),
+    )
+    .unwrap();
     // upload expert_ids as i32 buffer (use alloc_u32 + write_u32)
     let mut expert_ids_dev =
         <ferrum_kernels::backend::cuda::CudaBackend as Backend>::alloc_typed_in_context(

@@ -1,5 +1,5 @@
 //! CPU backend using Accelerate (macOS) / portable fallback (Linux).
-//! Context = () — all ops execute immediately, no batching needed.
+//! Operations execute immediately; each context owns its immutable policy.
 
 use half::f16;
 
@@ -285,6 +285,11 @@ fn validate_gated_rms_norm_shape(
 
 pub struct CpuBackend;
 
+#[derive(Debug, Clone, Default)]
+pub struct CpuContext {
+    config: ferrum_types::BackendContextConfig,
+}
+
 #[cfg(target_os = "macos")]
 unsafe extern "C" {
     unsafe fn cblas_sgemm(
@@ -338,7 +343,7 @@ pub enum CpuQuantStore {
 
 impl Backend for CpuBackend {
     type Buffer = Vec<f32>;
-    type Context = ();
+    type Context = CpuContext;
     // type GptqStore: removed in Phase C step 4e. CpuGptqStore is now
     // a private (crate-internal) detail of CpuMarlinExpertStack.
 
@@ -347,7 +352,16 @@ impl Backend for CpuBackend {
         crate::backend::timer::CpuTimer::new()
     }
 
-    fn new_context() -> Self::Context {}
+    fn new_context(config: &ferrum_types::BackendContextConfig) -> Result<Self::Context> {
+        config.validate()?;
+        Ok(CpuContext {
+            config: config.clone(),
+        })
+    }
+
+    fn context_config(ctx: &Self::Context) -> &ferrum_types::BackendContextConfig {
+        &ctx.config
+    }
     fn sync(_ctx: &mut Self::Context) {}
 
     fn host_execution_is_synchronous() -> bool {
@@ -2426,7 +2440,7 @@ fn cpu_read_u32_buffer(buf: &[f32], n: usize, label: &str) -> Result<Vec<u32>> {
 /// Single caller: `CpuMarlinExpertStack::gemm_phase_batched`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn cpu_gemm_gptq_with_offset_strided(
-    _ctx: &mut <CpuBackend as Backend>::Context,
+    ctx: &mut <CpuBackend as Backend>::Context,
     input: &<CpuBackend as Backend>::Buffer,
     in_row_offset: usize,
     weight: &CpuGptqStore,
@@ -2458,9 +2472,8 @@ pub(crate) fn cpu_gemm_gptq_with_offset_strided(
     let weight_slice = weight.weight_f32[row_start..row_end].to_vec();
     let in_slice = input[in_start..in_end].to_vec();
     let mut out_slice = vec![0.0f32; m * expert_n];
-    let mut ctx_local = ();
     CpuBackend::gemm(
-        &mut ctx_local,
+        ctx,
         &in_slice,
         &weight_slice,
         &mut out_slice,

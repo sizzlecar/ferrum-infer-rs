@@ -14,7 +14,7 @@ const BRANCH: f32 = 42_912.0;
 
 #[test]
 fn default_f16_add_inplace_overflows_gemma3_sandwich_scale() {
-    let mut ctx = CudaBackend::new_context();
+    let mut ctx = CudaBackend::new_context(&ferrum_types::BackendContextConfig::default()).unwrap();
     let mut residual = CudaBackend::from_slice_in_context(&mut ctx, &[RESIDUAL, 1.0]);
     let branch = CudaBackend::from_slice_in_context(&mut ctx, &[BRANCH, 2.0]);
 
@@ -36,7 +36,7 @@ fn default_f16_add_inplace_overflows_gemma3_sandwich_scale() {
 
 #[test]
 fn f32_add_inplace_keeps_gemma3_sandwich_scale_finite() {
-    let mut ctx = CudaBackend::new_context();
+    let mut ctx = CudaBackend::new_context(&ferrum_types::BackendContextConfig::default()).unwrap();
     let mut residual = CudaBackend::from_slice_typed_in_context::<f32>(&mut ctx, &[RESIDUAL, 1.0]);
     let branch = CudaBackend::from_slice_typed_in_context::<f32>(&mut ctx, &[BRANCH, 2.0]);
 
@@ -62,7 +62,7 @@ fn f32_add_inplace_keeps_gemma3_sandwich_scale_finite() {
 
 #[test]
 fn f32_rms_norm_uses_f32_kernel() {
-    let mut ctx = CudaBackend::new_context();
+    let mut ctx = CudaBackend::new_context(&ferrum_types::BackendContextConfig::default()).unwrap();
     let input = CudaBackend::from_slice_typed_in_context::<f32>(&mut ctx, &[3.0, 4.0, 1.0, 2.0]);
     let weight = CudaBackend::from_slice_typed_in_context::<f32>(&mut ctx, &[1.5, 0.5]);
     let mut out = CudaBackend::alloc_typed_in_context(&mut ctx, Dtype::F32, 4);
@@ -91,7 +91,7 @@ fn f32_rms_norm_uses_f32_kernel() {
 
 #[test]
 fn f32_shadow_sandwich_norm_hooks_match_reference() {
-    let mut ctx = CudaBackend::new_context();
+    let mut ctx = CudaBackend::new_context(&ferrum_types::BackendContextConfig::default()).unwrap();
     let activation = CudaBackend::from_slice_in_context(&mut ctx, &[3.0, 4.0, 1.0, 2.0]);
     let weight = CudaBackend::from_slice_in_context(&mut ctx, &[1.5, 0.5]);
     let mut shadow = CudaBackend::alloc_typed_in_context(&mut ctx, Dtype::F32, 4);

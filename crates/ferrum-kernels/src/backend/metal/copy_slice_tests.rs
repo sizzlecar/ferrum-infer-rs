@@ -8,7 +8,7 @@ fn actual_typed_copy<T: HostDtype + Debug + PartialEq>(source: &[T], initial: &[
     let mut dst = MetalBackend::from_slice_typed(initial);
     let mut expected = initial.to_vec();
     expected[2..5].copy_from_slice(&source[1..4]);
-    let mut ctx = MetalBackend::new_context();
+    let mut ctx = MetalBackend::new_context(&Default::default()).expect("backend context");
     MetalBackend::copy_slice(&mut ctx, &src, 1, &mut dst, 2, 3);
     MetalBackend::sync_checked(&mut ctx).expect("actual Metal copy must complete");
     assert_eq!(dst.dtype(), T::DTYPE);
@@ -43,7 +43,7 @@ fn copy_slice_real_metal_f16_preserves_offsets_and_canaries() {
 fn copy_slice_real_metal_rejects_dtype_and_extent_errors_before_encoding() {
     let src = MetalBackend::from_slice_typed(&[1.0_f32, 2.0, 3.0, 4.0]);
     let mut wrong_dtype = MetalBackend::from_slice_typed(&[f16::from_f32(9.0); 4]);
-    let mut ctx = MetalBackend::new_context();
+    let mut ctx = MetalBackend::new_context(&Default::default()).expect("backend context");
     assert!(catch_unwind(AssertUnwindSafe(|| {
         MetalBackend::copy_slice(&mut ctx, &src, 0, &mut wrong_dtype, 0, 1);
     }))

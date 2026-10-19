@@ -866,7 +866,7 @@ impl CudaDecodeRunner {
                 crate::cublas::linear_f16(blas, input, t, output, m, n, k)
             }
             crate::weight_store::LinearWeight::Marlin(mw) => {
-                crate::marlin::marlin_gemm(stream, input, mw, output, m)
+                crate::marlin::marlin_gemm(stream, input, mw, output, m, false)
             }
         }
     }
