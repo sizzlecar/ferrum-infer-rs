@@ -712,6 +712,12 @@ impl VNextTeacherForcingConfig {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RuntimeKnobs {
+    /// Retained Llama-family construction controls, never installed globally.
+    #[serde(default)]
+    pub llama: crate::LlamaExecutionOptions,
+    /// Native GPTQ loader diagnostics, scoped to this model's loader.
+    #[serde(default)]
+    pub gptq_gidx_trace: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub startup_memory_request: Option<crate::StartupMemoryRequest>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -824,6 +830,7 @@ impl EngineConfig {
         if let Some(value) = runtime_config_value(snapshot, "FERRUM_KV_MAX_BLOCKS") {
             self.kv_cache.max_blocks =
                 parse_required_positive_usize("FERRUM_KV_MAX_BLOCKS", value)?;
+            self.runtime.llama.kv_max_blocks = Some(self.kv_cache.max_blocks);
         }
         if let Some(value) = runtime_config_value(snapshot, "FERRUM_MAX_BATCHED_TOKENS") {
             self.batching.max_num_batched_tokens =
@@ -1063,12 +1070,22 @@ impl EngineConfig {
             self.runtime.tp = value.parse::<usize>().ok();
         }
 
-        // Publish the resolved snapshot process-wide. Model code (which is not
-        // threaded an EngineConfig) reads `active_runtime_snapshot()` for the
-        // remaining FERRUM_* toggles instead of `std::env`, keeping the env
-        // bridge at this single composition-root call.
-        crate::install_runtime_snapshot(snapshot.clone());
+        self.runtime.llama.apply_runtime_config_snapshot(snapshot);
+        if let Some(value) = runtime_config_value(snapshot, "FERRUM_GPTQ_GIDX_TRACE") {
+            self.runtime.gptq_gidx_trace = value == "1";
+        }
         Ok(())
+    }
+
+    /// Freeze model construction options before opening or loading weights.
+    pub fn llama_execution_config(&self) -> crate::LlamaExecutionConfig {
+        crate::LlamaExecutionConfig {
+            kv_capacity: self.runtime.kv_capacity,
+            paged_max_seqs: self.scheduler.max_running_requests,
+            prefix_cache: self.runtime.prefix_state_cache_enabled,
+            batched_graph: self.backend.enable_cuda_graphs,
+            options: self.runtime.llama.clone(),
+        }
     }
 }
 

@@ -125,6 +125,13 @@ impl Shard {
     }
 }
 
+/// Options captured by a native safetensors loader at construction.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct NativeSafetensorsLoadOptions {
+    /// Emit GPTQ group-index and zero-point diagnostics while loading weights.
+    pub gptq_gidx_trace: bool,
+}
+
 /// Native safetensors loader. Generic over `Backend` so every tensor is
 /// materialised directly into backend-native buffers.
 pub struct NativeSafetensorsLoader<B: Backend + BackendQuantMarlin> {
@@ -134,12 +141,21 @@ pub struct NativeSafetensorsLoader<B: Backend + BackendQuantMarlin> {
     index: HashMap<String, usize>,
     /// Optional `quantize_config.json` contents.
     quant_config: Option<QuantConfig>,
+    options: NativeSafetensorsLoadOptions,
     _m: std::marker::PhantomData<B>,
 }
 
 impl<B: Backend + BackendQuantMarlin> NativeSafetensorsLoader<B> {
     /// Discover shards under `model_dir` and build the name → shard index.
     pub fn open(model_dir: impl AsRef<Path>) -> Result<Self> {
+        Self::open_with_options(model_dir, NativeSafetensorsLoadOptions::default())
+    }
+
+    /// Discover shards with options retained for this loader's lifetime.
+    pub fn open_with_options(
+        model_dir: impl AsRef<Path>,
+        options: NativeSafetensorsLoadOptions,
+    ) -> Result<Self> {
         let dir = model_dir.as_ref();
 
         let shard_paths = if dir.join("model.safetensors").exists() {
@@ -171,6 +187,7 @@ impl<B: Backend + BackendQuantMarlin> NativeSafetensorsLoader<B> {
             shards,
             index,
             quant_config,
+            options,
             _m: std::marker::PhantomData,
         })
     }
@@ -800,8 +817,21 @@ impl<B: Backend + BackendQuantMarlin> NativeSafetensorsLoader<B> {
         let out_features = qw_shape[1];
 
         let is_desc_act = validate_gptq_g_idx(name, qcfg, g_idx.as_deref(), in_features)?;
-        trace_gptq_g_idx_if_requested(name, qcfg, g_idx.as_deref(), in_features, is_desc_act);
-        trace_gptq_qzeros_if_requested(name, qcfg, &qzeros, out_features);
+        trace_gptq_g_idx_if_requested(
+            self.options.gptq_gidx_trace,
+            name,
+            qcfg,
+            g_idx.as_deref(),
+            in_features,
+            is_desc_act,
+        );
+        trace_gptq_qzeros_if_requested(
+            self.options.gptq_gidx_trace,
+            name,
+            qcfg,
+            &qzeros,
+            out_features,
+        );
 
         // Act-order GPTQ. CUDA backend has perm-aware Marlin (load_gptq
         // builds perm = argsort(g_idx) + permutes qweight rows at load;
@@ -1006,13 +1036,20 @@ impl<B: Backend + BackendQuantMarlin> NativeSafetensorsLoader<B> {
         let fused_name = format!("GPTQ fusion {}", parts.join("+"));
         let is_desc_act = validate_gptq_g_idx(&fused_name, qcfg, g_idx.as_deref(), in_features)?;
         trace_gptq_g_idx_if_requested(
+            self.options.gptq_gidx_trace,
             &fused_name,
             qcfg,
             g_idx.as_deref(),
             in_features,
             is_desc_act,
         );
-        trace_gptq_qzeros_if_requested(&fused_name, qcfg, &qz_acc, out_features);
+        trace_gptq_qzeros_if_requested(
+            self.options.gptq_gidx_trace,
+            &fused_name,
+            qcfg,
+            &qz_acc,
+            out_features,
+        );
         // CUDA: perm-aware Marlin via load_gptq. CPU/Metal: dequant→Dense.
         #[cfg(not(feature = "cuda"))]
         if is_desc_act {
@@ -1144,13 +1181,14 @@ fn gptq_g_idx_is_desc_act(g_idx: &[i32], group_size: usize) -> bool {
 }
 
 fn trace_gptq_g_idx_if_requested(
+    enabled: bool,
     name: &str,
     qcfg: &QuantConfig,
     g_idx: Option<&[i32]>,
     in_features: usize,
     is_desc_act: bool,
 ) {
-    if !gptq_gidx_trace_enabled() {
+    if !enabled {
         return;
     }
 
@@ -1251,12 +1289,13 @@ fn canonicalize_gptq_qzeros_for_sym(qcfg: &QuantConfig, qzeros: &mut [i32]) {
 }
 
 fn trace_gptq_qzeros_if_requested(
+    enabled: bool,
     name: &str,
     qcfg: &QuantConfig,
     qzeros: &[i32],
     out_features: usize,
 ) {
-    if !gptq_gidx_trace_enabled() {
+    if !enabled {
         return;
     }
 
@@ -1276,18 +1315,6 @@ fn trace_gptq_qzeros_if_requested(
         stats.all_code7(),
         stats.histogram
     );
-}
-
-fn gptq_gidx_trace_enabled() -> bool {
-    runtime_snapshot_value("FERRUM_GPTQ_GIDX_TRACE").as_deref() == Some("1")
-}
-
-fn runtime_snapshot_value(key: &str) -> Option<String> {
-    ferrum_types::active_runtime_snapshot()
-        .entries
-        .iter()
-        .find(|entry| entry.key == key)
-        .map(|entry| entry.effective_value.clone())
 }
 
 fn validate_gptq_g_idx(

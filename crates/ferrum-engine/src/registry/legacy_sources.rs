@@ -208,4 +208,55 @@ mod tests {
         assert_eq!(definition.hidden_size, 8);
         assert_eq!(definition.architecture, ferrum_models::Architecture::Llama);
     }
+
+    #[test]
+    fn legacy_factory_keeps_instance_capacity_after_another_config_is_applied() {
+        use ferrum_interfaces::kv_dtype::KvFp16;
+        use ferrum_kernels::backend::cpu::CpuBackend;
+        use ferrum_models::models::LlamaFamilyConfig;
+        use ferrum_types::RuntimeConfigSnapshot;
+
+        let root = tempfile::tempdir().unwrap();
+        checkpoint(root.path());
+        let definition = ConfigManager::new()
+            .load_from_bytes(&serde_json::to_vec(&semantic_config()).unwrap())
+            .unwrap();
+        let config = LlamaFamilyConfig::llama_from_def(&definition);
+        let mut first = EngineConfig::default();
+        first
+            .apply_runtime_config_snapshot(&RuntimeConfigSnapshot::from_env_vars([
+                ("FERRUM_KV_CAPACITY", "8"),
+                ("FERRUM_METAL_PAGED_KV", "0"),
+            ]))
+            .unwrap();
+        let first_input = first.llama_execution_config();
+        let mut second = EngineConfig::default();
+        second
+            .apply_runtime_config_snapshot(&RuntimeConfigSnapshot::from_env_vars([
+                ("FERRUM_KV_CAPACITY", "16"),
+                ("FERRUM_METAL_PAGED_KV", "0"),
+            ]))
+            .unwrap();
+        let build = |execution| {
+            crate::registry::build_llm::<CpuBackend, KvFp16>(
+                config.clone(),
+                root.path().to_str().unwrap(),
+                None,
+                None,
+                execution,
+                ferrum_quantization::NativeSafetensorsLoadOptions::default(),
+            )
+            .unwrap()
+        };
+        let mut a = build(first_input);
+        let mut b = build(second.llama_execution_config());
+        assert_eq!(a.kv_capacity(), 8);
+        assert_eq!(b.kv_capacity(), 16);
+        assert_eq!(a.prefill("a", &[0, 1]), b.prefill("b", &[0, 1]));
+        assert_eq!(a.decode("a", 2, 2), b.decode("b", 2, 2));
+        let expected = a.decode("a", 3, 3);
+        a.release("a");
+        assert_eq!(b.decode("b", 3, 3), expected);
+        b.release("b");
+    }
 }

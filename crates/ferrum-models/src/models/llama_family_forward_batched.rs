@@ -208,59 +208,15 @@ fn resolve_unified_logits_return<'a>(
 }
 
 impl LlamaBatchedRuntimeConfig {
-    /// Resolve from the process-wide snapshot installed at the composition root
-    /// (was a direct `std::env::vars()` read). The model holds this in a
-    /// `batched_cfg` field, resolved once at construction.
-    pub(crate) fn from_env() -> Self {
-        Self::from_runtime_config_snapshot(&ferrum_types::active_runtime_snapshot())
-    }
-
-    fn from_runtime_config_snapshot(snapshot: &ferrum_types::RuntimeConfigSnapshot) -> Self {
-        Self::from_env_vars(
-            snapshot
-                .entries
-                .iter()
-                .map(|e| (e.key.as_str(), e.effective_value.as_str())),
-        )
-    }
-
-    fn from_env_vars<I, K, V>(vars: I) -> Self
-    where
-        I: IntoIterator<Item = (K, V)>,
-        K: AsRef<str>,
-        V: AsRef<str>,
-    {
-        let mut config = Self {
-            unified_graph: false,
-            unified_graph_layers_only: false,
-            unified_graph_lm_head_eager: false,
-            batched_graph: false,
-            greedy_argmax: false,
-            split_k_attn: None,
-        };
-        for (name, value) in vars {
-            let value = value.as_ref();
-            match name.as_ref() {
-                "FERRUM_UNIFIED_GRAPH" => config.unified_graph = value == "1",
-                "FERRUM_UNIFIED_GRAPH_LAYERS_ONLY" => {
-                    config.unified_graph_layers_only = value == "1"
-                }
-                "FERRUM_UNIFIED_GRAPH_LM_HEAD_EAGER" => {
-                    config.unified_graph_lm_head_eager = value == "1"
-                }
-                "FERRUM_BATCHED_GRAPH" => config.batched_graph = value != "0",
-                "FERRUM_GREEDY_ARGMAX" => config.greedy_argmax = value == "1",
-                "FERRUM_SPLIT_K_ATTN" => {
-                    config.split_k_attn = match value {
-                        "1" => Some(true),
-                        "0" => Some(false),
-                        _ => None,
-                    }
-                }
-                _ => {}
-            }
+    pub(crate) fn from_execution_config(config: &ferrum_types::LlamaExecutionConfig) -> Self {
+        Self {
+            unified_graph: config.options.unified_graph,
+            unified_graph_layers_only: config.options.unified_graph_layers_only,
+            unified_graph_lm_head_eager: config.options.unified_graph_lm_head_eager,
+            batched_graph: config.batched_graph,
+            greedy_argmax: config.options.greedy_argmax,
+            split_k_attn: config.options.split_k_attn,
         }
-        config
     }
 }
 
@@ -581,9 +537,21 @@ mod tests {
         ));
     }
 
+    fn config_from_entries<const N: usize>(
+        entries: [(&str, &str); N],
+    ) -> LlamaBatchedRuntimeConfig {
+        let mut engine = ferrum_types::EngineConfig::default();
+        engine
+            .apply_runtime_config_snapshot(&ferrum_types::RuntimeConfigSnapshot::from_env_vars(
+                entries,
+            ))
+            .unwrap();
+        LlamaBatchedRuntimeConfig::from_execution_config(&engine.llama_execution_config())
+    }
+
     #[test]
     fn llama_batched_runtime_config_parses_startup_knobs() {
-        let config = LlamaBatchedRuntimeConfig::from_env_vars([
+        let config = config_from_entries([
             ("FERRUM_UNIFIED_GRAPH", "1"),
             ("FERRUM_UNIFIED_GRAPH_LAYERS_ONLY", "1"),
             ("FERRUM_UNIFIED_GRAPH_LM_HEAD_EAGER", "1"),
@@ -601,7 +569,7 @@ mod tests {
 
     #[test]
     fn llama_batched_runtime_config_preserves_opt_out_values() {
-        let config = LlamaBatchedRuntimeConfig::from_env_vars([
+        let config = config_from_entries([
             ("FERRUM_UNIFIED_GRAPH", "true"),
             ("FERRUM_UNIFIED_GRAPH_LAYERS_ONLY", "true"),
             ("FERRUM_UNIFIED_GRAPH_LM_HEAD_EAGER", "true"),

@@ -179,68 +179,11 @@ fn write_f32_dump_with_width(dir: &str, label: &str, values: &[f32], row_width: 
     append_dump_summary(dir, label, stats_for(values), row_width);
 }
 
+use ferrum_types::{LlamaExecutionConfig, LlamaNanTraceConfig};
+
+#[cfg(test)]
 fn nan_trace_raw_matches(raw: &str, local_layer: usize, source_layer: usize) -> bool {
-    LlamaNanTraceConfig::from_raw(raw).matches_layer(local_layer, source_layer)
-}
-
-fn parse_nan_trace_layer_selector(part: &str) -> Option<usize> {
-    let part = part.trim();
-    if part.is_empty() {
-        return None;
-    }
-    if let Ok(layer) = part.parse::<usize>() {
-        return Some(layer);
-    }
-    for prefix in ["layer", "source", "l"] {
-        if part.len() > prefix.len() && part[..prefix.len()].eq_ignore_ascii_case(prefix) {
-            return part[prefix.len()..].parse::<usize>().ok();
-        }
-    }
-    None
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum LlamaNanTraceConfig {
-    Disabled,
-    All,
-    Layers(Vec<usize>),
-}
-
-impl Default for LlamaNanTraceConfig {
-    fn default() -> Self {
-        Self::Disabled
-    }
-}
-
-impl LlamaNanTraceConfig {
-    fn from_raw(raw: &str) -> Self {
-        let raw = raw.trim();
-        if raw.is_empty() || raw == "1" || raw.eq_ignore_ascii_case("all") {
-            return Self::All;
-        }
-        if raw == "0" || raw.eq_ignore_ascii_case("false") {
-            return Self::Disabled;
-        }
-        let layers: Vec<_> = raw
-            .split(',')
-            .filter_map(parse_nan_trace_layer_selector)
-            .collect();
-        if layers.is_empty() {
-            Self::Disabled
-        } else {
-            Self::Layers(layers)
-        }
-    }
-
-    fn matches_layer(&self, local_layer: usize, source_layer: usize) -> bool {
-        match self {
-            Self::Disabled => false,
-            Self::All => true,
-            Self::Layers(layers) => layers
-                .iter()
-                .any(|&layer| layer == local_layer || layer == source_layer),
-        }
-    }
+    LlamaNanTraceConfig::from_runtime_value(raw).matches_layer(local_layer, source_layer)
 }
 
 fn nan_trace_dump<B: Backend>(
@@ -336,61 +279,18 @@ pub(crate) struct LlamaFamilyRuntimeEnv {
 }
 
 impl LlamaFamilyRuntimeEnv {
-    /// Resolve from the process-wide snapshot installed at the composition root
-    /// (was a direct `std::env::vars()` read). The model holds this in a
-    /// `runtime_env` field, resolved once at construction.
-    fn from_env() -> Self {
-        Self::from_runtime_config_snapshot(&ferrum_types::active_runtime_snapshot())
-    }
-
-    fn from_runtime_config_snapshot(snapshot: &ferrum_types::RuntimeConfigSnapshot) -> Self {
-        Self::from_env_vars(
-            snapshot
-                .entries
-                .iter()
-                .map(|e| (e.key.as_str(), e.effective_value.as_str())),
-        )
-    }
-
-    fn from_env_vars<I, K, V>(vars: I) -> Self
-    where
-        I: IntoIterator<Item = (K, V)>,
-        K: AsRef<str>,
-        V: AsRef<str>,
-    {
-        let mut config = Self {
-            kv_capacity: None,
-            kv_max_blocks: None,
-            metal_paged_kv: None,
-            paged_max_seqs: 32,
-            prefix_cache: false,
-            cuda_graph: false,
-            nan_trace: LlamaNanTraceConfig::Disabled,
-            op_dump_dir: None,
-            layer_dump_dir: None,
-        };
-        for (name, value) in vars {
-            let value = value.as_ref();
-            match name.as_ref() {
-                "FERRUM_KV_CAPACITY" => config.kv_capacity = value.parse::<usize>().ok(),
-                "FERRUM_KV_MAX_BLOCKS" => {
-                    config.kv_max_blocks = value.parse::<usize>().ok().filter(|v| *v > 0)
-                }
-                "FERRUM_METAL_PAGED_KV" => config.metal_paged_kv = Some(value != "0"),
-                "FERRUM_PAGED_MAX_SEQS" => {
-                    if let Ok(max_seqs) = value.parse::<usize>() {
-                        config.paged_max_seqs = max_seqs;
-                    }
-                }
-                "FERRUM_PREFIX_CACHE" => config.prefix_cache = value == "1",
-                "FERRUM_CUDA_GRAPH" => config.cuda_graph = true,
-                "FERRUM_NAN_TRACE" => config.nan_trace = LlamaNanTraceConfig::from_raw(value),
-                "FERRUM_OP_DUMP" => config.op_dump_dir = Some(value.to_string()),
-                "FERRUM_LAYER_DUMP" => config.layer_dump_dir = Some(value.to_string()),
-                _ => {}
-            }
+    fn from_execution_config(config: &LlamaExecutionConfig) -> Self {
+        Self {
+            kv_capacity: config.kv_capacity,
+            kv_max_blocks: config.options.kv_max_blocks,
+            metal_paged_kv: config.options.metal_paged_kv,
+            paged_max_seqs: config.paged_max_seqs,
+            prefix_cache: config.prefix_cache,
+            cuda_graph: config.options.cuda_graph,
+            nan_trace: config.options.nan_trace.clone(),
+            op_dump_dir: config.options.op_dump_dir.clone(),
+            layer_dump_dir: config.options.layer_dump_dir.clone(),
         }
-        config
     }
 
     pub(crate) fn kv_capacity_for_model(&self, model_max: usize) -> usize {
@@ -1750,15 +1650,13 @@ pub struct LlamaFamilyModel<B: MoeLlmBackend, K: KvLayer<B> = KvFp16> {
     /// can't silently rot in the forward code.
     pub(crate) supports_varlen_qkv: bool,
     pub(crate) supports_batched_decode: bool,
-    /// Runtime knobs resolved once at construction from the snapshot installed
-    /// at the composition root (was a process-wide OnceLock reading env).
+    /// Runtime knobs resolved once from explicit instance construction options.
     /// Forward/decode read these fields instead of a global accessor.
     pub(crate) runtime_env: LlamaFamilyRuntimeEnv,
     pub(crate) batched_cfg: super::llama_family_forward_batched::LlamaBatchedRuntimeConfig,
 
-    /// Token embedding table. `None` for backbone-only models (e.g. the
-    /// Qwen3-TTS Talker, which embeds inputs externally and feeds via
-    /// `prefill_from_embeds`).
+    /// Token embedding table. `None` for backbone-only models receiving
+    /// externally embedded inputs through `prefill_from_embeds`.
     pub embed: Option<B::Buffer>,
     /// Source checkpoint layer range loaded into `layers`. Full LLM models
     /// use `0..cfg.num_layers`; layer-split stages load a contiguous subset.
@@ -1863,8 +1761,22 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
     /// The loader decides per-projection whether to instantiate DenseLinear,
     /// GptqLinear, etc. — this code doesn't care.
     pub fn new(cfg: LlamaFamilyConfig, loader: &dyn WeightLoader<B>) -> Result<Self> {
+        Self::new_with_execution_config(cfg, loader, LlamaExecutionConfig::default())
+    }
+
+    /// Construct with immutable instance options captured before any weight load.
+    pub fn new_with_execution_config(
+        cfg: LlamaFamilyConfig,
+        loader: &dyn WeightLoader<B>,
+        execution: LlamaExecutionConfig,
+    ) -> Result<Self> {
         let num_layers = cfg.num_layers;
-        Self::new_with_stage_config(cfg, loader, LlamaFamilyLayerStageConfig::full(num_layers))
+        Self::new_with_stage_config(
+            cfg,
+            loader,
+            LlamaFamilyLayerStageConfig::full(num_layers),
+            execution,
+        )
     }
 
     /// Build a backbone-only Qwen3 transformer stack (no embed, no lm_head).
@@ -1879,11 +1791,20 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
     /// the final `model.norm.weight`. `model.embed_tokens` and `lm_head`
     /// are NOT read.
     pub fn new_backbone_only(cfg: LlamaFamilyConfig, loader: &dyn WeightLoader<B>) -> Result<Self> {
+        Self::new_backbone_only_with_execution_config(cfg, loader, LlamaExecutionConfig::default())
+    }
+
+    pub fn new_backbone_only_with_execution_config(
+        cfg: LlamaFamilyConfig,
+        loader: &dyn WeightLoader<B>,
+        execution: LlamaExecutionConfig,
+    ) -> Result<Self> {
         let num_layers = cfg.num_layers;
         Self::new_with_stage_config(
             cfg,
             loader,
             LlamaFamilyLayerStageConfig::backbone(num_layers),
+            execution,
         )
     }
 
@@ -1895,19 +1816,37 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         loader: &dyn WeightLoader<B>,
         stage: LlamaFamilyLayerStageConfig,
     ) -> Result<Self> {
-        Self::new_with_stage_config(cfg, loader, stage)
+        Self::new_layer_stage_with_execution_config(
+            cfg,
+            loader,
+            stage,
+            LlamaExecutionConfig::default(),
+        )
+    }
+
+    pub fn new_layer_stage_with_execution_config(
+        cfg: LlamaFamilyConfig,
+        loader: &dyn WeightLoader<B>,
+        stage: LlamaFamilyLayerStageConfig,
+        execution: LlamaExecutionConfig,
+    ) -> Result<Self> {
+        Self::new_with_stage_config(cfg, loader, stage, execution)
     }
 
     fn new_with_stage_config(
         cfg: LlamaFamilyConfig,
         loader: &dyn WeightLoader<B>,
         stage: LlamaFamilyLayerStageConfig,
+        execution: LlamaExecutionConfig,
     ) -> Result<Self> {
-        ferrum_types::active_runtime_snapshot()
-            .validate_retired_options()
-            .map_err(|(key, reason)| {
-                ferrum_types::FerrumError::config(format!("{key}: {reason}"))
-            })?;
+        execution
+            .validate()
+            .map_err(ferrum_types::FerrumError::config)?;
+        let runtime_env = LlamaFamilyRuntimeEnv::from_execution_config(&execution);
+        let batched_cfg =
+            super::llama_family_forward_batched::LlamaBatchedRuntimeConfig::from_execution_config(
+                &execution,
+            );
 
         if stage.source_layers.is_empty() {
             return Err(ferrum_types::FerrumError::model(
@@ -1983,9 +1922,6 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
                 supports_varlen_qkv
             );
         }
-        let runtime_env = LlamaFamilyRuntimeEnv::from_env();
-        let batched_cfg =
-            super::llama_family_forward_batched::LlamaBatchedRuntimeConfig::from_env();
         Ok(Self {
             cfg,
             runtime_cfg,
@@ -5537,6 +5473,9 @@ mod int8_shared_pool_tests;
 mod prefix_cache_tests;
 
 #[cfg(test)]
+mod instance_config_tests;
+
+#[cfg(test)]
 mod tests {
     use std::sync::Mutex;
 
@@ -5763,7 +5702,7 @@ mod tests {
         for current in [&mut model, &mut reference] {
             // Exercise real CPU forwards with its supported contiguous KV.
             // Paged allocation/release has separate tests below.
-            current.runtime_env = LlamaFamilyRuntimeEnv::from_env_vars([
+            current.runtime_env = runtime_for_entries([
                 ("FERRUM_METAL_PAGED_KV", "0"),
                 ("FERRUM_KV_CAPACITY", "128"),
                 ("FERRUM_PREFIX_CACHE", "0"),
@@ -5801,7 +5740,7 @@ mod tests {
         cfg.max_seq_len = 64;
         let loader = RecordingLoader::default();
         let mut model = LlamaFamilyModel::<CpuBackend>::new(cfg, &loader).unwrap();
-        model.runtime_env = LlamaFamilyRuntimeEnv::from_env_vars([
+        model.runtime_env = runtime_for_entries([
             ("FERRUM_METAL_PAGED_KV", "1"),
             ("FERRUM_KV_CAPACITY", "64"),
             ("FERRUM_KV_MAX_BLOCKS", "4"),
@@ -5870,7 +5809,7 @@ mod tests {
         cfg.max_seq_len = 64;
         let loader = RecordingLoader::default();
         let mut model = LlamaFamilyModel::<CpuBackend>::new(cfg, &loader).unwrap();
-        model.runtime_env = LlamaFamilyRuntimeEnv::from_env_vars([
+        model.runtime_env = runtime_for_entries([
             ("FERRUM_METAL_PAGED_KV", "1"),
             ("FERRUM_KV_CAPACITY", "64"),
             ("FERRUM_KV_MAX_BLOCKS", "3"),
@@ -5943,7 +5882,7 @@ mod tests {
         cfg.max_seq_len = 64;
         let loader = RecordingLoader::default();
         let mut model = LlamaFamilyModel::<CpuBackend>::new(cfg, &loader).unwrap();
-        model.runtime_env = LlamaFamilyRuntimeEnv::from_env_vars([
+        model.runtime_env = runtime_for_entries([
             ("FERRUM_METAL_PAGED_KV", "1"),
             ("FERRUM_KV_CAPACITY", "64"),
             ("FERRUM_KV_MAX_BLOCKS", "2"),
@@ -6151,9 +6090,19 @@ mod tests {
         assert!(logits[0].is_finite());
     }
 
+    fn runtime_for_entries<const N: usize>(entries: [(&str, &str); N]) -> LlamaFamilyRuntimeEnv {
+        let mut engine = ferrum_types::EngineConfig::default();
+        engine
+            .apply_runtime_config_snapshot(&ferrum_types::RuntimeConfigSnapshot::from_env_vars(
+                entries,
+            ))
+            .unwrap();
+        LlamaFamilyRuntimeEnv::from_execution_config(&engine.llama_execution_config())
+    }
+
     #[test]
     fn llama_family_runtime_env_parses_startup_knobs() {
-        let env = LlamaFamilyRuntimeEnv::from_env_vars([
+        let env = runtime_for_entries([
             ("FERRUM_KV_CAPACITY", "4096"),
             ("FERRUM_KV_MAX_BLOCKS", "1234"),
             ("FERRUM_METAL_PAGED_KV", "0"),
@@ -6175,17 +6124,26 @@ mod tests {
     }
 
     #[test]
-    fn llama_family_runtime_env_uses_defaults_for_invalid_values() {
-        let env = LlamaFamilyRuntimeEnv::from_env_vars([
+    fn llama_family_runtime_config_rejects_invalid_product_capacity_and_keeps_library_defaults() {
+        for (key, value) in [
             ("FERRUM_KV_CAPACITY", "bad"),
             ("FERRUM_KV_MAX_BLOCKS", "0"),
             ("FERRUM_PAGED_MAX_SEQS", "bad"),
-            ("FERRUM_METAL_PAGED_KV", "1"),
-        ]);
+        ] {
+            let mut engine = ferrum_types::EngineConfig::default();
+            assert!(engine
+                .apply_runtime_config_snapshot(&ferrum_types::RuntimeConfigSnapshot::from_env_vars(
+                    [(key, value)]
+                ))
+                .is_err());
+        }
+        let env = LlamaFamilyRuntimeEnv::from_execution_config(
+            &ferrum_types::LlamaExecutionConfig::default(),
+        );
 
         assert_eq!(env.kv_capacity, None);
         assert_eq!(env.kv_max_blocks, None);
-        assert_eq!(env.metal_paged_kv, Some(true));
+        assert_eq!(env.metal_paged_kv, None);
         assert_eq!(env.paged_max_seqs, 32);
         assert_eq!(
             env.kv_capacity_for_model(DEFAULT_KV_CAPACITY * 2),

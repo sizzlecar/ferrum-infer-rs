@@ -230,6 +230,51 @@ fn source_bound_gguf_loads_same_family_and_mistral_alias_with_frozen_config() {
 }
 
 #[test]
+fn source_bound_gguf_keeps_explicit_instance_execution_config() {
+    let root = tempfile::tempdir().unwrap();
+    let sources = fixture(
+        root.path(),
+        &semantic("LlamaForCausalLM"),
+        "llama",
+        &[],
+        true,
+    );
+    let options = |capacity| ferrum_types::LlamaExecutionConfig {
+        kv_capacity: Some(capacity),
+        options: ferrum_types::LlamaExecutionOptions {
+            metal_paged_kv: Some(false),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let (mut first, _) = load_gguf_decoder_from_sources_with_execution_config(
+        &sources,
+        &Device::CPU,
+        ModelId::new("first"),
+        options(8),
+    )
+    .unwrap();
+    let (mut second, _) = load_gguf_decoder_with_execution_config(
+        sources.weights().path(),
+        &Device::CPU,
+        ModelId::new("second"),
+        options(16),
+    )
+    .unwrap();
+    assert_eq!(first.kv_capacity(), 8);
+    assert_eq!(second.kv_capacity(), 16);
+    assert_eq!(
+        first.prefill("first", &[0, 1]),
+        second.prefill("second", &[0, 1])
+    );
+    assert_eq!(first.decode("first", 2, 2), second.decode("second", 2, 2));
+    let expected = first.decode("first", 3, 3);
+    first.release("first");
+    assert_eq!(second.decode("second", 3, 3), expected);
+    second.release("second");
+}
+
+#[test]
 fn source_bound_gguf_rejects_missing_or_unsupported_rope_scaling() {
     let root = tempfile::tempdir().unwrap();
     let mut definition = semantic("MistralForCausalLM");

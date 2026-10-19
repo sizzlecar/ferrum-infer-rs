@@ -334,41 +334,18 @@ async fn lora_admission_capacity_failure_preserves_existing_and_discards_new_cac
 
 #[test]
 fn lora_direct_paged_preparation_commits_binding_only_after_reservation() {
-    // The production runtime snapshot is process-wide. Isolate its installation
-    // from the other real-model tests, rather than racing their constructors.
-    const CHILD: &str = "FERRUM_TEST_LORA_PAGED_PREPARATION_CHILD";
-    let test_name = std::thread::current()
-        .name()
-        .expect("Rust test thread must have its exact test name")
-        .to_owned();
-    if std::env::var(CHILD).ok().as_deref() != Some(test_name.as_str()) {
-        let output = std::process::Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                test_name.as_str(),
-                "--test-threads=1",
-                "--nocapture",
-            ])
-            .env(CHILD, &test_name)
-            .output()
-            .expect("run isolated direct-model preparation regression");
-        assert!(
-            output.status.success(),
-            "isolated preparation regression failed: {:?}\nstdout:\n{}\nstderr:\n{}",
-            output.status,
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-        return;
-    }
-
-    ferrum_types::install_runtime_snapshot(ferrum_types::RuntimeConfigSnapshot::from_env_vars([
-        ("FERRUM_METAL_PAGED_KV", "1"),
-        ("FERRUM_KV_CAPACITY", "64"),
-        ("FERRUM_KV_MAX_BLOCKS", "2"),
-        ("FERRUM_PAGED_MAX_SEQS", "2"),
-        ("FERRUM_PREFIX_CACHE", "0"),
-    ]));
+    // Configuration belongs to this model. This real paged preparation test
+    // can now run alongside default constructors without a child process.
+    let execution = ferrum_types::LlamaExecutionConfig {
+        kv_capacity: Some(64),
+        paged_max_seqs: 2,
+        options: ferrum_types::LlamaExecutionOptions {
+            metal_paged_kv: Some(true),
+            kv_max_blocks: Some(2),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
     let cfg = TinyLlamaConfig {
         max_seq_len: 64,
         ..TinyLlamaConfig::default()
@@ -378,7 +355,8 @@ fn lora_direct_paged_preparation_commits_binding_only_after_reservation() {
         name: "delta".to_owned(),
         path: directory.path().to_path_buf(),
     };
-    let mut model = tiny_llama_model(&cfg);
+    let mut model =
+        ferrum_models::test_support::tiny_llama_model_with_execution_config(&cfg, execution);
     model.preload_lora_adapter(&adapter).unwrap();
     let prompt: Arc<[u32]> = vec![0; 16].into();
     let two_blocks: Arc<[u32]> = vec![0; 32].into();

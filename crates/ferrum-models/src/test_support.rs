@@ -182,9 +182,21 @@ pub const TINY_MODEL_ID: &str = "tiny-llama-test";
 /// Build the tiny CPU model directly. Most tests want
 /// [`tiny_llama_executor`] instead; this is for op-level access.
 pub fn tiny_llama_model(cfg: &TinyLlamaConfig) -> LlamaFamilyModel<CpuBackend, KvFp16> {
+    tiny_llama_model_with_execution_config(cfg, ferrum_types::LlamaExecutionConfig::default())
+}
+
+/// Build the same real CPU fixture with explicit instance construction options.
+pub fn tiny_llama_model_with_execution_config(
+    cfg: &TinyLlamaConfig,
+    execution: ferrum_types::LlamaExecutionConfig,
+) -> LlamaFamilyModel<CpuBackend, KvFp16> {
     let loader = SyntheticLlamaLoader::new(cfg.to_llama_config());
-    LlamaFamilyModel::<CpuBackend, KvFp16>::new(cfg.to_llama_config(), &loader)
-        .expect("tiny llama model construction")
+    LlamaFamilyModel::<CpuBackend, KvFp16>::new_with_execution_config(
+        cfg.to_llama_config(),
+        &loader,
+        execution,
+    )
+    .expect("tiny llama model construction")
 }
 
 /// [`ModelInfo`] matching a [`TinyLlamaConfig`].

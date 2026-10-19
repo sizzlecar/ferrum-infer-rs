@@ -932,6 +932,8 @@ fn build_llm<B, K>(
     model_path: &str,
     llama_layer_split_plan: Option<crate::layer_split::ParsedLayerSplitPlan>,
     llama_layer_split_pipeline_mode: Option<ferrum_models::models::LlamaPipelineMode>,
+    execution: ferrum_types::LlamaExecutionConfig,
+    loader_options: ferrum_quantization::NativeSafetensorsLoadOptions,
 ) -> Result<Box<dyn ferrum_models::common::DecoderOnlyLLM>>
 where
     B: ferrum_kernels::backend::MoeLlmBackend,
@@ -945,7 +947,11 @@ where
              device-scoped execution; refusing to silently use the default device",
         ));
     }
-    let weight_loader = ferrum_quantization::NativeSafetensorsLoader::<B>::open(model_path)?;
+    execution.validate().map_err(FerrumError::config)?;
+    let weight_loader = ferrum_quantization::NativeSafetensorsLoader::<B>::open_with_options(
+        model_path,
+        loader_options,
+    )?;
     if let Some(plan) = llama_layer_split_plan {
         let stage_configs = plan.to_llama_stage_configs();
         let stage_device_ordinals = plan
@@ -964,10 +970,11 @@ where
                 device_ordinal
             );
             let stage = B::with_device_ordinal(device_ordinal, || {
-                ferrum_models::models::LlamaFamilyModel::<B, K>::new_layer_stage(
+                ferrum_models::models::LlamaFamilyModel::<B, K>::new_layer_stage_with_execution_config(
                     qcfg.clone(),
                     &weight_loader,
                     stage_config,
+                    execution.clone(),
                 )
             })?;
             stages.push(stage);
@@ -986,7 +993,11 @@ where
         )?))
     } else {
         Ok(Box::new(
-            ferrum_models::models::LlamaFamilyModel::<B, K>::new(qcfg, &weight_loader)?,
+            ferrum_models::models::LlamaFamilyModel::<B, K>::new_with_execution_config(
+                qcfg,
+                &weight_loader,
+                execution,
+            )?,
         ))
     }
 }
@@ -1614,6 +1625,12 @@ impl ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>> for LlmExecutorFacto
             )));
         }
 
+        // Freeze both model and loader options once, before any legacy weight
+        // loading. Every stage receives this same instance value.
+        let legacy_execution = config.engine_config.llama_execution_config();
+        let loader_options = ferrum_quantization::NativeSafetensorsLoadOptions {
+            gptq_gidx_trace: config.engine_config.runtime.gptq_gidx_trace,
+        };
         if let WeightFormat::Gguf { ref path } = weight_fmt {
             // Legacy or direct-path GGUF packages still use the monolithic
             // loader. Registered typed packages have already returned above.
@@ -1623,16 +1640,18 @@ impl ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>> for LlmExecutorFacto
             )?;
             let (llm, model_info) = match model_sources.as_deref() {
                 Some(sources) => {
-                    ferrum_models::gguf_engine_loader::load_gguf_decoder_from_sources_with_info(
+                    ferrum_models::gguf_engine_loader::load_gguf_decoder_from_sources_with_execution_config(
                         sources,
                         &config.device,
                         config.engine_config.model.model_id.clone(),
+                        legacy_execution,
                     )?
                 }
-                None => ferrum_models::gguf_engine_loader::load_gguf_decoder_with_info(
+                None => ferrum_models::gguf_engine_loader::load_gguf_decoder_with_execution_config(
                     path,
                     &config.device,
                     config.engine_config.model.model_id.clone(),
+                    legacy_execution,
                 )?,
             };
             return Ok(legacy_sources::bind_executor(
@@ -1739,6 +1758,8 @@ impl ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>> for LlmExecutorFacto
                                 &model_path,
                                 llama_layer_split_plan,
                                 llama_layer_split_pipeline_mode,
+                                legacy_execution,
+                                loader_options,
                             )?
                         }
                         #[cfg(any(target_os = "macos", target_os = "ios"))]
@@ -1760,6 +1781,8 @@ impl ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>> for LlmExecutorFacto
                                     &model_path,
                                     llama_layer_split_plan,
                                     llama_layer_split_pipeline_mode,
+                                    legacy_execution,
+                                    loader_options,
                                 )?
                             }
                             #[cfg(not(feature = "metal"))]
@@ -1778,6 +1801,8 @@ impl ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>> for LlmExecutorFacto
                                     &model_path,
                                     llama_layer_split_plan,
                                     llama_layer_split_pipeline_mode,
+                                    legacy_execution,
+                                    loader_options,
                                 )?
                             }
                             #[cfg(not(feature = "cuda"))]
@@ -1797,6 +1822,8 @@ impl ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>> for LlmExecutorFacto
                                     &model_path,
                                     llama_layer_split_plan,
                                     llama_layer_split_pipeline_mode,
+                                    legacy_execution,
+                                    loader_options,
                                 )?
                             }
                             #[cfg(not(feature = "cuda"))]
@@ -3348,6 +3375,8 @@ pub(crate) mod tests {
             "/missing/model/path",
             Some(plan),
             Some(ferrum_models::models::LlamaPipelineMode::Overlapped),
+            ferrum_types::LlamaExecutionConfig::default(),
+            ferrum_quantization::NativeSafetensorsLoadOptions::default(),
         ) {
             Ok(_) => panic!("layer_split build unexpectedly succeeded"),
             Err(err) => err.to_string(),

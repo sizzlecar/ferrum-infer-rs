@@ -44,7 +44,7 @@ pub use gptq_marlin_source::{GptqMarlinSafetensorsSource, GPTQ_MARLIN_INT4_FORMA
 pub use loader::{PrefixedLoader, WeightLoader};
 pub use lora::LoraLinearRef;
 pub use mxfp4_safetensors_source::{Mxfp4SafetensorsSource, MXFP4_E2M1_E8M0_SOURCE_FORMAT_ID};
-pub use native_safetensors::NativeSafetensorsLoader;
+pub use native_safetensors::{NativeSafetensorsLoadOptions, NativeSafetensorsLoader};
 pub use quant_linear::QuantLinear;
 pub use safetensors_archive::{SafetensorsArchive, SafetensorsTensor};
 pub use traits::Linear;

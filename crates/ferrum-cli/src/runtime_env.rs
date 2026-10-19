@@ -7,6 +7,28 @@
 
 use ferrum_types::{RuntimeConfigEntry, RuntimeConfigSnapshot, RuntimeConfigSource};
 
+fn model_construction_is_typed_only(key: &str) -> bool {
+    matches!(
+        key,
+        "FERRUM_KV_MAX_BLOCKS"
+            | "FERRUM_METAL_PAGED_KV"
+            | "FERRUM_PAGED_MAX_SEQS"
+            | "FERRUM_CUDA_GRAPH"
+            | "FERRUM_BATCHED_GRAPH"
+            | "FERRUM_UNIFIED_GRAPH"
+            | "FERRUM_UNIFIED_GRAPH_LAYERS_ONLY"
+            | "FERRUM_UNIFIED_GRAPH_LM_HEAD_EAGER"
+            | "FERRUM_GREEDY_ARGMAX"
+            | "FERRUM_NAN_TRACE"
+            | "FERRUM_OP_DUMP"
+            | "FERRUM_LAYER_DUMP"
+            | "FERRUM_GPTQ_GIDX_TRACE"
+    )
+    // KV_CAPACITY and SPLIT_K_ATTN still have retained CUDA backend consumers;
+    // PREFIX_CACHE also has HTTP metadata compatibility. Their separate
+    // environment bridges retire with those consumers, not by dropping input.
+}
+
 /// Reject retired controls before source resolution or device preparation.
 pub fn capture_supported_runtime_environment() -> ferrum_types::Result<RuntimeConfigSnapshot> {
     let snapshot = RuntimeConfigSnapshot::capture_current();
@@ -47,7 +69,8 @@ pub fn push_cli_runtime_usize(
 pub fn materialize_runtime_env_defaults(entries: &[RuntimeConfigEntry]) -> Vec<String> {
     let mut materialized = Vec::new();
     for entry in entries {
-        if entry.key == ferrum_types::SEGMENT_BINDING_OWNER_VIEW_MODE_CONFIG_KEY
+        if model_construction_is_typed_only(&entry.key)
+            || entry.key == ferrum_types::SEGMENT_BINDING_OWNER_VIEW_MODE_CONFIG_KEY
             || entry.key == ferrum_types::CAUSAL_DECODE_PREPARATION_MODE_CONFIG_KEY
             || entry.key == ferrum_types::CAUSAL_DECODE_ATTENTION_GROUPING_CONFIG_KEY
             || entry.key == ferrum_types::CAUSAL_DECODE_KV_REUSE_CONFIG_KEY
@@ -69,7 +92,8 @@ pub fn materialize_runtime_env_defaults(entries: &[RuntimeConfigEntry]) -> Vec<S
 pub fn materialize_runtime_env_effective(snapshot: &RuntimeConfigSnapshot) -> Vec<String> {
     let mut materialized = Vec::new();
     for entry in &snapshot.entries {
-        if entry.key == ferrum_types::SEGMENT_BINDING_OWNER_VIEW_MODE_CONFIG_KEY
+        if model_construction_is_typed_only(&entry.key)
+            || entry.key == ferrum_types::SEGMENT_BINDING_OWNER_VIEW_MODE_CONFIG_KEY
             || entry.key == ferrum_types::CAUSAL_DECODE_PREPARATION_MODE_CONFIG_KEY
             || entry.key == ferrum_types::CAUSAL_DECODE_ATTENTION_GROUPING_CONFIG_KEY
             || entry.key == ferrum_types::CAUSAL_DECODE_KV_REUSE_CONFIG_KEY
@@ -109,6 +133,41 @@ mod tests {
                 .iter()
                 .map(|(key, value, source)| RuntimeConfigEntry::new(*key, *value, *source)),
         )
+    }
+
+    #[test]
+    fn model_instance_options_are_never_materialized_as_environment() {
+        for (key, value) in [
+            ("FERRUM_KV_MAX_BLOCKS", "17"),
+            ("FERRUM_METAL_PAGED_KV", "0"),
+            ("FERRUM_PAGED_MAX_SEQS", "3"),
+            ("FERRUM_CUDA_GRAPH", "1"),
+            ("FERRUM_BATCHED_GRAPH", "1"),
+            ("FERRUM_UNIFIED_GRAPH", "1"),
+            ("FERRUM_UNIFIED_GRAPH_LAYERS_ONLY", "1"),
+            ("FERRUM_UNIFIED_GRAPH_LM_HEAD_EAGER", "1"),
+            ("FERRUM_GREEDY_ARGMAX", "1"),
+            ("FERRUM_NAN_TRACE", "layer3"),
+            ("FERRUM_OP_DUMP", "op-diagnostic"),
+            ("FERRUM_LAYER_DUMP", "layer-diagnostic"),
+            ("FERRUM_GPTQ_GIDX_TRACE", "1"),
+        ] {
+            let original = std::env::var_os(key);
+            for source in [
+                RuntimeConfigSource::Default,
+                RuntimeConfigSource::ConfigFile,
+                RuntimeConfigSource::Cli,
+                RuntimeConfigSource::Env,
+            ] {
+                let current = snapshot(&[(key, value, source)]);
+                assert!(materialize_runtime_env_defaults(&current.entries).is_empty());
+                assert!(materialize_runtime_env_effective(&current).is_empty());
+                assert_eq!(std::env::var_os(key), original);
+                let mut engine = ferrum_types::EngineConfig::default();
+                engine.apply_runtime_config_snapshot(&current).unwrap();
+                assert_eq!(runtime_snapshot_value(&current, key), Some(value));
+            }
+        }
     }
 
     #[test]
