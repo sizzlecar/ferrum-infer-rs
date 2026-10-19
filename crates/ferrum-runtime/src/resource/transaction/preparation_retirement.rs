@@ -5,6 +5,7 @@ use crate::{
     defer_device_cleanup, DeferredDeviceCleanupDisposition, DeferredDeviceCleanupTask,
     FailureEnvelope,
 };
+use std::any::Any;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 
 enum PreparationState<D: ResourceTransactionDriver> {
@@ -84,22 +85,11 @@ impl<D: ResourceTransactionDriver + 'static> ResourcePreparationRetirement<D> {
         match catch_unwind(AssertUnwindSafe(|| self.advance())) {
             Ok(result) => result,
             Err(payload) => {
-                let message = if let Some(message) = payload.downcast_ref::<String>() {
-                    message.clone()
-                } else if let Some(message) = payload.downcast_ref::<&str>() {
-                    (*message).to_owned()
-                } else {
-                    "non-string preparation retirement panic".to_owned()
-                };
-                let mut message = message
-                    .chars()
-                    .filter(|c| !c.is_control() || *c == ' ')
-                    .take(1024)
-                    .collect::<String>();
-                if message.trim().is_empty() {
-                    message.push_str("preparation retirement panicked");
-                }
-                let failure = core_resource_failure("preparation_retirement_panic", message, false);
+                let failure = core_resource_failure(
+                    "preparation_retirement_panic",
+                    panic_message(payload.as_ref()),
+                    false,
+                );
                 self.poison = Some(failure.clone());
                 Err(failure)
             }
@@ -207,6 +197,25 @@ impl<D: ResourceTransactionDriver + 'static> ResourcePreparationRetirement<D> {
             }
         }
     }
+}
+
+fn panic_message(payload: &(dyn Any + Send)) -> String {
+    let message = if let Some(message) = payload.downcast_ref::<String>() {
+        message.clone()
+    } else if let Some(message) = payload.downcast_ref::<&str>() {
+        (*message).to_owned()
+    } else {
+        "non-string preparation retirement panic".to_owned()
+    };
+    let mut message = message
+        .chars()
+        .filter(|c| !c.is_control() || *c == ' ')
+        .take(1024)
+        .collect::<String>();
+    if message.trim().is_empty() {
+        message.push_str("preparation retirement panicked");
+    }
+    message
 }
 
 impl<D: ResourceTransactionDriver + 'static> Drop for ResourcePreparationRetirement<D> {

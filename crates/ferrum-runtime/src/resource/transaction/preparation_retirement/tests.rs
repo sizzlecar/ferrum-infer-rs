@@ -197,6 +197,15 @@ fn preparation_retirement_poisoned_commit_reconciles_actual_slot_before_compensa
 
 #[test]
 fn preparation_retirement_hook_panic_drop_preserves_actual_resources_and_capacity() {
+    hook_panic_preserves_original_owner(false);
+}
+
+#[test]
+fn preparation_retirement_payload_drop_panic_cannot_reenable_unknown_hook() {
+    hook_panic_preserves_original_owner(true);
+}
+
+fn hook_panic_preserves_original_owner(panicking_payload: bool) {
     let _serial = crate::static_initialization::STATIC_PROVISION_CLEANUP_TEST
         .lock()
         .unwrap();
@@ -207,11 +216,15 @@ fn preparation_retirement_hook_panic_drop_preserves_actual_resources_and_capacit
         .unwrap()
         .post_allocation
         .insert(last.to_string(), PostAllocationBehavior::DropThenError);
-    trace
-        .lock()
-        .unwrap()
-        .hook_panics
-        .insert(format!("reconcile:{last}"));
+    {
+        let mut trace = trace.lock().unwrap();
+        let panics = if panicking_payload {
+            &mut trace.hook_panics_with_panicking_payload
+        } else {
+            &mut trace.hook_panics
+        };
+        panics.insert(format!("reconcile:{last}"));
+    }
     let mut original = ResourcePreparationRetirement::from_commit(
         original
             .reserve()
@@ -220,10 +233,20 @@ fn preparation_retirement_hook_panic_drop_preserves_actual_resources_and_capacit
             .err()
             .expect("injected commit failure"),
     );
-    assert_eq!(
-        original.retire_in_place().unwrap_err().code(),
-        "preparation_retirement_panic"
-    );
+    let first_cause = original.failure().clone();
+    if panicking_payload {
+        assert!(catch_unwind(AssertUnwindSafe(|| original.retire_in_place())).is_err());
+        assert!(
+            original.poison.is_some(),
+            "unknown side effects must be poisoned before the caught payload is destroyed"
+        );
+    } else {
+        assert_eq!(
+            original.retire_in_place().unwrap_err().code(),
+            "preparation_retirement_panic"
+        );
+    }
+    assert_eq!(original.failure(), &first_cause);
     let before = trace.lock().unwrap().calls.clone();
     assert!(original.retire_in_place().is_err());
     assert_eq!(trace.lock().unwrap().calls, before);

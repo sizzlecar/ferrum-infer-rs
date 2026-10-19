@@ -715,6 +715,7 @@ pub struct Trace {
     pub(crate) static_fence_indeterminate: bool,
     pub(crate) release_panics: BTreeSet<ResourceId>,
     pub(crate) hook_panics: BTreeSet<String>,
+    pub(crate) hook_panics_with_panicking_payload: BTreeSet<String>,
     pub(crate) upload_calls: u64,
     pub(crate) submit_calls: u64,
     pub(crate) release_notifications: Option<mpsc::Sender<()>>,
@@ -973,6 +974,16 @@ impl TestDriver {
             .unwrap_or_else(|| action.to_owned());
         let mut trace = self.trace.lock().unwrap();
         trace.calls.push(key.clone());
+        if trace.hook_panics_with_panicking_payload.remove(&key) {
+            drop(trace);
+            struct PanickingPayload;
+            impl Drop for PanickingPayload {
+                fn drop(&mut self) {
+                    panic!("injected panic payload destruction failure");
+                }
+            }
+            std::panic::panic_any(PanickingPayload);
+        }
         if trace.hook_panics.remove(&key) {
             drop(trace);
             panic!("injected resource hook uncertainty: {key}");
