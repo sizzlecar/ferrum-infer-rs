@@ -36,7 +36,8 @@ counters!(
     trained_samples,
     published_snapshots,
     training_failures,
-    worker_failures
+    worker_failures,
+    discarded_pending
 );
 
 pub(super) struct Shared {

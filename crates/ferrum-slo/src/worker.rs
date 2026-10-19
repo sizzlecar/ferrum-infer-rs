@@ -220,10 +220,31 @@ impl Table {
     }
 }
 
-struct Liveness(Arc<Shared>);
-impl Drop for Liveness {
+struct Liveness<'a> {
+    shared: Arc<Shared>,
+    receiver: &'a crossbeam_channel::Receiver<Envelope>,
+    wake: &'a crossbeam_channel::Receiver<()>,
+}
+
+impl Drop for Liveness<'_> {
     fn drop(&mut self) {
-        self.0.stop();
+        self.shared.stop();
+        // A surviving observer retains the bounded channel's allocation, even
+        // after its last receiver drops. Retire queued payload explicitly on
+        // unwind. The publication guard covers producers that passed the open
+        // check before stop, so they cannot enqueue after this drain completes.
+        // Normal shutdown already trained/drained everything before this point.
+        while !self.shared.drained() {
+            crossbeam_channel::select! {
+                recv(self.receiver) -> message => {
+                    if let Ok(envelope) = message {
+                        drop(envelope);
+                        self.shared.counters.discarded_pending.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+                recv(self.wake) -> _ => {}
+            }
+        }
     }
 }
 
@@ -236,7 +257,11 @@ pub(super) fn run(
     wake: crossbeam_channel::Receiver<()>,
     hooks: Hooks,
 ) {
-    let _liveness = Liveness(Arc::clone(&shared));
+    let _liveness = Liveness {
+        shared: Arc::clone(&shared),
+        receiver: &receiver,
+        wake: &wake,
+    };
     let mut table = Table {
         domains: HashMap::new(),
         count: 0,

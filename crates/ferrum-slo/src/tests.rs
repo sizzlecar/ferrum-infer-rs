@@ -1,4 +1,5 @@
 use super::*;
+mod worker_engine;
 use ferrum_execution::{execution_attempt::*, model_executor::PrefillChunk, token_execution::*};
 use ferrum_scheduler::cost_prediction::*;
 use ferrum_types::RequestId;
@@ -518,6 +519,55 @@ async fn reference_worker_panic_keeps_last_snapshot_until_its_original_expiry() 
     let mut changed = source.subscribe();
     changed.borrow_and_update();
     assert!(changed.changed().await.is_err());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reference_worker_panic_retires_pending_payload_with_observer_alive() {
+    let gate = Arc::new(Gate::default());
+    let release = Release(Arc::clone(&gate));
+    let owner = ReferenceEstimator::spawn_inner(
+        ReferenceEstimatorConfig {
+            queue_capacity: 3,
+            ..config()
+        },
+        worker::Hooks {
+            gate: Some(gate.clone()),
+            panic_next: Some(Arc::new(AtomicBool::new(true))),
+        },
+    )
+    .unwrap();
+    let observer = owner.observer();
+    assert_eq!(
+        observer.try_record(&sample(1, 3)),
+        ExecutionAttemptDelivery::Recorded
+    );
+    tokio::time::timeout(Duration::from_secs(5), gate.wait_entered())
+        .await
+        .unwrap();
+    for id in [2, 3] {
+        assert_eq!(
+            observer.try_record(&sample(id, 3)),
+            ExecutionAttemptDelivery::Recorded
+        );
+    }
+    assert_eq!(owner.stats().queued_records, 3);
+    drop(release);
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(5), owner.shutdown())
+            .await
+            .unwrap(),
+        Err(EstimatorError::WorkerPanicked),
+    );
+    let stats = owner.stats();
+    assert_eq!(stats.accepted, 3);
+    assert_eq!(stats.trained_samples, 0);
+    assert_eq!(stats.discarded_pending, 2);
+    assert_eq!(stats.queued_records, 0);
+    assert_eq!(stats.queued_bytes, 0);
+    assert_eq!(
+        observer.try_record(&sample(4, 3)),
+        ExecutionAttemptDelivery::Dropped(ExecutionAttemptDrop::Closed)
+    );
 }
 
 #[tokio::test]
