@@ -7,7 +7,7 @@ use crate::models::llama_family::LlamaFamilyConfig;
 use crate::models::LlamaFamilyModel;
 use crate::test_support::{tiny_model_info, SyntheticLlamaLoader, TinyLlamaConfig};
 use ferrum_execution::model_executor::{ExecutorPrefillAdmission, PrefillChunk};
-use ferrum_kernels::backend::{cpu::CpuBackend, MoeLlmBackend};
+use ferrum_kernels::backend::{cpu::CpuBackend, KvLayer, MoeLlmBackend};
 use ferrum_types::{Device, LlamaExecutionConfig, LlamaExecutionOptions};
 use std::time::Duration;
 
@@ -57,10 +57,12 @@ fn fixture<B: MoeLlmBackend>(
     executor_from_model(model, device)
 }
 
-fn executor_from_model<B: MoeLlmBackend>(
-    model: LlamaFamilyModel<B>,
-    device: Device,
-) -> LlmExecutor {
+fn executor_from_model<B, K>(model: LlamaFamilyModel<B, K>, device: Device) -> LlmExecutor
+where
+    B: MoeLlmBackend,
+    K: KvLayer<B>,
+    LlamaFamilyModel<B, K>: DecoderOnlyLLM,
+{
     let config = config();
     let mut info = tiny_model_info(&TinyLlamaConfig {
         hidden_size: config.hidden_size,

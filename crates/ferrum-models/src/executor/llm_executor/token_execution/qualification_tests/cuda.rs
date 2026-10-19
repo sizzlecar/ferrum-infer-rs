@@ -8,6 +8,7 @@ use cudarc::driver::CudaStream;
 use ferrum_execution::executor_lifecycle::{
     ExecutorOwner, ExecutorShutdownObserver, ExecutorShutdownPhase, ExecutorShutdownReport,
 };
+use ferrum_interfaces::kv_dtype::KvFp16;
 use ferrum_kernels::backend::{cuda::CudaBackend, Backend, CudaBuf};
 use ferrum_kernels::{Linear, LinearMetadata, LoadedLinear};
 use ferrum_quantization::{QuantConfig, WeightLoader};
@@ -225,12 +226,20 @@ impl WeightLoader<CudaBackend> for ObservedLoader {
 }
 
 fn observed_executor(paged: bool) -> (LlmExecutor, Arc<Control>) {
+    observed_executor_with_kv::<KvFp16>(paged)
+}
+
+fn observed_executor_with_kv<K>(paged: bool) -> (LlmExecutor, Arc<Control>)
+where
+    K: KvLayer<CudaBackend>,
+    LlamaFamilyModel<CudaBackend, K>: DecoderOnlyLLM,
+{
     let control = Control::new();
     let loader = ObservedLoader {
         inner: SyntheticLlamaLoader::new(config()),
         control: Arc::clone(&control),
     };
-    let model = LlamaFamilyModel::<CudaBackend>::new_with_execution_config(
+    let model = LlamaFamilyModel::<CudaBackend, K>::new_with_execution_config(
         config(),
         &loader,
         LlamaExecutionConfig {
@@ -319,6 +328,13 @@ async fn qualification_unwrapped_cuda_cold_owner_closes_without_admission() {
 #[ignore = "requires actual CUDA head encoding, failure recovery and independent CPU logits"]
 async fn qualification_unwrapped_cuda_encoded_failure_keeps_peer_and_closes_original() {
     let (executor, control) = observed_executor(true);
+    encoded_failure_keeps_peer_and_closes_original(executor, control).await;
+}
+
+async fn encoded_failure_keeps_peer_and_closes_original(
+    executor: LlmExecutor,
+    control: Arc<Control>,
+) {
     let failed = admit(&executor, &RequestId::new()).await;
     let peer = admit(&executor, &RequestId::new()).await;
     control.fail_head_once.store(true, Ordering::SeqCst);
@@ -427,6 +443,10 @@ async fn qualification_unwrapped_cuda_encoded_failure_keeps_peer_and_closes_orig
 #[ignore = "requires actual encoded CUDA cancellation and healthy peer continuation"]
 async fn qualification_unwrapped_cuda_encoded_cancellation_preserves_peer() {
     let (executor, control) = observed_executor(true);
+    encoded_cancellation_preserves_peer(executor, control).await;
+}
+
+async fn encoded_cancellation_preserves_peer(executor: LlmExecutor, control: Arc<Control>) {
     let cancelled = admit(&executor, &RequestId::new()).await;
     let peer = admit(&executor, &RequestId::new()).await;
     let mut reference = real_model::<CpuBackend>(false);
@@ -532,6 +552,13 @@ async fn qualification_unwrapped_cuda_encoded_cancellation_preserves_peer() {
 #[ignore = "requires real encoded CUDA work and cancellation-safe final-owner retirement"]
 async fn qualification_unwrapped_cuda_cancelled_close_waiter_joins_original_worker() {
     let (executor, control) = observed_executor(true);
+    cancelled_close_waiter_joins_original_worker(executor, control).await;
+}
+
+async fn cancelled_close_waiter_joins_original_worker(
+    executor: LlmExecutor,
+    control: Arc<Control>,
+) {
     let frontier = admit(&executor, &RequestId::new()).await;
     let policy = LogitsReturnPolicy::FullLogits;
     let work = [ExecutionWork::new(
@@ -570,3 +597,5 @@ async fn qualification_unwrapped_cuda_cancelled_close_waiter_joins_original_work
     assert_eq!(control.actual_forwards.load(Ordering::SeqCst), 1);
     assert_released(&slot, &control);
 }
+
+mod int8;

@@ -49,6 +49,19 @@ fn model_frame_tests(backend: Backend) -> Vec<ContractTest> {
     }
     if backend == Backend::Cuda {
         tests.push("models::llama_family::device_execution::tests::model_frame_cancels_failed_cuda_capture_without_executing_prefix".into());
+        tests.extend([
+            "qualification_unwrapped_cuda_completion_and_original_owner_close",
+            "qualification_unwrapped_cuda_cold_owner_closes_without_admission",
+            "qualification_unwrapped_cuda_encoded_failure_keeps_peer_and_closes_original",
+            "qualification_unwrapped_cuda_encoded_cancellation_preserves_peer",
+            "qualification_unwrapped_cuda_cancelled_close_waiter_joins_original_worker",
+            "int8::qualification_unwrapped_cuda_int8_completion_and_original_owner_close",
+            "int8::qualification_unwrapped_cuda_int8_cold_owner_closes_without_admission",
+            "int8::qualification_unwrapped_cuda_int8_encoded_failure_keeps_peer_and_closes_original",
+            "int8::qualification_unwrapped_cuda_int8_encoded_cancellation_preserves_peer",
+            "int8::qualification_unwrapped_cuda_int8_cancelled_close_waiter_joins_original_worker",
+            "int8::qualification_unwrapped_cuda_int8_serial_page_crossing_keeps_completed_peer",
+        ].into_iter().map(|test| format!("executor::llm_executor::token_execution::qualification_tests::cuda::{test}")));
     }
     tests
         .into_iter()

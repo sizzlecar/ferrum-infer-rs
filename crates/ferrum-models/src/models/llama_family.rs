@@ -4329,6 +4329,24 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         logits
     }
 
+    fn standalone_token_execution_mode(&self) -> crate::common::ModelTokenExecutionMode {
+        use crate::common::ModelTokenExecutionMode;
+        if B::host_execution_is_synchronous() {
+            ModelTokenExecutionMode::InlineSynchronous
+        } else if B::supports_retained_execution()
+            && self.layer_source_start == 0
+            && self.layer_source_end == self.cfg.num_layers
+            && self.embed.is_some()
+            && self.lm_head.is_some()
+        {
+            // Standalone token work requires the complete model. Backbone
+            // and layer-stage entry points have separate execution contracts.
+            ModelTokenExecutionMode::ManagedWorker
+        } else {
+            ModelTokenExecutionMode::Unsupported
+        }
+    }
+
     pub(crate) fn execute_host_token_work(
         &mut self,
         input: &crate::common::llm::ModelTokenInput<'_>,
@@ -5452,21 +5470,7 @@ impl<B: MoeLlmBackend> DecoderOnlyLLM for LlamaFamilyModel<B, KvFp16> {
     }
 
     fn token_execution_mode(&self) -> crate::common::ModelTokenExecutionMode {
-        use crate::common::ModelTokenExecutionMode;
-        if B::host_execution_is_synchronous() {
-            ModelTokenExecutionMode::InlineSynchronous
-        } else if B::supports_retained_execution()
-            && self.layer_source_start == 0
-            && self.layer_source_end == self.cfg.num_layers
-            && self.embed.is_some()
-            && self.lm_head.is_some()
-        {
-            // Standalone token work requires the complete model. Backbone
-            // and layer-stage entry points have separate execution contracts.
-            ModelTokenExecutionMode::ManagedWorker
-        } else {
-            ModelTokenExecutionMode::Unsupported
-        }
+        self.standalone_token_execution_mode()
     }
 
     fn execute_token_work(
@@ -5697,9 +5701,8 @@ impl<B: MoeLlmBackend> DecoderOnlyLLM for LlamaFamilyModel<B, KvFp16> {
     }
 }
 
-// INT8 DecoderOnlyLLM impl — minimal: no batched / unified-forward overrides
-// (default trait impl falls back to per-item decode). PR D will add INT8
-// batched paths once the kernels stabilize.
+// INT8 shares retained-frame ownership and per-participant token execution.
+// Batch work remains serial; it does not claim the FP16 fused batch contract.
 impl<B: MoeLlmBackend + BackendInt8KvOps> DecoderOnlyLLM for LlamaFamilyModel<B, KvInt8> {
     fn retire_model(&mut self) -> crate::common::llm::ModelRetirementOutcome {
         self.retire_original_model()
@@ -5719,13 +5722,7 @@ impl<B: MoeLlmBackend + BackendInt8KvOps> DecoderOnlyLLM for LlamaFamilyModel<B,
     }
 
     fn token_execution_mode(&self) -> crate::common::ModelTokenExecutionMode {
-        use crate::common::ModelTokenExecutionMode;
-        // Device INT8 qualification is independent of the FP16 worker path.
-        if B::host_execution_is_synchronous() {
-            ModelTokenExecutionMode::InlineSynchronous
-        } else {
-            ModelTokenExecutionMode::Unsupported
-        }
+        self.standalone_token_execution_mode()
     }
 
     fn execute_token_work(
