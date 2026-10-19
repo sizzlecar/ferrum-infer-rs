@@ -967,6 +967,7 @@ impl EngineInner {
     async fn prepare_token_prefill_cohort(
         &self,
         hint: &ferrum_interfaces::BatchHint,
+        mut planning: Option<&mut TimePlanningRound>,
     ) -> Result<bool> {
         let Some(configured_target) = self.config.scheduler.prefill_first_until_active else {
             return Ok(false);
@@ -986,7 +987,9 @@ impl EngineInner {
             if desired == 0 || self.scheduler.waiting_count() == 0 {
                 break;
             }
-            let (admitted, maintenance) = self.prepare_dynamic_admission_round(desired).await?;
+            let (admitted, maintenance) = self
+                .prepare_dynamic_admission_round(desired, planning.as_deref_mut())
+                .await?;
             let maintenance =
                 PendingPrefillMaintenance::new(self.model_executor.as_ref().as_ref(), maintenance);
             progressed |= admitted > 0;
@@ -1283,11 +1286,26 @@ impl EngineInner {
         let hint_max_tokens = hint.max_tokens;
 
         let sched_t0 = Instant::now();
-        if self.prepare_token_prefill_cohort(&hint).await? {
+        // A planning iteration may contain multiple asynchronous admission
+        // rounds. Keep one immutable prediction version across all of them;
+        // prediction queries still use their current monotonic time.
+        let mut planning = self.config.scheduler.slo.map(|policy| {
+            TimePlanningRound::new(
+                self.cost_snapshot_source
+                    .as_ref()
+                    .expect("feedback validated before startup")
+                    .load(),
+                policy,
+            )
+        });
+        if self
+            .prepare_token_prefill_cohort(&hint, planning.as_mut())
+            .await?
+        {
             return Ok(EngineIterationOutcome::Progressed);
         }
         let (_, prefill_maintenance) = self
-            .prepare_dynamic_admission_round(hint.max_batch_size)
+            .prepare_dynamic_admission_round(hint.max_batch_size, planning.as_mut())
             .await?;
         let prefill_maintenance = PendingPrefillMaintenance::new(
             self.model_executor.as_ref().as_ref(),
@@ -1316,11 +1334,12 @@ impl EngineInner {
                 )
             });
             let mut observations = Vec::new();
-            let scheduled =
-                self.scheduler
-                    .next_batch_with_token_admissions(hint, wake, &mut |observation| {
-                        observations.push(observation)
-                    });
+            let scheduled = self.scheduler.next_batch_with_token_admissions(
+                hint,
+                wake,
+                &mut |observation| observations.push(observation),
+                planning.as_mut(),
+            );
             (scheduled, observations)
         };
         for observation in observations {
@@ -1331,7 +1350,9 @@ impl EngineInner {
         let sched_elapsed = sched_t0.elapsed();
         self.record_scheduling_time(sched_elapsed);
 
-        let batch = match nb_result {
+        let retry_at = nb_result.retry_at;
+        let time_blocked = nb_result.time_blocked;
+        let batch = match nb_result.batch {
             Some(b) => b,
             None => {
                 self.execute_executor_prefill_maintenance(prefill_maintenance.into_pending());
@@ -1371,24 +1392,42 @@ impl EngineInner {
                                     "plan runtime did not register its capacity waiter",
                                 )
                             })?;
-                        return Ok(EngineIterationOutcome::CapacityBlocked(registration));
+                        return Ok(EngineIterationOutcome::Waiting {
+                            capacity: Some(registration),
+                            retry_at,
+                        });
                     }
                     if self.scheduler.all_active_execution_readiness_blocked()
                         || self.scheduler.all_active_allocator_capacity_blocked()
                     {
-                        return Ok(EngineIterationOutcome::Idle);
+                        return Ok(EngineIterationOutcome::Waiting {
+                            capacity: None,
+                            retry_at,
+                        });
                     }
                 }
                 if self.scheduler.active_count() == 0
                     && self.scheduler.waiting_for_confirmed_capacity_release()
                 {
-                    return Ok(EngineIterationOutcome::Idle);
+                    return Ok(EngineIterationOutcome::Waiting {
+                        capacity: None,
+                        retry_at,
+                    });
+                }
+                if time_blocked {
+                    return Ok(EngineIterationOutcome::Waiting {
+                        capacity: None,
+                        retry_at,
+                    });
                 }
                 if self.scheduler.active_count() > 0 {
                     return Ok(EngineIterationOutcome::Progressed);
                 }
                 return if self.scheduler.waiting_count() == 0 {
-                    Ok(EngineIterationOutcome::Idle)
+                    Ok(EngineIterationOutcome::Waiting {
+                        capacity: None,
+                        retry_at,
+                    })
                 } else {
                     Ok(EngineIterationOutcome::Progressed)
                 };
@@ -1413,42 +1452,10 @@ impl EngineInner {
         // selected batch owns its request authorities, so new ingress may be
         // published while the device executes this wave.
         drop(iteration_guard);
-        // Fit only completed work. Planned tokens can disappear through
-        // cancellation, cache reuse or capacity deferral; they are not execution
-        // samples. Read these counters only when the optional policy is enabled.
-        let slo_before = self.config.scheduler.slo.as_ref().and_then(|_| {
-            let planned_tokens = batch
-                .requests
-                .iter()
-                .map(|request| request.tokens_to_process)
-                .sum::<Option<usize>>()?;
-            Some((
-                self.total_prefill_tokens.load(Ordering::Relaxed),
-                self.total_decode_tokens.load(Ordering::Relaxed),
-                planned_tokens as u64,
-            ))
-        });
         let process_t0 = Instant::now();
         let r = self.process_batch(&batch).await;
         let process_elapsed = process_t0.elapsed();
         self.record_model_execution_time(process_elapsed);
-        if let Some((prefill_before, decode_before, planned_tokens)) = slo_before {
-            let prefill = self
-                .total_prefill_tokens
-                .load(Ordering::Relaxed)
-                .saturating_sub(prefill_before);
-            let decode = self
-                .total_decode_tokens
-                .load(Ordering::Relaxed)
-                .saturating_sub(decode_before);
-            if r.is_ok() && prefill + decode > 0 && prefill + decode == planned_tokens {
-                self.scheduler.record_execution_step(
-                    prefill as usize,
-                    decode as usize,
-                    sched_elapsed + process_elapsed,
-                );
-            }
-        }
         self.execute_executor_prefill_maintenance(prefill_maintenance.into_pending());
         self.complete_typed_admission_failures().await?;
         if trace_enabled {

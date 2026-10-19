@@ -59,7 +59,7 @@ impl TokenAdmissionRound<'_> {
         probe: &mut dyn FnMut(&InferenceRequest) -> ExecutorAdmissionProbeOutcome,
         observer: &mut dyn FnMut(ExecutorAdmissionQueueObservation),
     ) -> Result<AdmissionTickReceipt> {
-        while let Some(candidate) = self.next(observer)? {
+        while let Some(candidate) = self.next(observer, None)? {
             let outcome = probe(candidate.request());
             match self.apply(candidate, outcome) {
                 TokenAdmissionApply::Applied { .. } => {}
@@ -76,54 +76,103 @@ impl TokenAdmissionRound<'_> {
     pub fn next(
         &mut self,
         observer: &mut dyn FnMut(ExecutorAdmissionQueueObservation),
+        planning: Option<&mut TimePlanningRound>,
     ) -> Result<Option<TokenAdmissionCandidate>> {
-        let scan = self.scan.as_mut().expect("live admission round");
-        let mut waiting = self.scheduler.waiting_queue.write();
-        let mut events = self.scheduler.dynamic_admission_events.lock();
-        events.clear();
-        let observer = std::cell::RefCell::new(observer);
-        let selected = waiting
-            .next_scan_candidate(
-                scan,
-                &mut events,
-                |request, ticket| {
-                    self.scheduler.token_admission_eligibility(
-                        request,
-                        ticket,
-                        &mut **observer.borrow_mut(),
-                    )
-                },
-                |_, _| {},
-                |request, ticket, deferral| {
-                    observer.borrow_mut()(ExecutorAdmissionQueueObservation::SkippedUnchanged {
-                        request_id: request.inner.request.id.clone(),
-                        ticket: ticket.get(),
-                        deferral: deferral.clone(),
-                        current: self
-                            .wake
-                            .expect("native deferral has a real snapshot")
-                            .epochs(),
-                    });
-                },
-            )
-            .map_err(|error| FerrumError::scheduler(error.to_string()))?;
-        // The waiting lock spans removal and publication of a contract failure,
-        // so concurrent cancel/submit cannot observe an unowned lifecycle gap.
-        self.scheduler.apply_token_admission_events(&mut events);
-        selected
-            .map(|ticket| {
-                let request = waiting
-                    .request_mut(ticket)
-                    .expect("selected ticket remains queued");
-                let key = PrefixRequestKey::from_request(request)
-                    .expect("queued request retains its original waiting identity");
-                Ok(TokenAdmissionCandidate {
-                    key,
-                    scan_id: scan.id(),
-                    request: request.inner.request.clone(),
+        self.next_at(observer, planning, Instant::now())
+    }
+
+    pub(super) fn next_at(
+        &mut self,
+        observer: &mut dyn FnMut(ExecutorAdmissionQueueObservation),
+        mut planning: Option<&mut TimePlanningRound>,
+        now: Instant,
+    ) -> Result<Option<TokenAdmissionCandidate>> {
+        loop {
+            let scan = self.scan.as_mut().expect("live admission round");
+            let mut waiting = self.scheduler.waiting_queue.write();
+            let mut events = self.scheduler.dynamic_admission_events.lock();
+            events.clear();
+            let observer = std::cell::RefCell::new(&mut *observer);
+            let mut time_rejection = None;
+            let selected = waiting
+                .next_scan_candidate(
+                    scan,
+                    &mut events,
+                    |request, ticket| {
+                        let eligibility = self.scheduler.token_admission_eligibility(
+                            request,
+                            ticket,
+                            &mut **observer.borrow_mut(),
+                        );
+                        if eligibility == AdmissionQueueEligibility::Held {
+                            return eligibility;
+                        }
+                        time_rejection = None;
+                        if let Some(round) = planning.as_deref_mut() {
+                            match self.scheduler.admission_time_decision(request, round, now) {
+                                TimeDecision::Allow(_) => {}
+                                TimeDecision::Hold => return AdmissionQueueEligibility::Held,
+                                TimeDecision::Reject(error) => {
+                                    time_rejection = Some((ticket, error))
+                                }
+                            }
+                        }
+                        eligibility
+                    },
+                    |_, _| {},
+                    |request, ticket, deferral| {
+                        observer.borrow_mut()(
+                            ExecutorAdmissionQueueObservation::SkippedUnchanged {
+                                request_id: request.inner.request.id.clone(),
+                                ticket: ticket.get(),
+                                deferral: deferral.clone(),
+                                current: self
+                                    .wake
+                                    .expect("native deferral has a real snapshot")
+                                    .epochs(),
+                            },
+                        );
+                    },
+                )
+                .map_err(|error| FerrumError::scheduler(error.to_string()))?;
+            // The waiting lock spans removal and publication of a contract failure,
+            // so concurrent cancel/submit cannot observe an unowned lifecycle gap.
+            self.scheduler.apply_token_admission_events(&mut events);
+            if let (Some(selected), Some((rejected, error))) = (selected, time_rejection) {
+                if selected == rejected {
+                    match waiting.apply_scan_probe(
+                        scan,
+                        selected,
+                        AdmissionProbeOutcome::Faulted(error),
+                        &mut events,
+                    ) {
+                        QueueProbeApplication::Applied => {
+                            self.scheduler.apply_token_admission_events(&mut events);
+                            continue;
+                        }
+                        QueueProbeApplication::Unapplied { error, .. } => {
+                            return Err(FerrumError::scheduler(format!(
+                                "time-policy rejection lost the original admission scan: {error:?}"
+                            )))
+                        }
+                    }
+                }
+            }
+            return selected
+                .map(|ticket| {
+                    let request = waiting
+                        .request_mut(ticket)
+                        .expect("selected ticket remains queued");
+                    let key = PrefixRequestKey::from_request(request)
+                        .expect("queued request retains its original waiting identity");
+                    Ok(TokenAdmissionCandidate {
+                        key,
+                        scan_id: scan.id(),
+                        request: request.inner.request.clone(),
+                    })
                 })
-            })
-            .transpose()
+                .transpose();
+        }
     }
 
     pub fn apply(

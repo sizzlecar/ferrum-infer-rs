@@ -153,7 +153,7 @@ async fn request_clock_deferred_and_cancelled_admission_preserve_waiting_segment
     let expected_wait = original.queue_wait_at(check_at);
 
     let mut round = scheduler.begin_token_admission(1, None).unwrap();
-    let candidate = round.next(&mut |_| {}).unwrap().unwrap();
+    let candidate = round.next(&mut |_| {}, None).unwrap().unwrap();
     assert_eq!(candidate.request().ingress, Some(original.ingress()));
     assert!(matches!(
         round.apply(candidate, AdmissionProbeOutcome::CapacityDeferred),
@@ -173,7 +173,7 @@ async fn request_clock_deferred_and_cancelled_admission_preserve_waiting_segment
         let task_scheduler = Arc::clone(&scheduler);
         let task = tokio::spawn(async move {
             let mut round = task_scheduler.begin_token_admission(1, None).unwrap();
-            let candidate = round.next(&mut |_| {}).unwrap().unwrap();
+            let candidate = round.next(&mut |_| {}, None).unwrap().unwrap();
             selected.send(candidate.key().ordinal()).unwrap();
             std::future::pending::<()>().await;
             drop(candidate);

@@ -28,6 +28,7 @@ pub mod requests;
 pub mod resource_trace;
 pub mod runtime_config;
 pub mod sampling;
+pub mod slo_config;
 pub mod startup_memory;
 
 // Re-export commonly used types
@@ -55,6 +56,7 @@ pub use requests::*;
 pub use resource_trace::*;
 pub use runtime_config::*;
 pub use sampling::*;
+pub use slo_config::*;
 pub use startup_memory::*;
 
 /// Result type used throughout Ferrum

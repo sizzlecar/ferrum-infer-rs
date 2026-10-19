@@ -409,11 +409,12 @@ async fn prefix_rendezvous_expiry_releases_optional_wait_once_without_failing_re
         .scheduler
         .prefix_rendezvous_max_wait_ms
         .unwrap();
-    // Exercise the same timer future used by Idle/CapacityBlocked, without a
+    // Exercise the same timer future used by the combined driver wait, without a
     // real wait or a spawned rendezvous task. Virtual Tokio time wakes it;
     // native lease expiry still uses the real monotonic clock below.
     let inner = engine.active_inner().expect("engine execution is open");
-    let mut wake = tokio_test::task::spawn(inner.wait_for_prefix_deadline());
+    let mut wake =
+        tokio_test::task::spawn(managed_driver::wait_for_deadline(inner.prefix_deadline()));
     tokio_test::assert_pending!(wake.poll());
     tokio::time::advance(Duration::from_millis(wait.get()) + Duration::from_secs(1)).await;
     tokio_test::assert_ready!(wake.poll());
@@ -455,7 +456,8 @@ async fn prefix_rendezvous_shutdown_drops_wait_and_pending_checkpoint_interest()
         .unwrap();
     assert_eq!(engine.scheduler.prefix_held_waiting_count(), 1);
     let inner = engine.active_inner().expect("engine execution is open");
-    let mut wake = tokio_test::task::spawn(inner.wait_for_prefix_deadline());
+    let mut wake =
+        tokio_test::task::spawn(managed_driver::wait_for_deadline(inner.prefix_deadline()));
     tokio_test::assert_pending!(wake.poll());
     // select! cancels this borrowed future when another branch wins. It owns
     // neither a checkpoint pin nor an independently spawned timer task.

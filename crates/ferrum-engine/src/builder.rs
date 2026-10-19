@@ -17,6 +17,7 @@ use ferrum_execution::ModelExecutor;
 use ferrum_interfaces::engine::{InferenceEngine, LlmInferenceEngine};
 use ferrum_interfaces::{KvCacheManager, RecurrentStateManager, Sampler, TensorFactory, Tokenizer};
 use ferrum_models::vnext::{DefinedProductionModel, ProductionModelSourceBundle};
+use ferrum_scheduler::cost_prediction::CostSnapshotSource;
 use ferrum_types::{EngineConfig, FerrumError, Result};
 use std::sync::Arc;
 use tracing::{debug, info};
@@ -30,6 +31,7 @@ mod source_binding;
 pub struct EngineBuilder {
     journal_scopes: Option<crate::EngineJournalScopes>,
     execution_attempt_observer: Option<Arc<dyn ExecutionAttemptObserver>>,
+    cost_snapshot_source: Option<Arc<dyn CostSnapshotSource>>,
     /// Component registry to use
     registry: Arc<ComponentRegistry>,
     /// Engine configuration
@@ -70,6 +72,7 @@ impl EngineBuilder {
         Self {
             journal_scopes: None,
             execution_attempt_observer: None,
+            cost_snapshot_source: None,
             registry,
             config,
             model_sources: None,
@@ -106,6 +109,18 @@ impl EngineBuilder {
         observer: Arc<dyn ExecutionAttemptObserver>,
     ) -> Self {
         self.execution_attempt_observer = Some(observer);
+        self
+    }
+
+    /// Install one feedback assembly before startup. The engine only observes
+    /// facts and reads published predictions; its owner lives in the assembly.
+    pub fn with_execution_feedback(
+        mut self,
+        observer: Arc<dyn ExecutionAttemptObserver>,
+        source: Arc<dyn CostSnapshotSource>,
+    ) -> Self {
+        self.execution_attempt_observer = Some(observer);
+        self.cost_snapshot_source = Some(source);
         self
     }
 
@@ -246,6 +261,11 @@ impl EngineBuilder {
 
     /// Build the inference engine
     pub async fn build(self) -> Result<Box<dyn LlmInferenceEngine + Send + Sync>> {
+        crate::continuous_engine::validate_execution_feedback(
+            &self.config,
+            self.execution_attempt_observer.as_ref(),
+            self.cost_snapshot_source.as_ref(),
+        )?;
         info!(
             "Building inference engine for model: {}",
             self.config.model.model_id
@@ -289,6 +309,7 @@ impl EngineBuilder {
         let custom_executor = self.custom_executor;
         let journal_scopes = self.journal_scopes;
         let execution_attempt_observer = self.execution_attempt_observer;
+        let cost_snapshot_source = self.cost_snapshot_source;
 
         // 2. Create or use provided tokenizer
         let tokenizer = if let Some(tokenizer) = custom_tokenizer {
@@ -441,6 +462,7 @@ impl EngineBuilder {
                     tensor_factory,
                     journal_scopes,
                     execution_attempt_observer,
+                    cost_snapshot_source,
                 )?
             }
             ferrum_execution::model_executor::ExecutionResourceAuthority::LegacyEngine => {
@@ -458,6 +480,7 @@ impl EngineBuilder {
                     recurrent_state_manager,
                     journal_scopes,
                     execution_attempt_observer,
+                    cost_snapshot_source,
                 )?
             }
         };

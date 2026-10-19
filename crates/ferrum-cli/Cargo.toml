@@ -26,6 +26,7 @@ ferrum-interfaces = { workspace = true }
 ferrum-engine = { workspace = true }
 ferrum-models = { workspace = true }
 ferrum-scheduler = { workspace = true }
+ferrum-slo = { workspace = true }
 ferrum-server = { workspace = true }
 ferrum-kernels = { workspace = true }
 ferrum-quantization = { workspace = true }

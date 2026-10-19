@@ -1,6 +1,8 @@
 //! Interrupted product downloads must recover through the same real CLI
 //! command and produce valid inference, rather than stopping at model loading.
 
+#[path = "cache_recovery/execution_feedback.rs"]
+mod execution_feedback;
 #[path = "download_jsonl/hub.rs"]
 mod hub;
 #[path = "cache_recovery/journal_lifecycle.rs"]
@@ -23,6 +25,7 @@ use tokio::{net::TcpListener, process::Command, time::Instant};
 struct Flow {
     arguments: Vec<String>,
     server_url: Option<String>,
+    expect_execution_feedback: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -57,6 +60,7 @@ impl Flow {
         Self {
             arguments,
             server_url: None,
+            expect_execution_feedback: false,
         }
     }
 
@@ -92,6 +96,7 @@ impl Flow {
         Self {
             arguments,
             server_url: Some(format!("http://{address}")),
+            expect_execution_feedback: false,
         }
     }
 
@@ -163,6 +168,9 @@ impl Flow {
             "{body}"
         );
         assert_eq!(body["usage"]["completion_tokens"], 1, "{body}");
+        if self.expect_execution_feedback {
+            execution_feedback::assert_worker_observed_execution(&client, url).await;
+        }
         match shutdown {
             Shutdown::Kill => child.start_kill().unwrap(),
             #[cfg(unix)]

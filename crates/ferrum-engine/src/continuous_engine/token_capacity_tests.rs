@@ -470,8 +470,10 @@ async fn token_capacity_sequence_extension_pressure_does_not_cap_survivors_durin
             ferrum_interfaces::BatchHint::simple(ids.len()),
             Some(wake),
             &mut |_| {},
+            None,
         )
         .unwrap()
+        .batch
         .expect("already admitted survivors remain schedulable");
     assert_eq!(survivors.requests.len(), ids.len() - 1);
     assert!(survivors.requests.iter().all(|scheduled| {

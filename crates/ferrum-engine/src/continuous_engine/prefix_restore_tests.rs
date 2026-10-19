@@ -221,6 +221,7 @@ fn engine_observed(
         Arc::new(MockTensorFactory),
         None,
         observer,
+        None,
     )
     .unwrap();
     (Arc::new(engine), observation, state)

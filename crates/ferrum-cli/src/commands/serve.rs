@@ -1092,16 +1092,28 @@ async fn run_serve_lifecycle(
             metadata.write(&journals, &product_observability)?;
         }
         let scopes = journals.engine_scopes(&engine_config)?;
+        let feedback = crate::slo_product::ProductExecutionFeedback::prepare(&engine_config)?;
         let mut builder =
             ferrum_engine::EngineBuilder::new(engine_config).with_journal_scopes(scopes);
+        builder = feedback.configure(builder);
         builder = match (defined_model, model_sources) {
             (Some(prepared), _) => builder.with_defined_model(prepared),
             (None, Some(sources)) => builder.with_model_sources(sources),
             (None, None) => builder,
         };
-        let lifetime = crate::observability_product::ProductEngineLifetime::new(
-            builder.build().await?,
+        let engine = match builder.build().await {
+            Ok(engine) => engine,
+            Err(error) => {
+                if let Err(cleanup) = feedback.shutdown().await {
+                    tracing::warn!(%cleanup, "failed startup feedback cleanup");
+                }
+                return Err(error);
+            }
+        };
+        let lifetime = crate::observability_product::ProductEngineLifetime::new_with_feedback(
+            engine,
             journals,
+            feedback.into_owner(),
         );
         let engine = lifetime.engine();
         engine_lifetime = Some(lifetime);

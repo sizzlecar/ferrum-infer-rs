@@ -4,6 +4,7 @@ use ferrum_bench_core::{
     JsonlFinalReceipt, JsonlJournal, JsonlJournalError, JsonlJournalErrorKind,
     JsonlJournalOpenMode, JsonlJournalOwner, JsonlProducerScope,
 };
+use futures::FutureExt;
 use std::sync::{Arc, Mutex};
 
 #[derive(Clone)]
@@ -415,6 +416,7 @@ enum EngineShutdown {
 /// The handle delegates execution, but never exposes the unwrapped engine.
 struct ProductEngineHandle {
     engine: Arc<dyn ferrum_engine::LlmInferenceEngine + Send + Sync>,
+    feedback: Option<Arc<crate::slo_product::ProductExecutionFeedback>>,
     shutdown: tokio::sync::Mutex<EngineShutdown>,
     completion: tokio::sync::Mutex<EngineShutdown>,
 }
@@ -424,7 +426,29 @@ impl ProductEngineHandle {
         let mut state = self.shutdown.lock().await;
         if matches!(*state, EngineShutdown::Idle) {
             let engine = Arc::clone(&self.engine);
-            *state = EngineShutdown::Running(tokio::spawn(async move { engine.shutdown().await }));
+            let feedback = self.feedback.clone();
+            *state = EngineShutdown::Running(tokio::spawn(async move {
+                let result = std::panic::AssertUnwindSafe(async { engine.shutdown().await })
+                    .catch_unwind()
+                    .await
+                    .unwrap_or_else(|_| {
+                        Err(FerrumError::internal("product engine shutdown panicked"))
+                    });
+                // Feedback is loss-tolerant and can stop even when shutdown
+                // panics or model retirement is held. This does not prove the
+                // model or its journal scopes retired; their original
+                // completion observation remains separate.
+                let feedback_result = match feedback {
+                    Some(feedback) => feedback.shutdown().await,
+                    None => Ok(()),
+                };
+                if let Err(error) = &feedback_result {
+                    if result.is_err() {
+                        tracing::warn!(%error, "feedback cleanup failed after engine shutdown error");
+                    }
+                }
+                result.and(feedback_result)
+            }));
         }
         observe_engine_task(&mut state, "shutdown", false).await
     }
@@ -498,7 +522,13 @@ impl ferrum_interfaces::InferenceEngine for ProductEngineHandle {
         self.engine.execution_attribution_snapshot()
     }
     fn scheduler_slo_snapshot(&self) -> Option<Value> {
-        self.engine.scheduler_slo_snapshot()
+        let mut snapshot = self.engine.scheduler_slo_snapshot()?;
+        if let (Some(fields), Some(feedback)) = (snapshot.as_object_mut(), &self.feedback) {
+            if let Some(stats) = feedback.stats() {
+                fields.insert("feedback".into(), stats);
+            }
+        }
+        Some(snapshot)
     }
     fn admission_snapshot(&self) -> Result<Option<ferrum_types::ExecutorAdmissionSnapshot>> {
         self.engine.admission_snapshot()
@@ -538,9 +568,18 @@ impl ProductEngineLifetime {
         engine: Box<dyn ferrum_engine::LlmInferenceEngine + Send + Sync>,
         journals: Arc<ProductJournalSession>,
     ) -> Self {
+        Self::new_with_feedback(engine, journals, None)
+    }
+
+    pub(crate) fn new_with_feedback(
+        engine: Box<dyn ferrum_engine::LlmInferenceEngine + Send + Sync>,
+        journals: Arc<ProductJournalSession>,
+        feedback: Option<Arc<crate::slo_product::ProductExecutionFeedback>>,
+    ) -> Self {
         Self {
             engine: Arc::new(ProductEngineHandle {
                 engine: Arc::from(engine),
+                feedback,
                 shutdown: tokio::sync::Mutex::new(EngineShutdown::Idle),
                 completion: tokio::sync::Mutex::new(EngineShutdown::Idle),
             }),

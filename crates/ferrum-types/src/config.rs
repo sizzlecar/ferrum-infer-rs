@@ -1158,10 +1158,16 @@ pub struct SchedulerSloConfig {
     pub tpot_ms: f64,
     #[serde(deserialize_with = "deserialize_slo_milliseconds")]
     pub itl_ms: f64,
+    #[serde(default)]
+    pub reference: crate::ReferenceEstimatorConfig,
+    #[serde(default)]
+    pub unknown_cost: crate::UnknownCostPolicy,
 }
 
 impl SchedulerSloConfig {
     pub fn validate(&self) -> std::result::Result<(), String> {
+        self.reference.validate()?;
+        self.unknown_cost.validate()?;
         for (name, value) in [
             ("ttft", self.ttft_ms),
             ("tpot", self.tpot_ms),
@@ -1209,6 +1215,8 @@ impl std::str::FromStr for SchedulerSloConfig {
             ttft_ms,
             tpot_ms,
             itl_ms,
+            reference: crate::ReferenceEstimatorConfig::default(),
+            unknown_cost: crate::UnknownCostPolicy::default(),
         };
         slo.validate()?;
         Ok(slo)

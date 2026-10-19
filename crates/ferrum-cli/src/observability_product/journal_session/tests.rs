@@ -5,6 +5,7 @@ struct EngineRetirementState {
     started: AtomicBool,
     changed: tokio::sync::Notify,
     shutdown_calls: AtomicUsize,
+    shutdown_panics: AtomicBool,
     waits: AtomicUsize,
     release: tokio::sync::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
 }
@@ -31,6 +32,10 @@ impl ferrum_interfaces::InferenceEngine for ScopedLifetimeEngine {
     }
     async fn shutdown(&self) -> Result<()> {
         self.state.shutdown_calls.fetch_add(1, Ordering::SeqCst);
+        assert!(
+            !self.state.shutdown_panics.load(Ordering::SeqCst),
+            "original engine shutdown panic"
+        );
         Err(FerrumError::backend("original retained engine failure"))
     }
     async fn wait_for_shutdown_completion(&self) -> Result<()> {
@@ -97,6 +102,18 @@ fn lifetime_fixture(
     tokio::sync::oneshot::Sender<()>,
     tokio::sync::oneshot::Receiver<()>,
 ) {
+    lifetime_fixture_with_feedback(session, None)
+}
+
+fn lifetime_fixture_with_feedback(
+    session: &Arc<ProductJournalSession>,
+    feedback: Option<Arc<crate::slo_product::ProductExecutionFeedback>>,
+) -> (
+    ProductEngineLifetime,
+    Arc<EngineRetirementState>,
+    tokio::sync::oneshot::Sender<()>,
+    tokio::sync::oneshot::Receiver<()>,
+) {
     let scope = {
         let routes = session.routes.lock().unwrap();
         let Route::Ready(ready) = routes.values().next().unwrap() else {
@@ -110,6 +127,7 @@ fn lifetime_fixture(
         started: AtomicBool::new(false),
         changed: tokio::sync::Notify::new(),
         shutdown_calls: AtomicUsize::new(0),
+        shutdown_panics: AtomicBool::new(false),
         waits: AtomicUsize::new(0),
         release: tokio::sync::Mutex::new(Some(receiver)),
     });
@@ -120,7 +138,7 @@ fn lifetime_fixture(
         dropped: Some(dropped),
     };
     (
-        ProductEngineLifetime::new(Box::new(engine), Arc::clone(session)),
+        ProductEngineLifetime::new_with_feedback(Box::new(engine), Arc::clone(session), feedback),
         state,
         release,
         drop_observer,
@@ -152,6 +170,71 @@ fn assert_original_writer_joined(session: &ProductJournalSession) {
     let receipt = ready.final_receipt.as_ref().unwrap();
     assert!(receipt.worker_joined);
     receipt.result().unwrap();
+}
+
+#[tokio::test]
+async fn product_lifetime_shutdown_panic_joins_feedback_without_proving_model_retirement() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("profile.jsonl");
+    let config = configuration(&path, ProfileDetailArg::Verify);
+    let mut engine_config = ferrum_types::EngineConfig::default();
+    engine_config.scheduler.slo = Some("ttft:200,tpot:15,itl:50".parse().unwrap());
+    let feedback = crate::slo_product::ProductExecutionFeedback::prepare(&engine_config)
+        .unwrap()
+        .into_owner()
+        .unwrap();
+    let mut revisions = feedback.revisions_for_test();
+    let session = ProductJournalSession::prepare(&config, &engine_config);
+    let (lifetime, state, release, dropped) =
+        lifetime_fixture_with_feedback(&session, Some(Arc::clone(&feedback)));
+    state.shutdown_panics.store(true, Ordering::SeqCst);
+
+    let first = lifetime.shutdown().await.unwrap_err();
+    assert!(first
+        .to_string()
+        .contains("product engine shutdown panicked"));
+    // The original worker is the only revision sender. Its exit must be
+    // observed without sending another stop or dropping its still-live owner.
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_secs(5), revisions.changed())
+            .await
+            .unwrap()
+            .is_err()
+    );
+    assert!(feedback.stats().is_some());
+    assert_eq!(state.shutdown_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(state.waits.load(Ordering::SeqCst), 0);
+    assert!(!session.is_closed());
+
+    let mut finish = Box::pin(lifetime.finish());
+    assert!(futures::poll!(finish.as_mut()).is_pending());
+    wait_for_retirement_observation(&state).await;
+    assert!(!session.is_closed());
+    session
+        .write(&event(&config, "after_shutdown_panic"), true, true, false)
+        .unwrap();
+    release.send(()).unwrap();
+    let final_error = tokio::time::timeout(std::time::Duration::from_secs(5), finish)
+        .await
+        .unwrap()
+        .unwrap_err();
+    assert_eq!(final_error.to_string(), first.to_string());
+    assert_original_writer_joined(&session);
+    assert_eq!(state.shutdown_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(state.waits.load(Ordering::SeqCst), 1);
+    let rows: Vec<Value> = fs::read_to_string(path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0]["phase"], "after_shutdown_panic");
+    assert_eq!(rows[1], json!({"actual_retirement_tail": true}));
+    drop(lifetime);
+    tokio::time::timeout(std::time::Duration::from_secs(5), dropped)
+        .await
+        .unwrap()
+        .unwrap();
 }
 
 #[tokio::test]

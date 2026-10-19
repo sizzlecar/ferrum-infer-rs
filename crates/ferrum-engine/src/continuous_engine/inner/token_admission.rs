@@ -412,6 +412,7 @@ impl EngineInner {
     pub(super) async fn prepare_dynamic_admission_round(
         &self,
         maximum_admissions: usize,
+        mut planning: Option<&mut TimePlanningRound>,
     ) -> Result<(usize, Vec<ExecutorPrefillMaintenanceDeferral>)> {
         let mut availability = AdmissionAvailability::take(&self.dynamic_admission_availability);
         let epochs = self
@@ -438,13 +439,16 @@ impl EngineInner {
                 .scheduler
                 .begin_token_admission(maximum_admissions, wake)?;
             loop {
-                let Some(candidate) = round.next(&mut |observation| {
-                    if capture_trace {
-                        records.push(ExecutorSchedulerTraceRecord::AdmissionQueueObservation(
-                            observation,
-                        ));
-                    }
-                })?
+                let Some(candidate) = round.next(
+                    &mut |observation| {
+                        if capture_trace {
+                            records.push(ExecutorSchedulerTraceRecord::AdmissionQueueObservation(
+                                observation,
+                            ));
+                        }
+                    },
+                    planning.as_deref_mut(),
+                )?
                 else {
                     break;
                 };

@@ -26,7 +26,7 @@ async fn token_admission_round_cancel_and_same_id_replacement_return_old_outcome
     let task_scheduler = Arc::clone(&scheduler);
     let task = tokio::spawn(async move {
         let mut round = task_scheduler.begin_token_admission(1, None).unwrap();
-        let candidate = round.next(&mut |_| {}).unwrap().unwrap();
+        let candidate = round.next(&mut |_| {}, None).unwrap().unwrap();
         let key = candidate.key().clone();
         selected.send(key.clone()).unwrap();
         resume_rx.await.unwrap();
@@ -53,7 +53,7 @@ async fn token_admission_round_cancel_and_same_id_replacement_return_old_outcome
     assert_eq!(scheduler.waiting_count(), 1);
     assert_eq!(scheduler.trace_phase(&id), Some(RequestPhase::Waiting));
     let mut round = scheduler.begin_token_admission(1, None).unwrap();
-    let replacement = round.next(&mut |_| {}).unwrap().unwrap();
+    let replacement = round.next(&mut |_| {}, None).unwrap().unwrap();
     assert_ne!(replacement.key(), &old_key);
     let new = accepted(round.apply(replacement, admitted(&id)));
     assert_eq!(round.finish().unwrap().admitted(), 1);
@@ -71,7 +71,7 @@ async fn token_admission_round_future_drop_restores_original_ticket_without_fake
     let task_scheduler = Arc::clone(&scheduler);
     let task = tokio::spawn(async move {
         let mut round = task_scheduler.begin_token_admission(1, None).unwrap();
-        let candidate = round.next(&mut |_| {}).unwrap().unwrap();
+        let candidate = round.next(&mut |_| {}, None).unwrap().unwrap();
         selected.send(candidate.key().clone()).unwrap();
         std::future::pending::<()>().await;
         drop(candidate);
@@ -86,7 +86,7 @@ async fn token_admission_round_future_drop_restores_original_ticket_without_fake
     assert_eq!(scheduler.trace_phase(&id), Some(RequestPhase::Waiting));
     assert!(!scheduler.waiting_for_confirmed_capacity_release());
     let mut round = scheduler.begin_token_admission(1, None).unwrap();
-    let candidate = round.next(&mut |_| {}).unwrap().unwrap();
+    let candidate = round.next(&mut |_| {}, None).unwrap().unwrap();
     assert_eq!(candidate.key(), &key);
     let accepted = accepted(round.apply(candidate, admitted(&id)));
     assert_eq!(round.finish().unwrap().admitted(), 1);
@@ -101,13 +101,13 @@ async fn token_admission_round_exact_accepted_rollback_cannot_cancel_replacement
     let id = request.id.clone();
     scheduler.submit(request.clone()).await.unwrap();
     let mut round = scheduler.begin_token_admission(1, None).unwrap();
-    let candidate = round.next(&mut |_| {}).unwrap().unwrap();
+    let candidate = round.next(&mut |_| {}, None).unwrap().unwrap();
     let original = accepted(round.apply(candidate, admitted(&id)));
     round.finish().unwrap();
     assert!(scheduler.cancel_token_admission(&original).unwrap());
     scheduler.submit(request).await.unwrap();
     let mut round = scheduler.begin_token_admission(1, None).unwrap();
-    let candidate = round.next(&mut |_| {}).unwrap().unwrap();
+    let candidate = round.next(&mut |_| {}, None).unwrap().unwrap();
     let replacement = accepted(round.apply(candidate, admitted(&id)));
     round.finish().unwrap();
     assert_ne!(original.key(), replacement.key());
@@ -129,7 +129,7 @@ async fn token_admission_round_preserves_priority_budget_and_defers_concurrent_i
     let first_id = first.id.clone();
     scheduler.submit(first).await.unwrap();
     let mut round = scheduler.begin_token_admission(2, None).unwrap();
-    let candidate = round.next(&mut |_| {}).unwrap().unwrap();
+    let candidate = round.next(&mut |_| {}, None).unwrap().unwrap();
     scheduler
         .update_priority(first_id.clone(), Priority::High)
         .await
@@ -138,17 +138,17 @@ async fn token_admission_round_preserves_priority_budget_and_defers_concurrent_i
     let later_id = later.id.clone();
     scheduler.submit(later).await.unwrap();
     let first_owner = accepted(round.apply(candidate, admitted(&first_id)));
-    assert!(round.next(&mut |_| {}).unwrap().is_none());
+    assert!(round.next(&mut |_| {}, None).unwrap().is_none());
     assert_eq!(round.finish().unwrap().admitted(), 1);
     assert_eq!(
         scheduler.prefill_queue.read()[0].inner.request.priority,
         Priority::High
     );
     let mut second = scheduler.begin_token_admission(8, None).unwrap();
-    let candidate = second.next(&mut |_| {}).unwrap().unwrap();
+    let candidate = second.next(&mut |_| {}, None).unwrap().unwrap();
     assert_eq!(candidate.request().id, later_id);
     let later_owner = accepted(second.apply(candidate, admitted(&later_id)));
-    assert!(second.next(&mut |_| {}).unwrap().is_none());
+    assert!(second.next(&mut |_| {}, None).unwrap().is_none());
     assert_eq!(second.finish().unwrap().admitted(), 1);
     assert_eq!(scheduler.active_count(), 2);
     assert!(scheduler.cancel_token_admission(&first_owner).unwrap());
@@ -162,7 +162,7 @@ async fn token_admission_round_release_during_await_is_not_lost() {
     let id = request.id.clone();
     scheduler.submit(request).await.unwrap();
     let mut round = scheduler.begin_token_admission(1, None).unwrap();
-    let candidate = round.next(&mut |_| {}).unwrap().unwrap();
+    let candidate = round.next(&mut |_| {}, None).unwrap().unwrap();
     scheduler.record_external_capacity_release();
     assert!(matches!(
         round.apply(candidate, AdmissionProbeOutcome::CapacityDeferred),
@@ -171,7 +171,7 @@ async fn token_admission_round_release_during_await_is_not_lost() {
     assert_eq!(round.finish().unwrap().deferred(), 1);
     assert!(!scheduler.waiting_for_confirmed_capacity_release());
     let mut retry = scheduler.begin_token_admission(1, None).unwrap();
-    let candidate = retry.next(&mut |_| {}).unwrap().unwrap();
+    let candidate = retry.next(&mut |_| {}, None).unwrap().unwrap();
     let owner = accepted(retry.apply(candidate, admitted(&id)));
     retry.finish().unwrap();
     assert!(scheduler.cancel_token_admission(&owner).unwrap());
@@ -185,10 +185,10 @@ async fn token_admission_round_stale_round_cannot_consume_current_candidate() {
     let id = request.id.clone();
     scheduler.submit(request).await.unwrap();
     let mut old = scheduler.begin_token_admission(1, None).unwrap();
-    let stale = old.next(&mut |_| {}).unwrap().unwrap();
+    let stale = old.next(&mut |_| {}, None).unwrap().unwrap();
     drop(old);
     let mut current = scheduler.begin_token_admission(1, None).unwrap();
-    let candidate = current.next(&mut |_| {}).unwrap().unwrap();
+    let candidate = current.next(&mut |_| {}, None).unwrap().unwrap();
     match current.apply(stale, admitted(&id)) {
         TokenAdmissionApply::Unapplied {
             outcome: AdmissionProbeOutcome::Admitted(receipt),
@@ -224,7 +224,7 @@ async fn token_admission_round_preserves_exact_native_wake_and_skip_observation(
             Some(AdmissionWakeSnapshot::new(first_epochs, &availability)),
         )
         .unwrap();
-    let candidate = round.next(&mut |_| {}).unwrap().unwrap();
+    let candidate = round.next(&mut |_| {}, None).unwrap().unwrap();
     let key = candidate.key().clone();
     assert!(matches!(
         round.apply(
@@ -248,7 +248,7 @@ async fn token_admission_round_preserves_exact_native_wake_and_skip_observation(
         )
         .unwrap();
     assert!(unchanged
-        .next(&mut |observation| observations.push(observation))
+        .next(&mut |observation| observations.push(observation), None)
         .unwrap()
         .is_none());
     let receipt = unchanged.finish().unwrap();
@@ -274,7 +274,7 @@ async fn token_admission_round_preserves_exact_native_wake_and_skip_observation(
             )),
         )
         .unwrap();
-    let candidate = retry.next(&mut |_| {}).unwrap().unwrap();
+    let candidate = retry.next(&mut |_| {}, None).unwrap().unwrap();
     assert_eq!(candidate.key(), &key);
     let owner = accepted(retry.apply(candidate, admitted(&id)));
     assert_eq!(retry.finish().unwrap().admitted(), 1);
@@ -316,7 +316,7 @@ async fn token_admission_round_coexists_with_capacity_requeue_and_logical_comple
         let admitted_id = pending_id.clone();
         let admission = std::thread::spawn(move || {
             let mut round = admit_scheduler.begin_token_admission(1, None).unwrap();
-            let candidate = round.next(&mut |_| {}).unwrap().unwrap();
+            let candidate = round.next(&mut |_| {}, None).unwrap().unwrap();
             assert_eq!(candidate.request().id, admitted_id);
             // Select before racing the queue transitions, otherwise a request
             // requeued before this round starts is legitimately selected first.

@@ -48,6 +48,7 @@ use ferrum_runtime::{
     OperationCompletionReceipt,
 };
 use ferrum_sampler::structured_output::{StructuredOutputFactory, StructuredOutputProcessor};
+use ferrum_scheduler::cost_prediction::{CostSnapshotSource, TimePlanningRound};
 #[cfg(test)]
 use ferrum_scheduler::implementations::PressureYieldKind;
 use ferrum_scheduler::implementations::{
@@ -1213,8 +1214,34 @@ pub use managed_driver::{DriverExitReport, DriverJournalDelivery, DriverObserver
 
 enum EngineIterationOutcome {
     Progressed,
-    Idle,
-    CapacityBlocked(ExecutorCapacityWaitRegistration),
+    Waiting {
+        capacity: Option<ExecutorCapacityWaitRegistration>,
+        retry_at: Option<Instant>,
+    },
+}
+
+pub(crate) fn validate_execution_feedback(
+    config: &EngineConfig,
+    observer: Option<&Arc<dyn ExecutionAttemptObserver>>,
+    source: Option<&Arc<dyn CostSnapshotSource>>,
+) -> Result<()> {
+    match config.scheduler.slo {
+        Some(policy) => {
+            policy.validate().map_err(FerrumError::config)?;
+            if observer.is_none() || source.is_none() {
+                return Err(FerrumError::config(
+                    "scheduler SLO policy requires an execution observer and cost snapshot source",
+                ));
+            }
+        }
+        None if source.is_some() => {
+            return Err(FerrumError::config(
+                "a cost snapshot source requires an enabled scheduler SLO policy",
+            ));
+        }
+        None => {}
+    }
+    Ok(())
 }
 
 enum EngineResourceComposition {
@@ -1417,6 +1444,7 @@ struct EngineInner {
     scheduler_trace_jsonl: Option<SchedulerTraceJournal>,
     host_profile_sink: Option<Arc<VNextProfileExecutionEventSink>>,
     execution_attempt_observer: Option<Arc<dyn ExecutionAttemptObserver>>,
+    cost_snapshot_source: Option<Arc<dyn CostSnapshotSource>>,
     legacy_scheduler_trace_jsonl: Option<JsonlJournal<serde_json::Value>>,
     journal_scopes: Arc<Mutex<EngineJournals>>,
     observation_health: ObservationHealth,
@@ -2245,6 +2273,7 @@ impl ContinuousBatchEngine {
             recurrent_state_manager,
             journal_scopes,
             None,
+            None,
         )
     }
 
@@ -2260,6 +2289,7 @@ impl ContinuousBatchEngine {
         recurrent_state_manager: Option<Arc<dyn RecurrentStateManager + Send + Sync>>,
         journal_scopes: Option<EngineJournalScopes>,
         execution_attempt_observer: Option<Arc<dyn ExecutionAttemptObserver>>,
+        cost_snapshot_source: Option<Arc<dyn CostSnapshotSource>>,
     ) -> Result<Self> {
         Self::new_with_resource_composition(
             config,
@@ -2274,6 +2304,7 @@ impl ContinuousBatchEngine {
             tensor_factory,
             journal_scopes,
             execution_attempt_observer,
+            cost_snapshot_source,
         )
     }
 
@@ -2318,6 +2349,7 @@ impl ContinuousBatchEngine {
             tensor_factory,
             journal_scopes,
             None,
+            None,
         )
     }
 
@@ -2331,6 +2363,7 @@ impl ContinuousBatchEngine {
         tensor_factory: Arc<dyn TensorFactory>,
         journal_scopes: Option<EngineJournalScopes>,
         execution_attempt_observer: Option<Arc<dyn ExecutionAttemptObserver>>,
+        cost_snapshot_source: Option<Arc<dyn CostSnapshotSource>>,
     ) -> Result<Self> {
         Self::new_with_resource_composition(
             config,
@@ -2342,6 +2375,7 @@ impl ContinuousBatchEngine {
             tensor_factory,
             journal_scopes,
             execution_attempt_observer,
+            cost_snapshot_source,
         )
     }
 
@@ -2356,7 +2390,13 @@ impl ContinuousBatchEngine {
         _tensor_factory: Arc<dyn TensorFactory>,
         journal_scopes: Option<EngineJournalScopes>,
         execution_attempt_observer: Option<Arc<dyn ExecutionAttemptObserver>>,
+        cost_snapshot_source: Option<Arc<dyn CostSnapshotSource>>,
     ) -> Result<Self> {
+        validate_execution_feedback(
+            &config,
+            execution_attempt_observer.as_ref(),
+            cost_snapshot_source.as_ref(),
+        )?;
         let binding = model_executor.into_engine_executor()?;
         let owns_executor = binding.owner.is_some();
         let model_executor = binding.scope;
@@ -2456,6 +2496,7 @@ impl ContinuousBatchEngine {
             scheduler_trace_jsonl,
             host_profile_sink,
             execution_attempt_observer,
+            cost_snapshot_source,
             legacy_scheduler_trace_jsonl,
             journal_scopes,
             observation_health,

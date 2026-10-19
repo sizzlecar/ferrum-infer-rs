@@ -247,7 +247,7 @@ async fn start_round(
             .active_inner()
             .expect("engine execution is open"),
     );
-    let task = tokio::spawn(async move { inner.prepare_dynamic_admission_round(1).await });
+    let task = tokio::spawn(async move { inner.prepare_dynamic_admission_round(1, None).await });
     let identity = tokio::time::timeout(Duration::from_secs(5), fixture.ready.take().unwrap())
         .await
         .expect("admission must reach its explicit gate")
@@ -477,7 +477,7 @@ async fn token_admission_replacement_keeps_new_outer() {
         .engine
         .active_inner()
         .expect("engine execution is open")
-        .prepare_dynamic_admission_round(1)
+        .prepare_dynamic_admission_round(1, None)
         .await
         .unwrap();
     assert_eq!(admitted, 1);

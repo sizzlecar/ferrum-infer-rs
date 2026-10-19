@@ -1238,6 +1238,7 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
         .or_else(|| crate::runtime_env::runtime_snapshot_value(&runtime_config, "FERRUM_KV_DTYPE"));
     apply_kv_dtype_override(&mut engine_config, effective_kv_dtype)?;
     let numerical_execution = engine_config.numerical_execution.clone();
+    let feedback = crate::slo_product::ProductExecutionFeedback::prepare(&engine_config)?;
     let journals = crate::observability_product::ProductJournalSession::prepare(
         &product_observability,
         &engine_config,
@@ -1247,6 +1248,7 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
         let scopes = journals.engine_scopes(&engine_config)?;
         let mut builder =
             ferrum_engine::EngineBuilder::new(engine_config).with_journal_scopes(scopes);
+        builder = feedback.configure(builder);
         builder = match (defined_model, model_sources.clone()) {
             (Some(prepared), _) => builder.with_defined_model(prepared),
             (None, Some(sources)) => builder.with_model_sources(sources),
@@ -1258,6 +1260,9 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
     let engine = match engine_result {
         Ok(engine) => engine,
         Err(error) => {
+            if let Err(cleanup) = feedback.shutdown().await {
+                tracing::warn!(%cleanup, "failed startup feedback cleanup");
+            }
             crate::commands::serve::write_failed_startup_config_artifacts(
                 &startup_auto_config,
                 product_source_identity.as_ref(),
@@ -1272,7 +1277,11 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
             return Err(error);
         }
     };
-    let engine = crate::observability_product::ProductEngineLifetime::new(engine, journals.clone());
+    let engine = crate::observability_product::ProductEngineLifetime::new_with_feedback(
+        engine,
+        journals.clone(),
+        feedback.into_owner(),
+    );
     let execution_result: Result<()> = async {
     crate::startup::apply_engine_plan(&mut startup_auto_config, engine.config());
     crate::commands::serve::write_startup_config_artifacts(

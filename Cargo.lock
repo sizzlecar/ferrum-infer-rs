@@ -127,6 +127,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "arc-swap"
+version = "1.9.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "380962b3d93b99642e50b9febf72c071e97e8b32d86eae9cf4ef582bb960ae6e"
+dependencies = [
+ "rustversion",
+]
+
+[[package]]
 name = "arraydeque"
 version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1291,6 +1300,7 @@ dependencies = [
  "ferrum-runtime",
  "ferrum-scheduler",
  "ferrum-server",
+ "ferrum-slo",
  "ferrum-types",
  "futures",
  "indicatif",
@@ -1711,6 +1721,25 @@ dependencies = [
  "tower-http 0.5.2",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "ferrum-slo"
+version = "0.13.0"
+dependencies = [
+ "arc-swap",
+ "async-trait",
+ "crossbeam-channel",
+ "ferrum-engine",
+ "ferrum-execution",
+ "ferrum-interfaces",
+ "ferrum-models",
+ "ferrum-scheduler",
+ "ferrum-testkit",
+ "ferrum-types",
+ "serde",
+ "thiserror 1.0.69",
+ "tokio",
 ]
 
 [[package]]

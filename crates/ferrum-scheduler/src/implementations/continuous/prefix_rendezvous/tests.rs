@@ -54,7 +54,7 @@ async fn prefix_hold_cannot_change_selected_admission_and_can_retry_after_round_
     let source_key = key(&scheduler, &source);
     let follower_key = key(&scheduler, &follower);
     let mut round = scheduler.begin_token_admission(2, None).unwrap();
-    let selected = round.next(&mut |_| {}).unwrap().unwrap();
+    let selected = round.next(&mut |_| {}, None).unwrap().unwrap();
     assert!(scheduler
         .hold_prefix_followers(&source_key, std::slice::from_ref(&follower_key), plan(7),)
         .is_none());

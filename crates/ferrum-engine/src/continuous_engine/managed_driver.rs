@@ -538,7 +538,16 @@ impl ManagedDriver {
 
     async fn run_iterations(&self, inner: &EngineInner) {
         info!("Background iteration loop started");
+        // Subscribe before the first planning load. A publication after the
+        // load but before the wait remains pending in this original receiver.
+        let mut prediction_updates = inner
+            .cost_snapshot_source
+            .as_ref()
+            .map(|source| source.subscribe());
         while self.is_running() {
+            if let Some(updates) = prediction_updates.as_mut() {
+                drop(updates.borrow_and_update());
+            }
             #[cfg(test)]
             if self.panic_next_iteration.swap(false, Ordering::AcqRel) {
                 panic!("injected managed driver iteration panic");
@@ -555,29 +564,58 @@ impl ManagedDriver {
             }
             match outcome {
                 EngineIterationOutcome::Progressed => tokio::task::yield_now().await,
-                EngineIterationOutcome::Idle => {
-                    tokio::select! {
-                        _ = inner.wait_for_prefix_deadline() => {}
-                        _ = inner.shutdown_notify.notified() => {}
-                        _ = inner.work_notify.notified() => {}
-                    }
-                }
-                EngineIterationOutcome::CapacityBlocked(registration) => {
-                    tokio::select! {
-                        _ = inner.wait_for_prefix_deadline() => {}
-                        _ = inner.shutdown_notify.notified() => {}
-                        _ = inner.work_notify.notified() => {}
-                        result = registration.wait_for_change() => {
-                            if let Err(error) = result {
-                                warn!("Executor capacity wait error: {}", error);
-                            }
-                        }
-                    }
+                EngineIterationOutcome::Waiting { capacity, retry_at } => {
+                    wait_for_iteration_wake(inner, capacity, retry_at, &mut prediction_updates)
+                        .await;
                 }
             }
         }
         info!("Background iteration loop stopped");
     }
+}
+
+pub(super) async fn wait_for_iteration_wake(
+    inner: &EngineInner,
+    capacity: Option<ExecutorCapacityWaitRegistration>,
+    retry_at: Option<Instant>,
+    prediction_updates: &mut Option<tokio::sync::watch::Receiver<u64>>,
+) {
+    let deadline = inner.prefix_deadline().into_iter().chain(retry_at).min();
+    tokio::select! {
+        _ = wait_for_deadline(deadline) => {}
+        _ = inner.shutdown_notify.notified() => {}
+        _ = inner.work_notify.notified() => {}
+        _ = wait_for_prediction_update(prediction_updates) => {}
+        result = async {
+            match capacity {
+                Some(registration) => registration.wait_for_change().await,
+                None => std::future::pending().await,
+            }
+        } => {
+            if let Err(error) = result {
+                warn!("Executor capacity wait error: {}", error);
+            }
+        }
+    }
+}
+
+pub(super) async fn wait_for_deadline(deadline: Option<Instant>) {
+    match deadline {
+        Some(deadline) => tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await,
+        None => std::future::pending().await,
+    }
+}
+
+async fn wait_for_prediction_update(updates: &mut Option<tokio::sync::watch::Receiver<u64>>) {
+    if let Some(receiver) = updates.as_mut() {
+        if receiver.changed().await.is_ok() {
+            return;
+        }
+        // Closing a watch is not new work. Disable this branch permanently;
+        // the original deadline/shutdown/work/capacity waits still apply.
+        *updates = None;
+    }
+    std::future::pending().await
 }
 
 struct DriverExitGuard<'a> {

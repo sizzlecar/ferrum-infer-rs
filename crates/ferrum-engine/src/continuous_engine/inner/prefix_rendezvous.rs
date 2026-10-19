@@ -290,18 +290,11 @@ impl EngineInner {
         None
     }
 
-    pub(in super::super) async fn wait_for_prefix_deadline(&self) {
-        let deadline = self
-            .prefix_rendezvous
+    pub(in super::super) fn prefix_deadline(&self) -> Option<Instant> {
+        self.prefix_rendezvous
             .lock()
             .iter()
             .map(|cohort| cohort.expires_at)
-            .min();
-        match deadline {
-            Some(deadline) => {
-                tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await
-            }
-            None => std::future::pending::<()>().await,
-        }
+            .min()
     }
 }

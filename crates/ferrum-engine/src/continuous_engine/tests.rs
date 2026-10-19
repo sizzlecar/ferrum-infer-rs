@@ -121,6 +121,8 @@ mod prefix_restore_tests;
 
 #[path = "completion_decode_tests.rs"]
 mod completion_decode_tests;
+#[path = "cost_feedback_tests.rs"]
+mod cost_feedback_tests;
 #[path = "managed_driver_tests.rs"]
 mod managed_driver_tests;
 #[path = "metrics_only_tests.rs"]
@@ -2711,6 +2713,7 @@ fn plan_runtime_test_engine_observed<E: ObservedTestExecutor>(
         tensor_factory,
         None,
         observer,
+        None,
     )
     .unwrap();
     (engine, scheduler, observation, tokenizer)

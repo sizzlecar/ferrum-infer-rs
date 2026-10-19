@@ -329,8 +329,10 @@ async fn token_allocator_shared_peers_close_in_order_before_recompute_can_readmi
             ferrum_interfaces::BatchHint::simple(3),
             None,
             &mut |_| {},
+            None,
         )
         .unwrap()
+        .batch
         .expect("the original progress owner must be allowed to re-probe");
     assert_eq!(
         retry_batch.requests.len(),
@@ -444,8 +446,10 @@ async fn token_allocator_shared_peers_close_in_order_before_recompute_can_readmi
             ferrum_interfaces::BatchHint::simple(3),
             None,
             &mut |_| {},
+            None,
         )
         .unwrap()
+        .batch
         .unwrap();
     assert_eq!(runnable.requests.len(), 1);
     assert_eq!(runnable.requests[0].request.id, inputs[0].request_id);

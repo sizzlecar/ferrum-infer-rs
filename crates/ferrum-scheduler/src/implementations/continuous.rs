@@ -16,6 +16,7 @@ mod prefix_restore;
 pub use prefix_rendezvous::{PrefixRendezvousCandidate, PrefixRendezvousHold, PrefixRequestKey};
 mod pressure;
 mod slo;
+mod time_policy;
 pub use slo::SchedulerSloSnapshot;
 mod token_admission;
 pub use token_admission::{
@@ -38,6 +39,7 @@ pub use pressure::{
     PressureYieldTransaction,
 };
 
+use crate::cost_prediction::{BatchSelection, TimePlanningRound};
 use crate::vnext::{
     AdmissionDeferral, AdmissionProbeOutcome, AdmissionQueueEligibility, AdmissionQueueEvent,
     AdmissionTickReceipt, AdmissionWakeEpochs, AdmissionWakeSnapshot, DynamicAdmissionQueue,
@@ -70,6 +72,7 @@ use std::{
     },
     time::{Duration, Instant},
 };
+use time_policy::TimeDecision;
 use tracing::{debug, info, warn};
 
 const NO_CAPACITY_BACKPRESSURE_LIMIT: usize = usize::MAX;
@@ -824,7 +827,7 @@ pub struct ContinuousBatchScheduler {
     runtime_config: ContinuousBatchRuntimeConfig,
 
     /// Present only when the typed SLO policy is enabled.
-    slo_controller: Option<Mutex<slo::SloController>>,
+    slo_diagnostics: Mutex<SchedulerSloSnapshot>,
 }
 
 /// Continuous batching specific configuration
@@ -1148,9 +1151,6 @@ impl ContinuousBatchScheduler {
             cb_config.max_prefill_batch, cb_config.max_decode_batch
         );
         let runtime_config = ContinuousBatchRuntimeConfig::from_scheduler_config(&config);
-        let slo_controller = config
-            .slo
-            .map(|_| Mutex::new(slo::SloController::default()));
 
         Self {
             config,
@@ -1199,31 +1199,16 @@ impl ContinuousBatchScheduler {
             metrics_tracker: Arc::new(ContinuousBatchMetrics::new()),
             cb_config,
             runtime_config,
-            slo_controller,
-        }
-    }
-
-    /// Feed only completed, successful execution waves and their actual work.
-    /// Planned work, failures and no-progress retries must not train estimates.
-    pub fn record_execution_step(
-        &self,
-        prefill_tokens: usize,
-        decode_sequences: usize,
-        elapsed: Duration,
-    ) {
-        if let (Some(targets), Some(controller)) = (self.config.slo, &self.slo_controller) {
-            if targets.validate().is_ok() {
-                controller
-                    .lock()
-                    .record(targets, prefill_tokens, decode_sequences, elapsed);
-            }
+            slo_diagnostics: Mutex::new(SchedulerSloSnapshot::default()),
         }
     }
 
     pub fn slo_snapshot(&self) -> Option<SchedulerSloSnapshot> {
-        self.slo_controller
-            .as_ref()
-            .map(|controller| controller.lock().snapshot())
+        self.config.slo.map(|_| {
+            let mut snapshot = self.slo_diagnostics.lock().clone();
+            snapshot.enabled = true;
+            snapshot
+        })
     }
 
     fn validate_slo(&self) -> Result<()> {
@@ -1940,11 +1925,22 @@ impl ContinuousBatchScheduler {
         hint: BatchHint,
         wake: Option<AdmissionWakeSnapshot<'_>>,
         observer: &mut dyn FnMut(ExecutorAdmissionQueueObservation),
-    ) -> Result<Option<BatchPlan>> {
-        self.create_iteration_batch_with_admission(
+        mut planning: Option<&mut TimePlanningRound>,
+    ) -> Result<BatchSelection> {
+        let batch = self.create_iteration_batch_with_time(
             hint,
             WaitingAdmissionMode::Prepared { wake, observer },
-        )
+            Instant::now(),
+            planning.as_deref_mut(),
+        )?;
+        if let Some(round) = planning.as_ref() {
+            self.slo_diagnostics.lock().record(round);
+        }
+        Ok(BatchSelection {
+            batch,
+            retry_at: planning.as_ref().and_then(|round| round.retry_at()),
+            time_blocked: planning.as_ref().is_some_and(|round| round.time_blocked()),
+        })
     }
 
     pub fn waiting_for_confirmed_capacity_release(&self) -> bool {
@@ -3479,39 +3475,6 @@ impl ContinuousBatchScheduler {
         }
     }
 
-    fn prioritize_ttft(&self, queue: &mut VecDeque<ContinuousBatchRequest>, now: Instant) {
-        let (Some(targets), Some(controller)) = (self.config.slo, &self.slo_controller) else {
-            return;
-        };
-        let prefill_cost = controller.lock().prefill_ms_per_token().unwrap_or(0.0);
-        let urgency_window_ms = targets.tpot_ms.min(targets.itl_ms);
-        let slack = |request: &ContinuousBatchRequest| {
-            // A recompute after output has no first-token deadline. Keep it
-            // in stable non-urgent order, just as the dynamic budget does.
-            if request.slo_first_token_emitted {
-                return f64::INFINITY;
-            }
-            let age_ms = request.inner.age_at(now).as_secs_f64() * 1000.0;
-            targets.ttft_ms - age_ms - self.remaining_prefill_tokens(request) as f64 * prefill_cost
-        };
-        // Keep non-urgent work stable. Only requests that are within one decode
-        // interval of exhausting their estimated TTFT slack move ahead. Waiting
-        // admission retains its existing FIFO and capacity/fairness barriers.
-        queue.make_contiguous().sort_by(|left, right| {
-            let left_slack = slack(left);
-            let right_slack = slack(right);
-            match (
-                left_slack <= urgency_window_ms,
-                right_slack <= urgency_window_ms,
-            ) {
-                (true, true) => left_slack.total_cmp(&right_slack),
-                (true, false) => std::cmp::Ordering::Less,
-                (false, true) => std::cmp::Ordering::Greater,
-                (false, false) => std::cmp::Ordering::Equal,
-            }
-        });
-    }
-
     fn chunked_prefill_budget_tokens(&self, req: &ContinuousBatchRequest, chunk: usize) -> usize {
         let remaining = if req.prefill_tokens == 0 {
             self.prompt_token_estimate(req)
@@ -3686,8 +3649,7 @@ impl ContinuousBatchScheduler {
         total_tokens: &mut usize,
         scheduled_request_ids: &mut HashSet<RequestId>,
         active_decode_prefill_tokens_remaining: &mut Option<usize>,
-        slo_static_prefill_tokens_remaining: &mut Option<usize>,
-        slo_prefill_limited: &mut bool,
+        planning: &mut Option<&mut TimePlanningRound>,
         active_decode_prefill_chunks_remaining: &mut Option<usize>,
         capacity_deferred_mixed_recompute_slots_remaining: &mut Option<usize>,
         active_decode_prefill_chunk: Option<usize>,
@@ -3701,7 +3663,8 @@ impl ContinuousBatchScheduler {
         }
 
         let mut prefill_queue = self.prefill_queue.write();
-        self.prioritize_ttft(&mut prefill_queue, now);
+        self.prioritize_ttft(&mut prefill_queue, now, planning.as_deref_mut());
+        let mut rejected = Vec::new();
         for req in prefill_queue.iter_mut() {
             if batch_requests.len() >= hint.max_batch_size {
                 break;
@@ -3755,23 +3718,12 @@ impl ContinuousBatchScheduler {
             if let Some(remaining) = active_decode_prefill_tokens_remaining.as_ref() {
                 step_tokens_remaining = step_tokens_remaining.min(*remaining);
             }
-            let prefill_chunk_tokens = self.prefill_budget_tokens(
+            let mut prefill_chunk_tokens = self.prefill_budget_tokens(
                 req,
                 active_decode_prefill_chunk,
                 prefill_step_chunk,
                 step_tokens_remaining,
             );
-            if let Some(static_remaining) = *slo_static_prefill_tokens_remaining {
-                // Count adaptation only when this runnable request would have
-                // received more work under the original static limits.
-                let static_chunk_tokens = self.prefill_budget_tokens(
-                    req,
-                    active_decode_prefill_chunk,
-                    prefill_step_chunk,
-                    static_remaining.min(hint.max_tokens.saturating_sub(*total_tokens)),
-                );
-                *slo_prefill_limited |= prefill_chunk_tokens < static_chunk_tokens;
-            }
             // Skip fully-prefilled requests that are still in the queue
             // (they'll be promoted by mark_prefill_chunk_processed on the
             // next iteration boundary).
@@ -3784,7 +3736,21 @@ impl ContinuousBatchScheduler {
                 }
             }
 
+            if let Some(round) = planning.as_deref_mut() {
+                match self.prefill_time_decision(req, prefill_chunk_tokens, round, now) {
+                    TimeDecision::Allow(tokens) => prefill_chunk_tokens = tokens,
+                    TimeDecision::Hold => continue,
+                    TimeDecision::Reject(error) => {
+                        rejected.push((req.inner.request.id.clone(), error));
+                        continue;
+                    }
+                }
+            }
+
             if *total_tokens + prefill_chunk_tokens <= hint.max_tokens {
+                if let Some(round) = planning.as_deref_mut() {
+                    round.selected_work(self.cost_work(req, prefill_chunk_tokens, false));
+                }
                 let mut scheduled = req.inner.clone();
                 scheduled.tokens_processed = req.prefill_chunk_offset;
                 scheduled.tokens_to_process = Some(prefill_chunk_tokens);
@@ -3794,9 +3760,6 @@ impl ContinuousBatchScheduler {
                 batch_requests.push(scheduled);
                 *total_tokens += prefill_chunk_tokens;
                 if let Some(remaining) = active_decode_prefill_tokens_remaining.as_mut() {
-                    *remaining = remaining.saturating_sub(prefill_chunk_tokens);
-                }
-                if let Some(remaining) = slo_static_prefill_tokens_remaining.as_mut() {
                     *remaining = remaining.saturating_sub(prefill_chunk_tokens);
                 }
                 if let Some(remaining) = active_decode_prefill_chunks_remaining.as_mut() {
@@ -3811,6 +3774,17 @@ impl ContinuousBatchScheduler {
                         *remaining = remaining.saturating_sub(1);
                     }
                 }
+            }
+        }
+        for (id, error) in rejected {
+            if let Some(index) = prefill_queue
+                .iter()
+                .position(|request| request.inner.request.id == id)
+            {
+                let request = prefill_queue
+                    .remove(index)
+                    .expect("rejected original prefill is still queued");
+                self.fail_typed_admission(request, error);
             }
         }
         Ok(())
@@ -4031,6 +4005,7 @@ impl ContinuousBatchScheduler {
         total_tokens: &mut usize,
         scheduled_request_ids: &mut HashSet<RequestId>,
         waiting_admission: &mut WaitingAdmissionMode<'_>,
+        planning: &mut Option<&mut TimePlanningRound>,
     ) -> Result<()> {
         let has_deferred_recompute_backlog = self.decode_capacity_deferred_backlog_len() > 0;
         let (enforce_execution_backpressure, decode_capacity_backpressure_limit) = {
@@ -4095,6 +4070,9 @@ impl ContinuousBatchScheduler {
             }
 
             let mut scheduled = req.inner.clone();
+            if let Some(round) = planning.as_deref_mut() {
+                round.selected_work(self.cost_work(req, 1, true));
+            }
             scheduled.tokens_processed = req.total_tokens();
             scheduled.tokens_to_process = Some(1);
             req.logical_work_frontier.mark_scheduled(1);
@@ -4124,12 +4102,22 @@ impl ContinuousBatchScheduler {
     fn create_iteration_batch_with_admission_at(
         &self,
         hint: BatchHint,
-        mut waiting_admission: WaitingAdmissionMode<'_>,
+        waiting_admission: WaitingAdmissionMode<'_>,
         now: Instant,
     ) -> Result<Option<BatchPlan>> {
+        self.create_iteration_batch_with_time(hint, waiting_admission, now, None)
+    }
+
+    fn create_iteration_batch_with_time(
+        &self,
+        hint: BatchHint,
+        mut waiting_admission: WaitingAdmissionMode<'_>,
+        now: Instant,
+        mut planning: Option<&mut TimePlanningRound>,
+    ) -> Result<Option<BatchPlan>> {
         self.validate_slo()?;
-        if let Some(controller) = &self.slo_controller {
-            controller.lock().begin_iteration();
+        if let Some(round) = planning.as_deref_mut() {
+            round.reset_selection();
         }
         let iteration = self.current_iteration.fetch_add(1, Ordering::Relaxed);
         self.metrics_tracker.record_iteration();
@@ -4177,6 +4165,7 @@ impl ContinuousBatchScheduler {
                 &mut total_tokens,
                 &mut scheduled_request_ids,
                 &mut waiting_admission,
+                &mut planning,
             )?;
         }
         let mut scheduled_decode_count = batch_requests.len();
@@ -4189,45 +4178,6 @@ impl ContinuousBatchScheduler {
             active_decode_prefill_chunk,
             prefill_step_chunk,
         );
-        let mut slo_static_prefill_tokens_remaining = None;
-        let mut slo_prefill_limited = false;
-        let dynamic_prefill_budget =
-            if let (Some(targets), Some(controller)) = (self.config.slo, &self.slo_controller) {
-                let live_limit = hint.max_tokens.saturating_sub(total_tokens);
-                let static_limit = active_decode_prefill_tokens_remaining
-                    .map_or(live_limit, |limit| limit.min(live_limit));
-                // Follow the existing prefill-queue -> controller lock order.
-                // Waiting admission stays unchanged; once admitted, a request
-                // participates with its real remaining work and chunk ceiling.
-                let prefill_queue = self.prefill_queue.read();
-                let active_prefills = prefill_queue
-                    .iter()
-                    // Recompute after visible output has no first-token deadline.
-                    .filter(|request| !request.slo_first_token_emitted)
-                    .map(|request| slo::PrefillTtftWork {
-                        remaining_tokens: self.remaining_prefill_tokens(request),
-                        chunk_cap: self.prefill_budget_tokens(
-                            request,
-                            active_decode_prefill_chunk,
-                            prefill_step_chunk,
-                            static_limit,
-                        ),
-                        age_ms: request.inner.age_at(now).as_secs_f64() * 1000.0,
-                    });
-                let budget = controller.lock().budget(
-                    targets,
-                    scheduled_decode_count,
-                    static_limit,
-                    active_prefills,
-                );
-                slo_static_prefill_tokens_remaining = budget.map(|_| static_limit);
-                budget
-            } else {
-                None
-            };
-        if let Some(budget) = dynamic_prefill_budget {
-            active_decode_prefill_tokens_remaining = Some(budget);
-        }
         let mut active_decode_prefill_chunks_remaining = self.active_decode_prefill_budget_chunks(
             &hint,
             scheduled_decode_count,
@@ -4283,8 +4233,7 @@ impl ContinuousBatchScheduler {
             &mut total_tokens,
             &mut scheduled_request_ids,
             &mut active_decode_prefill_tokens_remaining,
-            &mut slo_static_prefill_tokens_remaining,
-            &mut slo_prefill_limited,
+            &mut planning,
             &mut active_decode_prefill_chunks_remaining,
             &mut capacity_deferred_mixed_recompute_slots_remaining,
             active_decode_prefill_chunk,
@@ -4376,8 +4325,7 @@ impl ContinuousBatchScheduler {
             &mut total_tokens,
             &mut scheduled_request_ids,
             &mut active_decode_prefill_tokens_remaining,
-            &mut slo_static_prefill_tokens_remaining,
-            &mut slo_prefill_limited,
+            &mut planning,
             &mut active_decode_prefill_chunks_remaining,
             &mut capacity_deferred_mixed_recompute_slots_remaining,
             active_decode_prefill_chunk,
@@ -4400,6 +4348,7 @@ impl ContinuousBatchScheduler {
                 &mut total_tokens,
                 &mut scheduled_request_ids,
                 &mut waiting_admission,
+                &mut planning,
             )?;
             scheduled_decode_count += batch_requests.len() - batch_len_before_decode_fallback;
         }
@@ -4417,11 +4366,6 @@ impl ContinuousBatchScheduler {
         }
 
         let batch_id = BatchId::new();
-        if let Some(controller) = &self.slo_controller {
-            controller.lock().mark_adapted_prefill(
-                slo_prefill_limited && batch_requests.len() > scheduled_decode_count,
-            );
-        }
         let max_seq_len = batch_requests
             .iter()
             .map(|r| r.request.sampling_params.max_tokens)
@@ -4970,6 +4914,8 @@ mod tests {
                     ttft_ms: 1000.0,
                     tpot_ms: 100.0,
                     itl_ms: 120.0,
+                    reference: Default::default(),
+                    unknown_cost: Default::default(),
                 }),
                 ..SchedulerConfig::default()
             });

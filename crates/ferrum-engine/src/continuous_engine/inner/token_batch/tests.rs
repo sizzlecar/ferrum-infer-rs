@@ -219,6 +219,7 @@ async fn fixture_observed(
         None,
         None,
         observer,
+        None,
     )
     .unwrap();
     let mut inputs = Vec::new();

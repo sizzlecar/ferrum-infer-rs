@@ -179,7 +179,8 @@ async fn token_admission_later_publish_error_retires_earlier_real_faulted_fronti
             .active_inner()
             .expect("engine execution is open"),
     );
-    let task = tokio::spawn(async move { engine_inner.prepare_dynamic_admission_round(2).await });
+    let task =
+        tokio::spawn(async move { engine_inner.prepare_dynamic_admission_round(2, None).await });
     let second_identity =
         tokio::time::timeout(Duration::from_secs(5), fixture.ready.take().unwrap())
             .await

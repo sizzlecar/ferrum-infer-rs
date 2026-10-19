@@ -19,6 +19,7 @@
 //! - **SLA Awareness**: Consider latency SLAs and priorities
 //! - **Resource Awareness**: Schedule based on available resources
 
+pub mod cost_prediction;
 pub mod implementations;
 pub mod metrics;
 pub mod vnext;
@@ -38,4 +39,5 @@ pub use ferrum_types::{SchedulerConfig, SchedulerStats};
 pub use ferrum_types::{BatchId, InferenceRequest, InferenceResponse, Priority, RequestId, Result};
 
 // Re-exports of implementations
+pub use cost_prediction::{BatchSelection, TimePlanningRound};
 pub use implementations::*;
