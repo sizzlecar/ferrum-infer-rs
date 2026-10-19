@@ -1,7 +1,7 @@
 //! Handler-boundary timing through actual HTTP conversion and projection. The
 //! capturing engine checks transport of the clock, not model numerical timing.
 use super::*;
-use ferrum_bench_core::{JsonlJournalOpenMode, JsonlJournalOwner};
+use ferrum_journal::{JsonlJournalOpenMode, JsonlJournalOwner};
 use ferrum_types::ObservabilityProfileDetail;
 use std::time::{Duration, Instant};
 

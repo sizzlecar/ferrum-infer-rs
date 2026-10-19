@@ -11,7 +11,6 @@ use crate::resource_lifecycle::{
 };
 use crate::IntoEngineExecutor;
 use async_trait::async_trait;
-use ferrum_bench_core::{JsonlJournal, JsonlJournalError};
 use ferrum_execution::execution_attempt::ExecutionAttemptObserver;
 use ferrum_execution::executor_lifecycle::{
     ExecutorOwner, ExecutorScope, ExecutorShutdownObserver, ExecutorShutdownPhase,
@@ -33,6 +32,7 @@ use ferrum_interfaces::{
     KvCacheManager, RecurrentStateManager, Sampler, SchedulerInterface as Scheduler, TensorFactory,
     Tokenizer,
 };
+use ferrum_journal::{JsonlJournal, JsonlJournalError};
 use ferrum_output::{
     semantic_cost, InferenceOutput, InferenceStream, OutputBudget, OutputChunk,
     OutputSemanticLease, OutputSession,

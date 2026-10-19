@@ -2333,7 +2333,7 @@ fn profile_journal_budget_reaches_profile_scheduler_and_legacy_writers() {
     let mut config = EngineConfig::default();
     config.runtime.profile_journal.queue_capacity = 2;
     config.runtime.profile_journal.max_batch_records = 2048;
-    let expected: ferrum_bench_core::JsonlJournalConfig = config.runtime.profile_journal.into();
+    let expected: ferrum_journal::JsonlJournalConfig = config.runtime.profile_journal.into();
     config.runtime.profile_jsonl = Some(paths[0].clone());
     config.runtime.scheduler_trace_jsonl = Some(paths[1].clone());
     config.runtime.legacy_scheduler_trace_jsonl = Some(paths[2].clone());

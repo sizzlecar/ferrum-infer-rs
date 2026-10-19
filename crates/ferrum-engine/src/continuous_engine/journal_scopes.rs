@@ -1,6 +1,6 @@
 //! Journal producer custody belongs to the engine; final close belongs to its assembly.
 use super::*;
-use ferrum_bench_core::jsonl_journal::{
+use ferrum_journal::jsonl_journal::{
     normalize_jsonl_path, JsonlFinalReceipt, JsonlJournalOwner, JsonlProducerScope,
 };
 
@@ -130,7 +130,7 @@ impl EngineJournals {
             } else {
                 JsonlJournalOwner::open(
                     &path,
-                    ferrum_bench_core::JsonlJournalOpenMode::Truncate,
+                    ferrum_journal::JsonlJournalOpenMode::Truncate,
                     requested,
                 )
                 .and_then(|owner| {

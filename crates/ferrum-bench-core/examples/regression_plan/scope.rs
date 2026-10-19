@@ -124,7 +124,7 @@ fn refine_content(repo: &Path, base: &str, candidate: &str, impact: &mut Impact)
                 Ok(homebrew_documentation_only(&before, &after)?.then_some(ContentProof::Homebrew))
             } else if rust_validation_only(&before, &after)? {
                 Ok(Some(ContentProof::Tests))
-            } else if (entry.path == "crates/ferrum-bench-core/src/jsonl_journal.rs"
+            } else if (entry.path == "crates/ferrum-journal/src/jsonl_journal.rs"
                 && journal_initialization_only(&before, &after)?)
                 || (entry.path == "crates/ferrum-types/src/process_memory.rs"
                     && windows_process_memory_only(&before, &after)?)

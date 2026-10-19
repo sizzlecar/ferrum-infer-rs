@@ -1219,9 +1219,9 @@ impl EngineInner {
             let message = format!("enqueue scheduler trace: {error}");
             let error = if matches!(
                 error.kind(),
-                ferrum_bench_core::JsonlJournalErrorKind::Encoding
-                    | ferrum_bench_core::JsonlJournalErrorKind::Panic
-                    | ferrum_bench_core::JsonlJournalErrorKind::Config
+                ferrum_journal::JsonlJournalErrorKind::Encoding
+                    | ferrum_journal::JsonlJournalErrorKind::Panic
+                    | ferrum_journal::JsonlJournalErrorKind::Config
             ) {
                 ExecutionEventSinkError::contract(message)
             } else {

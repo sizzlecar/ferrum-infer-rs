@@ -262,7 +262,7 @@ pub fn write_synthetic_product_observability(
     let mut written = write_profile_outputs(
         config,
         &events,
-        ferrum_bench_core::JsonlJournalOpenMode::Truncate,
+        ferrum_journal::JsonlJournalOpenMode::Truncate,
         true,
         true,
         true,
@@ -537,7 +537,7 @@ fn add_profile_output_target(
     let Some(path) = path else {
         return Ok(());
     };
-    let normalized = ferrum_bench_core::normalize_jsonl_path(path).map_err(|error| {
+    let normalized = ferrum_journal::normalize_jsonl_path(path).map_err(|error| {
         FerrumError::io(format!(
             "normalize observability JSONL path {}: {error}",
             path.display()
@@ -550,7 +550,7 @@ fn add_profile_output_target(
 fn write_profile_outputs(
     config: &ProductObservabilityConfig,
     events: &[FerrumProfileEvent],
-    mode: ferrum_bench_core::JsonlJournalOpenMode,
+    mode: ferrum_journal::JsonlJournalOpenMode,
     include_profile: bool,
     include_memory: bool,
     include_scheduler: bool,
@@ -1981,7 +1981,7 @@ fn push_path_arg(parts: &mut Vec<String>, flag: &str, path: Option<&PathBuf>) {
 
 fn write_profile_events(
     path: &Path,
-    mode: ferrum_bench_core::JsonlJournalOpenMode,
+    mode: ferrum_journal::JsonlJournalOpenMode,
     events: &[FerrumProfileEvent],
     config: ferrum_types::ObservabilityJournalConfig,
 ) -> Result<()> {
@@ -1993,7 +1993,7 @@ fn write_profile_events(
             FerrumError::internal(format!("invalid product observability event: {err}"))
         })?;
     }
-    ferrum_bench_core::jsonl_journal::write_jsonl_records_with_config(
+    ferrum_journal::jsonl_journal::write_jsonl_records_with_config(
         path,
         mode,
         events,
@@ -2002,9 +2002,9 @@ fn write_profile_events(
     .map_err(|error| {
         if matches!(
             error.kind(),
-            ferrum_bench_core::JsonlJournalErrorKind::Encoding
-                | ferrum_bench_core::JsonlJournalErrorKind::Panic
-                | ferrum_bench_core::JsonlJournalErrorKind::Config
+            ferrum_journal::JsonlJournalErrorKind::Encoding
+                | ferrum_journal::JsonlJournalErrorKind::Panic
+                | ferrum_journal::JsonlJournalErrorKind::Config
         ) {
             FerrumError::serialization(error.to_string())
         } else {
@@ -2094,7 +2094,7 @@ mod tests {
                 let result = write_profile_outputs(
                     &config,
                     &events,
-                    ferrum_bench_core::JsonlJournalOpenMode::Truncate,
+                    ferrum_journal::JsonlJournalOpenMode::Truncate,
                     true,
                     false,
                     true,
@@ -2122,7 +2122,7 @@ mod tests {
                     write_profile_outputs(
                         &config,
                         &invalid,
-                        ferrum_bench_core::JsonlJournalOpenMode::Append,
+                        ferrum_journal::JsonlJournalOpenMode::Append,
                         true,
                         false,
                         true
@@ -2413,9 +2413,9 @@ mod tests {
             1.0,
         );
 
-        let mut original_owner = ferrum_bench_core::JsonlJournalOwner::open(
+        let mut original_owner = ferrum_journal::JsonlJournalOwner::open(
             &path,
-            ferrum_bench_core::JsonlJournalOpenMode::Append,
+            ferrum_journal::JsonlJournalOpenMode::Append,
             config.journal.into(),
         )
         .unwrap();
@@ -2441,7 +2441,7 @@ mod tests {
                     event.attributes.insert("seq".to_string(), json!(seq));
                     // Concurrent tool producers share one explicitly supplied
                     // scope each and one original ordered worker.
-                    ferrum_bench_core::write_jsonl_records_to(&producer, &[event])
+                    ferrum_journal::write_jsonl_records_to(&producer, &[event])
                         .unwrap()
                         .result()
                         .unwrap();

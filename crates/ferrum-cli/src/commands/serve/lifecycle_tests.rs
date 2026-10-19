@@ -1,5 +1,5 @@
 use super::lifecycle::ServeTaskObserver;
-use ferrum_bench_core::{JsonlJournalOpenMode, JsonlJournalOwner};
+use ferrum_journal::{JsonlJournalOpenMode, JsonlJournalOwner};
 use ferrum_types::FerrumError;
 use serde_json::json;
 

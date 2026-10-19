@@ -1,6 +1,6 @@
 //! Product assembly owns writers; each component receives publication scopes.
 use super::*;
-use ferrum_bench_core::{
+use ferrum_journal::{
     JsonlFinalReceipt, JsonlJournal, JsonlJournalError, JsonlJournalErrorKind,
     JsonlJournalOpenMode, JsonlJournalOwner, JsonlProducerScope,
 };
@@ -88,7 +88,7 @@ impl ProductJournalSession {
         ] {
             if let Some(path) = path {
                 let key =
-                    ferrum_bench_core::normalize_jsonl_path(path).unwrap_or_else(|_| path.clone());
+                    ferrum_journal::normalize_jsonl_path(path).unwrap_or_else(|_| path.clone());
                 let entry = paths.entry(key).or_insert_with(|| {
                     (
                         path.clone(),
@@ -104,8 +104,7 @@ impl ProductJournalSession {
             }
         }
         for path in ferrum_engine::EngineJournalScopes::configured_paths(engine) {
-            let key =
-                ferrum_bench_core::normalize_jsonl_path(&path).unwrap_or_else(|_| path.clone());
+            let key = ferrum_journal::normalize_jsonl_path(&path).unwrap_or_else(|_| path.clone());
             // Preserve the existing product epoch: an Engine trace starts a
             // new artifact, while an independent CLI memory log appends. One
             // canonical route is opened once even when these roles alias.
@@ -219,7 +218,7 @@ impl ProductJournalSession {
         let mut scopes = Vec::new();
         let mut unavailable = Vec::new();
         for path in paths {
-            let key = ferrum_bench_core::normalize_jsonl_path(&path).unwrap_or(path);
+            let key = ferrum_journal::normalize_jsonl_path(&path).unwrap_or(path);
             if !selected.insert(key.clone()) {
                 continue;
             }

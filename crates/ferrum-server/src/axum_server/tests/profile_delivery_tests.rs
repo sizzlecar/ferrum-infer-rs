@@ -1,7 +1,7 @@
 //! Actual HTTP projection and the real shared JSONL worker. The controlled LLM
 //! isolates delivery behavior; these are not model numerical/performance tests.
 use super::*;
-use ferrum_bench_core::{
+use ferrum_journal::{
     JsonlJournal, JsonlJournalErrorKind, JsonlJournalOpenMode, JsonlJournalOwner,
     JsonlProducerScope,
 };

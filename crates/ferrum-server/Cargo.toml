@@ -13,7 +13,7 @@ ferrum-types = { workspace = true }
 ferrum-interfaces = { workspace = true }
 ferrum-output = { workspace = true }
 ferrum-engine = { workspace = true }
-ferrum-bench-core = { workspace = true }
+ferrum-journal = { workspace = true }
 ferrum-scheduler = { workspace = true }
 ferrum-sampler = { workspace = true }
 async-trait = { workspace = true }

@@ -2,7 +2,7 @@
 
 **状态：目标已激活，R0 已合并，R4 最小闭环已验证；R1–R3 剩余边界与 R5 验收继续。** 工作分支：`refactor/execution-architecture-20261018`，从干净 `main`（`c2be4c67`）开始，PR #441 待合并；原工作区的旧 SLO 实现不作为代码基底。
 
-R0 六批退役与修复已合并（PR #429–#434）。执行契约、runtime、受管驱动、输出额度和实例资源已分责，旧 Tensor 控制流及全局 profiler 已退出。独立 SLO 参考组件通过真实 CPU mixed 执行、故障回收和 Metal 前缀恢复组合验证；调度与实际提交共用合法形状投影。剩余重点是 Engine 旧资源统计装配、生产日志对工具层的反向依赖、低层资源入口及保留 CUDA 路径资格，随后完成默认质量/性能回归和主线合并。27B GGUF 数值差异、Metal counter 间歇失败及既有 SM120 经典 Marlin 非法指令仍须分别解释或修复。原始证据留在仓库外；当前不新增性能或 SLO 达标声明。
+R0 六批退役与修复已合并（PR #429–#434）。执行契约、runtime、受管驱动、输出额度和实例资源已分责，旧 Tensor 控制流及全局 profiler 已退出。独立 SLO 参考组件通过真实 CPU mixed 执行、故障回收和 Metal 前缀恢复组合验证；调度与实际提交共用合法形状投影。生产日志已移至 `ferrum-journal`，Engine/Server 不再普通依赖 benchmark 工具包。剩余重点是 Engine 旧资源统计装配、低层资源入口及保留 CUDA 路径资格，随后完成默认质量/性能回归和主线合并。27B GGUF 数值差异、Metal counter 间歇失败及既有 SM120 经典 Marlin 非法指令仍须分别解释或修复。原始证据留在仓库外；当前不新增性能或 SLO 达标声明。
 
 ## 1. 目标与第一原则
 
@@ -96,6 +96,7 @@ LoRA API 迁移：退役公开的 `RuntimeLoraAdapter` / `load_runtime_lora_adap
 | `ferrum-types` | 通用值类型、配置声明、能力与数值描述 | 自动调优策略、运行时全局变量、SLO 拟合逻辑 |
 | `ferrum-interfaces` | 不依赖执行实现的基础端口与公共语义，例如 tokenizer、sampler、模型描述 | 资源池实现、具体 runtime 授权、产品默认选择 |
 | `ferrum-output` | 输出会话、内容额度与持有额度的流/内容容器；供 Engine 和 HTTP 共用 | 模型资源、调度策略、HTTP 事件语义 |
+| `ferrum-journal` | 有界 JSONL 投递、共享文件 writer、组件投递范围与真实关闭结果 | 执行/统计 schema、SLO 策略、benchmark 工作负载 |
 | `ferrum-runtime` | 计划准备、资源授权、提交/完成/退休、设备执行端口、复用与失效、实例上下文 | 请求 SLO 目标、统计特征、模型名称策略 |
 | `ferrum-execution` | 建立在 runtime 授权之上的产品执行契约、泛型执行驱动、结果/延期/取消协议；契约与驱动分模块 | 第二套资源运行时、具体模型/后端装配、训练器、HTTP 协议 |
 | `ferrum-models` / `ferrum-kernels` | 模型语义与计划生成；CPU/Metal/CUDA 的具体执行、布局和数值能力 | 校准样本目录、训练 schema、SLO 拒单策略 |
@@ -117,6 +118,8 @@ R2 输出 API：`infer()` / `infer_batch()` 返回持有额度的 `ferrum_output
 R2 观测 API：`ExecutionEventSinkError` 区分 `Contract` 与 `Transport`；`delivery_policy()` 默认要求完整证据。产品 `--profile-detail replay/verify/full` 保持完整证据要求，其余详细级别允许传输降级；不变量、编码错误及内部 panic 始终失败。生产 journal 使用原 writer 的有界 `try_*` 投递，队列满不等待，关闭报告保留丢样与实际 flush 状态。普通工具的阻塞写入另计，不能据生产队列预算宣称整个进程内存有界。prefix 恢复确认返回 `PrefixRestoreAcknowledgement`，调用方先保存实际 `frontier`，再处理确认后的观测错误，不能据此重新执行已恢复的工作。
 
 `JsonlJournal<T>` 只负责投递；`JsonlProducerScope` 结束组件投递，`JsonlJournalOwner` 在所有范围结束后关闭原 writer。库共享文件须显式注入独立 scope，工具独用 `OwnedJsonlJournal<T>`。flush/final receipt 分别保留固定前缀和真实 join 事实，调用方检查 `receipt.result()`；返回 receipt 不代表证据完整。
+
+日志 API 由 `ferrum-journal` 提供；HTTP benchmark correlation 的纯 wire 类型归 `ferrum-types`。`ferrum-bench-core` 为工具保留同类型重导出，只有一份 writer 与路径注册表；Engine/Server 直接依赖生产组件，CLI 的 benchmark 子命令保留工具依赖。
 
 执行事实由独立的 `ExecutionFactsCapture` 开关控制，不改变计时模式、程序身份或缓存资格。`ProfiledSubmissionHandle::into_parts()` 返回完成句柄与 `SubmissionObservation`；后者持有当前工作量、可选计时归因和设备事实，提交后错误保留有效附件。`TerminalExecutionFacts` 只借用原终态，不授予重试或释放权。CUDA Q6 执行与观测共用实际选择，原图保存无请求身份的投影模板，重放时绑定当前 token 范围；Off 捕获的图不回填模板，明确记为 `CachedTemplateUnavailable`。设备事实仅声明计算命令覆盖，不代表传输、初始化或每个 kernel 成功；缺失与未支持分别标记。产品投影经原有界日志队列交付，不用逻辑节点或 packed token 行数冒充物理矩阵。
 

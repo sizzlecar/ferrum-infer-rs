@@ -193,10 +193,10 @@ pub fn contract_groups() -> Vec<ContractGroup> {
         // The sampler exercises the host running this harness. A Unix result
         // never certifies the separately cfg(windows) K32 implementation.
         ("observability", Observability, all.clone(), vec![
-            lib("ferrum-bench-core", "jsonl_journal::tests::truncate_journal_appends_after_an_external_startup_record"),
-            lib("ferrum-bench-core", "jsonl_journal::tests::last_handle_drop_closes_and_flushes"),
-            lib("ferrum-bench-core", "jsonl_journal::tests::explicit_close_drains_joins_and_rejects_new_events"),
-            lib("ferrum-bench-core", "jsonl_journal::tests::serialization_failure_is_latched_and_returned_by_flush"),
+            lib("ferrum-journal", "jsonl_journal::tests::truncate_journal_appends_after_an_external_startup_record"),
+            lib("ferrum-journal", "jsonl_journal::tests::last_handle_drop_closes_and_flushes"),
+            lib("ferrum-journal", "jsonl_journal::tests::explicit_close_drains_joins_and_rejects_new_events"),
+            lib("ferrum-journal", "jsonl_journal::tests::serialization_failure_is_latched_and_returned_by_flush"),
             lib("ferrum-types", "process_memory::tests::process_memory_sampler_returns_valid_resident_bytes"),
             lib("ferrum-cli", "observability_product::tests::actual_run_observability_writes_prompt_token_ids"),
             lib("ferrum-cli", "observability_product::tests::actual_run_failure_observability_writes_diagnostics_bundle"),

@@ -1737,7 +1737,7 @@ pub(super) fn create_scheduler_trace_sink(path: Option<&Path>) -> Option<TestTra
 #[cfg(test)]
 pub(super) struct TestTraceJournal {
     journal: SchedulerTraceJournal,
-    owner: Mutex<ferrum_bench_core::jsonl_journal::OwnedJsonlJournal<SchedulerTraceRecord>>,
+    owner: Mutex<ferrum_journal::jsonl_journal::OwnedJsonlJournal<SchedulerTraceRecord>>,
 }
 
 #[cfg(test)]
@@ -1746,9 +1746,9 @@ impl TestTraceJournal {
         path: PathBuf,
         config: ferrum_types::ObservabilityJournalConfig,
     ) -> std::io::Result<Self> {
-        let owner = ferrum_bench_core::jsonl_journal::OwnedJsonlJournal::open(
+        let owner = ferrum_journal::jsonl_journal::OwnedJsonlJournal::open(
             path,
-            ferrum_bench_core::JsonlJournalOpenMode::Truncate,
+            ferrum_journal::JsonlJournalOpenMode::Truncate,
             config.into(),
         )?;
         let journal = SchedulerTraceJournal::from_producer(owner.producer().clone());

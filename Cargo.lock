@@ -1258,6 +1258,7 @@ name = "ferrum-bench-core"
 version = "0.13.0"
 dependencies = [
  "clap",
+ "ferrum-journal",
  "ferrum-types",
  "half",
  "quote",
@@ -1293,6 +1294,7 @@ dependencies = [
  "ferrum-engine",
  "ferrum-execution",
  "ferrum-interfaces",
+ "ferrum-journal",
  "ferrum-kernels",
  "ferrum-models",
  "ferrum-output",
@@ -1373,9 +1375,9 @@ dependencies = [
  "criterion",
  "crossbeam-channel",
  "crossbeam-utils",
- "ferrum-bench-core",
  "ferrum-execution",
  "ferrum-interfaces",
+ "ferrum-journal",
  "ferrum-kernels",
  "ferrum-kv",
  "ferrum-models",
@@ -1456,6 +1458,15 @@ dependencies = [
  "serde_json",
  "smallvec",
  "tokio",
+]
+
+[[package]]
+name = "ferrum-journal"
+version = "0.13.0"
+dependencies = [
+ "ferrum-types",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -1687,10 +1698,10 @@ dependencies = [
  "base64 0.22.1",
  "chrono",
  "config",
- "ferrum-bench-core",
  "ferrum-engine",
  "ferrum-execution",
  "ferrum-interfaces",
+ "ferrum-journal",
  "ferrum-output",
  "ferrum-sampler",
  "ferrum-scheduler",

@@ -514,6 +514,33 @@ fn classify(path: &str) -> Option<(Vec<ChangeArea>, &'static str)> {
             "isolated backend implementation: retain operator numerics, boundaries, model forward and performance; model architecture/state is a separate responsibility",
         ));
     }
+    if (component == "ferrum-journal"
+        && matches!(
+            relative,
+            "src/lib.rs"
+                | "src/jsonl_journal.rs"
+                | "src/jsonl_journal/delivery.rs"
+                | "src/jsonl_journal/ownership.rs"
+        ))
+        || (component == "ferrum-types" && relative == "src/benchmark_correlation.rs")
+    {
+        return Some((vec![Observability, Validation],
+            "production journal publication/retirement and HTTP correlation contracts; no device operators or model arithmetic"));
+    }
+    if component == "ferrum-journal"
+        && matches!(
+            relative,
+            "src/jsonl_journal/budget_tests.rs"
+                | "src/jsonl_journal/delivery_tests.rs"
+                | "src/jsonl_journal/ownership_tests.rs"
+                | "src/jsonl_journal/publication_tests.rs"
+        )
+    {
+        return Some((
+            vec![Validation],
+            "journal fault, capacity and ownership tests registered only under cfg(test)",
+        ));
+    }
     if component == "ferrum-bench-core" {
         return classify_bench_core(relative);
     }
@@ -596,6 +623,7 @@ fn known_component(component: &str) -> bool {
             | "ferrum-runtime"
             | "ferrum-execution"
             | "ferrum-output"
+            | "ferrum-journal"
             | "ferrum-engine"
             | "ferrum-sampler"
             | "ferrum-tokenizer"
@@ -615,16 +643,13 @@ fn known_component(component: &str) -> bool {
 
 fn classify_bench_core(relative: &str) -> Option<(Vec<ChangeArea>, &'static str)> {
     use ChangeArea::*;
-    if matches!(
-        relative,
-        "src/lib.rs" | "src/jsonl_journal.rs" | "src/profile.rs" | "src/trace.rs"
-    ) {
-        // lib.rs parses headers on the real Chat endpoint. The journal/profile/
-        // trace modules are called by engine lifecycle and backend execution,
-        // as well as benchmark producers; crate naming cannot erase that reach.
+    if matches!(relative, "src/lib.rs" | "src/profile.rs" | "src/trace.rs") {
+        // Tool-facing wire/journal re-exports and historical artifact readers
+        // retain observability validation. Production callers use the original
+        // contracts in ferrum-types and the writer in ferrum-journal directly.
         return Some((
             vec![Observability, Validation],
-            "shared production request metadata, profile sinks and runtime journals",
+            "tool-facing correlation/journal re-exports and historical profile artifacts",
         ));
     }
     if matches!(
@@ -1216,7 +1241,10 @@ mod tests {
     fn production_headers_and_sinks_retain_observability_without_inferred_numerics() {
         for path in [
             "crates/ferrum-bench-core/src/lib.rs",
-            "crates/ferrum-bench-core/src/jsonl_journal.rs",
+            "crates/ferrum-journal/src/jsonl_journal.rs",
+            "crates/ferrum-journal/src/jsonl_journal/delivery.rs",
+            "crates/ferrum-journal/src/jsonl_journal/ownership.rs",
+            "crates/ferrum-types/src/benchmark_correlation.rs",
             "crates/ferrum-bench-core/src/profile.rs",
             "crates/ferrum-bench-core/src/trace.rs",
         ] {
@@ -1307,7 +1335,7 @@ mod tests {
         }
         let combined = analyze_paths([
             "crates/ferrum-cli/examples/model_regression/protocol.rs",
-            "crates/ferrum-bench-core/src/jsonl_journal.rs",
+            "crates/ferrum-journal/src/jsonl_journal.rs",
         ]);
         assert!(combined.areas.contains(&ChangeArea::Observability));
         assert!(combined.areas.contains(&ChangeArea::Validation));

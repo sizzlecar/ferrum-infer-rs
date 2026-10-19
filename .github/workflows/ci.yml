@@ -855,10 +855,10 @@ jobs:
           $ErrorActionPreference = 'Stop'
           $PSNativeCommandUseErrorActionPreference = $true
           cargo test --locked -p ferrum-types --lib process_memory::tests::process_memory_sampler_returns_valid_resident_bytes -- --exact
-          cargo test --locked -p ferrum-bench-core --lib jsonl_journal::tests::truncate_journal_appends_after_an_external_startup_record -- --exact
-          cargo test --locked -p ferrum-bench-core --lib jsonl_journal::tests::last_handle_drop_closes_and_flushes -- --exact
-          cargo test --locked -p ferrum-bench-core --lib jsonl_journal::tests::explicit_close_drains_joins_and_rejects_new_events -- --exact
-          cargo test --locked -p ferrum-bench-core --lib jsonl_journal::tests::serialization_failure_is_latched_and_returned_by_flush -- --exact
+          cargo test --locked -p ferrum-journal --lib jsonl_journal::tests::truncate_journal_appends_after_an_external_startup_record -- --exact
+          cargo test --locked -p ferrum-journal --lib jsonl_journal::tests::last_handle_drop_closes_and_flushes -- --exact
+          cargo test --locked -p ferrum-journal --lib jsonl_journal::tests::explicit_close_drains_joins_and_rejects_new_events -- --exact
+          cargo test --locked -p ferrum-journal --lib jsonl_journal::tests::serialization_failure_is_latched_and_returned_by_flush -- --exact
       - name: Save Windows build caches
         if: ${{ always() && steps.windows_cache.outputs.cache-primary-key != '' && steps.windows_cache.outputs.cache-hit != 'true' }}
         uses: actions/cache/save@v4

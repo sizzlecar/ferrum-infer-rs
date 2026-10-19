@@ -2,7 +2,7 @@
 //! Production record delivery is bounded/nonwaiting; final flush runs only in
 //! the server's explicit stop path after HTTP and engine producers have drained.
 use super::*;
-use ferrum_bench_core::{
+use ferrum_journal::{
     JsonlFinalReceipt, JsonlFlushReceipt, JsonlJournal, JsonlJournalDeliveryStats,
     JsonlJournalError, JsonlJournalErrorKind, JsonlJournalOwner, JsonlProducerScope,
 };
@@ -30,7 +30,7 @@ impl HttpJournalScopes {
         error: std::io::Error,
     ) -> ferrum_types::Result<Self> {
         let path = path.into();
-        let key = ferrum_bench_core::normalize_jsonl_path(&path).unwrap_or(path);
+        let key = ferrum_journal::normalize_jsonl_path(&path).unwrap_or(path);
         if self.entries.insert(key, Err(error)).is_some() {
             return Err(Error::config("duplicate HTTP journal destination"));
         }
@@ -235,8 +235,8 @@ impl HttpProfileDelivery {
             (state.memory_profile_jsonl.as_deref(), false),
         ] {
             let Some(path) = path else { continue };
-            let key = ferrum_bench_core::normalize_jsonl_path(path)
-                .unwrap_or_else(|_| path.to_path_buf());
+            let key =
+                ferrum_journal::normalize_jsonl_path(path).unwrap_or_else(|_| path.to_path_buf());
             *targets.entry(key).or_default() |= profile;
         }
         if config_valid.is_ok() {
@@ -264,7 +264,7 @@ impl HttpProfileDelivery {
                     },
                     None => JsonlJournalOwner::open(
                         &path,
-                        ferrum_bench_core::JsonlJournalOpenMode::Append,
+                        ferrum_journal::JsonlJournalOpenMode::Append,
                         state.profile_journal.into(),
                     )
                     .and_then(|owner| {

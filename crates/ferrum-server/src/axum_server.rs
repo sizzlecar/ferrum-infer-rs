@@ -22,10 +22,6 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use ferrum_bench_core::{
-    BenchmarkRequestCorrelation, BENCHMARK_CELL_ID_HEADER, BENCHMARK_PHASE_HEADER,
-    BENCHMARK_REPEAT_INDEX_HEADER, BENCHMARK_REQUEST_INDEX_HEADER, BENCHMARK_RUN_ID_HEADER,
-};
 use ferrum_interfaces::{adapter::AdapterExecutionSupport, engine::LlmInferenceEngine};
 use ferrum_types::{
     has_unclosed_model_reasoning_block, model_reasoning_markers,
@@ -41,6 +37,10 @@ use ferrum_types::{
     DEFAULT_CHAT_REPETITION_PENALTY, DEFAULT_MAX_TOKENS_METADATA_KEY,
     OBSERVABILITY_PROFILE_SCHEMA_VERSION, PROMPT_OPENED_REASONING_METADATA_KEY, THINK_END_TAG,
     THINK_START_TAG,
+};
+use ferrum_types::{
+    BenchmarkRequestCorrelation, BENCHMARK_CELL_ID_HEADER, BENCHMARK_PHASE_HEADER,
+    BENCHMARK_REPEAT_INDEX_HEADER, BENCHMARK_REQUEST_INDEX_HEADER, BENCHMARK_RUN_ID_HEADER,
 };
 use sha2::{Digest, Sha256};
 use std::{
@@ -10758,7 +10758,7 @@ mod tests {
             "bench-123".to_string(),
             "cell-1-closed-c8".to_string(),
             2,
-            ferrum_bench_core::BenchmarkPhase::Measured,
+            ferrum_types::BenchmarkPhase::Measured,
             17,
         )
         .unwrap();

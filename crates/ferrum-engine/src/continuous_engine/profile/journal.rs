@@ -1,7 +1,7 @@
 use super::*;
 #[cfg(test)]
-use ferrum_bench_core::jsonl_journal::JsonlJournalDeliveryStats;
-use ferrum_bench_core::jsonl_journal::JsonlJournalErrorKind;
+use ferrum_journal::jsonl_journal::JsonlJournalDeliveryStats;
+use ferrum_journal::jsonl_journal::JsonlJournalErrorKind;
 use ferrum_runtime::ExecutionEventDeliveryPolicy;
 
 #[derive(Clone)]

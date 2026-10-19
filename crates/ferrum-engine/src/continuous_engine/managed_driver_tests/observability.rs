@@ -1,7 +1,7 @@
 //! Real CPU numerical work remains independent of optional journal delivery.
 use super::*;
-use ferrum_bench_core::jsonl_journal::{JsonlJournalOwner, OwnedJsonlJournal};
-use ferrum_bench_core::{JsonlJournalConfig, JsonlJournalErrorKind, JsonlJournalOpenMode};
+use ferrum_journal::jsonl_journal::{JsonlJournalOwner, OwnedJsonlJournal};
+use ferrum_journal::{JsonlJournalConfig, JsonlJournalErrorKind, JsonlJournalOpenMode};
 use ferrum_runtime::{ExecutionEventDeliveryPolicy, ExecutionEventSinkErrorKind};
 
 struct BlockWriter {

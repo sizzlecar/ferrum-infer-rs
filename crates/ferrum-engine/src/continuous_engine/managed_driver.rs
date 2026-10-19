@@ -56,10 +56,10 @@ pub struct DriverJournalDelivery {
     pub path: PathBuf,
     /// Dynamic whole-journal health, including other assemblies' producers.
     /// Scope completion is proved by `scope_receipt`, not these counters.
-    pub stats: ferrum_bench_core::jsonl_journal::JsonlJournalDeliveryStats,
-    pub scope_receipt: Option<ferrum_bench_core::jsonl_journal::JsonlFlushReceipt>,
+    pub stats: ferrum_journal::jsonl_journal::JsonlJournalDeliveryStats,
+    pub scope_receipt: Option<ferrum_journal::jsonl_journal::JsonlFlushReceipt>,
     /// Present only when this standalone engine owns final-close authority.
-    pub final_receipt: Option<ferrum_bench_core::jsonl_journal::JsonlFinalReceipt>,
+    pub final_receipt: Option<ferrum_journal::jsonl_journal::JsonlFinalReceipt>,
 }
 
 impl DriverExitReport {
