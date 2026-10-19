@@ -329,3 +329,99 @@ pub fn off_capture() {
     );
     f.close(s);
 }
+
+/// Preserve the original admitted identities while a real retirement changes
+/// physical rows. A fresh seven-session fixture would miss this transition.
+pub fn survivor_compaction() {
+    let f = Fixture::new(Head::Q6, 8, None, false);
+    let reference = Fixture::new(Head::Q6, 8, None, false);
+    let mut t = tokens(8, 8);
+    let mut s = sessions(&f, "survivors", &t);
+    let mut rs = sessions(&reference, "eager-survivors", &t);
+    let mut expected_participants = s
+        .iter()
+        .map(|session| {
+            BatchParticipantAuthority::new(
+                session.sequence_authority(),
+                session.request_authority(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let target = expected_participants[5];
+    assert_eq!(target.sequence_authority().sparse_id(), 5);
+    assert_eq!(expected_participants[3].sequence_authority().sparse_id(), 3);
+
+    for phase in 0..2 {
+        if phase == 1 {
+            // Close the actual original owners on both execution histories.
+            // No re-admission or manually edited slot/generation is involved.
+            for group in [&mut s, &mut rs] {
+                let retired = group.remove(3);
+                let weak = Arc::downgrade(&retired);
+                retired.try_abort_if_quiescent().unwrap();
+                drop(retired);
+                assert!(weak.upgrade().is_none());
+            }
+            t.remove(3);
+            expected_participants.remove(3);
+        }
+        for (step, path) in [Path::Eager, Path::Warm, Path::Warm, Path::Replay]
+            .into_iter()
+            .enumerate()
+        {
+            let position = phase * 4 + step;
+            let observed = f.execute_with_facts(
+                &s,
+                &t,
+                position..position + 1,
+                path,
+                ExecutionFactsCapture::On,
+            );
+            let expected = reference.execute_with_facts(
+                &rs,
+                &t,
+                position..position + 1,
+                Path::Eager,
+                ExecutionFactsCapture::Off,
+            );
+            assert_eq!(
+                observed.outputs, expected.outputs,
+                "full eager/replay logits"
+            );
+            oracle(&f, &observed.outputs, &t, position);
+            let (work, device) = observed.facts.as_ref().unwrap();
+            inspect(
+                work,
+                device,
+                Head::Q6,
+                s.len() as u32,
+                position..position + 1,
+                matches!(path, Path::Replay),
+            );
+            let projection = &device.projection_rows()[0];
+            let node = work
+                .nodes()
+                .iter()
+                .find(|node| node.node_index() == projection.node_index)
+                .unwrap();
+            assert_eq!(
+                node.participants()
+                    .iter()
+                    .map(BatchParticipantTokenRange::participant)
+                    .collect::<Vec<_>>(),
+                expected_participants,
+                "current work must retain each original admission identity"
+            );
+            let physical = if phase == 0 { 5 } else { 4 };
+            let row = &projection.rows[physical];
+            assert_eq!(row.physical_rows, physical as u32..physical as u32 + 1);
+            assert_eq!(
+                node.participants()[row.participant_index as usize].participant(),
+                target,
+                "original slot5 becomes row4, without becoming a new participant"
+            );
+        }
+    }
+    f.close(s);
+    reference.close(rs);
+}

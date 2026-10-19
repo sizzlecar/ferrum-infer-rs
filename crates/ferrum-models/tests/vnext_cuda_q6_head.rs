@@ -131,6 +131,13 @@ fn q6_head_execution_facts_original_capture_and_changed_replay_rows() {
 #[cfg(feature = "cuda-upstream-q6-f32-linear")]
 #[test]
 #[ignore = "requires exclusive CUDA and the actual production Q6 F32 native artifact"]
+fn q6_head_execution_facts_survivor_compaction_preserves_slots_and_logits() {
+    facts::survivor_compaction();
+}
+
+#[cfg(feature = "cuda-upstream-q6-f32-linear")]
+#[test]
+#[ignore = "requires exclusive CUDA and the actual production Q6 F32 native artifact"]
 fn q6_head_execution_facts_off_capture_is_not_retroactively_described() {
     facts::off_capture();
 }

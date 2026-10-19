@@ -1,7 +1,8 @@
 use super::*;
 pub const HIDDEN: u64 = legacy_family::HIDDEN;
 pub const OUTPUTS: u64 = 132;
-pub const MAX_TOKENS: u64 = 4;
+// Capture and replay both before and after an admitted participant retires.
+pub const MAX_TOKENS: u64 = 8;
 pub const PROFILE: &str = "fixture.q6-head.f32";
 const VOCAB: u64 = 64;
 
