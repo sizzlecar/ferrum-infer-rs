@@ -54,6 +54,65 @@ fn model_report_rechecks_observation_journals_instead_of_trusting_pass_labels() 
 }
 
 #[test]
+fn model_report_graceful_shutdown_requires_declared_original_child_exit() {
+    let expected = task("shutdown", Backend::Cpu, vec![ModelCheck::Basic]);
+    let mut valid = ReportFixture::passed(&expected);
+    // Existing reports retain their inference scope, without close evidence.
+    verify_model_report(&expected, &valid.value).unwrap();
+    valid.value["serve_shutdown_verification"] = json!("sigterm_exit_zero");
+    rejected(
+        &expected,
+        &valid,
+        "missing required model case serve-shutdown",
+    );
+    valid.value["cases"].as_array_mut().unwrap().push(json!({
+        "case": "serve-shutdown", "status": "passed",
+        "evidence": {"method": "SIGTERM", "child_pid": std::process::id(),
+            "signal_sent": true, "exit_code": 0}
+    }));
+    verify_model_report(&expected, &valid.value).unwrap();
+    for (field, value) in [
+        ("method", json!("kill")),
+        ("child_pid", json!(0)),
+        ("signal_sent", json!(false)),
+        ("exit_code", json!(17)),
+        ("exit_code", Value::Null),
+    ] {
+        let mut invalid = ReportFixture {
+            value: valid.value.clone(),
+        };
+        invalid.case_mut("serve-shutdown")["evidence"][field] = value;
+        rejected(&expected, &invalid, "original child and exit zero");
+    }
+    valid
+        .value
+        .as_object_mut()
+        .unwrap()
+        .remove("serve_shutdown_verification");
+    rejected(&expected, &valid, "unexpected model case serve-shutdown");
+}
+
+#[test]
+fn model_report_graceful_shutdown_unsupported_is_explicit_and_not_evidence() {
+    let expected = task("shutdown-platform", Backend::Cpu, vec![ModelCheck::Basic]);
+    let mut fixture = ReportFixture::passed(&expected);
+    fixture.value["serve_shutdown_verification"] = json!("unsupported");
+    rejected(&expected, &fixture, "explicit limitation");
+    fixture.value["serve_shutdown_limitation"] =
+        json!("No graceful process signal on this platform");
+    verify_model_report(&expected, &fixture.value).unwrap();
+    fixture.value["serve_shutdown_verification"] = json!("unknown");
+    rejected(&expected, &fixture, "unknown serve shutdown verification");
+    fixture.value["serve_shutdown_verification"] = json!("unsupported");
+    fixture.value["cases"].as_array_mut().unwrap().push(json!({
+        "case": "serve-shutdown", "status": "passed",
+        "evidence": {"method": "SIGTERM", "child_pid": std::process::id(),
+            "signal_sent": true, "exit_code": 0}
+    }));
+    rejected(&expected, &fixture, "unexpected model case serve-shutdown");
+}
+
+#[test]
 fn model_report_rechecks_state_histories_reset_and_isolation() {
     let expected = task("state", Backend::Cpu, vec![ModelCheck::State]);
     verify_model_report(&expected, &ReportFixture::passed(&expected).value).unwrap();

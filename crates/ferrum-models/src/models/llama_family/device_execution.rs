@@ -155,19 +155,29 @@ impl<B: QuantLlmBackend + BackendMoeFused> LlamaExecutionFrame<B> {
         Ok(())
     }
 
-    pub(in crate::models) fn observe(mut self) -> FrameObservation<B> {
-        if self.completed.take().is_some()
-            || self.preparation_only && B::preparation_is_host_only(&self.context)
-        {
+    pub(in crate::models) fn observe(self) -> FrameObservation<B> {
+        self.observe_with_host_only_failure(false)
+    }
+
+    fn observe_with_host_only_failure(mut self, failed_encoding: bool) -> FrameObservation<B> {
+        if self.completed.take().is_some() {
             return FrameObservation::Terminal {
                 owners: QuiescentLlamaFrame { frame: self },
                 error: None,
             };
         }
-        // Keep self outside the unwind scope. A backend observation panic is
-        // not permission to destroy its command buffer, graph lease or scratch.
+        // Keep self outside the unwind scope, including the host-only proof.
+        // A failed invocation may have stopped during synchronous preparation,
+        // before any device encode. That proof permits releasing its resources,
+        // but never turns an empty numerical success into completed work.
         let observed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            B::observe_completion(&mut self.context)
+            if (self.preparation_only || failed_encoding)
+                && B::preparation_is_host_only(&self.context)
+            {
+                BackendCompletion::Succeeded
+            } else {
+                B::observe_completion(&mut self.context)
+            }
         }))
         .unwrap_or_else(|payload| BackendCompletion::Unresolved(panic_error(payload)));
         match observed {
@@ -315,7 +325,7 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
                 tracing::error!(%error, "graph cancellation after encoding failure failed");
             }
         }
-        match frame.observe() {
+        match frame.observe_with_host_only_failure(result.is_err()) {
             FrameObservation::Terminal { owners, error } => {
                 self.execution_context = Some(owners.restore(&mut self.scratch));
                 let result = match (result, error) {

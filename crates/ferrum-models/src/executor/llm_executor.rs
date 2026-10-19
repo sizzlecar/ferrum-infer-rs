@@ -19,7 +19,7 @@ use ferrum_execution::{
 use ferrum_interfaces::{adapter::AdapterExecutionSupport, RecurrentStateSpec};
 use ferrum_types::{DataType, FerrumError, ModelInfo, RequestId, Result, TokenId};
 
-use crate::common::DecoderOnlyLLM;
+use crate::common::{DecoderOnlyLLM, ModelTokenExecutionMode};
 use crate::lora::ActiveLoraAdapter;
 use crate::vnext::ProductionModelSourceBundle;
 
@@ -41,7 +41,7 @@ pub struct LlmExecutor {
     model_lock_wait_samples: AtomicU64,
     token_issuer: ferrum_execution::token_execution::ExecutorSequenceIssuer,
     token_sequences: Arc<Mutex<token_execution::TokenSequences>>,
-    token_worker_required: bool,
+    token_execution_mode: ModelTokenExecutionMode,
     token_worker: OnceLock<Result<device_worker::LlmDeviceWorker>>,
 }
 
@@ -65,7 +65,7 @@ impl LlmExecutor {
         bound_sources: Option<Arc<ProductionModelSourceBundle>>,
     ) -> Self {
         let adapter_support = model.adapter_execution_support();
-        let token_worker_required = model.token_execution_requires_worker();
+        let token_execution_mode = model.token_execution_mode();
         Self {
             model: Arc::new(Mutex::new(model)),
             adapter_support,
@@ -76,7 +76,7 @@ impl LlmExecutor {
             model_lock_wait_samples: AtomicU64::new(0),
             token_issuer: ferrum_execution::token_execution::ExecutorSequenceIssuer::new(),
             token_sequences: Arc::new(Mutex::new(token_execution::TokenSequences::default())),
-            token_worker_required,
+            token_execution_mode,
             token_worker: OnceLock::new(),
         }
     }
@@ -154,10 +154,14 @@ impl ModelExecutor for LlmExecutor {
         &self,
         work: &[ferrum_execution::token_execution::ExecutionWork<'_>],
     ) -> Result<ferrum_execution::token_execution::ExecutionBatchOutcome> {
-        if self.token_worker_required {
-            self.token_device_worker()?.execute(work).await
-        } else {
-            self.execute_token_batch(work)
+        match self.token_execution_mode {
+            ModelTokenExecutionMode::ManagedWorker => {
+                self.token_device_worker()?.execute(work).await
+            }
+            ModelTokenExecutionMode::InlineSynchronous => self.execute_token_batch(work),
+            ModelTokenExecutionMode::Unsupported => Err(FerrumError::unsupported(
+                "model/backend has not qualified token execution",
+            )),
         }
     }
 
@@ -166,10 +170,16 @@ impl ModelExecutor for LlmExecutor {
         sequence: &ferrum_execution::token_execution::ExecutorSequence,
         reason: ferrum_execution::token_execution::ExecutionEndReason,
     ) -> Result<ferrum_execution::token_execution::ExecutionCloseOutcome> {
-        if self.token_worker_required {
-            self.token_device_worker()?.close(sequence, reason)
-        } else {
-            self.close_token_incarnation(sequence, reason)
+        match self.token_execution_mode {
+            ModelTokenExecutionMode::ManagedWorker => {
+                self.token_device_worker()?.close(sequence, reason)
+            }
+            ModelTokenExecutionMode::InlineSynchronous => {
+                self.close_token_incarnation(sequence, reason)
+            }
+            ModelTokenExecutionMode::Unsupported => Err(FerrumError::unsupported(
+                "model/backend has not qualified token execution",
+            )),
         }
     }
 
@@ -178,10 +188,16 @@ impl ModelExecutor for LlmExecutor {
         sequence: &ferrum_execution::token_execution::ExecutorSequence,
     ) -> Result<ferrum_execution::token_execution::ExecutionCloseOutcome> {
         let reason = ferrum_execution::token_execution::ExecutionEndReason::Cancelled;
-        if self.token_worker_required {
-            self.token_device_worker()?.close(sequence, reason)
-        } else {
-            self.close_token_incarnation(sequence, reason)
+        match self.token_execution_mode {
+            ModelTokenExecutionMode::ManagedWorker => {
+                self.token_device_worker()?.close(sequence, reason)
+            }
+            ModelTokenExecutionMode::InlineSynchronous => {
+                self.close_token_incarnation(sequence, reason)
+            }
+            ModelTokenExecutionMode::Unsupported => Err(FerrumError::unsupported(
+                "model/backend has not qualified token execution",
+            )),
         }
     }
 

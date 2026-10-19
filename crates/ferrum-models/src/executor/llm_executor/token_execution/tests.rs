@@ -38,8 +38,8 @@ impl DecoderOnlyLLM for ObservedModel {
     fn config(&self) -> &LlmRuntimeConfig {
         &self.config
     }
-    fn supports_direct_token_execution(&self) -> bool {
-        true
+    fn token_execution_mode(&self) -> ModelTokenExecutionMode {
+        ModelTokenExecutionMode::InlineSynchronous
     }
     fn prepare_kv_capacity(&mut self, cache_id: &str, capacity_hint: usize) {
         let mut state = self.state.lock();

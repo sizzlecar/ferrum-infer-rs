@@ -45,7 +45,7 @@ pub(in crate::executor::llm_executor) struct TokenWorkerState {
 impl TokenWorkerState {
     pub(super) fn new(executor: &LlmExecutor) -> Result<Self> {
         let model = executor.lock_model();
-        if !model.supports_direct_token_execution() || !model.token_execution_requires_worker() {
+        if executor.token_execution_mode != ModelTokenExecutionMode::ManagedWorker {
             return Err(FerrumError::unsupported(
                 "model has not qualified managed token execution",
             ));

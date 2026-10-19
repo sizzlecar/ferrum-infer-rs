@@ -104,6 +104,89 @@ fn single_device_frame_restores_original_scratch_after_real_metal_forward_failur
     });
 }
 
+#[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
+#[test]
+#[ignore = "requires an actual Metal model and original host-only context"]
+fn metal_frame_failure_before_first_encode_restores_owner_and_full_numerical_execution() {
+    use ferrum_kernels::backend::{metal::MetalBackend, Backend};
+
+    let config = LlamaFamilyConfig {
+        hidden_size: 128,
+        intermediate_size: 256,
+        num_heads: 2,
+        num_kv_heads: 1,
+        head_dim: 64,
+        num_layers: 1,
+        vocab_size: 128,
+        max_seq_len: 32,
+        ..Default::default()
+    };
+    let loader = SyntheticLlamaLoader::new(config.clone());
+    let mut model = LlamaFamilyModel::<MetalBackend, KvFp16>::new(config.clone(), &loader).unwrap();
+    let mut reference = LlamaFamilyModel::<MetalBackend, KvFp16>::new(config, &loader).unwrap();
+    for current in [&mut model, &mut reference] {
+        current.runtime_env.metal_paged_kv = Some(false);
+        current.runtime_env.prefix_cache = false;
+        current.runtime_env.cuda_graph = false;
+        current.runtime_env.kv_capacity = Some(32);
+        current.ensure_scratch(3);
+    }
+    let original = model.scratch.residual.as_ref().unwrap().raw().contents();
+    let failed: DeviceFrameResult<()> = model.run_device_frame(|model, frame| {
+        frame
+            .take_scratch(&mut model.scratch, FrameLayout::Single, false)
+            .unwrap();
+        assert_eq!(frame.residual.as_ref().unwrap().raw().contents(), original);
+        assert!(model.scratch.residual.is_none());
+        // The real Metal context proves that no encoder, command, submission
+        // or terminal observation exists in this successfully begun invocation.
+        assert!(MetalBackend::preparation_is_host_only(&frame.context));
+        std::panic::panic_any(FerrumError::backend(
+            "injected failure before first Metal encode",
+        ));
+    });
+    let DeviceFrameResult::Terminal(Err(error)) = failed else {
+        panic!("a proven host-only failure must not leave a permanently Held model");
+    };
+    assert!(error
+        .to_string()
+        .contains("injected failure before first Metal encode"));
+    assert!(model.pending_device_frame.is_none());
+    assert_eq!(
+        model.scratch.residual.as_ref().unwrap().raw().contents(),
+        original
+    );
+    assert!(model.kv_caches.is_empty());
+    // Resource retirement of a failed host-only operation is not a certificate
+    // that a successful numerical operation or an empty checked sync completed.
+    assert!(MetalBackend::sync_checked(model.execution_context.as_mut().unwrap()).is_err());
+    assert!(matches!(
+        model.recover_token_frame(),
+        crate::common::llm::ModelExecutionRecovery::Quiescent { error: None }
+    ));
+
+    let expected_prefill = reference.prefill_internal("oracle", &[1, 2, 3]);
+    let actual_prefill = model.prefill_internal("continued", &[1, 2, 3]);
+    assert_eq!(actual_prefill.len(), 128);
+    assert!(actual_prefill.iter().all(|value| value.is_finite()));
+    assert_eq!(actual_prefill, expected_prefill);
+    let expected_decode = reference.decode_internal("oracle", 4, 3);
+    let actual_decode = model.decode_internal("continued", 4, 3);
+    assert_eq!(actual_decode.len(), 128);
+    assert!(actual_decode.iter().all(|value| value.is_finite()));
+    assert_eq!(actual_decode, expected_decode);
+    assert_eq!(model.cache_len("continued"), 4);
+    assert_eq!(
+        model.scratch.residual.as_ref().unwrap().raw().contents(),
+        original
+    );
+    model.release("continued");
+    reference.release("oracle");
+    model.close().unwrap();
+    reference.close().unwrap();
+    assert!(model.execution_context.is_none() && model.pending_device_frame.is_none());
+}
+
 #[cfg(feature = "cuda")]
 #[test]
 #[ignore = "requires an actual CUDA device"]

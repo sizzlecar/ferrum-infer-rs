@@ -7,7 +7,7 @@ use std::fs::{self, File};
 use std::io::Write;
 use std::net::TcpListener;
 use std::path::PathBuf;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
 #[derive(Clone, Copy, Debug)]
@@ -122,15 +122,20 @@ impl Process {
     }
 
     async fn wait(&mut self, timeout: Duration) -> Result<String> {
+        let status = self.wait_status(timeout).await?;
+        ensure!(
+            status.success(),
+            "child exited {status}; stderr: {}",
+            self.stderr.display()
+        );
+        fs::read_to_string(&self.stdout).context("read child UTF-8 stdout")
+    }
+
+    async fn wait_status(&mut self, timeout: Duration) -> Result<ExitStatus> {
         let started = Instant::now();
         loop {
             if let Some(status) = self.child.try_wait()? {
-                ensure!(
-                    status.success(),
-                    "child exited {status}; stderr: {}",
-                    self.stderr.display()
-                );
-                return fs::read_to_string(&self.stdout).context("read child UTF-8 stdout");
+                return Ok(status);
             }
             ensure!(
                 started.elapsed() < timeout,
@@ -141,10 +146,53 @@ impl Process {
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
     }
+
+    #[cfg(unix)]
+    async fn terminate_and_wait(&mut self, timeout: Duration) -> Result<Value> {
+        let mut evidence = json!({
+            "method": "SIGTERM", "child_pid": self.child.id(),
+            "signal_sent": false, "exit_code": null,
+            "stdout": self.stdout, "stderr": self.stderr,
+            "timeout_ms": timeout.as_millis()
+        });
+        let result = async {
+            if let Some(status) = self.child.try_wait()? {
+                evidence["exit_code"] = json!(status.code());
+                bail!("server exited before graceful shutdown was requested: {status}");
+            }
+            let pid = libc::pid_t::try_from(self.child.id()).context("child PID exceeds pid_t")?;
+            // The original child is still owned and unreaped. It cannot have
+            // its PID reused while this handle awaits its actual exit.
+            if unsafe { libc::kill(pid, libc::SIGTERM) } != 0 {
+                return Err(std::io::Error::last_os_error())
+                    .context("signal original server child");
+            }
+            evidence["signal_sent"] = json!(true);
+            let status = self.wait_status(timeout).await?;
+            evidence["exit_code"] = json!(status.code());
+            ensure!(
+                status.success(),
+                "server graceful shutdown exited {status}; stderr: {}",
+                self.stderr.display()
+            );
+            Ok(())
+        }
+        .await;
+        match result {
+            Ok(()) => Ok(evidence),
+            Err(error) => Err(super::case_failure(evidence, error)),
+        }
+    }
 }
 
 impl Drop for Process {
     fn drop(&mut self) {
+        if matches!(self.child.try_wait(), Ok(Some(_))) {
+            return;
+        }
+        // Failed setup, timed-out observation, and unsupported-platform
+        // cleanup keep the original child owner until it is reaped. This is
+        // not graceful-shutdown evidence.
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
@@ -211,6 +259,13 @@ pub(super) struct Server<'a> {
 }
 
 impl<'a> Server<'a> {
+    #[cfg(unix)]
+    pub async fn shutdown(mut self) -> Result<Value> {
+        self._process
+            .terminate_and_wait(Duration::from_secs(self.args.request_timeout_secs))
+            .await
+    }
+
     pub async fn start(args: &'a Args) -> Result<Self> {
         let listener = TcpListener::bind("127.0.0.1:0")?;
         let port = listener.local_addr()?.port();
@@ -405,6 +460,107 @@ impl<'a> Server<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn graceful_shutdown_observes_original_child_exit_and_preserves_failures() {
+        const PROBE: &str = "MODEL_REGRESSION_SHUTDOWN_PROBE";
+        const DIRECTORY: &str = "MODEL_REGRESSION_SHUTDOWN_DIRECTORY";
+        if let Ok(mode) = std::env::var(PROBE) {
+            let directory = PathBuf::from(std::env::var_os(DIRECTORY).unwrap());
+            let mut signal =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).unwrap();
+            fs::write(directory.join("ready"), b"ready").unwrap();
+            signal.recv().await.expect("receive original child SIGTERM");
+            fs::write(directory.join("received"), std::process::id().to_string()).unwrap();
+            match mode.as_str() {
+                "success" => std::process::exit(0),
+                "failure" => std::process::exit(17),
+                "timeout" => std::future::pending::<()>().await,
+                _ => panic!("unknown shutdown probe"),
+            }
+            unreachable!();
+        }
+
+        for mode in ["success", "failure", "timeout"] {
+            let directory = tempfile::tempdir().unwrap();
+            let stdout = directory.path().join("stdout");
+            let stderr = directory.path().join("stderr");
+            let child = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "process::tests::graceful_shutdown_observes_original_child_exit_and_preserves_failures",
+                ])
+                .env(PROBE, mode)
+                .env(DIRECTORY, directory.path())
+                .stdin(Stdio::null())
+                .stdout(File::create(&stdout).unwrap())
+                .stderr(File::create(&stderr).unwrap())
+                .spawn().unwrap();
+            let mut process = Process {
+                child,
+                stdout,
+                stderr,
+            };
+            let original_pid = process.child.id();
+            let started = Instant::now();
+            while !directory.path().join("ready").exists() {
+                assert!(
+                    process.child.try_wait().unwrap().is_none(),
+                    "probe exited before readiness"
+                );
+                assert!(
+                    started.elapsed() < Duration::from_secs(10),
+                    "probe readiness timeout"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            let timeout = if mode == "timeout" {
+                Duration::from_secs(1)
+            } else {
+                Duration::from_secs(10)
+            };
+            let result = process.terminate_and_wait(timeout).await;
+            let evidence = if mode == "success" {
+                let evidence = result.unwrap();
+                assert_eq!(evidence["exit_code"], 0);
+                assert!(process.child.try_wait().unwrap().unwrap().success());
+                evidence
+            } else {
+                let error = result.unwrap_err();
+                let failure = error.downcast_ref::<super::super::CaseFailure>().unwrap();
+                if mode == "failure" {
+                    assert_eq!(failure.evidence["exit_code"], 17);
+                    assert_eq!(process.child.try_wait().unwrap().unwrap().code(), Some(17));
+                } else {
+                    assert!(failure.evidence["exit_code"].is_null());
+                    assert!(process.child.try_wait().unwrap().is_none());
+                    assert!(error.to_string().contains("exceeded"));
+                }
+                failure.evidence.clone()
+            };
+            assert_eq!(evidence["child_pid"], original_pid);
+            assert_eq!(evidence["method"], "SIGTERM");
+            assert_eq!(evidence["signal_sent"], true);
+            // A zero-test subprocess must not count as a successful shutdown.
+            // The child itself acknowledges receipt of the real signal.
+            let received = directory.path().join("received");
+            let started = Instant::now();
+            while !received.exists() {
+                assert!(
+                    started.elapsed() < Duration::from_secs(10),
+                    "signal receipt timeout"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            assert_eq!(
+                fs::read_to_string(received).unwrap(),
+                original_pid.to_string()
+            );
+            // Timeout cleanup still belongs to Process::drop, not the report.
+            drop(process);
+        }
+    }
 
     #[test]
     fn default_backend_isolates_only_child_product_environment() {

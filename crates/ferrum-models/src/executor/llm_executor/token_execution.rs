@@ -97,12 +97,16 @@ impl LlmExecutor {
         &self,
         input: ExecutionAdmission<'_>,
     ) -> Result<TokenAdmissionOutcome> {
-        if self.token_worker_required {
-            self.token_device_worker()?
-                .admit(input, self.gen_cache_id())
-                .await
-        } else {
-            self.admit_token_sequence(input)
+        match self.token_execution_mode {
+            ModelTokenExecutionMode::ManagedWorker => {
+                self.token_device_worker()?
+                    .admit(input, self.gen_cache_id())
+                    .await
+            }
+            ModelTokenExecutionMode::InlineSynchronous => self.admit_token_sequence(input),
+            ModelTokenExecutionMode::Unsupported => Err(FerrumError::unsupported(
+                "model/backend has not qualified token execution",
+            )),
         }
     }
 
@@ -111,6 +115,11 @@ impl LlmExecutor {
         input: ExecutionAdmission<'_>,
     ) -> Result<TokenAdmissionOutcome> {
         input.validate()?;
+        if self.token_execution_mode != ModelTokenExecutionMode::InlineSynchronous {
+            return Err(FerrumError::unsupported(
+                "model/backend has not qualified synchronous token execution",
+            ));
+        }
         let mut sequences = self.token_sequences.lock();
         if sequences
             .live
@@ -122,11 +131,6 @@ impl LlmExecutor {
             ));
         }
         let mut model = self.lock_model();
-        if !model.supports_direct_token_execution() {
-            return Err(FerrumError::unsupported(
-                "model/backend has not implemented the direct token lifecycle",
-            ));
-        }
         let context = input.context;
         if context.maximum_sequence_tokens > model.kv_capacity()
             || context.maximum_sequence_tokens > u32::MAX as usize
@@ -518,6 +522,9 @@ mod tests;
 
 #[cfg(test)]
 mod managed_tests;
+
+#[cfg(test)]
+mod qualification_tests;
 
 mod device_state;
 pub(super) use device_state::TokenWorkerState;

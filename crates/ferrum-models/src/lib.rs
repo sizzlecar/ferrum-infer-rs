@@ -35,7 +35,7 @@ pub mod tokenizer;
 pub mod vnext;
 pub mod weight_format;
 
-pub use common::{DecoderOnlyLLM, LlmRuntimeConfig};
+pub use common::{DecoderOnlyLLM, LlmRuntimeConfig, ModelTokenExecutionMode};
 pub use definition::{ConfigManager, ModelDefinition};
 pub use executor::{LlmExecutor, StubModelExecutor};
 pub use hf_download::HfDownloader;

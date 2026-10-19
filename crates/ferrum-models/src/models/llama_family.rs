@@ -5342,12 +5342,22 @@ impl<B: MoeLlmBackend> DecoderOnlyLLM for LlamaFamilyModel<B, KvFp16> {
         &self.runtime_cfg
     }
 
-    fn supports_direct_token_execution(&self) -> bool {
-        B::host_execution_is_synchronous()
-    }
-
-    fn token_execution_requires_worker(&self) -> bool {
-        !B::host_execution_is_synchronous()
+    fn token_execution_mode(&self) -> crate::common::ModelTokenExecutionMode {
+        use crate::common::ModelTokenExecutionMode;
+        if B::host_execution_is_synchronous() {
+            ModelTokenExecutionMode::InlineSynchronous
+        } else if B::supports_retained_execution()
+            && self.layer_source_start == 0
+            && self.layer_source_end == self.cfg.num_layers
+            && self.embed.is_some()
+            && self.lm_head.is_some()
+        {
+            // Standalone token work requires the complete model. Backbone
+            // and layer-stage entry points have separate execution contracts.
+            ModelTokenExecutionMode::ManagedWorker
+        } else {
+            ModelTokenExecutionMode::Unsupported
+        }
     }
 
     fn execute_token_work(
@@ -5603,12 +5613,14 @@ impl<B: MoeLlmBackend + BackendInt8KvOps> DecoderOnlyLLM for LlamaFamilyModel<B,
         &self.runtime_cfg
     }
 
-    fn supports_direct_token_execution(&self) -> bool {
-        B::host_execution_is_synchronous()
-    }
-
-    fn token_execution_requires_worker(&self) -> bool {
-        !B::host_execution_is_synchronous()
+    fn token_execution_mode(&self) -> crate::common::ModelTokenExecutionMode {
+        use crate::common::ModelTokenExecutionMode;
+        // Device INT8 qualification is independent of the FP16 worker path.
+        if B::host_execution_is_synchronous() {
+            ModelTokenExecutionMode::InlineSynchronous
+        } else {
+            ModelTokenExecutionMode::Unsupported
+        }
     }
 
     fn execute_token_work(

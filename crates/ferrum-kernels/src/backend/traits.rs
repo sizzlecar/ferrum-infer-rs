@@ -115,6 +115,19 @@ pub trait Backend: Send + Sync + Sized + 'static {
         false
     }
 
+    /// Explicit qualification for a model retaining this backend's original
+    /// context across managed invocations. Completion must distinguish success,
+    /// terminal failure and unresolved lifetime for all submitted work. Failed
+    /// encoding must preserve its actual owners; recovery observes that same
+    /// context without replay, and checked retirement precedes resource release.
+    /// `begin_execution` must never replace or reset an unresolved owner.
+    ///
+    /// This capability does not qualify a model, KV format, or pipeline by
+    /// itself. Those implementations opt into their own managed lifecycle.
+    fn supports_retained_execution() -> bool {
+        false
+    }
+
     /// Observe completion on the actual execution context. Unsupported is not
     /// evidence of quiescence; callers must retain that context and its owners.
     fn try_sync(_ctx: &mut Self::Context) -> ferrum_types::Result<()> {
@@ -132,8 +145,10 @@ pub trait Backend: Send + Sync + Sized + 'static {
     }
 
     /// Prove that storage allocation and table initialization on this exact
-    /// context have performed only synchronous host work. This is restricted
-    /// to preparation; it does not certify a numerical operation or replace
+    /// context have performed only synchronous host work. In addition to
+    /// preparation, after successful `begin_execution` this may establish safe
+    /// resource retirement for a host error before the first device encoding.
+    /// It does not certify successful numerical execution or replace ordinary
     /// checked synchronization. Device allocators that enqueue initialization
     /// must return false, even when no numerical kernel was launched.
     fn preparation_is_host_only(_ctx: &Self::Context) -> bool {

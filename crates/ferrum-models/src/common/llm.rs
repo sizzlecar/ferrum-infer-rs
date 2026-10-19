@@ -15,7 +15,8 @@ mod token;
 pub(crate) use token::catch_host_execution;
 pub use token::{
     ModelExecutionRecovery, ModelKvPreparation, ModelKvReservation, ModelTokenBatchOutcome,
-    ModelTokenCloseOutcome, ModelTokenInput, ModelTokenOutcome, ModelTokenProduct, ModelTokenWork,
+    ModelTokenCloseOutcome, ModelTokenExecutionMode, ModelTokenInput, ModelTokenOutcome,
+    ModelTokenProduct, ModelTokenWork,
 };
 
 /// Runtime configuration every decoder-only LLM must expose.
@@ -51,18 +52,12 @@ pub trait DecoderOnlyLLM: Send + Sync {
     /// Runtime-facing configuration.
     fn config(&self) -> &LlmRuntimeConfig;
 
-    /// Whether this implementation provides the direct token lifecycle below.
-    /// This is an implementation contract, not a device-name inference. The
-    /// initial Llama implementation covers synchronous host execution; GPU
-    /// implementations must retain the actual submission context on failure.
-    fn supports_direct_token_execution(&self) -> bool {
-        false
-    }
-
-    /// Device work must run under the executor's independently owned service.
-    /// This is an implementation property, never inferred from a model name.
-    fn token_execution_requires_worker(&self) -> bool {
-        false
+    /// Qualified execution and closure for this configured implementation.
+    /// The executor snapshots this immutable declaration at construction.
+    /// Managed execution must retain the original context on failure; being
+    /// asynchronous alone does not establish that contract.
+    fn token_execution_mode(&self) -> ModelTokenExecutionMode {
+        ModelTokenExecutionMode::Unsupported
     }
 
     /// Execute borrowed tokens directly in the model's numerical core. A
@@ -115,14 +110,17 @@ pub trait DecoderOnlyLLM: Send + Sync {
     }
 
     fn recover_token_execution(&mut self) -> ModelExecutionRecovery {
-        if self.token_execution_requires_worker() {
-            ModelExecutionRecovery::Held {
-                error: ferrum_types::FerrumError::unsupported(
-                    "device model has not implemented context recovery",
-                ),
+        match self.token_execution_mode() {
+            ModelTokenExecutionMode::InlineSynchronous => {
+                ModelExecutionRecovery::Quiescent { error: None }
             }
-        } else {
-            ModelExecutionRecovery::Quiescent { error: None }
+            ModelTokenExecutionMode::Unsupported | ModelTokenExecutionMode::ManagedWorker => {
+                ModelExecutionRecovery::Held {
+                    error: ferrum_types::FerrumError::unsupported(
+                        "model has not implemented context recovery",
+                    ),
+                }
+            }
         }
     }
 

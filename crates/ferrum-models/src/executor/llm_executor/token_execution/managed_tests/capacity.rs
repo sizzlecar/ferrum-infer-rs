@@ -39,11 +39,12 @@ impl DecoderOnlyLLM for CapacityModel {
     fn config(&self) -> &LlmRuntimeConfig {
         &self.config
     }
-    fn supports_direct_token_execution(&self) -> bool {
-        true
-    }
-    fn token_execution_requires_worker(&self) -> bool {
-        self.worker
+    fn token_execution_mode(&self) -> ModelTokenExecutionMode {
+        if self.worker {
+            ModelTokenExecutionMode::ManagedWorker
+        } else {
+            ModelTokenExecutionMode::InlineSynchronous
+        }
     }
     fn prepare_token_kv(&mut self, request: ModelKvPreparation<'_>) -> Result<ModelKvReservation> {
         let reserved = self.storage.lock().prepare_token_kv(request)?;

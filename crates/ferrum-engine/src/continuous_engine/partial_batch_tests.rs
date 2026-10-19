@@ -105,8 +105,8 @@ impl DecoderOnlyLLM for ObservedLlama {
         self.state.lock().model.reserve_token_kv_slots(requests)
     }
 
-    fn supports_direct_token_execution(&self) -> bool {
-        self.state.lock().model.supports_direct_token_execution()
+    fn token_execution_mode(&self) -> ferrum_models::ModelTokenExecutionMode {
+        self.state.lock().model.token_execution_mode()
     }
 
     fn execute_token_work(

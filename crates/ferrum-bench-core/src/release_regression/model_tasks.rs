@@ -458,6 +458,24 @@ pub fn verify_model_report(expected: &ExpectedModelRun, report: &Value) -> Resul
     for check in &expected.checks {
         required.extend(check.cases().iter().copied());
     }
+    // Older reports remain inference evidence only. A runner must explicitly
+    // declare and prove this additional capability for shutdown qualification.
+    match report.get("serve_shutdown_verification") {
+        None => {}
+        Some(Value::String(mode)) if mode == "sigterm_exit_zero" => {
+            required.insert("serve-shutdown");
+        }
+        Some(Value::String(mode)) if mode == "unsupported" => {
+            require(
+                &mut errors,
+                report["serve_shutdown_limitation"]
+                    .as_str()
+                    .is_some_and(|reason| !reason.trim().is_empty()),
+                "unsupported serve shutdown verification requires an explicit limitation",
+            );
+        }
+        Some(_) => errors.push("unknown serve shutdown verification mode".into()),
+    }
     let Some(cases) = report["cases"].as_array() else {
         errors.push("model report is missing its cases array".into());
         return Err(errors);
@@ -499,6 +517,17 @@ pub fn verify_model_report(expected: &ExpectedModelRun, report: &Value) -> Resul
             &mut errors,
             recorded.contains_key(name),
             format!("missing required model case {name}"),
+        );
+    }
+    if let Some(case) = recorded.get("serve-shutdown") {
+        let evidence = &case["evidence"];
+        require(
+            &mut errors,
+            evidence["method"] == "SIGTERM"
+                && evidence["child_pid"].as_u64().is_some_and(|pid| pid > 0)
+                && evidence["signal_sent"].as_bool() == Some(true)
+                && evidence["exit_code"].as_i64() == Some(0),
+            "serve-shutdown must observe SIGTERM delivery to the original child and exit zero",
         );
     }
     for name in [

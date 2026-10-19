@@ -63,13 +63,10 @@ impl<B: MoeLlmBackend> DecoderOnlyLLM for ManagedModel<B> {
     fn config(&self) -> &LlmRuntimeConfig {
         &self.config
     }
-    // This test-only wrapper exercises qualification before changing the
-    // production device capability. It delegates every numerical operation.
-    fn supports_direct_token_execution(&self) -> bool {
-        true
-    }
-    fn token_execution_requires_worker(&self) -> bool {
-        true
+    // Force the worker only for these queue/fault-injection tests, including
+    // CPU. Unwrapped production qualification is tested separately.
+    fn token_execution_mode(&self) -> ModelTokenExecutionMode {
+        ModelTokenExecutionMode::ManagedWorker
     }
     fn kv_capacity(&self) -> usize {
         self.model.lock().kv_capacity()

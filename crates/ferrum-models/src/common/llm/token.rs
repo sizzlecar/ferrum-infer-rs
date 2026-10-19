@@ -2,6 +2,19 @@
 
 use ferrum_types::{FerrumError, Result};
 
+/// The configured model's qualified token lifecycle. This is immutable for
+/// the lifetime of an executor; device type alone does not grant a mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ModelTokenExecutionMode {
+    #[default]
+    Unsupported,
+    /// Every operation is synchronous, including failed execution and close.
+    InlineSynchronous,
+    /// The executor's worker retains the actual model and submission context
+    /// until checked completion and cache retirement, independently of callers.
+    ManagedWorker,
+}
+
 /// Immutable preparation inputs for the incarnation's actual model owner.
 /// The executor preloads the adapter; preparation must bind it before looking
 /// up reusable prompt storage. Retaining storage does not consume the prompt.

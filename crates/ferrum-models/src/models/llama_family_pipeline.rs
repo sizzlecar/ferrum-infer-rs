@@ -844,8 +844,15 @@ where
         &self.runtime_cfg
     }
 
-    fn supports_direct_token_execution(&self) -> bool {
-        B::host_execution_is_synchronous()
+    fn token_execution_mode(&self) -> crate::common::ModelTokenExecutionMode {
+        use crate::common::ModelTokenExecutionMode;
+        // A device stage's retained context does not qualify a pipeline's
+        // aggregate submission and recovery lifecycle.
+        if B::host_execution_is_synchronous() {
+            ModelTokenExecutionMode::InlineSynchronous
+        } else {
+            ModelTokenExecutionMode::Unsupported
+        }
     }
 
     fn execute_token_work(

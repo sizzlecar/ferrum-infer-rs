@@ -49,7 +49,9 @@ MoE API 迁移：移除旧 `Qwen3MoeModel`、`Qwen3MoeConfig`、`Qwen3MoeLayer` 
 
 Metal 映射 API：`register_gguf_mmap` 接收 `RetainedHostMemoryRegion`，不再接受独立 slice 与任意 keeper。零拷贝 buffer 的原生释放回调持有真实内存所有者，覆盖 Rust 权重提前释放及原生 buffer 克隆；residency 独立持有，避免引用环。量化加载与原生静态权重导入共享范围检查和构造器；整页范围不能证明时复制对应 tensor，尾部 tensor 的额外内存及默认性能仍须验收。
 
-产品资格缺口：真实 Metal Llama GGUF 已能加载，但统一 worker 被模型现有的 CPU-only 能力声明拒绝。须补齐明确的 GPU 执行资格及原模型的 `run` / `serve` 验证；包装模型的内核/故障测试不能代替产品入口验收。
+模型执行资格改为 `ModelTokenExecutionMode::{Unsupported, InlineSynchronous, ManagedWorker}`，替代两个可矛盾的布尔值；执行器在构建时保存声明，准入、执行和关闭使用同一模式。后端单独声明保留原上下文的生命周期能力，不感知 token 业务。本次仅开放完整 Metal Llama FP16 KV 模型，CUDA legacy、设备 INT8 与 GPU pipeline 仍待各自验证。
+
+Metal 同步失败会阻止后续编码和宿主访问；未决工作保留原提交，只有显式开始下一次执行才清除已终结的错误。直接模型的完整输出、取消及失败恢复验证通过；真实 Llama-3.1-8B Q4_K_M 的三轮 `run`、五次 HTTP/SSE 请求和服务正常退出通过。该结果不替代默认性能与其余模型/格式验收。
 
 配置 API 迁移：移除 `install_runtime_snapshot` / `active_runtime_snapshot`。Engine 在加载权重前固定 `LlamaExecutionConfig`，显式传入普通模型、GGUF 与 layer stage；库调用使用 `*_with_execution_config`，原构造器使用固定默认值。GPTQ loader 诊断通过 `NativeSafetensorsLoadOptions` 传入。batched graph / prefix 的布尔值统一按 Engine 语义解释，修正旧模型对 `true` / `false` 的不同解释；默认值与 `0/1` 行为保留。CLI 配置来源保留，模型专属选项不再写回进程环境；仍有真实消费者的后端配置桥随 GPU 所有权迁移退出，本片不代表全部运行状态已隔离。
 

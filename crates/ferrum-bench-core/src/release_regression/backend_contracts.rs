@@ -33,6 +33,13 @@ fn model_frame_tests(backend: Backend) -> Vec<ContractTest> {
     ];
     if backend == Backend::Metal {
         tests.push("models::llama_family::device_execution::preparation_tests::preparation_frame_real_metal_pending_context_blocks_allocation".into());
+        tests.push("models::llama_family::device_execution::tests::metal_frame_failure_before_first_encode_restores_owner_and_full_numerical_execution".into());
+        tests.extend([
+            "qualification_unwrapped_metal_completes_and_rejects_invalid_close_without_losing_progress",
+            "qualification_unwrapped_metal_cancelled_delivery_closes_original_and_keeps_peer_usable",
+            "encoded_failure::qualification_unwrapped_metal_encoded_failure_retires_once_and_peer_matches_cpu",
+            "qualification_unwrapped_metal_backbone_and_partial_stage_remain_unsupported",
+        ].into_iter().map(|test| format!("executor::llm_executor::token_execution::qualification_tests::{test}")));
     }
     if backend != Backend::Cpu {
         tests.extend([
@@ -157,6 +164,20 @@ pub fn contract_groups(backend: Backend) -> Vec<ContractGroup> {
     if backend != Backend::Cpu {
         let mut tests = model_frame_tests(backend);
         if backend == Backend::Metal {
+            tests.extend(
+                [
+                    "metal_injected_failure_blocks_host_access_and_encoding_until_explicit_begin",
+                    "metal_injected_unresolved_observation_preserves_submission_and_blocks_host_access",
+                    "metal_host_synchronization_preserves_full_outputs_and_successful_continuation",
+                ]
+                .into_iter()
+                .map(|name| ContractTest {
+                    package: "ferrum-kernels".into(),
+                    target: "ferrum_kernels".into(),
+                    kind: "lib".into(),
+                    name: format!("backend::metal::host_access_tests::{name}"),
+                }),
+            );
             tests.extend(
                 [
                     "metal_no_copy_quant_weights_survive_drop_before_commit",

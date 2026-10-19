@@ -36,8 +36,8 @@ impl DecoderOnlyLLM for ObservedModel {
     fn config(&self) -> &LlmRuntimeConfig {
         &self.config
     }
-    fn supports_direct_token_execution(&self) -> bool {
-        true
+    fn token_execution_mode(&self) -> ferrum_models::ModelTokenExecutionMode {
+        ferrum_models::ModelTokenExecutionMode::InlineSynchronous
     }
     fn prepare_token_kv(&mut self, request: ModelKvPreparation<'_>) -> Result<ModelKvReservation> {
         self.state.lock().model.prepare_token_kv(request)

@@ -71,11 +71,12 @@ impl DecoderOnlyLLM for RecordingLlm {
     fn config(&self) -> &crate::common::LlmRuntimeConfig {
         &self.config
     }
-    fn supports_direct_token_execution(&self) -> bool {
-        true
-    }
-    fn token_execution_requires_worker(&self) -> bool {
-        self.worker
+    fn token_execution_mode(&self) -> ModelTokenExecutionMode {
+        if self.worker {
+            ModelTokenExecutionMode::ManagedWorker
+        } else {
+            ModelTokenExecutionMode::InlineSynchronous
+        }
     }
     fn recover_token_execution(&mut self) -> ModelExecutionRecovery {
         ModelExecutionRecovery::Quiescent { error: None }

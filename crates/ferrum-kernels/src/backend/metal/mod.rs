@@ -42,6 +42,8 @@ pub mod vnext_runtime;
 #[cfg(test)]
 mod copy_slice_tests;
 #[cfg(test)]
+mod host_access_tests;
+#[cfg(test)]
 mod instance_config_tests;
 #[cfg(test)]
 mod mmap_lifetime_tests;
@@ -350,6 +352,8 @@ pub struct MetalContext {
     // command buffer; it must not commit a replacement or forget its status.
     submitted: Option<metal::CommandBuffer>,
     last_completion: Option<ObservedMetalCommand>,
+    #[cfg(test)]
+    completion_observation_override: Option<ObservedMetalCommand>,
 }
 
 struct ObservedMetalCommand {
@@ -359,11 +363,28 @@ struct ObservedMetalCommand {
 }
 
 impl MetalContext {
+    /// Permit ordinary unsubmitted encoding/preparation, but never reuse an
+    /// unresolved submission or forget a terminal failure from this invocation.
+    fn require_reusable_state(&self) -> Result<()> {
+        if self.submitted.is_some() {
+            return Err(FerrumError::backend(
+                "Metal context has an unresolved submission",
+            ));
+        }
+        if let Some(observed) = &self.last_completion {
+            classify_command_buffer_completion(
+                observed.status,
+                observed.code,
+                observed.detail.as_deref(),
+            )
+            .into_result()?;
+        }
+        Ok(())
+    }
+
     fn cmd(&mut self) -> &metal::CommandBufferRef {
-        assert!(
-            self.submitted.is_none(),
-            "Metal context has an unresolved submission"
-        );
+        self.require_reusable_state()
+            .unwrap_or_else(|error| std::panic::panic_any(error));
         if self.cmd.is_none() {
             self.last_completion = None;
             self.cmd = Some(st().pipes.queue.new_command_buffer().to_owned());
@@ -398,13 +419,14 @@ impl MetalContext {
         Some(cmd)
     }
 
-    pub(crate) fn flush(&mut self) {
-        // Ordinary sync historically permits an empty no-op. A submitted
-        // command remains owned if the backend cannot establish its terminal
-        // state; no later encode may silently reuse this context.
-        if self.cmd.is_some() || self.submitted.is_some() {
-            let _ = self.observe_completion();
+    fn synchronize_for_host_access(&mut self) -> Result<()> {
+        // Preserve the pristine empty no-op, not a prior failed observation.
+        // A retry may prove an unresolved submission terminal; until then its
+        // shared buffers cannot be accessed by the host.
+        if MetalBackend::preparation_is_host_only(self) {
+            return Ok(());
         }
+        self.observe_completion().into_result()
     }
 
     fn observe_completion(&mut self) -> crate::backend::BackendCompletion {
@@ -428,6 +450,14 @@ impl MetalContext {
         } else {
             command_buffer_error(cmd)
         };
+        // Test-only observation fault, after a real native wait. It does not
+        // manufacture a GPU failure or change the command's native status.
+        #[cfg(test)]
+        let (status, code, detail) = self
+            .completion_observation_override
+            .take()
+            .map(|observed| (observed.status, observed.code, observed.detail))
+            .unwrap_or((status, code, detail));
         let completion = classify_command_buffer_completion(status, code, detail.as_deref());
         if completion.is_terminal() {
             self.last_completion = Some(ObservedMetalCommand {
@@ -605,6 +635,7 @@ mod checked_sync_tests {
             encoder: None,
             submitted: None,
             last_completion: None,
+            completion_observation_override: None,
         };
         let error = MetalBackend::sync_checked(&mut ctx).unwrap_err();
         assert!(error.to_string().contains("no pending command buffer"));
@@ -617,7 +648,14 @@ mod checked_sync_tests {
 
 impl Drop for MetalContext {
     fn drop(&mut self) {
-        self.flush();
+        // Destruction must not reuse the throwing host-access path, especially
+        // during an encoding unwind. Model retirement owns the decision to
+        // release a whole model; this only observes the original native work.
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            if self.cmd.is_some() || self.submitted.is_some() {
+                let _ = self.observe_completion();
+            }
+        }));
     }
 }
 
@@ -701,14 +739,22 @@ impl Backend for MetalBackend {
             encoder: None,
             submitted: None,
             last_completion: None,
+            #[cfg(test)]
+            completion_observation_override: None,
         })
     }
 
     fn context_config(ctx: &Self::Context) -> &BackendContextConfig {
         &ctx.config
     }
+
+    fn supports_retained_execution() -> bool {
+        true
+    }
+
     fn sync(ctx: &mut Self::Context) {
-        ctx.flush();
+        ctx.synchronize_for_host_access()
+            .unwrap_or_else(|error| std::panic::panic_any(error));
     }
 
     fn begin_execution(ctx: &mut Self::Context) -> Result<()> {
@@ -781,10 +827,12 @@ impl Backend for MetalBackend {
     /// Silicon means CPU writes the buffer's contents pointer
     /// directly — no blit encoder.
     fn write_typed<T: crate::backend::HostDtype>(
-        _ctx: &mut Self::Context,
+        ctx: &mut Self::Context,
         buf: &mut Self::Buffer,
         data: &[T],
     ) {
+        ctx.require_reusable_state()
+            .unwrap_or_else(|error| std::panic::panic_any(error));
         debug_assert_eq!(
             buf.dtype,
             T::DTYPE,
@@ -997,7 +1045,8 @@ impl Backend for MetalBackend {
         // CPU-side gather into the f32 activation output. `ids.len()` is
         // small (one per batch item); flush any pending GPU work first.
         let out = out.expect_f32_mut("embedding_lookup out");
-        ctx.flush();
+        ctx.synchronize_for_host_access()
+            .unwrap_or_else(|error| std::panic::panic_any(error));
         unsafe {
             let o = std::slice::from_raw_parts_mut(out.contents() as *mut f32, ids.len() * dim);
             match table.dtype {
@@ -1351,13 +1400,21 @@ impl Backend for MetalBackend {
         }
     }
 
+    fn to_vec_in_context(ctx: &mut Self::Context, buf: &Self::Buffer, len: usize) -> Vec<f32> {
+        ctx.require_reusable_state()
+            .unwrap_or_else(|error| std::panic::panic_any(error));
+        Self::to_vec(buf, len)
+    }
+
     fn argmax_rows_f16(
         ctx: &mut Self::Context,
         logits: &Self::Buffer,
         m: usize,
         n: usize,
     ) -> Result<Vec<u32>> {
+        ctx.require_reusable_state()?;
         if !matches!(logits.dtype, Dtype::F32) {
+            ctx.synchronize_for_host_access()?;
             let host = Self::to_vec(logits, m * n);
             let mut out = Vec::with_capacity(m);
             for row in 0..m {
@@ -1395,7 +1452,7 @@ impl Backend for MetalBackend {
             &params as *const _ as *const c_void,
         );
         enc.dispatch_thread_groups(MTLSize::new(1, m as u64, 1), MTLSize::new(256, 1, 1));
-        ctx.flush();
+        ctx.synchronize_for_host_access()?;
         let ptr = out.contents() as *const u32;
         let tokens = unsafe { std::slice::from_raw_parts(ptr, m).to_vec() };
         Ok(tokens)

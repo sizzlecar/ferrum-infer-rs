@@ -36,8 +36,8 @@ impl DecoderOnlyLLM for ObservedLlama {
         &self.config
     }
 
-    fn supports_direct_token_execution(&self) -> bool {
-        self.state.lock().model.supports_direct_token_execution()
+    fn token_execution_mode(&self) -> crate::common::ModelTokenExecutionMode {
+        self.state.lock().model.token_execution_mode()
     }
 
     fn adapter_execution_support(&self) -> AdapterExecutionSupport {
