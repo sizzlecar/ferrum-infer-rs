@@ -406,6 +406,18 @@ fn cuda_vs_cpu() {
     <CudaBackend as Backend>::sync(&mut cuda_ctx);
     let cuda_out = CudaBackend::to_vec_in_context(&mut cuda_ctx, &out_dev, m * n);
 
+    // f32::max ignores a NaN operand, so the error reduction alone cannot
+    // establish that every output element is valid.
+    for (label, values) in [("CPU", &cpu_out), ("CUDA", &cuda_out)] {
+        assert_eq!(values.len(), m * n, "{label} GPTQ output is incomplete");
+        for (index, value) in values.iter().enumerate() {
+            assert!(
+                value.is_finite(),
+                "{label} GPTQ output[{index}] is nonfinite: {value}"
+            );
+        }
+    }
+
     // Marlin is fp16-accum. CPU fp32. Expect modest drift.
     let max_diff = cpu_out
         .iter()
