@@ -2486,17 +2486,11 @@ pub(crate) mod tests {
     }
 
     fn unique_test_dir(name: &str) -> PathBuf {
-        let mut dir = std::env::temp_dir();
-        dir.push(format!(
-            "ferrum-{name}-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+        tempfile::Builder::new()
+            .prefix(&format!("ferrum-{name}-"))
+            .tempdir()
+            .unwrap()
+            .keep()
     }
 
     #[test]
