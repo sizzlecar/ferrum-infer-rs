@@ -101,6 +101,8 @@ fn bench_paged_decode_attn() {
             BLOCK_SIZE,
             MAX_BLOCKS_PER_SEQ,
             1, // q_len = 1
+            0, // full causal attention
+            None,
         )
         .unwrap();
     }
@@ -124,6 +126,8 @@ fn bench_paged_decode_attn() {
             BLOCK_SIZE,
             MAX_BLOCKS_PER_SEQ,
             1,
+            0, // full causal attention
+            None,
         )
         .unwrap();
     }

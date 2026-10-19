@@ -16,6 +16,99 @@
 
 use ferrum_kernels::backend::{cuda::CudaBackend, AttnConfig, Backend};
 
+/// Zero Q/K gives uniform weights, so every output has an independent exact
+/// arithmetic-mean oracle. Cover initial and offset prefill, query tile tails,
+/// GQA, padded KV stride, and a window that excludes a complete 32-position tile.
+#[test]
+fn flash_attn_prefill_window_matches_exact_visible_value_mean() {
+    let batch = 2;
+    let heads = 4;
+    let kv_heads = 2;
+    let head_dim = 16;
+    let capacity = 64;
+    for (q_len, position, causal, window) in [
+        (5, 0, true, 0),
+        (5, 0, true, 1),
+        (5, 0, true, 2),
+        (17, 40, true, 0),
+        (17, 40, true, 1),
+        (17, 40, true, 2),
+        (17, 40, false, 2),
+    ] {
+        let kv_len = position + q_len;
+        let mut ctx =
+            CudaBackend::new_context(&ferrum_types::BackendContextConfig::default()).unwrap();
+        let q = vec![0.0; batch * heads * q_len * head_dim];
+        let k = vec![0.0; batch * kv_heads * capacity * head_dim];
+        let mut v = vec![0.0; k.len()];
+        for item in 0..batch {
+            for head in 0..kv_heads {
+                for token in 0..capacity {
+                    for dim in 0..head_dim {
+                        let offset = ((item * kv_heads + head) * capacity + token) * head_dim + dim;
+                        // Exactly representable half values and means; excluded
+                        // prefix/future/padded rows all carry distinguishable values.
+                        v[offset] = (item * 100 + head * 40 + token * 2 + dim) as f32 / 128.0;
+                    }
+                }
+            }
+        }
+        let q_device = CudaBackend::from_slice_in_context(&mut ctx, &q);
+        let k_device = CudaBackend::from_slice_in_context(&mut ctx, &k);
+        let v_device = CudaBackend::from_slice_in_context(&mut ctx, &v);
+        let mut out_device = CudaBackend::alloc_in_context(&mut ctx, q.len());
+        let config = AttnConfig {
+            num_heads: heads,
+            num_kv_heads: kv_heads,
+            head_dim,
+            causal,
+            scale: 0.25,
+            kv_seq_stride: capacity,
+            sliding_window: window,
+        };
+        CudaBackend::flash_attention(
+            &mut ctx,
+            &q_device,
+            &k_device,
+            &v_device,
+            &mut out_device,
+            batch,
+            q_len,
+            kv_len,
+            position,
+            &config,
+        );
+        CudaBackend::try_sync(&mut ctx).unwrap();
+        let actual = CudaBackend::to_vec_in_context(&mut ctx, &out_device, q.len());
+        CudaBackend::retire_context(&mut ctx).unwrap();
+        assert_eq!(actual.len(), q.len());
+        for item in 0..batch {
+            for head in 0..heads {
+                let kv_head = head / (heads / kv_heads);
+                for query in 0..q_len {
+                    let end = if causal { position + query + 1 } else { kv_len };
+                    let start = if causal && window > 0 {
+                        end.saturating_sub(window)
+                    } else {
+                        0
+                    };
+                    for dim in 0..head_dim {
+                        // Mean of V[first..end] for the arithmetic progression:
+                        // 2 * mean(token) == first + (end - 1).
+                        let mean =
+                            (item * 100 + kv_head * 40 + start + end - 1 + dim) as f64 / 128.0;
+                        let expected = half::f16::from_f64(mean).to_f32();
+                        let offset = ((item * heads + head) * q_len + query) * head_dim + dim;
+                        assert!(actual[offset].is_finite());
+                        assert_eq!(actual[offset], expected,
+                            "q_len={q_len}, position={position}, causal={causal}, window={window}, item={item}, head={head}, query={query}, dim={dim}");
+                    }
+                }
+            }
+        }
+    }
+}
+
 const M: usize = 2;
 const NH: usize = 32;
 const NKV: usize = 8;

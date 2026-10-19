@@ -322,18 +322,25 @@ fn paged_kv_allowed_for_layer_schedule(
     paged_enabled: bool,
     backend_supports_varlen_qkv: bool,
     sliding_window_pattern: usize,
+    requires_window: bool,
+    backend_supports_window: bool,
 ) -> bool {
-    paged_enabled && (sliding_window_pattern == 0 || backend_supports_varlen_qkv)
+    paged_enabled
+        && (sliding_window_pattern == 0 || backend_supports_varlen_qkv)
+        && (!requires_window || backend_supports_window)
 }
 
 fn selected_llama_kv_cache_layout<B: BackendPagedKv>(
     requested_paged: Option<bool>,
     sliding_window_pattern: usize,
+    requires_window: bool,
 ) -> SelectedKvCacheLayout {
     if paged_kv_allowed_for_layer_schedule(
         requested_paged.unwrap_or_else(B::supports_paged_kv),
         B::supports_varlen_qkv(),
         sliding_window_pattern,
+        requires_window,
+        B::supports_windowed_paged_attention(),
     ) {
         SelectedKvCacheLayout::Paged {
             block_size_tokens: LLAMA_PAGED_BLOCK_SIZE,
@@ -341,6 +348,30 @@ fn selected_llama_kv_cache_layout<B: BackendPagedKv>(
     } else {
         SelectedKvCacheLayout::Contiguous
     }
+}
+
+/// The same original configuration chooses and validates allocation at cold
+/// construction and preparation. Dtype capability cannot be borrowed from FP16.
+fn selected_llama_kv_layout_for_dtype<B: BackendPagedKv, K: KvLayer<B>>(
+    cfg: &LlamaFamilyConfig,
+    requested_paged: Option<bool>,
+    source_layers: Range<usize>,
+) -> Result<SelectedKvCacheLayout> {
+    let requires_window = cfg.requires_windowed_attention(source_layers);
+    let mut layout = selected_llama_kv_cache_layout::<B>(
+        requested_paged,
+        cfg.sliding_window_pattern,
+        requires_window,
+    );
+    if requires_window && !K::supports_windowed_paged_attention() {
+        layout = SelectedKvCacheLayout::Contiguous;
+    }
+    if matches!(layout, SelectedKvCacheLayout::Contiguous) && !K::supports_contiguous() {
+        return Err(ferrum_types::FerrumError::unsupported(
+            "requested layer attention requires a contiguous or windowed paged KV implementation supported by this backend and KV dtype",
+        ));
+    }
+    Ok(layout)
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -464,7 +495,18 @@ impl LlamaFamilyConfig {
         &self,
         options: &LlamaExecutionOptions,
     ) -> SelectedKvCacheLayout {
-        selected_llama_kv_cache_layout::<B>(options.metal_paged_kv, self.sliding_window_pattern)
+        selected_llama_kv_cache_layout::<B>(
+            options.metal_paged_kv,
+            self.sliding_window_pattern,
+            self.requires_windowed_attention(0..self.num_layers),
+        )
+    }
+
+    pub(crate) fn requires_windowed_attention(&self, source_layers: Range<usize>) -> bool {
+        self.sliding_window > 0
+            && source_layers
+                .into_iter()
+                .any(|li| llama_layer_attention_schedule(self, li).sliding_window > 0)
     }
 
     pub fn to_runtime(&self) -> LlmRuntimeConfig {
@@ -1660,7 +1702,7 @@ impl<B: QuantLlmBackend + BackendMoeFused> LlamaFamilyScratch<B> {
         true
     }
 
-    pub(crate) fn ensure_paged_decode_graph_metadata(&mut self, ctx: &mut B::Context) {
+    pub(crate) fn ensure_paged_decode_metadata(&mut self, ctx: &mut B::Context) {
         if self.paged_batch_cu_seqlens.is_none() {
             self.paged_batch_cu_seqlens = Some(alloc_model_typed_buffer::<B>(
                 ctx,
@@ -1841,7 +1883,10 @@ pub struct LlamaFamilyModel<B: MoeLlmBackend, K: KvLayer<B> = KvFp16> {
     /// graph instead of thrashing a single slot.
     pub(crate) unified_graph_warmup: usize,
     pub(crate) unified_graph_failed: bool,
-    pub(crate) unified_graph_keys_seen: std::collections::HashSet<u64>,
+    pub(crate) unified_graph_keys_seen:
+        std::collections::HashMap<super::llama_family_forward_batched::UnifiedGraphShape, u64>,
+    /// Monotonic IDs in the high-bit namespace, never a hash authorization.
+    pub(crate) unified_graph_next_key: u64,
 
     // ── Real paged-KV prefix cache counters ─────────────────────────────
     prefix_cache_hits: u64,
@@ -1942,8 +1987,8 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         stage: LlamaFamilyLayerStageConfig,
         execution: LlamaExecutionConfig,
     ) -> Result<Self> {
-        execution
-            .validate()
+        let execution = execution
+            .normalized()
             .map_err(ferrum_types::FerrumError::config)?;
         let runtime_env = LlamaFamilyRuntimeEnv::from_execution_config(&execution);
         let batched_cfg =
@@ -1962,6 +2007,14 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
                 stage.source_layers.start, stage.source_layers.end, cfg.num_layers
             )));
         }
+
+        // Reject an unsupported dtype/layout before creating a device context
+        // or loading any weights. Preparation uses this same original policy.
+        selected_llama_kv_layout_for_dtype::<B, K>(
+            &cfg,
+            execution.options.metal_paged_kv,
+            stage.source_layers.clone(),
+        )?;
 
         let graphs_requested = execution.options.cuda_graph
             || execution.options.unified_graph
@@ -2124,7 +2177,8 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
             batched_pointers_for: None,
             unified_graph_warmup: 0,
             unified_graph_failed: false,
-            unified_graph_keys_seen: std::collections::HashSet::new(),
+            unified_graph_keys_seen: std::collections::HashMap::new(),
+            unified_graph_next_key: 0,
             prefix_cache_hits: 0,
             prefix_cache_misses: 0,
             prefix_cache_saved_prefill_tokens: 0,
@@ -2323,10 +2377,12 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         // Windowed Gemma3 can use paged KV only on backends whose varlen QKV
         // path takes the per-layer sliding-window schedule.
         let paged = matches!(
-            selected_llama_kv_cache_layout::<B>(
+            selected_llama_kv_layout_for_dtype::<B, K>(
+                &self.cfg,
                 runtime_env.metal_paged_kv,
-                self.cfg.sliding_window_pattern,
-            ),
+                self.source_layer_range(),
+            )
+            .expect("original KV layout validated at construction"),
             SelectedKvCacheLayout::Paged { .. }
         );
         // Paged KV uses a vLLM-style global physical block pool. `kv_capacity`
@@ -3353,6 +3409,7 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
                 hd,
                 new_len,
                 tokens,
+                layer_window,
             )
             .expect("K::paged_decode_attention");
 
@@ -5904,6 +5961,8 @@ mod prefix_cache_tests;
 mod graph_contract_tests;
 #[cfg(test)]
 mod instance_config_tests;
+#[cfg(test)]
+mod paged_window_tests;
 
 #[cfg(test)]
 mod tests {
@@ -6129,11 +6188,21 @@ mod tests {
 
     #[test]
     fn paged_kv_layer_schedule_allows_windowed_models_with_varlen_backend() {
-        assert!(paged_kv_allowed_for_layer_schedule(true, false, 0));
-        assert!(paged_kv_allowed_for_layer_schedule(true, true, 0));
-        assert!(!paged_kv_allowed_for_layer_schedule(true, false, 6));
-        assert!(paged_kv_allowed_for_layer_schedule(true, true, 6));
-        assert!(!paged_kv_allowed_for_layer_schedule(false, true, 6));
+        assert!(paged_kv_allowed_for_layer_schedule(
+            true, false, 0, false, false
+        ));
+        assert!(paged_kv_allowed_for_layer_schedule(
+            true, true, 0, false, false
+        ));
+        assert!(!paged_kv_allowed_for_layer_schedule(
+            true, false, 6, false, false
+        ));
+        assert!(paged_kv_allowed_for_layer_schedule(
+            true, true, 6, false, false
+        ));
+        assert!(!paged_kv_allowed_for_layer_schedule(
+            false, true, 6, false, false
+        ));
     }
 
     #[test]

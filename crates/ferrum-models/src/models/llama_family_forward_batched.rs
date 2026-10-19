@@ -84,14 +84,31 @@ pub(crate) struct LlamaBatchedRuntimeConfig {
     unified_graph_lm_head_eager: bool,
     batched_graph: bool,
     greedy_argmax: bool,
-    split_k_attn: Option<bool>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum UnifiedGraphCaptureScope {
     LayersOnly,
     LmHeadEager,
     Full,
+}
+
+/// Equality checks every captured host decision; hashes only index the map.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct UnifiedGraphShape {
+    scope: UnifiedGraphCaptureScope,
+    rows: usize,
+    sequences: usize,
+    attention: ferrum_kernels::backend::PagedAttentionLaunchGeometry,
+    final_indices: Vec<(usize, usize)>,
+}
+
+fn next_unified_graph_key(counter: u64) -> u64 {
+    assert!(
+        counter < (1u64 << 63),
+        "unified graph native ID space exhausted"
+    );
+    (1u64 << 63) | counter
 }
 
 impl UnifiedGraphCaptureScope {
@@ -217,7 +234,6 @@ impl LlamaBatchedRuntimeConfig {
             unified_graph_lm_head_eager: config.options.unified_graph_lm_head_eager,
             batched_graph: config.batched_graph,
             greedy_argmax: config.options.greedy_argmax,
-            split_k_attn: config.options.split_k_attn,
         }
     }
 }
@@ -765,7 +781,6 @@ mod tests {
         assert!(config.unified_graph_lm_head_eager);
         assert!(config.batched_graph);
         assert!(config.greedy_argmax);
-        assert_eq!(config.split_k_attn, Some(true));
     }
 
     #[test]
@@ -783,7 +798,6 @@ mod tests {
         assert!(!config.unified_graph_lm_head_eager);
         assert!(!config.batched_graph);
         assert!(!config.greedy_argmax);
-        assert_eq!(config.split_k_attn, None);
     }
 
     #[test]
@@ -834,6 +848,92 @@ mod tests {
             next_batched_decode_graph_key(1)
         );
         assert_eq!(next_batched_decode_graph_key(64) >> 63, 0);
+    }
+
+    #[test]
+    fn unified_graph_shapes_preserve_complete_capture_identity() {
+        use super::{
+            next_unified_graph_key, UnifiedGraphCaptureScope, UnifiedGraphShape,
+            SINGLE_ITEM_GRAPH_KEY,
+        };
+        use ferrum_kernels::backend::PagedAttentionLaunchGeometry as Geometry;
+        use std::hash::{BuildHasherDefault, Hasher};
+        #[derive(Default)]
+        struct SameHash;
+        impl Hasher for SameHash {
+            fn finish(&self) -> u64 {
+                0
+            }
+            fn write(&mut self, _: &[u8]) {}
+        }
+        let shape = UnifiedGraphShape {
+            scope: UnifiedGraphCaptureScope::Full,
+            rows: 5,
+            sequences: 5,
+            attention: Geometry::SplitK {
+                num_splits: 2,
+                score_capacity: 3,
+            },
+            final_indices: vec![(0, 0), (1, 1)],
+        };
+        let variants = [
+            UnifiedGraphShape {
+                attention: Geometry::SplitK {
+                    num_splits: 2,
+                    score_capacity: 4,
+                },
+                ..shape.clone()
+            },
+            UnifiedGraphShape {
+                attention: Geometry::SplitK {
+                    num_splits: 4,
+                    score_capacity: 3,
+                },
+                ..shape.clone()
+            },
+            UnifiedGraphShape {
+                attention: Geometry::SinglePass { score_capacity: 8 },
+                ..shape.clone()
+            },
+            UnifiedGraphShape {
+                rows: 6,
+                ..shape.clone()
+            },
+            UnifiedGraphShape {
+                sequences: 4,
+                ..shape.clone()
+            },
+            UnifiedGraphShape {
+                scope: UnifiedGraphCaptureScope::LayersOnly,
+                ..shape.clone()
+            },
+            UnifiedGraphShape {
+                scope: UnifiedGraphCaptureScope::LmHeadEager,
+                ..shape.clone()
+            },
+            UnifiedGraphShape {
+                final_indices: vec![(0, 0), (1, 2)],
+                ..shape.clone()
+            },
+        ];
+        let mut cache = std::collections::HashMap::<_, _, BuildHasherDefault<SameHash>>::default();
+        cache.insert(shape.clone(), next_unified_graph_key(0));
+        for (index, variant) in variants.iter().enumerate() {
+            assert_ne!(&shape, variant);
+            let key = next_unified_graph_key(index as u64 + 1);
+            assert_ne!(key >> 63, 0);
+            assert_ne!(key, SINGLE_ITEM_GRAPH_KEY);
+            assert_ne!(key, next_batched_decode_graph_key(index));
+            assert!(cache.insert(variant.clone(), key).is_none());
+        }
+        assert_eq!(cache.len(), variants.len() + 1);
+        assert_eq!(cache.get(&shape), Some(&next_unified_graph_key(0)));
+        for (index, variant) in variants.iter().enumerate() {
+            assert_eq!(
+                cache.get(variant),
+                Some(&next_unified_graph_key(index as u64 + 1))
+            );
+        }
     }
 
     #[test]
@@ -888,8 +988,71 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
         B::write_typed::<u32>(ctx, &mut self.scratch.batch_positions, &positions);
         B::write_typed::<u32>(ctx, &mut self.scratch.batch_kv_lens_pre, &kv_pre);
         B::write_typed::<u32>(ctx, &mut self.scratch.batch_kv_lens_post, &kv_post);
+        if self.paged_pools.is_some()
+            && self
+                .cfg
+                .requires_windowed_attention(self.source_layer_range())
+        {
+            self.prepare_paged_decode_metadata(ctx, batch);
+        }
 
         (m, self.cfg.hidden_size)
+    }
+
+    /// Prepare dynamic paged views before any layer encoding or capture.
+    /// Eager windowed attention and captured decode consume the same owners.
+    fn prepare_paged_decode_metadata(
+        &mut self,
+        ctx: &mut B::Context,
+        batch: &[(String, u32, u32)],
+    ) {
+        let m = batch.len();
+        assert!(
+            m <= self.scratch.paged_max_seqs,
+            "batch exceeds original paged metadata capacity"
+        );
+        for (cid, _, _) in batch {
+            let target = self
+                .cache_len(cid)
+                .checked_add(1)
+                .expect("paged length overflow");
+            self.ensure_paged_kv_capacity_for_cache_id(ctx, cid, target)
+                .expect("prepare windowed paged KV capacity");
+        }
+        self.scratch.ensure_paged_decode_metadata(ctx);
+        let cu_seqlens: Vec<u32> = (0..=m).map(|row| u32::try_from(row).unwrap()).collect();
+        let stride = self.scratch.paged_max_blocks_per_seq;
+        let mut tables = vec![0u32; m * stride];
+        let mut lengths = Vec::with_capacity(m);
+        for (row, (cid, _, position)) in batch.iter().enumerate() {
+            let caches = &self.kv_caches[cid];
+            let blocks = &caches[0].paged_block_indices;
+            assert!(blocks.len() <= stride);
+            assert!(
+                caches.iter().all(|cache| cache.block_size == 16
+                    && cache.capacity == stride * 16
+                    && cache.paged_block_indices == *blocks
+                    && cache.len == *position as usize),
+                "paged layers must share original sequence mapping and frontier"
+            );
+            tables[row * stride..row * stride + blocks.len()].copy_from_slice(blocks);
+            lengths.push(position.checked_add(1).expect("paged position overflow"));
+        }
+        B::write_typed::<u32>(
+            ctx,
+            self.scratch.paged_batch_cu_seqlens.as_mut().unwrap(),
+            &cu_seqlens,
+        );
+        B::write_typed::<u32>(
+            ctx,
+            self.scratch.paged_batch_block_tables.as_mut().unwrap(),
+            &tables,
+        );
+        B::write_typed::<u32>(
+            ctx,
+            self.scratch.paged_batch_context_lens.as_mut().unwrap(),
+            &lengths,
+        );
     }
 
     fn bump_local_batched_decode_kv_lengths(&mut self, batch: &[(String, u32, u32)]) {
@@ -1161,23 +1324,53 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
             let q_safe = unsafe { &*q_ptr };
             let o_safe = unsafe { &mut *o_ptr };
 
-            B::paged_decode_attention(
-                ctx,
-                q_safe,
-                pool_k,
-                pool_v,
-                o_safe,
-                bt_safe,
-                cl_safe,
-                m,
-                nh,
-                nkv,
-                hd,
-                block_size,
-                max_blocks_per_seq,
-                1, // q_len
-            )
-            .expect("paged batched decode");
+            if layer_window > 0 {
+                // The encoded extent is fixed by original pool geometry, so
+                // increasing device positions cannot outgrow captured scratch.
+                B::paged_varlen_attention(
+                    ctx,
+                    q_safe,
+                    pool_k,
+                    pool_v,
+                    o_safe,
+                    self.scratch
+                        .paged_batch_cu_seqlens
+                        .as_ref()
+                        .expect("paged query rows"),
+                    &self.scratch.batch_positions,
+                    bt_safe,
+                    m,
+                    m,
+                    block_size * max_blocks_per_seq,
+                    nh,
+                    nkv,
+                    hd,
+                    layer_window,
+                    block_size,
+                    max_blocks_per_seq,
+                )
+                .expect("windowed paged batched attention");
+            } else {
+                B::paged_decode_attention(
+                    ctx,
+                    q_safe,
+                    pool_k,
+                    pool_v,
+                    o_safe,
+                    bt_safe,
+                    cl_safe,
+                    m,
+                    nh,
+                    nkv,
+                    hd,
+                    block_size,
+                    max_blocks_per_seq,
+                    1, // q_len
+                    0, // full causal attention
+                    None,
+                )
+                .expect("paged batched decode");
+            }
 
             // Step 4: per-item copy paged_batch_o[i] → attn_flat[i * q_dim].
             // Both have q_dim floats per item; same head-major-equals-token-major
@@ -1918,34 +2111,33 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
         //   varlen + graph:  714 tok/s, TPOT 18.3 ms  (+5% / -5%)
         let graph_enabled = self.batched_cfg.unified_graph;
         let graph_scope = UnifiedGraphCaptureScope::from_config(&self.batched_cfg);
-        let attention_launch_key = crate::common::decoder_unified::unified_attention_launch_key(
-            m_total,
-            num_seqs,
-            max_kv_len,
-            self.batched_cfg.split_k_attn,
-        );
-        let graph_key = if graph_scope == UnifiedGraphCaptureScope::LayersOnly {
-            crate::common::decoder_unified::unified_layers_only_graph_key(
-                m_total,
-                num_seqs,
-                attention_launch_key,
-            )
-        } else if graph_scope == UnifiedGraphCaptureScope::LmHeadEager {
-            crate::common::decoder_unified::unified_lm_head_eager_graph_key(
-                m_total,
-                num_seqs,
-                attention_launch_key,
-                &final_indices,
-            )
+        let graph_shape = if graph_enabled {
+            // The original backend selects the actual route, validates native
+            // shared memory and prepares its own scratch before any capture.
+            // No model-side copy of the split-K policy participates in keying.
+            let attention =
+                B::prepare_paged_varlen_attention(&mut ctx, num_seqs, m_total, max_kv_len, nh, hd)?;
+            Some(UnifiedGraphShape {
+                scope: graph_scope,
+                rows: m_total,
+                sequences: num_seqs,
+                attention,
+                final_indices: if graph_scope.captures_final_pack() {
+                    final_indices.clone()
+                } else {
+                    Vec::new()
+                },
+            })
         } else {
-            crate::common::decoder_unified::unified_graph_key(
-                m_total,
-                num_seqs,
-                attention_launch_key,
-                &final_indices,
-            )
+            None
         };
-        let cache_has_key = self.unified_graph_keys_seen.contains(&graph_key);
+        let cached_key = graph_shape
+            .as_ref()
+            .and_then(|shape| self.unified_graph_keys_seen.get(shape))
+            .copied();
+        let cache_has_key = cached_key.is_some();
+        let graph_key =
+            cached_key.unwrap_or_else(|| next_unified_graph_key(self.unified_graph_next_key));
 
         // Pre-grow the marlin gather scratch slot to the worst-case
         // size for THIS call's matmul shapes. Done eagerly BEFORE
@@ -2057,7 +2249,17 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
                     self.unified_graph_failed = true;
                     std::panic::panic_any(e);
                 } else {
-                    self.unified_graph_keys_seen.insert(graph_key);
+                    self.unified_graph_keys_seen.insert(
+                        graph_shape
+                            .as_ref()
+                            .expect("captured unified shape")
+                            .clone(),
+                        graph_key,
+                    );
+                    self.unified_graph_next_key = self
+                        .unified_graph_next_key
+                        .checked_add(1)
+                        .expect("unified graph native ID exhausted");
 
                     // SAFETY: cold construction checked projection/KV capture contracts.
                     // The private model/frame owns all bindings through checked retirement;
@@ -3054,6 +3256,15 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
         batch: &[(String, u32, u32)],
         logits_return: DecodeLogitsReturn<'_>,
     ) -> Vec<ExecutorSamplingOutput> {
+        if self.batched_graph_failed && self.batched_pointers_for.is_some() {
+            // A failed capture/replay keeps its original cohort and graph
+            // closure. Recovering stream completion alone does not authorize
+            // another replay or the reuse of these bindings.
+            B::retire_graphs_for_storage_mutation(&mut frame.context)
+                .unwrap_or_else(|error| std::panic::panic_any(error));
+            self.clear_graph_bookkeeping();
+            self.batched_graph_failed = true;
+        }
         let m = batch.len();
         // Ensure all caches exist and scratch is sized for M tokens.
         for (cid, _, _) in batch {
@@ -3092,16 +3303,18 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
         }
 
         let paged = self.paged_pools.is_some();
-        let graph_enabled = should_use_batched_decode_graph(
-            self.batched_cfg.batched_graph,
-            use_host_residual_shadow,
-        ) && if paged {
-            B::supports_varlen_qkv()
-        } else {
-            B::supports_qk_norm_rope_batched_per_item()
-                && B::supports_kv_cache_append_batched_per_cache()
-                && B::supports_flash_attention_batched_per_cache()
-        };
+        let graph_enabled = !self.batched_graph_failed
+            && should_use_batched_decode_graph(
+                self.batched_cfg.batched_graph,
+                use_host_residual_shadow,
+            )
+            && if paged {
+                B::supports_varlen_qkv()
+            } else {
+                B::supports_qk_norm_rope_batched_per_item()
+                    && B::supports_kv_cache_append_batched_per_cache()
+                    && B::supports_flash_attention_batched_per_cache()
+            };
         if graph_enabled {
             // A captured dynamic write requires the actual committed frontier,
             // not an unrelated caller position or a duplicate cache row.
@@ -3162,44 +3375,16 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
         B::write_typed::<u32>(&mut ctx, &mut self.scratch.batch_kv_lens_pre, &kv_pre);
         B::write_typed::<u32>(&mut ctx, &mut self.scratch.batch_kv_lens_post, &kv_post);
 
+        if paged
+            && (graph_enabled
+                || self
+                    .cfg
+                    .requires_windowed_attention(self.source_layer_range()))
+        {
+            self.prepare_paged_decode_metadata(&mut ctx, batch);
+        }
         if graph_enabled {
-            if paged {
-                assert!(
-                    m <= self.scratch.paged_max_seqs,
-                    "graph batch exceeds original paged metadata capacity"
-                );
-                self.scratch.ensure_paged_decode_graph_metadata(&mut ctx);
-                let cu_seqlens: Vec<u32> = (0..=m).map(|row| row as u32).collect();
-                let stride = self.scratch.paged_max_blocks_per_seq;
-                let mut tables = vec![0u32; m * stride];
-                for (row, (cid, _, _)) in batch.iter().enumerate() {
-                    let caches = &self.kv_caches[cid];
-                    let blocks = &caches[0].paged_block_indices;
-                    assert!(blocks.len() <= stride);
-                    assert!(
-                        caches.iter().all(|cache| cache.block_size == 16
-                            && cache.capacity == stride * 16
-                            && cache.paged_block_indices == *blocks),
-                        "paged graph layers must share the original sequence mapping"
-                    );
-                    tables[row * stride..row * stride + blocks.len()].copy_from_slice(blocks);
-                }
-                B::write_typed::<u32>(
-                    &mut ctx,
-                    self.scratch.paged_batch_cu_seqlens.as_mut().unwrap(),
-                    &cu_seqlens,
-                );
-                B::write_typed::<u32>(
-                    &mut ctx,
-                    self.scratch.paged_batch_block_tables.as_mut().unwrap(),
-                    &tables,
-                );
-                B::write_typed::<u32>(
-                    &mut ctx,
-                    self.scratch.paged_batch_context_lens.as_mut().unwrap(),
-                    &kv_post,
-                );
-            } else {
+            if !paged {
                 // Refresh the canonical original-context tables every time:
                 // intervening eager/stage work may have used the same slots.
                 let mut keys = Vec::with_capacity(num_layers * m);
@@ -3212,6 +3397,21 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
                 }
                 B::populate_batched_pointers(&mut ctx, &keys, &values, num_layers, m)
                     .unwrap_or_else(|error| std::panic::panic_any(error));
+            }
+            if paged
+                && self
+                    .cfg
+                    .requires_windowed_attention(self.source_layer_range())
+            {
+                B::prepare_paged_varlen_attention(
+                    &mut ctx,
+                    m,
+                    m,
+                    16 * self.scratch.paged_max_blocks_per_seq,
+                    self.cfg.num_heads,
+                    self.cfg.head_dim,
+                )
+                .unwrap_or_else(|error| std::panic::panic_any(error));
             }
             B::pregrow_marlin_gather_scratch(&mut ctx, m * self.cfg.intermediate_size);
         }
@@ -3277,6 +3477,10 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
 
         let mut did_pure_replay = false;
         if graph_enabled && cache_has_key && !self.batched_graph_failed {
+            // Deny further replay before any fallible preparation, launch or
+            // completion observation. Only this complete invocation can
+            // restore eligibility; failure preserves the cohort's custody.
+            self.batched_graph_failed = true;
             // Sync stream first so embedding_lookup (just queued) plus
             // any null-stream cuMemcpyHtoD_v2's from write_u32 are all
             // settled before cuGraphLaunch.
@@ -3288,7 +3492,11 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
                 Ok(true) => {
                     did_pure_replay = true;
                 }
-                Ok(false) => {}
+                Ok(false) => {
+                    B::retire_graphs_for_storage_mutation(&mut ctx)
+                        .unwrap_or_else(|error| std::panic::panic_any(error));
+                    self.clear_graph_bookkeeping();
+                }
                 Err(e) => {
                     self.batched_graph_failed = true;
                     std::panic::panic_any(e);
@@ -3301,6 +3509,7 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
                 && !self.batched_graph_failed
                 && self.batched_graph_warmup >= BATCHED_GRAPH_WARMUP;
             if should_capture {
+                self.batched_graph_failed = true;
                 tracing::debug!("[batched-graph] BEGIN CAPTURE rows={m}");
                 device_execution::checked_sync::<B>(&mut ctx);
                 // SAFETY: cold construction checked projection/KV capture contracts.
@@ -3374,7 +3583,12 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
                 );
             }
 
-            if should_capture && B::graph_capture_in_flight(&ctx) {
+            if should_capture {
+                if !B::graph_capture_in_flight(&ctx) {
+                    std::panic::panic_any(ferrum_types::FerrumError::backend(
+                        "batched decode capture ended before graph installation",
+                    ));
+                }
                 // SAFETY: cold construction checked projection/KV capture contracts.
                 // The private model/frame owns all bindings through checked retirement;
                 // storage mutation retires cached graphs before replacing dependencies.
@@ -3442,6 +3656,9 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
                         .map(|token| ExecutorSamplingOutput::GreedyToken(TokenId::new(token)))
                         .collect();
                     self.bump_local_batched_decode_kv_lengths(batch);
+                    if graph_enabled {
+                        self.batched_graph_failed = false;
+                    }
                     frame.completed = Some(quiescent);
                     return output;
                 }
@@ -3456,6 +3673,9 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
         // Commit every host frontier only after this original execution
         // actually completed; failed capture/replay retains the old frontier.
         self.bump_local_batched_decode_kv_lengths(batch);
+        if graph_enabled {
+            self.batched_graph_failed = false;
+        }
         frame.completed = Some(quiescent);
         output
     }

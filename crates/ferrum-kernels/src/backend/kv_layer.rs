@@ -75,6 +75,15 @@ impl<B: Backend, K: ?Sized> KvGraphCaptureContract<B, K> {
 /// Per-K-dtype dispatch trait.
 #[allow(clippy::too_many_arguments)]
 pub trait KvLayer<B: Backend>: KvDtypeKind {
+    /// Explicit storage/attention capabilities for this backend and KV dtype.
+    /// A custom implementation must opt in to every layout it implements.
+    fn supports_contiguous() -> bool {
+        false
+    }
+    fn supports_windowed_paged_attention() -> bool {
+        false
+    }
+
     /// Safe custom KV implementations remain eager-only by default.
     fn graph_capture_contract() -> Option<KvGraphCaptureContract<B, Self>> {
         None
@@ -189,6 +198,7 @@ pub trait KvLayer<B: Backend>: KvDtypeKind {
         head_dim: usize,
         final_kv_len: usize,
         tokens: usize,
+        sliding_window: usize,
     ) -> Result<()>;
 
     /// Contig write: FP16 only. INT8 inherits the panic default —
@@ -240,6 +250,13 @@ pub trait KvLayer<B: Backend>: KvDtypeKind {
 // ─────────────────────────────────────────────────────────────────────
 
 impl<B: Backend + crate::backend::BackendPagedKv> KvLayer<B> for KvFp16 {
+    fn supports_contiguous() -> bool {
+        true
+    }
+    fn supports_windowed_paged_attention() -> bool {
+        B::supports_windowed_paged_attention()
+    }
+
     fn graph_capture_contract() -> Option<KvGraphCaptureContract<B, Self>> {
         // SAFETY: layer/pool owners retain backing allocations, with checked
         // storage retirement before pointer changes. Contiguous decode delegates
@@ -488,6 +505,7 @@ impl<B: Backend + crate::backend::BackendPagedKv> KvLayer<B> for KvFp16 {
         head_dim: usize,
         final_kv_len: usize,
         tokens: usize,
+        sliding_window: usize,
     ) -> Result<()> {
         let block_size = layer.block_size;
         let num_blocks_per_seq = layer.capacity / block_size;
@@ -500,7 +518,10 @@ impl<B: Backend + crate::backend::BackendPagedKv> KvLayer<B> for KvFp16 {
             .context_lens
             .as_mut()
             .ok_or_else(|| FerrumError::model("FP16 paged_decode: missing context_lens"))?;
-        B::write_typed::<u32>(ctx, cl_buf, &[final_kv_len as u32]);
+        let final_lens = [u32::try_from(final_kv_len)
+            .map_err(|_| FerrumError::model("FP16 paged context length exceeds u32"))?];
+        // Both views are projected from this exact original cache frontier.
+        B::write_typed::<u32>(ctx, cl_buf, &final_lens);
         // SAFETY: block_table outlives the call.
         let bt = unsafe { &*bt_ptr };
         let cl = layer.context_lens.as_ref().unwrap();
@@ -519,6 +540,8 @@ impl<B: Backend + crate::backend::BackendPagedKv> KvLayer<B> for KvFp16 {
             block_size,
             num_blocks_per_seq,
             tokens,
+            sliding_window,
+            Some(&final_lens),
         )
     }
 
@@ -829,7 +852,13 @@ impl<B: Backend + BackendInt8KvOps> KvLayer<B> for KvInt8 {
         head_dim: usize,
         final_kv_len: usize,
         tokens: usize,
+        sliding_window: usize,
     ) -> Result<()> {
+        if sliding_window != 0 {
+            return Err(FerrumError::unsupported(
+                "this INT8 KV implementation does not support windowed paged attention",
+            ));
+        }
         let block_size = layer.block_size;
         let cl_buf = layer
             .context_lens

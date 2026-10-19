@@ -1102,9 +1102,11 @@ impl EngineConfig {
         if let Some(capacity) = self.runtime.kv_capacity {
             backend_context.cuda.kv_capacity = capacity;
         }
-        if let Some(split_k) = self.runtime.llama.split_k_attn {
-            backend_context.cuda.split_k_attn = Some(split_k);
+        if backend_context.cuda.split_k_attn.is_none() {
+            backend_context.cuda.split_k_attn = self.runtime.llama.split_k_attn;
         }
+        // Preserve explicit conflicts for LlamaExecutionConfig::validate;
+        // the model alias must not silently replace the backend policy.
         crate::LlamaExecutionConfig {
             backend_context,
             kv_capacity: self.runtime.kv_capacity,

@@ -8,6 +8,290 @@ use ferrum_types::LlamaExecutionConfig;
 
 type Model = LlamaFamilyModel<CudaBackend>;
 
+/// A new unified graph shape must prepare its actual split-K workspace before
+/// capture. The native split count changes from two to four at length 385.
+#[test]
+#[ignore = "requires an actual CUDA device"]
+fn unified_graph_cuda_prepares_split_growth_before_capture() {
+    use crate::test_support::numerical::assert_full_logits_qualification;
+    use ferrum_kernels::backend::cpu::CpuBackend;
+
+    let mut config = physical_batch_config();
+    config.max_seq_len = 512;
+    let loader = SyntheticLlamaLoader::new(config.clone());
+    let mut execution = LlamaExecutionConfig::default();
+    execution.options.metal_paged_kv = Some(true);
+    execution.options.unified_graph = true;
+    execution.options.cuda_graph = false;
+    execution.batched_graph = false;
+    execution.prefix_cache = false;
+    execution.paged_max_seqs = 2;
+    execution.kv_capacity = Some(512);
+    assert_eq!(execution.options.split_k_attn, None);
+    assert_eq!(execution.backend_context.cuda.split_k_attn, None);
+    let mut graph =
+        Model::new_with_execution_config(config.clone(), &loader, execution.clone()).unwrap();
+    execution.options.unified_graph = false;
+    let mut eager =
+        Model::new_with_execution_config(config.clone(), &loader, execution.clone()).unwrap();
+    execution.options.metal_paged_kv = Some(false);
+    let mut cpu =
+        LlamaFamilyModel::<CpuBackend>::new_with_execution_config(config, &loader, execution)
+            .unwrap();
+
+    let id = "unified-split-threshold";
+    let prompt: Vec<u32> = (0..381).map(|index| 1 + (index % 97) as u32).collect();
+    let items = vec![(id.to_owned(), prompt.clone(), 0, true)];
+    let one_row = |model: &mut Model, items: &[(String, Vec<u32>, usize, bool)]| {
+        let mut rows = model.unified_forward(items).unwrap();
+        assert_eq!(rows.len(), 1);
+        rows.remove(0)
+            .expect("final unified item must return full logits")
+    };
+    let mut records = vec![(
+        381,
+        one_row(&mut graph, &items),
+        one_row(&mut eager, &items),
+        cpu.prefill_internal(id, &prompt),
+    )];
+    let mut graph_counts = Vec::new();
+    let mut lengths = Vec::new();
+    // Prefill plus lengths 382/383 are the real eager warmups. Length 384
+    // captures two splits; 385 needs larger scratch and a new four-split
+    // capture. Length 386 reuses that new shape's exact chunk size.
+    for position in 381..386 {
+        let token = 1 + (position % 97) as u32;
+        let items = vec![(id.to_owned(), vec![token], position, true)];
+        records.push((
+            position + 1,
+            one_row(&mut graph, &items),
+            one_row(&mut eager, &items),
+            cpu.decode_internal(id, token, position as u32),
+        ));
+        graph_counts.push((
+            position + 1,
+            graph.unified_graph_keys_seen.len(),
+            graph.unified_graph_warmup,
+        ));
+        lengths.push((
+            position + 1,
+            graph.cache_len(id),
+            eager.cache_len(id),
+            cpu.cache_len(id),
+        ));
+    }
+    let graph_failed = graph.unified_graph_failed;
+    let eager_captured = !eager.unified_graph_keys_seen.is_empty();
+    let graph_was_paged = graph.paged_pools.is_some();
+    let cpu_was_contiguous = cpu.paged_pools.is_none();
+    graph.close().unwrap();
+    eager.close().unwrap();
+    cpu.close().unwrap();
+
+    assert!(graph_was_paged && cpu_was_contiguous);
+    assert!(!graph_failed && !eager_captured);
+    let count_at = |length| {
+        graph_counts
+            .iter()
+            .find(|entry| entry.0 == length)
+            .unwrap()
+            .1
+    };
+    assert!(
+        count_at(384) > 0,
+        "the old split shape must actually capture"
+    );
+    assert!(
+        count_at(385) > count_at(384),
+        "the new split shape must capture"
+    );
+    assert_eq!(
+        count_at(386),
+        count_at(385),
+        "same chunk shape must reuse its graph"
+    );
+    let warmup_at = |length| {
+        graph_counts
+            .iter()
+            .find(|entry| entry.0 == length)
+            .unwrap()
+            .2
+    };
+    assert_eq!(
+        warmup_at(386),
+        warmup_at(385),
+        "the original native graph must replay"
+    );
+    for (expected, graph_len, eager_len, cpu_len) in lengths {
+        assert_eq!(
+            (graph_len, eager_len, cpu_len),
+            (expected, expected, expected)
+        );
+    }
+    for (length, actual, expected, cpu) in records {
+        full_logits(&actual, &expected, &format!("unified KV length {length}"));
+        assert_eq!(cpu.len(), 128);
+        for (route, logits) in [("eager", &expected), ("graph", &actual)] {
+            // Only annotate an assertion after every device owner has closed;
+            // do not catch or downgrade an execution/retirement failure.
+            if let Err(failure) = std::panic::catch_unwind(|| {
+                assert_full_logits_qualification(logits, &cpu);
+            }) {
+                eprintln!("unified split CPU oracle failed: length={length}, route={route}");
+                std::panic::resume_unwind(failure);
+            }
+        }
+    }
+}
+
+/// Independent window oracle. Record the real executions first so the original
+/// models are checked-closed even when the pre-fix numerical comparison fails.
+#[test]
+#[ignore = "requires an actual CUDA device"]
+fn explicit_batched_graph_cuda_paged_layer_window_matches_contiguous_and_cpu() {
+    use crate::models::llama_family::llama_layer_attention_schedule;
+    use crate::test_support::numerical::assert_full_logits_qualification;
+    use ferrum_kernels::backend::cpu::CpuBackend;
+
+    let mut config = physical_batch_config();
+    config.num_layers = 2;
+    config.sliding_window = 2;
+    config.sliding_window_pattern = 2;
+    config.rope_local_theta = Some(100.0);
+    config.max_seq_len = 64;
+    assert_eq!(llama_layer_attention_schedule(&config, 0).sliding_window, 2);
+    assert_eq!(llama_layer_attention_schedule(&config, 1).sliding_window, 0);
+    let loader = SyntheticLlamaLoader::new(config.clone());
+    let mut execution = LlamaExecutionConfig::default();
+    execution.options.metal_paged_kv = Some(true);
+    execution.options.cuda_graph = false;
+    execution.options.unified_graph = false;
+    execution.prefix_cache = false;
+    execution.batched_graph = true;
+    execution.paged_max_seqs = 4;
+    execution.kv_capacity = Some(64);
+    let mut graph =
+        Model::new_with_execution_config(config.clone(), &loader, execution.clone()).unwrap();
+    execution.batched_graph = false;
+    let mut eager =
+        Model::new_with_execution_config(config.clone(), &loader, execution.clone()).unwrap();
+    execution.options.metal_paged_kv = Some(false);
+    let mut contiguous =
+        Model::new_with_execution_config(config.clone(), &loader, execution.clone()).unwrap();
+    let mut cpu =
+        LlamaFamilyModel::<CpuBackend>::new_with_execution_config(config, &loader, execution)
+            .unwrap();
+
+    assert!(graph.supports_batched_decode && eager.supports_batched_decode);
+    assert!(graph.rope_local.is_some() && eager.rope_local.is_some());
+
+    // Each record contains every vocabulary element from four independently
+    // constructed models. No reference is seeded with a paged cache or output.
+    let mut records = Vec::new();
+    for (id, prompt) in [("window-a", vec![1]), ("window-b", vec![21, 22])] {
+        records.push((
+            format!("prefill {id}"),
+            graph.prefill_internal(id, &prompt),
+            eager.prefill_internal(id, &prompt),
+            contiguous.prefill_internal(id, &prompt),
+            cpu.prefill_internal(id, &prompt),
+        ));
+    }
+    assert!(graph.paged_pools.is_some() && eager.paged_pools.is_some());
+    assert!(contiguous.paged_pools.is_none() && cpu.paged_pools.is_none());
+    // Different absolute positions expose stale per-row metadata. Both rows
+    // cross the local window and a physical page while the global layer stays
+    // full causal. The first prefills were <=W, so they cannot seed a false
+    // common paged-prefill reference.
+    for step in 0..17_u32 {
+        let batch = vec![
+            ("window-a".to_owned(), 40 + step, 1 + step),
+            ("window-b".to_owned(), 80 + step, 2 + step),
+        ];
+        let g = graph.decode_batch_internal_with_full_logits(&batch, true);
+        let e = eager.decode_batch_internal_with_full_logits(&batch, true);
+        let c = contiguous.decode_batch_internal_with_full_logits(&batch, true);
+        assert_eq!(g.len(), 2);
+        assert_eq!(e.len(), 2);
+        assert_eq!(c.len(), 2);
+        for (row, (id, token, position)) in batch.iter().enumerate() {
+            let expected = cpu.decode_internal(id, *token, *position);
+            records.push((
+                format!("decode step={step} row={row} position={position}"),
+                g[row].clone(),
+                e[row].clone(),
+                c[row].clone(),
+                expected,
+            ));
+            for model in [&graph, &eager, &contiguous] {
+                assert!(model.kv_caches[id]
+                    .iter()
+                    .all(|cache| cache.len == *position as usize + 1));
+            }
+            assert_eq!(cpu.cache_len(id), *position as usize + 1);
+        }
+    }
+    assert!(!graph.batched_graph_keys_seen.is_empty());
+    assert!(!graph.batched_graph_failed);
+    assert!(eager.batched_graph_keys_seen.is_empty());
+    for id in ["window-a", "window-b"] {
+        assert!(graph.kv_caches[id]
+            .iter()
+            .all(|cache| cache.paged_block_indices.len() >= 2));
+    }
+
+    // The direct single path must also honor W for a prefill longer than W
+    // and a subsequent decode; unified/batch correctness cannot cover it.
+    let id = "window-single";
+    let prompt = [101, 102, 103, 104, 105];
+    records.push((
+        "single prefill beyond window".to_owned(),
+        graph.prefill_internal(id, &prompt),
+        eager.prefill_internal(id, &prompt),
+        contiguous.prefill_internal(id, &prompt),
+        cpu.prefill_internal(id, &prompt),
+    ));
+    records.push((
+        "single decode beyond window".to_owned(),
+        graph.decode_internal(id, 106, 5),
+        eager.decode_internal(id, 106, 5),
+        contiguous.decode_internal(id, 106, 5),
+        cpu.decode_internal(id, 106, 5),
+    ));
+    for model in [&graph, &eager, &contiguous] {
+        assert_eq!(model.cache_len(id), 6);
+    }
+    assert_eq!(cpu.cache_len(id), 6);
+    graph.close().unwrap();
+    eager.close().unwrap();
+    contiguous.close().unwrap();
+    cpu.close().unwrap();
+
+    // Preserve both existing contracts: strict graph/eager same-shape equality
+    // and the shared CPU full-vocabulary qualification envelope. A correct
+    // contiguous CUDA reference is independently checked against CPU as well.
+    for (stage, graph, eager, contiguous, cpu) in records {
+        full_logits(&graph, &eager, &stage);
+        assert_eq!(contiguous.len(), 128, "{stage}");
+        assert_eq!(cpu.len(), 128, "{stage}");
+        // Annotate only a numerical assertion failure, then preserve its panic.
+        // Actual device work and checked close above are never caught here.
+        for (route, actual, expected) in [
+            ("contiguous/CPU", &contiguous, &cpu),
+            ("graph/CPU", &graph, &cpu),
+            ("eager/CPU", &eager, &cpu),
+            ("graph/contiguous", &graph, &contiguous),
+        ] {
+            if let Err(error) = std::panic::catch_unwind(|| {
+                assert_full_logits_qualification(actual, expected);
+            }) {
+                eprintln!("paged layer-window oracle failed at {stage}: {route}");
+                std::panic::resume_unwind(error);
+            }
+        }
+    }
+}
+
 fn models() -> (Model, Model) {
     // Preserve the original counterexamples' fixed window and capacity.
     configured_models(false, 2, 1, 32)
@@ -325,4 +609,105 @@ fn explicit_batched_graph_cuda_paged_uses_alternating_layer_rope() {
     actual.close().unwrap();
     expected.close().unwrap();
     serial.close().unwrap();
+}
+
+/// Backend-only typed policy must control both the actual route and graph
+/// equality. M=5 is auto single-pass, but canonical Some(true) forces split-K.
+#[test]
+#[ignore = "requires an actual CUDA device"]
+fn unified_graph_cuda_uses_canonical_split_policy_for_capture_identity() {
+    use crate::test_support::numerical::assert_full_logits_qualification;
+    use ferrum_kernels::backend::cpu::CpuBackend;
+    let config = physical_batch_config();
+    let loader = SyntheticLlamaLoader::new(config.clone());
+    let mut execution = LlamaExecutionConfig::default();
+    execution.options.metal_paged_kv = Some(true);
+    execution.options.unified_graph = true;
+    execution.backend_context.cuda.split_k_attn = Some(true);
+    execution.paged_max_seqs = 5;
+    execution.kv_capacity = Some(32);
+    assert_eq!(execution.options.split_k_attn, None);
+    let mut graph =
+        Model::new_with_execution_config(config.clone(), &loader, execution.clone()).unwrap();
+    execution.options.unified_graph = false;
+    let mut eager =
+        Model::new_with_execution_config(config.clone(), &loader, execution.clone()).unwrap();
+    execution.options.metal_paged_kv = Some(false);
+    let mut cpu =
+        LlamaFamilyModel::<CpuBackend>::new_with_execution_config(config, &loader, execution)
+            .unwrap();
+    let ids: Vec<_> = (0..5).map(|row| format!("canonical-split-{row}")).collect();
+    let mut records = Vec::new();
+    let mut counts = Vec::new();
+    for position in 0..7_usize {
+        let items: Vec<_> = ids
+            .iter()
+            .enumerate()
+            .map(|(row, id)| {
+                (
+                    id.clone(),
+                    vec![(1 + row * 11 + position) as u32],
+                    position,
+                    true,
+                )
+            })
+            .collect();
+        let actual = graph.unified_forward(&items).unwrap();
+        let expected = eager.unified_forward(&items).unwrap();
+        assert_eq!(actual.len(), 5);
+        assert_eq!(expected.len(), 5);
+        for (row, (id, tokens, _, _)) in items.iter().enumerate() {
+            let reference = if position == 0 {
+                cpu.prefill_internal(id, tokens)
+            } else {
+                cpu.decode_internal(id, tokens[0], position as u32)
+            };
+            records.push((
+                position + 1,
+                row,
+                actual[row].clone().unwrap(),
+                expected[row].clone().unwrap(),
+                reference,
+            ));
+        }
+        counts.push((
+            position + 1,
+            graph.unified_graph_keys_seen.len(),
+            graph.unified_graph_warmup,
+        ));
+    }
+    let graph_failed = graph.unified_graph_failed;
+    let eager_captured = !eager.unified_graph_keys_seen.is_empty();
+    let lengths: Vec<_> = ids
+        .iter()
+        .map(|id| (graph.cache_len(id), eager.cache_len(id), cpu.cache_len(id)))
+        .collect();
+    graph.close().unwrap();
+    eager.close().unwrap();
+    cpu.close().unwrap();
+    assert!(!graph_failed && !eager_captured);
+    for lengths in lengths {
+        assert_eq!(lengths, (7, 7, 7));
+    }
+    let at = |length| counts.iter().find(|entry| entry.0 == length).unwrap();
+    assert!(at(4).1 > 0);
+    assert!(at(5).1 > at(4).1, "chunk 3 must capture after chunk 2");
+    assert_eq!(
+        (at(6).1, at(6).2),
+        (at(5).1, at(5).2),
+        "same split chunk must actually replay"
+    );
+    assert!(
+        at(7).1 > at(6).1,
+        "canonical split chunk 4 must not reuse the chunk 3 graph"
+    );
+    for (length, row, actual, expected, reference) in records {
+        full_logits(
+            &actual,
+            &expected,
+            &format!("canonical split length={length} row={row}"),
+        );
+        assert_full_logits_qualification(&expected, &reference);
+        assert_full_logits_qualification(&actual, &reference);
+    }
 }

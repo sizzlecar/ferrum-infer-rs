@@ -221,6 +221,11 @@ pub struct CudaState {
     /// that triggered CUDA_ERROR_ILLEGAL_ADDRESS via stream-ordered free.
     paged_attn_out_tm: Option<crate::backend::CudaBuf>,
     paged_attn_out_tm_capacity: usize,
+    // Eager paged wrapper metadata, owned until checked context retirement.
+    // Captured batch attention uses the model's separately prepared views.
+    paged_attn_cu_seqlens: Option<crate::backend::CudaBuf>,
+    paged_attn_pos_offsets: Option<crate::backend::CudaBuf>,
+    paged_attn_metadata_capacity: usize,
 }
 
 fn with_argmax_out<R>(
@@ -389,6 +394,7 @@ struct FlashAttnParams {
     causal: i32,
     pos_offset: i32,
     kv_seq_stride: i32,
+    sliding_window: i32,
 }
 
 unsafe impl DeviceRepr for FlashAttnParams {}
@@ -532,6 +538,9 @@ impl Backend for CudaBackend {
             moe_route_capacity: 0,
             paged_attn_out_tm: None,
             paged_attn_out_tm_capacity: 0,
+            paged_attn_cu_seqlens: None,
+            paged_attn_pos_offsets: None,
+            paged_attn_metadata_capacity: 0,
         })
     }
 
@@ -1747,6 +1756,7 @@ impl Backend for CudaBackend {
             } else {
                 kv_len as i32
             },
+            sliding_window: cfg.sliding_window as i32,
         };
         // Must match `#define TILE_Q 16` in kernels/flash_attn_full.cu.
         // Was 32 — produced grid with too few blocks for q_len > 16, so

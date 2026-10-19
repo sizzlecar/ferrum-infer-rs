@@ -5,6 +5,9 @@
 //! `ModelRunner` are generic over `Backend`, so one forward path serves
 //! all hardware targets.
 
+mod paged_attention;
+pub use paged_attention::PagedAttentionLaunchGeometry;
+
 mod traits;
 pub use traits::*;
 

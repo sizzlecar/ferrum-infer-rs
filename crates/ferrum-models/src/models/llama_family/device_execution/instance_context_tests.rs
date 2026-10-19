@@ -18,6 +18,7 @@ use std::sync::{
 struct TrackedCpu;
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum GraphFault {
+    BatchCaptureUnresolved,
     SecondLayer,
     SecondLayerUnresolved,
     EndCapture,
@@ -101,7 +102,17 @@ impl BackendGraph for TrackedCpu {
         Ok(())
     }
 }
-impl BackendPagedKv for TrackedCpu {}
+impl BackendPagedKv for TrackedCpu {
+    fn populate_batched_pointers(
+        _: &mut Context,
+        _: &[&Self::Buffer],
+        _: &[&Self::Buffer],
+        _: usize,
+        _: usize,
+    ) -> Result<()> {
+        Ok(())
+    }
+}
 impl BackendQuantMarlin for TrackedCpu {}
 impl BackendQuantGguf for TrackedCpu {}
 impl BackendMoeFused for TrackedCpu {}
@@ -176,6 +187,19 @@ impl Backend for TrackedCpu {
     fn graph_capture_in_flight(ctx: &Context) -> bool {
         ctx.capture_active
     }
+    // Advertise the batch route only for lifecycle fault injection. Its
+    // unimplemented dynamic kernels fail capture; eager execution falls back
+    // to the real CPU per-item operations. No successful graph numerics are
+    // fabricated by this fixture.
+    fn supports_qk_norm_rope_batched_per_item() -> bool {
+        true
+    }
+    fn supports_kv_cache_append_batched_per_cache() -> bool {
+        true
+    }
+    fn supports_flash_attention_batched_per_cache() -> bool {
+        true
+    }
     fn alloc(n: usize) -> Vec<f32> {
         CpuBackend::alloc(n)
     }
@@ -236,6 +260,12 @@ impl Backend for TrackedCpu {
         ctx.calls.fetch_add(1, Ordering::SeqCst);
         if ctx.capture_active {
             ctx.capture_gemms += 1;
+            if ctx.graph_fault == Some(GraphFault::BatchCaptureUnresolved) {
+                ctx.unresolved.store(true, Ordering::SeqCst);
+                std::panic::panic_any(FerrumError::backend(
+                    "controlled unresolved batch capture failure",
+                ));
+            }
             if ctx.capture_gemms == 5
                 && matches!(
                     ctx.graph_fault,
@@ -1606,6 +1636,190 @@ fn instance_context_batch_graph_members_retire_before_close_or_truncate() {
         &owner,
         &model.execution_context.as_ref().unwrap().identity
     ));
+    model.close().unwrap();
+    reference.close().unwrap();
+}
+
+fn prepared_batch_graph_fault_models() -> (
+    LlamaFamilyModel<TrackedCpu, KvFp16>,
+    LlamaFamilyModel<CpuBackend, KvFp16>,
+    Vec<(String, u32, u32)>,
+) {
+    let loader = SyntheticLlamaLoader::new(config());
+    let mut execution = ferrum_types::LlamaExecutionConfig::default();
+    execution.batched_graph = true;
+    execution.prefix_cache = false;
+    execution.options.metal_paged_kv = Some(false);
+    let mut model = LlamaFamilyModel::<TrackedCpu>::new_with_execution_config(
+        config(),
+        &loader,
+        execution.clone(),
+    )
+    .unwrap();
+    execution.batched_graph = false;
+    let mut reference =
+        LlamaFamilyModel::<CpuBackend>::new_with_execution_config(config(), &loader, execution)
+            .unwrap();
+    for (id, prompt) in [("a", [1, 2, 3]), ("b", [4, 5, 6])] {
+        model.prepare_kv_capacity(id, 32);
+        reference.prepare_kv_capacity(id, 32);
+        assert_eq!(
+            model.prefill_internal(id, &prompt),
+            reference.prefill_internal(id, &prompt)
+        );
+    }
+    model
+        .run_preparation_frame(|model, frame| {
+            model
+                .scratch
+                .ensure_batch_logits(&mut frame.context, &model.cfg, 2);
+        })
+        .into_legacy_result();
+    let batch = vec![("a".into(), 7, 3), ("b".into(), 8, 3)];
+    (model, reference, batch)
+}
+
+fn assert_original_batch_failure(
+    model: &LlamaFamilyModel<TrackedCpu, KvFp16>,
+    original: &[(usize, usize)],
+) {
+    assert!(model.batched_graph_failed);
+    assert_eq!(
+        model.batched_pointers_for.as_deref(),
+        Some(["a".to_owned(), "b".to_owned()].as_slice())
+    );
+    assert!(model.kv_free_pool.is_empty());
+    for (row, id) in ["a", "b"].into_iter().enumerate() {
+        assert!(model.kv_caches[id].iter().all(|cache| cache.len == 3));
+        assert_eq!(model.kv_caches[id][0].k.as_ptr() as usize, original[row].0);
+        assert_eq!(model.kv_caches[id][0].v.as_ptr() as usize, original[row].1);
+    }
+}
+
+#[test]
+fn instance_context_batch_capture_failure_denies_replay_and_retains_unresolved_cohort() {
+    use crate::common::llm::{ModelExecutionRecovery, ModelTokenCloseOutcome};
+    for unresolved in [false, true] {
+        let (mut model, mut reference, batch) = prepared_batch_graph_fault_models();
+        // Inject only eligibility and backend failure. Numerical CUDA graph
+        // capture/replay remains the responsibility of the real GPU tests.
+        model.batched_pointers_for = Some(vec!["a".into(), "b".into()]);
+        model.batched_graph_warmup = 3;
+        let context = model.execution_context.as_mut().unwrap();
+        let identity = context.identity.clone();
+        let pending = context.unresolved.clone();
+        if unresolved {
+            context.graph_fault = Some(GraphFault::BatchCaptureUnresolved);
+        }
+        let original: Vec<_> = ["a", "b"]
+            .into_iter()
+            .map(|id| {
+                (
+                    model.kv_caches[id][0].k.as_ptr() as usize,
+                    model.kv_caches[id][0].v.as_ptr() as usize,
+                )
+            })
+            .collect();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            model.decode_batch_internal_with_full_logits(&batch, true)
+        }));
+        assert!(result.is_err());
+        assert_original_batch_failure(&model, &original);
+        if unresolved {
+            assert!(model.execution_context.is_none());
+            assert!(Arc::ptr_eq(
+                &identity,
+                &model
+                    .pending_device_frame
+                    .as_ref()
+                    .unwrap()
+                    .context
+                    .identity
+            ));
+            assert!(matches!(
+                model.close_managed_token_cache("a"),
+                ModelTokenCloseOutcome::Held { .. }
+            ));
+            assert_original_batch_failure(&model, &original);
+            pending.store(false, Ordering::SeqCst);
+            assert!(matches!(
+                model.recover_token_frame(),
+                ModelExecutionRecovery::Quiescent { error: None }
+            ));
+        } else {
+            assert!(model.pending_device_frame.is_none());
+        }
+        let expected = reference.decode_batch_internal_with_full_logits(&batch, true);
+        let actual = model.decode_batch_internal_with_full_logits(&batch, true);
+        assert_eq!(actual.len(), 2);
+        for (row, expected_row) in actual.iter().zip(&expected) {
+            assert_eq!(row.len(), config().vocab_size);
+            assert!(row
+                .iter()
+                .chain(expected_row)
+                .all(|value| value.is_finite()));
+            assert_eq!(row, expected_row);
+        }
+        assert!(model.batched_pointers_for.is_none());
+        assert_eq!(model.execution_context.as_ref().unwrap().replay_attempts, 0);
+        assert!(Arc::ptr_eq(
+            &identity,
+            &model.execution_context.as_ref().unwrap().identity
+        ));
+        model.close().unwrap();
+        reference.close().unwrap();
+    }
+}
+
+#[test]
+fn instance_context_failed_batch_graph_must_retire_before_eager_reuse() {
+    use crate::common::llm::ModelTokenCloseOutcome;
+    let (mut model, mut reference, batch) = prepared_batch_graph_fault_models();
+    model.batched_pointers_for = Some(vec!["a".into(), "b".into()]);
+    model.batched_graph_failed = true;
+    let blocked = model
+        .execution_context
+        .as_ref()
+        .unwrap()
+        .storage_retirement_blocked
+        .clone();
+    let original: Vec<_> = ["a", "b"]
+        .into_iter()
+        .map(|id| {
+            (
+                model.kv_caches[id][0].k.as_ptr() as usize,
+                model.kv_caches[id][0].v.as_ptr() as usize,
+            )
+        })
+        .collect();
+    blocked.store(true, Ordering::SeqCst);
+    let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        model.decode_batch_internal_with_full_logits(&batch, true)
+    }))
+    .expect_err("failed graph retirement must block every eager encode");
+    assert!(panic_error(failed)
+        .to_string()
+        .contains("controlled graph retirement failure"));
+    assert_original_batch_failure(&model, &original);
+    assert!(matches!(
+        model.close_managed_token_cache("b"),
+        ModelTokenCloseOutcome::Held { .. }
+    ));
+    assert_original_batch_failure(&model, &original);
+    blocked.store(false, Ordering::SeqCst);
+    let expected = reference.decode_batch_internal_with_full_logits(&batch, true);
+    let actual = model.decode_batch_internal_with_full_logits(&batch, true);
+    assert_eq!(actual.len(), 2);
+    for (row, expected_row) in actual.iter().zip(&expected) {
+        assert_eq!(row.len(), config().vocab_size);
+        assert!(row
+            .iter()
+            .chain(expected_row)
+            .all(|value| value.is_finite()));
+        assert_eq!(row, expected_row);
+    }
+    assert!(model.batched_pointers_for.is_none());
+    assert_eq!(model.execution_context.as_ref().unwrap().replay_attempts, 0);
     model.close().unwrap();
     reference.close().unwrap();
 }

@@ -2,7 +2,7 @@
 //!
 //! The Llama / Qwen3-MoE / future decoder families all share the same
 //! outer scaffolding for unified forward: cu_seqlens construction,
-//! block-table stacking, final-token index lookup, graph-cache keying.
+//! block-table stacking and final-token index lookup.
 //! These are pure functions — no kernel calls, no model state — extracted
 //! here so each family's `unified_forward_internal` reads as
 //! "scaffolding + family-specific layer loop", not "scaffolding +
@@ -97,125 +97,6 @@ pub fn compute_final_indices(
         .collect()
 }
 
-/// Compact key for host-side varlen-attention launch decisions captured in a
-/// unified CUDA graph.
-///
-/// The raw `max_kv_len` changes almost every decode step. The non-split-K CUDA
-/// launcher rounds it to a power-of-two shared-memory bucket; include that
-/// bucket here so replay is safe without allocating the full configured
-/// context window for every short-context CTA. Split-K still uses an exact
-/// chunk-shaped dynamic shared allocation, so keep it conservative there.
-pub fn unified_attention_launch_key(
-    total_q_tokens: usize,
-    num_seqs: usize,
-    max_kv_len: usize,
-    split_k_attn: Option<bool>,
-) -> u64 {
-    let use_split_k = split_k_attn
-        .unwrap_or_else(|| total_q_tokens <= 64 && (num_seqs <= 4 || max_kv_len >= 768));
-    if use_split_k {
-        let num_splits = match max_kv_len {
-            kv if kv <= 384 => 2usize,
-            kv if kv <= 1024 => 4,
-            kv if kv <= 2048 => 8,
-            _ => 16,
-        };
-        let chunk = (max_kv_len + num_splits - 1) / num_splits;
-        return 0x7370_6c69_7400_0000u64 ^ ((num_splits as u64) << 32) ^ (chunk.max(1) as u64);
-    }
-
-    let shared_kv = ferrum_kernels::backend::attention_score_capacity_bucket(max_kv_len);
-    0x7368_6d65_6d00_0000u64 ^ (shared_kv as u64)
-}
-
-/// Graph cache key for a unified mixed-batch forward. High bit set so we
-/// never collide with legacy decode/batched keys (which use the low 63
-/// bits for `m_padded` / `SINGLE_ITEM = 0`).
-///
-/// The captured region bakes in more than launch grid shape:
-/// - varlen attention freezes the dynamic shared-memory size and split-K
-///   branch represented by `attention_launch_key`;
-/// - final-token packing records concrete `copy_slice` offsets from
-///   `final_indices`.
-///
-/// Include those host-side shape decisions in the key so a graph is only
-/// replayed for the same captured launch/memcpy layout. Device buffers
-/// such as cu_seqlens, position offsets, and block tables remain dynamic.
-pub fn unified_graph_key(
-    m_total: usize,
-    num_seqs: usize,
-    attention_launch_key: u64,
-    final_indices: &[(usize, usize)],
-) -> u64 {
-    scoped_unified_graph_key(
-        0x6675_6c6c_5f67_7261,
-        m_total,
-        num_seqs,
-        attention_launch_key,
-        final_indices,
-    )
-}
-
-/// Graph cache key for a diagnostic unified graph that captures only the
-/// transformer layer loop. Final norm, final-row packing, and lm_head remain
-/// eager, so final-token offsets are intentionally not part of the key.
-pub fn unified_layers_only_graph_key(
-    m_total: usize,
-    num_seqs: usize,
-    attention_launch_key: u64,
-) -> u64 {
-    scoped_unified_graph_key(
-        0x6c61_7965_725f_6772,
-        m_total,
-        num_seqs,
-        attention_launch_key,
-        &[],
-    )
-}
-
-/// Graph cache key for a diagnostic unified graph that captures transformer
-/// layers plus final norm / final-row packing, while leaving lm_head eager.
-pub fn unified_lm_head_eager_graph_key(
-    m_total: usize,
-    num_seqs: usize,
-    attention_launch_key: u64,
-    final_indices: &[(usize, usize)],
-) -> u64 {
-    scoped_unified_graph_key(
-        0x6c6d_6865_5f65_6772,
-        m_total,
-        num_seqs,
-        attention_launch_key,
-        final_indices,
-    )
-}
-
-fn scoped_unified_graph_key(
-    scope_tag: u64,
-    m_total: usize,
-    num_seqs: usize,
-    attention_launch_key: u64,
-    final_indices: &[(usize, usize)],
-) -> u64 {
-    fn feed(mut hash: u64, value: u64) -> u64 {
-        hash ^= value;
-        hash = hash.wrapping_mul(0x100000001b3);
-        hash
-    }
-
-    let mut hash = 0xcbf29ce484222325u64;
-    hash = feed(hash, scope_tag);
-    hash = feed(hash, m_total as u64);
-    hash = feed(hash, num_seqs as u64);
-    hash = feed(hash, attention_launch_key);
-    hash = feed(hash, final_indices.len() as u64);
-    for &(orig_idx, global_idx) in final_indices {
-        hash = feed(hash, orig_idx as u64);
-        hash = feed(hash, global_idx as u64);
-    }
-    (1u64 << 63) | (hash & !(1u64 << 63))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -263,78 +144,6 @@ mod tests {
         let (_, cu, _) = compute_cu_seqlens_q(&items);
         let fi = compute_final_indices(&items, &cu);
         assert_eq!(fi, vec![(0, 4), (1, 5)]);
-    }
-
-    #[test]
-    fn graph_key_high_bit_set() {
-        let launch_key = unified_attention_launch_key(32, 4, 128, None);
-        let k = unified_graph_key(32, 4, launch_key, &[(0, 0), (1, 1), (2, 2), (3, 3)]);
-        assert!(k & (1u64 << 63) != 0, "high bit must be set");
-        // Legacy key with same low bits should differ.
-        let legacy = ((32u64) << 32) | 4u64;
-        assert_ne!(k, legacy);
-    }
-
-    #[test]
-    fn attention_launch_key_coalesces_non_split_k_within_power_of_two_bucket() {
-        let short = unified_attention_launch_key(16, 16, 129, None);
-        let longer_in_bucket = unified_attention_launch_key(16, 16, 256, None);
-        let next_bucket = unified_attention_launch_key(16, 16, 257, None);
-
-        assert_eq!(short, longer_in_bucket);
-        assert_ne!(short, next_bucket);
-    }
-
-    #[test]
-    fn attention_launch_key_keeps_split_k_chunk_shape() {
-        let short = unified_attention_launch_key(2, 2, 128, None);
-        let longer = unified_attention_launch_key(2, 2, 256, None);
-        let forced_off = unified_attention_launch_key(2, 2, 128, Some(false));
-
-        assert_ne!(short, longer);
-        assert_ne!(short, forced_off);
-    }
-
-    #[test]
-    fn graph_key_uses_attention_launch_shape_and_final_offsets() {
-        let decode_final = vec![(0, 0), (1, 1)];
-        let same_launch_short = unified_attention_launch_key(16, 16, 129, None);
-        let same_launch_long = unified_attention_launch_key(16, 16, 256, None);
-        let next_bucket = unified_attention_launch_key(16, 16, 257, None);
-        let same_grid_short_kv = unified_graph_key(16, 16, same_launch_short, &decode_final);
-        let same_grid_long_kv = unified_graph_key(16, 16, same_launch_long, &decode_final);
-        let different_launch = unified_graph_key(16, 16, next_bucket, &decode_final);
-        assert_eq!(same_grid_short_kv, same_grid_long_kv);
-        assert_ne!(same_grid_short_kv, different_launch);
-
-        let prefill_final = vec![(0, 4), (1, 5)];
-        let prefill_launch = unified_attention_launch_key(6, 2, 128, None);
-        let different_final_offsets = unified_graph_key(6, 2, prefill_launch, &prefill_final);
-        let same_grid_other_offsets = unified_graph_key(6, 2, prefill_launch, &[(0, 2), (1, 5)]);
-        assert_ne!(different_final_offsets, same_grid_other_offsets);
-
-        let no_sample = unified_graph_key(6, 2, prefill_launch, &[]);
-        assert_ne!(different_final_offsets, no_sample);
-    }
-
-    #[test]
-    fn graph_key_distinguishes_capture_scope() {
-        let launch_short = unified_attention_launch_key(6, 2, 128, None);
-        let launch_long = unified_attention_launch_key(6, 2, 640, None);
-        let full_no_sample = unified_graph_key(6, 2, launch_short, &[]);
-        let layers_only = unified_layers_only_graph_key(6, 2, launch_short);
-        let lm_head_eager = unified_lm_head_eager_graph_key(6, 2, launch_short, &[(0, 4), (1, 5)]);
-        assert_ne!(full_no_sample, layers_only);
-        assert_ne!(full_no_sample, lm_head_eager);
-        assert_ne!(layers_only, lm_head_eager);
-        assert_ne!(
-            layers_only,
-            unified_layers_only_graph_key(6, 2, launch_long)
-        );
-        assert_ne!(
-            lm_head_eager,
-            unified_lm_head_eager_graph_key(6, 2, launch_long, &[(0, 4), (1, 5)])
-        );
     }
 
     #[test]

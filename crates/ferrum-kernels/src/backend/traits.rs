@@ -1736,6 +1736,14 @@ pub trait BackendPagedKv: Backend {
     fn supports_paged_kv() -> bool {
         false
     }
+
+    /// Whether paged prefill and decode preserve a nonzero causal sliding
+    /// window. Varlen QKV alone does not qualify attention masking. Callers
+    /// must select another supported layout when this capability is absent.
+    fn supports_windowed_paged_attention() -> bool {
+        false
+    }
+
     /// Prepare the original context's per-layer pointer tables before graph
     /// capture/replay. Flat inputs are layer-major: [layer * m + item].
     /// Each layer and K/V role has its own persistent host region; captured
@@ -1815,8 +1823,20 @@ pub trait BackendPagedKv: Backend {
     ///   `block_tables`: `[num_seqs, max_num_blocks_per_seq]` u32
     ///   `context_lens`: `[num_seqs]` u32
     ///
-    /// Backends without a paged kernel return Unsupported; callers are
-    /// expected to fall back to contiguous KV.
+    /// `sliding_window == 0` preserves full causal attention; otherwise each
+    /// query attends only its latest `sliding_window` positions. Windowed or
+    /// multi-token calls may prepare metadata and must run outside capture;
+    /// captured callers use the device-staged varlen entry directly.
+    ///
+    /// `host_context_lens`, when provided, is the exact per-row projection from
+    /// the same producer/frontier as `context_lens`, with `num_seqs` entries.
+    /// It must equal the device values submitted on this context; it is not a
+    /// capacity estimate or an independent cached length authority. Backends
+    /// may copy it into context-owned device metadata during this call; they
+    /// must not capture the borrowed host slice. Windowed CUDA calls require
+    /// this projection, or callers must use the device-staged varlen entry.
+    /// Backends without the required capability return Unsupported; callers
+    /// select a supported layout before allocating cache storage.
     #[allow(clippy::too_many_arguments)]
     fn paged_decode_attention(
         _ctx: &mut Self::Context,
@@ -1833,6 +1853,8 @@ pub trait BackendPagedKv: Backend {
         _block_size: usize,
         _max_num_blocks_per_seq: usize,
         _q_len: usize,
+        _sliding_window: usize,
+        _host_context_lens: Option<&[u32]>,
     ) -> Result<()> {
         Err(FerrumError::unsupported(
             "paged_decode_attention not implemented for this backend",
@@ -1890,6 +1912,24 @@ pub trait BackendPagedKv: Backend {
             "split_qkv_norm_rope_into_paged_cache_varlen not implemented for this backend",
         ))
     }
+    /// Prepare the actual context's varlen attention launch before graph capture.
+    /// The returned geometry must describe the same route and shared-memory
+    /// extent used by `paged_varlen_attention` for these dimensions. Any scratch
+    /// needed by that route remains owned by the original context, including
+    /// old storage retained for already-captured graphs. Default is unqualified.
+    fn prepare_paged_varlen_attention(
+        _ctx: &mut Self::Context,
+        _num_seqs: usize,
+        _total_q_tokens: usize,
+        _max_kv_len: usize,
+        _num_heads: usize,
+        _head_dim: usize,
+    ) -> Result<super::PagedAttentionLaunchGeometry> {
+        Err(FerrumError::unsupported(
+            "paged varlen capture preparation is not implemented",
+        ))
+    }
+
     /// Variable-length paged attention with GQA + causal mask.
     ///
     /// Supports a unified mixed batch where each sequence contributes

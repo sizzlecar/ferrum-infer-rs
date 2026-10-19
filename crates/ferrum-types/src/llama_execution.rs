@@ -69,6 +69,8 @@ pub struct LlamaExecutionOptions {
     pub unified_graph_layers_only: bool,
     pub unified_graph_lm_head_eager: bool,
     pub greedy_argmax: bool,
+    /// Legacy cold-assembly alias for backend_context.cuda.split_k_attn.
+    /// A missing canonical value adopts this alias; explicit conflicts fail.
     pub split_k_attn: Option<bool>,
     pub nan_trace: LlamaNanTraceConfig,
     pub op_dump_dir: Option<String>,
@@ -136,7 +138,26 @@ impl Default for LlamaExecutionConfig {
 }
 
 impl LlamaExecutionConfig {
+    /// Resolve legacy aliases once, before constructing the original backend.
+    pub fn normalized(mut self) -> Result<Self, String> {
+        self.validate()?;
+        if self.backend_context.cuda.split_k_attn.is_none() {
+            self.backend_context.cuda.split_k_attn = self.options.split_k_attn;
+        }
+        Ok(self)
+    }
+
     pub fn validate(&self) -> Result<(), String> {
+        if let (Some(alias), Some(canonical)) = (
+            self.options.split_k_attn,
+            self.backend_context.cuda.split_k_attn,
+        ) {
+            if alias != canonical {
+                return Err(
+                    "split-K alias conflicts with backend_context.cuda.split_k_attn".into(),
+                );
+            }
+        }
         self.backend_context
             .validate()
             .map_err(|error| error.to_string())?;
@@ -154,6 +175,27 @@ impl LlamaExecutionConfig {
 mod tests {
     use super::*;
     use crate::{EngineConfig, RuntimeConfigSnapshot};
+
+    #[test]
+    fn split_k_alias_normalizes_without_overriding_canonical_policy() {
+        let mut direct = LlamaExecutionConfig::default();
+        direct.options.split_k_attn = Some(false);
+        let normalized = direct.clone().normalized().unwrap();
+        assert_eq!(normalized.backend_context.cuda.split_k_attn, Some(false));
+        assert_eq!(direct.backend_context.cuda.split_k_attn, None);
+        direct.backend_context.cuda.split_k_attn = Some(true);
+        assert!(direct.validate().is_err());
+        assert!(direct.normalized().is_err());
+        let mut engine = EngineConfig::default();
+        engine.runtime.backend_context.cuda.split_k_attn = Some(true);
+        let canonical = engine.llama_execution_config().normalized().unwrap();
+        assert_eq!(canonical.options.split_k_attn, None);
+        assert_eq!(canonical.backend_context.cuda.split_k_attn, Some(true));
+        engine.runtime.llama.split_k_attn = Some(false);
+        assert!(engine.llama_execution_config().validate().is_err());
+        engine.runtime.llama.split_k_attn = Some(true);
+        assert!(engine.llama_execution_config().normalized().is_ok());
+    }
 
     #[test]
     fn llama_instance_defaults_preserve_model_pool_and_graph_policy() {
