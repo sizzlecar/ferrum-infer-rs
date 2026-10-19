@@ -3,8 +3,8 @@
 
 #![cfg(all(target_os = "macos", feature = "metal"))]
 
+use crate::attention::metal::pipelines::MetalPipelines;
 use std::ffi::c_void;
-use std::sync::OnceLock;
 
 use metal::{
     Buffer, CompileOptions, ComputeCommandEncoderRef, ComputePipelineState, Device, MTLSize,
@@ -12,72 +12,59 @@ use metal::{
 
 const SHADER_SRC: &str = include_str!("moe_post_ops.metal");
 
-static SILU_PIPELINE: OnceLock<ComputePipelineState> = OnceLock::new();
-static WSUM_PIPELINE: OnceLock<ComputePipelineState> = OnceLock::new();
-static WSUM_RES_PIPELINE: OnceLock<ComputePipelineState> = OnceLock::new();
-static WSUM_RES_NORM_PIPELINE: OnceLock<ComputePipelineState> = OnceLock::new();
-
-fn silu_pipeline(device: &Device) -> &'static ComputePipelineState {
-    SILU_PIPELINE.get_or_init(|| {
-        let lib = device
-            .new_library_with_source(SHADER_SRC, &CompileOptions::new())
-            .expect("compile moe_post_ops.metal");
-        let function = lib
-            .get_function("silu_mul_stacked_f32", None)
-            .expect("find silu_mul_stacked_f32");
-        device
-            .new_compute_pipeline_state_with_function(&function)
-            .expect("build silu_mul_stacked_f32 pipeline")
-    })
+pub(crate) fn build_silu_pipeline(device: &Device) -> ComputePipelineState {
+    let lib = device
+        .new_library_with_source(SHADER_SRC, &CompileOptions::new())
+        .expect("compile moe_post_ops.metal");
+    let function = lib
+        .get_function("silu_mul_stacked_f32", None)
+        .expect("find silu_mul_stacked_f32");
+    device
+        .new_compute_pipeline_state_with_function(&function)
+        .expect("build silu_mul_stacked_f32 pipeline")
 }
 
-fn wsum_pipeline(device: &Device) -> &'static ComputePipelineState {
-    WSUM_PIPELINE.get_or_init(|| {
-        let lib = device
-            .new_library_with_source(SHADER_SRC, &CompileOptions::new())
-            .expect("compile moe_post_ops.metal");
-        let function = lib
-            .get_function("weighted_sum_stacked_f32", None)
-            .expect("find weighted_sum_stacked_f32");
-        device
-            .new_compute_pipeline_state_with_function(&function)
-            .expect("build weighted_sum_stacked_f32 pipeline")
-    })
+pub(crate) fn build_wsum_pipeline(device: &Device) -> ComputePipelineState {
+    let lib = device
+        .new_library_with_source(SHADER_SRC, &CompileOptions::new())
+        .expect("compile moe_post_ops.metal");
+    let function = lib
+        .get_function("weighted_sum_stacked_f32", None)
+        .expect("find weighted_sum_stacked_f32");
+    device
+        .new_compute_pipeline_state_with_function(&function)
+        .expect("build weighted_sum_stacked_f32 pipeline")
 }
 
-fn wsum_res_pipeline(device: &Device) -> &'static ComputePipelineState {
-    WSUM_RES_PIPELINE.get_or_init(|| {
-        let lib = device
-            .new_library_with_source(SHADER_SRC, &CompileOptions::new())
-            .expect("compile moe_post_ops.metal");
-        let function = lib
-            .get_function("weighted_sum_residual_stacked_f32", None)
-            .expect("find weighted_sum_residual_stacked_f32");
-        device
-            .new_compute_pipeline_state_with_function(&function)
-            .expect("build weighted_sum_residual_stacked_f32 pipeline")
-    })
+pub(crate) fn build_wsum_res_pipeline(device: &Device) -> ComputePipelineState {
+    let lib = device
+        .new_library_with_source(SHADER_SRC, &CompileOptions::new())
+        .expect("compile moe_post_ops.metal");
+    let function = lib
+        .get_function("weighted_sum_residual_stacked_f32", None)
+        .expect("find weighted_sum_residual_stacked_f32");
+    device
+        .new_compute_pipeline_state_with_function(&function)
+        .expect("build weighted_sum_residual_stacked_f32 pipeline")
 }
 
-fn wsum_res_norm_pipeline(device: &Device) -> &'static ComputePipelineState {
-    WSUM_RES_NORM_PIPELINE.get_or_init(|| {
-        let lib = device
-            .new_library_with_source(SHADER_SRC, &CompileOptions::new())
-            .expect("compile moe_post_ops.metal");
-        let function = lib
-            .get_function("weighted_sum_residual_norm_stacked_f32", None)
-            .expect("find weighted_sum_residual_norm_stacked_f32");
-        device
-            .new_compute_pipeline_state_with_function(&function)
-            .expect("build weighted_sum_residual_norm_stacked_f32 pipeline")
-    })
+pub(crate) fn build_wsum_res_norm_pipeline(device: &Device) -> ComputePipelineState {
+    let lib = device
+        .new_library_with_source(SHADER_SRC, &CompileOptions::new())
+        .expect("compile moe_post_ops.metal");
+    let function = lib
+        .get_function("weighted_sum_residual_norm_stacked_f32", None)
+        .expect("find weighted_sum_residual_norm_stacked_f32");
+    device
+        .new_compute_pipeline_state_with_function(&function)
+        .expect("build weighted_sum_residual_norm_stacked_f32 pipeline")
 }
 
 /// Stacked SiLU·gate dispatch.
 ///
 /// `gate`, `up`: `[n_slots, ffn]`. `out`: `[n_slots, ffn]`.
-pub fn dispatch_silu_mul_stacked(
-    device: &Device,
+pub(crate) fn dispatch_silu_mul_stacked(
+    pipes: &MetalPipelines,
     enc: &ComputeCommandEncoderRef,
     gate: &Buffer,
     up: &Buffer,
@@ -95,7 +82,7 @@ pub fn dispatch_silu_mul_stacked(
         n_slots: n_slots as i32,
     };
 
-    let pipe = silu_pipeline(device);
+    let pipe = pipes.moe_post_ops_silu_pipeline();
     enc.set_compute_pipeline_state(pipe);
     enc.set_buffer(0, Some(gate), 0);
     enc.set_buffer(1, Some(up), 0);
@@ -115,8 +102,8 @@ pub fn dispatch_silu_mul_stacked(
 /// Weighted-sum across slots dispatch.
 ///
 /// `slots`: `[n_slots, hidden]`. `weights`: `[n_slots]`. `out`: `[hidden]`.
-pub fn dispatch_weighted_sum_stacked(
-    device: &Device,
+pub(crate) fn dispatch_weighted_sum_stacked(
+    pipes: &MetalPipelines,
     enc: &ComputeCommandEncoderRef,
     slots: &Buffer,
     weights: &Buffer,
@@ -134,7 +121,7 @@ pub fn dispatch_weighted_sum_stacked(
         n_slots: n_slots as i32,
     };
 
-    let pipe = wsum_pipeline(device);
+    let pipe = pipes.moe_post_ops_wsum_pipeline();
     enc.set_compute_pipeline_state(pipe);
     enc.set_buffer(0, Some(slots), 0);
     enc.set_buffer(1, Some(weights), 0);
@@ -156,8 +143,8 @@ pub fn dispatch_weighted_sum_stacked(
 /// `slots`: `[n_slots, hidden]`. `weights`: `[n_slots]`. `residual`: `[hidden]`,
 /// read-AND-written. Replaces the (`weighted_sum_stacked` → `moe_out`) +
 /// (`add_inplace` `residual += moe_out`) pair on the decode hot path.
-pub fn dispatch_weighted_sum_residual_stacked(
-    device: &Device,
+pub(crate) fn dispatch_weighted_sum_residual_stacked(
+    pipes: &MetalPipelines,
     enc: &ComputeCommandEncoderRef,
     slots: &Buffer,
     weights: &Buffer,
@@ -175,7 +162,7 @@ pub fn dispatch_weighted_sum_residual_stacked(
         n_slots: n_slots as i32,
     };
 
-    let pipe = wsum_res_pipeline(device);
+    let pipe = pipes.moe_post_ops_wsum_res_pipeline();
     enc.set_compute_pipeline_state(pipe);
     enc.set_buffer(0, Some(slots), 0);
     enc.set_buffer(1, Some(weights), 0);
@@ -200,8 +187,8 @@ pub fn dispatch_weighted_sum_residual_stacked(
 /// Caller must skip the next layer's standalone `rms_norm` — `normed_out`
 /// IS that layer's `norm_out` input.
 #[allow(clippy::too_many_arguments)]
-pub fn dispatch_weighted_sum_residual_norm_stacked(
-    device: &Device,
+pub(crate) fn dispatch_weighted_sum_residual_norm_stacked(
+    pipes: &MetalPipelines,
     enc: &ComputeCommandEncoderRef,
     slots: &Buffer,
     weights: &Buffer,
@@ -224,7 +211,7 @@ pub fn dispatch_weighted_sum_residual_norm_stacked(
         eps,
     };
 
-    let pipe = wsum_res_norm_pipeline(device);
+    let pipe = pipes.moe_post_ops_wsum_res_norm_pipeline();
     enc.set_compute_pipeline_state(pipe);
     enc.set_buffer(0, Some(slots), 0);
     enc.set_buffer(1, Some(weights), 0);

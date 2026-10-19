@@ -13,7 +13,7 @@
 use std::any::Any;
 
 use crate::backend::metal::{
-    dispatch_gemv_moe_id, dispatch_gemv_moe_id_offset, st, MetalBackend, MetalQuantStore,
+    dispatch_gemv_moe_id, dispatch_gemv_moe_id_offset, MetalBackend, MetalQuantStore,
 };
 use crate::stacked_expert::StackedExpertGgufLinear;
 use ferrum_types::{FerrumError, Result};
@@ -21,14 +21,14 @@ use ferrum_types::{FerrumError, Result};
 /// Metal MoE-stacked GGUF Linear. Internally holds a `MetalQuantStore`
 /// that MUST be `Q4KExperts` or `Q6KExperts` (constructor enforces).
 /// Plain enum wrapper keeps the existing dispatcher signatures usable.
-pub struct MetalStackedExpertGgufLinear {
-    pub store: MetalQuantStore,
+pub(crate) struct MetalStackedExpertGgufLinear {
+    pub(crate) store: MetalQuantStore,
 }
 
 impl MetalStackedExpertGgufLinear {
     /// Wrap a `MetalQuantStore` that's been built by `load_q4k_experts`
     /// or `load_q6k_experts`. Returns Err if any other variant is passed.
-    pub fn new(store: MetalQuantStore) -> Result<Self> {
+    pub(crate) fn new(store: MetalQuantStore) -> Result<Self> {
         match &store {
             MetalQuantStore::Q4KExperts { .. } | MetalQuantStore::Q6KExperts { .. } => {
                 Ok(Self { store })
@@ -38,12 +38,6 @@ impl MetalStackedExpertGgufLinear {
                     .to_string(),
             )),
         }
-    }
-
-    /// Borrow the inner `MetalQuantStore` — exposed for fused methods that
-    /// need to dispatch on both gate and up stores together.
-    pub fn store(&self) -> &MetalQuantStore {
-        &self.store
     }
 
     fn dims(&self) -> (usize, usize, usize) {
@@ -103,8 +97,9 @@ impl StackedExpertGgufLinear<MetalBackend> for MetalStackedExpertGgufLinear {
         let a_buf = a.expect_f32("gemv_moe_id a");
         let ids_buf = &ids.raw;
         let out_buf = out.expect_f32_mut("gemv_moe_id out");
-        let enc = ctx.compute_encoder();
+        let (pipes, enc, _) = ctx.encoder_parts();
         dispatch_gemv_moe_id(
+            pipes,
             enc,
             a_buf,
             &self.store,
@@ -129,10 +124,11 @@ impl StackedExpertGgufLinear<MetalBackend> for MetalStackedExpertGgufLinear {
         let a_buf = a.expect_f32("gemv_moe_id_offset a");
         let ids_buf = &ids.raw;
         let out_buf = out.expect_f32_mut("gemv_moe_id_offset out");
-        let enc = ctx.compute_encoder();
+        let (pipes, enc, _) = ctx.encoder_parts();
         let a_byte_offset = (a_offset * std::mem::size_of::<f32>()) as u64;
         let ids_byte_offset = (ids_offset * std::mem::size_of::<i32>()) as u64;
         dispatch_gemv_moe_id_offset(
+            pipes,
             enc,
             a_buf,
             a_byte_offset,
@@ -193,9 +189,9 @@ impl StackedExpertGgufLinear<MetalBackend> for MetalStackedExpertGgufLinear {
         let a_buf = a.expect_f32("gemv_moe_id_gate_up_silu a");
         let ids_buf = &ids.raw;
         let out_buf = silu_out.expect_f32_mut("gemv_moe_id_gate_up_silu silu_out");
-        let enc = ctx.compute_encoder();
-        crate::q4_k_moe_id_gate_up_silu::dispatch_gemv_q4k_moe_id_gate_up_silu_on_encoder(
-            &st().pipes.device,
+        let (pipes, enc, _) = ctx.encoder_parts();
+        crate::backend::metal::q4_k_moe_id_gate_up_silu::dispatch_gemv_q4k_moe_id_gate_up_silu_on_encoder(
+            pipes,
             enc,
             a_buf,
             gate_blocks,
@@ -225,7 +221,7 @@ impl StackedExpertGgufLinear<MetalBackend> for MetalStackedExpertGgufLinear {
         let a_buf = a.expect_f32("gemv_moe_id_batched a");
         let ids_buf = &ids.raw;
         let out_buf = out.expect_f32_mut("gemv_moe_id_batched out");
-        let enc = ctx.compute_encoder();
+        let (pipes, enc, _) = ctx.encoder_parts();
         match &self.store {
             MetalQuantStore::Q4KExperts {
                 blocks,
@@ -234,8 +230,8 @@ impl StackedExpertGgufLinear<MetalBackend> for MetalStackedExpertGgufLinear {
                 n_cols,
                 ..
             } => {
-                crate::q4_k_moe_id_gemv_batched::dispatch_gemv_q4k_moe_id_batched_on_encoder(
-                    &st().pipes.device,
+                crate::backend::metal::q4_k_moe_id_gemv_batched::dispatch_gemv_q4k_moe_id_batched_on_encoder(
+                    pipes,
                     enc,
                     a_buf,
                     blocks,
@@ -258,8 +254,8 @@ impl StackedExpertGgufLinear<MetalBackend> for MetalStackedExpertGgufLinear {
                 n_cols,
                 ..
             } => {
-                crate::q6_k_moe_id_gemv_batched::dispatch_gemv_q6k_moe_id_batched_on_encoder(
-                    &st().pipes.device,
+                crate::backend::metal::q6_k_moe_id_gemv_batched::dispatch_gemv_q6k_moe_id_batched_on_encoder(
+                    pipes,
                     enc,
                     a_buf,
                     blocks,
@@ -329,9 +325,9 @@ impl StackedExpertGgufLinear<MetalBackend> for MetalStackedExpertGgufLinear {
         let a_buf = a.expect_f32("gemv_moe_id_gate_up_silu_batched a");
         let ids_buf = &ids.raw;
         let out_buf = silu_out.expect_f32_mut("gemv_moe_id_gate_up_silu_batched silu_out");
-        let enc = ctx.compute_encoder();
-        crate::q4_k_moe_id_gate_up_silu_batched::dispatch_gemv_q4k_moe_id_gate_up_silu_batched_on_encoder(
-            &st().pipes.device,
+        let (pipes, enc, _) = ctx.encoder_parts();
+        crate::backend::metal::q4_k_moe_id_gate_up_silu_batched::dispatch_gemv_q4k_moe_id_gate_up_silu_batched_on_encoder(
+            pipes,
             enc,
             a_buf,
             gate_blocks,
@@ -366,7 +362,7 @@ impl StackedExpertGgufLinear<MetalBackend> for MetalStackedExpertGgufLinear {
         let ids_buf = &ids.raw;
         let tpe_buf = &tpe.raw;
         let out_buf = out.expect_f32_mut("gemm_moe_id out");
-        let enc = ctx.compute_encoder();
+        let (pipes, enc, _) = ctx.encoder_parts();
         match &self.store {
             MetalQuantStore::Q4KExperts {
                 blocks,
@@ -376,8 +372,8 @@ impl StackedExpertGgufLinear<MetalBackend> for MetalStackedExpertGgufLinear {
                 n_cols,
                 ..
             } => {
-                crate::q4_k_moe_id_gemm::dispatch_gemm_q4k_moe_id_on_encoder(
-                    &st().pipes.device,
+                crate::backend::metal::q4_k_moe_id_gemm::dispatch_gemm_q4k_moe_id_on_encoder(
+                    pipes,
                     enc,
                     blocks,
                     *byte_offset,
@@ -403,8 +399,8 @@ impl StackedExpertGgufLinear<MetalBackend> for MetalStackedExpertGgufLinear {
                 n_cols,
                 ..
             } => {
-                crate::q6_k_moe_id_gemm::dispatch_gemm_q6k_moe_id_on_encoder(
-                    &st().pipes.device,
+                crate::backend::metal::q6_k_moe_id_gemm::dispatch_gemm_q6k_moe_id_on_encoder(
+                    pipes,
                     enc,
                     blocks,
                     *byte_offset,
@@ -444,7 +440,7 @@ impl StackedExpertGgufLinear<MetalBackend> for MetalStackedExpertGgufLinear {
         let tpe_buf = &tpe.raw;
         let out_buf = out.expect_f32_mut("gemm_moe_id_indirect out");
         let args = &args_buf.raw;
-        let enc = ctx.compute_encoder();
+        let (pipes, enc, _) = ctx.encoder_parts();
         match &self.store {
             MetalQuantStore::Q4KExperts {
                 blocks,
@@ -454,8 +450,8 @@ impl StackedExpertGgufLinear<MetalBackend> for MetalStackedExpertGgufLinear {
                 n_cols,
                 ..
             } => {
-                crate::q4_k_moe_id_gemm::dispatch_gemm_q4k_moe_id_indirect_on_encoder(
-                    &st().pipes.device,
+                crate::backend::metal::q4_k_moe_id_gemm::dispatch_gemm_q4k_moe_id_indirect_on_encoder(
+                    pipes,
                     enc,
                     blocks,
                     *byte_offset,
@@ -482,8 +478,8 @@ impl StackedExpertGgufLinear<MetalBackend> for MetalStackedExpertGgufLinear {
                 n_cols,
                 ..
             } => {
-                crate::q6_k_moe_id_gemm::dispatch_gemm_q6k_moe_id_indirect_on_encoder(
-                    &st().pipes.device,
+                crate::backend::metal::q6_k_moe_id_gemm::dispatch_gemm_q6k_moe_id_indirect_on_encoder(
+                    pipes,
                     enc,
                     blocks,
                     *byte_offset,

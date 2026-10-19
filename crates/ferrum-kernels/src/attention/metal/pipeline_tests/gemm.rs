@@ -2,7 +2,7 @@
 
 #[cfg(all(target_os = "macos", feature = "metal"))]
 mod gemm_tests {
-    use ferrum_kernels::attention::metal::pipelines::MetalPipelines;
+    use crate::attention::metal::pipelines::MetalPipelines;
     use metal::Device;
 
     extern "C" {
@@ -49,6 +49,7 @@ mod gemm_tests {
 
     fn run_metal_gemm(
         pipes: &MetalPipelines,
+        queue: &metal::CommandQueue,
         a: &[f32],
         b: &[f32],
         m: usize,
@@ -59,7 +60,7 @@ mod gemm_tests {
         let b_buf = pipes.buffer_from_data(b);
         let c_buf = pipes.buffer_empty(m * n);
 
-        let cmd = pipes.queue.new_command_buffer();
+        let cmd = queue.new_command_buffer();
         let enc = cmd.new_compute_command_encoder();
 
         #[repr(C)]
@@ -73,7 +74,7 @@ mod gemm_tests {
             n: n as i32,
             k: k as i32,
         };
-        let params_buf = pipes.device.new_buffer_with_data(
+        let params_buf = pipes.device().new_buffer_with_data(
             &params as *const _ as *const std::ffi::c_void,
             12,
             metal::MTLResourceOptions::StorageModeShared,
@@ -108,6 +109,7 @@ mod gemm_tests {
     #[test]
     fn test_gemm_v2_aligned() {
         let device = Device::system_default().expect("no Metal");
+        let queue = device.new_command_queue();
         let pipes = MetalPipelines::new(&device);
 
         // 64x32 aligned (exact tile)
@@ -118,12 +120,16 @@ mod gemm_tests {
         let b = random_data(n * k, 13);
 
         let ref_c = ref_gemm_at_bt(&a, &b, m, n, k);
-        let metal_c = run_metal_gemm(&pipes, &a, &b, m, n, k);
+        let metal_c = run_metal_gemm(&pipes, &queue, &a, &b, m, n, k);
 
+        assert_eq!(ref_c.len(), metal_c.len());
         let max_diff = ref_c
             .iter()
             .zip(metal_c.iter())
-            .map(|(r, m)| (r - m).abs())
+            .map(|(r, m)| {
+                assert!(r.is_finite() && m.is_finite(), "reference={r}, Metal={m}");
+                (r - m).abs()
+            })
             .fold(0.0f32, f32::max);
         eprintln!("aligned {}x{}x{}: max_diff = {:.2e}", m, n, k, max_diff);
         assert!(max_diff < 1e-4, "max_diff {} too large", max_diff);
@@ -132,6 +138,7 @@ mod gemm_tests {
     #[test]
     fn test_gemm_v2_model_sizes() {
         let device = Device::system_default().expect("no Metal");
+        let queue = device.new_command_queue();
         let pipes = MetalPipelines::new(&device);
 
         // Real model GEMM sizes: Q/K/V projection, O proj, MLP
@@ -150,12 +157,19 @@ mod gemm_tests {
             let b = random_data(n * k, 13);
 
             let ref_c = ref_gemm_at_bt(&a, &b, m, n, k);
-            let metal_c = run_metal_gemm(&pipes, &a, &b, m, n, k);
+            let metal_c = run_metal_gemm(&pipes, &queue, &a, &b, m, n, k);
 
+            assert_eq!(ref_c.len(), metal_c.len());
             let max_diff = ref_c
                 .iter()
                 .zip(metal_c.iter())
-                .map(|(r, m)| (r - m).abs())
+                .map(|(r, m)| {
+                    assert!(
+                        r.is_finite() && m.is_finite(),
+                        "{name}: reference={r}, Metal={m}"
+                    );
+                    (r - m).abs()
+                })
                 .fold(0.0f32, f32::max);
             eprintln!("{}: {}x{}x{} max_diff = {:.2e}", name, m, n, k, max_diff);
             assert!(max_diff < 1e-3, "{}: max_diff {} too large", name, max_diff);
@@ -165,6 +179,7 @@ mod gemm_tests {
     #[test]
     fn test_gemm_v2_perf() {
         let device = Device::system_default().expect("no Metal");
+        let queue = device.new_command_queue();
         let pipes = MetalPipelines::new(&device);
 
         let m = 73;
@@ -174,12 +189,12 @@ mod gemm_tests {
         let b = random_data(n * k, 13);
 
         // Warmup
-        let _ = run_metal_gemm(&pipes, &a, &b, m, n, k);
+        let _ = run_metal_gemm(&pipes, &queue, &a, &b, m, n, k);
 
         let start = std::time::Instant::now();
         let iters = 100;
         for _ in 0..iters {
-            let _ = run_metal_gemm(&pipes, &a, &b, m, n, k);
+            let _ = run_metal_gemm(&pipes, &queue, &a, &b, m, n, k);
         }
         let elapsed = start.elapsed();
         let per_iter = elapsed.as_secs_f64() / iters as f64 * 1000.0;

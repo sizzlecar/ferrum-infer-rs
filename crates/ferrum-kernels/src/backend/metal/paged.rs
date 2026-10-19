@@ -1,6 +1,6 @@
 //! Metal `BackendPagedKv` impl. Extracted from `metal.rs` (Audit #8).
 
-use super::{st, MetalBackend};
+use super::MetalBackend;
 use ferrum_types::Result;
 
 impl crate::backend::BackendPagedKv for MetalBackend {
@@ -41,8 +41,8 @@ impl crate::backend::BackendPagedKv for MetalBackend {
         let cache_k = cache_k.expect_f32_mut("split_qkv_norm_rope_paged cache_k");
         let cache_v = cache_v.expect_f32_mut("split_qkv_norm_rope_paged cache_v");
         let bt = &block_table.raw;
-        let enc = ctx.compute_encoder();
-        st().pipes.split_qkv_norm_rope_into_paged_cache(
+        let (pipes, enc, _) = ctx.encoder_parts();
+        pipes.split_qkv_norm_rope_into_paged_cache(
             enc,
             qkv,
             qkv_byte_offset,
@@ -91,7 +91,7 @@ impl crate::backend::BackendPagedKv for MetalBackend {
         let out = out.expect_f32_mut("paged_decode_attention out");
         let bt = &block_tables.raw;
         let cl = &context_lens.raw;
-        let enc = ctx.compute_encoder();
+        let (pipes, enc, _) = ctx.encoder_parts();
         // q_len=1 (decode): token-major layout matches scratch.q_head_major
         // when tokens=1 (the head and token dims collapse).
         // q_len>1 (prefill): scratch.q_head_major is `[num_heads, q_len,
@@ -101,7 +101,7 @@ impl crate::backend::BackendPagedKv for MetalBackend {
         } else {
             crate::attention::metal::pipelines::PagedAttnQLayout::HeadMajor
         };
-        st().pipes.paged_decode_attention_on_encoder(
+        pipes.paged_decode_attention_on_encoder(
             enc,
             q,
             k_pool,

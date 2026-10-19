@@ -15,8 +15,8 @@
 
 #![cfg(all(target_os = "macos", feature = "metal"))]
 
+use crate::attention::metal::pipelines::MetalPipelines;
 use std::ffi::c_void;
-use std::sync::OnceLock;
 
 use metal::{
     Buffer, CompileOptions, ComputeCommandEncoderRef, ComputePipelineState, Device, MTLSize,
@@ -27,20 +27,16 @@ const KERNEL_NAME: &str = "gemv_f32a_q4kw_v2";
 pub(crate) const F16_BATCHED_KERNEL_NAME: &str = "gemv_f16a_q4kw_v2_batched";
 pub(crate) const F32_BATCHED_KERNEL_NAME: &str = "gemv_f32a_q4kw_v2_batched";
 
-static PIPELINE: OnceLock<ComputePipelineState> = OnceLock::new();
-
-fn pipeline(device: &Device) -> &'static ComputePipelineState {
-    PIPELINE.get_or_init(|| {
-        let lib = device
-            .new_library_with_source(SHADER_SRC, &CompileOptions::new())
-            .expect("compile q4_k_gemv_v2.metal");
-        let function = lib
-            .get_function(KERNEL_NAME, None)
-            .expect("find gemv_f32a_q4kw_v2 function");
-        device
-            .new_compute_pipeline_state_with_function(&function)
-            .expect("build gemv_f32a_q4kw_v2 pipeline")
-    })
+pub(crate) fn build_pipeline(device: &Device) -> ComputePipelineState {
+    let lib = device
+        .new_library_with_source(SHADER_SRC, &CompileOptions::new())
+        .expect("compile q4_k_gemv_v2.metal");
+    let function = lib
+        .get_function(KERNEL_NAME, None)
+        .expect("find gemv_f32a_q4kw_v2 function");
+    device
+        .new_compute_pipeline_state_with_function(&function)
+        .expect("build gemv_f32a_q4kw_v2 pipeline")
 }
 
 pub(crate) fn new_f16_batched_pipeline(device: &Device) -> Result<ComputePipelineState, String> {
@@ -74,8 +70,8 @@ pub(crate) fn new_f32_batched_pipeline(device: &Device) -> Result<ComputePipelin
 /// `c`:    `f32[N]` output (written by the kernel)
 /// `n`:    out_features (must satisfy n % 4 == 0 — block size is 4 rows)
 /// `k`:    in_features (must satisfy k % 256 == 0)
-pub fn dispatch_gemv_q4k_v2_on_encoder(
-    device: &Device,
+pub(crate) fn dispatch_gemv_q4k_v2_on_encoder(
+    pipes: &MetalPipelines,
     enc: &ComputeCommandEncoderRef,
     a: &Buffer,
     src0: &Buffer,
@@ -84,7 +80,7 @@ pub fn dispatch_gemv_q4k_v2_on_encoder(
     n: usize,
     k: usize,
 ) {
-    dispatch_gemv_q4k_v2_offset(device, enc, a, 0, src0, src0_byte_offset, c, 0, n, k);
+    dispatch_gemv_q4k_v2_offset(pipes, enc, a, 0, src0, src0_byte_offset, c, 0, n, k);
 }
 
 /// Same as [`dispatch_gemv_q4k_v2_on_encoder`] with byte offsets into
@@ -93,8 +89,8 @@ pub fn dispatch_gemv_q4k_v2_on_encoder(
 /// is a shared zero-copy mmap buffer). Used by `MultiQuantLinear` to
 /// write each fused-projection part into a disjoint slice of the shared
 /// output buffer.
-pub fn dispatch_gemv_q4k_v2_offset(
-    device: &Device,
+pub(crate) fn dispatch_gemv_q4k_v2_offset(
+    pipes: &MetalPipelines,
     enc: &ComputeCommandEncoderRef,
     a: &Buffer,
     a_offset_bytes: u64,
@@ -121,7 +117,7 @@ pub fn dispatch_gemv_q4k_v2_offset(
         nb01: nb01_bytes as i32,
     };
 
-    let pipe = pipeline(device);
+    let pipe = pipes.q4_k_gemv_v2_pipeline();
     enc.set_compute_pipeline_state(pipe);
     enc.set_buffer(0, Some(src0), src0_byte_offset);
     enc.set_buffer(1, Some(a), a_offset_bytes);
@@ -177,6 +173,7 @@ mod tests {
             eprintln!("no Metal device — skipping");
             return;
         };
+        let pipes = MetalPipelines::new(&device);
         let queue = device.new_command_queue();
 
         let a_buf = device.new_buffer_with_data(
@@ -193,7 +190,7 @@ mod tests {
 
         let cmd = queue.new_command_buffer();
         let enc = cmd.new_compute_command_encoder();
-        dispatch_gemv_q4k_v2_on_encoder(&device, enc, &a_buf, &w_buf, 0, &c_buf, n, k);
+        dispatch_gemv_q4k_v2_on_encoder(&pipes, enc, &a_buf, &w_buf, 0, &c_buf, n, k);
         enc.end_encoding();
         cmd.commit();
         cmd.wait_until_completed();

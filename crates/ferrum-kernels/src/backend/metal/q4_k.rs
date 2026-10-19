@@ -1,7 +1,7 @@
 //! Q4_K_M dequant — ferrum-native Metal compute kernel + Rust glue.
 //!
 //! The Metal shader (`q4_k_dequant.metal`) is embedded via `include_str!`
-//! and compiled at runtime on first call (cached for the process). No
+//! and compiled at runtime on first call (cached in the caller's catalog). No
 //! `build.rs` plumbing required.
 //!
 //! Block layout matches GGML / llama.cpp / candle's `BlockQ4K`
@@ -9,7 +9,7 @@
 //!   - 144 bytes per super-block of 256 weights (~4.5 bits / weight)
 //!   - `[d (fp16) | dmin (fp16) | scales[12] | qs[128]]`
 //!
-//! Public entry: [`dequant_q4_k_to_f16`]. Drop in raw block bytes (a
+//! Internal entry: [`encode_dequant_q4_k_to_f16`]. Drop in raw block bytes (a
 //! `Buffer` viewed as `block_q4_K[]`), get back fp16 elements
 //! (`Buffer` of `n_blocks * 256` halves).
 //!
@@ -17,9 +17,9 @@
 //! in Metal memory and dequant'ing on-the-fly per matmul, instead of
 //! eager-dequanting at load time and burning 8× the RAM.
 
-#![cfg(all(target_os = "macos", feature = "metal"))]
+#![cfg(all(test, target_os = "macos", feature = "metal"))]
 
-use std::sync::OnceLock;
+use crate::attention::metal::pipelines::MetalPipelines;
 
 use metal::{
     Buffer, CommandBufferRef, CompileOptions, ComputeCommandEncoderRef, ComputePipelineState,
@@ -27,29 +27,24 @@ use metal::{
 };
 
 /// Bytes per super-block (144 = 4 fp16 + 12 scales + 128 qs).
-pub const Q4_K_BLOCK_BYTES: usize = 144;
+const Q4_K_BLOCK_BYTES: usize = 144;
 /// Weights per super-block.
-pub const Q4_K_BLOCK_ELEMENTS: usize = 256;
+const Q4_K_BLOCK_ELEMENTS: usize = 256;
 
 const SHADER_SRC: &str = include_str!("q4_k_dequant.metal");
 const KERNEL_NAME: &str = "dequantize_q4_k_f16";
 
-static PIPELINE: OnceLock<ComputePipelineState> = OnceLock::new();
-
-/// Lazy-compile the kernel on first use; reuse the pipeline forever.
-/// Per-process compilation is ~5-10 ms, dwarfed by any actual workload.
-fn pipeline(device: &Device) -> &'static ComputePipelineState {
-    PIPELINE.get_or_init(|| {
-        let lib = device
-            .new_library_with_source(SHADER_SRC, &CompileOptions::new())
-            .expect("compile q4_k_dequant.metal");
-        let function = lib
-            .get_function(KERNEL_NAME, None)
-            .expect("find dequantize_q4_k_f16 function in library");
-        device
-            .new_compute_pipeline_state_with_function(&function)
-            .expect("build compute pipeline")
-    })
+/// Build this catalog's immutable pipeline; its lazy slot owns the result.
+pub(crate) fn build_pipeline(device: &Device) -> ComputePipelineState {
+    let lib = device
+        .new_library_with_source(SHADER_SRC, &CompileOptions::new())
+        .expect("compile q4_k_dequant.metal");
+    let function = lib
+        .get_function(KERNEL_NAME, None)
+        .expect("find dequantize_q4_k_f16 function in library");
+    device
+        .new_compute_pipeline_state_with_function(&function)
+        .expect("build compute pipeline")
 }
 
 /// Encode a Q4_K_M dequant pass on an existing command buffer. Caller
@@ -57,8 +52,8 @@ fn pipeline(device: &Device) -> &'static ComputePipelineState {
 ///
 /// `blocks_buf`: `[block_q4_K; n_blocks]`, total `n_blocks * 144` bytes
 /// `out_buf`:    `[half; n_blocks * 256]`, total `n_blocks * 512` bytes
-pub fn encode_dequant_q4_k_to_f16(
-    device: &Device,
+pub(crate) fn encode_dequant_q4_k_to_f16(
+    pipes: &MetalPipelines,
     cmd: &CommandBufferRef,
     blocks_buf: &Buffer,
     out_buf: &Buffer,
@@ -67,9 +62,8 @@ pub fn encode_dequant_q4_k_to_f16(
     if n_blocks == 0 {
         return;
     }
-    let pipe = pipeline(device);
     let enc = cmd.new_compute_command_encoder();
-    encode_dispatch(enc, pipe, blocks_buf, out_buf, n_blocks);
+    dispatch_dequant_q4_k_on_encoder(pipes, enc, blocks_buf, out_buf, n_blocks);
     enc.end_encoding();
 }
 
@@ -80,8 +74,8 @@ pub fn encode_dequant_q4_k_to_f16(
 /// this dispatch's device-memory writes by Metal's serialized-execution
 /// guarantee, no explicit fence needed. Saves one
 /// `new_compute_command_encoder` round-trip per matmul.
-pub fn dispatch_dequant_q4_k_on_encoder(
-    device: &Device,
+pub(crate) fn dispatch_dequant_q4_k_on_encoder(
+    pipes: &MetalPipelines,
     enc: &ComputeCommandEncoderRef,
     blocks_buf: &Buffer,
     out_buf: &Buffer,
@@ -90,7 +84,7 @@ pub fn dispatch_dequant_q4_k_on_encoder(
     if n_blocks == 0 {
         return;
     }
-    let pipe = pipeline(device);
+    let pipe = pipes.q4_k_pipeline();
     encode_dispatch(enc, pipe, blocks_buf, out_buf, n_blocks);
 }
 
@@ -119,15 +113,15 @@ fn encode_dispatch(
 /// commits, and waits. Use this in tests; the per-forward path inside
 /// the model should reuse a long-lived command buffer via
 /// [`encode_dequant_q4_k_to_f16`].
-pub fn dequant_q4_k_to_f16_blocking(
-    device: &Device,
+pub(crate) fn dequant_q4_k_to_f16_blocking(
+    pipes: &MetalPipelines,
     queue: &metal::CommandQueue,
     blocks_buf: &Buffer,
     out_buf: &Buffer,
     n_blocks: usize,
 ) {
     let cmd = queue.new_command_buffer();
-    encode_dequant_q4_k_to_f16(device, cmd, blocks_buf, out_buf, n_blocks);
+    encode_dequant_q4_k_to_f16(pipes, cmd, blocks_buf, out_buf, n_blocks);
     cmd.commit();
     cmd.wait_until_completed();
 }
@@ -182,6 +176,7 @@ mod tests {
             eprintln!("no Metal device available — skipping");
             return;
         };
+        let pipes = MetalPipelines::new(&device);
         let queue = device.new_command_queue();
 
         let blocks_buf = device.new_buffer_with_data(
@@ -195,7 +190,7 @@ mod tests {
         );
 
         // Run our kernel.
-        dequant_q4_k_to_f16_blocking(&device, &queue, &blocks_buf, &out_buf, n_blocks);
+        dequant_q4_k_to_f16_blocking(&pipes, &queue, &blocks_buf, &out_buf, n_blocks);
 
         // Read back fp16 → fp32.
         let out_ptr = out_buf.contents() as *const f16;
@@ -256,6 +251,7 @@ mod tests {
         let Some(device) = Device::system_default() else {
             return;
         };
+        let pipes = MetalPipelines::new(&device);
         let queue = device.new_command_queue();
         let blocks_buf = device.new_buffer_with_data(
             bytes.as_ptr() as *const _,
@@ -267,7 +263,7 @@ mod tests {
             MTLResourceOptions::StorageModeShared,
         );
 
-        dequant_q4_k_to_f16_blocking(&device, &queue, &blocks_buf, &out_buf, n_blocks);
+        dequant_q4_k_to_f16_blocking(&pipes, &queue, &blocks_buf, &out_buf, n_blocks);
 
         let out_ptr = out_buf.contents() as *const f16;
         let our_f16: &[f16] = unsafe { std::slice::from_raw_parts(out_ptr, n_elem) };

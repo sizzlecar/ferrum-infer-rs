@@ -9,7 +9,7 @@
 
 #![cfg(all(target_os = "macos", feature = "metal"))]
 
-use ferrum_kernels::attention::metal::pipelines::{
+use crate::attention::metal::pipelines::{
     MetalPipelines, PagedAttnDispatchParams, PagedAttnQLayout,
 };
 use metal::{Device, MTLResourceOptions};
@@ -20,6 +20,10 @@ fn assert_close(a: &[f32], b: &[f32], atol: f32, label: &str) {
     let mut max_diff = 0.0f32;
     let mut max_idx = 0;
     for (i, (x, y)) in a.iter().zip(b.iter()).enumerate() {
+        assert!(
+            x.is_finite() && y.is_finite(),
+            "{label}: non-finite output at idx {i}: a={x}, b={y}"
+        );
         let d = (x - y).abs();
         if d > max_diff {
             max_diff = d;
@@ -59,6 +63,7 @@ fn read_f32(buf: &metal::Buffer, len: usize) -> Vec<f32> {
 /// Reference: run the contiguous-KV decode kernel and read its output.
 fn run_contiguous(
     pipes: &MetalPipelines,
+    queue: &metal::CommandQueue,
     q: &[f32],
     k_contig: &[f32],
     v_contig: &[f32],
@@ -67,13 +72,13 @@ fn run_contiguous(
     head_dim: usize,
     kv_len: usize,
 ) -> Vec<f32> {
-    let device = &pipes.device;
+    let device = pipes.device();
     let q_buf = buffer_from_f32(device, q);
     let k_buf = buffer_from_f32(device, k_contig);
     let v_buf = buffer_from_f32(device, v_contig);
     let o_buf = device.new_buffer((q.len() * 4) as u64, MTLResourceOptions::StorageModeShared);
 
-    let cmd = pipes.queue.new_command_buffer();
+    let cmd = queue.new_command_buffer();
     let enc = cmd.new_compute_command_encoder();
 
     // Match the FlashAttnParams layout in flash_attn.metal verbatim.
@@ -166,6 +171,7 @@ fn pack_into_paged(
 
 fn run_paged(
     pipes: &MetalPipelines,
+    queue: &metal::CommandQueue,
     q: &[f32],
     k_paged: &[f32],
     v_paged: &[f32],
@@ -176,7 +182,7 @@ fn run_paged(
     head_dim: usize,
     block_size: usize,
 ) -> Vec<f32> {
-    let device = &pipes.device;
+    let device = pipes.device();
     let q_buf = buffer_from_f32(device, q);
     let k_buf = buffer_from_f32(device, k_paged);
     let v_buf = buffer_from_f32(device, v_paged);
@@ -184,7 +190,7 @@ fn run_paged(
     let bt_buf = buffer_from_u32(device, block_table);
     let cl_buf = buffer_from_u32(device, &[context_len]);
 
-    let cmd = pipes.queue.new_command_buffer();
+    let cmd = queue.new_command_buffer();
     let enc = cmd.new_compute_command_encoder();
     pipes.paged_decode_attention_on_encoder(
         enc,
@@ -233,10 +239,12 @@ fn paged_decode_matches_contiguous_small() {
         .collect();
 
     let device = Device::system_default().expect("no Metal device");
+    let queue = device.new_command_queue();
     let pipes = MetalPipelines::new(&device);
 
     let out_contig = run_contiguous(
         &pipes,
+        &queue,
         &q,
         &k,
         &v,
@@ -250,6 +258,7 @@ fn paged_decode_matches_contiguous_small() {
     let (v_paged, _) = pack_into_paged(&v, num_kv_heads, kv_len, head_dim, block_size);
     let out_paged = run_paged(
         &pipes,
+        &queue,
         &q,
         &k_paged,
         &v_paged,
@@ -289,10 +298,12 @@ fn paged_decode_matches_contiguous_long_context() {
         .collect();
 
     let device = Device::system_default().expect("no Metal device");
+    let queue = device.new_command_queue();
     let pipes = MetalPipelines::new(&device);
 
     let out_contig = run_contiguous(
         &pipes,
+        &queue,
         &q,
         &k,
         &v,
@@ -306,6 +317,7 @@ fn paged_decode_matches_contiguous_long_context() {
     let (v_paged, _) = pack_into_paged(&v, num_kv_heads, kv_len, head_dim, block_size);
     let out_paged = run_paged(
         &pipes,
+        &queue,
         &q,
         &k_paged,
         &v_paged,
@@ -378,10 +390,12 @@ fn paged_decode_handles_shuffled_block_table() {
     }
 
     let device = Device::system_default().expect("no Metal device");
+    let queue = device.new_command_queue();
     let pipes = MetalPipelines::new(&device);
 
     let out_contig = run_contiguous(
         &pipes,
+        &queue,
         &q,
         &k,
         &v,
@@ -392,6 +406,7 @@ fn paged_decode_handles_shuffled_block_table() {
     );
     let out_paged = run_paged(
         &pipes,
+        &queue,
         &q,
         &k_pool,
         &v_pool,

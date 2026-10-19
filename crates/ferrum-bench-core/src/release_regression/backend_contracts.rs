@@ -166,6 +166,21 @@ pub fn contract_groups(backend: Backend) -> Vec<ContractGroup> {
         if backend == Backend::Metal {
             tests.extend(
                 [
+                    "backend::metal::checked_sync_tests::missing_submission_is_not_success",
+                    "backend::metal::instance_queue_tests::metal_instance_queues_keep_peer_unsubmitted_work_through_retirement",
+                    "backend::metal::instance_queue_tests::metal_instance_queues_consume_original_buffer_after_checked_handoff",
+                    "attention::metal::pipelines::quantized::tests::quantized_catalog_lazy_slots_belong_to_each_catalog_and_share_by_borrow",
+                ]
+                .into_iter()
+                .map(|name| ContractTest {
+                    package: "ferrum-kernels".into(),
+                    target: "ferrum_kernels".into(),
+                    kind: "lib".into(),
+                    name: name.into(),
+                }),
+            );
+            tests.extend(
+                [
                     "metal_injected_failure_blocks_host_access_and_encoding_until_explicit_begin",
                     "metal_injected_unresolved_observation_preserves_submission_and_blocks_host_access",
                     "metal_host_synchronization_preserves_full_outputs_and_successful_continuation",

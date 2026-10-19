@@ -17,8 +17,8 @@
 
 #![cfg(all(target_os = "macos", feature = "metal"))]
 
+use crate::attention::metal::pipelines::MetalPipelines;
 use std::ffi::c_void;
-use std::sync::OnceLock;
 
 use metal::{
     Buffer, CompileOptions, ComputeCommandEncoderRef, ComputePipelineState, Device, MTLSize,
@@ -27,20 +27,16 @@ use metal::{
 const SHADER_SRC: &str = include_str!("q4_k_gemv.metal");
 const KERNEL_NAME: &str = "gemv_f32a_q4kw";
 
-static PIPELINE: OnceLock<ComputePipelineState> = OnceLock::new();
-
-fn pipeline(device: &Device) -> &'static ComputePipelineState {
-    PIPELINE.get_or_init(|| {
-        let lib = device
-            .new_library_with_source(SHADER_SRC, &CompileOptions::new())
-            .expect("compile q4_k_gemv.metal");
-        let function = lib
-            .get_function(KERNEL_NAME, None)
-            .expect("find gemv_f32a_q4kw function");
-        device
-            .new_compute_pipeline_state_with_function(&function)
-            .expect("build gemv_f32a_q4kw pipeline")
-    })
+pub(crate) fn build_pipeline(device: &Device) -> ComputePipelineState {
+    let lib = device
+        .new_library_with_source(SHADER_SRC, &CompileOptions::new())
+        .expect("compile q4_k_gemv.metal");
+    let function = lib
+        .get_function(KERNEL_NAME, None)
+        .expect("find gemv_f32a_q4kw function");
+    device
+        .new_compute_pipeline_state_with_function(&function)
+        .expect("build gemv_f32a_q4kw pipeline")
 }
 
 /// Dispatch fused GEMV on an existing compute encoder.
@@ -53,8 +49,8 @@ fn pipeline(device: &Device) -> &'static ComputePipelineState {
 ///
 /// Caller is responsible for `enc.end_encoding()` after the dispatch
 /// (or chaining further dispatches).
-pub fn dispatch_gemv_q4k_on_encoder(
-    device: &Device,
+pub(crate) fn dispatch_gemv_q4k_on_encoder(
+    pipes: &MetalPipelines,
     enc: &ComputeCommandEncoderRef,
     a: &Buffer,
     w: &Buffer,
@@ -78,7 +74,7 @@ pub fn dispatch_gemv_q4k_on_encoder(
         k: k as i32,
     };
 
-    let pipe = pipeline(device);
+    let pipe = pipes.q4_k_gemv_pipeline();
     enc.set_compute_pipeline_state(pipe);
     enc.set_buffer(0, Some(a), 0);
     enc.set_buffer(1, Some(w), w_byte_offset);
@@ -142,6 +138,7 @@ mod tests {
             eprintln!("no Metal device — skipping");
             return;
         };
+        let pipes = MetalPipelines::new(&device);
         let queue = device.new_command_queue();
 
         let a_buf = device.new_buffer_with_data(
@@ -158,7 +155,7 @@ mod tests {
 
         let cmd = queue.new_command_buffer();
         let enc = cmd.new_compute_command_encoder();
-        dispatch_gemv_q4k_on_encoder(&device, enc, &a_buf, &w_buf, 0, &c_buf, n, k);
+        dispatch_gemv_q4k_on_encoder(&pipes, enc, &a_buf, &w_buf, 0, &c_buf, n, k);
         enc.end_encoding();
         cmd.commit();
         cmd.wait_until_completed();

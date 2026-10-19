@@ -1927,7 +1927,7 @@ impl fmt::Debug for MetalDeviceRuntime {
 
 impl MetalDeviceRuntime {
     pub fn new(config: MetalDeviceRuntimeConfig) -> Result<Self, MetalDeviceRuntimeError> {
-        let device = st().pipes.device.clone();
+        let device = st().pipes.device().clone();
         let descriptor = DeviceDescriptor {
             id: config.device_id,
             class: DeviceClass::Accelerator,

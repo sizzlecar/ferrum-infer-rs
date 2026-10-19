@@ -10,7 +10,7 @@
 
 #![cfg(all(target_os = "macos", feature = "metal"))]
 
-use ferrum_kernels::attention::metal::pipelines::MetalPipelines;
+use crate::attention::metal::pipelines::MetalPipelines;
 use metal::{Device, MTLResourceOptions};
 use std::ffi::c_void;
 
@@ -84,6 +84,7 @@ fn make_input_data(c: &Cfg) -> (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>
 #[allow(clippy::too_many_arguments)]
 fn run_contiguous(
     pipes: &MetalPipelines,
+    queue: &metal::CommandQueue,
     c: &Cfg,
     qkv: &[f32],
     q_norm_w: &[f32],
@@ -91,7 +92,7 @@ fn run_contiguous(
     cos: &[f32],
     sin: &[f32],
 ) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
-    let device = &pipes.device;
+    let device = pipes.device();
     let qkv_buf = buffer_from_f32(device, qkv);
     let q_norm_buf = buffer_from_f32(device, q_norm_w);
     let k_norm_buf = buffer_from_f32(device, k_norm_w);
@@ -101,7 +102,7 @@ fn run_contiguous(
     let cache_k = empty_buffer(device, c.kv_heads * c.cache_capacity * c.head_dim);
     let cache_v = empty_buffer(device, c.kv_heads * c.cache_capacity * c.head_dim);
 
-    let cmd = pipes.queue.new_command_buffer();
+    let cmd = queue.new_command_buffer();
     let enc = cmd.new_compute_command_encoder();
     pipes.split_qkv_norm_rope_into_cache(
         enc,
@@ -141,6 +142,7 @@ fn run_contiguous(
 #[allow(clippy::too_many_arguments)]
 fn run_paged(
     pipes: &MetalPipelines,
+    queue: &metal::CommandQueue,
     c: &Cfg,
     qkv: &[f32],
     q_norm_w: &[f32],
@@ -150,7 +152,7 @@ fn run_paged(
     block_table: &[u32],
     num_physical_blocks: usize,
 ) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
-    let device = &pipes.device;
+    let device = pipes.device();
     let qkv_buf = buffer_from_f32(device, qkv);
     let q_norm_buf = buffer_from_f32(device, q_norm_w);
     let k_norm_buf = buffer_from_f32(device, k_norm_w);
@@ -162,7 +164,7 @@ fn run_paged(
     let cache_v = empty_buffer(device, pool_floats);
     let bt_buf = buffer_from_u32(device, block_table);
 
-    let cmd = pipes.queue.new_command_buffer();
+    let cmd = queue.new_command_buffer();
     let enc = cmd.new_compute_command_encoder();
     pipes.split_qkv_norm_rope_into_paged_cache(
         enc,
@@ -225,6 +227,11 @@ fn compare_caches(
                     + kvh * c.block_size * c.head_dim
                     + slot_in_block * c.head_dim
                     + d;
+                for (kind, contig, paged) in [("K", contig_k, paged_k), ("V", contig_v, paged_v)] {
+                    assert!(contig[contig_off].is_finite() && paged[paged_off].is_finite(),
+                        "{label}: non-finite {kind} at kvh={kvh}, tok={tok}, d={d}, phys_block={physical_block}: contig={}, paged={}",
+                        contig[contig_off], paged[paged_off]);
+                }
                 let dk = (contig_k[contig_off] - paged_k[paged_off]).abs();
                 let dv = (contig_v[contig_off] - paged_v[paged_off]).abs();
                 let dmax = dk.max(dv);
@@ -263,10 +270,12 @@ fn paged_kv_append_matches_contiguous_qk_norm() {
 
     let (qkv, qn, kn, cos, sin) = make_input_data(&c);
     let device = Device::system_default().expect("no Metal device");
+    let queue = device.new_command_queue();
     let pipes = MetalPipelines::new(&device);
 
     // Contiguous reference.
-    let (q_contig, k_contig, v_contig) = run_contiguous(&pipes, &c, &qkv, &qn, &kn, &cos, &sin);
+    let (q_contig, k_contig, v_contig) =
+        run_contiguous(&pipes, &queue, &c, &qkv, &qn, &kn, &cos, &sin);
 
     // Paged variant with non-identity block table.
     // cache_len=11, tokens=5 → writes to global slots [11..16). With
@@ -278,6 +287,7 @@ fn paged_kv_append_matches_contiguous_qk_norm() {
         .collect();
     let (q_paged, k_paged, v_paged) = run_paged(
         &pipes,
+        &queue,
         &c,
         &qkv,
         &qn,
@@ -289,7 +299,12 @@ fn paged_kv_append_matches_contiguous_qk_norm() {
     );
 
     // Q output should be byte-identical (same head-major scratch layout).
+    assert_eq!(q_contig.len(), q_paged.len());
     for (i, (a, b)) in q_contig.iter().zip(q_paged.iter()).enumerate() {
+        assert!(
+            a.is_finite() && b.is_finite(),
+            "non-finite Q at idx {i}: contig={a}, paged={b}"
+        );
         assert!(
             (a - b).abs() < 1e-6,
             "Q output mismatch at idx {i}: contig={a}, paged={b}",
@@ -326,9 +341,11 @@ fn paged_kv_append_matches_contiguous_no_qk_norm() {
 
     let (qkv, qn, kn, cos, sin) = make_input_data(&c);
     let device = Device::system_default().expect("no Metal device");
+    let queue = device.new_command_queue();
     let pipes = MetalPipelines::new(&device);
 
-    let (q_contig, k_contig, v_contig) = run_contiguous(&pipes, &c, &qkv, &qn, &kn, &cos, &sin);
+    let (q_contig, k_contig, v_contig) =
+        run_contiguous(&pipes, &queue, &c, &qkv, &qn, &kn, &cos, &sin);
 
     // tokens 33..40 span logical blocks 2 (slots 32-39) and possibly 3.
     // 40 is exclusive. 33→ block 2 slot 1, 39 → block 2 slot 7. All in block 2.
@@ -336,6 +353,7 @@ fn paged_kv_append_matches_contiguous_no_qk_norm() {
     let block_table: Vec<u32> = vec![5, 1, 4, 0, 2, 3]; // permutation
     let (q_paged, k_paged, v_paged) = run_paged(
         &pipes,
+        &queue,
         &c,
         &qkv,
         &qn,
@@ -346,7 +364,12 @@ fn paged_kv_append_matches_contiguous_no_qk_norm() {
         num_physical_blocks,
     );
 
+    assert_eq!(q_contig.len(), q_paged.len());
     for (i, (a, b)) in q_contig.iter().zip(q_paged.iter()).enumerate() {
+        assert!(
+            a.is_finite() && b.is_finite(),
+            "non-finite Q at idx {i}: contig={a}, paged={b}"
+        );
         assert!(
             (a - b).abs() < 1e-6,
             "Q output mismatch at idx {i}: contig={a}, paged={b}",
@@ -383,15 +406,18 @@ fn paged_kv_append_spans_block_boundary() {
 
     let (qkv, qn, kn, cos, sin) = make_input_data(&c);
     let device = Device::system_default().expect("no Metal device");
+    let queue = device.new_command_queue();
     let pipes = MetalPipelines::new(&device);
 
-    let (q_contig, k_contig, v_contig) = run_contiguous(&pipes, &c, &qkv, &qn, &kn, &cos, &sin);
+    let (q_contig, k_contig, v_contig) =
+        run_contiguous(&pipes, &queue, &c, &qkv, &qn, &kn, &cos, &sin);
 
     let num_physical_blocks = 8;
     // Logical block 0 → physical 5; logical block 1 → physical 2.
     let block_table: Vec<u32> = vec![5, 2, 7, 1];
     let (q_paged, k_paged, v_paged) = run_paged(
         &pipes,
+        &queue,
         &c,
         &qkv,
         &qn,
@@ -402,7 +428,12 @@ fn paged_kv_append_spans_block_boundary() {
         num_physical_blocks,
     );
 
+    assert_eq!(q_contig.len(), q_paged.len());
     for (i, (a, b)) in q_contig.iter().zip(q_paged.iter()).enumerate() {
+        assert!(
+            a.is_finite() && b.is_finite(),
+            "non-finite Q at idx {i}: contig={a}, paged={b}"
+        );
         assert!(
             (a - b).abs() < 1e-6,
             "Q output mismatch at idx {i}: contig={a}, paged={b}",
