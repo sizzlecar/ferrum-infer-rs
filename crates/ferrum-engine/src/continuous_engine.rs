@@ -3007,3 +3007,6 @@ mod executor_shutdown_tests;
 
 #[cfg(test)]
 mod attempt_observation_tests;
+
+#[cfg(all(test, feature = "metal", target_os = "macos"))]
+mod native_prefix_feedback_tests;

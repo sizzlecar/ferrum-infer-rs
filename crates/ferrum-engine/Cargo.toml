@@ -76,6 +76,7 @@ bytesize = "1.3"
 reqwest = { workspace = true }
 
 [dev-dependencies]
+ferrum-slo = { workspace = true }
 ferrum-execution = { workspace = true, features = ["test-support"] }
 tempfile = "3.8"
 tokio-test = "0.4"

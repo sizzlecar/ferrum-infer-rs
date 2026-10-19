@@ -1384,6 +1384,7 @@ dependencies = [
  "ferrum-runtime",
  "ferrum-sampler",
  "ferrum-scheduler",
+ "ferrum-slo",
  "ferrum-testkit",
  "ferrum-tokenizer",
  "ferrum-types",

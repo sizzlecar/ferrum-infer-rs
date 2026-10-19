@@ -399,3 +399,6 @@ impl Tokenizer for TinyTokenizer {
 
 /// Real compiled language-program construction shared by upper-layer tests.
 pub mod native_program;
+
+#[cfg(any(feature = "cuda", all(feature = "metal", target_os = "macos")))]
+pub mod stateful_program;
