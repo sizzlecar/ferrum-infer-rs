@@ -1181,6 +1181,8 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
             }
             let entries = crate::source_resolver::chat_profile_runtime_entries(
                 &source.local_path,
+                &device,
+                engine_config.kv_cache.dtype,
                 &effective_runtime_config,
                 RuntimeConfigSource::Default,
             );
@@ -5164,6 +5166,8 @@ mod tests {
         let source = tempfile::tempdir().unwrap();
         let entries = crate::source_resolver::chat_profile_runtime_entries(
             source.path(),
+            &ferrum_types::Device::CUDA(0),
+            ferrum_types::KvCacheDtype::Fp16,
             &RuntimeConfigSnapshot::default(),
             RuntimeConfigSource::Default,
         );
@@ -5171,6 +5175,42 @@ mod tests {
         let mut engine = ferrum_types::EngineConfig::default();
         engine.apply_runtime_config_snapshot(&snapshot).unwrap();
         assert_eq!(engine.runtime.kv_capacity, Some(8192));
+    }
+
+    #[test]
+    fn run_cuda_int8_chat_defaults_use_the_resolved_cli_request() {
+        let source = tempfile::tempdir().unwrap();
+        std::fs::write(
+            source.path().join("config.json"),
+            r#"{"model_type":"llama"}"#,
+        )
+        .unwrap();
+        let mut cmd = test_run_cmd();
+        cmd.kv_dtype = Some("int8".to_owned());
+        cmd.kv_capacity = Some(1024);
+        let mut requested = run_effective_runtime_config(
+            &RuntimeConfigSnapshot::default(),
+            &run_startup_cli_runtime_entries(&cmd, None),
+        );
+        let mut engine = ferrum_types::EngineConfig::default();
+        apply_kv_dtype_override(
+            &mut engine,
+            crate::runtime_env::runtime_snapshot_value(&requested, "FERRUM_KV_DTYPE"),
+        )
+        .unwrap();
+        for entry in crate::source_resolver::chat_profile_runtime_entries(
+            source.path(),
+            &ferrum_types::Device::CUDA(0),
+            engine.kv_cache.dtype,
+            &requested,
+            RuntimeConfigSource::Default,
+        ) {
+            requested.upsert_entry(entry);
+        }
+        engine.apply_runtime_config_snapshot(&requested).unwrap();
+        assert_eq!(engine.kv_cache.dtype, ferrum_types::KvCacheDtype::Int8);
+        assert_eq!(engine.runtime.llama.metal_paged_kv, Some(true));
+        assert_eq!(engine.runtime.kv_capacity, Some(1024));
     }
 
     #[tokio::test]

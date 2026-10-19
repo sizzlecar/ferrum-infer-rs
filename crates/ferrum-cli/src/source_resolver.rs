@@ -378,26 +378,19 @@ pub fn tokenizer_sibling_repo(gguf_repo: &str) -> Option<String> {
 ///
 /// Idempotent: if a user explicitly sets one of these env vars before
 /// invoking `ferrum run`, that value wins (we only set when unset).
-/// Called automatically by `resolve_model_source` when the autosize
-/// profile is `Chat`. Server/bench callers don't get these defaults —
-/// they don't fit the multi-turn REPL pattern this profile is tuned for.
+/// Called by `run` after the actual device and KV dtype have been resolved.
+/// CUDA INT8 requires paged storage; FP16 keeps the existing chat preferences.
+/// Server/bench callers do not receive these single-user defaults.
 ///
 /// Without this, dense safetensors models (e.g. `Qwen/Qwen3-0.6B`)
 /// inherit the model-level `DEFAULT_KV_CAPACITY=512` floor in
 /// `llama_family.rs::ensure_kv`, which overflows after ~512 tokens on
 /// a `max_tokens=2048` chat — manifesting as a `KV cache overflow on
 /// layer 0` panic mid-response.
-pub fn apply_chat_profile_env(snapshot_path: &Path) {
-    let entries = chat_profile_runtime_entries(
-        snapshot_path,
-        &RuntimeConfigSnapshot::capture_current(),
-        RuntimeConfigSource::Default,
-    );
-    crate::runtime_env::materialize_runtime_env_defaults(&entries);
-}
-
 pub fn chat_profile_runtime_entries(
     snapshot_path: &Path,
+    device: &ferrum_types::Device,
+    kv_dtype: ferrum_types::KvCacheDtype,
     current: &RuntimeConfigSnapshot,
     source: RuntimeConfigSource,
 ) -> Vec<RuntimeConfigEntry> {
@@ -408,13 +401,23 @@ pub fn chat_profile_runtime_entries(
             .unwrap_or(false);
     let is_moe = detect_moe_arch(snapshot_path);
     let model_family = detect_model_family(snapshot_path);
-    chat_profile_runtime_entries_for_arch(is_gguf, is_moe, model_family.as_deref(), current, source)
+    chat_profile_runtime_entries_for_arch(
+        is_gguf,
+        is_moe,
+        model_family.as_deref(),
+        device,
+        kv_dtype,
+        current,
+        source,
+    )
 }
 
 fn chat_profile_runtime_entries_for_arch(
     is_gguf: bool,
     is_moe: bool,
     model_family: Option<&str>,
+    device: &ferrum_types::Device,
+    kv_dtype: ferrum_types::KvCacheDtype,
     current: &RuntimeConfigSnapshot,
     source: RuntimeConfigSource,
 ) -> Vec<RuntimeConfigEntry> {
@@ -427,13 +430,18 @@ fn chat_profile_runtime_entries_for_arch(
         if is_moe { "4096" } else { "8192" },
         source,
     );
-    // GGUF: contiguous path is the correctness baseline. For safetensors,
-    // keep paged KV only on families with current product evidence.
-    let need_paged = !is_gguf
-        && (is_moe
-            || model_family.is_some_and(|family| {
-                family.eq_ignore_ascii_case("qwen3") || family.eq_ignore_ascii_case("qwen3_5")
-            }));
+    // Retained CUDA INT8 implements paged storage only. A chat preference
+    // must not select an unsupported layout for the explicit dtype request.
+    // Existing entries still win below; the model validates window/backend
+    // capabilities and rejects an explicit incompatible layout.
+    let requires_paged = matches!(device, ferrum_types::Device::CUDA(_))
+        && kv_dtype == ferrum_types::KvCacheDtype::Int8;
+    let need_paged = requires_paged
+        || (!is_gguf
+            && (is_moe
+                || model_family.is_some_and(|family| {
+                    family.eq_ignore_ascii_case("qwen3") || family.eq_ignore_ascii_case("qwen3_5")
+                })));
     push_paged_kv_compat_entries(
         &mut entries,
         current,
@@ -1815,9 +1823,6 @@ fn finalize_resolution(
 ) -> Resolved {
     let autosized = if let Some((profile, gpu_util)) = autosize {
         apply_auto_size_with_profile(&source.local_path, gpu_util, profile);
-        if profile == AutoSizeProfile::Chat {
-            apply_chat_profile_env(&source.local_path);
-        }
         true
     } else {
         false
@@ -2757,6 +2762,8 @@ mod tests {
         );
         let entries = chat_profile_runtime_entries(
             &dir,
+            &ferrum_types::Device::CUDA(0),
+            ferrum_types::KvCacheDtype::Fp16,
             &RuntimeConfigSnapshot::default(),
             RuntimeConfigSource::Default,
         );
@@ -2790,6 +2797,8 @@ mod tests {
 
         let entries = chat_profile_runtime_entries(
             &dir,
+            &ferrum_types::Device::CUDA(0),
+            ferrum_types::KvCacheDtype::Fp16,
             &RuntimeConfigSnapshot::default(),
             RuntimeConfigSource::Default,
         );
@@ -2811,6 +2820,8 @@ mod tests {
         );
         let entries = chat_profile_runtime_entries(
             &dir,
+            &ferrum_types::Device::CUDA(0),
+            ferrum_types::KvCacheDtype::Fp16,
             &RuntimeConfigSnapshot::default(),
             RuntimeConfigSource::Default,
         );
@@ -2831,6 +2842,8 @@ mod tests {
         );
         let entries = chat_profile_runtime_entries(
             &dir,
+            &ferrum_types::Device::CUDA(0),
+            ferrum_types::KvCacheDtype::Fp16,
             &RuntimeConfigSnapshot::default(),
             RuntimeConfigSource::Default,
         );
@@ -2851,6 +2864,8 @@ mod tests {
         );
         let entries = chat_profile_runtime_entries(
             &dir,
+            &ferrum_types::Device::CUDA(0),
+            ferrum_types::KvCacheDtype::Fp16,
             &RuntimeConfigSnapshot::default(),
             RuntimeConfigSource::Default,
         );
@@ -2885,6 +2900,8 @@ mod tests {
 
         let entries = chat_profile_runtime_entries(
             &dir,
+            &ferrum_types::Device::CUDA(0),
+            ferrum_types::KvCacheDtype::Fp16,
             &RuntimeConfigSnapshot::default(),
             RuntimeConfigSource::Default,
         );
@@ -2903,6 +2920,8 @@ mod tests {
             true,
             true,
             Some("qwen3_moe"),
+            &ferrum_types::Device::CUDA(0),
+            ferrum_types::KvCacheDtype::Fp16,
             &RuntimeConfigSnapshot::default(),
             RuntimeConfigSource::Default,
         );
@@ -2934,11 +2953,90 @@ mod tests {
             RuntimeConfigEntry::new("FERRUM_KV_CAPACITY", "1234", RuntimeConfigSource::Env),
             RuntimeConfigEntry::new("FERRUM_PAGED_MAX_SEQS", "7", RuntimeConfigSource::Env),
         ]);
-        let entries = chat_profile_runtime_entries(&dir, &current, RuntimeConfigSource::Default);
+        let entries = chat_profile_runtime_entries(
+            &dir,
+            &ferrum_types::Device::CUDA(0),
+            ferrum_types::KvCacheDtype::Fp16,
+            &current,
+            RuntimeConfigSource::Default,
+        );
 
         assert_eq!(value(&entries, "FERRUM_KV_CAPACITY"), None);
         assert_eq!(value(&entries, "FERRUM_PAGED_MAX_SEQS"), None);
         assert_eq!(value(&entries, "FERRUM_MOE_BATCHED"), None);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn chat_profile_cuda_int8_uses_paged_without_changing_fp16_preference() {
+        let dir = temp_model_dir(
+            "int8-layout",
+            r#"{"architectures":["LlamaForCausalLM"],"model_type":"llama"}"#,
+        );
+        for (dtype, expected) in [
+            (ferrum_types::KvCacheDtype::Fp16, "0"),
+            (ferrum_types::KvCacheDtype::Int8, "1"),
+        ] {
+            let entries = chat_profile_runtime_entries(
+                &dir,
+                &ferrum_types::Device::CUDA(0),
+                dtype,
+                &RuntimeConfigSnapshot::default(),
+                RuntimeConfigSource::Default,
+            );
+            assert_eq!(
+                value(&entries, "FERRUM_PAGED_KV").as_deref(),
+                Some(expected)
+            );
+            assert_eq!(
+                value(&entries, "FERRUM_METAL_PAGED_KV").as_deref(),
+                Some(expected)
+            );
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn chat_profile_cuda_int8_preserves_explicit_paged_disable_and_capacity() {
+        let dir = temp_model_dir("explicit-int8-layout", r#"{"model_type":"llama"}"#);
+        for key in ["FERRUM_PAGED_KV", "FERRUM_METAL_PAGED_KV"] {
+            let mut snapshot = RuntimeConfigSnapshot::from_entries([
+                RuntimeConfigEntry::new(key, "0", RuntimeConfigSource::Cli),
+                RuntimeConfigEntry::new("FERRUM_KV_DTYPE", "int8", RuntimeConfigSource::Cli),
+                RuntimeConfigEntry::new("FERRUM_KV_CAPACITY", "1024", RuntimeConfigSource::Cli),
+                RuntimeConfigEntry::new("FERRUM_PAGED_MAX_SEQS", "1", RuntimeConfigSource::Cli),
+            ]);
+            let entries = chat_profile_runtime_entries(
+                &dir,
+                &ferrum_types::Device::CUDA(0),
+                ferrum_types::KvCacheDtype::Int8,
+                &snapshot,
+                RuntimeConfigSource::Default,
+            );
+            assert!(entries.iter().all(|entry| entry.key != key));
+            for entry in entries {
+                snapshot.upsert_entry(entry);
+            }
+            let mut engine = ferrum_types::EngineConfig::default();
+            engine.kv_cache.dtype = ferrum_types::KvCacheDtype::Int8;
+            engine.apply_runtime_config_snapshot(&snapshot).unwrap();
+            assert_eq!(engine.runtime.llama.metal_paged_kv, Some(false));
+            assert_eq!(engine.kv_cache.dtype, ferrum_types::KvCacheDtype::Int8);
+            assert_eq!(engine.runtime.kv_capacity, Some(1024));
+            assert_eq!(
+                snapshot_value(&snapshot, "FERRUM_PAGED_MAX_SEQS"),
+                Some("1")
+            );
+            assert_eq!(
+                snapshot
+                    .entries
+                    .iter()
+                    .find(|entry| entry.key == key)
+                    .unwrap()
+                    .source,
+                RuntimeConfigSource::Cli
+            );
+        }
         let _ = std::fs::remove_dir_all(dir);
     }
 
