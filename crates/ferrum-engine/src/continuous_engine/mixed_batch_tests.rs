@@ -10,6 +10,9 @@ pub(super) enum MixedBehavior {
     Exact,
     NotSubmitted,
     SubmittedError,
+    /// The executor call itself returns no participant ledger. Unlike the
+    /// controlled work error, no terminal progress can be inferred from it.
+    ExecutorError,
     WrongDecodeCache,
     ShortPrefill,
 }
@@ -94,6 +97,15 @@ async fn mixed_fixture_with_execution(
     final_prefill: bool,
     execution: Option<ferrum_types::PrefillDecodeExecution>,
 ) -> MixedFixture {
+    mixed_fixture_observed(behavior, final_prefill, execution, None).await
+}
+
+async fn mixed_fixture_observed(
+    behavior: Option<MixedBehavior>,
+    final_prefill: bool,
+    execution: Option<ferrum_types::PrefillDecodeExecution>,
+    observer: Option<Arc<dyn ExecutionAttemptObserver>>,
+) -> MixedFixture {
     let executor = PlanRuntimeBatchDecodeTestExecutor::with_capacity_stage_transition(
         PlanRuntimeBatchDecodeBehavior::Exact,
         ExecutorExecutionCapacityStage::StepAdmission,
@@ -105,7 +117,7 @@ async fn mixed_fixture_with_execution(
     }
     config.runtime.profile_detail = ferrum_types::ObservabilityProfileDetail::Latency;
     let (engine, scheduler, executor, _) =
-        plan_runtime_test_engine(config, executor, Arc::new(MockTensorFactory));
+        plan_runtime_test_engine_observed(config, executor, Arc::new(MockTensorFactory), observer);
     *executor.mixed_behavior.lock().unwrap() = behavior;
     let decode_id = install_mixed_request(&engine, &scheduler, vec![TokenId::new(5)], true).await;
     let first = scheduler
@@ -674,5 +686,129 @@ async fn mixed_batch_rejects_invalid_phase_without_discarding_valid_peer() {
         assert_eq!(executor.batch_decode_calls.load(Ordering::Relaxed), 0);
         drop(healthy_guard);
         close_mixed_requests(&engine, &[healthy_id]).await;
+    }
+}
+
+#[tokio::test]
+async fn attempt_intervals_follow_actual_split_and_zero_submission_invocations() {
+    use crate::continuous_engine::attempt_observation_tests::AttemptRecorder;
+    use ferrum_execution::execution_attempt::*;
+    for execution in [
+        ferrum_types::PrefillDecodeExecution::Split,
+        ferrum_types::PrefillDecodeExecution::Mixed,
+    ] {
+        let recorder = Arc::new(AttemptRecorder::default());
+        let (engine, executor, batch, prefill_id, decode_id) =
+            mixed_fixture_observed(None, true, Some(execution), Some(recorder.clone())).await;
+        recorder.take(); // The first request's actual earlier prefill is independent.
+        engine
+            .active_inner()
+            .unwrap()
+            .process_batch(&batch)
+            .await
+            .unwrap();
+        let summaries = recorder.take();
+        let mut completed = Vec::new();
+        for (index, summary) in summaries.iter().enumerate() {
+            assert!(summary.completed_at >= summary.started_at);
+            if index > 0 {
+                assert!(summary.started_at >= summaries[index - 1].completed_at);
+            }
+            if summary.eligibility == ExecutionAttemptEligibility::NotSubmitted {
+                assert_eq!(execution, ferrum_types::PrefillDecodeExecution::Mixed);
+                assert_eq!(summary.participants.len(), 2);
+                assert!(summary.participants.iter().all(|member| matches!(
+                    member.outcome,
+                    AttemptParticipantOutcome::NotSubmitted {
+                        cause: AttemptNoSubmissionCause::UnsupportedShape,
+                        ..
+                    }
+                )));
+            } else {
+                assert_eq!(summary.eligibility, ExecutionAttemptEligibility::Completed);
+                for member in &summary.participants {
+                    let AttemptParticipantOutcome::Completed {
+                        work,
+                        frontier_committed: true,
+                    } = member.outcome
+                    else {
+                        panic!("child must retain actual progress");
+                    };
+                    completed.push((member.request_id.clone(), work.range().unwrap().as_range()));
+                }
+            }
+        }
+        assert_eq!(
+            summaries.len(),
+            if execution == ferrum_types::PrefillDecodeExecution::Mixed {
+                3
+            } else {
+                2
+            }
+        );
+        assert_eq!(completed.len(), 2);
+        assert!(completed.contains(&(prefill_id.clone(), 0..4)));
+        assert!(completed.contains(&(decode_id.clone(), 1..2)));
+        assert_eq!(
+            executor
+                .token_frontier_for_request(&prefill_id)
+                .unwrap()
+                .consumed_tokens(),
+            4
+        );
+        assert_eq!(
+            executor
+                .token_frontier_for_request(&decode_id)
+                .unwrap()
+                .consumed_tokens(),
+            2
+        );
+        close_mixed_requests(&engine, &[&prefill_id, &decode_id]).await;
+    }
+}
+
+#[tokio::test]
+async fn attempt_executor_error_never_invents_terminal_and_keeps_attested_quiescence() {
+    use crate::continuous_engine::attempt_observation_tests::AttemptRecorder;
+    use ferrum_execution::execution_attempt::*;
+    use ferrum_execution::token_execution::{ExecutionProgress, TerminalModelDisposition};
+    for behavior in [MixedBehavior::ExecutorError, MixedBehavior::SubmittedError] {
+        let recorder = Arc::new(AttemptRecorder::default());
+        let (engine, executor, batch, prefill_id, decode_id) = mixed_fixture_observed(
+            Some(behavior),
+            true,
+            Some(ferrum_types::PrefillDecodeExecution::Mixed),
+            Some(recorder.clone()),
+        )
+        .await;
+        recorder.take();
+        let _ = engine.active_inner().unwrap().process_batch(&batch).await;
+        let summaries = recorder.take();
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].participants.len(), 2);
+        if matches!(behavior, MixedBehavior::ExecutorError) {
+            assert_eq!(
+                summaries[0].eligibility,
+                ExecutionAttemptEligibility::ExecutorError
+            );
+            assert!(summaries[0]
+                .participants
+                .iter()
+                .all(|member| member.outcome == AttemptParticipantOutcome::Unverified));
+        } else {
+            assert_eq!(
+                summaries[0].eligibility,
+                ExecutionAttemptEligibility::Interrupted
+            );
+            assert!(summaries[0].participants.iter().all(|member| matches!(
+                member.outcome,
+                AttemptParticipantOutcome::Interrupted(ExecutionProgress::Terminal {
+                    disposition: TerminalModelDisposition::UnknownAfterQuiescence,
+                    executed_range: None,
+                })
+            )));
+        }
+        assert_eq!(executor.mixed_calls.load(Ordering::Relaxed), 1);
+        close_mixed_requests(&engine, &[&prefill_id, &decode_id]).await;
     }
 }

@@ -2,7 +2,7 @@ use super::*;
 use ferrum_execution::executor_lifecycle::ExecutorOwner;
 use ferrum_execution::token_execution::{
     ExecutionAdmission, ExecutionBatchOutcome, ExecutionCloseOutcome, ExecutionEndReason,
-    ExecutionFrontier, ExecutionWork, ExecutorSequence, TokenAdmissionOutcome,
+    ExecutionFrontier, ExecutionWork, ExecutorSequence, TokenAdmissionOutcome, TokenWork,
 };
 use ferrum_execution::{
     model_executor::{
@@ -676,6 +676,21 @@ impl ModelExecutor for PlanRuntimeBatchDecodeTestExecutor {
         controlled_token_fixture::admit(self, &self.tokens, input)
     }
     async fn execute_tokens(&self, work: &[ExecutionWork<'_>]) -> Result<ExecutionBatchOutcome> {
+        if matches!(
+            *self.mixed_behavior.lock().unwrap(),
+            Some(mixed_batch_tests::MixedBehavior::ExecutorError)
+        ) && work
+            .iter()
+            .any(|input| matches!(input.work(), TokenWork::Prefill(_)))
+            && work
+                .iter()
+                .any(|input| matches!(input.work(), TokenWork::Decode { .. }))
+        {
+            self.mixed_calls.fetch_add(1, Ordering::Relaxed);
+            return Err(FerrumError::backend(
+                "injected executor error without a participant ledger",
+            ));
+        }
         controlled_token_fixture::execute(self, &self.tokens, work).await
     }
     async fn finish_tokens(
@@ -2667,19 +2682,35 @@ fn plan_runtime_test_engine<E: ObservedTestExecutor>(
     Arc<E::Observation>,
     Arc<dyn Tokenizer + Send + Sync>,
 ) {
+    plan_runtime_test_engine_observed(config, executor, tensor_factory, None)
+}
+
+fn plan_runtime_test_engine_observed<E: ObservedTestExecutor>(
+    config: EngineConfig,
+    executor: E,
+    tensor_factory: Arc<dyn TensorFactory>,
+    observer: Option<Arc<dyn ExecutionAttemptObserver>>,
+) -> (
+    ContinuousBatchEngine,
+    Arc<ContinuousBatchScheduler>,
+    Arc<E::Observation>,
+    Arc<dyn Tokenizer + Send + Sync>,
+) {
     let observation = executor.observer();
     let executor_owner = ExecutorOwner::new(Box::new(executor));
     let scheduler = Arc::new(ContinuousBatchScheduler::new(config.scheduler.clone()));
     let tokenizer: Arc<dyn Tokenizer + Send + Sync> =
         Arc::new(PolicyTokenizer::new(64, &[("test", 5), ("ok", 6)]));
     let sampler: Arc<dyn Sampler + Send + Sync> = Arc::new(crate::registry::GreedySampler);
-    let engine = ContinuousBatchEngine::new_plan_runtime(
+    let engine = ContinuousBatchEngine::new_plan_runtime_observed(
         config,
         scheduler.clone(),
         tokenizer.clone(),
         sampler,
         executor_owner,
         tensor_factory,
+        None,
+        observer,
     )
     .unwrap();
     (engine, scheduler, observation, tokenizer)

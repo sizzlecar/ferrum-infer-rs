@@ -11,7 +11,10 @@ use ferrum_execution::{
     },
 };
 
+mod attempt;
 mod commit;
+use attempt::TokenAttemptCapture;
+use ferrum_execution::execution_attempt::ExecutionAttemptEligibility;
 mod deferral;
 mod outcome;
 mod prefill;
@@ -246,21 +249,40 @@ impl EngineInner {
                     continue;
                 }
             };
-            let started_at = self
-                .config
-                .runtime
-                .profile_detail
-                .captures_engine_token_timing()
-                .then(Instant::now);
+            let mut attempt = self.prepare_execution_attempt(&selected);
             // A close may complete while numerical work is in flight. Keep
             // the pre-attempt epoch so installing a later wait cannot lose it.
             let observed_release_epoch = self.scheduler.confirmed_capacity_release_epoch();
+            let capture_product_timing = self
+                .config
+                .runtime
+                .profile_detail
+                .captures_engine_token_timing();
+            let started_at = (capture_product_timing || attempt.is_some()).then(Instant::now);
             let outcome = self.model_executor.execute_tokens(&works).await;
             let completed_at = started_at.map(|_| Instant::now());
+            let measured = started_at
+                .zip(completed_at)
+                .map(|(started_at, completed_at)| TokenExecutionTiming {
+                    started_at,
+                    completed_at,
+                });
+            if let (Some(attempt), Some(interval)) = (&mut attempt, measured) {
+                attempt.complete_interval(interval);
+            }
+            // Attempt collection must not enable request timing evidence or
+            // consume semantic output quota when the product profile is Off.
+            let timing = measured.filter(|_| capture_product_timing);
             // An ordinary error is never a reason to replay the whole cohort.
             let outcome = match outcome {
                 Ok(outcome) => outcome,
                 Err(error) => {
+                    self.publish_execution_attempt(
+                        attempt,
+                        ExecutionAttemptEligibility::ExecutorError,
+                        &selected,
+                        None,
+                    );
                     if decode_only {
                         decode_root_eligible = false;
                     }
@@ -275,6 +297,15 @@ impl EngineInner {
                 }
             };
             if let ExecutionBatchOutcome::NotSubmitted(not_submitted) = outcome {
+                if let Some(attempt) = &mut attempt {
+                    attempt.not_submitted(not_submitted.reason());
+                }
+                self.publish_execution_attempt(
+                    attempt,
+                    ExecutionAttemptEligibility::NotSubmitted,
+                    &selected,
+                    None,
+                );
                 if decode_only {
                     decode_root_eligible = false;
                 }
@@ -315,15 +346,9 @@ impl EngineInner {
                     && completed.completions().iter().enumerate().all(|(index, completion)| {
                         completion.validate_for(index, &works[index], self.model_executor.info().vocab_size).is_ok()
                     }));
-            let timing = started_at
-                .zip(completed_at)
-                .map(|(started_at, completed_at)| TokenExecutionTiming {
-                    started_at,
-                    completed_at,
-                });
             let mut deferred = Vec::new();
             match self
-                .consume_token_outcome(&selected, &works, outcome, timing, &mut deferred)
+                .consume_token_outcome(&selected, &works, outcome, timing, &mut deferred, attempt)
                 .await
             {
                 Ok(()) => {

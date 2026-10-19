@@ -281,6 +281,10 @@ pub struct SequenceState {
     pub(super) pending_token_admission:
         Option<ferrum_scheduler::implementations::continuous::PrefixRequestKey>,
     pub(super) execution_frontier: Option<ferrum_execution::token_execution::ExecutionFrontier>,
+    /// Optional observation of an acknowledged prefix, tied to the original
+    /// incarnation. This identity is never exported to an attempt observer.
+    pub(super) confirmed_prefix_restore:
+        Option<(ferrum_execution::token_execution::ExecutorSequence, usize)>,
     /// Preserve an interrupted participant's actual close observation until
     /// terminal processing transfers it into the independent close registry.
     pub(super) execution_close:
@@ -590,6 +594,7 @@ impl SequenceState {
             output_accounting_error: None,
             pending_token_admission: None,
             execution_frontier: None,
+            confirmed_prefix_restore: None,
             execution_close: None,
             sampling_params: request.sampling_params,
             sampling_plan,

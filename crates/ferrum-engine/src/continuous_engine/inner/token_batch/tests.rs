@@ -12,6 +12,8 @@ use ferrum_models::test_support::{tiny_llama_executor_owned, TinyLlamaConfig, Ti
 
 #[path = "tests/allocator_tests.rs"]
 mod allocator_tests;
+#[path = "tests/attempts.rs"]
+mod attempts;
 #[path = "tests/request_clock.rs"]
 mod request_clock;
 
@@ -156,6 +158,18 @@ async fn fixture_with_clock(
     Arc<ProtocolObservation>,
     Vec<TokenBatchInput>,
 ) {
+    fixture_observed(request_count, capture_timing, None).await
+}
+
+async fn fixture_observed(
+    request_count: usize,
+    capture_timing: bool,
+    observer: Option<Arc<dyn ExecutionAttemptObserver>>,
+) -> (
+    ContinuousBatchEngine,
+    Arc<ProtocolObservation>,
+    Vec<TokenBatchInput>,
+) {
     let cfg = TinyLlamaConfig::default();
     let owner = ExecutorOwner::new(tiny_llama_executor_owned(&cfg));
     let metadata = owner.scope().unwrap();
@@ -194,7 +208,7 @@ async fn fixture_with_clock(
         )
         .unwrap(),
     );
-    let engine = ContinuousBatchEngine::new(
+    let engine = ContinuousBatchEngine::new_legacy_observed(
         config,
         scheduler.clone(),
         tokenizer.clone(),
@@ -202,6 +216,9 @@ async fn fixture_with_clock(
         kv,
         ExecutorOwner::new(Box::new(implementation)),
         Arc::new(crate::tensor_factory::CandleTensorFactory::new(Device::CPU)),
+        None,
+        None,
+        observer,
     )
     .unwrap();
     let mut inputs = Vec::new();
@@ -347,7 +364,7 @@ async fn token_outcome_wrong_index_held_conflicts_only_with_its_actual_incarnati
         engine
             .active_inner()
             .expect("engine execution is open")
-            .consume_token_outcome(&selected, &works, outcome, None, &mut Vec::new())
+            .consume_token_outcome(&selected, &works, outcome, None, &mut Vec::new(), None)
             .await
             .unwrap();
         engine
@@ -448,7 +465,7 @@ async fn token_outcome_foreign_held_does_not_poison_the_declared_healthy_peer() 
     engine
         .active_inner()
         .expect("engine execution is open")
-        .consume_token_outcome(&selected, &works, outcome, None, &mut Vec::new())
+        .consume_token_outcome(&selected, &works, outcome, None, &mut Vec::new(), None)
         .await
         .unwrap();
     for input in &inputs {
@@ -518,7 +535,7 @@ async fn token_outcome_foreign_completion_does_not_claim_a_healthy_index() {
     engine
         .active_inner()
         .expect("engine execution is open")
-        .consume_token_outcome(&selected, &works, outcome, None, &mut Vec::new())
+        .consume_token_outcome(&selected, &works, outcome, None, &mut Vec::new(), None)
         .await
         .unwrap();
     for input in &inputs {
@@ -562,7 +579,7 @@ async fn token_outcome_foreign_retryable_preserves_another_live_split_request() 
     engine
         .active_inner()
         .expect("engine execution is open")
-        .consume_token_outcome(&selected, &works, outcome, None, &mut Vec::new())
+        .consume_token_outcome(&selected, &works, outcome, None, &mut Vec::new(), None)
         .await
         .unwrap();
 
@@ -618,7 +635,14 @@ async fn token_outcome_foreign_retryable_preserves_another_live_split_request() 
     engine
         .active_inner()
         .expect("engine execution is open")
-        .consume_token_outcome(&[pending], &pending_work, outcome, None, &mut Vec::new())
+        .consume_token_outcome(
+            &[pending],
+            &pending_work,
+            outcome,
+            None,
+            &mut Vec::new(),
+            None,
+        )
         .await
         .unwrap();
     assert_healthy(&engine, pending);
@@ -712,7 +736,7 @@ async fn token_outcome_keeps_deferred_subcohort_after_peer_close_and_commit() {
     let _ = engine
         .active_inner()
         .expect("engine execution is open")
-        .consume_token_outcome(&selected, &works, outcome, None, &mut deferred)
+        .consume_token_outcome(&selected, &works, outcome, None, &mut deferred, None)
         .await;
     assert_healthy(&engine, &inputs[1]);
     assert_eq!(deferred.len(), 1);
@@ -769,7 +793,7 @@ async fn token_outcome_keeps_deferred_subcohort_after_peer_close_and_commit() {
         engine
             .active_inner()
             .expect("engine execution is open")
-            .consume_token_outcome(&[input], &retry_work, result, None, &mut Vec::new())
+            .consume_token_outcome(&[input], &retry_work, result, None, &mut Vec::new(), None)
             .await
             .unwrap();
         assert_healthy(&engine, input);
@@ -833,7 +857,7 @@ async fn token_outcome_contract_violation_never_grants_capacity_retry() {
     let _ = engine
         .active_inner()
         .expect("engine execution is open")
-        .consume_token_outcome(&selected, &works, outcome, None, &mut deferred)
+        .consume_token_outcome(&selected, &works, outcome, None, &mut deferred, None)
         .await;
     assert!(deferred.is_empty());
     engine

@@ -123,6 +123,7 @@ pub(super) async fn commit_initial_products(
             scope.completed(completions).unwrap(),
             None,
             &mut deferred,
+            None,
         )
         .await
         .unwrap();
@@ -501,6 +502,7 @@ async fn token_allocator_shared_peers_close_in_order_before_recompute_can_readmi
             scope.completed(vec![completion]).unwrap(),
             None,
             &mut deferred,
+            None,
         )
         .await
         .unwrap();

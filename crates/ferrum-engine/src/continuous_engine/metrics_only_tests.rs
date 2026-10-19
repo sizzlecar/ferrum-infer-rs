@@ -26,6 +26,7 @@ fn basic_metrics_only_attaches_to_target_without_journals() {
                 owner,
                 Arc::new(MockTensorFactory),
                 None,
+                None,
             )
             .unwrap();
             assert!(engine

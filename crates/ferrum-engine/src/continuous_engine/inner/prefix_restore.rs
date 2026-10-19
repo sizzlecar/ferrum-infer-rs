@@ -329,6 +329,10 @@ impl EngineInner {
                 }
                 sequence.execution_frontier = Some(frontier);
                 sequence.prefill_tokens_processed = restored_tokens;
+                if self.execution_attempt_observer.is_some() {
+                    sequence.confirmed_prefix_restore =
+                        Some((incarnation.clone(), restored_tokens));
+                }
                 if let Some(error) = acknowledgement.error {
                     return Err(error);
                 }

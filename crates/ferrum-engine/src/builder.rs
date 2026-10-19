@@ -10,6 +10,7 @@
 
 use crate::registry::{ComponentConfig, ComponentRegistry};
 use crate::{EngineExecutor, IntoEngineExecutor};
+use ferrum_execution::execution_attempt::ExecutionAttemptObserver;
 use ferrum_execution::executor_lifecycle::{ExecutorOwner, ExecutorScope};
 #[cfg(test)]
 use ferrum_execution::ModelExecutor;
@@ -28,6 +29,7 @@ mod source_binding;
 /// Engine builder for creating inference engines with registry-based components
 pub struct EngineBuilder {
     journal_scopes: Option<crate::EngineJournalScopes>,
+    execution_attempt_observer: Option<Arc<dyn ExecutionAttemptObserver>>,
     /// Component registry to use
     registry: Arc<ComponentRegistry>,
     /// Engine configuration
@@ -67,6 +69,7 @@ impl EngineBuilder {
     pub fn with_registry(config: EngineConfig, registry: Arc<ComponentRegistry>) -> Self {
         Self {
             journal_scopes: None,
+            execution_attempt_observer: None,
             registry,
             config,
             model_sources: None,
@@ -93,6 +96,16 @@ impl EngineBuilder {
     /// producer scopes; the assembly retains final writer-close authority.
     pub fn with_journal_scopes(mut self, scopes: crate::EngineJournalScopes) -> Self {
         self.journal_scopes = Some(scopes);
+        self
+    }
+
+    /// Observe bounded product execution facts independently of detailed traces.
+    /// The observer is fixed before startup; omitting it keeps collection off.
+    pub fn with_execution_attempt_observer(
+        mut self,
+        observer: Arc<dyn ExecutionAttemptObserver>,
+    ) -> Self {
+        self.execution_attempt_observer = Some(observer);
         self
     }
 
@@ -275,6 +288,7 @@ impl EngineBuilder {
         let custom_recurrent_state_manager = self.custom_recurrent_state_manager;
         let custom_executor = self.custom_executor;
         let journal_scopes = self.journal_scopes;
+        let execution_attempt_observer = self.execution_attempt_observer;
 
         // 2. Create or use provided tokenizer
         let tokenizer = if let Some(tokenizer) = custom_tokenizer {
@@ -418,7 +432,7 @@ impl EngineBuilder {
         // sink is attached before executor startup emits warmup/capture events.
         let engine = match execution_resource_authority {
             ferrum_execution::model_executor::ExecutionResourceAuthority::PlanRuntime => {
-                crate::ContinuousBatchEngine::new_plan_runtime_with_journal_scopes(
+                crate::ContinuousBatchEngine::new_plan_runtime_observed(
                     config,
                     cb_scheduler,
                     tokenizer,
@@ -426,13 +440,14 @@ impl EngineBuilder {
                     executor,
                     tensor_factory,
                     journal_scopes,
+                    execution_attempt_observer,
                 )?
             }
             ferrum_execution::model_executor::ExecutionResourceAuthority::LegacyEngine => {
                 let kv_cache = kv_cache.ok_or_else(|| {
                     FerrumError::internal("legacy-engine composition lost its KV-cache manager")
                 })?;
-                crate::ContinuousBatchEngine::new_with_recurrent_state_manager_and_journal_scopes(
+                crate::ContinuousBatchEngine::new_legacy_observed(
                     config,
                     cb_scheduler,
                     tokenizer,
@@ -442,6 +457,7 @@ impl EngineBuilder {
                     tensor_factory,
                     recurrent_state_manager,
                     journal_scopes,
+                    execution_attempt_observer,
                 )?
             }
         };

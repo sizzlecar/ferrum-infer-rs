@@ -19,6 +19,7 @@ impl EngineInner {
         inputs: &[&TokenBatchInput],
         completions: Vec<ExecutionCompletion>,
         timing: Option<TokenExecutionTiming>,
+        attempt: &mut Option<TokenAttemptCapture>,
     ) -> TokenBatchEffects {
         let mut effects = TokenBatchEffects {
             ready: Vec::new(),
@@ -33,6 +34,9 @@ impl EngineInner {
             for completion in completions {
                 let (input_index, next_frontier, executed, product) = completion.into_parts();
                 let input = inputs[input_index];
+                if let Some(attempt) = attempt.as_mut() {
+                    attempt.completed(input_index, executed, false);
+                }
                 let mut state = input.handle.lock();
                 let Some(sequence) = state.as_mut() else {
                     effects.failed.push((
@@ -54,6 +58,9 @@ impl EngineInner {
                     continue;
                 }
                 sequence.execution_frontier = Some(next_frontier.clone());
+                if let Some(attempt) = attempt.as_mut() {
+                    attempt.completed(input_index, executed, true);
+                }
                 match executed {
                     ExecutedTokenWork::Prefill { chunk, .. } => {
                         sequence.prefill_tokens_processed = chunk.end();

@@ -12,6 +12,7 @@ use crate::resource_lifecycle::{
 use crate::IntoEngineExecutor;
 use async_trait::async_trait;
 use ferrum_bench_core::{JsonlJournal, JsonlJournalError};
+use ferrum_execution::execution_attempt::ExecutionAttemptObserver;
 use ferrum_execution::executor_lifecycle::{
     ExecutorOwner, ExecutorScope, ExecutorShutdownObserver, ExecutorShutdownPhase,
 };
@@ -1415,6 +1416,7 @@ struct EngineInner {
     runtime_config: ContinuousEngineRuntimeConfig,
     scheduler_trace_jsonl: Option<SchedulerTraceJournal>,
     host_profile_sink: Option<Arc<VNextProfileExecutionEventSink>>,
+    execution_attempt_observer: Option<Arc<dyn ExecutionAttemptObserver>>,
     legacy_scheduler_trace_jsonl: Option<JsonlJournal<serde_json::Value>>,
     journal_scopes: Arc<Mutex<EngineJournals>>,
     observation_health: ObservationHealth,
@@ -2232,6 +2234,33 @@ impl ContinuousBatchEngine {
         recurrent_state_manager: Option<Arc<dyn RecurrentStateManager + Send + Sync>>,
         journal_scopes: Option<EngineJournalScopes>,
     ) -> Result<Self> {
+        Self::new_legacy_observed(
+            config,
+            scheduler,
+            tokenizer,
+            sampler,
+            kv_cache,
+            model_executor,
+            tensor_factory,
+            recurrent_state_manager,
+            journal_scopes,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new_legacy_observed(
+        config: EngineConfig,
+        scheduler: Arc<ContinuousBatchScheduler>,
+        tokenizer: Arc<dyn Tokenizer + Send + Sync>,
+        sampler: Arc<dyn Sampler + Send + Sync>,
+        kv_cache: Arc<dyn KvCacheManager + Send + Sync>,
+        model_executor: impl IntoEngineExecutor,
+        tensor_factory: Arc<dyn TensorFactory>,
+        recurrent_state_manager: Option<Arc<dyn RecurrentStateManager + Send + Sync>>,
+        journal_scopes: Option<EngineJournalScopes>,
+        execution_attempt_observer: Option<Arc<dyn ExecutionAttemptObserver>>,
+    ) -> Result<Self> {
         Self::new_with_resource_composition(
             config,
             scheduler,
@@ -2244,6 +2273,7 @@ impl ContinuousBatchEngine {
             model_executor,
             tensor_factory,
             journal_scopes,
+            execution_attempt_observer,
         )
     }
 
@@ -2279,6 +2309,29 @@ impl ContinuousBatchEngine {
         tensor_factory: Arc<dyn TensorFactory>,
         journal_scopes: Option<EngineJournalScopes>,
     ) -> Result<Self> {
+        Self::new_plan_runtime_observed(
+            config,
+            scheduler,
+            tokenizer,
+            sampler,
+            model_executor,
+            tensor_factory,
+            journal_scopes,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new_plan_runtime_observed(
+        config: EngineConfig,
+        scheduler: Arc<ContinuousBatchScheduler>,
+        tokenizer: Arc<dyn Tokenizer + Send + Sync>,
+        sampler: Arc<dyn Sampler + Send + Sync>,
+        model_executor: impl IntoEngineExecutor,
+        tensor_factory: Arc<dyn TensorFactory>,
+        journal_scopes: Option<EngineJournalScopes>,
+        execution_attempt_observer: Option<Arc<dyn ExecutionAttemptObserver>>,
+    ) -> Result<Self> {
         Self::new_with_resource_composition(
             config,
             scheduler,
@@ -2288,6 +2341,7 @@ impl ContinuousBatchEngine {
             model_executor,
             tensor_factory,
             journal_scopes,
+            execution_attempt_observer,
         )
     }
 
@@ -2301,6 +2355,7 @@ impl ContinuousBatchEngine {
         model_executor: impl IntoEngineExecutor,
         _tensor_factory: Arc<dyn TensorFactory>,
         journal_scopes: Option<EngineJournalScopes>,
+        execution_attempt_observer: Option<Arc<dyn ExecutionAttemptObserver>>,
     ) -> Result<Self> {
         let binding = model_executor.into_engine_executor()?;
         let owns_executor = binding.owner.is_some();
@@ -2400,6 +2455,7 @@ impl ContinuousBatchEngine {
             runtime_config,
             scheduler_trace_jsonl,
             host_profile_sink,
+            execution_attempt_observer,
             legacy_scheduler_trace_jsonl,
             journal_scopes,
             observation_health,
@@ -2907,3 +2963,6 @@ mod token_completion_tests;
 #[cfg(test)]
 #[path = "continuous_engine/executor_shutdown_tests.rs"]
 mod executor_shutdown_tests;
+
+#[cfg(test)]
+mod attempt_observation_tests;

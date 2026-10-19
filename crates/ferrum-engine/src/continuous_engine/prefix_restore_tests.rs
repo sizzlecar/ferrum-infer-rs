@@ -101,6 +101,7 @@ enum RestoreBehavior {
     Miss,
     ForeignRequest,
     FailedAcknowledgement,
+    AcknowledgedWithObserverError,
 }
 
 pub(super) struct RestoreState {
@@ -158,7 +159,16 @@ impl RestoreState {
                 let frontier = tokens.restore_frontier(&sequence, guard.state.tokens)?;
                 guard.acknowledged = true;
                 guard.state.acknowledgements.fetch_add(1, Ordering::Relaxed);
-                Ok(ferrum_execution::model_executor::PrefixRestoreAcknowledgement::new(frontier))
+                let mut acknowledgement =
+                    ferrum_execution::model_executor::PrefixRestoreAcknowledgement::new(frontier);
+                if matches!(
+                    guard.state.behavior,
+                    RestoreBehavior::AcknowledgedWithObserverError
+                ) {
+                    acknowledgement.error =
+                        Some(FerrumError::backend("post-acknowledgement observer error"));
+                }
+                Ok(acknowledgement)
             },
         )
         .map(PlanRuntimePrefixRestoreOutcome::Restored)
@@ -169,6 +179,19 @@ fn engine(
     behavior: RestoreBehavior,
     tokens: usize,
     trace_path: Option<PathBuf>,
+) -> (
+    Arc<ContinuousBatchEngine>,
+    Arc<PlanRuntimeChunkedPrefillObservation>,
+    Arc<RestoreState>,
+) {
+    engine_observed(behavior, tokens, trace_path, None)
+}
+
+fn engine_observed(
+    behavior: RestoreBehavior,
+    tokens: usize,
+    trace_path: Option<PathBuf>,
+    observer: Option<Arc<dyn ExecutionAttemptObserver>>,
 ) -> (
     Arc<ContinuousBatchEngine>,
     Arc<PlanRuntimeChunkedPrefillObservation>,
@@ -189,13 +212,15 @@ fn engine(
     let observation = executor.observer();
     let executor = ExecutorOwner::new(Box::new(executor));
     let scheduler = Arc::new(ContinuousBatchScheduler::new(config.scheduler.clone()));
-    let engine = ContinuousBatchEngine::new_plan_runtime(
+    let engine = ContinuousBatchEngine::new_plan_runtime_observed(
         config,
         scheduler,
         Arc::new(ferrum_testkit::MockTokenizer::new(128)),
         Arc::new(ferrum_testkit::MockSampler),
         executor,
         Arc::new(MockTensorFactory),
+        None,
+        observer,
     )
     .unwrap();
     (Arc::new(engine), observation, state)
@@ -379,5 +404,70 @@ async fn prefix_restore_profile_accounts_only_for_committed_prefill_work() {
         }
         engine.shutdown().await.unwrap();
         std::fs::remove_file(path).unwrap();
+    }
+}
+
+#[tokio::test]
+async fn attempt_prefix_facts_require_acknowledgement_and_preserve_suffix_ranges() {
+    use crate::continuous_engine::attempt_observation_tests::AttemptRecorder;
+    use ferrum_execution::execution_attempt::*;
+    for behavior in [
+        RestoreBehavior::Hit,
+        RestoreBehavior::Miss,
+        RestoreBehavior::FailedAcknowledgement,
+        RestoreBehavior::AcknowledgedWithObserverError,
+    ] {
+        let recorder = Arc::new(AttemptRecorder::default());
+        let (engine, execution, restore) =
+            engine_observed(behavior, 3, None, Some(recorder.clone()));
+        let result = engine.infer(request()).await;
+        let samples = recorder.take();
+        let failed = matches!(
+            behavior,
+            RestoreBehavior::FailedAcknowledgement | RestoreBehavior::AcknowledgedWithObserverError
+        );
+        assert_eq!(result.is_err(), failed);
+        if failed {
+            assert!(samples.is_empty(), "a restore is not an execute invocation");
+            assert!(execution.attempted_chunks.lock().unwrap().is_empty());
+            assert_eq!(
+                restore.acknowledgements.load(Ordering::Relaxed),
+                u64::from(matches!(
+                    behavior,
+                    RestoreBehavior::AcknowledgedWithObserverError
+                ))
+            );
+        } else {
+            let mut start = if matches!(behavior, RestoreBehavior::Hit) {
+                3
+            } else {
+                0
+            };
+            for sample in &samples {
+                assert_eq!(sample.eligibility, ExecutionAttemptEligibility::Completed);
+                assert_eq!(sample.participants.len(), 1);
+                let member = &sample.participants[0];
+                assert_eq!(
+                    member.prefix_restore,
+                    if matches!(behavior, RestoreBehavior::Hit) {
+                        AttemptPrefixRestore::Restored { tokens: 3 }
+                    } else {
+                        AttemptPrefixRestore::NoneObserved
+                    }
+                );
+                assert_eq!(member.internally_reused_tokens, None);
+                let AttemptParticipantOutcome::Completed {
+                    work,
+                    frontier_committed: true,
+                } = member.outcome
+                else {
+                    panic!("suffix was not actually committed");
+                };
+                assert_eq!(work.range().unwrap().start(), start);
+                start = work.range().unwrap().end();
+            }
+            assert_eq!(start, 5);
+        }
+        engine.shutdown().await.unwrap();
     }
 }

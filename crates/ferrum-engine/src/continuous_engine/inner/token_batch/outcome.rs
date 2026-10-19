@@ -29,6 +29,7 @@ impl EngineInner {
         outcome: ExecutionBatchOutcome,
         timing: Option<TokenExecutionTiming>,
         deferred: &mut Vec<TokenDeferredGroup>,
+        mut attempt: Option<TokenAttemptCapture>,
     ) -> Result<()> {
         let vocabulary_size = self.model_executor.info().vocab_size;
         let validated_interruption = matches!(&outcome, ExecutionBatchOutcome::Interrupted(_));
@@ -55,8 +56,18 @@ impl EngineInner {
                         (batch.into_completions(), Vec::new(), Vec::new()),
                     )
                 } else {
-                    let effects =
-                        self.commit_token_completions(inputs, batch.into_completions(), timing);
+                    let effects = self.commit_token_completions(
+                        inputs,
+                        batch.into_completions(),
+                        timing,
+                        &mut attempt,
+                    );
+                    let eligibility = attempt
+                        .as_ref()
+                        .map_or(ExecutionAttemptEligibility::Completed, |attempt| {
+                            attempt.eligibility(false)
+                        });
+                    self.publish_execution_attempt(attempt, eligibility, inputs, Some(&effects));
                     return self.publish_token_effects(inputs, effects).await;
                 }
             }
@@ -90,6 +101,11 @@ impl EngineInner {
             rejected_participants,
             unassigned_products,
         } = malformed;
+        let mut invalid_contract = !validated_interruption
+            || !rejected_completions.is_empty()
+            || !rejected_participants.is_empty()
+            || !unassigned_products.is_empty();
+        let has_execution_error = causes.iter().any(|cause| cause.as_error().is_some());
         // A foreign or otherwise unassignable result may leave every requested
         // peer healthy. Still report the original failure independently; it is
         // not permission to fail or replay those peers.
@@ -148,12 +164,16 @@ impl EngineInner {
                         accepted.push(completion);
                     }
                     Err(cause) => {
+                        invalid_contract = true;
                         failures[index] = Some(cause);
                     }
                     _ => {
+                        invalid_contract = true;
                         failures[index] = Some(error.clone());
                     }
                 }
+            } else {
+                invalid_contract = true;
             }
         }
         let mut closures = (0..inputs.len())
@@ -166,6 +186,9 @@ impl EngineInner {
             let continuation_index = cohort_index(inputs, continuation_sequence(&continuation));
             let matching =
                 actual_index == Some(index) && continuation_sequence(&continuation) == &sequence;
+            if !matching || claims[index] != 1 || cause_index >= causes.len() {
+                invalid_contract = true;
+            }
             if validated_interruption
                 && matching
                 && claims[index] == 1
@@ -177,6 +200,9 @@ impl EngineInner {
                     causes.get(cause_index)
                 {
                     deferred_indices[index] = true;
+                    if let Some(attempt) = &mut attempt {
+                        attempt.deferred(index, progress);
+                    }
                     if let Some(group) = deferred
                         .iter_mut()
                         .find(|group| group.cause_index == cause_index)
@@ -192,12 +218,13 @@ impl EngineInner {
                     continue;
                 }
             }
-            if validated_interruption
-                && matching
-                && claims[index] == 1
-                && !matches!(progress, ExecutionProgress::NotSubmitted { .. })
-            {
-                executed_failures.push(index);
+            if validated_interruption && matching && claims[index] == 1 {
+                if let Some(attempt) = &mut attempt {
+                    attempt.progress(index, progress);
+                }
+                if !matches!(progress, ExecutionProgress::NotSubmitted { .. }) {
+                    executed_failures.push(index);
+                }
             }
             let cause = causes
                 .get(cause_index)
@@ -235,7 +262,7 @@ impl EngineInner {
         // Save every healthy model result before any close/output await. Close
         // observations for failed peers move into engine-owned sequence state,
         // so cancelling the caller cannot drop the rest of this batch's Helds.
-        let mut effects = self.commit_token_completions(inputs, accepted, timing);
+        let mut effects = self.commit_token_completions(inputs, accepted, timing, &mut attempt);
         // The real healthy frontiers are already saved. Only independently
         // validated submitted/terminal participants consume scheduling time;
         // NotSubmitted retries preserve the still-open interval.
@@ -283,6 +310,21 @@ impl EngineInner {
                 }
             }
         }
+        let mut eligibility = attempt
+            .as_ref()
+            .map_or(ExecutionAttemptEligibility::InvalidOutcome, |attempt| {
+                attempt.eligibility(invalid_contract)
+            });
+        if has_execution_error
+            && matches!(
+                eligibility,
+                ExecutionAttemptEligibility::Completed
+                    | ExecutionAttemptEligibility::CompletedWithNotSubmitted
+            )
+        {
+            eligibility = ExecutionAttemptEligibility::Interrupted;
+        }
+        self.publish_execution_attempt(attempt, eligibility, inputs, Some(&effects));
         self.publish_token_effects(inputs, effects).await
     }
 

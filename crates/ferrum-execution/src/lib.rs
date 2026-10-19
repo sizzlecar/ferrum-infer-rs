@@ -5,6 +5,7 @@
 
 pub mod driver;
 mod event_sink;
+pub mod execution_attempt;
 pub mod executor_lifecycle;
 pub mod model_executor;
 pub mod prepared_model;

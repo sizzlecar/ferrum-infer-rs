@@ -69,7 +69,7 @@ async fn request_clock_interrupted_retry_preserves_decode_scheduling_until_actua
     engine
         .active_inner()
         .expect("engine execution is open")
-        .consume_token_outcome(&selected, &works, outcome, Some(first), &mut deferred)
+        .consume_token_outcome(&selected, &works, outcome, Some(first), &mut deferred, None)
         .await
         .unwrap();
     assert_eq!(deferred.len(), 1);
@@ -104,6 +104,7 @@ async fn request_clock_interrupted_retry_preserves_decode_scheduling_until_actua
             retry_scope.completed(vec![completion]).unwrap(),
             Some(actual),
             &mut Vec::new(),
+            None,
         )
         .await
         .unwrap();
