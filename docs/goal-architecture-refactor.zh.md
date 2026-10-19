@@ -69,6 +69,8 @@ Metal 同步失败会阻止后续编码和宿主访问；未决工作保留原�
 
 LoRA API 迁移：退役公开的 `RuntimeLoraAdapter` / `load_runtime_lora_adapter` 裸执行入口，保留 startup metadata 与模型级 preload/set 接口。权重和元数据不可变，可变工作区由原模型实例持有，按当前 adapter 的 rank、输出宽度和实际行数准备，随未决执行保活。
 
+容量 API：`FerrumConfigBuilder` 通过 `SelectedKvCacheLayout` 接收实际模型/后端选择的布局；只有明确分页布局才能把块数换算成 token 容量。连续布局与未知布局不套用分页上限，compiled plan 仍由原 runtime 准入。`run` / `serve` 与模型分配共用选择逻辑，状态页不再按后端名称猜布局。
+
 ## 2. 问题与对应工作
 
 下表综合 Codex ARCH-01/02、Claude R177–R180 与 10/6—10/17 优化复盘。静态确认表示调用关系或边界成立，不表示已复现线上故障或量化其性能损失。

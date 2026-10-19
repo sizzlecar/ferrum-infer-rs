@@ -4,9 +4,70 @@
 //! Keeping this compatibility parser in the model crate prevents product
 //! entrypoints from owning architecture-specific resource formulas.
 
-use ferrum_types::{HardwareCapabilities, ModelCapabilities, MoeCapabilities};
+use ferrum_types::{
+    Device, HardwareCapabilities, LlamaExecutionOptions, ModelCapabilities, MoeCapabilities,
+    SelectedKvCacheLayout,
+};
 
 use crate::{Architecture, ModelDefinition};
+
+/// Cold allocation selection for the retained dense factory. The model uses
+/// the same generic selector at cache allocation; device ordinals do not change
+/// its layout. Unsupported/undefined families remain unqualified here.
+pub fn selected_kv_cache_layout(
+    definition: &ModelDefinition,
+    device: &Device,
+    options: &LlamaExecutionOptions,
+) -> SelectedKvCacheLayout {
+    use crate::models::LlamaFamilyConfig;
+    if definition.num_attention_heads == 0 {
+        return SelectedKvCacheLayout::Unknown;
+    }
+    let config = match definition.architecture {
+        Architecture::Llama => LlamaFamilyConfig::llama_from_def(definition),
+        Architecture::Qwen2 => LlamaFamilyConfig::qwen2_from_def(definition),
+        Architecture::Qwen3 => LlamaFamilyConfig::qwen3_from_def(definition),
+        Architecture::Mistral => LlamaFamilyConfig::mistral_from_def(definition),
+        Architecture::Gemma3 => LlamaFamilyConfig::gemma3_from_def(definition),
+        _ => return SelectedKvCacheLayout::Unknown,
+    };
+    selected_llama_kv_cache_layout(&config, device, options)
+}
+
+/// Direct GGUF paths have no separate semantic definition. Read the same
+/// physical config as their loader, without loading weights or creating a context.
+pub fn selected_gguf_kv_cache_layout(
+    path: &std::path::Path,
+    device: &Device,
+    options: &LlamaExecutionOptions,
+) -> ferrum_types::Result<SelectedKvCacheLayout> {
+    let gguf = ferrum_quantization::gguf::GgufFile::open(path).map_err(|error| {
+        ferrum_types::FerrumError::model(format!("GgufFile::open {}: {error}", path.display()))
+    })?;
+    let config = crate::models::LlamaFamilyConfig::from_gguf(&gguf)?;
+    Ok(selected_llama_kv_cache_layout(&config, device, options))
+}
+
+fn selected_llama_kv_cache_layout(
+    config: &crate::models::LlamaFamilyConfig,
+    device: &Device,
+    options: &LlamaExecutionOptions,
+) -> SelectedKvCacheLayout {
+    match device {
+        Device::CPU => {
+            config.selected_kv_cache_layout::<ferrum_kernels::backend::cpu::CpuBackend>(options)
+        }
+        #[cfg(feature = "cuda")]
+        Device::CUDA(_) => {
+            config.selected_kv_cache_layout::<ferrum_kernels::backend::cuda::CudaBackend>(options)
+        }
+        #[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
+        Device::Metal => {
+            config.selected_kv_cache_layout::<ferrum_kernels::backend::metal::MetalBackend>(options)
+        }
+        _ => SelectedKvCacheLayout::Unknown,
+    }
+}
 
 pub fn from_definition_with_weight_bytes(
     definition: &ModelDefinition,

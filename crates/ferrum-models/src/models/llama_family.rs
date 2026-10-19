@@ -183,7 +183,9 @@ fn write_f32_dump_with_width(dir: &str, label: &str, values: &[f32], row_width: 
     append_dump_summary(dir, label, stats_for(values), row_width);
 }
 
-use ferrum_types::{LlamaExecutionConfig, LlamaNanTraceConfig};
+use ferrum_types::{
+    LlamaExecutionConfig, LlamaExecutionOptions, LlamaNanTraceConfig, SelectedKvCacheLayout,
+};
 
 #[cfg(test)]
 fn nan_trace_raw_matches(raw: &str, local_layer: usize, source_layer: usize) -> bool {
@@ -309,11 +311,6 @@ impl LlamaFamilyRuntimeEnv {
             .max(1)
     }
 
-    fn paged_kv_enabled<B: BackendPagedKv>(&self) -> bool {
-        self.metal_paged_kv
-            .unwrap_or_else(|| B::supports_paged_kv())
-    }
-
     pub(crate) fn graph_capture_allowed(&self) -> bool {
         self.nan_trace == LlamaNanTraceConfig::Disabled
             && self.op_dump_dir.is_none()
@@ -327,6 +324,23 @@ fn paged_kv_allowed_for_layer_schedule(
     sliding_window_pattern: usize,
 ) -> bool {
     paged_enabled && (sliding_window_pattern == 0 || backend_supports_varlen_qkv)
+}
+
+fn selected_llama_kv_cache_layout<B: BackendPagedKv>(
+    requested_paged: Option<bool>,
+    sliding_window_pattern: usize,
+) -> SelectedKvCacheLayout {
+    if paged_kv_allowed_for_layer_schedule(
+        requested_paged.unwrap_or_else(B::supports_paged_kv),
+        B::supports_varlen_qkv(),
+        sliding_window_pattern,
+    ) {
+        SelectedKvCacheLayout::Paged {
+            block_size_tokens: LLAMA_PAGED_BLOCK_SIZE,
+        }
+    } else {
+        SelectedKvCacheLayout::Contiguous
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -443,6 +457,16 @@ impl Default for LlamaFamilyConfig {
 }
 
 impl LlamaFamilyConfig {
+    /// The allocation layout selected by the same policy used at cache creation.
+    /// This cold query allocates no device resources and does not infer layout
+    /// from a model name or execution resource-authority tag.
+    pub fn selected_kv_cache_layout<B: BackendPagedKv>(
+        &self,
+        options: &LlamaExecutionOptions,
+    ) -> SelectedKvCacheLayout {
+        selected_llama_kv_cache_layout::<B>(options.metal_paged_kv, self.sliding_window_pattern)
+    }
+
     pub fn to_runtime(&self) -> LlmRuntimeConfig {
         LlmRuntimeConfig {
             hidden_size: self.hidden_size,
@@ -2213,10 +2237,12 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         // env-var knowledge.
         // Windowed Gemma3 can use paged KV only on backends whose varlen QKV
         // path takes the per-layer sliding-window schedule.
-        let paged = paged_kv_allowed_for_layer_schedule(
-            runtime_env.paged_kv_enabled::<B>(),
-            B::supports_varlen_qkv(),
-            self.cfg.sliding_window_pattern,
+        let paged = matches!(
+            selected_llama_kv_cache_layout::<B>(
+                runtime_env.metal_paged_kv,
+                self.cfg.sliding_window_pattern,
+            ),
+            SelectedKvCacheLayout::Paged { .. }
         );
         // Paged KV uses a vLLM-style global physical block pool. `kv_capacity`
         // defines the per-sequence logical table stride; `kv_max_blocks`

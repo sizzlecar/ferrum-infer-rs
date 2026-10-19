@@ -70,7 +70,7 @@ struct HealthResponse {
 #[derive(Debug, Clone, Default, Deserialize)]
 struct HealthCache {
     #[serde(default)]
-    prefix_cache: HealthNativeExecutor,
+    prefix_cache: Option<HealthNativeExecutor>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -254,11 +254,6 @@ fn resolve_capabilities(health: HealthResponse) -> Result<DecodeIsolationCapabil
         == Some(ferrum_types::ExecutionResourceAuthority::PlanRuntime)
         || health.auto_config.admission.resource_authority
             == Some(ferrum_types::ExecutionResourceAuthority::PlanRuntime)
-        || health
-            .auto_config
-            .admission
-            .kv_capacity_applies_to_selected_state_layout
-            == Some(false)
     {
         if health.admission.runtime_snapshot_available != Some(true)
             || health.admission.runtime_contract_error.is_some()
@@ -280,7 +275,7 @@ fn resolve_capabilities(health: HealthResponse) -> Result<DecodeIsolationCapabil
         let max_model_length = health
             .cache
             .prefix_cache
-            .maximum_model_tokens
+            .and_then(|snapshot| snapshot.maximum_model_tokens)
             .filter(|value| *value > 0)
             .ok_or_else(|| missing("native model token limit"))?;
         let storage = health
@@ -299,6 +294,11 @@ fn resolve_capabilities(health: HealthResponse) -> Result<DecodeIsolationCapabil
         });
     }
     let auto = health.auto_config.admission;
+    if auto.kv_capacity_applies_to_selected_state_layout == Some(false) {
+        return Err(ferrum_types::FerrumError::model(
+            "decode-isolation cannot derive block-rounded KV headroom: /health marks the advertised KV capacity as inapplicable to the selected state layout",
+        ));
+    }
     let effective_max_concurrent = [
         health.admission.maximum_active_sequences,
         health.admission.effective_max_concurrent,
@@ -877,6 +877,80 @@ mod tests {
         assert!(resolve_capabilities(health).is_err());
     }
 
+    fn paged_health() -> serde_json::Value {
+        serde_json::json!({
+            "admission": {
+                "resource_authority": "legacy_engine",
+                "maximum_active_sequences": 16,
+                "maximum_scheduled_tokens": 192
+            },
+            "cache": {"prefix_cache": null},
+            "auto_config": {
+                "selected_max_model_len": 4096,
+                "selected_kv_capacity": 4096,
+                "admission": {
+                    "resource_authority": "legacy_engine",
+                    "kv_capacity_applies_to_selected_state_layout": true,
+                    "kv_capacity_tokens": 4096,
+                    "kv_block_size_tokens": 16
+                }
+            }
+        })
+    }
+
+    #[test]
+    fn paged_health_without_prefix_owner_preserves_capacity_and_block_headroom() {
+        let mut cmd = command();
+        cmd.random_input_len = 256;
+        cmd.random_output_len = 128;
+        for prefix_cache in [None, Some(serde_json::Value::Null)] {
+            let mut health = paged_health();
+            let cache = health["cache"].as_object_mut().unwrap();
+            if let Some(snapshot) = prefix_cache {
+                cache.insert("prefix_cache".into(), snapshot);
+            } else {
+                cache.remove("prefix_cache");
+            }
+            let caps = resolve_capabilities(serde_json::from_value(health).unwrap()).unwrap();
+            assert_eq!(caps.kv_capacity_tokens, Some(4096));
+            assert_eq!(caps.kv_block_size_tokens, Some(16));
+            assert!(caps.native_sequence_state.is_none());
+            let config = resolve_config(&cmd, caps).unwrap();
+            assert_eq!(config.incumbents, 5);
+            assert_eq!(config.aggressor_input_tokens, 1536);
+            assert_eq!(config.aggregate_kv_budget_blocks, Some(230));
+            assert_eq!(config.estimated_aggregate_kv_blocks, Some(217));
+        }
+    }
+
+    #[test]
+    fn legacy_health_without_layout_hint_preserves_advertised_capacity() {
+        let mut health = paged_health();
+        health["auto_config"]["admission"]
+            .as_object_mut()
+            .unwrap()
+            .remove("kv_capacity_applies_to_selected_state_layout");
+        let caps = resolve_capabilities(serde_json::from_value(health).unwrap()).unwrap();
+        assert_eq!(caps.kv_capacity_tokens, Some(4096));
+        assert_eq!(caps.kv_block_size_tokens, Some(16));
+        assert!(caps.native_sequence_state.is_none());
+    }
+
+    #[test]
+    fn contiguous_layout_does_not_use_inapplicable_capacity_or_require_native_snapshot() {
+        let mut health = paged_health();
+        health["admission"]["runtime_snapshot_available"] = serde_json::json!(false);
+        health["auto_config"]["admission"]["kv_capacity_applies_to_selected_state_layout"] =
+            serde_json::json!(false);
+        health["auto_config"]["admission"]["selected_kv_cache_layout"] =
+            serde_json::json!({"kind": "contiguous"});
+        let error = resolve_capabilities(serde_json::from_value(health).unwrap())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("KV capacity as inapplicable to the selected state layout"));
+        assert!(!error.contains("native runtime admission snapshot"));
+    }
+
     fn native_health() -> serde_json::Value {
         serde_json::json!({
             "admission": {
@@ -934,8 +1008,10 @@ mod tests {
     #[test]
     fn native_missing_or_failed_evidence_cannot_fall_back_to_legacy_capacity() {
         for path in [
+            "/admission/resource_authority",
             "/admission/runtime_snapshot_available",
             "/admission/maximum_scheduled_tokens",
+            "/cache/prefix_cache",
             "/cache/prefix_cache/maximum_model_tokens",
             "/kv_storage",
         ] {
@@ -949,6 +1025,19 @@ mod tests {
         let mut health = native_health();
         health["admission"]["runtime_contract_error"] = serde_json::json!("capacity unavailable");
         assert!(resolve_capabilities(serde_json::from_value(health).unwrap()).is_err());
+    }
+
+    #[test]
+    fn native_owner_still_requires_model_token_evidence_when_snapshot_is_missing() {
+        let mut health = native_health();
+        health["cache"]
+            .as_object_mut()
+            .unwrap()
+            .remove("prefix_cache");
+        let error = resolve_capabilities(serde_json::from_value(health).unwrap())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("native model token limit"));
     }
 
     #[test]

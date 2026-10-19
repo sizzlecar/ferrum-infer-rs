@@ -1002,10 +1002,19 @@ async fn run_serve_lifecycle(
             )
         })
         .transpose()?;
+    let selected_kv_cache_layout = crate::startup::selected_kv_cache_layout(
+        execution_resource_authority,
+        model_definition.as_ref(),
+        Some(&source.local_path),
+        &device,
+        &product_engine_config,
+        &runtime_config,
+    )?;
     let mut startup_auto_config = startup_auto_config(
         hardware,
         typed_model_capabilities,
         execution_resource_authority,
+        selected_kv_cache_layout,
         arch_for_dispatch,
         model_definition.as_ref(),
         model_weight_bytes_from_path(&source.local_path),
@@ -1449,6 +1458,7 @@ fn startup_auto_config(
     hardware: HardwareCapabilities,
     typed_model_capabilities: Option<ModelCapabilities>,
     execution_resource_authority: ferrum_types::ExecutionResourceAuthority,
+    selected_kv_cache_layout: ferrum_types::SelectedKvCacheLayout,
     architecture: Option<ferrum_models::Architecture>,
     model_definition: Option<&ferrum_models::ModelDefinition>,
     model_weight_bytes: Option<u64>,
@@ -1488,6 +1498,7 @@ fn startup_auto_config(
         hardware,
         workload,
         execution_resource_authority,
+        selected_kv_cache_layout,
         crate::startup::StartupUsage::PersistentServing,
     )
 }
@@ -3855,11 +3866,75 @@ mod tests {
     }
 
     #[test]
+    fn serve_cpu_contiguous_startup_keeps_window_beyond_block_estimate() {
+        let definition = ferrum_models::ModelDefinition {
+            hidden_size: 8,
+            intermediate_size: 16,
+            vocab_size: 16,
+            num_hidden_layers: 1,
+            num_attention_heads: 2,
+            num_key_value_heads: Some(1),
+            max_position_embeddings: 32,
+            ..Default::default()
+        };
+        let window =
+            RuntimeConfigEntry::new("FERRUM_KV_CAPACITY", "32", RuntimeConfigSource::ConfigFile);
+        let requested = RuntimeConfigSnapshot::from_entries([
+            RuntimeConfigEntry::new("FERRUM_KV_MAX_BLOCKS", "1", RuntimeConfigSource::Cli),
+            RuntimeConfigEntry::new("FERRUM_MAX_MODEL_LEN", "32", RuntimeConfigSource::Cli),
+            RuntimeConfigEntry::new("FERRUM_MAX_BATCHED_TOKENS", "32", RuntimeConfigSource::Cli),
+            window.clone(),
+        ]);
+        let device = ferrum_types::Device::CPU;
+        let authority = ferrum_types::ExecutionResourceAuthority::LegacyEngine;
+        let mut engine = ferrum_types::EngineConfig::default();
+        let layout = crate::startup::selected_kv_cache_layout(
+            authority,
+            Some(&definition),
+            None,
+            &device,
+            &engine,
+            &requested,
+        )
+        .unwrap();
+        assert_eq!(layout, ferrum_types::SelectedKvCacheLayout::Contiguous);
+        assert_eq!(engine.runtime.kv_capacity, None);
+        let resolved = startup_auto_config(
+            crate::commands::serve::hardware_capabilities_for_device(&device),
+            None,
+            authority,
+            layout,
+            Some(definition.architecture.clone()),
+            Some(&definition),
+            None,
+            None,
+            requested,
+        )
+        .expect("CPU contiguous state is not bounded by a paged block estimate");
+        assert_eq!(resolved.model_capabilities.max_context_len, Some(32));
+        assert!(resolved.runtime_config.entries.contains(&window));
+        engine
+            .apply_runtime_config_snapshot(&resolved.runtime_config)
+            .unwrap();
+        assert_eq!(engine.runtime.llama.kv_max_blocks, Some(1));
+        assert_eq!(engine.runtime.kv_capacity, Some(32));
+        assert_eq!(engine.runtime.max_model_len, Some(32));
+        assert_eq!(engine.batching.max_num_batched_tokens, 32);
+        let document = resolved.effective_config_document();
+        assert_eq!(document["selected_kv_capacity"], 32);
+        assert_eq!(
+            document["selected_kv_capacity_source"],
+            "configured_token_limit"
+        );
+    }
+
+    #[test]
     fn serve_startup_requests_native_prefix_state_cache_by_default() {
         let resolved = startup_auto_config(
             HardwareCapabilities::unknown(),
             Some(ModelCapabilities::unknown()),
             ferrum_types::ExecutionResourceAuthority::PlanRuntime,
+            ferrum_types::SelectedKvCacheLayout::Unknown,
             None,
             None,
             None,
@@ -4007,6 +4082,7 @@ mod tests {
                 HardwareCapabilities::unknown(),
                 Some(ModelCapabilities::unknown()),
                 ferrum_types::ExecutionResourceAuthority::PlanRuntime,
+                ferrum_types::SelectedKvCacheLayout::Unknown,
                 None,
                 None,
                 None,

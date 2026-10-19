@@ -3,7 +3,7 @@
 use ferrum_types::{
     EngineConfig, ExecutionResourceAuthority, FerrumConfigBuilder, FerrumError,
     HardwareCapabilities, ModelCapabilities, ResolvedFerrumConfig, Result, RuntimeConfigSnapshot,
-    RuntimeConfigSource, StartupMemoryRequest, WorkloadProfile,
+    RuntimeConfigSource, SelectedKvCacheLayout, StartupMemoryRequest, WorkloadProfile,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -18,6 +18,7 @@ pub(crate) fn resolve_config(
     hardware: HardwareCapabilities,
     workload: WorkloadProfile,
     authority: ExecutionResourceAuthority,
+    selected_kv_cache_layout: SelectedKvCacheLayout,
     usage: StartupUsage,
 ) -> Result<ResolvedFerrumConfig> {
     if authority == ExecutionResourceAuthority::PlanRuntime
@@ -57,8 +58,50 @@ pub(crate) fn resolve_config(
         .with_hardware_capabilities(hardware)
         .with_workload_profile(workload)
         .with_execution_resource_authority(authority)
+        .with_selected_kv_cache_layout(selected_kv_cache_layout)
         .resolve()
         .map_err(|error| FerrumError::config(format!("invalid auto config: {error}")))
+}
+
+/// Select the retained model's KV layout using the same typed options passed to
+/// its allocator. A native plan proves its own layout during compilation.
+pub(crate) fn selected_kv_cache_layout(
+    authority: ExecutionResourceAuthority,
+    definition: Option<&ferrum_models::ModelDefinition>,
+    model_path: Option<&std::path::Path>,
+    device: &ferrum_types::Device,
+    engine_config: &EngineConfig,
+    requested: &RuntimeConfigSnapshot,
+) -> Result<SelectedKvCacheLayout> {
+    if authority == ExecutionResourceAuthority::PlanRuntime {
+        return Ok(SelectedKvCacheLayout::Unknown);
+    }
+    let gguf_path = model_path
+        .filter(|path| ferrum_models::gguf_engine_loader::is_gguf_path(&path.to_string_lossy()));
+    if definition.is_none() && gguf_path.is_none() {
+        return Ok(SelectedKvCacheLayout::Unknown);
+    }
+    let mut selected_config = engine_config.clone();
+    selected_config
+        .apply_runtime_config_snapshot(requested)
+        .map_err(FerrumError::config)?;
+    if let Some(definition) = definition {
+        Ok(
+            ferrum_models::legacy_capabilities::selected_kv_cache_layout(
+                definition,
+                device,
+                &selected_config.runtime.llama,
+            ),
+        )
+    } else if let Some(path) = gguf_path {
+        ferrum_models::legacy_capabilities::selected_gguf_kv_cache_layout(
+            path,
+            device,
+            &selected_config.runtime.llama,
+        )
+    } else {
+        Ok(SelectedKvCacheLayout::Unknown)
+    }
 }
 
 pub(crate) fn memory_request(
@@ -226,6 +269,7 @@ mod tests {
                         hardware(),
                         WorkloadProfile::serving_default(),
                         authority,
+                        SelectedKvCacheLayout::Unknown,
                         usage,
                     )
                     .expect_err("removed controls must not disappear at either startup boundary");
@@ -266,6 +310,7 @@ mod tests {
                     hardware.clone(),
                     WorkloadProfile::serving_default(),
                     ExecutionResourceAuthority::PlanRuntime,
+                    SelectedKvCacheLayout::Unknown,
                     usage,
                 )
                 .unwrap();
@@ -355,6 +400,7 @@ mod tests {
                 HardwareCapabilities::unknown(),
                 WorkloadProfile::serving_default(),
                 ExecutionResourceAuthority::PlanRuntime,
+                SelectedKvCacheLayout::Unknown,
                 usage,
             )
             .unwrap();
@@ -386,6 +432,7 @@ mod tests {
                     hardware(),
                     WorkloadProfile::serving_default(),
                     ExecutionResourceAuthority::PlanRuntime,
+                    SelectedKvCacheLayout::Unknown,
                     usage,
                 )
                 .unwrap();
@@ -403,6 +450,7 @@ mod tests {
                 hardware(),
                 WorkloadProfile::serving_default(),
                 ExecutionResourceAuthority::LegacyEngine,
+                SelectedKvCacheLayout::Unknown,
                 usage,
             )
             .unwrap();
@@ -432,6 +480,7 @@ mod tests {
                 hardware(),
                 workload,
                 ExecutionResourceAuthority::PlanRuntime,
+                SelectedKvCacheLayout::Unknown,
                 StartupUsage::PersistentServing,
             )
             .unwrap();
@@ -460,6 +509,7 @@ mod tests {
             hardware(),
             WorkloadProfile::serving_default_for_hardware(&hardware()),
             ExecutionResourceAuthority::PlanRuntime,
+            SelectedKvCacheLayout::Unknown,
             StartupUsage::PersistentServing,
         )
         .unwrap();
@@ -486,6 +536,7 @@ mod tests {
             hardware(),
             workload.clone(),
             ExecutionResourceAuthority::PlanRuntime,
+            SelectedKvCacheLayout::Unknown,
             StartupUsage::PersistentServing,
         )
         .unwrap();
@@ -509,6 +560,7 @@ mod tests {
             hardware(),
             workload,
             ExecutionResourceAuthority::PlanRuntime,
+            SelectedKvCacheLayout::Unknown,
             StartupUsage::PersistentServing,
         )
         .is_err());
@@ -546,12 +598,126 @@ mod tests {
                 hardware(),
                 WorkloadProfile::serving_default_for_hardware(&hardware()),
                 ExecutionResourceAuthority::PlanRuntime,
+                SelectedKvCacheLayout::Unknown,
                 StartupUsage::PersistentServing,
             )
             .unwrap();
             for entry in requested.entries {
                 assert!(resolved.runtime_config.entries.contains(&entry));
             }
+        }
+    }
+
+    #[test]
+    fn selected_kv_layout_requires_a_retained_model_source() {
+        let definition = ferrum_models::ModelDefinition::default();
+        let engine = EngineConfig::default();
+        let requested = RuntimeConfigSnapshot::from_entries([RuntimeConfigEntry::new(
+            "FERRUM_KV_MAX_BLOCKS",
+            "0",
+            RuntimeConfigSource::Cli,
+        )]);
+        for (authority, definition) in [
+            (ExecutionResourceAuthority::PlanRuntime, Some(&definition)),
+            (ExecutionResourceAuthority::LegacyEngine, None),
+        ] {
+            assert_eq!(
+                selected_kv_cache_layout(
+                    authority,
+                    definition,
+                    None,
+                    &ferrum_types::Device::CPU,
+                    &engine,
+                    &requested,
+                )
+                .unwrap(),
+                SelectedKvCacheLayout::Unknown,
+            );
+        }
+        assert!(selected_kv_cache_layout(
+            ExecutionResourceAuthority::LegacyEngine,
+            Some(&definition),
+            None,
+            &ferrum_types::Device::CPU,
+            &engine,
+            &requested,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn direct_gguf_layout_reads_header_only_for_retained_source_without_definition() {
+        let file = tempfile::Builder::new().suffix(".GGUF").tempfile().unwrap();
+        let definition = ferrum_models::ModelDefinition::default();
+        let engine = EngineConfig::default();
+        let requested = RuntimeConfigSnapshot::default();
+        assert_eq!(
+            selected_kv_cache_layout(
+                ExecutionResourceAuthority::PlanRuntime,
+                None,
+                Some(file.path()),
+                &ferrum_types::Device::CPU,
+                &engine,
+                &requested,
+            )
+            .unwrap(),
+            SelectedKvCacheLayout::Unknown,
+        );
+        assert_eq!(
+            selected_kv_cache_layout(
+                ExecutionResourceAuthority::LegacyEngine,
+                Some(&definition),
+                Some(file.path()),
+                &ferrum_types::Device::CPU,
+                &engine,
+                &requested,
+            )
+            .unwrap(),
+            SelectedKvCacheLayout::Contiguous,
+        );
+        assert!(
+            selected_kv_cache_layout(
+                ExecutionResourceAuthority::LegacyEngine,
+                None,
+                Some(file.path()),
+                &ferrum_types::Device::CPU,
+                &engine,
+                &requested,
+            )
+            .is_err(),
+            "a direct GGUF with an invalid header must not become an unknown layout"
+        );
+    }
+
+    #[test]
+    fn explicit_paged_layout_keeps_physical_block_capacity_validation() {
+        for usage in [StartupUsage::SingleRequest, StartupUsage::PersistentServing] {
+            let requested = RuntimeConfigSnapshot::from_entries([
+                RuntimeConfigEntry::new("FERRUM_KV_MAX_BLOCKS", "1", RuntimeConfigSource::Cli),
+                RuntimeConfigEntry::new("FERRUM_MAX_MODEL_LEN", "32", RuntimeConfigSource::Cli),
+                RuntimeConfigEntry::new("FERRUM_KV_CAPACITY", "32", RuntimeConfigSource::Cli),
+                RuntimeConfigEntry::new(
+                    "FERRUM_MAX_BATCHED_TOKENS",
+                    "32",
+                    RuntimeConfigSource::Cli,
+                ),
+            ]);
+            let error = resolve_config(
+                requested,
+                model(),
+                hardware(),
+                WorkloadProfile::serving_default(),
+                ExecutionResourceAuthority::LegacyEngine,
+                SelectedKvCacheLayout::Paged {
+                    block_size_tokens: 16,
+                },
+                usage,
+            )
+            .expect_err("one physical page cannot admit a batch of 32 tokens");
+            assert!(
+                error.to_string().contains("KV cache token capacity"),
+                "{error}"
+            );
         }
     }
 

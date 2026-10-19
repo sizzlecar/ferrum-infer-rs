@@ -297,3 +297,63 @@ fn supported_dense_architectures_keep_metadata_parsing() {
         assert_eq!(config.vocab_size, 4, "{arch}");
     }
 }
+
+#[test]
+fn selected_kv_layout_direct_gguf_reads_original_physical_config() {
+    use ferrum_kernels::backend::cpu::CpuBackend;
+    use ferrum_models::legacy_capabilities::selected_gguf_kv_cache_layout;
+    use ferrum_types::{LlamaExecutionOptions, SelectedKvCacheLayout};
+    let extra = [
+        ("llama.block_count", Value::U32(1)),
+        ("llama.embedding_length", Value::U32(16)),
+        ("llama.feed_forward_length", Value::U32(32)),
+        ("llama.attention.head_count", Value::U32(2)),
+        ("llama.attention.head_count_kv", Value::U32(2)),
+        ("llama.attention.layer_norm_rms_epsilon", Value::F32(1.0e-5)),
+        ("llama.context_length", Value::U32(32)),
+    ];
+    let file = build_metadata_gguf("llama", &extra, 32, 16);
+    let gguf = GgufFile::open(file.path()).unwrap();
+    let actual_config = LlamaFamilyConfig::from_gguf(&gguf).unwrap();
+    for requested_paged in [None, Some(false), Some(true)] {
+        let options = LlamaExecutionOptions {
+            metal_paged_kv: requested_paged,
+            ..Default::default()
+        };
+        let selected =
+            selected_gguf_kv_cache_layout(file.path(), &ferrum_types::Device::CPU, &options)
+                .unwrap();
+        assert_eq!(
+            selected,
+            actual_config.selected_kv_cache_layout::<CpuBackend>(&options)
+        );
+        assert_eq!(
+            selected,
+            if requested_paged == Some(true) {
+                SelectedKvCacheLayout::Paged {
+                    block_size_tokens: 16,
+                }
+            } else {
+                SelectedKvCacheLayout::Contiguous
+            }
+        );
+    }
+    #[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
+    {
+        // Capability selection only: no Metal context or GPU work is created.
+        let options = LlamaExecutionOptions::default();
+        assert_eq!(
+            selected_gguf_kv_cache_layout(file.path(), &ferrum_types::Device::Metal, &options)
+                .unwrap(),
+            actual_config
+                .selected_kv_cache_layout::<ferrum_kernels::backend::metal::MetalBackend>(&options)
+        );
+        assert_eq!(
+            selected_gguf_kv_cache_layout(file.path(), &ferrum_types::Device::Metal, &options)
+                .unwrap(),
+            SelectedKvCacheLayout::Paged {
+                block_size_tokens: 16
+            }
+        );
+    }
+}

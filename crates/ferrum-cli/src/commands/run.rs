@@ -1203,10 +1203,19 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
         &effective_runtime_config,
     )?;
     let hardware = crate::startup::hardware_for_request(&device, startup_memory_request.as_ref());
+    let selected_kv_cache_layout = crate::startup::selected_kv_cache_layout(
+        execution_resource_authority,
+        model_definition_for_config.as_ref(),
+        Some(&source.local_path),
+        &device,
+        &engine_config,
+        &effective_runtime_config,
+    )?;
     let mut startup_auto_config = run_startup_auto_config(
         hardware,
         typed_model_capabilities,
         execution_resource_authority,
+        selected_kv_cache_layout,
         model_definition_for_config.as_ref(),
         crate::commands::serve::model_weight_bytes_from_path(&source.local_path),
         effective_runtime_config,
@@ -2920,6 +2929,7 @@ fn run_startup_auto_config(
     hardware: ferrum_types::HardwareCapabilities,
     typed_model_capabilities: Option<ModelCapabilities>,
     execution_resource_authority: ferrum_types::ExecutionResourceAuthority,
+    selected_kv_cache_layout: ferrum_types::SelectedKvCacheLayout,
     model_definition: Option<&ferrum_models::ModelDefinition>,
     model_weight_bytes: Option<u64>,
     runtime_config: RuntimeConfigSnapshot,
@@ -2942,6 +2952,7 @@ fn run_startup_auto_config(
         hardware,
         workload,
         execution_resource_authority,
+        selected_kv_cache_layout,
         crate::startup::StartupUsage::SingleRequest,
     )
 }
@@ -3762,6 +3773,7 @@ mod tests {
                 ferrum_types::HardwareCapabilities::unknown(),
                 Some(ModelCapabilities::unknown()),
                 ferrum_types::ExecutionResourceAuthority::PlanRuntime,
+                ferrum_types::SelectedKvCacheLayout::Unknown,
                 None,
                 None,
                 effective,
@@ -4178,11 +4190,73 @@ mod tests {
     }
 
     #[test]
+    fn run_cpu_contiguous_startup_keeps_window_beyond_block_estimate() {
+        let definition = ferrum_models::ModelDefinition {
+            hidden_size: 8,
+            intermediate_size: 16,
+            vocab_size: 16,
+            num_hidden_layers: 1,
+            num_attention_heads: 2,
+            num_key_value_heads: Some(1),
+            max_position_embeddings: 32,
+            ..Default::default()
+        };
+        let window =
+            RuntimeConfigEntry::new("FERRUM_KV_CAPACITY", "32", RuntimeConfigSource::ConfigFile);
+        let requested = RuntimeConfigSnapshot::from_entries([
+            RuntimeConfigEntry::new("FERRUM_KV_MAX_BLOCKS", "1", RuntimeConfigSource::Cli),
+            RuntimeConfigEntry::new("FERRUM_MAX_MODEL_LEN", "32", RuntimeConfigSource::Cli),
+            RuntimeConfigEntry::new("FERRUM_MAX_BATCHED_TOKENS", "32", RuntimeConfigSource::Cli),
+            window.clone(),
+        ]);
+        let device = ferrum_types::Device::CPU;
+        let authority = ferrum_types::ExecutionResourceAuthority::LegacyEngine;
+        let mut engine = ferrum_types::EngineConfig::default();
+        let layout = crate::startup::selected_kv_cache_layout(
+            authority,
+            Some(&definition),
+            None,
+            &device,
+            &engine,
+            &requested,
+        )
+        .unwrap();
+        assert_eq!(layout, ferrum_types::SelectedKvCacheLayout::Contiguous);
+        assert_eq!(engine.runtime.kv_capacity, None);
+        let resolved = run_startup_auto_config(
+            crate::commands::serve::hardware_capabilities_for_device(&device),
+            None,
+            authority,
+            layout,
+            Some(&definition),
+            None,
+            requested,
+        )
+        .expect("CPU contiguous state is not bounded by a paged block estimate");
+        assert_eq!(resolved.model_capabilities.max_context_len, Some(32));
+        assert!(resolved.runtime_config.entries.contains(&window));
+        engine
+            .apply_runtime_config_snapshot(&resolved.runtime_config)
+            .unwrap();
+        assert_eq!(engine.runtime.llama.kv_max_blocks, Some(1));
+        assert_eq!(engine.runtime.kv_capacity, Some(32));
+        assert_eq!(engine.runtime.max_model_len, Some(32));
+        assert_eq!(engine.batching.max_num_batched_tokens, 32);
+        let document = resolved.effective_config_document();
+        assert_eq!(document["selected_kv_capacity"], 32);
+        assert_eq!(
+            document["selected_kv_capacity_source"],
+            "configured_token_limit"
+        );
+    }
+
+    #[test]
     fn run_startup_auto_config_renders_effective_config_schema() {
         let resolved = run_startup_auto_config(
             crate::commands::serve::hardware_capabilities_for_device(&ferrum_types::Device::CPU),
             None,
             ferrum_types::ExecutionResourceAuthority::LegacyEngine,
+            ferrum_types::SelectedKvCacheLayout::Unknown,
             None,
             None,
             RuntimeConfigSnapshot::from_entries(Vec::new()),
@@ -4981,6 +5055,7 @@ mod tests {
             crate::commands::serve::hardware_capabilities_for_device(&ferrum_types::Device::CPU),
             Some(capabilities),
             authority,
+            ferrum_types::SelectedKvCacheLayout::Unknown,
             None,
             None,
             effective,
@@ -5110,6 +5185,7 @@ mod tests {
             crate::commands::serve::hardware_capabilities_for_device(&ferrum_types::Device::CPU),
             Some(capabilities),
             authority,
+            ferrum_types::SelectedKvCacheLayout::Unknown,
             None,
             None,
             effective,
@@ -5158,6 +5234,7 @@ mod tests {
             crate::commands::serve::hardware_capabilities_for_device(&ferrum_types::Device::CPU),
             Some(model),
             ferrum_types::ExecutionResourceAuthority::PlanRuntime,
+            ferrum_types::SelectedKvCacheLayout::Unknown,
             None,
             None,
             run_base_runtime_config(&CliConfig::default(), RuntimeConfigSnapshot::default()),
@@ -5326,6 +5403,7 @@ mod tests {
             crate::commands::serve::hardware_capabilities_for_device(&ferrum_types::Device::CPU),
             None,
             ferrum_types::ExecutionResourceAuthority::PlanRuntime,
+            ferrum_types::SelectedKvCacheLayout::Unknown,
             None,
             None,
             effective,

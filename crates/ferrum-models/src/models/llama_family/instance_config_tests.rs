@@ -341,3 +341,137 @@ fn invalid_instance_capacity_is_rejected_before_any_weight_load() {
         assert_eq!(reads.load(Ordering::Relaxed), 0);
     }
 }
+
+#[test]
+fn selected_kv_layout_cpu_contiguous_crosses_block_estimate_with_full_logits() {
+    use crate::common::DecoderOnlyLLM;
+    use crate::test_support::SyntheticLlamaLoader;
+    use ferrum_types::{FerrumConfigBuilder, SelectedKvCacheLayout};
+    let cfg = LlamaFamilyConfig {
+        hidden_size: 16,
+        intermediate_size: 32,
+        num_heads: 2,
+        num_kv_heads: 2,
+        head_dim: 8,
+        num_layers: 2,
+        vocab_size: 32,
+        max_seq_len: 32,
+        ..Default::default()
+    };
+    let request = RuntimeConfigSnapshot::from_env_vars([
+        ("FERRUM_KV_CAPACITY", "32"),
+        ("FERRUM_KV_MAX_BLOCKS", "1"),
+        ("FERRUM_PAGED_MAX_SEQS", "1"),
+        ("FERRUM_MAX_MODEL_LEN", "32"),
+        ("FERRUM_MAX_BATCHED_TOKENS", "32"),
+    ]);
+    let mut input = EngineConfig::default();
+    input.apply_runtime_config_snapshot(&request).unwrap();
+    let selected = cfg.selected_kv_cache_layout::<CpuBackend>(&input.runtime.llama);
+    assert_eq!(selected, SelectedKvCacheLayout::Contiguous);
+    let definition = crate::ModelDefinition {
+        hidden_size: cfg.hidden_size,
+        intermediate_size: cfg.intermediate_size,
+        num_attention_heads: cfg.num_heads,
+        num_key_value_heads: Some(cfg.num_kv_heads),
+        num_hidden_layers: cfg.num_layers,
+        vocab_size: cfg.vocab_size,
+        max_position_embeddings: cfg.max_seq_len,
+        ..Default::default()
+    };
+    assert_eq!(
+        crate::legacy_capabilities::selected_kv_cache_layout(
+            &definition,
+            &ferrum_types::Device::CPU,
+            &input.runtime.llama,
+        ),
+        selected
+    );
+    let resolved = FerrumConfigBuilder::new(request)
+        .with_selected_kv_cache_layout(selected)
+        .resolve()
+        .unwrap();
+    let mut engine = EngineConfig::default();
+    engine
+        .apply_runtime_config_snapshot(&resolved.runtime_config)
+        .unwrap();
+    let loader = SyntheticLlamaLoader::new(cfg.clone());
+    let mut candidate =
+        Model::new_with_execution_config(cfg.clone(), &loader, engine.llama_execution_config())
+            .unwrap();
+    let mut reference = Model::new(cfg.clone(), &loader).unwrap();
+    let tokens: Vec<_> = (0..17).map(|index| (index % 7 + 1) as u32).collect();
+    let actual = candidate.prefill_internal("candidate", &tokens);
+    let expected = reference.prefill_internal("reference", &tokens);
+    assert_eq!(actual.len(), cfg.vocab_size);
+    assert!(actual.iter().all(|value| value.is_finite()));
+    assert_eq!(actual, expected);
+    assert!(candidate.paged_pools.is_none());
+    assert!(candidate.paged_block_alloc.is_none());
+    assert!(candidate.kv_caches["candidate"]
+        .iter()
+        .all(|cache| cache.capacity >= 17));
+    let actual = candidate.decode_internal("candidate", 3, 17);
+    let expected = reference.decode_internal("reference", 3, 17);
+    assert_eq!(actual.len(), cfg.vocab_size);
+    assert!(actual.iter().all(|value| value.is_finite()));
+    assert_eq!(actual, expected);
+    candidate.release("candidate");
+    reference.release("reference");
+    candidate.close().unwrap();
+    reference.close().unwrap();
+    assert!(candidate.execution_context.is_none());
+    assert!(reference.execution_context.is_none());
+    assert!(candidate.kv_caches.is_empty());
+    assert!(reference.kv_caches.is_empty());
+}
+
+#[test]
+fn selected_kv_layout_preserves_paged_allocator_geometry_and_layer_fallback() {
+    use ferrum_types::{FerrumConfigBuilder, SelectedKvCacheLayout};
+    let engine = configured_engine(32, 2, 1, false);
+    let mut cfg = tiny_config();
+    cfg.max_seq_len = 32;
+    let selected = cfg.selected_kv_cache_layout::<CpuBackend>(&engine.runtime.llama);
+    assert_eq!(
+        selected,
+        SelectedKvCacheLayout::Paged {
+            block_size_tokens: LLAMA_PAGED_BLOCK_SIZE
+        }
+    );
+    let mut model = Model::new_with_execution_config(
+        cfg.clone(),
+        &FirstLoadLoader::default(),
+        engine.llama_execution_config(),
+    )
+    .unwrap();
+    // This checks the existing real allocation path, not GPU numerical eligibility.
+    assert_initial_paged_allocation(&mut model, 32, 2, 1);
+    let actual_pool_tokens = model
+        .paged_block_alloc
+        .as_ref()
+        .unwrap()
+        .lock()
+        .unwrap()
+        .capacity() as usize
+        * LLAMA_PAGED_BLOCK_SIZE;
+    assert_eq!(actual_pool_tokens, 32);
+    assert!(
+        FerrumConfigBuilder::new(RuntimeConfigSnapshot::from_env_vars([
+            ("FERRUM_KV_MAX_BLOCKS", "1"),
+            ("FERRUM_PAGED_MAX_SEQS", "1"),
+            ("FERRUM_MAX_BATCHED_TOKENS", "16"),
+            ("FERRUM_MAX_MODEL_LEN", "32"),
+        ]))
+        .with_selected_kv_cache_layout(selected)
+        .resolve()
+        .is_err()
+    );
+    model.close().unwrap();
+    // The same requested paged mode falls back for an unsupported layer schedule.
+    cfg.sliding_window_pattern = 6;
+    assert_eq!(
+        cfg.selected_kv_cache_layout::<CpuBackend>(&engine.runtime.llama),
+        SelectedKvCacheLayout::Contiguous
+    );
+}

@@ -8,6 +8,7 @@ fn config() -> ResolvedFerrumConfig {
         HardwareCapabilities::unknown(),
         Some(ModelCapabilities::unknown()),
         ferrum_types::ExecutionResourceAuthority::PlanRuntime,
+        ferrum_types::SelectedKvCacheLayout::Unknown,
         None,
         None,
         None,

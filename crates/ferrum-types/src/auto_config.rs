@@ -325,12 +325,37 @@ pub enum WorkloadPriority {
     Balanced,
 }
 
+/// Cold selection of the KV allocation layout used by the retained model.
+/// This is supplied by the model/backend selector, never inferred from the
+/// resource-authority tag. Unknown does not authorize a block-to-token limit.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SelectedKvCacheLayout {
+    #[default]
+    Unknown,
+    Contiguous,
+    Paged {
+        block_size_tokens: usize,
+    },
+}
+
+impl SelectedKvCacheLayout {
+    fn block_size_tokens(self) -> Option<usize> {
+        match self {
+            Self::Paged { block_size_tokens } => Some(block_size_tokens),
+            Self::Unknown | Self::Contiguous => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResolvedFerrumConfig {
     pub schema_version: u32,
     pub preset: Option<String>,
     #[serde(default)]
     pub execution_resource_authority: ExecutionResourceAuthority,
+    #[serde(default)]
+    pub selected_kv_cache_layout: SelectedKvCacheLayout,
     #[serde(default)]
     pub requested_attention_policy: Option<AttentionExecutionPolicy>,
     #[serde(default)]
@@ -503,7 +528,11 @@ impl ResolvedFerrumConfig {
             "selected_microbatch_size": selected_microbatch_size,
             "selected_stage_bridge": selected_stage_bridge,
             "selected_weight_placement": if selected_layer_split_plan.is_some() { "layer_split" } else { "single_device" },
-            "selected_kv_layout": if backend.eq_ignore_ascii_case("cpu") { "contiguous" } else { "paged" },
+            "selected_kv_layout": match self.selected_kv_cache_layout {
+                SelectedKvCacheLayout::Unknown => "unknown",
+                SelectedKvCacheLayout::Contiguous => "contiguous",
+                SelectedKvCacheLayout::Paged { .. } => "paged",
+            },
             "selected_attention_impl": selected_attention_impl,
             "selected_attention_policy": selected_attention_policy,
             "attention_execution": self.attention_execution_document(),
@@ -529,8 +558,12 @@ impl ResolvedFerrumConfig {
         let kv_blocks = self.selected_usize("kv_block_count");
         let max_batched_tokens = self.selected_usize("max_batched_tokens");
         let max_model_len = self.selected_usize("max_model_len");
-        let kv_capacity_tokens =
-            kv_blocks.map(|blocks| blocks.saturating_mul(DEFAULT_KV_BLOCK_SIZE_TOKENS));
+        let block_size = self.selected_kv_cache_layout.block_size_tokens();
+        // Preserve the explicitly labelled geometry estimate for old reports;
+        // applicability is true only when the actual selector supplied Paged.
+        let kv_capacity_tokens = kv_blocks.map(|blocks| {
+            blocks.saturating_mul(block_size.unwrap_or(DEFAULT_KV_BLOCK_SIZE_TOKENS))
+        });
         let kv_bytes_per_token = kv_cache_bytes_per_token_for_model(&self.model_capabilities);
         let scheduler_policy = self
             .selected_string("scheduler_admission_policy")
@@ -570,10 +603,11 @@ impl ResolvedFerrumConfig {
             "completed_requests_total": 0u64,
             "max_sequences": max_sequences,
             "kv_capacity_source": "legacy_block_preflight_estimate",
-            "kv_capacity_applies_to_selected_state_layout": self.execution_resource_authority == ExecutionResourceAuthority::LegacyEngine,
+            "selected_kv_cache_layout": self.selected_kv_cache_layout,
+            "kv_capacity_applies_to_selected_state_layout": block_size.is_some(),
             "kv_capacity_is_resident_usage": false,
             "kv_block_count": kv_blocks,
-            "kv_block_size_tokens": DEFAULT_KV_BLOCK_SIZE_TOKENS,
+            "kv_block_size_tokens": block_size.unwrap_or(DEFAULT_KV_BLOCK_SIZE_TOKENS),
             "kv_capacity_tokens": kv_capacity_tokens,
             "max_model_length": max_model_len,
             "max_batched_tokens": max_batched_tokens,
@@ -738,6 +772,7 @@ pub struct FerrumConfigBuilder {
     hardware: HardwareCapabilities,
     workload: WorkloadProfile,
     execution_resource_authority: ExecutionResourceAuthority,
+    selected_kv_cache_layout: SelectedKvCacheLayout,
 }
 
 impl FerrumConfigBuilder {
@@ -748,6 +783,7 @@ impl FerrumConfigBuilder {
             hardware: HardwareCapabilities::unknown(),
             workload: WorkloadProfile::default(),
             execution_resource_authority: ExecutionResourceAuthority::LegacyEngine,
+            selected_kv_cache_layout: SelectedKvCacheLayout::Unknown,
         }
     }
 
@@ -783,9 +819,30 @@ impl FerrumConfigBuilder {
         self
     }
 
+    /// The caller must use the same cold selector as its actual model allocator.
+    /// Compiled-runtime layouts are admitted by their plan and remain Unknown here.
+    pub fn with_selected_kv_cache_layout(mut self, layout: SelectedKvCacheLayout) -> Self {
+        self.selected_kv_cache_layout = layout;
+        self
+    }
+
     pub fn resolve(self) -> Result<ResolvedFerrumConfig, AutoConfigError> {
         if let Err((key, reason)) = self.runtime_config.validate_retired_options() {
             return self.invalid(key, reason);
+        }
+        if self.selected_kv_cache_layout.block_size_tokens() == Some(0) {
+            return self.invalid(
+                "selected_kv_cache_layout",
+                "paged block size must be positive",
+            );
+        }
+        if self.execution_resource_authority == ExecutionResourceAuthority::PlanRuntime
+            && self.selected_kv_cache_layout != SelectedKvCacheLayout::Unknown
+        {
+            return self.invalid(
+                "selected_kv_cache_layout",
+                "compiled runtime capacity belongs to its actual plan",
+            );
         }
         let mut decisions = Vec::new();
         let cuda_backend = self.is_cuda_backend();
@@ -1188,6 +1245,7 @@ impl FerrumConfigBuilder {
             schema_version: 1,
             preset: self.workload.preset.clone(),
             execution_resource_authority: self.execution_resource_authority,
+            selected_kv_cache_layout: self.selected_kv_cache_layout,
             requested_attention_policy: plan_attention
                 .as_ref()
                 .map(|(requested, _)| requested.value),
@@ -1270,10 +1328,10 @@ impl FerrumConfigBuilder {
         max_sequences: &ResolvedValue<usize>,
         kv_blocks: &ResolvedValue<usize>,
     ) -> ResolvedValue<usize> {
-        let kv_token_capacity = kv_blocks
-            .value
-            .saturating_mul(DEFAULT_KV_BLOCK_SIZE_TOKENS)
-            .max(max_sequences.value.max(1));
+        let kv_token_capacity = self
+            .selected_kv_cache_layout
+            .block_size_tokens()
+            .map(|block_size| kv_blocks.value.saturating_mul(block_size));
         let target = if self
             .workload
             .is_preset(QWEN25_72B_GPTQ_INT4_2X4090_LAYER_SPLIT_PRESET)
@@ -1282,19 +1340,16 @@ impl FerrumConfigBuilder {
         } else {
             max_sequences.value.max(1).saturating_mul(64)
         };
-        // PlanRuntime admits exact typed states and workspace against its
-        // device budget. Legacy block estimates do not cap its token work.
-        let value = if self.execution_resource_authority == ExecutionResourceAuthority::PlanRuntime
-        {
-            target
-        } else {
-            target.min(kv_token_capacity)
-        }
-        .max(max_sequences.value.max(1));
+        // Only the selected paged allocator turns this block count into token
+        // capacity. Contiguous and unqualified layouts retain the workload target.
+        let value = kv_token_capacity
+            .map_or(target, |capacity| target.min(capacity))
+            .max(max_sequences.value.max(1));
         ResolvedValue {
             value,
             source: if max_sequences.source == AutoConfigSource::HardwareCapability
-                || kv_blocks.source == AutoConfigSource::HardwareCapability
+                || (kv_token_capacity.is_some()
+                    && kv_blocks.source == AutoConfigSource::HardwareCapability)
             {
                 AutoConfigSource::HardwareCapability
             } else {
@@ -1790,10 +1845,11 @@ impl FerrumConfigBuilder {
                 "must be at least FERRUM_PAGED_MAX_SEQS",
             );
         }
-        let kv_token_capacity = kv_blocks.saturating_mul(DEFAULT_KV_BLOCK_SIZE_TOKENS);
-        if self.execution_resource_authority == ExecutionResourceAuthority::LegacyEngine
-            && max_batched_tokens > kv_token_capacity
-        {
+        let kv_token_capacity = self
+            .selected_kv_cache_layout
+            .block_size_tokens()
+            .map(|block_size| kv_blocks.saturating_mul(block_size));
+        if kv_token_capacity.is_some_and(|capacity| max_batched_tokens > capacity) {
             return self.invalid(
                 "FERRUM_MAX_BATCHED_TOKENS",
                 "exceeds KV cache token capacity",
@@ -1811,9 +1867,7 @@ impl FerrumConfigBuilder {
                     );
                 }
             }
-            if self.execution_resource_authority == ExecutionResourceAuthority::LegacyEngine
-                && max_model_len > kv_token_capacity
-            {
+            if kv_token_capacity.is_some_and(|capacity| max_model_len > capacity) {
                 return self.invalid(
                     "FERRUM_KV_MAX_BLOCKS",
                     "KV cache token capacity is smaller than FERRUM_MAX_MODEL_LEN",
@@ -3360,6 +3414,9 @@ mod tests {
             .with_model_capabilities(ModelCapabilities::qwen3_30b_a3b_gptq_int4())
             .with_hardware_capabilities(HardwareCapabilities::rtx4090_cuda(features))
             .with_workload_profile(WorkloadProfile::m3_qwen3_30b_a3b_int4())
+            .with_selected_kv_cache_layout(SelectedKvCacheLayout::Paged {
+                block_size_tokens: 16,
+            })
     }
 
     fn m3_with_hardware(
@@ -3370,6 +3427,9 @@ mod tests {
             .with_model_capabilities(ModelCapabilities::qwen3_30b_a3b_gptq_int4())
             .with_hardware_capabilities(hardware)
             .with_workload_profile(WorkloadProfile::m3_qwen3_30b_a3b_int4())
+            .with_selected_kv_cache_layout(SelectedKvCacheLayout::Paged {
+                block_size_tokens: 16,
+            })
     }
 
     fn qwen35_moe_gptq_int4_model() -> ModelCapabilities {
@@ -3937,7 +3997,7 @@ mod tests {
             assert_eq!(admission["kv_capacity_is_resident_usage"], false);
             assert_eq!(
                 admission["kv_capacity_applies_to_selected_state_layout"],
-                authority == ExecutionResourceAuthority::LegacyEngine
+                false
             );
             let estimate = &admission["memory_estimate"];
             assert_eq!(
@@ -4009,6 +4069,127 @@ mod tests {
     }
 
     #[test]
+    fn selected_kv_layout_applies_block_limits_only_to_actual_paged_geometry() {
+        let mut model = ModelCapabilities::unknown();
+        model.max_context_len = Some(32);
+        let resolve = |layout, batch, window| {
+            FerrumConfigBuilder::new(snapshot(&[
+                ("FERRUM_KV_MAX_BLOCKS", "1"),
+                ("FERRUM_PAGED_MAX_SEQS", "1"),
+                ("FERRUM_MAX_BATCHED_TOKENS", batch),
+                ("FERRUM_MAX_MODEL_LEN", window),
+            ]))
+            .with_model_capabilities(model.clone())
+            .with_selected_kv_cache_layout(layout)
+            .resolve()
+        };
+        for layout in [
+            SelectedKvCacheLayout::Contiguous,
+            SelectedKvCacheLayout::Unknown,
+        ] {
+            let resolved = resolve(layout, "32", "32").unwrap();
+            assert_eq!(resolved.selected_usize("max_model_len"), Some(32));
+            assert_eq!(resolved.selected_usize("max_batched_tokens"), Some(32));
+            assert_eq!(resolved.selected_kv_cache_layout, layout);
+            assert_eq!(
+                resolved.admission_summary_document()
+                    ["kv_capacity_applies_to_selected_state_layout"],
+                false
+            );
+        }
+        let paged = SelectedKvCacheLayout::Paged {
+            block_size_tokens: 16,
+        };
+        assert!(
+            matches!(resolve(paged, "32", "16"), Err(AutoConfigError::InvalidOverride { key, .. }) if key == "FERRUM_MAX_BATCHED_TOKENS")
+        );
+        assert!(
+            matches!(resolve(paged, "16", "32"), Err(AutoConfigError::InvalidOverride { key, .. }) if key == "FERRUM_KV_MAX_BLOCKS")
+        );
+        let actual = resolve(paged, "16", "16").unwrap();
+        assert_eq!(
+            actual.admission_summary_document()["kv_capacity_tokens"],
+            16
+        );
+        assert_eq!(
+            actual.admission_summary_document()["kv_capacity_applies_to_selected_state_layout"],
+            true
+        );
+        // The selected allocator's geometry is the authority, not a hardcoded 16.
+        let wider = resolve(
+            SelectedKvCacheLayout::Paged {
+                block_size_tokens: 32,
+            },
+            "32",
+            "32",
+        )
+        .unwrap();
+        assert_eq!(wider.admission_summary_document()["kv_capacity_tokens"], 32);
+        assert!(resolve(
+            SelectedKvCacheLayout::Paged {
+                block_size_tokens: 0
+            },
+            "1",
+            "1"
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn selected_kv_layout_metadata_uses_same_selection_instead_of_backend_label() {
+        let mut hardware = HardwareCapabilities::unknown();
+        hardware.backend = "metal".into();
+        for (layout, label) in [
+            (SelectedKvCacheLayout::Unknown, "unknown"),
+            (SelectedKvCacheLayout::Contiguous, "contiguous"),
+            (
+                SelectedKvCacheLayout::Paged {
+                    block_size_tokens: 16,
+                },
+                "paged",
+            ),
+        ] {
+            let resolved = FerrumConfigBuilder::new(snapshot(&[]))
+                .with_hardware_capabilities(hardware.clone())
+                .with_selected_kv_cache_layout(layout)
+                .resolve()
+                .unwrap();
+            let document = resolved.effective_config_document();
+            assert_eq!(document["selected_kv_layout"], label);
+            assert_eq!(
+                document["admission"]["selected_kv_cache_layout"],
+                serde_json::to_value(layout).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn selected_kv_layout_default_workload_target_does_not_cap_contiguous_work() {
+        for (layout, expected) in [
+            (SelectedKvCacheLayout::Contiguous, 64),
+            (SelectedKvCacheLayout::Unknown, 64),
+            (
+                SelectedKvCacheLayout::Paged {
+                    block_size_tokens: 16,
+                },
+                16,
+            ),
+        ] {
+            let resolved = FerrumConfigBuilder::new(snapshot(&[
+                ("FERRUM_KV_MAX_BLOCKS", "1"),
+                ("FERRUM_PAGED_MAX_SEQS", "1"),
+            ]))
+            .with_selected_kv_cache_layout(layout)
+            .resolve()
+            .unwrap();
+            assert_eq!(
+                resolved.selected_usize("max_batched_tokens"),
+                Some(expected)
+            );
+        }
+    }
+
+    #[test]
     fn plan_runtime_context_and_batch_limits_do_not_inherit_legacy_kv_block_estimates() {
         let hardware =
             HardwareCapabilities::rtx4090_cuda(CompiledKernelFeatures::m3_fast_path_without_fa2());
@@ -4027,10 +4208,13 @@ mod tests {
             ]);
             let builder = FerrumConfigBuilder::new(entries.clone())
                 .with_hardware_capabilities(hardware.clone())
-                .with_model_capabilities(model.clone());
+                .with_model_capabilities(model.clone())
+                .with_selected_kv_cache_layout(SelectedKvCacheLayout::Paged {
+                    block_size_tokens: 16,
+                });
             assert!(
                 builder.resolve().is_err(),
-                "legacy capacity must remain enforced"
+                "selected paged capacity must remain enforced"
             );
             let resolved = FerrumConfigBuilder::new(entries)
                 .with_hardware_capabilities(hardware.clone())
