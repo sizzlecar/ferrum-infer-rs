@@ -31,6 +31,6 @@
     "host_position_independent_code": true,
     "host_default_visibility": false
   },
-  "architecture": "compute80_ptx",
+  "architecture": "compute80_ptx_with_sm120_native",
   "archive_file": "libmarlin.a"
 }

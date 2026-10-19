@@ -12,3 +12,12 @@ source lock, and use the ordinary source-build/package/assemble-set pipeline.
 This repository overlay is a build input, not a published binary. Actual CUDA
 math and child-process environment isolation must pass with the newly built
 artifact before product pins are updated.
+
+The source definition uses `compute80_ptx_with_sm120_native`: the exact
+`sm_120` target compiles with `-arch=sm_120`; every other target retains the
+original `-arch=compute_80` policy. This does not change the CUDA source or FFI
+ABI and does not qualify additional targets. Regenerate the source plan with
+`lock-source`; the resolved argument is recorded and validated in source-build
+receipts and object-cache identities. A new SM120 artifact requires its own
+numerical qualification and package/set receipts; existing SM89 artifacts
+retain their original build provenance.
