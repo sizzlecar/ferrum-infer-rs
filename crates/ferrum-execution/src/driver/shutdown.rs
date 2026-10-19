@@ -10,6 +10,8 @@ use parking_lot::Condvar;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 
 enum Owner<R: DeviceRuntime> {
+    Preparation(Option<ferrum_runtime::ResourcePreparationRetirement<VNextDriver<R>>>),
+    Initialization(Option<ferrum_runtime::StaticInitializationFailure<VNextDriver<R>>>),
     Shared(Option<Arc<ProgramExecutor<R>>>),
     Driver(Option<Box<ProgramExecutor<R>>>),
     Resources(Option<Arc<PlanRuntimeResources<R>>>),
@@ -32,6 +34,10 @@ struct Custody<R: DeviceRuntime> {
     state: Mutex<State<R>>,
     wake: Mutex<Wake>,
     changed: Condvar,
+    // Only OS-thread-start failure uses this explicit per-instance quarantine.
+    // A later successful start transfers custody to the original service and
+    // clears this hold; there is no global registry or repeated leaked Arc.
+    failed_start_hold: Mutex<Option<Arc<Self>>>,
 }
 
 pub(super) fn begin<R: DeviceRuntime>(
@@ -45,12 +51,52 @@ pub(super) fn begin<R: DeviceRuntime>(
         Ok(executor) => Owner::Driver(Some(Box::new(executor))),
         Err(executor) => Owner::Shared(Some(executor)),
     };
+    begin_owned(owner, None)
+}
+
+pub(super) fn initialization_error<R: DeviceRuntime>(
+    mut failure: ferrum_runtime::StaticInitializationFailure<VNextDriver<R>>,
+    cause: FerrumError,
+) -> crate::ExecutorBuildError {
+    if !failure.is_indeterminate() && failure.retire_in_place().is_ok() {
+        return cause.into();
+    }
+    let cleanup = begin_initialization(failure, cause.clone());
+    crate::ExecutorBuildError::with_cleanup(cause, cleanup)
+}
+
+pub(super) fn begin_initialization<R: DeviceRuntime>(
+    failure: ferrum_runtime::StaticInitializationFailure<VNextDriver<R>>,
+    cause: FerrumError,
+) -> ExecutorShutdownObserver {
+    begin_owned(Owner::Initialization(Some(failure)), Some(cause))
+}
+
+pub(super) fn preparation_error<R: DeviceRuntime>(
+    mut original: ferrum_runtime::ResourcePreparationRetirement<VNextDriver<R>>,
+    cause: FerrumError,
+) -> crate::ExecutorBuildError {
+    if original.retire_in_place().is_ok() {
+        return cause.into();
+    }
+    let cleanup = begin_owned(Owner::Preparation(Some(original)), Some(cause.clone()));
+    crate::ExecutorBuildError::with_cleanup(cause, cleanup)
+}
+
+fn begin_owned<R: DeviceRuntime>(
+    owner: Owner<R>,
+    error: Option<FerrumError>,
+) -> ExecutorShutdownObserver {
     let custody = Arc::new(Custody {
-        state: Mutex::new(State { owner, error: None }),
+        state: Mutex::new(State {
+            owner,
+            error: error.clone(),
+        }),
         wake: Mutex::new(Wake::default()),
         changed: Condvar::new(),
+        failed_start_hold: Mutex::new(None),
     });
-    let (reporter, observer) = ExecutorShutdownObserver::channel(custody.clone());
+    let (reporter, observer) = ExecutorShutdownObserver::channel_with_error(custody.clone(), error);
     let weak = Arc::downgrade(&custody);
     let retry_reporter = reporter.clone();
     let observer = observer.with_retry(Arc::new(move || {
@@ -81,11 +127,18 @@ impl<R: DeviceRuntime> Custody<R> {
             .spawn(move || custody.run(reporter));
         if let Err(error) = spawned {
             wake.running = false;
-            // The observer still owns the same custody and can retry spawning.
-            // No worker or plan owner has moved out of it.
+            // Preserve the one original custody even if the public build error
+            // and every observer are dropped before an OS thread can start.
+            let mut hold = self.failed_start_hold.lock();
+            if hold.is_none() {
+                *hold = Some(Arc::clone(self));
+            }
             failed_start.retained(FerrumError::backend(format!(
                 "could not start program retirement service: {error}",
             )));
+        } else {
+            // The spawned service now owns the same instance independently.
+            self.failed_start_hold.lock().take();
         }
     }
 
@@ -120,6 +173,32 @@ impl<R: DeviceRuntime> Custody<R> {
 
 impl<R: DeviceRuntime> State<R> {
     fn advance(&mut self) -> Result<()> {
+        if let Owner::Preparation(original) = &mut self.owner {
+            let failure = original
+                .as_mut()
+                .expect("failed preparation retains original owner");
+            failure.retire_in_place().map_err(|error| {
+                FerrumError::backend(format!(
+                    "static preparation retirement: {}",
+                    error.message()
+                ))
+            })?;
+            debug_assert!(failure.is_retired());
+            self.owner = Owner::Retired;
+        }
+        if let Owner::Initialization(original) = &mut self.owner {
+            let failure = original
+                .as_mut()
+                .expect("failed initialization retains original owner");
+            failure.retire_in_place().map_err(|error| {
+                FerrumError::backend(format!(
+                    "static initialization retirement: {}",
+                    error.message()
+                ))
+            })?;
+            debug_assert!(failure.is_retired());
+            self.owner = Owner::Retired;
+        }
         if let Owner::Shared(executor) = &mut self.owner {
             let original = executor
                 .take()
@@ -269,5 +348,113 @@ impl<R: DeviceRuntime> State<R> {
                 "program shutdown lost its close authority",
             ))
         }
+    }
+}
+
+#[cfg(test)]
+mod initialization_tests {
+    use super::*;
+    use crate::{ExecutorBuildError, ExecutorShutdownPhase};
+    use ferrum_runtime::test_support::resource_support::failed_static_initialization;
+    use std::sync::Barrier;
+    use std::time::Duration;
+
+    async fn retained(observer: &mut ExecutorShutdownObserver) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while observer.snapshot().phase() != ExecutorShutdownPhase::Retained {
+                observer.changed().await;
+            }
+        })
+        .await
+        .expect("original first retirement attempt must be observable");
+    }
+
+    #[tokio::test]
+    async fn failed_static_initialization_keeps_original_owner_and_cause_across_retry() {
+        let (failure, probe) = failed_static_initialization(1);
+        let cause = FerrumError::device(failure.failure().message());
+        let initial = probe.snapshot();
+        let mut observer = begin_initialization(failure, cause.clone());
+        let error = ExecutorBuildError::with_cleanup(cause.clone(), observer.clone());
+        retained(&mut observer).await;
+        assert_eq!(
+            observer.snapshot().error().unwrap().to_string(),
+            cause.to_string()
+        );
+        assert_eq!(probe.snapshot().buffer_drops, 0);
+        assert!(probe.runtime_alive());
+        // Cancel a wait and discard the constructor's error. Neither owns the
+        // original transaction; the same service still does.
+        let mut cancelled = error.cleanup().unwrap().clone();
+        // Consume the already-published Retained revision, then cancel a wait
+        // for a new result from the same service.
+        cancelled.wait().await;
+        let pending = async {
+            loop {
+                if cancelled.changed().await.phase() == ExecutorShutdownPhase::Retired {
+                    break;
+                }
+            }
+        };
+        assert!(tokio::time::timeout(Duration::ZERO, pending).await.is_err());
+        drop(error);
+        assert_eq!(probe.snapshot().synchronizations, 1);
+        observer.retry();
+        let final_state = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let report = observer.snapshot();
+                if report.phase() == ExecutorShutdownPhase::Retired {
+                    break report;
+                }
+                observer.changed().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(final_state.phase(), ExecutorShutdownPhase::Retired);
+        assert_eq!(final_state.error().unwrap().to_string(), cause.to_string());
+        assert!(
+            final_state.result().is_err(),
+            "retirement must not erase initialization failure"
+        );
+        probe.wait_for_all_buffer_drops();
+        let retired = probe.snapshot();
+        assert_eq!(retired.synchronizations, 2);
+        assert_eq!(retired.uploads, initial.uploads);
+        assert_eq!(retired.submissions, initial.submissions);
+        assert!(!probe.runtime_alive());
+        observer.retry();
+        assert_eq!(
+            probe.snapshot().synchronizations,
+            2,
+            "terminal retry cannot repeat release"
+        );
+    }
+
+    #[test]
+    fn failed_static_initialization_service_survives_all_public_observers() {
+        let (failure, probe) = failed_static_initialization(0);
+        let entered = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        probe.block_next_synchronize(entered.clone(), release.clone());
+        let observer = begin_initialization(
+            failure,
+            FerrumError::device("original initialization failed"),
+        );
+        entered.wait();
+        struct Release(Arc<Barrier>);
+        impl Drop for Release {
+            fn drop(&mut self) {
+                self.0.wait();
+            }
+        }
+        let release = Release(release);
+        assert!(probe.runtime_alive());
+        assert_eq!(probe.snapshot().buffer_drops, 0);
+        drop(observer);
+        drop(release);
+        probe.wait_for_all_buffer_drops();
+        assert_eq!(probe.snapshot().submissions, 1);
+        assert_eq!(probe.snapshot().synchronizations, 1);
     }
 }

@@ -31,7 +31,7 @@ sha2 = { version = "0.10", features = ["asm"] }
 
 [features]
 default = []
-test-support = ["dep:futures"]
+test-support = ["dep:futures", "ferrum-runtime/test-support"]
 
 [dev-dependencies]
 futures = { workspace = true }

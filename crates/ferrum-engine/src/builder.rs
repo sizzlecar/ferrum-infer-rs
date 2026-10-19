@@ -14,7 +14,8 @@ use ferrum_execution::execution_attempt::ExecutionAttemptObserver;
 use ferrum_execution::executor_lifecycle::{ExecutorOwner, ExecutorScope};
 #[cfg(test)]
 use ferrum_execution::ModelExecutor;
-use ferrum_interfaces::engine::{InferenceEngine, LlmInferenceEngine};
+use ferrum_execution::{ExecutorBuildError, ExecutorBuildResult, ExecutorShutdownObserver};
+use ferrum_interfaces::engine::LlmInferenceEngine;
 use ferrum_interfaces::{Sampler, Tokenizer};
 use ferrum_models::vnext::{DefinedProductionModel, ProductionModelSourceBundle};
 use ferrum_scheduler::cost_prediction::CostSnapshotSource;
@@ -22,6 +23,8 @@ use ferrum_types::{EngineConfig, FerrumError, Result};
 use std::sync::Arc;
 use tracing::{debug, info};
 
+#[cfg(test)]
+mod failure_retirement;
 mod source_binding;
 
 // The product composition root captures model-loading options in the typed
@@ -217,7 +220,31 @@ impl EngineBuilder {
     }
 
     /// Build the inference engine
-    pub async fn build(self) -> Result<Box<dyn LlmInferenceEngine + Send + Sync>> {
+    pub async fn build(self) -> ExecutorBuildResult<Box<dyn LlmInferenceEngine + Send + Sync>> {
+        // An owned custom executor already exists before the first validation.
+        // Observation never starts close; its original owner/drop retains that
+        // authority. Keep this fallback outside every fallible assembly step.
+        let mut cleanup = self
+            .custom_executor
+            .as_ref()
+            .and_then(|binding| binding.owner.as_ref())
+            .map(ExecutorOwner::shutdown_observer);
+        match self.build_observed(&mut cleanup).await {
+            Err(error) if error.cleanup().is_none() => match cleanup {
+                Some(cleanup) => Err(ExecutorBuildError::with_cleanup(
+                    error.cause().clone(),
+                    cleanup,
+                )),
+                None => Err(error),
+            },
+            result => result,
+        }
+    }
+
+    async fn build_observed(
+        self,
+        cleanup: &mut Option<ExecutorShutdownObserver>,
+    ) -> ExecutorBuildResult<Box<dyn LlmInferenceEngine + Send + Sync>> {
         crate::continuous_engine::validate_execution_feedback(
             &self.config,
             self.execution_attempt_observer.as_ref(),
@@ -232,7 +259,8 @@ impl EngineBuilder {
             if self.config.backend.backend_options.contains_key(key) {
                 return Err(FerrumError::config(format!(
                     "backend option '{key}' belongs to retired experimental speculative decoding"
-                )));
+                ))
+                .into());
             }
         }
 
@@ -281,7 +309,8 @@ impl EngineBuilder {
                         return Err(FerrumError::config(format!(
                             "Failed to create tokenizer '{}' in model mode: {}",
                             tokenizer_name, e
-                        )));
+                        ))
+                        .into());
                     }
 
                     tracing::warn!(
@@ -319,13 +348,16 @@ impl EngineBuilder {
                 .create_executor(&executor_name, &component_config)
                 .await
             {
-                Ok(e) => e.into_engine_executor()?,
+                Ok(e) => {
+                    *cleanup = Some(e.shutdown_observer());
+                    e.into_engine_executor()?
+                }
                 Err(err) => {
-                    if has_model_path {
-                        return Err(FerrumError::config(format!(
-                            "Failed to create executor '{}' in model mode: {}",
-                            executor_name, err
-                        )));
+                    if has_model_path || err.cleanup().is_some() {
+                        // A retained original initializer is terminal for this
+                        // build, including custom factories without a path.
+                        // Do not flatten its observer or fall back to a stub.
+                        return Err(err);
                     }
 
                     tracing::warn!(
@@ -333,10 +365,9 @@ impl EngineBuilder {
                         executor_name,
                         err
                     );
-                    registry
-                        .create_executor("stub", &component_config)
-                        .await?
-                        .into_engine_executor()?
+                    let owner = registry.create_executor("stub", &component_config).await?;
+                    *cleanup = Some(owner.shutdown_observer());
+                    owner.into_engine_executor()?
                 }
             }
         };
@@ -358,7 +389,8 @@ impl EngineBuilder {
         {
             return Err(FerrumError::config(
                 "plan-runtime executor did not expose its authoritative ResolvedModelPlan",
-            ));
+            )
+            .into());
         }
 
         // 5. Create the engine — always ContinuousBatchEngine.
@@ -388,12 +420,7 @@ impl EngineBuilder {
         // and warmup complete, but those events now share the product trace.
         let startup_result = engine.prepare_startup().await;
         if let Err(startup_error) = startup_result {
-            if let Err(shutdown_error) = engine.shutdown().await {
-                tracing::warn!(
-                    "Failed to close engine resources after startup rejection: {shutdown_error}"
-                );
-            }
-            return Err(startup_error);
+            return Err(engine.into_startup_failure(startup_error).await);
         }
         Ok(Box::new(engine))
     }
@@ -449,7 +476,7 @@ fn validate_layer_split_plan(component_config: &ComponentConfig) -> Result<()> {
 /// Create an engine with the default configuration and registry
 pub async fn create_engine(
     config: EngineConfig,
-) -> Result<Box<dyn LlmInferenceEngine + Send + Sync>> {
+) -> ExecutorBuildResult<Box<dyn LlmInferenceEngine + Send + Sync>> {
     EngineBuilder::new(config).build().await
 }
 
@@ -457,7 +484,7 @@ pub async fn create_engine(
 pub async fn create_product_engine(
     config: EngineConfig,
     sources: Arc<ProductionModelSourceBundle>,
-) -> Result<Box<dyn LlmInferenceEngine + Send + Sync>> {
+) -> ExecutorBuildResult<Box<dyn LlmInferenceEngine + Send + Sync>> {
     EngineBuilder::new(config)
         .with_model_sources(sources)
         .build()
@@ -469,7 +496,7 @@ pub async fn create_product_engine(
 pub async fn create_defined_product_engine(
     config: EngineConfig,
     prepared: Arc<DefinedProductionModel>,
-) -> Result<Box<dyn LlmInferenceEngine + Send + Sync>> {
+) -> ExecutorBuildResult<Box<dyn LlmInferenceEngine + Send + Sync>> {
     EngineBuilder::new(config)
         .with_defined_model(prepared)
         .build()
@@ -809,7 +836,10 @@ mod tests {
                     .await
                     .err()
                     .expect("retired options must not silently select ordinary decoding");
-                assert!(matches!(&error, FerrumError::Config { .. }), "{error}");
+                assert!(
+                    matches!(error.cause(), FerrumError::Config { .. }),
+                    "{error}"
+                );
                 let message = error.to_string();
                 assert!(
                     message.contains(key) && message.contains("retired"),
@@ -1019,5 +1049,70 @@ mod tests {
             .to_string()
             .contains("authoritative ResolvedModelPlan"));
         executor.begin_shutdown().wait().await.result().unwrap();
+    }
+    #[tokio::test]
+    async fn builder_preserves_actual_failed_initialization_owner_without_stub_fallback() {
+        use crate::registry::{ComponentFactory, ComponentMetadata};
+        use ferrum_execution::{ExecutorBuildError, ExecutorShutdownPhase};
+        use std::time::Duration;
+        struct FailedFactory(parking_lot::Mutex<Option<ExecutorBuildError>>);
+        #[async_trait::async_trait]
+        impl ComponentFactory<ExecutorOwner, ExecutorBuildError> for FailedFactory {
+            async fn create(
+                &self,
+                _config: &ComponentConfig,
+            ) -> ExecutorBuildResult<ExecutorOwner> {
+                Err(self.0.lock().take().expect("factory is invoked once"))
+            }
+            fn metadata(&self) -> ComponentMetadata {
+                ComponentMetadata::default()
+            }
+        }
+        let (original, probe) =
+            ferrum_execution::driver::test_support::shutdown::failed_initialization_build_error(1);
+        let original_message = original.cause().to_string();
+        let registry = Arc::new(ComponentRegistry::new());
+        registry.register_executor_factory(
+            "failed-original",
+            Arc::new(FailedFactory(parking_lot::Mutex::new(Some(original)))),
+        );
+        let error = EngineBuilder::with_registry(EngineConfig::default(), registry)
+            .with_custom_tokenizer(Arc::new(ferrum_testkit::MockTokenizer::new(128)))
+            .with_custom_sampler(Arc::new(ferrum_sampler::GreedySampler))
+            .with_executor("failed-original")
+            .build()
+            .await
+            .err()
+            .expect("retained failure cannot become a stub");
+        assert_eq!(error.cause().to_string(), original_message);
+        let mut cleanup = error
+            .cleanup()
+            .expect("factory must preserve original recovery observation")
+            .clone();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while cleanup.snapshot().phase() != ExecutorShutdownPhase::Retained {
+                cleanup.changed().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(probe.snapshot().buffer_drops, 0);
+        assert!(probe.runtime_alive());
+        drop(error);
+        cleanup.retry();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while cleanup.snapshot().phase() != ExecutorShutdownPhase::Retired {
+                cleanup.changed().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            cleanup.snapshot().error().unwrap().to_string(),
+            original_message
+        );
+        probe.wait_for_all_buffer_drops();
+        assert_eq!(probe.snapshot().submissions, 1);
+        assert_eq!(probe.snapshot().synchronizations, 2);
     }
 }

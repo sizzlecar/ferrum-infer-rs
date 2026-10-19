@@ -16,6 +16,9 @@ use super::{
     VNextError, PLAN_RUNTIME_OPEN,
 };
 
+mod preparation_retirement;
+pub use preparation_retirement::ResourcePreparationRetirement;
+
 mod sealed {
     pub trait Sealed {}
 }
@@ -837,6 +840,16 @@ impl<D: ResourceTransactionDriver> ResourceTransaction<D, TransactionReserved> {
         mut self,
     ) -> Result<ResourceTransaction<D, TransactionRolledBack>, ResourceRollbackTransitionError<D>>
     {
+        match self.rollback_in_place() {
+            Ok(receipt) => Ok(self.advance(Some(receipt))),
+            Err(failure) => Err(ResourceRollbackTransitionError {
+                transaction: Some(self),
+                failure,
+            }),
+        }
+    }
+
+    fn rollback_in_place(&mut self) -> Result<ResourceTransitionReceipt, ResourceFailureReceipt> {
         debug_assert!(
             self.states
                 .iter()
@@ -882,10 +895,7 @@ impl<D: ResourceTransactionDriver> ResourceTransaction<D, TransactionReserved> {
                         self.ledger_snapshot_entries(),
                     );
                     self.set_pending_failure(&receipt);
-                    return Err(ResourceRollbackTransitionError {
-                        transaction: Some(self),
-                        failure: receipt,
-                    });
+                    return Err(receipt);
                 }
             }
         }
@@ -896,7 +906,7 @@ impl<D: ResourceTransactionDriver> ResourceTransaction<D, TransactionReserved> {
                 completed,
             )
             .expect("core rollback journal must validate");
-        Ok(self.advance(Some(receipt)))
+        Ok(receipt)
     }
 }
 
@@ -1268,6 +1278,24 @@ impl<D: ResourceTransactionDriver> ResourceTransaction<D, TransactionCommitted> 
         )
     }
 
+    /// Used only by the retained failed-initialization owner, after proving
+    /// its original device stream quiescent. Keep the transaction in its caller
+    /// across backend callbacks, including panic; reuse the existing ledger so
+    /// an acknowledged release prefix is never replayed.
+    pub(crate) fn release_quiescent_in_place(&mut self) -> Result<(), ResourceFailureReceipt> {
+        if self.pending_subset_release.is_some() {
+            self.complete_pending_release()?;
+        }
+        if self
+            .states
+            .iter()
+            .all(|state| *state == ResourceTransactionState::Released)
+        {
+            return Ok(());
+        }
+        self.release_all_resources().map(|_| ())
+    }
+
     pub fn release(
         mut self,
     ) -> Result<ResourceTransaction<D, TransactionReleased>, ResourceReleaseTransitionError<D>>
@@ -1362,6 +1390,19 @@ impl<D: ResourceTransactionDriver, S: TransactionStage> ResourcePrepareTransitio
     }
 
     pub fn recover(mut self) -> Result<ResourceTransaction<D, S>, Self> {
+        if self.recover_in_place().is_err() {
+            return Err(self);
+        }
+        Ok(self
+            .transaction
+            .take()
+            .expect("prepare recovery owns transaction"))
+    }
+
+    fn recover_in_place(&mut self) -> Result<(), ResourceFailureReceipt> {
+        if self.failure.recovery_complete {
+            return Ok(());
+        }
         while self.failure.compensation.len() < self.failure.completed.len() {
             let record_index = self.failure.completed.len() - 1 - self.failure.compensation.len();
             let attempted = self.failure.completed[record_index].clone();
@@ -1392,7 +1433,7 @@ impl<D: ResourceTransactionDriver, S: TransactionStage> ResourcePrepareTransitio
                 );
                 self.failure.ledger_after = transaction.ledger_snapshot_entries();
                 transaction.set_pending_failure(&self.failure);
-                return Err(self);
+                return Err(self.failure.clone());
             }
             let result = match self.failure.action {
                 ResourceTransactionAction::Reserve => {
@@ -1484,14 +1525,14 @@ impl<D: ResourceTransactionDriver, S: TransactionStage> ResourcePrepareTransitio
                     );
                     self.failure.ledger_after = transaction.ledger_snapshot_entries();
                     transaction.set_pending_failure(&self.failure);
-                    return Err(self);
+                    return Err(self.failure.clone());
                 }
             }
         }
         self.failure.recovery_complete = true;
-        let mut transaction = self
+        let transaction = self
             .transaction
-            .take()
+            .as_mut()
             .expect("prepare recovery owns transaction");
         self.failure.ledger_after = transaction.ledger_snapshot_entries();
         transaction.clear_pending_failure();
@@ -1500,8 +1541,8 @@ impl<D: ResourceTransactionDriver, S: TransactionStage> ResourcePrepareTransitio
                 authority.store(false, Ordering::Release);
             }
         }
-        transaction.recovery_history.push(self.failure);
-        Ok(transaction)
+        transaction.recovery_history.push(self.failure.clone());
+        Ok(())
     }
 
     pub fn quarantine(mut self) -> Result<ResourceTransaction<D, TransactionQuarantined>, Self> {
@@ -1564,6 +1605,16 @@ impl<D: ResourceTransactionDriver> ResourcePoisonedTransaction<D> {
     pub fn reconcile(
         mut self,
     ) -> Result<ResourcePrepareTransitionError<D, TransactionReserved>, Self> {
+        if self.reconcile_in_place().is_err() {
+            return Err(self);
+        }
+        Ok(ResourcePrepareTransitionError {
+            transaction: self.transaction.take(),
+            failure: self.failure,
+        })
+    }
+
+    fn reconcile_in_place(&mut self) -> Result<(), ResourceFailureReceipt> {
         let transaction = self
             .transaction
             .as_mut()
@@ -1621,14 +1672,7 @@ impl<D: ResourceTransactionDriver> ResourcePoisonedTransaction<D> {
                     .clear(self.poisoned_order);
                 self.failure.recovery_strategy = ResourceRecoveryStrategy::ReverseCompensation;
                 self.failure.ledger_after = transaction.ledger_snapshot_entries();
-                let transaction = self
-                    .transaction
-                    .take()
-                    .expect("poisoned owner owns transaction");
-                Ok(ResourcePrepareTransitionError {
-                    transaction: Some(transaction),
-                    failure: self.failure,
-                })
+                Ok(())
             }
             Err(failure) => {
                 self.failure.record_recovery_failure(
@@ -1641,7 +1685,7 @@ impl<D: ResourceTransactionDriver> ResourcePoisonedTransaction<D> {
                 );
                 self.failure.ledger_after = transaction.ledger_snapshot_entries();
                 transaction.set_pending_failure(&self.failure);
-                Err(self)
+                Err(self.failure.clone())
             }
         }
     }
@@ -1702,6 +1746,18 @@ impl<D: ResourceTransactionDriver> ResourceRollbackTransitionError<D> {
     }
 
     pub fn complete(mut self) -> Result<ResourceTransaction<D, TransactionRolledBack>, Self> {
+        let receipt = match self.complete_in_place() {
+            Ok(receipt) => receipt,
+            Err(_) => return Err(self),
+        };
+        Ok(self
+            .transaction
+            .take()
+            .expect("rollback recovery owns transaction")
+            .advance(Some(receipt)))
+    }
+
+    fn complete_in_place(&mut self) -> Result<ResourceTransitionReceipt, ResourceFailureReceipt> {
         let transaction = self
             .transaction
             .as_mut()
@@ -1727,7 +1783,7 @@ impl<D: ResourceTransactionDriver> ResourceRollbackTransitionError<D> {
                     );
                     self.failure.ledger_after = transaction.ledger_snapshot_entries();
                     transaction.set_pending_failure(&self.failure);
-                    return Err(self);
+                    return Err(self.failure.clone());
                 }
             }
             let result = {
@@ -1778,7 +1834,7 @@ impl<D: ResourceTransactionDriver> ResourceRollbackTransitionError<D> {
                     );
                     self.failure.ledger_after = transaction.ledger_snapshot_entries();
                     transaction.set_pending_failure(&self.failure);
-                    return Err(self);
+                    return Err(self.failure.clone());
                 }
             }
         }
@@ -1792,12 +1848,8 @@ impl<D: ResourceTransactionDriver> ResourceRollbackTransitionError<D> {
             )
             .expect("forward-completed rollback journal must validate");
         transaction.clear_pending_failure();
-        transaction.recovery_history.push(self.failure);
-        let transaction = self
-            .transaction
-            .take()
-            .expect("rollback recovery owns transaction");
-        Ok(transaction.advance(Some(receipt)))
+        transaction.recovery_history.push(self.failure.clone());
+        Ok(receipt)
     }
 
     pub fn quarantine(mut self) -> Result<ResourceTransaction<D, TransactionQuarantined>, Self> {

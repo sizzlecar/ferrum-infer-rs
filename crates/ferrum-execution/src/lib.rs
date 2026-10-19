@@ -3,6 +3,9 @@
 //! Foundation ports remain in `ferrum_interfaces`; device submission, completion,
 //! and resource authorization belong to `ferrum_runtime`.
 
+mod build_error;
+pub use build_error::{ExecutorBuildError, ExecutorBuildResult};
+
 pub mod driver;
 mod event_sink;
 pub mod execution_attempt;

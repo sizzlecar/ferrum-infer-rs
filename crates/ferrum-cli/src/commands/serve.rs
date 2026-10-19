@@ -403,7 +403,10 @@ fn resolve_interleaved_system_coalescing(
     }
 }
 
-pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
+pub async fn execute(
+    cmd: ServeCommand,
+    config: CliConfig,
+) -> ferrum_execution::ExecutorBuildResult<()> {
     execute_with_compatibility(cmd, config, false, false, true, None).await
 }
 
@@ -411,7 +414,7 @@ pub async fn execute_cli(
     cmd: ServeCliCommand,
     config: CliConfig,
     configured_interleaved_system_coalescing: bool,
-) -> Result<()> {
+) -> ferrum_execution::ExecutorBuildResult<()> {
     execute_with_compatibility(
         cmd.command,
         config,
@@ -430,7 +433,7 @@ async fn execute_with_compatibility(
     disable_interleaved_system_coalescing: bool,
     configured_interleaved_system_coalescing: bool,
     prefix_rendezvous_max_wait_ms: Option<std::num::NonZeroU64>,
-) -> Result<()> {
+) -> ferrum_execution::ExecutorBuildResult<()> {
     let mut observer = lifecycle::ServeTaskObserver::spawn(move |cancellation, report| {
         run_serve_lifecycle(
             cmd,
@@ -454,8 +457,8 @@ async fn run_serve_lifecycle(
     configured_interleaved_system_coalescing: bool,
     prefix_rendezvous_max_wait_ms: Option<std::num::NonZeroU64>,
     mut cancellation: tokio::sync::oneshot::Receiver<()>,
-    early_result: tokio::sync::oneshot::Sender<Result<()>>,
-) -> Result<()> {
+    early_result: tokio::sync::oneshot::Sender<ferrum_execution::ExecutorBuildResult<()>>,
+) -> ferrum_execution::ExecutorBuildResult<()> {
     let mut shutdown = lifecycle::ShutdownObservation::new(Duration::from_secs(30), early_result);
     config.profile_journal.validate()?;
     let user_environment = crate::runtime_env::capture_supported_runtime_environment()?;
@@ -1053,7 +1056,8 @@ async fn run_serve_lifecycle(
     if vnext_checkpoint.teacher_token_file.is_some() {
         return Err(FerrumError::unsupported(
             "vNext checkpoint teacher forcing is supported only by one-shot ferrum run",
-        ));
+        )
+        .into());
     }
     let vnext_checkpoint_capture = vnext_checkpoint.to_config()?;
     let diagnostic_output_capture = diagnostic_output_capture.to_config()?;
@@ -1070,7 +1074,7 @@ async fn run_serve_lifecycle(
     let mut cache_allocated_status = None;
     let mut product_journals = None;
     let mut engine_lifetime = None;
-    let server_result: Result<_> = async {
+    let server_result: ferrum_execution::ExecutorBuildResult<_> = async {
         println!(
             "{}",
             "Initializing engine (continuous batching)...".dimmed()
@@ -1122,7 +1126,7 @@ async fn run_serve_lifecycle(
                 if let Err(cleanup) = feedback.shutdown().await {
                     tracing::warn!(%cleanup, "failed startup feedback cleanup");
                 }
-                return Err(error);
+                return Err(error.into());
             }
         };
         let lifetime = crate::observability_product::ProductEngineLifetime::new_with_feedback(
@@ -1134,7 +1138,7 @@ async fn run_serve_lifecycle(
         engine_lifetime = Some(lifetime);
         if served_model_registry.adapter_count() > 0 {
             if let Err(error) = engine.adapter_execution_support().require_lora() {
-                return Err(error);
+                return Err(error.into());
             }
         }
         crate::startup::apply_engine_plan(&mut startup_auto_config, engine.config());
@@ -1148,13 +1152,14 @@ async fn run_serve_lifecycle(
     let server = match server_result {
         Ok(server) => server,
         Err(error) => {
+            shutdown.record_failure(&error);
             write_failed_startup_config_artifacts(
                 &startup_auto_config,
                 product_source_identity.as_ref(),
                 &numerical_execution,
                 effective_config_json.as_deref(),
                 decision_trace_jsonl.as_deref(),
-                &error,
+                error.cause(),
             );
             if let Some(lifetime) = &engine_lifetime {
                 if let Err(cleanup) = shutdown.wait(lifetime.finish()).await {
@@ -1342,7 +1347,7 @@ async fn run_serve_lifecycle(
     if let Err(error) = &cleanup_result {
         tracing::warn!(%error, "serve final cleanup incomplete");
     }
-    shutdown.finish(execution_result.and(cleanup_result))
+    shutdown.finish(execution_result.and(cleanup_result).map_err(Into::into))
 }
 
 async fn serve_shutdown_signal() {

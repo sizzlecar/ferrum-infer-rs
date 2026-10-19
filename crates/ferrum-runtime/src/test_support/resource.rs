@@ -294,8 +294,14 @@ pub(crate) fn catalog() -> CapabilityCatalog {
 pub(crate) fn catalog_with_runtime_fingerprint(
     runtime_implementation_fingerprint: String,
 ) -> CapabilityCatalog {
+    catalog_with_device(runtime_implementation_fingerprint, id("device.reference.0"))
+}
+
+fn catalog_with_device(
+    runtime_implementation_fingerprint: String,
+    device_id: DeviceId,
+) -> CapabilityCatalog {
     let operation = operation();
-    let device_id: DeviceId = id("device.reference.0");
     let capabilities = BTreeSet::from([id("capability.compute")]);
     let provider = OperationProviderDescriptor::new(
         id("provider.operation.reference"),
@@ -528,6 +534,16 @@ pub(crate) fn node_resolution(
     )
     .unwrap()])
     .unwrap();
+    node_resolution_with_weight_storage(family, catalog, policy, planning, weight_storage)
+}
+
+fn node_resolution_with_weight_storage(
+    family: &PreparedModelFamily,
+    catalog: &CapabilityCatalog,
+    policy: &ResolvedRuntimePolicy,
+    planning: &OperationPlanningHandle<'_>,
+    weight_storage: ResolvedValueStorage,
+) -> PlanNodeResolution {
     let values = vec![
         binding(
             "value.input",
@@ -633,6 +649,9 @@ impl Drop for TestBuffer {
         if let Some(trace) = self.drop_trace.upgrade() {
             let mut trace = trace.lock().unwrap();
             trace.buffer_drops += 1;
+            if let Some(notify) = &trace.release_notifications {
+                let _ = notify.send(());
+            }
             if self.backend_lifetime.upgrade().is_none() {
                 trace.buffer_drops_after_backend += 1;
             }
@@ -693,6 +712,12 @@ pub(crate) enum PostAllocationBehavior {
 pub struct Trace {
     pub(crate) calls: Vec<String>,
     pub(crate) runtime_allocate_calls: u64,
+    pub(crate) static_fence_indeterminate: bool,
+    pub(crate) release_panics: BTreeSet<ResourceId>,
+    pub(crate) hook_panics: BTreeSet<String>,
+    pub(crate) upload_calls: u64,
+    pub(crate) submit_calls: u64,
+    pub(crate) release_notifications: Option<mpsc::Sender<()>>,
     pub(crate) drift_on_allocate: bool,
     pub(crate) drift_on_create_stream: bool,
     pub(crate) drift_on_submit: bool,
@@ -826,6 +851,7 @@ impl DeviceRuntime for TestRuntime {
         _destination: &Self::Buffer,
         _destination_offset_bytes: u64,
     ) -> Result<Self::Command, Self::Error> {
+        self.trace.lock().unwrap().upload_calls += 1;
         Ok(())
     }
 
@@ -844,6 +870,7 @@ impl DeviceRuntime for TestRuntime {
         commands: DeviceCommandBatch<Self::Command>,
     ) -> Result<Self::Fence, DefinitelyNotSubmitted<Self::Error>> {
         assert!(!commands.is_empty(), "core must not submit an empty batch");
+        self.trace.lock().unwrap().submit_calls += 1;
         if self.trace.lock().unwrap().drift_on_submit {
             self.use_alternate_descriptor.store(true, Ordering::Release);
         }
@@ -859,6 +886,11 @@ impl DeviceRuntime for TestRuntime {
         &self,
         _fence: &Self::Fence,
     ) -> Result<DeviceTerminalReceipt<Self::Error>, FenceIndeterminate<Self::Error>> {
+        if self.trace.lock().unwrap().static_fence_indeterminate {
+            return Err(FenceIndeterminate::new(TestRuntimeError(
+                "original static fence indeterminate",
+            )));
+        }
         Ok(DeviceTerminalReceipt::unprofiled(DeviceTerminal::Succeeded))
     }
 
@@ -941,6 +973,10 @@ impl TestDriver {
             .unwrap_or_else(|| action.to_owned());
         let mut trace = self.trace.lock().unwrap();
         trace.calls.push(key.clone());
+        if trace.hook_panics.remove(&key) {
+            drop(trace);
+            panic!("injected resource hook uncertainty: {key}");
+        }
         let remaining = trace.failures.entry(key).or_default();
         if *remaining == 0 {
             false
@@ -1125,7 +1161,17 @@ impl ResourceTransactionDriver for TestDriver {
         buffer: &Self::Buffer,
     ) -> Result<(), ResourceDriverFailure> {
         assert_eq!(buffer.marker, reservation.resource_id().as_str());
-        if self.record("release", Some(reservation.resource_id())) {
+        let failed = self.record("release", Some(reservation.resource_id()));
+        let panics = self
+            .trace
+            .lock()
+            .unwrap()
+            .release_panics
+            .remove(reservation.resource_id());
+        if panics {
+            panic!("injected release side-effect uncertainty");
+        }
+        if failed {
             Err(Self::failure("release"))
         } else {
             Ok(())
@@ -1519,4 +1565,266 @@ pub(crate) fn rehash_plan_json(value: &mut Value) {
     let digest = format!("{:x}", Sha256::digest(bytes));
     value["payload"]["plan_id"] = json!(format!("plan/sha256/{digest}"));
     value["plan_hash"] = json!(digest);
+}
+
+/// Control and observation of a real static-provision/init failure. This handle
+/// owns no buffer, runtime, transaction, or recovery authority.
+pub struct StaticInitializationProbe {
+    trace: Arc<Mutex<Trace>>,
+    runtime: Weak<TestRuntime>,
+    released: mpsc::Receiver<()>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct StaticInitializationProbeSnapshot {
+    pub allocations: u64,
+    pub uploads: u64,
+    pub submissions: u64,
+    pub synchronizations: u64,
+    pub buffer_drops: u64,
+    pub late_buffer_drops: u64,
+}
+
+impl StaticInitializationProbe {
+    pub fn snapshot(&self) -> StaticInitializationProbeSnapshot {
+        let trace = self.trace.lock().unwrap();
+        StaticInitializationProbeSnapshot {
+            allocations: trace.runtime_allocate_calls,
+            uploads: trace.upload_calls,
+            submissions: trace.submit_calls,
+            synchronizations: trace.runtime_synchronize_calls,
+            buffer_drops: trace.buffer_drops,
+            late_buffer_drops: trace.buffer_drops_after_backend,
+        }
+    }
+
+    pub fn block_next_synchronize(&self, entered: Arc<Barrier>, release: Arc<Barrier>) {
+        self.trace.lock().unwrap().synchronize_block = Some((entered, release));
+    }
+
+    pub fn runtime_alive(&self) -> bool {
+        self.runtime.upgrade().is_some()
+    }
+
+    /// Each notification follows a real original TestBuffer destructor.
+    pub fn wait_for_all_buffer_drops(&self) {
+        let allocations = self.snapshot().allocations;
+        for _ in 0..allocations {
+            self.released
+                .recv_timeout(Duration::from_secs(5))
+                .expect("original buffers must retire");
+        }
+        assert_eq!(self.snapshot().buffer_drops, allocations);
+        assert_eq!(self.snapshot().late_buffer_drops, 0);
+    }
+}
+
+pub fn failed_static_initialization(
+    synchronization_failures: u32,
+) -> (
+    StaticInitializationFailure<RuntimeResourceDriver<TestRuntime>>,
+    StaticInitializationProbe,
+) {
+    let (family, plan) = isolated_static_initialization_plan();
+    let runtime = sequence_runtime(&plan);
+    let (notify, released) = mpsc::channel();
+    {
+        let mut trace = runtime.trace.lock().unwrap();
+        trace.static_fence_indeterminate = true;
+        trace.synchronize_failures = synchronization_failures;
+        trace.release_notifications = Some(notify);
+    }
+    let probe = StaticInitializationProbe {
+        trace: Arc::clone(&runtime.trace),
+        runtime: Arc::downgrade(&runtime),
+        released,
+    };
+    let permit = required_static(
+        &plan,
+        Arc::clone(&runtime),
+        id("request.failed-static-init"),
+    )
+    .unwrap();
+    let identity = ResourceTransactionIdentity::for_admission(
+        permit.binding(),
+        id("run.failed-static-init"),
+        id("transaction.failed-static-init"),
+    );
+    let driver = RuntimeResourceDriver::new(runtime).unwrap();
+    let committed = ResourceTransaction::begin(driver, identity, permit)
+        .unwrap()
+        .reserve()
+        .unwrap()
+        .commit()
+        .unwrap_or_else(|error| match error {
+            ResourceCommitTransitionError::Recoverable(failure) => {
+                panic!("fixture static commit failed: {:?}", failure.failure())
+            }
+            ResourceCommitTransitionError::Poisoned(failure) => {
+                panic!(
+                    "fixture static commit became indeterminate: {:?}",
+                    failure.failure()
+                )
+            }
+        });
+    struct Weights;
+    impl WeightComponentSource for Weights {
+        fn component<'source>(
+            &'source self,
+            component: &WeightComponentSpec,
+        ) -> Result<WeightComponentPayload<'source>, VNextError> {
+            WeightComponentPayload::new(
+                component,
+                component.external_names[0].clone(),
+                "model.safetensors",
+                component.dimensions.clone(),
+                component.physical_element_type(),
+                vec![0; usize::try_from(component.physical_bytes()?).unwrap()],
+            )
+        }
+    }
+    // Include the actual zero-initialization and weight uploads in the first
+    // submitted batch, so the injected unknown fence covers real weight work.
+    let staging_bytes = family
+        .weight_schema()
+        .components
+        .iter()
+        .map(|component| component.physical_bytes().unwrap())
+        .sum();
+    let commands =
+        committed.reservations().reservations().len() + family.weight_schema().components.len();
+    let failure = committed
+        .initialize_static(
+            &family,
+            &plan,
+            &Weights,
+            StaticInitializationPolicy::new(staging_bytes, commands).unwrap(),
+        )
+        .err()
+        .expect("the actual submitted initialization must retain its unknown fence");
+    assert!(failure.is_indeterminate());
+    assert!(probe.snapshot().uploads > 0);
+    assert_eq!(probe.snapshot().submissions, 1);
+    assert_eq!(probe.snapshot().buffer_drops, 0);
+    (failure, probe)
+}
+
+pub(crate) fn isolated_static_initialization_plan() -> (PreparedModelFamily, ExecutionPlan) {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let ordinal = NEXT.fetch_add(1, Ordering::Relaxed);
+    let family = TypedFamilyRegistration::new(StaticRetirementFamily)
+        .prepare_fixture(&json!({"width": 4}))
+        .unwrap();
+    let catalog = catalog_with_device(sha('d'), id(format!("device.static-retirement.{ordinal}")));
+    let registry = operation_registry(&catalog);
+    let policy = policy();
+    let weight_storage = ResolvedValueStorage::composite(
+        ["left", "right"]
+            .into_iter()
+            .map(|name| {
+                ResolvedStorageComponent::new(
+                    Some(id(format!("weight.component.{name}"))),
+                    id(format!("resource.weight.{name}")),
+                    0,
+                    8,
+                    ElementType::F32,
+                )
+                .unwrap()
+            })
+            .collect(),
+    )
+    .unwrap();
+    let resolution = node_resolution_with_weight_storage(
+        &family,
+        &catalog,
+        &policy,
+        &registry.planning(),
+        weight_storage,
+    );
+    let plan = ExecutionPlan::build(
+        PlanBuildRequest::new(&family, &catalog, &policy, vec![resolution]).unwrap(),
+    )
+    .unwrap();
+    (family, plan)
+}
+
+// The same resource family with two actual static components. This permits
+// testing a completed release prefix followed by a failure without fake ledgers.
+struct StaticRetirementFamily;
+impl ModelFamilyProvider for StaticRetirementFamily {
+    type Config = TestConfig;
+    fn family_id(&self) -> &ModelFamilyId {
+        static BASE: TestFamily = TestFamily;
+        BASE.family_id()
+    }
+    fn external_metadata_ids(&self) -> BTreeSet<ExternalModelMetadataId> {
+        TestFamily.external_metadata_ids()
+    }
+    fn validate_config_identity(
+        &self,
+        raw: &Value,
+        config: &Self::Config,
+    ) -> Result<(), VNextError> {
+        TestFamily.validate_config_identity(raw, config)
+    }
+    fn validated_external_metadata_id(
+        &self,
+        raw: &Value,
+        config: &Self::Config,
+    ) -> Result<ExternalModelMetadataId, VNextError> {
+        TestFamily.validated_external_metadata_id(raw, config)
+    }
+    fn parse_config(&self, raw: &Value) -> Result<Self::Config, VNextError> {
+        TestFamily.parse_config(raw)
+    }
+    fn weight_schema(&self, config: &Self::Config) -> Result<WeightSchema, VNextError> {
+        let mut schema = TestFamily.weight_schema(config)?;
+        schema.components = ["left", "right"]
+            .iter()
+            .map(|name| WeightComponentSpec {
+                id: id(format!("weight.component.{name}")),
+                role: WeightComponentRole::Values,
+                external_names: vec![format!("weight.{name}.bin")],
+                dimensions: vec![2],
+                encoding: WeightEncoding::Dense {
+                    element_type: ElementType::F32,
+                },
+                required: true,
+            })
+            .collect();
+        schema.tensors[0].physical_layout = PhysicalWeightLayout::Composite {
+            parts: schema
+                .components
+                .iter()
+                .enumerate()
+                .map(|(index, component)| CompositeWeightPart {
+                    layout: Box::new(PhysicalWeightLayout::Dense {
+                        component_id: component.id.clone(),
+                    }),
+                    logical_offsets: vec![index as u64 * 2],
+                    extents: vec![2],
+                })
+                .collect(),
+        };
+        Ok(schema)
+    }
+    fn numerical_profiles(
+        &self,
+        config: &Self::Config,
+    ) -> Result<FamilyNumericalProfiles, VNextError> {
+        TestFamily.numerical_profiles(config)
+    }
+    fn semantic_program(
+        &self,
+        config: &Self::Config,
+        profile: &NumericalExecutionProfile,
+    ) -> Result<ModelProgram, VNextError> {
+        TestFamily.semantic_program(config, profile)
+    }
+    fn semantic_metadata(
+        &self,
+        config: &Self::Config,
+    ) -> Result<ModelSemanticMetadata, VNextError> {
+        TestFamily.semantic_metadata(config)
+    }
 }

@@ -327,6 +327,32 @@ impl<R: DeviceRuntime> Fixture<R> {
         catalog: CapabilityCatalog,
         options: FixtureOptions,
     ) -> Self {
+        Self::try_new_with_engine_config(
+            mode,
+            device,
+            runtime,
+            registry,
+            materializers,
+            catalog,
+            options,
+            |_| {},
+        )
+        .unwrap()
+    }
+
+    /// Fallible cold assembly for error-boundary tests using the real compiler
+    /// and runtime. The callback configures product input before construction;
+    /// it cannot inject a fake resource, fence, or initialization receipt.
+    pub fn try_new_with_engine_config(
+        mode: SamplingReadbackMode,
+        device: ferrum_types::Device,
+        runtime: Arc<R>,
+        registry: OperationRuntimeRegistry<R>,
+        materializers: WeightMaterializerRegistry,
+        catalog: CapabilityCatalog,
+        options: FixtureOptions,
+        configure: impl FnOnce(&mut EngineConfig),
+    ) -> ferrum_execution::ExecutorBuildResult<Self> {
         assert!(matches!(
             options.logits_type,
             ElementType::F16 | ElementType::F32
@@ -473,6 +499,7 @@ impl<R: DeviceRuntime> Fixture<R> {
             engine.backend.reusable_execution_capture.preparation =
                 ReusableExecutionPreparationMode::Startup;
         }
+        configure(&mut engine);
         let executor = ProgramExecutor::from_runtime_composition(
             prepared.execution_input().unwrap(),
             info,
@@ -499,12 +526,11 @@ impl<R: DeviceRuntime> Fixture<R> {
                     },
                 )
             },
-        )
-        .unwrap();
-        Self {
+        )?;
+        Ok(Self {
             _directory: directory,
             executor,
-        }
+        })
     }
 }
 

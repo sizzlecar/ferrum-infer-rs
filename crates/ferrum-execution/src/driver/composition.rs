@@ -26,6 +26,12 @@ impl From<ProgramCompilationError> for FerrumError {
     }
 }
 
+impl From<ProgramCompilationError> for crate::ExecutorBuildError {
+    fn from(error: ProgramCompilationError) -> Self {
+        FerrumError::from(error).into()
+    }
+}
+
 impl ProgramCompilationError {
     fn from_plan(error: VNextError) -> Self {
         match error {
@@ -266,7 +272,7 @@ impl<'a, R: DeviceRuntime> CompiledProgram<'a, R> {
         Ok(())
     }
 
-    pub fn initialize<F>(self, resolve_plan: F) -> Result<ProgramExecutor<R>>
+    pub fn initialize<F>(self, resolve_plan: F) -> crate::ExecutorBuildResult<ProgramExecutor<R>>
     where
         F: FnOnce(
             &ResolvedRuntimePolicy,

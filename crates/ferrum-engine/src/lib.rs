@@ -55,7 +55,7 @@ mod product_composition;
 pub mod registry;
 pub(crate) mod resource_lifecycle;
 pub mod tensor_factory;
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", test))]
 pub mod vnext_determinism;
 
 // Re-exports of interfaces
@@ -81,6 +81,7 @@ pub use continuous_engine::{ContinuousBatchEngine, EngineJournalScopes, Sequence
 pub use builder::{
     create_defined_product_engine, create_engine, create_product_engine, EngineBuilder,
 };
+pub use ferrum_execution::{ExecutorBuildError, ExecutorBuildResult};
 
 // Re-exports of registry
 pub use registry::{
@@ -105,7 +106,7 @@ pub use parallel::{
 /// This is a convenience function that uses the default registry.
 pub async fn create_default_engine(
     config: EngineConfig,
-) -> Result<Box<dyn LlmInferenceEngine + Send + Sync>> {
+) -> ExecutorBuildResult<Box<dyn LlmInferenceEngine + Send + Sync>> {
     create_engine(config).await
 }
 

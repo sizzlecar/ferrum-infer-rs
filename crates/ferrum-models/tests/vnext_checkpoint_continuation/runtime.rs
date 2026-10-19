@@ -167,7 +167,7 @@ impl Fixture {
             .unwrap();
         let resources = match initialized.into_plan_runtime() {
             Ok(resources) => resources,
-            Err(error) => panic!("plan runtime handoff failed: {}", error.error()),
+            Err(error) => panic!("plan runtime handoff failed: {}", error.failure().message()),
         };
         let lane = resources.create_execution_lane().unwrap();
         if reusable {

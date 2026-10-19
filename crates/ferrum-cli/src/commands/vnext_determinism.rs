@@ -167,7 +167,9 @@ impl ShapeFixture {
     }
 }
 
-pub async fn execute(command: VNextDeterminismCommand) -> Result<()> {
+pub async fn execute(
+    command: VNextDeterminismCommand,
+) -> ferrum_execution::ExecutorBuildResult<()> {
     let bindings = validate_command(&command)?;
     #[cfg(feature = "cuda")]
     {
@@ -178,7 +180,8 @@ pub async fn execute(command: VNextDeterminismCommand) -> Result<()> {
         let _ = bindings;
         Err(FerrumError::unsupported(
             "ferrum vnext-determinism requires a binary built with the cuda feature",
-        ))
+        )
+        .into())
     }
 }
 
@@ -538,7 +541,7 @@ mod cuda {
     pub(super) async fn collect(
         command: VNextDeterminismCommand,
         bindings: Vec<ModelBinding>,
-    ) -> Result<()> {
+    ) -> ferrum_execution::ExecutorBuildResult<()> {
         match collect_inner(&command, &bindings).await {
             Ok(pass_line) => {
                 println!("{pass_line}");
@@ -562,7 +565,7 @@ mod cuda {
     async fn collect_inner(
         command: &VNextDeterminismCommand,
         bindings: &[ModelBinding],
-    ) -> Result<String> {
+    ) -> ferrum_execution::ExecutorBuildResult<String> {
         let fixtures = shape_fixtures(command.scope);
         let expected_case_count = command.scope.expected_case_count();
         let cases_per_model = fixtures.len() * 4;
@@ -640,54 +643,51 @@ mod cuda {
                 .unwrap_or_else(|| "none".to_owned());
             let mut engine = determinism_engine_config(binding, &prepared);
             engine.backend.dtype = prepared.descriptor().execution_dtype();
-            let collector = create_cuda_vnext_determinism_collector(&engine, &prepared, 0)
-                .map_err(|error| {
+            let collector = create_cuda_vnext_determinism_collector(&engine, &prepared, 0)?;
+            let collection = async {
+                let catalog_fingerprint = collector
+                    .capability_catalog()
+                    .fingerprint()
+                    .map_err(vnext_backend_error)?;
+                match canonical_catalog_fingerprint.as_deref() {
+                    Some(expected) if expected != catalog_fingerprint => {
+                        return Err(FerrumError::backend(format!(
+                            "CUDA capability catalog drifted between primary models: expected {expected}, got {catalog_fingerprint} for {}",
+                            binding.key
+                        )));
+                    }
+                    None => {
+                        canonical_catalog = Some(collector.capability_catalog().clone());
+                        canonical_catalog_fingerprint = Some(catalog_fingerprint);
+                    }
+                    Some(_) => {}
+                }
+                let plan = collector.resolved_model_plan().clone();
+                let dtype = collector.model_info().dtype.to_string();
+                collector.prepare().await.map_err(|error| {
                     FerrumError::backend(format!(
-                        "cannot create CUDA determinism collector for {}: {error}",
+                        "cannot prepare CUDA determinism collector for {}: {error}",
                         binding.key
                     ))
                 })?;
-            let catalog_fingerprint = collector
-                .capability_catalog()
-                .fingerprint()
-                .map_err(vnext_backend_error)?;
-            match canonical_catalog_fingerprint.as_deref() {
-                Some(expected) if expected != catalog_fingerprint => {
-                    return Err(FerrumError::backend(format!(
-                        "CUDA capability catalog drifted between primary models: expected {expected}, got {catalog_fingerprint} for {}",
-                        binding.key
-                    )));
-                }
-                None => {
-                    canonical_catalog = Some(collector.capability_catalog().clone());
-                    canonical_catalog_fingerprint = Some(catalog_fingerprint);
-                }
-                Some(_) => {}
-            }
-            let plan = collector.resolved_model_plan().clone();
-            let dtype = collector.model_info().dtype.to_string();
-            collector.prepare().await.map_err(|error| {
-                FerrumError::backend(format!(
-                    "cannot prepare CUDA determinism collector for {}: {error}",
+                println!(
+                    "FERRUM VNEXT DETERMINISM PROGRESS model={} stage=prepared",
                     binding.key
-                ))
-            })?;
-            println!(
-                "FERRUM VNEXT DETERMINISM PROGRESS model={} stage=prepared",
-                binding.key
-            );
-            let cases = collect_model_cases(
-                &collector,
-                &binding.key,
-                &dtype,
-                &quantization,
-                &fixtures,
-                model_ordinal * cases_per_model,
-                expected_case_count,
-                &progress_cases,
-            )
-            .await?;
-            drop(collector);
+                );
+                let cases = collect_model_cases(
+                    &collector,
+                    &binding.key,
+                    &dtype,
+                    &quantization,
+                    &fixtures,
+                    model_ordinal * cases_per_model,
+                    expected_case_count,
+                    &progress_cases,
+                )
+                .await?;
+                Ok((plan, dtype, cases))
+            }.await;
+            let (plan, dtype, cases) = collector.finish_collection(collection).await?;
             drop(prepared);
             println!(
                 "FERRUM VNEXT DETERMINISM PROGRESS model={} stage=released cases={}",
@@ -770,7 +770,7 @@ mod cuda {
             Ok(manifest) => manifest,
             Err(error) => {
                 let _ = fs::remove_dir_all(&stage);
-                return Err(error);
+                return Err(error.into());
             }
         };
         publish_stage(&stage, &command.artifact_root)?;

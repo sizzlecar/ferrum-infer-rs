@@ -969,7 +969,10 @@ pub struct RunCommand {
     pub output_format: OutputFormat,
 }
 
-pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
+pub async fn execute(
+    cmd: RunCommand,
+    config: CliConfig,
+) -> ferrum_execution::ExecutorBuildResult<()> {
     config.profile_journal.validate()?;
     // Capture user input once, before model selection or device preparation.
     let user_environment = crate::runtime_env::capture_supported_runtime_environment()?;
@@ -1284,7 +1287,7 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
                 &numerical_execution,
                 cmd.effective_config_json.as_deref(),
                 cmd.decision_trace_jsonl.as_deref(),
-                &error,
+                error.cause(),
             );
             if let Err(cleanup) = journals.finish().await {
                 tracing::warn!(%cleanup, "failed startup journal cleanup");
@@ -2053,7 +2056,7 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
     if let Err(error) = &cleanup_result {
         tracing::warn!(%error, "run final cleanup incomplete");
     }
-    execution_result.and(cleanup_result)
+    execution_result.and(cleanup_result).map_err(Into::into)
 }
 
 fn process_memory_observation_between(

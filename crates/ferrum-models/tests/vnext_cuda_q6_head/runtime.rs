@@ -155,7 +155,7 @@ impl Fixture {
             .unwrap();
         let resources = match initialized.into_plan_runtime() {
             Ok(v) => v,
-            Err(e) => panic!("runtime handoff: {}", e.error()),
+            Err(e) => panic!("runtime handoff: {}", e.failure().message()),
         };
         let lane = resources.create_execution_lane().unwrap();
         lane.configure_reusable_executables(DeviceReusableExecutionPlan::on_demand(8).unwrap())

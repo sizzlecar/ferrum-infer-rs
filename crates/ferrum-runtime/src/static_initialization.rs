@@ -10,8 +10,8 @@ use super::{
     new_deferred_device_cleanup_domain, BufferUsage, DeferredDeviceCleanupDisposition,
     DeferredDeviceCleanupDomainId, DeferredDeviceCleanupMaintenanceReceipt,
     DeferredDeviceCleanupStatus, DeferredDeviceCleanupTask, DeviceRuntime, ElementType,
-    ExecutionPlan, FailureDomain, FailureEnvelope, PlanRuntimeHandoffError, PlanRuntimeResources,
-    ResourceId, ResourceTransaction, ResourceTransactionDriver, TransactionCommitted, VNextError,
+    ExecutionPlan, FailureDomain, FailureEnvelope, PlanRuntimeResources, ResourceId,
+    ResourceTransaction, ResourceTransactionDriver, TransactionCommitted, VNextError,
     MAX_DEFERRED_DEVICE_CLEANUP_MAINTENANCE_TASKS,
 };
 use super::{
@@ -24,17 +24,17 @@ use super::{
 static STATIC_INITIALIZATION_CLEANUP_DOMAIN: OnceLock<DeferredDeviceCleanupDomainId> =
     OnceLock::new();
 
-fn static_initialization_cleanup_domain() -> DeferredDeviceCleanupDomainId {
+pub(crate) fn static_initialization_cleanup_domain() -> DeferredDeviceCleanupDomainId {
     *STATIC_INITIALIZATION_CLEANUP_DOMAIN.get_or_init(new_deferred_device_cleanup_domain)
 }
 
-/// Process-reachable status for initialization owners whose submission state
-/// was indeterminate and whose explicit failure owner was dropped.
+/// Process-reachable status for abandoned static-provision owners, including
+/// failed reservation/allocation and indeterminate initialization retirement.
 pub fn static_initialization_cleanup_status() -> DeferredDeviceCleanupStatus {
     deferred_device_cleanup_status(static_initialization_cleanup_domain())
 }
 
-/// Runs bounded recovery for abandoned static-initialization owners. This may
+/// Runs bounded recovery for abandoned static-provision owners. This may
 /// block in backend synchronization and belongs on a recovery thread.
 pub fn maintain_static_initialization_cleanups(
     maximum_tasks: usize,
@@ -218,13 +218,28 @@ where
         &self.receipt
     }
 
+    /// Activation is still cold: failed handoff retains the initialized,
+    /// quiescent transaction and retires it through its original release ledger.
     pub fn into_plan_runtime(
         self,
-    ) -> Result<Arc<PlanRuntimeResources<D::Runtime>>, PlanRuntimeHandoffError<D>>
+    ) -> Result<Arc<PlanRuntimeResources<D::Runtime>>, StaticInitializationFailure<D>>
     where
         D: 'static,
     {
-        self.transaction.into_plan_runtime()
+        self.transaction.into_plan_runtime().map_err(|error| {
+            let failure = contract_failure(error.error().clone());
+            StaticInitializationFailure::new(error.into_transaction(), failure)
+        })
+    }
+
+    /// Stop after successful initialization when a cold activation check fails.
+    /// Only this initialized owner can supply the quiescence proof; callers do
+    /// not manufacture a stream, fence or a permission to release a raw lease.
+    pub fn abort_activation(self, error: VNextError) -> StaticInitializationFailure<D>
+    where
+        D: 'static,
+    {
+        StaticInitializationFailure::new(self.transaction, contract_failure(error))
     }
 }
 
@@ -248,6 +263,8 @@ where
     transaction: Option<ResourceTransaction<D, TransactionCommitted>>,
     failure: FailureEnvelope,
     recovery: Option<StaticInitializationRecovery<D::Runtime>>,
+    retirement_started: bool,
+    retirement_poison: Option<FailureEnvelope>,
 }
 
 impl<D> fmt::Debug for StaticInitializationFailure<D>
@@ -294,11 +311,15 @@ where
                 transaction: Some(transaction),
                 failure,
                 recovery: None,
+                retirement_started: false,
+                retirement_poison: None,
             },
             InitializationStepFailure::Indeterminate { failure, recovery } => Self {
                 transaction: Some(transaction),
                 failure,
                 recovery: Some(recovery),
+                retirement_started: false,
+                retirement_poison: None,
             },
         }
     }
@@ -314,7 +335,7 @@ where
     pub fn into_transaction(
         mut self,
     ) -> Result<ResourceTransaction<D, TransactionCommitted>, Self> {
-        if self.recovery.is_some() {
+        if self.recovery.is_some() || self.retirement_started {
             return Err(self);
         }
         Ok(self
@@ -323,9 +344,84 @@ where
             .expect("static initialization failure owns its transaction"))
     }
 
+    /// Retire the original failed initialization without replaying any upload.
+    ///
+    /// A call makes at most one synchronization attempt. Failure retains this
+    /// same owner in place for an explicit retry; success proves quiescence and
+    /// releases the original transaction through its actual release ledger.
+    /// Once retirement starts, this object cannot return executable resources.
+    /// Backend release panics leave the remaining owner poisoned and retained:
+    /// their unknown side effects are not a permission to replay release hooks.
+    pub fn retire_in_place(&mut self) -> Result<(), FailureEnvelope> {
+        self.retirement_started = true;
+        if let Some(failure) = &self.retirement_poison {
+            return Err(failure.clone());
+        }
+        let Some(transaction) = self.transaction.as_mut() else {
+            return Ok(());
+        };
+        if let Some(recovery) = self.recovery.as_mut() {
+            let runtime = Arc::clone(transaction.lease().runtime());
+            let synchronized = catch_unwind(AssertUnwindSafe(|| {
+                runtime.synchronize(&mut recovery.stream)
+            }));
+            match synchronized {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    return Err(device_failure(&runtime, &error, "static_retirement"))
+                }
+                Err(payload) => {
+                    return Err(portable_failure(
+                        FailureDomain::Device,
+                        "static_retirement_sync_panic",
+                        panic_message(payload),
+                        false,
+                    ))
+                }
+            }
+            // The successful synchronization precedes releasing fence, stream,
+            // buffers or capacity. The original failure's cause is unchanged.
+            self.recovery.take();
+        }
+        match catch_unwind(AssertUnwindSafe(|| {
+            transaction.release_quiescent_in_place()
+        })) {
+            Ok(Ok(())) => {}
+            Ok(Err(failure)) => return Err(failure.failure().clone()),
+            Err(payload) => {
+                let failure = portable_failure(
+                    FailureDomain::Resource,
+                    "static_retirement_release_panic",
+                    panic_message(payload),
+                    false,
+                );
+                self.retirement_poison = Some(failure.clone());
+                return Err(failure);
+            }
+        }
+        // Every ledger entry is already Released. This typestate transition
+        // runs no backend callback and cannot repeat a release prefix.
+        let transaction = self
+            .transaction
+            .take()
+            .expect("retirement owns its transaction");
+        let released = transaction
+            .release()
+            .expect("checked release completed every entry");
+        drop(released);
+        Ok(())
+    }
+
+    pub fn is_retired(&self) -> bool {
+        self.retirement_started && self.transaction.is_none()
+    }
+
     /// Blocks until the failed initialization stream is quiescent. Success
     /// returns the committed transaction for a complete retry from byte zero.
     pub fn recover(mut self) -> Result<ResourceTransaction<D, TransactionCommitted>, Self> {
+        if self.retirement_started {
+            return Err(self);
+        }
         let Some(mut recovery) = self.recovery.take() else {
             return Ok(self
                 .transaction
@@ -374,17 +470,25 @@ where
     D: ResourceTransactionDriver + 'static,
 {
     fn drop(&mut self) {
-        if let Some(recovery) = self.recovery.take() {
-            let transaction = self
-                .transaction
-                .take()
-                .expect("indeterminate static initialization owns its transaction");
+        // A fresh quiescent failure needs no background task when its original
+        // checked release succeeds. Err/panic preserves the full remaining
+        // owner below; never fall through to raw transaction abandonment.
+        if !self.retirement_started && self.recovery.is_none() {
+            let _ = self.retire_in_place();
+        }
+        if let Some(transaction) = self.transaction.take() {
+            // Preserve the actual state even after quiescence was proved but a
+            // release failed/panicked. No fabricated stream/fence is needed.
+            let original = StaticInitializationFailure {
+                transaction: Some(transaction),
+                failure: self.failure.clone(),
+                recovery: self.recovery.take(),
+                retirement_started: self.retirement_started,
+                retirement_poison: self.retirement_poison.take(),
+            };
             defer_device_cleanup(
                 static_initialization_cleanup_domain(),
-                DeferredStaticInitializationCleanup {
-                    transaction: Some(transaction),
-                    recovery: Some(recovery),
-                },
+                DeferredStaticInitializationCleanup { original },
             );
         }
     }
@@ -394,8 +498,7 @@ struct DeferredStaticInitializationCleanup<D>
 where
     D: ResourceTransactionDriver + 'static,
 {
-    transaction: Option<ResourceTransaction<D, TransactionCommitted>>,
-    recovery: Option<StaticInitializationRecovery<D::Runtime>>,
+    original: StaticInitializationFailure<D>,
 }
 
 impl<D> DeferredDeviceCleanupTask for DeferredStaticInitializationCleanup<D>
@@ -403,33 +506,13 @@ where
     D: ResourceTransactionDriver + 'static,
 {
     fn try_cleanup(&mut self) -> DeferredDeviceCleanupDisposition {
-        let transaction = self
-            .transaction
-            .as_ref()
-            .expect("deferred static initialization owns its transaction");
-        let recovery = self
-            .recovery
-            .as_mut()
-            .expect("deferred static initialization owns its recovery stream");
-        let runtime = Arc::clone(transaction.lease().runtime());
-        let synchronized = catch_unwind(AssertUnwindSafe(|| {
-            runtime.synchronize(&mut recovery.stream)
-        }));
-        if !matches!(synchronized, Ok(Ok(()))) {
-            return DeferredDeviceCleanupDisposition::Retryable;
+        match self.original.retire_in_place() {
+            Ok(()) => DeferredDeviceCleanupDisposition::Completed,
+            Err(_) if self.original.retirement_poison.is_some() => {
+                DeferredDeviceCleanupDisposition::Quarantined
+            }
+            Err(_) => DeferredDeviceCleanupDisposition::Retryable,
         }
-        let mut recovery = self
-            .recovery
-            .take()
-            .expect("successful recovery retains its stream and fence");
-        drop(recovery.fence.take());
-        drop(recovery);
-        drop(
-            self.transaction
-                .take()
-                .expect("successful recovery retains its transaction"),
-        );
-        DeferredDeviceCleanupDisposition::Completed
     }
 }
 
@@ -1397,3 +1480,10 @@ fn panic_message(payload: Box<dyn Any + Send>) -> String {
         "device runtime panicked during static initialization submission".to_owned()
     }
 }
+
+#[cfg(test)]
+pub(crate) static STATIC_PROVISION_CLEANUP_TEST: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(test)]
+#[path = "static_initialization/retirement_tests.rs"]
+mod retirement_tests;

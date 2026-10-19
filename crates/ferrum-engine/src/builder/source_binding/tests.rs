@@ -391,3 +391,42 @@ async fn source_binding_typed_plan_cannot_hide_other_sources_or_definition() {
     )
     .await;
 }
+
+#[tokio::test]
+async fn source_binding_failure_preserves_owned_original_cpu_retirement() {
+    use ferrum_execution::ExecutorShutdownPhase;
+    use ferrum_models::test_support::{tiny_llama_executor_owned, TinyLlamaConfig};
+    let (_directory, sources) = unregistered_sources();
+    let owner = ExecutorOwner::new(tiny_llama_executor_owned(&TinyLlamaConfig::default()));
+    let peer = owner.scope().unwrap();
+    let original = owner.shutdown_observer();
+    let error = EngineBuilder::new(EngineConfig::default())
+        .with_model_sources(sources)
+        .with_tokenizer("stub")
+        .with_owned_executor(owner)
+        .unwrap()
+        .build()
+        .await
+        .err()
+        .expect("original CPU executor has no binding for these unrelated sources");
+    assert!(error
+        .cause()
+        .to_string()
+        .contains("did not report its bound"));
+    let mut cleanup = error
+        .cleanup()
+        .expect("source failure must keep cleanup")
+        .clone();
+    assert_eq!(cleanup.snapshot().phase(), ExecutorShutdownPhase::Draining);
+    drop(error);
+    drop(peer);
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while cleanup.snapshot().phase() != ExecutorShutdownPhase::Retired {
+            cleanup.changed().await;
+        }
+    })
+    .await
+    .unwrap();
+    cleanup.snapshot().result().unwrap();
+    assert_eq!(original.snapshot().phase(), ExecutorShutdownPhase::Retired);
+}

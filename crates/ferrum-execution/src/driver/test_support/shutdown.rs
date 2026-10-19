@@ -174,3 +174,23 @@ pub async fn program_shutdown_retains_referenced_cpu_plan_until_original_retry<R
     assert!(observer.snapshot().result().is_err());
     runtime
 }
+
+/// An actual original static upload/fence failure for upper construction tests.
+/// The returned probe observes the allocation ledger; it owns no execution resource.
+pub fn failed_initialization_build_error(
+    synchronization_failures: u32,
+) -> (
+    crate::ExecutorBuildError,
+    ferrum_runtime::test_support::resource_support::StaticInitializationProbe,
+) {
+    let (failure, probe) =
+        ferrum_runtime::test_support::resource_support::failed_static_initialization(
+            synchronization_failures,
+        );
+    let cause = FerrumError::device(failure.failure().message());
+    let cleanup = super::super::shutdown::begin_initialization(failure, cause.clone());
+    (
+        crate::ExecutorBuildError::with_cleanup(cause, cleanup),
+        probe,
+    )
+}

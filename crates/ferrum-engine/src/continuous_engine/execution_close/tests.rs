@@ -1862,3 +1862,94 @@ async fn execution_close_detached_held_and_fresh_slotless_release_have_distinct_
         );
     }
 }
+
+#[tokio::test]
+async fn startup_failure_observes_retained_engine_scope_before_original_journal_close() {
+    use ferrum_execution::ExecutorShutdownPhase;
+    let trace = std::env::temp_dir().join(format!(
+        "ferrum-startup-failure-{}.jsonl",
+        uuid::Uuid::new_v4()
+    ));
+    let cfg = TinyLlamaConfig::default();
+    let (engine, executor, sequence, request_id, slot, _sender) =
+        fixture_with_inner(false, tiny_llama_executor_owned(&cfg), Some(trace.clone()));
+    let foreign = executor.issuer.issue_sequence().unwrap();
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    let held = executor
+        .issuer
+        .held(
+            executor.issuer.recovery_key(&foreign).unwrap(),
+            async move {
+                receiver
+                    .await
+                    .map_err(|_| FerrumError::internal("lost original held terminal"))?
+            },
+        )
+        .unwrap();
+    drop(executor.issuer.ended(&sequence).unwrap());
+    let ticket = engine
+        .active_inner()
+        .unwrap()
+        .begin_observed_close(
+            request_id,
+            sequence,
+            Some(slot),
+            ExecutionCloseOutcome::held(held)
+                .with_error(FerrumError::backend("original foreign publication failure")),
+        )
+        .unwrap();
+    assert!(ticket.initial_result().await.is_err());
+    {
+        let inner = engine.active_inner().unwrap();
+        inner.execution_closes.join_observers().await;
+        assert!(inner.drain_execution_closes().is_err());
+    }
+    let (inner_weak, scope_weak, journal) = {
+        let inner = engine.active_inner().unwrap();
+        (
+            Arc::downgrade(&inner),
+            Arc::downgrade(&inner.model_executor),
+            inner
+                .scheduler_trace_jsonl
+                .clone()
+                .expect("original journal"),
+        )
+    };
+    let error = engine
+        .into_startup_failure(FerrumError::backend("startup rejected"))
+        .await;
+    assert!(error.cause().to_string().contains("startup rejected"));
+    let mut cleanup = error.cleanup().unwrap().clone();
+    let report = tokio::time::timeout(Duration::from_secs(5), cleanup.wait())
+        .await
+        .unwrap();
+    assert_eq!(report.phase(), ExecutorShutdownPhase::Retained);
+    assert!(inner_weak.upgrade().is_some());
+    assert!(scope_weak.upgrade().is_some());
+    assert!(!journal.delivery_stats().worker_finished);
+    assert!(!sender.is_closed());
+    drop(error);
+    cleanup.retry();
+    assert_ne!(cleanup.snapshot().phase(), ExecutorShutdownPhase::Retired);
+    sender
+        .send(Ok(ExecutionTerminalOutcome::ended(
+            executor.issuer.ended(&foreign).unwrap(),
+        )))
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while cleanup.snapshot().phase() != ExecutorShutdownPhase::Retired {
+            cleanup.changed().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(inner_weak.upgrade().is_none());
+    assert!(scope_weak.upgrade().is_none());
+    assert!(journal.delivery_stats().worker_finished);
+    assert!(
+        cleanup.snapshot().result().is_err(),
+        "retirement keeps prior close failure"
+    );
+    assert_eq!(executor.calls.load(Ordering::SeqCst), 0);
+    let _ = std::fs::remove_file(trace);
+}

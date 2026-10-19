@@ -4779,7 +4779,7 @@ impl<R: DeviceRuntime> ProgramExecutor<R> {
         weight_materializer_selection: WeightMaterializerSelection,
         catalog: CapabilityCatalog,
         resolve_plan: F,
-    ) -> Result<Self>
+    ) -> crate::ExecutorBuildResult<Self>
     where
         F: FnOnce(
             &ResolvedRuntimePolicy,
@@ -4816,7 +4816,7 @@ impl<R: DeviceRuntime> ProgramExecutor<R> {
         weight_materializer_selection: WeightMaterializerSelection,
         catalog: CapabilityCatalog,
         resolve_plan: F,
-    ) -> Result<Self>
+    ) -> crate::ExecutorBuildResult<Self>
     where
         F: FnOnce(
             &ResolvedRuntimePolicy,
@@ -4836,7 +4836,10 @@ impl<R: DeviceRuntime> ProgramExecutor<R> {
             .initialize(resolve_plan)
     }
 
-    fn from_compiled_model<F>(compiled: CompiledProgram<'_, R>, resolve_plan: F) -> Result<Self>
+    fn from_compiled_model<F>(
+        compiled: CompiledProgram<'_, R>,
+        resolve_plan: F,
+    ) -> crate::ExecutorBuildResult<Self>
     where
         F: FnOnce(
             &ResolvedRuntimePolicy,
@@ -4864,7 +4867,8 @@ impl<R: DeviceRuntime> ProgramExecutor<R> {
         if resolved_plan.execution_plan() != compilation.executable().execution_plan() {
             return Err(FerrumError::internal(
                 "product composition returned a different execution plan than the compiler",
-            ));
+            )
+            .into());
         }
         prepared.validate_resolved_plan(&resolved_plan)?;
         let sequence_state_memory = state_memory::logical_sequence_state_memory(
@@ -4896,106 +4900,9 @@ impl<R: DeviceRuntime> ProgramExecutor<R> {
             .static_bytes();
         let run_id = RunId::new(format!("run.vnext.{}", uuid::Uuid::new_v4()))
             .map_err(|error| FerrumError::internal(error.to_string()))?;
-        let provision_request = RequestIdentity::new(format!("request.vnext.provision.{run_id}"))
-            .map_err(|error| FerrumError::internal(error.to_string()))?;
-        let provision_phase = StartupPhaseTimer::start("static_provision");
-        let provisioned = resolved_plan
-            .execution_plan()
-            .provision_static(Arc::clone(&runtime), provision_request)
-            .map_err(|error| FerrumError::device(format!("vNext static provision: {error}")))?;
-        provision_phase.finish();
-        let (plan_resources, static_provider_attribution) = match provisioned.into_provisioning() {
-            StaticProvisioning::NoStatic(no_static) => (no_static.into_plan_runtime(), None),
-            StaticProvisioning::Required(permit) => {
-                let identity = ResourceTransactionIdentity::for_admission(
-                    permit.binding(),
-                    run_id.clone(),
-                    TransactionId::new(format!("transaction.vnext.provision.{run_id}"))
-                        .map_err(|error| FerrumError::internal(error.to_string()))?,
-                );
-                let driver = RuntimeResourceDriver::new(Arc::clone(&runtime))
-                    .map_err(|error| FerrumError::device(error.to_string()))?;
-                let transaction_begin_phase =
-                    StartupPhaseTimer::start("resource_transaction_begin");
-                let transaction = ResourceTransaction::<VNextDriver<R>, TransactionNew>::begin(
-                    driver, identity, permit,
-                )
-                .map_err(|error| FerrumError::device(error.to_string()))?;
-                transaction_begin_phase.finish();
-                let reserve_phase = StartupPhaseTimer::start("resource_reserve");
-                let reserved = match transaction.reserve() {
-                    Ok(reserved) => reserved,
-                    Err(error) => {
-                        let message = format!("{:?}", error.failure());
-                        drop(error);
-                        return Err(FerrumError::device(format!(
-                            "vNext static reserve failed: {message}"
-                        )));
-                    }
-                };
-                reserve_phase.finish();
-                let commit_phase = StartupPhaseTimer::start("resource_commit");
-                let committed = match reserved.commit() {
-                    Ok(committed) => committed,
-                    Err(ResourceCommitTransitionError::Recoverable(error)) => {
-                        let message = format!("{:?}", error.failure());
-                        drop(error);
-                        return Err(FerrumError::device(format!(
-                            "vNext static commit failed: {message}"
-                        )));
-                    }
-                    Err(ResourceCommitTransitionError::Poisoned(error)) => {
-                        let message = format!("{:?}", error.failure());
-                        drop(error);
-                        return Err(FerrumError::device(format!(
-                            "vNext static commit was indeterminate: {message}"
-                        )));
-                    }
-                };
-                commit_phase.finish();
-                let initialized = match committed.initialize_static(
-                    family,
-                    resolved_plan.execution_plan(),
-                    prepared.weights(),
-                    config.static_initialization,
-                ) {
-                    Ok(initialized) => initialized,
-                    Err(error) => {
-                        let message = error.failure().message().to_owned();
-                        drop(error);
-                        return Err(FerrumError::device(format!(
-                            "vNext static initialization failed: {message}"
-                        )));
-                    }
-                };
-                log_static_initialization_receipt(initialized.receipt());
-                let provider_attribution =
-                    StaticProviderAttributionWitness::from_completed_static_initialization(
-                        &resolved_plan,
-                        initialized.receipt(),
-                    )
-                    .map_err(|error| {
-                        FerrumError::model(format!(
-                            "vNext static provider attribution failed: {error}"
-                        ))
-                    })?;
-                let handoff_phase = StartupPhaseTimer::start("runtime_handoff");
-                match initialized.into_plan_runtime() {
-                    Ok(resources) => {
-                        handoff_phase.finish();
-                        (resources, provider_attribution)
-                    }
-                    Err(error) => {
-                        let message = error.error().to_string();
-                        drop(error);
-                        return Err(FerrumError::device(format!(
-                            "vNext runtime handoff failed: {message}"
-                        )));
-                    }
-                }
-            }
-        };
-        executor_startup.finish();
+        // Finish all fallible cold assembly before acquiring plan-static
+        // ownership. The lane has no flights and this worker has no accepted
+        // jobs; ordinary early Drop can join it without abandoning plan data.
         let lane = ExecutionLane::create(Arc::clone(&runtime)).map_err(|error| {
             FerrumError::device(format!("vNext execution lane creation failed: {error:?}"))
         })?;
@@ -5076,6 +4983,118 @@ impl<R: DeviceRuntime> ProgramExecutor<R> {
             .diagnostic_output_capture
             .map(|config| RetainedOutputCapture::new(config).map(Arc::new))
             .transpose()?;
+
+        let provision_request = RequestIdentity::new(format!("request.vnext.provision.{run_id}"))
+            .map_err(|error| FerrumError::internal(error.to_string()))?;
+        let provision_phase = StartupPhaseTimer::start("static_provision");
+        let provisioned = resolved_plan
+            .execution_plan()
+            .provision_static(Arc::clone(&runtime), provision_request)
+            .map_err(|error| FerrumError::device(format!("vNext static provision: {error}")))?;
+        provision_phase.finish();
+        let (plan_resources, static_provider_attribution) = match provisioned.into_provisioning() {
+            StaticProvisioning::NoStatic(no_static) => (no_static.into_plan_runtime(), None),
+            StaticProvisioning::Required(permit) => {
+                let identity = ResourceTransactionIdentity::for_admission(
+                    permit.binding(),
+                    run_id.clone(),
+                    TransactionId::new(format!("transaction.vnext.provision.{run_id}"))
+                        .map_err(|error| FerrumError::internal(error.to_string()))?,
+                );
+                let driver = RuntimeResourceDriver::new(Arc::clone(&runtime))
+                    .map_err(|error| FerrumError::device(error.to_string()))?;
+                let transaction_begin_phase =
+                    StartupPhaseTimer::start("resource_transaction_begin");
+                let transaction = ResourceTransaction::<VNextDriver<R>, TransactionNew>::begin(
+                    driver, identity, permit,
+                )
+                .map_err(|error| FerrumError::device(error.to_string()))?;
+                transaction_begin_phase.finish();
+                let reserve_phase = StartupPhaseTimer::start("resource_reserve");
+                let reserved = match transaction.reserve() {
+                    Ok(reserved) => reserved,
+                    Err(error) => {
+                        let cause = FerrumError::device(format!(
+                            "vNext static reserve failed: {:?}",
+                            error.failure()
+                        ));
+                        let original =
+                            ferrum_runtime::ResourcePreparationRetirement::from_reserve(error);
+                        return Err(shutdown::preparation_error(original, cause));
+                    }
+                };
+                reserve_phase.finish();
+                let commit_phase = StartupPhaseTimer::start("resource_commit");
+                let committed = match reserved.commit() {
+                    Ok(committed) => committed,
+                    Err(error) => {
+                        let cause = match &error {
+                            ResourceCommitTransitionError::Recoverable(error) => {
+                                FerrumError::device(format!(
+                                    "vNext static commit failed: {:?}",
+                                    error.failure()
+                                ))
+                            }
+                            ResourceCommitTransitionError::Poisoned(error) => {
+                                FerrumError::device(format!(
+                                    "vNext static commit was indeterminate: {:?}",
+                                    error.failure()
+                                ))
+                            }
+                        };
+                        let original =
+                            ferrum_runtime::ResourcePreparationRetirement::from_commit(error);
+                        return Err(shutdown::preparation_error(original, cause));
+                    }
+                };
+                commit_phase.finish();
+                let initialized = match committed.initialize_static(
+                    family,
+                    resolved_plan.execution_plan(),
+                    prepared.weights(),
+                    config.static_initialization,
+                ) {
+                    Ok(initialized) => initialized,
+                    Err(failure) => {
+                        let cause = FerrumError::device(format!(
+                            "vNext static initialization failed: {}",
+                            failure.failure().message()
+                        ));
+                        return Err(shutdown::initialization_error(failure, cause));
+                    }
+                };
+                log_static_initialization_receipt(initialized.receipt());
+                let provider_attribution =
+                    match StaticProviderAttributionWitness::from_completed_static_initialization(
+                        &resolved_plan,
+                        initialized.receipt(),
+                    ) {
+                        Ok(attribution) => attribution,
+                        Err(error) => {
+                            let cause = FerrumError::model(format!(
+                                "vNext static provider attribution failed: {error}"
+                            ));
+                            let original = initialized.abort_activation(error);
+                            return Err(shutdown::initialization_error(original, cause));
+                        }
+                    };
+                let handoff_phase = StartupPhaseTimer::start("runtime_handoff");
+                match initialized.into_plan_runtime() {
+                    Ok(resources) => {
+                        handoff_phase.finish();
+                        (resources, provider_attribution)
+                    }
+                    Err(original) => {
+                        let cause = FerrumError::device(format!(
+                            "vNext runtime handoff failed: {}",
+                            original.failure().message()
+                        ));
+                        return Err(shutdown::initialization_error(original, cause));
+                    }
+                }
+            }
+        };
+        executor_startup.finish();
         metrics
             .program_binding_upload
             .reset_baseline(runtime.program_binding_upload_snapshot());

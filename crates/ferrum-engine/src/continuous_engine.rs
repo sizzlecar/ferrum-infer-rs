@@ -1207,6 +1207,7 @@ mod execution_close;
 use execution_close::ExecutionCloseRegistry;
 mod journal_scopes;
 mod managed_driver;
+mod startup_failure;
 pub use journal_scopes::EngineJournalScopes;
 use journal_scopes::EngineJournals;
 use managed_driver::ManagedDriver;

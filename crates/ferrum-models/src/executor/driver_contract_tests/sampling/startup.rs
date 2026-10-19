@@ -97,3 +97,61 @@ async fn native_startup_cuda_rejects_segments_without_program_binding() {
         assertions::native_startup_rejects_segments_without_program_binding(executor).await;
     drop(_directory);
 }
+
+#[test]
+fn native_startup_cpu_late_configuration_error_precedes_static_allocation() {
+    let (runtime, registry, materializers, _, catalog) = CpuVNextComposition::create(
+        DeviceId::new("device.fixture.failed-cold-activation").unwrap(),
+        256 << 20,
+    )
+    .unwrap()
+    .into_parts()
+    .unwrap();
+    assert_eq!(runtime.resident_bytes(), 0);
+    assert_eq!(runtime.peak_resident_bytes(), 0);
+    let directory = tempfile::tempdir().unwrap();
+    let result = Fixture::try_new_with_engine_config(
+        SamplingReadbackMode::Uniform,
+        Device::CPU,
+        Arc::clone(&runtime),
+        registry,
+        materializers,
+        catalog,
+        FixtureOptions::default(),
+        |engine| {
+            engine.runtime.diagnostic_output_capture =
+                Some(ferrum_types::RetainedOutputCaptureConfig {
+                    output_dir: directory.path().join("capture"),
+                    prompt_token_count: 1,
+                    prompt_token_sha256: "a".repeat(64),
+                    source_span: 1..2,
+                    consumed_history_sha256: "b".repeat(64),
+                    // This concrete cold activation constructor used to run only
+                    // after static weight allocation and successful initialization.
+                    maximum_readback_bytes: 0,
+                });
+        },
+    );
+    let error = match result {
+        Ok(fixture) => {
+            assert_executor_closed(fixture.executor);
+            panic!("invalid original capture config must reject construction");
+        }
+        Err(error) => error,
+    };
+    assert!(
+        error
+            .cause()
+            .to_string()
+            .contains("output capture requires"),
+        "{error}"
+    );
+    assert!(error.cleanup().is_none(), "no plan ownership was acquired");
+    assert_eq!(runtime.resident_bytes(), 0);
+    assert_eq!(
+        runtime.peak_resident_bytes(),
+        0,
+        "releasing after allocation is not prevalidation"
+    );
+    assert!(!directory.path().join("capture").exists());
+}

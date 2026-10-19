@@ -13,7 +13,11 @@ struct ServeCli {
     command: crate::commands::serve::ServeCommand,
 }
 
-async fn synthetic_entrypoint(run: bool, path: &Path, config: CliConfig) -> Result<()> {
+async fn synthetic_entrypoint(
+    run: bool,
+    path: &Path,
+    config: CliConfig,
+) -> ferrum_execution::ExecutorBuildResult<()> {
     let args = [
         "ferrum",
         "synthetic/no-weight",

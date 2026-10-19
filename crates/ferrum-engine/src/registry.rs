@@ -12,7 +12,7 @@
 
 use async_trait::async_trait;
 use ferrum_execution::executor_lifecycle::ExecutorOwner;
-use ferrum_execution::ModelExecutor;
+use ferrum_execution::{ExecutorBuildError, ExecutorBuildResult, ModelExecutor};
 use ferrum_interfaces::{Sampler, SchedulerInterface as Scheduler, Tokenizer};
 use ferrum_models::vnext::{DefinedProductionModel, ProductionModelSourceBundle};
 use ferrum_types::{Device, EngineConfig, FerrumError, Result};
@@ -33,9 +33,9 @@ mod source_binding_tests;
 
 /// Factory trait for creating components
 #[async_trait]
-pub trait ComponentFactory<T>: Send + Sync {
+pub trait ComponentFactory<T, E = FerrumError>: Send + Sync {
     /// Create a component instance
-    async fn create(&self, config: &ComponentConfig) -> Result<T>;
+    async fn create(&self, config: &ComponentConfig) -> std::result::Result<T, E>;
 
     /// Get component metadata
     fn metadata(&self) -> ComponentMetadata;
@@ -156,7 +156,8 @@ pub struct ComponentRegistry {
         RwLock<HashMap<String, Arc<dyn ComponentFactory<Arc<dyn Sampler + Send + Sync>>>>>,
     scheduler_factories:
         RwLock<HashMap<String, Arc<dyn ComponentFactory<Arc<dyn Scheduler + Send + Sync>>>>>,
-    executor_factories: RwLock<HashMap<String, Arc<dyn ComponentFactory<ExecutorOwner>>>>,
+    executor_factories:
+        RwLock<HashMap<String, Arc<dyn ComponentFactory<ExecutorOwner, ExecutorBuildError>>>>,
 }
 
 impl ComponentRegistry {
@@ -246,7 +247,7 @@ impl ComponentRegistry {
     pub fn register_executor_factory(
         &self,
         name: impl Into<String>,
-        factory: Arc<dyn ComponentFactory<ExecutorOwner>>,
+        factory: Arc<dyn ComponentFactory<ExecutorOwner, ExecutorBuildError>>,
     ) {
         let name = name.into();
         debug!("Registering executor factory: {}", name);
@@ -285,7 +286,7 @@ impl ComponentRegistry {
     pub fn get_executor_factory(
         &self,
         name: &str,
-    ) -> Option<Arc<dyn ComponentFactory<ExecutorOwner>>> {
+    ) -> Option<Arc<dyn ComponentFactory<ExecutorOwner, ExecutorBuildError>>> {
         self.executor_factories.read().get(name).cloned()
     }
 
@@ -370,7 +371,7 @@ impl ComponentRegistry {
         &self,
         name: &str,
         config: &ComponentConfig,
-    ) -> Result<ExecutorOwner> {
+    ) -> ExecutorBuildResult<ExecutorOwner> {
         let factory = self.get_executor_factory(name).ok_or_else(|| {
             FerrumError::model(format!(
                 "Executor '{}' not found. Available: {:?}",
@@ -636,8 +637,8 @@ impl ComponentFactory<Arc<dyn Scheduler + Send + Sync>> for ContinuousBatchSched
 pub struct StubExecutorFactory;
 
 #[async_trait]
-impl ComponentFactory<ExecutorOwner> for StubExecutorFactory {
-    async fn create(&self, config: &ComponentConfig) -> Result<ExecutorOwner> {
+impl ComponentFactory<ExecutorOwner, ExecutorBuildError> for StubExecutorFactory {
+    async fn create(&self, config: &ComponentConfig) -> ExecutorBuildResult<ExecutorOwner> {
         validate_causal_decode_preparation_mode(config, false)?;
         validate_segment_binding_owner_view_mode(config, false)?;
         validate_program_binding_upload_strategy(config, false)?;
@@ -1145,7 +1146,7 @@ fn create_registered_program_executor(
     sources: Option<Arc<ProductionModelSourceBundle>>,
     defined_model: Option<Arc<DefinedProductionModel>>,
     registration: ferrum_models::vnext::RegisteredProductionModel,
-) -> Result<ExecutorOwner> {
+) -> ExecutorBuildResult<ExecutorOwner> {
     use ferrum_models::vnext::ProductionExecutionKind;
 
     validate_causal_decode_preparation_mode(config, true)?;
@@ -1165,7 +1166,8 @@ fn create_registered_program_executor(
         if !Arc::ptr_eq(prepared.sources(), sources) {
             return Err(FerrumError::model(
                 "prepared product model and component sources do not share one source lease",
-            ));
+            )
+            .into());
         }
     }
     let prepared = match defined_model {
@@ -1175,7 +1177,8 @@ fn create_registered_program_executor(
                     "prepared product metadata {} differs from registered metadata {}",
                     prepared.definition().external_metadata_id(),
                     registration.external_metadata_id()
-                )));
+                ))
+                .into());
             }
             prepared
         }
@@ -1265,7 +1268,7 @@ fn create_registered_program_executor(
                 let _ = (ordinal, model_path, prepared);
                 Err(FerrumError::device(
                     "registered vNext CUDA composition requires the 'cuda' feature",
-                ))
+                ).into())
             }
         }
         #[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
@@ -1349,7 +1352,7 @@ fn create_registered_program_executor(
         (kind, device) => Err(FerrumError::unsupported(format!(
             "registered vNext model metadata {} requires a {kind:?} backend composition, but {device} is not registered",
             registration.external_metadata_id()
-        ))),
+        )).into()),
     }
 }
 
@@ -1359,8 +1362,8 @@ fn create_registered_program_executor(
 pub type CandleExecutorFactory = LlmExecutorFactory;
 
 #[async_trait]
-impl ComponentFactory<ExecutorOwner> for LlmExecutorFactory {
-    async fn create(&self, config: &ComponentConfig) -> Result<ExecutorOwner> {
+impl ComponentFactory<ExecutorOwner, ExecutorBuildError> for LlmExecutorFactory {
+    async fn create(&self, config: &ComponentConfig) -> ExecutorBuildResult<ExecutorOwner> {
         use ferrum_models::weight_format::WeightFormat;
 
         if let Some(defined) = &config.defined_model {
@@ -1371,7 +1374,8 @@ impl ComponentFactory<ExecutorOwner> for LlmExecutorFactory {
             {
                 return Err(FerrumError::model(
                     "defined product model and component sources do not share one source lease",
-                ));
+                )
+                .into());
             }
         }
 
@@ -1401,7 +1405,8 @@ impl ComponentFactory<ExecutorOwner> for LlmExecutorFactory {
                 if checkpoint_capture_enabled {
                     return Err(FerrumError::unsupported(
                         "vNext checkpoint capture requires a registered model source",
-                    ));
+                    )
+                    .into());
                 }
                 info!("No model path found, falling back to stub executor");
                 return StubExecutorFactory.create(config).await;
@@ -1455,7 +1460,7 @@ impl ComponentFactory<ExecutorOwner> for LlmExecutorFactory {
                     if checkpoint_capture_enabled {
                         return Err(FerrumError::unsupported(format!(
                             "vNext checkpoint capture requires a migrated model; metadata {external_metadata_id} is still legacy"
-                        )));
+                        )).into());
                     }
                     info!(
                         %external_metadata_id,
@@ -1472,7 +1477,8 @@ impl ComponentFactory<ExecutorOwner> for LlmExecutorFactory {
         if checkpoint_capture_enabled {
             return Err(FerrumError::unsupported(
                 "vNext checkpoint capture requires a registered vNext model package",
-            ));
+            )
+            .into());
         }
 
         if let ferrum_types::NumericalExecutionPolicy::Require(profile) =
@@ -1480,7 +1486,8 @@ impl ComponentFactory<ExecutorOwner> for LlmExecutorFactory {
         {
             return Err(FerrumError::unsupported(format!(
                 "numerical profile {profile} requires a registered vNext model package"
-            )));
+            ))
+            .into());
         }
 
         // Freeze both model and loader options once, before any legacy weight
@@ -1559,7 +1566,8 @@ impl ComponentFactory<ExecutorOwner> for LlmExecutorFactory {
                     return Err(FerrumError::unsupported(
                         "FERRUM_TP>1 not supported on the Backend<B> path. \
                          Run with FERRUM_TP=1 (default) for single-GPU inference.",
-                    ));
+                    )
+                    .into());
                 }
                 // GPTQ is loaded via NativeSafetensorsLoader's load_linear:
                 // it auto-detects `<name>.qweight` tensors and constructs
@@ -1647,7 +1655,8 @@ impl ComponentFactory<ExecutorOwner> for LlmExecutorFactory {
                             {
                                 return Err(FerrumError::device(
                                     "Metal requested but 'metal' feature not enabled",
-                                ));
+                                )
+                                .into());
                             }
                         }
                         (Device::CUDA(_), KvCacheDtype::Fp16) => {
@@ -1667,7 +1676,8 @@ impl ComponentFactory<ExecutorOwner> for LlmExecutorFactory {
                             {
                                 return Err(FerrumError::device(
                                     "CUDA requested but 'cuda' feature not enabled",
-                                ));
+                                )
+                                .into());
                             }
                         }
                         (Device::CUDA(_), KvCacheDtype::Int8) => {
@@ -1688,13 +1698,15 @@ impl ComponentFactory<ExecutorOwner> for LlmExecutorFactory {
                             {
                                 return Err(FerrumError::device(
                                     "CUDA requested but 'cuda' feature not enabled",
-                                ));
+                                )
+                                .into());
                             }
                         }
                         (dev, dt) => {
                             return Err(FerrumError::unsupported(format!(
                                 "(device={dev:?}, kv_dtype={dt:?}) not implemented"
-                            )));
+                            ))
+                            .into());
                         }
                     };
 
@@ -1707,7 +1719,8 @@ impl ComponentFactory<ExecutorOwner> for LlmExecutorFactory {
             _ => Err(FerrumError::model(format!(
                 "Architecture {:?} not supported",
                 model_def.architecture
-            ))),
+            ))
+            .into()),
         }
     }
 
@@ -2701,7 +2714,7 @@ pub(crate) mod tests {
             .err()
             .unwrap();
         assert!(
-            matches!(error, FerrumError::Device { message } if message == "terminal initialization failure")
+            matches!(error.cause(), FerrumError::Device { message } if message == "terminal initialization failure")
         );
         assert_eq!(initializations, 1);
         assert_eq!(retained.runtime().peak_resident_bytes(), 0);

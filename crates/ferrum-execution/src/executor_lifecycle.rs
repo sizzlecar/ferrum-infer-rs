@@ -105,9 +105,16 @@ pub struct ExecutorShutdownObserver {
 
 impl ExecutorShutdownObserver {
     pub fn channel(custody: Arc<dyn Any + Send + Sync>) -> (ExecutorShutdownReporter, Self) {
+        Self::channel_with_error(custody, None)
+    }
+
+    pub(crate) fn channel_with_error(
+        custody: Arc<dyn Any + Send + Sync>,
+        error: Option<FerrumError>,
+    ) -> (ExecutorShutdownReporter, Self) {
         let (sender, receiver) = watch::channel(ExecutorShutdownReport {
             phase: ExecutorShutdownPhase::Draining,
-            error: None,
+            error,
         });
         (
             ExecutorShutdownReporter {
@@ -285,10 +292,23 @@ impl ExecutorOwner {
     /// A failed start remains observable and can be retried by this same owner.
     pub fn begin_shutdown(&self) -> ExecutorShutdownObserver {
         begin_owner_shutdown(&self.state);
+        self.shutdown_observer()
+    }
+
+    /// Observe this original owner's future retirement without sealing its
+    /// scopes or starting cleanup. Retry only wakes an already-authorized close.
+    pub fn shutdown_observer(&self) -> ExecutorShutdownObserver {
         let state = Arc::downgrade(&self.state);
         self.state.observer.clone().with_retry(Arc::new(move || {
             if let Some(state) = state.upgrade() {
-                begin_owner_shutdown(&state);
+                let sealed = state
+                    .gate
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .sealed;
+                if sealed {
+                    begin_owner_shutdown(&state);
+                }
             }
         }))
     }
@@ -526,6 +546,27 @@ mod tests {
             reporter.retired(None);
             observer
         }
+    }
+
+    #[tokio::test]
+    async fn shutdown_observation_cannot_seal_or_start_original_owner() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let owner = ExecutorOwner::new(Box::new(CloseProbe {
+            calls: calls.clone(),
+        }));
+        let observer = owner.shutdown_observer();
+        observer.retry();
+        let scope = owner.scope().expect("observation cannot seal registration");
+        assert_eq!(calls.load(Ordering::Relaxed), 0);
+        drop(owner);
+        assert_eq!(observer.snapshot().phase(), ExecutorShutdownPhase::Draining);
+        drop(scope);
+        tokio::time::timeout(Duration::from_secs(5), observer.wait())
+            .await
+            .unwrap()
+            .result()
+            .unwrap();
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
     }
 
     #[tokio::test]

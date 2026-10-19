@@ -129,7 +129,10 @@ fn measured_request_count(cmd: &BenchCommand) -> Result<u32> {
     })
 }
 
-pub async fn execute(cmd: BenchCommand, config: CliConfig) -> Result<()> {
+pub async fn execute(
+    cmd: BenchCommand,
+    config: CliConfig,
+) -> ferrum_execution::ExecutorBuildResult<()> {
     validate_command(&cmd)?;
     let runtime_config = crate::runtime_env::capture_supported_runtime_environment()?;
     let cache_dir = crate::source_resolver::hf_cache_dir(&config);
@@ -243,9 +246,7 @@ pub async fn execute(cmd: BenchCommand, config: CliConfig) -> Result<()> {
     eprintln!("{}", "Warmup...".dimmed());
     let warmup = run_single(&*engine, &model_id, "Hello", 16).await?;
     if !warmup.success {
-        return Err(ferrum_types::FerrumError::model(
-            "benchmark warmup request failed",
-        ));
+        return Err(ferrum_types::FerrumError::model("benchmark warmup request failed").into());
     }
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
@@ -306,7 +307,7 @@ pub async fn execute(cmd: BenchCommand, config: CliConfig) -> Result<()> {
         env,
     );
 
-    emit_then_enforce_bench_report(&cmd, &report, &mode_str)
+    emit_then_enforce_bench_report(&cmd, &report, &mode_str).map_err(Into::into)
 }
 
 // ── Run loops (one round = N sequential or concurrent passes) ───────

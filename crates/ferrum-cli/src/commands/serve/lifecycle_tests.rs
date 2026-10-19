@@ -19,7 +19,8 @@ async fn serve_lifecycle_early_timeout_report_keeps_original_scope_until_same_ta
         report
             .send(Err(FerrumError::internal(
                 "controlled HTTP drain remains pending",
-            )))
+            )
+            .into()))
             .unwrap();
         wait.await
             .map_err(|e| FerrumError::internal(e.to_string()))?;
@@ -29,7 +30,7 @@ async fn serve_lifecycle_early_timeout_report_keeps_original_scope_until_same_ta
         scope
             .finish()
             .result()
-            .map_err(|e| FerrumError::io(e.to_string()))
+            .map_err(|e| FerrumError::io(e.to_string()).into())
     });
     let error = observer.result().await.unwrap_err();
     assert!(error
@@ -185,7 +186,7 @@ async fn actual_shutdown_deadline(http_already_drained: bool, late_failure: bool
                 scope.finish().result().unwrap();
                 run_finished.fetch_add(1, Ordering::SeqCst);
                 if late_failure {
-                    Err(FerrumError::io("controlled late cleanup failure"))
+                    Err(FerrumError::io("controlled late cleanup failure").into())
                 } else {
                     Ok(())
                 }
@@ -251,4 +252,57 @@ async fn actual_shutdown_deadline(http_already_drained: bool, late_failure: bool
             json!({"actual_cleanup_finished": true})
         ]
     );
+}
+
+#[tokio::test]
+async fn serve_startup_timeout_preserves_original_static_failure_and_recovery_observer() {
+    use super::lifecycle::ShutdownObservation;
+    use ferrum_execution::ExecutorShutdownPhase;
+    use std::time::Duration;
+    let (error, probe) =
+        ferrum_execution::driver::test_support::shutdown::failed_initialization_build_error(1);
+    let cause = error.cause().to_string();
+    let (release, pending) = tokio::sync::oneshot::channel();
+    let mut task = ServeTaskObserver::spawn(move |_cancel, report| async move {
+        let mut shutdown = ShutdownObservation::new(Duration::ZERO, report);
+        shutdown.record_failure(&error);
+        shutdown
+            .wait(async {
+                let _ = pending.await;
+            })
+            .await;
+        shutdown.finish(Err(error))
+    });
+    let reported = task.result().await.unwrap_err();
+    assert_eq!(reported.cause().to_string(), cause);
+    let mut cleanup = reported
+        .cleanup()
+        .expect("timeout must retain original construction observation")
+        .clone();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while cleanup.snapshot().phase() != ExecutorShutdownPhase::Retained {
+            cleanup.changed().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(probe.snapshot().buffer_drops, 0);
+    drop(reported);
+    cleanup.retry();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while cleanup.snapshot().phase() != ExecutorShutdownPhase::Retired {
+            cleanup.changed().await;
+        }
+    })
+    .await
+    .unwrap();
+    probe.wait_for_all_buffer_drops();
+    release.send(()).unwrap();
+    let terminal = task.join().await.unwrap_err();
+    assert_eq!(terminal.cause().to_string(), cause);
+    assert_eq!(
+        terminal.cleanup().unwrap().snapshot().phase(),
+        ExecutorShutdownPhase::Retired
+    );
+    assert_eq!(probe.snapshot().submissions, 1);
 }

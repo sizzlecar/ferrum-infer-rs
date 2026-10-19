@@ -65,7 +65,7 @@ pub(crate) fn create_program_executor<R: DeviceRuntime>(
         ferrum_runtime::VNextError,
     >,
     q8_predecoded_composition: Option<&mut dyn FnMut() -> Result<RuntimeComposition<R>>>,
-) -> Result<ProgramExecutor<R>> {
+) -> ferrum_execution::ExecutorBuildResult<ProgramExecutor<R>> {
     create_program_executor_with_configuration(
         engine,
         defined,
@@ -95,7 +95,7 @@ pub(crate) fn create_program_executor_with_configuration<R: DeviceRuntime>(
     >,
     mut q8_predecoded_composition: Option<&mut dyn FnMut() -> Result<RuntimeComposition<R>>>,
     executor_config: impl Fn(&EngineConfig, &ModelInfo, &R) -> Result<ProgramExecutorConfig>,
-) -> Result<ProgramExecutor<R>> {
+) -> ferrum_execution::ExecutorBuildResult<ProgramExecutor<R>> {
     let requested_kv_storage = ferrum_types::KvStorageFormat::try_from(engine.kv_cache.dtype)
         .map_err(FerrumError::config)?;
     let composition =
@@ -129,35 +129,35 @@ pub(crate) fn create_program_executor_with_configuration<R: DeviceRuntime>(
         {
             return Err(FerrumError::unsupported(
                 "predecoded-f32 Q8 projection weights require a selected supported upstream causal or GDN numerical route",
-            ));
+            ).into());
         }
         if engine.runtime.q4_mmvq_weight_decode == ferrum_types::Q4MmvqWeightDecode::SharedM8
             && !profile_has_shared_m8_q4_route(profile)
         {
             return Err(FerrumError::unsupported(
                 "shared-m8 Q4 weight decode requires a selected causal or GDN numerical profile declaring Q4_K Columns M8 MarkerV2 MMVQ; select an appropriate explicit numerical profile",
-            ));
+            ).into());
         }
         if engine.runtime.q5_mmvq_weight_decode == ferrum_types::Q5MmvqWeightDecode::SharedM8
             && !profile_has_shared_m8_q5_route(profile)
         {
             return Err(FerrumError::unsupported(
                 "shared-m8 Q5 weight decode requires a selected causal or GDN numerical profile declaring Q5_K Columns M8 MarkerV2 MMVQ; select an appropriate explicit numerical profile",
-            ));
+            ).into());
         }
         if engine.runtime.q4_mmvq_weight_decode == ferrum_types::Q4MmvqWeightDecode::SharedM4M8
             && !profile_has_shared_m4_m8_route(profile, ferrum_runtime::ProjectionBlockFormat::Q4K)
         {
             return Err(FerrumError::unsupported(
                 "shared-m4-m8 Q4 weight decode requires a selected causal, GDN or SwiGLU numerical profile declaring Q4_K Columns M4 or M8 MarkerV2 MMVQ",
-            ));
+            ).into());
         }
         if engine.runtime.q5_mmvq_weight_decode == ferrum_types::Q5MmvqWeightDecode::SharedM4M8
             && !profile_has_shared_m4_m8_route(profile, ferrum_runtime::ProjectionBlockFormat::Q5K)
         {
             return Err(FerrumError::unsupported(
                 "shared-m4-m8 Q5 weight decode requires a selected causal, GDN or SwiGLU numerical profile declaring Q5_K Columns M4 or M8 MarkerV2 MMVQ",
-            ));
+            ).into());
         }
         let prepared = match defined.prepare(&profile.id) {
             Ok(prepared) => prepared,
@@ -431,7 +431,8 @@ pub(crate) fn create_program_executor_with_configuration<R: DeviceRuntime>(
             ))
             .collect::<Vec<_>>()
             .join("; ")
-    )))
+    ))
+    .into())
 }
 
 fn q8_auto_preparation_eligible(
@@ -1233,7 +1234,7 @@ mod tests {
             0,
             "source mismatch must precede static allocation/upload"
         );
-        let FerrumError::Model { message } = &error else {
+        let FerrumError::Model { message } = error.cause() else {
             panic!("wrong source-binding error: {error:?}");
         };
         assert!(

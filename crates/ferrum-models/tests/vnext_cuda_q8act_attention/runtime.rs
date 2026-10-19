@@ -171,7 +171,7 @@ impl Fixture {
             .unwrap();
         let resources = match initialized.into_plan_runtime() {
             Ok(resources) => resources,
-            Err(error) => panic!("plan runtime handoff failed: {}", error.error()),
+            Err(error) => panic!("plan runtime handoff failed: {}", error.failure().message()),
         };
         let cold_status = resources.dynamic_pool_status().unwrap();
         assert!(cold_status.pools().iter().all(|p| p.resident_bytes() == 0));

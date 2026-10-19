@@ -1,5 +1,6 @@
 //! A command may report a timeout while its original lifecycle still owns cleanup.
-use ferrum_types::{FerrumError, Result};
+use ferrum_execution::ExecutorBuildResult as Result;
+use ferrum_types::FerrumError;
 use std::future::Future;
 use tokio::sync::oneshot;
 
@@ -10,6 +11,7 @@ pub(super) struct ShutdownObservation {
     deadline: Option<tokio::time::Instant>,
     report: Option<oneshot::Sender<Result<()>>>,
     timed_out: Option<FerrumError>,
+    first_failure: Option<ferrum_execution::ExecutorBuildError>,
 }
 
 impl ShutdownObservation {
@@ -19,6 +21,15 @@ impl ShutdownObservation {
             deadline: None,
             report: Some(report),
             timed_out: None,
+            first_failure: None,
+        }
+    }
+
+    /// A known construction failure precedes cleanup's observation timeout.
+    /// Retain its original typed recovery observation in every public report.
+    pub(super) fn record_failure(&mut self, error: &ferrum_execution::ExecutorBuildError) {
+        if self.first_failure.is_none() {
+            self.first_failure = Some(error.clone());
         }
     }
 
@@ -37,7 +48,11 @@ impl ShutdownObservation {
                     ));
                     tracing::warn!(%error, "retaining original serve cleanup custody");
                     if let Some(report) = self.report.take() {
-                        let _ = report.send(Err(error.clone()));
+                        let reported = self
+                            .first_failure
+                            .clone()
+                            .unwrap_or_else(|| error.clone().into());
+                        let _ = report.send(Err(reported));
                     }
                     self.timed_out = Some(error);
                 }
@@ -48,12 +63,15 @@ impl ShutdownObservation {
     }
 
     pub(super) fn finish(self, actual: Result<()>) -> Result<()> {
+        if let Some(first) = self.first_failure {
+            return Err(first);
+        }
         match self.timed_out {
             Some(timeout) => {
                 if let Err(error) = actual {
                     tracing::warn!(%error, "serve cleanup later failed after reported timeout");
                 }
-                Err(timeout)
+                Err(timeout.into())
             }
             None => actual,
         }
@@ -90,7 +108,7 @@ impl ServeTaskObserver {
         };
         tokio::select! {
             joined = &mut self.task => {
-                let result = joined.unwrap_or_else(|error| Err(FerrumError::internal(format!("serve lifecycle task failed: {error}"))));
+                let result = joined.unwrap_or_else(|error| Err(FerrumError::internal(format!("serve lifecycle task failed: {error}")).into()));
                 self.terminal = Some(result.clone()); result
             }
             report = reported => {
@@ -104,9 +122,7 @@ impl ServeTaskObserver {
             return result.clone();
         }
         let result = (&mut self.task).await.unwrap_or_else(|error| {
-            Err(FerrumError::internal(format!(
-                "serve lifecycle task failed: {error}"
-            )))
+            Err(FerrumError::internal(format!("serve lifecycle task failed: {error}")).into())
         });
         self.terminal = Some(result.clone());
         result
