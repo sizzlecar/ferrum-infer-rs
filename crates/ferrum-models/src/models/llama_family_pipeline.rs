@@ -1228,15 +1228,21 @@ mod tests {
             &self,
             ctx: &mut <CpuBackend as ferrum_kernels::backend::Backend>::Context,
             name: &str,
-        ) -> Result<Box<dyn ferrum_quantization::Linear<CpuBackend>>> {
-            let (out_features, in_features) = self.linear_dims(name)?;
-            let weights = Self::deterministic_values(name, out_features * in_features, 0.0, 0.015);
-            Ok(Box::new(DenseLinear::<CpuBackend>::from_rows_in_context(
-                ctx,
-                &weights,
-                out_features,
-                in_features,
-            )))
+        ) -> Result<ferrum_kernels::LoadedLinear<CpuBackend>> {
+            let linear = (|| -> Result<Box<dyn ferrum_quantization::Linear<CpuBackend>>> {
+                let (out_features, in_features) = self.linear_dims(name)?;
+                let weights =
+                    Self::deterministic_values(name, out_features * in_features, 0.0, 0.015);
+                Ok(Box::new(DenseLinear::<CpuBackend>::from_rows_in_context(
+                    ctx,
+                    &weights,
+                    out_features,
+                    in_features,
+                )))
+            })()?;
+            // SAFETY: these built-in projections own their weights and encode only
+            // backend work; the model retains them until checked graph retirement.
+            Ok(unsafe { ferrum_kernels::LoadedLinear::new_capture_stable(linear) })
         }
 
         fn has_tensor(&self, name: &str) -> bool {

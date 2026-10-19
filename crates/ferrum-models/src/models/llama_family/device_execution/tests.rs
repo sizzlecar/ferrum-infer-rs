@@ -287,7 +287,7 @@ fn model_frame_cancels_failed_cuda_capture_without_executing_prefix() {
         frame
             .take_scratch(&mut model.scratch, FrameLayout::Single, false)
             .unwrap();
-        CudaBackend::begin_graph_capture(&mut frame.context).unwrap();
+        unsafe { CudaBackend::begin_graph_capture(&mut frame.context) }.unwrap();
         CudaBackend::zero_buffer(&mut frame.context, frame.residual.as_mut().unwrap(), count)
             .unwrap();
         // The model's real unwind boundary must cancel this recorded prefix.

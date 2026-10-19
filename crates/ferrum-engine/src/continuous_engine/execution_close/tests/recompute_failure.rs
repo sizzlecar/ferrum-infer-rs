@@ -305,11 +305,11 @@ async fn execution_close_late_recompute_failure_ends_products_but_retains_real_c
             let expected = reference.decode("reference", 2, 1);
             assert_eq!(actual, expected);
             assert_eq!(actual.len(), cfg.vocab_size);
-            assert!(owner.kv_caches["retained-owner"]
+            assert!(owner.kv_caches()["retained-owner"]
                 .iter()
                 .all(|cache| cache.len == 2));
             owner.close_token_sequence("retained-owner").unwrap();
-            assert!(owner.kv_caches.is_empty());
+            assert!(owner.kv_caches().is_empty());
         }
         executor.issuer.ended(&identity).unwrap();
         engine

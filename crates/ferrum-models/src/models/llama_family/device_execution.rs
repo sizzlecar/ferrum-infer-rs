@@ -235,7 +235,7 @@ impl<B: QuantLlmBackend + BackendMoeFused> QuiescentLlamaFrame<B> {
     }
 }
 
-fn panic_error(payload: Box<dyn std::any::Any + Send>) -> FerrumError {
+pub(super) fn panic_error(payload: Box<dyn std::any::Any + Send>) -> FerrumError {
     if let Some(error) = payload.downcast_ref::<FerrumError>() {
         return error.clone();
     }
@@ -436,7 +436,16 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
             .unwrap_or_else(|error| std::panic::panic_any(error));
         self.recover_for_mutation();
         self.run_preparation_frame(|model, frame| {
-            B::reset_graph(&mut frame.context, super::SINGLE_ITEM_GRAPH_KEY);
+            if model.single_graph_cache_id.as_deref() == Some(cache_id)
+                || model
+                    .batched_pointers_for
+                    .as_ref()
+                    .is_some_and(|owners| owners.iter().any(|id| id == cache_id))
+            {
+                B::retire_graphs_for_storage_mutation(&mut frame.context)
+                    .unwrap_or_else(|error| std::panic::panic_any(error));
+                model.clear_graph_bookkeeping();
+            }
             if let Some(caches) = model.kv_caches.get_mut(cache_id) {
                 for cache in caches {
                     if new_len < K::len(cache) {
@@ -445,7 +454,9 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
                 }
             }
             model.graph_warmup = 0;
-            model.graph_capture_failed = false;
+            if model.single_graph_cache_id.is_none() {
+                model.graph_capture_failed = false;
+            }
         })
         .into_legacy_result();
     }
@@ -477,6 +488,7 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
             B::retire_graphs_for_storage_mutation(&mut frame.context)
                 .unwrap_or_else(|error| std::panic::panic_any(error));
             model.graph_warmup = 0;
+            model.single_graph_cache_id = None;
             model.graph_capture_failed = false;
             model.batched_graph_keys_seen.clear();
             model.batched_graph_warmup = 0;

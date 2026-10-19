@@ -42,14 +42,35 @@ pub trait BackendGraph: Backend {
 
     /// Begin stream capture. Subsequent kernel launches are recorded into
     /// a pending graph instead of executing eagerly.
-    fn begin_graph_capture(_ctx: &mut Self::Context) -> Result<()> {
+    ///
+    /// # Safety
+    /// The caller owns the capture closure: every referenced device/host buffer,
+    /// weight, library and callback dependency must remain valid and bound to
+    /// this context until all cached graphs and in-flight replays actually retire.
+    /// Stream completion alone does not retire a cached graph. No pointer owner
+    /// may be replaced or dropped before `retire_graphs_for_storage_mutation`
+    /// succeeds. An encoding failure must cancel capture and observe completion;
+    /// Unresolved or cleanup failure retains the entire original closure.
+    ///
+    /// ```compile_fail,E0133
+    /// use ferrum_kernels::backend::BackendGraph;
+    /// fn capture<B: BackendGraph>(ctx: &mut B::Context) {
+    ///     B::begin_graph_capture(ctx).unwrap();
+    /// }
+    /// ```
+    unsafe fn begin_graph_capture(_ctx: &mut Self::Context) -> Result<()> {
         Err(FerrumError::unsupported("graph capture not supported"))
     }
 
     /// End stream capture and install the captured graph keyed by
     /// `_key` (opaque caller-chosen u64; the model uses `m_padded` so
     /// that different batch shapes don't thrash a single slot).
-    fn end_graph_capture(_ctx: &mut Self::Context, _key: u64) -> Result<()> {
+    ///
+    /// # Safety
+    /// Preserve the complete dependency closure promised to `begin_graph_capture`
+    /// for this key, including future replays. The graph handle does not acquire
+    /// ownership of arbitrary buffers passed to backend operations.
+    unsafe fn end_graph_capture(_ctx: &mut Self::Context, _key: u64) -> Result<()> {
         Err(FerrumError::unsupported("graph capture not supported"))
     }
 
@@ -69,7 +90,13 @@ pub trait BackendGraph: Backend {
 
     /// Replay the captured graph for `_key`. Returns `Ok(false)` if no
     /// graph is cached for that key; caller should run eager.
-    fn replay_graph(_ctx: &mut Self::Context, _key: u64) -> Result<bool> {
+    ///
+    /// # Safety
+    /// The captured dependency closure must still be owned, at the same addresses
+    /// and with the same layouts, and serialized on its original context. Retain
+    /// it through actual completion and graph retirement, including errors. A key
+    /// cache hit proves neither buffer identity nor buffer lifetime.
+    unsafe fn replay_graph(_ctx: &mut Self::Context, _key: u64) -> Result<bool> {
         Ok(false)
     }
 

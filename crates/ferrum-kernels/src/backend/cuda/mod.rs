@@ -184,33 +184,6 @@ pub struct CudaState {
     use_dev_state: bool,
     capture_in_flight: bool,
     completion_observed: bool,
-    /// Stable scratch buffers for batched-decode kernels that take per-item
-    /// device-pointer arrays (flash_attn_batched, kv_cache_append_batched).
-    /// Per-call `alloc_zeros::<T>(m)` was 3 allocs × 32 layers × 3 ops
-    /// = ~96 allocs/token. Caching here saves the allocator overhead AND
-    /// keeps the buffer addresses stable across calls — required so a
-    /// future CUDA-graph capture can replay over them.
-    /// Allocated lazily to `BATCHED_SCRATCH_CAP` (covers max_seqs ≤ 64).
-    batched_scratch_u64_k: Option<CudaSlice<u64>>,
-    batched_scratch_u64_v: Option<CudaSlice<u64>>,
-    batched_scratch_u64_cache: Option<CudaSlice<u64>>,
-    batched_scratch_i32_kv_lens: Option<CudaSlice<i32>>,
-    batched_scratch_i32_cache_lens: Option<CudaSlice<i32>>,
-    /// Stable HOST-side staging buffers for the per-item u64/i32 arrays
-    /// fed into the device-side scratch via `stream.memcpy_htod`. The
-    /// memcpy is async and gets recorded in any active CUDA-graph
-    /// capture, which captures the HOST POINTER. If we used a local
-    /// Vec, that Vec drops at function return → captured graph holds a
-    /// dangling host pointer → replay reads garbage → MISALIGNED at
-    /// later kernel. Owning these on the long-lived CudaState keeps
-    /// the host pointers stable, and clearing+re-filling between calls
-    /// updates the contents the captured memcpy reads on each replay.
-    /// Fixed-size arrays (not Vec) avoid the realloc-invalidates-ptr trap.
-    batched_host_k_ptrs: Box<[u64; HOST_STAGING_TOTAL]>,
-    batched_host_v_ptrs: Box<[u64; HOST_STAGING_TOTAL]>,
-    batched_host_cache_ptrs: Box<[u64; HOST_STAGING_TOTAL]>,
-    batched_host_kv_lens: Box<[i32; HOST_STAGING_TOTAL]>,
-    batched_host_cache_lens: Box<[i32; HOST_STAGING_TOTAL]>,
     /// Stream pool for parallel MoE expert dispatch. At c=32 with 128
     /// active experts, ~256 sequential Marlin GEMMs/layer hit launch +
     /// SM-allocation serialization. Round-robin across N streams lets
@@ -551,16 +524,6 @@ impl Backend for CudaBackend {
             use_dev_state: false,
             capture_in_flight: false,
             completion_observed: false,
-            batched_scratch_u64_k: None,
-            batched_scratch_u64_v: None,
-            batched_scratch_u64_cache: None,
-            batched_scratch_i32_kv_lens: None,
-            batched_scratch_i32_cache_lens: None,
-            batched_host_k_ptrs: Box::new([0u64; HOST_STAGING_TOTAL]),
-            batched_host_v_ptrs: Box::new([0u64; HOST_STAGING_TOTAL]),
-            batched_host_cache_ptrs: Box::new([0u64; HOST_STAGING_TOTAL]),
-            batched_host_kv_lens: Box::new([0i32; HOST_STAGING_TOTAL]),
-            batched_host_cache_lens: Box::new([0i32; HOST_STAGING_TOTAL]),
             moe_streams: None,
             moe_entry_event: None,
             moe_exit_events: None,
@@ -609,6 +572,12 @@ impl Backend for CudaBackend {
     }
 
     fn supports_device_ordinal() -> bool {
+        true
+    }
+
+    // This opts into retained-context lifecycle handling. Numerical/provider
+    // qualification remains specific to the selected model and CUDA route.
+    fn supports_retained_execution() -> bool {
         true
     }
 
@@ -2848,7 +2817,21 @@ impl Backend for CudaBackend {
         } else {
             max_valid_kv
         };
-        let shared_bytes = (active_kv.min(capacity).max(1) as u32) * 4;
+        let shared_bytes = active_kv
+            .min(capacity)
+            .max(1)
+            .checked_mul(4)
+            .and_then(|bytes| i32::try_from(bytes).ok())
+            .ok_or_else(|| FerrumError::model("batched attention shared-memory size overflow"))?;
+        if shared_bytes > 48 * 1024 {
+            func.set_attribute(
+                cudarc::driver::sys::CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                shared_bytes,
+            ).map_err(|error| FerrumError::model(format!(
+                "batched attention shared-memory capacity: {error}"
+            )))?;
+        }
+        let shared_bytes = shared_bytes as u32;
         with_batched_scratch_mut(&mut ctx.batched_scratch, |slot_g| {
             for i in 0..m {
                 let (kp, _) = k_caches[i].as_f16().device_ptr(&stream);

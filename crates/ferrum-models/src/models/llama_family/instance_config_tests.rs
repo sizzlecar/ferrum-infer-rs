@@ -49,21 +49,26 @@ impl WeightLoader<CpuBackend> for FirstLoadLoader<'_> {
         &self,
         ctx: &mut <CpuBackend as ferrum_kernels::backend::Backend>::Context,
         name: &str,
-    ) -> Result<Box<dyn Linear<CpuBackend>>> {
-        self.on_load(ctx);
-        let rows = if name.ends_with("qkv_proj") {
-            3
-        } else if name.ends_with("gate_up_proj") {
-            2
-        } else {
-            1
-        };
-        Ok(Box::new(DenseLinear::<CpuBackend>::from_rows_in_context(
-            ctx,
-            &vec![1.0; rows],
-            rows,
-            1,
-        )))
+    ) -> Result<ferrum_kernels::LoadedLinear<CpuBackend>> {
+        let linear = (|| -> Result<Box<dyn Linear<CpuBackend>>> {
+            self.on_load(ctx);
+            let rows = if name.ends_with("qkv_proj") {
+                3
+            } else if name.ends_with("gate_up_proj") {
+                2
+            } else {
+                1
+            };
+            Ok(Box::new(DenseLinear::<CpuBackend>::from_rows_in_context(
+                ctx,
+                &vec![1.0; rows],
+                rows,
+                1,
+            )))
+        })()?;
+        // SAFETY: these built-in projections own their weights and encode only
+        // backend work; the model retains them until checked graph retirement.
+        Ok(unsafe { ferrum_kernels::LoadedLinear::new_capture_stable(linear) })
     }
 
     fn has_tensor(&self, _name: &str) -> bool {

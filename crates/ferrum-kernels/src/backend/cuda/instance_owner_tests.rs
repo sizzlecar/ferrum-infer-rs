@@ -52,9 +52,9 @@ impl Projection {
         self.encode(context);
         complete(context);
         CudaBackend::begin_execution(context).unwrap();
-        CudaBackend::begin_graph_capture(context).unwrap();
+        unsafe { CudaBackend::begin_graph_capture(context) }.unwrap();
         self.encode(context);
-        CudaBackend::end_graph_capture(context, key).unwrap();
+        unsafe { CudaBackend::end_graph_capture(context, key) }.unwrap();
         complete(context);
     }
 
@@ -65,7 +65,7 @@ impl Projection {
             &mut self.output,
             &vec![f32::NAN; self.expected.len()],
         );
-        let hit = CudaBackend::replay_graph(context, key).unwrap();
+        let hit = unsafe { CudaBackend::replay_graph(context, key) }.unwrap();
         complete(context);
         assert!(hit, "the original captured executable must remain cached");
         let actual = CudaBackend::to_vec_in_context(context, &self.output, self.expected.len());
@@ -133,7 +133,7 @@ fn equal_graph_keys_remain_owned_across_peer_reset_and_retirement() {
 
     CudaBackend::begin_execution(&mut second).unwrap();
     CudaBackend::reset_graph(&mut second, KEY);
-    let removed = !CudaBackend::replay_graph(&mut second, KEY).unwrap();
+    let removed = !unsafe { CudaBackend::replay_graph(&mut second, KEY) }.unwrap();
     complete(&mut second);
     assert!(removed);
     a.replay_and_check(&mut first, KEY);
@@ -141,7 +141,7 @@ fn equal_graph_keys_remain_owned_across_peer_reset_and_retirement() {
     b.capture(&mut second, KEY);
     CudaBackend::begin_execution(&mut second).unwrap();
     CudaBackend::reset_all_graphs(&mut second);
-    let removed = !CudaBackend::replay_graph(&mut second, KEY).unwrap();
+    let removed = !unsafe { CudaBackend::replay_graph(&mut second, KEY) }.unwrap();
     complete(&mut second);
     assert!(removed);
     a.replay_and_check(&mut first, KEY);

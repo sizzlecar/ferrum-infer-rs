@@ -168,11 +168,11 @@ fn qkv_capture_reuses_original_scratch_and_replays_after_eager_growth() {
     let original = fixture.pointers();
     CudaBackend::set_decode_state(&mut fixture.ctx, 0, 1);
     CudaBackend::set_dev_state_mode(&mut fixture.ctx, true);
-    CudaBackend::begin_graph_capture(&mut fixture.ctx).unwrap();
+    unsafe { CudaBackend::begin_graph_capture(&mut fixture.ctx) }.unwrap();
     fixture.encode(1);
     assert_eq!(fixture.pointers(), original);
-    CudaBackend::end_graph_capture(&mut fixture.ctx, 71).unwrap();
-    assert!(CudaBackend::replay_graph(&mut fixture.ctx, 71).unwrap());
+    unsafe { CudaBackend::end_graph_capture(&mut fixture.ctx, 71) }.unwrap();
+    assert!(unsafe { CudaBackend::replay_graph(&mut fixture.ctx, 71) }.unwrap());
     fixture.check(1, 1);
 
     // Growing eager scratch cannot release the addresses captured by key 71.
@@ -181,7 +181,7 @@ fn qkv_capture_reuses_original_scratch_and_replays_after_eager_growth() {
     assert_ne!(fixture.pointers(), original);
     assert_eq!(fixture.ctx.captured_storage.len(), 3);
     CudaBackend::set_decode_state(&mut fixture.ctx, 0, 2);
-    assert!(CudaBackend::replay_graph(&mut fixture.ctx, 71).unwrap());
+    assert!(unsafe { CudaBackend::replay_graph(&mut fixture.ctx, 71) }.unwrap());
     fixture.check(1, 2);
     assert_eq!(fixture.ctx.captured_storage.len(), 3);
     CudaBackend::reset_graph(&mut fixture.ctx, 71);
@@ -202,7 +202,7 @@ fn qkv_unprepared_capture_failure_discards_prefix_and_reuses_original_context() 
     CudaBackend::observe_completion(&mut fixture.ctx)
         .into_result()
         .unwrap();
-    CudaBackend::begin_graph_capture(&mut fixture.ctx).unwrap();
+    unsafe { CudaBackend::begin_graph_capture(&mut fixture.ctx) }.unwrap();
     CudaBackend::zero_buffer(&mut fixture.ctx, &mut fixture.q, Q_HEADS * HEAD_DIM).unwrap();
     let failure = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| fixture.encode(1)));
     assert!(failure.is_err());
@@ -234,7 +234,7 @@ fn invalidated_capture_is_confirmed_ended_before_original_context_reuse() {
     let mut fixture = Fixture::new();
     fixture.encode(1);
     fixture.check(1, 1);
-    CudaBackend::begin_graph_capture(&mut fixture.ctx).unwrap();
+    unsafe { CudaBackend::begin_graph_capture(&mut fixture.ctx) }.unwrap();
     fixture.encode(1);
     // Synchronizing a capturing stream is a real prohibited CUDA operation,
     // invalidating this capture. Do not fabricate the driver error/status.

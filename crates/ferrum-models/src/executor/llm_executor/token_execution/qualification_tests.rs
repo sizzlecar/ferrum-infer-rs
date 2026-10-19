@@ -154,6 +154,14 @@ async fn qualified_completion<B: MoeLlmBackend>(
     device: Device,
 ) {
     let executor = fixture::<B>(paged, mode, device);
+    drop(qualified_completion_with_executor(executor, paged, mode).await);
+}
+
+async fn qualified_completion_with_executor(
+    executor: LlmExecutor,
+    paged: bool,
+    mode: ModelTokenExecutionMode,
+) -> LlmExecutor {
     let mut reference = real_model::<CpuBackend>(false);
     let request = RequestId::new();
     let initial = admit(&executor, &request).await;
@@ -274,6 +282,7 @@ async fn qualified_completion<B: MoeLlmBackend>(
     reference.release("reference");
     reference.release("fresh");
     reference.close().unwrap();
+    executor
 }
 
 #[tokio::test]
@@ -417,7 +426,7 @@ async fn qualification_unwrapped_metal_cancelled_delivery_closes_original_and_ke
 mod encoded_failure {
     use super::*;
     use ferrum_kernels::backend::{metal::MetalBackend, Backend};
-    use ferrum_kernels::{Linear, LinearMetadata};
+    use ferrum_kernels::{Linear, LinearMetadata, LoadedLinear};
     use ferrum_quantization::{QuantConfig, WeightLoader};
     use std::sync::atomic::{AtomicBool, AtomicUsize};
 
@@ -479,17 +488,19 @@ mod encoded_failure {
             &self,
             ctx: &mut <MetalBackend as Backend>::Context,
             name: &str,
-        ) -> Result<Box<dyn Linear<MetalBackend>>> {
+        ) -> Result<LoadedLinear<MetalBackend>> {
             let inner = <SyntheticLlamaLoader as WeightLoader<MetalBackend>>::load_linear(
                 &self.inner,
                 ctx,
                 name,
             )?;
             if name == "lm_head" {
-                Ok(Box::new(FaultingHead {
-                    inner,
+                // Graph replay would skip this per-execution host fault.
+                // Decorating the mathematical projection drops its graph qualification.
+                Ok(LoadedLinear::new(Box::new(FaultingHead {
+                    inner: inner.into_eager_box(),
                     failure: Arc::clone(&self.failure),
-                }))
+                })))
             } else {
                 Ok(inner)
             }
@@ -743,3 +754,6 @@ async fn qualification_unwrapped_metal_backbone_and_partial_stage_remain_unsuppo
             .is_none());
     }
 }
+
+#[cfg(feature = "cuda")]
+mod cuda;

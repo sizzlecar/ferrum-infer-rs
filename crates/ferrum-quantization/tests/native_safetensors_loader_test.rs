@@ -250,7 +250,7 @@ fn cuda_invalid_fused_bias_does_not_enter_device_allocation() {
         .into_result()
         .unwrap();
     CudaBackend::begin_execution(&mut context).unwrap();
-    CudaBackend::begin_graph_capture(&mut context).unwrap();
+    unsafe { CudaBackend::begin_graph_capture(&mut context) }.unwrap();
     CudaBackend::zero_buffer(&mut context, &mut capture_output, 1).unwrap();
     // The instance allocation path rejects allocation during capture. A
     // malformed host bias must return its validation error without entering
@@ -270,7 +270,7 @@ fn cuda_invalid_fused_bias_does_not_enter_device_allocation() {
         }
         errors
     }));
-    CudaBackend::end_graph_capture(&mut context, 0).unwrap();
+    unsafe { CudaBackend::end_graph_capture(&mut context, 0) }.unwrap();
     assert!(matches!(
         CudaBackend::observe_completion(&mut context),
         BackendCompletion::Succeeded

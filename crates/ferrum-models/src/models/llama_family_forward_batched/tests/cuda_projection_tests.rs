@@ -107,17 +107,21 @@ impl WeightLoader<CudaBackend> for TappedLoader {
         <SyntheticLlamaLoader as WeightLoader<CudaBackend>>::load_tensor(&self.inner, ctx, name)
     }
 
-    fn load_linear(&self, ctx: &mut Context, name: &str) -> Result<Box<dyn Linear<CudaBackend>>> {
+    fn load_linear(
+        &self,
+        ctx: &mut Context,
+        name: &str,
+    ) -> Result<ferrum_kernels::LoadedLinear<CudaBackend>> {
         let inner = <SyntheticLlamaLoader as WeightLoader<CudaBackend>>::load_linear(
             &self.inner,
             ctx,
             name,
         )?;
-        Ok(Box::new(TappedLinear {
-            inner,
+        Ok(ferrum_kernels::LoadedLinear::new(Box::new(TappedLinear {
+            inner: inner.into_eager_box(),
             name: name.to_owned(),
             trace: Arc::clone(&self.trace),
-        }))
+        })))
     }
 
     fn has_tensor(&self, name: &str) -> bool {

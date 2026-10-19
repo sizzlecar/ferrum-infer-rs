@@ -28,7 +28,7 @@ use cudarc::driver::{
 use ferrum_types::{FerrumError, Result};
 use half::f16;
 
-use super::{CudaBackend, CudaState, BATCHED_SCRATCH_CAP, HOST_STAGING_TOTAL};
+use super::{CudaBackend, CudaState, BATCHED_SCRATCH_CAP};
 use crate::backend::{Backend, BackendPagedKv};
 use crate::ptx;
 
@@ -726,98 +726,33 @@ impl BackendPagedKv for CudaBackend {
             ));
         }
 
+        if ctx.capture_in_flight {
+            return Err(FerrumError::backend(
+                "batched pointer preparation must precede capture",
+            ));
+        }
         let stream = ctx.stream.clone();
-        // Lazy-alloc all three device scratch buffers to HOST_STAGING_TOTAL
-        // u64 elements. Done outside any captured stream — sync allocs only.
-        if ctx.batched_scratch_u64_cache.is_none() {
-            ctx.batched_scratch_u64_cache = Some(
-                stream
-                    .alloc_zeros::<u64>(HOST_STAGING_TOTAL)
-                    .map_err(|e| FerrumError::model(format!("alloc cache_ptrs: {e}")))?,
-            );
-        }
-        if ctx.batched_scratch_u64_k.is_none() {
-            ctx.batched_scratch_u64_k = Some(
-                stream
-                    .alloc_zeros::<u64>(HOST_STAGING_TOTAL)
-                    .map_err(|e| FerrumError::model(format!("alloc k_ptrs: {e}")))?,
-            );
-        }
-        if ctx.batched_scratch_u64_v.is_none() {
-            ctx.batched_scratch_u64_v = Some(
-                stream
-                    .alloc_zeros::<u64>(HOST_STAGING_TOTAL)
-                    .map_err(|e| FerrumError::model(format!("alloc v_ptrs: {e}")))?,
-            );
-        }
-        // Fill host arrays at every slot we'll launch from. Layout:
-        //   K-append (kv_cache_append): slot = li → host_cache_ptrs[li * CAP ..]
-        //   V-append (kv_cache_append): slot = li + MAX_LAYERS_FOR_GRAPH
-        //   flash_attn:                 slot = li → host_k_ptrs / host_v_ptrs
-        for li in 0..num_layers {
-            let k_off = li * BATCHED_SCRATCH_CAP;
-            let v_off = (li + super::MAX_LAYERS_FOR_GRAPH) * BATCHED_SCRATCH_CAP;
-            for i in 0..m {
-                let (kp, _) = k_caches[li * m + i].as_f16().device_ptr(&stream);
-                let (vp, _) = v_caches[li * m + i].as_f16().device_ptr(&stream);
-                ctx.batched_host_cache_ptrs[k_off + i] = kp;
-                ctx.batched_host_cache_ptrs[v_off + i] = vp;
-                ctx.batched_host_k_ptrs[k_off + i] = kp;
-                ctx.batched_host_v_ptrs[k_off + i] = vp;
+        // These are the SAME original-context arrays consumed by append and
+        // attention nodes, with distinct slots for every layer and K/V role.
+        // Graph nodes upload them on each replay; no second device-table owner
+        // or temporary host allocation is introduced here.
+        super::with_batched_scratch_mut(&mut ctx.batched_scratch, |tables| {
+            for li in 0..num_layers {
+                let k_off = li * BATCHED_SCRATCH_CAP;
+                let v_off = (li + super::MAX_LAYERS_FOR_GRAPH) * BATCHED_SCRATCH_CAP;
+                for i in 0..m {
+                    let (kp, _) = k_caches[li * m + i].as_f16().device_ptr(&stream);
+                    let (vp, _) = v_caches[li * m + i].as_f16().device_ptr(&stream);
+                    tables.host_cache_ptrs[k_off + i] = kp;
+                    tables.host_cache_ptrs[v_off + i] = vp;
+                    tables.host_k_ptrs[k_off + i] = kp;
+                    tables.host_v_ptrs[k_off + i] = vp;
+                }
             }
-        }
-        // Bind context for sync memcpys (tokio thread-shift safe).
-        ctx.ctx
-            .bind_to_thread()
-            .map_err(|e| FerrumError::unsupported(format!("populate bind_to_thread: {e}")))?;
-
-        // Sync memcpy each entire host array to its device scratch in one shot.
-        // cuMemcpyHtoD_v2 is on the legacy default (null) stream → NOT
-        // captured by stream capture, so the captured graph contains
-        // only kernel launches. Device scratch is fresh before every
-        // call, including pure-replay (which doesn't re-enter Rust).
-        let total_bytes = HOST_STAGING_TOTAL * std::mem::size_of::<u64>();
-        unsafe {
-            use cudarc::driver::{sys, DevicePtrMut};
-            let scratch_cache = ctx.batched_scratch_u64_cache.as_mut().unwrap();
-            let (dst, _g) = scratch_cache.device_ptr_mut(&stream);
-            let st = sys::cuMemcpyHtoD_v2(
-                dst,
-                ctx.batched_host_cache_ptrs.as_ptr() as *const std::ffi::c_void,
-                total_bytes,
-            );
-            if st != sys::CUresult::CUDA_SUCCESS {
-                return Err(FerrumError::unsupported(format!(
-                    "populate cache_ptrs sync memcpy: {st:?}"
-                )));
-            }
-            let scratch_k = ctx.batched_scratch_u64_k.as_mut().unwrap();
-            let (dst, _g) = scratch_k.device_ptr_mut(&stream);
-            let st = sys::cuMemcpyHtoD_v2(
-                dst,
-                ctx.batched_host_k_ptrs.as_ptr() as *const std::ffi::c_void,
-                total_bytes,
-            );
-            if st != sys::CUresult::CUDA_SUCCESS {
-                return Err(FerrumError::unsupported(format!(
-                    "populate k_ptrs sync memcpy: {st:?}"
-                )));
-            }
-            let scratch_v = ctx.batched_scratch_u64_v.as_mut().unwrap();
-            let (dst, _g) = scratch_v.device_ptr_mut(&stream);
-            let st = sys::cuMemcpyHtoD_v2(
-                dst,
-                ctx.batched_host_v_ptrs.as_ptr() as *const std::ffi::c_void,
-                total_bytes,
-            );
-            if st != sys::CUresult::CUDA_SUCCESS {
-                return Err(FerrumError::unsupported(format!(
-                    "populate v_ptrs sync memcpy: {st:?}"
-                )));
-            }
-        }
+        });
         Ok(())
     }
+
     fn paged_varlen_attention(
         ctx: &mut Self::Context,
         q: &Self::Buffer,

@@ -288,7 +288,10 @@ fn lora_cuda_existing_base_graph_cannot_bypass_adapter() {
     // No CUDA, unsupported capture, or missing graph is a failure, not a skip.
     model
         .run_device_frame(|_, frame| {
-            assert!(CudaBackend::replay_graph(&mut frame.context, SINGLE_ITEM_GRAPH_KEY).unwrap());
+            assert!(unsafe {
+                CudaBackend::replay_graph(&mut frame.context, SINGLE_ITEM_GRAPH_KEY)
+            }
+            .unwrap());
             frame.completed = Some(super::device_execution::checked_sync::<CudaBackend>(
                 &mut frame.context,
             ));

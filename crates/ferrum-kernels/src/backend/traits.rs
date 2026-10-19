@@ -1736,20 +1736,15 @@ pub trait BackendPagedKv: Backend {
     fn supports_paged_kv() -> bool {
         false
     }
-    /// Pre-populate the per-slot device-pointer scratch arrays used by
-    /// the batched kernels (`kv_cache_append_batched_per_cache` and
-    /// `flash_attention_batched_per_cache`). Required by the CUDA-graph
-    /// capture path: the captured graph contains only kernel launches
-    /// (no captured `memcpy_htod`), so the device scratch must be fresh
-    /// when the graph replays.
-    ///
-    /// Caller passes flat layer-major slices: `k_caches[li * m + i]` and
-    /// `v_caches[li * m + i]`. Backend extracts each cache's device
-    /// pointer and writes into its corresponding slot in the device
-    /// scratch via SYNCHRONOUS memcpy (not captured by stream capture).
-    ///
-    /// CUDA-only; other backends fall through to the default
-    /// `unsupported` and the caller skips the population call.
+    /// Prepare the original context's per-layer pointer tables before graph
+    /// capture/replay. Flat inputs are layer-major: [layer * m + item].
+    /// Each layer and K/V role has its own persistent host region; captured
+    /// append/attention nodes upload those regions on replay. The caller must
+    /// refresh them for every invocation, including after other eager work used
+    /// the same context, and retain the referenced caches through retirement.
+    /// This host preparation must run outside capture. It does not submit work
+    /// or provide another completion/ownership authority.
+    /// Other backends may return Unsupported when no such graph route exists.
     fn populate_batched_pointers(
         _ctx: &mut Self::Context,
         _k_caches: &[&Self::Buffer],

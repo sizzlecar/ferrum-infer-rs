@@ -86,44 +86,53 @@ impl<'a, B: ferrum_kernels::backend::Backend> WeightLoader<B> for CandleShimLoad
         Ok(B::from_slice_in_context(ctx, &data))
     }
 
-    fn load_linear(&self, ctx: &mut B::Context, name: &str) -> Result<Box<dyn Linear<B>>> {
-        // Try direct fused `<name>.weight` first.
-        let direct = format!("{name}.weight");
-        if let Some((r, c, data)) = self.fetch_2d(&direct) {
-            return Ok(Box::new(DenseLinear::<B>::from_rows_in_context(
-                ctx, &data, r, c,
-            )));
-        }
-
-        // Fallback: Qwen3 0.6B (and Llama family) checkpoints store projections
-        // split as q/k/v and gate/up — fuse them by concatenating on dim 0.
-        if let Some(prefix) = name.strip_suffix("qkv_proj") {
-            let keys = vec![
-                format!("{prefix}q_proj.weight"),
-                format!("{prefix}k_proj.weight"),
-                format!("{prefix}v_proj.weight"),
-            ];
-            if let Some((r, c, data)) = self.fetch_2d_concat(&keys) {
+    fn load_linear(
+        &self,
+        ctx: &mut B::Context,
+        name: &str,
+    ) -> Result<ferrum_kernels::LoadedLinear<B>> {
+        let linear = (|| -> Result<Box<dyn Linear<B>>> {
+            // Try direct fused `<name>.weight` first.
+            let direct = format!("{name}.weight");
+            if let Some((r, c, data)) = self.fetch_2d(&direct) {
                 return Ok(Box::new(DenseLinear::<B>::from_rows_in_context(
                     ctx, &data, r, c,
                 )));
             }
-        }
-        if let Some(prefix) = name.strip_suffix("gate_up_proj") {
-            let keys = vec![
-                format!("{prefix}gate_proj.weight"),
-                format!("{prefix}up_proj.weight"),
-            ];
-            if let Some((r, c, data)) = self.fetch_2d_concat(&keys) {
-                return Ok(Box::new(DenseLinear::<B>::from_rows_in_context(
-                    ctx, &data, r, c,
-                )));
-            }
-        }
 
-        Err(FerrumError::model(format!(
-            "could not load linear '{name}' — no direct weight, no split components"
-        )))
+            // Fallback: Qwen3 0.6B (and Llama family) checkpoints store projections
+            // split as q/k/v and gate/up — fuse them by concatenating on dim 0.
+            if let Some(prefix) = name.strip_suffix("qkv_proj") {
+                let keys = vec![
+                    format!("{prefix}q_proj.weight"),
+                    format!("{prefix}k_proj.weight"),
+                    format!("{prefix}v_proj.weight"),
+                ];
+                if let Some((r, c, data)) = self.fetch_2d_concat(&keys) {
+                    return Ok(Box::new(DenseLinear::<B>::from_rows_in_context(
+                        ctx, &data, r, c,
+                    )));
+                }
+            }
+            if let Some(prefix) = name.strip_suffix("gate_up_proj") {
+                let keys = vec![
+                    format!("{prefix}gate_proj.weight"),
+                    format!("{prefix}up_proj.weight"),
+                ];
+                if let Some((r, c, data)) = self.fetch_2d_concat(&keys) {
+                    return Ok(Box::new(DenseLinear::<B>::from_rows_in_context(
+                        ctx, &data, r, c,
+                    )));
+                }
+            }
+
+            Err(FerrumError::model(format!(
+                "could not load linear '{name}' — no direct weight, no split components"
+            )))
+        })()?;
+        // SAFETY: these built-in projections own their weights and encode only
+        // backend work; the model retains them until checked graph retirement.
+        Ok(unsafe { ferrum_kernels::LoadedLinear::new_capture_stable(linear) })
     }
 
     fn has_tensor(&self, name: &str) -> bool {

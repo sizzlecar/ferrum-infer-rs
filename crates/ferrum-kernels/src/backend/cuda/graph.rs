@@ -112,7 +112,7 @@ impl BackendGraph for CudaBackend {
         ctx.use_dev_state = enable;
     }
 
-    fn begin_graph_capture(ctx: &mut Self::Context) -> Result<()> {
+    unsafe fn begin_graph_capture(ctx: &mut Self::Context) -> Result<()> {
         use cudarc::driver::sys::CUstreamCaptureMode;
         if ctx.completion_observed {
             ctx.graph_leases.retire_completed(&ctx.graph_cache)?;
@@ -133,7 +133,7 @@ impl BackendGraph for CudaBackend {
         Ok(())
     }
 
-    fn end_graph_capture(ctx: &mut Self::Context, key: u64) -> Result<()> {
+    unsafe fn end_graph_capture(ctx: &mut Self::Context, key: u64) -> Result<()> {
         use cudarc::driver::sys;
         if !ctx.capture_in_flight {
             return Err(FerrumError::unsupported("end_capture without begin"));
@@ -272,7 +272,7 @@ impl BackendGraph for CudaBackend {
         Ok(())
     }
 
-    fn replay_graph(ctx: &mut Self::Context, key: u64) -> Result<bool> {
+    unsafe fn replay_graph(ctx: &mut Self::Context, key: u64) -> Result<bool> {
         use cudarc::driver::sys;
         if ctx.completion_observed {
             ctx.graph_leases.retire_completed(&ctx.graph_cache)?;
@@ -494,25 +494,25 @@ mod tests {
         let mut ctx =
             CudaBackend::new_context(&ferrum_types::BackendContextConfig::default()).unwrap();
         let mut buffer = CudaBackend::from_slice_in_context(&mut ctx, &[1.0, 2.0, 3.0, 4.0]);
-        CudaBackend::begin_graph_capture(&mut ctx).unwrap();
+        unsafe { CudaBackend::begin_graph_capture(&mut ctx) }.unwrap();
         CudaBackend::zero_buffer(&mut ctx, &mut buffer, 4).unwrap();
-        CudaBackend::end_graph_capture(&mut ctx, key).unwrap();
+        unsafe { CudaBackend::end_graph_capture(&mut ctx, key) }.unwrap();
         let peer_key = key.wrapping_add(1);
-        CudaBackend::begin_graph_capture(&mut ctx).unwrap();
+        unsafe { CudaBackend::begin_graph_capture(&mut ctx) }.unwrap();
         CudaBackend::zero_buffer(&mut ctx, &mut buffer, 4).unwrap();
-        CudaBackend::end_graph_capture(&mut ctx, peer_key).unwrap();
+        unsafe { CudaBackend::end_graph_capture(&mut ctx, peer_key) }.unwrap();
         assert!(matches!(
             CudaBackend::observe_completion(&mut ctx),
             crate::backend::BackendCompletion::Succeeded
         ));
-        assert!(CudaBackend::replay_graph(&mut ctx, key).unwrap());
+        assert!(unsafe { CudaBackend::replay_graph(&mut ctx, key) }.unwrap());
         let exact_graph = Arc::downgrade(ctx.graph_leases.first.as_ref().unwrap());
         CudaBackend::reset_graph(&mut ctx, key);
         assert!(exact_graph.upgrade().is_some());
         // The public graph API must invalidate the prior observation even
         // without an explicit begin_execution. Replaying another key cannot
         // retire A using the observation from before A's latest submission.
-        assert!(CudaBackend::replay_graph(&mut ctx, peer_key).unwrap());
+        assert!(unsafe { CudaBackend::replay_graph(&mut ctx, peer_key) }.unwrap());
         assert!(exact_graph.upgrade().is_some());
         assert!(matches!(
             CudaBackend::observe_completion(&mut ctx),
@@ -523,6 +523,7 @@ mod tests {
             CudaBackend::to_vec_in_context(&mut ctx, &buffer, 4),
             vec![0.0; 4]
         );
+        CudaBackend::retire_context(&mut ctx).unwrap();
     }
 
     #[test]
@@ -550,11 +551,11 @@ mod tests {
             .into_result()
             .unwrap();
         CudaBackend::begin_execution(&mut ctx).unwrap();
-        CudaBackend::begin_graph_capture(&mut ctx).unwrap();
+        unsafe { CudaBackend::begin_graph_capture(&mut ctx) }.unwrap();
         stream
             .memcpy_dtod(&ctx.argmax_out.as_ref().unwrap().slice(..4), &mut output)
             .unwrap();
-        CudaBackend::end_graph_capture(&mut ctx, 37).unwrap();
+        unsafe { CudaBackend::end_graph_capture(&mut ctx, 37) }.unwrap();
         CudaBackend::observe_completion(&mut ctx)
             .into_result()
             .unwrap();
@@ -568,7 +569,7 @@ mod tests {
             |scratch| stream.memset_zeros(scratch).unwrap(),
         );
         assert_eq!(ctx.captured_storage.len(), 1);
-        assert!(CudaBackend::replay_graph(&mut ctx, 37).unwrap());
+        assert!(unsafe { CudaBackend::replay_graph(&mut ctx, 37) }.unwrap());
         CudaBackend::observe_completion(&mut ctx)
             .into_result()
             .unwrap();
@@ -576,7 +577,7 @@ mod tests {
         // Completion alone cannot release storage referenced by a cached graph.
         assert_eq!(ctx.captured_storage.len(), 1);
 
-        assert!(CudaBackend::replay_graph(&mut ctx, 37).unwrap());
+        assert!(unsafe { CudaBackend::replay_graph(&mut ctx, 37) }.unwrap());
         CudaBackend::reset_graph(&mut ctx, 37);
         // Eviction alone cannot release the original in-flight resources.
         assert_eq!(ctx.captured_storage.len(), 1);
@@ -595,10 +596,10 @@ mod tests {
         let mut ctx =
             CudaBackend::new_context(&ferrum_types::BackendContextConfig::default()).unwrap();
         let mut buffer = CudaBackend::from_slice_in_context(&mut ctx, &[3.0, 5.0, 7.0, 9.0]);
-        CudaBackend::begin_graph_capture(&mut ctx).unwrap();
+        unsafe { CudaBackend::begin_graph_capture(&mut ctx) }.unwrap();
         CudaBackend::zero_buffer(&mut ctx, &mut buffer, 4).unwrap();
-        CudaBackend::end_graph_capture(&mut ctx, 41).unwrap();
-        assert!(CudaBackend::replay_graph(&mut ctx, 41).unwrap());
+        unsafe { CudaBackend::end_graph_capture(&mut ctx, 41) }.unwrap();
+        assert!(unsafe { CudaBackend::replay_graph(&mut ctx, 41) }.unwrap());
         CudaBackend::observe_completion(&mut ctx)
             .into_result()
             .unwrap();
@@ -670,10 +671,10 @@ mod tests {
             let mut ctx =
                 CudaBackend::new_context(&ferrum_types::BackendContextConfig::default()).unwrap();
             let mut buffer = CudaBackend::from_slice_in_context(&mut ctx, &[1.0; 4]);
-            CudaBackend::begin_graph_capture(&mut ctx).unwrap();
+            unsafe { CudaBackend::begin_graph_capture(&mut ctx) }.unwrap();
             CudaBackend::zero_buffer(&mut ctx, &mut buffer, 4).unwrap();
-            CudaBackend::end_graph_capture(&mut ctx, 43).unwrap();
-            assert!(CudaBackend::replay_graph(&mut ctx, 43).unwrap());
+            unsafe { CudaBackend::end_graph_capture(&mut ctx, 43) }.unwrap();
+            assert!(unsafe { CudaBackend::replay_graph(&mut ctx, 43) }.unwrap());
             CudaBackend::observe_completion(&mut ctx)
                 .into_result()
                 .unwrap();

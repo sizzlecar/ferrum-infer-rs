@@ -198,6 +198,7 @@ impl<'a, B: Backend> Qwen35WeightPlanLoader<'a, B> {
         let tensor = self.required_global_tensor(role)?;
         self.inner
             .load_linear(ctx, &linear_module_name(&tensor.name))
+            .map(ferrum_kernels::LoadedLinear::into_eager_box)
     }
 
     pub fn load_layer_linear(
@@ -209,6 +210,7 @@ impl<'a, B: Backend> Qwen35WeightPlanLoader<'a, B> {
         let tensor = self.required_layer_tensor(layer_index, role)?;
         self.inner
             .load_linear(ctx, &linear_module_name(&tensor.name))
+            .map(ferrum_kernels::LoadedLinear::into_eager_box)
     }
 
     pub fn load_layer_dense_gate_up_linear(
@@ -236,6 +238,7 @@ impl<'a, B: Backend> Qwen35WeightPlanLoader<'a, B> {
 
         self.inner
             .load_linear(ctx, &format!("{prefix}gate_up_proj"))
+            .map(ferrum_kernels::LoadedLinear::into_eager_box)
     }
 
     pub fn load_layer_shared_expert_gate_up_linear(
@@ -263,6 +266,7 @@ impl<'a, B: Backend> Qwen35WeightPlanLoader<'a, B> {
 
         self.inner
             .load_linear(ctx, &format!("{prefix}gate_up_proj"))
+            .map(ferrum_kernels::LoadedLinear::into_eager_box)
     }
 
     pub fn load_layer_linear_attention_qkvz(
@@ -373,6 +377,7 @@ impl<'a, B: Backend> Qwen35WeightPlanLoader<'a, B> {
 
         self.inner
             .load_linear(ctx, &format!("{prefix}{fused_suffix}"))
+            .map(ferrum_kernels::LoadedLinear::into_eager_box)
     }
 }
 
@@ -1097,14 +1102,19 @@ mod tests {
             &self,
             ctx: &mut <CpuBackend as ferrum_kernels::backend::Backend>::Context,
             name: &str,
-        ) -> FerrumResult<Box<dyn ferrum_quantization::Linear<CpuBackend>>> {
-            self.linear_names.lock().unwrap().push(name.to_string());
-            Ok(Box::new(DenseLinear::<CpuBackend>::from_rows_in_context(
-                ctx,
-                &[0.0, 0.0],
-                1,
-                2,
-            )))
+        ) -> FerrumResult<ferrum_kernels::LoadedLinear<CpuBackend>> {
+            let linear = (|| -> FerrumResult<Box<dyn ferrum_quantization::Linear<CpuBackend>>> {
+                self.linear_names.lock().unwrap().push(name.to_string());
+                Ok(Box::new(DenseLinear::<CpuBackend>::from_rows_in_context(
+                    ctx,
+                    &[0.0, 0.0],
+                    1,
+                    2,
+                )))
+            })()?;
+            // SAFETY: these built-in projections own their weights and encode only
+            // backend work; the model retains them until checked graph retirement.
+            Ok(unsafe { ferrum_kernels::LoadedLinear::new_capture_stable(linear) })
         }
 
         fn has_tensor(&self, name: &str) -> bool {

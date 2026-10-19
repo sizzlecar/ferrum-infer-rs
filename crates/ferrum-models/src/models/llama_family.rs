@@ -30,11 +30,11 @@ use ferrum_kernels::backend::{
 };
 
 /// Graph cache key for the single-item decode path (`decode_internal`).
-/// Distinct from any `m_padded`-based key used by the batched path.
+/// Distinct from the nonzero native IDs allocated by the batched path.
 pub(crate) const SINGLE_ITEM_GRAPH_KEY: u64 = 0;
 const LLAMA_PAGED_BLOCK_SIZE: usize = 16;
 
-use ferrum_quantization::{Linear, WeightLoader};
+use ferrum_quantization::WeightLoader;
 use ferrum_types::{Activation, Result};
 
 use crate::common::{DecoderOnlyLLM, LlmRuntimeConfig};
@@ -700,15 +700,15 @@ fn json_f64(value: Option<&serde_json::Value>) -> Option<f64> {
     }
 }
 
-/// Per-layer weights. `Box<dyn Linear<B>>` means each projection can be
+/// Per-layer weights. `ferrum_kernels::LoadedLinear<B>` means each projection can be
 /// Dense / GPTQ / AWQ / GGUF without the surrounding code caring.
 pub struct LlamaFamilyLayer<B: QuantLlmBackend + BackendMoeFused> {
     pub input_ln_w: B::Buffer,
-    pub qkv_proj: Box<dyn Linear<B>>,
+    pub qkv_proj: ferrum_kernels::LoadedLinear<B>,
     /// QK-norm weight per head: `[head_dim]`. Optional for non-Qwen3 derivatives.
     pub q_norm_w: Option<B::Buffer>,
     pub k_norm_w: Option<B::Buffer>,
-    pub o_proj: Box<dyn Linear<B>>,
+    pub o_proj: ferrum_kernels::LoadedLinear<B>,
     /// Pre-MLP norm. Llama naming: `post_attention_layernorm`; Gemma 3
     /// sandwich naming: `pre_feedforward_layernorm`.
     pub post_ln_w: B::Buffer,
@@ -718,8 +718,8 @@ pub struct LlamaFamilyLayer<B: QuantLlmBackend + BackendMoeFused> {
     /// Gemma 3 sandwich: norm applied to the MLP output before the
     /// residual add (`post_feedforward_layernorm`).
     pub post_ffn_ln_w: Option<B::Buffer>,
-    pub gate_up_proj: Box<dyn Linear<B>>,
-    pub down_proj: Box<dyn Linear<B>>,
+    pub gate_up_proj: ferrum_kernels::LoadedLinear<B>,
+    pub down_proj: ferrum_kernels::LoadedLinear<B>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -763,13 +763,13 @@ impl LlamaFamilyLayerStageConfig {
 // payloads so observation precedes their destruction, including unwinding.
 struct LayerConstruction<B: MoeLlmBackend> {
     input_ln_w: Option<B::Buffer>,
-    qkv_proj: Option<Box<dyn Linear<B>>>,
-    o_proj: Option<Box<dyn Linear<B>>>,
+    qkv_proj: Option<ferrum_kernels::LoadedLinear<B>>,
+    o_proj: Option<ferrum_kernels::LoadedLinear<B>>,
     post_ln_w: Option<B::Buffer>,
     post_attn_ln_w: Option<B::Buffer>,
     post_ffn_ln_w: Option<B::Buffer>,
-    gate_up_proj: Option<Box<dyn Linear<B>>>,
-    down_proj: Option<Box<dyn Linear<B>>>,
+    gate_up_proj: Option<ferrum_kernels::LoadedLinear<B>>,
+    down_proj: Option<ferrum_kernels::LoadedLinear<B>>,
     q_norm_w: Option<B::Buffer>,
     k_norm_w: Option<B::Buffer>,
 }
@@ -780,7 +780,7 @@ struct ModelConstruction<B: MoeLlmBackend> {
     scratch: Option<LlamaFamilyScratch<B>>,
     embed: Option<B::Buffer>,
     layers: Option<Vec<LlamaFamilyLayer<B>>>,
-    lm_head: Option<Box<dyn Linear<B>>>,
+    lm_head: Option<ferrum_kernels::LoadedLinear<B>>,
     final_norm: Option<B::Buffer>,
     final_norm_w: Option<B::Buffer>,
 }
@@ -930,7 +930,7 @@ fn load_llama_family_lm_head<B: MoeLlmBackend>(
     ctx: &mut B::Context,
     cfg: &LlamaFamilyConfig,
     loader: &dyn WeightLoader<B>,
-) -> Result<Box<dyn Linear<B>>> {
+) -> Result<ferrum_kernels::LoadedLinear<B>> {
     // LM head: either dedicated `lm_head.weight` or tied to embedding.
     // Many models (Qwen3-4B, Llama-3.2-1B, some Qwen2.5) use TIED
     // embeddings — lm_head shares weights with model.embed_tokens. When
@@ -1226,6 +1226,8 @@ pub struct LlamaFamilyScratch<B: QuantLlmBackend + BackendMoeFused> {
     /// Stacked per-seq context lengths for batched paged dispatch
     /// (`[max_M]` u32).
     pub paged_batch_context_lens: Option<B::Buffer>,
+    /// Graph-only cumulative query rows [0, 1, ..., M], owned by original scratch.
+    pub(crate) paged_batch_cu_seqlens: Option<B::Buffer>,
     /// `max_blocks_per_seq` value baked into the stacked block_tables
     /// stride. Set when `paged_batch_block_tables` is allocated.
     pub paged_max_blocks_per_seq: usize,
@@ -1369,6 +1371,7 @@ impl<B: QuantLlmBackend + BackendMoeFused> LlamaFamilyScratch<B> {
             paged_batch_o: None,
             paged_batch_block_tables: None,
             paged_batch_context_lens: None,
+            paged_batch_cu_seqlens: None,
             paged_max_blocks_per_seq: 0,
             paged_max_seqs: 0,
             batch_positions: alloc_model_typed_buffer::<B>(
@@ -1657,6 +1660,16 @@ impl<B: QuantLlmBackend + BackendMoeFused> LlamaFamilyScratch<B> {
         true
     }
 
+    pub(crate) fn ensure_paged_decode_graph_metadata(&mut self, ctx: &mut B::Context) {
+        if self.paged_batch_cu_seqlens.is_none() {
+            self.paged_batch_cu_seqlens = Some(alloc_model_typed_buffer::<B>(
+                ctx,
+                ferrum_kernels::backend::Dtype::U32,
+                self.paged_max_seqs + 1,
+            ));
+        }
+    }
+
     /// Allocate scratch for batched paged dispatch (Phase 4b). Called
     /// lazily from `ensure_kv` once paged mode is enabled and we know
     /// the pool dimensions. Idempotent.
@@ -1702,12 +1715,28 @@ impl<B: QuantLlmBackend + BackendMoeFused> LlamaFamilyScratch<B> {
 /// `B: BackendKvDtype<KvInt8>` bound is structurally required by the
 /// enum and is satisfied by all backends via stub impls (Cpu/Metal) or
 /// the real impl (CUDA).
+/// Graph-bound model buffers cannot be replaced through safe public field access.
+///
+/// ```compile_fail,E0616
+/// use ferrum_models::models::llama_family::LlamaFamilyModel;
+/// use ferrum_kernels::backend::cpu::CpuBackend;
+/// fn replace_logits(model: &mut LlamaFamilyModel<CpuBackend>) {
+///     model.scratch.logits = Vec::new();
+/// }
+/// ```
+/// ```compile_fail,E0616
+/// use ferrum_models::models::llama_family::LlamaFamilyModel;
+/// use ferrum_kernels::backend::cpu::CpuBackend;
+/// fn replace_weights(model: &mut LlamaFamilyModel<CpuBackend>) {
+///     model.layers.clear();
+/// }
+/// ```
 pub struct LlamaFamilyModel<B: MoeLlmBackend, K: KvLayer<B> = KvFp16> {
     /// The original instance context is lent to one frame at a time. None
     /// means borrowed or held by pending_device_frame; it never means create.
     execution_context: Option<B::Context>,
-    pub cfg: LlamaFamilyConfig,
-    pub runtime_cfg: LlmRuntimeConfig,
+    pub(crate) cfg: LlamaFamilyConfig,
+    pub(crate) runtime_cfg: LlmRuntimeConfig,
 
     /// Backend capabilities resolved once at construction (the allowed
     /// "构造期 capability 决策一次"). Decode/prefill hot paths branch on these
@@ -1722,21 +1751,21 @@ pub struct LlamaFamilyModel<B: MoeLlmBackend, K: KvLayer<B> = KvFp16> {
 
     /// Token embedding table. `None` for backbone-only models receiving
     /// externally embedded inputs through `prefill_from_embeds`.
-    pub embed: Option<B::Buffer>,
+    pub(crate) embed: Option<B::Buffer>,
     /// Source checkpoint layer range loaded into `layers`. Full LLM models
     /// use `0..cfg.num_layers`; layer-split stages load a contiguous subset.
-    pub layer_source_start: usize,
-    pub layer_source_end: usize,
-    pub layers: Vec<LlamaFamilyLayer<B>>,
-    pub final_norm_w: B::Buffer,
+    pub(crate) layer_source_start: usize,
+    pub(crate) layer_source_end: usize,
+    pub(crate) layers: Vec<LlamaFamilyLayer<B>>,
+    pub(crate) final_norm_w: B::Buffer,
     /// LM output head. `None` for backbone-only models.
-    pub lm_head: Option<Box<dyn Linear<B>>>,
+    pub(crate) lm_head: Option<ferrum_kernels::LoadedLinear<B>>,
 
-    pub rope: RopeCache<B>,
+    pub(crate) rope: RopeCache<B>,
     /// Second rope table for local-attention layers (Gemma 3 dual-θ
     /// scheduling). `None` for single-table families.
-    pub rope_local: Option<RopeCache<B>>,
-    pub scratch: LlamaFamilyScratch<B>,
+    pub(crate) rope_local: Option<RopeCache<B>>,
+    pub(crate) scratch: LlamaFamilyScratch<B>,
     // An unresolved context keeps the exact moved scratch owners. The device
     // worker must retain this entire model until actual terminal observation.
     pending_device_frame: Option<LlamaExecutionFrame<B>>,
@@ -1749,7 +1778,7 @@ pub struct LlamaFamilyModel<B: MoeLlmBackend, K: KvLayer<B> = KvFp16> {
     /// - **Paged mode** (`FERRUM_METAL_PAGED_KV=1`): k/v are unused
     ///   placeholders; the real K/V live in [`Self::paged_pools`] and
     ///   the cache's `block_table` + `context_lens` index into them.
-    pub kv_caches: HashMap<String, Vec<K::Layer>>,
+    pub(crate) kv_caches: HashMap<String, Vec<K::Layer>>,
     prepared_prefixes: HashMap<String, prefix_preparation::PreparedPrefix>,
     /// Free pool of pre-allocated KV cache slots. Released caches return
     /// here instead of being dropped, so their device pointers stay valid
@@ -1768,22 +1797,27 @@ pub struct LlamaFamilyModel<B: MoeLlmBackend, K: KvLayer<B> = KvFp16> {
     //
     /// Shared K/V pools, one per layer. Sized at model load time for the
     /// configured `MAX_RUNNING_REQUESTS × max_blocks_per_seq` blocks.
-    pub paged_pools: Option<Vec<K::PagedPool>>,
+    pub(crate) paged_pools: Option<Vec<K::PagedPool>>,
     /// Block allocator hands out physical block indices from the pool.
     /// `Mutex` because the engine can call `ensure_kv` / `release_kv`
     /// from multiple threads in concurrent serving.
-    pub paged_block_alloc: Option<std::sync::Mutex<crate::common::paged_pool::BlockAllocator>>,
+    pub(crate) paged_block_alloc:
+        Option<std::sync::Mutex<crate::common::paged_pool::BlockAllocator>>,
     /// Paged-batch dispatch dimensions `(max_seqs, max_blocks_per_seq)`,
     /// pinned at the first `ensure_kv` when paged-KV is on. Stored on
     /// the model (not on scratch) so `ensure_scratch`'s realloc can
     /// re-call `enable_paged_batch` after wiping scratch's
     /// `paged_batch_block_tables` / `paged_batch_q` etc.
-    pub paged_dims: Option<(usize, usize)>,
+    pub(crate) paged_dims: Option<(usize, usize)>,
 
     // ── Graph capture state (CUDA only; harmless no-op on other backends) ──
     /// Count of eager decode steps run so far. After `GRAPH_WARMUP`, the
     /// next step captures the decode flow as a graph.
     pub(crate) graph_warmup: usize,
+    /// Exact live cache incarnation referenced by key 0 or its pending capture.
+    /// This lifetime binding survives failures until checked graph retirement;
+    /// `graph_capture_failed` separately denies capture/replay eligibility.
+    single_graph_cache_id: Option<String>,
     /// True if capture was attempted but failed (e.g. backend doesn't
     /// support graph capture). Stops further attempts, falls back to eager.
     pub(crate) graph_capture_failed: bool,
@@ -1791,14 +1825,15 @@ pub struct LlamaFamilyModel<B: MoeLlmBackend, K: KvLayer<B> = KvFp16> {
     pub(crate) batched_graph_warmup: usize,
     /// True if batched graph capture failed.
     pub(crate) batched_graph_failed: bool,
-    /// Set of `m_padded` values (as u64 graph keys) for which a batched
-    /// graph has been captured. Multi-slot via cuda.rs's HashMap-keyed
-    /// graph cache — different batch shapes don't thrash a single slot.
-    pub(crate) batched_graph_keys_seen: std::collections::HashSet<u64>,
-    /// Cache IDs for which device-pointer scratch is currently populated.
-    /// Populate only re-runs when the batch composition changes (new
-    /// requests joined / requests finished). Hot-path optimization:
-    /// avoids 3 sync cuMemcpyHtoD_v2's per decode token (~5% TPOT).
+    /// Complete captured shapes map to separate native graph IDs. Hash
+    /// equality alone never authorizes replay of a different shape.
+    pub(crate) batched_graph_keys_seen: std::collections::HashMap<
+        super::llama_family_forward_batched::BatchedDecodeGraphShape,
+        u64,
+    >,
+    /// Ordered live cache owners bound to the current batch graph set.
+    /// Changing or retiring a member requires checked graph retirement.
+    /// Host pointer staging is refreshed separately before every invocation.
     pub(crate) batched_pointers_for: Option<Vec<String>>,
     /// CUDA-graph state for the unified_forward path. Mirrors the
     /// `batched_graph_*` triple but keyed on `(m_total, num_seqs)`
@@ -1928,6 +1963,14 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
             )));
         }
 
+        let graphs_requested = execution.options.cuda_graph
+            || execution.options.unified_graph
+            || execution.batched_graph;
+        if graphs_requested && K::graph_capture_contract().is_none() {
+            return Err(ferrum_types::FerrumError::unsupported(
+                "graph capture requires a capture-stable KV implementation",
+            ));
+        }
         let mut context = B::new_context(&execution.backend_context)?;
         // These are the actual partially built owners, declared before the
         // guard so failure observes the original context before their Drop.
@@ -1968,6 +2011,33 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
                     &cfg,
                     loader,
                 )?);
+            }
+            if graphs_requested {
+                let stable_layers =
+                    partial
+                        .layers
+                        .as_ref()
+                        .expect("loaded layers")
+                        .iter()
+                        .all(|layer| {
+                            [
+                                &layer.qkv_proj,
+                                &layer.o_proj,
+                                &layer.gate_up_proj,
+                                &layer.down_proj,
+                            ]
+                            .iter()
+                            .all(|projection| projection.is_capture_stable())
+                        });
+                let stable_head = partial
+                    .lm_head
+                    .as_ref()
+                    .is_none_or(|head| head.is_capture_stable());
+                if !stable_layers || !stable_head {
+                    return Err(ferrum_types::FerrumError::unsupported(
+                        "explicit graph capture requires capture-stable loaded projections; use eager execution or an audited LoadedLinear::new_capture_stable implementation",
+                    ));
+                }
             }
             partial.final_norm =
                 Some(loader.load_tensor(construction.context, "model.norm.weight")?);
@@ -2046,10 +2116,11 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
             paged_block_alloc: None,
             paged_dims: None,
             graph_warmup: 0,
+            single_graph_cache_id: None,
             graph_capture_failed: false,
             batched_graph_warmup: 0,
             batched_graph_failed: false,
-            batched_graph_keys_seen: std::collections::HashSet::new(),
+            batched_graph_keys_seen: std::collections::HashMap::new(),
             batched_pointers_for: None,
             unified_graph_warmup: 0,
             unified_graph_failed: false,
@@ -2063,6 +2134,17 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
             lora_cache_adapters: HashMap::new(),
             lora_projection_applications: 0,
         })
+    }
+
+    /// Immutable model geometry. Replacing graph-bound storage is only allowed
+    /// through the model's checked growth/retirement paths.
+    pub fn model_config(&self) -> &LlamaFamilyConfig {
+        &self.cfg
+    }
+
+    /// Read-only cache observation. No mutable owner escapes the model.
+    pub fn kv_caches(&self) -> &HashMap<String, Vec<K::Layer>> {
+        &self.kv_caches
     }
 
     pub(crate) fn backend_device_ordinal(&self) -> Option<usize> {
@@ -2111,6 +2193,7 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
 
     pub(in crate::models) fn clear_graph_bookkeeping(&mut self) {
         self.graph_warmup = 0;
+        self.single_graph_cache_id = None;
         self.graph_capture_failed = false;
         self.batched_graph_keys_seen.clear();
         self.batched_graph_warmup = 0;
@@ -2128,16 +2211,18 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         }
         // Any captured decode graph holds pointers to the old scratch
         // buffers; those are about to be freed. Invalidate ALL captured
-        // graphs (both single-item and per-m_padded batched) — every
+        // graphs (both single-item and shaped batched) — every
         // captured kernel-arg pointer into scratch is stale.
         B::retire_graphs_for_storage_mutation(ctx)
             .unwrap_or_else(|error| std::panic::panic_any(error));
         self.scratch = LlamaFamilyScratch::alloc(ctx, &self.cfg, tokens);
         self.graph_warmup = 0;
+        self.single_graph_cache_id = None;
         self.graph_capture_failed = false;
         self.batched_graph_keys_seen.clear();
         self.batched_graph_warmup = 0;
         self.batched_graph_failed = false;
+        self.batched_pointers_for = None;
         self.unified_graph_keys_seen.clear();
         self.unified_graph_warmup = 0;
         self.unified_graph_failed = false;
@@ -2857,6 +2942,11 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
 
     fn single_decode_graph_enabled(&self) -> bool {
         self.runtime_env.cuda_graph
+            && !self.graph_capture_failed
+            // This single-item route uploads a stack context-length value and
+            // encodes fixed paged write positions. Paged graphs use the separate
+            // batched/unified device-staged routes, never this capture region.
+            && self.paged_pools.is_none()
             && self.runtime_env.graph_capture_allowed()
             && !self.use_host_residual_shadow()
             && !self.use_device_residual_shadow()
@@ -3312,7 +3402,11 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         );
 
         let new_len = cache_len_before + tokens;
-        K::set_len(&mut caches[li], new_len);
+        // Recording is not execution. Every captured layer keeps its original
+        // host frontier until the complete graph has actually finished.
+        if !B::graph_capture_in_flight(ctx) {
+            K::set_len(&mut caches[li], new_len);
+        }
         let kv_stride = cache_capacity;
 
         let attn_cfg = ferrum_kernels::backend::AttnConfig {
@@ -3332,6 +3426,7 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
             attn_cfg,
             tokens,
             pos_offset,
+            new_len,
         )
         .expect("K::contig_decode_attention");
         nt!(
@@ -3796,11 +3891,13 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         assert!(seq_len > 0, "forward_verify called with empty tokens");
         self.ensure_scratch_in_context(&mut frame.context, seq_len);
         self.prepare_lora_workspace_for_cache(&mut frame.context, cache_id, seq_len);
-        if seq_len > self.scratch.batch_logits_capacity {
-            self.clear_graph_bookkeeping();
-        }
+        let grows_batch_logits = seq_len > self.scratch.batch_logits_capacity;
         self.scratch
             .ensure_batch_logits(&mut frame.context, &self.cfg, seq_len);
+        if grows_batch_logits {
+            // A failed retirement must retain the original graph/cache binding.
+            self.clear_graph_bookkeeping();
+        }
         self.ensure_kv_in_context(&mut frame.context, cache_id, None);
 
         let h = self.cfg.hidden_size;
@@ -4371,11 +4468,37 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
             }
             ModelExecutionRecovery::Quiescent { error } => error,
         };
+        // Completion alone does not retire a cached executable. Before this
+        // incarnation can enter the free pool, retire its captured pointer
+        // closure on the original context. Failure keeps every cache owner.
+        if self.single_graph_cache_id.as_deref() == Some(cache_id)
+            || self
+                .batched_pointers_for
+                .as_ref()
+                .is_some_and(|owners| owners.iter().any(|id| id == cache_id))
+        {
+            let retired = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let context = self.execution_context.as_mut().ok_or_else(|| {
+                    ferrum_types::FerrumError::backend("single graph owner has no original context")
+                })?;
+                B::retire_graphs_for_storage_mutation(context)
+            }))
+            .map_err(device_execution::panic_error)
+            .and_then(|result| result);
+            if let Err(retirement_error) = retired {
+                return ModelTokenCloseOutcome::Held {
+                    error: error.unwrap_or(retirement_error),
+                };
+            }
+            self.clear_graph_bookkeeping();
+        }
         // Every token/preparation encoder used the original retained frame.
         // Its actual terminal observation permits metadata retirement; making
         // and syncing an unrelated context here would prove nothing new.
         self.graph_warmup = 0;
-        self.graph_capture_failed = false;
+        if self.single_graph_cache_id.is_none() {
+            self.graph_capture_failed = false;
+        }
         self.lora_cache_adapters.remove(cache_id);
         self.prepared_prefixes.remove(cache_id);
         if let Some(mut caches) = self.kv_caches.remove(cache_id) {
@@ -4413,6 +4536,15 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         token: u32,
         pos: u32,
     ) -> Vec<f32> {
+        if self.graph_capture_failed && self.single_graph_cache_id.is_some() {
+            // The previous invocation may have installed a graph or only a
+            // captured prefix. Its original owners remain bound until checked
+            // retirement succeeds, even if launch/completion was unresolved.
+            B::retire_graphs_for_storage_mutation(&mut frame.context)
+                .unwrap_or_else(|error| std::panic::panic_any(error));
+            self.clear_graph_bookkeeping();
+            self.graph_capture_failed = true;
+        }
         self.ensure_scratch_in_context(&mut frame.context, 1);
         self.prepare_lora_workspace_for_cache(&mut frame.context, cache_id, 1);
         self.ensure_kv_in_context(&mut frame.context, cache_id, None);
@@ -4442,22 +4574,53 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         let graph_enabled = self.single_decode_graph_enabled();
 
         if graph_enabled {
+            if self
+                .single_graph_cache_id
+                .as_deref()
+                .is_some_and(|owner| owner != cache_id)
+            {
+                B::retire_graphs_for_storage_mutation(&mut ctx)
+                    .unwrap_or_else(|error| std::panic::panic_any(error));
+                self.clear_graph_bookkeeping();
+            }
             // Refresh device-side dynamic state (token/pos/kv_len) before
             // replay — captured graph reads these from device buffers.
             B::set_decode_state(&mut ctx, token, pos);
 
             // Fast path: graph replay (if available). Single-item path
             // uses key=SINGLE_ITEM_GRAPH_KEY (0) — separate from the
-            // batched path's m_padded keys.
-            match B::replay_graph(&mut ctx, SINGLE_ITEM_GRAPH_KEY) {
-                Ok(true) => {
-                    let quiescent = device_execution::checked_sync::<B>(&mut ctx);
-                    let logits = B::to_vec_in_context(ctx, &self.scratch.logits, vocab);
-                    frame.completed = Some(quiescent);
-                    return logits;
+            // batched path's allocated nonzero keys.
+            // SAFETY: cold construction checked projection/KV capture contracts.
+            // The private model/frame owns all bindings through checked retirement;
+            // storage mutation retires cached graphs before replacing dependencies.
+            if self.single_graph_cache_id.as_deref() == Some(cache_id) {
+                // Any replay/observation unwind keeps the owner but removes its
+                // eligibility. A later invocation must retire it before eager use.
+                self.graph_capture_failed = true;
+                match unsafe { B::replay_graph(&mut ctx, SINGLE_ITEM_GRAPH_KEY) } {
+                    Ok(true) => {
+                        let quiescent = device_execution::checked_sync::<B>(&mut ctx);
+                        let logits = B::to_vec_in_context(ctx, &self.scratch.logits, vocab);
+                        // Replay skips the host layer loop, so publish its actual
+                        // successful KV advancement explicitly before returning.
+                        for cache in self
+                            .kv_caches
+                            .get_mut(cache_id)
+                            .expect("captured cache owner")
+                        {
+                            K::set_len(cache, target_len);
+                        }
+                        self.graph_capture_failed = false;
+                        frame.completed = Some(quiescent);
+                        return logits;
+                    }
+                    Ok(false) => {
+                        B::retire_graphs_for_storage_mutation(&mut ctx)
+                            .unwrap_or_else(|error| std::panic::panic_any(error));
+                        self.clear_graph_bookkeeping();
+                    }
+                    Err(error) => std::panic::panic_any(error),
                 }
-                Ok(false) => { /* no graph yet, fall through to eager */ }
-                Err(error) => std::panic::panic_any(error),
             }
         }
 
@@ -4465,8 +4628,16 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
             graph_enabled && !self.graph_capture_failed && self.graph_warmup >= GRAPH_WARMUP;
 
         if should_capture {
+            // Bind the cache before capture can reference it. This is lifetime
+            // custody, not replay permission; success is published only after
+            // the first launch and checked completion/readback both succeed.
+            self.single_graph_cache_id = Some(cache_id.to_owned());
+            self.graph_capture_failed = true;
             B::set_dev_state_mode(&mut ctx, true);
-            if let Err(error) = B::begin_graph_capture(&mut ctx) {
+            // SAFETY: cold construction checked projection/KV capture contracts.
+            // The private model/frame owns all bindings through checked retirement;
+            // storage mutation retires cached graphs before replacing dependencies.
+            if let Err(error) = unsafe { B::begin_graph_capture(&mut ctx) } {
                 self.graph_capture_failed = true;
                 B::set_dev_state_mode(&mut ctx, false);
                 std::panic::panic_any(error);
@@ -4558,8 +4729,16 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
             );
         }
 
-        if should_capture && B::graph_capture_in_flight(&ctx) {
-            if let Err(error) = B::end_graph_capture(&mut ctx, SINGLE_ITEM_GRAPH_KEY) {
+        if should_capture {
+            if !B::graph_capture_in_flight(&ctx) {
+                std::panic::panic_any(ferrum_types::FerrumError::backend(
+                    "single decode capture ended before graph installation",
+                ));
+            }
+            // SAFETY: cold construction checked projection/KV capture contracts.
+            // The private model/frame owns all bindings through checked retirement;
+            // storage mutation retires cached graphs before replacing dependencies.
+            if let Err(error) = unsafe { B::end_graph_capture(&mut ctx, SINGLE_ITEM_GRAPH_KEY) } {
                 self.graph_capture_failed = true;
                 B::set_dev_state_mode(&mut ctx, false);
                 std::panic::panic_any(error);
@@ -4570,7 +4749,10 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
                 // actually execute and produce this step's logits. Without
                 // this, the capture step's to_vec returns stale logits,
                 // yielding a 1-token offset in the generated sequence.
-                match B::replay_graph(&mut ctx, SINGLE_ITEM_GRAPH_KEY) {
+                // SAFETY: cold construction checked projection/KV capture contracts.
+                // The private model/frame owns all bindings through checked retirement;
+                // storage mutation retires cached graphs before replacing dependencies.
+                match unsafe { B::replay_graph(&mut ctx, SINGLE_ITEM_GRAPH_KEY) } {
                     Ok(true) => {}
                     Ok(false) => {
                         self.graph_capture_failed = true;
@@ -4599,6 +4781,16 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         // Metal requires the explicit flush here.
         let quiescent = device_execution::checked_sync::<B>(&mut ctx);
         let logits = B::to_vec_in_context(ctx, &self.scratch.logits, vocab);
+        if should_capture {
+            for cache in self
+                .kv_caches
+                .get_mut(cache_id)
+                .expect("captured cache owner")
+            {
+                K::set_len(cache, target_len);
+            }
+            self.graph_capture_failed = false;
+        }
         frame.completed = Some(quiescent);
         logits
     }
@@ -5293,21 +5485,9 @@ impl<B: MoeLlmBackend> DecoderOnlyLLM for LlamaFamilyModel<B, KvFp16> {
 
         const WARMUP_CACHE: &str = "__ferrum_warmup__";
         let _ = self.prefill_internal(WARMUP_CACHE, &[0u32]);
-        self.prepared_prefixes.remove(WARMUP_CACHE);
-        if let Some(mut caches) = self.kv_caches.remove(WARMUP_CACHE) {
-            if let Some(alloc_arc) = self.paged_block_alloc.as_ref() {
-                let mut alloc = alloc_arc.lock().unwrap_or_else(|p| p.into_inner());
-                if let Some(c0) = caches.first() {
-                    if !c0.paged_block_indices.is_empty() {
-                        alloc.free(&c0.paged_block_indices);
-                    }
-                }
-                for c in caches.iter_mut() {
-                    c.paged_block_indices.clear();
-                }
-            }
-            self.kv_free_pool.push(caches);
-        }
+        // Use the same checked close as public release; even the warmup ID
+        // must not bypass retirement of a previously captured incarnation.
+        self.release_token_cache(WARMUP_CACHE);
     }
 
     fn prepare_kv_capacity(&mut self, cache_id: &str, capacity_hint: usize) {
@@ -5560,21 +5740,9 @@ impl<B: MoeLlmBackend + BackendInt8KvOps> DecoderOnlyLLM for LlamaFamilyModel<B,
 
         const WARMUP_CACHE: &str = "__ferrum_warmup__";
         let _ = self.prefill_internal(WARMUP_CACHE, &[0u32]);
-        self.prepared_prefixes.remove(WARMUP_CACHE);
-        if let Some(mut caches) = self.kv_caches.remove(WARMUP_CACHE) {
-            if let Some(alloc_arc) = self.paged_block_alloc.as_ref() {
-                let mut alloc = alloc_arc.lock().unwrap_or_else(|p| p.into_inner());
-                if let Some(c0) = caches.first() {
-                    if !c0.paged_block_indices.is_empty() {
-                        alloc.free(&c0.paged_block_indices);
-                    }
-                }
-                for c in caches.iter_mut() {
-                    c.paged_block_indices.clear();
-                }
-            }
-            self.kv_free_pool.push(caches);
-        }
+        // Use the same checked close as public release; even the warmup ID
+        // must not bypass retirement of a previously captured incarnation.
+        self.release_token_cache(WARMUP_CACHE);
     }
 
     fn prepare_kv_capacity(&mut self, cache_id: &str, capacity_hint: usize) {
@@ -5733,6 +5901,8 @@ mod int8_shared_pool_tests;
 mod prefix_cache_tests;
 
 #[cfg(test)]
+mod graph_contract_tests;
+#[cfg(test)]
 mod instance_config_tests;
 
 #[cfg(test)]
@@ -5837,14 +6007,19 @@ mod tests {
             &self,
             ctx: &mut <CpuBackend as ferrum_kernels::backend::Backend>::Context,
             name: &str,
-        ) -> Result<Box<dyn ferrum_quantization::Linear<CpuBackend>>> {
-            self.linears.lock().unwrap().push(name.to_string());
-            Ok(Box::new(DenseLinear::<CpuBackend>::from_rows_in_context(
-                ctx,
-                &[1.0],
-                1,
-                1,
-            )))
+        ) -> Result<ferrum_kernels::LoadedLinear<CpuBackend>> {
+            let linear = (|| -> Result<Box<dyn ferrum_quantization::Linear<CpuBackend>>> {
+                self.linears.lock().unwrap().push(name.to_string());
+                Ok(Box::new(DenseLinear::<CpuBackend>::from_rows_in_context(
+                    ctx,
+                    &[1.0],
+                    1,
+                    1,
+                )))
+            })()?;
+            // SAFETY: these built-in projections own their weights and encode only
+            // backend work; the model retains them until checked graph retirement.
+            Ok(unsafe { ferrum_kernels::LoadedLinear::new_capture_stable(linear) })
         }
 
         fn has_tensor(&self, _name: &str) -> bool {
@@ -6633,3 +6808,6 @@ mod tests {
         assert_eq!(v, vec![33.9375, -67.875, 16.96875]);
     }
 }
+
+#[cfg(all(test, feature = "cuda"))]
+mod single_graph_tests;

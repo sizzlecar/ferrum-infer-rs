@@ -34,6 +34,8 @@ pub mod native_ops;
 
 pub mod linear;
 pub use linear::{Linear, LinearMetadata, LinearProjectionRole};
+mod loaded_linear;
+pub use loaded_linear::LoadedLinear;
 
 pub mod stacked_expert;
 pub use stacked_expert::StackedExpertGgufLinear;

@@ -167,15 +167,20 @@ impl<B: Backend> WeightLoader<B> for SyntheticLlamaLoader {
         &self,
         ctx: &mut B::Context,
         name: &str,
-    ) -> Result<Box<dyn ferrum_quantization::Linear<B>>> {
-        let (out_features, in_features) = self.linear_dims(name)?;
-        let weights = Self::deterministic_values(name, out_features * in_features, 0.0, 0.015);
-        Ok(Box::new(DenseLinear::<B>::from_rows_in_context(
-            ctx,
-            &weights,
-            out_features,
-            in_features,
-        )))
+    ) -> Result<ferrum_kernels::LoadedLinear<B>> {
+        let linear = (|| -> Result<Box<dyn ferrum_quantization::Linear<B>>> {
+            let (out_features, in_features) = self.linear_dims(name)?;
+            let weights = Self::deterministic_values(name, out_features * in_features, 0.0, 0.015);
+            Ok(Box::new(DenseLinear::<B>::from_rows_in_context(
+                ctx,
+                &weights,
+                out_features,
+                in_features,
+            )))
+        })()?;
+        // SAFETY: these built-in projections own their weights and encode only
+        // backend work; the model retains them until checked graph retirement.
+        Ok(unsafe { ferrum_kernels::LoadedLinear::new_capture_stable(linear) })
     }
 
     fn has_tensor(&self, name: &str) -> bool {

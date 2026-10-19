@@ -15,7 +15,6 @@ use ferrum_kernels::{backend::Backend, MarlinExpertStack};
 use ferrum_types::{FerrumError, Result};
 
 use crate::config::QuantConfig;
-use crate::traits::Linear;
 
 /// Uploads and repacks use the caller's execution context. The resulting
 /// buffers are consumed by that same instance; loaders do not select a stream.
@@ -30,7 +29,11 @@ pub trait WeightLoader<B: Backend>: Send + Sync {
     ///
     /// `name` is the module path without the `.weight` suffix, e.g.
     /// `"model.layers.0.self_attn.qkv_proj"`.
-    fn load_linear(&self, ctx: &mut B::Context, name: &str) -> Result<Box<dyn Linear<B>>>;
+    fn load_linear(
+        &self,
+        ctx: &mut B::Context,
+        name: &str,
+    ) -> Result<ferrum_kernels::LoadedLinear<B>>;
 
     /// Whether a tensor with this name exists in the source.
     fn has_tensor(&self, name: &str) -> bool;
@@ -85,7 +88,11 @@ impl<'a, B: Backend> WeightLoader<B> for PrefixedLoader<'a, B> {
             .load_tensor(ctx, &format!("{}{}", self.prefix, name))
     }
 
-    fn load_linear(&self, ctx: &mut B::Context, name: &str) -> Result<Box<dyn Linear<B>>> {
+    fn load_linear(
+        &self,
+        ctx: &mut B::Context,
+        name: &str,
+    ) -> Result<ferrum_kernels::LoadedLinear<B>> {
         self.inner
             .load_linear(ctx, &format!("{}{}", self.prefix, name))
     }

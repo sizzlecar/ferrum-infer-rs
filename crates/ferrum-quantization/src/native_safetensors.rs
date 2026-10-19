@@ -613,147 +613,160 @@ impl<B: Backend + BackendQuantMarlin> WeightLoader<B> for NativeSafetensorsLoade
         Ok(B::from_weight_bytes_in_context(ctx, raw, src_dtype))
     }
 
-    fn load_linear(&self, ctx: &mut B::Context, name: &str) -> Result<Box<dyn Linear<B>>> {
-        // GPTQ first: `<name>.qweight` + `<name>.scales` + `<name>.qzeros`.
-        let qw_key = format!("{name}.qweight");
-        if self.has(&qw_key) {
-            return self.load_gptq_linear(ctx, name);
-        }
-        // GPTQ fusion shims: synthesise qkv_proj / gate_up_proj from split
-        // components — same pattern as Dense but concatenating the GPTQ
-        // tensors (qweight/scales/qzeros) along the N dim.
-        if let Some(prefix) = name.strip_suffix("qkv_proj") {
-            let parts = [
-                format!("{prefix}q_proj"),
-                format!("{prefix}k_proj"),
-                format!("{prefix}v_proj"),
-            ];
-            if parts.iter().all(|p| self.has(&format!("{p}.qweight"))) {
-                return self.load_gptq_linear_fused(ctx, &parts);
+    fn load_linear(
+        &self,
+        ctx: &mut B::Context,
+        name: &str,
+    ) -> Result<ferrum_kernels::LoadedLinear<B>> {
+        let linear = (|| -> Result<Box<dyn Linear<B>>> {
+            // GPTQ first: `<name>.qweight` + `<name>.scales` + `<name>.qzeros`.
+            let qw_key = format!("{name}.qweight");
+            if self.has(&qw_key) {
+                return self.load_gptq_linear(ctx, name);
             }
-        }
-        if let Some(prefix) = name.strip_suffix("gate_up_proj") {
-            let parts = [format!("{prefix}gate_proj"), format!("{prefix}up_proj")];
-            if parts.iter().all(|p| self.has(&format!("{p}.qweight"))) {
-                return self.load_gptq_linear_fused(ctx, &parts);
+            // GPTQ fusion shims: synthesise qkv_proj / gate_up_proj from split
+            // components — same pattern as Dense but concatenating the GPTQ
+            // tensors (qweight/scales/qzeros) along the N dim.
+            if let Some(prefix) = name.strip_suffix("qkv_proj") {
+                let parts = [
+                    format!("{prefix}q_proj"),
+                    format!("{prefix}k_proj"),
+                    format!("{prefix}v_proj"),
+                ];
+                if parts.iter().all(|p| self.has(&format!("{p}.qweight"))) {
+                    return self.load_gptq_linear_fused(ctx, &parts);
+                }
             }
-        }
-        if let Some(prefix) = name.strip_suffix("in_proj_qkvz") {
-            let parts = [format!("{prefix}in_proj_qkv"), format!("{prefix}in_proj_z")];
-            if parts.iter().all(|p| self.has(&format!("{p}.qweight"))) {
-                return self.load_gptq_linear_fused(ctx, &parts);
+            if let Some(prefix) = name.strip_suffix("gate_up_proj") {
+                let parts = [format!("{prefix}gate_proj"), format!("{prefix}up_proj")];
+                if parts.iter().all(|p| self.has(&format!("{p}.qweight"))) {
+                    return self.load_gptq_linear_fused(ctx, &parts);
+                }
             }
-        }
-        if let Some(prefix) = name.strip_suffix("in_proj_ba") {
-            let parts = [format!("{prefix}in_proj_b"), format!("{prefix}in_proj_a")];
-            if parts.iter().all(|p| self.has(&format!("{p}.qweight"))) {
-                return self.load_gptq_linear_fused(ctx, &parts);
+            if let Some(prefix) = name.strip_suffix("in_proj_qkvz") {
+                let parts = [format!("{prefix}in_proj_qkv"), format!("{prefix}in_proj_z")];
+                if parts.iter().all(|p| self.has(&format!("{p}.qweight"))) {
+                    return self.load_gptq_linear_fused(ctx, &parts);
+                }
             }
-        }
+            if let Some(prefix) = name.strip_suffix("in_proj_ba") {
+                let parts = [format!("{prefix}in_proj_b"), format!("{prefix}in_proj_a")];
+                if parts.iter().all(|p| self.has(&format!("{p}.qweight"))) {
+                    return self.load_gptq_linear_fused(ctx, &parts);
+                }
+            }
 
-        // Direct fused `<name>.weight` next. Load straight from raw bytes
-        // so fp16-preferring backends can skip the f32 Vec intermediate.
-        let direct = format!("{name}.weight");
-        if self.has(&direct) {
-            let (raw, src_dtype, shape) = self.read_bytes_typed(&direct)?;
-            if shape.len() != 2 {
-                return Err(FerrumError::model(format!(
-                    "linear '{name}': expected 2D weight, got {shape:?}"
-                )));
+            // Direct fused `<name>.weight` next. Load straight from raw bytes
+            // so fp16-preferring backends can skip the f32 Vec intermediate.
+            let direct = format!("{name}.weight");
+            if self.has(&direct) {
+                let (raw, src_dtype, shape) = self.read_bytes_typed(&direct)?;
+                if shape.len() != 2 {
+                    return Err(FerrumError::model(format!(
+                        "linear '{name}': expected 2D weight, got {shape:?}"
+                    )));
+                }
+                // Validate the optional bias before allocating backend buffers.
+                // A directly stored fused projection obeys the same row contract.
+                let bias = self.cat_optional_biases(std::slice::from_ref(&direct), shape[0])?;
+                let weight = B::from_weight_bytes_in_context(ctx, raw, src_dtype);
+                let mut linear = DenseLinear::<B>::from_buffer(weight, shape[0], shape[1])
+                    .with_metadata(LinearMetadata::from_name(name));
+                if let Some(bias) = bias {
+                    linear = linear.with_bias(B::from_slice_in_context(ctx, &bias));
+                }
+                return Ok(Box::new(linear));
             }
-            // Validate the optional bias before allocating backend buffers.
-            // A directly stored fused projection obeys the same row contract.
-            let bias = self.cat_optional_biases(std::slice::from_ref(&direct), shape[0])?;
-            let weight = B::from_weight_bytes_in_context(ctx, raw, src_dtype);
-            let mut linear = DenseLinear::<B>::from_buffer(weight, shape[0], shape[1])
-                .with_metadata(LinearMetadata::from_name(name));
-            if let Some(bias) = bias {
-                linear = linear.with_bias(B::from_slice_in_context(ctx, &bias));
-            }
-            return Ok(Box::new(linear));
-        }
 
-        // Llama-family fusion shims: synthesise qkv_proj / gate_up_proj from
-        // split q_proj+k_proj+v_proj / gate_proj+up_proj if present. The cat
-        // happens at the byte level so fused-weight memory is the same size
-        // as the per-part weights — no expansion to f32.
-        if let Some(prefix) = name.strip_suffix("qkv_proj") {
-            let parts = [
-                format!("{prefix}q_proj.weight"),
-                format!("{prefix}k_proj.weight"),
-                format!("{prefix}v_proj.weight"),
-            ];
-            if parts.iter().all(|p| self.has(p)) {
-                let (bytes, dtype, (rows, cols)) = self.cat_rows_bytes(&parts)?;
-                let bias = self.cat_optional_biases(&parts, rows)?;
-                let weight = B::from_weight_bytes_in_context(ctx, &bytes, dtype);
-                let mut linear = DenseLinear::<B>::from_buffer(weight, rows, cols).with_metadata(
-                    LinearMetadata::from_fused_names(parts.iter().map(String::as_str)),
-                );
-                if let Some(bias) = bias {
-                    linear = linear.with_bias(B::from_slice_in_context(ctx, &bias));
+            // Llama-family fusion shims: synthesise qkv_proj / gate_up_proj from
+            // split q_proj+k_proj+v_proj / gate_proj+up_proj if present. The cat
+            // happens at the byte level so fused-weight memory is the same size
+            // as the per-part weights — no expansion to f32.
+            if let Some(prefix) = name.strip_suffix("qkv_proj") {
+                let parts = [
+                    format!("{prefix}q_proj.weight"),
+                    format!("{prefix}k_proj.weight"),
+                    format!("{prefix}v_proj.weight"),
+                ];
+                if parts.iter().all(|p| self.has(p)) {
+                    let (bytes, dtype, (rows, cols)) = self.cat_rows_bytes(&parts)?;
+                    let bias = self.cat_optional_biases(&parts, rows)?;
+                    let weight = B::from_weight_bytes_in_context(ctx, &bytes, dtype);
+                    let mut linear = DenseLinear::<B>::from_buffer(weight, rows, cols)
+                        .with_metadata(LinearMetadata::from_fused_names(
+                            parts.iter().map(String::as_str),
+                        ));
+                    if let Some(bias) = bias {
+                        linear = linear.with_bias(B::from_slice_in_context(ctx, &bias));
+                    }
+                    return Ok(Box::new(linear));
                 }
-                return Ok(Box::new(linear));
             }
-        }
-        if let Some(prefix) = name.strip_suffix("gate_up_proj") {
-            let parts = [
-                format!("{prefix}gate_proj.weight"),
-                format!("{prefix}up_proj.weight"),
-            ];
-            if parts.iter().all(|p| self.has(p)) {
-                let (bytes, dtype, (rows, cols)) = self.cat_rows_bytes(&parts)?;
-                let bias = self.cat_optional_biases(&parts, rows)?;
-                let weight = B::from_weight_bytes_in_context(ctx, &bytes, dtype);
-                let mut linear = DenseLinear::<B>::from_buffer(weight, rows, cols).with_metadata(
-                    LinearMetadata::from_fused_names(parts.iter().map(String::as_str)),
-                );
-                if let Some(bias) = bias {
-                    linear = linear.with_bias(B::from_slice_in_context(ctx, &bias));
+            if let Some(prefix) = name.strip_suffix("gate_up_proj") {
+                let parts = [
+                    format!("{prefix}gate_proj.weight"),
+                    format!("{prefix}up_proj.weight"),
+                ];
+                if parts.iter().all(|p| self.has(p)) {
+                    let (bytes, dtype, (rows, cols)) = self.cat_rows_bytes(&parts)?;
+                    let bias = self.cat_optional_biases(&parts, rows)?;
+                    let weight = B::from_weight_bytes_in_context(ctx, &bytes, dtype);
+                    let mut linear = DenseLinear::<B>::from_buffer(weight, rows, cols)
+                        .with_metadata(LinearMetadata::from_fused_names(
+                            parts.iter().map(String::as_str),
+                        ));
+                    if let Some(bias) = bias {
+                        linear = linear.with_bias(B::from_slice_in_context(ctx, &bias));
+                    }
+                    return Ok(Box::new(linear));
                 }
-                return Ok(Box::new(linear));
             }
-        }
-        if let Some(prefix) = name.strip_suffix("in_proj_qkvz") {
-            let parts = [
-                format!("{prefix}in_proj_qkv.weight"),
-                format!("{prefix}in_proj_z.weight"),
-            ];
-            if parts.iter().all(|p| self.has(p)) {
-                let (bytes, dtype, (rows, cols)) = self.cat_rows_bytes(&parts)?;
-                let bias = self.cat_optional_biases(&parts, rows)?;
-                let weight = B::from_weight_bytes_in_context(ctx, &bytes, dtype);
-                let mut linear = DenseLinear::<B>::from_buffer(weight, rows, cols).with_metadata(
-                    LinearMetadata::from_fused_names(parts.iter().map(String::as_str)),
-                );
-                if let Some(bias) = bias {
-                    linear = linear.with_bias(B::from_slice_in_context(ctx, &bias));
+            if let Some(prefix) = name.strip_suffix("in_proj_qkvz") {
+                let parts = [
+                    format!("{prefix}in_proj_qkv.weight"),
+                    format!("{prefix}in_proj_z.weight"),
+                ];
+                if parts.iter().all(|p| self.has(p)) {
+                    let (bytes, dtype, (rows, cols)) = self.cat_rows_bytes(&parts)?;
+                    let bias = self.cat_optional_biases(&parts, rows)?;
+                    let weight = B::from_weight_bytes_in_context(ctx, &bytes, dtype);
+                    let mut linear = DenseLinear::<B>::from_buffer(weight, rows, cols)
+                        .with_metadata(LinearMetadata::from_fused_names(
+                            parts.iter().map(String::as_str),
+                        ));
+                    if let Some(bias) = bias {
+                        linear = linear.with_bias(B::from_slice_in_context(ctx, &bias));
+                    }
+                    return Ok(Box::new(linear));
                 }
-                return Ok(Box::new(linear));
             }
-        }
-        if let Some(prefix) = name.strip_suffix("in_proj_ba") {
-            let parts = [
-                format!("{prefix}in_proj_b.weight"),
-                format!("{prefix}in_proj_a.weight"),
-            ];
-            if parts.iter().all(|p| self.has(p)) {
-                let (bytes, dtype, (rows, cols)) = self.cat_rows_bytes(&parts)?;
-                let bias = self.cat_optional_biases(&parts, rows)?;
-                let weight = B::from_weight_bytes_in_context(ctx, &bytes, dtype);
-                let mut linear = DenseLinear::<B>::from_buffer(weight, rows, cols).with_metadata(
-                    LinearMetadata::from_fused_names(parts.iter().map(String::as_str)),
-                );
-                if let Some(bias) = bias {
-                    linear = linear.with_bias(B::from_slice_in_context(ctx, &bias));
+            if let Some(prefix) = name.strip_suffix("in_proj_ba") {
+                let parts = [
+                    format!("{prefix}in_proj_b.weight"),
+                    format!("{prefix}in_proj_a.weight"),
+                ];
+                if parts.iter().all(|p| self.has(p)) {
+                    let (bytes, dtype, (rows, cols)) = self.cat_rows_bytes(&parts)?;
+                    let bias = self.cat_optional_biases(&parts, rows)?;
+                    let weight = B::from_weight_bytes_in_context(ctx, &bytes, dtype);
+                    let mut linear = DenseLinear::<B>::from_buffer(weight, rows, cols)
+                        .with_metadata(LinearMetadata::from_fused_names(
+                            parts.iter().map(String::as_str),
+                        ));
+                    if let Some(bias) = bias {
+                        linear = linear.with_bias(B::from_slice_in_context(ctx, &bias));
+                    }
+                    return Ok(Box::new(linear));
                 }
-                return Ok(Box::new(linear));
             }
-        }
 
-        Err(FerrumError::model(format!(
-            "could not load linear '{name}' — no direct `.weight`, no split components"
-        )))
+            Err(FerrumError::model(format!(
+                "could not load linear '{name}' — no direct `.weight`, no split components"
+            )))
+        })()?;
+        // SAFETY: these built-in projections own their weights and encode only
+        // backend work; the model retains them until checked graph retirement.
+        Ok(unsafe { ferrum_kernels::LoadedLinear::new_capture_stable(linear) })
     }
 
     fn has_tensor(&self, name: &str) -> bool {

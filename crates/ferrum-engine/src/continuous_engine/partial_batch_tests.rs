@@ -69,7 +69,7 @@ impl ObservedLlama {
     fn publish_snapshot(&self) {
         self.state.lock().model.kv_caches = self
             .model
-            .kv_caches
+            .kv_caches()
             .iter()
             .map(|(id, layers)| {
                 (
@@ -177,7 +177,7 @@ impl DecoderOnlyLLM for ObservedLlama {
     }
 
     fn close_token_sequence(&mut self, id: &str) -> Result<()> {
-        let lengths = self.model.kv_caches[id]
+        let lengths = self.model.kv_caches()[id]
             .iter()
             .map(|layer| layer.len)
             .collect();

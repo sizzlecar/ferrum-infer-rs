@@ -22,9 +22,64 @@ use crate::backend::{
 };
 use ferrum_interfaces::kv_dtype::{KvDtypeKind, KvFp16, KvInt8};
 
+/// Type-bound storage and contiguous-replay contract for one backend/KV implementation.
+/// Safe code cannot reuse a proof for another backend's Layer/PagedPool methods.
+/// This is not permission to capture every KV helper: the paged single-item
+/// helpers may upload temporary host values and are eager-only. Batched/unified
+/// graph callers use persistent views with their own device-staged operations.
+///
+/// A proof can be moved without changing either implementation type:
+/// ```
+/// use ferrum_kernels::backend::{cpu::CpuBackend, Backend, KvGraphCaptureContract, KvLayer};
+/// use ferrum_interfaces::kv_dtype::KvFp16;
+/// fn same_backend<B: Backend, K: ?Sized>(
+///     proof: KvGraphCaptureContract<B, K>,
+/// ) -> KvGraphCaptureContract<B, K> { proof }
+/// let proof = <KvFp16 as KvLayer<CpuBackend>>::graph_capture_contract().unwrap();
+/// let _: KvGraphCaptureContract<CpuBackend, KvFp16> = same_backend(proof);
+/// ```
+/// Qualification for B1 cannot be borrowed by a different B2 implementation.
+/// This example requires no optional GPU feature:
+/// ```compile_fail,E0308
+/// use ferrum_kernels::backend::{Backend, KvGraphCaptureContract};
+/// fn wrong_backend<B1: Backend, B2: Backend, K: ?Sized>(
+///     proof: KvGraphCaptureContract<B1, K>,
+/// ) -> KvGraphCaptureContract<B2, K> { proof }
+/// ```
+pub struct KvGraphCaptureContract<B: Backend, K: ?Sized> {
+    _implementation: std::marker::PhantomData<fn(B, *const K) -> (B, *const K)>,
+}
+
+impl<B: Backend, K: ?Sized> KvGraphCaptureContract<B, K> {
+    /// # Safety
+    /// Persistent device storage exposed by K's KvLayer<B> Layer/PagedPool
+    /// must remain owned and stable until checked graph retirement. Growth or
+    /// rebinding must retire graphs before freeing their old storage; ordinary
+    /// submitted copies keep their source/destination owners through completion.
+    ///
+    /// If contiguous execution is supported, contig_write and
+    /// contig_decode_attention must be replay-equivalent under the backend's
+    /// dynamic decode state: no required host side effect or temporary host
+    /// upload may be captured. Custom implementations must uphold this constraint.
+    /// Batched/unified callers separately qualify the actual backend operations
+    /// over the retained views. paged_write and paged_decode_attention are not
+    /// capture-qualified by this proof: their eager-only host uploads must stay
+    /// outside any capture region.
+    pub const unsafe fn new() -> Self {
+        Self {
+            _implementation: std::marker::PhantomData,
+        }
+    }
+}
+
 /// Per-K-dtype dispatch trait.
 #[allow(clippy::too_many_arguments)]
 pub trait KvLayer<B: Backend>: KvDtypeKind {
+    /// Safe custom KV implementations remain eager-only by default.
+    fn graph_capture_contract() -> Option<KvGraphCaptureContract<B, Self>> {
+        None
+    }
+
     /// Per-layer cache type (FP16 → `KvCache`, INT8 → `KvCacheQuant`).
     type Layer: Send + Sync;
 
@@ -164,7 +219,8 @@ pub trait KvLayer<B: Backend>: KvDtypeKind {
         unimplemented!("contig_write: not supported for this K dtype")
     }
 
-    /// Contig decode attention: FP16 only.
+    /// Contig decode attention: FP16 only. The encoded attention extent is
+    /// explicit so recording work need not publish a completed host frontier.
     fn contig_decode_attention(
         _ctx: &mut B::Context,
         _layer: &Self::Layer,
@@ -173,6 +229,7 @@ pub trait KvLayer<B: Backend>: KvDtypeKind {
         _attn_cfg: crate::backend::AttnConfig,
         _tokens: usize,
         _pos_offset: usize,
+        _final_kv_len: usize,
     ) -> Result<()> {
         unimplemented!("contig_decode_attention: not supported for this K dtype")
     }
@@ -183,6 +240,13 @@ pub trait KvLayer<B: Backend>: KvDtypeKind {
 // ─────────────────────────────────────────────────────────────────────
 
 impl<B: Backend + crate::backend::BackendPagedKv> KvLayer<B> for KvFp16 {
+    fn graph_capture_contract() -> Option<KvGraphCaptureContract<B, Self>> {
+        // SAFETY: layer/pool owners retain backing allocations, with checked
+        // storage retirement before pointer changes. Contiguous decode delegates
+        // to graph-aware backend operations; paged single helpers remain eager.
+        Some(unsafe { KvGraphCaptureContract::new() })
+    }
+
     type Layer = KvCache<B, KvFp16>;
     type PagedPool = (B::Buffer, B::Buffer);
 
@@ -595,10 +659,19 @@ impl<B: Backend + crate::backend::BackendPagedKv> KvLayer<B> for KvFp16 {
         attn_cfg: crate::backend::AttnConfig,
         tokens: usize,
         pos_offset: usize,
+        final_kv_len: usize,
     ) -> Result<()> {
-        let kv_len = layer.len;
         B::flash_attention(
-            ctx, q, &layer.k, &layer.v, output, 1, tokens, kv_len, pos_offset, &attn_cfg,
+            ctx,
+            q,
+            &layer.k,
+            &layer.v,
+            output,
+            1,
+            tokens,
+            final_kv_len,
+            pos_offset,
+            &attn_cfg,
         );
         Ok(())
     }
@@ -609,6 +682,13 @@ impl<B: Backend + crate::backend::BackendPagedKv> KvLayer<B> for KvFp16 {
 // ─────────────────────────────────────────────────────────────────────
 
 impl<B: Backend + BackendInt8KvOps> KvLayer<B> for KvInt8 {
+    fn graph_capture_contract() -> Option<KvGraphCaptureContract<B, Self>> {
+        // SAFETY: INT8 owns its persistent paged views and has no contiguous
+        // path. Batch/unified callers use their graph-aware backend operations;
+        // the single-item paged helpers are not capture-qualified.
+        Some(unsafe { KvGraphCaptureContract::new() })
+    }
+
     type Layer = KvCacheQuant<B, KvInt8>;
     type PagedPool = QuantizedPagedKvPool<B, KvInt8>;
 

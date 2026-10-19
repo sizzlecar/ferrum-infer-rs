@@ -16,6 +16,15 @@ use std::sync::{
 };
 
 struct TrackedCpu;
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum GraphFault {
+    SecondLayer,
+    SecondLayerUnresolved,
+    EndCapture,
+    ReplayMissing,
+    ReplayError,
+    ReplayUnresolved,
+}
 struct Context {
     cpu: CpuContext,
     identity: Arc<()>,
@@ -28,6 +37,13 @@ struct Context {
     terminal_error: Arc<AtomicBool>,
     // Armed only by the LoRA allocation-failure test on its original context.
     successful_allocations_before_failure: Option<usize>,
+    // Fault injection exercises the real model's bookkeeping/custody only;
+    // CPU arithmetic remains eager and does not emulate CUDA graph numerics.
+    graph_fault: Option<GraphFault>,
+    capture_active: bool,
+    capture_gemms: usize,
+    graph_installed: bool,
+    replay_attempts: usize,
 }
 struct Timer;
 impl BackendTimer<TrackedCpu> for Timer {
@@ -41,11 +57,48 @@ impl BackendTimer<TrackedCpu> for Timer {
     }
 }
 impl BackendGraph for TrackedCpu {
+    unsafe fn begin_graph_capture(ctx: &mut Context) -> Result<()> {
+        ctx.capture_active = true;
+        ctx.capture_gemms = 0;
+        Ok(())
+    }
+    unsafe fn end_graph_capture(ctx: &mut Context, _: u64) -> Result<()> {
+        assert!(ctx.capture_active);
+        ctx.capture_active = false;
+        if ctx.graph_fault == Some(GraphFault::EndCapture) {
+            return Err(FerrumError::backend(
+                "controlled graph installation failure",
+            ));
+        }
+        ctx.graph_installed = true;
+        Ok(())
+    }
+    unsafe fn replay_graph(ctx: &mut Context, _: u64) -> Result<bool> {
+        ctx.replay_attempts += 1;
+        assert!(
+            ctx.graph_installed,
+            "only an installed original graph may replay"
+        );
+        match ctx.graph_fault {
+            Some(GraphFault::ReplayMissing) => Ok(false),
+            Some(GraphFault::ReplayUnresolved) => {
+                ctx.unresolved.store(true, Ordering::SeqCst);
+                Err(FerrumError::backend("controlled unresolved graph launch"))
+            }
+            _ => Err(FerrumError::backend("controlled graph launch failure")),
+        }
+    }
+    fn abort_graph_capture(ctx: &mut Context) -> Result<()> {
+        ctx.capture_active = false;
+        Ok(())
+    }
     fn retire_graphs_for_storage_mutation(ctx: &mut Context) -> Result<()> {
         if ctx.storage_retirement_blocked.load(Ordering::SeqCst) {
             return Err(FerrumError::backend("controlled graph retirement failure"));
         }
-        Self::observe_completion(ctx).into_result()
+        Self::observe_completion(ctx).into_result()?;
+        ctx.graph_installed = false;
+        Ok(())
     }
 }
 impl BackendPagedKv for TrackedCpu {}
@@ -75,6 +128,11 @@ impl Backend for TrackedCpu {
             retirement_blocked: Arc::new(AtomicBool::new(false)),
             terminal_error: Arc::new(AtomicBool::new(false)),
             successful_allocations_before_failure: None,
+            graph_fault: None,
+            capture_active: false,
+            capture_gemms: 0,
+            graph_installed: false,
+            replay_attempts: 0,
         })
     }
     fn context_config(ctx: &Context) -> &ferrum_types::BackendContextConfig {
@@ -92,7 +150,7 @@ impl Backend for TrackedCpu {
         Ok(())
     }
     fn observe_completion(ctx: &mut Context) -> BackendCompletion {
-        if ctx.unresolved.load(Ordering::SeqCst) {
+        if ctx.capture_active || ctx.unresolved.load(Ordering::SeqCst) {
             BackendCompletion::Unresolved(FerrumError::backend(
                 "controlled original context remains unresolved",
             ))
@@ -114,6 +172,9 @@ impl Backend for TrackedCpu {
     }
     fn sync(ctx: &mut Context) {
         Self::observe_completion(ctx).into_result().unwrap();
+    }
+    fn graph_capture_in_flight(ctx: &Context) -> bool {
+        ctx.capture_active
     }
     fn alloc(n: usize) -> Vec<f32> {
         CpuBackend::alloc(n)
@@ -173,6 +234,22 @@ impl Backend for TrackedCpu {
         k: usize,
     ) {
         ctx.calls.fetch_add(1, Ordering::SeqCst);
+        if ctx.capture_active {
+            ctx.capture_gemms += 1;
+            if ctx.capture_gemms == 5
+                && matches!(
+                    ctx.graph_fault,
+                    Some(GraphFault::SecondLayer | GraphFault::SecondLayerUnresolved)
+                )
+            {
+                if ctx.graph_fault == Some(GraphFault::SecondLayerUnresolved) {
+                    ctx.unresolved.store(true, Ordering::SeqCst);
+                }
+                std::panic::panic_any(FerrumError::backend(
+                    "controlled second layer capture failure",
+                ));
+            }
+        }
         CpuBackend::gemm(&mut ctx.cpu, a, b, out, m, n, k)
     }
     fn rms_norm(
@@ -1021,7 +1098,7 @@ fn instance_context_whole_retirement_reports_terminal_error_with_released_owner(
 
 #[test]
 fn instance_context_constructor_error_retires_original_before_return() {
-    use ferrum_quantization::{Linear, QuantConfig, WeightLoader};
+    use ferrum_quantization::{QuantConfig, WeightLoader};
     type Captured = (std::sync::Weak<()>, Arc<AtomicUsize>);
     struct FailingLoader(std::sync::Mutex<Option<Captured>>);
     impl WeightLoader<TrackedCpu> for FailingLoader {
@@ -1033,7 +1110,11 @@ fn instance_context_constructor_error_retires_original_before_return() {
             *self.0.lock().unwrap() = Some((Arc::downgrade(&ctx.identity), ctx.retired.clone()));
             Err(FerrumError::model("controlled first weight failure"))
         }
-        fn load_linear(&self, _: &mut Context, _: &str) -> Result<Box<dyn Linear<TrackedCpu>>> {
+        fn load_linear(
+            &self,
+            _: &mut Context,
+            _: &str,
+        ) -> Result<ferrum_kernels::LoadedLinear<TrackedCpu>> {
             unreachable!()
         }
         fn has_tensor(&self, _: &str) -> bool {
@@ -1079,4 +1160,452 @@ fn instance_context_unresolved_bare_drop_fails_stop() {
     }
     assert!(String::from_utf8_lossy(&output.stderr)
         .contains("cannot drop model with unretired original device context"));
+}
+
+#[test]
+fn instance_context_single_graph_close_failure_retains_exact_cache_until_retry() {
+    use crate::common::llm::ModelTokenCloseOutcome;
+    let mut model = tracked_model();
+    model.prefill_internal("captured", &[1, 2, 3]);
+    // Fault injection exercises the retirement boundary, not a simulated CUDA
+    // graph result. Actual capture/replay mathematics has separate GPU tests.
+    model.single_graph_cache_id = Some("captured".to_owned());
+    let blocked = model
+        .execution_context
+        .as_ref()
+        .unwrap()
+        .storage_retirement_blocked
+        .clone();
+    let original = model.kv_caches["captured"][0].k.as_ptr();
+    blocked.store(true, Ordering::SeqCst);
+    assert!(matches!(
+        model.close_managed_token_cache("captured"),
+        ModelTokenCloseOutcome::Held { .. }
+    ));
+    assert_eq!(model.kv_caches["captured"][0].k.as_ptr(), original);
+    assert_eq!(model.cache_len("captured"), 3);
+    assert!(model.kv_free_pool.is_empty());
+    assert_eq!(model.single_graph_cache_id.as_deref(), Some("captured"));
+    assert!(model.execution_context.is_some());
+    blocked.store(false, Ordering::SeqCst);
+    assert!(matches!(
+        model.close_managed_token_cache("captured"),
+        ModelTokenCloseOutcome::Ended { error: None }
+    ));
+    assert!(model.single_graph_cache_id.is_none());
+    assert!(!model.kv_caches.contains_key("captured"));
+    assert_eq!(model.kv_free_pool[0][0].k.as_ptr(), original);
+    let loader = SyntheticLlamaLoader::new(config());
+    let mut reference = LlamaFamilyModel::<CpuBackend>::new(config(), &loader).unwrap();
+    let actual = model.prefill_internal("captured", &[5, 6, 7]);
+    let expected = reference.prefill_internal("reference", &[5, 6, 7]);
+    assert!(actual.iter().all(|value| value.is_finite()));
+    assert_eq!(actual, expected);
+    model.close().unwrap();
+    reference.close().unwrap();
+}
+
+#[test]
+fn instance_context_logits_growth_failure_keeps_single_graph_owner_until_retirement() {
+    use crate::common::llm::ModelTokenCloseOutcome;
+    let mut model = tracked_model();
+    model.prefill_internal("captured", &[1, 2, 3]);
+    assert!(model.scratch.max_tokens >= 2);
+    assert_eq!(model.scratch.batch_logits_capacity, 1);
+    // Inject only the graph-retirement boundary. The actual CUDA graph and
+    // full-logit equivalence are exercised by the separate GPU regressions.
+    model.single_graph_cache_id = Some("captured".to_owned());
+    let context = model.execution_context.as_ref().unwrap();
+    let owner = context.identity.clone();
+    let blocked = context.storage_retirement_blocked.clone();
+    let original_kv: Vec<_> = model.kv_caches["captured"]
+        .iter()
+        .map(|cache| (cache.k.as_ptr(), cache.v.as_ptr(), cache.capacity))
+        .collect();
+    let original_logits = model.scratch.batch_logits.as_ptr();
+    blocked.store(true, Ordering::SeqCst);
+    let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        model.forward_verify("captured", &[4, 5]);
+    }));
+    let error = failed.expect_err("logits growth requires graph retirement");
+    assert!(panic_error(error)
+        .to_string()
+        .contains("controlled graph retirement failure"));
+    assert_eq!(model.single_graph_cache_id.as_deref(), Some("captured"));
+    assert_eq!(model.scratch.batch_logits.as_ptr(), original_logits);
+    assert_eq!(model.scratch.batch_logits_capacity, 1);
+    assert_eq!(model.cache_len("captured"), 3);
+    assert!(Arc::ptr_eq(
+        &owner,
+        &model.execution_context.as_ref().unwrap().identity
+    ));
+    assert!(matches!(
+        model.close_managed_token_cache("captured"),
+        ModelTokenCloseOutcome::Held { .. }
+    ));
+    assert!(model.kv_free_pool.is_empty());
+    assert_eq!(
+        model.kv_caches["captured"]
+            .iter()
+            .map(|cache| (cache.k.as_ptr(), cache.v.as_ptr(), cache.capacity))
+            .collect::<Vec<_>>(),
+        original_kv
+    );
+    blocked.store(false, Ordering::SeqCst);
+    let loader = SyntheticLlamaLoader::new(config());
+    let mut reference = LlamaFamilyModel::<CpuBackend>::new(config(), &loader).unwrap();
+    reference.prefill_internal("reference", &[1, 2, 3]);
+    let actual = model.forward_verify("captured", &[4, 5]);
+    let expected = reference.forward_verify("reference", &[4, 5]);
+    assert_eq!(actual.len(), 2 * config().vocab_size);
+    assert!(actual
+        .iter()
+        .chain(&expected)
+        .all(|value| value.is_finite()));
+    assert_eq!(actual, expected);
+    assert_eq!(model.cache_len("captured"), 5);
+    assert!(model.single_graph_cache_id.is_none());
+    assert!(Arc::ptr_eq(
+        &owner,
+        &model.execution_context.as_ref().unwrap().identity
+    ));
+    assert!(matches!(
+        model.close_managed_token_cache("captured"),
+        ModelTokenCloseOutcome::Ended { error: None }
+    ));
+    assert_eq!(model.kv_free_pool[0][0].k.as_ptr(), original_kv[0].0);
+    reference.release("reference");
+    let actual = model.prefill_internal("captured", &[6, 7, 8]);
+    let expected = reference.prefill_internal("reference", &[6, 7, 8]);
+    assert_eq!(actual.len(), config().vocab_size);
+    assert!(actual
+        .iter()
+        .chain(&expected)
+        .all(|value| value.is_finite()));
+    assert_eq!(actual, expected);
+    model.close().unwrap();
+    reference.close().unwrap();
+}
+
+fn prepared_graph_fault_models() -> (
+    LlamaFamilyModel<TrackedCpu, KvFp16>,
+    LlamaFamilyModel<CpuBackend, KvFp16>,
+) {
+    let loader = SyntheticLlamaLoader::new(config());
+    let mut execution = ferrum_types::LlamaExecutionConfig::default();
+    execution.options.cuda_graph = true;
+    execution.prefix_cache = false;
+    execution.options.metal_paged_kv = Some(false);
+    let mut model = LlamaFamilyModel::<TrackedCpu>::new_with_execution_config(
+        config(),
+        &loader,
+        execution.clone(),
+    )
+    .unwrap();
+    execution.options.cuda_graph = false;
+    let mut reference =
+        LlamaFamilyModel::<CpuBackend>::new_with_execution_config(config(), &loader, execution)
+            .unwrap();
+    for id in ["captured", "peer"] {
+        model.prepare_kv_capacity(id, 32);
+        reference.prepare_kv_capacity(id, 32);
+        assert_eq!(
+            model.prefill_internal(id, &[1, 2, 3]),
+            reference.prefill_internal(id, &[1, 2, 3]),
+        );
+    }
+    for position in 3..6 {
+        assert_eq!(
+            model.decode_internal("captured", position + 4, position),
+            reference.decode_internal("captured", position + 4, position),
+        );
+    }
+    assert_eq!(model.graph_warmup, 3);
+    assert!(model.single_graph_cache_id.is_none());
+    (model, reference)
+}
+
+fn assert_graph_failure_frontier(model: &LlamaFamilyModel<TrackedCpu, KvFp16>) {
+    assert_eq!(model.cache_len("captured"), 6);
+    assert!(model.kv_caches["captured"]
+        .iter()
+        .all(|cache| cache.len == 6));
+    assert!(model.graph_capture_failed);
+    assert!(!model.single_decode_graph_enabled());
+    assert_eq!(model.single_graph_cache_id.as_deref(), Some("captured"));
+}
+
+#[test]
+fn instance_context_single_capture_partial_failure_never_publishes_layer_frontiers() {
+    use crate::common::llm::{ModelExecutionRecovery, ModelTokenCloseOutcome};
+
+    for unresolved in [false, true] {
+        let (mut model, mut reference) = prepared_graph_fault_models();
+        let context = model.execution_context.as_mut().unwrap();
+        let identity = context.identity.clone();
+        let pending = context.unresolved.clone();
+        context.graph_fault = Some(if unresolved {
+            GraphFault::SecondLayerUnresolved
+        } else {
+            GraphFault::SecondLayer
+        });
+        let original_kv: Vec<_> = model.kv_caches["captured"]
+            .iter()
+            .map(|cache| (cache.k.as_ptr(), cache.v.as_ptr()))
+            .collect();
+        let residual = model.scratch.residual.as_ref().unwrap().as_ptr();
+        let failed =
+            model.run_device_frame(|model, frame| model.decode_in_frame(frame, "captured", 10, 6));
+        if unresolved {
+            assert!(matches!(failed, DeviceFrameResult::Held(_)));
+            assert!(model.execution_context.is_none());
+            let frame = model.pending_device_frame.as_ref().unwrap();
+            assert!(Arc::ptr_eq(&identity, &frame.context.identity));
+            assert_eq!(frame.residual.as_ref().unwrap().as_ptr(), residual);
+            assert!(model.scratch.residual.is_none());
+            assert!(matches!(
+                model.run_device_frame(
+                    |model, frame| model.decode_in_frame(frame, "captured", 10, 6)
+                ),
+                DeviceFrameResult::Rejected(_)
+            ));
+            assert!(matches!(
+                model.close_managed_token_cache("captured"),
+                ModelTokenCloseOutcome::Held { .. }
+            ));
+            assert!(model.kv_free_pool.is_empty());
+            assert_graph_failure_frontier(&model);
+            pending.store(false, Ordering::SeqCst);
+            assert!(matches!(
+                model.recover_token_frame(),
+                ModelExecutionRecovery::Quiescent { error: None }
+            ));
+        } else {
+            let DeviceFrameResult::Terminal(Err(error)) = failed else {
+                panic!("capture must fail");
+            };
+            assert!(error
+                .to_string()
+                .contains("controlled second layer capture failure"));
+        }
+        assert_graph_failure_frontier(&model);
+        assert_eq!(model.execution_context.as_ref().unwrap().capture_gemms, 5);
+        assert_eq!(model.execution_context.as_ref().unwrap().replay_attempts, 0);
+        assert_eq!(model.scratch.residual.as_ref().unwrap().as_ptr(), residual);
+        assert_eq!(
+            model.kv_caches["captured"]
+                .iter()
+                .map(|cache| (cache.k.as_ptr(), cache.v.as_ptr()))
+                .collect::<Vec<_>>(),
+            original_kv
+        );
+        // This is CPU numerical recovery after an injected contract failure,
+        // not a claim that CPU simulated CUDA graph execution.
+        let expected = reference.decode_internal("captured", 10, 6);
+        let actual = model.decode_internal("captured", 10, 6);
+        assert_eq!(actual.len(), config().vocab_size);
+        assert!(actual
+            .iter()
+            .chain(&expected)
+            .all(|value| value.is_finite()));
+        assert_eq!(actual, expected);
+        assert!(model.kv_caches["captured"]
+            .iter()
+            .all(|cache| cache.len == 7));
+        assert!(model.single_graph_cache_id.is_none());
+        model.close().unwrap();
+        reference.close().unwrap();
+    }
+}
+
+#[test]
+fn instance_context_single_graph_first_replay_failure_keeps_custody_but_denies_replay() {
+    use crate::common::llm::{ModelExecutionRecovery, ModelTokenCloseOutcome};
+
+    for fault in [
+        GraphFault::EndCapture,
+        GraphFault::ReplayMissing,
+        GraphFault::ReplayError,
+        GraphFault::ReplayUnresolved,
+    ] {
+        let (mut model, mut reference) = prepared_graph_fault_models();
+        let context = model.execution_context.as_mut().unwrap();
+        let identity = context.identity.clone();
+        let pending = context.unresolved.clone();
+        let retirement_blocked = context.storage_retirement_blocked.clone();
+        context.graph_fault = Some(fault);
+        let original_kv: Vec<_> = model.kv_caches["captured"]
+            .iter()
+            .map(|cache| (cache.k.as_ptr(), cache.v.as_ptr()))
+            .collect();
+        let result =
+            model.run_device_frame(|model, frame| model.decode_in_frame(frame, "captured", 10, 6));
+        if fault == GraphFault::ReplayUnresolved {
+            assert!(matches!(result, DeviceFrameResult::Held(_)));
+            assert!(model.execution_context.is_none());
+            assert!(Arc::ptr_eq(
+                &identity,
+                &model
+                    .pending_device_frame
+                    .as_ref()
+                    .unwrap()
+                    .context
+                    .identity
+            ));
+            assert!(matches!(
+                model.close_managed_token_cache("captured"),
+                ModelTokenCloseOutcome::Held { .. }
+            ));
+            assert!(model.kv_free_pool.is_empty());
+            assert_graph_failure_frontier(&model);
+            pending.store(false, Ordering::SeqCst);
+            assert!(matches!(
+                model.recover_token_frame(),
+                ModelExecutionRecovery::Quiescent { error: None }
+            ));
+        } else {
+            assert!(matches!(result, DeviceFrameResult::Terminal(Err(_))));
+        }
+        assert_graph_failure_frontier(&model);
+        let attempts = usize::from(fault != GraphFault::EndCapture);
+        assert_eq!(
+            model.execution_context.as_ref().unwrap().replay_attempts,
+            attempts
+        );
+        retirement_blocked.store(true, Ordering::SeqCst);
+        let blocked =
+            model.run_device_frame(|model, frame| model.decode_in_frame(frame, "captured", 10, 6));
+        let DeviceFrameResult::Terminal(Err(error)) = blocked else {
+            panic!("checked retirement must block reuse");
+        };
+        assert!(error
+            .to_string()
+            .contains("controlled graph retirement failure"));
+        assert_eq!(
+            model.execution_context.as_ref().unwrap().replay_attempts,
+            attempts
+        );
+        assert_graph_failure_frontier(&model);
+        assert!(matches!(
+            model.close_managed_token_cache("captured"),
+            ModelTokenCloseOutcome::Held { .. }
+        ));
+        assert_eq!(
+            model.kv_caches["captured"]
+                .iter()
+                .map(|cache| (cache.k.as_ptr(), cache.v.as_ptr()))
+                .collect::<Vec<_>>(),
+            original_kv
+        );
+        // Unrelated cache operations cannot restore failed graph eligibility.
+        model.truncate_kv("peer", 2);
+        assert!(model.graph_capture_failed);
+        model.release("peer");
+        assert_graph_failure_frontier(&model);
+        retirement_blocked.store(false, Ordering::SeqCst);
+        let expected = reference.decode_internal("captured", 10, 6);
+        let actual = model.decode_internal("captured", 10, 6);
+        assert_eq!(actual.len(), config().vocab_size);
+        assert!(actual
+            .iter()
+            .chain(&expected)
+            .all(|value| value.is_finite()));
+        assert_eq!(actual, expected);
+        assert_eq!(
+            model.execution_context.as_ref().unwrap().replay_attempts,
+            attempts
+        );
+        assert!(Arc::ptr_eq(
+            &identity,
+            &model.execution_context.as_ref().unwrap().identity
+        ));
+        assert!(model.kv_caches["captured"]
+            .iter()
+            .all(|cache| cache.len == 7));
+        assert!(model.single_graph_cache_id.is_none());
+        model.close().unwrap();
+        reference.close().unwrap();
+    }
+}
+
+#[test]
+fn instance_context_batch_graph_members_retire_before_close_or_truncate() {
+    use crate::common::llm::ModelTokenCloseOutcome;
+    let mut model = tracked_model();
+    model.prefill_internal("batch-a", &[1, 2, 3]);
+    model.prefill_internal("batch-b", &[4, 5, 6]);
+    // Only the checked-retirement failure is injected. The actual CPU cache,
+    // original context and subsequent numerical execution remain real; CUDA
+    // capture/replay is covered by the separate backend regressions.
+    model.batched_pointers_for = Some(vec!["batch-a".into(), "batch-b".into()]);
+    let context = model.execution_context.as_ref().unwrap();
+    let owner = context.identity.clone();
+    let blocked = context.storage_retirement_blocked.clone();
+    let original_a = model.kv_caches["batch-a"][0].k.as_ptr();
+    let original_b = model.kv_caches["batch-b"][0].k.as_ptr();
+    blocked.store(true, Ordering::SeqCst);
+    assert!(matches!(
+        model.close_managed_token_cache("batch-a"),
+        ModelTokenCloseOutcome::Held { .. }
+    ));
+    let failure = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        model.truncate_token_cache("batch-b", 2);
+    }))
+    .expect_err("a graph-bound truncation must retire the original graph");
+    assert!(panic_error(failure)
+        .to_string()
+        .contains("controlled graph retirement failure"));
+    assert_eq!(model.cache_len("batch-a"), 3);
+    assert_eq!(model.cache_len("batch-b"), 3);
+    assert_eq!(model.kv_caches["batch-a"][0].k.as_ptr(), original_a);
+    assert_eq!(model.kv_caches["batch-b"][0].k.as_ptr(), original_b);
+    assert!(model.kv_free_pool.is_empty());
+    assert_eq!(
+        model.batched_pointers_for.as_deref(),
+        Some(["batch-a".to_owned(), "batch-b".to_owned()].as_slice())
+    );
+    assert!(Arc::ptr_eq(
+        &owner,
+        &model.execution_context.as_ref().unwrap().identity
+    ));
+
+    blocked.store(false, Ordering::SeqCst);
+    model.truncate_token_cache("batch-b", 2);
+    assert!(model.batched_pointers_for.is_none());
+    assert_eq!(model.cache_len("batch-b"), 2);
+    let loader = SyntheticLlamaLoader::new(config());
+    let mut reference = LlamaFamilyModel::<CpuBackend>::new(config(), &loader).unwrap();
+    reference.prefill_internal("a", &[1, 2, 3]);
+    reference.prefill_internal("b", &[4, 5]);
+    for (actual_id, reference_id, token, position) in
+        [("batch-b", "b", 7, 2), ("batch-a", "a", 8, 3)]
+    {
+        let actual = model.decode_internal(actual_id, token, position);
+        let expected = reference.decode_internal(reference_id, token, position);
+        assert_eq!(actual.len(), config().vocab_size);
+        assert!(actual
+            .iter()
+            .chain(&expected)
+            .all(|value| value.is_finite()));
+        assert_eq!(actual, expected);
+    }
+    assert!(matches!(
+        model.close_managed_token_cache("batch-a"),
+        ModelTokenCloseOutcome::Ended { error: None }
+    ));
+    assert_eq!(model.kv_free_pool[0][0].k.as_ptr(), original_a);
+    reference.release("a");
+    let actual = model.prefill_internal("batch-a", &[9, 10, 11]);
+    let expected = reference.prefill_internal("a", &[9, 10, 11]);
+    assert!(actual
+        .iter()
+        .chain(&expected)
+        .all(|value| value.is_finite()));
+    assert_eq!(actual, expected);
+    assert!(Arc::ptr_eq(
+        &owner,
+        &model.execution_context.as_ref().unwrap().identity
+    ));
+    model.close().unwrap();
+    reference.close().unwrap();
 }

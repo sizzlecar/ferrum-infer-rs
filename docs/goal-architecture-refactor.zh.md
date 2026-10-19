@@ -63,6 +63,8 @@ Metal 同步失败会阻止后续编码和宿主访问；未决工作保留原�
 
 资源 API 迁移：`WeightLoader`、动态 LoRA 与 KV 分配显式接收原实例 context；模型从构造到关闭复用同一所有者。`LlamaFamilyModel::close` 检查设备完成及 graph 清理；退休失败保留原资源供重试，成功关闭后拒绝继续执行。graph 驱逐不等于执行完成，替换被捕获存储须先通过 checked retirement；KV 复制的旧存储留至原 context 确认终态。受管执行沿既有 worker 恢复；直接使用裸模型的调用方应显式关闭，若最终 `Drop` 仍无法安全退休，则诊断并终止进程，避免释放仍被引用的资源。设备执行未知与已完成后的清理失败分别报告；此异常兜底不替代正常产品 shutdown，也不构成未测 GPU 路线的支持声明。
 
+Graph API 迁移：权重加载返回 `LoadedLinear`，自定义实现默认仅供 eager 执行；捕获资格须保证原依赖的地址与重放语义，KV 资格同时绑定后端和存储类型。裸捕获/重放入口为 `unsafe`，模型持有完整依赖并在释放前检查退休结果。保留的 Llama graph 按实际批宽、布局和 attention 范围复用，缓存换组或复用前先退休旧图；捕获不提交 KV 长度，实际完成后才提交。CUDA 生命周期资格不等于所有模型、量化格式或性能已验收。
+
 旧执行 API 迁移：移除独立 FIFO/Priority、pipeline/模拟 parallel、speculative 驱动及 whole-prompt 缓存 API；Engine 使用连续批处理配置，普通 prefix 使用原有 `FERRUM_PREFIX_CACHE`/CLI 选项。旧 speculative/whole-prompt 参数、退役配置字段和策略名称明确拒绝，不能静默转成默认行为；原生 checkpoint、请求优先级、真实 layer-split/chunked prefill 和显式自定义注册保留。`GenericKvCacheHandle::clone_handle` 拒绝没有物理 fork 的复制；Phi/GPT2 不再被内建注册为可执行家族，通用元数据识别和下载不受此限制。
 
 扩展点限于任务能力声明、可组合的注册/装配边界，以及未来按任务定义独立请求/结果的空间；**不新建无人使用的 Embed/ASR/TTS 引擎、空实现或插件框架来替代删除。** Candle、量化加载、通用算子等仍被文本 LLM 使用的依赖继续保留；独立 CLIP 处理链和未支持的聊天视觉输入不是同一件事，不能删掉主线已有的能力限制校验。
