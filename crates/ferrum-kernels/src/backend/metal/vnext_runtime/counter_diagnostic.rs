@@ -3,6 +3,62 @@
 
 use super::*;
 
+const ERROR_TEXT_LIMIT_BYTES: usize = 4096;
+
+/// Copy the original NSError while its surrounding autorelease pool is alive.
+/// Only owned, bounded Rust strings escape; no native pointer is retained.
+pub(super) fn objective_c_error(error: *mut Object) -> serde_json::Value {
+    if error.is_null() {
+        return serde_json::json!({
+            "status": "nil_nserror",
+            "domain": null,
+            "code": null,
+            "description": null,
+        });
+    }
+    unsafe {
+        let domain: *mut Object = msg_send![error, domain];
+        let description: *mut Object = msg_send![error, localizedDescription];
+        let code: metal::NSInteger = msg_send![error, code];
+        let owned_text = |object: *mut Object| {
+            if object.is_null() {
+                return None;
+            }
+            let text: *const std::ffi::c_char = msg_send![object, UTF8String];
+            if text.is_null() {
+                return None;
+            }
+            // UTF8String is NUL-terminated. Bound even the source scan rather
+            // than copying an arbitrarily large description and truncating it.
+            let mut length = 0;
+            while length < ERROR_TEXT_LIMIT_BYTES && *text.add(length) != 0 {
+                length += 1;
+            }
+            let bytes = std::slice::from_raw_parts(text.cast::<u8>(), length);
+            let mut owned = String::from_utf8_lossy(bytes).into_owned();
+            // A cut through a UTF-8 scalar can add replacement-character bytes.
+            while owned.len() > ERROR_TEXT_LIMIT_BYTES {
+                owned.pop();
+            }
+            Some(owned)
+        };
+        serde_json::json!({
+            "status": "present",
+            "domain": owned_text(domain),
+            "code": code,
+            "description": owned_text(description),
+            "text_limit_bytes": ERROR_TEXT_LIMIT_BYTES,
+        })
+    }
+}
+
+pub(super) fn report_counter_allocation_error(error: *mut Object) {
+    eprintln!(
+        "ferrum_metal_counter_allocation_error {}",
+        objective_c_error(error),
+    );
+}
+
 fn checked_cpu_resolve(
     page: &MetalCounterPage,
     mapping: &MetalCounterIntervalMapping,

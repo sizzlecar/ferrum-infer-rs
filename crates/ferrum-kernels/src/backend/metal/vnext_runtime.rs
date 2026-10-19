@@ -642,6 +642,8 @@ fn new_counter_sample_buffer_checked(
         msg_send![device, newCounterSampleBufferWithDescriptor: descriptor error: &mut error]
     };
     if buffer.is_null() {
+        #[cfg(test)]
+        counter_diagnostic::report_counter_allocation_error(error);
         Err(())
     } else {
         Ok(unsafe { CounterSampleBuffer::from_ptr(buffer) })
