@@ -5,7 +5,7 @@
 //! Cold helpers receive explicit policy; production trait calls use the
 //! original context. Context-free compatibility methods use fixed defaults.
 
-use super::{add_registered_mmap_buffer, slice_is_in_registered_mmap, st, MetalBackend};
+use super::{add_registered_mmap_buffer, registered_mmap_entry, st, MetalBackend};
 use crate::backend::{Backend, GgufQuantType};
 use ferrum_types::{FerrumError, MetalBackendConfig, Result};
 use metal::MTLResourceOptions;
@@ -120,55 +120,72 @@ unsafe impl Sync for MetalQuantStore {}
 /// ~30× on M1 Max — Apple's GPU residency tracking on huge buffers is
 /// expensive per dispatch. Per-tensor views are registered in one model-owned
 /// residency set so Metal wires them during load instead of every dispatch.
-fn buffer_for_quant_bytes(
+pub(super) fn buffer_for_quant_bytes(
     bytes: &[u8],
     options: &MetalBackendConfig,
 ) -> Result<(metal::Buffer, u64, Option<super::MetalMmapLease>)> {
-    const PAGE: usize = 16384;
     let trace = options.mmap_trace;
-    if slice_is_in_registered_mmap(bytes) {
-        // Zero-copy: page-align the host range covering this tensor and
-        // wrap it in an MTLBuffer. The lease returned below keeps the mmap
-        // and residency set alive for exactly as long as the quant store.
+    // Resolve once and retain that exact registration through native creation,
+    // residency publication, or copy fallback. A boolean lookup followed by a
+    // second lookup could lose the registration between those operations.
+    if let Some(entry) = registered_mmap_entry(bytes) {
         let ptr_addr = bytes.as_ptr() as usize;
-        let aligned_start = ptr_addr & !(PAGE - 1);
-        let aligned_end = (ptr_addr + bytes.len()).div_ceil(PAGE) * PAGE;
-        let aligned_len = aligned_end - aligned_start;
-        let byte_offset = (ptr_addr - aligned_start) as u64;
-        let buf = st().pipes.device.new_buffer_with_bytes_no_copy(
-            aligned_start as *const c_void,
-            aligned_len as u64,
-            MTLResourceOptions::StorageModeShared,
-            None,
-        );
-        if buf.length() != 0 {
-            let mmap_lease = add_registered_mmap_buffer(bytes, &buf)?;
+        if let Some(native) = super::retained_memory::new_retained_buffer(
+            &st().pipes.device,
+            entry.memory.clone(),
+            bytes,
+            1,
+        )? {
+            let mmap_lease = add_registered_mmap_buffer(entry, &native.buffer)?;
             if trace {
                 eprintln!(
-                    "[mmap] zero-copy: tensor ptr=0x{ptr_addr:x} len={} -> buf @0x{aligned_start:x} len={aligned_len} off={byte_offset}",
-                    bytes.len()
+                    "[mmap] zero-copy: tensor ptr=0x{ptr_addr:x} len={} -> native_len={} off={}",
+                    bytes.len(),
+                    native.buffer.length(),
+                    native.byte_offset,
                 );
             }
-            return Ok((buf, byte_offset, Some(mmap_lease)));
+            return Ok((native.buffer, native.byte_offset as u64, Some(mmap_lease)));
         }
-        // newBufferWithBytesNoCopy can refuse very rare edge cases
-        // (fragmented host pages?). Fall through to the copy path.
         if trace {
             eprintln!(
-                "[mmap] zero-copy refused for tensor ptr=0x{ptr_addr:x} len={} aligned_len={aligned_len} — copying",
+                "[mmap] no safe native view for tensor ptr=0x{ptr_addr:x} len={} — copying",
                 bytes.len()
             );
         }
+        // Keep the resolved owner alive until the copy completes as well.
+        let buffer = copy_quant_bytes(bytes);
+        drop(entry);
+        return buffer.map(|buffer| (buffer, 0, None));
     }
     if trace {
         eprintln!("[mmap] copy: ptr={:p} len={}", bytes.as_ptr(), bytes.len());
     }
-    let buf = st().pipes.device.new_buffer_with_data(
-        bytes.as_ptr() as *const c_void,
-        bytes.len() as u64,
-        MTLResourceOptions::StorageModeShared,
-    );
-    Ok((buf, 0, None))
+    copy_quant_bytes(bytes).map(|buffer| (buffer, 0, None))
+}
+
+#[allow(
+    unexpected_cfgs,
+    reason = "objc 0.2 selector macros use legacy cargo-clippy cfg"
+)]
+fn copy_quant_bytes(bytes: &[u8]) -> Result<metal::Buffer> {
+    use metal::foreign_types::ForeignType;
+    use metal::objc::{msg_send, sel, sel_impl};
+    let device: &metal::DeviceRef = &st().pipes.device;
+    // SAFETY: Metal copies the borrowed bytes before returning. Keep native
+    // allocation failure out of metal-rs's non-null owned Buffer wrapper.
+    let raw: *mut metal::MTLBuffer = unsafe {
+        msg_send![device,
+            newBufferWithBytes: bytes.as_ptr() as *const c_void
+            length: bytes.len() as metal::NSUInteger
+            options: MTLResourceOptions::StorageModeShared
+        ]
+    };
+    if raw.is_null() {
+        Err(FerrumError::backend("Metal quant weight allocation failed"))
+    } else {
+        Ok(unsafe { metal::Buffer::from_ptr(raw) })
+    }
 }
 
 // ── MoE expert stack builders ────────────────────────────────────────
@@ -548,7 +565,7 @@ fn dispatch_part_gemv_offset(
 /// Phase 3e/3 extracted from the old `load_quant` body so `load_quant_fused`
 /// can compose multiple stores into a `Fused` variant without going
 /// through the `Box<dyn Linear>` wrapper.
-fn metal_load_quant_store_helper(
+pub(super) fn metal_load_quant_store_helper(
     kind: GgufQuantType,
     bytes: &[u8],
     n_rows: usize,

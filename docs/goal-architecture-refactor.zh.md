@@ -47,6 +47,10 @@ MoE API 迁移：移除旧 `Qwen3MoeModel`、`Qwen3MoeConfig`、`Qwen3MoeLayer` 
 
 后端配置 API：`Backend::new_context(&BackendContextConfig)` 返回可失败的原实例，`context_config` 提供加载与执行共享的不可变策略；移除设备选择 TLS，layer stage 显式绑定设备。库直接构造使用固定默认配置，CLI 仅在冷装配解析来源。Metal 共享设备/队列/mmap、独立 CUDA decode 诊断及 native TILE override 仍有单独边界，不据此宣称所有全局状态已消除。
 
+Metal 映射 API：`register_gguf_mmap` 接收 `RetainedHostMemoryRegion`，不再接受独立 slice 与任意 keeper。零拷贝 buffer 的原生释放回调持有真实内存所有者，覆盖 Rust 权重提前释放及原生 buffer 克隆；residency 独立持有，避免引用环。量化加载与原生静态权重导入共享范围检查和构造器；整页范围不能证明时复制对应 tensor，尾部 tensor 的额外内存及默认性能仍须验收。
+
+产品资格缺口：真实 Metal Llama GGUF 已能加载，但统一 worker 被模型现有的 CPU-only 能力声明拒绝。须补齐明确的 GPU 执行资格及原模型的 `run` / `serve` 验证；包装模型的内核/故障测试不能代替产品入口验收。
+
 配置 API 迁移：移除 `install_runtime_snapshot` / `active_runtime_snapshot`。Engine 在加载权重前固定 `LlamaExecutionConfig`，显式传入普通模型、GGUF 与 layer stage；库调用使用 `*_with_execution_config`，原构造器使用固定默认值。GPTQ loader 诊断通过 `NativeSafetensorsLoadOptions` 传入。batched graph / prefix 的布尔值统一按 Engine 语义解释，修正旧模型对 `true` / `false` 的不同解释；默认值与 `0/1` 行为保留。CLI 配置来源保留，模型专属选项不再写回进程环境；仍有真实消费者的后端配置桥随 GPU 所有权迁移退出，本片不代表全部运行状态已隔离。
 
 资源 API 迁移：`WeightLoader`、动态 LoRA 与 KV 分配显式接收原实例 context；模型从构造到关闭复用同一所有者。`LlamaFamilyModel::close` 检查设备完成及 graph 清理；退休失败保留原资源供重试，成功关闭后拒绝继续执行。graph 驱逐不等于执行完成，替换被捕获存储须先通过 checked retirement；KV 复制的旧存储留至原 context 确认终态。受管执行沿既有 worker 恢复；直接使用裸模型的调用方应显式关闭，若最终 `Drop` 仍无法安全退休，则诊断并终止进程，避免释放仍被引用的资源。设备执行未知与已完成后的清理失败分别报告；此异常兜底不替代正常产品 shutdown，也不构成未测 GPU 路线的支持声明。

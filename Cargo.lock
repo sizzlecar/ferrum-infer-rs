@@ -1452,6 +1452,7 @@ name = "ferrum-kernels"
 version = "0.13.0"
 dependencies = [
  "bindgen_cuda",
+ "block",
  "candle-core",
  "cudarc 0.19.4",
  "ferrum-interfaces",

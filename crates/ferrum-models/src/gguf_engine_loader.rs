@@ -257,8 +257,12 @@ fn load_open_gguf_decoder_with_info(
                 // `B::load_quant_*` calls produce zero-copy MTLBuffers. CRITICAL
                 // on a 32 GB Mac for 30B-A3B Q4_K_M (saves ~17 GB resident).
                 let mmap_registration = ferrum_kernels::backend::metal::register_gguf_mmap(
-                    gguf_arc.mmap_bytes(),
-                    gguf_arc.clone(),
+                    ferrum_runtime::RetainedHostMemoryRegion::new(
+                        gguf_arc.clone(),
+                        0,
+                        gguf_arc.mmap_bytes().len(),
+                    )
+                    .map_err(|e| FerrumError::model(format!("retain_gguf_mmap: {e}")))?,
                     &execution.backend_context.metal,
                 )
                 .map_err(|e| FerrumError::model(format!("register_gguf_mmap: {e}")))?;

@@ -94,6 +94,8 @@ pub fn contract_groups(backend: Backend) -> Vec<ContractGroup> {
                 "encode_failure_is_definitely_not_submitted_and_restores_stream",
                 "completed_device_status_is_checked_after_fence_and_fails_quiescently",
                 "completed_device_status_reused_slot_is_cleared_by_each_submission",
+                "static_weight_no_copy_region_retains_page_owner_after_source_drop",
+                "static_weight_import_copies_retained_regions_without_a_safe_native_view",
             ],
         ),
         Backend::Cuda => (
@@ -155,6 +157,21 @@ pub fn contract_groups(backend: Backend) -> Vec<ContractGroup> {
     if backend != Backend::Cpu {
         let mut tests = model_frame_tests(backend);
         if backend == Backend::Metal {
+            tests.extend(
+                [
+                    "metal_no_copy_quant_weights_survive_drop_before_commit",
+                    "metal_no_copy_raw_buffer_clone_outlives_context_and_weight",
+                    "metal_no_copy_peer_survives_independent_and_shared_mapping_retirement",
+                    "metal_registered_partial_page_copies_exact_tensor_and_releases_source",
+                ]
+                .into_iter()
+                .map(|name| ContractTest {
+                    package: "ferrum-kernels".into(),
+                    target: "ferrum_kernels".into(),
+                    kind: "lib".into(),
+                    name: format!("backend::metal::mmap_lifetime_tests::{name}"),
+                }),
+            );
             tests.extend(
                 [
                     "metal_instance_weight_policy_is_frozen_across_interleaved_loads_and_peer_retirement",
