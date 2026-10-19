@@ -826,6 +826,29 @@ impl Backend for MetalBackend {
         ctx.flush();
     }
 
+    fn begin_execution(ctx: &mut Self::Context) -> Result<()> {
+        if ctx.cmd.is_some() || ctx.encoder.is_some() || ctx.submitted.is_some() {
+            return Err(FerrumError::backend(
+                "Metal cannot begin an invocation before the original command is terminal",
+            ));
+        }
+        // This is an invocation boundary, not resource retirement. Only the
+        // previous terminal status is reset; queue and allocations stay owned.
+        ctx.last_completion = None;
+        Ok(())
+    }
+
+    fn retire_context(ctx: &mut Self::Context) -> Result<()> {
+        if Self::preparation_is_host_only(ctx) {
+            return Ok(());
+        }
+        match ctx.observe_completion() {
+            crate::backend::BackendCompletion::Succeeded
+            | crate::backend::BackendCompletion::Failed(_) => Ok(()),
+            crate::backend::BackendCompletion::Unresolved(error) => Err(error),
+        }
+    }
+
     fn try_sync(ctx: &mut Self::Context) -> Result<()> {
         ctx.flush_checked()
     }

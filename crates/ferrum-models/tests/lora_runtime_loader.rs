@@ -1,5 +1,5 @@
 use ferrum_kernels::backend::cpu::CpuBackend;
-use ferrum_kernels::backend::Backend;
+use ferrum_kernels::backend::{Backend, BackendCompletion};
 use ferrum_models::{load_runtime_lora_adapter, ActiveLoraAdapter, LoraAdapterConfig};
 use safetensors::tensor::{serialize_to_file, Dtype, TensorView};
 use std::collections::HashMap;
@@ -68,10 +68,14 @@ fn runtime_lora_loader_materializes_projection_metadata() {
         ],
     );
 
-    let adapter = load_runtime_lora_adapter::<CpuBackend>(&ActiveLoraAdapter {
-        name: "sql".to_string(),
-        path: tmp.path().to_path_buf(),
-    })
+    let mut ctx = CpuBackend::new_context();
+    let adapter = load_runtime_lora_adapter::<CpuBackend>(
+        &mut ctx,
+        &ActiveLoraAdapter {
+            name: "sql".to_string(),
+            path: tmp.path().to_path_buf(),
+        },
+    )
     .unwrap();
 
     assert_eq!(adapter.name, "sql");
@@ -86,8 +90,7 @@ fn runtime_lora_loader_materializes_projection_metadata() {
     assert_eq!(linear.scaling, 3.0);
 }
 
-#[test]
-fn runtime_lora_apply_projection_adds_scaled_delta() {
+fn lora_workspace_growth_matches_complete_outputs<B: Backend>() {
     let tmp = TempDir::new().unwrap();
     let config = LoraAdapterConfig {
         r: 2,
@@ -111,20 +114,66 @@ fn runtime_lora_apply_projection_adds_scaled_delta() {
             ),
         ],
     );
-    let adapter = load_runtime_lora_adapter::<CpuBackend>(&ActiveLoraAdapter {
-        name: "sql".to_string(),
-        path: tmp.path().to_path_buf(),
-    })
+    let mut ctx = B::new_context();
+    B::begin_execution(&mut ctx).unwrap();
+    let adapter = load_runtime_lora_adapter::<B>(
+        &mut ctx,
+        &ActiveLoraAdapter {
+            name: "sql".to_string(),
+            path: tmp.path().to_path_buf(),
+        },
+    )
     .unwrap();
 
-    let mut ctx = CpuBackend::new_context();
-    let input = CpuBackend::from_slice(&[1.0, 2.0, 3.0]);
-    let mut out = CpuBackend::from_slice(&[10.0, 20.0, 30.0, 40.0]);
-    adapter
-        .apply_projection(&mut ctx, 7, "qkv_proj", &input, &mut out, 1)
-        .unwrap();
+    let inputs = [1.0, 2.0, 3.0, -2.0, 0.5, 7.0];
+    let initial = [10.0, 20.0, 30.0, 40.0, 1.0, 2.0, 3.0, 4.0];
+    // A selects (x0, x1), B produces (x0, x1, x0+x1, 0), and the
+    // declared alpha/rank is 6/2 = 3. Every result is exactly representable
+    // in F16/F32; the third input coordinate must not influence any output.
+    let expected = [13.0, 26.0, 39.0, 40.0, -5.0, 3.5, -1.5, 4.0];
+    for rows in [1, 2] {
+        if rows > 1 {
+            B::begin_execution(&mut ctx).unwrap();
+        }
+        adapter.prepare_workspace(&mut ctx, rows).unwrap();
+        let input = B::from_slice_in_context(&mut ctx, &inputs[..rows * 3]);
+        let mut out = B::from_slice_in_context(&mut ctx, &initial[..rows * 4]);
+        let applied = adapter
+            .apply_projection(&mut ctx, 7, "qkv_proj", &input, &mut out, rows)
+            .unwrap();
+        // Observe once after both GEMMs and the scaled addition. Keep all
+        // inputs, outputs and adapter workspace alive through this boundary.
+        assert!(matches!(
+            B::observe_completion(&mut ctx),
+            BackendCompletion::Succeeded
+        ));
+        let actual = B::to_vec_in_context(&mut ctx, &out, rows * 4);
+        assert_eq!(applied, 1);
+        assert_eq!(actual, expected[..rows * 4]);
+    }
+    B::retire_context(&mut ctx).unwrap();
+    drop(adapter);
+    drop(ctx);
+}
 
-    assert_eq!(CpuBackend::to_vec(&out, 4), vec![13.0, 26.0, 39.0, 40.0]);
+#[test]
+fn runtime_lora_apply_projection_adds_scaled_delta() {
+    lora_workspace_growth_matches_complete_outputs::<CpuBackend>();
+}
+
+#[cfg(feature = "metal")]
+#[test]
+#[ignore = "requires actual Metal execution and LoRA workspace growth"]
+fn metal_lora_workspace_growth_matches_complete_outputs() {
+    lora_workspace_growth_matches_complete_outputs::<ferrum_kernels::backend::metal::MetalBackend>(
+    );
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "requires actual CUDA execution and LoRA workspace growth"]
+fn cuda_lora_workspace_growth_matches_complete_outputs() {
+    lora_workspace_growth_matches_complete_outputs::<ferrum_kernels::backend::cuda::CudaBackend>();
 }
 
 #[cfg(feature = "test-support")]

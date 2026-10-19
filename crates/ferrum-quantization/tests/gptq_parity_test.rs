@@ -349,7 +349,9 @@ fn cuda_vs_cpu() {
     .expect("CPU load_gptq");
 
     // CUDA Marlin path.
-    let cuda_linear = GptqLinear::<CudaBackend>::from_raw(
+    let mut cuda_ctx = <CudaBackend as Backend>::new_context();
+    let cuda_linear = GptqLinear::<CudaBackend>::from_raw_in_context(
+        &mut cuda_ctx,
         &syn.qweight,
         &syn.scales,
         &syn.qzeros,
@@ -375,12 +377,11 @@ fn cuda_vs_cpu() {
     cpu_linear.forward(&mut cpu_ctx, &input_f16, &mut cpu_out, m);
 
     // CUDA out
-    let mut cuda_ctx = <CudaBackend as Backend>::new_context();
-    let input_dev = CudaBackend::from_slice(&input_f32);
-    let mut out_dev = CudaBackend::alloc(m * n);
+    let input_dev = CudaBackend::from_slice_in_context(&mut cuda_ctx, &input_f32);
+    let mut out_dev = CudaBackend::alloc_in_context(&mut cuda_ctx, m * n);
     cuda_linear.forward(&mut cuda_ctx, &input_dev, &mut out_dev, m);
     <CudaBackend as Backend>::sync(&mut cuda_ctx);
-    let cuda_out = CudaBackend::to_vec(&out_dev, m * n);
+    let cuda_out = CudaBackend::to_vec_in_context(&mut cuda_ctx, &out_dev, m * n);
 
     // Marlin is fp16-accum. CPU fp32. Expect modest drift.
     let max_diff = cpu_out
@@ -426,7 +427,9 @@ fn run_cuda_desc_act_vs_cpu_reference_shape(label: &str, k: usize, n: usize, m: 
     let mut cpu_out = vec![0.0f32; m * n];
     <CpuBackend as Backend>::gemm(&mut (), &input_f16, &ref_w, &mut cpu_out, m, n, k);
 
-    let cuda_linear = GptqLinear::<CudaBackend>::from_raw(
+    let mut cuda_ctx = <CudaBackend as Backend>::new_context();
+    let cuda_linear = GptqLinear::<CudaBackend>::from_raw_in_context(
+        &mut cuda_ctx,
         &syn.qweight,
         &syn.scales,
         &syn.qzeros,
@@ -439,12 +442,11 @@ fn run_cuda_desc_act_vs_cpu_reference_shape(label: &str, k: usize, n: usize, m: 
     )
     .expect("CUDA load_gptq desc_act (Marlin repack + upload)");
 
-    let mut cuda_ctx = <CudaBackend as Backend>::new_context();
-    let input_dev = CudaBackend::from_slice(&input_f32);
-    let mut out_dev = CudaBackend::alloc(m * n);
+    let input_dev = CudaBackend::from_slice_in_context(&mut cuda_ctx, &input_f32);
+    let mut out_dev = CudaBackend::alloc_in_context(&mut cuda_ctx, m * n);
     cuda_linear.forward(&mut cuda_ctx, &input_dev, &mut out_dev, m);
     <CudaBackend as Backend>::sync(&mut cuda_ctx);
-    let cuda_out = CudaBackend::to_vec(&out_dev, m * n);
+    let cuda_out = CudaBackend::to_vec_in_context(&mut cuda_ctx, &out_dev, m * n);
 
     let nonfinite = cuda_out.iter().filter(|x| !x.is_finite()).count();
     assert_eq!(
@@ -529,7 +531,9 @@ fn run_real_gptq_prefix_vs_cpu_reference(label: &str, prefix: &str, input_path: 
     let mut cpu_out = vec![0.0f32; m * n];
     <CpuBackend as Backend>::gemm(&mut (), &input_f16, &ref_w, &mut cpu_out, m, n, k);
 
-    let cuda_linear = GptqLinear::<CudaBackend>::from_raw(
+    let mut cuda_ctx = <CudaBackend as Backend>::new_context();
+    let cuda_linear = GptqLinear::<CudaBackend>::from_raw_in_context(
+        &mut cuda_ctx,
         &qweight,
         &scales,
         &qzeros,
@@ -542,12 +546,11 @@ fn run_real_gptq_prefix_vs_cpu_reference(label: &str, prefix: &str, input_path: 
     )
     .expect("CUDA load real GPTQ prefix");
 
-    let mut cuda_ctx = <CudaBackend as Backend>::new_context();
-    let input_dev = CudaBackend::from_slice(&input_f32);
-    let mut out_dev = CudaBackend::alloc(m * n);
+    let input_dev = CudaBackend::from_slice_in_context(&mut cuda_ctx, &input_f32);
+    let mut out_dev = CudaBackend::alloc_in_context(&mut cuda_ctx, m * n);
     cuda_linear.forward(&mut cuda_ctx, &input_dev, &mut out_dev, m);
     <CudaBackend as Backend>::sync(&mut cuda_ctx);
-    let cuda_out = CudaBackend::to_vec(&out_dev, m * n);
+    let cuda_out = CudaBackend::to_vec_in_context(&mut cuda_ctx, &out_dev, m * n);
 
     let cuda_nonfinite = cuda_out.iter().filter(|x| !x.is_finite()).count();
     let cpu_nonfinite = cpu_out.iter().filter(|x| !x.is_finite()).count();
@@ -721,16 +724,20 @@ fn cuda_stacked_offset_vs_per_expert() {
         .map(|e| make_synthetic(k, n_per, gs, 0xCAFE0000 + e as u64))
         .collect();
 
+    let bias: Vec<f32> = (0..n_per).map(|index| (index % 7) as f32 * 0.125).collect();
+
     // Per-expert dedicated GptqLinears (each gets its own MarlinWeight).
+    let mut ctx = <CudaBackend as Backend>::new_context();
     let per_expert: Vec<GptqLinear<CudaBackend>> = experts
         .iter()
         .map(|syn| {
-            GptqLinear::<CudaBackend>::from_raw(
+            GptqLinear::<CudaBackend>::from_raw_in_context(
+                &mut ctx,
                 &syn.qweight,
                 &syn.scales,
                 &syn.qzeros,
                 None,
-                None,
+                Some(&bias),
                 syn.bits,
                 syn.group_size,
                 syn.k,
@@ -748,31 +755,33 @@ fn cuda_stacked_offset_vs_per_expert() {
     let qz_refs: Vec<&[i32]> = experts.iter().map(|e| e.qzeros.as_slice()).collect();
     // Phase C step 4e: load_gptq_stacked now returns the trait-object
     // MarlinExpertStack directly (no intermediate GptqStore type).
-    let stacked = <CudaBackend as BackendQuantMarlin>::load_gptq_stacked(
-        &qw_refs, &sc_refs, &qz_refs, None, 4, gs, k, n_per,
+    let stacked = <CudaBackend as BackendQuantMarlin>::load_gptq_stacked_in_context(
+        &mut ctx, &qw_refs, &sc_refs, &qz_refs, None, 4, gs, k, n_per,
     )
     .expect("stacked load_gptq");
 
     let m = 2;
     let input: Vec<f32> = (0..m * k).map(|i| (i as f32 * 0.0027).sin()).collect();
-    let mut ctx = <CudaBackend as Backend>::new_context();
 
     // Run per-expert reference + offset variant for each expert; compare.
     for (e, lin) in per_expert.iter().enumerate() {
-        let input_dev = CudaBackend::from_slice(&input);
-        let mut ref_out_dev = CudaBackend::alloc(m * n_per);
+        let input_dev = CudaBackend::from_slice_in_context(&mut ctx, &input);
+        let mut ref_out_dev = CudaBackend::alloc_in_context(&mut ctx, m * n_per);
         lin.forward(&mut ctx, &input_dev, &mut ref_out_dev, m);
         <CudaBackend as Backend>::sync(&mut ctx);
-        let ref_out = CudaBackend::to_vec(&ref_out_dev, m * n_per);
+        let ref_out = CudaBackend::to_vec_in_context(&mut ctx, &ref_out_dev, m * n_per);
 
-        let input_dev_off = CudaBackend::from_slice(&input);
-        let mut off_out_dev = CudaBackend::alloc(m * n_per);
-        let off_lin = ferrum_quantization::StackedExpertLinear::<CudaBackend>::new(
-            stacked.clone(),
-            e * n_per,
-            n_per,
-        )
-        .expect("StackedExpertLinear::new");
+        let input_dev_off = CudaBackend::from_slice_in_context(&mut ctx, &input);
+        let mut off_out_dev = CudaBackend::alloc_in_context(&mut ctx, m * n_per);
+        let off_lin =
+            ferrum_quantization::StackedExpertLinear::<CudaBackend>::new_with_bias_in_context(
+                &mut ctx,
+                stacked.clone(),
+                e * n_per,
+                n_per,
+                &bias,
+            )
+            .expect("StackedExpertLinear::new");
         ferrum_kernels::Linear::<CudaBackend>::forward(
             &off_lin,
             &mut ctx,
@@ -781,7 +790,7 @@ fn cuda_stacked_offset_vs_per_expert() {
             m,
         );
         <CudaBackend as Backend>::sync(&mut ctx);
-        let off_out = CudaBackend::to_vec(&off_out_dev, m * n_per);
+        let off_out = CudaBackend::to_vec_in_context(&mut ctx, &off_out_dev, m * n_per);
 
         let max_diff = ref_out
             .iter()
@@ -855,8 +864,9 @@ fn cpu_stacked_vs_per_expert_parity() {
     let qweights: Vec<&[i32]> = experts.iter().map(|s| s.qweight.as_slice()).collect();
     let scales: Vec<&[f32]> = experts.iter().map(|s| s.scales.as_slice()).collect();
     let qzeros: Vec<&[i32]> = experts.iter().map(|s| s.qzeros.as_slice()).collect();
-    let stacked_store = <CpuBackend as BackendQuantMarlin>::load_gptq_stacked(
-        &qweights, &scales, &qzeros, None, 4, gs, k, n_per,
+    let mut ctx = <CpuBackend as Backend>::new_context();
+    let stacked_store = <CpuBackend as BackendQuantMarlin>::load_gptq_stacked_in_context(
+        &mut ctx, &qweights, &scales, &qzeros, None, 4, gs, k, n_per,
     )
     .expect("stacked load_gptq_stacked");
 

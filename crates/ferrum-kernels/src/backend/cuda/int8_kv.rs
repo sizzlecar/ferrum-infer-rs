@@ -17,7 +17,7 @@
 use crate::backend::{KvInt8, KvTokenLayout, QuantizedPagedKvPool};
 use ferrum_types::{FerrumError, Result};
 
-use super::{default_stream, CudaBackend};
+use super::{CudaBackend, CudaState};
 
 // CUDA: INT8 KV cache (vLLM-style scale-per-token symmetric quantization).
 // Kernel-side dispatch is exposed via [`crate::int8_kv::launch_int8_paged_decode_attention`]
@@ -42,9 +42,14 @@ impl crate::backend::BackendKvDtype<crate::backend::KvInt8> for CudaBackend {
 pub struct OptionalCudaInt8(pub Option<cudarc::driver::CudaSlice<i8>>);
 
 impl OptionalCudaInt8 {
-    /// Allocate `len` zeroed `int8_t` elements on the default CUDA stream.
-    pub fn alloc(len: usize) -> Self {
-        let stream = default_stream();
+    /// Allocate `len` zeroed `int8_t` elements on the owning context's CUDA stream.
+    pub fn alloc(ctx: &mut CudaState, len: usize) -> Self {
+        assert!(
+            !ctx.capture_in_flight,
+            "INT8 allocation during CUDA capture"
+        );
+        ctx.completion_observed = false;
+        let stream = &ctx.stream;
         let buf = stream.alloc_zeros::<i8>(len).expect("alloc int8 KV buffer");
         Self(Some(buf))
     }
@@ -63,9 +68,14 @@ impl OptionalCudaInt8 {
 pub struct OptionalCudaScalesF16(pub Option<cudarc::driver::CudaSlice<half::f16>>);
 
 impl OptionalCudaScalesF16 {
-    /// Allocate `len` zeroed FP16 scales on the default CUDA stream.
-    pub fn alloc(len: usize) -> Self {
-        let stream = default_stream();
+    /// Allocate `len` zeroed FP16 scales on the owning context's CUDA stream.
+    pub fn alloc(ctx: &mut CudaState, len: usize) -> Self {
+        assert!(
+            !ctx.capture_in_flight,
+            "INT8 allocation during CUDA capture"
+        );
+        ctx.completion_observed = false;
+        let stream = &ctx.stream;
         let buf = stream
             .alloc_zeros::<half::f16>(len)
             .expect("alloc int8 KV scales");
@@ -91,21 +101,24 @@ impl OptionalCudaScalesF16 {
 // cudarc primitives directly.
 impl crate::backend::BackendInt8KvOps for CudaBackend {
     fn alloc_paged_int8_pool(
+        ctx: &mut Self::Context,
         num_blocks: usize,
         block_size: usize,
         num_kv_heads: usize,
         head_dim: usize,
     ) -> QuantizedPagedKvPool<Self, KvInt8> {
-        QuantizedPagedKvPool::new_cuda(num_blocks, block_size, num_kv_heads, head_dim)
+        QuantizedPagedKvPool::new_cuda(ctx, num_blocks, block_size, num_kv_heads, head_dim)
     }
 
     fn alloc_paged_int8_layer(
+        ctx: &mut Self::Context,
         max_blocks_per_seq: usize,
         block_size: usize,
         num_kv_heads: usize,
         head_dim: usize,
     ) -> crate::backend::KvCacheQuant<Self, crate::backend::KvInt8> {
         crate::backend::KvCacheQuant::<CudaBackend, crate::backend::KvInt8>::new_paged_cuda(
+            ctx,
             max_blocks_per_seq,
             block_size,
             num_kv_heads,
@@ -230,6 +243,7 @@ impl QuantizedPagedKvPool<CudaBackend, KvInt8> {
     /// Allocate physical storage once per model layer. Every sequence and
     /// cached prefix refers to the same block namespace and these same arrays.
     pub fn new_cuda(
+        ctx: &mut CudaState,
         num_blocks: usize,
         block_size: usize,
         num_kv_heads: usize,
@@ -250,10 +264,10 @@ impl QuantizedPagedKvPool<CudaBackend, KvInt8> {
             .checked_mul(head_dim)
             .expect("INT8 pool element overflow");
         Self {
-            k: OptionalCudaInt8::alloc(elem_count),
-            v: OptionalCudaInt8::alloc(elem_count),
-            k_scales: OptionalCudaScalesF16::alloc(scale_count),
-            v_scales: OptionalCudaScalesF16::alloc(scale_count),
+            k: OptionalCudaInt8::alloc(ctx, elem_count),
+            v: OptionalCudaInt8::alloc(ctx, elem_count),
+            k_scales: OptionalCudaScalesF16::alloc(ctx, scale_count),
+            v_scales: OptionalCudaScalesF16::alloc(ctx, scale_count),
             num_blocks,
             block_size,
             num_kv_heads,
@@ -335,6 +349,7 @@ impl crate::backend::KvCacheQuant<CudaBackend, crate::backend::KvInt8> {
     /// - `block_table` is allocated as u32[max_blocks_per_seq] via `B::alloc_u32`
     /// - `context_lens` is allocated as u32[1] (single seq for now)
     pub fn new_paged_cuda(
+        ctx: &mut CudaState,
         max_blocks_per_seq: usize,
         block_size: usize,
         num_kv_heads: usize,
@@ -344,11 +359,15 @@ impl crate::backend::KvCacheQuant<CudaBackend, crate::backend::KvInt8> {
         let logical_capacity = max_blocks_per_seq
             .checked_mul(block_size)
             .expect("INT8 table capacity overflow");
-        let block_table =
-            <CudaBackend as Backend>::alloc_typed(crate::backend::Dtype::U32, max_blocks_per_seq);
+        let block_table = <CudaBackend as Backend>::alloc_typed_in_context(
+            ctx,
+            crate::backend::Dtype::U32,
+            max_blocks_per_seq,
+        );
         // The caller initializes tables on its preparation context and observes
         // that context before publishing the cache as ready.
-        let context_lens = <CudaBackend as Backend>::alloc_typed(crate::backend::Dtype::U32, 1);
+        let context_lens =
+            <CudaBackend as Backend>::alloc_typed_in_context(ctx, crate::backend::Dtype::U32, 1);
 
         // Re-cast typed u32 buffer to the trait's Buffer (FP16) — same
         // pattern the FP16 paged path uses for block_table/context_lens

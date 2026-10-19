@@ -39,6 +39,28 @@ impl<B: Backend> DenseLinear<B> {
         }
     }
 
+    /// Construct using the owning model's execution context.
+    pub fn from_rows_in_context(
+        ctx: &mut B::Context,
+        weight_row_major: &[f32],
+        out_features: usize,
+        in_features: usize,
+    ) -> Self {
+        debug_assert_eq!(
+            weight_row_major.len(),
+            out_features * in_features,
+            "DenseLinear weight length mismatch"
+        );
+        let weight = B::from_slice_in_context(ctx, weight_row_major);
+        Self {
+            weight,
+            bias: None,
+            in_features,
+            out_features,
+            metadata: LinearMetadata::default(),
+        }
+    }
+
     /// Build a dense projection with a bias vector of length `out_features`.
     pub fn from_rows_with_bias(
         weight_row_major: &[f32],
@@ -50,6 +72,24 @@ impl<B: Backend> DenseLinear<B> {
         Self {
             weight: B::from_slice(weight_row_major),
             bias: Some(B::from_slice(bias)),
+            in_features,
+            out_features,
+            metadata: LinearMetadata::default(),
+        }
+    }
+
+    /// Construct using the owning model's execution context.
+    pub fn from_rows_with_bias_in_context(
+        ctx: &mut B::Context,
+        weight_row_major: &[f32],
+        bias: &[f32],
+        out_features: usize,
+        in_features: usize,
+    ) -> Self {
+        debug_assert_eq!(bias.len(), out_features, "DenseLinear bias length mismatch");
+        Self {
+            weight: B::from_slice_in_context(ctx, weight_row_major),
+            bias: Some(B::from_slice_in_context(ctx, bias)),
             in_features,
             out_features,
             metadata: LinearMetadata::default(),

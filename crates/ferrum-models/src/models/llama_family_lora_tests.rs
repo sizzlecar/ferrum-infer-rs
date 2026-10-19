@@ -132,6 +132,78 @@ fn lora_graph_requested_decode_stays_eager_and_preserves_base_adapter_base() {
 }
 
 #[test]
+fn lora_workspace_prepares_only_bound_adapter_and_current_rows() {
+    let cfg = TinyLlamaConfig::default();
+    let mut model = tiny_llama_model(&cfg);
+    let mut reference = tiny_llama_model(&cfg);
+    let (_first_directory, first) = adapter_fixture(cfg.hidden_size);
+    let (_second_directory, mut second) = adapter_fixture(cfg.hidden_size);
+    second.name = "unused".into();
+    model.preload_lora_adapter(&first).unwrap();
+    model.preload_lora_adapter(&second).unwrap();
+    model.ensure_scratch(16);
+    assert_eq!(
+        model.prefill("base", &[0, 1, 2, 3, 4, 5]),
+        reference.prefill("base", &[0, 1, 2, 3, 4, 5])
+    );
+    assert_eq!(
+        model.lora_adapters[&first.name].workspace_rows_for_test(),
+        0
+    );
+    assert_eq!(
+        model.lora_adapters[&second.name].workspace_rows_for_test(),
+        0
+    );
+
+    model
+        .set_lora_adapter_for_cache("adapted", Some(first.clone()))
+        .unwrap();
+    reference
+        .set_lora_adapter_for_cache("adapted", Some(first.clone()))
+        .unwrap();
+    for chunk in [&[0, 1][..], &[2, 3][..]] {
+        assert_eq!(
+            model.prefill("adapted", chunk),
+            reference.prefill("adapted", chunk)
+        );
+        assert_eq!(
+            model.lora_adapters[&first.name].workspace_rows_for_test(),
+            2
+        );
+        assert_eq!(
+            model.lora_adapters[&second.name].workspace_rows_for_test(),
+            0
+        );
+    }
+    assert_eq!(model.cache_len("adapted"), 4);
+    assert_eq!(
+        model.decode("adapted", 4, 4),
+        reference.decode("adapted", 4, 4)
+    );
+    assert_eq!(
+        model.lora_adapters[&first.name].workspace_rows_for_test(),
+        2
+    );
+    assert_eq!(
+        model.prefill("adapted", &[5, 6, 7]),
+        reference.prefill("adapted", &[5, 6, 7])
+    );
+    assert_eq!(model.cache_len("adapted"), 8);
+    assert_eq!(
+        model.lora_adapters[&first.name].workspace_rows_for_test(),
+        3
+    );
+    assert_eq!(
+        model.lora_adapters[&second.name].workspace_rows_for_test(),
+        0
+    );
+    model.release("base");
+    model.release("adapted");
+    model.close().unwrap();
+    reference.close().unwrap();
+}
+
+#[test]
 fn lora_preload_validates_identity_and_shape_without_sequence_state() {
     let cfg = TinyLlamaConfig::default();
     let mut model = tiny_llama_model(&cfg);
@@ -168,13 +240,13 @@ fn lora_preload_validates_identity_and_shape_without_sequence_state() {
 #[cfg(feature = "cuda")]
 #[test]
 fn lora_cuda_existing_base_graph_cannot_bypass_adapter() {
-    use ferrum_kernels::backend::{cuda::CudaBackend, Backend, BackendGraph};
+    use ferrum_kernels::backend::{cuda::CudaBackend, BackendGraph};
 
     use super::{LlamaFamilyConfig, LlamaFamilyModel, SINGLE_ITEM_GRAPH_KEY};
     use crate::test_support::SyntheticLlamaLoader;
 
-    // One real model owns the eager oracle and captured graph: constructing a
-    // second model would invalidate the process-global graph under test.
+    // One real model owns both the eager oracle and the captured graph on its
+    // original context. A fresh context cannot replay this instance's graph.
     let cfg = LlamaFamilyConfig {
         hidden_size: 128,
         intermediate_size: 256,
@@ -226,9 +298,14 @@ fn lora_cuda_existing_base_graph_cannot_bypass_adapter() {
     // before the adapter call. This repeats the last base write at the same
     // device position; its still-live, separate KV is not the adapter's KV.
     // No CUDA, unsupported capture, or missing graph is a failure, not a skip.
-    let mut ctx = CudaBackend::new_context();
-    assert!(CudaBackend::replay_graph(&mut ctx, SINGLE_ITEM_GRAPH_KEY).unwrap());
-    CudaBackend::sync(&mut ctx);
+    model
+        .run_device_frame(|_, frame| {
+            assert!(CudaBackend::replay_graph(&mut frame.context, SINGLE_ITEM_GRAPH_KEY).unwrap());
+            frame.completed = Some(super::device_execution::checked_sync::<CudaBackend>(
+                &mut frame.context,
+            ));
+        })
+        .into_legacy_result();
     assert_eq!(model.cache_len("adapted"), 3);
 
     let adapted_decode = model.decode("adapted", 3, 3);

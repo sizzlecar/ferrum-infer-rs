@@ -30,12 +30,20 @@ impl FirstLoadLoader<'_> {
 }
 
 impl WeightLoader<CpuBackend> for FirstLoadLoader<'_> {
-    fn load_tensor(&self, _name: &str) -> Result<Vec<f32>> {
+    fn load_tensor(
+        &self,
+        _ctx: &mut <CpuBackend as ferrum_kernels::backend::Backend>::Context,
+        _name: &str,
+    ) -> Result<Vec<f32>> {
         self.on_load();
         Ok(vec![1.0])
     }
 
-    fn load_linear(&self, name: &str) -> Result<Box<dyn Linear<CpuBackend>>> {
+    fn load_linear(
+        &self,
+        ctx: &mut <CpuBackend as ferrum_kernels::backend::Backend>::Context,
+        name: &str,
+    ) -> Result<Box<dyn Linear<CpuBackend>>> {
         self.on_load();
         let rows = if name.ends_with("qkv_proj") {
             3
@@ -44,7 +52,8 @@ impl WeightLoader<CpuBackend> for FirstLoadLoader<'_> {
         } else {
             1
         };
-        Ok(Box::new(DenseLinear::<CpuBackend>::from_rows(
+        Ok(Box::new(DenseLinear::<CpuBackend>::from_rows_in_context(
+            ctx,
             &vec![1.0; rows],
             rows,
             1,

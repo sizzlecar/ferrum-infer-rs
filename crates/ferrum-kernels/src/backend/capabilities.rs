@@ -59,14 +59,25 @@ pub trait BackendGraph: Backend {
         Ok(false)
     }
 
-    /// Drop the cached graph for `_key` — required when its kernel-arg
-    /// pointers (KV cache, scratch) might no longer be valid. Use
-    /// `reset_all_graphs` when EVERY cached graph should be evicted
-    /// (hard model reload / scratch realloc).
+    /// Evict the cached graph for `_key`. Submitted executions retain their
+    /// original graph lease; eviction alone does not permit freeing captured
+    /// storage. Use `retire_graphs_for_storage_mutation` before replacing it.
     fn reset_graph(_ctx: &mut Self::Context, _key: u64) {}
 
-    /// Drop ALL cached graphs — used by hard reset paths.
+    /// Evict all cached graphs without claiming execution retirement.
     fn reset_all_graphs(_ctx: &mut Self::Context) {}
+
+    /// Retire every captured executable before replacing captured storage.
+    /// A capturing backend must observe the original work and destroy its
+    /// actual graph handles before returning Ok. On error, callers retain the
+    /// old storage and context for recovery. This is a cold growth boundary,
+    /// distinct from ordinary cache eviction.
+    ///
+    /// Backends without captured programs have no graph handles to retire.
+    fn retire_graphs_for_storage_mutation(ctx: &mut Self::Context) -> Result<()> {
+        Self::reset_all_graphs(ctx);
+        Ok(())
+    }
 }
 
 // ════════════════════════════════════════════════════════════════════════
@@ -148,6 +159,31 @@ pub trait BackendQuantMarlin: Backend {
             "load_gptq not implemented for this backend",
         ))
     }
+
+    fn load_gptq_in_context(
+        _ctx: &mut Self::Context,
+        _qweight: &[i32],
+        _scales: &[f32],
+        _qzeros: &[i32],
+        _g_idx: Option<&[i32]>,
+        _bias_host: Option<&[f32]>,
+        _bits: u32,
+        _group_size: usize,
+        _k: usize,
+        _n: usize,
+    ) -> Result<Box<dyn crate::Linear<Self> + Send + Sync>> {
+        Self::load_gptq(
+            _qweight,
+            _scales,
+            _qzeros,
+            _g_idx,
+            _bias_host,
+            _bits,
+            _group_size,
+            _k,
+            _n,
+        )
+    }
     /// Load num_experts GPTQ weight tiles into ONE stacked store, with
     /// the property that **each expert's packed bytes are contiguous**
     /// in the resulting store. This is what the offset GEMM needs to
@@ -190,6 +226,29 @@ pub trait BackendQuantMarlin: Backend {
         Err(FerrumError::unsupported(
             "load_gptq_stacked not implemented for this backend",
         ))
+    }
+
+    fn load_gptq_stacked_in_context(
+        _ctx: &mut Self::Context,
+        _qweights: &[&[i32]],
+        _scales: &[&[f32]],
+        _qzeros: &[&[i32]],
+        _g_idx: Option<&[i32]>,
+        _bits: u32,
+        _group_size: usize,
+        _k: usize,
+        _n_per_expert: usize,
+    ) -> Result<std::sync::Arc<dyn crate::MarlinExpertStack<Self>>> {
+        Self::load_gptq_stacked(
+            _qweights,
+            _scales,
+            _qzeros,
+            _g_idx,
+            _bits,
+            _group_size,
+            _k,
+            _n_per_expert,
+        )
     }
     // Phase C step 4a: marlin_zero_stacked_workspace — body inlined into
     // MarlinExpertStack::zero_workspace.
@@ -252,6 +311,16 @@ pub trait BackendQuantGguf: Backend {
             "load_quant not implemented for this backend",
         ))
     }
+
+    fn load_quant_in_context(
+        _ctx: &mut Self::Context,
+        _kind: GgufQuantType,
+        _bytes: &[u8],
+        _n_rows: usize,
+        _n_cols: usize,
+    ) -> Result<Box<dyn crate::Linear<Self> + Send + Sync>> {
+        Self::load_quant(_kind, _bytes, _n_rows, _n_cols)
+    }
     /// Build a fused linear from multiple `(kind, bytes, n_rows)`
     /// parts that share `n_cols`. Used by `GgufLoader::load_fused` when
     /// parts have heterogeneous quant kinds (e.g. Qwen3 qkv_proj where
@@ -268,6 +337,14 @@ pub trait BackendQuantGguf: Backend {
         Err(FerrumError::unsupported(
             "load_quant_fused not implemented for this backend",
         ))
+    }
+
+    fn load_quant_fused_in_context(
+        _ctx: &mut Self::Context,
+        _parts: &[(GgufQuantType, &[u8], usize)],
+        _n_cols: usize,
+    ) -> Result<Box<dyn crate::Linear<Self> + Send + Sync>> {
+        Self::load_quant_fused(_parts, _n_cols)
     }
     /// Build a stacked-experts MoE linear from a contiguous 3-D weight
     /// payload `[num_experts, n_rows, n_cols/256]` super-blocks. Used for
@@ -289,6 +366,17 @@ pub trait BackendQuantGguf: Backend {
         Err(FerrumError::unsupported(
             "load_quant_experts not implemented for this backend",
         ))
+    }
+
+    fn load_quant_experts_in_context(
+        _ctx: &mut Self::Context,
+        _kind: GgufQuantType,
+        _bytes: &[u8],
+        _num_experts: usize,
+        _n_rows: usize,
+        _n_cols: usize,
+    ) -> Result<Box<dyn crate::StackedExpertGgufLinear<Self>>> {
+        Self::load_quant_experts(_kind, _bytes, _num_experts, _n_rows, _n_cols)
     }
 }
 

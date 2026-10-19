@@ -13,7 +13,6 @@
 use cudarc::driver::{CudaSlice, CudaStream, DevicePtr, DevicePtrMut};
 use ferrum_types::{FerrumError, Result, CUDA_NATIVE_ADAPTIVE_V1_MAX_SEQUENCE_TOKENS};
 use half::f16;
-use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
 
 pub(crate) const VNEXT_VLLM_BLOCK_TOKENS: u64 = 16;
@@ -997,11 +996,11 @@ unsafe fn dispatch_vnext_addressed_paged_attention_indexed_impl(
     Ok(kernel)
 }
 
-// Process-global scratch (exp_sums / max_logits / tmp_out).  Mirrors the
-// MARLIN_GATHER_SCRATCH pattern — stable GPU addresses so captured graphs
+// Per-context scratch (exp_sums / max_logits / tmp_out). Stable GPU addresses
+// and retained predecessor storage let the original captured graphs
 // can replay safely; sized once for the model's max (num_seqs, num_heads,
 // max_partitions, head_dim).
-struct PagedAttnScratch {
+pub(super) struct PagedAttnScratch {
     exp_sums: CudaSlice<f32>,
     max_logits: CudaSlice<f32>,
     tmp_out: CudaSlice<f16>,
@@ -1015,9 +1014,6 @@ struct PagedAttnCapacity {
     max_partitions: usize,
     head_dim: usize,
 }
-
-static PA_SCRATCH: std::sync::OnceLock<std::sync::RwLock<HashMap<usize, PagedAttnScratch>>> =
-    std::sync::OnceLock::new();
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct VllmPagedAttnRuntimeConfig {
@@ -1050,62 +1046,50 @@ fn vllm_paged_attn_runtime_config() -> &'static VllmPagedAttnRuntimeConfig {
     CONFIG.get_or_init(VllmPagedAttnRuntimeConfig::from_env)
 }
 
-fn pa_scratch_slots() -> &'static std::sync::RwLock<HashMap<usize, PagedAttnScratch>> {
-    PA_SCRATCH.get_or_init(|| std::sync::RwLock::new(HashMap::new()))
-}
-
 fn pa_v1_short_enabled() -> bool {
     vllm_paged_attn_runtime_config().v1_short
 }
 
 fn ensure_pa_scratch(
-    stream: &Arc<CudaStream>,
-    ordinal: usize,
+    ctx: &mut super::CudaState,
     num_seqs: usize,
     num_heads: usize,
     max_partitions: usize,
     head_dim: usize,
 ) {
-    let need = PagedAttnCapacity {
-        num_seqs,
+    if ctx.paged_attention_scratch.as_ref().is_some_and(|s| {
+        s.capacity.num_seqs >= num_seqs
+            && s.capacity.num_heads >= num_heads
+            && s.capacity.max_partitions >= max_partitions
+            && s.capacity.head_dim >= head_dim
+    }) {
+        return;
+    }
+    assert!(
+        !ctx.capture_in_flight,
+        "paged attention scratch growth during CUDA capture"
+    );
+    let cap = PagedAttnCapacity {
+        num_seqs: num_seqs.max(64),
         num_heads,
-        max_partitions,
+        max_partitions: max_partitions.max(8),
         head_dim,
     };
-    {
-        let g = pa_scratch_slots().read().expect("PA_SCRATCH poisoned");
-        if let Some(s) = g.get(&ordinal) {
-            if s.capacity.num_seqs >= need.num_seqs
-                && s.capacity.num_heads >= need.num_heads
-                && s.capacity.max_partitions >= need.max_partitions
-                && s.capacity.head_dim >= need.head_dim
-            {
-                return;
-            }
-        }
-    }
-    // Allocate to the new max (round num_seqs up so growth amortises).
-    let cap = PagedAttnCapacity {
-        num_seqs: need.num_seqs.max(64),
-        num_heads: need.num_heads,
-        max_partitions: need.max_partitions.max(8),
-        head_dim: need.head_dim,
-    };
     let n_floats = cap.num_seqs * cap.num_heads * cap.max_partitions;
-    let n_halves = cap.num_seqs * cap.num_heads * cap.max_partitions * cap.head_dim;
-    let exp_sums = unsafe { stream.alloc::<f32>(n_floats) }.expect("PA exp_sums alloc");
-    let max_logits = unsafe { stream.alloc::<f32>(n_floats) }.expect("PA max_logits alloc");
-    let tmp_out = unsafe { stream.alloc::<f16>(n_halves) }.expect("PA tmp_out alloc");
-    let mut w = pa_scratch_slots().write().expect("PA_SCRATCH poisoned");
-    w.insert(
-        ordinal,
-        PagedAttnScratch {
-            exp_sums,
-            max_logits,
-            tmp_out,
-            capacity: cap,
-        },
-    );
+    let n_halves = n_floats * cap.head_dim;
+    let exp_sums = unsafe { ctx.stream.alloc::<f32>(n_floats) }.expect("PA exp_sums allocation");
+    let max_logits =
+        unsafe { ctx.stream.alloc::<f32>(n_floats) }.expect("PA max_logits allocation");
+    let tmp_out = unsafe { ctx.stream.alloc::<f16>(n_halves) }.expect("PA tmp_out allocation");
+    let next = PagedAttnScratch {
+        exp_sums,
+        max_logits,
+        tmp_out,
+        capacity: cap,
+    };
+    if let Some(previous) = ctx.paged_attention_scratch.replace(next) {
+        ctx.captured_storage.push(Box::new(previous));
+    }
 }
 
 /// Dispatch vLLM paged attention for the FP16 / HEAD={128,256} / BLOCK=16
@@ -1118,8 +1102,7 @@ fn ensure_pa_scratch(
 /// `seq_lens` is `[num_seqs]` (i32).
 #[allow(clippy::too_many_arguments)]
 pub fn dispatch_paged_attention_v2(
-    stream: &Arc<CudaStream>,
-    ordinal: usize,
+    ctx: &mut super::CudaState,
     out: &mut CudaSlice<f16>,
     q: &CudaSlice<f16>,
     k_cache: &CudaSlice<f16>,
@@ -1134,6 +1117,8 @@ pub fn dispatch_paged_attention_v2(
     max_num_blocks_per_seq: usize,
     max_seq_len: usize,
 ) -> Result<()> {
+    let stream = ctx.stream.clone();
+    let stream = &stream;
     const PARTITION_SIZE: usize = 512;
     if !matches!(head_dim, 128 | 256) {
         return Err(FerrumError::unsupported(format!(
@@ -1207,18 +1192,11 @@ pub fn dispatch_paged_attention_v2(
     }
 
     let max_partitions = max_seq_len.div_ceil(PARTITION_SIZE).max(1);
-    ensure_pa_scratch(
-        stream,
-        ordinal,
-        num_seqs,
-        num_heads,
-        max_partitions,
-        head_dim,
-    );
+    ensure_pa_scratch(ctx, num_seqs, num_heads, max_partitions, head_dim);
 
-    let mut sg = pa_scratch_slots().write().expect("PA_SCRATCH poisoned");
-    let scratch = sg
-        .get_mut(&ordinal)
+    let scratch = ctx
+        .paged_attention_scratch
+        .as_mut()
         .expect("ensure_pa_scratch must have populated");
 
     // SAFETY: all pointers come from CudaSlice (device pointers via cudarc).

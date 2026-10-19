@@ -137,30 +137,38 @@ impl SyntheticLlamaLoader {
 }
 
 impl<B: Backend> WeightLoader<B> for SyntheticLlamaLoader {
-    fn load_tensor(&self, name: &str) -> Result<B::Buffer> {
+    fn load_tensor(&self, ctx: &mut B::Context, name: &str) -> Result<B::Buffer> {
         if name == "model.embed_tokens.weight" {
-            return Ok(B::from_slice(&Self::deterministic_values(
-                name,
-                self.cfg.vocab_size * self.cfg.hidden_size,
-                0.0,
-                0.02,
-            )));
+            return Ok(B::from_slice_in_context(
+                ctx,
+                &Self::deterministic_values(
+                    name,
+                    self.cfg.vocab_size * self.cfg.hidden_size,
+                    0.0,
+                    0.02,
+                ),
+            ));
         }
         if name == "model.norm.weight"
             || name.ends_with(".input_layernorm.weight")
             || name.ends_with(".post_attention_layernorm.weight")
         {
-            return Ok(B::from_slice(&self.layer_norm_values(name)));
+            return Ok(B::from_slice_in_context(ctx, &self.layer_norm_values(name)));
         }
         Err(FerrumError::model(format!(
             "unexpected tensor requested by synthetic loader: {name}"
         )))
     }
 
-    fn load_linear(&self, name: &str) -> Result<Box<dyn ferrum_quantization::Linear<B>>> {
+    fn load_linear(
+        &self,
+        ctx: &mut B::Context,
+        name: &str,
+    ) -> Result<Box<dyn ferrum_quantization::Linear<B>>> {
         let (out_features, in_features) = self.linear_dims(name)?;
         let weights = Self::deterministic_values(name, out_features * in_features, 0.0, 0.015);
-        Ok(Box::new(DenseLinear::<B>::from_rows(
+        Ok(Box::new(DenseLinear::<B>::from_rows_in_context(
+            ctx,
             &weights,
             out_features,
             in_features,

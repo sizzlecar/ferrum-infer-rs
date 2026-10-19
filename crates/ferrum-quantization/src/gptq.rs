@@ -56,6 +56,35 @@ impl<B: Backend + BackendQuantMarlin> GptqLinear<B> {
         )
     }
 
+    /// Construct using the owning model's execution context.
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_raw_in_context(
+        ctx: &mut B::Context,
+        qweight: &[i32],
+        scales: &[f32],
+        qzeros: &[i32],
+        g_idx: Option<&[i32]>,
+        bias: Option<&[f32]>,
+        bits: u32,
+        group_size: usize,
+        in_features: usize,
+        out_features: usize,
+    ) -> Result<Self> {
+        Self::from_raw_with_metadata_in_context(
+            ctx,
+            qweight,
+            scales,
+            qzeros,
+            g_idx,
+            bias,
+            bits,
+            group_size,
+            in_features,
+            out_features,
+            LinearMetadata::default(),
+        )
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn from_raw_with_metadata(
         qweight: &[i32],
@@ -70,6 +99,36 @@ impl<B: Backend + BackendQuantMarlin> GptqLinear<B> {
         metadata: LinearMetadata,
     ) -> Result<Self> {
         let inner = B::load_gptq(
+            qweight,
+            scales,
+            qzeros,
+            g_idx,
+            bias,
+            bits,
+            group_size,
+            in_features,
+            out_features,
+        )?;
+        Ok(Self { inner, metadata })
+    }
+
+    /// Construct using the owning model's execution context.
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_raw_with_metadata_in_context(
+        ctx: &mut B::Context,
+        qweight: &[i32],
+        scales: &[f32],
+        qzeros: &[i32],
+        g_idx: Option<&[i32]>,
+        bias: Option<&[f32]>,
+        bits: u32,
+        group_size: usize,
+        in_features: usize,
+        out_features: usize,
+        metadata: LinearMetadata,
+    ) -> Result<Self> {
+        let inner = B::load_gptq_in_context(
+            ctx,
             qweight,
             scales,
             qzeros,
@@ -141,6 +200,18 @@ impl<B: Backend + BackendQuantMarlin> StackedExpertLinear<B> {
         Ok(Self { inner, k, expert_n })
     }
 
+    /// Construct using the owning model's execution context.
+    pub fn new_in_context(
+        ctx: &mut B::Context,
+        stack: Arc<dyn ferrum_kernels::MarlinExpertStack<B>>,
+        expert_offset: usize,
+        expert_n: usize,
+    ) -> Result<Self> {
+        let k = stack.k();
+        let inner = stack.make_expert_linear_in_context(ctx, expert_offset, expert_n, None)?;
+        Ok(Self { inner, k, expert_n })
+    }
+
     pub fn new_with_bias(
         stack: Arc<dyn ferrum_kernels::MarlinExpertStack<B>>,
         expert_offset: usize,
@@ -149,6 +220,20 @@ impl<B: Backend + BackendQuantMarlin> StackedExpertLinear<B> {
     ) -> Result<Self> {
         let k = stack.k();
         let inner = stack.make_expert_linear(expert_offset, expert_n, Some(bias))?;
+        Ok(Self { inner, k, expert_n })
+    }
+
+    /// Construct using the owning model's execution context.
+    pub fn new_with_bias_in_context(
+        ctx: &mut B::Context,
+        stack: Arc<dyn ferrum_kernels::MarlinExpertStack<B>>,
+        expert_offset: usize,
+        expert_n: usize,
+        bias: &[f32],
+    ) -> Result<Self> {
+        let k = stack.k();
+        let inner =
+            stack.make_expert_linear_in_context(ctx, expert_offset, expert_n, Some(bias))?;
         Ok(Self { inner, k, expert_n })
     }
 }

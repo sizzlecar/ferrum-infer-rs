@@ -207,4 +207,24 @@ impl MarlinExpertStack<CudaBackend> for CudaMarlinExpertStack {
             },
         ))
     }
+    fn make_expert_linear_in_context(
+        self: Arc<Self>,
+        ctx: &mut <CudaBackend as crate::backend::Backend>::Context,
+        expert_offset: usize,
+        expert_n: usize,
+        bias_host: Option<&[f32]>,
+    ) -> Result<Box<dyn Linear<CudaBackend> + Send + Sync>> {
+        let bias = bias_host.map(|values| {
+            <CudaBackend as crate::backend::Backend>::from_slice_in_context(ctx, values)
+        });
+        Ok(Box::new(
+            crate::quant_linear::cuda_marlin::CudaMarlinStackedExpertLinear {
+                store: self.store.clone(),
+                expert_offset,
+                expert_n,
+                k: self.k,
+                bias,
+            },
+        ))
+    }
 }

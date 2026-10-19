@@ -57,6 +57,24 @@ impl<B: Backend> GgufLinear<B> {
         })
     }
 
+    /// Construct using the owning model's execution context.
+    pub fn from_qtensor_in_context(ctx: &mut B::Context, qt: &QTensor) -> CandleResult<Self> {
+        let dims = qt.shape().dims();
+        if dims.len() != 2 {
+            return Err(candle_core::Error::Msg(format!(
+                "GgufLinear: expected 2-D weight tensor, got rank {} (shape {:?})",
+                dims.len(),
+                dims
+            )));
+        }
+        let out_features = dims[0];
+        let in_features = dims[1];
+        let weights = dequantize_to_vec(qt)?;
+        Ok(Self {
+            inner: DenseLinear::<B>::from_rows_in_context(ctx, &weights, out_features, in_features),
+        })
+    }
+
     /// Build with a bias vector. `bias_qt` must be a 1-D `[out_features]`
     /// tensor — typical for Qwen2.5 / Bert / any model with attention bias.
     pub fn from_qtensor_with_bias(qt: &QTensor, bias_qt: &QTensor) -> CandleResult<Self> {
@@ -90,6 +108,43 @@ impl<B: Backend> GgufLinear<B> {
         })
     }
 
+    /// Construct using the owning model's execution context.
+    pub fn from_qtensor_with_bias_in_context(
+        ctx: &mut B::Context,
+        qt: &QTensor,
+        bias_qt: &QTensor,
+    ) -> CandleResult<Self> {
+        let weight_dims = qt.shape().dims();
+        if weight_dims.len() != 2 {
+            return Err(candle_core::Error::Msg(format!(
+                "GgufLinear: expected 2-D weight, got rank {}",
+                weight_dims.len()
+            )));
+        }
+        let out_features = weight_dims[0];
+        let in_features = weight_dims[1];
+
+        let bias_dims = bias_qt.shape().dims();
+        if bias_dims.len() != 1 || bias_dims[0] != out_features {
+            return Err(candle_core::Error::Msg(format!(
+                "GgufLinear: bias shape {:?} doesn't match weight out_features {}",
+                bias_dims, out_features
+            )));
+        }
+
+        let weights = dequantize_to_vec(qt)?;
+        let bias = dequantize_to_vec(bias_qt)?;
+        Ok(Self {
+            inner: DenseLinear::<B>::from_rows_with_bias_in_context(
+                ctx,
+                &weights,
+                &bias,
+                out_features,
+                in_features,
+            ),
+        })
+    }
+
     /// Build directly from already-dequantized fp32 weights. Useful when the
     /// caller has already paid the dequant cost (e.g. cached weights, or
     /// constructing from synthetic data in tests).
@@ -100,6 +155,23 @@ impl<B: Backend> GgufLinear<B> {
     ) -> Self {
         Self {
             inner: DenseLinear::<B>::from_rows(weight_row_major, out_features, in_features),
+        }
+    }
+
+    /// Construct using the owning model's execution context.
+    pub fn from_dense_rows_in_context(
+        ctx: &mut B::Context,
+        weight_row_major: &[f32],
+        out_features: usize,
+        in_features: usize,
+    ) -> Self {
+        Self {
+            inner: DenseLinear::<B>::from_rows_in_context(
+                ctx,
+                weight_row_major,
+                out_features,
+                in_features,
+            ),
         }
     }
 }

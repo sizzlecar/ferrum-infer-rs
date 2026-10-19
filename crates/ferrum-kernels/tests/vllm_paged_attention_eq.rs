@@ -2,8 +2,8 @@
 
 #![cfg(all(feature = "cuda", feature = "vllm-paged-attn-v2"))]
 
-use cudarc::driver::CudaContext;
 use ferrum_kernels::backend::cuda::vllm_paged_attn::dispatch_paged_attention_v2;
+use ferrum_kernels::backend::{cuda::CudaBackend, Backend, BackendCompletion};
 use half::f16;
 
 const BLOCK_SIZE: usize = 16;
@@ -162,11 +162,12 @@ impl Inputs {
 #[test]
 #[ignore = "requires a CUDA GPU and the vLLM paged-attention native artifact"]
 fn native_paged_attention_matches_cpu_with_permuted_blocks_and_partition_tail() {
-    let context = CudaContext::new(0).expect("CUDA device 0");
-    let stream = context.default_stream();
+    let mut context = CudaBackend::new_context();
+    let stream = context.stream.clone();
     // These are the two separately compiled native head-size instantiations.
-    // Reuse one context and stream because the dispatcher owns shared scratch.
+    // Reuse the owning context and its stream across scratch growth.
     for head_dim in [128, 256] {
+        CudaBackend::begin_execution(&mut context).unwrap();
         let inputs = Inputs::new(head_dim);
         let expected = inputs.cpu_reference();
         let (keys, values, table) = inputs.native_cache();
@@ -183,8 +184,7 @@ fn native_paged_attention_matches_cpu_with_permuted_blocks_and_partition_tail() 
             .clone_htod(&vec![f16::NAN; expected.len()])
             .expect("initialize output sentinel");
         dispatch_paged_attention_v2(
-            &stream,
-            0,
+            &mut context,
             &mut output_device,
             &query_device,
             &key_device,
@@ -202,9 +202,10 @@ fn native_paged_attention_matches_cpu_with_permuted_blocks_and_partition_tail() 
         .expect("dispatch native vLLM attention");
         // max_seq_len > 512 necessarily selects the native V2 kernel + reduce,
         // regardless of the optional short-sequence V1 environment setting.
-        stream
-            .synchronize()
-            .expect("native attention CUDA completion");
+        assert!(matches!(
+            CudaBackend::observe_completion(&mut context),
+            BackendCompletion::Succeeded
+        ));
         let actual = stream
             .clone_dtoh(&output_device)
             .expect("read native output");
@@ -241,4 +242,5 @@ fn native_paged_attention_matches_cpu_with_permuted_blocks_and_partition_tail() 
             })
         );
     }
+    CudaBackend::retire_context(&mut context).unwrap();
 }

@@ -404,6 +404,7 @@ impl<B: Backend + BackendQuantMarlin> NativeSafetensorsLoader<B> {
     /// per-expert column width and `k = in_features` (shared by all).
     pub fn load_stacked_gptq_experts(
         &self,
+        ctx: &mut B::Context,
         expert_prefix_fmt: &str,
         num_experts: usize,
         proj_names: &[&str],
@@ -587,7 +588,8 @@ impl<B: Backend + BackendQuantMarlin> NativeSafetensorsLoader<B> {
         #[cfg(not(feature = "cuda"))]
         let _ = is_desc_act;
 
-        let store = B::load_gptq_stacked(
+        let store = B::load_gptq_stacked_in_context(
+            ctx,
             &qw_refs,
             &sc_refs,
             &qz_refs,
@@ -602,20 +604,20 @@ impl<B: Backend + BackendQuantMarlin> NativeSafetensorsLoader<B> {
 }
 
 impl<B: Backend + BackendQuantMarlin> WeightLoader<B> for NativeSafetensorsLoader<B> {
-    fn load_tensor(&self, name: &str) -> Result<B::Buffer> {
+    fn load_tensor(&self, ctx: &mut B::Context, name: &str) -> Result<B::Buffer> {
         // Route through `from_weight_bytes` so fp16-preferring backends can
         // materialise big tensors (embed table) directly as half-precision
         // without the transient f32 Vec. Tiny tensors (norm weights) still
         // end up as f32 because backends size-threshold inside the override.
         let (raw, src_dtype, _) = self.read_bytes_typed(name)?;
-        Ok(B::from_weight_bytes(raw, src_dtype))
+        Ok(B::from_weight_bytes_in_context(ctx, raw, src_dtype))
     }
 
-    fn load_linear(&self, name: &str) -> Result<Box<dyn Linear<B>>> {
+    fn load_linear(&self, ctx: &mut B::Context, name: &str) -> Result<Box<dyn Linear<B>>> {
         // GPTQ first: `<name>.qweight` + `<name>.scales` + `<name>.qzeros`.
         let qw_key = format!("{name}.qweight");
         if self.has(&qw_key) {
-            return self.load_gptq_linear(name);
+            return self.load_gptq_linear(ctx, name);
         }
         // GPTQ fusion shims: synthesise qkv_proj / gate_up_proj from split
         // components — same pattern as Dense but concatenating the GPTQ
@@ -627,25 +629,25 @@ impl<B: Backend + BackendQuantMarlin> WeightLoader<B> for NativeSafetensorsLoade
                 format!("{prefix}v_proj"),
             ];
             if parts.iter().all(|p| self.has(&format!("{p}.qweight"))) {
-                return self.load_gptq_linear_fused(&parts);
+                return self.load_gptq_linear_fused(ctx, &parts);
             }
         }
         if let Some(prefix) = name.strip_suffix("gate_up_proj") {
             let parts = [format!("{prefix}gate_proj"), format!("{prefix}up_proj")];
             if parts.iter().all(|p| self.has(&format!("{p}.qweight"))) {
-                return self.load_gptq_linear_fused(&parts);
+                return self.load_gptq_linear_fused(ctx, &parts);
             }
         }
         if let Some(prefix) = name.strip_suffix("in_proj_qkvz") {
             let parts = [format!("{prefix}in_proj_qkv"), format!("{prefix}in_proj_z")];
             if parts.iter().all(|p| self.has(&format!("{p}.qweight"))) {
-                return self.load_gptq_linear_fused(&parts);
+                return self.load_gptq_linear_fused(ctx, &parts);
             }
         }
         if let Some(prefix) = name.strip_suffix("in_proj_ba") {
             let parts = [format!("{prefix}in_proj_b"), format!("{prefix}in_proj_a")];
             if parts.iter().all(|p| self.has(&format!("{p}.qweight"))) {
-                return self.load_gptq_linear_fused(&parts);
+                return self.load_gptq_linear_fused(ctx, &parts);
             }
         }
 
@@ -662,11 +664,11 @@ impl<B: Backend + BackendQuantMarlin> WeightLoader<B> for NativeSafetensorsLoade
             // Validate the optional bias before allocating backend buffers.
             // A directly stored fused projection obeys the same row contract.
             let bias = self.cat_optional_biases(std::slice::from_ref(&direct), shape[0])?;
-            let weight = B::from_weight_bytes(raw, src_dtype);
+            let weight = B::from_weight_bytes_in_context(ctx, raw, src_dtype);
             let mut linear = DenseLinear::<B>::from_buffer(weight, shape[0], shape[1])
                 .with_metadata(LinearMetadata::from_name(name));
             if let Some(bias) = bias {
-                linear = linear.with_bias(B::from_slice(&bias));
+                linear = linear.with_bias(B::from_slice_in_context(ctx, &bias));
             }
             return Ok(Box::new(linear));
         }
@@ -683,12 +685,13 @@ impl<B: Backend + BackendQuantMarlin> WeightLoader<B> for NativeSafetensorsLoade
             ];
             if parts.iter().all(|p| self.has(p)) {
                 let (bytes, dtype, (rows, cols)) = self.cat_rows_bytes(&parts)?;
-                let weight = B::from_weight_bytes(&bytes, dtype);
+                let bias = self.cat_optional_biases(&parts, rows)?;
+                let weight = B::from_weight_bytes_in_context(ctx, &bytes, dtype);
                 let mut linear = DenseLinear::<B>::from_buffer(weight, rows, cols).with_metadata(
                     LinearMetadata::from_fused_names(parts.iter().map(String::as_str)),
                 );
-                if let Some(bias) = self.cat_optional_biases(&parts, rows)? {
-                    linear = linear.with_bias(B::from_slice(&bias));
+                if let Some(bias) = bias {
+                    linear = linear.with_bias(B::from_slice_in_context(ctx, &bias));
                 }
                 return Ok(Box::new(linear));
             }
@@ -700,12 +703,13 @@ impl<B: Backend + BackendQuantMarlin> WeightLoader<B> for NativeSafetensorsLoade
             ];
             if parts.iter().all(|p| self.has(p)) {
                 let (bytes, dtype, (rows, cols)) = self.cat_rows_bytes(&parts)?;
-                let weight = B::from_weight_bytes(&bytes, dtype);
+                let bias = self.cat_optional_biases(&parts, rows)?;
+                let weight = B::from_weight_bytes_in_context(ctx, &bytes, dtype);
                 let mut linear = DenseLinear::<B>::from_buffer(weight, rows, cols).with_metadata(
                     LinearMetadata::from_fused_names(parts.iter().map(String::as_str)),
                 );
-                if let Some(bias) = self.cat_optional_biases(&parts, rows)? {
-                    linear = linear.with_bias(B::from_slice(&bias));
+                if let Some(bias) = bias {
+                    linear = linear.with_bias(B::from_slice_in_context(ctx, &bias));
                 }
                 return Ok(Box::new(linear));
             }
@@ -717,12 +721,13 @@ impl<B: Backend + BackendQuantMarlin> WeightLoader<B> for NativeSafetensorsLoade
             ];
             if parts.iter().all(|p| self.has(p)) {
                 let (bytes, dtype, (rows, cols)) = self.cat_rows_bytes(&parts)?;
-                let weight = B::from_weight_bytes(&bytes, dtype);
+                let bias = self.cat_optional_biases(&parts, rows)?;
+                let weight = B::from_weight_bytes_in_context(ctx, &bytes, dtype);
                 let mut linear = DenseLinear::<B>::from_buffer(weight, rows, cols).with_metadata(
                     LinearMetadata::from_fused_names(parts.iter().map(String::as_str)),
                 );
-                if let Some(bias) = self.cat_optional_biases(&parts, rows)? {
-                    linear = linear.with_bias(B::from_slice(&bias));
+                if let Some(bias) = bias {
+                    linear = linear.with_bias(B::from_slice_in_context(ctx, &bias));
                 }
                 return Ok(Box::new(linear));
             }
@@ -734,12 +739,13 @@ impl<B: Backend + BackendQuantMarlin> WeightLoader<B> for NativeSafetensorsLoade
             ];
             if parts.iter().all(|p| self.has(p)) {
                 let (bytes, dtype, (rows, cols)) = self.cat_rows_bytes(&parts)?;
-                let weight = B::from_weight_bytes(&bytes, dtype);
+                let bias = self.cat_optional_biases(&parts, rows)?;
+                let weight = B::from_weight_bytes_in_context(ctx, &bytes, dtype);
                 let mut linear = DenseLinear::<B>::from_buffer(weight, rows, cols).with_metadata(
                     LinearMetadata::from_fused_names(parts.iter().map(String::as_str)),
                 );
-                if let Some(bias) = self.cat_optional_biases(&parts, rows)? {
-                    linear = linear.with_bias(B::from_slice(&bias));
+                if let Some(bias) = bias {
+                    linear = linear.with_bias(B::from_slice_in_context(ctx, &bias));
                 }
                 return Ok(Box::new(linear));
             }
@@ -760,6 +766,7 @@ impl<B: Backend + BackendQuantMarlin> WeightLoader<B> for NativeSafetensorsLoade
 
     fn load_stacked_gptq_experts(
         &self,
+        ctx: &mut B::Context,
         expert_prefix_fmt: &str,
         num_experts: usize,
         proj_names: &[&str],
@@ -770,6 +777,7 @@ impl<B: Backend + BackendQuantMarlin> WeightLoader<B> for NativeSafetensorsLoade
     )> {
         NativeSafetensorsLoader::load_stacked_gptq_experts(
             self,
+            ctx,
             expert_prefix_fmt,
             num_experts,
             proj_names,
@@ -782,7 +790,7 @@ impl<B: Backend + BackendQuantMarlin> NativeSafetensorsLoader<B> {
     /// `<name>.scales`, `<name>.qzeros`, optionally `<name>.g_idx`, and
     /// hands the raw host-side tensors to `Backend::load_gptq` which
     /// repacks + uploads per its own strategy.
-    fn load_gptq_linear(&self, name: &str) -> Result<Box<dyn Linear<B>>> {
+    fn load_gptq_linear(&self, ctx: &mut B::Context, name: &str) -> Result<Box<dyn Linear<B>>> {
         let qcfg = self.quant_config.as_ref().ok_or_else(|| {
             FerrumError::model(format!(
                 "'{name}.qweight' present but no quantize_config.json — \
@@ -848,13 +856,17 @@ impl<B: Backend + BackendQuantMarlin> NativeSafetensorsLoader<B> {
                 in_features,
                 out_features,
             );
-            let mut linear =
-                crate::dense::DenseLinear::<B>::from_rows(&dequant_f32, out_features, in_features)
-                    .with_metadata(LinearMetadata::from_name(name));
+            let mut linear = crate::dense::DenseLinear::<B>::from_rows_in_context(
+                ctx,
+                &dequant_f32,
+                out_features,
+                in_features,
+            )
+            .with_metadata(LinearMetadata::from_name(name));
             let bias_key = format!("{name}.bias");
             if self.has(&bias_key) {
                 let (bias, _) = self.read_f32(&bias_key)?;
-                linear = linear.with_bias(B::from_slice(&bias));
+                linear = linear.with_bias(B::from_slice_in_context(ctx, &bias));
             }
             tracing::info!(
                 "GPTQ load (desc_act dequant→DenseLinear, non-cuda): name={name} K={in_features} N={out_features}"
@@ -892,7 +904,8 @@ impl<B: Backend + BackendQuantMarlin> NativeSafetensorsLoader<B> {
             None
         };
 
-        let linear = GptqLinear::<B>::from_raw_with_metadata(
+        let linear = GptqLinear::<B>::from_raw_with_metadata_in_context(
+            ctx,
             &qweight,
             &scales_f32,
             &qzeros,
@@ -919,7 +932,11 @@ impl<B: Backend + BackendQuantMarlin> NativeSafetensorsLoader<B> {
     ///
     /// g_idx: only present when desc_act=true. When present, all parts
     /// share it (same K rows, same activation permutation).
-    fn load_gptq_linear_fused(&self, parts: &[String]) -> Result<Box<dyn Linear<B>>> {
+    fn load_gptq_linear_fused(
+        &self,
+        ctx: &mut B::Context,
+        parts: &[String],
+    ) -> Result<Box<dyn Linear<B>>> {
         let qcfg = self.quant_config.as_ref().ok_or_else(|| {
             FerrumError::model("GPTQ fusion requires quantize_config.json".to_string())
         })?;
@@ -1062,11 +1079,15 @@ impl<B: Backend + BackendQuantMarlin> NativeSafetensorsLoader<B> {
                 in_features,
                 out_features,
             );
-            let mut linear =
-                crate::dense::DenseLinear::<B>::from_rows(&dequant_f32, out_features, in_features)
-                    .with_metadata(LinearMetadata::from_fused_names(
-                        parts.iter().map(String::as_str),
-                    ));
+            let mut linear = crate::dense::DenseLinear::<B>::from_rows_in_context(
+                ctx,
+                &dequant_f32,
+                out_features,
+                in_features,
+            )
+            .with_metadata(LinearMetadata::from_fused_names(
+                parts.iter().map(String::as_str),
+            ));
             let mut bias_acc: Vec<f32> = Vec::new();
             let mut any_bias = false;
             for p in parts {
@@ -1081,7 +1102,7 @@ impl<B: Backend + BackendQuantMarlin> NativeSafetensorsLoader<B> {
                 }
             }
             if any_bias {
-                linear = linear.with_bias(B::from_slice(&bias_acc));
+                linear = linear.with_bias(B::from_slice_in_context(ctx, &bias_acc));
             }
             tracing::info!(
                 "GPTQ fused load (desc_act dequant→DenseLinear, non-cuda): K={in_features} N={out_features} parts={}",
@@ -1127,7 +1148,8 @@ impl<B: Backend + BackendQuantMarlin> NativeSafetensorsLoader<B> {
             None
         };
 
-        let linear = GptqLinear::<B>::from_raw_with_metadata(
+        let linear = GptqLinear::<B>::from_raw_with_metadata_in_context(
+            ctx,
             &qw_acc,
             &sc_acc,
             &qz_acc,

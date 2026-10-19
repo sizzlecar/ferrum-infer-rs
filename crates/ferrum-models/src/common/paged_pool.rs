@@ -496,16 +496,15 @@ impl<B: Backend> PagedSeqState<B> {
     /// Allocate buffers for a sequence that hasn't yet allocated any
     /// blocks. The allocator isn't touched here — the first call to
     /// [`Self::ensure_capacity`] does the real work.
-    pub fn new(block_size: usize, max_blocks_per_seq: usize) -> Self {
+    pub fn new(ctx: &mut B::Context, block_size: usize, max_blocks_per_seq: usize) -> Self {
         let block_table_buf =
-            B::alloc_typed(ferrum_kernels::backend::Dtype::U32, max_blocks_per_seq);
-        let context_lens_buf = B::alloc_typed(ferrum_kernels::backend::Dtype::U32, 1);
+            B::alloc_typed_in_context(ctx, ferrum_kernels::backend::Dtype::U32, max_blocks_per_seq);
+        let context_lens_buf =
+            B::alloc_typed_in_context(ctx, ferrum_kernels::backend::Dtype::U32, 1);
         // Initialise context_lens to 0 so a forward dispatched before
         // any token has been written sees an empty context.
-        let mut ctx = B::new_context();
         let mut cl = context_lens_buf;
-        B::write_typed::<u32>(&mut ctx, &mut cl, &[0u32]);
-        B::sync(&mut ctx);
+        B::write_typed::<u32>(ctx, &mut cl, &[0u32]);
         Self {
             blocks: Vec::with_capacity(max_blocks_per_seq),
             block_table_buf,

@@ -33,6 +33,7 @@ pub trait KvLayer<B: Backend>: KvDtypeKind {
     type PagedPool: Send + Sync;
 
     fn alloc_paged_pool(
+        ctx: &mut B::Context,
         num_blocks: usize,
         block_size: usize,
         num_kv_heads: usize,
@@ -44,6 +45,7 @@ pub trait KvLayer<B: Backend>: KvDtypeKind {
     /// preparation context before using the layer. Allocator RAII still covers
     /// backend-internal zero initialization.
     fn alloc_paged(
+        ctx: &mut B::Context,
         max_blocks_per_seq: usize,
         block_size: usize,
         num_kv_heads: usize,
@@ -51,7 +53,12 @@ pub trait KvLayer<B: Backend>: KvDtypeKind {
     ) -> Self::Layer;
 
     /// Allocate a contiguous cache layer (FP16 only; INT8 panics).
-    fn alloc_contig(capacity: usize, num_kv_heads: usize, head_dim: usize) -> Self::Layer;
+    fn alloc_contig(
+        ctx: &mut B::Context,
+        capacity: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+    ) -> Self::Layer;
 
     // Metadata accessors (variant-agnostic).
     fn len(layer: &Self::Layer) -> usize;
@@ -70,6 +77,7 @@ pub trait KvLayer<B: Backend>: KvDtypeKind {
     /// Ensure a contiguous cache has physical room for `required_capacity`
     /// KV positions. Copies are encoded on the caller's retained context;
     /// the caller must observe it before exposing the new capacity as ready.
+    /// Captured executables must retire before old buffers can be replaced.
     /// Paged caches and fixed-size cache dtypes may no-op.
     fn ensure_contig_capacity(
         _ctx: &mut B::Context,
@@ -77,7 +85,10 @@ pub trait KvLayer<B: Backend>: KvDtypeKind {
         _required_capacity: usize,
         _num_kv_heads: usize,
         _head_dim: usize,
-    ) -> Result<()> {
+    ) -> Result<()>
+    where
+        B: crate::backend::BackendGraph,
+    {
         Ok(())
     }
 
@@ -176,6 +187,7 @@ impl<B: Backend + crate::backend::BackendPagedKv> KvLayer<B> for KvFp16 {
     type PagedPool = (B::Buffer, B::Buffer);
 
     fn alloc_paged_pool(
+        ctx: &mut B::Context,
         num_blocks: usize,
         block_size: usize,
         num_kv_heads: usize,
@@ -186,20 +198,25 @@ impl<B: Backend + crate::backend::BackendPagedKv> KvLayer<B> for KvFp16 {
             .and_then(|n| n.checked_mul(num_kv_heads))
             .and_then(|n| n.checked_mul(head_dim))
             .expect("FP16 paged pool dimensions overflow");
-        (B::alloc(elements), B::alloc(elements))
+        (
+            B::alloc_in_context(ctx, elements),
+            B::alloc_in_context(ctx, elements),
+        )
     }
 
     fn alloc_paged(
+        ctx: &mut B::Context,
         max_blocks_per_seq: usize,
         block_size: usize,
         num_kv_heads: usize,
         head_dim: usize,
     ) -> Self::Layer {
-        let block_table = B::alloc_typed(crate::backend::Dtype::U32, max_blocks_per_seq);
-        let context_lens = B::alloc_typed(crate::backend::Dtype::U32, 1);
+        let block_table =
+            B::alloc_typed_in_context(ctx, crate::backend::Dtype::U32, max_blocks_per_seq);
+        let context_lens = B::alloc_typed_in_context(ctx, crate::backend::Dtype::U32, 1);
         KvCache {
-            k: B::alloc(1),
-            v: B::alloc(1),
+            k: B::alloc_in_context(ctx, 1),
+            v: B::alloc_in_context(ctx, 1),
             len: 0,
             capacity: max_blocks_per_seq * block_size,
             num_kv_heads,
@@ -212,10 +229,15 @@ impl<B: Backend + crate::backend::BackendPagedKv> KvLayer<B> for KvFp16 {
         }
     }
 
-    fn alloc_contig(capacity: usize, num_kv_heads: usize, head_dim: usize) -> Self::Layer {
+    fn alloc_contig(
+        ctx: &mut B::Context,
+        capacity: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+    ) -> Self::Layer {
         KvCache {
-            k: B::alloc(num_kv_heads * capacity * head_dim),
-            v: B::alloc(num_kv_heads * capacity * head_dim),
+            k: B::alloc_in_context(ctx, num_kv_heads * capacity * head_dim),
+            v: B::alloc_in_context(ctx, num_kv_heads * capacity * head_dim),
             len: 0,
             capacity,
             num_kv_heads,
@@ -271,29 +293,69 @@ impl<B: Backend + crate::backend::BackendPagedKv> KvLayer<B> for KvFp16 {
         required_capacity: usize,
         num_kv_heads: usize,
         head_dim: usize,
-    ) -> Result<()> {
+    ) -> Result<()>
+    where
+        B: crate::backend::BackendGraph,
+    {
         if layer.block_size > 0 || required_capacity <= layer.capacity {
             return Ok(());
         }
+        B::retire_graphs_for_storage_mutation(ctx)?;
         let old_capacity = layer.capacity;
         let old_len = layer.len;
-        let mut new_k = B::alloc(num_kv_heads * required_capacity * head_dim);
-        let mut new_v = B::alloc(num_kv_heads * required_capacity * head_dim);
-        if old_len > 0 {
-            let copy_len = old_len * head_dim;
-            for head in 0..num_kv_heads {
-                let old_offset = head * old_capacity * head_dim;
-                let new_offset = head * required_capacity * head_dim;
-                B::copy_slice(ctx, &layer.k, old_offset, &mut new_k, new_offset, copy_len);
-                B::copy_slice(ctx, &layer.v, old_offset, &mut new_v, new_offset, copy_len);
+        // These owners are outside the unwind boundary: an allocator/copy
+        // panic cannot drop a destination that earlier commands may still use.
+        let mut new_k = None;
+        let mut new_v = None;
+        let copied = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            new_k = Some(B::alloc_in_context(
+                ctx,
+                num_kv_heads * required_capacity * head_dim,
+            ));
+            new_v = Some(B::alloc_in_context(
+                ctx,
+                num_kv_heads * required_capacity * head_dim,
+            ));
+            if old_len > 0 {
+                let copy_len = old_len * head_dim;
+                for head in 0..num_kv_heads {
+                    let old_offset = head * old_capacity * head_dim;
+                    let new_offset = head * required_capacity * head_dim;
+                    B::copy_slice(
+                        ctx,
+                        &layer.k,
+                        old_offset,
+                        new_k.as_mut().unwrap(),
+                        new_offset,
+                        copy_len,
+                    );
+                    B::copy_slice(
+                        ctx,
+                        &layer.v,
+                        old_offset,
+                        new_v.as_mut().unwrap(),
+                        new_offset,
+                        copy_len,
+                    );
+                }
             }
+        }));
+        if let Err(panic) = copied {
+            if let Some(buffer) = new_k {
+                B::retain_buffer_until_completion(ctx, buffer);
+            }
+            if let Some(buffer) = new_v {
+                B::retain_buffer_until_completion(ctx, buffer);
+            }
+            std::panic::resume_unwind(panic);
         }
-        // CUDA buffers free on their ordered allocation stream; Metal's
-        // command buffer retains its referenced buffers. Keep those existing
-        // RAII guarantees and let the caller observe the entire preparation,
-        // rather than hiding a separate synchronization inside this copy.
-        layer.k = new_k;
-        layer.v = new_v;
+        // Publish both new buffers only after every copy was encoded. Keep
+        // the old sources in the original context until actual completion,
+        // including CUDA's non-async-allocation fallback on an unknown result.
+        let old_k = std::mem::replace(&mut layer.k, new_k.unwrap());
+        B::retain_buffer_until_completion(ctx, old_k);
+        let old_v = std::mem::replace(&mut layer.v, new_v.unwrap());
+        B::retain_buffer_until_completion(ctx, old_v);
         layer.capacity = required_capacity;
         Ok(())
     }
@@ -551,24 +613,31 @@ impl<B: Backend + BackendInt8KvOps> KvLayer<B> for KvInt8 {
     type PagedPool = QuantizedPagedKvPool<B, KvInt8>;
 
     fn alloc_paged_pool(
+        ctx: &mut B::Context,
         num_blocks: usize,
         block_size: usize,
         num_kv_heads: usize,
         head_dim: usize,
     ) -> Self::PagedPool {
-        B::alloc_paged_int8_pool(num_blocks, block_size, num_kv_heads, head_dim)
+        B::alloc_paged_int8_pool(ctx, num_blocks, block_size, num_kv_heads, head_dim)
     }
 
     fn alloc_paged(
+        ctx: &mut B::Context,
         max_blocks_per_seq: usize,
         block_size: usize,
         num_kv_heads: usize,
         head_dim: usize,
     ) -> Self::Layer {
-        B::alloc_paged_int8_layer(max_blocks_per_seq, block_size, num_kv_heads, head_dim)
+        B::alloc_paged_int8_layer(ctx, max_blocks_per_seq, block_size, num_kv_heads, head_dim)
     }
 
-    fn alloc_contig(_capacity: usize, _num_kv_heads: usize, _head_dim: usize) -> Self::Layer {
+    fn alloc_contig(
+        _ctx: &mut B::Context,
+        _capacity: usize,
+        _num_kv_heads: usize,
+        _head_dim: usize,
+    ) -> Self::Layer {
         panic!("KvInt8::alloc_contig: INT8 KV is paged-only")
     }
 

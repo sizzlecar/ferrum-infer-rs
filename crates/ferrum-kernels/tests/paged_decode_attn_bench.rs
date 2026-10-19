@@ -11,7 +11,6 @@
 
 #![cfg(feature = "cuda")]
 
-use cudarc::driver::CudaContext;
 use ferrum_kernels::backend::cuda::CudaBackend;
 use ferrum_kernels::backend::{Backend, BackendPagedKv};
 use std::time::Instant;
@@ -32,13 +31,13 @@ fn bench_paged_decode_attn() {
     const N_ITERS: usize = 200;
     const N_WARMUP: usize = 20;
 
-    let ctx_handle = CudaContext::new(0).expect("CUDA context");
-    let stream = ctx_handle.default_stream();
+    let mut ctx = <CudaBackend as Backend>::new_context();
+    let stream = ctx.stream.clone();
 
     // Q: [num_seqs, num_heads, head_dim] (q_len=1)
     let q_n = NUM_SEQS * NUM_HEADS * HEAD_DIM;
     let q_data: Vec<f32> = (0..q_n).map(|i| ((i as f32) * 0.0017).sin()).collect();
-    let q = CudaBackend::from_slice(&q_data);
+    let q = CudaBackend::from_slice_in_context(&mut ctx, &q_data);
 
     // KV pool: [total_blocks, num_kv_heads, block_size, head_dim] f16
     // total_blocks = num_seqs * max_blocks_per_seq (over-alloc)
@@ -46,8 +45,8 @@ fn bench_paged_decode_attn() {
     let kv_n = total_blocks * NUM_KV_HEADS * BLOCK_SIZE * HEAD_DIM;
     let k_data: Vec<f32> = (0..kv_n).map(|i| ((i as f32) * 0.0011).cos()).collect();
     let v_data: Vec<f32> = (0..kv_n).map(|i| ((i as f32) * 0.0009).sin()).collect();
-    let k_pool = CudaBackend::from_slice(&k_data);
-    let v_pool = CudaBackend::from_slice(&v_data);
+    let k_pool = CudaBackend::from_slice_in_context(&mut ctx, &k_data);
+    let v_pool = CudaBackend::from_slice_in_context(&mut ctx, &v_data);
 
     // block_tables: [num_seqs, max_blocks_per_seq] i32
     let mut bt_host: Vec<i32> = Vec::with_capacity(NUM_SEQS * MAX_BLOCKS_PER_SEQ);
@@ -81,8 +80,7 @@ fn bench_paged_decode_attn() {
     let bt_f16 = CudaBuf::from_f16(bt_f16_inner);
     let kvl_f16 = CudaBuf::from_f16(kvl_f16_inner);
 
-    let mut out_dev = CudaBackend::alloc(NUM_SEQS * NUM_HEADS * HEAD_DIM);
-    let mut ctx = <CudaBackend as Backend>::new_context();
+    let mut out_dev = CudaBackend::alloc_in_context(&mut ctx, NUM_SEQS * NUM_HEADS * HEAD_DIM);
 
     // Warmup
     for _ in 0..N_WARMUP {

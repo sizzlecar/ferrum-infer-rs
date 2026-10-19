@@ -3,8 +3,8 @@
 //!
 //! Extracted from `cuda/mod.rs` (#8 Phase 4). Owns:
 //!
-//! - `SplitKScratch` process-global f32 partial buffers for split-K
-//!   phase 1 + `split_k_scratch_slot` / `with_split_k_scratch` helpers.
+//! - `SplitKScratch` instance-owned f32 partial buffers for split-K
+//!   phase 1 + `with_split_k_scratch`.
 //! - `paged_varlen_split_k_dispatch` (split-K varlen path used by
 //!   prefill on long contexts).
 //! - `paged_batched_flash_dispatch` (Stage 13a batched paged-decode
@@ -19,7 +19,6 @@
 //! All helpers stay private to this module; the trait impl is the
 //! only public surface.
 
-use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
 
 use cudarc::driver::{
@@ -142,70 +141,57 @@ fn cuda_paged_runtime_config() -> &'static CudaPagedRuntimeConfig {
 // Paged-varlen split-K scratch + dispatch
 // ────────────────────────────────────────────────────────────────────────
 
-/// Process-global scratch for split-K phase1 outputs. Three buffers
+/// Per-context scratch for split-K phase1 outputs. Three buffers
 /// (partial_out f32, partial_m f32, partial_l f32) sized to the largest
 /// shape ever requested. Same lazy-grow pattern as Marlin gather scratch.
-struct SplitKScratch {
+pub(super) struct SplitKScratch {
     partial_out: CudaSlice<f32>, // [M_total * num_q_heads * num_splits * head_dim]
     partial_m: CudaSlice<f32>,   // [M_total * num_q_heads * num_splits]
     partial_l: CudaSlice<f32>,   // [M_total * num_q_heads * num_splits]
     out_capacity: usize,
     ml_capacity: usize,
 }
-unsafe impl Send for SplitKScratch {}
-unsafe impl Sync for SplitKScratch {}
-
-static SPLIT_K_SCRATCH: std::sync::OnceLock<std::sync::RwLock<HashMap<usize, SplitKScratch>>> =
-    std::sync::OnceLock::new();
-
-fn split_k_scratch_slots() -> &'static std::sync::RwLock<HashMap<usize, SplitKScratch>> {
-    SPLIT_K_SCRATCH.get_or_init(|| std::sync::RwLock::new(HashMap::new()))
-}
-
 fn with_split_k_scratch<R>(
-    stream: &Arc<CudaStream>,
-    ordinal: usize,
+    ctx: &mut CudaState,
     out_required: usize,
     ml_required: usize,
     body: impl FnOnce(&mut CudaSlice<f32>, &mut CudaSlice<f32>, &mut CudaSlice<f32>) -> R,
 ) -> R {
-    let slots = split_k_scratch_slots();
-    {
-        let g = slots.read().expect("SPLIT_K_SCRATCH poisoned");
-        if let Some(s) = g.get(&ordinal) {
-            if s.out_capacity >= out_required && s.ml_capacity >= ml_required {
-                drop(g);
-                let mut w = slots.write().expect("SPLIT_K_SCRATCH poisoned");
-                let s = w.get_mut(&ordinal).expect("just observed Some");
-                return body(&mut s.partial_out, &mut s.partial_m, &mut s.partial_l);
-            }
+    let need_new = ctx
+        .split_k_scratch
+        .as_ref()
+        .is_none_or(|s| s.out_capacity < out_required || s.ml_capacity < ml_required);
+    if need_new {
+        assert!(
+            !ctx.capture_in_flight,
+            "split-K scratch growth during CUDA capture"
+        );
+        let partial_out = unsafe { ctx.stream.alloc::<f32>(out_required) }
+            .expect("split-K partial_out allocation");
+        let partial_m =
+            unsafe { ctx.stream.alloc::<f32>(ml_required) }.expect("split-K partial_m allocation");
+        let partial_l =
+            unsafe { ctx.stream.alloc::<f32>(ml_required) }.expect("split-K partial_l allocation");
+        let next = SplitKScratch {
+            partial_out,
+            partial_m,
+            partial_l,
+            out_capacity: out_required,
+            ml_capacity: ml_required,
+        };
+        if let Some(previous) = ctx.split_k_scratch.replace(next) {
+            ctx.captured_storage.push(Box::new(previous));
         }
     }
-    let mut w = slots.write().expect("SPLIT_K_SCRATCH poisoned");
-    let need_new = match w.get(&ordinal) {
-        Some(s) => s.out_capacity < out_required || s.ml_capacity < ml_required,
-        None => true,
-    };
-    if need_new {
-        let partial_out = unsafe { stream.alloc::<f32>(out_required) }
-            .expect("SPLIT_K_SCRATCH partial_out alloc");
-        let partial_m =
-            unsafe { stream.alloc::<f32>(ml_required) }.expect("SPLIT_K_SCRATCH partial_m alloc");
-        let partial_l =
-            unsafe { stream.alloc::<f32>(ml_required) }.expect("SPLIT_K_SCRATCH partial_l alloc");
-        w.insert(
-            ordinal,
-            SplitKScratch {
-                partial_out,
-                partial_m,
-                partial_l,
-                out_capacity: out_required,
-                ml_capacity: ml_required,
-            },
-        );
-    }
-    let s = w.get_mut(&ordinal).expect("just allocated");
-    body(&mut s.partial_out, &mut s.partial_m, &mut s.partial_l)
+    let scratch = ctx
+        .split_k_scratch
+        .as_mut()
+        .expect("prepared split-K scratch");
+    body(
+        &mut scratch.partial_out,
+        &mut scratch.partial_m,
+        &mut scratch.partial_l,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -262,8 +248,7 @@ fn paged_varlen_split_k_dispatch(
     );
 
     with_split_k_scratch(
-        &stream,
-        ctx.ordinal,
+        ctx,
         out_required,
         ml_required,
         |partial_out, partial_m, partial_l| {
@@ -459,8 +444,7 @@ fn paged_batched_flash_dispatch(
     );
 
     with_split_k_scratch(
-        &stream,
-        ctx.ordinal,
+        ctx,
         out_required,
         ml_required,
         |partial_out, partial_m, partial_l| {
@@ -1224,9 +1208,11 @@ impl BackendPagedKv for CudaBackend {
             )));
         }
         let pos_offset = (final_kv_len - q_len) as u32;
-        let mut cu_seqlens_q_buf = <Self as Backend>::alloc_typed(crate::backend::Dtype::U32, 2);
+        let mut cu_seqlens_q_buf =
+            <Self as Backend>::alloc_typed_in_context(ctx, crate::backend::Dtype::U32, 2);
         <Self as Backend>::write_typed::<u32>(ctx, &mut cu_seqlens_q_buf, &[0u32, q_len as u32]);
-        let mut pos_offsets_buf = <Self as Backend>::alloc_typed(crate::backend::Dtype::U32, 1);
+        let mut pos_offsets_buf =
+            <Self as Backend>::alloc_typed_in_context(ctx, crate::backend::Dtype::U32, 1);
         <Self as Backend>::write_typed::<u32>(ctx, &mut pos_offsets_buf, &[pos_offset]);
 
         // The paged-write kernel produces q_out[token, head, dim], which
@@ -1241,11 +1227,18 @@ impl BackendPagedKv for CudaBackend {
         if ctx.paged_attn_out_tm_capacity < q_n {
             let stream = ctx.stream.clone();
             let n_grown = q_n.next_power_of_two().max(q_n);
-            ctx.paged_attn_out_tm = Some(crate::backend::CudaBuf::from_f16(
+            assert!(
+                !ctx.capture_in_flight,
+                "paged output scratch growth during CUDA capture"
+            );
+            let next = crate::backend::CudaBuf::from_f16(
                 stream
                     .alloc_zeros::<f16>(n_grown)
                     .map_err(|e| FerrumError::model(format!("alloc paged_attn_out_tm: {e}")))?,
-            ));
+            );
+            if let Some(previous) = ctx.paged_attn_out_tm.replace(next) {
+                ctx.captured_storage.push(Box::new(previous));
+            }
             ctx.paged_attn_out_tm_capacity = n_grown;
         }
 
@@ -1726,10 +1719,8 @@ impl BackendPagedKv for CudaBackend {
         if num_seqs == 0 {
             return Ok(());
         }
-        let stream = ctx.stream.clone();
         super::vllm_paged_attn::dispatch_paged_attention_v2(
-            &stream,
-            ctx.ordinal,
+            ctx,
             out.as_f16_mut(),
             q.as_f16(),
             k_pool.as_f16(),
@@ -1792,20 +1783,28 @@ impl BackendPagedKv for CudaBackend {
             )));
         }
         let pos_offset = (final_kv_len - q_len) as u32;
-        let mut cu_seqlens_q_buf = <Self as Backend>::alloc_typed(crate::backend::Dtype::U32, 2);
+        let mut cu_seqlens_q_buf =
+            <Self as Backend>::alloc_typed_in_context(ctx, crate::backend::Dtype::U32, 2);
         <Self as Backend>::write_typed::<u32>(ctx, &mut cu_seqlens_q_buf, &[0u32, q_len as u32]);
-        let mut pos_offsets_buf = <Self as Backend>::alloc_typed(crate::backend::Dtype::U32, 1);
+        let mut pos_offsets_buf =
+            <Self as Backend>::alloc_typed_in_context(ctx, crate::backend::Dtype::U32, 1);
         <Self as Backend>::write_typed::<u32>(ctx, &mut pos_offsets_buf, &[pos_offset]);
 
         let q_n = q_len * num_heads * head_dim;
         if ctx.paged_attn_out_tm_capacity < q_n {
             let stream = ctx.stream.clone();
             let n_grown = q_n.next_power_of_two().max(q_n);
-            ctx.paged_attn_out_tm = Some(crate::backend::CudaBuf::from_f16(
-                stream.alloc_zeros::<f16>(n_grown).map_err(|e| {
-                    FerrumError::model(format!("alloc paged_attn_out_tm vllm: {e}"))
-                })?,
-            ));
+            assert!(
+                !ctx.capture_in_flight,
+                "paged output scratch growth during CUDA capture"
+            );
+            let next =
+                crate::backend::CudaBuf::from_f16(stream.alloc_zeros::<f16>(n_grown).map_err(
+                    |e| FerrumError::model(format!("alloc paged_attn_out_tm vllm: {e}")),
+                )?);
+            if let Some(previous) = ctx.paged_attn_out_tm.replace(next) {
+                ctx.captured_storage.push(Box::new(previous));
+            }
             ctx.paged_attn_out_tm_capacity = n_grown;
         }
 

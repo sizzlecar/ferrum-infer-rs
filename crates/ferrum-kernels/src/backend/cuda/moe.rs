@@ -81,20 +81,26 @@ impl BackendMoeFused for CudaBackend {
         // bytes = 2*total_pairs f16 elements; f32 storage same (4 bytes
         // per element).
         if ctx.moe_route_capacity < total_pairs {
+            assert!(
+                !ctx.capture_in_flight,
+                "MoE route scratch growth during CUDA capture"
+            );
             let stream = ctx.stream.clone();
             // 2 × total_pairs because each i32 / f32 element needs 4
             // bytes = 2 f16 slots in the underlying CudaSlice<f16>.
             let nf16 = 2 * total_pairs;
-            ctx.moe_route_ids = Some(
-                stream
-                    .alloc_zeros::<f16>(nf16)
-                    .map_err(|e| FerrumError::model(format!("alloc moe_route_ids: {e}")))?,
-            );
-            ctx.moe_route_weights = Some(
-                stream
-                    .alloc_zeros::<f16>(nf16)
-                    .map_err(|e| FerrumError::model(format!("alloc moe_route_weights: {e}")))?,
-            );
+            let ids = stream
+                .alloc_zeros::<f16>(nf16)
+                .map_err(|e| FerrumError::model(format!("alloc moe_route_ids: {e}")))?;
+            let weights = stream
+                .alloc_zeros::<f16>(nf16)
+                .map_err(|e| FerrumError::model(format!("alloc moe_route_weights: {e}")))?;
+            if let Some(previous) = ctx.moe_route_ids.replace(ids) {
+                ctx.captured_storage.push(Box::new(previous));
+            }
+            if let Some(previous) = ctx.moe_route_weights.replace(weights) {
+                ctx.captured_storage.push(Box::new(previous));
+            }
             ctx.moe_route_capacity = total_pairs;
         }
 

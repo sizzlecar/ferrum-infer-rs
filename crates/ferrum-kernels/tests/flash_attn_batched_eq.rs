@@ -42,22 +42,22 @@ fn flash_attn_batched_matches_per_item() {
 
     // Q: [m, NH, HD] item-major
     let q_h = det_f32(1, M * NH * HD);
-    let q_dev = CudaBackend::from_slice(&q_h);
+    let q_dev = CudaBackend::from_slice_in_context(&mut ctx, &q_h);
 
     // K and V caches per item (head-major [NKV, CAPACITY, HD])
     let k0_h = det_f32(10, NKV * CAPACITY * HD);
     let v0_h = det_f32(11, NKV * CAPACITY * HD);
     let k1_h = det_f32(20, NKV * CAPACITY * HD);
     let v1_h = det_f32(21, NKV * CAPACITY * HD);
-    let k0_dev = CudaBackend::from_slice(&k0_h);
-    let v0_dev = CudaBackend::from_slice(&v0_h);
-    let k1_dev = CudaBackend::from_slice(&k1_h);
-    let v1_dev = CudaBackend::from_slice(&v1_h);
+    let k0_dev = CudaBackend::from_slice_in_context(&mut ctx, &k0_h);
+    let v0_dev = CudaBackend::from_slice_in_context(&mut ctx, &v0_h);
+    let k1_dev = CudaBackend::from_slice_in_context(&mut ctx, &k1_h);
+    let v1_dev = CudaBackend::from_slice_in_context(&mut ctx, &v1_h);
 
     // Per-item: split Q + run head-major decode_attention per item
     let mut per_item_concat = vec![0.0f32; M * NH * HD];
-    let mut q_single_scratch = CudaBackend::alloc(NH * HD);
-    let mut out_single_scratch = CudaBackend::alloc(NH * HD);
+    let mut q_single_scratch = CudaBackend::alloc_in_context(&mut ctx, NH * HD);
+    let mut out_single_scratch = CudaBackend::alloc_in_context(&mut ctx, NH * HD);
     let attn_cfg = AttnConfig {
         num_heads: NH,
         num_kv_heads: NKV,
@@ -91,15 +91,16 @@ fn flash_attn_batched_matches_per_item() {
             &attn_cfg,
         );
         CudaBackend::sync(&mut ctx);
-        let out_h = CudaBackend::to_vec(&out_single_scratch, NH * HD);
+        let out_h = CudaBackend::to_vec_in_context(&mut ctx, &out_single_scratch, NH * HD);
         per_item_concat[i * NH * HD..(i + 1) * NH * HD].copy_from_slice(&out_h);
     }
 
     // Batched: 1 call for m items
     let kv_lens_h: Vec<u32> = vec![VALID_KV as u32; M];
-    let mut kv_lens_dev = CudaBackend::alloc_typed(ferrum_kernels::backend::Dtype::U32, M);
+    let mut kv_lens_dev =
+        CudaBackend::alloc_typed_in_context(&mut ctx, ferrum_kernels::backend::Dtype::U32, M);
     CudaBackend::write_typed::<u32>(&mut ctx, &mut kv_lens_dev, &kv_lens_h);
-    let mut out_batched_dev = CudaBackend::alloc(M * NH * HD);
+    let mut out_batched_dev = CudaBackend::alloc_in_context(&mut ctx, M * NH * HD);
     let k_caches: Vec<&_> = vec![&k0_dev, &k1_dev];
     let v_caches: Vec<&_> = vec![&v0_dev, &v1_dev];
 
@@ -121,7 +122,7 @@ fn flash_attn_batched_matches_per_item() {
     )
     .expect("flash_attention_batched_per_cache");
     CudaBackend::sync(&mut ctx);
-    let batched_concat = CudaBackend::to_vec(&out_batched_dev, M * NH * HD);
+    let batched_concat = CudaBackend::to_vec_in_context(&mut ctx, &out_batched_dev, M * NH * HD);
 
     // Compare elementwise
     let mut max_abs = 0.0f32;
@@ -171,22 +172,23 @@ fn flash_attn_batched_sliding_window_one_selects_latest_v() {
     let mut ctx = CudaBackend::new_context();
 
     let q_h = det_f32(100, M * NH * HD);
-    let q_dev = CudaBackend::from_slice(&q_h);
+    let q_dev = CudaBackend::from_slice_in_context(&mut ctx, &q_h);
 
     let k0_h = det_f32(110, NKV * CAPACITY * HD);
     let v0_h = det_f32(111, NKV * CAPACITY * HD);
     let k1_h = det_f32(120, NKV * CAPACITY * HD);
     let v1_h = det_f32(121, NKV * CAPACITY * HD);
-    let k0_dev = CudaBackend::from_slice(&k0_h);
-    let v0_dev = CudaBackend::from_slice(&v0_h);
-    let k1_dev = CudaBackend::from_slice(&k1_h);
-    let v1_dev = CudaBackend::from_slice(&v1_h);
+    let k0_dev = CudaBackend::from_slice_in_context(&mut ctx, &k0_h);
+    let v0_dev = CudaBackend::from_slice_in_context(&mut ctx, &v0_h);
+    let k1_dev = CudaBackend::from_slice_in_context(&mut ctx, &k1_h);
+    let v1_dev = CudaBackend::from_slice_in_context(&mut ctx, &v1_h);
 
     let kv_lens_h: Vec<u32> = vec![VALID_KV as u32; M];
-    let mut kv_lens_dev = CudaBackend::alloc_typed(ferrum_kernels::backend::Dtype::U32, M);
+    let mut kv_lens_dev =
+        CudaBackend::alloc_typed_in_context(&mut ctx, ferrum_kernels::backend::Dtype::U32, M);
     CudaBackend::write_typed::<u32>(&mut ctx, &mut kv_lens_dev, &kv_lens_h);
 
-    let mut out_batched_dev = CudaBackend::alloc(M * NH * HD);
+    let mut out_batched_dev = CudaBackend::alloc_in_context(&mut ctx, M * NH * HD);
     let k_caches: Vec<&_> = vec![&k0_dev, &k1_dev];
     let v_caches: Vec<&_> = vec![&v0_dev, &v1_dev];
 
@@ -208,7 +210,7 @@ fn flash_attn_batched_sliding_window_one_selects_latest_v() {
     )
     .expect("flash_attention_batched_per_cache sliding_window=1");
     CudaBackend::sync(&mut ctx);
-    let out = CudaBackend::to_vec(&out_batched_dev, M * NH * HD);
+    let out = CudaBackend::to_vec_in_context(&mut ctx, &out_batched_dev, M * NH * HD);
 
     let mut max_abs = 0.0f32;
     for item in 0..M {

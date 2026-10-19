@@ -273,7 +273,7 @@ fn preparation_frame_real_metal_pending_context_blocks_allocation() {
         panic!("the same context's actual encoded work must reach terminal");
     };
     assert!(error.is_none());
-    owners.restore(&mut model.scratch);
+    model.execution_context = Some(owners.restore(&mut model.scratch));
     assert_eq!(
         MetalBackend::to_vec(&model.scratch.last_normed, count),
         vec![2.0; count]

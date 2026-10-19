@@ -90,14 +90,14 @@ fn recurrent_gated_delta_rule_cuda_matches_cpu_reference() {
     .unwrap();
 
     let mut cuda_ctx = CudaBackend::new_context();
-    let q_dev = CudaBackend::from_slice_typed(&query);
-    let k_dev = CudaBackend::from_slice_typed(&key);
-    let v_dev = CudaBackend::from_slice_typed(&value);
-    let g_dev = CudaBackend::from_slice_typed(&g);
-    let beta_dev = CudaBackend::from_slice_typed(&beta);
-    let state0_dev = CudaBackend::from_slice_typed(&initial_state);
-    let mut out_dev = CudaBackend::alloc_typed(Dtype::F32, out_len);
-    let mut state_dev = CudaBackend::alloc_typed(Dtype::F32, state_len);
+    let q_dev = CudaBackend::from_slice_typed_in_context(&mut cuda_ctx, &query);
+    let k_dev = CudaBackend::from_slice_typed_in_context(&mut cuda_ctx, &key);
+    let v_dev = CudaBackend::from_slice_typed_in_context(&mut cuda_ctx, &value);
+    let g_dev = CudaBackend::from_slice_typed_in_context(&mut cuda_ctx, &g);
+    let beta_dev = CudaBackend::from_slice_typed_in_context(&mut cuda_ctx, &beta);
+    let state0_dev = CudaBackend::from_slice_typed_in_context(&mut cuda_ctx, &initial_state);
+    let mut out_dev = CudaBackend::alloc_typed_in_context(&mut cuda_ctx, Dtype::F32, out_len);
+    let mut state_dev = CudaBackend::alloc_typed_in_context(&mut cuda_ctx, Dtype::F32, state_len);
     CudaBackend::recurrent_gated_delta_rule_f32(
         &mut cuda_ctx,
         &q_dev,
@@ -119,9 +119,13 @@ fn recurrent_gated_delta_rule_cuda_matches_cpu_reference() {
     .unwrap();
     CudaBackend::sync(&mut cuda_ctx);
 
-    assert_close(&CudaBackend::to_vec(&out_dev, out_len), &expected_out, 2e-5);
     assert_close(
-        &CudaBackend::to_vec(&state_dev, state_len),
+        &CudaBackend::to_vec_in_context(&mut cuda_ctx, &out_dev, out_len),
+        &expected_out,
+        2e-5,
+    );
+    assert_close(
+        &CudaBackend::to_vec_in_context(&mut cuda_ctx, &state_dev, state_len),
         &expected_state,
         2e-5,
     );
@@ -179,14 +183,14 @@ fn recurrent_gated_delta_rule_batch_cuda_matches_cpu_reference() {
     .unwrap();
 
     let mut cuda_ctx = CudaBackend::new_context();
-    let q_dev = CudaBackend::from_slice_typed(&query);
-    let k_dev = CudaBackend::from_slice_typed(&key);
-    let v_dev = CudaBackend::from_slice_typed(&value);
-    let g_dev = CudaBackend::from_slice_typed(&g);
-    let beta_dev = CudaBackend::from_slice_typed(&beta);
-    let state0_dev = CudaBackend::from_slice_typed(&initial_states);
-    let mut out_dev = CudaBackend::alloc_typed(Dtype::F32, out_len);
-    let mut state_dev = CudaBackend::alloc_typed(Dtype::F32, state_len);
+    let q_dev = CudaBackend::from_slice_typed_in_context(&mut cuda_ctx, &query);
+    let k_dev = CudaBackend::from_slice_typed_in_context(&mut cuda_ctx, &key);
+    let v_dev = CudaBackend::from_slice_typed_in_context(&mut cuda_ctx, &value);
+    let g_dev = CudaBackend::from_slice_typed_in_context(&mut cuda_ctx, &g);
+    let beta_dev = CudaBackend::from_slice_typed_in_context(&mut cuda_ctx, &beta);
+    let state0_dev = CudaBackend::from_slice_typed_in_context(&mut cuda_ctx, &initial_states);
+    let mut out_dev = CudaBackend::alloc_typed_in_context(&mut cuda_ctx, Dtype::F32, out_len);
+    let mut state_dev = CudaBackend::alloc_typed_in_context(&mut cuda_ctx, Dtype::F32, state_len);
     CudaBackend::recurrent_gated_delta_rule_batch_f32(
         &mut cuda_ctx,
         &q_dev,
@@ -208,9 +212,13 @@ fn recurrent_gated_delta_rule_batch_cuda_matches_cpu_reference() {
     .unwrap();
     CudaBackend::sync(&mut cuda_ctx);
 
-    assert_close(&CudaBackend::to_vec(&out_dev, out_len), &expected_out, 2e-5);
     assert_close(
-        &CudaBackend::to_vec(&state_dev, state_len),
+        &CudaBackend::to_vec_in_context(&mut cuda_ctx, &out_dev, out_len),
+        &expected_out,
+        2e-5,
+    );
+    assert_close(
+        &CudaBackend::to_vec_in_context(&mut cuda_ctx, &state_dev, state_len),
         &expected_state,
         2e-5,
     );
@@ -275,15 +283,15 @@ fn recurrent_gated_delta_rule_varlen_tiled_cuda_matches_cpu_reference() {
     .unwrap();
 
     let mut cuda_ctx = CudaBackend::new_context();
-    let q_dev = CudaBackend::from_slice_typed(&query);
-    let k_dev = CudaBackend::from_slice_typed(&key);
-    let v_dev = CudaBackend::from_slice_typed(&value);
-    let g_dev = CudaBackend::from_slice_typed(&g);
-    let beta_dev = CudaBackend::from_slice_typed(&beta);
-    let state0_dev = CudaBackend::from_slice_typed(&initial_states);
-    let cu_dev = CudaBackend::from_slice_typed(&cu_seqlens);
-    let mut out_dev = CudaBackend::alloc_typed(Dtype::F32, value_len);
-    let mut state_dev = CudaBackend::alloc_typed(Dtype::F32, state_len);
+    let q_dev = CudaBackend::from_slice_typed_in_context(&mut cuda_ctx, &query);
+    let k_dev = CudaBackend::from_slice_typed_in_context(&mut cuda_ctx, &key);
+    let v_dev = CudaBackend::from_slice_typed_in_context(&mut cuda_ctx, &value);
+    let g_dev = CudaBackend::from_slice_typed_in_context(&mut cuda_ctx, &g);
+    let beta_dev = CudaBackend::from_slice_typed_in_context(&mut cuda_ctx, &beta);
+    let state0_dev = CudaBackend::from_slice_typed_in_context(&mut cuda_ctx, &initial_states);
+    let cu_dev = CudaBackend::from_slice_typed_in_context(&mut cuda_ctx, &cu_seqlens);
+    let mut out_dev = CudaBackend::alloc_typed_in_context(&mut cuda_ctx, Dtype::F32, value_len);
+    let mut state_dev = CudaBackend::alloc_typed_in_context(&mut cuda_ctx, Dtype::F32, state_len);
     CudaBackend::recurrent_gated_delta_rule_varlen_f32(
         &mut cuda_ctx,
         &q_dev,
@@ -308,12 +316,12 @@ fn recurrent_gated_delta_rule_varlen_tiled_cuda_matches_cpu_reference() {
     CudaBackend::sync(&mut cuda_ctx);
 
     assert_close(
-        &CudaBackend::to_vec(&out_dev, value_len),
+        &CudaBackend::to_vec_in_context(&mut cuda_ctx, &out_dev, value_len),
         &expected_out,
         1e-4,
     );
     assert_close(
-        &CudaBackend::to_vec(&state_dev, state_len),
+        &CudaBackend::to_vec_in_context(&mut cuda_ctx, &state_dev, state_len),
         &expected_state,
         1e-4,
     );
@@ -431,13 +439,14 @@ fn recurrent_gated_delta_rule_batch_indexed_packed_cuda_matches_cpu_reference() 
     );
 
     let mut cuda_ctx = CudaBackend::new_context();
-    let mixed_dev = CudaBackend::from_slice_typed(&mixed_qkv);
-    let ba_dev = CudaBackend::from_slice_typed(&ba_raw);
-    let a_log_dev = CudaBackend::from_slice_typed(&a_log);
-    let dt_bias_dev = CudaBackend::from_slice_typed(&dt_bias);
-    let mut state_dev = CudaBackend::from_slice_typed(&initial_slots);
-    let slot_dev = CudaBackend::from_slice_typed(&slot_indices);
-    let mut out_dev = CudaBackend::alloc_typed(Dtype::F32, batch * value_total);
+    let mixed_dev = CudaBackend::from_slice_typed_in_context(&mut cuda_ctx, &mixed_qkv);
+    let ba_dev = CudaBackend::from_slice_typed_in_context(&mut cuda_ctx, &ba_raw);
+    let a_log_dev = CudaBackend::from_slice_typed_in_context(&mut cuda_ctx, &a_log);
+    let dt_bias_dev = CudaBackend::from_slice_typed_in_context(&mut cuda_ctx, &dt_bias);
+    let mut state_dev = CudaBackend::from_slice_typed_in_context(&mut cuda_ctx, &initial_slots);
+    let slot_dev = CudaBackend::from_slice_typed_in_context(&mut cuda_ctx, &slot_indices);
+    let mut out_dev =
+        CudaBackend::alloc_typed_in_context(&mut cuda_ctx, Dtype::F32, batch * value_total);
     gated_delta_rule::recurrent_gated_delta_rule_batch_indexed_packed_f32(
         &mut cuda_ctx,
         &mixed_dev,
@@ -459,12 +468,12 @@ fn recurrent_gated_delta_rule_batch_indexed_packed_cuda_matches_cpu_reference() 
     CudaBackend::sync(&mut cuda_ctx);
 
     assert_close(
-        &CudaBackend::to_vec(&out_dev, batch * value_total),
+        &CudaBackend::to_vec_in_context(&mut cuda_ctx, &out_dev, batch * value_total),
         &expected_out,
         2e-5,
     );
     assert_close(
-        &CudaBackend::to_vec(&state_dev, state_len),
+        &CudaBackend::to_vec_in_context(&mut cuda_ctx, &state_dev, state_len),
         &expected_slots,
         2e-5,
     );
@@ -513,13 +522,14 @@ fn recurrent_gated_delta_rule_batch_indexed_packed_cuda_accepts_f16_ba() {
     );
 
     let mut cuda_ctx = CudaBackend::new_context();
-    let mixed_dev = CudaBackend::from_slice_typed(&mixed_qkv);
-    let ba_dev = CudaBackend::from_slice_typed(&to_f16_vec(&ba_raw_f32));
-    let a_log_dev = CudaBackend::from_slice_typed(&a_log);
-    let dt_bias_dev = CudaBackend::from_slice_typed(&dt_bias);
-    let mut state_dev = CudaBackend::from_slice_typed(&initial_slots);
-    let slot_dev = CudaBackend::from_slice_typed(&slot_indices);
-    let mut out_dev = CudaBackend::alloc_typed(Dtype::F32, batch * value_total);
+    let mixed_dev = CudaBackend::from_slice_typed_in_context(&mut cuda_ctx, &mixed_qkv);
+    let ba_dev = CudaBackend::from_slice_typed_in_context(&mut cuda_ctx, &to_f16_vec(&ba_raw_f32));
+    let a_log_dev = CudaBackend::from_slice_typed_in_context(&mut cuda_ctx, &a_log);
+    let dt_bias_dev = CudaBackend::from_slice_typed_in_context(&mut cuda_ctx, &dt_bias);
+    let mut state_dev = CudaBackend::from_slice_typed_in_context(&mut cuda_ctx, &initial_slots);
+    let slot_dev = CudaBackend::from_slice_typed_in_context(&mut cuda_ctx, &slot_indices);
+    let mut out_dev =
+        CudaBackend::alloc_typed_in_context(&mut cuda_ctx, Dtype::F32, batch * value_total);
     gated_delta_rule::recurrent_gated_delta_rule_batch_indexed_packed_f32(
         &mut cuda_ctx,
         &mixed_dev,
@@ -541,12 +551,12 @@ fn recurrent_gated_delta_rule_batch_indexed_packed_cuda_accepts_f16_ba() {
     CudaBackend::sync(&mut cuda_ctx);
 
     assert_close(
-        &CudaBackend::to_vec(&out_dev, batch * value_total),
+        &CudaBackend::to_vec_in_context(&mut cuda_ctx, &out_dev, batch * value_total),
         &expected_out,
         2e-5,
     );
     assert_close(
-        &CudaBackend::to_vec(&state_dev, state_len),
+        &CudaBackend::to_vec_in_context(&mut cuda_ctx, &state_dev, state_len),
         &expected_slots,
         2e-5,
     );

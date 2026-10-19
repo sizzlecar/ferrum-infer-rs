@@ -190,8 +190,15 @@ mod metal_quant_leaf {
         let bytes = quantized.data().unwrap();
         // Unlike GgufLinear's dense reference path, this constructor preserves
         // the packed leaf and reaches metal_gemm_quant_dispatch directly.
-        let linear = QuantLinear::<MetalBackend>::from_gguf_bytes(kind, &bytes, n, k)
-            .expect("the selected Metal device must load the packed quantized leaf");
+        let mut context = MetalBackend::new_context();
+        let linear = QuantLinear::<MetalBackend>::from_gguf_bytes_in_context(
+            &mut context,
+            kind,
+            &bytes,
+            n,
+            k,
+        )
+        .expect("the selected Metal device must load the packed quantized leaf");
         assert_eq!(linear.in_features(), k);
         assert_eq!(linear.out_features(), n);
         let input: Vec<f32> = (0..m * k)
@@ -201,15 +208,15 @@ mod metal_quant_leaf {
                 ((col * 7 + row * 11) % 29) as f32 / 64.0 - 14.0 / 64.0
             })
             .collect();
-        let input_buffer = MetalBackend::from_slice(&input);
-        let mut output_buffer = MetalBackend::from_slice(&vec![f32::NAN; m * n]);
+        let input_buffer = MetalBackend::from_slice_in_context(&mut context, &input);
+        let mut output_buffer =
+            MetalBackend::from_slice_in_context(&mut context, &vec![f32::NAN; m * n]);
         // No unavailable-device early return: selecting these tests requires
         // a real Metal device and successful completion of its actual work.
-        let mut context = MetalBackend::new_context();
         linear.forward(&mut context, &input_buffer, &mut output_buffer, m);
         MetalBackend::sync_checked(&mut context)
             .expect("packed quantized leaf must complete real Metal work");
-        let actual = MetalBackend::to_vec(&output_buffer, m * n);
+        let actual = MetalBackend::to_vec_in_context(&mut context, &output_buffer, m * n);
         assert_eq!(actual.len(), m * n);
         for row in 0..m {
             for column in 0..n {

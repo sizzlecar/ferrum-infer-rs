@@ -48,16 +48,23 @@ use device_execution::{DeviceFrameResult, FrameLayout, LlamaExecutionFrame};
 const DEFAULT_KV_CAPACITY: usize = 512;
 
 fn alloc_model_buffer<B: QuantLlmBackend + BackendMoeFused>(
+    ctx: &mut B::Context,
     label: &'static str,
     len: usize,
 ) -> B::Buffer {
     let _ = label;
     #[cfg(feature = "cuda")]
     let _alloc_label = ferrum_kernels::backend::cuda::push_alloc_label(label);
-    B::alloc(len)
+    // On an allocator panic, observe before earlier fields in the enclosing
+    // scratch construction can unwind. Successful allocation adds no sync.
+    let mut construction = device_execution::ConstructionContext::<B>::new(ctx);
+    let buffer = B::alloc_in_context(construction.context, len);
+    construction.transfer();
+    buffer
 }
 
 fn alloc_model_typed_buffer<B: QuantLlmBackend + BackendMoeFused>(
+    ctx: &mut B::Context,
     label: &'static str,
     dtype: ferrum_kernels::backend::Dtype,
     len: usize,
@@ -65,7 +72,10 @@ fn alloc_model_typed_buffer<B: QuantLlmBackend + BackendMoeFused>(
     let _ = label;
     #[cfg(feature = "cuda")]
     let _alloc_label = ferrum_kernels::backend::cuda::push_alloc_label(label);
-    B::alloc_typed(dtype, len)
+    let mut construction = device_execution::ConstructionContext::<B>::new(ctx);
+    let buffer = B::alloc_typed_in_context(construction.context, dtype, len);
+    construction.transfer();
+    buffer
 }
 
 pub(crate) fn elapsed_micros_u64_floor1(t0: std::time::Instant) -> u64 {
@@ -196,7 +206,7 @@ fn nan_trace_dump<B: Backend>(
     op_dump_dir: Option<&str>,
 ) {
     B::sync(ctx);
-    let v = B::to_vec(buf, len);
+    let v = B::to_vec_in_context(ctx, buf, len);
     let stats = stats_for(&v);
     let maxabs_index = stats
         .maxabs_index
@@ -731,7 +741,34 @@ impl LlamaFamilyLayerStageConfig {
     }
 }
 
+// Actual partial construction owners. Failure guards are declared after these
+// payloads so observation precedes their destruction, including unwinding.
+struct LayerConstruction<B: MoeLlmBackend> {
+    input_ln_w: Option<B::Buffer>,
+    qkv_proj: Option<Box<dyn Linear<B>>>,
+    o_proj: Option<Box<dyn Linear<B>>>,
+    post_ln_w: Option<B::Buffer>,
+    post_attn_ln_w: Option<B::Buffer>,
+    post_ffn_ln_w: Option<B::Buffer>,
+    gate_up_proj: Option<Box<dyn Linear<B>>>,
+    down_proj: Option<Box<dyn Linear<B>>>,
+    q_norm_w: Option<B::Buffer>,
+    k_norm_w: Option<B::Buffer>,
+}
+
+struct ModelConstruction<B: MoeLlmBackend> {
+    rope: Option<RopeCache<B>>,
+    rope_local: Option<RopeCache<B>>,
+    scratch: Option<LlamaFamilyScratch<B>>,
+    embed: Option<B::Buffer>,
+    layers: Option<Vec<LlamaFamilyLayer<B>>>,
+    lm_head: Option<Box<dyn Linear<B>>>,
+    final_norm: Option<B::Buffer>,
+    final_norm_w: Option<B::Buffer>,
+}
+
 fn load_llama_family_layers<B: MoeLlmBackend>(
+    ctx: &mut B::Context,
     cfg: &LlamaFamilyConfig,
     loader: &dyn WeightLoader<B>,
     source_layers: Range<usize>,
@@ -753,50 +790,95 @@ fn load_llama_family_layers<B: MoeLlmBackend>(
         .unwrap_or(1.0);
     for li in source_layers {
         let prefix = format!("model.layers.{li}");
-        let norm = |name: &str, len: usize, scale: f32| -> Result<B::Buffer> {
-            let t = loader.load_tensor(&format!("{prefix}.{name}.weight"))?;
-            Ok(fold_norm_weight::<B>(
-                t,
-                len,
-                cfg.rmsnorm_unit_offset,
-                scale,
-            ))
-        };
+        let norm =
+            |ctx: &mut B::Context, name: &str, len: usize, scale: f32| -> Result<B::Buffer> {
+                let t = loader.load_tensor(ctx, &format!("{prefix}.{name}.weight"))?;
+                Ok(fold_norm_weight::<B>(
+                    ctx,
+                    t,
+                    len,
+                    cfg.rmsnorm_unit_offset,
+                    scale,
+                ))
+            };
         let h = cfg.hidden_size;
-        let input_ln_w = norm("input_layernorm", h, 1.0)?;
-        let qkv_proj = loader.load_linear(&format!("{prefix}.self_attn.qkv_proj"))?;
-        let o_proj = loader.load_linear(&format!("{prefix}.self_attn.o_proj"))?;
-        let (post_ln_w, post_attn_ln_w, post_ffn_ln_w) = if cfg.sandwich_norms {
-            (
-                norm("pre_feedforward_layernorm", h, 1.0)?,
-                Some(norm("post_attention_layernorm", h, 1.0)?),
-                Some(norm("post_feedforward_layernorm", h, 1.0)?),
+        let mut partial = LayerConstruction::<B> {
+            input_ln_w: None,
+            qkv_proj: None,
+            o_proj: None,
+            post_ln_w: None,
+            post_attn_ln_w: None,
+            post_ffn_ln_w: None,
+            gate_up_proj: None,
+            down_proj: None,
+            q_norm_w: None,
+            k_norm_w: None,
+        };
+        let mut construction = device_execution::ConstructionContext::<B>::new(ctx);
+        partial.input_ln_w = Some(norm(construction.context, "input_layernorm", h, 1.0)?);
+        partial.qkv_proj = Some(loader.load_linear(
+            construction.context,
+            &format!("{prefix}.self_attn.qkv_proj"),
+        )?);
+        partial.o_proj =
+            Some(loader.load_linear(construction.context, &format!("{prefix}.self_attn.o_proj"))?);
+        if cfg.sandwich_norms {
+            partial.post_ln_w = Some(norm(
+                construction.context,
+                "pre_feedforward_layernorm",
+                h,
+                1.0,
+            )?);
+            partial.post_attn_ln_w = Some(norm(
+                construction.context,
+                "post_attention_layernorm",
+                h,
+                1.0,
+            )?);
+            partial.post_ffn_ln_w = Some(norm(
+                construction.context,
+                "post_feedforward_layernorm",
+                h,
+                1.0,
+            )?);
+        } else {
+            partial.post_ln_w = Some(norm(
+                construction.context,
+                "post_attention_layernorm",
+                h,
+                1.0,
+            )?);
+        }
+        partial.gate_up_proj =
+            Some(loader.load_linear(construction.context, &format!("{prefix}.mlp.gate_up_proj"))?);
+        partial.down_proj =
+            Some(loader.load_linear(construction.context, &format!("{prefix}.mlp.down_proj"))?);
+        if cfg.has_qk_norm {
+            partial.q_norm_w = norm(
+                construction.context,
+                "self_attn.q_norm",
+                cfg.head_dim,
+                q_norm_scale,
             )
-        } else {
-            (norm("post_attention_layernorm", h, 1.0)?, None, None)
-        };
-        let gate_up_proj = loader.load_linear(&format!("{prefix}.mlp.gate_up_proj"))?;
-        let down_proj = loader.load_linear(&format!("{prefix}.mlp.down_proj"))?;
-
-        let (q_norm_w, k_norm_w) = if cfg.has_qk_norm {
-            let q = norm("self_attn.q_norm", cfg.head_dim, q_norm_scale).ok();
-            let k = norm("self_attn.k_norm", cfg.head_dim, 1.0).ok();
-            (q, k)
-        } else {
-            (None, None)
-        };
-
+            .ok();
+            partial.k_norm_w =
+                norm(construction.context, "self_attn.k_norm", cfg.head_dim, 1.0).ok();
+        }
+        // Success transfers these exact owners into the still-guarded model
+        // construction; it does not introduce a per-layer synchronization.
+        construction.transfer();
+        drop(construction);
         layers.push(LlamaFamilyLayer {
-            input_ln_w,
-            qkv_proj,
-            q_norm_w,
-            k_norm_w,
-            o_proj,
-            post_ln_w,
-            post_attn_ln_w,
-            post_ffn_ln_w,
-            gate_up_proj,
-            down_proj,
+            input_ln_w: partial.input_ln_w.expect("loaded input norm"),
+            qkv_proj: partial.qkv_proj.expect("loaded qkv"),
+            q_norm_w: partial.q_norm_w,
+            k_norm_w: partial.k_norm_w,
+            o_proj: partial.o_proj.expect("loaded attention output"),
+            post_ln_w: partial.post_ln_w.expect("loaded post norm"),
+            post_attn_ln_w: partial.post_attn_ln_w,
+            post_ffn_ln_w: partial.post_ffn_ln_w,
+            gate_up_proj: partial.gate_up_proj.expect("loaded gate/up"),
+            down_proj: partial.down_proj.expect("loaded down"),
         });
     }
     Ok(layers)
@@ -806,6 +888,7 @@ fn load_llama_family_layers<B: MoeLlmBackend>(
 /// `w' = (w + 1)·scale` when `unit_offset` (Gemma RMSNorm is `x̂·(1+w)`),
 /// plus an optional extra scale (query_pre_attn_scalar fold on q_norm).
 fn fold_norm_weight<B: MoeLlmBackend>(
+    ctx: &mut B::Context,
     buf: B::Buffer,
     len: usize,
     unit_offset: bool,
@@ -814,15 +897,19 @@ fn fold_norm_weight<B: MoeLlmBackend>(
     if !unit_offset && scale == 1.0 {
         return buf;
     }
-    let mut v = B::to_vec(&buf, len);
+    let mut construction = device_execution::ConstructionContext::<B>::new(ctx);
+    let mut v = B::to_vec_in_context(construction.context, &buf, len);
     let off = if unit_offset { 1.0 } else { 0.0 };
     for x in v.iter_mut() {
         *x = (*x + off) * scale;
     }
-    B::from_slice(&v)
+    let output = B::from_slice_in_context(construction.context, &v);
+    construction.transfer();
+    output
 }
 
 fn load_llama_family_lm_head<B: MoeLlmBackend>(
+    ctx: &mut B::Context,
     cfg: &LlamaFamilyConfig,
     loader: &dyn WeightLoader<B>,
 ) -> Result<Box<dyn Linear<B>>> {
@@ -834,12 +921,13 @@ fn load_llama_family_lm_head<B: MoeLlmBackend>(
     // bytes, e.g. ~770MB for Qwen3-4B) but keeps the Linear trait's
     // owned-weights invariant. Sharing via Arc is a future optimisation.
     let lm_head = if loader.has_tensor("lm_head.weight") {
-        loader.load_linear("lm_head")?
+        loader.load_linear(ctx, "lm_head")?
     } else {
         tracing::info!(
             "LlamaFamilyModel: tied embeddings — loading model.embed_tokens.weight as lm_head"
         );
-        let as_linear = loader.load_linear("model.embed_tokens")?;
+        let as_linear = loader.load_linear(ctx, "model.embed_tokens")?;
+        let mut construction = device_execution::ConstructionContext::<B>::new(ctx);
         // Sanity check: shape must be [vocab, hidden].
         if as_linear.out_features() != cfg.vocab_size || as_linear.in_features() != cfg.hidden_size
         {
@@ -851,6 +939,8 @@ fn load_llama_family_lm_head<B: MoeLlmBackend>(
                 cfg.hidden_size
             )));
         }
+        construction.transfer();
+        drop(construction);
         as_linear
     };
     Ok(lm_head)
@@ -1195,7 +1285,7 @@ pub struct LlamaFamilyScratch<B: QuantLlmBackend + BackendMoeFused> {
 }
 
 impl<B: QuantLlmBackend + BackendMoeFused> LlamaFamilyScratch<B> {
-    fn alloc(cfg: &LlamaFamilyConfig, max_tokens: usize) -> Self {
+    fn alloc(ctx: &mut B::Context, cfg: &LlamaFamilyConfig, max_tokens: usize) -> Self {
         let h = cfg.hidden_size;
         let im = cfg.intermediate_size;
         let q_dim = cfg.num_heads * cfg.head_dim;
@@ -1203,15 +1293,20 @@ impl<B: QuantLlmBackend + BackendMoeFused> LlamaFamilyScratch<B> {
         let qkv_dim = q_dim + 2 * kv_dim;
         let t = max_tokens;
         Self {
-            residual: Some(alloc_model_buffer::<B>("llama.scratch.residual", t * h)),
-            norm_out: alloc_model_buffer::<B>("llama.scratch.norm_out", t * h),
-            qkv_out: alloc_model_buffer::<B>("llama.scratch.qkv_out", t * qkv_dim),
+            residual: Some(alloc_model_buffer::<B>(
+                ctx,
+                "llama.scratch.residual",
+                t * h,
+            )),
+            norm_out: alloc_model_buffer::<B>(ctx, "llama.scratch.norm_out", t * h),
+            qkv_out: alloc_model_buffer::<B>(ctx, "llama.scratch.qkv_out", t * qkv_dim),
             sandwich_tmp: cfg
                 .sandwich_norms
-                .then(|| alloc_model_buffer::<B>("llama.scratch.sandwich_tmp", t * h)),
+                .then(|| alloc_model_buffer::<B>(ctx, "llama.scratch.sandwich_tmp", t * h)),
             residual_f32_shadow: (cfg.sandwich_norms && B::supports_device_f32_residual_shadow())
                 .then(|| {
                     alloc_model_typed_buffer::<B>(
+                        ctx,
                         "llama.scratch.residual_f32_shadow",
                         ferrum_kernels::backend::Dtype::F32,
                         t * h,
@@ -1220,59 +1315,72 @@ impl<B: QuantLlmBackend + BackendMoeFused> LlamaFamilyScratch<B> {
             sandwich_branch_f32: (cfg.sandwich_norms && B::supports_device_f32_residual_shadow())
                 .then(|| {
                     alloc_model_typed_buffer::<B>(
+                        ctx,
                         "llama.scratch.sandwich_branch_f32",
                         ferrum_kernels::backend::Dtype::F32,
                         t * h,
                     )
                 }),
-            q_buf: alloc_model_buffer::<B>("llama.scratch.q_buf", t * q_dim),
-            k_buf: alloc_model_buffer::<B>("llama.scratch.k_buf", t * kv_dim),
-            v_buf: alloc_model_buffer::<B>("llama.scratch.v_buf", t * kv_dim),
+            q_buf: alloc_model_buffer::<B>(ctx, "llama.scratch.q_buf", t * q_dim),
+            k_buf: alloc_model_buffer::<B>(ctx, "llama.scratch.k_buf", t * kv_dim),
+            v_buf: alloc_model_buffer::<B>(ctx, "llama.scratch.v_buf", t * kv_dim),
             q_head_major: alloc_model_buffer::<B>(
+                ctx,
                 "llama.scratch.q_head_major",
                 cfg.num_heads * t * cfg.head_dim,
             ),
             k_head_major: alloc_model_buffer::<B>(
+                ctx,
                 "llama.scratch.k_head_major",
                 cfg.num_kv_heads * t * cfg.head_dim,
             ),
             v_head_major: alloc_model_buffer::<B>(
+                ctx,
                 "llama.scratch.v_head_major",
                 cfg.num_kv_heads * t * cfg.head_dim,
             ),
             attn_head_major_out: alloc_model_buffer::<B>(
+                ctx,
                 "llama.scratch.attn_head_major_out",
                 cfg.num_heads * t * cfg.head_dim,
             ),
-            attn_flat: alloc_model_buffer::<B>("llama.scratch.attn_flat", t * q_dim),
-            o_proj_out: alloc_model_buffer::<B>("llama.scratch.o_proj_out", t * h),
-            gate_up_out: alloc_model_buffer::<B>("llama.scratch.gate_up_out", t * 2 * im),
-            silu_out: alloc_model_buffer::<B>("llama.scratch.silu_out", t * im),
-            mlp_out: alloc_model_buffer::<B>("llama.scratch.mlp_out", t * h),
-            last_hidden: alloc_model_buffer::<B>("llama.scratch.last_hidden", h),
-            last_normed: alloc_model_buffer::<B>("llama.scratch.last_normed", h),
-            logits: alloc_model_buffer::<B>("llama.scratch.logits", cfg.vocab_size),
-            q_single: alloc_model_buffer::<B>("llama.scratch.q_single", q_dim),
-            k_single: alloc_model_buffer::<B>("llama.scratch.k_single", kv_dim),
-            v_single: alloc_model_buffer::<B>("llama.scratch.v_single", kv_dim),
+            attn_flat: alloc_model_buffer::<B>(ctx, "llama.scratch.attn_flat", t * q_dim),
+            o_proj_out: alloc_model_buffer::<B>(ctx, "llama.scratch.o_proj_out", t * h),
+            gate_up_out: alloc_model_buffer::<B>(ctx, "llama.scratch.gate_up_out", t * 2 * im),
+            silu_out: alloc_model_buffer::<B>(ctx, "llama.scratch.silu_out", t * im),
+            mlp_out: alloc_model_buffer::<B>(ctx, "llama.scratch.mlp_out", t * h),
+            last_hidden: alloc_model_buffer::<B>(ctx, "llama.scratch.last_hidden", h),
+            last_normed: alloc_model_buffer::<B>(ctx, "llama.scratch.last_normed", h),
+            logits: alloc_model_buffer::<B>(ctx, "llama.scratch.logits", cfg.vocab_size),
+            q_single: alloc_model_buffer::<B>(ctx, "llama.scratch.q_single", q_dim),
+            k_single: alloc_model_buffer::<B>(ctx, "llama.scratch.k_single", kv_dim),
+            v_single: alloc_model_buffer::<B>(ctx, "llama.scratch.v_single", kv_dim),
             q_head_major_single: alloc_model_buffer::<B>(
+                ctx,
                 "llama.scratch.q_head_major_single",
                 q_dim,
             ),
             k_head_major_single: alloc_model_buffer::<B>(
+                ctx,
                 "llama.scratch.k_head_major_single",
                 kv_dim,
             ),
             v_head_major_single: alloc_model_buffer::<B>(
+                ctx,
                 "llama.scratch.v_head_major_single",
                 kv_dim,
             ),
             attn_head_major_single: alloc_model_buffer::<B>(
+                ctx,
                 "llama.scratch.attn_head_major_single",
                 q_dim,
             ),
-            attn_flat_single: alloc_model_buffer::<B>("llama.scratch.attn_flat_single", q_dim),
-            batch_logits: alloc_model_buffer::<B>("llama.scratch.batch_logits", cfg.vocab_size),
+            attn_flat_single: alloc_model_buffer::<B>(ctx, "llama.scratch.attn_flat_single", q_dim),
+            batch_logits: alloc_model_buffer::<B>(
+                ctx,
+                "llama.scratch.batch_logits",
+                cfg.vocab_size,
+            ),
             batch_logits_capacity: 1,
             argmax_token_mask: None,
             argmax_token_mask_fingerprint: None,
@@ -1296,28 +1404,44 @@ impl<B: QuantLlmBackend + BackendMoeFused> LlamaFamilyScratch<B> {
             paged_max_blocks_per_seq: 0,
             paged_max_seqs: 0,
             batch_positions: alloc_model_typed_buffer::<B>(
+                ctx,
                 "llama.scratch.batch_positions",
                 ferrum_kernels::backend::Dtype::U32,
                 t.max(1),
             ),
             batch_tokens: alloc_model_typed_buffer::<B>(
+                ctx,
                 "llama.scratch.batch_tokens",
                 ferrum_kernels::backend::Dtype::U32,
                 t.max(1),
             ),
             batch_kv_lens_pre: alloc_model_typed_buffer::<B>(
+                ctx,
                 "llama.scratch.batch_kv_lens_pre",
                 ferrum_kernels::backend::Dtype::U32,
                 t.max(1),
             ),
             batch_kv_lens_post: alloc_model_typed_buffer::<B>(
+                ctx,
                 "llama.scratch.batch_kv_lens_post",
                 ferrum_kernels::backend::Dtype::U32,
                 t.max(1),
             ),
-            q_normed_batched: alloc_model_buffer::<B>("llama.scratch.q_normed_batched", t * q_dim),
-            k_normed_batched: alloc_model_buffer::<B>("llama.scratch.k_normed_batched", t * kv_dim),
-            v_normed_batched: alloc_model_buffer::<B>("llama.scratch.v_normed_batched", t * kv_dim),
+            q_normed_batched: alloc_model_buffer::<B>(
+                ctx,
+                "llama.scratch.q_normed_batched",
+                t * q_dim,
+            ),
+            k_normed_batched: alloc_model_buffer::<B>(
+                ctx,
+                "llama.scratch.k_normed_batched",
+                t * kv_dim,
+            ),
+            v_normed_batched: alloc_model_buffer::<B>(
+                ctx,
+                "llama.scratch.v_normed_batched",
+                t * kv_dim,
+            ),
             unified_capacity: 0,
             unified_residual: None,
             unified_norm_out: None,
@@ -1340,13 +1464,23 @@ impl<B: QuantLlmBackend + BackendMoeFused> LlamaFamilyScratch<B> {
         }
     }
 
-    pub(crate) fn ensure_batch_logits(&mut self, cfg: &LlamaFamilyConfig, rows: usize) {
+    pub(crate) fn ensure_batch_logits(
+        &mut self,
+        ctx: &mut B::Context,
+        cfg: &LlamaFamilyConfig,
+        rows: usize,
+    ) {
         let rows = rows.max(1);
         if rows <= self.batch_logits_capacity {
             return;
         }
-        self.batch_logits =
-            alloc_model_buffer::<B>("llama.scratch.batch_logits.grow", rows * cfg.vocab_size);
+        B::retire_graphs_for_storage_mutation(ctx)
+            .unwrap_or_else(|error| std::panic::panic_any(error));
+        self.batch_logits = alloc_model_buffer::<B>(
+            ctx,
+            "llama.scratch.batch_logits.grow",
+            rows * cfg.vocab_size,
+        );
         self.batch_logits_capacity = rows;
     }
 
@@ -1359,6 +1493,7 @@ impl<B: QuantLlmBackend + BackendMoeFused> LlamaFamilyScratch<B> {
             || self.argmax_token_mask_len != mask.len();
         if needs_upload {
             let mut device_mask = alloc_model_typed_buffer::<B>(
+                ctx,
                 "llama.scratch.argmax_token_mask",
                 ferrum_kernels::backend::Dtype::I8,
                 mask.len().max(1),
@@ -1404,6 +1539,7 @@ impl<B: QuantLlmBackend + BackendMoeFused> LlamaFamilyScratch<B> {
                 .checked_next_power_of_two()
                 .unwrap_or(offsets_len);
             self.argmax_repetition_offsets = Some(alloc_model_typed_buffer::<B>(
+                ctx,
                 "llama.scratch.argmax_repetition_offsets",
                 ferrum_kernels::backend::Dtype::U32,
                 capacity,
@@ -1416,6 +1552,7 @@ impl<B: QuantLlmBackend + BackendMoeFused> LlamaFamilyScratch<B> {
                 .checked_next_power_of_two()
                 .unwrap_or(token_ids_len);
             self.argmax_repetition_token_ids = Some(alloc_model_typed_buffer::<B>(
+                ctx,
                 "llama.scratch.argmax_repetition_token_ids",
                 ferrum_kernels::backend::Dtype::U32,
                 capacity,
@@ -1428,6 +1565,7 @@ impl<B: QuantLlmBackend + BackendMoeFused> LlamaFamilyScratch<B> {
                 .checked_next_power_of_two()
                 .unwrap_or(penalties_len);
             self.argmax_repetition_penalties = Some(alloc_model_typed_buffer::<B>(
+                ctx,
                 "llama.scratch.argmax_repetition_penalties",
                 ferrum_kernels::backend::Dtype::F32,
                 capacity,
@@ -1465,13 +1603,19 @@ impl<B: QuantLlmBackend + BackendMoeFused> LlamaFamilyScratch<B> {
         token_ids.len()
     }
 
-    pub(crate) fn ensure_unified_argmax_logits(&mut self, cfg: &LlamaFamilyConfig, rows: usize) {
+    pub(crate) fn ensure_unified_argmax_logits(
+        &mut self,
+        ctx: &mut B::Context,
+        cfg: &LlamaFamilyConfig,
+        rows: usize,
+    ) {
         let rows = rows.max(1);
         if rows <= self.unified_argmax_logits_capacity {
             return;
         }
         let capacity = rows.checked_next_power_of_two().unwrap_or(rows);
         self.unified_argmax_logits = Some(alloc_model_buffer::<B>(
+            ctx,
             "llama.scratch.unified_argmax_logits",
             capacity * cfg.vocab_size,
         ));
@@ -1485,6 +1629,7 @@ impl<B: QuantLlmBackend + BackendMoeFused> LlamaFamilyScratch<B> {
     /// references the previous pointers must be invalidated by the caller.
     pub(crate) fn ensure_unified_scratch(
         &mut self,
+        ctx: &mut B::Context,
         cfg: &LlamaFamilyConfig,
         m_total: usize,
         max_seqs: usize,
@@ -1508,6 +1653,10 @@ impl<B: QuantLlmBackend + BackendMoeFused> LlamaFamilyScratch<B> {
         let qkv_dim = q_dim + 2 * kv_dim;
         let im = cfg.intermediate_size;
         let v = cfg.vocab_size;
+        // Cached graphs must stop owning these addresses before any of the
+        // corresponding scratch allocations are replaced.
+        B::retire_graphs_for_storage_mutation(ctx)
+            .unwrap_or_else(|error| std::panic::panic_any(error));
         self.unified_residual = None;
         self.unified_norm_out = None;
         self.unified_qkv_out = None;
@@ -1521,34 +1670,51 @@ impl<B: QuantLlmBackend + BackendMoeFused> LlamaFamilyScratch<B> {
         self.unified_silu_out = None;
         self.unified_mlp_out = None;
 
-        self.unified_residual = Some(alloc_model_buffer::<B>("llama.unified.residual", cap * h));
-        self.unified_norm_out = Some(alloc_model_buffer::<B>("llama.unified.norm_out", cap * h));
+        self.unified_residual = Some(alloc_model_buffer::<B>(
+            ctx,
+            "llama.unified.residual",
+            cap * h,
+        ));
+        self.unified_norm_out = Some(alloc_model_buffer::<B>(
+            ctx,
+            "llama.unified.norm_out",
+            cap * h,
+        ));
         self.unified_qkv_out = Some(alloc_model_buffer::<B>(
+            ctx,
             "llama.unified.qkv_out",
             cap * qkv_dim,
         ));
         self.unified_packed_q = Some(alloc_model_buffer::<B>(
+            ctx,
             "llama.unified.packed_q",
             cap * q_dim,
         ));
         self.unified_attn_out = Some(alloc_model_buffer::<B>(
+            ctx,
             "llama.unified.attn_out",
             cap * q_dim,
         ));
-        self.unified_o_proj_out =
-            Some(alloc_model_buffer::<B>("llama.unified.o_proj_out", cap * h));
+        self.unified_o_proj_out = Some(alloc_model_buffer::<B>(
+            ctx,
+            "llama.unified.o_proj_out",
+            cap * h,
+        ));
         if cfg.sandwich_norms {
             self.unified_sandwich_tmp = Some(alloc_model_buffer::<B>(
+                ctx,
                 "llama.unified.sandwich_tmp",
                 cap * h,
             ));
             if B::supports_device_f32_residual_shadow() {
                 self.unified_residual_f32_shadow = Some(alloc_model_typed_buffer::<B>(
+                    ctx,
                     "llama.unified.residual_f32_shadow",
                     ferrum_kernels::backend::Dtype::F32,
                     cap * h,
                 ));
                 self.unified_sandwich_branch_f32 = Some(alloc_model_typed_buffer::<B>(
+                    ctx,
                     "llama.unified.sandwich_branch_f32",
                     ferrum_kernels::backend::Dtype::F32,
                     cap * h,
@@ -1556,32 +1722,46 @@ impl<B: QuantLlmBackend + BackendMoeFused> LlamaFamilyScratch<B> {
             }
         }
         self.unified_gate_up_out = Some(alloc_model_buffer::<B>(
+            ctx,
             "llama.unified.gate_up_out",
             cap * 2 * im,
         ));
-        self.unified_silu_out = Some(alloc_model_buffer::<B>("llama.unified.silu_out", cap * im));
-        self.unified_mlp_out = Some(alloc_model_buffer::<B>("llama.unified.mlp_out", cap * h));
+        self.unified_silu_out = Some(alloc_model_buffer::<B>(
+            ctx,
+            "llama.unified.silu_out",
+            cap * im,
+        ));
+        self.unified_mlp_out = Some(alloc_model_buffer::<B>(
+            ctx,
+            "llama.unified.mlp_out",
+            cap * h,
+        ));
         if self.unified_cu_seqlens_q.is_none() {
             self.unified_cu_seqlens_q = Some(alloc_model_typed_buffer::<B>(
+                ctx,
                 "llama.unified.cu_seqlens_q",
                 ferrum_kernels::backend::Dtype::U32,
                 max_seqs + 1,
             ));
             self.unified_pos_offsets = Some(alloc_model_typed_buffer::<B>(
+                ctx,
                 "llama.unified.pos_offsets",
                 ferrum_kernels::backend::Dtype::U32,
                 max_seqs,
             ));
             self.unified_block_tables = Some(alloc_model_typed_buffer::<B>(
+                ctx,
                 "llama.unified.block_tables",
                 ferrum_kernels::backend::Dtype::U32,
                 max_seqs * max_blocks_per_seq,
             ));
             self.unified_packed_normed = Some(alloc_model_buffer::<B>(
+                ctx,
                 "llama.unified.packed_normed",
                 max_seqs * h,
             ));
             self.unified_packed_logits = Some(alloc_model_buffer::<B>(
+                ctx,
                 "llama.unified.packed_logits",
                 max_seqs * v,
             ));
@@ -1595,6 +1775,7 @@ impl<B: QuantLlmBackend + BackendMoeFused> LlamaFamilyScratch<B> {
     /// the pool dimensions. Idempotent.
     fn enable_paged_batch(
         &mut self,
+        ctx: &mut B::Context,
         cfg: &LlamaFamilyConfig,
         max_seqs: usize,
         max_blocks_per_seq: usize,
@@ -1604,19 +1785,23 @@ impl<B: QuantLlmBackend + BackendMoeFused> LlamaFamilyScratch<B> {
         }
         let q_dim = cfg.num_heads * cfg.head_dim;
         self.paged_batch_q = Some(alloc_model_buffer::<B>(
+            ctx,
             "llama.paged_batch.q",
             max_seqs * q_dim,
         ));
         self.paged_batch_o = Some(alloc_model_buffer::<B>(
+            ctx,
             "llama.paged_batch.o",
             max_seqs * q_dim,
         ));
         self.paged_batch_block_tables = Some(alloc_model_typed_buffer::<B>(
+            ctx,
             "llama.paged_batch.block_tables",
             ferrum_kernels::backend::Dtype::U32,
             max_seqs * max_blocks_per_seq,
         ));
         self.paged_batch_context_lens = Some(alloc_model_typed_buffer::<B>(
+            ctx,
             "llama.paged_batch.context_lens",
             ferrum_kernels::backend::Dtype::U32,
             max_seqs,
@@ -1641,6 +1826,9 @@ impl<B: QuantLlmBackend + BackendMoeFused> LlamaFamilyScratch<B> {
 /// enum and is satisfied by all backends via stub impls (Cpu/Metal) or
 /// the real impl (CUDA).
 pub struct LlamaFamilyModel<B: MoeLlmBackend, K: KvLayer<B> = KvFp16> {
+    /// The original instance context is lent to one frame at a time. None
+    /// means borrowed or held by pending_device_frame; it never means create.
+    execution_context: Option<B::Context>,
     pub cfg: LlamaFamilyConfig,
     pub runtime_cfg: LlmRuntimeConfig,
 
@@ -1860,41 +2048,72 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
             )));
         }
 
-        // Invalidate any graph from a previously-loaded model. The captured
-        // graph references the old model's scratch buffers; a fresh model
-        // gets fresh scratch, so reusing the graph would read/write freed
-        // pointers. Matters for test suites where multiple models coexist.
+        let mut context = B::new_context();
+        // These are the actual partially built owners, declared before the
+        // guard so failure observes the original context before their Drop.
+        let mut partial = ModelConstruction::<B> {
+            rope: None,
+            rope_local: None,
+            scratch: None,
+            embed: None,
+            layers: None,
+            lm_head: None,
+            final_norm: None,
+            final_norm_w: None,
+        };
         {
-            let mut ctx = B::new_context();
-            B::reset_all_graphs(&mut ctx);
+            let mut construction = device_execution::ConstructionContext::<B>::new(&mut context);
+            B::begin_execution(construction.context)?;
+            partial.rope = Some(build_rope_cache::<B>(construction.context, &cfg));
+            if let Some(theta) = cfg.rope_local_theta {
+                let mut local_cfg = cfg.clone();
+                local_cfg.rope_theta = theta;
+                local_cfg.rope_scaling = None;
+                partial.rope_local = Some(build_rope_cache::<B>(construction.context, &local_cfg));
+            }
+            partial.scratch = Some(LlamaFamilyScratch::alloc(construction.context, &cfg, 1));
+            if stage.load_embedding {
+                partial.embed =
+                    Some(loader.load_tensor(construction.context, "model.embed_tokens.weight")?);
+            }
+            partial.layers = Some(load_llama_family_layers(
+                construction.context,
+                &cfg,
+                loader,
+                stage.source_layers.clone(),
+            )?);
+            if stage.load_lm_head {
+                partial.lm_head = Some(load_llama_family_lm_head(
+                    construction.context,
+                    &cfg,
+                    loader,
+                )?);
+            }
+            partial.final_norm =
+                Some(loader.load_tensor(construction.context, "model.norm.weight")?);
+            partial.final_norm_w = Some(fold_norm_weight::<B>(
+                construction.context,
+                partial.final_norm.take().expect("loaded final norm"),
+                cfg.hidden_size,
+                cfg.rmsnorm_unit_offset,
+                1.0,
+            ));
+            construction.complete()?;
         }
-        let rope = build_rope_cache::<B>(&cfg);
-        // Local-attention rope table (Gemma 3): own θ, never rope-scaled.
-        let rope_local = cfg.rope_local_theta.map(|theta| {
-            let mut local_cfg = cfg.clone();
-            local_cfg.rope_theta = theta;
-            local_cfg.rope_scaling = None;
-            build_rope_cache::<B>(&local_cfg)
-        });
-        let scratch = LlamaFamilyScratch::alloc(&cfg, 1);
-        let embed = if stage.load_embedding {
-            Some(loader.load_tensor("model.embed_tokens.weight")?)
-        } else {
-            None
-        };
-        let layers = load_llama_family_layers(&cfg, loader, stage.source_layers.clone())?;
-
-        let lm_head = if stage.load_lm_head {
-            Some(load_llama_family_lm_head(&cfg, loader)?)
-        } else {
-            None
-        };
-        let final_norm_w = fold_norm_weight::<B>(
-            loader.load_tensor("model.norm.weight")?,
-            cfg.hidden_size,
-            cfg.rmsnorm_unit_offset,
-            1.0,
-        );
+        let ModelConstruction {
+            rope,
+            rope_local,
+            scratch,
+            embed,
+            layers,
+            lm_head,
+            final_norm: _,
+            final_norm_w,
+        } = partial;
+        let rope = rope.expect("constructed rope");
+        let scratch = scratch.expect("constructed scratch");
+        let layers = layers.expect("constructed layers");
+        let final_norm_w = final_norm_w.expect("constructed norm");
 
         let layer_source_start = stage.source_layers.start;
         let layer_source_end = stage.source_layers.end;
@@ -1923,6 +2142,7 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
             );
         }
         Ok(Self {
+            execution_context: Some(context),
             cfg,
             runtime_cfg,
             supports_varlen_qkv,
@@ -1997,7 +2217,19 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         Some(source_layer_index - self.layer_source_start)
     }
 
-    fn resize_scratch(&mut self, tokens: usize) {
+    pub(in crate::models) fn clear_graph_bookkeeping(&mut self) {
+        self.graph_warmup = 0;
+        self.graph_capture_failed = false;
+        self.batched_graph_keys_seen.clear();
+        self.batched_graph_warmup = 0;
+        self.batched_graph_failed = false;
+        self.batched_pointers_for = None;
+        self.unified_graph_keys_seen.clear();
+        self.unified_graph_warmup = 0;
+        self.unified_graph_failed = false;
+    }
+
+    fn resize_scratch_in_context(&mut self, ctx: &mut B::Context, tokens: usize) {
         let tokens = tokens.max(1);
         if self.scratch.max_tokens == tokens {
             return;
@@ -2006,14 +2238,9 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         // buffers; those are about to be freed. Invalidate ALL captured
         // graphs (both single-item and per-m_padded batched) — every
         // captured kernel-arg pointer into scratch is stale.
-        {
-            let mut ctx = B::new_context();
-            B::reset_all_graphs(&mut ctx);
-        }
-        let minimal = LlamaFamilyScratch::alloc(&self.cfg, 1);
-        let old = std::mem::replace(&mut self.scratch, minimal);
-        drop(old);
-        self.scratch = LlamaFamilyScratch::alloc(&self.cfg, tokens);
+        B::retire_graphs_for_storage_mutation(ctx)
+            .unwrap_or_else(|error| std::panic::panic_any(error));
+        self.scratch = LlamaFamilyScratch::alloc(ctx, &self.cfg, tokens);
         self.graph_warmup = 0;
         self.graph_capture_failed = false;
         self.batched_graph_keys_seen.clear();
@@ -2028,14 +2255,21 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         // `paged_batch_block_tables missing`.
         if let Some((max_seqs, max_blocks_per_seq)) = self.paged_dims {
             self.scratch
-                .enable_paged_batch(&self.cfg, max_seqs, max_blocks_per_seq);
+                .enable_paged_batch(ctx, &self.cfg, max_seqs, max_blocks_per_seq);
         }
     }
 
     /// Grow scratch buffers if `tokens` exceeds the current sizing.
     pub(crate) fn ensure_scratch(&mut self, tokens: usize) {
+        self.run_preparation_frame(|model, frame| {
+            model.ensure_scratch_in_context(&mut frame.context, tokens);
+        })
+        .into_legacy_result();
+    }
+
+    pub(crate) fn ensure_scratch_in_context(&mut self, ctx: &mut B::Context, tokens: usize) {
         if self.scratch.max_tokens < tokens {
-            self.resize_scratch(tokens);
+            self.resize_scratch_in_context(ctx, tokens);
         }
     }
 
@@ -2130,14 +2364,20 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         // implies every request reserves its full context window.
         if paged && self.paged_pools.is_none() {
             let mut pools = Vec::with_capacity(self.local_layer_count());
+            // Observe the original allocation/upload context before an
+            // incomplete layer collection can unwind and release its buffers.
+            let mut construction = device_execution::ConstructionContext::<B>::new(ctx);
             for _ in self.local_layer_indices() {
                 pools.push(K::alloc_paged_pool(
+                    construction.context,
                     total_pool_blocks,
                     LLAMA_PAGED_BLOCK_SIZE,
                     nkv,
                     hd,
                 ));
             }
+            construction.transfer();
+            drop(construction);
             self.paged_pools = Some(pools);
             self.paged_block_alloc = Some(std::sync::Mutex::new(
                 crate::common::paged_pool::BlockAllocator::new(total_pool_blocks as u32),
@@ -2150,7 +2390,7 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         // since the pools were first allocated.
         if paged {
             self.scratch
-                .enable_paged_batch(&self.cfg, max_seqs, max_blocks_per_seq);
+                .enable_paged_batch(ctx, &self.cfg, max_seqs, max_blocks_per_seq);
             // Pin dims on the model so `ensure_scratch`'s realloc can
             // re-init paged_batch_* after wiping scratch.
             self.paged_dims = Some((max_seqs, max_blocks_per_seq));
@@ -2164,16 +2404,37 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         // model's K marker. INT8 supports paged mode only — KvInt8::alloc_contig
         // panics, surfacing the misconfiguration here at first ensure_kv.
         let local_layer_count = self.local_layer_count();
-        let allocate_caches = || {
-            (0..local_layer_count)
-                .map(|_| {
-                    if paged {
-                        K::alloc_paged(max_blocks_per_seq, LLAMA_PAGED_BLOCK_SIZE, nkv, hd)
-                    } else {
-                        K::alloc_contig(contig_initial_capacity, nkv, hd)
-                    }
-                })
-                .collect()
+        let replaces_cached_storage = !paged
+            && capacity_hint.is_some()
+            && self
+                .kv_free_pool
+                .last()
+                .and_then(|layers| layers.first())
+                .is_some_and(|cache| K::capacity(cache) != contig_initial_capacity);
+        if replaces_cached_storage {
+            B::retire_graphs_for_storage_mutation(ctx)
+                .unwrap_or_else(|error| std::panic::panic_any(error));
+            self.clear_graph_bookkeeping();
+        }
+        let mut allocate_caches = || {
+            let mut caches = Vec::with_capacity(local_layer_count);
+            let mut construction = device_execution::ConstructionContext::<B>::new(ctx);
+            for _ in 0..local_layer_count {
+                caches.push(if paged {
+                    K::alloc_paged(
+                        construction.context,
+                        max_blocks_per_seq,
+                        LLAMA_PAGED_BLOCK_SIZE,
+                        nkv,
+                        hd,
+                    )
+                } else {
+                    K::alloc_contig(construction.context, contig_initial_capacity, nkv, hd)
+                });
+            }
+            construction.transfer();
+            drop(construction);
+            caches
         };
         let caches = match self.kv_free_pool.pop() {
             Some(mut cached)
@@ -2240,6 +2501,29 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         target_len: usize,
     ) -> Result<()> {
         if self.paged_pools.is_none() {
+            let caches = self.kv_caches.get(cache_id).ok_or_else(|| {
+                ferrum_types::FerrumError::model("KV preparation requires the original cache")
+            })?;
+            if caches.iter().any(|cache| target_len > K::capacity(cache)) {
+                if target_len > self.runtime_env.kv_capacity_for_model(self.cfg.max_seq_len) {
+                    return Err(ferrum_types::FerrumError::resource_exhausted(
+                        "KV target exceeds configured capacity",
+                    ));
+                }
+                // Previous invocations were observed before this frame began.
+                // Retire graph pointers before replacing any layer allocation.
+                B::retire_graphs_for_storage_mutation(ctx)?;
+                self.clear_graph_bookkeeping();
+                for cache in self.kv_caches.get_mut(cache_id).expect("original cache") {
+                    K::ensure_contig_capacity(
+                        ctx,
+                        cache,
+                        target_len,
+                        self.cfg.num_kv_heads,
+                        self.cfg.head_dim,
+                    )?;
+                }
+            }
             return Ok(());
         }
 
@@ -2658,10 +2942,23 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
             }
             return Ok(());
         }
-        let runtime = load_runtime_lora_adapter::<B>(&adapter)?;
-        self.validate_lora_adapter(&runtime)?;
-        self.lora_adapters.insert(adapter.name.clone(), runtime);
-        Ok(())
+        match self.run_preparation_frame(|model, frame| {
+            let runtime = load_runtime_lora_adapter::<B>(&mut frame.context, &adapter)?;
+            let validation = model.validate_lora_adapter(&runtime);
+            // Even an invalid upload remains an actual frame product until
+            // terminal observation; Held retains it with the original frame.
+            Ok::<_, ferrum_types::FerrumError>((runtime, validation))
+        }) {
+            DeviceFrameResult::Terminal(Ok(Ok((runtime, validation)))) => {
+                validation?;
+                self.lora_adapters.insert(adapter.name.clone(), runtime);
+                Ok(())
+            }
+            DeviceFrameResult::Terminal(Ok(Err(error)))
+            | DeviceFrameResult::Terminal(Err(error))
+            | DeviceFrameResult::Rejected(error)
+            | DeviceFrameResult::Held(error) => Err(error),
+        }
     }
 
     fn single_decode_graph_enabled(&self) -> bool {
@@ -2681,6 +2978,17 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
     ) -> Option<&RuntimeLoraAdapter<B>> {
         let adapter_name = self.lora_cache_adapters.get(cache_id)?;
         self.lora_adapters.get(adapter_name)
+    }
+
+    fn prepare_lora_workspace_for_cache(&self, ctx: &mut B::Context, cache_id: &str, rows: usize) {
+        // Prepare only the adapter consumed by this invocation. The original
+        // frame begins after its predecessor is terminal; LoRA is never
+        // captured, and apply_projection retains these buffers on the adapter.
+        if let Some(adapter) = self.active_lora_adapter_for_cache(cache_id) {
+            adapter
+                .prepare_workspace(ctx, rows)
+                .unwrap_or_else(|error| std::panic::panic_any(error));
+        }
     }
 
     fn active_lora_adapter_ptr_for_cache(
@@ -2748,20 +3056,21 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         tokens: usize,
         dim: usize,
     ) {
-        let weight_h = B::to_vec(weight, dim);
+        let weight_h = B::to_vec_in_context(ctx, weight, dim);
         let normed = Self::rms_norm_host(input, &weight_h, tokens, dim, eps);
         B::write_f32_to_activation(ctx, out, &normed);
     }
 
     fn rms_norm_device_to_host(
+        ctx: &mut B::Context,
         input: &B::Buffer,
         weight: &B::Buffer,
         eps: f32,
         tokens: usize,
         dim: usize,
     ) -> Vec<f32> {
-        let input_h = B::to_vec(input, tokens * dim);
-        let weight_h = B::to_vec(weight, dim);
+        let input_h = B::to_vec_in_context(ctx, input, tokens * dim);
+        let weight_h = B::to_vec_in_context(ctx, weight, dim);
         Self::rms_norm_host(&input_h, &weight_h, tokens, dim, eps)
     }
 
@@ -3307,6 +3616,7 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
             if let Some(post_attn_w) = &layer.post_attn_ln_w {
                 if let Some(host) = host_residual.as_deref_mut() {
                     let branch = Self::rms_norm_device_to_host(
+                        ctx,
                         &self.scratch.o_proj_out,
                         post_attn_w,
                         eps,
@@ -3498,6 +3808,7 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
             if let Some(post_ffn_w) = &layer.post_ffn_ln_w {
                 if let Some(host) = host_residual.as_deref_mut() {
                     let branch = Self::rms_norm_device_to_host(
+                        ctx,
                         &self.scratch.mlp_out,
                         post_ffn_w,
                         eps,
@@ -3568,6 +3879,10 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
     /// `pos_offset = cache.len` the same way prefill_internal does, so
     /// chunked prefill semantics carry over for free.
     pub fn forward_verify(&mut self, cache_id: &str, tokens: &[u32]) -> Vec<f32> {
+        assert!(
+            !tokens.is_empty(),
+            "forward_verify called with empty tokens"
+        );
         self.validate_prepared_legacy_write(
             cache_id,
             self.cache_len(cache_id),
@@ -3575,11 +3890,26 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
             Some(tokens),
         )
         .unwrap_or_else(|error| std::panic::panic_any(error));
+        self.run_device_frame(|model, frame| model.forward_verify_in_frame(frame, cache_id, tokens))
+            .into_legacy_result()
+    }
+
+    fn forward_verify_in_frame(
+        &mut self,
+        frame: &mut LlamaExecutionFrame<B>,
+        cache_id: &str,
+        tokens: &[u32],
+    ) -> Vec<f32> {
         let seq_len = tokens.len();
         assert!(seq_len > 0, "forward_verify called with empty tokens");
-        self.ensure_scratch(seq_len);
-        self.scratch.ensure_batch_logits(&self.cfg, seq_len);
-        self.ensure_kv(cache_id);
+        self.ensure_scratch_in_context(&mut frame.context, seq_len);
+        self.prepare_lora_workspace_for_cache(&mut frame.context, cache_id, seq_len);
+        if seq_len > self.scratch.batch_logits_capacity {
+            self.clear_graph_bookkeeping();
+        }
+        self.scratch
+            .ensure_batch_logits(&mut frame.context, &self.cfg, seq_len);
+        self.ensure_kv_in_context(&mut frame.context, cache_id, None);
 
         let h = self.cfg.hidden_size;
         let vocab = self.cfg.vocab_size;
@@ -3591,14 +3921,18 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
             .map(|c| K::len(c))
             .unwrap_or(0);
 
-        let mut ctx = B::new_context();
+        let use_device_residual_shadow = self.use_device_residual_shadow();
+        frame
+            .take_scratch(
+                &mut self.scratch,
+                FrameLayout::Single,
+                use_device_residual_shadow,
+            )
+            .expect("take frame scratch");
+        let mut ctx = &mut frame.context;
         self.ensure_paged_kv_capacity_for_cache_id(&mut ctx, cache_id, pos_offset + seq_len)
             .expect("paged KV dynamic grow");
-        let mut residual = self
-            .scratch
-            .residual
-            .take()
-            .expect("scratch residual missing (previous call didn't restore)");
+        let mut residual = frame.residual.as_mut().expect("frame residual");
 
         let embed = self
             .embed
@@ -3609,34 +3943,18 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
             B::scale_inplace(&mut ctx, &mut residual, scale, seq_len * h);
         }
         let use_host_residual_shadow = self.use_host_residual_shadow();
-        let use_device_residual_shadow = self.use_device_residual_shadow();
+
         let mut host_residual = if use_host_residual_shadow {
             B::sync(&mut ctx);
-            Some(B::to_vec(&residual, seq_len * h))
+            Some(B::to_vec_in_context(ctx, &residual, seq_len * h))
         } else {
             None
         };
-        let mut device_residual_shadow = if use_device_residual_shadow {
-            let mut shadow = self
-                .scratch
-                .residual_f32_shadow
-                .take()
-                .expect("device F32 residual shadow scratch missing");
-            B::activation_to_f32_shadow(&mut ctx, &residual, &mut shadow, seq_len * h);
-            Some(shadow)
-        } else {
-            None
-        };
-        let mut device_branch_shadow = if use_device_residual_shadow {
-            Some(
-                self.scratch
-                    .sandwich_branch_f32
-                    .take()
-                    .expect("device F32 sandwich branch scratch missing"),
-            )
-        } else {
-            None
-        };
+        let mut device_residual_shadow = frame.residual_f32.as_mut();
+        if let Some(shadow) = device_residual_shadow.as_deref_mut() {
+            B::activation_to_f32_shadow(&mut ctx, &residual, shadow, seq_len * h);
+        }
+        let mut device_branch_shadow = frame.branch_f32.as_mut();
 
         for li in self.local_layer_indices() {
             self.forward_layer_with_residual_shadow(
@@ -3647,8 +3965,8 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
                 pos_offset,
                 seq_len,
                 host_residual.as_deref_mut(),
-                device_residual_shadow.as_mut(),
-                device_branch_shadow.as_mut(),
+                device_residual_shadow.as_deref_mut(),
+                device_branch_shadow.as_deref_mut(),
             );
         }
 
@@ -3705,13 +4023,10 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
             );
         }
 
-        B::sync(&mut ctx);
-        if use_device_residual_shadow {
-            self.scratch.residual_f32_shadow = device_residual_shadow;
-            self.scratch.sandwich_branch_f32 = device_branch_shadow;
-        }
-        self.scratch.residual = Some(residual);
-        B::to_vec(&self.scratch.batch_logits, seq_len * vocab)
+        let quiescent = device_execution::checked_sync::<B>(ctx);
+        let output = B::to_vec_in_context(ctx, &self.scratch.batch_logits, seq_len * vocab);
+        frame.completed = Some(quiescent);
+        output
     }
 
     /// Prefill: process `tokens` prompt tokens in a single batch, return
@@ -3782,7 +4097,8 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         );
         let suffix_tokens = tokens;
         let seq_len = tokens.len();
-        self.ensure_scratch(seq_len);
+        self.ensure_scratch_in_context(&mut frame.context, seq_len);
+        self.prepare_lora_workspace_for_cache(&mut frame.context, cache_id, seq_len);
 
         // Starting position for this chunk — 0 for a fresh prefill, kv_len
         // for the second+ chunk of a split prefill.
@@ -3829,7 +4145,7 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         }
         let mut host_residual = if use_host_residual_shadow {
             device_execution::checked_sync::<B>(&mut ctx);
-            Some(B::to_vec(&residual, seq_len * h))
+            Some(B::to_vec_in_context(ctx, &residual, seq_len * h))
         } else {
             None
         };
@@ -3844,7 +4160,7 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         let dump = |ctx: &mut B::Context, buf: &B::Buffer, name: &str| {
             if let Some(dir) = &layer_dump {
                 B::sync(ctx);
-                let v = B::to_vec(buf, seq_len * h);
+                let v = B::to_vec_in_context(ctx, buf, seq_len * h);
                 write_f32_dump(dir, name, &v);
             }
         };
@@ -3957,11 +4273,11 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         let quiescent = device_execution::checked_sync::<B>(&mut ctx);
 
         if let Some(dir) = &layer_dump {
-            let v = B::to_vec(&self.scratch.logits, vocab);
+            let v = B::to_vec_in_context(ctx, &self.scratch.logits, vocab);
             write_f32_dump(dir, "logits", &v);
         }
 
-        let logits = B::to_vec(&self.scratch.logits, vocab);
+        let logits = B::to_vec_in_context(ctx, &self.scratch.logits, vocab);
         frame.completed = Some(quiescent);
         logits
     }
@@ -3982,7 +4298,10 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
 
     pub(crate) fn recover_host_token_scratch(&mut self) {
         assert!(B::host_execution_is_synchronous());
-        self.resize_scratch(self.scratch.max_tokens);
+        self.run_preparation_frame(|model, frame| {
+            model.resize_scratch_in_context(&mut frame.context, model.scratch.max_tokens);
+        })
+        .into_legacy_result();
     }
 
     pub(crate) fn validate_managed_token_work(
@@ -4208,14 +4527,14 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         token: u32,
         pos: u32,
     ) -> Vec<f32> {
-        self.ensure_scratch(1);
+        self.ensure_scratch_in_context(&mut frame.context, 1);
+        self.prepare_lora_workspace_for_cache(&mut frame.context, cache_id, 1);
         self.ensure_kv_in_context(&mut frame.context, cache_id, None);
 
         let h = self.cfg.hidden_size;
         let vocab = self.cfg.vocab_size;
 
-        // Context creation is cheap (CUDA reuses the process-global stream).
-        // The captured graph lives in a process-global slot, not on ctx.
+        // The frame borrows this model's original context and graph cache.
         let use_host_residual_shadow = self.use_host_residual_shadow();
         let use_device_residual_shadow = self.use_device_residual_shadow();
         frame
@@ -4247,7 +4566,7 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
             match B::replay_graph(&mut ctx, SINGLE_ITEM_GRAPH_KEY) {
                 Ok(true) => {
                     let quiescent = device_execution::checked_sync::<B>(&mut ctx);
-                    let logits = B::to_vec(&self.scratch.logits, vocab);
+                    let logits = B::to_vec_in_context(ctx, &self.scratch.logits, vocab);
                     frame.completed = Some(quiescent);
                     return logits;
                 }
@@ -4284,7 +4603,7 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         }
         let mut host_residual = if use_host_residual_shadow {
             device_execution::checked_sync::<B>(&mut ctx);
-            Some(B::to_vec(&residual, h))
+            Some(B::to_vec_in_context(ctx, &residual, h))
         } else {
             None
         };
@@ -4396,7 +4715,7 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         // the call redundant there (~50µs/step cost), but correctness on
         // Metal requires the explicit flush here.
         let quiescent = device_execution::checked_sync::<B>(&mut ctx);
-        let logits = B::to_vec(&self.scratch.logits, vocab);
+        let logits = B::to_vec_in_context(ctx, &self.scratch.logits, vocab);
         frame.completed = Some(quiescent);
         logits
     }
@@ -4407,23 +4726,49 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         tokens: &[u32],
         pos_offset: usize,
     ) -> Vec<f32> {
+        assert!(
+            !tokens.is_empty(),
+            "stage token forward called with zero length"
+        );
+        assert!(
+            self.embed.is_some(),
+            "stage token forward requires embedding"
+        );
         self.validate_prepared_legacy_write(cache_id, pos_offset, tokens.len(), Some(tokens))
             .unwrap_or_else(|error| std::panic::panic_any(error));
+        self.run_device_frame(|model, frame| {
+            model.stage_tokens_to_hidden_in_frame(frame, cache_id, tokens, pos_offset)
+        })
+        .into_legacy_result()
+    }
+
+    fn stage_tokens_to_hidden_in_frame(
+        &mut self,
+        frame: &mut LlamaExecutionFrame<B>,
+        cache_id: &str,
+        tokens: &[u32],
+        pos_offset: usize,
+    ) -> Vec<f32> {
         let seq_len = tokens.len();
         assert!(seq_len > 0, "stage token forward called with zero length");
-        self.ensure_scratch(seq_len);
-        self.ensure_kv(cache_id);
+        self.ensure_scratch_in_context(&mut frame.context, seq_len);
+        self.prepare_lora_workspace_for_cache(&mut frame.context, cache_id, seq_len);
+        self.ensure_kv_in_context(&mut frame.context, cache_id, None);
 
         let h = self.cfg.hidden_size;
-        let mut ctx = B::new_context();
+        let use_device_residual_shadow = self.use_device_residual_shadow();
+        frame
+            .take_scratch(
+                &mut self.scratch,
+                FrameLayout::Single,
+                use_device_residual_shadow,
+            )
+            .expect("take frame scratch");
+        let mut ctx = &mut frame.context;
         let target_len = self.cache_len(cache_id).saturating_add(seq_len);
         self.ensure_paged_kv_capacity_for_cache_id(&mut ctx, cache_id, target_len)
             .expect("paged KV dynamic grow");
-        let mut residual = self
-            .scratch
-            .residual
-            .take()
-            .expect("scratch residual missing (previous call didn't restore)");
+        let mut residual = frame.residual.as_mut().expect("frame residual");
         let embed = self
             .embed
             .as_ref()
@@ -4433,34 +4778,18 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
             B::scale_inplace(&mut ctx, &mut residual, scale, tokens.len() * h);
         }
         let use_host_residual_shadow = self.use_host_residual_shadow();
-        let use_device_residual_shadow = self.use_device_residual_shadow();
+
         let mut host_residual = if use_host_residual_shadow {
             B::sync(&mut ctx);
-            Some(B::to_vec(&residual, seq_len * h))
+            Some(B::to_vec_in_context(ctx, &residual, seq_len * h))
         } else {
             None
         };
-        let mut device_residual_shadow = if use_device_residual_shadow {
-            let mut shadow = self
-                .scratch
-                .residual_f32_shadow
-                .take()
-                .expect("device F32 residual shadow scratch missing");
-            B::activation_to_f32_shadow(&mut ctx, &residual, &mut shadow, seq_len * h);
-            Some(shadow)
-        } else {
-            None
-        };
-        let mut device_branch_shadow = if use_device_residual_shadow {
-            Some(
-                self.scratch
-                    .sandwich_branch_f32
-                    .take()
-                    .expect("device F32 sandwich branch scratch missing"),
-            )
-        } else {
-            None
-        };
+        let mut device_residual_shadow = frame.residual_f32.as_mut();
+        if let Some(shadow) = device_residual_shadow.as_deref_mut() {
+            B::activation_to_f32_shadow(&mut ctx, &residual, shadow, seq_len * h);
+        }
+        let mut device_branch_shadow = frame.branch_f32.as_mut();
 
         for li in self.local_layer_indices() {
             self.forward_layer_with_residual_shadow(
@@ -4471,24 +4800,20 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
                 pos_offset,
                 seq_len,
                 host_residual.as_deref_mut(),
-                device_residual_shadow.as_mut(),
-                device_branch_shadow.as_mut(),
+                device_residual_shadow.as_deref_mut(),
+                device_branch_shadow.as_deref_mut(),
             );
         }
 
-        B::sync(&mut ctx);
+        let quiescent = device_execution::checked_sync::<B>(ctx);
         let out = if let Some(host) = host_residual.as_deref() {
             host.to_vec()
         } else if let Some(device) = device_residual_shadow.as_ref() {
-            B::to_vec(device, seq_len * h)
+            B::to_vec_in_context(ctx, device, seq_len * h)
         } else {
-            B::to_vec(&residual, seq_len * h)
+            B::to_vec_in_context(ctx, &residual, seq_len * h)
         };
-        if use_device_residual_shadow {
-            self.scratch.residual_f32_shadow = device_residual_shadow;
-            self.scratch.sandwich_branch_f32 = device_branch_shadow;
-        }
-        self.scratch.residual = Some(residual);
+        frame.completed = Some(quiescent);
         out
     }
 
@@ -4532,8 +4857,30 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         seq_len: usize,
         pos_offset: usize,
     ) -> (Vec<f32>, LlamaStageHiddenBridgeTiming) {
+        assert!(seq_len > 0, "stage hidden forward called with zero length");
+        assert_eq!(
+            hidden.len(),
+            seq_len * self.cfg.hidden_size,
+            "stage hidden length"
+        );
         self.validate_prepared_legacy_write(cache_id, pos_offset, seq_len, None)
             .unwrap_or_else(|error| std::panic::panic_any(error));
+        self.run_device_frame(|model, frame| {
+            model.stage_hidden_from_host_with_timing_in_frame(
+                frame, cache_id, hidden, seq_len, pos_offset,
+            )
+        })
+        .into_legacy_result()
+    }
+
+    fn stage_hidden_from_host_with_timing_in_frame(
+        &mut self,
+        frame: &mut LlamaExecutionFrame<B>,
+        cache_id: &str,
+        hidden: &[f32],
+        seq_len: usize,
+        pos_offset: usize,
+    ) -> (Vec<f32>, LlamaStageHiddenBridgeTiming) {
         let h = self.cfg.hidden_size;
         assert_eq!(
             hidden.len(),
@@ -4544,22 +4891,23 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         );
         assert!(seq_len > 0, "stage hidden forward called with zero length");
 
-        self.ensure_scratch(seq_len);
-        self.ensure_kv(cache_id);
+        self.ensure_scratch_in_context(&mut frame.context, seq_len);
+        self.prepare_lora_workspace_for_cache(&mut frame.context, cache_id, seq_len);
+        self.ensure_kv_in_context(&mut frame.context, cache_id, None);
 
-        let mut ctx = B::new_context();
+        frame
+            .take_scratch(&mut self.scratch, FrameLayout::Single, false)
+            .expect("take frame scratch");
+        let mut ctx = &mut frame.context;
         let target_len = self.cache_len(cache_id).saturating_add(seq_len);
         self.ensure_paged_kv_capacity_for_cache_id(&mut ctx, cache_id, target_len)
             .expect("paged KV dynamic grow");
-        let mut residual = self
-            .scratch
-            .residual
-            .take()
-            .expect("scratch residual missing (previous call didn't restore)");
+        let mut residual = frame.residual.as_mut().expect("frame residual");
 
         let bridge_t0 = std::time::Instant::now();
         let host_copy_t0 = std::time::Instant::now();
-        let hidden_buf = B::from_slice(hidden);
+        frame.input = Some(B::from_slice_in_context(ctx, hidden));
+        let hidden_buf = frame.input.as_ref().expect("frame input");
         let host_copy_us = elapsed_micros_u64_floor1(host_copy_t0);
         let device_copy_t0 = std::time::Instant::now();
         B::copy_slice(&mut ctx, &hidden_buf, 0, &mut residual, 0, seq_len * h);
@@ -4574,9 +4922,9 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
             self.forward_layer(&mut ctx, li, cache_id, &mut residual, pos_offset, seq_len);
         }
 
-        B::sync(&mut ctx);
-        let out = B::to_vec(&residual, seq_len * h);
-        self.scratch.residual = Some(residual);
+        let quiescent = device_execution::checked_sync::<B>(ctx);
+        let out = B::to_vec_in_context(ctx, &residual, seq_len * h);
+        frame.completed = Some(quiescent);
         (out, bridge_timing)
     }
 
@@ -4617,6 +4965,16 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
     /// stage after local transformer layers have produced the final hidden
     /// state for sampling.
     pub fn logits_from_hidden(&mut self, hidden: &[f32]) -> Vec<f32> {
+        assert_eq!(hidden.len(), self.cfg.hidden_size, "hidden length");
+        self.run_device_frame(|model, frame| model.logits_from_hidden_in_frame(frame, hidden))
+            .into_legacy_result()
+    }
+
+    fn logits_from_hidden_in_frame(
+        &mut self,
+        frame: &mut LlamaExecutionFrame<B>,
+        hidden: &[f32],
+    ) -> Vec<f32> {
         let h = self.cfg.hidden_size;
         let vocab = self.cfg.vocab_size;
         assert_eq!(
@@ -4626,10 +4984,11 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
             hidden.len(),
             h
         );
-        self.ensure_scratch(1);
+        self.ensure_scratch_in_context(&mut frame.context, 1);
 
-        let mut ctx = B::new_context();
-        let hidden_buf = B::from_slice(hidden);
+        let mut ctx = &mut frame.context;
+        frame.input = Some(B::from_slice_in_context(ctx, hidden));
+        let hidden_buf = frame.input.as_ref().expect("frame input");
         B::rms_norm(
             &mut ctx,
             &hidden_buf,
@@ -4654,8 +5013,10 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
                 1,
             );
         }
-        B::sync(&mut ctx);
-        B::to_vec(&self.scratch.logits, vocab)
+        let quiescent = device_execution::checked_sync::<B>(ctx);
+        let output = B::to_vec_in_context(ctx, &self.scratch.logits, vocab);
+        frame.completed = Some(quiescent);
+        output
     }
 
     /// Prefill with pre-computed embeddings instead of token IDs.
@@ -4672,8 +5033,27 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         embeds: &[f32],
         seq_len: usize,
     ) -> Vec<f32> {
+        assert!(seq_len > 0, "prefill_from_embeds called with zero length");
+        assert_eq!(
+            embeds.len(),
+            seq_len * self.cfg.hidden_size,
+            "embedding length"
+        );
         self.validate_prepared_legacy_write(cache_id, 0, seq_len, None)
             .unwrap_or_else(|error| std::panic::panic_any(error));
+        self.run_device_frame(|model, frame| {
+            model.prefill_from_embeds_in_frame(frame, cache_id, embeds, seq_len)
+        })
+        .into_legacy_result()
+    }
+
+    fn prefill_from_embeds_in_frame(
+        &mut self,
+        frame: &mut LlamaExecutionFrame<B>,
+        cache_id: &str,
+        embeds: &[f32],
+        seq_len: usize,
+    ) -> Vec<f32> {
         let h = self.cfg.hidden_size;
         assert_eq!(
             embeds.len(),
@@ -4684,19 +5064,20 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         );
         assert!(seq_len > 0, "prefill_from_embeds called with zero length");
 
-        self.ensure_scratch(seq_len);
-        self.ensure_kv(cache_id);
+        self.ensure_scratch_in_context(&mut frame.context, seq_len);
+        self.prepare_lora_workspace_for_cache(&mut frame.context, cache_id, seq_len);
+        self.ensure_kv_in_context(&mut frame.context, cache_id, None);
+        self.ensure_paged_kv_capacity_for_cache_id(&mut frame.context, cache_id, seq_len)
+            .expect("KV preparation");
 
-        let mut ctx = B::new_context();
-        let mut residual = self
-            .scratch
-            .residual
-            .take()
-            .expect("scratch residual missing (previous call didn't restore)");
+        frame
+            .take_scratch(&mut self.scratch, FrameLayout::Single, false)
+            .expect("take frame scratch");
+        let mut ctx = &mut frame.context;
+        let mut residual = frame.residual.as_mut().expect("frame residual");
 
         // Upload embeds → residual[0 .. seq_len*h].
-        let embed_buf = B::from_slice(embeds);
-        B::copy_slice(&mut ctx, &embed_buf, 0, &mut residual, 0, seq_len * h);
+        B::write_f32_to_activation(ctx, &mut residual, embeds);
 
         for li in self.local_layer_indices() {
             self.forward_layer(&mut ctx, li, cache_id, &mut residual, 0, seq_len);
@@ -4710,17 +5091,32 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
             0,
             h,
         );
-        B::sync(&mut ctx);
-        self.scratch.residual = Some(residual);
-        B::to_vec(&self.scratch.last_hidden, h)
+        let quiescent = device_execution::checked_sync::<B>(ctx);
+        let output = B::to_vec_in_context(ctx, &self.scratch.last_hidden, h);
+        frame.completed = Some(quiescent);
+        output
     }
 
     /// Decode with a single pre-computed embedding (shape `[hidden]`).
     /// Returns the pre-norm hidden state for the position `pos`. Caller
     /// applies final norm + its own output head.
     pub fn decode_from_embed(&mut self, cache_id: &str, embed: &[f32], pos: u32) -> Vec<f32> {
+        assert_eq!(embed.len(), self.cfg.hidden_size, "embedding length");
         self.validate_prepared_legacy_write(cache_id, pos as usize, 1, None)
             .unwrap_or_else(|error| std::panic::panic_any(error));
+        self.run_device_frame(|model, frame| {
+            model.decode_from_embed_in_frame(frame, cache_id, embed, pos)
+        })
+        .into_legacy_result()
+    }
+
+    fn decode_from_embed_in_frame(
+        &mut self,
+        frame: &mut LlamaExecutionFrame<B>,
+        cache_id: &str,
+        embed: &[f32],
+        pos: u32,
+    ) -> Vec<f32> {
         let h = self.cfg.hidden_size;
         assert_eq!(
             embed.len(),
@@ -4730,27 +5126,29 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
             h
         );
 
-        self.ensure_scratch(1);
-        self.ensure_kv(cache_id);
+        self.ensure_scratch_in_context(&mut frame.context, 1);
+        self.prepare_lora_workspace_for_cache(&mut frame.context, cache_id, 1);
+        self.ensure_kv_in_context(&mut frame.context, cache_id, None);
+        self.ensure_paged_kv_capacity_for_cache_id(&mut frame.context, cache_id, pos as usize + 1)
+            .expect("KV preparation");
 
-        let mut ctx = B::new_context();
-        let mut residual = self
-            .scratch
-            .residual
-            .take()
-            .expect("scratch residual missing (previous call didn't restore)");
+        frame
+            .take_scratch(&mut self.scratch, FrameLayout::Single, false)
+            .expect("take frame scratch");
+        let mut ctx = &mut frame.context;
+        let mut residual = frame.residual.as_mut().expect("frame residual");
 
-        let embed_buf = B::from_slice(embed);
-        B::copy_slice(&mut ctx, &embed_buf, 0, &mut residual, 0, h);
+        B::write_f32_to_activation(ctx, &mut residual, embed);
 
         for li in self.local_layer_indices() {
             self.forward_layer(&mut ctx, li, cache_id, &mut residual, pos as usize, 1);
         }
 
         B::copy_slice(&mut ctx, &residual, 0, &mut self.scratch.last_hidden, 0, h);
-        B::sync(&mut ctx);
-        self.scratch.residual = Some(residual);
-        B::to_vec(&self.scratch.last_hidden, h)
+        let quiescent = device_execution::checked_sync::<B>(ctx);
+        let output = B::to_vec_in_context(ctx, &self.scratch.last_hidden, h);
+        frame.completed = Some(quiescent);
+        output
     }
 
     /// Variant of `prefill_from_embeds` that applies `final_norm` to every
@@ -4770,8 +5168,28 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         seq_len: usize,
         pos_offset: usize,
     ) -> Vec<f32> {
+        assert!(seq_len > 0, "prefill_all_post_norm called with zero length");
+        assert_eq!(
+            embeds.len(),
+            seq_len * self.cfg.hidden_size,
+            "embedding length"
+        );
         self.validate_prepared_legacy_write(cache_id, pos_offset, seq_len, None)
             .unwrap_or_else(|error| std::panic::panic_any(error));
+        self.run_device_frame(|model, frame| {
+            model.prefill_all_post_norm_in_frame(frame, cache_id, embeds, seq_len, pos_offset)
+        })
+        .into_legacy_result()
+    }
+
+    fn prefill_all_post_norm_in_frame(
+        &mut self,
+        frame: &mut LlamaExecutionFrame<B>,
+        cache_id: &str,
+        embeds: &[f32],
+        seq_len: usize,
+        pos_offset: usize,
+    ) -> Vec<f32> {
         let h = self.cfg.hidden_size;
         assert_eq!(
             embeds.len(),
@@ -4782,18 +5200,23 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         );
         assert!(seq_len > 0);
 
-        self.ensure_scratch(seq_len);
-        self.ensure_kv(cache_id);
+        self.ensure_scratch_in_context(&mut frame.context, seq_len);
+        self.prepare_lora_workspace_for_cache(&mut frame.context, cache_id, seq_len);
+        self.ensure_kv_in_context(&mut frame.context, cache_id, None);
+        self.ensure_paged_kv_capacity_for_cache_id(
+            &mut frame.context,
+            cache_id,
+            pos_offset + seq_len,
+        )
+        .expect("KV preparation");
 
-        let mut ctx = B::new_context();
-        let mut residual = self
-            .scratch
-            .residual
-            .take()
-            .expect("scratch residual missing (previous call didn't restore)");
+        frame
+            .take_scratch(&mut self.scratch, FrameLayout::Single, false)
+            .expect("take frame scratch");
+        let mut ctx = &mut frame.context;
+        let mut residual = frame.residual.as_mut().expect("frame residual");
 
-        let embed_buf = B::from_slice(embeds);
-        B::copy_slice(&mut ctx, &embed_buf, 0, &mut residual, 0, seq_len * h);
+        B::write_f32_to_activation(ctx, &mut residual, embeds);
 
         for li in self.local_layer_indices() {
             self.forward_layer(&mut ctx, li, cache_id, &mut residual, pos_offset, seq_len);
@@ -4809,9 +5232,10 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
             seq_len,
             h,
         );
-        B::sync(&mut ctx);
-        self.scratch.residual = Some(residual);
-        B::to_vec(&self.scratch.norm_out, seq_len * h)
+        let quiescent = device_execution::checked_sync::<B>(ctx);
+        let output = B::to_vec_in_context(ctx, &self.scratch.norm_out, seq_len * h);
+        frame.completed = Some(quiescent);
+        output
     }
 
     /// Decode-side companion to `prefill_all_post_norm`. Runs a single-token
@@ -4823,23 +5247,38 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         embed: &[f32],
         pos: u32,
     ) -> Vec<f32> {
+        assert_eq!(embed.len(), self.cfg.hidden_size, "embedding length");
         self.validate_prepared_legacy_write(cache_id, pos as usize, 1, None)
             .unwrap_or_else(|error| std::panic::panic_any(error));
+        self.run_device_frame(|model, frame| {
+            model.decode_post_norm_from_embed_in_frame(frame, cache_id, embed, pos)
+        })
+        .into_legacy_result()
+    }
+
+    fn decode_post_norm_from_embed_in_frame(
+        &mut self,
+        frame: &mut LlamaExecutionFrame<B>,
+        cache_id: &str,
+        embed: &[f32],
+        pos: u32,
+    ) -> Vec<f32> {
         let h = self.cfg.hidden_size;
         assert_eq!(embed.len(), h);
 
-        self.ensure_scratch(1);
-        self.ensure_kv(cache_id);
+        self.ensure_scratch_in_context(&mut frame.context, 1);
+        self.prepare_lora_workspace_for_cache(&mut frame.context, cache_id, 1);
+        self.ensure_kv_in_context(&mut frame.context, cache_id, None);
+        self.ensure_paged_kv_capacity_for_cache_id(&mut frame.context, cache_id, pos as usize + 1)
+            .expect("KV preparation");
 
-        let mut ctx = B::new_context();
-        let mut residual = self
-            .scratch
-            .residual
-            .take()
-            .expect("scratch residual missing (previous call didn't restore)");
+        frame
+            .take_scratch(&mut self.scratch, FrameLayout::Single, false)
+            .expect("take frame scratch");
+        let mut ctx = &mut frame.context;
+        let mut residual = frame.residual.as_mut().expect("frame residual");
 
-        let embed_buf = B::from_slice(embed);
-        B::copy_slice(&mut ctx, &embed_buf, 0, &mut residual, 0, h);
+        B::write_f32_to_activation(ctx, &mut residual, embed);
 
         for li in self.local_layer_indices() {
             self.forward_layer(&mut ctx, li, cache_id, &mut residual, pos as usize, 1);
@@ -4854,9 +5293,10 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
             1,
             h,
         );
-        B::sync(&mut ctx);
-        self.scratch.residual = Some(residual);
-        B::to_vec(&self.scratch.last_normed, h)
+        let quiescent = device_execution::checked_sync::<B>(ctx);
+        let output = B::to_vec_in_context(ctx, &self.scratch.last_normed, h);
+        frame.completed = Some(quiescent);
+        output
     }
 }
 
@@ -5107,61 +5547,15 @@ impl<B: MoeLlmBackend> DecoderOnlyLLM for LlamaFamilyModel<B, KvFp16> {
     }
 
     fn truncate_kv(&mut self, cache_id: &str, new_len: usize) {
-        self.validate_prepared_truncate(cache_id, new_len)
-            .unwrap_or_else(|error| std::panic::panic_any(error));
-        if let Some(caches) = self.kv_caches.get_mut(cache_id) {
-            for c in caches.iter_mut() {
-                if new_len < c.len {
-                    c.len = new_len;
-                }
-            }
-        }
-        let mut ctx = B::new_context();
-        B::reset_graph(&mut ctx, SINGLE_ITEM_GRAPH_KEY);
-        self.graph_warmup = 0;
-        self.graph_capture_failed = false;
+        self.truncate_token_cache(cache_id, new_len);
     }
 
     fn release(&mut self, cache_id: &str) {
-        let mut ctx = B::new_context();
-        B::sync(&mut ctx);
-        self.graph_warmup = 0;
-        self.graph_capture_failed = false;
-        self.lora_cache_adapters.remove(cache_id);
-        self.prepared_prefixes.remove(cache_id);
-        if let Some(mut caches) = self.kv_caches.remove(cache_id) {
-            if let Some(alloc_arc) = self.paged_block_alloc.as_ref() {
-                let mut alloc = alloc_arc.lock().unwrap_or_else(|p| p.into_inner());
-                if let Some(c0) = caches.first() {
-                    if !c0.paged_block_indices.is_empty() {
-                        alloc.free(&c0.paged_block_indices);
-                    }
-                }
-                for c in caches.iter_mut() {
-                    c.paged_block_indices.clear();
-                }
-            }
-            self.kv_free_pool.push(caches);
-        }
+        self.release_token_cache(cache_id);
     }
 
     fn reset(&mut self) {
-        let mut ctx = B::new_context();
-        B::sync(&mut ctx);
-        B::reset_all_graphs(&mut ctx);
-        B::sync(&mut ctx);
-        self.graph_warmup = 0;
-        self.graph_capture_failed = false;
-        self.batched_graph_keys_seen.clear();
-        self.batched_graph_warmup = 0;
-        self.batched_graph_failed = false;
-        self.prepared_prefixes.clear();
-        self.kv_caches.clear();
-        self.kv_free_pool.clear();
-        self.paged_pools = None;
-        self.paged_block_alloc = None;
-        self.paged_dims = None;
-        self.lora_cache_adapters.clear();
+        self.reset_token_caches();
     }
 }
 
@@ -5337,62 +5731,22 @@ impl<B: MoeLlmBackend + BackendInt8KvOps> DecoderOnlyLLM for LlamaFamilyModel<B,
     }
 
     fn truncate_kv(&mut self, cache_id: &str, new_len: usize) {
-        self.validate_prepared_truncate(cache_id, new_len)
-            .unwrap_or_else(|error| std::panic::panic_any(error));
-        if let Some(caches) = self.kv_caches.get_mut(cache_id) {
-            for c in caches.iter_mut() {
-                if new_len < c.len {
-                    c.len = new_len;
-                }
-            }
-        }
-        let mut ctx = B::new_context();
-        B::reset_graph(&mut ctx, SINGLE_ITEM_GRAPH_KEY);
-        self.graph_warmup = 0;
-        self.graph_capture_failed = false;
+        self.truncate_token_cache(cache_id, new_len);
     }
 
     fn release(&mut self, cache_id: &str) {
-        let mut ctx = B::new_context();
-        B::sync(&mut ctx);
-        self.graph_warmup = 0;
-        self.graph_capture_failed = false;
-        self.lora_cache_adapters.remove(cache_id);
-        self.prepared_prefixes.remove(cache_id);
-        if let Some(mut caches) = self.kv_caches.remove(cache_id) {
-            if let Some(alloc_arc) = self.paged_block_alloc.as_ref() {
-                let mut alloc = alloc_arc.lock().unwrap_or_else(|p| p.into_inner());
-                if let Some(c0) = caches.first() {
-                    if !c0.paged_block_indices.is_empty() {
-                        alloc.free(&c0.paged_block_indices);
-                    }
-                }
-                for c in caches.iter_mut() {
-                    c.paged_block_indices.clear();
-                }
-            }
-            self.kv_free_pool.push(caches);
-        }
+        self.release_token_cache(cache_id);
     }
 
     fn reset(&mut self) {
-        let mut ctx = B::new_context();
-        B::sync(&mut ctx);
-        B::reset_all_graphs(&mut ctx);
-        B::sync(&mut ctx);
-        self.graph_warmup = 0;
-        self.graph_capture_failed = false;
-        self.prepared_prefixes.clear();
-        self.kv_caches.clear();
-        self.kv_free_pool.clear();
-        self.paged_pools = None;
-        self.paged_block_alloc = None;
-        self.paged_dims = None;
-        self.lora_cache_adapters.clear();
+        self.reset_token_caches();
     }
 }
 
-fn build_rope_cache<B: QuantLlmBackend + BackendMoeFused>(cfg: &LlamaFamilyConfig) -> RopeCache<B> {
+fn build_rope_cache<B: QuantLlmBackend + BackendMoeFused>(
+    ctx: &mut B::Context,
+    cfg: &LlamaFamilyConfig,
+) -> RopeCache<B> {
     let hd = cfg.head_dim;
     let half = hd / 2;
     let max = cfg.max_seq_len;
@@ -5406,9 +5760,15 @@ fn build_rope_cache<B: QuantLlmBackend + BackendMoeFused>(cfg: &LlamaFamilyConfi
             sin[pos * half + i] = angle.sin() as f32;
         }
     }
+    let mut partial = (None, None);
+    let mut construction = device_execution::ConstructionContext::<B>::new(ctx);
+    partial.0 = Some(B::from_slice_in_context(construction.context, &cos));
+    partial.1 = Some(B::from_slice_in_context(construction.context, &sin));
+    construction.transfer();
+    drop(construction);
     RopeCache {
-        cos: B::from_slice(&cos),
-        sin: B::from_slice(&sin),
+        cos: partial.0.expect("rope cos"),
+        sin: partial.1.expect("rope sin"),
     }
 }
 
@@ -5564,17 +5924,27 @@ mod tests {
     }
 
     impl WeightLoader<CpuBackend> for RecordingLoader {
-        fn load_tensor(&self, name: &str) -> Result<Vec<f32>> {
+        fn load_tensor(
+            &self,
+            _ctx: &mut <CpuBackend as ferrum_kernels::backend::Backend>::Context,
+            name: &str,
+        ) -> Result<Vec<f32>> {
             self.tensors.lock().unwrap().push(name.to_string());
             Ok(vec![1.0])
         }
 
         fn load_linear(
             &self,
+            ctx: &mut <CpuBackend as ferrum_kernels::backend::Backend>::Context,
             name: &str,
         ) -> Result<Box<dyn ferrum_quantization::Linear<CpuBackend>>> {
             self.linears.lock().unwrap().push(name.to_string());
-            Ok(Box::new(DenseLinear::<CpuBackend>::from_rows(&[1.0], 1, 1)))
+            Ok(Box::new(DenseLinear::<CpuBackend>::from_rows_in_context(
+                ctx,
+                &[1.0],
+                1,
+                1,
+            )))
         }
 
         fn has_tensor(&self, _name: &str) -> bool {
@@ -5918,7 +6288,8 @@ mod tests {
         let cfg = test_llama_config(5, true);
         let loader = RecordingLoader::default();
 
-        let layers = load_llama_family_layers(&cfg, &loader, 2..4).unwrap();
+        let layers =
+            load_llama_family_layers(&mut CpuBackend::new_context(), &cfg, &loader, 2..4).unwrap();
 
         assert_eq!(layers.len(), 2);
         assert!(layers.iter().all(|layer| layer.q_norm_w.is_some()));
@@ -5956,10 +6327,11 @@ mod tests {
         let cfg = test_llama_config(2, false);
         let loader = RecordingLoader::default();
 
-        let err = match load_llama_family_layers(&cfg, &loader, 1..3) {
-            Ok(_) => panic!("expected out-of-bounds layer range to fail"),
-            Err(err) => err,
-        };
+        let err =
+            match load_llama_family_layers(&mut CpuBackend::new_context(), &cfg, &loader, 1..3) {
+                Ok(_) => panic!("expected out-of-bounds layer range to fail"),
+                Err(err) => err,
+            };
 
         assert!(
             err.to_string().contains("outside model layer count"),
@@ -6170,13 +6542,14 @@ mod tests {
     #[test]
     fn prefill_scratch_keeps_batch_logits_lazy() {
         let cfg = test_llama_config(1, false);
-        let mut scratch = LlamaFamilyScratch::<CpuBackend>::alloc(&cfg, 128);
+        let mut scratch =
+            LlamaFamilyScratch::<CpuBackend>::alloc(&mut CpuBackend::new_context(), &cfg, 128);
 
         assert_eq!(scratch.max_tokens, 128);
         assert_eq!(scratch.batch_logits_capacity, 1);
         assert_eq!(scratch.batch_logits.len(), cfg.vocab_size);
 
-        scratch.ensure_batch_logits(&cfg, 128);
+        scratch.ensure_batch_logits(&mut CpuBackend::new_context(), &cfg, 128);
         assert_eq!(scratch.batch_logits_capacity, 128);
         assert_eq!(scratch.batch_logits.len(), 128 * cfg.vocab_size);
     }

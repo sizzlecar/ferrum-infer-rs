@@ -70,6 +70,32 @@ pub trait Backend: Send + Sync + Sized + 'static {
     /// Create a new execution context (begin accumulating work).
     fn new_context() -> Self::Context;
 
+    /// Begin a new invocation on the same instance owner. Implementations must
+    /// reject an unresolved previous invocation; persistent resources survive.
+    fn begin_execution(_ctx: &mut Self::Context) -> Result<()> {
+        Ok(())
+    }
+
+    /// Retire an instance only after observing its actual execution terminal.
+    /// Backends with captured programs destroy them before captured storage.
+    /// Ok certifies safe retirement, not successful device execution. Callers
+    /// retain any terminal failure from their original completion observation.
+    fn retire_context(ctx: &mut Self::Context) -> Result<()> {
+        match Self::observe_completion(ctx) {
+            super::BackendCompletion::Succeeded | super::BackendCompletion::Failed(_) => Ok(()),
+            super::BackendCompletion::Unresolved(error) => Err(error),
+        }
+    }
+
+    /// Keep a replaced buffer alive until the original context observes its
+    /// submitted work as terminal. Synchronous backends may drop it directly;
+    /// command-buffer backends may rely on retained native resource references.
+    /// Backends whose buffer Drop does not prove completion must transfer it
+    /// into the original context's existing execution custody.
+    fn retain_buffer_until_completion(_ctx: &mut Self::Context, buffer: Self::Buffer) {
+        drop(buffer);
+    }
+
     /// Run `body` while binding context-free backend operations to an
     /// explicit device ordinal when the backend supports multi-device scopes.
     ///
@@ -203,11 +229,26 @@ pub trait Backend: Send + Sync + Sized + 'static {
     /// accessors get the correct byte count automatically.
     fn alloc_typed(dtype: super::Dtype, n: usize) -> Self::Buffer;
 
+    fn alloc_typed_in_context(
+        _ctx: &mut Self::Context,
+        dtype: super::Dtype,
+        n: usize,
+    ) -> Self::Buffer {
+        Self::alloc_typed(dtype, n)
+    }
+
     /// Upload typed host data — replaces `from_slice_i32` /
     /// `from_slice_u32` etc. The host element type `T` carries its
     /// `Dtype` via the `HostDtype` marker so dispatch in the impl
     /// is a one-line `match T::DTYPE`.
     fn from_slice_typed<T: super::HostDtype>(data: &[T]) -> Self::Buffer;
+
+    fn from_slice_typed_in_context<T: super::HostDtype>(
+        _ctx: &mut Self::Context,
+        data: &[T],
+    ) -> Self::Buffer {
+        Self::from_slice_typed(data)
+    }
 
     /// In-place typed write — replaces `write_u32` / `write_i32_into`
     /// / `write_f32_into`. The buffer must already be dtype-tagged
@@ -1423,6 +1464,18 @@ pub trait Backend: Send + Sync + Sized + 'static {
     fn to_vec(buf: &Self::Buffer, len: usize) -> Vec<f32>;
     fn from_slice(data: &[f32]) -> Self::Buffer;
 
+    fn alloc_in_context(_ctx: &mut Self::Context, len: usize) -> Self::Buffer {
+        Self::alloc(len)
+    }
+
+    fn to_vec_in_context(_ctx: &mut Self::Context, buf: &Self::Buffer, len: usize) -> Vec<f32> {
+        Self::to_vec(buf, len)
+    }
+
+    fn from_slice_in_context(_ctx: &mut Self::Context, data: &[f32]) -> Self::Buffer {
+        Self::from_slice(data)
+    }
+
     fn write_f32_to_activation(ctx: &mut Self::Context, dst: &mut Self::Buffer, data: &[f32]) {
         if data.is_empty() {
             return;
@@ -1640,6 +1693,14 @@ pub trait Backend: Send + Sync + Sized + 'static {
     fn from_weight_bytes(raw: &[u8], src_dtype: SrcDtype) -> Self::Buffer {
         let data = src_dtype.to_f32_vec(raw);
         Self::from_slice(&data)
+    }
+
+    fn from_weight_bytes_in_context(
+        _ctx: &mut Self::Context,
+        raw: &[u8],
+        src_dtype: SrcDtype,
+    ) -> Self::Buffer {
+        Self::from_weight_bytes(raw, src_dtype)
     }
 
     // (The Phase A3 unified `gemm_quant(QuantWeights, QuantKind)` stub
@@ -2309,6 +2370,7 @@ pub trait BackendInt8KvOps: Backend + BackendKvDtype<KvInt8> {
     /// Allocate the model layer's physical INT8 storage once, using the same
     /// total block capacity as its allocator. Sequence tables reference it.
     fn alloc_paged_int8_pool(
+        _ctx: &mut Self::Context,
         _num_blocks: usize,
         _block_size: usize,
         _num_kv_heads: usize,
@@ -2321,6 +2383,7 @@ pub trait BackendInt8KvOps: Backend + BackendKvDtype<KvInt8> {
     /// Default panics — backends without INT8 support never reach this
     /// path (factory rejects (Cpu/Metal, Int8) before ensure_kv runs).
     fn alloc_paged_int8_layer(
+        _ctx: &mut Self::Context,
         _max_blocks_per_seq: usize,
         _block_size: usize,
         _num_kv_heads: usize,

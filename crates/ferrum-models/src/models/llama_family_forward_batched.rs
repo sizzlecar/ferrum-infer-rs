@@ -51,7 +51,7 @@ fn read_full_logits_after_selection<B: MoeLlmBackend>(
     if quiescent.is_none() {
         *quiescent = Some(device_execution::checked_sync::<B>(context));
     }
-    B::to_vec(logits, count)
+    B::to_vec_in_context(context, logits, count)
 }
 
 /// A missing graph is an eager opportunity only before capture. After a
@@ -414,10 +414,13 @@ mod tests {
     >() {
         let mut context = B::new_context();
         // Use the backend's activation dtype, including CUDA's F16 scale kernel.
-        let mut logits = B::from_slice(&[1.0f32, 2.0, 3.0, 4.0]);
+        let mut logits = B::from_slice_in_context(&mut context, &[1.0f32, 2.0, 3.0, 4.0]);
         B::scale_inplace(&mut context, &mut logits, 1.0, 4);
         let mut quiescent = Some(super::device_execution::checked_sync::<B>(&mut context));
-        assert_eq!(B::to_vec(&logits, 4), [1.0, 2.0, 3.0, 4.0]);
+        assert_eq!(
+            B::to_vec_in_context(&mut context, &logits, 4),
+            [1.0, 2.0, 3.0, 4.0]
+        );
 
         // Inject selection failure after real preparation work has been
         // encoded, but before its readback/synchronization. On Metal this
@@ -637,27 +640,26 @@ mod tests {
 impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
     fn prepare_batched_decode_stage(
         &mut self,
+        ctx: &mut B::Context,
         batch: &[(String, u32, u32)],
-    ) -> (usize, usize, B::Context) {
+    ) -> (usize, usize) {
         let m = batch.len();
         debug_assert!(m > 0);
         for (cid, _, _) in batch {
-            self.ensure_kv(cid);
+            self.ensure_kv_in_context(ctx, cid, None);
         }
-        self.ensure_scratch(m);
-
-        let mut ctx = B::new_context();
+        self.ensure_scratch_in_context(ctx, m);
         let positions: Vec<u32> = batch.iter().map(|(_, _, p)| *p).collect();
         let kv_pre: Vec<u32> = batch
             .iter()
             .map(|(cid, _, _)| self.kv_caches.get(cid).expect("kv_caches missing")[0].len as u32)
             .collect();
         let kv_post: Vec<u32> = kv_pre.iter().map(|&x| x + 1).collect();
-        B::write_typed::<u32>(&mut ctx, &mut self.scratch.batch_positions, &positions);
-        B::write_typed::<u32>(&mut ctx, &mut self.scratch.batch_kv_lens_pre, &kv_pre);
-        B::write_typed::<u32>(&mut ctx, &mut self.scratch.batch_kv_lens_post, &kv_post);
+        B::write_typed::<u32>(ctx, &mut self.scratch.batch_positions, &positions);
+        B::write_typed::<u32>(ctx, &mut self.scratch.batch_kv_lens_pre, &kv_pre);
+        B::write_typed::<u32>(ctx, &mut self.scratch.batch_kv_lens_post, &kv_post);
 
-        (m, self.cfg.hidden_size, ctx)
+        (m, self.cfg.hidden_size)
     }
 
     fn bump_local_batched_decode_kv_lengths(&mut self, batch: &[(String, u32, u32)]) {
@@ -1538,23 +1540,15 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
         // already snapshotted above into h/nh/etc — cfg is just for the
         // shape constants ensure_unified_scratch needs).
         let cfg_for_alloc = self.cfg.clone();
-        let prev_unified_capacity = self.scratch.unified_capacity;
         let unified_scratch_rebuilt = self.scratch.ensure_unified_scratch(
+            &mut frame.context,
             &cfg_for_alloc,
             m_total,
             max_seqs,
             max_blocks_per_seq,
         );
-        if unified_scratch_rebuilt && prev_unified_capacity > 0 {
-            let old_graph_keys: Vec<u64> = self.unified_graph_keys_seen.drain().collect();
-            if !old_graph_keys.is_empty() {
-                let mut graph_ctx = B::new_context();
-                for key in old_graph_keys {
-                    B::reset_graph(&mut graph_ctx, key);
-                }
-            }
-            self.unified_graph_warmup = 0;
-            self.unified_graph_failed = false;
+        if unified_scratch_rebuilt {
+            self.clear_graph_bookkeeping();
         }
 
         let use_device_residual_shadow =
@@ -2011,7 +2005,7 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
                         repetition_penalties,
                     } => {
                         self.scratch
-                            .ensure_unified_argmax_logits(&self.cfg, num_sampled);
+                            .ensure_unified_argmax_logits(&mut ctx, &self.cfg, num_sampled);
                         if let Some(mask) = token_mask {
                             self.scratch.ensure_argmax_token_mask(&mut ctx, mask);
                         }
@@ -2787,8 +2781,12 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
         for (cid, _, _) in batch {
             self.ensure_kv_in_context(&mut frame.context, cid, None);
         }
-        self.ensure_scratch(m);
-        self.scratch.ensure_batch_logits(&self.cfg, m);
+        self.ensure_scratch_in_context(&mut frame.context, m);
+        if m > self.scratch.batch_logits_capacity {
+            self.clear_graph_bookkeeping();
+        }
+        self.scratch
+            .ensure_batch_logits(&mut frame.context, &self.cfg, m);
         // Phase 4b: when paged mode is on, ensure_kv has already
         // populated the batched scratch buffers (paged_batch_q etc.).
         // The forward path branches on `paged_pools.is_some()` inside
@@ -2856,7 +2854,7 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
         }
         let mut host_residual = if use_host_residual_shadow {
             device_execution::checked_sync::<B>(&mut ctx);
-            Some(B::to_vec(&residual, m * h))
+            Some(B::to_vec_in_context(ctx, &residual, m * h))
         } else {
             None
         };
@@ -3058,7 +3056,7 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
         }
 
         let quiescent = device_execution::checked_sync::<B>(&mut ctx);
-        let all = B::to_vec(&self.scratch.batch_logits, m * vocab);
+        let all = B::to_vec_in_context(ctx, &self.scratch.batch_logits, m * vocab);
         let output = (0..m)
             .map(|i| ExecutorSamplingOutput::FullLogits(all[i * vocab..(i + 1) * vocab].to_vec()))
             .collect();
@@ -3089,37 +3087,10 @@ impl<B: MoeLlmBackend> LlamaPipelineStageBatchOps<B> for LlamaFamilyModel<B, KvF
             return PipelineHidden::host(hidden, batch.len(), h);
         }
 
-        let (m, h, mut ctx) = self.prepare_batched_decode_stage(batch);
-        let tokens: Vec<u32> = batch.iter().map(|(_, token, _)| *token).collect();
-        let mut residual = self
-            .scratch
-            .residual
-            .take()
-            .expect("scratch residual missing (previous call didn't restore)");
-        let embed = self
-            .embed
-            .as_ref()
-            .expect("decode_stage_tokens_to_hidden_batch called on stage without embedding");
-        B::embedding_lookup(&mut ctx, embed, &tokens, &mut residual, h);
-
-        for li in 0..self.local_layer_count() {
-            self.forward_layer_batched_decode(
-                &mut ctx,
-                li,
-                batch,
-                &mut residual,
-                m,
-                None,
-                None,
-                None,
-            );
-        }
-        self.bump_local_batched_decode_kv_lengths(batch);
-
-        B::sync(&mut ctx);
-        let out = B::to_vec(&residual, m * h);
-        self.scratch.residual = Some(residual);
-        PipelineHidden::host(out, m, h)
+        self.run_device_frame(|model, frame| {
+            model.decode_stage_tokens_to_hidden_batch_in_frame(frame, batch)
+        })
+        .into_legacy_result()
     }
 
     fn decode_stage_hidden_from_host_batch(
@@ -3162,12 +3133,98 @@ impl<B: MoeLlmBackend> LlamaPipelineStageBatchOps<B> for LlamaFamilyModel<B, KvF
             return (PipelineHidden::host(out, batch.len(), h), bridge_timing);
         }
 
-        let (m, h, mut ctx) = self.prepare_batched_decode_stage(batch);
-        let mut residual = self
-            .scratch
-            .residual
-            .take()
-            .expect("scratch residual missing (previous call didn't restore)");
+        self.run_device_frame(|model, frame| {
+            model.decode_stage_hidden_from_host_batch_in_frame(frame, batch, hidden)
+        })
+        .into_legacy_result()
+    }
+
+    fn logits_from_hidden_batch(
+        &mut self,
+        hidden: &PipelineHidden<B>,
+        force_full_logits: bool,
+    ) -> Vec<Vec<f32>> {
+        let row_count = hidden.row_count();
+        if row_count == 0 {
+            return Vec::new();
+        }
+        let h = self.cfg.hidden_size;
+        let hidden_slice = hidden.host_slice();
+        assert_eq!(
+            hidden_slice.len(),
+            row_count * h,
+            "hidden length {} != row_count * hidden_size {}",
+            hidden_slice.len(),
+            row_count * h
+        );
+        if row_count == 1 || !self.supports_batched_decode || self.cfg.sandwich_norms {
+            return (0..row_count)
+                .map(|row| {
+                    let start = row * h;
+                    self.logits_from_hidden(&hidden_slice[start..start + h])
+                })
+                .collect();
+        }
+
+        self.run_device_frame(|model, frame| {
+            model.logits_from_hidden_batch_in_frame(frame, hidden, force_full_logits)
+        })
+        .into_legacy_result()
+    }
+}
+
+impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
+    fn decode_stage_tokens_to_hidden_batch_in_frame(
+        &mut self,
+        frame: &mut LlamaExecutionFrame<B>,
+        batch: &[(String, u32, u32)],
+    ) -> PipelineHidden<B> {
+        let (m, h) = self.prepare_batched_decode_stage(&mut frame.context, batch);
+        frame
+            .take_scratch(&mut self.scratch, FrameLayout::Single, false)
+            .expect("stage scratch");
+        let mut ctx = &mut frame.context;
+        let tokens: Vec<u32> = batch.iter().map(|(_, token, _)| *token).collect();
+        let mut residual = frame.residual.as_mut().expect("stage residual");
+        let embed = self
+            .embed
+            .as_ref()
+            .expect("decode_stage_tokens_to_hidden_batch called on stage without embedding");
+        B::embedding_lookup(&mut ctx, embed, &tokens, &mut residual, h);
+
+        for li in 0..self.local_layer_count() {
+            self.forward_layer_batched_decode(
+                &mut ctx,
+                li,
+                batch,
+                &mut residual,
+                m,
+                None,
+                None,
+                None,
+            );
+        }
+        self.bump_local_batched_decode_kv_lengths(batch);
+
+        let quiescent = device_execution::checked_sync::<B>(ctx);
+        let out = B::to_vec_in_context(ctx, &residual, m * h);
+        frame.completed = Some(quiescent);
+        PipelineHidden::host(out, m, h)
+    }
+
+    fn decode_stage_hidden_from_host_batch_in_frame(
+        &mut self,
+        frame: &mut LlamaExecutionFrame<B>,
+        batch: &[(String, u32, u32)],
+        hidden: &PipelineHidden<B>,
+    ) -> (PipelineHidden<B>, LlamaStageHiddenBridgeTiming) {
+        let hidden_slice = hidden.host_slice();
+        let (m, h) = self.prepare_batched_decode_stage(&mut frame.context, batch);
+        frame
+            .take_scratch(&mut self.scratch, FrameLayout::Single, false)
+            .expect("stage scratch");
+        let mut ctx = &mut frame.context;
+        let mut residual = frame.residual.as_mut().expect("stage residual");
         let bridge_t0 = std::time::Instant::now();
         let host_copy_t0 = std::time::Instant::now();
         B::write_f32_to_activation(&mut ctx, &mut residual, hidden_slice);
@@ -3192,48 +3249,33 @@ impl<B: MoeLlmBackend> LlamaPipelineStageBatchOps<B> for LlamaFamilyModel<B, KvF
         }
         self.bump_local_batched_decode_kv_lengths(batch);
 
-        B::sync(&mut ctx);
-        let out = B::to_vec(&residual, m * h);
-        self.scratch.residual = Some(residual);
+        let quiescent = device_execution::checked_sync::<B>(ctx);
+        let out = B::to_vec_in_context(ctx, &residual, m * h);
+        frame.completed = Some(quiescent);
         (PipelineHidden::host(out, m, h), bridge_timing)
     }
 
-    fn logits_from_hidden_batch(
+    fn logits_from_hidden_batch_in_frame(
         &mut self,
+        frame: &mut LlamaExecutionFrame<B>,
         hidden: &PipelineHidden<B>,
         force_full_logits: bool,
     ) -> Vec<Vec<f32>> {
         let row_count = hidden.row_count();
-        if row_count == 0 {
-            return Vec::new();
-        }
         let h = self.cfg.hidden_size;
         let vocab = self.cfg.vocab_size;
         let hidden_slice = hidden.host_slice();
-        assert_eq!(
-            hidden_slice.len(),
-            row_count * h,
-            "hidden length {} != row_count * hidden_size {}",
-            hidden_slice.len(),
-            row_count * h
-        );
-        if row_count == 1 || !self.supports_batched_decode || self.cfg.sandwich_norms {
-            return (0..row_count)
-                .map(|row| {
-                    let start = row * h;
-                    self.logits_from_hidden(&hidden_slice[start..start + h])
-                })
-                .collect();
+        self.ensure_scratch_in_context(&mut frame.context, row_count);
+        if row_count > self.scratch.batch_logits_capacity {
+            self.clear_graph_bookkeeping();
         }
-
-        self.ensure_scratch(row_count);
-        self.scratch.ensure_batch_logits(&self.cfg, row_count);
-        let mut ctx = B::new_context();
-        let mut hidden_buf = self
-            .scratch
-            .residual
-            .take()
-            .expect("scratch residual missing before logits_from_hidden_batch");
+        self.scratch
+            .ensure_batch_logits(&mut frame.context, &self.cfg, row_count);
+        frame
+            .take_scratch(&mut self.scratch, FrameLayout::Single, false)
+            .expect("stage scratch");
+        let mut ctx = &mut frame.context;
+        let mut hidden_buf = frame.residual.as_mut().expect("stage residual");
         B::write_f32_to_activation(&mut ctx, &mut hidden_buf, hidden_slice);
         B::rms_norm(
             &mut ctx,
@@ -3259,8 +3301,6 @@ impl<B: MoeLlmBackend> LlamaPipelineStageBatchOps<B> for LlamaFamilyModel<B, KvF
                 row_count,
             );
         }
-        B::sync(&mut ctx);
-        self.scratch.residual = Some(hidden_buf);
 
         let greedy = self.batched_cfg.greedy_argmax && !force_full_logits;
         if greedy {
@@ -3268,7 +3308,9 @@ impl<B: MoeLlmBackend> LlamaPipelineStageBatchOps<B> for LlamaFamilyModel<B, KvF
                 .expect("argmax_rows_f16");
             tokens.into_iter().map(|t| vec![t as f32]).collect()
         } else {
-            let all = B::to_vec(&self.scratch.batch_logits, row_count * vocab);
+            let quiescent = device_execution::checked_sync::<B>(ctx);
+            let all = B::to_vec_in_context(ctx, &self.scratch.batch_logits, row_count * vocab);
+            frame.completed = Some(quiescent);
             (0..row_count)
                 .map(|row| all[row * vocab..(row + 1) * vocab].to_vec())
                 .collect()

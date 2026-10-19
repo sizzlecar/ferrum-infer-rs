@@ -6,7 +6,7 @@
 //!
 //! Usage in model code:
 //! ```ignore
-//! let qkv: Box<dyn Linear<B>> = loader.load_linear("model.layers.0.self_attn.qkv_proj")?;
+//! let qkv: Box<dyn Linear<B>> = loader.load_linear(ctx, "model.layers.0.self_attn.qkv_proj")?;
 //! qkv.forward(ctx, &input, &mut out, m);
 //! ```
 //!

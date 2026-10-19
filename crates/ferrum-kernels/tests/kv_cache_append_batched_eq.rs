@@ -41,7 +41,7 @@ fn kv_append_batched_matches_per_item_head_major() {
     // new_data = [m, NKV, HD] item-major (output of qk_norm_rope_batched
     // for K). Same source for both paths.
     let new_data_h = det_f32(1, M * NKV * HD);
-    let new_data_dev = CudaBackend::from_slice(&new_data_h);
+    let new_data_dev = CudaBackend::from_slice_in_context(&mut ctx, &new_data_h);
 
     // ── Per-item path ─────────────────────────────────────────────────
     // For each item i: copy_slice new_data[i*NKV*HD..(i+1)*NKV*HD] →
@@ -49,19 +49,19 @@ fn kv_append_batched_matches_per_item_head_major() {
     // then call kv_cache_append_head_major.
     let mut per_item_caches: Vec<_> = (0..M)
         .map(|_| {
-            let mut buf = CudaBackend::alloc(NKV * CAPACITY * HD);
+            let mut buf = CudaBackend::alloc_in_context(&mut ctx, NKV * CAPACITY * HD);
             // pre-fill with sentinel so unmodified slots stay distinct
             let sentinel = vec![0.0f32; NKV * CAPACITY * HD];
             // The simplest way to seed is from_slice + write; but
             // we'll use B::sync after each append to read back.
-            let seed_buf = CudaBackend::from_slice(&sentinel);
+            let seed_buf = CudaBackend::from_slice_in_context(&mut ctx, &sentinel);
             CudaBackend::copy_slice(&mut ctx, &seed_buf, 0, &mut buf, 0, NKV * CAPACITY * HD);
             let _ = seed_buf;
             buf
         })
         .collect();
 
-    let mut single_scratch = CudaBackend::alloc(NKV * HD);
+    let mut single_scratch = CudaBackend::alloc_in_context(&mut ctx, NKV * HD);
     for i in 0..M {
         CudaBackend::copy_slice(
             &mut ctx,
@@ -71,10 +71,10 @@ fn kv_append_batched_matches_per_item_head_major() {
             0,
             NKV * HD,
         );
-        let v_dummy = CudaBackend::alloc(NKV * CAPACITY * HD);
+        let v_dummy = CudaBackend::alloc_in_context(&mut ctx, NKV * CAPACITY * HD);
         // We only test K append; pass single_scratch as both K and V
         // sources (V cache is throwaway, just needs same shape).
-        let mut v_dummy_cache = CudaBackend::alloc(NKV * CAPACITY * HD);
+        let mut v_dummy_cache = CudaBackend::alloc_in_context(&mut ctx, NKV * CAPACITY * HD);
         CudaBackend::kv_cache_append_head_major(
             &mut ctx,
             &mut per_item_caches[i],
@@ -89,15 +89,17 @@ fn kv_append_batched_matches_per_item_head_major() {
         );
     }
     CudaBackend::sync(&mut ctx);
-    let per_item_cache_0_h = CudaBackend::to_vec(&per_item_caches[0], NKV * CAPACITY * HD);
-    let per_item_cache_1_h = CudaBackend::to_vec(&per_item_caches[1], NKV * CAPACITY * HD);
+    let per_item_cache_0_h =
+        CudaBackend::to_vec_in_context(&mut ctx, &per_item_caches[0], NKV * CAPACITY * HD);
+    let per_item_cache_1_h =
+        CudaBackend::to_vec_in_context(&mut ctx, &per_item_caches[1], NKV * CAPACITY * HD);
 
     // ── Batched path ──────────────────────────────────────────────────
     let batched_caches: Vec<_> = (0..M)
         .map(|_| {
             let zero = vec![0.0f32; NKV * CAPACITY * HD];
-            let seed_buf = CudaBackend::from_slice(&zero);
-            let mut buf = CudaBackend::alloc(NKV * CAPACITY * HD);
+            let seed_buf = CudaBackend::from_slice_in_context(&mut ctx, &zero);
+            let mut buf = CudaBackend::alloc_in_context(&mut ctx, NKV * CAPACITY * HD);
             CudaBackend::copy_slice(&mut ctx, &seed_buf, 0, &mut buf, 0, NKV * CAPACITY * HD);
             let _ = seed_buf;
             buf
@@ -105,7 +107,8 @@ fn kv_append_batched_matches_per_item_head_major() {
         .collect();
 
     let cache_lens_h: Vec<u32> = vec![CACHE_LEN as u32; M];
-    let mut cache_lens_dev = CudaBackend::alloc_typed(ferrum_kernels::backend::Dtype::U32, M);
+    let mut cache_lens_dev =
+        CudaBackend::alloc_typed_in_context(&mut ctx, ferrum_kernels::backend::Dtype::U32, M);
     CudaBackend::write_typed::<u32>(&mut ctx, &mut cache_lens_dev, &cache_lens_h);
 
     let cache_refs: Vec<&_> = batched_caches.iter().collect();
@@ -122,8 +125,10 @@ fn kv_append_batched_matches_per_item_head_major() {
     )
     .expect("batched kv_append");
     CudaBackend::sync(&mut ctx);
-    let batched_cache_0_h = CudaBackend::to_vec(&batched_caches[0], NKV * CAPACITY * HD);
-    let batched_cache_1_h = CudaBackend::to_vec(&batched_caches[1], NKV * CAPACITY * HD);
+    let batched_cache_0_h =
+        CudaBackend::to_vec_in_context(&mut ctx, &batched_caches[0], NKV * CAPACITY * HD);
+    let batched_cache_1_h =
+        CudaBackend::to_vec_in_context(&mut ctx, &batched_caches[1], NKV * CAPACITY * HD);
 
     // ── Compare cache contents ────────────────────────────────────────
     fn diff_stats(a: &[f32], b: &[f32], label: &str) {

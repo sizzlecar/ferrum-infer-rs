@@ -81,16 +81,18 @@ impl<'a, B: ferrum_kernels::backend::Backend> CandleShimLoader<'a, B> {
 }
 
 impl<'a, B: ferrum_kernels::backend::Backend> WeightLoader<B> for CandleShimLoader<'a, B> {
-    fn load_tensor(&self, name: &str) -> Result<B::Buffer> {
+    fn load_tensor(&self, ctx: &mut B::Context, name: &str) -> Result<B::Buffer> {
         let data = self.load_f32_rows(name)?;
-        Ok(B::from_slice(&data))
+        Ok(B::from_slice_in_context(ctx, &data))
     }
 
-    fn load_linear(&self, name: &str) -> Result<Box<dyn Linear<B>>> {
+    fn load_linear(&self, ctx: &mut B::Context, name: &str) -> Result<Box<dyn Linear<B>>> {
         // Try direct fused `<name>.weight` first.
         let direct = format!("{name}.weight");
         if let Some((r, c, data)) = self.fetch_2d(&direct) {
-            return Ok(Box::new(DenseLinear::<B>::from_rows(&data, r, c)));
+            return Ok(Box::new(DenseLinear::<B>::from_rows_in_context(
+                ctx, &data, r, c,
+            )));
         }
 
         // Fallback: Qwen3 0.6B (and Llama family) checkpoints store projections
@@ -102,7 +104,9 @@ impl<'a, B: ferrum_kernels::backend::Backend> WeightLoader<B> for CandleShimLoad
                 format!("{prefix}v_proj.weight"),
             ];
             if let Some((r, c, data)) = self.fetch_2d_concat(&keys) {
-                return Ok(Box::new(DenseLinear::<B>::from_rows(&data, r, c)));
+                return Ok(Box::new(DenseLinear::<B>::from_rows_in_context(
+                    ctx, &data, r, c,
+                )));
             }
         }
         if let Some(prefix) = name.strip_suffix("gate_up_proj") {
@@ -111,7 +115,9 @@ impl<'a, B: ferrum_kernels::backend::Backend> WeightLoader<B> for CandleShimLoad
                 format!("{prefix}up_proj.weight"),
             ];
             if let Some((r, c, data)) = self.fetch_2d_concat(&keys) {
-                return Ok(Box::new(DenseLinear::<B>::from_rows(&data, r, c)));
+                return Ok(Box::new(DenseLinear::<B>::from_rows_in_context(
+                    ctx, &data, r, c,
+                )));
             }
         }
 

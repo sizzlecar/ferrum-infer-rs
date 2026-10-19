@@ -1201,7 +1201,11 @@ mod tests {
     }
 
     impl WeightLoader<CpuBackend> for ParityLoader {
-        fn load_tensor(&self, name: &str) -> Result<Vec<f32>> {
+        fn load_tensor(
+            &self,
+            _ctx: &mut <CpuBackend as ferrum_kernels::backend::Backend>::Context,
+            name: &str,
+        ) -> Result<Vec<f32>> {
             if name == "model.embed_tokens.weight" {
                 return Ok(Self::deterministic_values(
                     name,
@@ -1223,11 +1227,13 @@ mod tests {
 
         fn load_linear(
             &self,
+            ctx: &mut <CpuBackend as ferrum_kernels::backend::Backend>::Context,
             name: &str,
         ) -> Result<Box<dyn ferrum_quantization::Linear<CpuBackend>>> {
             let (out_features, in_features) = self.linear_dims(name)?;
             let weights = Self::deterministic_values(name, out_features * in_features, 0.0, 0.015);
-            Ok(Box::new(DenseLinear::<CpuBackend>::from_rows(
+            Ok(Box::new(DenseLinear::<CpuBackend>::from_rows_in_context(
+                ctx,
                 &weights,
                 out_features,
                 in_features,

@@ -995,7 +995,7 @@ impl<B: QuantLlmBackend + BackendMoeFused> ExpertStack<B> {
 ///   - `down_buf`     : `[hidden]` per-(token, expert) accumulate src
 ///
 /// Routing (softmax + top-K + optional renorm) runs host-side using
-/// `B::to_vec(router_logits, …)` — the routing computation is small
+/// `B::to_vec_in_context(ctx, router_logits, …)` — the routing computation is small
 /// (`batch * num_experts` floats) and the top-K is a sort, both of
 /// which dwarf in cost any plausible host↔device transfer.
 ///
@@ -1058,7 +1058,7 @@ pub fn moe_forward<B: QuantLlmBackend + BackendMoeFused>(
     // per layer for Qwen3-30B-A3B prefill); cheap relative to the per-
     // expert gemvs that follow.
     B::sync(ctx);
-    let logits_host = B::to_vec(router_logits, batch * num_experts);
+    let logits_host = B::to_vec_in_context(ctx, router_logits, batch * num_experts);
     let route_out =
         crate::moe::router::route(&logits_host, batch, num_experts, top_k, norm_topk_prob);
 
@@ -1506,7 +1506,7 @@ pub fn moe_forward_bucketed<B: QuantLlmBackend + BackendMoeFused>(
         );
         if gpu_route.is_err() {
             B::sync(ctx);
-            let logits_host = B::to_vec(router_logits, batch * num_experts);
+            let logits_host = B::to_vec_in_context(ctx, router_logits, batch * num_experts);
             crate::moe::router::route_into(
                 &logits_host,
                 batch,

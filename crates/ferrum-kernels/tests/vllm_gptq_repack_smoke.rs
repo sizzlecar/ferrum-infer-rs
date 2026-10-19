@@ -29,7 +29,7 @@ fn vllm_gptq_marlin_repack_runs() {
     vllm_gptq_marlin_repack(&stream, &qw_in, &mut qw_out, K, N).expect("repack");
     stream.synchronize().unwrap();
 
-    let qw_out_host: Vec<i32> = stream.memcpy_dtov(&qw_out).unwrap();
+    let qw_out_host: Vec<i32> = stream.clone_dtoh(&qw_out).unwrap();
     let nonzero = qw_out_host.iter().filter(|&&x| x != 0).count();
     eprintln!(
         "repack done: {} elements out, {} non-zero ({:.1}%)",

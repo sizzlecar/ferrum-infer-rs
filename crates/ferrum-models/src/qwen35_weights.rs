@@ -175,32 +175,45 @@ impl<'a, B: Backend> Qwen35WeightPlanLoader<'a, B> {
             .is_some_and(|tensor| self.inner.has_tensor(&tensor.name))
     }
 
-    pub fn load_global_tensor(&self, role: &str) -> FerrumResult<B::Buffer> {
+    pub fn load_global_tensor(&self, ctx: &mut B::Context, role: &str) -> FerrumResult<B::Buffer> {
         let tensor = self.required_global_tensor(role)?;
-        self.inner.load_tensor(&tensor.name)
+        self.inner.load_tensor(ctx, &tensor.name)
     }
 
-    pub fn load_layer_tensor(&self, layer_index: usize, role: &str) -> FerrumResult<B::Buffer> {
+    pub fn load_layer_tensor(
+        &self,
+        ctx: &mut B::Context,
+        layer_index: usize,
+        role: &str,
+    ) -> FerrumResult<B::Buffer> {
         let tensor = self.required_layer_tensor(layer_index, role)?;
-        self.inner.load_tensor(&tensor.name)
+        self.inner.load_tensor(ctx, &tensor.name)
     }
 
-    pub fn load_global_linear(&self, role: &str) -> FerrumResult<Box<dyn Linear<B>>> {
+    pub fn load_global_linear(
+        &self,
+        ctx: &mut B::Context,
+        role: &str,
+    ) -> FerrumResult<Box<dyn Linear<B>>> {
         let tensor = self.required_global_tensor(role)?;
-        self.inner.load_linear(&linear_module_name(&tensor.name))
+        self.inner
+            .load_linear(ctx, &linear_module_name(&tensor.name))
     }
 
     pub fn load_layer_linear(
         &self,
+        ctx: &mut B::Context,
         layer_index: usize,
         role: &str,
     ) -> FerrumResult<Box<dyn Linear<B>>> {
         let tensor = self.required_layer_tensor(layer_index, role)?;
-        self.inner.load_linear(&linear_module_name(&tensor.name))
+        self.inner
+            .load_linear(ctx, &linear_module_name(&tensor.name))
     }
 
     pub fn load_layer_dense_gate_up_linear(
         &self,
+        ctx: &mut B::Context,
         layer_index: usize,
     ) -> FerrumResult<Box<dyn Linear<B>>> {
         let gate = self.required_layer_tensor(layer_index, "mlp_gate")?;
@@ -221,11 +234,13 @@ impl<'a, B: Backend> Qwen35WeightPlanLoader<'a, B> {
             )));
         }
 
-        self.inner.load_linear(&format!("{prefix}gate_up_proj"))
+        self.inner
+            .load_linear(ctx, &format!("{prefix}gate_up_proj"))
     }
 
     pub fn load_layer_shared_expert_gate_up_linear(
         &self,
+        ctx: &mut B::Context,
         layer_index: usize,
     ) -> FerrumResult<Box<dyn Linear<B>>> {
         let gate = self.required_layer_tensor(layer_index, "moe_shared_expert_gate_proj")?;
@@ -246,14 +261,17 @@ impl<'a, B: Backend> Qwen35WeightPlanLoader<'a, B> {
             )));
         }
 
-        self.inner.load_linear(&format!("{prefix}gate_up_proj"))
+        self.inner
+            .load_linear(ctx, &format!("{prefix}gate_up_proj"))
     }
 
     pub fn load_layer_linear_attention_qkvz(
         &self,
+        ctx: &mut B::Context,
         layer_index: usize,
     ) -> FerrumResult<Box<dyn Linear<B>>> {
         self.load_fused_layer_linear(
+            ctx,
             layer_index,
             "linear_attn_qkv",
             "linear_attn_z",
@@ -265,9 +283,11 @@ impl<'a, B: Backend> Qwen35WeightPlanLoader<'a, B> {
 
     pub fn load_layer_linear_attention_ba(
         &self,
+        ctx: &mut B::Context,
         layer_index: usize,
     ) -> FerrumResult<Box<dyn Linear<B>>> {
         self.load_fused_layer_linear(
+            ctx,
             layer_index,
             "linear_attn_b",
             "linear_attn_a",
@@ -279,6 +299,7 @@ impl<'a, B: Backend> Qwen35WeightPlanLoader<'a, B> {
 
     pub fn load_layer_stacked_gptq_experts(
         &self,
+        ctx: &mut B::Context,
         layer_index: usize,
         num_experts: usize,
         proj_names: &[&str],
@@ -292,7 +313,7 @@ impl<'a, B: Backend> Qwen35WeightPlanLoader<'a, B> {
             self.plan.prefix
         );
         self.inner
-            .load_stacked_gptq_experts(&expert_prefix, num_experts, proj_names)
+            .load_stacked_gptq_experts(ctx, &expert_prefix, num_experts, proj_names)
     }
 
     fn required_global_tensor(&self, role: &str) -> FerrumResult<&Qwen35ResolvedWeightSpec> {
@@ -324,6 +345,7 @@ impl<'a, B: Backend> Qwen35WeightPlanLoader<'a, B> {
 
     fn load_fused_layer_linear(
         &self,
+        ctx: &mut B::Context,
         layer_index: usize,
         first_role: &str,
         second_role: &str,
@@ -349,7 +371,8 @@ impl<'a, B: Backend> Qwen35WeightPlanLoader<'a, B> {
             )));
         }
 
-        self.inner.load_linear(&format!("{prefix}{fused_suffix}"))
+        self.inner
+            .load_linear(ctx, &format!("{prefix}{fused_suffix}"))
     }
 }
 
@@ -1059,7 +1082,11 @@ mod tests {
     }
 
     impl WeightLoader<CpuBackend> for RecordingLoader {
-        fn load_tensor(&self, name: &str) -> FerrumResult<Vec<f32>> {
+        fn load_tensor(
+            &self,
+            _ctx: &mut <CpuBackend as ferrum_kernels::backend::Backend>::Context,
+            name: &str,
+        ) -> FerrumResult<Vec<f32>> {
             self.tensors
                 .get(name)
                 .cloned()
@@ -1068,10 +1095,12 @@ mod tests {
 
         fn load_linear(
             &self,
+            ctx: &mut <CpuBackend as ferrum_kernels::backend::Backend>::Context,
             name: &str,
         ) -> FerrumResult<Box<dyn ferrum_quantization::Linear<CpuBackend>>> {
             self.linear_names.lock().unwrap().push(name.to_string());
-            Ok(Box::new(DenseLinear::<CpuBackend>::from_rows(
+            Ok(Box::new(DenseLinear::<CpuBackend>::from_rows_in_context(
+                ctx,
                 &[0.0, 0.0],
                 1,
                 2,
@@ -1282,12 +1311,32 @@ mod tests {
         let planned = Qwen35WeightPlanLoader::<CpuBackend>::new(&plan, &loader);
         assert!(planned.has_global_tensor("lm_head"));
         assert!(planned.has_layer_tensor(3, "self_attn_q"));
-        planned.load_global_linear("lm_head").unwrap();
-        planned.load_layer_linear(3, "self_attn_q").unwrap();
         planned
-            .load_layer_linear(0, "moe_shared_expert_gate")
+            .load_global_linear(
+                &mut <CpuBackend as ferrum_kernels::backend::Backend>::new_context(),
+                "lm_head",
+            )
             .unwrap();
-        planned.load_layer_shared_expert_gate_up_linear(0).unwrap();
+        planned
+            .load_layer_linear(
+                &mut <CpuBackend as ferrum_kernels::backend::Backend>::new_context(),
+                3,
+                "self_attn_q",
+            )
+            .unwrap();
+        planned
+            .load_layer_linear(
+                &mut <CpuBackend as ferrum_kernels::backend::Backend>::new_context(),
+                0,
+                "moe_shared_expert_gate",
+            )
+            .unwrap();
+        planned
+            .load_layer_shared_expert_gate_up_linear(
+                &mut <CpuBackend as ferrum_kernels::backend::Backend>::new_context(),
+                0,
+            )
+            .unwrap();
 
         assert_eq!(
             loader.linear_names(),
@@ -1612,11 +1661,22 @@ mod tests {
         assert_eq!(planned.plan().prefix, "model");
         assert!(planned.has_global_tensor("embed_tokens"));
         assert_eq!(
-            planned.load_global_tensor("embed_tokens").unwrap(),
+            planned
+                .load_global_tensor(
+                    &mut <CpuBackend as ferrum_kernels::backend::Backend>::new_context(),
+                    "embed_tokens"
+                )
+                .unwrap(),
             vec![1.0]
         );
         assert!(planned.has_layer_tensor(0, "linear_attn_qkv"));
-        let linear = planned.load_layer_linear(0, "linear_attn_qkv").unwrap();
+        let linear = planned
+            .load_layer_linear(
+                &mut <CpuBackend as ferrum_kernels::backend::Backend>::new_context(),
+                0,
+                "linear_attn_qkv",
+            )
+            .unwrap();
 
         assert_eq!(linear.in_features(), 2);
         assert_eq!(
@@ -1624,7 +1684,10 @@ mod tests {
             vec!["model.layers.0.linear_attn.in_proj_qkv".to_string()]
         );
         let err = planned
-            .load_global_tensor("lm_head")
+            .load_global_tensor(
+                &mut <CpuBackend as ferrum_kernels::backend::Backend>::new_context(),
+                "lm_head",
+            )
             .expect_err("tied lm_head is optional and absent");
         assert!(err.to_string().contains("lm_head"), "{err}");
     }
@@ -1650,8 +1713,18 @@ mod tests {
         let loader = RecordingLoader::from_names(names);
         let planned = Qwen35WeightPlanLoader::<CpuBackend>::new(&plan, &loader);
 
-        let qkvz = planned.load_layer_linear_attention_qkvz(0).unwrap();
-        let ba = planned.load_layer_linear_attention_ba(0).unwrap();
+        let qkvz = planned
+            .load_layer_linear_attention_qkvz(
+                &mut <CpuBackend as ferrum_kernels::backend::Backend>::new_context(),
+                0,
+            )
+            .unwrap();
+        let ba = planned
+            .load_layer_linear_attention_ba(
+                &mut <CpuBackend as ferrum_kernels::backend::Backend>::new_context(),
+                0,
+            )
+            .unwrap();
 
         assert_eq!(qkvz.in_features(), 2);
         assert_eq!(ba.in_features(), 2);

@@ -17,10 +17,12 @@ use ferrum_types::{FerrumError, Result};
 use crate::config::QuantConfig;
 use crate::traits::Linear;
 
+/// Uploads and repacks use the caller's execution context. The resulting
+/// buffers are consumed by that same instance; loaders do not select a stream.
 pub trait WeightLoader<B: Backend>: Send + Sync {
     /// Load a single tensor by fully qualified name
     /// (e.g. `"model.embed_tokens.weight"`).
-    fn load_tensor(&self, name: &str) -> Result<B::Buffer>;
+    fn load_tensor(&self, ctx: &mut B::Context, name: &str) -> Result<B::Buffer>;
 
     /// Load a projection as a `Linear<B>`. The concrete implementation
     /// (DenseLinear / GptqLinear / AwqLinear / GgufLinear) depends on the
@@ -28,7 +30,7 @@ pub trait WeightLoader<B: Backend>: Send + Sync {
     ///
     /// `name` is the module path without the `.weight` suffix, e.g.
     /// `"model.layers.0.self_attn.qkv_proj"`.
-    fn load_linear(&self, name: &str) -> Result<Box<dyn Linear<B>>>;
+    fn load_linear(&self, ctx: &mut B::Context, name: &str) -> Result<Box<dyn Linear<B>>>;
 
     /// Whether a tensor with this name exists in the source.
     fn has_tensor(&self, name: &str) -> bool;
@@ -42,11 +44,12 @@ pub trait WeightLoader<B: Backend>: Send + Sync {
     /// explicit unsupported error.
     fn load_stacked_gptq_experts(
         &self,
+        ctx: &mut B::Context,
         expert_prefix_fmt: &str,
         num_experts: usize,
         proj_names: &[&str],
     ) -> Result<(std::sync::Arc<dyn MarlinExpertStack<B>>, usize, usize)> {
-        let _ = (expert_prefix_fmt, num_experts, proj_names);
+        let _ = (ctx, expert_prefix_fmt, num_experts, proj_names);
         Err(FerrumError::unsupported(
             "load_stacked_gptq_experts not implemented for this weight loader",
         ))
@@ -77,12 +80,14 @@ impl<'a, B: Backend> PrefixedLoader<'a, B> {
 }
 
 impl<'a, B: Backend> WeightLoader<B> for PrefixedLoader<'a, B> {
-    fn load_tensor(&self, name: &str) -> Result<B::Buffer> {
-        self.inner.load_tensor(&format!("{}{}", self.prefix, name))
+    fn load_tensor(&self, ctx: &mut B::Context, name: &str) -> Result<B::Buffer> {
+        self.inner
+            .load_tensor(ctx, &format!("{}{}", self.prefix, name))
     }
 
-    fn load_linear(&self, name: &str) -> Result<Box<dyn Linear<B>>> {
-        self.inner.load_linear(&format!("{}{}", self.prefix, name))
+    fn load_linear(&self, ctx: &mut B::Context, name: &str) -> Result<Box<dyn Linear<B>>> {
+        self.inner
+            .load_linear(ctx, &format!("{}{}", self.prefix, name))
     }
 
     fn has_tensor(&self, name: &str) -> bool {
@@ -95,11 +100,13 @@ impl<'a, B: Backend> WeightLoader<B> for PrefixedLoader<'a, B> {
 
     fn load_stacked_gptq_experts(
         &self,
+        ctx: &mut B::Context,
         expert_prefix_fmt: &str,
         num_experts: usize,
         proj_names: &[&str],
     ) -> Result<(std::sync::Arc<dyn MarlinExpertStack<B>>, usize, usize)> {
         self.inner.load_stacked_gptq_experts(
+            ctx,
             &format!("{}{}", self.prefix, expert_prefix_fmt),
             num_experts,
             proj_names,
