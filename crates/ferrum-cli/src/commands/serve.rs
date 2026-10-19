@@ -1738,16 +1738,6 @@ fn serve_cli_runtime_entries(
     }
     if let Some(enabled) = prefix_cache {
         entries.push(RuntimeConfigEntry::new(
-            "FERRUM_PREFIX_CACHE_REQUESTED",
-            if enabled { "1" } else { "0" },
-            RuntimeConfigSource::Cli,
-        ));
-        entries.push(RuntimeConfigEntry::new(
-            "FERRUM_PREFIX_CACHE_PRODUCT",
-            if enabled { "1" } else { "0" },
-            RuntimeConfigSource::Cli,
-        ));
-        entries.push(RuntimeConfigEntry::new(
             "FERRUM_PREFIX_CACHE",
             if enabled { "1" } else { "0" },
             RuntimeConfigSource::Cli,

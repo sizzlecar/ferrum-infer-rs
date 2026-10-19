@@ -26,17 +26,16 @@ use ferrum_interfaces::{adapter::AdapterExecutionSupport, engine::LlmInferenceEn
 use ferrum_types::{
     has_unclosed_model_reasoning_block, model_reasoning_markers,
     parse_harmony_response_for_finish_reason, parse_model_reasoning_response,
-    should_defer_model_reasoning_stream_delta, EngineMetrics, EngineStatus,
-    ExecutionResourceAuthority, FerrumConfigBuilder, FerrumError as Error, FerrumProfileEvent,
-    FinishReason, InferenceExecutionEvidence, InferenceRequest, InferenceResponse, ModelId,
-    ModelOutputProtocol, ParsedReasoningResponse, Priority, ProcessMemoryObservation,
-    ProcessMemorySample, ProcessMemorySampler, ProfileEntrypoint, ProfileError, ProfileEventKind,
-    ProfileStatus, ReplayReference, RequestId, RequestIngressAnchor, RequestIngressBoundary,
-    ResolvedFerrumConfig, ResourceAction, ResourceTraceEvent, ResponseCompletionBoundary,
-    RuntimeConfigSnapshot, SamplingParams, StructuredOutputStart, TokenId, TokenUsage,
-    DEFAULT_CHAT_REPETITION_PENALTY, DEFAULT_MAX_TOKENS_METADATA_KEY,
-    OBSERVABILITY_PROFILE_SCHEMA_VERSION, PROMPT_OPENED_REASONING_METADATA_KEY, THINK_END_TAG,
-    THINK_START_TAG,
+    should_defer_model_reasoning_stream_delta, EngineMetrics, EngineStatus, FerrumConfigBuilder,
+    FerrumError as Error, FerrumProfileEvent, FinishReason, InferenceExecutionEvidence,
+    InferenceRequest, InferenceResponse, ModelId, ModelOutputProtocol, ParsedReasoningResponse,
+    Priority, ProcessMemoryObservation, ProcessMemorySample, ProcessMemorySampler,
+    ProfileEntrypoint, ProfileError, ProfileEventKind, ProfileStatus, ReplayReference, RequestId,
+    RequestIngressAnchor, RequestIngressBoundary, ResolvedFerrumConfig, ResourceAction,
+    ResourceTraceEvent, ResponseCompletionBoundary, RuntimeConfigSnapshot, SamplingParams,
+    StructuredOutputStart, TokenId, TokenUsage, DEFAULT_CHAT_REPETITION_PENALTY,
+    DEFAULT_MAX_TOKENS_METADATA_KEY, OBSERVABILITY_PROFILE_SCHEMA_VERSION,
+    PROMPT_OPENED_REASONING_METADATA_KEY, THINK_END_TAG, THINK_START_TAG,
 };
 use ferrum_types::{
     BenchmarkRequestCorrelation, BENCHMARK_CELL_ID_HEADER, BENCHMARK_PHASE_HEADER,
@@ -97,7 +96,6 @@ pub fn default_chat_sampling_params() -> SamplingParams {
 
 #[derive(Debug, Clone)]
 struct CachePolicy {
-    prefix_cache_enabled: bool,
     session_cache_mode: String,
     session_cache_max_entries: usize,
     session_cache_max_tokens: usize,
@@ -106,10 +104,6 @@ struct CachePolicy {
 impl CachePolicy {
     fn current() -> Self {
         Self {
-            prefix_cache_enabled: env_bool("FERRUM_PREFIX_CACHE_PRODUCT")
-                .or_else(|| env_bool("FERRUM_PREFIX_CACHE_REQUESTED"))
-                .or_else(|| env_bool("FERRUM_PREFIX_CACHE"))
-                .unwrap_or(false),
             session_cache_mode: std::env::var("FERRUM_SESSION_CACHE")
                 .unwrap_or_else(|_| "off".to_string())
                 .to_ascii_lowercase(),
@@ -120,14 +114,6 @@ impl CachePolicy {
 
     fn session_memory_enabled(&self) -> bool {
         self.session_cache_mode == "memory"
-    }
-}
-
-fn env_bool(key: &str) -> Option<bool> {
-    match std::env::var(key).ok()?.to_ascii_lowercase().as_str() {
-        "1" | "true" | "yes" | "on" => Some(true),
-        "0" | "false" | "no" | "off" => Some(false),
-        _ => None,
     }
 }
 
@@ -505,18 +491,6 @@ impl AppState {
         Ok(())
     }
 
-    fn record_prefix_prompt(&self, prompt: &str, policy: &CachePolicy) {
-        if self.llm.as_ref().is_some_and(|engine| {
-            engine.execution_resource_authority() == ExecutionResourceAuthority::PlanRuntime
-        }) {
-            // Native cache health already reports actual reuse or an unsupported
-            // plan. The legacy text-LCP estimate would only duplicate full raw
-            // prompts and scan them under a lock, outside the runtime budget.
-            return;
-        }
-        self.cache.record_prefix_prompt(prompt, policy);
-    }
-
     pub fn with_llm(mut self, engine: Arc<dyn LlmInferenceEngine + Send + Sync>) -> Self {
         if self.served_model_registry.is_empty() {
             self.served_model_registry = Arc::new(single_model_registry(
@@ -628,18 +602,11 @@ impl AppState {
 #[derive(Default)]
 struct CacheRuntimeState {
     stats: Mutex<CacheStats>,
-    prefix_prompts: Mutex<HashMap<String, usize>>,
     sessions: Mutex<HashMap<String, Vec<SessionMessage>>>,
 }
 
 #[derive(Debug, Clone, Default)]
 struct CacheStats {
-    prefix_hits: u64,
-    prefix_misses: u64,
-    prefix_evictions: u64,
-    prefix_saved_prefill_tokens: u64,
-    prefix_entries: u64,
-    prefix_bytes: u64,
     session_hits: u64,
     session_misses: u64,
     session_evictions: u64,
@@ -672,39 +639,6 @@ struct SessionContext {
 }
 
 impl CacheRuntimeState {
-    fn record_prefix_prompt(&self, prompt: &str, policy: &CachePolicy) {
-        if !policy.prefix_cache_enabled {
-            return;
-        }
-
-        let prompt_tokens = approx_tokens(prompt);
-        let mut prompts = self.prefix_prompts.lock().expect("prefix cache lock");
-        let saved_tokens = prompts
-            .keys()
-            .map(|seen| approx_tokens_for_chars(longest_common_prefix_chars(seen, prompt)))
-            .max()
-            .unwrap_or(0);
-
-        let mut stats = self.stats.lock().expect("cache stats lock");
-        if saved_tokens > 0 {
-            stats.prefix_hits += 1;
-            stats.prefix_saved_prefill_tokens += saved_tokens as u64;
-        } else {
-            stats.prefix_misses += 1;
-        }
-
-        let max_entries = policy.session_cache_max_entries.max(1);
-        if !prompts.contains_key(prompt) && prompts.len() >= max_entries {
-            if let Some(key) = prompts.keys().next().cloned() {
-                prompts.remove(&key);
-                stats.prefix_evictions += 1;
-            }
-        }
-        prompts.insert(prompt.to_string(), prompt_tokens);
-        stats.prefix_entries = prompts.len() as u64;
-        stats.prefix_bytes = prompts.keys().map(|key| key.len() as u64).sum();
-    }
-
     fn prepare_session_request(
         &self,
         request: &mut ChatCompletionsRequest,
@@ -812,7 +746,6 @@ impl CacheRuntimeState {
 
     fn stats(&self) -> CacheStats {
         let mut stats = self.stats.lock().expect("cache stats lock").clone();
-        stats.prefix_entries = self.prefix_prompts.lock().expect("prefix cache lock").len() as u64;
         let sessions = self.sessions.lock().expect("session cache lock");
         stats.session_entries = sessions.len() as u64;
         stats.session_tokens = sessions
@@ -833,39 +766,10 @@ impl CacheRuntimeState {
         engine_prefix_cache: Option<&serde_json::Value>,
     ) -> serde_json::Value {
         let stats = self.stats();
-        let prefix_hits = engine_u64(engine_prefix_cache, "hits").unwrap_or(stats.prefix_hits);
-        let prefix_misses =
-            engine_u64(engine_prefix_cache, "misses").unwrap_or(stats.prefix_misses);
-        let prefix_evictions =
-            engine_u64(engine_prefix_cache, "evictions").unwrap_or(stats.prefix_evictions);
-        let prefix_saved = engine_u64(engine_prefix_cache, "saved_prefill_tokens")
-            .unwrap_or(stats.prefix_saved_prefill_tokens);
-        let prefix_entries =
-            engine_u64(engine_prefix_cache, "entries").unwrap_or(stats.prefix_entries);
-        let prefix_bytes = engine_u64(engine_prefix_cache, "bytes").unwrap_or(stats.prefix_bytes);
-        let mut prefix_cache = serde_json::json!({
-            "enabled": engine_bool(engine_prefix_cache, "enabled").unwrap_or(policy.prefix_cache_enabled),
-            "position": engine_str(engine_prefix_cache, "position").unwrap_or("product-observability"),
-            "source": engine_str(engine_prefix_cache, "source").unwrap_or("server-prompt-lcp-observability"),
-            "entries": prefix_entries,
-            "hits": prefix_hits,
-            "misses": prefix_misses,
-            "evictions": prefix_evictions,
-            "saved_prefill_tokens": prefix_saved,
-            "bytes": prefix_bytes,
-            "block_size": engine_u64(engine_prefix_cache, "block_size"),
-            "kv_dtype": engine_str(engine_prefix_cache, "kv_dtype"),
-        });
-        if let (Some(engine), Some(prefix)) = (
-            engine_prefix_cache.and_then(|value| value.as_object()),
-            prefix_cache.as_object_mut(),
-        ) {
-            for (key, value) in engine {
-                prefix.entry(key.clone()).or_insert_with(|| value.clone());
-            }
-        }
+        // Only the execution owner can observe physical KV reuse. Preserve its
+        // snapshot, including absent or null fields, without text-based estimates.
         serde_json::json!({
-            "prefix_cache": prefix_cache,
+            "prefix_cache": engine_prefix_cache,
             "session_cache": {
                 "mode": policy.session_cache_mode,
                 "entries": stats.session_entries,
@@ -881,55 +785,42 @@ impl CacheRuntimeState {
 
     fn prometheus_metrics(&self, engine_prefix_cache: Option<&serde_json::Value>) -> String {
         let stats = self.stats();
-        let prefix_hits = engine_u64(engine_prefix_cache, "hits").unwrap_or(stats.prefix_hits);
-        let prefix_misses =
-            engine_u64(engine_prefix_cache, "misses").unwrap_or(stats.prefix_misses);
-        let prefix_evictions =
-            engine_u64(engine_prefix_cache, "evictions").unwrap_or(stats.prefix_evictions);
-        let prefix_saved = engine_u64(engine_prefix_cache, "saved_prefill_tokens")
-            .unwrap_or(stats.prefix_saved_prefill_tokens);
-        let prefix_entries =
-            engine_u64(engine_prefix_cache, "entries").unwrap_or(stats.prefix_entries);
-        let prefix_bytes = engine_u64(engine_prefix_cache, "bytes").unwrap_or(stats.prefix_bytes);
-        format!(
+        let mut output = String::new();
+        for (field, metric) in [
+            ("hits", "ferrum_prefix_cache_hits_total"),
+            ("misses", "ferrum_prefix_cache_misses_total"),
+            ("evictions", "ferrum_prefix_cache_evictions_total"),
+            (
+                "saved_prefill_tokens",
+                "ferrum_prefix_cache_saved_prefill_tokens_total",
+            ),
+            ("entries", "ferrum_prefix_cache_entries"),
+            ("bytes", "ferrum_prefix_cache_bytes"),
+        ] {
+            if let Some(value) = engine_u64(engine_prefix_cache, field) {
+                output.push_str(&format!("{metric} {value}\n"));
+            }
+        }
+        output.push_str(&format!(
             concat!(
-                "ferrum_prefix_cache_hits_total {}\n",
-                "ferrum_prefix_cache_misses_total {}\n",
-                "ferrum_prefix_cache_evictions_total {}\n",
-                "ferrum_prefix_cache_saved_prefill_tokens_total {}\n",
-                "ferrum_prefix_cache_entries {}\n",
-                "ferrum_prefix_cache_bytes {}\n",
                 "ferrum_session_cache_hits_total {}\n",
                 "ferrum_session_cache_misses_total {}\n",
                 "ferrum_session_cache_evictions_total {}\n",
                 "ferrum_session_cache_entries {}\n",
                 "ferrum_session_cache_tokens {}\n"
             ),
-            prefix_hits,
-            prefix_misses,
-            prefix_evictions,
-            prefix_saved,
-            prefix_entries,
-            prefix_bytes,
             stats.session_hits,
             stats.session_misses,
             stats.session_evictions,
             stats.session_entries,
             stats.session_tokens,
-        )
+        ));
+        output
     }
 }
 
 fn engine_u64(snapshot: Option<&serde_json::Value>, key: &str) -> Option<u64> {
     snapshot?.get(key)?.as_u64()
-}
-
-fn engine_bool(snapshot: Option<&serde_json::Value>, key: &str) -> Option<bool> {
-    snapshot?.get(key)?.as_bool()
-}
-
-fn engine_str<'a>(snapshot: Option<&'a serde_json::Value>, key: &str) -> Option<&'a str> {
-    snapshot?.get(key)?.as_str()
 }
 
 fn auto_config_health_value(auto_config: Option<&ResolvedFerrumConfig>) -> serde_json::Value {
@@ -1165,10 +1056,6 @@ fn approx_tokens(text: &str) -> usize {
 
 fn approx_tokens_for_chars(chars: usize) -> usize {
     (chars / 4).max(1)
-}
-
-fn longest_common_prefix_chars(a: &str, b: &str) -> usize {
-    a.chars().zip(b.chars()).take_while(|(a, b)| a == b).count()
 }
 
 fn trim_messages_to_token_budget(messages: &mut Vec<SessionMessage>, max_tokens: usize) {
@@ -1408,7 +1295,6 @@ async fn chat_completions_handler_with_projection(
     inference_request
         .evidence_request
         .capture_engine_token_timing = state.profile_detail.captures_engine_token_timing();
-    state.record_prefix_prompt(&inference_request.prompt, &cache_policy);
     if let Err(err) =
         write_chat_request_replay_bundle(&state, &headers, &request, &inference_request)
     {
@@ -5193,9 +5079,9 @@ mod tests {
     use ferrum_interfaces::engine::{InferenceEngine, LlmInferenceEngine};
     use ferrum_types::{
         has_unclosed_thinking_block, parse_reasoning_response_started_in_think, EngineConfig,
-        EngineMetrics, EngineStatus, EngineTokenTimingEvidence, FinishReason,
-        HealthStatus as EngineHealthStatus, InferenceRequest, InferenceResponse, MemoryUsage,
-        ModelId, StreamChunk, TokenId, TokenUsage,
+        EngineMetrics, EngineStatus, EngineTokenTimingEvidence, ExecutionResourceAuthority,
+        FinishReason, HealthStatus as EngineHealthStatus, InferenceRequest, InferenceResponse,
+        MemoryUsage, ModelId, StreamChunk, TokenId, TokenUsage,
     };
     use futures::{stream, Stream};
     use serde_json::{json, Value};
@@ -5333,6 +5219,7 @@ mod tests {
         api_response: Option<ferrum_types::ApiResponse>,
         finish_reason: FinishReason,
         execution_attribution: Option<Value>,
+        cache_metrics: Option<Value>,
         lora_metrics: Option<Value>,
         pending_stream_drop_notify: Option<Arc<Notify>>,
         stream_after_first_gate: Option<Arc<StreamGate>>,
@@ -5358,6 +5245,7 @@ mod tests {
                 api_response: None,
                 finish_reason: FinishReason::EOS,
                 execution_attribution: None,
+                cache_metrics: None,
                 lora_metrics: None,
                 pending_stream_drop_notify: None,
                 stream_after_first_gate: None,
@@ -5605,6 +5493,10 @@ mod tests {
 
     #[async_trait]
     impl InferenceEngine for StubLlm {
+        fn cache_metrics_snapshot(&self) -> Option<Value> {
+            self.cache_metrics.clone()
+        }
+
         async fn status(&self) -> EngineStatus {
             EngineStatus {
                 is_ready: true,
@@ -13503,65 +13395,49 @@ mod tests {
         }
     }
 
-    #[test]
-    fn server_prefix_prompt_observation_follows_engine_authority() {
-        let policy = CachePolicy {
-            prefix_cache_enabled: true,
-            session_cache_mode: "off".to_string(),
-            session_cache_max_entries: 128,
-            session_cache_max_tokens: 4096,
-        };
+    #[tokio::test]
+    async fn route_overlapping_prompts_without_owner_leave_prefix_metrics_unavailable() {
         for authority in [
             ExecutionResourceAuthority::PlanRuntime,
             ExecutionResourceAuthority::LegacyEngine,
         ] {
-            let engine = StubLlm {
+            let engine = Arc::new(StubLlm {
                 resource_authority: authority,
                 ..StubLlm::new("ok")
-            };
-            // There is deliberately no cache metrics snapshot. Native authority
-            // alone must skip the text fallback, including unsupported plans.
+            });
             assert!(engine.cache_metrics_snapshot().is_none());
-            let state = AppState::default().with_llm(Arc::new(engine));
-            state.record_prefix_prompt("alpha beta gamma", &policy);
-            state.record_prefix_prompt("alpha beta delta", &policy);
-            let stats = state.cache.stats();
-            let prompts = state.cache.prefix_prompts.lock().unwrap();
-            match authority {
-                ExecutionResourceAuthority::PlanRuntime => {
-                    assert!(prompts.is_empty());
-                    assert_eq!(stats.prefix_entries, 0);
-                    assert_eq!(stats.prefix_bytes, 0);
-                    assert_eq!(stats.prefix_hits, 0);
-                    assert_eq!(stats.prefix_misses, 0);
-                    assert_eq!(stats.prefix_saved_prefill_tokens, 0);
-                }
-                ExecutionResourceAuthority::LegacyEngine => {
-                    assert_eq!(prompts.len(), 2);
-                    assert!(prompts.contains_key("alpha beta gamma"));
-                    assert!(prompts.contains_key("alpha beta delta"));
-                    assert_eq!(stats.prefix_entries, 2);
-                    assert_eq!(stats.prefix_bytes, 32);
-                    assert_eq!(stats.prefix_hits, 1);
-                    assert_eq!(stats.prefix_misses, 1);
-                    assert!(stats.prefix_saved_prefill_tokens > 0);
-                }
+            let state = AppState::default().with_llm(engine.clone());
+            let cache = state.cache.clone();
+            let router = AxumServer::from_state(state).build_router().unwrap();
+            for prompt in ["alpha beta gamma", "alpha beta delta"] {
+                let response = post_json(
+                    router.clone(),
+                    "/v1/chat/completions",
+                    json!({
+                        "model": "stub-model",
+                        "messages": [{"role": "user", "content": prompt}],
+                    }),
+                )
+                .await;
+                assert_eq!(response.status(), AxumStatusCode::OK);
+                let body = response_json(response).await;
+                assert_eq!(body["choices"][0]["message"]["content"], "ok");
             }
+
+            let health = response_json(get(router.clone(), "/health").await).await;
+            assert_eq!(health["status"], "healthy");
+            assert_eq!(health["cache"]["prefix_cache"], Value::Null);
+            assert_eq!(health["cache"]["session_cache"]["entries"], 0);
+            assert!(cache.sessions.lock().unwrap().is_empty());
+            assert_eq!(engine.output_budget.usage().sessions, 0);
+            let metrics = response_text(get(router, "/metrics").await).await;
+            assert!(!metrics.contains("ferrum_prefix_cache_"), "{metrics}");
+            assert!(metrics.contains("ferrum_session_cache_entries 0\n"));
         }
     }
 
-    #[test]
-    fn cache_metrics_use_engine_real_kv_snapshot_when_available() {
-        let cache = CacheRuntimeState::default();
-        let policy = CachePolicy {
-            prefix_cache_enabled: true,
-            session_cache_mode: "memory".to_string(),
-            session_cache_max_entries: 128,
-            session_cache_max_tokens: 4096,
-        };
-        cache.record_prefix_prompt("alpha beta gamma", &policy);
-        cache.record_prefix_prompt("alpha beta delta", &policy);
-
+    #[tokio::test]
+    async fn route_cache_metrics_preserve_owner_snapshot() {
         let engine_snapshot = json!({
             "position": "real-kv-reuse",
             "source": "llama-family-paged-block-prefix-cache",
@@ -13578,29 +13454,49 @@ mod tests {
             "selected_stage_bridge": "host",
             "stage_count": 2,
         });
+        let router = AxumServer::from_llm(Arc::new(StubLlm {
+            cache_metrics: Some(engine_snapshot.clone()),
+            ..StubLlm::new("ok")
+        }))
+        .build_router()
+        .unwrap();
+        let health = response_json(get(router.clone(), "/health").await).await;
+        assert_eq!(health["status"], "healthy");
+        assert_eq!(health["cache"]["prefix_cache"], engine_snapshot);
 
-        let health = cache.health_json(&policy, Some(&engine_snapshot));
-        let prefix = &health["prefix_cache"];
-        assert_eq!(prefix["position"], "real-kv-reuse");
-        assert_eq!(prefix["source"], "llama-family-paged-block-prefix-cache");
-        assert_eq!(prefix["hits"], 7);
-        assert_eq!(prefix["misses"], 3);
-        assert_eq!(prefix["evictions"], 1);
-        assert_eq!(prefix["saved_prefill_tokens"], 64);
-        assert_eq!(prefix["entries"], 5);
-        assert_eq!(prefix["bytes"], 8192);
-        assert_eq!(prefix["block_size"], 16);
-        assert_eq!(prefix["kv_dtype"], "fp16");
-        assert_eq!(prefix["selected_pipeline_mode"], "batch");
-        assert_eq!(prefix["selected_stage_bridge"], "host");
-        assert_eq!(prefix["stage_count"], 2);
-
-        let metrics = cache.prometheus_metrics(Some(&engine_snapshot));
+        let metrics = response_text(get(router, "/metrics").await).await;
         assert!(metrics.contains("ferrum_prefix_cache_hits_total 7\n"));
         assert!(metrics.contains("ferrum_prefix_cache_misses_total 3\n"));
+        assert!(metrics.contains("ferrum_prefix_cache_evictions_total 1\n"));
         assert!(metrics.contains("ferrum_prefix_cache_saved_prefill_tokens_total 64\n"));
         assert!(metrics.contains("ferrum_prefix_cache_entries 5\n"));
         assert!(metrics.contains("ferrum_prefix_cache_bytes 8192\n"));
+    }
+
+    #[tokio::test]
+    async fn route_cache_metrics_preserve_partial_owner_snapshot_without_filling_gaps() {
+        let engine_snapshot = json!({
+            "source": "test-owner",
+            "enabled": false,
+            "hits": 0,
+            "bytes": null,
+            "reason": "cache disabled",
+        });
+        let router = AxumServer::from_llm(Arc::new(StubLlm {
+            cache_metrics: Some(engine_snapshot.clone()),
+            ..StubLlm::new("ok")
+        }))
+        .build_router()
+        .unwrap();
+        let health = response_json(get(router.clone(), "/health").await).await;
+        assert_eq!(health["status"], "healthy");
+        assert_eq!(health["cache"]["prefix_cache"], engine_snapshot);
+        let metrics = response_text(get(router, "/metrics").await).await;
+        let prefix_metrics: Vec<_> = metrics
+            .lines()
+            .filter(|line| line.starts_with("ferrum_prefix_cache_"))
+            .collect();
+        assert_eq!(prefix_metrics, ["ferrum_prefix_cache_hits_total 0"]);
     }
 
     #[tokio::test]

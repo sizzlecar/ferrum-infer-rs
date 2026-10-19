@@ -18,7 +18,7 @@ Flags map to runtime config entries and appear in `--effective-config-json`:
 
 | Flag | Runtime key |
 |---|---|
-| `--enable-prefix-cache` | `FERRUM_PREFIX_CACHE_REQUESTED=1`, `FERRUM_PREFIX_CACHE_PRODUCT=1`, `FERRUM_PREFIX_CACHE=1` |
+| `--enable-prefix-cache` | `FERRUM_PREFIX_CACHE=1` |
 | `--disable-prefix-cache` | `FERRUM_PREFIX_CACHE=0` |
 | `--session-cache off` | `FERRUM_SESSION_CACHE=off` |
 | `--session-cache memory` | `FERRUM_SESSION_CACHE=memory` |
@@ -28,11 +28,10 @@ Flags map to runtime config entries and appear in `--effective-config-json`:
 The vLLM-compatible `--enable-prefix-caching` and
 `--no-enable-prefix-caching` flags remain supported aliases for migration.
 
-Correctness is prioritized over raw cache speed. `FERRUM_PREFIX_CACHE=1` enables
-model-level paged-KV prefix reuse on supported decoder models. `/health` labels
-those metrics with `position=real-kv-reuse`; unsupported or disabled paths fall
-back to product-level prompt observability while preserving the same health and
-metrics contract.
+Prefix reuse requires a supported model execution path. Cache observations come
+from the execution owner; requesting caching or observing overlapping prompt text
+does not prove that KV state was reused. The server does not retain prompts or
+estimate saved prefill work for prefix metrics.
 
 ## Session API
 
@@ -58,7 +57,7 @@ Rules:
 
 ## Observability
 
-`/health` includes:
+When the execution owner supplies a prefix snapshot, `/health` preserves it:
 
 ```json
 {
@@ -75,7 +74,12 @@ Rules:
 }
 ```
 
-`/metrics` always includes the G3 cache metrics:
+Without an owner snapshot, `cache.prefix_cache` is `null`; this alone does not
+make the server unhealthy. Partial snapshots preserve missing and null fields.
+
+`/metrics` emits each prefix series only when the owner supplies its unsigned
+integer value, including a measured zero. Unavailable values are omitted.
+Session series remain available independently:
 
 ```text
 ferrum_prefix_cache_hits_total
@@ -102,4 +106,4 @@ schema responses, tool calls, or session isolation. G3 gates verify:
 - required tool calls remain OpenAI-shaped with prefix cache enabled
 - same-session history can be reused when the caller opts in
 - different sessions do not leak secrets
-- disabled prefix cache leaves hit counters at zero
+- unavailable prefix observations remain null or omitted; measured zeros stay zero

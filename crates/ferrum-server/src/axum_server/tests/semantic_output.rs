@@ -243,7 +243,6 @@ fn http_semantic_session_history_shares_original_owner_until_last_reference() {
     let charged = session.semantic_usage();
     let cache = CacheRuntimeState::default();
     let policy = CachePolicy {
-        prefix_cache_enabled: false,
         session_cache_mode: "memory".into(),
         session_cache_max_entries: 2,
         session_cache_max_tokens: 4096,
