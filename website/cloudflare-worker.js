@@ -140,9 +140,9 @@ const pages = {
     alternatePath: "/zh/",
     alternateLabel: "中文",
     title: "Ferrum — Rust LLM inference",
-    description: "Local LLM inference and an OpenAI-compatible server in one Rust binary. Ferrum 0.13.0 is available.",
+    description: "Local LLM inference and an OpenAI-compatible server in one Rust binary. Ferrum 0.14.0 unifies the execution architecture.",
     nav: [["Quick start", "#quick-start"], ["Supported scope", "#support"], ["Throughput", "#performance"], ["Project", "#project"]],
-    eyebrow: "v0.13.0 · Released",
+    eyebrow: "v0.14.0 · Released",
     h1: "Local LLMs.<br>One Rust binary.",
     lead: "Terminal chat and an OpenAI-compatible API, without a Python runtime.",
     goal: "Goal: maximize output throughput while meeting TTFT, TPOT and ITL SLOs.",
@@ -153,7 +153,7 @@ const pages = {
       'L_k is the latency sample distribution, Q_p_k its chosen quantile, and S_k its upper limit. TTFT includes queueing; missing latency does not count as meeting its SLO. <a href="https://github.com/sizzlecar/ferrum-infer-rs/blob/main/docs/performance-popular-models-p0.zh.md">Sampling rules</a>.',
       "C is the fraction of W successfully completed by the cutoff; its denominator includes rejected, failed, timed-out and unfinished requests. Declare p_k, S_k and 0 < ρ ≤ 1 before measuring.",
     ],
-    primary: "Install 0.13.0",
+    primary: "Install 0.14.0",
     secondary: "View on GitHub",
     quickTitle: "Install and run",
     installTitle: "Installation commands",
@@ -173,7 +173,7 @@ const pages = {
       ["Weights", "GGUF, including Q4_K/Q5_K/Q6_K/Q8_0; SafeTensors. Selected CUDA paths: GPTQ INT4, compressed-tensors INT4, block-FP8."],
       ["Specific paths", "Gemma 4 compressed-tensors W4A16 and GPT-OSS MXFP4: CUDA. PQ2_0: complete-model validation on Metal; CUDA operator coverage only."],
     ],
-    supportNote: 'Support varies by architecture, format and backend. CPU is a compatibility backend; text support does not imply vision support. <a href="https://github.com/sizzlecar/ferrum-infer-rs/blob/main/docs/release-regression-catalog.md">Validation scope</a>.',
+    supportNote: 'Support varies by architecture, format and backend. CPU is a compatibility backend; text support does not imply vision support. Embedding, ASR and TTS APIs were removed in 0.14.0. <a href="https://github.com/sizzlecar/ferrum-infer-rs/releases/tag/v0.14.0">Release notes</a> · <a href="https://github.com/sizzlecar/ferrum-infer-rs/blob/main/docs/release-regression-catalog.md">Validation scope</a>.',
     performanceTitle: "Recent 27B throughput",
     performanceLead: "RTX 5090 · Qwen3.8-27B · frozen ShareGPT workload. Accepted 0.13 candidate measurements: fixed 32 slots, context/batch 2048; 200 requests × 2 repeats per cell, 8 warmups per repeat, zero protocol errors. These tables fix the request count and use each repeat’s actual elapsed time, rather than a fixed window. Output tok/s = total output tokens / total measured time; C in the tables is client concurrency.",
     ggufCaption: "GGUF Q4_K_M · same weights",
@@ -185,7 +185,7 @@ const pages = {
     projectBody: "Ferrum uses AI-assisted development and iterates quickly. Internal APIs may change; model coverage and performance evolve. Quality remains a priority through correctness checks, model validation and honest reporting of failures. Personal GPU resources are limited; hardware access and contributions are welcome.",
     attribution: 'Thanks to <a href="https://github.com/vllm-project/vllm">vLLM</a> and <a href="https://github.com/ggml-org/llama.cpp">llama.cpp</a> for code and implementation references. Component licenses and notices are preserved.',
     docsLabel: "Documentation",
-    releaseLabel: "0.13.0 release",
+    releaseLabel: "0.14.0 release",
     footer: "Ferrum · MIT licensed",
   },
   zh: {
@@ -194,9 +194,9 @@ const pages = {
     alternatePath: "/",
     alternateLabel: "English",
     title: "Ferrum — Rust 大模型推理",
-    description: "一个 Rust 二进制提供本地大模型推理与 OpenAI 兼容 API。Ferrum 0.13.0 已发布。",
+    description: "一个 Rust 二进制提供本地大模型推理与 OpenAI 兼容 API。Ferrum 0.14.0 统一执行架构。",
     nav: [["快速开始", "#quick-start"], ["支持范围", "#support"], ["吞吐结果", "#performance"], ["项目说明", "#project"]],
-    eyebrow: "v0.13.0 · 已发布",
+    eyebrow: "v0.14.0 · 已发布",
     h1: "本地推理，<br>一个 Rust 二进制。",
     lead: "终端对话与 OpenAI 兼容 API，无需 Python 运行时。",
     goal: "目标：在满足 TTFT、TPOT、ITL SLO 的前提下，最大化输出吞吐。",
@@ -207,7 +207,7 @@ const pages = {
       'L_k 为延迟采样分布，Q_p_k 为指定分位数，S_k 为上限。TTFT 包含排队；缺失延迟不视为达标。<a href="https://github.com/sizzlecar/ferrum-infer-rs/blob/main/docs/performance-popular-models-p0.zh.md">采样规则</a>。',
       "C 为同一 W 在截止前成功完成的比例，分母包含拒绝、失败、超时和未完成请求；p_k、S_k 与 0 < ρ ≤ 1 均须预先给定。",
     ],
-    primary: "安装 0.13.0",
+    primary: "安装 0.14.0",
     secondary: "查看 GitHub",
     quickTitle: "安装与使用",
     installTitle: "安装命令",
@@ -227,7 +227,7 @@ const pages = {
       ["权重格式", "GGUF（含 Q4_K/Q5_K/Q6_K/Q8_0）、SafeTensors。部分 CUDA 路径支持 GPTQ INT4、compressed-tensors INT4、block-FP8。"],
       ["专用路径", "Gemma 4 compressed-tensors W4A16、GPT-OSS MXFP4 为 CUDA 路径。PQ2_0 完整模型仅在 Metal 实测，CUDA 目前为算子级验证。"],
     ],
-    supportNote: '支持范围取决于架构、格式与后端组合。CPU 为兼容后端，文本支持不代表视觉支持。<a href="https://github.com/sizzlecar/ferrum-infer-rs/blob/main/docs/release-regression-catalog.md">验证范围</a>。',
+    supportNote: '支持范围取决于架构、格式与后端组合。CPU 为兼容后端，文本支持不代表视觉支持。0.14.0 已移除 embedding、ASR 和 TTS API。<a href="https://github.com/sizzlecar/ferrum-infer-rs/releases/tag/v0.14.0">发布说明</a> · <a href="https://github.com/sizzlecar/ferrum-infer-rs/blob/main/docs/release-regression-catalog.md">验证范围</a>。',
     performanceTitle: "近期 27B 吞吐",
     performanceLead: "RTX 5090 · Qwen3.8-27B · 冻结 ShareGPT 负载。已验收的 0.13 候选测量：固定 32 槽、上下文/批处理 2048；每格正式 200 请求 × 2 轮，每轮另有 8 次预热，零协议错误。本表固定请求数，以各轮实际耗时计算吞吐，不采用固定窗口。输出 token/s＝总输出 token / 总正式时长；表中 C 为客户端并发。",
     ggufCaption: "GGUF Q4_K_M · 同权重",
@@ -239,7 +239,7 @@ const pages = {
     projectBody: "Ferrum 使用 AI 辅助开发，仍在快速迭代。内部 API 暂不承诺稳定，模型支持与性能持续更新。质量始终重要：保留正确性检查、模型验证并如实报告失败。个人 GPU 资源有限，欢迎提供硬件测试支持和贡献。",
     attribution: '感谢 <a href="https://github.com/vllm-project/vllm">vLLM</a> 与 <a href="https://github.com/ggml-org/llama.cpp">llama.cpp</a>，部分实现参考或复用了其代码；相关许可证与署名随组件保留。',
     docsLabel: "文档",
-    releaseLabel: "0.13.0 发布说明",
+    releaseLabel: "0.14.0 发布说明",
     footer: "Ferrum · MIT 开源",
   },
 };
@@ -262,7 +262,7 @@ function render(page) {
     name: "Ferrum",
     applicationCategory: "DeveloperApplication",
     operatingSystem: "macOS, Linux, Windows",
-    softwareVersion: "0.13.0",
+    softwareVersion: "0.14.0",
     description: page.description,
     url: canonical,
     codeRepository: REPOSITORY,
@@ -313,7 +313,7 @@ function render(page) {
   </div></nav>
   <main>
     <header><div class="wrap">
-      <a class="eyebrow" href="${REPOSITORY}/releases/tag/v0.13.0">${page.eyebrow}</a>
+      <a class="eyebrow" href="${REPOSITORY}/releases/tag/v0.14.0">${page.eyebrow}</a>
       <h1>${page.h1}</h1>
       <p class="hero-copy">${page.lead}</p>
       <div class="objective">
@@ -357,7 +357,7 @@ function render(page) {
       <div class="section-head"><h2>${page.projectTitle}</h2></div>
       <p>${page.projectBody}</p>
       <p class="muted">${page.attribution}</p>
-      <div class="actions"><a class="button" href="${REPOSITORY}${page.lang === "en" ? "#readme" : "/blob/main/README_zh.md"}">${page.docsLabel}</a><a class="button" href="${REPOSITORY}/releases/tag/v0.13.0">${page.releaseLabel}</a></div>
+      <div class="actions"><a class="button" href="${REPOSITORY}${page.lang === "en" ? "#readme" : "/blob/main/README_zh.md"}">${page.docsLabel}</a><a class="button" href="${REPOSITORY}/releases/tag/v0.14.0">${page.releaseLabel}</a></div>
     </div></section>
   </main>
   <footer><div class="wrap footer-inner"><span>${page.footer}</span><span><a href="${REPOSITORY}">GitHub</a> · <a href="${REPOSITORY}/blob/main/LICENSE">MIT License</a></span></div></footer>
