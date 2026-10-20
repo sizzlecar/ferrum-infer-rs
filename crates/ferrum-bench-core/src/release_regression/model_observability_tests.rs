@@ -134,6 +134,48 @@ pub(crate) fn report_fixture(
 }
 
 #[test]
+fn physical_close_and_terminal_output_can_finish_in_either_order() {
+    for entrypoint in [
+        Entrypoint::Run,
+        Entrypoint::ServeSync,
+        Entrypoint::ServeStream,
+    ] {
+        let evidence = fixture(entrypoint);
+        for order in [
+            [0, 1, 2],
+            [0, 2, 1],
+            [1, 0, 2],
+            [1, 2, 0],
+            [2, 0, 1],
+            [2, 1, 0],
+        ] {
+            let mut reordered = evidence.clone();
+            reordered.events = order.map(|index| evidence.events[index].clone()).into();
+            assert_eq!(
+                verify(&reordered, Backend::Cpu, &[entrypoint], 32).is_ok(),
+                order[0] == 0,
+                "{entrypoint:?}: {order:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn journal_readiness_waits_for_both_completion_facts_of_the_same_request() {
+    let evidence = fixture(Entrypoint::ServeStream);
+    let id = &evidence.requests[0].request_id;
+    for order in [[0, 1, 2], [0, 2, 1]] {
+        let events = order.map(|index| evidence.events[index].clone());
+        assert!(!lifecycle_is_persisted(&events[..1], id));
+        assert!(!lifecycle_is_persisted(&events[..2], id));
+        assert!(lifecycle_is_persisted(&events, id));
+        let mut unrelated = events;
+        unrelated[2].request_id = "another-request".into();
+        assert!(!lifecycle_is_persisted(&unrelated, id));
+    }
+}
+
+#[test]
 fn runtime_observations_require_correlated_output_usage_and_closed_ownership() {
     let good = fixture(Entrypoint::Run);
     verify(&good, Backend::Cpu, &[Entrypoint::Run], 32).unwrap();
@@ -170,6 +212,19 @@ fn runtime_observations_require_correlated_output_usage_and_closed_ownership() {
         },
         |e| {
             e.events[1].status = ProfileStatus::Failure;
+        },
+        |e| {
+            e.events[1].model = Some("another/model".into());
+        },
+        |e| {
+            e.events[1]
+                .attributes
+                .insert("finish_reason".into(), json!("error"));
+        },
+        |e| {
+            e.events[2]
+                .attributes
+                .insert("resource_close_error".into(), json!("close failed"));
         },
         |e| {
             e.events.swap(0, 2);

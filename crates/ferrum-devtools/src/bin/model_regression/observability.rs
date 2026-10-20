@@ -1,15 +1,19 @@
 use super::*;
 use ferrum_bench_core::release_regression::{
-    model_observability::{verify, ObservabilityEvidence, ObservedRequest},
+    model_observability::{lifecycle_is_persisted, verify, ObservabilityEvidence, ObservedRequest},
     Backend, Entrypoint,
 };
 use ferrum_types::FerrumProfileEvent;
 use std::{fs, path::Path, time::Instant};
 
 fn read_events(path: &Path) -> Result<Vec<FerrumProfileEvent>> {
-    fs::read_to_string(path)
-        .with_context(|| format!("read actual journal {}", path.display()))?
-        .lines()
+    let text = fs::read_to_string(path)
+        .with_context(|| format!("read actual journal {}", path.display()))?;
+    parse_events(&text)
+}
+
+fn parse_events(text: &str) -> Result<Vec<FerrumProfileEvent>> {
+    text.lines()
         .filter(|line| !line.trim().is_empty())
         .map(|line| serde_json::from_str(line).context("parse actual scheduler journal event"))
         .collect()
@@ -88,24 +92,26 @@ pub(crate) async fn serve_observability(server: &Server<'_>) -> Result<Value> {
         });
     }
     // HTTP completion can precede the asynchronous journal's flush. Wait for
-    // these actual requests to close; do not assume a sleep proves persistence.
+    // both physical close and final output evidence; neither establishes that
+    // the other has already been persisted.
     let path = server.args.report_dir.join("serve.scheduler.jsonl");
     let start = Instant::now();
     let events = loop {
         let text = fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
         if text.ends_with('\n') {
-            let events = read_events(&path)?;
-            if requests.iter().all(|request| {
-                events.iter().any(|event| {
-                    event.request_id == request.request_id && event.phase == "engine_request_close"
-                })
-            }) {
+            // Parse the same complete snapshot checked above, rather than
+            // re-reading while the writer may be appending another JSON line.
+            let events = parse_events(&text)?;
+            if requests
+                .iter()
+                .all(|request| lifecycle_is_persisted(&events, &request.request_id))
+            {
                 break events;
             }
         }
         ensure!(
             start.elapsed() < Duration::from_secs(server.args.request_timeout_secs),
-            "request closure was not persisted before the observation deadline"
+            "request lifecycle was not persisted before the observation deadline"
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
     };

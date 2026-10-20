@@ -24,6 +24,23 @@ pub struct ObservabilityEvidence {
     pub events: Vec<FerrumProfileEvent>,
 }
 
+const LIFECYCLE_PHASES: [&str; 3] = [
+    "engine_request_open",
+    "engine_sequence_terminal_evidence",
+    "engine_request_close",
+];
+
+/// Journal readiness only: callers must still verify identity, ordering,
+/// uniqueness, output and ownership. Neither close nor terminal alone implies
+/// that the asynchronous writer has persisted the other completion fact.
+pub fn lifecycle_is_persisted(events: &[FerrumProfileEvent], request_id: &str) -> bool {
+    LIFECYCLE_PHASES.iter().all(|phase| {
+        events
+            .iter()
+            .any(|event| event.request_id == request_id && event.phase == *phase)
+    })
+}
+
 pub fn verify(
     evidence: &ObservabilityEvidence,
     backend: Backend,
@@ -67,11 +84,7 @@ pub fn verify(
             return Err("observability output token usage is inconsistent".into());
         }
         let mut phases = Vec::new();
-        for phase in [
-            "engine_request_open",
-            "engine_sequence_terminal_evidence",
-            "engine_request_close",
-        ] {
+        for phase in LIFECYCLE_PHASES {
             let matching: Vec<_> = evidence
                 .events
                 .iter()
@@ -113,14 +126,20 @@ pub fn verify(
             }
             phases.push((*position, *event));
         }
-        if !(phases[0].0 < phases[1].0 && phases[1].0 < phases[2].0)
-            || phases
-                .iter()
-                .any(|(_, event)| event.model != phases[0].1.model)
-        {
+        // Physical request-slot retirement and final output evidence have
+        // separate lifetimes. Close may precede terminal evidence when the
+        // output path first absorbs the close result, or follow it while an
+        // execution is still held. Both must follow the same request's open.
+        if !(phases[0].0 < phases[1].0 && phases[0].0 < phases[2].0) {
             return Err(
-                "observed lifecycle order or model identity changed inside a request".into(),
+                "observed terminal evidence or resource close precedes request open".into(),
             );
+        }
+        if phases
+            .iter()
+            .any(|(_, event)| event.model != phases[0].1.model)
+        {
+            return Err("observed model identity changed inside a request".into());
         }
         let terminal = phases[1].1;
         for (event, action) in [
