@@ -65,7 +65,7 @@ ferrum serve --model qwen3.5:4b-q4_k_m --served-model-name ferrum --disable-thin
 
 并非任意架构、格式和设备组合都受支持，也不由文本支持推断视觉能力；范围见[回归目录](docs/release-regression-catalog.md)。
 
-本次架构更新退役 embedding、ASR、TTS 入口及旧执行 API，升级见[迁移说明](docs/goal-architecture-refactor.zh.md)。
+本次架构更新退役 embedding、ASR、TTS 入口及旧执行 API，升级见[迁移说明](https://github.com/sizzlecar/ferrum-infer-rs/pull/441)。
 
 默认执行策略按设备、算子能力和容量选择；合资格的 SM120 GGUF 路径可采用 8 位激活量化及整数点积，数值路径或批布局可能改变输出。`--numerical-profile qwen3_5.f32-master` 保留原混合精度参考路径，见[数值执行策略](docs/numerical-execution.zh.md)与[缓存说明](docs/cache-product.md)。
 

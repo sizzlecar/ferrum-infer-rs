@@ -65,7 +65,7 @@ Defaults adapt execution and capacity to capabilities, hardware and memory; expl
 
 Support varies by combination; CPU is a compatibility backend. See [validation scope](docs/release-regression-catalog.md).
 
-This architecture update retires embedding, ASR, TTS and legacy execution APIs. See [migration notes](docs/goal-architecture-refactor.zh.md).
+This architecture update retires embedding, ASR, TTS and legacy execution APIs. See [migration notes](https://github.com/sizzlecar/ferrum-infer-rs/pull/441).
 
 ## Recent throughput
 

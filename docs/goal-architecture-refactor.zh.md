@@ -1,10 +1,8 @@
 # Goal：统一执行架构，为 SLO 优化建立可靠基础
 
-**状态：核心架构迁移与 SLO 最小闭环已验证，正在完成 R5 默认性能、设备内存及主线交付。** 工作分支：`refactor/execution-architecture-20261018`，从干净 `main`（`c2be4c67`）开始，PR #441 待合并；原工作区的旧 SLO 实现不作为代码基底。
+**状态：目标已激活，R0 已合并，R1 实施中。** 工作分支：`refactor/execution-architecture-20261018`，从 2026-10-18 的干净 `main`（`c2be4c67`）开始。首个 checkpoint 退役独立 embedding/ASR/TTS 链路；原工作区未合并的旧 SLO 实现不作为代码基底。
 
-R0 六批退役与修复已合并（PR #429–#434）。执行契约、runtime、受管驱动、输出及生产日志已分责，旧控制流和重复资源管理已退出。原实例的构建失败、执行、取消与关闭，以及真实 CPU mixed 执行和 Metal 前缀恢复闭环均已验证；必需 CI 检查通过。27B GGUF 在两种受控布局下新旧版本完整生成一致，不据此宣称历史 HTTP 差异已唯一归因或任意调度顺序输出不变。
-
-当前候选的 CUDA 27B GGUF/CT C32 新鲜同窗对照通过相对吞吐、延迟和采样设备内存预算；CT C8 的既有资格按原证据范围保留。Metal C8 新鲜对照通过客户端相对吞吐和延迟预算，设备内存 A/B 及 C4 延迟波动仍待收尾。CUDA C32 两臂的绝对延迟 SLO 均未达标，Metal 未声明有限绝对 SLO。双物理 GPU 仍未实测，Metal 计时计数器间歇分配失败仍是已知限制。详细证据留在仓外，不将本次重构扩大为全工作负载 SLO 优化。
+R0 六批清理与正确性修复已合并（PR #429–#434），必需 CI 全过。R1 首批分离 runtime 与产品执行契约，随后迁移泛型驱动；尚未完成核心控制流统一。原始证据留在仓库外交接目录，没有新增性能或 SLO 达标声明。
 
 ## 1. 目标与第一原则
 
@@ -45,37 +43,9 @@ R0 六批退役与修复已合并（PR #429–#434）。执行契约、runtime�
 
 MoE API 迁移：移除旧 `Qwen3MoeModel`、`Qwen3MoeConfig`、`Qwen3MoeLayer` 和独立 `GgufRuntime`；通过产品来源注册入口使用保留的 typed MoE。旧 CPU MoE 整模型路径随之退役，CPU 路由/dispatch 数值参考不代表 typed CPU MoE 可运行。旧 MoE graph/batch 专属选项明确拒绝；`[runtime]` 未知字段及已有 `ferrum.toml` 的读取/解析错误会报错，缺少配置文件仍使用默认值。
 
-观测 API 迁移：移除 bench-core 全局 profile/trace writer、旧算子计数诊断与 native profile set/clear 导出；历史 `ProfileEvent` 解析保留。`run` / `serve` 显式指定日志路径时统一使用实例产品 schema，`Off` 仍不采集设备计时或计算事实。旧诊断配置明确拒绝；保留的 serve metadata 参数仅作为用户声明。classic Marlin 使用 operator ABI 2，MoE Marlin 使用 operator ABI 3；共享 descriptor ABI 2 和数学入口签名保留。CUDA 源码构建须使用更新的锁定算子包，不能继续链接旧 writer。
-
-后端配置 API：`Backend::new_context(&BackendContextConfig)` 返回可失败的原实例，`context_config` 提供加载与执行共享的不可变策略；移除设备选择 TLS，layer stage 显式绑定设备。库直接构造使用固定默认配置，CLI 仅在冷装配解析来源。Metal 默认设备目录与弱 mmap 索引、独立 CUDA decode 诊断及 native override 仍有各自边界，不据此宣称所有全局状态已消除。
-
-Metal 队列 API：原 `MetalContext` 独占队列、命令与完成状态，只共享无队列的设备管线目录；量化管线按目录所属设备延迟初始化。移除公开裸派发、可替换的 `MetalBuf::raw_mut` 及具体量化 store/linear 构造面，使用 `Backend`、`Linear` 与 `StackedExpertGgufLinear` 契约。保留独立 attention 的 slice 入口及原标量算法，成功同步后才能读回；跨上下文传递 GPU 数据须先确认生产者完成。冷分配仍限定默认设备，不宣称任意设备或多 GPU 已验收。
-
-CUDA 资源 API：`CudaState` 的设备、stream、BLAS 与捕获状态改为私有，调用方通过 `CudaBackend` 和实例配置操作原上下文；MoE 辅助流和事件不再公开。退役没有产品调用的 `cuda_decode` / `tp_decode` / `cuda_graph`、专用 weight/decode/KV 容器及根 `quant` 模块，使用模型与统一 token 执行入口；保留底层量化、attention、INT8、Triton 和真实 layer split。移除 `push_alloc_label` 线程局部栈，分配失败仍报告操作、类型、容量及回溯；GGUF 加载诊断使用标准 `tracing`，不再扫描 `FERRUM_GGUF_LOAD_TRACE`。
-
-Metal 映射 API：`register_gguf_mmap` 接收 `RetainedHostMemoryRegion`，不再接受独立 slice 与任意 keeper。零拷贝 buffer 的原生释放回调持有真实内存所有者，覆盖 Rust 权重提前释放及原生 buffer 克隆；residency 独立持有，避免引用环。量化加载与原生静态权重导入共享范围检查和构造器；整页范围不能证明时复制对应 tensor，尾部 tensor 的额外内存及默认性能仍须验收。
-
-模型执行资格改为 `ModelTokenExecutionMode::{Unsupported, InlineSynchronous, ManagedWorker}`，替代两个可矛盾的布尔值；执行器在构建时保存声明，准入、执行和关闭使用同一模式。后端单独声明保留原上下文的生命周期能力，不感知 token 业务。Metal FP16、CUDA FP16/INT8 的原执行、故障和关闭已验证，CUDA INT8 的真实 `run` / `serve` 通过。pipeline 保留各 stage 原 context 与 worker，CPU、同卡独立 CUDA context 和 Metal 实例的数值、取消与关闭通过；不据此声明双物理 GPU 已验收。
-
-整执行器关闭 API：`ExecutorOwner` 消费原执行器，`ExecutorScope` 只授予使用权；自定义 Engine 分别通过 `with_owned_executor` 或 `with_custom_executor` 接入。最后一个实际作用域结束后，原 worker、模型与 plan 才能受检退休。`InferenceEngine::wait_for_shutdown_completion` 观察原关闭过程，不重新发起关闭；CLI、HTTP 与日志收尾共用此过程。失败仍保留原资源，已安全退休也不抹去先前错误。自定义实现须提供实际关闭证明，默认不把未实现的关闭视为成功。
-
-冷构建错误 API：factory 与 Builder 返回 `ExecutorBuildError`，分别保留原失败原因与可选清理观察端。失败的预留、分配及静态上传由原事务和原关闭服务继续处理；未知副作用不自动重放。调用方观察清理结果，不能将返回错误等同于资源已释放。
-
-Metal 同步失败会阻止后续编码和宿主访问；未决工作保留原提交，只有显式开始下一次执行才清除已终结的错误。直接模型的完整输出、取消及失败恢复验证通过；真实 Llama-3.1-8B Q4_K_M 的三轮 `run`、五次 HTTP/SSE 请求和服务正常退出通过。该结果不替代默认性能与其余模型/格式验收。
-
-配置 API 迁移：移除 `install_runtime_snapshot` / `active_runtime_snapshot`。Engine 在加载权重前固定 `LlamaExecutionConfig`，显式传入普通模型、GGUF 与 layer stage；库调用使用 `*_with_execution_config`，原构造器使用固定默认值。GPTQ loader 诊断通过 `NativeSafetensorsLoadOptions` 传入。batched graph / prefix 的布尔值统一按 Engine 语义解释，修正旧模型对 `true` / `false` 的不同解释；默认值与 `0/1` 行为保留。CLI 配置来源保留，模型专属选项不再写回进程环境；仍有真实消费者的后端配置桥随 GPU 所有权迁移退出，本片不代表全部运行状态已隔离。
-
-资源 API 迁移：`WeightLoader`、动态 LoRA 与 KV 分配显式接收原实例 context；模型从构造到关闭复用同一所有者。`LlamaFamilyModel::close` 检查设备完成及 graph 清理；退休失败保留原资源供重试，成功关闭后拒绝继续执行。graph 驱逐不等于执行完成，替换被捕获存储须先通过 checked retirement；KV 复制的旧存储留至原 context 确认终态。受管执行沿既有 worker 恢复；直接使用裸模型的调用方应显式关闭，若最终 `Drop` 仍无法安全退休，则诊断并终止进程，避免释放仍被引用的资源。设备执行未知与已完成后的清理失败分别报告；此异常兜底不替代正常产品 shutdown，也不构成未测 GPU 路线的支持声明。
-
-Graph API 迁移：权重加载返回 `LoadedLinear`，自定义实现默认仅供 eager 执行；捕获资格须保证原依赖的地址与重放语义，KV 资格同时绑定后端和存储类型。裸捕获/重放入口为 `unsafe`，模型持有完整依赖并在释放前检查退休结果。保留的 Llama graph 按实际批宽、布局和 attention 范围复用，缓存换组或复用前先退休旧图；捕获不提交 KV 长度，实际完成后才提交。CUDA 生命周期资格不等于所有模型、量化格式或性能已验收。
-
 旧执行 API 迁移：移除独立 FIFO/Priority、pipeline/模拟 parallel、speculative 驱动及 whole-prompt 缓存 API；Engine 使用连续批处理配置，普通 prefix 使用原有 `FERRUM_PREFIX_CACHE`/CLI 选项。旧 speculative/whole-prompt 参数、退役配置字段和策略名称明确拒绝，不能静默转成默认行为；原生 checkpoint、请求优先级、真实 layer-split/chunked prefill 和显式自定义注册保留。`GenericKvCacheHandle::clone_handle` 拒绝没有物理 fork 的复制；Phi/GPT2 不再被内建注册为可执行家族，通用元数据识别和下载不受此限制。
 
 扩展点限于任务能力声明、可组合的注册/装配边界，以及未来按任务定义独立请求/结果的空间；**不新建无人使用的 Embed/ASR/TTS 引擎、空实现或插件框架来替代删除。** Candle、量化加载、通用算子等仍被文本 LLM 使用的依赖继续保留；独立 CLIP 处理链和未支持的聊天视觉输入不是同一件事，不能删掉主线已有的能力限制校验。
-
-LoRA API 迁移：退役公开的 `RuntimeLoraAdapter` / `load_runtime_lora_adapter` 裸执行入口，保留 startup metadata 与模型级 preload/set 接口。权重和元数据不可变，可变工作区由原模型实例持有，按当前 adapter 的 rank、输出宽度和实际行数准备，随未决执行保活。
-
-容量 API：`FerrumConfigBuilder` 通过 `SelectedKvCacheLayout` 接收实际模型/后端选择的布局；只有明确分页布局才能把块数换算成 token 容量。连续布局与未知布局不套用分页上限，compiled plan 仍由原 runtime 准入。`run` / `serve` 与模型分配共用选择逻辑，状态页不再按后端名称猜布局。
 
 ## 2. 问题与对应工作
 
@@ -84,7 +54,7 @@ LoRA API 迁移：退役公开的 `RuntimeLoraAdapter` / `load_runtime_lora_adap
 | 问题 | 证据性质与范围 | 本轮必须形成的结果 |
 |---|---|---|
 | `interfaces::vnext` 包含计划编译、资源池、提交/完成状态机；与 `ModelExecutor` 相互引用 | 主线结构确认；编译成本未量化 | 契约与运行时实现分离，无环依赖 |
-| 原 `ModelExecutor`、Engine 同时维护旧执行/计划运行时路由；CLI 与公共 builder 的模型选择规则不一致 | 历史基线；当前 Engine 统一消费 token 协议，保留不同执行实现的冷规划合同 | 保持统一构建与执行协议，保留能力和实际所有权验收，不以分类名代替迁移证据 |
+| `ModelExecutor`、Engine 同时维护 legacy/PlanRuntime 路由；CLI 与公共 builder 的模型选择规则不一致 | 主线结构确认；legacy 仍承载生产能力 | 单一执行协议、统一构建入口、明确旧路径退出条件 |
 | legacy 批次出错后整批转逐请求重试，部分请求可能已经推进 KV 或输出 | 静态错误路径确认，待故障注入 | 按参与者记录提交结果，仅证明未提交的工作可重试 |
 | 完成结果在 executor、Engine、scheduler 之间多处手工发布/补偿 | 维护风险确认，不能据锁数量宣称死锁 | 具名提交事务、可收敛的取消与回收协议 |
 | 可选观测 I/O 与执行契约错误混在一起；诊断关闭时部分调用仍构造快照/JSON | 条件性路径确认；默认无 journal 不受其 I/O 错误影响 | 执行错误与观测降级分离，关闭诊断不构造诊断负载 |
@@ -103,8 +73,6 @@ LoRA API 迁移：退役公开的 `RuntimeLoraAdapter` / `load_runtime_lora_adap
 |---|---|---|
 | `ferrum-types` | 通用值类型、配置声明、能力与数值描述 | 自动调优策略、运行时全局变量、SLO 拟合逻辑 |
 | `ferrum-interfaces` | 不依赖执行实现的基础端口与公共语义，例如 tokenizer、sampler、模型描述 | 资源池实现、具体 runtime 授权、产品默认选择 |
-| `ferrum-output` | 输出会话、内容额度与持有额度的流/内容容器；供 Engine 和 HTTP 共用 | 模型资源、调度策略、HTTP 事件语义 |
-| `ferrum-journal` | 有界 JSONL 投递、共享文件 writer、组件投递范围与真实关闭结果 | 执行/统计 schema、SLO 策略、benchmark 工作负载 |
 | `ferrum-runtime` | 计划准备、资源授权、提交/完成/退休、设备执行端口、复用与失效、实例上下文 | 请求 SLO 目标、统计特征、模型名称策略 |
 | `ferrum-execution` | 建立在 runtime 授权之上的产品执行契约、泛型执行驱动、结果/延期/取消协议；契约与驱动分模块 | 第二套资源运行时、具体模型/后端装配、训练器、HTTP 协议 |
 | `ferrum-models` / `ferrum-kernels` | 模型语义与计划生成；CPU/Metal/CUDA 的具体执行、布局和数值能力 | 校准样本目录、训练 schema、SLO 拒单策略 |
@@ -117,29 +85,11 @@ LoRA API 迁移：退役公开的 `RuntimeLoraAdapter` / `load_runtime_lora_adap
 
 依赖方向（箭头指向被依赖者）：`engine → scheduler → execution → {runtime, interfaces} → types`，Engine 也直接消费 execution；execution 不反向依赖 scheduler。runtime 当前不需要依赖 interfaces。kernels 实现 runtime 的设备端口，models 提供语义/权重和合法执行实现；execution/runtime 不反向依赖 models 或具体 kernels。基础 interfaces 不重导出依赖自己的上层 crate。SLO 组件消费只读执行事实，发布策略快照；数据面不反向依赖 SLO 实现。上述责任和依赖关系必须落地，同时更新 workspace membership 和发布依赖顺序。
 
-R1 Rust API 迁移：原 `ferrum_interfaces::vnext::*` 改为 `ferrum_runtime::*`，`model_executor` 与 `ModelExecutor` 改由 `ferrum_execution` 导出。原 `ferrum_models::VNextModelExecutor` / `VNextExecutorConfig` 改为 `ferrum_execution::ProgramExecutor` / `ProgramExecutorConfig`，编译结果与装配合同改为 `CompiledProgram` / `RuntimeComposition`；不保留旧路径别名。产品 prefix 观测使用 `ProductExecutionEventSink`，可向上转型为 runtime sink，不增加队列或放宽事件授权；基础 interfaces 不向上重导出。
-
-R2 驱动 API：`ContinuousBatchEngine::start_loop()` 返回 `Result<DriverObserver>`；显式启动和首请求共用同一任务。用 `observer.wait().await.result()` 观察退出，停止仍调用 `shutdown()`；观察端没有 abort 权限，取消等待不取消清理。关闭后拒绝新请求和重启；失败报告保留未证明已释放的原资源。
-
-R2 输出 API：`infer()` / `infer_batch()` 返回持有额度的 `ferrum_output::InferenceOutput`，通过 `response()` 借用结果，克隆共享内容及额度；`infer_stream()` 返回 `InferenceStream`，每项为 `Result<OutputChunk>`，通过 `chunk()` 借用数据。原输出会话随结果、历史记录或帧的最后持有者释放，不能在模型完成或上游 EOF 时提前归还；会话代表一次推理输出，区别于多轮对话。CLI 的 `[output]` 与库的 `EngineConfig.output` 使用同一 typed 配置；HTTP 复用原会话，增长额度不足明确失败，不等待自己持有的历史释放。慢流暂停自己的生成，关闭错误仍由原驱动观察。内容额度计生成内容的逻辑负载，tokenizer 缓存另按条数与字节数限制；输入预算、解析/解码临时分配及分配器开销不在此范围，不能据此宣称总内存有界。
-
-R2 观测 API：`ExecutionEventSinkError` 区分 `Contract` 与 `Transport`；`delivery_policy()` 默认要求完整证据。产品 `--profile-detail replay/verify/full` 保持完整证据要求，其余详细级别允许传输降级；不变量、编码错误及内部 panic 始终失败。生产 journal 使用原 writer 的有界 `try_*` 投递，队列满不等待，关闭报告保留丢样与实际 flush 状态。普通工具的阻塞写入另计，不能据生产队列预算宣称整个进程内存有界。prefix 恢复确认返回 `PrefixRestoreAcknowledgement`，调用方先保存实际 `frontier`，再处理确认后的观测错误，不能据此重新执行已恢复的工作。
-
-`JsonlJournal<T>` 只负责投递；`JsonlProducerScope` 结束组件投递，`JsonlJournalOwner` 在所有范围结束后关闭原 writer。库共享文件须显式注入独立 scope，工具独用 `OwnedJsonlJournal<T>`。flush/final receipt 分别保留固定前缀和真实 join 事实，调用方检查 `receipt.result()`；返回 receipt 不代表证据完整。
-
-日志 API 由 `ferrum-journal` 提供；HTTP benchmark correlation 的纯 wire 类型归 `ferrum-types`。`ferrum-bench-core` 为工具保留同类型重导出，只有一份 writer 与路径注册表；Engine/Server 直接依赖生产组件，CLI 的 benchmark 子命令保留工具依赖。
-
-Engine 资源 API：统一构造器只接收配置、scheduler、tokenizer、sampler 和原 executor；显式日志 scope 使用 `new_with_journal_scopes`。移除未参与执行的 KV/recurrent manager 注入、注册工厂及 TensorFactory 参数。真实 KV/recurrent provider 仍归原执行所有者；Qwen3.5 保留模型内的张量形状与容量估计，退出无执行消费者的 request/slot allocation spec。旧 `recurrent_state_max_slots` 配置明确拒绝；物理块数不再作为 token 窗口回退。
-
-`ModelExecutor::memory_observation` 返回原所有者的 `MemoryObservation`。`Known` 保留原 JSON 对象，`Unknown` 为 `null`，CLI/HTTP 明确显示不可用，不伪报零用量或因此置为不健康。缺少 CompiledPlan 必需的原 runtime 资源快照仍是合同错误。设备字段来自实际 executor，统计限定在其声明的内存域；不代表进程总内存或关闭后的释放证明。
-
-冷规划 API 迁移：`ExecutionResourceAuthority::{LegacyEngine, PlanRuntime}` 改为 `ExecutionPlanningModel::{ExecutorManaged, CompiledPlan}`，trait 查询改为 `execution_planning_model()`；配置 builder/字段使用 `with_execution_planning_model` / `execution_planning_model`，admission snapshot 使用 `planning_model()`。不保留旧 Rust 别名。前者由原执行实现管理资源，后者另外必须提供实际 compiled plan、来源一致性、admission/capacity 与资源观察合同；两者均使用原 token 执行和真实关闭协议。分类不授权分配/释放，不决定 KV 布局、prefix 恢复或内存用量。为保持已有 health、effective config、性能记录和文件摘要可读可比，wire 仍写出 `execution_resource_authority` / `resource_authority` 及 `legacy_engine` / `plan_runtime`；这些是历史兼容标签，不能解释成 Engine 拥有资源。schema、原 runtime entries、native plan/provider 指纹不因这次 Rust API 迁移改变。本片无算法或性能收益声明。
-
-执行事实由独立的 `ExecutionFactsCapture` 开关控制，不改变计时模式、程序身份或缓存资格。`ProfiledSubmissionHandle::into_parts()` 返回完成句柄与 `SubmissionObservation`；后者持有当前工作量、可选计时归因和设备事实，提交后错误保留有效附件。`TerminalExecutionFacts` 只借用原终态，不授予重试或释放权。CUDA Q6 执行与观测共用实际选择，原图保存无请求身份的投影模板，重放时绑定当前 token 范围；Off 捕获的图不回填模板，明确记为 `CachedTemplateUnavailable`。设备事实仅声明计算命令覆盖，不代表传输、初始化或每个 kernel 成功；缺失与未支持分别标记。产品投影经原有界日志队列交付，不用逻辑节点或 packed token 行数冒充物理矩阵。
+R1 首批 Rust API 迁移：原 `ferrum_interfaces::vnext::*` 改为 `ferrum_runtime::*`，原 `model_executor` 与 `ModelExecutor` 改由 `ferrum_execution` 导出。产品 prefix 观测使用其 `ProductExecutionEventSink`；同一实例可向上转型为 runtime sink，不增加队列或放宽事件授权。基础 interfaces 不保留向上重导出。此批只拆契约依赖；泛型驱动迁移与单一执行协议仍待完成。
 
 产品装配层组合模型准备结果、具体设备 runtime 与泛型驱动。迁移 `VNextModelExecutor<R>` 时同时解开其对 `PreparedProductionModel` 的依赖，将中立准备输入与编译结果归到正确层，并保留 source/registry/初始化身份校验；不能整文件搬迁后让 execution 再引用 models。泛型驱动本身已后端中立，不能将这项整理描述成新消除的具体 GPU 绑定。量化格式描述/解析与设备执行也按此分层，不能经 quantization 引回 kernels 依赖环。
 
-原 Engine 未参与实际执行的容量/KV/recurrent 账本及其注入接口已删除；这项历史问题不等于曾证明重复分配两份 GPU KV。真实资源由原执行所有者持有：模型执行保留原模型/context/worker，compiled-plan 执行保留原 runtime 资源域；Engine/scheduler 只消费凭证与只读状态。`ferrum-kv` 仍有 testkit 和测试依赖，需按实际剩余职责迁移后再删除；其 crate 名称存在不代表 Engine 仍维护生产双账本，亦不能为维持旧接口恢复第二套账本。
+legacy Engine 的容量分配记录与模型自己的物理 KV 当前是两套账本，不等于已证明重复分配两份 GPU KV。统一后容量权威归执行 runtime，Engine/scheduler 只消费凭证与只读状态。`ferrum-kv` 的 testkit 使用和公共统计类型需迁移；没有剩余独立职责后删除 crate，不为维持旧测试保留生产双重记账。
 
 公共契约的具体归属按依赖闭包决定。`PrefixRestoreObservation` 等当前借用带授权语义的 deferral，不能因名称像数据就下沉到 `types`：拆开只读观测表示与可操作的授权，或将完整授权契约放在正确边界；不得把私有字段/构造校验改成任意可伪造的快照来解环。
 
@@ -149,7 +99,7 @@ Engine 资源 API：统一构造器只接收配置、scheduler、tokenizer、sam
 
 ### 4.1 一个执行协议，旧路径有终点
 
-构建时根据声明能力选择执行实现。Engine 的 batch/prefill/decode 主循环只面对统一协议，不按 executor-managed 或 compiled-plan 冷分类维护另一套控制流。CLI、`run`、`serve` 与公共 EngineBuilder 使用相同的来源解析和能力规则。
+构建时根据声明能力选择执行实现。Engine 的 batch/prefill/decode 主循环只面对统一协议，不持续判断资源属于 legacy 还是 PlanRuntime。CLI、`run`、`serve` 与公共 EngineBuilder 使用相同的来源解析和能力规则。
 
 迁移期间允许兼容 adapter，但它必须实现统一的提交、完成、取消和容量协议；旧算法可暂时留在 adapter 内，不能再维护平行的 Engine 调度/资源所有权。每个保留能力记录迁移去向与退出里程碑；退役项按 §1 删除。存在尚未覆盖的保留能力时，不能宣告旧架构退出完成。最终模型实现可以复用旧算子，但不再依赖两套执行协议之间的转换 adapter。
 
@@ -193,8 +143,6 @@ CUDA graph、stream、工作区与可变配置归属于 runtime 实例。确需�
 沿用 [README 的目标](../README.md)：固定硬件、模型、输出策略、请求集合/到达计划和测量窗口，在预先声明的 TTFT、TPOT、ITL 分位数上限及最低完成率约束下，最大化有效输出吞吐。
 
 请求从入口携带单调时间锚点，覆盖排队与 tokenization；墙钟跳变不改变 deadline，跨边界传递不能悄悄重置请求年龄。跨进程只比较有明确定义的持续时间/关联事件，不直接相减不同时钟。保留生成、排队、服务端发送与客户端接收的不同时间。TTFT 以首个非空可见文本为准；主表 ITL 是相邻非空 SSE 文本事件间隔，单 token 诊断另列并披露传输合并。TPOT 的样本单位、分母和不足两个输出 token 的处理须声明。拒绝、失败、超时和未完成请求保留在固定 cohort 的完成率分母，不能通过拒单或删掉缺失样本制造达标。
-
-本地计时合同：`InferenceRequest.ingress` 不序列化，首个 HTTP handler、Engine 或直接 Scheduler 入口捕获 `RequestIngressAnchor`，后续原样传递。HTTP 起点在 JSON 提取之后，包含请求转换与 prompt 准备，不能代替客户端可见延迟；新 evidence 标注 `request_start_boundary`，旧产物缺此字段表示起点未声明。墙钟仅关联事件，转换失败不影响普通请求的单调计时。Scheduler 的请求年龄沿原起点，queue wait 仅统计每次实际入队至晋升的区间；重新排队不重复累计先前执行时间，公有 wall 时间字段不再决定 duration。
 
 ### 数据面只提供执行事实
 
@@ -245,14 +193,14 @@ CPU wall time、设备事件区间和包含重叠的耗时不得直接相加。�
 
 ## 7. 完成条件
 
-- [x] 生产依赖中契约、运行时、后端、控制面与工具边界实际成立；改变成本统计特征不要求修改模型/kernel，修改 HTTP 协议不要求改设备执行器。
+- [ ] 生产依赖中契约、运行时、后端、控制面与工具边界实际成立；改变成本统计特征不要求修改模型/kernel，修改 HTTP 协议不要求改设备执行器。
 - [x] BERT/独立 CLIP embedding、Whisper ASR、Qwen3-TTS 等退役链路的实现、注册、入口、独占依赖及支持声明已清理；共享 LLM 组件保留，未支持任务明确拒绝，扩展点不带空引擎或假实现。
-- [x] 一个执行协议、一个受管驱动和一致的构建规则；旧 Engine 控制流与重复资源所有权退出，保留能力全部有可验证实现。
-- [x] 提交后失败、部分完成、prefix restore、取消/shutdown 与资源回收有组合测试；不重复执行，已证明终态的授权正确回收，未知终态隔离且退出状态明确。
-- [x] 输出全链路有界；正常完成不静默丢失/重复提交文本，Unicode、stop、thinking/tool、慢消费者和中途断连正确；可选观测故障不推翻正常推理，必需证据/不变量失败仍被识别。
-- [x] 多实例加载/释放不串扰；缓存身份与拓扑失效、逻辑/物理/活跃容量边界、数值能力在真实 Plan 上验证，而非只有孤立 kernel/mock。
+- [ ] 一个执行协议、一个受管驱动和一致的构建规则；旧 Engine 控制流与重复资源所有权退出，保留能力全部有可验证实现。
+- [ ] 提交后失败、部分完成、prefix restore、取消/shutdown 与资源回收有组合测试；不重复执行，已证明终态的授权正确回收，未知终态隔离且退出状态明确。
+- [ ] 输出全链路有界；正常完成不静默丢失/重复提交文本，Unicode、stop、thinking/tool、慢消费者和中途断连正确；可选观测故障不推翻正常推理，必需证据/不变量失败仍被识别。
+- [ ] 多实例加载/释放不串扰；缓存身份与拓扑失效、逻辑/物理/活跃容量边界、数值能力在真实 Plan 上验证，而非只有孤立 kernel/mock。
 - [ ] 默认优化继续生效，内部控制参数 typed，`run` / `serve` 共享解析规则；有同机默认配置的吞吐、延迟、内存及质量回归证据，所有超预算退化已解决。
-- [x] SLO 参考闭环与 prefix 共存；训练、发布、未知域和观测降级有明确策略；客户端指标与内部预测各自可解释，没有宣称未测的 SLO 达标。
+- [ ] SLO 参考闭环与 prefix 共存；训练、发布、未知域和观测降级有明确策略；客户端指标与内部预测各自可解释，没有宣称未测的 SLO 达标。
 - [ ] 必要工作区与后端检查完成，相关修改合并主线；迁移说明和一页结果/决定保持简洁，详细原始证据留在仓库外。
 
 以上完成项须有实现与验证后再勾选。历史交付见 [0.13.0 goal](goal-popular-models-concurrency.zh.md) 与[性能结果](performance-popular-models-p0.zh.md)；旧 SLO 文档保留历史用途，本轮架构范围、迁移终点和验收以本文为准。Claude 协作继续使用既有仓库外交接目录：阶段开始、重要设计变化、提交/合并检查点更新事实并请求独立复核；持续阶段至少每小时检查新回复，建议经源码/测试核实后采纳，不让等待评审阻塞可独立推进的工作。
