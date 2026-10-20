@@ -142,10 +142,11 @@ fn cuda_operator_source(path: &str) -> bool {
 }
 
 fn cuda_operator_distribution(path: &str) -> bool {
-    matches!(
-        cuda_operator_member(path),
-        Some("README.md" | "llama-MIT.txt")
-    )
+    path == "native-operators/cuda/README.md"
+        || matches!(
+            cuda_operator_member(path),
+            Some("README.md" | "llama-MIT.txt")
+        )
 }
 
 fn cargo_integration_target(relative: &str) -> bool {
@@ -193,6 +194,12 @@ fn classify(path: &str) -> Option<(Vec<ChangeArea>, &'static str)> {
         return Some((
             ALL_AREAS.to_vec(),
             "shared dependency/toolchain change: conservatively include all components",
+        ));
+    }
+    if path == "ferrum.toml" {
+        return Some((
+            ALL_AREAS.to_vec(),
+            "shared product configuration can change source resolution, protocol, execution and validation defaults",
         ));
     }
     if path == ".gitignore" {
@@ -259,6 +266,12 @@ fn classify(path: &str) -> Option<(Vec<ChangeArea>, &'static str)> {
                 "reviewed fixed prompt inputs passed to the standalone KV teacher regression runner",
             ));
         }
+        if relative == "tests/fixtures/vnext_legacy_contract_map.json" {
+            return Some((
+                vec![Validation],
+                "reviewed legacy execution migration ownership fixture consumed by the runtime_legacy_map integration target",
+            ));
+        }
         if cargo_integration_target(relative)
             || relative == "tests/fixtures/unix_bootstrap_program.rs"
             || matches!(
@@ -318,6 +331,23 @@ fn classify(path: &str) -> Option<(Vec<ChangeArea>, &'static str)> {
             vec![Validation],
             "known crate's top-level Cargo integration-test target",
         ));
+    }
+    if component == "ferrum-slo"
+        && matches!(relative, "src/tests.rs" | "src/tests/worker_engine.rs")
+    {
+        return Some((
+            vec![Validation],
+            "reference estimator unit-test modules declared only under cfg(test)",
+        ));
+    }
+    if component == "ferrum-slo"
+        && matches!(
+            relative,
+            "src/lib.rs" | "src/queue.rs" | "src/snapshot.rs" | "src/worker.rs"
+        )
+    {
+        return Some((vec![Scheduler, Kv, Architecture, Observability],
+            "bounded execution observations and prefix/instance-aware cost snapshots feed admission and scheduled architecture execution; retain real runtime obligations"));
     }
     if component == "ferrum-kernels" && relative == "tests/compressed_tensors_marlin_eq/guards.rs" {
         return Some((vec![Validation],
@@ -522,6 +552,9 @@ fn classify(path: &str) -> Option<(Vec<ChangeArea>, &'static str)> {
                 | "src/jsonl_journal/delivery.rs"
                 | "src/jsonl_journal/ownership.rs"
         ))
+        // Keep the removed pre-extraction production writer classified when a
+        // complete release diff contains both old and current module paths.
+        || (component == "ferrum-bench-core" && relative == "src/jsonl_journal.rs")
         || (component == "ferrum-types" && relative == "src/benchmark_correlation.rs")
     {
         return Some((vec![Observability, Validation],
@@ -624,6 +657,7 @@ fn known_component(component: &str) -> bool {
             | "ferrum-execution"
             | "ferrum-output"
             | "ferrum-journal"
+            | "ferrum-slo"
             | "ferrum-engine"
             | "ferrum-sampler"
             | "ferrum-tokenizer"
@@ -1132,6 +1166,96 @@ mod tests {
                 assert!(impact.areas.contains(area), "{path:?} omitted {area:?}");
             }
         }
+    }
+
+    #[test]
+    fn release_refactor_slo_paths_keep_runtime_and_test_scopes() {
+        let production = [
+            "crates/ferrum-slo/src/lib.rs",
+            "crates/ferrum-slo/src/queue.rs",
+            "crates/ferrum-slo/src/snapshot.rs",
+            "crates/ferrum-slo/src/worker.rs",
+        ];
+        for path in production {
+            let impact = analyze_paths([path]);
+            assert!(impact.unknown_paths.is_empty(), "{path}");
+            assert_eq!(
+                impact.areas,
+                [
+                    ChangeArea::Scheduler,
+                    ChangeArea::Kv,
+                    ChangeArea::Architecture,
+                    ChangeArea::Observability,
+                ],
+                "{path}"
+            );
+        }
+        let tests = [
+            "crates/ferrum-slo/src/tests.rs",
+            "crates/ferrum-slo/src/tests/worker_engine.rs",
+            "crates/ferrum-slo/tests/engine_feedback.rs",
+            "crates/ferrum-slo/tests/reference_mixed_execution.rs",
+        ];
+        for path in tests {
+            let impact = analyze_paths([path]);
+            assert!(impact.unknown_paths.is_empty(), "{path}");
+            assert_eq!(impact.areas, [ChangeArea::Validation], "{path}");
+        }
+        let combined = analyze_paths(production.into_iter().chain(tests));
+        assert!(combined.unknown_paths.is_empty());
+        assert!(combined.areas.contains(&ChangeArea::Scheduler));
+        assert!(combined.areas.contains(&ChangeArea::Observability));
+        assert!(combined.areas.contains(&ChangeArea::Validation));
+        for path in [
+            "crates/ferrum-slo/src/new_policy.rs",
+            "crates/ferrum-slo/src/tests/new_helper.rs",
+            "crates/ferrum-slo/tests/fixtures/runtime.json",
+        ] {
+            let impact = analyze_paths([path]);
+            assert_eq!(impact.unknown_paths, [path]);
+            assert_eq!(impact.areas, ALL_AREAS);
+        }
+    }
+
+    #[test]
+    fn release_refactor_migration_paths_keep_deleted_production_scope() {
+        let old = "crates/ferrum-bench-core/src/jsonl_journal.rs";
+        let current = "crates/ferrum-journal/src/jsonl_journal.rs";
+        let fixture = "crates/ferrum-devtools/tests/fixtures/vnext_legacy_contract_map.json";
+        for path in [old, current] {
+            let impact = analyze_paths([path]);
+            assert!(impact.unknown_paths.is_empty());
+            assert_eq!(
+                impact.areas,
+                [ChangeArea::Observability, ChangeArea::Validation]
+            );
+        }
+        let impact = analyze_paths([old, current, fixture]);
+        assert!(impact.unknown_paths.is_empty());
+        assert_eq!(impact.paths.len(), 3);
+        assert_eq!(
+            impact.areas,
+            [ChangeArea::Observability, ChangeArea::Validation]
+        );
+        assert_eq!(analyze_paths([fixture]).areas, [ChangeArea::Validation]);
+        let unknown = "crates/ferrum-devtools/tests/fixtures/new_runtime_contract.json";
+        assert_eq!(analyze_paths([unknown]).unknown_paths, [unknown]);
+    }
+
+    #[test]
+    fn release_refactor_root_config_and_native_docs_keep_declared_reach() {
+        let config = analyze_paths(["ferrum.toml"]);
+        assert!(config.unknown_paths.is_empty());
+        assert_eq!(config.areas, ALL_AREAS);
+        let native_readme = "native-operators/cuda/README.md";
+        let native = analyze_paths([native_readme]);
+        assert!(native.unknown_paths.is_empty());
+        assert_eq!(native.areas, [ChangeArea::Build]);
+        assert_eq!(path_backend(native_readme), Some(Backend::Cuda));
+        let combined = analyze_paths(["ferrum.toml", native_readme, "README.md"]);
+        assert!(combined.unknown_paths.is_empty());
+        assert_eq!(combined.areas, ALL_AREAS);
+        assert!(combined.product_contract_changed);
     }
 
     #[test]
