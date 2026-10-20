@@ -224,3 +224,6 @@ pub(super) fn verify(
 #[cfg(test)]
 #[path = "submission_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+pub(crate) use tests::verified_fixture;
