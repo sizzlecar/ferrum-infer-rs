@@ -13,7 +13,6 @@ ferrum-types = { workspace = true }
 ferrum-interfaces = { workspace = true }
 ferrum-native-ops = { workspace = true }
 # Trace writer for FERRUM_TRACE_OUT chrome-trace JSON (Phase 1.5).
-ferrum-bench-core = { workspace = true }
 candle-core = { workspace = true }
 half = { workspace = true }
 float8 = { workspace = true }
@@ -24,6 +23,7 @@ rayon = { workspace = true }
 sha2 = "0.10"
 cudarc = { version = "0.19", default-features = false, features = ["std", "driver", "cublas", "f16", "nvrtc", "cuda-version-from-build-system", "dynamic-linking"], optional = true }
 metal = { version = "0.31", optional = true }
+block = { version = "0.1.6", optional = true }
 libc = "0.2"
 
 [dev-dependencies]
@@ -56,7 +56,7 @@ cuda-production = [
     "cuda-q6-f16-linear",
 ]
 candle-cuda-compat = ["cuda", "candle-core/cuda"]
-metal = ["dep:metal"]  # Metal backend (macOS).
+metal = ["dep:metal", "dep:block"]  # Metal backend (macOS).
 marlin = []  # Marlin INT4xFP16 native artifact (auto-enabled by cuda).
 vllm-marlin = ["cuda"]  # vLLM GPTQ-Marlin native artifact (Phase 12).
 vllm-moe-marlin = ["cuda", "vllm-marlin"]  # vLLM Marlin MoE artifact (Stage

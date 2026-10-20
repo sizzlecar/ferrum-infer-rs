@@ -95,6 +95,80 @@ pub(in crate::backend::cuda::vnext_ops) fn retain_workspace(
     Ok(Some(index))
 }
 
+#[derive(Clone, Copy)]
+enum HadamardKernel {
+    F16F32,
+    F32F32,
+    F32F16,
+}
+
+#[derive(Clone, Copy)]
+pub(in crate::backend::cuda::vnext_ops) struct HadamardSelection {
+    kernel: HadamardKernel,
+    parameters: [u32; 6],
+    rows: u32,
+    explicit_signs: bool,
+    in_place_allowed: bool,
+}
+impl HadamardSelection {
+    pub(in crate::backend::cuda::vnext_ops) fn select(
+        rows: u32,
+        width: u32,
+        input_type: ElementType,
+        output_type: ElementType,
+        spec: &HadamardTransformSpec,
+    ) -> Result<Self, CudaDeviceRuntimeError> {
+        validate(spec, u64::from(width)).map_err(CudaDeviceRuntimeError::contract)?;
+        if rows == 0 || rows > u16::MAX as u32 {
+            return Err(CudaDeviceRuntimeError::contract(
+                "CUDA Hadamard rows differ from the declaration",
+            ));
+        }
+        let (inverse, permutation) = match spec.application {
+            HadamardApplication::BeforeMatmul { input_permutation } => (0_u32, input_permutation),
+            HadamardApplication::AfterEmbeddingLookup => (1, None),
+        };
+        let kernel = match (input_type, output_type) {
+            (ElementType::F16, ElementType::F32) => HadamardKernel::F16F32,
+            (ElementType::F32, ElementType::F32) => HadamardKernel::F32F32,
+            (ElementType::F32, ElementType::F16) => HadamardKernel::F32F16,
+            _ => {
+                return Err(CudaDeviceRuntimeError::contract(
+                    "unsupported CUDA Hadamard precision",
+                ))
+            }
+        };
+        let (inner, first, second) = permutation.map_or((0, 0, 0), |p| {
+            (
+                p.inner_extent as u32,
+                p.first_outer_extent as u32,
+                p.second_outer_extent as u32,
+            )
+        });
+        Ok(Self {
+            kernel,
+            parameters: [width, spec.block_size.get(), inverse, inner, first, second],
+            rows,
+            explicit_signs: matches!(spec.signs, HadamardSigns::Explicit(_)),
+            in_place_allowed: input_type == output_type && permutation.is_none(),
+        })
+    }
+    pub(in crate::backend::cuda::vnext_ops) fn implementation(self) -> &'static str {
+        match self.kernel {
+            HadamardKernel::F16F32 => "vnext_gguf_hadamard_f16_f32",
+            HadamardKernel::F32F32 => "vnext_gguf_hadamard_f32_f32",
+            HadamardKernel::F32F16 => "vnext_gguf_hadamard_f32_f16",
+        }
+    }
+    pub(in crate::backend::cuda::vnext_ops) fn launch(self) -> LaunchConfig {
+        LaunchConfig {
+            grid_dim: (self.parameters[0] / self.parameters[1], self.rows, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: self.parameters[1] * 4,
+        }
+    }
+}
+
 #[derive(Clone)]
 pub(super) struct CudaHadamardKernels {
     f16_f32: CudaFunction,
@@ -129,65 +203,43 @@ impl CudaHadamardKernels {
         output_type: ElementType,
         spec: &HadamardTransformSpec,
     ) -> Result<(), CudaDeviceRuntimeError> {
-        validate(spec, u64::from(width)).map_err(CudaDeviceRuntimeError::contract)?;
-        if rows == 0
-            || rows > u16::MAX as u32
-            || matches!(spec.signs, HadamardSigns::Explicit(_)) != (signs != 0)
-        {
+        let selection = HadamardSelection::select(rows, width, input_type, output_type, spec)?;
+        self.launch_selected(stream, input, output, signs, selection)
+    }
+
+    pub(in crate::backend::cuda::vnext_ops) fn launch_selected(
+        &self,
+        stream: &CudaStream,
+        input: u64,
+        output: u64,
+        signs: u64,
+        selection: HadamardSelection,
+    ) -> Result<(), CudaDeviceRuntimeError> {
+        if selection.explicit_signs != (signs != 0) {
             return Err(CudaDeviceRuntimeError::contract(
-                "CUDA Hadamard rows or signs differ from the declaration",
+                "CUDA Hadamard signs differ from the declaration",
             ));
         }
-        let (inverse, permutation) = match spec.application {
-            HadamardApplication::BeforeMatmul { input_permutation } => (0_u32, input_permutation),
-            HadamardApplication::AfterEmbeddingLookup => (1, None),
-        };
-        if input == output && (input_type != output_type || permutation.is_some()) {
+        if input == output && !selection.in_place_allowed {
             return Err(CudaDeviceRuntimeError::contract(
                 "CUDA Hadamard cannot overwrite permuted or differently sized input",
             ));
         }
-        let function = match (input_type, output_type) {
-            (ElementType::F16, ElementType::F32) => &self.f16_f32,
-            (ElementType::F32, ElementType::F32) => &self.f32_f32,
-            (ElementType::F32, ElementType::F16) => &self.f32_f16,
-            _ => {
-                return Err(CudaDeviceRuntimeError::contract(
-                    "unsupported CUDA Hadamard precision",
-                ))
-            }
+        let function = match selection.kernel {
+            HadamardKernel::F16F32 => &self.f16_f32,
+            HadamardKernel::F32F32 => &self.f32_f32,
+            HadamardKernel::F32F16 => &self.f32_f16,
         };
-        let (inner, first, second) = permutation.map_or((0, 0, 0), |permutation| {
-            (
-                permutation.inner_extent as u32,
-                permutation.first_outer_extent as u32,
-                permutation.second_outer_extent as u32,
-            )
-        });
-        let block = spec.block_size.get();
         let mut launch = stream.launch_builder(function);
-        launch
-            .arg(&input)
-            .arg(&output)
-            .arg(&signs)
-            .arg(&width)
-            .arg(&block)
-            .arg(&inverse)
-            .arg(&inner)
-            .arg(&first)
-            .arg(&second);
-        // SAFETY: The caller retains complete row spans and the optional full
-        // width F32 signs. Each block owns its shared memory and output span;
-        // every thread participates in every butterfly barrier.
-        unsafe {
-            launch.launch(LaunchConfig {
-                grid_dim: (width / block, rows, 1),
-                block_dim: (256, 1, 1),
-                shared_mem_bytes: block * 4,
-            })
+        launch.arg(&input).arg(&output).arg(&signs);
+        for parameter in &selection.parameters {
+            launch.arg(parameter);
         }
-        .map(|_| ())
-        .map_err(|error| CudaDeviceRuntimeError::driver("native Hadamard launch", error))
+        // SAFETY: Original retained row spans and signs remain alive; every
+        // block owns the selected shared-memory span and butterfly barriers.
+        unsafe { launch.launch(selection.launch()) }
+            .map(|_| ())
+            .map_err(|error| CudaDeviceRuntimeError::driver("native Hadamard launch", error))
     }
 }
 

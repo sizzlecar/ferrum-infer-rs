@@ -1,30 +1,27 @@
 use super::{json_rejection_detail, AppState, ServerError};
-use crate::openai::{
-    AssistantMessagePhase, ChatCompletionsRequest, ChatCompletionsResponse, ChatMessage,
-    ChatToolCall, Usage,
-};
+use crate::openai::{AssistantMessagePhase, ChatCompletionsRequest, Usage};
 use axum::{
-    body::to_bytes,
     extract::{rejection::JsonRejection, State},
     http::HeaderMap,
-    response::{IntoResponse, Response},
+    response::Response,
     Json,
 };
+use ferrum_types::{RequestIngressAnchor, RequestIngressBoundary};
 use serde_json::{json, Map, Value};
 use std::collections::HashMap;
 use uuid::Uuid;
 
 #[cfg(test)]
-use crate::openai::{ChatFunctionCall, MessageRole};
+use crate::openai::{ChatFunctionCall, ChatToolCall, MessageRole};
 #[cfg(test)]
 use std::collections::HashSet;
 
 mod request;
-mod stream;
+pub(super) mod stream;
 mod tools;
+mod wire;
 
 use request::ResponsesRequest;
-use stream::adapt_chat_stream;
 
 #[cfg(test)]
 use request::{parse_input, parse_input_phases};
@@ -33,17 +30,14 @@ use stream::SseDecoder;
 #[cfg(test)]
 use tools::{allocate_namespace_alias, stable_namespace_alias_hash, MAX_CHAT_TOOL_NAME_BYTES};
 
-const MAX_SYNC_ADAPTER_BODY_BYTES: usize = 16 * 1024 * 1024;
-
 struct ConvertedRequest {
     chat: ChatCompletionsRequest,
     message_phases: Vec<Option<AssistantMessagePhase>>,
     response: ResponseContext,
-    stream: bool,
 }
 
 #[derive(Clone)]
-struct ResponseContext {
+pub(super) struct ResponseContext {
     id: String,
     created_at: u64,
     model: String,
@@ -65,7 +59,7 @@ struct ResponseContext {
     tool_names: ToolNameMap,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize)]
 struct ResponseToolName {
     namespace: Option<String>,
     name: String,
@@ -109,6 +103,7 @@ pub(super) async fn responses_handler(
     headers: HeaderMap,
     request: std::result::Result<Json<ResponsesRequest>, JsonRejection>,
 ) -> std::result::Result<Response, ServerError> {
+    let ingress = RequestIngressAnchor::capture(RequestIngressBoundary::HttpHandler);
     let Json(request) = request.map_err(|error| {
         ServerError::invalid_request(
             format!(
@@ -118,71 +113,20 @@ pub(super) async fn responses_handler(
             None,
         )
     })?;
+    #[cfg(test)]
+    if let Some(observer) = &state.request_construction_observer {
+        observer(ingress, "responses_conversion");
+    }
     let converted = request.convert()?;
-    let chat_response = super::chat_completions_handler_with_phases(
+    super::chat_completions_handler_with_projection(
         State(state),
         headers,
         Ok(Json(converted.chat)),
         Some(converted.message_phases),
+        Some(converted.response),
+        ingress,
     )
-    .await?;
-    if converted.stream {
-        Ok(adapt_chat_stream(chat_response, converted.response))
-    } else {
-        adapt_chat_sync(chat_response, converted.response).await
-    }
-}
-
-impl ResponseContext {
-    fn response(
-        &self,
-        status: &str,
-        output: Vec<Value>,
-        usage: Option<&Usage>,
-        error: Option<Value>,
-    ) -> Value {
-        let incomplete_details = (status == "incomplete")
-            .then(|| json!({"reason": "max_output_tokens"}))
-            .unwrap_or(Value::Null);
-        let completed_at = matches!(status, "completed" | "incomplete" | "failed")
-            .then(|| chrono::Utc::now().timestamp() as u64)
-            .map(Value::from)
-            .unwrap_or(Value::Null);
-        json!({
-            "id": self.id,
-            "object": "response",
-            "created_at": self.created_at,
-            "completed_at": completed_at,
-            "status": status,
-            "background": false,
-            "error": error,
-            "incomplete_details": incomplete_details,
-            "instructions": self.instructions,
-            "max_output_tokens": self.max_output_tokens,
-            "max_tool_calls": null,
-            "metadata": self.metadata,
-            "model": self.model,
-            "output": output,
-            "parallel_tool_calls": self.parallel_tool_calls,
-            "previous_response_id": null,
-            "reasoning": self.reasoning,
-            "service_tier": "default",
-            "store": false,
-            "temperature": self.temperature,
-            "text": self.text,
-            "tool_choice": self.tool_choice,
-            "tools": self.tools,
-            "top_logprobs": 0,
-            "top_p": self.top_p,
-            "truncation": "disabled",
-            "usage": usage.map(response_usage),
-            "user": self.user,
-            "presence_penalty": self.presence_penalty,
-            "frequency_penalty": self.frequency_penalty,
-            "prompt_cache_key": self.prompt_cache_key,
-            "safety_identifier": null
-        })
-    }
+    .await
 }
 
 fn response_usage(usage: &Usage) -> Value {
@@ -195,209 +139,125 @@ fn response_usage(usage: &Usage) -> Value {
     })
 }
 
-async fn adapt_chat_sync(
-    response: Response,
+pub(super) async fn adapt_chat_sync(
+    output: super::ChatSyncOutput,
     context: ResponseContext,
 ) -> std::result::Result<Response, ServerError> {
-    let bytes = to_bytes(response.into_body(), MAX_SYNC_ADAPTER_BODY_BYTES)
-        .await
-        .map_err(|error| {
-            ServerError::InternalError(format!("failed to read chat response: {error}"))
-        })?;
-    let chat: ChatCompletionsResponse = serde_json::from_slice(&bytes).map_err(|error| {
-        ServerError::InternalError(format!("failed to decode chat response: {error}"))
+    let chat = output.value();
+    let choice = chat.choices.first().ok_or_else(|| {
+        ServerError::InternalError("chat response did not contain a choice".into())
     })?;
-    let choice = chat.choices.into_iter().next().ok_or_else(|| {
-        ServerError::InternalError("chat response did not contain a choice".to_string())
+    let message = choice.message.as_ref().ok_or_else(|| {
+        ServerError::InternalError("chat response did not contain a message".into())
     })?;
-    let message = choice.message.ok_or_else(|| {
-        ServerError::InternalError("chat response did not contain a message".to_string())
-    })?;
-    let status = if choice.finish_reason.as_deref() == Some("length") {
+    let incomplete = choice.finish_reason.as_deref() == Some("length");
+    let status = if incomplete {
         "incomplete"
     } else {
         "completed"
     };
-    let mut output = response_output_from_message(
-        message,
-        context.parallel_tool_calls,
-        context.include_encrypted_reasoning,
-        &context.tool_names,
-    )?;
-    if status == "incomplete" {
-        mark_last_output_incomplete(&mut output);
-    }
-    Ok(Json(context.response(status, output, chat.usage.as_ref(), None)).into_response())
-}
-
-fn mark_last_output_incomplete(output: &mut [Value]) {
-    if let Some(item) = output.last_mut().and_then(Value::as_object_mut) {
-        item.insert("status".to_string(), json!("incomplete"));
-    }
-}
-
-fn response_output_from_message(
-    message: ChatMessage,
-    parallel_tool_calls: bool,
-    include_encrypted_reasoning: bool,
-    tool_names: &ToolNameMap,
-) -> std::result::Result<Vec<Value>, ServerError> {
-    let mut output = Vec::new();
-    let has_reasoning = message
-        .reasoning
-        .as_ref()
-        .is_some_and(|value| !value.is_empty());
-    let call_count = message
-        .tool_calls
-        .as_ref()
-        .map(Vec::len)
-        .unwrap_or_default()
-        + usize::from(message.function_call.is_some());
-    let message_phase = if call_count > 0 {
-        AssistantMessagePhase::Commentary
-    } else {
-        AssistantMessagePhase::FinalAnswer
-    };
-    if !parallel_tool_calls && call_count > 1 {
+    let reasoning = message.reasoning.as_deref().filter(|text| !text.is_empty());
+    let calls = message.tool_calls.as_deref().unwrap_or_default();
+    let call_count = calls.len() + usize::from(message.function_call.is_some());
+    if !context.parallel_tool_calls && call_count > 1 {
         return Err(ServerError::InternalError(
-            "model emitted multiple function calls while parallel_tool_calls=false".to_string(),
+            "model emitted multiple function calls while parallel_tool_calls=false".into(),
         ));
     }
-    if let Some(reasoning) = message.reasoning.filter(|value| !value.is_empty()) {
-        output.push(reasoning_output_item(
-            format!("rs_{}", Uuid::new_v4().simple()),
-            reasoning,
-            "completed",
-            include_encrypted_reasoning,
-        ));
-    }
-    let has_calls = message
-        .tool_calls
+    let emit_text = !message.content.is_empty() || (call_count == 0 && reasoning.is_none());
+    let total = usize::from(reasoning.is_some()) + usize::from(emit_text) + call_count;
+    let ids: Vec<String> = (0..total)
+        .map(|index| {
+            format!(
+                "{}_{}",
+                if index == 0 && reasoning.is_some() {
+                    "rs"
+                } else if index == usize::from(reasoning.is_some()) && emit_text {
+                    "msg"
+                } else {
+                    "fc"
+                },
+                Uuid::new_v4().simple()
+            )
+        })
+        .collect();
+    let names: Vec<_> = calls
+        .iter()
+        .map(|call| context.tool_names.response_name(&call.function.name))
+        .chain(
+            message
+                .function_call
+                .iter()
+                .map(|call| context.tool_names.response_name(&call.name)),
+        )
+        .collect();
+    let legacy_call_id = message
+        .function_call
         .as_ref()
-        .is_some_and(|calls| !calls.is_empty())
-        || message.function_call.is_some();
-    if !message.content.is_empty() || (!has_calls && !has_reasoning) {
-        output.push(message_output_item(
-            format!("msg_{}", Uuid::new_v4().simple()),
-            message.content,
-            "completed",
-            message_phase,
-        ));
+        .map(|_| format!("call_{}", Uuid::new_v4().simple()));
+    let _metadata = output
+        .output_session()
+        .try_reserve_semantic(
+            ferrum_output::semantic_cost(&(&ids, &names, &legacy_call_id))
+                .map_err(super::server_error_from_ferrum_error)?,
+        )
+        .map_err(super::server_error_from_ferrum_error)?;
+    let mut items = Vec::with_capacity(total);
+    let item_status = |index| {
+        if incomplete && index + 1 == total {
+            "incomplete"
+        } else {
+            "completed"
+        }
+    };
+    if let Some(text) = reasoning {
+        items.push(wire::Item::Reasoning {
+            id: &ids[items.len()],
+            text,
+            status: item_status(items.len()),
+            encrypted: context.include_encrypted_reasoning,
+        });
     }
-    for call in message.tool_calls.unwrap_or_default() {
-        output.push(function_output_item(&call, "completed", tool_names));
+    if emit_text {
+        items.push(wire::Item::Message {
+            id: &ids[items.len()],
+            text: &message.content,
+            status: item_status(items.len()),
+            phase: if call_count > 0 {
+                AssistantMessagePhase::Commentary
+            } else {
+                AssistantMessagePhase::FinalAnswer
+            },
+        });
     }
-    if let Some(function) = message.function_call {
-        let call = ChatToolCall {
-            index: None,
-            id: format!("call_{}", Uuid::new_v4().simple()),
-            tool_type: "function".to_string(),
-            function,
-        };
-        output.push(function_output_item(&call, "completed", tool_names));
+    for (index, call) in calls.iter().enumerate() {
+        items.push(wire::Item::Function {
+            id: &ids[items.len()],
+            call_id: &call.id,
+            name: &names[index],
+            arguments: &call.function.arguments,
+            status: item_status(items.len()),
+        });
     }
-    Ok(output)
-}
-
-fn reasoning_output_item(
-    id: String,
-    reasoning: String,
-    status: &str,
-    include_encrypted: bool,
-) -> Value {
-    let mut item = Map::new();
-    item.insert("id".to_string(), json!(id));
-    item.insert("type".to_string(), json!("reasoning"));
-    item.insert("status".to_string(), json!(status));
-    item.insert("summary".to_string(), json!([]));
-    item.insert(
-        "content".to_string(),
-        json!([{"type": "reasoning_text", "text": reasoning}]),
-    );
-    if include_encrypted {
-        // Local model reasoning has no provider-owned encrypted state. A null
-        // expansion tells clients to replay the readable content instead.
-        item.insert("encrypted_content".to_string(), Value::Null);
+    if let Some(call) = &message.function_call {
+        items.push(wire::Item::Function {
+            id: &ids[items.len()],
+            call_id: legacy_call_id.as_deref().expect("legacy call id"),
+            name: &names[calls.len()],
+            arguments: &call.arguments,
+            status: item_status(items.len()),
+        });
     }
-    Value::Object(item)
-}
-
-fn message_output_item(
-    id: String,
-    text: String,
-    status: &str,
-    phase: AssistantMessagePhase,
-) -> Value {
-    json!({
-        "id": id,
-        "type": "message",
-        "status": status,
-        "role": "assistant",
-        "phase": phase,
-        "content": [{
-            "type": "output_text",
-            "text": text,
-            "annotations": [],
-            "logprobs": []
-        }]
-    })
-}
-
-fn function_output_item(call: &ChatToolCall, status: &str, tool_names: &ToolNameMap) -> Value {
-    let response_name = tool_names.response_name(&call.function.name);
-    function_call_item(
-        format!("fc_{}", Uuid::new_v4().simple()),
+    let response = wire::ResponseView {
+        context: &context,
         status,
-        &call.id,
-        &response_name,
-        &call.function.arguments,
-    )
-}
-
-fn function_call_item(
-    id: String,
-    status: &str,
-    call_id: &str,
-    response_name: &ResponseToolName,
-    arguments: &str,
-) -> Value {
-    let mut item = json!({
-        "id": id,
-        "type": "function_call",
-        "status": status,
-        "call_id": call_id,
-        "name": response_name.name,
-        "arguments": arguments
-    });
-    if let Some(namespace) = response_name.namespace.as_deref() {
-        item.as_object_mut()
-            .expect("function call item is an object")
-            .insert("namespace".to_string(), json!(namespace));
-    }
-    item
-}
-
-fn function_call_arguments_done(
-    item_id: &str,
-    output_index: usize,
-    call_id: &str,
-    response_name: &ResponseToolName,
-    arguments: &str,
-) -> Value {
-    let mut event = json!({
-        "item_id": item_id,
-        "output_index": output_index,
-        "call_id": call_id,
-        "name": response_name.name,
-        "arguments": arguments
-    });
-    if let Some(namespace) = response_name.namespace.as_deref() {
-        event
-            .as_object_mut()
-            .expect("function arguments event is an object")
-            .insert("namespace".to_string(), json!(namespace));
-    }
-    event
+        output: &items,
+        usage: chat.usage.as_ref(),
+        completed_at: Some(chrono::Utc::now().timestamp() as u64),
+    };
+    super::output::json_response(output.output_session(), &response)
+        .await
+        .map_err(super::server_error_from_ferrum_error)
 }
 
 #[cfg(test)]
@@ -782,7 +642,7 @@ mod tests {
         .expect("captured Codex request");
 
         let converted = request.convert().expect("Codex HTTP request conversion");
-        assert!(converted.stream);
+        assert_eq!(converted.chat.stream, Some(true));
         assert_eq!(converted.chat.messages.len(), 4);
         assert_eq!(converted.chat.messages[0].role, MessageRole::System);
         assert_eq!(
@@ -905,21 +765,35 @@ mod tests {
                 arguments: "{}".to_string(),
             },
         };
-        let item = function_output_item(&backend_call, "completed", &converted.response.tool_names);
+        let name = converted
+            .response
+            .tool_names
+            .response_name(&backend_call.function.name);
+        let item = serde_json::to_value(wire::Item::Function {
+            id: "fc_test",
+            status: "completed",
+            call_id: &backend_call.id,
+            name: &name,
+            arguments: &backend_call.function.arguments,
+        })
+        .unwrap();
         assert_eq!(item["namespace"], "collaboration");
         assert_eq!(item["name"], "wait_agent");
         assert_ne!(item["name"], "collaboration__wait_agent__2");
 
-        let arguments_done = function_call_arguments_done(
-            "fc_1",
-            0,
-            "call_2",
-            &converted
-                .response
-                .tool_names
-                .response_name(&collaboration_alias),
-            "{}",
-        );
+        let name = converted
+            .response
+            .tool_names
+            .response_name(&collaboration_alias);
+        let arguments_done = serde_json::to_value(wire::ArgumentsEvent {
+            item_id: "fc_1",
+            output_index: 0,
+            call_id: "call_2",
+            name: &name.name,
+            arguments: "{}",
+            namespace: name.namespace.as_deref(),
+        })
+        .unwrap();
         assert_eq!(arguments_done["namespace"], "collaboration");
         assert_eq!(arguments_done["name"], "wait_agent");
 

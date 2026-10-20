@@ -469,39 +469,20 @@ fn metal_static_weight_allocation(
         ));
     }
     if let Some(retained) = payload.retained_host_memory() {
-        let page_size = system_page_size()?;
-        let owner = retained.owner_bytes();
-        let owner_start = owner.as_ptr() as usize;
-        let owner_end = owner_start.checked_add(owner.len());
-        let region_start = retained.bytes().as_ptr() as usize;
-        let region_end = region_start.checked_add(retained.length_bytes());
-        if owner_start.is_multiple_of(page_size) && region_start.is_multiple_of(required_alignment)
+        if let Some(native) = super::retained_memory::new_retained_buffer(
+            device,
+            retained.clone(),
+            payload.bytes(),
+            required_alignment,
+        )
+        .map_err(|error| MetalDeviceRuntimeError::contract(error.to_string()))?
         {
-            if let (Some(owner_end), Some(region_end)) = (owner_end, region_end) {
-                let aligned_start = region_start / page_size * page_size;
-                let aligned_end = region_end
-                    .checked_add(page_size - 1)
-                    .map(|end| end / page_size * page_size);
-                if let Some(aligned_end) = aligned_end {
-                    if aligned_start >= owner_start && aligned_end <= owner_end {
-                        let aligned_len = aligned_end - aligned_start;
-                        let base = device.new_buffer_with_bytes_no_copy(
-                            aligned_start as *const c_void,
-                            aligned_len as u64,
-                            MTLResourceOptions::StorageModeShared,
-                            None,
-                        );
-                        if base.length() == aligned_len as u64 {
-                            return Ok(Arc::new(MetalAllocation {
-                                base,
-                                aligned_offset_bytes: (region_start - aligned_start) as u64,
-                                requested_bytes: retained.length_bytes() as u64,
-                                _retained_host_memory: Some(retained.clone()),
-                            }));
-                        }
-                    }
-                }
-            }
+            return Ok(Arc::new(MetalAllocation {
+                base: native.buffer,
+                aligned_offset_bytes: native.byte_offset as u64,
+                requested_bytes: retained.length_bytes() as u64,
+                _retained_host_memory: Some(retained.clone()),
+            }));
         }
     }
 
@@ -557,19 +538,6 @@ fn metal_static_weight_allocation(
         requested_bytes: length_bytes,
         _retained_host_memory: None,
     }))
-}
-
-fn system_page_size() -> Result<usize, MetalDeviceRuntimeError> {
-    let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
-    let page_size = usize::try_from(page_size).map_err(|_| {
-        MetalDeviceRuntimeError::contract("host page size is unavailable for Metal no-copy import")
-    })?;
-    if !page_size.is_power_of_two() {
-        return Err(MetalDeviceRuntimeError::contract(
-            "host page size is not a power of two",
-        ));
-    }
-    Ok(page_size)
 }
 
 /// Owned physical Metal range retained by an encoded command and its fence.
@@ -674,6 +642,8 @@ fn new_counter_sample_buffer_checked(
         msg_send![device, newCounterSampleBufferWithDescriptor: descriptor error: &mut error]
     };
     if buffer.is_null() {
+        #[cfg(test)]
+        counter_diagnostic::report_counter_allocation_error(error);
         Err(())
     } else {
         Ok(unsafe { CounterSampleBuffer::from_ptr(buffer) })
@@ -1957,7 +1927,7 @@ impl fmt::Debug for MetalDeviceRuntime {
 
 impl MetalDeviceRuntime {
     pub fn new(config: MetalDeviceRuntimeConfig) -> Result<Self, MetalDeviceRuntimeError> {
-        let device = st().pipes.device.clone();
+        let device = st().pipes.device().clone();
         let descriptor = DeviceDescriptor {
             id: config.device_id,
             class: DeviceClass::Accelerator,
@@ -3073,7 +3043,8 @@ mod tests {
         let weights = runtime
             .allocate_request(&weight_buffer_request("resource/mmap-weights", 8))
             .expect("logical weight arena");
-        let page_size = system_page_size().expect("page size");
+        let page_size =
+            crate::backend::metal::retained_memory::native_page_size().expect("page size");
         let owner = Arc::new(PageMemory::new(page_size));
         let retained = RetainedHostMemoryRegion::new(Arc::clone(&owner), 128, 8).unwrap();
         let component = weight_component("component.mmap", "mmap.weight", 8);
@@ -3098,7 +3069,8 @@ mod tests {
     #[test]
     fn static_weight_import_copies_retained_regions_without_a_safe_native_view() {
         let runtime = runtime();
-        let page_size = system_page_size().expect("page size");
+        let page_size =
+            crate::backend::metal::retained_memory::native_page_size().expect("page size");
         for (suffix, owner_length, region_offset) in [
             ("misaligned", page_size, 1_usize),
             ("partial-tail-page", page_size + 8, page_size),

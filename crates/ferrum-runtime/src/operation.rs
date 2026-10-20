@@ -8,6 +8,7 @@ mod compiled_submission_wave;
 mod descriptor;
 mod determinism;
 mod determinism_artifact;
+mod device_facts;
 mod dispatch;
 mod dispatch_contract;
 mod foundation;
@@ -50,6 +51,7 @@ mod semantic;
 mod storage_profile;
 mod tensor_contract;
 mod weight_contract;
+mod work_facts;
 mod workspace_encoding;
 
 pub use attribute::{AttributeConstraint, AttributeSchema, AttributeSpec};

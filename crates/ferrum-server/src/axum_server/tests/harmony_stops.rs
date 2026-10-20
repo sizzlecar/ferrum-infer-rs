@@ -42,6 +42,7 @@ fn router(chunks: &[&str], finish_reason: FinishReason, separate_final: bool) ->
     AxumServer::from_llm(Arc::new(engine))
         .with_prompt_template(Some(harmony_json_template()))
         .build_router()
+        .unwrap()
 }
 
 fn request(stream: bool, stop: Option<&str>) -> Value {

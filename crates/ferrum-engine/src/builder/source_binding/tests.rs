@@ -1,8 +1,10 @@
 use super::*;
 use crate::builder::EngineBuilder;
+use ferrum_execution::executor_lifecycle::{
+    ExecutorOwner, ExecutorScope, ExecutorShutdownObserver, ExecutorShutdownPermit,
+};
 use ferrum_execution::model_executor::{
-    DecodeInput, DecodeOutput, ExecutorCapabilities, ExecutorStatus, PlanRuntimeResourceSnapshot,
-    PrefillInput, PrefillOutput,
+    ExecutorCapabilities, ExecutorStatus, PlanRuntimeResourceSnapshot,
 };
 use ferrum_runtime::{
     DeviceId, ModelSourceKind, OriginalModelSource, OriginalModelSources, ResolvedModelSources,
@@ -29,25 +31,35 @@ enum SourceReport {
 }
 
 struct BindingProbe {
-    inner: Arc<dyn ModelExecutor>,
+    inner: ExecutorScope,
+    owner: ExecutorOwner,
     report: SourceReport,
+    observation: Arc<BindingObservation>,
+}
+
+struct BindingObservation {
     startup_calls: AtomicUsize,
     memory_plan_reads: AtomicUsize,
 }
 
 impl BindingProbe {
-    fn new(inner: Arc<dyn ModelExecutor>, report: SourceReport) -> Arc<Self> {
-        Arc::new(Self {
-            inner,
-            report,
+    fn new(owner: ExecutorOwner, report: SourceReport) -> (ExecutorOwner, Arc<BindingObservation>) {
+        let observation = Arc::new(BindingObservation {
             startup_calls: AtomicUsize::new(0),
             memory_plan_reads: AtomicUsize::new(0),
-        })
+        });
+        let probe = Self {
+            inner: owner.scope().unwrap(),
+            owner,
+            report,
+            observation: Arc::clone(&observation),
+        };
+        (ExecutorOwner::new(Box::new(probe)), observation)
     }
 
-    fn mock(report: SourceReport) -> Arc<Self> {
+    fn mock(report: SourceReport) -> (ExecutorOwner, Arc<BindingObservation>) {
         Self::new(
-            Arc::new(ferrum_testkit::MockModelExecutor::instant(128)),
+            ExecutorOwner::new(Box::new(ferrum_testkit::MockModelExecutor::instant(128))),
             report,
         )
     }
@@ -55,6 +67,30 @@ impl BindingProbe {
 
 #[async_trait::async_trait]
 impl ModelExecutor for BindingProbe {
+    fn begin_shutdown(
+        self: Arc<Self>,
+        permit: &ExecutorShutdownPermit,
+    ) -> ExecutorShutdownObserver {
+        if let Err(error) = permit.check(self.as_ref()) {
+            return ExecutorShutdownObserver::retained(Arc::new(self), error);
+        }
+        match Arc::try_unwrap(self) {
+            Ok(Self {
+                inner,
+                owner,
+                report: _,
+                observation: _,
+            }) => {
+                drop(inner);
+                owner.begin_shutdown()
+            }
+            Err(original) => ExecutorShutdownObserver::retained(
+                Arc::new(original),
+                FerrumError::internal("source binding probe still has execution borrowers"),
+            ),
+        }
+    }
+
     fn info(&self) -> &ModelInfo {
         self.inner.info()
     }
@@ -71,8 +107,8 @@ impl ModelExecutor for BindingProbe {
         self.inner.resolved_model_plan()
     }
 
-    fn execution_resource_authority(&self) -> ExecutionResourceAuthority {
-        self.inner.execution_resource_authority()
+    fn execution_planning_model(&self) -> ExecutionPlanningModel {
+        self.inner.execution_planning_model()
     }
 
     fn admission_limits(&self) -> Result<Option<ExecutorAdmissionLimits>> {
@@ -88,21 +124,17 @@ impl ModelExecutor for BindingProbe {
     }
 
     fn startup_memory_plan(&self) -> Option<&ferrum_types::StartupMemoryPlan> {
-        self.memory_plan_reads.fetch_add(1, Ordering::Relaxed);
+        self.observation
+            .memory_plan_reads
+            .fetch_add(1, Ordering::Relaxed);
         self.inner.startup_memory_plan()
     }
 
     async fn prepare_startup(&self) -> Result<()> {
-        self.startup_calls.fetch_add(1, Ordering::Relaxed);
+        self.observation
+            .startup_calls
+            .fetch_add(1, Ordering::Relaxed);
         self.inner.prepare_startup().await
-    }
-
-    async fn prefill(&self, input: &PrefillInput) -> Result<PrefillOutput> {
-        self.inner.prefill(input).await
-    }
-
-    async fn decode(&self, input: &DecodeInput) -> Result<DecodeOutput> {
-        self.inner.decode(input).await
     }
 
     fn capabilities(&self) -> ExecutorCapabilities {
@@ -148,17 +180,18 @@ fn unregistered_sources() -> (FixtureDir, Arc<ProductionModelSourceBundle>) {
 
 fn custom_builder(
     sources: Arc<ProductionModelSourceBundle>,
-    probe: Arc<BindingProbe>,
+    owner: &ExecutorOwner,
 ) -> EngineBuilder {
     EngineBuilder::new(EngineConfig::default())
         .with_model_sources(sources)
         .with_tokenizer("stub")
-        .with_custom_executor(probe)
+        .with_custom_executor(owner.scope().unwrap())
 }
 
 async fn assert_rejected_before_startup(
     builder: EngineBuilder,
-    probe: &BindingProbe,
+    probe: &BindingObservation,
+    owner: &ExecutorOwner,
     reason: &str,
 ) {
     let error = builder
@@ -172,47 +205,52 @@ async fn assert_rejected_before_startup(
     );
     assert_eq!(probe.startup_calls.load(Ordering::Relaxed), 0);
     assert_eq!(probe.memory_plan_reads.load(Ordering::Relaxed), 0);
+    owner.begin_shutdown().wait().await.result().unwrap();
 }
 
 #[tokio::test]
 async fn source_binding_preserves_source_independent_custom_executor() {
-    let probe = BindingProbe::mock(SourceReport::Missing);
+    let (owner, probe) = BindingProbe::mock(SourceReport::Missing);
     let engine = EngineBuilder::new(EngineConfig::default())
-        .with_custom_executor(probe.clone())
+        .with_custom_executor(owner.scope().unwrap())
         .build()
         .await
         .unwrap();
     assert_eq!(probe.startup_calls.load(Ordering::Relaxed), 1);
     engine.shutdown().await.unwrap();
+    owner.begin_shutdown().wait().await.result().unwrap();
 }
 
 #[tokio::test]
 async fn source_binding_accepts_matching_custom_and_delegated_sources() {
     let (_dir, sources) = unregistered_sources();
     for delegate in [false, true] {
-        let inner = BindingProbe::mock(SourceReport::Bound(sources.resolved_sources().clone()));
-        let probe = if delegate {
-            BindingProbe::new(inner.clone(), SourceReport::Delegate)
+        let (inner_owner, inner) =
+            BindingProbe::mock(SourceReport::Bound(sources.resolved_sources().clone()));
+        let (owner, probe) = if delegate {
+            BindingProbe::new(inner_owner, SourceReport::Delegate)
         } else {
-            inner.clone()
+            (inner_owner, Arc::clone(&inner))
         };
-        let engine = custom_builder(sources.clone(), probe.clone())
+        let engine = custom_builder(sources.clone(), &owner)
             .build()
             .await
             .unwrap();
         assert_eq!(probe.startup_calls.load(Ordering::Relaxed), 1);
         assert_eq!(inner.startup_calls.load(Ordering::Relaxed), 1);
         engine.shutdown().await.unwrap();
+        owner.begin_shutdown().wait().await.result().unwrap();
     }
 }
 
 #[tokio::test]
 async fn source_binding_rejects_missing_and_each_mismatched_role_before_startup() {
     let (_dir, sources) = unregistered_sources();
-    let missing = BindingProbe::mock(SourceReport::Missing);
+    let (owner, missing) = BindingProbe::mock(SourceReport::Missing);
     assert_rejected_before_startup(
-        custom_builder(sources.clone(), missing.clone()),
+        custom_builder(sources.clone(), &owner),
         &missing,
+        &owner,
         "did not report its bound product model sources",
     )
     .await;
@@ -224,10 +262,11 @@ async fn source_binding_rejects_missing_and_each_mismatched_role_before_startup(
             ModelArtifactSourceRole::Weights => &mut reported.weights,
         };
         changed.files[0].sha256 = "a".repeat(64);
-        let probe = BindingProbe::mock(SourceReport::Bound(reported));
+        let (owner, probe) = BindingProbe::mock(SourceReport::Bound(reported));
         assert_rejected_before_startup(
-            custom_builder(sources.clone(), probe.clone()),
+            custom_builder(sources.clone(), &owner),
             &probe,
+            &owner,
             "executor bound model sources differ",
         )
         .await;
@@ -237,11 +276,17 @@ async fn source_binding_rejects_missing_and_each_mismatched_role_before_startup(
 #[tokio::test]
 async fn source_binding_legacy_custom_cannot_bypass_required_numerical_profile() {
     let (_dir, sources) = unregistered_sources();
-    let probe = BindingProbe::mock(SourceReport::Bound(sources.resolved_sources().clone()));
-    let mut builder = custom_builder(sources, probe.clone());
+    let (owner, probe) =
+        BindingProbe::mock(SourceReport::Bound(sources.resolved_sources().clone()));
+    let mut builder = custom_builder(sources, &owner);
     builder.config.numerical_execution = "fixture.explicit-profile".parse().unwrap();
-    assert_rejected_before_startup(builder, &probe, "requires a registered vNext model package")
-        .await;
+    assert_rejected_before_startup(
+        builder,
+        &probe,
+        &owner,
+        "requires a registered vNext model package",
+    )
+    .await;
 }
 
 fn defined_fixture(context: usize) -> (FixtureDir, Arc<DefinedProductionModel>) {
@@ -261,7 +306,7 @@ fn defined_fixture(context: usize) -> (FixtureDir, Arc<DefinedProductionModel>) 
     (dir, Arc::new(defined))
 }
 
-fn typed_executor(defined: &DefinedProductionModel) -> (EngineConfig, Arc<dyn ModelExecutor>) {
+fn typed_executor(defined: &DefinedProductionModel) -> (EngineConfig, ExecutorOwner) {
     use ferrum_kernels::backend::cpu::vnext_ops::CpuVNextComposition;
 
     let mut config = EngineConfig::default();
@@ -280,7 +325,7 @@ fn typed_executor(defined: &DefinedProductionModel) -> (EngineConfig, Arc<dyn Mo
     .unwrap();
     let (runtime, operations, materializers, materializer, catalog) =
         composition.into_parts().unwrap();
-    let executor = crate::product_composition::create_vnext_executor(
+    let executor = crate::product_composition::create_program_executor(
         &config,
         defined,
         runtime,
@@ -291,14 +336,14 @@ fn typed_executor(defined: &DefinedProductionModel) -> (EngineConfig, Arc<dyn Mo
         None,
     )
     .unwrap();
-    (config, Arc::new(executor))
+    (config, ExecutorOwner::new(Box::new(executor)))
 }
 
 #[tokio::test]
 async fn source_binding_typed_delegation_accepts_frozen_sources_and_prepared_profile() {
     let (dir, defined) = defined_fixture(16);
     let (config, executor) = typed_executor(&defined);
-    let probe = BindingProbe::new(executor, SourceReport::Delegate);
+    let (owner, probe) = BindingProbe::new(executor, SourceReport::Delegate);
     // Validation consumes the retained source bytes, never a later semantic
     // reread that could choose another architecture or definition.
     std::fs::write(
@@ -308,12 +353,13 @@ async fn source_binding_typed_delegation_accepts_frozen_sources_and_prepared_pro
     .unwrap();
     let engine = EngineBuilder::new(config)
         .with_defined_model(defined)
-        .with_custom_executor(probe.clone())
+        .with_custom_executor(owner.scope().unwrap())
         .build()
         .await
         .unwrap();
     assert_eq!(probe.startup_calls.load(Ordering::Relaxed), 1);
     engine.shutdown().await.unwrap();
+    owner.begin_shutdown().wait().await.result().unwrap();
 }
 
 #[tokio::test]
@@ -321,23 +367,66 @@ async fn source_binding_typed_plan_cannot_hide_other_sources_or_definition() {
     let (_dir, defined) = defined_fixture(16);
     let (_other_dir, other_defined) = defined_fixture(32);
     let (config, executor) = typed_executor(&defined);
-    let plan = executor.resolved_model_plan().unwrap();
-    validate_defined_family(&defined, plan).unwrap();
-    let error = validate_defined_family(&other_defined, plan).unwrap_err();
-    assert!(error.to_string().contains("prepared family differs"));
+    {
+        let scope = executor.scope().unwrap();
+        let plan = scope.resolved_model_plan().unwrap();
+        validate_defined_family(&defined, plan).unwrap();
+        let error = validate_defined_family(&other_defined, plan).unwrap_err();
+        assert!(error.to_string().contains("prepared family differs"));
+    }
 
     // Matching wrapper metadata does not replace the actual typed plan's
     // bound source identity.
-    let probe = BindingProbe::new(
+    let (owner, probe) = BindingProbe::new(
         executor,
         SourceReport::Bound(other_defined.sources().resolved_sources().clone()),
     );
     assert_rejected_before_startup(
         EngineBuilder::new(config)
             .with_defined_model(other_defined)
-            .with_custom_executor(probe.clone()),
+            .with_custom_executor(owner.scope().unwrap()),
         &probe,
+        &owner,
         "resolved plan sources differ",
     )
     .await;
+}
+
+#[tokio::test]
+async fn source_binding_failure_preserves_owned_original_cpu_retirement() {
+    use ferrum_execution::ExecutorShutdownPhase;
+    use ferrum_models::test_support::{tiny_llama_executor_owned, TinyLlamaConfig};
+    let (_directory, sources) = unregistered_sources();
+    let owner = ExecutorOwner::new(tiny_llama_executor_owned(&TinyLlamaConfig::default()));
+    let peer = owner.scope().unwrap();
+    let original = owner.shutdown_observer();
+    let error = EngineBuilder::new(EngineConfig::default())
+        .with_model_sources(sources)
+        .with_tokenizer("stub")
+        .with_owned_executor(owner)
+        .unwrap()
+        .build()
+        .await
+        .err()
+        .expect("original CPU executor has no binding for these unrelated sources");
+    assert!(error
+        .cause()
+        .to_string()
+        .contains("did not report its bound"));
+    let mut cleanup = error
+        .cleanup()
+        .expect("source failure must keep cleanup")
+        .clone();
+    assert_eq!(cleanup.snapshot().phase(), ExecutorShutdownPhase::Draining);
+    drop(error);
+    drop(peer);
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while cleanup.snapshot().phase() != ExecutorShutdownPhase::Retired {
+            cleanup.changed().await;
+        }
+    })
+    .await
+    .unwrap();
+    cleanup.snapshot().result().unwrap();
+    assert_eq!(original.snapshot().phase(), ExecutorShutdownPhase::Retired);
 }

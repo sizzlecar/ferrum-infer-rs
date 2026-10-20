@@ -5,11 +5,9 @@
 //! Extracted from `cuda/mod.rs` (#8 Phase 3). Owns:
 //!
 //! - `GptqStoreCuda` enum + cfg-gated alias — chooses Marlin (default)
-//!   vs Triton-rs w4a16 store at runtime via `FERRUM_TRITON_INT4=1`.
-//! - `use_triton_int4()` / `use_vllm_moe()` env-var dispatch toggles.
-//! - `MarlinGatherScratch` + `marlin_gather_scratch_slots` +
-//!   `with_marlin_gather_scratch` + `pregrow_marlin_gather_scratch_helper`
-//!   — per-device staging buffers for desc_act perm-aware Marlin
+//!   vs Triton-rs w4a16 store from the original context's typed policy.
+//! - `MarlinGatherScratch` + `with_marlin_gather_scratch` +
+//!   `pregrow_marlin_gather_scratch` — instance staging for desc_act Marlin
 //!   (avoids per-call cudarc alloc that grew unboundedly).
 //! - `moe_gemm_phase_fused_impl` (Stage 12 fused MoE Marlin one-launch-per-bucket).
 //! - `marlin_gemm_with_perm` — perm-aware dispatcher used by both
@@ -23,8 +21,7 @@
 //! preserve the historical `crate::backend::cuda::*` paths used by
 //! `quant_linear::cuda_marlin` and parity tests.
 
-use std::collections::HashMap;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 use cudarc::driver::{
     CudaContext, CudaFunction, CudaModule, CudaSlice, CudaStream, DeviceRepr, LaunchConfig,
@@ -33,7 +30,7 @@ use cudarc::driver::{
 use ferrum_types::{FerrumError, Result};
 use half::f16;
 
-use super::{current_device_ordinal, default_stream, CudaBackend, CudaState};
+use super::{CudaBackend, CudaState};
 use crate::backend::{Backend, BackendQuantGguf, BackendQuantMarlin};
 use crate::ptx;
 
@@ -43,18 +40,15 @@ use crate::ptx;
 
 /// CUDA-side GPTQ weight, pre-loaded for one of two fused INT4×FP16 paths.
 ///
-/// Selected once per weight at load time (`load_gptq`) based on the
-/// `FERRUM_TRITON_INT4` env var:
-///   - unset / `0`: build `Marlin` (the existing default — Marlin's tile
+/// Selected once per weight at load time from `context.cuda.triton_int4`:
+///   - false: build `Marlin` (the existing default — Marlin's tile
 ///     repack runs on the CPU; inference uses the hand-tuned CUTLASS
 ///     kernel from IST-DASLab/marlin).
-///   - `1`: build `Triton` (port of vLLM's `triton_w4a16_gemm_kernel`,
+///   - true: build `Triton` (port of vLLM's `triton_w4a16_gemm_kernel`,
 ///     adapted to ferrum's on-disk GPTQ layout — no host-side repack).
 ///
-/// The two stores cannot coexist for the same layer (load-time gating),
-/// so a process-wide A/B comparison runs as two separate `bench`
-/// invocations. This avoids doubling VRAM and keeps the dispatch
-/// branchless on the hot path.
+/// Each instance loads one actual representation per layer. Different
+/// instances may select different representations without process state.
 #[cfg(feature = "triton-kernels")]
 pub enum GptqStoreCuda {
     Marlin(crate::marlin::MarlinWeight),
@@ -67,86 +61,6 @@ pub enum GptqStoreCuda {
 /// can stay shape-identical between the two cfgs.
 #[cfg(not(feature = "triton-kernels"))]
 pub type GptqStoreCuda = crate::marlin::MarlinWeight;
-
-/// Read `FERRUM_TRITON_INT4` once. Returns true iff `=1`. Anything else
-/// (unset, `0`, empty, garbage) → false.
-fn use_triton_int4() -> bool {
-    cuda_quant_runtime_config().triton_int4
-}
-
-/// Read `FERRUM_VLLM_MOE` once. Returns true iff `=1`. Selects the
-/// vLLM marlin_moe_wna16 native artifact path for stacked-MoE GPTQ INT4
-/// weights (load + dispatch pair must be enabled together).
-#[cfg(feature = "vllm-moe-marlin")]
-pub(crate) fn use_vllm_moe() -> bool {
-    cuda_quant_runtime_config().vllm_moe
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct CudaQuantRuntimeConfig {
-    triton_int4: bool,
-    vllm_moe: bool,
-    vllm_marlin: bool,
-    vllm_marlin_sms: i32,
-    vllm_atomic_add: bool,
-    vllm_fp32_reduce: bool,
-    moe_fused: bool,
-    moe_streams: usize,
-}
-
-impl CudaQuantRuntimeConfig {
-    fn from_env() -> Self {
-        Self::from_env_vars(std::env::vars())
-    }
-
-    fn from_env_vars<I, K, V>(vars: I) -> Self
-    where
-        I: IntoIterator<Item = (K, V)>,
-        K: AsRef<str>,
-        V: AsRef<str>,
-    {
-        let mut config = Self {
-            triton_int4: false,
-            vllm_moe: false,
-            vllm_marlin: false,
-            vllm_marlin_sms: 128,
-            vllm_atomic_add: false,
-            vllm_fp32_reduce: false,
-            moe_fused: true,
-            moe_streams: 4,
-        };
-
-        for (name, value) in vars {
-            let value = value.as_ref();
-            match name.as_ref() {
-                "FERRUM_TRITON_INT4" => config.triton_int4 = value == "1",
-                "FERRUM_VLLM_MOE" => config.vllm_moe = value == "1",
-                "FERRUM_VLLM_MARLIN" => config.vllm_marlin = value == "1",
-                "FERRUM_VLLM_MARLIN_SMS" => {
-                    if let Ok(sms) = value.parse::<i32>() {
-                        config.vllm_marlin_sms = sms;
-                    }
-                }
-                "FERRUM_VLLM_ATOMIC_ADD" => config.vllm_atomic_add = value == "1",
-                "FERRUM_VLLM_FP32_REDUCE" => config.vllm_fp32_reduce = value == "1",
-                "FERRUM_MOE_FUSED" => config.moe_fused = value != "0",
-                "FERRUM_MOE_STREAMS" => {
-                    if let Ok(streams) = value.parse::<usize>() {
-                        config.moe_streams = streams.max(1);
-                    }
-                }
-                _ => {}
-            }
-        }
-
-        config
-    }
-}
-
-fn cuda_quant_runtime_config() -> &'static CudaQuantRuntimeConfig {
-    static CONFIG: OnceLock<CudaQuantRuntimeConfig> = OnceLock::new();
-    CONFIG.get_or_init(CudaQuantRuntimeConfig::from_env)
-}
 
 fn marlin_qzeros_are_symmetric_code7(qzeros: &[i32]) -> bool {
     !qzeros.is_empty()
@@ -197,114 +111,51 @@ fn reject_unsupported_marlin_qzeros(context: &str, qzeros: &[i32]) -> Result<()>
 // gather kernel per Marlin call (~10us on H≤14336 / m≤32) — net cost
 // dominated by the Marlin GEMM that follows, not the gather.
 
+/// The original context owns the gather buffer and all captured predecessors.
 #[cfg(feature = "marlin")]
-/// Process-global scratch buffer for the perm-aware Marlin's `a_gathered`
-/// staging slot. Without this, every `marlin_gemm_with_perm` call did
-/// `stream.alloc::<f16>(m * k)` and dropped at scope end — cudarc's
-/// allocator pool grew unboundedly (≥ 32 MB / iter × 200 iters → ~6 GB
-/// VRAM after one c=16 bench rep, OOM on rep 2). Now we keep one slot
-/// per process, grown on demand to the largest `m * k` ever requested.
-struct MarlinGatherScratch {
+pub(super) struct MarlinGatherScratch {
     buf: CudaSlice<f16>,
-    capacity: usize, // in f16 elements
-}
-unsafe impl Send for MarlinGatherScratch {}
-unsafe impl Sync for MarlinGatherScratch {}
-
-static MARLIN_GATHER_SCRATCH: std::sync::OnceLock<
-    std::sync::RwLock<HashMap<usize, MarlinGatherScratch>>,
-> = std::sync::OnceLock::new();
-
-fn marlin_gather_scratch_slots() -> &'static std::sync::RwLock<HashMap<usize, MarlinGatherScratch>>
-{
-    MARLIN_GATHER_SCRATCH.get_or_init(|| std::sync::RwLock::new(HashMap::new()))
+    capacity: usize,
 }
 
-/// Run `body` with a mut ref to a Marlin-gather scratch buffer of at
-/// least `required` f16 elements. Reuses the existing slot if it fits;
-/// reallocates (replacing the old one) if it needs to grow.
-/// Pre-grow the marlin_gather_scratch slot to at least `required`
-/// elements. Idempotent. Used by callers that are about to enter a
-/// CUDA-graph capture region — `with_marlin_gather_scratch`'s
-/// in-place grow does `stream.alloc::<f16>(required)`, and CUDA
-/// graph capture rejects runtime allocs inside the captured region
-/// with `CUDA_ERROR_INVALID_VALUE`. Pre-warming OUTSIDE the capture
-/// keeps the alloc eager, the capture-region kernel launches just
-/// re-use the existing slot's pointer.
 #[cfg(feature = "marlin")]
-pub fn pregrow_marlin_gather_scratch(stream: &Arc<CudaStream>, required: usize) {
-    pregrow_marlin_gather_scratch_for_ordinal(current_device_ordinal(), stream, required);
-}
-
-fn pregrow_marlin_gather_scratch_for_ordinal(
-    ordinal: usize,
-    stream: &Arc<CudaStream>,
-    required: usize,
-) {
-    let slots = marlin_gather_scratch_slots();
+pub fn pregrow_marlin_gather_scratch(ctx: &mut CudaState, required: usize) {
+    if ctx
+        .marlin_gather_scratch
+        .as_ref()
+        .is_some_and(|s| s.capacity >= required)
     {
-        let g = slots.read().expect("MARLIN_GATHER_SCRATCH poisoned");
-        if let Some(s) = g.get(&ordinal) {
-            if s.capacity >= required {
-                return;
-            }
-        }
+        return;
     }
-    let mut w = slots.write().expect("MARLIN_GATHER_SCRATCH poisoned");
-    let need_new = match w.get(&ordinal) {
-        Some(s) => s.capacity < required,
-        None => true,
+    assert!(
+        !ctx.capture_in_flight,
+        "Marlin gather scratch growth during CUDA capture"
+    );
+    let buf =
+        unsafe { ctx.stream.alloc::<f16>(required) }.expect("Marlin gather scratch allocation");
+    let next = MarlinGatherScratch {
+        buf,
+        capacity: required,
     };
-    if need_new {
-        let buf = unsafe { stream.alloc::<f16>(required) }
-            .expect("MARLIN_GATHER_SCRATCH pregrow alloc failed");
-        w.insert(
-            ordinal,
-            MarlinGatherScratch {
-                buf,
-                capacity: required,
-            },
-        );
+    if let Some(previous) = ctx.marlin_gather_scratch.replace(next) {
+        ctx.captured_storage.push(Box::new(previous));
     }
 }
 
+#[cfg(feature = "marlin")]
 fn with_marlin_gather_scratch<R>(
-    stream: &Arc<CudaStream>,
-    ordinal: usize,
+    ctx: &mut CudaState,
     required: usize,
     body: impl FnOnce(&mut CudaSlice<f16>) -> R,
 ) -> R {
-    let slots = marlin_gather_scratch_slots();
-    {
-        let g = slots.read().expect("MARLIN_GATHER_SCRATCH poisoned");
-        if let Some(s) = g.get(&ordinal) {
-            if s.capacity >= required {
-                drop(g);
-                let mut w = slots.write().expect("MARLIN_GATHER_SCRATCH poisoned");
-                let s = w.get_mut(&ordinal).expect("just observed Some");
-                return body(&mut s.buf);
-            }
-        }
-    }
-    // Need to (re)allocate.
-    let mut w = slots.write().expect("MARLIN_GATHER_SCRATCH poisoned");
-    let need_new = match w.get(&ordinal) {
-        Some(s) => s.capacity < required,
-        None => true,
-    };
-    if need_new {
-        let buf =
-            unsafe { stream.alloc::<f16>(required) }.expect("MARLIN_GATHER_SCRATCH alloc failed");
-        w.insert(
-            ordinal,
-            MarlinGatherScratch {
-                buf,
-                capacity: required,
-            },
-        );
-    }
-    let s = w.get_mut(&ordinal).expect("just allocated");
-    body(&mut s.buf)
+    pregrow_marlin_gather_scratch(ctx, required);
+    body(
+        &mut ctx
+            .marlin_gather_scratch
+            .as_mut()
+            .expect("prepared gather scratch")
+            .buf,
+    )
 }
 // ────────────────────────────────────────────────────────────────────────
 // Stage 12 — Fused MoE Marlin: bucket dispatches by max-m, fire one
@@ -424,8 +275,13 @@ pub fn marlin_gemm_with_perm(
     out: &mut CudaSlice<f16>,
     m: usize,
 ) -> Result<()> {
-    let runtime_config = cuda_quant_runtime_config();
-    let use_vllm = runtime_config.vllm_marlin;
+    let use_vllm = ctx.configuration.cuda.vllm_marlin;
+    let skip_zero = ctx.configuration.cuda.marlin_skip_ws_zero;
+    let vllm_options = (
+        ctx.configuration.cuda.vllm_marlin_sms,
+        ctx.configuration.cuda.vllm_atomic_add,
+        ctx.configuration.cuda.vllm_fp32_reduce,
+    );
     if weight.vllm_moe {
         return Err(FerrumError::unsupported(
             "vLLM Marlin-MoE packed weight cannot be dispatched through dense Marlin GEMM",
@@ -440,23 +296,8 @@ pub fn marlin_gemm_with_perm(
         let k_i32 = k as i32;
         let block_x: u32 = 512;
         let grid_y: u32 = ((k as u32) + block_x - 1) / block_x;
-        // Borrow the gather-scratch slot for the entire (gather +
-        // marlin_gemm) sequence so the GPU work using `a_gathered`
-        // completes (or at least gets stream-ordered) before another
-        // marlin_gemm_with_perm caller can grab the same buffer.
-        // RwLock write-guard is held across the launch+marlin_gemm
-        // calls; both queue async on the same `stream`, and the next
-        // caller's Marlin work also serialises on this stream — so
-        // even a weaker single-slot pool is correct as long as we
-        // don't leave the function before the kernel queues complete.
-        with_marlin_gather_scratch(&stream, ctx.ordinal, m * k, |a_gathered| -> Result<()> {
-            let profile = crate::marlin::profile_marlin();
-            if profile {
-                stream.synchronize().map_err(|e| {
-                    FerrumError::model(format!("marlin gather profile pre-sync: {e}"))
-                })?;
-            }
-            let t0 = profile.then(std::time::Instant::now);
+        // The persistent context serializes this scratch on its own stream.
+        with_marlin_gather_scratch(ctx, m * k, |a_gathered| -> Result<()> {
             let mut b = stream.launch_builder(&func);
             b.arg(a);
             b.arg(perm);
@@ -471,25 +312,17 @@ pub fn marlin_gemm_with_perm(
                 })
             }
             .map_err(|e| FerrumError::model(format!("gather_columns launch: {e}")))?;
-            if let Some(t0) = t0 {
-                stream.synchronize().map_err(|e| {
-                    FerrumError::model(format!("marlin gather profile post-sync: {e}"))
-                })?;
-                crate::marlin::record_marlin_gather_for_current_label(
-                    t0.elapsed().as_micros() as u64
-                );
-            }
             if use_vllm {
-                return launch_vllm_marlin(&ctx.stream, a_gathered, weight, out, m);
+                return launch_vllm_marlin(&stream, a_gathered, weight, out, m, vllm_options);
             }
-            crate::marlin::marlin_gemm(&ctx.stream, a_gathered, weight, out, m as i32)
+            crate::marlin::marlin_gemm(&stream, a_gathered, weight, out, m as i32, skip_zero)
                 .map_err(|e| FerrumError::model(format!("marlin_gemm (perm): {e}")))
         })
     } else {
         if use_vllm {
-            return launch_vllm_marlin(&ctx.stream, a, weight, out, m);
+            return launch_vllm_marlin(&ctx.stream, a, weight, out, m, vllm_options);
         }
-        crate::marlin::marlin_gemm(&ctx.stream, a, weight, out, m as i32)
+        crate::marlin::marlin_gemm(&ctx.stream, a, weight, out, m as i32, skip_zero)
             .map_err(|e| FerrumError::model(format!("marlin_gemm: {e}")))
     }
 }
@@ -501,17 +334,9 @@ pub fn launch_vllm_marlin(
     weight: &crate::marlin::MarlinWeight,
     out: &mut CudaSlice<f16>,
     m: usize,
+    options: (i32, bool, bool),
 ) -> Result<()> {
     use cudarc::driver::DevicePtr;
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static VLLM_MARLIN_CALLS: AtomicU64 = AtomicU64::new(0);
-    let n = VLLM_MARLIN_CALLS.fetch_add(1, Ordering::Relaxed);
-    if n == 0 || n.is_multiple_of(1024) {
-        eprintln!(
-            "[vllm-marlin] launch #{n} m={m} n={} k={} group_size={}",
-            weight.n, weight.k, weight.group_size,
-        );
-    }
     // Zero workspace (it's used as mutex locks in vLLM's marlin too).
     {
         let (ws_ptr, _g) = weight.workspace.device_ptr(stream);
@@ -530,12 +355,7 @@ pub fn launch_vllm_marlin(
     let k = weight.k as i32;
     let group_size = weight.group_size;
     let num_groups = if group_size > 0 { k / group_size } else { 1 };
-    // RTX 4090 = 128 SMs. TODO: query CudaDevice attribute.
-    let runtime_config = cuda_quant_runtime_config();
-    let sms = runtime_config.vllm_marlin_sms;
-    // vLLM perf knobs — try toggling via env to see if either helps.
-    let use_atomic_add = runtime_config.vllm_atomic_add;
-    let use_fp32_reduce = runtime_config.vllm_fp32_reduce;
+    let (sms, use_atomic_add, use_fp32_reduce) = options;
 
     unsafe {
         crate::vllm_marlin::launch_marlin_mm_f16_u4b8(
@@ -557,7 +377,7 @@ pub fn launch_vllm_marlin(
             true,  // is_k_full
             num_groups,
             group_size,
-            0, // dev
+            stream.context().ordinal() as i32, // actual stream device
             raw_stream as cudarc::driver::sys::CUstream,
             sms,
             use_atomic_add,
@@ -574,6 +394,7 @@ fn launch_vllm_marlin(
     _weight: &crate::marlin::MarlinWeight,
     _out: &mut CudaSlice<f16>,
     _m: usize,
+    _options: (i32, bool, bool),
 ) -> Result<()> {
     Err(FerrumError::model(
         "FERRUM_VLLM_MARLIN=1 set but binary not built with --features vllm-marlin",
@@ -583,8 +404,7 @@ impl BackendQuantMarlin for CudaBackend {
     fn pregrow_marlin_gather_scratch(ctx: &mut Self::Context, required: usize) {
         #[cfg(feature = "marlin")]
         {
-            let stream = ctx.stream.clone();
-            pregrow_marlin_gather_scratch_for_ordinal(ctx.ordinal, &stream, required);
+            pregrow_marlin_gather_scratch(ctx, required);
         }
         #[cfg(not(feature = "marlin"))]
         {
@@ -606,6 +426,32 @@ impl BackendQuantMarlin for CudaBackend {
         k: usize,
         n: usize,
     ) -> Result<Box<dyn crate::Linear<Self> + Send + Sync>> {
+        let mut ctx = Self::new_context(&ferrum_types::BackendContextConfig::default())?;
+        let result = Self::load_gptq_in_context(
+            &mut ctx, qweight, scales, qzeros, g_idx, bias_host, bits, group_size, k, n,
+        );
+        if let Err(error) = Self::retire_context(&mut ctx) {
+            // This context-free compatibility call has no external recovery
+            // owner. Keep the loaded weights alive until the fail-stop.
+            eprintln!("fatal: unresolved standalone CUDA weight upload: {error}");
+            std::process::abort();
+        }
+        result
+    }
+    fn load_gptq_in_context(
+        ctx: &mut Self::Context,
+        qweight: &[i32],
+        scales: &[f32],
+        qzeros: &[i32],
+        g_idx: Option<&[i32]>,
+        bias_host: Option<&[f32]>,
+        bits: u32,
+        group_size: usize,
+        k: usize,
+        n: usize,
+    ) -> Result<Box<dyn crate::Linear<Self> + Send + Sync>> {
+        assert!(!ctx.capture_in_flight, "weight upload during CUDA capture");
+        ctx.completion_observed = false;
         if bits != 4 {
             return Err(FerrumError::unsupported(format!(
                 "CUDA GPTQ: only bits=4 supported (got {bits})"
@@ -627,8 +473,8 @@ impl BackendQuantMarlin for CudaBackend {
         // GPTQ tensor layout directly. Just upload the three tensors and
         // tag the store as Triton. No CPU-side repack.
         #[cfg(feature = "triton-kernels")]
-        if use_triton_int4() {
-            let stream = default_stream();
+        if ctx.configuration.cuda.triton_int4 {
+            let stream = ctx.stream.clone();
             let scales_f16: Vec<f16> = scales.iter().map(|&x| f16::from_f32(x)).collect();
             let qweight_dev = stream
                 .clone_htod(qweight)
@@ -648,7 +494,7 @@ impl BackendQuantMarlin for CudaBackend {
                 n,
                 group_size: group_size as i32,
             });
-            let bias = bias_host.map(<Self as crate::backend::Backend>::from_slice);
+            let bias = bias_host.map(|bias| Self::from_slice_in_context(ctx, bias));
             return Ok(Box::new(
                 crate::quant_linear::cuda_marlin::CudaMarlinLinear {
                     store,
@@ -679,7 +525,7 @@ impl BackendQuantMarlin for CudaBackend {
                     let permuted_qweight =
                         crate::marlin::permute_gptq_qweight_rows(qweight, &perm, k, n);
                     let perm_i32: Vec<i32> = perm.iter().map(|&p| p as i32).collect();
-                    let stream = default_stream();
+                    let stream = ctx.stream.clone();
                     let perm_dev = stream
                         .clone_htod(&perm_i32)
                         .map_err(|e| FerrumError::model(format!("perm htod: {e}")))?;
@@ -702,8 +548,8 @@ impl BackendQuantMarlin for CudaBackend {
         let marlin_scales_f16 =
             crate::marlin::repack_scales_to_marlin(&scales_f16, k, n, group_size);
 
-        // Upload on the global stream (same one inference uses).
-        let stream = default_stream();
+        // Upload on the original execution context's stream.
+        let stream = ctx.stream.clone();
         let qweight_dev = stream
             .clone_htod(&marlin_qweight_i32)
             .map_err(|e| FerrumError::model(format!("qweight htod: {e}")))?;
@@ -739,7 +585,7 @@ impl BackendQuantMarlin for CudaBackend {
         #[cfg(not(feature = "triton-kernels"))]
         let store: GptqStoreCuda = marlin_weight;
 
-        let bias = bias_host.map(<Self as crate::backend::Backend>::from_slice);
+        let bias = bias_host.map(|bias| Self::from_slice_in_context(ctx, bias));
         Ok(Box::new(
             crate::quant_linear::cuda_marlin::CudaMarlinLinear {
                 store,
@@ -759,6 +605,39 @@ impl BackendQuantMarlin for CudaBackend {
         k: usize,
         n_per_expert: usize,
     ) -> Result<std::sync::Arc<dyn crate::MarlinExpertStack<Self>>> {
+        let mut ctx = Self::new_context(&ferrum_types::BackendContextConfig::default())?;
+        let result = Self::load_gptq_stacked_in_context(
+            &mut ctx,
+            qweights,
+            scales,
+            qzeros,
+            g_idx,
+            bits,
+            group_size,
+            k,
+            n_per_expert,
+        );
+        if let Err(error) = Self::retire_context(&mut ctx) {
+            // This context-free compatibility call has no external recovery
+            // owner. Keep the loaded weights alive until the fail-stop.
+            eprintln!("fatal: unresolved standalone CUDA weight upload: {error}");
+            std::process::abort();
+        }
+        result
+    }
+    fn load_gptq_stacked_in_context(
+        ctx: &mut Self::Context,
+        qweights: &[&[i32]],
+        scales: &[&[f32]],
+        qzeros: &[&[i32]],
+        g_idx: Option<&[i32]>,
+        bits: u32,
+        group_size: usize,
+        k: usize,
+        n_per_expert: usize,
+    ) -> Result<std::sync::Arc<dyn crate::MarlinExpertStack<Self>>> {
+        assert!(!ctx.capture_in_flight, "weight upload during CUDA capture");
+        ctx.completion_observed = false;
         if bits != 4 {
             return Err(FerrumError::unsupported(format!(
                 "CUDA GPTQ stacked: only bits=4 supported (got {bits})"
@@ -788,8 +667,8 @@ impl BackendQuantMarlin for CudaBackend {
         // zero-point bias. FERRUM_VLLM_MOE=1 remains an opt-in for
         // symmetric models; asymmetric stacks select vLLM automatically.
         #[cfg(feature = "vllm-moe-marlin")]
-        if use_vllm_moe() || needs_vllm_qzeros {
-            let stream = default_stream();
+        if ctx.configuration.moe.vllm_moe || needs_vllm_qzeros {
+            let stream = ctx.stream.clone();
             let mw = crate::vllm_marlin::load_stacked_gptq_vllm_marlin(
                 &stream,
                 qweights,
@@ -838,7 +717,7 @@ impl BackendQuantMarlin for CudaBackend {
         // Triton path: would need a stacked variant — not implemented.
         // Fall through to Marlin.
         #[cfg(feature = "triton-kernels")]
-        if use_triton_int4() {
+        if ctx.configuration.cuda.triton_int4 {
             return Err(FerrumError::unsupported(
                 "load_gptq_stacked: Triton w4a16 path not implemented; \
                  unset FERRUM_TRITON_INT4 to use Marlin",
@@ -857,7 +736,7 @@ impl BackendQuantMarlin for CudaBackend {
                     let mut perm: Vec<usize> = (0..k).collect();
                     perm.sort_by_key(|&i| gx[i]);
                     let perm_i32: Vec<i32> = perm.iter().map(|&p| p as i32).collect();
-                    let stream = default_stream();
+                    let stream = ctx.stream.clone();
                     let perm_dev = stream
                         .clone_htod(&perm_i32)
                         .map_err(|e| FerrumError::model(format!("perm htod: {e}")))?;
@@ -906,7 +785,7 @@ impl BackendQuantMarlin for CudaBackend {
             });
 
         // Single htod upload of the concatenated packed buffer.
-        let stream = default_stream();
+        let stream = ctx.stream.clone();
         let qweight_dev = stream
             .clone_htod(&packed_qw)
             .map_err(|e| FerrumError::model(format!("stacked qweight htod: {e}")))?;
@@ -1006,10 +885,10 @@ pub(crate) fn moe_gemm_phase_batched_impl(
     // bucket ∈ {1, 2, 3, 4}) instead of N round-robin calls. At c=32
     // with ~100 active experts/layer this is 1-4 launches/layer
     // instead of 100. Bench: +25% c=32, +35% c=16, +48% c=8 over
-    // the multi-stream per-expert path. Set FERRUM_MOE_FUSED=0 to
-    // opt out (fall back to multi-stream pool).
-    let runtime_config = cuda_quant_runtime_config();
-    if runtime_config.moe_fused {
+    // the multi-stream per-expert path. The context's `moe_fused=false`
+    // selects the multi-stream pool.
+    let skip_zero = ctx.configuration.cuda.marlin_skip_ws_zero;
+    if ctx.configuration.moe.moe_fused {
         return moe_gemm_phase_fused_impl(
             ctx,
             input.as_f16(),
@@ -1024,7 +903,7 @@ pub(crate) fn moe_gemm_phase_batched_impl(
     // n_streams=1: serial dispatch on the DEFAULT context stream
     // (avoids the cross-stream sync overhead and matches the
     // pre-multi-stream path bit-for-bit).
-    let n_streams = runtime_config.moe_streams;
+    let n_streams = ctx.configuration.moe.moe_streams;
     if n_streams == 1 {
         let default_stream = ctx.stream.clone();
         for (expert_idx, in_row_offset, out_row_offset, m) in dispatches {
@@ -1038,6 +917,7 @@ pub(crate) fn moe_gemm_phase_batched_impl(
                 *m as i32,
                 (expert_idx * n_per_expert) as i32,
                 n_per_expert as i32,
+                skip_zero,
             )
             .map_err(|e| FerrumError::model(format!("marlin offset_strided: {e}")))?;
         }
@@ -1082,6 +962,7 @@ pub(crate) fn moe_gemm_phase_batched_impl(
             *m as i32,
             (expert_idx * n_per_expert) as i32,
             n_per_expert as i32,
+            skip_zero,
         )
         .map_err(|e| FerrumError::model(format!("marlin offset_strided: {e}")))?;
     }
@@ -1144,79 +1025,40 @@ pub(crate) fn moe_gemm_phase_vllm_impl(
     let eid_ref = expert_ids.as_i32();
     let npp_ref = num_tokens_past_padded.as_i32();
 
-    // c_tmp moved process-global (was per-ctx lazy-alloc). Captured
-    // graph kernel args stay valid across `new_context()` calls now.
-    crate::backend::cuda::with_vllm_moe_c_tmp(&stream, ctx.ordinal, |c_tmp_mut| {
-        crate::marlin::marlin_gemm_moe_vllm(
-            &stream,
-            input.as_f16(),
-            mw,
-            output.as_f16_mut(),
-            Some(c_tmp_mut),
-            st_ref,
-            eid_ref,
-            npp_ref,
-            None,
-            moe_block_size as i32,
-            top_k as i32,
-            false,
-            false,
-            prob_m as i32,
-            n_per_expert as i32,
-            k as i32,
-        )
-        .map_err(|e| FerrumError::model(format!("marlin_gemm_moe_vllm: {e}")))
-    })
+    // The original context keeps this storage through capture and retirement.
+    crate::backend::cuda::with_vllm_moe_c_tmp(
+        &stream,
+        &mut ctx.vllm_moe_c_tmp,
+        ctx.capture_in_flight,
+        |c_tmp_mut| {
+            crate::marlin::marlin_gemm_moe_vllm(
+                &stream,
+                input.as_f16(),
+                mw,
+                output.as_f16_mut(),
+                Some(c_tmp_mut),
+                st_ref,
+                eid_ref,
+                npp_ref,
+                None,
+                moe_block_size as i32,
+                top_k as i32,
+                false,
+                false,
+                prob_m as i32,
+                n_per_expert as i32,
+                k as i32,
+            )
+            .map_err(|e| FerrumError::model(format!("marlin_gemm_moe_vllm: {e}")))
+        },
+    )
 }
 // CUDA does not ship GGUF k-quant kernels; inherit unsupported defaults.
 impl BackendQuantGguf for CudaBackend {}
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        marlin_qzeros_are_symmetric_code7, reject_unsupported_marlin_qzeros, CudaQuantRuntimeConfig,
-    };
-
-    #[test]
-    fn cuda_quant_runtime_config_parses_marlin_and_moe_knobs() {
-        let config = CudaQuantRuntimeConfig::from_env_vars([
-            ("FERRUM_TRITON_INT4", "1"),
-            ("FERRUM_VLLM_MOE", "1"),
-            ("FERRUM_VLLM_MARLIN", "1"),
-            ("FERRUM_VLLM_MARLIN_SMS", "132"),
-            ("FERRUM_VLLM_ATOMIC_ADD", "1"),
-            ("FERRUM_VLLM_FP32_REDUCE", "1"),
-            ("FERRUM_MOE_FUSED", "0"),
-            ("FERRUM_MOE_STREAMS", "0"),
-        ]);
-
-        assert!(config.triton_int4);
-        assert!(config.vllm_moe);
-        assert!(config.vllm_marlin);
-        assert_eq!(config.vllm_marlin_sms, 132);
-        assert!(config.vllm_atomic_add);
-        assert!(config.vllm_fp32_reduce);
-        assert!(!config.moe_fused);
-        assert_eq!(config.moe_streams, 1);
-    }
-
-    #[test]
-    fn cuda_quant_runtime_config_keeps_existing_defaults() {
-        let config = CudaQuantRuntimeConfig::from_env_vars([
-            ("FERRUM_TRITON_INT4", "true"),
-            ("FERRUM_VLLM_MARLIN_SMS", "bad"),
-            ("FERRUM_MOE_STREAMS", "bad"),
-        ]);
-
-        assert!(!config.triton_int4);
-        assert!(!config.vllm_moe);
-        assert!(!config.vllm_marlin);
-        assert_eq!(config.vllm_marlin_sms, 128);
-        assert!(!config.vllm_atomic_add);
-        assert!(!config.vllm_fp32_reduce);
-        assert!(config.moe_fused);
-        assert_eq!(config.moe_streams, 4);
-    }
+    use super::{marlin_qzeros_are_symmetric_code7, reject_unsupported_marlin_qzeros};
 
     #[test]
     fn marlin_qzeros_must_be_symmetric_code7() {

@@ -4,7 +4,7 @@
 //! the executor's complete runtime policy. Source-independent custom executors
 //! retain the existing extension path.
 
-use ferrum_execution::{model_executor::ExecutionResourceAuthority, ModelExecutor};
+use ferrum_execution::{model_executor::ExecutionPlanningModel, ModelExecutor};
 use ferrum_models::vnext::{DefinedProductionModel, ProductionModelSourceBundle};
 use ferrum_runtime::{ModelArtifactSourceRole, ResolvedModelPlan};
 use ferrum_types::{EngineConfig, FerrumError, NumericalExecutionPolicy, Result};
@@ -34,7 +34,7 @@ pub(super) fn validate(
             "executor bound model sources differ from the builder's semantic, tokenizer, or weight source",
         ));
     }
-    if executor.execution_resource_authority() == ExecutionResourceAuthority::LegacyEngine {
+    if executor.execution_planning_model() == ExecutionPlanningModel::ExecutorManaged {
         if let NumericalExecutionPolicy::Require(profile) = &config.numerical_execution {
             return Err(FerrumError::unsupported(format!(
                 "numerical profile {profile} requires a registered vNext model package"

@@ -8,12 +8,15 @@
 use ferrum_execution::model_executor::{
     KvSlotCapacitySnapshot, KvSlotRequest, KvSlotReservation, LogitsReturnPolicy,
 };
-use ferrum_interfaces::RecurrentStateSpec;
-use ferrum_types::{RequestId, Result, TokenId};
+use ferrum_types::Result;
 
 mod token;
 pub(crate) use token::catch_host_execution;
-pub use token::{ModelTokenOutcome, ModelTokenWork};
+pub use token::{
+    ModelExecutionRecovery, ModelKvPreparation, ModelKvReservation, ModelRetirementOutcome,
+    ModelTokenBatchOutcome, ModelTokenCloseOutcome, ModelTokenExecutionMode, ModelTokenInput,
+    ModelTokenOutcome, ModelTokenProduct, ModelTokenWork,
+};
 
 /// Runtime configuration every decoder-only LLM must expose.
 ///
@@ -48,12 +51,12 @@ pub trait DecoderOnlyLLM: Send + Sync {
     /// Runtime-facing configuration.
     fn config(&self) -> &LlmRuntimeConfig;
 
-    /// Whether this implementation provides the direct token lifecycle below.
-    /// This is an implementation contract, not a device-name inference. The
-    /// initial Llama implementation covers synchronous host execution; GPU
-    /// implementations must retain the actual submission context on failure.
-    fn supports_direct_token_execution(&self) -> bool {
-        false
+    /// Qualified execution and closure for this configured implementation.
+    /// The executor snapshots this immutable declaration at construction.
+    /// Managed execution must retain the original context on failure; being
+    /// asynchronous alone does not establish that contract.
+    fn token_execution_mode(&self) -> ModelTokenExecutionMode {
+        ModelTokenExecutionMode::Unsupported
     }
 
     /// Execute borrowed tokens directly in the model's numerical core. A
@@ -61,12 +64,31 @@ pub trait DecoderOnlyLLM: Send + Sync {
     /// any later member of a batch ran or that its product was accepted.
     fn execute_token_work(
         &mut self,
-        _cache_id: &str,
-        _work: ModelTokenWork<'_>,
-    ) -> ModelTokenOutcome {
+        _input: &ModelTokenInput<'_>,
+    ) -> ModelTokenOutcome<ModelTokenProduct> {
         ModelTokenOutcome::NotSubmitted(ferrum_types::FerrumError::unsupported(
             "model has not implemented direct token execution",
         ))
+    }
+
+    /// Preserve physical batching where implemented. The host fallback keeps
+    /// per-participant outcomes instead of pretending a serial batch is atomic.
+    fn execute_token_batch(&mut self, inputs: &[ModelTokenInput<'_>]) -> ModelTokenBatchOutcome {
+        let mut rows = Vec::with_capacity(inputs.len());
+        let mut held = false;
+        for input in inputs {
+            let result = if held {
+                ModelTokenOutcome::NotSubmitted(ferrum_types::FerrumError::backend(
+                    "earlier participant retains the model execution context",
+                ))
+            } else {
+                let result = self.execute_token_work(input);
+                held = matches!(result, ModelTokenOutcome::Held(_));
+                result
+            };
+            rows.push(result);
+        }
+        ModelTokenBatchOutcome::Serial(rows)
     }
 
     /// Checked model-owned cache retirement. An error retains the cache and
@@ -75,6 +97,42 @@ pub trait DecoderOnlyLLM: Send + Sync {
         Err(ferrum_types::FerrumError::unsupported(
             "model has not implemented checked token closure",
         ))
+    }
+
+    /// Device implementations return lifetime and operation error separately.
+    /// The default preserves the checked synchronous-host implementation.
+    fn close_token_execution(&mut self, cache_id: &str) -> ModelTokenCloseOutcome {
+        match self.close_token_sequence(cache_id) {
+            Ok(()) => ModelTokenCloseOutcome::Ended { error: None },
+            Err(error) => ModelTokenCloseOutcome::Held { error },
+        }
+    }
+
+    fn recover_token_execution(&mut self) -> ModelExecutionRecovery {
+        match self.token_execution_mode() {
+            ModelTokenExecutionMode::InlineSynchronous => {
+                ModelExecutionRecovery::Quiescent { error: None }
+            }
+            ModelTokenExecutionMode::Unsupported | ModelTokenExecutionMode::ManagedWorker => {
+                ModelExecutionRecovery::Held {
+                    error: ferrum_types::FerrumError::unsupported(
+                        "model has not implemented context recovery",
+                    ),
+                }
+            }
+        }
+    }
+
+    /// Retire this exact model's original execution context and captured programs.
+    /// Request-cache closure is not proof of whole-model retirement. Implementations
+    /// must preserve their actual owners when returning Retained; callers may retry
+    /// observation/cleanup, never the numerical work.
+    fn retire_model(&mut self) -> ModelRetirementOutcome {
+        ModelRetirementOutcome::Retained {
+            error: ferrum_types::FerrumError::unsupported(
+                "model has not implemented checked whole-model retirement",
+            ),
+        }
     }
 
     /// Adapter execution implemented by this configured model instance.
@@ -156,6 +214,20 @@ pub trait DecoderOnlyLLM: Send + Sync {
         let _ = (cache_id, capacity_hint);
     }
 
+    /// Prepare the incarnation's storage and reserve its initial prompt under
+    /// the model's actual ownership boundary. Device models override this to
+    /// use one retained context for both operations. An error does not prove
+    /// quiescence: the caller must close through this same model owner.
+    fn prepare_token_kv(&mut self, request: ModelKvPreparation<'_>) -> Result<ModelKvReservation> {
+        self.set_lora_adapter_for_cache(request.cache_id, request.adapter.cloned())?;
+        self.prepare_kv_capacity(request.cache_id, request.capacity_hint);
+        self.reserve_token_kv_slots(&[KvSlotRequest {
+            cache_id: request.cache_id.to_owned(),
+            target_len: request.prompt.len(),
+            admission_target_len: Some(request.prompt.len()),
+        }])
+    }
+
     /// Per-cache KV capacity in tokens — the maximum sequence length any
     /// single `cache_id` can grow to before `prefill` / `decode` would
     /// overflow the pre-allocated K/V buffers.
@@ -184,21 +256,29 @@ pub trait DecoderOnlyLLM: Send + Sync {
         Ok(None)
     }
 
+    /// Reserve through the same model-owned allocator, preserving its typed
+    /// fit rejection where available. The default does not reinterpret an
+    /// error or a diagnostic snapshot as a capacity deferral.
+    fn reserve_token_kv_slots(&mut self, requests: &[KvSlotRequest]) -> Result<ModelKvReservation> {
+        self.reserve_kv_slots(requests)
+            .map(ModelKvReservation::Reserved)
+    }
+
     /// Snapshot model-owned paged-KV capacity without allocating slots.
     fn kv_slot_capacity_snapshot(&self) -> Option<KvSlotCapacitySnapshot> {
         None
     }
 
-    /// Recurrent-state allocation spec for state-space or hybrid models.
-    ///
-    /// Most decoder-only models are KV-only and return `None`. Models with
-    /// model-owned recurrent state can return a spec here so the engine can
-    /// apply admission/backpressure before dispatching a forward.
-    fn recurrent_state_spec(
+    /// Observe joint reclaimability in one actual allocator without releasing
+    /// any cache. The executor resolves exact incarnations to these cache ids
+    /// under its existing ownership guard. `None` means this implementation
+    /// does not identify the requested domain, not proof of zero reclaimability.
+    fn observe_token_allocator_reclaim(
         &self,
-        _request_id: &RequestId,
-        _input_tokens: &[TokenId],
-    ) -> Result<Option<RecurrentStateSpec>> {
+        _blocked_cache_id: &str,
+        _domain: &ferrum_execution::token_execution::AllocatorCapacityDomain,
+        _candidates: &[&str],
+    ) -> Result<Option<ferrum_execution::token_execution::TokenAllocatorReclaim>> {
         Ok(None)
     }
 

@@ -5,16 +5,16 @@ use ferrum_types::{
     EngineConfig, EngineMetrics, EngineStatus, FinishReason, HealthStatus, InferenceRequest,
     InferenceResponse, MemoryUsage, ModelId, StreamChunk, TokenId, TokenUsage,
 };
-use futures::{stream, Stream};
+use futures::stream;
 use reqwest::Client;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::net::TcpListener;
-use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 struct StubLlm {
+    output_budget: ferrum_output::OutputBudget,
     config: EngineConfig,
     text: String,
 }
@@ -24,6 +24,7 @@ impl StubLlm {
         let mut config = EngineConfig::default();
         config.model.model_id = ModelId::new("stub-model");
         Self {
+            output_budget: ferrum_output::OutputBudget::new(config.output.clone()).unwrap(),
             config,
             text: text.to_string(),
         }
@@ -38,7 +39,7 @@ impl InferenceEngine for StubLlm {
             loaded_models: vec![self.config.model.model_id.clone()],
             active_requests: 0,
             queued_requests: 0,
-            memory_usage: MemoryUsage {
+            memory_usage: ferrum_types::MemoryObservation::Known(MemoryUsage {
                 total_bytes: 0,
                 used_bytes: 0,
                 free_bytes: 0,
@@ -46,7 +47,7 @@ impl InferenceEngine for StubLlm {
                 cpu_memory_bytes: None,
                 cache_memory_bytes: 0,
                 utilization_percent: 0.0,
-            },
+            }),
             uptime_seconds: 0,
             last_heartbeat: chrono::Utc::now(),
             version: "test".to_string(),
@@ -54,6 +55,11 @@ impl InferenceEngine for StubLlm {
     }
 
     async fn shutdown(&self) -> ferrum_types::Result<()> {
+        Ok(())
+    }
+
+    async fn wait_for_shutdown_completion(&self) -> ferrum_types::Result<()> {
+        // No background execution or journal producers in this wire fixture.
         Ok(())
     }
 
@@ -72,26 +78,33 @@ impl InferenceEngine for StubLlm {
 
 #[async_trait]
 impl LlmInferenceEngine for StubLlm {
-    async fn infer(&self, request: InferenceRequest) -> ferrum_types::Result<InferenceResponse> {
-        Ok(InferenceResponse {
-            request_id: request.id,
-            text: self.text.clone(),
-            tokens: vec![TokenId::new(11), TokenId::new(12)],
-            finish_reason: FinishReason::Stop,
-            usage: TokenUsage::new(7, 2),
-            latency_ms: 1,
-            created_at: chrono::Utc::now(),
-            metadata: HashMap::new(),
-            api_response: None,
-            execution_evidence: None,
-        })
+    async fn infer(
+        &self,
+        request: InferenceRequest,
+    ) -> ferrum_types::Result<ferrum_output::InferenceOutput> {
+        ferrum_output::InferenceOutput::new(
+            InferenceResponse {
+                request_id: request.id,
+                text: self.text.clone(),
+                tokens: vec![TokenId::new(11), TokenId::new(12)],
+                finish_reason: FinishReason::Stop,
+                usage: TokenUsage::new(7, 2),
+                latency_ms: 1,
+                created_at: chrono::Utc::now(),
+                metadata: HashMap::new(),
+                api_response: None,
+                execution_evidence: None,
+            },
+            self.output_budget
+                .try_open_session()?
+                .try_reserve_semantic(0)?,
+        )
     }
 
     async fn infer_stream(
         &self,
         request: InferenceRequest,
-    ) -> ferrum_types::Result<Pin<Box<dyn Stream<Item = ferrum_types::Result<StreamChunk>> + Send>>>
-    {
+    ) -> ferrum_types::Result<ferrum_output::InferenceStream> {
         let chunk = StreamChunk {
             request_id: request.id,
             text: self.text.clone(),
@@ -103,7 +116,12 @@ impl LlmInferenceEngine for StubLlm {
             api_response: None,
             execution_evidence: None,
         };
-        Ok(Box::pin(stream::iter(vec![Ok(chunk)])))
+        let session = self.output_budget.try_open_session()?;
+        let chunk = session.wrap_chunk(chunk).await?;
+        Ok(ferrum_output::InferenceStream::new(
+            session,
+            Box::pin(stream::iter(vec![Ok(chunk)])),
+        ))
     }
 }
 

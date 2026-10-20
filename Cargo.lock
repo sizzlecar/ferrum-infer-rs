@@ -127,6 +127,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "arc-swap"
+version = "1.9.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "380962b3d93b99642e50b9febf72c071e97e8b32d86eae9cf4ef582bb960ae6e"
+dependencies = [
+ "rustversion",
+]
+
+[[package]]
 name = "arraydeque"
 version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1249,6 +1258,7 @@ name = "ferrum-bench-core"
 version = "0.13.0"
 dependencies = [
  "clap",
+ "ferrum-journal",
  "ferrum-types",
  "half",
  "quote",
@@ -1282,13 +1292,17 @@ dependencies = [
  "dirs 5.0.1",
  "ferrum-bench-core",
  "ferrum-engine",
+ "ferrum-execution",
  "ferrum-interfaces",
+ "ferrum-journal",
  "ferrum-kernels",
  "ferrum-models",
+ "ferrum-output",
  "ferrum-quantization",
  "ferrum-runtime",
  "ferrum-scheduler",
  "ferrum-server",
+ "ferrum-slo",
  "ferrum-types",
  "futures",
  "indicatif",
@@ -1361,16 +1375,18 @@ dependencies = [
  "criterion",
  "crossbeam-channel",
  "crossbeam-utils",
- "ferrum-bench-core",
  "ferrum-execution",
  "ferrum-interfaces",
+ "ferrum-journal",
  "ferrum-kernels",
  "ferrum-kv",
  "ferrum-models",
+ "ferrum-output",
  "ferrum-quantization",
  "ferrum-runtime",
  "ferrum-sampler",
  "ferrum-scheduler",
+ "ferrum-slo",
  "ferrum-testkit",
  "ferrum-tokenizer",
  "ferrum-types",
@@ -1413,8 +1429,17 @@ dependencies = [
  "ferrum-runtime",
  "ferrum-types",
  "futures",
+ "half",
+ "parking_lot",
+ "pin-project-lite",
  "serde",
  "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]
@@ -1424,8 +1449,8 @@ dependencies = [
  "async-trait",
  "chrono",
  "criterion",
+ "ferrum-output",
  "ferrum-types",
- "futures",
  "parking_lot",
  "rand 0.9.2",
  "rand_chacha 0.9.0",
@@ -1436,13 +1461,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "ferrum-journal"
+version = "0.13.0"
+dependencies = [
+ "ferrum-types",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "ferrum-kernels"
 version = "0.13.0"
 dependencies = [
  "bindgen_cuda",
+ "block",
  "candle-core",
  "cudarc 0.19.4",
- "ferrum-bench-core",
  "ferrum-interfaces",
  "ferrum-native-ops",
  "ferrum-runtime",
@@ -1490,8 +1524,8 @@ dependencies = [
  "candle-flash-attn",
  "candle-nn",
  "chrono",
+ "cudarc 0.19.4",
  "dirs 5.0.1",
- "ferrum-bench-core",
  "ferrum-execution",
  "ferrum-interfaces",
  "ferrum-kernels",
@@ -1509,7 +1543,6 @@ dependencies = [
  "once_cell",
  "parking_lot",
  "pathdiff",
- "pin-project-lite",
  "rand 0.8.5",
  "reqwest",
  "safetensors 0.4.5",
@@ -1553,6 +1586,18 @@ dependencies = [
  "sha2",
  "tempfile",
  "thiserror 1.0.69",
+]
+
+[[package]]
+name = "ferrum-output"
+version = "0.13.0"
+dependencies = [
+ "chrono",
+ "ferrum-types",
+ "futures",
+ "serde",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]
@@ -1647,15 +1692,17 @@ name = "ferrum-server"
 version = "0.13.0"
 dependencies = [
  "anyhow",
+ "async-stream",
  "async-trait",
  "axum",
  "base64 0.22.1",
  "chrono",
  "config",
- "ferrum-bench-core",
  "ferrum-engine",
  "ferrum-execution",
  "ferrum-interfaces",
+ "ferrum-journal",
+ "ferrum-output",
  "ferrum-sampler",
  "ferrum-scheduler",
  "ferrum-testkit",
@@ -1686,6 +1733,28 @@ dependencies = [
  "tower-http 0.5.2",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "ferrum-slo"
+version = "0.13.0"
+dependencies = [
+ "arc-swap",
+ "async-trait",
+ "crossbeam-channel",
+ "ferrum-engine",
+ "ferrum-execution",
+ "ferrum-interfaces",
+ "ferrum-kernels",
+ "ferrum-models",
+ "ferrum-runtime",
+ "ferrum-scheduler",
+ "ferrum-testkit",
+ "ferrum-types",
+ "futures",
+ "serde",
+ "thiserror 1.0.69",
+ "tokio",
 ]
 
 [[package]]

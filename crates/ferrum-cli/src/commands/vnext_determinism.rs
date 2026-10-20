@@ -10,12 +10,12 @@ use std::path::{Path, PathBuf};
 
 use clap::{Args, ValueEnum};
 #[cfg(feature = "cuda")]
-use ferrum_models::{
-    VNextDeterminismExecutionMode, VNextDeterminismExecutionSpec, VNextDeterminismInitialState,
-    VNextDeterminismPhase, VNextDeterminismWorkspacePoison,
+use ferrum_execution::{
+    DeterminismExecutionMode, DeterminismExecutionSpec, DeterminismInitialState, DeterminismPhase,
+    DeterminismWorkspacePoison,
 };
 #[cfg(any(feature = "cuda", test))]
-use ferrum_models::{VNextDeterminismParticipantSpec, MAX_VNEXT_DETERMINISM_PARTICIPANTS};
+use ferrum_execution::{DeterminismParticipantSpec, MAX_DETERMINISM_PARTICIPANTS};
 use ferrum_types::{FerrumError, Result};
 
 const PRIMARY_MODEL_KEYS: [&str; 3] = ["m1-qwen35-4b", "m2-qwen35-35b-a3b", "m3-qwen3-30b-a3b"];
@@ -107,10 +107,10 @@ impl ShapePhase {
     }
 
     #[cfg(feature = "cuda")]
-    const fn execution_phase(self) -> VNextDeterminismPhase {
+    const fn execution_phase(self) -> DeterminismPhase {
         match self {
-            Self::Prefill => VNextDeterminismPhase::Prefill,
-            Self::Decode => VNextDeterminismPhase::Decode,
+            Self::Prefill => DeterminismPhase::Prefill,
+            Self::Decode => DeterminismPhase::Decode,
         }
     }
 }
@@ -128,8 +128,8 @@ impl ParticipantFixture {
         self.token_ids.len()
     }
 
-    fn to_spec(&self) -> Result<VNextDeterminismParticipantSpec> {
-        VNextDeterminismParticipantSpec::new(
+    fn to_spec(&self) -> Result<DeterminismParticipantSpec> {
+        DeterminismParticipantSpec::new(
             self.token_ids.clone(),
             self.immediate_start..self.immediate_end(),
             self.immediate_end().saturating_add(8),
@@ -150,11 +150,11 @@ impl ShapeFixture {
     #[cfg(feature = "cuda")]
     fn execution_spec(
         &self,
-        initial_state: VNextDeterminismInitialState,
-        workspace_poison: VNextDeterminismWorkspacePoison,
-        mode: VNextDeterminismExecutionMode,
-    ) -> Result<VNextDeterminismExecutionSpec> {
-        VNextDeterminismExecutionSpec::new(
+        initial_state: DeterminismInitialState,
+        workspace_poison: DeterminismWorkspacePoison,
+        mode: DeterminismExecutionMode,
+    ) -> Result<DeterminismExecutionSpec> {
+        DeterminismExecutionSpec::new(
             self.phase.execution_phase(),
             self.participants
                 .iter()
@@ -167,7 +167,9 @@ impl ShapeFixture {
     }
 }
 
-pub async fn execute(command: VNextDeterminismCommand) -> Result<()> {
+pub async fn execute(
+    command: VNextDeterminismCommand,
+) -> ferrum_execution::ExecutorBuildResult<()> {
     let bindings = validate_command(&command)?;
     #[cfg(feature = "cuda")]
     {
@@ -178,7 +180,8 @@ pub async fn execute(command: VNextDeterminismCommand) -> Result<()> {
         let _ = bindings;
         Err(FerrumError::unsupported(
             "ferrum vnext-determinism requires a binary built with the cuda feature",
-        ))
+        )
+        .into())
     }
 }
 
@@ -293,7 +296,7 @@ fn shape_fixtures(scope: VNextDeterminismScope) -> Vec<ShapeFixture> {
         decode("multi_participant", 4),
     ];
     if scope == VNextDeterminismScope::ReleaseFull {
-        fixtures.push(decode("c32", MAX_VNEXT_DETERMINISM_PARTICIPANTS));
+        fixtures.push(decode("c32", MAX_DETERMINISM_PARTICIPANTS));
     }
     fixtures
 }
@@ -538,7 +541,7 @@ mod cuda {
     pub(super) async fn collect(
         command: VNextDeterminismCommand,
         bindings: Vec<ModelBinding>,
-    ) -> Result<()> {
+    ) -> ferrum_execution::ExecutorBuildResult<()> {
         match collect_inner(&command, &bindings).await {
             Ok(pass_line) => {
                 println!("{pass_line}");
@@ -562,7 +565,7 @@ mod cuda {
     async fn collect_inner(
         command: &VNextDeterminismCommand,
         bindings: &[ModelBinding],
-    ) -> Result<String> {
+    ) -> ferrum_execution::ExecutorBuildResult<String> {
         let fixtures = shape_fixtures(command.scope);
         let expected_case_count = command.scope.expected_case_count();
         let cases_per_model = fixtures.len() * 4;
@@ -640,54 +643,51 @@ mod cuda {
                 .unwrap_or_else(|| "none".to_owned());
             let mut engine = determinism_engine_config(binding, &prepared);
             engine.backend.dtype = prepared.descriptor().execution_dtype();
-            let collector = create_cuda_vnext_determinism_collector(&engine, &prepared, 0)
-                .map_err(|error| {
+            let collector = create_cuda_vnext_determinism_collector(&engine, &prepared, 0)?;
+            let collection = async {
+                let catalog_fingerprint = collector
+                    .capability_catalog()
+                    .fingerprint()
+                    .map_err(vnext_backend_error)?;
+                match canonical_catalog_fingerprint.as_deref() {
+                    Some(expected) if expected != catalog_fingerprint => {
+                        return Err(FerrumError::backend(format!(
+                            "CUDA capability catalog drifted between primary models: expected {expected}, got {catalog_fingerprint} for {}",
+                            binding.key
+                        )));
+                    }
+                    None => {
+                        canonical_catalog = Some(collector.capability_catalog().clone());
+                        canonical_catalog_fingerprint = Some(catalog_fingerprint);
+                    }
+                    Some(_) => {}
+                }
+                let plan = collector.resolved_model_plan().clone();
+                let dtype = collector.model_info().dtype.to_string();
+                collector.prepare().await.map_err(|error| {
                     FerrumError::backend(format!(
-                        "cannot create CUDA determinism collector for {}: {error}",
+                        "cannot prepare CUDA determinism collector for {}: {error}",
                         binding.key
                     ))
                 })?;
-            let catalog_fingerprint = collector
-                .capability_catalog()
-                .fingerprint()
-                .map_err(vnext_backend_error)?;
-            match canonical_catalog_fingerprint.as_deref() {
-                Some(expected) if expected != catalog_fingerprint => {
-                    return Err(FerrumError::backend(format!(
-                        "CUDA capability catalog drifted between primary models: expected {expected}, got {catalog_fingerprint} for {}",
-                        binding.key
-                    )));
-                }
-                None => {
-                    canonical_catalog = Some(collector.capability_catalog().clone());
-                    canonical_catalog_fingerprint = Some(catalog_fingerprint);
-                }
-                Some(_) => {}
-            }
-            let plan = collector.resolved_model_plan().clone();
-            let dtype = collector.model_info().dtype.to_string();
-            collector.prepare().await.map_err(|error| {
-                FerrumError::backend(format!(
-                    "cannot prepare CUDA determinism collector for {}: {error}",
+                println!(
+                    "FERRUM VNEXT DETERMINISM PROGRESS model={} stage=prepared",
                     binding.key
-                ))
-            })?;
-            println!(
-                "FERRUM VNEXT DETERMINISM PROGRESS model={} stage=prepared",
-                binding.key
-            );
-            let cases = collect_model_cases(
-                &collector,
-                &binding.key,
-                &dtype,
-                &quantization,
-                &fixtures,
-                model_ordinal * cases_per_model,
-                expected_case_count,
-                &progress_cases,
-            )
-            .await?;
-            drop(collector);
+                );
+                let cases = collect_model_cases(
+                    &collector,
+                    &binding.key,
+                    &dtype,
+                    &quantization,
+                    &fixtures,
+                    model_ordinal * cases_per_model,
+                    expected_case_count,
+                    &progress_cases,
+                )
+                .await?;
+                Ok((plan, dtype, cases))
+            }.await;
+            let (plan, dtype, cases) = collector.finish_collection(collection).await?;
             drop(prepared);
             println!(
                 "FERRUM VNEXT DETERMINISM PROGRESS model={} stage=released cases={}",
@@ -770,7 +770,7 @@ mod cuda {
             Ok(manifest) => manifest,
             Err(error) => {
                 let _ = fs::remove_dir_all(&stage);
-                return Err(error);
+                return Err(error.into());
             }
         };
         publish_stage(&stage, &command.artifact_root)?;
@@ -787,9 +787,9 @@ mod cuda {
         engine.backend.device = Device::CUDA(0);
         engine.backend.dtype = prepared.descriptor().execution_dtype();
         engine.backend.enable_reusable_execution = true;
-        engine.scheduler.max_running_requests = MAX_VNEXT_DETERMINISM_PARTICIPANTS;
-        engine.batching.max_batch_size = MAX_VNEXT_DETERMINISM_PARTICIPANTS;
-        engine.batching.max_num_batched_tokens = MAX_VNEXT_DETERMINISM_PARTICIPANTS;
+        engine.scheduler.max_running_requests = MAX_DETERMINISM_PARTICIPANTS;
+        engine.batching.max_batch_size = MAX_DETERMINISM_PARTICIPANTS;
+        engine.batching.max_num_batched_tokens = MAX_DETERMINISM_PARTICIPANTS;
         engine.runtime.model_path = Some(binding.directory.display().to_string());
         engine
     }
@@ -807,8 +807,8 @@ mod cuda {
         let mut cases = Vec::with_capacity(fixtures.len() * 4);
         for fixture in fixtures {
             for (initial_state, initial_state_kind) in [
-                (VNextDeterminismInitialState::Zero, "zero"),
-                (VNextDeterminismInitialState::Nonzero, "nonzero"),
+                (DeterminismInitialState::Zero, "zero"),
+                (DeterminismInitialState::Nonzero, "nonzero"),
             ] {
                 let zero = collect_case(
                     collector,
@@ -818,7 +818,7 @@ mod cuda {
                     quantization,
                     initial_state,
                     initial_state_kind,
-                    VNextDeterminismWorkspacePoison::Zero,
+                    DeterminismWorkspacePoison::Zero,
                     "00",
                 )
                 .await?;
@@ -836,7 +836,7 @@ mod cuda {
                     quantization,
                     initial_state,
                     initial_state_kind,
-                    VNextDeterminismWorkspacePoison::A5,
+                    DeterminismWorkspacePoison::A5,
                     "a5",
                 )
                 .await?;
@@ -905,9 +905,9 @@ mod cuda {
         fixture: &ShapeFixture,
         dtype: &str,
         quantization: &str,
-        initial_state: VNextDeterminismInitialState,
+        initial_state: DeterminismInitialState,
         initial_state_kind: &str,
-        workspace_poison: VNextDeterminismWorkspacePoison,
+        workspace_poison: DeterminismWorkspacePoison,
         workspace_poison_label: &str,
     ) -> Result<PendingCase> {
         let case_id = format!(
@@ -919,8 +919,8 @@ mod cuda {
         );
         let mut executions = Vec::with_capacity(EXECUTIONS_PER_MODE * 2);
         for (mode, mode_label) in [
-            (VNextDeterminismExecutionMode::Eager, "eager"),
-            (VNextDeterminismExecutionMode::Replayed, "replay"),
+            (DeterminismExecutionMode::Eager, "eager"),
+            (DeterminismExecutionMode::Replayed, "replay"),
         ] {
             for repeat in 0..EXECUTIONS_PER_MODE {
                 let spec = fixture.execution_spec(initial_state, workspace_poison, mode)?;

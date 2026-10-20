@@ -47,6 +47,30 @@ fn key(scheduler: &ContinuousBatchScheduler, id: &RequestId) -> PrefixRequestKey
 }
 
 #[tokio::test]
+async fn prefix_hold_cannot_change_selected_admission_and_can_retry_after_round_drop() {
+    let scheduler = ContinuousBatchScheduler::new(SchedulerConfig::default());
+    let source = scheduler.submit(request()).await.unwrap();
+    let follower = scheduler.submit(request()).await.unwrap();
+    let source_key = key(&scheduler, &source);
+    let follower_key = key(&scheduler, &follower);
+    let mut round = scheduler.begin_token_admission(2, None).unwrap();
+    let selected = round.next(&mut |_| {}, None).unwrap().unwrap();
+    assert!(scheduler
+        .hold_prefix_followers(&source_key, std::slice::from_ref(&follower_key), plan(7),)
+        .is_none());
+    assert_eq!(scheduler.prefix_held_waiting_count(), 0);
+    drop(selected);
+    drop(round);
+    let hold = scheduler
+        .hold_prefix_followers(&source_key, std::slice::from_ref(&follower_key), plan(7))
+        .unwrap();
+    assert_eq!(admit(&scheduler, 2), [source]);
+    assert_eq!(scheduler.prefix_held_waiting_count(), 1);
+    hold.release();
+    assert_eq!(admit(&scheduler, 1), [follower]);
+}
+
+#[tokio::test]
 async fn held_followers_do_not_probe_capacity_and_unrelated_work_advances() {
     let scheduler = ContinuousBatchScheduler::new(SchedulerConfig {
         prefill_step_chunk: Some(8),

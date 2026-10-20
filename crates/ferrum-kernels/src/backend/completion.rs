@@ -9,7 +9,9 @@ use ferrum_types::{FerrumError, Result};
 #[must_use]
 pub enum BackendCompletion {
     Succeeded,
-    /// The backend observed a terminal device command, which failed.
+    /// Device execution is terminal, but execution or checked resource cleanup
+    /// failed. A cleanup failure can retain native handles for a later retry;
+    /// terminal execution alone does not certify complete resource retirement.
     Failed(FerrumError),
     /// No terminal observation was obtained. This includes unsupported checks.
     Unresolved(FerrumError),

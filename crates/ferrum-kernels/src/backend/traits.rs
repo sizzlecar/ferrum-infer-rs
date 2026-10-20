@@ -7,7 +7,7 @@ pub use super::capabilities::{
 };
 use super::dtype::Dtype;
 pub use super::types::MoeRouting;
-use super::types::{AttnConfig, KvCacheQuant, SrcDtype};
+use super::types::{AttnConfig, KvCacheQuant, KvTokenLayout, QuantizedPagedKvPool, SrcDtype};
 
 /// Maximum decode-graph layer count. Per-layer call sites that share
 /// graph-captured host staging arrays use this as the stride between
@@ -26,9 +26,9 @@ pub const MAX_LAYERS_FOR_GRAPH: usize = 64;
 /// The core abstraction over CUDA / Metal / CPU.
 ///
 /// Key design: operations take a `&mut Self::Context` which accumulates work.
-///   - **CPU**: Context is `()` — ops execute immediately.
-///   - **Metal**: Context is a `CommandBuffer` — ops encode into it, flushed on `sync()`.
-///   - **CUDA**: Context is a `CudaStream` — ops launch on the stream, synced on `sync()`.
+///   - **CPU**: `CpuContext` retains immutable policy; ops execute immediately.
+///   - **Metal**: `MetalContext` owns policy and command-buffer completion state.
+///   - **CUDA**: `CudaState` owns policy, streams, reusable graphs, and scratch.
 ///
 /// `layer_forward` passes the context through all ops in a layer.
 /// `ModelRunner` calls `sync()` only when it needs results (e.g., reading logits).
@@ -36,10 +36,12 @@ pub trait Backend: Send + Sync + Sized + 'static {
     type Buffer: Send + Sync;
 
     /// Execution context that accumulates GPU work.
-    ///   - CPU: `()` (no-op, ops execute inline)
+    ///   - CPU: `CpuContext` (no-op, ops execute inline)
     ///   - Metal: wraps a CommandBuffer
     ///   - CUDA: wraps a CudaStream
-    type Context;
+    // Submitted contexts must be retainable by the model's recovery service,
+    // independently of the thread/future that initiated the operation.
+    type Context: Send + Sync;
 
     /// GPU-side timer scoped to this backend. See `super::timer` —
     /// CPU: `Instant`; Metal: sync-wrap; CUDA: `cuEvent`.
@@ -65,23 +67,40 @@ pub trait Backend: Send + Sync + Sized + 'static {
     //   by `load_gptq`. Adding a new Marlin-capable backend is purely a
     //   new MarlinExpertStack<NewBackend> impl — no Backend trait edits.
 
-    /// Create a new execution context (begin accumulating work).
-    fn new_context() -> Self::Context;
+    /// Construct one execution owner from an explicit immutable policy.
+    fn new_context(config: &ferrum_types::BackendContextConfig) -> Result<Self::Context>;
 
-    /// Run `body` while binding context-free backend operations to an
-    /// explicit device ordinal when the backend supports multi-device scopes.
-    ///
-    /// Most backends have no per-ordinal concept and use the default no-op
-    /// implementation. CUDA overrides this once its stream/context caches are
-    /// device-keyed, allowing layer-split stages to load and execute on their
-    /// selected GPU instead of relying on process-global defaults.
-    fn with_device_ordinal<R>(_device_ordinal: Option<usize>, body: impl FnOnce() -> R) -> R {
-        body()
+    /// The exact policy used for weight loading and execution on this owner.
+    fn context_config(ctx: &Self::Context) -> &ferrum_types::BackendContextConfig;
+
+    /// Begin a new invocation on the same instance owner. Implementations must
+    /// reject an unresolved previous invocation; persistent resources survive.
+    fn begin_execution(_ctx: &mut Self::Context) -> Result<()> {
+        Ok(())
     }
 
-    /// Whether [`Self::with_device_ordinal`] actually switches backend
-    /// execution to the requested ordinal.
-    fn supports_device_ordinal_scope() -> bool {
+    /// Retire an instance only after observing its actual execution terminal.
+    /// Backends with captured programs destroy them before captured storage.
+    /// Ok certifies safe retirement, not successful device execution. Callers
+    /// retain any terminal failure from their original completion observation.
+    fn retire_context(ctx: &mut Self::Context) -> Result<()> {
+        match Self::observe_completion(ctx) {
+            super::BackendCompletion::Succeeded | super::BackendCompletion::Failed(_) => Ok(()),
+            super::BackendCompletion::Unresolved(error) => Err(error),
+        }
+    }
+
+    /// Keep a replaced buffer alive until the original context observes its
+    /// submitted work as terminal. Synchronous backends may drop it directly;
+    /// command-buffer backends may rely on retained native resource references.
+    /// Backends whose buffer Drop does not prove completion must transfer it
+    /// into the original context's existing execution custody.
+    fn retain_buffer_until_completion(_ctx: &mut Self::Context, buffer: Self::Buffer) {
+        drop(buffer);
+    }
+
+    /// Whether context construction supports explicit device placement.
+    fn supports_device_ordinal() -> bool {
         false
     }
 
@@ -93,6 +112,19 @@ pub trait Backend: Send + Sync + Sized + 'static {
     /// no device work can retain local buffers after an operation returns or
     /// unwinds. This permits host model code to report terminal failures.
     fn host_execution_is_synchronous() -> bool {
+        false
+    }
+
+    /// Explicit qualification for a model retaining this backend's original
+    /// context across managed invocations. Completion must distinguish success,
+    /// terminal failure and unresolved lifetime for all submitted work. Failed
+    /// encoding must preserve its actual owners; recovery observes that same
+    /// context without replay, and checked retirement precedes resource release.
+    /// `begin_execution` must never replace or reset an unresolved owner.
+    ///
+    /// This capability does not qualify a model, KV format, or pipeline by
+    /// itself. Those implementations opt into their own managed lifecycle.
+    fn supports_retained_execution() -> bool {
         false
     }
 
@@ -110,6 +142,17 @@ pub trait Backend: Send + Sync + Sized + 'static {
         super::BackendCompletion::Unresolved(FerrumError::unsupported(
             "backend has no checked completion observation",
         ))
+    }
+
+    /// Prove that storage allocation and table initialization on this exact
+    /// context have performed only synchronous host work. In addition to
+    /// preparation, after successful `begin_execution` this may establish safe
+    /// resource retirement for a host error before the first device encoding.
+    /// It does not certify successful numerical execution or replace ordinary
+    /// checked synchronization. Device allocators that enqueue initialization
+    /// must return false, even when no numerical kernel was launched.
+    fn preparation_is_host_only(_ctx: &Self::Context) -> bool {
+        false
     }
 
     /// Whether the backend context is currently inside a graph-capture window.
@@ -192,11 +235,26 @@ pub trait Backend: Send + Sync + Sized + 'static {
     /// accessors get the correct byte count automatically.
     fn alloc_typed(dtype: super::Dtype, n: usize) -> Self::Buffer;
 
+    fn alloc_typed_in_context(
+        _ctx: &mut Self::Context,
+        dtype: super::Dtype,
+        n: usize,
+    ) -> Self::Buffer {
+        Self::alloc_typed(dtype, n)
+    }
+
     /// Upload typed host data — replaces `from_slice_i32` /
     /// `from_slice_u32` etc. The host element type `T` carries its
     /// `Dtype` via the `HostDtype` marker so dispatch in the impl
     /// is a one-line `match T::DTYPE`.
     fn from_slice_typed<T: super::HostDtype>(data: &[T]) -> Self::Buffer;
+
+    fn from_slice_typed_in_context<T: super::HostDtype>(
+        _ctx: &mut Self::Context,
+        data: &[T],
+    ) -> Self::Buffer {
+        Self::from_slice_typed(data)
+    }
 
     /// In-place typed write — replaces `write_u32` / `write_i32_into`
     /// / `write_f32_into`. The buffer must already be dtype-tagged
@@ -1412,6 +1470,18 @@ pub trait Backend: Send + Sync + Sized + 'static {
     fn to_vec(buf: &Self::Buffer, len: usize) -> Vec<f32>;
     fn from_slice(data: &[f32]) -> Self::Buffer;
 
+    fn alloc_in_context(_ctx: &mut Self::Context, len: usize) -> Self::Buffer {
+        Self::alloc(len)
+    }
+
+    fn to_vec_in_context(_ctx: &mut Self::Context, buf: &Self::Buffer, len: usize) -> Vec<f32> {
+        Self::to_vec(buf, len)
+    }
+
+    fn from_slice_in_context(_ctx: &mut Self::Context, data: &[f32]) -> Self::Buffer {
+        Self::from_slice(data)
+    }
+
     fn write_f32_to_activation(ctx: &mut Self::Context, dst: &mut Self::Buffer, data: &[f32]) {
         if data.is_empty() {
             return;
@@ -1631,6 +1701,14 @@ pub trait Backend: Send + Sync + Sized + 'static {
         Self::from_slice(&data)
     }
 
+    fn from_weight_bytes_in_context(
+        _ctx: &mut Self::Context,
+        raw: &[u8],
+        src_dtype: SrcDtype,
+    ) -> Self::Buffer {
+        Self::from_weight_bytes(raw, src_dtype)
+    }
+
     // (The Phase A3 unified `gemm_quant(QuantWeights, QuantKind)` stub
     // that used to live here is superseded by the `load_quant` /
     // `gemm_quant(QuantStore)` pair earlier in this trait — same idea,
@@ -1658,20 +1736,23 @@ pub trait BackendPagedKv: Backend {
     fn supports_paged_kv() -> bool {
         false
     }
-    /// Pre-populate the per-slot device-pointer scratch arrays used by
-    /// the batched kernels (`kv_cache_append_batched_per_cache` and
-    /// `flash_attention_batched_per_cache`). Required by the CUDA-graph
-    /// capture path: the captured graph contains only kernel launches
-    /// (no captured `memcpy_htod`), so the device scratch must be fresh
-    /// when the graph replays.
-    ///
-    /// Caller passes flat layer-major slices: `k_caches[li * m + i]` and
-    /// `v_caches[li * m + i]`. Backend extracts each cache's device
-    /// pointer and writes into its corresponding slot in the device
-    /// scratch via SYNCHRONOUS memcpy (not captured by stream capture).
-    ///
-    /// CUDA-only; other backends fall through to the default
-    /// `unsupported` and the caller skips the population call.
+
+    /// Whether paged prefill and decode preserve a nonzero causal sliding
+    /// window. Varlen QKV alone does not qualify attention masking. Callers
+    /// must select another supported layout when this capability is absent.
+    fn supports_windowed_paged_attention() -> bool {
+        false
+    }
+
+    /// Prepare the original context's per-layer pointer tables before graph
+    /// capture/replay. Flat inputs are layer-major: [layer * m + item].
+    /// Each layer and K/V role has its own persistent host region; captured
+    /// append/attention nodes upload those regions on replay. The caller must
+    /// refresh them for every invocation, including after other eager work used
+    /// the same context, and retain the referenced caches through retirement.
+    /// This host preparation must run outside capture. It does not submit work
+    /// or provide another completion/ownership authority.
+    /// Other backends may return Unsupported when no such graph route exists.
     fn populate_batched_pointers(
         _ctx: &mut Self::Context,
         _k_caches: &[&Self::Buffer],
@@ -1742,8 +1823,20 @@ pub trait BackendPagedKv: Backend {
     ///   `block_tables`: `[num_seqs, max_num_blocks_per_seq]` u32
     ///   `context_lens`: `[num_seqs]` u32
     ///
-    /// Backends without a paged kernel return Unsupported; callers are
-    /// expected to fall back to contiguous KV.
+    /// `sliding_window == 0` preserves full causal attention; otherwise each
+    /// query attends only its latest `sliding_window` positions. Windowed or
+    /// multi-token calls may prepare metadata and must run outside capture;
+    /// captured callers use the device-staged varlen entry directly.
+    ///
+    /// `host_context_lens`, when provided, is the exact per-row projection from
+    /// the same producer/frontier as `context_lens`, with `num_seqs` entries.
+    /// It must equal the device values submitted on this context; it is not a
+    /// capacity estimate or an independent cached length authority. Backends
+    /// may copy it into context-owned device metadata during this call; they
+    /// must not capture the borrowed host slice. Windowed CUDA calls require
+    /// this projection, or callers must use the device-staged varlen entry.
+    /// Backends without the required capability return Unsupported; callers
+    /// select a supported layout before allocating cache storage.
     #[allow(clippy::too_many_arguments)]
     fn paged_decode_attention(
         _ctx: &mut Self::Context,
@@ -1760,6 +1853,8 @@ pub trait BackendPagedKv: Backend {
         _block_size: usize,
         _max_num_blocks_per_seq: usize,
         _q_len: usize,
+        _sliding_window: usize,
+        _host_context_lens: Option<&[u32]>,
     ) -> Result<()> {
         Err(FerrumError::unsupported(
             "paged_decode_attention not implemented for this backend",
@@ -1817,6 +1912,24 @@ pub trait BackendPagedKv: Backend {
             "split_qkv_norm_rope_into_paged_cache_varlen not implemented for this backend",
         ))
     }
+    /// Prepare the actual context's varlen attention launch before graph capture.
+    /// The returned geometry must describe the same route and shared-memory
+    /// extent used by `paged_varlen_attention` for these dimensions. Any scratch
+    /// needed by that route remains owned by the original context, including
+    /// old storage retained for already-captured graphs. Default is unqualified.
+    fn prepare_paged_varlen_attention(
+        _ctx: &mut Self::Context,
+        _num_seqs: usize,
+        _total_q_tokens: usize,
+        _max_kv_len: usize,
+        _num_heads: usize,
+        _head_dim: usize,
+    ) -> Result<super::PagedAttentionLaunchGeometry> {
+        Err(FerrumError::unsupported(
+            "paged varlen capture preparation is not implemented",
+        ))
+    }
+
     /// Variable-length paged attention with GQA + causal mask.
     ///
     /// Supports a unified mixed batch where each sequence contributes
@@ -2295,10 +2408,23 @@ pub trait BackendKvDtype<K: KvDtypeKind>: BackendPagedKv {
 /// gets a chance to call into these.
 #[allow(clippy::too_many_arguments)]
 pub trait BackendInt8KvOps: Backend + BackendKvDtype<KvInt8> {
-    /// Allocate the per-layer INT8 paged cache for one sequence.
+    /// Allocate the model layer's physical INT8 storage once, using the same
+    /// total block capacity as its allocator. Sequence tables reference it.
+    fn alloc_paged_int8_pool(
+        _ctx: &mut Self::Context,
+        _num_blocks: usize,
+        _block_size: usize,
+        _num_kv_heads: usize,
+        _head_dim: usize,
+    ) -> QuantizedPagedKvPool<Self, KvInt8> {
+        unimplemented!("alloc_paged_int8_pool not supported on this backend")
+    }
+
+    /// Allocate only the logical table and metadata for one sequence.
     /// Default panics — backends without INT8 support never reach this
     /// path (factory rejects (Cpu/Metal, Int8) before ensure_kv runs).
     fn alloc_paged_int8_layer(
+        _ctx: &mut Self::Context,
         _max_blocks_per_seq: usize,
         _block_size: usize,
         _num_kv_heads: usize,
@@ -2316,18 +2442,16 @@ pub trait BackendInt8KvOps: Backend + BackendKvDtype<KvInt8> {
     /// on the same stream — fully overlapping with prior work.
     /// `cache_len_before` is the current number of valid tokens; the
     /// backend quantizes FP16 → INT8 with per-(token, kv-head) FP16 scale
-    /// and writes both into the layer's INT8 / scale buffers.
+    /// and writes both into the shared physical INT8 / scale buffers.
     fn int8_kv_append_paged(
         _ctx: &mut Self::Context,
         _k_in: &Self::Buffer,
         _v_in: &Self::Buffer,
-        _layer_k: &mut <Self as BackendKvDtype<KvInt8>>::KvBuffer,
-        _layer_v: &mut <Self as BackendKvDtype<KvInt8>>::KvBuffer,
-        _layer_k_scales: &mut <Self as BackendKvDtype<KvInt8>>::KvScales,
-        _layer_v_scales: &mut <Self as BackendKvDtype<KvInt8>>::KvScales,
+        _pool: &mut QuantizedPagedKvPool<Self, KvInt8>,
         _paged_block_indices: &[u32],
         _cache_len_before: usize,
         _tokens: usize,
+        _input_layout: KvTokenLayout,
         _block_size: usize,
         _num_kv_heads: usize,
         _head_dim: usize,
@@ -2337,23 +2461,23 @@ pub trait BackendInt8KvOps: Backend + BackendKvDtype<KvInt8> {
         ))
     }
 
-    /// Run paged decode attention reading from an INT8 cache. Q is FP16,
-    /// output is FP16; the kernel dequantizes K/V on the fly using the
-    /// per-token scales. `valid_kv_len` is the post-append cache length
-    /// (i.e. the kernel attends over `[0, valid_kv_len)` tokens).
+    /// Run causal paged attention against the shared INT8 pool. Q and output
+    /// use `query_layout`. The query rows occupy the last `query_rows` positions
+    /// of `valid_kv_len`; row r reads only the prefix through its own position.
+    /// Decode is the same contract with one query row.
     fn int8_paged_decode_attention(
         _ctx: &mut Self::Context,
         _q: &Self::Buffer,
-        _layer_k: &<Self as BackendKvDtype<KvInt8>>::KvBuffer,
-        _layer_v: &<Self as BackendKvDtype<KvInt8>>::KvBuffer,
-        _layer_k_scales: &<Self as BackendKvDtype<KvInt8>>::KvScales,
-        _layer_v_scales: &<Self as BackendKvDtype<KvInt8>>::KvScales,
+        _pool: &QuantizedPagedKvPool<Self, KvInt8>,
         _block_table: &Self::Buffer,
+        _paged_block_indices: &[u32],
         _output: &mut Self::Buffer,
         _num_q_heads: usize,
         _num_kv_heads: usize,
         _head_dim: usize,
         _valid_kv_len: usize,
+        _query_rows: usize,
+        _query_layout: KvTokenLayout,
         _block_size: usize,
         _scale: f32,
     ) -> Result<()> {

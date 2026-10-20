@@ -11,14 +11,51 @@ use super::{
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExecutionEventSinkError {
+    kind: ExecutionEventSinkErrorKind,
     message: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExecutionEventSinkErrorKind {
+    Contract,
+    Transport,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ExecutionEventDeliveryPolicy {
+    #[default]
+    RequiredEvidence,
+    OptionalTelemetry,
+}
+
 impl ExecutionEventSinkError {
+    /// Unclassified existing errors remain contract failures. Only an explicit
+    /// transport classification may be degraded by optional telemetry.
     pub fn new(message: impl Into<String>) -> Self {
+        Self::contract(message)
+    }
+
+    pub fn contract(message: impl Into<String>) -> Self {
         Self {
+            kind: ExecutionEventSinkErrorKind::Contract,
             message: message.into(),
         }
+    }
+
+    pub fn transport(message: impl Into<String>) -> Self {
+        Self {
+            kind: ExecutionEventSinkErrorKind::Transport,
+            message: message.into(),
+        }
+    }
+
+    pub const fn kind(&self) -> ExecutionEventSinkErrorKind {
+        self.kind
+    }
+
+    pub const fn is_optional_transport(&self, policy: ExecutionEventDeliveryPolicy) -> bool {
+        matches!(self.kind, ExecutionEventSinkErrorKind::Transport)
+            && matches!(policy, ExecutionEventDeliveryPolicy::OptionalTelemetry)
     }
 
     pub fn message(&self) -> &str {
@@ -123,6 +160,13 @@ pub enum ExecutionEventSinkEnablement {
 }
 
 pub trait ExecutionEventSink: Send + Sync {
+    /// Delivery requirements are independent of event validation and capture.
+    /// Optional transports must retain their own loss/failure status: accepting
+    /// an execution event is not proof of a complete or flushed evidence file.
+    fn delivery_policy(&self) -> ExecutionEventDeliveryPolicy {
+        ExecutionEventDeliveryPolicy::RequiredEvidence
+    }
+
     /// Resolves stable event enablement once when an emitter is constructed.
     ///
     /// Dynamically filtered sinks keep the conservative `PerKind` default.
@@ -136,6 +180,24 @@ pub trait ExecutionEventSink: Send + Sync {
 
     fn device_timing_mode(&self) -> super::super::DeviceTimingMode {
         super::super::DeviceTimingMode::Off
+    }
+
+    /// Observation only: this must not change timing, execution qualification,
+    /// or reusable program identity. The caller fixes this choice and sink for
+    /// the submission rather than consulting a replacement sink at completion.
+    fn execution_facts_capture(&self) -> super::super::ExecutionFactsCapture {
+        super::super::ExecutionFactsCapture::Off
+    }
+
+    /// Called synchronously on an execution or recovery thread with borrowed
+    /// facts. Consumers must not block or retain execution owners; deferred
+    /// delivery must use their bounded, nonblocking enqueue path. Failure to
+    /// observe a terminal receipt never authorizes replay of its submitted work.
+    fn record_execution_facts(
+        &self,
+        _facts: super::super::TerminalExecutionFacts<'_>,
+    ) -> Result<(), ExecutionEventSinkError> {
+        Ok(())
     }
 
     fn capture_policy(&self) -> ExecutionEventCapturePolicy {
@@ -185,13 +247,20 @@ pub trait ExecutionEventSink: Send + Sync {
         &self,
         permit: EventBatchEmissionPermit,
     ) -> Result<(), ExecutionEventSinkError> {
+        let mut transport_failure = None;
         for event in permit.into_events() {
-            self.record(EventEmissionPermit {
+            if let Err(error) = self.record(EventEmissionPermit {
                 event,
                 _seal: event_sink_seal::Seal,
-            })?;
+            }) {
+                if error.is_optional_transport(self.delivery_policy()) {
+                    transport_failure.get_or_insert(error);
+                } else {
+                    return Err(error);
+                }
+            }
         }
-        Ok(())
+        transport_failure.map_or(Ok(()), Err)
     }
 }
 
@@ -224,7 +293,9 @@ where
     cursor: ExecutionEventCursor,
     capture_policy: ExecutionEventCapturePolicy,
     sink_enablement: ExecutionEventSinkEnablement,
-    sink_failed: bool,
+    delivery_policy: ExecutionEventDeliveryPolicy,
+    sink_failure: Option<ExecutionEventSinkError>,
+    transport_failure: Option<ExecutionEventSinkError>,
 }
 
 impl<'sink, S> ExecutionEventEmitter<'sink, S>
@@ -244,7 +315,9 @@ where
             cursor: ExecutionEventCursor::new(run_id, request_id),
             capture_policy,
             sink_enablement,
-            sink_failed: false,
+            delivery_policy: sink.delivery_policy(),
+            sink_failure: None,
+            transport_failure: None,
         }
     }
 }
@@ -285,12 +358,15 @@ impl ExecutionEventEmitter<'static, dyn ExecutionEventSink> {
         capture_policy: ExecutionEventCapturePolicy,
         sink_enablement: ExecutionEventSinkEnablement,
     ) -> ExecutionEventEmitter<'static> {
+        let delivery_policy = sink.delivery_policy();
         ExecutionEventEmitter {
             sink: ExecutionEventSinkHandle::Shared(sink),
             cursor: ExecutionEventCursor::new(run_id, request_id),
             capture_policy,
             sink_enablement,
-            sink_failed: false,
+            delivery_policy,
+            sink_failure: None,
+            transport_failure: None,
         }
     }
 }
@@ -299,6 +375,23 @@ impl<'sink, S> ExecutionEventEmitter<'sink, S>
 where
     S: ExecutionEventSink + ?Sized,
 {
+    fn accept_delivery(
+        &mut self,
+        result: Result<(), ExecutionEventSinkError>,
+    ) -> Result<(), ExecutionEventSinkError> {
+        let Err(error) = result else { return Ok(()) };
+        if error.kind() == ExecutionEventSinkErrorKind::Transport {
+            self.transport_failure.get_or_insert_with(|| error.clone());
+        }
+        if error.is_optional_transport(self.delivery_policy) {
+            // Do not disable a shared/fanout sink. A full queue may recover,
+            // and an independent destination may still accept later events.
+            return Ok(());
+        }
+        self.sink_failure = Some(error.clone());
+        Err(error)
+    }
+
     #[inline]
     fn records_event(&self, event: &ExecutionEvent) -> bool {
         self.capture_policy.records_event(event.kind())
@@ -321,37 +414,37 @@ where
             ExecutionEventKind::FrameStarted | ExecutionEventKind::NodeStarted => context
                 .active_binding()
                 .ok_or_else(|| {
-                    ExecutionEventSinkError::new(
+                    ExecutionEventSinkError::contract(
                         "active execution emission lacks live sequence evidence",
                     )
                 })?
                 .ensure_open_for_emission()
-                .map_err(|error| ExecutionEventSinkError::new(error.to_string()))?,
+                .map_err(|error| ExecutionEventSinkError::contract(error.to_string()))?,
             ExecutionEventKind::OperationSubmitted
             | ExecutionEventKind::NodeRetired
             | ExecutionEventKind::FrameCompleted => context
                 .active_binding()
                 .ok_or_else(|| {
-                    ExecutionEventSinkError::new(
+                    ExecutionEventSinkError::contract(
                         "active execution emission lacks live sequence evidence",
                     )
                 })?
                 .ensure_live_for_emission()
-                .map_err(|error| ExecutionEventSinkError::new(error.to_string()))?,
+                .map_err(|error| ExecutionEventSinkError::contract(error.to_string()))?,
             ExecutionEventKind::FailureObserved if has_active(event.identity().parts()) => context
                 .active_binding()
                 .ok_or_else(|| {
-                    ExecutionEventSinkError::new(
+                    ExecutionEventSinkError::contract(
                         "active execution emission lacks live sequence evidence",
                     )
                 })?
                 .ensure_live_for_emission()
-                .map_err(|error| ExecutionEventSinkError::new(error.to_string()))?,
+                .map_err(|error| ExecutionEventSinkError::contract(error.to_string()))?,
             _ => {}
         }
         cursor
             .observe_candidate_in_place(event, context)
-            .map_err(|error| ExecutionEventSinkError::new(error.to_string()))
+            .map_err(|error| ExecutionEventSinkError::contract(error.to_string()))
     }
 
     #[inline]
@@ -366,10 +459,8 @@ where
             self.cursor = next_cursor;
             return Ok(());
         }
-        if self.sink_failed {
-            return Err(ExecutionEventSinkError::new(
-                "execution event emitter is sealed after a sink failure",
-            ));
+        if let Some(error) = &self.sink_failure {
+            return Err(error.clone());
         }
         let mut next_cursor = self.cursor.clone();
         Self::validate_next(&mut next_cursor, &event, context)?;
@@ -378,10 +469,8 @@ where
                 event,
                 _seal: event_sink_seal::Seal,
             };
-            if let Err(error) = self.sink.as_sink().record(permit) {
-                self.sink_failed = true;
-                return Err(error);
-            }
+            let delivered = self.sink.as_sink().record(permit);
+            self.accept_delivery(delivered)?;
         }
         self.cursor = next_cursor;
         Ok(())
@@ -394,7 +483,7 @@ where
     ) -> Result<(), ExecutionEventSinkError> {
         if self.sink_enablement == ExecutionEventSinkEnablement::None {
             if events.len() != contexts.len() {
-                return Err(ExecutionEventSinkError::new(
+                return Err(ExecutionEventSinkError::contract(
                     "execution event batch context count differs from event count",
                 ));
             }
@@ -408,13 +497,11 @@ where
             self.cursor = next_cursor;
             return Ok(());
         }
-        if self.sink_failed {
-            return Err(ExecutionEventSinkError::new(
-                "execution event emitter is sealed after a sink failure",
-            ));
+        if let Some(error) = &self.sink_failure {
+            return Err(error.clone());
         }
         if events.len() != contexts.len() {
-            return Err(ExecutionEventSinkError::new(
+            return Err(ExecutionEventSinkError::contract(
                 "execution event batch context count differs from event count",
             ));
         }
@@ -433,10 +520,8 @@ where
                 events,
                 _seal: event_sink_seal::Seal,
             };
-            if let Err(error) = self.sink.as_sink().record_batch(permit) {
-                self.sink_failed = true;
-                return Err(error);
-            }
+            let delivered = self.sink.as_sink().record_batch(permit);
+            self.accept_delivery(delivered)?;
         } else {
             for event in events {
                 if !self.records_event(&event) {
@@ -446,10 +531,8 @@ where
                     event,
                     _seal: event_sink_seal::Seal,
                 };
-                if let Err(error) = self.sink.as_sink().record(permit) {
-                    self.sink_failed = true;
-                    return Err(error);
-                }
+                let delivered = self.sink.as_sink().record(permit);
+                self.accept_delivery(delivered)?;
             }
         }
         self.cursor = next_cursor;
@@ -461,7 +544,13 @@ where
     }
 
     pub const fn sink_failed(&self) -> bool {
-        self.sink_failed
+        self.sink_failure.is_some()
+    }
+
+    /// First observed transport loss, including optional delivery failures.
+    /// Cursor progress alone never certifies complete delivered evidence.
+    pub fn transport_failure(&self) -> Option<&ExecutionEventSinkError> {
+        self.transport_failure.as_ref()
     }
 }
 

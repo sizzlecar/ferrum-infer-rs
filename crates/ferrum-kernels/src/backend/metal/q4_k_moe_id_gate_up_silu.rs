@@ -16,8 +16,8 @@
 
 #![cfg(all(target_os = "macos", feature = "metal"))]
 
+use crate::attention::metal::pipelines::MetalPipelines;
 use std::ffi::c_void;
-use std::sync::OnceLock;
 
 use metal::{
     Buffer, CompileOptions, ComputeCommandEncoderRef, ComputePipelineState, Device, MTLSize,
@@ -26,20 +26,16 @@ use metal::{
 const SHADER_SRC: &str = include_str!("q4_k_moe_id_gate_up_silu.metal");
 const KERNEL_NAME: &str = "gemv_q4kw_moe_id_gate_up_silu_f32";
 
-static PIPELINE: OnceLock<ComputePipelineState> = OnceLock::new();
-
-fn pipeline(device: &Device) -> &'static ComputePipelineState {
-    PIPELINE.get_or_init(|| {
-        let lib = device
-            .new_library_with_source(SHADER_SRC, &CompileOptions::new())
-            .expect("compile q4_k_moe_id_gate_up_silu.metal");
-        let function = lib
-            .get_function(KERNEL_NAME, None)
-            .expect("find gemv_q4kw_moe_id_gate_up_silu_f32 function");
-        device
-            .new_compute_pipeline_state_with_function(&function)
-            .expect("build gemv_q4kw_moe_id_gate_up_silu_f32 pipeline")
-    })
+pub(crate) fn build_pipeline(device: &Device) -> ComputePipelineState {
+    let lib = device
+        .new_library_with_source(SHADER_SRC, &CompileOptions::new())
+        .expect("compile q4_k_moe_id_gate_up_silu.metal");
+    let function = lib
+        .get_function(KERNEL_NAME, None)
+        .expect("find gemv_q4kw_moe_id_gate_up_silu_f32 function");
+    device
+        .new_compute_pipeline_state_with_function(&function)
+        .expect("build gemv_q4kw_moe_id_gate_up_silu_f32 pipeline")
 }
 
 /// Dispatch the fused gate+up+silu MoE GEMV on an existing compute encoder.
@@ -56,8 +52,8 @@ fn pipeline(device: &Device) -> &'static ComputePipelineState {
 /// `k`               : in_features (multiple of 256).
 /// `n_selected`      : number of selected experts (= top_k for decode m=1).
 #[allow(clippy::too_many_arguments)]
-pub fn dispatch_gemv_q4k_moe_id_gate_up_silu_on_encoder(
-    device: &Device,
+pub(crate) fn dispatch_gemv_q4k_moe_id_gate_up_silu_on_encoder(
+    pipes: &MetalPipelines,
     enc: &ComputeCommandEncoderRef,
     a: &Buffer,
     gate_w_stacked: &Buffer,
@@ -92,7 +88,7 @@ pub fn dispatch_gemv_q4k_moe_id_gate_up_silu_on_encoder(
         n_selected: n_selected as i32,
     };
 
-    let pipe = pipeline(device);
+    let pipe = pipes.q4_k_moe_id_gate_up_silu_pipeline();
     enc.set_compute_pipeline_state(pipe);
     enc.set_buffer(0, Some(gate_w_stacked), gate_w_byte_offset);
     enc.set_buffer(1, Some(up_w_stacked), up_w_byte_offset);
@@ -166,6 +162,7 @@ mod tests {
             eprintln!("no Metal device — skipping");
             return;
         };
+        let pipes = MetalPipelines::new(&device);
         let queue = device.new_command_queue();
 
         let a_buf = device.new_buffer_with_data(
@@ -198,14 +195,14 @@ mod tests {
         // ── Unfused: 3 dispatches ──────────────────────────────────────
         let cmd1 = queue.new_command_buffer();
         let enc1 = cmd1.new_compute_command_encoder();
-        crate::q4_k_moe_id_gemv::dispatch_gemv_q4k_moe_id_on_encoder(
-            &device, enc1, &a_buf, &gate_buf, 0, &ids_buf, &gate_out, N, K, TOP_K, 0,
+        crate::backend::metal::q4_k_moe_id_gemv::dispatch_gemv_q4k_moe_id_on_encoder(
+            &pipes, enc1, &a_buf, &gate_buf, 0, &ids_buf, &gate_out, N, K, TOP_K, 0,
         );
-        crate::q4_k_moe_id_gemv::dispatch_gemv_q4k_moe_id_on_encoder(
-            &device, enc1, &a_buf, &up_buf, 0, &ids_buf, &up_out, N, K, TOP_K, 0,
+        crate::backend::metal::q4_k_moe_id_gemv::dispatch_gemv_q4k_moe_id_on_encoder(
+            &pipes, enc1, &a_buf, &up_buf, 0, &ids_buf, &up_out, N, K, TOP_K, 0,
         );
-        crate::moe_post_ops::dispatch_silu_mul_stacked(
-            &device,
+        crate::backend::metal::moe_post_ops::dispatch_silu_mul_stacked(
+            &pipes,
             enc1,
             &gate_out,
             &up_out,
@@ -221,7 +218,7 @@ mod tests {
         let cmd2 = queue.new_command_buffer();
         let enc2 = cmd2.new_compute_command_encoder();
         dispatch_gemv_q4k_moe_id_gate_up_silu_on_encoder(
-            &device,
+            &pipes,
             enc2,
             &a_buf,
             &gate_buf,

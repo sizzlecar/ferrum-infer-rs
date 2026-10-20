@@ -123,9 +123,25 @@ pub fn load_gguf_decoder_with_info(
     device: &Device,
     model_id: ModelId,
 ) -> Result<(Box<dyn DecoderOnlyLLM>, ModelInfo)> {
+    load_gguf_decoder_with_execution_config(
+        gguf_path,
+        device,
+        model_id,
+        ferrum_types::LlamaExecutionConfig::default(),
+    )
+}
+
+/// Load with explicit instance options; resolve these before opening weights.
+pub fn load_gguf_decoder_with_execution_config(
+    gguf_path: &Path,
+    device: &Device,
+    model_id: ModelId,
+    execution: ferrum_types::LlamaExecutionConfig,
+) -> Result<(Box<dyn DecoderOnlyLLM>, ModelInfo)> {
+    execution.validate().map_err(FerrumError::config)?;
     let gguf = GgufFile::open(gguf_path)
         .map_err(|e| FerrumError::model(format!("GgufFile::open {}: {e}", gguf_path.display())))?;
-    load_open_gguf_decoder_with_info(gguf, device, model_id, None)
+    load_open_gguf_decoder_with_info(gguf, device, model_id, None, execution)
 }
 
 /// Loads a dense GGUF only after checking its physical architecture and
@@ -137,6 +153,21 @@ pub fn load_gguf_decoder_from_sources_with_info(
     device: &Device,
     model_id: ModelId,
 ) -> Result<(Box<dyn DecoderOnlyLLM>, ModelInfo)> {
+    load_gguf_decoder_from_sources_with_execution_config(
+        sources,
+        device,
+        model_id,
+        ferrum_types::LlamaExecutionConfig::default(),
+    )
+}
+
+pub fn load_gguf_decoder_from_sources_with_execution_config(
+    sources: &ProductionModelSourceBundle,
+    device: &Device,
+    model_id: ModelId,
+    execution: ferrum_types::LlamaExecutionConfig,
+) -> Result<(Box<dyn DecoderOnlyLLM>, ModelInfo)> {
+    execution.validate().map_err(FerrumError::config)?;
     let ProductionWeightArtifact::GgufFile(path) = sources.weights() else {
         return Err(FerrumError::model(
             "GGUF decoder requires a GGUF weight source",
@@ -145,7 +176,7 @@ pub fn load_gguf_decoder_from_sources_with_info(
     let definition = ConfigManager::new().load_from_bytes(sources.config_json())?;
     let gguf = GgufFile::open(path)
         .map_err(|e| FerrumError::model(format!("GgufFile::open {}: {e}", path.display())))?;
-    load_open_gguf_decoder_with_info(gguf, device, model_id, Some(&definition))
+    load_open_gguf_decoder_with_info(gguf, device, model_id, Some(&definition), execution)
 }
 
 fn load_open_gguf_decoder_with_info(
@@ -153,6 +184,7 @@ fn load_open_gguf_decoder_with_info(
     device: &Device,
     model_id: ModelId,
     semantic: Option<&ModelDefinition>,
+    execution: ferrum_types::LlamaExecutionConfig,
 ) -> Result<(Box<dyn DecoderOnlyLLM>, ModelInfo)> {
     let arch = gguf
         .architecture()
@@ -211,7 +243,9 @@ fn load_open_gguf_decoder_with_info(
         Device::CPU => {
             use ferrum_kernels::backend::cpu::CpuBackend;
             let loader = GgufLoader::<CpuBackend>::from_file(gguf_arc.clone());
-            let model = LlamaFamilyModel::<CpuBackend>::new(dense_cfg, &loader)?;
+            let model = LlamaFamilyModel::<CpuBackend>::new_with_execution_config(
+                dense_cfg, &loader, execution,
+            )?;
             Box::new(model)
         }
         #[cfg(any(target_os = "macos", target_os = "ios"))]
@@ -223,12 +257,19 @@ fn load_open_gguf_decoder_with_info(
                 // `B::load_quant_*` calls produce zero-copy MTLBuffers. CRITICAL
                 // on a 32 GB Mac for 30B-A3B Q4_K_M (saves ~17 GB resident).
                 let mmap_registration = ferrum_kernels::backend::metal::register_gguf_mmap(
-                    gguf_arc.mmap_bytes(),
-                    gguf_arc.clone(),
+                    ferrum_runtime::RetainedHostMemoryRegion::new(
+                        gguf_arc.clone(),
+                        0,
+                        gguf_arc.mmap_bytes().len(),
+                    )
+                    .map_err(|e| FerrumError::model(format!("retain_gguf_mmap: {e}")))?,
+                    &execution.backend_context.metal,
                 )
                 .map_err(|e| FerrumError::model(format!("register_gguf_mmap: {e}")))?;
                 let loader = GgufLoader::<MetalBackend>::from_file(gguf_arc.clone());
-                let model = LlamaFamilyModel::<MetalBackend>::new(dense_cfg, &loader)?;
+                let model = LlamaFamilyModel::<MetalBackend>::new_with_execution_config(
+                    dense_cfg, &loader, execution,
+                )?;
                 mmap_registration
                     .commit_residency()
                     .map_err(|e| FerrumError::model(format!("commit_gguf_mmap_residency: {e}")))?;

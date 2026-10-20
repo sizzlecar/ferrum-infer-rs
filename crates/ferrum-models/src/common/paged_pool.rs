@@ -54,6 +54,7 @@
 //!   scheduler would refuse-and-queue or evict.
 //! - Cross-process or cross-model pooling.
 
+use ferrum_execution::token_execution::AllocatorCapacityDomain;
 use ferrum_kernels::backend::Backend;
 use ferrum_types::{FerrumError, Result, TokenId};
 use std::collections::HashMap;
@@ -63,6 +64,14 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 /// Hash identifying a content-addressable KV block. Computed from a chain
 /// of (parent_hash, block_tokens) — see [`block_hash_chain`].
 pub type BlockHash = u64;
+
+/// Read-only consequence of releasing a complete candidate set. Contributors
+/// name candidate positions, not individually reclaimable block counts.
+#[derive(Debug, PartialEq, Eq)]
+pub struct BlockReclaimObservation {
+    pub reclaimable_blocks: usize,
+    pub contributing_candidates: Vec<usize>,
+}
 
 /// Compute the hash for one block, chained from its parent.
 ///
@@ -104,6 +113,9 @@ pub fn block_hash_chain(tokens: &[TokenId], block_size: usize) -> Vec<BlockHash>
 /// load time. The allocator is independent per-model (block index space
 /// is not portable across models).
 pub struct BlockAllocator {
+    /// Stable identity of this physical block index space, independent of its
+    /// dimensions or current allocation state.
+    capacity_domain: AllocatorCapacityDomain,
     free_list: Vec<u32>,
     capacity: u32,
     /// Watermark: how many blocks have been live at peak, useful for
@@ -140,6 +152,7 @@ impl BlockAllocator {
         let mut free_list: Vec<u32> = (0..num_blocks).collect();
         free_list.reverse(); // pop() yields 0 first
         Self {
+            capacity_domain: AllocatorCapacityDomain::new(),
             free_list,
             capacity: num_blocks,
             peak_in_use: AtomicUsize::new(0),
@@ -355,6 +368,99 @@ impl BlockAllocator {
         self.free_list.len()
     }
 
+    /// Identity of this allocator's physical capacity. Moving the allocator,
+    /// freeing every block, or resurrecting a cached prefix keeps this domain.
+    pub fn capacity_domain(&self) -> &AllocatorCapacityDomain {
+        &self.capacity_domain
+    }
+
+    /// Observe how many distinct blocks would become newly free after releasing
+    /// all the supplied candidates together. Each slice must be the first-layer
+    /// block indices of one distinct, currently owned sequence cache. A shared
+    /// block counts only when the combined releases remove its last reference;
+    /// per-candidate observations therefore must not be summed.
+    ///
+    /// This does not release references or authorize eviction. The caller must
+    /// obtain the candidate sets from their actual owners and keep that mapping
+    /// consistent with this allocator observation. The indices alone cannot
+    /// establish which cache owns a reference.
+    ///
+    /// Duplicate indices within a cache, out-of-range indices and more releases
+    /// than live references are rejected. In particular, a soft-free block is
+    /// already included in [`Self::free_count`] and has no reference to revoke;
+    /// it cannot contribute additional capacity here.
+    pub fn reclaimable_blocks<'a>(
+        &self,
+        candidates: impl IntoIterator<Item = &'a [u32]>,
+    ) -> Result<usize> {
+        self.observe_reclaimable_blocks(candidates)
+            .map(|observation| observation.reclaimable_blocks)
+    }
+
+    /// The same joint observation, retaining each candidate whose reference
+    /// participates in a block that the complete set would free. A contributor
+    /// can free zero blocks alone. No pool-wide scan or repeated per-candidate
+    /// reclaim query is needed; only the supplied block mappings are visited.
+    pub fn observe_reclaimable_blocks<'a>(
+        &self,
+        candidates: impl IntoIterator<Item = &'a [u32]>,
+    ) -> Result<BlockReclaimObservation> {
+        let mut releases: HashMap<u32, Vec<usize>> = HashMap::new();
+        let mut contributing = Vec::new();
+        for (candidate, blocks) in candidates.into_iter().enumerate() {
+            contributing.push(false);
+            for &block in blocks {
+                let references = self.ref_counts.get(block as usize).ok_or_else(|| {
+                    FerrumError::request_validation(format!(
+                        "paged KV reclaim candidate contains block {block} outside capacity {}",
+                        self.capacity
+                    ))
+                })?;
+                if *references == 0 {
+                    return Err(FerrumError::request_validation(format!(
+                        "paged KV reclaim candidate contains already-free block {block}"
+                    )));
+                }
+                match releases.entry(block) {
+                    std::collections::hash_map::Entry::Vacant(entry) => {
+                        entry.insert(vec![candidate]);
+                    }
+                    std::collections::hash_map::Entry::Occupied(mut entry) => {
+                        let owners = entry.get_mut();
+                        if owners.last() == Some(&candidate) {
+                            return Err(FerrumError::request_validation(format!(
+                                "paged KV reclaim candidate repeats block {block} within one cache"
+                            )));
+                        }
+                        if owners.len() >= usize::from(*references) {
+                            return Err(FerrumError::request_validation(format!(
+                                "paged KV reclaim candidates exceed block {block}'s live references"
+                            )));
+                        }
+                        owners.push(candidate);
+                    }
+                }
+            }
+        }
+        let mut reclaimable_blocks = 0;
+        for (block, owners) in releases {
+            if owners.len() == usize::from(self.ref_counts[block as usize]) {
+                reclaimable_blocks += 1;
+                for candidate in owners {
+                    contributing[candidate] = true;
+                }
+            }
+        }
+        Ok(BlockReclaimObservation {
+            reclaimable_blocks,
+            contributing_candidates: contributing
+                .into_iter()
+                .enumerate()
+                .filter_map(|(candidate, contributes)| contributes.then_some(candidate))
+                .collect(),
+        })
+    }
+
     pub fn capacity(&self) -> u32 {
         self.capacity
     }
@@ -390,16 +496,15 @@ impl<B: Backend> PagedSeqState<B> {
     /// Allocate buffers for a sequence that hasn't yet allocated any
     /// blocks. The allocator isn't touched here — the first call to
     /// [`Self::ensure_capacity`] does the real work.
-    pub fn new(block_size: usize, max_blocks_per_seq: usize) -> Self {
+    pub fn new(ctx: &mut B::Context, block_size: usize, max_blocks_per_seq: usize) -> Self {
         let block_table_buf =
-            B::alloc_typed(ferrum_kernels::backend::Dtype::U32, max_blocks_per_seq);
-        let context_lens_buf = B::alloc_typed(ferrum_kernels::backend::Dtype::U32, 1);
+            B::alloc_typed_in_context(ctx, ferrum_kernels::backend::Dtype::U32, max_blocks_per_seq);
+        let context_lens_buf =
+            B::alloc_typed_in_context(ctx, ferrum_kernels::backend::Dtype::U32, 1);
         // Initialise context_lens to 0 so a forward dispatched before
         // any token has been written sees an empty context.
-        let mut ctx = B::new_context();
         let mut cl = context_lens_buf;
-        B::write_typed::<u32>(&mut ctx, &mut cl, &[0u32]);
-        B::sync(&mut ctx);
+        B::write_typed::<u32>(ctx, &mut cl, &[0u32]);
         Self {
             blocks: Vec::with_capacity(max_blocks_per_seq),
             block_table_buf,
@@ -461,6 +566,183 @@ impl<B: Backend> PagedSeqState<B> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn allocator_capacity_domain_is_stable_and_distinguishes_equal_sized_pools() {
+        let mut allocator = BlockAllocator::new(4);
+        let domain = allocator.capacity_domain().clone();
+        let other = BlockAllocator::new(4);
+        assert_eq!(allocator.capacity(), other.capacity());
+        assert_eq!(allocator.free_count(), other.free_count());
+        assert_ne!(allocator.capacity_domain(), other.capacity_domain());
+        let block = allocator.allocate().unwrap();
+        allocator.register_block_hash(block, 41);
+        allocator.free(&[block]);
+        let mut moved = allocator;
+        assert_eq!(moved.capacity_domain(), &domain);
+        assert_eq!(moved.try_acquire_by_hash(41), Some(block));
+        assert_eq!(moved.capacity_domain(), &domain);
+        moved.free(&[block]);
+        assert_eq!(moved.capacity_domain(), &domain);
+    }
+
+    #[test]
+    fn allocator_reclaim_observation_matches_exclusive_release_without_mutation() {
+        let mut allocator = BlockAllocator::new(5);
+        let blocks = allocator.allocate_n(3).unwrap();
+        allocator.register_block_hash(blocks[0], 42);
+        let free_before = allocator.free_count();
+        let peak_before = allocator.peak_in_use();
+        let hashes_before = allocator.hash_table_size();
+        let observed = allocator.reclaimable_blocks([blocks.as_slice()]).unwrap();
+        assert_eq!(observed, 3);
+        assert_eq!(allocator.free_count(), free_before);
+        assert_eq!(allocator.peak_in_use(), peak_before);
+        assert_eq!(allocator.hash_table_size(), hashes_before);
+        assert!(blocks.iter().all(|&block| allocator.ref_count(block) == 1));
+        allocator.free(&blocks);
+        assert_eq!(allocator.free_count() - free_before, observed);
+        assert_eq!(allocator.free_count(), allocator.capacity() as usize);
+        assert_eq!(allocator.hash_table_size(), hashes_before);
+    }
+
+    #[test]
+    fn allocator_reclaim_observation_combines_shared_owners_before_counting() {
+        let mut allocator = BlockAllocator::new(6);
+        let blocks = allocator.allocate_n(3).unwrap();
+        allocator.acquire(blocks[0]);
+        let first = [blocks[0], blocks[1]];
+        let second = [blocks[0], blocks[2]];
+        let first_only = allocator.reclaimable_blocks([first.as_slice()]).unwrap();
+        let second_only = allocator.reclaimable_blocks([second.as_slice()]).unwrap();
+        assert_eq!(first_only, 1);
+        assert_eq!(second_only, 1);
+        let combined = allocator
+            .reclaimable_blocks([first.as_slice(), second.as_slice()])
+            .unwrap();
+        assert_eq!(combined, 3);
+        assert_ne!(combined, first_only + second_only);
+        assert_eq!(allocator.ref_count(blocks[0]), 2);
+        let free_before = allocator.free_count();
+        allocator.free(&first);
+        assert_eq!(allocator.free_count() - free_before, first_only);
+        assert_eq!(allocator.ref_count(blocks[0]), 1);
+        assert_eq!(
+            allocator.reclaimable_blocks([second.as_slice()]).unwrap(),
+            2
+        );
+        allocator.free(&second);
+        assert_eq!(allocator.free_count() - free_before, combined);
+    }
+
+    #[test]
+    fn allocator_reclaim_contributors_include_joint_only_owners_and_keep_input_indices() {
+        let mut allocator = BlockAllocator::new(3);
+        let joint = allocator.allocate().unwrap();
+        let blocked_shared = allocator.allocate().unwrap();
+        allocator.acquire(joint);
+        allocator.acquire(blocked_shared);
+        let first = [joint];
+        let second = [joint];
+        let insufficient = [blocked_shared];
+        let missing: &[u32] = &[];
+        assert_eq!(
+            allocator
+                .observe_reclaimable_blocks([first.as_slice()])
+                .unwrap(),
+            BlockReclaimObservation {
+                reclaimable_blocks: 0,
+                contributing_candidates: vec![]
+            }
+        );
+        assert_eq!(
+            allocator
+                .observe_reclaimable_blocks([second.as_slice()])
+                .unwrap(),
+            BlockReclaimObservation {
+                reclaimable_blocks: 0,
+                contributing_candidates: vec![]
+            }
+        );
+        let joint_observation = allocator
+            .observe_reclaimable_blocks([
+                missing,
+                first.as_slice(),
+                insufficient.as_slice(),
+                second.as_slice(),
+            ])
+            .unwrap();
+        assert_eq!(
+            joint_observation,
+            BlockReclaimObservation {
+                reclaimable_blocks: 1,
+                contributing_candidates: vec![1, 3],
+            }
+        );
+        let free_before = allocator.free_count();
+        allocator.free(&first);
+        assert_eq!(allocator.free_count(), free_before);
+        allocator.free(&second);
+        assert_eq!(
+            allocator.free_count(),
+            free_before + joint_observation.reclaimable_blocks
+        );
+        assert_eq!(allocator.ref_count(blocked_shared), 2);
+    }
+
+    #[test]
+    fn allocator_reclaim_observation_rejects_invalid_reference_sets() {
+        let mut allocator = BlockAllocator::new(3);
+        let block = allocator.allocate().unwrap();
+        allocator.acquire(block);
+        let duplicate = [block, block];
+        let one = [block];
+        let out_of_range = [allocator.capacity()];
+        assert!(allocator
+            .reclaimable_blocks([duplicate.as_slice()])
+            .is_err());
+        assert!(allocator
+            .reclaimable_blocks([out_of_range.as_slice()])
+            .is_err());
+        assert!(allocator
+            .reclaimable_blocks([one.as_slice(), one.as_slice(), one.as_slice()])
+            .is_err());
+        assert_eq!(allocator.ref_count(block), 2);
+        assert_eq!(allocator.free_count(), 2);
+        assert_eq!(allocator.reclaimable_blocks([one.as_slice()]).unwrap(), 0);
+        assert_eq!(
+            allocator
+                .reclaimable_blocks([one.as_slice(), one.as_slice()])
+                .unwrap(),
+            1
+        );
+        allocator.free(&one);
+        allocator.free(&one);
+        assert_eq!(allocator.free_count(), 3);
+    }
+
+    #[test]
+    fn allocator_reclaim_observation_does_not_count_soft_free_blocks_twice() {
+        let mut allocator = BlockAllocator::new(3);
+        let blocks = allocator.allocate_n(2).unwrap();
+        allocator.register_block_hash(blocks[0], 43);
+        allocator.free(&blocks[..1]);
+        let free_before = allocator.free_count();
+        assert_eq!(free_before, 2);
+        assert_eq!(allocator.reclaimable_blocks(std::iter::empty()).unwrap(), 0);
+        assert!(allocator.reclaimable_blocks([&blocks[..1]]).is_err());
+        assert_eq!(allocator.reclaimable_blocks([&blocks[1..]]).unwrap(), 1);
+        assert_eq!(allocator.free_count(), free_before);
+        assert_eq!(allocator.hash_table_size(), 1);
+        allocator.free(&blocks[1..]);
+        assert_eq!(allocator.free_count(), 3);
+        assert_eq!(allocator.try_acquire_by_hash(43), Some(blocks[0]));
+        assert_eq!(allocator.free_count(), 2);
+        let observed = allocator.reclaimable_blocks([&blocks[..1]]).unwrap();
+        assert_eq!(observed, 1);
+        allocator.free(&blocks[..1]);
+        assert_eq!(allocator.free_count(), 3);
+    }
 
     #[test]
     fn allocator_basic() {

@@ -4,7 +4,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use ferrum_execution::ModelExecutor;
+use ferrum_execution::executor_lifecycle::ExecutorOwner;
 use ferrum_models::vnext::ProductionModelSourceBundle;
 use ferrum_models::{ConfigManager, LlmExecutor, ModelDefinition};
 use ferrum_types::{ModelInfo, Result};
@@ -24,21 +24,27 @@ pub(super) fn bind_executor(
     model: Box<dyn ferrum_models::common::DecoderOnlyLLM>,
     info: ModelInfo,
     sources: Option<Arc<ProductionModelSourceBundle>>,
-) -> Arc<dyn ModelExecutor + Send + Sync> {
-    Arc::new(match sources {
+) -> ExecutorOwner {
+    ExecutorOwner::new(Box::new(match sources {
         Some(sources) => LlmExecutor::new_with_model_sources(model, info, sources),
         None => LlmExecutor::new(model, info),
-    })
+    }))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::registry::{ComponentConfig, ComponentFactory, LlmExecutorFactory};
-    use ferrum_execution::model_executor::PrefillInput;
+    use ferrum_execution::model_executor::{
+        ExecutorPrefillAdmission, ExecutorSamplingOutput, LogitsReturnPolicy, PrefillChunk,
+    };
+    use ferrum_execution::token_execution::{
+        ExecutionAdmission, ExecutionBatchOutcome, ExecutionCloseDisposition, ExecutionProduct,
+        ExecutionWork, TokenAdmissionOutcome, TokenWork,
+    };
     use ferrum_models::vnext::ProductionWeightArtifact;
     use ferrum_runtime::{ModelSourceKind, OriginalModelSource, OriginalModelSources};
-    use ferrum_types::{Device, EngineConfig};
+    use ferrum_types::{Device, EngineConfig, RequestId, TokenId};
     use safetensors::tensor::{serialize_to_file, Dtype, TensorView};
     use serde_json::json;
 
@@ -141,35 +147,61 @@ mod tests {
         engine.backend.device = Device::CPU;
         let component =
             ComponentConfig::from_engine_config_and_sources(&engine, Some(Arc::clone(&sources)));
-        let executor = LlmExecutorFactory.create(&component).await.unwrap();
+        let owner = LlmExecutorFactory.create(&component).await.unwrap();
+        let executor = owner.scope().unwrap();
         assert_eq!(executor.info().hidden_size, 8);
         assert_eq!(executor.info().num_layers, 1);
         assert_eq!(
             executor.bound_resolved_sources(),
             Some(sources.resolved_sources())
         );
-        let tokens =
-            ferrum_models::executor::common::tokens_to_tensor(&[0, 1], &candle_core::Device::Cpu)
-                .unwrap();
-        let output = executor
-            .prefill(&PrefillInput::new(
-                ferrum_models::executor::common::wrap_tensor(tokens),
-            ))
+        let request = RequestId::new();
+        let tokens = [TokenId::new(0), TokenId::new(1)];
+        let TokenAdmissionOutcome::Admitted(frontier) = executor
+            .admit_tokens(ExecutionAdmission {
+                context: ExecutorPrefillAdmission::for_diagnostic(&request, &tokens, 4),
+                adapter: None,
+            })
             .await
-            .unwrap();
-        assert_eq!(output.logits.shape().last().copied(), Some(4));
-        assert!(output
-            .logits
-            .to_vec_f32()
             .unwrap()
-            .iter()
-            .all(|value| value.is_finite()));
-        let cache = output
-            .kv_cache
-            .as_any()
-            .downcast_ref::<ferrum_models::executor::common::GenericKvCacheHandle>()
-            .unwrap();
-        executor.release_cache(cache.request_cache_id());
+        else {
+            panic!("tiny frozen model admission must succeed")
+        };
+        let policy = LogitsReturnPolicy::FullLogits;
+        let work = ExecutionWork::new(
+            &frontier,
+            TokenWork::Prefill(PrefillChunk::new(0, 2, 2).unwrap()),
+            &policy,
+        )
+        .unwrap();
+        let ExecutionBatchOutcome::Completed(output) =
+            executor.execute_tokens(&[work]).await.unwrap()
+        else {
+            panic!("tiny frozen model prefill must complete")
+        };
+        let completions = output.into_completions();
+        assert_eq!(completions.len(), 1);
+        let ExecutionProduct::Sampling(ExecutorSamplingOutput::FullLogits(logits)) =
+            completions[0].product()
+        else {
+            panic!("final prefill must return its real logits")
+        };
+        assert_eq!(logits.len(), 4);
+        assert!(logits.iter().all(|value| value.is_finite()));
+        assert_eq!(completions[0].next_frontier().consumed_tokens(), 2);
+        let closed = executor.cancel_tokens(frontier.sequence()).unwrap();
+        assert!(closed.error.is_none());
+        let ExecutionCloseDisposition::Ended(ended) = closed.disposition else {
+            panic!("tiny CPU model must release its exact incarnation")
+        };
+        assert_eq!(ended.sequence(), frontier.sequence());
+        drop(executor);
+        let retired = owner.begin_shutdown().wait().await;
+        assert_eq!(
+            retired.phase(),
+            ferrum_execution::executor_lifecycle::ExecutorShutdownPhase::Retired
+        );
+        retired.result().unwrap();
     }
 
     #[tokio::test]
@@ -183,5 +215,56 @@ mod tests {
         let definition = load_definition(root.path(), None).await.unwrap();
         assert_eq!(definition.hidden_size, 8);
         assert_eq!(definition.architecture, ferrum_models::Architecture::Llama);
+    }
+
+    #[test]
+    fn legacy_factory_keeps_instance_capacity_after_another_config_is_applied() {
+        use ferrum_interfaces::kv_dtype::KvFp16;
+        use ferrum_kernels::backend::cpu::CpuBackend;
+        use ferrum_models::models::LlamaFamilyConfig;
+        use ferrum_types::RuntimeConfigSnapshot;
+
+        let root = tempfile::tempdir().unwrap();
+        checkpoint(root.path());
+        let definition = ConfigManager::new()
+            .load_from_bytes(&serde_json::to_vec(&semantic_config()).unwrap())
+            .unwrap();
+        let config = LlamaFamilyConfig::llama_from_def(&definition);
+        let mut first = EngineConfig::default();
+        first
+            .apply_runtime_config_snapshot(&RuntimeConfigSnapshot::from_env_vars([
+                ("FERRUM_KV_CAPACITY", "8"),
+                ("FERRUM_METAL_PAGED_KV", "0"),
+            ]))
+            .unwrap();
+        let first_input = first.llama_execution_config();
+        let mut second = EngineConfig::default();
+        second
+            .apply_runtime_config_snapshot(&RuntimeConfigSnapshot::from_env_vars([
+                ("FERRUM_KV_CAPACITY", "16"),
+                ("FERRUM_METAL_PAGED_KV", "0"),
+            ]))
+            .unwrap();
+        let build = |execution| {
+            crate::registry::build_llm::<CpuBackend, KvFp16>(
+                config.clone(),
+                root.path().to_str().unwrap(),
+                None,
+                None,
+                execution,
+                ferrum_quantization::NativeSafetensorsLoadOptions::default(),
+            )
+            .unwrap()
+        };
+        let mut a = build(first_input);
+        let mut b = build(second.llama_execution_config());
+        assert_eq!(a.kv_capacity(), 8);
+        assert_eq!(b.kv_capacity(), 16);
+        assert_eq!(a.prefill("a", &[0, 1]), b.prefill("b", &[0, 1]));
+        assert_eq!(a.decode("a", 2, 2), b.decode("b", 2, 2));
+        let expected = a.decode("a", 3, 3);
+        a.release("a");
+        assert_eq!(b.decode("b", 3, 3), expected);
+        b.release("b");
     }
 }

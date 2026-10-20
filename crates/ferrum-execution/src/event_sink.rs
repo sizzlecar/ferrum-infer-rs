@@ -1,6 +1,18 @@
 use crate::model_executor::PrefixRestoreObservation;
 use ferrum_runtime::{ExecutionEventSink, ExecutionEventSinkError};
 
+/// Apply delivery policy only after a sink has validated its observation.
+/// A sink retains transport health independently of the execution result.
+pub(crate) fn resolve_event_delivery(
+    sink: &dyn ExecutionEventSink,
+    result: Result<(), ExecutionEventSinkError>,
+) -> Result<(), ExecutionEventSinkError> {
+    match result {
+        Err(error) if error.is_optional_transport(sink.delivery_policy()) => Ok(()),
+        other => other,
+    }
+}
+
 /// Product observations that borrow executor-owned restore evidence.
 ///
 /// A product sink also consumes runtime events. An `Arc` can be upcast to the

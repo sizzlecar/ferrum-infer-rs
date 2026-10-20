@@ -30,7 +30,7 @@ where
 
 #[test]
 fn q6_head_fixture_declares_last_token_and_exact_input_oracle() {
-    for head in [Head::Q6, Head::Dense] {
+    for head in [Head::Q6, Head::Dense, Head::Q6Split, Head::Q6Hadamard] {
         let definition = Family::new(head);
         let family = TypedFamilyRegistration::new(definition)
             .prepare_with_profile(&serde_json::to_value(head).unwrap(), &id(PROFILE))
@@ -53,6 +53,15 @@ fn q6_head_fixture_declares_last_token_and_exact_input_oracle() {
             (OUTPUTS * 4) % 16,
             0,
             "physical head rows permit packed adjacency"
+        );
+        assert_eq!(
+            family
+                .weight_schema()
+                .components
+                .iter()
+                .filter(|component| component.id.as_str().starts_with("component.head"))
+                .count(),
+            head.parts()
         );
         let source = Weights::new(family.weight_schema(), None, false);
         for component in &family.weight_schema().components {
@@ -99,4 +108,36 @@ fn q6_head_actual_provider_markers_isolate_rows_and_poison_leaf() {
 #[ignore = "requires exclusive CUDA and the actual production Q6 F32 native artifact"]
 fn q6_head_actual_provider_two_lanes_share_retained_validation() {
     checks::shared_plan_lanes();
+}
+
+#[cfg(feature = "cuda-upstream-q6-f32-linear")]
+#[path = "vnext_cuda_q6_head/facts.rs"]
+mod facts;
+
+#[cfg(feature = "cuda-upstream-q6-f32-linear")]
+#[test]
+#[ignore = "requires exclusive CUDA and the actual production Q6 F32 native artifact"]
+fn q6_head_execution_facts_actual_geometry_and_current_rows() {
+    facts::geometry_and_rows();
+}
+
+#[cfg(feature = "cuda-upstream-q6-f32-linear")]
+#[test]
+#[ignore = "requires exclusive CUDA and the actual production Q6 F32 native artifact"]
+fn q6_head_execution_facts_original_capture_and_changed_replay_rows() {
+    facts::replay();
+}
+
+#[cfg(feature = "cuda-upstream-q6-f32-linear")]
+#[test]
+#[ignore = "requires exclusive CUDA and the actual production Q6 F32 native artifact"]
+fn q6_head_execution_facts_survivor_compaction_preserves_slots_and_logits() {
+    facts::survivor_compaction();
+}
+
+#[cfg(feature = "cuda-upstream-q6-f32-linear")]
+#[test]
+#[ignore = "requires exclusive CUDA and the actual production Q6 F32 native artifact"]
+fn q6_head_execution_facts_off_capture_is_not_retroactively_described() {
+    facts::off_capture();
 }

@@ -105,6 +105,25 @@ impl ComposedState {
             .unwrap_or_default()
     }
 
+    pub(super) fn retained_token_growth_bound(&self, token: TokenId) -> Result<usize> {
+        self.bytes(token.get())
+            .len()
+            .checked_add(std::mem::size_of::<usize>())
+            .ok_or_else(|| {
+                FerrumError::resource_exhausted("structured output retained size overflow")
+            })
+    }
+
+    pub(super) fn retained_payload_bytes(&self) -> Result<usize> {
+        self.token_ends
+            .len()
+            .checked_mul(std::mem::size_of::<usize>())
+            .and_then(|ends| self.wire.len().checked_add(ends))
+            .ok_or_else(|| {
+                FerrumError::resource_exhausted("structured output retained size overflow")
+            })
+    }
+
     fn token_at(&self, byte_offset: usize) -> usize {
         self.token_ends.partition_point(|end| *end <= byte_offset)
     }

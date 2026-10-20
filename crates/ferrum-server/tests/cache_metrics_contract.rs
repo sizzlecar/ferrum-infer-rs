@@ -5,22 +5,24 @@ use ferrum_types::{
     EngineConfig, EngineMetrics, EngineStatus, FinishReason, HealthStatus, InferenceRequest,
     InferenceResponse, MemoryUsage, ModelId, StreamChunk, TokenId, TokenUsage,
 };
-use futures::{stream, Stream};
+use futures::stream;
 use reqwest::Client;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::net::TcpListener;
-use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-const REQUIRED_METRICS: &[&str] = &[
+const PREFIX_METRICS: &[&str] = &[
     "ferrum_prefix_cache_hits_total",
     "ferrum_prefix_cache_misses_total",
     "ferrum_prefix_cache_evictions_total",
     "ferrum_prefix_cache_saved_prefill_tokens_total",
     "ferrum_prefix_cache_entries",
     "ferrum_prefix_cache_bytes",
+];
+
+const SESSION_METRICS: &[&str] = &[
     "ferrum_session_cache_hits_total",
     "ferrum_session_cache_misses_total",
     "ferrum_session_cache_evictions_total",
@@ -29,8 +31,10 @@ const REQUIRED_METRICS: &[&str] = &[
 ];
 
 struct StubLlm {
+    output_budget: ferrum_output::OutputBudget,
     config: EngineConfig,
     text: String,
+    prompts: Mutex<Vec<String>>,
 }
 
 impl StubLlm {
@@ -38,8 +42,10 @@ impl StubLlm {
         let mut config = EngineConfig::default();
         config.model.model_id = ModelId::new("stub-model");
         Self {
+            output_budget: ferrum_output::OutputBudget::new(config.output.clone()).unwrap(),
             config,
             text: text.to_string(),
+            prompts: Mutex::new(Vec::new()),
         }
     }
 }
@@ -52,7 +58,7 @@ impl InferenceEngine for StubLlm {
             loaded_models: vec![self.config.model.model_id.clone()],
             active_requests: 0,
             queued_requests: 0,
-            memory_usage: MemoryUsage {
+            memory_usage: ferrum_types::MemoryObservation::Known(MemoryUsage {
                 total_bytes: 0,
                 used_bytes: 0,
                 free_bytes: 0,
@@ -60,7 +66,7 @@ impl InferenceEngine for StubLlm {
                 cpu_memory_bytes: None,
                 cache_memory_bytes: 0,
                 utilization_percent: 0.0,
-            },
+            }),
             uptime_seconds: 0,
             last_heartbeat: chrono::Utc::now(),
             version: "test".to_string(),
@@ -68,6 +74,11 @@ impl InferenceEngine for StubLlm {
     }
 
     async fn shutdown(&self) -> ferrum_types::Result<()> {
+        Ok(())
+    }
+
+    async fn wait_for_shutdown_completion(&self) -> ferrum_types::Result<()> {
+        // No background execution or journal producers in this wire fixture.
         Ok(())
     }
 
@@ -86,26 +97,34 @@ impl InferenceEngine for StubLlm {
 
 #[async_trait]
 impl LlmInferenceEngine for StubLlm {
-    async fn infer(&self, request: InferenceRequest) -> ferrum_types::Result<InferenceResponse> {
-        Ok(InferenceResponse {
-            request_id: request.id,
-            text: self.text.clone(),
-            tokens: vec![TokenId::new(11)],
-            finish_reason: FinishReason::Stop,
-            usage: TokenUsage::new(7, 1),
-            latency_ms: 1,
-            created_at: chrono::Utc::now(),
-            metadata: HashMap::new(),
-            api_response: None,
-            execution_evidence: None,
-        })
+    async fn infer(
+        &self,
+        request: InferenceRequest,
+    ) -> ferrum_types::Result<ferrum_output::InferenceOutput> {
+        self.prompts.lock().unwrap().push(request.prompt.clone());
+        ferrum_output::InferenceOutput::new(
+            InferenceResponse {
+                request_id: request.id,
+                text: self.text.clone(),
+                tokens: vec![TokenId::new(11)],
+                finish_reason: FinishReason::Stop,
+                usage: TokenUsage::new(7, 1),
+                latency_ms: 1,
+                created_at: chrono::Utc::now(),
+                metadata: HashMap::new(),
+                api_response: None,
+                execution_evidence: None,
+            },
+            self.output_budget
+                .try_open_session()?
+                .try_reserve_semantic(0)?,
+        )
     }
 
     async fn infer_stream(
         &self,
         request: InferenceRequest,
-    ) -> ferrum_types::Result<Pin<Box<dyn Stream<Item = ferrum_types::Result<StreamChunk>> + Send>>>
-    {
+    ) -> ferrum_types::Result<ferrum_output::InferenceStream> {
         let chunk = StreamChunk {
             request_id: request.id,
             text: self.text.clone(),
@@ -117,12 +136,18 @@ impl LlmInferenceEngine for StubLlm {
             api_response: None,
             execution_evidence: None,
         };
-        Ok(Box::pin(stream::iter(vec![Ok(chunk)])))
+        let session = self.output_budget.try_open_session()?;
+        let chunk = session.wrap_chunk(chunk).await?;
+        Ok(ferrum_output::InferenceStream::new(
+            session,
+            Box::pin(stream::iter(vec![Ok(chunk)])),
+        ))
     }
 }
 
 struct ServerFixture {
     base_url: String,
+    engine: Arc<StubLlm>,
     task: tokio::task::JoinHandle<()>,
 }
 
@@ -133,12 +158,17 @@ impl ServerFixture {
         let mut config = ServerConfig::default();
         config.host = "127.0.0.1".to_string();
         config.port = port;
-        let server = AxumServer::from_llm(Arc::new(StubLlm::new(text)));
+        let engine = Arc::new(StubLlm::new(text));
+        let server = AxumServer::from_llm(engine.clone());
         let task = tokio::spawn(async move {
             let _ = server.start(&config).await;
         });
         wait_health(&base_url).await;
-        Self { base_url, task }
+        Self {
+            base_url,
+            engine,
+            task,
+        }
     }
 
     fn chat_url(&self) -> String {
@@ -193,21 +223,24 @@ fn metric_value(metrics: &str, name: &str) -> f64 {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn cache_metrics_contract_exposes_prefix_and_session_metrics() {
+async fn cache_metrics_contract_keeps_session_history_without_inventing_prefix_reuse() {
+    // Requesting prefix caching does not establish that KV state was reused.
     std::env::set_var("FERRUM_PREFIX_CACHE", "1");
     std::env::set_var("FERRUM_SESSION_CACHE", "memory");
     std::env::set_var("FERRUM_SESSION_CACHE_MAX_ENTRIES", "8");
     std::env::set_var("FERRUM_SESSION_CACHE_MAX_TOKENS", "512");
 
-    let fx = ServerFixture::spawn("ok").await;
+    let fx = ServerFixture::spawn("remembered assistant answer").await;
     let client = Client::new();
-    let payload = json!({
-        "model": "stub-model",
-        "messages": [{"role": "user", "content": "shared prefix prompt with stable suffix"}],
-        "temperature": 0,
-        "max_tokens": 8
-    });
-    for _ in 0..2 {
+    let first_prompt = "shared prefix prompt with first suffix";
+    let second_prompt = "shared prefix prompt with second suffix";
+    for prompt in [first_prompt, second_prompt] {
+        let payload = json!({
+            "model": "stub-model",
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0,
+            "max_tokens": 8
+        });
         let response = client
             .post(fx.chat_url())
             .header("X-Ferrum-Session", "session-a")
@@ -216,6 +249,20 @@ async fn cache_metrics_contract_exposes_prefix_and_session_metrics() {
             .await
             .expect("chat post");
         assert_eq!(response.status(), 200);
+        let body: Value = response.json().await.expect("chat json");
+        assert_eq!(
+            body["choices"][0]["message"]["content"],
+            "remembered assistant answer"
+        );
+    }
+    {
+        let prompts = fx.engine.prompts.lock().unwrap();
+        assert_eq!(prompts.len(), 2);
+        assert!(prompts[0].contains(first_prompt));
+        assert!(!prompts[0].contains("remembered assistant answer"));
+        assert!(prompts[1].contains(first_prompt));
+        assert!(prompts[1].contains("remembered assistant answer"));
+        assert!(prompts[1].contains(second_prompt));
     }
 
     let health: Value = client
@@ -226,7 +273,7 @@ async fn cache_metrics_contract_exposes_prefix_and_session_metrics() {
         .json()
         .await
         .expect("health json");
-    assert_eq!(health["cache"]["prefix_cache"]["enabled"], true);
+    assert_eq!(health["cache"]["prefix_cache"], Value::Null);
     assert_eq!(health["cache"]["session_cache"]["mode"], "memory");
 
     let metrics = client
@@ -237,10 +284,22 @@ async fn cache_metrics_contract_exposes_prefix_and_session_metrics() {
         .text()
         .await
         .expect("metrics text");
-    for name in REQUIRED_METRICS {
+    for name in SESSION_METRICS {
         assert!(metrics.contains(name), "missing {name}:\n{metrics}");
     }
-    assert!(metric_value(&metrics, "ferrum_prefix_cache_hits_total") > 0.0);
-    assert!(metric_value(&metrics, "ferrum_prefix_cache_saved_prefill_tokens_total") > 0.0);
-    assert!(metric_value(&metrics, "ferrum_session_cache_hits_total") > 0.0);
+    for name in PREFIX_METRICS {
+        assert!(
+            !metrics.contains(name),
+            "prefix metric has no owner observation: {name}\n{metrics}"
+        );
+    }
+    assert_eq!(
+        metric_value(&metrics, "ferrum_session_cache_hits_total"),
+        1.0
+    );
+    assert_eq!(
+        metric_value(&metrics, "ferrum_session_cache_misses_total"),
+        1.0
+    );
+    assert_eq!(metric_value(&metrics, "ferrum_session_cache_entries"), 1.0);
 }

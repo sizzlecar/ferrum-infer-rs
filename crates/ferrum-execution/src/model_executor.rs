@@ -1,10 +1,9 @@
-//! Model execution interface with clear prefill/decode separation
+//! Product execution through admitted token work and exact sequence lifecycles.
 //!
-//! This module provides the ModelExecutor trait that replaces the "fat" Model
-//! interface, focusing purely on tensor operations without tokenization or sampling.
+//! Model implementations own numerical execution and physical resources; callers
+//! use one admission, execution and close protocol without tensor/cache adapters.
 
 use async_trait::async_trait;
-use ferrum_interfaces::{KvCacheHandle, RecurrentStateHandle, RecurrentStateSpec, TensorRef};
 pub use ferrum_runtime::{ExecutorRequestOrigin, PlanRuntimeResourceSnapshot};
 use ferrum_types::{ExecutorAdmissionLimits, FerrumError, ModelInfo, RequestId, Result, TokenId};
 use serde::{Deserialize, Serialize};
@@ -18,16 +17,18 @@ use std::{
     sync::Arc,
 };
 
+mod prefill_shape;
 mod prefix_capture;
 mod prefix_restore;
+pub use prefill_shape::{PrefillShapePlan, PrefillShapePolicy};
 pub use prefix_capture::{
     PrefixCaptureBoundary, PrefixCaptureLease, PrefixCapturePlan, PrefixCaptureRequest,
     PrefixCaptureStatus,
 };
 pub use prefix_restore::{
     PlanRuntimePrefixRestoreDeferral, PlanRuntimePrefixRestoreInput,
-    PlanRuntimePrefixRestoreOutcome, PlanRuntimePrefixRestoreOutput, PrefixRestoreDecision,
-    PrefixRestoreObservation, PrefixRestoreSource,
+    PlanRuntimePrefixRestoreOutcome, PlanRuntimePrefixRestoreOutput, PrefixRestoreAcknowledgement,
+    PrefixRestoreDecision, PrefixRestoreObservation, PrefixRestoreSource,
 };
 
 /// One model-owned KV slot reservation request.
@@ -380,111 +381,6 @@ mod greedy_repetition_penalty_tests {
     }
 }
 
-/// Input for prefill phase (processing the initial prompt)
-#[derive(Debug, Clone)]
-pub struct PrefillInput {
-    /// Stable product request identity for plan-runtime resources.
-    pub request_id: Option<RequestId>,
-    /// Maximum sequence extent this request may reach, including the prompt.
-    /// Executors use this for fit validation without allocating future pages.
-    pub maximum_sequence_tokens: Option<usize>,
-    /// Exact scheduler-owned prompt chunk for this invocation.
-    ///
-    /// The input tensor still contains the full prompt so token identity and
-    /// global offsets remain stable. Plan runtimes execute only this range.
-    pub chunk: Option<PrefillChunk>,
-    /// Input token IDs [batch_size, sequence_length]
-    pub input_ids: TensorRef,
-    /// Attention mask [batch_size, sequence_length] (optional)
-    pub attention_mask: Option<TensorRef>,
-    /// Position IDs [batch_size, sequence_length] (optional, for RoPE)
-    pub position_ids: Option<TensorRef>,
-    /// Pre-allocated KV cache handle (optional, for paged attention)
-    pub kv_cache: Option<Arc<dyn KvCacheHandle>>,
-    /// Pre-allocated recurrent-state handle (optional, for state-space layers)
-    pub recurrent_state: Option<Arc<dyn RecurrentStateHandle>>,
-    /// Request metadata that can affect model execution.
-    pub metadata: HashMap<String, serde_json::Value>,
-}
-
-impl PrefillInput {
-    /// Create new prefill input
-    pub fn new(input_ids: TensorRef) -> Self {
-        Self {
-            request_id: None,
-            maximum_sequence_tokens: None,
-            chunk: None,
-            input_ids,
-            attention_mask: None,
-            position_ids: None,
-            kv_cache: None,
-            recurrent_state: None,
-            metadata: HashMap::new(),
-        }
-    }
-
-    /// Attach the typed request boundary consumed by plan runtimes.
-    pub fn with_request_context(
-        mut self,
-        request_id: RequestId,
-        maximum_sequence_tokens: usize,
-    ) -> Self {
-        self.request_id = Some(request_id);
-        self.maximum_sequence_tokens = Some(maximum_sequence_tokens);
-        self
-    }
-
-    /// Attach the exact scheduler-published prompt chunk.
-    pub fn with_chunk(mut self, chunk: PrefillChunk) -> Self {
-        self.chunk = Some(chunk);
-        self
-    }
-
-    /// Create prefill input with a pre-allocated KV cache handle.
-    pub fn with_kv_cache(mut self, kv_cache: Arc<dyn KvCacheHandle>) -> Self {
-        self.kv_cache = Some(kv_cache);
-        self
-    }
-
-    /// Create prefill input with a pre-allocated recurrent-state handle.
-    pub fn with_recurrent_state(mut self, recurrent_state: Arc<dyn RecurrentStateHandle>) -> Self {
-        self.recurrent_state = Some(recurrent_state);
-        self
-    }
-
-    /// Attach request metadata.
-    pub fn with_metadata(mut self, metadata: HashMap<String, serde_json::Value>) -> Self {
-        self.metadata = metadata;
-        self
-    }
-
-    /// Add attention mask
-    pub fn with_attention_mask(mut self, mask: TensorRef) -> Self {
-        self.attention_mask = Some(mask);
-        self
-    }
-
-    /// Add position IDs
-    pub fn with_position_ids(mut self, positions: TensorRef) -> Self {
-        self.position_ids = Some(positions);
-        self
-    }
-
-    /// Get batch size
-    pub fn batch_size(&self) -> usize {
-        self.input_ids.shape()[0]
-    }
-
-    /// Get sequence length
-    pub fn sequence_length(&self) -> usize {
-        if self.input_ids.shape().len() >= 2 {
-            self.input_ids.shape()[1]
-        } else {
-            1
-        }
-    }
-}
-
 /// Exact, validated prompt progress assigned to one prefill invocation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct PrefillChunk {
@@ -566,489 +462,6 @@ impl PrefillChunk {
     }
 }
 
-/// Output from prefill phase
-#[derive(Debug, Clone)]
-pub struct PrefillOutput {
-    /// Logits for all positions [batch_size, sequence_length, vocab_size]
-    pub logits: TensorRef,
-    /// KV cache handle populated with prompt states
-    pub kv_cache: Arc<dyn KvCacheHandle>,
-    /// Recurrent-state handle populated with prompt state, when used.
-    pub recurrent_state: Option<Arc<dyn RecurrentStateHandle>>,
-    /// Hidden states at each layer (optional, for analysis)
-    pub hidden_states: Option<Vec<TensorRef>>,
-    /// Attention weights (optional, for analysis)
-    pub attention_weights: Option<Vec<TensorRef>>,
-}
-
-impl PrefillOutput {
-    /// Create new prefill output
-    pub fn new(logits: TensorRef, kv_cache: Arc<dyn KvCacheHandle>) -> Self {
-        Self {
-            logits,
-            kv_cache,
-            recurrent_state: None,
-            hidden_states: None,
-            attention_weights: None,
-        }
-    }
-
-    /// Attach updated recurrent state to the prefill output.
-    pub fn with_recurrent_state(mut self, recurrent_state: Arc<dyn RecurrentStateHandle>) -> Self {
-        self.recurrent_state = Some(recurrent_state);
-        self
-    }
-
-    /// Get logits for last position (for next token generation)
-    pub fn last_token_logits(&self) -> Result<TensorRef> {
-        let shape = self.logits.shape();
-        if shape.len() != 3 {
-            return Err(ferrum_types::FerrumError::backend(
-                "Expected 3D logits tensor [batch, seq, vocab]",
-            ));
-        }
-
-        let seq_len = shape[1];
-        if seq_len == 0 {
-            return Err(ferrum_types::FerrumError::backend("Empty sequence"));
-        }
-
-        // Extract last position: [batch, seq-1:seq, vocab] -> [batch, vocab]
-        self.logits
-            .view(&[0, seq_len - 1, 0], &[shape[0], seq_len, shape[2]])
-    }
-}
-
-/// Input for decode phase (generating one token at a time)
-#[derive(Debug, Clone)]
-pub struct DecodeInput {
-    /// Stable product request identity for plan-runtime resources.
-    pub request_id: Option<RequestId>,
-    /// Input token ID for current step [batch_size, 1]
-    pub input_ids: TensorRef,
-    /// Existing KV cache from previous steps
-    pub kv_cache: Arc<dyn KvCacheHandle>,
-    /// Existing recurrent state from previous steps, when used.
-    pub recurrent_state: Option<Arc<dyn RecurrentStateHandle>>,
-    /// Position IDs for current step [batch_size, 1] (optional)
-    pub position_ids: Option<TensorRef>,
-    /// Request metadata that can affect model execution.
-    pub metadata: HashMap<String, serde_json::Value>,
-    /// How the model may return final-position logits for this request.
-    pub logits_policy: LogitsReturnPolicy,
-}
-
-impl DecodeInput {
-    /// Create new decode input
-    pub fn new(input_ids: TensorRef, kv_cache: Arc<dyn KvCacheHandle>) -> Self {
-        Self {
-            request_id: None,
-            input_ids,
-            kv_cache,
-            recurrent_state: None,
-            position_ids: None,
-            metadata: HashMap::new(),
-            logits_policy: LogitsReturnPolicy::FullLogits,
-        }
-    }
-
-    /// Attach the product request identity to this decode step.
-    pub fn with_request_id(mut self, request_id: RequestId) -> Self {
-        self.request_id = Some(request_id);
-        self
-    }
-
-    /// Add position IDs
-    pub fn with_position_ids(mut self, positions: TensorRef) -> Self {
-        self.position_ids = Some(positions);
-        self
-    }
-
-    /// Attach recurrent state for state-space or hybrid layers.
-    pub fn with_recurrent_state(mut self, recurrent_state: Arc<dyn RecurrentStateHandle>) -> Self {
-        self.recurrent_state = Some(recurrent_state);
-        self
-    }
-
-    /// Attach request metadata.
-    pub fn with_metadata(mut self, metadata: HashMap<String, serde_json::Value>) -> Self {
-        self.metadata = metadata;
-        self
-    }
-
-    pub fn with_logits_policy(mut self, policy: LogitsReturnPolicy) -> Self {
-        self.logits_policy = policy;
-        self
-    }
-
-    /// Get batch size
-    pub fn batch_size(&self) -> usize {
-        self.input_ids.shape()[0]
-    }
-}
-
-/// One sequence's contribution to a unified mixed-batch forward.
-///
-/// A unified batch lets a single model forward pass process a mix of
-/// per-sequence work units: a prefill chunk (q_tokens.len() ≥ 1, possibly
-/// continuing from `pos_offset > 0` for chunked prefill) and a decode step
-/// (q_tokens.len() == 1, `pos_offset` = current cache length) coexist in
-/// the same call. The model layer concatenates all `q_tokens` into one
-/// [M_total, hidden] tensor and runs all GEMMs / norms once; only the
-/// attention kernel sees per-item segmentation.
-///
-/// This is the abstraction that enables vLLM-style chunked prefill where
-/// decode tokens for already-running sequences are produced in the same
-/// iter as a prefill chunk for a newly-arriving sequence.
-#[derive(Clone)]
-pub struct UnifiedBatchItem {
-    /// Identifier matching the sequence's KV cache (model-side keying).
-    pub seq_id: String,
-    /// Tokens to process this iter. For decode this is exactly 1 token;
-    /// for prefill (chunked or whole) this is the chunk's tokens.
-    pub q_tokens: Vec<u32>,
-    /// KV cache handle for this sequence.
-    pub kv_cache: Arc<dyn KvCacheHandle>,
-    /// Recurrent-state handle for this sequence, when used.
-    pub recurrent_state: Option<Arc<dyn RecurrentStateHandle>>,
-    /// Starting absolute position for the FIRST token in `q_tokens`.
-    /// 0 for a fresh prefill, `kv_len` for a decode step or a continuing
-    /// chunked-prefill slice.
-    pub pos_offset: usize,
-    /// True iff this item completes the request's prefill (or is a decode
-    /// item) — i.e. logits at the last token of `q_tokens` should be
-    /// returned for sampling. Intermediate prefill chunks set this false
-    /// to skip the lm_head + sampling path.
-    pub is_final_chunk: bool,
-    /// Request metadata that can affect model execution.
-    pub metadata: HashMap<String, serde_json::Value>,
-    /// How the model may return final-position logits for this item.
-    pub logits_policy: LogitsReturnPolicy,
-}
-
-impl std::fmt::Debug for UnifiedBatchItem {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("UnifiedBatchItem")
-            .field("seq_id", &self.seq_id)
-            .field("q_len", &self.q_tokens.len())
-            .field("has_recurrent_state", &self.recurrent_state.is_some())
-            .field("pos_offset", &self.pos_offset)
-            .field("is_final_chunk", &self.is_final_chunk)
-            .finish()
-    }
-}
-
-/// A mixed-batch forward request: any combination of in-progress prefill
-/// chunks and decode steps. See [`UnifiedBatchItem`] for the per-item
-/// semantics. The producer (engine) groups all sequences active in this
-/// iter into a single batch; the consumer (model) runs one forward and
-/// returns per-item logits (only for items with `is_final_chunk = true`,
-/// in the order they appear in `items`).
-#[derive(Debug, Clone, Default)]
-pub struct UnifiedBatch {
-    pub items: Vec<UnifiedBatchItem>,
-}
-
-impl UnifiedBatch {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Total query tokens across all items — corresponds to the M dim of
-    /// the model's per-layer GEMMs in the unified forward.
-    pub fn total_q_tokens(&self) -> usize {
-        self.items.iter().map(|it| it.q_tokens.len()).sum()
-    }
-
-    /// Number of items that will produce a logits vector (decode items
-    /// always; prefill items only on their final chunk).
-    pub fn num_sampled_items(&self) -> usize {
-        self.items.iter().filter(|it| it.is_final_chunk).count()
-    }
-}
-
-/// Tensor-free decode input for an executor with plan-runtime resource
-/// authority.
-///
-/// The runtime already owns the request's physical cache and accepts exactly
-/// one token per decode frontier, so materializing a host tensor here adds no
-/// information. Legacy and modality executors continue to use [`DecodeInput`].
-#[derive(Debug, Clone)]
-pub struct PlanRuntimeDecodeInput {
-    pub request_id: RequestId,
-    pub input_token: TokenId,
-    pub kv_cache: Arc<dyn KvCacheHandle>,
-    pub logits_policy: LogitsReturnPolicy,
-}
-
-impl PlanRuntimeDecodeInput {
-    pub fn new(
-        request_id: RequestId,
-        input_token: TokenId,
-        kv_cache: Arc<dyn KvCacheHandle>,
-    ) -> Self {
-        Self {
-            request_id,
-            input_token,
-            kv_cache,
-            logits_policy: LogitsReturnPolicy::FullLogits,
-        }
-    }
-
-    pub fn with_logits_policy(mut self, logits_policy: LogitsReturnPolicy) -> Self {
-        self.logits_policy = logits_policy;
-        self
-    }
-}
-
-/// Tensor-free prefill input for an executor with plan-runtime resource
-/// authority.
-///
-/// The complete prompt remains immutable across chunk retries so scheduler
-/// offsets and executor sequence identity cannot drift. Physical KV and
-/// recurrent resources remain opaque executor-owned state.
-#[derive(Debug, Clone)]
-pub struct PlanRuntimePrefillInput {
-    pub request_id: RequestId,
-    pub input_tokens: Arc<[TokenId]>,
-    pub maximum_sequence_tokens: usize,
-    pub chunk: PrefillChunk,
-}
-
-impl PlanRuntimePrefillInput {
-    pub fn new(
-        request_id: RequestId,
-        input_tokens: impl Into<Arc<[TokenId]>>,
-        maximum_sequence_tokens: usize,
-        chunk: PrefillChunk,
-    ) -> Result<Self> {
-        let input_tokens = input_tokens.into();
-        if input_tokens.is_empty() {
-            return Err(FerrumError::request_validation(
-                "plan-runtime prefill requires at least one input token",
-            ));
-        }
-        if chunk.total_prompt_tokens() != input_tokens.len() {
-            return Err(FerrumError::request_validation(format!(
-                "plan-runtime prefill chunk declares {} prompt tokens for input length {}",
-                chunk.total_prompt_tokens(),
-                input_tokens.len()
-            )));
-        }
-        if maximum_sequence_tokens < input_tokens.len() {
-            return Err(FerrumError::request_validation(format!(
-                "plan-runtime sequence ceiling {maximum_sequence_tokens} does not cover prompt length {}",
-                input_tokens.len()
-            )));
-        }
-        Ok(Self {
-            request_id,
-            input_tokens,
-            maximum_sequence_tokens,
-            chunk,
-        })
-    }
-}
-
-/// Output from decode phase
-#[derive(Debug, Clone)]
-pub struct DecodeOutput {
-    /// Logits for next token [batch_size, vocab_size]
-    pub logits: TensorRef,
-    /// Updated KV cache with new token state
-    pub kv_cache: Arc<dyn KvCacheHandle>,
-    /// Updated recurrent state, when used.
-    pub recurrent_state: Option<Arc<dyn RecurrentStateHandle>>,
-    /// Hidden state for current token (optional)
-    pub hidden_state: Option<TensorRef>,
-    /// Attention weights for current token (optional)
-    pub attention_weights: Option<Vec<TensorRef>>,
-}
-
-impl DecodeOutput {
-    /// Create new decode output
-    pub fn new(logits: TensorRef, kv_cache: Arc<dyn KvCacheHandle>) -> Self {
-        Self {
-            logits,
-            kv_cache,
-            recurrent_state: None,
-            hidden_state: None,
-            attention_weights: None,
-        }
-    }
-
-    /// Attach updated recurrent state to the decode output.
-    pub fn with_recurrent_state(mut self, recurrent_state: Arc<dyn RecurrentStateHandle>) -> Self {
-        self.recurrent_state = Some(recurrent_state);
-        self
-    }
-}
-
-/// Tensor-free decode output from a plan-runtime executor.
-#[derive(Debug, Clone)]
-pub struct PlanRuntimeDecodeOutput {
-    pub sampling_output: ExecutorSamplingOutput,
-    pub kv_cache: Arc<dyn KvCacheHandle>,
-}
-
-impl PlanRuntimeDecodeOutput {
-    pub fn new(sampling_output: ExecutorSamplingOutput, kv_cache: Arc<dyn KvCacheHandle>) -> Self {
-        Self {
-            sampling_output,
-            kv_cache,
-        }
-    }
-}
-
-/// Product state emitted by one completed plan-runtime prefill chunk.
-#[derive(Debug)]
-pub enum PlanRuntimePrefillProduct {
-    /// An intermediate chunk updates executor-owned state but is not sampleable.
-    Intermediate,
-    /// A final chunk returns the complete vocabulary row to the engine.
-    FinalLogits(Vec<f32>),
-}
-
-/// Exact executor-owned authority advanced by one prefill completion.
-#[derive(Debug)]
-pub struct PlanRuntimePrefillAuthority {
-    request_id: RequestId,
-    committed_tokens: usize,
-    kv_cache: Arc<dyn KvCacheHandle>,
-}
-
-impl PlanRuntimePrefillAuthority {
-    pub fn request_id(&self) -> &RequestId {
-        &self.request_id
-    }
-
-    pub const fn committed_tokens(&self) -> usize {
-        self.committed_tokens
-    }
-
-    pub fn kv_cache(&self) -> &Arc<dyn KvCacheHandle> {
-        &self.kv_cache
-    }
-
-    pub fn into_cache(self) -> Arc<dyn KvCacheHandle> {
-        self.kv_cache
-    }
-}
-
-/// Tensor-free prefill output bound to one request and committed KV extent.
-#[derive(Debug)]
-pub struct PlanRuntimePrefillOutput {
-    authority: PlanRuntimePrefillAuthority,
-    product: PlanRuntimePrefillProduct,
-}
-
-impl PlanRuntimePrefillOutput {
-    pub fn intermediate(
-        request_id: RequestId,
-        committed_tokens: usize,
-        kv_cache: Arc<dyn KvCacheHandle>,
-    ) -> Self {
-        Self {
-            authority: PlanRuntimePrefillAuthority {
-                request_id,
-                committed_tokens,
-                kv_cache,
-            },
-            product: PlanRuntimePrefillProduct::Intermediate,
-        }
-    }
-
-    pub fn final_logits(
-        request_id: RequestId,
-        committed_tokens: usize,
-        logits: Vec<f32>,
-        kv_cache: Arc<dyn KvCacheHandle>,
-    ) -> Result<Self> {
-        if logits.is_empty() {
-            return Err(FerrumError::backend(
-                "plan-runtime final prefill returned empty logits",
-            ));
-        }
-        Ok(Self {
-            authority: PlanRuntimePrefillAuthority {
-                request_id,
-                committed_tokens,
-                kv_cache,
-            },
-            product: PlanRuntimePrefillProduct::FinalLogits(logits),
-        })
-    }
-
-    pub fn request_id(&self) -> &RequestId {
-        self.authority.request_id()
-    }
-
-    pub const fn committed_tokens(&self) -> usize {
-        self.authority.committed_tokens()
-    }
-
-    pub fn product(&self) -> &PlanRuntimePrefillProduct {
-        &self.product
-    }
-
-    pub fn kv_cache(&self) -> &Arc<dyn KvCacheHandle> {
-        self.authority.kv_cache()
-    }
-
-    pub fn validate_for_completion(
-        &self,
-        expected_request_id: &RequestId,
-        completed_chunk: PrefillChunk,
-        vocabulary_size: usize,
-    ) -> Result<()> {
-        if self.request_id() != expected_request_id {
-            return Err(FerrumError::backend(format!(
-                "plan runtime returned prefill output for request {}, expected {expected_request_id}",
-                self.request_id()
-            )));
-        }
-        if self.committed_tokens() != completed_chunk.end() {
-            return Err(FerrumError::backend(format!(
-                "plan runtime returned prefill extent {}, expected {}",
-                self.committed_tokens(),
-                completed_chunk.end()
-            )));
-        }
-        if self.kv_cache().num_tokens() != self.committed_tokens() {
-            return Err(FerrumError::backend(format!(
-                "plan runtime prefill cache `{}` reports {} tokens for committed extent {}",
-                self.kv_cache().cache_id(),
-                self.kv_cache().num_tokens(),
-                self.committed_tokens()
-            )));
-        }
-        match (&self.product, completed_chunk.is_final()) {
-            (PlanRuntimePrefillProduct::Intermediate, false) => Ok(()),
-            (PlanRuntimePrefillProduct::FinalLogits(logits), true)
-                if logits.len() == vocabulary_size =>
-            {
-                Ok(())
-            }
-            (PlanRuntimePrefillProduct::FinalLogits(logits), true) => {
-                Err(FerrumError::backend(format!(
-                    "plan runtime returned {} final prefill logits for vocabulary {vocabulary_size}",
-                    logits.len()
-                )))
-            }
-            (PlanRuntimePrefillProduct::Intermediate, true) => Err(FerrumError::backend(
-                "plan runtime returned an intermediate product for a final prefill chunk",
-            )),
-            (PlanRuntimePrefillProduct::FinalLogits(_), false) => Err(FerrumError::backend(
-                "plan runtime returned final logits for an intermediate prefill chunk",
-            )),
-        }
-    }
-
-    pub fn into_parts(self) -> (PlanRuntimePrefillAuthority, PlanRuntimePrefillProduct) {
-        (self.authority, self.product)
-    }
-}
-
 /// Product-authoritative evidence for a successfully completed sequence.
 ///
 /// Physical cache release is not completion evidence: cancellation, failure,
@@ -1107,7 +520,7 @@ impl ExecutorSequenceCompletion {
     }
 }
 
-pub use ferrum_types::ExecutionResourceAuthority;
+pub use ferrum_types::ExecutionPlanningModel;
 
 /// Request-scoped authority selected for a capacity-pressure preemption.
 ///
@@ -1191,8 +604,8 @@ impl ExecutorExecutionCapacityPreemptionReceipt {
 /// This carries semantic token identity rather than an aggregate token count:
 /// vNext derives the exact resource work shape and its fingerprint from this
 /// boundary. The request remains owned by the scheduler while the executor
-/// retains any admitted authority internally until [`ModelExecutor::prefill`]
-/// consumes it or cancellation releases it.
+/// retains the admitted sequence internally for [`ModelExecutor::execute_tokens`]
+/// until its exact token lifecycle reaches a terminal state.
 #[derive(Debug, Clone, Copy)]
 pub struct ExecutorPrefillAdmission<'a> {
     pub request_id: &'a RequestId,
@@ -2185,6 +1598,10 @@ impl ExecutorRequestStateDeferral {
 #[serde(tag = "reason", content = "evidence", rename_all = "snake_case")]
 pub enum ExecutorExecutionDeferral {
     Capacity(ExecutorExecutionCapacityDeferral),
+    /// A real model-owned KV block shortfall without native coordinator
+    /// generations. This observation is neither a reservation nor a release
+    /// capability; the original allocator must approve any later retry.
+    AllocatorCapacity(crate::token_execution::TokenAdmissionCapacityDeferral),
     RequestState(ExecutorRequestStateDeferral),
 }
 
@@ -2192,20 +1609,32 @@ impl ExecutorExecutionDeferral {
     pub const fn stage(&self) -> ExecutorExecutionCapacityStage {
         match self {
             Self::Capacity(deferral) => deferral.stage(),
+            Self::AllocatorCapacity(_) => ExecutorExecutionCapacityStage::SequenceExtension,
             Self::RequestState(deferral) => deferral.stage(),
         }
     }
 
+    /// Native coordinator evidence only. Allocator observations have no
+    /// synthetic native source, wait condition or epoch.
     pub const fn as_capacity(&self) -> Option<&ExecutorExecutionCapacityDeferral> {
         match self {
             Self::Capacity(deferral) => Some(deferral),
-            Self::RequestState(_) => None,
+            Self::AllocatorCapacity(_) | Self::RequestState(_) => None,
+        }
+    }
+
+    pub const fn as_allocator_capacity(
+        &self,
+    ) -> Option<&crate::token_execution::TokenAdmissionCapacityDeferral> {
+        match self {
+            Self::AllocatorCapacity(deferral) => Some(deferral),
+            Self::Capacity(_) | Self::RequestState(_) => None,
         }
     }
 
     pub const fn as_request_state(&self) -> Option<&ExecutorRequestStateDeferral> {
         match self {
-            Self::Capacity(_) => None,
+            Self::Capacity(_) | Self::AllocatorCapacity(_) => None,
             Self::RequestState(deferral) => Some(deferral),
         }
     }
@@ -2220,6 +1649,12 @@ impl From<ExecutorExecutionCapacityDeferral> for ExecutorExecutionDeferral {
 impl From<ExecutorRequestStateDeferral> for ExecutorExecutionDeferral {
     fn from(deferral: ExecutorRequestStateDeferral) -> Self {
         Self::RequestState(deferral)
+    }
+}
+
+impl From<crate::token_execution::TokenAdmissionCapacityDeferral> for ExecutorExecutionDeferral {
+    fn from(deferral: crate::token_execution::TokenAdmissionCapacityDeferral) -> Self {
+        Self::AllocatorCapacity(deferral)
     }
 }
 
@@ -2367,230 +1802,6 @@ mod execution_capacity_deferral_tests {
             .unwrap()
             .is_some());
     }
-}
-
-/// Capacity-aware batch decode result.
-///
-/// `Deferred` is only legal before provider encode or device submission. All
-/// possibly-submitted failures remain ordinary errors and retain their typed
-/// fence/recovery authority inside the executor.
-pub enum ExecutorBatchDecodeOutcome {
-    Completed(Vec<DecodeOutput>),
-    Deferred(ExecutorExecutionDeferral),
-}
-
-/// Capacity-aware, tensor-free batch decode result for a plan runtime.
-pub enum PlanRuntimeBatchDecodeOutcome {
-    Completed(Vec<PlanRuntimeDecodeOutput>),
-    Deferred(ExecutorExecutionDeferral),
-}
-
-/// Capacity-aware result for one tensor-free plan-runtime prefill frontier.
-pub struct PlanRuntimePrefillCompletion {
-    output: PlanRuntimePrefillOutput,
-    planned_chunk: PrefillChunk,
-    completed_chunk: PrefillChunk,
-    capacity_probe_count: u32,
-}
-
-impl PlanRuntimePrefillCompletion {
-    pub fn new(
-        output: PlanRuntimePrefillOutput,
-        planned_chunk: PrefillChunk,
-        completed_chunk: PrefillChunk,
-        capacity_probe_count: u32,
-    ) -> Result<Self> {
-        validate_prefill_completion_shape(planned_chunk, completed_chunk, capacity_probe_count)?;
-        Ok(Self {
-            output,
-            planned_chunk,
-            completed_chunk,
-            capacity_probe_count,
-        })
-    }
-
-    pub fn exact(output: PlanRuntimePrefillOutput, chunk: PrefillChunk) -> Self {
-        Self {
-            output,
-            planned_chunk: chunk,
-            completed_chunk: chunk,
-            capacity_probe_count: 0,
-        }
-    }
-
-    pub const fn planned_chunk(&self) -> PrefillChunk {
-        self.planned_chunk
-    }
-
-    pub const fn completed_chunk(&self) -> PrefillChunk {
-        self.completed_chunk
-    }
-
-    pub const fn capacity_probe_count(&self) -> u32 {
-        self.capacity_probe_count
-    }
-
-    pub fn output(&self) -> &PlanRuntimePrefillOutput {
-        &self.output
-    }
-
-    pub fn validate_for(
-        &self,
-        expected_request_id: &RequestId,
-        expected_planned_chunk: PrefillChunk,
-        vocabulary_size: usize,
-    ) -> Result<()> {
-        if self.planned_chunk != expected_planned_chunk {
-            return Err(FerrumError::backend(format!(
-                "plan runtime completed prefill frontier {:?}, expected {:?}",
-                self.planned_chunk.range(),
-                expected_planned_chunk.range()
-            )));
-        }
-        validate_prefill_completion_shape(
-            self.planned_chunk,
-            self.completed_chunk,
-            self.capacity_probe_count,
-        )?;
-        self.output.validate_for_completion(
-            expected_request_id,
-            self.completed_chunk,
-            vocabulary_size,
-        )
-    }
-
-    pub fn into_parts(self) -> (PlanRuntimePrefillOutput, PrefillChunk, PrefillChunk, u32) {
-        (
-            self.output,
-            self.planned_chunk,
-            self.completed_chunk,
-            self.capacity_probe_count,
-        )
-    }
-}
-
-pub enum PlanRuntimePrefillOutcome {
-    Completed(PlanRuntimePrefillCompletion),
-    Deferred(ExecutorExecutionDeferral),
-}
-
-pub enum PlanRuntimeBatchPrefillOutcome {
-    Completed(Vec<PlanRuntimePrefillCompletion>),
-    NotSubmitted(ExecutorExecutionDeferral),
-    Unsupported,
-}
-
-/// One physical execution containing prefill chunks and decode frontiers.
-/// Each output list preserves the order of its corresponding input list.
-/// `NotSubmitted` proves that no participant reached provider encoding or
-/// device submission and every retained frontier is retryable. Ordinary
-/// errors may follow submission and must never trigger a replay fallback.
-pub enum PlanRuntimeMixedBatchOutcome {
-    Completed {
-        prefills: Vec<PlanRuntimePrefillCompletion>,
-        decodes: Vec<PlanRuntimeDecodeOutput>,
-    },
-    NotSubmitted(ExecutorExecutionDeferral),
-    /// The executor left all input frontiers unchanged.
-    Unsupported,
-}
-
-/// Capacity-aware result for one planned prefill frontier.
-///
-/// `Deferred` is only legal before provider encode or device submission. The
-/// executor may complete a strict prefix after typed capacity probes; the
-/// scheduler commits only that prefix and learns the narrower execution ceiling.
-pub struct ExecutorPrefillCompletion {
-    output: PrefillOutput,
-    planned_chunk: PrefillChunk,
-    completed_chunk: PrefillChunk,
-    capacity_probe_count: u32,
-}
-
-impl ExecutorPrefillCompletion {
-    pub fn new(
-        output: PrefillOutput,
-        planned_chunk: PrefillChunk,
-        completed_chunk: PrefillChunk,
-        capacity_probe_count: u32,
-    ) -> Result<Self> {
-        validate_prefill_completion_shape(planned_chunk, completed_chunk, capacity_probe_count)?;
-        Ok(Self {
-            output,
-            planned_chunk,
-            completed_chunk,
-            capacity_probe_count,
-        })
-    }
-
-    pub fn exact(output: PrefillOutput, chunk: PrefillChunk) -> Self {
-        Self {
-            output,
-            planned_chunk: chunk,
-            completed_chunk: chunk,
-            capacity_probe_count: 0,
-        }
-    }
-
-    pub const fn planned_chunk(&self) -> PrefillChunk {
-        self.planned_chunk
-    }
-
-    pub const fn completed_chunk(&self) -> PrefillChunk {
-        self.completed_chunk
-    }
-
-    pub const fn capacity_probe_count(&self) -> u32 {
-        self.capacity_probe_count
-    }
-
-    pub fn into_parts(self) -> (PrefillOutput, PrefillChunk, PrefillChunk, u32) {
-        (
-            self.output,
-            self.planned_chunk,
-            self.completed_chunk,
-            self.capacity_probe_count,
-        )
-    }
-}
-
-fn validate_prefill_completion_shape(
-    planned_chunk: PrefillChunk,
-    completed_chunk: PrefillChunk,
-    capacity_probe_count: u32,
-) -> Result<()> {
-    if completed_chunk.tokens_processed() != planned_chunk.tokens_processed()
-        || completed_chunk.total_prompt_tokens() != planned_chunk.total_prompt_tokens()
-        || completed_chunk.tokens_to_process() > planned_chunk.tokens_to_process()
-    {
-        return Err(ferrum_types::FerrumError::internal(
-            "completed prefill chunk is not a non-empty prefix of its planned chunk",
-        ));
-    }
-    if completed_chunk != planned_chunk && capacity_probe_count == 0 {
-        return Err(ferrum_types::FerrumError::internal(
-            "partial prefill completion requires a failed capacity probe",
-        ));
-    }
-    Ok(())
-}
-
-pub enum ExecutorPrefillOutcome {
-    Completed(ExecutorPrefillCompletion),
-    Deferred(ExecutorExecutionDeferral),
-}
-
-/// Transactional result of attempting one physical prefill batch.
-///
-/// `NotSubmitted` proves that no participant in the batch reached provider
-/// encode or device submission. The caller may therefore retry a narrower
-/// partition or the existing per-request capacity path without duplicating
-/// model work. `Unsupported` keeps the optimization optional for legacy
-/// executors while plan-runtime implementations provide the real batch edge.
-pub enum ExecutorBatchPrefillOutcome {
-    Completed(Vec<ExecutorPrefillCompletion>),
-    NotSubmitted(ExecutorExecutionDeferral),
-    Unsupported,
 }
 
 /// Stage that must advance before a plan-runtime prefill can be admitted.
@@ -2796,10 +2007,14 @@ pub enum ExecutorPrefillAdmissionDecision {
 
 /// Core model executor trait focusing on tensor operations
 #[async_trait]
-pub trait ModelExecutor: Send + Sync {
+pub trait ModelExecutor: Send + Sync + 'static {
     /// Admit immutable token work using this executor's actual resource owner.
-    /// Deferred probes do not issue an executable incarnation.
-    fn admit_tokens(
+    /// Deferred probes do not issue an executable incarnation. An implementation
+    /// that queues device preparation retains its actual resources independently
+    /// of this future: dropping it must reclaim the unpublished incarnation.
+    /// Returning `Admitted` transfers that exact frontier to the caller, which
+    /// must publish it or close it without an intervening ownership gap.
+    async fn admit_tokens(
         &self,
         _input: crate::token_execution::ExecutionAdmission<'_>,
     ) -> Result<crate::token_execution::TokenAdmissionOutcome> {
@@ -2843,13 +2058,13 @@ pub trait ModelExecutor: Send + Sync {
         ))
     }
 
-    /// Plan an optional prompt-tail checkpoint before a prefill chunk is
-    /// dispatched. The boundary must lie after this chunk's start and no later
-    /// than its end, leaving a legal suffix for logits. None preserves the chunk. Planning
-    /// grants no capacity or capture authority and does not report a failed
-    /// capacity probe; the caller dispatches the resulting chunk explicitly.
-    fn plan_prompt_tail_capture_boundary(&self, _chunk: PrefillChunk) -> Option<PrefixCapturePlan> {
-        None
+    /// Immutable product-range planning for this executor instance. Planning
+    /// never grants capacity, capture or submission authority. Both selection
+    /// and execution preparation use the same pure rule with current progress.
+    /// Unknown preserves the supplied chunk without qualifying it for exact
+    /// advance prediction; wrappers must explicitly forward their inner rule.
+    fn prefill_shape_policy(&self) -> PrefillShapePolicy {
+        PrefillShapePolicy::Unknown
     }
 
     /// Pure boundary planning for optional sharing. None leaves normal scheduling
@@ -2874,26 +2089,26 @@ pub trait ModelExecutor: Send + Sync {
     /// Get model information and metadata
     fn info(&self) -> &ModelInfo;
 
-    /// Selects the single authority for request-lifetime model resources.
-    /// Existing executors remain on the transitional legacy-engine path by
-    /// default. A runtime that returns `PlanRuntime` must return the shared
-    /// runtime's opaque cache handle from prefill/decode and delegate release
-    /// of that authority from `release_cache`.
-    fn execution_resource_authority(&self) -> ExecutionResourceAuthority {
-        ExecutionResourceAuthority::LegacyEngine
+    /// Declares the resource planning model used by this implementation.
+    /// Both variants execute and close through the same exact token sequence
+    /// protocol. `CompiledPlan` additionally exposes its immutable resolved plan
+    /// and shared runtime's capacity evidence; this tag grants no authority.
+    fn execution_planning_model(&self) -> ExecutionPlanningModel {
+        ExecutionPlanningModel::ExecutorManaged
     }
 
     /// Immutable admission limits compiled into this executor's runtime plan.
-    /// A PlanRuntime executor must return `Some`; legacy executors may defer to
-    /// the engine-owned scheduler and recurrent-state limits.
+    /// A CompiledPlan executor must return `Some`. Other executors may leave
+    /// this unreported; the engine then reports its scheduler service limits,
+    /// without claiming an independent physical or recurrent-state capacity.
     fn admission_limits(&self) -> Result<Option<ExecutorAdmissionLimits>> {
         Ok(None)
     }
 
     /// Returns the immutable product plan that owns planning, provider
     /// selection, and resource authority for a plan-runtime executor.
-    /// Legacy executors return `None`; `PlanRuntime` executors must expose the
-    /// exact plan used for provisioning and dispatch.
+    /// Executor-managed implementations may return `None`; `CompiledPlan`
+    /// implementations must expose the exact plan used for provisioning and dispatch.
     fn resolved_model_plan(&self) -> Option<&ferrum_runtime::ResolvedModelPlan> {
         None
     }
@@ -2908,22 +2123,50 @@ pub trait ModelExecutor: Send + Sync {
     }
 
     /// Returns the authoritative memory breakdown for a shared plan runtime.
-    /// `LegacyEngine` executors return `None`; `PlanRuntime` executors must
-    /// return `Some` while they are ready.
+    /// Executor-managed implementations may return `None`; `CompiledPlan`
+    /// implementations must return `Some` while they are ready.
     fn plan_runtime_resource_snapshot(&self) -> Result<Option<PlanRuntimeResourceSnapshot>> {
         Ok(None)
     }
 
-    /// Whether this executor's backend can run the unified mixed prefill+decode
-    /// forward natively. When false, the engine routes Qwen3-MoE batches through
-    /// the legacy split path. Reported by the (backend-aware) executor so the
-    /// engine stays backend-agnostic — replaces a `cfg(target_os)` branch that
-    /// previously hard-coded "Metal/CPU lack native unified" in the hot path.
+    /// Read-only memory accounting from the original execution owner.
     ///
-    /// Default false (conservative legacy path); accelerators with a native
-    /// unified forward override to true.
-    fn supports_native_unified_decode(&self) -> bool {
-        false
+    /// The default projects the original plan-runtime accounting domain. An
+    /// executor without that evidence reports Unknown, not fabricated zeros or
+    /// a separate cache manager. This observation grants no allocation/release
+    /// authority and does not imply that a completed close released all memory.
+    ///
+    /// Return Unknown for optional/unsupported metrics or a failed optional
+    /// measurement. Err is reserved for a violation of the original owner's
+    /// required resource-accounting contract; Engine readiness reflects it.
+    fn memory_observation(&self) -> Result<ferrum_types::MemoryObservation> {
+        let Some(snapshot) = self.plan_runtime_resource_snapshot()? else {
+            if self.execution_planning_model() == ExecutionPlanningModel::CompiledPlan {
+                return Err(FerrumError::internal(
+                    "CompiledPlan executor did not expose its required resource snapshot",
+                ));
+            }
+            return Ok(ferrum_types::MemoryObservation::Unknown);
+        };
+        snapshot.validate()?;
+        let bytes = |value: u64| {
+            usize::try_from(value)
+                .map_err(|_| FerrumError::internal("owner memory observation exceeds usize"))
+        };
+        let total_bytes = bytes(snapshot.usable_capacity_bytes())?;
+        let used_bytes = bytes(snapshot.used_bytes()?)?;
+        let mut usage = ferrum_types::MemoryUsage {
+            total_bytes,
+            used_bytes,
+            free_bytes: total_bytes.saturating_sub(used_bytes),
+            gpu_memory_bytes: self.info().device.is_gpu().then_some(used_bytes),
+            cpu_memory_bytes: matches!(self.info().device, ferrum_types::Device::CPU)
+                .then_some(used_bytes),
+            cache_memory_bytes: bytes(snapshot.dynamic_used_bytes())?,
+            utilization_percent: 0.0,
+        };
+        usage.calculate_utilization();
+        Ok(ferrum_types::MemoryObservation::Known(usage))
     }
 
     /// Per-request KV capacity in tokens when the executor owns a smaller
@@ -2933,21 +2176,21 @@ pub trait ModelExecutor: Send + Sync {
     }
 
     /// Device-aware limits selected from the exact compiled memory plan before
-    /// static model upload. Legacy executors do not provide this evidence.
+    /// static model upload. Executor-managed implementations may leave it unreported.
     fn startup_memory_plan(&self) -> Option<&ferrum_types::StartupMemoryPlan> {
         None
     }
 
     /// Installs the product-owned execution event sink before requests start.
     ///
-    /// Legacy executors have no typed execution journal and keep the default
-    /// no-op. Executors backed by the vNext runtime retain this sink with each
+    /// Implementations without typed execution events keep the default no-op.
+    /// Executors backed by the compiled runtime retain this sink with each
     /// admitted request so node/operation events share the product artifact.
     fn attach_execution_event_sink(&self, _sink: Arc<dyn crate::ProductExecutionEventSink>) {}
 
     /// Current plan-local capacity evidence for scheduler wake suppression.
-    /// Legacy-engine executors return `None`; an executor declaring
-    /// [`ExecutionResourceAuthority::PlanRuntime`] must return `Some`.
+    /// Executor-managed implementations may return `None`; an executor declaring
+    /// [`ExecutionPlanningModel::CompiledPlan`] must return `Some`.
     fn execution_capacity_epochs(&self) -> Result<Option<ExecutorAdmissionEpochs>> {
         Ok(None)
     }
@@ -2968,8 +2211,8 @@ pub trait ModelExecutor: Send + Sync {
     /// wait. The returned registration must remain alive until it is awaited or
     /// deliberately cancelled by being dropped.
     ///
-    /// Legacy-engine executors return `None`. An executor declaring
-    /// [`ExecutionResourceAuthority::PlanRuntime`] must return `Some` for a
+    /// Executor-managed implementations may return `None`. An executor declaring
+    /// [`ExecutionPlanningModel::CompiledPlan`] must return `Some` for a
     /// wait condition issued by its own admission coordinator.
     fn register_execution_capacity_waiter(
         &self,
@@ -3033,6 +2276,34 @@ pub trait ModelExecutor: Send + Sync {
         Ok(false)
     }
 
+    /// Query the real release footprint of this executor's exact live token
+    /// incarnation. This is scheduling evidence, not permission to release or
+    /// proof of quiescence: callers must still observe `cancel_tokens` reaching
+    /// `Ended`. Executors without native source generations return `false`.
+    fn write_token_capacity_release_sources(
+        &self,
+        _sequence: &crate::token_execution::ExecutorSequence,
+        sources: &mut Vec<ferrum_runtime::CapacityAvailabilitySource>,
+    ) -> Result<bool> {
+        sources.clear();
+        Ok(false)
+    }
+
+    /// Observe the real allocator behind a typed capacity shortfall. The
+    /// blocked frontier must still identify the original live owner. External
+    /// candidates are distinct exact incarnations, including retained closes;
+    /// missing already-retired candidates contribute no resources. `None`
+    /// means this implementation cannot observe the specified physical domain.
+    /// Only the original close protocol can establish actual release.
+    fn observe_token_allocator_reclaim(
+        &self,
+        _blocked: &crate::token_execution::ExecutionFrontier,
+        _domain: &ferrum_types::AllocatorCapacityDomain,
+        _candidates: &[crate::token_execution::ExecutorSequence],
+    ) -> Result<Option<crate::token_execution::TokenAllocatorReclaim>> {
+        Ok(None)
+    }
+
     /// Retire one exact request-scoped runtime authority for recompute.
     ///
     /// Success is a terminal release fence: all provider/device work that can
@@ -3063,10 +2334,9 @@ pub trait ModelExecutor: Send + Sync {
 
     /// Reserve model-owned KV slots before a forward is dispatched.
     ///
-    /// This is the executor-level admission hook for vLLM-style paged KV. The
-    /// engine calls it at the batch boundary so a request that cannot grow its
-    /// KV cache is delayed or preempted before kernel launch instead of
-    /// panicking inside attention.
+    /// This capability observes the model's existing allocator. Normal token
+    /// execution prepares storage through its admitted sequence owner before
+    /// kernel launch; a separate reservation is not permission to execute.
     fn reserve_kv_slots(&self, _requests: &[KvSlotRequest]) -> Result<Option<KvSlotReservation>> {
         Ok(None)
     }
@@ -3076,245 +2346,6 @@ pub trait ModelExecutor: Send + Sync {
     /// Executors without model-owned paged KV return `None`.
     fn kv_slot_capacity_snapshot(&self) -> Option<KvSlotCapacitySnapshot> {
         None
-    }
-
-    /// Recurrent-state allocation spec for this request, when the model has
-    /// state-space or hybrid layers that need per-request recurrent state.
-    ///
-    /// Attention-only models return `None`. If this returns `Some`, the engine
-    /// must allocate a recurrent-state handle before prefill and pass it through
-    /// prefill/decode inputs. The default keeps existing executors KV-only.
-    fn recurrent_state_spec(
-        &self,
-        _request_id: &RequestId,
-        _input_tokens: &[TokenId],
-    ) -> Result<Option<RecurrentStateSpec>> {
-        Ok(None)
-    }
-
-    /// Execute prefill phase (process initial prompt)
-    async fn prefill(&self, input: &PrefillInput) -> Result<PrefillOutput>;
-
-    /// Execute one exact prefill chunk with an explicit pre-submit capacity
-    /// deferral edge. Legacy executors inherit full-prefill behavior.
-    async fn prefill_with_capacity(&self, input: &PrefillInput) -> Result<ExecutorPrefillOutcome> {
-        let output = self.prefill(input).await?;
-        let chunk = match input.chunk {
-            Some(chunk) => chunk,
-            None => PrefillChunk::new(0, input.sequence_length(), input.sequence_length())?,
-        };
-        Ok(ExecutorPrefillOutcome::Completed(
-            ExecutorPrefillCompletion::exact(output, chunk),
-        ))
-    }
-
-    /// Batch prefill: process multiple prompts' prefill in ONE forward pass.
-    ///
-    /// Default implementation falls back to per-request `prefill()` (serial,
-    /// which is the current behavior the engine sees today). Executors that
-    /// support unified mixed-batch forward (e.g. via `model.unified_forward`
-    /// over a varlen QKV path) should override this to amortize launch /
-    /// kernel-overhead across all `inputs` items in one call.
-    ///
-    /// Used by the continuous-batching engine to coalesce a cohort of new
-    /// prefills (apples M3 c=32 sees 32 simultaneous prefills as one logical
-    /// batch; the serial fallback runs each in ~47 ms while a true batched
-    /// path runs all 32 in ~100 ms).
-    async fn batch_prefill(&self, inputs: &[PrefillInput]) -> Result<Vec<PrefillOutput>> {
-        let support = self.adapter_execution_support();
-        for input in inputs {
-            support.validate_metadata(&input.metadata)?;
-        }
-        let mut outputs = Vec::with_capacity(inputs.len());
-        for input in inputs {
-            outputs.push(self.prefill(input).await?);
-        }
-        Ok(outputs)
-    }
-
-    /// Attempt one physical, capacity-aware prefill batch.
-    ///
-    /// Implementations must either complete every input in original order or
-    /// return `NotSubmitted` after restoring every retained prefill authority
-    /// to a retryable state. Partial device submission is an ordinary error,
-    /// never a `NotSubmitted` result.
-    async fn batch_prefill_with_capacity(
-        &self,
-        _inputs: &[PrefillInput],
-    ) -> Result<ExecutorBatchPrefillOutcome> {
-        Ok(ExecutorBatchPrefillOutcome::Unsupported)
-    }
-
-    /// Tensor-free prefill for executors that declare
-    /// [`ExecutionResourceAuthority::PlanRuntime`].
-    ///
-    /// The default fails closed because adapting through [`PrefillInput`]
-    /// would silently restore a host tensor boundary.
-    async fn plan_runtime_prefill_with_capacity(
-        &self,
-        _input: &PlanRuntimePrefillInput,
-    ) -> Result<PlanRuntimePrefillOutcome> {
-        Err(FerrumError::unsupported(
-            "tensor-free plan-runtime prefill is not implemented",
-        ))
-    }
-
-    /// Attempt one physical tensor-free prefill batch.
-    ///
-    /// `Unsupported` is an optimization fallback to the typed single-request
-    /// method. `NotSubmitted` proves that no participant reached provider
-    /// encode or device submission.
-    async fn plan_runtime_batch_prefill_with_capacity(
-        &self,
-        _inputs: &[PlanRuntimePrefillInput],
-    ) -> Result<PlanRuntimeBatchPrefillOutcome> {
-        Ok(PlanRuntimeBatchPrefillOutcome::Unsupported)
-    }
-
-    /// Attempt one physical mixed prefill/decode wave. Prefills must already
-    /// hold typed admission, and decodes must retain their exact cache identity.
-    /// An intermediate prefill completion is never sampleable. Full logits are
-    /// a legal fallback for a decode participant's greedy sampling policy.
-    /// Only `Unsupported` or `NotSubmitted` permit separate-phase fallback.
-    async fn plan_runtime_mixed_batch_with_capacity(
-        &self,
-        _prefills: &[PlanRuntimePrefillInput],
-        _decodes: &[PlanRuntimeDecodeInput],
-    ) -> Result<PlanRuntimeMixedBatchOutcome> {
-        Ok(PlanRuntimeMixedBatchOutcome::Unsupported)
-    }
-
-    /// Discard an exact prefill authority after engine-side validation,
-    /// sampling, or scheduler commit fails.
-    ///
-    /// Plan runtimes should override this to remove both retained-prefill and
-    /// active state by the exact opaque handle, not by a reusable request id.
-    fn discard_plan_runtime_prefill(&self, authority: PlanRuntimePrefillAuthority) -> Result<()> {
-        self.release_cache(&authority.kv_cache().cache_id());
-        Ok(())
-    }
-
-    /// Execute decode phase (generate next token)
-    async fn decode(&self, input: &DecodeInput) -> Result<DecodeOutput>;
-
-    /// Batch decode: process multiple sequences in one forward pass.
-    ///
-    /// A successful result must contain exactly one output per input, in the
-    /// original input order, and each output cache must retain the identity of
-    /// its corresponding input cache. Implementations must not expose partial
-    /// success as a shorter or reordered vector.
-    ///
-    /// The default implementation falls back to serial per-request `decode()`.
-    /// Executors with a typed batch submission path should override this so one
-    /// call maps to one resource step and one terminal submission fence.
-    async fn batch_decode(&self, inputs: &[DecodeInput]) -> Result<Vec<DecodeOutput>> {
-        let support = self.adapter_execution_support();
-        for input in inputs {
-            support.validate_metadata(&input.metadata)?;
-        }
-        let mut outputs = Vec::with_capacity(inputs.len());
-        for input in inputs {
-            outputs.push(self.decode(input).await?);
-        }
-        Ok(outputs)
-    }
-
-    /// Batch decode with an explicit pre-submit capacity deferral edge.
-    ///
-    /// Legacy executors inherit the successful/error-only behavior. A runtime
-    /// with typed resource authority overrides this method so temporary
-    /// capacity pressure is never flattened into a stringly resource error.
-    async fn batch_decode_with_capacity(
-        &self,
-        inputs: &[DecodeInput],
-    ) -> Result<ExecutorBatchDecodeOutcome> {
-        self.batch_decode(inputs)
-            .await
-            .map(ExecutorBatchDecodeOutcome::Completed)
-    }
-
-    /// Tensor-free batch decode for executors that declare
-    /// [`ExecutionResourceAuthority::PlanRuntime`].
-    ///
-    /// Implementations must preserve input ordering and cache identity exactly.
-    /// Temporary pressure may return `Deferred` only before device submission.
-    /// The default fails closed because adapting through [`DecodeInput`] would
-    /// silently restore the host-tensor boundary this contract removes.
-    async fn plan_runtime_batch_decode_with_capacity(
-        &self,
-        _inputs: &[PlanRuntimeDecodeInput],
-    ) -> Result<PlanRuntimeBatchDecodeOutcome> {
-        Err(FerrumError::unsupported(
-            "tensor-free plan-runtime batch decode is not implemented",
-        ))
-    }
-
-    /// Unified mixed-batch forward: process a [`UnifiedBatch`] containing
-    /// any combination of prefill chunks (one or more `q_tokens` per item,
-    /// possibly continuing from `pos_offset > 0`) and decode steps
-    /// (`q_tokens.len() == 1`, `is_final_chunk = true`) in a single model
-    /// forward pass.
-    ///
-    /// Returns one element per `batch.items[i]`:
-    /// - `Some(logits)` for items with `is_final_chunk = true` (the
-    ///   request's final-position logits, ready for sampling)
-    /// - `None` for intermediate prefill chunks (no lm_head executed —
-    ///   model only updates KV state)
-    ///
-    /// Default implementation returns `Err(unsupported)`. Concrete LLM
-    /// executors should override with either:
-    /// - A behavioral fallback that dispatches each chunk via existing
-    ///   `prefill()` and groups decode items into `batch_decode()` (this
-    ///   preserves current behavior; no perf change), OR
-    /// - A real unified-forward path that runs all items through one
-    ///   `[M_total, hidden]` GEMM chain with a varlen attention kernel
-    ///   (this is the chunked-prefill perf unlock).
-    async fn unified_decode(&self, _batch: &UnifiedBatch) -> Result<Vec<Option<Vec<f32>>>> {
-        Err(ferrum_types::FerrumError::unsupported(
-            "unified_decode not implemented for this executor",
-        ))
-    }
-
-    /// Optional: full forward pass (for non-autoregressive use cases)
-    async fn forward(&self, _input: &TensorRef) -> Result<TensorRef> {
-        // Default implementation not supported
-        Err(ferrum_types::FerrumError::unsupported(
-            "Full forward pass not supported by this executor",
-        ))
-    }
-
-    /// Roll the KV cache for this executor's sequence back to `new_len`.
-    /// Used by speculative decoding on partial rejection so the next
-    /// iteration sees a KV prefix that matches the accepted token stream.
-    /// Default: Ok(()) — executors that don't cache per-sequence state
-    /// (stub, mock) are inherently tolerant; real LLM executors override.
-    async fn truncate_kv(
-        &self,
-        _kv_cache: &std::sync::Arc<dyn ferrum_interfaces::KvCacheHandle>,
-        _new_len: usize,
-    ) -> Result<()> {
-        Ok(())
-    }
-
-    /// Multi-position decode-verify: one forward over `N+1` tokens,
-    /// producing one logits row per position. Used by speculative
-    /// decoding's target path so we don't pay N+1 sequential forwards.
-    ///
-    /// Default falls back to N+1 sequential `decode()` calls — correct
-    /// but slow; real LLM executors override.
-    ///
-    /// Returns a `Vec<DecodeOutput>` of length `inputs.len()` with the
-    /// final KV handle attached to the last element.
-    async fn forward_verify(&self, inputs: &[DecodeInput]) -> Result<Vec<DecodeOutput>> {
-        let support = self.adapter_execution_support();
-        for input in inputs {
-            support.validate_metadata(&input.metadata)?;
-        }
-        let mut out = Vec::with_capacity(inputs.len());
-        for input in inputs {
-            out.push(self.decode(input).await?);
-        }
-        Ok(out)
     }
 
     /// Get executor capabilities
@@ -3367,32 +2398,20 @@ pub trait ModelExecutor: Send + Sync {
         Ok(())
     }
 
-    /// Shutdown executor gracefully
-    async fn shutdown(&mut self) -> Result<()> {
-        // Default no-op implementation
-        Ok(())
-    }
-
-    /// Complete and release one cache authority with product-authoritative
-    /// terminal token counts.
-    ///
-    /// Legacy executors only need physical release and inherit that behavior.
-    /// Plan runtimes with terminal journals override this method so completion
-    /// cannot be inferred from a generic release operation. Implementations may
-    /// await retention of the last completed native state before releasing its
-    /// source; sampled output alone is not evidence of an executed frontier.
-    async fn complete_cache(&self, completion: ExecutorSequenceCompletion) -> Result<()> {
-        self.release_cache(completion.cache_id());
-        Ok(())
-    }
-
-    /// Release KV cache and state without asserting successful completion.
-    ///
-    /// Called for cancellation, failure, recompute, and legacy cleanup. The
-    /// `cache_id` matches the value embedded in the `KvCacheHandle` returned by
-    /// prefill/decode. Successful product completion uses [`Self::complete_cache`].
-    fn release_cache(&self, _cache_id: &str) {
-        // Default no-op — executors that manage per-sequence KV caches should override.
+    /// Begin final retirement under the original assembly owner's authority.
+    /// A per-engine request drain does not grant this permission. Implementations
+    /// must retain unresolved resources independently of an awaiting caller.
+    /// The owner transfers its last execution reference after all use scopes
+    /// end. Retry observes or wakes this same retirement; it must not rebuild
+    /// the executor, replay inference, or release an original owner twice.
+    fn begin_shutdown(
+        self: Arc<Self>,
+        permit: &crate::executor_lifecycle::ExecutorShutdownPermit,
+    ) -> crate::executor_lifecycle::ExecutorShutdownObserver {
+        let error = permit.check(self.as_ref()).err().unwrap_or_else(|| {
+            FerrumError::unsupported("executor has not implemented checked whole-model shutdown")
+        });
+        crate::executor_lifecycle::ExecutorShutdownObserver::retained(Arc::new(self), error)
     }
 }
 
@@ -3650,58 +2669,11 @@ pub struct ExecutorMemoryUsage {
     pub utilization_percent: f32,
 }
 
-/// Batch model executor for processing multiple requests efficiently
-#[async_trait]
-pub trait BatchModelExecutor: ModelExecutor {
-    /// Execute batch prefill for multiple sequences
-    async fn batch_prefill(&self, inputs: &[PrefillInput]) -> Result<Vec<PrefillOutput>>;
-
-    /// Execute batch decode for multiple sequences
-    async fn batch_decode(&self, inputs: &[DecodeInput]) -> Result<Vec<DecodeOutput>>;
-
-    /// Get optimal batch size for current conditions
-    fn optimal_batch_size(&self) -> usize;
-
-    /// Check if batch size is supported
-    fn supports_batch_size(&self, batch_size: usize) -> bool;
-}
-
-/// Speculative execution support
-#[async_trait]
-pub trait SpeculativeExecutor: ModelExecutor {
-    /// Execute speculative decoding with draft model
-    async fn speculative_decode(
-        &self,
-        input: &DecodeInput,
-        draft_tokens: &[ferrum_types::TokenId],
-        acceptance_threshold: f32,
-    ) -> Result<SpeculativeDecodeOutput>;
-}
-
-/// Output from speculative decoding
-#[derive(Debug, Clone)]
-pub struct SpeculativeDecodeOutput {
-    /// Accepted tokens (subset of draft tokens)
-    pub accepted_tokens: Vec<ferrum_types::TokenId>,
-    /// Logits for the next token after last accepted
-    pub next_logits: TensorRef,
-    /// Updated KV cache
-    pub kv_cache: Arc<dyn KvCacheHandle>,
-    /// Number of draft tokens accepted
-    pub acceptance_count: usize,
-}
-
 /// Model executor factory
 #[async_trait]
 pub trait ModelExecutorFactory: Send + Sync {
     /// Create executor from model configuration
     async fn create_executor(&self, config: &ExecutorConfig) -> Result<Box<dyn ModelExecutor>>;
-
-    /// Create batch executor
-    async fn create_batch_executor(
-        &self,
-        config: &ExecutorConfig,
-    ) -> Result<Box<dyn BatchModelExecutor>>;
 
     /// Get supported executor types
     fn supported_types(&self) -> Vec<ExecutorType>;

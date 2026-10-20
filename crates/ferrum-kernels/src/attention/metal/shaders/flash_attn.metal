@@ -248,7 +248,7 @@ kernel void flash_attn_q_tiled_f32(
     // 3. Walk KV in C=32 chunks.
     for (int ic = 0; ic < attend_end_max; ic += FA_C) {
         // ── 3a. QK^T: each simdgroup writes one [8,8] tile to ss. ──
-        {
+        if (ic + FA_C <= p.kv_len) {
             device const float* pk = k_base + (ic + 8 * int(sgitg)) * FA_DK;
             threadgroup const float* pq = sq;
             threadgroup       float* ps = ss + 8 * int(sgitg);
@@ -264,6 +264,23 @@ kernel void flash_attn_q_tiled_f32(
             }
 
             simdgroup_store(mqk, ps, FA_C, ulong2(0, 0), false);
+        } else {
+            // simdgroup_load always reads its complete 8x8 matrix. A
+            // partial final KV tile has no padding contract: stay within
+            // its live rows instead of reading past the allocation (or
+            // into the next head). Full tiles keep the matrix fast path
+            // and its original threadgroup-memory footprint.
+            const int k_pos = ic + int(tiisg);
+            for (int jj = 0; jj < FA_NQ; ++jj) {
+                const int j = jj * FA_NSG + int(sgitg);
+                float score = 0.0f;
+                if (k_pos < p.kv_len) {
+                    for (int d = 0; d < FA_DK; ++d) {
+                        score += sq[j * FA_DK + d] * k_base[k_pos * FA_DK + d];
+                    }
+                }
+                ss[j * FA_C + int(tiisg)] = score;
+            }
         }
 
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -317,7 +334,7 @@ kernel void flash_attn_q_tiled_f32(
         // 8*sgitg, 8*(sgitg+NSG), 8*(sgitg+2*NSG), 8*(sgitg+3*NSG). Loading
         // the running O tiles into registers, accumulating, then storing
         // back avoids touching the other simdgroups' data.
-        {
+        if (ic + FA_C <= p.kv_len) {
             simdgroup_float8x8 lo[FA_NO];
             {
                 threadgroup const float* pso = so + 8 * int(sgitg);
@@ -349,6 +366,22 @@ kernel void flash_attn_q_tiled_f32(
                     simdgroup_store(lo[ii], pso, FA_DV, ulong2(0, 0), false);
                     pso += 8 * FA_NSG;
                 }
+            }
+        } else {
+            // A masked zero probability cannot make an out-of-bounds V
+            // load safe: 0 * NaN can still poison the result. Each lane
+            // owns four output columns and visits only live KV rows.
+            const int live_rows = p.kv_len - ic;
+            for (int jj = 0; jj < FA_NQ; ++jj) {
+                const int j = jj * FA_NSG + int(sgitg);
+                threadgroup float4* so4 = (threadgroup float4 *)(so + j * FA_DV);
+                float4 acc = so4[tiisg];
+                for (int ki = 0; ki < live_rows; ++ki) {
+                    device const float4* v_row =
+                        (device const float4 *)(v_base + (ic + ki) * FA_DV);
+                    acc += ss[j * FA_C + ki] * v_row[tiisg];
+                }
+                so4[tiisg] = acc;
             }
         }
 

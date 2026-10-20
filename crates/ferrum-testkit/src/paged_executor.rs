@@ -8,22 +8,25 @@
 //! Uses identity projections (Q=K=V=input embedding) for deterministic,
 //! verifiable behavior without model weights.
 
-use crate::tensor::MockTensor;
+use crate::executor_observation::{ExecutorCounters, ExecutorObservation};
 use async_trait::async_trait;
 use ferrum_execution::{
     model_executor::{
-        AttentionType, DecodeInput, DecodeOutput, ExecutorCapabilities, ExecutorMemoryUsage,
-        ExecutorState, ExecutorStatus, MemoryRequirements, PrefillInput, PrefillOutput,
+        AttentionType, ExecutorCapabilities, ExecutorMemoryUsage, ExecutorState, ExecutorStatus,
+        MemoryRequirements,
     },
     ModelExecutor,
 };
-use ferrum_interfaces::{KvCacheHandle, KvCacheManager};
+use ferrum_interfaces::KvCacheHandle;
 use ferrum_kv::attention::paged_attention;
 use ferrum_kv::managers::paged::{PagedKvCacheHandle, PagedKvCacheManager};
 use ferrum_types::{DataType, Device, FerrumError, ModelInfo, ModelType, RequestId, Result};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
+
+mod token_execution;
+use token_execution::PagedTokenState;
 
 /// Configuration for the paged attention executor.
 #[derive(Debug, Clone)]
@@ -62,13 +65,18 @@ impl Default for PagedExecutorConfig {
 pub struct PagedAttentionExecutor {
     config: PagedExecutorConfig,
     info: ModelInfo,
-    /// Shared with the engine's KV cache manager.
+    /// Owns physical KV; token entries retain exact handles from this manager.
     kv_manager: Arc<PagedKvCacheManager>,
-    prefill_count: AtomicU64,
-    decode_count: AtomicU64,
+    counters: Arc<ExecutorCounters>,
+    tokens: PagedTokenState,
 }
 
 impl PagedAttentionExecutor {
+    /// Observe counts without retaining this executor or its resources.
+    pub fn observer(&self) -> ExecutorObservation {
+        ExecutorObservation::new(&self.counters)
+    }
+
     pub fn new(config: PagedExecutorConfig, kv_manager: Arc<PagedKvCacheManager>) -> Self {
         let info = ModelInfo {
             model_id: "paged-test-model".into(),
@@ -91,17 +99,17 @@ impl PagedAttentionExecutor {
             config,
             info,
             kv_manager,
-            prefill_count: AtomicU64::new(0),
-            decode_count: AtomicU64::new(0),
+            counters: Arc::default(),
+            tokens: PagedTokenState::default(),
         }
     }
 
     pub fn prefill_count(&self) -> u64 {
-        self.prefill_count.load(Ordering::Relaxed)
+        self.counters.prefill.load(Ordering::Relaxed)
     }
 
     pub fn decode_count(&self) -> u64 {
-        self.decode_count.load(Ordering::Relaxed)
+        self.counters.decode.load(Ordering::Relaxed)
     }
 
     /// Create an embedding vector from a token ID.
@@ -132,7 +140,7 @@ impl PagedAttentionExecutor {
         logits
     }
 
-    /// Get the paged handle from an Arc<dyn KvCacheHandle>.
+    #[cfg(test)]
     fn as_paged_handle(handle: &dyn KvCacheHandle) -> Result<&PagedKvCacheHandle> {
         handle
             .as_any()
@@ -143,181 +151,47 @@ impl PagedAttentionExecutor {
 
 #[async_trait]
 impl ModelExecutor for PagedAttentionExecutor {
+    fn begin_shutdown(
+        self: Arc<Self>,
+        permit: &ferrum_execution::executor_lifecycle::ExecutorShutdownPermit,
+    ) -> ferrum_execution::executor_lifecycle::ExecutorShutdownObserver {
+        crate::host_shutdown::begin(self, permit, |executor| executor.shutdown_token_sequences())
+    }
+
+    async fn admit_tokens(
+        &self,
+        input: ferrum_execution::token_execution::ExecutionAdmission<'_>,
+    ) -> Result<ferrum_execution::token_execution::TokenAdmissionOutcome> {
+        self.admit_token_sequence(input)
+    }
+
+    async fn execute_tokens(
+        &self,
+        work: &[ferrum_execution::token_execution::ExecutionWork<'_>],
+    ) -> Result<ferrum_execution::token_execution::ExecutionBatchOutcome> {
+        self.execute_token_work(work)
+    }
+
+    async fn finish_tokens(
+        &self,
+        sequence: &ferrum_execution::token_execution::ExecutorSequence,
+        reason: ferrum_execution::token_execution::ExecutionEndReason,
+    ) -> Result<ferrum_execution::token_execution::ExecutionCloseOutcome> {
+        self.close_token_sequence(sequence, reason)
+    }
+
+    fn cancel_tokens(
+        &self,
+        sequence: &ferrum_execution::token_execution::ExecutorSequence,
+    ) -> Result<ferrum_execution::token_execution::ExecutionCloseOutcome> {
+        self.close_token_sequence(
+            sequence,
+            ferrum_execution::token_execution::ExecutionEndReason::Cancelled,
+        )
+    }
+
     fn info(&self) -> &ModelInfo {
         &self.info
-    }
-
-    async fn prefill(&self, input: &PrefillInput) -> Result<PrefillOutput> {
-        self.prefill_count.fetch_add(1, Ordering::Relaxed);
-
-        let batch_size = input.batch_size();
-        let seq_len = input.sequence_length();
-        let vocab_size = self.config.vocab_size;
-        let num_heads = self.config.num_heads;
-        let num_kv_heads = self.config.num_kv_heads;
-        let head_dim = self.config.head_dim;
-
-        // Extract token IDs from input tensor
-        let token_ids = input.input_ids.to_vec_u32()?;
-
-        // Use pre-allocated KV cache from engine, or allocate if not provided
-        let kv_handle = match &input.kv_cache {
-            Some(handle) => handle.clone(),
-            None => {
-                let alloc_request = ferrum_interfaces::kv_cache::AllocationRequest {
-                    request_id: RequestId::new(),
-                    initial_tokens: seq_len,
-                    max_sequence_length: self.config.max_sequence_length,
-                    num_layers: self.config.num_layers,
-                    num_heads: num_kv_heads,
-                    head_dim,
-                    device: Device::CPU,
-                    dtype: DataType::FP32,
-                    priority: ferrum_types::Priority::Normal,
-                };
-                self.kv_manager.allocate(&alloc_request).await?
-            }
-        };
-        let paged_handle = Self::as_paged_handle(kv_handle.as_ref())?;
-
-        // For each token, compute embedding and write K/V to paged cache
-        for pos in 0..seq_len {
-            let token_id = if pos < token_ids.len() {
-                token_ids[pos]
-            } else {
-                0
-            };
-            let embedding = self.token_embedding(token_id);
-
-            // Identity projection: K = V = embedding
-            for layer in 0..self.config.num_layers {
-                self.kv_manager
-                    .write_kv(paged_handle, layer, pos, &embedding, &embedding)?;
-            }
-        }
-
-        // Run paged attention for all layers, accumulate output for last layer
-        // For logits, we only need the last layer's attention output
-        let last_layer = self.config.num_layers - 1;
-
-        // Build query for all positions (prefill): Q = embeddings
-        let mut query = Vec::with_capacity(seq_len * num_heads * head_dim);
-        for pos in 0..seq_len {
-            let token_id = if pos < token_ids.len() {
-                token_ids[pos]
-            } else {
-                0
-            };
-            let emb = self.token_embedding(token_id);
-            // Expand KV heads to query heads if num_heads > num_kv_heads (GQA)
-            let heads_per_kv = num_heads / num_kv_heads;
-            for kv_h in 0..num_kv_heads {
-                for _ in 0..heads_per_kv {
-                    query.extend_from_slice(&emb[kv_h * head_dim..(kv_h + 1) * head_dim]);
-                }
-            }
-        }
-
-        let attn_output = paged_attention(
-            &query,
-            seq_len,
-            num_heads,
-            num_kv_heads,
-            head_dim,
-            &self.kv_manager,
-            paged_handle,
-            last_layer,
-            seq_len,
-        )?;
-
-        // Build logits [batch, seq_len, vocab_size]
-        let q_head_size = num_heads * head_dim;
-        let mut logits_data = Vec::with_capacity(batch_size * seq_len * vocab_size);
-        for _b in 0..batch_size {
-            for s in 0..seq_len {
-                let attn_slice = &attn_output[s * q_head_size..(s + 1) * q_head_size];
-                let token_logits = self.attention_to_logits(attn_slice);
-                logits_data.extend_from_slice(&token_logits);
-            }
-        }
-
-        let logits =
-            MockTensor::from_f32(logits_data, &[batch_size, seq_len, vocab_size]).into_ref();
-
-        Ok(PrefillOutput::new(logits, kv_handle))
-    }
-
-    async fn decode(&self, input: &DecodeInput) -> Result<DecodeOutput> {
-        self.decode_count.fetch_add(1, Ordering::Relaxed);
-
-        let batch_size = input.batch_size();
-        let vocab_size = self.config.vocab_size;
-        let num_heads = self.config.num_heads;
-        let num_kv_heads = self.config.num_kv_heads;
-        let head_dim = self.config.head_dim;
-
-        let paged_handle = Self::as_paged_handle(input.kv_cache.as_ref())?;
-
-        // Current position = number of tokens already cached
-        let position = paged_handle.num_tokens();
-
-        // We may need to allocate an additional block
-        let blocks_needed = (position + 1).div_ceil(self.kv_manager.gpu_pool().block_size());
-        let current_blocks = paged_handle.num_blocks();
-        if blocks_needed > current_blocks {
-            self.kv_manager
-                .allocate_blocks(paged_handle, blocks_needed - current_blocks)?;
-        }
-
-        // Extract the new token ID
-        let token_ids = input.input_ids.to_vec_u32()?;
-        let token_id = token_ids.first().copied().unwrap_or(0);
-
-        let embedding = self.token_embedding(token_id);
-
-        // Write K/V for the new token at `position` in each layer
-        for layer in 0..self.config.num_layers {
-            self.kv_manager
-                .write_kv(paged_handle, layer, position, &embedding, &embedding)?;
-        }
-
-        // Update token count
-        paged_handle.set_num_tokens(position + 1);
-
-        // Run attention for the new token (decode: q_tokens=1, kv_len=position+1)
-        let last_layer = self.config.num_layers - 1;
-
-        // Build query for the single new token
-        let mut query = Vec::with_capacity(num_heads * head_dim);
-        let heads_per_kv = num_heads / num_kv_heads;
-        for kv_h in 0..num_kv_heads {
-            for _ in 0..heads_per_kv {
-                query.extend_from_slice(&embedding[kv_h * head_dim..(kv_h + 1) * head_dim]);
-            }
-        }
-
-        let attn_output = paged_attention(
-            &query,
-            1,
-            num_heads,
-            num_kv_heads,
-            head_dim,
-            &self.kv_manager,
-            paged_handle,
-            last_layer,
-            position + 1,
-        )?;
-
-        // Convert attention output to logits [batch, vocab_size]
-        let mut logits_data = Vec::with_capacity(batch_size * vocab_size);
-        for _b in 0..batch_size {
-            let token_logits = self.attention_to_logits(&attn_output);
-            logits_data.extend_from_slice(&token_logits);
-        }
-
-        let logits = MockTensor::from_f32(logits_data, &[batch_size, vocab_size]).into_ref();
-
-        Ok(DecodeOutput::new(logits, input.kv_cache.clone()))
     }
 
     fn capabilities(&self) -> ExecutorCapabilities {

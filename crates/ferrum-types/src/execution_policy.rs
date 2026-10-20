@@ -1,4 +1,4 @@
-//! Typed execution-policy and admission authority contracts.
+//! Typed execution-policy and admission observation contracts.
 
 use serde::{Deserialize, Serialize};
 
@@ -7,20 +7,31 @@ use serde::{Deserialize, Serialize};
 /// this same constant.
 pub const CUDA_NATIVE_ADAPTIVE_V1_MAX_SEQUENCE_TOKENS: u64 = 512;
 
-/// Declares the authoritative owner of request-lifetime accelerator resources.
+/// Cold planning and evidence contract declared by an execution implementation.
 ///
-/// `PlanRuntime` owns admission, allocation, fences, backpressure, and release.
-/// `LegacyEngine` remains only for executors that have not migrated.
+/// Both models retain resources in their original executor and implement the
+/// same token submission, completion, cancellation, and retirement protocol.
+/// This classification grants no execution or resource-release authority and
+/// does not describe KV layout, prefix restoration, or measured memory usage.
+///
+/// Serialized labels remain compatible with historical health and performance
+/// records. In particular, `legacy_engine` does not mean Engine-owned resources.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum ExecutionResourceAuthority {
-    LegacyEngine,
-    PlanRuntime,
+pub enum ExecutionPlanningModel {
+    /// Resource management is internal to the execution implementation; it need
+    /// not expose a shared compiled plan or that plan's accounting ports.
+    #[serde(rename = "legacy_engine")]
+    ExecutorManaged,
+    /// Exposes the exact compiled plan, admission limits, and resource/capacity
+    /// observations used by its original runtime.
+    #[serde(rename = "plan_runtime")]
+    CompiledPlan,
 }
 
-impl Default for ExecutionResourceAuthority {
+impl Default for ExecutionPlanningModel {
     fn default() -> Self {
-        Self::LegacyEngine
+        Self::ExecutorManaged
     }
 }
 
@@ -127,7 +138,9 @@ impl ExecutorAdmissionLimits {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExecutorAdmissionSnapshot {
     schema_version: u32,
-    resource_authority: ExecutionResourceAuthority,
+    // Historical observation wire label; not an allocation authority.
+    #[serde(rename = "resource_authority")]
+    planning_model: ExecutionPlanningModel,
     #[serde(flatten)]
     limits: ExecutorAdmissionLimits,
     waiting_requests: u32,
@@ -140,7 +153,7 @@ pub struct ExecutorAdmissionSnapshot {
 
 impl ExecutorAdmissionSnapshot {
     pub fn new(
-        resource_authority: ExecutionResourceAuthority,
+        planning_model: ExecutionPlanningModel,
         limits: ExecutorAdmissionLimits,
         waiting_requests: u32,
         active_prefill_sequences: u32,
@@ -174,7 +187,7 @@ impl ExecutorAdmissionSnapshot {
         }
         Ok(Self {
             schema_version: 2,
-            resource_authority,
+            planning_model,
             limits,
             waiting_requests,
             active_sequences,
@@ -185,8 +198,8 @@ impl ExecutorAdmissionSnapshot {
         })
     }
 
-    pub const fn resource_authority(&self) -> ExecutionResourceAuthority {
-        self.resource_authority
+    pub const fn planning_model(&self) -> ExecutionPlanningModel {
+        self.planning_model
     }
 
     pub const fn maximum_active_sequences(&self) -> u32 {
@@ -225,9 +238,60 @@ impl ExecutorAdmissionSnapshot {
 #[cfg(test)]
 mod tests {
     use super::{
-        AttentionExecutionPolicy, ExecutionResourceAuthority, ExecutorAdmissionLimits,
+        AttentionExecutionPolicy, ExecutionPlanningModel, ExecutorAdmissionLimits,
         ExecutorAdmissionSnapshot,
     };
+
+    #[test]
+    fn execution_planning_model_preserves_historical_wire_labels() {
+        for (wire, expected) in [
+            ("legacy_engine", ExecutionPlanningModel::ExecutorManaged),
+            ("plan_runtime", ExecutionPlanningModel::CompiledPlan),
+        ] {
+            assert_eq!(
+                serde_json::from_value::<ExecutionPlanningModel>(wire.into()).unwrap(),
+                expected
+            );
+            assert_eq!(serde_json::to_value(expected).unwrap(), wire);
+        }
+        assert!(serde_json::from_value::<ExecutionPlanningModel>("engine_owned".into()).is_err());
+    }
+
+    #[test]
+    fn execution_planning_model_admission_wire_keeps_original_limits_and_schema() {
+        let historical = serde_json::json!({
+            "schema_version": 2,
+            "resource_authority": "plan_runtime",
+            "maximum_active_sequences": 32,
+            "maximum_scheduled_tokens": 4096,
+            "waiting_requests": 3,
+            "active_sequences": 18,
+            "active_prefill_sequences": 7,
+            "active_decode_sequences": 11,
+            "current_batch_size": 8,
+            "capacity_blocked_requests": 2,
+        });
+        let decoded: ExecutorAdmissionSnapshot =
+            serde_json::from_value(historical.clone()).unwrap();
+        assert_eq!(
+            decoded.planning_model(),
+            ExecutionPlanningModel::CompiledPlan
+        );
+        assert_eq!(decoded.maximum_active_sequences(), 32);
+        assert_eq!(decoded.maximum_scheduled_tokens(), 4096);
+        let observed = ExecutorAdmissionSnapshot::new(
+            ExecutionPlanningModel::CompiledPlan,
+            ExecutorAdmissionLimits::new(32, 4096).unwrap(),
+            3,
+            7,
+            11,
+            Some(8),
+            Some(2),
+        )
+        .unwrap();
+        assert_eq!(decoded, observed);
+        assert_eq!(serde_json::to_value(observed).unwrap(), historical);
+    }
 
     #[test]
     fn attention_policy_resolves_auto_without_hiding_native_requirements() {
@@ -248,7 +312,7 @@ mod tests {
     fn admission_snapshot_rejects_runtime_over_admission_ceiling() {
         let limits = ExecutorAdmissionLimits::new(16, 2048).unwrap();
         assert!(ExecutorAdmissionSnapshot::new(
-            ExecutionResourceAuthority::PlanRuntime,
+            ExecutionPlanningModel::CompiledPlan,
             limits,
             0,
             8,
@@ -262,7 +326,7 @@ mod tests {
     #[test]
     fn admission_snapshot_reconciles_single_source_phase_counts() {
         let snapshot = ExecutorAdmissionSnapshot::new(
-            ExecutionResourceAuthority::PlanRuntime,
+            ExecutionPlanningModel::CompiledPlan,
             ExecutorAdmissionLimits::new(32, 4096).unwrap(),
             3,
             7,

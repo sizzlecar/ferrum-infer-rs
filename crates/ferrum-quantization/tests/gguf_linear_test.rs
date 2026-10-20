@@ -9,7 +9,8 @@
 //!      load tensor, build `GgufLinear`, forward — proves the Phase 1A
 //!      reader and Phase 1B linear compose correctly.
 //!
-//! All tests run on `CpuBackend` (always available, no feature flags).
+//! CPU reference tests are always available. The Metal leaf tests exercise
+//! the packed Q4_K/Q6_K dispatch directly when the Metal feature is selected.
 
 use std::io::{Cursor, Write};
 
@@ -23,14 +24,14 @@ use ferrum_quantization::gguf::{GgufFile, GgufLinear};
 use ferrum_quantization::DenseLinear;
 
 /// Run a Linear and return the output vector.
-fn forward<B: Backend<Buffer = Vec<f32>, Context = ()>>(
+fn forward<B: Backend<Buffer = Vec<f32>, Context = ferrum_kernels::backend::cpu::CpuContext>>(
     linear: &dyn Linear<B>,
     input: &[f32],
     m: usize,
 ) -> Vec<f32> {
     let in_buf = input.to_vec();
     let mut out_buf = vec![0.0f32; m * linear.out_features()];
-    let mut ctx = ();
+    let mut ctx = B::new_context(&Default::default()).expect("CPU context");
     linear.forward(&mut ctx, &in_buf, &mut out_buf, m);
     out_buf
 }
@@ -158,4 +159,106 @@ fn gguf_linear_round_trip_through_gguf_file() {
     let out = forward(&linear, &[1.0_f32, 1.0], 1);
     // Identity-ish: [1,1] * diag(2,3) = [2, 3]
     assert_eq!(out, vec![2.0, 3.0]);
+}
+
+#[cfg(all(feature = "metal", target_os = "macos"))]
+mod metal_quant_leaf {
+    use super::*;
+    use ferrum_kernels::backend::metal::MetalBackend;
+    use ferrum_kernels::backend::GgufQuantType;
+    use ferrum_quantization::QuantLinear;
+
+    fn assert_complete_leaf_output(dtype: GgmlDType, kind: GgufQuantType, m: usize) {
+        let n = 64;
+        let k = 256;
+        let original_weights: Vec<f32> = (0..n * k)
+            .map(|index| {
+                let row = index / k;
+                let col = index % k;
+                ((col * 13 + row * 17) % 63) as f32 / 32.0 - 31.0 / 32.0
+            })
+            .collect();
+        let tensor = Tensor::from_vec(original_weights, (n, k), &Device::Cpu).unwrap();
+        let quantized = QTensor::quantize(&tensor, dtype).unwrap();
+        let reference_weights = quantized
+            .dequantize(&Device::Cpu)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        let bytes = quantized.data().unwrap();
+        // Unlike GgufLinear's dense reference path, this constructor preserves
+        // the packed leaf and reaches metal_gemm_quant_dispatch directly.
+        let mut context = MetalBackend::new_context(&Default::default()).expect("backend context");
+        let linear = QuantLinear::<MetalBackend>::from_gguf_bytes_in_context(
+            &mut context,
+            kind,
+            &bytes,
+            n,
+            k,
+        )
+        .expect("the selected Metal device must load the packed quantized leaf");
+        assert_eq!(linear.in_features(), k);
+        assert_eq!(linear.out_features(), n);
+        let input: Vec<f32> = (0..m * k)
+            .map(|index| {
+                let row = index / k;
+                let col = index % k;
+                ((col * 7 + row * 11) % 29) as f32 / 64.0 - 14.0 / 64.0
+            })
+            .collect();
+        let input_buffer = MetalBackend::from_slice_in_context(&mut context, &input);
+        let mut output_buffer =
+            MetalBackend::from_slice_in_context(&mut context, &vec![f32::NAN; m * n]);
+        // No unavailable-device early return: selecting these tests requires
+        // a real Metal device and successful completion of its actual work.
+        linear.forward(&mut context, &input_buffer, &mut output_buffer, m);
+        MetalBackend::sync_checked(&mut context)
+            .expect("packed quantized leaf must complete real Metal work");
+        let actual = MetalBackend::to_vec_in_context(&mut context, &output_buffer, m * n);
+        assert_eq!(actual.len(), m * n);
+        for row in 0..m {
+            for column in 0..n {
+                let mut expected = 0.0_f64;
+                let mut absolute_products = 0.0_f64;
+                for inner in 0..k {
+                    let product = f64::from(input[row * k + inner])
+                        * f64::from(reference_weights[column * k + inner]);
+                    expected += product;
+                    absolute_products += product.abs();
+                }
+                // M=1 reduces in FP32; M>1 uses the existing half-precision
+                // dequant/operand tiles. Bound cancellation error by the
+                // absolute dot products, independently of the device result.
+                let roundoff = if m == 1 { 2e-5 } else { 2e-3 };
+                let tolerance = roundoff * (1.0 + absolute_products);
+                let got = f64::from(actual[row * n + column]);
+                assert!(
+                    got.is_finite() && (got - expected).abs() <= tolerance,
+                    "{dtype:?} M={m} row={row} column={column}: {got} != {expected}, tolerance={tolerance}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn metal_quant_leaf_q4k_m1_matches_independent_oracle() {
+        assert_complete_leaf_output(GgmlDType::Q4K, GgufQuantType::Q4K, 1);
+    }
+
+    #[test]
+    fn metal_quant_leaf_q4k_m4_matches_independent_oracle() {
+        assert_complete_leaf_output(GgmlDType::Q4K, GgufQuantType::Q4K, 4);
+    }
+
+    #[test]
+    fn metal_quant_leaf_q6k_m1_matches_independent_oracle() {
+        assert_complete_leaf_output(GgmlDType::Q6K, GgufQuantType::Q6K, 1);
+    }
+
+    #[test]
+    fn metal_quant_leaf_q6k_m4_matches_independent_oracle() {
+        assert_complete_leaf_output(GgmlDType::Q6K, GgufQuantType::Q6K, 4);
+    }
 }

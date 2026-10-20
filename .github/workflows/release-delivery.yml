@@ -239,6 +239,27 @@ jobs:
 
           Linux/WSL gains an automatically selected SM120 package built with CUDA 12.8 and the production feature set. The SM89 package uses CUDA 12.4; both require compatible driver/runtime libraries. Windows and Homebrew CUDA coverage remains SM89.
           NOTES_013
+          elif [ "$version" = 0.14.0 ]; then
+            cat >> "$RUNNER_TEMP/release-notes.md" <<'NOTES_014'
+
+          ## 0.14.0: unified execution architecture
+
+          Text generation through `ferrum run` and `ferrum serve` now uses one token execution protocol, with separate runtime, execution, output and observability responsibilities. Cancellation and shutdown retain the original resource owners until cleanup is confirmed. Classic Marlin's SM120 compilation is corrected in the updated pinned native package.
+
+          ### Breaking changes
+
+          - Remove embedding, ASR and TTS product paths: `embed`, `transcribe`, `tts`, `/v1/embeddings`, `/v1/audio/transcriptions` and `/v1/audio/speech`.
+          - Move Rust runtime contracts to `ferrum_runtime` and execution contracts to `ferrum_execution`; output, custom-executor and shutdown APIs change. Removed `vnext` paths have no compatibility aliases.
+          - Retire the old CPU MoE implementation, standalone schedulers, simulated pipeline executors, experimental speculative decoding and unsafe whole-prompt cache APIs. Real layer splitting, chunked prefill and typed checkpoint/restore remain within their documented capability limits.
+
+          See the [architecture migration](https://github.com/sizzlecar/ferrum-infer-rs/pull/441).
+
+          ### Scope and known limitations
+
+          This version provides execution facts and a reference estimator/admission loop for future joint throughput and latency-SLO optimization; it does not claim SLO compliance. README throughput comparisons remain historical 0.13 results. Batch layouts can change generated output. Dual physical-GPU execution remains untested, and Metal timing counters can intermittently fail allocation. Model, precision and backend qualification remains limited to the recorded configurations; release-package and public-install checks are separate from development measurements.
+
+          Metal C4 tail-latency qualification remains unresolved: TPOT P99 rose 21.44% in one pair and TTFT P99 18.92% in the reverse pair (10% budget). All four repetitions pooled are within budget; this release retains and discloses both failures as a known limitation.
+          NOTES_014
           fi
           printf '\n## CPU compatibility scope\n\nRequired load and basic run/serve representatives:\n' >> "$RUNNER_TEMP/release-notes.md"
           jq -r '.model_tasks.runs[] | select(.profile.target.backend == "cpu") | "- " + .profile.id + ": " + .profile.model' "$RUNNER_TEMP/release-plan.json" >> "$RUNNER_TEMP/release-notes.md"

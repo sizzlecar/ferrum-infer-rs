@@ -122,7 +122,7 @@ impl OpUnderTest for MetalContextOp {
         let mut output = Vec::with_capacity(self.expected_output_len().unwrap());
         for (index, _) in SUBMISSION_PHASES.iter().enumerate() {
             let mut buffers = self.buffers::<CpuBackend>(seed.wrapping_add(index as u64 * 2));
-            let mut ctx = CpuBackend::new_context();
+            let mut ctx = CpuBackend::new_context(&Default::default()).expect("backend context");
             self.enqueue::<CpuBackend>(&mut ctx, &mut buffers);
             CpuBackend::sync(&mut ctx);
             output.extend(CpuBackend::to_vec(&buffers.output, len));
@@ -136,14 +136,14 @@ impl OpUnderTest for MetalContextOp {
         let len = self.segment_len().expect("valid context shape");
         let mut output = Vec::with_capacity(self.expected_output_len().unwrap());
         let mut first = self.buffers::<MetalBackend>(seed);
-        let mut ctx = MetalBackend::new_context();
+        let mut ctx = MetalBackend::new_context(&Default::default()).expect("backend context");
         self.enqueue::<MetalBackend>(&mut ctx, &mut first);
         MetalBackend::sync_checked(&mut ctx).expect("initial chain Metal completion");
         output.extend(MetalBackend::to_vec(&first.output, len));
 
         let mut reused = self.buffers::<MetalBackend>(seed.wrapping_add(2));
         let mut independent = self.buffers::<MetalBackend>(seed.wrapping_add(4));
-        let mut peer = MetalBackend::new_context();
+        let mut peer = MetalBackend::new_context(&Default::default()).expect("backend context");
         self.enqueue::<MetalBackend>(&mut ctx, &mut reused);
         self.enqueue::<MetalBackend>(&mut peer, &mut independent);
         // Submit the independently recorded context first: the reused context
@@ -155,7 +155,8 @@ impl OpUnderTest for MetalContextOp {
 
         let mut dropped = self.buffers::<MetalBackend>(seed.wrapping_add(6));
         {
-            let mut pending = MetalBackend::new_context();
+            let mut pending =
+                MetalBackend::new_context(&Default::default()).expect("backend context");
             self.enqueue::<MetalBackend>(&mut pending, &mut dropped);
             // Production Drop flushes and waits. Its API returns no driver
             // status; this segment asserts the actual post-Drop data only.

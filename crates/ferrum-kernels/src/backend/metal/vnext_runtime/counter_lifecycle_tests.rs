@@ -43,29 +43,6 @@ fn probe_runtime() -> MetalDeviceRuntime {
     .expect("Metal runtime")
 }
 
-fn objective_c_error(error: *mut Object) -> serde_json::Value {
-    if error.is_null() {
-        return serde_json::Value::Null;
-    }
-    unsafe {
-        let domain: *mut Object = msg_send![error, domain];
-        let description: *mut Object = msg_send![error, localizedDescription];
-        let code: metal::NSInteger = msg_send![error, code];
-        let owned_text = |object: *mut Object| {
-            if object.is_null() {
-                return None;
-            }
-            let text: *const std::ffi::c_char = msg_send![object, UTF8String];
-            (!text.is_null()).then(|| CStr::from_ptr(text).to_string_lossy().into_owned())
-        };
-        serde_json::json!({
-            "domain": owned_text(domain),
-            "code": code,
-            "description": owned_text(description),
-        })
-    }
-}
-
 /// An extra, clearly identified allocation after the first observed failure.
 /// It captures NSError without changing production measurement handling.
 fn probe_counter_creation(runtime: &MetalDeviceRuntime) -> serde_json::Value {
@@ -86,7 +63,7 @@ fn probe_counter_creation(runtime: &MetalDeviceRuntime) -> serde_json::Value {
         ]
     };
     let allocated = !pointer.is_null();
-    let error = objective_c_error(error);
+    let error = super::counter_diagnostic::objective_c_error(error);
     if allocated {
         // new returns an owned reference. Do not retain it a second time.
         drop(unsafe { CounterSampleBuffer::from_ptr(pointer) });

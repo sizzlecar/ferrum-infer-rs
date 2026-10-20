@@ -15,13 +15,13 @@ fn registry() -> ServedModelRegistry {
 }
 
 #[test]
-fn lora_registration_requires_execution_support_not_metrics_or_resource_authority() {
-    for resource_authority in [
-        ExecutionResourceAuthority::LegacyEngine,
-        ExecutionResourceAuthority::PlanRuntime,
+fn lora_registration_requires_execution_support_not_metrics_or_planning_model() {
+    for planning_model in [
+        ExecutionPlanningModel::ExecutorManaged,
+        ExecutionPlanningModel::CompiledPlan,
     ] {
         let engine = StubLlm {
-            resource_authority,
+            planning_model,
             ..StubLlm::with_lora_metrics("ok", json!({"enabled": true, "adapter_count": 1}))
         };
         let result = AxumServer::from_llm(Arc::new(engine))
@@ -74,7 +74,8 @@ async fn injected_lora_alias_cannot_fall_through_to_base_inference() {
     let engine = Arc::new(CapturingLlm::new());
     let router = AxumServer::from_llm(engine.clone())
         .with_served_model_registry(registry())
-        .build_router();
+        .build_router()
+        .unwrap();
     for stream in [false, true] {
         for (path, body) in [
             (

@@ -1880,6 +1880,9 @@ fn benchmark_cell_id(index: usize, cell: Cell) -> String {
 
 pub async fn execute(cmd: BenchServeCommand, _cfg: CliConfig) -> Result<()> {
     validate_command(&cmd)?;
+    if sharegpt::export_pool_if_requested(&cmd)? {
+        return Ok(());
+    }
     let prepared_sharegpt = sharegpt::prepare(&cmd)?;
     let banner = if cmd.scenario == BenchServeWorkload::DecodeIsolation {
         format!(
@@ -1956,9 +1959,6 @@ fn emit_then_enforce_error_policy(cmd: &BenchServeCommand, reports: &[BenchRepor
     // Emit final report before enforcing error policy so failed release cells
     // still leave quality/error-count evidence in --out artifacts.
     emit_reports(cmd, reports)?;
-
-    // PLAYBOOK § 1.5: static globals don't drop on Rust process exit.
-    ferrum_bench_core::trace::flush_global_trace();
 
     enforce_error_policy(cmd, reports)?;
     if cmd.latency_slo_fail_on_violation

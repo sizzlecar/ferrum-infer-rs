@@ -899,7 +899,10 @@ fn handoff(
 ) -> Arc<PlanRuntimeResources<TestRuntime>> {
     match initialized.into_plan_runtime() {
         Ok(resources) => resources,
-        Err(failure) => panic!("plan runtime handoff failed: {}", failure.error()),
+        Err(failure) => panic!(
+            "plan runtime handoff failed: {}",
+            failure.failure().message()
+        ),
     }
 }
 
@@ -1160,7 +1163,10 @@ fn required_static_transforms_preserve_sources_destinations_and_reuse_maximum_sc
     let expected_static_resources = plan.payload().memory().static_allocations().len();
     let resources = match initialized.into_plan_runtime() {
         Ok(resources) => resources,
-        Err(failure) => panic!("transform plan runtime handoff failed: {}", failure.error()),
+        Err(failure) => panic!(
+            "transform plan runtime handoff failed: {}",
+            failure.failure().message()
+        ),
     };
     close_transform(resources, expected_static_resources);
 }

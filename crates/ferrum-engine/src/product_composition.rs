@@ -5,12 +5,12 @@
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
+use ferrum_execution::{
+    CompiledProgram, ProgramCompilationError, ProgramExecutor, ProgramExecutorConfig,
+    RuntimeComposition,
+};
 use ferrum_models::vnext::{
     DefinedProductionModel, PreparedProductionModel, ProductionModelFamilyRegistry,
-};
-use ferrum_models::{
-    VNextCompiledModel, VNextExecutorConfig, VNextModelCompilationError, VNextModelExecutor,
-    VNextRuntimeComposition,
 };
 use ferrum_runtime::{
     CapabilityCatalog, ContractVersion, DeviceRuntime, EngineSelection, ExecutablePlanView,
@@ -51,7 +51,7 @@ pub(crate) fn cuda_attention_policy_for_kv(
     }
 }
 
-pub(crate) fn create_vnext_executor<R: DeviceRuntime>(
+pub(crate) fn create_program_executor<R: DeviceRuntime>(
     engine: &EngineConfig,
     defined: &DefinedProductionModel,
     runtime: Arc<R>,
@@ -64,9 +64,9 @@ pub(crate) fn create_vnext_executor<R: DeviceRuntime>(
         WeightMaterializerSelection,
         ferrum_runtime::VNextError,
     >,
-    q8_predecoded_composition: Option<&mut dyn FnMut() -> Result<VNextRuntimeComposition<R>>>,
-) -> Result<VNextModelExecutor<R>> {
-    create_vnext_executor_with_configuration(
+    q8_predecoded_composition: Option<&mut dyn FnMut() -> Result<RuntimeComposition<R>>>,
+) -> ferrum_execution::ExecutorBuildResult<ProgramExecutor<R>> {
+    create_program_executor_with_configuration(
         engine,
         defined,
         runtime,
@@ -75,12 +75,12 @@ pub(crate) fn create_vnext_executor<R: DeviceRuntime>(
         catalog,
         select_materializer,
         q8_predecoded_composition,
-        |engine, info, runtime| VNextExecutorConfig::from_engine_config(engine, info, runtime),
+        |engine, info, runtime| ProgramExecutorConfig::from_engine_config(engine, info, runtime),
     )
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn create_vnext_executor_with_configuration<R: DeviceRuntime>(
+pub(crate) fn create_program_executor_with_configuration<R: DeviceRuntime>(
     engine: &EngineConfig,
     defined: &DefinedProductionModel,
     runtime: Arc<R>,
@@ -93,13 +93,13 @@ pub(crate) fn create_vnext_executor_with_configuration<R: DeviceRuntime>(
         WeightMaterializerSelection,
         ferrum_runtime::VNextError,
     >,
-    mut q8_predecoded_composition: Option<&mut dyn FnMut() -> Result<VNextRuntimeComposition<R>>>,
-    executor_config: impl Fn(&EngineConfig, &ModelInfo, &R) -> Result<VNextExecutorConfig>,
-) -> Result<VNextModelExecutor<R>> {
+    mut q8_predecoded_composition: Option<&mut dyn FnMut() -> Result<RuntimeComposition<R>>>,
+    executor_config: impl Fn(&EngineConfig, &ModelInfo, &R) -> Result<ProgramExecutorConfig>,
+) -> ferrum_execution::ExecutorBuildResult<ProgramExecutor<R>> {
     let requested_kv_storage = ferrum_types::KvStorageFormat::try_from(engine.kv_cache.dtype)
         .map_err(FerrumError::config)?;
     let composition =
-        VNextRuntimeComposition::new(runtime, operation_registry, weight_materializers, catalog);
+        RuntimeComposition::new(runtime, operation_registry, weight_materializers, catalog);
     let candidates = defined
         .definition()
         .numerical_profiles()
@@ -129,35 +129,35 @@ pub(crate) fn create_vnext_executor_with_configuration<R: DeviceRuntime>(
         {
             return Err(FerrumError::unsupported(
                 "predecoded-f32 Q8 projection weights require a selected supported upstream causal or GDN numerical route",
-            ));
+            ).into());
         }
         if engine.runtime.q4_mmvq_weight_decode == ferrum_types::Q4MmvqWeightDecode::SharedM8
             && !profile_has_shared_m8_q4_route(profile)
         {
             return Err(FerrumError::unsupported(
                 "shared-m8 Q4 weight decode requires a selected causal or GDN numerical profile declaring Q4_K Columns M8 MarkerV2 MMVQ; select an appropriate explicit numerical profile",
-            ));
+            ).into());
         }
         if engine.runtime.q5_mmvq_weight_decode == ferrum_types::Q5MmvqWeightDecode::SharedM8
             && !profile_has_shared_m8_q5_route(profile)
         {
             return Err(FerrumError::unsupported(
                 "shared-m8 Q5 weight decode requires a selected causal or GDN numerical profile declaring Q5_K Columns M8 MarkerV2 MMVQ; select an appropriate explicit numerical profile",
-            ));
+            ).into());
         }
         if engine.runtime.q4_mmvq_weight_decode == ferrum_types::Q4MmvqWeightDecode::SharedM4M8
             && !profile_has_shared_m4_m8_route(profile, ferrum_runtime::ProjectionBlockFormat::Q4K)
         {
             return Err(FerrumError::unsupported(
                 "shared-m4-m8 Q4 weight decode requires a selected causal, GDN or SwiGLU numerical profile declaring Q4_K Columns M4 or M8 MarkerV2 MMVQ",
-            ));
+            ).into());
         }
         if engine.runtime.q5_mmvq_weight_decode == ferrum_types::Q5MmvqWeightDecode::SharedM4M8
             && !profile_has_shared_m4_m8_route(profile, ferrum_runtime::ProjectionBlockFormat::Q5K)
         {
             return Err(FerrumError::unsupported(
                 "shared-m4-m8 Q5 weight decode requires a selected causal, GDN or SwiGLU numerical profile declaring Q5_K Columns M4 or M8 MarkerV2 MMVQ",
-            ));
+            ).into());
         }
         let prepared = match defined.prepare(&profile.id) {
             Ok(prepared) => prepared,
@@ -205,7 +205,7 @@ pub(crate) fn create_vnext_executor_with_configuration<R: DeviceRuntime>(
             }
         };
         let compiled = match composition.compile_model(
-            &prepared,
+            prepared.execution_input()?,
             model_info.clone(),
             &selected_engine,
             config,
@@ -254,7 +254,7 @@ pub(crate) fn create_vnext_executor_with_configuration<R: DeviceRuntime>(
                 drop(compiled);
                 let config = executor_config(&selected_engine, &model_info, composition.runtime())?;
                 composition.compile_model(
-                    &prepared,
+                    prepared.execution_input()?,
                     model_info.clone(),
                     &selected_engine,
                     config,
@@ -299,7 +299,7 @@ pub(crate) fn create_vnext_executor_with_configuration<R: DeviceRuntime>(
         } else {
             compiled
         };
-        let initialize = |compiled: VNextCompiledModel<'_, R>, selected_engine: &EngineConfig| {
+        let initialize = |compiled: CompiledProgram<'_, R>, selected_engine: &EngineConfig| {
             tracing::info!(requested_numerical_policy = ?engine.numerical_execution,
             requested_kv_dtype = engine.kv_cache.dtype.as_str(),
             kv_storage = ?requested_kv_storage,
@@ -308,7 +308,7 @@ pub(crate) fn create_vnext_executor_with_configuration<R: DeviceRuntime>(
             q8_preparation_requested = engine.runtime.q8_projection_weight_preparation.as_runtime_value(),
             q8_preparation_selected = selected_engine.runtime.q8_projection_weight_preparation.as_runtime_value(),
             "Selected numerical profile using the complete static program");
-            compiled.initialize(|prepared, runtime, catalog, compilation| {
+            compiled.initialize(|runtime, catalog, compilation| {
                 let numerical_execution = NumericalProfileResolution::from_static_plan(
                     selected_engine.numerical_execution.clone(),
                     requested_kv_storage,
@@ -322,7 +322,7 @@ pub(crate) fn create_vnext_executor_with_configuration<R: DeviceRuntime>(
                 .map_err(|error| FerrumError::model(error.to_string()))?;
                 resolve_model_plan(
                     selected_engine,
-                    prepared,
+                    &prepared,
                     catalog,
                     runtime,
                     compilation,
@@ -351,7 +351,7 @@ pub(crate) fn create_vnext_executor_with_configuration<R: DeviceRuntime>(
                 optional_composition.runtime(),
             )?;
             match optional_composition.compile_model(
-                &prepared,
+                prepared.execution_input()?,
                 model_info.clone(),
                 &optional_engine,
                 config,
@@ -405,7 +405,7 @@ pub(crate) fn create_vnext_executor_with_configuration<R: DeviceRuntime>(
                     }
                     drop(optional);
                 }
-                Err(VNextModelCompilationError::Capacity {
+                Err(ProgramCompilationError::Capacity {
                     required_bytes,
                     usable_capacity_bytes,
                 }) => {
@@ -431,7 +431,8 @@ pub(crate) fn create_vnext_executor_with_configuration<R: DeviceRuntime>(
             ))
             .collect::<Vec<_>>()
             .join("; ")
-    )))
+    ))
+    .into())
 }
 
 fn q8_auto_preparation_eligible(
@@ -1127,6 +1128,210 @@ const fn decision_source_name(source: ResolutionDecisionSource) -> &'static str 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn prepared_execution_fixture() -> (
+        std::path::PathBuf,
+        DefinedProductionModel,
+        PreparedProductionModel,
+        EngineConfig,
+    ) {
+        let directory = crate::registry::tests::write_qwen35_fixture_model_dir();
+        std::fs::write(directory.join("tokenizer.json"), br#"{"version":"1.0"}"#).unwrap();
+        std::fs::write(directory.join("tokenizer_config.json"), br#"{"chat_template":"{% for message in messages %}{{ message['content'] }}{% endfor %}","eos_token_id":2,"unk_token":"<unk>"}"#).unwrap();
+        let defined = ferrum_models::vnext::qwen35::define_from_model_dir(&directory).unwrap();
+        let mut engine = EngineConfig::default();
+        engine.backend.device = ferrum_types::Device::CPU;
+        engine.scheduler.max_running_requests = 4;
+        engine.batching.max_num_batched_tokens = 8;
+        engine.backend.enable_reusable_execution = false;
+        let profile = defined
+            .definition()
+            .numerical_profiles()
+            .candidates(
+                &engine.numerical_execution,
+                ferrum_types::KvStorageFormat::F16,
+            )
+            .unwrap()[0]
+            .id
+            .clone();
+        let prepared = defined.prepare(&profile).unwrap();
+        (directory, defined, prepared, engine)
+    }
+
+    #[test]
+    fn prepared_execution_composition_rejects_foreign_sources_before_allocation() {
+        use ferrum_kernels::backend::cpu::vnext_ops::CpuVNextComposition;
+        let (directory_a, defined_a, prepared_a, engine) = prepared_execution_fixture();
+        let (directory_b, defined_b, prepared_b, _) = prepared_execution_fixture();
+        assert_eq!(prepared_a.family(), prepared_b.family());
+        assert_ne!(
+            prepared_a.sources().resolved_sources(),
+            prepared_b.sources().resolved_sources()
+        );
+        let (runtime, operations, materializers, materializer, catalog) =
+            CpuVNextComposition::create(
+                ferrum_runtime::DeviceId::new("device.cpu.prepared-source-binding").unwrap(),
+                16 * 1024 * 1024,
+            )
+            .unwrap()
+            .into_parts()
+            .unwrap();
+        let composition =
+            RuntimeComposition::new(Arc::clone(&runtime), operations, materializers, catalog);
+        let info = prepared_a.model_info(engine.model.model_id.clone(), ferrum_types::Device::CPU);
+        let config =
+            ProgramExecutorConfig::from_engine_config(&engine, &info, runtime.as_ref()).unwrap();
+        let compiled = composition
+            .compile_model(
+                prepared_a.execution_input().unwrap(),
+                info.clone(),
+                &engine,
+                config,
+                WeightMaterializerSelection::exact(materializer.clone()),
+            )
+            .unwrap();
+        assert!(std::ptr::eq(
+            compiled.prepared().weights(),
+            prepared_a.weights()
+        ));
+        assert_eq!(runtime.peak_resident_bytes(), 0);
+        let mut foreign_plan_was_valid = false;
+        let error = compiled
+            .initialize(|policy, catalog, compilation| {
+                let numerical = NumericalProfileResolution::from_static_plan(
+                    engine.numerical_execution.clone(),
+                    ferrum_types::KvStorageFormat::F16,
+                    defined_b.definition(),
+                    prepared_b.family(),
+                    catalog,
+                    policy,
+                    compilation.executable().execution_plan(),
+                    vec![],
+                )
+                .map_err(|error| FerrumError::model(error.to_string()))?;
+                let resolved = resolve_model_plan(
+                    &engine,
+                    &prepared_b,
+                    catalog,
+                    policy,
+                    compilation,
+                    &numerical,
+                )?;
+                assert_eq!(
+                    resolved.execution_plan(),
+                    compilation.executable().execution_plan()
+                );
+                foreign_plan_was_valid = true;
+                Ok(resolved)
+            })
+            .expect_err("an otherwise-valid plan cannot substitute another source bundle");
+        assert!(
+            foreign_plan_was_valid,
+            "the test must reach retained-input validation"
+        );
+        assert_eq!(
+            runtime.peak_resident_bytes(),
+            0,
+            "source mismatch must precede static allocation/upload"
+        );
+        let FerrumError::Model { message } = error.cause() else {
+            panic!("wrong source-binding error: {error:?}");
+        };
+        assert!(
+            message.contains("different original model sources"),
+            "{message}"
+        );
+
+        // The same actual composition can initialize the retained source. No
+        // fixture-only validation function substitutes for real static upload.
+        let config =
+            ProgramExecutorConfig::from_engine_config(&engine, &info, runtime.as_ref()).unwrap();
+        let compiled = composition
+            .compile_model(
+                prepared_a.execution_input().unwrap(),
+                info,
+                &engine,
+                config,
+                WeightMaterializerSelection::exact(materializer),
+            )
+            .unwrap();
+        assert!(std::ptr::eq(
+            compiled.prepared().weights(),
+            prepared_a.weights()
+        ));
+        let executor = compiled
+            .initialize(|policy, catalog, compilation| {
+                let numerical = NumericalProfileResolution::from_static_plan(
+                    engine.numerical_execution.clone(),
+                    ferrum_types::KvStorageFormat::F16,
+                    defined_a.definition(),
+                    prepared_a.family(),
+                    catalog,
+                    policy,
+                    compilation.executable().execution_plan(),
+                    vec![],
+                )
+                .map_err(|error| FerrumError::model(error.to_string()))?;
+                resolve_model_plan(
+                    &engine,
+                    &prepared_a,
+                    catalog,
+                    policy,
+                    compilation,
+                    &numerical,
+                )
+            })
+            .unwrap();
+        assert_eq!(
+            executor.resolved_plan().parts().resolved_sources,
+            *prepared_a.sources().resolved_sources()
+        );
+        assert!(
+            runtime.peak_resident_bytes() > 0,
+            "matching source must reach actual static initialization"
+        );
+        drop(executor);
+        std::fs::remove_dir_all(directory_a).unwrap();
+        std::fs::remove_dir_all(directory_b).unwrap();
+    }
+
+    #[test]
+    fn prepared_execution_composition_rejects_info_geometry_before_allocation() {
+        use ferrum_kernels::backend::cpu::vnext_ops::CpuVNextComposition;
+        let (directory, _, prepared, engine) = prepared_execution_fixture();
+        let (runtime, operations, materializers, materializer, catalog) =
+            CpuVNextComposition::create(
+                ferrum_runtime::DeviceId::new("device.cpu.prepared-info-binding").unwrap(),
+                16 * 1024 * 1024,
+            )
+            .unwrap()
+            .into_parts()
+            .unwrap();
+        let composition =
+            RuntimeComposition::new(Arc::clone(&runtime), operations, materializers, catalog);
+        let mut info =
+            prepared.model_info(engine.model.model_id.clone(), ferrum_types::Device::CPU);
+        let config =
+            ProgramExecutorConfig::from_engine_config(&engine, &info, runtime.as_ref()).unwrap();
+        info.hidden_size += 1;
+        let error = composition
+            .compile_model(
+                prepared.execution_input().unwrap(),
+                info,
+                &engine,
+                config,
+                WeightMaterializerSelection::exact(materializer),
+            )
+            .err()
+            .expect("reported geometry must match the retained model before compilation");
+        let error = FerrumError::from(error);
+        let FerrumError::Model { message } = &error else {
+            panic!("wrong geometry error: {error:?}");
+        };
+        assert!(message.contains("ModelInfo.hidden_size"), "{message}");
+        assert_eq!(runtime.peak_resident_bytes(), 0);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
 
     fn q6_auto_profile() -> ferrum_runtime::NumericalExecutionProfile {
         use ferrum_runtime::{

@@ -92,12 +92,17 @@ fn moe_pair_id_align_is_bitwise_stable_and_matches_reference() {
         reference_align(&expert_ids_host, NUM_EXPERTS, BLOCK_SIZE);
 
     // GPU side
-    let mut ctx = <ferrum_kernels::backend::cuda::CudaBackend as Backend>::new_context();
+    let mut ctx = <ferrum_kernels::backend::cuda::CudaBackend as Backend>::new_context(
+        &ferrum_types::BackendContextConfig::default(),
+    )
+    .unwrap();
     // upload expert_ids as i32 buffer (use alloc_u32 + write_u32)
-    let mut expert_ids_dev = <ferrum_kernels::backend::cuda::CudaBackend as Backend>::alloc_typed(
-        ferrum_kernels::backend::Dtype::U32,
-        n_pairs,
-    );
+    let mut expert_ids_dev =
+        <ferrum_kernels::backend::cuda::CudaBackend as Backend>::alloc_typed_in_context(
+            &mut ctx,
+            ferrum_kernels::backend::Dtype::U32,
+            n_pairs,
+        );
     let expert_ids_u32: Vec<u32> = expert_ids_host.iter().map(|&v| v as u32).collect();
     <ferrum_kernels::backend::cuda::CudaBackend as Backend>::write_typed::<u32>(
         &mut ctx,
@@ -105,18 +110,24 @@ fn moe_pair_id_align_is_bitwise_stable_and_matches_reference() {
         &expert_ids_u32,
     );
 
-    let mut sorted_dev = <ferrum_kernels::backend::cuda::CudaBackend as Backend>::alloc_typed(
-        ferrum_kernels::backend::Dtype::U32,
-        sorted_max,
-    );
-    let mut block_ids_dev = <ferrum_kernels::backend::cuda::CudaBackend as Backend>::alloc_typed(
-        ferrum_kernels::backend::Dtype::U32,
-        sorted_max / BLOCK_SIZE,
-    );
-    let mut total_dev = <ferrum_kernels::backend::cuda::CudaBackend as Backend>::alloc_typed(
-        ferrum_kernels::backend::Dtype::U32,
-        1,
-    );
+    let mut sorted_dev =
+        <ferrum_kernels::backend::cuda::CudaBackend as Backend>::alloc_typed_in_context(
+            &mut ctx,
+            ferrum_kernels::backend::Dtype::U32,
+            sorted_max,
+        );
+    let mut block_ids_dev =
+        <ferrum_kernels::backend::cuda::CudaBackend as Backend>::alloc_typed_in_context(
+            &mut ctx,
+            ferrum_kernels::backend::Dtype::U32,
+            sorted_max / BLOCK_SIZE,
+        );
+    let mut total_dev =
+        <ferrum_kernels::backend::cuda::CudaBackend as Backend>::alloc_typed_in_context(
+            &mut ctx,
+            ferrum_kernels::backend::Dtype::U32,
+            1,
+        );
 
     let used = ref_total as usize;
     let total_blocks = used / BLOCK_SIZE;
@@ -139,7 +150,7 @@ fn moe_pair_id_align_is_bitwise_stable_and_matches_reference() {
             )
             .expect("moe_align_block_size_pair_ids launch");
 
-        let stream = ctx.stream.clone();
+        let stream = sorted_dev.as_u32().stream().clone();
         let sorted_view = unsafe {
             sorted_dev
                 .transmute::<i32>(sorted_max)

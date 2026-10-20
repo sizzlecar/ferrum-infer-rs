@@ -5,8 +5,8 @@
 
 #![cfg(all(target_os = "macos", feature = "metal"))]
 
+use crate::attention::metal::pipelines::MetalPipelines;
 use std::ffi::c_void;
-use std::sync::OnceLock;
 
 use metal::{
     Buffer, CompileOptions, ComputeCommandEncoderRef, ComputePipelineState, Device, MTLSize,
@@ -15,25 +15,21 @@ use metal::{
 const SHADER_SRC: &str = include_str!("q6_k_moe_id_gemm.metal");
 const KERNEL_NAME: &str = "gemm_q6kw_moe_id_f32";
 
-static PIPELINE: OnceLock<ComputePipelineState> = OnceLock::new();
-
-fn pipeline(device: &Device) -> &'static ComputePipelineState {
-    PIPELINE.get_or_init(|| {
-        let lib = device
-            .new_library_with_source(SHADER_SRC, &CompileOptions::new())
-            .expect("compile q6_k_moe_id_gemm.metal");
-        let function = lib
-            .get_function(KERNEL_NAME, None)
-            .expect("find gemm_q6kw_moe_id_f32");
-        device
-            .new_compute_pipeline_state_with_function(&function)
-            .expect("build gemm_q6kw_moe_id_f32 pipeline")
-    })
+pub(crate) fn build_pipeline(device: &Device) -> ComputePipelineState {
+    let lib = device
+        .new_library_with_source(SHADER_SRC, &CompileOptions::new())
+        .expect("compile q6_k_moe_id_gemm.metal");
+    let function = lib
+        .get_function(KERNEL_NAME, None)
+        .expect("find gemm_q6kw_moe_id_f32");
+    device
+        .new_compute_pipeline_state_with_function(&function)
+        .expect("build gemm_q6kw_moe_id_f32 pipeline")
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn dispatch_gemm_q6k_moe_id_on_encoder(
-    device: &Device,
+pub(crate) fn dispatch_gemm_q6k_moe_id_on_encoder(
+    pipes: &MetalPipelines,
     enc: &ComputeCommandEncoderRef,
     weights_stacked: &Buffer,
     weights_byte_offset: u64,
@@ -50,7 +46,7 @@ pub fn dispatch_gemm_q6k_moe_id_on_encoder(
     batch: usize,
 ) {
     dispatch_gemm_q6k_moe_id_inner(
-        device,
+        pipes,
         enc,
         weights_stacked,
         weights_byte_offset,
@@ -71,8 +67,8 @@ pub fn dispatch_gemm_q6k_moe_id_on_encoder(
 
 /// Indirect-dispatch variant — see `q4_k_moe_id_gemm` for the rationale.
 #[allow(clippy::too_many_arguments)]
-pub fn dispatch_gemm_q6k_moe_id_indirect_on_encoder(
-    device: &Device,
+pub(crate) fn dispatch_gemm_q6k_moe_id_indirect_on_encoder(
+    pipes: &MetalPipelines,
     enc: &ComputeCommandEncoderRef,
     weights_stacked: &Buffer,
     weights_byte_offset: u64,
@@ -90,7 +86,7 @@ pub fn dispatch_gemm_q6k_moe_id_indirect_on_encoder(
     batch: usize,
 ) {
     dispatch_gemm_q6k_moe_id_inner(
-        device,
+        pipes,
         enc,
         weights_stacked,
         weights_byte_offset,
@@ -111,7 +107,7 @@ pub fn dispatch_gemm_q6k_moe_id_indirect_on_encoder(
 
 #[allow(clippy::too_many_arguments)]
 fn dispatch_gemm_q6k_moe_id_inner(
-    device: &Device,
+    pipes: &MetalPipelines,
     enc: &ComputeCommandEncoderRef,
     weights_stacked: &Buffer,
     weights_byte_offset: u64,
@@ -131,7 +127,7 @@ fn dispatch_gemm_q6k_moe_id_inner(
     debug_assert!(k % 256 == 0);
     debug_assert!(m % 4 == 0);
 
-    let nb01_bytes = (k / 256) * crate::q6_k_gemv::Q6_K_BLOCK_BYTES;
+    let nb01_bytes = (k / 256) * crate::backend::metal::q6_k_gemv::Q6_K_BLOCK_BYTES;
     let nb02_bytes = m * nb01_bytes;
 
     #[repr(C)]
@@ -156,7 +152,7 @@ fn dispatch_gemm_q6k_moe_id_inner(
         batch: batch as i32,
     };
 
-    let pipe = pipeline(device);
+    let pipe = pipes.q6_k_moe_id_gemm_pipeline();
     enc.set_compute_pipeline_state(pipe);
     enc.set_buffer(0, Some(weights_stacked), weights_byte_offset);
     enc.set_buffer(1, Some(src1), 0);

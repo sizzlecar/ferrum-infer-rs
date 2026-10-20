@@ -9,32 +9,32 @@
 use crate::resource_lifecycle::{
     ResourceLedgerTransition, ResourceLifecycleLedger, ResourceOwnerCloseSummary,
 };
+use crate::IntoEngineExecutor;
 use async_trait::async_trait;
-use ferrum_bench_core::{
-    global_profile, profile_fields_from_json, JsonlJournal, JsonlJournalError,
+use ferrum_execution::execution_attempt::ExecutionAttemptObserver;
+use ferrum_execution::executor_lifecycle::{
+    ExecutorOwner, ExecutorScope, ExecutorShutdownObserver, ExecutorShutdownPhase,
 };
 use ferrum_execution::{
     model_executor::{
-        ExecutionResourceAuthority, ExecutorAdmissionEpochs, ExecutorCapacityWaitRegistration,
-        ExecutorExecutionCapacityDeferral, ExecutorExecutionCapacityPreemption,
+        ExecutionPlanningModel, ExecutorAdmissionEpochs, ExecutorCapacityWaitRegistration,
         ExecutorExecutionCapacityStage, ExecutorExecutionDeferral, ExecutorPrefillAdmission,
-        ExecutorPrefillAdmissionDecision, ExecutorPrefillAdmissionReceipt,
-        ExecutorPrefillMaintenanceDeferral, ExecutorPrefillMaintenanceOutcome,
-        ExecutorRequestOrigin, ExecutorRequestStateDeferral, ExecutorSamplingOutput,
-        ExecutorSequenceCompletion, GreedyRepetitionPenalty, KvSlotRequest, LogitsReturnPolicy,
-        PlanRuntimeBatchDecodeOutcome, PlanRuntimeBatchPrefillOutcome, PlanRuntimeDecodeInput,
-        PlanRuntimePrefillInput, PlanRuntimePrefillOutcome, PlanRuntimePrefillProduct,
-        TokenSelectionMask,
+        ExecutorPrefillAdmissionReceipt, ExecutorPrefillMaintenanceDeferral,
+        ExecutorPrefillMaintenanceOutcome, ExecutorRequestOrigin, ExecutorRequestStateDeferral,
+        ExecutorSamplingOutput, GreedyRepetitionPenalty, LogitsReturnPolicy, TokenSelectionMask,
     },
     ModelExecutor, ProductExecutionEventSink,
 };
 use ferrum_interfaces::{
     adapter::AdapterExecutionSupport,
     engine::{InferenceEngine, LlmInferenceEngine},
-    kv_cache::AllocationRequest,
     sampler::{SamplingConfig as TokenSamplingPlan, SamplingRng},
-    KvCacheHandle, KvCacheManager, RecurrentStateHandle, RecurrentStateManager, Sampler,
-    SchedulerInterface as Scheduler, TensorFactory, TensorRef, Tokenizer,
+    Sampler, SchedulerInterface as Scheduler, Tokenizer,
+};
+use ferrum_journal::{JsonlJournal, JsonlJournalError};
+use ferrum_output::{
+    semantic_cost, InferenceOutput, InferenceStream, OutputBudget, OutputChunk,
+    OutputSemanticLease, OutputSession,
 };
 use ferrum_runtime::{
     AdmissionDeferred, AdmissionRejected, BoundDeviceSubmissionAttribution,
@@ -47,25 +47,28 @@ use ferrum_runtime::{
     OperationCompletionReceipt,
 };
 use ferrum_sampler::structured_output::{StructuredOutputFactory, StructuredOutputProcessor};
+use ferrum_scheduler::cost_prediction::{CostSnapshotSource, TimePlanningRound};
+#[cfg(test)]
+use ferrum_scheduler::implementations::PressureYieldKind;
 use ferrum_scheduler::implementations::{
     ContinuousBatchScheduler, ExecutionCapacityAction, ExecutionCapacityReleaseSnapshot,
     ExecutionReadinessWake, ExecutorAdmissionProbeOutcome, ExecutorAdmissionQueueObservation,
     PressureYieldTransaction, RequestPhase,
 };
-#[cfg(test)]
-use ferrum_scheduler::implementations::{PressureTransitionKind, PressureYieldKind};
 use ferrum_scheduler::vnext::{
     AdmissionDeferral, AdmissionProbeOutcome, AdmissionWakeEpochs, AdmissionWakeSnapshot,
 };
+#[cfg(test)]
+use ferrum_types::Device;
 use ferrum_types::{
-    DataType, Device, EngineConfig, EngineDecodeStage, EngineDecodeStageInterval, EngineStatus,
+    EngineConfig, EngineDecodeStage, EngineDecodeStageInterval, EngineStatus,
     EngineTokenTimingEvidence, FerrumError, FerrumProfileEvent, FinishReason,
     InferenceExecutionEvidence, InferenceRequest, InferenceResponse, ObservabilityProfileDetail,
-    Priority, ProfileEntrypoint, ProfileError, ProfileEventKind, ProfileStatus, RequestId,
-    ResourceAction, ResourceTraceEvent, ResponseCompletionBoundary, Result, SamplingParams,
-    StreamChunk, TokenId, TokenUsage, DEFAULT_MAX_TOKENS_METADATA_KEY,
-    ENGINE_RUNTIME_TRACE_PRESET_HASH, OBSERVABILITY_PROFILE_SCHEMA_VERSION,
-    PROMPT_TOKENS_METADATA_KEY,
+    ProfileEntrypoint, ProfileError, ProfileEventKind, ProfileStatus, RequestId,
+    RequestIngressAnchor, RequestIngressBoundary, ResourceAction, ResourceTraceEvent,
+    ResponseCompletionBoundary, Result, SamplingParams, StreamChunk, TokenId, TokenUsage,
+    DEFAULT_MAX_TOKENS_METADATA_KEY, ENGINE_RUNTIME_TRACE_PRESET_HASH,
+    OBSERVABILITY_PROFILE_SCHEMA_VERSION, PROMPT_TOKENS_METADATA_KEY,
 };
 use futures::{stream::Stream, FutureExt};
 use metrics::{counter, gauge, histogram};
@@ -74,14 +77,13 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::future::Future;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::OnceLock;
 use std::sync::{Arc, Weak};
 use std::task::{Context, Poll};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, Notify, Semaphore};
 use tracing::{debug, info, warn};
 
@@ -97,12 +99,6 @@ const CHUNKED_PREFILL_ENV: &str = "FERRUM_CHUNKED_PREFILL";
 const KV_CAPACITY_ENV: &str = "FERRUM_KV_CAPACITY";
 #[cfg(test)]
 const MAX_MODEL_LEN_ENV: &str = "FERRUM_MAX_MODEL_LEN";
-#[cfg(test)]
-const NEXT_BATCH_PROF_ENV: &str = "FERRUM_NEXT_BATCH_PROF";
-#[cfg(test)]
-const RBD_PROF_ENV: &str = "FERRUM_RBD_PROF";
-#[cfg(test)]
-const UNIFIED_POST_PROF_ENV: &str = "FERRUM_UNIFIED_POST_PROF";
 const GENERATION_POLICY_SCAN_LIMIT: usize = 262_144;
 const FORBIDDEN_DECODE_RESAMPLE_LIMIT: usize = 64;
 const TOKEN_TRACE_PROMPT_PREFIX_LIMIT: usize = 64;
@@ -138,13 +134,10 @@ struct ContinuousEngineRuntimeConfig {
     chunked_prefill_size: Option<usize>,
     kv_capacity: Option<usize>,
     max_model_len: Option<usize>,
-    next_batch_prof: bool,
     profile_entrypoint: Option<ProfileEntrypoint>,
     profile_jsonl: Option<PathBuf>,
-    rbd_prof: bool,
     scheduler_trace_jsonl: Option<PathBuf>,
     legacy_scheduler_trace_jsonl: Option<PathBuf>,
-    unified_post_prof: bool,
 }
 
 impl ContinuousEngineRuntimeConfig {
@@ -160,13 +153,10 @@ impl ContinuousEngineRuntimeConfig {
             chunked_prefill_size: r.chunked_prefill_size,
             kv_capacity: r.kv_capacity,
             max_model_len: r.max_model_len,
-            next_batch_prof: r.next_batch_prof,
             profile_entrypoint: r.profile_entrypoint,
             profile_jsonl: r.profile_jsonl.clone(),
-            rbd_prof: r.rbd_prof,
             scheduler_trace_jsonl: r.scheduler_trace_jsonl.clone(),
             legacy_scheduler_trace_jsonl: r.legacy_scheduler_trace_jsonl.clone(),
-            unified_post_prof: r.unified_post_prof,
         }
     }
 
@@ -188,26 +178,19 @@ impl ContinuousEngineRuntimeConfig {
             chunked_prefill_size: parse_positive_usize_env(&vars, CHUNKED_PREFILL_ENV),
             kv_capacity: parse_positive_usize_env(&vars, KV_CAPACITY_ENV),
             max_model_len: parse_positive_usize_env(&vars, MAX_MODEL_LEN_ENV),
-            next_batch_prof: vars.contains_key(NEXT_BATCH_PROF_ENV),
             profile_entrypoint: vars
                 .get("FERRUM_PROFILE_ENTRYPOINT")
                 .and_then(|value| ProfileEntrypoint::parse(value)),
             profile_jsonl: vars
                 .get("FERRUM_PROFILE_JSONL")
                 .and_then(|value| ferrum_types::parse_path_env_value(value).ok()),
-            rbd_prof: vars.contains_key(RBD_PROF_ENV),
             scheduler_trace_jsonl: vars
                 .get("FERRUM_SCHEDULER_TRACE_JSONL")
                 .and_then(|value| ferrum_types::parse_path_env_value(value).ok()),
             legacy_scheduler_trace_jsonl: vars
                 .get("FERRUM_LEGACY_SCHEDULER_TRACE_JSONL")
                 .and_then(|value| ferrum_types::parse_path_env_value(value).ok()),
-            unified_post_prof: vars.contains_key(UNIFIED_POST_PROF_ENV),
         }
-    }
-
-    fn chunked_prefill_size_for(&self, num_tokens: usize) -> Option<usize> {
-        self.chunked_prefill_size.filter(|&n| n < num_tokens)
     }
 }
 
@@ -223,10 +206,9 @@ fn effective_request_context_capacity(
     runtime_config: &ContinuousEngineRuntimeConfig,
     executor_kv_capacity: Option<usize>,
 ) -> Option<usize> {
-    let kv_capacity = runtime_config
-        .kv_capacity
-        .or(executor_kv_capacity)
-        .or_else(|| (config.kv_cache.max_blocks > 0).then_some(config.kv_cache.max_blocks));
+    // Block counts describe a physical allocator, not a per-request token
+    // window. Only the declared token limit or original executor can supply it.
+    let kv_capacity = runtime_config.kv_capacity.or(executor_kv_capacity);
     let max_model_len = runtime_config.max_model_len.or_else(|| {
         config
             .model
@@ -1217,28 +1199,62 @@ fn token_id_tail(tokens: &[TokenId], limit: usize) -> Vec<u32> {
 }
 
 mod sequence;
+mod sequence_registry;
 pub use sequence::SequenceState;
 use sequence::*;
+use sequence_registry::{SequenceHandle, SequenceRegistry};
+mod execution_close;
+use execution_close::ExecutionCloseRegistry;
+mod journal_scopes;
+mod managed_driver;
+mod startup_failure;
+pub use journal_scopes::EngineJournalScopes;
+use journal_scopes::EngineJournals;
+use managed_driver::ManagedDriver;
+pub use managed_driver::{DriverExitReport, DriverJournalDelivery, DriverObserver};
 
 enum EngineIterationOutcome {
     Progressed,
-    Idle,
-    CapacityBlocked(ExecutorCapacityWaitRegistration),
+    Waiting {
+        capacity: Option<ExecutorCapacityWaitRegistration>,
+        retry_at: Option<Instant>,
+    },
 }
 
-enum EngineResourceComposition {
-    LegacyEngine {
-        kv_cache: Arc<dyn KvCacheManager + Send + Sync>,
-        recurrent_state_manager: Option<Arc<dyn RecurrentStateManager + Send + Sync>>,
-    },
-    PlanRuntime,
+pub(crate) fn validate_execution_feedback(
+    config: &EngineConfig,
+    observer: Option<&Arc<dyn ExecutionAttemptObserver>>,
+    source: Option<&Arc<dyn CostSnapshotSource>>,
+) -> Result<()> {
+    match config.scheduler.slo {
+        Some(policy) => {
+            policy.validate().map_err(FerrumError::config)?;
+            if observer.is_none() || source.is_none() {
+                return Err(FerrumError::config(
+                    "scheduler SLO policy requires an execution observer and cost snapshot source",
+                ));
+            }
+        }
+        None if source.is_some() => {
+            return Err(FerrumError::config(
+                "a cost snapshot source requires an enabled scheduler SLO policy",
+            ));
+        }
+        None => {}
+    }
+    Ok(())
 }
 
 const MAX_EXECUTION_READINESS_WAITERS: usize = 64;
 
+struct ExecutionReadinessWaitTarget {
+    request: Weak<SequenceHandle>,
+    sequence: ferrum_execution::token_execution::ExecutorSequence,
+}
+
 struct ExecutionReadinessWaitFailure {
     ticket_id: u64,
-    request_ids: Vec<RequestId>,
+    requests: Vec<ExecutionReadinessWaitTarget>,
     message: String,
 }
 
@@ -1273,7 +1289,7 @@ impl ExecutionReadinessWaitRegistry {
         &self,
         wake: ExecutionReadinessWake,
         wait: F,
-        request_ids: Vec<RequestId>,
+        requests: Vec<ExecutionReadinessWaitTarget>,
         work_notify: Arc<Notify>,
         slot: tokio::sync::OwnedSemaphorePermit,
     ) -> Result<()>
@@ -1287,7 +1303,7 @@ impl ExecutionReadinessWaitRegistry {
         if tasks.contains_key(&ticket_id) {
             failures.lock().push_back(ExecutionReadinessWaitFailure {
                 ticket_id,
-                request_ids,
+                requests,
                 message: format!("execution readiness ticket {ticket_id} was registered twice"),
             });
             wake.mark_failed();
@@ -1306,7 +1322,7 @@ impl ExecutionReadinessWaitRegistry {
                 Ok(Err(error)) => {
                     failures.lock().push_back(ExecutionReadinessWaitFailure {
                         ticket_id,
-                        request_ids,
+                        requests,
                         message: error.to_string(),
                     });
                     wake.mark_failed();
@@ -1314,7 +1330,7 @@ impl ExecutionReadinessWaitRegistry {
                 Err(_) => {
                     failures.lock().push_back(ExecutionReadinessWaitFailure {
                         ticket_id,
-                        request_ids,
+                        requests,
                         message: "Request-state readiness waiter panicked".to_string(),
                     });
                     wake.mark_failed();
@@ -1371,33 +1387,13 @@ impl ExecutionReadinessWaitRegistry {
     }
 }
 
-impl EngineResourceComposition {
-    const fn authority(&self) -> ExecutionResourceAuthority {
-        match self {
-            Self::LegacyEngine { .. } => ExecutionResourceAuthority::LegacyEngine,
-            Self::PlanRuntime => ExecutionResourceAuthority::PlanRuntime,
-        }
-    }
-
-    fn kv_cache(&self) -> Option<&Arc<dyn KvCacheManager + Send + Sync>> {
-        match self {
-            Self::LegacyEngine { kv_cache, .. } => Some(kv_cache),
-            Self::PlanRuntime => None,
-        }
-    }
-
-    fn recurrent_state_manager(&self) -> Option<&Arc<dyn RecurrentStateManager + Send + Sync>> {
-        match self {
-            Self::LegacyEngine {
-                recurrent_state_manager,
-                ..
-            } => recurrent_state_manager.as_ref(),
-            Self::PlanRuntime => None,
-        }
-    }
-}
+mod output_delivery;
+use output_delivery::{OutputReceiver, OutputSender, OutputTaskRegistry};
 
 struct EngineInner {
+    self_weak: Weak<EngineInner>,
+    output_budget: OutputBudget,
+    output_tasks: Arc<OutputTaskRegistry>,
     config: EngineConfig,
     scheduler: Arc<ContinuousBatchScheduler>,
     tokenizer: Arc<dyn Tokenizer + Send + Sync>,
@@ -1407,11 +1403,9 @@ struct EngineInner {
     #[allow(dead_code)]
     // Retained for constructor API; sampling now uses per-request SamplingConfig
     sampler: Arc<dyn Sampler + Send + Sync>,
-    resource_composition: EngineResourceComposition,
-    model_executor: Arc<dyn ModelExecutor + Send + Sync>,
-    tensor_factory: Arc<dyn TensorFactory>,
-    sequences: RwLock<HashMap<RequestId, SequenceState>>,
-    is_running: AtomicBool,
+    model_executor: Arc<ExecutorScope>,
+    sequences: SequenceRegistry,
+    driver: Weak<ManagedDriver>,
     shutdown_notify: Arc<Notify>,
     /// Serializes request publication with cancellation and BatchPlan
     /// construction. Device execution deliberately runs after this guard is
@@ -1420,14 +1414,21 @@ struct EngineInner {
     /// Wakes callers or a background loop when new work is submitted.
     work_notify: Arc<Notify>,
     runtime_config: ContinuousEngineRuntimeConfig,
-    profile_trace_jsonl: Option<SchedulerTraceJournal>,
     scheduler_trace_jsonl: Option<SchedulerTraceJournal>,
-    legacy_scheduler_trace_jsonl: Option<Arc<Mutex<std::fs::File>>>,
+    host_profile_sink: Option<Arc<VNextProfileExecutionEventSink>>,
+    execution_attempt_observer: Option<Arc<dyn ExecutionAttemptObserver>>,
+    cost_snapshot_source: Option<Arc<dyn CostSnapshotSource>>,
+    legacy_scheduler_trace_jsonl: Option<JsonlJournal<serde_json::Value>>,
+    journal_scopes: Arc<Mutex<EngineJournals>>,
+    observation_health: ObservationHealth,
+    #[cfg(test)]
+    trace_payload_builds: Arc<AtomicU64>,
     scheduler_trace_none_streak: AtomicU64,
     resource_lifecycle: Mutex<ResourceLifecycleLedger>,
     resource_trace_event_counter: AtomicU64,
     dynamic_admission_availability: Mutex<Vec<CapacityAvailabilityEpoch>>,
     execution_readiness_waiters: ExecutionReadinessWaitRegistry,
+    execution_closes: ExecutionCloseRegistry,
     prefix_rendezvous: Mutex<Vec<inner::prefix_rendezvous::PrefixRendezvous>>,
     prefix_restore_pending: Mutex<HashMap<RequestId, inner::prefix_restore::PendingPrefixRestore>>,
     // stats
@@ -1442,14 +1443,22 @@ struct EngineInner {
     scheduling_time_samples: AtomicU64,
     total_model_execution_time_us: AtomicU64,
     model_execution_time_samples: AtomicU64,
-    /// Set true the first time `ensure_bg_loop` runs, so per-request
-    /// `infer_stream` callers don't each spawn their own competing
-    /// driver task (16 streaming requests = 16 drivers thrashing on
-    /// `iteration_lock`, ~5ms/iter of tokio scheduling overhead).
-    bg_loop_spawned: AtomicBool,
-    shutdown_started: AtomicBool,
-    shutdown_lock: tokio::sync::Mutex<()>,
-    background_loop: Mutex<Option<tokio::task::JoinHandle<()>>>,
+}
+
+struct ActiveInferGuard(metrics::Gauge);
+
+impl ActiveInferGuard {
+    fn new() -> Self {
+        let active = gauge!("ferrum.engine.active_requests");
+        active.increment(1.0);
+        Self(active)
+    }
+}
+
+impl Drop for ActiveInferGuard {
+    fn drop(&mut self) {
+        self.0.decrement(1.0);
+    }
 }
 
 struct ClientReceiverDropWake {
@@ -1458,16 +1467,10 @@ struct ClientReceiverDropWake {
 }
 
 impl EngineInner {
-    fn signal_shutdown(&self) {
-        self.shutdown_started.store(true, Ordering::Release);
-        self.is_running.store(false, Ordering::SeqCst);
-
-        // The background loop can be between its state check and registering
-        // the async wait. `notify_one` retains a permit across that window;
-        // `notify_waiters` would lose the shutdown signal when no waiter is
-        // registered yet.
-        self.shutdown_notify.notify_one();
-        self.work_notify.notify_one();
+    fn shutdown_started(&self) -> bool {
+        self.driver
+            .upgrade()
+            .is_none_or(|driver| driver.is_closing())
     }
 
     fn structured_output_factory(&self) -> Result<Arc<StructuredOutputFactory>> {
@@ -1509,12 +1512,12 @@ impl Drop for ClientReceiverDropWake {
 }
 
 struct CancellationAwareResponseStream {
-    receiver: tokio_stream::wrappers::ReceiverStream<Result<StreamChunk>>,
+    receiver: OutputReceiver,
     receiver_drop_wake: ClientReceiverDropWake,
 }
 
 impl Stream for CancellationAwareResponseStream {
-    type Item = Result<StreamChunk>;
+    type Item = Result<OutputChunk>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let result = Pin::new(&mut self.receiver).poll_next(cx);
@@ -1526,18 +1529,6 @@ impl Stream for CancellationAwareResponseStream {
 }
 
 impl EngineInner {
-    fn engine_managed_kv_cache(&self) -> Result<&Arc<dyn KvCacheManager + Send + Sync>> {
-        self.resource_composition.kv_cache().ok_or_else(|| {
-            FerrumError::internal(
-                "plan runtime attempted to use the legacy engine KV-cache manager",
-            )
-        })
-    }
-
-    fn recurrent_state_manager(&self) -> Option<&Arc<dyn RecurrentStateManager + Send + Sync>> {
-        self.resource_composition.recurrent_state_manager()
-    }
-
     fn record_iteration_lock_wait(&self, duration: Duration) {
         self.total_iteration_lock_wait_us
             .fetch_add(duration_to_us(duration), Ordering::Relaxed);
@@ -1718,11 +1709,11 @@ impl EngineInner {
             attributes,
         };
         if let Err(error) = event.validate() {
-            warn!("Skipping invalid engine resource trace event: {}", error);
+            self.report_observation_failure(ExecutionEventSinkError::contract(error));
             return;
         }
         if let Err(error) = sink.enqueue(event) {
-            warn!("Failed to enqueue engine resource trace event: {}", error);
+            self.report_observation_failure(error);
         }
     }
 
@@ -1879,17 +1870,11 @@ impl EngineInner {
             attributes,
         };
         if let Err(error) = event.validate() {
-            warn!(
-                "Skipping invalid engine resource close trace event: {}",
-                error
-            );
+            self.report_observation_failure(ExecutionEventSinkError::contract(error));
             return;
         }
         if let Err(error) = sink.enqueue(event) {
-            warn!(
-                "Failed to enqueue engine resource close trace event: {}",
-                error
-            );
+            self.report_observation_failure(error);
         }
     }
 
@@ -2053,24 +2038,6 @@ impl EngineInner {
         );
     }
 
-    fn trace_scheduler_defer(&self, request_id: &RequestId, phase: &str, reason: &str) {
-        self.trace_resource_event(
-            request_id,
-            "request",
-            &request_id.to_string(),
-            "scheduler_capacity",
-            phase,
-            ResourceAction::Defer,
-            None,
-            None,
-            None,
-            Some(Self::resource_amount_i64(
-                self.config.scheduler.max_running_requests.max(1),
-            )),
-            Some(reason.to_string()),
-        );
-    }
-
     fn trace_resource_reserve_commit(
         &self,
         request_id: &RequestId,
@@ -2149,438 +2116,6 @@ impl EngineInner {
         );
     }
 
-    fn trace_resource_release_failure(
-        &self,
-        request_id: &RequestId,
-        resource_kind: &str,
-        phase: &str,
-        capacity: Option<usize>,
-        reason: String,
-    ) {
-        self.trace_resource_event(
-            request_id,
-            "request",
-            &request_id.to_string(),
-            resource_kind,
-            phase,
-            ResourceAction::Reject,
-            None,
-            None,
-            None,
-            capacity.map(Self::resource_amount_i64),
-            Some(reason),
-        );
-    }
-
-    fn kv_resource_blocks_for_tokens(&self, tokens: usize) -> usize {
-        tokens
-            .div_ceil(self.config.kv_cache.block_size.max(1))
-            .max(1)
-    }
-
-    fn trace_kv_allocate(&self, request_id: &RequestId, blocks: usize) {
-        self.trace_resource_reserve_commit(
-            request_id,
-            "request",
-            &request_id.to_string(),
-            "kv_block",
-            "engine_kv_block",
-            blocks,
-            Some(self.config.kv_cache.max_blocks),
-        );
-    }
-
-    async fn allocate_kv_lease(
-        &self,
-        owner_request_id: &RequestId,
-        allocation_request_id: RequestId,
-        request: &AllocationRequest,
-        tokens: usize,
-    ) -> Result<KvAllocationLease> {
-        debug_assert_eq!(allocation_request_id, request.request_id);
-        let handle = self.engine_managed_kv_cache()?.allocate(request).await?;
-        let blocks = self.kv_resource_blocks_for_tokens(tokens);
-        self.trace_kv_allocate(owner_request_id, blocks);
-        Ok(KvAllocationLease::new(
-            owner_request_id.clone(),
-            allocation_request_id,
-            handle,
-            blocks,
-        ))
-    }
-
-    fn trace_kv_release(&self, request_id: &RequestId, blocks: usize) {
-        self.trace_resource_release(
-            request_id,
-            "request",
-            &request_id.to_string(),
-            "kv_block",
-            "engine_kv_block_release",
-            blocks,
-            Some(self.config.kv_cache.max_blocks),
-        );
-    }
-
-    fn trace_model_cache_ref_acquire(&self, request_id: &RequestId) {
-        self.trace_resource_reserve_commit(
-            request_id,
-            "request",
-            &request_id.to_string(),
-            "model_cache_ref",
-            "engine_model_cache_ref",
-            1,
-            None,
-        );
-    }
-
-    fn trace_model_cache_ref_release(&self, request_id: &RequestId) {
-        self.trace_resource_release(
-            request_id,
-            "request",
-            &request_id.to_string(),
-            "model_cache_ref",
-            "engine_model_cache_ref_release",
-            1,
-            None,
-        );
-    }
-
-    fn legacy_backend_workspace_trace_capacity(&self) -> Option<usize> {
-        Some(self.config.scheduler.max_running_requests.max(1))
-    }
-
-    fn trace_legacy_backend_workspace_acquire(&self, request_id: &RequestId, phase_prefix: &str) {
-        self.trace_resource_reserve_commit(
-            request_id,
-            "request",
-            &request_id.to_string(),
-            "backend_workspace",
-            phase_prefix,
-            1,
-            self.legacy_backend_workspace_trace_capacity(),
-        );
-    }
-
-    fn trace_legacy_backend_workspace_release(&self, request_id: &RequestId, phase: &str) {
-        self.trace_resource_release(
-            request_id,
-            "request",
-            &request_id.to_string(),
-            "backend_workspace",
-            phase,
-            1,
-            self.legacy_backend_workspace_trace_capacity(),
-        );
-    }
-
-    fn trace_legacy_backend_workspace_acquire_many(
-        &self,
-        request_ids: &[RequestId],
-        phase_prefix: &str,
-    ) {
-        for request_id in request_ids {
-            self.trace_legacy_backend_workspace_acquire(request_id, phase_prefix);
-        }
-    }
-
-    fn trace_legacy_backend_workspace_release_many(&self, request_ids: &[RequestId], phase: &str) {
-        for request_id in request_ids {
-            self.trace_legacy_backend_workspace_release(request_id, phase);
-        }
-    }
-
-    fn acquire_legacy_backend_workspace_trace_lease(
-        &self,
-        request_ids: Vec<RequestId>,
-        phase_prefix: &'static str,
-        release_phase: &'static str,
-    ) -> Result<LegacyBackendWorkspaceTraceLease<'_>> {
-        if self.resource_composition.authority() != ExecutionResourceAuthority::LegacyEngine {
-            return Err(FerrumError::internal(
-                "synthetic backend workspace tracing is forbidden for PlanRuntime authority",
-            ));
-        }
-        Ok(LegacyBackendWorkspaceTraceLease::new(
-            self,
-            request_ids,
-            phase_prefix,
-            release_phase,
-        ))
-    }
-
-    fn apply_model_cache_ref_update(&self, request_id: &RequestId, update: ModelCacheRefUpdate) {
-        if let Some(cache_id) = update.released {
-            self.model_executor.release_cache(&cache_id);
-            self.trace_model_cache_ref_release(request_id);
-        }
-        if update.acquired.is_some() {
-            self.trace_model_cache_ref_acquire(request_id);
-        }
-    }
-
-    fn release_model_cache_ref(&self, request_id: &RequestId, cache_id: &str) {
-        self.model_executor.release_cache(cache_id);
-        self.trace_model_cache_ref_release(request_id);
-    }
-
-    async fn release_kv_allocation(
-        &self,
-        owner_request_id: &RequestId,
-        allocation_request_id: RequestId,
-        blocks: usize,
-    ) {
-        let kv_cache = match self.engine_managed_kv_cache() {
-            Ok(kv_cache) => kv_cache,
-            Err(error) => {
-                warn!(
-                    owner_request_id = %owner_request_id,
-                    allocation_request_id = %allocation_request_id,
-                    error = %error,
-                    "Legacy engine KV allocation reached a plan-runtime composition"
-                );
-                return;
-            }
-        };
-        match kv_cache.deallocate(allocation_request_id.clone()).await {
-            Ok(()) => {
-                self.trace_kv_release(owner_request_id, blocks);
-            }
-            Err(error) => {
-                warn!(
-                    owner_request_id = %owner_request_id,
-                    allocation_request_id = %allocation_request_id,
-                    error = %error,
-                    "KV allocation release failed"
-                );
-                self.trace_resource_release_failure(
-                    owner_request_id,
-                    "kv_block",
-                    "engine_kv_block_release_failed",
-                    Some(self.config.kv_cache.max_blocks),
-                    format!("kv release failed for {allocation_request_id}: {error}"),
-                );
-            }
-        }
-    }
-
-    async fn release_sequence_physical_resources(
-        &self,
-        request_id: &RequestId,
-        resources: SequencePhysicalResources,
-    ) {
-        if let Some(cache_id) = resources.model_cache_id {
-            self.release_model_cache_ref(request_id, &cache_id);
-        }
-        if let Some(kv_allocation) = resources.legacy_kv_allocation {
-            self.release_kv_allocation(request_id, kv_allocation.request_id, kv_allocation.blocks)
-                .await;
-        }
-        if let Some(recurrent_allocation) = resources.recurrent_state_allocation {
-            self.release_recurrent_allocation(request_id, recurrent_allocation.slots)
-                .await;
-        }
-    }
-
-    async fn complete_sequence_physical_resources(
-        &self,
-        request_id: &RequestId,
-        mut resources: SequencePhysicalResources,
-        usage: &TokenUsage,
-    ) -> Result<()> {
-        let completion_result = if let Some(cache_id) = resources.model_cache_id.take() {
-            let completion = ExecutorSequenceCompletion::new(
-                request_id.clone(),
-                cache_id.clone(),
-                usage.prompt_tokens,
-                usage.completion_tokens,
-            );
-            match completion {
-                Ok(completion) => match self.model_executor.complete_cache(completion).await {
-                    Ok(()) => {
-                        self.trace_model_cache_ref_release(request_id);
-                        Ok(())
-                    }
-                    Err(error) => {
-                        self.trace_resource_release_failure(
-                            request_id,
-                            "model_cache_ref",
-                            "engine_model_cache_completion_failed",
-                            None,
-                            error.to_string(),
-                        );
-                        Err(error)
-                    }
-                },
-                Err(error) => {
-                    self.model_executor.release_cache(&cache_id);
-                    self.trace_model_cache_ref_release(request_id);
-                    Err(error)
-                }
-            }
-        } else {
-            Ok(())
-        };
-
-        self.release_sequence_physical_resources(request_id, resources)
-            .await;
-        completion_result
-    }
-
-    fn trace_recurrent_allocate(
-        &self,
-        request_id: &RequestId,
-        slots: usize,
-        capacity: Option<usize>,
-    ) {
-        self.trace_resource_reserve_commit(
-            request_id,
-            "request",
-            &request_id.to_string(),
-            "recurrent_state_slot",
-            "engine_recurrent_state_slot",
-            slots,
-            capacity,
-        );
-    }
-
-    fn trace_recurrent_release(
-        &self,
-        request_id: &RequestId,
-        slots: usize,
-        capacity: Option<usize>,
-    ) {
-        self.trace_resource_release(
-            request_id,
-            "request",
-            &request_id.to_string(),
-            "recurrent_state_slot",
-            "engine_recurrent_state_slot_release",
-            slots,
-            capacity,
-        );
-    }
-
-    async fn release_recurrent_allocation(&self, request_id: &RequestId, slots: Option<usize>) {
-        if let Some(manager) = self.recurrent_state_manager() {
-            let capacity = manager.stats().total_batch_slots;
-            match manager.deallocate(request_id.clone()).await {
-                Ok(()) => {
-                    if let Some(slots) = slots {
-                        self.trace_recurrent_release(request_id, slots, Some(capacity));
-                    }
-                }
-                Err(error) => {
-                    warn!(
-                        request_id = %request_id,
-                        error = %error,
-                        "Recurrent-state release failed"
-                    );
-                    if slots.is_some() {
-                        self.trace_resource_release_failure(
-                            request_id,
-                            "recurrent_state_slot",
-                            "engine_recurrent_state_slot_release_failed",
-                            Some(capacity),
-                            format!("recurrent-state release failed for {request_id}: {error}"),
-                        );
-                    }
-                }
-            }
-        }
-    }
-
-    async fn prepare_recurrent_state(
-        &self,
-        request_id: &RequestId,
-        spec: Option<ferrum_interfaces::RecurrentStateSpec>,
-    ) -> Result<RecurrentStateAdmission> {
-        if let Some(existing) = self
-            .sequences
-            .read()
-            .get(request_id)
-            .and_then(SequenceState::recurrent_state_handle)
-        {
-            return Ok(RecurrentStateAdmission::existing(existing));
-        }
-
-        let Some(spec) = spec else {
-            return Ok(RecurrentStateAdmission::none());
-        };
-
-        debug_assert_eq!(&spec.request_id, request_id);
-        let Some(manager) = self.recurrent_state_manager() else {
-            return Err(FerrumError::config(format!(
-                "model '{}' requires recurrent state for request {}, but no recurrent-state manager is configured",
-                self.model_executor.info().model_id, request_id
-            )));
-        };
-
-        let before_stats = manager.stats();
-        let slots = spec.max_batch_slots.max(1);
-        let handle = match manager.allocate(&spec).await {
-            Ok(handle) => handle,
-            Err(error) => {
-                self.trace_resource_event(
-                    request_id,
-                    "request",
-                    &request_id.to_string(),
-                    "recurrent_state_slot",
-                    "engine_recurrent_state_slot_reject",
-                    ResourceAction::Reject,
-                    None,
-                    None,
-                    None,
-                    Some(Self::resource_amount_i64(before_stats.total_batch_slots)),
-                    Some(error.to_string()),
-                );
-                return Err(error);
-            }
-        };
-        let after_stats = manager.stats();
-        self.trace_recurrent_allocate(request_id, slots, Some(after_stats.total_batch_slots));
-        Ok(RecurrentStateAdmission::fresh(RecurrentStateLease::new(
-            request_id.clone(),
-            handle,
-            slots,
-            Some(after_stats.total_batch_slots),
-        )))
-    }
-
-    async fn ensure_recurrent_state(
-        &self,
-        request_id: &RequestId,
-        spec: Option<ferrum_interfaces::RecurrentStateSpec>,
-    ) -> Result<Option<Arc<dyn RecurrentStateHandle>>> {
-        let mut admission = self.prepare_recurrent_state(request_id, spec).await?;
-        let handle = admission.handle();
-        if let Some(slots) = admission.fresh_slots() {
-            let Some(handle) = handle.clone() else {
-                admission.release_fresh(self).await;
-                return Err(FerrumError::internal(format!(
-                    "missing recurrent state handle while committing recurrent slots for {request_id}"
-                )));
-            };
-            let mut found = false;
-            {
-                let mut sequences = self.sequences.write();
-                if let Some(seq) = sequences.get_mut(request_id) {
-                    seq.commit_recurrent_state_admission(handle, slots);
-                    found = true;
-                }
-            }
-            if found {
-                admission.commit_fresh();
-            } else {
-                admission.release_fresh(self).await;
-                return Err(FerrumError::internal(format!(
-                    "sequence not found while committing recurrent state for {request_id}"
-                )));
-            }
-        }
-
-        Ok(handle)
-    }
-
     fn performance_breakdown(&self) -> ferrum_types::PerformanceBreakdown {
         ferrum_types::PerformanceBreakdown {
             scheduling_time_ms: avg_duration_ms(
@@ -2628,130 +2163,84 @@ mod inner;
 /// an internal `iteration_lock` serializes engine steps while allowing
 /// all pending requests to be processed in each iteration's batch.
 pub struct ContinuousBatchEngine {
-    inner: Arc<EngineInner>,
+    driver: Arc<ManagedDriver>,
+    config: EngineConfig,
+    scheduler: Arc<ContinuousBatchScheduler>,
+    adapter_support: AdapterExecutionSupport,
+    planning_model: ExecutionPlanningModel,
+    context_capacity: Option<usize>,
 }
 
 impl ContinuousBatchEngine {
+    /// Build one engine over the executor's original resource owner.
     pub fn new(
         config: EngineConfig,
         scheduler: Arc<ContinuousBatchScheduler>,
         tokenizer: Arc<dyn Tokenizer + Send + Sync>,
         sampler: Arc<dyn Sampler + Send + Sync>,
-        kv_cache: Arc<dyn KvCacheManager + Send + Sync>,
-        model_executor: Arc<dyn ModelExecutor + Send + Sync>,
-        tensor_factory: Arc<dyn TensorFactory>,
+        model_executor: impl IntoEngineExecutor,
     ) -> Result<Self> {
-        Self::new_with_recurrent_state_manager(
+        Self::new_with_journal_scopes(config, scheduler, tokenizer, sampler, model_executor, None)
+    }
+
+    pub fn new_with_journal_scopes(
+        config: EngineConfig,
+        scheduler: Arc<ContinuousBatchScheduler>,
+        tokenizer: Arc<dyn Tokenizer + Send + Sync>,
+        sampler: Arc<dyn Sampler + Send + Sync>,
+        model_executor: impl IntoEngineExecutor,
+
+        journal_scopes: Option<EngineJournalScopes>,
+    ) -> Result<Self> {
+        Self::new_observed(
             config,
             scheduler,
             tokenizer,
             sampler,
-            kv_cache,
             model_executor,
-            tensor_factory,
+            journal_scopes,
+            None,
             None,
         )
     }
 
-    /// Build an engine with an optional recurrent-state manager for
-    /// state-space / hybrid models.
     #[allow(clippy::too_many_arguments)]
-    pub fn new_with_recurrent_state_manager(
+    pub(crate) fn new_observed(
         config: EngineConfig,
         scheduler: Arc<ContinuousBatchScheduler>,
         tokenizer: Arc<dyn Tokenizer + Send + Sync>,
         sampler: Arc<dyn Sampler + Send + Sync>,
-        kv_cache: Arc<dyn KvCacheManager + Send + Sync>,
-        model_executor: Arc<dyn ModelExecutor + Send + Sync>,
-        tensor_factory: Arc<dyn TensorFactory>,
-        recurrent_state_manager: Option<Arc<dyn RecurrentStateManager + Send + Sync>>,
-    ) -> Result<Self> {
-        Self::new_with_resource_composition(
-            config,
-            scheduler,
-            tokenizer,
-            sampler,
-            EngineResourceComposition::LegacyEngine {
-                kv_cache,
-                recurrent_state_manager,
-            },
-            model_executor,
-            tensor_factory,
-        )
-    }
+        model_executor: impl IntoEngineExecutor,
 
-    /// Build an engine bound to the shared plan runtime, which is the sole
-    /// owner of request-lifetime KV, recurrent state, and backing capacity.
-    /// The model executor adapts that runtime but does not own a second
-    /// resource manager; no legacy engine manager is created or retained.
-    pub fn new_plan_runtime(
-        config: EngineConfig,
-        scheduler: Arc<ContinuousBatchScheduler>,
-        tokenizer: Arc<dyn Tokenizer + Send + Sync>,
-        sampler: Arc<dyn Sampler + Send + Sync>,
-        model_executor: Arc<dyn ModelExecutor + Send + Sync>,
-        tensor_factory: Arc<dyn TensorFactory>,
+        journal_scopes: Option<EngineJournalScopes>,
+        execution_attempt_observer: Option<Arc<dyn ExecutionAttemptObserver>>,
+        cost_snapshot_source: Option<Arc<dyn CostSnapshotSource>>,
     ) -> Result<Self> {
-        Self::new_with_resource_composition(
-            config,
-            scheduler,
-            tokenizer,
-            sampler,
-            EngineResourceComposition::PlanRuntime,
-            model_executor,
-            tensor_factory,
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn new_with_resource_composition(
-        config: EngineConfig,
-        scheduler: Arc<ContinuousBatchScheduler>,
-        tokenizer: Arc<dyn Tokenizer + Send + Sync>,
-        sampler: Arc<dyn Sampler + Send + Sync>,
-        resource_composition: EngineResourceComposition,
-        model_executor: Arc<dyn ModelExecutor + Send + Sync>,
-        tensor_factory: Arc<dyn TensorFactory>,
-    ) -> Result<Self> {
-        let executor_authority = model_executor.execution_resource_authority();
-        if resource_composition.authority() != executor_authority {
-            return Err(FerrumError::config(format!(
-                "engine resource composition {:?} does not match executor authority {:?}",
-                resource_composition.authority(),
-                executor_authority
-            )));
-        }
-        let recurrent_state_manager = resource_composition.recurrent_state_manager().is_some();
-        info!(
-            ?executor_authority,
-            "Creating ContinuousBatchEngine (recurrent_state_manager={})", recurrent_state_manager
-        );
+        validate_execution_feedback(
+            &config,
+            execution_attempt_observer.as_ref(),
+            cost_snapshot_source.as_ref(),
+        )?;
+        let binding = model_executor.into_engine_executor()?;
+        let owns_executor = binding.owner.is_some();
+        let model_executor = binding.scope;
+        let executor_planning_model = model_executor.execution_planning_model();
+        info!(?executor_planning_model, "Creating ContinuousBatchEngine");
+        config.runtime.profile_journal.validate()?;
         let runtime_config = ContinuousEngineRuntimeConfig::from_engine_config(&config);
-        let profile_trace_jsonl = runtime_config
-            .profile_jsonl
-            .as_ref()
-            .map(|path| {
-                SchedulerTraceJournal::create(path.clone()).map_err(|error| {
-                    FerrumError::io(format!(
-                        "open product profile JSONL {}: {error}",
-                        path.display()
-                    ))
-                })
-            })
-            .transpose()?;
-        let scheduler_trace_jsonl = match runtime_config.scheduler_trace_jsonl.as_deref() {
-            Some(path)
-                if profile_trace_jsonl
-                    .as_ref()
-                    .is_some_and(|journal| journal.path() == path) =>
-            {
-                profile_trace_jsonl.clone()
-            }
-            path => create_scheduler_trace_sink(path),
+        let observation_health = ObservationHealth::default();
+        let journals = EngineJournals::prepare(&config, journal_scopes, &observation_health)?;
+        let open_profile = |path: Option<&Path>| {
+            path.and_then(|path| journals.producer(path))
+                .map(SchedulerTraceJournal::from_producer)
         };
-        let legacy_scheduler_trace_jsonl = create_legacy_scheduler_trace_sink(
-            runtime_config.legacy_scheduler_trace_jsonl.as_deref(),
-        );
+        let profile_trace_jsonl = open_profile(runtime_config.profile_jsonl.as_deref());
+        let scheduler_trace_jsonl = open_profile(runtime_config.scheduler_trace_jsonl.as_deref());
+        let legacy_scheduler_trace_jsonl = runtime_config
+            .legacy_scheduler_trace_jsonl
+            .as_deref()
+            .and_then(|path| journals.producer(path));
+        let journal_scopes = Arc::new(Mutex::new(journals));
         let mut execution_profile_journals = Vec::with_capacity(2);
         if let Some(journal) = profile_trace_jsonl.as_ref() {
             execution_profile_journals.push(journal.clone());
@@ -2764,201 +2253,196 @@ impl ContinuousBatchEngine {
                 execution_profile_journals.push(journal.clone());
             }
         }
-        let execution_sink: Option<Arc<dyn ProductExecutionEventSink>> =
-            if !execution_profile_journals.is_empty() {
-                Some(Arc::new(VNextProfileExecutionEventSink::with_journals(
-                    execution_profile_journals,
-                    runtime_config
-                        .profile_entrypoint
-                        .unwrap_or(ProfileEntrypoint::Synthetic),
-                    &config,
-                )))
-            } else if config.runtime.profile_detail == ObservabilityProfileDetail::Basic {
-                Some(Arc::new(MetricsOnlyExecutionEventSink))
-            } else {
-                None
-            };
-        if let Some(sink) = execution_sink {
-            model_executor.attach_execution_event_sink(sink);
+        // Host diagnostics and executor events share the same instance and
+        // producer scopes. The legacy executor need not implement a profiler.
+        let host_profile_sink = (!execution_profile_journals.is_empty()).then(|| {
+            Arc::new(VNextProfileExecutionEventSink::with_journals(
+                execution_profile_journals,
+                runtime_config
+                    .profile_entrypoint
+                    .unwrap_or(ProfileEntrypoint::Synthetic),
+                &config,
+            ))
+        });
+        if !owns_executor && host_profile_sink.is_some() {
+            return Err(FerrumError::config(
+                "a shared executor scope cannot replace the assembly-owned execution event sink",
+            ));
+        }
+        if let Some(sink) = &host_profile_sink {
+            model_executor.attach_execution_event_sink(sink.clone());
+        } else if owns_executor
+            && config.runtime.profile_detail == ObservabilityProfileDetail::Basic
+        {
+            model_executor.attach_execution_event_sink(Arc::new(MetricsOnlyExecutionEventSink));
         }
 
+        let driver = Arc::new(ManagedDriver::default());
+        *driver.final_owner.lock() = binding.owner;
+        let output_budget = OutputBudget::new(config.output.clone())?;
+        let engine_config = config.clone();
+        let engine_scheduler = Arc::clone(&scheduler);
+        let adapter_support = model_executor.adapter_execution_support();
+        let context_capacity = effective_request_context_capacity(
+            &config,
+            &runtime_config,
+            model_executor.kv_capacity(),
+        );
+        let inner = Arc::new_cyclic(|self_weak| EngineInner {
+            self_weak: self_weak.clone(),
+            output_budget,
+            output_tasks: Arc::new(OutputTaskRegistry::default()),
+            config,
+            scheduler,
+            tokenizer,
+            structured_output_factory: OnceLock::new(),
+            sampler,
+            model_executor,
+            sequences: SequenceRegistry::default(),
+            driver: Arc::downgrade(&driver),
+            shutdown_notify: Arc::new(Notify::new()),
+            iteration_lock: tokio::sync::Mutex::new(()),
+            work_notify: Arc::new(Notify::new()),
+            iteration_count: AtomicU64::new(0),
+            runtime_config,
+            scheduler_trace_jsonl,
+            host_profile_sink,
+            execution_attempt_observer,
+            cost_snapshot_source,
+            legacy_scheduler_trace_jsonl,
+            journal_scopes,
+            observation_health,
+            #[cfg(test)]
+            trace_payload_builds: Arc::new(AtomicU64::new(0)),
+            scheduler_trace_none_streak: AtomicU64::new(0),
+            resource_lifecycle: Mutex::new(ResourceLifecycleLedger::default()),
+            resource_trace_event_counter: AtomicU64::new(0),
+            dynamic_admission_availability: Mutex::new(Vec::with_capacity(16)),
+            execution_readiness_waiters: ExecutionReadinessWaitRegistry::new(),
+            execution_closes: ExecutionCloseRegistry::default(),
+            prefix_rendezvous: Mutex::new(Vec::new()),
+            prefix_restore_pending: Mutex::new(HashMap::new()),
+            total_prefill_tokens: AtomicU64::new(0),
+            total_decode_tokens: AtomicU64::new(0),
+            total_preemptions: AtomicU64::new(0),
+            prefix_cache_hits: AtomicU64::new(0),
+            total_iteration_lock_wait_us: AtomicU64::new(0),
+            iteration_lock_wait_samples: AtomicU64::new(0),
+            total_scheduling_time_us: AtomicU64::new(0),
+            scheduling_time_samples: AtomicU64::new(0),
+            total_model_execution_time_us: AtomicU64::new(0),
+            model_execution_time_samples: AtomicU64::new(0),
+        });
+        *driver.active.lock() = Some(inner);
         Ok(Self {
-            inner: Arc::new(EngineInner {
-                config,
-                scheduler,
-                tokenizer,
-                structured_output_factory: OnceLock::new(),
-                sampler,
-                resource_composition,
-                model_executor,
-                tensor_factory,
-                sequences: RwLock::new(HashMap::new()),
-                is_running: AtomicBool::new(false),
-                shutdown_notify: Arc::new(Notify::new()),
-                iteration_lock: tokio::sync::Mutex::new(()),
-                work_notify: Arc::new(Notify::new()),
-                iteration_count: AtomicU64::new(0),
-                runtime_config,
-                profile_trace_jsonl,
-                scheduler_trace_jsonl,
-                legacy_scheduler_trace_jsonl,
-                scheduler_trace_none_streak: AtomicU64::new(0),
-                resource_lifecycle: Mutex::new(ResourceLifecycleLedger::default()),
-                resource_trace_event_counter: AtomicU64::new(0),
-                dynamic_admission_availability: Mutex::new(Vec::with_capacity(16)),
-                execution_readiness_waiters: ExecutionReadinessWaitRegistry::new(),
-                prefix_rendezvous: Mutex::new(Vec::new()),
-                prefix_restore_pending: Mutex::new(HashMap::new()),
-                total_prefill_tokens: AtomicU64::new(0),
-                total_decode_tokens: AtomicU64::new(0),
-                total_preemptions: AtomicU64::new(0),
-                prefix_cache_hits: AtomicU64::new(0),
-                total_iteration_lock_wait_us: AtomicU64::new(0),
-                iteration_lock_wait_samples: AtomicU64::new(0),
-                total_scheduling_time_us: AtomicU64::new(0),
-                scheduling_time_samples: AtomicU64::new(0),
-                total_model_execution_time_us: AtomicU64::new(0),
-                model_execution_time_samples: AtomicU64::new(0),
-                bg_loop_spawned: AtomicBool::new(false),
-                shutdown_started: AtomicBool::new(false),
-                shutdown_lock: tokio::sync::Mutex::new(()),
-                background_loop: Mutex::new(None),
-            }),
+            driver,
+            config: engine_config,
+            scheduler: engine_scheduler,
+            adapter_support,
+            planning_model: executor_planning_model,
+            context_capacity,
         })
     }
 
-    /// Spawn the background iteration loop on first request. Without this,
-    /// every concurrent infer/infer_stream call spawned its own
-    /// drive_to_completion task → 16 streaming requests = 16 tasks all
-    /// racing for `iteration_lock` (thundering herd, observed as ~5ms of
-    /// per-iter tokio scheduling overhead at c=16). With one bg loop +
-    /// per-request tasks just consuming their channel, lock is uncontested.
-    fn ensure_bg_loop(&self) {
-        if self.inner.bg_loop_spawned.load(Ordering::Acquire) {
-            return;
-        }
-        let mut background_loop = self.inner.background_loop.lock();
-        if self.inner.shutdown_started.load(Ordering::Acquire) {
-            return;
-        }
-        if !self.inner.bg_loop_spawned.swap(true, Ordering::AcqRel) {
-            *background_loop = Some(self.start_loop());
-        }
+    fn active_inner(&self) -> Result<Arc<EngineInner>> {
+        self.driver.active.lock().clone().ok_or_else(|| {
+            FerrumError::scheduler("engine is closing and no longer accepts requests")
+        })
+    }
+
+    pub(crate) async fn prepare_startup(&self) -> Result<()> {
+        let inner = self.active_inner()?;
+        inner.model_executor.prepare_startup().await
     }
 
     /// Hit count since engine construction (prefix cache). Exposed for
     /// tests + /metrics endpoint; monotonic, Relaxed-ordered.
     pub fn prefix_cache_hits(&self) -> u64 {
-        self.inner.prefix_cache_hits.load(Ordering::Relaxed)
+        self.driver.active.lock().as_ref().map_or_else(
+            || self.driver.final_prefix_hits.load(Ordering::Relaxed),
+            |inner| inner.prefix_cache_hits.load(Ordering::Relaxed),
+        )
     }
 
-    /// Start a background iteration loop.  Returns a `JoinHandle` that
-    /// runs until `shutdown()` is called.  When a background loop is
-    /// active, `infer()` / `infer_stream()` simply submit and wait.
-    pub fn start_loop(&self) -> tokio::task::JoinHandle<()> {
-        let inner = self.inner.clone();
-        inner.is_running.store(true, Ordering::SeqCst);
-        tokio::spawn(async move {
-            info!("Background iteration loop started");
-            let prof = inner.runtime_config.batch_decode_prof;
-            let mut last_iter_end: Option<std::time::Instant> = None;
-            static GAP_PROF_CALLS: std::sync::atomic::AtomicU64 =
-                std::sync::atomic::AtomicU64::new(0);
-            loop {
-                if !inner.is_running.load(Ordering::SeqCst) {
-                    break;
-                }
-                let inter_iter_us = if let Some(prev) = last_iter_end {
-                    Some(prev.elapsed().as_micros() as u64)
-                } else {
-                    None
-                };
-                let outcome = match inner.run_iteration().await {
-                    Ok(outcome) => outcome,
-                    Err(error) => {
-                        warn!("Iteration error: {}", error);
-                        EngineIterationOutcome::Progressed
-                    }
-                };
-                if prof {
-                    let n = GAP_PROF_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    if n.is_multiple_of(8) {
-                        if let Some(gap_us) = inter_iter_us {
-                            eprintln!("[bg-loop-gap] call#{} inter_iter={}us", n, gap_us);
+    /// Start or observe the one managed iteration task. The returned observer
+    /// has no abort authority. A closing engine cannot be restarted.
+    pub fn start_loop(&self) -> Result<DriverObserver> {
+        let inner = self.active_inner()?;
+        self.driver.start(&inner)
+    }
+
+    async fn publish_request(
+        &self,
+        request: InferenceRequest,
+        mut sequence: SequenceState,
+    ) -> Result<()> {
+        let inner = self.active_inner()?;
+        let request_id = request.id.clone();
+        let _iteration = inner.iteration_lock.lock().await;
+        self.driver.publish(&inner, || {
+            inner
+                .sequences
+                .publish(request_id.clone(), || {
+                    // No cancellable await exists after opening the product slot.
+                    // The same gate serializes this publication with shutdown.
+                    sequence.request_slot =
+                        Some(RequestSlotLease::open(&inner, request_id.clone()));
+                    if let Err(error) = inner.scheduler.submit_request(request) {
+                        if let Some(slot) = sequence.request_slot.take() {
+                            slot.reject(&inner, error.to_string());
                         }
+                        return Err(error);
                     }
-                }
-                last_iter_end = Some(std::time::Instant::now());
-                if !inner.is_running.load(Ordering::SeqCst) {
-                    break;
-                }
-                match outcome {
-                    EngineIterationOutcome::Progressed => tokio::task::yield_now().await,
-                    EngineIterationOutcome::Idle => {
-                        tokio::select! {
-                            _ = inner.wait_for_prefix_deadline() => {}
-                            _ = inner.shutdown_notify.notified() => {}
-                            _ = inner.work_notify.notified() => {}
-                        }
-                    }
-                    EngineIterationOutcome::CapacityBlocked(registration) => {
-                        tokio::select! {
-                            _ = inner.wait_for_prefix_deadline() => {}
-                            _ = inner.shutdown_notify.notified() => {}
-                            _ = inner.work_notify.notified() => {}
-                            result = registration.wait_for_change() => {
-                                if let Err(error) = result {
-                                    warn!("Executor capacity wait error: {}", error);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            info!("Background iteration loop stopped");
-        })
+                    sequence
+                        .request_slot
+                        .as_mut()
+                        .expect("new publication owns its slot")
+                        .admit(&inner);
+                    Ok(sequence)
+                })
+                .map(drop)
+        })?;
+        inner.work_notify.notify_one();
+        Ok(())
     }
 }
 
 #[async_trait]
 impl LlmInferenceEngine for ContinuousBatchEngine {
     fn adapter_execution_support(&self) -> AdapterExecutionSupport {
-        self.inner.model_executor.adapter_execution_support()
+        self.adapter_support
     }
 
-    fn execution_resource_authority(&self) -> ExecutionResourceAuthority {
-        self.inner.resource_composition.authority()
+    fn execution_planning_model(&self) -> ExecutionPlanningModel {
+        self.planning_model
     }
 
     fn context_capacity(&self) -> Option<usize> {
-        effective_request_context_capacity(
-            &self.inner.config,
-            &self.inner.runtime_config,
-            self.inner.model_executor.kv_capacity(),
-        )
+        self.context_capacity
     }
 
-    async fn infer(&self, mut request: InferenceRequest) -> Result<InferenceResponse> {
+    async fn infer(&self, mut request: InferenceRequest) -> Result<InferenceOutput> {
+        let inner = self.active_inner()?;
+        let ingress = request.ensure_ingress(RequestIngressBoundary::EngineApi);
         self.adapter_execution_support()
             .validate_metadata(&request.metadata)?;
-        let request_id = request.id.clone();
-        let infer_start = Instant::now();
+        let session = inner.output_budget.try_open_session()?;
         counter!("ferrum.engine.requests_total").increment(1);
 
-        let input_tokens = self.inner.tokenizer.encode(&request.prompt, true)?;
+        let input_tokens = inner.tokenizer.encode(&request.prompt, true)?;
         clamp_default_max_tokens_to_context(
             &mut request,
             input_tokens.len(),
-            &self.inner.config,
-            &self.inner.runtime_config,
-            self.inner.model_executor.kv_capacity(),
+            &inner.config,
+            &inner.runtime_config,
+            inner.model_executor.kv_capacity(),
         );
         validate_request_context_budget(
             &request,
             input_tokens.len(),
-            &self.inner.config,
-            &self.inner.runtime_config,
-            self.inner.model_executor.kv_capacity(),
+            &inner.config,
+            &inner.runtime_config,
+            inner.model_executor.kv_capacity(),
         )?;
         request.metadata.insert(
             PROMPT_TOKENS_METADATA_KEY.to_string(),
@@ -2969,10 +2453,9 @@ impl LlmInferenceEngine for ContinuousBatchEngine {
         // respect to the iteration driver. Typed admission must never observe
         // one without the other.
         let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
-        let mut receiver_drop_wake =
-            ClientReceiverDropWake::new(Arc::clone(&self.inner.work_notify));
+        let mut receiver_drop_wake = ClientReceiverDropWake::new(Arc::clone(&inner.work_notify));
         let structured_factory = if request.requires_structured_output() {
-            Some(self.inner.structured_output_factory()?)
+            Some(inner.structured_output_factory()?)
         } else {
             None
         };
@@ -2980,58 +2463,14 @@ impl LlmInferenceEngine for ContinuousBatchEngine {
             SequenceState::try_new_with_tokenizer_model_vocab_and_structured_factory(
                 request.clone(),
                 input_tokens,
-                Some(self.inner.tokenizer.clone()),
-                Some(self.inner.model_executor.info().vocab_size),
+                Some(inner.tokenizer.clone()),
+                Some(inner.model_executor.info().vocab_size),
                 structured_factory.as_deref(),
+                session.clone(),
             )?;
-        gauge!("ferrum.engine.active_requests").increment(1.0);
-        let request_slot = RequestSlotLease::open(&self.inner, request_id.clone());
         seq_state.response_sender = Some(resp_tx);
-        seq_state.request_slot = Some(request_slot);
-        {
-            let _iteration = self.inner.iteration_lock.lock().await;
-            {
-                let mut sequences = self.inner.sequences.write();
-                if sequences.contains_key(&request_id) {
-                    let error = FerrumError::already_exists(format!(
-                        "request {} is already active",
-                        request_id
-                    ));
-                    if let Some(request_slot) = seq_state.request_slot.take() {
-                        request_slot.reject(&self.inner, error.to_string());
-                    }
-                    gauge!("ferrum.engine.active_requests").decrement(1.0);
-                    return Err(error);
-                }
-                sequences.insert(request_id.clone(), seq_state);
-            }
-            if let Err(error) = self.inner.scheduler.submit(request).await {
-                let mut sequence = self
-                    .inner
-                    .sequences
-                    .write()
-                    .remove(&request_id)
-                    .expect("just-published sequence remains present after submit failure");
-                if let Some(request_slot) = sequence.request_slot.take() {
-                    request_slot.reject(&self.inner, error.to_string());
-                }
-                gauge!("ferrum.engine.active_requests").decrement(1.0);
-                return Err(error);
-            }
-            self.inner
-                .sequences
-                .write()
-                .get_mut(&request_id)
-                .and_then(|sequence| sequence.request_slot.as_mut())
-                .expect("submitted sequence retains its request slot")
-                .admit(&self.inner);
-        }
-
-        // Make sure the single shared bg loop is running, then just wait
-        // for our oneshot to fire. Avoids per-request drive_to_completion
-        // contention on iteration_lock.
-        self.ensure_bg_loop();
-        self.inner.work_notify.notify_one();
+        self.publish_request(request, seq_state).await?;
+        let _active_request = ActiveInferGuard::new();
 
         let result = resp_rx.await.unwrap_or_else(|_| {
             Err(FerrumError::internal(
@@ -3040,13 +2479,13 @@ impl LlmInferenceEngine for ContinuousBatchEngine {
         });
         receiver_drop_wake.disarm();
 
-        gauge!("ferrum.engine.active_requests").decrement(1.0);
-        let elapsed_ms = infer_start.elapsed().as_secs_f64() * 1000.0;
+        let elapsed_ms = ingress.elapsed().as_secs_f64() * 1000.0;
         histogram!("ferrum.engine.request_duration_ms").record(elapsed_ms);
 
         if let Ok(ref resp) = result {
             counter!("ferrum.engine.requests_completed").increment(1);
-            counter!("ferrum.engine.tokens_generated_total").increment(resp.tokens.len() as u64);
+            counter!("ferrum.engine.tokens_generated_total")
+                .increment(resp.response().tokens.len() as u64);
             // NOTE: real TTFT lives in `send_stream_update` —
             // emitted as `ferrum.engine.ttft_seconds`. The sync `infer`
             // path returns the whole response at once, so there's no
@@ -3058,30 +2497,34 @@ impl LlmInferenceEngine for ContinuousBatchEngine {
         result
     }
 
-    async fn infer_stream(
-        &self,
-        mut request: InferenceRequest,
-    ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamChunk>> + Send>>> {
+    async fn infer_stream(&self, mut request: InferenceRequest) -> Result<InferenceStream> {
+        let inner = self.active_inner()?;
+        request.ensure_ingress(RequestIngressBoundary::EngineApi);
         self.adapter_execution_support()
             .validate_metadata(&request.metadata)?;
-        let (tx, rx) = mpsc::channel(100);
-        let receiver_drop_wake = ClientReceiverDropWake::new(Arc::clone(&self.inner.work_notify));
-        let request_id = request.id.clone();
+        let session = inner.output_budget.try_open_session()?;
+        let (tx, rx) = OutputSender::new(
+            inner.self_weak.clone(),
+            request.id.clone(),
+            session.clone(),
+            inner.config.output.engine_queue_items,
+        );
+        let receiver_drop_wake = ClientReceiverDropWake::new(Arc::clone(&inner.work_notify));
 
-        let input_tokens = self.inner.tokenizer.encode(&request.prompt, true)?;
+        let input_tokens = inner.tokenizer.encode(&request.prompt, true)?;
         clamp_default_max_tokens_to_context(
             &mut request,
             input_tokens.len(),
-            &self.inner.config,
-            &self.inner.runtime_config,
-            self.inner.model_executor.kv_capacity(),
+            &inner.config,
+            &inner.runtime_config,
+            inner.model_executor.kv_capacity(),
         );
         validate_request_context_budget(
             &request,
             input_tokens.len(),
-            &self.inner.config,
-            &self.inner.runtime_config,
-            self.inner.model_executor.kv_capacity(),
+            &inner.config,
+            &inner.runtime_config,
+            inner.model_executor.kv_capacity(),
         )?;
         request.metadata.insert(
             PROMPT_TOKENS_METADATA_KEY.to_string(),
@@ -3091,7 +2534,7 @@ impl LlmInferenceEngine for ContinuousBatchEngine {
         // Publish tokenized state and the scheduler item under the same
         // iteration boundary; see the non-streaming path above.
         let structured_factory = if request.requires_structured_output() {
-            Some(self.inner.structured_output_factory()?)
+            Some(inner.structured_output_factory()?)
         } else {
             None
         };
@@ -3099,127 +2542,56 @@ impl LlmInferenceEngine for ContinuousBatchEngine {
             SequenceState::try_new_with_tokenizer_model_vocab_and_structured_factory(
                 request.clone(),
                 input_tokens,
-                Some(self.inner.tokenizer.clone()),
-                Some(self.inner.model_executor.info().vocab_size),
+                Some(inner.tokenizer.clone()),
+                Some(inner.model_executor.info().vocab_size),
                 structured_factory.as_deref(),
+                session.clone(),
             )?;
-        let request_slot = RequestSlotLease::open(&self.inner, request_id.clone());
         seq_state.stream_sender = Some(tx);
-        seq_state.request_slot = Some(request_slot);
-        {
-            let _iteration = self.inner.iteration_lock.lock().await;
-            {
-                let mut sequences = self.inner.sequences.write();
-                if sequences.contains_key(&request_id) {
-                    let error = FerrumError::already_exists(format!(
-                        "request {} is already active",
-                        request_id
-                    ));
-                    if let Some(request_slot) = seq_state.request_slot.take() {
-                        request_slot.reject(&self.inner, error.to_string());
-                    }
-                    return Err(error);
-                }
-                sequences.insert(request_id.clone(), seq_state);
+        self.publish_request(request, seq_state).await?;
+
+        Ok(InferenceStream::new(
+            session,
+            Box::pin(CancellationAwareResponseStream {
+                receiver: rx,
+                receiver_drop_wake,
+            }),
+        ))
+    }
+}
+
+impl EngineInner {
+    fn memory_snapshot(&self) -> (ferrum_types::MemoryObservation, bool) {
+        match self.model_executor.memory_observation() {
+            Ok(observation) => (observation, true),
+            Err(error) => {
+                warn!(error = %error, "Executor resource observation failed");
+                (ferrum_types::MemoryObservation::Unknown, false)
             }
-            if let Err(error) = self.inner.scheduler.submit(request).await {
-                let mut sequence = self
-                    .inner
-                    .sequences
-                    .write()
-                    .remove(&request_id)
-                    .expect("just-published sequence remains present after submit failure");
-                if let Some(request_slot) = sequence.request_slot.take() {
-                    request_slot.reject(&self.inner, error.to_string());
-                }
-                return Err(error);
-            }
-            self.inner
-                .sequences
-                .write()
-                .get_mut(&request_id)
-                .and_then(|sequence| sequence.request_slot.as_mut())
-                .expect("submitted sequence retains its request slot")
-                .admit(&self.inner);
         }
-
-        // Single shared bg loop drives iters; per-request stream just
-        // consumes from `rx`. Used to spawn a per-request drive_to_completion
-        // task here, but with c=N concurrent streams that produced N
-        // tasks all racing for `iteration_lock` — measured ~5ms/iter of
-        // tokio thundering-herd overhead at c=16.
-        let _ = request_id;
-        self.ensure_bg_loop();
-        self.inner.work_notify.notify_one();
-
-        Ok(Box::pin(CancellationAwareResponseStream {
-            receiver: tokio_stream::wrappers::ReceiverStream::new(rx),
-            receiver_drop_wake,
-        }))
     }
 }
 
 #[async_trait]
 impl InferenceEngine for ContinuousBatchEngine {
     async fn status(&self) -> EngineStatus {
-        let metrics = self.inner.scheduler.metrics();
-        let (total_bytes, used_bytes, cache_memory_bytes, resource_status_ready) =
-            match &self.inner.resource_composition {
-                EngineResourceComposition::LegacyEngine { kv_cache, .. } => {
-                    let kv_stats = kv_cache.stats();
-                    (
-                        kv_stats.total_memory_bytes,
-                        kv_stats.used_memory_bytes,
-                        kv_stats.used_memory_bytes,
-                        true,
-                    )
-                }
-                EngineResourceComposition::PlanRuntime => {
-                    match self.inner.model_executor.plan_runtime_resource_snapshot() {
-                        Ok(Some(snapshot)) => {
-                            let total_bytes = usize::try_from(snapshot.usable_capacity_bytes())
-                                .unwrap_or(usize::MAX);
-                            let used_bytes = snapshot
-                                .used_bytes()
-                                .ok()
-                                .and_then(|bytes| usize::try_from(bytes).ok())
-                                .unwrap_or(usize::MAX);
-                            let dynamic_used_bytes = usize::try_from(snapshot.dynamic_used_bytes())
-                                .unwrap_or(usize::MAX);
-                            (total_bytes, used_bytes, dynamic_used_bytes, true)
-                        }
-                        Ok(None) => {
-                            warn!("Plan runtime did not expose its required resource snapshot");
-                            (0, 0, 0, false)
-                        }
-                        Err(error) => {
-                            warn!(error = %error, "Plan-runtime resource snapshot failed");
-                            (0, 0, 0, false)
-                        }
-                    }
-                }
+        let Some(inner) = self.driver.active.lock().clone() else {
+            return EngineStatus {
+                is_ready: false,
+                loaded_models: Vec::new(),
+                active_requests: 0,
+                queued_requests: 0,
+                memory_usage: self.driver.final_memory.lock().clone().unwrap_or_default(),
+                uptime_seconds: 0,
+                last_heartbeat: chrono::Utc::now(),
+                version: env!("CARGO_PKG_VERSION").to_owned(),
             };
-        let free_bytes = total_bytes.saturating_sub(used_bytes);
-        let mut memory_usage = ferrum_types::MemoryUsage {
-            total_bytes,
-            used_bytes,
-            free_bytes,
-            gpu_memory_bytes: self
-                .inner
-                .config
-                .backend
-                .device
-                .is_gpu()
-                .then_some(used_bytes),
-            cpu_memory_bytes: matches!(self.inner.config.backend.device, Device::CPU)
-                .then_some(used_bytes),
-            cache_memory_bytes,
-            utilization_percent: 0.0,
         };
-        memory_usage.calculate_utilization();
+        let metrics = inner.scheduler.metrics();
+        let (memory_usage, resource_status_ready) = inner.memory_snapshot();
         EngineStatus {
-            is_ready: resource_status_ready && self.inner.is_running.load(Ordering::SeqCst),
-            loaded_models: vec![self.inner.config.model.model_id.clone()],
+            is_ready: resource_status_ready && self.driver.is_running(),
+            loaded_models: vec![inner.config.model.model_id.clone()],
             active_requests: metrics.running_requests,
             queued_requests: metrics.waiting_requests,
             memory_usage,
@@ -3230,73 +2602,22 @@ impl InferenceEngine for ContinuousBatchEngine {
     }
 
     async fn shutdown(&self) -> Result<()> {
-        let _shutdown_guard = self.inner.shutdown_lock.lock().await;
-        info!("Shutting down continuous batch engine");
-        let background_loop = {
-            let mut background_loop = self.inner.background_loop.lock();
-            self.inner.signal_shutdown();
-            background_loop.take()
-        };
+        let observer = self.driver.shutdown_active()?;
+        observer.wait().await.result()
+    }
 
-        let loop_result = match background_loop {
-            Some(background_loop) => background_loop.await.map_err(|error| {
-                FerrumError::internal(format!("background iteration loop failed: {error}"))
-            }),
-            None => Ok(()),
-        };
-        let readiness_result = self
-            .inner
-            .execution_readiness_waiters
-            .abort_and_join()
-            .await;
-        // Drop immutable checkpoint pins outside the cohort mutex before native
-        // resource shutdown. No pending dependency survives engine shutdown.
-        let prefix_cohorts = std::mem::take(&mut *self.inner.prefix_rendezvous.lock());
-        drop(prefix_cohorts);
-        let prefix_restores = std::mem::take(&mut *self.inner.prefix_restore_pending.lock());
-        drop(prefix_restores);
-
-        let mut trace_journals = Vec::with_capacity(2);
-        if let Some(journal) = self.inner.profile_trace_jsonl.clone() {
-            trace_journals.push(journal);
-        }
-        if let Some(journal) = self.inner.scheduler_trace_jsonl.clone() {
-            if trace_journals
-                .iter()
-                .all(|existing| existing.path() != journal.path())
-            {
-                trace_journals.push(journal);
-            }
-        }
-        let trace_result = if trace_journals.is_empty() {
-            Ok(())
-        } else {
-            tokio::task::spawn_blocking(move || {
-                for journal in trace_journals {
-                    journal.close()?;
-                }
-                Ok::<(), JsonlJournalError>(())
-            })
-            .await
-            .map_err(|error| {
-                FerrumError::internal(format!("scheduler trace close task failed: {error}"))
-            })?
-            .map_err(|error| {
-                FerrumError::internal(format!("scheduler trace close failed: {error}"))
-            })
-        };
-
-        loop_result?;
-        readiness_result?;
-        trace_result
+    async fn wait_for_shutdown_completion(&self) -> Result<()> {
+        let observer = self.driver.shutdown_active()?;
+        let report = observer.wait().await;
+        report.wait_for_shutdown_completion().await
     }
 
     fn config(&self) -> &EngineConfig {
-        &self.inner.config
+        &self.config
     }
 
     fn metrics(&self) -> ferrum_types::EngineMetrics {
-        let sm = self.inner.scheduler.metrics();
+        let sm = self.scheduler.metrics();
         ferrum_types::EngineMetrics {
             total_requests: sm.completed_requests + sm.failed_requests,
             successful_requests: sm.completed_requests,
@@ -3314,58 +2635,50 @@ impl InferenceEngine for ContinuousBatchEngine {
             },
             resource_utilization: Default::default(),
             error_stats: Default::default(),
-            performance_breakdown: self.inner.performance_breakdown(),
+            performance_breakdown: self
+                .driver
+                .active
+                .lock()
+                .as_ref()
+                .map(|inner| inner.performance_breakdown())
+                .unwrap_or_else(|| self.driver.final_performance.lock().clone()),
         }
     }
 
     fn cache_metrics_snapshot(&self) -> Option<serde_json::Value> {
-        self.inner.model_executor.cache_metrics_snapshot()
+        let inner = self.driver.active.lock().clone()?;
+        inner.model_executor.cache_metrics_snapshot()
     }
 
     fn execution_attribution_snapshot(&self) -> Option<serde_json::Value> {
-        self.inner.model_executor.execution_attribution_snapshot()
+        let inner = self.driver.active.lock().clone()?;
+        inner.model_executor.execution_attribution_snapshot()
     }
 
     fn scheduler_slo_snapshot(&self) -> Option<serde_json::Value> {
-        serde_json::to_value(self.inner.scheduler.slo_snapshot()?).ok()
+        serde_json::to_value(self.scheduler.slo_snapshot()?).ok()
     }
 
     fn admission_snapshot(
         &self,
     ) -> ferrum_types::Result<Option<ferrum_types::ExecutorAdmissionSnapshot>> {
-        let scheduler = self.inner.scheduler.admission_phase_counts();
-        let authority = self.inner.resource_composition.authority();
-        let limits = match authority {
-            ExecutionResourceAuthority::PlanRuntime => self
-                .inner
-                .model_executor
-                .admission_limits()?
-                .ok_or_else(|| {
-                    FerrumError::internal(
-                        "PlanRuntime executor did not expose its resolved admission limits",
-                    )
-                })?,
-            ExecutionResourceAuthority::LegacyEngine => {
-                let scheduler_limit = self.inner.config.scheduler.max_running_requests;
-                let maximum_active_sequences = self
-                    .inner
-                    .recurrent_state_manager()
-                    .map(|manager| scheduler_limit.min(manager.stats().total_batch_slots))
-                    .unwrap_or(scheduler_limit);
-                ferrum_types::ExecutorAdmissionLimits::new(
-                    u32::try_from(maximum_active_sequences).map_err(|_| {
-                        FerrumError::internal("legacy admission sequence limit exceeds u32")
-                    })?,
-                    u64::try_from(self.inner.config.batching.max_num_batched_tokens).map_err(
-                        |_| FerrumError::internal("legacy scheduled-token limit exceeds u64"),
-                    )?,
-                )
-                .map_err(|reason| {
-                    FerrumError::internal(format!(
-                        "legacy admission limits violated their typed contract: {reason}"
-                    ))
-                })?
+        let inner = self.active_inner()?;
+        let scheduler = inner.scheduler.admission_phase_counts();
+        let authority = inner.model_executor.execution_planning_model();
+        let limits = match inner.model_executor.admission_limits()? {
+            Some(limits) => limits,
+            None if authority == ExecutionPlanningModel::CompiledPlan => {
+                return Err(FerrumError::internal(
+                    "CompiledPlan executor did not expose its resolved admission limits",
+                ));
             }
+            None => ferrum_types::ExecutorAdmissionLimits::new(
+                u32::try_from(inner.config.scheduler.max_running_requests)
+                    .map_err(|_| FerrumError::internal("service sequence limit exceeds u32"))?,
+                u64::try_from(inner.config.batching.max_num_batched_tokens)
+                    .map_err(|_| FerrumError::internal("service token limit exceeds u64"))?,
+            )
+            .map_err(FerrumError::config)?,
         };
         ferrum_types::ExecutorAdmissionSnapshot::new(
             authority,
@@ -3388,11 +2701,12 @@ impl InferenceEngine for ContinuousBatchEngine {
     }
 
     fn lora_metrics_snapshot(&self) -> Option<serde_json::Value> {
-        self.inner.model_executor.lora_metrics_snapshot()
+        let inner = self.driver.active.lock().clone()?;
+        inner.model_executor.lora_metrics_snapshot()
     }
 
     async fn health_check(&self) -> ferrum_types::HealthStatus {
-        if self.inner.is_running.load(Ordering::SeqCst) {
+        if self.driver.is_running() {
             ferrum_types::HealthStatus::healthy()
         } else {
             ferrum_types::HealthStatus {
@@ -3404,15 +2718,21 @@ impl InferenceEngine for ContinuousBatchEngine {
     }
 }
 
+impl Drop for ContinuousBatchEngine {
+    fn drop(&mut self) {
+        // The managed task and executor owner survive a cancelled product builder.
+        let _ = self.driver.shutdown_active();
+    }
+}
+
 impl std::fmt::Debug for ContinuousBatchEngine {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ContinuousBatchEngine")
-            .field("is_running", &self.inner.is_running.load(Ordering::SeqCst))
+            .field("is_running", &self.driver.is_running())
             .field(
-                "iteration_count",
-                &self.inner.iteration_count.load(Ordering::SeqCst),
+                "active_requests",
+                &self.scheduler.metrics().running_requests,
             )
-            .field("active_sequences", &self.inner.sequences.read().len())
             .finish()
     }
 }
@@ -3423,3 +2743,16 @@ impl std::fmt::Debug for ContinuousBatchEngine {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod token_completion_tests;
+
+#[cfg(test)]
+#[path = "continuous_engine/executor_shutdown_tests.rs"]
+mod executor_shutdown_tests;
+
+#[cfg(test)]
+mod attempt_observation_tests;
+
+#[cfg(all(test, feature = "metal", target_os = "macos"))]
+mod native_prefix_feedback_tests;

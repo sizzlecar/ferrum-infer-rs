@@ -388,6 +388,7 @@ fn identity_projection_off_submission_stays_lazy_until_explicit_observation() {
         &identity,
         active.iter(),
         DeviceTimingMode::Off,
+        ExecutionFactsCapture::Off,
         &[],
         SubmissionExecutionPolicy::adaptive(),
         InvocationPreparationStrategy::IdentityProjection,

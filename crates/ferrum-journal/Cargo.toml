@@ -1,0 +1,14 @@
+[package]
+name = "ferrum-journal"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Bounded JSONL publication and writer lifecycle for Ferrum"
+readme = "../../README.md"
+
+[dependencies]
+ferrum-types = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }

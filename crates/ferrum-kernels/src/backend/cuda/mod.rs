@@ -28,7 +28,7 @@
 //   Phase 1 (#8): INT8 KV (`BackendInt8KvOps` + helpers + `KvCacheQuant`
 //     constructor) → `cuda/int8_kv.rs`.
 //   Phase 2: `BackendCollective` → `cuda/collective.rs`. `BackendGraph` +
-//     `GraphSlotRaw` + `DECODE_GRAPHS` helpers → `cuda/graph.rs`.
+//     `GraphSlotRaw` + instance graph cache helpers → `cuda/graph.rs`.
 //   Phase 3: `BackendQuantMarlin` + `BackendQuantGguf` (incl.
 //     `GptqStoreCuda`, `marlin_gemm_with_perm`, `launch_vllm_marlin`,
 //     `MarlinGatherScratch`, `moe_gemm_phase_fused_impl`) → `cuda/quant.rs`.
@@ -40,18 +40,21 @@
 //     `moe_combine`) → `cuda/moe.rs`.
 //
 // After Phase 5, `cuda/mod.rs` only carries `impl Backend for
-// CudaBackend` (the core trait) + `CudaState` struct + global
-// stream/decode-state slots + `KvFp16` BackendKvDtype impl.
+// CudaBackend` (the core trait) + original `CudaState` resource owner
+// + `KvFp16` BackendKvDtype impl.
 pub mod collective;
 pub mod fa2_ffi;
 #[cfg(feature = "fa2-source")]
 pub mod fa2_source;
 pub mod gated_delta_rule;
 pub mod graph;
+#[cfg(test)]
+mod instance_owner_tests;
 pub mod int8_kv;
 pub mod linear_attention;
 pub mod moe;
 pub mod paged;
+mod qkv;
 pub mod quant;
 
 // Audit #9: CUDA-only kernels moved from crate-root to backend/cuda/.
@@ -61,17 +64,11 @@ pub mod quant;
 // references keep working unchanged.
 pub mod cublas;
 #[cfg(feature = "candle-cuda-compat")]
-pub mod cuda_decode;
-#[cfg(feature = "candle-cuda-compat")]
-pub mod cuda_graph;
-#[cfg(feature = "candle-cuda-compat")]
 pub mod decode_attention;
-pub mod decode_buffers;
 #[cfg(feature = "candle-cuda-compat")]
 pub mod fused_add_rms_norm;
 #[cfg(feature = "candle-cuda-compat")]
 pub mod fused_silu_mul;
-pub mod gpu_paged_kv;
 pub mod marlin;
 #[cfg(not(target_os = "windows"))]
 pub mod nccl_comm;
@@ -81,14 +78,10 @@ pub mod residual_add;
 pub mod rms_norm;
 #[cfg(feature = "candle-cuda-compat")]
 pub mod rope;
-#[cfg(all(feature = "candle-cuda-compat", not(target_os = "windows")))]
-pub mod tp_decode;
 pub mod vnext_ops;
 mod vnext_replay;
 pub mod vnext_runtime;
 mod vnext_tool_correlation;
-#[cfg(feature = "candle-cuda-compat")]
-pub mod weight_store;
 
 // Triton kernels (only when the `triton-kernels` feature is also on —
 // `cuda` alone doesn't enable them).
@@ -152,91 +145,6 @@ use half::f16;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct CudaBackendRuntimeEnv {
-    moe_streams: usize,
-    cuda_max_kv: Option<usize>,
-    cuda_device: usize,
-}
-
-impl CudaBackendRuntimeEnv {
-    fn from_env() -> Self {
-        Self::from_env_vars(std::env::vars())
-    }
-
-    fn from_env_vars<I, K, V>(vars: I) -> Self
-    where
-        I: IntoIterator<Item = (K, V)>,
-        K: AsRef<str>,
-        V: Into<String>,
-    {
-        let mut moe_streams = None;
-        let mut cuda_max_kv = None;
-        let mut cuda_device = None;
-
-        for (key, value) in vars {
-            let value = value.into();
-            match key.as_ref() {
-                "FERRUM_MOE_STREAMS" => moe_streams = value.parse::<usize>().ok(),
-                "FERRUM_CUDA_MAX_KV" => cuda_max_kv = value.parse::<usize>().ok(),
-                "FERRUM_CUDA_DEVICE" => cuda_device = value.parse::<usize>().ok(),
-                _ => {}
-            }
-        }
-
-        Self {
-            moe_streams: moe_streams.unwrap_or(4).max(1),
-            cuda_max_kv,
-            cuda_device: cuda_device.unwrap_or(0),
-        }
-    }
-}
-
-fn cuda_backend_runtime_env() -> &'static CudaBackendRuntimeEnv {
-    static CONFIG: std::sync::OnceLock<CudaBackendRuntimeEnv> = std::sync::OnceLock::new();
-    CONFIG.get_or_init(CudaBackendRuntimeEnv::from_env)
-}
-
-thread_local! {
-    static CUDA_DEVICE_SCOPE: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
-}
-
-struct CudaDeviceScopeGuard {
-    previous: Option<usize>,
-}
-
-impl CudaDeviceScopeGuard {
-    fn enter(ordinal: usize) -> Self {
-        let previous = CUDA_DEVICE_SCOPE.with(|scope| {
-            let previous = scope.get();
-            scope.set(Some(ordinal));
-            previous
-        });
-        Self { previous }
-    }
-}
-
-impl Drop for CudaDeviceScopeGuard {
-    fn drop(&mut self) {
-        CUDA_DEVICE_SCOPE.with(|scope| scope.set(self.previous));
-    }
-}
-
-pub(super) fn current_device_ordinal() -> usize {
-    CUDA_DEVICE_SCOPE
-        .with(|scope| scope.get())
-        .unwrap_or(cuda_backend_runtime_env().cuda_device)
-}
-
-fn with_cuda_device_ordinal<R>(device_ordinal: Option<usize>, body: impl FnOnce() -> R) -> R {
-    if let Some(ordinal) = device_ordinal {
-        let _guard = CudaDeviceScopeGuard::enter(ordinal);
-        body()
-    } else {
-        body()
-    }
-}
-
 // ────────────────────────────────────────────────────────────────────────
 // Context
 // ────────────────────────────────────────────────────────────────────────
@@ -245,50 +153,37 @@ fn with_cuda_device_ordinal<R>(device_ordinal: Option<usize>, body: impl FnOnce(
 ///
 /// Owns the `CudaContext`, a dedicated `CudaStream`, a cuBLAS handle
 /// bound to that stream, and a lazy cache of PTX modules. All kernels
-/// launch on `stream`; sync'ing `stream` covers all of this backend's work.
+/// launch on the instance's stream(s); completion observes the main stream
+/// and any auxiliary MoE streams before releasing execution leases.
 pub struct CudaState {
-    pub ordinal: usize,
-    pub ctx: Arc<CudaContext>,
-    pub stream: Arc<CudaStream>,
-    /// Shared cuBLAS handle (process-global, initialised once). Graph
-    /// capture records pointers to the cuBLAS workspace; a per-ctx
-    /// workspace would dangle after ctx drop → CUDA_ERROR_INVALID_VALUE
-    /// at next sync. Share the handle so the workspace outlives captures.
-    pub blas: Arc<CudaBlas>,
-    modules: HashMap<&'static str, Arc<CudaModule>>,
-    pub use_dev_state: bool,
-    /// True between begin_graph_capture and end_graph_capture.
-    pub capture_in_flight: bool,
-    // Every graph uploaded/launched through this context remains owned until
-    // this exact context is known quiescent, even if its cache entry is evicted.
+    configuration: ferrum_types::BackendContextConfig,
+    fa2_shim: Option<fa2_ffi::Fa2Shim>,
+    // Programs and in-flight leases retire before their captured resource closure.
+    graph_cache: HashMap<u64, Arc<graph::GraphSlotRaw>>,
     graph_leases: graph::GraphLeases,
-    /// Stable scratch buffers for batched-decode kernels that take per-item
-    /// device-pointer arrays (flash_attn_batched, kv_cache_append_batched).
-    /// Per-call `alloc_zeros::<T>(m)` was 3 allocs × 32 layers × 3 ops
-    /// = ~96 allocs/token. Caching here saves the allocator overhead AND
-    /// keeps the buffer addresses stable across calls — required so a
-    /// future CUDA-graph capture can replay over them.
-    /// Allocated lazily to `BATCHED_SCRATCH_CAP` (covers max_seqs ≤ 64).
-    batched_scratch_u64_k: Option<CudaSlice<u64>>,
-    batched_scratch_u64_v: Option<CudaSlice<u64>>,
-    batched_scratch_u64_cache: Option<CudaSlice<u64>>,
-    batched_scratch_i32_kv_lens: Option<CudaSlice<i32>>,
-    batched_scratch_i32_cache_lens: Option<CudaSlice<i32>>,
-    /// Stable HOST-side staging buffers for the per-item u64/i32 arrays
-    /// fed into the device-side scratch via `stream.memcpy_htod`. The
-    /// memcpy is async and gets recorded in any active CUDA-graph
-    /// capture, which captures the HOST POINTER. If we used a local
-    /// Vec, that Vec drops at function return → captured graph holds a
-    /// dangling host pointer → replay reads garbage → MISALIGNED at
-    /// later kernel. Owning these on the long-lived CudaState keeps
-    /// the host pointers stable, and clearing+re-filling between calls
-    /// updates the contents the captured memcpy reads on each replay.
-    /// Fixed-size arrays (not Vec) avoid the realloc-invalidates-ptr trap.
-    batched_host_k_ptrs: Box<[u64; HOST_STAGING_TOTAL]>,
-    batched_host_v_ptrs: Box<[u64; HOST_STAGING_TOTAL]>,
-    batched_host_cache_ptrs: Box<[u64; HOST_STAGING_TOTAL]>,
-    batched_host_kv_lens: Box<[i32; HOST_STAGING_TOTAL]>,
-    batched_host_cache_lens: Box<[i32; HOST_STAGING_TOTAL]>,
+    // Replaced scratch remains owned until no cached or in-flight graph can
+    // reference it and actual completion has been observed. Growth is cold.
+    captured_storage: Vec<Box<dyn Send + Sync>>,
+    ordinal: usize,
+    ctx: Arc<CudaContext>,
+    stream: Arc<CudaStream>,
+    blas: Arc<CudaBlas>,
+    blas_resources: BlasSlot,
+    modules: HashMap<&'static str, Arc<CudaModule>>,
+    decode_state: DecodeStateBufs,
+    batched_scratch: BatchedScratchSlot,
+    argmax_out: Option<CudaSlice<i32>>,
+    qkv_scratch: qkv::QkvScratch,
+    #[cfg(feature = "vllm-moe-marlin")]
+    vllm_moe_c_tmp: Option<CudaSlice<f32>>,
+    #[cfg(feature = "marlin")]
+    marlin_gather_scratch: Option<quant::MarlinGatherScratch>,
+    split_k_scratch: Option<paged::SplitKScratch>,
+    #[cfg(feature = "vllm-paged-attn-v2")]
+    paged_attention_scratch: Option<vllm_paged_attn::PagedAttnScratch>,
+    use_dev_state: bool,
+    capture_in_flight: bool,
+    completion_observed: bool,
     /// Stream pool for parallel MoE expert dispatch. At c=32 with 128
     /// active experts, ~256 sequential Marlin GEMMs/layer hit launch +
     /// SM-allocation serialization. Round-robin across N streams lets
@@ -326,113 +221,54 @@ pub struct CudaState {
     /// that triggered CUDA_ERROR_ILLEGAL_ADDRESS via stream-ordered free.
     paged_attn_out_tm: Option<crate::backend::CudaBuf>,
     paged_attn_out_tm_capacity: usize,
-}
-
-// Process-global fp32 reduce scratch for vLLM marlin_moe_wna16.
-//
-// Sized at the upper bound vLLM uses internally:
-// `sms * 4 * moe_block_size * max_thread_n`, with the vLLM special-case
-// doubling for `moe_block_size=8`. That is 4M fp32 = 16MB on a 4090.
-//
-// MUST be process-global (not per-CudaState) for CUDA Graph capture.
-// `new_context()` builds a fresh CudaState every `decode_batch_internal`
-// call; if c_tmp lived on the state it would be dropped + reallocated
-// per call, but the captured graph holds the c_tmp pointer from
-// capture time → next replay reads a freed/reassigned address →
-// `cuGraphLaunch: CUDA_ERROR_INVALID_VALUE` on every pre-capture
-// replay (the post-capture replay just happens to still see the
-// original ctx's allocation). Mirrors the pattern already used by
-// `MARLIN_GATHER_SCRATCH`, cuBLAS workspace, and `BATCHED_SCRATCH_*`.
-#[cfg(feature = "vllm-moe-marlin")]
-static VLLM_MOE_C_TMP: std::sync::OnceLock<std::sync::RwLock<HashMap<usize, CudaSlice<f32>>>> =
-    std::sync::OnceLock::new();
-
-// Greedy-argmax output scratch — see `Backend::argmax_rows_f16`.
-// Process-global like VLLM_MOE_C_TMP so the GPU address baked into
-// captured kernel args stays valid for the engine's life. Allocated
-// to MAX_BATCH capacity on first use; the caller passes m ≤ capacity
-// and reads only the first m entries.
-static ARGMAX_OUT: std::sync::OnceLock<std::sync::RwLock<HashMap<usize, CudaSlice<i32>>>> =
-    std::sync::OnceLock::new();
-
-fn argmax_out_slots() -> &'static std::sync::RwLock<HashMap<usize, CudaSlice<i32>>> {
-    ARGMAX_OUT.get_or_init(|| std::sync::RwLock::new(HashMap::new()))
+    // Eager paged wrapper metadata, owned until checked context retirement.
+    // Captured batch attention uses the model's separately prepared views.
+    paged_attn_cu_seqlens: Option<crate::backend::CudaBuf>,
+    paged_attn_pos_offsets: Option<crate::backend::CudaBuf>,
+    paged_attn_metadata_capacity: usize,
 }
 
 fn with_argmax_out<R>(
     stream: &Arc<CudaStream>,
-    ordinal: usize,
+    slot: &mut Option<CudaSlice<i32>>,
+    capture_in_flight: bool,
+    captured_storage: &mut Vec<Box<dyn Send + Sync>>,
     m: usize,
     body: impl FnOnce(&mut CudaSlice<i32>) -> R,
 ) -> R {
-    let slots = argmax_out_slots();
-    // Fast path: existing buffer large enough.
-    {
-        let g = slots.read().expect("ARGMAX_OUT poisoned");
-        if let Some(buf) = g.get(&ordinal) {
-            if buf.len() >= m {
-                drop(g);
-                let mut w = slots.write().expect("ARGMAX_OUT poisoned");
-                return body(w.get_mut(&ordinal).expect("just observed Some"));
-            }
+    if slot.as_ref().is_none_or(|buf| buf.len() < m) {
+        assert!(
+            !capture_in_flight,
+            "argmax scratch must be grown before graph capture"
+        );
+        let capacity = m.max(64).next_power_of_two();
+        let next = unsafe { stream.alloc::<i32>(capacity) }.expect("argmax_out alloc");
+        if let Some(previous) = slot.replace(next) {
+            captured_storage.push(Box::new(previous));
         }
     }
-    // Slow path: allocate / grow. Round up so growth amortises.
-    let capacity = m.max(64).next_power_of_two();
-    let mut w = slots.write().expect("ARGMAX_OUT poisoned");
-    let need_alloc = w.get(&ordinal).map(|b| b.len() < m).unwrap_or(true);
-    if need_alloc {
-        let new = unsafe { stream.alloc::<i32>(capacity) }.expect("argmax_out alloc");
-        w.insert(ordinal, new);
-    }
-    body(w.get_mut(&ordinal).expect("alloc above"))
+    body(slot.as_mut().expect("argmax scratch initialized"))
 }
 
-#[cfg(feature = "vllm-moe-marlin")]
-fn vllm_moe_c_tmp_slots() -> &'static std::sync::RwLock<HashMap<usize, CudaSlice<f32>>> {
-    VLLM_MOE_C_TMP.get_or_init(|| std::sync::RwLock::new(HashMap::new()))
-}
-
-/// Run `body` with a `&mut CudaSlice<f32>` pointing at the process-
-/// global vLLM MoE fp32 reduce scratch. Allocates on first call only;
-/// every subsequent caller sees the SAME GPU address — graph-capture
-/// safe (the address baked into a captured kernel arg stays valid
-/// for the lifetime of the process).
 #[cfg(feature = "vllm-moe-marlin")]
 pub fn with_vllm_moe_c_tmp<R>(
     stream: &Arc<CudaStream>,
-    ordinal: usize,
+    slot: &mut Option<CudaSlice<f32>>,
+    capture_in_flight: bool,
     body: impl FnOnce(&mut CudaSlice<f32>) -> R,
 ) -> R {
-    let slots = vllm_moe_c_tmp_slots();
-    // Fast path: scratch already up. Take the write lock briefly to
-    // hand a `&mut` to the body. There is at most one engine forward
-    // call serialized on the model's iteration_lock at any time, so
-    // contention here is zero in practice.
-    {
-        let g = slots.read().expect("VLLM_MOE_C_TMP poisoned");
-        if g.contains_key(&ordinal) {
-            drop(g);
-            let mut w = slots.write().expect("VLLM_MOE_C_TMP poisoned");
-            let s = w.get_mut(&ordinal).expect("just observed Some");
-            return body(s);
-        }
-    }
-    // First-time alloc.
-    let mut w = slots.write().expect("VLLM_MOE_C_TMP poisoned");
-    if !w.contains_key(&ordinal) {
-        const C_TMP_SIZE_F32: usize = 4 * 1024 * 1024;
-        let buf = stream
-            .alloc_zeros::<f32>(C_TMP_SIZE_F32)
-            .expect("alloc_zeros vllm_moe_c_tmp_f32 (per-device)");
-        tracing::info!(
-            "vLLM moe c_tmp scratch allocated (device {ordinal}): {} fp32 ({:.1} MB)",
-            C_TMP_SIZE_F32,
-            (C_TMP_SIZE_F32 * 4) as f32 / 1e6
+    if slot.is_none() {
+        assert!(
+            !capture_in_flight,
+            "MoE scratch must be initialized before graph capture"
         );
-        w.insert(ordinal, buf);
+        *slot = Some(
+            stream
+                .alloc_zeros::<f32>(4 * 1024 * 1024)
+                .expect("alloc vllm_moe_c_tmp"),
+        );
     }
-    body(w.get_mut(&ordinal).unwrap())
+    body(slot.as_mut().expect("MoE scratch initialized"))
 }
 
 pub(super) const BATCHED_SCRATCH_CAP: usize = 64;
@@ -451,12 +287,17 @@ const MAX_GRAPH_SLOTS: usize = 2 * super::MAX_LAYERS_FOR_GRAPH;
 pub(super) const HOST_STAGING_TOTAL: usize = MAX_GRAPH_SLOTS * BATCHED_SCRATCH_CAP;
 
 impl CudaState {
+    /// Borrow the original execution stream for crate-owned math and timers.
+    pub(crate) fn stream(&self) -> &Arc<CudaStream> {
+        &self.stream
+    }
+
     /// Lazy-init the MoE stream pool on first access. Pool size is
-    /// 4 by default; override via FERRUM_MOE_STREAMS env (1 disables
-    /// multi-stream dispatch).
-    pub fn moe_stream_pool(&mut self) -> &[Arc<CudaStream>] {
+    /// 4 by default; the original context's `moe_streams` policy fixes
+    /// its size (1 selects serial expert dispatch).
+    fn moe_stream_pool(&mut self) -> &[Arc<CudaStream>] {
         if self.moe_streams.is_none() {
-            let n = cuda_backend_runtime_env().moe_streams;
+            let n = self.configuration.moe.moe_streams;
             let mut pool = Vec::with_capacity(n);
             for _ in 0..n {
                 let s = self
@@ -471,16 +312,11 @@ impl CudaState {
         self.moe_streams.as_ref().unwrap()
     }
 
-    // `vllm_moe_c_tmp` moved out of CudaState — see VLLM_MOE_C_TMP
-    // process-global below + `with_vllm_moe_c_tmp` helper. Was on
-    // per-state lazy-alloc; that caused INVALID_VALUE on every
-    // graph replay since each new_context() reseats the buffer.
-
     /// Lazy-init the persistent cuEvents used by
     /// `moe_gemm_phase_batched` for cross-stream sync. The (entry,
     /// exits) tuple is stable across calls — events are only ever
     /// recorded / waited on, never destroyed (until `Drop`).
-    pub fn moe_sync_events(
+    fn moe_sync_events(
         &mut self,
     ) -> (
         cudarc::driver::sys::CUevent,
@@ -522,10 +358,10 @@ impl CudaState {
         if let Some(m) = self.modules.get(key) {
             return m.clone();
         }
-        // Route through process-global cache — keeps Arc<CudaModule>
-        // alive forever so captured CUfunction handles never go stale
-        // even after this CudaState drops.
-        let m = ensure_module(self.ordinal, &self.ctx, key, ptx_src);
+        let m = self
+            .ctx
+            .load_module(Ptx::from_src(ptx_src.to_owned()))
+            .unwrap_or_else(|error| panic!("CudaBackend: load_module({key}): {error}"));
         self.modules.insert(key, m.clone());
         m
     }
@@ -558,6 +394,7 @@ struct FlashAttnParams {
     causal: i32,
     pos_offset: i32,
     kv_seq_stride: i32,
+    sliding_window: i32,
 }
 
 unsafe impl DeviceRepr for FlashAttnParams {}
@@ -567,38 +404,6 @@ unsafe impl DeviceRepr for FlashAttnParams {}
 // ────────────────────────────────────────────────────────────────────────
 
 pub struct CudaBackend;
-
-thread_local! {
-    static CUDA_ALLOC_LABELS: std::cell::RefCell<Vec<&'static str>> =
-        std::cell::RefCell::new(Vec::new());
-}
-
-#[must_use]
-pub struct CudaAllocLabelGuard;
-
-pub fn push_alloc_label(label: &'static str) -> CudaAllocLabelGuard {
-    CUDA_ALLOC_LABELS.with(|labels| labels.borrow_mut().push(label));
-    CudaAllocLabelGuard
-}
-
-impl Drop for CudaAllocLabelGuard {
-    fn drop(&mut self) {
-        CUDA_ALLOC_LABELS.with(|labels| {
-            labels.borrow_mut().pop();
-        });
-    }
-}
-
-fn current_cuda_alloc_label() -> String {
-    CUDA_ALLOC_LABELS.with(|labels| {
-        let labels = labels.borrow();
-        if labels.is_empty() {
-            "label=<none>".to_string()
-        } else {
-            format!("label={}", labels.join(">"))
-        }
-    })
-}
 
 fn cuda_alloc_failed(
     op: &str,
@@ -611,10 +416,9 @@ fn cuda_alloc_failed(
     let mem_info = cudarc::driver::result::mem_get_info()
         .map(|(free, total)| format!("free={free} total={total}"))
         .unwrap_or_else(|mem_err| format!("mem_get_info_failed={mem_err:?}"));
-    let alloc_label = current_cuda_alloc_label();
     let backtrace = std::backtrace::Backtrace::force_capture();
     panic!(
-        "{op} failed: dtype={dtype:?} elements={n} bytes={bytes} {mem_info} {alloc_label}: {err:?}\n{backtrace}"
+        "{op} failed: dtype={dtype:?} elements={n} bytes={bytes} {mem_info}: {err:?}\n{backtrace}"
     );
 }
 
@@ -651,57 +455,81 @@ impl Backend for CudaBackend {
 
     // ── Lifecycle ────────────────────────────────────────────────────────
 
-    fn new_context() -> Self::Context {
-        // Reuse the process-global stream populated by `default_stream()`.
-        // Model constructors call `B::from_slice` thousands of times to
-        // upload weights BEFORE the engine ever calls `new_context()`, so
-        // `default_stream()` has already lazily spun up a stream. Reusing
-        // it here keeps allocations + ops on the SAME stream — no
-        // cross-stream synchronization needed.
-        let ordinal = current_device_ordinal();
-        let stream = default_stream();
-        let ctx = stream.context().clone();
-        // Process-global blas handle + workspace. Critical for graph capture:
-        // the captured kernel args include the workspace pointer, which must
-        // outlive the ctx that owned it at capture time.
-        let blas = ensure_blas_handle(&stream);
-        // Ensure process-global decode state buffers exist.
-        ensure_decode_state_bufs(&stream);
-        // Process-global batched-scratch device + host arrays. SAME
-        // graph-capture lifetime requirement as cuBLAS workspace above:
-        // captured stream.memcpy_htod records the host array address;
-        // captured kernel arg holds the device scratch address; both
-        // must outlive every CudaState that triggers a capture+replay.
-        ensure_batched_scratch(&stream);
-
-        // Disable cudarc's per-slice event tracking globally. We run everything
-        // on one stream → CUDA stream semantics handle ordering natively.
-        // Critical for graph capture: without this, the post-capture `to_vec`
-        // dtoh sync hits cuStreamWaitEvent on events that were recorded during
-        // pre-capture weight htods and are stale after replay.
-        unsafe {
-            ctx.disable_event_tracking();
+    fn new_context(config: &ferrum_types::BackendContextConfig) -> Result<Self::Context> {
+        config.validate()?;
+        if config.collective.world_size != 1 {
+            return Err(FerrumError::unsupported(
+                "retained CUDA context has no multi-rank collective owner",
+            ));
         }
+        #[cfg(not(feature = "triton-kernels"))]
+        if config.cuda.triton_int4 {
+            return Err(FerrumError::unsupported(
+                "triton_int4 requires the triton-kernels feature",
+            ));
+        }
+        #[cfg(not(feature = "vllm-marlin"))]
+        if config.cuda.vllm_marlin {
+            return Err(FerrumError::unsupported(
+                "vllm_marlin requires the vllm-marlin feature",
+            ));
+        }
+        #[cfg(not(feature = "vllm-moe-marlin"))]
+        if config.moe.vllm_moe {
+            return Err(FerrumError::unsupported(
+                "vllm_moe requires the vllm-moe-marlin feature",
+            ));
+        }
+        #[cfg(not(feature = "fa2-source"))]
+        if config.cuda.fa2_source {
+            return Err(FerrumError::unsupported(
+                "fa2_source requires the fa2-source feature",
+            ));
+        }
+        let fa2_shim = if config.cuda.fa2_source {
+            None
+        } else {
+            config
+                .cuda
+                .fa2_direct_ffi_shim
+                .as_deref()
+                .map(fa2_ffi::Fa2Shim::load)
+                .transpose()?
+        };
+        let ordinal = config.device_ordinal;
+        let stream = fresh_stream(ordinal)?;
+        let ctx = stream.context().clone();
+        let blas_resources = BlasSlot::new(&stream);
+        let blas = blas_resources.blas.clone();
+        let decode_state = DecodeStateBufs::new(&stream);
+        let batched_scratch = BatchedScratchSlot::new(&stream);
 
-        Self::Context {
+        Ok(Self::Context {
+            configuration: config.clone(),
+            fa2_shim,
             ordinal,
             ctx,
             stream,
             blas,
+            graph_cache: HashMap::new(),
+            graph_leases: graph::GraphLeases::default(),
+            captured_storage: Vec::new(),
+            blas_resources,
             modules: HashMap::new(),
+            decode_state,
+            batched_scratch,
+            argmax_out: None,
+            qkv_scratch: qkv::QkvScratch::default(),
+            #[cfg(feature = "vllm-moe-marlin")]
+            vllm_moe_c_tmp: None,
+            #[cfg(feature = "marlin")]
+            marlin_gather_scratch: None,
+            split_k_scratch: None,
+            #[cfg(feature = "vllm-paged-attn-v2")]
+            paged_attention_scratch: None,
             use_dev_state: false,
             capture_in_flight: false,
-            graph_leases: graph::GraphLeases::default(),
-            batched_scratch_u64_k: None,
-            batched_scratch_u64_v: None,
-            batched_scratch_u64_cache: None,
-            batched_scratch_i32_kv_lens: None,
-            batched_scratch_i32_cache_lens: None,
-            batched_host_k_ptrs: Box::new([0u64; HOST_STAGING_TOTAL]),
-            batched_host_v_ptrs: Box::new([0u64; HOST_STAGING_TOTAL]),
-            batched_host_cache_ptrs: Box::new([0u64; HOST_STAGING_TOTAL]),
-            batched_host_kv_lens: Box::new([0i32; HOST_STAGING_TOTAL]),
-            batched_host_cache_lens: Box::new([0i32; HOST_STAGING_TOTAL]),
+            completion_observed: false,
             moe_streams: None,
             moe_entry_event: None,
             moe_exit_events: None,
@@ -710,14 +538,55 @@ impl Backend for CudaBackend {
             moe_route_capacity: 0,
             paged_attn_out_tm: None,
             paged_attn_out_tm_capacity: 0,
+            paged_attn_cu_seqlens: None,
+            paged_attn_pos_offsets: None,
+            paged_attn_metadata_capacity: 0,
+        })
+    }
+
+    fn context_config(ctx: &Self::Context) -> &ferrum_types::BackendContextConfig {
+        &ctx.configuration
+    }
+
+    fn begin_execution(ctx: &mut Self::Context) -> Result<()> {
+        if !ctx.completion_observed {
+            Self::observe_completion(ctx).into_result()?;
+        } else {
+            // A previous observation may have proven device completion while
+            // graph cleanup failed. Retry that original cleanup before reuse.
+            ctx.graph_leases.retire_completed(&ctx.graph_cache)?;
         }
+        ctx.completion_observed = false;
+        ctx.use_dev_state = false;
+        Ok(())
     }
 
-    fn with_device_ordinal<R>(device_ordinal: Option<usize>, body: impl FnOnce() -> R) -> R {
-        with_cuda_device_ordinal(device_ordinal, body)
+    fn retire_context(ctx: &mut Self::Context) -> Result<()> {
+        Self::reset_all_graphs(ctx);
+        // Final context retirement also observes ordinary eager work when
+        // there was no captured program; the storage-growth hook need not.
+        Self::observe_completion(ctx).into_result()
     }
 
-    fn supports_device_ordinal_scope() -> bool {
+    fn retain_buffer_until_completion(ctx: &mut Self::Context, buffer: Self::Buffer) {
+        ctx.captured_storage.push(Box::new(buffer));
+    }
+
+    fn from_weight_bytes_in_context(
+        ctx: &mut Self::Context,
+        raw: &[u8],
+        src_dtype: crate::backend::SrcDtype,
+    ) -> Self::Buffer {
+        Self::from_slice_in_context(ctx, &src_dtype.to_f32_vec(raw))
+    }
+
+    fn supports_device_ordinal() -> bool {
+        true
+    }
+
+    // This opts into retained-context lifecycle handling. Numerical/provider
+    // qualification remains specific to the selected model and CUDA route.
+    fn supports_retained_execution() -> bool {
         true
     }
 
@@ -726,7 +595,68 @@ impl Backend for CudaBackend {
     fn alloc_typed(dtype: crate::backend::Dtype, n: usize) -> Self::Buffer {
         use crate::backend::{CudaBuf, Dtype};
         let n = n.max(1);
-        with_stream(|stream| match dtype {
+        with_standalone_allocation(|stream| match dtype {
+            Dtype::F32 => match stream.alloc_zeros::<f32>(n) {
+                Ok(buf) => CudaBuf::from_f32(buf),
+                Err(err) => cuda_alloc_failed(
+                    "CudaBackend::alloc_typed alloc_zeros",
+                    dtype,
+                    n,
+                    std::mem::size_of::<f32>(),
+                    err,
+                ),
+            },
+            Dtype::F16 => match stream.alloc_zeros::<f16>(n) {
+                Ok(buf) => CudaBuf::from_f16(buf),
+                Err(err) => cuda_alloc_failed(
+                    "CudaBackend::alloc_typed alloc_zeros",
+                    dtype,
+                    n,
+                    std::mem::size_of::<f16>(),
+                    err,
+                ),
+            },
+            Dtype::U32 => match stream.alloc_zeros::<u32>(n) {
+                Ok(buf) => CudaBuf::from_u32(buf),
+                Err(err) => cuda_alloc_failed(
+                    "CudaBackend::alloc_typed alloc_zeros",
+                    dtype,
+                    n,
+                    std::mem::size_of::<u32>(),
+                    err,
+                ),
+            },
+            Dtype::I32 => match stream.alloc_zeros::<i32>(n) {
+                Ok(buf) => CudaBuf::from_i32(buf),
+                Err(err) => cuda_alloc_failed(
+                    "CudaBackend::alloc_typed alloc_zeros",
+                    dtype,
+                    n,
+                    std::mem::size_of::<i32>(),
+                    err,
+                ),
+            },
+            Dtype::I8 => match stream.alloc_zeros::<i8>(n) {
+                Ok(buf) => CudaBuf::from_i8(buf),
+                Err(err) => cuda_alloc_failed(
+                    "CudaBackend::alloc_typed alloc_zeros",
+                    dtype,
+                    n,
+                    std::mem::size_of::<i8>(),
+                    err,
+                ),
+            },
+        })
+    }
+
+    fn alloc_typed_in_context(
+        ctx: &mut Self::Context,
+        dtype: crate::backend::Dtype,
+        n: usize,
+    ) -> Self::Buffer {
+        use crate::backend::{CudaBuf, Dtype};
+        let n = n.max(1);
+        with_instance_allocation(ctx, |stream| match dtype {
             Dtype::F32 => match stream.alloc_zeros::<f32>(n) {
                 Ok(buf) => CudaBuf::from_f32(buf),
                 Err(err) => cuda_alloc_failed(
@@ -785,7 +715,43 @@ impl Backend for CudaBackend {
     /// `from_slice_i32` + ad-hoc `from_u32` helpers.
     fn from_slice_typed<T: crate::backend::HostDtype>(data: &[T]) -> Self::Buffer {
         use crate::backend::{CudaBuf, Dtype};
-        with_stream(|stream| match T::DTYPE {
+        with_standalone_allocation(|stream| match T::DTYPE {
+            Dtype::F32 => {
+                // SAFETY: T::DTYPE = F32 implies T = f32 (HostDtype is
+                // sealed by trait coherence on concrete primitives).
+                let host: &[f32] =
+                    unsafe { std::slice::from_raw_parts(data.as_ptr() as *const f32, data.len()) };
+                CudaBuf::from_f32(stream.clone_htod(host).expect("cuda htod f32"))
+            }
+            Dtype::F16 => {
+                let host: &[f16] =
+                    unsafe { std::slice::from_raw_parts(data.as_ptr() as *const f16, data.len()) };
+                CudaBuf::from_f16(stream.clone_htod(host).expect("cuda htod f16"))
+            }
+            Dtype::U32 => {
+                let host: &[u32] =
+                    unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u32, data.len()) };
+                CudaBuf::from_u32(stream.clone_htod(host).expect("cuda htod u32"))
+            }
+            Dtype::I32 => {
+                let host: &[i32] =
+                    unsafe { std::slice::from_raw_parts(data.as_ptr() as *const i32, data.len()) };
+                CudaBuf::from_i32(stream.clone_htod(host).expect("cuda htod i32"))
+            }
+            Dtype::I8 => {
+                let host: &[i8] =
+                    unsafe { std::slice::from_raw_parts(data.as_ptr() as *const i8, data.len()) };
+                CudaBuf::from_i8(stream.clone_htod(host).expect("cuda htod i8"))
+            }
+        })
+    }
+
+    fn from_slice_typed_in_context<T: crate::backend::HostDtype>(
+        ctx: &mut Self::Context,
+        data: &[T],
+    ) -> Self::Buffer {
+        use crate::backend::{CudaBuf, Dtype};
+        with_instance_allocation(ctx, |stream| match T::DTYPE {
             Dtype::F32 => {
                 // SAFETY: T::DTYPE = F32 implies T = f32 (HostDtype is
                 // sealed by trait coherence on concrete primitives).
@@ -874,8 +840,9 @@ impl Backend for CudaBackend {
     }
 
     fn sync(ctx: &mut Self::Context) {
-        ctx.stream.synchronize().expect("CudaBackend: stream sync");
-        ctx.graph_leases.clear();
+        Self::observe_completion(ctx)
+            .into_result()
+            .expect("CudaBackend: instance synchronization");
     }
 
     fn try_sync(ctx: &mut Self::Context) -> ferrum_types::Result<()> {
@@ -910,7 +877,15 @@ impl Backend for CudaBackend {
         match failure {
             Some(error) => BackendCompletion::Unresolved(error),
             None => {
-                ctx.graph_leases.clear();
+                ctx.completion_observed = true;
+                if let Err(error) = ctx.graph_leases.retire_completed(&ctx.graph_cache) {
+                    // The device is terminal. This is a separate cleanup
+                    // failure, with every unfinished handle still retained.
+                    return BackendCompletion::Failed(error);
+                }
+                if ctx.graph_cache.is_empty() && ctx.graph_leases.is_empty() {
+                    ctx.captured_storage.clear();
+                }
                 BackendCompletion::Succeeded
             }
         }
@@ -921,7 +896,23 @@ impl Backend for CudaBackend {
     }
 
     fn alloc(len: usize) -> Self::Buffer {
-        with_stream(|stream| {
+        with_standalone_allocation(|stream| {
+            let len = len.max(1);
+            match unsafe { stream.alloc::<f16>(len) } {
+                Ok(buf) => crate::backend::CudaBuf::from_f16(buf),
+                Err(err) => cuda_alloc_failed(
+                    "CudaBackend::alloc",
+                    crate::backend::Dtype::F16,
+                    len,
+                    std::mem::size_of::<f16>(),
+                    err,
+                ),
+            }
+        })
+    }
+
+    fn alloc_in_context(ctx: &mut Self::Context, len: usize) -> Self::Buffer {
+        with_instance_allocation(ctx, |stream| {
             let len = len.max(1);
             match unsafe { stream.alloc::<f16>(len) } {
                 Ok(buf) => crate::backend::CudaBuf::from_f16(buf),
@@ -938,7 +929,14 @@ impl Backend for CudaBackend {
 
     fn from_slice(data: &[f32]) -> Self::Buffer {
         let host: Vec<f16> = data.iter().map(|&x| f16::from_f32(x)).collect();
-        with_stream(|stream| {
+        with_standalone_allocation(|stream| {
+            crate::backend::CudaBuf::from_f16(stream.clone_htod(&host).expect("cuda htod"))
+        })
+    }
+
+    fn from_slice_in_context(ctx: &mut Self::Context, data: &[f32]) -> Self::Buffer {
+        let host: Vec<f16> = data.iter().map(|&x| f16::from_f32(x)).collect();
+        with_instance_allocation(ctx, |stream| {
             crate::backend::CudaBuf::from_f16(stream.clone_htod(&host).expect("cuda htod"))
         })
     }
@@ -1262,7 +1260,43 @@ impl Backend for CudaBackend {
     }
 
     fn to_vec(buf: &Self::Buffer, len: usize) -> Vec<f32> {
-        with_stream(|stream| {
+        // External callers must finish any use on another context first.
+        // This compatibility readback uses the actual allocation stream.
+        let stream = match buf.dtype() {
+            crate::backend::Dtype::F16 => buf.as_f16().stream(),
+            crate::backend::Dtype::F32 => buf.as_f32().stream(),
+            other => panic!("CUDA readback unsupported dtype {}", other.name()),
+        };
+        (|stream: &Arc<CudaStream>| {
+            // cudarc asserts host.len() >= buf.len() — but we may want a
+            // PARTIAL read (len < buf capacity), e.g. reading only 4 rows
+            // out of a batch_logits buffer sized for max_batch. Slice the
+            // device buffer so its reported length matches `len`.
+            match buf.dtype() {
+                crate::backend::Dtype::F16 => {
+                    let mut host = vec![f16::ZERO; len];
+                    let view = buf.as_f16().slice(0..len);
+                    stream.memcpy_dtoh(&view, &mut host).expect("cuda dtoh f16");
+                    stream.synchronize().expect("cuda dtoh sync");
+                    host.into_iter().map(|x| x.to_f32()).collect()
+                }
+                crate::backend::Dtype::F32 => {
+                    let mut host = vec![0.0f32; len];
+                    let view = buf.as_f32().slice(0..len);
+                    stream.memcpy_dtoh(&view, &mut host).expect("cuda dtoh f32");
+                    stream.synchronize().expect("cuda dtoh sync");
+                    host
+                }
+                other => panic!(
+                    "CudaBackend::to_vec unsupported dtype {} (expected F16 or F32)",
+                    other.name()
+                ),
+            }
+        })(stream)
+    }
+
+    fn to_vec_in_context(ctx: &mut Self::Context, buf: &Self::Buffer, len: usize) -> Vec<f32> {
+        with_instance_readback(ctx, |stream| {
             // cudarc asserts host.len() >= buf.len() — but we may want a
             // PARTIAL read (len < buf capacity), e.g. reading only 4 rows
             // out of a batch_logits buffer sized for max_batch. Slice the
@@ -1301,38 +1335,41 @@ impl Backend for CudaBackend {
         // At c=32, vocab=152064: 19.5 MB + 4.8 ms CPU → 128 B + ~0.3 ms GPU.
         let func = ctx.func("argmax_rows", ptx::ARGMAX_ROWS, "argmax_rows_f16");
         let stream = ctx.stream.clone();
-        // Output buffer: process-global, grown lazily. Reuses the same
-        // device allocation across iters (avoids ~30-50 µs / iter for
-        // `stream.alloc_zeros`). Mirrors the MARLIN_GATHER_SCRATCH /
-        // VLLM_MOE_C_TMP pattern; the slot is owned process-wide so the
-        // GPU address it hands out is stable for the engine's life
-        // (graph-capture safe — see vllm_moe_c_tmp's doc for rationale).
-        let host = with_argmax_out(&stream, ctx.ordinal, m, |out_dev| -> Result<Vec<i32>> {
-            let n_i32 = n as i32;
-            let mut b = stream.launch_builder(&func);
-            b.arg(logits);
-            b.arg(&n_i32);
-            b.arg(&mut *out_dev);
-            unsafe {
-                b.launch(LaunchConfig {
-                    grid_dim: (m as u32, 1, 1),
-                    block_dim: (256, 1, 1),
-                    shared_mem_bytes: 0,
-                })
-            }
-            .map_err(|e| FerrumError::internal(format!("argmax_rows launch: {e}")))?;
-            let mut host = vec![0i32; m];
-            // Use a sliced view so cudarc's host.len() == src.len() guard
-            // accepts (out_dev may be capacity > m).
-            let view = out_dev.slice(0..m);
-            stream
-                .memcpy_dtoh(&view, &mut host)
-                .map_err(|e| FerrumError::internal(format!("argmax_rows dtoh: {e}")))?;
-            stream
-                .synchronize()
-                .map_err(|e| FerrumError::internal(format!("argmax_rows sync: {e}")))?;
-            Ok(host)
-        })?;
+        // Reuse this context's output allocation across invocations.
+        // Captured predecessors survive growth until graph retirement.
+        let host = with_argmax_out(
+            &stream,
+            &mut ctx.argmax_out,
+            ctx.capture_in_flight,
+            &mut ctx.captured_storage,
+            m,
+            |out_dev| -> Result<Vec<i32>> {
+                let n_i32 = n as i32;
+                let mut b = stream.launch_builder(&func);
+                b.arg(logits);
+                b.arg(&n_i32);
+                b.arg(&mut *out_dev);
+                unsafe {
+                    b.launch(LaunchConfig {
+                        grid_dim: (m as u32, 1, 1),
+                        block_dim: (256, 1, 1),
+                        shared_mem_bytes: 0,
+                    })
+                }
+                .map_err(|e| FerrumError::internal(format!("argmax_rows launch: {e}")))?;
+                let mut host = vec![0i32; m];
+                // Use a sliced view so cudarc's host.len() == src.len() guard
+                // accepts (out_dev may be capacity > m).
+                let view = out_dev.slice(0..m);
+                stream
+                    .memcpy_dtoh(&view, &mut host)
+                    .map_err(|e| FerrumError::internal(format!("argmax_rows dtoh: {e}")))?;
+                stream
+                    .synchronize()
+                    .map_err(|e| FerrumError::internal(format!("argmax_rows sync: {e}")))?;
+                Ok(host)
+            },
+        )?;
         Ok(host.into_iter().map(|x| x as u32).collect())
     }
 
@@ -1346,33 +1383,40 @@ impl Backend for CudaBackend {
     ) -> Result<Vec<u32>> {
         let func = ctx.func("argmax_rows", ptx::ARGMAX_ROWS, "argmax_rows_f16_masked");
         let stream = ctx.stream.clone();
-        let host = with_argmax_out(&stream, ctx.ordinal, m, |out_dev| -> Result<Vec<i32>> {
-            let n_i32 = n as i32;
-            let mask_len_i32 = mask_len as i32;
-            let mut b = stream.launch_builder(&func);
-            b.arg(logits);
-            b.arg(&n_i32);
-            b.arg(valid_token_mask);
-            b.arg(&mask_len_i32);
-            b.arg(&mut *out_dev);
-            unsafe {
-                b.launch(LaunchConfig {
-                    grid_dim: (m as u32, 1, 1),
-                    block_dim: (256, 1, 1),
-                    shared_mem_bytes: 0,
-                })
-            }
-            .map_err(|e| FerrumError::internal(format!("argmax_rows_masked launch: {e}")))?;
-            let mut host = vec![0i32; m];
-            let view = out_dev.slice(0..m);
-            stream
-                .memcpy_dtoh(&view, &mut host)
-                .map_err(|e| FerrumError::internal(format!("argmax_rows_masked dtoh: {e}")))?;
-            stream
-                .synchronize()
-                .map_err(|e| FerrumError::internal(format!("argmax_rows_masked sync: {e}")))?;
-            Ok(host)
-        })?;
+        let host = with_argmax_out(
+            &stream,
+            &mut ctx.argmax_out,
+            ctx.capture_in_flight,
+            &mut ctx.captured_storage,
+            m,
+            |out_dev| -> Result<Vec<i32>> {
+                let n_i32 = n as i32;
+                let mask_len_i32 = mask_len as i32;
+                let mut b = stream.launch_builder(&func);
+                b.arg(logits);
+                b.arg(&n_i32);
+                b.arg(valid_token_mask);
+                b.arg(&mask_len_i32);
+                b.arg(&mut *out_dev);
+                unsafe {
+                    b.launch(LaunchConfig {
+                        grid_dim: (m as u32, 1, 1),
+                        block_dim: (256, 1, 1),
+                        shared_mem_bytes: 0,
+                    })
+                }
+                .map_err(|e| FerrumError::internal(format!("argmax_rows_masked launch: {e}")))?;
+                let mut host = vec![0i32; m];
+                let view = out_dev.slice(0..m);
+                stream
+                    .memcpy_dtoh(&view, &mut host)
+                    .map_err(|e| FerrumError::internal(format!("argmax_rows_masked dtoh: {e}")))?;
+                stream
+                    .synchronize()
+                    .map_err(|e| FerrumError::internal(format!("argmax_rows_masked sync: {e}")))?;
+                Ok(host)
+            },
+        )?;
         Ok(host.into_iter().map(|x| x as u32).collect())
     }
 
@@ -1535,13 +1579,12 @@ impl Backend for CudaBackend {
         };
         use cudarc::driver::{DevicePtr, DevicePtrMut};
 
-        // cuBLAS is set to CUBLAS_POINTER_MODE_DEVICE (see ensure_blas_handle)
-        // so alpha/beta are read from device memory. Using the process-global
-        // alpha_f32/beta_f32 slices keeps pointers stable for graph capture.
+        // The instance BLAS handle uses CUBLAS_POINTER_MODE_DEVICE;
+        // its original scalar allocations remain stable through capture.
         let (a_ptr, _rec_a) = b.as_f16().device_ptr(&ctx.stream); // cuBLAS arg "A" = weight = our `b`
         let (b_ptr, _rec_b) = a.as_f16().device_ptr(&ctx.stream); // cuBLAS arg "B" = input = our `a`
         let (c_ptr, _rec_c) = out.as_f16_mut().device_ptr_mut(&ctx.stream);
-        with_blas_scalars(ctx.ordinal, |alpha_f32, beta_f32| {
+        with_blas_scalars(&ctx.blas_resources, |alpha_f32, beta_f32| {
             let (alpha_ptr, _ga) = alpha_f32.device_ptr(&ctx.stream);
             let (beta_ptr, _gb) = beta_f32.device_ptr(&ctx.stream);
 
@@ -1638,8 +1681,10 @@ impl Backend for CudaBackend {
             //   raise via FERRUM_CUDA_MAX_KV env (bumps dynamic shared beyond
             //   48 KB via CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES).
             const DECODE_MAX_KV_POS_DEFAULT: usize = 8192; // 32 KB
-            let env_cap = cuda_backend_runtime_env()
-                .cuda_max_kv
+            let env_cap = ctx
+                .configuration
+                .cuda
+                .max_kv
                 .unwrap_or(DECODE_MAX_KV_POS_DEFAULT);
             let max_kv_pos = capacity.min(env_cap as i32) as u32;
             let active_kv_pos = if cfg.sliding_window > 0 {
@@ -1657,16 +1702,8 @@ impl Backend for CudaBackend {
                 );
             }
             let stream = ctx.stream.clone();
-            // Hold read-guard on global state bufs for the builder's lifetime.
-            let dec_guard = if use_dyn {
-                Some(
-                    decode_state_slot_for_ordinal(ctx.ordinal)
-                        .read()
-                        .expect("DECODE_STATE poisoned"),
-                )
-            } else {
-                None
-            };
+            // Borrow the original context's decode state for the builder.
+            let dec_guard = use_dyn.then_some(&ctx.decode_state);
             let mut bld = stream.launch_builder(&func);
             bld.arg(q);
             bld.arg(k);
@@ -1677,7 +1714,7 @@ impl Backend for CudaBackend {
             bld.arg(&hd);
             bld.arg(&capacity);
             if use_dyn {
-                let bufs = dec_guard.as_ref().unwrap().as_ref().unwrap();
+                let bufs = dec_guard.as_ref().unwrap();
                 bld.arg(&bufs.kv);
             } else {
                 bld.arg(&valid_kv_scalar);
@@ -1692,7 +1729,6 @@ impl Backend for CudaBackend {
                 })
             }
             .expect("decode_attention_head_major launch");
-            drop(dec_guard);
             return;
         }
         let func = ctx.func(
@@ -1720,6 +1756,7 @@ impl Backend for CudaBackend {
             } else {
                 kv_len as i32
             },
+            sliding_window: cfg.sliding_window as i32,
         };
         // Must match `#define TILE_Q 16` in kernels/flash_attn_full.cu.
         // Was 32 — produced grid with too few blocks for q_len > 16, so
@@ -2491,10 +2528,7 @@ impl Backend for CudaBackend {
                 "embedding_lookup_f16_dyn",
             );
             let stream = ctx.stream.clone();
-            let dec_guard = decode_state_slot_for_ordinal(ctx.ordinal)
-                .read()
-                .expect("DECODE_STATE poisoned");
-            let bufs = dec_guard.as_ref().expect("DecodeStateBufs");
+            let bufs = &ctx.decode_state;
             let mut b = stream.launch_builder(&func);
             b.arg(table);
             b.arg(&bufs.token);
@@ -2508,7 +2542,6 @@ impl Backend for CudaBackend {
                 })
             }
             .expect("embedding_lookup_dyn launch");
-            drop(dec_guard);
             return;
         }
 
@@ -2552,26 +2585,7 @@ impl Backend for CudaBackend {
         kv_dim: usize,
     ) {
         let func = ctx.func("split_qkv", ptx::SPLIT_QKV, "split_qkv_f16");
-        let tokens_i32 = tokens as i32;
-        let q_dim_i32 = q_dim as i32;
-        let kv_dim_i32 = kv_dim as i32;
-        let stream = ctx.stream.clone();
-        let mut b = stream.launch_builder(&func);
-        b.arg(qkv);
-        b.arg(q);
-        b.arg(k);
-        b.arg(v);
-        b.arg(&tokens_i32);
-        b.arg(&q_dim_i32);
-        b.arg(&kv_dim_i32);
-        unsafe {
-            b.launch(LaunchConfig {
-                grid_dim: (tokens as u32, 1, 1),
-                block_dim: (256, 1, 1),
-                shared_mem_bytes: 0,
-            })
-        }
-        .expect("split_qkv launch");
+        qkv::launch_split_qkv(&ctx.stream, &func, qkv, q, k, v, tokens, q_dim, kv_dim);
     }
 
     fn fused_silu_mul_split(
@@ -2706,14 +2720,9 @@ impl Backend for CudaBackend {
             ptx::KV_CACHE_APPEND,
             "kv_cache_append_batched_per_cache_f16",
         );
-        // Per-slot region of the PROCESS-GLOBAL host_cache_ptrs +
-        // scratch_u64_cache. Each call site uses a distinct slot.
-        // Captured graph records host pointer (per-slot region of the
-        // global Box) + device pointer (per-slot view of the global
-        // scratch); both outlive any CudaState. Replay across decode
-        // calls re-reads CURRENT host content from the same address,
-        // launches kernel reading CURRENT device content from the same
-        // address. This is what makes FERRUM_BATCHED_GRAPH=1 safe.
+        // Original context's stable host/device pointer-table regions.
+        // Each captured call site has a distinct slot; the context and
+        // its tables remain owned until actual graph retirement.
         let m_i32 = m as i32;
         let nkv_i32 = nkv as i32;
         let hd_i32 = hd as i32;
@@ -2721,14 +2730,14 @@ impl Backend for CudaBackend {
         let per_item = nkv * hd;
         let block_dim = 256u32;
         let grid_x = (per_item as u32 + block_dim - 1) / block_dim;
-        with_batched_scratch_mut(ctx.ordinal, |slot_g| {
+        with_batched_scratch_mut(&mut ctx.batched_scratch, |slot_g| {
             for i in 0..m {
                 let (cp, _) = caches[i].as_f16().device_ptr(&stream);
                 slot_g.host_cache_ptrs[host_start + i] = cp;
             }
             // Async memcpy host_slice → device per-slot region. Recorded
             // into the captured graph when capture is in flight; both
-            // endpoints are stable global addresses.
+            // endpoints are stable addresses owned by this context.
             {
                 let host_slice: &[u64] = &slot_g.host_cache_ptrs[host_start..host_start + m];
                 let mut view = slot_g
@@ -2818,8 +2827,22 @@ impl Backend for CudaBackend {
         } else {
             max_valid_kv
         };
-        let shared_bytes = (active_kv.min(capacity).max(1) as u32) * 4;
-        with_batched_scratch_mut(ctx.ordinal, |slot_g| {
+        let shared_bytes = active_kv
+            .min(capacity)
+            .max(1)
+            .checked_mul(4)
+            .and_then(|bytes| i32::try_from(bytes).ok())
+            .ok_or_else(|| FerrumError::model("batched attention shared-memory size overflow"))?;
+        if shared_bytes > 48 * 1024 {
+            func.set_attribute(
+                cudarc::driver::sys::CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                shared_bytes,
+            ).map_err(|error| FerrumError::model(format!(
+                "batched attention shared-memory capacity: {error}"
+            )))?;
+        }
+        let shared_bytes = shared_bytes as u32;
+        with_batched_scratch_mut(&mut ctx.batched_scratch, |slot_g| {
             for i in 0..m {
                 let (kp, _) = k_caches[i].as_f16().device_ptr(&stream);
                 let (vp, _) = v_caches[i].as_f16().device_ptr(&stream);
@@ -2827,10 +2850,8 @@ impl Backend for CudaBackend {
                 slot_g.host_v_ptrs[host_start + i] = vp;
             }
             // Two captured memcpys, each into its own per-slot region of
-            // process-global device scratch. Both host arrays + both
-            // device scratches live in BATCHED_SCRATCH (process-global,
-            // outlives every CudaState) — replay across decode calls is
-            // safe because no pointer dangles.
+            // instance device scratch. The persistent original context
+            // owns both host arrays and device arrays through retirement.
             {
                 let k_host_slice: &[u64] = &slot_g.host_k_ptrs[host_start..host_start + m];
                 let mut view = slot_g.scratch_u64_k.slice_mut(host_start..host_start + m);
@@ -2940,46 +2961,22 @@ impl Backend for CudaBackend {
             "qk_norm_rope_transpose_f16"
         };
         let func = ctx.func("qk_norm_rope", ptx::QK_NORM_ROPE, fn_name);
-        let tokens_i32 = tokens as i32;
-        let heads_i32 = heads as i32;
-        let head_dim_i32 = head_dim as i32;
-        let pos_offset_i32 = pos_offset as i32;
-        let stream = ctx.stream.clone();
-        let dec_guard = if use_dyn {
-            Some(
-                decode_state_slot_for_ordinal(ctx.ordinal)
-                    .read()
-                    .expect("DECODE_STATE poisoned"),
-            )
-        } else {
-            None
-        };
-        let mut b = stream.launch_builder(&func);
-        b.arg(input);
-        b.arg(norm_w);
-        b.arg(cos);
-        b.arg(sin);
-        b.arg(output);
-        b.arg(&tokens_i32);
-        b.arg(&heads_i32);
-        b.arg(&head_dim_i32);
-        if use_dyn {
-            let bufs = dec_guard.as_ref().unwrap().as_ref().unwrap();
-            b.arg(&bufs.pos);
-        } else {
-            b.arg(&pos_offset_i32);
-        }
-        b.arg(&eps);
-        b.arg(&mode);
-        unsafe {
-            b.launch(LaunchConfig {
-                grid_dim: (tokens as u32, heads as u32, 1),
-                block_dim: (32, 1, 1),
-                shared_mem_bytes: 0,
-            })
-        }
-        .expect("qk_norm_rope launch");
-        drop(dec_guard);
+        qkv::launch_qk_norm_rope(
+            &ctx.stream,
+            &func,
+            use_dyn.then_some(&ctx.decode_state.pos),
+            input,
+            norm_w,
+            cos,
+            sin,
+            output,
+            tokens,
+            heads,
+            head_dim,
+            pos_offset,
+            eps,
+            mode,
+        );
     }
 
     fn qk_norm_rope_partial(
@@ -3300,10 +3297,9 @@ impl Backend for CudaBackend {
     /// Split QKV + qk-norm + RoPE into FP16 head-major scratch buffers.
     /// Implemented as a chain over the existing primitives: `split_qkv` →
     /// 3× `qk_norm_rope` (Q/K with their respective norms; V with mode=0).
-    /// Used by the INT8 KV path's `KvLayer<KvInt8>::paged_write` to
-    /// materialize FP16 K/V before quantizing into the INT8 paged pool.
-    /// FP16 paths use the fused `split_qkv_norm_rope_into_paged_cache`
-    /// directly and never hit this method.
+    /// Used by contiguous FP16 KV and the INT8 paged-write path. Token-major
+    /// temporaries belong to the original context, so eager warmup prepares
+    /// stable storage which capture and replay reuse without allocation.
     fn split_qkv_norm_rope(
         ctx: &mut Self::Context,
         qkv: &Self::Buffer,
@@ -3322,33 +3318,10 @@ impl Backend for CudaBackend {
         eps: f32,
         qk_mode: i32,
     ) -> Result<()> {
-        // Lazy scratch — split_qkv writes into per-token-major buffers.
-        // We allocate just-in-time; the caller's `q_out/k_out/v_out` are
-        // head-major after the chain.
-        let q_dim = q_heads * head_dim;
-        let kv_dim = kv_heads * head_dim;
-        let q_buf_size = tokens * q_dim;
-        let kv_buf_size = tokens * kv_dim;
-        let mut q_buf = <Self as Backend>::alloc(q_buf_size);
-        let mut k_buf = <Self as Backend>::alloc(kv_buf_size);
-        let mut v_buf = <Self as Backend>::alloc(kv_buf_size);
-        Self::split_qkv(
-            ctx, qkv, &mut q_buf, &mut k_buf, &mut v_buf, tokens, q_dim, kv_dim,
-        );
-        Self::qk_norm_rope(
-            ctx, &q_buf, q_norm_w, cos, sin, q_out, tokens, q_heads, head_dim, pos_offset, eps,
-            qk_mode,
-        );
-        Self::qk_norm_rope(
-            ctx, &k_buf, k_norm_w, cos, sin, k_out, tokens, kv_heads, head_dim, pos_offset, eps,
-            qk_mode,
-        );
-        // V: no norm + RoPE-only (qk_mode=0); pass q_norm_w as a dummy
-        // (kernel ignores it when mode=0).
-        Self::qk_norm_rope(
-            ctx, &v_buf, q_norm_w, cos, sin, v_out, tokens, kv_heads, head_dim, pos_offset, eps, 0,
-        );
-        Ok(())
+        qkv::split_qkv_norm_rope(
+            ctx, qkv, q_norm_w, k_norm_w, cos, sin, q_out, k_out, v_out, tokens, q_heads, kv_heads,
+            head_dim, pos_offset, eps, qk_mode,
+        )
     }
 
     fn kv_cache_append_head_major(
@@ -3386,15 +3359,7 @@ impl Backend for CudaBackend {
             shared_mem_bytes: 0,
         };
         let stream = ctx.stream.clone();
-        let dec_guard = if use_dyn {
-            Some(
-                decode_state_slot_for_ordinal(ctx.ordinal)
-                    .read()
-                    .expect("DECODE_STATE poisoned"),
-            )
-        } else {
-            None
-        };
+        let dec_guard = use_dyn.then_some(&ctx.decode_state);
 
         // K half.
         {
@@ -3404,7 +3369,7 @@ impl Backend for CudaBackend {
             b.arg(&nkv_i32);
             b.arg(&hd_i32);
             if use_dyn {
-                let bufs = dec_guard.as_ref().unwrap().as_ref().unwrap();
+                let bufs = dec_guard.as_ref().unwrap();
                 b.arg(&bufs.pos);
             } else {
                 b.arg(&cache_len_i32);
@@ -3421,7 +3386,7 @@ impl Backend for CudaBackend {
             b.arg(&nkv_i32);
             b.arg(&hd_i32);
             if use_dyn {
-                let bufs = dec_guard.as_ref().unwrap().as_ref().unwrap();
+                let bufs = dec_guard.as_ref().unwrap();
                 b.arg(&bufs.pos);
             } else {
                 b.arg(&cache_len_i32);
@@ -3430,7 +3395,6 @@ impl Backend for CudaBackend {
             b.arg(&cap_i32);
             unsafe { b.launch(cfg) }.expect("kv_cache_append V launch");
         }
-        drop(dec_guard);
     }
 
     fn transpose_head_to_token(
@@ -3754,385 +3718,170 @@ impl Backend for CudaBackend {
 }
 
 // ────────────────────────────────────────────────────────────────────────
-// Process-global stream for context-free ops
+// Explicit instance allocation and external context-free constructors
 // ────────────────────────────────────────────────────────────────────────
 //
-// `alloc` / `from_slice` / `to_vec` inherit a no-context signature from
-// the Backend trait. cudarc 0.19 hangs all memory APIs off `CudaStream`,
-// so we stash an Arc<CudaStream> in a process-global slot populated by
-// `new_context`.
-//
-// Must be process-global (not thread-local): the engine's executor is
-// created on one thread (where `new_context` runs) and ops may fire on
-// other threads (tokio worker pool, Rayon parallel loops, etc.). A
-// thread-local would panic on every worker. cudarc's `stream.alloc()`
-// internally calls `ctx.bind_to_thread()` on whichever thread it's
-// invoked from, so sharing one stream across threads is safe.
-
-static GLOBAL_STREAMS: std::sync::OnceLock<std::sync::RwLock<HashMap<usize, Arc<CudaStream>>>> =
-    std::sync::OnceLock::new();
-
-fn stream_slots() -> &'static std::sync::RwLock<HashMap<usize, Arc<CudaStream>>> {
-    GLOBAL_STREAMS.get_or_init(|| std::sync::RwLock::new(HashMap::new()))
+// Context-free compatibility helpers create their own allocation stream.
+// Retained model production uses the explicit instance context APIs.
+fn with_instance_allocation<R>(ctx: &mut CudaState, body: impl FnOnce(&Arc<CudaStream>) -> R) -> R {
+    assert!(
+        !ctx.capture_in_flight,
+        "CUDA allocation must be prepared before graph capture"
+    );
+    ctx.completion_observed = false;
+    body(&ctx.stream)
 }
 
-/// Return the global stream, lazily creating it if neither `new_context`
-/// nor `install_thread_stream` has populated it yet.
-///
-/// This is needed because `LlamaFamilyModel::new()` (and other model
-/// constructors) call `B::from_slice` on thousands of weights before
-/// any engine code creates a `Context`. We can't easily force ordering
-/// through trait signatures, so the first `from_slice` lazily spins up
-/// a default context (ordinal from `FERRUM_CUDA_DEVICE` env, else 0)
-/// and a dedicated stream. Subsequent `new_context()` calls reuse this
-/// same stream — no divergence.
-pub(super) fn default_stream() -> Arc<CudaStream> {
-    let ordinal = current_device_ordinal();
-    if let Some(s) = stream_slots()
-        .read()
-        .expect("GLOBAL_STREAMS poisoned")
-        .get(&ordinal)
-    {
-        return s.clone();
+fn with_instance_readback<R>(ctx: &mut CudaState, body: impl FnOnce(&Arc<CudaStream>) -> R) -> R {
+    assert!(
+        !ctx.capture_in_flight,
+        "CUDA readback cannot complete an active capture"
+    );
+    body(&ctx.stream)
+}
+
+fn fresh_stream(ordinal: usize) -> Result<Arc<CudaStream>> {
+    let context = CudaContext::new(ordinal)
+        .map_err(|error| FerrumError::backend(format!("CudaBackend context {ordinal}: {error}")))?;
+    unsafe {
+        context.disable_event_tracking();
     }
-    let mut w = stream_slots().write().expect("GLOBAL_STREAMS poisoned");
-    if !w.contains_key(&ordinal) {
-        let ctx = CudaContext::new(ordinal).unwrap_or_else(|e| {
-            panic!("CudaBackend: failed to init default context {ordinal}: {e}")
-        });
-        // Disable cudarc event tracking BEFORE any buffer is allocated on
-        // this context. Previously we only disabled in `new_context`, which
-        // runs after model construction — meaning every weight buffer had a
-        // dependency event recorded from its htod. During graph capture the
-        // captured launches picked up those event dependencies, and on
-        // replay cuGraphLaunch dereferenced a stale event pointer → SIGSEGV
-        // inside libcuda.so. Flipping this here means all weight loads go
-        // in cleanly, and the graph captured later sees no stray event
-        // dependencies. Standalone C++ reproducers
-        // work because they never enable event tracking in the first place.
-        unsafe {
-            ctx.disable_event_tracking();
-        }
-        let stream = ctx
-            .new_stream()
-            .unwrap_or_else(|e| panic!("CudaBackend: failed to create default stream: {e}"));
-        w.insert(ordinal, stream);
-    }
-    w.get(&ordinal).cloned().expect("just inserted")
+    context
+        .new_stream()
+        .map_err(|error| FerrumError::backend(format!("CudaBackend new instance stream: {error}")))
 }
 
-fn with_stream<R>(f: impl FnOnce(&Arc<CudaStream>) -> R) -> R {
-    let stream = default_stream();
-    f(&stream)
+fn standalone_allocation_stream() -> Arc<CudaStream> {
+    fresh_stream(ferrum_types::BackendContextConfig::default().device_ordinal)
+        .expect("standalone default CUDA stream")
 }
 
-/// Install a stream as the ordinal-local default for context-free ops.
-/// Subsequent `alloc`/`from_slice`/`to_vec` calls made under the same
-/// device scope route through it. If `default_stream` already lazily
-/// created a stream for that ordinal, this replaces it.
-pub fn install_thread_stream(stream: Arc<CudaStream>) {
-    stream_slots()
-        .write()
-        .expect("GLOBAL_STREAMS poisoned")
-        .insert(current_device_ordinal(), stream);
+fn with_standalone_allocation<R>(f: impl FnOnce(&Arc<CudaStream>) -> R) -> R {
+    let stream = standalone_allocation_stream();
+    let value = f(&stream);
+    // No destination stream is supplied by the compatibility constructor.
+    // Complete initialization before returning; explicit APIs avoid this.
+    stream
+        .synchronize()
+        .expect("context-free CUDA allocation initialization");
+    value
 }
-
-// ────────────────────────────────────────────────────────────────────────
-// Process-global decode state buffers (token_id, pos, kv_len)
-// ────────────────────────────────────────────────────────────────────────
-//
-// Must be global (not per-ctx): captured graph holds pointers to these
-// buffers. If ctx is recreated per decode step (which it is), per-ctx
-// bufs would be freed between capture and replay → dangling pointer →
-// CUDA_ERROR_INVALID_VALUE on next sync.
 
 pub struct DecodeStateBufs {
     pub token: CudaSlice<u32>,
     pub pos: CudaSlice<i32>,
     pub kv: CudaSlice<i32>,
 }
-unsafe impl Send for DecodeStateBufs {}
-unsafe impl Sync for DecodeStateBufs {}
-
-static DECODE_STATES: std::sync::OnceLock<
-    std::sync::RwLock<HashMap<usize, &'static std::sync::RwLock<Option<DecodeStateBufs>>>>,
-> = std::sync::OnceLock::new();
-
-fn decode_state_slots(
-) -> &'static std::sync::RwLock<HashMap<usize, &'static std::sync::RwLock<Option<DecodeStateBufs>>>>
-{
-    DECODE_STATES.get_or_init(|| std::sync::RwLock::new(HashMap::new()))
-}
-
-pub(super) fn decode_state_slot_for_ordinal(
-    ordinal: usize,
-) -> &'static std::sync::RwLock<Option<DecodeStateBufs>> {
-    {
-        let g = decode_state_slots().read().expect("DECODE_STATES poisoned");
-        if let Some(slot) = g.get(&ordinal) {
-            return *slot;
+impl DecodeStateBufs {
+    fn new(stream: &Arc<CudaStream>) -> Self {
+        Self {
+            token: unsafe { stream.alloc::<u32>(1) }.expect("token state alloc"),
+            pos: unsafe { stream.alloc::<i32>(1) }.expect("position state alloc"),
+            kv: unsafe { stream.alloc::<i32>(1) }.expect("KV state alloc"),
         }
     }
-    let mut w = decode_state_slots()
-        .write()
-        .expect("DECODE_STATES poisoned");
-    *w.entry(ordinal)
-        .or_insert_with(|| Box::leak(Box::new(std::sync::RwLock::new(None))))
 }
-
-fn ensure_decode_state_bufs(stream: &Arc<CudaStream>) {
-    let slot = decode_state_slot_for_ordinal(current_device_ordinal());
-    let guard = slot.read().expect("DECODE_STATE poisoned");
-    if guard.is_some() {
-        return;
-    }
-    drop(guard);
-    let mut w = slot.write().expect("DECODE_STATE poisoned");
-    if w.is_none() {
-        let token = unsafe { stream.alloc::<u32>(1) }.expect("token_buf alloc");
-        let pos = unsafe { stream.alloc::<i32>(1) }.expect("pos_buf alloc");
-        let kv = unsafe { stream.alloc::<i32>(1) }.expect("kv_buf alloc");
-        *w = Some(DecodeStateBufs { token, pos, kv });
-    }
-}
-
-// ────────────────────────────────────────────────────────────────────────
-// Process-global cuBLAS handle + 32MB workspace
-// ────────────────────────────────────────────────────────────────────────
-//
-// Must be process-global (not per-ctx): graph capture records the workspace
-// device pointer as a kernel arg. Per-ctx workspace would be freed when ctx
-// drops → dangling pointer on replay → CUDA_ERROR_INVALID_VALUE.
 
 struct BlasSlot {
     blas: Arc<CudaBlas>,
     _workspace: CudaSlice<u8>,
-    // Device-resident alpha/beta for f16/f32 GEMMs. cuBLAS captures the
-    // scalar-copy of alpha/beta into the graph; host pointers would
-    // dangle on replay (stack-local). Device pointers persist.
-    pub alpha_f32: CudaSlice<f32>, // [1.0]
-    pub beta_f32: CudaSlice<f32>,  // [0.0]
+    alpha_f32: CudaSlice<f32>,
+    beta_f32: CudaSlice<f32>,
 }
-unsafe impl Send for BlasSlot {}
-unsafe impl Sync for BlasSlot {}
-
-static BLAS_HANDLES: std::sync::OnceLock<std::sync::RwLock<HashMap<usize, BlasSlot>>> =
-    std::sync::OnceLock::new();
-
-fn blas_slots() -> &'static std::sync::RwLock<HashMap<usize, BlasSlot>> {
-    BLAS_HANDLES.get_or_init(|| std::sync::RwLock::new(HashMap::new()))
-}
-
-fn ensure_blas_handle(stream: &Arc<CudaStream>) -> Arc<CudaBlas> {
-    let ordinal = current_device_ordinal();
-    if let Some(slot) = blas_slots().read().expect("BLAS poisoned").get(&ordinal) {
-        return slot.blas.clone();
-    }
-    let mut w = blas_slots().write().expect("BLAS poisoned");
-    if !w.contains_key(&ordinal) {
+impl BlasSlot {
+    fn new(stream: &Arc<CudaStream>) -> Self {
         const WS_BYTES: usize = 32 * 1024 * 1024;
         let blas = Arc::new(CudaBlas::new(stream.clone()).expect("CudaBlas::new"));
-        let workspace = unsafe { stream.alloc::<u8>(WS_BYTES) }.expect("blas ws alloc");
-        let alpha_f32 = stream.clone_htod(&[1.0f32]).expect("alpha htod");
-        let beta_f32 = stream.clone_htod(&[0.0f32]).expect("beta htod");
+        let workspace = unsafe { stream.alloc::<u8>(WS_BYTES) }.expect("blas workspace alloc");
+        let alpha_f32 = stream.clone_htod(&[1.0f32]).expect("alpha upload");
+        let beta_f32 = stream.clone_htod(&[0.0f32]).expect("beta upload");
         unsafe {
             use cudarc::cublas::sys;
             use cudarc::driver::DevicePtr;
-            let (ws_ptr, _g) = workspace.device_ptr(stream);
-            let st = sys::cublasSetWorkspace_v2(*blas.handle(), ws_ptr as *mut _, WS_BYTES);
+            let (workspace_ptr, _record) = workspace.device_ptr(stream);
             assert_eq!(
-                st,
+                sys::cublasSetWorkspace_v2(*blas.handle(), workspace_ptr as *mut _, WS_BYTES),
                 sys::cublasStatus_t::CUBLAS_STATUS_SUCCESS,
-                "set workspace"
-            );
-            // Switch to device-pointer mode so alpha/beta pass cleanly through
-            // graph capture. cuBLAS is HOST mode by default; in HOST mode it
-            // internally memcpies the scalar from host, and that memcpy lands
-            // in the captured graph with a stack-local pointer → UB at replay.
-            let st = sys::cublasSetPointerMode_v2(
-                *blas.handle(),
-                sys::cublasPointerMode_t::CUBLAS_POINTER_MODE_DEVICE,
+                "set instance BLAS workspace"
             );
             assert_eq!(
-                st,
+                sys::cublasSetPointerMode_v2(
+                    *blas.handle(),
+                    sys::cublasPointerMode_t::CUBLAS_POINTER_MODE_DEVICE
+                ),
                 sys::cublasStatus_t::CUBLAS_STATUS_SUCCESS,
-                "set pointer mode"
+                "set instance BLAS scalar mode"
             );
         }
-        w.insert(
-            ordinal,
-            BlasSlot {
-                blas,
-                _workspace: workspace,
-                alpha_f32,
-                beta_f32,
-            },
-        );
+        Self {
+            blas,
+            _workspace: workspace,
+            alpha_f32,
+            beta_f32,
+        }
     }
-    w.get(&ordinal).unwrap().blas.clone()
 }
 
-/// Access the process-global alpha/beta device scalars for cuBLAS.
 fn with_blas_scalars<R>(
-    ordinal: usize,
+    slot: &BlasSlot,
     f: impl FnOnce(&CudaSlice<f32>, &CudaSlice<f32>) -> R,
 ) -> R {
-    let g = blas_slots().read().expect("BLAS poisoned");
-    let s = g.get(&ordinal).expect("BLAS not init");
-    f(&s.alpha_f32, &s.beta_f32)
+    f(&slot.alpha_f32, &slot.beta_f32)
 }
-
-// ────────────────────────────────────────────────────────────────────────
-// Process-global batched-scratch device + host arrays
-// ────────────────────────────────────────────────────────────────────────
-//
-// Used by `kv_cache_append_batched_per_cache` and
-// `flash_attention_batched_per_cache`. CRITICAL for FERRUM_BATCHED_GRAPH=1:
-//
-//   * Captured graph contains `cuMemcpy(host_array, device_scratch, ...)`
-//     and kernel launches reading `device_scratch[slot..slot+m]`.
-//   * Captured memcpy reads HOST POINTER at REPLAY time
-//     (verified: cudarc_graph_shared_host_array_multi_memcpy).
-//   * Captured kernel arg holds a fixed device pointer.
-//
-// If either array lives in per-call CudaState, drop()-ing the state
-// between decode calls invalidates the pointer the captured graph
-// holds → 2nd replay's cuGraphLaunch SIGSEGVs inside libcuda.so.
-// Per-call new_context() in this file is exactly that pattern.
-// Process-global slot keeps both arrays alive forever.
 
 struct BatchedScratchSlot {
-    /// Device staging for K cache pointers (flash_attn read).
-    pub scratch_u64_k: CudaSlice<u64>,
-    /// Device staging for V cache pointers (flash_attn read).
-    pub scratch_u64_v: CudaSlice<u64>,
-    /// Device staging for K-or-V cache pointers (kv_cache_append read).
-    pub scratch_u64_cache: CudaSlice<u64>,
-    /// Host staging — captured memcpy reads these heap addresses on replay.
-    /// Box keeps stable heap address; static slot keeps Box alive forever.
-    pub host_k_ptrs: Box<[u64; HOST_STAGING_TOTAL]>,
-    pub host_v_ptrs: Box<[u64; HOST_STAGING_TOTAL]>,
-    pub host_cache_ptrs: Box<[u64; HOST_STAGING_TOTAL]>,
+    scratch_u64_k: CudaSlice<u64>,
+    scratch_u64_v: CudaSlice<u64>,
+    scratch_u64_cache: CudaSlice<u64>,
+    host_k_ptrs: Box<[u64; HOST_STAGING_TOTAL]>,
+    host_v_ptrs: Box<[u64; HOST_STAGING_TOTAL]>,
+    host_cache_ptrs: Box<[u64; HOST_STAGING_TOTAL]>,
 }
-unsafe impl Send for BatchedScratchSlot {}
-unsafe impl Sync for BatchedScratchSlot {}
-
-static BATCHED_SCRATCH: std::sync::OnceLock<
-    std::sync::RwLock<HashMap<usize, &'static std::sync::RwLock<Option<BatchedScratchSlot>>>>,
-> = std::sync::OnceLock::new();
-
-fn batched_scratch_slots() -> &'static std::sync::RwLock<
-    HashMap<usize, &'static std::sync::RwLock<Option<BatchedScratchSlot>>>,
-> {
-    BATCHED_SCRATCH.get_or_init(|| std::sync::RwLock::new(HashMap::new()))
-}
-
-fn batched_scratch_slot_for_ordinal(
-    ordinal: usize,
-) -> &'static std::sync::RwLock<Option<BatchedScratchSlot>> {
-    {
-        let g = batched_scratch_slots()
-            .read()
-            .expect("BATCHED_SCRATCH poisoned");
-        if let Some(slot) = g.get(&ordinal) {
-            return *slot;
+impl BatchedScratchSlot {
+    fn new(stream: &Arc<CudaStream>) -> Self {
+        Self {
+            scratch_u64_k: unsafe { stream.alloc::<u64>(HOST_STAGING_TOTAL) }
+                .expect("batched K pointers"),
+            scratch_u64_v: unsafe { stream.alloc::<u64>(HOST_STAGING_TOTAL) }
+                .expect("batched V pointers"),
+            scratch_u64_cache: unsafe { stream.alloc::<u64>(HOST_STAGING_TOTAL) }
+                .expect("batched cache pointers"),
+            host_k_ptrs: Box::new([0; HOST_STAGING_TOTAL]),
+            host_v_ptrs: Box::new([0; HOST_STAGING_TOTAL]),
+            host_cache_ptrs: Box::new([0; HOST_STAGING_TOTAL]),
         }
     }
-    let mut w = batched_scratch_slots()
-        .write()
-        .expect("BATCHED_SCRATCH poisoned");
-    *w.entry(ordinal)
-        .or_insert_with(|| Box::leak(Box::new(std::sync::RwLock::new(None))))
 }
 
-fn ensure_batched_scratch(stream: &Arc<CudaStream>) {
-    let slot = batched_scratch_slot_for_ordinal(current_device_ordinal());
-    {
-        let g = slot.read().expect("BATCHED_SCRATCH poisoned");
-        if g.is_some() {
-            return;
+fn with_batched_scratch_mut<R>(
+    slot: &mut BatchedScratchSlot,
+    body: impl FnOnce(&mut BatchedScratchSlot) -> R,
+) -> R {
+    body(slot)
+}
+
+impl Drop for CudaState {
+    fn drop(&mut self) {
+        if let Err(error) = CudaBackend::retire_context(self) {
+            eprintln!(
+                "fatal: dropping CUDA instance after unsuccessful checked retirement: {error}"
+            );
+            std::process::abort();
+        }
+        // Graphs are now destroyed while modules, workspace, staging, and
+        // buffers are still owned. Auxiliary events retire only after all
+        // their streams have been observed by retire_context.
+        unsafe {
+            if let Some(event) = self.moe_entry_event.take() {
+                cudarc::driver::sys::cuEventDestroy_v2(event as _);
+            }
+            if let Some(events) = self.moe_exit_events.take() {
+                for event in events {
+                    cudarc::driver::sys::cuEventDestroy_v2(event as _);
+                }
+            }
         }
     }
-    let mut w = slot.write().expect("BATCHED_SCRATCH poisoned");
-    if w.is_none() {
-        let scratch_u64_k = unsafe { stream.alloc::<u64>(HOST_STAGING_TOTAL) }
-            .expect("batched scratch_u64_k alloc");
-        let scratch_u64_v = unsafe { stream.alloc::<u64>(HOST_STAGING_TOTAL) }
-            .expect("batched scratch_u64_v alloc");
-        let scratch_u64_cache = unsafe { stream.alloc::<u64>(HOST_STAGING_TOTAL) }
-            .expect("batched scratch_u64_cache alloc");
-        *w = Some(BatchedScratchSlot {
-            scratch_u64_k,
-            scratch_u64_v,
-            scratch_u64_cache,
-            host_k_ptrs: Box::new([0u64; HOST_STAGING_TOTAL]),
-            host_v_ptrs: Box::new([0u64; HOST_STAGING_TOTAL]),
-            host_cache_ptrs: Box::new([0u64; HOST_STAGING_TOTAL]),
-        });
-    }
-}
-
-/// Access the process-global batched scratch for the duration of one
-/// captured-or-eager kernel call. Holds the slot's RwLock write guard
-/// for that duration — no other batched op runs concurrently (single
-/// stream, single decode_batch_internal at a time per iteration_lock).
-fn with_batched_scratch_mut<R>(ordinal: usize, f: impl FnOnce(&mut BatchedScratchSlot) -> R) -> R {
-    let mut g = batched_scratch_slot_for_ordinal(ordinal)
-        .write()
-        .expect("BATCHED_SCRATCH poisoned");
-    f(g.as_mut().expect("BatchedScratchSlot not initialised"))
-}
-
-// ────────────────────────────────────────────────────────────────────────
-// Process-global PTX module cache
-// ────────────────────────────────────────────────────────────────────────
-//
-// Same graph-capture lifetime requirement as cuBLAS workspace + batched
-// scratch above: cudarc records a CUfunction handle into the captured
-// graph's kernel node. CUfunction handles are owned by their CUmodule;
-// when the last Arc<CudaModule> drops, cudarc unloads the module and the
-// CUfunction goes invalid → captured graph's kernel node references a
-// stale handle → 2nd cuGraphLaunch SIGSEGVs inside libcuda.so.
-//
-// Per-CudaState `modules: HashMap<...>` was the third pointer-lifetime
-// bug in this file (after BLAS workspace and batched scratch). Routing
-// loads through a process-global cache keeps every loaded CudaModule
-// alive for the rest of the process — captured graphs always find a
-// valid CUfunction at replay time.
-//
-// CudaState still keeps its local HashMap as a hot-path cache so that
-// per-kernel launches don't lock the global Mutex.
-
-static MODULES: std::sync::OnceLock<
-    std::sync::Mutex<HashMap<(usize, &'static str), Arc<CudaModule>>>,
-> = std::sync::OnceLock::new();
-
-fn modules_cache() -> &'static std::sync::Mutex<HashMap<(usize, &'static str), Arc<CudaModule>>> {
-    MODULES.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
-}
-
-pub(super) fn ensure_module(
-    ordinal: usize,
-    ctx: &Arc<CudaContext>,
-    key: &'static str,
-    ptx_src: &str,
-) -> Arc<CudaModule> {
-    let cache_key = (ordinal, key);
-    {
-        let g = modules_cache().lock().expect("MODULES poisoned");
-        if let Some(m) = g.get(&cache_key) {
-            return m.clone();
-        }
-    }
-    let mut g = modules_cache().lock().expect("MODULES poisoned");
-    if let Some(m) = g.get(&cache_key) {
-        return m.clone();
-    }
-    let m = ctx
-        .load_module(Ptx::from_src(ptx_src.to_string()))
-        .unwrap_or_else(|e| panic!("CudaBackend: load_module({key}): {e}"));
-    g.insert(cache_key, m.clone());
-    m
 }
 
 // CUDA: existing KV cache path is FP16.
@@ -4143,49 +3892,3 @@ impl crate::backend::BackendKvDtype<crate::backend::KvFp16> for CudaBackend {
 
 #[cfg(test)]
 mod submission_tests;
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn cuda_backend_runtime_env_parses_values() {
-        let env = CudaBackendRuntimeEnv::from_env_vars([
-            ("FERRUM_MOE_STREAMS", "8"),
-            ("FERRUM_CUDA_MAX_KV", "16384"),
-            ("FERRUM_CUDA_DEVICE", "2"),
-        ]);
-
-        assert_eq!(env.moe_streams, 8);
-        assert_eq!(env.cuda_max_kv, Some(16384));
-        assert_eq!(env.cuda_device, 2);
-    }
-
-    #[test]
-    fn cuda_backend_runtime_env_defaults_invalid_values() {
-        let env = CudaBackendRuntimeEnv::from_env_vars([
-            ("FERRUM_MOE_STREAMS", "0"),
-            ("FERRUM_CUDA_MAX_KV", "invalid"),
-            ("FERRUM_CUDA_DEVICE", "invalid"),
-        ]);
-
-        assert_eq!(env.moe_streams, 1);
-        assert_eq!(env.cuda_max_kv, None);
-        assert_eq!(env.cuda_device, 0);
-    }
-
-    #[test]
-    fn cuda_device_scope_nests_and_restores() {
-        let default = current_device_ordinal();
-
-        with_cuda_device_ordinal(Some(1), || {
-            assert_eq!(current_device_ordinal(), 1);
-            with_cuda_device_ordinal(Some(2), || {
-                assert_eq!(current_device_ordinal(), 2);
-            });
-            assert_eq!(current_device_ordinal(), 1);
-        });
-
-        assert_eq!(current_device_ordinal(), default);
-    }
-}

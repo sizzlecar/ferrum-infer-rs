@@ -120,9 +120,11 @@ fn cuda_operator_member(path: &str) -> Option<&str> {
     let (directory, filename) = relative.split_once('/')?;
     (matches!(
         directory,
-        "upstream-linear"
+        "marlin-instance-policy"
+            | "upstream-linear"
             | "upstream-extra-linear"
             | "upstream-q6-f32-linear"
+            | "vllm-moe-marlin-profiler-free"
             | "vllm-paged-attention-indexed"
     ) && !filename.is_empty()
         && !filename.contains('/'))
@@ -512,6 +514,33 @@ fn classify(path: &str) -> Option<(Vec<ChangeArea>, &'static str)> {
             "isolated backend implementation: retain operator numerics, boundaries, model forward and performance; model architecture/state is a separate responsibility",
         ));
     }
+    if (component == "ferrum-journal"
+        && matches!(
+            relative,
+            "src/lib.rs"
+                | "src/jsonl_journal.rs"
+                | "src/jsonl_journal/delivery.rs"
+                | "src/jsonl_journal/ownership.rs"
+        ))
+        || (component == "ferrum-types" && relative == "src/benchmark_correlation.rs")
+    {
+        return Some((vec![Observability, Validation],
+            "production journal publication/retirement and HTTP correlation contracts; no device operators or model arithmetic"));
+    }
+    if component == "ferrum-journal"
+        && matches!(
+            relative,
+            "src/jsonl_journal/budget_tests.rs"
+                | "src/jsonl_journal/delivery_tests.rs"
+                | "src/jsonl_journal/ownership_tests.rs"
+                | "src/jsonl_journal/publication_tests.rs"
+        )
+    {
+        return Some((
+            vec![Validation],
+            "journal fault, capacity and ownership tests registered only under cfg(test)",
+        ));
+    }
     if component == "ferrum-bench-core" {
         return classify_bench_core(relative);
     }
@@ -532,6 +561,10 @@ fn classify(path: &str) -> Option<(Vec<ChangeArea>, &'static str)> {
                 Architecture,
             ],
             "shared execution: retain protocol, sampling, resource and backend interactions",
+        ),
+        "ferrum-output" => (
+            vec![Template, Termination, Structured, Tools, Scheduler, Kv, Architecture],
+            "shared output ownership and backpressure affect run/serve semantics, admission and request lifetime",
         ),
         "ferrum-sampler" => (
             vec![Termination, Structured, Tools],
@@ -589,6 +622,8 @@ fn known_component(component: &str) -> bool {
             | "ferrum-interfaces"
             | "ferrum-runtime"
             | "ferrum-execution"
+            | "ferrum-output"
+            | "ferrum-journal"
             | "ferrum-engine"
             | "ferrum-sampler"
             | "ferrum-tokenizer"
@@ -608,16 +643,13 @@ fn known_component(component: &str) -> bool {
 
 fn classify_bench_core(relative: &str) -> Option<(Vec<ChangeArea>, &'static str)> {
     use ChangeArea::*;
-    if matches!(
-        relative,
-        "src/lib.rs" | "src/jsonl_journal.rs" | "src/profile.rs" | "src/trace.rs"
-    ) {
-        // lib.rs parses headers on the real Chat endpoint. The journal/profile/
-        // trace modules are called by engine lifecycle and backend execution,
-        // as well as benchmark producers; crate naming cannot erase that reach.
+    if matches!(relative, "src/lib.rs" | "src/profile.rs" | "src/trace.rs") {
+        // Tool-facing wire/journal re-exports and historical artifact readers
+        // retain observability validation. Production callers use the original
+        // contracts in ferrum-types and the writer in ferrum-journal directly.
         return Some((
             vec![Observability, Validation],
-            "shared production request metadata, profile sinks and runtime journals",
+            "tool-facing correlation/journal re-exports and historical profile artifacts",
         ));
     }
     if matches!(
@@ -729,6 +761,8 @@ mod tests {
             "native-operators/cuda/package-definitions/vllm-paged-attention-v2.json",
             "native-operators/cuda/source-locks/vllm-moe-marlin.plan.json",
             "native-operators/cuda/source-overlays/vllm-paged-attention-indexed.json",
+            "native-operators/cuda/source-overlays/vllm-moe-marlin-profiler-free.json",
+            "native-operators/cuda/source-overlays/marlin-instance-policy.json",
         ];
         for path in descriptors {
             assert_eq!(path_backend(path), Some(Backend::Cuda));
@@ -772,6 +806,8 @@ mod tests {
             "native-operators/cuda/upstream-extra-linear/abi.h",
             "native-operators/cuda/upstream-q6-f32-linear/f16_adapter.cuh",
             "native-operators/cuda/vllm-paged-attention-indexed/launcher_gqa2_test.cu",
+            "native-operators/cuda/vllm-moe-marlin-profiler-free/ops.cu",
+            "native-operators/cuda/marlin-instance-policy/marlin_cuda_kernel.cu",
         ];
         for path in sources {
             let impact = analyze_paths([path]);
@@ -784,6 +820,8 @@ mod tests {
             "native-operators/cuda/upstream-extra-linear/llama-MIT.txt",
             "native-operators/cuda/upstream-q6-f32-linear/llama-MIT.txt",
             "native-operators/cuda/vllm-paged-attention-indexed/README.md",
+            "native-operators/cuda/vllm-moe-marlin-profiler-free/README.md",
+            "native-operators/cuda/marlin-instance-policy/README.md",
         ] {
             assert_eq!(analyze_paths([path]).areas, [ChangeArea::Build]);
             assert_eq!(path_backend(path), Some(Backend::Cuda));
@@ -1057,6 +1095,7 @@ mod tests {
             "crates/ferrum-interfaces/src/tokenizer.rs",
             "crates/ferrum-runtime/src/resource.rs",
             "crates/ferrum-execution/src/model_executor.rs",
+            "crates/ferrum-output/src/lib.rs",
             "crates/ferrum-engine/src/continuous_engine.rs",
         ] {
             let impact = analyze_paths([path]);
@@ -1202,7 +1241,10 @@ mod tests {
     fn production_headers_and_sinks_retain_observability_without_inferred_numerics() {
         for path in [
             "crates/ferrum-bench-core/src/lib.rs",
-            "crates/ferrum-bench-core/src/jsonl_journal.rs",
+            "crates/ferrum-journal/src/jsonl_journal.rs",
+            "crates/ferrum-journal/src/jsonl_journal/delivery.rs",
+            "crates/ferrum-journal/src/jsonl_journal/ownership.rs",
+            "crates/ferrum-types/src/benchmark_correlation.rs",
             "crates/ferrum-bench-core/src/profile.rs",
             "crates/ferrum-bench-core/src/trace.rs",
         ] {
@@ -1293,7 +1335,7 @@ mod tests {
         }
         let combined = analyze_paths([
             "crates/ferrum-cli/examples/model_regression/protocol.rs",
-            "crates/ferrum-bench-core/src/jsonl_journal.rs",
+            "crates/ferrum-journal/src/jsonl_journal.rs",
         ]);
         assert!(combined.areas.contains(&ChangeArea::Observability));
         assert!(combined.areas.contains(&ChangeArea::Validation));
@@ -1407,6 +1449,7 @@ mod tests {
         for component in [
             "ferrum-cli",
             "ferrum-engine",
+            "ferrum-output",
             "ferrum-models",
             "ferrum-kernels",
             "ferrum-bench-core",

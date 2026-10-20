@@ -59,7 +59,7 @@ impl OpUnderTest for SiluMulOp {
         use ferrum_kernels::backend::Backend;
 
         let gate_up = self.build_input(seed);
-        let mut ctx = CpuBackend::new_context();
+        let mut ctx = CpuBackend::new_context(&Default::default()).expect("backend context");
         let gu_buf = CpuBackend::from_slice(&gate_up);
         let mut out = CpuBackend::alloc(self.output_len());
         CpuBackend::fused_silu_mul_split(
@@ -79,7 +79,7 @@ impl OpUnderTest for SiluMulOp {
         use ferrum_kernels::backend::Backend;
 
         let gate_up = self.build_input(seed);
-        let mut ctx = MetalBackend::new_context();
+        let mut ctx = MetalBackend::new_context(&Default::default()).expect("backend context");
         let gu_buf = MetalBackend::from_slice(&gate_up);
         let mut out = MetalBackend::alloc(self.output_len());
         MetalBackend::fused_silu_mul_split(
@@ -100,7 +100,7 @@ impl OpUnderTest for SiluMulOp {
         use ferrum_kernels::backend::Backend;
 
         let gate_up = self.build_input(seed);
-        let mut ctx = CudaBackend::new_context();
+        let mut ctx = CudaBackend::new_context(&Default::default()).expect("backend context");
         let gu_buf = CudaBackend::from_slice(&gate_up);
         let mut out = CudaBackend::alloc(self.output_len());
         CudaBackend::fused_silu_mul_split(

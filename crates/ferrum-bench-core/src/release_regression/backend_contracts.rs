@@ -8,13 +8,83 @@ mod compatibility;
 mod numerical;
 
 const PATH: &str = "production-plan-runtime";
-const LEGACY_CUDA_CHECK: &str = "backend-contract.cuda.legacy-submission";
 
-fn legacy_cuda_scope() -> ObligationScope {
+fn legacy_scope(backend: Backend) -> ObligationScope {
     ObligationScope::ExecutionPath {
-        backend: Backend::Cuda,
+        backend,
         execution_path: super::submission::LEGACY_EXECUTION_PATH.into(),
     }
+}
+
+fn legacy_checker_id(backend: Backend) -> String {
+    format!(
+        "backend-contract.{}.legacy-submission",
+        backend_name(backend)
+    )
+}
+
+fn model_frame_tests(backend: Backend) -> Vec<ContractTest> {
+    let name = backend_name(backend);
+    let mut tests = vec![
+        format!("models::llama_family::device_execution::tests::single_device_frame_restores_original_scratch_after_real_{name}_forward_failure"),
+        format!("models::llama_family_forward_batched::tests::physical_batch_frame_preserves_real_{name}_logits_and_scratch_on_failure"),
+        format!("models::llama_family_forward_batched::tests::selection_failure_full_readback_observes_real_{name}_preparation"),
+        format!("models::llama_family::device_execution::preparation_tests::preparation_frame_real_{name}_allocator_and_contiguous_growth"),
+    ];
+    if backend == Backend::Metal {
+        tests.push("models::llama_family::device_execution::preparation_tests::preparation_frame_real_metal_pending_context_blocks_allocation".into());
+        tests.push("models::llama_family::device_execution::tests::metal_frame_failure_before_first_encode_restores_owner_and_full_numerical_execution".into());
+        tests.extend([
+            "qualification_unwrapped_metal_completes_and_rejects_invalid_close_without_losing_progress",
+            "qualification_unwrapped_metal_cancelled_delivery_closes_original_and_keeps_peer_usable",
+            "encoded_failure::qualification_unwrapped_metal_encoded_failure_retires_once_and_peer_matches_cpu",
+            "qualification_unwrapped_metal_backbone_and_partial_stage_remain_unsupported",
+        ].into_iter().map(|test| format!("executor::llm_executor::token_execution::qualification_tests::{test}")));
+    }
+    if backend == Backend::Metal {
+        tests.extend([
+            "qualification_pipeline_metal_batch_and_overlap_full_logits",
+            "qualification_pipeline_metal_later_stage_failure_and_cancellation",
+        ].into_iter().map(|test| format!("executor::llm_executor::token_execution::qualification_tests::pipeline::{test}")));
+    }
+    if backend != Backend::Cpu {
+        tests.extend([
+            format!("lora::runtime_tests::{name}_lora_workspace_growth_matches_complete_outputs"),
+            format!("models::llama_family::lora_tests::instance_workspace::{name}_lora_instance_workspace_interleaves_adapters_and_survives_peer_close"),
+        ]);
+    }
+    if backend == Backend::Cuda {
+        tests.push("models::llama_family::device_execution::tests::model_frame_cancels_failed_cuda_capture_without_executing_prefix".into());
+        tests.extend([
+            "qualification_unwrapped_cuda_completion_and_original_owner_close",
+            "qualification_unwrapped_cuda_cold_owner_closes_without_admission",
+            "qualification_unwrapped_cuda_encoded_failure_keeps_peer_and_closes_original",
+            "qualification_unwrapped_cuda_encoded_cancellation_preserves_peer",
+            "qualification_unwrapped_cuda_cancelled_close_waiter_joins_original_worker",
+            "int8::qualification_unwrapped_cuda_int8_completion_and_original_owner_close",
+            "int8::qualification_unwrapped_cuda_int8_cold_owner_closes_without_admission",
+            "int8::qualification_unwrapped_cuda_int8_encoded_failure_keeps_peer_and_closes_original",
+            "int8::qualification_unwrapped_cuda_int8_encoded_cancellation_preserves_peer",
+            "int8::qualification_unwrapped_cuda_int8_cancelled_close_waiter_joins_original_worker",
+            "int8::qualification_unwrapped_cuda_int8_serial_page_crossing_keeps_completed_peer",
+        ].into_iter().map(|test| format!("executor::llm_executor::token_execution::qualification_tests::cuda::{test}")));
+    }
+    if backend == Backend::Cuda {
+        tests.extend([
+            "qualification_pipeline_cuda_batch_and_overlap_full_logits",
+            "qualification_pipeline_cuda_later_stage_failure_and_cancellation",
+            "qualification_pipeline_cuda_int8_original_stage_owners",
+        ].into_iter().map(|test| format!("executor::llm_executor::token_execution::qualification_tests::pipeline::{test}")));
+    }
+    tests
+        .into_iter()
+        .map(|name| ContractTest {
+            package: "ferrum-models".into(),
+            target: "ferrum_models".into(),
+            kind: "lib".into(),
+            name,
+        })
+        .collect()
 }
 
 pub fn submission_scope(backend: Backend) -> ObligationScope {
@@ -57,6 +127,8 @@ pub fn contract_groups(backend: Backend) -> Vec<ContractGroup> {
                 "encode_failure_is_definitely_not_submitted_and_restores_stream",
                 "completed_device_status_is_checked_after_fence_and_fails_quiescently",
                 "completed_device_status_reused_slot_is_cleared_by_each_submission",
+                "static_weight_no_copy_region_retains_page_owner_after_source_drop",
+                "static_weight_import_copies_retained_regions_without_a_safe_native_view",
             ],
         ),
         Backend::Cuda => (
@@ -77,6 +149,15 @@ pub fn contract_groups(backend: Backend) -> Vec<ContractGroup> {
             name: format!("{module}::{name}"),
         })
         .collect();
+    submission_tests.push(ContractTest {
+        package: "ferrum-models".into(),
+        target: "ferrum_models".into(),
+        kind: "lib".into(),
+        name: format!(
+            "executor::driver_contract_tests::sampling::shutdown::native_shutdown_{}_joins_cancelled_submission_after_waiter_drop",
+            backend_name(backend),
+        ),
+    });
     if backend == Backend::Cuda {
         submission_tests.push(ContractTest {
             package: "ferrum-kernels".into(),
@@ -115,12 +196,104 @@ pub fn contract_groups(backend: Backend) -> Vec<ContractGroup> {
         entrypoints: Vec::new(),
         tests: submission_tests,
     }];
-    if backend == Backend::Cuda {
-        groups.push(ContractGroup {
-            id: LEGACY_CUDA_CHECK.into(),
-            behavior: Behavior::SubmissionCompletion,
-            entrypoints: Vec::new(),
-            tests: vec![
+    if backend != Backend::Cpu {
+        let mut tests = model_frame_tests(backend);
+        if backend == Backend::Metal {
+            tests.extend(
+                [
+                    "backend::metal::checked_sync_tests::missing_submission_is_not_success",
+                    "backend::metal::instance_queue_tests::metal_instance_queues_keep_peer_unsubmitted_work_through_retirement",
+                    "backend::metal::instance_queue_tests::metal_instance_queues_consume_original_buffer_after_checked_handoff",
+                    "attention::metal::pipelines::quantized::tests::quantized_catalog_lazy_slots_belong_to_each_catalog_and_share_by_borrow",
+                ]
+                .into_iter()
+                .map(|name| ContractTest {
+                    package: "ferrum-kernels".into(),
+                    target: "ferrum_kernels".into(),
+                    kind: "lib".into(),
+                    name: name.into(),
+                }),
+            );
+            tests.extend(
+                [
+                    "metal_injected_failure_blocks_host_access_and_encoding_until_explicit_begin",
+                    "metal_injected_unresolved_observation_preserves_submission_and_blocks_host_access",
+                    "metal_host_synchronization_preserves_full_outputs_and_successful_continuation",
+                ]
+                .into_iter()
+                .map(|name| ContractTest {
+                    package: "ferrum-kernels".into(),
+                    target: "ferrum_kernels".into(),
+                    kind: "lib".into(),
+                    name: format!("backend::metal::host_access_tests::{name}"),
+                }),
+            );
+            tests.extend(
+                [
+                    "metal_no_copy_quant_weights_survive_drop_before_commit",
+                    "metal_no_copy_raw_buffer_clone_outlives_context_and_weight",
+                    "metal_no_copy_peer_survives_independent_and_shared_mapping_retirement",
+                    "metal_registered_partial_page_copies_exact_tensor_and_releases_source",
+                ]
+                .into_iter()
+                .map(|name| ContractTest {
+                    package: "ferrum-kernels".into(),
+                    target: "ferrum_kernels".into(),
+                    kind: "lib".into(),
+                    name: format!("backend::metal::mmap_lifetime_tests::{name}"),
+                }),
+            );
+            tests.extend(
+                [
+                    "metal_instance_weight_policy_is_frozen_across_interleaved_loads_and_peer_retirement",
+                    "metal_instance_attention_routes_and_full_outputs_survive_interleaving_and_peer_retirement",
+                    "metal_query_tiled_partial_kv_tiles_match_cpu_without_padding",
+                ]
+                .into_iter()
+                .map(|name| ContractTest {
+                    package: "ferrum-kernels".into(),
+                    target: "ferrum_kernels".into(),
+                    kind: "lib".into(),
+                    name: format!("backend::metal::instance_config_tests::{name}"),
+                }),
+            );
+            tests.extend(
+                [
+                    "copy_slice_real_metal_f32_preserves_offsets_and_canaries",
+                    "copy_slice_real_metal_f16_preserves_offsets_and_canaries",
+                    "copy_slice_real_metal_rejects_dtype_and_extent_errors_before_encoding",
+                ]
+                .into_iter()
+                .map(|name| ContractTest {
+                    package: "ferrum-kernels".into(),
+                    target: "ferrum_kernels".into(),
+                    kind: "lib".into(),
+                    name: format!("backend::metal::copy_slice_tests::{name}"),
+                }),
+            );
+        }
+        if backend == Backend::Cuda {
+            tests.extend(
+                [
+                    "qkv_capture_reuses_original_scratch_and_replays_after_eager_growth",
+                    "qkv_unprepared_capture_failure_discards_prefix_and_reuses_original_context",
+                    "invalidated_capture_is_confirmed_ended_before_original_context_reuse",
+                ]
+                .into_iter()
+                .map(|name| ContractTest {
+                    package: "ferrum-kernels".into(),
+                    target: "ferrum_kernels".into(),
+                    kind: "lib".into(),
+                    name: format!("backend::cuda::qkv::tests::{name}"),
+                }),
+            );
+            tests.extend([
+                ContractTest {
+                    package: "ferrum-kernels".into(),
+                    target: "ferrum_kernels".into(),
+                    kind: "lib".into(),
+                    name: "backend::cuda::instance_owner_tests::equal_graph_keys_remain_owned_across_peer_reset_and_retirement".into(),
+                },
                 ContractTest {
                     package: "ferrum-kernels".into(),
                     target: "ferrum_kernels".into(),
@@ -133,12 +306,55 @@ pub fn contract_groups(backend: Backend) -> Vec<ContractGroup> {
                     kind: "lib".into(),
                     name: "models::llama_family::lora_tests::lora_cuda_existing_base_graph_cannot_bypass_adapter".into(),
                 },
-            ],
+                ContractTest {
+                    package: "ferrum-kernels".into(),
+                    target: "int8_kv_parity".into(),
+                    kind: "test".into(),
+                    name: "int8_kv_append_then_decode_e2e".into(),
+                },
+                ContractTest {
+                    package: "ferrum-kernels".into(),
+                    target: "int8_kv_parity".into(),
+                    kind: "test".into(),
+                    name: "kv_cache_quant_int8_e2e".into(),
+                },
+            ]);
+        }
+        groups.push(ContractGroup {
+            id: legacy_checker_id(backend),
+            behavior: Behavior::SubmissionCompletion,
+            entrypoints: Vec::new(),
+            tests,
         });
     }
     groups.extend(numerical::groups(backend));
     groups.extend(compatibility::groups(backend));
     if backend != Backend::Cpu {
+        // Lifecycle recovery compares independent models at the same physical
+        // batch shape. Numerical qualification stays independently mandatory:
+        // CUDA checks each shape against the CPU full-vocabulary oracle;
+        // Metal retains its existing strict M=1/M=2 comparison.
+        groups.push(ContractGroup {
+            id: format!(
+                "backend-contract.{}.legacy-physical-batch-numerics",
+                backend_name(backend),
+            ),
+            behavior: Behavior::KernelNumerics,
+            entrypoints: Vec::new(),
+            tests: vec![ContractTest {
+                package: "ferrum-models".into(),
+                target: "ferrum_models".into(),
+                kind: "lib".into(),
+                name: if backend == Backend::Cuda {
+                    "models::llama_family_forward_batched::tests::physical_batch_and_single_logits_match_cpu_oracle_on_cuda".into()
+                } else {
+                    format!(
+                        "models::llama_family_forward_batched::tests::physical_batch_logits_match_single_item_decode_on_{}",
+                        backend_name(backend),
+                    )
+                },
+            }],
+        });
         // Shared legacy weight loading has its own numerical contract. These
         // checks do not establish qualification for a typed model plan.
         groups.push(ContractGroup {
@@ -228,19 +444,23 @@ pub fn check_descriptors(targets: &[ExecutionTarget]) -> Vec<CheckDescriptor> {
             })
         })
         .chain(
-            targets
-                .iter()
-                .filter(|target| {
-                    target.backend == Backend::Cuda
-                        && target.execution_path == super::submission::LEGACY_EXECUTION_PATH
-                })
-                .min_by_key(|target| (&target.architecture, &target.precision))
-                .map(|target| CheckDescriptor {
-                    id: LEGACY_CUDA_CHECK.into(),
-                    behavior: Behavior::SubmissionCompletion,
-                    layer: EvidenceLayer::BackendNumerics,
-                    target: Some(target.clone()),
-                    entrypoints: Vec::new(),
+            [Backend::Metal, Backend::Cuda]
+                .into_iter()
+                .filter_map(|backend| {
+                    targets
+                        .iter()
+                        .filter(|target| {
+                            target.backend == backend
+                                && target.execution_path == super::submission::LEGACY_EXECUTION_PATH
+                        })
+                        .min_by_key(|target| (&target.architecture, &target.precision))
+                        .map(|target| CheckDescriptor {
+                            id: legacy_checker_id(backend),
+                            behavior: Behavior::SubmissionCompletion,
+                            layer: EvidenceLayer::BackendNumerics,
+                            target: Some(target.clone()),
+                            entrypoints: Vec::new(),
+                        })
                 }),
         )
         .chain(numerical::descriptors(targets))
@@ -273,11 +493,11 @@ fn expected_checker(backend: Backend, obligation: &super::Obligation) -> Option<
         && obligation.scope == submission_scope(backend)
     {
         Some(checker_id(backend))
-    } else if backend == Backend::Cuda
+    } else if backend != Backend::Cpu
         && obligation.behavior == Behavior::SubmissionCompletion
-        && obligation.scope == legacy_cuda_scope()
+        && obligation.scope == legacy_scope(backend)
     {
-        Some(LEGACY_CUDA_CHECK.into())
+        Some(legacy_checker_id(backend))
     } else {
         numerical::expected_checker(backend, obligation)
             .or_else(|| compatibility::expected_checker(backend, obligation))
@@ -462,6 +682,90 @@ mod tests {
     }
 
     #[test]
+    fn legacy_lifecycle_receipt_cannot_replace_physical_batch_numerical_execution() {
+        for backend in [Backend::Metal, Backend::Cuda] {
+            let report = report_fixture(backend);
+            verify_report(backend, &report).unwrap();
+            let numerical_id = format!(
+                "backend-contract.{}.legacy-physical-batch-numerics",
+                backend_name(backend),
+            );
+            let mut failed = report.clone();
+            let execution = failed
+                .execution
+                .groups
+                .iter_mut()
+                .find(|group| group.id == numerical_id)
+                .unwrap()
+                .tests[0]
+                .execution
+                .as_mut()
+                .unwrap();
+            execution.exit_code = Some(1);
+            assert!(verify_report(backend, &failed).is_err());
+            let mut missing = report;
+            missing
+                .execution
+                .groups
+                .retain(|group| group.id != numerical_id);
+            assert!(verify_report(backend, &missing).is_err());
+        }
+    }
+
+    #[test]
+    fn cuda_physical_batch_receipt_requires_the_cpu_oracle_execution() {
+        let mut report = report_fixture(Backend::Cuda);
+        verify_report(Backend::Cuda, &report).unwrap();
+        let numerical = report
+            .execution
+            .groups
+            .iter_mut()
+            .find(|group| group.id == "backend-contract.cuda.legacy-physical-batch-numerics")
+            .unwrap();
+        assert_eq!(
+            numerical.tests[0].binding.name,
+            "models::llama_family_forward_batched::tests::physical_batch_and_single_logits_match_cpu_oracle_on_cuda",
+        );
+        // Even a purported passing receipt for the former cross-GPU-shape
+        // comparison cannot substitute for the independent CPU-oracle test.
+        numerical.tests[0].binding.name =
+            "models::llama_family_forward_batched::tests::physical_batch_logits_match_single_item_decode_on_cuda".into();
+        assert!(verify_report(Backend::Cuda, &report).is_err());
+    }
+
+    #[test]
+    fn pipeline_receipts_require_the_original_stage_failure_execution() {
+        for backend in [Backend::Metal, Backend::Cuda] {
+            let name = format!(
+                "executor::llm_executor::token_execution::qualification_tests::pipeline::qualification_pipeline_{}_later_stage_failure_and_cancellation",
+                backend_name(backend),
+            );
+            let report = report_fixture(backend);
+            verify_report(backend, &report).unwrap();
+            let mut failed = report.clone();
+            failed
+                .execution
+                .groups
+                .iter_mut()
+                .flat_map(|group| &mut group.tests)
+                .find(|test| test.binding.name == name)
+                .expect("pipeline stage failure has its own execution receipt")
+                .execution
+                .as_mut()
+                .unwrap()
+                .exit_code = Some(1);
+            assert!(verify_report(backend, &failed).is_err());
+            let mut missing = report;
+            for group in &mut missing.execution.groups {
+                group.tests.retain(|test| test.binding.name != name);
+            }
+            // A passing single-model lifecycle does not prove the pipeline's
+            // aggregate stage recovery and original-owner retirement boundary.
+            assert!(verify_report(backend, &missing).is_err());
+        }
+    }
+
+    #[test]
     fn device_reports_reject_missing_execution_and_cross_backend_substitution() {
         for backend in [Backend::Cpu, Backend::Metal, Backend::Cuda] {
             let report = report_fixture(backend);
@@ -588,48 +892,70 @@ mod tests {
     }
 
     #[test]
-    fn legacy_cuda_requires_its_own_execution_and_cannot_certify_operator_numerics() {
-        let target = ExecutionTarget {
-            architecture: "llama_dense".into(),
-            protocol: ferrum_types::ModelOutputProtocol::Text,
-            precision: "safetensors-bf16".into(),
-            backend: Backend::Cuda,
-            execution_path: super::super::submission::LEGACY_EXECUTION_PATH.into(),
-        };
-        let descriptors = check_descriptors(&[target]);
-        let descriptor = descriptors
-            .iter()
-            .find(|d| d.id == LEGACY_CUDA_CHECK)
-            .unwrap();
-        let mut obligation = super::super::Obligation {
-            behavior: descriptor.behavior,
-            layer: descriptor.layer,
-            scope: legacy_cuda_scope(),
-            checkers: vec![descriptor.id.clone()],
-            entrypoints: Vec::new(),
-            reason: "legacy stream lifecycle".into(),
-        };
-        let report = report_fixture(Backend::Cuda);
-        let receipt = verify_report(Backend::Cuda, &report).unwrap();
-        assert!(receipt.covers(&obligation));
-        assert_eq!(required_backend(&obligation), Some(Backend::Cuda));
-        obligation.behavior = Behavior::KernelNumerics;
-        assert!(!receipt.covers(&obligation));
-        obligation.behavior = Behavior::SubmissionCompletion;
-        obligation.checkers = vec![checker_id(Backend::Cuda)];
-        assert!(!receipt.covers(&obligation));
-        let mut vnext_only = report;
-        vnext_only
-            .execution
-            .groups
-            .retain(|group| group.id != LEGACY_CUDA_CHECK);
-        assert!(verify_report(Backend::Cuda, &vnext_only).is_err());
-        assert!(!contract_groups(Backend::Cpu)
-            .iter()
-            .any(|group| group.id == LEGACY_CUDA_CHECK));
-        assert!(!contract_groups(Backend::Metal)
-            .iter()
-            .any(|group| group.id == LEGACY_CUDA_CHECK));
+    fn legacy_accelerators_require_model_frame_execution_and_cannot_certify_operator_numerics() {
+        for backend in [Backend::Metal, Backend::Cuda] {
+            let target = ExecutionTarget {
+                architecture: "llama_dense".into(),
+                protocol: ferrum_types::ModelOutputProtocol::Text,
+                precision: match backend {
+                    Backend::Metal => "gguf-q4_k_m",
+                    _ => "safetensors-bf16",
+                }
+                .into(),
+                backend,
+                execution_path: super::super::submission::LEGACY_EXECUTION_PATH.into(),
+            };
+            let descriptors = check_descriptors(&[target]);
+            let descriptor = descriptors
+                .iter()
+                .find(|d| d.id == legacy_checker_id(backend))
+                .unwrap();
+            let mut obligation = super::super::Obligation {
+                behavior: descriptor.behavior,
+                layer: descriptor.layer,
+                scope: legacy_scope(backend),
+                checkers: vec![descriptor.id.clone()],
+                entrypoints: Vec::new(),
+                reason: "legacy stream lifecycle".into(),
+            };
+            let report = report_fixture(backend);
+            let receipt = verify_report(backend, &report).unwrap();
+            assert!(receipt.covers(&obligation));
+            assert_eq!(required_backend(&obligation), Some(backend));
+            obligation.behavior = Behavior::KernelNumerics;
+            assert!(!receipt.covers(&obligation));
+            obligation.behavior = Behavior::SubmissionCompletion;
+            obligation.checkers = vec![checker_id(backend)];
+            assert!(!receipt.covers(&obligation));
+            for expected in model_frame_tests(backend) {
+                let mut listed_only = report.clone();
+                let group = listed_only
+                    .execution
+                    .groups
+                    .iter_mut()
+                    .find(|group| group.id == legacy_checker_id(backend))
+                    .unwrap();
+                let test = group
+                    .tests
+                    .iter_mut()
+                    .find(|test| test.binding == expected)
+                    .unwrap();
+                test.execution = None;
+                assert!(
+                    verify_report(backend, &listed_only).is_err(),
+                    "listing the frame assertion is not execution evidence"
+                );
+            }
+            let mut vnext_only = report;
+            vnext_only
+                .execution
+                .groups
+                .retain(|group| group.id != legacy_checker_id(backend));
+            assert!(verify_report(backend, &vnext_only).is_err());
+            assert!(!contract_groups(Backend::Cpu)
+                .iter()
+                .any(|group| group.id == legacy_checker_id(backend)));
+        }
     }
 
     #[test]
@@ -665,6 +991,31 @@ mod tests {
                 .retain(|test| !test.binding.name.contains("::f16_tests::"));
         }
         assert!(verify_report(Backend::Cuda, &native_only).is_err());
+    }
+
+    #[test]
+    fn native_override_retirement_requires_each_actual_ffi_entrypoint() {
+        let report = report_fixture(Backend::Cuda);
+        assert!(verify_report(Backend::Cuda, &report).is_ok());
+        for required in [
+            "native_classic_dense_tile_retirement_preserves_cpu_reference",
+            "native_classic_fused_tile_retirement_preserves_cpu_reference",
+            "native_moe_f16_override_retirement_preserves_cpu_reference",
+            "native_moe_fp8_override_retirement_preserves_cpu_reference",
+            "native_moe_mxfp4_override_retirement_preserves_source_reference",
+            "native_moe_profile_retirement_ignores_environment_after_real_math",
+        ] {
+            let mut missing = report.clone();
+            for group in &mut missing.execution.groups {
+                group
+                    .tests
+                    .retain(|test| !test.binding.name.ends_with(required));
+            }
+            assert!(
+                verify_report(Backend::Cuda, &missing).is_err(),
+                "a receipt must not omit native FFI evidence for {required}",
+            );
+        }
     }
 
     #[test]

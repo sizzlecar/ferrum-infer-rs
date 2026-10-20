@@ -27,7 +27,7 @@ impl OpUnderTest for TransposeHeadToTokenOp {
         use ferrum_kernels::backend::Backend;
 
         let src = random_vec(self.elems(), -2.0, 2.0, seed);
-        let mut ctx = CpuBackend::new_context();
+        let mut ctx = CpuBackend::new_context(&Default::default()).expect("backend context");
         let src_buf = CpuBackend::from_slice(&src);
         let mut dst = CpuBackend::alloc(self.elems());
         CpuBackend::transpose_head_to_token(
@@ -48,7 +48,7 @@ impl OpUnderTest for TransposeHeadToTokenOp {
         use ferrum_kernels::backend::Backend;
 
         let src = random_vec(self.elems(), -2.0, 2.0, seed);
-        let mut ctx = MetalBackend::new_context();
+        let mut ctx = MetalBackend::new_context(&Default::default()).expect("backend context");
         let src_buf = MetalBackend::from_slice(&src);
         let mut dst = MetalBackend::alloc(self.elems());
         MetalBackend::transpose_head_to_token(
@@ -69,7 +69,7 @@ impl OpUnderTest for TransposeHeadToTokenOp {
         use ferrum_kernels::backend::Backend;
 
         let src = random_vec(self.elems(), -2.0, 2.0, seed);
-        let mut ctx = CudaBackend::new_context();
+        let mut ctx = CudaBackend::new_context(&Default::default()).expect("backend context");
         let src_buf = CudaBackend::from_slice(&src);
         let mut dst = CudaBackend::alloc(self.elems());
         CudaBackend::transpose_head_to_token(

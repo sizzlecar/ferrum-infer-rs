@@ -4,12 +4,10 @@
 //! implementing text-generation operations or creating dummy KV state.
 
 use async_trait::async_trait;
+use ferrum_output::{InferenceOutput, InferenceStream};
 use ferrum_types::{
-    EngineConfig, ExecutionResourceAuthority, ExecutorAdmissionSnapshot, InferenceRequest,
-    InferenceResponse, Result, StreamChunk,
+    EngineConfig, ExecutionPlanningModel, ExecutorAdmissionSnapshot, InferenceRequest, Result,
 };
-use futures::Stream;
-use std::pin::Pin;
 
 /// Lifecycle / status methods shared by every engine kind.
 ///
@@ -21,6 +19,15 @@ pub trait InferenceEngine: Send + Sync {
 
     /// Shutdown engine gracefully.
     async fn shutdown(&self) -> Result<()>;
+
+    /// Observe completion of the original shutdown, including its execution
+    /// owners and journal producer scopes. This must not start a second close.
+    ///
+    /// Unlike `shutdown`, which may report retained resources immediately,
+    /// this method returns only after cleanup is terminal. An error may still
+    /// report an earlier execution or cleanup failure. Cancelling this wait
+    /// must not cancel the original cleanup or release its custody.
+    async fn wait_for_shutdown_completion(&self) -> Result<()>;
 
     /// Get engine configuration.
     fn config(&self) -> &EngineConfig;
@@ -74,12 +81,12 @@ pub trait LlmInferenceEngine: InferenceEngine {
         crate::adapter::AdapterExecutionSupport::Unsupported
     }
 
-    /// Authoritative owner of request-lifetime state and capacity. This is a
-    /// cheap capability query; it must not construct a metrics snapshot.
-    /// Plan-runtime engines supply native prefix observations even when their
-    /// selected plan cannot retain checkpoints.
-    fn execution_resource_authority(&self) -> ExecutionResourceAuthority {
-        ExecutionResourceAuthority::LegacyEngine
+    /// Cold planning and evidence contract of the original executor. This is
+    /// a cheap query and must not construct a metrics snapshot. It grants no
+    /// resource authority and does not prove a particular KV layout or prefix
+    /// restoration; those capabilities come from their actual owner ports.
+    fn execution_planning_model(&self) -> ExecutionPlanningModel {
+        ExecutionPlanningModel::ExecutorManaged
     }
 
     /// Effective per-request capacity in tokens, including input and output.
@@ -90,13 +97,11 @@ pub trait LlmInferenceEngine: InferenceEngine {
     }
 
     /// Execute single inference request.
-    async fn infer(&self, request: InferenceRequest) -> Result<InferenceResponse>;
+    async fn infer(&self, request: InferenceRequest) -> Result<InferenceOutput>;
 
-    /// Execute streaming inference request.
-    async fn infer_stream(
-        &self,
-        request: InferenceRequest,
-    ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamChunk>> + Send>>>;
+    /// Execute streaming inference request. Each output chunk retains its
+    /// session budget until the consumer releases it.
+    async fn infer_stream(&self, request: InferenceRequest) -> Result<InferenceStream>;
 }
 
 /// Advanced engine capabilities — opt-in addition to LLM engines that
@@ -107,7 +112,7 @@ pub trait AdvancedInferenceEngine: LlmInferenceEngine {
     async fn infer_batch(
         &self,
         requests: Vec<InferenceRequest>,
-    ) -> Result<Vec<Result<InferenceResponse>>>;
+    ) -> Result<Vec<Result<InferenceOutput>>>;
 
     /// Warm up engine with sample requests.
     async fn warmup(

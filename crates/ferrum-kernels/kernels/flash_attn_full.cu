@@ -30,6 +30,7 @@ struct FlashAttnParams {
     int causal;      // 1 = causal mask, 0 = no mask
     int pos_offset;  // for decode: attend up to pos_offset + q_pos
     int kv_seq_stride; // stride between KV positions (for GPU cache: max_len, for contiguous: kv_len)
+    int sliding_window; // 0 = full attention; causal queries see at most this many positions
 };
 
 extern "C" __global__ void flash_attn_full_f32(
@@ -72,8 +73,16 @@ extern "C" __global__ void flash_attn_full_f32(
     float acc[MAX_HEAD_DIM];   // accumulator for output
     for (int d = 0; d < hd; d++) acc[d] = 0.0f;
 
-    // Iterate over KV tiles
-    for (int kv_start = 0; kv_start < sk; kv_start += TILE_KV) {
+    // Start at the real causal window, matching the CPU attention contract.
+    // Skipping its excluded prefix also avoids starting online softmax with
+    // an entirely masked tile, where -FLT_MAX - -FLT_MAX would create weights.
+    int first_kv = 0;
+    if (params.causal && params.sliding_window > 0) {
+        const int attend_end = min(sk, params.pos_offset + q_pos + 1);
+        first_kv = max(0, attend_end - params.sliding_window);
+    }
+    // Iterate over KV tiles. A zero window preserves the original traversal.
+    for (int kv_start = first_kv; kv_start < sk; kv_start += TILE_KV) {
         // Compute dot products Q @ K^T for this tile
         float scores[TILE_KV];
         for (int kv_local = 0; kv_local < TILE_KV; kv_local++) {
@@ -170,7 +179,12 @@ extern "C" __global__ void flash_attn_full_f16(
     float acc[MAX_HEAD_DIM];
     for (int d = 0; d < hd; d++) acc[d] = 0.0f;
 
-    for (int kv_start = 0; kv_start < sk; kv_start += TILE_KV) {
+    int first_kv = 0;
+    if (params.causal && params.sliding_window > 0) {
+        const int attend_end = min(sk, params.pos_offset + q_pos + 1);
+        first_kv = max(0, attend_end - params.sliding_window);
+    }
+    for (int kv_start = first_kv; kv_start < sk; kv_start += TILE_KV) {
         float scores[TILE_KV];
         for (int kv_local = 0; kv_local < TILE_KV; kv_local++) {
             int kv_pos = kv_start + kv_local;

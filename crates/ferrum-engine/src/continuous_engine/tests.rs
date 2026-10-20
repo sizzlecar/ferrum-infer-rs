@@ -1,34 +1,108 @@
 use super::*;
-use crate::recurrent_state::{InMemoryRecurrentStateConfig, InMemoryRecurrentStateManager};
+use ferrum_execution::executor_lifecycle::ExecutorOwner;
+use ferrum_execution::token_execution::{
+    ExecutionAdmission, ExecutionBatchOutcome, ExecutionCloseOutcome, ExecutionEndReason,
+    ExecutionFrontier, ExecutionWork, ExecutorSequence, TokenAdmissionOutcome, TokenWork,
+};
 use ferrum_execution::{
     model_executor::{
-        DecodeInput, DecodeOutput, ExecutorAdmissionEpochs, ExecutorBatchDecodeOutcome,
-        ExecutorBatchPrefillOutcome, ExecutorCapabilities, ExecutorCapacityWaitRegistration,
+        ExecutorAdmissionEpochs, ExecutorCapabilities, ExecutorCapacityWaitRegistration,
         ExecutorExecutionCapacityDeferral, ExecutorExecutionCapacityPreemption,
-        ExecutorExecutionCapacityPreemptionAuthority, ExecutorExecutionCapacityPreemptionReceipt,
         ExecutorExecutionCapacityStage, ExecutorPrefillAdmission, ExecutorPrefillAdmissionDecision,
-        ExecutorPrefillAdmissionReceipt, ExecutorPrefillCompletion,
-        ExecutorPrefillMaintenanceBlocker, ExecutorPrefillMaintenanceDeferral,
-        ExecutorPrefillMaintenanceOutcome, ExecutorPrefillMaintenanceStage, ExecutorPrefillOutcome,
-        ExecutorSamplingOutput, ExecutorSequenceCompletion, ExecutorStatus,
-        PlanRuntimeBatchDecodeOutcome, PlanRuntimeBatchPrefillOutcome, PlanRuntimeDecodeInput,
-        PlanRuntimeDecodeOutput, PlanRuntimePrefillCompletion, PlanRuntimePrefillInput,
-        PlanRuntimePrefillOutcome, PlanRuntimePrefillOutput, PlanRuntimeResourceSnapshot,
-        PrefillChunk, PrefillInput, PrefillOutput, UnifiedBatch,
+        ExecutorPrefillAdmissionReceipt, ExecutorPrefillMaintenanceBlocker,
+        ExecutorPrefillMaintenanceDeferral, ExecutorPrefillMaintenanceOutcome,
+        ExecutorPrefillMaintenanceStage, ExecutorSamplingOutput, ExecutorSequenceCompletion,
+        ExecutorStatus, PlanRuntimeResourceSnapshot, PrefillChunk,
     },
     ModelExecutor,
 };
-use ferrum_interfaces::kv_cache::{
-    AllocationRequest, CacheGcStats, CacheManagerStats, MemoryPressure,
-};
 use ferrum_interfaces::tokenizer::{TokenizerInfo, TokenizerType};
-use ferrum_interfaces::{
-    KvCacheHandle, KvCacheManager, RecurrentStateManager, RecurrentStateSpec,
-    RecurrentStateTensorSpec, TensorRef,
-};
-use ferrum_models::{DecoderOnlyLLM, LlmExecutor, LlmRuntimeConfig};
-use ferrum_testkit::{MockKvCacheManager, MockModelExecutor, MockTensor, MockTensorFactory};
+use ferrum_models::DecoderOnlyLLM;
+use ferrum_testkit::MockModelExecutor;
+use ferrum_types::Priority;
 use std::time::Duration;
+
+#[path = "controlled_token_fixture.rs"]
+mod controlled_token_fixture;
+use controlled_token_fixture::ControlledTokenState;
+
+struct ControlledTokenObservation(std::sync::Weak<ControlledTokenState>);
+
+impl ControlledTokenObservation {
+    fn frontier_for_request(&self, request: &RequestId) -> Option<ExecutionFrontier> {
+        self.0.upgrade()?.frontier_for_request(request)
+    }
+}
+
+trait ObservedTestExecutor: ModelExecutor {
+    type Observation;
+    fn observer(&self) -> Arc<Self::Observation>;
+    fn retire_fixture(&mut self) -> Result<()>;
+}
+
+fn begin_controlled_shutdown<E: ObservedTestExecutor>(
+    executor: Arc<E>,
+    permit: &ferrum_execution::executor_lifecycle::ExecutorShutdownPermit,
+) -> ferrum_execution::executor_lifecycle::ExecutorShutdownObserver {
+    use ferrum_execution::executor_lifecycle::{
+        ExecutorShutdownObserver, ExecutorShutdownReporter,
+    };
+    if let Err(error) = permit.check(executor.as_ref()) {
+        return ExecutorShutdownObserver::retained(Arc::new(executor), error);
+    }
+    let executor = match Arc::try_unwrap(executor) {
+        Ok(executor) => executor,
+        Err(original) => {
+            return ExecutorShutdownObserver::retained(
+                Arc::new(original),
+                FerrumError::internal(
+                    "controlled fixture still has an unscoped execution reference",
+                ),
+            )
+        }
+    };
+    enum Original<E> {
+        Live(E),
+        Dropping,
+        Retired,
+    }
+    fn advance<E: ObservedTestExecutor>(
+        original: &Mutex<Original<E>>,
+        reporter: &ExecutorShutdownReporter,
+    ) {
+        let mut original = original.lock();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<()> {
+            match &mut *original {
+                Original::Live(executor) => executor.retire_fixture()?,
+                Original::Dropping => {
+                    return Err(FerrumError::internal(
+                        "controlled fixture destruction unwound without a retirement receipt",
+                    ))
+                }
+                Original::Retired => return Ok(()),
+            }
+            drop(std::mem::replace(&mut *original, Original::Dropping));
+            *original = Original::Retired;
+            Ok(())
+        }));
+        match result {
+            Ok(Ok(())) => reporter.retired(None),
+            Ok(Err(error)) => reporter.retained(error),
+            Err(_) => reporter.retained(FerrumError::internal("controlled fixture close panicked")),
+        }
+    }
+    let original = Arc::new(Mutex::new(Original::Live(executor)));
+    let (reporter, observer) = ExecutorShutdownObserver::channel(original.clone());
+    let weak = Arc::downgrade(&original);
+    let retry_reporter = reporter.clone();
+    let observer = observer.with_retry(Arc::new(move || {
+        if let Some(original) = weak.upgrade() {
+            advance(&original, &retry_reporter);
+        }
+    }));
+    advance(&original, &reporter);
+    observer
+}
 
 #[path = "adapter_admission_tests.rs"]
 mod adapter_admission_tests;
@@ -43,8 +117,12 @@ mod prefix_restore_deferred_tests;
 #[path = "prefix_restore_tests.rs"]
 mod prefix_restore_tests;
 
-#[path = "completion_failure_tests.rs"]
-mod completion_failure_tests;
+#[path = "completion_decode_tests.rs"]
+mod completion_decode_tests;
+#[path = "cost_feedback_tests.rs"]
+mod cost_feedback_tests;
+#[path = "managed_driver_tests.rs"]
+mod managed_driver_tests;
 #[path = "metrics_only_tests.rs"]
 mod metrics_only_tests;
 #[path = "mixed_batch_tests.rs"]
@@ -53,6 +131,8 @@ mod mixed_batch_tests;
 mod partial_batch_tests;
 #[path = "prefix_prompt_tail_tests.rs"]
 mod prefix_prompt_tail_tests;
+#[path = "token_capacity_tests.rs"]
+mod token_capacity_tests;
 
 fn test_execution_capacity_deferral(
     observed: ExecutorAdmissionEpochs,
@@ -79,12 +159,19 @@ fn test_execution_capacity_deferral(
 }
 
 struct PlanRuntimeAdmissionTestExecutor {
+    tokens: Arc<ControlledTokenState>,
     inner: MockModelExecutor,
+    maintenance_gated: bool,
+    missing_resource_snapshot: bool,
+    observation: Arc<PlanRuntimeAdmissionObservation>,
+}
+
+struct PlanRuntimeAdmissionObservation {
+    tokens: ControlledTokenObservation,
     event_sink: std::sync::Mutex<Option<Arc<dyn ProductExecutionEventSink>>>,
     retained: std::sync::Mutex<HashSet<RequestId>>,
     admission_accounting: std::sync::Mutex<Vec<(RequestId, usize, usize, usize)>>,
     completions: std::sync::Mutex<Vec<ExecutorSequenceCompletion>>,
-    maintenance_gated: bool,
     available_admissions: AtomicU64,
     capacity_epoch: AtomicU64,
     admission_probes: AtomicU64,
@@ -95,8 +182,48 @@ struct PlanRuntimeAdmissionTestExecutor {
     fail_next_prefill_after_admission: AtomicBool,
 }
 
+impl std::ops::Deref for PlanRuntimeAdmissionTestExecutor {
+    type Target = PlanRuntimeAdmissionObservation;
+    fn deref(&self) -> &Self::Target {
+        &self.observation
+    }
+}
+
+impl ObservedTestExecutor for PlanRuntimeAdmissionTestExecutor {
+    type Observation = PlanRuntimeAdmissionObservation;
+    fn observer(&self) -> Arc<Self::Observation> {
+        Arc::clone(&self.observation)
+    }
+    fn retire_fixture(&mut self) -> Result<()> {
+        controlled_token_fixture::shutdown(self, &self.tokens)?;
+        let pending = self
+            .retained
+            .lock()
+            .unwrap()
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        for request in pending {
+            self.cancel_prefill_admission(&request);
+        }
+        drop(self.event_sink.lock().unwrap().take());
+        Ok(())
+    }
+}
+
 struct PlanRuntimeChunkedPrefillTestExecutor {
+    tokens: Arc<ControlledTokenState>,
     inner: MockModelExecutor,
+    prefix_restore: Option<Arc<prefix_restore_tests::RestoreState>>,
+    prefix_retry: Option<Arc<prefix_restore_deferred_tests::RestoreState>>,
+    rendezvous: Option<Arc<prefix_rendezvous_tests::CaptureState>>,
+    prompt_tail_reserve: Option<usize>,
+    releases_sequence_capacity: bool,
+    observation: Arc<PlanRuntimeChunkedPrefillObservation>,
+}
+
+struct PlanRuntimeChunkedPrefillObservation {
+    tokens: ControlledTokenObservation,
     retained: std::sync::Mutex<HashSet<RequestId>>,
     attempted_chunks: std::sync::Mutex<Vec<PrefillChunk>>,
     completed_chunks: AtomicU64,
@@ -105,11 +232,36 @@ struct PlanRuntimeChunkedPrefillTestExecutor {
     release_epoch: Arc<AtomicU64>,
     capacity_wait_registrations: AtomicU64,
     capacity_signal: tokio::sync::watch::Sender<u64>,
-    prefix_restore: Option<Arc<prefix_restore_tests::RestoreState>>,
-    prefix_retry: Option<Arc<prefix_restore_deferred_tests::RestoreState>>,
-    rendezvous: Option<Arc<prefix_rendezvous_tests::CaptureState>>,
-    prompt_tail_reserve: Option<usize>,
     tail_batch_prefill_calls: AtomicU64,
+    shape_policy_reads: AtomicU64,
+}
+
+impl std::ops::Deref for PlanRuntimeChunkedPrefillTestExecutor {
+    type Target = PlanRuntimeChunkedPrefillObservation;
+    fn deref(&self) -> &Self::Target {
+        &self.observation
+    }
+}
+
+impl ObservedTestExecutor for PlanRuntimeChunkedPrefillTestExecutor {
+    type Observation = PlanRuntimeChunkedPrefillObservation;
+    fn observer(&self) -> Arc<Self::Observation> {
+        Arc::clone(&self.observation)
+    }
+    fn retire_fixture(&mut self) -> Result<()> {
+        controlled_token_fixture::shutdown(self, &self.tokens)?;
+        let pending = self
+            .retained
+            .lock()
+            .unwrap()
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        for request in pending {
+            self.cancel_prefill_admission(&request);
+        }
+        Ok(())
+    }
 }
 
 impl PlanRuntimeChunkedPrefillTestExecutor {
@@ -117,21 +269,28 @@ impl PlanRuntimeChunkedPrefillTestExecutor {
 
     fn new(defer_first_prefill: bool) -> Self {
         let (capacity_signal, _) = tokio::sync::watch::channel(0);
+        let tokens = Arc::new(ControlledTokenState::default());
         Self {
+            tokens: Arc::clone(&tokens),
             inner: MockModelExecutor::instant(128),
-            retained: std::sync::Mutex::new(HashSet::new()),
-            attempted_chunks: std::sync::Mutex::new(Vec::new()),
-            completed_chunks: AtomicU64::new(0),
-            defer_next_prefill: AtomicBool::new(defer_first_prefill),
-            narrow_next_prefill: AtomicBool::new(false),
-            release_epoch: Arc::new(AtomicU64::new(0)),
-            capacity_wait_registrations: AtomicU64::new(0),
-            capacity_signal,
             prefix_restore: None,
             prefix_retry: None,
             rendezvous: None,
             prompt_tail_reserve: None,
-            tail_batch_prefill_calls: AtomicU64::new(0),
+            releases_sequence_capacity: false,
+            observation: Arc::new(PlanRuntimeChunkedPrefillObservation {
+                tokens: ControlledTokenObservation(Arc::downgrade(&tokens)),
+                retained: std::sync::Mutex::new(HashSet::new()),
+                attempted_chunks: std::sync::Mutex::new(Vec::new()),
+                completed_chunks: AtomicU64::new(0),
+                defer_next_prefill: AtomicBool::new(defer_first_prefill),
+                narrow_next_prefill: AtomicBool::new(false),
+                release_epoch: Arc::new(AtomicU64::new(0)),
+                capacity_wait_registrations: AtomicU64::new(0),
+                capacity_signal,
+                tail_batch_prefill_calls: AtomicU64::new(0),
+                shape_policy_reads: AtomicU64::new(0),
+            }),
         }
     }
 
@@ -164,29 +323,26 @@ impl PlanRuntimeChunkedPrefillTestExecutor {
         )
         .unwrap()
     }
-
-    fn publish_release(&self) {
-        let epoch = self.release_epoch.fetch_add(1, Ordering::AcqRel) + 1;
-        self.capacity_signal.send_replace(epoch);
-    }
 }
 
 #[derive(Clone, Copy)]
 enum PlanRuntimeBatchDecodeBehavior {
     Exact,
-    NoFiniteFirst { selected: bool },
-    Short,
-    WrongFirstCache,
     DeferUntilPeerCacheRelease,
-    DeferWideThenFailSecond,
     DeferThenPreemptionFails,
 }
 
 struct PlanRuntimeBatchDecodeTestExecutor {
+    tokens: Arc<ControlledTokenState>,
     inner: MockModelExecutor,
     behavior: PlanRuntimeBatchDecodeBehavior,
     capacity_stage: ExecutorExecutionCapacityStage,
     capacity_stage_after_first_call: Option<ExecutorExecutionCapacityStage>,
+    observation: Arc<PlanRuntimeBatchDecodeObservation>,
+}
+
+struct PlanRuntimeBatchDecodeObservation {
+    tokens: ControlledTokenObservation,
     decode_calls: AtomicU64,
     batch_decode_calls: AtomicU64,
     released_cache_count: AtomicU64,
@@ -194,53 +350,21 @@ struct PlanRuntimeBatchDecodeTestExecutor {
     mixed_calls: AtomicU64,
 }
 
-fn plan_runtime_prefill_to_mock_input(input: &PlanRuntimePrefillInput) -> PrefillInput {
-    let values = input
-        .input_tokens
-        .iter()
-        .map(|token| token.get() as f32)
-        .collect::<Vec<_>>();
-    PrefillInput::new(MockTensor::from_f32(values, &[1, input.input_tokens.len()]).into_ref())
-        .with_request_context(input.request_id.clone(), input.maximum_sequence_tokens)
-        .with_chunk(input.chunk)
+impl std::ops::Deref for PlanRuntimeBatchDecodeTestExecutor {
+    type Target = PlanRuntimeBatchDecodeObservation;
+    fn deref(&self) -> &Self::Target {
+        &self.observation
+    }
 }
 
-fn plan_runtime_prefill_completion_from_mock(
-    request_id: &RequestId,
-    completion: ExecutorPrefillCompletion,
-) -> Result<PlanRuntimePrefillCompletion> {
-    let (output, planned_chunk, completed_chunk, capacity_probe_count) = completion.into_parts();
-    let logits = output.last_token_logits()?.to_vec_f32()?;
-    let cache: Arc<dyn KvCacheHandle> = Arc::new(ferrum_testkit::MockKvCacheHandle::new(
-        request_id.clone(),
-        output.kv_cache.num_layers(),
-        completed_chunk.end(),
-    ));
-    let output = if completed_chunk.is_final() {
-        PlanRuntimePrefillOutput::final_logits(
-            request_id.clone(),
-            completed_chunk.end(),
-            logits,
-            cache,
-        )?
-    } else {
-        PlanRuntimePrefillOutput::intermediate(request_id.clone(), completed_chunk.end(), cache)
-    };
-    PlanRuntimePrefillCompletion::new(output, planned_chunk, completed_chunk, capacity_probe_count)
-}
-
-fn plan_runtime_prefill_outcome_from_mock(
-    request_id: &RequestId,
-    outcome: ExecutorPrefillOutcome,
-) -> Result<PlanRuntimePrefillOutcome> {
-    match outcome {
-        ExecutorPrefillOutcome::Completed(completion) => {
-            plan_runtime_prefill_completion_from_mock(request_id, completion)
-                .map(PlanRuntimePrefillOutcome::Completed)
-        }
-        ExecutorPrefillOutcome::Deferred(deferral) => {
-            Ok(PlanRuntimePrefillOutcome::Deferred(deferral))
-        }
+impl ObservedTestExecutor for PlanRuntimeBatchDecodeTestExecutor {
+    type Observation = PlanRuntimeBatchDecodeObservation;
+    fn observer(&self) -> Arc<Self::Observation> {
+        Arc::clone(&self.observation)
+    }
+    fn retire_fixture(&mut self) -> Result<()> {
+        controlled_token_fixture::shutdown(self, &self.tokens)?;
+        Ok(())
     }
 }
 
@@ -250,16 +374,21 @@ impl PlanRuntimeBatchDecodeTestExecutor {
         capacity_stage: ExecutorExecutionCapacityStage,
         capacity_stage_after_first_call: Option<ExecutorExecutionCapacityStage>,
     ) -> Self {
+        let tokens = Arc::new(ControlledTokenState::default());
         Self {
+            tokens: Arc::clone(&tokens),
             inner: MockModelExecutor::instant(64),
             behavior,
             capacity_stage,
             capacity_stage_after_first_call,
-            decode_calls: AtomicU64::new(0),
-            batch_decode_calls: AtomicU64::new(0),
-            released_cache_count: AtomicU64::new(0),
-            mixed_behavior: std::sync::Mutex::new(None),
-            mixed_calls: AtomicU64::new(0),
+            observation: Arc::new(PlanRuntimeBatchDecodeObservation {
+                tokens: ControlledTokenObservation(Arc::downgrade(&tokens)),
+                decode_calls: AtomicU64::new(0),
+                batch_decode_calls: AtomicU64::new(0),
+                released_cache_count: AtomicU64::new(0),
+                mixed_behavior: std::sync::Mutex::new(None),
+                mixed_calls: AtomicU64::new(0),
+            }),
         }
     }
 
@@ -275,28 +404,61 @@ impl PlanRuntimeBatchDecodeTestExecutor {
 
 #[async_trait::async_trait]
 impl ModelExecutor for PlanRuntimeChunkedPrefillTestExecutor {
-    fn plan_prompt_tail_capture_boundary(
+    fn begin_shutdown(
+        self: Arc<Self>,
+        permit: &ferrum_execution::executor_lifecycle::ExecutorShutdownPermit,
+    ) -> ferrum_execution::executor_lifecycle::ExecutorShutdownObserver {
+        begin_controlled_shutdown(self, permit)
+    }
+
+    async fn admit_tokens(&self, input: ExecutionAdmission<'_>) -> Result<TokenAdmissionOutcome> {
+        controlled_token_fixture::admit(self, &self.tokens, input)
+    }
+    async fn execute_tokens(&self, work: &[ExecutionWork<'_>]) -> Result<ExecutionBatchOutcome> {
+        controlled_token_fixture::execute(self, &self.tokens, work).await
+    }
+    async fn finish_tokens(
         &self,
-        chunk: PrefillChunk,
-    ) -> Option<ferrum_execution::model_executor::PrefixCapturePlan> {
-        let boundary = chunk
-            .total_prompt_tokens()
-            .checked_sub(self.prompt_tail_reserve?)?;
-        if boundary <= chunk.tokens_processed() || boundary > chunk.end() {
-            return None;
-        }
-        Some(ferrum_execution::model_executor::PrefixCapturePlan {
-            boundary,
-            span: ferrum_runtime::CheckpointTokenSpanConstraint::any_positive(),
-        })
+        sequence: &ExecutorSequence,
+        reason: ExecutionEndReason,
+    ) -> Result<ExecutionCloseOutcome> {
+        controlled_token_fixture::finish(self, &self.tokens, sequence, reason).await
+    }
+    fn cancel_tokens(&self, sequence: &ExecutorSequence) -> Result<ExecutionCloseOutcome> {
+        controlled_token_fixture::cancel(self, &self.tokens, sequence)
+    }
+    fn write_token_capacity_release_sources(
+        &self,
+        sequence: &ExecutorSequence,
+        sources: &mut Vec<ferrum_runtime::CapacityAvailabilitySource>,
+    ) -> Result<bool> {
+        controlled_token_fixture::release_sources(self, &self.tokens, sequence, sources)
+    }
+    fn prefill_shape_policy(&self) -> ferrum_execution::model_executor::PrefillShapePolicy {
+        use ferrum_execution::model_executor::PrefillShapePolicy;
+        self.shape_policy_reads.fetch_add(1, Ordering::Relaxed);
+        let Some(reserve) = self.prompt_tail_reserve else {
+            return PrefillShapePolicy::Identity;
+        };
+        PrefillShapePolicy::PromptTail(
+            ferrum_runtime::CheckpointBoundaryConstraint::new(
+                ferrum_runtime::CheckpointTokenSpanConstraint::any_positive(),
+                ferrum_runtime::CheckpointTokenSpanConstraint::new(
+                    std::num::NonZeroU64::new(reserve as u64).unwrap(),
+                    std::num::NonZeroU64::MIN,
+                )
+                .unwrap(),
+            )
+            .unwrap(),
+        )
     }
 
     fn info(&self) -> &ferrum_types::ModelInfo {
         self.inner.info()
     }
 
-    fn execution_resource_authority(&self) -> ExecutionResourceAuthority {
-        ExecutionResourceAuthority::PlanRuntime
+    fn execution_planning_model(&self) -> ExecutionPlanningModel {
+        ExecutionPlanningModel::CompiledPlan
     }
 
     fn supports_plan_runtime_prefix_restore(&self) -> bool {
@@ -334,12 +496,20 @@ impl ModelExecutor for PlanRuntimeChunkedPrefillTestExecutor {
     ) -> Result<ferrum_execution::model_executor::PlanRuntimePrefixRestoreOutcome> {
         assert!(self.retained.lock().unwrap().contains(input.request_id));
         if let Some(state) = &self.prefix_retry {
-            return state.restore(input, self.epochs(), self.wait_condition());
+            return state.restore(
+                input,
+                self.tokens.clone(),
+                self.epochs(),
+                self.wait_condition(),
+            );
         }
         if let Some(state) = &self.rendezvous {
-            return state.restore(input);
+            return state.restore(input, self.tokens.clone());
         }
-        self.prefix_restore.as_ref().unwrap().restore(input)
+        self.prefix_restore
+            .as_ref()
+            .unwrap()
+            .restore(input, self.tokens.clone())
     }
 
     fn plan_runtime_resource_snapshot(&self) -> Result<Option<PlanRuntimeResourceSnapshot>> {
@@ -365,10 +535,11 @@ impl ModelExecutor for PlanRuntimeChunkedPrefillTestExecutor {
         sources: &mut Vec<ferrum_runtime::CapacityAvailabilitySource>,
     ) -> Result<bool> {
         sources.clear();
-        if self
-            .prefix_retry
-            .as_ref()
-            .is_some_and(|state| state.release_capable(preemption.request_id()))
+        if self.releases_sequence_capacity
+            || self
+                .prefix_retry
+                .as_ref()
+                .is_some_and(|state| state.release_capable(preemption.request_id()))
         {
             sources.push(ferrum_runtime::CapacityAvailabilitySource::ActiveSequenceSlots);
             return Ok(true);
@@ -492,131 +663,6 @@ impl ModelExecutor for PlanRuntimeChunkedPrefillTestExecutor {
         })
     }
 
-    async fn prefill(&self, input: &PrefillInput) -> Result<PrefillOutput> {
-        self.inner.prefill(input).await
-    }
-
-    async fn prefill_with_capacity(&self, input: &PrefillInput) -> Result<ExecutorPrefillOutcome> {
-        let request_id = input
-            .request_id
-            .as_ref()
-            .ok_or_else(|| FerrumError::request_validation("missing request id"))?;
-        let chunk = input
-            .chunk
-            .ok_or_else(|| FerrumError::request_validation("missing typed prefill chunk"))?;
-        if !self
-            .retained
-            .lock()
-            .expect("chunked prefill retained mutex poisoned")
-            .contains(request_id)
-        {
-            return Err(FerrumError::internal(
-                "chunked prefill submit has no retained admission",
-            ));
-        }
-        self.attempted_chunks
-            .lock()
-            .expect("chunked prefill attempt mutex poisoned")
-            .push(chunk);
-        if let Some(state) = &self.prefix_retry {
-            state.computed(request_id, chunk);
-        }
-
-        if self.defer_next_prefill.swap(false, Ordering::AcqRel) {
-            return Ok(ExecutorPrefillOutcome::Deferred(
-                test_execution_capacity_deferral(
-                    self.epochs(),
-                    self.wait_condition(),
-                    ExecutorExecutionCapacityStage::StepAdmission,
-                )
-                .into(),
-            ));
-        }
-
-        let completed_chunk = if self.narrow_next_prefill.swap(false, Ordering::AcqRel) {
-            PrefillChunk::new(
-                chunk.tokens_processed(),
-                chunk.tokens_to_process().div_ceil(2),
-                chunk.total_prompt_tokens(),
-            )?
-        } else {
-            chunk
-        };
-        let mut completed_input = input.clone();
-        completed_input.chunk = Some(completed_chunk);
-        let output = self.inner.prefill(&completed_input).await?;
-        if let Some(state) = &self.rendezvous {
-            state.retired(request_id, completed_chunk);
-        }
-        self.completed_chunks.fetch_add(1, Ordering::Relaxed);
-        if completed_chunk.is_final() {
-            assert!(self
-                .retained
-                .lock()
-                .expect("chunked prefill retained mutex poisoned")
-                .remove(request_id));
-        }
-        Ok(ExecutorPrefillOutcome::Completed(
-            ExecutorPrefillCompletion::new(
-                output,
-                chunk,
-                completed_chunk,
-                u32::from(completed_chunk != chunk),
-            )?,
-        ))
-    }
-
-    async fn plan_runtime_prefill_with_capacity(
-        &self,
-        input: &PlanRuntimePrefillInput,
-    ) -> Result<PlanRuntimePrefillOutcome> {
-        let mock_input = plan_runtime_prefill_to_mock_input(input);
-        let outcome = self.prefill_with_capacity(&mock_input).await?;
-        let outcome = plan_runtime_prefill_outcome_from_mock(&input.request_id, outcome)?;
-        if self.prompt_tail_reserve.is_some() {
-            if let PlanRuntimePrefillOutcome::Completed(completion) = &outcome {
-                assert_eq!(completion.capacity_probe_count(), 0);
-                assert_eq!(completion.planned_chunk(), completion.completed_chunk());
-            }
-        }
-        Ok(outcome)
-    }
-
-    async fn plan_runtime_batch_prefill_with_capacity(
-        &self,
-        inputs: &[PlanRuntimePrefillInput],
-    ) -> Result<PlanRuntimeBatchPrefillOutcome> {
-        if self.prompt_tail_reserve.is_none() {
-            return Ok(PlanRuntimeBatchPrefillOutcome::Unsupported);
-        }
-        self.tail_batch_prefill_calls
-            .fetch_add(1, Ordering::Relaxed);
-        let mut completions = Vec::new();
-        for input in inputs {
-            let PlanRuntimePrefillOutcome::Completed(completion) =
-                self.plan_runtime_prefill_with_capacity(input).await?
-            else {
-                return Err(FerrumError::internal("tail fixture unexpectedly deferred"));
-            };
-            assert_eq!(
-                completion.capacity_probe_count(),
-                0,
-                "planned tail cuts are not capacity failures"
-            );
-            assert_eq!(completion.planned_chunk(), completion.completed_chunk());
-            completions.push(completion);
-        }
-        Ok(PlanRuntimeBatchPrefillOutcome::Completed(completions))
-    }
-
-    async fn decode(&self, input: &DecodeInput) -> Result<DecodeOutput> {
-        self.inner.decode(input).await
-    }
-
-    fn release_cache(&self, cache_id: &str) {
-        self.inner.release_cache(cache_id);
-    }
-
     fn capabilities(&self) -> ExecutorCapabilities {
         self.inner.capabilities()
     }
@@ -628,20 +674,78 @@ impl ModelExecutor for PlanRuntimeChunkedPrefillTestExecutor {
 
 #[async_trait::async_trait]
 impl ModelExecutor for PlanRuntimeBatchDecodeTestExecutor {
-    async fn plan_runtime_mixed_batch_with_capacity(
+    fn begin_shutdown(
+        self: Arc<Self>,
+        permit: &ferrum_execution::executor_lifecycle::ExecutorShutdownPermit,
+    ) -> ferrum_execution::executor_lifecycle::ExecutorShutdownObserver {
+        begin_controlled_shutdown(self, permit)
+    }
+
+    async fn admit_tokens(&self, input: ExecutionAdmission<'_>) -> Result<TokenAdmissionOutcome> {
+        controlled_token_fixture::admit(self, &self.tokens, input)
+    }
+    async fn execute_tokens(&self, work: &[ExecutionWork<'_>]) -> Result<ExecutionBatchOutcome> {
+        if matches!(
+            *self.mixed_behavior.lock().unwrap(),
+            Some(mixed_batch_tests::MixedBehavior::ExecutorError)
+        ) && work
+            .iter()
+            .any(|input| matches!(input.work(), TokenWork::Prefill(_)))
+            && work
+                .iter()
+                .any(|input| matches!(input.work(), TokenWork::Decode { .. }))
+        {
+            self.mixed_calls.fetch_add(1, Ordering::Relaxed);
+            return Err(FerrumError::backend(
+                "injected executor error without a participant ledger",
+            ));
+        }
+        controlled_token_fixture::execute(self, &self.tokens, work).await
+    }
+    async fn finish_tokens(
         &self,
-        prefills: &[PlanRuntimePrefillInput],
-        decodes: &[PlanRuntimeDecodeInput],
-    ) -> Result<ferrum_execution::model_executor::PlanRuntimeMixedBatchOutcome> {
-        self.mock_mixed_batch(prefills, decodes).await
+        sequence: &ExecutorSequence,
+        reason: ExecutionEndReason,
+    ) -> Result<ExecutionCloseOutcome> {
+        controlled_token_fixture::finish(self, &self.tokens, sequence, reason).await
+    }
+    fn cancel_tokens(&self, sequence: &ExecutorSequence) -> Result<ExecutionCloseOutcome> {
+        if matches!(
+            self.behavior,
+            PlanRuntimeBatchDecodeBehavior::DeferThenPreemptionFails
+        ) {
+            return Err(FerrumError::internal(
+                "synthetic request-scoped close failure",
+            ));
+        }
+        controlled_token_fixture::cancel(self, &self.tokens, sequence)
+    }
+    fn write_token_capacity_release_sources(
+        &self,
+        sequence: &ExecutorSequence,
+        sources: &mut Vec<ferrum_runtime::CapacityAvailabilitySource>,
+    ) -> Result<bool> {
+        controlled_token_fixture::release_sources(self, &self.tokens, sequence, sources)
+    }
+
+    fn try_admit_prefill(
+        &self,
+        input: ExecutorPrefillAdmission<'_>,
+    ) -> Result<ExecutorPrefillAdmissionDecision> {
+        input.validate()?;
+        Ok(ExecutorPrefillAdmissionDecision::Admitted(
+            ExecutorPrefillAdmissionReceipt {
+                request_id: input.request_id.clone(),
+            },
+        ))
     }
 
     fn info(&self) -> &ferrum_types::ModelInfo {
         self.inner.info()
     }
 
-    fn execution_resource_authority(&self) -> ExecutionResourceAuthority {
-        ExecutionResourceAuthority::PlanRuntime
+    fn execution_planning_model(&self) -> ExecutionPlanningModel {
+        ExecutionPlanningModel::CompiledPlan
     }
 
     fn plan_runtime_resource_snapshot(&self) -> Result<Option<PlanRuntimeResourceSnapshot>> {
@@ -681,248 +785,6 @@ impl ModelExecutor for PlanRuntimeBatchDecodeTestExecutor {
         Ok(true)
     }
 
-    async fn preempt_execution_capacity(
-        &self,
-        preemption: ExecutorExecutionCapacityPreemption,
-    ) -> Result<ExecutorExecutionCapacityPreemptionReceipt> {
-        if matches!(
-            self.behavior,
-            PlanRuntimeBatchDecodeBehavior::DeferThenPreemptionFails
-        ) {
-            return Err(FerrumError::internal(
-                "synthetic request-scoped preemption failure",
-            ));
-        }
-        self.released_cache_count.fetch_add(1, Ordering::Release);
-        self.inner.release_cache(preemption.cache_id());
-        Ok(ExecutorExecutionCapacityPreemptionReceipt::new(
-            preemption.request_id().clone(),
-            preemption.cache_id().to_string(),
-            ExecutorExecutionCapacityPreemptionAuthority::ActiveSequence,
-        ))
-    }
-
-    async fn prefill(&self, input: &PrefillInput) -> Result<PrefillOutput> {
-        let mut output = self.inner.prefill(input).await?;
-        let batch_size = input.batch_size();
-        let sequence_length = input.sequence_length();
-        let vocabulary_size = self.info().vocab_size;
-        let mut logits = vec![0.0; batch_size * sequence_length * vocabulary_size];
-        for position in 0..batch_size * sequence_length {
-            logits[position * vocabulary_size + 6] = 1.0;
-        }
-        output.logits =
-            MockTensor::from_f32(logits, &[batch_size, sequence_length, vocabulary_size])
-                .into_ref();
-        Ok(output)
-    }
-
-    async fn plan_runtime_prefill_with_capacity(
-        &self,
-        input: &PlanRuntimePrefillInput,
-    ) -> Result<PlanRuntimePrefillOutcome> {
-        let mock_input = plan_runtime_prefill_to_mock_input(input);
-        let outcome = self.prefill_with_capacity(&mock_input).await?;
-        plan_runtime_prefill_outcome_from_mock(&input.request_id, outcome)
-    }
-
-    async fn decode(&self, input: &DecodeInput) -> Result<DecodeOutput> {
-        self.decode_calls.fetch_add(1, Ordering::Relaxed);
-        self.inner.decode(input).await
-    }
-
-    async fn batch_decode(&self, inputs: &[DecodeInput]) -> Result<Vec<DecodeOutput>> {
-        self.batch_decode_calls.fetch_add(1, Ordering::Relaxed);
-        if matches!(
-            self.behavior,
-            PlanRuntimeBatchDecodeBehavior::DeferUntilPeerCacheRelease
-                | PlanRuntimeBatchDecodeBehavior::DeferWideThenFailSecond
-                | PlanRuntimeBatchDecodeBehavior::DeferThenPreemptionFails
-        ) {
-            return Err(FerrumError::resource_exhausted(
-                "typed test decode is waiting for capacity",
-            ));
-        }
-        let mut outputs = self.inner.batch_decode(inputs).await?;
-        match self.behavior {
-            PlanRuntimeBatchDecodeBehavior::Exact
-            | PlanRuntimeBatchDecodeBehavior::NoFiniteFirst { .. } => {}
-            PlanRuntimeBatchDecodeBehavior::Short => {
-                outputs.pop();
-            }
-            PlanRuntimeBatchDecodeBehavior::WrongFirstCache => {
-                if let Some(output) = outputs.first_mut() {
-                    output.kv_cache = Arc::new(ferrum_testkit::MockKvCacheHandle::new(
-                        RequestId::new(),
-                        1,
-                        1,
-                    ));
-                }
-            }
-            PlanRuntimeBatchDecodeBehavior::DeferUntilPeerCacheRelease
-            | PlanRuntimeBatchDecodeBehavior::DeferWideThenFailSecond
-            | PlanRuntimeBatchDecodeBehavior::DeferThenPreemptionFails => unreachable!(),
-        }
-        Ok(outputs)
-    }
-
-    async fn batch_decode_with_capacity(
-        &self,
-        inputs: &[DecodeInput],
-    ) -> Result<ExecutorBatchDecodeOutcome> {
-        if !matches!(
-            self.behavior,
-            PlanRuntimeBatchDecodeBehavior::DeferUntilPeerCacheRelease
-                | PlanRuntimeBatchDecodeBehavior::DeferWideThenFailSecond
-                | PlanRuntimeBatchDecodeBehavior::DeferThenPreemptionFails
-        ) {
-            return self
-                .batch_decode(inputs)
-                .await
-                .map(ExecutorBatchDecodeOutcome::Completed);
-        }
-        let call_index = self.batch_decode_calls.fetch_add(1, Ordering::Relaxed);
-        if matches!(
-            self.behavior,
-            PlanRuntimeBatchDecodeBehavior::DeferUntilPeerCacheRelease
-        ) && self.released_cache_count.load(Ordering::Acquire) > 0
-        {
-            return self
-                .inner
-                .batch_decode(inputs)
-                .await
-                .map(ExecutorBatchDecodeOutcome::Completed);
-        }
-        if matches!(
-            self.behavior,
-            PlanRuntimeBatchDecodeBehavior::DeferWideThenFailSecond
-        ) && inputs.len() == 1
-        {
-            if inputs[0].kv_cache.cache_id().ends_with("-1") {
-                return Err(FerrumError::backend(
-                    "synthetic exact-subcohort decode failure",
-                ));
-            }
-            return self
-                .inner
-                .batch_decode(inputs)
-                .await
-                .map(ExecutorBatchDecodeOutcome::Completed);
-        }
-        let source = ferrum_runtime::CapacityAvailabilitySource::ActiveSequenceSlots;
-        let observed = ferrum_runtime::CapacityAvailabilityEpoch::new(source, 1)
-            .map_err(|error| FerrumError::internal(error.to_string()))?;
-        let wait_condition =
-            ferrum_runtime::CapacityWaitCondition::from_observation(47, vec![observed])
-                .map_err(|error| FerrumError::internal(error.to_string()))?;
-        Ok(ExecutorBatchDecodeOutcome::Deferred(
-            test_execution_capacity_deferral(
-                ExecutorAdmissionEpochs::new(std::num::NonZeroU64::new(47).unwrap(), 0, 0),
-                wait_condition,
-                self.capacity_stage_for_call(call_index),
-            )
-            .into(),
-        ))
-    }
-
-    async fn plan_runtime_batch_decode_with_capacity(
-        &self,
-        inputs: &[PlanRuntimeDecodeInput],
-    ) -> Result<PlanRuntimeBatchDecodeOutcome> {
-        let call_index = self.batch_decode_calls.fetch_add(1, Ordering::Relaxed);
-        let deferred_behavior = matches!(
-            self.behavior,
-            PlanRuntimeBatchDecodeBehavior::DeferUntilPeerCacheRelease
-                | PlanRuntimeBatchDecodeBehavior::DeferWideThenFailSecond
-                | PlanRuntimeBatchDecodeBehavior::DeferThenPreemptionFails
-        );
-        let released = self.released_cache_count.load(Ordering::Acquire) > 0;
-        let exact_subcohort = matches!(
-            self.behavior,
-            PlanRuntimeBatchDecodeBehavior::DeferWideThenFailSecond
-        ) && inputs.len() == 1;
-        if exact_subcohort && inputs[0].kv_cache.cache_id().ends_with("-1") {
-            return Err(FerrumError::backend(
-                "synthetic exact-subcohort decode failure",
-            ));
-        }
-        if !deferred_behavior
-            || (matches!(
-                self.behavior,
-                PlanRuntimeBatchDecodeBehavior::DeferUntilPeerCacheRelease
-            ) && released)
-            || exact_subcohort
-        {
-            let mut outputs = inputs
-                .iter()
-                .map(|input| {
-                    let mut logits = vec![0.0; self.info().vocab_size];
-                    if logits.len() > 6 {
-                        logits[6] = 1.0;
-                    }
-                    PlanRuntimeDecodeOutput::new(
-                        ExecutorSamplingOutput::FullLogits(logits),
-                        Arc::clone(&input.kv_cache),
-                    )
-                })
-                .collect::<Vec<_>>();
-            match self.behavior {
-                PlanRuntimeBatchDecodeBehavior::NoFiniteFirst { selected } => {
-                    if let Some(output) = outputs.first_mut() {
-                        output.sampling_output = if selected {
-                            ExecutorSamplingOutput::NoSelectableFiniteLogit
-                        } else {
-                            ExecutorSamplingOutput::FullLogits(vec![
-                                f32::NAN;
-                                self.info().vocab_size
-                            ])
-                        };
-                    }
-                    if selected {
-                        for output in outputs.iter_mut().skip(1) {
-                            output.sampling_output =
-                                ExecutorSamplingOutput::GreedyToken(TokenId::new(6));
-                        }
-                    }
-                }
-                PlanRuntimeBatchDecodeBehavior::Short => {
-                    outputs.pop();
-                }
-                PlanRuntimeBatchDecodeBehavior::WrongFirstCache => {
-                    if let Some(output) = outputs.first_mut() {
-                        output.kv_cache = Arc::new(ferrum_testkit::MockKvCacheHandle::new(
-                            RequestId::new(),
-                            1,
-                            1,
-                        ));
-                    }
-                }
-                _ => {}
-            }
-            return Ok(PlanRuntimeBatchDecodeOutcome::Completed(outputs));
-        }
-
-        let source = ferrum_runtime::CapacityAvailabilitySource::ActiveSequenceSlots;
-        let observed = ferrum_runtime::CapacityAvailabilityEpoch::new(source, 1)
-            .map_err(|error| FerrumError::internal(error.to_string()))?;
-        let wait_condition =
-            ferrum_runtime::CapacityWaitCondition::from_observation(47, vec![observed])
-                .map_err(|error| FerrumError::internal(error.to_string()))?;
-        Ok(PlanRuntimeBatchDecodeOutcome::Deferred(
-            test_execution_capacity_deferral(
-                ExecutorAdmissionEpochs::new(std::num::NonZeroU64::new(47).unwrap(), 0, 0),
-                wait_condition,
-                self.capacity_stage_for_call(call_index),
-            )
-            .into(),
-        ))
-    }
-
-    fn release_cache(&self, cache_id: &str) {
-        self.released_cache_count.fetch_add(1, Ordering::Release);
-        self.inner.release_cache(cache_id);
-    }
-
     fn capabilities(&self) -> ExecutorCapabilities {
         self.inner.capabilities()
     }
@@ -934,21 +796,27 @@ impl ModelExecutor for PlanRuntimeBatchDecodeTestExecutor {
 
 impl PlanRuntimeAdmissionTestExecutor {
     fn new(vocab_size: usize) -> Self {
+        let tokens = Arc::new(ControlledTokenState::default());
         Self {
+            tokens: Arc::clone(&tokens),
             inner: MockModelExecutor::instant(vocab_size),
-            event_sink: std::sync::Mutex::new(None),
-            retained: std::sync::Mutex::new(HashSet::new()),
-            admission_accounting: std::sync::Mutex::new(Vec::new()),
-            completions: std::sync::Mutex::new(Vec::new()),
             maintenance_gated: false,
-            available_admissions: AtomicU64::new(0),
-            capacity_epoch: AtomicU64::new(0),
-            admission_probes: AtomicU64::new(0),
-            maintenance_calls: AtomicU64::new(0),
-            prefill_calls: AtomicU64::new(0),
-            batch_prefill_calls: AtomicU64::new(0),
-            defer_batch_prefill_once: AtomicBool::new(false),
-            fail_next_prefill_after_admission: AtomicBool::new(false),
+            missing_resource_snapshot: false,
+            observation: Arc::new(PlanRuntimeAdmissionObservation {
+                tokens: ControlledTokenObservation(Arc::downgrade(&tokens)),
+                event_sink: std::sync::Mutex::new(None),
+                retained: std::sync::Mutex::new(HashSet::new()),
+                admission_accounting: std::sync::Mutex::new(Vec::new()),
+                completions: std::sync::Mutex::new(Vec::new()),
+                available_admissions: AtomicU64::new(0),
+                capacity_epoch: AtomicU64::new(0),
+                admission_probes: AtomicU64::new(0),
+                maintenance_calls: AtomicU64::new(0),
+                prefill_calls: AtomicU64::new(0),
+                batch_prefill_calls: AtomicU64::new(0),
+                defer_batch_prefill_once: AtomicBool::new(false),
+                fail_next_prefill_after_admission: AtomicBool::new(false),
+            }),
         }
     }
 
@@ -1007,6 +875,39 @@ impl PlanRuntimeAdmissionTestExecutor {
 
 #[async_trait::async_trait]
 impl ModelExecutor for PlanRuntimeAdmissionTestExecutor {
+    fn prefill_shape_policy(&self) -> ferrum_execution::model_executor::PrefillShapePolicy {
+        ferrum_execution::model_executor::PrefillShapePolicy::Identity
+    }
+    fn begin_shutdown(
+        self: Arc<Self>,
+        permit: &ferrum_execution::executor_lifecycle::ExecutorShutdownPermit,
+    ) -> ferrum_execution::executor_lifecycle::ExecutorShutdownObserver {
+        begin_controlled_shutdown(self, permit)
+    }
+
+    async fn admit_tokens(&self, input: ExecutionAdmission<'_>) -> Result<TokenAdmissionOutcome> {
+        controlled_token_fixture::admit(self, &self.tokens, input)
+    }
+    async fn execute_tokens(&self, work: &[ExecutionWork<'_>]) -> Result<ExecutionBatchOutcome> {
+        controlled_token_fixture::execute(self, &self.tokens, work).await
+    }
+    async fn finish_tokens(
+        &self,
+        sequence: &ExecutorSequence,
+        reason: ExecutionEndReason,
+    ) -> Result<ExecutionCloseOutcome> {
+        controlled_token_fixture::finish(self, &self.tokens, sequence, reason).await
+    }
+    fn cancel_tokens(&self, sequence: &ExecutorSequence) -> Result<ExecutionCloseOutcome> {
+        controlled_token_fixture::cancel(self, &self.tokens, sequence)
+    }
+    fn write_token_capacity_release_sources(
+        &self,
+        sequence: &ExecutorSequence,
+        sources: &mut Vec<ferrum_runtime::CapacityAvailabilitySource>,
+    ) -> Result<bool> {
+        controlled_token_fixture::release_sources(self, &self.tokens, sequence, sources)
+    }
     fn attach_execution_event_sink(&self, sink: Arc<dyn ProductExecutionEventSink>) {
         *self.event_sink.lock().unwrap() = Some(sink);
     }
@@ -1015,11 +916,14 @@ impl ModelExecutor for PlanRuntimeAdmissionTestExecutor {
         self.inner.info()
     }
 
-    fn execution_resource_authority(&self) -> ExecutionResourceAuthority {
-        ExecutionResourceAuthority::PlanRuntime
+    fn execution_planning_model(&self) -> ExecutionPlanningModel {
+        ExecutionPlanningModel::CompiledPlan
     }
 
     fn plan_runtime_resource_snapshot(&self) -> Result<Option<PlanRuntimeResourceSnapshot>> {
+        if self.missing_resource_snapshot {
+            return Ok(None);
+        }
         PlanRuntimeResourceSnapshot::new(1_000, 900, 700, 700, 400, 300, 200, 0, 0).map(Some)
     }
 
@@ -1133,125 +1037,6 @@ impl ModelExecutor for PlanRuntimeAdmissionTestExecutor {
         }
     }
 
-    async fn prefill(&self, input: &PrefillInput) -> Result<PrefillOutput> {
-        let request_id = input
-            .request_id
-            .as_ref()
-            .ok_or_else(|| FerrumError::request_validation("missing request id"))?;
-        if !self
-            .retained
-            .lock()
-            .expect("retained admission mutex poisoned")
-            .remove(request_id)
-        {
-            return Err(FerrumError::internal(
-                "test prefill reached submit without retained admission",
-            ));
-        }
-        self.prefill_calls.fetch_add(1, Ordering::Relaxed);
-        if self
-            .fail_next_prefill_after_admission
-            .swap(false, Ordering::AcqRel)
-        {
-            return Err(FerrumError::resource_exhausted(
-                "typed diagnostic resource failure after prefill submission",
-            ));
-        }
-        self.inner.prefill(input).await
-    }
-
-    async fn batch_prefill_with_capacity(
-        &self,
-        inputs: &[PrefillInput],
-    ) -> Result<ExecutorBatchPrefillOutcome> {
-        self.batch_prefill_calls.fetch_add(1, Ordering::Relaxed);
-        if self.defer_batch_prefill_once.swap(false, Ordering::AcqRel) {
-            return Ok(ExecutorBatchPrefillOutcome::NotSubmitted(
-                test_execution_capacity_deferral(
-                    self.capacity_epochs(),
-                    self.capacity_wait_condition(),
-                    ExecutorExecutionCapacityStage::SubmissionWave,
-                )
-                .into(),
-            ));
-        }
-        let mut completions = Vec::with_capacity(inputs.len());
-        for input in inputs {
-            let request_id = input
-                .request_id
-                .as_ref()
-                .ok_or_else(|| FerrumError::request_validation("missing request id"))?;
-            if !self
-                .retained
-                .lock()
-                .expect("retained admission mutex poisoned")
-                .remove(request_id)
-            {
-                return Err(FerrumError::internal(
-                    "test batch prefill reached submit without retained admission",
-                ));
-            }
-            let chunk = input
-                .chunk
-                .ok_or_else(|| FerrumError::request_validation("missing typed prefill chunk"))?;
-            let output = self.inner.prefill(input).await?;
-            completions.push(ExecutorPrefillCompletion::exact(output, chunk));
-        }
-        Ok(ExecutorBatchPrefillOutcome::Completed(completions))
-    }
-
-    async fn plan_runtime_prefill_with_capacity(
-        &self,
-        input: &PlanRuntimePrefillInput,
-    ) -> Result<PlanRuntimePrefillOutcome> {
-        let mock_input = plan_runtime_prefill_to_mock_input(input);
-        let outcome = self.prefill_with_capacity(&mock_input).await?;
-        plan_runtime_prefill_outcome_from_mock(&input.request_id, outcome)
-    }
-
-    async fn plan_runtime_batch_prefill_with_capacity(
-        &self,
-        inputs: &[PlanRuntimePrefillInput],
-    ) -> Result<PlanRuntimeBatchPrefillOutcome> {
-        let mock_inputs = inputs
-            .iter()
-            .map(plan_runtime_prefill_to_mock_input)
-            .collect::<Vec<_>>();
-        match self.batch_prefill_with_capacity(&mock_inputs).await? {
-            ExecutorBatchPrefillOutcome::Completed(completions) => completions
-                .into_iter()
-                .zip(inputs)
-                .map(|(completion, input)| {
-                    plan_runtime_prefill_completion_from_mock(&input.request_id, completion)
-                })
-                .collect::<Result<Vec<_>>>()
-                .map(PlanRuntimeBatchPrefillOutcome::Completed),
-            ExecutorBatchPrefillOutcome::NotSubmitted(deferral) => {
-                Ok(PlanRuntimeBatchPrefillOutcome::NotSubmitted(deferral))
-            }
-            ExecutorBatchPrefillOutcome::Unsupported => {
-                Ok(PlanRuntimeBatchPrefillOutcome::Unsupported)
-            }
-        }
-    }
-
-    async fn decode(&self, input: &DecodeInput) -> Result<DecodeOutput> {
-        self.inner.decode(input).await
-    }
-
-    fn release_cache(&self, cache_id: &str) {
-        self.inner.release_cache(cache_id);
-    }
-
-    async fn complete_cache(&self, completion: ExecutorSequenceCompletion) -> Result<()> {
-        self.inner.release_cache(completion.cache_id());
-        self.completions
-            .lock()
-            .expect("completion receipt mutex poisoned")
-            .push(completion);
-        Ok(())
-    }
-
     fn capabilities(&self) -> ExecutorCapabilities {
         self.inner.capabilities()
     }
@@ -1271,7 +1056,14 @@ enum TestMaintenanceBehavior {
 }
 
 struct PlanRuntimeMaintenanceTestExecutor {
+    tokens: Arc<ControlledTokenState>,
     inner: MockModelExecutor,
+    maintenance_behavior: TestMaintenanceBehavior,
+    observation: Arc<PlanRuntimeMaintenanceObservation>,
+}
+
+struct PlanRuntimeMaintenanceObservation {
+    tokens: ControlledTokenObservation,
     retained: std::sync::Mutex<HashSet<RequestId>>,
     release_epoch: AtomicU64,
     capacity_epoch: AtomicU64,
@@ -1280,8 +1072,35 @@ struct PlanRuntimeMaintenanceTestExecutor {
     capacity_wait_registrations: AtomicU64,
     prefill_calls: AtomicU64,
     call_order: std::sync::Mutex<Vec<&'static str>>,
-    maintenance_behavior: TestMaintenanceBehavior,
     capacity_signal: tokio::sync::watch::Sender<u64>,
+}
+
+impl std::ops::Deref for PlanRuntimeMaintenanceTestExecutor {
+    type Target = PlanRuntimeMaintenanceObservation;
+    fn deref(&self) -> &Self::Target {
+        &self.observation
+    }
+}
+
+impl ObservedTestExecutor for PlanRuntimeMaintenanceTestExecutor {
+    type Observation = PlanRuntimeMaintenanceObservation;
+    fn observer(&self) -> Arc<Self::Observation> {
+        Arc::clone(&self.observation)
+    }
+    fn retire_fixture(&mut self) -> Result<()> {
+        controlled_token_fixture::shutdown(self, &self.tokens)?;
+        let pending = self
+            .retained
+            .lock()
+            .unwrap()
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        for request in pending {
+            self.cancel_prefill_admission(&request);
+        }
+        Ok(())
+    }
 }
 
 impl PlanRuntimeMaintenanceTestExecutor {
@@ -1291,24 +1110,24 @@ impl PlanRuntimeMaintenanceTestExecutor {
 
     fn with_behavior(vocab_size: usize, maintenance_behavior: TestMaintenanceBehavior) -> Self {
         let (capacity_signal, _) = tokio::sync::watch::channel(0);
+        let tokens = Arc::new(ControlledTokenState::default());
         Self {
+            tokens: Arc::clone(&tokens),
             inner: MockModelExecutor::instant(vocab_size),
-            retained: std::sync::Mutex::new(HashSet::new()),
-            release_epoch: AtomicU64::new(0),
-            capacity_epoch: AtomicU64::new(0),
-            admission_probes: AtomicU64::new(0),
-            maintenance_calls: AtomicU64::new(0),
-            capacity_wait_registrations: AtomicU64::new(0),
-            prefill_calls: AtomicU64::new(0),
-            call_order: std::sync::Mutex::new(Vec::new()),
             maintenance_behavior,
-            capacity_signal,
+            observation: Arc::new(PlanRuntimeMaintenanceObservation {
+                tokens: ControlledTokenObservation(Arc::downgrade(&tokens)),
+                retained: std::sync::Mutex::new(HashSet::new()),
+                release_epoch: AtomicU64::new(0),
+                capacity_epoch: AtomicU64::new(0),
+                admission_probes: AtomicU64::new(0),
+                maintenance_calls: AtomicU64::new(0),
+                capacity_wait_registrations: AtomicU64::new(0),
+                prefill_calls: AtomicU64::new(0),
+                call_order: std::sync::Mutex::new(Vec::new()),
+                capacity_signal,
+            }),
         }
-    }
-
-    fn publish_release(&self) {
-        let release_epoch = self.release_epoch.fetch_add(1, Ordering::AcqRel) + 1;
-        self.capacity_signal.send_replace(release_epoch);
     }
 
     fn epochs(&self) -> ExecutorAdmissionEpochs {
@@ -1340,12 +1159,42 @@ impl PlanRuntimeMaintenanceTestExecutor {
 
 #[async_trait::async_trait]
 impl ModelExecutor for PlanRuntimeMaintenanceTestExecutor {
+    fn begin_shutdown(
+        self: Arc<Self>,
+        permit: &ferrum_execution::executor_lifecycle::ExecutorShutdownPermit,
+    ) -> ferrum_execution::executor_lifecycle::ExecutorShutdownObserver {
+        begin_controlled_shutdown(self, permit)
+    }
+
+    async fn admit_tokens(&self, input: ExecutionAdmission<'_>) -> Result<TokenAdmissionOutcome> {
+        controlled_token_fixture::admit(self, &self.tokens, input)
+    }
+    async fn execute_tokens(&self, work: &[ExecutionWork<'_>]) -> Result<ExecutionBatchOutcome> {
+        controlled_token_fixture::execute(self, &self.tokens, work).await
+    }
+    async fn finish_tokens(
+        &self,
+        sequence: &ExecutorSequence,
+        reason: ExecutionEndReason,
+    ) -> Result<ExecutionCloseOutcome> {
+        controlled_token_fixture::finish(self, &self.tokens, sequence, reason).await
+    }
+    fn cancel_tokens(&self, sequence: &ExecutorSequence) -> Result<ExecutionCloseOutcome> {
+        controlled_token_fixture::cancel(self, &self.tokens, sequence)
+    }
+    fn write_token_capacity_release_sources(
+        &self,
+        sequence: &ExecutorSequence,
+        sources: &mut Vec<ferrum_runtime::CapacityAvailabilitySource>,
+    ) -> Result<bool> {
+        controlled_token_fixture::release_sources(self, &self.tokens, sequence, sources)
+    }
     fn info(&self) -> &ferrum_types::ModelInfo {
         self.inner.info()
     }
 
-    fn execution_resource_authority(&self) -> ExecutionResourceAuthority {
-        ExecutionResourceAuthority::PlanRuntime
+    fn execution_planning_model(&self) -> ExecutionPlanningModel {
+        ExecutionPlanningModel::CompiledPlan
     }
 
     fn plan_runtime_resource_snapshot(&self) -> Result<Option<PlanRuntimeResourceSnapshot>> {
@@ -1545,46 +1394,6 @@ impl ModelExecutor for PlanRuntimeMaintenanceTestExecutor {
         }
     }
 
-    async fn prefill(&self, input: &PrefillInput) -> Result<PrefillOutput> {
-        let request_id = input
-            .request_id
-            .as_ref()
-            .ok_or_else(|| FerrumError::request_validation("missing request id"))?;
-        if !self
-            .retained
-            .lock()
-            .expect("retained admission mutex poisoned")
-            .remove(request_id)
-        {
-            return Err(FerrumError::internal(
-                "test prefill reached submit without retained admission",
-            ));
-        }
-        self.prefill_calls.fetch_add(1, Ordering::Relaxed);
-        self.call_order
-            .lock()
-            .expect("call order mutex poisoned")
-            .push("prefill");
-        self.inner.prefill(input).await
-    }
-
-    async fn plan_runtime_prefill_with_capacity(
-        &self,
-        input: &PlanRuntimePrefillInput,
-    ) -> Result<PlanRuntimePrefillOutcome> {
-        let mock_input = plan_runtime_prefill_to_mock_input(input);
-        let outcome = self.prefill_with_capacity(&mock_input).await?;
-        plan_runtime_prefill_outcome_from_mock(&input.request_id, outcome)
-    }
-
-    async fn decode(&self, input: &DecodeInput) -> Result<DecodeOutput> {
-        self.inner.decode(input).await
-    }
-
-    fn release_cache(&self, cache_id: &str) {
-        self.inner.release_cache(cache_id);
-    }
-
     fn capabilities(&self) -> ExecutorCapabilities {
         self.inner.capabilities()
     }
@@ -1592,73 +1401,6 @@ impl ModelExecutor for PlanRuntimeMaintenanceTestExecutor {
     fn status(&self) -> ExecutorStatus {
         self.inner.status()
     }
-}
-
-#[derive(Debug, Clone)]
-struct TestRecurrentStateHandle {
-    request_id: RequestId,
-    slots: usize,
-}
-
-impl TestRecurrentStateHandle {
-    fn new(request_id: RequestId, slots: usize) -> Self {
-        Self {
-            request_id,
-            slots: slots.max(1),
-        }
-    }
-}
-
-impl ferrum_interfaces::RecurrentStateHandle for TestRecurrentStateHandle {
-    fn request_id(&self) -> RequestId {
-        self.request_id.clone()
-    }
-
-    fn device(&self) -> Device {
-        Device::CPU
-    }
-
-    fn num_layers(&self) -> usize {
-        1
-    }
-
-    fn state_bytes(&self) -> usize {
-        self.slots * std::mem::size_of::<f32>()
-    }
-
-    fn clone_handle(
-        &self,
-    ) -> ferrum_types::Result<Arc<dyn ferrum_interfaces::RecurrentStateHandle>> {
-        Ok(Arc::new(self.clone()))
-    }
-
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
-    fn stats(&self) -> ferrum_interfaces::RecurrentStateHandleStats {
-        ferrum_interfaces::RecurrentStateHandleStats {
-            memory_bytes: self.state_bytes(),
-            state_tensors: 1,
-            batch_slots: self.slots,
-            last_access: Instant::now(),
-        }
-    }
-
-    fn is_valid(&self) -> bool {
-        true
-    }
-
-    fn cache_id(&self) -> String {
-        format!("test-recurrent-state-{}", self.request_id)
-    }
-}
-
-fn test_recurrent_state_handle(
-    request_id: RequestId,
-    slots: usize,
-) -> Arc<dyn ferrum_interfaces::RecurrentStateHandle> {
-    Arc::new(TestRecurrentStateHandle::new(request_id, slots))
 }
 
 struct PolicyTokenizer {
@@ -1914,6 +1656,7 @@ fn policy_request() -> InferenceRequest {
         client_id: None,
         session_id: None,
         created_at: chrono::Utc::now(),
+        ingress: None,
         api_request: None,
         evidence_request: Default::default(),
         metadata: HashMap::new(),
@@ -1938,6 +1681,25 @@ async fn install_execution_readiness_wake(
     (request_id, receipt.into_wake())
 }
 
+fn readiness_wait_target(
+    request_id: &RequestId,
+) -> (Arc<SequenceHandle>, ExecutionReadinessWaitTarget) {
+    let issuer = ferrum_execution::token_execution::ExecutorSequenceIssuer::new();
+    let sequence = issuer.issue_sequence().unwrap();
+    let mut request = policy_request();
+    request.id = request_id.clone();
+    let mut state = SequenceState::new(request, vec![TokenId(1)]);
+    state.execution_frontier = Some(issuer.frontier(&sequence, 0).unwrap());
+    let sequences = SequenceRegistry::default();
+    assert!(sequences.insert(request_id.clone(), state).is_none());
+    let handle = sequences.get(request_id).unwrap();
+    let target = ExecutionReadinessWaitTarget {
+        request: Arc::downgrade(&handle),
+        sequence,
+    };
+    (handle, target)
+}
+
 #[test]
 fn execution_readiness_registry_enforces_an_independent_fixed_cap() {
     let registry = ExecutionReadinessWaitRegistry::new();
@@ -1954,6 +1716,8 @@ async fn execution_readiness_registry_resumes_only_after_successful_wait() {
     let scheduler = ContinuousBatchScheduler::new(ferrum_types::SchedulerConfig::default());
     let (request_id, wake) = install_execution_readiness_wake(&scheduler).await;
     let registry = ExecutionReadinessWaitRegistry::new();
+    let (handle, target) = readiness_wait_target(&request_id);
+    let sequence = target.sequence.clone();
     let work_notify = Arc::new(Notify::new());
     let notified = work_notify.notified();
     tokio::pin!(notified);
@@ -1962,7 +1726,7 @@ async fn execution_readiness_registry_resumes_only_after_successful_wait() {
         .track(
             wake,
             async { Ok(()) },
-            vec![request_id.clone()],
+            vec![target],
             Arc::clone(&work_notify),
             slot,
         )
@@ -1973,6 +1737,17 @@ async fn execution_readiness_registry_resumes_only_after_successful_wait() {
         .expect("successful waiter must wake the engine");
     assert_eq!(registry.pending_count(), 0);
     assert!(registry.take_failures().is_empty());
+    assert_eq!(
+        handle
+            .lock()
+            .as_ref()
+            .unwrap()
+            .execution_frontier
+            .as_ref()
+            .unwrap()
+            .sequence(),
+        &sequence
+    );
     let resumed = scheduler
         .next_batch(ferrum_interfaces::BatchHint::simple(1))
         .await
@@ -1997,6 +1772,8 @@ async fn execution_readiness_registry_reports_wait_errors_without_rescheduling()
     let scheduler = ContinuousBatchScheduler::new(ferrum_types::SchedulerConfig::default());
     let (request_id, wake) = install_execution_readiness_wake(&scheduler).await;
     let registry = ExecutionReadinessWaitRegistry::new();
+    let (handle, target) = readiness_wait_target(&request_id);
+    let sequence = target.sequence.clone();
     let work_notify = Arc::new(Notify::new());
     let notified = work_notify.notified();
     tokio::pin!(notified);
@@ -2005,7 +1782,7 @@ async fn execution_readiness_registry_reports_wait_errors_without_rescheduling()
         .track(
             wake,
             async { Err("hazard channel closed".to_string()) },
-            vec![request_id.clone()],
+            vec![target],
             Arc::clone(&work_notify),
             slot,
         )
@@ -2016,7 +1793,11 @@ async fn execution_readiness_registry_reports_wait_errors_without_rescheduling()
         .expect("failed waiter must wake the terminal owner");
     let failures = registry.take_failures();
     assert_eq!(failures.len(), 1);
-    assert_eq!(failures[0].request_ids, vec![request_id]);
+    assert_eq!(failures[0].requests.len(), 1);
+    assert!(failures[0].requests[0]
+        .request
+        .ptr_eq(&Arc::downgrade(&handle)));
+    assert_eq!(failures[0].requests[0].sequence, sequence);
     assert_eq!(failures[0].message, "hazard channel closed");
     assert!(scheduler
         .next_batch(ferrum_interfaces::BatchHint::simple(1))
@@ -2029,6 +1810,8 @@ async fn execution_readiness_registry_converts_waiter_panic_to_terminal_failure(
     let scheduler = ContinuousBatchScheduler::new(ferrum_types::SchedulerConfig::default());
     let (request_id, wake) = install_execution_readiness_wake(&scheduler).await;
     let registry = ExecutionReadinessWaitRegistry::new();
+    let (handle, target) = readiness_wait_target(&request_id);
+    let sequence = target.sequence.clone();
     let work_notify = Arc::new(Notify::new());
     let notified = work_notify.notified();
     tokio::pin!(notified);
@@ -2041,7 +1824,7 @@ async fn execution_readiness_registry_converts_waiter_panic_to_terminal_failure(
                 #[allow(unreachable_code)]
                 Ok::<(), String>(())
             },
-            vec![request_id.clone()],
+            vec![target],
             Arc::clone(&work_notify),
             slot,
         )
@@ -2052,7 +1835,11 @@ async fn execution_readiness_registry_converts_waiter_panic_to_terminal_failure(
         .expect("panicked waiter must wake the terminal owner");
     let failures = registry.take_failures();
     assert_eq!(failures.len(), 1);
-    assert_eq!(failures[0].request_ids, vec![request_id]);
+    assert_eq!(failures[0].requests.len(), 1);
+    assert!(failures[0].requests[0]
+        .request
+        .ptr_eq(&Arc::downgrade(&handle)));
+    assert_eq!(failures[0].requests[0].sequence, sequence);
     assert_eq!(
         failures[0].message,
         "Request-state readiness waiter panicked"
@@ -2068,13 +1855,15 @@ async fn execution_readiness_registry_cancels_ticket_before_shutdown_join() {
     let scheduler = ContinuousBatchScheduler::new(ferrum_types::SchedulerConfig::default());
     let (request_id, wake) = install_execution_readiness_wake(&scheduler).await;
     let registry = ExecutionReadinessWaitRegistry::new();
+    let (handle, target) = readiness_wait_target(&request_id);
+    let sequence = target.sequence.clone();
     let work_notify = Arc::new(Notify::new());
     let slot = registry.reserve().await.unwrap();
     registry
         .track(
             wake,
             std::future::pending::<std::result::Result<(), String>>(),
-            vec![request_id.clone()],
+            vec![target],
             work_notify,
             slot,
         )
@@ -2088,6 +1877,17 @@ async fn execution_readiness_registry_cancels_ticket_before_shutdown_join() {
     assert_eq!(registry.pending_count(), 0);
     assert!(registry.tasks.lock().is_empty());
     assert!(registry.take_failures().is_empty());
+    assert_eq!(
+        handle
+            .lock()
+            .as_ref()
+            .unwrap()
+            .execution_frontier
+            .as_ref()
+            .unwrap()
+            .sequence(),
+        &sequence
+    );
     let resumed = scheduler
         .next_batch(ferrum_interfaces::BatchHint::simple(1))
         .await
@@ -2202,7 +2002,11 @@ fn read_engine_profile_events(path: &Path) -> Vec<FerrumProfileEvent> {
 }
 
 fn flush_engine_profile_events(engine: &ContinuousBatchEngine) {
-    if let Some(journal) = &engine.inner.scheduler_trace_jsonl {
+    if let Some(journal) = &engine
+        .active_inner()
+        .expect("engine execution is open")
+        .scheduler_trace_jsonl
+    {
         journal.flush().expect("scheduler trace flush barrier");
     }
 }
@@ -2290,1140 +2094,6 @@ fn assert_engine_resource_trace_balanced(path: &Path) -> Vec<ResourceTraceEvent>
     resources
 }
 
-struct RecurrentSpecExecutor {
-    inner: MockModelExecutor,
-}
-
-struct FailingBatchPrefillExecutor {
-    inner: RecurrentSpecExecutor,
-}
-
-struct FailingUnifiedReserveExecutor {
-    inner: FailingBatchPrefillExecutor,
-}
-
-struct StructuredPressureOnceUnifiedReserveExecutor {
-    inner: RecurrentSpecExecutor,
-    remaining_failures: std::sync::atomic::AtomicUsize,
-    message: &'static str,
-}
-
-struct FailingUnifiedForwardExecutor {
-    inner: RecurrentSpecExecutor,
-    resource_exhausted: bool,
-}
-
-struct BadShapePrefillExecutor {
-    inner: RecurrentSpecExecutor,
-}
-
-struct ShortBatchPrefillExecutor {
-    inner: RecurrentSpecExecutor,
-}
-
-struct FailingFromSliceTensorFactory;
-
-struct ShortUnifiedResultExecutor {
-    inner: RecurrentSpecExecutor,
-}
-
-struct MissingFinalUnifiedResultExecutor {
-    inner: RecurrentSpecExecutor,
-}
-
-struct GreedySentinelUnifiedExecutor {
-    inner: RecurrentSpecExecutor,
-    token: u32,
-}
-
-struct FailingDecodeExecutor {
-    inner: RecurrentSpecExecutor,
-}
-
-struct FirstAllocateThenFailKvCacheManager {
-    inner: MockKvCacheManager,
-    allocate_calls: std::sync::atomic::AtomicU64,
-}
-
-impl FirstAllocateThenFailKvCacheManager {
-    fn new(total_blocks: usize) -> Self {
-        Self {
-            inner: MockKvCacheManager::new(total_blocks),
-            allocate_calls: std::sync::atomic::AtomicU64::new(0),
-        }
-    }
-}
-
-struct FailingDeallocateKvCacheManager {
-    inner: MockKvCacheManager,
-}
-
-impl FailingDeallocateKvCacheManager {
-    fn new(total_blocks: usize) -> Self {
-        Self {
-            inner: MockKvCacheManager::new(total_blocks),
-        }
-    }
-}
-
-struct FailingDeallocateRecurrentStateManager {
-    inner: InMemoryRecurrentStateManager,
-}
-
-impl FailingDeallocateRecurrentStateManager {
-    fn new(config: InMemoryRecurrentStateConfig) -> Self {
-        Self {
-            inner: InMemoryRecurrentStateManager::new(config),
-        }
-    }
-}
-
-struct RecurrentSpecLlm {
-    config: LlmRuntimeConfig,
-}
-
-impl RecurrentSpecLlm {
-    fn new() -> Self {
-        Self {
-            config: LlmRuntimeConfig {
-                hidden_size: 4,
-                num_layers: 1,
-                num_kv_heads: 1,
-                head_dim: 4,
-                vocab_size: 64,
-                max_seq_len: 16,
-            },
-        }
-    }
-}
-
-impl DecoderOnlyLLM for RecurrentSpecLlm {
-    fn config(&self) -> &LlmRuntimeConfig {
-        &self.config
-    }
-
-    fn recurrent_state_spec(
-        &self,
-        request_id: &RequestId,
-        _input_tokens: &[TokenId],
-    ) -> Result<Option<RecurrentStateSpec>> {
-        Ok(Some(RecurrentStateSpec {
-            request_id: request_id.clone(),
-            num_layers: 1,
-            tensors: vec![RecurrentStateTensorSpec::new(
-                0,
-                "delta_state",
-                vec![4],
-                DataType::FP32,
-            )],
-            device: Device::CPU,
-            max_batch_slots: 1,
-        }))
-    }
-
-    fn prefill(&mut self, _cache_id: &str, _tokens: &[u32]) -> Vec<f32> {
-        let mut logits = vec![0.0; self.config.vocab_size];
-        logits[0] = 1.0;
-        logits
-    }
-
-    fn decode(&mut self, _cache_id: &str, _token: u32, _pos: u32) -> Vec<f32> {
-        let mut logits = vec![0.0; self.config.vocab_size];
-        logits[0] = 1.0;
-        logits
-    }
-
-    fn release(&mut self, _cache_id: &str) {}
-}
-
-#[derive(Clone, Debug)]
-struct CapturedUnifiedItem {
-    q_len: usize,
-    pos_offset: usize,
-    is_final_chunk: bool,
-    admission_target_len: Option<usize>,
-    logits_policy: ferrum_execution::model_executor::LogitsReturnPolicy,
-}
-
-struct CapturingUnifiedExecutor {
-    inner: MockModelExecutor,
-    captured: Arc<std::sync::Mutex<Vec<Vec<CapturedUnifiedItem>>>>,
-    output_token: u32,
-}
-
-#[async_trait::async_trait]
-impl ModelExecutor for CapturingUnifiedExecutor {
-    fn info(&self) -> &ferrum_types::ModelInfo {
-        self.inner.info()
-    }
-
-    fn supports_native_unified_decode(&self) -> bool {
-        true
-    }
-
-    async fn prefill(&self, input: &PrefillInput) -> Result<PrefillOutput> {
-        self.inner.prefill(input).await
-    }
-
-    async fn decode(&self, input: &DecodeInput) -> Result<DecodeOutput> {
-        self.inner.decode(input).await
-    }
-
-    async fn unified_decode(&self, batch: &UnifiedBatch) -> Result<Vec<Option<Vec<f32>>>> {
-        let captured = batch
-            .items
-            .iter()
-            .map(|item| CapturedUnifiedItem {
-                q_len: item.q_tokens.len(),
-                pos_offset: item.pos_offset,
-                is_final_chunk: item.is_final_chunk,
-                admission_target_len: item
-                    .metadata
-                    .get("ferrum_kv_admission_target_len")
-                    .and_then(|value| value.as_u64())
-                    .map(|value| value as usize),
-                logits_policy: item.logits_policy.clone(),
-            })
-            .collect::<Vec<_>>();
-        self.captured
-            .lock()
-            .expect("capture mutex poisoned")
-            .push(captured);
-
-        Ok(batch
-            .items
-            .iter()
-            .map(|item| item.is_final_chunk.then(|| vec![self.output_token as f32]))
-            .collect())
-    }
-
-    fn capabilities(&self) -> ExecutorCapabilities {
-        self.inner.capabilities()
-    }
-
-    fn status(&self) -> ExecutorStatus {
-        self.inner.status()
-    }
-}
-
-#[async_trait::async_trait]
-impl ModelExecutor for RecurrentSpecExecutor {
-    fn info(&self) -> &ferrum_types::ModelInfo {
-        self.inner.info()
-    }
-
-    fn supports_native_unified_decode(&self) -> bool {
-        true
-    }
-
-    fn recurrent_state_spec(
-        &self,
-        request_id: &RequestId,
-        _input_tokens: &[TokenId],
-    ) -> Result<Option<RecurrentStateSpec>> {
-        Ok(Some(RecurrentStateSpec {
-            request_id: request_id.clone(),
-            num_layers: 1,
-            tensors: vec![RecurrentStateTensorSpec::new(
-                0,
-                "delta_state",
-                vec![4],
-                DataType::BF16,
-            )],
-            device: Device::CPU,
-            max_batch_slots: 1,
-        }))
-    }
-
-    async fn prefill(&self, input: &PrefillInput) -> Result<PrefillOutput> {
-        self.inner.prefill(input).await
-    }
-
-    async fn decode(&self, input: &DecodeInput) -> Result<DecodeOutput> {
-        self.inner.decode(input).await
-    }
-
-    async fn unified_decode(&self, batch: &UnifiedBatch) -> Result<Vec<Option<Vec<f32>>>> {
-        Ok(batch
-            .items
-            .iter()
-            .map(|item| {
-                item.is_final_chunk.then(|| {
-                    let mut logits = vec![0.0; self.info().vocab_size];
-                    logits[0] = 1.0;
-                    logits
-                })
-            })
-            .collect())
-    }
-
-    fn capabilities(&self) -> ExecutorCapabilities {
-        self.inner.capabilities()
-    }
-
-    fn status(&self) -> ExecutorStatus {
-        self.inner.status()
-    }
-}
-
-#[async_trait::async_trait]
-impl ModelExecutor for FailingBatchPrefillExecutor {
-    fn info(&self) -> &ferrum_types::ModelInfo {
-        self.inner.info()
-    }
-
-    fn supports_native_unified_decode(&self) -> bool {
-        self.inner.supports_native_unified_decode()
-    }
-
-    fn recurrent_state_spec(
-        &self,
-        request_id: &RequestId,
-        input_tokens: &[TokenId],
-    ) -> Result<Option<RecurrentStateSpec>> {
-        self.inner.recurrent_state_spec(request_id, input_tokens)
-    }
-
-    async fn prefill(&self, _input: &PrefillInput) -> Result<PrefillOutput> {
-        Err(FerrumError::resource_exhausted(
-            "synthetic single prefill model-side KV reserve failure",
-        ))
-    }
-
-    async fn batch_prefill(&self, _inputs: &[PrefillInput]) -> Result<Vec<PrefillOutput>> {
-        Err(FerrumError::resource_exhausted(
-            "synthetic model-side KV reserve failure",
-        ))
-    }
-
-    async fn decode(&self, input: &DecodeInput) -> Result<DecodeOutput> {
-        self.inner.decode(input).await
-    }
-
-    fn capabilities(&self) -> ExecutorCapabilities {
-        self.inner.capabilities()
-    }
-
-    fn status(&self) -> ExecutorStatus {
-        self.inner.status()
-    }
-}
-
-#[async_trait::async_trait]
-impl ModelExecutor for FailingUnifiedReserveExecutor {
-    fn info(&self) -> &ferrum_types::ModelInfo {
-        self.inner.info()
-    }
-
-    fn supports_native_unified_decode(&self) -> bool {
-        true
-    }
-
-    fn recurrent_state_spec(
-        &self,
-        request_id: &RequestId,
-        input_tokens: &[TokenId],
-    ) -> Result<Option<RecurrentStateSpec>> {
-        self.inner.recurrent_state_spec(request_id, input_tokens)
-    }
-
-    fn reserve_kv_slots(
-        &self,
-        _requests: &[ferrum_execution::model_executor::KvSlotRequest],
-    ) -> Result<Option<ferrum_execution::model_executor::KvSlotReservation>> {
-        Err(FerrumError::resource_exhausted(
-            "synthetic unified reserve failure",
-        ))
-    }
-
-    async fn prefill(&self, input: &PrefillInput) -> Result<PrefillOutput> {
-        self.inner.prefill(input).await
-    }
-
-    async fn batch_prefill(&self, inputs: &[PrefillInput]) -> Result<Vec<PrefillOutput>> {
-        self.inner.batch_prefill(inputs).await
-    }
-
-    async fn decode(&self, input: &DecodeInput) -> Result<DecodeOutput> {
-        self.inner.decode(input).await
-    }
-
-    fn capabilities(&self) -> ExecutorCapabilities {
-        self.inner.capabilities()
-    }
-
-    fn status(&self) -> ExecutorStatus {
-        self.inner.status()
-    }
-}
-
-#[async_trait::async_trait]
-impl ModelExecutor for StructuredPressureOnceUnifiedReserveExecutor {
-    fn info(&self) -> &ferrum_types::ModelInfo {
-        self.inner.info()
-    }
-
-    fn supports_native_unified_decode(&self) -> bool {
-        true
-    }
-
-    fn recurrent_state_spec(
-        &self,
-        request_id: &RequestId,
-        input_tokens: &[TokenId],
-    ) -> Result<Option<RecurrentStateSpec>> {
-        self.inner.recurrent_state_spec(request_id, input_tokens)
-    }
-
-    fn reserve_kv_slots(
-        &self,
-        _requests: &[ferrum_execution::model_executor::KvSlotRequest],
-    ) -> Result<Option<ferrum_execution::model_executor::KvSlotReservation>> {
-        if self
-            .remaining_failures
-            .fetch_update(
-                std::sync::atomic::Ordering::Relaxed,
-                std::sync::atomic::Ordering::Relaxed,
-                |remaining| remaining.checked_sub(1),
-            )
-            .is_ok()
-        {
-            return Err(FerrumError::resource_exhausted(self.message));
-        }
-        Ok(None)
-    }
-
-    async fn prefill(&self, input: &PrefillInput) -> Result<PrefillOutput> {
-        self.inner.prefill(input).await
-    }
-
-    async fn batch_prefill(&self, inputs: &[PrefillInput]) -> Result<Vec<PrefillOutput>> {
-        self.inner.batch_prefill(inputs).await
-    }
-
-    async fn decode(&self, input: &DecodeInput) -> Result<DecodeOutput> {
-        self.inner.decode(input).await
-    }
-
-    async fn unified_decode(&self, batch: &UnifiedBatch) -> Result<Vec<Option<Vec<f32>>>> {
-        self.inner.unified_decode(batch).await
-    }
-
-    fn capabilities(&self) -> ExecutorCapabilities {
-        self.inner.capabilities()
-    }
-
-    fn status(&self) -> ExecutorStatus {
-        self.inner.status()
-    }
-}
-
-#[async_trait::async_trait]
-impl ModelExecutor for FailingUnifiedForwardExecutor {
-    fn info(&self) -> &ferrum_types::ModelInfo {
-        self.inner.info()
-    }
-
-    fn supports_native_unified_decode(&self) -> bool {
-        true
-    }
-
-    fn recurrent_state_spec(
-        &self,
-        request_id: &RequestId,
-        input_tokens: &[TokenId],
-    ) -> Result<Option<RecurrentStateSpec>> {
-        self.inner.recurrent_state_spec(request_id, input_tokens)
-    }
-
-    async fn prefill(&self, input: &PrefillInput) -> Result<PrefillOutput> {
-        self.inner.prefill(input).await
-    }
-
-    async fn batch_prefill(&self, inputs: &[PrefillInput]) -> Result<Vec<PrefillOutput>> {
-        self.inner.batch_prefill(inputs).await
-    }
-
-    async fn decode(&self, input: &DecodeInput) -> Result<DecodeOutput> {
-        self.inner.decode(input).await
-    }
-
-    async fn unified_decode(&self, _batch: &UnifiedBatch) -> Result<Vec<Option<Vec<f32>>>> {
-        if self.resource_exhausted {
-            Err(FerrumError::resource_exhausted(
-                "synthetic unified forward resource exhaustion",
-            ))
-        } else {
-            Err(FerrumError::internal(
-                "synthetic unified forward internal failure",
-            ))
-        }
-    }
-
-    fn capabilities(&self) -> ExecutorCapabilities {
-        self.inner.capabilities()
-    }
-
-    fn status(&self) -> ExecutorStatus {
-        self.inner.status()
-    }
-}
-
-#[async_trait::async_trait]
-impl ModelExecutor for BadShapePrefillExecutor {
-    fn info(&self) -> &ferrum_types::ModelInfo {
-        self.inner.info()
-    }
-
-    fn supports_native_unified_decode(&self) -> bool {
-        false
-    }
-
-    fn recurrent_state_spec(
-        &self,
-        request_id: &RequestId,
-        input_tokens: &[TokenId],
-    ) -> Result<Option<RecurrentStateSpec>> {
-        self.inner.recurrent_state_spec(request_id, input_tokens)
-    }
-
-    async fn prefill(&self, input: &PrefillInput) -> Result<PrefillOutput> {
-        let kv = input
-            .kv_cache
-            .clone()
-            .ok_or_else(|| FerrumError::internal("bad-shape prefill missing kv"))?;
-        let logits = MockTensor::zeros(&[1, self.info().vocab_size], DataType::FP32).into_ref();
-        let output = PrefillOutput::new(logits, kv);
-        Ok(if let Some(state) = input.recurrent_state.clone() {
-            output.with_recurrent_state(state)
-        } else {
-            output
-        })
-    }
-
-    async fn batch_prefill(&self, inputs: &[PrefillInput]) -> Result<Vec<PrefillOutput>> {
-        let mut outputs = Vec::with_capacity(inputs.len());
-        for input in inputs {
-            outputs.push(self.prefill(input).await?);
-        }
-        Ok(outputs)
-    }
-
-    async fn decode(&self, input: &DecodeInput) -> Result<DecodeOutput> {
-        self.inner.decode(input).await
-    }
-
-    fn capabilities(&self) -> ExecutorCapabilities {
-        self.inner.capabilities()
-    }
-
-    fn status(&self) -> ExecutorStatus {
-        self.inner.status()
-    }
-}
-
-#[async_trait::async_trait]
-impl ModelExecutor for ShortBatchPrefillExecutor {
-    fn info(&self) -> &ferrum_types::ModelInfo {
-        self.inner.info()
-    }
-
-    fn supports_native_unified_decode(&self) -> bool {
-        false
-    }
-
-    fn recurrent_state_spec(
-        &self,
-        request_id: &RequestId,
-        input_tokens: &[TokenId],
-    ) -> Result<Option<RecurrentStateSpec>> {
-        self.inner.recurrent_state_spec(request_id, input_tokens)
-    }
-
-    async fn prefill(&self, input: &PrefillInput) -> Result<PrefillOutput> {
-        self.inner.prefill(input).await
-    }
-
-    async fn batch_prefill(&self, _inputs: &[PrefillInput]) -> Result<Vec<PrefillOutput>> {
-        Ok(Vec::new())
-    }
-
-    async fn decode(&self, input: &DecodeInput) -> Result<DecodeOutput> {
-        self.inner.decode(input).await
-    }
-
-    fn capabilities(&self) -> ExecutorCapabilities {
-        self.inner.capabilities()
-    }
-
-    fn status(&self) -> ExecutorStatus {
-        self.inner.status()
-    }
-}
-
-#[async_trait::async_trait]
-impl ModelExecutor for ShortUnifiedResultExecutor {
-    fn info(&self) -> &ferrum_types::ModelInfo {
-        self.inner.info()
-    }
-
-    fn supports_native_unified_decode(&self) -> bool {
-        true
-    }
-
-    fn recurrent_state_spec(
-        &self,
-        request_id: &RequestId,
-        input_tokens: &[TokenId],
-    ) -> Result<Option<RecurrentStateSpec>> {
-        self.inner.recurrent_state_spec(request_id, input_tokens)
-    }
-
-    async fn prefill(&self, input: &PrefillInput) -> Result<PrefillOutput> {
-        self.inner.prefill(input).await
-    }
-
-    async fn decode(&self, input: &DecodeInput) -> Result<DecodeOutput> {
-        self.inner.decode(input).await
-    }
-
-    async fn unified_decode(&self, _batch: &UnifiedBatch) -> Result<Vec<Option<Vec<f32>>>> {
-        Ok(Vec::new())
-    }
-
-    fn capabilities(&self) -> ExecutorCapabilities {
-        self.inner.capabilities()
-    }
-
-    fn status(&self) -> ExecutorStatus {
-        self.inner.status()
-    }
-}
-
-#[async_trait::async_trait]
-impl ModelExecutor for MissingFinalUnifiedResultExecutor {
-    fn info(&self) -> &ferrum_types::ModelInfo {
-        self.inner.info()
-    }
-
-    fn supports_native_unified_decode(&self) -> bool {
-        true
-    }
-
-    fn recurrent_state_spec(
-        &self,
-        request_id: &RequestId,
-        input_tokens: &[TokenId],
-    ) -> Result<Option<RecurrentStateSpec>> {
-        self.inner.recurrent_state_spec(request_id, input_tokens)
-    }
-
-    async fn prefill(&self, input: &PrefillInput) -> Result<PrefillOutput> {
-        self.inner.prefill(input).await
-    }
-
-    async fn decode(&self, input: &DecodeInput) -> Result<DecodeOutput> {
-        self.inner.decode(input).await
-    }
-
-    async fn unified_decode(&self, batch: &UnifiedBatch) -> Result<Vec<Option<Vec<f32>>>> {
-        Ok(batch.items.iter().map(|_| None).collect())
-    }
-
-    fn capabilities(&self) -> ExecutorCapabilities {
-        self.inner.capabilities()
-    }
-
-    fn status(&self) -> ExecutorStatus {
-        self.inner.status()
-    }
-}
-
-#[async_trait::async_trait]
-impl ModelExecutor for GreedySentinelUnifiedExecutor {
-    fn info(&self) -> &ferrum_types::ModelInfo {
-        self.inner.info()
-    }
-
-    fn supports_native_unified_decode(&self) -> bool {
-        true
-    }
-
-    fn recurrent_state_spec(
-        &self,
-        request_id: &RequestId,
-        input_tokens: &[TokenId],
-    ) -> Result<Option<RecurrentStateSpec>> {
-        self.inner.recurrent_state_spec(request_id, input_tokens)
-    }
-
-    async fn prefill(&self, input: &PrefillInput) -> Result<PrefillOutput> {
-        self.inner.prefill(input).await
-    }
-
-    async fn decode(&self, input: &DecodeInput) -> Result<DecodeOutput> {
-        self.inner.decode(input).await
-    }
-
-    async fn unified_decode(&self, batch: &UnifiedBatch) -> Result<Vec<Option<Vec<f32>>>> {
-        Ok(batch
-            .items
-            .iter()
-            .map(|item| item.is_final_chunk.then(|| vec![self.token as f32]))
-            .collect())
-    }
-
-    fn capabilities(&self) -> ExecutorCapabilities {
-        self.inner.capabilities()
-    }
-
-    fn status(&self) -> ExecutorStatus {
-        self.inner.status()
-    }
-}
-
-#[async_trait::async_trait]
-impl ModelExecutor for FailingDecodeExecutor {
-    fn info(&self) -> &ferrum_types::ModelInfo {
-        self.inner.info()
-    }
-
-    fn supports_native_unified_decode(&self) -> bool {
-        self.inner.supports_native_unified_decode()
-    }
-
-    fn recurrent_state_spec(
-        &self,
-        request_id: &RequestId,
-        input_tokens: &[TokenId],
-    ) -> Result<Option<RecurrentStateSpec>> {
-        self.inner.recurrent_state_spec(request_id, input_tokens)
-    }
-
-    async fn prefill(&self, input: &PrefillInput) -> Result<PrefillOutput> {
-        self.inner.prefill(input).await
-    }
-
-    async fn decode(&self, _input: &DecodeInput) -> Result<DecodeOutput> {
-        Err(FerrumError::resource_exhausted(
-            "synthetic decode model-side KV reserve failure",
-        ))
-    }
-
-    fn capabilities(&self) -> ExecutorCapabilities {
-        self.inner.capabilities()
-    }
-
-    fn status(&self) -> ExecutorStatus {
-        self.inner.status()
-    }
-}
-
-#[async_trait::async_trait]
-impl KvCacheManager for FirstAllocateThenFailKvCacheManager {
-    async fn allocate(&self, request: &AllocationRequest) -> Result<Arc<dyn KvCacheHandle>> {
-        let call = self
-            .allocate_calls
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        if call == 0 {
-            self.inner.allocate(request).await
-        } else {
-            Err(FerrumError::resource_exhausted(
-                "synthetic fallback KV allocation exhaustion",
-            ))
-        }
-    }
-
-    async fn extend(&self, handle: &mut dyn KvCacheHandle, additional_tokens: usize) -> Result<()> {
-        self.inner.extend(handle, additional_tokens).await
-    }
-
-    async fn deallocate(&self, request_id: RequestId) -> Result<()> {
-        self.inner.deallocate(request_id).await
-    }
-
-    fn can_allocate(&self, request: &AllocationRequest) -> bool {
-        self.inner.can_allocate(request)
-    }
-
-    fn stats(&self) -> CacheManagerStats {
-        self.inner.stats()
-    }
-
-    async fn gc(&self) -> Result<CacheGcStats> {
-        self.inner.gc().await
-    }
-
-    fn set_pressure_callback(&self, callback: Box<dyn Fn(MemoryPressure) + Send + Sync>) {
-        self.inner.set_pressure_callback(callback);
-    }
-
-    fn get_handle(&self, request_id: RequestId) -> Option<Arc<dyn KvCacheHandle>> {
-        self.inner.get_handle(request_id)
-    }
-
-    fn list_handles(&self) -> Vec<(RequestId, Arc<dyn KvCacheHandle>)> {
-        self.inner.list_handles()
-    }
-}
-
-#[async_trait::async_trait]
-impl KvCacheManager for FailingDeallocateKvCacheManager {
-    async fn allocate(&self, request: &AllocationRequest) -> Result<Arc<dyn KvCacheHandle>> {
-        self.inner.allocate(request).await
-    }
-
-    async fn extend(&self, handle: &mut dyn KvCacheHandle, additional_tokens: usize) -> Result<()> {
-        self.inner.extend(handle, additional_tokens).await
-    }
-
-    async fn deallocate(&self, request_id: RequestId) -> Result<()> {
-        Err(FerrumError::internal(format!(
-            "synthetic KV release failure for {request_id}"
-        )))
-    }
-
-    fn can_allocate(&self, request: &AllocationRequest) -> bool {
-        self.inner.can_allocate(request)
-    }
-
-    fn stats(&self) -> CacheManagerStats {
-        self.inner.stats()
-    }
-
-    async fn gc(&self) -> Result<CacheGcStats> {
-        self.inner.gc().await
-    }
-
-    fn set_pressure_callback(&self, callback: Box<dyn Fn(MemoryPressure) + Send + Sync>) {
-        self.inner.set_pressure_callback(callback);
-    }
-
-    fn get_handle(&self, request_id: RequestId) -> Option<Arc<dyn KvCacheHandle>> {
-        self.inner.get_handle(request_id)
-    }
-
-    fn list_handles(&self) -> Vec<(RequestId, Arc<dyn KvCacheHandle>)> {
-        self.inner.list_handles()
-    }
-}
-
-#[async_trait::async_trait]
-impl RecurrentStateManager for FailingDeallocateRecurrentStateManager {
-    async fn allocate(&self, spec: &RecurrentStateSpec) -> Result<Arc<dyn RecurrentStateHandle>> {
-        self.inner.allocate(spec).await
-    }
-
-    async fn deallocate(&self, request_id: RequestId) -> Result<()> {
-        Err(FerrumError::internal(format!(
-            "synthetic recurrent-state release failure for {request_id}"
-        )))
-    }
-
-    fn can_allocate(&self, spec: &RecurrentStateSpec) -> bool {
-        self.inner.can_allocate(spec)
-    }
-
-    fn get_handle(&self, request_id: RequestId) -> Option<Arc<dyn RecurrentStateHandle>> {
-        self.inner.get_handle(request_id)
-    }
-
-    fn list_handles(&self) -> Vec<(RequestId, Arc<dyn RecurrentStateHandle>)> {
-        self.inner.list_handles()
-    }
-
-    fn stats(&self) -> ferrum_interfaces::RecurrentStateManagerStats {
-        self.inner.stats()
-    }
-
-    async fn reset(&self) -> Result<()> {
-        self.inner.reset().await
-    }
-}
-
-impl TensorFactory for FailingFromSliceTensorFactory {
-    fn empty(&self, shape: &[usize], dtype: DataType, device: Device) -> Result<TensorRef> {
-        MockTensorFactory.empty(shape, dtype, device)
-    }
-
-    fn zeros_like(&self, tensor: &TensorRef) -> Result<TensorRef> {
-        MockTensorFactory.zeros_like(tensor)
-    }
-
-    fn from_slice(
-        &self,
-        _data: &[f32],
-        _shape: &[usize],
-        _dtype: DataType,
-        _device: Device,
-    ) -> Result<TensorRef> {
-        Err(FerrumError::backend("synthetic tokens_to_tensor failure"))
-    }
-
-    fn to_device(&self, tensor: &TensorRef, device: Device) -> Result<TensorRef> {
-        MockTensorFactory.to_device(tensor, device)
-    }
-
-    fn narrow(
-        &self,
-        tensor: &TensorRef,
-        dim: usize,
-        start: usize,
-        length: usize,
-    ) -> Result<TensorRef> {
-        MockTensorFactory.narrow(tensor, dim, start, length)
-    }
-
-    fn reshape(&self, tensor: &TensorRef, shape: &[usize]) -> Result<TensorRef> {
-        MockTensorFactory.reshape(tensor, shape)
-    }
-
-    fn zeros(&self, shape: &[usize], dtype: DataType, device: &Device) -> Result<TensorRef> {
-        MockTensorFactory.zeros(shape, dtype, device)
-    }
-
-    fn ones(&self, shape: &[usize], dtype: DataType, device: &Device) -> Result<TensorRef> {
-        MockTensorFactory.ones(shape, dtype, device)
-    }
-
-    fn uniform(
-        &self,
-        shape: &[usize],
-        low: f32,
-        high: f32,
-        dtype: DataType,
-        device: &Device,
-    ) -> Result<TensorRef> {
-        MockTensorFactory.uniform(shape, low, high, dtype, device)
-    }
-
-    fn normal(
-        &self,
-        shape: &[usize],
-        mean: f32,
-        std: f32,
-        dtype: DataType,
-        device: &Device,
-    ) -> Result<TensorRef> {
-        MockTensorFactory.normal(shape, mean, std, dtype, device)
-    }
-
-    fn from_tensor(&self, tensor: &TensorRef, device: &Device) -> Result<TensorRef> {
-        MockTensorFactory.from_tensor(tensor, device)
-    }
-}
-
-#[tokio::test]
-async fn process_batch_unified_forwards_prefill_logits_policy() {
-    let mut config = EngineConfig::default();
-    config.kv_cache.max_blocks = 128;
-    let scheduler = Arc::new(ContinuousBatchScheduler::new(config.scheduler.clone()));
-    let tokenizer: Arc<dyn Tokenizer + Send + Sync> = Arc::new(PolicyTokenizer::new(
-        64,
-        &[("test", 5), ("ok", 6), ("<unk>", 2), ("<pad>", 4)],
-    ));
-    let sampler: Arc<dyn Sampler + Send + Sync> = Arc::new(crate::registry::GreedySampler);
-    let kv_cache: Arc<dyn KvCacheManager + Send + Sync> = Arc::new(MockKvCacheManager::new(128));
-    let tensor_factory: Arc<dyn TensorFactory> = Arc::new(MockTensorFactory);
-    let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
-    let executor: Arc<dyn ModelExecutor + Send + Sync> = Arc::new(CapturingUnifiedExecutor {
-        inner: MockModelExecutor::instant(64),
-        captured: captured.clone(),
-        output_token: 6,
-    });
-    let engine = ContinuousBatchEngine::new(
-        config,
-        scheduler,
-        tokenizer,
-        sampler,
-        kv_cache,
-        executor,
-        tensor_factory,
-    )
-    .expect("legacy engine composition must match executor authority");
-    let mut request = policy_request().with_prompt_token_evidence();
-    request.sampling_params.max_tokens = 1;
-
-    let response = engine.infer(request).await.unwrap();
-    assert_eq!(response.finish_reason, FinishReason::Length);
-    assert_eq!(
-        response
-            .execution_evidence
-            .expect("prompt-token evidence was explicitly requested")
-            .prompt_token_ids,
-        vec![TokenId::new(5)]
-    );
-
-    let captured = captured.lock().expect("capture mutex poisoned");
-    assert_eq!(captured.len(), 1);
-    assert_eq!(captured[0].len(), 1);
-    let item = &captured[0][0];
-    assert_eq!(item.q_len, 1);
-    assert_eq!(item.pos_offset, 0);
-    assert!(item.is_final_chunk);
-    let ferrum_execution::model_executor::LogitsReturnPolicy::GreedyArgmax {
-        token_mask: Some(mask),
-        repetition_penalty: None,
-    } = &item.logits_policy
-    else {
-        panic!("final product prefill should use model-side greedy argmax policy");
-    };
-    assert_eq!(mask.valid_token_mask[2], 0, "unk token must stay masked");
-    assert_eq!(
-        mask.valid_token_mask[6], 1,
-        "normal generated token must be selectable"
-    );
-}
-
-#[tokio::test]
-async fn process_batch_unified_honors_runtime_chunked_prefill() {
-    let mut config = EngineConfig::default();
-    config.kv_cache.max_blocks = 128;
-    config.runtime.chunked_prefill_size = Some(1);
-    let scheduler = Arc::new(ContinuousBatchScheduler::new(config.scheduler.clone()));
-    let tokenizer: Arc<dyn Tokenizer + Send + Sync> = Arc::new(PolicyTokenizer::new(
-        64,
-        &[("test", 5), ("ok", 6), ("<unk>", 2), ("<pad>", 4)],
-    ));
-    let sampler: Arc<dyn Sampler + Send + Sync> = Arc::new(crate::registry::GreedySampler);
-    let kv_cache: Arc<dyn KvCacheManager + Send + Sync> = Arc::new(MockKvCacheManager::new(128));
-    let tensor_factory: Arc<dyn TensorFactory> = Arc::new(MockTensorFactory);
-    let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
-    let executor: Arc<dyn ModelExecutor + Send + Sync> = Arc::new(CapturingUnifiedExecutor {
-        inner: MockModelExecutor::instant(64),
-        captured: captured.clone(),
-        output_token: 6,
-    });
-    let engine = ContinuousBatchEngine::new(
-        config,
-        scheduler,
-        tokenizer,
-        sampler,
-        kv_cache,
-        executor,
-        tensor_factory,
-    )
-    .expect("legacy engine composition must match executor authority");
-    let mut request = policy_request();
-    request.prompt = "test ok".to_string();
-    request.sampling_params.max_tokens = 1;
-
-    let response = engine.infer(request).await.unwrap();
-    assert_eq!(response.finish_reason, FinishReason::Length);
-
-    let captured = captured.lock().expect("capture mutex poisoned");
-    assert_eq!(captured.len(), 2);
-    assert_eq!(captured[0].len(), 1);
-    assert_eq!(captured[0][0].q_len, 1);
-    assert_eq!(captured[0][0].pos_offset, 0);
-    assert!(!captured[0][0].is_final_chunk);
-    assert_eq!(captured[1].len(), 1);
-    assert_eq!(captured[1][0].q_len, 1);
-    assert_eq!(captured[1][0].pos_offset, 1);
-    assert!(captured[1][0].is_final_chunk);
-}
-
-#[tokio::test]
-async fn process_batch_unified_co_batches_active_decode_with_fresh_prefill_chunk() {
-    let mut config = EngineConfig::default();
-    config.kv_cache.max_blocks = 128;
-    config.runtime.chunked_prefill_size = Some(1);
-    let scheduler = Arc::new(ContinuousBatchScheduler::new(config.scheduler.clone()));
-    let tokenizer: Arc<dyn Tokenizer + Send + Sync> = Arc::new(PolicyTokenizer::new(
-        64,
-        &[("test", 5), ("ok", 6), ("<unk>", 2), ("<pad>", 4)],
-    ));
-    let sampler: Arc<dyn Sampler + Send + Sync> = Arc::new(crate::registry::GreedySampler);
-    let kv_cache: Arc<dyn KvCacheManager + Send + Sync> = Arc::new(MockKvCacheManager::new(128));
-    let tensor_factory: Arc<dyn TensorFactory> = Arc::new(MockTensorFactory);
-    let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
-    let executor: Arc<dyn ModelExecutor + Send + Sync> = Arc::new(CapturingUnifiedExecutor {
-        inner: MockModelExecutor::instant(64),
-        captured: captured.clone(),
-        output_token: 6,
-    });
-    let engine = ContinuousBatchEngine::new(
-        config,
-        scheduler,
-        tokenizer.clone(),
-        sampler,
-        kv_cache,
-        executor,
-        tensor_factory,
-    )
-    .expect("legacy engine composition must match executor authority");
-
-    let mut decode_request = policy_request();
-    decode_request.prompt = "test".to_string();
-    decode_request.sampling_params.max_tokens = 3;
-    let decode_id = decode_request.id.clone();
-    let decode_kv = engine
-        .inner
-        .make_model_kv_handle_with_seq("decode-cache".to_string(), 2);
-    let mut decode_seq = SequenceState::new_with_tokenizer_and_model_vocab_size(
-        decode_request.clone(),
-        vec![TokenId::new(5)],
-        Some(tokenizer.clone()),
-        Some(64),
-    );
-    decode_seq.generated_tokens.push(TokenId::new(6));
-    decode_seq.prefill_complete = true;
-    decode_seq.prefill_tokens_processed = 1;
-    decode_seq.install_runtime_managed_model_kv(decode_kv);
-    decode_seq.phase = RequestPhase::Decoding;
-    {
-        let mut sequences = engine.inner.sequences.write();
-        sequences.insert(decode_id.clone(), decode_seq);
-    }
-
-    let mut prefill_request = policy_request();
-    prefill_request.prompt = "test ok".to_string();
-    prefill_request.sampling_params.max_tokens = 1;
-    let mut prefill_scheduled =
-        ferrum_interfaces::scheduler::ScheduledRequest::new(prefill_request);
-    prefill_scheduled.tokens_to_process = Some(1);
-    let mut decode_scheduled = ferrum_interfaces::scheduler::ScheduledRequest::new(decode_request);
-    decode_scheduled.tokens_to_process = Some(1);
-    let batch = ferrum_interfaces::BatchPlan {
-        batch_id: ferrum_types::BatchId::new(),
-        requests: vec![prefill_scheduled, decode_scheduled],
-        max_sequence_length: 2,
-        estimated_time_ms: None,
-        resource_requirements: ferrum_interfaces::scheduler::BatchResourceRequirements::default(),
-        created_at: chrono::Utc::now(),
-    };
-
-    engine
-        .inner
-        .process_batch_with_test_sequences(&batch)
-        .await
-        .unwrap();
-
-    let captured = captured.lock().expect("capture mutex poisoned");
-    assert_eq!(captured.len(), 1, "mixed work must use one unified call");
-    assert_eq!(captured[0].len(), 2);
-    let prefill = &captured[0][0];
-    assert_eq!(prefill.q_len, 1);
-    assert_eq!(prefill.pos_offset, 0);
-    assert!(
-        !prefill.is_final_chunk,
-        "fresh first chunk should stay non-final in the mixed batch"
-    );
-    assert_eq!(
-        prefill.admission_target_len, None,
-        "mixed non-final prefill chunk should reserve only immediate KV slots"
-    );
-    let decode = &captured[0][1];
-    assert_eq!(decode.q_len, 1);
-    assert_eq!(decode.pos_offset, 1);
-    assert!(decode.is_final_chunk);
-    assert_eq!(
-        decode.admission_target_len,
-        Some(2),
-        "decode metadata should keep its current-context admission target"
-    );
-}
-
 #[test]
 fn continuous_engine_runtime_config_parses_env_snapshot() {
     let cfg = ContinuousEngineRuntimeConfig::from_env_vars(
@@ -3433,11 +2103,8 @@ fn continuous_engine_runtime_config_parses_env_snapshot() {
             (CHUNKED_PREFILL_ENV, "128"),
             (KV_CAPACITY_ENV, "2048"),
             (MAX_MODEL_LEN_ENV, "4096"),
-            (NEXT_BATCH_PROF_ENV, "1"),
-            (RBD_PROF_ENV, "1"),
             ("FERRUM_PROFILE_JSONL", "/tmp/profile.jsonl"),
             ("FERRUM_SCHEDULER_TRACE_JSONL", "/tmp/scheduler-trace.jsonl"),
-            (UNIFIED_POST_PROF_ENV, "1"),
         ],
     );
 
@@ -3445,12 +2112,23 @@ fn continuous_engine_runtime_config_parses_env_snapshot() {
     assert!(cfg.batch_decode_prof);
     assert!(cfg.chunked_prefill_present);
     assert_eq!(cfg.chunked_prefill_size, Some(128));
-    assert_eq!(cfg.chunked_prefill_size_for(200), Some(128));
-    assert_eq!(cfg.chunked_prefill_size_for(128), None);
+    // This snapshot preserves resolved configuration. Chunk extent now comes
+    // from the scheduler's typed work and is tested at that execution boundary.
+    let mut typed = EngineConfig::default();
+    typed.scheduler.active_decode_prefill_chunk = Some(64);
+    typed.runtime.chunked_prefill_size = Some(128);
+    let resolved = ContinuousEngineRuntimeConfig::from_engine_config(&typed);
+    assert_eq!(
+        resolved.active_decode_prefill_chunk,
+        cfg.active_decode_prefill_chunk
+    );
+    assert_eq!(resolved.chunked_prefill_size, cfg.chunked_prefill_size);
+    assert_eq!(
+        resolved.chunked_prefill_present,
+        cfg.chunked_prefill_present
+    );
     assert_eq!(cfg.kv_capacity, Some(2048));
     assert_eq!(cfg.max_model_len, Some(4096));
-    assert!(cfg.next_batch_prof);
-    assert!(cfg.rbd_prof);
     assert_eq!(
         cfg.profile_jsonl.as_deref(),
         Some(std::path::Path::new("/tmp/profile.jsonl"))
@@ -3459,17 +2137,19 @@ fn continuous_engine_runtime_config_parses_env_snapshot() {
         cfg.scheduler_trace_jsonl.as_deref(),
         Some(std::path::Path::new("/tmp/scheduler-trace.jsonl"))
     );
-    assert!(cfg.unified_post_prof);
 }
 
 #[test]
 fn continuous_engine_runtime_config_keeps_invalid_chunk_presence() {
-    let cfg =
-        ContinuousEngineRuntimeConfig::from_env_vars(None, [(CHUNKED_PREFILL_ENV, "invalid")]);
-
-    assert!(cfg.chunked_prefill_present);
-    assert_eq!(cfg.chunked_prefill_size, None);
-    assert_eq!(cfg.chunked_prefill_size_for(200), None);
+    for value in ["invalid", "", "0"] {
+        let cfg =
+            ContinuousEngineRuntimeConfig::from_env_vars(None, [(CHUNKED_PREFILL_ENV, value)]);
+        assert!(cfg.chunked_prefill_present);
+        assert_eq!(cfg.chunked_prefill_size, None);
+    }
+    let absent = ContinuousEngineRuntimeConfig::from_env_vars(None, [] as [(&str, &str); 0]);
+    assert!(!absent.chunked_prefill_present);
+    assert_eq!(absent.chunked_prefill_size, None);
 }
 
 #[test]
@@ -3479,39 +2159,35 @@ fn performance_breakdown_reports_engine_timing_counters() {
     let tokenizer: Arc<dyn Tokenizer + Send + Sync> =
         Arc::new(ferrum_testkit::MockTokenizer::new(128));
     let sampler: Arc<dyn Sampler + Send + Sync> = Arc::new(ferrum_testkit::MockSampler);
-    let kv_cache: Arc<dyn KvCacheManager + Send + Sync> =
-        Arc::new(ferrum_testkit::MockKvCacheManager::new(256));
-    let tensor_factory: Arc<dyn TensorFactory> = Arc::new(ferrum_testkit::MockTensorFactory);
-    let model_executor: Arc<dyn ModelExecutor + Send + Sync> =
-        Arc::new(ferrum_testkit::MockModelExecutor::instant(128));
-    let engine = ContinuousBatchEngine::new(
-        config,
-        scheduler,
-        tokenizer,
-        sampler,
-        kv_cache,
-        model_executor,
-        tensor_factory,
-    )
-    .expect("legacy engine composition must match executor authority");
+
+    let model_executor =
+        ExecutorOwner::new(Box::new(ferrum_testkit::MockModelExecutor::instant(128)));
+    let engine = ContinuousBatchEngine::new(config, scheduler, tokenizer, sampler, model_executor)
+        .expect("legacy engine composition must match executor authority");
 
     engine
-        .inner
+        .active_inner()
+        .expect("engine execution is open")
         .record_scheduling_time(Duration::from_micros(1500));
     engine
-        .inner
+        .active_inner()
+        .expect("engine execution is open")
         .record_scheduling_time(Duration::from_micros(2500));
     engine
-        .inner
+        .active_inner()
+        .expect("engine execution is open")
         .record_model_execution_time(Duration::from_micros(10_000));
     engine
-        .inner
+        .active_inner()
+        .expect("engine execution is open")
         .record_model_execution_time(Duration::from_micros(14_000));
     engine
-        .inner
+        .active_inner()
+        .expect("engine execution is open")
         .record_iteration_lock_wait(Duration::from_micros(300));
     engine
-        .inner
+        .active_inner()
+        .expect("engine execution is open")
         .record_iteration_lock_wait(Duration::from_micros(700));
 
     let breakdown = engine.metrics().performance_breakdown;
@@ -3526,25 +2202,14 @@ fn test_continuous_engine() -> ContinuousBatchEngine {
 
 fn test_continuous_engine_with_config(config: EngineConfig) -> ContinuousBatchEngine {
     let scheduler = Arc::new(ContinuousBatchScheduler::new(config.scheduler.clone()));
-    let tokenizer: Arc<dyn Tokenizer + Send + Sync> =
-        Arc::new(ferrum_testkit::MockTokenizer::new(128));
-    let sampler: Arc<dyn Sampler + Send + Sync> = Arc::new(ferrum_testkit::MockSampler);
-    let kv_cache: Arc<dyn KvCacheManager + Send + Sync> =
-        Arc::new(ferrum_testkit::MockKvCacheManager::new(256));
-    let tensor_factory: Arc<dyn TensorFactory> = Arc::new(ferrum_testkit::MockTensorFactory);
-    let model_executor: Arc<dyn ModelExecutor + Send + Sync> =
-        Arc::new(ferrum_testkit::MockModelExecutor::instant(128));
-
     ContinuousBatchEngine::new(
         config,
         scheduler,
-        tokenizer,
-        sampler,
-        kv_cache,
-        model_executor,
-        tensor_factory,
+        Arc::new(ferrum_testkit::MockTokenizer::new(128)),
+        Arc::new(ferrum_testkit::MockSampler),
+        ExecutorOwner::new(Box::new(PlanRuntimeAdmissionTestExecutor::new(128))),
     )
-    .expect("legacy engine composition must match executor authority")
+    .unwrap()
 }
 
 #[test]
@@ -3563,11 +2228,60 @@ fn product_profile_path_constructs_a_vnext_execution_journal() {
 
     let engine = test_continuous_engine_with_config(config);
 
-    assert!(engine.inner.profile_trace_jsonl.is_some());
-    assert!(engine.inner.scheduler_trace_jsonl.is_none());
+    assert!(engine
+        .active_inner()
+        .expect("engine execution is open")
+        .profile_trace_journal()
+        .is_some());
+    assert!(engine
+        .active_inner()
+        .expect("engine execution is open")
+        .scheduler_trace_jsonl
+        .is_none());
     assert!(trace_path.exists());
     drop(engine);
     let _ = std::fs::remove_file(trace_path);
+}
+
+#[test]
+fn profile_journal_budget_reaches_profile_scheduler_and_legacy_writers() {
+    let directory = tempfile::tempdir().unwrap();
+    let paths = ["profile.jsonl", "scheduler.jsonl", "legacy.jsonl"]
+        .map(|name| directory.path().join(name));
+    let mut config = EngineConfig::default();
+    config.runtime.profile_journal.queue_capacity = 2;
+    config.runtime.profile_journal.max_batch_records = 2048;
+    let expected: ferrum_journal::JsonlJournalConfig = config.runtime.profile_journal.into();
+    config.runtime.profile_jsonl = Some(paths[0].clone());
+    config.runtime.scheduler_trace_jsonl = Some(paths[1].clone());
+    config.runtime.legacy_scheduler_trace_jsonl = Some(paths[2].clone());
+    let engine = test_continuous_engine_with_config(config);
+    assert!(engine
+        .active_inner()
+        .expect("engine execution is open")
+        .profile_trace_journal()
+        .is_some());
+    assert!(engine
+        .active_inner()
+        .expect("engine execution is open")
+        .scheduler_trace_jsonl
+        .is_some());
+    assert!(engine
+        .active_inner()
+        .expect("engine execution is open")
+        .legacy_scheduler_trace_jsonl
+        .is_some());
+    for path in &paths {
+        let original = engine
+            .active_inner()
+            .expect("engine execution is open")
+            .journal_scopes
+            .lock()
+            .producer::<serde_json::Value>(path)
+            .unwrap();
+        assert_eq!(original.config(), expected);
+    }
+    drop(engine);
 }
 
 #[tokio::test]
@@ -3582,9 +2296,17 @@ async fn idle_background_loop_parks_and_new_work_resumes_it() {
 
     let parked_iteration = tokio::time::timeout(Duration::from_secs(1), async {
         loop {
-            let before = engine.inner.iteration_count.load(Ordering::Acquire);
+            let before = engine
+                .active_inner()
+                .expect("engine execution is open")
+                .iteration_count
+                .load(Ordering::Acquire);
             tokio::time::sleep(Duration::from_millis(10)).await;
-            let after = engine.inner.iteration_count.load(Ordering::Acquire);
+            let after = engine
+                .active_inner()
+                .expect("engine execution is open")
+                .iteration_count
+                .load(Ordering::Acquire);
             if before == after {
                 break after;
             }
@@ -3594,7 +2316,11 @@ async fn idle_background_loop_parks_and_new_work_resumes_it() {
     .expect("background loop must reach its idle wait");
     tokio::time::sleep(Duration::from_millis(20)).await;
     assert_eq!(
-        engine.inner.iteration_count.load(Ordering::Acquire),
+        engine
+            .active_inner()
+            .expect("engine execution is open")
+            .iteration_count
+            .load(Ordering::Acquire),
         parked_iteration,
         "an idle engine must not poll for work"
     );
@@ -3605,16 +2331,29 @@ async fn idle_background_loop_parks_and_new_work_resumes_it() {
         .await
         .expect("new work must wake the parked background loop")
         .unwrap();
-    assert!(engine.inner.iteration_count.load(Ordering::Acquire) > parked_iteration);
+    assert!(
+        engine
+            .active_inner()
+            .expect("engine execution is open")
+            .iteration_count
+            .load(Ordering::Acquire)
+            > parked_iteration
+    );
     engine.shutdown().await.unwrap();
 }
 
 #[tokio::test]
 async fn shutdown_wakes_an_idle_background_loop() {
     let engine = test_continuous_engine();
-    let background = engine.start_loop();
+    let background = engine.start_loop().unwrap();
     tokio::time::timeout(Duration::from_secs(1), async {
-        while engine.inner.iteration_count.load(Ordering::Acquire) == 0 {
+        while engine
+            .active_inner()
+            .expect("engine execution is open")
+            .iteration_count
+            .load(Ordering::Acquire)
+            == 0
+        {
             tokio::task::yield_now().await;
         }
     })
@@ -3622,9 +2361,10 @@ async fn shutdown_wakes_an_idle_background_loop() {
     .expect("background loop must enter one idle iteration");
 
     engine.shutdown().await.unwrap();
-    tokio::time::timeout(Duration::from_secs(1), background)
+    tokio::time::timeout(Duration::from_secs(1), background.wait())
         .await
         .expect("shutdown must wake the idle loop")
+        .result()
         .expect("background loop must not panic");
 }
 
@@ -3632,22 +2372,34 @@ async fn shutdown_wakes_an_idle_background_loop() {
 async fn shutdown_signal_retains_wakes_before_wait_registration() {
     let engine = test_continuous_engine();
 
-    engine.inner.signal_shutdown();
+    let observer = engine
+        .driver
+        .shutdown(&engine.active_inner().expect("engine execution is open"))
+        .unwrap();
 
-    assert!(engine.inner.shutdown_started.load(Ordering::Acquire));
-    assert!(!engine.inner.is_running.load(Ordering::SeqCst));
+    assert!(engine.driver.is_closing());
+    assert!(!engine.driver.is_running());
     tokio::time::timeout(
         Duration::from_millis(100),
-        engine.inner.shutdown_notify.notified(),
+        engine
+            .active_inner()
+            .expect("engine execution is open")
+            .shutdown_notify
+            .notified(),
     )
     .await
     .expect("shutdown wake must survive registration after the signal");
     tokio::time::timeout(
         Duration::from_millis(100),
-        engine.inner.work_notify.notified(),
+        engine
+            .active_inner()
+            .expect("engine execution is open")
+            .work_notify
+            .notified(),
     )
     .await
     .expect("work wake must survive registration after the signal");
+    observer.wait().await.result().unwrap();
 }
 
 #[tokio::test]
@@ -3665,72 +2417,76 @@ async fn process_batch_rejects_a_scheduler_item_without_published_sequence_state
     };
 
     let error = engine
-        .inner
+        .active_inner()
+        .expect("engine execution is open")
         .process_batch(&batch)
         .await
         .expect_err("batch processing must not create a second tokenized request state");
 
-    assert!(error
-        .to_string()
-        .contains("without atomically published sequence state"));
-    assert!(!engine.inner.sequences.read().contains_key(&request_id));
+    assert!(matches!(error, FerrumError::Internal { .. }));
+    assert!(engine
+        .active_inner()
+        .expect("engine execution is open")
+        .sequences
+        .get(&request_id)
+        .is_none());
+    assert_eq!(
+        engine
+            .active_inner()
+            .expect("engine execution is open")
+            .execution_closes
+            .unreclaimed_count(),
+        0
+    );
+}
+
+#[tokio::test]
+async fn owner_memory_unknown_preserves_engine_readiness_and_shutdown() {
+    let engine = ContinuousBatchEngine::new(
+        EngineConfig::default(),
+        Arc::new(ContinuousBatchScheduler::new(Default::default())),
+        Arc::new(ferrum_testkit::MockTokenizer::new(128)),
+        Arc::new(ferrum_testkit::MockSampler),
+        ExecutorOwner::new(Box::new(MockModelExecutor::instant(128))),
+    )
+    .unwrap();
+    let observer = engine.start_loop().unwrap();
+    let status = engine.status().await;
+    assert!(status.is_ready);
+    assert!(matches!(
+        status.memory_usage,
+        ferrum_types::MemoryObservation::Unknown
+    ));
+    engine.shutdown().await.unwrap();
+    engine.wait_for_shutdown_completion().await.unwrap();
+    observer.wait().await.result().unwrap();
+    let status = engine.status().await;
+    assert!(!status.is_ready);
+    assert!(matches!(
+        status.memory_usage,
+        ferrum_types::MemoryObservation::Unknown
+    ));
 }
 
 #[test]
-fn resource_composition_mismatch_is_a_configuration_error() {
+fn public_engine_planning_model_reports_the_original_executor_contract() {
     let config = EngineConfig::default();
-    let scheduler = Arc::new(ContinuousBatchScheduler::new(config.scheduler.clone()));
-    let tokenizer: Arc<dyn Tokenizer + Send + Sync> =
-        Arc::new(ferrum_testkit::MockTokenizer::new(128));
-    let sampler: Arc<dyn Sampler + Send + Sync> = Arc::new(ferrum_testkit::MockSampler);
-    let tensor_factory: Arc<dyn TensorFactory> = Arc::new(MockTensorFactory);
-
-    let legacy_executor: Arc<dyn ModelExecutor + Send + Sync> =
-        Arc::new(MockModelExecutor::instant(128));
-    let plan_runtime_error = ContinuousBatchEngine::new_plan_runtime(
+    let legacy = ContinuousBatchEngine::new(
         config.clone(),
-        Arc::clone(&scheduler),
-        Arc::clone(&tokenizer),
-        Arc::clone(&sampler),
-        legacy_executor,
-        Arc::clone(&tensor_factory),
+        Arc::new(ContinuousBatchScheduler::new(config.scheduler)),
+        Arc::new(ferrum_testkit::MockTokenizer::new(128)),
+        Arc::new(ferrum_testkit::MockSampler),
+        ExecutorOwner::new(Box::new(MockModelExecutor::instant(128))),
     )
-    .err()
-    .expect("legacy executor must not enter a plan-runtime composition");
-    assert!(plan_runtime_error
-        .to_string()
-        .contains("does not match executor authority"));
-
-    let kv_cache: Arc<dyn KvCacheManager + Send + Sync> = Arc::new(MockKvCacheManager::new(128));
-    let plan_runtime_executor: Arc<dyn ModelExecutor + Send + Sync> =
-        Arc::new(PlanRuntimeAdmissionTestExecutor::new(128));
-    let legacy_error = ContinuousBatchEngine::new(
-        config,
-        scheduler,
-        tokenizer,
-        sampler,
-        kv_cache,
-        plan_runtime_executor,
-        tensor_factory,
-    )
-    .err()
-    .expect("plan-runtime executor must not enter a legacy composition");
-    assert!(legacy_error
-        .to_string()
-        .contains("does not match executor authority"));
-}
-
-#[test]
-fn public_engine_authority_reports_validated_resource_composition() {
-    let legacy = test_continuous_engine();
+    .unwrap();
     let (native, _, _, _) =
         plan_runtime_batch_decode_test_engine(PlanRuntimeBatchDecodeBehavior::Exact);
     for (engine, expected) in [
-        (&legacy, ExecutionResourceAuthority::LegacyEngine),
-        (&native, ExecutionResourceAuthority::PlanRuntime),
+        (&legacy, ExecutionPlanningModel::ExecutorManaged),
+        (&native, ExecutionPlanningModel::CompiledPlan),
     ] {
         let engine: &dyn LlmInferenceEngine = engine;
-        assert_eq!(engine.execution_resource_authority(), expected);
+        assert_eq!(engine.execution_planning_model(), expected);
     }
 }
 
@@ -3739,7 +2495,7 @@ fn plan_runtime_batch_decode_test_engine(
 ) -> (
     ContinuousBatchEngine,
     Arc<ContinuousBatchScheduler>,
-    Arc<PlanRuntimeBatchDecodeTestExecutor>,
+    Arc<PlanRuntimeBatchDecodeObservation>,
     Arc<dyn Tokenizer + Send + Sync>,
 ) {
     plan_runtime_batch_decode_test_engine_with_trace(behavior, None)
@@ -3750,54 +2506,17 @@ fn plan_runtime_batch_decode_profile_test_engine(
 ) -> (
     ContinuousBatchEngine,
     Arc<ContinuousBatchScheduler>,
-    Arc<PlanRuntimeBatchDecodeTestExecutor>,
+    Arc<PlanRuntimeBatchDecodeObservation>,
     Arc<dyn Tokenizer + Send + Sync>,
 ) {
-    let (mut engine, scheduler, executor, tokenizer) =
-        plan_runtime_batch_decode_test_engine(PlanRuntimeBatchDecodeBehavior::Exact);
-    Arc::get_mut(&mut engine.inner)
-        .expect("new test engine must have one inner owner")
-        .config
-        .runtime
-        .profile_detail = profile_detail;
-    (engine, scheduler, executor, tokenizer)
-}
-
-fn plan_runtime_batch_decode_test_engine_with_stage(
-    behavior: PlanRuntimeBatchDecodeBehavior,
-    capacity_stage: ExecutorExecutionCapacityStage,
-) -> (
-    ContinuousBatchEngine,
-    Arc<ContinuousBatchScheduler>,
-    Arc<PlanRuntimeBatchDecodeTestExecutor>,
-    Arc<dyn Tokenizer + Send + Sync>,
-) {
-    plan_runtime_batch_decode_test_engine_with_trace_factory_and_stage(
-        behavior,
+    let mut config = plan_runtime_test_config(None);
+    config.runtime.profile_detail = profile_detail;
+    let executor = PlanRuntimeBatchDecodeTestExecutor::with_capacity_stage_transition(
+        PlanRuntimeBatchDecodeBehavior::Exact,
+        ExecutorExecutionCapacityStage::StepAdmission,
         None,
-        Arc::new(MockTensorFactory),
-        capacity_stage,
-        None,
-    )
-}
-
-fn plan_runtime_batch_decode_test_engine_with_stage_transition(
-    behavior: PlanRuntimeBatchDecodeBehavior,
-    capacity_stage: ExecutorExecutionCapacityStage,
-    capacity_stage_after_first_call: ExecutorExecutionCapacityStage,
-) -> (
-    ContinuousBatchEngine,
-    Arc<ContinuousBatchScheduler>,
-    Arc<PlanRuntimeBatchDecodeTestExecutor>,
-    Arc<dyn Tokenizer + Send + Sync>,
-) {
-    plan_runtime_batch_decode_test_engine_with_trace_factory_and_stage(
-        behavior,
-        None,
-        Arc::new(MockTensorFactory),
-        capacity_stage,
-        Some(capacity_stage_after_first_call),
-    )
+    );
+    plan_runtime_test_engine(config, executor)
 }
 
 fn plan_runtime_batch_decode_test_engine_with_trace(
@@ -3806,79 +2525,93 @@ fn plan_runtime_batch_decode_test_engine_with_trace(
 ) -> (
     ContinuousBatchEngine,
     Arc<ContinuousBatchScheduler>,
-    Arc<PlanRuntimeBatchDecodeTestExecutor>,
+    Arc<PlanRuntimeBatchDecodeObservation>,
     Arc<dyn Tokenizer + Send + Sync>,
 ) {
-    plan_runtime_batch_decode_test_engine_with_trace_and_factory(
+    plan_runtime_batch_decode_test_engine_with_trace_and_stage(
         behavior,
         trace_path,
-        Arc::new(MockTensorFactory),
-    )
-}
-
-fn plan_runtime_batch_decode_test_engine_with_trace_and_factory(
-    behavior: PlanRuntimeBatchDecodeBehavior,
-    trace_path: Option<PathBuf>,
-    tensor_factory: Arc<dyn TensorFactory>,
-) -> (
-    ContinuousBatchEngine,
-    Arc<ContinuousBatchScheduler>,
-    Arc<PlanRuntimeBatchDecodeTestExecutor>,
-    Arc<dyn Tokenizer + Send + Sync>,
-) {
-    plan_runtime_batch_decode_test_engine_with_trace_factory_and_stage(
-        behavior,
-        trace_path,
-        tensor_factory,
         ExecutorExecutionCapacityStage::StepAdmission,
         None,
     )
 }
 
-fn plan_runtime_batch_decode_test_engine_with_trace_factory_and_stage(
+fn plan_runtime_batch_decode_test_engine_with_trace_and_stage(
     behavior: PlanRuntimeBatchDecodeBehavior,
     trace_path: Option<PathBuf>,
-    tensor_factory: Arc<dyn TensorFactory>,
+
     capacity_stage: ExecutorExecutionCapacityStage,
     capacity_stage_after_first_call: Option<ExecutorExecutionCapacityStage>,
 ) -> (
     ContinuousBatchEngine,
     Arc<ContinuousBatchScheduler>,
-    Arc<PlanRuntimeBatchDecodeTestExecutor>,
+    Arc<PlanRuntimeBatchDecodeObservation>,
     Arc<dyn Tokenizer + Send + Sync>,
 ) {
+    let executor = PlanRuntimeBatchDecodeTestExecutor::with_capacity_stage_transition(
+        behavior,
+        capacity_stage,
+        capacity_stage_after_first_call,
+    );
+    plan_runtime_test_engine(plan_runtime_test_config(trace_path), executor)
+}
+
+fn plan_runtime_test_config(trace_path: Option<PathBuf>) -> EngineConfig {
     let mut config = EngineConfig::default();
     config.kv_cache.max_blocks = 128;
     config.runtime.scheduler_trace_jsonl = trace_path;
     config.runtime.profile_entrypoint = Some(ProfileEntrypoint::Synthetic);
+    config
+}
+
+fn plan_runtime_test_engine<E: ObservedTestExecutor>(
+    config: EngineConfig,
+    executor: E,
+) -> (
+    ContinuousBatchEngine,
+    Arc<ContinuousBatchScheduler>,
+    Arc<E::Observation>,
+    Arc<dyn Tokenizer + Send + Sync>,
+) {
+    plan_runtime_test_engine_observed(config, executor, None)
+}
+
+fn plan_runtime_test_engine_observed<E: ObservedTestExecutor>(
+    config: EngineConfig,
+    executor: E,
+
+    observer: Option<Arc<dyn ExecutionAttemptObserver>>,
+) -> (
+    ContinuousBatchEngine,
+    Arc<ContinuousBatchScheduler>,
+    Arc<E::Observation>,
+    Arc<dyn Tokenizer + Send + Sync>,
+) {
+    let observation = executor.observer();
+    let executor_owner = ExecutorOwner::new(Box::new(executor));
     let scheduler = Arc::new(ContinuousBatchScheduler::new(config.scheduler.clone()));
     let tokenizer: Arc<dyn Tokenizer + Send + Sync> =
         Arc::new(PolicyTokenizer::new(64, &[("test", 5), ("ok", 6)]));
     let sampler: Arc<dyn Sampler + Send + Sync> = Arc::new(crate::registry::GreedySampler);
-    let executor = Arc::new(
-        PlanRuntimeBatchDecodeTestExecutor::with_capacity_stage_transition(
-            behavior,
-            capacity_stage,
-            capacity_stage_after_first_call,
-        ),
-    );
-    let engine = ContinuousBatchEngine::new_plan_runtime(
+    let engine = ContinuousBatchEngine::new_observed(
         config,
         scheduler.clone(),
         tokenizer.clone(),
         sampler,
-        executor.clone(),
-        tensor_factory,
+        executor_owner,
+        None,
+        observer,
+        None,
     )
     .unwrap();
-    (engine, scheduler, executor, tokenizer)
+    (engine, scheduler, observation, tokenizer)
 }
 
 async fn install_plan_runtime_decode_cohort(
     engine: &ContinuousBatchEngine,
     scheduler: &ContinuousBatchScheduler,
     tokenizer: Arc<dyn Tokenizer + Send + Sync>,
-) -> (Vec<RequestId>, Vec<TokenId>, Vec<String>) {
+) -> (Vec<RequestId>, Vec<TokenId>, Vec<ExecutorSequence>) {
     install_plan_runtime_decode_frontiers(engine, scheduler, tokenizer, &["test", "ok"]).await
 }
 
@@ -3887,8 +2620,8 @@ async fn install_plan_runtime_decode_frontiers(
     scheduler: &ContinuousBatchScheduler,
     tokenizer: Arc<dyn Tokenizer + Send + Sync>,
     prompts: &[&str],
-) -> (Vec<RequestId>, Vec<TokenId>, Vec<String>) {
-    let mut requests = Vec::new();
+) -> (Vec<RequestId>, Vec<TokenId>, Vec<ExecutorSequence>) {
+    let mut ids = Vec::new();
     for prompt in prompts {
         let mut request = policy_request();
         request.prompt = (*prompt).to_string();
@@ -3896,47 +2629,87 @@ async fn install_plan_runtime_decode_frontiers(
         request
             .metadata
             .insert(PROMPT_TOKENS_METADATA_KEY.to_string(), serde_json::json!(1));
-        scheduler.submit(request.clone()).await.unwrap();
-        requests.push(request);
-    }
-    let initial_batch = scheduler
-        .next_batch(ferrum_interfaces::BatchHint::simple(prompts.len().max(1)))
-        .await
-        .expect("decode cohort should first be scheduled as prefill");
-    assert_eq!(initial_batch.requests.len(), requests.len());
-
-    let mut request_ids = Vec::with_capacity(requests.len());
-    let mut initial_tokens = Vec::with_capacity(requests.len());
-    let mut cache_ids = Vec::with_capacity(requests.len());
-    for (index, request) in requests.into_iter().enumerate() {
-        let request_id = request.id.clone();
-        let token = TokenId::new(5 + index as u32);
-        let cache_id = format!("plan-runtime-batch-cache-{index}");
-        scheduler.mark_prefill_complete(&request_id, 1);
-        let kv_cache = engine
-            .inner
-            .make_model_kv_handle_with_seq(cache_id.clone(), 1);
+        let tokens = tokenizer.encode(prompt, true).unwrap();
+        assert_eq!(tokens.len(), 1);
         let mut sequence = SequenceState::new_with_tokenizer_and_model_vocab_size(
-            request,
-            vec![token],
+            request.clone(),
+            tokens.clone(),
             Some(tokenizer.clone()),
             Some(64),
         );
-        sequence.generated_tokens.push(token);
-        sequence.prefill_complete = true;
-        sequence.prefill_tokens_processed = 1;
-        sequence.install_runtime_managed_model_kv(kv_cache);
-        sequence.phase = RequestPhase::Decoding;
+        let TokenAdmissionOutcome::Admitted(frontier) = engine
+            .active_inner()
+            .expect("engine execution is open")
+            .model_executor
+            .admit_tokens(ExecutionAdmission {
+                context: ExecutorPrefillAdmission::for_product_request(
+                    &request.id,
+                    &tokens,
+                    sequence.model_maximum_sequence_tokens(),
+                    tokens.len(),
+                    0,
+                )
+                .unwrap(),
+                adapter: None,
+            })
+            .await
+            .unwrap()
+        else {
+            panic!("controlled cohort admission must succeed");
+        };
+        sequence.execution_frontier = Some(frontier);
+        ids.push(request.id.clone());
         engine
-            .inner
+            .active_inner()
+            .expect("engine execution is open")
             .sequences
-            .write()
-            .insert(request_id.clone(), sequence);
-        request_ids.push(request_id);
-        initial_tokens.push(token);
-        cache_ids.push(cache_id);
+            .insert(request.id.clone(), sequence);
+        scheduler.submit(request).await.unwrap();
     }
-    (request_ids, initial_tokens, cache_ids)
+    let batch = scheduler
+        .next_batch(ferrum_interfaces::BatchHint::simple(prompts.len().max(1)))
+        .await
+        .unwrap();
+    assert_eq!(batch.requests.len(), ids.len());
+    engine
+        .active_inner()
+        .expect("engine execution is open")
+        .process_batch(&batch)
+        .await
+        .unwrap();
+    let sequences = &engine
+        .active_inner()
+        .expect("engine execution is open")
+        .sequences;
+    let initial = ids
+        .iter()
+        .map(|id| {
+            sequences
+                .get(id)
+                .unwrap()
+                .lock()
+                .as_ref()
+                .unwrap()
+                .generated_tokens[0]
+        })
+        .collect();
+    let identities = ids
+        .iter()
+        .map(|id| {
+            let frontier = sequences
+                .get(id)
+                .unwrap()
+                .lock()
+                .as_ref()
+                .unwrap()
+                .execution_frontier
+                .clone()
+                .unwrap();
+            assert_eq!(frontier.consumed_tokens(), 1);
+            frontier.sequence().clone()
+        })
+        .collect();
+    (ids, initial, identities)
 }
 
 async fn install_profiled_plan_runtime_decode_frontier(
@@ -3945,332 +2718,143 @@ async fn install_profiled_plan_runtime_decode_frontier(
     tokenizer: Arc<dyn Tokenizer + Send + Sync>,
 ) -> RequestId {
     let mut request = policy_request();
-    request.prompt = "test".to_string();
+    request.prompt = "test".to_owned();
     request.sampling_params.max_tokens = 4;
     request.evidence_request.capture_engine_token_timing = true;
     request
         .metadata
-        .insert(PROMPT_TOKENS_METADATA_KEY.to_string(), serde_json::json!(1));
-    let request_id = request.id.clone();
-    scheduler.submit(request.clone()).await.unwrap();
-    let initial_batch = scheduler
-        .next_batch(ferrum_interfaces::BatchHint::simple(1))
-        .await
-        .expect("profiled decode request must first schedule as prefill");
-    assert_eq!(initial_batch.requests.len(), 1);
-    scheduler.mark_prefill_complete(&request_id, 1);
-
-    let token = TokenId::new(5);
-    let kv_cache = engine
-        .inner
-        .make_model_kv_handle_with_seq("profiled-plan-runtime-cache".to_string(), 1);
+        .insert(PROMPT_TOKENS_METADATA_KEY.to_owned(), serde_json::json!(1));
+    let id = request.id.clone();
+    let tokens = vec![TokenId(5)];
     let mut sequence = SequenceState::new_with_tokenizer_and_model_vocab_size(
-        request,
-        vec![token],
+        request.clone(),
+        tokens.clone(),
         Some(tokenizer),
         Some(64),
     );
-    sequence.prefill_complete = true;
-    sequence.prefill_tokens_processed = 1;
-    sequence.install_runtime_managed_model_kv(kv_cache);
-    sequence.phase = RequestPhase::Decoding;
-    sequence.record_decode_ready();
-    sequence.generated_tokens.push(token);
-    sequence.record_generated_token_commit();
+    let TokenAdmissionOutcome::Admitted(frontier) = engine
+        .active_inner()
+        .expect("engine execution is open")
+        .model_executor
+        .admit_tokens(ExecutionAdmission {
+            context: ExecutorPrefillAdmission::for_product_request(
+                &id,
+                &tokens,
+                sequence.model_maximum_sequence_tokens(),
+                tokens.len(),
+                0,
+            )
+            .unwrap(),
+            adapter: None,
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("controlled profile admission must succeed");
+    };
+    sequence.execution_frontier = Some(frontier);
     engine
-        .inner
+        .active_inner()
+        .expect("engine execution is open")
         .sequences
-        .write()
-        .insert(request_id.clone(), sequence);
-    request_id
+        .insert(id.clone(), sequence);
+    scheduler.submit(request).await.unwrap();
+    let batch = scheduler
+        .next_batch(ferrum_interfaces::BatchHint::simple(1))
+        .await
+        .unwrap();
+    assert_eq!(batch.requests.len(), 1);
+    engine
+        .active_inner()
+        .expect("engine execution is open")
+        .process_batch(&batch)
+        .await
+        .unwrap();
+    id
 }
 
 #[tokio::test]
-async fn plan_runtime_lone_decode_self_recompute_releases_exact_cache_before_requeue() {
-    let trace_path = resource_trace_temp_path("plan-runtime-self-recompute");
-    let _ = std::fs::remove_file(&trace_path);
-    let (engine, scheduler, executor, tokenizer) = plan_runtime_batch_decode_test_engine_with_trace(
-        PlanRuntimeBatchDecodeBehavior::Exact,
-        Some(trace_path.clone()),
-    );
-    let (request_ids, initial_tokens, _cache_ids) =
+async fn token_lone_decode_self_recompute_releases_exact_incarnation_before_requeue() {
+    let (engine, scheduler, executor, tokenizer) =
+        plan_runtime_batch_decode_test_engine(PlanRuntimeBatchDecodeBehavior::Exact);
+    let (ids, initial_tokens, incarnations) =
         install_plan_runtime_decode_frontiers(&engine, &scheduler, tokenizer, &["test"]).await;
-    let request_id = request_ids[0].clone();
-    let source = ferrum_runtime::CapacityAvailabilitySource::ActiveSequenceSlots;
-    let availability = [ferrum_runtime::CapacityAvailabilityEpoch::new(source, 1).unwrap()];
-    let condition =
-        ferrum_runtime::CapacityWaitCondition::from_observation(47, availability.to_vec()).unwrap();
-    let wake = AdmissionWakeEpochs::new(std::num::NonZeroU64::new(47).unwrap(), 0, 0, 0);
-    let deferral = AdmissionDeferral::new(DeferredAction::WaitForRelease, wake, condition);
-    let release_snapshot = engine.inner.execution_capacity_release_snapshot().unwrap();
-
+    let id = &ids[0];
+    let mut availability = Vec::new();
+    let epochs = engine
+        .active_inner()
+        .expect("engine execution is open")
+        .model_executor
+        .write_execution_capacity_snapshot(&mut availability)
+        .unwrap()
+        .unwrap();
+    let condition = ferrum_runtime::CapacityWaitCondition::from_observation(
+        epochs.coordinator_id.get(),
+        availability,
+    )
+    .unwrap();
+    let deferral = AdmissionDeferral::new(
+        DeferredAction::WaitForRelease,
+        AdmissionWakeEpochs::new(
+            epochs.coordinator_id,
+            epochs.release_epoch,
+            epochs.capacity_epoch,
+            0,
+        ),
+        condition,
+    );
     let action = scheduler
         .defer_decode_for_execution_capacity(
-            std::slice::from_ref(&request_id),
+            &ids,
             deferral,
-            &release_snapshot,
+            &engine
+                .active_inner()
+                .expect("engine execution is open")
+                .execution_capacity_release_snapshot()
+                .unwrap(),
         )
         .unwrap();
     let ExecutionCapacityAction::YieldPlanned { transaction } = action else {
-        panic!("lone decode pressure must plan a typed self recompute");
+        panic!("self recompute must be planned");
     };
     assert_eq!(transaction.kind(), PressureYieldKind::SelfRecompute);
-    assert_eq!(transaction.victim_request_id(), &request_id);
-    assert_eq!(transaction.progress_owner_id(), &request_id);
-
-    let progress_owner_resumable = engine
-        .inner
+    assert_eq!(transaction.victim_request_id(), id);
+    assert!(!engine
+        .active_inner()
+        .expect("engine execution is open")
         .execute_capacity_yield(&transaction, 1, None)
         .await
+        .unwrap());
+    engine
+        .active_inner()
+        .expect("engine execution is open")
+        .execution_closes
+        .join_observers()
+        .await;
+    engine
+        .active_inner()
+        .expect("engine execution is open")
+        .drain_execution_closes()
         .unwrap();
-    assert!(!progress_owner_resumable);
+    assert!(incarnations[0].observed_end().is_some());
+    assert!(executor.token_frontier_for_request(id).is_none());
     assert_eq!(executor.released_cache_count.load(Ordering::Acquire), 1);
-    let snapshot = scheduler.trace_snapshot();
-    assert_eq!(snapshot.active_len, 0);
-    assert_eq!(snapshot.waiting_queue_len, 1);
-    assert_eq!(snapshot.pressure_active_episodes, 0);
-    assert_eq!(snapshot.pressure_pending_release_fences, 0);
-
-    let sequences = engine.inner.sequences.read();
-    let sequence = sequences.get(&request_id).expect("self-recompute sequence");
-    assert_eq!(sequence.generated_tokens, vec![initial_tokens[0]]);
+    let trace = scheduler.trace_snapshot();
+    assert_eq!(trace.active_len, 0);
+    assert_eq!(trace.waiting_queue_len, 1);
+    assert_eq!(trace.pressure_pending_release_fences, 0);
+    assert_eq!(trace.capacity_release_epoch, 1);
+    let sequences = &engine
+        .active_inner()
+        .expect("engine execution is open")
+        .sequences;
+    let sequence_handle = sequences.get(id).unwrap();
+    let sequence_guard = sequence_handle.lock();
+    let sequence = sequence_guard.as_ref().unwrap();
+    assert!(sequence.execution_frontier.is_none());
+    assert_eq!(sequence.generated_tokens, initial_tokens);
     assert_eq!(sequence.phase, RequestPhase::Waiting);
-    assert!(sequence.model_cache_id().is_none());
     assert_eq!(sequence.preemption_count, 1);
-    drop(sequences);
-
-    flush_engine_profile_events(&engine);
-    let profile_events = read_engine_profile_events(&trace_path);
-    let completed = profile_events
-        .iter()
-        .find(|event| event.phase == "vnext.execution_capacity_pressure_release_fence_completed")
-        .expect("self-recompute fence completion must be profiled");
-    assert_eq!(
-        completed.shape.get("yield_kind"),
-        Some(&serde_json::json!("self_recompute"))
-    );
-    assert_eq!(
-        completed.shape.get("completion_disposition"),
-        Some(&serde_json::json!("self_recompute_queued"))
-    );
-    assert_eq!(
-        completed.shape.get("progress_owner_resumable"),
-        Some(&serde_json::json!(false))
-    );
-    assert_eq!(
-        completed.shape.get("resumable_transition_ordinal"),
-        Some(&serde_json::Value::Null)
-    );
-    assert!(completed.shape["closed_transition_ordinal"]
-        .as_u64()
-        .is_some());
-    assert!(!profile_events.iter().any(|event| {
-        event.phase == "vnext.execution_capacity_pressure_hold_active"
-            && event.request_id == request_id.to_string()
-    }));
-}
-
-#[tokio::test]
-async fn plan_runtime_pressure_rotates_progressed_owner_after_two_physical_releases() {
-    let trace_path = resource_trace_temp_path("plan-runtime-stable-pressure-owner");
-    let _ = std::fs::remove_file(&trace_path);
-    let (engine, scheduler, executor, tokenizer) = plan_runtime_batch_decode_test_engine_with_trace(
-        PlanRuntimeBatchDecodeBehavior::Exact,
-        Some(trace_path.clone()),
-    );
-    let (request_ids, initial_tokens, _) =
-        install_plan_runtime_decode_cohort(&engine, &scheduler, tokenizer).await;
-    let source = ferrum_runtime::CapacityAvailabilitySource::ActiveSequenceSlots;
-    let first_availability = ferrum_runtime::CapacityAvailabilityEpoch::new(source, 1).unwrap();
-    let first_condition =
-        ferrum_runtime::CapacityWaitCondition::from_observation(47, vec![first_availability])
-            .unwrap();
-    let first_deferral = AdmissionDeferral::new(
-        DeferredAction::WaitForRelease,
-        AdmissionWakeEpochs::new(std::num::NonZeroU64::new(47).unwrap(), 0, 0, 0),
-        first_condition,
-    );
-
-    let first_action = scheduler
-        .defer_decode_for_execution_capacity(
-            &request_ids,
-            first_deferral,
-            &engine.inner.execution_capacity_release_snapshot().unwrap(),
-        )
-        .unwrap();
-    let ExecutionCapacityAction::YieldPlanned {
-        transaction: first_transaction,
-    } = first_action
-    else {
-        panic!("two decode frontiers must select one peer handoff");
-    };
-    assert_eq!(first_transaction.kind(), PressureYieldKind::PeerHandoff);
-    let progress_owner_id = first_transaction.progress_owner_id().clone();
-    let held_peer_id = first_transaction.victim_request_id().clone();
-    assert_ne!(progress_owner_id, held_peer_id);
-
-    assert!(engine
-        .inner
-        .execute_capacity_yield(&first_transaction, 2, None)
-        .await
-        .unwrap());
-    assert_eq!(executor.released_cache_count.load(Ordering::Acquire), 1);
-    scheduler.update_decode_progress(&progress_owner_id, 1);
-
-    let second_availability = ferrum_runtime::CapacityAvailabilityEpoch::new(source, 2).unwrap();
-    let second_condition =
-        ferrum_runtime::CapacityWaitCondition::from_observation(47, vec![second_availability])
-            .unwrap();
-    let second_deferral = AdmissionDeferral::new(
-        DeferredAction::WaitForRelease,
-        AdmissionWakeEpochs::new(std::num::NonZeroU64::new(47).unwrap(), 1, 0, 0),
-        second_condition,
-    );
-    let second_action = scheduler
-        .defer_decode_for_execution_capacity(
-            std::slice::from_ref(&progress_owner_id),
-            second_deferral,
-            &engine.inner.execution_capacity_release_snapshot().unwrap(),
-        )
-        .unwrap();
-    let ExecutionCapacityAction::YieldPlanned {
-        transaction: second_transaction,
-    } = second_action
-    else {
-        panic!("the progressed owner must rotate to the oldest held peer");
-    };
-    assert_eq!(second_transaction.kind(), PressureYieldKind::PeerHandoff);
-    assert_eq!(second_transaction.progress_owner_id(), &held_peer_id);
-    assert_eq!(second_transaction.victim_request_id(), &progress_owner_id);
-    assert_eq!(
-        second_transaction.rotated_from_progress_owner_id(),
-        Some(&progress_owner_id)
-    );
-    assert_eq!(
-        second_transaction.rotated_from_progress_baseline(),
-        Some(first_transaction.progress_baseline())
-    );
-    assert!(
-        second_transaction
-            .rotated_from_progress_current()
-            .is_some_and(|current| current > first_transaction.progress_baseline()),
-        "owner rotation requires new logical progress beyond its generation baseline"
-    );
-
-    assert!(!engine
-        .inner
-        .execute_capacity_yield(&second_transaction, 1, None)
-        .await
-        .unwrap());
-    assert_eq!(executor.released_cache_count.load(Ordering::Acquire), 2);
-    let snapshot = scheduler.trace_snapshot();
-    assert_eq!(snapshot.active_len, 0);
-    assert_eq!(snapshot.waiting_queue_len, 2);
-    assert_eq!(snapshot.pressure_active_episodes, 1);
-    assert_eq!(snapshot.pressure_pending_release_fences, 0);
-
-    let initial_tokens_by_request = request_ids
-        .iter()
-        .cloned()
-        .zip(initial_tokens.iter().copied())
-        .collect::<HashMap<_, _>>();
-    let sequences = engine.inner.sequences.read();
-    for request_id in [&progress_owner_id, &held_peer_id] {
-        let sequence = sequences
-            .get(request_id)
-            .expect("both pressure participants remain queued for recompute");
-        assert_eq!(
-            sequence.generated_tokens,
-            vec![initial_tokens_by_request[request_id]]
-        );
-        assert_eq!(sequence.phase, RequestPhase::Waiting);
-        assert!(sequence.model_cache_id().is_none());
-        assert_eq!(sequence.preemption_count, 1);
-    }
-    drop(sequences);
-
-    flush_engine_profile_events(&engine);
-    let profile_events = read_engine_profile_events(&trace_path);
-    let completions = profile_events
-        .iter()
-        .filter(|event| event.phase == "vnext.execution_capacity_pressure_release_fence_completed")
-        .collect::<Vec<_>>();
-    assert_eq!(completions.len(), 2);
-    assert_eq!(
-        completions[0].shape.get("completion_disposition"),
-        Some(&serde_json::json!("progress_owner_resumable"))
-    );
-    assert_eq!(
-        completions[1].shape.get("completion_disposition"),
-        Some(&serde_json::json!("progress_owner_admission_pending"))
-    );
-    assert!(
-        completions[1].shape["owner_admission_pending_transition_ordinal"]
-            .as_u64()
-            .is_some()
-    );
-    assert_eq!(
-        completions[1].shape.get("resumable_transition_ordinal"),
-        Some(&serde_json::Value::Null)
-    );
-    assert_eq!(
-        completions[1].shape.get("closed_transition_ordinal"),
-        Some(&serde_json::Value::Null)
-    );
-    assert_eq!(
-        completions[1].attributes.get("progress_owner_id"),
-        Some(&serde_json::json!(held_peer_id))
-    );
-    assert_eq!(completions[1].request_id, progress_owner_id.to_string());
-    let holds = profile_events
-        .iter()
-        .filter(|event| event.phase == "vnext.execution_capacity_pressure_hold_active")
-        .collect::<Vec<_>>();
-    assert_eq!(holds.len(), 2);
-    let first_hold = holds
-        .iter()
-        .find(|event| event.request_id == held_peer_id.to_string())
-        .expect("the first yielded peer must publish its physical hold");
-    let rotated_hold = holds
-        .iter()
-        .find(|event| event.request_id == progress_owner_id.to_string())
-        .expect("the rotated-out owner must publish its physical hold");
-    assert_eq!(
-        first_hold.shape.get("progress_owner_id"),
-        Some(&serde_json::json!(progress_owner_id))
-    );
-    assert_eq!(
-        first_hold.shape.get("hold_transition_ordinal"),
-        completions[0].shape.get("release_transition_ordinal")
-    );
-    assert_eq!(
-        rotated_hold.shape.get("progress_owner_id"),
-        Some(&serde_json::json!(held_peer_id))
-    );
-    assert_eq!(
-        rotated_hold.shape.get("hold_transition_ordinal"),
-        completions[1].shape.get("release_transition_ordinal")
-    );
-    assert!(first_hold.shape["waiting_ticket"].as_u64().is_some());
-    assert!(rotated_hold.shape["waiting_ticket"].as_u64().is_some());
-    let _ = std::fs::remove_file(trace_path);
-}
-
-fn assert_plan_runtime_decode_cohort_unchanged(
-    engine: &ContinuousBatchEngine,
-    request_ids: &[RequestId],
-    initial_tokens: &[TokenId],
-    cache_ids: &[String],
-) {
-    let sequences = engine.inner.sequences.read();
-    for ((request_id, initial_token), cache_id) in
-        request_ids.iter().zip(initial_tokens).zip(cache_ids)
-    {
-        let sequence = sequences.get(request_id).expect("decode sequence");
-        assert_eq!(sequence.generated_tokens, vec![*initial_token]);
-        assert_eq!(sequence.model_cache_id(), Some(cache_id.as_str()));
-        assert_eq!(sequence.tokens_this_iteration, 0);
-    }
 }
 
 #[tokio::test]
@@ -4288,21 +2872,34 @@ async fn plan_runtime_batch_decode_process_batch_submits_one_cohort() {
         .await
         .expect("ready decode cohort");
 
-    engine.inner.process_batch(&decode_batch).await.unwrap();
+    engine
+        .active_inner()
+        .expect("engine execution is open")
+        .process_batch(&decode_batch)
+        .await
+        .unwrap();
 
     assert_eq!(executor.batch_decode_calls.load(Ordering::Relaxed), 1);
     assert_eq!(executor.decode_calls.load(Ordering::Relaxed), 0);
-    let sequences = engine.inner.sequences.read();
+    let sequences = &engine
+        .active_inner()
+        .expect("engine execution is open")
+        .sequences;
     for ((request_id, initial_token), cache_id) in
         request_ids.iter().zip(initial_tokens).zip(cache_ids)
     {
-        let sequence = sequences.get(request_id).expect("decoded sequence");
+        let sequence_handle = sequences.get(request_id).expect("decoded sequence");
+        let sequence_guard = sequence_handle.lock();
+        let sequence = sequence_guard.as_ref().unwrap();
         assert_eq!(sequence.generated_tokens.first(), Some(&initial_token));
         assert_eq!(sequence.generated_tokens.len(), 2);
-        assert_eq!(sequence.model_cache_id(), Some(cache_id.as_str()));
+        assert_eq!(
+            sequence.execution_frontier.as_ref().unwrap().sequence(),
+            &cache_id
+        );
         assert_eq!(sequence.tokens_this_iteration, 1);
     }
-    drop(sequences);
+
     flush_engine_profile_events(&engine);
     let trace = std::fs::read_to_string(&trace_path).unwrap();
     let events = trace
@@ -4323,496 +2920,62 @@ async fn plan_runtime_batch_decode_process_batch_submits_one_cohort() {
 }
 
 #[tokio::test]
-async fn plan_runtime_batch_decode_capacity_deferral_recomputes_a_blocked_progress_victim() {
-    let trace_path = resource_trace_temp_path("plan-runtime-decode-capacity");
-    let _ = std::fs::remove_file(&trace_path);
-    let (engine, scheduler, executor, tokenizer) = plan_runtime_batch_decode_test_engine_with_trace(
-        PlanRuntimeBatchDecodeBehavior::DeferUntilPeerCacheRelease,
-        Some(trace_path.clone()),
-    );
-    let (request_ids, initial_tokens, _) =
-        install_plan_runtime_decode_cohort(&engine, &scheduler, tokenizer).await;
-    let initial_tokens_by_request = request_ids
-        .iter()
-        .cloned()
-        .zip(initial_tokens.iter().copied())
-        .collect::<HashMap<_, _>>();
-    let decode_batch = scheduler
-        .next_batch(ferrum_interfaces::BatchHint::simple(2))
-        .await
-        .expect("ready decode cohort");
-    assert_eq!(decode_batch.requests.len(), 2);
-    let progress_owner_id = decode_batch.requests[0].request.id.clone();
-    let victim_id = decode_batch.requests[1].request.id.clone();
-    let victim_initial_token = initial_tokens_by_request[&victim_id];
-    engine
-        .inner
-        .sequences
-        .write()
-        .get_mut(&progress_owner_id)
-        .expect("progress owner sequence")
-        .sampling_params
-        .max_tokens = 2;
-
-    engine.inner.process_batch(&decode_batch).await.unwrap();
-
-    assert_eq!(executor.batch_decode_calls.load(Ordering::Relaxed), 4);
-    assert_eq!(executor.decode_calls.load(Ordering::Relaxed), 0);
-    assert_eq!(executor.released_cache_count.load(Ordering::Relaxed), 2);
-    assert_eq!(scheduler.active_count(), 0);
-    assert_eq!(scheduler.waiting_count(), 1);
-    assert_eq!(
-        scheduler
-            .trace_snapshot()
-            .execution_capacity_blocked_decode_len,
-        0
-    );
-    assert!(scheduler
-        .passive_capacity_wait_condition()
-        .unwrap()
-        .is_none());
-
-    let sequences = engine.inner.sequences.read();
-    let victim = sequences
-        .get(&victim_id)
-        .expect("capacity victim remains queued for logical recompute");
-    assert_eq!(victim.generated_tokens, vec![victim_initial_token]);
-    assert!(victim.model_cache_id().is_none());
-    assert!(!victim.prefill_complete);
-    assert_eq!(victim.phase, RequestPhase::Waiting);
-    assert_eq!(victim.preemption_count, 1);
-    assert!(
-        !sequences.contains_key(&progress_owner_id),
-        "progress owner must reach its release point and complete"
-    );
-    drop(sequences);
-
-    let scheduler_trace = scheduler.trace_snapshot();
-    assert_eq!(scheduler_trace.cancelled_total, 0);
-    assert_eq!(scheduler_trace.completed_total, 1);
-    assert_eq!(scheduler_trace.decode_queue_len, 0);
-    assert_eq!(scheduler_trace.waiting_queue_len, 1);
-    let pressure_journal = scheduler.pressure_transition_journal();
-    assert!(pressure_journal
-        .windows(2)
-        .all(|pair| pair[0].ordinal() < pair[1].ordinal()));
-    let pressure_kinds = pressure_journal
-        .iter()
-        .map(|transition| transition.kind())
-        .collect::<Vec<_>>();
-    let position = |kind| {
-        pressure_kinds
-            .iter()
-            .position(|candidate| *candidate == kind)
-            .expect("engine pressure transition must be journaled")
-    };
-    assert!(
-        position(PressureTransitionKind::YieldPlanned)
-            < position(PressureTransitionKind::ReleaseFenceArmed)
-    );
-    assert!(
-        position(PressureTransitionKind::ReleaseFenceArmed)
-            < position(PressureTransitionKind::ReleaseFenceCompleted)
-    );
-    assert!(
-        position(PressureTransitionKind::ReleaseFenceCompleted)
-            < position(PressureTransitionKind::FrontierResumable)
-    );
-    assert!(
-        position(PressureTransitionKind::FrontierResumable)
-            < position(PressureTransitionKind::FrontierTerminal)
-    );
-
-    for expected_offset in [0, 1] {
-        let recompute_batch = scheduler
-            .next_batch(ferrum_interfaces::BatchHint::simple(1))
-            .await
-            .expect("released capacity must schedule the victim recompute");
-        assert_eq!(recompute_batch.requests.len(), 1);
-        assert_eq!(recompute_batch.requests[0].request.id, victim_id);
-        assert_eq!(
-            recompute_batch.requests[0].tokens_processed,
-            expected_offset
-        );
-        assert_eq!(recompute_batch.requests[0].tokens_to_process, Some(1));
-        engine.inner.process_batch(&recompute_batch).await.unwrap();
-    }
-
-    let sequences = engine.inner.sequences.read();
-    let resumed = sequences
-        .get(&victim_id)
-        .expect("recomputed victim must resume decode ownership");
-    assert_eq!(
-        resumed.generated_tokens.first(),
-        Some(&victim_initial_token)
-    );
-    assert_eq!(resumed.generated_tokens.len(), 2);
-    assert!(resumed.model_cache_id().is_some());
-    assert!(resumed.prefill_complete);
-    assert_eq!(resumed.phase, RequestPhase::Decoding);
-    assert_eq!(resumed.preemption_count, 1);
-    drop(sequences);
-    let resumed_trace = scheduler.trace_snapshot();
-    assert_eq!(resumed_trace.cancelled_total, 0);
-    assert_eq!(resumed_trace.completed_total, 1);
-    assert_eq!(resumed_trace.waiting_queue_len, 0);
-    assert_eq!(resumed_trace.prefill_queue_len, 0);
-    assert_eq!(resumed_trace.decode_queue_len, 1);
-    assert_eq!(resumed_trace.execution_capacity_blocked_decode_len, 0);
-
-    flush_engine_profile_events(&engine);
-    let profile_events = read_engine_profile_events(&trace_path);
-    let fence_armed = profile_events
-        .iter()
-        .find(|event| event.phase == "vnext.execution_capacity_pressure_release_fence_armed")
-        .expect("physical release fence must be armed in the profile");
-    let fence_completed = profile_events
-        .iter()
-        .find(|event| event.phase == "vnext.execution_capacity_pressure_release_fence_completed")
-        .expect("physical release fence must complete in the profile");
-    let profile_ordinal = |event: &FerrumProfileEvent, field: &str| {
-        event.shape[field]
-            .as_u64()
-            .unwrap_or_else(|| panic!("pressure profile field {field} must be an ordinal"))
-    };
-    assert!(
-        profile_ordinal(fence_armed, "planned_transition_ordinal")
-            < profile_ordinal(fence_armed, "transition_ordinal")
-    );
-    assert!(
-        profile_ordinal(fence_armed, "transition_ordinal")
-            < profile_ordinal(fence_completed, "release_transition_ordinal")
-    );
-    assert!(
-        profile_ordinal(fence_completed, "release_transition_ordinal")
-            < profile_ordinal(fence_completed, "resumable_transition_ordinal")
-    );
-    assert_eq!(
-        fence_completed.shape.get("physical_release_completed"),
-        Some(&serde_json::json!(true))
-    );
-    assert_eq!(
-        fence_completed.shape.get("exact_source_advanced"),
-        Some(&serde_json::json!(true))
-    );
-    assert_eq!(
-        fence_completed
-            .shape
-            .get("transaction_wait_condition_advanced"),
-        Some(&serde_json::json!(true))
-    );
-    assert_eq!(
-        fence_completed.shape.get("release_authority"),
-        Some(&serde_json::json!("active_sequence"))
-    );
-    assert_eq!(
-        fence_completed.shape.get("progress_owner_resumable"),
-        Some(&serde_json::json!(true))
-    );
-    assert_eq!(
-        fence_completed.shape.get("closed_transition_ordinal"),
-        Some(&serde_json::Value::Null)
-    );
-    assert_eq!(
-        fence_completed.shape.get("closed_reason"),
-        Some(&serde_json::Value::Null)
-    );
-    assert_eq!(
-        fence_completed.shape.get("completion_disposition"),
-        Some(&serde_json::json!("progress_owner_resumable"))
-    );
-    assert!(fence_completed
-        .attributes
-        .contains_key("current_capacity_availability"));
-    assert!(profile_events.iter().any(|event| {
-        event.phase == "engine_model_cache_ref_release" && event.request_id == victim_id.to_string()
-    }));
-
-    let deferred_events = profile_events
-        .iter()
-        .filter(|event| event.phase == "vnext.decode_capacity_deferred")
-        .collect::<Vec<_>>();
-    assert_eq!(deferred_events.len(), 3);
-    assert_eq!(
-        deferred_events
-            .iter()
-            .filter(|event| event.shape.get("decision") == Some(&serde_json::json!("split_cohort")))
-            .count(),
-        1
-    );
-    assert_eq!(
-        deferred_events
-            .iter()
-            .filter(|event| {
-                event.shape.get("decision") == Some(&serde_json::json!("wait_for_release"))
-            })
-            .count(),
-        1
-    );
-    assert_eq!(
-        deferred_events
-            .iter()
-            .filter(|event| {
-                event.shape.get("decision") == Some(&serde_json::json!("pressure_yield_planned"))
-            })
-            .count(),
-        1
-    );
-    let recompute_event = deferred_events
-        .iter()
-        .find(|event| {
-            event.shape.get("decision") == Some(&serde_json::json!("pressure_yield_planned"))
-        })
-        .expect("progress-victim decision must be traced");
-    assert_eq!(
-        recompute_event.attributes.get("victim_request_id"),
-        Some(&serde_json::json!(victim_id))
-    );
-    assert_eq!(
-        recompute_event.attributes.get("progress_owner_id"),
-        Some(&serde_json::json!(progress_owner_id))
-    );
-    assert_eq!(
-        recompute_event.attributes.get("progress_baseline"),
-        Some(&serde_json::json!(1))
-    );
-    for event in &deferred_events {
-        assert_eq!(
-            event.shape.get("decode_submit_observed"),
-            Some(&serde_json::json!(false))
-        );
-        assert_eq!(
-            event.shape.get("execution_stage"),
-            Some(&serde_json::json!("step_admission"))
-        );
-        assert!(event.attributes.contains_key("request_ids"));
-        assert!(event.attributes.contains_key("capacity_evidence"));
-        if event.shape.get("decision") != Some(&serde_json::json!("pressure_yield_planned")) {
-            assert!(!event.attributes.contains_key("victim_request_id"));
-        }
-    }
-    let _ = std::fs::remove_file(trace_path);
-}
-
-#[tokio::test]
-async fn plan_runtime_execution_pressure_preserves_root_width_across_recursive_split_and_yield() {
-    for capacity_stage in [
-        ExecutorExecutionCapacityStage::StepAdmission,
-        ExecutorExecutionCapacityStage::SubmissionWave,
-    ] {
-        let (engine, scheduler, executor, tokenizer) =
-            plan_runtime_batch_decode_test_engine_with_stage(
-                PlanRuntimeBatchDecodeBehavior::DeferUntilPeerCacheRelease,
-                capacity_stage,
-            );
-        let (request_ids, _, _) =
-            install_plan_runtime_decode_frontiers(&engine, &scheduler, tokenizer, &["test"; 8])
-                .await;
-        let decode_batch = scheduler
-            .next_batch(ferrum_interfaces::BatchHint::simple(8))
-            .await
-            .expect("ready decode cohort");
-        assert_eq!(decode_batch.requests.len(), 8);
-
-        engine.inner.process_batch(&decode_batch).await.unwrap();
-
-        let pressure = scheduler.trace_snapshot();
-        assert_eq!(executor.released_cache_count.load(Ordering::Acquire), 1);
-        assert_eq!(pressure.decode_capacity_backpressure_admit_limit, Some(4));
-        assert!(pressure.decode_execution_pressure_enforced);
-        assert_eq!(pressure.waiting_queue_len, 1);
-        assert_eq!(pressure.decode_queue_len, request_ids.len() - 1);
-    }
-}
-
-#[tokio::test]
-async fn plan_runtime_sequence_extension_pressure_does_not_cap_decode_survivors_during_recompute() {
-    let (engine, scheduler, executor, tokenizer) = plan_runtime_batch_decode_test_engine_with_stage(
-        PlanRuntimeBatchDecodeBehavior::DeferUntilPeerCacheRelease,
-        ExecutorExecutionCapacityStage::SequenceExtension,
-    );
-    let (request_ids, _, _) =
-        install_plan_runtime_decode_frontiers(&engine, &scheduler, tokenizer, &["test"; 8]).await;
-    let decode_batch = scheduler
-        .next_batch(ferrum_interfaces::BatchHint::simple(8))
-        .await
-        .expect("ready decode cohort");
-    assert_eq!(decode_batch.requests.len(), 8);
-
-    engine.inner.process_batch(&decode_batch).await.unwrap();
-
-    let pressure = scheduler.trace_snapshot();
-    assert_eq!(executor.released_cache_count.load(Ordering::Acquire), 1);
-    assert_eq!(pressure.decode_capacity_backpressure_admit_limit, Some(4));
-    assert!(!pressure.decode_execution_pressure_enforced);
-    assert_eq!(pressure.waiting_queue_len, 1);
-    assert_eq!(pressure.decode_queue_len, request_ids.len() - 1);
-}
-
-#[tokio::test]
-async fn plan_runtime_recursive_cohort_pressure_upgrades_sequence_extension_feedback() {
-    let (engine, scheduler, executor, tokenizer) =
-        plan_runtime_batch_decode_test_engine_with_stage_transition(
-            PlanRuntimeBatchDecodeBehavior::DeferUntilPeerCacheRelease,
-            ExecutorExecutionCapacityStage::SequenceExtension,
-            ExecutorExecutionCapacityStage::StepAdmission,
-        );
-    let (request_ids, _, _) =
-        install_plan_runtime_decode_frontiers(&engine, &scheduler, tokenizer, &["test"; 8]).await;
-    let decode_batch = scheduler
-        .next_batch(ferrum_interfaces::BatchHint::simple(8))
-        .await
-        .expect("ready decode cohort");
-    assert_eq!(decode_batch.requests.len(), 8);
-
-    engine.inner.process_batch(&decode_batch).await.unwrap();
-
-    let pressure = scheduler.trace_snapshot();
-    assert_eq!(executor.released_cache_count.load(Ordering::Acquire), 1);
-    assert_eq!(pressure.decode_capacity_backpressure_admit_limit, Some(4));
-    assert!(pressure.decode_execution_pressure_enforced);
-    assert_eq!(pressure.waiting_queue_len, 1);
-    assert_eq!(pressure.decode_queue_len, request_ids.len() - 1);
-}
-
-#[tokio::test]
-async fn plan_runtime_saturated_root_success_recovers_execution_pressure_additively() {
-    let (engine, scheduler, _executor, tokenizer) =
-        plan_runtime_batch_decode_test_engine(PlanRuntimeBatchDecodeBehavior::Exact);
-    let (request_ids, _, _) =
-        install_plan_runtime_decode_frontiers(&engine, &scheduler, tokenizer, &["test"; 8]).await;
-
-    scheduler.record_decode_execution_capacity_pressure(8);
-    assert_eq!(
-        scheduler
-            .trace_snapshot()
-            .decode_capacity_backpressure_admit_limit,
-        Some(4)
-    );
-
-    assert!(!scheduler.record_decode_execution_capacity_success(4));
-    let before_capacity_release = scheduler.trace_snapshot();
-    assert_eq!(
-        before_capacity_release.decode_capacity_backpressure_admit_limit,
-        Some(4)
-    );
-    assert!(before_capacity_release.decode_execution_pressure_enforced);
-
-    scheduler.record_external_capacity_release();
-    engine
-        .inner
-        .run_plan_runtime_batch_decode_adaptive(&request_ids[..4])
-        .await
-        .unwrap();
-    let after_saturated_success = scheduler.trace_snapshot();
-    assert_eq!(
-        after_saturated_success.decode_capacity_backpressure_admit_limit,
-        Some(5)
-    );
-    assert!(after_saturated_success.decode_execution_pressure_enforced);
-
-    engine
-        .inner
-        .run_plan_runtime_batch_decode_adaptive(&request_ids[..3])
-        .await
-        .unwrap();
-    let after_small_tail = scheduler.trace_snapshot();
-    assert_eq!(
-        after_small_tail.decode_capacity_backpressure_admit_limit,
-        Some(5)
-    );
-    assert!(after_small_tail.decode_execution_pressure_enforced);
-
-    scheduler.record_external_capacity_release();
-    engine
-        .inner
-        .run_plan_runtime_batch_decode_adaptive(&request_ids[..5])
-        .await
-        .unwrap();
-    let after_next_saturated_success = scheduler.trace_snapshot();
-    assert_eq!(
-        after_next_saturated_success.decode_capacity_backpressure_admit_limit,
-        Some(6)
-    );
-    assert!(after_next_saturated_success.decode_execution_pressure_enforced);
-}
-
-#[tokio::test]
-async fn plan_runtime_capacity_yield_preemption_failure_aborts_pending_transaction() {
+async fn token_capacity_unproved_close_keeps_the_release_fence_and_original_owner() {
     let (engine, scheduler, executor, tokenizer) = plan_runtime_batch_decode_test_engine(
         PlanRuntimeBatchDecodeBehavior::DeferThenPreemptionFails,
     );
-    let _ = install_plan_runtime_decode_cohort(&engine, &scheduler, tokenizer).await;
-    let decode_batch = scheduler
+    let (_, _, incarnations) =
+        install_plan_runtime_decode_cohort(&engine, &scheduler, tokenizer).await;
+    let batch = scheduler
         .next_batch(ferrum_interfaces::BatchHint::simple(2))
         .await
-        .expect("ready decode cohort");
-
-    let error = engine
-        .inner
-        .process_batch(&decode_batch)
+        .unwrap();
+    engine
+        .active_inner()
+        .expect("engine execution is open")
+        .process_batch(&batch)
         .await
-        .expect_err("typed preemption failure must fail the batch");
-
+        .unwrap();
+    engine
+        .active_inner()
+        .expect("engine execution is open")
+        .execution_closes
+        .join_observers()
+        .await;
+    engine
+        .active_inner()
+        .expect("engine execution is open")
+        .output_tasks
+        .join_current()
+        .await;
+    let error = engine
+        .active_inner()
+        .expect("engine execution is open")
+        .run_iteration()
+        .await
+        .err()
+        .expect("the driver must observe the managed close failure");
     assert!(error
         .to_string()
-        .contains("synthetic request-scoped preemption failure"));
+        .contains("synthetic request-scoped close failure"));
+    let _ = engine
+        .active_inner()
+        .expect("engine execution is open")
+        .drain_execution_closes();
     assert_eq!(executor.released_cache_count.load(Ordering::Acquire), 0);
-    let trace = scheduler.trace_snapshot();
-    assert_eq!(trace.pressure_active_episodes, 0);
-    assert_eq!(trace.pressure_pending_release_fences, 0);
-    let kinds = scheduler
-        .pressure_transition_journal()
-        .into_iter()
-        .map(|transition| transition.kind())
-        .collect::<Vec<_>>();
-    let position = |kind| {
-        kinds
-            .iter()
-            .position(|candidate| *candidate == kind)
-            .expect("yield reconciliation transition must be journaled")
-    };
+    assert!(incarnations
+        .iter()
+        .all(|identity| identity.observed_end().is_none()));
+    assert_eq!(scheduler.trace_snapshot().capacity_release_epoch, 0);
     assert!(
-        position(PressureTransitionKind::YieldPlanned)
-            < position(PressureTransitionKind::ReleaseFenceArmed)
+        engine
+            .active_inner()
+            .expect("engine execution is open")
+            .execution_closes
+            .unreclaimed_count()
+            > 0
     );
-    assert!(
-        position(PressureTransitionKind::ReleaseFenceArmed)
-            < position(PressureTransitionKind::YieldAborted)
-    );
-    assert!(
-        position(PressureTransitionKind::YieldAborted) < position(PressureTransitionKind::Closed)
-    );
-}
-
-#[tokio::test]
-async fn plan_runtime_adaptive_decode_failure_only_completes_its_exact_subcohort() {
-    let (engine, scheduler, executor, tokenizer) = plan_runtime_batch_decode_test_engine(
-        PlanRuntimeBatchDecodeBehavior::DeferWideThenFailSecond,
-    );
-    let (request_ids, initial_tokens, cache_ids) =
-        install_plan_runtime_decode_cohort(&engine, &scheduler, tokenizer).await;
-    let decode_batch = scheduler
-        .next_batch(ferrum_interfaces::BatchHint::simple(2))
-        .await
-        .expect("ready decode cohort");
-
-    engine.inner.process_batch(&decode_batch).await.unwrap();
-
-    assert_eq!(executor.batch_decode_calls.load(Ordering::Relaxed), 3);
-    assert_eq!(scheduler.active_count(), 1);
-    let sequences = engine.inner.sequences.read();
-    let succeeded = sequences
-        .get(&request_ids[0])
-        .expect("successful subcohort must remain active");
-    assert_eq!(succeeded.generated_tokens.first(), Some(&initial_tokens[0]));
-    assert_eq!(succeeded.generated_tokens.len(), 2);
-    assert_eq!(succeeded.model_cache_id(), Some(cache_ids[0].as_str()));
-    assert_eq!(succeeded.tokens_this_iteration, 1);
-    assert!(
-        !sequences.contains_key(&request_ids[1]),
-        "only the failed exact subcohort may be completed"
-    );
+    assert!(scheduler.trace_snapshot().pressure_pending_release_fences > 0);
 }
 
 #[tokio::test]
@@ -4827,18 +2990,26 @@ async fn plan_runtime_profile_records_only_explicit_decode_host_stages() {
         let request_id =
             install_profiled_plan_runtime_decode_frontier(&engine, &scheduler, tokenizer).await;
 
+        let batch = scheduler
+            .next_batch(ferrum_interfaces::BatchHint::simple(1))
+            .await
+            .unwrap();
         engine
-            .inner
-            .run_plan_runtime_batch_decode(std::slice::from_ref(&request_id))
+            .active_inner()
+            .expect("engine execution is open")
+            .process_batch(&batch)
             .await
             .unwrap();
 
         assert_eq!(executor.batch_decode_calls.load(Ordering::Relaxed), 1);
         let timing = engine
-            .inner
+            .active_inner()
+            .expect("engine execution is open")
             .sequences
-            .write()
-            .get_mut(&request_id)
+            .get(&request_id)
+            .unwrap()
+            .lock()
+            .as_mut()
             .unwrap()
             .take_execution_evidence()
             .unwrap()
@@ -4883,71 +3054,39 @@ async fn plan_runtime_profile_records_only_explicit_decode_host_stages() {
 }
 
 #[tokio::test]
-async fn plan_runtime_batch_decode_rejects_short_output_before_state_commit() {
-    let (engine, scheduler, executor, tokenizer) =
-        plan_runtime_batch_decode_test_engine(PlanRuntimeBatchDecodeBehavior::Short);
-    let (request_ids, initial_tokens, cache_ids) =
-        install_plan_runtime_decode_cohort(&engine, &scheduler, tokenizer).await;
-
-    let error = engine
-        .inner
-        .run_plan_runtime_batch_decode(&request_ids)
-        .await
-        .expect_err("short output must fail closed");
-
-    assert!(error
-        .to_string()
-        .contains("returned 1 outputs for 2 requests"));
-    assert_eq!(executor.batch_decode_calls.load(Ordering::Relaxed), 1);
-    assert_eq!(executor.decode_calls.load(Ordering::Relaxed), 0);
-    assert_plan_runtime_decode_cohort_unchanged(&engine, &request_ids, &initial_tokens, &cache_ids);
-}
-
-#[tokio::test]
-async fn plan_runtime_batch_decode_rejects_changed_cache_before_state_commit() {
-    let (engine, scheduler, executor, tokenizer) =
-        plan_runtime_batch_decode_test_engine(PlanRuntimeBatchDecodeBehavior::WrongFirstCache);
-    let (request_ids, initial_tokens, cache_ids) =
-        install_plan_runtime_decode_cohort(&engine, &scheduler, tokenizer).await;
-
-    let error = engine
-        .inner
-        .run_plan_runtime_batch_decode(&request_ids)
-        .await
-        .expect_err("changed cache authority must fail closed");
-
-    assert!(error.to_string().contains("output 0 returned cache"));
-    assert_eq!(executor.batch_decode_calls.load(Ordering::Relaxed), 1);
-    assert_eq!(executor.decode_calls.load(Ordering::Relaxed), 0);
-    assert_plan_runtime_decode_cohort_unchanged(&engine, &request_ids, &initial_tokens, &cache_ids);
-}
-
-#[tokio::test]
-async fn plan_runtime_batch_decode_does_not_materialize_host_token_tensors() {
-    let tensor_factory: Arc<dyn TensorFactory> = Arc::new(FailingFromSliceTensorFactory);
-    let (engine, scheduler, executor, tokenizer) =
-        plan_runtime_batch_decode_test_engine_with_trace_and_factory(
-            PlanRuntimeBatchDecodeBehavior::Exact,
-            None,
-            tensor_factory,
-        );
+async fn plan_runtime_batch_decode_commits_original_executor_cohort() {
+    let (engine, scheduler, executor, tokenizer) = plan_runtime_batch_decode_test_engine_with_trace(
+        PlanRuntimeBatchDecodeBehavior::Exact,
+        None,
+    );
     let (request_ids, _, _) =
         install_plan_runtime_decode_cohort(&engine, &scheduler, tokenizer).await;
 
-    engine
-        .inner
-        .run_plan_runtime_batch_decode(&request_ids)
+    let batch = scheduler
+        .next_batch(ferrum_interfaces::BatchHint::simple(request_ids.len()))
         .await
-        .expect("typed PlanRuntime decode must not call TensorFactory::from_slice");
+        .unwrap();
+    engine
+        .active_inner()
+        .expect("engine execution is open")
+        .process_batch(&batch)
+        .await
+        .expect("common token decode completes through the original executor");
 
     assert_eq!(executor.batch_decode_calls.load(Ordering::Relaxed), 1);
     assert_eq!(executor.decode_calls.load(Ordering::Relaxed), 0);
-    let sequences = engine.inner.sequences.read();
+    let sequences = &engine
+        .active_inner()
+        .expect("engine execution is open")
+        .sequences;
     for request_id in request_ids {
         assert_eq!(
             sequences
                 .get(&request_id)
                 .expect("decoded sequence must remain active")
+                .lock()
+                .as_ref()
+                .unwrap()
                 .generated_tokens
                 .len(),
             2
@@ -4956,32 +3095,57 @@ async fn plan_runtime_batch_decode_does_not_materialize_host_token_tensors() {
 }
 
 #[tokio::test]
+async fn owner_memory_missing_required_plan_snapshot_is_a_contract_error() {
+    let mut executor = PlanRuntimeAdmissionTestExecutor::new(128);
+    executor.missing_resource_snapshot = true;
+    let error = executor.memory_observation().unwrap_err();
+    assert!(error.to_string().contains("required resource snapshot"));
+    let engine = ContinuousBatchEngine::new(
+        EngineConfig::default(),
+        Arc::new(ContinuousBatchScheduler::new(Default::default())),
+        Arc::new(ferrum_testkit::MockTokenizer::new(128)),
+        Arc::new(ferrum_testkit::MockSampler),
+        ExecutorOwner::new(Box::new(executor)),
+    )
+    .unwrap();
+    let observer = engine.start_loop().unwrap();
+    let status = engine.status().await;
+    assert!(!status.is_ready);
+    assert!(matches!(
+        status.memory_usage,
+        ferrum_types::MemoryObservation::Unknown
+    ));
+    engine.shutdown().await.unwrap();
+    engine.wait_for_shutdown_completion().await.unwrap();
+    observer.wait().await.result().unwrap();
+}
+
+#[tokio::test]
 async fn plan_runtime_status_separates_static_and_dynamic_memory() {
-    let config = EngineConfig::default();
+    let mut config = EngineConfig::default();
+    // A configured device cannot relabel the actual owner's CPU accounting.
+    config.backend.device = Device::CUDA(0);
     let scheduler = Arc::new(ContinuousBatchScheduler::new(config.scheduler.clone()));
     let tokenizer: Arc<dyn Tokenizer + Send + Sync> =
         Arc::new(ferrum_testkit::MockTokenizer::new(128));
     let sampler: Arc<dyn Sampler + Send + Sync> = Arc::new(ferrum_testkit::MockSampler);
-    let executor: Arc<dyn ModelExecutor + Send + Sync> =
-        Arc::new(PlanRuntimeAdmissionTestExecutor::new(128));
-    let tensor_factory: Arc<dyn TensorFactory> = Arc::new(MockTensorFactory);
-    let engine = ContinuousBatchEngine::new_plan_runtime(
-        config,
-        scheduler,
-        tokenizer,
-        sampler,
-        executor,
-        tensor_factory,
-    )
-    .unwrap();
+    let executor = ExecutorOwner::new(Box::new(PlanRuntimeAdmissionTestExecutor::new(128)));
+
+    let engine =
+        ContinuousBatchEngine::new(config, scheduler, tokenizer, sampler, executor).unwrap();
 
     let status = engine.status().await;
 
-    assert_eq!(status.memory_usage.total_bytes, 900);
-    assert_eq!(status.memory_usage.used_bytes, 500);
-    assert_eq!(status.memory_usage.free_bytes, 400);
-    assert_eq!(status.memory_usage.cache_memory_bytes, 100);
-    assert!((status.memory_usage.utilization_percent - 55.555557).abs() < 0.001);
+    assert_eq!(status.memory_usage.known().unwrap().total_bytes, 900);
+    assert_eq!(status.memory_usage.known().unwrap().used_bytes, 500);
+    assert_eq!(status.memory_usage.known().unwrap().free_bytes, 400);
+    assert_eq!(status.memory_usage.known().unwrap().cache_memory_bytes, 100);
+    assert_eq!(
+        status.memory_usage.known().unwrap().cpu_memory_bytes,
+        Some(500)
+    );
+    assert_eq!(status.memory_usage.known().unwrap().gpu_memory_bytes, None);
+    assert!((status.memory_usage.known().unwrap().utilization_percent - 55.555557).abs() < 0.001);
 }
 
 #[tokio::test]
@@ -4992,15 +3156,17 @@ async fn plan_runtime_product_path_requires_typed_admission_before_prefill() {
     let tokenizer: Arc<dyn Tokenizer + Send + Sync> =
         Arc::new(ferrum_testkit::MockTokenizer::new(128));
     let sampler: Arc<dyn Sampler + Send + Sync> = Arc::new(ferrum_testkit::MockSampler);
-    let executor = Arc::new(PlanRuntimeAdmissionTestExecutor::new(128));
-    let tensor_factory: Arc<dyn TensorFactory> = Arc::new(FailingFromSliceTensorFactory);
-    let engine = ContinuousBatchEngine::new_plan_runtime(
+    let executor = PlanRuntimeAdmissionTestExecutor::new(128);
+    let observation = executor.observer();
+    let executor_owner = ExecutorOwner::new(Box::new(executor));
+    let executor = observation;
+
+    let engine = ContinuousBatchEngine::new(
         config,
         Arc::clone(&scheduler),
         tokenizer,
         sampler,
-        executor.clone(),
-        tensor_factory,
+        executor_owner,
     )
     .unwrap();
     let mut request = policy_request();
@@ -5008,7 +3174,7 @@ async fn plan_runtime_product_path_requires_typed_admission_before_prefill() {
 
     let response = engine.infer(request).await.unwrap();
 
-    assert_eq!(response.finish_reason, FinishReason::Length);
+    assert_eq!(response.response().finish_reason, FinishReason::Length);
     assert_eq!(executor.admission_probes.load(Ordering::Relaxed), 1);
     assert_eq!(executor.prefill_calls.load(Ordering::Relaxed), 1);
     let completions = executor
@@ -5016,14 +3182,14 @@ async fn plan_runtime_product_path_requires_typed_admission_before_prefill() {
         .lock()
         .expect("completion receipt mutex poisoned");
     assert_eq!(completions.len(), 1);
-    assert_eq!(completions[0].request_id(), &response.request_id);
+    assert_eq!(completions[0].request_id(), &response.response().request_id);
     assert_eq!(
         completions[0].input_tokens(),
-        response.usage.prompt_tokens as u64
+        response.response().usage.prompt_tokens as u64
     );
     assert_eq!(
         completions[0].output_tokens(),
-        response.usage.completion_tokens as u64
+        response.response().usage.completion_tokens as u64
     );
     drop(completions);
     assert!(executor
@@ -5044,18 +3210,13 @@ async fn plan_runtime_prefill_resource_failure_preserves_terminal_error_and_rele
     let tokenizer: Arc<dyn Tokenizer + Send + Sync> =
         Arc::new(ferrum_testkit::MockTokenizer::new(128));
     let sampler: Arc<dyn Sampler + Send + Sync> = Arc::new(ferrum_testkit::MockSampler);
-    let executor =
-        Arc::new(PlanRuntimeAdmissionTestExecutor::new_with_resource_prefill_failure(128));
-    let tensor_factory: Arc<dyn TensorFactory> = Arc::new(FailingFromSliceTensorFactory);
-    let engine = ContinuousBatchEngine::new_plan_runtime(
-        config,
-        scheduler,
-        tokenizer,
-        sampler,
-        executor.clone(),
-        tensor_factory,
-    )
-    .unwrap();
+    let executor = PlanRuntimeAdmissionTestExecutor::new_with_resource_prefill_failure(128);
+    let observation = executor.observer();
+    let executor_owner = ExecutorOwner::new(Box::new(executor));
+    let executor = observation;
+
+    let engine =
+        ContinuousBatchEngine::new(config, scheduler, tokenizer, sampler, executor_owner).unwrap();
     let mut request = policy_request();
     request.sampling_params.max_tokens = 1;
     let request_id = request.id.clone();
@@ -5072,7 +3233,12 @@ async fn plan_runtime_prefill_resource_failure_preserves_terminal_error_and_rele
     assert!(error
         .to_string()
         .contains("typed diagnostic resource failure after prefill submission"));
-    assert!(!engine.inner.sequences.read().contains_key(&request_id));
+    assert!(!engine
+        .active_inner()
+        .expect("engine execution is open")
+        .sequences
+        .get(&request_id)
+        .is_some());
     assert!(executor
         .retained
         .lock()
@@ -5081,25 +3247,21 @@ async fn plan_runtime_prefill_resource_failure_preserves_terminal_error_and_rele
     assert_eq!(executor.prefill_calls.load(Ordering::Relaxed), 1);
 }
 
-#[test]
-fn plan_runtime_recompute_admission_preserves_product_usage_accounting() {
+#[tokio::test]
+async fn plan_runtime_recompute_admission_preserves_product_usage_accounting() {
     let mut config = EngineConfig::default();
     config.kv_cache.max_blocks = 128;
     let scheduler = Arc::new(ContinuousBatchScheduler::new(config.scheduler.clone()));
     let tokenizer: Arc<dyn Tokenizer + Send + Sync> =
         Arc::new(ferrum_testkit::MockTokenizer::new(128));
     let sampler: Arc<dyn Sampler + Send + Sync> = Arc::new(ferrum_testkit::MockSampler);
-    let executor = Arc::new(PlanRuntimeAdmissionTestExecutor::new(128));
-    let tensor_factory: Arc<dyn TensorFactory> = Arc::new(MockTensorFactory);
-    let engine = ContinuousBatchEngine::new_plan_runtime(
-        config,
-        scheduler,
-        tokenizer,
-        sampler,
-        executor.clone(),
-        tensor_factory,
-    )
-    .unwrap();
+    let executor = PlanRuntimeAdmissionTestExecutor::new(128);
+    let observation = executor.observer();
+    let executor_owner = ExecutorOwner::new(Box::new(executor));
+    let executor = observation;
+
+    let engine =
+        ContinuousBatchEngine::new(config, scheduler, tokenizer, sampler, executor_owner).unwrap();
     let mut request = policy_request();
     request.sampling_params.max_tokens = 8;
     let request_id = request.id.clone();
@@ -5108,14 +3270,16 @@ fn plan_runtime_recompute_admission_preserves_product_usage_accounting() {
     sequence.generated_tokens.push(TokenId::new(13));
     sequence.phase = RequestPhase::Waiting;
     engine
-        .inner
+        .active_inner()
+        .expect("engine execution is open")
         .sequences
-        .write()
         .insert(request_id.clone(), sequence);
 
     let admitted = engine
-        .inner
-        .probe_executor_prefill_admission_for_test(&request);
+        .active_inner()
+        .expect("engine execution is open")
+        .probe_executor_prefill_admission_for_test(&request)
+        .await;
 
     assert!(admitted);
     assert_eq!(
@@ -5126,7 +3290,21 @@ fn plan_runtime_recompute_admission_preserves_product_usage_accounting() {
             .as_slice(),
         &[(request_id.clone(), 3, 2, 1)]
     );
-    assert!(executor.cancel_prefill_admission(&request_id));
+    let frontier = executor
+        .tokens
+        .frontier_for_request(&request_id)
+        .expect("admitted identity");
+    let close = engine
+        .active_inner()
+        .expect("engine execution is open")
+        .model_executor
+        .cancel_tokens(frontier.sequence())
+        .expect("close exact admission");
+    assert!(matches!(
+        close.disposition,
+        ferrum_execution::token_execution::ExecutionCloseDisposition::Ended(_)
+    ));
+    assert!(executor.tokens.frontier_for_request(&request_id).is_none());
 }
 
 #[tokio::test]
@@ -5140,15 +3318,17 @@ async fn plan_runtime_prefill_cohort_uses_one_capacity_aware_batch() {
         &[("test", 5), ("ok", 6), ("generated", 42)],
     ));
     let sampler: Arc<dyn Sampler + Send + Sync> = Arc::new(crate::registry::GreedySampler);
-    let executor = Arc::new(PlanRuntimeAdmissionTestExecutor::new(128));
-    let tensor_factory: Arc<dyn TensorFactory> = Arc::new(FailingFromSliceTensorFactory);
-    let engine = ContinuousBatchEngine::new_plan_runtime(
+    let executor = PlanRuntimeAdmissionTestExecutor::new(128);
+    let observation = executor.observer();
+    let executor_owner = ExecutorOwner::new(Box::new(executor));
+    let executor = observation;
+
+    let engine = ContinuousBatchEngine::new(
         config,
         Arc::clone(&scheduler),
         Arc::clone(&tokenizer),
         sampler,
-        executor.clone(),
-        tensor_factory,
+        executor_owner,
     )
     .unwrap();
 
@@ -5162,15 +3342,18 @@ async fn plan_runtime_prefill_cohort_uses_one_capacity_aware_batch() {
             .insert(PROMPT_TOKENS_METADATA_KEY.to_string(), serde_json::json!(1));
         scheduler.submit(request.clone()).await.unwrap();
         let tokens = tokenizer.encode(&request.prompt, true).unwrap();
-        let sequence = SequenceState::new_with_tokenizer_and_model_vocab_size(
+        let mut sequence = SequenceState::new_with_tokenizer_and_model_vocab_size(
             request.clone(),
             tokens.clone(),
             Some(Arc::clone(&tokenizer)),
             Some(128),
         );
-        executor
-            .try_admit_prefill(
-                ExecutorPrefillAdmission::for_product_request(
+        let TokenAdmissionOutcome::Admitted(frontier) = engine
+            .active_inner()
+            .expect("engine execution is open")
+            .model_executor
+            .admit_tokens(ExecutionAdmission {
+                context: ExecutorPrefillAdmission::for_product_request(
                     &request.id,
                     &tokens,
                     sequence.model_maximum_sequence_tokens(),
@@ -5178,13 +3361,19 @@ async fn plan_runtime_prefill_cohort_uses_one_capacity_aware_batch() {
                     0,
                 )
                 .unwrap(),
-            )
-            .unwrap();
+                adapter: None,
+            })
+            .await
+            .unwrap()
+        else {
+            panic!("fixture batch admission must succeed");
+        };
+        sequence.execution_frontier = Some(frontier);
         request_ids.push(request.id.clone());
         engine
-            .inner
+            .active_inner()
+            .expect("engine execution is open")
             .sequences
-            .write()
             .insert(request.id.clone(), sequence);
     }
     let batch = scheduler
@@ -5193,7 +3382,12 @@ async fn plan_runtime_prefill_cohort_uses_one_capacity_aware_batch() {
         .expect("two admitted prefills should form one scheduler cohort");
     assert_eq!(batch.requests.len(), 2);
 
-    engine.inner.process_batch(&batch).await.unwrap();
+    engine
+        .active_inner()
+        .expect("engine execution is open")
+        .process_batch(&batch)
+        .await
+        .unwrap();
 
     assert_eq!(executor.batch_prefill_calls.load(Ordering::Relaxed), 1);
     assert_eq!(executor.prefill_calls.load(Ordering::Relaxed), 0);
@@ -5202,18 +3396,27 @@ async fn plan_runtime_prefill_cohort_uses_one_capacity_aware_batch() {
         .lock()
         .expect("retained admission mutex poisoned")
         .is_empty());
-    let sequences = engine.inner.sequences.read();
-    let remaining_request_ids = sequences.keys().cloned().collect::<Vec<_>>();
+    let sequences = &engine
+        .active_inner()
+        .expect("engine execution is open")
+        .sequences;
+    let remaining_request_ids = sequences
+        .snapshot()
+        .iter()
+        .map(|handle| handle.request_id().clone())
+        .collect::<Vec<_>>();
     let scheduler_trace = scheduler.trace_snapshot();
     for request_id in request_ids {
-        let sequence = sequences.get(&request_id).unwrap_or_else(|| {
+        let sequence_handle = sequences.get(&request_id).unwrap_or_else(|| {
             panic!(
                 "prefilled sequence {request_id} disappeared; remaining={remaining_request_ids:?}; scheduler={scheduler_trace:?}"
             )
         });
+        let sequence_guard = sequence_handle.lock();
+        let sequence = sequence_guard.as_ref().unwrap();
         assert!(sequence.prefill_complete);
         assert_eq!(sequence.generated_tokens.len(), 1);
-        assert!(sequence.model_cache_id().is_some());
+        assert!(sequence.execution_frontier.is_some());
     }
 }
 
@@ -5228,15 +3431,17 @@ async fn plan_runtime_batch_prefill_deferral_falls_back_without_failing_requests
         &[("test", 5), ("ok", 6), ("generated", 42)],
     ));
     let sampler: Arc<dyn Sampler + Send + Sync> = Arc::new(crate::registry::GreedySampler);
-    let executor = Arc::new(PlanRuntimeAdmissionTestExecutor::new_with_batch_prefill_deferral(128));
-    let tensor_factory: Arc<dyn TensorFactory> = Arc::new(FailingFromSliceTensorFactory);
-    let engine = ContinuousBatchEngine::new_plan_runtime(
+    let executor = PlanRuntimeAdmissionTestExecutor::new_with_batch_prefill_deferral(128);
+    let observation = executor.observer();
+    let executor_owner = ExecutorOwner::new(Box::new(executor));
+    let executor = observation;
+
+    let engine = ContinuousBatchEngine::new(
         config,
         Arc::clone(&scheduler),
         Arc::clone(&tokenizer),
         sampler,
-        executor.clone(),
-        tensor_factory,
+        executor_owner,
     )
     .unwrap();
 
@@ -5250,15 +3455,18 @@ async fn plan_runtime_batch_prefill_deferral_falls_back_without_failing_requests
             .insert(PROMPT_TOKENS_METADATA_KEY.to_string(), serde_json::json!(1));
         scheduler.submit(request.clone()).await.unwrap();
         let tokens = tokenizer.encode(&request.prompt, true).unwrap();
-        let sequence = SequenceState::new_with_tokenizer_and_model_vocab_size(
+        let mut sequence = SequenceState::new_with_tokenizer_and_model_vocab_size(
             request.clone(),
             tokens.clone(),
             Some(Arc::clone(&tokenizer)),
             Some(128),
         );
-        executor
-            .try_admit_prefill(
-                ExecutorPrefillAdmission::for_product_request(
+        let TokenAdmissionOutcome::Admitted(frontier) = engine
+            .active_inner()
+            .expect("engine execution is open")
+            .model_executor
+            .admit_tokens(ExecutionAdmission {
+                context: ExecutorPrefillAdmission::for_product_request(
                     &request.id,
                     &tokens,
                     sequence.model_maximum_sequence_tokens(),
@@ -5266,13 +3474,19 @@ async fn plan_runtime_batch_prefill_deferral_falls_back_without_failing_requests
                     0,
                 )
                 .unwrap(),
-            )
-            .unwrap();
+                adapter: None,
+            })
+            .await
+            .unwrap()
+        else {
+            panic!("fixture batch admission must succeed");
+        };
+        sequence.execution_frontier = Some(frontier);
         request_ids.push(request.id.clone());
         engine
-            .inner
+            .active_inner()
+            .expect("engine execution is open")
             .sequences
-            .write()
             .insert(request.id.clone(), sequence);
     }
     let batch = scheduler
@@ -5280,7 +3494,12 @@ async fn plan_runtime_batch_prefill_deferral_falls_back_without_failing_requests
         .await
         .expect("two admitted prefills should form one scheduler cohort");
 
-    engine.inner.process_batch(&batch).await.unwrap();
+    engine
+        .active_inner()
+        .expect("engine execution is open")
+        .process_batch(&batch)
+        .await
+        .unwrap();
 
     assert_eq!(executor.batch_prefill_calls.load(Ordering::Relaxed), 1);
     assert_eq!(executor.prefill_calls.load(Ordering::Relaxed), 2);
@@ -5289,11 +3508,16 @@ async fn plan_runtime_batch_prefill_deferral_falls_back_without_failing_requests
         .lock()
         .expect("retained admission mutex poisoned")
         .is_empty());
-    let sequences = engine.inner.sequences.read();
+    let sequences = &engine
+        .active_inner()
+        .expect("engine execution is open")
+        .sequences;
     for request_id in request_ids {
-        let sequence = sequences
+        let sequence_handle = sequences
             .get(&request_id)
             .expect("deferred batch participant must survive per-request fallback");
+        let sequence_guard = sequence_handle.lock();
+        let sequence = sequence_guard.as_ref().unwrap();
         assert!(sequence.prefill_complete);
         assert_eq!(sequence.generated_tokens.len(), 1);
     }
@@ -5313,15 +3537,17 @@ async fn plan_runtime_serial_backing_growth_converges_before_batch_submission() 
         &[("test", 5), ("ok", 6), ("generated", 42)],
     ));
     let sampler: Arc<dyn Sampler + Send + Sync> = Arc::new(crate::registry::GreedySampler);
-    let executor = Arc::new(PlanRuntimeAdmissionTestExecutor::new_with_serial_backing_growth(128));
-    let tensor_factory: Arc<dyn TensorFactory> = Arc::new(MockTensorFactory);
-    let engine = ContinuousBatchEngine::new_plan_runtime(
+    let executor = PlanRuntimeAdmissionTestExecutor::new_with_serial_backing_growth(128);
+    let observation = executor.observer();
+    let executor_owner = ExecutorOwner::new(Box::new(executor));
+    let executor = observation;
+
+    let engine = ContinuousBatchEngine::new(
         config,
         Arc::clone(&scheduler),
         Arc::clone(&tokenizer),
         sampler,
-        executor.clone(),
-        tensor_factory,
+        executor_owner,
     )
     .unwrap();
 
@@ -5334,18 +3560,27 @@ async fn plan_runtime_serial_backing_growth_converges_before_batch_submission() 
             .insert(PROMPT_TOKENS_METADATA_KEY.to_string(), serde_json::json!(1));
         scheduler.submit(request.clone()).await.unwrap();
         let tokens = tokenizer.encode(&request.prompt, true).unwrap();
-        engine.inner.sequences.write().insert(
-            request.id.clone(),
-            SequenceState::new_with_tokenizer_and_model_vocab_size(
-                request,
-                tokens,
-                Some(Arc::clone(&tokenizer)),
-                Some(128),
-            ),
-        );
+        engine
+            .active_inner()
+            .expect("engine execution is open")
+            .sequences
+            .insert(
+                request.id.clone(),
+                SequenceState::new_with_tokenizer_and_model_vocab_size(
+                    request,
+                    tokens,
+                    Some(Arc::clone(&tokenizer)),
+                    Some(128),
+                ),
+            );
     }
 
-    engine.inner.run_iteration().await.unwrap();
+    engine
+        .active_inner()
+        .expect("engine execution is open")
+        .run_iteration()
+        .await
+        .unwrap();
 
     assert_eq!(executor.maintenance_calls.load(Ordering::Relaxed), 3);
     assert_eq!(executor.batch_prefill_calls.load(Ordering::Relaxed), 1);
@@ -5360,6 +3595,106 @@ async fn plan_runtime_serial_backing_growth_converges_before_batch_submission() 
 }
 
 #[tokio::test]
+async fn fill_first_priority_precedes_general_admission_without_starving_decode() {
+    let mut config = EngineConfig::default();
+    config.kv_cache.max_blocks = 128;
+    config.scheduler.max_running_requests = 4;
+    config.scheduler.prefill_first_until_active = Some(4);
+    config.scheduler.prompt_token_estimate = true;
+    config.batching.max_batch_size = 4;
+    config.batching.max_num_batched_tokens = 2;
+    let scheduler = Arc::new(ContinuousBatchScheduler::new(config.scheduler.clone()));
+    let tokenizer: Arc<dyn Tokenizer + Send + Sync> = Arc::new(PolicyTokenizer::new(
+        128,
+        &[("test", 5), ("ok", 6), ("generated", 42)],
+    ));
+    let engine = ContinuousBatchEngine::new(
+        config,
+        Arc::clone(&scheduler),
+        Arc::clone(&tokenizer),
+        Arc::new(crate::registry::GreedySampler),
+        ExecutorOwner::new(Box::new(PlanRuntimeChunkedPrefillTestExecutor::new(false))),
+    )
+    .unwrap();
+
+    let mut incumbent = None;
+    for prompts in [vec!["test"], vec!["test ok", "ok test", "ok ok"]] {
+        for prompt in prompts {
+            let mut request = policy_request();
+            request.prompt = prompt.to_owned();
+            request.sampling_params.max_tokens = 8;
+            let tokens = tokenizer.encode(prompt, true).unwrap();
+            request.metadata.insert(
+                PROMPT_TOKENS_METADATA_KEY.to_owned(),
+                serde_json::json!(tokens.len()),
+            );
+            incumbent.get_or_insert_with(|| request.id.clone());
+            scheduler.submit(request.clone()).await.unwrap();
+            engine.active_inner().unwrap().sequences.insert(
+                request.id.clone(),
+                SequenceState::new_with_tokenizer_and_model_vocab_size(
+                    request,
+                    tokens,
+                    Some(Arc::clone(&tokenizer)),
+                    Some(128),
+                ),
+            );
+        }
+        if scheduler.decoding_count() == 0 {
+            for _ in 0..2 {
+                engine
+                    .active_inner()
+                    .unwrap()
+                    .run_iteration()
+                    .await
+                    .unwrap();
+                if scheduler.decoding_count() == 1 {
+                    break;
+                }
+            }
+            assert_eq!(scheduler.decoding_count(), 1);
+        }
+    }
+    let incumbent = incumbent.unwrap();
+    let generated = || {
+        let inner = engine.active_inner().unwrap();
+        let sequence = inner.sequences.get(&incumbent).unwrap();
+        let state = sequence.lock();
+        state.as_ref().unwrap().generated_tokens.len()
+    };
+    assert_eq!(generated(), 1);
+
+    engine
+        .active_inner()
+        .unwrap()
+        .run_iteration()
+        .await
+        .unwrap();
+    assert_eq!(scheduler.active_count(), 4);
+    assert_eq!(scheduler.waiting_count(), 0);
+    assert_eq!(scheduler.decoding_count(), 2);
+    assert_eq!(scheduler.prefilling_count(), 2);
+    assert_eq!(
+        generated(),
+        1,
+        "general admission must not overturn this iteration's fill-first priority"
+    );
+
+    engine
+        .active_inner()
+        .unwrap()
+        .run_iteration()
+        .await
+        .unwrap();
+    assert_eq!(
+        generated(),
+        2,
+        "the following iteration must resume decode at the active target"
+    );
+    engine.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn request_publication_lock_is_released_during_device_execution() {
     let mut config = EngineConfig::default();
     config.kv_cache.max_blocks = 128;
@@ -5368,18 +3703,18 @@ async fn request_publication_lock_is_released_during_device_execution() {
     let tokenizer: Arc<dyn Tokenizer + Send + Sync> =
         Arc::new(PolicyTokenizer::new(128, &[("test", 5)]));
     let sampler: Arc<dyn Sampler + Send + Sync> = Arc::new(crate::registry::GreedySampler);
-    let executor = Arc::new(PlanRuntimeAdmissionTestExecutor::new_with_prefill_latency(
-        128,
-        Duration::from_millis(100),
-    ));
-    let tensor_factory: Arc<dyn TensorFactory> = Arc::new(MockTensorFactory);
-    let engine = ContinuousBatchEngine::new_plan_runtime(
+    let executor =
+        PlanRuntimeAdmissionTestExecutor::new_with_prefill_latency(128, Duration::from_millis(100));
+    let observation = executor.observer();
+    let executor_owner = ExecutorOwner::new(Box::new(executor));
+    let executor = observation;
+
+    let engine = ContinuousBatchEngine::new(
         config,
         Arc::clone(&scheduler),
         Arc::clone(&tokenizer),
         sampler,
-        executor.clone(),
-        tensor_factory,
+        executor_owner,
     )
     .unwrap();
 
@@ -5391,17 +3726,21 @@ async fn request_publication_lock_is_released_during_device_execution() {
         .insert(PROMPT_TOKENS_METADATA_KEY.to_string(), serde_json::json!(1));
     scheduler.submit(request.clone()).await.unwrap();
     let tokens = tokenizer.encode(&request.prompt, true).unwrap();
-    engine.inner.sequences.write().insert(
-        request.id.clone(),
-        SequenceState::new_with_tokenizer_and_model_vocab_size(
-            request,
-            tokens,
-            Some(tokenizer),
-            Some(128),
-        ),
-    );
+    engine
+        .active_inner()
+        .expect("engine execution is open")
+        .sequences
+        .insert(
+            request.id.clone(),
+            SequenceState::new_with_tokenizer_and_model_vocab_size(
+                request,
+                tokens,
+                Some(tokenizer),
+                Some(128),
+            ),
+        );
 
-    let inner = Arc::clone(&engine.inner);
+    let inner = Arc::clone(&engine.active_inner().expect("engine execution is open"));
     let iteration = tokio::spawn(async move { inner.run_iteration().await });
     tokio::time::timeout(Duration::from_millis(50), async {
         while executor.prefill_calls.load(Ordering::Acquire) == 0 {
@@ -5411,13 +3750,15 @@ async fn request_publication_lock_is_released_during_device_execution() {
     .await
     .expect("test prefill must enter device execution");
 
+    let publication_inner = engine.active_inner().expect("engine execution is open");
     let publication_guard = tokio::time::timeout(
         Duration::from_millis(20),
-        engine.inner.iteration_lock.lock(),
+        publication_inner.iteration_lock.lock(),
     )
     .await
     .expect("request publication must not wait for the device wave");
     drop(publication_guard);
+    drop(publication_inner);
     iteration.await.unwrap().unwrap();
 }
 
@@ -5431,16 +3772,18 @@ async fn plan_runtime_chunked_prefill_retries_exact_chunk_and_samples_only_final
     let tokenizer: Arc<dyn Tokenizer + Send + Sync> =
         Arc::new(ferrum_testkit::MockTokenizer::new(128));
     let sampler: Arc<dyn Sampler + Send + Sync> = Arc::new(ferrum_testkit::MockSampler);
-    let executor = Arc::new(PlanRuntimeChunkedPrefillTestExecutor::new(true));
-    let tensor_factory: Arc<dyn TensorFactory> = Arc::new(MockTensorFactory);
+    let executor = PlanRuntimeChunkedPrefillTestExecutor::new(true);
+    let observation = executor.observer();
+    let executor_owner = ExecutorOwner::new(Box::new(executor));
+    let executor = observation;
+
     let engine = Arc::new(
-        ContinuousBatchEngine::new_plan_runtime(
+        ContinuousBatchEngine::new(
             config,
             Arc::clone(&scheduler),
             tokenizer,
             sampler,
-            executor.clone(),
-            tensor_factory,
+            executor_owner,
         )
         .unwrap(),
     );
@@ -5467,10 +3810,15 @@ async fn plan_runtime_chunked_prefill_retries_exact_chunk_and_samples_only_final
         vec![PrefillChunk::new(0, 2, 5).unwrap()]
     );
     {
-        let sequences = engine.inner.sequences.read();
-        let sequence = sequences
+        let sequences = &engine
+            .active_inner()
+            .expect("engine execution is open")
+            .sequences;
+        let sequence_handle = sequences
             .get(&request_id)
             .expect("deferred prefill retains engine sequence state");
+        let sequence_guard = sequence_handle.lock();
+        let sequence = sequence_guard.as_ref().unwrap();
         assert_eq!(sequence.prefill_tokens_processed, 0);
         assert!(sequence.generated_tokens.is_empty());
     }
@@ -5489,8 +3837,12 @@ async fn plan_runtime_chunked_prefill_retries_exact_chunk_and_samples_only_final
         .expect("chunked prefill inference task must not panic")
         .unwrap();
 
-    assert_eq!(response.finish_reason, FinishReason::Length);
-    assert_eq!(response.tokens.len(), 1, "only the final chunk may sample");
+    assert_eq!(response.response().finish_reason, FinishReason::Length);
+    assert_eq!(
+        response.response().tokens.len(),
+        1,
+        "only the final chunk may sample"
+    );
     assert_eq!(executor.completed_chunks.load(Ordering::Relaxed), 3);
     assert_eq!(
         *executor
@@ -5528,16 +3880,17 @@ async fn plan_runtime_partial_prefill_completion_commits_only_the_executor_prefi
     let tokenizer: Arc<dyn Tokenizer + Send + Sync> =
         Arc::new(ferrum_testkit::MockTokenizer::new(128));
     let sampler: Arc<dyn Sampler + Send + Sync> = Arc::new(ferrum_testkit::MockSampler);
-    let executor =
-        Arc::new(PlanRuntimeChunkedPrefillTestExecutor::new_with_partial_first_prefill());
-    let tensor_factory: Arc<dyn TensorFactory> = Arc::new(MockTensorFactory);
-    let engine = ContinuousBatchEngine::new_plan_runtime(
+    let executor = PlanRuntimeChunkedPrefillTestExecutor::new_with_partial_first_prefill();
+    let observation = executor.observer();
+    let executor_owner = ExecutorOwner::new(Box::new(executor));
+    let executor = observation;
+
+    let engine = ContinuousBatchEngine::new(
         config,
         Arc::clone(&scheduler),
         tokenizer,
         sampler,
-        executor.clone(),
-        tensor_factory,
+        executor_owner,
     )
     .unwrap();
     let mut request = policy_request();
@@ -5546,8 +3899,12 @@ async fn plan_runtime_partial_prefill_completion_commits_only_the_executor_prefi
 
     let response = engine.infer(request).await.unwrap();
 
-    assert_eq!(response.finish_reason, FinishReason::Length);
-    assert_eq!(response.tokens.len(), 1, "only the final prefix may sample");
+    assert_eq!(response.response().finish_reason, FinishReason::Length);
+    assert_eq!(
+        response.response().tokens.len(),
+        1,
+        "only the final prefix may sample"
+    );
     assert_eq!(executor.completed_chunks.load(Ordering::Relaxed), 3);
     assert_eq!(
         *executor
@@ -5584,20 +3941,23 @@ async fn plan_runtime_one_token_prefill_without_external_releaser_fails_closed()
     let tokenizer: Arc<dyn Tokenizer + Send + Sync> =
         Arc::new(ferrum_testkit::MockTokenizer::new(128));
     let sampler: Arc<dyn Sampler + Send + Sync> = Arc::new(ferrum_testkit::MockSampler);
-    let executor = Arc::new(PlanRuntimeChunkedPrefillTestExecutor::new(true));
-    let tensor_factory: Arc<dyn TensorFactory> = Arc::new(MockTensorFactory);
-    let engine = ContinuousBatchEngine::new_plan_runtime(
+    let executor = PlanRuntimeChunkedPrefillTestExecutor::new(true);
+    let observation = executor.observer();
+    let executor_owner = ExecutorOwner::new(Box::new(executor));
+    let executor = observation;
+
+    let engine = ContinuousBatchEngine::new(
         config,
         Arc::clone(&scheduler),
         tokenizer,
         sampler,
-        executor.clone(),
-        tensor_factory,
+        executor_owner,
     )
     .unwrap();
     let mut request = policy_request();
     request.prompt = "one two three four".to_string();
     request.sampling_params.max_tokens = 1;
+    let request_id = request.id.clone();
 
     let error = tokio::time::timeout(Duration::from_secs(2), engine.infer(request))
         .await
@@ -5610,7 +3970,7 @@ async fn plan_runtime_one_token_prefill_without_external_releaser_fails_closed()
     );
     assert!(error
         .to_string()
-        .contains("has no runnable one-token frontier and no external capacity releaser"));
+        .contains("one-token prefill does not fit and has no external capacity releaser"));
     assert_eq!(
         executor.capacity_wait_registrations.load(Ordering::Relaxed),
         0,
@@ -5622,6 +3982,38 @@ async fn plan_runtime_one_token_prefill_without_external_releaser_fails_closed()
             .execution_capacity_blocked_prefill_len,
         0
     );
+    assert_eq!(executor.completed_chunks.load(Ordering::Relaxed), 0);
+    assert_eq!(
+        executor
+            .attempted_chunks
+            .lock()
+            .expect("chunked prefill attempt mutex poisoned")
+            .len(),
+        1,
+        "a terminal minimum frontier must not be retried"
+    );
+    assert!(executor.tokens.frontier_for_request(&request_id).is_none());
+    assert!(executor
+        .retained
+        .lock()
+        .expect("chunked prefill retained mutex poisoned")
+        .is_empty());
+    assert!(!engine
+        .active_inner()
+        .expect("engine execution is open")
+        .sequences
+        .get(&request_id)
+        .is_some());
+    assert_eq!(
+        engine
+            .active_inner()
+            .expect("engine execution is open")
+            .execution_closes
+            .unreclaimed_count(),
+        0
+    );
+    assert_eq!(scheduler.active_count(), 0);
+    assert_eq!(scheduler.waiting_count(), 0);
     engine.shutdown().await.unwrap();
 }
 
@@ -5637,15 +4029,17 @@ async fn plan_runtime_backing_maintenance_advances_epoch_before_prefill() {
     let tokenizer: Arc<dyn Tokenizer + Send + Sync> =
         Arc::new(ferrum_testkit::MockTokenizer::new(128));
     let sampler: Arc<dyn Sampler + Send + Sync> = Arc::new(ferrum_testkit::MockSampler);
-    let executor = Arc::new(PlanRuntimeMaintenanceTestExecutor::new(128));
-    let tensor_factory: Arc<dyn TensorFactory> = Arc::new(MockTensorFactory);
-    let engine = ContinuousBatchEngine::new_plan_runtime(
+    let executor = PlanRuntimeMaintenanceTestExecutor::new(128);
+    let observation = executor.observer();
+    let executor_owner = ExecutorOwner::new(Box::new(executor));
+    let executor = observation;
+
+    let engine = ContinuousBatchEngine::new(
         config,
         Arc::clone(&scheduler),
         tokenizer,
         sampler,
-        executor.clone(),
-        tensor_factory,
+        executor_owner,
     )
     .unwrap();
     let mut request = policy_request();
@@ -5654,7 +4048,7 @@ async fn plan_runtime_backing_maintenance_advances_epoch_before_prefill() {
 
     let response = engine.infer(request).await.unwrap();
 
-    assert_eq!(response.finish_reason, FinishReason::Length);
+    assert_eq!(response.response().finish_reason, FinishReason::Length);
     assert_eq!(executor.admission_probes.load(Ordering::Relaxed), 2);
     assert_eq!(executor.maintenance_calls.load(Ordering::Relaxed), 1);
     assert_eq!(executor.prefill_calls.load(Ordering::Relaxed), 1);
@@ -5747,7 +4141,7 @@ async fn plan_runtime_backing_maintenance_advances_epoch_before_prefill() {
 fn plan_runtime_wait_for_release_engine() -> (
     Arc<ContinuousBatchEngine>,
     Arc<ContinuousBatchScheduler>,
-    Arc<PlanRuntimeMaintenanceTestExecutor>,
+    Arc<PlanRuntimeMaintenanceObservation>,
 ) {
     let mut config = EngineConfig::default();
     config.kv_cache.max_blocks = 128;
@@ -5755,26 +4149,28 @@ fn plan_runtime_wait_for_release_engine() -> (
     let tokenizer: Arc<dyn Tokenizer + Send + Sync> =
         Arc::new(ferrum_testkit::MockTokenizer::new(128));
     let sampler: Arc<dyn Sampler + Send + Sync> = Arc::new(ferrum_testkit::MockSampler);
-    let executor = Arc::new(PlanRuntimeMaintenanceTestExecutor::with_behavior(
+    let executor = PlanRuntimeMaintenanceTestExecutor::with_behavior(
         128,
         TestMaintenanceBehavior::WaitForRelease,
-    ));
-    let tensor_factory: Arc<dyn TensorFactory> = Arc::new(MockTensorFactory);
+    );
+    let observation = executor.observer();
+    let executor_owner = ExecutorOwner::new(Box::new(executor));
+    let executor = observation;
+
     let engine = Arc::new(
-        ContinuousBatchEngine::new_plan_runtime(
+        ContinuousBatchEngine::new(
             config,
             Arc::clone(&scheduler),
             tokenizer,
             sampler,
-            executor.clone(),
-            tensor_factory,
+            executor_owner,
         )
         .unwrap(),
     );
     (engine, scheduler, executor)
 }
 
-async fn wait_for_capacity_wait(executor: &PlanRuntimeMaintenanceTestExecutor) {
+async fn wait_for_capacity_wait(executor: &PlanRuntimeMaintenanceObservation) {
     tokio::time::timeout(Duration::from_secs(1), async {
         while executor.maintenance_calls.load(Ordering::Acquire) == 0
             || executor.capacity_wait_registrations.load(Ordering::Acquire) == 0
@@ -5795,10 +4191,18 @@ async fn plan_runtime_capacity_pressure_waits_without_spinning_then_retries_on_r
     let inference = tokio::spawn(async move { infer_engine.infer(request).await });
 
     wait_for_capacity_wait(&executor).await;
-    let parked_iteration = engine.inner.iteration_count.load(Ordering::Acquire);
+    let parked_iteration = engine
+        .active_inner()
+        .expect("engine execution is open")
+        .iteration_count
+        .load(Ordering::Acquire);
     tokio::time::sleep(Duration::from_millis(20)).await;
     assert_eq!(
-        engine.inner.iteration_count.load(Ordering::Acquire),
+        engine
+            .active_inner()
+            .expect("engine execution is open")
+            .iteration_count
+            .load(Ordering::Acquire),
         parked_iteration,
         "a registered capacity wait must park the background loop"
     );
@@ -5814,7 +4218,7 @@ async fn plan_runtime_capacity_pressure_waits_without_spinning_then_retries_on_r
         .expect("release epoch must wake the waiting request")
         .expect("inference task must not panic")
         .unwrap();
-    assert_eq!(response.finish_reason, FinishReason::Length);
+    assert_eq!(response.response().finish_reason, FinishReason::Length);
     assert_eq!(executor.admission_probes.load(Ordering::Relaxed), 2);
     assert_eq!(executor.maintenance_calls.load(Ordering::Relaxed), 1);
     assert_eq!(executor.prefill_calls.load(Ordering::Relaxed), 1);
@@ -5838,17 +4242,34 @@ async fn plan_runtime_capacity_wait_wakes_and_cancels_when_stream_is_dropped() {
     let stream = engine.infer_stream(request).await.unwrap();
 
     wait_for_capacity_wait(&executor).await;
-    let parked_iteration = engine.inner.iteration_count.load(Ordering::Acquire);
+    let parked_iteration = engine
+        .active_inner()
+        .expect("engine execution is open")
+        .iteration_count
+        .load(Ordering::Acquire);
     drop(stream);
 
     tokio::time::timeout(Duration::from_secs(1), async {
-        while engine.inner.sequences.read().contains_key(&request_id) {
+        while engine
+            .active_inner()
+            .expect("engine execution is open")
+            .sequences
+            .get(&request_id)
+            .is_some()
+        {
             tokio::task::yield_now().await;
         }
     })
     .await
     .expect("dropping the stream must wake cancellation without a capacity release");
-    assert!(engine.inner.iteration_count.load(Ordering::Acquire) > parked_iteration);
+    assert!(
+        engine
+            .active_inner()
+            .expect("engine execution is open")
+            .iteration_count
+            .load(Ordering::Acquire)
+            > parked_iteration
+    );
     assert_eq!(scheduler.trace_phase(&request_id), None);
     assert_eq!(scheduler.trace_snapshot().cancelled_total, 1);
     assert_eq!(scheduler.waiting_count(), 0);
@@ -5872,7 +4293,13 @@ async fn plan_runtime_capacity_wait_wakes_and_cancels_when_sync_future_is_aborte
         .is_cancelled());
 
     tokio::time::timeout(Duration::from_secs(1), async {
-        while engine.inner.sequences.read().contains_key(&request_id) {
+        while engine
+            .active_inner()
+            .expect("engine execution is open")
+            .sequences
+            .get(&request_id)
+            .is_some()
+        {
             tokio::task::yield_now().await;
         }
     })
@@ -5892,24 +4319,19 @@ async fn plan_runtime_capacity_wait_accepts_new_work_and_shutdown_without_reprob
     let tokenizer: Arc<dyn Tokenizer + Send + Sync> =
         Arc::new(ferrum_testkit::MockTokenizer::new(128));
     let sampler: Arc<dyn Sampler + Send + Sync> = Arc::new(ferrum_testkit::MockSampler);
-    let executor = Arc::new(PlanRuntimeMaintenanceTestExecutor::with_behavior(
+    let executor = PlanRuntimeMaintenanceTestExecutor::with_behavior(
         128,
         TestMaintenanceBehavior::WaitForRelease,
-    ));
-    let tensor_factory: Arc<dyn TensorFactory> = Arc::new(MockTensorFactory);
-    let engine = Arc::new(
-        ContinuousBatchEngine::new_plan_runtime(
-            config,
-            scheduler,
-            tokenizer,
-            sampler,
-            executor.clone(),
-            tensor_factory,
-        )
-        .unwrap(),
     );
-    engine.inner.bg_loop_spawned.store(true, Ordering::Release);
-    let background = engine.start_loop();
+    let observation = executor.observer();
+    let executor_owner = ExecutorOwner::new(Box::new(executor));
+    let executor = observation;
+
+    let engine = Arc::new(
+        ContinuousBatchEngine::new(config, scheduler, tokenizer, sampler, executor_owner).unwrap(),
+    );
+    let original_inner = Arc::downgrade(&engine.active_inner().expect("engine execution is open"));
+    let background = engine.start_loop().unwrap();
 
     let mut first = policy_request();
     first.sampling_params.max_tokens = 1;
@@ -5945,12 +4367,44 @@ async fn plan_runtime_capacity_wait_accepts_new_work_and_shutdown_without_reprob
     assert_eq!(executor.prefill_calls.load(Ordering::Acquire), 0);
 
     engine.shutdown().await.unwrap();
-    tokio::time::timeout(Duration::from_secs(1), background)
+    let report = tokio::time::timeout(Duration::from_secs(1), background.wait())
         .await
-        .expect("shutdown must interrupt the capacity waiter")
+        .expect("shutdown must interrupt the capacity waiter");
+    report
+        .result()
         .expect("capacity-waiting background loop must not panic");
-    first_task.abort();
-    second_task.abort();
+    assert_eq!(
+        report
+            .executor_shutdown()
+            .expect("standalone Engine closes its original executor")
+            .snapshot()
+            .phase(),
+        ferrum_execution::executor_lifecycle::ExecutorShutdownPhase::Retired,
+    );
+    for task in [first_task, second_task] {
+        assert!(tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("shutdown must notify every parked request")
+            .expect("inference task must not panic")
+            .is_err());
+    }
+    assert!(matches!(
+        engine.active_inner(),
+        Err(FerrumError::Scheduler { message }) if message.contains("engine is closing")
+    ));
+    assert!(
+        original_inner.upgrade().is_none(),
+        "the original sequence registry and Engine scope are retired"
+    );
+    assert!(
+        executor.tokens.0.upgrade().is_none(),
+        "observation must not keep the original executor token state alive"
+    );
+    assert!(executor.retained.lock().unwrap().is_empty());
+    assert_eq!(engine.scheduler.waiting_count(), 0);
+    assert_eq!(engine.scheduler.trace_snapshot().active_len, 0);
+    assert_eq!(executor.admission_probes.load(Ordering::Acquire), 2);
+    assert_eq!(executor.prefill_calls.load(Ordering::Acquire), 0);
 }
 
 #[tokio::test]
@@ -5961,18 +4415,20 @@ async fn plan_runtime_retry_admission_does_not_require_a_published_epoch() {
     let tokenizer: Arc<dyn Tokenizer + Send + Sync> =
         Arc::new(ferrum_testkit::MockTokenizer::new(128));
     let sampler: Arc<dyn Sampler + Send + Sync> = Arc::new(ferrum_testkit::MockSampler);
-    let executor = Arc::new(PlanRuntimeMaintenanceTestExecutor::with_behavior(
+    let executor = PlanRuntimeMaintenanceTestExecutor::with_behavior(
         128,
         TestMaintenanceBehavior::RetryAdmission,
-    ));
-    let tensor_factory: Arc<dyn TensorFactory> = Arc::new(MockTensorFactory);
-    let engine = ContinuousBatchEngine::new_plan_runtime(
+    );
+    let observation = executor.observer();
+    let executor_owner = ExecutorOwner::new(Box::new(executor));
+    let executor = observation;
+
+    let engine = ContinuousBatchEngine::new(
         config,
         Arc::clone(&scheduler),
         tokenizer,
         sampler,
-        executor.clone(),
-        tensor_factory,
+        executor_owner,
     )
     .unwrap();
     let mut request = policy_request();
@@ -5983,7 +4439,7 @@ async fn plan_runtime_retry_admission_does_not_require_a_published_epoch() {
         .expect("physical recheck must force a bounded admission retry")
         .unwrap();
 
-    assert_eq!(response.finish_reason, FinishReason::Length);
+    assert_eq!(response.response().finish_reason, FinishReason::Length);
     assert_eq!(executor.admission_probes.load(Ordering::Relaxed), 2);
     assert_eq!(executor.maintenance_calls.load(Ordering::Relaxed), 1);
     assert_eq!(executor.prefill_calls.load(Ordering::Relaxed), 1);
@@ -6004,31 +4460,60 @@ async fn plan_runtime_invalid_maintenance_fails_waiting_request_without_retry_lo
         let tokenizer: Arc<dyn Tokenizer + Send + Sync> =
             Arc::new(ferrum_testkit::MockTokenizer::new(128));
         let sampler: Arc<dyn Sampler + Send + Sync> = Arc::new(ferrum_testkit::MockSampler);
-        let executor = Arc::new(PlanRuntimeMaintenanceTestExecutor::with_behavior(
-            128, behavior,
-        ));
-        let tensor_factory: Arc<dyn TensorFactory> = Arc::new(MockTensorFactory);
-        let engine = ContinuousBatchEngine::new_plan_runtime(
+        let executor = PlanRuntimeMaintenanceTestExecutor::with_behavior(128, behavior);
+        let observation = executor.observer();
+        let executor_owner = ExecutorOwner::new(Box::new(executor));
+        let executor = observation;
+
+        let engine = ContinuousBatchEngine::new(
             config,
             Arc::clone(&scheduler),
             tokenizer,
             sampler,
-            executor.clone(),
-            tensor_factory,
+            executor_owner,
         )
         .unwrap();
         let mut request = policy_request();
         request.sampling_params.max_tokens = 1;
+        let request_id = request.id.clone();
 
-        let response = tokio::time::timeout(Duration::from_secs(2), engine.infer(request))
+        let error = tokio::time::timeout(Duration::from_secs(2), engine.infer(request))
             .await
             .expect("invalid maintenance must not leave the request waiting forever")
-            .unwrap();
+            .expect_err("maintenance failure must preserve the terminal error for the caller");
 
-        assert_eq!(response.finish_reason, FinishReason::Error);
+        match (behavior, &error) {
+            (TestMaintenanceBehavior::Fail, FerrumError::Backend { message }) => {
+                assert_eq!(message, "synthetic backing allocation failure");
+            }
+            (TestMaintenanceBehavior::IncoherentRebalance, FerrumError::Internal { message }) => {
+                assert!(message.contains("reported growth without installed capacity"));
+            }
+            _ => panic!("maintenance returned an unrelated terminal error: {error:?}"),
+        }
         assert_eq!(executor.admission_probes.load(Ordering::Relaxed), 1);
         assert_eq!(executor.maintenance_calls.load(Ordering::Relaxed), 1);
         assert_eq!(executor.prefill_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            executor.capacity_wait_registrations.load(Ordering::Relaxed),
+            0
+        );
+        assert!(executor.tokens.frontier_for_request(&request_id).is_none());
+        assert!(!engine
+            .active_inner()
+            .expect("engine execution is open")
+            .sequences
+            .get(&request_id)
+            .is_some());
+        assert_eq!(
+            engine
+                .active_inner()
+                .expect("engine execution is open")
+                .execution_closes
+                .unreclaimed_count(),
+            0
+        );
+        assert_eq!(scheduler.active_count(), 0);
         assert_eq!(scheduler.waiting_count(), 0);
         assert_eq!(scheduler.trace_snapshot().dynamic_admission_failed, 1);
         assert!(executor
@@ -6044,7 +4529,10 @@ async fn plan_runtime_invalid_maintenance_fails_waiting_request_without_retry_lo
 #[should_panic(expected = "request slot lease dropped without explicit reject or close")]
 fn request_slot_lease_drop_without_consumption_panics_in_tests() {
     let engine = test_continuous_engine();
-    let _lease = RequestSlotLease::open(&engine.inner, RequestId::new());
+    let _lease = RequestSlotLease::open(
+        &engine.active_inner().expect("engine execution is open"),
+        RequestId::new(),
+    );
 }
 
 #[test]
@@ -6053,679 +4541,10 @@ fn sequence_state_drop_with_owned_request_slot_panics_in_tests() {
     let engine = test_continuous_engine();
     let request = policy_request();
     let mut sequence = SequenceState::new(request.clone(), vec![TokenId::new(1)]);
-    sequence.request_slot = Some(RequestSlotLease::open(&engine.inner, request.id));
-}
-
-#[test]
-#[should_panic(expected = "unified prefill resources dropped without explicit release or commit")]
-fn unified_prefill_owned_resources_drop_without_release_or_commit_panics_in_tests() {
-    let _resources = UnifiedPrefillOwnedResources::default()
-        .with_fresh_kv(SequenceKvAllocation::new(RequestId::new(), 1));
-}
-
-#[test]
-fn unified_prefill_owned_resources_commit_consumes_transaction() {
-    let mut resources = UnifiedPrefillOwnedResources::default()
-        .with_fresh_kv(SequenceKvAllocation::new(RequestId::new(), 1));
-    assert!(!resources.is_empty());
-
-    std::mem::take(&mut resources).commit();
-
-    assert!(resources.is_empty());
-}
-
-#[test]
-fn sequence_take_completion_resources_moves_request_slot_and_physical_resources_together() {
-    let engine = test_continuous_engine();
-    let request = policy_request();
-    let request_id = request.id.clone();
-    let mut sequence = SequenceState::new(request, vec![TokenId::new(1)]);
-    let model_kv: Arc<dyn KvCacheHandle> = Arc::new(ferrum_testkit::MockKvCacheHandle::new(
-        request_id.clone(),
-        1,
-        1,
+    sequence.request_slot = Some(RequestSlotLease::open(
+        &engine.active_inner().expect("engine execution is open"),
+        request.id,
     ));
-    let model_cache_id = model_kv.cache_id();
-    sequence.install_legacy_allocated_model_kv(
-        model_kv,
-        SequenceKvAllocation::new(request_id.clone(), 2),
-    );
-
-    let mut request_slot = RequestSlotLease::open(&engine.inner, request_id.clone());
-    request_slot.admit(&engine.inner);
-    sequence.request_slot = Some(request_slot);
-
-    let completion_resources = sequence.take_completion_resources();
-
-    assert_eq!(
-        completion_resources.physical.legacy_kv_allocation,
-        Some(SequenceKvAllocation::new(request_id.clone(), 2))
-    );
-    assert_eq!(
-        completion_resources.physical.model_cache_id(),
-        Some(model_cache_id.as_str())
-    );
-    assert!(completion_resources.request_slot.is_some());
-    assert!(sequence.kv_cache_handle().is_none());
-    assert!(sequence.model_cache_id().is_none());
-    assert!(sequence.request_slot.is_none());
-
-    completion_resources
-        .request_slot
-        .expect("request slot")
-        .close(&engine.inner);
-}
-
-#[tokio::test]
-async fn sequence_take_physical_resources_for_recompute_clears_owned_resources() {
-    let request = policy_request();
-    let request_id = request.id.clone();
-    let mut sequence = SequenceState::new(request, vec![TokenId::new(1)]);
-    let model_kv: Arc<dyn KvCacheHandle> = Arc::new(ferrum_testkit::MockKvCacheHandle::new(
-        request_id.clone(),
-        1,
-        1,
-    ));
-    let model_cache_id = model_kv.cache_id();
-    sequence.install_legacy_allocated_model_kv(
-        model_kv,
-        SequenceKvAllocation::new(request_id.clone(), 2),
-    );
-    sequence.prefill_complete = true;
-    sequence.phase = RequestPhase::Decoding;
-    sequence.tokens_this_iteration = 4;
-
-    let recurrent_manager = InMemoryRecurrentStateManager::new(InMemoryRecurrentStateConfig {
-        total_memory_bytes: 8,
-        total_batch_slots: 1,
-    });
-    let recurrent_spec = RecurrentStateSpec {
-        request_id: request_id.clone(),
-        num_layers: 1,
-        tensors: vec![RecurrentStateTensorSpec::new(
-            0,
-            "state",
-            vec![1],
-            DataType::FP32,
-        )],
-        device: Device::CPU,
-        max_batch_slots: 1,
-    };
-    let recurrent_state = recurrent_manager.allocate(&recurrent_spec).await.unwrap();
-    sequence.commit_recurrent_state_admission(recurrent_state, 1);
-
-    let resources = sequence.take_physical_resources_for_recompute();
-
-    assert_eq!(
-        resources.legacy_kv_allocation,
-        Some(SequenceKvAllocation::new(request_id.clone(), 2))
-    );
-    assert_eq!(
-        resources.recurrent_state_allocation,
-        Some(SequenceRecurrentAllocation::new(Some(1)))
-    );
-    assert_eq!(resources.model_cache_id(), Some(model_cache_id.as_str()));
-    assert!(sequence.kv_cache_handle().is_none());
-    assert!(sequence.kv_resource_blocks().is_none());
-    assert!(sequence.recurrent_state.is_none());
-    assert!(sequence.recurrent_state_slots().is_none());
-    assert!(sequence.model_cache_id().is_none());
-    assert!(!sequence.prefill_complete);
-    assert_eq!(sequence.phase, RequestPhase::Waiting);
-    assert_eq!(sequence.tokens_this_iteration, 0);
-}
-
-#[test]
-fn sequence_take_physical_resources_keeps_runtime_managed_kv_out_of_legacy_manager() {
-    let request = policy_request();
-    let request_id = request.id.clone();
-    let mut sequence = SequenceState::new(request, vec![TokenId::new(1)]);
-    let model_kv: Arc<dyn KvCacheHandle> = Arc::new(ferrum_testkit::MockKvCacheHandle::new(
-        request_id.clone(),
-        1,
-        1,
-    ));
-    let model_cache_id = model_kv.cache_id();
-
-    sequence.install_runtime_managed_model_kv(model_kv);
-    let resources = sequence.take_physical_resources();
-
-    assert!(resources.legacy_kv_allocation.is_none());
-    assert!(resources.recurrent_state_allocation.is_none());
-    assert_eq!(resources.model_cache_id(), Some(model_cache_id.as_str()));
-    assert!(sequence.kv_cache_handle().is_none());
-    assert!(sequence.kv_resource_blocks().is_none());
-}
-
-#[test]
-fn sequence_prefill_commit_helpers_keep_resource_metadata_together() {
-    let request = policy_request();
-    let request_id = request.id.clone();
-    let mut sequence = SequenceState::new(request, vec![TokenId::new(1)]);
-    let model_kv: Arc<dyn KvCacheHandle> = Arc::new(ferrum_testkit::MockKvCacheHandle::new(
-        request_id.clone(),
-        1,
-        1,
-    ));
-    let model_cache_id = model_kv.cache_id();
-
-    sequence.install_runtime_managed_model_kv(model_kv.clone());
-    assert!(sequence.kv_cache_handle().is_some());
-    assert_eq!(sequence.model_cache_id(), Some(model_cache_id.as_str()));
-    assert!(sequence.kv_resource_blocks().is_none());
-
-    let cached_kv: Arc<dyn KvCacheHandle> = Arc::new(ferrum_testkit::MockKvCacheHandle::new(
-        RequestId::new(),
-        1,
-        2,
-    ));
-    let cached_cache_id = cached_kv.cache_id();
-    sequence.commit_plan_runtime_prefill_chunk_resources(cached_kv, 1, true);
-    assert_eq!(sequence.model_cache_id(), Some(cached_cache_id.as_str()));
-    assert!(sequence.kv_cache_handle().is_some());
-    assert_eq!(sequence.kv_resource_blocks(), None);
-    assert_eq!(sequence.prefill_tokens_processed, 1);
-    assert!(sequence.prefill_complete);
-    assert_eq!(sequence.phase, RequestPhase::Decoding);
-
-    let owned_kv: Arc<dyn KvCacheHandle> = Arc::new(ferrum_testkit::MockKvCacheHandle::new(
-        request_id.clone(),
-        1,
-        2,
-    ));
-    let owned_cache_id = owned_kv.cache_id();
-    sequence.commit_prefill_physical_resources(owned_kv.clone(), 4, None, None);
-
-    assert_eq!(sequence.model_cache_id(), Some(owned_cache_id.as_str()));
-    assert!(sequence.kv_cache_handle().is_some());
-    assert_eq!(sequence.kv_resource_blocks(), Some(4));
-    assert!(sequence.recurrent_state.is_none());
-    assert!(sequence.recurrent_state_slots().is_none());
-    assert!(sequence.prefill_complete);
-    assert_eq!(sequence.phase, RequestPhase::Decoding);
-
-    let resources = sequence.prefill_resources();
-    assert!(resources.kv_cache_handle().is_some());
-    assert_eq!(resources.kv_resource_blocks(), Some(4));
-    assert!(resources.recurrent_state.is_none());
-    assert_eq!(
-        resources.prefill_tokens_processed,
-        sequence.prefill_tokens_processed
-    );
-}
-
-#[test]
-fn sequence_prefill_chunk_commit_tracks_partial_and_final_state() {
-    let request = policy_request();
-    let request_id = request.id.clone();
-    let mut sequence = SequenceState::new(request, vec![TokenId::new(1), TokenId::new(2)]);
-
-    let partial_kv: Arc<dyn KvCacheHandle> = Arc::new(ferrum_testkit::MockKvCacheHandle::new(
-        RequestId::new(),
-        1,
-        2,
-    ));
-    let partial_cache_id = partial_kv.cache_id();
-    let recurrent_state = test_recurrent_state_handle(request_id.clone(), 3);
-    let allocation = SequenceKvAllocation::new(request_id.clone(), 2);
-    sequence.commit_recurrent_state_admission(recurrent_state, 3);
-    sequence.commit_prefill_chunk_physical_resources(
-        partial_kv,
-        allocation.clone(),
-        None,
-        1,
-        false,
-    );
-
-    assert_eq!(sequence.model_cache_id(), Some(partial_cache_id.as_str()));
-    assert!(sequence.kv_cache_handle().is_some());
-    assert_eq!(sequence.kv_resource_blocks(), Some(2));
-    assert!(sequence.recurrent_state.is_none());
-    assert!(sequence.recurrent_state_slots().is_none());
-    assert_eq!(sequence.prefill_tokens_processed, 1);
-    assert!(!sequence.prefill_complete);
-    assert_eq!(sequence.phase, RequestPhase::Prefilling);
-
-    let final_kv: Arc<dyn KvCacheHandle> =
-        Arc::new(ferrum_testkit::MockKvCacheHandle::new(request_id, 1, 4));
-    let final_cache_id = final_kv.cache_id();
-    sequence.commit_prefill_chunk_physical_resources(final_kv, allocation, None, 2, true);
-
-    assert_eq!(sequence.model_cache_id(), Some(final_cache_id.as_str()));
-    assert_eq!(sequence.kv_resource_blocks(), Some(2));
-    assert_eq!(sequence.prefill_tokens_processed, 2);
-    assert!(sequence.prefill_complete);
-    assert_eq!(sequence.phase, RequestPhase::Decoding);
-}
-
-#[test]
-fn sequence_decode_commit_helpers_keep_resource_metadata_together() {
-    let request = policy_request();
-    let request_id = request.id.clone();
-    let mut sequence = SequenceState::new(request, vec![TokenId::new(1), TokenId::new(2)]);
-
-    assert_eq!(
-        sequence.decode_model_cache_id_or_request_id(&request_id),
-        request_id.to_string()
-    );
-    let decode_kv: Arc<dyn KvCacheHandle> = Arc::new(ferrum_testkit::MockKvCacheHandle::new(
-        request_id.clone(),
-        1,
-        2,
-    ));
-    let decode_cache_id = decode_kv.cache_id();
-    sequence.install_runtime_managed_model_kv(decode_kv.clone());
-    sequence.generated_tokens.push(TokenId::new(7));
-    assert_eq!(
-        sequence.decode_model_cache_id_or_request_id(&request_id),
-        decode_cache_id
-    );
-    assert_eq!(sequence.decode_model_kv_len_after_last_generated_token(), 2);
-
-    sequence
-        .commit_decode_step_physical_resources(decode_kv)
-        .unwrap();
-    assert!(sequence.kv_cache_handle().is_some());
-    assert_eq!(sequence.tokens_this_iteration, 1);
-    assert_eq!(sequence.model_cache_id(), Some(decode_cache_id.as_str()));
-    let decode_resources = sequence
-        .decode_resources(&request_id)
-        .expect("decode resources");
-    assert_eq!(decode_resources.seq_id, decode_cache_id);
-    assert_eq!(decode_resources.last_token, TokenId::new(7));
-    assert_eq!(decode_resources.pos_offset, 2);
-
-    let recurrent_state = test_recurrent_state_handle(request_id.clone(), 1);
-    sequence.commit_recurrent_state_admission(recurrent_state, 1);
-    sequence.commit_decode_recurrent_state(None);
-    assert!(sequence.recurrent_state.is_none());
-    assert!(sequence.recurrent_state_slots().is_none());
-}
-
-#[test]
-fn sequence_decode_commit_rejects_missing_or_changed_cache_authority() {
-    let request = policy_request();
-    let request_id = request.id.clone();
-    let mut sequence = SequenceState::new(request, vec![TokenId::new(1)]);
-    let first: Arc<dyn KvCacheHandle> = Arc::new(ferrum_testkit::MockKvCacheHandle::new(
-        request_id.clone(),
-        1,
-        1,
-    ));
-    let first_cache_id = first.cache_id();
-
-    let missing = sequence
-        .commit_decode_step_physical_resources(first.clone())
-        .expect_err("decode must not invent a KV release authority");
-    assert!(missing
-        .to_string()
-        .contains("without an active model KV lease"));
-
-    sequence.install_runtime_managed_model_kv(first);
-    let replacement: Arc<dyn KvCacheHandle> = Arc::new(ferrum_testkit::MockKvCacheHandle::new(
-        RequestId::new(),
-        1,
-        2,
-    ));
-    let changed = sequence
-        .commit_decode_step_physical_resources(replacement)
-        .expect_err("decode must not replace one cache authority with another");
-    assert!(changed
-        .to_string()
-        .contains("decode replaced model cache authority"));
-    assert_eq!(
-        sequence.model_cache_id().map(str::to_string),
-        Some(first_cache_id)
-    );
-    assert_eq!(sequence.tokens_this_iteration, 0);
-}
-
-#[test]
-fn sequence_decode_commit_preserves_exact_legacy_allocation() {
-    let request = policy_request();
-    let request_id = request.id.clone();
-    let mut sequence = SequenceState::new(request, vec![TokenId::new(1)]);
-    let initial: Arc<dyn KvCacheHandle> = Arc::new(ferrum_testkit::MockKvCacheHandle::new(
-        request_id.clone(),
-        1,
-        1,
-    ));
-    let allocation = SequenceKvAllocation::new(request_id.clone(), 3);
-    sequence.install_legacy_allocated_model_kv(initial, allocation.clone());
-    let replacement: Arc<dyn KvCacheHandle> =
-        Arc::new(ferrum_testkit::MockKvCacheHandle::new(request_id, 1, 2));
-
-    sequence
-        .commit_decode_step_physical_resources(replacement)
-        .unwrap();
-    let resources = sequence.take_physical_resources();
-
-    assert_eq!(resources.legacy_kv_allocation, Some(allocation));
-    assert!(resources.model_cache_id.is_some());
-}
-
-#[tokio::test]
-async fn sequence_recurrent_admission_helpers_keep_handle_and_slots_together() {
-    let request = policy_request();
-    let request_id = request.id.clone();
-    let mut sequence = SequenceState::new(request, vec![TokenId::new(1)]);
-    let recurrent_manager = InMemoryRecurrentStateManager::new(InMemoryRecurrentStateConfig {
-        total_memory_bytes: 8,
-        total_batch_slots: 1,
-    });
-    let recurrent_spec = RecurrentStateSpec {
-        request_id,
-        num_layers: 1,
-        tensors: vec![RecurrentStateTensorSpec::new(
-            0,
-            "state",
-            vec![1],
-            DataType::FP32,
-        )],
-        device: Device::CPU,
-        max_batch_slots: 1,
-    };
-    let recurrent_state = recurrent_manager.allocate(&recurrent_spec).await.unwrap();
-
-    sequence.commit_recurrent_state_admission(recurrent_state, 1);
-    assert!(sequence.recurrent_state.is_some());
-    assert_eq!(sequence.recurrent_state_slots(), Some(1));
-
-    let slots = sequence.take_recurrent_state_allocation();
-    assert_eq!(slots, Some(1));
-    assert!(sequence.recurrent_state.is_none());
-    assert!(sequence.recurrent_state_slots().is_none());
-}
-
-#[test]
-#[should_panic(expected = "KV allocation lease dropped without explicit commit or async release")]
-fn kv_allocation_lease_drop_without_consumption_panics_in_tests() {
-    let request_id = RequestId::new();
-    let handle: Arc<dyn KvCacheHandle> = Arc::new(ferrum_testkit::MockKvCacheHandle::new(
-        request_id.clone(),
-        1,
-        1,
-    ));
-
-    let _lease = KvAllocationLease::new(request_id.clone(), request_id, handle, 1);
-}
-
-#[tokio::test]
-async fn kv_release_failure_traces_reject_without_successful_release() {
-    let trace_path = resource_trace_temp_path("kv-release-failure");
-    let _ = std::fs::remove_file(&trace_path);
-    let mut config = EngineConfig::default();
-    config.runtime.scheduler_trace_jsonl = Some(trace_path.clone());
-
-    let scheduler = Arc::new(ContinuousBatchScheduler::new(config.scheduler.clone()));
-    let tokenizer: Arc<dyn Tokenizer + Send + Sync> =
-        Arc::new(ferrum_testkit::MockTokenizer::new(128));
-    let sampler: Arc<dyn Sampler + Send + Sync> = Arc::new(ferrum_testkit::MockSampler);
-    let kv_cache: Arc<dyn KvCacheManager + Send + Sync> =
-        Arc::new(FailingDeallocateKvCacheManager::new(256));
-    let tensor_factory: Arc<dyn TensorFactory> = Arc::new(ferrum_testkit::MockTensorFactory);
-    let model_executor: Arc<dyn ModelExecutor + Send + Sync> =
-        Arc::new(ferrum_testkit::MockModelExecutor::instant(128));
-    let engine = ContinuousBatchEngine::new(
-        config,
-        scheduler,
-        tokenizer,
-        sampler,
-        kv_cache,
-        model_executor,
-        tensor_factory,
-    )
-    .expect("legacy engine composition must match executor authority");
-
-    let request_id = RequestId::new();
-    engine.inner.trace_kv_allocate(&request_id, 2);
-    engine
-        .inner
-        .release_kv_allocation(&request_id, request_id.clone(), 2)
-        .await;
-
-    flush_engine_profile_events(&engine);
-    let resources: Vec<_> = read_engine_profile_events(&trace_path)
-        .into_iter()
-        .filter_map(|event| event.resource)
-        .collect();
-    assert!(
-        !resources
-            .iter()
-            .any(|resource| resource.resource_kind == "kv_block"
-                && resource.action == ResourceAction::Release),
-        "failed deallocate must not be traced as a successful release: {resources:?}"
-    );
-    let reject = resources
-        .iter()
-        .find(|resource| {
-            resource.resource_kind == "kv_block" && resource.action == ResourceAction::Reject
-        })
-        .expect("failed KV release should be traced as resource reject");
-    assert!(
-        reject
-            .reason
-            .as_deref()
-            .is_some_and(|reason| reason.contains("kv release failed")),
-        "reject reason should explain release failure: {reject:?}"
-    );
-    let _ = std::fs::remove_file(trace_path);
-}
-
-#[tokio::test]
-async fn recurrent_release_failure_traces_reject_without_successful_release() {
-    let trace_path = resource_trace_temp_path("recurrent-release-failure");
-    let _ = std::fs::remove_file(&trace_path);
-    let mut config = EngineConfig::default();
-    config.runtime.scheduler_trace_jsonl = Some(trace_path.clone());
-
-    let scheduler = Arc::new(ContinuousBatchScheduler::new(config.scheduler.clone()));
-    let tokenizer: Arc<dyn Tokenizer + Send + Sync> =
-        Arc::new(ferrum_testkit::MockTokenizer::new(128));
-    let sampler: Arc<dyn Sampler + Send + Sync> = Arc::new(ferrum_testkit::MockSampler);
-    let kv_cache: Arc<dyn KvCacheManager + Send + Sync> =
-        Arc::new(ferrum_testkit::MockKvCacheManager::new(256));
-    let tensor_factory: Arc<dyn TensorFactory> = Arc::new(ferrum_testkit::MockTensorFactory);
-    let model_executor: Arc<dyn ModelExecutor + Send + Sync> =
-        Arc::new(ferrum_testkit::MockModelExecutor::instant(128));
-    let recurrent_manager: Arc<dyn RecurrentStateManager + Send + Sync> = Arc::new(
-        FailingDeallocateRecurrentStateManager::new(InMemoryRecurrentStateConfig {
-            total_memory_bytes: 8,
-            total_batch_slots: 1,
-        }),
-    );
-    let engine = ContinuousBatchEngine::new_with_recurrent_state_manager(
-        config,
-        scheduler,
-        tokenizer,
-        sampler,
-        kv_cache,
-        model_executor,
-        tensor_factory,
-        Some(recurrent_manager),
-    )
-    .expect("legacy engine composition must match executor authority");
-
-    let request_id = RequestId::new();
-    engine
-        .inner
-        .trace_recurrent_allocate(&request_id, 1, Some(1));
-    engine
-        .inner
-        .release_recurrent_allocation(&request_id, Some(1))
-        .await;
-
-    flush_engine_profile_events(&engine);
-    let resources: Vec<_> = read_engine_profile_events(&trace_path)
-        .into_iter()
-        .filter_map(|event| event.resource)
-        .collect();
-    assert!(
-        !resources
-            .iter()
-            .any(|resource| resource.resource_kind == "recurrent_state_slot"
-                && resource.action == ResourceAction::Release),
-        "failed recurrent deallocate must not be traced as a successful release: {resources:?}"
-    );
-    let reject = resources
-        .iter()
-        .find(|resource| {
-            resource.resource_kind == "recurrent_state_slot"
-                && resource.action == ResourceAction::Reject
-        })
-        .expect("failed recurrent release should be traced as resource reject");
-    assert!(
-        reject
-            .reason
-            .as_deref()
-            .is_some_and(|reason| reason.contains("recurrent-state release failed")),
-        "reject reason should explain release failure: {reject:?}"
-    );
-    let _ = std::fs::remove_file(trace_path);
-}
-
-#[test]
-fn request_owner_close_event_reports_outstanding_resources() {
-    let trace_path = resource_trace_temp_path("request-owner-close-outstanding");
-    let _ = std::fs::remove_file(&trace_path);
-    let mut config = EngineConfig::default();
-    config.runtime.scheduler_trace_jsonl = Some(trace_path.clone());
-
-    let engine = test_continuous_engine_with_config(config);
-    let request_id = RequestId::new();
-
-    engine.inner.trace_request_open(&request_id);
-    engine.inner.trace_request_admitted(&request_id);
-    engine.inner.trace_request_owner_close(&request_id);
-
-    flush_engine_profile_events(&engine);
-    let events = read_engine_profile_events(&trace_path);
-    let close = events
-        .iter()
-        .find(|event| {
-            event
-                .resource
-                .as_ref()
-                .is_some_and(|resource| resource.action == ResourceAction::RequestClose)
-        })
-        .expect("request close event should be present");
-
-    assert_eq!(close.status, ProfileStatus::Failure);
-    assert_eq!(
-        close.error.as_ref().map(|error| error.kind.as_str()),
-        Some("resource_owner_close_outstanding")
-    );
-    assert_eq!(
-        close
-            .resource
-            .as_ref()
-            .and_then(|resource| resource.resource_error_kind.as_deref()),
-        Some("resource_leak")
-    );
-    assert_eq!(
-        close
-            .attributes
-            .get("resource_owner_outstanding_count")
-            .and_then(serde_json::Value::as_u64),
-        Some(1)
-    );
-    let summary = close
-        .attributes
-        .get("resource_owner_close_summary")
-        .and_then(serde_json::Value::as_array)
-        .expect("close summary should be an array");
-    assert!(
-        summary.iter().any(|item| {
-            item.get("resource_kind")
-                .and_then(serde_json::Value::as_str)
-                == Some("request_slot")
-                && item
-                    .get("outstanding_reserved")
-                    .and_then(serde_json::Value::as_i64)
-                    == Some(1)
-                && item
-                    .get("outstanding_committed")
-                    .and_then(serde_json::Value::as_i64)
-                    == Some(1)
-        }),
-        "close summary must identify the leaked request_slot: {summary:?}"
-    );
-
-    let _ = std::fs::remove_file(trace_path);
-}
-
-#[tokio::test]
-#[should_panic(expected = "recurrent-state lease dropped without explicit commit or async release")]
-async fn recurrent_state_lease_drop_without_consumption_panics_in_tests() {
-    let request_id = RequestId::new();
-    let manager = InMemoryRecurrentStateManager::new(InMemoryRecurrentStateConfig {
-        total_memory_bytes: 8,
-        total_batch_slots: 1,
-    });
-    let spec = RecurrentStateSpec {
-        request_id: request_id.clone(),
-        num_layers: 1,
-        tensors: vec![RecurrentStateTensorSpec::new(
-            0,
-            "state",
-            vec![1],
-            DataType::FP32,
-        )],
-        device: Device::CPU,
-        max_batch_slots: 1,
-    };
-    let handle = manager.allocate(&spec).await.unwrap();
-
-    let _lease = RecurrentStateLease::new(request_id, handle, 1, Some(1));
-}
-
-#[test]
-fn model_kv_handle_with_seq_is_executor_decode_handle() {
-    let engine = test_continuous_engine();
-
-    let handle = engine
-        .inner
-        .make_model_kv_handle_with_seq("cache-a".to_string(), 17);
-    let generic = handle
-        .as_any()
-        .downcast_ref::<ferrum_models::executor::common::GenericKvCacheHandle>()
-        .expect("model KV handle must be GenericKvCacheHandle");
-
-    assert_eq!(generic.request_cache_id(), "cache-a");
-    assert_eq!(handle.block_table().sequence_length, 17);
-}
-
-#[test]
-fn decode_ready_request_ids_skip_preempted_sequences_without_kv() {
-    let engine = test_continuous_engine();
-    let ready_request = policy_request();
-    let ready_id = ready_request.id.clone();
-    let preempted_request = policy_request();
-    let preempted_id = preempted_request.id.clone();
-
-    let ready_kv = engine
-        .inner
-        .make_model_kv_handle_with_seq("ready-cache".to_string(), 2);
-    let mut ready_seq = SequenceState::new(ready_request, vec![TokenId::new(1)]);
-    ready_seq.generated_tokens.push(TokenId::new(2));
-    ready_seq.prefill_complete = true;
-    ready_seq.install_runtime_managed_model_kv(ready_kv);
-
-    let mut preempted_seq = SequenceState::new(preempted_request, vec![TokenId::new(1)]);
-    preempted_seq.generated_tokens.push(TokenId::new(2));
-    preempted_seq.prefill_complete = false;
-
-    {
-        let mut sequences = engine.inner.sequences.write();
-        sequences.insert(ready_id.clone(), ready_seq);
-        sequences.insert(preempted_id.clone(), preempted_seq);
-    }
-
-    let ready = engine
-        .inner
-        .decode_ready_request_ids(&[ready_id.clone(), preempted_id]);
-
-    assert_eq!(ready, vec![ready_id]);
 }
 
 #[tokio::test]
@@ -6734,14 +4553,8 @@ async fn scheduler_trace_plan_stats_reports_request_details() {
     let request = policy_request();
     let request_id = request.id.clone();
 
-    engine
-        .inner
-        .scheduler
-        .submit(request.clone())
-        .await
-        .unwrap();
+    engine.scheduler.submit(request.clone()).await.unwrap();
     let batch = engine
-        .inner
         .scheduler
         .next_batch(ferrum_interfaces::BatchHint {
             max_batch_size: 4,
@@ -6764,11 +4577,17 @@ async fn scheduler_trace_plan_stats_reports_request_details() {
     );
     seq.prefill_tokens_processed = 1;
     {
-        let mut sequences = engine.inner.sequences.write();
+        let sequences = &engine
+            .active_inner()
+            .expect("engine execution is open")
+            .sequences;
         sequences.insert(request_id.clone(), seq);
     }
 
-    let stats = engine.inner.scheduler_trace_plan_stats(&batch);
+    let stats = engine
+        .active_inner()
+        .expect("engine execution is open")
+        .scheduler_trace_plan_stats(&batch);
     assert_eq!(stats.batch_size, 1);
     assert_eq!(stats.prefill_items, 1);
     assert_eq!(stats.prefill_tokens, 4);
@@ -6801,8 +4620,8 @@ async fn scheduler_trace_jsonl_resource_events_balance_successful_infer() {
     let request_id = request.id.clone();
     let response = engine.infer(request).await.unwrap();
 
-    assert_eq!(response.request_id, request_id);
-    assert_eq!(response.finish_reason, FinishReason::Length);
+    assert_eq!(response.response().request_id, request_id);
+    assert_eq!(response.response().finish_reason, FinishReason::Length);
 
     engine.shutdown().await.unwrap();
     let resources = assert_engine_resource_trace_balanced(&trace_path);
@@ -6817,15 +4636,9 @@ async fn scheduler_trace_jsonl_resource_events_balance_successful_infer() {
     assert!(saw("request_slot", ResourceAction::Commit));
     assert!(saw("request_slot", ResourceAction::Release));
     assert!(saw("request_slot", ResourceAction::RequestClose));
-    assert!(saw("kv_block", ResourceAction::Reserve));
-    assert!(saw("kv_block", ResourceAction::Commit));
-    assert!(saw("kv_block", ResourceAction::Release));
-    assert!(saw("model_cache_ref", ResourceAction::Reserve));
-    assert!(saw("model_cache_ref", ResourceAction::Commit));
-    assert!(saw("model_cache_ref", ResourceAction::Release));
-    assert!(saw("backend_workspace", ResourceAction::Reserve));
-    assert!(saw("backend_workspace", ResourceAction::Commit));
-    assert!(saw("backend_workspace", ResourceAction::Release));
+    assert!(resources
+        .iter()
+        .all(|resource| resource.resource_kind == "request_slot"));
 
     let events = read_engine_profile_events(&trace_path);
     let request_open = events
@@ -7137,27 +4950,64 @@ fn vnext_profile_preserves_the_complete_canonical_execution_identity() {
 
 #[test]
 fn basic_vnext_profile_serializes_identity_once_and_stays_within_request_budget() {
+    assert_compact_vnext_profile(ObservabilityProfileDetail::Basic);
+}
+
+#[test]
+fn off_vnext_profile_compacts_nodes_and_preserves_lifecycle_identity() {
+    assert_compact_vnext_profile(ObservabilityProfileDetail::Off);
+}
+
+fn assert_compact_vnext_profile(detail: ObservabilityProfileDetail) {
     use ferrum_runtime::ExecutionEventKind;
 
     const NODES_PER_REQUEST: usize = 132;
     const LIFECYCLE_EVENTS_PER_REQUEST: usize = 6;
     const MAX_BYTES_PER_REQUEST: usize = 1024 * 1024;
 
-    let trace_path = resource_trace_temp_path("vnext-basic-compact-execution-identity");
+    let trace_path = resource_trace_temp_path(&format!(
+        "vnext-{}-compact-execution-identity",
+        detail.as_str()
+    ));
     let journal = create_scheduler_trace_sink(Some(&trace_path)).unwrap();
     let mut config = EngineConfig::default();
-    config.runtime.profile_detail = ObservabilityProfileDetail::Basic;
+    config.runtime.profile_detail = detail;
     let sink =
         VNextProfileExecutionEventSink::new(journal.clone(), ProfileEntrypoint::Serve, &config);
+
+    assert_eq!(
+        sink.capture_policy(),
+        ExecutionEventCapturePolicy::FirstFramePerRequest
+    );
+    assert_eq!(
+        sink.device_timing_mode(),
+        match detail {
+            ObservabilityProfileDetail::Off => ferrum_runtime::DeviceTimingMode::Off,
+            ObservabilityProfileDetail::Basic => ferrum_runtime::DeviceTimingMode::Completion,
+            _ => unreachable!("this helper checks Off and Basic projections"),
+        }
+    );
+    assert_eq!(
+        sink.execution_facts_capture(),
+        ferrum_runtime::ExecutionFactsCapture::Off
+    );
 
     let operation = sink
         .profile_event(&vnext_profile_test_operation_event())
         .unwrap();
     operation.validate().unwrap();
-    assert!(!operation.attributes.contains_key("execution_identity"));
-    assert!(!operation.attributes.contains_key("execution_request_id"));
-    assert!(!operation.attributes.contains_key("backend_device"));
-    assert!(!operation.attributes.contains_key("backend_type"));
+    for field in [
+        "execution_identity",
+        "execution_request_id",
+        "backend_device",
+        "backend_type",
+    ] {
+        assert_eq!(
+            operation.attributes.contains_key(field),
+            detail == ObservabilityProfileDetail::Off,
+            "{detail:?} operation projection changed {field}"
+        );
+    }
     assert_eq!(
         operation.attributes["execution_identity_version"],
         ferrum_runtime::EXECUTION_IDENTITY_VERSION.to_string()
@@ -7206,6 +5056,13 @@ fn basic_vnext_profile_serializes_identity_once_and_stays_within_request_budget(
         ))
         .unwrap();
     for event in [&started, &retired] {
+        event.validate().unwrap();
+        assert_eq!(event.request_id, operation.request_id);
+        assert_eq!(event.shape["frame_id"], operation.shape["frame_id"]);
+        assert_eq!(
+            event.shape["node_invocation_id"],
+            operation.shape["node_invocation_id"]
+        );
         for field in [
             "plan_id",
             "plan_hash",
@@ -7228,6 +5085,9 @@ fn basic_vnext_profile_serializes_identity_once_and_stays_within_request_budget(
         }
         for field in [
             "execution_identity",
+            "execution_request_id",
+            "backend_device",
+            "backend_type",
             "resource_pool_identity_fingerprint",
             "provisioning_run_id",
             "provisioning_request_id",
@@ -7245,6 +5105,16 @@ fn basic_vnext_profile_serializes_identity_once_and_stays_within_request_budget(
 
     let (_, _, accepted) = vnext_profile_test_event();
     let lifecycle = sink.profile_event(&accepted).unwrap();
+    lifecycle.validate().unwrap();
+    assert_eq!(lifecycle.phase, "vnext.request_accepted");
+    assert_eq!(
+        lifecycle.attributes["vnext_monotonic_wall_anchor_unix_nanos"],
+        1_700_000_000_000_000_000_i64
+    );
+    assert_eq!(
+        lifecycle.attributes.contains_key("execution_identity"),
+        detail == ObservabilityProfileDetail::Off
+    );
     let serialized_request_upper_bound = NODES_PER_REQUEST
         * (serde_json::to_vec(&started).unwrap().len()
             + serde_json::to_vec(&operation).unwrap().len()
@@ -7254,16 +5124,46 @@ fn basic_vnext_profile_serializes_identity_once_and_stays_within_request_budget(
                 .unwrap()
                 .len()
                 .max(serde_json::to_vec(&lifecycle).unwrap().len());
-    assert!(
-        serialized_request_upper_bound <= MAX_BYTES_PER_REQUEST,
-        "basic execution trace upper bound is {serialized_request_upper_bound} bytes"
-    );
+    if detail == ObservabilityProfileDetail::Basic {
+        assert!(
+            serialized_request_upper_bound <= MAX_BYTES_PER_REQUEST,
+            "basic execution trace upper bound is {serialized_request_upper_bound} bytes"
+        );
+    }
 
     let failure = sink
         .profile_event(&vnext_profile_test_resource_failure_event())
         .unwrap();
     assert!(failure.attributes.contains_key("execution_identity"));
     assert!(failure.attributes.contains_key("execution_request_id"));
+
+    let mut terminal_identity = accepted.identity().parts().clone();
+    terminal_identity.sequence = 5;
+    let terminal = ferrum_runtime::ExecutionEvent::new(
+        ferrum_runtime::MonotonicTimestamp {
+            nanos_since_run_start: 5,
+        },
+        ferrum_runtime::ExecutionPhase::Completion,
+        ExecutionEventKind::RequestFailed,
+        ferrum_runtime::ExecutionIdentityEnvelope::new(terminal_identity).unwrap(),
+        ferrum_runtime::ExecutionEventDetail::FailureTerminal {
+            first_failure_fingerprint: failure.attributes["first_failure_fingerprint"]
+                .as_str()
+                .unwrap()
+                .to_owned(),
+        },
+    )
+    .unwrap();
+    let terminal = sink.profile_event(&terminal).unwrap();
+    terminal.validate().unwrap();
+    assert_eq!(terminal.phase, "vnext.request_failed");
+    assert_eq!(terminal.status, ProfileStatus::Failure);
+    assert_eq!(
+        terminal.attributes["first_failure_fingerprint"],
+        failure.attributes["first_failure_fingerprint"]
+    );
+    assert!(terminal.attributes.contains_key("execution_identity"));
+    assert!(terminal.attributes.contains_key("execution_request_id"));
 
     drop(sink);
     journal.close().unwrap();
@@ -7909,12 +5809,37 @@ fn vnext_profile_event_producer_cost_probe() {
 #[test]
 fn request_context_capacity_uses_executor_kv_capacity_when_smaller() {
     let mut config = EngineConfig::default();
-    config.kv_cache.max_blocks = 2048;
-    let runtime = ContinuousEngineRuntimeConfig::from_env_vars(None, Vec::<(&str, &str)>::new());
+    config.runtime.max_model_len = Some(2048);
+    let runtime = ContinuousEngineRuntimeConfig::from_engine_config(&config);
 
     assert_eq!(
         effective_request_context_capacity(&config, &runtime, Some(512)),
         Some(512)
+    );
+}
+
+#[test]
+fn request_context_capacity_does_not_treat_physical_blocks_as_tokens() {
+    let mut config = EngineConfig::default();
+    config.kv_cache.max_blocks = 64;
+    config.model.model_info = None;
+    config.runtime.kv_capacity = None;
+    config.runtime.max_model_len = Some(1024);
+    let runtime = ContinuousEngineRuntimeConfig::from_engine_config(&config);
+    assert_eq!(
+        effective_request_context_capacity(&config, &runtime, None),
+        Some(1024)
+    );
+    assert_eq!(
+        effective_request_context_capacity(&config, &runtime, Some(512)),
+        Some(512)
+    );
+
+    config.runtime.max_model_len = None;
+    let runtime = ContinuousEngineRuntimeConfig::from_engine_config(&config);
+    assert_eq!(
+        effective_request_context_capacity(&config, &runtime, None),
+        None
     );
 }
 
@@ -7932,9 +5857,16 @@ fn advertised_context_capacity_matches_the_request_admission_boundary() {
     validate_request_context_budget(
         &request,
         capacity - 1,
-        &engine.inner.config,
-        &engine.inner.runtime_config,
-        engine.inner.model_executor.kv_capacity(),
+        &engine.config,
+        &engine
+            .active_inner()
+            .expect("engine execution is open")
+            .runtime_config,
+        engine
+            .active_inner()
+            .expect("engine execution is open")
+            .model_executor
+            .kv_capacity(),
     )
     .expect("advertised capacity must be accepted");
     request.sampling_params.max_tokens = 2;
@@ -7942,9 +5874,9 @@ fn advertised_context_capacity_matches_the_request_admission_boundary() {
         validate_request_context_budget(
             &request,
             capacity - 1,
-            &engine.inner.config,
-            &engine.inner.runtime_config,
-            engine.inner.model_executor.kv_capacity(),
+            &engine.config,
+            &engine.active_inner().expect("engine execution is open").runtime_config,
+            engine.active_inner().expect("engine execution is open").model_executor.kv_capacity(),
         ),
         Err(FerrumError::ContextLengthExceeded { capacity: actual, .. }) if actual == capacity
     ));
@@ -8123,6 +6055,7 @@ fn test_sequence_state() {
         client_id: None,
         session_id: None,
         created_at: chrono::Utc::now(),
+        ingress: None,
         api_request: None,
         evidence_request: Default::default(),
         metadata: HashMap::new(),
@@ -8134,7 +6067,6 @@ fn test_sequence_state() {
     assert_eq!(state.phase, RequestPhase::Waiting);
     assert_eq!(state.total_tokens(), 2);
     assert!(!state.prefill_complete);
-    assert!(state.recurrent_state.is_none());
 }
 
 #[test]
@@ -8176,198 +6108,6 @@ fn sequence_terminal_token_trace_is_bounded_and_stable() {
     assert_ne!(first.generated_token_sha256, changed.generated_token_sha256);
 }
 
-#[tokio::test]
-async fn engine_allocates_and_deallocates_model_declared_recurrent_state() {
-    let scheduler = Arc::new(ContinuousBatchScheduler::new(
-        ferrum_types::SchedulerConfig::default(),
-    ));
-    let tokenizer = Arc::new(PolicyTokenizer::new(64, &[]));
-    let sampler = Arc::new(crate::registry::GreedySampler);
-    let kv_cache = Arc::new(MockKvCacheManager::new(128));
-    let executor = Arc::new(RecurrentSpecExecutor {
-        inner: MockModelExecutor::new(64, Duration::ZERO, Duration::ZERO),
-    });
-    let tensor_factory = Arc::new(MockTensorFactory);
-    let recurrent_manager = Arc::new(InMemoryRecurrentStateManager::new(
-        InMemoryRecurrentStateConfig {
-            total_memory_bytes: 1024,
-            total_batch_slots: 4,
-        },
-    ));
-    let engine = ContinuousBatchEngine::new_with_recurrent_state_manager(
-        EngineConfig::default(),
-        scheduler,
-        tokenizer,
-        sampler,
-        kv_cache,
-        executor,
-        tensor_factory,
-        Some(recurrent_manager.clone()),
-    )
-    .expect("legacy engine composition must match executor authority");
-    let mut request = policy_request();
-    request.sampling_params.max_tokens = 1;
-
-    let response = engine.infer(request).await.unwrap();
-
-    assert_eq!(response.finish_reason, FinishReason::Length);
-    let stats = recurrent_manager.stats();
-    assert_eq!(stats.allocation_count, 1);
-    assert_eq!(stats.allocation_failures, 0);
-    assert_eq!(stats.active_states, 0);
-    assert_eq!(stats.used_memory_bytes, 0);
-}
-
-#[tokio::test]
-async fn run_iteration_cancels_disconnected_client_and_releases_recurrent_state() {
-    let trace_path = resource_trace_temp_path("client-disconnect-release");
-    let _ = std::fs::remove_file(&trace_path);
-    let mut config = EngineConfig::default();
-    config.runtime.scheduler_trace_jsonl = Some(trace_path.clone());
-    config.runtime.profile_entrypoint = Some(ProfileEntrypoint::Serve);
-    config.runtime.profile_detail = ObservabilityProfileDetail::Replay;
-    config.kv_cache.max_blocks = 128;
-    let scheduler = Arc::new(ContinuousBatchScheduler::new(config.scheduler.clone()));
-    let tokenizer: Arc<dyn Tokenizer + Send + Sync> = Arc::new(PolicyTokenizer::new(64, &[]));
-    let sampler: Arc<dyn Sampler + Send + Sync> = Arc::new(crate::registry::GreedySampler);
-    let kv_cache: Arc<dyn KvCacheManager + Send + Sync> = Arc::new(MockKvCacheManager::new(128));
-    let executor: Arc<dyn ModelExecutor + Send + Sync> = Arc::new(RecurrentSpecExecutor {
-        inner: MockModelExecutor::new(64, Duration::ZERO, Duration::ZERO),
-    });
-    let tensor_factory: Arc<dyn TensorFactory> = Arc::new(MockTensorFactory);
-    let recurrent_manager = Arc::new(InMemoryRecurrentStateManager::new(
-        InMemoryRecurrentStateConfig {
-            total_memory_bytes: 1024,
-            total_batch_slots: 1,
-        },
-    ));
-    let engine = ContinuousBatchEngine::new_with_recurrent_state_manager(
-        config,
-        scheduler.clone(),
-        tokenizer,
-        sampler,
-        kv_cache,
-        executor,
-        tensor_factory,
-        Some(recurrent_manager.clone()),
-    )
-    .expect("legacy engine composition must match executor authority");
-
-    let request = policy_request();
-    let request_id = request.id.clone();
-    scheduler.submit(request.clone()).await.unwrap();
-    let recurrent_spec = RecurrentStateSpec {
-        request_id: request_id.clone(),
-        num_layers: 1,
-        tensors: vec![RecurrentStateTensorSpec::new(
-            0,
-            "state",
-            vec![1],
-            DataType::FP32,
-        )],
-        device: Device::CPU,
-        max_batch_slots: 1,
-    };
-    let recurrent_state = recurrent_manager.allocate(&recurrent_spec).await.unwrap();
-    let (stream_sender, stream_receiver) = tokio::sync::mpsc::channel(1);
-    drop(stream_receiver);
-
-    let mut sequence = SequenceState::new(request, vec![TokenId::new(1)]);
-    sequence.generated_tokens = vec![TokenId::new(10), TokenId::new(11), TokenId::new(12)];
-    sequence.stream_sender = Some(stream_sender);
-    sequence.commit_recurrent_state_admission(recurrent_state, 1);
-    let mut request_slot = RequestSlotLease::open(&engine.inner, request_id.clone());
-    request_slot.admit(&engine.inner);
-    sequence.request_slot = Some(request_slot);
-    engine
-        .inner
-        .sequences
-        .write()
-        .insert(request_id.clone(), sequence);
-
-    engine.inner.run_iteration().await.unwrap();
-    flush_engine_profile_events(&engine);
-
-    assert!(!engine.inner.sequences.read().contains_key(&request_id));
-    assert_eq!(scheduler.trace_phase(&request_id), None);
-    let scheduler_stats = scheduler.trace_snapshot();
-    assert_eq!(scheduler_stats.waiting_queue_len, 0);
-    assert_eq!(scheduler_stats.cancelled_total, 1);
-    assert_eq!(scheduler_stats.capacity_release_epoch, 1);
-    let recurrent_stats = recurrent_manager.stats();
-    assert_eq!(recurrent_stats.active_states, 0);
-    assert_eq!(recurrent_stats.used_batch_slots, 0);
-    assert_eq!(recurrent_stats.used_memory_bytes, 0);
-
-    let events = read_engine_profile_events(&trace_path);
-    let detected = events
-        .iter()
-        .find(|event| {
-            event.request_id == request_id.to_string()
-                && event.phase == "engine_client_disconnect_detected"
-        })
-        .expect("disconnect detection must be traced");
-    let released = events
-        .iter()
-        .find(|event| {
-            event.request_id == request_id.to_string()
-                && event.phase == "engine_client_disconnect_released"
-        })
-        .expect("disconnect release must be traced");
-    let terminal_evidence = events
-        .iter()
-        .find(|event| {
-            event.request_id == request_id.to_string()
-                && event.phase == "engine_sequence_terminal_evidence"
-        })
-        .expect("disconnect token evidence must be traced in replay mode");
-    assert_eq!(
-        detected.attributes.get("terminal_state"),
-        Some(&serde_json::json!("pending_release"))
-    );
-    assert_eq!(
-        released.attributes.get("terminal_state"),
-        Some(&serde_json::json!("released"))
-    );
-    assert_eq!(
-        released.attributes.get("scheduler_cancel_result"),
-        Some(&serde_json::json!("cancelled"))
-    );
-    assert!(
-        released.shape["scheduler_tick_delta"]
-            .as_u64()
-            .expect("scheduler tick delta must be an unsigned integer")
-            <= 2,
-        "disconnect resources must reach a terminal state within two scheduler ticks"
-    );
-    assert_eq!(
-        released.attributes["scheduler_snapshot"]["cancelled_total"],
-        serde_json::json!(1)
-    );
-    assert_eq!(
-        terminal_evidence.attributes["termination"],
-        serde_json::json!("client_disconnected")
-    );
-    assert_eq!(
-        terminal_evidence.shape["prompt_token_count"],
-        serde_json::json!(1)
-    );
-    assert_eq!(
-        terminal_evidence.shape["generated_token_count"],
-        serde_json::json!(3)
-    );
-    assert_eq!(
-        terminal_evidence.attributes["token_trace"]["generated_token_prefix"],
-        serde_json::json!([10, 11, 12])
-    );
-    assert!(!events.iter().any(|event| {
-        event.request_id == request_id.to_string()
-            && event.phase == "engine_client_disconnect_release_failed"
-    }));
-
-    let _ = std::fs::remove_file(trace_path);
-}
-
 #[test]
 fn sequence_state_detects_closed_run_and_serve_receivers() {
     let mut run_sequence = SequenceState::new(policy_request(), vec![TokenId::new(1)]);
@@ -8378,2337 +6118,17 @@ fn sequence_state_detects_closed_run_and_serve_receivers() {
     assert!(run_sequence.client_receiver_closed());
 
     let mut serve_sequence = SequenceState::new(policy_request(), vec![TokenId::new(1)]);
-    let (stream_sender, stream_receiver) = tokio::sync::mpsc::channel(1);
+    let budget = OutputBudget::new(ferrum_types::OutputConfig::default()).unwrap();
+    let (stream_sender, stream_receiver) = OutputSender::new(
+        Weak::new(),
+        serve_sequence.original_request.id.clone(),
+        budget.try_open_session().unwrap(),
+        1,
+    );
     serve_sequence.stream_sender = Some(stream_sender);
     assert!(!serve_sequence.client_receiver_closed());
     drop(stream_receiver);
     assert!(serve_sequence.client_receiver_closed());
-}
-
-#[tokio::test]
-async fn engine_status_reports_kv_cache_memory_from_manager_stats() {
-    let mut config = EngineConfig::default();
-    config.kv_cache.max_blocks = 128;
-    let scheduler = Arc::new(ContinuousBatchScheduler::new(config.scheduler.clone()));
-    let tokenizer: Arc<dyn Tokenizer + Send + Sync> = Arc::new(PolicyTokenizer::new(64, &[]));
-    let sampler: Arc<dyn Sampler + Send + Sync> = Arc::new(crate::registry::GreedySampler);
-    let kv_cache = Arc::new(MockKvCacheManager::new(128));
-    kv_cache
-        .allocate(&AllocationRequest {
-            request_id: RequestId::new(),
-            initial_tokens: 17,
-            max_sequence_length: 32,
-            num_layers: 1,
-            num_heads: 1,
-            head_dim: 1,
-            device: Device::CPU,
-            dtype: DataType::FP16,
-            priority: Priority::Normal,
-        })
-        .await
-        .unwrap();
-    let executor: Arc<dyn ModelExecutor + Send + Sync> = Arc::new(MockModelExecutor::instant(64));
-    let tensor_factory: Arc<dyn TensorFactory> = Arc::new(MockTensorFactory);
-    let engine = ContinuousBatchEngine::new(
-        config,
-        scheduler,
-        tokenizer,
-        sampler,
-        kv_cache,
-        executor,
-        tensor_factory,
-    )
-    .expect("legacy engine composition must match executor authority");
-
-    let status = engine.status().await;
-
-    assert_eq!(status.memory_usage.total_bytes, 128 * 16 * 1024);
-    assert_eq!(status.memory_usage.used_bytes, 2 * 16 * 1024);
-    assert_eq!(status.memory_usage.cache_memory_bytes, 2 * 16 * 1024);
-    assert_eq!(
-        status.memory_usage.free_bytes,
-        status.memory_usage.total_bytes - status.memory_usage.used_bytes
-    );
-    assert_eq!(status.memory_usage.cpu_memory_bytes, Some(2 * 16 * 1024));
-    assert_eq!(status.memory_usage.gpu_memory_bytes, None);
-    assert!(status.memory_usage.utilization_percent > 0.0);
-}
-
-#[tokio::test]
-async fn engine_allocates_and_deallocates_llm_executor_declared_recurrent_state() {
-    let scheduler = Arc::new(ContinuousBatchScheduler::new(
-        ferrum_types::SchedulerConfig::default(),
-    ));
-    let tokenizer = Arc::new(PolicyTokenizer::new(64, &[]));
-    let sampler = Arc::new(crate::registry::GreedySampler);
-    let kv_cache = Arc::new(MockKvCacheManager::new(128));
-    let model_info = ferrum_types::ModelInfo {
-        model_id: ferrum_types::ModelId::new("recurrent-llm"),
-        model_type: ferrum_types::ModelType::Custom("recurrent-llm".to_string()),
-        num_parameters: 0,
-        hidden_size: 4,
-        num_layers: 1,
-        num_heads: 1,
-        num_kv_heads: 1,
-        vocab_size: 64,
-        max_sequence_length: 16,
-        dtype: DataType::FP32,
-        device: Device::CUDA(0),
-        version: None,
-        license: None,
-        metadata: HashMap::new(),
-    };
-    let executor: Arc<dyn ModelExecutor + Send + Sync> = Arc::new(LlmExecutor::new(
-        Box::new(RecurrentSpecLlm::new()),
-        model_info,
-    ));
-    let tensor_factory = Arc::new(MockTensorFactory);
-    let recurrent_manager = Arc::new(InMemoryRecurrentStateManager::new(
-        InMemoryRecurrentStateConfig {
-            total_memory_bytes: 1024,
-            total_batch_slots: 1,
-        },
-    ));
-    let engine = ContinuousBatchEngine::new_with_recurrent_state_manager(
-        EngineConfig::default(),
-        scheduler,
-        tokenizer,
-        sampler,
-        kv_cache,
-        executor,
-        tensor_factory,
-        Some(recurrent_manager.clone()),
-    )
-    .expect("legacy engine composition must match executor authority");
-    let mut request = policy_request();
-    request.sampling_params.max_tokens = 1;
-
-    let response = engine.infer(request).await.unwrap();
-
-    assert_eq!(response.finish_reason, FinishReason::Length);
-    let stats = recurrent_manager.stats();
-    assert_eq!(stats.total_batch_slots, 1);
-    assert_eq!(stats.allocation_count, 1);
-    assert_eq!(stats.allocation_failures, 0);
-    assert_eq!(stats.active_states, 0);
-    assert_eq!(stats.used_batch_slots, 0);
-}
-
-#[tokio::test]
-async fn process_batch_unified_defers_prefill_for_recurrent_state_capacity() {
-    let mut config = EngineConfig::default();
-    config.kv_cache.max_blocks = 128;
-    let scheduler = Arc::new(ContinuousBatchScheduler::new(config.scheduler.clone()));
-    let tokenizer: Arc<dyn Tokenizer + Send + Sync> =
-        Arc::new(PolicyTokenizer::new(64, &[("test", 5), ("ok", 6)]));
-    let sampler: Arc<dyn Sampler + Send + Sync> = Arc::new(crate::registry::GreedySampler);
-    let kv_cache: Arc<dyn KvCacheManager + Send + Sync> = Arc::new(MockKvCacheManager::new(128));
-    let executor: Arc<dyn ModelExecutor + Send + Sync> = Arc::new(RecurrentSpecExecutor {
-        inner: MockModelExecutor::new(64, Duration::ZERO, Duration::ZERO),
-    });
-    let tensor_factory: Arc<dyn TensorFactory> = Arc::new(MockTensorFactory);
-    let recurrent_manager = Arc::new(InMemoryRecurrentStateManager::new(
-        InMemoryRecurrentStateConfig {
-            total_memory_bytes: 8,
-            total_batch_slots: 1,
-        },
-    ));
-    let engine = ContinuousBatchEngine::new_with_recurrent_state_manager(
-        config,
-        scheduler,
-        tokenizer.clone(),
-        sampler,
-        kv_cache,
-        executor,
-        tensor_factory,
-        Some(recurrent_manager.clone()),
-    )
-    .expect("legacy engine composition must match executor authority");
-
-    let mut victim_request = policy_request();
-    victim_request.prompt = "test".to_string();
-    victim_request.sampling_params.max_tokens = 4;
-    let victim_id = victim_request.id.clone();
-    let victim_spec = RecurrentStateSpec {
-        request_id: victim_id.clone(),
-        num_layers: 1,
-        tensors: vec![RecurrentStateTensorSpec::new(
-            0,
-            "delta_state",
-            vec![4],
-            DataType::BF16,
-        )],
-        device: Device::CPU,
-        max_batch_slots: 1,
-    };
-    let victim_recurrent_state = recurrent_manager.allocate(&victim_spec).await.unwrap();
-    let victim_kv = engine
-        .inner
-        .make_model_kv_handle_with_seq("victim-cache".to_string(), 1);
-    let mut victim_seq = SequenceState::new_with_tokenizer_and_model_vocab_size(
-        victim_request.clone(),
-        vec![TokenId::new(5)],
-        Some(tokenizer.clone()),
-        Some(64),
-    );
-    victim_seq.generated_tokens.push(TokenId::new(6));
-    victim_seq.prefill_complete = true;
-    victim_seq.prefill_tokens_processed = 1;
-    victim_seq.install_runtime_managed_model_kv(victim_kv);
-    victim_seq.commit_recurrent_state_admission(victim_recurrent_state, 1);
-    victim_seq.phase = RequestPhase::Decoding;
-    {
-        let mut sequences = engine.inner.sequences.write();
-        sequences.insert(victim_id.clone(), victim_seq);
-    }
-
-    let mut fresh_request = policy_request();
-    fresh_request.prompt = "test".to_string();
-    fresh_request.sampling_params.max_tokens = 2;
-    let fresh_id = fresh_request.id.clone();
-    let batch = ferrum_interfaces::BatchPlan {
-        batch_id: ferrum_types::BatchId::new(),
-        requests: vec![ferrum_interfaces::scheduler::ScheduledRequest::new(
-            fresh_request,
-        )],
-        max_sequence_length: 1,
-        estimated_time_ms: None,
-        resource_requirements: ferrum_interfaces::scheduler::BatchResourceRequirements::default(),
-        created_at: chrono::Utc::now(),
-    };
-
-    engine
-        .inner
-        .process_batch_with_test_sequences(&batch)
-        .await
-        .unwrap();
-
-    let stats = recurrent_manager.stats();
-    assert_eq!(stats.allocation_count, 1);
-    assert_eq!(stats.allocation_failures, 0);
-    assert_eq!(stats.active_states, 1);
-    assert_eq!(stats.used_batch_slots, 1);
-
-    let sequences = engine.inner.sequences.read();
-    let victim = sequences
-        .get(&victim_id)
-        .expect("decode request should stay active while prefill waits");
-    assert!(victim.prefill_complete);
-    assert!(victim.kv_cache_handle().is_some());
-    assert!(victim.recurrent_state.is_some());
-    assert_eq!(victim.generated_tokens, vec![TokenId::new(6)]);
-    assert_eq!(victim.preemption_count, 0);
-
-    let fresh = sequences
-        .get(&fresh_id)
-        .expect("fresh request should remain queued for retry");
-    assert!(!fresh.prefill_complete);
-    assert!(fresh.kv_cache_handle().is_none());
-    assert!(fresh.recurrent_state.is_none());
-}
-
-#[tokio::test]
-async fn process_batch_unified_releases_recurrent_state_when_kv_alloc_defers() {
-    let mut config = EngineConfig::default();
-    config.kv_cache.max_blocks = 0;
-    let scheduler = Arc::new(ContinuousBatchScheduler::new(config.scheduler.clone()));
-    let tokenizer: Arc<dyn Tokenizer + Send + Sync> =
-        Arc::new(PolicyTokenizer::new(64, &[("test", 5), ("ok", 6)]));
-    let sampler: Arc<dyn Sampler + Send + Sync> = Arc::new(crate::registry::GreedySampler);
-    let kv_cache = Arc::new(MockKvCacheManager::new(0));
-    let executor: Arc<dyn ModelExecutor + Send + Sync> = Arc::new(RecurrentSpecExecutor {
-        inner: MockModelExecutor::new(64, Duration::ZERO, Duration::ZERO),
-    });
-    let tensor_factory: Arc<dyn TensorFactory> = Arc::new(MockTensorFactory);
-    let recurrent_manager = Arc::new(InMemoryRecurrentStateManager::new(
-        InMemoryRecurrentStateConfig {
-            total_memory_bytes: 8,
-            total_batch_slots: 1,
-        },
-    ));
-    let engine = ContinuousBatchEngine::new_with_recurrent_state_manager(
-        config,
-        scheduler,
-        tokenizer,
-        sampler,
-        kv_cache.clone(),
-        executor,
-        tensor_factory,
-        Some(recurrent_manager.clone()),
-    )
-    .expect("legacy engine composition must match executor authority");
-
-    let mut request = policy_request();
-    request.prompt = "test".to_string();
-    request.sampling_params.max_tokens = 2;
-    let request_id = request.id.clone();
-    let batch = ferrum_interfaces::BatchPlan {
-        batch_id: ferrum_types::BatchId::new(),
-        requests: vec![ferrum_interfaces::scheduler::ScheduledRequest::new(request)],
-        max_sequence_length: 1,
-        estimated_time_ms: None,
-        resource_requirements: ferrum_interfaces::scheduler::BatchResourceRequirements::default(),
-        created_at: chrono::Utc::now(),
-    };
-
-    engine
-        .inner
-        .process_batch_with_test_sequences(&batch)
-        .await
-        .unwrap();
-
-    let recurrent_stats = recurrent_manager.stats();
-    assert_eq!(recurrent_stats.allocation_count, 1);
-    assert_eq!(recurrent_stats.active_states, 0);
-    assert_eq!(recurrent_stats.used_batch_slots, 0);
-    let active_kv = kv_cache.list_handles();
-    assert_eq!(active_kv.len(), 0, "active kv handles: {active_kv:?}");
-
-    let sequences = engine.inner.sequences.read();
-    let sequence = sequences
-        .get(&request_id)
-        .expect("deferred request should remain queued");
-    assert!(!sequence.prefill_complete);
-    assert!(sequence.kv_cache_handle().is_none());
-    assert!(sequence.recurrent_state.is_none());
-}
-
-#[tokio::test]
-async fn process_batch_unified_kv_defer_does_not_preempt_decode_for_fresh_prefill() {
-    let mut config = EngineConfig::default();
-    config.kv_cache.max_blocks = 1;
-    let scheduler = Arc::new(ContinuousBatchScheduler::new(config.scheduler.clone()));
-    let tokenizer: Arc<dyn Tokenizer + Send + Sync> =
-        Arc::new(PolicyTokenizer::new(64, &[("test", 5), ("ok", 6)]));
-    let sampler: Arc<dyn Sampler + Send + Sync> = Arc::new(crate::registry::GreedySampler);
-    let kv_cache = Arc::new(MockKvCacheManager::new(1));
-    let executor: Arc<dyn ModelExecutor + Send + Sync> = Arc::new(CapturingUnifiedExecutor {
-        inner: MockModelExecutor::new(64, Duration::ZERO, Duration::ZERO),
-        captured: Arc::new(std::sync::Mutex::new(Vec::new())),
-        output_token: 6,
-    });
-    let tensor_factory: Arc<dyn TensorFactory> = Arc::new(MockTensorFactory);
-    let engine = ContinuousBatchEngine::new_with_recurrent_state_manager(
-        config,
-        scheduler.clone(),
-        tokenizer.clone(),
-        sampler,
-        kv_cache.clone(),
-        executor,
-        tensor_factory,
-        None,
-    )
-    .expect("legacy engine composition must match executor authority");
-
-    let mut decode_request = policy_request();
-    decode_request.prompt = "test".to_string();
-    decode_request.sampling_params.max_tokens = 4;
-    let decode_id = decode_request.id.clone();
-    scheduler.submit(decode_request.clone()).await.unwrap();
-    let initial_batch = scheduler
-        .next_batch(ferrum_interfaces::BatchHint::simple(4))
-        .await
-        .expect("decode request should first be scheduled as prefill");
-    assert_eq!(initial_batch.requests.len(), 1);
-    scheduler.mark_prefill_complete(&decode_id, 1);
-
-    let decode_kv = kv_cache
-        .allocate(&AllocationRequest {
-            request_id: decode_id.clone(),
-            initial_tokens: 1,
-            max_sequence_length: 16,
-            num_layers: 1,
-            num_heads: 1,
-            head_dim: 4,
-            device: Device::CPU,
-            dtype: DataType::FP32,
-            priority: Priority::Normal,
-        })
-        .await
-        .unwrap();
-    let mut decode_seq = SequenceState::new_with_tokenizer_and_model_vocab_size(
-        decode_request.clone(),
-        vec![TokenId::new(5)],
-        Some(tokenizer),
-        Some(64),
-    );
-    decode_seq.generated_tokens.push(TokenId::new(6));
-    decode_seq.prefill_complete = true;
-    decode_seq.prefill_tokens_processed = 1;
-    let decode_blocks = engine.inner.kv_resource_blocks_for_tokens(1);
-    engine.inner.trace_kv_allocate(&decode_id, decode_blocks);
-    decode_seq.install_legacy_allocated_model_kv(
-        decode_kv,
-        SequenceKvAllocation::new(decode_id.clone(), decode_blocks),
-    );
-    decode_seq.phase = RequestPhase::Decoding;
-    engine
-        .inner
-        .sequences
-        .write()
-        .insert(decode_id.clone(), decode_seq);
-
-    let mut fresh_request = policy_request();
-    fresh_request.prompt = "test".to_string();
-    fresh_request.sampling_params.max_tokens = 2;
-    let fresh_id = fresh_request.id.clone();
-    scheduler.submit(fresh_request).await.unwrap();
-    let batch = scheduler
-        .next_batch(ferrum_interfaces::BatchHint::simple(4))
-        .await
-        .expect("mixed decode/fresh prefill batch should be scheduled");
-    assert_eq!(batch.requests.len(), 2);
-
-    engine
-        .inner
-        .process_batch_with_test_sequences(&batch)
-        .await
-        .unwrap();
-
-    let trace = scheduler.trace_snapshot();
-    assert_eq!(
-        trace.cancelled_total, 0,
-        "fresh waiting prefill KV pressure must not cancel an active decode victim"
-    );
-    assert_eq!(
-        scheduler.trace_phase(&fresh_id),
-        Some(RequestPhase::Waiting),
-        "fresh prefill should be retried later from waiting"
-    );
-
-    let sequences = engine.inner.sequences.read();
-    let decode = sequences
-        .get(&decode_id)
-        .expect("decode victim should remain active");
-    assert!(decode.prefill_complete);
-    assert!(decode.kv_cache_handle().is_some());
-    assert_eq!(decode.preemption_count, 0);
-
-    let fresh = sequences
-        .get(&fresh_id)
-        .expect("deferred fresh request should remain in sequence state");
-    assert!(!fresh.prefill_complete);
-    assert!(fresh.kv_cache_handle().is_none());
-    assert_eq!(kv_cache.active_count(), 1);
-}
-
-#[tokio::test]
-async fn process_batch_unified_reserve_defer_requeues_decode_for_recompute() {
-    let mut config = EngineConfig::default();
-    config.kv_cache.max_blocks = 128;
-    let scheduler = Arc::new(ContinuousBatchScheduler::new(config.scheduler.clone()));
-    let tokenizer: Arc<dyn Tokenizer + Send + Sync> =
-        Arc::new(PolicyTokenizer::new(64, &[("test", 5), ("ok", 6)]));
-    let sampler: Arc<dyn Sampler + Send + Sync> = Arc::new(crate::registry::GreedySampler);
-    let kv_cache = Arc::new(MockKvCacheManager::new(128));
-    let executor: Arc<dyn ModelExecutor + Send + Sync> = Arc::new(FailingUnifiedReserveExecutor {
-        inner: FailingBatchPrefillExecutor {
-            inner: RecurrentSpecExecutor {
-                inner: MockModelExecutor::new(64, Duration::ZERO, Duration::ZERO),
-            },
-        },
-    });
-    let tensor_factory: Arc<dyn TensorFactory> = Arc::new(MockTensorFactory);
-    let recurrent_manager = Arc::new(InMemoryRecurrentStateManager::new(
-        InMemoryRecurrentStateConfig {
-            total_memory_bytes: 32,
-            total_batch_slots: 4,
-        },
-    ));
-    let engine = ContinuousBatchEngine::new_with_recurrent_state_manager(
-        config,
-        scheduler.clone(),
-        tokenizer.clone(),
-        sampler,
-        kv_cache.clone(),
-        executor,
-        tensor_factory,
-        Some(recurrent_manager),
-    )
-    .expect("legacy engine composition must match executor authority");
-
-    let mut first_decode_request = policy_request();
-    first_decode_request.prompt = "test".to_string();
-    first_decode_request.sampling_params.max_tokens = 4;
-    let first_decode_id = first_decode_request.id.clone();
-
-    let mut second_decode_request = policy_request();
-    second_decode_request.prompt = "ok".to_string();
-    second_decode_request.sampling_params.max_tokens = 4;
-    let second_decode_id = second_decode_request.id.clone();
-
-    scheduler
-        .submit(first_decode_request.clone())
-        .await
-        .unwrap();
-    scheduler
-        .submit(second_decode_request.clone())
-        .await
-        .unwrap();
-    let initial_batch = scheduler
-        .next_batch(ferrum_interfaces::BatchHint::simple(4))
-        .await
-        .expect("decode requests should first be scheduled as prefills");
-    assert_eq!(initial_batch.requests.len(), 2);
-    scheduler.mark_prefill_complete(&first_decode_id, 1);
-    scheduler.mark_prefill_complete(&second_decode_id, 1);
-
-    for (request, request_id, token, cache_id) in [
-        (
-            first_decode_request.clone(),
-            first_decode_id.clone(),
-            TokenId::new(5),
-            "first-decode-cache",
-        ),
-        (
-            second_decode_request.clone(),
-            second_decode_id.clone(),
-            TokenId::new(6),
-            "second-decode-cache",
-        ),
-    ] {
-        let kv = engine
-            .inner
-            .make_model_kv_handle_with_seq(cache_id.to_string(), 1);
-        let mut sequence = SequenceState::new_with_tokenizer_and_model_vocab_size(
-            request,
-            vec![token],
-            Some(tokenizer.clone()),
-            Some(64),
-        );
-        sequence.generated_tokens.push(token);
-        sequence.prefill_complete = true;
-        sequence.prefill_tokens_processed = 1;
-        sequence.install_runtime_managed_model_kv(kv);
-        sequence.phase = RequestPhase::Decoding;
-        engine.inner.sequences.write().insert(request_id, sequence);
-    }
-
-    let mut fresh_request = policy_request();
-    fresh_request.prompt = "test ok".to_string();
-    fresh_request.sampling_params.max_tokens = 2;
-    let fresh_id = fresh_request.id.clone();
-    scheduler.submit(fresh_request).await.unwrap();
-    let mixed_batch = scheduler
-        .next_batch(ferrum_interfaces::BatchHint::simple(4))
-        .await
-        .expect("mixed decode/fresh prefill batch should be scheduled");
-    assert_eq!(mixed_batch.requests.len(), 3);
-
-    engine
-        .inner
-        .process_batch_with_test_sequences(&mixed_batch)
-        .await
-        .unwrap();
-
-    let trace = scheduler.trace_snapshot();
-    assert_eq!(
-        trace.cancelled_total, 0,
-        "model-owned KV reserve pressure must not cancel active decodes"
-    );
-    assert_eq!(trace.waiting_queue_len, 3);
-    assert_eq!(trace.decode_queue_len, 0);
-    assert_eq!(trace.active_len, 0);
-    assert_eq!(
-        scheduler.trace_phase(&fresh_id),
-        Some(RequestPhase::Waiting)
-    );
-
-    let sequences = engine.inner.sequences.read();
-    for (request_id, token) in [
-        (&first_decode_id, TokenId::new(5)),
-        (&second_decode_id, TokenId::new(6)),
-    ] {
-        let decode = sequences
-            .get(request_id)
-            .expect("decode request should remain available for recompute");
-        assert_eq!(decode.phase, RequestPhase::Waiting);
-        assert!(!decode.prefill_complete);
-        assert!(decode.kv_cache_handle().is_none());
-        assert!(decode.model_cache_id().is_none());
-        assert_eq!(decode.generated_tokens, vec![token]);
-        assert_eq!(decode.preemption_count, 1);
-        assert_eq!(
-            scheduler.trace_phase(request_id),
-            Some(RequestPhase::Waiting)
-        );
-    }
-    let fresh = sequences
-        .get(&fresh_id)
-        .expect("deferred fresh request should remain in sequence state");
-    assert_eq!(fresh.phase, RequestPhase::Waiting);
-    assert!(!fresh.prefill_complete);
-    assert!(fresh.kv_cache_handle().is_none());
-    assert_eq!(kv_cache.active_count(), 0);
-}
-
-#[tokio::test]
-async fn process_batch_unified_structured_pressure_reopens_capacity_recompute_next_epoch() {
-    let mut config = EngineConfig::default();
-    config.kv_cache.max_blocks = 128;
-    let scheduler = Arc::new(ContinuousBatchScheduler::new(config.scheduler.clone()));
-    let tokenizer: Arc<dyn Tokenizer + Send + Sync> =
-        Arc::new(PolicyTokenizer::new(64, &[("test", 5), ("ok", 6)]));
-    let sampler: Arc<dyn Sampler + Send + Sync> = Arc::new(crate::registry::GreedySampler);
-    let kv_cache = Arc::new(MockKvCacheManager::new(128));
-    let executor: Arc<dyn ModelExecutor + Send + Sync> =
-        Arc::new(StructuredPressureOnceUnifiedReserveExecutor {
-            inner: RecurrentSpecExecutor {
-                inner: MockModelExecutor::new(64, Duration::ZERO, Duration::ZERO),
-            },
-            remaining_failures: std::sync::atomic::AtomicUsize::new(1),
-            message:
-                "Qwen3.5 paged KV admission: need 4 admission blocks (4 immediate) but only 5 free",
-        });
-    let tensor_factory: Arc<dyn TensorFactory> = Arc::new(MockTensorFactory);
-    let recurrent_manager = Arc::new(InMemoryRecurrentStateManager::new(
-        InMemoryRecurrentStateConfig {
-            total_memory_bytes: 32,
-            total_batch_slots: 4,
-        },
-    ));
-    let engine = ContinuousBatchEngine::new_with_recurrent_state_manager(
-        config,
-        scheduler.clone(),
-        tokenizer.clone(),
-        sampler,
-        kv_cache,
-        executor,
-        tensor_factory,
-        Some(recurrent_manager),
-    )
-    .expect("legacy engine composition must match executor authority");
-
-    let mut requests = Vec::new();
-    for _ in 0..4 {
-        let mut request = policy_request();
-        request.prompt = "test".to_string();
-        request.sampling_params.max_tokens = 4;
-        scheduler.submit(request.clone()).await.unwrap();
-        requests.push(request);
-    }
-
-    let initial_batch = scheduler
-        .next_batch(ferrum_interfaces::BatchHint::simple(4))
-        .await
-        .expect("decode requests should first be scheduled as prefills");
-    assert_eq!(initial_batch.requests.len(), 4);
-    for request in &requests {
-        scheduler.mark_prefill_complete(&request.id, 1);
-        let kv = engine
-            .inner
-            .make_model_kv_handle_with_seq(format!("decode-cache-{}", request.id), 1);
-        let mut sequence = SequenceState::new_with_tokenizer_and_model_vocab_size(
-            request.clone(),
-            vec![TokenId::new(5)],
-            Some(tokenizer.clone()),
-            Some(64),
-        );
-        sequence.generated_tokens.push(TokenId::new(6));
-        sequence.prefill_complete = true;
-        sequence.prefill_tokens_processed = 1;
-        sequence.install_runtime_managed_model_kv(kv);
-        sequence.phase = RequestPhase::Decoding;
-        engine
-            .inner
-            .sequences
-            .write()
-            .insert(request.id.clone(), sequence);
-    }
-
-    let recompute_id = requests[0].id.clone();
-    {
-        let mut sequences = engine.inner.sequences.write();
-        let sequence = sequences
-            .get_mut(&recompute_id)
-            .expect("recompute sequence should exist");
-        sequence.clear_model_kv_for_test();
-        sequence.prefill_complete = false;
-        sequence.prefill_tokens_processed = 0;
-        sequence.phase = RequestPhase::Waiting;
-        sequence.tokens_this_iteration = 0;
-        sequence.preemption_count += 1;
-    }
-    assert!(
-        scheduler.defer_decode_to_waiting_for_capacity_with_pressure(&recompute_id, 4, Some(0))
-    );
-
-    let mixed_batch = scheduler
-        .next_batch(ferrum_interfaces::BatchHint::simple(4))
-        .await
-        .expect("decode plus capacity-deferred recompute should be scheduled");
-    assert_eq!(mixed_batch.requests.len(), 4);
-    assert!(
-        mixed_batch.requests.iter().any(|request| {
-            request.request.id == recompute_id && request.tokens_to_process != Some(1)
-        }),
-        "the first mixed attempt must contain the capacity-deferred recompute"
-    );
-
-    engine
-        .inner
-        .process_batch_with_test_sequences(&mixed_batch)
-        .await
-        .unwrap();
-
-    let retry_batch = scheduler
-        .next_batch(ferrum_interfaces::BatchHint::simple(4))
-        .await
-        .expect("structured KV feedback should reopen recompute in the next epoch");
-    assert!(
-        retry_batch.requests.iter().any(|request| {
-            request.request.id == recompute_id && request.tokens_to_process != Some(1)
-        }),
-        "failed recompute must not be marked attempted in the same epoch that structured KV feedback reopens"
-    );
-}
-
-#[tokio::test]
-async fn process_batch_unified_capacity_defer_releases_existing_kv() {
-    let mut config = EngineConfig::default();
-    config.kv_cache.max_blocks = 128;
-    let scheduler = Arc::new(ContinuousBatchScheduler::new(config.scheduler.clone()));
-    let tokenizer: Arc<dyn Tokenizer + Send + Sync> =
-        Arc::new(PolicyTokenizer::new(64, &[("test", 5), ("ok", 6)]));
-    let sampler: Arc<dyn Sampler + Send + Sync> = Arc::new(crate::registry::GreedySampler);
-    let kv_cache = Arc::new(MockKvCacheManager::new(128));
-    let executor: Arc<dyn ModelExecutor + Send + Sync> = Arc::new(RecurrentSpecExecutor {
-        inner: MockModelExecutor::new(64, Duration::ZERO, Duration::ZERO),
-    });
-    let tensor_factory: Arc<dyn TensorFactory> = Arc::new(MockTensorFactory);
-    let recurrent_manager = Arc::new(InMemoryRecurrentStateManager::new(
-        InMemoryRecurrentStateConfig {
-            total_memory_bytes: 0,
-            total_batch_slots: 0,
-        },
-    ));
-    let engine = ContinuousBatchEngine::new_with_recurrent_state_manager(
-        config,
-        scheduler.clone(),
-        tokenizer.clone(),
-        sampler,
-        kv_cache.clone(),
-        executor,
-        tensor_factory,
-        Some(recurrent_manager.clone()),
-    )
-    .expect("legacy engine composition must match executor authority");
-
-    let mut request = policy_request();
-    request.prompt = "test ok".to_string();
-    request.sampling_params.max_tokens = 2;
-    let request_id = request.id.clone();
-    scheduler.submit(request.clone()).await.unwrap();
-    let batch = scheduler
-        .next_batch(ferrum_interfaces::BatchHint::simple(4))
-        .await
-        .expect("submitted request should be scheduled");
-
-    let allocated_kv = kv_cache
-        .allocate(&AllocationRequest {
-            request_id: request_id.clone(),
-            initial_tokens: 1,
-            max_sequence_length: 16,
-            num_layers: 1,
-            num_heads: 1,
-            head_dim: 4,
-            device: Device::CPU,
-            dtype: DataType::FP32,
-            priority: Priority::Normal,
-        })
-        .await
-        .unwrap();
-    let mut sequence = SequenceState::new_with_tokenizer_and_model_vocab_size(
-        request,
-        vec![TokenId::new(5), TokenId::new(6)],
-        Some(tokenizer),
-        Some(64),
-    );
-    let allocated_blocks = engine.inner.kv_resource_blocks_for_tokens(1);
-    engine
-        .inner
-        .trace_kv_allocate(&request_id, allocated_blocks);
-    sequence.install_legacy_allocated_model_kv(
-        allocated_kv,
-        SequenceKvAllocation::new(request_id.clone(), allocated_blocks),
-    );
-    sequence.prefill_tokens_processed = 1;
-    sequence.phase = RequestPhase::Prefilling;
-    engine
-        .inner
-        .sequences
-        .write()
-        .insert(request_id.clone(), sequence);
-
-    engine
-        .inner
-        .process_batch_with_test_sequences(&batch)
-        .await
-        .unwrap();
-
-    let deferred = scheduler.trace_snapshot();
-    assert_eq!(deferred.waiting_queue_len, 1);
-    assert_eq!(deferred.prefill_queue_len, 0);
-    assert_eq!(deferred.active_len, 0);
-    let active_kv = kv_cache.list_handles();
-    assert_eq!(
-        active_kv.len(),
-        0,
-        "capacity-deferred prefill must not leak KV handles: {active_kv:?}"
-    );
-    {
-        let sequences = engine.inner.sequences.read();
-        let sequence = sequences
-            .get(&request_id)
-            .expect("deferred request should remain available for retry");
-        assert_eq!(sequence.phase, RequestPhase::Waiting);
-        assert!(sequence.kv_cache_handle().is_none());
-        assert!(sequence.recurrent_state.is_none());
-    }
-}
-
-#[tokio::test]
-async fn process_batch_unified_kv_defer_moves_active_prefill_back_to_waiting() {
-    let mut config = EngineConfig::default();
-    config.kv_cache.max_blocks = 0;
-    let scheduler = Arc::new(ContinuousBatchScheduler::new(config.scheduler.clone()));
-    let tokenizer: Arc<dyn Tokenizer + Send + Sync> =
-        Arc::new(PolicyTokenizer::new(64, &[("test", 5), ("ok", 6)]));
-    let sampler: Arc<dyn Sampler + Send + Sync> = Arc::new(crate::registry::GreedySampler);
-    let kv_cache = Arc::new(MockKvCacheManager::new(0));
-    let executor: Arc<dyn ModelExecutor + Send + Sync> = Arc::new(RecurrentSpecExecutor {
-        inner: MockModelExecutor::new(64, Duration::ZERO, Duration::ZERO),
-    });
-    let tensor_factory: Arc<dyn TensorFactory> = Arc::new(MockTensorFactory);
-    let recurrent_manager = Arc::new(InMemoryRecurrentStateManager::new(
-        InMemoryRecurrentStateConfig {
-            total_memory_bytes: 8,
-            total_batch_slots: 1,
-        },
-    ));
-    let engine = ContinuousBatchEngine::new_with_recurrent_state_manager(
-        config,
-        scheduler.clone(),
-        tokenizer,
-        sampler,
-        kv_cache,
-        executor,
-        tensor_factory,
-        Some(recurrent_manager),
-    )
-    .expect("legacy engine composition must match executor authority");
-
-    let mut request = policy_request();
-    request.prompt = "test".to_string();
-    request.sampling_params.max_tokens = 2;
-    let request_id = request.id.clone();
-    scheduler.submit(request).await.unwrap();
-    let batch = scheduler
-        .next_batch(ferrum_interfaces::BatchHint::simple(4))
-        .await
-        .expect("submitted request should be scheduled");
-    let active = scheduler.trace_snapshot();
-    assert_eq!(active.prefill_queue_len, 1);
-    assert_eq!(active.active_len, 1);
-
-    engine
-        .inner
-        .process_batch_with_test_sequences(&batch)
-        .await
-        .unwrap();
-
-    let deferred = scheduler.trace_snapshot();
-    assert_eq!(deferred.waiting_queue_len, 1);
-    assert_eq!(deferred.prefill_queue_len, 0);
-    assert_eq!(deferred.active_len, 0);
-    assert_eq!(deferred.cancelled_total, 0);
-    assert_eq!(
-        scheduler.trace_phase(&request_id),
-        Some(RequestPhase::Waiting)
-    );
-    let sequences = engine.inner.sequences.read();
-    let sequence = sequences
-        .get(&request_id)
-        .expect("deferred request should remain in sequence state");
-    assert_eq!(sequence.phase, RequestPhase::Waiting);
-    assert!(!sequence.prefill_complete);
-    assert!(sequence.kv_cache_handle().is_none());
-    assert!(sequence.recurrent_state.is_none());
-}
-
-#[tokio::test]
-async fn process_batch_releases_kv_and_recurrent_state_when_model_admission_fails() {
-    let trace_path = resource_trace_temp_path("model-admission-failure");
-    let _ = std::fs::remove_file(&trace_path);
-    let mut config = EngineConfig::default();
-    config.kv_cache.max_blocks = 128;
-    config.runtime.scheduler_trace_jsonl = Some(trace_path.clone());
-    config.runtime.profile_entrypoint = Some(ProfileEntrypoint::Synthetic);
-    let scheduler = Arc::new(ContinuousBatchScheduler::new(config.scheduler.clone()));
-    let tokenizer: Arc<dyn Tokenizer + Send + Sync> =
-        Arc::new(PolicyTokenizer::new(64, &[("test", 5), ("ok", 6)]));
-    let sampler: Arc<dyn Sampler + Send + Sync> = Arc::new(crate::registry::GreedySampler);
-    let kv_cache = Arc::new(MockKvCacheManager::new(128));
-    let executor: Arc<dyn ModelExecutor + Send + Sync> = Arc::new(FailingBatchPrefillExecutor {
-        inner: RecurrentSpecExecutor {
-            inner: MockModelExecutor::new(64, Duration::ZERO, Duration::ZERO),
-        },
-    });
-    let tensor_factory: Arc<dyn TensorFactory> = Arc::new(MockTensorFactory);
-    let recurrent_manager = Arc::new(InMemoryRecurrentStateManager::new(
-        InMemoryRecurrentStateConfig {
-            total_memory_bytes: 8,
-            total_batch_slots: 1,
-        },
-    ));
-    let engine = ContinuousBatchEngine::new_with_recurrent_state_manager(
-        config,
-        scheduler,
-        tokenizer.clone(),
-        sampler,
-        kv_cache.clone(),
-        executor,
-        tensor_factory,
-        Some(recurrent_manager.clone()),
-    )
-    .expect("legacy engine composition must match executor authority");
-
-    let mut request = policy_request();
-    request.prompt = "test".to_string();
-    request.sampling_params.max_tokens = 2;
-    let request_id = request.id.clone();
-    let batch = ferrum_interfaces::BatchPlan {
-        batch_id: ferrum_types::BatchId::new(),
-        requests: vec![ferrum_interfaces::scheduler::ScheduledRequest::new(request)],
-        max_sequence_length: 1,
-        estimated_time_ms: None,
-        resource_requirements: ferrum_interfaces::scheduler::BatchResourceRequirements::default(),
-        created_at: chrono::Utc::now(),
-    };
-
-    engine
-        .inner
-        .process_batch_legacy_split_with_test_sequences(&batch)
-        .await
-        .unwrap();
-
-    let active_kv = kv_cache.list_handles();
-    assert_eq!(active_kv.len(), 0, "active kv handles: {active_kv:?}");
-    let recurrent_stats = recurrent_manager.stats();
-    assert!(recurrent_stats.allocation_count >= 2);
-    assert_eq!(recurrent_stats.active_states, 0);
-    assert_eq!(recurrent_stats.used_batch_slots, 0);
-    flush_engine_profile_events(&engine);
-    let resources = assert_engine_resource_trace_balanced(&trace_path);
-    let saw = |kind: &str, action: ResourceAction| {
-        resources
-            .iter()
-            .any(|resource| resource.resource_kind == kind && resource.action == action)
-    };
-    assert!(saw("kv_block", ResourceAction::Reserve));
-    assert!(saw("kv_block", ResourceAction::Commit));
-    assert!(saw("kv_block", ResourceAction::Release));
-    assert!(saw("recurrent_state_slot", ResourceAction::Reserve));
-    assert!(saw("recurrent_state_slot", ResourceAction::Commit));
-    assert!(saw("recurrent_state_slot", ResourceAction::Release));
-    assert!(saw("backend_workspace", ResourceAction::Reserve));
-    assert!(saw("backend_workspace", ResourceAction::Commit));
-    assert!(saw("backend_workspace", ResourceAction::Release));
-    let _ = std::fs::remove_file(trace_path);
-
-    let sequences = engine.inner.sequences.read();
-    let sequence = sequences
-        .get(&request_id)
-        .expect("failed request should remain available for retry");
-    assert!(!sequence.prefill_complete);
-    assert!(sequence.kv_cache_handle().is_none());
-    assert!(sequence.recurrent_state.is_none());
-}
-
-#[tokio::test]
-async fn process_batch_chunked_prefill_postprocess_error_releases_kv_and_recurrent_state() {
-    let mut config = EngineConfig::default();
-    config.kv_cache.max_blocks = 128;
-    config.runtime.chunked_prefill_size = Some(1);
-    let scheduler = Arc::new(ContinuousBatchScheduler::new(config.scheduler.clone()));
-    let tokenizer: Arc<dyn Tokenizer + Send + Sync> =
-        Arc::new(PolicyTokenizer::new(64, &[("test", 5), ("ok", 6)]));
-    let sampler: Arc<dyn Sampler + Send + Sync> = Arc::new(crate::registry::GreedySampler);
-    let kv_cache = Arc::new(MockKvCacheManager::new(128));
-    let executor: Arc<dyn ModelExecutor + Send + Sync> = Arc::new(BadShapePrefillExecutor {
-        inner: RecurrentSpecExecutor {
-            inner: MockModelExecutor::new(64, Duration::ZERO, Duration::ZERO),
-        },
-    });
-    let tensor_factory: Arc<dyn TensorFactory> = Arc::new(MockTensorFactory);
-    let recurrent_manager = Arc::new(InMemoryRecurrentStateManager::new(
-        InMemoryRecurrentStateConfig {
-            total_memory_bytes: 8,
-            total_batch_slots: 1,
-        },
-    ));
-    let engine = ContinuousBatchEngine::new_with_recurrent_state_manager(
-        config,
-        scheduler.clone(),
-        tokenizer.clone(),
-        sampler,
-        kv_cache.clone(),
-        executor,
-        tensor_factory,
-        Some(recurrent_manager.clone()),
-    )
-    .expect("legacy engine composition must match executor authority");
-
-    let mut request = policy_request();
-    request.prompt = "test ok".to_string();
-    request.sampling_params.max_tokens = 2;
-    let request_id = request.id.clone();
-    scheduler.submit(request).await.unwrap();
-    let batch = scheduler
-        .next_batch(ferrum_interfaces::BatchHint::simple(1))
-        .await
-        .expect("prefill request must enter the scheduler's active queues");
-    assert_eq!(batch.requests.len(), 1);
-    assert_eq!(batch.requests[0].request.id, request_id);
-
-    engine
-        .inner
-        .process_batch_legacy_split_with_test_sequences(&batch)
-        .await
-        .expect("request-local prefill failure must complete through the scheduler");
-
-    let active_kv = kv_cache.list_handles();
-    assert_eq!(active_kv.len(), 0, "active kv handles: {active_kv:?}");
-    let recurrent_stats = recurrent_manager.stats();
-    assert_eq!(recurrent_stats.allocation_count, 1);
-    assert_eq!(recurrent_stats.active_states, 0);
-    assert_eq!(recurrent_stats.used_batch_slots, 0);
-
-    assert!(
-        !engine.inner.sequences.read().contains_key(&request_id),
-        "error-completed request should be removed from active sequences"
-    );
-    assert_eq!(scheduler.trace_phase(&request_id), None);
-    assert_eq!(scheduler.trace_snapshot().active_len, 0);
-}
-
-#[tokio::test]
-async fn process_batch_batch_prefill_len_mismatch_releases_kv_and_recurrent_state() {
-    let mut config = EngineConfig::default();
-    config.kv_cache.max_blocks = 128;
-    let scheduler = Arc::new(ContinuousBatchScheduler::new(config.scheduler.clone()));
-    let tokenizer: Arc<dyn Tokenizer + Send + Sync> =
-        Arc::new(PolicyTokenizer::new(64, &[("test", 5), ("ok", 6)]));
-    let sampler: Arc<dyn Sampler + Send + Sync> = Arc::new(crate::registry::GreedySampler);
-    let kv_cache = Arc::new(FirstAllocateThenFailKvCacheManager::new(128));
-    let executor: Arc<dyn ModelExecutor + Send + Sync> = Arc::new(ShortBatchPrefillExecutor {
-        inner: RecurrentSpecExecutor {
-            inner: MockModelExecutor::new(64, Duration::ZERO, Duration::ZERO),
-        },
-    });
-    let tensor_factory: Arc<dyn TensorFactory> = Arc::new(MockTensorFactory);
-    let recurrent_manager = Arc::new(InMemoryRecurrentStateManager::new(
-        InMemoryRecurrentStateConfig {
-            total_memory_bytes: 8,
-            total_batch_slots: 1,
-        },
-    ));
-    let engine = ContinuousBatchEngine::new_with_recurrent_state_manager(
-        config,
-        scheduler,
-        tokenizer.clone(),
-        sampler,
-        kv_cache.clone(),
-        executor,
-        tensor_factory,
-        Some(recurrent_manager.clone()),
-    )
-    .expect("legacy engine composition must match executor authority");
-
-    let mut request = policy_request();
-    request.prompt = "test".to_string();
-    request.sampling_params.max_tokens = 2;
-    let request_id = request.id.clone();
-    let batch = ferrum_interfaces::BatchPlan {
-        batch_id: ferrum_types::BatchId::new(),
-        requests: vec![ferrum_interfaces::scheduler::ScheduledRequest::new(request)],
-        max_sequence_length: 1,
-        estimated_time_ms: None,
-        resource_requirements: ferrum_interfaces::scheduler::BatchResourceRequirements::default(),
-        created_at: chrono::Utc::now(),
-    };
-
-    engine
-        .inner
-        .process_batch_legacy_split_with_test_sequences(&batch)
-        .await
-        .unwrap();
-
-    let active_kv = kv_cache.list_handles();
-    assert_eq!(active_kv.len(), 0, "active kv handles: {active_kv:?}");
-    let recurrent_stats = recurrent_manager.stats();
-    assert_eq!(recurrent_stats.allocation_count, 2);
-    assert_eq!(recurrent_stats.active_states, 0);
-    assert_eq!(recurrent_stats.used_batch_slots, 0);
-
-    let sequences = engine.inner.sequences.read();
-    let sequence = sequences
-        .get(&request_id)
-        .expect("deferred fallback request should remain available for retry");
-    assert!(!sequence.prefill_complete);
-    assert!(sequence.kv_cache_handle().is_none());
-    assert!(sequence.recurrent_state.is_none());
-}
-
-#[tokio::test]
-async fn process_batch_batch_prefill_postprocess_error_releases_kv_and_recurrent_state() {
-    let mut config = EngineConfig::default();
-    config.kv_cache.max_blocks = 128;
-    let scheduler = Arc::new(ContinuousBatchScheduler::new(config.scheduler.clone()));
-    let tokenizer: Arc<dyn Tokenizer + Send + Sync> =
-        Arc::new(PolicyTokenizer::new(64, &[("test", 5), ("ok", 6)]));
-    let sampler: Arc<dyn Sampler + Send + Sync> = Arc::new(crate::registry::GreedySampler);
-    let kv_cache = Arc::new(MockKvCacheManager::new(128));
-    let executor: Arc<dyn ModelExecutor + Send + Sync> = Arc::new(BadShapePrefillExecutor {
-        inner: RecurrentSpecExecutor {
-            inner: MockModelExecutor::new(64, Duration::ZERO, Duration::ZERO),
-        },
-    });
-    let tensor_factory: Arc<dyn TensorFactory> = Arc::new(MockTensorFactory);
-    let recurrent_manager = Arc::new(InMemoryRecurrentStateManager::new(
-        InMemoryRecurrentStateConfig {
-            total_memory_bytes: 8,
-            total_batch_slots: 1,
-        },
-    ));
-    let engine = ContinuousBatchEngine::new_with_recurrent_state_manager(
-        config,
-        scheduler.clone(),
-        tokenizer.clone(),
-        sampler,
-        kv_cache.clone(),
-        executor,
-        tensor_factory,
-        Some(recurrent_manager.clone()),
-    )
-    .expect("legacy engine composition must match executor authority");
-
-    let mut request = policy_request();
-    request.prompt = "test".to_string();
-    request.sampling_params.max_tokens = 2;
-    let request_id = request.id.clone();
-    scheduler.submit(request).await.unwrap();
-    let batch = scheduler
-        .next_batch(ferrum_interfaces::BatchHint::simple(1))
-        .await
-        .expect("prefill request must enter the scheduler's active queues");
-    assert_eq!(batch.requests.len(), 1);
-    assert_eq!(batch.requests[0].request.id, request_id);
-
-    engine
-        .inner
-        .process_batch_legacy_split_with_test_sequences(&batch)
-        .await
-        .expect("request-local prefill failure must complete through the scheduler");
-
-    let active_kv = kv_cache.list_handles();
-    assert_eq!(active_kv.len(), 0, "active kv handles: {active_kv:?}");
-    let recurrent_stats = recurrent_manager.stats();
-    assert_eq!(recurrent_stats.allocation_count, 1);
-    assert_eq!(recurrent_stats.active_states, 0);
-    assert_eq!(recurrent_stats.used_batch_slots, 0);
-    assert!(
-        !engine.inner.sequences.read().contains_key(&request_id),
-        "error-completed request should be removed from active sequences"
-    );
-    assert_eq!(scheduler.trace_phase(&request_id), None);
-    assert_eq!(scheduler.trace_snapshot().active_len, 0);
-}
-
-#[tokio::test]
-async fn process_batch_chunked_prefill_tensor_error_releases_kv_and_recurrent_state() {
-    let mut config = EngineConfig::default();
-    config.kv_cache.max_blocks = 128;
-    config.runtime.chunked_prefill_size = Some(1);
-    let scheduler = Arc::new(ContinuousBatchScheduler::new(config.scheduler.clone()));
-    let tokenizer: Arc<dyn Tokenizer + Send + Sync> =
-        Arc::new(PolicyTokenizer::new(64, &[("test", 5), ("ok", 6)]));
-    let sampler: Arc<dyn Sampler + Send + Sync> = Arc::new(crate::registry::GreedySampler);
-    let kv_cache = Arc::new(MockKvCacheManager::new(128));
-    let executor: Arc<dyn ModelExecutor + Send + Sync> = Arc::new(RecurrentSpecExecutor {
-        inner: MockModelExecutor::new(64, Duration::ZERO, Duration::ZERO),
-    });
-    let tensor_factory: Arc<dyn TensorFactory> = Arc::new(FailingFromSliceTensorFactory);
-    let recurrent_manager = Arc::new(InMemoryRecurrentStateManager::new(
-        InMemoryRecurrentStateConfig {
-            total_memory_bytes: 8,
-            total_batch_slots: 1,
-        },
-    ));
-    let engine = ContinuousBatchEngine::new_with_recurrent_state_manager(
-        config,
-        scheduler.clone(),
-        tokenizer.clone(),
-        sampler,
-        kv_cache.clone(),
-        executor,
-        tensor_factory,
-        Some(recurrent_manager.clone()),
-    )
-    .expect("legacy engine composition must match executor authority");
-
-    let mut request = policy_request();
-    request.prompt = "test ok".to_string();
-    request.sampling_params.max_tokens = 2;
-    let request_id = request.id.clone();
-    scheduler.submit(request).await.unwrap();
-    let batch = scheduler
-        .next_batch(ferrum_interfaces::BatchHint::simple(1))
-        .await
-        .expect("prefill request must enter the scheduler's active queues");
-    assert_eq!(batch.requests.len(), 1);
-    assert_eq!(batch.requests[0].request.id, request_id);
-
-    engine
-        .inner
-        .process_batch_legacy_split_with_test_sequences(&batch)
-        .await
-        .expect("request-local prefill failure must complete through the scheduler");
-
-    let active_kv = kv_cache.list_handles();
-    assert_eq!(active_kv.len(), 0, "active kv handles: {active_kv:?}");
-    let recurrent_stats = recurrent_manager.stats();
-    assert_eq!(recurrent_stats.allocation_count, 1);
-    assert_eq!(recurrent_stats.active_states, 0);
-    assert_eq!(recurrent_stats.used_batch_slots, 0);
-    assert!(
-        !engine.inner.sequences.read().contains_key(&request_id),
-        "error-completed request should be removed from active sequences"
-    );
-    assert_eq!(scheduler.trace_phase(&request_id), None);
-    assert_eq!(scheduler.trace_snapshot().active_len, 0);
-}
-
-#[tokio::test]
-async fn process_batch_batch_prefill_tensor_error_releases_kv_and_recurrent_state() {
-    let mut config = EngineConfig::default();
-    config.kv_cache.max_blocks = 128;
-    let scheduler = Arc::new(ContinuousBatchScheduler::new(config.scheduler.clone()));
-    let tokenizer: Arc<dyn Tokenizer + Send + Sync> =
-        Arc::new(PolicyTokenizer::new(64, &[("test", 5), ("ok", 6)]));
-    let sampler: Arc<dyn Sampler + Send + Sync> = Arc::new(crate::registry::GreedySampler);
-    let kv_cache = Arc::new(MockKvCacheManager::new(128));
-    let executor: Arc<dyn ModelExecutor + Send + Sync> = Arc::new(RecurrentSpecExecutor {
-        inner: MockModelExecutor::new(64, Duration::ZERO, Duration::ZERO),
-    });
-    let tensor_factory: Arc<dyn TensorFactory> = Arc::new(FailingFromSliceTensorFactory);
-    let recurrent_manager = Arc::new(InMemoryRecurrentStateManager::new(
-        InMemoryRecurrentStateConfig {
-            total_memory_bytes: 8,
-            total_batch_slots: 1,
-        },
-    ));
-    let engine = ContinuousBatchEngine::new_with_recurrent_state_manager(
-        config,
-        scheduler.clone(),
-        tokenizer.clone(),
-        sampler,
-        kv_cache.clone(),
-        executor,
-        tensor_factory,
-        Some(recurrent_manager.clone()),
-    )
-    .expect("legacy engine composition must match executor authority");
-
-    let mut request = policy_request();
-    request.prompt = "test".to_string();
-    request.sampling_params.max_tokens = 2;
-    let request_id = request.id.clone();
-    scheduler.submit(request).await.unwrap();
-    let batch = scheduler
-        .next_batch(ferrum_interfaces::BatchHint::simple(1))
-        .await
-        .expect("prefill request must enter the scheduler's active queues");
-    assert_eq!(batch.requests.len(), 1);
-    assert_eq!(batch.requests[0].request.id, request_id);
-
-    engine
-        .inner
-        .process_batch_legacy_split_with_test_sequences(&batch)
-        .await
-        .expect("request-local prefill failure must complete through the scheduler");
-
-    let active_kv = kv_cache.list_handles();
-    assert_eq!(active_kv.len(), 0, "active kv handles: {active_kv:?}");
-    let recurrent_stats = recurrent_manager.stats();
-    assert!(recurrent_stats.allocation_count >= 1);
-    assert_eq!(recurrent_stats.active_states, 0);
-    assert_eq!(recurrent_stats.used_batch_slots, 0);
-    assert!(
-        !engine.inner.sequences.read().contains_key(&request_id),
-        "error-completed request should be removed from active sequences"
-    );
-    assert_eq!(scheduler.trace_phase(&request_id), None);
-    assert_eq!(scheduler.trace_snapshot().active_len, 0);
-}
-
-#[tokio::test]
-async fn process_batch_decode_tensor_error_releases_owned_kv() {
-    let mut config = EngineConfig::default();
-    config.kv_cache.max_blocks = 128;
-    let scheduler = Arc::new(ContinuousBatchScheduler::new(config.scheduler.clone()));
-    let mut raw_tokenizer = PolicyTokenizer::new(64, &[]);
-    raw_tokenizer.special = ferrum_types::SpecialTokens::default();
-    let tokenizer: Arc<dyn Tokenizer + Send + Sync> = Arc::new(raw_tokenizer);
-    let sampler: Arc<dyn Sampler + Send + Sync> = Arc::new(crate::registry::GreedySampler);
-    let kv_cache = Arc::new(MockKvCacheManager::new(128));
-    let target_executor: Arc<dyn ModelExecutor + Send + Sync> =
-        Arc::new(MockModelExecutor::new(64, Duration::ZERO, Duration::ZERO));
-    let tensor_factory: Arc<dyn TensorFactory> = Arc::new(FailingFromSliceTensorFactory);
-    let engine = ContinuousBatchEngine::new_with_recurrent_state_manager(
-        config,
-        scheduler.clone(),
-        tokenizer.clone(),
-        sampler,
-        kv_cache.clone(),
-        target_executor,
-        tensor_factory,
-        None,
-    )
-    .expect("legacy engine composition must match executor authority");
-
-    let mut request = policy_request();
-    request.prompt = "test".to_string();
-    request.sampling_params.max_tokens = 2;
-    let request_id = request.id.clone();
-    scheduler.submit(request.clone()).await.unwrap();
-    let initial_batch = scheduler
-        .next_batch(ferrum_interfaces::BatchHint::simple(1))
-        .await
-        .expect("decode request must first enter the scheduler's active queues");
-    assert_eq!(initial_batch.requests.len(), 1);
-    scheduler.mark_prefill_complete(&request_id, 1);
-    let target_alloc = AllocationRequest {
-        request_id: request_id.clone(),
-        initial_tokens: 1,
-        max_sequence_length: 16,
-        num_layers: 1,
-        num_heads: 1,
-        head_dim: 4,
-        device: Device::CPU,
-        dtype: DataType::FP32,
-        priority: Priority::Normal,
-    };
-    let target_kv = kv_cache.allocate(&target_alloc).await.unwrap();
-    let mut sequence = SequenceState::new_with_tokenizer_and_model_vocab_size(
-        request.clone(),
-        vec![TokenId::new(5)],
-        Some(tokenizer),
-        Some(64),
-    );
-    sequence.generated_tokens.push(TokenId::new(6));
-    sequence.prefill_complete = true;
-    sequence.prefill_tokens_processed = 1;
-    let target_blocks = engine.inner.kv_resource_blocks_for_tokens(1);
-    engine.inner.trace_kv_allocate(&request_id, target_blocks);
-    sequence.install_legacy_allocated_model_kv(
-        target_kv,
-        SequenceKvAllocation::new(request_id.clone(), target_blocks),
-    );
-    sequence.phase = RequestPhase::Decoding;
-    engine
-        .inner
-        .sequences
-        .write()
-        .insert(request_id.clone(), sequence);
-
-    let batch = scheduler
-        .next_batch(ferrum_interfaces::BatchHint::simple(1))
-        .await
-        .expect("active request must be scheduled for decode");
-    assert_eq!(batch.requests.len(), 1);
-    assert_eq!(batch.requests[0].request.id, request_id);
-
-    engine
-        .inner
-        .process_batch_legacy_split_with_test_sequences(&batch)
-        .await
-        .expect("request-local tensor failure must be completed by the batch driver");
-
-    let stats = kv_cache.stats();
-    assert_eq!(
-        stats.allocation_count, 1,
-        "ordinary decode retains the single owned target allocation"
-    );
-    assert_eq!(
-        stats.active_caches, 0,
-        "failed decode must release its owned KV allocation"
-    );
-    let active_kv = kv_cache.list_handles();
-    assert_eq!(active_kv.len(), 0, "active kv handles: {active_kv:?}");
-    assert!(
-        !engine.inner.sequences.read().contains_key(&request_id),
-        "error-completed request should be removed from active sequences"
-    );
-}
-
-#[tokio::test]
-async fn process_batch_unified_reserve_resource_exhausted_defers_without_fallback() {
-    let mut config = EngineConfig::default();
-    config.kv_cache.max_blocks = 128;
-    let scheduler = Arc::new(ContinuousBatchScheduler::new(config.scheduler.clone()));
-    let tokenizer: Arc<dyn Tokenizer + Send + Sync> =
-        Arc::new(PolicyTokenizer::new(64, &[("test", 5), ("ok", 6)]));
-    let sampler: Arc<dyn Sampler + Send + Sync> = Arc::new(crate::registry::GreedySampler);
-    let kv_cache = Arc::new(MockKvCacheManager::new(128));
-    let executor: Arc<dyn ModelExecutor + Send + Sync> = Arc::new(FailingUnifiedReserveExecutor {
-        inner: FailingBatchPrefillExecutor {
-            inner: RecurrentSpecExecutor {
-                inner: MockModelExecutor::new(64, Duration::ZERO, Duration::ZERO),
-            },
-        },
-    });
-    let tensor_factory: Arc<dyn TensorFactory> = Arc::new(MockTensorFactory);
-    let recurrent_manager = Arc::new(InMemoryRecurrentStateManager::new(
-        InMemoryRecurrentStateConfig {
-            total_memory_bytes: 8,
-            total_batch_slots: 1,
-        },
-    ));
-    let engine = ContinuousBatchEngine::new_with_recurrent_state_manager(
-        config,
-        scheduler,
-        tokenizer.clone(),
-        sampler,
-        kv_cache.clone(),
-        executor,
-        tensor_factory,
-        Some(recurrent_manager.clone()),
-    )
-    .expect("legacy engine composition must match executor authority");
-
-    let mut request = policy_request();
-    request.prompt = "test".to_string();
-    request.sampling_params.max_tokens = 2;
-    let request_id = request.id.clone();
-    let batch = ferrum_interfaces::BatchPlan {
-        batch_id: ferrum_types::BatchId::new(),
-        requests: vec![ferrum_interfaces::scheduler::ScheduledRequest::new(request)],
-        max_sequence_length: 1,
-        estimated_time_ms: None,
-        resource_requirements: ferrum_interfaces::scheduler::BatchResourceRequirements::default(),
-        created_at: chrono::Utc::now(),
-    };
-
-    engine
-        .inner
-        .process_batch_with_test_sequences(&batch)
-        .await
-        .unwrap();
-
-    let active_kv = kv_cache.list_handles();
-    assert_eq!(active_kv.len(), 0, "active kv handles: {active_kv:?}");
-    let recurrent_stats = recurrent_manager.stats();
-    assert_eq!(
-        recurrent_stats.allocation_count, 1,
-        "ResourceExhausted admission should wait instead of entering legacy fallback"
-    );
-    assert_eq!(recurrent_stats.active_states, 0);
-    assert_eq!(recurrent_stats.used_batch_slots, 0);
-
-    let sequences = engine.inner.sequences.read();
-    let sequence = sequences
-        .get(&request_id)
-        .expect("failed request should remain available for retry");
-    assert!(!sequence.prefill_complete);
-    assert!(sequence.kv_cache_handle().is_none());
-    assert!(sequence.recurrent_state.is_none());
-}
-
-#[tokio::test]
-async fn process_batch_unified_reserve_resource_exhausted_defers_existing_kv_prefill() {
-    let mut config = EngineConfig::default();
-    config.kv_cache.max_blocks = 128;
-    let scheduler = Arc::new(ContinuousBatchScheduler::new(config.scheduler.clone()));
-    let tokenizer: Arc<dyn Tokenizer + Send + Sync> =
-        Arc::new(PolicyTokenizer::new(64, &[("test", 5), ("ok", 6)]));
-    let sampler: Arc<dyn Sampler + Send + Sync> = Arc::new(crate::registry::GreedySampler);
-    let kv_cache = Arc::new(MockKvCacheManager::new(128));
-    let executor: Arc<dyn ModelExecutor + Send + Sync> = Arc::new(FailingUnifiedReserveExecutor {
-        inner: FailingBatchPrefillExecutor {
-            inner: RecurrentSpecExecutor {
-                inner: MockModelExecutor::new(64, Duration::ZERO, Duration::ZERO),
-            },
-        },
-    });
-    let tensor_factory: Arc<dyn TensorFactory> = Arc::new(MockTensorFactory);
-    let recurrent_manager = Arc::new(InMemoryRecurrentStateManager::new(
-        InMemoryRecurrentStateConfig {
-            total_memory_bytes: 8,
-            total_batch_slots: 1,
-        },
-    ));
-    let engine = ContinuousBatchEngine::new_with_recurrent_state_manager(
-        config,
-        scheduler.clone(),
-        tokenizer.clone(),
-        sampler,
-        kv_cache.clone(),
-        executor,
-        tensor_factory,
-        Some(recurrent_manager.clone()),
-    )
-    .expect("legacy engine composition must match executor authority");
-
-    let mut request = policy_request();
-    request.prompt = "test ok".to_string();
-    request.sampling_params.max_tokens = 2;
-    let request_id = request.id.clone();
-    scheduler.submit(request.clone()).await.unwrap();
-    let batch = scheduler
-        .next_batch(ferrum_interfaces::BatchHint::simple(4))
-        .await
-        .expect("submitted request should be scheduled");
-    let active = scheduler.trace_snapshot();
-    assert_eq!(active.prefill_queue_len, 1);
-    assert_eq!(active.active_len, 1);
-
-    let allocated_kv = kv_cache
-        .allocate(&AllocationRequest {
-            request_id: request_id.clone(),
-            initial_tokens: 1,
-            max_sequence_length: 16,
-            num_layers: 1,
-            num_heads: 1,
-            head_dim: 4,
-            device: Device::CPU,
-            dtype: DataType::FP32,
-            priority: Priority::Normal,
-        })
-        .await
-        .unwrap();
-    let mut sequence = SequenceState::new_with_tokenizer_and_model_vocab_size(
-        request,
-        vec![TokenId::new(5), TokenId::new(6)],
-        Some(tokenizer),
-        Some(64),
-    );
-    let allocated_blocks = engine.inner.kv_resource_blocks_for_tokens(1);
-    engine
-        .inner
-        .trace_kv_allocate(&request_id, allocated_blocks);
-    sequence.install_legacy_allocated_model_kv(
-        allocated_kv,
-        SequenceKvAllocation::new(request_id.clone(), allocated_blocks),
-    );
-    sequence.prefill_tokens_processed = 1;
-    sequence.phase = RequestPhase::Prefilling;
-    engine
-        .inner
-        .sequences
-        .write()
-        .insert(request_id.clone(), sequence);
-
-    engine
-        .inner
-        .process_batch_with_test_sequences(&batch)
-        .await
-        .unwrap();
-
-    let deferred = scheduler.trace_snapshot();
-    assert_eq!(deferred.waiting_queue_len, 1);
-    assert_eq!(deferred.prefill_queue_len, 0);
-    assert_eq!(deferred.active_len, 0);
-    assert_eq!(deferred.cancelled_total, 0);
-    assert_eq!(
-        scheduler.trace_phase(&request_id),
-        Some(RequestPhase::Waiting)
-    );
-    let active_kv = kv_cache.list_handles();
-    assert_eq!(active_kv.len(), 0, "active kv handles: {active_kv:?}");
-    let recurrent_stats = recurrent_manager.stats();
-    assert_eq!(recurrent_stats.active_states, 0);
-    assert_eq!(recurrent_stats.used_batch_slots, 0);
-
-    let sequences = engine.inner.sequences.read();
-    let sequence = sequences
-        .get(&request_id)
-        .expect("deferred request should remain available for retry");
-    assert_eq!(sequence.phase, RequestPhase::Waiting);
-    assert!(!sequence.prefill_complete);
-    assert!(sequence.kv_cache_handle().is_none());
-    assert!(sequence.recurrent_state.is_none());
-    assert!(sequence.model_cache_id().is_none());
-    assert_eq!(
-        sequence.prefill_tokens_processed, 0,
-        "retry must rebuild KV from the full logical context"
-    );
-}
-
-#[tokio::test]
-async fn process_batch_unified_forward_resource_exhausted_defers_existing_kv_prefill() {
-    let trace_path = resource_trace_temp_path("unified-forward-resource-exhausted");
-    let _ = std::fs::remove_file(&trace_path);
-    let mut config = EngineConfig::default();
-    config.kv_cache.max_blocks = 128;
-    config.runtime.scheduler_trace_jsonl = Some(trace_path.clone());
-    config.runtime.profile_entrypoint = Some(ProfileEntrypoint::Synthetic);
-    let scheduler = Arc::new(ContinuousBatchScheduler::new(config.scheduler.clone()));
-    let tokenizer: Arc<dyn Tokenizer + Send + Sync> =
-        Arc::new(PolicyTokenizer::new(64, &[("test", 5), ("ok", 6)]));
-    let sampler: Arc<dyn Sampler + Send + Sync> = Arc::new(crate::registry::GreedySampler);
-    let kv_cache = Arc::new(MockKvCacheManager::new(128));
-    let executor: Arc<dyn ModelExecutor + Send + Sync> = Arc::new(FailingUnifiedForwardExecutor {
-        inner: RecurrentSpecExecutor {
-            inner: MockModelExecutor::new(64, Duration::ZERO, Duration::ZERO),
-        },
-        resource_exhausted: true,
-    });
-    let tensor_factory: Arc<dyn TensorFactory> = Arc::new(MockTensorFactory);
-    let recurrent_manager = Arc::new(InMemoryRecurrentStateManager::new(
-        InMemoryRecurrentStateConfig {
-            total_memory_bytes: 8,
-            total_batch_slots: 1,
-        },
-    ));
-    let engine = ContinuousBatchEngine::new_with_recurrent_state_manager(
-        config,
-        scheduler.clone(),
-        tokenizer.clone(),
-        sampler,
-        kv_cache.clone(),
-        executor,
-        tensor_factory,
-        Some(recurrent_manager.clone()),
-    )
-    .expect("legacy engine composition must match executor authority");
-
-    let mut request = policy_request();
-    request.prompt = "test ok".to_string();
-    request.sampling_params.max_tokens = 2;
-    let request_id = request.id.clone();
-    scheduler.submit(request.clone()).await.unwrap();
-    let batch = scheduler
-        .next_batch(ferrum_interfaces::BatchHint::simple(4))
-        .await
-        .expect("submitted request should be scheduled");
-    let active = scheduler.trace_snapshot();
-    assert_eq!(active.prefill_queue_len, 1);
-    assert_eq!(active.active_len, 1);
-
-    let allocated_kv = kv_cache
-        .allocate(&AllocationRequest {
-            request_id: request_id.clone(),
-            initial_tokens: 1,
-            max_sequence_length: 16,
-            num_layers: 1,
-            num_heads: 1,
-            head_dim: 4,
-            device: Device::CPU,
-            dtype: DataType::FP32,
-            priority: Priority::Normal,
-        })
-        .await
-        .unwrap();
-    let mut sequence = SequenceState::new_with_tokenizer_and_model_vocab_size(
-        request,
-        vec![TokenId::new(5), TokenId::new(6)],
-        Some(tokenizer),
-        Some(64),
-    );
-    let allocated_blocks = engine.inner.kv_resource_blocks_for_tokens(1);
-    engine
-        .inner
-        .trace_kv_allocate(&request_id, allocated_blocks);
-    sequence.install_legacy_allocated_model_kv(
-        allocated_kv,
-        SequenceKvAllocation::new(request_id.clone(), allocated_blocks),
-    );
-    sequence.prefill_tokens_processed = 1;
-    sequence.phase = RequestPhase::Prefilling;
-    engine
-        .inner
-        .sequences
-        .write()
-        .insert(request_id.clone(), sequence);
-
-    engine.inner.trace_model_cache_ref_acquire(&request_id);
-    engine
-        .inner
-        .process_batch_with_test_sequences(&batch)
-        .await
-        .unwrap();
-
-    let deferred = scheduler.trace_snapshot();
-    assert_eq!(deferred.waiting_queue_len, 1);
-    assert_eq!(deferred.prefill_queue_len, 0);
-    assert_eq!(deferred.active_len, 0);
-    assert_eq!(deferred.cancelled_total, 0);
-    assert_eq!(
-        scheduler.trace_phase(&request_id),
-        Some(RequestPhase::Waiting)
-    );
-    let active_kv = kv_cache.list_handles();
-    assert_eq!(active_kv.len(), 0, "active kv handles: {active_kv:?}");
-    let recurrent_stats = recurrent_manager.stats();
-    assert_eq!(recurrent_stats.active_states, 0);
-    assert_eq!(recurrent_stats.used_batch_slots, 0);
-    flush_engine_profile_events(&engine);
-    let resources = assert_engine_resource_trace_balanced(&trace_path);
-    let saw = |kind: &str, action: ResourceAction| {
-        resources
-            .iter()
-            .any(|resource| resource.resource_kind == kind && resource.action == action)
-    };
-    assert!(saw("backend_workspace", ResourceAction::Reserve));
-    assert!(saw("backend_workspace", ResourceAction::Commit));
-    assert!(saw("backend_workspace", ResourceAction::Release));
-    let profile_events = read_engine_profile_events(&trace_path);
-    let defer_event = profile_events
-        .iter()
-        .find(|event| {
-            event
-                .resource
-                .as_ref()
-                .is_some_and(|resource| resource.action == ResourceAction::Defer)
-        })
-        .expect("capacity defer event should be traced");
-    let scheduler_snapshot = defer_event
-        .attributes
-        .get("scheduler_snapshot")
-        .and_then(serde_json::Value::as_object)
-        .expect("defer event should include scheduler snapshot");
-    assert_eq!(
-        scheduler_snapshot
-            .get("waiting_queue_len")
-            .and_then(serde_json::Value::as_u64),
-        Some(1)
-    );
-    assert_eq!(
-        scheduler_snapshot
-            .get("capacity_deferred_total")
-            .and_then(serde_json::Value::as_u64),
-        Some(1)
-    );
-    assert!(
-        scheduler_snapshot.contains_key("capacity_release_epoch"),
-        "scheduler snapshot must expose release epoch"
-    );
-    assert!(
-        scheduler_snapshot.contains_key("capacity_mixed_recompute_epoch"),
-        "scheduler snapshot must expose mixed recompute epoch"
-    );
-    let _ = std::fs::remove_file(trace_path);
-
-    let sequences = engine.inner.sequences.read();
-    let sequence = sequences
-        .get(&request_id)
-        .expect("deferred request should remain available for retry");
-    assert_eq!(sequence.phase, RequestPhase::Waiting);
-    assert!(!sequence.prefill_complete);
-    assert!(sequence.kv_cache_handle().is_none());
-    assert!(sequence.recurrent_state.is_none());
-    assert!(sequence.model_cache_id().is_none());
-    assert_eq!(
-        sequence.prefill_tokens_processed, 0,
-        "retry must rebuild KV from the full logical context"
-    );
-}
-
-#[tokio::test]
-async fn process_batch_unified_forward_failure_then_fallback_kv_defer_releases_recurrent_state() {
-    let mut config = EngineConfig::default();
-    config.kv_cache.max_blocks = 128;
-    let scheduler = Arc::new(ContinuousBatchScheduler::new(config.scheduler.clone()));
-    let tokenizer: Arc<dyn Tokenizer + Send + Sync> =
-        Arc::new(PolicyTokenizer::new(64, &[("test", 5), ("ok", 6)]));
-    let sampler: Arc<dyn Sampler + Send + Sync> = Arc::new(crate::registry::GreedySampler);
-    let kv_cache = Arc::new(FirstAllocateThenFailKvCacheManager::new(128));
-    let executor: Arc<dyn ModelExecutor + Send + Sync> = Arc::new(FailingUnifiedForwardExecutor {
-        inner: RecurrentSpecExecutor {
-            inner: MockModelExecutor::new(64, Duration::ZERO, Duration::ZERO),
-        },
-        resource_exhausted: false,
-    });
-    let tensor_factory: Arc<dyn TensorFactory> = Arc::new(MockTensorFactory);
-    let recurrent_manager = Arc::new(InMemoryRecurrentStateManager::new(
-        InMemoryRecurrentStateConfig {
-            total_memory_bytes: 8,
-            total_batch_slots: 1,
-        },
-    ));
-    let engine = ContinuousBatchEngine::new_with_recurrent_state_manager(
-        config,
-        scheduler,
-        tokenizer.clone(),
-        sampler,
-        kv_cache.clone(),
-        executor,
-        tensor_factory,
-        Some(recurrent_manager.clone()),
-    )
-    .expect("legacy engine composition must match executor authority");
-
-    let mut request = policy_request();
-    request.prompt = "test".to_string();
-    request.sampling_params.max_tokens = 2;
-    let request_id = request.id.clone();
-    let batch = ferrum_interfaces::BatchPlan {
-        batch_id: ferrum_types::BatchId::new(),
-        requests: vec![ferrum_interfaces::scheduler::ScheduledRequest::new(request)],
-        max_sequence_length: 1,
-        estimated_time_ms: None,
-        resource_requirements: ferrum_interfaces::scheduler::BatchResourceRequirements::default(),
-        created_at: chrono::Utc::now(),
-    };
-
-    engine
-        .inner
-        .process_batch_with_test_sequences(&batch)
-        .await
-        .unwrap();
-
-    let active_kv = kv_cache.list_handles();
-    assert_eq!(active_kv.len(), 0, "active kv handles: {active_kv:?}");
-    let recurrent_stats = recurrent_manager.stats();
-    assert_eq!(recurrent_stats.allocation_count, 1);
-    assert_eq!(recurrent_stats.active_states, 0);
-    assert_eq!(recurrent_stats.used_batch_slots, 0);
-
-    let sequences = engine.inner.sequences.read();
-    let sequence = sequences
-        .get(&request_id)
-        .expect("deferred request should remain available for retry");
-    assert!(!sequence.prefill_complete);
-    assert!(sequence.kv_cache_handle().is_none());
-    assert!(sequence.recurrent_state.is_none());
-}
-
-#[tokio::test]
-async fn process_batch_unified_result_len_mismatch_releases_recurrent_state() {
-    let mut config = EngineConfig::default();
-    config.kv_cache.max_blocks = 128;
-    let scheduler = Arc::new(ContinuousBatchScheduler::new(config.scheduler.clone()));
-    let tokenizer: Arc<dyn Tokenizer + Send + Sync> =
-        Arc::new(PolicyTokenizer::new(64, &[("test", 5), ("ok", 6)]));
-    let sampler: Arc<dyn Sampler + Send + Sync> = Arc::new(crate::registry::GreedySampler);
-    let kv_cache = Arc::new(MockKvCacheManager::new(128));
-    let executor: Arc<dyn ModelExecutor + Send + Sync> = Arc::new(ShortUnifiedResultExecutor {
-        inner: RecurrentSpecExecutor {
-            inner: MockModelExecutor::new(64, Duration::ZERO, Duration::ZERO),
-        },
-    });
-    let tensor_factory: Arc<dyn TensorFactory> = Arc::new(MockTensorFactory);
-    let recurrent_manager = Arc::new(InMemoryRecurrentStateManager::new(
-        InMemoryRecurrentStateConfig {
-            total_memory_bytes: 8,
-            total_batch_slots: 1,
-        },
-    ));
-    let engine = ContinuousBatchEngine::new_with_recurrent_state_manager(
-        config,
-        scheduler,
-        tokenizer.clone(),
-        sampler,
-        kv_cache.clone(),
-        executor,
-        tensor_factory,
-        Some(recurrent_manager.clone()),
-    )
-    .expect("legacy engine composition must match executor authority");
-
-    let mut request = policy_request();
-    request.prompt = "test".to_string();
-    request.sampling_params.max_tokens = 2;
-    let request_id = request.id.clone();
-    let batch = ferrum_interfaces::BatchPlan {
-        batch_id: ferrum_types::BatchId::new(),
-        requests: vec![ferrum_interfaces::scheduler::ScheduledRequest::new(request)],
-        max_sequence_length: 1,
-        estimated_time_ms: None,
-        resource_requirements: ferrum_interfaces::scheduler::BatchResourceRequirements::default(),
-        created_at: chrono::Utc::now(),
-    };
-
-    let err = engine
-        .inner
-        .process_batch_with_test_sequences(&batch)
-        .await
-        .unwrap_err();
-    assert!(
-        err.to_string().contains("unified_decode returned"),
-        "unexpected error: {err}"
-    );
-
-    let active_kv = kv_cache.list_handles();
-    assert_eq!(active_kv.len(), 0, "active kv handles: {active_kv:?}");
-    let recurrent_stats = recurrent_manager.stats();
-    assert_eq!(recurrent_stats.allocation_count, 1);
-    assert_eq!(recurrent_stats.active_states, 0);
-    assert_eq!(recurrent_stats.used_batch_slots, 0);
-
-    let sequences = engine.inner.sequences.read();
-    let sequence = sequences
-        .get(&request_id)
-        .expect("failed request should remain inspectable");
-    assert!(!sequence.prefill_complete);
-    assert!(sequence.kv_cache_handle().is_none());
-    assert!(sequence.recurrent_state.is_none());
-}
-
-#[tokio::test]
-async fn process_batch_unified_missing_final_prefill_result_releases_fresh_kv() {
-    let mut config = EngineConfig::default();
-    config.kv_cache.max_blocks = 128;
-    let scheduler = Arc::new(ContinuousBatchScheduler::new(config.scheduler.clone()));
-    let tokenizer: Arc<dyn Tokenizer + Send + Sync> =
-        Arc::new(PolicyTokenizer::new(64, &[("test", 5), ("ok", 6)]));
-    let sampler: Arc<dyn Sampler + Send + Sync> = Arc::new(crate::registry::GreedySampler);
-    let kv_cache = Arc::new(MockKvCacheManager::new(128));
-    let executor: Arc<dyn ModelExecutor + Send + Sync> =
-        Arc::new(MissingFinalUnifiedResultExecutor {
-            inner: RecurrentSpecExecutor {
-                inner: MockModelExecutor::new(64, Duration::ZERO, Duration::ZERO),
-            },
-        });
-    let tensor_factory: Arc<dyn TensorFactory> = Arc::new(MockTensorFactory);
-    let recurrent_manager = Arc::new(InMemoryRecurrentStateManager::new(
-        InMemoryRecurrentStateConfig {
-            total_memory_bytes: 8,
-            total_batch_slots: 1,
-        },
-    ));
-    let engine = ContinuousBatchEngine::new_with_recurrent_state_manager(
-        config,
-        scheduler.clone(),
-        tokenizer.clone(),
-        sampler,
-        kv_cache.clone(),
-        executor,
-        tensor_factory,
-        Some(recurrent_manager.clone()),
-    )
-    .expect("legacy engine composition must match executor authority");
-
-    let mut request = policy_request();
-    request.prompt = "test".to_string();
-    request.sampling_params.max_tokens = 2;
-    let request_id = request.id.clone();
-    scheduler.submit(request).await.unwrap();
-    let batch = scheduler
-        .next_batch(ferrum_interfaces::BatchHint::simple(1))
-        .await
-        .expect("prefill request must enter the scheduler's active queues");
-    assert_eq!(batch.requests.len(), 1);
-    assert_eq!(batch.requests[0].request.id, request_id);
-
-    engine
-        .inner
-        .process_batch_with_test_sequences(&batch)
-        .await
-        .expect("request-local prefill failure must complete through the scheduler");
-
-    let active_kv = kv_cache.list_handles();
-    assert_eq!(active_kv.len(), 0, "active kv handles: {active_kv:?}");
-    let recurrent_stats = recurrent_manager.stats();
-    assert_eq!(recurrent_stats.allocation_count, 1);
-    assert_eq!(recurrent_stats.active_states, 0);
-    assert_eq!(recurrent_stats.used_batch_slots, 0);
-    assert!(
-        !engine.inner.sequences.read().contains_key(&request_id),
-        "error-completed request should be removed from active sequences"
-    );
-    assert_eq!(scheduler.trace_phase(&request_id), None);
-    assert_eq!(scheduler.trace_snapshot().active_len, 0);
-}
-
-#[tokio::test]
-async fn process_batch_unified_prefill_postprocess_error_releases_fresh_kv() {
-    let mut config = EngineConfig::default();
-    config.kv_cache.max_blocks = 128;
-    let scheduler = Arc::new(ContinuousBatchScheduler::new(config.scheduler.clone()));
-    let tokenizer: Arc<dyn Tokenizer + Send + Sync> = Arc::new(PolicyTokenizer::new(
-        64,
-        &[("test", 5), ("ok", 6), ("<unk>", 2)],
-    ));
-    let sampler: Arc<dyn Sampler + Send + Sync> = Arc::new(crate::registry::GreedySampler);
-    let kv_cache = Arc::new(MockKvCacheManager::new(128));
-    let executor: Arc<dyn ModelExecutor + Send + Sync> = Arc::new(GreedySentinelUnifiedExecutor {
-        inner: RecurrentSpecExecutor {
-            inner: MockModelExecutor::new(64, Duration::ZERO, Duration::ZERO),
-        },
-        token: 6,
-    });
-    let tensor_factory: Arc<dyn TensorFactory> = Arc::new(MockTensorFactory);
-    let recurrent_manager = Arc::new(InMemoryRecurrentStateManager::new(
-        InMemoryRecurrentStateConfig {
-            total_memory_bytes: 8,
-            total_batch_slots: 1,
-        },
-    ));
-    let engine = ContinuousBatchEngine::new_with_recurrent_state_manager(
-        config,
-        scheduler.clone(),
-        tokenizer.clone(),
-        sampler,
-        kv_cache.clone(),
-        executor,
-        tensor_factory,
-        Some(recurrent_manager.clone()),
-    )
-    .expect("legacy engine composition must match executor authority");
-
-    let mut request = policy_request();
-    request.prompt = "test".to_string();
-    request.sampling_params.max_tokens = 2;
-    request.sampling_params.response_format = ferrum_types::ResponseFormat::JsonObject;
-    let request_id = request.id.clone();
-    scheduler.submit(request).await.unwrap();
-    let batch = scheduler
-        .next_batch(ferrum_interfaces::BatchHint::simple(1))
-        .await
-        .expect("prefill request must enter the scheduler's active queues");
-    assert_eq!(batch.requests.len(), 1);
-    assert_eq!(batch.requests[0].request.id, request_id);
-
-    engine
-        .inner
-        .process_batch_with_test_sequences(&batch)
-        .await
-        .expect("request-local prefill failure must complete through the scheduler");
-
-    let active_kv = kv_cache.list_handles();
-    assert_eq!(active_kv.len(), 0, "active kv handles: {active_kv:?}");
-    let recurrent_stats = recurrent_manager.stats();
-    assert_eq!(recurrent_stats.allocation_count, 1);
-    assert_eq!(recurrent_stats.active_states, 0);
-    assert_eq!(recurrent_stats.used_batch_slots, 0);
-    assert!(
-        !engine.inner.sequences.read().contains_key(&request_id),
-        "error-completed request should be removed from active sequences"
-    );
-    assert_eq!(scheduler.trace_phase(&request_id), None);
-    assert_eq!(scheduler.trace_snapshot().active_len, 0);
-}
-
-#[tokio::test]
-async fn process_batch_unified_decode_postprocess_error_releases_recurrent_state() {
-    let mut config = EngineConfig::default();
-    config.kv_cache.max_blocks = 128;
-    let scheduler = Arc::new(ContinuousBatchScheduler::new(config.scheduler.clone()));
-    let tokenizer: Arc<dyn Tokenizer + Send + Sync> =
-        Arc::new(PolicyTokenizer::new(64, &[("test", 5), ("ok", 6)]));
-    let sampler: Arc<dyn Sampler + Send + Sync> = Arc::new(crate::registry::GreedySampler);
-    let kv_cache: Arc<dyn KvCacheManager + Send + Sync> = Arc::new(MockKvCacheManager::new(128));
-    let executor: Arc<dyn ModelExecutor + Send + Sync> = Arc::new(GreedySentinelUnifiedExecutor {
-        inner: RecurrentSpecExecutor {
-            inner: MockModelExecutor::new(64, Duration::ZERO, Duration::ZERO),
-        },
-        token: 6,
-    });
-    let tensor_factory: Arc<dyn TensorFactory> = Arc::new(MockTensorFactory);
-    let recurrent_manager = Arc::new(InMemoryRecurrentStateManager::new(
-        InMemoryRecurrentStateConfig {
-            total_memory_bytes: 8,
-            total_batch_slots: 1,
-        },
-    ));
-    let engine = ContinuousBatchEngine::new_with_recurrent_state_manager(
-        config,
-        scheduler.clone(),
-        tokenizer.clone(),
-        sampler,
-        kv_cache,
-        executor,
-        tensor_factory,
-        Some(recurrent_manager.clone()),
-    )
-    .expect("legacy engine composition must match executor authority");
-
-    let mut request = policy_request();
-    request.prompt = "test".to_string();
-    request.sampling_params.max_tokens = 4;
-    request.sampling_params.response_format = ferrum_types::ResponseFormat::JsonObject;
-    let request_id = request.id.clone();
-    scheduler.submit(request.clone()).await.unwrap();
-    let initial_batch = scheduler
-        .next_batch(ferrum_interfaces::BatchHint::simple(1))
-        .await
-        .expect("decode request must first enter the scheduler's active queues");
-    assert_eq!(initial_batch.requests.len(), 1);
-    assert_eq!(initial_batch.requests[0].request.id, request_id);
-    scheduler.mark_prefill_complete(&request_id, 1);
-    let recurrent_spec = RecurrentStateSpec {
-        request_id: request_id.clone(),
-        num_layers: 1,
-        tensors: vec![RecurrentStateTensorSpec::new(
-            0,
-            "delta_state",
-            vec![4],
-            DataType::BF16,
-        )],
-        device: Device::CPU,
-        max_batch_slots: 1,
-    };
-    let recurrent_state = recurrent_manager.allocate(&recurrent_spec).await.unwrap();
-    let kv = engine
-        .inner
-        .make_model_kv_handle_with_seq("decode-cache".to_string(), 1);
-    let mut sequence = SequenceState::new_with_tokenizer_and_model_vocab_size(
-        request.clone(),
-        vec![TokenId::new(5)],
-        Some(tokenizer),
-        Some(64),
-    );
-    sequence.generated_tokens.push(TokenId::new(6));
-    sequence.prefill_complete = true;
-    sequence.prefill_tokens_processed = 1;
-    sequence.install_runtime_managed_model_kv(kv);
-    sequence.commit_recurrent_state_admission(recurrent_state, 1);
-    sequence.phase = RequestPhase::Decoding;
-    engine
-        .inner
-        .sequences
-        .write()
-        .insert(request_id.clone(), sequence);
-
-    let batch = scheduler
-        .next_batch(ferrum_interfaces::BatchHint::simple(1))
-        .await
-        .expect("active request must be scheduled for decode");
-    assert_eq!(batch.requests.len(), 1);
-    assert_eq!(batch.requests[0].request.id, request_id);
-
-    engine
-        .inner
-        .process_batch_with_test_sequences(&batch)
-        .await
-        .expect("request-local decode failure must complete through the scheduler");
-
-    assert!(
-        !engine.inner.sequences.read().contains_key(&request_id),
-        "error-completed decode request should be removed from active sequences"
-    );
-    let recurrent_stats = recurrent_manager.stats();
-    assert_eq!(recurrent_stats.active_states, 0);
-    assert_eq!(recurrent_stats.used_batch_slots, 0);
-    assert_eq!(scheduler.trace_phase(&request_id), None);
-    assert_eq!(scheduler.trace_snapshot().active_len, 0);
-}
-
-#[tokio::test]
-async fn process_batch_single_decode_resource_exhausted_keeps_recurrent_state_waiting() {
-    let mut config = EngineConfig::default();
-    config.kv_cache.max_blocks = 128;
-    let scheduler = Arc::new(ContinuousBatchScheduler::new(config.scheduler.clone()));
-    let tokenizer: Arc<dyn Tokenizer + Send + Sync> =
-        Arc::new(PolicyTokenizer::new(64, &[("test", 5), ("ok", 6)]));
-    let sampler: Arc<dyn Sampler + Send + Sync> = Arc::new(crate::registry::GreedySampler);
-    let kv_cache: Arc<dyn KvCacheManager + Send + Sync> = Arc::new(MockKvCacheManager::new(128));
-    let executor: Arc<dyn ModelExecutor + Send + Sync> = Arc::new(FailingDecodeExecutor {
-        inner: RecurrentSpecExecutor {
-            inner: MockModelExecutor::new(64, Duration::ZERO, Duration::ZERO),
-        },
-    });
-    let tensor_factory: Arc<dyn TensorFactory> = Arc::new(MockTensorFactory);
-    let recurrent_manager = Arc::new(InMemoryRecurrentStateManager::new(
-        InMemoryRecurrentStateConfig {
-            total_memory_bytes: 8,
-            total_batch_slots: 1,
-        },
-    ));
-    let engine = ContinuousBatchEngine::new_with_recurrent_state_manager(
-        config,
-        scheduler,
-        tokenizer.clone(),
-        sampler,
-        kv_cache,
-        executor,
-        tensor_factory,
-        Some(recurrent_manager.clone()),
-    )
-    .expect("legacy engine composition must match executor authority");
-
-    let mut request = policy_request();
-    request.prompt = "test".to_string();
-    request.sampling_params.max_tokens = 4;
-    let request_id = request.id.clone();
-    let recurrent_spec = RecurrentStateSpec {
-        request_id: request_id.clone(),
-        num_layers: 1,
-        tensors: vec![RecurrentStateTensorSpec::new(
-            0,
-            "delta_state",
-            vec![4],
-            DataType::BF16,
-        )],
-        device: Device::CPU,
-        max_batch_slots: 1,
-    };
-    let recurrent_state = recurrent_manager.allocate(&recurrent_spec).await.unwrap();
-    let kv = engine
-        .inner
-        .make_model_kv_handle_with_seq("decode-cache".to_string(), 1);
-    let mut sequence = SequenceState::new_with_tokenizer_and_model_vocab_size(
-        request.clone(),
-        vec![TokenId::new(5)],
-        Some(tokenizer),
-        Some(64),
-    );
-    sequence.generated_tokens.push(TokenId::new(6));
-    sequence.prefill_complete = true;
-    sequence.prefill_tokens_processed = 1;
-    sequence.install_runtime_managed_model_kv(kv);
-    sequence.commit_recurrent_state_admission(recurrent_state, 1);
-    sequence.phase = RequestPhase::Decoding;
-    engine
-        .inner
-        .sequences
-        .write()
-        .insert(request_id.clone(), sequence);
-
-    let batch = ferrum_interfaces::BatchPlan {
-        batch_id: ferrum_types::BatchId::new(),
-        requests: vec![ferrum_interfaces::scheduler::ScheduledRequest::new(request)],
-        max_sequence_length: 1,
-        estimated_time_ms: None,
-        resource_requirements: ferrum_interfaces::scheduler::BatchResourceRequirements::default(),
-        created_at: chrono::Utc::now(),
-    };
-
-    engine
-        .inner
-        .process_batch_legacy_split_with_test_sequences(&batch)
-        .await
-        .unwrap();
-
-    let sequences = engine.inner.sequences.read();
-    let sequence = sequences
-        .get(&request_id)
-        .expect("resource-exhausted decode should remain queued");
-    assert!(sequence.prefill_complete);
-    assert!(sequence.kv_cache_handle().is_some());
-    assert!(sequence.recurrent_state.is_some());
-    assert_eq!(sequence.generated_tokens, vec![TokenId::new(6)]);
-    assert_eq!(recurrent_manager.stats().active_states, 1);
-}
-
-#[tokio::test]
-async fn process_batch_unified_decode_resource_exhausted_keeps_recurrent_state_waiting() {
-    let mut config = EngineConfig::default();
-    config.kv_cache.max_blocks = 128;
-    let scheduler = Arc::new(ContinuousBatchScheduler::new(config.scheduler.clone()));
-    let tokenizer: Arc<dyn Tokenizer + Send + Sync> =
-        Arc::new(PolicyTokenizer::new(64, &[("test", 5), ("ok", 6)]));
-    let sampler: Arc<dyn Sampler + Send + Sync> = Arc::new(crate::registry::GreedySampler);
-    let kv_cache: Arc<dyn KvCacheManager + Send + Sync> = Arc::new(MockKvCacheManager::new(128));
-    let executor: Arc<dyn ModelExecutor + Send + Sync> = Arc::new(FailingUnifiedReserveExecutor {
-        inner: FailingBatchPrefillExecutor {
-            inner: RecurrentSpecExecutor {
-                inner: MockModelExecutor::new(64, Duration::ZERO, Duration::ZERO),
-            },
-        },
-    });
-    let tensor_factory: Arc<dyn TensorFactory> = Arc::new(MockTensorFactory);
-    let recurrent_manager = Arc::new(InMemoryRecurrentStateManager::new(
-        InMemoryRecurrentStateConfig {
-            total_memory_bytes: 8,
-            total_batch_slots: 1,
-        },
-    ));
-    let engine = ContinuousBatchEngine::new_with_recurrent_state_manager(
-        config,
-        scheduler.clone(),
-        tokenizer.clone(),
-        sampler,
-        kv_cache,
-        executor,
-        tensor_factory,
-        Some(recurrent_manager.clone()),
-    )
-    .expect("legacy engine composition must match executor authority");
-
-    let mut request = policy_request();
-    request.prompt = "test".to_string();
-    request.sampling_params.max_tokens = 4;
-    let request_id = request.id.clone();
-    scheduler.submit(request.clone()).await.unwrap();
-    let initial_batch = scheduler
-        .next_batch(ferrum_interfaces::BatchHint::simple(4))
-        .await
-        .expect("decode request should first be scheduled as prefill");
-    assert_eq!(initial_batch.requests.len(), 1);
-    scheduler.mark_prefill_complete(&request_id, 1);
-
-    let recurrent_spec = RecurrentStateSpec {
-        request_id: request_id.clone(),
-        num_layers: 1,
-        tensors: vec![RecurrentStateTensorSpec::new(
-            0,
-            "delta_state",
-            vec![4],
-            DataType::BF16,
-        )],
-        device: Device::CPU,
-        max_batch_slots: 1,
-    };
-    let recurrent_state = recurrent_manager.allocate(&recurrent_spec).await.unwrap();
-    let kv = engine
-        .inner
-        .make_model_kv_handle_with_seq("decode-cache".to_string(), 1);
-    let mut sequence = SequenceState::new_with_tokenizer_and_model_vocab_size(
-        request.clone(),
-        vec![TokenId::new(5)],
-        Some(tokenizer),
-        Some(64),
-    );
-    sequence.generated_tokens.push(TokenId::new(6));
-    sequence.prefill_complete = true;
-    sequence.prefill_tokens_processed = 1;
-    sequence.install_runtime_managed_model_kv(kv);
-    sequence.commit_recurrent_state_admission(recurrent_state, 1);
-    sequence.phase = RequestPhase::Decoding;
-    engine
-        .inner
-        .sequences
-        .write()
-        .insert(request_id.clone(), sequence);
-
-    let batch = scheduler
-        .next_batch(ferrum_interfaces::BatchHint::simple(4))
-        .await
-        .expect("decode request should be scheduled");
-    assert_eq!(batch.requests.len(), 1);
-
-    engine
-        .inner
-        .process_batch_with_test_sequences(&batch)
-        .await
-        .unwrap();
-
-    let trace = scheduler.trace_snapshot();
-    assert_eq!(trace.cancelled_total, 0);
-    assert_eq!(trace.waiting_queue_len, 1);
-    assert_eq!(trace.decode_queue_len, 0);
-    assert_eq!(
-        scheduler.trace_phase(&request_id),
-        Some(RequestPhase::Waiting)
-    );
-
-    let sequences = engine.inner.sequences.read();
-    let sequence = sequences
-        .get(&request_id)
-        .expect("resource-exhausted unified decode should remain queued");
-    assert_eq!(sequence.phase, RequestPhase::Waiting);
-    assert!(!sequence.prefill_complete);
-    assert!(sequence.kv_cache_handle().is_none());
-    assert!(sequence.recurrent_state.is_none());
-    assert!(sequence.model_cache_id().is_none());
-    assert_eq!(sequence.generated_tokens, vec![TokenId::new(6)]);
-    assert_eq!(sequence.preemption_count, 1);
-    let recurrent_stats = recurrent_manager.stats();
-    assert_eq!(recurrent_stats.active_states, 0);
-    assert_eq!(recurrent_stats.used_batch_slots, 0);
 }
 
 #[test]
@@ -10884,6 +6304,10 @@ fn structured_sequence_requires_a_tokenizer_aware_grammar_factory() {
         None,
         None,
         None,
+        OutputBudget::new(Default::default())
+            .unwrap()
+            .try_open_session()
+            .unwrap(),
     )
     .unwrap_err()
     .to_string();
@@ -10928,10 +6352,10 @@ fn sequence_state_prefill_context_preserves_generated_tokens_for_kv_recompute() 
 
 /// Recompute resumes from token history, not from serialized/swapped KV. The
 /// scheduler/deferral tests above cover requeueing; this exercises the actual CPU
-/// model cache and the SequenceState transition used by that requeueing path.
+/// model cache and logical token history. The common close-registry tests cover
+/// the actual Engine requeue transition and exact incarnation ownership.
 #[test]
 fn cpu_kv_recompute_matches_uninterrupted_logits_and_preserves_peer() {
-    use ferrum_models::executor::common::GenericKvCacheHandle;
     use ferrum_models::test_support::{tiny_llama_model, TinyLlamaConfig};
 
     fn assert_logits_equal(label: &str, expected: &[f32], actual: &[f32], vocab: usize) {
@@ -10947,17 +6371,6 @@ fn cpu_kv_recompute_matches_uninterrupted_logits_and_preserves_peer() {
                 "{label}: logit {index} differs: {expected} vs {actual}"
             );
         }
-    }
-
-    fn handle(cfg: &TinyLlamaConfig, cache_id: &str, len: usize) -> Arc<dyn KvCacheHandle> {
-        Arc::new(GenericKvCacheHandle::new(
-            cfg.num_layers,
-            cfg.num_kv_heads,
-            cfg.head_dim,
-            candle_core::Device::Cpu,
-            len,
-            cache_id.to_string(),
-        ))
     }
 
     // Both the first sampled token and a later decode boundary leave one
@@ -10982,12 +6395,6 @@ fn cpu_kv_recompute_matches_uninterrupted_logits_and_preserves_peer() {
             &reference.prefill(cache_id, &prompt),
             &logits,
             cfg.vocab_size,
-        );
-        state.commit_prefill_physical_resources(
-            handle(&cfg, cache_id, prompt.len()),
-            1,
-            None,
-            None,
         );
         let mut pending = state
             .sample_and_commit_with_processors(&mut logits)
@@ -11027,20 +6434,13 @@ fn cpu_kv_recompute_matches_uninterrupted_logits_and_preserves_peer() {
         let generated_before = state.generated_tokens.clone();
         state.tokens_this_iteration = 1;
 
-        let released = state.take_physical_resources_for_recompute();
-        assert_eq!(released.model_cache_id(), Some(cache_id));
-        model.release(released.model_cache_id().expect("owned real model cache"));
+        model.release(cache_id);
         assert_eq!(model.cache_len(cache_id), 0, "old physical KV must be gone");
         assert_eq!(
             model.cache_len(peer_id),
             peer_len,
             "release must be isolated"
         );
-        assert!(state.model_cache_id().is_none());
-        assert!(!state.prefill_complete);
-        assert_eq!(state.prefill_tokens_processed, 0);
-        assert_eq!(state.tokens_this_iteration, 0);
-        assert_eq!(state.phase, RequestPhase::Waiting);
         assert_eq!(state.generated_tokens, generated_before);
 
         // An independent request continues while the first has no physical KV.
@@ -11063,12 +6463,6 @@ fn cpu_kv_recompute_matches_uninterrupted_logits_and_preserves_peer() {
         assert_logits_equal("recomputed prefill", &expected, &logits, cfg.vocab_size);
         assert_eq!(model.cache_len(cache_id), history.len());
         assert_eq!(model.cache_len(peer_id), peer_len + 1);
-        state.commit_prefill_physical_resources(
-            handle(&cfg, cache_id, history.len()),
-            1,
-            None,
-            None,
-        );
 
         // Compare the whole distribution after further autoregressive steps,
         // not merely the greedy choice at the restoration point.
@@ -11092,8 +6486,7 @@ fn cpu_kv_recompute_matches_uninterrupted_logits_and_preserves_peer() {
             cfg.vocab_size,
         );
         let peer_len = model.cache_len(peer_id);
-        let completed = state.take_completion_resources();
-        model.release(completed.physical.model_cache_id().expect("resumed cache"));
+        model.release(cache_id);
         assert_eq!(model.cache_len(cache_id), 0);
         assert_eq!(model.cache_len(peer_id), peer_len);
         model.release(peer_id);
@@ -11770,8 +7163,14 @@ fn request_sampling_plan_applies_presence_and_frequency_penalties() {
     request.sampling_params.frequency_penalty = 0.5;
     let mut state = SequenceState::new(request, vec![TokenId::new(0)]);
     state.generated_tokens = vec![TokenId::new(1), TokenId::new(1)];
-    state.sampling_history.record(TokenId::new(1));
-    state.sampling_history.record(TokenId::new(1));
+    state
+        .sampling_history
+        .record(TokenId::new(1), &mut state.output_semantic)
+        .unwrap();
+    state
+        .sampling_history
+        .record(TokenId::new(1), &mut state.output_semantic)
+        .unwrap();
 
     assert_eq!(
         state.sampling_plan.processor_chain.processor_names(),
@@ -11800,6 +7199,12 @@ fn request_sampling_plan_applies_presence_and_frequency_penalties() {
 
 #[test]
 fn sampling_history_transitions_keep_scope_and_frequency_table_consistent() {
+    let mut credit = OutputBudget::new(Default::default())
+        .unwrap()
+        .try_open_session()
+        .unwrap()
+        .try_reserve_semantic(0)
+        .unwrap();
     let mut history = SequenceSamplingHistory::default();
     let generated = vec![
         TokenId::new(1),
@@ -11808,7 +7213,7 @@ fn sampling_history_transitions_keep_scope_and_frequency_table_consistent() {
         TokenId::new(3),
     ];
     for &token in &generated {
-        history.record(token);
+        history.record(token, &mut credit).unwrap();
     }
     assert_eq!(
         history.scope(),
@@ -11817,14 +7222,19 @@ fn sampling_history_transitions_keep_scope_and_frequency_table_consistent() {
     assert_eq!(history.previous_tokens(&generated).unwrap(), &generated);
     assert_eq!(history.token_frequencies().get(&TokenId::new(1)), Some(&2));
 
-    assert!(history.enter_hidden_structured_output());
+    assert_eq!(
+        credit.bytes(),
+        3 * (std::mem::size_of::<TokenId>() + std::mem::size_of::<usize>())
+    );
+    assert!(history.enter_hidden_structured_output(&mut credit).unwrap());
     assert_eq!(history.previous_tokens(&generated).unwrap(), &[]);
     assert!(history.token_frequencies().is_empty());
-    history.record(TokenId::new(4));
+    assert_eq!(credit.bytes(), 0);
+    history.record(TokenId::new(4), &mut credit).unwrap();
     assert!(history.token_frequencies().is_empty());
 
     assert!(history
-        .activate_visible_structured_output(2, &generated)
+        .activate_visible_structured_output(2, &generated, &mut credit)
         .unwrap());
     assert_eq!(
         history.scope(),
@@ -11837,11 +7247,15 @@ fn sampling_history_transitions_keep_scope_and_frequency_table_consistent() {
         &[TokenId::new(2), TokenId::new(3)]
     );
     assert_eq!(history.token_frequencies().len(), 2);
+    assert_eq!(
+        credit.bytes(),
+        2 * (std::mem::size_of::<TokenId>() + std::mem::size_of::<usize>())
+    );
     assert!(!history
-        .activate_visible_structured_output(2, &generated)
+        .activate_visible_structured_output(2, &generated, &mut credit)
         .unwrap());
     assert!(history
-        .activate_visible_structured_output(generated.len() + 1, &generated)
+        .activate_visible_structured_output(generated.len() + 1, &generated, &mut credit)
         .is_err());
 }
 
@@ -11856,6 +7270,10 @@ fn sequence_rejects_unrepresented_sampling_modes_before_execution() {
         None,
         None,
         None,
+        OutputBudget::new(Default::default())
+            .unwrap()
+            .try_open_session()
+            .unwrap(),
     )
     .unwrap_err()
     .to_string();
@@ -13641,53 +9059,22 @@ fn sample_masks_metadata_initial_token_text_only_before_first_generation() {
 
 mod auto_tools_json;
 
-#[tokio::test]
-async fn plan_runtime_no_finite_logit_failure_is_request_local_and_preserves_later_commit() {
-    for selected in [false, true] {
-        let (engine, scheduler, executor, tokenizer) =
-            plan_runtime_batch_decode_test_engine(PlanRuntimeBatchDecodeBehavior::NoFiniteFirst {
-                selected,
-            });
-        let (request_ids, initial_tokens, cache_ids) =
-            install_plan_runtime_decode_cohort(&engine, &scheduler, tokenizer).await;
-        let (response_sender, response_receiver) = tokio::sync::oneshot::channel();
-        engine
-            .inner
-            .sequences
-            .write()
-            .get_mut(&request_ids[0])
-            .unwrap()
-            .response_sender = Some(response_sender);
+impl PlanRuntimeChunkedPrefillObservation {
+    fn publish_release(&self) {
+        let epoch = self.release_epoch.fetch_add(1, Ordering::AcqRel) + 1;
+        self.capacity_signal.send_replace(epoch);
+    }
+}
 
-        engine
-            .inner
-            .run_plan_runtime_batch_decode(&request_ids)
-            .await
-            .expect("sampling failure must not fail the entire execution wave");
-        let error = response_receiver
-            .await
-            .expect("failed request must receive its terminal response")
-            .expect_err("a row without finite logits must fail sampling");
-        let FerrumError::Model { message } = &error else {
-            panic!("sampling failure must preserve the host model error: {error:?}");
-        };
-        assert_eq!(message, "engine sampling policies have no finite token");
+impl PlanRuntimeMaintenanceObservation {
+    fn publish_release(&self) {
+        let release_epoch = self.release_epoch.fetch_add(1, Ordering::AcqRel) + 1;
+        self.capacity_signal.send_replace(release_epoch);
+    }
+}
 
-        let sequences = engine.inner.sequences.read();
-        assert!(!sequences.contains_key(&request_ids[0]));
-        let healthy = sequences
-            .get(&request_ids[1])
-            .expect("later healthy participant must remain active");
-        assert_eq!(
-            healthy.generated_tokens,
-            vec![initial_tokens[1], TokenId::new(6)]
-        );
-        assert_eq!(healthy.model_cache_id(), Some(cache_ids[1].as_str()));
-        assert_eq!(healthy.tokens_this_iteration, 1);
-        assert_eq!(healthy.phase, RequestPhase::Decoding);
-        drop(sequences);
-        assert_eq!(executor.released_cache_count.load(Ordering::Acquire), 1);
-        assert_eq!(engine.inner.total_decode_tokens.load(Ordering::Relaxed), 1);
-        assert_eq!(scheduler.trace_snapshot().active_len, 1);
+impl PlanRuntimeBatchDecodeObservation {
+    fn token_frontier_for_request(&self, request: &RequestId) -> Option<ExecutionFrontier> {
+        self.tokens.frontier_for_request(request)
     }
 }

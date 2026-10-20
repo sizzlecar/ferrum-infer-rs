@@ -31,7 +31,8 @@ fn legacy_stream_preserves_upload_compute_copy_order_and_context_reuse() {
     let b = CudaBackend::from_slice(&weights);
     let mut out = CudaBackend::from_slice(&vec![sentinel; count + guard]);
     let mut copies = CudaBackend::from_slice(&vec![sentinel; 2 * count + 3 * guard]);
-    let mut context = CudaBackend::new_context();
+    let mut context =
+        CudaBackend::new_context(&ferrum_types::BackendContextConfig::default()).unwrap();
     CudaBackend::gemm(&mut context, &a, &b, &mut out, rows, columns, inner);
     CudaBackend::copy_slice(&mut context, &out, 0, &mut copies, guard, count);
     CudaBackend::scale_inplace(&mut context, &mut out, 0.5, count);
@@ -68,7 +69,8 @@ fn legacy_stream_preserves_upload_compute_copy_order_and_context_reuse() {
     // A following context must retain stream/scalar ownership for existing
     // allocations, without corrupting either earlier completed copy.
     drop(context);
-    let mut context = CudaBackend::new_context();
+    let mut context =
+        CudaBackend::new_context(&ferrum_types::BackendContextConfig::default()).unwrap();
     CudaBackend::scale_inplace(&mut context, &mut out, -2.0, count);
     CudaBackend::copy_slice(&mut context, &out, 0, &mut copies, guard, count);
     let complete = context

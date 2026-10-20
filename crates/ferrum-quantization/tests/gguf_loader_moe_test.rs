@@ -125,7 +125,10 @@ fn router_load_tensor_returns_full_buffer() {
     let loader = build_loader(&tmp);
 
     let router = loader
-        .load_tensor("model.layers.0.mlp.router.weight")
+        .load_tensor(
+            &mut ferrum_kernels::backend::cpu::CpuContext::default(),
+            "model.layers.0.mlp.router.weight",
+        )
         .unwrap();
     // [num_experts=4, hidden=4] = 16 elements
     assert_eq!(router.len(), NUM_EXPERTS * HIDDEN);
@@ -147,17 +150,26 @@ fn stacked_expert_tensors_load_at_full_3d_size() {
     let loader = build_loader(&tmp);
 
     let gate = loader
-        .load_tensor("model.layers.0.mlp.gate_exps.weight")
+        .load_tensor(
+            &mut ferrum_kernels::backend::cpu::CpuContext::default(),
+            "model.layers.0.mlp.gate_exps.weight",
+        )
         .unwrap();
     assert_eq!(gate.len(), NUM_EXPERTS * EXPERT_FFN * HIDDEN);
 
     let up = loader
-        .load_tensor("model.layers.0.mlp.up_exps.weight")
+        .load_tensor(
+            &mut ferrum_kernels::backend::cpu::CpuContext::default(),
+            "model.layers.0.mlp.up_exps.weight",
+        )
         .unwrap();
     assert_eq!(up.len(), NUM_EXPERTS * EXPERT_FFN * HIDDEN);
 
     let down = loader
-        .load_tensor("model.layers.0.mlp.down_exps.weight")
+        .load_tensor(
+            &mut ferrum_kernels::backend::cpu::CpuContext::default(),
+            "model.layers.0.mlp.down_exps.weight",
+        )
         .unwrap();
     assert_eq!(down.len(), NUM_EXPERTS * HIDDEN * EXPERT_FFN);
 
@@ -178,7 +190,12 @@ fn router_load_linear_succeeds_as_2d() {
     let tmp = build_moe_gguf();
     let loader = build_loader(&tmp);
 
-    let router_linear = loader.load_linear("model.layers.0.mlp.router").unwrap();
+    let router_linear = loader
+        .load_linear(
+            &mut ferrum_kernels::backend::cpu::CpuContext::default(),
+            "model.layers.0.mlp.router",
+        )
+        .unwrap();
     assert_eq!(router_linear.in_features(), HIDDEN);
     assert_eq!(router_linear.out_features(), NUM_EXPERTS);
 }
@@ -191,7 +208,10 @@ fn stacked_expert_load_linear_rejects_rank_3() {
     let tmp = build_moe_gguf();
     let loader = build_loader(&tmp);
 
-    let result = loader.load_linear("model.layers.0.mlp.gate_exps");
+    let result = loader.load_linear(
+        &mut ferrum_kernels::backend::cpu::CpuContext::default(),
+        "model.layers.0.mlp.gate_exps",
+    );
     assert!(result.is_err(), "3-D stacked expert tensor must reject");
     let err = result.err().unwrap().to_string();
     assert!(

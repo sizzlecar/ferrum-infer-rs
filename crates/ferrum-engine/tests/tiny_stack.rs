@@ -12,30 +12,25 @@
 use std::sync::Arc;
 
 use ferrum_engine::{ContinuousBatchEngine, GreedySampler, LlmInferenceEngine, SequenceState};
+use ferrum_interfaces::InferenceEngine;
 use ferrum_kernels::backend::{cpu::CpuBackend, BackendPagedKv};
 use ferrum_models::test_support::{
-    tiny_llama_executor, tiny_tokenizer, TinyLlamaConfig, TinyTokenizer,
+    tiny_llama_executor_owned, tiny_tokenizer, TinyLlamaConfig, TinyTokenizer,
 };
 use ferrum_scheduler::implementations::ContinuousBatchScheduler;
-use ferrum_testkit::{MockKvCacheManager, MockTensorFactory};
 use ferrum_types::{
     EngineConfig, FinishReason, InferenceRequest, ResponseFormat, SchedulerConfig, TokenId,
 };
 
-const KV_TOKENS: usize = 4096;
-
 /// Assemble a real engine over the tiny model. Returns the engine plus the
 /// typed tokenizer (so scenarios can query EOS / token texts).
 fn build_engine() -> (ContinuousBatchEngine, Arc<TinyTokenizer>) {
-    build_engine_with(TinyLlamaConfig::default(), KV_TOKENS)
+    build_engine_with(TinyLlamaConfig::default())
 }
 
-fn build_engine_with(
-    cfg: TinyLlamaConfig,
-    kv_tokens: usize,
-) -> (ContinuousBatchEngine, Arc<TinyTokenizer>) {
+fn build_engine_with(cfg: TinyLlamaConfig) -> (ContinuousBatchEngine, Arc<TinyTokenizer>) {
     let tokenizer = tiny_tokenizer(&cfg);
-    let engine = build_engine_with_tokenizer(cfg, kv_tokens, tokenizer.clone());
+    let engine = build_engine_with_tokenizer(cfg, tokenizer.clone());
     (engine, tokenizer)
 }
 
@@ -43,23 +38,18 @@ fn build_engine_with(
 /// composite scenarios that need a customized vocab).
 fn build_engine_with_tokenizer(
     cfg: TinyLlamaConfig,
-    kv_tokens: usize,
     tokenizer: Arc<TinyTokenizer>,
 ) -> ContinuousBatchEngine {
     let scheduler = Arc::new(ContinuousBatchScheduler::new(SchedulerConfig::default()));
     let sampler = Arc::new(GreedySampler);
-    let kv_cache = Arc::new(MockKvCacheManager::new(kv_tokens));
-    let executor = tiny_llama_executor(&cfg);
-    let tensor_factory = Arc::new(MockTensorFactory);
+    let executor = tiny_llama_executor_owned(&cfg);
 
     ContinuousBatchEngine::new(
         EngineConfig::default(),
         scheduler,
         tokenizer,
         sampler,
-        kv_cache,
-        executor,
-        tensor_factory,
+        ferrum_execution::executor_lifecycle::ExecutorOwner::new(executor),
     )
     .expect("legacy engine composition must match executor authority")
 }
@@ -80,11 +70,11 @@ async fn observe_stream(prompt: &str, max_tokens: usize) -> Vec<u32> {
         .await
         .expect("observe run completes");
     assert_eq!(
-        resp.finish_reason,
+        resp.response().finish_reason,
         FinishReason::Length,
         "observe run must not early-stop"
     );
-    resp.tokens.iter().map(|t| t.get()).collect()
+    resp.response().tokens.iter().map(|t| t.get()).collect()
 }
 
 /// Five sequential turns whose prompt grows each round, simulating an
@@ -102,16 +92,16 @@ async fn tiny_stack_multi_turn_five_rounds() {
         let req = greedy_request(&history, 6);
         let resp = engine.infer(req).await.expect("turn must complete");
         assert!(
-            !resp.text.is_empty(),
+            !resp.response().text.is_empty(),
             "round {round}: response text must be non-empty"
         );
         assert_eq!(
-            resp.finish_reason,
+            resp.response().finish_reason,
             ferrum_types::FinishReason::Length,
             "round {round}: short max_tokens must stop by Length"
         );
         if round == 0 {
-            first_round_text = Some(resp.text.clone());
+            first_round_text = Some(resp.response().text.clone());
         }
         history.push_str(" more context turn ");
         history.push_str(&round.to_string());
@@ -124,7 +114,7 @@ async fn tiny_stack_multi_turn_five_rounds() {
         .await
         .expect("replay must complete");
     assert_eq!(
-        Some(replay.text),
+        Some(replay.response().text.clone()),
         first_round_text,
         "greedy decode must be deterministic across engine instances"
     );
@@ -146,12 +136,12 @@ async fn tiny_stack_eos_terminates() {
         .await
         .expect("observe run completes");
     assert_eq!(
-        observed.finish_reason,
+        observed.response().finish_reason,
         FinishReason::Length,
         "observe run must not early-stop; got {:?}",
-        observed.finish_reason
+        observed.response().finish_reason
     );
-    let ids: Vec<u32> = observed.tokens.iter().map(|t| t.get()).collect();
+    let ids: Vec<u32> = observed.response().tokens.iter().map(|t| t.get()).collect();
     assert!(ids.len() >= 4, "need >=4 tokens to pick an EOS: {ids:?}");
     // Pick a token the model actually emits, then compute where the engine
     // should stop = first occurrence of that token + 1. Robust whether the
@@ -160,18 +150,18 @@ async fn tiny_stack_eos_terminates() {
     let expected_len = ids.iter().position(|&id| id == eos).unwrap() + 1;
 
     let tokenizer = Arc::new(TinyTokenizer::new(cfg.vocab_size).with_eos(eos));
-    let engine2 = build_engine_with_tokenizer(cfg, KV_TOKENS, tokenizer);
+    let engine2 = build_engine_with_tokenizer(cfg, tokenizer);
     let resp = engine2
         .infer(greedy_request("hello world", 8))
         .await
         .expect("eos run completes");
 
     assert_eq!(
-        resp.finish_reason,
+        resp.response().finish_reason,
         FinishReason::EOS,
         "must report model EOS"
     );
-    let out_ids: Vec<u32> = resp.tokens.iter().map(|t| t.get()).collect();
+    let out_ids: Vec<u32> = resp.response().tokens.iter().map(|t| t.get()).collect();
     assert_eq!(
         out_ids.last(),
         Some(&eos),
@@ -197,14 +187,14 @@ async fn tiny_stack_stop_sequence_composite_token() {
 
     let tokenizer =
         Arc::new(TinyTokenizer::new(cfg.vocab_size).with_composite_token(emitted, "a@b"));
-    let engine = build_engine_with_tokenizer(cfg, KV_TOKENS, tokenizer);
+    let engine = build_engine_with_tokenizer(cfg, tokenizer);
 
     let mut req = greedy_request("hello world", 6);
     req.sampling_params.stop_sequences = vec!["@".to_string()];
     let resp = engine.infer(req).await.expect("stop run completes");
 
     assert_eq!(
-        resp.finish_reason,
+        resp.response().finish_reason,
         FinishReason::Stop,
         "marker inside composite token must stop generation, not run to Length"
     );
@@ -229,14 +219,17 @@ async fn tiny_stack_stream_chunk_contract() {
         .expect("all chunks ok");
 
     assert!(!chunks.is_empty(), "stream must produce chunks");
-    let terminal = chunks.iter().filter(|c| c.finish_reason.is_some()).count();
+    let terminal = chunks
+        .iter()
+        .filter(|c| c.chunk().finish_reason.is_some())
+        .count();
     assert_eq!(terminal, 1, "exactly one terminal chunk");
     assert!(
-        chunks.last().unwrap().finish_reason.is_some(),
+        chunks.last().unwrap().chunk().finish_reason.is_some(),
         "the last chunk is the terminal one"
     );
 
-    let joined: String = chunks.iter().map(|c| c.text.as_str()).collect();
+    let joined: String = chunks.iter().map(|c| c.chunk().text.as_str()).collect();
     assert!(!joined.is_empty(), "streamed text must be non-empty");
 }
 
@@ -251,8 +244,7 @@ async fn tiny_stack_concurrent_sessions_isolated() {
     let solo = engine
         .infer(greedy_request("anchor prompt", 6))
         .await
-        .expect("solo completes")
-        .text;
+        .expect("solo completes");
 
     let mut handles = Vec::new();
     for i in 0..4 {
@@ -272,12 +264,13 @@ async fn tiny_stack_concurrent_sessions_isolated() {
     }
 
     assert_eq!(
-        results[0].text, solo,
+        results[0].response().text,
+        solo.response().text,
         "anchor result must match whether run alone or amid concurrent load"
     );
     for r in &results {
         assert!(
-            !r.text.is_empty(),
+            !r.response().text.is_empty(),
             "every concurrent request produces output"
         );
     }
@@ -306,7 +299,7 @@ async fn tiny_stack_cancel_mid_stream() {
         .infer(greedy_request("after cancel", 5))
         .await
         .expect("engine still works after cancellation");
-    assert!(!after.text.is_empty());
+    assert!(!after.response().text.is_empty());
 }
 
 /// Repetition-runaway guard: a model that emits a near-constant token must
@@ -319,23 +312,22 @@ async fn tiny_stack_repetition_runaway_guard() {
         .infer(greedy_request("repeat repeat", budget))
         .await
         .expect("completes");
-    assert_eq!(resp.finish_reason, FinishReason::Length);
+    assert_eq!(resp.response().finish_reason, FinishReason::Length);
     assert!(
-        resp.tokens.len() <= budget,
+        resp.response().tokens.len() <= budget,
         "generated {} tokens, must not exceed budget {budget}",
-        resp.tokens.len()
+        resp.response().tokens.len()
     );
 }
 
-/// KV capacity boundary: under a tight engine KV pool, several concurrent
-/// requests must not panic — they either complete or fail cleanly. Exercises
-/// the paged scratch growth path (hb-08 surface) at the admission boundary.
+/// Concurrent requests use the original model caches, then a new request
+/// completes and the original executor retires. No separate Engine KV pool
+/// is created or counted as evidence of model capacity.
 #[tokio::test]
-async fn tiny_stack_kv_capacity_boundary() {
+async fn tiny_stack_concurrent_model_cache_reuse_and_shutdown() {
     let cfg = TinyLlamaConfig::default();
     let tokenizer = tiny_tokenizer(&cfg);
-    // Deliberately tight pool relative to the concurrent demand below.
-    let engine = Arc::new(build_engine_with_tokenizer(cfg, 64, tokenizer));
+    let engine = Arc::new(build_engine_with_tokenizer(cfg, tokenizer));
 
     let mut handles = Vec::new();
     for i in 0..6 {
@@ -347,17 +339,22 @@ async fn tiny_stack_kv_capacity_boundary() {
         }));
     }
     for h in handles {
-        // Must not panic. A clean Err is acceptable under capacity pressure;
-        // a completion is fine too.
-        let _ = h.await.expect("task must not panic");
+        let response = h
+            .await
+            .expect("task must not panic")
+            .expect("real model request completes");
+        assert_eq!(response.response().finish_reason, FinishReason::Length);
+        assert_eq!(response.response().tokens.len(), 8);
     }
 
     // After the pressure wave, a fresh request still completes.
     let after = engine
         .infer(greedy_request("recovered", 4))
         .await
-        .expect("engine usable after capacity pressure");
-    assert!(!after.text.is_empty());
+        .expect("engine usable after concurrent requests");
+    assert!(!after.response().text.is_empty());
+    engine.shutdown().await.unwrap();
+    engine.wait_for_shutdown_completion().await.unwrap();
 }
 
 /// Capability-fallback law (Gate A5, Llama path). The tiny model runs on
@@ -380,8 +377,8 @@ async fn tiny_stack_capability_fallback_law_cpu() {
         .infer(greedy_request("fallback path", 6))
         .await
         .expect("all-capabilities-off backend must complete via fallback code");
-    assert_eq!(resp.finish_reason, FinishReason::Length);
-    assert!(!resp.tokens.is_empty());
+    assert_eq!(resp.response().finish_reason, FinishReason::Length);
+    assert!(!resp.response().tokens.is_empty());
 }
 
 /// Guided / tool constraints. Two checks:
@@ -401,8 +398,16 @@ async fn tiny_stack_guided_tool_constraint() {
     let mut req = greedy_request("constrain me", 4);
     req.sampling_params.response_format =
         ResponseFormat::JsonSchema("{\"type\":\"object\"}".into());
-    let seq =
-        SequenceState::new_with_tokenizer(req, vec![TokenId::new(1)], Some(tokenizer.clone()));
+    let output_budget = ferrum_output::OutputBudget::new(Default::default()).unwrap();
+    let seq = SequenceState::try_new_with_tokenizer_model_vocab_and_structured_factory(
+        req,
+        vec![TokenId::new(1)],
+        Some(tokenizer.clone()),
+        None,
+        None,
+        output_budget.try_open_session().unwrap(),
+    )
+    .expect("valid guided sequence must compile its grammar");
     assert!(
         seq.has_structured_output_constraint(),
         "a JsonSchema request must compile a tokenizer-aware grammar processor"
@@ -413,7 +418,7 @@ async fn tiny_stack_guided_tool_constraint() {
     );
 
     // (2) Valid guided request runs end-to-end without panic.
-    let engine = build_engine_with_tokenizer(cfg, KV_TOKENS, tokenizer);
+    let engine = build_engine_with_tokenizer(cfg, tokenizer);
     let mut guided = greedy_request("integer please", 4);
     guided.sampling_params.response_format =
         ResponseFormat::JsonSchema("{\"type\":\"integer\"}".into());
@@ -422,13 +427,50 @@ async fn tiny_stack_guided_tool_constraint() {
         .await
         .expect("guided request must complete without panic");
     assert!(
-        matches!(resp.finish_reason, FinishReason::Length | FinishReason::EOS),
+        matches!(
+            resp.response().finish_reason,
+            FinishReason::Length | FinishReason::EOS
+        ),
         "guided run terminates cleanly: {:?}",
-        resp.finish_reason
+        resp.response().finish_reason
     );
     assert!(
-        serde_json::from_str::<i64>(&resp.text).is_ok(),
+        serde_json::from_str::<i64>(&resp.response().text).is_ok(),
         "guided output must be a JSON integer: {:?}",
-        resp.text
+        resp.response().text
     );
+}
+
+/// The real Llm owner has no complete byte census. Its readiness, output and
+/// whole-executor close remain usable without a dummy Engine cache manager.
+#[tokio::test]
+async fn tiny_stack_unknown_memory_preserves_full_output_and_owner_close() {
+    let (engine, _) = build_engine();
+    let (reference, _) = build_engine();
+    let output = engine
+        .infer(greedy_request("owner memory", 6))
+        .await
+        .unwrap();
+    let expected = reference
+        .infer(greedy_request("owner memory", 6))
+        .await
+        .unwrap();
+    assert_eq!(output.response().tokens, expected.response().tokens);
+    assert_eq!(output.response().text, expected.response().text);
+    assert_eq!(
+        output.response().finish_reason,
+        expected.response().finish_reason
+    );
+    let status = engine.status().await;
+    assert!(status.is_ready);
+    assert!(matches!(
+        status.memory_usage,
+        ferrum_types::MemoryObservation::Unknown
+    ));
+    assert!(serde_json::to_value(&status).unwrap()["memory_usage"].is_null());
+    for original in [&engine, &reference] {
+        original.shutdown().await.unwrap();
+        original.wait_for_shutdown_completion().await.unwrap();
+        assert!(!original.status().await.is_ready);
+    }
 }

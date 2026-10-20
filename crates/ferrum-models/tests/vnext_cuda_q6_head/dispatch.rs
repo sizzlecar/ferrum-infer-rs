@@ -7,6 +7,9 @@ impl DeviceSubmissionTimingSink for NoHostTiming {
     const ENABLED: bool = false;
     fn record_device_submission(&self, _: DeviceSubmissionStage, _: std::time::Duration) {}
 }
+impl InvocationPreparationSink for NoHostTiming {
+    fn record_preparation(&self, _: InvocationPreparationStats) {}
+}
 impl SubmissionWaveDispatchTimingSink for NoHostTiming {
     fn record(&self, _: SubmissionWaveDispatchStage, _: std::time::Duration) {}
 }
@@ -20,6 +23,7 @@ pub enum Path {
 pub struct ObservedRun {
     pub outputs: Vec<Vec<u8>>,
     pub dependency_work: Vec<(u64, u64, u64)>,
+    pub facts: Option<(BoundSubmissionWork, BoundSubmissionDeviceFacts)>,
 }
 
 #[derive(Default)]
@@ -103,6 +107,58 @@ impl Fixture {
         path: Path,
         submitted: Option<&SubmissionRendezvous>,
     ) -> ObservedRun {
+        self.run_observed(
+            lane,
+            reaper,
+            sessions,
+            tokens,
+            range,
+            path,
+            submitted,
+            ExecutionFactsCapture::Off,
+            None,
+        )
+    }
+
+    pub fn execute_with_facts(
+        &self,
+        sessions: &[Arc<SequenceSession<Runtime>>],
+        tokens: &[Arc<[u32]>],
+        range: Range<usize>,
+        path: Path,
+        capture: ExecutionFactsCapture,
+    ) -> ObservedRun {
+        self.run_observed(
+            &self.lane,
+            &self.reaper,
+            sessions,
+            tokens,
+            range,
+            path,
+            None,
+            capture,
+            Some(DeviceTimingMode::Off),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_observed(
+        &self,
+        lane: &Arc<ExecutionLane<Runtime>>,
+        reaper: &Arc<CompletionReaper<Runtime>>,
+        sessions: &[Arc<SequenceSession<Runtime>>],
+        tokens: &[Arc<[u32]>],
+        range: Range<usize>,
+        path: Path,
+        submitted: Option<&SubmissionRendezvous>,
+        capture: ExecutionFactsCapture,
+        timing_override: Option<DeviceTimingMode>,
+    ) -> ObservedRun {
+        let timing = timing_override.unwrap_or(if matches!(path, Path::Eager) {
+            DeviceTimingMode::Kernel
+        } else {
+            DeviceTimingMode::Replay
+        });
         let mut submission_guard = submitted.map(|rendezvous| SubmissionGuard {
             rendezvous,
             completed: false,
@@ -243,7 +299,7 @@ impl Fixture {
                 !program.eager_boundary_node_indices().contains(&index),
                 "head must actually replay"
             );
-            if self.head == Head::Q6 {
+            if self.head.quantized() && !self.head.transformed() {
                 assert!(
                     program
                         .retained_plan_dependencies()
@@ -252,15 +308,18 @@ impl Fixture {
                     "replay must retain validated weight flag"
                 );
             }
-            OperationDispatch::encode_and_submit_reusable_wave_with_inputs_and_timing(
+            OperationDispatch::encode_and_submit_reusable_wave_with_inputs_and_preparation(
                 self.providers.providers(),
                 executable,
                 &identity,
                 active.iter(),
-                DeviceTimingMode::Replay,
+                timing,
+                capture,
                 &uploads,
                 program,
                 SubmissionExecutionPolicy::determinism_replayed(0xa5),
+                ferrum_types::InvocationPreparationStrategy::Full,
+                &NoHostTiming,
                 &NoHostTiming,
                 wave,
                 lane,
@@ -273,18 +332,17 @@ impl Fixture {
             } else {
                 SubmissionExecutionPolicy::adaptive()
             };
-            OperationDispatch::encode_and_submit_wave_with_inputs_and_timing(
+            OperationDispatch::encode_and_submit_wave_with_inputs_and_preparation(
                 self.providers.providers(),
                 executable,
                 &identity,
                 active.iter(),
-                if matches!(path, Path::Eager) {
-                    DeviceTimingMode::Kernel
-                } else {
-                    DeviceTimingMode::Replay
-                },
+                timing,
+                capture,
                 &uploads,
                 policy,
+                ferrum_types::InvocationPreparationStrategy::Full,
+                &NoHostTiming,
                 &NoHostTiming,
                 wave,
                 lane,
@@ -292,15 +350,18 @@ impl Fixture {
             )
             .unwrap()
         };
-        let (handle, attribution) = profiled.into_parts();
+        let (handle, observation) = profiled.into_parts();
+        let (work_facts, attribution, device_facts) = observation.into_parts();
         // Keep the first submission's command leases alive until the other
         // lane has encoded and submitted against the same retained state.
         if let Some(guard) = submission_guard.as_mut() {
             guard.complete();
         }
         let mut dependency_work = Vec::new();
-        let observed = if matches!(path, Path::Eager) {
-            let attribution = attribution.expect("eager command attribution is required");
+        let observed = if matches!(path, Path::Eager) && timing_override.is_none() {
+            let attribution = attribution
+                .as_ref()
+                .expect("eager command attribution is required");
             let device = attribution.device();
             let physical = device
                 .commands()
@@ -324,7 +385,7 @@ impl Fixture {
                 "head must have one actual physical command"
             );
             let (form, count, token_count, dispatches) = head_commands[0];
-            let packed = range.len() == 1 && participants > 1;
+            let packed = range.len() == 1 && participants > 1 && !self.head.transformed();
             assert_eq!(
                 form,
                 if packed {
@@ -337,7 +398,9 @@ impl Fixture {
             assert_eq!(count, participants);
             assert_eq!(token_count, u64::from(participants));
             let launches = if packed { 1 } else { u64::from(participants) };
-            let mmq = self.head == Head::Q6 && (!packed || participants <= 32);
+            let mmq = self.head.quantized()
+                && !self.head.transformed()
+                && (!packed || participants <= 32);
             for dependency in device
                 .commands()
                 .iter()
@@ -366,17 +429,22 @@ impl Fixture {
             }
             assert_eq!(
                 dependency_work.len(),
-                usize::from(mmq),
+                usize::from(mmq) * self.head.parts(),
                 "one retained dependency per MMQ weight leaf; strict fallback queues none"
             );
             if mmq {
                 assert!(
-                    [4 * launches, 5 * launches].contains(&dispatches),
+                    [
+                        4 * launches * self.head.parts() as u64,
+                        5 * launches * self.head.parts() as u64
+                    ]
+                    .contains(&dispatches),
                     "pack/dot/optional fixup/publish must execute MMQ"
                 );
             } else {
                 assert_eq!(
-                    dispatches, launches,
+                    dispatches,
+                    launches * self.head.parts() as u64 * (1 + u64::from(self.head.transformed())),
                     "declared ineligible route uses strict projection"
                 );
             }
@@ -404,6 +472,25 @@ impl Fixture {
                 .is_none());
         }
         assert_eq!(values.len(), participants as usize);
+        let facts = if let Some(work) = work_facts {
+            let device = device_facts.expect("actual CUDA submission captures command coverage");
+            let terminal = TerminalExecutionFacts::new(
+                receipt.completion(),
+                &work,
+                attribution.as_ref(),
+                Some(&device),
+            )
+            .unwrap();
+            assert_eq!(
+                terminal.completion().disposition(),
+                &OperationCompletionDisposition::Succeeded
+            );
+            assert!(terminal.device_facts().is_some());
+            Some((work, device))
+        } else {
+            assert!(device_facts.is_none());
+            None
+        };
         drop((receipt, handle, identity, active));
         step.try_retire_normal().unwrap();
         println!(
@@ -413,6 +500,7 @@ impl Fixture {
         ObservedRun {
             outputs: values.into_values().collect(),
             dependency_work,
+            facts,
         }
     }
 }

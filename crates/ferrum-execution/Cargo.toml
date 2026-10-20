@@ -5,7 +5,7 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Product execution contracts for the Ferrum inference runtime"
+description = "Product execution protocol and model-program driver for Ferrum"
 readme = "../../README.md"
 
 [dependencies]
@@ -15,6 +15,25 @@ ferrum-runtime = { workspace = true }
 async-trait = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+parking_lot = { workspace = true }
+tokio = { workspace = true }
+pin-project-lite = "0.2"
+thiserror = { workspace = true }
+half = { workspace = true }
+sha2 = "0.10"
+tracing = { workspace = true }
+uuid = { workspace = true }
+futures = { workspace = true, optional = true }
+
+# Preserve accelerated checkpoint hashing where the original driver enabled it.
+[target.'cfg(all(target_arch = "aarch64", any(target_os = "macos", target_os = "linux")))'.dependencies]
+sha2 = { version = "0.10", features = ["asm"] }
+
+[features]
+default = []
+test-support = ["dep:futures", "ferrum-runtime/test-support"]
 
 [dev-dependencies]
 futures = { workspace = true }
+ferrum-runtime = { workspace = true, features = ["test-support"] }
+tempfile = "3.8"

@@ -35,7 +35,7 @@ impl OpUnderTest for FusedAddRmsNormOp {
         use ferrum_kernels::backend::Backend;
 
         let (residual, x, w) = self.build_input(seed);
-        let mut ctx = CpuBackend::new_context();
+        let mut ctx = CpuBackend::new_context(&Default::default()).expect("backend context");
         let mut residual_buf = CpuBackend::from_slice(&residual);
         let x_buf = CpuBackend::from_slice(&x);
         let w_buf = CpuBackend::from_slice(&w);
@@ -62,7 +62,7 @@ impl OpUnderTest for FusedAddRmsNormOp {
         use ferrum_kernels::backend::Backend;
 
         let (residual, x, w) = self.build_input(seed);
-        let mut ctx = MetalBackend::new_context();
+        let mut ctx = MetalBackend::new_context(&Default::default()).expect("backend context");
         let mut residual_buf = MetalBackend::from_slice(&residual);
         let x_buf = MetalBackend::from_slice(&x);
         let w_buf = MetalBackend::from_slice(&w);
@@ -89,7 +89,7 @@ impl OpUnderTest for FusedAddRmsNormOp {
         use ferrum_kernels::backend::Backend;
 
         let (residual, x, w) = self.build_input(seed);
-        let mut ctx = CudaBackend::new_context();
+        let mut ctx = CudaBackend::new_context(&Default::default()).expect("backend context");
         let mut residual_buf = CudaBackend::from_slice(&residual);
         let x_buf = CudaBackend::from_slice(&x);
         let w_buf = CudaBackend::from_slice(&w);

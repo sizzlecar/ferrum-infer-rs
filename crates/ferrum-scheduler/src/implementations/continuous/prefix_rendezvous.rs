@@ -10,6 +10,16 @@ pub struct PrefixRequestKey {
     incarnation: Arc<()>,
 }
 
+impl PartialEq for PrefixRequestKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.request_id == other.request_id
+            && self.ticket == other.ticket
+            && Arc::ptr_eq(&self.incarnation, &other.incarnation)
+    }
+}
+
+impl Eq for PrefixRequestKey {}
+
 impl PrefixRequestKey {
     pub fn request_id(&self) -> &RequestId {
         &self.request_id
@@ -17,7 +27,17 @@ impl PrefixRequestKey {
     pub fn ordinal(&self) -> u64 {
         self.ticket.get()
     }
-    fn matches(&self, request: &ContinuousBatchRequest) -> bool {
+    pub(super) fn from_request(request: &ContinuousBatchRequest) -> Option<Self> {
+        Some(Self {
+            request_id: request.inner.request.id.clone(),
+            ticket: request.waiting_admission_ticket?,
+            incarnation: Arc::clone(&request.prefix_rendezvous.incarnation),
+        })
+    }
+    pub(super) fn ticket(&self) -> WaitingAdmissionTicket {
+        self.ticket
+    }
+    pub(super) fn matches(&self, request: &ContinuousBatchRequest) -> bool {
         request.inner.request.id == self.request_id
             && request.waiting_admission_ticket == Some(self.ticket)
             && Arc::ptr_eq(&self.incarnation, &request.prefix_rendezvous.incarnation)
@@ -202,6 +222,12 @@ impl ContinuousBatchScheduler {
             return None;
         }
         let mut waiting = self.waiting_queue.write();
+        // An admission probe may already be preparing executor resources
+        // outside this lock. Install prefix dependencies before that round,
+        // never turn its selected request into a follower while it awaits.
+        if waiting.scan_active() {
+            return None;
+        }
         let mut prefill = self.prefill_queue.write();
         let producer = prefill
             .iter()

@@ -17,8 +17,8 @@
 
 #![cfg(all(target_os = "macos", feature = "metal"))]
 
+use crate::attention::metal::pipelines::MetalPipelines;
 use std::ffi::c_void;
-use std::sync::OnceLock;
 
 use metal::{
     Buffer, CompileOptions, ComputeCommandEncoderRef, ComputePipelineState, Device, MTLSize,
@@ -27,20 +27,16 @@ use metal::{
 const SHADER_SRC: &str = include_str!("q4_k_moe_id_gemv_batched.metal");
 const KERNEL_NAME: &str = "gemv_q4kw_moe_id_batched_f32";
 
-static PIPELINE: OnceLock<ComputePipelineState> = OnceLock::new();
-
-fn pipeline(device: &Device) -> &'static ComputePipelineState {
-    PIPELINE.get_or_init(|| {
-        let lib = device
-            .new_library_with_source(SHADER_SRC, &CompileOptions::new())
-            .expect("compile q4_k_moe_id_gemv_batched.metal");
-        let function = lib
-            .get_function(KERNEL_NAME, None)
-            .expect("find gemv_q4kw_moe_id_batched_f32 function");
-        device
-            .new_compute_pipeline_state_with_function(&function)
-            .expect("build gemv_q4kw_moe_id_batched_f32 pipeline")
-    })
+pub(crate) fn build_pipeline(device: &Device) -> ComputePipelineState {
+    let lib = device
+        .new_library_with_source(SHADER_SRC, &CompileOptions::new())
+        .expect("compile q4_k_moe_id_gemv_batched.metal");
+    let function = lib
+        .get_function(KERNEL_NAME, None)
+        .expect("find gemv_q4kw_moe_id_batched_f32 function");
+    device
+        .new_compute_pipeline_state_with_function(&function)
+        .expect("build gemv_q4kw_moe_id_batched_f32 pipeline")
 }
 
 /// Dispatch the batched MoE GEMV on an existing compute encoder.
@@ -59,8 +55,8 @@ fn pipeline(device: &Device) -> &'static ComputePipelineState {
 /// `n`, `k`          : per-expert out_features / in_features.
 /// `m`, `top_k`      : token batch size and selected experts per token.
 #[allow(clippy::too_many_arguments)]
-pub fn dispatch_gemv_q4k_moe_id_batched_on_encoder(
-    device: &Device,
+pub(crate) fn dispatch_gemv_q4k_moe_id_batched_on_encoder(
+    pipes: &MetalPipelines,
     enc: &ComputeCommandEncoderRef,
     a: &Buffer,
     weights_stacked: &Buffer,
@@ -104,7 +100,7 @@ pub fn dispatch_gemv_q4k_moe_id_batched_on_encoder(
         src1_inner_stride: src1_inner_stride as i32,
     };
 
-    let pipe = pipeline(device);
+    let pipe = pipes.q4_k_moe_id_gemv_batched_pipeline();
     enc.set_compute_pipeline_state(pipe);
     enc.set_buffer(0, Some(weights_stacked), weights_byte_offset);
     enc.set_buffer(1, Some(a), 0);
@@ -173,6 +169,7 @@ mod tests {
             eprintln!("no Metal device — skipping");
             return;
         };
+        let pipes = MetalPipelines::new(&device);
         let queue = device.new_command_queue();
 
         let a_buf = device.new_buffer_with_data(
@@ -208,8 +205,8 @@ mod tests {
             // a slice → at offset t*K floats, ids slice → at offset t*TOP_K i32s.
             // The existing kernel doesn't take offsets natively; both buffers
             // are addressed via the `_offset_on_encoder` variant.
-            crate::q4_k_moe_id_gemv::dispatch_gemv_q4k_moe_id_offset_on_encoder(
-                &device,
+            crate::backend::metal::q4_k_moe_id_gemv::dispatch_gemv_q4k_moe_id_offset_on_encoder(
+                &pipes,
                 enc1,
                 &a_buf,
                 (t * K * std::mem::size_of::<f32>()) as u64,
@@ -251,8 +248,8 @@ mod tests {
         for t in 0..M {
             let cmd_t = queue.new_command_buffer();
             let enc_t = cmd_t.new_compute_command_encoder();
-            crate::q4_k_moe_id_gemv::dispatch_gemv_q4k_moe_id_offset_on_encoder(
-                &device,
+            crate::backend::metal::q4_k_moe_id_gemv::dispatch_gemv_q4k_moe_id_offset_on_encoder(
+                &pipes,
                 enc_t,
                 &a_buf,
                 (t * K * std::mem::size_of::<f32>()) as u64,
@@ -285,7 +282,7 @@ mod tests {
         let cmd2 = queue.new_command_buffer();
         let enc2 = cmd2.new_compute_command_encoder();
         dispatch_gemv_q4k_moe_id_batched_on_encoder(
-            &device,
+            &pipes,
             enc2,
             &a_buf,
             &w_buf,
@@ -365,6 +362,7 @@ mod tests {
             eprintln!("no Metal device — skipping");
             return;
         };
+        let pipes = MetalPipelines::new(&device);
         let queue = device.new_command_queue();
 
         let a_buf = device.new_buffer_with_data(
@@ -397,8 +395,8 @@ mod tests {
             // Per-token: src1 row at offset t*top_k*K, src1_stride=K
             // (per-slot row inside the token — matches down projection's
             // [top_k, K] block per token).
-            crate::q4_k_moe_id_gemv::dispatch_gemv_q4k_moe_id_offset_on_encoder(
-                &device,
+            crate::backend::metal::q4_k_moe_id_gemv::dispatch_gemv_q4k_moe_id_offset_on_encoder(
+                &pipes,
                 enc_t,
                 &a_buf,
                 (t * TOP_K * K * std::mem::size_of::<f32>()) as u64,
@@ -429,7 +427,7 @@ mod tests {
         let cmd2 = queue.new_command_buffer();
         let enc2 = cmd2.new_compute_command_encoder();
         dispatch_gemv_q4k_moe_id_batched_on_encoder(
-            &device,
+            &pipes,
             enc2,
             &a_buf,
             &w_buf,
@@ -526,6 +524,7 @@ mod tests {
             eprintln!("no Metal device — skipping");
             return;
         };
+        let pipes = MetalPipelines::new(&device);
         let queue = device.new_command_queue();
 
         let w_buf = device.new_buffer_with_data(
@@ -575,7 +574,7 @@ mod tests {
                 let cmd = queue.new_command_buffer();
                 let enc = cmd.new_compute_command_encoder();
                 dispatch_gemv_q4k_moe_id_batched_on_encoder(
-                    &device, enc, &a_buf, &w_buf, 0, &ids_buf, &out_buf, N, K, m, TOP_K, K, 0,
+                    &pipes, enc, &a_buf, &w_buf, 0, &ids_buf, &out_buf, N, K, m, TOP_K, K, 0,
                 );
                 enc.end_encoding();
                 cmd.commit();
@@ -590,7 +589,7 @@ mod tests {
                 let cmd = queue.new_command_buffer();
                 let enc = cmd.new_compute_command_encoder();
                 dispatch_gemv_q4k_moe_id_batched_on_encoder(
-                    &device, enc, &a_buf, &w_buf, 0, &ids_buf, &out_buf, N, K, m, TOP_K, K, 0,
+                    &pipes, enc, &a_buf, &w_buf, 0, &ids_buf, &out_buf, N, K, m, TOP_K, K, 0,
                 );
                 enc.end_encoding();
                 cmd.commit();
@@ -649,7 +648,7 @@ mod tests {
     #[test]
     #[ignore = "manually-run capture — needs MTL_CAPTURE_ENABLED=1"]
     fn moe_gemv_capture_one_iter() {
-        use crate::q4_k_moe_id_gate_up_silu_batched::dispatch_gemv_q4k_moe_id_gate_up_silu_batched_on_encoder;
+        use crate::backend::metal::q4_k_moe_id_gate_up_silu_batched::dispatch_gemv_q4k_moe_id_gate_up_silu_batched_on_encoder;
         use metal::{CaptureDescriptor, MTLCaptureDestination};
 
         const NUM_EXPERTS: usize = 8;
@@ -684,6 +683,7 @@ mod tests {
             eprintln!("no Metal device");
             return;
         };
+        let pipes = MetalPipelines::new(&device);
         let queue = device.new_command_queue();
 
         let gate_buf = device.new_buffer_with_data(
@@ -722,7 +722,7 @@ mod tests {
             let cmd = queue.new_command_buffer();
             let enc = cmd.new_compute_command_encoder();
             dispatch_gemv_q4k_moe_id_gate_up_silu_batched_on_encoder(
-                &device, enc, &a_buf, &gate_buf, 0, &up_buf, 0, &ids_buf, &out_buf, N, K, M, TOP_K,
+                &pipes, enc, &a_buf, &gate_buf, 0, &up_buf, 0, &ids_buf, &out_buf, N, K, M, TOP_K,
                 K, 0,
             );
             enc.end_encoding();
@@ -750,7 +750,7 @@ mod tests {
             let cmd = queue.new_command_buffer();
             let enc = cmd.new_compute_command_encoder();
             dispatch_gemv_q4k_moe_id_gate_up_silu_batched_on_encoder(
-                &device, enc, &a_buf, &gate_buf, 0, &up_buf, 0, &ids_buf, &out_buf, N, K, M, TOP_K,
+                &pipes, enc, &a_buf, &gate_buf, 0, &up_buf, 0, &ids_buf, &out_buf, N, K, M, TOP_K,
                 K, 0,
             );
             enc.end_encoding();
@@ -774,7 +774,7 @@ mod tests {
     #[test]
     #[ignore = "microbench — only run manually with --release"]
     fn moe_gemv_fused_scaling_microbench() {
-        use crate::q4_k_moe_id_gate_up_silu_batched::dispatch_gemv_q4k_moe_id_gate_up_silu_batched_on_encoder;
+        use crate::backend::metal::q4_k_moe_id_gate_up_silu_batched::dispatch_gemv_q4k_moe_id_gate_up_silu_batched_on_encoder;
 
         const NUM_EXPERTS: usize = 8;
         const N: usize = 768;
@@ -804,6 +804,7 @@ mod tests {
         let Some(device) = metal::Device::system_default() else {
             return;
         };
+        let pipes = MetalPipelines::new(&device);
         let queue = device.new_command_queue();
 
         let gate_buf = device.new_buffer_with_data(
@@ -850,7 +851,7 @@ mod tests {
                 let cmd = queue.new_command_buffer();
                 let enc = cmd.new_compute_command_encoder();
                 dispatch_gemv_q4k_moe_id_gate_up_silu_batched_on_encoder(
-                    &device, enc, &a_buf, &gate_buf, 0, &up_buf, 0, &ids_buf, &out_buf, N, K, m,
+                    &pipes, enc, &a_buf, &gate_buf, 0, &up_buf, 0, &ids_buf, &out_buf, N, K, m,
                     TOP_K, K, 0,
                 );
                 enc.end_encoding();
@@ -862,7 +863,7 @@ mod tests {
                 let cmd = queue.new_command_buffer();
                 let enc = cmd.new_compute_command_encoder();
                 dispatch_gemv_q4k_moe_id_gate_up_silu_batched_on_encoder(
-                    &device, enc, &a_buf, &gate_buf, 0, &up_buf, 0, &ids_buf, &out_buf, N, K, m,
+                    &pipes, enc, &a_buf, &gate_buf, 0, &up_buf, 0, &ids_buf, &out_buf, N, K, m,
                     TOP_K, K, 0,
                 );
                 enc.end_encoding();

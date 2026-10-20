@@ -2,13 +2,13 @@
 //! Verifies end-to-end paged KV cache usage: block allocation, K/V storage,
 //! cross-block attention, and deallocation.
 
-use ferrum_engine::{ContinuousBatchEngine, KvCacheManager, LlmInferenceEngine};
+use ferrum_engine::{ContinuousBatchEngine, LlmInferenceEngine};
+use ferrum_interfaces::KvCacheManager;
 use ferrum_kv::managers::paged::{PagedKvCacheConfig, PagedKvCacheManager};
+use ferrum_output::InferenceOutput;
 use ferrum_scheduler::implementations::ContinuousBatchScheduler;
-use ferrum_testkit::{
-    MockSampler, MockTensorFactory, MockTokenizer, PagedAttentionExecutor, PagedExecutorConfig,
-};
-use ferrum_types::{InferenceRequest, InferenceResponse, SchedulerConfig};
+use ferrum_testkit::{MockSampler, MockTokenizer, PagedAttentionExecutor, PagedExecutorConfig};
+use ferrum_types::{InferenceRequest, SchedulerConfig};
 use std::sync::Arc;
 
 const VOCAB_SIZE: usize = 256;
@@ -42,22 +42,19 @@ fn make_engine() -> (ContinuousBatchEngine, Arc<PagedKvCacheManager>) {
 
     let kv_manager =
         Arc::new(PagedKvCacheManager::new(ferrum_types::Device::CPU, kv_config).unwrap());
-    let executor = Arc::new(PagedAttentionExecutor::new(exec_config, kv_manager.clone()));
+    let executor = PagedAttentionExecutor::new(exec_config, kv_manager.clone());
 
     let config = ferrum_types::EngineConfig::default();
     let scheduler = Arc::new(ContinuousBatchScheduler::new(SchedulerConfig::default()));
     let tokenizer = Arc::new(MockTokenizer::new(VOCAB_SIZE));
     let sampler = Arc::new(MockSampler);
-    let tensor_factory = Arc::new(MockTensorFactory);
 
     let engine = ContinuousBatchEngine::new(
         config,
         scheduler,
         tokenizer,
         sampler,
-        kv_manager.clone(),
-        executor,
-        tensor_factory,
+        ferrum_execution::executor_lifecycle::ExecutorOwner::new(Box::new(executor)),
     )
     .expect("legacy engine composition must match executor authority");
 
@@ -78,7 +75,7 @@ async fn single_request_with_paged_kv() {
 
     // Should complete with some tokens generated
     assert!(
-        !response.text.is_empty() || !response.tokens.is_empty(),
+        !response.response().text.is_empty() || !response.response().tokens.is_empty(),
         "Should produce output"
     );
 
@@ -95,7 +92,7 @@ async fn multiple_requests_sequential() {
         let request = make_request(&format!("Request {}", i));
         let response = engine.infer(request).await.unwrap();
         assert!(
-            !response.tokens.is_empty(),
+            !response.response().tokens.is_empty(),
             "Request {} should produce tokens",
             i
         );
@@ -131,27 +128,25 @@ async fn paged_executor_tracks_operations() {
 
     let kv_manager =
         Arc::new(PagedKvCacheManager::new(ferrum_types::Device::CPU, kv_config).unwrap());
-    let executor = Arc::new(PagedAttentionExecutor::new(exec_config, kv_manager.clone()));
+    let executor = PagedAttentionExecutor::new(exec_config, kv_manager.clone());
+    let observation = executor.observer();
 
     let config = ferrum_types::EngineConfig::default();
     let scheduler = Arc::new(ContinuousBatchScheduler::new(SchedulerConfig::default()));
     let tokenizer = Arc::new(MockTokenizer::new(VOCAB_SIZE));
     let sampler = Arc::new(MockSampler);
-    let tensor_factory = Arc::new(MockTensorFactory);
 
     let engine = ContinuousBatchEngine::new(
         config,
         scheduler,
         tokenizer,
         sampler,
-        kv_manager,
-        executor.clone(),
-        tensor_factory,
+        ferrum_execution::executor_lifecycle::ExecutorOwner::new(Box::new(executor)),
     )
     .expect("legacy engine composition must match executor authority");
 
-    assert_eq!(executor.prefill_count(), 0);
-    assert_eq!(executor.decode_count(), 0);
+    assert_eq!(observation.prefill_count(), 0);
+    assert_eq!(observation.decode_count(), 0);
 
     let mut request = make_request("Track ops");
     // This test validates executor operation accounting, so make the
@@ -162,8 +157,8 @@ async fn paged_executor_tracks_operations() {
     let _response = engine.infer(request).await.unwrap();
 
     // Should have done 1 prefill and (max_tokens - 1) decodes
-    assert_eq!(executor.prefill_count(), 1);
-    assert_eq!(executor.decode_count(), 4); // max_tokens=5, first from prefill
+    assert_eq!(observation.prefill_count(), 1);
+    assert_eq!(observation.decode_count(), 4); // max_tokens=5, first from prefill
 }
 
 #[tokio::test]
@@ -185,7 +180,7 @@ async fn streaming_with_paged_kv() {
 
     let last = chunks.last().unwrap();
     assert!(
-        last.finish_reason.is_some(),
+        last.chunk().finish_reason.is_some(),
         "Final chunk should have finish_reason"
     );
 }
@@ -220,13 +215,12 @@ fn make_tight_engine() -> (Arc<ContinuousBatchEngine>, Arc<PagedKvCacheManager>)
 
     let kv_manager =
         Arc::new(PagedKvCacheManager::new(ferrum_types::Device::CPU, kv_config).unwrap());
-    let executor = Arc::new(PagedAttentionExecutor::new(exec_config, kv_manager.clone()));
+    let executor = PagedAttentionExecutor::new(exec_config, kv_manager.clone());
 
     let config = ferrum_types::EngineConfig::default();
     let scheduler = Arc::new(ContinuousBatchScheduler::new(SchedulerConfig::default()));
     let tokenizer = Arc::new(MockTokenizer::new(VOCAB_SIZE));
     let sampler = Arc::new(MockSampler);
-    let tensor_factory = Arc::new(MockTensorFactory);
 
     let engine = Arc::new(
         ContinuousBatchEngine::new(
@@ -234,9 +228,7 @@ fn make_tight_engine() -> (Arc<ContinuousBatchEngine>, Arc<PagedKvCacheManager>)
             scheduler,
             tokenizer,
             sampler,
-            kv_manager.clone(),
-            executor,
-            tensor_factory,
+            ferrum_execution::executor_lifecycle::ExecutorOwner::new(Box::new(executor)),
         )
         .expect("legacy engine composition must match executor authority"),
     );
@@ -261,7 +253,7 @@ async fn preemption_allows_all_requests_to_complete() {
         }));
     }
 
-    let results: Vec<InferenceResponse> = futures::future::join_all(handles)
+    let results: Vec<InferenceOutput> = futures::future::join_all(handles)
         .await
         .into_iter()
         .map(|r| r.unwrap().unwrap())
@@ -269,7 +261,10 @@ async fn preemption_allows_all_requests_to_complete() {
 
     assert_eq!(results.len(), 5, "All requests should complete");
     for resp in &results {
-        assert!(!resp.tokens.is_empty(), "Each should generate tokens");
+        assert!(
+            !resp.response().tokens.is_empty(),
+            "Each should generate tokens"
+        );
     }
 
     // All KV caches freed after completion

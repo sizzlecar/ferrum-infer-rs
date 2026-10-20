@@ -8,7 +8,7 @@
 //! all the components from other ferrum crates:
 //!
 //! - Request admission and scheduling (ferrum-scheduler)
-//! - KV-cache allocation and management (ferrum-kv)
+//! - Original executor resource admission, observations and retirement
 //! - Tokenization and incremental decoding (ferrum-tokenizer)
 //! - Logits processing and sampling (ferrum-sampler)
 //! - Model execution and weight loading (ferrum-models)
@@ -47,21 +47,22 @@
 
 pub mod builder;
 pub mod continuous_engine;
+mod executor_binding;
+pub use executor_binding::{EngineExecutor, IntoEngineExecutor};
 pub(crate) mod layer_split;
 pub mod parallel;
 mod product_composition;
-pub mod recurrent_state;
 pub mod registry;
 pub(crate) mod resource_lifecycle;
 pub mod tensor_factory;
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", test))]
 pub mod vnext_determinism;
 
 // Re-exports of interfaces
 pub use ferrum_execution::ModelExecutor;
 pub use ferrum_interfaces::engine::LlmInferenceEngine;
 pub use ferrum_interfaces::{
-    IncrementalTokenizer, InferenceEngine as InferenceEngineInterface, KvCacheManager, Sampler,
+    IncrementalTokenizer, InferenceEngine as InferenceEngineInterface, Sampler,
     SchedulerInterface as Scheduler, Tokenizer,
 };
 
@@ -74,24 +75,20 @@ pub use ferrum_types::{
 pub use ferrum_scheduler::BatchPlan;
 
 // Re-exports of engine implementation
-pub use continuous_engine::{ContinuousBatchEngine, SequenceState};
-
-pub use recurrent_state::{
-    InMemoryRecurrentStateConfig, InMemoryRecurrentStateHandle, InMemoryRecurrentStateManager,
-};
+pub use continuous_engine::{ContinuousBatchEngine, EngineJournalScopes, SequenceState};
 
 // Re-exports of builder
 pub use builder::{
     create_defined_product_engine, create_engine, create_product_engine, EngineBuilder,
 };
+pub use ferrum_execution::{ExecutorBuildError, ExecutorBuildResult};
 
 // Re-exports of registry
 pub use registry::{
     global_registry, set_global_registry, ComponentConfig, ComponentFactory, ComponentMetadata,
-    ComponentRegistry, ContinuousBatchSchedulerFactory, DefaultKvCacheFactory, GreedySampler,
-    GreedySamplerFactory, HuggingFaceTokenizerFactory, LlmExecutorFactory,
-    MultinomialSamplerFactory, PagedKvCacheFactory, StubExecutorFactory, StubTokenizer,
-    StubTokenizerFactory,
+    ComponentRegistry, ContinuousBatchSchedulerFactory, GreedySampler, GreedySamplerFactory,
+    HuggingFaceTokenizerFactory, LlmExecutorFactory, MultinomialSamplerFactory,
+    StubExecutorFactory, StubTokenizer, StubTokenizerFactory,
 };
 
 // Back-compat alias for the renamed factory (PR A).
@@ -109,7 +106,7 @@ pub use parallel::{
 /// This is a convenience function that uses the default registry.
 pub async fn create_default_engine(
     config: EngineConfig,
-) -> Result<Box<dyn LlmInferenceEngine + Send + Sync>> {
+) -> ExecutorBuildResult<Box<dyn LlmInferenceEngine + Send + Sync>> {
     create_engine(config).await
 }
 

@@ -129,7 +129,10 @@ fn measured_request_count(cmd: &BenchCommand) -> Result<u32> {
     })
 }
 
-pub async fn execute(cmd: BenchCommand, config: CliConfig) -> Result<()> {
+pub async fn execute(
+    cmd: BenchCommand,
+    config: CliConfig,
+) -> ferrum_execution::ExecutorBuildResult<()> {
     validate_command(&cmd)?;
     let runtime_config = crate::runtime_env::capture_supported_runtime_environment()?;
     let cache_dir = crate::source_resolver::hf_cache_dir(&config);
@@ -144,6 +147,8 @@ pub async fn execute(cmd: BenchCommand, config: CliConfig) -> Result<()> {
     let model_id = product_input.public_model_id.clone();
     let source = product_input.source;
     let mut engine_config = product_input.engine_config;
+    engine_config.output = config.output.clone();
+    engine_config.output.validate()?;
     engine_config.numerical_execution =
         config.resolve_numerical_execution(cmd.numerical_profile.as_ref());
     let model_sources = product_input.model_sources;
@@ -241,9 +246,7 @@ pub async fn execute(cmd: BenchCommand, config: CliConfig) -> Result<()> {
     eprintln!("{}", "Warmup...".dimmed());
     let warmup = run_single(&*engine, &model_id, "Hello", 16).await?;
     if !warmup.success {
-        return Err(ferrum_types::FerrumError::model(
-            "benchmark warmup request failed",
-        ));
+        return Err(ferrum_types::FerrumError::model("benchmark warmup request failed").into());
     }
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
@@ -304,7 +307,7 @@ pub async fn execute(cmd: BenchCommand, config: CliConfig) -> Result<()> {
         env,
     );
 
-    emit_then_enforce_bench_report(&cmd, &report, &mode_str)
+    emit_then_enforce_bench_report(&cmd, &report, &mode_str).map_err(Into::into)
 }
 
 // ── Run loops (one round = N sequential or concurrent passes) ───────
@@ -421,6 +424,7 @@ fn make_request(model_id: &str, prompt: &str, max_tokens: u32) -> InferenceReque
         client_id: None,
         session_id: None,
         created_at: Utc::now(),
+        ingress: None,
         api_request: None,
         evidence_request: Default::default(),
         metadata: HashMap::new(),
@@ -453,18 +457,7 @@ async fn run_single(
     Ok(collect_stream(stream).await?)
 }
 
-async fn collect_stream(
-    mut stream: std::pin::Pin<
-        Box<
-            dyn futures::Stream<
-                    Item = std::result::Result<
-                        ferrum_types::StreamChunk,
-                        ferrum_types::FerrumError,
-                    >,
-                > + Send,
-        >,
-    >,
-) -> Result<RequestRecord> {
+async fn collect_stream(mut stream: ferrum_output::InferenceStream) -> Result<RequestRecord> {
     let start = Instant::now();
     let mut token_count: u32 = 0;
     let mut first_token_time: Option<Instant> = None;
@@ -476,6 +469,7 @@ async fn collect_stream(
     while let Some(result) = stream.next().await {
         match result {
             Ok(chunk) => {
+                let chunk = chunk.chunk();
                 if chunk.token.is_some() {
                     let now = Instant::now();
                     if first_token_time.is_none() {
@@ -651,10 +645,6 @@ fn emit_then_enforce_bench_report(
         }
     }
 
-    // PLAYBOOK § 1.5: Rust's `static` items don't run Drop on program
-    // exit, so the global TraceWriter's flush-on-drop never fires. Call
-    // it explicitly here. No-op when FERRUM_TRACE_OUT is unset.
-    ferrum_bench_core::trace::flush_global_trace();
     enforce_bench_error_policy(report)
 }
 

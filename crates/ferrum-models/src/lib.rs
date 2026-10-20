@@ -35,21 +35,15 @@ pub mod tokenizer;
 pub mod vnext;
 pub mod weight_format;
 
-pub use common::{DecoderOnlyLLM, LlmRuntimeConfig};
+pub use common::{DecoderOnlyLLM, LlmRuntimeConfig, ModelTokenExecutionMode};
 pub use definition::{ConfigManager, ModelDefinition};
-pub use executor::{
-    LlmExecutor, StubModelExecutor, VNextCompiledModel, VNextDeterminismExecutionMode,
-    VNextDeterminismExecutionSpec, VNextDeterminismInitialState, VNextDeterminismParticipantSpec,
-    VNextDeterminismPhase, VNextDeterminismWorkspacePoison, VNextExecutorConfig,
-    VNextModelCompilationError, VNextModelExecutor, VNextRuntimeComposition,
-    MAX_VNEXT_DETERMINISM_PARTICIPANTS,
-};
+pub use executor::{LlmExecutor, StubModelExecutor};
 pub use hf_download::HfDownloader;
 pub use loader::SafeTensorsLoader;
 pub use lora::{
-    default_lora_model_id, load_runtime_lora_adapter, load_startup_lora_adapter,
-    load_startup_lora_adapters, render_lora_model_id, ActiveLoraAdapter, LoraAdapterConfig,
-    RuntimeLoraAdapter, StartupLoraAdapter, StartupLoraSpec,
+    default_lora_model_id, load_startup_lora_adapter, load_startup_lora_adapters,
+    render_lora_model_id, ActiveLoraAdapter, LoraAdapterConfig, StartupLoraAdapter,
+    StartupLoraSpec,
 };
 pub use registry::{
     Architecture, DefaultModelRegistry, ModelAlias, ModelDiscoveryEntry, ModelFormatType,

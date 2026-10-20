@@ -17,8 +17,9 @@ pub struct EngineStatus {
     pub active_requests: usize,
     /// Number of queued requests
     pub queued_requests: usize,
-    /// Current memory usage
-    pub memory_usage: MemoryUsage,
+    /// Memory evidence from the original execution owner, when available.
+    /// Missing evidence does not mean zero usage or an unready engine.
+    pub memory_usage: MemoryObservation,
     /// Engine uptime
     pub uptime_seconds: u64,
     /// Last heartbeat timestamp
@@ -27,10 +28,30 @@ pub struct EngineStatus {
     pub version: String,
 }
 
-/// Memory usage statistics
+/// An owner may be ready without exposing complete memory accounting.
+/// Known observations retain the original JSON object; Unknown is JSON null.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum MemoryObservation {
+    Known(MemoryUsage),
+    #[default]
+    Unknown,
+}
+
+impl MemoryObservation {
+    pub fn known(&self) -> Option<&MemoryUsage> {
+        match self {
+            Self::Known(usage) => Some(usage),
+            Self::Unknown => None,
+        }
+    }
+}
+
+/// Memory accounting within the reporting owner's declared domain.
+/// This is not an RSS measurement or a process/device allocation census.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MemoryUsage {
-    /// Total system memory in bytes
+    /// Total bytes in the reporting owner's accounting domain
     pub total_bytes: usize,
     /// Used memory in bytes
     pub used_bytes: usize,
@@ -648,4 +669,34 @@ pub struct LatencyRequirements {
     pub target_p95_latency_ms: u64,
     pub target_p99_latency_ms: u64,
     pub max_latency_ms: u64,
+}
+
+#[cfg(test)]
+mod memory_observation_tests {
+    use super::*;
+
+    #[test]
+    fn known_memory_preserves_wire_object_and_unknown_is_not_measured_zero() {
+        let zero = MemoryUsage {
+            total_bytes: 0,
+            used_bytes: 0,
+            free_bytes: 0,
+            gpu_memory_bytes: None,
+            cpu_memory_bytes: Some(0),
+            cache_memory_bytes: 0,
+            utilization_percent: 0.0,
+        };
+        let original = serde_json::to_value(&zero).unwrap();
+        let known = serde_json::to_value(MemoryObservation::Known(zero)).unwrap();
+        assert_eq!(known, original);
+        assert_eq!(known["used_bytes"], 0);
+        let round_trip: MemoryObservation = serde_json::from_value(known).unwrap();
+        assert_eq!(round_trip.known().unwrap().used_bytes, 0);
+        let unknown = serde_json::to_value(MemoryObservation::Unknown).unwrap();
+        assert!(unknown.is_null());
+        assert!(matches!(
+            serde_json::from_value::<MemoryObservation>(unknown).unwrap(),
+            MemoryObservation::Unknown
+        ));
+    }
 }

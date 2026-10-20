@@ -6,18 +6,30 @@ use clap::{Args, ValueEnum};
 use colored::*;
 use console::{measure_text_width, Key, Term};
 use ferrum_models::source::{ModelFormat, ResolvedModelSource};
+use ferrum_output::{semantic_cost, OutputSemanticLease};
 use ferrum_server::chat_template::{ChatTemplateOptions, ModelChatTemplate, PromptMessage};
+use ferrum_types::TokenId;
 use ferrum_types::{
     has_unclosed_model_reasoning_block, model_reasoning_markers,
     parse_harmony_response_for_finish_reason, parse_model_reasoning_response,
     should_defer_model_reasoning_stream_delta, FerrumError, FinishReason, InferenceRequest,
-    InferenceResponse, ModelCapabilities, ModelOutputProtocol, ParsedReasoningResponse, Priority,
-    RequestId, ResolvedFerrumConfig, ResponseCompletionBoundary, Result, RuntimeConfigEntry,
-    RuntimeConfigSnapshot, RuntimeConfigSource, SamplingParams, StreamChunk, TokenUsage,
-    WorkloadProfile, DEFAULT_CHAT_REPETITION_PENALTY, THINK_START_TAG,
+    ModelCapabilities, ModelOutputProtocol, ParsedReasoningResponse, Priority, RequestId,
+    ResolvedFerrumConfig, ResponseCompletionBoundary, Result, RuntimeConfigEntry,
+    RuntimeConfigSnapshot, RuntimeConfigSource, SamplingParams, TokenUsage, WorkloadProfile,
+    DEFAULT_CHAT_REPETITION_PENALTY, THINK_START_TAG,
 };
 use futures::StreamExt;
+
+mod jsonl;
+mod semantic;
+#[cfg(test)]
+mod semantic_tests;
 use indicatif::{ProgressBar, ProgressStyle};
+use jsonl::{jsonl_assistant_delta_record, jsonl_assistant_record};
+use semantic::{
+    resize_field, stream_reservation, CollectedRunGeneration, RetainedRunProjection,
+    RunGenerationView, RunHistoryMessage, StreamGenerationData,
+};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::io::{self, BufRead, IsTerminal, Write};
@@ -26,51 +38,15 @@ use std::mem;
 #[cfg(unix)]
 use std::os::fd::{AsRawFd, RawFd};
 use std::path::{Path, PathBuf};
-use std::pin::Pin;
 use uuid::Uuid;
 
 #[cfg(test)]
 use crate::source_resolver::tokenizer_sibling_repo;
 #[cfg(test)]
-use ferrum_types::{has_unclosed_thinking_block, THINK_END_TAG};
+use ferrum_types::{has_unclosed_thinking_block, InferenceResponse, StreamChunk, THINK_END_TAG};
 
 const RUN_INITIAL_FORBIDDEN_TOKEN_TEXTS_METADATA_KEY: &str = "ferrum_initial_forbidden_token_texts";
 const RUN_JSONL_SCHEMA_VERSION: u32 = 2;
-
-/// Keep the raw history evidence separate from the model template's messages.
-#[derive(Clone, Debug)]
-struct RunHistoryMessage {
-    prompt: PromptMessage,
-    raw_content: String,
-}
-
-impl RunHistoryMessage {
-    fn new(role: &str, content: &str) -> Self {
-        Self {
-            prompt: PromptMessage::new(role, content),
-            raw_content: content.to_string(),
-        }
-    }
-
-    fn assistant(
-        raw_content: &str,
-        protocol: ModelOutputProtocol,
-        parsed: &ParsedReasoningResponse,
-    ) -> Self {
-        let mut message = Self::new("assistant", raw_content);
-        match protocol {
-            // Text templates own their policy for inline <think> history.
-            ModelOutputProtocol::Text => {}
-            // Reuse the validated result, including valid user/length truncation.
-            // Native channel envelopes are not an assistant message's content.
-            ModelOutputProtocol::HarmonyGptOss | ModelOutputProtocol::GemmaThought => {
-                message.prompt.content = parsed.content.clone();
-                message.prompt.reasoning_content = parsed.reasoning.clone();
-            }
-        }
-        message
-    }
-}
 
 /// Output format for `ferrum run`. JSONL mode emits one record per event
 /// (assistant generation result, user input, exit) on stdout — used by
@@ -157,29 +133,6 @@ fn emit_jsonl_assistant_delta(
     ));
 }
 
-fn jsonl_assistant_delta_record(
-    session_id: &str,
-    history_epoch: usize,
-    request_id: &str,
-    turn: usize,
-    index: usize,
-    raw_text_delta: &str,
-    token_id: Option<u32>,
-) -> serde_json::Value {
-    serde_json::json!({
-        "schema_version": RUN_JSONL_SCHEMA_VERSION,
-        "event": "assistant_delta",
-        "session_id": session_id,
-        "history_epoch": history_epoch,
-        "request_id": request_id,
-        "turn": turn,
-        "index": index,
-        "raw_text_delta": raw_text_delta,
-        "utf8_bytes": raw_text_delta.len(),
-        "token_id": token_id,
-    })
-}
-
 fn emit_jsonl_assistant(
     session_id: &str,
     history_epoch: usize,
@@ -212,40 +165,6 @@ fn emit_jsonl_assistant(
     ));
 }
 
-fn jsonl_assistant_record(
-    session_id: &str,
-    history_epoch: usize,
-    request_id: &str,
-    turn: usize,
-    content: &str,
-    reasoning: Option<&str>,
-    history: &[RunHistoryMessage],
-    finish_reason: Option<FinishReason>,
-    usage: Option<&TokenUsage>,
-    n_tokens: usize,
-    chunk_count: usize,
-    raw_text: &str,
-    ms: f64,
-) -> serde_json::Value {
-    serde_json::json!({
-        "schema_version": RUN_JSONL_SCHEMA_VERSION,
-        "event": "assistant",
-        "session_id": session_id,
-        "history_epoch": history_epoch,
-        "request_id": request_id,
-        "turn": turn,
-        "content": content,
-        "reasoning": reasoning,
-        "history_before": history_evidence(history),
-        "finish_reason": finish_reason.map(finish_reason_str),
-        "usage": usage,
-        "n_tokens": n_tokens,
-        "chunk_count": chunk_count,
-        "raw_text_sha256": sha256_text(raw_text),
-        "ms": ms,
-    })
-}
-
 fn emit_jsonl_exit(session_id: &str, history_epoch: usize, reason: &str) {
     let record = serde_json::json!({
         "schema_version": RUN_JSONL_SCHEMA_VERSION,
@@ -257,9 +176,11 @@ fn emit_jsonl_exit(session_id: &str, history_epoch: usize, reason: &str) {
     emit_jsonl_record(&record);
 }
 
-fn emit_jsonl_record(record: &serde_json::Value) {
-    println!("{record}");
-    io::stdout().flush().ok();
+fn emit_jsonl_record(record: &impl serde::Serialize) {
+    let mut stdout = io::stdout().lock();
+    serde_json::to_writer(&mut stdout, record).expect("run JSONL serialization failed");
+    writeln!(stdout).expect("run JSONL write failed");
+    stdout.flush().ok();
 }
 
 fn sha256_text(value: &str) -> String {
@@ -267,15 +188,10 @@ fn sha256_text(value: &str) -> String {
 }
 
 fn history_evidence(history: &[RunHistoryMessage]) -> serde_json::Value {
-    let raw_history: Vec<_> = history
-        .iter()
-        .map(|message| (&message.prompt.role, &message.raw_content))
-        .collect();
-    let encoded = serde_json::to_vec(&raw_history).expect("run history serialization cannot fail");
     serde_json::json!({
         "message_count": history.len(),
         "turn_count": count_user_turns(history),
-        "sha256": format!("{:x}", Sha256::digest(encoded)),
+        "sha256": jsonl::hash_history(history),
     })
 }
 
@@ -413,8 +329,8 @@ impl RunBudget {
     }
 }
 
-fn display_response_text(text: &str) -> String {
-    text.trim().to_string()
+fn display_response_text(text: &str) -> &str {
+    text.trim()
 }
 
 fn parse_run_model_output(
@@ -442,37 +358,6 @@ fn parse_run_model_output(
     }
 }
 
-struct CollectedRunGeneration {
-    request_id: String,
-    raw_text: String,
-    finish_reason: Option<FinishReason>,
-    usage: Option<TokenUsage>,
-    token_count: usize,
-    token_ids: Vec<u32>,
-    chunk_count: usize,
-    execution_evidence: Option<ferrum_types::InferenceExecutionEvidence>,
-}
-
-impl CollectedRunGeneration {
-    fn from_response(response: InferenceResponse) -> Result<Self> {
-        require_run_terminal_reason(Some(response.finish_reason))?;
-        Ok(Self {
-            request_id: response.request_id.to_string(),
-            raw_text: response.text,
-            finish_reason: Some(response.finish_reason),
-            usage: Some(response.usage),
-            token_count: response.tokens.len(),
-            token_ids: response
-                .tokens
-                .into_iter()
-                .map(|token| token.get())
-                .collect(),
-            chunk_count: 1,
-            execution_evidence: response.execution_evidence,
-        })
-    }
-}
-
 fn require_run_terminal_reason(reason: Option<FinishReason>) -> Result<()> {
     match reason {
         Some(FinishReason::Error) => Err(FerrumError::model(
@@ -485,12 +370,13 @@ fn require_run_terminal_reason(reason: Option<FinishReason>) -> Result<()> {
     }
 }
 
-type RunResponseStream = Pin<Box<dyn futures::Stream<Item = Result<StreamChunk>> + Send + 'static>>;
+type RunResponseStream = ferrum_output::InferenceStream;
 
 struct RunStreamOutput {
     protocol: ModelOutputProtocol,
     prompt_opened_thinking: bool,
     emitted_content: String,
+    semantic: Option<OutputSemanticLease>,
 }
 
 impl RunStreamOutput {
@@ -499,12 +385,18 @@ impl RunStreamOutput {
             protocol,
             prompt_opened_thinking,
             emitted_content: String::new(),
+            semantic: None,
         }
     }
 
-    fn delta(&mut self, raw_text: &str, raw_delta: &str) -> Result<Option<String>> {
+    fn bind_session(mut self, session: &ferrum_output::OutputSession) -> Result<Self> {
+        self.semantic = Some(session.try_reserve_semantic(0)?);
+        Ok(self)
+    }
+
+    fn delta<'a>(&'a mut self, raw_text: &str, raw_delta: &'a str) -> Result<Option<&'a str>> {
         match self.protocol {
-            ModelOutputProtocol::Text => Ok(Some(raw_delta.to_string())),
+            ModelOutputProtocol::Text => Ok(Some(raw_delta)),
             ModelOutputProtocol::HarmonyGptOss => Ok(None),
             ModelOutputProtocol::GemmaThought => {
                 if should_defer_model_reasoning_stream_delta(self.protocol, raw_text) {
@@ -515,7 +407,7 @@ impl RunStreamOutput {
         }
     }
 
-    fn finish(&mut self, raw_text: &str) -> Result<Option<String>> {
+    fn finish(&mut self, raw_text: &str) -> Result<Option<&str>> {
         match self.protocol {
             // Ordinary text has already streamed; Harmony is validated and
             // displayed as a complete message by the caller.
@@ -526,19 +418,27 @@ impl RunStreamOutput {
         }
     }
 
-    fn parsed_content_delta(&mut self, raw_text: &str) -> Result<Option<String>> {
+    fn parsed_content_delta(&mut self, raw_text: &str) -> Result<Option<&str>> {
         let parsed =
             parse_model_reasoning_response(self.protocol, raw_text, self.prompt_opened_thinking)?;
-        let delta = parsed
-            .content
-            .strip_prefix(&self.emitted_content)
-            .ok_or_else(|| {
-                FerrumError::invalid_format(
-                    "model reasoning parsing changed previously emitted content",
-                )
-            })?
-            .to_string();
+        let previous_len = self.emitted_content.len();
+        if !parsed.content.starts_with(&self.emitted_content) {
+            return Err(FerrumError::invalid_format(
+                "model reasoning parsing changed previously emitted content",
+            ));
+        }
+        let lease = self
+            .semantic
+            .as_mut()
+            .ok_or_else(|| FerrumError::internal("run stream output has no output session"))?;
+        // The old prefix remains allocated until assignment; reserve the new
+        // retained value before replacing it. Parser-local scratch is separate.
+        let next = lease
+            .output_session()
+            .try_reserve_semantic(parsed.content.len())?;
         self.emitted_content = parsed.content;
+        *lease = next;
+        let delta = &self.emitted_content[previous_len..];
         Ok((!delta.is_empty()).then_some(delta))
     }
 }
@@ -552,6 +452,12 @@ async fn collect_run_stream(
     history_epoch: usize,
     expected_request_id: &str,
 ) -> Result<CollectedRunGeneration> {
+    let session = stream.output_session().clone();
+    let expected_id = RequestId(
+        Uuid::parse_str(expected_request_id)
+            .map_err(|error| FerrumError::internal(error.to_string()))?,
+    );
+    let mut semantic = stream_reservation(&session, &expected_id)?;
     let mut request_id = None;
     let mut raw_text = String::new();
     let mut finish_reason = None;
@@ -561,16 +467,18 @@ async fn collect_run_stream(
     let mut chunk_count = 0usize;
     let mut execution_evidence = None;
     while let Some(chunk) = stream.next().await {
-        let mut chunk = chunk?;
+        let output_chunk = chunk?;
+        let chunk = output_chunk.chunk();
         let chunk_request_id = chunk.request_id.to_string();
         if chunk_request_id != expected_request_id {
             return Err(FerrumError::internal(format!(
                 "run stream request id drift: expected {expected_request_id}, got {chunk_request_id}"
             )));
         }
-        request_id.get_or_insert_with(|| chunk_request_id.clone());
+        request_id.get_or_insert_with(|| chunk.request_id.clone());
         let token_id = chunk.token.map(|token| token.get());
         if !chunk.text.is_empty() {
+            semantic.try_grow(chunk.text.len())?;
             raw_text.push_str(&chunk.text);
             // JSONL raw_text_delta is an evidence field: concatenation must
             // match raw_text_sha256, including native channel framing. The
@@ -595,27 +503,32 @@ async fn collect_run_stream(
                     token_id, chunk.text
                 );
             }
-            token_ids.push(token_id);
+            semantic.try_grow(4)?;
+            token_ids.push(TokenId::new(token_id));
             token_count += 1;
         }
         if let Some(usage) = chunk.usage.as_ref() {
             token_count = usage.completion_tokens;
+            resize_field(&mut semantic, &latest_usage.as_ref(), &Some(usage))?;
             latest_usage = Some(usage.clone());
         }
         if chunk.finish_reason.is_some() {
+            resize_field(&mut semantic, &finish_reason, &chunk.finish_reason)?;
             finish_reason = chunk.finish_reason;
         }
-        if let Some(evidence) = chunk.execution_evidence.take() {
-            if execution_evidence.replace(evidence).is_some() {
+        if let Some(evidence) = chunk.execution_evidence.as_ref() {
+            if execution_evidence.is_some() {
                 return Err(FerrumError::internal(
                     "run stream emitted engine execution evidence more than once",
                 ));
             }
+            semantic.try_grow(semantic_cost(evidence)?)?;
+            execution_evidence = Some(evidence.clone());
         }
     }
     require_run_terminal_reason(finish_reason)?;
-    Ok(CollectedRunGeneration {
-        request_id: request_id.unwrap_or_else(|| expected_request_id.to_string()),
+    let data = StreamGenerationData {
+        request_id: request_id.unwrap_or(expected_id),
         raw_text,
         finish_reason,
         usage: latest_usage,
@@ -623,7 +536,9 @@ async fn collect_run_stream(
         token_ids,
         chunk_count,
         execution_evidence,
-    })
+    };
+    semantic.try_resize(semantic_cost(&data)?)?;
+    Ok(CollectedRunGeneration::Stream { data, semantic })
 }
 
 async fn collect_run_text_stream(
@@ -635,7 +550,11 @@ async fn collect_run_text_stream(
     stdin_is_tty: bool,
     capture_token_ids: bool,
 ) -> Result<CollectedRunGeneration> {
-    let mut first_token_indicator = start_first_token_indicator(stdin_is_tty);
+    let session = stream.output_session().clone();
+    let mut semantic = stream_reservation(&session, expected_request_id)?;
+    output = output.bind_session(&session)?;
+    let mut indicator = FirstTokenIndicator(start_first_token_indicator(stdin_is_tty));
+    let first_token_indicator = &mut indicator.0;
     let mut request_id = None;
     let mut raw_text = String::new();
     let mut finish_reason = None;
@@ -645,15 +564,16 @@ async fn collect_run_text_stream(
     let mut chunk_count = 0usize;
     let mut execution_evidence = None;
     while let Some(chunk) = stream.next().await {
-        let mut chunk = match chunk {
+        let output_chunk = match chunk {
             Ok(chunk) => chunk,
             Err(error) => {
-                clear_first_token_indicator(&mut first_token_indicator);
+                clear_first_token_indicator(first_token_indicator);
                 return Err(error);
             }
         };
+        let chunk = output_chunk.chunk();
         if &chunk.request_id != expected_request_id {
-            clear_first_token_indicator(&mut first_token_indicator);
+            clear_first_token_indicator(first_token_indicator);
             return Err(FerrumError::internal(format!(
                 "run stream request id drift: expected {expected_request_id}, got {}",
                 chunk.request_id
@@ -664,7 +584,7 @@ async fn collect_run_text_stream(
         if first_token_indicator.is_some()
             && (!chunk.text.is_empty() || token_id.is_some() || chunk.finish_reason.is_some())
         {
-            clear_first_token_indicator(&mut first_token_indicator);
+            clear_first_token_indicator(first_token_indicator);
         }
         if trace_tokens {
             if let Some(token_id) = token_id {
@@ -675,9 +595,10 @@ async fn collect_run_text_stream(
             }
         }
         if !chunk.text.is_empty() {
+            semantic.try_grow(chunk.text.len())?;
             raw_text.push_str(&chunk.text);
             let delta = output.delta(&raw_text, &chunk.text).inspect_err(|_| {
-                clear_first_token_indicator(&mut first_token_indicator);
+                clear_first_token_indicator(first_token_indicator);
             })?;
             if let Some(delta) = delta {
                 print!("{delta}");
@@ -687,36 +608,39 @@ async fn collect_run_text_stream(
         }
         if let Some(token_id) = token_id {
             if capture_token_ids {
-                token_ids.push(token_id);
+                semantic.try_grow(4)?;
+                token_ids.push(TokenId::new(token_id));
             }
             token_count += 1;
         }
         if let Some(usage) = chunk.usage.as_ref() {
             token_count = usage.completion_tokens;
+            resize_field(&mut semantic, &latest_usage.as_ref(), &Some(usage))?;
             latest_usage = Some(usage.clone());
         }
         if chunk.finish_reason.is_some() {
+            resize_field(&mut semantic, &finish_reason, &chunk.finish_reason)?;
             finish_reason = chunk.finish_reason;
         }
-        if let Some(evidence) = chunk.execution_evidence.take() {
-            if execution_evidence.replace(evidence).is_some() {
-                clear_first_token_indicator(&mut first_token_indicator);
+        if let Some(evidence) = chunk.execution_evidence.as_ref() {
+            if execution_evidence.is_some() {
+                clear_first_token_indicator(first_token_indicator);
                 return Err(FerrumError::internal(
                     "run stream emitted engine execution evidence more than once",
                 ));
             }
+            semantic.try_grow(semantic_cost(evidence)?)?;
+            execution_evidence = Some(evidence.clone());
         }
     }
-    clear_first_token_indicator(&mut first_token_indicator);
+    clear_first_token_indicator(first_token_indicator);
     require_run_terminal_reason(finish_reason)?;
     if let Some(delta) = output.finish(&raw_text)? {
         print!("{delta}");
         io::stdout().flush().ok();
     }
-    Ok(CollectedRunGeneration {
-        request_id: request_id
-            .unwrap_or_else(|| expected_request_id.clone())
-            .to_string(),
+    let data = StreamGenerationData {
+        request_id: request_id.unwrap_or_else(|| expected_request_id.clone()),
         raw_text,
         finish_reason,
         usage: latest_usage,
@@ -724,7 +648,9 @@ async fn collect_run_text_stream(
         token_ids,
         chunk_count,
         execution_evidence,
-    })
+    };
+    semantic.try_resize(semantic_cost(&data)?)?;
+    Ok(CollectedRunGeneration::Stream { data, semantic })
 }
 
 #[derive(Args)]
@@ -1005,12 +931,15 @@ pub struct RunCommand {
 
     #[command(flatten)]
     pub vnext_checkpoint: crate::commands::vnext_checkpoint::VNextCheckpointArgs,
+    #[command(flatten)]
+    pub diagnostic_output_capture:
+        crate::commands::diagnostic_output_capture::DiagnosticOutputCaptureArgs,
 
     /// Write product observability profile events to this JSONL path.
     #[arg(long, value_name = "PATH")]
     pub profile_jsonl: Option<PathBuf>,
 
-    /// Product observability detail level. Basic without artifact paths collects timing metrics only.
+    /// Profile detail. Basic without paths collects metrics only; replay/verify/full require complete artifacts.
     #[arg(long, value_enum, default_value_t = crate::observability_product::ProfileDetailArg::Off)]
     pub profile_detail: crate::observability_product::ProfileDetailArg,
 
@@ -1040,7 +969,11 @@ pub struct RunCommand {
     pub output_format: OutputFormat,
 }
 
-pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
+pub async fn execute(
+    cmd: RunCommand,
+    config: CliConfig,
+) -> ferrum_execution::ExecutorBuildResult<()> {
+    config.profile_journal.validate()?;
     // Capture user input once, before model selection or device preparation.
     let user_environment = crate::runtime_env::capture_supported_runtime_environment()?;
     let scheduler_slo = config.resolve_scheduler_slo(cmd.scheduler_slo)?;
@@ -1067,7 +1000,8 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
         cmd.scheduler_trace_jsonl.as_ref(),
         cmd.request_dump_dir.as_ref(),
         cmd.profile_sample_rate,
-    );
+    )
+    .with_journal(config.profile_journal)?;
     let memory_sampler = crate::memory_profile::ProcessMemorySampler;
     let product_memory_enabled = product_observability.enabled();
     let process_start_sample = product_memory_enabled
@@ -1133,6 +1067,8 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
     let model_id = product_input.public_model_id.clone();
     let source = product_input.source;
     let mut engine_config = product_input.engine_config;
+    config.apply_output_and_tokenizer_config(&mut engine_config)?;
+    config.apply_profile_journal_config(&mut engine_config)?;
     engine_config.scheduler.slo = scheduler_slo;
     engine_config.numerical_execution =
         config.resolve_numerical_execution(cmd.numerical_profile.as_ref());
@@ -1228,12 +1164,12 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
         &effective_runtime_config,
         &mut engine_config.backend.backend_options,
     )?;
-    let execution_resource_authority = if defined_model.is_some() {
-        ferrum_types::ExecutionResourceAuthority::PlanRuntime
+    let execution_planning_model = if defined_model.is_some() {
+        ferrum_types::ExecutionPlanningModel::CompiledPlan
     } else {
-        ferrum_types::ExecutionResourceAuthority::LegacyEngine
+        ferrum_types::ExecutionPlanningModel::ExecutorManaged
     };
-    if execution_resource_authority == ferrum_types::ExecutionResourceAuthority::LegacyEngine {
+    if execution_planning_model == ferrum_types::ExecutionPlanningModel::ExecutorManaged {
         if let Some((profile, utilization)) =
             run_autosize_for_device(&device, cmd.gpu_memory_utilization)
         {
@@ -1248,6 +1184,8 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
             }
             let entries = crate::source_resolver::chat_profile_runtime_entries(
                 &source.local_path,
+                &device,
+                engine_config.kv_cache.dtype,
                 &effective_runtime_config,
                 RuntimeConfigSource::Default,
             );
@@ -1268,15 +1206,24 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
         .transpose()?;
     let startup_memory_request = crate::startup::memory_request(
         &device,
-        execution_resource_authority,
+        execution_planning_model,
         cmd.gpu_memory_utilization,
         &effective_runtime_config,
     )?;
     let hardware = crate::startup::hardware_for_request(&device, startup_memory_request.as_ref());
+    let selected_kv_cache_layout = crate::startup::selected_kv_cache_layout(
+        execution_planning_model,
+        model_definition_for_config.as_ref(),
+        Some(&source.local_path),
+        &device,
+        &engine_config,
+        &effective_runtime_config,
+    )?;
     let mut startup_auto_config = run_startup_auto_config(
         hardware,
         typed_model_capabilities,
-        execution_resource_authority,
+        execution_planning_model,
+        selected_kv_cache_layout,
         model_definition_for_config.as_ref(),
         crate::commands::serve::model_weight_bytes_from_path(&source.local_path),
         effective_runtime_config,
@@ -1294,6 +1241,7 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
         .as_ref()
         .and_then(|capture| capture.teacher_forcing.clone());
     engine_config.runtime.vnext_checkpoint_capture = vnext_checkpoint_capture;
+    engine_config.runtime.diagnostic_output_capture = cmd.diagnostic_output_capture.to_config()?;
     if runtime_config_bool(&startup_auto_config.runtime_config, "FERRUM_PAGED_KV")
         .or_else(|| {
             runtime_config_bool(&startup_auto_config.runtime_config, "FERRUM_METAL_PAGED_KV")
@@ -1308,27 +1256,51 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
         .or_else(|| crate::runtime_env::runtime_snapshot_value(&runtime_config, "FERRUM_KV_DTYPE"));
     apply_kv_dtype_override(&mut engine_config, effective_kv_dtype)?;
     let numerical_execution = engine_config.numerical_execution.clone();
-    let engine_result = match (defined_model, model_sources.clone()) {
-        (Some(prepared), _) => {
-            ferrum_engine::create_defined_product_engine(engine_config, prepared).await
-        }
-        (None, Some(sources)) => ferrum_engine::create_product_engine(engine_config, sources).await,
-        (None, None) => ferrum_engine::create_default_engine(engine_config).await,
-    };
+    let feedback = crate::slo_product::ProductExecutionFeedback::prepare(&engine_config)?;
+    let journals = crate::observability_product::ProductJournalSession::prepare(
+        &product_observability,
+        &engine_config,
+    );
+    let engine_result = async {
+        journals.result()?;
+        let scopes = journals.engine_scopes(&engine_config)?;
+        let mut builder =
+            ferrum_engine::EngineBuilder::new(engine_config).with_journal_scopes(scopes);
+        builder = feedback.configure(builder);
+        builder = match (defined_model, model_sources.clone()) {
+            (Some(prepared), _) => builder.with_defined_model(prepared),
+            (None, Some(sources)) => builder.with_model_sources(sources),
+            (None, None) => builder,
+        };
+        builder.build().await
+    }
+    .await;
     let engine = match engine_result {
         Ok(engine) => engine,
         Err(error) => {
+            if let Err(cleanup) = feedback.shutdown().await {
+                tracing::warn!(%cleanup, "failed startup feedback cleanup");
+            }
             crate::commands::serve::write_failed_startup_config_artifacts(
                 &startup_auto_config,
                 product_source_identity.as_ref(),
                 &numerical_execution,
                 cmd.effective_config_json.as_deref(),
                 cmd.decision_trace_jsonl.as_deref(),
-                &error,
+                error.cause(),
             );
+            if let Err(cleanup) = journals.finish().await {
+                tracing::warn!(%cleanup, "failed startup journal cleanup");
+            }
             return Err(error);
         }
     };
+    let engine = crate::observability_product::ProductEngineLifetime::new_with_feedback(
+        engine,
+        journals.clone(),
+        feedback.into_owner(),
+    );
+    let execution_result: Result<()> = async {
     crate::startup::apply_engine_plan(&mut startup_auto_config, engine.config());
     crate::commands::serve::write_startup_config_artifacts(
         &startup_auto_config,
@@ -1461,6 +1433,7 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
             client_id: None,
             session_id: None,
             created_at: Utc::now(),
+            ingress: None,
             api_request: None,
             evidence_request: ferrum_types::InferenceEvidenceRequest {
                 capture_engine_token_timing: product_observability
@@ -1510,6 +1483,7 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
                 let elapsed = start.elapsed().as_secs_f64();
                 if let Err(observability_err) =
                     crate::observability_product::write_actual_run_failure_observability(
+                        &journals,
                         &product_observability,
                         &crate::observability_product::ActualRunFailureObservation {
                             request_id: profile_request_id,
@@ -1545,7 +1519,7 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
             .then(|| memory_sampler.sample())
             .flatten();
         let memory = process_memory_observation_between(memory_before, memory_after.clone());
-        let CollectedRunGeneration {
+        let RunGenerationView {
             request_id: response_request_id,
             raw_text,
             finish_reason,
@@ -1554,19 +1528,23 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
             token_ids: output_token_ids,
             chunk_count,
             execution_evidence,
-        } = generation;
-        if response_request_id != request_id_text {
+        } = generation.view();
+        if response_request_id.to_string() != request_id_text {
             return Err(FerrumError::internal(format!(
                 "run response request id drift: expected {request_id_text}, got {response_request_id}"
             )));
         }
         let raw_response = display_response_text(&raw_text);
-        let parsed = parse_run_model_output(
-            model_output_protocol,
-            &raw_response,
-            prompt_opened_thinking,
-            finish_reason,
+        let projection = RetainedRunProjection::new(
+            generation.session(),
+            parse_run_model_output(
+                model_output_protocol,
+                &raw_response,
+                prompt_opened_thinking,
+                finish_reason,
+            )?,
         )?;
+        let parsed = &projection.parsed;
         let content = display_response_text(&parsed.content);
         let reasoning = parsed
             .reasoning
@@ -1611,7 +1589,7 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
                     reasoning,
                     &one_shot_history,
                     finish_reason,
-                    usage.as_ref(),
+                    usage,
                     tokens,
                     chunk_count,
                     &raw_response,
@@ -1631,7 +1609,8 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
                 .or_else(|| process_start_sample.clone()),
             shutdown_after,
         );
-        crate::observability_product::write_actual_run_observability(
+        let observation_result = crate::observability_product::write_actual_run_observability(
+            &journals,
             &product_observability,
             &crate::observability_product::ActualRunObservation {
                 request_id: profile_request_id,
@@ -1658,10 +1637,12 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
                     cache_allocated_memory.clone(),
                     cache_allocated_status.clone(),
                     shutdown_memory,
-                ),
+                ).into_iter().filter(|stage| stage.stage != "shutdown" || shutdown_result.is_ok()).collect(),
             },
-        )?;
+        );
+        if let Err(error) = &observation_result { tracing::warn!(%error, "final run observation incomplete"); }
         shutdown_result?;
+        observation_result?;
         if format == OutputFormat::Jsonl {
             emit_jsonl_exit(&run_session_id, 0, "one_shot_complete");
         }
@@ -1802,6 +1783,7 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
                     client_id: None,
                     session_id: None,
                     created_at: Utc::now(),
+                    ingress: None,
                     api_request: None,
                     evidence_request: ferrum_types::InferenceEvidenceRequest {
                         capture_engine_token_timing: product_observability
@@ -1882,6 +1864,7 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
                         if product_memory_enabled {
                             if let Err(observability_error) =
                                 crate::observability_product::write_actual_run_failure_observability(
+                                    &journals,
                                     &product_observability,
                                     &crate::observability_product::ActualRunFailureObservation {
                                         request_id: request_id_text,
@@ -1914,7 +1897,7 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
                     .then(|| memory_sampler.sample())
                     .flatten();
                 let memory = process_memory_observation_between(memory_before, memory_after);
-                let CollectedRunGeneration {
+                let RunGenerationView {
                     request_id: response_request_id,
                     raw_text,
                     finish_reason,
@@ -1923,25 +1906,40 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
                     token_ids: output_token_ids,
                     chunk_count,
                     execution_evidence,
-                } = generation;
-                if response_request_id != request_id_text {
+                } = generation.view();
+                if response_request_id.to_string() != request_id_text {
                     return Err(FerrumError::internal(format!(
                         "run response request id drift: expected {request_id_text}, got {response_request_id}"
                     )));
                 }
                 let raw_response = display_response_text(&raw_text);
-                let parsed = parse_run_model_output(
-                    model_output_protocol,
-                    &raw_response,
-                    prompt_opened_thinking,
-                    finish_reason,
+                let projection = RetainedRunProjection::new(
+                    generation.session(),
+                    parse_run_model_output(
+                        model_output_protocol,
+                        &raw_response,
+                        prompt_opened_thinking,
+                        finish_reason,
+                    )?,
                 )?;
+                let parsed = &projection.parsed;
                 let clean_response = display_response_text(&parsed.content);
                 let reasoning = (format == OutputFormat::Jsonl)
                     .then_some(parsed.reasoning.as_deref())
                     .flatten()
-                    .map(|value| value.trim().to_string())
+                    .map(str::trim)
                     .filter(|value| !value.is_empty());
+
+                let assistant_history = if raw_response.is_empty() {
+                    None
+                } else {
+                    Some(RunHistoryMessage::assistant(
+                        generation.session(),
+                        raw_response,
+                        model_output_protocol,
+                        parsed,
+                    )?)
+                };
 
                 if format == OutputFormat::Text
                     && model_output_protocol == ModelOutputProtocol::HarmonyGptOss
@@ -1978,7 +1976,7 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
                             reasoning.as_deref(),
                             &history,
                             finish_reason,
-                            usage.as_ref(),
+                            usage,
                             token_count,
                             chunk_count,
                             &raw_response,
@@ -1989,6 +1987,7 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
 
                 if product_memory_enabled {
                     crate::observability_product::write_actual_run_observability(
+                        &journals,
                         &product_observability,
                         &crate::observability_product::ActualRunObservation {
                             request_id: request_id_text.clone(),
@@ -2004,7 +2003,7 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
                             finish_reason: finish_reason.map(finish_reason_str).map(str::to_string),
                             prompt_chars,
                             response_chars: raw_response.chars().count(),
-                            response_text: raw_response.clone(),
+                            response_text: raw_response,
                             execution_evidence,
                             memory,
                             memory_stages,
@@ -2020,12 +2019,8 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
 
                 // Add to history
                 history.push(RunHistoryMessage::new("user", input));
-                if !raw_response.is_empty() {
-                    history.push(RunHistoryMessage::assistant(
-                        &raw_response,
-                        model_output_protocol,
-                        &parsed,
-                    ));
+                if let Some(message) = assistant_history {
+                    history.push(message);
                 }
 
                 // Limit history
@@ -2056,6 +2051,12 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
     }
     engine.shutdown().await?;
     Ok(())
+    }.await;
+    let cleanup_result = engine.finish().await;
+    if let Err(error) = &cleanup_result {
+        tracing::warn!(%error, "run final cleanup incomplete");
+    }
+    execution_result.and(cleanup_result).map_err(Into::into)
 }
 
 fn process_memory_observation_between(
@@ -2279,6 +2280,13 @@ fn read_tty_input_line(term: &Term) -> io::Result<Option<String>> {
         }
     }
     Ok(Some(chars.into_iter().collect()))
+}
+
+struct FirstTokenIndicator(Option<ProgressBar>);
+impl Drop for FirstTokenIndicator {
+    fn drop(&mut self) {
+        clear_first_token_indicator(&mut self.0);
+    }
 }
 
 fn start_first_token_indicator(enabled: bool) -> Option<ProgressBar> {
@@ -2635,7 +2643,11 @@ fn build_chat_prompt(
     if let Some(sys) = system {
         messages.push(PromptMessage::new("system", sys));
     }
-    messages.extend(history.iter().map(|message| message.prompt.clone()));
+    let mut prompt_copy_leases = Vec::with_capacity(history.len());
+    for message in history {
+        prompt_copy_leases.push(message.reserve_prompt_copy()?);
+        messages.push(message.prompt.clone());
+    }
     messages.push(PromptMessage::new("user", user_input));
     ferrum_server::chat_template::render_prompt_messages_with_options(
         &messages,
@@ -2925,7 +2937,8 @@ fn bool_cli_override(enable: bool, disable: bool) -> Option<bool> {
 fn run_startup_auto_config(
     hardware: ferrum_types::HardwareCapabilities,
     typed_model_capabilities: Option<ModelCapabilities>,
-    execution_resource_authority: ferrum_types::ExecutionResourceAuthority,
+    execution_planning_model: ferrum_types::ExecutionPlanningModel,
+    selected_kv_cache_layout: ferrum_types::SelectedKvCacheLayout,
     model_definition: Option<&ferrum_models::ModelDefinition>,
     model_weight_bytes: Option<u64>,
     runtime_config: RuntimeConfigSnapshot,
@@ -2947,7 +2960,8 @@ fn run_startup_auto_config(
         model,
         hardware,
         workload,
-        execution_resource_authority,
+        execution_planning_model,
+        selected_kv_cache_layout,
         crate::startup::StartupUsage::SingleRequest,
     )
 }
@@ -2993,8 +3007,32 @@ pub fn apply_kv_dtype_override(
 
 #[cfg(test)]
 mod tests {
+    fn test_output_session() -> ferrum_output::OutputSession {
+        ferrum_output::OutputBudget::new(ferrum_types::OutputConfig::default())
+            .unwrap()
+            .try_open_session()
+            .unwrap()
+    }
+
+    fn retained_test_response(response: InferenceResponse) -> ferrum_output::InferenceOutput {
+        let session = test_output_session();
+        ferrum_output::InferenceOutput::new(response, session.try_reserve_semantic(0).unwrap())
+            .unwrap()
+    }
     use super::*;
     use ferrum_types::{RuntimeConfigSource, SequenceFitPolicy, TokenId};
+
+    fn budgeted_test_stream(chunks: Vec<Result<StreamChunk>>) -> RunResponseStream {
+        let budget = ferrum_output::OutputBudget::new(ferrum_types::OutputConfig::default())
+            .expect("valid fixture output budget");
+        let session = budget.try_open_session().expect("fixture output session");
+        let producer = session.clone();
+        let stream = futures::stream::iter(chunks).then(move |chunk| {
+            let session = producer.clone();
+            async move { session.wrap_chunk(chunk?).await }
+        });
+        RunResponseStream::new(session, Box::pin(stream))
+    }
 
     fn default_params(max_tokens: usize) -> SamplingParams {
         SamplingParams {
@@ -3371,6 +3409,7 @@ mod tests {
             decision_trace_jsonl: None,
             observability_vertical_slice_out: None,
             vnext_checkpoint: Default::default(),
+            diagnostic_output_capture: Default::default(),
             profile_jsonl: None,
             profile_detail: crate::observability_product::ProfileDetailArg::Off,
             vnext_diagnostic_fault: None,
@@ -3743,7 +3782,8 @@ mod tests {
             let resolved = run_startup_auto_config(
                 ferrum_types::HardwareCapabilities::unknown(),
                 Some(ModelCapabilities::unknown()),
-                ferrum_types::ExecutionResourceAuthority::PlanRuntime,
+                ferrum_types::ExecutionPlanningModel::CompiledPlan,
+                ferrum_types::SelectedKvCacheLayout::Unknown,
                 None,
                 None,
                 effective,
@@ -4137,22 +4177,87 @@ mod tests {
     }
 
     #[test]
-    fn run_effective_runtime_config_applies_recurrent_state_slots_to_engine_config() {
-        let cmd = test_run_cmd();
-        let snapshot = RuntimeConfigSnapshot::from_entries([RuntimeConfigEntry::new(
-            "FERRUM_RECURRENT_STATE_MAX_SLOTS",
-            "16",
-            RuntimeConfigSource::ConfigFile,
-        )]);
-        let cli_entries = run_startup_cli_runtime_entries(&cmd, None);
-        let effective = run_effective_runtime_config(&snapshot, &cli_entries);
-        let mut engine_config = ferrum_types::EngineConfig::default();
+    fn run_effective_runtime_config_rejects_retired_recurrent_state_slots() {
+        for value in ["0", "16"] {
+            let cmd = test_run_cmd();
+            let snapshot = RuntimeConfigSnapshot::from_entries([RuntimeConfigEntry::new(
+                "FERRUM_RECURRENT_STATE_MAX_SLOTS",
+                value,
+                RuntimeConfigSource::Env,
+            )]);
+            let cli_entries = run_startup_cli_runtime_entries(&cmd, None);
+            let effective = run_effective_runtime_config(&snapshot, &cli_entries);
+            let mut engine_config = ferrum_types::EngineConfig::default();
+            let error = engine_config
+                .apply_runtime_config_snapshot(&effective)
+                .unwrap_err();
+            assert!(
+                error.contains("FERRUM_RECURRENT_STATE_MAX_SLOTS"),
+                "{error}"
+            );
+            assert!(error.contains("retired"), "{error}");
+        }
+    }
 
-        engine_config
-            .apply_runtime_config_snapshot(&effective)
-            .expect("run effective runtime config should apply");
-
-        assert_eq!(engine_config.runtime.recurrent_state_max_slots, Some(16));
+    #[test]
+    fn run_cpu_contiguous_startup_keeps_window_beyond_block_estimate() {
+        let definition = ferrum_models::ModelDefinition {
+            hidden_size: 8,
+            intermediate_size: 16,
+            vocab_size: 16,
+            num_hidden_layers: 1,
+            num_attention_heads: 2,
+            num_key_value_heads: Some(1),
+            max_position_embeddings: 32,
+            ..Default::default()
+        };
+        let window =
+            RuntimeConfigEntry::new("FERRUM_KV_CAPACITY", "32", RuntimeConfigSource::ConfigFile);
+        let requested = RuntimeConfigSnapshot::from_entries([
+            RuntimeConfigEntry::new("FERRUM_KV_MAX_BLOCKS", "1", RuntimeConfigSource::Cli),
+            RuntimeConfigEntry::new("FERRUM_MAX_MODEL_LEN", "32", RuntimeConfigSource::Cli),
+            RuntimeConfigEntry::new("FERRUM_MAX_BATCHED_TOKENS", "32", RuntimeConfigSource::Cli),
+            window.clone(),
+        ]);
+        let device = ferrum_types::Device::CPU;
+        let authority = ferrum_types::ExecutionPlanningModel::ExecutorManaged;
+        let mut engine = ferrum_types::EngineConfig::default();
+        let layout = crate::startup::selected_kv_cache_layout(
+            authority,
+            Some(&definition),
+            None,
+            &device,
+            &engine,
+            &requested,
+        )
+        .unwrap();
+        assert_eq!(layout, ferrum_types::SelectedKvCacheLayout::Contiguous);
+        assert_eq!(engine.runtime.kv_capacity, None);
+        let resolved = run_startup_auto_config(
+            crate::commands::serve::hardware_capabilities_for_device(&device),
+            None,
+            authority,
+            layout,
+            Some(&definition),
+            None,
+            requested,
+        )
+        .expect("CPU contiguous state is not bounded by a paged block estimate");
+        assert_eq!(resolved.model_capabilities.max_context_len, Some(32));
+        assert!(resolved.runtime_config.entries.contains(&window));
+        engine
+            .apply_runtime_config_snapshot(&resolved.runtime_config)
+            .unwrap();
+        assert_eq!(engine.runtime.llama.kv_max_blocks, Some(1));
+        assert_eq!(engine.runtime.kv_capacity, Some(32));
+        assert_eq!(engine.runtime.max_model_len, Some(32));
+        assert_eq!(engine.batching.max_num_batched_tokens, 32);
+        let document = resolved.effective_config_document();
+        assert_eq!(document["selected_kv_capacity"], 32);
+        assert_eq!(
+            document["selected_kv_capacity_source"],
+            "configured_token_limit"
+        );
     }
 
     #[test]
@@ -4160,7 +4265,8 @@ mod tests {
         let resolved = run_startup_auto_config(
             crate::commands::serve::hardware_capabilities_for_device(&ferrum_types::Device::CPU),
             None,
-            ferrum_types::ExecutionResourceAuthority::LegacyEngine,
+            ferrum_types::ExecutionPlanningModel::ExecutorManaged,
+            ferrum_types::SelectedKvCacheLayout::Unknown,
             None,
             None,
             RuntimeConfigSnapshot::from_entries(Vec::new()),
@@ -4448,7 +4554,9 @@ mod tests {
                 .map(|(index, _)| index)
                 .chain(std::iter::once(raw.len()))
             {
-                let mut output = RunStreamOutput::new(ModelOutputProtocol::GemmaThought, opened);
+                let mut output = RunStreamOutput::new(ModelOutputProtocol::GemmaThought, opened)
+                    .bind_session(&test_output_session())
+                    .unwrap();
                 let mut cumulative = String::new();
                 let mut visible = String::new();
                 for chunk in [&raw[..split], &raw[split..]] {
@@ -4477,7 +4585,9 @@ mod tests {
 
     #[test]
     fn gemma_run_stream_delivers_plain_content_early_and_rejects_unknown_channels() {
-        let mut output = RunStreamOutput::new(ModelOutputProtocol::GemmaThought, false);
+        let mut output = RunStreamOutput::new(ModelOutputProtocol::GemmaThought, false)
+            .bind_session(&test_output_session())
+            .unwrap();
         assert_eq!(
             output.delta("Hello.", "Hello.").unwrap().as_deref(),
             Some("Hello.")
@@ -4515,6 +4625,7 @@ mod tests {
             "<think>why</think>answer",
             12.5,
         );
+        let record = serde_json::to_value(record).unwrap();
         assert_eq!(record["schema_version"], RUN_JSONL_SCHEMA_VERSION);
         assert_eq!(record["session_id"], "session-1");
         assert_eq!(record["history_epoch"], 2);
@@ -4557,13 +4668,20 @@ mod tests {
             raw,
             0.0,
         );
+        let record = serde_json::to_value(record).unwrap();
 
         assert_eq!(record["content"], r#"{"text":"<think>literal</think>"}"#);
         assert_eq!(record["reasoning"], "reason");
         assert_eq!(record["raw_text_sha256"], sha256_text(raw));
 
         // Text history remains raw; these parsed fields belong to JSONL output.
-        let history = RunHistoryMessage::assistant(raw, ModelOutputProtocol::Text, &parsed);
+        let history = RunHistoryMessage::assistant(
+            &test_output_session(),
+            raw,
+            ModelOutputProtocol::Text,
+            &parsed,
+        )
+        .unwrap();
         assert_eq!(history.prompt.content, raw);
         assert!(history.prompt.reasoning_content.is_none());
     }
@@ -4585,6 +4703,7 @@ mod tests {
     fn jsonl_v2_delta_preserves_utf8_bytes_and_request_binding() {
         let record =
             jsonl_assistant_delta_record("session-1", 3, "request-1", 4, 2, "🙂", Some(9271));
+        let record = serde_json::to_value(record).unwrap();
         assert_eq!(record["event"], "assistant_delta");
         assert_eq!(record["session_id"], "session-1");
         assert_eq!(record["history_epoch"], 3);
@@ -4626,12 +4745,14 @@ mod tests {
                 })
             })
             .collect::<Vec<_>>();
-            let stream: RunResponseStream = Box::pin(futures::stream::iter(chunks));
+            let stream = budgeted_test_stream(chunks);
             let result = if text_output {
                 collect_run_text_stream(
                     stream,
                     false,
-                    RunStreamOutput::new(ModelOutputProtocol::HarmonyGptOss, false),
+                    RunStreamOutput::new(ModelOutputProtocol::HarmonyGptOss, false)
+                        .bind_session(&test_output_session())
+                        .unwrap(),
                     0,
                     &request_id,
                     false,
@@ -4643,12 +4764,12 @@ mod tests {
             }
             .expect("collect stream with a separately flushed tail");
 
-            assert_eq!(result.raw_text, "hello 尾");
-            assert_eq!(result.finish_reason, Some(FinishReason::Length));
-            assert_eq!(result.token_ids, vec![11]);
-            assert_eq!(result.token_count, 2, "final usage is authoritative");
-            assert_eq!(result.chunk_count, 2);
-            let usage = result.usage.expect("terminal usage");
+            assert_eq!(result.view().raw_text, "hello 尾");
+            assert_eq!(result.view().finish_reason, Some(FinishReason::Length));
+            assert_eq!(result.view().token_ids, &[TokenId::new(11)]);
+            assert_eq!(result.view().token_count, 2, "final usage is authoritative");
+            assert_eq!(result.view().chunk_count, 2);
+            let usage = result.view().usage.expect("terminal usage");
             assert_eq!(usage.prompt_tokens, 7);
             assert_eq!(usage.completion_tokens, 2);
         }
@@ -4681,12 +4802,14 @@ mod tests {
                         })
                     })
                     .collect::<Vec<_>>();
-                let stream: RunResponseStream = Box::pin(futures::stream::iter(chunks));
+                let stream = budgeted_test_stream(chunks);
                 let result = if text_output {
                     collect_run_text_stream(
                         stream,
                         false,
-                        RunStreamOutput::new(ModelOutputProtocol::Text, false),
+                        RunStreamOutput::new(ModelOutputProtocol::Text, false)
+                            .bind_session(&test_output_session())
+                            .unwrap(),
                         0,
                         &request_id,
                         false,
@@ -4731,11 +4854,15 @@ mod tests {
             api_response: None,
             execution_evidence: None,
         };
-        assert!(CollectedRunGeneration::from_response(response.clone()).is_err());
+        assert!(
+            CollectedRunGeneration::from_response(retained_test_response(response.clone()))
+                .is_err()
+        );
         response.finish_reason = FinishReason::Length;
-        let collected = CollectedRunGeneration::from_response(response).unwrap();
-        assert_eq!(collected.raw_text, "partial output before failure");
-        assert_eq!(collected.token_count, 1);
+        let collected =
+            CollectedRunGeneration::from_response(retained_test_response(response)).unwrap();
+        assert_eq!(collected.view().raw_text, "partial output before failure");
+        assert_eq!(collected.view().token_count, 1);
     }
 
     #[test]
@@ -4931,13 +5058,14 @@ mod tests {
             RuntimeConfigSource::MemoryProfile,
         );
         let mut engine = ferrum_types::EngineConfig::default();
-        let authority = ferrum_types::ExecutionResourceAuthority::PlanRuntime;
+        let authority = ferrum_types::ExecutionPlanningModel::CompiledPlan;
         let mut capabilities = ModelCapabilities::unknown();
         capabilities.max_context_len = Some(262_144);
         let resolved = run_startup_auto_config(
             crate::commands::serve::hardware_capabilities_for_device(&ferrum_types::Device::CPU),
             Some(capabilities),
             authority,
+            ferrum_types::SelectedKvCacheLayout::Unknown,
             None,
             None,
             effective,
@@ -5041,6 +5169,8 @@ mod tests {
         let source = tempfile::tempdir().unwrap();
         let entries = crate::source_resolver::chat_profile_runtime_entries(
             source.path(),
+            &ferrum_types::Device::CUDA(0),
+            ferrum_types::KvCacheDtype::Fp16,
             &RuntimeConfigSnapshot::default(),
             RuntimeConfigSource::Default,
         );
@@ -5048,6 +5178,42 @@ mod tests {
         let mut engine = ferrum_types::EngineConfig::default();
         engine.apply_runtime_config_snapshot(&snapshot).unwrap();
         assert_eq!(engine.runtime.kv_capacity, Some(8192));
+    }
+
+    #[test]
+    fn run_cuda_int8_chat_defaults_use_the_resolved_cli_request() {
+        let source = tempfile::tempdir().unwrap();
+        std::fs::write(
+            source.path().join("config.json"),
+            r#"{"model_type":"llama"}"#,
+        )
+        .unwrap();
+        let mut cmd = test_run_cmd();
+        cmd.kv_dtype = Some("int8".to_owned());
+        cmd.kv_capacity = Some(1024);
+        let mut requested = run_effective_runtime_config(
+            &RuntimeConfigSnapshot::default(),
+            &run_startup_cli_runtime_entries(&cmd, None),
+        );
+        let mut engine = ferrum_types::EngineConfig::default();
+        apply_kv_dtype_override(
+            &mut engine,
+            crate::runtime_env::runtime_snapshot_value(&requested, "FERRUM_KV_DTYPE"),
+        )
+        .unwrap();
+        for entry in crate::source_resolver::chat_profile_runtime_entries(
+            source.path(),
+            &ferrum_types::Device::CUDA(0),
+            engine.kv_cache.dtype,
+            &requested,
+            RuntimeConfigSource::Default,
+        ) {
+            requested.upsert_entry(entry);
+        }
+        engine.apply_runtime_config_snapshot(&requested).unwrap();
+        assert_eq!(engine.kv_cache.dtype, ferrum_types::KvCacheDtype::Int8);
+        assert_eq!(engine.runtime.llama.metal_paged_kv, Some(true));
+        assert_eq!(engine.runtime.kv_capacity, Some(1024));
     }
 
     #[tokio::test]
@@ -5060,13 +5226,14 @@ mod tests {
         )]);
         let effective = requested.clone();
         let mut engine_config = ferrum_types::EngineConfig::default();
-        let authority = ferrum_types::ExecutionResourceAuthority::PlanRuntime;
+        let authority = ferrum_types::ExecutionPlanningModel::CompiledPlan;
         let mut capabilities = ModelCapabilities::unknown();
         capabilities.max_context_len = Some(32_768);
         let resolved = run_startup_auto_config(
             crate::commands::serve::hardware_capabilities_for_device(&ferrum_types::Device::CPU),
             Some(capabilities),
             authority,
+            ferrum_types::SelectedKvCacheLayout::Unknown,
             None,
             None,
             effective,
@@ -5114,7 +5281,8 @@ mod tests {
         let mut resolved = run_startup_auto_config(
             crate::commands::serve::hardware_capabilities_for_device(&ferrum_types::Device::CPU),
             Some(model),
-            ferrum_types::ExecutionResourceAuthority::PlanRuntime,
+            ferrum_types::ExecutionPlanningModel::CompiledPlan,
+            ferrum_types::SelectedKvCacheLayout::Unknown,
             None,
             None,
             run_base_runtime_config(&CliConfig::default(), RuntimeConfigSnapshot::default()),
@@ -5282,7 +5450,8 @@ mod tests {
         let resolved = run_startup_auto_config(
             crate::commands::serve::hardware_capabilities_for_device(&ferrum_types::Device::CPU),
             None,
-            ferrum_types::ExecutionResourceAuthority::PlanRuntime,
+            ferrum_types::ExecutionPlanningModel::CompiledPlan,
+            ferrum_types::SelectedKvCacheLayout::Unknown,
             None,
             None,
             effective,
@@ -5641,7 +5810,13 @@ mod tests {
                     .unwrap();
             let history = vec![
                 RunHistoryMessage::new("user", "17+25?"),
-                RunHistoryMessage::assistant(raw, template.output_protocol, &parsed),
+                RunHistoryMessage::assistant(
+                    &test_output_session(),
+                    raw,
+                    template.output_protocol,
+                    &parsed,
+                )
+                .unwrap(),
             ];
             let plan = build_run_prompt_plan(
                 &history,
@@ -5685,6 +5860,7 @@ mod tests {
                 raw,
                 1.0,
             );
+            let record = serde_json::to_value(record).unwrap();
             assert_eq!(record["content"], content);
             assert_eq!(record["raw_text_sha256"], sha256_text(raw));
             assert_eq!(record["finish_reason"], finish_reason_str(finish_reason));
@@ -5743,7 +5919,13 @@ mod tests {
             .unwrap();
             let history = vec![
                 RunHistoryMessage::new("user", "123+456?"),
-                RunHistoryMessage::assistant(raw, template.output_protocol, &parsed),
+                RunHistoryMessage::assistant(
+                    &test_output_session(),
+                    raw,
+                    template.output_protocol,
+                    &parsed,
+                )
+                .unwrap(),
             ];
             assert_eq!(history[1].prompt.content, content);
             assert_eq!(history[1].prompt.reasoning_content.as_deref(), reasoning);
@@ -5793,10 +5975,12 @@ mod tests {
             )
             .unwrap();
             let history = [RunHistoryMessage::assistant(
+                &test_output_session(),
                 raw,
                 ModelOutputProtocol::Text,
                 &parsed,
-            )];
+            )
+            .unwrap()];
             let prompt = build_chat_prompt(
                 &history,
                 "Continue.",

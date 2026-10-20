@@ -7,32 +7,73 @@
 
 use std::collections::HashMap;
 
-use ferrum_execution::model_executor::ExecutorSamplingOutput;
+mod capacity;
+
+#[cfg(test)]
+use ferrum_execution::model_executor::{ExecutorSamplingOutput, LogitsReturnPolicy};
 use ferrum_execution::token_execution::*;
 
 use super::*;
-use crate::common::llm::{catch_host_execution, ModelTokenOutcome, ModelTokenWork};
+use crate::common::llm::{
+    catch_host_execution, ModelKvPreparation, ModelKvReservation, ModelTokenInput,
+    ModelTokenOutcome, ModelTokenProduct, ModelTokenWork,
+};
 
 #[derive(Default)]
 pub(super) struct TokenSequences {
     live: HashMap<ExecutorSequence, TokenSequence>,
+    /// Sealed under the same lock as every inline admission/work preflight.
+    /// Worker shutdown uses this same gate, including before it is first spawned.
+    closing: bool,
+}
+
+impl TokenSequences {
+    pub(super) fn seal(&mut self) {
+        self.closing = true;
+        for entry in self.live.values_mut() {
+            entry.closing = true;
+        }
+    }
+
+    pub(super) fn is_closing(&self) -> bool {
+        self.closing
+    }
 }
 
 struct TokenSequence {
     request_id: RequestId,
     cache_id: String,
-    prompt: Vec<u32>,
+    prompt: Arc<[u32]>,
     maximum_tokens: usize,
     product_prompt_tokens: usize,
     replayed_output_tokens: usize,
     frontier: ExecutionFrontier,
     recovery_key: ExecutionRecoveryKey,
-    adapter: Option<ActiveLoraAdapter>,
-    prepared: bool,
     closing: bool,
+    device: Option<device_state::DeviceSequenceState>,
 }
 
 impl TokenSequence {
+    fn validate_close(&self, reason: ExecutionEndReason) -> Result<()> {
+        if let ExecutionEndReason::Completed {
+            input_tokens,
+            output_tokens,
+        } = reason
+        {
+            if input_tokens != self.product_prompt_tokens
+                || output_tokens < self.replayed_output_tokens
+                || input_tokens
+                    .checked_add(output_tokens.saturating_sub(1))
+                    .is_none_or(|consumed| consumed > self.maximum_tokens)
+            {
+                return Err(FerrumError::request_validation(
+                    "token completion usage differs from immutable admission",
+                ));
+            }
+        }
+        Ok(())
+    }
+
     fn validate_work(&self, input: &ExecutionWork<'_>) -> Result<()> {
         if self.closing || input.expected_frontier() != &self.frontier {
             return Err(FerrumError::request_validation(
@@ -58,12 +99,47 @@ impl TokenSequence {
 }
 
 impl LlmExecutor {
+    pub(super) fn token_device_worker(&self) -> Result<&super::device_worker::LlmDeviceWorker> {
+        self.token_worker
+            .get_or_init(|| {
+                let state = Arc::new(TokenWorkerState::new(self)?);
+                super::device_worker::LlmDeviceWorker::new(state)
+            })
+            .as_ref()
+            .map_err(Clone::clone)
+    }
+
+    pub(super) async fn admit_token_sequence_async(
+        &self,
+        input: ExecutionAdmission<'_>,
+    ) -> Result<TokenAdmissionOutcome> {
+        match self.token_execution_mode {
+            ModelTokenExecutionMode::ManagedWorker => {
+                self.token_device_worker()?
+                    .admit(input, self.gen_cache_id())
+                    .await
+            }
+            ModelTokenExecutionMode::InlineSynchronous => self.admit_token_sequence(input),
+            ModelTokenExecutionMode::Unsupported => Err(FerrumError::unsupported(
+                "model/backend has not qualified token execution",
+            )),
+        }
+    }
+
     pub(super) fn admit_token_sequence(
         &self,
         input: ExecutionAdmission<'_>,
     ) -> Result<TokenAdmissionOutcome> {
         input.validate()?;
+        if self.token_execution_mode != ModelTokenExecutionMode::InlineSynchronous {
+            return Err(FerrumError::unsupported(
+                "model/backend has not qualified synchronous token execution",
+            ));
+        }
         let mut sequences = self.token_sequences.lock();
+        if sequences.closing {
+            return Err(FerrumError::request_validation("model executor is closing"));
+        }
         if sequences
             .live
             .values()
@@ -73,12 +149,7 @@ impl LlmExecutor {
                 "request already has a live token incarnation",
             ));
         }
-        let mut model = self.lock_model();
-        if !model.supports_direct_token_execution() {
-            return Err(FerrumError::unsupported(
-                "model/backend has not implemented the direct token lifecycle",
-            ));
-        }
+        let mut model = self.lock_model()?;
         let context = input.context;
         if context.maximum_sequence_tokens > model.kv_capacity()
             || context.maximum_sequence_tokens > u32::MAX as usize
@@ -112,11 +183,16 @@ impl LlmExecutor {
         let sequence = self.token_issuer.issue_sequence()?;
         let frontier = self.token_issuer.frontier(&sequence, 0)?;
         let recovery_key = self.token_issuer.recovery_key(&sequence)?;
+        let cache_id = self.gen_cache_id();
+        // Keep the incarnation reachable before preparing any physical KV.
+        // It becomes externally usable only after the model has reserved the
+        // prompt and bound the already-loaded adapter. Failed preparation is
+        // retired through the same actual model owner, never a global reset.
         sequences.live.insert(
-            sequence,
+            sequence.clone(),
             TokenSequence {
                 request_id: context.request_id.clone(),
-                cache_id: self.gen_cache_id(),
+                cache_id: cache_id.clone(),
                 prompt: context
                     .input_tokens
                     .iter()
@@ -127,12 +203,57 @@ impl LlmExecutor {
                 replayed_output_tokens: context.replayed_output_tokens,
                 frontier: frontier.clone(),
                 recovery_key,
-                adapter,
-                prepared: false,
                 closing: false,
+                device: None,
             },
         );
-        Ok(TokenAdmissionOutcome::Admitted(frontier))
+        let prompt = Arc::clone(&sequences.live[&sequence].prompt);
+        let preparation = catch_host_execution(|| -> Result<ModelKvReservation> {
+            model.prepare_token_kv(ModelKvPreparation {
+                cache_id: &cache_id,
+                capacity_hint: context.maximum_sequence_tokens,
+                prompt: &prompt,
+                adapter: adapter.as_ref(),
+            })
+        })
+        .and_then(|result| result);
+        match preparation {
+            Ok(ModelKvReservation::Reserved(_)) => Ok(TokenAdmissionOutcome::Admitted(frontier)),
+            result => {
+                let cleanup_error =
+                    match self.close_token_locked(&mut sequences, &mut **model, &sequence) {
+                        Err(error) => Some(error),
+                        Ok(closed) => closed.error.or_else(|| {
+                            (!matches!(closed.disposition, ExecutionCloseDisposition::Ended(_)))
+                                .then(|| {
+                                    FerrumError::backend(
+                                        "token admission cleanup remains held by the model",
+                                    )
+                                })
+                        }),
+                    };
+                if let Some(cleanup_error) = cleanup_error {
+                    // Keep the primary error's actual variant/panic detail.
+                    // FerrumError has no source stack, so report the separate
+                    // cleanup failure while its original owner stays reachable
+                    // through the closing registry entry.
+                    tracing::error!(
+                        request_id = %context.request_id,
+                        primary_error = ?result.as_ref().err(),
+                        %cleanup_error,
+                        "token admission cleanup failed; model ownership retained",
+                    );
+                    return Err(result.err().unwrap_or(cleanup_error));
+                }
+                match result {
+                    Ok(ModelKvReservation::CapacityDeferred(deferred)) => {
+                        Ok(TokenAdmissionOutcome::CapacityDeferred(deferred))
+                    }
+                    Err(error) => Err(error),
+                    Ok(ModelKvReservation::Reserved(_)) => unreachable!(),
+                }
+            }
+        }
     }
 
     pub(super) fn execute_token_batch(
@@ -141,6 +262,9 @@ impl LlmExecutor {
     ) -> Result<ExecutionBatchOutcome> {
         let batch = self.token_issuer.batch(inputs, self.info.vocab_size)?;
         let mut sequences = self.token_sequences.lock();
+        if sequences.closing {
+            return Err(FerrumError::request_validation("model executor is closing"));
+        }
         // Reject foreign, stale or malformed members across the whole input
         // before any reservation or numerical operation mutates the model.
         for input in inputs {
@@ -150,7 +274,7 @@ impl LlmExecutor {
                 .ok_or_else(|| FerrumError::request_validation("token incarnation is not live"))?
                 .validate_work(input)?;
         }
-        let mut model = self.lock_model();
+        let mut model = self.lock_model()?;
         let mut completed = Vec::with_capacity(inputs.len());
         let mut remaining = Vec::new();
         let mut causes = Vec::new();
@@ -179,20 +303,12 @@ impl LlmExecutor {
                     ))
                 }
             };
-            let preparation = catch_host_execution(|| -> Result<()> {
-                if !entry.prepared {
-                    model.prepare_kv_capacity(&entry.cache_id, entry.maximum_tokens);
-                }
-                model.reserve_kv_slots(&[KvSlotRequest {
+            let preparation = catch_host_execution(|| {
+                model.reserve_token_kv_slots(&[KvSlotRequest {
                     cache_id: entry.cache_id.clone(),
                     target_len: range.end(),
                     admission_target_len: Some(entry.prompt.len().max(range.end())),
-                }])?;
-                if !entry.prepared {
-                    model.set_lora_adapter_for_cache(&entry.cache_id, entry.adapter.clone())?;
-                    entry.prepared = true;
-                }
-                Ok(())
+                }])
             })
             .and_then(|result| result);
             let actual = match input.work() {
@@ -202,9 +318,12 @@ impl LlmExecutor {
                 },
                 TokenWork::Decode { position, .. } => ExecutedTokenWork::Decode { position },
             };
-            let outcome = match preparation {
+            let outcome: ModelTokenOutcome<ModelTokenProduct> = match preparation {
                 Err(error) => ModelTokenOutcome::NotSubmitted(error),
-                Ok(()) => {
+                Ok(ModelKvReservation::CapacityDeferred(deferred)) => {
+                    ModelTokenOutcome::CapacityDeferred(deferred)
+                }
+                Ok(ModelKvReservation::Reserved(_)) => {
                     let work = match input.work() {
                         TokenWork::Prefill(chunk) => ModelTokenWork::Prefill {
                             tokens: &entry.prompt[chunk.range()],
@@ -215,10 +334,42 @@ impl LlmExecutor {
                             position: position as u32,
                         },
                     };
-                    model.execute_token_work(&entry.cache_id, work)
+                    model.execute_token_work(&ModelTokenInput {
+                        cache_id: &entry.cache_id,
+                        work,
+                        logits_policy: input.logits_policy(),
+                        sample: !matches!(input.work(), TokenWork::Prefill(chunk) if !chunk.is_final()),
+                    })
                 }
             };
             let (progress, error) = match outcome {
+                ModelTokenOutcome::CapacityDeferred(deferred) => {
+                    // Both original registry and model guards still cover the
+                    // validated frontier. No close or token work occurred for
+                    // this member; earlier serial products remain committed.
+                    let cause_index = causes.len();
+                    causes.push(ExecutionInterruptionCause::Deferred(deferred.into()));
+                    match batch.participant(
+                        index,
+                        ExecutionProgress::NotSubmitted {
+                            stage: NoSubmissionStage::BeforeSubmit,
+                        },
+                        ContinuationDisposition::Retryable(entry.frontier.clone()),
+                        cause_index,
+                    ) {
+                        Ok(participant) => remaining.push(participant),
+                        Err(rejected) => {
+                            let mut outcome = rejected.into_outcome((completed, remaining, causes));
+                            if let ExecutionBatchOutcome::ContractViolation(violation) =
+                                &mut outcome
+                            {
+                                violation.rejected_completions = rejected_completions;
+                            }
+                            return Ok(outcome);
+                        }
+                    }
+                    continue;
+                }
                 ModelTokenOutcome::NotSubmitted(error) => (
                     // Zero execution of this call does not prove the original
                     // frontier is usable (a model KV precheck may disagree).
@@ -235,13 +386,16 @@ impl LlmExecutor {
                     },
                     error,
                 ),
-                ModelTokenOutcome::Terminal(Ok(logits)) => {
-                    let product = match input.work() {
-                        TokenWork::Prefill(chunk) if !chunk.is_final() => {
-                            ExecutionProduct::Intermediate
-                        }
-                        _ => ExecutionProduct::Sampling(ExecutorSamplingOutput::FullLogits(logits)),
-                    };
+                ModelTokenOutcome::Held(error) => (
+                    ExecutionProgress::Unknown {
+                        last_known: LastKnownExecutionStage::EnteredSubmit,
+                        known_executed_range: None,
+                    },
+                    error,
+                ),
+                ModelTokenOutcome::Terminal(Ok(product)) => {
+                    let product =
+                        product.map_or(ExecutionProduct::Intermediate, ExecutionProduct::Sampling);
                     match batch.completion(index, actual, product) {
                         Ok(completion) => {
                             entry.frontier = completion.next_frontier().clone();
@@ -266,12 +420,12 @@ impl LlmExecutor {
                 }
             };
             let cause_index = causes.len();
-            causes.push(error);
+            causes.push(error.into());
             let continuation =
                 match self.close_token_locked(&mut sequences, &mut **model, input.sequence()) {
                     Ok(close) => {
                         if let Some(error) = close.error {
-                            causes.push(error);
+                            causes.push(error.into());
                         }
                         match close.disposition {
                             ExecutionCloseDisposition::Ended(ended) => {
@@ -329,23 +483,8 @@ impl LlmExecutor {
             .live
             .get(sequence)
             .ok_or_else(|| FerrumError::request_validation("token incarnation is not live"))?;
-        if let ExecutionEndReason::Completed {
-            input_tokens,
-            output_tokens,
-        } = reason
-        {
-            if input_tokens != entry.product_prompt_tokens
-                || output_tokens < entry.replayed_output_tokens
-                || input_tokens
-                    .checked_add(output_tokens)
-                    .is_none_or(|total| total > entry.maximum_tokens)
-            {
-                return Err(FerrumError::request_validation(
-                    "token completion usage differs from immutable admission",
-                ));
-            }
-        }
-        self.close_token_locked(&mut sequences, &mut **self.lock_model(), sequence)
+        entry.validate_close(reason)?;
+        self.close_token_locked(&mut sequences, &mut **self.lock_model()?, sequence)
     }
 
     fn close_token_locked(
@@ -386,7 +525,7 @@ fn contract_violation(
     error: FerrumError,
     completed: Vec<ExecutionCompletion>,
     remaining: Vec<InterruptedParticipant>,
-    causes: Vec<FerrumError>,
+    causes: Vec<ExecutionInterruptionCause>,
     rejected_completions: Vec<CompletionParts>,
 ) -> ExecutionBatchOutcome {
     ExecutionBatchOutcome::ContractViolation(ExecutionContractViolation {
@@ -402,3 +541,12 @@ fn contract_violation(
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod managed_tests;
+
+#[cfg(test)]
+mod qualification_tests;
+
+mod device_state;
+pub(super) use device_state::TokenWorkerState;

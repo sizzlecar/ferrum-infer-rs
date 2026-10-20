@@ -1,7 +1,9 @@
 use super::*;
 
 use ferrum_execution::model_executor::ExecutorPrefillAdmissionReceipt;
-use ferrum_runtime::{CapacityDomainId, DeferredAction};
+use ferrum_runtime::{
+    CapacityAvailabilitySource, CapacityDomainId, CapacityWaitCondition, DeferredAction,
+};
 use ferrum_types::{ModelId, SamplingParams};
 use serde::Deserialize;
 
@@ -123,6 +125,7 @@ enum HistoricalPressureTransitionKind {
     YieldPlanned,
     YieldAborted,
     ReleaseFenceArmed,
+    ReleaseObservationFailed,
     ReleaseFenceCompleted,
     FrontierResumable,
     OwnerAdmissionPending,
@@ -143,6 +146,7 @@ impl From<PressureTransitionKind> for HistoricalPressureTransitionKind {
             PressureTransitionKind::YieldPlanned => Self::YieldPlanned,
             PressureTransitionKind::YieldAborted => Self::YieldAborted,
             PressureTransitionKind::ReleaseFenceArmed => Self::ReleaseFenceArmed,
+            PressureTransitionKind::ReleaseObservationFailed => Self::ReleaseObservationFailed,
             PressureTransitionKind::ReleaseFenceCompleted => Self::ReleaseFenceCompleted,
             PressureTransitionKind::FrontierResumable => Self::FrontierResumable,
             PressureTransitionKind::OwnerAdmissionPending => Self::OwnerAdmissionPending,
@@ -302,6 +306,7 @@ fn request(_role: HistoricalRequestRole, request_id: RequestId) -> InferenceRequ
         client_id: None,
         session_id: None,
         created_at: chrono::Utc::now(),
+        ingress: None,
         api_request: None,
         evidence_request: Default::default(),
         metadata: std::collections::HashMap::new(),

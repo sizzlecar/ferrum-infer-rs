@@ -637,6 +637,45 @@ impl VNextDiagnosticFault {
     }
 }
 
+/// One observed output row from an unchanged execution and consumed history.
+/// This diagnostic does not retain new values or select an execution policy.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RetainedOutputCaptureConfig {
+    pub output_dir: PathBuf,
+    pub prompt_token_count: usize,
+    pub prompt_token_sha256: String,
+    pub source_span: std::ops::Range<u64>,
+    pub consumed_history_sha256: String,
+    pub maximum_readback_bytes: u64,
+}
+
+impl RetainedOutputCaptureConfig {
+    pub const MAXIMUM_READBACK_BYTES: u64 = 1024 * 1024;
+
+    pub fn validate(&self) -> Result<(), String> {
+        let digest = |value: &str| {
+            value.len() == 64
+                && value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        };
+        if self.output_dir.as_os_str().is_empty()
+            || self.prompt_token_count == 0
+            || !digest(&self.prompt_token_sha256)
+            || !digest(&self.consumed_history_sha256)
+            || self.source_span.start.checked_add(1) != Some(self.source_span.end)
+            || self.source_span.end <= self.prompt_token_count as u64
+            || usize::try_from(self.source_span.end).is_err()
+            || self.maximum_readback_bytes == 0
+            || self.maximum_readback_bytes > Self::MAXIMUM_READBACK_BYTES
+        {
+            return Err("output capture requires a directory, lowercase SHA256 digests, one decode token after the prompt, and a 1..=1MiB readback budget".into());
+        }
+        Ok(())
+    }
+}
+
 /// Explicit diagnostic capture of semantic vNext activations. Product paths
 /// leave this unset; release tooling must supply a dedicated empty directory.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -712,6 +751,14 @@ impl VNextTeacherForcingConfig {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RuntimeKnobs {
+    #[serde(default)]
+    pub backend_context: crate::BackendContextConfig,
+    /// Retained Llama-family construction controls, never installed globally.
+    #[serde(default)]
+    pub llama: crate::LlamaExecutionOptions,
+    /// Native GPTQ loader diagnostics, scoped to this model's loader.
+    #[serde(default)]
+    pub gptq_gidx_trace: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub startup_memory_request: Option<crate::StartupMemoryRequest>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -720,19 +767,17 @@ pub struct RuntimeKnobs {
     pub max_model_len: Option<usize>,
     pub chunked_prefill_size: Option<usize>,
     pub batch_decode_prof: bool,
-    pub next_batch_prof: bool,
-    pub rbd_prof: bool,
     #[serde(default)]
     pub profile_jsonl: Option<PathBuf>,
     pub scheduler_trace_jsonl: Option<PathBuf>,
     pub legacy_scheduler_trace_jsonl: Option<PathBuf>,
     pub profile_entrypoint: Option<ProfileEntrypoint>,
     pub profile_detail: ObservabilityProfileDetail,
-    pub unified_post_prof: bool,
+    #[serde(default)]
+    pub profile_journal: crate::ObservabilityJournalConfig,
     /// Retain independent vNext sequence-state checkpoints across requests.
     #[serde(default)]
     pub prefix_state_cache_enabled: bool,
-    pub recurrent_state_max_slots: Option<usize>,
     pub attention_execution_policy: AttentionExecutionPolicy,
     /// Host invocation preparation policy; full preparation is the default.
     #[serde(default)]
@@ -783,6 +828,9 @@ pub struct RuntimeKnobs {
     pub tp: Option<usize>,
     #[serde(default)]
     pub vnext_checkpoint_capture: Option<VNextCheckpointCaptureConfig>,
+    /// Read one already-retained output without changing execution selection.
+    #[serde(default)]
+    pub diagnostic_output_capture: Option<RetainedOutputCaptureConfig>,
     #[serde(default)]
     pub vnext_diagnostic_fault: Option<VNextDiagnosticFault>,
 }
@@ -802,6 +850,8 @@ pub struct EngineConfig {
     pub memory: MemoryConfig,
     pub batching: BatchConfig,
     pub monitoring: MonitoringConfig,
+    #[serde(default)]
+    pub output: crate::OutputConfig,
     #[serde(default)]
     pub runtime: RuntimeKnobs,
 }
@@ -823,6 +873,7 @@ impl EngineConfig {
         if let Some(value) = runtime_config_value(snapshot, "FERRUM_KV_MAX_BLOCKS") {
             self.kv_cache.max_blocks =
                 parse_required_positive_usize("FERRUM_KV_MAX_BLOCKS", value)?;
+            self.runtime.llama.kv_max_blocks = Some(self.kv_cache.max_blocks);
         }
         if let Some(value) = runtime_config_value(snapshot, "FERRUM_MAX_BATCHED_TOKENS") {
             self.batching.max_num_batched_tokens =
@@ -890,12 +941,6 @@ impl EngineConfig {
         if let Some(value) = runtime_config_value(snapshot, "FERRUM_MAX_MODEL_LEN") {
             self.runtime.max_model_len = Some(parse_required_positive_usize(
                 "FERRUM_MAX_MODEL_LEN",
-                value,
-            )?);
-        }
-        if let Some(value) = runtime_config_value(snapshot, "FERRUM_RECURRENT_STATE_MAX_SLOTS") {
-            self.runtime.recurrent_state_max_slots = Some(parse_required_positive_usize(
-                "FERRUM_RECURRENT_STATE_MAX_SLOTS",
                 value,
             )?);
         }
@@ -1012,9 +1057,6 @@ impl EngineConfig {
         }
         self.runtime.batch_decode_prof |=
             runtime_config_value(snapshot, "FERRUM_BATCH_DECODE_PROF").is_some();
-        self.runtime.next_batch_prof |=
-            runtime_config_value(snapshot, "FERRUM_NEXT_BATCH_PROF").is_some();
-        self.runtime.rbd_prof |= runtime_config_value(snapshot, "FERRUM_RBD_PROF").is_some();
         if let Some(value) = runtime_config_value(snapshot, "FERRUM_PROFILE_JSONL") {
             self.runtime.profile_jsonl = Some(parse_path_env_value(value)?);
         }
@@ -1044,8 +1086,6 @@ impl EngineConfig {
                     .map_err(|reason| format!("FERRUM_VNEXT_DIAGNOSTIC_FAULT: {reason}"))?,
             );
         }
-        self.runtime.unified_post_prof |=
-            runtime_config_value(snapshot, "FERRUM_UNIFIED_POST_PROF").is_some();
         if let Some(value) = runtime_config_value(snapshot, "FERRUM_PREFIX_CACHE") {
             self.runtime.prefix_state_cache_enabled = parse_bool_env_value(value)
                 .map_err(|reason| format!("FERRUM_PREFIX_CACHE: {reason}"))?;
@@ -1067,12 +1107,56 @@ impl EngineConfig {
             self.runtime.tp = value.parse::<usize>().ok();
         }
 
-        // Publish the resolved snapshot process-wide. Model code (which is not
-        // threaded an EngineConfig) reads `active_runtime_snapshot()` for the
-        // remaining FERRUM_* toggles instead of `std::env`, keeping the env
-        // bridge at this single composition-root call.
-        crate::install_runtime_snapshot(snapshot.clone());
+        self.runtime.llama.apply_runtime_config_snapshot(snapshot);
+        // Validate the same effective policy that model construction will use.
+        // A rank-only snapshot must see an existing explicit TP setting, and
+        // all other legacy overrides keep the single projection precedence.
+        let mut backend_context = self.llama_execution_config().backend_context;
+        backend_context
+            .apply_runtime_config_snapshot(snapshot)
+            .map_err(|error| error.to_string())?;
+        self.runtime.backend_context = backend_context;
+        if runtime_config_value(snapshot, "FERRUM_CUDA_DEVICE").is_some()
+            && matches!(self.backend.device, Device::CUDA(_))
+        {
+            self.backend.device = Device::CUDA(self.runtime.backend_context.device_ordinal);
+        }
+        if let Some(value) = runtime_config_value(snapshot, "FERRUM_GPTQ_GIDX_TRACE") {
+            self.runtime.gptq_gidx_trace = value == "1";
+        }
         Ok(())
+    }
+
+    /// Freeze model construction options before opening or loading weights.
+    pub fn llama_execution_config(&self) -> crate::LlamaExecutionConfig {
+        let mut backend_context = self.runtime.backend_context.clone();
+        // Existing explicit product fields remain authoritative during cold
+        // assembly. The constructed backend reads only this frozen value.
+        // CPU/Metal have no ordinal and must not inherit a CUDA environment
+        // selection captured for another backend.
+        backend_context.device_ordinal = self.backend.device.index().unwrap_or(0);
+        if let Some(dtype) = &self.runtime.metal_dtype {
+            backend_context.metal.prefer_f16_weights = dtype.eq_ignore_ascii_case("f16");
+        }
+        if let Some(world_size) = self.runtime.tp {
+            backend_context.collective.world_size = world_size;
+        }
+        if let Some(capacity) = self.runtime.kv_capacity {
+            backend_context.cuda.kv_capacity = capacity;
+        }
+        if backend_context.cuda.split_k_attn.is_none() {
+            backend_context.cuda.split_k_attn = self.runtime.llama.split_k_attn;
+        }
+        // Preserve explicit conflicts for LlamaExecutionConfig::validate;
+        // the model alias must not silently replace the backend policy.
+        crate::LlamaExecutionConfig {
+            backend_context,
+            kv_capacity: self.runtime.kv_capacity,
+            paged_max_seqs: self.scheduler.max_running_requests,
+            prefix_cache: self.runtime.prefix_state_cache_enabled,
+            batched_graph: self.backend.enable_cuda_graphs,
+            options: self.runtime.llama.clone(),
+        }
     }
 }
 
@@ -1111,10 +1195,16 @@ pub struct SchedulerSloConfig {
     pub tpot_ms: f64,
     #[serde(deserialize_with = "deserialize_slo_milliseconds")]
     pub itl_ms: f64,
+    #[serde(default)]
+    pub reference: crate::ReferenceEstimatorConfig,
+    #[serde(default)]
+    pub unknown_cost: crate::UnknownCostPolicy,
 }
 
 impl SchedulerSloConfig {
     pub fn validate(&self) -> std::result::Result<(), String> {
+        self.reference.validate()?;
+        self.unknown_cost.validate()?;
         for (name, value) in [
             ("ttft", self.ttft_ms),
             ("tpot", self.tpot_ms),
@@ -1162,6 +1252,8 @@ impl std::str::FromStr for SchedulerSloConfig {
             ttft_ms,
             tpot_ms,
             itl_ms,
+            reference: crate::ReferenceEstimatorConfig::default(),
+            unknown_cost: crate::UnknownCostPolicy::default(),
         };
         slo.validate()?;
         Ok(slo)
@@ -1219,9 +1311,6 @@ pub struct SchedulerConfig {
     /// not restrict pure-prefill iterations. `None` or zero disables the limit.
     #[serde(default)]
     pub active_decode_prefill_token_budget: Option<usize>,
-    /// Emit diagnostic scheduler None/SOME decisions.
-    #[serde(default)]
-    pub scheduler_none_prof: bool,
     /// Non-reserving sequence fit gate used before prefill admission.
     #[serde(default)]
     pub sequence_fit_policy: SequenceFitPolicy,
@@ -1241,7 +1330,6 @@ impl Default for SchedulerConfig {
             prefill_step_chunk: None,
             active_decode_prefill_chunk: None,
             active_decode_prefill_token_budget: None,
-            scheduler_none_prof: false,
             sequence_fit_policy: SequenceFitPolicy::default(),
         }
     }
@@ -1256,6 +1344,9 @@ impl SchedulerConfig {
         &mut self,
         snapshot: &RuntimeConfigSnapshot,
     ) -> std::result::Result<(), String> {
+        snapshot
+            .validate_retired_options()
+            .map_err(|(key, reason)| format!("{key}: {reason}"))?;
         if let Some(value) = runtime_config_value(snapshot, "FERRUM_PREFIX_RENDEZVOUS_MAX_WAIT_MS")
         {
             self.prefix_rendezvous_max_wait_ms = Some(
@@ -1287,10 +1378,6 @@ impl SchedulerConfig {
         {
             self.active_decode_prefill_token_budget =
                 parse_optional_positive_usize("FERRUM_ACTIVE_DECODE_PREFILL_TOKEN_BUDGET", value)?;
-        }
-        if let Some(value) = runtime_config_value(snapshot, "FERRUM_SCHED_NONE_PROF") {
-            self.scheduler_none_prof = parse_presence_bool(value)
-                .map_err(|reason| format!("FERRUM_SCHED_NONE_PROF: {reason}"))?;
         }
         if let Some(value) = runtime_config_value(snapshot, "FERRUM_SEQUENCE_FIT_POLICY") {
             self.sequence_fit_policy = SequenceFitPolicy::parse_runtime_value(value)
@@ -1724,9 +1811,41 @@ pub enum BackendType {
     Custom,
 }
 
+/// Shared tokenizer-instance cache policy, independent of request output credit.
+/// Either zero disables caching; it never means an unlimited cache.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct TokenizerDecodeCacheConfig {
+    pub max_entries: usize,
+    /// Retained token IDs (four bytes each) plus decoded UTF-8 text bytes.
+    pub max_bytes: usize,
+}
+
+impl Default for TokenizerDecodeCacheConfig {
+    fn default() -> Self {
+        Self {
+            max_entries: 1000,
+            max_bytes: 64 * 1024 * 1024,
+        }
+    }
+}
+
+impl TokenizerDecodeCacheConfig {
+    pub fn validate(&self) -> crate::Result<()> {
+        if self.max_bytes > isize::MAX as usize || self.max_entries > isize::MAX as usize {
+            return Err(crate::FerrumError::config(
+                "tokenizer decode cache limits exceed addressable storage",
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// Tokenizer configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TokenizerConfig {
+    #[serde(default)]
+    pub decode_cache: TokenizerDecodeCacheConfig,
     /// Tokenizer type
     pub tokenizer_type: TokenizerType,
     /// Path to tokenizer files
@@ -1744,6 +1863,7 @@ pub struct TokenizerConfig {
 impl Default for TokenizerConfig {
     fn default() -> Self {
         Self {
+            decode_cache: TokenizerDecodeCacheConfig::default(),
             tokenizer_type: TokenizerType::BPE,
             tokenizer_path: None,
             enable_fast: true,
@@ -1915,6 +2035,30 @@ impl Default for BatchConfig {
 mod tests {
     use super::*;
     use crate::{RuntimeConfigEntry, RuntimeConfigSource};
+
+    #[test]
+    fn retired_native_overrides_reject_before_mutating_engine_config() {
+        for key in [
+            "FERRUM_MARLIN_TILE",
+            "FERRUM_VLLM_MOE_THREAD_K",
+            "FERRUM_VLLM_MOE_THREAD_N",
+            "FERRUM_VLLM_MOE_BLOCKS_PER_SM",
+        ] {
+            for value in ["", "0", "-1", "128"] {
+                for source in [RuntimeConfigSource::Env, RuntimeConfigSource::ConfigFile] {
+                    let mut config = EngineConfig::default();
+                    let before = serde_json::to_value(&config).unwrap();
+                    let snapshot = RuntimeConfigSnapshot::from_entries([
+                        RuntimeConfigEntry::new("FERRUM_KV_CAPACITY", "1024", source),
+                        RuntimeConfigEntry::new(key, value, source),
+                    ]);
+                    let error = config.apply_runtime_config_snapshot(&snapshot).unwrap_err();
+                    assert!(error.contains(key) && error.contains("retired"), "{error}");
+                    assert_eq!(serde_json::to_value(&config).unwrap(), before);
+                }
+            }
+        }
+    }
 
     #[test]
     fn retired_legacy_moe_controls_reject_before_mutating_engine_config() {
@@ -2659,44 +2803,47 @@ mod tests {
     }
 
     #[test]
-    fn engine_config_applies_recurrent_state_max_slots_runtime_key() {
-        let mut config = EngineConfig::default();
-        let snapshot =
-            RuntimeConfigSnapshot::from_env_vars([("FERRUM_RECURRENT_STATE_MAX_SLOTS", "16")]);
-
-        config
-            .apply_runtime_config_snapshot(&snapshot)
-            .expect("runtime config should apply");
-
-        assert_eq!(config.runtime.recurrent_state_max_slots, Some(16));
+    fn engine_config_rejects_retired_recurrent_state_slots_before_mutation() {
+        for value in ["", "0", "16"] {
+            let mut config = EngineConfig::default();
+            let original = serde_json::to_value(&config).unwrap();
+            let snapshot = RuntimeConfigSnapshot::from_env_vars([
+                ("FERRUM_RECURRENT_STATE_MAX_SLOTS", value),
+                ("FERRUM_KV_MAX_BLOCKS", "123"),
+                ("FERRUM_PAGED_MAX_SEQS", "8"),
+            ]);
+            let error = config.apply_runtime_config_snapshot(&snapshot).unwrap_err();
+            assert!(
+                error.contains("FERRUM_RECURRENT_STATE_MAX_SLOTS"),
+                "{error}"
+            );
+            assert!(error.contains("retired"), "{error}");
+            assert_eq!(serde_json::to_value(&config).unwrap(), original);
+        }
     }
 
     #[test]
     fn engine_config_does_not_apply_removed_qwen35_slot_alias() {
         let mut config = EngineConfig::default();
+        let original = serde_json::to_value(&config).unwrap();
         let snapshot =
             RuntimeConfigSnapshot::from_env_vars([("FERRUM_QWEN35_LINEAR_STATE_MAX_SLOTS", "16")]);
-
-        config
-            .apply_runtime_config_snapshot(&snapshot)
-            .expect("runtime config should apply");
-
-        assert_eq!(config.runtime.recurrent_state_max_slots, None);
+        config.apply_runtime_config_snapshot(&snapshot).unwrap();
+        assert_eq!(serde_json::to_value(&config).unwrap(), original);
     }
 
     #[test]
-    fn engine_config_uses_generic_recurrent_state_slots_when_removed_alias_is_present() {
-        let mut config = EngineConfig::default();
-        let snapshot = RuntimeConfigSnapshot::from_env_vars([
-            ("FERRUM_RECURRENT_STATE_MAX_SLOTS", "8"),
-            ("FERRUM_QWEN35_LINEAR_STATE_MAX_SLOTS", "16"),
-        ]);
-
-        config
-            .apply_runtime_config_snapshot(&snapshot)
-            .expect("runtime config should apply");
-
-        assert_eq!(config.runtime.recurrent_state_max_slots, Some(8));
+    fn engine_config_rejects_retired_recurrent_state_slots_in_serialized_runtime() {
+        for value in [0, 16] {
+            let mut document = serde_json::to_value(EngineConfig::default()).unwrap();
+            document["runtime"]["recurrent_state_max_slots"] = serde_json::json!(value);
+            let error = serde_json::from_value::<EngineConfig>(document).unwrap_err();
+            assert!(error.to_string().contains("unknown field"), "{error}");
+            assert!(
+                error.to_string().contains("recurrent_state_max_slots"),
+                "{error}"
+            );
+        }
     }
 
     #[test]

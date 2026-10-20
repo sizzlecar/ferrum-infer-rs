@@ -36,6 +36,18 @@ impl<B: Backend + BackendQuantGguf> QuantLinear<B> {
         Ok(Self { inner })
     }
 
+    /// Construct using the owning model's execution context.
+    pub fn from_gguf_bytes_in_context(
+        ctx: &mut B::Context,
+        kind: GgufQuantType,
+        bytes: &[u8],
+        out_features: usize,
+        in_features: usize,
+    ) -> Result<Self> {
+        let inner = B::load_quant_in_context(ctx, kind, bytes, out_features, in_features)?;
+        Ok(Self { inner })
+    }
+
     /// Build a fused projection from multiple `(kind, bytes, rows)`
     /// parts that share `in_features`. Each part stays in its own
     /// QuantStore (no byte-concat); forward dispatches one matvec per
@@ -47,6 +59,16 @@ impl<B: Backend + BackendQuantGguf> QuantLinear<B> {
         in_features: usize,
     ) -> Result<Self> {
         let inner = B::load_quant_fused(parts, in_features)?;
+        Ok(Self { inner })
+    }
+
+    /// Construct using the owning model's execution context.
+    pub fn from_gguf_fused_in_context(
+        ctx: &mut B::Context,
+        parts: &[(GgufQuantType, &[u8], usize)],
+        in_features: usize,
+    ) -> Result<Self> {
+        let inner = B::load_quant_fused_in_context(ctx, parts, in_features)?;
         Ok(Self { inner })
     }
 }

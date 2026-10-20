@@ -120,4 +120,13 @@ impl MarlinExpertStack<CpuBackend> for CpuMarlinExpertStack {
             out_features: expert_n,
         }))
     }
+    fn make_expert_linear_in_context(
+        self: Arc<Self>,
+        _ctx: &mut <CpuBackend as crate::backend::Backend>::Context,
+        expert_offset: usize,
+        expert_n: usize,
+        bias_host: Option<&[f32]>,
+    ) -> Result<Box<dyn Linear<CpuBackend> + Send + Sync>> {
+        self.make_expert_linear(expert_offset, expert_n, bias_host)
+    }
 }

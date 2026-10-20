@@ -261,7 +261,10 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           jobs=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/attempts/$GITHUB_RUN_ATTEMPT/jobs?per_page=100")
-          job_id=$(jq -er '[.jobs[] | select(.name == "CPU (Linux)" or .name == "Quality / CPU (Linux)") | select(.status == "in_progress")] | if length == 1 then .[0].id else error("ambiguous CPU producer") end' <<< "$jobs")
+          # Identify the producer within this attempt. API status can lag the
+          # executing job; successful completion is checked by the consumer.
+          job_id=$(jq -er --argjson run "$GITHUB_RUN_ID" --argjson attempt "$GITHUB_RUN_ATTEMPT" \
+            '[.jobs[] | select(.name == "CPU (Linux)" or .name == "Quality / CPU (Linux)") | select(.run_id == $run and .run_attempt == $attempt)] | if length == 1 then .[0].id else error("missing or ambiguous CPU producer") end' <<< "$jobs")
           jq -n --argjson run_id "$GITHUB_RUN_ID" --argjson run_attempt "$GITHUB_RUN_ATTEMPT" \
             --arg head_sha "$GITHUB_SHA" --argjson job_id "$job_id" \
             '{schema_version:1,run_id:$run_id,run_attempt:$run_attempt,head_sha:$head_sha,job_id:$job_id}' \
@@ -293,8 +296,8 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           jobs=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/attempts/$GITHUB_RUN_ATTEMPT/jobs?per_page=100")
-          job_id=$(jq -er --arg suffix "CPU (Linux)" \
-            '[.jobs[] | select(.name | endswith($suffix)) | select(.status == "in_progress")] | if length == 1 then .[0].id else error("ambiguous producer job") end' <<< "$jobs")
+          job_id=$(jq -er --arg name "CPU (Linux)" --argjson run "$GITHUB_RUN_ID" --argjson attempt "$GITHUB_RUN_ATTEMPT" \
+            '[.jobs[] | select(.name == $name or .name == ("Quality / " + $name)) | select(.run_id == $run and .run_attempt == $attempt)] | if length == 1 then .[0].id else error("missing or ambiguous producer job") end' <<< "$jobs")
           mkdir -p "$RUNNER_TEMP/backend-numerics"
           jq -n --argjson run_id "$GITHUB_RUN_ID" --argjson run_attempt "$GITHUB_RUN_ATTEMPT" \
             --arg head_sha "$GITHUB_SHA" --argjson job_id "$job_id" \
@@ -379,8 +382,8 @@ jobs:
       CUDA_COMPUTE_CAP: "89"
       # Build-time, content-addressed component. The resulting ferrum binary
       # links these operators statically and performs no runtime download.
-      NATIVE_OPERATOR_SET_ARCHIVE_URL: https://github.com/sizzlecar/ferrum-infer-rs/releases/download/ferrum-native-cuda12.4-sm89-v6/native-operator-set-cuda12.4-sm89-v6.tar.zst
-      NATIVE_OPERATOR_SET_ARCHIVE_SHA256: d4cdfe8818ed2071dbf8e2fcd3f12263a96f1cb32b542a2b161c99c9fc81584e
+      NATIVE_OPERATOR_SET_ARCHIVE_URL: https://github.com/sizzlecar/ferrum-infer-rs/releases/download/ferrum-native-cuda12.4-sm89-v8/native-operator-set-cuda12.4-sm89-v8.tar.zst
+      NATIVE_OPERATOR_SET_ARCHIVE_SHA256: 977538d1f33e02adfef43e6648cf0749f07b15b238e0b240ad1e3bd338c37d60
     steps:
       - name: Install deps
         run: |
@@ -397,7 +400,7 @@ jobs:
 
       - name: Materialize pinned CUDA native operator set
         run: |
-          archive="$RUNNER_TEMP/native-operator-set-cuda12.4-sm89-v6.tar.zst"
+          archive="$RUNNER_TEMP/native-operator-set-cuda12.4-sm89-v8.tar.zst"
           root="$RUNNER_TEMP/ferrum-native-operator-set"
           curl --fail --location --retry 5 --retry-all-errors \
             --output "$archive" "$NATIVE_OPERATOR_SET_ARCHIVE_URL"
@@ -512,8 +515,8 @@ jobs:
         if: matrix.backend == 'cuda'
         timeout-minutes: 15
         env:
-          NATIVE_OPERATOR_SET_ARCHIVE_URL: https://github.com/sizzlecar/ferrum-infer-rs/releases/download/ferrum-native-cuda12.4-sm89-v6/native-operator-set-cuda12.4-sm89-v6.tar.zst
-          NATIVE_OPERATOR_SET_ARCHIVE_SHA256: d4cdfe8818ed2071dbf8e2fcd3f12263a96f1cb32b542a2b161c99c9fc81584e
+          NATIVE_OPERATOR_SET_ARCHIVE_URL: https://github.com/sizzlecar/ferrum-infer-rs/releases/download/ferrum-native-cuda12.4-sm89-v8/native-operator-set-cuda12.4-sm89-v8.tar.zst
+          NATIVE_OPERATOR_SET_ARCHIVE_SHA256: 977538d1f33e02adfef43e6648cf0749f07b15b238e0b240ad1e3bd338c37d60
         run: |
           # Persist verified bytes outside checkout and the per-job temp directory.
           cache_root="${RUNNER_TOOL_CACHE:?}/ferrum-native-operator-set"
@@ -604,7 +607,7 @@ jobs:
           targets=(--lib --test op_diff --test "vnext_${BACKEND}_checkpoint_continuation" --test gguf_loader_test --test native_safetensors_loader_test)
           if [[ "$BACKEND" == cuda ]]; then
             features="$features,ferrum-kernels/vllm-moe-marlin,ferrum-kernels/vllm-paged-attn-v2"
-            targets+=(--test compressed_tensors_marlin_eq)
+            targets+=(--test compressed_tensors_marlin_eq --test int8_kv_parity)
           fi
           cargo test --locked -p ferrum-kernels -p ferrum-testkit -p ferrum-models -p ferrum-quantization "${targets[@]}" --features "$features" \
             --no-run --message-format=json > "$RUNNER_TEMP/device-contract-artifacts.jsonl"
@@ -619,8 +622,8 @@ jobs:
           BACKEND: ${{ matrix.backend }}
         run: |
           jobs=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/attempts/$GITHUB_RUN_ATTEMPT/jobs?per_page=100")
-          job_id=$(jq -er --arg suffix "GPU runtime ($BACKEND)" \
-            '[.jobs[] | select(.name | endswith($suffix)) | select(.status == "in_progress")] | if length == 1 then .[0].id else error("ambiguous producer job") end' <<< "$jobs")
+          job_id=$(jq -er --arg name "GPU runtime ($BACKEND)" --argjson run "$GITHUB_RUN_ID" --argjson attempt "$GITHUB_RUN_ATTEMPT" \
+            '[.jobs[] | select(.name == $name or .name == ("Quality / " + $name)) | select(.run_id == $run and .run_attempt == $attempt)] | if length == 1 then .[0].id else error("missing or ambiguous producer job") end' <<< "$jobs")
           mkdir -p "$RUNNER_TEMP/backend-numerics"
           jq -n --argjson run_id "$GITHUB_RUN_ID" --argjson run_attempt "$GITHUB_RUN_ATTEMPT" \
             --arg head_sha "$GITHUB_SHA" --argjson job_id "$job_id" \
@@ -855,10 +858,10 @@ jobs:
           $ErrorActionPreference = 'Stop'
           $PSNativeCommandUseErrorActionPreference = $true
           cargo test --locked -p ferrum-types --lib process_memory::tests::process_memory_sampler_returns_valid_resident_bytes -- --exact
-          cargo test --locked -p ferrum-bench-core --lib jsonl_journal::tests::truncate_journal_appends_after_an_external_startup_record -- --exact
-          cargo test --locked -p ferrum-bench-core --lib jsonl_journal::tests::last_handle_drop_closes_and_flushes -- --exact
-          cargo test --locked -p ferrum-bench-core --lib jsonl_journal::tests::explicit_close_drains_joins_and_rejects_new_events -- --exact
-          cargo test --locked -p ferrum-bench-core --lib jsonl_journal::tests::serialization_failure_is_latched_and_returned_by_flush -- --exact
+          cargo test --locked -p ferrum-journal --lib jsonl_journal::tests::truncate_journal_appends_after_an_external_startup_record -- --exact
+          cargo test --locked -p ferrum-journal --lib jsonl_journal::tests::last_handle_drop_closes_and_flushes -- --exact
+          cargo test --locked -p ferrum-journal --lib jsonl_journal::tests::explicit_close_drains_joins_and_rejects_new_events -- --exact
+          cargo test --locked -p ferrum-journal --lib jsonl_journal::tests::serialization_failure_is_latched_and_returned_by_flush -- --exact
       - name: Save Windows build caches
         if: ${{ always() && steps.windows_cache.outputs.cache-primary-key != '' && steps.windows_cache.outputs.cache-hit != 'true' }}
         uses: actions/cache/save@v4

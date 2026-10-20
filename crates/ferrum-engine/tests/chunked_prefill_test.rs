@@ -7,9 +7,7 @@
 
 use ferrum_engine::{ContinuousBatchEngine, LlmInferenceEngine};
 use ferrum_scheduler::implementations::ContinuousBatchScheduler;
-use ferrum_testkit::{
-    ConfigurableModelExecutor, MockKvCacheManager, MockSampler, MockTensorFactory, MockTokenizer,
-};
+use ferrum_testkit::{ConfigurableModelExecutor, MockSampler, MockTokenizer};
 use ferrum_types::{InferenceRequest, SchedulerConfig};
 use std::sync::Arc;
 
@@ -20,17 +18,14 @@ fn make_engine() -> ContinuousBatchEngine {
     let scheduler = Arc::new(ContinuousBatchScheduler::new(SchedulerConfig::default()));
     let tokenizer = Arc::new(MockTokenizer::new(VOCAB));
     let sampler = Arc::new(MockSampler);
-    let kv_cache = Arc::new(MockKvCacheManager::new(1024));
-    let tensor_factory = Arc::new(MockTensorFactory);
-    let executor = Arc::new(ConfigurableModelExecutor::with_eos_after(VOCAB, 3, 2));
+
+    let executor = ConfigurableModelExecutor::with_eos_after(VOCAB, 3, 2);
     ContinuousBatchEngine::new(
         config,
         scheduler,
         tokenizer,
         sampler,
-        kv_cache,
-        executor,
-        tensor_factory,
+        ferrum_execution::executor_lifecycle::ExecutorOwner::new(Box::new(executor)),
     )
     .expect("legacy engine composition must match executor authority")
 }
@@ -61,9 +56,9 @@ async fn baseline_no_chunking() {
     let resp = engine.infer(req).await.expect("baseline infer");
 
     // Mock produces deterministic output independent of chunking; capture it.
-    assert!(!resp.text.is_empty());
+    assert!(!resp.response().text.is_empty());
     // Sanity: generation should include the stop token from the mock.
-    assert!(!resp.tokens.is_empty());
+    assert!(!resp.response().tokens.is_empty());
 }
 
 /// Chunked prefill: same prompt, `FERRUM_CHUNKED_PREFILL=64` → 200 / 64 = 4
@@ -89,12 +84,13 @@ async fn chunked_matches_baseline() {
     std::env::remove_var("FERRUM_CHUNKED_PREFILL");
 
     assert_eq!(
-        baseline.text, chunked.text,
+        baseline.response().text,
+        chunked.response().text,
         "chunked prefill output must match non-chunked baseline"
     );
     assert_eq!(
-        baseline.tokens.len(),
-        chunked.tokens.len(),
+        baseline.response().tokens.len(),
+        chunked.response().tokens.len(),
         "chunked prefill must generate the same number of tokens"
     );
 }
@@ -119,7 +115,7 @@ async fn chunked_small_chunk_size() {
         .expect("chunked infer");
     std::env::remove_var("FERRUM_CHUNKED_PREFILL");
 
-    assert_eq!(baseline.text, chunked.text);
+    assert_eq!(baseline.response().text, chunked.response().text);
 }
 
 /// Chunk size larger than prompt must degrade gracefully to a single prefill.
@@ -132,5 +128,5 @@ async fn chunked_larger_than_prompt_falls_back() {
         .await
         .expect("infer");
     std::env::remove_var("FERRUM_CHUNKED_PREFILL");
-    assert!(!resp.text.is_empty());
+    assert!(!resp.response().text.is_empty());
 }

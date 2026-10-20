@@ -1221,3 +1221,52 @@ fn pretty_final_opener_outscores_a_tool_when_both_branches_are_valid() {
         }
     }
 }
+
+#[test]
+fn composed_retained_growth_covers_wire_offsets_and_reset_replay() {
+    let wire = "<|channel|>commentary to=functions.weather<|constrain|>json<|message|>{\"city\":\"Paris\"}<|call|>";
+    let tokenizer = Arc::new(PacketTokenizer::new(&[wire]));
+    let processor = processor(
+        Arc::clone(&tokenizer),
+        ApiToolCallProtocol::Json,
+        ModelOutputProtocol::HarmonyGptOss,
+        StructuredOutputStart::HarmonyFinal,
+        512,
+    );
+    // Both ordinary tokenization and one merged native terminal packet use the
+    // exact canonical byte table and retain one offset per consumed token.
+    let ordinary = PacketTokenizer::new(&[]).encode(wire, false).unwrap();
+    let merged = vec![TokenId::new(tokenizer.id(wire))];
+    for tokens in [ordinary, merged] {
+        processor.reset().unwrap();
+        assert_eq!(processor.retained_payload_bytes().unwrap(), 0);
+        let credit = tokens
+            .iter()
+            .try_fold(0usize, |bytes, &token| {
+                processor
+                    .retained_token_growth_bound(token)
+                    .map(|additional| bytes + additional)
+            })
+            .unwrap();
+        assert!(processor
+            .is_protocol_complete_with_terminals(&tokens, &tokenizer.terminals())
+            .unwrap());
+        let retained = processor.retained_payload_bytes().unwrap();
+        assert_eq!(
+            retained,
+            wire.len() + tokens.len() * std::mem::size_of::<usize>()
+        );
+        assert!(retained <= credit);
+        // Re-observing the same prefix does not append another retained copy.
+        assert!(processor
+            .is_protocol_complete_with_terminals(&tokens, &tokenizer.terminals())
+            .unwrap());
+        assert_eq!(processor.retained_payload_bytes().unwrap(), retained);
+        processor.reset().unwrap();
+        assert_eq!(processor.retained_payload_bytes().unwrap(), 0);
+        assert!(processor
+            .is_protocol_complete_with_terminals(&tokens, &tokenizer.terminals())
+            .unwrap());
+        assert_eq!(processor.retained_payload_bytes().unwrap(), retained);
+    }
+}

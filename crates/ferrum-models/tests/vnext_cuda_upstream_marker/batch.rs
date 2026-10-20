@@ -580,6 +580,7 @@ impl Fixture {
                 &identity,
                 active.iter(),
                 observation.timing,
+                ExecutionFactsCapture::Off,
                 &uploads,
                 program,
                 SubmissionExecutionPolicy::determinism_replayed(0xa5),
@@ -603,6 +604,7 @@ impl Fixture {
                 &identity,
                 active.iter(),
                 observation.timing,
+                ExecutionFactsCapture::Off,
                 &uploads,
                 policy,
                 preparation_strategy,
@@ -614,7 +616,8 @@ impl Fixture {
             )
             .unwrap()
         };
-        let (handle, attribution) = profiled.into_parts();
+        let (handle, observation) = profiled.into_parts();
+        let (_, attribution, _) = observation.into_parts();
         let segment_publication = handle.take_segment_binding_publication();
         let receipt = match handle
             .wait_with_readback_collection(

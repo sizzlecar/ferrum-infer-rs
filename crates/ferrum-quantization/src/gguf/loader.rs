@@ -31,32 +31,6 @@ use crate::gguf::names::{gate_up_split_parts, qkv_split_parts};
 use crate::loader::WeightLoader;
 use crate::traits::Linear;
 
-const GGUF_LOAD_TRACE_ENV: &str = "FERRUM_GGUF_LOAD_TRACE";
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-struct GgufLoaderRuntimeConfig {
-    load_trace: bool,
-}
-
-impl GgufLoaderRuntimeConfig {
-    fn from_env() -> Self {
-        Self::from_env_vars(std::env::vars())
-    }
-
-    fn from_env_vars<I, K, V>(vars: I) -> Self
-    where
-        I: IntoIterator<Item = (K, V)>,
-        K: Into<String>,
-        V: Into<String>,
-    {
-        Self {
-            load_trace: vars
-                .into_iter()
-                .any(|(name, _value)| name.into() == GGUF_LOAD_TRACE_ENV),
-        }
-    }
-}
-
 /// Backend-generic weight loader for GGUF files.
 ///
 /// Build with [`GgufLoader::open`]. The underlying file stays mmap'd for
@@ -69,7 +43,6 @@ pub struct GgufLoader<B: Backend + BackendQuantGguf + BackendQuantMarlin> {
     /// backend's preferred memory. Going through Metal/CUDA candle paths
     /// would add a cross-allocator hop with no benefit (Phase 1D revisits).
     decode_device: Device,
-    runtime_config: GgufLoaderRuntimeConfig,
     /// `general.architecture` from the file. Name translation is
     /// arch-aware: Gemma 3 reuses the `post_attention_layernorm` ferrum
     /// name for a different GGUF tensor than the Llama families.
@@ -86,7 +59,6 @@ impl<B: Backend + BackendQuantGguf + BackendQuantMarlin> GgufLoader<B> {
         Ok(Self {
             gguf: Arc::new(gguf),
             decode_device: Device::Cpu,
-            runtime_config: GgufLoaderRuntimeConfig::from_env(),
             arch,
             _marker: std::marker::PhantomData,
         })
@@ -99,7 +71,6 @@ impl<B: Backend + BackendQuantGguf + BackendQuantMarlin> GgufLoader<B> {
         Self {
             gguf,
             decode_device: Device::Cpu,
-            runtime_config: GgufLoaderRuntimeConfig::from_env(),
             arch,
             _marker: std::marker::PhantomData,
         }
@@ -184,23 +155,29 @@ impl<B: Backend + BackendQuantGguf + BackendQuantMarlin> GgufLoader<B> {
     /// to 25+ GB in RAM, defeating Q4_K_M entirely. The fast path only
     /// works for Q4K-without-bias which is the vast majority of dense
     /// transformers; bias-bearing fusions (rare) take the eager hit.
-    fn load_fused(&self, parts: &[String]) -> Result<Box<dyn Linear<B>>> {
-        if let Some(fast) = self.try_load_fused_q4k(parts)? {
-            if self.runtime_config.load_trace {
-                eprintln!("[gguf-load] {:?} → fused-Q4 (homogeneous)", parts);
-            }
+    fn load_fused(&self, ctx: &mut B::Context, parts: &[String]) -> Result<Box<dyn Linear<B>>> {
+        if let Some(fast) = self.try_load_fused_q4k(ctx, parts)? {
+            tracing::debug!(
+                route = "fused_q4k",
+                part_count = parts.len(),
+                "Loading fused GGUF weights"
+            );
             return Ok(fast);
         }
-        if let Some(multi) = self.try_load_fused_multi_quant(parts)? {
-            if self.runtime_config.load_trace {
-                eprintln!("[gguf-load] {:?} → MultiQuant (mixed dtype)", parts);
-            }
+        if let Some(multi) = self.try_load_fused_multi_quant(ctx, parts)? {
+            tracing::debug!(
+                route = "fused_multi_quant",
+                part_count = parts.len(),
+                "Loading fused GGUF weights"
+            );
             return Ok(multi);
         }
-        if self.runtime_config.load_trace {
-            eprintln!("[gguf-load] {:?} → eager fp32 fallback ⚠", parts);
-        }
-        self.load_fused_eager(parts)
+        tracing::debug!(
+            route = "eager_f32",
+            part_count = parts.len(),
+            "Loading fused GGUF weights"
+        );
+        self.load_fused_eager(ctx, parts)
     }
 
     /// Multi-quant fused fast path: each part is a Q4_K or Q6_K tensor
@@ -209,7 +186,11 @@ impl<B: Backend + BackendQuantGguf + BackendQuantMarlin> GgufLoader<B> {
     /// `MetalQuantStore::Fused` (or whatever the backend's `Fused`
     /// variant is) so each part stays compact in backend memory and
     /// gemv dispatches per part with output offsets.
-    fn try_load_fused_multi_quant(&self, parts: &[String]) -> Result<Option<Box<dyn Linear<B>>>> {
+    fn try_load_fused_multi_quant(
+        &self,
+        ctx: &mut B::Context,
+        parts: &[String],
+    ) -> Result<Option<Box<dyn Linear<B>>>> {
         let mut spec: Vec<(ferrum_kernels::backend::GgufQuantType, &[u8], usize)> = Vec::new();
         let mut cols_check: Option<usize> = None;
 
@@ -282,16 +263,21 @@ impl<B: Backend + BackendQuantGguf + BackendQuantMarlin> GgufLoader<B> {
             .iter()
             .map(|(kind, bytes, rows)| (*kind, *bytes, *rows))
             .collect();
-        let quant = match crate::QuantLinear::<B>::from_gguf_fused(&parts_view, cols) {
-            Ok(q) => q,
-            Err(_) => return Ok(None), // backend doesn't support Fused
-        };
+        let quant =
+            match crate::QuantLinear::<B>::from_gguf_fused_in_context(ctx, &parts_view, cols) {
+                Ok(q) => q,
+                Err(_) => return Ok(None), // backend doesn't support Fused
+            };
         Ok(Some(Box::new(quant)))
     }
 
     /// Q4_K fast path for `load_fused`. Returns `Ok(None)` if any part
     /// disqualifies (non-Q4K dtype, rank != 2, has bias, cols mismatch).
-    fn try_load_fused_q4k(&self, parts: &[String]) -> Result<Option<Box<dyn Linear<B>>>> {
+    fn try_load_fused_q4k(
+        &self,
+        ctx: &mut B::Context,
+        parts: &[String],
+    ) -> Result<Option<Box<dyn Linear<B>>>> {
         let mut fused_bytes: Vec<u8> = Vec::new();
         let mut total_rows = 0usize;
         let mut cols_check: Option<usize> = None;
@@ -376,7 +362,8 @@ impl<B: Backend + BackendQuantGguf + BackendQuantMarlin> GgufLoader<B> {
         }
 
         let cols = cols_check.ok_or_else(|| FerrumError::model("fusion: no parts"))?;
-        let quant = crate::QuantLinear::<B>::from_gguf_bytes(
+        let quant = crate::QuantLinear::<B>::from_gguf_bytes_in_context(
+            ctx,
             ferrum_kernels::backend::GgufQuantType::Q4K,
             &fused_bytes,
             total_rows,
@@ -387,7 +374,11 @@ impl<B: Backend + BackendQuantGguf + BackendQuantMarlin> GgufLoader<B> {
 
     /// Eager (dequant-to-fp32 then concat) fusion. Used for non-Q4K parts
     /// or parts with bias. See `load_fused` doc for the trade-off.
-    fn load_fused_eager(&self, parts: &[String]) -> Result<Box<dyn Linear<B>>> {
+    fn load_fused_eager(
+        &self,
+        ctx: &mut B::Context,
+        parts: &[String],
+    ) -> Result<Box<dyn Linear<B>>> {
         let mut fused: Vec<f32> = Vec::new();
         let mut fused_bias: Option<Vec<f32>> = None;
         let mut total_rows = 0usize;
@@ -447,122 +438,135 @@ impl<B: Backend + BackendQuantGguf + BackendQuantMarlin> GgufLoader<B> {
         let cols = cols_check.ok_or_else(|| FerrumError::model("fusion: no parts"))?;
         if let Some(bias) = fused_bias {
             return Ok(Box::new(
-                crate::dense::DenseLinear::<B>::from_rows_with_bias(
-                    &fused, &bias, total_rows, cols,
+                crate::dense::DenseLinear::<B>::from_rows_with_bias_in_context(
+                    ctx, &fused, &bias, total_rows, cols,
                 ),
             ));
         }
-        Ok(Box::new(GgufLinear::<B>::from_dense_rows(
-            &fused, total_rows, cols,
+        Ok(Box::new(GgufLinear::<B>::from_dense_rows_in_context(
+            ctx, &fused, total_rows, cols,
         )))
     }
 }
 
 impl<B: Backend + BackendQuantGguf + BackendQuantMarlin> WeightLoader<B> for GgufLoader<B> {
-    fn load_tensor(&self, name: &str) -> Result<B::Buffer> {
+    fn load_tensor(&self, ctx: &mut B::Context, name: &str) -> Result<B::Buffer> {
         let gguf_name = self.locate(name)?;
         let raw = self.read_dequant(&gguf_name)?;
-        Ok(B::from_slice(&raw))
+        Ok(B::from_slice_in_context(ctx, &raw))
     }
 
-    fn load_linear(&self, name: &str) -> Result<Box<dyn Linear<B>>> {
-        // 1) Direct path: <name>.weight exists as a single GGUF tensor.
-        if let Some(gguf_weight) = self.translate(&format!("{name}.weight")) {
-            if self.gguf.has_tensor(&gguf_weight) {
-                // Inspect the on-disk dtype before reading the payload.
-                // Q4_K_M (and future k-quant flavours) get the QuantLinear
-                // path that keeps weights quantised in backend memory;
-                // F16 / F32 / non-Q4-K dtypes fall through to GgufLinear's
-                // eager-dequant DenseLinear path.
-                let info = self.gguf.tensor_info(&gguf_weight).ok_or_else(|| {
-                    FerrumError::model(format!("tensor_info missing for '{gguf_weight}'"))
-                })?;
-                let dims = info.shape.dims();
-                if dims.len() != 2 {
-                    return Err(FerrumError::model(format!(
-                        "GgufLoader::load_linear '{name}': expected rank-2 weight, got rank {}",
-                        dims.len()
-                    )));
-                }
-                let (n_rows, n_cols) = (dims[0], dims[1]);
+    fn load_linear(
+        &self,
+        ctx: &mut B::Context,
+        name: &str,
+    ) -> Result<ferrum_kernels::LoadedLinear<B>> {
+        let linear = (|| -> Result<Box<dyn Linear<B>>> {
+            // 1) Direct path: <name>.weight exists as a single GGUF tensor.
+            if let Some(gguf_weight) = self.translate(&format!("{name}.weight")) {
+                if self.gguf.has_tensor(&gguf_weight) {
+                    // Inspect the on-disk dtype before reading the payload.
+                    // Q4_K_M (and future k-quant flavours) get the QuantLinear
+                    // path that keeps weights quantised in backend memory;
+                    // F16 / F32 / non-Q4-K dtypes fall through to GgufLinear's
+                    // eager-dequant DenseLinear path.
+                    let info = self.gguf.tensor_info(&gguf_weight).ok_or_else(|| {
+                        FerrumError::model(format!("tensor_info missing for '{gguf_weight}'"))
+                    })?;
+                    let dims = info.shape.dims();
+                    if dims.len() != 2 {
+                        return Err(FerrumError::model(format!(
+                            "GgufLoader::load_linear '{name}': expected rank-2 weight, got rank {}",
+                            dims.len()
+                        )));
+                    }
+                    let (n_rows, n_cols) = (dims[0], dims[1]);
 
-                let quant_kind = match info.ggml_dtype {
-                    candle_core::quantized::GgmlDType::Q4K => {
-                        Some(ferrum_kernels::backend::GgufQuantType::Q4K)
+                    let quant_kind = match info.ggml_dtype {
+                        candle_core::quantized::GgmlDType::Q4K => {
+                            Some(ferrum_kernels::backend::GgufQuantType::Q4K)
+                        }
+                        candle_core::quantized::GgmlDType::Q6K => {
+                            Some(ferrum_kernels::backend::GgufQuantType::Q6K)
+                        }
+                        _ => None,
+                    };
+                    if let Some(kind) = quant_kind {
+                        // Read raw block bytes and hand to QuantLinear.
+                        // Bias on quantised projections is rare in GGUF
+                        // (Qwen2.5 attention biases land as F32), so we
+                        // currently take the bias path only when the bias
+                        // tensor is present AND the weight is non-quantised.
+                        // For quantised weights with bias, fall back to
+                        // eager dequant so Phase 1B's bias support keeps
+                        // working.
+                        let has_bias = self
+                            .translate(&format!("{name}.bias"))
+                            .map(|n| self.gguf.has_tensor(&n))
+                            .unwrap_or(false);
+                        if !has_bias {
+                            // Zero-copy: slice the mmap directly. The
+                            // backend's registry (`register_gguf_mmap`)
+                            // recognises the slice as belonging to the
+                            // shared file buffer and returns a `QuantStore`
+                            // that bind-references the big buffer with an
+                            // offset, instead of allocating a fresh device
+                            // copy. Falls back to copy if no registration
+                            // covers this slice.
+                            let bytes =
+                                self.gguf.tensor_byte_slice(&gguf_weight).ok_or_else(|| {
+                                    FerrumError::model(format!(
+                                        "GgufLoader: tensor_byte_slice failed for '{gguf_weight}'"
+                                    ))
+                                })?;
+                            let quant = crate::QuantLinear::<B>::from_gguf_bytes_in_context(
+                                ctx, kind, bytes, n_rows, n_cols,
+                            )?;
+                            return Ok(Box::new(quant));
+                        }
+                        // else fall through to eager-dequant bias path below
                     }
-                    candle_core::quantized::GgmlDType::Q6K => {
-                        Some(ferrum_kernels::backend::GgufQuantType::Q6K)
-                    }
-                    _ => None,
-                };
-                if let Some(kind) = quant_kind {
-                    // Read raw block bytes and hand to QuantLinear.
-                    // Bias on quantised projections is rare in GGUF
-                    // (Qwen2.5 attention biases land as F32), so we
-                    // currently take the bias path only when the bias
-                    // tensor is present AND the weight is non-quantised.
-                    // For quantised weights with bias, fall back to
-                    // eager dequant so Phase 1B's bias support keeps
-                    // working.
-                    let has_bias = self
-                        .translate(&format!("{name}.bias"))
-                        .map(|n| self.gguf.has_tensor(&n))
-                        .unwrap_or(false);
-                    if !has_bias {
-                        // Zero-copy: slice the mmap directly. The
-                        // backend's registry (`register_gguf_mmap`)
-                        // recognises the slice as belonging to the
-                        // shared file buffer and returns a `QuantStore`
-                        // that bind-references the big buffer with an
-                        // offset, instead of allocating a fresh device
-                        // copy. Falls back to copy if no registration
-                        // covers this slice.
-                        let bytes = self.gguf.tensor_byte_slice(&gguf_weight).ok_or_else(|| {
-                            FerrumError::model(format!(
-                                "GgufLoader: tensor_byte_slice failed for '{gguf_weight}'"
-                            ))
-                        })?;
-                        let quant =
-                            crate::QuantLinear::<B>::from_gguf_bytes(kind, bytes, n_rows, n_cols)?;
-                        return Ok(Box::new(quant));
-                    }
-                    // else fall through to eager-dequant bias path below
-                }
 
-                let qt = self
-                    .gguf
-                    .read_tensor(&gguf_weight, &self.decode_device)
-                    .map_err(candle_to_ferrum)?;
-                if let Some(gguf_bias) = self.translate(&format!("{name}.bias")) {
-                    if self.gguf.has_tensor(&gguf_bias) {
-                        let bqt = self
-                            .gguf
-                            .read_tensor(&gguf_bias, &self.decode_device)
-                            .map_err(candle_to_ferrum)?;
-                        let linear = GgufLinear::<B>::from_qtensor_with_bias(&qt, &bqt)
-                            .map_err(candle_to_ferrum)?;
-                        return Ok(Box::new(linear));
+                    let qt = self
+                        .gguf
+                        .read_tensor(&gguf_weight, &self.decode_device)
+                        .map_err(candle_to_ferrum)?;
+                    if let Some(gguf_bias) = self.translate(&format!("{name}.bias")) {
+                        if self.gguf.has_tensor(&gguf_bias) {
+                            let bqt = self
+                                .gguf
+                                .read_tensor(&gguf_bias, &self.decode_device)
+                                .map_err(candle_to_ferrum)?;
+                            let linear =
+                                GgufLinear::<B>::from_qtensor_with_bias_in_context(ctx, &qt, &bqt)
+                                    .map_err(candle_to_ferrum)?;
+                            return Ok(Box::new(linear));
+                        }
                     }
+                    let linear = GgufLinear::<B>::from_qtensor_in_context(ctx, &qt)
+                        .map_err(candle_to_ferrum)?;
+                    return Ok(Box::new(linear));
                 }
-                let linear = GgufLinear::<B>::from_qtensor(&qt).map_err(candle_to_ferrum)?;
-                return Ok(Box::new(linear));
             }
-        }
 
-        // 2) Fusion path: qkv_proj from q_proj/k_proj/v_proj
-        if let Some(layer_prefix) = name.strip_suffix("self_attn.qkv_proj") {
-            let parts = qkv_split_parts(layer_prefix);
-            return self.load_fused(&parts);
-        }
-        // 3) Fusion path: gate_up_proj from gate_proj/up_proj
-        if let Some(layer_prefix) = name.strip_suffix("mlp.gate_up_proj") {
-            let parts = gate_up_split_parts(layer_prefix);
-            return self.load_fused(&parts);
-        }
+            // 2) Fusion path: qkv_proj from q_proj/k_proj/v_proj
+            if let Some(layer_prefix) = name.strip_suffix("self_attn.qkv_proj") {
+                let parts = qkv_split_parts(layer_prefix);
+                return self.load_fused(ctx, &parts);
+            }
+            // 3) Fusion path: gate_up_proj from gate_proj/up_proj
+            if let Some(layer_prefix) = name.strip_suffix("mlp.gate_up_proj") {
+                let parts = gate_up_split_parts(layer_prefix);
+                return self.load_fused(ctx, &parts);
+            }
 
-        Err(FerrumError::model(format!(
+            Err(FerrumError::model(format!(
             "GgufLoader: could not load Linear '{name}' — no direct weight, no split components"
         )))
+        })()?;
+        // SAFETY: these built-in projections own their weights and encode only
+        // backend work; the model retains them until checked graph retirement.
+        Ok(unsafe { ferrum_kernels::LoadedLinear::new_capture_stable(linear) })
     }
 
     fn has_tensor(&self, name: &str) -> bool {
@@ -584,19 +588,4 @@ impl<B: Backend + BackendQuantGguf + BackendQuantMarlin> WeightLoader<B> for Ggu
 
 fn candle_to_ferrum(e: candle_core::Error) -> FerrumError {
     FerrumError::model(format!("candle: {e}"))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn gguf_loader_runtime_config_parses_load_trace_presence() {
-        let cfg =
-            GgufLoaderRuntimeConfig::from_env_vars([(GGUF_LOAD_TRACE_ENV, ""), ("OTHER", "1")]);
-        assert!(cfg.load_trace);
-
-        let cfg = GgufLoaderRuntimeConfig::from_env_vars([("OTHER", "1")]);
-        assert!(!cfg.load_trace);
-    }
 }

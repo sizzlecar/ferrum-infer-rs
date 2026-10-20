@@ -22,38 +22,44 @@
 //
 // Each int8 element is dequantized as `scale * (float)int8_val`.
 //
-// Grid:  (num_q_heads,)
+// Grid:  (num_q_heads, query_rows)
 // Block: (256,)
-// Shared: valid_kv_len * sizeof(float) for attention scores
+// Shared: 3 * valid_kv_len * sizeof(float) for scores and per-head scales
 
 #include "common.cuh"
 
 #define WARP_SIZE 32
 
 extern "C" __global__ void paged_decode_attention_int8(
-    const __half* __restrict__ q,                 // [num_q_heads, head_dim] FP16
+    const __half* __restrict__ q,                 // explicit token/head strides, FP16
     const int8_t* __restrict__ k_block_pool,      // INT8 paged
     const int8_t* __restrict__ v_block_pool,      // INT8 paged
     const __half* __restrict__ k_scales_pool,     // FP16 per-token scales
     const __half* __restrict__ v_scales_pool,     // FP16 per-token scales
     const int*    __restrict__ block_table,       // [max_logical_blocks]
-    __half* __restrict__ output,                  // [num_q_heads, head_dim]
+    __half* __restrict__ output,                  // same layout as Q
     const int num_q_heads,
     const int num_kv_heads,
     const int head_dim,
     const int valid_kv_len,
+    const int query_rows,
+    const int query_token_stride,
+    const int query_head_stride,
     const int block_size,
     const float scale                             // attention scale = 1/sqrt(hd)
 ) {
     const int q_head = blockIdx.x;
+    const int query_row = blockIdx.y;
+    const int visible_kv_len = valid_kv_len - query_rows + query_row + 1;
     const int kv_head = q_head / (num_q_heads / num_kv_heads);
-    const int kv_stride = num_kv_heads * head_dim;
-    const int block_stride = block_size * kv_stride;
-    const int scale_block_stride = block_size * num_kv_heads;
-    const int scale_kv_stride = num_kv_heads;
+    const size_t kv_stride = static_cast<size_t>(num_kv_heads) * head_dim;
+    const size_t block_stride = block_size * kv_stride;
+    const size_t scale_block_stride = static_cast<size_t>(block_size) * num_kv_heads;
+    const size_t scale_kv_stride = num_kv_heads;
 
-    const __half* q_ptr = q + q_head * head_dim;
-    __half* out_ptr = output + q_head * head_dim;
+    const int query_offset = query_row * query_token_stride + q_head * query_head_stride;
+    const __half* q_ptr = q + query_offset;
+    __half* out_ptr = output + query_offset;
 
     // Dynamic shmem layout (caller allocates 3 × valid_kv_len floats):
     //   [0 .. valid_kv_len)             — s_scores  (Q·K^T → softmax → weights)
@@ -74,11 +80,11 @@ extern "C" __global__ void paged_decode_attention_int8(
     // K/V scales into shmem. The (kv_head) component is the same for the
     // whole block — only the (token) varies — so we need one load per
     // kv_pos. Coalesces well: consecutive threads load consecutive kv_pos.
-    for (int kv_pos = threadIdx.x; kv_pos < valid_kv_len; kv_pos += blockDim.x) {
+    for (int kv_pos = threadIdx.x; kv_pos < visible_kv_len; kv_pos += blockDim.x) {
         int logical_block  = kv_pos / block_size;
         int slot           = kv_pos % block_size;
         int physical_block = block_table[logical_block];
-        int scale_offset   = physical_block * scale_block_stride
+        size_t scale_offset = physical_block * scale_block_stride
                            + slot * scale_kv_stride
                            + kv_head;
         s_k_scales[kv_pos] = __half2float(k_scales_pool[scale_offset]);
@@ -101,7 +107,7 @@ extern "C" __global__ void paged_decode_attention_int8(
     __syncthreads();  // wait for s_k_scales / s_v_scales to be visible
 
     // ====== Step 1: Q·K^T (dequantizing K on the fly) ======
-    for (int kv_pos = warp_id; kv_pos < valid_kv_len; kv_pos += num_warps) {
+    for (int kv_pos = warp_id; kv_pos < visible_kv_len; kv_pos += num_warps) {
         int logical_block = kv_pos / block_size;
         int slot = kv_pos % block_size;
         int physical_block = block_table[logical_block];
@@ -129,7 +135,7 @@ extern "C" __global__ void paged_decode_attention_int8(
 
     // ====== Step 2: Softmax (identical to FP16) ======
     float thread_max = -1e20f;
-    for (int i = threadIdx.x; i < valid_kv_len; i += blockDim.x)
+    for (int i = threadIdx.x; i < visible_kv_len; i += blockDim.x)
         thread_max = fmaxf(thread_max, s_scores[i]);
 
     __shared__ float s_global_max;
@@ -139,7 +145,7 @@ extern "C" __global__ void paged_decode_attention_int8(
     float global_max = s_global_max;
 
     float thread_sum = 0.0f;
-    for (int i = threadIdx.x; i < valid_kv_len; i += blockDim.x) {
+    for (int i = threadIdx.x; i < visible_kv_len; i += blockDim.x) {
         float val = expf(s_scores[i] - global_max);
         s_scores[i] = val;
         thread_sum += val;
@@ -152,7 +158,7 @@ extern "C" __global__ void paged_decode_attention_int8(
     __syncthreads();
     float inv_sum = 1.0f / s_global_sum;
 
-    for (int i = threadIdx.x; i < valid_kv_len; i += blockDim.x)
+    for (int i = threadIdx.x; i < visible_kv_len; i += blockDim.x)
         s_scores[i] *= inv_sum;
     __syncthreads();
 
@@ -162,14 +168,14 @@ extern "C" __global__ void paged_decode_attention_int8(
     // vs the original (1 shmem + 1 global v_scale + 1 cast + 2 fma + scalar mul).
     // The fold uses s_scores in-place — safe because no thread re-reads
     // the un-folded values after Step 2's softmax.
-    for (int kv_pos = threadIdx.x; kv_pos < valid_kv_len; kv_pos += blockDim.x) {
+    for (int kv_pos = threadIdx.x; kv_pos < visible_kv_len; kv_pos += blockDim.x) {
         s_scores[kv_pos] *= s_v_scales[kv_pos];
     }
     __syncthreads();
 
     for (int d = threadIdx.x; d < head_dim; d += blockDim.x) {
         float acc = 0.0f;
-        for (int kv_pos = 0; kv_pos < valid_kv_len; kv_pos++) {
+        for (int kv_pos = 0; kv_pos < visible_kv_len; kv_pos++) {
             int logical_block = kv_pos / block_size;
             int slot = kv_pos % block_size;
             int physical_block = block_table[logical_block];
@@ -191,7 +197,7 @@ extern "C" __global__ void paged_decode_attention_int8(
 // `s = max(|x|)/127`, write INT8 quantized values to the paged cache.
 //
 // Layouts:
-//   k_in / v_in  : [num_tokens, num_kv_heads, head_dim] FP16
+//   k_in / v_in  : FP16, explicit token and head element strides
 //   k_out_pool / v_out_pool : same paged INT8 layout as the kernel above
 //   k_scales_pool / v_scales_pool : same FP16 scales
 //   slot_mapping : [num_tokens] i32 — flat KV position for each input token,
@@ -199,7 +205,7 @@ extern "C" __global__ void paged_decode_attention_int8(
 //                  Caller fills this from block_table + per-token (block_idx, slot).
 //
 // Grid:  (num_tokens, num_kv_heads)
-// Block: (head_dim,) — one thread per head element. Assumes head_dim ≤ 256.
+// Block: head_dim rounded up to a full warp, at most 256 threads.
 //
 // Algorithm per (token, kv_head):
 //   1. Each thread holds one head element of K and V.
@@ -217,19 +223,20 @@ extern "C" __global__ void int8_kv_cache_append(
     const int*    __restrict__ slot_mapping,     // i32 [num_tokens]
     const int num_kv_heads,
     const int head_dim,
-    const int num_tokens
+    const int num_tokens,
+    const int input_token_stride,
+    const int input_head_stride
 ) {
     const int token = blockIdx.x;
     const int kv_head = blockIdx.y;
     const int tid = threadIdx.x;
-    if (token >= num_tokens || kv_head >= num_kv_heads || tid >= head_dim) return;
+    if (token >= num_tokens || kv_head >= num_kv_heads) return;
 
     const int slot = slot_mapping[token];
 
-    // Input pointers (token-major, packed by head_dim).
-    const int in_offset = (token * num_kv_heads + kv_head) * head_dim;
-    float kv_k = __half2float(k_in[in_offset + tid]);
-    float kv_v = __half2float(v_in[in_offset + tid]);
+    const int in_offset = token * input_token_stride + kv_head * input_head_stride;
+    float kv_k = tid < head_dim ? __half2float(k_in[in_offset + tid]) : 0.0f;
+    float kv_v = tid < head_dim ? __half2float(v_in[in_offset + tid]) : 0.0f;
 
     // Block-wide max(|x|) for K and V.
     __shared__ float s_max_k, s_max_v;
@@ -282,13 +289,15 @@ extern "C" __global__ void int8_kv_cache_append(
     int8_t qk = (int8_t)__float2int_rn(fmaxf(-127.0f, fminf(127.0f, kv_k * inv_scale_k)));
     int8_t qv = (int8_t)__float2int_rn(fmaxf(-127.0f, fminf(127.0f, kv_v * inv_scale_v)));
 
-    const int out_offset = slot * num_kv_heads * head_dim + kv_head * head_dim + tid;
-    k_out_pool[out_offset] = qk;
-    v_out_pool[out_offset] = qv;
+    const size_t out_offset = static_cast<size_t>(slot) * num_kv_heads * head_dim + kv_head * head_dim + tid;
+    if (tid < head_dim) {
+        k_out_pool[out_offset] = qk;
+        v_out_pool[out_offset] = qv;
+    }
 
     // Thread 0 writes the per-(token, head) scales.
     if (tid == 0) {
-        const int scale_offset = slot * num_kv_heads + kv_head;
+        const size_t scale_offset = static_cast<size_t>(slot) * num_kv_heads + kv_head;
         k_scales_pool[scale_offset] = __float2half(scale_k);
         v_scales_pool[scale_offset] = __float2half(scale_v);
     }

@@ -21,17 +21,34 @@ fn is_panic_payload_boundary(signature: &syn::Signature) -> bool {
     let Some(syn::FnArg::Typed(argument)) = signature.inputs.first() else {
         return false;
     };
-    let syn::Type::Path(box_type) = argument.ty.as_ref() else {
-        return false;
+    // Both owned and borrowed panic payloads are legitimate boundaries. A
+    // borrowed payload lets the caller preserve its original destruction order.
+    let payload_type = match argument.ty.as_ref() {
+        syn::Type::Reference(reference) if reference.mutability.is_none() => {
+            reference.elem.as_ref()
+        }
+        syn::Type::Path(box_type) => {
+            let Some(box_segment) = box_type.path.segments.last() else {
+                return false;
+            };
+            let syn::PathArguments::AngleBracketed(arguments) = &box_segment.arguments else {
+                return false;
+            };
+            if box_segment.ident != "Box" || arguments.args.len() != 1 {
+                return false;
+            }
+            let Some(syn::GenericArgument::Type(payload)) = arguments.args.first() else {
+                return false;
+            };
+            payload
+        }
+        _ => return false,
     };
-    let Some(box_segment) = box_type.path.segments.last() else {
-        return false;
+    let payload_type = match payload_type {
+        syn::Type::Paren(paren) => paren.elem.as_ref(),
+        other => other,
     };
-    let syn::PathArguments::AngleBracketed(arguments) = &box_segment.arguments else {
-        return false;
-    };
-    let Some(syn::GenericArgument::Type(syn::Type::TraitObject(payload))) = arguments.args.first()
-    else {
+    let syn::Type::TraitObject(payload) = payload_type else {
         return false;
     };
     let mut bounds = payload
@@ -49,8 +66,6 @@ fn is_panic_payload_boundary(signature: &syn::Signature) -> bool {
     bounds.sort();
     signature.ident == "panic_message"
         && signature.inputs.len() == 1
-        && box_segment.ident == "Box"
-        && arguments.args.len() == 1
         && bounds == ["Any", "Send"]
         && matches!(&signature.output, syn::ReturnType::Type(_, output)
             if type_path_ends_with(output, "String"))

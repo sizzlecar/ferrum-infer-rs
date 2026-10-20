@@ -1,127 +1,50 @@
 //! EngineInner iteration and request-processing implementation.
 
 use super::*;
+use ferrum_execution::token_execution::{
+    ExecutionAdmission, ExecutionEndReason, TokenAdmissionCapacityDeferral, TokenAdmissionOutcome,
+};
 use ferrum_runtime::DynamicBackingPressure;
 
 mod batch;
-mod completion;
-mod decode;
-mod mixed;
-mod prefill;
+pub(super) mod completion;
 pub(super) mod prefix_rendezvous;
 pub(super) mod prefix_restore;
+mod token_admission;
+mod token_batch;
 
-#[derive(Debug)]
-pub(super) enum PlanRuntimeBatchPrefillDisposition {
-    Completed,
-    PerRequestFallback(Vec<RequestId>),
+/// Retained admission maintenance is an owned obligation even while product
+/// completion/prefix work awaits. An early error or dropped iteration must
+/// cancel those exact pending admissions, not abandon their native owners.
+struct PendingPrefillMaintenance<'a> {
+    executor: &'a (dyn ModelExecutor + Send + Sync),
+    pending: Vec<ExecutorPrefillMaintenanceDeferral>,
 }
 
-pub(super) fn is_resource_exhausted_error(error: &FerrumError) -> bool {
-    matches!(error, FerrumError::ResourceExhausted { .. })
-}
+impl<'a> PendingPrefillMaintenance<'a> {
+    fn new(
+        executor: &'a (dyn ModelExecutor + Send + Sync),
+        pending: Vec<ExecutorPrefillMaintenanceDeferral>,
+    ) -> Self {
+        Self { executor, pending }
+    }
 
-pub(super) fn unaffected_maintenance_retry_frontiers(
-    current_request_ids: &[RequestId],
-    affected_request_ids: &[RequestId],
-) -> Vec<RequestId> {
-    current_request_ids
-        .iter()
-        .filter(|request_id| !affected_request_ids.contains(request_id))
-        .cloned()
-        .collect()
-}
+    fn is_empty(&self) -> bool {
+        self.pending.is_empty()
+    }
 
-#[cfg(test)]
-mod maintenance_retry_scope_tests {
-    use super::unaffected_maintenance_retry_frontiers;
-    use ferrum_types::RequestId;
-
-    #[test]
-    fn maintenance_retry_keeps_healthy_cohort_frontiers_runnable() {
-        let healthy = RequestId::new();
-        let affected = RequestId::new();
-
-        assert_eq!(
-            unaffected_maintenance_retry_frontiers(
-                &[healthy.clone(), affected.clone()],
-                std::slice::from_ref(&affected),
-            ),
-            [healthy]
-        );
-        assert!(unaffected_maintenance_retry_frontiers(
-            std::slice::from_ref(&affected),
-            std::slice::from_ref(&affected),
-        )
-        .is_empty());
+    fn into_pending(mut self) -> Vec<ExecutorPrefillMaintenanceDeferral> {
+        std::mem::take(&mut self.pending)
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct PagedKvAdmissionPressure {
-    pub(super) admission_blocks: usize,
-    pub(super) immediate_blocks: usize,
-    pub(super) free_blocks: usize,
-}
-
-pub(super) fn paged_kv_admission_pressure(error: &FerrumError) -> Option<PagedKvAdmissionPressure> {
-    let FerrumError::ResourceExhausted { message } = error else {
-        return None;
-    };
-    let (_, after_need) = message.split_once("paged KV admission: need ")?;
-    let (admission_blocks, rest) = parse_usize_prefix(after_need)?;
-    let rest = rest.strip_prefix(" admission blocks (")?;
-    let (immediate_blocks, rest) = parse_usize_prefix(rest)?;
-    let rest = rest.strip_prefix(" immediate) but only ")?;
-    let (free_blocks, rest) = parse_usize_prefix(rest)?;
-    if rest != " free" {
-        return None;
+impl Drop for PendingPrefillMaintenance<'_> {
+    fn drop(&mut self) {
+        for deferral in &self.pending {
+            self.executor
+                .cancel_prefill_admission(deferral.request_id());
+        }
     }
-    Some(PagedKvAdmissionPressure {
-        admission_blocks,
-        immediate_blocks,
-        free_blocks,
-    })
-}
-
-fn parse_usize_prefix(input: &str) -> Option<(usize, &str)> {
-    let end = input
-        .char_indices()
-        .find_map(|(index, ch)| (!ch.is_ascii_digit()).then_some(index))
-        .unwrap_or(input.len());
-    if end == 0 {
-        return None;
-    }
-    let value = input[..end].parse().ok()?;
-    Some((value, &input[end..]))
-}
-
-pub(super) fn kv_slot_requests_for_unified_batch(
-    batch: &ferrum_execution::model_executor::UnifiedBatch,
-) -> Vec<KvSlotRequest> {
-    batch
-        .items
-        .iter()
-        .map(|item| {
-            let target_len = item.pos_offset.saturating_add(item.q_tokens.len());
-            KvSlotRequest {
-                cache_id: item.seq_id.clone(),
-                target_len,
-                admission_target_len: metadata_kv_admission_target_len(&item.metadata)
-                    .map(|len| len.max(target_len)),
-            }
-        })
-        .collect()
-}
-
-pub(super) fn metadata_kv_admission_target_len(
-    metadata: &HashMap<String, serde_json::Value>,
-) -> Option<usize> {
-    metadata
-        .get(KV_ADMISSION_TARGET_LEN_METADATA_KEY)
-        .and_then(|value| value.as_u64())
-        .map(|value| value as usize)
-        .filter(|&value| value > 0)
 }
 
 #[derive(Debug, Default, serde::Serialize)]
@@ -171,6 +94,7 @@ struct ExecutorPrefillProbeResult {
 enum ExecutorPrefillAdmissionTraceEvidence {
     Admitted(ExecutorPrefillAdmissionReceipt),
     Deferred(AdmissionDeferred),
+    CapacityDeferred(TokenAdmissionCapacityDeferral),
     MaintenanceDeferred(ExecutorPrefillMaintenanceDeferral),
     PermanentRejected(AdmissionRejected),
     Faulted(String),
@@ -210,216 +134,13 @@ fn scheduler_trace_distribution(mut values: Vec<usize>) -> SchedulerTraceDistrib
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn paged_kv_admission_pressure_parses_qwen35_resource_error() {
-        let error = FerrumError::resource_exhausted(
-            "Qwen3.5 paged KV admission: need 24 admission blocks (4 immediate) but only 3 free",
-        );
-
-        assert_eq!(
-            paged_kv_admission_pressure(&error),
-            Some(PagedKvAdmissionPressure {
-                admission_blocks: 24,
-                immediate_blocks: 4,
-                free_blocks: 3,
-            })
-        );
-    }
-
-    #[test]
-    fn paged_kv_admission_pressure_parses_generic_llama_resource_error() {
-        let error = FerrumError::resource_exhausted(
-            "paged KV admission: need 1 admission blocks (1 immediate) but only 0 free",
-        );
-
-        assert_eq!(
-            paged_kv_admission_pressure(&error),
-            Some(PagedKvAdmissionPressure {
-                admission_blocks: 1,
-                immediate_blocks: 1,
-                free_blocks: 0,
-            })
-        );
-    }
-
-    #[test]
-    fn paged_kv_admission_pressure_ignores_unrelated_resource_errors() {
-        let error = FerrumError::resource_exhausted("synthetic unified reserve failure");
-
-        assert_eq!(paged_kv_admission_pressure(&error), None);
-    }
+struct SchedulerProfileFields {
+    shape: BTreeMap<String, serde_json::Value>,
+    attributes: BTreeMap<String, serde_json::Value>,
+    error: Option<ProfileError>,
 }
 
 impl EngineInner {
-    fn probe_executor_prefill_admission(
-        &self,
-        request: &InferenceRequest,
-        capture_trace: bool,
-    ) -> ExecutorPrefillProbeResult {
-        let Some((
-            input_tokens,
-            maximum_sequence_tokens,
-            product_prompt_tokens,
-            replayed_output_tokens,
-        )) = self.sequences.read().get(&request.id).map(|sequence| {
-            (
-                sequence.prefill_context_tokens(),
-                sequence.model_maximum_sequence_tokens(),
-                sequence.input_tokens.len(),
-                sequence.generated_tokens.len(),
-            )
-        })
-        else {
-            let error = FerrumError::internal(format!(
-                "request {} reached typed admission before its sequence state was published",
-                request.id
-            ));
-            return ExecutorPrefillProbeResult {
-                trace: capture_trace.then(|| ExecutorPrefillAdmissionTrace {
-                    request_id: request.id.clone(),
-                    input_token_count: None,
-                    maximum_sequence_tokens: None,
-                    evidence: ExecutorPrefillAdmissionTraceEvidence::Faulted(error.to_string()),
-                }),
-                outcome: AdmissionProbeOutcome::Faulted(error),
-                maintenance: None,
-            };
-        };
-        let admission = match ExecutorPrefillAdmission::for_product_request(
-            &request.id,
-            &input_tokens,
-            maximum_sequence_tokens,
-            product_prompt_tokens,
-            replayed_output_tokens,
-        ) {
-            Ok(admission) => admission,
-            Err(error) => {
-                return ExecutorPrefillProbeResult {
-                    trace: capture_trace.then(|| ExecutorPrefillAdmissionTrace {
-                        request_id: request.id.clone(),
-                        input_token_count: Some(input_tokens.len()),
-                        maximum_sequence_tokens: Some(maximum_sequence_tokens),
-                        evidence: ExecutorPrefillAdmissionTraceEvidence::Faulted(error.to_string()),
-                    }),
-                    outcome: AdmissionProbeOutcome::Faulted(error),
-                    maintenance: None,
-                };
-            }
-        };
-        let capture_admission_trace = |evidence| {
-            capture_trace.then(|| ExecutorPrefillAdmissionTrace {
-                request_id: request.id.clone(),
-                input_token_count: Some(input_tokens.len()),
-                maximum_sequence_tokens: Some(maximum_sequence_tokens),
-                evidence,
-            })
-        };
-        match self.model_executor.try_admit_prefill(admission) {
-            Ok(ExecutorPrefillAdmissionDecision::Admitted(receipt)) => ExecutorPrefillProbeResult {
-                trace: capture_admission_trace(ExecutorPrefillAdmissionTraceEvidence::Admitted(
-                    receipt.clone(),
-                )),
-                outcome: AdmissionProbeOutcome::Admitted(receipt),
-                maintenance: None,
-            },
-            Ok(ExecutorPrefillAdmissionDecision::Deferred(deferred)) => {
-                if deferred.action() == DeferredAction::AwaitBackingGrowth {
-                    self.model_executor.cancel_prefill_admission(&request.id);
-                    let error = FerrumError::internal(format!(
-                        "executor returned AwaitBackingGrowth for {} without retaining typed maintenance state",
-                        request.id
-                    ));
-                    return ExecutorPrefillProbeResult {
-                        trace: capture_admission_trace(
-                            ExecutorPrefillAdmissionTraceEvidence::Faulted(error.to_string()),
-                        ),
-                        outcome: AdmissionProbeOutcome::Faulted(error),
-                        maintenance: None,
-                    };
-                }
-                let outcome = AdmissionProbeOutcome::Deferred(AdmissionDeferral::from_admission(
-                    &deferred, 0,
-                ));
-                ExecutorPrefillProbeResult {
-                    trace: capture_admission_trace(
-                        ExecutorPrefillAdmissionTraceEvidence::Deferred(deferred),
-                    ),
-                    outcome,
-                    maintenance: None,
-                }
-            }
-            Ok(ExecutorPrefillAdmissionDecision::MaintenanceDeferred(deferred)) => {
-                if deferred.request_id() != &request.id {
-                    self.model_executor.cancel_prefill_admission(&request.id);
-                    let error = FerrumError::internal(format!(
-                        "executor maintenance deferral belongs to {}, expected {}",
-                        deferred.request_id(),
-                        request.id
-                    ));
-                    return ExecutorPrefillProbeResult {
-                        trace: capture_admission_trace(
-                            ExecutorPrefillAdmissionTraceEvidence::Faulted(error.to_string()),
-                        ),
-                        outcome: AdmissionProbeOutcome::Faulted(error),
-                        maintenance: None,
-                    };
-                }
-                let observed = deferred.observed();
-                let outcome = AdmissionProbeOutcome::Deferred(AdmissionDeferral::new(
-                    DeferredAction::AwaitBackingGrowth,
-                    AdmissionWakeEpochs::new(
-                        observed.coordinator_id,
-                        observed.release_epoch,
-                        observed.capacity_epoch,
-                        0,
-                    ),
-                    deferred.wait_condition().clone(),
-                ));
-                ExecutorPrefillProbeResult {
-                    trace: capture_admission_trace(
-                        ExecutorPrefillAdmissionTraceEvidence::MaintenanceDeferred(
-                            deferred.clone(),
-                        ),
-                    ),
-                    outcome,
-                    maintenance: Some(deferred),
-                }
-            }
-            Ok(ExecutorPrefillAdmissionDecision::PermanentRejected(rejected)) => {
-                ExecutorPrefillProbeResult {
-                    trace: capture_admission_trace(
-                        ExecutorPrefillAdmissionTraceEvidence::PermanentRejected(rejected.clone()),
-                    ),
-                    outcome: AdmissionProbeOutcome::PermanentRejected(rejected),
-                    maintenance: None,
-                }
-            }
-            Err(error) => ExecutorPrefillProbeResult {
-                trace: capture_admission_trace(ExecutorPrefillAdmissionTraceEvidence::Faulted(
-                    error.to_string(),
-                )),
-                outcome: AdmissionProbeOutcome::Faulted(error),
-                maintenance: None,
-            },
-        }
-    }
-
-    #[cfg(test)]
-    pub(super) fn probe_executor_prefill_admission_for_test(
-        &self,
-        request: &InferenceRequest,
-    ) -> bool {
-        matches!(
-            self.probe_executor_prefill_admission(request, false)
-                .outcome,
-            AdmissionProbeOutcome::Admitted(_)
-        )
-    }
-
     fn write_executor_scheduler_profile_event(
         &self,
         request_id: &RequestId,
@@ -427,13 +148,18 @@ impl EngineInner {
         event_kind: ProfileEventKind,
         status: ProfileStatus,
         duration_us: Option<u64>,
-        shape: BTreeMap<String, serde_json::Value>,
-        mut attributes: BTreeMap<String, serde_json::Value>,
-        error: Option<ProfileError>,
+        build_fields: impl FnOnce() -> SchedulerProfileFields,
     ) {
         let Some(sink) = &self.scheduler_trace_jsonl else {
             return;
         };
+        #[cfg(test)]
+        self.trace_payload_builds.fetch_add(1, Ordering::Relaxed);
+        let SchedulerProfileFields {
+            shape,
+            mut attributes,
+            error,
+        } = build_fields();
         let entrypoint = self.trace_entrypoint();
         attributes.insert(
             "actual_model_smoke".to_string(),
@@ -482,11 +208,13 @@ impl EngineInner {
             attributes,
         };
         if let Err(error) = event.validate() {
-            warn!("Skipping invalid executor admission trace event: {}", error);
+            self.report_observation_failure(ExecutionEventSinkError::contract(format!(
+                "invalid executor admission trace event: {error}"
+            )));
             return;
         }
         if let Err(error) = sink.enqueue(event) {
-            warn!("Failed to enqueue executor admission trace: {}", error);
+            self.report_observation_failure(error);
         }
     }
 
@@ -508,6 +236,20 @@ impl EngineInner {
                 "deferred",
                 serde_json::to_value(&deferred).unwrap_or(serde_json::Value::Null),
                 deferred.blockers().len(),
+                false,
+                false,
+                None,
+            ),
+            ExecutorPrefillAdmissionTraceEvidence::CapacityDeferred(deferred) => (
+                "capacity_deferred",
+                serde_json::json!({
+                    "required_blocks": deferred.required_blocks(),
+                    "free_blocks": deferred.snapshot().free_blocks,
+                    "total_blocks": deferred.snapshot().total_blocks,
+                    "block_size": deferred.snapshot().block_size,
+                    "retry_after": "confirmed_physical_release",
+                }),
+                1,
                 false,
                 false,
                 None,
@@ -558,35 +300,37 @@ impl EngineInner {
                 ProfileStatus::Ok
             },
             None,
-            BTreeMap::from([
-                ("decision".to_string(), serde_json::json!(decision)),
-                (
-                    "blocker_count".to_string(),
-                    serde_json::json!(blocker_count),
-                ),
-                (
-                    "input_token_count".to_string(),
-                    serde_json::json!(trace.input_token_count),
-                ),
-                (
-                    "maximum_sequence_tokens".to_string(),
-                    serde_json::json!(trace.maximum_sequence_tokens),
-                ),
-                (
-                    "execution_authority_retained".to_string(),
-                    serde_json::json!(retained),
-                ),
-                (
-                    "maintenance_required".to_string(),
-                    serde_json::json!(maintenance),
-                ),
-                (
-                    "prefill_submit_observed".to_string(),
-                    serde_json::json!(false),
-                ),
-            ]),
-            BTreeMap::from([("admission_evidence".to_string(), evidence)]),
-            error,
+            || SchedulerProfileFields {
+                shape: BTreeMap::from([
+                    ("decision".to_string(), serde_json::json!(decision)),
+                    (
+                        "blocker_count".to_string(),
+                        serde_json::json!(blocker_count),
+                    ),
+                    (
+                        "input_token_count".to_string(),
+                        serde_json::json!(trace.input_token_count),
+                    ),
+                    (
+                        "maximum_sequence_tokens".to_string(),
+                        serde_json::json!(trace.maximum_sequence_tokens),
+                    ),
+                    (
+                        "execution_authority_retained".to_string(),
+                        serde_json::json!(retained),
+                    ),
+                    (
+                        "maintenance_required".to_string(),
+                        serde_json::json!(maintenance),
+                    ),
+                    (
+                        "prefill_submit_observed".to_string(),
+                        serde_json::json!(false),
+                    ),
+                ]),
+                attributes: BTreeMap::from([("admission_evidence".to_string(), evidence)]),
+                error: error,
+            },
         );
     }
 
@@ -594,6 +338,9 @@ impl EngineInner {
         &self,
         observation: ExecutorAdmissionQueueObservation,
     ) {
+        if self.scheduler_trace_jsonl.is_none() {
+            return;
+        }
         let epochs = |value: AdmissionWakeEpochs| {
             serde_json::json!({
                 "coordinator_id": value.coordinator_id().get(),
@@ -603,6 +350,78 @@ impl EngineInner {
             })
         };
         match observation {
+            ExecutorAdmissionQueueObservation::AllocatorCapacityWaitingForOwner {
+                request_id,
+                domain,
+                progress_owner_id,
+                observed_release_epoch,
+                current_release_epoch,
+            } => self.write_executor_scheduler_profile_event(
+                &request_id,
+                "execution.allocator_capacity_wait",
+                ProfileEventKind::Instant,
+                ProfileStatus::Ok,
+                None,
+                || SchedulerProfileFields {
+                    shape: BTreeMap::from([
+                        (
+                            "decision".to_string(),
+                            serde_json::json!("waiting_for_owner"),
+                        ),
+                        ("probe_performed".to_string(), serde_json::json!(false)),
+                    ]),
+                    attributes: BTreeMap::from([(
+                        "deferral_evidence".to_string(),
+                        serde_json::json!({
+                            "allocator_domain": domain,
+                            "progress_owner_id": progress_owner_id,
+                            "observed_release_epoch": observed_release_epoch,
+                            "current_release_epoch": current_release_epoch,
+                        }),
+                    )]),
+                    error: None,
+                },
+            ),
+            ExecutorAdmissionQueueObservation::AllocatorCapacitySkippedUnchanged {
+                request_id,
+                domain,
+                observed_release_epoch,
+                current_release_epoch,
+            }
+            | ExecutorAdmissionQueueObservation::AllocatorCapacityResumed {
+                request_id,
+                domain,
+                observed_release_epoch,
+                current_release_epoch,
+            } => self.write_executor_scheduler_profile_event(
+                &request_id,
+                "execution.allocator_capacity_wait",
+                ProfileEventKind::Instant,
+                ProfileStatus::Ok,
+                None,
+                || SchedulerProfileFields {
+                    shape: BTreeMap::from([
+                        (
+                            "decision".to_string(),
+                            serde_json::json!(if current_release_epoch > observed_release_epoch {
+                                "release_observed"
+                            } else {
+                                "skipped_unchanged"
+                            }),
+                        ),
+                        ("probe_performed".to_string(), serde_json::json!(false)),
+                    ]),
+                    attributes: BTreeMap::from([(
+                        "deferral_evidence".to_string(),
+                        serde_json::json!({
+                            "allocator_domain": domain,
+                            "observed_release_epoch": observed_release_epoch,
+                            "current_release_epoch": current_release_epoch,
+                        }),
+                    )]),
+                    error: None,
+                },
+            ),
             ExecutorAdmissionQueueObservation::PressureHoldReleased {
                 episode_id,
                 transition_ordinal,
@@ -620,46 +439,48 @@ impl EngineInner {
                 ProfileEventKind::Instant,
                 ProfileStatus::Ok,
                 None,
-                BTreeMap::from([
-                    ("decision".to_string(), serde_json::json!(reason.as_str())),
-                    (
-                        "episode_id".to_string(),
-                        serde_json::json!(episode_id.get()),
-                    ),
-                    (
-                        "transition_ordinal".to_string(),
-                        serde_json::json!(transition_ordinal.get()),
-                    ),
-                    ("waiting_ticket".to_string(), serde_json::json!(ticket)),
-                    (
-                        "progress_owner_id".to_string(),
-                        serde_json::json!(progress_owner_id.0),
-                    ),
-                    (
-                        "progress_baseline".to_string(),
-                        serde_json::json!(progress_baseline.get()),
-                    ),
-                    (
-                        "progress_current".to_string(),
-                        serde_json::json!(progress_current.get()),
-                    ),
-                    (
-                        "previous_wait_condition".to_string(),
-                        serde_json::json!(previous_wait_condition),
-                    ),
-                    (
-                        "current_wait_condition".to_string(),
-                        serde_json::json!(current_wait_condition),
-                    ),
-                    ("admission_eligible".to_string(), serde_json::json!(true)),
-                    ("probe_performed".to_string(), serde_json::json!(false)),
-                    (
-                        "prefill_submit_observed".to_string(),
-                        serde_json::json!(false),
-                    ),
-                ]),
-                BTreeMap::new(),
-                None,
+                || SchedulerProfileFields {
+                    shape: BTreeMap::from([
+                        ("decision".to_string(), serde_json::json!(reason.as_str())),
+                        (
+                            "episode_id".to_string(),
+                            serde_json::json!(episode_id.get()),
+                        ),
+                        (
+                            "transition_ordinal".to_string(),
+                            serde_json::json!(transition_ordinal.get()),
+                        ),
+                        ("waiting_ticket".to_string(), serde_json::json!(ticket)),
+                        (
+                            "progress_owner_id".to_string(),
+                            serde_json::json!(progress_owner_id.0),
+                        ),
+                        (
+                            "progress_baseline".to_string(),
+                            serde_json::json!(progress_baseline.get()),
+                        ),
+                        (
+                            "progress_current".to_string(),
+                            serde_json::json!(progress_current.get()),
+                        ),
+                        (
+                            "previous_wait_condition".to_string(),
+                            serde_json::json!(previous_wait_condition),
+                        ),
+                        (
+                            "current_wait_condition".to_string(),
+                            serde_json::json!(current_wait_condition),
+                        ),
+                        ("admission_eligible".to_string(), serde_json::json!(true)),
+                        ("probe_performed".to_string(), serde_json::json!(false)),
+                        (
+                            "prefill_submit_observed".to_string(),
+                            serde_json::json!(false),
+                        ),
+                    ]),
+                    attributes: BTreeMap::new(),
+                    error: None,
+                },
             ),
             ExecutorAdmissionQueueObservation::SkippedUnchanged {
                 request_id,
@@ -672,28 +493,30 @@ impl EngineInner {
                 ProfileEventKind::Instant,
                 ProfileStatus::Ok,
                 None,
-                BTreeMap::from([
-                    (
-                        "decision".to_string(),
-                        serde_json::json!("skipped_unchanged"),
-                    ),
-                    ("waiting_ticket".to_string(), serde_json::json!(ticket)),
-                    (
-                        "prefill_submit_observed".to_string(),
-                        serde_json::json!(false),
-                    ),
-                    ("probe_performed".to_string(), serde_json::json!(false)),
-                ]),
-                BTreeMap::from([(
-                    "deferral_evidence".to_string(),
-                    serde_json::json!({
-                        "action": deferral.action(),
-                        "observed": epochs(deferral.observed()),
-                        "current": epochs(current),
-                        "wait_condition": deferral.wait_condition(),
-                    }),
-                )]),
-                None,
+                || SchedulerProfileFields {
+                    shape: BTreeMap::from([
+                        (
+                            "decision".to_string(),
+                            serde_json::json!("skipped_unchanged"),
+                        ),
+                        ("waiting_ticket".to_string(), serde_json::json!(ticket)),
+                        (
+                            "prefill_submit_observed".to_string(),
+                            serde_json::json!(false),
+                        ),
+                        ("probe_performed".to_string(), serde_json::json!(false)),
+                    ]),
+                    attributes: BTreeMap::from([(
+                        "deferral_evidence".to_string(),
+                        serde_json::json!({
+                            "action": deferral.action(),
+                            "observed": epochs(deferral.observed()),
+                            "current": epochs(current),
+                            "wait_condition": deferral.wait_condition(),
+                        }),
+                    )]),
+                    error: None,
+                },
             ),
             ExecutorAdmissionQueueObservation::DecodeSkippedUnchanged {
                 request_id,
@@ -706,28 +529,30 @@ impl EngineInner {
                 ProfileEventKind::Instant,
                 ProfileStatus::Ok,
                 None,
-                BTreeMap::from([
-                    (
-                        "decision".to_string(),
-                        serde_json::json!("skipped_unchanged"),
-                    ),
-                    (
-                        "decode_submit_observed".to_string(),
-                        serde_json::json!(false),
-                    ),
-                    ("probe_performed".to_string(), serde_json::json!(false)),
-                ]),
-                BTreeMap::from([(
-                    "deferral_evidence".to_string(),
-                    serde_json::json!({
-                        "action": deferral.action(),
-                        "observed": epochs(deferral.observed()),
-                        "current": epochs(current),
-                        "wait_condition": deferral.wait_condition(),
-                        "current_wait_sources": current_wait_sources,
-                    }),
-                )]),
-                None,
+                || SchedulerProfileFields {
+                    shape: BTreeMap::from([
+                        (
+                            "decision".to_string(),
+                            serde_json::json!("skipped_unchanged"),
+                        ),
+                        (
+                            "decode_submit_observed".to_string(),
+                            serde_json::json!(false),
+                        ),
+                        ("probe_performed".to_string(), serde_json::json!(false)),
+                    ]),
+                    attributes: BTreeMap::from([(
+                        "deferral_evidence".to_string(),
+                        serde_json::json!({
+                            "action": deferral.action(),
+                            "observed": epochs(deferral.observed()),
+                            "current": epochs(current),
+                            "wait_condition": deferral.wait_condition(),
+                            "current_wait_sources": current_wait_sources,
+                        }),
+                    )]),
+                    error: None,
+                },
             ),
             ExecutorAdmissionQueueObservation::DecodeResumed {
                 request_id,
@@ -742,40 +567,42 @@ impl EngineInner {
                 ProfileEventKind::Instant,
                 ProfileStatus::Ok,
                 None,
-                BTreeMap::from([
-                    (
-                        "decision".to_string(),
-                        serde_json::json!(if exact_source_changed {
-                            "exact_source_changed"
-                        } else {
-                            "policy_epoch_changed"
+                || SchedulerProfileFields {
+                    shape: BTreeMap::from([
+                        (
+                            "decision".to_string(),
+                            serde_json::json!(if exact_source_changed {
+                                "exact_source_changed"
+                            } else {
+                                "policy_epoch_changed"
+                            }),
+                        ),
+                        (
+                            "exact_source_changed".to_string(),
+                            serde_json::json!(exact_source_changed),
+                        ),
+                        (
+                            "policy_epoch_changed".to_string(),
+                            serde_json::json!(policy_epoch_changed),
+                        ),
+                        (
+                            "decode_submit_observed".to_string(),
+                            serde_json::json!(false),
+                        ),
+                        ("probe_performed".to_string(), serde_json::json!(false)),
+                    ]),
+                    attributes: BTreeMap::from([(
+                        "deferral_evidence".to_string(),
+                        serde_json::json!({
+                            "action": deferral.action(),
+                            "observed": epochs(deferral.observed()),
+                            "current": epochs(current),
+                            "wait_condition": deferral.wait_condition(),
+                            "current_wait_sources": current_wait_sources,
                         }),
-                    ),
-                    (
-                        "exact_source_changed".to_string(),
-                        serde_json::json!(exact_source_changed),
-                    ),
-                    (
-                        "policy_epoch_changed".to_string(),
-                        serde_json::json!(policy_epoch_changed),
-                    ),
-                    (
-                        "decode_submit_observed".to_string(),
-                        serde_json::json!(false),
-                    ),
-                    ("probe_performed".to_string(), serde_json::json!(false)),
-                ]),
-                BTreeMap::from([(
-                    "deferral_evidence".to_string(),
-                    serde_json::json!({
-                        "action": deferral.action(),
-                        "observed": epochs(deferral.observed()),
-                        "current": epochs(current),
-                        "wait_condition": deferral.wait_condition(),
-                        "current_wait_sources": current_wait_sources,
-                    }),
-                )]),
-                None,
+                    )]),
+                    error: None,
+                },
             ),
             ExecutorAdmissionQueueObservation::PrefillSkippedUnchanged {
                 request_id,
@@ -788,28 +615,30 @@ impl EngineInner {
                 ProfileEventKind::Instant,
                 ProfileStatus::Ok,
                 None,
-                BTreeMap::from([
-                    (
-                        "decision".to_string(),
-                        serde_json::json!("skipped_unchanged"),
-                    ),
-                    (
-                        "prefill_submit_observed".to_string(),
-                        serde_json::json!(false),
-                    ),
-                    ("probe_performed".to_string(), serde_json::json!(false)),
-                ]),
-                BTreeMap::from([(
-                    "deferral_evidence".to_string(),
-                    serde_json::json!({
-                        "action": deferral.action(),
-                        "observed": epochs(deferral.observed()),
-                        "current": epochs(current),
-                        "wait_condition": deferral.wait_condition(),
-                        "current_wait_sources": current_wait_sources,
-                    }),
-                )]),
-                None,
+                || SchedulerProfileFields {
+                    shape: BTreeMap::from([
+                        (
+                            "decision".to_string(),
+                            serde_json::json!("skipped_unchanged"),
+                        ),
+                        (
+                            "prefill_submit_observed".to_string(),
+                            serde_json::json!(false),
+                        ),
+                        ("probe_performed".to_string(), serde_json::json!(false)),
+                    ]),
+                    attributes: BTreeMap::from([(
+                        "deferral_evidence".to_string(),
+                        serde_json::json!({
+                            "action": deferral.action(),
+                            "observed": epochs(deferral.observed()),
+                            "current": epochs(current),
+                            "wait_condition": deferral.wait_condition(),
+                            "current_wait_sources": current_wait_sources,
+                        }),
+                    )]),
+                    error: None,
+                },
             ),
             ExecutorAdmissionQueueObservation::PrefillResumed {
                 request_id,
@@ -824,144 +653,44 @@ impl EngineInner {
                 ProfileEventKind::Instant,
                 ProfileStatus::Ok,
                 None,
-                BTreeMap::from([
-                    (
-                        "decision".to_string(),
-                        serde_json::json!(if exact_source_changed {
-                            "exact_source_changed"
-                        } else {
-                            "policy_epoch_changed"
+                || SchedulerProfileFields {
+                    shape: BTreeMap::from([
+                        (
+                            "decision".to_string(),
+                            serde_json::json!(if exact_source_changed {
+                                "exact_source_changed"
+                            } else {
+                                "policy_epoch_changed"
+                            }),
+                        ),
+                        (
+                            "exact_source_changed".to_string(),
+                            serde_json::json!(exact_source_changed),
+                        ),
+                        (
+                            "policy_epoch_changed".to_string(),
+                            serde_json::json!(policy_epoch_changed),
+                        ),
+                        (
+                            "prefill_submit_observed".to_string(),
+                            serde_json::json!(false),
+                        ),
+                        ("probe_performed".to_string(), serde_json::json!(false)),
+                    ]),
+                    attributes: BTreeMap::from([(
+                        "deferral_evidence".to_string(),
+                        serde_json::json!({
+                            "action": deferral.action(),
+                            "observed": epochs(deferral.observed()),
+                            "current": epochs(current),
+                            "wait_condition": deferral.wait_condition(),
+                            "current_wait_sources": current_wait_sources,
                         }),
-                    ),
-                    (
-                        "exact_source_changed".to_string(),
-                        serde_json::json!(exact_source_changed),
-                    ),
-                    (
-                        "policy_epoch_changed".to_string(),
-                        serde_json::json!(policy_epoch_changed),
-                    ),
-                    (
-                        "prefill_submit_observed".to_string(),
-                        serde_json::json!(false),
-                    ),
-                    ("probe_performed".to_string(), serde_json::json!(false)),
-                ]),
-                BTreeMap::from([(
-                    "deferral_evidence".to_string(),
-                    serde_json::json!({
-                        "action": deferral.action(),
-                        "observed": epochs(deferral.observed()),
-                        "current": epochs(current),
-                        "wait_condition": deferral.wait_condition(),
-                        "current_wait_sources": current_wait_sources,
-                    }),
-                )]),
-                None,
+                    )]),
+                    error: None,
+                },
             ),
         }
-    }
-
-    fn trace_executor_decode_capacity_decision(
-        &self,
-        request_ids: &[RequestId],
-        deferral: &ExecutorExecutionCapacityDeferral,
-        decision: &'static str,
-        pressure_yield: Option<&PressureYieldTransaction>,
-    ) {
-        let Some(request_id) = request_ids.first() else {
-            return;
-        };
-        let observed = deferral.observed();
-        let mut attributes = BTreeMap::from([
-            ("request_ids".to_string(), serde_json::json!(request_ids)),
-            (
-                "capacity_evidence".to_string(),
-                serde_json::json!({
-                    "stage": deferral.stage(),
-                    "observed": {
-                        "coordinator_id": observed.coordinator_id,
-                        "release_epoch": observed.release_epoch,
-                        "capacity_epoch": observed.capacity_epoch,
-                    },
-                    "wait_condition": deferral.wait_condition(),
-                    "shortfalls": deferral.shortfalls(),
-                    "backing_blockers": deferral.backing_blockers(),
-                    "typed_evidence": deferral.evidence(),
-                    "maintenance_retry": deferral.maintenance_retry(),
-                }),
-            ),
-        ]);
-        if let Some(transaction) = pressure_yield {
-            attributes.insert(
-                "episode_id".to_string(),
-                serde_json::json!(transaction.episode_id().get()),
-            );
-            attributes.insert(
-                "planned_transition_ordinal".to_string(),
-                serde_json::json!(transaction.planned_ordinal().get()),
-            );
-            attributes.insert(
-                "handoff_generation".to_string(),
-                serde_json::json!(transaction.handoff_generation()),
-            );
-            attributes.insert(
-                "yield_kind".to_string(),
-                serde_json::json!(transaction.kind().as_str()),
-            );
-            attributes.insert(
-                "victim_request_id".to_string(),
-                serde_json::json!(transaction.victim_request_id()),
-            );
-            attributes.insert(
-                "progress_owner_id".to_string(),
-                serde_json::json!(transaction.progress_owner_id()),
-            );
-            attributes.insert(
-                "progress_baseline".to_string(),
-                serde_json::json!(transaction.progress_baseline().get()),
-            );
-            attributes.insert(
-                "rotated_from_progress_owner_id".to_string(),
-                serde_json::json!(transaction.rotated_from_progress_owner_id()),
-            );
-            attributes.insert(
-                "rotated_from_progress_baseline".to_string(),
-                serde_json::json!(transaction
-                    .rotated_from_progress_baseline()
-                    .map(|generation| generation.get())),
-            );
-            attributes.insert(
-                "rotated_from_progress_current".to_string(),
-                serde_json::json!(transaction
-                    .rotated_from_progress_current()
-                    .map(|generation| generation.get())),
-            );
-        }
-        self.write_executor_scheduler_profile_event(
-            request_id,
-            "vnext.decode_capacity_deferred",
-            ProfileEventKind::Instant,
-            ProfileStatus::Ok,
-            None,
-            BTreeMap::from([
-                ("decision".to_string(), serde_json::json!(decision)),
-                (
-                    "attempted_decode_width".to_string(),
-                    serde_json::json!(request_ids.len()),
-                ),
-                (
-                    "execution_stage".to_string(),
-                    serde_json::json!(deferral.stage()),
-                ),
-                (
-                    "decode_submit_observed".to_string(),
-                    serde_json::json!(false),
-                ),
-            ]),
-            attributes,
-            None,
-        );
     }
 
     fn validate_executor_prefill_maintenance(
@@ -1135,15 +864,17 @@ impl EngineInner {
                 ProfileStatus::Ok
             },
             Some(duration_to_us(elapsed)),
-            BTreeMap::from([
-                ("outcome".to_string(), serde_json::json!(outcome_name)),
-                (
-                    "duration_us".to_string(),
-                    serde_json::json!(duration_to_us(elapsed)),
-                ),
-            ]),
-            BTreeMap::from([("maintenance_evidence".to_string(), evidence)]),
-            error,
+            || SchedulerProfileFields {
+                shape: BTreeMap::from([
+                    ("outcome".to_string(), serde_json::json!(outcome_name)),
+                    (
+                        "duration_us".to_string(),
+                        serde_json::json!(duration_to_us(elapsed)),
+                    ),
+                ]),
+                attributes: BTreeMap::from([("maintenance_evidence".to_string(), evidence)]),
+                error: error,
+            },
         );
     }
 
@@ -1229,97 +960,14 @@ impl EngineInner {
         }
     }
 
-    fn prepare_dynamic_admission_round(
-        &self,
-        maximum_admissions: usize,
-    ) -> Result<(usize, Vec<ExecutorPrefillMaintenanceDeferral>)> {
-        let mut maintenance = Vec::new();
-        let mut availability = self.dynamic_admission_availability.lock();
-        let epochs = self
-            .model_executor
-            .write_execution_capacity_snapshot(&mut availability)?
-            .ok_or_else(|| {
-                FerrumError::scheduler("plan runtime did not expose typed admission epochs")
-            })?;
-        let wake_epochs = AdmissionWakeEpochs::new(
-            epochs.coordinator_id,
-            epochs.release_epoch,
-            epochs.capacity_epoch,
-            0,
-        );
-        let wake = AdmissionWakeSnapshot::new(wake_epochs, &availability);
-        let capture_trace = self.scheduler_trace_jsonl.is_some();
-        let records = std::cell::RefCell::new(Vec::<ExecutorSchedulerTraceRecord>::new());
-        let mut prefix_pressure = false;
-        let mut probe = |request: &InferenceRequest| {
-            let result = self.probe_executor_prefill_admission(request, capture_trace);
-            if (self
-                .config
-                .scheduler
-                .prefix_rendezvous_max_wait_ms
-                .is_some()
-                || !self.prefix_restore_pending.lock().is_empty())
-                && matches!(&result.outcome, AdmissionProbeOutcome::Deferred(_))
-                && result.maintenance.is_none()
-            {
-                prefix_pressure = true;
-            }
-            if let Some(deferral) = result.maintenance {
-                maintenance.push(deferral);
-            }
-            if let Some(trace) = result.trace {
-                records
-                    .borrow_mut()
-                    .push(ExecutorSchedulerTraceRecord::PrefillAdmission(trace));
-            }
-            result.outcome
-        };
-        let prepared =
-            self.scheduler.prepare_dynamic_admission_observed(
-                maximum_admissions,
-                wake,
-                &mut probe,
-                &mut |observation| {
-                    records.borrow_mut().push(
-                        ExecutorSchedulerTraceRecord::AdmissionQueueObservation(observation),
-                    )
-                },
-            );
-        drop(probe);
-        drop(availability);
-        if prefix_pressure {
-            self.release_prefix_rendezvous_for_capacity_pressure();
-        }
-
-        for record in records.into_inner() {
-            match record {
-                ExecutorSchedulerTraceRecord::PrefillAdmission(trace) => {
-                    self.trace_executor_prefill_admission(trace);
-                }
-                ExecutorSchedulerTraceRecord::AdmissionQueueObservation(observation) => {
-                    self.trace_executor_admission_queue_observation(observation);
-                }
-            }
-        }
-        match prepared {
-            Ok(receipt) => Ok((receipt.admitted(), maintenance)),
-            Err(error) => {
-                for deferral in &maintenance {
-                    self.model_executor
-                        .cancel_prefill_admission(deferral.request_id());
-                }
-                Err(error)
-            }
-        }
-    }
-
     /// Fill-first is allowed to delay decode until its active target, so form
     /// that target's retained admission cohort before constructing a physical
     /// batch. Each round performs one bounded maintenance attempt per deferred
     /// request and then re-probes against fresh typed capacity evidence.
-    async fn prepare_plan_runtime_prefill_cohort(
+    async fn prepare_token_prefill_cohort(
         &self,
         hint: &ferrum_interfaces::BatchHint,
+        mut planning: Option<&mut TimePlanningRound>,
     ) -> Result<bool> {
         let Some(configured_target) = self.config.scheduler.prefill_first_until_active else {
             return Ok(false);
@@ -1339,14 +987,18 @@ impl EngineInner {
             if desired == 0 || self.scheduler.waiting_count() == 0 {
                 break;
             }
-            let (admitted, maintenance) = self.prepare_dynamic_admission_round(desired)?;
+            let (admitted, maintenance) = self
+                .prepare_dynamic_admission_round(desired, planning.as_deref_mut())
+                .await?;
+            let maintenance =
+                PendingPrefillMaintenance::new(self.model_executor.as_ref().as_ref(), maintenance);
             progressed |= admitted > 0;
             self.complete_typed_admission_failures().await?;
             if maintenance.is_empty() {
                 break;
             }
             progressed = true;
-            self.execute_executor_prefill_maintenance(maintenance);
+            self.execute_executor_prefill_maintenance(maintenance.into_pending());
             self.complete_typed_admission_failures().await?;
         }
 
@@ -1356,28 +1008,45 @@ impl EngineInner {
     }
 
     async fn complete_typed_admission_failures(&self) -> Result<()> {
-        for (request_id, error) in self.scheduler.take_admission_failures() {
+        let mut first_error = None;
+        // Keep not-yet-processed failures in the scheduler's original queue.
+        // Explicit-error completion transfers this one's frontier/slot before
+        // its first await, so cancellation cannot lose the remaining owners.
+        while let Some((request_id, error)) = self.scheduler.take_next_admission_failure() {
             warn!(
                 request_id = %request_id,
                 error = %error,
-                "Typed prefill admission failed before device submission"
+                "Typed prefill admission failed"
             );
-            self.model_executor.cancel_prefill_admission(&request_id);
-            self.complete_request(&request_id, FinishReason::Error)
-                .await?;
+            if let Err(error) =
+                self.complete_request_detached(&request_id, FinishReason::Error, Some(error))
+            {
+                warn!(request_id = %request_id, %error, "Admission failure cleanup reported an error");
+                first_error.get_or_insert(error);
+            }
         }
-        Ok(())
+        first_error.map_or(Ok(()), Err)
     }
 
     async fn defer_for_request_state_readiness(
         &self,
         deferral: ExecutorRequestStateDeferral,
+        handles: Vec<(
+            Arc<SequenceHandle>,
+            ferrum_execution::token_execution::ExecutorSequence,
+        )>,
     ) -> Result<()> {
         let slot = self.execution_readiness_waiters.reserve().await?;
         let registration = deferral.register_waiter()?;
-        let receipt = self
-            .scheduler
-            .defer_for_execution_readiness(deferral.request_ids())?;
+        // Slot reservation can suspend. Use the captured original cohort;
+        // the short index transaction excludes replacement publication while
+        // the synchronous scheduler operation still accepts RequestIds.
+        let receipt =
+            self.sequences
+                .with_current(handles.iter().map(|(handle, _)| handle), || {
+                    self.scheduler
+                        .defer_for_execution_readiness(deferral.request_ids())
+                })?;
         if receipt.deferred_count() != deferral.request_ids().len() {
             receipt.wake().cancel();
             return Err(FerrumError::scheduler(format!(
@@ -1396,100 +1065,53 @@ impl EngineInner {
                     .map(|_| ())
                     .map_err(|error| error.to_string())
             },
-            deferral.request_ids().to_vec(),
+            handles
+                .iter()
+                .map(|(handle, sequence)| ExecutionReadinessWaitTarget {
+                    request: Arc::downgrade(handle),
+                    sequence: sequence.clone(),
+                })
+                .collect(),
             Arc::clone(&self.work_notify),
             slot,
         )?;
-        self.write_scheduler_trace_event(serde_json::json!({
-            "event": "scheduler_execution_request_state_defer",
-            "ticket_id": ticket_id,
-            "request_ids": deferral.request_ids(),
-            "stage": deferral.stage(),
-            "observed_change_epoch": deferral.hazard().observed_change_epoch(),
-            "blockers": deferral.hazard().blockers(),
-            "pending_waiters": self.execution_readiness_waiters.pending_count(),
-            "scheduler": self.scheduler.trace_snapshot(),
-        }));
+        self.write_scheduler_trace_event(|| {
+            serde_json::json!({
+                "event": "scheduler_execution_request_state_defer",
+                "ticket_id": ticket_id,
+                "request_ids": deferral.request_ids(),
+                "stage": deferral.stage(),
+                "observed_change_epoch": deferral.hazard().observed_change_epoch(),
+                "blockers": deferral.hazard().blockers(),
+                "pending_waiters": self.execution_readiness_waiters.pending_count(),
+                "scheduler": self.scheduler.trace_snapshot(),
+            })
+        });
         Ok(())
     }
 
     async fn complete_execution_readiness_failures(&self) -> Result<()> {
         self.execution_readiness_waiters.reap_finished();
         for failure in self.execution_readiness_waiters.take_failures() {
-            for request_id in failure.request_ids {
-                self.complete_request_with_error(
-                    &request_id,
-                    FerrumError::backend(format!(
+            for request in failure.requests {
+                let Some(handle) = request.request.upgrade() else {
+                    continue;
+                };
+                // Cancelling a scheduler wake does not retract a later waiter
+                // error. A recompute keeps its logical handle but replaces the
+                // executor incarnation, which an old failure cannot close.
+                self.complete_request_exact_frontier_detached(
+                    &handle,
+                    &request.sequence,
+                    FinishReason::Error,
+                    Some(FerrumError::backend(format!(
                         "Request-state readiness ticket {} failed: {}",
                         failure.ticket_id, failure.message
-                    )),
-                )
-                .await?;
+                    ))),
+                )?;
             }
         }
         Ok(())
-    }
-
-    // ── tensor helper ──────────────────────────────────────────────────
-
-    pub(super) fn tokens_to_tensor(&self, token_ids: &[u32]) -> Result<TensorRef> {
-        let f32_data: Vec<f32> = token_ids.iter().map(|&v| v as f32).collect();
-        let len = f32_data.len();
-        self.tensor_factory
-            .from_slice(&f32_data, &[1, len], DataType::FP32, Device::CPU)
-    }
-
-    /// Build the model-executor KV handle used by `LlmExecutor::decode`.
-    ///
-    /// The continuous engine has two KV identities:
-    /// - `KvCacheManager` allocations, keyed by request id, track resource
-    ///   lifetime and are deallocated on preemption/completion.
-    /// - model/executor cache ids track the actual model-side KV contents.
-    ///
-    /// `SequenceState` model-KV state must carry the second identity because the
-    /// fallback single-request decode path downcasts it to
-    /// `GenericKvCacheHandle`. Unified CUDA paths don't read the handle body,
-    /// but keeping this invariant prevents resource-pressure fallbacks from
-    /// feeding a manager handle into `LlmExecutor::decode`.
-    pub(super) fn make_model_kv_handle_with_seq(
-        &self,
-        cache_id: String,
-        seq_len: usize,
-    ) -> std::sync::Arc<dyn ferrum_interfaces::KvCacheHandle> {
-        let info = self.model_executor.info();
-        let head_dim = if info.num_heads == 0 {
-            info.hidden_size.max(1)
-        } else {
-            (info.hidden_size / info.num_heads).max(1)
-        };
-        let num_kv_heads = if info.num_kv_heads == 0 {
-            info.num_heads.max(1)
-        } else {
-            info.num_kv_heads
-        };
-        std::sync::Arc::new(ferrum_models::executor::common::GenericKvCacheHandle::new(
-            info.num_layers,
-            num_kv_heads,
-            head_dim,
-            candle_core::Device::Cpu,
-            seq_len,
-            cache_id,
-        ))
-    }
-
-    pub(super) fn decode_ready_request_ids(&self, request_ids: &[RequestId]) -> Vec<RequestId> {
-        let sequences = self.sequences.read();
-        request_ids
-            .iter()
-            .filter(|rid| {
-                sequences.get(*rid).is_some_and(|seq| {
-                    seq.prefill_complete
-                        && seq.kv_cache_handle().is_some()
-                        && !seq.generated_tokens.is_empty()
-                })
-            })
-            .cloned()
-            .collect()
     }
 
     fn scheduler_trace_enabled(&self) -> bool {
@@ -1500,13 +1122,14 @@ impl EngineInner {
         &self,
         batch: &ferrum_interfaces::BatchPlan,
     ) -> SchedulerTracePlanStats {
+        #[cfg(test)]
+        self.trace_payload_builds.fetch_add(1, Ordering::Relaxed);
         let mut stats = SchedulerTracePlanStats {
             batch_size: batch.size(),
             ..SchedulerTracePlanStats::default()
         };
         let mut decode_generated_tokens = Vec::new();
         let mut prefill_prompt_tokens = Vec::new();
-        let sequences = self.sequences.read();
 
         for scheduled_req in &batch.requests {
             let request_id = &scheduled_req.request.id;
@@ -1517,7 +1140,9 @@ impl EngineInner {
             stats.scheduled_tokens_total += scheduled_tokens;
 
             let phase = self.scheduler.trace_phase(request_id);
-            let seq = sequences.get(request_id);
+            let handle = self.sequences.get(request_id);
+            let state = handle.as_ref().map(|handle| handle.lock());
+            let seq = state.as_ref().and_then(|state| state.as_ref());
             let prompt_tokens = seq.map(|seq| seq.prefill_context_len());
             let generated_tokens = seq.map(|seq| seq.generated_tokens.len());
             let prefill_tokens_processed = seq.map(|seq| seq.prefill_tokens_processed);
@@ -1581,17 +1206,28 @@ impl EngineInner {
         stats
     }
 
-    fn write_scheduler_trace_event(&self, event: serde_json::Value) {
-        let Some(file) = &self.legacy_scheduler_trace_jsonl else {
+    pub(in crate::continuous_engine) fn write_scheduler_trace_event(
+        &self,
+        build_event: impl FnOnce() -> serde_json::Value,
+    ) {
+        let Some(journal) = &self.legacy_scheduler_trace_jsonl else {
             return;
         };
-        let mut file = file.lock();
-        if let Err(error) = serde_json::to_writer(&mut *file, &event) {
-            warn!("Failed to write scheduler trace event: {}", error);
-            return;
-        }
-        if let Err(error) = file.write_all(b"\n") {
-            warn!("Failed to terminate scheduler trace event: {}", error);
+        #[cfg(test)]
+        self.trace_payload_builds.fetch_add(1, Ordering::Relaxed);
+        if let Err(error) = journal.try_enqueue(build_event()) {
+            let message = format!("enqueue scheduler trace: {error}");
+            let error = if matches!(
+                error.kind(),
+                ferrum_journal::JsonlJournalErrorKind::Encoding
+                    | ferrum_journal::JsonlJournalErrorKind::Panic
+                    | ferrum_journal::JsonlJournalErrorKind::Config
+            ) {
+                ExecutionEventSinkError::contract(message)
+            } else {
+                ExecutionEventSinkError::transport(message)
+            };
+            self.report_observation_failure(error);
         }
     }
 
@@ -1602,6 +1238,16 @@ impl EngineInner {
         let lock_wait_start = Instant::now();
         let iteration_guard = self.iteration_lock.lock().await;
         self.record_iteration_lock_wait(lock_wait_start.elapsed());
+        let close_error = self.drain_execution_closes().err();
+        let output_control_error = self.output_tasks.take_control_error();
+        if output_control_error.is_some() {
+            counter!("ferrum.engine.completion_control_errors_total").increment(1);
+        }
+        let failure_completion = self.complete_failed_execution_recomputes().await;
+        if let Some(error) = close_error.or(output_control_error) {
+            return Err(error);
+        }
+        failure_completion?;
         self.cancel_abandoned_requests().await?;
         self.complete_execution_readiness_failures().await?;
         self.prepare_prefix_rendezvous()?;
@@ -1639,35 +1285,48 @@ impl EngineInner {
         let hint_max_batch_size = hint.max_batch_size;
         let hint_max_tokens = hint.max_tokens;
 
-        // FERRUM_NEXT_BATCH_PROF=1: count Some/None returns to root-cause
-        // the apples HTTP-serve 17 ms inter-batch-iter gap. Prints every
-        // 1024 run_iteration calls. Set None_size to 0 explicitly so the
-        // bg-loop tight-spin theory can be confirmed.
-        let nb_prof = self.runtime_config.next_batch_prof;
         let sched_t0 = Instant::now();
-        let nb_t0 = if nb_prof { Some(Instant::now()) } else { None };
-        let plan_runtime_managed = self.model_executor.execution_resource_authority()
-            == ExecutionResourceAuthority::PlanRuntime;
-        if plan_runtime_managed && self.prepare_plan_runtime_prefill_cohort(&hint).await? {
+        // A planning iteration may contain multiple asynchronous admission
+        // rounds. Keep one immutable prediction version across all of them;
+        // prediction queries still use their current monotonic time.
+        let prefill_shape_policy = self.model_executor.prefill_shape_policy();
+        let mut planning = self.config.scheduler.slo.map(|policy| {
+            TimePlanningRound::new(
+                self.cost_snapshot_source
+                    .as_ref()
+                    .expect("feedback validated before startup")
+                    .load(),
+                policy,
+                prefill_shape_policy,
+            )
+        });
+        if self
+            .prepare_token_prefill_cohort(&hint, planning.as_mut())
+            .await?
+        {
             return Ok(EngineIterationOutcome::Progressed);
         }
-        let mut prefill_maintenance = Vec::new();
-        let nb_result = if plan_runtime_managed
-            && self.model_executor.supports_plan_runtime_prefix_restore()
-        {
-            let (_, maintenance) = self.prepare_dynamic_admission_round(hint.max_batch_size)?;
+        let selection_intent = self.scheduler.prepare_token_batch_selection(hint);
+        let (_, prefill_maintenance) = self
+            .prepare_dynamic_admission_round(hint_max_batch_size, planning.as_mut())
+            .await?;
+        let prefill_maintenance = PendingPrefillMaintenance::new(
+            self.model_executor.as_ref().as_ref(),
+            prefill_maintenance,
+        );
+        self.complete_typed_admission_failures().await?;
+        self.refresh_prefix_rendezvous()?;
+        if self.model_executor.supports_plan_runtime_prefix_restore() {
+            self.restore_admitted_prefixes().await?;
             self.refresh_prefix_rendezvous()?;
-            prefill_maintenance = maintenance;
-            let scheduled = async {
-                self.complete_typed_admission_failures().await?;
-                self.restore_admitted_prefixes().await?;
-                self.refresh_prefix_rendezvous()?;
-                let mut availability = self.dynamic_admission_availability.lock();
-                let epochs = self
-                    .model_executor
-                    .write_execution_capacity_snapshot(&mut availability)?
-                    .ok_or_else(|| FerrumError::scheduler("plan runtime lost admission epochs"))?;
-                let wake = AdmissionWakeSnapshot::new(
+        }
+        let (scheduled, observations) = {
+            let mut availability = self.dynamic_admission_availability.lock();
+            let epochs = self
+                .model_executor
+                .write_execution_capacity_snapshot(&mut availability)?;
+            let wake = epochs.map(|epochs| {
+                AdmissionWakeSnapshot::new(
                     AdmissionWakeEpochs::new(
                         epochs.coordinator_id,
                         epochs.release_epoch,
@@ -1675,144 +1334,31 @@ impl EngineInner {
                         0,
                     ),
                     &availability,
-                );
-                let mut observations = Vec::new();
-                let scheduled = self.scheduler.next_batch_with_prepared_admission_observed(
-                    hint,
-                    wake,
-                    &mut |observation| observations.push(observation),
-                );
-                drop(availability);
-                for observation in observations {
-                    self.trace_executor_admission_queue_observation(observation);
-                }
-                scheduled
-            }
-            .await;
-            if scheduled.is_err() {
-                for deferral in &prefill_maintenance {
-                    self.model_executor
-                        .cancel_prefill_admission(deferral.request_id());
-                }
-                prefill_maintenance.clear();
-            }
-            scheduled?
-        } else if plan_runtime_managed {
-            let mut availability = self.dynamic_admission_availability.lock();
-            let epochs = self
-                .model_executor
-                .write_execution_capacity_snapshot(&mut availability)?
-                .ok_or_else(|| {
-                    FerrumError::scheduler("plan runtime did not expose typed admission epochs")
-                })?;
-            let wake_epochs = AdmissionWakeEpochs::new(
-                epochs.coordinator_id,
-                epochs.release_epoch,
-                epochs.capacity_epoch,
-                0,
-            );
-            let wake = AdmissionWakeSnapshot::new(wake_epochs, &availability);
-            let capture_trace = self.scheduler_trace_jsonl.is_some();
-            // The scheduler invokes queue-observation and admission-probe
-            // callbacks in causal order. Keep one buffer so trace emission
-            // cannot reorder a released pressure hold behind its admission.
-            let scheduler_trace_records = capture_trace
-                .then(|| std::cell::RefCell::new(Vec::<ExecutorSchedulerTraceRecord>::new()));
-            let mut probe = |request: &InferenceRequest| {
-                let result = self.probe_executor_prefill_admission(request, capture_trace);
-                if let Some(maintenance) = result.maintenance {
-                    prefill_maintenance.push(maintenance);
-                }
-                if let (Some(records), Some(trace)) = (&scheduler_trace_records, result.trace) {
-                    records
-                        .borrow_mut()
-                        .push(ExecutorSchedulerTraceRecord::PrefillAdmission(trace));
-                }
-                result.outcome
-            };
-            let scheduled = if let Some(records) = &scheduler_trace_records {
-                self.scheduler.next_batch_with_dynamic_admission_observed(
-                    hint,
-                    wake,
-                    &mut probe,
-                    &mut |observation| {
-                        records.borrow_mut().push(
-                            ExecutorSchedulerTraceRecord::AdmissionQueueObservation(observation),
-                        )
-                    },
                 )
-            } else {
-                self.scheduler
-                    .next_batch_with_dynamic_admission(hint, wake, &mut probe)
-            };
-            drop(availability);
-            drop(probe);
-            if let Some(records) = scheduler_trace_records {
-                for record in records.into_inner() {
-                    match record {
-                        ExecutorSchedulerTraceRecord::PrefillAdmission(trace) => {
-                            self.trace_executor_prefill_admission(trace);
-                        }
-                        ExecutorSchedulerTraceRecord::AdmissionQueueObservation(observation) => {
-                            self.trace_executor_admission_queue_observation(observation);
-                        }
-                    }
-                }
-            }
-            if scheduled.is_err() {
-                for deferral in &prefill_maintenance {
-                    self.model_executor
-                        .cancel_prefill_admission(deferral.request_id());
-                }
-                prefill_maintenance.clear();
-            }
-            scheduled?
-        } else {
-            self.scheduler.next_batch(hint).await
+            });
+            let mut observations = Vec::new();
+            let scheduled = self.scheduler.next_batch_with_token_admissions(
+                selection_intent,
+                wake,
+                &mut |observation| observations.push(observation),
+                planning.as_mut(),
+            );
+            (scheduled, observations)
         };
+        for observation in observations {
+            self.trace_executor_admission_queue_observation(observation);
+        }
+        let nb_result = scheduled?;
         self.complete_typed_admission_failures().await?;
         let sched_elapsed = sched_t0.elapsed();
         self.record_scheduling_time(sched_elapsed);
-        if let Some(t0) = nb_t0 {
-            use std::sync::atomic::AtomicU64;
-            static SOME_N: AtomicU64 = AtomicU64::new(0);
-            static NONE_N: AtomicU64 = AtomicU64::new(0);
-            static SOME_US: AtomicU64 = AtomicU64::new(0);
-            static NONE_US: AtomicU64 = AtomicU64::new(0);
-            let us = t0.elapsed().as_micros() as u64;
-            let is_some = nb_result.is_some();
-            let batch_size = nb_result.as_ref().map_or(0, |b| b.size());
-            if is_some {
-                SOME_N.fetch_add(1, Ordering::Relaxed);
-                SOME_US.fetch_add(us, Ordering::Relaxed);
-            } else {
-                NONE_N.fetch_add(1, Ordering::Relaxed);
-                NONE_US.fetch_add(us, Ordering::Relaxed);
-            }
-            let total = SOME_N.load(Ordering::Relaxed) + NONE_N.load(Ordering::Relaxed);
-            if total.is_multiple_of(1024) {
-                let s_n = SOME_N.load(Ordering::Relaxed);
-                let n_n = NONE_N.load(Ordering::Relaxed);
-                let s_us = SOME_US.load(Ordering::Relaxed);
-                let n_us = NONE_US.load(Ordering::Relaxed);
-                eprintln!(
-                    "[nb-prof] total={} some={} none={} ratio={:.3} | some_avg={}us none_avg={}us last_batch_size={} last_was_some={}",
-                    total,
-                    s_n,
-                    n_n,
-                    s_n as f64 / total as f64,
-                    if s_n > 0 { s_us / s_n } else { 0 },
-                    if n_n > 0 { n_us / n_n } else { 0 },
-                    batch_size,
-                    is_some,
-                );
-            }
-        }
 
-        let batch = match nb_result {
+        let retry_at = nb_result.retry_at;
+        let time_blocked = nb_result.time_blocked;
+        let batch = match nb_result.batch {
             Some(b) => b,
             None => {
-                self.execute_executor_prefill_maintenance(prefill_maintenance);
+                self.execute_executor_prefill_maintenance(prefill_maintenance.into_pending());
                 self.complete_typed_admission_failures().await?;
                 if trace_enabled {
                     let none_streak = self
@@ -1820,24 +1366,26 @@ impl EngineInner {
                         .fetch_add(1, Ordering::Relaxed)
                         + 1;
                     if none_streak <= 4 || none_streak.is_multiple_of(128) {
-                        self.write_scheduler_trace_event(serde_json::json!({
-                            "event": "scheduler_iteration",
-                            "iteration": iteration,
-                            "result": "none",
-                            "none_streak": none_streak,
-                            "hint": {
-                                "max_batch_size": hint_max_batch_size,
-                                "max_tokens": hint_max_tokens,
-                            },
-                            "scheduler_before": trace_scheduler_before.as_ref(),
-                            "scheduler_after_schedule": self.scheduler.trace_snapshot(),
-                            "timing_us": {
-                                "schedule": duration_to_us(sched_elapsed),
-                            },
-                        }));
+                        self.write_scheduler_trace_event(|| {
+                            serde_json::json!({
+                                "event": "scheduler_iteration",
+                                "iteration": iteration,
+                                "result": "none",
+                                "none_streak": none_streak,
+                                "hint": {
+                                    "max_batch_size": hint_max_batch_size,
+                                    "max_tokens": hint_max_tokens,
+                                },
+                                "scheduler_before": trace_scheduler_before.as_ref(),
+                                "scheduler_after_schedule": self.scheduler.trace_snapshot(),
+                                "timing_us": {
+                                    "schedule": duration_to_us(sched_elapsed),
+                                },
+                            })
+                        });
                     }
                 }
-                if plan_runtime_managed {
+                {
                     if let Some(observed) = self.scheduler.passive_capacity_wait_condition()? {
                         let registration = self
                             .model_executor
@@ -1847,17 +1395,42 @@ impl EngineInner {
                                     "plan runtime did not register its capacity waiter",
                                 )
                             })?;
-                        return Ok(EngineIterationOutcome::CapacityBlocked(registration));
+                        return Ok(EngineIterationOutcome::Waiting {
+                            capacity: Some(registration),
+                            retry_at,
+                        });
                     }
-                    if self.scheduler.all_active_execution_readiness_blocked() {
-                        return Ok(EngineIterationOutcome::Idle);
+                    if self.scheduler.all_active_execution_readiness_blocked()
+                        || self.scheduler.all_active_allocator_capacity_blocked()
+                    {
+                        return Ok(EngineIterationOutcome::Waiting {
+                            capacity: None,
+                            retry_at,
+                        });
                     }
+                }
+                if self.scheduler.active_count() == 0
+                    && self.scheduler.waiting_for_confirmed_capacity_release()
+                {
+                    return Ok(EngineIterationOutcome::Waiting {
+                        capacity: None,
+                        retry_at,
+                    });
+                }
+                if time_blocked {
+                    return Ok(EngineIterationOutcome::Waiting {
+                        capacity: None,
+                        retry_at,
+                    });
                 }
                 if self.scheduler.active_count() > 0 {
                     return Ok(EngineIterationOutcome::Progressed);
                 }
                 return if self.scheduler.waiting_count() == 0 {
-                    Ok(EngineIterationOutcome::Idle)
+                    Ok(EngineIterationOutcome::Waiting {
+                        capacity: None,
+                        retry_at,
+                    })
                 } else {
                     Ok(EngineIterationOutcome::Progressed)
                 };
@@ -1882,48 +1455,24 @@ impl EngineInner {
         // selected batch owns its request authorities, so new ingress may be
         // published while the device executes this wave.
         drop(iteration_guard);
-        // Fit only completed work. Planned tokens can disappear through
-        // cancellation, cache reuse or capacity deferral; they are not execution
-        // samples. Read these counters only when the optional policy is enabled.
-        let slo_before = self.config.scheduler.slo.as_ref().and_then(|_| {
-            let planned_tokens = batch
-                .requests
-                .iter()
-                .map(|request| request.tokens_to_process)
-                .sum::<Option<usize>>()?;
-            Some((
-                self.total_prefill_tokens.load(Ordering::Relaxed),
-                self.total_decode_tokens.load(Ordering::Relaxed),
-                planned_tokens as u64,
-            ))
-        });
         let process_t0 = Instant::now();
-        let r = self.process_batch(&batch).await;
+        let r = self
+            .process_batch_with_shape(
+                &batch,
+                prefill_shape_policy,
+                planning
+                    .as_ref()
+                    .is_some_and(|round| round.selection_is_exact(batch.size())),
+            )
+            .await;
         let process_elapsed = process_t0.elapsed();
         self.record_model_execution_time(process_elapsed);
-        if let Some((prefill_before, decode_before, planned_tokens)) = slo_before {
-            let prefill = self
-                .total_prefill_tokens
-                .load(Ordering::Relaxed)
-                .saturating_sub(prefill_before);
-            let decode = self
-                .total_decode_tokens
-                .load(Ordering::Relaxed)
-                .saturating_sub(decode_before);
-            if r.is_ok() && prefill + decode > 0 && prefill + decode == planned_tokens {
-                self.scheduler.record_execution_step(
-                    prefill as usize,
-                    decode as usize,
-                    sched_elapsed + process_elapsed,
-                );
-            }
-        }
-        self.execute_executor_prefill_maintenance(prefill_maintenance);
+        self.execute_executor_prefill_maintenance(prefill_maintenance.into_pending());
         self.complete_typed_admission_failures().await?;
         if trace_enabled {
             let prefill_tokens_after = self.total_prefill_tokens.load(Ordering::Relaxed);
             let decode_tokens_after = self.total_decode_tokens.load(Ordering::Relaxed);
-            self.write_scheduler_trace_event(serde_json::json!({
+            self.write_scheduler_trace_event(|| serde_json::json!({
                 "event": "scheduler_iteration",
                 "iteration": iteration,
                 "result": if r.is_ok() { "some_ok" } else { "some_error" },
@@ -1957,33 +1506,14 @@ impl EngineInner {
         if let (Some(t0), Some(ts)) = (t_iter_start, t_after_sched) {
             let n = self.iteration_count.load(Ordering::Relaxed);
             if n < 64 || n.is_multiple_of(32) {
-                let total = t0.elapsed().as_micros();
-                let sched = ts.duration_since(t0).as_micros();
-                let proc = ts.elapsed().as_micros();
-                eprintln!(
-                    "[iter-prof] iter#{} total={}us sched={}us process={}us batch_size={}",
+                self.record_host_observation(EngineHostObservation::Iteration {
                     iteration,
-                    total,
-                    sched,
-                    proc,
-                    batch.size()
-                );
-                let profile = global_profile();
-                if profile.is_enabled() {
-                    let _ = profile.push_event(
-                        "iter_prof",
-                        profile_fields_from_json(serde_json::json!({
-                            "iter": iteration,
-                            "batch_size": batch.size(),
-                        })),
-                        profile_fields_from_json(serde_json::json!({
-                            "total": total,
-                            "sched": sched,
-                            "process": proc,
-                        })),
-                        false,
-                    );
-                }
+                    batch_size: batch.size(),
+                    started: t0,
+                    scheduled: ts,
+                    completed: Instant::now(),
+                    error: r.as_ref().err(),
+                });
             }
         }
         r?;

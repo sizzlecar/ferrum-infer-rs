@@ -25,6 +25,7 @@ use ferrum_runtime::{
     DeviceReusableExecutionProgram, DeviceReusableExecutionProgramGap,
     DeviceReusableExecutionProgramGapReason, DeviceReusableExecutionProgramId,
     DeviceReusableExecutionSegment, DeviceSubmissionTimingSink, DeviceTimingMode, ElementType,
+    ExecutionFactsCapture, ProjectionInvocationTemplate,
 };
 use sha2::{Digest, Sha256};
 
@@ -288,6 +289,10 @@ struct CudaExecutableSegment {
     _blas: Arc<CudaBlas>,
     _executables: Vec<Arc<CudaCommandExecutable>>,
     command_graph_node_counts: Option<Arc<[u32]>>,
+    // Only descriptions from the commands actually captured by this entry.
+    // None means capture ran with observation disabled; an individual empty
+    // slot means that captured compute command has no supported producer.
+    execution_facts: Option<CudaCapturedComputeFacts>,
     uploaded: bool,
     last_used: u64,
     profile_identity: OnceLock<CudaExecutableProfileIdentity>,
@@ -644,6 +649,7 @@ impl CudaExecutableSegment {
         stream: &Arc<CudaStream>,
         blas: &Arc<CudaBlas>,
         commands: &[CudaDeviceCommand],
+        facts_capture: ExecutionFactsCapture,
         last_used: u64,
     ) -> Result<Self, CudaReplayError> {
         let capture_status = unsafe {
@@ -755,6 +761,12 @@ impl CudaExecutableSegment {
             _blas: Arc::clone(blas),
             _executables: commands.iter().map(CudaDeviceCommand::executable).collect(),
             command_graph_node_counts,
+            execution_facts: (facts_capture == ExecutionFactsCapture::On).then(|| {
+                commands
+                    .iter()
+                    .map(CudaDeviceCommand::execution_facts)
+                    .collect()
+            }),
             uploaded: false,
             last_used,
             profile_identity: OnceLock::new(),
@@ -1041,13 +1053,20 @@ impl CudaExecutableProgram {
     }
 }
 
+pub(crate) type CudaCapturedComputeFacts = Arc<[Option<Arc<[ProjectionInvocationTemplate]>>]>;
+
 pub(crate) struct CudaExecutableLaunch {
     reusable_executable_fingerprint: Option<Arc<str>>,
     reusable_graph_node_counts: Option<Arc<[u32]>>,
     replayed_logical_commands: Option<Arc<[DeviceReplayedLogicalCommandAttribution]>>,
+    execution_facts: Option<CudaCapturedComputeFacts>,
 }
 
 impl CudaExecutableLaunch {
+    pub(crate) fn execution_facts(&self) -> Option<&CudaCapturedComputeFacts> {
+        self.execution_facts.as_ref()
+    }
+
     pub(crate) fn reusable_executable_fingerprint(&self) -> Option<Arc<str>> {
         self.reusable_executable_fingerprint
             .as_ref()
@@ -1192,6 +1211,7 @@ impl CudaExecutableCache {
         commands: &[CudaDeviceCommand],
         candidates: &[CudaExecutableCandidate],
         capture_allowed: bool,
+        facts_capture: ExecutionFactsCapture,
     ) -> Result<CudaExecutablePreparation, CudaReplayError> {
         let mut report = CudaExecutablePreparation::default();
         for candidate in candidates {
@@ -1325,6 +1345,7 @@ impl CudaExecutableCache {
                 stream,
                 blas,
                 candidate.commands(commands),
+                facts_capture,
                 now,
             ) {
                 Ok(entry) => captured.push((key, entry)),
@@ -1751,6 +1772,7 @@ impl CudaExecutableCache {
         invocation: &DeviceReusableExecutionInvocation,
         timing_mode: DeviceTimingMode,
         retain_logical_attribution: bool,
+        facts_capture: ExecutionFactsCapture,
         timing_sink: &S,
     ) -> Result<Option<CudaExecutableLaunch>, CudaReplayError> {
         let Some(program) = self.programs.get(invocation.program_id()) else {
@@ -1800,6 +1822,9 @@ impl CudaExecutableCache {
             reusable_executable_fingerprint: profile_fingerprint.or(sealed_fingerprint),
             reusable_graph_node_counts,
             replayed_logical_commands,
+            execution_facts: (facts_capture == ExecutionFactsCapture::On)
+                .then(|| entry.execution_facts.clone())
+                .flatten(),
         }))
     }
 
@@ -1853,6 +1878,7 @@ impl CudaExecutableCache {
         stream: &CudaStream,
         candidate: &CudaExecutableCandidate,
         timing_mode: DeviceTimingMode,
+        facts_capture: ExecutionFactsCapture,
         timing_sink: &S,
     ) -> Result<Option<CudaExecutableLaunch>, CudaReplayError> {
         let now = self.tick();
@@ -1865,6 +1891,9 @@ impl CudaExecutableCache {
             reusable_executable_fingerprint,
             reusable_graph_node_counts,
             replayed_logical_commands: None,
+            execution_facts: (facts_capture == ExecutionFactsCapture::On)
+                .then(|| entry.execution_facts.clone())
+                .flatten(),
         }))
     }
 

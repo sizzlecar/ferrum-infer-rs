@@ -106,4 +106,12 @@ pub trait MarlinExpertStack<B: Backend>: Send + Sync {
         expert_n: usize,
         bias_host: Option<&[f32]>,
     ) -> Result<Box<dyn Linear<B> + Send + Sync>>;
+    /// Build a view and upload its optional bias on the owning instance's stream.
+    fn make_expert_linear_in_context(
+        self: Arc<Self>,
+        ctx: &mut B::Context,
+        expert_offset: usize,
+        expert_n: usize,
+        bias_host: Option<&[f32]>,
+    ) -> Result<Box<dyn Linear<B> + Send + Sync>>;
 }

@@ -7,8 +7,8 @@
 
 #![cfg(all(target_os = "macos", feature = "metal"))]
 
+use crate::attention::metal::pipelines::MetalPipelines;
 use std::ffi::c_void;
-use std::sync::OnceLock;
 
 use metal::{
     Buffer, CompileOptions, ComputeCommandEncoderRef, ComputePipelineState, Device, MTLSize,
@@ -19,35 +19,28 @@ const KERNEL_NAME: &str = "moe_router_topk_softmax_f32";
 const IDS_TPE_KERNEL_NAME: &str = "moe_compute_ids_tpe_f32";
 const IDS_TPE_THREADS: u64 = 256;
 
-static PIPELINE: OnceLock<ComputePipelineState> = OnceLock::new();
-static IDS_TPE_PIPELINE: OnceLock<ComputePipelineState> = OnceLock::new();
-
-fn pipeline(device: &Device) -> &'static ComputePipelineState {
-    PIPELINE.get_or_init(|| {
-        let lib = device
-            .new_library_with_source(SHADER_SRC, &CompileOptions::new())
-            .expect("compile moe_router.metal");
-        let function = lib
-            .get_function(KERNEL_NAME, None)
-            .expect("find moe_router_topk_softmax_f32");
-        device
-            .new_compute_pipeline_state_with_function(&function)
-            .expect("build moe_router_topk_softmax_f32 pipeline")
-    })
+pub(crate) fn build_pipeline(device: &Device) -> ComputePipelineState {
+    let lib = device
+        .new_library_with_source(SHADER_SRC, &CompileOptions::new())
+        .expect("compile moe_router.metal");
+    let function = lib
+        .get_function(KERNEL_NAME, None)
+        .expect("find moe_router_topk_softmax_f32");
+    device
+        .new_compute_pipeline_state_with_function(&function)
+        .expect("build moe_router_topk_softmax_f32 pipeline")
 }
 
-fn ids_tpe_pipeline(device: &Device) -> &'static ComputePipelineState {
-    IDS_TPE_PIPELINE.get_or_init(|| {
-        let lib = device
-            .new_library_with_source(SHADER_SRC, &CompileOptions::new())
-            .expect("compile moe_router.metal");
-        let function = lib
-            .get_function(IDS_TPE_KERNEL_NAME, None)
-            .expect("find moe_compute_ids_tpe_f32");
-        device
-            .new_compute_pipeline_state_with_function(&function)
-            .expect("build moe_compute_ids_tpe_f32 pipeline")
-    })
+pub(crate) fn build_ids_tpe_pipeline(device: &Device) -> ComputePipelineState {
+    let lib = device
+        .new_library_with_source(SHADER_SRC, &CompileOptions::new())
+        .expect("compile moe_router.metal");
+    let function = lib
+        .get_function(IDS_TPE_KERNEL_NAME, None)
+        .expect("find moe_compute_ids_tpe_f32");
+    device
+        .new_compute_pipeline_state_with_function(&function)
+        .expect("build moe_compute_ids_tpe_f32 pipeline")
 }
 
 /// Dispatch the GPU-side router kernel on an existing compute encoder.
@@ -60,8 +53,8 @@ fn ids_tpe_pipeline(device: &Device) -> &'static ComputePipelineState {
 ///   index-wins tie-breaking to match the host `route()` reference)
 /// - `out_weights`: `[batch, top_k]` f32 (post-softmax probabilities,
 ///   optionally renormalised so each row sums to 1)
-pub fn dispatch_route_topk_softmax(
-    device: &Device,
+pub(crate) fn dispatch_route_topk_softmax(
+    pipes: &MetalPipelines,
     enc: &ComputeCommandEncoderRef,
     logits: &Buffer,
     out_ids: &Buffer,
@@ -86,7 +79,7 @@ pub fn dispatch_route_topk_softmax(
         norm_topk_prob: if norm_topk_prob { 1 } else { 0 },
     };
 
-    let pipe = pipeline(device);
+    let pipe = pipes.moe_router_pipeline();
     enc.set_compute_pipeline_state(pipe);
     enc.set_buffer(0, Some(logits), 0);
     enc.set_buffer(1, Some(out_ids), 0);
@@ -127,8 +120,8 @@ pub fn dispatch_route_topk_softmax(
 /// require a separate compaction pass; the GEMM kernel's
 /// `r1 >= tpe[e]` early-exit handles the over-strided indices for free.
 #[allow(clippy::too_many_arguments)]
-pub fn dispatch_compute_ids_tpe(
-    device: &Device,
+pub(crate) fn dispatch_compute_ids_tpe(
+    pipes: &MetalPipelines,
     enc: &ComputeCommandEncoderRef,
     selected_ids: &Buffer,
     tpe: &Buffer,
@@ -160,7 +153,7 @@ pub fn dispatch_compute_ids_tpe(
         m_down: m_down as i32,
     };
 
-    let pipe = ids_tpe_pipeline(device);
+    let pipe = pipes.moe_router_ids_tpe_pipeline();
     enc.set_compute_pipeline_state(pipe);
     enc.set_buffer(0, Some(selected_ids), 0);
     enc.set_buffer(1, Some(tpe), 0);
@@ -195,6 +188,7 @@ mod tests {
             eprintln!("no Metal device — skipping");
             return;
         };
+        let pipes = MetalPipelines::new(&device);
         let queue = device.new_command_queue();
 
         let batch = 3;
@@ -227,7 +221,7 @@ mod tests {
         let cmd = queue.new_command_buffer();
         let enc = cmd.new_compute_command_encoder();
         dispatch_route_topk_softmax(
-            &device,
+            &pipes,
             enc,
             &logits_buf,
             &ids_buf,
@@ -303,6 +297,7 @@ mod tests {
             eprintln!("no Metal device — skipping");
             return;
         };
+        let pipes = MetalPipelines::new(&device);
         let queue = device.new_command_queue();
 
         let batch = 5usize;
@@ -345,7 +340,7 @@ mod tests {
         let cmd = queue.new_command_buffer();
         let enc = cmd.new_compute_command_encoder();
         dispatch_compute_ids_tpe(
-            &device,
+            &pipes,
             enc,
             &sel_buf,
             &tpe_buf,

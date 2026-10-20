@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "operator": "ferrum.cuda.vllm_moe_marlin",
-  "operator_abi_version": "1",
+  "operator_abi_version": "3",
   "backend": "cuda",
   "compute_capabilities": [
     "sm_89"
@@ -37,11 +37,9 @@
     }
   ],
   "required_exports": [
-    "ferrum_vllm_marlin_moe_clear_profile_config",
     "ferrum_vllm_marlin_moe_f16",
     "ferrum_vllm_marlin_moe_fp8_f16",
-    "ferrum_vllm_marlin_moe_mxfp4_bf16",
-    "ferrum_vllm_marlin_moe_set_profile_config"
+    "ferrum_vllm_marlin_moe_mxfp4_bf16"
   ],
   "license_files": [
     {

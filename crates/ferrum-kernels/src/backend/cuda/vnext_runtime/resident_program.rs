@@ -389,6 +389,7 @@ pub(super) fn encode(
         program_binding_patch: None,
         binding_program: Some(Arc::clone(&data.projection)),
         reusable_execution: None,
+        execution_facts: None,
         completion_checks: Vec::new(),
     };
     let dependency_data = Arc::clone(data);
@@ -443,6 +444,7 @@ pub(super) fn encode(
         program_binding_patch: None,
         binding_program: None,
         reusable_execution: None,
+        execution_facts: None,
         completion_checks: Vec::new(),
     };
     let dependencies = request

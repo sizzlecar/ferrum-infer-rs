@@ -11,8 +11,9 @@
 //! - Easy testing with mock components
 
 use async_trait::async_trait;
-use ferrum_execution::ModelExecutor;
-use ferrum_interfaces::{KvCacheManager, Sampler, SchedulerInterface as Scheduler, Tokenizer};
+use ferrum_execution::executor_lifecycle::ExecutorOwner;
+use ferrum_execution::{ExecutorBuildError, ExecutorBuildResult, ModelExecutor};
+use ferrum_interfaces::{Sampler, SchedulerInterface as Scheduler, Tokenizer};
 use ferrum_models::vnext::{DefinedProductionModel, ProductionModelSourceBundle};
 use ferrum_types::{Device, EngineConfig, FerrumError, Result};
 use parking_lot::RwLock;
@@ -32,9 +33,9 @@ mod source_binding_tests;
 
 /// Factory trait for creating components
 #[async_trait]
-pub trait ComponentFactory<T>: Send + Sync {
+pub trait ComponentFactory<T, E = FerrumError>: Send + Sync {
     /// Create a component instance
-    async fn create(&self, config: &ComponentConfig) -> Result<T>;
+    async fn create(&self, config: &ComponentConfig) -> std::result::Result<T, E>;
 
     /// Get component metadata
     fn metadata(&self) -> ComponentMetadata;
@@ -155,10 +156,8 @@ pub struct ComponentRegistry {
         RwLock<HashMap<String, Arc<dyn ComponentFactory<Arc<dyn Sampler + Send + Sync>>>>>,
     scheduler_factories:
         RwLock<HashMap<String, Arc<dyn ComponentFactory<Arc<dyn Scheduler + Send + Sync>>>>>,
-    kv_cache_factories:
-        RwLock<HashMap<String, Arc<dyn ComponentFactory<Arc<dyn KvCacheManager + Send + Sync>>>>>,
     executor_factories:
-        RwLock<HashMap<String, Arc<dyn ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>>>>>,
+        RwLock<HashMap<String, Arc<dyn ComponentFactory<ExecutorOwner, ExecutorBuildError>>>>,
 }
 
 impl ComponentRegistry {
@@ -168,7 +167,6 @@ impl ComponentRegistry {
             tokenizer_factories: RwLock::new(HashMap::new()),
             sampler_factories: RwLock::new(HashMap::new()),
             scheduler_factories: RwLock::new(HashMap::new()),
-            kv_cache_factories: RwLock::new(HashMap::new()),
             executor_factories: RwLock::new(HashMap::new()),
         }
     }
@@ -195,20 +193,15 @@ impl ComponentRegistry {
         // Scheduler factories
         self.register_scheduler_factory("continuous", Arc::new(ContinuousBatchSchedulerFactory));
 
-        // KV cache factories
-        self.register_kv_cache_factory("default", Arc::new(DefaultKvCacheFactory));
-        self.register_kv_cache_factory("paged", Arc::new(PagedKvCacheFactory));
-
         // Executor factories
         self.register_executor_factory("stub", Arc::new(StubExecutorFactory));
         self.register_executor_factory("llm", Arc::new(LlmExecutorFactory));
 
         debug!(
-            "Registered factories - tokenizers: {:?}, samplers: {:?}, schedulers: {:?}, kv_caches: {:?}, executors: {:?}",
+            "Registered factories - tokenizers: {:?}, samplers: {:?}, schedulers: {:?}, executors: {:?}",
             self.list_tokenizers(),
             self.list_samplers(),
             self.list_schedulers(),
-            self.list_kv_caches(),
             self.list_executors()
         );
     }
@@ -250,22 +243,11 @@ impl ComponentRegistry {
         self.scheduler_factories.write().insert(name, factory);
     }
 
-    /// Register a KV cache factory
-    pub fn register_kv_cache_factory(
-        &self,
-        name: impl Into<String>,
-        factory: Arc<dyn ComponentFactory<Arc<dyn KvCacheManager + Send + Sync>>>,
-    ) {
-        let name = name.into();
-        debug!("Registering KV cache factory: {}", name);
-        self.kv_cache_factories.write().insert(name, factory);
-    }
-
     /// Register a model executor factory
     pub fn register_executor_factory(
         &self,
         name: impl Into<String>,
-        factory: Arc<dyn ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>>>,
+        factory: Arc<dyn ComponentFactory<ExecutorOwner, ExecutorBuildError>>,
     ) {
         let name = name.into();
         debug!("Registering executor factory: {}", name);
@@ -300,19 +282,11 @@ impl ComponentRegistry {
         self.scheduler_factories.read().get(name).cloned()
     }
 
-    /// Get a KV cache factory by name
-    pub fn get_kv_cache_factory(
-        &self,
-        name: &str,
-    ) -> Option<Arc<dyn ComponentFactory<Arc<dyn KvCacheManager + Send + Sync>>>> {
-        self.kv_cache_factories.read().get(name).cloned()
-    }
-
     /// Get a model executor factory by name
     pub fn get_executor_factory(
         &self,
         name: &str,
-    ) -> Option<Arc<dyn ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>>>> {
+    ) -> Option<Arc<dyn ComponentFactory<ExecutorOwner, ExecutorBuildError>>> {
         self.executor_factories.read().get(name).cloned()
     }
 
@@ -333,11 +307,6 @@ impl ComponentRegistry {
     /// List all registered scheduler names
     pub fn list_schedulers(&self) -> Vec<String> {
         self.scheduler_factories.read().keys().cloned().collect()
-    }
-
-    /// List all registered KV cache names
-    pub fn list_kv_caches(&self) -> Vec<String> {
-        self.kv_cache_factories.read().keys().cloned().collect()
     }
 
     /// List all registered executor names
@@ -397,28 +366,12 @@ impl ComponentRegistry {
         factory.create(config).await
     }
 
-    /// Create a KV cache manager by name
-    pub async fn create_kv_cache(
-        &self,
-        name: &str,
-        config: &ComponentConfig,
-    ) -> Result<Arc<dyn KvCacheManager + Send + Sync>> {
-        let factory = self.get_kv_cache_factory(name).ok_or_else(|| {
-            FerrumError::internal(format!(
-                "KV cache '{}' not found. Available: {:?}",
-                name,
-                self.list_kv_caches()
-            ))
-        })?;
-        factory.create(config).await
-    }
-
     /// Create a model executor by name
     pub async fn create_executor(
         &self,
         name: &str,
         config: &ComponentConfig,
-    ) -> Result<Arc<dyn ModelExecutor + Send + Sync>> {
+    ) -> ExecutorBuildResult<ExecutorOwner> {
         let factory = self.get_executor_factory(name).ok_or_else(|| {
             FerrumError::model(format!(
                 "Executor '{}' not found. Available: {:?}",
@@ -442,7 +395,6 @@ impl std::fmt::Debug for ComponentRegistry {
             .field("tokenizers", &self.list_tokenizers())
             .field("samplers", &self.list_samplers())
             .field("schedulers", &self.list_schedulers())
-            .field("kv_caches", &self.list_kv_caches())
             .field("executors", &self.list_executors())
             .finish()
     }
@@ -458,9 +410,8 @@ impl std::fmt::Debug for ComponentRegistry {
 
 // CandleBackendFactory deleted in Phase: legacy `ComputeBackend` trait
 // gone; the registry's component graph never produced a runtime backend
-// (`_backend` in builder.rs was unused). The stub-executor factory now
-// constructs `CandleTensorFactory` directly when it needs to mint dummy
-// logits; everything else dispatches via `Backend<B>` in ferrum-kernels.
+// (`_backend` in builder.rs was unused). Executor implementations own their
+// backend resources and dispatch via `Backend<B>` in ferrum-kernels.
 
 // ----------------------------------------------------------------------------
 // Tokenizer Factories
@@ -472,6 +423,12 @@ pub struct HuggingFaceTokenizerFactory;
 #[async_trait]
 impl ComponentFactory<Arc<dyn Tokenizer + Send + Sync>> for HuggingFaceTokenizerFactory {
     async fn create(&self, config: &ComponentConfig) -> Result<Arc<dyn Tokenizer + Send + Sync>> {
+        config
+            .engine_config
+            .model
+            .tokenizer
+            .decode_cache
+            .validate()?;
         if let Some(sources) = config.model_sources.as_ref() {
             let tokenizer =
                 ferrum_tokenizer::implementations::HuggingFaceTokenizer::from_source_bytes(
@@ -479,7 +436,10 @@ impl ComponentFactory<Arc<dyn Tokenizer + Send + Sync>> for HuggingFaceTokenizer
                     sources.tokenizer_config_json(),
                     sources.generation_config_json(),
                 )
-                .await?;
+                .await?
+                .with_decode_cache_config(
+                    config.engine_config.model.tokenizer.decode_cache.clone(),
+                )?;
             info!(
                 tokenizer_root = %sources.tokenizer_root().display(),
                 "Loaded HuggingFace tokenizer from typed product sources"
@@ -521,6 +481,9 @@ impl ComponentFactory<Arc<dyn Tokenizer + Send + Sync>> for HuggingFaceTokenizer
                 .await
                 {
                     Ok(tokenizer) => {
+                        let tokenizer = tokenizer.with_decode_cache_config(
+                            config.engine_config.model.tokenizer.decode_cache.clone(),
+                        )?;
                         info!("HuggingFace tokenizer loaded successfully");
                         return Ok(Arc::new(tokenizer));
                     }
@@ -667,93 +630,6 @@ impl ComponentFactory<Arc<dyn Scheduler + Send + Sync>> for ContinuousBatchSched
 }
 
 // ----------------------------------------------------------------------------
-// KV Cache Factories
-// ----------------------------------------------------------------------------
-
-/// Default KV cache factory
-pub struct DefaultKvCacheFactory;
-
-#[async_trait]
-impl ComponentFactory<Arc<dyn KvCacheManager + Send + Sync>> for DefaultKvCacheFactory {
-    async fn create(
-        &self,
-        config: &ComponentConfig,
-    ) -> Result<Arc<dyn KvCacheManager + Send + Sync>> {
-        let block_size = config.engine_config.kv_cache.block_size;
-        let max_blocks = config.engine_config.kv_cache.max_blocks;
-
-        info!(
-            "Creating default KV cache manager: device={:?}, block_size={}, max_blocks={}",
-            config.device, block_size, max_blocks
-        );
-
-        let manager = ferrum_kv::managers::DefaultKvCacheManager::new(
-            config.device.clone(),
-            block_size,
-            max_blocks,
-        )?;
-        Ok(Arc::new(manager))
-    }
-
-    fn metadata(&self) -> ComponentMetadata {
-        ComponentMetadata {
-            name: "default".to_string(),
-            version: "0.1.0".to_string(),
-            description: "Default contiguous KV cache manager".to_string(),
-            supported_devices: cpu_cuda_and_optional_metal_devices(),
-            capabilities: vec!["contiguous".to_string()],
-        }
-    }
-}
-
-/// Paged KV cache factory (for PagedAttention)
-pub struct PagedKvCacheFactory;
-
-#[async_trait]
-impl ComponentFactory<Arc<dyn KvCacheManager + Send + Sync>> for PagedKvCacheFactory {
-    async fn create(
-        &self,
-        config: &ComponentConfig,
-    ) -> Result<Arc<dyn KvCacheManager + Send + Sync>> {
-        let block_size = config.engine_config.kv_cache.block_size;
-        let max_blocks = config.engine_config.kv_cache.max_blocks;
-
-        info!(
-            "Creating paged KV cache manager: device={:?}, block_size={}, max_blocks={}",
-            config.device, block_size, max_blocks
-        );
-
-        // Use the PagedKvCacheManager for PagedAttention support
-        let paged_config = ferrum_kv::managers::PagedKvCacheConfig {
-            block_size,
-            max_gpu_blocks: max_blocks,
-            max_cpu_blocks: max_blocks / 2,
-            enable_cow: true,
-            enable_swapping: true,
-            ..Default::default()
-        };
-
-        let manager =
-            ferrum_kv::managers::PagedKvCacheManager::new(config.device.clone(), paged_config)?;
-        Ok(Arc::new(manager))
-    }
-
-    fn metadata(&self) -> ComponentMetadata {
-        ComponentMetadata {
-            name: "paged".to_string(),
-            version: "0.1.0".to_string(),
-            description: "Paged KV cache manager for PagedAttention".to_string(),
-            supported_devices: cpu_cuda_and_optional_metal_devices(),
-            capabilities: vec![
-                "paged".to_string(),
-                "copy_on_write".to_string(),
-                "swap".to_string(),
-            ],
-        }
-    }
-}
-
-// ----------------------------------------------------------------------------
 // Executor Factories
 // ----------------------------------------------------------------------------
 
@@ -761,11 +637,8 @@ impl ComponentFactory<Arc<dyn KvCacheManager + Send + Sync>> for PagedKvCacheFac
 pub struct StubExecutorFactory;
 
 #[async_trait]
-impl ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>> for StubExecutorFactory {
-    async fn create(
-        &self,
-        config: &ComponentConfig,
-    ) -> Result<Arc<dyn ModelExecutor + Send + Sync>> {
+impl ComponentFactory<ExecutorOwner, ExecutorBuildError> for StubExecutorFactory {
+    async fn create(&self, config: &ComponentConfig) -> ExecutorBuildResult<ExecutorOwner> {
         validate_causal_decode_preparation_mode(config, false)?;
         validate_segment_binding_owner_view_mode(config, false)?;
         validate_program_binding_upload_strategy(config, false)?;
@@ -784,21 +657,12 @@ impl ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>> for StubExecutorFact
             config.engine_config.model.model_id
         );
 
-        // The stub executor only needs a `TensorFactory` to mint dummy
-        // logits — no real backend dispatch involved. Wire the candle
-        // tensor factory directly without the legacy `ComputeBackend`
-        // wrapper.
-        let tensor_factory: Arc<dyn ferrum_interfaces::TensorFactory> = Arc::new(
-            crate::tensor_factory::candle::CandleTensorFactory::new(config.device.clone()),
-        );
-
         let executor = ferrum_models::StubModelExecutor::new(
             config.engine_config.model.model_id.clone(),
             vocab_size,
-            tensor_factory,
         );
 
-        Ok(Arc::new(executor))
+        Ok(ExecutorOwner::new(Box::new(executor)))
     }
 
     fn metadata(&self) -> ComponentMetadata {
@@ -929,6 +793,8 @@ fn build_llm<B, K>(
     model_path: &str,
     llama_layer_split_plan: Option<crate::layer_split::ParsedLayerSplitPlan>,
     llama_layer_split_pipeline_mode: Option<ferrum_models::models::LlamaPipelineMode>,
+    execution: ferrum_types::LlamaExecutionConfig,
+    loader_options: ferrum_quantization::NativeSafetensorsLoadOptions,
 ) -> Result<Box<dyn ferrum_models::common::DecoderOnlyLLM>>
 where
     B: ferrum_kernels::backend::MoeLlmBackend,
@@ -936,13 +802,17 @@ where
     ferrum_models::models::LlamaFamilyModel<B, K>: ferrum_models::common::DecoderOnlyLLM,
     ferrum_models::models::LlamaFamilyPipelineModel<B, K>: ferrum_models::common::DecoderOnlyLLM,
 {
-    if llama_layer_split_plan.is_some() && !B::supports_device_ordinal_scope() {
+    if llama_layer_split_plan.is_some() && !B::supports_device_ordinal() {
         return Err(FerrumError::unsupported(
             "selected_distributed_strategy=layer_split requires a backend with \
-             device-scoped execution; refusing to silently use the default device",
+             explicit device ordinals; refusing to silently use the default device",
         ));
     }
-    let weight_loader = ferrum_quantization::NativeSafetensorsLoader::<B>::open(model_path)?;
+    execution.validate().map_err(FerrumError::config)?;
+    let weight_loader = ferrum_quantization::NativeSafetensorsLoader::<B>::open_with_options(
+        model_path,
+        loader_options,
+    )?;
     if let Some(plan) = llama_layer_split_plan {
         let stage_configs = plan.to_llama_stage_configs();
         let stage_device_ordinals = plan
@@ -960,13 +830,15 @@ where
                 "Loading Llama layer_split stage {idx} on backend device {:?}",
                 device_ordinal
             );
-            let stage = B::with_device_ordinal(device_ordinal, || {
-                ferrum_models::models::LlamaFamilyModel::<B, K>::new_layer_stage(
-                    qcfg.clone(),
-                    &weight_loader,
-                    stage_config,
-                )
-            })?;
+            let mut stage_execution = execution.clone();
+            stage_execution.backend_context.device_ordinal =
+                device_ordinal.expect("layer-split stages have explicit placement");
+            let stage = ferrum_models::models::LlamaFamilyModel::<B, K>::new_layer_stage_with_execution_config(
+                qcfg.clone(),
+                &weight_loader,
+                stage_config,
+                stage_execution,
+            )?;
             stages.push(stage);
         }
         Ok(Box::new(ferrum_models::models::LlamaFamilyPipelineModel::<
@@ -983,7 +855,11 @@ where
         )?))
     } else {
         Ok(Box::new(
-            ferrum_models::models::LlamaFamilyModel::<B, K>::new(qcfg, &weight_loader)?,
+            ferrum_models::models::LlamaFamilyModel::<B, K>::new_with_execution_config(
+                qcfg,
+                &weight_loader,
+                execution,
+            )?,
         ))
     }
 }
@@ -1264,13 +1140,13 @@ fn validate_registered_vnext_backend(
     }
 }
 
-fn create_registered_vnext_executor(
+fn create_registered_program_executor(
     config: &ComponentConfig,
     model_path: &std::path::Path,
     sources: Option<Arc<ProductionModelSourceBundle>>,
     defined_model: Option<Arc<DefinedProductionModel>>,
     registration: ferrum_models::vnext::RegisteredProductionModel,
-) -> Result<Arc<dyn ModelExecutor + Send + Sync>> {
+) -> ExecutorBuildResult<ExecutorOwner> {
     use ferrum_models::vnext::ProductionExecutionKind;
 
     validate_causal_decode_preparation_mode(config, true)?;
@@ -1290,7 +1166,8 @@ fn create_registered_vnext_executor(
         if !Arc::ptr_eq(prepared.sources(), sources) {
             return Err(FerrumError::model(
                 "prepared product model and component sources do not share one source lease",
-            ));
+            )
+            .into());
         }
     }
     let prepared = match defined_model {
@@ -1300,7 +1177,8 @@ fn create_registered_vnext_executor(
                     "prepared product metadata {} differs from registered metadata {}",
                     prepared.definition().external_metadata_id(),
                     registration.external_metadata_id()
-                )));
+                ))
+                .into());
             }
             prepared
         }
@@ -1358,7 +1236,7 @@ fn create_registered_vnext_executor(
                     let (runtime, operations, materializers, catalog) = create_composition(
                         ferrum_types::Q8ProjectionWeightPreparation::PredecodedF32,
                     )?.into_parts();
-                    Ok(ferrum_models::VNextRuntimeComposition::new(runtime, operations, materializers, catalog))
+                    Ok(ferrum_execution::RuntimeComposition::new(runtime, operations, materializers, catalog))
                 };
                 let (
                     runtime,
@@ -1366,7 +1244,7 @@ fn create_registered_vnext_executor(
                     weight_materializers,
                     catalog,
                 ) = composition.into_parts();
-                let executor = crate::product_composition::create_vnext_executor(
+                let executor = crate::product_composition::create_program_executor(
                     &config.engine_config,
                     prepared.as_ref(),
                     runtime,
@@ -1383,14 +1261,14 @@ fn create_registered_vnext_executor(
                         .unwrap_or("missing"),
                     "Resolved product model plan is authoritative for vNext execution"
                 );
-                Ok(Arc::new(executor))
+                Ok(ExecutorOwner::new(Box::new(executor)))
             }
             #[cfg(not(feature = "cuda"))]
             {
                 let _ = (ordinal, model_path, prepared);
                 Err(FerrumError::device(
                     "registered vNext CUDA composition requires the 'cuda' feature",
-                ))
+                ).into())
             }
         }
         #[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
@@ -1427,7 +1305,7 @@ fn create_registered_vnext_executor(
                 ferrum_runtime::WeightMaterializerSelection::exact(
                     weight_materializer_id,
                 );
-            let executor = crate::product_composition::create_vnext_executor(
+            let executor = crate::product_composition::create_program_executor(
                 &config.engine_config,
                 prepared.as_ref(),
                 runtime,
@@ -1444,7 +1322,7 @@ fn create_registered_vnext_executor(
                     .unwrap_or("missing"),
                 "Resolved product model plan is authoritative for vNext execution"
             );
-            Ok(Arc::new(executor))
+            Ok(ExecutorOwner::new(Box::new(executor)))
         }
         (ProductionExecutionKind::CausalLanguage, Device::CPU) => {
             let device_id = ferrum_runtime::DeviceId::new("device.cpu.0")
@@ -1461,7 +1339,7 @@ fn create_registered_vnext_executor(
                 backend = "cpu",
                 "Resolving a defined model against the actual vNext runtime"
             );
-            let executor = crate::product_composition::create_vnext_executor(
+            let executor = crate::product_composition::create_program_executor(
                 &config.engine_config, prepared.as_ref(), runtime, operation_registry,
                 weight_materializers, catalog, |_| Ok(selection.clone()), None,
             )?;
@@ -1469,12 +1347,12 @@ fn create_registered_vnext_executor(
                 resolved_plan_fingerprint = executor.resolved_model_plan().map(|plan| plan.fingerprint()).unwrap_or("missing"),
                 "Resolved product model plan is authoritative for vNext execution"
             );
-            Ok(Arc::new(executor))
+            Ok(ExecutorOwner::new(Box::new(executor)))
         }
         (kind, device) => Err(FerrumError::unsupported(format!(
             "registered vNext model metadata {} requires a {kind:?} backend composition, but {device} is not registered",
             registration.external_metadata_id()
-        ))),
+        )).into()),
     }
 }
 
@@ -1484,11 +1362,8 @@ fn create_registered_vnext_executor(
 pub type CandleExecutorFactory = LlmExecutorFactory;
 
 #[async_trait]
-impl ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>> for LlmExecutorFactory {
-    async fn create(
-        &self,
-        config: &ComponentConfig,
-    ) -> Result<Arc<dyn ModelExecutor + Send + Sync>> {
+impl ComponentFactory<ExecutorOwner, ExecutorBuildError> for LlmExecutorFactory {
+    async fn create(&self, config: &ComponentConfig) -> ExecutorBuildResult<ExecutorOwner> {
         use ferrum_models::weight_format::WeightFormat;
 
         if let Some(defined) = &config.defined_model {
@@ -1499,7 +1374,8 @@ impl ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>> for LlmExecutorFacto
             {
                 return Err(FerrumError::model(
                     "defined product model and component sources do not share one source lease",
-                ));
+                )
+                .into());
             }
         }
 
@@ -1529,7 +1405,8 @@ impl ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>> for LlmExecutorFacto
                 if checkpoint_capture_enabled {
                     return Err(FerrumError::unsupported(
                         "vNext checkpoint capture requires a registered model source",
-                    ));
+                    )
+                    .into());
                 }
                 info!("No model path found, falling back to stub executor");
                 return StubExecutorFactory.create(config).await;
@@ -1569,7 +1446,7 @@ impl ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>> for LlmExecutorFacto
         if let Some(production_registration) = production_registration {
             match production_registration {
                 ferrum_models::vnext::ProductionModelRegistration::Registered(registration) => {
-                    return create_registered_vnext_executor(
+                    return create_registered_program_executor(
                         config,
                         std::path::Path::new(&model_path),
                         model_sources,
@@ -1583,7 +1460,7 @@ impl ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>> for LlmExecutorFacto
                     if checkpoint_capture_enabled {
                         return Err(FerrumError::unsupported(format!(
                             "vNext checkpoint capture requires a migrated model; metadata {external_metadata_id} is still legacy"
-                        )));
+                        )).into());
                     }
                     info!(
                         %external_metadata_id,
@@ -1600,7 +1477,8 @@ impl ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>> for LlmExecutorFacto
         if checkpoint_capture_enabled {
             return Err(FerrumError::unsupported(
                 "vNext checkpoint capture requires a registered vNext model package",
-            ));
+            )
+            .into());
         }
 
         if let ferrum_types::NumericalExecutionPolicy::Require(profile) =
@@ -1608,9 +1486,19 @@ impl ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>> for LlmExecutorFacto
         {
             return Err(FerrumError::unsupported(format!(
                 "numerical profile {profile} requires a registered vNext model package"
-            )));
+            ))
+            .into());
         }
 
+        // Freeze both model and loader options once, before any legacy weight
+        // loading. Every stage receives this same instance value.
+        let mut legacy_execution = config.engine_config.llama_execution_config();
+        if let Device::CUDA(ordinal) | Device::ROCm(ordinal) = &config.device {
+            legacy_execution.backend_context.device_ordinal = *ordinal;
+        }
+        let loader_options = ferrum_quantization::NativeSafetensorsLoadOptions {
+            gptq_gidx_trace: config.engine_config.runtime.gptq_gidx_trace,
+        };
         if let WeightFormat::Gguf { ref path } = weight_fmt {
             // Legacy or direct-path GGUF packages still use the monolithic
             // loader. Registered typed packages have already returned above.
@@ -1620,16 +1508,18 @@ impl ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>> for LlmExecutorFacto
             )?;
             let (llm, model_info) = match model_sources.as_deref() {
                 Some(sources) => {
-                    ferrum_models::gguf_engine_loader::load_gguf_decoder_from_sources_with_info(
+                    ferrum_models::gguf_engine_loader::load_gguf_decoder_from_sources_with_execution_config(
                         sources,
                         &config.device,
                         config.engine_config.model.model_id.clone(),
+                        legacy_execution,
                     )?
                 }
-                None => ferrum_models::gguf_engine_loader::load_gguf_decoder_with_info(
+                None => ferrum_models::gguf_engine_loader::load_gguf_decoder_with_execution_config(
                     path,
                     &config.device,
                     config.engine_config.model.model_id.clone(),
+                    legacy_execution,
                 )?,
             };
             return Ok(legacy_sources::bind_executor(
@@ -1671,12 +1561,13 @@ impl ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>> for LlmExecutorFacto
                 // pre-Architecture-v2 CandleBackend and hasn't been ported
                 // to the Backend<B> trait stack. Reject explicitly so users
                 // don't get a silent single-GPU fallback.
-                let tp_size = config.engine_config.runtime.tp.unwrap_or(0);
+                let tp_size = legacy_execution.backend_context.collective.world_size;
                 if tp_size > 1 {
                     return Err(FerrumError::unsupported(
                         "FERRUM_TP>1 not supported on the Backend<B> path. \
                          Run with FERRUM_TP=1 (default) for single-GPU inference.",
-                    ));
+                    )
+                    .into());
                 }
                 // GPTQ is loaded via NativeSafetensorsLoader's load_linear:
                 // it auto-detects `<name>.qweight` tensors and constructs
@@ -1736,34 +1627,36 @@ impl ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>> for LlmExecutorFacto
                                 &model_path,
                                 llama_layer_split_plan,
                                 llama_layer_split_pipeline_mode,
+                                legacy_execution,
+                                loader_options,
                             )?
                         }
                         #[cfg(any(target_os = "macos", target_os = "ios"))]
                         (Device::Metal, KvCacheDtype::Fp16) => {
                             #[cfg(feature = "metal")]
                             {
-                                // FERRUM_METAL_DTYPE=f16 toggles fp16 weight storage
-                                // inside MetalBackend. Halves big-tensor RAM;
-                                // recommended for 4B+ models on 16 GB Macs.
-                                let dtype_hint = config
-                                    .engine_config
-                                    .runtime
-                                    .metal_dtype
-                                    .as_deref()
-                                    .unwrap_or("f32");
+                                let dtype_hint =
+                                    if legacy_execution.backend_context.metal.prefer_f16_weights {
+                                        "f16"
+                                    } else {
+                                        "f32"
+                                    };
                                 info!("  Backend: Metal (weights {}), KV: fp16", dtype_hint);
                                 build_llm::<ferrum_kernels::backend::metal::MetalBackend, KvFp16>(
                                     qcfg,
                                     &model_path,
                                     llama_layer_split_plan,
                                     llama_layer_split_pipeline_mode,
+                                    legacy_execution,
+                                    loader_options,
                                 )?
                             }
                             #[cfg(not(feature = "metal"))]
                             {
                                 return Err(FerrumError::device(
                                     "Metal requested but 'metal' feature not enabled",
-                                ));
+                                )
+                                .into());
                             }
                         }
                         (Device::CUDA(_), KvCacheDtype::Fp16) => {
@@ -1775,13 +1668,16 @@ impl ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>> for LlmExecutorFacto
                                     &model_path,
                                     llama_layer_split_plan,
                                     llama_layer_split_pipeline_mode,
+                                    legacy_execution,
+                                    loader_options,
                                 )?
                             }
                             #[cfg(not(feature = "cuda"))]
                             {
                                 return Err(FerrumError::device(
                                     "CUDA requested but 'cuda' feature not enabled",
-                                ));
+                                )
+                                .into());
                             }
                         }
                         (Device::CUDA(_), KvCacheDtype::Int8) => {
@@ -1794,19 +1690,23 @@ impl ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>> for LlmExecutorFacto
                                     &model_path,
                                     llama_layer_split_plan,
                                     llama_layer_split_pipeline_mode,
+                                    legacy_execution,
+                                    loader_options,
                                 )?
                             }
                             #[cfg(not(feature = "cuda"))]
                             {
                                 return Err(FerrumError::device(
                                     "CUDA requested but 'cuda' feature not enabled",
-                                ));
+                                )
+                                .into());
                             }
                         }
                         (dev, dt) => {
                             return Err(FerrumError::unsupported(format!(
                                 "(device={dev:?}, kv_dtype={dt:?}) not implemented"
-                            )));
+                            ))
+                            .into());
                         }
                     };
 
@@ -1819,7 +1719,8 @@ impl ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>> for LlmExecutorFacto
             _ => Err(FerrumError::model(format!(
                 "Architecture {:?} not supported",
                 model_def.architecture
-            ))),
+            ))
+            .into()),
         }
     }
 
@@ -2461,17 +2362,11 @@ pub(crate) mod tests {
     }
 
     fn unique_test_dir(name: &str) -> PathBuf {
-        let mut dir = std::env::temp_dir();
-        dir.push(format!(
-            "ferrum-{name}-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+        tempfile::Builder::new()
+            .prefix(&format!("ferrum-{name}-"))
+            .tempdir()
+            .unwrap()
+            .keep()
     }
 
     #[test]
@@ -2716,10 +2611,10 @@ pub(crate) mod tests {
 
     #[test]
     fn optional_layout_compilation_drops_trial_before_one_terminal_initialization() {
-        use ferrum_kernels::backend::cpu::vnext_ops::CpuVNextComposition;
-        use ferrum_models::{
-            VNextExecutorConfig, VNextModelCompilationError, VNextRuntimeComposition,
+        use ferrum_execution::{
+            ProgramCompilationError, ProgramExecutorConfig, RuntimeComposition,
         };
+        use ferrum_kernels::backend::cpu::vnext_ops::CpuVNextComposition;
         use ferrum_runtime::{DeviceId, ExecutablePlanView, WeightMaterializerSelection};
 
         let dir = write_qwen35_fixture_model_dir();
@@ -2754,17 +2649,17 @@ pub(crate) mod tests {
                 .unwrap();
             let observed = Arc::downgrade(&runtime);
             (
-                VNextRuntimeComposition::new(runtime, operations, materializers, catalog),
+                RuntimeComposition::new(runtime, operations, materializers, catalog),
                 materializer,
                 observed,
             )
         };
         let (retained, materializer, retained_owner) = composition();
         let config =
-            VNextExecutorConfig::from_engine_config(&engine, &info, retained.runtime()).unwrap();
+            ProgramExecutorConfig::from_engine_config(&engine, &info, retained.runtime()).unwrap();
         let compiled = retained
             .compile_model(
-                &prepared,
+                prepared.execution_input().unwrap(),
                 info.clone(),
                 &engine,
                 config,
@@ -2789,16 +2684,17 @@ pub(crate) mod tests {
             .unwrap(),
         );
         let trial_config =
-            VNextExecutorConfig::from_engine_config(&trial_engine, &info, trial.runtime()).unwrap();
+            ProgramExecutorConfig::from_engine_config(&trial_engine, &info, trial.runtime())
+                .unwrap();
         assert!(matches!(
             trial.compile_model(
-                &prepared,
+                prepared.execution_input().unwrap(),
                 info,
                 &trial_engine,
                 trial_config,
                 WeightMaterializerSelection::exact(trial_materializer)
             ),
-            Err(VNextModelCompilationError::Capacity { .. })
+            Err(ProgramCompilationError::Capacity { .. })
         ));
         assert_eq!(trial.runtime().peak_resident_bytes(), 0);
         drop(trial);
@@ -2811,14 +2707,14 @@ pub(crate) mod tests {
         // not be interpreted as permission to retry another storage layout.
         let mut initializations = 0;
         let error = compiled
-            .initialize(|_, _, _, _| {
+            .initialize(|_, _, _| {
                 initializations += 1;
                 Err(FerrumError::device("terminal initialization failure"))
             })
             .err()
             .unwrap();
         assert!(
-            matches!(error, FerrumError::Device { message } if message == "terminal initialization failure")
+            matches!(error.cause(), FerrumError::Device { message } if message == "terminal initialization failure")
         );
         assert_eq!(initializations, 1);
         assert_eq!(retained.runtime().peak_resident_bytes(), 0);
@@ -2863,7 +2759,7 @@ pub(crate) mod tests {
             let (runtime, operations, materializers, materializer, catalog) =
                 composition.into_parts().unwrap();
             let observed = Arc::clone(&runtime);
-            let executor = crate::product_composition::create_vnext_executor(
+            let executor = crate::product_composition::create_program_executor(
                 engine,
                 &defined,
                 runtime,
@@ -2963,7 +2859,8 @@ pub(crate) mod tests {
         assert!(runtime.peak_resident_bytes() > 0);
         let engine = crate::EngineBuilder::new(config.clone())
             .with_defined_model(Arc::clone(&defined))
-            .with_custom_executor(Arc::new(executor))
+            .with_owned_executor(ExecutorOwner::new(Box::new(executor)))
+            .unwrap()
             .build()
             .await
             .unwrap();
@@ -3344,12 +3241,14 @@ pub(crate) mod tests {
             "/missing/model/path",
             Some(plan),
             Some(ferrum_models::models::LlamaPipelineMode::Overlapped),
+            ferrum_types::LlamaExecutionConfig::default(),
+            ferrum_quantization::NativeSafetensorsLoadOptions::default(),
         ) {
             Ok(_) => panic!("layer_split build unexpectedly succeeded"),
             Err(err) => err.to_string(),
         };
 
-        assert!(err.contains("device-scoped execution"));
+        assert!(err.contains("explicit device ordinals"));
         assert!(err.contains("refusing to silently use the default device"));
     }
 

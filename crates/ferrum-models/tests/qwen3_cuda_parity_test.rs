@@ -77,40 +77,55 @@ impl<'a, B: ferrum_kernels::backend::Backend> CandleShimLoader<'a, B> {
 }
 
 impl<'a, B: ferrum_kernels::backend::Backend> WeightLoader<B> for CandleShimLoader<'a, B> {
-    fn load_tensor(&self, name: &str) -> Result<B::Buffer> {
+    fn load_tensor(&self, ctx: &mut B::Context, name: &str) -> Result<B::Buffer> {
         let data = self.load_f32_rows(name)?;
-        Ok(B::from_slice(&data))
+        Ok(B::from_slice_in_context(ctx, &data))
     }
 
-    fn load_linear(&self, name: &str) -> Result<Box<dyn Linear<B>>> {
-        let direct = format!("{name}.weight");
-        if let Some((r, c, data)) = self.fetch_2d(&direct) {
-            return Ok(Box::new(DenseLinear::<B>::from_rows(&data, r, c)));
-        }
-        if name.ends_with("qkv_proj") {
-            let prefix = &name[..name.len() - "qkv_proj".len()];
-            let keys = vec![
-                format!("{prefix}q_proj.weight"),
-                format!("{prefix}k_proj.weight"),
-                format!("{prefix}v_proj.weight"),
-            ];
-            if let Some((r, c, data)) = self.fetch_2d_concat(&keys) {
-                return Ok(Box::new(DenseLinear::<B>::from_rows(&data, r, c)));
+    fn load_linear(
+        &self,
+        ctx: &mut B::Context,
+        name: &str,
+    ) -> Result<ferrum_kernels::LoadedLinear<B>> {
+        let linear = (|| -> Result<Box<dyn Linear<B>>> {
+            let direct = format!("{name}.weight");
+            if let Some((r, c, data)) = self.fetch_2d(&direct) {
+                return Ok(Box::new(DenseLinear::<B>::from_rows_in_context(
+                    ctx, &data, r, c,
+                )));
             }
-        }
-        if name.ends_with("gate_up_proj") {
-            let prefix = &name[..name.len() - "gate_up_proj".len()];
-            let keys = vec![
-                format!("{prefix}gate_proj.weight"),
-                format!("{prefix}up_proj.weight"),
-            ];
-            if let Some((r, c, data)) = self.fetch_2d_concat(&keys) {
-                return Ok(Box::new(DenseLinear::<B>::from_rows(&data, r, c)));
+            if name.ends_with("qkv_proj") {
+                let prefix = &name[..name.len() - "qkv_proj".len()];
+                let keys = vec![
+                    format!("{prefix}q_proj.weight"),
+                    format!("{prefix}k_proj.weight"),
+                    format!("{prefix}v_proj.weight"),
+                ];
+                if let Some((r, c, data)) = self.fetch_2d_concat(&keys) {
+                    return Ok(Box::new(DenseLinear::<B>::from_rows_in_context(
+                        ctx, &data, r, c,
+                    )));
+                }
             }
-        }
-        Err(FerrumError::model(format!(
-            "could not load linear '{name}'"
-        )))
+            if name.ends_with("gate_up_proj") {
+                let prefix = &name[..name.len() - "gate_up_proj".len()];
+                let keys = vec![
+                    format!("{prefix}gate_proj.weight"),
+                    format!("{prefix}up_proj.weight"),
+                ];
+                if let Some((r, c, data)) = self.fetch_2d_concat(&keys) {
+                    return Ok(Box::new(DenseLinear::<B>::from_rows_in_context(
+                        ctx, &data, r, c,
+                    )));
+                }
+            }
+            Err(FerrumError::model(format!(
+                "could not load linear '{name}'"
+            )))
+        })()?;
+        // SAFETY: these built-in projections own their weights and encode only
+        // backend work; the model retains them until checked graph retirement.
+        Ok(unsafe { ferrum_kernels::LoadedLinear::new_capture_stable(linear) })
     }
 
     fn has_tensor(&self, name: &str) -> bool {

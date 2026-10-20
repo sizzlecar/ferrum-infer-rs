@@ -7,9 +7,10 @@ license.workspace = true
 description = "Canonical bench schema, metric aggregation, variance, and env_hash contracts for ferrum bench commands."
 
 [dependencies]
+ferrum-journal = { workspace = true }
 ferrum-types = { workspace = true }
 serde = { workspace = true }
-serde_json = { workspace = true }
+serde_json = { workspace = true, features = ["raw_value"] }
 rand = { workspace = true }
 sha2 = "0.10"
 

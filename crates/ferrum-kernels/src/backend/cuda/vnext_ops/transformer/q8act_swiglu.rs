@@ -31,6 +31,7 @@ impl CudaQ8ActSwiGluProvider {
             include_bytes!("native_swiglu.rs"),
             include_bytes!("../native_blocks/q8act.rs"),
             include_bytes!("../native_blocks.rs"),
+            include_bytes!("../native_blocks/linear.rs"),
             include_bytes!("../native_blocks/weights.rs"),
             include_bytes!("../native_blocks/hadamard.rs"),
             crate::ptx::VNEXT_GGUF.as_bytes(),

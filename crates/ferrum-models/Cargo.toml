@@ -17,7 +17,6 @@ ferrum-types = { workspace = true }
 ferrum-interfaces = { workspace = true }
 ferrum-runtime = { workspace = true }
 ferrum-execution = { workspace = true }
-ferrum-bench-core = { workspace = true }
 
 # Optional runtime dependency for loading weights
 
@@ -25,7 +24,6 @@ ferrum-bench-core = { workspace = true }
 async-trait = { workspace = true }
 tokio = { workspace = true }
 futures = { workspace = true }
-pin-project-lite = "0.2"
 parking_lot = { workspace = true }
 
 # Serialization
@@ -47,6 +45,8 @@ memmap2 = "0.9"
 ferrum-kernels = { workspace = true }
 ferrum-quantization = { workspace = true }
 half = { workspace = true }
+# CUDA ownership tests inspect the same device allocations as ferrum-kernels.
+cudarc = { version = "0.19", default-features = false, features = ["driver"], optional = true }
 
 # Error handling
 anyhow = { workspace = true }
@@ -70,6 +70,7 @@ hf-hub = { workspace = true }
 indicatif = "0.17"
 pathdiff = "0.2"
 futures-util = "0.3"
+tempfile = { version = "3.8", optional = true }
 
 # AArch64 acceleration is opt-in in sha2 0.10 and detects CPU support at runtime.
 # Limit assembly integration to macOS/Linux; other targets retain portable hashing.
@@ -77,6 +78,7 @@ futures-util = "0.3"
 sha2 = { version = "0.10", features = ["asm"] }
 
 [dev-dependencies]
+ferrum-execution = { workspace = true, features = ["test-support"] }
 tokio-test = "0.4"
 tempfile = "3.8"
 ferrum-testkit = { workspace = true }
@@ -88,7 +90,7 @@ default = []
 # Enable CUDA FlashAttention-2 and fused custom kernels
 accelerate = ["candle-core/accelerate", "candle-nn/accelerate"]
 metal = ["ferrum-kernels/metal"]
-cuda = ["ferrum-kernels/cuda"]
+cuda = ["ferrum-kernels/cuda", "dep:cudarc"]
 cuda-indexed-causal-attention = ["cuda", "ferrum-kernels/cuda-indexed-causal-attention"]
 cuda-causal-gqa2 = ["cuda-indexed-causal-attention", "ferrum-kernels/cuda-causal-gqa2"]
 cuda-q4-shared-weight-decode = ["cuda", "ferrum-kernels/cuda-q4-shared-weight-decode"]
@@ -111,4 +113,4 @@ integration-tests = []
 registry = []
 # Deterministic tiny-model construction for downstream full-stack tests.
 # Never enabled in release; turned on by ferrum-engine dev-dependencies.
-test-support = []
+test-support = ["dep:tempfile"]

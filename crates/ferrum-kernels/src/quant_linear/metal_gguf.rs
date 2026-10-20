@@ -4,17 +4,17 @@
 //! MetalBackend. The kernel dispatch (decode/prefill split, fused-store
 //! handling, q4_k / q6_k mul_mm + gemv variants) lives inside
 //! `crate::backend::metal::metal_gemm_quant_dispatch` (the body that
-//! used to be the trait method, now `pub fn`).
+//! used to be the trait method, now `pub(crate) fn`).
 
 use crate::backend::metal::{metal_gemm_quant_dispatch, MetalBackend, MetalQuantStore};
 use crate::Linear;
 
 /// Metal GGUF Linear: holds a `MetalQuantStore` (Q4_K / Q6_K /
 /// Fused-mixed) plus shape, dispatches via `metal_gemm_quant_dispatch`.
-pub struct MetalGgufLinear {
-    pub store: MetalQuantStore,
-    pub in_features: usize,
-    pub out_features: usize,
+pub(crate) struct MetalGgufLinear {
+    pub(crate) store: MetalQuantStore,
+    pub(crate) in_features: usize,
+    pub(crate) out_features: usize,
 }
 
 impl Linear<MetalBackend> for MetalGgufLinear {

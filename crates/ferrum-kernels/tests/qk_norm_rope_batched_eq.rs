@@ -66,7 +66,7 @@ fn qkr_batched_matches_per_item_mode_1() {
 }
 
 fn run_eq(mode: i32, label: &str) {
-    let mut ctx = CudaBackend::new_context();
+    let mut ctx = CudaBackend::new_context(&ferrum_types::BackendContextConfig::default()).unwrap();
 
     // Inputs (deterministic random):
     //   input  [m, heads, head_dim] — same for both kernels
@@ -78,21 +78,22 @@ fn run_eq(mode: i32, label: &str) {
     let cos_h = make_rope_table(3);
     let sin_h = make_rope_table(4);
 
-    let input_dev = CudaBackend::from_slice(&input_h);
-    let norm_w_dev = CudaBackend::from_slice(&norm_w_h);
-    let cos_dev = CudaBackend::from_slice(&cos_h);
-    let sin_dev = CudaBackend::from_slice(&sin_h);
+    let input_dev = CudaBackend::from_slice_in_context(&mut ctx, &input_h);
+    let norm_w_dev = CudaBackend::from_slice_in_context(&mut ctx, &norm_w_h);
+    let cos_dev = CudaBackend::from_slice_in_context(&mut ctx, &cos_h);
+    let sin_dev = CudaBackend::from_slice_in_context(&mut ctx, &sin_h);
 
-    let mut out_batched_dev = CudaBackend::alloc(M * HEADS * HD);
+    let mut out_batched_dev = CudaBackend::alloc_in_context(&mut ctx, M * HEADS * HD);
 
     // Positions buffer (device i32 / u32 wire-compatible).
     let positions_h: Vec<u32> = vec![POSITION as u32; M];
-    let mut positions_dev = CudaBackend::alloc_typed(ferrum_kernels::backend::Dtype::U32, M);
+    let mut positions_dev =
+        CudaBackend::alloc_typed_in_context(&mut ctx, ferrum_kernels::backend::Dtype::U32, M);
     CudaBackend::write_typed::<u32>(&mut ctx, &mut positions_dev, &positions_h);
 
     // ── Per-item: m calls, each with tokens=1, copying item i's slice ─
-    let mut per_item_scratch = CudaBackend::alloc(HEADS * HD);
-    let mut input_single_scratch = CudaBackend::alloc(HEADS * HD);
+    let mut per_item_scratch = CudaBackend::alloc_in_context(&mut ctx, HEADS * HD);
+    let mut input_single_scratch = CudaBackend::alloc_in_context(&mut ctx, HEADS * HD);
     let mut per_item_concat = vec![0.0f32; M * HEADS * HD];
     for i in 0..M {
         CudaBackend::copy_slice(
@@ -118,7 +119,7 @@ fn run_eq(mode: i32, label: &str) {
             mode,
         );
         CudaBackend::sync(&mut ctx);
-        let item_h = CudaBackend::to_vec(&per_item_scratch, HEADS * HD);
+        let item_h = CudaBackend::to_vec_in_context(&mut ctx, &per_item_scratch, HEADS * HD);
         per_item_concat[i * HEADS * HD..(i + 1) * HEADS * HD].copy_from_slice(&item_h);
     }
 
@@ -139,7 +140,7 @@ fn run_eq(mode: i32, label: &str) {
     )
     .expect("qk_norm_rope_batched_per_item");
     CudaBackend::sync(&mut ctx);
-    let batched_concat = CudaBackend::to_vec(&out_batched_dev, M * HEADS * HD);
+    let batched_concat = CudaBackend::to_vec_in_context(&mut ctx, &out_batched_dev, M * HEADS * HD);
 
     // ── Compare elementwise ──────────────────────────────────────────
     assert_eq!(per_item_concat.len(), batched_concat.len());

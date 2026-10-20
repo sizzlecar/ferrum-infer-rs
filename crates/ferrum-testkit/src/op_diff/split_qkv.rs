@@ -27,7 +27,7 @@ impl OpUnderTest for SplitQkvOp {
         use ferrum_kernels::backend::Backend;
 
         let qkv = random_vec(self.fused(), -2.0, 2.0, seed);
-        let mut ctx = CpuBackend::new_context();
+        let mut ctx = CpuBackend::new_context(&Default::default()).expect("backend context");
         let qkv_buf = CpuBackend::from_slice(&qkv);
         let mut q = CpuBackend::alloc(self.tokens * self.q_dim);
         let mut k = CpuBackend::alloc(self.tokens * self.kv_dim);
@@ -55,7 +55,7 @@ impl OpUnderTest for SplitQkvOp {
         use ferrum_kernels::backend::Backend;
 
         let qkv = random_vec(self.fused(), -2.0, 2.0, seed);
-        let mut ctx = MetalBackend::new_context();
+        let mut ctx = MetalBackend::new_context(&Default::default()).expect("backend context");
         let qkv_buf = MetalBackend::from_slice(&qkv);
         let mut q = MetalBackend::alloc(self.tokens * self.q_dim);
         let mut k = MetalBackend::alloc(self.tokens * self.kv_dim);
@@ -83,7 +83,7 @@ impl OpUnderTest for SplitQkvOp {
         use ferrum_kernels::backend::Backend;
 
         let qkv = random_vec(self.fused(), -2.0, 2.0, seed);
-        let mut ctx = CudaBackend::new_context();
+        let mut ctx = CudaBackend::new_context(&Default::default()).expect("backend context");
         let qkv_buf = CudaBackend::from_slice(&qkv);
         let mut q = CudaBackend::alloc(self.tokens * self.q_dim);
         let mut k = CudaBackend::alloc(self.tokens * self.kv_dim);

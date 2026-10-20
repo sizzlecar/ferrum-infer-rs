@@ -1,20 +1,23 @@
 //! Mock model executor with configurable latency for scheduling tests.
 
-use crate::kv_cache::MockKvCacheHandle;
-use crate::tensor::MockTensor;
+use crate::executor_observation::{ExecutorCounters, ExecutorObservation};
 use async_trait::async_trait;
+use ferrum_execution::token_execution::*;
 use ferrum_execution::{
     model_executor::{
-        AttentionType, DecodeInput, DecodeOutput, ExecutorCapabilities, ExecutorMemoryUsage,
-        ExecutorState, ExecutorStatus, MemoryRequirements, PrefillInput, PrefillOutput,
+        AttentionType, ExecutorCapabilities, ExecutorMemoryUsage, ExecutorState, ExecutorStatus,
+        MemoryRequirements,
     },
     ModelExecutor,
 };
-use ferrum_types::{DataType, Device, ModelInfo, ModelType, RequestId, Result};
+use ferrum_types::{DataType, Device, ModelInfo, ModelType, Result};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
+
+pub(crate) mod token_state;
+use token_state::TokenState;
 
 /// Mock model executor that simulates prefill/decode with configurable latency.
 /// No model weights, no GPU — pure async simulation.
@@ -22,11 +25,16 @@ pub struct MockModelExecutor {
     info: ModelInfo,
     prefill_latency: Duration,
     decode_latency: Duration,
-    prefill_count: AtomicU64,
-    decode_count: AtomicU64,
+    counters: Arc<ExecutorCounters>,
+    tokens: TokenState,
 }
 
 impl MockModelExecutor {
+    /// Observe counts without retaining this executor or its resources.
+    pub fn observer(&self) -> ExecutorObservation {
+        ExecutorObservation::new(&self.counters)
+    }
+
     pub fn new(vocab_size: usize, prefill_latency: Duration, decode_latency: Duration) -> Self {
         let info = ModelInfo {
             model_id: "mock-model".into(),
@@ -48,8 +56,8 @@ impl MockModelExecutor {
             info,
             prefill_latency,
             decode_latency,
-            prefill_count: AtomicU64::new(0),
-            decode_count: AtomicU64::new(0),
+            counters: Arc::default(),
+            tokens: TokenState::default(),
         }
     }
 
@@ -59,73 +67,78 @@ impl MockModelExecutor {
     }
 
     pub fn prefill_count(&self) -> u64 {
-        self.prefill_count.load(Ordering::Relaxed)
+        self.counters.prefill.load(Ordering::Relaxed)
     }
 
     pub fn decode_count(&self) -> u64 {
-        self.decode_count.load(Ordering::Relaxed)
+        self.counters.decode.load(Ordering::Relaxed)
     }
 }
 
 #[async_trait]
 impl ModelExecutor for MockModelExecutor {
-    fn info(&self) -> &ModelInfo {
-        &self.info
+    fn begin_shutdown(
+        self: Arc<Self>,
+        permit: &ferrum_execution::executor_lifecycle::ExecutorShutdownPermit,
+    ) -> ferrum_execution::executor_lifecycle::ExecutorShutdownObserver {
+        crate::host_shutdown::begin(self, permit, |executor| executor.tokens.shutdown())
     }
 
-    async fn prefill(&self, input: &PrefillInput) -> Result<PrefillOutput> {
-        if !self.prefill_latency.is_zero() {
-            tokio::time::sleep(self.prefill_latency).await;
+    async fn admit_tokens(&self, input: ExecutionAdmission<'_>) -> Result<TokenAdmissionOutcome> {
+        self.tokens
+            .admit(input, self.info.max_sequence_length, self.info.vocab_size)
+    }
+
+    async fn execute_tokens(&self, work: &[ExecutionWork<'_>]) -> Result<ExecutionBatchOutcome> {
+        // No state is touched until the delay completes. Cancellation during
+        // this simulated latency therefore leaves the original frontier live.
+        let prefill = work
+            .iter()
+            .any(|input| matches!(input.work(), TokenWork::Prefill(_)));
+        let latency = if prefill {
+            self.prefill_latency
+        } else {
+            self.decode_latency
+        };
+        if !latency.is_zero() {
+            tokio::time::sleep(latency).await;
         }
-        self.prefill_count.fetch_add(1, Ordering::Relaxed);
-
-        let batch_size = input.batch_size();
-        let seq_len = input.sequence_length();
-        let vocab_size = self.info.vocab_size;
-
-        // Return synthetic logits [batch, seq_len, vocab_size]
-        // Put a slight bias toward token 42 so greedy sampling is deterministic
-        let mut logits_data = vec![0.0f32; batch_size * seq_len * vocab_size];
-        for b in 0..batch_size {
-            for s in 0..seq_len {
-                let offset = (b * seq_len + s) * vocab_size;
-                if offset + 42 < logits_data.len() {
-                    logits_data[offset + 42] = 1.0;
+        let outcome = self.tokens.execute(work, self.info.vocab_size, |_, _| {
+            let mut logits = vec![0.0; self.info.vocab_size];
+            if let Some(value) = logits.get_mut(42) {
+                *value = 1.0;
+            }
+            logits
+        })?;
+        if matches!(outcome, ExecutionBatchOutcome::Completed(_)) {
+            for input in work {
+                match input.work() {
+                    TokenWork::Prefill(_) => {
+                        self.counters.prefill.fetch_add(1, Ordering::Relaxed);
+                    }
+                    TokenWork::Decode { .. } => {
+                        self.counters.decode.fetch_add(1, Ordering::Relaxed);
+                    }
                 }
             }
         }
-        let logits =
-            MockTensor::from_f32(logits_data, &[batch_size, seq_len, vocab_size]).into_ref();
-
-        let kv_cache = Arc::new(MockKvCacheHandle::new(
-            RequestId::new(),
-            self.info.num_layers,
-            seq_len,
-        ));
-
-        Ok(PrefillOutput::new(logits, kv_cache))
+        Ok(outcome)
     }
 
-    async fn decode(&self, input: &DecodeInput) -> Result<DecodeOutput> {
-        if !self.decode_latency.is_zero() {
-            tokio::time::sleep(self.decode_latency).await;
-        }
-        self.decode_count.fetch_add(1, Ordering::Relaxed);
+    async fn finish_tokens(
+        &self,
+        sequence: &ExecutorSequence,
+        reason: ExecutionEndReason,
+    ) -> Result<ExecutionCloseOutcome> {
+        self.tokens.close(sequence, reason)
+    }
 
-        let batch_size = input.batch_size();
-        let vocab_size = self.info.vocab_size;
+    fn cancel_tokens(&self, sequence: &ExecutorSequence) -> Result<ExecutionCloseOutcome> {
+        self.tokens.close(sequence, ExecutionEndReason::Cancelled)
+    }
 
-        // Return logits [batch, vocab_size] with bias toward token 42
-        let mut logits_data = vec![0.0f32; batch_size * vocab_size];
-        for b in 0..batch_size {
-            let offset = b * vocab_size;
-            if offset + 42 < logits_data.len() {
-                logits_data[offset + 42] = 1.0;
-            }
-        }
-        let logits = MockTensor::from_f32(logits_data, &[batch_size, vocab_size]).into_ref();
-
-        Ok(DecodeOutput::new(logits, input.kv_cache.clone()))
+    fn info(&self) -> &ModelInfo {
+        &self.info
     }
 
     fn capabilities(&self) -> ExecutorCapabilities {
@@ -155,8 +168,8 @@ impl ModelExecutor for MockModelExecutor {
             state: ExecutorState::Ready,
             is_ready: true,
             current_batch_size: 0,
-            prefill_operations: self.prefill_count.load(Ordering::Relaxed),
-            decode_operations: self.decode_count.load(Ordering::Relaxed),
+            prefill_operations: self.counters.prefill.load(Ordering::Relaxed),
+            decode_operations: self.counters.decode.load(Ordering::Relaxed),
             avg_prefill_time_ms: self.prefill_latency.as_millis() as f64,
             avg_decode_time_ms: self.decode_latency.as_millis() as f64,
             memory_usage: ExecutorMemoryUsage {

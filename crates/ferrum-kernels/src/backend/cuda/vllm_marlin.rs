@@ -532,8 +532,8 @@ pub fn load_stacked_gptq_vllm_marlin(
                 k as i32,
                 n_per_expert as i32,
                 bits as i32,
-                0, // has_perm
-                0, // dev
+                0,                                 // has_perm
+                stream.context().ordinal() as i32, // actual stream device
                 raw_stream,
             )
         };
@@ -700,9 +700,9 @@ pub fn vllm_gptq_marlin_repack(
             out_ptr as *mut _,
             size_k,
             size_n,
-            4, // num_bits — INT4 GPTQ
-            0, // has_perm — sym=true
-            0, // dev
+            4,                                 // num_bits — INT4 GPTQ
+            0,                                 // has_perm — sym=true
+            stream.context().ordinal() as i32, // actual stream device
             raw_stream,
         )
     };
@@ -746,7 +746,7 @@ pub(crate) unsafe fn vllm_gptq_marlin_repack_raw(
         size_n,
         4,
         0,
-        0,
+        stream.context().ordinal() as i32,
         stream.cu_stream(),
     );
     if ret != 0 {

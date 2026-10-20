@@ -8,8 +8,8 @@
 //! The default policy:
 //!   - Activations (`alloc`, `from_slice`, scratch) are F32 — precision-
 //!     sensitive paths (norm / rope / attention) stay unchanged.
-//!   - Weights loaded via `from_weight_bytes` go F16 for tensors past a
-//!     size threshold when `FERRUM_METAL_DTYPE=f16` is set; otherwise
+//!   - Weights loaded through the original context go F16 for tensors past a
+//!     size threshold when its typed weight policy selects F16; otherwise
 //!     they stay F32.
 //!
 //! The same shape generalises: an INT8 / GPTQ variant would add another
@@ -31,50 +31,56 @@
 //! - [`paged`] — `BackendPagedKv` (paged-KV decode + split_qkv into pool).
 //! - [`moe`]   — `BackendMoeFused` (route/topk, silu/mul, weighted-sum).
 
-pub mod moe;
-pub mod paged;
-pub mod quant;
+mod moe;
+mod paged;
+pub(crate) mod quant;
 mod residency;
+mod retained_memory;
 pub mod vnext_ops;
 pub mod vnext_runtime;
 
-// GGUF k-quant kernels (Audit #9 moved here from kernels-crate top level).
-// Re-exported via `pub use backend::metal::{...}` in `crate::lib` so the
-// historical `ferrum_kernels::q4_k_gemm::*` and internal `crate::q4_k_*`
-// paths keep working without rippling import updates through the
-// metal_gguf_moe.rs et al. consumers.
-pub(crate) mod k_quant_gemm;
-pub mod moe_post_ops;
-pub mod moe_post_ops_batched;
-pub mod moe_router;
-pub mod q4_k;
-pub mod q4_k_gemm;
-pub mod q4_k_gemv;
-pub mod q4_k_gemv_v2;
-pub mod q4_k_moe_id_gate_up_silu;
-pub mod q4_k_moe_id_gate_up_silu_batched;
-pub mod q4_k_moe_id_gemm;
-pub mod q4_k_moe_id_gemv;
-pub mod q4_k_moe_id_gemv_batched;
-pub mod q5_k_gemv;
-pub mod q6_k_gemm;
-pub mod q6_k_gemv;
-pub mod q6_k_moe_id_gemm;
-pub mod q6_k_moe_id_gemv;
-pub mod q6_k_moe_id_gemv_batched;
+#[cfg(test)]
+mod copy_slice_tests;
+#[cfg(test)]
+mod host_access_tests;
+#[cfg(test)]
+mod instance_config_tests;
+#[cfg(test)]
+mod instance_queue_tests;
+#[cfg(test)]
+mod mmap_lifetime_tests;
 
-// Preserve the historical `crate::backend::metal::*` public surface that
-// external callers (`quant_linear::metal_gguf*`, model tests,
-// `ferrum-engine::registry`) depend on.
-pub use quant::{
-    dispatch_gemv_moe_id, dispatch_gemv_moe_id_offset, load_q4k_experts, load_q6k_experts,
-    metal_gemm_quant_dispatch, MetalQuantStore,
+// Raw encoders and device pipelines stay behind the context-bound Backend
+// and Linear contracts. The typed runtime keeps its own explicit providers.
+pub(crate) mod k_quant_gemm;
+pub(crate) mod moe_post_ops;
+pub(crate) mod moe_post_ops_batched;
+pub(crate) mod moe_router;
+pub(crate) mod q4_k;
+pub(crate) mod q4_k_gemm;
+pub(crate) mod q4_k_gemv;
+pub(crate) mod q4_k_gemv_v2;
+pub(crate) mod q4_k_moe_id_gate_up_silu;
+pub(crate) mod q4_k_moe_id_gate_up_silu_batched;
+pub(crate) mod q4_k_moe_id_gemm;
+pub(crate) mod q4_k_moe_id_gemv;
+pub(crate) mod q4_k_moe_id_gemv_batched;
+pub(crate) mod q5_k_gemv;
+pub(crate) mod q6_k_gemm;
+pub(crate) mod q6_k_gemv;
+pub(crate) mod q6_k_moe_id_gemm;
+pub(crate) mod q6_k_moe_id_gemv;
+pub(crate) mod q6_k_moe_id_gemv_batched;
+
+pub(crate) use quant::{
+    dispatch_gemv_moe_id, dispatch_gemv_moe_id_offset, metal_gemm_quant_dispatch, MetalQuantStore,
 };
 
 use super::{AttnConfig, Backend, SrcDtype};
 use crate::attention::metal::pipelines::MetalPipelines;
 use crate::attention::AttentionParams;
-use ferrum_types::{FerrumError, Result};
+use ferrum_runtime::RetainedHostMemoryRegion;
+use ferrum_types::{BackendContextConfig, FerrumError, MetalBackendConfig, Result};
 use half::{bf16, f16};
 use metal::{Device, MTLResourceOptions, MTLSize};
 use std::ffi::c_void;
@@ -84,10 +90,9 @@ use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 /// One registered host-memory region eligible for zero-copy Metal binding.
 ///
-/// `base_addr / len` describe the host range (`as_ptr() as usize` for Send/
-/// Sync). `_keeper` holds an Arc to whatever owns the host memory
-/// (typically `Arc<GgufFile>`) so the mmap stays alive as long as any
-/// Metal buffer wraps a part of it.
+/// The exact registered range and its stable owner come from `memory`.
+/// Each native no-copy buffer also retains this host memory independently
+/// of its registration or Rust weight, through its deallocator block.
 ///
 /// Unlike the early "one big buffer" attempt, we do **not** create a
 /// single MTLBuffer for the whole region here — that approach worked but
@@ -99,16 +104,14 @@ use std::sync::{Arc, Mutex, OnceLock, Weak};
 /// many small buffers fit Apple's GPU residency model the way llama.cpp
 /// observed.
 struct MetalMmapEntry {
-    base_addr: usize,
-    len: usize,
     residency: Option<Mutex<residency::MetalResidencySet>>,
     // Rust drops fields in declaration order. Keep this after `residency` so
     // the mmap remains valid until the set releases its Metal allocations.
-    _keeper: Arc<dyn std::any::Any + Send + Sync>,
+    memory: RetainedHostMemoryRegion,
 }
 
-/// Keeps a registered mmap and its residency set alive for one quantized
-/// weight. The last lease releases both resources when the model is dropped.
+/// Keeps residency requested while a quantized weight exists. Native buffers
+/// independently retain the host memory until their final native release.
 pub struct MetalMmapLease {
     _entry: Arc<MetalMmapEntry>,
 }
@@ -145,53 +148,19 @@ impl MetalMmapRegistration {
 }
 
 pub(crate) struct MetalState {
-    pub(crate) pipes: MetalPipelines,
+    pub(crate) pipes: Arc<MetalPipelines>,
     /// Weak index of mmap regions eligible for zero-copy Metal buffers.
     /// Per-weight leases, rather than this registry, own each live mapping.
     mmaps: Mutex<Vec<Weak<MetalMmapEntry>>>,
 }
+// Default-device pipelines and the weak mmap index may be shared. Execution
+// queues, completion state and instance policy never live in this catalog.
 static METAL_STATE: OnceLock<MetalState> = OnceLock::new();
 pub(crate) fn st() -> &'static MetalState {
     METAL_STATE.get_or_init(|| MetalState {
-        pipes: MetalPipelines::new(&Device::system_default().unwrap()),
+        pipes: Arc::new(MetalPipelines::new(&Device::system_default().unwrap())),
         mmaps: Mutex::new(Vec::new()),
     })
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct MetalRuntimeConfig {
-    mmap_trace: bool,
-    capture_path: Option<String>,
-    mtl_capture_enabled: bool,
-    prefer_f16_weights: bool,
-}
-
-fn metal_runtime_config() -> &'static MetalRuntimeConfig {
-    static CONFIG: OnceLock<MetalRuntimeConfig> = OnceLock::new();
-    CONFIG.get_or_init(|| {
-        let mut config = MetalRuntimeConfig {
-            mmap_trace: false,
-            capture_path: None,
-            mtl_capture_enabled: false,
-            prefer_f16_weights: false,
-        };
-        for (name, value) in std::env::vars() {
-            match name.as_str() {
-                "FERRUM_MMAP_TRACE" => config.mmap_trace = true,
-                "FERRUM_METAL_CAPTURE" => config.capture_path = Some(value),
-                "FERRUM_METAL_DTYPE" => {
-                    config.prefer_f16_weights = value.eq_ignore_ascii_case("f16")
-                }
-                "MTL_CAPTURE_ENABLED" => config.mtl_capture_enabled = true,
-                _ => {}
-            }
-        }
-        config
-    })
-}
-
-pub(crate) fn metal_mmap_trace_enabled() -> bool {
-    metal_runtime_config().mmap_trace
 }
 
 /// Register a host-memory region (typically the full mmap of a GGUF file)
@@ -199,34 +168,29 @@ pub(crate) fn metal_mmap_trace_enabled() -> bool {
 /// range can use the shared zero-copy `MTLBuffer` instead of allocating a
 /// fresh device-resident copy.
 ///
-/// `keeper` is anything that, while alive, guarantees `slice` stays mapped.
-/// For GGUF the natural choice is `Arc<GgufFile>`. The returned registration
-/// is held during construction; each zero-copy quant store then owns a lease,
-/// so model drop releases the mmap and residency set without global pinning.
+/// The stable memory owner proves the registered range and keeps it mapped.
+/// The returned registration is held during construction; each zero-copy
+/// quant store then owns a residency lease. Each native buffer separately
+/// retains the host memory, including native command and raw-buffer clones.
 ///
 /// Constraints (`newBufferWithBytesNoCopy`):
-///   * the slice base pointer must be page-aligned (16 KB on Apple Silicon)
+///   * the native buffer's base pointer must be page-aligned
 ///   * the wrapped length must be a multiple of the page size
 ///
-/// `mmap` returns a page-aligned base, so the address constraint is met
-/// for free. For length we round **up** to the next page; the kernel
-/// zero-fills any tail past EOF, but our reads never go past the file
-/// length so that's harmless.
+/// Loading proves that the entire aligned native view is within the stable
+/// owner's readable range. A tensor without such a view uses the copy path;
+/// registration does not grant reads beyond the owner's declared bytes.
 ///
 /// Returns a construction handle on success. Duplicate registration of the
-/// same live mapping shares the existing entry.
+/// same live mapping shares the existing entry. Diagnostics use the caller's
+/// explicit options even when another instance registered that mapping first.
 pub fn register_gguf_mmap(
-    slice: &[u8],
-    keeper: Arc<dyn std::any::Any + Send + Sync>,
+    memory: RetainedHostMemoryRegion,
+    options: &MetalBackendConfig,
 ) -> Result<MetalMmapRegistration> {
-    const PAGE: usize = 16384;
+    let slice = memory.bytes();
     let base_addr = slice.as_ptr() as usize;
-    if !base_addr.is_multiple_of(PAGE) {
-        return Err(FerrumError::model(format!(
-            "register_gguf_mmap: base pointer 0x{base_addr:x} not page-aligned (need {PAGE})"
-        )));
-    }
-    let trace = metal_mmap_trace_enabled();
+    let trace = options.mmap_trace;
     if trace {
         eprintln!(
             "[mmap] register file at 0x{base_addr:x} len={} ({:.2} GB)",
@@ -240,34 +204,25 @@ pub fn register_gguf_mmap(
         .lock()
         .map_err(|e| FerrumError::model(format!("register_gguf_mmap: registry poisoned: {e}")))?;
     guard.retain(|entry| entry.strong_count() > 0);
-    if let Some(entry) = guard
-        .iter()
-        .filter_map(Weak::upgrade)
-        .find(|entry| entry.base_addr == base_addr && entry.len == slice.len())
-    {
+    if let Some(entry) = guard.iter().filter_map(Weak::upgrade).find(|entry| {
+        let registered = entry.memory.bytes();
+        registered.as_ptr() as usize == base_addr && registered.len() == slice.len()
+    }) {
         return Ok(MetalMmapRegistration { entry });
     }
-    let residency = residency::MetalResidencySet::new(&state.pipes.device)?.map(Mutex::new);
+    let residency = residency::MetalResidencySet::new(state.pipes.device())?.map(Mutex::new);
     if residency.is_none() {
         tracing::info!("Metal residency sets unavailable; using implicit resource residency");
     }
-    let entry = Arc::new(MetalMmapEntry {
-        base_addr,
-        len: slice.len(),
-        residency,
-        _keeper: keeper,
-    });
+    let entry = Arc::new(MetalMmapEntry { residency, memory });
     guard.push(Arc::downgrade(&entry));
     Ok(MetalMmapRegistration { entry })
 }
 
-/// Check whether `bytes` lives inside a registered mmap region.
-#[inline(never)]
-pub(crate) fn slice_is_in_registered_mmap(bytes: &[u8]) -> bool {
-    registered_mmap_entry(bytes).is_some()
-}
-
 fn registered_mmap_entry(bytes: &[u8]) -> Option<Arc<MetalMmapEntry>> {
+    if bytes.is_empty() {
+        return None;
+    }
     let ptr = bytes.as_ptr() as usize;
     let len = bytes.len();
     let end = match ptr.checked_add(len) {
@@ -280,11 +235,13 @@ fn registered_mmap_entry(bytes: &[u8]) -> Option<Arc<MetalMmapEntry>> {
     };
     guard.retain(|entry| entry.strong_count() > 0);
     for entry in guard.iter().filter_map(Weak::upgrade) {
-        let entry_end = match entry.base_addr.checked_add(entry.len) {
+        let registered = entry.memory.bytes();
+        let entry_start = registered.as_ptr() as usize;
+        let entry_end = match entry_start.checked_add(registered.len()) {
             Some(e) => e,
             None => continue,
         };
-        if ptr >= entry.base_addr && end <= entry_end {
+        if ptr >= entry_start && end <= entry_end {
             return Some(entry);
         }
     }
@@ -293,12 +250,10 @@ fn registered_mmap_entry(bytes: &[u8]) -> Option<Arc<MetalMmapEntry>> {
 
 /// Add a zero-copy buffer to the residency set owned by its registered mmap.
 /// The returned lease ties the mapping and residency lifetime to the weight.
-pub(crate) fn add_registered_mmap_buffer(
-    bytes: &[u8],
+fn add_registered_mmap_buffer(
+    entry: Arc<MetalMmapEntry>,
     buffer: &metal::BufferRef,
 ) -> Result<MetalMmapLease> {
-    let entry = registered_mmap_entry(bytes)
-        .ok_or_else(|| FerrumError::model("zero-copy Metal buffer has no registered mmap owner"))?;
     if let Some(residency) = entry.residency.as_ref() {
         residency
             .lock()
@@ -306,89 +261,6 @@ pub(crate) fn add_registered_mmap_buffer(
             .add_allocation(buffer);
     }
     Ok(MetalMmapLease::new(entry))
-}
-
-#[cfg(test)]
-mod mmap_lifetime_tests {
-    use super::*;
-
-    #[test]
-    fn mmap_lease_keeps_entry_alive_until_last_weight_drop() {
-        let entry = Arc::new(MetalMmapEntry {
-            base_addr: 0,
-            len: 1,
-            residency: None,
-            _keeper: Arc::new(()),
-        });
-        let weak = Arc::downgrade(&entry);
-        let registration = MetalMmapRegistration {
-            entry: Arc::clone(&entry),
-        };
-        let lease = MetalMmapLease::new(entry);
-
-        drop(registration);
-        assert!(
-            weak.upgrade().is_some(),
-            "weight lease must retain the mmap"
-        );
-
-        drop(lease);
-        assert!(
-            weak.upgrade().is_none(),
-            "last weight lease must release the mmap and residency set"
-        );
-    }
-}
-
-// ── Frame capture ─────────────────────────────────────────────────────
-
-/// Begin a Metal frame capture if `FERRUM_METAL_CAPTURE` is set to an
-/// output path. The result is a `.gputrace` file you can open in Xcode
-/// to view per-kernel GPU timing, occupancy, instruction counts, etc.
-///
-/// Requirements:
-///   - The process must have been launched with `MTL_CAPTURE_ENABLED=1`
-///     in its environment (Metal silently rejects capture otherwise).
-///   - The output path must not exist already.
-///
-/// Returns `true` if a capture started, `false` if no env var set or
-/// capture failed (in which case stderr explains).
-pub fn maybe_begin_frame_capture() -> bool {
-    use metal::{CaptureDescriptor, CaptureManager, MTLCaptureDestination};
-    let Some(out_path) = metal_runtime_config().capture_path.as_deref() else {
-        return false;
-    };
-    if !metal_runtime_config().mtl_capture_enabled {
-        eprintln!(
-            "[capture] FERRUM_METAL_CAPTURE set but MTL_CAPTURE_ENABLED is not — Metal will reject. Re-launch with MTL_CAPTURE_ENABLED=1."
-        );
-        return false;
-    }
-    let mgr = CaptureManager::shared();
-    if !mgr.supports_destination(MTLCaptureDestination::GpuTraceDocument) {
-        eprintln!("[capture] device does not support GpuTraceDocument");
-        return false;
-    }
-    let desc = CaptureDescriptor::new();
-    desc.set_capture_device(&st().pipes.device);
-    desc.set_destination(MTLCaptureDestination::GpuTraceDocument);
-    desc.set_output_url(&out_path);
-    match mgr.start_capture(&desc) {
-        Ok(()) => {
-            eprintln!("[capture] started → {out_path}");
-            true
-        }
-        Err(e) => {
-            eprintln!("[capture] start_capture failed: {e}");
-            false
-        }
-    }
-}
-
-/// Stop the active frame capture and flush the `.gputrace` to disk.
-pub fn end_frame_capture() {
-    metal::CaptureManager::shared().stop_capture();
-    eprintln!("[capture] stopped — open .gputrace in Xcode");
 }
 
 // ── Dtype tag + tagged buffer ─────────────────────────────────────────
@@ -415,9 +287,6 @@ pub struct MetalBuf {
 impl MetalBuf {
     pub fn raw(&self) -> &metal::Buffer {
         &self.raw
-    }
-    pub fn raw_mut(&mut self) -> &mut metal::Buffer {
-        &mut self.raw
     }
     pub fn dtype(&self) -> Dtype {
         self.dtype
@@ -452,8 +321,9 @@ impl MetalBuf {
     }
 }
 
-// Safety: metal::Buffer wraps a retained NSObject pointer that's safe to move
-// and share across threads (Metal serialises on its command queue).
+// Safety: the retained native Metal allocation supports sharing its object
+// across threads. Retention is separate from content readiness: host access
+// and dependent work on another context still require producer completion.
 unsafe impl Send for MetalBuf {}
 unsafe impl Sync for MetalBuf {}
 
@@ -461,8 +331,14 @@ unsafe impl Sync for MetalBuf {}
 
 /// Metal context — one in-flight command buffer that accumulates encodes
 /// across multiple `Backend` method calls. `sync()` commits + waits and
-/// drops the handle so the next call creates a fresh buffer.
+/// drops the handle so the next call creates a fresh buffer. The context owns
+/// its queue and immutable policy, and may share device-bound pipelines.
 pub struct MetalContext {
+    config: BackendContextConfig,
+    pipes: Arc<MetalPipelines>,
+    queue: metal::CommandQueue,
+    #[cfg(test)]
+    last_attention_kernel: Option<crate::attention::metal::pipelines::MetalAttentionKernel>,
     // Own the Objective-C objects. The command queue's lifetime does not make
     // an autoreleased command buffer or encoder a Rust 'static reference.
     cmd: Option<metal::CommandBuffer>,
@@ -471,6 +347,8 @@ pub struct MetalContext {
     // command buffer; it must not commit a replacement or forget its status.
     submitted: Option<metal::CommandBuffer>,
     last_completion: Option<ObservedMetalCommand>,
+    #[cfg(test)]
+    completion_observation_override: Option<ObservedMetalCommand>,
 }
 
 struct ObservedMetalCommand {
@@ -480,14 +358,31 @@ struct ObservedMetalCommand {
 }
 
 impl MetalContext {
+    /// Permit ordinary unsubmitted encoding/preparation, but never reuse an
+    /// unresolved submission or forget a terminal failure from this invocation.
+    fn require_reusable_state(&self) -> Result<()> {
+        if self.submitted.is_some() {
+            return Err(FerrumError::backend(
+                "Metal context has an unresolved submission",
+            ));
+        }
+        if let Some(observed) = &self.last_completion {
+            classify_command_buffer_completion(
+                observed.status,
+                observed.code,
+                observed.detail.as_deref(),
+            )
+            .into_result()?;
+        }
+        Ok(())
+    }
+
     fn cmd(&mut self) -> &metal::CommandBufferRef {
-        assert!(
-            self.submitted.is_none(),
-            "Metal context has an unresolved submission"
-        );
+        self.require_reusable_state()
+            .unwrap_or_else(|error| std::panic::panic_any(error));
         if self.cmd.is_none() {
             self.last_completion = None;
-            self.cmd = Some(st().pipes.queue.new_command_buffer().to_owned());
+            self.cmd = Some(self.queue.new_command_buffer().to_owned());
         }
         self.cmd.as_ref().expect("command buffer was initialized")
     }
@@ -495,11 +390,50 @@ impl MetalContext {
     /// Keep one encoder open across adjacent compute operations, preserving
     /// the existing command order and batching behavior.
     pub(crate) fn compute_encoder(&mut self) -> &metal::ComputeCommandEncoderRef {
+        self.require_reusable_state()
+            .unwrap_or_else(|error| std::panic::panic_any(error));
         if self.encoder.is_none() {
             let encoder = self.cmd().new_compute_command_encoder().to_owned();
             self.encoder = Some(encoder);
         }
         self.encoder.as_ref().expect("encoder was initialized")
+    }
+
+    /// Borrow the pipeline catalog and encoder from the same original owner.
+    /// Field splitting avoids cloning shared catalog/policy handles per op.
+    pub(crate) fn encoder_parts(
+        &mut self,
+    ) -> (
+        &MetalPipelines,
+        &metal::ComputeCommandEncoderRef,
+        &ferrum_types::MetalBackendConfig,
+    ) {
+        self.compute_encoder();
+        (
+            &self.pipes,
+            self.encoder.as_ref().expect("encoder was initialized"),
+            &self.config.metal,
+        )
+    }
+
+    /// End the sticky compute encoder before callers use another encoder on
+    /// this invocation's original command buffer. This does not submit it.
+    pub(crate) fn command_parts(
+        &mut self,
+    ) -> (
+        &MetalPipelines,
+        &metal::CommandBufferRef,
+        &ferrum_types::MetalBackendConfig,
+    ) {
+        self.require_reusable_state()
+            .unwrap_or_else(|error| std::panic::panic_any(error));
+        self.compute_encoder_end();
+        self.cmd();
+        (
+            &self.pipes,
+            self.cmd.as_ref().expect("command buffer was initialized"),
+            &self.config.metal,
+        )
     }
 
     fn compute_encoder_end(&mut self) {
@@ -519,13 +453,14 @@ impl MetalContext {
         Some(cmd)
     }
 
-    pub(crate) fn flush(&mut self) {
-        // Ordinary sync historically permits an empty no-op. A submitted
-        // command remains owned if the backend cannot establish its terminal
-        // state; no later encode may silently reuse this context.
-        if self.cmd.is_some() || self.submitted.is_some() {
-            let _ = self.observe_completion();
+    fn synchronize_for_host_access(&mut self) -> Result<()> {
+        // Preserve the pristine empty no-op, not a prior failed observation.
+        // A retry may prove an unresolved submission terminal; until then its
+        // shared buffers cannot be accessed by the host.
+        if MetalBackend::preparation_is_host_only(self) {
+            return Ok(());
         }
+        self.observe_completion().into_result()
     }
 
     fn observe_completion(&mut self) -> crate::backend::BackendCompletion {
@@ -549,6 +484,14 @@ impl MetalContext {
         } else {
             command_buffer_error(cmd)
         };
+        // Test-only observation fault, after a real native wait. It does not
+        // manufacture a GPU failure or change the command's native status.
+        #[cfg(test)]
+        let (status, code, detail) = self
+            .completion_observation_override
+            .take()
+            .map(|observed| (observed.status, observed.code, observed.detail))
+            .unwrap_or((status, code, detail));
         let completion = classify_command_buffer_completion(status, code, detail.as_deref());
         if completion.is_terminal() {
             self.last_completion = Some(ObservedMetalCommand {
@@ -694,7 +637,8 @@ mod checked_sync_tests {
     #[ignore = "requires an actual Metal device"]
     fn owned_command_buffer_survives_context_transfer_and_is_not_resubmitted() {
         let mut buffer = MetalBackend::from_slice(&[1.0, -2.0, 3.0, -4.0]);
-        let mut ctx = MetalBackend::new_context();
+        let mut ctx =
+            MetalBackend::new_context(&BackendContextConfig::default()).expect("Metal context");
         MetalBackend::scale_inplace(&mut ctx, &mut buffer, 2.0, 4);
         let original = &**ctx.cmd.as_ref().expect("actual encoded command")
             as *const metal::CommandBufferRef as usize;
@@ -717,13 +661,9 @@ mod checked_sync_tests {
     }
 
     #[test]
+    #[ignore = "requires the original Metal context and its native queue"]
     fn missing_submission_is_not_success() {
-        let mut ctx = MetalContext {
-            cmd: None,
-            encoder: None,
-            submitted: None,
-            last_completion: None,
-        };
+        let mut ctx = MetalBackend::new_context(&BackendContextConfig::default()).unwrap();
         let error = MetalBackend::sync_checked(&mut ctx).unwrap_err();
         assert!(error.to_string().contains("no pending command buffer"));
         // The legacy API and subsequent Drop still permit an empty no-op.
@@ -735,19 +675,19 @@ mod checked_sync_tests {
 
 impl Drop for MetalContext {
     fn drop(&mut self) {
-        self.flush();
+        // Destruction must not reuse the throwing host-access path, especially
+        // during an encoding unwind. Model retirement owns the decision to
+        // release a whole model; this only observes the original native work.
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            if self.cmd.is_some() || self.submitted.is_some() {
+                let _ = self.observe_completion();
+            }
+        }));
     }
 }
 
-// ── Policy: should big weights land as f16? ───────────────────────────
-// Cached on first read so each tensor load doesn't re-parse env.
-
-fn prefer_f16_weights() -> bool {
-    metal_runtime_config().prefer_f16_weights
-}
-
 /// Element-count threshold above which a weight tensor goes to F16 storage
-/// (when `FERRUM_METAL_DTYPE=f16`). Tiny tensors (norm weights, biases) stay
+/// (when the context selects F16 weights). Tiny tensors (norm weights, biases) stay
 /// F32 so the existing f32 shaders continue to see f32 inputs.
 ///
 /// 1M elements = 4 MB as f32 / 2 MB as f16. Anything smaller saves little
@@ -766,7 +706,7 @@ fn buffer_from_f32_slice(data: &[f32]) -> metal::Buffer {
 
 fn buffer_from_f16_bytes(bytes: &[u8]) -> metal::Buffer {
     debug_assert_eq!(bytes.len() % 2, 0);
-    st().pipes.device.new_buffer_with_data(
+    st().pipes.device().new_buffer_with_data(
         bytes.as_ptr() as *const c_void,
         bytes.len() as u64,
         MTLResourceOptions::StorageModeShared,
@@ -811,16 +751,64 @@ impl Backend for MetalBackend {
     // GPTQ path (GGUF is the quant story on Metal). Adding GPTQ later
     // means impl-ing MarlinExpertStack<MetalBackend> + load_gptq_stacked.
 
-    fn new_context() -> Self::Context {
-        MetalContext {
+    fn new_context(config: &BackendContextConfig) -> Result<Self::Context> {
+        config.validate()?;
+        if config.device_ordinal != 0 {
+            return Err(FerrumError::unsupported(
+                "Metal's shared device boundary does not support device ordinal selection",
+            ));
+        }
+        let pipes = Arc::clone(&st().pipes);
+        let queue = pipes.device().new_command_queue();
+        Ok(MetalContext {
+            config: config.clone(),
+            pipes,
+            queue,
+            #[cfg(test)]
+            last_attention_kernel: None,
             cmd: None,
             encoder: None,
             submitted: None,
             last_completion: None,
-        }
+            #[cfg(test)]
+            completion_observation_override: None,
+        })
     }
+
+    fn context_config(ctx: &Self::Context) -> &BackendContextConfig {
+        &ctx.config
+    }
+
+    fn supports_retained_execution() -> bool {
+        true
+    }
+
     fn sync(ctx: &mut Self::Context) {
-        ctx.flush();
+        ctx.synchronize_for_host_access()
+            .unwrap_or_else(|error| std::panic::panic_any(error));
+    }
+
+    fn begin_execution(ctx: &mut Self::Context) -> Result<()> {
+        if ctx.cmd.is_some() || ctx.encoder.is_some() || ctx.submitted.is_some() {
+            return Err(FerrumError::backend(
+                "Metal cannot begin an invocation before the original command is terminal",
+            ));
+        }
+        // This is an invocation boundary, not resource retirement. Only the
+        // previous terminal status is reset; queue and allocations stay owned.
+        ctx.last_completion = None;
+        Ok(())
+    }
+
+    fn retire_context(ctx: &mut Self::Context) -> Result<()> {
+        if Self::preparation_is_host_only(ctx) {
+            return Ok(());
+        }
+        match ctx.observe_completion() {
+            crate::backend::BackendCompletion::Succeeded
+            | crate::backend::BackendCompletion::Failed(_) => Ok(()),
+            crate::backend::BackendCompletion::Unresolved(error) => Err(error),
+        }
     }
 
     fn try_sync(ctx: &mut Self::Context) -> Result<()> {
@@ -829,6 +817,16 @@ impl Backend for MetalBackend {
 
     fn observe_completion(ctx: &mut Self::Context) -> crate::backend::BackendCompletion {
         ctx.observe_completion()
+    }
+
+    fn preparation_is_host_only(ctx: &Self::Context) -> bool {
+        // Metal allocation and write_typed use shared host memory. Any real
+        // encode, unresolved command or previous completion invalidates this
+        // pristine-only proof; ordinary empty checked_sync remains an error.
+        ctx.cmd.is_none()
+            && ctx.encoder.is_none()
+            && ctx.submitted.is_none()
+            && ctx.last_completion.is_none()
     }
     fn sync_before_host_readback(ctx: &mut Self::Context) {
         Self::sync(ctx);
@@ -843,7 +841,7 @@ impl Backend for MetalBackend {
     /// the legacy `from_slice` (which is kept as f32-default convenience).
     fn from_slice_typed<T: crate::backend::HostDtype>(data: &[T]) -> Self::Buffer {
         let bytes = data.len() * std::mem::size_of::<T>();
-        let raw = st().pipes.device.new_buffer_with_data(
+        let raw = st().pipes.device().new_buffer_with_data(
             data.as_ptr() as *const c_void,
             bytes as u64,
             MTLResourceOptions::StorageModeShared,
@@ -860,10 +858,12 @@ impl Backend for MetalBackend {
     /// Silicon means CPU writes the buffer's contents pointer
     /// directly — no blit encoder.
     fn write_typed<T: crate::backend::HostDtype>(
-        _ctx: &mut Self::Context,
+        ctx: &mut Self::Context,
         buf: &mut Self::Buffer,
         data: &[T],
     ) {
+        ctx.require_reusable_state()
+            .unwrap_or_else(|error| std::panic::panic_any(error));
         debug_assert_eq!(
             buf.dtype,
             T::DTYPE,
@@ -891,26 +891,25 @@ impl Backend for MetalBackend {
     ) {
         let a_buf = a.expect_f32("gemm a");
         let out_buf = out.expect_f32_mut("gemm out");
-        let enc = ctx.compute_encoder();
+        let (pipes, enc, _) = ctx.encoder_parts();
         match b.dtype {
             Dtype::F16 => {
                 // f16 weights — route through the f32-activation / f16-weight kernels.
                 if m == 1 {
-                    st().pipes.gemv_enc_f16w(enc, a_buf, &b.raw, out_buf, n, k);
+                    pipes.gemv_enc_f16w(enc, a_buf, &b.raw, out_buf, n, k);
                 } else {
-                    st().pipes
-                        .gemm_v2_f16w(enc, a_buf, &b.raw, out_buf, m, n, k);
+                    pipes.gemm_v2_f16w(enc, a_buf, &b.raw, out_buf, m, n, k);
                 }
             }
             Dtype::F32 => {
                 if m == 1 {
                     // GEMV with K-reduction via simd_sum — good for lm_head
                     // (N = vocab = 152k for Qwen3).
-                    st().pipes.gemv_enc(enc, a_buf, &b.raw, out_buf, n, k);
+                    pipes.gemv_enc(enc, a_buf, &b.raw, out_buf, n, k);
                 } else {
                     // GPU simdgroup-matrix tiled GEMM. Replaces an earlier
                     // cblas_sgemm fallback that serialised against GPU work.
-                    st().pipes.gemm_v2(enc, a_buf, &b.raw, out_buf, m, n, k);
+                    pipes.gemm_v2(enc, a_buf, &b.raw, out_buf, m, n, k);
                 }
             }
             // Phase A: integer dtypes are reserved for the upcoming typed-
@@ -938,8 +937,8 @@ impl Backend for MetalBackend {
         let x = x.expect_f32("rms_norm x");
         let w = w.expect_f32("rms_norm w");
         let out = out.expect_f32_mut("rms_norm out");
-        let enc = ctx.compute_encoder();
-        st().pipes.rms_norm_enc(enc, x, w, out, tokens, dim, eps);
+        let (pipes, enc, _) = ctx.encoder_parts();
+        pipes.rms_norm_enc(enc, x, w, out, tokens, dim, eps);
     }
 
     fn fused_add_rms_norm(
@@ -956,8 +955,8 @@ impl Backend for MetalBackend {
         let x = x.expect_f32("fused_add_rms_norm x");
         let w = w.expect_f32("fused_add_rms_norm w");
         let out = out.expect_f32_mut("fused_add_rms_norm out");
-        let enc = ctx.compute_encoder();
-        st().pipes.fused_residual_norm_enc(
+        let (pipes, enc, _) = ctx.encoder_parts();
+        pipes.fused_residual_norm_enc(
             enc, residual, x, None, w, residual, out, tokens, dim, eps, 0,
         );
     }
@@ -992,10 +991,14 @@ impl Backend for MetalBackend {
         // flash_attn_v2 opens its own compute encoder internally; close
         // the sticky one first so we don't have two open at once on the
         // same cmd buffer.
-        ctx.compute_encoder_end();
-        let cmd = ctx.cmd();
-        st().pipes
-            .flash_attn_v2(cmd, q, k, v, out, &p, cfg.kv_seq_stride);
+        let (pipes, cmd, options) = ctx.command_parts();
+        let kernel = pipes.flash_attn_v2(cmd, q, k, v, out, &p, cfg.kv_seq_stride, options);
+        #[cfg(test)]
+        {
+            ctx.last_attention_kernel = Some(kernel);
+        }
+        #[cfg(not(test))]
+        let _ = kernel;
     }
 
     fn copy_slice(
@@ -1006,21 +1009,53 @@ impl Backend for MetalBackend {
         dst_offset: usize,
         len: usize,
     ) {
+        assert_eq!(src.dtype, dst.dtype, "Metal copy_slice dtype mismatch");
+        let src_end = src_offset
+            .checked_add(len)
+            .expect("Metal copy_slice source extent overflow");
+        let dst_end = dst_offset
+            .checked_add(len)
+            .expect("Metal copy_slice destination extent overflow");
+        assert!(src_end <= src.n, "Metal copy_slice source out of bounds");
+        assert!(
+            dst_end <= dst.n,
+            "Metal copy_slice destination out of bounds"
+        );
+        let element_bytes = src.dtype.bytes_per_elem();
+        let bytes = |elements: usize| {
+            u64::try_from(
+                elements
+                    .checked_mul(element_bytes)
+                    .expect("Metal copy_slice byte extent overflow"),
+            )
+            .expect("Metal copy_slice byte extent exceeds Metal address range")
+        };
+        assert!(
+            bytes(src_end) <= src.raw.length(),
+            "Metal copy_slice source exceeds allocation"
+        );
+        assert!(
+            bytes(dst_end) <= dst.raw.length(),
+            "Metal copy_slice destination exceeds allocation"
+        );
+        let src_offset_bytes = bytes(src_offset);
+        let dst_offset_bytes = bytes(dst_offset);
+        let len_bytes = bytes(len);
+        if len == 0 {
+            return;
+        }
         // Blit encoder stays in the same command buffer as neighbouring
         // compute encoders, keeping the single-command-buffer invariant.
         // Close the sticky compute encoder first — Metal forbids two
         // active encoders on one cmd buffer.
-        let src = src.expect_f32("copy_slice src");
-        let dst = dst.expect_f32_mut("copy_slice dst");
-        ctx.compute_encoder_end();
-        let cmd = ctx.cmd();
+        let (_, cmd, _) = ctx.command_parts();
         let blit = cmd.new_blit_command_encoder();
         blit.copy_from_buffer(
-            src,
-            (src_offset * 4) as u64,
-            dst,
-            (dst_offset * 4) as u64,
-            (len * 4) as u64,
+            &src.raw,
+            src_offset_bytes,
+            &dst.raw,
+            dst_offset_bytes,
+            len_bytes,
         );
         blit.end_encoding();
     }
@@ -1035,7 +1070,8 @@ impl Backend for MetalBackend {
         // CPU-side gather into the f32 activation output. `ids.len()` is
         // small (one per batch item); flush any pending GPU work first.
         let out = out.expect_f32_mut("embedding_lookup out");
-        ctx.flush();
+        ctx.synchronize_for_host_access()
+            .unwrap_or_else(|error| std::panic::panic_any(error));
         unsafe {
             let o = std::slice::from_raw_parts_mut(out.contents() as *mut f32, ids.len() * dim);
             match table.dtype {
@@ -1083,9 +1119,8 @@ impl Backend for MetalBackend {
         let q = q.expect_f32_mut("split_qkv q");
         let k = k.expect_f32_mut("split_qkv k");
         let v = v.expect_f32_mut("split_qkv v");
-        let enc = ctx.compute_encoder();
-        st().pipes
-            .split_qkv_enc(enc, qkv, q, k, v, tokens, q_dim, kv_dim);
+        let (pipes, enc, _) = ctx.encoder_parts();
+        pipes.split_qkv_enc(enc, qkv, q, k, v, tokens, q_dim, kv_dim);
     }
 
     fn fused_silu_mul_split(
@@ -1097,8 +1132,8 @@ impl Backend for MetalBackend {
     ) {
         let gu = gu.expect_f32("fused_silu_mul_split gate_up");
         let out = out.expect_f32_mut("fused_silu_mul_split out");
-        let enc = ctx.compute_encoder();
-        st().pipes.silu_mul_split_enc(enc, gu, out, tokens, im);
+        let (pipes, enc, _) = ctx.encoder_parts();
+        pipes.silu_mul_split_enc(enc, gu, out, tokens, im);
     }
 
     fn fused_gelu_tanh_mul_split(
@@ -1110,8 +1145,8 @@ impl Backend for MetalBackend {
     ) {
         let gu = gu.expect_f32("fused_gelu_tanh_mul_split gate_up");
         let out = out.expect_f32_mut("fused_gelu_tanh_mul_split out");
-        let enc = ctx.compute_encoder();
-        st().pipes.gelu_tanh_mul_split_enc(enc, gu, out, tokens, im);
+        let (pipes, enc, _) = ctx.encoder_parts();
+        pipes.gelu_tanh_mul_split_enc(enc, gu, out, tokens, im);
     }
 
     fn scale_inplace(ctx: &mut Self::Context, buf: &mut Self::Buffer, scale: f32, len: usize) {
@@ -1120,8 +1155,8 @@ impl Backend for MetalBackend {
         let scale_buf = Self::from_slice(&[scale]);
         let scale_mb = scale_buf.expect_f32("scale_inplace scale");
         let buf = buf.expect_f32_mut("scale_inplace buf");
-        let enc = ctx.compute_encoder();
-        st().pipes.mul_scale_enc(enc, buf, scale_mb, buf, len, 1);
+        let (pipes, enc, _) = ctx.encoder_parts();
+        pipes.mul_scale_enc(enc, buf, scale_mb, buf, len, 1);
     }
 
     fn qk_norm_rope(
@@ -1143,8 +1178,8 @@ impl Backend for MetalBackend {
         let cos = cos.expect_f32("qk_norm_rope cos");
         let sin = sin.expect_f32("qk_norm_rope sin");
         let output = output.expect_f32_mut("qk_norm_rope output");
-        let enc = ctx.compute_encoder();
-        st().pipes.qk_norm_rope(
+        let (pipes, enc, _) = ctx.encoder_parts();
+        pipes.qk_norm_rope(
             enc, input, norm_w, cos, sin, output, tokens, heads, head_dim, pos_offset, eps, mode,
         );
     }
@@ -1175,8 +1210,8 @@ impl Backend for MetalBackend {
         let q_out = q_out.expect_f32_mut("split_qkv_norm_rope q_out");
         let k_out = k_out.expect_f32_mut("split_qkv_norm_rope k_out");
         let v_out = v_out.expect_f32_mut("split_qkv_norm_rope v_out");
-        let enc = ctx.compute_encoder();
-        st().pipes.split_qkv_norm_rope(
+        let (pipes, enc, _) = ctx.encoder_parts();
+        pipes.split_qkv_norm_rope(
             enc, qkv, q_norm_w, k_norm_w, cos, sin, q_out, k_out, v_out, tokens, q_heads, kv_heads,
             head_dim, pos_offset, eps, qk_mode,
         );
@@ -1211,8 +1246,8 @@ impl Backend for MetalBackend {
         let q_out = q_out.expect_f32_mut("split_qkv_norm_rope_kvc q_out");
         let cache_k = cache_k.expect_f32_mut("split_qkv_norm_rope_kvc cache_k");
         let cache_v = cache_v.expect_f32_mut("split_qkv_norm_rope_kvc cache_v");
-        let enc = ctx.compute_encoder();
-        st().pipes.split_qkv_norm_rope_into_cache(
+        let (pipes, enc, _) = ctx.encoder_parts();
+        pipes.split_qkv_norm_rope_into_cache(
             enc,
             qkv,
             q_norm_w,
@@ -1240,7 +1275,7 @@ impl Backend for MetalBackend {
         let bytes = (n * dtype.bytes_per_elem()) as u64;
         let raw = st()
             .pipes
-            .device
+            .device()
             .new_buffer(bytes, MTLResourceOptions::StorageModeShared);
         MetalBuf { raw, dtype, n }
     }
@@ -1262,8 +1297,8 @@ impl Backend for MetalBackend {
         let cache_v = cache_v.expect_f32_mut("kv_cache_append cache_v");
         let new_k_head_major = new_k_head_major.expect_f32("kv_cache_append new_k");
         let new_v_head_major = new_v_head_major.expect_f32("kv_cache_append new_v");
-        let enc = ctx.compute_encoder();
-        st().pipes.kv_cache_append(
+        let (pipes, enc, _) = ctx.encoder_parts();
+        pipes.kv_cache_append(
             enc,
             new_k_head_major,
             cache_k,
@@ -1273,7 +1308,7 @@ impl Backend for MetalBackend {
             new_tokens,
             cache_capacity,
         );
-        st().pipes.kv_cache_append(
+        pipes.kv_cache_append(
             enc,
             new_v_head_major,
             cache_v,
@@ -1295,8 +1330,8 @@ impl Backend for MetalBackend {
     ) {
         let src = src.expect_f32("transpose_head_to_token src");
         let dst = dst.expect_f32_mut("transpose_head_to_token dst");
-        let enc = ctx.compute_encoder();
-        st().pipes.transpose_out(enc, src, dst, tokens, heads, dim);
+        let (pipes, enc, _) = ctx.encoder_parts();
+        pipes.transpose_out(enc, src, dst, tokens, heads, dim);
     }
 
     fn add_bias(
@@ -1308,8 +1343,8 @@ impl Backend for MetalBackend {
     ) {
         let data = data.expect_f32_mut("add_bias data");
         let bias = bias.expect_f32("add_bias bias");
-        let enc = ctx.compute_encoder();
-        st().pipes.add_bias_enc(enc, data, bias, rows, cols);
+        let (pipes, enc, _) = ctx.encoder_parts();
+        pipes.add_bias_enc(enc, data, bias, rows, cols);
     }
 
     fn layer_norm(
@@ -1326,23 +1361,22 @@ impl Backend for MetalBackend {
         let gamma = gamma.expect_f32("layer_norm gamma");
         let beta = beta.expect_f32("layer_norm beta");
         let out = out.expect_f32_mut("layer_norm out");
-        let enc = ctx.compute_encoder();
-        st().pipes
-            .layer_norm_enc(enc, x, gamma, beta, out, tokens, dim, eps);
+        let (pipes, enc, _) = ctx.encoder_parts();
+        pipes.layer_norm_enc(enc, x, gamma, beta, out, tokens, dim, eps);
     }
 
     fn gelu(ctx: &mut Self::Context, x: &Self::Buffer, out: &mut Self::Buffer, len: usize) {
         let x = x.expect_f32("gelu x");
         let out = out.expect_f32_mut("gelu out");
-        let enc = ctx.compute_encoder();
-        st().pipes.gelu_enc(enc, x, out, len);
+        let (pipes, enc, _) = ctx.encoder_parts();
+        pipes.gelu_enc(enc, x, out, len);
     }
 
     fn add_inplace(ctx: &mut Self::Context, r: &mut Self::Buffer, x: &Self::Buffer, len: usize) {
         let r = r.expect_f32_mut("add_inplace r");
         let x = x.expect_f32("add_inplace x");
-        let enc = ctx.compute_encoder();
-        st().pipes.add_enc(enc, r, x, r, len);
+        let (pipes, enc, _) = ctx.encoder_parts();
+        pipes.add_enc(enc, r, x, r, len);
     }
 
     fn scaled_add_inplace(
@@ -1354,9 +1388,8 @@ impl Backend for MetalBackend {
     ) {
         let dst_buf = dst.expect_f32_mut("scaled_add_inplace dst");
         let src_buf = src.expect_f32("scaled_add_inplace src");
-        let enc = ctx.compute_encoder();
-        st().pipes
-            .scaled_add_inplace_enc(enc, dst_buf, src_buf, scale, len);
+        let (pipes, enc, _) = ctx.encoder_parts();
+        pipes.scaled_add_inplace_enc(enc, dst_buf, src_buf, scale, len);
     }
 
     // ── Buffer management ────────────────────────────────────────────
@@ -1389,13 +1422,21 @@ impl Backend for MetalBackend {
         }
     }
 
+    fn to_vec_in_context(ctx: &mut Self::Context, buf: &Self::Buffer, len: usize) -> Vec<f32> {
+        ctx.require_reusable_state()
+            .unwrap_or_else(|error| std::panic::panic_any(error));
+        Self::to_vec(buf, len)
+    }
+
     fn argmax_rows_f16(
         ctx: &mut Self::Context,
         logits: &Self::Buffer,
         m: usize,
         n: usize,
     ) -> Result<Vec<u32>> {
+        ctx.require_reusable_state()?;
         if !matches!(logits.dtype, Dtype::F32) {
+            ctx.synchronize_for_host_access()?;
             let host = Self::to_vec(logits, m * n);
             let mut out = Vec::with_capacity(m);
             for row in 0..m {
@@ -1418,13 +1459,13 @@ impl Backend for MetalBackend {
             n: i32,
         }
 
-        let out = st().pipes.device.new_buffer(
+        let out = ctx.pipes.device().new_buffer(
             (m * std::mem::size_of::<u32>()) as u64,
             MTLResourceOptions::StorageModeShared,
         );
         let params = ArgmaxParams { n: n as i32 };
-        let enc = ctx.compute_encoder();
-        enc.set_compute_pipeline_state(st().pipes.pipeline("argmax_rows_f32"));
+        let (pipes, enc, _) = ctx.encoder_parts();
+        enc.set_compute_pipeline_state(pipes.pipeline("argmax_rows_f32"));
         enc.set_buffer(0, Some(&logits.raw), 0);
         enc.set_buffer(1, Some(&out), 0);
         enc.set_bytes(
@@ -1433,7 +1474,7 @@ impl Backend for MetalBackend {
             &params as *const _ as *const c_void,
         );
         enc.dispatch_thread_groups(MTLSize::new(1, m as u64, 1), MTLSize::new(256, 1, 1));
-        ctx.flush();
+        ctx.synchronize_for_host_access()?;
         let ptr = out.contents() as *const u32;
         let tokens = unsafe { std::slice::from_raw_parts(ptr, m).to_vec() };
         Ok(tokens)
@@ -1448,54 +1489,72 @@ impl Backend for MetalBackend {
         }
     }
 
+    /// Context-free compatibility construction uses the fixed F32 default.
+    /// Model weight loading uses `from_weight_bytes_in_context` below.
     fn from_weight_bytes(raw: &[u8], src_dtype: SrcDtype) -> Self::Buffer {
-        let n = raw.len() / src_dtype.bytes_per_elem();
-        let want_f16 = prefer_f16_weights() && n >= F16_MIN_ELEMS;
+        weight_bytes_with_options(raw, src_dtype, &MetalBackendConfig::default())
+    }
 
-        if !want_f16 {
-            // Default behaviour: materialise as f32, matches pre-refactor
-            // MetalBackend byte-for-byte.
-            let data = src_dtype.to_f32_vec(raw);
-            return MetalBuf {
-                raw: buffer_from_f32_slice(&data),
-                dtype: Dtype::F32,
-                n,
-            };
-        }
+    fn from_weight_bytes_in_context(
+        ctx: &mut Self::Context,
+        raw: &[u8],
+        src_dtype: SrcDtype,
+    ) -> Self::Buffer {
+        weight_bytes_with_options(raw, src_dtype, &ctx.config.metal)
+    }
+}
 
-        // f16 storage path — go directly from raw bytes where possible to
-        // avoid the transient 2× RAM spike.
-        match src_dtype {
-            SrcDtype::F16 => MetalBuf {
-                raw: buffer_from_f16_bytes(raw),
+fn weight_bytes_with_options(
+    raw: &[u8],
+    src_dtype: SrcDtype,
+    options: &MetalBackendConfig,
+) -> MetalBuf {
+    let n = raw.len() / src_dtype.bytes_per_elem();
+    let want_f16 = options.prefer_f16_weights && n >= F16_MIN_ELEMS;
+
+    if !want_f16 {
+        // Default behaviour: materialise as f32, matches pre-refactor
+        // MetalBackend byte-for-byte.
+        let data = src_dtype.to_f32_vec(raw);
+        return MetalBuf {
+            raw: buffer_from_f32_slice(&data),
+            dtype: Dtype::F32,
+            n,
+        };
+    }
+
+    // f16 storage path — go directly from raw bytes where possible to
+    // avoid the transient 2× RAM spike.
+    match src_dtype {
+        SrcDtype::F16 => MetalBuf {
+            raw: buffer_from_f16_bytes(raw),
+            dtype: Dtype::F16,
+            n,
+        },
+        SrcDtype::BF16 => {
+            // bf16 → f16 via f32. Loses magnitude range (bf16 has a
+            // broader exponent) but gains mantissa precision, which for
+            // typical weight magnitudes (|w| < 32) is a net upgrade.
+            let mut f16_bytes = vec![0u8; n * 2];
+            for i in 0..n {
+                let v = bf16::from_le_bytes([raw[i * 2], raw[i * 2 + 1]]).to_f32();
+                let h = f16::from_f32(v).to_le_bytes();
+                f16_bytes[i * 2] = h[0];
+                f16_bytes[i * 2 + 1] = h[1];
+            }
+            MetalBuf {
+                raw: buffer_from_f16_bytes(&f16_bytes),
                 dtype: Dtype::F16,
                 n,
-            },
-            SrcDtype::BF16 => {
-                // bf16 → f16 via f32. Loses magnitude range (bf16 has a
-                // broader exponent) but gains mantissa precision, which for
-                // typical weight magnitudes (|w| < 32) is a net upgrade.
-                let mut f16_bytes = vec![0u8; n * 2];
-                for i in 0..n {
-                    let v = bf16::from_le_bytes([raw[i * 2], raw[i * 2 + 1]]).to_f32();
-                    let h = f16::from_f32(v).to_le_bytes();
-                    f16_bytes[i * 2] = h[0];
-                    f16_bytes[i * 2 + 1] = h[1];
-                }
-                MetalBuf {
-                    raw: buffer_from_f16_bytes(&f16_bytes),
-                    dtype: Dtype::F16,
-                    n,
-                }
             }
-            SrcDtype::F32 => {
-                // f32 → f16 downcast. Halves storage.
-                let data = src_dtype.to_f32_vec(raw);
-                MetalBuf {
-                    raw: buffer_f16_from_f32(&data),
-                    dtype: Dtype::F16,
-                    n,
-                }
+        }
+        SrcDtype::F32 => {
+            // f32 → f16 downcast. Halves storage.
+            let data = src_dtype.to_f32_vec(raw);
+            MetalBuf {
+                raw: buffer_f16_from_f32(&data),
+                dtype: Dtype::F16,
+                n,
             }
         }
     }

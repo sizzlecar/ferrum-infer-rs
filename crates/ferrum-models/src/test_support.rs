@@ -27,6 +27,9 @@ use crate::models::llama_family::LlamaFamilyConfig;
 use crate::models::LlamaFamilyModel;
 use crate::LlmExecutor;
 
+#[cfg(test)]
+pub(crate) mod numerical;
+
 /// Shape of a deterministic tiny LLaMA-family model.
 ///
 /// Defaults are larger than the op-parity micro config (vocab 7, hidden 4):
@@ -137,34 +140,47 @@ impl SyntheticLlamaLoader {
 }
 
 impl<B: Backend> WeightLoader<B> for SyntheticLlamaLoader {
-    fn load_tensor(&self, name: &str) -> Result<B::Buffer> {
+    fn load_tensor(&self, ctx: &mut B::Context, name: &str) -> Result<B::Buffer> {
         if name == "model.embed_tokens.weight" {
-            return Ok(B::from_slice(&Self::deterministic_values(
-                name,
-                self.cfg.vocab_size * self.cfg.hidden_size,
-                0.0,
-                0.02,
-            )));
+            return Ok(B::from_slice_in_context(
+                ctx,
+                &Self::deterministic_values(
+                    name,
+                    self.cfg.vocab_size * self.cfg.hidden_size,
+                    0.0,
+                    0.02,
+                ),
+            ));
         }
         if name == "model.norm.weight"
             || name.ends_with(".input_layernorm.weight")
             || name.ends_with(".post_attention_layernorm.weight")
         {
-            return Ok(B::from_slice(&self.layer_norm_values(name)));
+            return Ok(B::from_slice_in_context(ctx, &self.layer_norm_values(name)));
         }
         Err(FerrumError::model(format!(
             "unexpected tensor requested by synthetic loader: {name}"
         )))
     }
 
-    fn load_linear(&self, name: &str) -> Result<Box<dyn ferrum_quantization::Linear<B>>> {
-        let (out_features, in_features) = self.linear_dims(name)?;
-        let weights = Self::deterministic_values(name, out_features * in_features, 0.0, 0.015);
-        Ok(Box::new(DenseLinear::<B>::from_rows(
-            &weights,
-            out_features,
-            in_features,
-        )))
+    fn load_linear(
+        &self,
+        ctx: &mut B::Context,
+        name: &str,
+    ) -> Result<ferrum_kernels::LoadedLinear<B>> {
+        let linear = (|| -> Result<Box<dyn ferrum_quantization::Linear<B>>> {
+            let (out_features, in_features) = self.linear_dims(name)?;
+            let weights = Self::deterministic_values(name, out_features * in_features, 0.0, 0.015);
+            Ok(Box::new(DenseLinear::<B>::from_rows_in_context(
+                ctx,
+                &weights,
+                out_features,
+                in_features,
+            )))
+        })()?;
+        // SAFETY: these built-in projections own their weights and encode only
+        // backend work; the model retains them until checked graph retirement.
+        Ok(unsafe { ferrum_kernels::LoadedLinear::new_capture_stable(linear) })
     }
 
     fn has_tensor(&self, name: &str) -> bool {
@@ -182,9 +198,21 @@ pub const TINY_MODEL_ID: &str = "tiny-llama-test";
 /// Build the tiny CPU model directly. Most tests want
 /// [`tiny_llama_executor`] instead; this is for op-level access.
 pub fn tiny_llama_model(cfg: &TinyLlamaConfig) -> LlamaFamilyModel<CpuBackend, KvFp16> {
+    tiny_llama_model_with_execution_config(cfg, ferrum_types::LlamaExecutionConfig::default())
+}
+
+/// Build the same real CPU fixture with explicit instance construction options.
+pub fn tiny_llama_model_with_execution_config(
+    cfg: &TinyLlamaConfig,
+    execution: ferrum_types::LlamaExecutionConfig,
+) -> LlamaFamilyModel<CpuBackend, KvFp16> {
     let loader = SyntheticLlamaLoader::new(cfg.to_llama_config());
-    LlamaFamilyModel::<CpuBackend, KvFp16>::new(cfg.to_llama_config(), &loader)
-        .expect("tiny llama model construction")
+    LlamaFamilyModel::<CpuBackend, KvFp16>::new_with_execution_config(
+        cfg.to_llama_config(),
+        &loader,
+        execution,
+    )
+    .expect("tiny llama model construction")
 }
 
 /// [`ModelInfo`] matching a [`TinyLlamaConfig`].
@@ -210,8 +238,14 @@ pub fn tiny_model_info(cfg: &TinyLlamaConfig) -> ModelInfo {
 /// Build a real [`ModelExecutor`] wrapping the tiny model — the seam the
 /// engine scheduler calls. Real forward, real KV, no mock.
 pub fn tiny_llama_executor(cfg: &TinyLlamaConfig) -> Arc<dyn ModelExecutor> {
+    Arc::from(tiny_llama_executor_owned(cfg))
+}
+
+/// Build the same real model without manufacturing a shared executor owner.
+/// Product lifecycle tests can transfer this value into `ExecutorOwner`.
+pub fn tiny_llama_executor_owned(cfg: &TinyLlamaConfig) -> Box<dyn ModelExecutor> {
     let model = tiny_llama_model(cfg);
-    Arc::new(LlmExecutor::new(Box::new(model), tiny_model_info(cfg)))
+    Box::new(LlmExecutor::new(Box::new(model), tiny_model_info(cfg)))
 }
 
 /// Build a [`TinyTokenizer`] whose vocab matches the model's.
@@ -367,3 +401,9 @@ impl Tokenizer for TinyTokenizer {
         }
     }
 }
+
+/// Real compiled language-program construction shared by upper-layer tests.
+pub mod native_program;
+
+#[cfg(any(feature = "cuda", all(feature = "metal", target_os = "macos")))]
+pub mod stateful_program;

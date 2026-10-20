@@ -3,7 +3,6 @@ use super::*;
 use ferrum_engine::ContinuousBatchEngine;
 use ferrum_interfaces::{sampler::GreedySampler, Tokenizer};
 use ferrum_scheduler::ContinuousBatchScheduler;
-use ferrum_testkit::MockTensorFactory;
 use ferrum_tokenizer::HuggingFaceTokenizer;
 use ferrum_types::{FerrumError, ReasoningEffortSupport};
 use futures::FutureExt;
@@ -163,7 +162,7 @@ async fn infer_with_real_engine(
         .await
         .unwrap(),
     );
-    let executor = Arc::new(if steps.iter().all(|step| step.len() == 1) {
+    let executor = if steps.iter().all(|step| step.len() == 1) {
         ScriptedExecutor::new(
             tokenizer.vocab_size(),
             steps
@@ -185,25 +184,27 @@ async fn infer_with_real_engine(
                 })
                 .collect(),
         )
-    });
+    };
     let mut config = EngineConfig::default();
     config.model.model_id = ModelId::new("reasoning-contract");
     config.scheduler.max_running_requests = 1;
     config.batching.max_num_batched_tokens = 256;
+    let observation = executor.observer();
     let engine = Arc::new(
-        ContinuousBatchEngine::new_plan_runtime(
+        ContinuousBatchEngine::new(
             config.clone(),
             Arc::new(ContinuousBatchScheduler::new(config.scheduler)),
             tokenizer.clone(),
             Arc::new(GreedySampler),
-            executor.clone(),
-            Arc::new(MockTensorFactory),
+            ferrum_execution::ExecutorOwner::new(Box::new(executor)),
         )
         .unwrap(),
     );
+    let executor = observation;
     let router = AxumServer::from_llm(engine.clone())
         .with_prompt_template(Some(template))
-        .build_router();
+        .build_router()
+        .unwrap();
     wire["model"] = json!("reasoning-contract");
     wire["temperature"] = json!(0);
     wire["max_tokens"] = json!(8);

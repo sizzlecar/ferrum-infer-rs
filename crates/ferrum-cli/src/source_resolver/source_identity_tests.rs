@@ -129,9 +129,7 @@ fn legacy_source_identity_binds_actual_roles_and_retained_template() {
             let config = ferrum_types::FerrumConfigBuilder::new(
                 RuntimeConfigSnapshot::from_entries(Vec::new()),
             )
-            .with_execution_resource_authority(
-                ferrum_types::ExecutionResourceAuthority::LegacyEngine,
-            )
+            .with_execution_planning_model(ferrum_types::ExecutionPlanningModel::ExecutorManaged)
             .resolve()
             .unwrap();
             let output = fixture._directory.path().join("effective.json");

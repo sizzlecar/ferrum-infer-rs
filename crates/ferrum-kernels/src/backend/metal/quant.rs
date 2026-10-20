@@ -2,32 +2,15 @@
 //! `BackendQuantGguf` impl. Extracted from the monolithic `metal.rs`
 //! (Audit #8 split mirror of the cuda/quant.rs layout).
 //!
-//! Public surface preserved via `pub use` in `super` (metal/mod.rs), so
-//! external `crate::backend::metal::{MetalQuantStore, ...}` paths keep
-//! working without changes.
+//! Cold helpers receive explicit policy; production trait calls use the
+//! original context. Context-free compatibility methods use fixed defaults.
 
-use super::{
-    add_registered_mmap_buffer, metal_mmap_trace_enabled, slice_is_in_registered_mmap, st,
-    MetalBackend,
-};
+use super::{add_registered_mmap_buffer, registered_mmap_entry, st, MetalBackend};
+use crate::attention::metal::pipelines::MetalPipelines;
 use crate::backend::{Backend, GgufQuantType};
-use ferrum_types::{FerrumError, Result};
+use ferrum_types::{FerrumError, MetalBackendConfig, Result};
 use metal::MTLResourceOptions;
 use std::ffi::c_void;
-use std::sync::OnceLock;
-
-// ── Profiling counters for `gemm_quant` (off by default) ─────────────
-
-static QUANT_GEMM_TIME_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-static QUANT_GEMM_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-static QUANT_GEMM_LAST_M: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-static QUANT_GEMM_LAST_N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-static QUANT_GEMM_LAST_K: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-fn debug_per_call_flush() -> bool {
-    static FLAG: OnceLock<bool> = OnceLock::new();
-    *FLAG.get_or_init(|| std::env::vars().any(|(name, _)| name == "FERRUM_METAL_QUANT_PROFILE"))
-}
 
 // ── MetalQuantStore (GGUF k-quant container) ──────────────────────────
 
@@ -39,7 +22,7 @@ fn debug_per_call_flush() -> bool {
 /// Q4_K_M) instead of inflating to fp16 (~16 GB) or fp32 (~32 GB).
 /// New k-quant types add new variants (and matched dequant kernel +
 /// `gemm_quant` arm) without touching the trait surface.
-pub enum MetalQuantStore {
+pub(crate) enum MetalQuantStore {
     Q4K {
         /// Either a private allocation owning `[n_blocks * 144]` bytes
         /// (copy fallback) or a clone of the shared zero-copy mmap buffer.
@@ -138,54 +121,72 @@ unsafe impl Sync for MetalQuantStore {}
 /// ~30× on M1 Max — Apple's GPU residency tracking on huge buffers is
 /// expensive per dispatch. Per-tensor views are registered in one model-owned
 /// residency set so Metal wires them during load instead of every dispatch.
-fn buffer_for_quant_bytes(
+pub(super) fn buffer_for_quant_bytes(
     bytes: &[u8],
+    options: &MetalBackendConfig,
 ) -> Result<(metal::Buffer, u64, Option<super::MetalMmapLease>)> {
-    const PAGE: usize = 16384;
-    let trace = metal_mmap_trace_enabled();
-    if slice_is_in_registered_mmap(bytes) {
-        // Zero-copy: page-align the host range covering this tensor and
-        // wrap it in an MTLBuffer. The lease returned below keeps the mmap
-        // and residency set alive for exactly as long as the quant store.
+    let trace = options.mmap_trace;
+    // Resolve once and retain that exact registration through native creation,
+    // residency publication, or copy fallback. A boolean lookup followed by a
+    // second lookup could lose the registration between those operations.
+    if let Some(entry) = registered_mmap_entry(bytes) {
         let ptr_addr = bytes.as_ptr() as usize;
-        let aligned_start = ptr_addr & !(PAGE - 1);
-        let aligned_end = (ptr_addr + bytes.len()).div_ceil(PAGE) * PAGE;
-        let aligned_len = aligned_end - aligned_start;
-        let byte_offset = (ptr_addr - aligned_start) as u64;
-        let buf = st().pipes.device.new_buffer_with_bytes_no_copy(
-            aligned_start as *const c_void,
-            aligned_len as u64,
-            MTLResourceOptions::StorageModeShared,
-            None,
-        );
-        if buf.length() != 0 {
-            let mmap_lease = add_registered_mmap_buffer(bytes, &buf)?;
+        if let Some(native) = super::retained_memory::new_retained_buffer(
+            st().pipes.device(),
+            entry.memory.clone(),
+            bytes,
+            1,
+        )? {
+            let mmap_lease = add_registered_mmap_buffer(entry, &native.buffer)?;
             if trace {
                 eprintln!(
-                    "[mmap] zero-copy: tensor ptr=0x{ptr_addr:x} len={} -> buf @0x{aligned_start:x} len={aligned_len} off={byte_offset}",
-                    bytes.len()
+                    "[mmap] zero-copy: tensor ptr=0x{ptr_addr:x} len={} -> native_len={} off={}",
+                    bytes.len(),
+                    native.buffer.length(),
+                    native.byte_offset,
                 );
             }
-            return Ok((buf, byte_offset, Some(mmap_lease)));
+            return Ok((native.buffer, native.byte_offset as u64, Some(mmap_lease)));
         }
-        // newBufferWithBytesNoCopy can refuse very rare edge cases
-        // (fragmented host pages?). Fall through to the copy path.
         if trace {
             eprintln!(
-                "[mmap] zero-copy refused for tensor ptr=0x{ptr_addr:x} len={} aligned_len={aligned_len} — copying",
+                "[mmap] no safe native view for tensor ptr=0x{ptr_addr:x} len={} — copying",
                 bytes.len()
             );
         }
+        // Keep the resolved owner alive until the copy completes as well.
+        let buffer = copy_quant_bytes(bytes);
+        drop(entry);
+        return buffer.map(|buffer| (buffer, 0, None));
     }
     if trace {
         eprintln!("[mmap] copy: ptr={:p} len={}", bytes.as_ptr(), bytes.len());
     }
-    let buf = st().pipes.device.new_buffer_with_data(
-        bytes.as_ptr() as *const c_void,
-        bytes.len() as u64,
-        MTLResourceOptions::StorageModeShared,
-    );
-    Ok((buf, 0, None))
+    copy_quant_bytes(bytes).map(|buffer| (buffer, 0, None))
+}
+
+#[allow(
+    unexpected_cfgs,
+    reason = "objc 0.2 selector macros use legacy cargo-clippy cfg"
+)]
+fn copy_quant_bytes(bytes: &[u8]) -> Result<metal::Buffer> {
+    use metal::foreign_types::ForeignType;
+    use metal::objc::{msg_send, sel, sel_impl};
+    let device: &metal::DeviceRef = st().pipes.device();
+    // SAFETY: Metal copies the borrowed bytes before returning. Keep native
+    // allocation failure out of metal-rs's non-null owned Buffer wrapper.
+    let raw: *mut metal::MTLBuffer = unsafe {
+        msg_send![device,
+            newBufferWithBytes: bytes.as_ptr() as *const c_void
+            length: bytes.len() as metal::NSUInteger
+            options: MTLResourceOptions::StorageModeShared
+        ]
+    };
+    if raw.is_null() {
+        Err(FerrumError::backend("Metal quant weight allocation failed"))
+    } else {
+        Ok(unsafe { metal::Buffer::from_ptr(raw) })
+    }
 }
 
 // ── MoE expert stack builders ────────────────────────────────────────
@@ -197,11 +198,12 @@ fn buffer_for_quant_bytes(
 /// straight off the GGUF. When the slice belongs to a registered mmap,
 /// the returned store points into the shared zero-copy buffer with a
 /// non-zero `byte_offset`; otherwise a fresh allocation is made.
-pub fn load_q4k_experts(
+pub(crate) fn load_q4k_experts(
     bytes: &[u8],
     num_experts: usize,
     n_rows: usize,
     n_cols: usize,
+    options: &MetalBackendConfig,
 ) -> Result<MetalQuantStore> {
     const QK_K: usize = 256;
     const BLOCK_BYTES: usize = 144;
@@ -217,7 +219,7 @@ pub fn load_q4k_experts(
             bytes.len()
         )));
     }
-    let (blocks, byte_offset, mmap_lease) = buffer_for_quant_bytes(bytes)?;
+    let (blocks, byte_offset, mmap_lease) = buffer_for_quant_bytes(bytes, options)?;
     Ok(MetalQuantStore::Q4KExperts {
         blocks,
         byte_offset,
@@ -230,14 +232,15 @@ pub fn load_q4k_experts(
 
 /// Build a `Q6KExperts` MoE stack from a contiguous block-bytes payload.
 /// Honours the mmap registry the same way as [`load_q4k_experts`].
-pub fn load_q6k_experts(
+pub(crate) fn load_q6k_experts(
     bytes: &[u8],
     num_experts: usize,
     n_rows: usize,
     n_cols: usize,
+    options: &MetalBackendConfig,
 ) -> Result<MetalQuantStore> {
     const QK_K: usize = 256;
-    const BLOCK_BYTES: usize = crate::q6_k_gemv::Q6_K_BLOCK_BYTES;
+    const BLOCK_BYTES: usize = crate::backend::metal::q6_k_gemv::Q6_K_BLOCK_BYTES;
     if n_cols % QK_K != 0 {
         return Err(FerrumError::model(format!(
             "load_q6k_experts: n_cols {n_cols} not a multiple of {QK_K}"
@@ -250,7 +253,7 @@ pub fn load_q6k_experts(
             bytes.len()
         )));
     }
-    let (blocks, byte_offset, mmap_lease) = buffer_for_quant_bytes(bytes)?;
+    let (blocks, byte_offset, mmap_lease) = buffer_for_quant_bytes(bytes, options)?;
     Ok(MetalQuantStore::Q6KExperts {
         blocks,
         byte_offset,
@@ -266,7 +269,8 @@ pub fn load_q6k_experts(
 /// selected slot). The kernel writes `[n_selected, n_rows]` outputs.
 /// `src1_stride` is the per-slot activation stride in elements: 0 for
 /// broadcast (gate/up), `n_cols` for per-slot (down).
-pub fn dispatch_gemv_moe_id(
+pub(crate) fn dispatch_gemv_moe_id(
+    pipes: &MetalPipelines,
     enc: &metal::ComputeCommandEncoderRef,
     a: &metal::Buffer,
     weights: &MetalQuantStore,
@@ -283,8 +287,8 @@ pub fn dispatch_gemv_moe_id(
             n_cols,
             ..
         } => {
-            crate::q4_k_moe_id_gemv::dispatch_gemv_q4k_moe_id_on_encoder(
-                &st().pipes.device,
+            crate::backend::metal::q4_k_moe_id_gemv::dispatch_gemv_q4k_moe_id_on_encoder(
+                pipes,
                 enc,
                 a,
                 blocks,
@@ -305,8 +309,8 @@ pub fn dispatch_gemv_moe_id(
             n_cols,
             ..
         } => {
-            crate::q6_k_moe_id_gemv::dispatch_gemv_q6k_moe_id_on_encoder(
-                &st().pipes.device,
+            crate::backend::metal::q6_k_moe_id_gemv::dispatch_gemv_q6k_moe_id_on_encoder(
+                pipes,
                 enc,
                 a,
                 blocks,
@@ -336,7 +340,8 @@ pub fn dispatch_gemv_moe_id(
 /// decode path on Qwen3-MoE — saves 2 dispatches per (item × layer)
 /// at no GPU compute cost (Metal's `set_buffer(buf, offset)` is free).
 #[allow(clippy::too_many_arguments)]
-pub fn dispatch_gemv_moe_id_offset(
+pub(crate) fn dispatch_gemv_moe_id_offset(
+    pipes: &MetalPipelines,
     enc: &metal::ComputeCommandEncoderRef,
     a: &metal::Buffer,
     a_byte_offset: u64,
@@ -355,8 +360,8 @@ pub fn dispatch_gemv_moe_id_offset(
             n_cols,
             ..
         } => {
-            crate::q4_k_moe_id_gemv::dispatch_gemv_q4k_moe_id_offset_on_encoder(
-                &st().pipes.device,
+            crate::backend::metal::q4_k_moe_id_gemv::dispatch_gemv_q4k_moe_id_offset_on_encoder(
+                pipes,
                 enc,
                 a,
                 a_byte_offset,
@@ -379,8 +384,8 @@ pub fn dispatch_gemv_moe_id_offset(
             n_cols,
             ..
         } => {
-            crate::q6_k_moe_id_gemv::dispatch_gemv_q6k_moe_id_offset_on_encoder(
-                &st().pipes.device,
+            crate::backend::metal::q6_k_moe_id_gemv::dispatch_gemv_q6k_moe_id_offset_on_encoder(
+                pipes,
                 enc,
                 a,
                 a_byte_offset,
@@ -408,6 +413,7 @@ pub fn dispatch_gemv_moe_id_offset(
 /// Dispatch a single mul_mm for one Q4K / Q6K leaf part with output
 /// column offset + row stride. Used by the Fused m>1 path.
 fn dispatch_part_gemm(
+    pipes: &MetalPipelines,
     enc: &metal::ComputeCommandEncoderRef,
     a_buf: &metal::Buffer,
     part: &MetalQuantStore,
@@ -429,8 +435,8 @@ fn dispatch_part_gemm(
             byte_offset,
             ..
         } => {
-            crate::q4_k_gemm::dispatch_gemm_q4k_part(
-                &st().pipes.device,
+            crate::backend::metal::q4_k_gemm::dispatch_gemm_q4k_part(
+                pipes,
                 enc,
                 a_buf,
                 blocks,
@@ -448,8 +454,8 @@ fn dispatch_part_gemm(
             byte_offset,
             ..
         } => {
-            crate::q6_k_gemm::dispatch_gemm_q6k_part(
-                &st().pipes.device,
+            crate::backend::metal::q6_k_gemm::dispatch_gemm_q6k_part(
+                pipes,
                 enc,
                 a_buf,
                 blocks,
@@ -476,6 +482,7 @@ fn dispatch_part_gemm(
 /// Dispatch a single fused gemv for one Q4K / Q6K leaf part with
 /// activation and output byte offsets. Used by the Fused m=1 path.
 fn dispatch_part_gemv_offset(
+    pipes: &MetalPipelines,
     enc: &metal::ComputeCommandEncoderRef,
     a_buf: &metal::Buffer,
     a_offset_bytes: u64,
@@ -492,8 +499,8 @@ fn dispatch_part_gemv_offset(
             ..
         } => {
             if *n_rows % 4 != 0 {
-                crate::q4_k_gemv::dispatch_gemv_q4k_on_encoder(
-                    &st().pipes.device,
+                crate::backend::metal::q4_k_gemv::dispatch_gemv_q4k_on_encoder(
+                    pipes,
                     enc,
                     a_buf,
                     blocks,
@@ -509,8 +516,8 @@ fn dispatch_part_gemv_offset(
                 }
                 return Ok(());
             }
-            crate::q4_k_gemv_v2::dispatch_gemv_q4k_v2_offset(
-                &st().pipes.device,
+            crate::backend::metal::q4_k_gemv_v2::dispatch_gemv_q4k_v2_offset(
+                pipes,
                 enc,
                 a_buf,
                 a_offset_bytes,
@@ -533,8 +540,8 @@ fn dispatch_part_gemv_offset(
                     "gemm_quant Fused: Q6K part n_rows={n_rows} not divisible by 4"
                 )));
             }
-            crate::q6_k_gemv::dispatch_gemv_q6k_v2_offset(
-                &st().pipes.device,
+            crate::backend::metal::q6_k_gemv::dispatch_gemv_q6k_v2_offset(
+                pipes,
                 enc,
                 a_buf,
                 a_offset_bytes,
@@ -563,11 +570,12 @@ fn dispatch_part_gemv_offset(
 /// Phase 3e/3 extracted from the old `load_quant` body so `load_quant_fused`
 /// can compose multiple stores into a `Fused` variant without going
 /// through the `Box<dyn Linear>` wrapper.
-fn metal_load_quant_store_helper(
+pub(super) fn metal_load_quant_store_helper(
     kind: GgufQuantType,
     bytes: &[u8],
     n_rows: usize,
     n_cols: usize,
+    options: &MetalBackendConfig,
 ) -> Result<MetalQuantStore> {
     const QK_K: usize = 256;
     match kind {
@@ -588,7 +596,7 @@ fn metal_load_quant_store_helper(
                     expected
                 )));
             }
-            let (blocks, byte_offset, mmap_lease) = buffer_for_quant_bytes(bytes)?;
+            let (blocks, byte_offset, mmap_lease) = buffer_for_quant_bytes(bytes, options)?;
             Ok(MetalQuantStore::Q4K {
                 blocks,
                 byte_offset,
@@ -599,7 +607,7 @@ fn metal_load_quant_store_helper(
             })
         }
         GgufQuantType::Q6K => {
-            const BLOCK_BYTES: usize = crate::q6_k_gemv::Q6_K_BLOCK_BYTES; // 210
+            const BLOCK_BYTES: usize = crate::backend::metal::q6_k_gemv::Q6_K_BLOCK_BYTES; // 210
             let total_elems = n_rows * n_cols;
             if total_elems % QK_K != 0 {
                 return Err(FerrumError::model(format!(
@@ -615,7 +623,7 @@ fn metal_load_quant_store_helper(
                     expected
                 )));
             }
-            let (blocks, byte_offset, mmap_lease) = buffer_for_quant_bytes(bytes)?;
+            let (blocks, byte_offset, mmap_lease) = buffer_for_quant_bytes(bytes, options)?;
             Ok(MetalQuantStore::Q6K {
                 blocks,
                 byte_offset,
@@ -638,14 +646,25 @@ impl crate::backend::BackendQuantGguf for MetalBackend {
         n_rows: usize,
         n_cols: usize,
     ) -> Result<Box<dyn crate::Linear<Self> + Send + Sync>> {
-        let store = metal_load_quant_store_helper(kind, bytes, n_rows, n_cols)?;
-        // Phase 3e/3: dispatch via MetalGgufLinear::forward.
-        Ok(Box::new(crate::quant_linear::metal_gguf::MetalGgufLinear {
-            store,
-            in_features: n_cols,
-            out_features: n_rows,
-        }))
+        load_quant_with_options(kind, bytes, n_rows, n_cols, &MetalBackendConfig::default())
     }
+
+    fn load_quant_in_context(
+        ctx: &mut Self::Context,
+        kind: GgufQuantType,
+        bytes: &[u8],
+        n_rows: usize,
+        n_cols: usize,
+    ) -> Result<Box<dyn crate::Linear<Self> + Send + Sync>> {
+        load_quant_with_options(
+            kind,
+            bytes,
+            n_rows,
+            n_cols,
+            &Self::context_config(ctx).metal,
+        )
+    }
+
     fn load_quant_experts(
         kind: GgufQuantType,
         bytes: &[u8],
@@ -653,50 +672,117 @@ impl crate::backend::BackendQuantGguf for MetalBackend {
         n_rows: usize,
         n_cols: usize,
     ) -> Result<Box<dyn crate::StackedExpertGgufLinear<Self>>> {
-        let store = match kind {
-            GgufQuantType::Q4K => load_q4k_experts(bytes, num_experts, n_rows, n_cols)?,
-            GgufQuantType::Q6K => load_q6k_experts(bytes, num_experts, n_rows, n_cols)?,
-            other => {
-                return Err(FerrumError::unsupported(format!(
-                    "Metal load_quant_experts: {other:?} not implemented (only Q4K / Q6K)"
-                )));
-            }
-        };
-        Ok(Box::new(
-            crate::quant_linear::metal_gguf_moe::MetalStackedExpertGgufLinear::new(store)?,
-        ))
+        load_quant_experts_with_options(
+            kind,
+            bytes,
+            num_experts,
+            n_rows,
+            n_cols,
+            &MetalBackendConfig::default(),
+        )
     }
+
+    fn load_quant_experts_in_context(
+        ctx: &mut Self::Context,
+        kind: GgufQuantType,
+        bytes: &[u8],
+        num_experts: usize,
+        n_rows: usize,
+        n_cols: usize,
+    ) -> Result<Box<dyn crate::StackedExpertGgufLinear<Self>>> {
+        load_quant_experts_with_options(
+            kind,
+            bytes,
+            num_experts,
+            n_rows,
+            n_cols,
+            &Self::context_config(ctx).metal,
+        )
+    }
+
     fn load_quant_fused(
         parts: &[(GgufQuantType, &[u8], usize)],
         n_cols: usize,
     ) -> Result<Box<dyn crate::Linear<Self> + Send + Sync>> {
-        let mut sub_stores: Vec<MetalQuantStore> = Vec::with_capacity(parts.len());
-        let mut total_rows = 0;
-        for (kind, bytes, n_rows) in parts {
-            // Phase 3e/3: use the helper to get the raw QuantStore (the
-            // trait method now returns Box<dyn Linear>, which we can't
-            // unwrap into Fused).
-            let store = metal_load_quant_store_helper(*kind, bytes, *n_rows, n_cols)?;
-            // Only leaf (Q4K / Q6K) parts are valid; nested Fused isn't.
-            if matches!(store, MetalQuantStore::Fused { .. }) {
-                return Err(FerrumError::model(
-                    "Metal load_quant_fused: nested Fused not supported".to_string(),
-                ));
-            }
-            total_rows += n_rows;
-            sub_stores.push(store);
-        }
-        let fused = MetalQuantStore::Fused {
-            parts: sub_stores,
-            total_rows,
-            n_cols,
-        };
-        Ok(Box::new(crate::quant_linear::metal_gguf::MetalGgufLinear {
-            store: fused,
-            in_features: n_cols,
-            out_features: total_rows,
-        }))
+        load_quant_fused_with_options(parts, n_cols, &MetalBackendConfig::default())
     }
+
+    fn load_quant_fused_in_context(
+        ctx: &mut Self::Context,
+        parts: &[(GgufQuantType, &[u8], usize)],
+        n_cols: usize,
+    ) -> Result<Box<dyn crate::Linear<Self> + Send + Sync>> {
+        load_quant_fused_with_options(parts, n_cols, &Self::context_config(ctx).metal)
+    }
+}
+
+fn load_quant_with_options(
+    kind: GgufQuantType,
+    bytes: &[u8],
+    n_rows: usize,
+    n_cols: usize,
+    options: &MetalBackendConfig,
+) -> Result<Box<dyn crate::Linear<MetalBackend> + Send + Sync>> {
+    let store = metal_load_quant_store_helper(kind, bytes, n_rows, n_cols, options)?;
+    // Phase 3e/3: dispatch via MetalGgufLinear::forward.
+    Ok(Box::new(crate::quant_linear::metal_gguf::MetalGgufLinear {
+        store,
+        in_features: n_cols,
+        out_features: n_rows,
+    }))
+}
+fn load_quant_experts_with_options(
+    kind: GgufQuantType,
+    bytes: &[u8],
+    num_experts: usize,
+    n_rows: usize,
+    n_cols: usize,
+    options: &MetalBackendConfig,
+) -> Result<Box<dyn crate::StackedExpertGgufLinear<MetalBackend>>> {
+    let store = match kind {
+        GgufQuantType::Q4K => load_q4k_experts(bytes, num_experts, n_rows, n_cols, options)?,
+        GgufQuantType::Q6K => load_q6k_experts(bytes, num_experts, n_rows, n_cols, options)?,
+        other => {
+            return Err(FerrumError::unsupported(format!(
+                "Metal load_quant_experts: {other:?} not implemented (only Q4K / Q6K)"
+            )));
+        }
+    };
+    Ok(Box::new(
+        crate::quant_linear::metal_gguf_moe::MetalStackedExpertGgufLinear::new(store)?,
+    ))
+}
+fn load_quant_fused_with_options(
+    parts: &[(GgufQuantType, &[u8], usize)],
+    n_cols: usize,
+    options: &MetalBackendConfig,
+) -> Result<Box<dyn crate::Linear<MetalBackend> + Send + Sync>> {
+    let mut sub_stores: Vec<MetalQuantStore> = Vec::with_capacity(parts.len());
+    let mut total_rows = 0;
+    for (kind, bytes, n_rows) in parts {
+        // Phase 3e/3: use the helper to get the raw QuantStore (the
+        // trait method now returns Box<dyn Linear>, which we can't
+        // unwrap into Fused).
+        let store = metal_load_quant_store_helper(*kind, bytes, *n_rows, n_cols, options)?;
+        // Only leaf (Q4K / Q6K) parts are valid; nested Fused isn't.
+        if matches!(store, MetalQuantStore::Fused { .. }) {
+            return Err(FerrumError::model(
+                "Metal load_quant_fused: nested Fused not supported".to_string(),
+            ));
+        }
+        total_rows += n_rows;
+        sub_stores.push(store);
+    }
+    let fused = MetalQuantStore::Fused {
+        parts: sub_stores,
+        total_rows,
+        n_cols,
+    };
+    Ok(Box::new(crate::quant_linear::metal_gguf::MetalGgufLinear {
+        store: fused,
+        in_features: n_cols,
+        out_features: total_rows,
+    }))
 }
 
 // ── Free-fn matmul dispatcher (called by MetalGgufLinear::forward) ───
@@ -706,7 +792,7 @@ impl crate::backend::BackendQuantGguf for MetalBackend {
 /// `MetalGgufLinear::forward` (in `quant_linear::metal_gguf`) can call
 /// it from outside the trait. Trait method `gemm_quant` itself is
 /// gone; this free fn is the sole entry point now.
-pub fn metal_gemm_quant_dispatch(
+pub(crate) fn metal_gemm_quant_dispatch(
     ctx: &mut <MetalBackend as Backend>::Context,
     a: &<MetalBackend as Backend>::Buffer,
     weight: &MetalQuantStore,
@@ -735,11 +821,12 @@ pub fn metal_gemm_quant_dispatch(
             // on Qwen3 (mixed Q4+Q6 qkv).
             let a_buf = a.expect_f32("gemm_quant a (fused)");
             let out_buf = out.expect_f32_mut("gemm_quant out (fused)");
-            let enc = ctx.compute_encoder();
+            let (pipes, enc, _) = ctx.encoder_parts();
             let mut col_off = 0usize;
             for part in parts {
                 let part_rows = part.n_rows();
                 dispatch_part_gemm(
+                    pipes,
                     enc,
                     a_buf,
                     part,
@@ -757,12 +844,12 @@ pub fn metal_gemm_quant_dispatch(
         // m == 1 — single output row of length total_rows.
         let a_buf = a.expect_f32("gemm_quant a (fused m=1)");
         let out_buf = out.expect_f32_mut("gemm_quant out (fused m=1)");
-        let enc = ctx.compute_encoder();
+        let (pipes, enc, _) = ctx.encoder_parts();
         let mut row_off_elems = 0usize;
         for part in parts {
             let part_rows = part.n_rows();
             let c_off = (row_off_elems * 4) as u64;
-            dispatch_part_gemv_offset(enc, a_buf, 0, part, out_buf, c_off, *n_cols)?;
+            dispatch_part_gemv_offset(pipes, enc, a_buf, 0, part, out_buf, c_off, *n_cols)?;
             row_off_elems += part_rows;
         }
         return Ok(());
@@ -797,12 +884,6 @@ pub fn metal_gemm_quant_dispatch(
         }
     };
 
-    let _t0 = if debug_per_call_flush() {
-        Some(std::time::Instant::now())
-    } else {
-        None
-    };
-
     let a_buf = a.expect_f32("gemm_quant a");
     let out_buf = out.expect_f32_mut("gemm_quant out");
 
@@ -816,44 +897,23 @@ pub fn metal_gemm_quant_dispatch(
         // N divisible by 4. Q6_K has no v1 fallback yet — Qwen3 /
         // Llama always satisfy the constraint, so we just panic if
         // not.
-        let enc = ctx.compute_encoder();
+        let (pipes, enc, _) = ctx.encoder_parts();
         if is_q6k {
             if n_rows % 4 != 0 {
                 return Err(FerrumError::model(format!(
                     "gemm_quant Q6K: n_rows={n_rows} not divisible by 4"
                 )));
             }
-            crate::q6_k_gemv::dispatch_gemv_q6k_v2_on_encoder(
-                &st().pipes.device,
-                enc,
-                a_buf,
-                blocks,
-                blocks_off,
-                out_buf,
-                n_rows,
-                n_cols,
+            crate::backend::metal::q6_k_gemv::dispatch_gemv_q6k_v2_on_encoder(
+                pipes, enc, a_buf, blocks, blocks_off, out_buf, n_rows, n_cols,
             );
         } else if n_rows % 4 == 0 {
-            crate::q4_k_gemv_v2::dispatch_gemv_q4k_v2_on_encoder(
-                &st().pipes.device,
-                enc,
-                a_buf,
-                blocks,
-                blocks_off,
-                out_buf,
-                n_rows,
-                n_cols,
+            crate::backend::metal::q4_k_gemv_v2::dispatch_gemv_q4k_v2_on_encoder(
+                pipes, enc, a_buf, blocks, blocks_off, out_buf, n_rows, n_cols,
             );
         } else {
-            crate::q4_k_gemv::dispatch_gemv_q4k_on_encoder(
-                &st().pipes.device,
-                enc,
-                a_buf,
-                blocks,
-                blocks_off,
-                out_buf,
-                n_rows,
-                n_cols,
+            crate::backend::metal::q4_k_gemv::dispatch_gemv_q4k_on_encoder(
+                pipes, enc, a_buf, blocks, blocks_off, out_buf, n_rows, n_cols,
             );
         }
     } else if is_q6k {
@@ -863,17 +923,9 @@ pub fn metal_gemm_quant_dispatch(
         // prior per-row gemv loop which scaled linearly with m
         // and was the dominant prefill bottleneck on Q4_K_M models
         // where down_proj / lm_head live as Q6_K.
-        let enc = ctx.compute_encoder();
-        crate::q6_k_gemm::dispatch_gemm_q6k_on_encoder(
-            &st().pipes.device,
-            enc,
-            a_buf,
-            blocks,
-            blocks_off,
-            out_buf,
-            m,
-            n_rows,
-            n_cols,
+        let (pipes, enc, _) = ctx.encoder_parts();
+        crate::backend::metal::q6_k_gemm::dispatch_gemm_q6k_on_encoder(
+            pipes, enc, a_buf, blocks, blocks_off, out_buf, m, n_rows, n_cols,
         );
     } else {
         // **Fused mul_mm path** for prefill (m > 1) Q4_K — ported
@@ -882,38 +934,12 @@ pub fn metal_gemm_quant_dispatch(
         // `simdgroup_half8x8` matmul, eliminating both the fp16
         // transient buffer (~2× memory traffic) and the scalar
         // gemm_v2_f16w inner loop.
-        let enc = ctx.compute_encoder();
-        crate::q4_k_gemm::dispatch_gemm_q4k_on_encoder(
-            &st().pipes.device,
-            enc,
-            a_buf,
-            blocks,
-            blocks_off,
-            out_buf,
-            m,
-            n_rows,
-            n_cols,
+        let (pipes, enc, _) = ctx.encoder_parts();
+        crate::backend::metal::q4_k_gemm::dispatch_gemm_q4k_on_encoder(
+            pipes, enc, a_buf, blocks, blocks_off, out_buf, m, n_rows, n_cols,
         );
         let _ = n_blocks; // not consumed by mul_mm path; kept for the load-time block accounting
     }
 
-    // Optional per-call timing: commit + wait the cmd buffer right
-    // here so we measure the GPU work for *this* matmul. Off by
-    // default (would serialize the whole pipeline).
-    if let Some(t0) = _t0 {
-        ctx.flush();
-        let elapsed_us = t0.elapsed().as_micros();
-        QUANT_GEMM_TIME_US.fetch_add(elapsed_us as u64, std::sync::atomic::Ordering::Relaxed);
-        QUANT_GEMM_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        QUANT_GEMM_LAST_M.store(m as u64, std::sync::atomic::Ordering::Relaxed);
-        QUANT_GEMM_LAST_N.store(n_rows as u64, std::sync::atomic::Ordering::Relaxed);
-        QUANT_GEMM_LAST_K.store(n_cols as u64, std::sync::atomic::Ordering::Relaxed);
-        if QUANT_GEMM_CALLS.load(std::sync::atomic::Ordering::Relaxed) <= 16 {
-            eprintln!(
-                "[gemm_quant] m={} n={} k={} took {} us",
-                m, n_rows, n_cols, elapsed_us
-            );
-        }
-    }
     Ok(())
 }

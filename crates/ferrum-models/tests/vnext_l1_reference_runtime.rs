@@ -541,7 +541,10 @@ fn build_mixed_reference_fixture() -> MixedReferenceFixture {
     assert_eq!(initialized.receipt().uploaded_bytes(), 8);
     let plan_resources = match initialized.into_plan_runtime() {
         Ok(resources) => resources,
-        Err(error) => panic!("mixed L1 runtime handoff failed: {}", error.error()),
+        Err(error) => panic!(
+            "mixed L1 runtime handoff failed: {}",
+            error.failure().message()
+        ),
     };
 
     MixedReferenceFixture {
@@ -1049,7 +1052,10 @@ fn tiny_safetensors_runtime<R: DeviceRuntime>(
     );
     let plan_resources = match initialized.into_plan_runtime() {
         Ok(resources) => resources,
-        Err(error) => panic!("reference L1 runtime handoff failed: {}", error.error()),
+        Err(error) => panic!(
+            "reference L1 runtime handoff failed: {}",
+            error.failure().message()
+        ),
     };
 
     let (span, work) = tiny_work();

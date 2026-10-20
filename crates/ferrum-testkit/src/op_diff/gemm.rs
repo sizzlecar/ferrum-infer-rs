@@ -73,7 +73,7 @@ impl OpUnderTest for GemmOp {
     fn run_cpu(&self, seed: u64) -> Output {
         use ferrum_kernels::backend::cpu::CpuBackend;
         let (a, b) = self.build_input(seed);
-        let mut ctx = CpuBackend::new_context();
+        let mut ctx = CpuBackend::new_context(&Default::default()).expect("backend context");
         let a_buf = CpuBackend::from_slice(&a);
         let b_buf = CpuBackend::from_slice(&b);
         let mut out = CpuBackend::alloc(self.output_len());
@@ -86,7 +86,7 @@ impl OpUnderTest for GemmOp {
     fn run_metal(&self, seed: u64) -> Output {
         use ferrum_kernels::backend::metal::MetalBackend;
         let (a, b) = self.build_input(seed);
-        let mut ctx = MetalBackend::new_context();
+        let mut ctx = MetalBackend::new_context(&Default::default()).expect("backend context");
         let a_buf = MetalBackend::from_slice(&a);
         let b_buf = MetalBackend::from_slice(&b);
         let mut out = MetalBackend::alloc(self.output_len());
@@ -100,7 +100,7 @@ impl OpUnderTest for GemmOp {
     fn run_cuda(&self, seed: u64) -> Output {
         use ferrum_kernels::backend::cuda::CudaBackend;
         let (a, b) = self.build_input(seed);
-        let mut ctx = CudaBackend::new_context();
+        let mut ctx = CudaBackend::new_context(&Default::default()).expect("backend context");
         let a_buf = CudaBackend::from_slice(&a);
         let b_buf = CudaBackend::from_slice(&b);
         let mut out = CudaBackend::alloc(self.output_len());

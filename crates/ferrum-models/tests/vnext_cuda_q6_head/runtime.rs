@@ -103,7 +103,7 @@ impl Fixture {
         let requirement = node.provider_resources().persistent().unwrap();
         assert_eq!(
             requirement.fixed_bytes(),
-            Some(4),
+            Some(4 * head.parts() as u64),
             "one admitted validation flag per physical leaf"
         );
         let allocation = plan
@@ -155,7 +155,7 @@ impl Fixture {
             .unwrap();
         let resources = match initialized.into_plan_runtime() {
             Ok(v) => v,
-            Err(e) => panic!("runtime handoff: {}", e.error()),
+            Err(e) => panic!("runtime handoff: {}", e.failure().message()),
         };
         let lane = resources.create_execution_lane().unwrap();
         lane.configure_reusable_executables(DeviceReusableExecutionPlan::on_demand(8).unwrap())
@@ -171,6 +171,28 @@ impl Fixture {
             source,
             head,
         }
+    }
+    pub fn close(self, sessions: Vec<Arc<SequenceSession<Runtime>>>) {
+        for session in &sessions {
+            session.try_abort_if_quiescent().unwrap();
+        }
+        drop(sessions);
+        drop(self.lane);
+        drop(self.reaper);
+        let weak = Arc::downgrade(&self.resources);
+        match PlanRuntimeResources::close(self.resources) {
+            Ok(PlanRuntimeCloseOutcome::Closed(receipt)) => {
+                assert!(receipt.released_static_resources() > 0)
+            }
+            Ok(PlanRuntimeCloseOutcome::Referenced { strong_count, .. }) => {
+                panic!("fixture still owns {strong_count} plan references")
+            }
+            Err(error) => panic!("actual plan close failed: {:?}", error.failure()),
+        }
+        assert!(
+            weak.upgrade().is_none(),
+            "terminal facts retain identities, not resource ownership"
+        );
     }
     pub fn admit(&self, name: &str, tokens: Arc<[u32]>) -> Arc<SequenceSession<Runtime>> {
         let work = ResourceWorkShape::single(token_span(tokens.clone(), 0..tokens.len())).unwrap();

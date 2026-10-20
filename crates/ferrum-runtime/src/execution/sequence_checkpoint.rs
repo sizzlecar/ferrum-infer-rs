@@ -199,6 +199,11 @@ impl SequenceCheckpointLayout {
     ) -> super::super::operation::CheckpointTokenSpanConstraint {
         self.data.boundaries.prefix()
     }
+    /// Pure span rules for product planning. This value grants no capture,
+    /// capacity or native checkpoint authority.
+    pub fn boundary_constraint(&self) -> crate::CheckpointBoundaryConstraint {
+        self.data.boundaries
+    }
     /// Greatest shared boundary reachable from the source's actual retired
     /// offset, with a legal nonempty suffix for every participant.
     pub fn shared_prefix_boundary(
@@ -213,7 +218,12 @@ impl SequenceCheckpointLayout {
         {
             return None;
         }
-        self.latest_reusable_boundary(processed, source_prompt, common_prefix, follower_prompts)
+        self.data.boundaries.latest_reusable_boundary(
+            processed,
+            source_prompt,
+            common_prefix,
+            follower_prompts,
+        )
     }
 
     /// Nearest boundary before the end of this input that can serve an exact
@@ -223,64 +233,7 @@ impl SequenceCheckpointLayout {
         if self.input_dependency() != CheckpointInputDependency::ExactTokenPrefix {
             return None;
         }
-        self.latest_reusable_boundary(processed, prompt, prompt, &[])
-    }
-
-    fn latest_reusable_boundary(
-        &self,
-        processed: u64,
-        source_prompt: u64,
-        common_prefix: u64,
-        follower_prompts: &[u64],
-    ) -> Option<u64> {
-        let prefix = self.data.boundaries.prefix();
-        let suffix = self.data.boundaries.suffix();
-        let prefix_alignment = prefix.alignment().get();
-        let suffix_alignment = suffix.alignment().get();
-        let suffix_residue = source_prompt % suffix_alignment;
-        let mut upper =
-            common_prefix.min(source_prompt.checked_sub(suffix.minimum_tokens().get())?);
-        for &prompt in follower_prompts {
-            // All suffixes share one alignment. Incompatible residues cannot
-            // acquire a common boundary, regardless of common-prefix length.
-            if prompt % suffix_alignment != suffix_residue {
-                return None;
-            }
-            upper = upper.min(prompt.checked_sub(suffix.minimum_tokens().get())?);
-        }
-        let lower = processed.checked_add(prefix.minimum_tokens().get())?;
-        if lower > upper {
-            return None;
-        }
-        let (mut divisor, mut remainder) = (prefix_alignment, suffix_alignment);
-        while remainder != 0 {
-            (divisor, remainder) = (remainder, divisor % remainder);
-        }
-        if processed % divisor != source_prompt % divisor {
-            return None;
-        }
-        // Search only the sparser of the two alignment lattices. This skips
-        // invalid token positions without multiplying alignments or overflowing
-        // an LCM. The aggregate contract remains the final authority.
-        let (step, residue) = if prefix_alignment >= suffix_alignment {
-            (prefix_alignment, processed % prefix_alignment)
-        } else {
-            (suffix_alignment, suffix_residue)
-        };
-        let remainder = upper % step;
-        let adjustment = if remainder >= residue {
-            remainder - residue
-        } else {
-            step - (residue - remainder)
-        };
-        let mut boundary = upper.checked_sub(adjustment)?;
-        while boundary >= lower {
-            if self.permits_capture_from(processed, boundary, source_prompt) {
-                return Some(boundary);
-            }
-            boundary = boundary.checked_sub(step)?;
-        }
-        None
+        self.data.boundaries.prompt_tail_boundary(processed, prompt)
     }
     pub fn states(&self) -> &[SequenceCheckpointState] {
         &self.data.states

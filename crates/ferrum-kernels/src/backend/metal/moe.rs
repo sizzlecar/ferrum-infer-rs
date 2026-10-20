@@ -1,6 +1,6 @@
 //! Metal `BackendMoeFused` impl. Extracted from `metal.rs` (Audit #8).
 
-use super::{st, MetalBackend};
+use super::MetalBackend;
 use ferrum_types::Result;
 
 impl crate::backend::BackendMoeFused for MetalBackend {
@@ -23,9 +23,9 @@ impl crate::backend::BackendMoeFused for MetalBackend {
         let logits_buf = logits.expect_f32("route_topk_softmax logits");
         let ids_buf = &out_ids.raw;
         let weights_buf = out_weights.expect_f32_mut("route_topk_softmax out_weights");
-        let enc = ctx.compute_encoder();
-        crate::moe_router::dispatch_route_topk_softmax(
-            &st().pipes.device,
+        let (pipes, enc, _) = ctx.encoder_parts();
+        crate::backend::metal::moe_router::dispatch_route_topk_softmax(
+            pipes,
             enc,
             logits_buf,
             ids_buf,
@@ -48,9 +48,9 @@ impl crate::backend::BackendMoeFused for MetalBackend {
         let gate_buf = gate.expect_f32("silu_mul_batched gate");
         let up_buf = up.expect_f32("silu_mul_batched up");
         let out_buf = out.expect_f32_mut("silu_mul_batched out");
-        let enc = ctx.compute_encoder();
-        crate::moe_post_ops_batched::dispatch_silu_mul_batched(
-            &st().pipes.device,
+        let (pipes, enc, _) = ctx.encoder_parts();
+        crate::backend::metal::moe_post_ops_batched::dispatch_silu_mul_batched(
+            pipes,
             enc,
             gate_buf,
             up_buf,
@@ -78,9 +78,9 @@ impl crate::backend::BackendMoeFused for MetalBackend {
         let ids_buf = &ids.raw;
         let gate_up_args_buf = &gate_up_args.raw;
         let down_args_buf = &down_args.raw;
-        let enc = ctx.compute_encoder();
-        crate::moe_router::dispatch_compute_ids_tpe(
-            &st().pipes.device,
+        let (pipes, enc, _) = ctx.encoder_parts();
+        crate::backend::metal::moe_router::dispatch_compute_ids_tpe(
+            pipes,
             enc,
             sel_buf,
             tpe_buf,
@@ -106,9 +106,9 @@ impl crate::backend::BackendMoeFused for MetalBackend {
         let slots_buf = slots.expect_f32("weighted_sum_residual_stacked slots");
         let weights_buf = weights.expect_f32("weighted_sum_residual_stacked weights");
         let residual_buf = residual.expect_f32_mut("weighted_sum_residual_stacked residual");
-        let enc = ctx.compute_encoder();
-        crate::moe_post_ops::dispatch_weighted_sum_residual_stacked(
-            &st().pipes.device,
+        let (pipes, enc, _) = ctx.encoder_parts();
+        crate::backend::metal::moe_post_ops::dispatch_weighted_sum_residual_stacked(
+            pipes,
             enc,
             slots_buf,
             weights_buf,
@@ -134,9 +134,9 @@ impl crate::backend::BackendMoeFused for MetalBackend {
         let residual_buf = residual.expect_f32_mut("weighted_sum_residual_norm_stacked residual");
         let nw_buf = next_norm_w.expect_f32("weighted_sum_residual_norm_stacked next_norm_w");
         let normed_buf = normed_out.expect_f32_mut("weighted_sum_residual_norm_stacked normed_out");
-        let enc = ctx.compute_encoder();
-        crate::moe_post_ops::dispatch_weighted_sum_residual_norm_stacked(
-            &st().pipes.device,
+        let (pipes, enc, _) = ctx.encoder_parts();
+        crate::backend::metal::moe_post_ops::dispatch_weighted_sum_residual_norm_stacked(
+            pipes,
             enc,
             slots_buf,
             weights_buf,
@@ -161,9 +161,9 @@ impl crate::backend::BackendMoeFused for MetalBackend {
         let slots_buf = slots.expect_f32("weighted_sum_batched slots");
         let weights_buf = weights.expect_f32("weighted_sum_batched weights");
         let out_buf = out.expect_f32_mut("weighted_sum_batched out");
-        let enc = ctx.compute_encoder();
-        crate::moe_post_ops_batched::dispatch_weighted_sum_batched(
-            &st().pipes.device,
+        let (pipes, enc, _) = ctx.encoder_parts();
+        crate::backend::metal::moe_post_ops_batched::dispatch_weighted_sum_batched(
+            pipes,
             enc,
             slots_buf,
             weights_buf,
@@ -188,12 +188,12 @@ impl crate::backend::BackendMoeFused for MetalBackend {
         let slots_buf = slots.expect_f32("weighted_sum_batched_offset slots");
         let weights_buf = weights.expect_f32("weighted_sum_batched_offset weights");
         let out_buf = out.expect_f32_mut("weighted_sum_batched_offset out");
-        let enc = ctx.compute_encoder();
+        let (pipes, enc, _) = ctx.encoder_parts();
         // weights/out are f32; multiply by 4 for byte offset.
         let weights_byte_offset = (weights_offset * std::mem::size_of::<f32>()) as u64;
         let out_byte_offset = (out_offset * std::mem::size_of::<f32>()) as u64;
-        crate::moe_post_ops_batched::dispatch_weighted_sum_batched_offset(
-            &st().pipes.device,
+        crate::backend::metal::moe_post_ops_batched::dispatch_weighted_sum_batched_offset(
+            pipes,
             enc,
             slots_buf,
             0,
@@ -218,15 +218,9 @@ impl crate::backend::BackendMoeFused for MetalBackend {
         let gate_buf = gate.expect_f32("silu_mul_stacked gate");
         let up_buf = up.expect_f32("silu_mul_stacked up");
         let out_buf = out.expect_f32_mut("silu_mul_stacked out");
-        let enc = ctx.compute_encoder();
-        crate::moe_post_ops::dispatch_silu_mul_stacked(
-            &st().pipes.device,
-            enc,
-            gate_buf,
-            up_buf,
-            out_buf,
-            n_slots,
-            ffn,
+        let (pipes, enc, _) = ctx.encoder_parts();
+        crate::backend::metal::moe_post_ops::dispatch_silu_mul_stacked(
+            pipes, enc, gate_buf, up_buf, out_buf, n_slots, ffn,
         );
         Ok(())
     }
@@ -244,9 +238,9 @@ impl crate::backend::BackendMoeFused for MetalBackend {
         let slots_buf = slots.expect_f32("weighted_sum_stacked slots");
         let weights_buf = weights.expect_f32("weighted_sum_stacked weights");
         let out_buf = out.expect_f32_mut("weighted_sum_stacked out");
-        let enc = ctx.compute_encoder();
-        crate::moe_post_ops::dispatch_weighted_sum_stacked(
-            &st().pipes.device,
+        let (pipes, enc, _) = ctx.encoder_parts();
+        crate::backend::metal::moe_post_ops::dispatch_weighted_sum_stacked(
+            pipes,
             enc,
             slots_buf,
             weights_buf,

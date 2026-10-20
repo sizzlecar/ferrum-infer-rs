@@ -83,7 +83,8 @@ fn assert_complete_outputs<B: Backend + BackendQuantMarlin>(
     let bias_shape = [rows];
     let fixture = fixture(name, &[rows, cols], biased.then_some(&bias_shape), dtype);
     let loader = NativeSafetensorsLoader::<B>::open(fixture.directory.path()).unwrap();
-    let linear = loader.load_linear(name).unwrap();
+    let mut context = B::new_context(&Default::default()).expect("backend context");
+    let linear = loader.load_linear(&mut context, name).unwrap();
     assert_eq!(linear.in_features(), cols);
     assert_eq!(linear.out_features(), rows);
     assert_eq!(linear.metadata(), LinearMetadata::from_name(name));
@@ -91,12 +92,11 @@ fn assert_complete_outputs<B: Backend + BackendQuantMarlin>(
     // Zero, positive and signed rows check every output and batch stride.
     let input = [0.0, 0.0, 0.0, 0.0, 0.5, 1.0, 1.5, 2.0, -1.0, 0.5, -1.5, 2.0];
     let batch = 3;
-    let device_input = B::from_slice(&input);
-    let mut device_output = B::from_slice(&vec![f32::NAN; batch * rows]);
-    let mut context = B::new_context();
+    let device_input = B::from_slice_in_context(&mut context, &input);
+    let mut device_output = B::from_slice_in_context(&mut context, &vec![f32::NAN; batch * rows]);
     linear.forward(&mut context, &device_input, &mut device_output, batch);
     synchronize(&mut context);
-    let actual = B::to_vec(&device_output, batch * rows);
+    let actual = B::to_vec_in_context(&mut context, &device_output, batch * rows);
 
     // Construct an independent CPU projection from the fixture, bypassing
     // NativeSafetensorsLoader so the reference cannot repeat a dropped bias.
@@ -105,7 +105,8 @@ fn assert_complete_outputs<B: Backend + BackendQuantMarlin>(
     } else {
         DenseLinear::<CpuBackend>::from_rows(&fixture.weight, rows, cols)
     };
-    let mut reference_context = CpuBackend::new_context();
+    let mut reference_context =
+        CpuBackend::new_context(&Default::default()).expect("backend context");
     let mut separate = vec![f32::NAN; batch * rows];
     reference.forward(
         &mut reference_context,
@@ -174,12 +175,109 @@ fn direct_bias_rejects_wrong_length_or_rank() {
             let fixture = fixture(name, &[3, 4], Some(&shape), Dtype::F32);
             let loader =
                 NativeSafetensorsLoader::<CpuBackend>::open(fixture.directory.path()).unwrap();
-            let error = match loader.load_linear(name) {
+            let error = match loader.load_linear(
+                &mut ferrum_kernels::backend::cpu::CpuContext::default(),
+                name,
+            ) {
                 Ok(_) => panic!("accepted bias shape {shape:?} for [3, 4] weight"),
                 Err(error) => error,
             };
             assert!(error.to_string().contains("bias"), "{error}");
         }
+    }
+}
+
+const FUSED_PROJECTIONS: &[(&str, &[&str])] = &[
+    ("qkv_proj", &["q_proj", "k_proj", "v_proj"]),
+    ("gate_up_proj", &["gate_proj", "up_proj"]),
+    ("in_proj_qkvz", &["in_proj_qkv", "in_proj_z"]),
+    ("in_proj_ba", &["in_proj_b", "in_proj_a"]),
+];
+
+fn invalid_fused_bias_fixture(parts: &[&str], invalid_shape: &[usize]) -> tempfile::TempDir {
+    let weight = encoded(&[0.25; 8], Dtype::F32);
+    let bias = encoded(&[0.5; 2], Dtype::F32);
+    let invalid_bias = encoded(&vec![0.5; invalid_shape.iter().product()], Dtype::F32);
+    let mut tensors = Vec::new();
+    for (index, part) in parts.iter().enumerate() {
+        tensors.push((
+            format!("{part}.weight"),
+            TensorView::new(Dtype::F32, vec![2, 4], &weight).unwrap(),
+        ));
+        let (shape, bytes) = if index + 1 == parts.len() {
+            (invalid_shape.to_vec(), &invalid_bias)
+        } else {
+            (vec![2], &bias)
+        };
+        tensors.push((
+            format!("{part}.bias"),
+            TensorView::new(Dtype::F32, shape, bytes).unwrap(),
+        ));
+    }
+    let directory = tempfile::tempdir().unwrap();
+    serialize_to_file(tensors, &None, &directory.path().join("model.safetensors")).unwrap();
+    directory
+}
+
+#[test]
+fn fused_bias_rejects_wrong_length_or_rank() {
+    for &(name, parts) in FUSED_PROJECTIONS {
+        for shape in [&[3][..], &[1, 2][..]] {
+            let directory = invalid_fused_bias_fixture(parts, shape);
+            let loader = NativeSafetensorsLoader::<CpuBackend>::open(directory.path()).unwrap();
+            let error = match loader.load_linear(
+                &mut ferrum_kernels::backend::cpu::CpuContext::default(),
+                name,
+            ) {
+                Ok(_) => panic!("accepted {name} with invalid split bias {shape:?}"),
+                Err(error) => error,
+            };
+            assert!(error.to_string().contains("bias"), "{error}");
+        }
+    }
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "requires real CUDA capture to prove invalid fused bias is rejected before upload"]
+fn cuda_invalid_fused_bias_does_not_enter_device_allocation() {
+    use ferrum_kernels::backend::{cuda::CudaBackend, BackendCompletion, BackendGraph};
+
+    let mut context = CudaBackend::new_context(&Default::default()).expect("backend context");
+    CudaBackend::begin_execution(&mut context).unwrap();
+    let mut capture_output = CudaBackend::alloc_in_context(&mut context, 1);
+    CudaBackend::observe_completion(&mut context)
+        .into_result()
+        .unwrap();
+    CudaBackend::begin_execution(&mut context).unwrap();
+    unsafe { CudaBackend::begin_graph_capture(&mut context) }.unwrap();
+    CudaBackend::zero_buffer(&mut context, &mut capture_output, 1).unwrap();
+    // The instance allocation path rejects allocation during capture. A
+    // malformed host bias must return its validation error without entering
+    // that path. Catch regressions so the actual capture can retire first.
+    let results = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let mut errors = Vec::new();
+        for &(name, parts) in FUSED_PROJECTIONS {
+            for shape in [&[3][..], &[1, 2][..]] {
+                let directory = invalid_fused_bias_fixture(parts, shape);
+                let loader =
+                    NativeSafetensorsLoader::<CudaBackend>::open(directory.path()).unwrap();
+                match loader.load_linear(&mut context, name) {
+                    Ok(_) => panic!("accepted {name} with invalid split bias {shape:?}"),
+                    Err(error) => errors.push(error.to_string()),
+                }
+            }
+        }
+        errors
+    }));
+    unsafe { CudaBackend::end_graph_capture(&mut context, 0) }.unwrap();
+    assert!(matches!(
+        CudaBackend::observe_completion(&mut context),
+        BackendCompletion::Succeeded
+    ));
+    CudaBackend::retire_context(&mut context).unwrap();
+    for error in results.expect("invalid bias reached the CUDA allocation path") {
+        assert!(error.contains("bias"), "{error}");
     }
 }
 
@@ -202,4 +300,93 @@ fn cuda_direct_bias_matches_complete_oracles() {
 
     direct_cases::<CudaBackend>(true, CudaBackend::sync);
     direct_cases::<CudaBackend>(false, CudaBackend::sync);
+}
+
+fn interleaved_instances_preserve_loaded_weights<B: Backend + BackendQuantMarlin>(
+    synchronize: impl Fn(&mut B::Context),
+) {
+    let name = "model.layers.0.self_attn.o_proj";
+    let first = fixture(name, &[3, 4], Some(&[3]), Dtype::F16);
+    let second = fixture(name, &[3, 4], None, Dtype::BF16);
+    let mut first_context = B::new_context(&Default::default()).expect("backend context");
+    let first_loader = NativeSafetensorsLoader::<B>::open(first.directory.path()).unwrap();
+    let first_linear = first_loader.load_linear(&mut first_context, name).unwrap();
+    drop(first_loader);
+    let mut second_context = B::new_context(&Default::default()).expect("backend context");
+    let second_loader = NativeSafetensorsLoader::<B>::open(second.directory.path()).unwrap();
+    let second_linear = second_loader
+        .load_linear(&mut second_context, name)
+        .unwrap();
+    drop(second_loader);
+
+    let check = |context: &mut B::Context,
+                 linear: &dyn Linear<B>,
+                 fixture: &Fixture,
+                 input: [f32; 4]| {
+        let input_buffer = B::from_slice_in_context(context, &input);
+        let mut output = B::from_slice_in_context(context, &[f32::NAN; 3]);
+        linear.forward(context, &input_buffer, &mut output, 1);
+        synchronize(context);
+        let actual = B::to_vec_in_context(context, &output, 3);
+        for (row, value) in actual.iter().enumerate() {
+            let expected = input
+                .iter()
+                .enumerate()
+                .map(|(col, value)| f64::from(*value) * f64::from(fixture.weight[row * 4 + col]))
+                .sum::<f64>()
+                + fixture
+                    .bias
+                    .as_ref()
+                    .map_or(0.0, |bias| f64::from(bias[row]));
+            assert_eq!(f64::from(*value), expected, "row {row}");
+        }
+    };
+
+    // B is constructed between A's upload and first execution. Every upload,
+    // projection and readback must still use the correct instance context.
+    check(
+        &mut first_context,
+        first_linear.as_ref(),
+        &first,
+        [1.0, -1.0, 0.5, 2.0],
+    );
+    check(
+        &mut second_context,
+        second_linear.as_ref(),
+        &second,
+        [0.5, 1.0, -2.0, 1.0],
+    );
+    B::retire_context(&mut second_context).expect("peer execution must retire before teardown");
+    drop(second_context);
+    // The peer's loaded weight owns its storage after its execution context is gone.
+    drop(second_linear);
+    // Tearing down B cannot invalidate the loaded weights or stream used by A.
+    check(
+        &mut first_context,
+        first_linear.as_ref(),
+        &first,
+        [-1.0, 0.5, 1.0, -2.0],
+    );
+    B::retire_context(&mut first_context).expect("surviving execution must retire before teardown");
+}
+
+#[test]
+fn independent_loader_contexts_survive_peer_teardown() {
+    interleaved_instances_preserve_loaded_weights::<CpuBackend>(CpuBackend::sync);
+}
+
+#[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
+#[test]
+fn metal_independent_loader_contexts_survive_peer_teardown() {
+    use ferrum_kernels::backend::metal::MetalBackend;
+    interleaved_instances_preserve_loaded_weights::<MetalBackend>(|context| {
+        MetalBackend::sync_checked(context).expect("independent loader work must complete");
+    });
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+fn cuda_independent_loader_contexts_survive_peer_teardown() {
+    use ferrum_kernels::backend::cuda::CudaBackend;
+    interleaved_instances_preserve_loaded_weights::<CudaBackend>(CudaBackend::sync);
 }

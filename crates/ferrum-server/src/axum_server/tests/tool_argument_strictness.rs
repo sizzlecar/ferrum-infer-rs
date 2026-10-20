@@ -326,7 +326,9 @@ impl ToolFeedbackLlm {
         } else {
             malformed_arguments()
         };
-        StubLlm::with_api_response("", tool_response(&arguments))
+        let mut reply = StubLlm::with_api_response("", tool_response(&arguments));
+        reply.output_budget = self.base.output_budget.clone();
+        reply
     }
 }
 
@@ -338,6 +340,10 @@ impl InferenceEngine for ToolFeedbackLlm {
 
     async fn shutdown(&self) -> ferrum_types::Result<()> {
         self.base.shutdown().await
+    }
+
+    async fn wait_for_shutdown_completion(&self) -> ferrum_types::Result<()> {
+        self.base.wait_for_shutdown_completion().await
     }
 
     fn config(&self) -> &EngineConfig {
@@ -355,15 +361,17 @@ impl InferenceEngine for ToolFeedbackLlm {
 
 #[async_trait]
 impl LlmInferenceEngine for ToolFeedbackLlm {
-    async fn infer(&self, request: InferenceRequest) -> ferrum_types::Result<InferenceResponse> {
+    async fn infer(
+        &self,
+        request: InferenceRequest,
+    ) -> ferrum_types::Result<ferrum_output::InferenceOutput> {
         self.reply(&request).infer(request).await
     }
 
     async fn infer_stream(
         &self,
         request: InferenceRequest,
-    ) -> ferrum_types::Result<Pin<Box<dyn Stream<Item = ferrum_types::Result<StreamChunk>> + Send>>>
-    {
+    ) -> ferrum_types::Result<ferrum_output::InferenceStream> {
         self.reply(&request).infer_stream(request).await
     }
 }
@@ -375,7 +383,7 @@ async fn non_strict_tool_validation_error_reaches_the_next_model_turn() {
     // resulting error through the server's normal message/template conversion.
     for stream in [false, true] {
         let engine = Arc::new(ToolFeedbackLlm::new());
-        let router = AxumServer::from_llm(engine.clone()).build_router();
+        let router = AxumServer::from_llm(engine.clone()).build_router().unwrap();
         let mut request = tool_request(Some(false), Some(json!("auto")), stream);
         let first = post_json(router.clone(), "/v1/chat/completions", request.clone()).await;
         let call = accepted_tool_call(first, stream).await;

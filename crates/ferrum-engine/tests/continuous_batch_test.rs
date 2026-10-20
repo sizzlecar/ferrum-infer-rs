@@ -2,11 +2,11 @@
 //! Runs on any platform — no GPU required.
 
 use ferrum_engine::{ContinuousBatchEngine, LlmInferenceEngine, Scheduler, Tokenizer};
+use ferrum_interfaces::InferenceEngine;
+use ferrum_output::InferenceOutput;
 use ferrum_scheduler::implementations::ContinuousBatchScheduler;
-use ferrum_testkit::{
-    MockKvCacheManager, MockModelExecutor, MockSampler, MockTensorFactory, MockTokenizer,
-};
-use ferrum_types::{InferenceRequest, InferenceResponse, SchedulerConfig, SpecialTokens, TokenId};
+use ferrum_testkit::{MockModelExecutor, MockSampler, MockTokenizer};
+use ferrum_types::{InferenceRequest, SchedulerConfig, SpecialTokens, TokenId};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -23,18 +23,14 @@ fn make_engine_with_tokenizer(
     let config = ferrum_types::EngineConfig::default();
     let scheduler = Arc::new(ContinuousBatchScheduler::new(SchedulerConfig::default()));
     let sampler = Arc::new(MockSampler);
-    let kv_cache = Arc::new(MockKvCacheManager::new(1024));
-    let executor = Arc::new(MockModelExecutor::instant(VOCAB_SIZE));
-    let tensor_factory = Arc::new(MockTensorFactory);
+    let executor = MockModelExecutor::instant(VOCAB_SIZE);
 
     ContinuousBatchEngine::new(
         config,
         scheduler,
         tokenizer,
         sampler,
-        kv_cache,
-        executor,
-        tensor_factory,
+        ferrum_execution::executor_lifecycle::ExecutorOwner::new(Box::new(executor)),
     )
     .expect("legacy engine composition must match executor authority")
 }
@@ -127,8 +123,11 @@ async fn single_request_completes() {
     let request = make_request("Hello world");
     let response = engine.infer(request).await.unwrap();
 
-    assert_eq!(response.finish_reason, ferrum_types::FinishReason::Length);
-    assert!(!response.text.is_empty());
+    assert_eq!(
+        response.response().finish_reason,
+        ferrum_types::FinishReason::Length
+    );
+    assert!(!response.response().text.is_empty());
 }
 
 #[tokio::test]
@@ -138,7 +137,10 @@ async fn multiple_requests_complete_sequentially() {
     for i in 0..5 {
         let request = make_request(&format!("Request number {}", i));
         let response = engine.infer(request).await.unwrap();
-        assert_eq!(response.finish_reason, ferrum_types::FinishReason::Length);
+        assert_eq!(
+            response.response().finish_reason,
+            ferrum_types::FinishReason::Length
+        );
     }
 }
 
@@ -163,7 +165,7 @@ async fn streaming_produces_chunks() {
     // Last chunk should have finish_reason
     let last = chunks.last().unwrap();
     assert!(
-        last.finish_reason.is_some(),
+        last.chunk().finish_reason.is_some(),
         "Final chunk should have finish_reason"
     );
 }
@@ -177,11 +179,17 @@ async fn non_streaming_usage_matches_tokenizer_and_generated_tokens() {
 
     let response = engine.infer(make_request(prompt)).await.unwrap();
 
-    assert_eq!(response.usage.prompt_tokens, expected_prompt_tokens);
-    assert_eq!(response.usage.completion_tokens, response.tokens.len());
     assert_eq!(
-        response.usage.total_tokens,
-        response.usage.prompt_tokens + response.usage.completion_tokens
+        response.response().usage.prompt_tokens,
+        expected_prompt_tokens
+    );
+    assert_eq!(
+        response.response().usage.completion_tokens,
+        response.response().tokens.len()
+    );
+    assert_eq!(
+        response.response().usage.total_tokens,
+        response.response().usage.prompt_tokens + response.response().usage.completion_tokens
     );
 }
 
@@ -201,10 +209,13 @@ async fn streaming_final_usage_matches_tokenizer_and_emitted_tokens() {
         .into_iter()
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
-    let emitted_tokens = chunks.iter().filter(|chunk| chunk.token.is_some()).count();
+    let emitted_tokens = chunks
+        .iter()
+        .filter(|chunk| chunk.chunk().token.is_some())
+        .count();
     let final_usage = chunks
         .last()
-        .and_then(|chunk| chunk.usage.as_ref())
+        .and_then(|chunk| chunk.chunk().usage.as_ref())
         .expect("final stream chunk should include usage");
 
     assert_eq!(final_usage.prompt_tokens, expected_prompt_tokens);
@@ -230,66 +241,58 @@ async fn concurrent_submit_tracked_by_scheduler() {
 }
 
 #[tokio::test]
-async fn kv_cache_allocated_and_deallocated() {
-    let kv_cache = Arc::new(MockKvCacheManager::new(1024));
+async fn request_completion_retires_original_executor_on_shutdown() {
     let config = ferrum_types::EngineConfig::default();
     let scheduler = Arc::new(ContinuousBatchScheduler::new(SchedulerConfig::default()));
     let tokenizer = Arc::new(MockTokenizer::new(VOCAB_SIZE));
     let sampler = Arc::new(MockSampler);
-    let executor = Arc::new(MockModelExecutor::instant(VOCAB_SIZE));
-    let tensor_factory = Arc::new(MockTensorFactory);
+    let executor = MockModelExecutor::instant(VOCAB_SIZE);
 
     let engine = ContinuousBatchEngine::new(
         config,
         scheduler,
         tokenizer,
         sampler,
-        kv_cache.clone(),
-        executor,
-        tensor_factory,
+        ferrum_execution::executor_lifecycle::ExecutorOwner::new(Box::new(executor)),
     )
     .expect("legacy engine composition must match executor authority");
 
-    // Before: no active caches
-    assert_eq!(kv_cache.active_count(), 0);
+    assert_eq!(engine.status().await.active_requests, 0);
 
     let request = make_request("KV cache test");
     let _response = engine.infer(request).await.unwrap();
 
-    // After completion: cache should be deallocated
-    assert_eq!(kv_cache.active_count(), 0);
+    engine.shutdown().await.unwrap();
+    engine.wait_for_shutdown_completion().await.unwrap();
 }
 
 #[tokio::test]
 async fn mock_executor_tracks_operations() {
-    let executor = Arc::new(MockModelExecutor::instant(VOCAB_SIZE));
+    let executor = MockModelExecutor::instant(VOCAB_SIZE);
+    let observation = executor.observer();
     let config = ferrum_types::EngineConfig::default();
     let scheduler = Arc::new(ContinuousBatchScheduler::new(SchedulerConfig::default()));
     let tokenizer = Arc::new(MockTokenizer::new(VOCAB_SIZE));
     let sampler = Arc::new(MockSampler);
-    let kv_cache = Arc::new(MockKvCacheManager::new(1024));
-    let tensor_factory = Arc::new(MockTensorFactory);
 
     let engine = ContinuousBatchEngine::new(
         config,
         scheduler,
         tokenizer,
         sampler,
-        kv_cache,
-        executor.clone(),
-        tensor_factory,
+        ferrum_execution::executor_lifecycle::ExecutorOwner::new(Box::new(executor)),
     )
     .expect("legacy engine composition must match executor authority");
 
-    assert_eq!(executor.prefill_count(), 0);
-    assert_eq!(executor.decode_count(), 0);
+    assert_eq!(observation.prefill_count(), 0);
+    assert_eq!(observation.decode_count(), 0);
 
     let request = make_request("Track ops");
     let _response = engine.infer(request).await.unwrap();
 
     // Should have done 1 prefill and max_tokens-1 decodes (first token comes from prefill)
-    assert_eq!(executor.prefill_count(), 1);
-    assert_eq!(executor.decode_count(), 4); // max_tokens=5, first from prefill
+    assert_eq!(observation.prefill_count(), 1);
+    assert_eq!(observation.decode_count(), 4); // max_tokens=5, first from prefill
 }
 
 #[tokio::test]
@@ -298,30 +301,29 @@ async fn engine_with_latency_still_completes() {
     let scheduler = Arc::new(ContinuousBatchScheduler::new(SchedulerConfig::default()));
     let tokenizer = Arc::new(MockTokenizer::new(VOCAB_SIZE));
     let sampler = Arc::new(MockSampler);
-    let kv_cache = Arc::new(MockKvCacheManager::new(1024));
-    let executor = Arc::new(MockModelExecutor::new(
+    let executor = MockModelExecutor::new(
         VOCAB_SIZE,
         Duration::from_millis(5),
         Duration::from_millis(2),
-    ));
-    let tensor_factory = Arc::new(MockTensorFactory);
+    );
 
     let engine = ContinuousBatchEngine::new(
         config,
         scheduler,
         tokenizer,
         sampler,
-        kv_cache,
-        executor,
-        tensor_factory,
+        ferrum_execution::executor_lifecycle::ExecutorOwner::new(Box::new(executor)),
     )
     .expect("legacy engine composition must match executor authority");
 
     let request = make_request("Latency test");
     let response = engine.infer(request).await.unwrap();
-    assert_eq!(response.finish_reason, ferrum_types::FinishReason::Length);
+    assert_eq!(
+        response.response().finish_reason,
+        ferrum_types::FinishReason::Length
+    );
     // With 5ms prefill + 4*2ms decode = ~13ms minimum
-    assert!(response.latency_ms >= 10);
+    assert!(response.response().latency_ms >= 10);
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -345,7 +347,7 @@ async fn concurrent_requests_all_complete() {
         }));
     }
 
-    let results: Vec<InferenceResponse> = futures::future::join_all(handles)
+    let results: Vec<InferenceOutput> = futures::future::join_all(handles)
         .await
         .into_iter()
         .map(|r| r.unwrap().unwrap())
@@ -353,20 +355,21 @@ async fn concurrent_requests_all_complete() {
 
     assert_eq!(results.len(), 5);
     for resp in &results {
-        assert_eq!(resp.finish_reason, ferrum_types::FinishReason::Length);
-        assert!(!resp.tokens.is_empty());
+        assert_eq!(
+            resp.response().finish_reason,
+            ferrum_types::FinishReason::Length
+        );
+        assert!(!resp.response().tokens.is_empty());
     }
 }
 
 #[tokio::test]
-async fn concurrent_requests_deallocate_kv() {
-    let kv_cache = Arc::new(MockKvCacheManager::new(1024));
+async fn concurrent_requests_retire_original_executor_on_shutdown() {
     let config = ferrum_types::EngineConfig::default();
     let scheduler = Arc::new(ContinuousBatchScheduler::new(SchedulerConfig::default()));
     let tokenizer = Arc::new(MockTokenizer::new(VOCAB_SIZE));
     let sampler = Arc::new(MockSampler);
-    let executor = Arc::new(MockModelExecutor::instant(VOCAB_SIZE));
-    let tensor_factory = Arc::new(MockTensorFactory);
+    let executor = MockModelExecutor::instant(VOCAB_SIZE);
 
     let engine = Arc::new(
         ContinuousBatchEngine::new(
@@ -374,14 +377,12 @@ async fn concurrent_requests_deallocate_kv() {
             scheduler,
             tokenizer,
             sampler,
-            kv_cache.clone(),
-            executor,
-            tensor_factory,
+            ferrum_execution::executor_lifecycle::ExecutorOwner::new(Box::new(executor)),
         )
         .expect("legacy engine composition must match executor authority"),
     );
 
-    assert_eq!(kv_cache.active_count(), 0);
+    assert_eq!(engine.status().await.active_requests, 0);
 
     let mut handles = Vec::new();
     for i in 0..3 {
@@ -394,8 +395,8 @@ async fn concurrent_requests_deallocate_kv() {
 
     futures::future::join_all(handles).await;
 
-    // All KV caches should be deallocated after all requests complete
-    assert_eq!(kv_cache.active_count(), 0, "All KV caches should be freed");
+    engine.shutdown().await.unwrap();
+    engine.wait_for_shutdown_completion().await.unwrap();
 }
 
 #[tokio::test]
@@ -431,7 +432,7 @@ async fn concurrent_streams_all_complete() {
         assert!(!chunks.is_empty(), "Each stream should produce chunks");
         let last = chunks.last().unwrap();
         assert!(
-            last.finish_reason.is_some(),
+            last.chunk().finish_reason.is_some(),
             "Final chunk should have finish_reason"
         );
     }
@@ -457,42 +458,39 @@ async fn concurrent_streams_all_complete() {
 #[ignore = "prefix cache defaults OFF; opt in with FERRUM_PREFIX_CACHE=1 + --ignored"]
 #[tokio::test]
 async fn prefix_cache_avoids_second_prefill() {
-    let executor = Arc::new(MockModelExecutor::instant(VOCAB_SIZE));
+    let executor = MockModelExecutor::instant(VOCAB_SIZE);
+    let observation = executor.observer();
     let config = ferrum_types::EngineConfig::default();
     let scheduler = Arc::new(ContinuousBatchScheduler::new(SchedulerConfig::default()));
     let tokenizer = Arc::new(MockTokenizer::new(VOCAB_SIZE));
     let sampler = Arc::new(MockSampler);
-    let kv_cache = Arc::new(MockKvCacheManager::new(1024));
-    let tensor_factory = Arc::new(MockTensorFactory);
 
     let engine = ContinuousBatchEngine::new(
         config,
         scheduler,
         tokenizer,
         sampler,
-        kv_cache,
-        executor.clone(),
-        tensor_factory,
+        ferrum_execution::executor_lifecycle::ExecutorOwner::new(Box::new(executor)),
     )
     .expect("legacy engine composition must match executor authority");
 
     // First request — cache miss, runs real prefill
     let req1 = make_request("Identical prompt for prefix cache");
     let resp1 = engine.infer(req1).await.unwrap();
-    assert_eq!(executor.prefill_count(), 1);
+    assert_eq!(observation.prefill_count(), 1);
 
     // Second request with same prompt — should hit prefix cache, no executor prefill
     let req2 = make_request("Identical prompt for prefix cache");
     let resp2 = engine.infer(req2).await.unwrap();
     assert_eq!(
-        executor.prefill_count(),
+        observation.prefill_count(),
         1,
         "Prefix cache should skip second prefill"
     );
 
     // Both should produce the same output (same prompt + deterministic sampling)
-    assert_eq!(resp1.tokens, resp2.tokens);
-    assert!(!resp1.tokens.is_empty());
+    assert_eq!(resp1.response().tokens, resp2.response().tokens);
+    assert!(!resp1.response().tokens.is_empty());
 }
 
 #[tokio::test]
@@ -506,7 +504,7 @@ async fn json_mode_biases_first_token() {
     plain_req.sampling_params.max_tokens = 1;
     let plain_resp = engine.infer(plain_req).await.unwrap();
     assert_eq!(
-        plain_resp.tokens[0].get(),
+        plain_resp.response().tokens[0].get(),
         42,
         "Without JSON mode, greedy should pick token 42"
     );
@@ -517,9 +515,9 @@ async fn json_mode_biases_first_token() {
     json_req.sampling_params.response_format = ResponseFormat::JsonObject;
     let json_resp = engine.infer(json_req).await.unwrap();
     assert_eq!(
-        json_resp.tokens[0].get(),
+        json_resp.response().tokens[0].get(),
         JSON_OBJECT_TOKEN_ID,
         "JSON mode should select the complete JSON object token"
     );
-    assert_eq!(json_resp.text, "{}");
+    assert_eq!(json_resp.response().text, "{}");
 }

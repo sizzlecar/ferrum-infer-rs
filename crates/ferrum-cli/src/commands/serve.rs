@@ -1,10 +1,17 @@
 //! Serve command - Start the HTTP inference server
 
+mod lifecycle;
+#[cfg(test)]
+#[path = "serve/lifecycle_tests.rs"]
+mod lifecycle_tests;
+#[cfg(test)]
+#[path = "serve/profile_metadata_tests.rs"]
+mod profile_metadata_tests;
+
 use crate::config::CliConfig;
 use crate::runtime_env::runtime_snapshot_value;
 use clap::Args;
 use colored::*;
-use ferrum_bench_core::{ProfileMetadata, ProfileSinkConfig};
 use ferrum_models::source::ModelFormat;
 use ferrum_server::{AxumServer, HttpServer, ServedModelKind, ServedModelRegistry, ServerConfig};
 use ferrum_types::{
@@ -299,12 +306,15 @@ pub struct ServeCommand {
 
     #[command(flatten)]
     pub vnext_checkpoint: crate::commands::vnext_checkpoint::VNextCheckpointArgs,
+    #[command(flatten)]
+    pub diagnostic_output_capture:
+        crate::commands::diagnostic_output_capture::DiagnosticOutputCaptureArgs,
 
-    /// Write native structured profile events to this JSONL path.
+    /// Write standard product profile events to this JSONL path.
     #[arg(long, value_name = "PATH")]
     pub profile_jsonl: Option<PathBuf>,
 
-    /// Product observability detail level. Basic without artifact paths collects timing metrics only.
+    /// Profile detail. Basic without paths collects metrics only; replay/verify/full require complete artifacts.
     #[arg(long, value_enum, default_value_t = crate::observability_product::ProfileDetailArg::Off)]
     pub profile_detail: crate::observability_product::ProfileDetailArg,
 
@@ -328,23 +338,23 @@ pub struct ServeCommand {
     #[arg(long, default_value_t = crate::observability_product::default_profile_sample_rate())]
     pub profile_sample_rate: f64,
 
-    /// Git commit stamped into native structured profile events.
+    /// Git commit recorded in product session metadata.
     #[arg(long, value_name = "SHA")]
     pub profile_commit_sha: Option<String>,
 
-    /// Runtime environment hash stamped into native structured profile events.
+    /// Runtime environment hash recorded in product session metadata.
     #[arg(long, value_name = "SHA256")]
     pub profile_env_hash: Option<String>,
 
-    /// Model label stamped into native structured profile events.
+    /// Model label recorded in product session metadata.
     #[arg(long, value_name = "MODEL")]
     pub profile_model: Option<String>,
 
-    /// Concurrency stamped into native structured profile events.
+    /// Concurrency recorded in product session metadata.
     #[arg(long, value_name = "N")]
     pub profile_concurrency: Option<u32>,
 
-    /// Runtime flags/config JSON object embedded in native profile events.
+    /// Runtime flags/config JSON object embedded in product session metadata.
     #[arg(long, value_name = "JSON")]
     pub profile_runtime_flags_json: Option<String>,
 
@@ -393,7 +403,10 @@ fn resolve_interleaved_system_coalescing(
     }
 }
 
-pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
+pub async fn execute(
+    cmd: ServeCommand,
+    config: CliConfig,
+) -> ferrum_execution::ExecutorBuildResult<()> {
     execute_with_compatibility(cmd, config, false, false, true, None).await
 }
 
@@ -401,7 +414,7 @@ pub async fn execute_cli(
     cmd: ServeCliCommand,
     config: CliConfig,
     configured_interleaved_system_coalescing: bool,
-) -> Result<()> {
+) -> ferrum_execution::ExecutorBuildResult<()> {
     execute_with_compatibility(
         cmd.command,
         config,
@@ -420,7 +433,34 @@ async fn execute_with_compatibility(
     disable_interleaved_system_coalescing: bool,
     configured_interleaved_system_coalescing: bool,
     prefix_rendezvous_max_wait_ms: Option<std::num::NonZeroU64>,
-) -> Result<()> {
+) -> ferrum_execution::ExecutorBuildResult<()> {
+    let mut observer = lifecycle::ServeTaskObserver::spawn(move |cancellation, report| {
+        run_serve_lifecycle(
+            cmd,
+            config,
+            enable_interleaved_system_coalescing,
+            disable_interleaved_system_coalescing,
+            configured_interleaved_system_coalescing,
+            prefix_rendezvous_max_wait_ms,
+            cancellation,
+            report,
+        )
+    });
+    observer.result().await
+}
+
+async fn run_serve_lifecycle(
+    cmd: ServeCommand,
+    config: CliConfig,
+    enable_interleaved_system_coalescing: bool,
+    disable_interleaved_system_coalescing: bool,
+    configured_interleaved_system_coalescing: bool,
+    prefix_rendezvous_max_wait_ms: Option<std::num::NonZeroU64>,
+    mut cancellation: tokio::sync::oneshot::Receiver<()>,
+    early_result: tokio::sync::oneshot::Sender<ferrum_execution::ExecutorBuildResult<()>>,
+) -> ferrum_execution::ExecutorBuildResult<()> {
+    let mut shutdown = lifecycle::ShutdownObservation::new(Duration::from_secs(30), early_result);
+    config.profile_journal.validate()?;
     let user_environment = crate::runtime_env::capture_supported_runtime_environment()?;
     let ServeCommand {
         model,
@@ -486,6 +526,7 @@ async fn execute_with_compatibility(
         decision_trace_jsonl,
         observability_vertical_slice_out,
         vnext_checkpoint,
+        diagnostic_output_capture,
         profile_jsonl,
         profile_detail,
         vnext_diagnostic_fault,
@@ -557,7 +598,8 @@ async fn execute_with_compatibility(
         scheduler_trace_jsonl.as_ref(),
         request_dump_dir.as_ref(),
         profile_sample_rate,
-    );
+    )
+    .with_journal(config.profile_journal)?;
     let memory_sampler = crate::memory_profile::ProcessMemorySampler;
     let product_memory_enabled = product_observability.enabled();
     let process_start_sample = product_memory_enabled
@@ -624,6 +666,8 @@ async fn execute_with_compatibility(
     let model_id = product_input.public_model_id.clone();
     let source = product_input.source;
     let mut product_engine_config = product_input.engine_config;
+    config.apply_output_and_tokenizer_config(&mut product_engine_config)?;
+    config.apply_profile_journal_config(&mut product_engine_config)?;
     product_engine_config.scheduler.slo = scheduler_slo;
     product_engine_config.numerical_execution =
         config.resolve_numerical_execution(numerical_profile.as_ref());
@@ -826,11 +870,6 @@ async fn execute_with_compatibility(
         session_cache_max_tokens,
         profile_jsonl.as_ref(),
         scheduler_trace_jsonl.as_ref(),
-        profile_commit_sha.as_deref(),
-        profile_env_hash.as_deref(),
-        profile_model.as_deref(),
-        profile_concurrency,
-        profile_runtime_flags_json.as_deref(),
         layer_split_pipeline_mode,
     );
     push_invocation_preparation_strategy_cli_entry(
@@ -932,17 +971,17 @@ async fn execute_with_compatibility(
     if let Some(selection) = &gpu_selection {
         startup_cli_runtime_entries.extend(selection.runtime_config_entries());
     }
-    let execution_resource_authority = if defined_model.is_some() {
-        ferrum_types::ExecutionResourceAuthority::PlanRuntime
+    let execution_planning_model = if defined_model.is_some() {
+        ferrum_types::ExecutionPlanningModel::CompiledPlan
     } else {
-        ferrum_types::ExecutionResourceAuthority::LegacyEngine
+        ferrum_types::ExecutionPlanningModel::ExecutorManaged
     };
     let mut runtime_config = merge_runtime_config_sources(
         non_env_runtime_entries,
         user_environment,
         startup_cli_runtime_entries,
     );
-    if execution_resource_authority == ferrum_types::ExecutionResourceAuthority::LegacyEngine {
+    if execution_planning_model == ferrum_types::ExecutionPlanningModel::ExecutorManaged {
         let entries = crate::gpu_mem_autosize::auto_size_runtime_entries(
             &source.local_path,
             gpu_memory_utilization,
@@ -955,7 +994,7 @@ async fn execute_with_compatibility(
     }
     let startup_memory_request = crate::startup::memory_request(
         &device,
-        execution_resource_authority,
+        execution_planning_model,
         gpu_memory_utilization,
         &runtime_config,
     )?;
@@ -970,10 +1009,19 @@ async fn execute_with_compatibility(
             )
         })
         .transpose()?;
+    let selected_kv_cache_layout = crate::startup::selected_kv_cache_layout(
+        execution_planning_model,
+        model_definition.as_ref(),
+        Some(&source.local_path),
+        &device,
+        &product_engine_config,
+        &runtime_config,
+    )?;
     let mut startup_auto_config = startup_auto_config(
         hardware,
         typed_model_capabilities,
-        execution_resource_authority,
+        execution_planning_model,
+        selected_kv_cache_layout,
         arch_for_dispatch,
         model_definition.as_ref(),
         model_weight_bytes_from_path(&source.local_path),
@@ -981,6 +1029,20 @@ async fn execute_with_compatibility(
         runtime_config,
     )?;
     crate::runtime_env::materialize_runtime_env_effective(&startup_auto_config.runtime_config);
+    let profile_metadata = profile_jsonl
+        .as_ref()
+        .map(|_| {
+            crate::observability_product::ProductSessionMetadata::new(
+                profile_commit_sha,
+                profile_env_hash,
+                profile_model,
+                profile_concurrency,
+                profile_runtime_flags_json,
+                &startup_auto_config,
+                &model_id,
+            )
+        })
+        .transpose()?;
     let lora_server_models: Vec<ferrum_server::LoraAdapterModel> = startup_lora_adapters
         .iter()
         .map(|adapter| {
@@ -994,9 +1056,11 @@ async fn execute_with_compatibility(
     if vnext_checkpoint.teacher_token_file.is_some() {
         return Err(FerrumError::unsupported(
             "vNext checkpoint teacher forcing is supported only by one-shot ferrum run",
-        ));
+        )
+        .into());
     }
     let vnext_checkpoint_capture = vnext_checkpoint.to_config()?;
+    let diagnostic_output_capture = diagnostic_output_capture.to_config()?;
     let served_model_registry = ServedModelRegistry::try_new(
         model_id.clone(),
         ServedModelKind::Llm,
@@ -1008,7 +1072,9 @@ async fn execute_with_compatibility(
     let numerical_execution = product_engine_config.numerical_execution.clone();
     let mut resolved_execution_metrics = None;
     let mut cache_allocated_status = None;
-    let server_result: Result<_> = async {
+    let mut product_journals = None;
+    let mut engine_lifetime = None;
+    let server_result: ferrum_execution::ExecutorBuildResult<_> = async {
         println!(
             "{}",
             "Initializing engine (continuous batching)...".dimmed()
@@ -1021,6 +1087,7 @@ async fn execute_with_compatibility(
             .apply_runtime_config_snapshot(&startup_auto_config.runtime_config)
             .map_err(ferrum_types::FerrumError::config)?;
         engine_config.runtime.vnext_checkpoint_capture = vnext_checkpoint_capture;
+        engine_config.runtime.diagnostic_output_capture = diagnostic_output_capture;
         engine_config.runtime.startup_memory_request = startup_memory_request;
         engine_config.backend.backend_options.insert(
             "model_path".to_string(),
@@ -1034,22 +1101,44 @@ async fn execute_with_compatibility(
             &mut engine_config.backend.backend_options,
         )?;
         super::run::apply_kv_dtype_override(&mut engine_config, effective_kv_dtype)?;
-        let engine: Arc<dyn ferrum_engine::LlmInferenceEngine + Send + Sync> =
-            Arc::from(match (defined_model, model_sources) {
-                (Some(prepared), _) => {
-                    ferrum_engine::create_defined_product_engine(engine_config, prepared).await?
+        let journals = crate::observability_product::ProductJournalSession::prepare(
+            &product_observability,
+            &engine_config,
+        );
+        product_journals = Some(journals.clone());
+        journals.result()?;
+        if let Some(metadata) = &profile_metadata {
+            metadata.write(&journals, &product_observability)?;
+        }
+        let scopes = journals.engine_scopes(&engine_config)?;
+        let feedback = crate::slo_product::ProductExecutionFeedback::prepare(&engine_config)?;
+        let mut builder =
+            ferrum_engine::EngineBuilder::new(engine_config).with_journal_scopes(scopes);
+        builder = feedback.configure(builder);
+        builder = match (defined_model, model_sources) {
+            (Some(prepared), _) => builder.with_defined_model(prepared),
+            (None, Some(sources)) => builder.with_model_sources(sources),
+            (None, None) => builder,
+        };
+        let engine = match builder.build().await {
+            Ok(engine) => engine,
+            Err(error) => {
+                if let Err(cleanup) = feedback.shutdown().await {
+                    tracing::warn!(%cleanup, "failed startup feedback cleanup");
                 }
-                (None, Some(sources)) => {
-                    ferrum_engine::create_product_engine(engine_config, sources).await?
-                }
-                (None, None) => ferrum_engine::create_default_engine(engine_config).await?,
-            });
+                return Err(error.into());
+            }
+        };
+        let lifetime = crate::observability_product::ProductEngineLifetime::new_with_feedback(
+            engine,
+            journals,
+            feedback.into_owner(),
+        );
+        let engine = lifetime.engine();
+        engine_lifetime = Some(lifetime);
         if served_model_registry.adapter_count() > 0 {
             if let Err(error) = engine.adapter_execution_support().require_lora() {
-                if let Err(shutdown_error) = engine.shutdown().await {
-                    tracing::warn!(%shutdown_error, "engine cleanup after unsupported LoRA startup failed");
-                }
-                return Err(error);
+                return Err(error.into());
             }
         }
         crate::startup::apply_engine_plan(&mut startup_auto_config, engine.config());
@@ -1063,40 +1152,37 @@ async fn execute_with_compatibility(
     let server = match server_result {
         Ok(server) => server,
         Err(error) => {
+            shutdown.record_failure(&error);
             write_failed_startup_config_artifacts(
                 &startup_auto_config,
                 product_source_identity.as_ref(),
                 &numerical_execution,
                 effective_config_json.as_deref(),
                 decision_trace_jsonl.as_deref(),
-                &error,
+                error.cause(),
             );
-            return Err(error);
+            if let Some(lifetime) = &engine_lifetime {
+                if let Err(cleanup) = shutdown.wait(lifetime.finish()).await {
+                    tracing::warn!(%cleanup, "serve startup cleanup incomplete");
+                }
+            } else if let Some(journals) = &product_journals {
+                if let Err(cleanup) = shutdown.wait(journals.finish()).await {
+                    tracing::warn!(%cleanup, "serve startup journals incomplete");
+                }
+            }
+            return shutdown.finish(Err(error));
         }
     };
+    let journals = product_journals
+        .as_ref()
+        .ok_or_else(|| FerrumError::internal("serve journals missing after engine assembly"))?;
+    let execution_result: Result<()> = async {
     write_startup_config_artifacts(
         &startup_auto_config,
         product_source_identity.as_ref(),
         &numerical_execution,
         effective_config_json.as_deref(),
         decision_trace_jsonl.as_deref(),
-    )?;
-    let native_profile_jsonl = if product_observability.unified_product_profile_enabled() {
-        None
-    } else {
-        profile_jsonl.clone()
-    };
-    configure_profile_sink(
-        native_profile_jsonl,
-        ProfileSinkCliFields {
-            commit_sha: profile_commit_sha,
-            env_hash: profile_env_hash,
-            model: profile_model,
-            concurrency: profile_concurrency,
-            runtime_flags_json: profile_runtime_flags_json,
-        },
-        &startup_auto_config,
-        &model_id,
     )?;
 
     write_resolved_execution_config(
@@ -1140,6 +1226,7 @@ async fn execute_with_compatibility(
     );
     let server = server.with_served_model_registry(served_model_registry);
     crate::observability_product::write_actual_serve_startup_observability(
+        journals,
         &product_observability,
         model_loaded_duration_us,
         model_loaded_memory.clone(),
@@ -1158,15 +1245,10 @@ async fn execute_with_compatibility(
         host: host.clone(),
         port,
         request_dump_dir: request_dump_dir.clone(),
-        profile_jsonl: product_observability
-            .unified_product_profile_enabled()
-            .then(|| profile_jsonl.clone())
-            .flatten(),
+        profile_jsonl: profile_jsonl.clone(),
         profile_detail: product_observability.profile_detail,
-        memory_profile_jsonl: product_observability
-            .unified_product_profile_enabled()
-            .then(|| memory_profile_jsonl.clone())
-            .flatten(),
+        profile_journal: product_observability.journal,
+        memory_profile_jsonl: memory_profile_jsonl.clone(),
         ..Default::default()
     };
 
@@ -1192,54 +1274,42 @@ async fn execute_with_compatibility(
     std::fs::write(&pid_file, std::process::id().to_string()).ok();
 
     // Keep the server future alive while stop requests graceful HTTP drain.
-    let server = Arc::new(server);
+    let server = Arc::new(server.with_journal_scopes(journals.http_scopes(&server_config)?));
     let mut server_task = {
         let server = Arc::clone(&server);
         let server_config = server_config.clone();
         tokio::spawn(async move { server.start(&server_config).await })
     };
-    let shutdown_timeout = Duration::from_secs(30);
-    let serve_result: Result<()> = tokio::select! {
-        joined = &mut server_task => {
-            let start_result = match joined {
-                Ok(result) => result,
-                Err(error) => Err(FerrumError::internal(format!(
-                    "serve task failed: {error}"
-                ))),
-            };
-            let stop_result = server.stop(shutdown_timeout).await;
-            start_result.and(stop_result)
-        }
-        _ = serve_shutdown_signal() => {
+    let already_joined = tokio::select! {
+        joined = &mut server_task => Some(joined),
+        _ = async { tokio::select! { _ = serve_shutdown_signal() => {}, _ = &mut cancellation => {} } } => {
             println!();
             println!("{}", "Shutting down...".yellow());
-            let stop_result = server.stop(shutdown_timeout).await;
-            let start_result = match tokio::time::timeout(shutdown_timeout, &mut server_task).await {
-                Ok(Ok(result)) => result,
-                Ok(Err(error)) => Err(FerrumError::internal(format!(
-                    "serve task failed during shutdown: {error}"
-                ))),
-                Err(_) => {
-                    server_task.abort();
-                    let _ = server_task.await;
-                    Err(FerrumError::internal(format!(
-                        "serve task did not stop within {} ms",
-                        shutdown_timeout.as_millis()
-                    )))
-                }
-            };
-            stop_result.and(start_result)
+            None
         }
     };
+    let serve_result = shutdown.wait(async {
+        // This one cleanup future owns HTTP drain, Engine shutdown and the
+        // HTTP scope receipt. An observation timeout does not drop or retry it.
+        let stop_result = server.finish_stop().await;
+        let joined = match already_joined {
+            Some(joined) => joined,
+            None => (&mut server_task).await,
+        };
+        let start_result = joined.unwrap_or_else(|error| Err(FerrumError::internal(format!(
+            "serve task failed: {error}"
+        ))));
+        if start_result.is_err() {
+            if let Err(error) = &stop_result {
+                tracing::warn!(%error, "serve cleanup failed after server task failure");
+            }
+        }
+        start_result.and(stop_result)
+    }).await;
 
     // Clean up PID file
     std::fs::remove_file(&pid_file).ok();
 
-    // PLAYBOOK § 1.5: Rust statics don't drop on exit, so the global
-    // TraceWriter's buffered events would be lost. Force-flush on
-    // ctrl_c-driven shutdown (matches bench / bench-serve exit paths).
-    ferrum_bench_core::trace::flush_global_trace();
-    ferrum_bench_core::flush_global_profile();
     let shutdown_after = product_memory_enabled
         .then(|| memory_sampler.sample())
         .flatten();
@@ -1250,7 +1320,9 @@ async fn execute_with_compatibility(
             .or_else(|| process_start_sample.clone()),
         shutdown_after,
     );
+    if serve_result.is_ok() {
     crate::observability_product::append_actual_serve_memory_stage_observability(
+        journals,
         &product_observability,
         crate::observability_product::ActualMemoryStageObservation::new(
             "actual_serve_shutdown",
@@ -1260,8 +1332,22 @@ async fn execute_with_compatibility(
         ),
     )?;
 
+    }
     serve_result?;
     Ok(())
+    }.await;
+    let cleanup_result = shutdown
+        .wait(async {
+            match &engine_lifetime {
+                Some(lifetime) => lifetime.finish().await,
+                None => journals.finish().await,
+            }
+        })
+        .await;
+    if let Err(error) = &cleanup_result {
+        tracing::warn!(%error, "serve final cleanup incomplete");
+    }
+    shutdown.finish(execution_result.and(cleanup_result).map_err(Into::into))
 }
 
 async fn serve_shutdown_signal() {
@@ -1382,7 +1468,8 @@ fn parse_lora_specs(values: &[String]) -> Result<Vec<ferrum_models::StartupLoraS
 fn startup_auto_config(
     hardware: HardwareCapabilities,
     typed_model_capabilities: Option<ModelCapabilities>,
-    execution_resource_authority: ferrum_types::ExecutionResourceAuthority,
+    execution_planning_model: ferrum_types::ExecutionPlanningModel,
+    selected_kv_cache_layout: ferrum_types::SelectedKvCacheLayout,
     architecture: Option<ferrum_models::Architecture>,
     model_definition: Option<&ferrum_models::ModelDefinition>,
     model_weight_bytes: Option<u64>,
@@ -1421,7 +1508,8 @@ fn startup_auto_config(
         model,
         hardware,
         workload,
-        execution_resource_authority,
+        execution_planning_model,
+        selected_kv_cache_layout,
         crate::startup::StartupUsage::PersistentServing,
     )
 }
@@ -1620,11 +1708,6 @@ fn serve_cli_runtime_entries(
     session_cache_max_tokens: Option<usize>,
     profile_jsonl: Option<&PathBuf>,
     scheduler_trace_jsonl: Option<&PathBuf>,
-    profile_commit_sha: Option<&str>,
-    profile_env_hash: Option<&str>,
-    profile_model: Option<&str>,
-    profile_concurrency: Option<u32>,
-    profile_runtime_flags_json: Option<&str>,
     layer_split_pipeline_mode: Option<crate::layer_split_pipeline::LayerSplitPipelineModeArg>,
 ) -> Vec<RuntimeConfigEntry> {
     let mut entries = Vec::new();
@@ -1677,16 +1760,6 @@ fn serve_cli_runtime_entries(
     }
     if let Some(enabled) = prefix_cache {
         entries.push(RuntimeConfigEntry::new(
-            "FERRUM_PREFIX_CACHE_REQUESTED",
-            if enabled { "1" } else { "0" },
-            RuntimeConfigSource::Cli,
-        ));
-        entries.push(RuntimeConfigEntry::new(
-            "FERRUM_PREFIX_CACHE_PRODUCT",
-            if enabled { "1" } else { "0" },
-            RuntimeConfigSource::Cli,
-        ));
-        entries.push(RuntimeConfigEntry::new(
             "FERRUM_PREFIX_CACHE",
             if enabled { "1" } else { "0" },
             RuntimeConfigSource::Cli,
@@ -1724,25 +1797,6 @@ fn serve_cli_runtime_entries(
             RuntimeConfigSource::Cli,
         ));
     }
-    push_cli_runtime_entry(
-        &mut entries,
-        "FERRUM_PROFILE_COMMIT_SHA",
-        profile_commit_sha,
-    );
-    push_cli_runtime_entry(&mut entries, "FERRUM_PROFILE_ENV_HASH", profile_env_hash);
-    push_cli_runtime_entry(&mut entries, "FERRUM_PROFILE_MODEL", profile_model);
-    if let Some(concurrency) = profile_concurrency {
-        entries.push(RuntimeConfigEntry::new(
-            "FERRUM_PROFILE_CONCURRENCY",
-            concurrency.to_string(),
-            RuntimeConfigSource::Cli,
-        ));
-    }
-    push_cli_runtime_entry(
-        &mut entries,
-        "FERRUM_PROFILE_RUNTIME_FLAGS_JSON",
-        profile_runtime_flags_json,
-    );
     crate::layer_split_pipeline::push_cli_runtime_entry(&mut entries, layer_split_pipeline_mode);
     entries
 }
@@ -1983,10 +2037,9 @@ fn write_startup_config_artifacts_with_failure(
     Ok(())
 }
 
-/// Replace requested-only startup evidence with the selected plan after the
-/// executor has compiled and initialized successfully. Both run and serve use
-/// this path; legacy executors without numerical evidence retain their requested
-/// numerical policy. Scheduler targets are recorded independently of the backend.
+/// Record actual executor selection after successful initialization. Both run
+/// and serve use this path. Model-owned KV facts keep their original source,
+/// separately from compiled-plan formats and numerical profiles.
 pub(crate) fn write_resolved_execution_config(
     path: Option<&std::path::Path>,
     executor_snapshot: Option<&serde_json::Value>,
@@ -2006,6 +2059,21 @@ pub(crate) fn write_resolved_execution_config(
         "scheduler".into(),
         serde_json::json!({"slo": scheduler_slo}),
     );
+    // These are observed from the instantiated model's snapshot, never inferred
+    // from requested runtime options. Keep the source and dtype vocabulary
+    // intact: a model-owned cache is not a resolved numerical plan.
+    object.remove("model_kv_storage");
+    if let Some(snapshot) = executor_snapshot {
+        if let (Some(source), Some(dtype)) = (
+            snapshot.get("source").and_then(serde_json::Value::as_str),
+            snapshot.get("kv_dtype").and_then(serde_json::Value::as_str),
+        ) {
+            object.insert(
+                "model_kv_storage".into(),
+                serde_json::json!({"source": source, "kv_dtype": dtype}),
+            );
+        }
+    }
     if let Some(snapshot) =
         executor_snapshot.filter(|value| value.get("numerical_execution").is_some())
     {
@@ -2023,72 +2091,6 @@ pub(crate) fn write_resolved_execution_config(
         .map_err(|error| ferrum_types::FerrumError::serialization(error.to_string()))?;
     std::fs::write(path, [bytes.as_slice(), b"\n"].concat())
         .map_err(|error| ferrum_types::FerrumError::io(error.to_string()))
-}
-
-struct ProfileSinkCliFields {
-    commit_sha: Option<String>,
-    env_hash: Option<String>,
-    model: Option<String>,
-    concurrency: Option<u32>,
-    runtime_flags_json: Option<String>,
-}
-
-fn configure_profile_sink(
-    profile_jsonl: Option<PathBuf>,
-    fields: ProfileSinkCliFields,
-    auto_config: &ResolvedFerrumConfig,
-    model_id: &str,
-) -> Result<()> {
-    let Some(path) = profile_jsonl else {
-        return Ok(());
-    };
-
-    let runtime_flags = match fields.runtime_flags_json {
-        Some(json) => {
-            let value = serde_json::from_str::<serde_json::Value>(&json).map_err(|err| {
-                ferrum_types::FerrumError::config(format!(
-                    "invalid --profile-runtime-flags-json: {err}"
-                ))
-            })?;
-            if !value.is_object() {
-                return Err(ferrum_types::FerrumError::config(
-                    "--profile-runtime-flags-json must be a JSON object",
-                ));
-            }
-            value
-        }
-        None => auto_config.effective_config_document(),
-    };
-
-    let env_hash = match fields.env_hash {
-        Some(value) if value.starts_with("sha256:") => value,
-        Some(_) => {
-            return Err(ferrum_types::FerrumError::config(
-                "--profile-env-hash must start with sha256:",
-            ))
-        }
-        None => auto_config.runtime_env_hash(),
-    };
-
-    let metadata = ProfileMetadata {
-        commit_sha: fields.commit_sha.filter(|value| !value.trim().is_empty()),
-        env_hash,
-        model: fields
-            .model
-            .filter(|value| !value.trim().is_empty())
-            .unwrap_or_else(|| model_id.to_string()),
-        concurrency: fields
-            .concurrency
-            .filter(|value| *value > 0)
-            .unwrap_or_else(|| auto_config.workload_profile.target_concurrency.max(1) as u32),
-        runtime_flags,
-    };
-    let profile_config = ProfileSinkConfig::enabled(path, metadata);
-    ferrum_bench_core::configure_global_profile(profile_config.clone())
-        .map_err(|err| ferrum_types::FerrumError::io(err.to_string()))?;
-    ferrum_kernels::configure_native_profile_sink(&profile_config)
-        .map_err(|err| ferrum_types::FerrumError::io(err.to_string()))?;
-    Ok(())
 }
 
 #[cfg(test)]
@@ -3164,11 +3166,6 @@ mod tests {
             Some(1024),
             Some(&PathBuf::from("/tmp/profile.jsonl")),
             Some(&PathBuf::from("/tmp/scheduler-trace.jsonl")),
-            Some("abc123"),
-            Some("sha256:test"),
-            Some("Qwen/Qwen3-30B-A3B-GPTQ-Int4"),
-            Some(32),
-            Some("{\"schema_version\":1}"),
             Some(crate::layer_split_pipeline::LayerSplitPipelineModeArg::Batch),
         );
         push_sequence_fit_policy_cli_entry(
@@ -3252,11 +3249,10 @@ mod tests {
             "/tmp/scheduler-trace.jsonl"
         );
         assert_eq!(entry("FERRUM_PROFILE_ENTRYPOINT").effective_value, "serve");
-        assert_eq!(
-            entry("FERRUM_PROFILE_ENV_HASH").effective_value,
-            "sha256:test"
-        );
-        assert_eq!(entry("FERRUM_PROFILE_CONCURRENCY").effective_value, "32");
+        assert!(!snapshot.entries.iter().any(|entry| matches!(
+            entry.key.as_str(),
+            "FERRUM_PROFILE_ENV_HASH" | "FERRUM_PROFILE_CONCURRENCY"
+        )));
         assert_eq!(
             entry("FERRUM_SEQUENCE_FIT_POLICY").effective_value,
             "full-input-must-fit"
@@ -3334,11 +3330,6 @@ mod tests {
             None,
             None,
             None,
-            None,
-            None,
-            None,
-            None,
-            None,
         );
         push_sequence_fit_policy_cli_entry(
             &mut cli_entries,
@@ -3367,31 +3358,27 @@ mod tests {
     }
 
     #[test]
-    fn serve_runtime_snapshot_applies_recurrent_state_slots_to_engine_config() {
-        let config_entries = crate::config::RuntimeCliConfig {
-            recurrent_state_max_slots: Some(16),
-            ..Default::default()
+    fn serve_runtime_snapshot_rejects_retired_recurrent_state_slots() {
+        for value in ["0", "16"] {
+            let snapshot = merge_runtime_config_sources(
+                Vec::new(),
+                RuntimeConfigSnapshot::from_entries([RuntimeConfigEntry::new(
+                    "FERRUM_RECURRENT_STATE_MAX_SLOTS",
+                    value,
+                    RuntimeConfigSource::Env,
+                )]),
+                Vec::new(),
+            );
+            let mut engine_config = ferrum_types::EngineConfig::default();
+            let error = engine_config
+                .apply_runtime_config_snapshot(&snapshot)
+                .unwrap_err();
+            assert!(
+                error.contains("FERRUM_RECURRENT_STATE_MAX_SLOTS"),
+                "{error}"
+            );
+            assert!(error.contains("retired"), "{error}");
         }
-        .runtime_config_entries();
-        let snapshot = merge_runtime_config_sources(
-            config_entries,
-            RuntimeConfigSnapshot::default(),
-            Vec::new(),
-        );
-        let entry = snapshot
-            .entries
-            .iter()
-            .find(|entry| entry.key == "FERRUM_RECURRENT_STATE_MAX_SLOTS")
-            .expect("missing recurrent state slot entry");
-        let mut engine_config = ferrum_types::EngineConfig::default();
-
-        engine_config
-            .apply_runtime_config_snapshot(&snapshot)
-            .expect("serve runtime config should apply to engine config");
-
-        assert_eq!(entry.effective_value, "16");
-        assert_eq!(entry.source, RuntimeConfigSource::ConfigFile);
-        assert_eq!(engine_config.runtime.recurrent_state_max_slots, Some(16));
     }
 
     #[test]
@@ -3464,11 +3451,6 @@ mod tests {
             Some(crate::commands::PrefillDecodeExecutionArg::Split),
             Some(false),
             Some(false),
-            None,
-            None,
-            None,
-            None,
-            None,
             None,
             None,
             None,
@@ -3896,11 +3878,6 @@ mod tests {
             None,
             None,
             None,
-            None,
-            None,
-            None,
-            None,
-            None,
         );
 
         let snapshot = merge_runtime_config_sources(Vec::new(), env_snapshot, cli_entries);
@@ -3914,11 +3891,75 @@ mod tests {
     }
 
     #[test]
+    fn serve_cpu_contiguous_startup_keeps_window_beyond_block_estimate() {
+        let definition = ferrum_models::ModelDefinition {
+            hidden_size: 8,
+            intermediate_size: 16,
+            vocab_size: 16,
+            num_hidden_layers: 1,
+            num_attention_heads: 2,
+            num_key_value_heads: Some(1),
+            max_position_embeddings: 32,
+            ..Default::default()
+        };
+        let window =
+            RuntimeConfigEntry::new("FERRUM_KV_CAPACITY", "32", RuntimeConfigSource::ConfigFile);
+        let requested = RuntimeConfigSnapshot::from_entries([
+            RuntimeConfigEntry::new("FERRUM_KV_MAX_BLOCKS", "1", RuntimeConfigSource::Cli),
+            RuntimeConfigEntry::new("FERRUM_MAX_MODEL_LEN", "32", RuntimeConfigSource::Cli),
+            RuntimeConfigEntry::new("FERRUM_MAX_BATCHED_TOKENS", "32", RuntimeConfigSource::Cli),
+            window.clone(),
+        ]);
+        let device = ferrum_types::Device::CPU;
+        let authority = ferrum_types::ExecutionPlanningModel::ExecutorManaged;
+        let mut engine = ferrum_types::EngineConfig::default();
+        let layout = crate::startup::selected_kv_cache_layout(
+            authority,
+            Some(&definition),
+            None,
+            &device,
+            &engine,
+            &requested,
+        )
+        .unwrap();
+        assert_eq!(layout, ferrum_types::SelectedKvCacheLayout::Contiguous);
+        assert_eq!(engine.runtime.kv_capacity, None);
+        let resolved = startup_auto_config(
+            crate::commands::serve::hardware_capabilities_for_device(&device),
+            None,
+            authority,
+            layout,
+            Some(definition.architecture.clone()),
+            Some(&definition),
+            None,
+            None,
+            requested,
+        )
+        .expect("CPU contiguous state is not bounded by a paged block estimate");
+        assert_eq!(resolved.model_capabilities.max_context_len, Some(32));
+        assert!(resolved.runtime_config.entries.contains(&window));
+        engine
+            .apply_runtime_config_snapshot(&resolved.runtime_config)
+            .unwrap();
+        assert_eq!(engine.runtime.llama.kv_max_blocks, Some(1));
+        assert_eq!(engine.runtime.kv_capacity, Some(32));
+        assert_eq!(engine.runtime.max_model_len, Some(32));
+        assert_eq!(engine.batching.max_num_batched_tokens, 32);
+        let document = resolved.effective_config_document();
+        assert_eq!(document["selected_kv_capacity"], 32);
+        assert_eq!(
+            document["selected_kv_capacity_source"],
+            "configured_token_limit"
+        );
+    }
+
+    #[test]
     fn serve_startup_requests_native_prefix_state_cache_by_default() {
         let resolved = startup_auto_config(
             HardwareCapabilities::unknown(),
             Some(ModelCapabilities::unknown()),
-            ferrum_types::ExecutionResourceAuthority::PlanRuntime,
+            ferrum_types::ExecutionPlanningModel::CompiledPlan,
+            ferrum_types::SelectedKvCacheLayout::Unknown,
             None,
             None,
             None,
@@ -3973,11 +4014,6 @@ mod tests {
             None,
             None,
             None,
-            None,
-            None,
-            None,
-            None,
-            None,
         );
         let product_enabled_entries = serve_cli_runtime_entries(
             None,
@@ -3994,11 +4030,6 @@ mod tests {
             None,
             None,
             prefix_cache_cli_override(false, false, true, false),
-            None,
-            None,
-            None,
-            None,
-            None,
             None,
             None,
             None,
@@ -4027,11 +4058,6 @@ mod tests {
             None,
             None,
             None,
-            None,
-            None,
-            None,
-            None,
-            None,
         );
         let product_disabled_entries = serve_cli_runtime_entries(
             None,
@@ -4048,11 +4074,6 @@ mod tests {
             None,
             None,
             prefix_cache_cli_override(false, false, false, true),
-            None,
-            None,
-            None,
-            None,
-            None,
             None,
             None,
             None,
@@ -4085,7 +4106,8 @@ mod tests {
             let resolved = startup_auto_config(
                 HardwareCapabilities::unknown(),
                 Some(ModelCapabilities::unknown()),
-                ferrum_types::ExecutionResourceAuthority::PlanRuntime,
+                ferrum_types::ExecutionPlanningModel::CompiledPlan,
+                ferrum_types::SelectedKvCacheLayout::Unknown,
                 None,
                 None,
                 None,
@@ -4167,6 +4189,47 @@ mod tests {
             serde_json::to_value(slo).unwrap()
         );
     }
+    #[test]
+    fn resolved_execution_config_records_model_kv_without_fabricating_plan_evidence() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("effective.json");
+        let original = serde_json::json!({
+            "numerical_execution": {"requested": "auto"},
+            "scheduler": {"slo": null},
+        });
+        std::fs::write(&path, serde_json::to_vec(&original).unwrap()).unwrap();
+        let snapshot = serde_json::json!({
+            "source": "llama-family-paged-block-prefix-cache",
+            "position": "real-kv-reuse",
+            "kv_dtype": "int8",
+            "hits": 0,
+        });
+        write_resolved_execution_config(Some(&path), Some(&snapshot), None).unwrap();
+        let observed: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(
+            observed["model_kv_storage"],
+            serde_json::json!({
+                "source": snapshot["source"], "kv_dtype": snapshot["kv_dtype"],
+            })
+        );
+        assert_eq!(
+            observed["numerical_execution"],
+            original["numerical_execution"]
+        );
+        assert!(observed.get("kv_storage").is_none());
+        assert!(observed["model_kv_storage"].get("requested").is_none());
+        assert!(observed["model_kv_storage"]
+            .get("numerical_profile")
+            .is_none());
+
+        // Missing actual model evidence cannot inherit the preceding snapshot.
+        write_resolved_execution_config(Some(&path), Some(&serde_json::json!({})), None).unwrap();
+        let missing: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(missing, original);
+    }
+
     #[test]
     fn q4_mmvq_weight_decode_serve_precedence_preserves_upload_policy() {
         use crate::commands::Q4MmvqWeightDecodeArg as Arg;

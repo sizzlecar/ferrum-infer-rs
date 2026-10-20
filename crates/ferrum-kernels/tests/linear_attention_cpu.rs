@@ -59,7 +59,7 @@ fn linear_attention_prepare_cpu_splits_gates_and_l2_normalizes_qk() {
     let a_log = vec![2.0f32.ln(), 0.5f32.ln()];
     let dt_bias = vec![0.1, -0.2];
 
-    let mut ctx = CpuBackend::new_context();
+    let mut ctx = CpuBackend::new_context(&Default::default()).expect("backend context");
     let mut query = vec![0.0; tokens * qk_total];
     let mut key = vec![0.0; tokens * qk_total];
     let mut value = vec![0.0; tokens * value_total];
@@ -146,7 +146,7 @@ fn linear_attention_prepare_varlen_cpu_rejects_mismatched_token_seq_indices() {
     let cu_seqlens = vec![0u32, 1, 3];
     let bad_token_seq_indices = vec![0u32, 0, 1];
 
-    let mut ctx = CpuBackend::new_context();
+    let mut ctx = CpuBackend::new_context(&Default::default()).expect("backend context");
     let mut query = vec![0.0; total_tokens * key_heads * key_dim];
     let mut key = vec![0.0; total_tokens * key_heads * key_dim];
     let mut value = vec![0.0; total_tokens * value_heads * value_dim];
@@ -245,7 +245,7 @@ fn linear_attention_prepare_varlen_packed_cpu_matches_separate_prepare() {
     let cu_seqlens = CpuBackend::from_slice_typed(&[0u32, 2, 3]);
     let token_seq_indices = CpuBackend::from_slice_typed(&[0u32, 0, 1]);
 
-    let mut ctx = CpuBackend::new_context();
+    let mut ctx = CpuBackend::new_context(&Default::default()).expect("backend context");
     let mut query = vec![0.0; total_tokens * qk_total];
     let mut key = vec![0.0; total_tokens * qk_total];
     let mut value = vec![0.0; total_tokens * value_total];
@@ -358,7 +358,7 @@ fn linear_attention_decode_prepare_cpu_updates_conv_state_and_splits_current_tok
     let a_log = vec![2.0f32.ln(), 0.5f32.ln()];
     let dt_bias = vec![0.1, -0.2];
 
-    let mut ctx = CpuBackend::new_context();
+    let mut ctx = CpuBackend::new_context(&Default::default()).expect("backend context");
     let mut query = vec![0.0; qk_total];
     let mut key = vec![0.0; qk_total];
     let mut value = vec![0.0; value_total];
@@ -452,7 +452,7 @@ fn linear_attention_decode_prepare_batch_cpu_matches_repeated_single_decode_prep
         .collect();
     let dt_bias: Vec<f32> = (0..value_heads).map(|i| -0.2 + i as f32 * 0.1).collect();
 
-    let mut ctx = CpuBackend::new_context();
+    let mut ctx = CpuBackend::new_context(&Default::default()).expect("backend context");
     let mut query = vec![0.0; batch * qk_total];
     let mut key = vec![0.0; batch * qk_total];
     let mut value = vec![0.0; batch * value_total];
@@ -550,7 +550,7 @@ fn gated_rms_norm_cpu_matches_norm_before_gate() {
     let z = vec![0.5, -0.25, 1.0, 1.5, -1.0, 0.25];
     let weight = vec![0.5, 1.5, -2.0];
     let mut out = vec![0.0; tokens * heads * dim];
-    let mut ctx = CpuBackend::new_context();
+    let mut ctx = CpuBackend::new_context(&Default::default()).expect("backend context");
 
     CpuBackend::gated_rms_norm_f32(
         &mut ctx, &core, &z, &weight, &mut out, tokens, heads, dim, eps,

@@ -15,7 +15,7 @@ macro_rules! run_backend {
     ($B:ty, $self:expr, $seed:expr) => {{
         use ferrum_kernels::backend::Backend;
         let data = random_vec($self.len, -2.0, 2.0, $seed);
-        let mut ctx = <$B>::new_context();
+        let mut ctx = <$B>::new_context(&Default::default()).expect("backend context");
         let src = <$B>::from_slice(&data);
         let mut dst = <$B>::alloc($self.len);
         <$B>::copy_slice(&mut ctx, &src, 0, &mut dst, 0, $self.len);

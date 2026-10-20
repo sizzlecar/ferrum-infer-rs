@@ -6,7 +6,7 @@
 use std::sync::Arc;
 
 use ferrum_kernels::backend::cpu::CpuBackend;
-use ferrum_kernels::backend::BackendQuantMarlin;
+use ferrum_kernels::backend::{Backend, BackendQuantMarlin};
 use ferrum_models::moe::{
     moe_forward, moe_forward_bucketed, ExpertStack, MoeForwardBucketedParams, MoeForwardParams,
     MoeRouteScratch,
@@ -133,7 +133,8 @@ fn bucketed_matches_per_pair_dispatch() {
     let mut silu_buf = vec![0.0f32; inter];
     let mut down_buf = vec![0.0f32; hidden];
     let zero_hidden = vec![0.0f32; hidden];
-    let mut ctx_a = ();
+    let mut ctx_a = CpuBackend::new_context(&ferrum_types::BackendContextConfig::default())
+        .expect("per-pair CPU context");
     moe_forward::<CpuBackend>(MoeForwardParams {
         ctx: &mut ctx_a,
         x: &x,
@@ -165,7 +166,8 @@ fn bucketed_matches_per_pair_dispatch() {
     let mut gate_up_packed = vec![0.0f32; total_pairs * 2 * inter];
     let mut silu_packed = vec![0.0f32; total_pairs * inter];
     let mut down_packed = vec![0.0f32; total_pairs * hidden];
-    let mut ctx_b = ();
+    let mut ctx_b = CpuBackend::new_context(&ferrum_types::BackendContextConfig::default())
+        .expect("bucketed CPU context");
     let mut route_scratch = MoeRouteScratch::new();
     moe_forward_bucketed::<CpuBackend>(MoeForwardBucketedParams {
         ctx: &mut ctx_b,
@@ -184,7 +186,6 @@ fn bucketed_matches_per_pair_dispatch() {
         silu_packed: &mut silu_packed,
         down_packed: &mut down_packed,
         route_scratch: &mut route_scratch,
-        profile_bucket: false,
         device_route: None,
     })
     .expect("bucketed forward");

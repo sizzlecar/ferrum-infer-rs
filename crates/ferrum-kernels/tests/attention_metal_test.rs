@@ -16,6 +16,10 @@ fn assert_close(a: &[f32], b: &[f32], atol: f32, label: &str) {
     let mut max_diff = 0.0f32;
     let mut max_idx = 0;
     for (i, (x, y)) in a.iter().zip(b.iter()).enumerate() {
+        assert!(
+            x.is_finite() && y.is_finite(),
+            "{label}: non-finite output at idx {i}: a={x}, b={y}"
+        );
         let d = (x - y).abs();
         if d > max_diff {
             max_diff = d;

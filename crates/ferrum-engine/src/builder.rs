@@ -9,14 +9,22 @@
 //! - Validation before engine creation
 
 use crate::registry::{ComponentConfig, ComponentRegistry};
+use crate::{EngineExecutor, IntoEngineExecutor};
+use ferrum_execution::execution_attempt::ExecutionAttemptObserver;
+use ferrum_execution::executor_lifecycle::{ExecutorOwner, ExecutorScope};
+#[cfg(test)]
 use ferrum_execution::ModelExecutor;
-use ferrum_interfaces::engine::{InferenceEngine, LlmInferenceEngine};
-use ferrum_interfaces::{KvCacheManager, RecurrentStateManager, Sampler, TensorFactory, Tokenizer};
+use ferrum_execution::{ExecutorBuildError, ExecutorBuildResult, ExecutorShutdownObserver};
+use ferrum_interfaces::engine::LlmInferenceEngine;
+use ferrum_interfaces::{Sampler, Tokenizer};
 use ferrum_models::vnext::{DefinedProductionModel, ProductionModelSourceBundle};
+use ferrum_scheduler::cost_prediction::CostSnapshotSource;
 use ferrum_types::{EngineConfig, FerrumError, Result};
 use std::sync::Arc;
 use tracing::{debug, info};
 
+#[cfg(test)]
+mod failure_retirement;
 mod source_binding;
 
 // The product composition root captures model-loading options in the typed
@@ -24,6 +32,9 @@ mod source_binding;
 
 /// Engine builder for creating inference engines with registry-based components
 pub struct EngineBuilder {
+    journal_scopes: Option<crate::EngineJournalScopes>,
+    execution_attempt_observer: Option<Arc<dyn ExecutionAttemptObserver>>,
+    cost_snapshot_source: Option<Arc<dyn CostSnapshotSource>>,
     /// Component registry to use
     registry: Arc<ComponentRegistry>,
     /// Engine configuration
@@ -37,20 +48,14 @@ pub struct EngineBuilder {
     tokenizer_name: Option<String>,
     /// Override: custom sampler name
     sampler_name: Option<String>,
-    /// Override: custom KV cache name
-    kv_cache_name: Option<String>,
     /// Override: custom executor name
     executor_name: Option<String>,
     /// Pre-created tokenizer (skip factory)
     custom_tokenizer: Option<Arc<dyn Tokenizer + Send + Sync>>,
     /// Pre-created sampler (skip factory)
     custom_sampler: Option<Arc<dyn Sampler + Send + Sync>>,
-    /// Pre-created KV cache (skip factory)
-    custom_kv_cache: Option<Arc<dyn KvCacheManager + Send + Sync>>,
-    /// Pre-created recurrent-state manager (skip factory)
-    custom_recurrent_state_manager: Option<Arc<dyn RecurrentStateManager + Send + Sync>>,
     /// Pre-created executor (skip factory)
-    custom_executor: Option<Arc<dyn ModelExecutor + Send + Sync>>,
+    custom_executor: Option<EngineExecutor>,
 }
 
 impl EngineBuilder {
@@ -62,18 +67,18 @@ impl EngineBuilder {
     /// Create a new engine builder with a custom registry
     pub fn with_registry(config: EngineConfig, registry: Arc<ComponentRegistry>) -> Self {
         Self {
+            journal_scopes: None,
+            execution_attempt_observer: None,
+            cost_snapshot_source: None,
             registry,
             config,
             model_sources: None,
             defined_model: None,
             tokenizer_name: None,
             sampler_name: None,
-            kv_cache_name: None,
             executor_name: None,
             custom_tokenizer: None,
             custom_sampler: None,
-            custom_kv_cache: None,
-            custom_recurrent_state_manager: None,
             custom_executor: None,
         }
     }
@@ -81,6 +86,35 @@ impl EngineBuilder {
     pub fn with_model_sources(mut self, sources: Arc<ProductionModelSourceBundle>) -> Self {
         self.model_sources = Some(sources);
         self.defined_model = None;
+        self
+    }
+
+    /// Use assembly-owned journal destinations. Engine shutdown retires these
+    /// producer scopes; the assembly retains final writer-close authority.
+    pub fn with_journal_scopes(mut self, scopes: crate::EngineJournalScopes) -> Self {
+        self.journal_scopes = Some(scopes);
+        self
+    }
+
+    /// Observe bounded product execution facts independently of detailed traces.
+    /// The observer is fixed before startup; omitting it keeps collection off.
+    pub fn with_execution_attempt_observer(
+        mut self,
+        observer: Arc<dyn ExecutionAttemptObserver>,
+    ) -> Self {
+        self.execution_attempt_observer = Some(observer);
+        self
+    }
+
+    /// Install one feedback assembly before startup. The engine only observes
+    /// facts and reads published predictions; its owner lives in the assembly.
+    pub fn with_execution_feedback(
+        mut self,
+        observer: Arc<dyn ExecutionAttemptObserver>,
+        source: Arc<dyn CostSnapshotSource>,
+    ) -> Self {
+        self.execution_attempt_observer = Some(observer);
+        self.cost_snapshot_source = Some(source);
         self
     }
 
@@ -114,27 +148,6 @@ impl EngineBuilder {
         self
     }
 
-    /// Set the KV cache to use by name
-    pub fn with_kv_cache(mut self, name: impl Into<String>) -> Self {
-        self.kv_cache_name = Some(name.into());
-        self
-    }
-
-    /// Set a pre-created KV cache manager
-    pub fn with_custom_kv_cache(mut self, kv_cache: Arc<dyn KvCacheManager + Send + Sync>) -> Self {
-        self.custom_kv_cache = Some(kv_cache);
-        self
-    }
-
-    /// Set a pre-created recurrent-state manager.
-    pub fn with_custom_recurrent_state_manager(
-        mut self,
-        manager: Arc<dyn RecurrentStateManager + Send + Sync>,
-    ) -> Self {
-        self.custom_recurrent_state_manager = Some(manager);
-        self
-    }
-
     /// Set the executor to use by name
     pub fn with_executor(mut self, name: impl Into<String>) -> Self {
         self.executor_name = Some(name.into());
@@ -142,9 +155,19 @@ impl EngineBuilder {
     }
 
     /// Set a pre-created model executor
-    pub fn with_custom_executor(mut self, executor: Arc<dyn ModelExecutor + Send + Sync>) -> Self {
-        self.custom_executor = Some(executor);
+    pub fn with_custom_executor(mut self, executor: ExecutorScope) -> Self {
+        self.custom_executor = Some(
+            executor
+                .into_engine_executor()
+                .expect("existing scope is infallible"),
+        );
         self
+    }
+
+    /// Transfer final-close authority with a custom executor.
+    pub fn with_owned_executor(mut self, executor: ExecutorOwner) -> Result<Self> {
+        self.custom_executor = Some(executor.into_engine_executor()?);
+        Ok(self)
     }
 
     /// Determine which tokenizer to use based on config and overrides
@@ -169,19 +192,6 @@ impl EngineBuilder {
 
         // Could derive from sampling params in the future
         "multinomial".to_string()
-    }
-
-    /// Determine which KV cache to use based on config and overrides
-    fn resolve_kv_cache_name(&self) -> String {
-        if let Some(ref name) = self.kv_cache_name {
-            return name.clone();
-        }
-
-        match self.config.kv_cache.cache_type {
-            ferrum_types::KvCacheType::Contiguous => "default".to_string(),
-            ferrum_types::KvCacheType::Paged => "paged".to_string(),
-            ferrum_types::KvCacheType::Tree => "default".to_string(), // Fallback
-        }
     }
 
     /// Determine which executor to use based on config and overrides
@@ -210,7 +220,36 @@ impl EngineBuilder {
     }
 
     /// Build the inference engine
-    pub async fn build(self) -> Result<Box<dyn LlmInferenceEngine + Send + Sync>> {
+    pub async fn build(self) -> ExecutorBuildResult<Box<dyn LlmInferenceEngine + Send + Sync>> {
+        // An owned custom executor already exists before the first validation.
+        // Observation never starts close; its original owner/drop retains that
+        // authority. Keep this fallback outside every fallible assembly step.
+        let mut cleanup = self
+            .custom_executor
+            .as_ref()
+            .and_then(|binding| binding.owner.as_ref())
+            .map(ExecutorOwner::shutdown_observer);
+        match self.build_observed(&mut cleanup).await {
+            Err(error) if error.cleanup().is_none() => match cleanup {
+                Some(cleanup) => Err(ExecutorBuildError::with_cleanup(
+                    error.cause().clone(),
+                    cleanup,
+                )),
+                None => Err(error),
+            },
+            result => result,
+        }
+    }
+
+    async fn build_observed(
+        self,
+        cleanup: &mut Option<ExecutorShutdownObserver>,
+    ) -> ExecutorBuildResult<Box<dyn LlmInferenceEngine + Send + Sync>> {
+        crate::continuous_engine::validate_execution_feedback(
+            &self.config,
+            self.execution_attempt_observer.as_ref(),
+            self.cost_snapshot_source.as_ref(),
+        )?;
         info!(
             "Building inference engine for model: {}",
             self.config.model.model_id
@@ -220,16 +259,15 @@ impl EngineBuilder {
             if self.config.backend.backend_options.contains_key(key) {
                 return Err(FerrumError::config(format!(
                     "backend option '{key}' belongs to retired experimental speculative decoding"
-                )));
+                ))
+                .into());
             }
         }
 
         // Pre-compute all component names before consuming self
         let tokenizer_name = self.resolve_tokenizer_name();
         let sampler_name = self.resolve_sampler_name();
-        let kv_cache_name = self.resolve_kv_cache_name();
         let executor_name = self.resolve_executor_name();
-        let explicit_kv_cache_override = self.kv_cache_name.is_some();
 
         let component_config = ComponentConfig::from_engine_config_and_product_model(
             &self.config,
@@ -245,13 +283,13 @@ impl EngineBuilder {
         // Extract custom components. Phase 3e+ deleted the legacy
         // `ComputeBackend` trait, so there's no "backend" component to
         // build here — real GPU dispatch goes through `Backend<B>` in
-        // `ferrum-kernels`. The stub executor now wires
-        // `CandleTensorFactory` directly from the registry.
+        // `ferrum-kernels` and stays owned by the original executor.
         let custom_tokenizer = self.custom_tokenizer;
         let custom_sampler = self.custom_sampler;
-        let custom_kv_cache = self.custom_kv_cache;
-        let custom_recurrent_state_manager = self.custom_recurrent_state_manager;
         let custom_executor = self.custom_executor;
+        let journal_scopes = self.journal_scopes;
+        let execution_attempt_observer = self.execution_attempt_observer;
+        let cost_snapshot_source = self.cost_snapshot_source;
 
         // 2. Create or use provided tokenizer
         let tokenizer = if let Some(tokenizer) = custom_tokenizer {
@@ -271,7 +309,8 @@ impl EngineBuilder {
                         return Err(FerrumError::config(format!(
                             "Failed to create tokenizer '{}' in model mode: {}",
                             tokenizer_name, e
-                        )));
+                        ))
+                        .into());
                     }
 
                     tracing::warn!(
@@ -309,13 +348,16 @@ impl EngineBuilder {
                 .create_executor(&executor_name, &component_config)
                 .await
             {
-                Ok(e) => e,
+                Ok(e) => {
+                    *cleanup = Some(e.shutdown_observer());
+                    e.into_engine_executor()?
+                }
                 Err(err) => {
-                    if has_model_path {
-                        return Err(FerrumError::config(format!(
-                            "Failed to create executor '{}' in model mode: {}",
-                            executor_name, err
-                        )));
+                    if has_model_path || err.cleanup().is_some() {
+                        // A retained original initializer is terminal for this
+                        // build, including custom factories without a path.
+                        // Do not flatten its observer or fall back to a stub.
+                        return Err(err);
                     }
 
                     tracing::warn!(
@@ -323,7 +365,9 @@ impl EngineBuilder {
                         executor_name,
                         err
                     );
-                    registry.create_executor("stub", &component_config).await?
+                    let owner = registry.create_executor("stub", &component_config).await?;
+                    *cleanup = Some(owner.shutdown_observer());
+                    owner.into_engine_executor()?
                 }
             }
         };
@@ -337,42 +381,17 @@ impl EngineBuilder {
             plan.apply_to_engine_config(&mut config)
                 .map_err(FerrumError::config)?;
         }
-        let execution_resource_authority = executor.execution_resource_authority();
+        let execution_planning_model = executor.execution_planning_model();
 
-        let (kv_cache, recurrent_state_manager) = match execution_resource_authority {
-            ferrum_execution::model_executor::ExecutionResourceAuthority::PlanRuntime => {
-                if explicit_kv_cache_override || custom_kv_cache.is_some() {
-                    return Err(FerrumError::config(
-                        "plan runtime cannot be combined with a legacy engine KV-cache override",
-                    ));
-                }
-                if custom_recurrent_state_manager.is_some() {
-                    return Err(FerrumError::config(
-                        "plan runtime cannot be combined with a legacy engine recurrent-state manager",
-                    ));
-                }
-                if executor.resolved_model_plan().is_none() {
-                    return Err(FerrumError::config(
-                        "plan-runtime executor did not expose its authoritative ResolvedModelPlan",
-                    ));
-                }
-                (None, None)
-            }
-            ferrum_execution::model_executor::ExecutionResourceAuthority::LegacyEngine => {
-                let kv_cache = if let Some(kv_cache) = custom_kv_cache {
-                    debug!("Using custom KV cache");
-                    kv_cache
-                } else {
-                    debug!("Creating KV cache: {}", kv_cache_name);
-                    registry
-                        .create_kv_cache(&kv_cache_name, &component_config)
-                        .await?
-                };
-                let recurrent_state_manager = custom_recurrent_state_manager
-                    .or_else(|| default_recurrent_state_manager(&config));
-                (Some(kv_cache), recurrent_state_manager)
-            }
-        };
+        if execution_planning_model
+            == ferrum_execution::model_executor::ExecutionPlanningModel::CompiledPlan
+            && executor.resolved_model_plan().is_none()
+        {
+            return Err(FerrumError::config(
+                "plan-runtime executor did not expose its authoritative ResolvedModelPlan",
+            )
+            .into());
+        }
 
         // 5. Create the engine — always ContinuousBatchEngine.
         info!("All components created, building ContinuousBatchEngine");
@@ -383,72 +402,28 @@ impl EngineBuilder {
             ),
         );
 
-        // Create TensorFactory for the configured device
-        let tensor_factory: Arc<dyn TensorFactory> = Arc::new(
-            crate::tensor_factory::candle::CandleTensorFactory::new(config.backend.device.clone()),
-        );
-
         // Construct the unpublished engine shell first so its typed profile
         // sink is attached before executor startup emits warmup/capture events.
-        let engine = match execution_resource_authority {
-            ferrum_execution::model_executor::ExecutionResourceAuthority::PlanRuntime => {
-                crate::ContinuousBatchEngine::new_plan_runtime(
-                    config,
-                    cb_scheduler,
-                    tokenizer,
-                    sampler,
-                    Arc::clone(&executor),
-                    tensor_factory,
-                )?
-            }
-            ferrum_execution::model_executor::ExecutionResourceAuthority::LegacyEngine => {
-                let kv_cache = kv_cache.ok_or_else(|| {
-                    FerrumError::internal("legacy-engine composition lost its KV-cache manager")
-                })?;
-                crate::ContinuousBatchEngine::new_with_recurrent_state_manager(
-                    config,
-                    cb_scheduler,
-                    tokenizer,
-                    sampler,
-                    kv_cache,
-                    Arc::clone(&executor),
-                    tensor_factory,
-                    recurrent_state_manager,
-                )?
-            }
-        };
+        let engine = crate::ContinuousBatchEngine::new_observed(
+            config,
+            cb_scheduler,
+            tokenizer,
+            sampler,
+            executor,
+            journal_scopes,
+            execution_attempt_observer,
+            cost_snapshot_source,
+        )?;
 
         // This is the single product readiness boundary shared by `run` and
         // `serve`. The engine is not exposed until executor-owned compilation
         // and warmup complete, but those events now share the product trace.
-        let startup_result = executor.prepare_startup().await;
+        let startup_result = engine.prepare_startup().await;
         if let Err(startup_error) = startup_result {
-            if let Err(shutdown_error) = engine.shutdown().await {
-                tracing::warn!(
-                    "Failed to close engine resources after startup rejection: {shutdown_error}"
-                );
-            }
-            return Err(startup_error);
+            return Err(engine.into_startup_failure(startup_error).await);
         }
         Ok(Box::new(engine))
     }
-}
-
-fn default_recurrent_state_manager(
-    config: &EngineConfig,
-) -> Option<Arc<dyn RecurrentStateManager + Send + Sync>> {
-    let total_batch_slots = config
-        .runtime
-        .recurrent_state_max_slots
-        .unwrap_or(usize::MAX);
-    Some(
-        Arc::new(crate::recurrent_state::InMemoryRecurrentStateManager::new(
-            crate::recurrent_state::InMemoryRecurrentStateConfig {
-                total_memory_bytes: usize::MAX,
-                total_batch_slots,
-            },
-        )) as Arc<dyn RecurrentStateManager + Send + Sync>,
-    )
 }
 
 fn validate_layer_split_plan(component_config: &ComponentConfig) -> Result<()> {
@@ -501,7 +476,7 @@ fn validate_layer_split_plan(component_config: &ComponentConfig) -> Result<()> {
 /// Create an engine with the default configuration and registry
 pub async fn create_engine(
     config: EngineConfig,
-) -> Result<Box<dyn LlmInferenceEngine + Send + Sync>> {
+) -> ExecutorBuildResult<Box<dyn LlmInferenceEngine + Send + Sync>> {
     EngineBuilder::new(config).build().await
 }
 
@@ -509,7 +484,7 @@ pub async fn create_engine(
 pub async fn create_product_engine(
     config: EngineConfig,
     sources: Arc<ProductionModelSourceBundle>,
-) -> Result<Box<dyn LlmInferenceEngine + Send + Sync>> {
+) -> ExecutorBuildResult<Box<dyn LlmInferenceEngine + Send + Sync>> {
     EngineBuilder::new(config)
         .with_model_sources(sources)
         .build()
@@ -521,7 +496,7 @@ pub async fn create_product_engine(
 pub async fn create_defined_product_engine(
     config: EngineConfig,
     prepared: Arc<DefinedProductionModel>,
-) -> Result<Box<dyn LlmInferenceEngine + Send + Sync>> {
+) -> ExecutorBuildResult<Box<dyn LlmInferenceEngine + Send + Sync>> {
     EngineBuilder::new(config)
         .with_defined_model(prepared)
         .build()
@@ -535,24 +510,16 @@ pub async fn create_defined_product_engine(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ferrum_execution::executor_lifecycle::{ExecutorShutdownObserver, ExecutorShutdownPermit};
     use ferrum_execution::model_executor::{
-        DecodeInput, DecodeOutput, ExecutionResourceAuthority, ExecutorCapabilities,
-        ExecutorStatus, PlanRuntimeResourceSnapshot, PrefillInput, PrefillOutput,
+        ExecutionPlanningModel, ExecutorCapabilities, ExecutorStatus, PlanRuntimeResourceSnapshot,
     };
     use ferrum_execution::ProductExecutionEventSink;
-    use ferrum_interfaces::{
-        RecurrentStateHandle, RecurrentStateManager, RecurrentStateManagerStats,
-        RecurrentStateSpec, RecurrentStateTensorSpec,
-    };
     use ferrum_runtime::ExecutionEventSink;
-    use ferrum_types::{DataType, Device, RequestId};
     use std::sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
         Mutex,
     };
-
-    #[derive(Debug)]
-    struct NoopRecurrentStateManager;
 
     struct PlanRuntimeBuilderExecutor {
         inner: ferrum_testkit::MockModelExecutor,
@@ -572,6 +539,22 @@ mod tests {
 
     #[async_trait::async_trait]
     impl ModelExecutor for StartupProbeExecutor {
+        fn begin_shutdown(
+            self: Arc<Self>,
+            permit: &ExecutorShutdownPermit,
+        ) -> ExecutorShutdownObserver {
+            if let Err(error) = permit.check(self.as_ref()) {
+                return ExecutorShutdownObserver::retained(Arc::new(self), error);
+            }
+            match Arc::try_unwrap(self) {
+                Ok(original) => ExecutorOwner::new(Box::new(original.inner)).begin_shutdown(),
+                Err(original) => ExecutorShutdownObserver::retained(
+                    Arc::new(original),
+                    FerrumError::internal("startup probe still has execution borrowers"),
+                ),
+            }
+        }
+
         fn info(&self) -> &ferrum_types::ModelInfo {
             self.inner.info()
         }
@@ -582,14 +565,6 @@ mod tests {
                 return Err(FerrumError::backend("startup preparation rejected"));
             }
             Ok(())
-        }
-
-        async fn prefill(&self, input: &PrefillInput) -> Result<PrefillOutput> {
-            self.inner.prefill(input).await
-        }
-
-        async fn decode(&self, input: &DecodeInput) -> Result<DecodeOutput> {
-            self.inner.decode(input).await
         }
 
         fn capabilities(&self) -> ExecutorCapabilities {
@@ -603,6 +578,22 @@ mod tests {
 
     #[async_trait::async_trait]
     impl ModelExecutor for ProfileStartupProbeExecutor {
+        fn begin_shutdown(
+            self: Arc<Self>,
+            permit: &ExecutorShutdownPermit,
+        ) -> ExecutorShutdownObserver {
+            if let Err(error) = permit.check(self.as_ref()) {
+                return ExecutorShutdownObserver::retained(Arc::new(self), error);
+            }
+            match Arc::try_unwrap(self) {
+                Ok(original) => ExecutorOwner::new(Box::new(original.inner)).begin_shutdown(),
+                Err(original) => ExecutorShutdownObserver::retained(
+                    Arc::new(original),
+                    FerrumError::internal("profile probe still has execution borrowers"),
+                ),
+            }
+        }
+
         fn info(&self) -> &ferrum_types::ModelInfo {
             self.inner.info()
         }
@@ -637,14 +628,6 @@ mod tests {
                 .event_sink
                 .lock()
                 .expect("profile startup probe sink lock") = Some(sink);
-        }
-
-        async fn prefill(&self, input: &PrefillInput) -> Result<PrefillOutput> {
-            self.inner.prefill(input).await
-        }
-
-        async fn decode(&self, input: &DecodeInput) -> Result<DecodeOutput> {
-            self.inner.decode(input).await
         }
 
         fn capabilities(&self) -> ExecutorCapabilities {
@@ -716,24 +699,32 @@ mod tests {
 
     #[async_trait::async_trait]
     impl ModelExecutor for PlanRuntimeBuilderExecutor {
+        fn begin_shutdown(
+            self: Arc<Self>,
+            permit: &ExecutorShutdownPermit,
+        ) -> ExecutorShutdownObserver {
+            if let Err(error) = permit.check(self.as_ref()) {
+                return ExecutorShutdownObserver::retained(Arc::new(self), error);
+            }
+            match Arc::try_unwrap(self) {
+                Ok(original) => ExecutorOwner::new(Box::new(original.inner)).begin_shutdown(),
+                Err(original) => ExecutorShutdownObserver::retained(
+                    Arc::new(original),
+                    FerrumError::internal("plan probe still has execution borrowers"),
+                ),
+            }
+        }
+
         fn info(&self) -> &ferrum_types::ModelInfo {
             self.inner.info()
         }
 
-        fn execution_resource_authority(&self) -> ExecutionResourceAuthority {
-            ExecutionResourceAuthority::PlanRuntime
+        fn execution_planning_model(&self) -> ExecutionPlanningModel {
+            ExecutionPlanningModel::CompiledPlan
         }
 
         fn plan_runtime_resource_snapshot(&self) -> Result<Option<PlanRuntimeResourceSnapshot>> {
             PlanRuntimeResourceSnapshot::new(1_000, 900, 700, 700, 400, 300, 200, 0, 0).map(Some)
-        }
-
-        async fn prefill(&self, input: &PrefillInput) -> Result<PrefillOutput> {
-            self.inner.prefill(input).await
-        }
-
-        async fn decode(&self, input: &DecodeInput) -> Result<DecodeOutput> {
-            self.inner.decode(input).await
         }
 
         fn capabilities(&self) -> ExecutorCapabilities {
@@ -745,80 +736,12 @@ mod tests {
         }
     }
 
-    struct CountingKvFactory {
-        calls: Arc<AtomicUsize>,
-    }
-
-    #[async_trait::async_trait]
-    impl crate::registry::ComponentFactory<Arc<dyn KvCacheManager + Send + Sync>>
-        for CountingKvFactory
-    {
-        async fn create(
-            &self,
-            _config: &ComponentConfig,
-        ) -> Result<Arc<dyn KvCacheManager + Send + Sync>> {
-            self.calls.fetch_add(1, Ordering::Relaxed);
-            Ok(Arc::new(ferrum_testkit::MockKvCacheManager::new(8)))
-        }
-
-        fn metadata(&self) -> crate::registry::ComponentMetadata {
-            crate::registry::ComponentMetadata::default()
-        }
-    }
-
-    #[async_trait::async_trait]
-    impl RecurrentStateManager for NoopRecurrentStateManager {
-        async fn allocate(
-            &self,
-            _spec: &RecurrentStateSpec,
-        ) -> Result<Arc<dyn RecurrentStateHandle>> {
-            Err(FerrumError::unsupported(
-                "noop recurrent-state manager does not allocate",
-            ))
-        }
-
-        async fn deallocate(&self, _request_id: RequestId) -> Result<()> {
-            Ok(())
-        }
-
-        fn can_allocate(&self, _spec: &RecurrentStateSpec) -> bool {
-            false
-        }
-
-        fn get_handle(&self, _request_id: RequestId) -> Option<Arc<dyn RecurrentStateHandle>> {
-            None
-        }
-
-        fn list_handles(&self) -> Vec<(RequestId, Arc<dyn RecurrentStateHandle>)> {
-            Vec::new()
-        }
-
-        fn stats(&self) -> RecurrentStateManagerStats {
-            RecurrentStateManagerStats {
-                total_memory_bytes: 0,
-                used_memory_bytes: 0,
-                active_states: 0,
-                active_state_tensors: 0,
-                total_batch_slots: 0,
-                used_batch_slots: 0,
-                allocation_count: 0,
-                allocation_failures: 0,
-                eviction_count: 0,
-            }
-        }
-
-        async fn reset(&self) -> Result<()> {
-            Ok(())
-        }
-    }
-
     #[test]
     fn test_builder_creation() {
         let config = EngineConfig::default();
         let builder = EngineBuilder::new(config);
 
         assert!(builder.tokenizer_name.is_none());
-        assert!(builder.custom_recurrent_state_manager.is_none());
     }
 
     #[test]
@@ -827,22 +750,11 @@ mod tests {
         let builder = EngineBuilder::new(config)
             .with_tokenizer("custom_tokenizer")
             .with_sampler("greedy")
-            .with_kv_cache("paged")
             .with_executor("custom_executor");
 
         assert_eq!(builder.tokenizer_name, Some("custom_tokenizer".to_string()));
         assert_eq!(builder.sampler_name, Some("greedy".to_string()));
-        assert_eq!(builder.kv_cache_name, Some("paged".to_string()));
         assert_eq!(builder.executor_name, Some("custom_executor".to_string()));
-    }
-
-    #[test]
-    fn test_builder_with_custom_recurrent_state_manager() {
-        let config = EngineConfig::default();
-        let manager = Arc::new(NoopRecurrentStateManager);
-        let builder = EngineBuilder::new(config).with_custom_recurrent_state_manager(manager);
-
-        assert!(builder.custom_recurrent_state_manager.is_some());
     }
 
     #[test]
@@ -924,7 +836,10 @@ mod tests {
                     .await
                     .err()
                     .expect("retired options must not silently select ordinary decoding");
-                assert!(matches!(&error, FerrumError::Config { .. }), "{error}");
+                assert!(
+                    matches!(error.cause(), FerrumError::Config { .. }),
+                    "{error}"
+                );
                 let message = error.to_string();
                 assert!(
                     message.contains(key) && message.contains("retired"),
@@ -932,38 +847,6 @@ mod tests {
                 );
             }
         }
-    }
-
-    #[test]
-    fn test_builder_cuda_recurrent_state_manager_uses_recurrent_state_slot_cap() {
-        let mut config = EngineConfig::default();
-        config.backend.device = Device::CUDA(0);
-        config.runtime.recurrent_state_max_slots = Some(2);
-        let manager = default_recurrent_state_manager(&config)
-            .expect("cuda product path should install admission recurrent-state manager");
-        let spec = |request_id| RecurrentStateSpec {
-            request_id,
-            num_layers: 1,
-            tensors: vec![RecurrentStateTensorSpec::new(
-                0,
-                "delta_state",
-                vec![1, 1, 1],
-                DataType::FP32,
-            )],
-            device: Device::CUDA(0),
-            max_batch_slots: 1,
-        };
-
-        tokio_test::block_on(manager.allocate(&spec(RequestId::new()))).unwrap();
-        tokio_test::block_on(manager.allocate(&spec(RequestId::new()))).unwrap();
-        let err = tokio_test::block_on(manager.allocate(&spec(RequestId::new())))
-            .expect_err("third recurrent allocation should exceed the two-slot cap");
-
-        assert!(matches!(err, FerrumError::ResourceExhausted { .. }));
-        let stats = manager.stats();
-        assert_eq!(stats.total_batch_slots, 2);
-        assert_eq!(stats.used_batch_slots, 2);
-        assert_eq!(stats.allocation_failures, 1);
     }
 
     #[test]
@@ -1042,7 +925,6 @@ mod tests {
         let builder = EngineBuilder::new(config);
 
         assert_eq!(builder.resolve_sampler_name(), "multinomial");
-        assert_eq!(builder.resolve_kv_cache_name(), "default");
     }
 
     #[tokio::test]
@@ -1057,32 +939,35 @@ mod tests {
     #[tokio::test]
     async fn startup_preparation_runs_once_and_blocks_engine_publication_on_failure() {
         let success_calls = Arc::new(AtomicUsize::new(0));
-        let success: Arc<dyn ModelExecutor + Send + Sync> = Arc::new(StartupProbeExecutor {
+        let success = ExecutorOwner::new(Box::new(StartupProbeExecutor {
             inner: ferrum_testkit::MockModelExecutor::instant(128),
             calls: Arc::clone(&success_calls),
             fail: false,
-        });
-        EngineBuilder::new(EngineConfig::default())
-            .with_custom_executor(success)
+        }));
+        let engine = EngineBuilder::new(EngineConfig::default())
+            .with_custom_executor(success.scope().unwrap())
             .build()
             .await
             .expect("successful startup preparation builds the engine");
         assert_eq!(success_calls.load(Ordering::Relaxed), 1);
+        engine.shutdown().await.unwrap();
+        success.begin_shutdown().wait().await.result().unwrap();
 
         let failure_calls = Arc::new(AtomicUsize::new(0));
-        let failure: Arc<dyn ModelExecutor + Send + Sync> = Arc::new(StartupProbeExecutor {
+        let failure = ExecutorOwner::new(Box::new(StartupProbeExecutor {
             inner: ferrum_testkit::MockModelExecutor::instant(128),
             calls: Arc::clone(&failure_calls),
             fail: true,
-        });
+        }));
         let error = EngineBuilder::new(EngineConfig::default())
-            .with_custom_executor(failure)
+            .with_custom_executor(failure.scope().unwrap())
             .build()
             .await
             .err()
             .expect("failed startup preparation must stop engine construction");
         assert!(error.to_string().contains("startup preparation rejected"));
         assert_eq!(failure_calls.load(Ordering::Relaxed), 1);
+        failure.begin_shutdown().wait().await.result().unwrap();
     }
 
     #[tokio::test]
@@ -1097,18 +982,20 @@ mod tests {
         ));
         let _ = std::fs::remove_file(&trace_path);
         let saw_sink_during_startup = Arc::new(AtomicBool::new(false));
-        let executor: Arc<dyn ModelExecutor + Send + Sync> =
-            Arc::new(ProfileStartupProbeExecutor {
-                inner: ferrum_testkit::MockModelExecutor::instant(128),
-                event_sink: Mutex::new(None),
-                saw_sink_during_startup: Arc::clone(&saw_sink_during_startup),
-            });
+        let executor = ExecutorOwner::new(Box::new(ProfileStartupProbeExecutor {
+            inner: ferrum_testkit::MockModelExecutor::instant(128),
+            event_sink: Mutex::new(None),
+            saw_sink_during_startup: Arc::clone(&saw_sink_during_startup),
+        }));
         let mut config = EngineConfig::default();
         config.runtime.profile_jsonl = Some(trace_path.clone());
         config.runtime.profile_entrypoint = Some(ferrum_types::ProfileEntrypoint::Run);
 
+        // Product assembly owns the executor and may install its startup sink.
+        // A borrowed scope cannot replace another assembly's event sink.
         let engine = EngineBuilder::new(config)
-            .with_custom_executor(executor)
+            .with_owned_executor(executor)
+            .expect("original executor owner provides the product scope")
             .build()
             .await
             .expect("profile-enabled startup builds the engine");
@@ -1128,38 +1015,30 @@ mod tests {
     #[tokio::test]
     async fn product_without_profile_does_not_attach_execution_event_sink() {
         let saw_sink_during_startup = Arc::new(AtomicBool::new(false));
-        let executor: Arc<dyn ModelExecutor + Send + Sync> =
-            Arc::new(ProfileStartupProbeExecutor {
-                inner: ferrum_testkit::MockModelExecutor::instant(128),
-                event_sink: Mutex::new(None),
-                saw_sink_during_startup: Arc::clone(&saw_sink_during_startup),
-            });
+        let executor = ExecutorOwner::new(Box::new(ProfileStartupProbeExecutor {
+            inner: ferrum_testkit::MockModelExecutor::instant(128),
+            event_sink: Mutex::new(None),
+            saw_sink_during_startup: Arc::clone(&saw_sink_during_startup),
+        }));
 
         let engine = EngineBuilder::new(EngineConfig::default())
-            .with_custom_executor(executor)
+            .with_custom_executor(executor.scope().unwrap())
             .build()
             .await
             .expect("profile-disabled engine builds");
         assert!(!saw_sink_during_startup.load(Ordering::Acquire));
         engine.shutdown().await.unwrap();
+        executor.begin_shutdown().wait().await.result().unwrap();
     }
 
     #[tokio::test]
-    async fn plan_runtime_without_resolved_plan_rejects_before_legacy_kv_factory() {
-        let calls = Arc::new(AtomicUsize::new(0));
-        let registry = Arc::new(ComponentRegistry::with_defaults());
-        registry.register_kv_cache_factory(
-            "default",
-            Arc::new(CountingKvFactory {
-                calls: Arc::clone(&calls),
-            }),
-        );
-        let executor: Arc<dyn ModelExecutor + Send + Sync> = Arc::new(PlanRuntimeBuilderExecutor {
+    async fn plan_runtime_without_resolved_plan_rejects_before_startup() {
+        let executor = ExecutorOwner::new(Box::new(PlanRuntimeBuilderExecutor {
             inner: ferrum_testkit::MockModelExecutor::instant(128),
-        });
+        }));
 
-        let result = EngineBuilder::with_registry(EngineConfig::default(), registry)
-            .with_custom_executor(executor)
+        let result = EngineBuilder::new(EngineConfig::default())
+            .with_custom_executor(executor.scope().unwrap())
             .build()
             .await;
 
@@ -1169,27 +1048,71 @@ mod tests {
         assert!(error
             .to_string()
             .contains("authoritative ResolvedModelPlan"));
-        assert_eq!(calls.load(Ordering::Relaxed), 0);
+        executor.begin_shutdown().wait().await.result().unwrap();
     }
-
     #[tokio::test]
-    async fn plan_runtime_build_rejects_legacy_resource_override() {
-        let executor: Arc<dyn ModelExecutor + Send + Sync> = Arc::new(PlanRuntimeBuilderExecutor {
-            inner: ferrum_testkit::MockModelExecutor::instant(128),
-        });
-        let kv_cache: Arc<dyn KvCacheManager + Send + Sync> =
-            Arc::new(ferrum_testkit::MockKvCacheManager::new(8));
-
-        let error = EngineBuilder::new(EngineConfig::default())
-            .with_custom_executor(executor)
-            .with_custom_kv_cache(kv_cache)
+    async fn builder_preserves_actual_failed_initialization_owner_without_stub_fallback() {
+        use crate::registry::{ComponentFactory, ComponentMetadata};
+        use ferrum_execution::{ExecutorBuildError, ExecutorShutdownPhase};
+        use std::time::Duration;
+        struct FailedFactory(parking_lot::Mutex<Option<ExecutorBuildError>>);
+        #[async_trait::async_trait]
+        impl ComponentFactory<ExecutorOwner, ExecutorBuildError> for FailedFactory {
+            async fn create(
+                &self,
+                _config: &ComponentConfig,
+            ) -> ExecutorBuildResult<ExecutorOwner> {
+                Err(self.0.lock().take().expect("factory is invoked once"))
+            }
+            fn metadata(&self) -> ComponentMetadata {
+                ComponentMetadata::default()
+            }
+        }
+        let (original, probe) =
+            ferrum_execution::driver::test_support::shutdown::failed_initialization_build_error(1);
+        let original_message = original.cause().to_string();
+        let registry = Arc::new(ComponentRegistry::new());
+        registry.register_executor_factory(
+            "failed-original",
+            Arc::new(FailedFactory(parking_lot::Mutex::new(Some(original)))),
+        );
+        let error = EngineBuilder::with_registry(EngineConfig::default(), registry)
+            .with_custom_tokenizer(Arc::new(ferrum_testkit::MockTokenizer::new(128)))
+            .with_custom_sampler(Arc::new(ferrum_sampler::GreedySampler))
+            .with_executor("failed-original")
             .build()
             .await
             .err()
-            .expect("plan runtime must reject a legacy KV manager override");
-
-        assert!(error
-            .to_string()
-            .contains("cannot be combined with a legacy engine KV-cache override"));
+            .expect("retained failure cannot become a stub");
+        assert_eq!(error.cause().to_string(), original_message);
+        let mut cleanup = error
+            .cleanup()
+            .expect("factory must preserve original recovery observation")
+            .clone();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while cleanup.snapshot().phase() != ExecutorShutdownPhase::Retained {
+                cleanup.changed().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(probe.snapshot().buffer_drops, 0);
+        assert!(probe.runtime_alive());
+        drop(error);
+        cleanup.retry();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while cleanup.snapshot().phase() != ExecutorShutdownPhase::Retired {
+                cleanup.changed().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            cleanup.snapshot().error().unwrap().to_string(),
+            original_message
+        );
+        probe.wait_for_all_buffer_drops();
+        assert_eq!(probe.snapshot().submissions, 1);
+        assert_eq!(probe.snapshot().synchronizations, 2);
     }
 }

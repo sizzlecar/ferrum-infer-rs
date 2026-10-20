@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "operator": "ferrum.cuda.marlin",
-  "operator_abi_version": "1",
+  "operator_abi_version": "2",
   "backend": "cuda",
   "compute_capabilities": [
     "sm_89"

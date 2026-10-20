@@ -49,6 +49,7 @@ pub(super) fn descriptor(
             include_str!("native_io.rs").as_bytes(),
             include_str!("../vnext_ops.rs").as_bytes(),
             include_str!("native_blocks.rs").as_bytes(),
+            include_str!("native_blocks/linear.rs").as_bytes(),
             include_str!("native_blocks/hadamard.rs").as_bytes(),
             include_str!("native_blocks/weights.rs").as_bytes(),
             crate::ptx::EMBEDDING_LOOKUP.as_bytes(),

@@ -25,6 +25,99 @@ will define their own contracts at the model registration and assembly boundary.
 | `POST /v1/audio/transcriptions` | Removed | Returns HTTP 404. |
 | `POST /v1/audio/speech` | Removed | Returns HTTP 404. |
 
+## Output Limits
+
+`run` and `serve` share these optional `ferrum.toml` settings (shown with defaults):
+
+```toml
+[output]
+max_sessions = 2048
+engine_queue_items = 100
+semantic_bytes_total = 268435456
+semantic_bytes_per_session = 33554432
+queued_bytes_total = 67108864
+encoded_bytes_total = 67108864
+max_event_bytes = 33554432
+
+[tokenizer_decode_cache]
+max_entries = 1000
+max_bytes = 67108864
+```
+
+Output limits must be positive; per-session content and individual encoded events
+must fit their respective per-engine shared pools. Generated history, completion results,
+cached assistant messages and CLI history retain their content credit until their
+last owner is dropped. A session means one inference output, not a conversation:
+retaining several turns can occupy several sessions. Exhausted session capacity
+rejects new requests before model admission. Persistent content growth fails
+explicitly when full; slow wire consumers pause their own generation. Each session
+has one separate error allowance of at most 1 KiB.
+
+Semantic limits count logical retained payload; queued/encoded limits count wire
+content. Each tokenizer instance has its own token-ID plus UTF-8 cache byte limit;
+either cache limit set to zero disables caching. Oversized entries use ordinary
+decoding without entering the cache. These limits exclude tokenizer/parser scratch,
+allocation capacity/overhead and transport buffers, so they are not a process-memory
+limit. Library callers configure `EngineConfig.output` and
+`EngineConfig.model.tokenizer.decode_cache`; borrow `InferenceOutput::response()`
+or `OutputChunk::chunk()`. Cloning `InferenceOutput` shares its content and credit.
+
+## Profile Delivery Limits
+
+`run` and `serve` share optional journal limits in `ferrum.toml` (defaults shown):
+
+```toml
+[profile_journal]
+queue_capacity = 256
+payload_capacity_bytes = 16777216
+max_record_bytes = 1048576
+max_batch_bytes = 4194304
+max_batch_records = 1024
+```
+
+Limits apply per physical journal. Values must be positive, with
+`max_record_bytes <= max_batch_bytes <= payload_capacity_bytes`. Record sizes
+include the trailing newline; batches are accepted or rejected whole. The payload
+budget covers measured JSONL bytes retained by nonblocking delivery, including
+active writer work. It excludes object/allocation overhead and is not an RSS limit.
+Startup/shutdown profile records use the same bounded queue. Explicit shutdown
+waits for the original writer to flush and finish.
+
+Explicit settings for a shared journal path must match. Library callers use
+`EngineConfig.runtime.profile_journal` and `ServerConfig.profile_journal`.
+Library components sharing a file take separate producer scopes from one
+`JsonlJournalOwner`, through `EngineBuilder::with_journal_scopes` and
+`AxumServer::with_journal_scopes`. Each component finishes its own scope; the
+owner closes the file after all scopes and final records finish. Opening a second
+independent owner for the same live file is a configuration error. Check both the
+close result and the returned receipt's `result()` for writer failures.
+Optional telemetry loss is reported without replaying inference. Replay, Verify
+and Full require complete evidence; configuration, encoding and internal contract
+failures are never treated as optional delivery loss.
+
+`run` and `serve --profile-detail off --profile-jsonl ...` write the standard
+`FerrumProfileEvent` product schema through those same bounded journals. Off
+keeps device timing and detailed execution facts disabled; explicit artifacts
+still contain startup, request/output and close observations. Aliased profile
+and scheduler paths share one writer and producer scopes.
+
+Serve's `--profile-commit-sha`, `--profile-env-hash`, `--profile-model`,
+`--profile-concurrency` and `--profile-runtime-flags-json` are preserved as
+`declared_metadata` in one `product_session_metadata` event per invocation.
+These labels do not override actual model identity, execution geometry or
+capacity. The environment-only versions of these metadata controls and the old
+process-global profiler/trace switches are rejected, including explicitly
+forced-off values. Historical native-profile files remain readable by the
+historical parser; new product artifacts do not use that schema.
+
+The optional Engine batch diagnostic (`runtime.batch_decode_prof`) writes
+`iter_prof` and `stream_ttft_prof` through its own instance sink when a typed
+journal is configured. First-text duration retains the original request ingress
+anchor and ends when the Engine commits nonempty text to output. It is not
+client-observed SSE latency. Retired legacy per-operator/graph/Marlin/MoE
+profiling switches do not implicitly enable detailed profiles on the retained
+executor.
+
 ## Model Capacity
 
 For loaded language models, each model card includes `max_model_len` when the
@@ -135,7 +228,8 @@ internal aliases are never part of the public Responses contract.
 Streaming uses typed Responses lifecycle events with contiguous sequence numbers.
 It emits the applicable semantic terminal event (`response.completed`,
 `response.incomplete`, or `response.failed`) and then the transport sentinel
-`[DONE]`.
+`[DONE]`. If an event exceeds the encoding limit, the stream instead ends with
+`response.failed` and no `[DONE]`.
 
 Ferrum does not store Response objects. Requests for `store=true`,
 `previous_response_id`, conversations, background execution, built-in tools, or

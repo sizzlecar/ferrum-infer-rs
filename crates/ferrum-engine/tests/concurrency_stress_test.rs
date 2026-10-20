@@ -1,33 +1,28 @@
-//! Concurrency stress tests: 32/64 concurrent, preemption, mixed lengths.
+//! Concurrency tests: queued requests, mixed lengths, and streaming completion.
 //!
 //! Uses mock executor with zero latency for fast execution.
 
 use ferrum_engine::{ContinuousBatchEngine, LlmInferenceEngine};
 use ferrum_scheduler::implementations::ContinuousBatchScheduler;
-use ferrum_testkit::{
-    MockKvCacheManager, MockModelExecutor, MockSampler, MockTensorFactory, MockTokenizer,
-};
+use ferrum_testkit::{MockModelExecutor, MockSampler, MockTokenizer};
 use ferrum_types::{FinishReason, InferenceRequest, SchedulerConfig};
 use std::sync::Arc;
 
 const VOCAB: usize = 1000;
 
-fn make_engine_with_blocks(max_blocks: usize) -> ContinuousBatchEngine {
+fn make_engine() -> ContinuousBatchEngine {
     let config = ferrum_types::EngineConfig::default();
     let scheduler = Arc::new(ContinuousBatchScheduler::new(SchedulerConfig::default()));
     let tokenizer = Arc::new(MockTokenizer::new(VOCAB));
     let sampler = Arc::new(MockSampler);
-    let kv_cache = Arc::new(MockKvCacheManager::new(max_blocks));
-    let executor = Arc::new(MockModelExecutor::instant(VOCAB));
-    let tensor_factory = Arc::new(MockTensorFactory);
+    let executor = MockModelExecutor::instant(VOCAB);
+
     ContinuousBatchEngine::new(
         config,
         scheduler,
         tokenizer,
         sampler,
-        kv_cache,
-        executor,
-        tensor_factory,
+        ferrum_execution::executor_lifecycle::ExecutorOwner::new(Box::new(executor)),
     )
     .expect("legacy engine composition must match executor authority")
 }
@@ -41,7 +36,7 @@ fn make_request(id: usize, max_tokens: usize) -> InferenceRequest {
 
 #[tokio::test]
 async fn concurrent_32_all_complete() {
-    let engine = Arc::new(make_engine_with_blocks(4096));
+    let engine = Arc::new(make_engine());
     let mut handles = Vec::new();
 
     for i in 0..32 {
@@ -54,7 +49,7 @@ async fn concurrent_32_all_complete() {
     let mut completed = 0;
     for h in handles {
         let resp = h.await.unwrap().unwrap();
-        assert_eq!(resp.finish_reason, FinishReason::Length);
+        assert_eq!(resp.response().finish_reason, FinishReason::Length);
         completed += 1;
     }
     assert_eq!(completed, 32);
@@ -62,7 +57,7 @@ async fn concurrent_32_all_complete() {
 
 #[tokio::test]
 async fn concurrent_64_all_complete() {
-    let engine = Arc::new(make_engine_with_blocks(8192));
+    let engine = Arc::new(make_engine());
     let mut handles = Vec::new();
 
     for i in 0..64 {
@@ -72,29 +67,16 @@ async fn concurrent_64_all_complete() {
         ));
     }
 
-    let mut completed = 0;
     for h in handles {
-        match h.await.unwrap() {
-            Ok(resp) => {
-                assert!(!resp.tokens.is_empty());
-                completed += 1;
-            }
-            Err(e) => {
-                // Preemption/retry is OK, outright crash is not
-                tracing::warn!("Request failed (acceptable under pressure): {e}");
-            }
-        }
+        let resp = h.await.unwrap().expect("queued request must complete");
+        assert_eq!(resp.response().finish_reason, FinishReason::Length);
+        assert_eq!(resp.response().tokens.len(), 3);
     }
-    // At least 90% should complete even under pressure
-    assert!(
-        completed >= 57, // 90% of 64
-        "only {completed}/64 completed"
-    );
 }
 
 #[tokio::test]
 async fn concurrent_mixed_lengths() {
-    let engine = Arc::new(make_engine_with_blocks(4096));
+    let engine = Arc::new(make_engine());
     let mut handles = Vec::new();
 
     for i in 0..16 {
@@ -107,7 +89,7 @@ async fn concurrent_mixed_lengths() {
 
     for h in handles {
         let resp = h.await.unwrap().unwrap();
-        assert!(!resp.tokens.is_empty());
+        assert!(!resp.response().tokens.is_empty());
     }
 }
 
@@ -115,7 +97,7 @@ async fn concurrent_mixed_lengths() {
 async fn concurrent_streams_16() {
     use futures::StreamExt;
 
-    let engine = Arc::new(make_engine_with_blocks(4096));
+    let engine = Arc::new(make_engine());
     let mut handles = Vec::new();
 
     for i in 0..16 {

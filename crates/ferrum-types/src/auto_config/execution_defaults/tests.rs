@@ -22,7 +22,7 @@ fn builder(hardware: HardwareCapabilities, entries: &[(&str, &str)]) -> FerrumCo
         |(key, value)| RuntimeConfigEntry::new(*key, *value, RuntimeConfigSource::Cli),
     )))
     .with_hardware_capabilities(hardware)
-    .with_execution_resource_authority(ExecutionResourceAuthority::PlanRuntime)
+    .with_execution_planning_model(ExecutionPlanningModel::CompiledPlan)
 }
 
 fn engine(resolved: &ResolvedFerrumConfig) -> crate::EngineConfig {
@@ -213,7 +213,7 @@ fn cuda_execution_defaults_preserve_explicit_opt_outs_and_provenance() {
         );
         let resolved = FerrumConfigBuilder::new(requested)
             .with_hardware_capabilities(cuda())
-            .with_execution_resource_authority(ExecutionResourceAuthority::PlanRuntime)
+            .with_execution_planning_model(ExecutionPlanningModel::CompiledPlan)
             .resolve()
             .unwrap();
         let runtime = engine(&resolved).runtime;
@@ -397,12 +397,12 @@ fn cuda_execution_defaults_do_not_change_other_backends_or_legacy() {
         let mut hardware = cuda();
         hardware.backend = backend.into();
         let authority = if backend == "cuda" {
-            ExecutionResourceAuthority::LegacyEngine
+            ExecutionPlanningModel::ExecutorManaged
         } else {
-            ExecutionResourceAuthority::PlanRuntime
+            ExecutionPlanningModel::CompiledPlan
         };
         let resolved = builder(hardware, &[])
-            .with_execution_resource_authority(authority)
+            .with_execution_planning_model(authority)
             .resolve()
             .unwrap();
         let runtime = engine(&resolved).runtime;
@@ -489,7 +489,7 @@ fn cuda_execution_defaults_do_not_hide_explicit_incompatibilities() {
     assert!(matches!(
         FerrumConfigBuilder::new(requested)
             .with_hardware_capabilities(cuda())
-            .with_execution_resource_authority(ExecutionResourceAuthority::PlanRuntime)
+            .with_execution_planning_model(ExecutionPlanningModel::CompiledPlan)
             .resolve(),
         Err(AutoConfigError::InvalidOverride { .. })
     ));

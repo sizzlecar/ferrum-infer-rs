@@ -18,29 +18,28 @@ use async_trait::async_trait;
 use axum::{
     extract::{rejection::JsonRejection, State},
     http::{HeaderMap, StatusCode as AxumStatusCode},
-    response::{sse::Event, IntoResponse, Response, Sse},
+    response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
-};
-use ferrum_bench_core::{
-    BenchmarkRequestCorrelation, BENCHMARK_CELL_ID_HEADER, BENCHMARK_PHASE_HEADER,
-    BENCHMARK_REPEAT_INDEX_HEADER, BENCHMARK_REQUEST_INDEX_HEADER, BENCHMARK_RUN_ID_HEADER,
 };
 use ferrum_interfaces::{adapter::AdapterExecutionSupport, engine::LlmInferenceEngine};
 use ferrum_types::{
     has_unclosed_model_reasoning_block, model_reasoning_markers,
     parse_harmony_response_for_finish_reason, parse_model_reasoning_response,
-    should_defer_model_reasoning_stream_delta, EngineMetrics, EngineStatus,
-    ExecutionResourceAuthority, FerrumConfigBuilder, FerrumError as Error, FerrumProfileEvent,
-    FinishReason, InferenceExecutionEvidence, InferenceRequest, InferenceResponse, ModelId,
-    ModelOutputProtocol, NativeChatOutputProjector, ParsedReasoningResponse, Priority,
-    ProcessMemoryObservation, ProcessMemorySample, ProcessMemorySampler, ProfileEntrypoint,
-    ProfileError, ProfileEventKind, ProfileStatus, ReplayReference, RequestId,
-    ResolvedFerrumConfig, ResourceAction, ResourceTraceEvent, ResponseCompletionBoundary,
-    RuntimeConfigSnapshot, SamplingParams, StructuredOutputStart, TokenId, TokenUsage,
-    DEFAULT_CHAT_REPETITION_PENALTY, DEFAULT_MAX_TOKENS_METADATA_KEY,
-    OBSERVABILITY_PROFILE_SCHEMA_VERSION, PROMPT_OPENED_REASONING_METADATA_KEY, THINK_END_TAG,
-    THINK_START_TAG,
+    should_defer_model_reasoning_stream_delta, EngineMetrics, EngineStatus, FerrumConfigBuilder,
+    FerrumError as Error, FerrumProfileEvent, FinishReason, InferenceExecutionEvidence,
+    InferenceRequest, InferenceResponse, ModelId, ModelOutputProtocol, ParsedReasoningResponse,
+    Priority, ProcessMemoryObservation, ProcessMemorySample, ProcessMemorySampler,
+    ProfileEntrypoint, ProfileError, ProfileEventKind, ProfileStatus, ReplayReference, RequestId,
+    RequestIngressAnchor, RequestIngressBoundary, ResolvedFerrumConfig, ResourceAction,
+    ResourceTraceEvent, ResponseCompletionBoundary, RuntimeConfigSnapshot, SamplingParams,
+    StructuredOutputStart, TokenId, TokenUsage, DEFAULT_CHAT_REPETITION_PENALTY,
+    DEFAULT_MAX_TOKENS_METADATA_KEY, OBSERVABILITY_PROFILE_SCHEMA_VERSION,
+    PROMPT_OPENED_REASONING_METADATA_KEY, THINK_END_TAG, THINK_START_TAG,
+};
+use ferrum_types::{
+    BenchmarkRequestCorrelation, BENCHMARK_CELL_ID_HEADER, BENCHMARK_PHASE_HEADER,
+    BENCHMARK_REPEAT_INDEX_HEADER, BENCHMARK_REQUEST_INDEX_HEADER, BENCHMARK_RUN_ID_HEADER,
 };
 use sha2::{Digest, Sha256};
 use std::{
@@ -52,16 +51,23 @@ use std::{
         atomic::{AtomicBool, Ordering},
         Arc, Mutex, OnceLock,
     },
-    time::Instant,
 };
-use tokio::sync::{mpsc, Notify};
+use tokio::sync::Notify;
 use tokio_stream::StreamExt;
 use tower::ServiceBuilder;
 use tower_http::{cors::CorsLayer, trace::TraceLayer};
 use tracing::{debug, error, info, span, warn, Level};
 use uuid::Uuid;
 
+mod chat_stream;
+mod output;
+mod profile_delivery;
 mod responses;
+
+use profile_delivery::HttpProfileDelivery;
+pub use profile_delivery::{
+    HttpJournalScopes, HttpProfileDeliveryReport, HttpProfileJournalReport,
+};
 
 const DEFAULT_SAMPLING_TEMPERATURE: f32 = 0.0;
 const DEFAULT_SAMPLING_TOP_P: f32 = 1.0;
@@ -90,7 +96,6 @@ pub fn default_chat_sampling_params() -> SamplingParams {
 
 #[derive(Debug, Clone)]
 struct CachePolicy {
-    prefix_cache_enabled: bool,
     session_cache_mode: String,
     session_cache_max_entries: usize,
     session_cache_max_tokens: usize,
@@ -99,10 +104,6 @@ struct CachePolicy {
 impl CachePolicy {
     fn current() -> Self {
         Self {
-            prefix_cache_enabled: env_bool("FERRUM_PREFIX_CACHE_PRODUCT")
-                .or_else(|| env_bool("FERRUM_PREFIX_CACHE_REQUESTED"))
-                .or_else(|| env_bool("FERRUM_PREFIX_CACHE"))
-                .unwrap_or(false),
             session_cache_mode: std::env::var("FERRUM_SESSION_CACHE")
                 .unwrap_or_else(|_| "off".to_string())
                 .to_ascii_lowercase(),
@@ -113,14 +114,6 @@ impl CachePolicy {
 
     fn session_memory_enabled(&self) -> bool {
         self.session_cache_mode == "memory"
-    }
-}
-
-fn env_bool(key: &str) -> Option<bool> {
-    match std::env::var(key).ok()?.to_ascii_lowercase().as_str() {
-        "1" | "true" | "yes" | "on" => Some(true),
-        "0" | "false" | "no" | "off" => Some(false),
-        _ => None,
     }
 }
 
@@ -165,6 +158,19 @@ struct AxumServerLifecycle {
     shutdown_notify: Notify,
     stopped_notify: Notify,
     stop_lock: tokio::sync::Mutex<()>,
+    engine_shutdown: tokio::sync::Mutex<LoadedEngineShutdown>,
+    engine_shutdown_error: Mutex<Option<ferrum_types::FerrumError>>,
+    profile_detail: Mutex<Option<ferrum_types::ObservabilityProfileDetail>>,
+    profile_delivery: Mutex<Option<Arc<HttpProfileDelivery>>>,
+    profile_scopes: Mutex<Option<HttpJournalScopes>>,
+}
+
+#[derive(Default)]
+enum LoadedEngineShutdown {
+    #[default]
+    Idle,
+    Running(tokio::task::JoinHandle<ferrum_types::Result<()>>),
+    Finished(ferrum_types::Result<()>),
 }
 
 impl AxumServerLifecycle {
@@ -174,14 +180,22 @@ impl AxumServerLifecycle {
     }
 
     async fn wait_for_shutdown(&self) {
-        while !self.shutdown_requested.load(Ordering::Acquire) {
-            self.shutdown_notify.notified().await;
+        loop {
+            let notified = self.shutdown_notify.notified();
+            if self.shutdown_requested.load(Ordering::Acquire) {
+                return;
+            }
+            notified.await;
         }
     }
 
     async fn wait_until_stopped(&self) {
-        while self.running.load(Ordering::Acquire) {
-            self.stopped_notify.notified().await;
+        loop {
+            let notified = self.stopped_notify.notified();
+            if !self.running.load(Ordering::Acquire) {
+                return;
+            }
+            notified.await;
         }
     }
 }
@@ -281,11 +295,135 @@ impl AxumServer {
         Ok(self)
     }
 
-    async fn shutdown_loaded_engines(&self) -> ferrum_types::Result<()> {
-        let mut first_error = None;
-        if let Some(engine) = &self.state.llm {
-            if let Err(error) = engine.shutdown().await {
-                first_error = Some(error);
+    async fn shutdown_loaded_engines(&self, wait_for_completion: bool) -> ferrum_types::Result<()> {
+        let first_result = {
+            let mut state = self.lifecycle.engine_shutdown.lock().await;
+            if matches!(*state, LoadedEngineShutdown::Idle) {
+                let engine = self.state.llm.clone();
+                *state = LoadedEngineShutdown::Running(tokio::spawn(async move {
+                    match engine {
+                        Some(engine) => engine.shutdown().await,
+                        None => Ok(()),
+                    }
+                }));
+            }
+            if let LoadedEngineShutdown::Running(task) = &mut *state {
+                let result = task.await.unwrap_or_else(|error| {
+                    Err(Error::internal(format!(
+                        "loaded engine shutdown task failed: {error}"
+                    )))
+                });
+                *state = LoadedEngineShutdown::Finished(result);
+            }
+            let LoadedEngineShutdown::Finished(result) = &*state else {
+                unreachable!("joined original shutdown");
+            };
+            result.clone()
+        };
+        let settled = if wait_for_completion {
+            // Timeouts and earlier errors leave the original operation intact.
+            // Finish observes its terminal cleanup instead of starting it again.
+            match &self.state.llm {
+                Some(engine) => engine.wait_for_shutdown_completion().await,
+                None => Ok(()),
+            }
+        } else {
+            Ok(())
+        };
+        if wait_for_completion || first_result.is_ok() {
+            self.lifecycle
+                .engines_stopped
+                .store(true, Ordering::Release);
+        }
+        let result = first_result.and(settled);
+        if let Err(error) = &result {
+            self.lifecycle
+                .engine_shutdown_error
+                .lock()
+                .unwrap()
+                .get_or_insert_with(|| error.clone());
+        }
+        result
+    }
+
+    /// Finish the original shutdown without abandoning its waits at a timeout.
+    /// A caller may time out an observation of this future and then continue
+    /// awaiting the same future; no second cleanup task or journal is created.
+    pub async fn finish_stop(&self) -> ferrum_types::Result<()> {
+        self.stop_inner(None).await
+    }
+
+    async fn stop_inner(&self, timeout: Option<std::time::Duration>) -> ferrum_types::Result<()> {
+        let _stop_guard = self.lifecycle.stop_lock.lock().await;
+        info!("Stopping Axum server");
+        self.lifecycle.request_shutdown();
+
+        let mut first_error = self.lifecycle.engine_shutdown_error.lock().unwrap().clone();
+        if self.lifecycle.running.load(Ordering::Acquire) {
+            if let Some(timeout) = timeout {
+                if tokio::time::timeout(timeout, self.lifecycle.wait_until_stopped())
+                    .await
+                    .is_err()
+                {
+                    first_error.get_or_insert_with(|| {
+                        Error::internal(format!(
+                            "Axum server did not drain within {} ms",
+                            timeout.as_millis()
+                        ))
+                    });
+                }
+            } else {
+                self.lifecycle.wait_until_stopped().await;
+            }
+        }
+
+        if !self.lifecycle.engines_stopped.load(Ordering::Acquire) {
+            let result = match timeout {
+                Some(timeout) => {
+                    match tokio::time::timeout(timeout, self.shutdown_loaded_engines(false)).await {
+                        Ok(result) => result,
+                        Err(_) => Err(Error::internal(format!(
+                            "engine shutdown did not complete within {} ms",
+                            timeout.as_millis()
+                        ))),
+                    }
+                }
+                None => self.shutdown_loaded_engines(true).await,
+            };
+            match result {
+                Ok(()) => self
+                    .lifecycle
+                    .engines_stopped
+                    .store(true, Ordering::Release),
+                Err(error) => {
+                    if first_error.is_some() {
+                        warn!(%error, "additional engine shutdown failure");
+                    }
+                    first_error.get_or_insert(error);
+                }
+            }
+        }
+
+        // Only drained or never-started HTTP may retire its scopes. An engine
+        // error is independent of this component's publication authority.
+        if !self.lifecycle.running.load(Ordering::Acquire) {
+            let result = match timeout {
+                Some(timeout) => {
+                    match tokio::time::timeout(timeout, self.close_profile_delivery()).await {
+                        Ok(result) => result,
+                        Err(_) => Err(Error::internal(format!(
+                            "HTTP profile journal close did not finish within {} ms",
+                            timeout.as_millis()
+                        ))),
+                    }
+                }
+                None => self.close_profile_delivery().await,
+            };
+            if let Err(error) = result {
+                if first_error.is_some() {
+                    warn!(%error, "additional HTTP profile close failure");
+                }
+                first_error.get_or_insert(error);
             }
         }
         first_error.map_or(Ok(()), Err)
@@ -293,8 +431,9 @@ impl AxumServer {
 
     /// Build the router with all routes
     #[allow(dead_code)]
-    fn build_router(&self) -> Router {
-        self.build_router_with_state(self.state.clone())
+    fn build_router(&self) -> ferrum_types::Result<Router> {
+        let state = self.prepare_profile_state(self.state.clone())?;
+        Ok(self.build_router_with_state(state))
     }
 
     fn build_router_with_state(&self, app_state: AppState) -> Router {
@@ -330,9 +469,14 @@ pub struct AppState {
     pub request_dump_dir: Option<Arc<PathBuf>>,
     pub profile_jsonl: Option<Arc<PathBuf>>,
     pub profile_detail: ferrum_types::ObservabilityProfileDetail,
+    pub profile_journal: ferrum_types::ObservabilityJournalConfig,
     pub memory_profile_jsonl: Option<Arc<PathBuf>>,
     pub first_request_memory_recorded: Arc<AtomicBool>,
+    profile_delivery: Option<Arc<HttpProfileDelivery>>,
     cache: Arc<CacheRuntimeState>,
+    #[cfg(test)]
+    request_construction_observer:
+        Option<Arc<dyn Fn(RequestIngressAnchor, &'static str) + Send + Sync>>,
 }
 
 impl AppState {
@@ -345,18 +489,6 @@ impl AppState {
                 .require_lora()?;
         }
         Ok(())
-    }
-
-    fn record_prefix_prompt(&self, prompt: &str, policy: &CachePolicy) {
-        if self.llm.as_ref().is_some_and(|engine| {
-            engine.execution_resource_authority() == ExecutionResourceAuthority::PlanRuntime
-        }) {
-            // Native cache health already reports actual reuse or an unsupported
-            // plan. The legacy text-LCP estimate would only duplicate full raw
-            // prompts and scan them under a lock, outside the runtime budget.
-            return;
-        }
-        self.cache.record_prefix_prompt(prompt, policy);
     }
 
     pub fn with_llm(mut self, engine: Arc<dyn LlmInferenceEngine + Send + Sync>) -> Self {
@@ -401,6 +533,7 @@ impl AppState {
 
     pub fn with_profile_jsonl(mut self, profile_jsonl: Option<PathBuf>) -> Self {
         self.profile_jsonl = profile_jsonl.map(Arc::new);
+        self.profile_delivery = None;
         self
     }
 
@@ -409,11 +542,22 @@ impl AppState {
         profile_detail: ferrum_types::ObservabilityProfileDetail,
     ) -> Self {
         self.profile_detail = profile_detail;
+        self.profile_delivery = None;
+        self
+    }
+
+    pub fn with_profile_journal(
+        mut self,
+        config: ferrum_types::ObservabilityJournalConfig,
+    ) -> Self {
+        self.profile_journal = config;
+        self.profile_delivery = None;
         self
     }
 
     pub fn with_memory_profile_jsonl(mut self, memory_profile_jsonl: Option<PathBuf>) -> Self {
         self.memory_profile_jsonl = memory_profile_jsonl.map(Arc::new);
+        self.profile_delivery = None;
         self
     }
 
@@ -427,15 +571,7 @@ impl AppState {
             loaded_models: vec![],
             active_requests: 0,
             queued_requests: 0,
-            memory_usage: ferrum_types::MemoryUsage {
-                total_bytes: 0,
-                used_bytes: 0,
-                free_bytes: 0,
-                gpu_memory_bytes: None,
-                cpu_memory_bytes: None,
-                cache_memory_bytes: 0,
-                utilization_percent: 0.0,
-            },
+            memory_usage: ferrum_types::MemoryObservation::Unknown,
             uptime_seconds: 0,
             last_heartbeat: chrono::Utc::now(),
             version: env!("CARGO_PKG_VERSION").to_string(),
@@ -466,18 +602,11 @@ impl AppState {
 #[derive(Default)]
 struct CacheRuntimeState {
     stats: Mutex<CacheStats>,
-    prefix_prompts: Mutex<HashMap<String, usize>>,
-    sessions: Mutex<HashMap<String, Vec<ChatMessage>>>,
+    sessions: Mutex<HashMap<String, Vec<SessionMessage>>>,
 }
 
 #[derive(Debug, Clone, Default)]
 struct CacheStats {
-    prefix_hits: u64,
-    prefix_misses: u64,
-    prefix_evictions: u64,
-    prefix_saved_prefill_tokens: u64,
-    prefix_entries: u64,
-    prefix_bytes: u64,
     session_hits: u64,
     session_misses: u64,
     session_evictions: u64,
@@ -486,55 +615,41 @@ struct CacheStats {
 }
 
 #[derive(Clone)]
+enum SessionMessage {
+    Input(ChatMessage),
+    Assistant(ChatSyncOutput),
+}
+impl SessionMessage {
+    fn message(&self) -> &ChatMessage {
+        match self {
+            Self::Input(message) => message,
+            Self::Assistant(output) => output.value().choices[0]
+                .message
+                .as_ref()
+                .expect("cached assistant message"),
+        }
+    }
+}
+
 struct SessionContext {
     id: String,
-    prior_messages: Vec<ChatMessage>,
+    prior_messages: Vec<SessionMessage>,
     incoming_messages: Vec<ChatMessage>,
+    _request_copies: Vec<ferrum_output::OutputSemanticLease>,
 }
 
 impl CacheRuntimeState {
-    fn record_prefix_prompt(&self, prompt: &str, policy: &CachePolicy) {
-        if !policy.prefix_cache_enabled {
-            return;
-        }
-
-        let prompt_tokens = approx_tokens(prompt);
-        let mut prompts = self.prefix_prompts.lock().expect("prefix cache lock");
-        let saved_tokens = prompts
-            .keys()
-            .map(|seen| approx_tokens_for_chars(longest_common_prefix_chars(seen, prompt)))
-            .max()
-            .unwrap_or(0);
-
-        let mut stats = self.stats.lock().expect("cache stats lock");
-        if saved_tokens > 0 {
-            stats.prefix_hits += 1;
-            stats.prefix_saved_prefill_tokens += saved_tokens as u64;
-        } else {
-            stats.prefix_misses += 1;
-        }
-
-        let max_entries = policy.session_cache_max_entries.max(1);
-        if !prompts.contains_key(prompt) && prompts.len() >= max_entries {
-            if let Some(key) = prompts.keys().next().cloned() {
-                prompts.remove(&key);
-                stats.prefix_evictions += 1;
-            }
-        }
-        prompts.insert(prompt.to_string(), prompt_tokens);
-        stats.prefix_entries = prompts.len() as u64;
-        stats.prefix_bytes = prompts.keys().map(|key| key.len() as u64).sum();
-    }
-
     fn prepare_session_request(
         &self,
         request: &mut ChatCompletionsRequest,
         headers: &HeaderMap,
         policy: &CachePolicy,
-    ) -> Option<SessionContext> {
-        let session_id = request_session_id(headers, request)?;
+    ) -> std::result::Result<Option<SessionContext>, ServerError> {
+        let Some(session_id) = request_session_id(headers, request) else {
+            return Ok(None);
+        };
         if !policy.session_memory_enabled() {
-            return None;
+            return Ok(None);
         }
 
         let incoming_messages = request.messages.clone();
@@ -542,29 +657,45 @@ impl CacheRuntimeState {
             let sessions = self.sessions.lock().expect("session cache lock");
             sessions.get(&session_id).cloned().unwrap_or_default()
         };
+        let mut request_copies = Vec::new();
         {
             let mut stats = self.stats.lock().expect("cache stats lock");
             if prior_messages.is_empty() {
                 stats.session_misses += 1;
             } else {
                 stats.session_hits += 1;
-                let mut merged = prior_messages.clone();
+                let mut merged = Vec::with_capacity(prior_messages.len() + request.messages.len());
+                for prior in &prior_messages {
+                    if let SessionMessage::Assistant(output) = prior {
+                        request_copies.push(
+                            output
+                                .output_session()
+                                .try_reserve_semantic(
+                                    ferrum_output::semantic_cost(prior.message())
+                                        .map_err(server_error_from_ferrum_error)?,
+                                )
+                                .map_err(server_error_from_ferrum_error)?,
+                        );
+                    }
+                    merged.push(prior.message().clone());
+                }
                 merged.extend(request.messages.clone());
                 request.messages = merged;
             }
         }
 
-        Some(SessionContext {
+        Ok(Some(SessionContext {
             id: session_id,
             prior_messages,
             incoming_messages,
-        })
+            _request_copies: request_copies,
+        }))
     }
 
     fn update_session(
         &self,
         context: Option<SessionContext>,
-        assistant_message: ChatMessage,
+        assistant_message: ChatSyncOutput,
         policy: &CachePolicy,
     ) {
         let Some(context) = context else {
@@ -575,8 +706,13 @@ impl CacheRuntimeState {
         }
 
         let mut history = context.prior_messages;
-        history.extend(context.incoming_messages);
-        history.push(assistant_message);
+        history.extend(
+            context
+                .incoming_messages
+                .into_iter()
+                .map(SessionMessage::Input),
+        );
+        history.push(SessionMessage::Assistant(assistant_message));
         trim_messages_to_token_budget(&mut history, policy.session_cache_max_tokens);
 
         let mut sessions = self.sessions.lock().expect("session cache lock");
@@ -599,7 +735,7 @@ impl CacheRuntimeState {
             .map(|messages| {
                 messages
                     .iter()
-                    .map(|msg| approx_tokens(&msg.content))
+                    .map(|msg| approx_tokens(&msg.message().content))
                     .sum::<usize>()
             })
             .sum::<usize>() as u64;
@@ -610,7 +746,6 @@ impl CacheRuntimeState {
 
     fn stats(&self) -> CacheStats {
         let mut stats = self.stats.lock().expect("cache stats lock").clone();
-        stats.prefix_entries = self.prefix_prompts.lock().expect("prefix cache lock").len() as u64;
         let sessions = self.sessions.lock().expect("session cache lock");
         stats.session_entries = sessions.len() as u64;
         stats.session_tokens = sessions
@@ -618,7 +753,7 @@ impl CacheRuntimeState {
             .map(|messages| {
                 messages
                     .iter()
-                    .map(|msg| approx_tokens(&msg.content))
+                    .map(|msg| approx_tokens(&msg.message().content))
                     .sum::<usize>()
             })
             .sum::<usize>() as u64;
@@ -631,39 +766,10 @@ impl CacheRuntimeState {
         engine_prefix_cache: Option<&serde_json::Value>,
     ) -> serde_json::Value {
         let stats = self.stats();
-        let prefix_hits = engine_u64(engine_prefix_cache, "hits").unwrap_or(stats.prefix_hits);
-        let prefix_misses =
-            engine_u64(engine_prefix_cache, "misses").unwrap_or(stats.prefix_misses);
-        let prefix_evictions =
-            engine_u64(engine_prefix_cache, "evictions").unwrap_or(stats.prefix_evictions);
-        let prefix_saved = engine_u64(engine_prefix_cache, "saved_prefill_tokens")
-            .unwrap_or(stats.prefix_saved_prefill_tokens);
-        let prefix_entries =
-            engine_u64(engine_prefix_cache, "entries").unwrap_or(stats.prefix_entries);
-        let prefix_bytes = engine_u64(engine_prefix_cache, "bytes").unwrap_or(stats.prefix_bytes);
-        let mut prefix_cache = serde_json::json!({
-            "enabled": engine_bool(engine_prefix_cache, "enabled").unwrap_or(policy.prefix_cache_enabled),
-            "position": engine_str(engine_prefix_cache, "position").unwrap_or("product-observability"),
-            "source": engine_str(engine_prefix_cache, "source").unwrap_or("server-prompt-lcp-observability"),
-            "entries": prefix_entries,
-            "hits": prefix_hits,
-            "misses": prefix_misses,
-            "evictions": prefix_evictions,
-            "saved_prefill_tokens": prefix_saved,
-            "bytes": prefix_bytes,
-            "block_size": engine_u64(engine_prefix_cache, "block_size"),
-            "kv_dtype": engine_str(engine_prefix_cache, "kv_dtype"),
-        });
-        if let (Some(engine), Some(prefix)) = (
-            engine_prefix_cache.and_then(|value| value.as_object()),
-            prefix_cache.as_object_mut(),
-        ) {
-            for (key, value) in engine {
-                prefix.entry(key.clone()).or_insert_with(|| value.clone());
-            }
-        }
+        // Only the execution owner can observe physical KV reuse. Preserve its
+        // snapshot, including absent or null fields, without text-based estimates.
         serde_json::json!({
-            "prefix_cache": prefix_cache,
+            "prefix_cache": engine_prefix_cache,
             "session_cache": {
                 "mode": policy.session_cache_mode,
                 "entries": stats.session_entries,
@@ -679,55 +785,42 @@ impl CacheRuntimeState {
 
     fn prometheus_metrics(&self, engine_prefix_cache: Option<&serde_json::Value>) -> String {
         let stats = self.stats();
-        let prefix_hits = engine_u64(engine_prefix_cache, "hits").unwrap_or(stats.prefix_hits);
-        let prefix_misses =
-            engine_u64(engine_prefix_cache, "misses").unwrap_or(stats.prefix_misses);
-        let prefix_evictions =
-            engine_u64(engine_prefix_cache, "evictions").unwrap_or(stats.prefix_evictions);
-        let prefix_saved = engine_u64(engine_prefix_cache, "saved_prefill_tokens")
-            .unwrap_or(stats.prefix_saved_prefill_tokens);
-        let prefix_entries =
-            engine_u64(engine_prefix_cache, "entries").unwrap_or(stats.prefix_entries);
-        let prefix_bytes = engine_u64(engine_prefix_cache, "bytes").unwrap_or(stats.prefix_bytes);
-        format!(
+        let mut output = String::new();
+        for (field, metric) in [
+            ("hits", "ferrum_prefix_cache_hits_total"),
+            ("misses", "ferrum_prefix_cache_misses_total"),
+            ("evictions", "ferrum_prefix_cache_evictions_total"),
+            (
+                "saved_prefill_tokens",
+                "ferrum_prefix_cache_saved_prefill_tokens_total",
+            ),
+            ("entries", "ferrum_prefix_cache_entries"),
+            ("bytes", "ferrum_prefix_cache_bytes"),
+        ] {
+            if let Some(value) = engine_u64(engine_prefix_cache, field) {
+                output.push_str(&format!("{metric} {value}\n"));
+            }
+        }
+        output.push_str(&format!(
             concat!(
-                "ferrum_prefix_cache_hits_total {}\n",
-                "ferrum_prefix_cache_misses_total {}\n",
-                "ferrum_prefix_cache_evictions_total {}\n",
-                "ferrum_prefix_cache_saved_prefill_tokens_total {}\n",
-                "ferrum_prefix_cache_entries {}\n",
-                "ferrum_prefix_cache_bytes {}\n",
                 "ferrum_session_cache_hits_total {}\n",
                 "ferrum_session_cache_misses_total {}\n",
                 "ferrum_session_cache_evictions_total {}\n",
                 "ferrum_session_cache_entries {}\n",
                 "ferrum_session_cache_tokens {}\n"
             ),
-            prefix_hits,
-            prefix_misses,
-            prefix_evictions,
-            prefix_saved,
-            prefix_entries,
-            prefix_bytes,
             stats.session_hits,
             stats.session_misses,
             stats.session_evictions,
             stats.session_entries,
             stats.session_tokens,
-        )
+        ));
+        output
     }
 }
 
 fn engine_u64(snapshot: Option<&serde_json::Value>, key: &str) -> Option<u64> {
     snapshot?.get(key)?.as_u64()
-}
-
-fn engine_bool(snapshot: Option<&serde_json::Value>, key: &str) -> Option<bool> {
-    snapshot?.get(key)?.as_bool()
-}
-
-fn engine_str<'a>(snapshot: Option<&'a serde_json::Value>, key: &str) -> Option<&'a str> {
-    snapshot?.get(key)?.as_str()
 }
 
 fn auto_config_health_value(auto_config: Option<&ResolvedFerrumConfig>) -> serde_json::Value {
@@ -795,7 +888,7 @@ fn admission_health_json(
         "runtime_snapshot_available": runtime_snapshot.is_some(),
         "runtime_contract_error": runtime_error,
         "resource_authority": runtime_snapshot
-            .and_then(|snapshot| serde_json::to_value(snapshot.resource_authority()).ok())
+            .and_then(|snapshot| serde_json::to_value(snapshot.planning_model()).ok())
             .unwrap_or(serde_json::Value::Null),
         "effective_max_concurrent": effective_max_concurrent,
         "maximum_active_sequences": runtime_snapshot
@@ -965,16 +1058,12 @@ fn approx_tokens_for_chars(chars: usize) -> usize {
     (chars / 4).max(1)
 }
 
-fn longest_common_prefix_chars(a: &str, b: &str) -> usize {
-    a.chars().zip(b.chars()).take_while(|(a, b)| a == b).count()
-}
-
-fn trim_messages_to_token_budget(messages: &mut Vec<ChatMessage>, max_tokens: usize) {
+fn trim_messages_to_token_budget(messages: &mut Vec<SessionMessage>, max_tokens: usize) {
     let max_tokens = max_tokens.max(1);
     while messages.len() > 1
         && messages
             .iter()
-            .map(|msg| approx_tokens(&msg.content))
+            .map(|msg| approx_tokens(&msg.message().content))
             .sum::<usize>()
             > max_tokens
     {
@@ -985,11 +1074,23 @@ fn trim_messages_to_token_budget(messages: &mut Vec<ChatMessage>, max_tokens: us
 #[async_trait]
 impl HttpServer for AxumServer {
     async fn start(&self, config: &ServerConfig) -> ferrum_types::Result<()> {
+        // Publish start before stop can decide HTTP is drained. The guard is
+        // released before profile assembly, bind, and serving: shutdown never
+        // waits for a running task that needs this same lock to make progress.
+        let start_guard = self.lifecycle.stop_lock.lock().await;
         if self.lifecycle.shutdown_requested.load(Ordering::Acquire) {
             return Err(Error::internal(
                 "cannot start Axum server after shutdown was requested",
             ));
         }
+        if self.lifecycle.running.load(Ordering::Acquire) {
+            return Err(Error::internal("Axum server is already running"));
+        }
+        *self
+            .lifecycle
+            .profile_detail
+            .lock()
+            .expect("HTTP selected profile detail") = Some(config.profile_detail);
         self.state.validate_lora_execution_support(
             self.state.served_model_registry.adapter_count() > 0,
         )?;
@@ -1000,17 +1101,20 @@ impl HttpServer for AxumServer {
         let _run_guard = AxumServerRunGuard {
             lifecycle: Arc::clone(&self.lifecycle),
         };
+        drop(start_guard);
         let addr = format!("{}:{}", config.host, config.port);
         info!("Starting Axum server on {}", addr);
 
-        let app = self.build_router_with_state(
+        let state = self.prepare_profile_state(
             self.state
                 .clone()
                 .with_request_dump_dir(config.request_dump_dir.clone())
                 .with_profile_jsonl(config.profile_jsonl.clone())
                 .with_profile_detail(config.profile_detail)
+                .with_profile_journal(config.profile_journal.clone())
                 .with_memory_profile_jsonl(config.memory_profile_jsonl.clone()),
-        );
+        )?;
+        let app = self.build_router_with_state(state);
         let listener = tokio::net::TcpListener::bind(&addr)
             .await
             .map_err(|e| Error::internal(format!("Failed to bind to {}: {}", addr, e)))?;
@@ -1027,47 +1131,7 @@ impl HttpServer for AxumServer {
     }
 
     async fn stop(&self, timeout: std::time::Duration) -> ferrum_types::Result<()> {
-        let _stop_guard = self.lifecycle.stop_lock.lock().await;
-        info!("Stopping Axum server");
-        self.lifecycle.request_shutdown();
-
-        let mut first_error = None;
-        if self.lifecycle.running.load(Ordering::Acquire) {
-            if tokio::time::timeout(timeout, self.lifecycle.wait_until_stopped())
-                .await
-                .is_err()
-            {
-                first_error = Some(Error::internal(format!(
-                    "Axum server did not drain within {} ms",
-                    timeout.as_millis()
-                )));
-            }
-        }
-
-        if !self.lifecycle.engines_stopped.load(Ordering::Acquire) {
-            match tokio::time::timeout(timeout, self.shutdown_loaded_engines()).await {
-                Ok(Ok(())) => {
-                    self.lifecycle
-                        .engines_stopped
-                        .store(true, Ordering::Release);
-                }
-                Ok(Err(error)) => {
-                    if first_error.is_none() {
-                        first_error = Some(error);
-                    }
-                }
-                Err(_) => {
-                    if first_error.is_none() {
-                        first_error = Some(Error::internal(format!(
-                            "engine shutdown did not complete within {} ms",
-                            timeout.as_millis()
-                        )));
-                    }
-                }
-            }
-        }
-
-        first_error.map_or(Ok(()), Err)
+        self.stop_inner(Some(timeout)).await
     }
 
     fn is_running(&self) -> bool {
@@ -1114,7 +1178,11 @@ impl HttpServer for AxumServer {
     }
 
     async fn health_check(&self) -> HealthStatus {
-        HealthStatus::Healthy
+        match self.profile_delivery_report() {
+            Some(report) if report.required_error.is_some() => HealthStatus::Unhealthy,
+            Some(report) if report.is_degraded() => HealthStatus::Degraded,
+            _ => HealthStatus::Healthy,
+        }
     }
 }
 
@@ -1124,15 +1192,40 @@ async fn chat_completions_handler(
     headers: HeaderMap,
     request: std::result::Result<Json<ChatCompletionsRequest>, JsonRejection>,
 ) -> std::result::Result<Response, ServerError> {
-    chat_completions_handler_with_phases(State(state), headers, request, None).await
+    let ingress = RequestIngressAnchor::capture(RequestIngressBoundary::HttpHandler);
+    chat_completions_handler_with_phases(State(state), headers, request, None, ingress).await
 }
 
 async fn chat_completions_handler_with_phases(
     State(state): State<AppState>,
     headers: HeaderMap,
     request: std::result::Result<Json<ChatCompletionsRequest>, JsonRejection>,
-    mut message_phases: Option<Vec<Option<AssistantMessagePhase>>>,
+    message_phases: Option<Vec<Option<AssistantMessagePhase>>>,
+    ingress: RequestIngressAnchor,
 ) -> std::result::Result<Response, ServerError> {
+    chat_completions_handler_with_projection(
+        State(state),
+        headers,
+        request,
+        message_phases,
+        None,
+        ingress,
+    )
+    .await
+}
+
+async fn chat_completions_handler_with_projection(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    request: std::result::Result<Json<ChatCompletionsRequest>, JsonRejection>,
+    mut message_phases: Option<Vec<Option<AssistantMessagePhase>>>,
+    response_context: Option<responses::ResponseContext>,
+    ingress: RequestIngressAnchor,
+) -> std::result::Result<Response, ServerError> {
+    #[cfg(test)]
+    if let Some(observer) = &state.request_construction_observer {
+        observer(ingress, "chat_session_and_prompt");
+    }
     let Json(mut request) = request.map_err(|error| {
         ServerError::invalid_request(
             format!(
@@ -1155,7 +1248,7 @@ async fn chat_completions_handler_with_phases(
     let session_context =
         state
             .cache
-            .prepare_session_request(&mut request, &headers, &cache_policy);
+            .prepare_session_request(&mut request, &headers, &cache_policy)?;
     if let Some(phases) = &mut message_phases {
         let prepended = request
             .messages
@@ -1194,6 +1287,7 @@ async fn chat_completions_handler_with_phases(
         message_phases.as_deref(),
     )
     .map_err(server_error_from_ferrum_error)?;
+    inference_request.ingress = Some(ingress);
     apply_served_model_resolution(&mut inference_request, engine_model_id, lora_adapter);
     if state.request_dump_dir.is_some() {
         inference_request.evidence_request.capture_prompt_token_ids = true;
@@ -1201,7 +1295,6 @@ async fn chat_completions_handler_with_phases(
     inference_request
         .evidence_request
         .capture_engine_token_timing = state.profile_detail.captures_engine_token_timing();
-    state.record_prefix_prompt(&inference_request.prompt, &cache_policy);
     if let Err(err) =
         write_chat_request_replay_bundle(&state, &headers, &request, &inference_request)
     {
@@ -1210,17 +1303,31 @@ async fn chat_completions_handler_with_phases(
 
     // Check if streaming is requested
     if request.stream.unwrap_or(false) {
-        handle_chat_completions_stream(state, request, inference_request, benchmark_correlation)
-            .await
+        handle_chat_completions_stream(
+            state,
+            request,
+            inference_request,
+            benchmark_correlation,
+            response_context,
+            session_context,
+        )
+        .await
     } else {
-        handle_chat_completions_sync(
+        let output = handle_chat_completions_sync(
             state,
             request,
             inference_request,
             session_context,
             benchmark_correlation,
         )
-        .await
+        .await?;
+        if let Some(context) = response_context {
+            responses::adapt_chat_sync(output, context).await
+        } else {
+            output::json_response(output.output_session(), output.value())
+                .await
+                .map_err(server_error_from_ferrum_error)
+        }
     }
 }
 
@@ -1492,16 +1599,16 @@ fn write_chat_request_profile_event(
     model: &str,
     stream: bool,
     phase: &str,
-    started_at: Instant,
+    started_at: RequestIngressAnchor,
     timing: ChatRequestProfileTiming<'_>,
     output_token_count: usize,
     usage: Option<&TokenUsage>,
     finish_reason: Option<&str>,
     error: Option<ProfileError>,
 ) -> std::result::Result<(), String> {
-    let Some(path) = state.profile_jsonl.as_ref() else {
+    if state.profile_jsonl.is_none() {
         return Ok(());
-    };
+    }
     let timestamp = chrono::Utc::now();
     let status = if error.is_some() {
         ProfileStatus::Failure
@@ -1522,6 +1629,16 @@ fn write_chat_request_profile_event(
         (
             "e2e_duration_us".to_string(),
             serde_json::json!(duration_us),
+        ),
+        (
+            "request_start_boundary".to_string(),
+            serde_json::json!(started_at.boundary().as_str()),
+        ),
+        (
+            "request_start_excludes".to_string(),
+            serde_json::json!(
+                "body reception, JSON extraction, network transport and client-visible latency"
+            ),
         ),
         ("l0_only".to_string(), serde_json::json!(false)),
         (
@@ -1672,7 +1789,7 @@ fn write_chat_request_profile_event(
         backend_detail: None,
         attributes,
     };
-    append_profile_event(path.as_path(), &event)
+    append_profile_event(state, event, false)
 }
 
 fn maybe_write_first_request_memory_stage(
@@ -1681,7 +1798,7 @@ fn maybe_write_first_request_memory_stage(
     benchmark_correlation: Option<&BenchmarkRequestCorrelation>,
     model: &str,
     stream: bool,
-    started_at: Instant,
+    started_at: RequestIngressAnchor,
     before: Option<ProcessMemorySample>,
 ) -> std::result::Result<(), String> {
     if state.profile_jsonl.is_none() && state.memory_profile_jsonl.is_none() {
@@ -1711,6 +1828,14 @@ fn maybe_write_first_request_memory_stage(
         (
             "memory_stage".to_string(),
             serde_json::json!("first_request_done"),
+        ),
+        (
+            "request_start_boundary".to_string(),
+            serde_json::json!(started_at.boundary().as_str()),
+        ),
+        (
+            "memory_before_boundary".to_string(),
+            serde_json::json!("before_engine_call_after_request_preparation"),
         ),
         (
             "profile_detail".to_string(),
@@ -1780,13 +1905,7 @@ fn maybe_write_first_request_memory_stage(
         backend_detail: None,
         attributes,
     };
-    if let Some(path) = &state.profile_jsonl {
-        append_profile_event(path.as_path(), &event)?;
-    }
-    if let Some(path) = &state.memory_profile_jsonl {
-        append_profile_event(path.as_path(), &event)?;
-    }
-    Ok(())
+    append_profile_event(state, event, true)
 }
 
 fn request_memory_sample_before(state: &AppState) -> Option<ProcessMemorySample> {
@@ -1796,20 +1915,21 @@ fn request_memory_sample_before(state: &AppState) -> Option<ProcessMemorySample>
 }
 
 fn append_profile_event(
-    path: &Path,
-    event: &FerrumProfileEvent,
+    state: &AppState,
+    event: FerrumProfileEvent,
+    include_memory: bool,
 ) -> std::result::Result<(), String> {
-    event.validate().map_err(|err| err.to_string())?;
-    ferrum_bench_core::write_jsonl_records(
-        path,
-        ferrum_bench_core::JsonlJournalOpenMode::Append,
-        std::slice::from_ref(event),
-    )
-    .map_err(|error| error.to_string())
+    state
+        .profile_delivery
+        .as_ref()
+        .ok_or_else(|| "HTTP profile delivery was not prepared before publication".to_string())?
+        .enqueue(event, include_memory)
+        .map_err(|error| error.to_string())
 }
 
-fn elapsed_us_since(started_at: Instant) -> u64 {
+fn elapsed_us_since(started_at: RequestIngressAnchor) -> u64 {
     started_at
+        .instant()
         .elapsed()
         .as_micros()
         .max(1)
@@ -1922,7 +2042,7 @@ fn chat_resource_failure_diagnostics(
 ) -> serde_json::Value {
     let resource_kind = chat_resource_kind_for_failure(failure_kind);
     let memory = engine_status
-        .map(|status| &status.memory_usage)
+        .and_then(|status| status.memory_usage.known())
         .map(|memory| {
             let current = memory.used_bytes as i64;
             let high_water = current.max(0);
@@ -1942,22 +2062,20 @@ fn chat_resource_failure_diagnostics(
             serde_json::json!({
                 "scope": "serve_failure",
                 "backend": "engine_status",
-                "current_bytes": 0,
-                "high_water_bytes": 0,
-                "source": "not_collected"
+                "current_bytes": null,
+                "high_water_bytes": null,
+                "source": "unavailable"
             })
         });
     let capacity = chat_failure_capacity(resource_kind, admission_summary, engine_status, message);
     let needed = capacity
         .get("needed")
-        .and_then(|value| value.as_i64())
-        .unwrap_or(1)
-        .max(1);
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
     let capacity_value = capacity
         .get("capacity")
-        .and_then(|value| value.as_i64())
-        .unwrap_or(0)
-        .max(0);
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
     serde_json::json!({
         "schema_version": OBSERVABILITY_PROFILE_SCHEMA_VERSION,
         "entrypoint": "serve",
@@ -1998,19 +2116,26 @@ fn chat_failure_capacity(
     reason: &str,
 ) -> serde_json::Value {
     if resource_kind == "device_memory" {
-        let (needed, available, capacity) = engine_status
-            .map(|status| {
-                let memory = &status.memory_usage;
-                let used = memory.used_bytes as i64;
-                let available = memory.free_bytes as i64;
-                let capacity = memory.total_bytes as i64;
-                (
-                    used.saturating_add(1).max(1),
-                    available.max(0),
-                    capacity.max(0),
-                )
-            })
-            .unwrap_or((1, 0, 0));
+        let Some(memory) = engine_status.and_then(|status| status.memory_usage.known()) else {
+            return serde_json::json!({
+                "resource_kind": resource_kind,
+                "needed": null,
+                "available": null,
+                "capacity": null,
+                "source": "unavailable",
+                "reason": reason,
+            });
+        };
+        let (needed, available, capacity) = {
+            let used = memory.used_bytes as i64;
+            let available = memory.free_bytes as i64;
+            let capacity = memory.total_bytes as i64;
+            (
+                used.saturating_add(1).max(1),
+                available.max(0),
+                capacity.max(0),
+            )
+        };
         return serde_json::json!({
             "resource_kind": resource_kind,
             "needed": needed,
@@ -2366,639 +2491,33 @@ async fn handle_chat_completions_stream(
     openai_request: ChatCompletionsRequest,
     inference_request: InferenceRequest,
     benchmark_correlation: Option<BenchmarkRequestCorrelation>,
+    response_context: Option<responses::ResponseContext>,
+    session_context: Option<SessionContext>,
 ) -> std::result::Result<Response, ServerError> {
-    let (tx, rx) = mpsc::unbounded_channel::<std::result::Result<Event, axum::Error>>();
-
-    // Spawn task to generate tokens
-    let engine = state.llm.clone().ok_or_else(|| {
-        ServerError::ServiceUnavailable("LLM engine not loaded; chat unavailable".into())
-    })?;
-    let request_id = inference_request.id.to_string();
-    let include_stream_usage = openai_request
-        .stream_options
-        .as_ref()
-        .and_then(|opts| opts.include_usage)
-        .unwrap_or(false);
-    let output_contract = EffectiveChatOutputContract::resolve(&openai_request);
-    let buffer_json_object_stream = matches!(
-        output_contract,
-        EffectiveChatOutputContract::JsonObjectContent
-    );
-    let buffer_strict_json_schema_stream = matches!(
-        output_contract,
-        EffectiveChatOutputContract::StrictJsonSchemaContent
-    );
-    let stream_api_request = match inference_request.api_request.as_ref() {
-        Some(ferrum_types::ApiRequest::Chat(request)) => request.clone(),
-        _ => api_chat_request(
-            &openai_request,
-            openai_request.tool_choice.as_ref(),
-            ferrum_types::ApiToolCallProtocol::default(),
-        ),
-    };
-    let buffer_structured_api_stream =
-        ferrum_types::chat_api_may_emit_tool_or_function_call(&stream_api_request);
-    let model_output_protocol = inference_request.sampling_params.model_output_protocol;
-    let buffer_stream_output = buffer_json_object_stream
-        || buffer_strict_json_schema_stream
-        || buffer_structured_api_stream
-        || model_output_protocol == ModelOutputProtocol::HarmonyGptOss;
-    // R1-distill-style templates open the think block inside the prompt;
-    // the parser must know generation starts mid-think.
-    let started_in_think = request_started_in_reasoning(&inference_request);
-    let mut native_projector = NativeChatOutputProjector::for_request(&inference_request);
-    let replay_request_id = inference_request.id.to_string();
-    let profile_request_model = openai_request.model.clone();
-    let profile_started_at = Instant::now();
-    let request_memory_before = request_memory_sample_before(&state);
-    let mut stream = match engine.infer_stream(inference_request).await {
-        Ok(stream) => stream,
-        Err(e) => {
-            let failure_kind = e.observability_failure_kind();
-            let error_kind = e.observability_error_kind();
-            let error_message = e.to_string();
-            if let Err(err) = write_chat_request_profile_event(
-                &state,
-                &replay_request_id,
-                benchmark_correlation.as_ref(),
-                &profile_request_model,
-                true,
-                "chat_completions_stream_start",
-                profile_started_at,
-                ChatRequestProfileTiming::default(),
-                0,
-                None,
-                Some("error"),
-                Some(ProfileError {
-                    kind: error_kind.to_string(),
-                    message: error_message.clone(),
-                    blocking: false,
-                }),
-            ) {
-                warn!("failed to write chat stream failure profile event: {}", err);
-            }
-            let engine_status = if chat_resource_failure_kind(failure_kind) {
-                Some(engine.status().await)
-            } else {
-                None
-            };
-            error!(
-                "Stream generation failed before first chunk: {}",
-                error_message
-            );
-            if let Err(err) = write_chat_request_failure_diagnostics(
-                &state,
-                &replay_request_id,
-                failure_kind,
-                "chat_completions_stream_start",
-                error_kind,
-                &error_message,
-                engine_status.as_ref(),
-            ) {
-                warn!("failed to write chat stream failure diagnostics: {}", err);
-            }
-            return Err(server_error_from_ferrum_error(e));
-        }
-    };
-    let request_dump_dir = state.request_dump_dir.clone();
-    let admission_summary = state
-        .auto_config
-        .as_ref()
-        .map(|config| config.admission_summary_document());
-    let diagnostics_engine = engine.clone();
-    let profile_state = state.clone();
-
-    tokio::spawn(async move {
-        let mut current_text = String::new();
-        let mut output_token_ids = Vec::new();
-        let mut first_engine_chunk_received_us = None;
-        let mut first_sse_enqueue_us = None;
-        let mut sent_reasoning_len = 0usize;
-        let mut sent_content_len = 0usize;
-
-        loop {
-            let next = tokio::select! {
-                biased;
-                _ = tx.closed() => break,
-                next = stream.next() => next,
-            };
-            let Some(result) = next else {
-                break;
-            };
-            match result {
-                Ok(chunk) => {
-                    if first_engine_chunk_received_us.is_none()
-                        && (chunk.token.is_some() || !chunk.text.is_empty())
-                    {
-                        first_engine_chunk_received_us = Some(elapsed_us_since(profile_started_at));
-                    }
-                    if let Some(token) = chunk.token {
-                        output_token_ids.push(token);
-                    }
-                    if !chunk.text.is_empty() {
-                        current_text.push_str(&chunk.text);
-                        if let Some(projector) = native_projector.as_mut() {
-                            projector.push(&chunk.text);
-                        }
-
-                        if native_projector.is_some()
-                            || (!buffer_stream_output
-                                && !should_defer_model_reasoning_stream_delta(
-                                    model_output_protocol,
-                                    &current_text,
-                                ))
-                        {
-                            let parsed_result = if let Some(projector) = native_projector.as_ref() {
-                                Ok(ParsedReasoningResponse {
-                                    content: projector.visible_prefix().to_owned(),
-                                    reasoning: projector.reasoning_prefix().map(str::to_owned),
-                                })
-                            } else {
-                                parse_model_reasoning_response(
-                                    model_output_protocol,
-                                    &current_text,
-                                    started_in_think,
-                                )
-                            };
-                            let parsed = match parsed_result {
-                                Ok(parsed) => parsed,
-                                Err(error) => {
-                                    let _ = tx.send(Ok(openai_error_sse_event(
-                                        error.to_string(),
-                                        "internal_server_error",
-                                        Some("model_output"),
-                                    )));
-                                    let _ = tx.send(Ok(Event::default().data("[DONE]")));
-                                    break;
-                                }
-                            };
-                            let full_reasoning = parsed.reasoning.as_deref().unwrap_or("");
-                            let reasoning_delta =
-                                stream_text_delta(full_reasoning, &mut sent_reasoning_len);
-                            let content_delta =
-                                stream_text_delta(&parsed.content, &mut sent_content_len);
-                            if !reasoning_delta.is_empty() || !content_delta.is_empty() {
-                                // Create streaming response chunk
-                                let response_chunk = ChatCompletionsResponse {
-                                    id: request_id.clone(),
-                                    object: "chat.completion.chunk".to_string(),
-                                    created: chrono::Utc::now().timestamp() as u64,
-                                    model: openai_request.model.clone(),
-                                    choices: vec![ChatChoice {
-                                        index: 0,
-                                        message: None,
-                                        delta: Some(ChatMessage {
-                                            role: MessageRole::Assistant,
-                                            content: content_delta,
-                                            reasoning: (!reasoning_delta.is_empty())
-                                                .then_some(reasoning_delta),
-                                            name: None,
-                                            tool_calls: None,
-                                            tool_call_id: None,
-                                            function_call: None,
-                                        }),
-                                        finish_reason: None,
-                                    }],
-                                    usage: None,
-                                };
-
-                                let sse_event = Event::default()
-                                    .json_data(&response_chunk)
-                                    .unwrap_or_else(|_| Event::default().data("error"));
-                                if tx.send(Ok(sse_event)).is_err() {
-                                    break;
-                                }
-                                first_sse_enqueue_us
-                                    .get_or_insert_with(|| elapsed_us_since(profile_started_at));
-                            }
-                        }
-                    }
-
-                    if chunk.finish_reason.is_some() {
-                        let terminal_finish_reason = chunk
-                            .finish_reason
-                            .expect("finish_reason presence checked above");
-                        if let Err(err) = write_chat_prompt_token_evidence(
-                            request_dump_dir.as_ref().map(|root| root.as_path()),
-                            &replay_request_id,
-                            &profile_request_model,
-                            chunk.execution_evidence.as_ref(),
-                        ) {
-                            warn!("failed to write chat stream prompt-token evidence: {}", err);
-                        }
-                        let usage = chunk.usage.as_ref().map(openai_usage_from_token_usage);
-                        let native_projected = native_projector
-                            .take()
-                            .map(|projector| projector.finish(terminal_finish_reason));
-                        let parsed_output_result =
-                            if let Some(projected) = native_projected.as_ref() {
-                                Ok(ParsedChatModelOutput {
-                                    visible: projected.visible.clone(),
-                                    harmony_response: None,
-                                })
-                            } else {
-                                parse_chat_model_output(
-                                    model_output_protocol,
-                                    &current_text,
-                                    started_in_think,
-                                    terminal_finish_reason,
-                                )
-                            };
-                        let parsed_model_output = match parsed_output_result {
-                            Ok(parsed) => parsed,
-                            Err(error) => {
-                                let error_event = openai_error_sse_event(
-                                    stream_validation_error_message(error),
-                                    "internal_server_error",
-                                    Some("model_output"),
-                                );
-                                let _ = tx.send(Ok(error_event));
-                                let _ = tx.send(Ok(Event::default().data("[DONE]")));
-                                break;
-                            }
-                        };
-                        let mut parsed_final = parsed_model_output.visible;
-                        parsed_final.content = normalize_structured_response_content(
-                            &openai_request,
-                            &parsed_final.content,
-                        );
-                        let mut structured_chat_response =
-                            finish_reason_allows_structured_api_response(terminal_finish_reason)
-                                .then(|| match chunk.api_response.as_ref() {
-                                    // The native envelope owns the recipient and whether this is
-                                    // a call at all, including a final answer containing JSON.
-                                    _ if model_output_protocol
-                                        == ModelOutputProtocol::HarmonyGptOss =>
-                                    {
-                                        parsed_model_output.harmony_response.clone()
-                                    }
-                                    Some(ferrum_types::ApiResponse::Chat(response)) => {
-                                        Some(response.clone())
-                                    }
-                                    _ if native_projected.is_some() => native_projected
-                                        .as_ref()
-                                        .and_then(|projected| projected.api_response.clone()),
-                                    _ if buffer_structured_api_stream => {
-                                        chat_api_response_from_parsed_generated_text(
-                                            &stream_api_request,
-                                            &parsed_final,
-                                            terminal_finish_reason,
-                                        )
-                                    }
-                                    _ => None,
-                                })
-                                .flatten();
-
-                        if native_projected.is_none()
-                            && matches!(
-                                chunk.api_response,
-                                Some(ferrum_types::ApiResponse::Chat(_))
-                            )
-                        {
-                            if let Some(response) = structured_chat_response.as_mut() {
-                                if let Err(error) = project_typed_tool_response_content(
-                                    response,
-                                    model_output_protocol,
-                                    started_in_think,
-                                ) {
-                                    let _ = tx.send(Ok(openai_error_sse_event(
-                                        stream_validation_error_message(error),
-                                        "internal_server_error",
-                                        Some("model_output"),
-                                    )));
-                                    let _ = tx.send(Ok(Event::default().data("[DONE]")));
-                                    break;
-                                }
-                            }
-                        }
-
-                        if let Some(chat_response) = structured_chat_response.as_ref() {
-                            if let Err(e) =
-                                validate_structured_tool_response(&openai_request, chat_response)
-                            {
-                                let error_event = openai_error_sse_event(
-                                    stream_validation_error_message(e),
-                                    "internal_server_error",
-                                    Some("tool_choice"),
-                                );
-                                let _ = tx.send(Ok(error_event));
-                                let _ = tx.send(Ok(Event::default().data("[DONE]")));
-                                break;
-                            }
-                        } else if tool_choice_required(&openai_request) {
-                            log_required_tool_choice_failure(
-                                &openai_request,
-                                &parsed_final.content,
-                                parsed_final.reasoning.as_deref(),
-                            );
-                            let error_event = openai_error_sse_event(
-                                "model output did not satisfy required tool_choice",
-                                "invalid_request_error",
-                                Some("tool_choice"),
-                            );
-                            let _ = tx.send(Ok(error_event));
-                            let _ = tx.send(Ok(Event::default().data("[DONE]")));
-                            break;
-                        }
-                        if let Err(e) = validate_hard_structured_response(
-                            &openai_request,
-                            &parsed_final.content,
-                            structured_chat_response.as_ref(),
-                        ) {
-                            let error_event = openai_error_sse_event(
-                                stream_validation_error_message(e),
-                                "internal_server_error",
-                                structured_response_error_param(output_contract),
-                            );
-                            let _ = tx.send(Ok(error_event));
-                            let _ = tx.send(Ok(Event::default().data("[DONE]")));
-                            break;
-                        }
-
-                        if let Some(chat_response) = structured_chat_response.as_ref() {
-                            let mut delta = openai_chat_delta_from_api(&chat_response.message);
-                            if native_projected.is_some() {
-                                delta.content =
-                                    stream_text_delta(&delta.content, &mut sent_content_len);
-                            }
-                            if delta.reasoning.is_none() {
-                                delta.reasoning = parsed_final.reasoning.clone();
-                            }
-                            if native_projected.is_some() {
-                                let reasoning = stream_text_delta(
-                                    delta.reasoning.as_deref().unwrap_or(""),
-                                    &mut sent_reasoning_len,
-                                );
-                                delta.reasoning = (!reasoning.is_empty()).then_some(reasoning);
-                            }
-                            let response_chunk = ChatCompletionsResponse {
-                                id: request_id.clone(),
-                                object: "chat.completion.chunk".to_string(),
-                                created: chrono::Utc::now().timestamp() as u64,
-                                model: openai_request.model.clone(),
-                                choices: vec![ChatChoice {
-                                    index: 0,
-                                    message: None,
-                                    delta: Some(delta),
-                                    finish_reason: None,
-                                }],
-                                usage: None,
-                            };
-
-                            let sse_event = Event::default()
-                                .json_data(&response_chunk)
-                                .unwrap_or_else(|_| Event::default().data("error"));
-                            if tx.send(Ok(sse_event)).is_err() {
-                                break;
-                            }
-                            first_sse_enqueue_us
-                                .get_or_insert_with(|| elapsed_us_since(profile_started_at));
-                        } else if buffer_structured_api_stream
-                            && parsed_final.content.trim().is_empty()
-                            // A token-limited response may contain only reasoning.
-                            // Preserve its terminal reason and usage, as sync does;
-                            // required tool and hard content contracts were checked above.
-                            && terminal_finish_reason != FinishReason::Length
-                        {
-                            let error_event = openai_error_sse_event(
-                                "model output did not satisfy tool/function call request",
-                                "internal_server_error",
-                                Some("tool_choice"),
-                            );
-                            let _ = tx.send(Ok(error_event));
-                            let _ = tx.send(Ok(Event::default().data("[DONE]")));
-                            break;
-                        } else if !current_text.is_empty() {
-                            // Flush safe text held with an incomplete trailing
-                            // marker, including when text and finish share a chunk.
-                            // Buffered streams have sent lengths of zero.
-                            let content_delta =
-                                stream_text_delta(&parsed_final.content, &mut sent_content_len);
-                            let reasoning_delta = stream_text_delta(
-                                parsed_final.reasoning.as_deref().unwrap_or(""),
-                                &mut sent_reasoning_len,
-                            );
-                            if !content_delta.is_empty() || !reasoning_delta.is_empty() {
-                                let response_chunk = ChatCompletionsResponse {
-                                    id: request_id.clone(),
-                                    object: "chat.completion.chunk".to_string(),
-                                    created: chrono::Utc::now().timestamp() as u64,
-                                    model: openai_request.model.clone(),
-                                    choices: vec![ChatChoice {
-                                        index: 0,
-                                        message: None,
-                                        delta: Some(ChatMessage {
-                                            role: MessageRole::Assistant,
-                                            content: content_delta,
-                                            reasoning: (!reasoning_delta.is_empty())
-                                                .then_some(reasoning_delta),
-                                            name: None,
-                                            tool_calls: None,
-                                            tool_call_id: None,
-                                            function_call: None,
-                                        }),
-                                        finish_reason: None,
-                                    }],
-                                    usage: None,
-                                };
-
-                                let sse_event = Event::default()
-                                    .json_data(&response_chunk)
-                                    .unwrap_or_else(|_| Event::default().data("error"));
-                                if tx.send(Ok(sse_event)).is_err() {
-                                    break;
-                                }
-                                first_sse_enqueue_us
-                                    .get_or_insert_with(|| elapsed_us_since(profile_started_at));
-                            }
-                        }
-                        // Send final chunk. OpenAI-style streaming
-                        // clients (e.g. `vllm bench serve`) blindly
-                        // read `choices[0]["delta"]` on every chunk
-                        // that has any `choices` entries, so the
-                        // last chunk must include `delta` even when
-                        // empty. Skipping it triggers
-                        // `KeyError: 'delta'` on the client side
-                        // and the request is reported as failed
-                        // despite returning a 200 with content.
-                        let final_finish_reason = structured_chat_response
-                            .as_ref()
-                            .and_then(|response| response.finish_reason.clone())
-                            .or_else(|| chunk.finish_reason.as_ref().map(finish_reason_to_string))
-                            .or(Some("length".to_string()));
-                        let final_chunk = ChatCompletionsResponse {
-                            id: request_id.clone(),
-                            object: "chat.completion.chunk".to_string(),
-                            created: chrono::Utc::now().timestamp() as u64,
-                            model: openai_request.model.clone(),
-                            choices: vec![ChatChoice {
-                                index: 0,
-                                message: None,
-                                delta: Some(ChatMessage {
-                                    role: MessageRole::Assistant,
-                                    content: String::new(),
-                                    reasoning: None,
-                                    name: None,
-                                    tool_calls: None,
-                                    tool_call_id: None,
-                                    function_call: None,
-                                }),
-                                finish_reason: final_finish_reason.clone(),
-                            }],
-                            usage: None,
-                        };
-
-                        let final_event = Event::default()
-                            .json_data(&final_chunk)
-                            .unwrap_or_else(|_| Event::default().data("error"));
-                        if tx.send(Ok(final_event)).is_ok() {
-                            first_sse_enqueue_us
-                                .get_or_insert_with(|| elapsed_us_since(profile_started_at));
-                        }
-                        let completion_token_count = chunk
-                            .usage
-                            .as_ref()
-                            .map(|usage| usage.completion_tokens)
-                            .unwrap_or(output_token_ids.len());
-                        let replay_output_token_ids = chunk
-                            .execution_evidence
-                            .as_ref()
-                            .map(|evidence| evidence.output_token_ids.as_slice())
-                            .filter(|tokens| tokens.len() == completion_token_count)
-                            .unwrap_or(output_token_ids.as_slice());
-                        if let Err(err) = write_chat_request_completion_replay_bundle(
-                            request_dump_dir.as_ref().map(|root| root.as_path()),
-                            &replay_request_id,
-                            &parsed_final.content,
-                            replay_output_token_ids,
-                            final_finish_reason.as_deref(),
-                        ) {
-                            warn!("failed to write chat stream replay bundle: {}", err);
-                        }
-                        if let Err(err) = write_chat_request_profile_event(
-                            &profile_state,
-                            &replay_request_id,
-                            benchmark_correlation.as_ref(),
-                            &profile_request_model,
-                            true,
-                            "chat_completions_stream_complete",
-                            profile_started_at,
-                            ChatRequestProfileTiming {
-                                engine_evidence: chunk.execution_evidence.as_ref(),
-                                first_engine_chunk_received_us,
-                                first_sse_enqueue_us,
-                            },
-                            completion_token_count,
-                            chunk.usage.as_ref(),
-                            final_finish_reason.as_deref(),
-                            None,
-                        ) {
-                            warn!("failed to write chat stream profile event: {}", err);
-                        }
-                        if let Err(err) = maybe_write_first_request_memory_stage(
-                            &profile_state,
-                            &replay_request_id,
-                            benchmark_correlation.as_ref(),
-                            &profile_request_model,
-                            true,
-                            profile_started_at,
-                            request_memory_before,
-                        ) {
-                            warn!("failed to write chat stream memory profile event: {}", err);
-                        }
-                        if include_stream_usage && usage.is_some() {
-                            let usage_chunk = ChatCompletionsResponse {
-                                id: request_id.clone(),
-                                object: "chat.completion.chunk".to_string(),
-                                created: chrono::Utc::now().timestamp() as u64,
-                                model: openai_request.model.clone(),
-                                choices: vec![],
-                                usage,
-                            };
-                            let usage_event = Event::default()
-                                .json_data(&usage_chunk)
-                                .unwrap_or_else(|_| Event::default().data("error"));
-                            let _ = tx.send(Ok(usage_event));
-                        }
-                        let _ = tx.send(Ok(Event::default().data("[DONE]")));
-                        break;
-                    }
-                }
-                Err(e) => {
-                    let failure_kind = e.observability_failure_kind();
-                    let error_kind = e.observability_error_kind();
-                    let error_message = e.to_string();
-                    let engine_status = if chat_resource_failure_kind(failure_kind) {
-                        Some(diagnostics_engine.status().await)
-                    } else {
-                        None
-                    };
-                    error!("Stream generation error: {}", error_message);
-                    if let Err(err) = write_chat_request_profile_event(
-                        &profile_state,
-                        &replay_request_id,
-                        benchmark_correlation.as_ref(),
-                        &profile_request_model,
-                        true,
-                        "chat_completions_stream_next",
-                        profile_started_at,
-                        ChatRequestProfileTiming {
-                            engine_evidence: None,
-                            first_engine_chunk_received_us,
-                            first_sse_enqueue_us,
-                        },
-                        output_token_ids.len(),
-                        None,
-                        Some("error"),
-                        Some(ProfileError {
-                            kind: error_kind.to_string(),
-                            message: error_message.clone(),
-                            blocking: false,
-                        }),
-                    ) {
-                        warn!("failed to write chat stream chunk profile event: {}", err);
-                    }
-                    if let Err(err) = write_chat_request_failure_diagnostics_at_root(
-                        request_dump_dir.as_ref().map(|root| root.as_path()),
-                        admission_summary.as_ref(),
-                        engine_status.as_ref(),
-                        &replay_request_id,
-                        failure_kind,
-                        "chat_completions_stream_next",
-                        error_kind,
-                        &error_message,
-                    ) {
-                        warn!(
-                            "failed to write chat stream chunk failure diagnostics: {}",
-                            err
-                        );
-                    }
-                    let _ = tx.send(Ok(openai_error_sse_event(
-                        error_message,
-                        "internal_server_error",
-                        None,
-                    )));
-                    let _ = tx.send(Ok(Event::default().data("[DONE]")));
-                    break;
-                }
-            }
-        }
-    });
-
-    let stream = tokio_stream::wrappers::UnboundedReceiverStream::new(rx);
-    let sse_stream = Sse::new(stream);
-
-    Ok(sse_stream.into_response())
+    let events = chat_stream::open_chat_events(
+        state,
+        openai_request,
+        inference_request,
+        benchmark_correlation,
+        session_context,
+    )
+    .await?;
+    Ok(match response_context {
+        Some(context) => responses::stream::adapt_chat_stream(events, context),
+        None => chat_stream::into_response(events),
+    })
 }
 
 /// Handle non-streaming chat completions
+type ChatSyncOutput = output::Retained<ChatCompletionsResponse>;
+
 async fn handle_chat_completions_sync(
     state: AppState,
     openai_request: ChatCompletionsRequest,
     inference_request: InferenceRequest,
     session_context: Option<SessionContext>,
     benchmark_correlation: Option<BenchmarkRequestCorrelation>,
-) -> std::result::Result<Response, ServerError> {
+) -> std::result::Result<ChatSyncOutput, ServerError> {
     info!("Processing non-streaming chat completion");
 
     let engine = state.llm.clone().ok_or_else(|| {
@@ -3017,10 +2536,15 @@ async fn handle_chat_completions_sync(
     let model_output_protocol = inference_request.sampling_params.model_output_protocol;
     // R1-distill-style templates open the think block inside the prompt.
     let started_in_think = request_started_in_reasoning(&inference_request);
-    let mut native_projector = NativeChatOutputProjector::for_request(&inference_request);
+    let native_render_state = inference_request
+        .metadata
+        .get(ferrum_types::PROMPT_OPENED_REASONING_METADATA_KEY)
+        .and_then(serde_json::Value::as_bool);
     let replay_request_id = inference_request.id.to_string();
     let profile_request_model = openai_request.model.clone();
-    let profile_started_at = Instant::now();
+    let profile_started_at = inference_request.ingress.ok_or_else(|| {
+        ServerError::InternalError("HTTP request is missing its handler ingress clock".into())
+    })?;
     let request_memory_before = request_memory_sample_before(&state);
     match engine.infer(inference_request).await {
         Ok(output) => {
@@ -3032,7 +2556,8 @@ async fn handle_chat_completions_sync(
                 api_response,
                 execution_evidence,
                 ..
-            } = output;
+            } = output.response();
+            let finish_reason = *finish_reason;
             if let Err(err) = write_chat_prompt_token_evidence(
                 state.request_dump_dir.as_ref().map(|root| root.as_path()),
                 &replay_request_id,
@@ -3047,10 +2572,17 @@ async fn handle_chat_completions_sync(
             // here; malformed output must fail the response contract below.
             let stop_sequences = openai_request.stop.clone().unwrap_or_default();
             let content = strip_after_stop(&output_text, &stop_sequences);
-            let native_projected = native_projector.take().map(|mut projector| {
-                projector.push(&content);
-                projector.finish(finish_reason)
-            });
+            let native_projected = request_chat_api.as_ref().zip(native_render_state).and_then(
+                |(request, started)| {
+                    ferrum_types::project_native_chat_output(
+                        request,
+                        model_output_protocol,
+                        started,
+                        &content,
+                        finish_reason,
+                    )
+                },
+            );
             let parsed_model_output = if let Some(projected) = native_projected.as_ref() {
                 ParsedChatModelOutput {
                     visible: projected.visible.clone(),
@@ -3251,9 +2783,6 @@ async fn handle_chat_completions_sync(
             ) {
                 warn!("failed to write chat sync memory profile event: {}", err);
             }
-            state
-                .cache
-                .update_session(session_context, message.clone(), &CachePolicy::current());
             let response = ChatCompletionsResponse {
                 id: replay_request_id,
                 object: "chat.completion".to_string(),
@@ -3268,7 +2797,12 @@ async fn handle_chat_completions_sync(
                 usage: Some(openai_usage_from_token_usage(&usage)),
             };
 
-            Ok(Json(response).into_response())
+            let response = output::Retained::new(output.output_session(), response)
+                .map_err(server_error_from_ferrum_error)?;
+            state
+                .cache
+                .update_session(session_context, response.clone(), &CachePolicy::current());
+            Ok(response)
         }
         Err(e) => {
             let failure_kind = e.observability_failure_kind();
@@ -3669,6 +3203,7 @@ fn convert_chat_request_with_template_model_and_default(
         client_id: None,
         session_id: None,
         created_at: chrono::Utc::now(),
+        ingress: None,
         api_request: Some(ferrum_types::ApiRequest::Chat(api_chat)),
         evidence_request: Default::default(),
         metadata,
@@ -4855,16 +4390,6 @@ fn stream_error_payload(
     }
 }
 
-fn openai_error_sse_event(
-    message: impl Into<String>,
-    error_type: &str,
-    param: Option<&str>,
-) -> Event {
-    Event::default()
-        .json_data(&stream_error_payload(message, error_type, param))
-        .unwrap_or_else(|_| Event::default().data("error"))
-}
-
 fn convert_completion_request(request: &CompletionsRequest) -> InferenceRequest {
     let prompt = request
         .prompt
@@ -4898,6 +4423,7 @@ fn convert_completion_request(request: &CompletionsRequest) -> InferenceRequest 
         client_id: None,
         session_id: None,
         created_at: chrono::Utc::now(),
+        ingress: None,
         api_request: Some(ferrum_types::ApiRequest::Completion(
             ferrum_types::ApiCompletionRequest {
                 prompt: prompt.to_string(),
@@ -4974,7 +4500,7 @@ async fn handle_completions_sync(
                 usage,
                 api_response,
                 ..
-            } = output;
+            } = output.response();
             let stop_sequences = openai_request.stop.clone().unwrap_or_default();
             let mut text = strip_after_stop(&output_text, &stop_sequences);
             let mut openai_finish_reason = finish_reason_to_string(&finish_reason);
@@ -4998,7 +4524,11 @@ async fn handle_completions_sync(
                 }],
                 usage: Some(openai_usage_from_token_usage(&usage)),
             };
-            Ok(Json(response).into_response())
+            let response = output::Retained::new(output.output_session(), response)
+                .map_err(server_error_from_ferrum_error)?;
+            output::json_response(response.output_session(), response.value())
+                .await
+                .map_err(server_error_from_ferrum_error)
         }
         Err(e) => {
             error!("Completion generation failed: {}", e);
@@ -5012,7 +4542,6 @@ async fn handle_completions_stream(
     openai_request: CompletionsRequest,
     inference_request: InferenceRequest,
 ) -> std::result::Result<Response, ServerError> {
-    let (tx, rx) = mpsc::unbounded_channel::<std::result::Result<Event, axum::Error>>();
     let engine = state.llm.clone().ok_or_else(|| {
         ServerError::ServiceUnavailable("LLM engine not loaded; completions unavailable".into())
     })?;
@@ -5024,10 +4553,13 @@ async fn handle_completions_stream(
         error!("Failed to start completion stream: {}", e);
         server_error_from_ferrum_error(e)
     })?;
-    tokio::spawn(async move {
+    let session = stream.output_session().clone();
+    let body_session = session.clone();
+    let frames = async_stream::try_stream! {
         while let Some(result) = stream.next().await {
             match result {
-                Ok(chunk) => {
+                Ok(owned_chunk) => {
+                    let chunk = owned_chunk.chunk();
                     let response_chunk = CompletionsResponse {
                         id: request_id.clone(),
                         object: "text_completion".to_string(),
@@ -5043,12 +4575,15 @@ async fn handle_completions_stream(
                         }],
                         usage: None,
                     };
-                    let event = Event::default()
-                        .json_data(&response_chunk)
-                        .unwrap_or_else(|_| Event::default().data("error"));
-                    if tx.send(Ok(event)).is_err() {
-                        break;
+                    let encoded = match output::Retained::new(&session, response_chunk) { Ok(value) => output::encode_json(&session, None, value.value()).await, Err(error) => Err(error) };
+                    let (bytes, terminal_error) = output::chat_encoding_result(&session, encoded)?;
+                    if terminal_error {
+                        drop(owned_chunk);
+                        drop(stream);
+                        yield bytes;
+                        return;
                     }
+                    yield bytes;
                     if chunk.finish_reason.is_some() {
                         if let Some(usage) = chunk.usage.as_ref().map(openai_usage_from_token_usage)
                         {
@@ -5060,31 +4595,43 @@ async fn handle_completions_stream(
                                 choices: vec![],
                                 usage: Some(usage),
                             };
-                            let event = Event::default()
-                                .json_data(&final_chunk)
-                                .unwrap_or_else(|_| Event::default().data("error"));
-                            let _ = tx.send(Ok(event));
+                            let encoded = match output::Retained::new(&session, final_chunk) { Ok(value) => output::encode_json(&session, None, value.value()).await, Err(error) => Err(error) };
+                            let (bytes, terminal_error) = output::chat_encoding_result(&session, encoded)?;
+                            if terminal_error {
+                                drop(owned_chunk);
+                                drop(stream);
+                                yield bytes;
+                                return;
+                            }
+                            yield bytes;
                         }
-                        let _ = tx.send(Ok(Event::default().data("[DONE]")));
+                        let encoded = output::encode_done(&session).await;
+                        let (bytes, terminal_error) = output::chat_encoding_result(&session, encoded)?;
+                        if terminal_error {
+                            drop(owned_chunk);
+                            drop(stream);
+                            yield bytes;
+                            return;
+                        }
+                        yield bytes;
                         break;
                     }
                 }
                 Err(e) => {
                     error!("Completion stream generation error: {}", e);
-                    let _ = tx.send(Ok(openai_error_sse_event(
+                    let bytes = output::encode_chat_failure(&session, &stream_error_payload(
                         e.to_string(),
                         "internal_server_error",
                         None,
-                    )));
-                    let _ = tx.send(Ok(Event::default().data("[DONE]")));
-                    break;
+                    ))?;
+                    drop(stream);
+                    yield bytes;
+                    return;
                 }
             }
         }
-    });
-
-    let stream = tokio_stream::wrappers::UnboundedReceiverStream::new(rx);
-    Ok(Sse::new(stream).into_response())
+    };
+    Ok(output::sse_response(body_session, frames))
 }
 
 /// Other handlers
@@ -5092,6 +4639,11 @@ async fn completions_handler(
     State(state): State<AppState>,
     request: std::result::Result<Json<CompletionsRequest>, JsonRejection>,
 ) -> std::result::Result<Response, ServerError> {
+    let ingress = RequestIngressAnchor::capture(RequestIngressBoundary::HttpHandler);
+    #[cfg(test)]
+    if let Some(observer) = &state.request_construction_observer {
+        observer(ingress, "completion_prompt");
+    }
     let Json(request) = request.map_err(|e| {
         ServerError::invalid_request(format!("invalid completions request: {e}"), None)
     })?;
@@ -5099,6 +4651,7 @@ async fn completions_handler(
     let (engine_model_id, lora_adapter) =
         resolve_request_model(&state, &request.model, ServedModelKind::Llm)?;
     let mut inference_request = convert_completion_request(&request);
+    inference_request.ingress = Some(ingress);
     apply_served_model_resolution(&mut inference_request, engine_model_id, lora_adapter);
     if request.stream.unwrap_or(false) {
         handle_completions_stream(state, request, inference_request).await
@@ -5247,8 +4800,20 @@ async fn health_handler(
         runtime_admission_error.as_deref(),
     );
 
+    let profile_report = state
+        .profile_delivery
+        .as_ref()
+        .map(|delivery| delivery.report());
+    let profile_failed = profile_report
+        .as_ref()
+        .is_some_and(|report| report.required_error.is_some());
+    let profile_degraded = profile_report
+        .as_ref()
+        .is_some_and(HttpProfileDeliveryReport::is_degraded);
     let health = serde_json::json!({
-        "status": if runtime_admission_error.is_some() { "unhealthy" } else { "healthy" },
+        "status": if runtime_admission_error.is_some() || profile_failed { "unhealthy" }
+            else if profile_degraded { "degraded" } else { "healthy" },
+        "profile_delivery": profile_report.as_ref().map(HttpProfileDeliveryReport::health_json),
         "reasoning_protocol": state.prompt_template.as_deref().map(ModelChatTemplate::reasoning_capability).unwrap_or_default(),
         "timestamp": chrono::Utc::now().to_rfc3339(),
         "version": env!("CARGO_PKG_VERSION"),
@@ -5497,8 +5062,11 @@ mod tests {
     mod lora_execution_support;
     mod model_reasoning_metadata;
     mod native_tool_stream;
+    mod profile_delivery_tests;
     mod reasoning_controls;
+    mod request_clock_tests;
     mod retired_routes;
+    mod semantic_output;
     mod tool_argument_strictness;
     mod tool_length;
     use super::*;
@@ -5511,9 +5079,9 @@ mod tests {
     use ferrum_interfaces::engine::{InferenceEngine, LlmInferenceEngine};
     use ferrum_types::{
         has_unclosed_thinking_block, parse_reasoning_response_started_in_think, EngineConfig,
-        EngineMetrics, EngineStatus, EngineTokenTimingEvidence, FinishReason,
-        HealthStatus as EngineHealthStatus, InferenceRequest, InferenceResponse, MemoryUsage,
-        ModelId, StreamChunk, TokenId, TokenUsage,
+        EngineMetrics, EngineStatus, EngineTokenTimingEvidence, ExecutionPlanningModel,
+        FinishReason, HealthStatus as EngineHealthStatus, InferenceRequest, InferenceResponse,
+        MemoryUsage, ModelId, StreamChunk, TokenId, TokenUsage,
     };
     use futures::{stream, Stream};
     use serde_json::{json, Value};
@@ -5638,9 +5206,10 @@ mod tests {
     }
 
     struct StubLlm {
+        output_budget: ferrum_output::OutputBudget,
         config: EngineConfig,
         adapter_support: AdapterExecutionSupport,
-        resource_authority: ExecutionResourceAuthority,
+        planning_model: ExecutionPlanningModel,
         context_capacity: Option<usize>,
         text: String,
         stream_chunks: Option<Vec<String>>,
@@ -5650,6 +5219,7 @@ mod tests {
         api_response: Option<ferrum_types::ApiResponse>,
         finish_reason: FinishReason,
         execution_attribution: Option<Value>,
+        cache_metrics: Option<Value>,
         lora_metrics: Option<Value>,
         pending_stream_drop_notify: Option<Arc<Notify>>,
         stream_after_first_gate: Option<Arc<StreamGate>>,
@@ -5662,9 +5232,10 @@ mod tests {
             let mut config = EngineConfig::default();
             config.model.model_id = ModelId::new("stub-model");
             Self {
+                output_budget: ferrum_output::OutputBudget::new(config.output.clone()).unwrap(),
                 config,
                 adapter_support: AdapterExecutionSupport::Unsupported,
-                resource_authority: ExecutionResourceAuthority::LegacyEngine,
+                planning_model: ExecutionPlanningModel::ExecutorManaged,
                 text: text.to_string(),
                 context_capacity: None,
                 stream_chunks: None,
@@ -5674,6 +5245,7 @@ mod tests {
                 api_response: None,
                 finish_reason: FinishReason::EOS,
                 execution_attribution: None,
+                cache_metrics: None,
                 lora_metrics: None,
                 pending_stream_drop_notify: None,
                 stream_after_first_gate: None,
@@ -5761,6 +5333,42 @@ mod tests {
         }
     }
 
+    fn test_inference_stream(
+        source: impl Stream<Item = ferrum_types::Result<StreamChunk>> + Send + 'static,
+    ) -> ferrum_types::Result<ferrum_output::InferenceStream> {
+        let budget = ferrum_output::OutputBudget::new(ferrum_types::OutputConfig::default())?;
+        let session = budget.try_open_session()?;
+        let producer_session = session.clone();
+        let mut source = Box::pin(source);
+        let wrapped = async_stream::try_stream! {
+            while let Some(chunk) = source.next().await {
+                yield producer_session.wrap_chunk(chunk?).await?;
+            }
+        };
+        Ok(ferrum_output::InferenceStream::new(
+            session,
+            Box::pin(wrapped),
+        ))
+    }
+
+    fn inference_stream_with_budget(
+        budget: &ferrum_output::OutputBudget,
+        source: impl Stream<Item = ferrum_types::Result<StreamChunk>> + Send + 'static,
+    ) -> ferrum_types::Result<ferrum_output::InferenceStream> {
+        let session = budget.try_open_session()?;
+        let producer_session = session.clone();
+        let mut source = Box::pin(source);
+        let wrapped = async_stream::try_stream! {
+            while let Some(chunk) = source.next().await {
+                yield producer_session.wrap_chunk(chunk?).await?;
+            }
+        };
+        Ok(ferrum_output::InferenceStream::new(
+            session,
+            Box::pin(wrapped),
+        ))
+    }
+
     struct PendingDropStream {
         drop_notify: Arc<Notify>,
     }
@@ -5794,6 +5402,7 @@ mod tests {
         infer_failure: ferrum_types::FerrumError,
         stream_start_failure: ferrum_types::FerrumError,
         stream_chunk_failure: ferrum_types::FerrumError,
+        output_session: Option<ferrum_output::OutputSession>,
     }
 
     impl FailingLlm {
@@ -5808,6 +5417,7 @@ mod tests {
                 stream_chunk_failure: ferrum_types::FerrumError::internal(
                     "stub stream chunk failed",
                 ),
+                output_session: None,
             }
         }
 
@@ -5845,6 +5455,7 @@ mod tests {
     }
 
     struct CapturingLlm {
+        output_budget: ferrum_output::OutputBudget,
         config: EngineConfig,
         adapter_support: AdapterExecutionSupport,
         last_request: Mutex<Option<InferenceRequest>>,
@@ -5855,6 +5466,7 @@ mod tests {
             let mut config = EngineConfig::default();
             config.model.model_id = ModelId::new("qwen3");
             Self {
+                output_budget: ferrum_output::OutputBudget::new(config.output.clone()).unwrap(),
                 config,
                 adapter_support: AdapterExecutionSupport::Unsupported,
                 last_request: Mutex::new(None),
@@ -5881,13 +5493,17 @@ mod tests {
 
     #[async_trait]
     impl InferenceEngine for StubLlm {
+        fn cache_metrics_snapshot(&self) -> Option<Value> {
+            self.cache_metrics.clone()
+        }
+
         async fn status(&self) -> EngineStatus {
             EngineStatus {
                 is_ready: true,
                 loaded_models: vec![self.config.model.model_id.clone()],
                 active_requests: 0,
                 queued_requests: 0,
-                memory_usage: MemoryUsage {
+                memory_usage: ferrum_types::MemoryObservation::Known(MemoryUsage {
                     total_bytes: 0,
                     used_bytes: 0,
                     free_bytes: 0,
@@ -5895,7 +5511,7 @@ mod tests {
                     cpu_memory_bytes: None,
                     cache_memory_bytes: 0,
                     utilization_percent: 0.0,
-                },
+                }),
                 uptime_seconds: 0,
                 last_heartbeat: chrono::Utc::now(),
                 version: "test".to_string(),
@@ -5904,6 +5520,11 @@ mod tests {
 
         async fn shutdown(&self) -> ferrum_types::Result<()> {
             self.shutdown_count.fetch_add(1, Ordering::AcqRel);
+            Ok(())
+        }
+
+        async fn wait_for_shutdown_completion(&self) -> ferrum_types::Result<()> {
+            // This HTTP response fixture has no background execution owners.
             Ok(())
         }
 
@@ -5936,7 +5557,7 @@ mod tests {
                 loaded_models: vec![self.config.model.model_id.clone()],
                 active_requests: 0,
                 queued_requests: 0,
-                memory_usage: MemoryUsage {
+                memory_usage: ferrum_types::MemoryObservation::Known(MemoryUsage {
                     total_bytes: 0,
                     used_bytes: 0,
                     free_bytes: 0,
@@ -5944,7 +5565,7 @@ mod tests {
                     cpu_memory_bytes: None,
                     cache_memory_bytes: 0,
                     utilization_percent: 0.0,
-                },
+                }),
                 uptime_seconds: 0,
                 last_heartbeat: chrono::Utc::now(),
                 version: "test".to_string(),
@@ -5952,6 +5573,10 @@ mod tests {
         }
 
         async fn shutdown(&self) -> ferrum_types::Result<()> {
+            Ok(())
+        }
+
+        async fn wait_for_shutdown_completion(&self) -> ferrum_types::Result<()> {
             Ok(())
         }
 
@@ -5976,7 +5601,7 @@ mod tests {
                 loaded_models: vec![self.config.model.model_id.clone()],
                 active_requests: 0,
                 queued_requests: 0,
-                memory_usage: MemoryUsage {
+                memory_usage: ferrum_types::MemoryObservation::Known(MemoryUsage {
                     total_bytes: 0,
                     used_bytes: 0,
                     free_bytes: 0,
@@ -5984,7 +5609,7 @@ mod tests {
                     cpu_memory_bytes: None,
                     cache_memory_bytes: 0,
                     utilization_percent: 0.0,
-                },
+                }),
                 uptime_seconds: 0,
                 last_heartbeat: chrono::Utc::now(),
                 version: "test".to_string(),
@@ -5992,6 +5617,10 @@ mod tests {
         }
 
         async fn shutdown(&self) -> ferrum_types::Result<()> {
+            Ok(())
+        }
+
+        async fn wait_for_shutdown_completion(&self) -> ferrum_types::Result<()> {
             Ok(())
         }
 
@@ -6027,6 +5656,7 @@ mod tests {
             engine_token_timing: requested.capture_engine_token_timing.then(|| {
                 EngineTokenTimingEvidence {
                     clock_source: "rust_std_instant".to_string(),
+                    request_start_boundary: request.ingress.map(|anchor| anchor.boundary()),
                     wall_anchor_unix_nanos: 1_700_000_000_000_000_000,
                     wall_anchor_max_error_nanos: 500,
                     decode_ready_nanos_since_request_start: Some(1_000_000),
@@ -6045,8 +5675,8 @@ mod tests {
             self.adapter_support
         }
 
-        fn execution_resource_authority(&self) -> ExecutionResourceAuthority {
-            self.resource_authority
+        fn execution_planning_model(&self) -> ExecutionPlanningModel {
+            self.planning_model
         }
 
         fn context_capacity(&self) -> Option<usize> {
@@ -6056,32 +5686,38 @@ mod tests {
         async fn infer(
             &self,
             request: InferenceRequest,
-        ) -> ferrum_types::Result<InferenceResponse> {
+        ) -> ferrum_types::Result<ferrum_output::InferenceOutput> {
             let execution_evidence = stub_execution_evidence(&request, 2);
-            Ok(InferenceResponse {
-                request_id: request.id,
-                text: self.text.clone(),
-                tokens: vec![TokenId::new(11), TokenId::new(12)],
-                finish_reason: self.finish_reason,
-                usage: TokenUsage::new(7, 2),
-                latency_ms: 1,
-                created_at: chrono::Utc::now(),
-                metadata: HashMap::new(),
-                api_response: self.api_response.clone(),
-                execution_evidence,
-            })
+            ferrum_output::InferenceOutput::new(
+                InferenceResponse {
+                    request_id: request.id,
+                    text: self.text.clone(),
+                    tokens: vec![TokenId::new(11), TokenId::new(12)],
+                    finish_reason: self.finish_reason,
+                    usage: TokenUsage::new(7, 2),
+                    latency_ms: 1,
+                    created_at: chrono::Utc::now(),
+                    metadata: HashMap::new(),
+                    api_response: self.api_response.clone(),
+                    execution_evidence,
+                },
+                self.output_budget
+                    .try_open_session()?
+                    .try_reserve_semantic(0)?,
+            )
         }
 
         async fn infer_stream(
             &self,
             request: InferenceRequest,
-        ) -> ferrum_types::Result<
-            Pin<Box<dyn Stream<Item = ferrum_types::Result<StreamChunk>> + Send>>,
-        > {
+        ) -> ferrum_types::Result<ferrum_output::InferenceStream> {
             if let Some(drop_notify) = self.pending_stream_drop_notify.as_ref() {
-                return Ok(Box::pin(PendingDropStream {
-                    drop_notify: Arc::clone(drop_notify),
-                }));
+                return inference_stream_with_budget(
+                    &self.output_budget,
+                    PendingDropStream {
+                        drop_notify: Arc::clone(drop_notify),
+                    },
+                );
             }
             if let Some(chunks) = &self.stream_chunks {
                 let completion_token_count = self
@@ -6135,19 +5771,25 @@ mod tests {
                     );
                 }
                 if let Some(gate) = self.stream_after_first_gate.clone() {
-                    return Ok(Box::pin(stream::unfold(
-                        (stream_chunks.into_iter().enumerate(), gate),
-                        |(mut chunks, gate)| async move {
-                            let (index, chunk) = chunks.next()?;
-                            if index == 1 {
-                                gate.entered.notify_one();
-                                gate.resume.notified().await;
-                            }
-                            Some((chunk, (chunks, gate)))
-                        },
-                    )));
+                    return inference_stream_with_budget(
+                        &self.output_budget,
+                        stream::unfold(
+                            (stream_chunks.into_iter().enumerate(), gate),
+                            |(mut chunks, gate)| async move {
+                                let (index, chunk) = chunks.next()?;
+                                if index == 1 {
+                                    gate.entered.notify_one();
+                                    gate.resume.notified().await;
+                                }
+                                Some((chunk, (chunks, gate)))
+                            },
+                        ),
+                    );
                 }
-                return Ok(Box::pin(stream::iter(stream_chunks)));
+                return inference_stream_with_budget(
+                    &self.output_budget,
+                    stream::iter(stream_chunks),
+                );
             }
 
             let execution_evidence = stub_execution_evidence(&request, 1);
@@ -6162,7 +5804,7 @@ mod tests {
                 api_response: self.api_response.clone(),
                 execution_evidence,
             };
-            Ok(Box::pin(stream::iter(vec![Ok(chunk)])))
+            inference_stream_with_budget(&self.output_budget, stream::iter(vec![Ok(chunk)]))
         }
     }
 
@@ -6171,21 +5813,25 @@ mod tests {
         async fn infer(
             &self,
             _request: InferenceRequest,
-        ) -> ferrum_types::Result<InferenceResponse> {
+        ) -> ferrum_types::Result<ferrum_output::InferenceOutput> {
             Err(self.infer_failure.clone())
         }
 
         async fn infer_stream(
             &self,
             request: InferenceRequest,
-        ) -> ferrum_types::Result<
-            Pin<Box<dyn Stream<Item = ferrum_types::Result<StreamChunk>> + Send>>,
-        > {
+        ) -> ferrum_types::Result<ferrum_output::InferenceStream> {
             if self.fail_after_stream_start {
                 let _request_id = request.id;
-                return Ok(Box::pin(stream::iter(vec![Err(self
+                if let Some(session) = &self.output_session {
+                    return Ok(ferrum_output::InferenceStream::new(
+                        session.clone(),
+                        Box::pin(stream::iter([Err(self.stream_chunk_failure.clone())])),
+                    ));
+                }
+                return test_inference_stream(stream::iter(vec![Err(self
                     .stream_chunk_failure
-                    .clone())])));
+                    .clone())]));
             }
             Err(self.stream_start_failure.clone())
         }
@@ -6200,28 +5846,31 @@ mod tests {
         async fn infer(
             &self,
             request: InferenceRequest,
-        ) -> ferrum_types::Result<InferenceResponse> {
+        ) -> ferrum_types::Result<ferrum_output::InferenceOutput> {
             *self.last_request.lock().expect("capture lock") = Some(request.clone());
-            Ok(InferenceResponse {
-                request_id: request.id,
-                text: "captured".to_string(),
-                tokens: vec![TokenId::new(21)],
-                finish_reason: FinishReason::Stop,
-                usage: TokenUsage::new(9, 1),
-                latency_ms: 1,
-                created_at: chrono::Utc::now(),
-                metadata: HashMap::new(),
-                api_response: None,
-                execution_evidence: None,
-            })
+            ferrum_output::InferenceOutput::new(
+                InferenceResponse {
+                    request_id: request.id,
+                    text: "captured".to_string(),
+                    tokens: vec![TokenId::new(21)],
+                    finish_reason: FinishReason::Stop,
+                    usage: TokenUsage::new(9, 1),
+                    latency_ms: 1,
+                    created_at: chrono::Utc::now(),
+                    metadata: HashMap::new(),
+                    api_response: None,
+                    execution_evidence: None,
+                },
+                self.output_budget
+                    .try_open_session()?
+                    .try_reserve_semantic(0)?,
+            )
         }
 
         async fn infer_stream(
             &self,
             request: InferenceRequest,
-        ) -> ferrum_types::Result<
-            Pin<Box<dyn Stream<Item = ferrum_types::Result<StreamChunk>> + Send>>,
-        > {
+        ) -> ferrum_types::Result<ferrum_output::InferenceStream> {
             *self.last_request.lock().expect("capture lock") = Some(request.clone());
             let chunk = StreamChunk {
                 request_id: request.id,
@@ -6234,7 +5883,7 @@ mod tests {
                 api_response: None,
                 execution_evidence: None,
             };
-            Ok(Box::pin(stream::iter(vec![Ok(chunk)])))
+            inference_stream_with_budget(&self.output_budget, stream::iter(vec![Ok(chunk)]))
         }
     }
 
@@ -6243,13 +5892,16 @@ mod tests {
     }
 
     fn router_with_stub(text: &str) -> Router {
-        AxumServer::from_llm(Arc::new(StubLlm::new(text))).build_router()
+        AxumServer::from_llm(Arc::new(StubLlm::new(text)))
+            .build_router()
+            .unwrap()
     }
 
     fn router_with_stub_and_template(text: &str, template: ModelChatTemplate) -> Router {
         AxumServer::from_llm(Arc::new(StubLlm::new(text)))
             .with_prompt_template(Some(template))
             .build_router()
+            .unwrap()
     }
 
     fn router_with_stub_and_request_dump_dir(text: &str, request_dump_dir: PathBuf) -> Router {
@@ -6259,25 +5911,29 @@ mod tests {
                 .with_request_dump_dir(Some(request_dump_dir)),
         )
         .build_router()
+        .unwrap()
     }
 
     fn router_with_stub_request_dump_and_profile(
         text: &str,
         request_dump_dir: PathBuf,
         profile_jsonl: PathBuf,
-    ) -> Router {
-        AxumServer::from_state(
+    ) -> (AxumServer, Router) {
+        let server = AxumServer::from_state(
             AppState::default()
                 .with_llm(Arc::new(StubLlm::new(text)))
                 .with_request_dump_dir(Some(request_dump_dir))
                 .with_profile_detail(ferrum_types::ObservabilityProfileDetail::Latency)
                 .with_profile_jsonl(Some(profile_jsonl)),
-        )
-        .build_router()
+        );
+        let router = server.build_router().unwrap();
+        (server, router)
     }
 
     fn router_with_stub_stream_chunks(chunks: &[&str]) -> Router {
-        AxumServer::from_llm(Arc::new(StubLlm::with_stream_chunks(chunks))).build_router()
+        AxumServer::from_llm(Arc::new(StubLlm::with_stream_chunks(chunks)))
+            .build_router()
+            .unwrap()
     }
 
     fn router_with_stub_finish_reason(text: &str, finish_reason: FinishReason) -> Router {
@@ -6286,6 +5942,7 @@ mod tests {
             ..StubLlm::new(text)
         }))
         .build_router()
+        .unwrap()
     }
 
     fn router_with_stub_stream_chunks_and_request_dump_dir(
@@ -6298,26 +5955,29 @@ mod tests {
                 .with_request_dump_dir(Some(request_dump_dir)),
         )
         .build_router()
+        .unwrap()
     }
 
     fn router_with_stub_stream_request_dump_and_profile(
         chunks: &[&str],
         request_dump_dir: PathBuf,
         profile_jsonl: PathBuf,
-    ) -> Router {
-        AxumServer::from_state(
+    ) -> (AxumServer, Router) {
+        let server = AxumServer::from_state(
             AppState::default()
                 .with_llm(Arc::new(StubLlm::with_stream_chunks(chunks)))
                 .with_request_dump_dir(Some(request_dump_dir))
                 .with_profile_detail(ferrum_types::ObservabilityProfileDetail::Latency)
                 .with_profile_jsonl(Some(profile_jsonl)),
-        )
-        .build_router()
+        );
+        let router = server.build_router().unwrap();
+        (server, router)
     }
 
     fn router_with_stub_separate_final_stream_chunk(chunks: &[&str]) -> Router {
         AxumServer::from_llm(Arc::new(StubLlm::with_separate_final_stream_chunk(chunks)))
             .build_router()
+            .unwrap()
     }
 
     fn router_with_stub_api_response(
@@ -6326,6 +5986,7 @@ mod tests {
     ) -> Router {
         AxumServer::from_llm(Arc::new(StubLlm::with_api_response(text, api_response)))
             .build_router()
+            .unwrap()
     }
 
     fn router_with_stub_api_response_and_finish_reason(
@@ -6339,6 +6000,7 @@ mod tests {
             finish_reason,
         )))
         .build_router()
+        .unwrap()
     }
 
     fn weather_tool_api_response() -> ferrum_types::ApiResponse {
@@ -6424,15 +6086,21 @@ mod tests {
     }
 
     fn router_with_stub_without_stream_usage(text: &str) -> Router {
-        AxumServer::from_llm(Arc::new(StubLlm::without_stream_usage(text))).build_router()
+        AxumServer::from_llm(Arc::new(StubLlm::without_stream_usage(text)))
+            .build_router()
+            .unwrap()
     }
 
     fn router_without_llm() -> Router {
-        AxumServer::from_state(AppState::default()).build_router()
+        AxumServer::from_state(AppState::default())
+            .build_router()
+            .unwrap()
     }
 
     fn router_with_failing_llm() -> Router {
-        AxumServer::from_llm(Arc::new(FailingLlm::new())).build_router()
+        AxumServer::from_llm(Arc::new(FailingLlm::new()))
+            .build_router()
+            .unwrap()
     }
 
     fn router_with_failing_llm_and_request_dump_dir(request_dump_dir: PathBuf) -> Router {
@@ -6442,20 +6110,22 @@ mod tests {
                 .with_request_dump_dir(Some(request_dump_dir)),
         )
         .build_router()
+        .unwrap()
     }
 
     fn router_with_failing_llm_request_dump_and_profile(
         request_dump_dir: PathBuf,
         profile_jsonl: PathBuf,
-    ) -> Router {
-        AxumServer::from_state(
+    ) -> (AxumServer, Router) {
+        let server = AxumServer::from_state(
             AppState::default()
                 .with_llm(Arc::new(FailingLlm::new()))
                 .with_request_dump_dir(Some(request_dump_dir))
                 .with_profile_detail(ferrum_types::ObservabilityProfileDetail::Latency)
                 .with_profile_jsonl(Some(profile_jsonl)),
-        )
-        .build_router()
+        );
+        let router = server.build_router().unwrap();
+        (server, router)
     }
 
     fn router_with_resource_exhausted_llm_and_request_dump_dir(
@@ -6467,10 +6137,13 @@ mod tests {
                 .with_request_dump_dir(Some(request_dump_dir)),
         )
         .build_router()
+        .unwrap()
     }
 
     fn router_with_stream_chunk_failing_llm() -> Router {
-        AxumServer::from_llm(Arc::new(FailingLlm::after_stream_start())).build_router()
+        AxumServer::from_llm(Arc::new(FailingLlm::after_stream_start()))
+            .build_router()
+            .unwrap()
     }
 
     fn router_with_stream_chunk_failing_llm_and_request_dump_dir(
@@ -6482,6 +6155,7 @@ mod tests {
                 .with_request_dump_dir(Some(request_dump_dir)),
         )
         .build_router()
+        .unwrap()
     }
 
     fn router_with_capturing_llm() -> (Router, Arc<CapturingLlm>) {
@@ -6499,7 +6173,8 @@ mod tests {
         .unwrap();
         let router = AxumServer::from_llm(engine.clone())
             .with_served_model_registry(registry)
-            .build_router();
+            .build_router()
+            .unwrap();
         (router, engine)
     }
 
@@ -6676,7 +6351,8 @@ mod tests {
             .with_served_model_registry(registry)
             .with_prompt_template(Some(template))
             .with_default_enable_thinking(default_enable_thinking)
-            .build_router();
+            .build_router()
+            .unwrap();
         (router, engine)
     }
 
@@ -6759,7 +6435,8 @@ mod tests {
                 )],
             )
             .unwrap()
-            .build_router();
+            .build_router()
+            .unwrap();
         (router, engine)
     }
 
@@ -7241,7 +6918,8 @@ mod tests {
                 .with_prompt_template(Some(template))
                 .with_interleaved_system_coalescing(false),
         )
-        .build_router();
+        .build_router()
+        .unwrap();
         let response = post_json(
             router,
             "/v1/responses",
@@ -7317,7 +6995,8 @@ mod tests {
                 .with_prompt_template(Some(template()))
                 .with_interleaved_system_coalescing(false),
         )
-        .build_router();
+        .build_router()
+        .unwrap();
         let disabled = post_json(disabled_router, "/v1/chat/completions", request()).await;
         assert_eq!(disabled.status(), AxumStatusCode::BAD_REQUEST);
         let body = response_json(disabled).await;
@@ -7738,13 +7417,46 @@ mod tests {
     }
 
     #[test]
+    fn unknown_owner_memory_is_not_zero_or_unhealthy() {
+        let status = EngineStatus {
+            is_ready: true,
+            loaded_models: Vec::new(),
+            active_requests: 0,
+            queued_requests: 0,
+            memory_usage: ferrum_types::MemoryObservation::Unknown,
+            uptime_seconds: 0,
+            last_heartbeat: chrono::Utc::now(),
+            version: "test".into(),
+        };
+        let diagnostic = chat_resource_failure_diagnostics(
+            "request",
+            "oom",
+            "execute",
+            "resource_exhausted",
+            "device allocation failed",
+            1,
+            None,
+            Some(&status),
+        );
+        let memory = &diagnostic["nearest_memory_snapshot"];
+        assert_eq!(memory["source"], "unavailable");
+        assert!(memory["current_bytes"].is_null());
+        assert!(memory["high_water_bytes"].is_null());
+        for key in ["needed", "available", "capacity"] {
+            assert!(diagnostic["capacity"][key].is_null(), "fabricated {key}");
+        }
+        assert!(status.is_ready);
+        assert!(serde_json::to_value(status).unwrap()["memory_usage"].is_null());
+    }
+
+    #[test]
     fn admission_health_prefers_runtime_authority_over_preflight_estimate() {
         let engine_status = EngineStatus {
             is_ready: true,
             loaded_models: Vec::new(),
             active_requests: 2,
             queued_requests: 1,
-            memory_usage: MemoryUsage {
+            memory_usage: ferrum_types::MemoryObservation::Known(MemoryUsage {
                 total_bytes: 0,
                 used_bytes: 0,
                 free_bytes: 0,
@@ -7752,13 +7464,13 @@ mod tests {
                 cpu_memory_bytes: None,
                 cache_memory_bytes: 0,
                 utilization_percent: 0.0,
-            },
+            }),
             uptime_seconds: 0,
             last_heartbeat: chrono::Utc::now(),
             version: "test".to_owned(),
         };
         let runtime = ferrum_types::ExecutorAdmissionSnapshot::new(
-            ferrum_types::ExecutionResourceAuthority::PlanRuntime,
+            ferrum_types::ExecutionPlanningModel::CompiledPlan,
             ferrum_types::ExecutorAdmissionLimits::new(32, 4096).unwrap(),
             2,
             7,
@@ -7802,7 +7514,7 @@ mod tests {
             loaded_models: Vec::new(),
             active_requests: 32,
             queued_requests: 1,
-            memory_usage: MemoryUsage {
+            memory_usage: ferrum_types::MemoryObservation::Known(MemoryUsage {
                 total_bytes: 0,
                 used_bytes: 0,
                 free_bytes: 0,
@@ -7810,7 +7522,7 @@ mod tests {
                 cpu_memory_bytes: None,
                 cache_memory_bytes: 0,
                 utilization_percent: 0.0,
-            },
+            }),
             uptime_seconds: 0,
             last_heartbeat: chrono::Utc::now(),
             version: "test".to_owned(),
@@ -7926,7 +7638,8 @@ mod tests {
             )],
         )
         .unwrap()
-        .build_router();
+        .build_router()
+        .unwrap();
         let response = get(router, "/health").await;
         assert_eq!(response.status(), AxumStatusCode::OK);
         let body = response_json(response).await;
@@ -7957,7 +7670,7 @@ mod tests {
                 "fallback_counts": {"silent": 0, "dense": 0, "legacy": 0}
             }),
         )))
-        .build_router();
+        .build_router().unwrap();
         let response = get(router, "/health").await;
         assert_eq!(response.status(), AxumStatusCode::OK);
         let body = response_json(response).await;
@@ -8006,7 +7719,8 @@ mod tests {
         .unwrap();
         let router = AxumServer::from_llm(engine.clone())
             .with_served_model_registry(registry)
-            .build_router();
+            .build_router()
+            .unwrap();
         let response = post_json(
             router,
             "/v1/chat/completions",
@@ -8035,7 +7749,8 @@ mod tests {
         .unwrap();
         let router = AxumServer::from_llm(Arc::new(CapturingLlm::new()))
             .with_served_model_registry(registry)
-            .build_router();
+            .build_router()
+            .unwrap();
         let body = response_json(get(router, "/v1/models").await).await;
         let ids = body["data"]
             .as_array()
@@ -8074,7 +7789,8 @@ mod tests {
         .unwrap();
         let router = AxumServer::from_llm(Arc::new(engine))
             .with_served_model_registry(registry)
-            .build_router();
+            .build_router()
+            .unwrap();
         let body = response_json(get(router, "/v1/models").await).await;
         let entries = body["data"].as_array().unwrap();
         assert_eq!(entries.len(), 3);
@@ -8097,7 +7813,8 @@ mod tests {
             )],
         )
         .unwrap()
-        .build_router();
+        .build_router()
+        .unwrap();
         let response = get(router, "/v1/models").await;
         assert_eq!(response.status(), AxumStatusCode::OK);
         let body = response_json(response).await;
@@ -8189,7 +7906,7 @@ mod tests {
     #[tokio::test]
     async fn route_chat_unknown_served_model_returns_openai_model_error() {
         let engine = Arc::new(CapturingLlm::new());
-        let router = AxumServer::from_llm(engine.clone()).build_router();
+        let router = AxumServer::from_llm(engine.clone()).build_router().unwrap();
         let response = post_json(
             router,
             "/v1/chat/completions",
@@ -8967,7 +8684,8 @@ mod tests {
             AxumServer::from_llm(Arc::new(StubLlm::with_pending_stream(Arc::clone(
                 &stream_dropped,
             ))))
-            .build_router(),
+            .build_router()
+            .unwrap(),
             "/v1/chat/completions",
             required_tool_with_strict_response_format_request(true),
         )
@@ -9658,7 +9376,8 @@ mod tests {
                 request["prompt"] = json!("hello");
             }
             let router = AxumServer::from_llm(Arc::new(StubLlm::with_tokenless_tail(&chunks)))
-                .build_router();
+                .build_router()
+                .unwrap();
             let response = post_json(router, path, request).await;
             assert_eq!(response.status(), AxumStatusCode::OK);
             let body = response_text(response).await;
@@ -10247,7 +9966,7 @@ mod tests {
     #[tokio::test]
     async fn chat_request_forbids_initial_think_close_token() {
         let engine = Arc::new(CapturingLlm::new());
-        let router = AxumServer::from_llm(engine.clone()).build_router();
+        let router = AxumServer::from_llm(engine.clone()).build_router().unwrap();
         let response = post_json(
             router,
             "/v1/chat/completions",
@@ -10708,7 +10427,8 @@ mod tests {
                 input["model"] = json!("failing-model");
                 input["stream"] = json!(stream);
                 let router = AxumServer::from_llm(Arc::new(FailingLlm::context_length_exceeded()))
-                    .build_router();
+                    .build_router()
+                    .unwrap();
                 let response = post_json(router, path, input).await;
                 assert_eq!(
                     response.status(),
@@ -10754,8 +10474,10 @@ mod tests {
     async fn route_chat_generation_failure_writes_replay_diagnostics() {
         let root = unique_request_dump_dir("chat-sync-failure");
         let profile = unique_profile_jsonl("chat-sync-failure");
+        let (server, router) =
+            router_with_failing_llm_request_dump_and_profile(root.clone(), profile.clone());
         let response = post_json(
-            router_with_failing_llm_request_dump_and_profile(root.clone(), profile.clone()),
+            router,
             "/v1/chat/completions",
             json!({
                 "model": "failing-model",
@@ -10770,6 +10492,15 @@ mod tests {
             "internal",
             "stub generation failed",
         );
+        server
+            .lifecycle
+            .profile_delivery
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .flush()
+            .unwrap();
         let event = read_profile_events(&profile)
             .into_iter()
             .find(|event| event["phase"] == "chat_completions_sync")
@@ -10845,8 +10576,10 @@ mod tests {
     async fn route_chat_sync_success_writes_product_profile_event() {
         let root = unique_request_dump_dir("chat-sync-profile");
         let profile = unique_profile_jsonl("chat-sync-profile");
+        let (server, router) =
+            router_with_stub_request_dump_and_profile("OK", root.clone(), profile.clone());
         let response = post_json(
-            router_with_stub_request_dump_and_profile("OK", root.clone(), profile.clone()),
+            router,
             "/v1/chat/completions",
             json!({
                 "model": "stub-model",
@@ -10857,6 +10590,15 @@ mod tests {
         assert_eq!(response.status(), AxumStatusCode::OK);
         let response_body = response_json(response).await;
 
+        server
+            .lifecycle
+            .profile_delivery
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .flush()
+            .unwrap();
         let events = read_profile_events(&profile);
         assert_eq!(events.len(), 2, "events: {events:#?}");
         let event = events
@@ -10938,12 +10680,14 @@ mod tests {
             "bench-123".to_string(),
             "cell-1-closed-c8".to_string(),
             2,
-            ferrum_bench_core::BenchmarkPhase::Measured,
+            ferrum_types::BenchmarkPhase::Measured,
             17,
         )
         .unwrap();
+        let (server, router) =
+            router_with_stub_request_dump_and_profile("OK", root.clone(), profile.clone());
         let response = post_json_with_benchmark_correlation(
-            router_with_stub_request_dump_and_profile("OK", root.clone(), profile.clone()),
+            router,
             "/v1/chat/completions",
             json!({
                 "model": "stub-model",
@@ -10955,6 +10699,15 @@ mod tests {
         assert_eq!(response.status(), AxumStatusCode::OK);
         let _ = response_json(response).await;
 
+        server
+            .lifecycle
+            .profile_delivery
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .flush()
+            .unwrap();
         let events = read_profile_events(&profile);
         assert_eq!(events.len(), 2, "events: {events:#?}");
         for event in events {
@@ -10995,7 +10748,12 @@ mod tests {
     async fn route_chat_sync_profile_jsonl_is_parseable_under_concurrent_requests() {
         let root = unique_request_dump_dir("chat-sync-profile-concurrent");
         let profile = unique_profile_jsonl("chat-sync-profile-concurrent");
-        let app = router_with_stub_request_dump_and_profile("OK", root.clone(), profile.clone());
+        let server = AxumServer::from_state(
+            state_with_stub("OK")
+                .with_request_dump_dir(Some(root.clone()))
+                .with_profile_jsonl(Some(profile.clone())),
+        );
+        let app = server.build_router().unwrap();
 
         let mut handles = Vec::new();
         for request_index in 0..8 {
@@ -11020,6 +10778,24 @@ mod tests {
             handle.await.expect("concurrent request task");
         }
 
+        server
+            .lifecycle
+            .profile_delivery
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .flush()
+            .unwrap();
+        let report = server.profile_delivery_report().unwrap();
+        let stats = report.journals[0].stats;
+        assert_eq!(
+            stats.accepted + stats.dropped,
+            9,
+            "8 completions and 1 first-request memory observation"
+        );
+        assert_eq!(stats.failed, 0);
+        assert_eq!(stats.accepted, stats.flushed);
         let raw = fs::read_to_string(&profile).expect("profile jsonl");
         let mut completion_events = 0usize;
         for (line_index, line) in raw
@@ -11037,7 +10813,18 @@ mod tests {
                 completion_events += 1;
             }
         }
-        assert_eq!(completion_events, 8);
+        assert_eq!(
+            raw.lines().filter(|line| !line.trim().is_empty()).count() as u64,
+            stats.accepted
+        );
+        assert!(completion_events <= 8);
+        if stats.dropped == 0 {
+            assert_eq!(completion_events, 8);
+        }
+        server
+            .stop(std::time::Duration::from_secs(2))
+            .await
+            .unwrap();
         let _ = fs::remove_dir_all(root);
         let _ = fs::remove_file(profile);
     }
@@ -11066,12 +10853,13 @@ mod tests {
     async fn route_chat_stream_success_writes_product_profile_event() {
         let root = unique_request_dump_dir("chat-stream-profile");
         let profile = unique_profile_jsonl("chat-stream-profile");
+        let (server, router) = router_with_stub_stream_request_dump_and_profile(
+            &["O", "K"],
+            root.clone(),
+            profile.clone(),
+        );
         let response = post_json(
-            router_with_stub_stream_request_dump_and_profile(
-                &["O", "K"],
-                root.clone(),
-                profile.clone(),
-            ),
+            router,
             "/v1/chat/completions",
             json!({
                 "model": "stub-model",
@@ -11084,6 +10872,15 @@ mod tests {
         let body = response_text(response).await;
         assert!(body.contains("data: [DONE]"), "body: {body}");
 
+        server
+            .lifecycle
+            .profile_delivery
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .flush()
+            .unwrap();
         let events = read_profile_events(&profile);
         assert_eq!(events.len(), 2, "events: {events:#?}");
         let event = events
@@ -11171,14 +10968,14 @@ mod tests {
             stream_usage: Some(TokenUsage::new(5, 2)),
             ..StubLlm::with_stream_chunks(&["Paris"])
         };
-        let app = AxumServer::from_state(
+        let server = AxumServer::from_state(
             AppState::default()
                 .with_llm(Arc::new(llm))
                 .with_request_dump_dir(Some(root.clone()))
                 .with_profile_detail(ferrum_types::ObservabilityProfileDetail::Latency)
                 .with_profile_jsonl(Some(profile.clone())),
-        )
-        .build_router();
+        );
+        let app = server.build_router().unwrap();
 
         let response = post_json(
             app,
@@ -11196,6 +10993,15 @@ mod tests {
         assert!(body.contains("\"completion_tokens\":2"), "body: {body}");
         assert!(body.contains("data: [DONE]"), "body: {body}");
 
+        server
+            .lifecycle
+            .profile_delivery
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .flush()
+            .unwrap();
         let events = read_profile_events(&profile);
         let event = events
             .iter()
@@ -11383,6 +11189,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn route_completions_known_error_bypasses_full_encoded_pool() {
+        use futures::FutureExt;
+        let budget = ferrum_output::OutputBudget::new(ferrum_types::OutputConfig {
+            encoded_bytes_total: 8,
+            max_event_bytes: 8,
+            ..Default::default()
+        })
+        .unwrap();
+        let session = budget.try_open_session().unwrap();
+        let held = session.reserve_encoded(8).await.unwrap();
+        let engine = FailingLlm {
+            output_session: Some(session),
+            ..FailingLlm::after_stream_start()
+        };
+        let router = AxumServer::from_llm(Arc::new(engine))
+            .build_router()
+            .unwrap();
+        let response = post_json(
+            router,
+            "/v1/completions",
+            json!({
+                "model": "failing-model", "prompt": "complete me", "stream": true
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), AxumStatusCode::OK);
+        let mut body = response.into_body().into_data_stream();
+        let frame = body
+            .next()
+            .now_or_never()
+            .expect("known failure cannot await normal credit")
+            .unwrap()
+            .unwrap();
+        let wire = std::str::from_utf8(&frame).unwrap();
+        assert_openai_stream_error(wire, "stub stream chunk failed");
+        assert!(wire.ends_with("data: [DONE]\n\n"));
+        assert_eq!(wire.matches("[DONE]").count(), 1);
+        assert_eq!(budget.usage().encoded_bytes, 8);
+        assert_eq!(budget.usage().control_bytes, frame.len());
+        assert!(body.next().now_or_never().unwrap().is_none());
+        drop(body);
+        drop(frame);
+        drop(held);
+        assert_eq!(budget.usage().control_bytes, 0);
+        assert_eq!(budget.usage().sessions, 0);
+    }
+
+    #[tokio::test]
     async fn route_completions_stream_chunk_failure_emits_openai_error_event() {
         let response = post_json(
             router_with_stream_chunk_failing_llm(),
@@ -11432,7 +11286,8 @@ mod tests {
         .unwrap();
         let router = AxumServer::from_llm(engine.clone())
             .with_served_model_registry(registry)
-            .build_router();
+            .build_router()
+            .unwrap();
         let response = post_json(
             router,
             "/v1/completions",
@@ -12625,7 +12480,8 @@ mod tests {
         ] {
             let router = AxumServer::from_llm(Arc::new(StubLlm::with_stream_chunks(&chunks)))
                 .with_prompt_template(Some(prompt_opened_literal_json_template()))
-                .build_router();
+                .build_router()
+                .unwrap();
             let response = post_json(
                 router,
                 "/v1/chat/completions",
@@ -12973,7 +12829,8 @@ mod tests {
                 };
                 let router = AxumServer::from_llm(Arc::new(engine))
                     .with_prompt_template(Some(harmony_json_template()))
-                    .build_router();
+                    .build_router()
+                    .unwrap();
                 let mut request = harmony_json_request(stream);
                 if finish_reason == FinishReason::Stop {
                     // An explicit stop at the model's terminal removes that
@@ -13538,65 +13395,49 @@ mod tests {
         }
     }
 
-    #[test]
-    fn server_prefix_prompt_observation_follows_engine_authority() {
-        let policy = CachePolicy {
-            prefix_cache_enabled: true,
-            session_cache_mode: "off".to_string(),
-            session_cache_max_entries: 128,
-            session_cache_max_tokens: 4096,
-        };
+    #[tokio::test]
+    async fn route_overlapping_prompts_without_owner_leave_prefix_metrics_unavailable() {
         for authority in [
-            ExecutionResourceAuthority::PlanRuntime,
-            ExecutionResourceAuthority::LegacyEngine,
+            ExecutionPlanningModel::CompiledPlan,
+            ExecutionPlanningModel::ExecutorManaged,
         ] {
-            let engine = StubLlm {
-                resource_authority: authority,
+            let engine = Arc::new(StubLlm {
+                planning_model: authority,
                 ..StubLlm::new("ok")
-            };
-            // There is deliberately no cache metrics snapshot. Native authority
-            // alone must skip the text fallback, including unsupported plans.
+            });
             assert!(engine.cache_metrics_snapshot().is_none());
-            let state = AppState::default().with_llm(Arc::new(engine));
-            state.record_prefix_prompt("alpha beta gamma", &policy);
-            state.record_prefix_prompt("alpha beta delta", &policy);
-            let stats = state.cache.stats();
-            let prompts = state.cache.prefix_prompts.lock().unwrap();
-            match authority {
-                ExecutionResourceAuthority::PlanRuntime => {
-                    assert!(prompts.is_empty());
-                    assert_eq!(stats.prefix_entries, 0);
-                    assert_eq!(stats.prefix_bytes, 0);
-                    assert_eq!(stats.prefix_hits, 0);
-                    assert_eq!(stats.prefix_misses, 0);
-                    assert_eq!(stats.prefix_saved_prefill_tokens, 0);
-                }
-                ExecutionResourceAuthority::LegacyEngine => {
-                    assert_eq!(prompts.len(), 2);
-                    assert!(prompts.contains_key("alpha beta gamma"));
-                    assert!(prompts.contains_key("alpha beta delta"));
-                    assert_eq!(stats.prefix_entries, 2);
-                    assert_eq!(stats.prefix_bytes, 32);
-                    assert_eq!(stats.prefix_hits, 1);
-                    assert_eq!(stats.prefix_misses, 1);
-                    assert!(stats.prefix_saved_prefill_tokens > 0);
-                }
+            let state = AppState::default().with_llm(engine.clone());
+            let cache = state.cache.clone();
+            let router = AxumServer::from_state(state).build_router().unwrap();
+            for prompt in ["alpha beta gamma", "alpha beta delta"] {
+                let response = post_json(
+                    router.clone(),
+                    "/v1/chat/completions",
+                    json!({
+                        "model": "stub-model",
+                        "messages": [{"role": "user", "content": prompt}],
+                    }),
+                )
+                .await;
+                assert_eq!(response.status(), AxumStatusCode::OK);
+                let body = response_json(response).await;
+                assert_eq!(body["choices"][0]["message"]["content"], "ok");
             }
+
+            let health = response_json(get(router.clone(), "/health").await).await;
+            assert_eq!(health["status"], "healthy");
+            assert_eq!(health["cache"]["prefix_cache"], Value::Null);
+            assert_eq!(health["cache"]["session_cache"]["entries"], 0);
+            assert!(cache.sessions.lock().unwrap().is_empty());
+            assert_eq!(engine.output_budget.usage().sessions, 0);
+            let metrics = response_text(get(router, "/metrics").await).await;
+            assert!(!metrics.contains("ferrum_prefix_cache_"), "{metrics}");
+            assert!(metrics.contains("ferrum_session_cache_entries 0\n"));
         }
     }
 
-    #[test]
-    fn cache_metrics_use_engine_real_kv_snapshot_when_available() {
-        let cache = CacheRuntimeState::default();
-        let policy = CachePolicy {
-            prefix_cache_enabled: true,
-            session_cache_mode: "memory".to_string(),
-            session_cache_max_entries: 128,
-            session_cache_max_tokens: 4096,
-        };
-        cache.record_prefix_prompt("alpha beta gamma", &policy);
-        cache.record_prefix_prompt("alpha beta delta", &policy);
-
+    #[tokio::test]
+    async fn route_cache_metrics_preserve_owner_snapshot() {
         let engine_snapshot = json!({
             "position": "real-kv-reuse",
             "source": "llama-family-paged-block-prefix-cache",
@@ -13613,29 +13454,49 @@ mod tests {
             "selected_stage_bridge": "host",
             "stage_count": 2,
         });
+        let router = AxumServer::from_llm(Arc::new(StubLlm {
+            cache_metrics: Some(engine_snapshot.clone()),
+            ..StubLlm::new("ok")
+        }))
+        .build_router()
+        .unwrap();
+        let health = response_json(get(router.clone(), "/health").await).await;
+        assert_eq!(health["status"], "healthy");
+        assert_eq!(health["cache"]["prefix_cache"], engine_snapshot);
 
-        let health = cache.health_json(&policy, Some(&engine_snapshot));
-        let prefix = &health["prefix_cache"];
-        assert_eq!(prefix["position"], "real-kv-reuse");
-        assert_eq!(prefix["source"], "llama-family-paged-block-prefix-cache");
-        assert_eq!(prefix["hits"], 7);
-        assert_eq!(prefix["misses"], 3);
-        assert_eq!(prefix["evictions"], 1);
-        assert_eq!(prefix["saved_prefill_tokens"], 64);
-        assert_eq!(prefix["entries"], 5);
-        assert_eq!(prefix["bytes"], 8192);
-        assert_eq!(prefix["block_size"], 16);
-        assert_eq!(prefix["kv_dtype"], "fp16");
-        assert_eq!(prefix["selected_pipeline_mode"], "batch");
-        assert_eq!(prefix["selected_stage_bridge"], "host");
-        assert_eq!(prefix["stage_count"], 2);
-
-        let metrics = cache.prometheus_metrics(Some(&engine_snapshot));
+        let metrics = response_text(get(router, "/metrics").await).await;
         assert!(metrics.contains("ferrum_prefix_cache_hits_total 7\n"));
         assert!(metrics.contains("ferrum_prefix_cache_misses_total 3\n"));
+        assert!(metrics.contains("ferrum_prefix_cache_evictions_total 1\n"));
         assert!(metrics.contains("ferrum_prefix_cache_saved_prefill_tokens_total 64\n"));
         assert!(metrics.contains("ferrum_prefix_cache_entries 5\n"));
         assert!(metrics.contains("ferrum_prefix_cache_bytes 8192\n"));
+    }
+
+    #[tokio::test]
+    async fn route_cache_metrics_preserve_partial_owner_snapshot_without_filling_gaps() {
+        let engine_snapshot = json!({
+            "source": "test-owner",
+            "enabled": false,
+            "hits": 0,
+            "bytes": null,
+            "reason": "cache disabled",
+        });
+        let router = AxumServer::from_llm(Arc::new(StubLlm {
+            cache_metrics: Some(engine_snapshot.clone()),
+            ..StubLlm::new("ok")
+        }))
+        .build_router()
+        .unwrap();
+        let health = response_json(get(router.clone(), "/health").await).await;
+        assert_eq!(health["status"], "healthy");
+        assert_eq!(health["cache"]["prefix_cache"], engine_snapshot);
+        let metrics = response_text(get(router, "/metrics").await).await;
+        let prefix_metrics: Vec<_> = metrics
+            .lines()
+            .filter(|line| line.starts_with("ferrum_prefix_cache_"))
+            .collect();
+        assert_eq!(prefix_metrics, ["ferrum_prefix_cache_hits_total 0"]);
     }
 
     #[tokio::test]

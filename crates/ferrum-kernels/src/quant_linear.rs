@@ -23,7 +23,7 @@ pub mod cuda_marlin;
 pub mod cuda_marlin_stack;
 
 #[cfg(all(target_os = "macos", feature = "metal"))]
-pub mod metal_gguf;
+pub(crate) mod metal_gguf;
 
 #[cfg(all(target_os = "macos", feature = "metal"))]
-pub mod metal_gguf_moe;
+pub(crate) mod metal_gguf_moe;

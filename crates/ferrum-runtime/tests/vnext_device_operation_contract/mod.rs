@@ -7,6 +7,9 @@ pub(crate) use ferrum_runtime::*;
 #[path = "../vnext_numerical_fixture/mod.rs"]
 mod numerical_fixture;
 pub(crate) use numerical_fixture::*;
+mod device_facts_backend;
+mod resident_backend;
+pub(crate) use device_facts_backend::{test_device_facts, DeviceFactsFault};
 pub(crate) use serde::{Deserialize, Serialize};
 pub(crate) use serde_json::{json, Value};
 pub(crate) use std::collections::{BTreeMap, BTreeSet};
@@ -773,6 +776,8 @@ impl ProviderBehavior {
 
 #[derive(Default)]
 pub(crate) struct ProviderTrace {
+    pub(crate) facts_capture_at_encode: Vec<ExecutionFactsCapture>,
+    pub(crate) segment_regions_by_node: BTreeMap<NodeId, Vec<SegmentBindingRegionRequest>>,
     pub(crate) reusable_binding_resources: ReusableBindingResources,
     pub(crate) reusable_views: Vec<(NodeId, BTreeSet<ResourceId>, BTreeSet<ProgramValueId>)>,
     pub(crate) reusable_topology_calls: u64,
@@ -962,6 +967,9 @@ impl OperationProvider<TestRuntime> for TestProvider {
     ) -> Result<EncodedDeviceOperation<TestCommand>, OperationFailure> {
         let mut trace = self.trace.lock().unwrap();
         trace.encode_calls += 1;
+        trace
+            .facts_capture_at_encode
+            .push(invocation.execution_facts_capture());
         trace.last_participant_count = invocation.participants().len();
         trace.last_work_sequences = invocation.work_shape().immediate_sequences();
         if let Some(binding) = invocation.program_binding() {
@@ -1062,6 +1070,29 @@ impl OperationProvider<TestRuntime> for TestProvider {
             )
             .unwrap()),
         }
+    }
+
+    fn encode_selected_with_segment_declaration(
+        &self,
+        invocation: BatchedOperationInvocation<'_, TestBuffer>,
+    ) -> Result<
+        (
+            EncodedDeviceOperation<TestCommand>,
+            Option<SegmentBindingDeclaration>,
+        ),
+        OperationFailure,
+    > {
+        let regions = self
+            .trace
+            .lock()
+            .unwrap()
+            .segment_regions_by_node
+            .get(invocation.node_id())
+            .cloned();
+        let declaration = regions
+            .map(|regions| SegmentBindingDeclaration::new(regions, vec![], Arc::new(())).unwrap());
+        self.encode_selected(invocation)
+            .map(|encoded| (encoded, declaration))
     }
 
     fn encode_reusable_execution_bindings(
@@ -1415,6 +1446,7 @@ pub(crate) struct TestFence(
     DeviceTimingMode,
     Option<DeviceSubmissionAttribution>,
     Option<Arc<TestTerminalPacket>>,
+    Option<DeviceSubmissionExecutionFacts>,
 );
 
 pub(crate) struct TestTerminalPacket {
@@ -1542,6 +1574,13 @@ pub(crate) enum ReadbackBehavior {
 
 #[derive(Default)]
 pub(crate) struct RuntimeTrace {
+    pub(crate) device_facts_templates: Option<Arc<[ProjectionInvocationTemplate]>>,
+    pub(crate) device_facts_fault: DeviceFactsFault,
+    pub(crate) device_facts_calls: usize,
+    pub(crate) resident_enabled: bool,
+    pub(crate) resident_compile_calls: usize,
+    pub(crate) resident_encode_calls: usize,
+    pub(crate) resident_source_ranges: Vec<Vec<std::ops::Range<u64>>>,
     pub(crate) terminal_readback_enabled: bool,
     pub(crate) terminal_prepare_calls: usize,
     pub(crate) terminal_finish_calls: usize,
@@ -2116,6 +2155,33 @@ impl DeviceRuntime for TestRuntime {
         }))
     }
 
+    fn supports_physical_segment_bindings(&self) -> bool {
+        self.trace.lock().unwrap().resident_enabled
+    }
+
+    fn compile_sequence_physical_bindings(
+        &self,
+        table: &SequencePhysicalBindingTable<Self::Buffer>,
+    ) -> Result<Option<Arc<dyn std::any::Any + Send + Sync>>, Self::Error> {
+        resident_backend::compile_table(self, table)
+    }
+
+    fn compile_resident_decode_program(
+        &self,
+        program: &(dyn std::any::Any + Send + Sync),
+        wave: &PreparedPhysicalSegmentWave<'_, Self::Buffer>,
+    ) -> Result<Option<Arc<dyn std::any::Any + Send + Sync>>, Self::Error> {
+        resident_backend::compile_program(self, program, wave)
+    }
+
+    fn encode_resident_decode_program(
+        &self,
+        program: &(dyn std::any::Any + Send + Sync),
+        request: &mut DeviceResidentDecodeRequest<'_>,
+    ) -> Result<Option<DeviceEncodedResidentDecode<Self::Command>>, Self::Error> {
+        resident_backend::encode_program(self, program, request)
+    }
+
     fn reusable_execution_entry_identity(
         &self,
         _stream: &Self::Stream,
@@ -2267,7 +2333,12 @@ impl DeviceRuntime for TestRuntime {
         trace.program_binding_coalesce_calls += 1;
         trace.program_binding_input_counts.push(commands.len());
         drop(trace);
-        if commands.is_empty() {
+        if matches!(commands.as_slice(), [TestCommand::CoalescedProgramBinding]) {
+            // The whole-segment encoder already produced the single prelude.
+            // Preserve it at the dispatcher's common coalescing boundary;
+            // mixed or unrelated commands still fail the test-backend contract.
+            Ok(commands)
+        } else if commands.is_empty() {
             Ok(commands)
         } else if commands
             .iter()
@@ -2298,6 +2369,7 @@ impl DeviceRuntime for TestRuntime {
     ) -> Result<Self::Fence, DefinitelyNotSubmitted<Self::Error>> {
         assert!(!commands.is_empty(), "core must not submit an empty batch");
         let timing_mode = commands.timing_mode();
+        let facts_capture = commands.execution_facts_capture();
         let compute_path_requirement = commands.compute_path_requirement();
         let declared_eager_compute_node_count =
             commands.declared_eager_compute_node_indices().len();
@@ -2371,6 +2443,16 @@ impl DeviceRuntime for TestRuntime {
         }
         let command_phases = entries.iter().map(DeviceCommandEntry::phase).collect();
         let command_node_indices = entries.iter().map(DeviceCommandEntry::node_index).collect();
+        let device_facts = {
+            let trace = self.trace.lock().unwrap();
+            test_device_facts(
+                &entries,
+                &reusable_invocations,
+                facts_capture,
+                trace.device_facts_templates.as_ref(),
+                trace.device_facts_fault,
+            )
+        };
         let attribution = test_submission_attribution(
             timing_mode,
             attribution_requirement,
@@ -2432,7 +2514,13 @@ impl DeviceRuntime for TestRuntime {
             (
                 trace.drift_on_submit,
                 trace.submit_behavior,
-                TestFence(trace.next_fence, timing_mode, attribution, terminal_packet),
+                TestFence(
+                    trace.next_fence,
+                    timing_mode,
+                    attribution,
+                    terminal_packet,
+                    device_facts,
+                ),
             )
         };
         match behavior {
@@ -2458,6 +2546,22 @@ impl DeviceRuntime for TestRuntime {
             panic!("injected submission attribution panic");
         }
         fence.2.clone()
+    }
+
+    fn submission_execution_facts(
+        &self,
+        fence: &Self::Fence,
+    ) -> Result<Option<DeviceSubmissionExecutionFacts>, Self::Error> {
+        let fault = {
+            let mut trace = self.trace.lock().unwrap();
+            trace.device_facts_calls += 1;
+            trace.device_facts_fault
+        };
+        match fault {
+            DeviceFactsFault::GetterPanic => panic!("injected facts getter panic"),
+            DeviceFactsFault::GetterError => Err(TestRuntimeError("injected facts getter error")),
+            _ => Ok(fence.4.clone()),
+        }
     }
 
     fn query_fence(&self, fence: &Self::Fence) -> FenceQuery<Self::Error> {

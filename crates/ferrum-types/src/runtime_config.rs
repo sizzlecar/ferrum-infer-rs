@@ -6,38 +6,9 @@
 
 use serde::{Deserialize, Serialize};
 use std::ffi::OsString;
-use std::sync::RwLock;
 use std::{collections::BTreeMap, path::PathBuf};
 
-/// Process-wide runtime snapshot, installed once at the composition root.
-///
-/// This is the single env-bridge seam the test-architecture goal asks for:
-/// the CLI (`serve`/`run`/`bench`) captures `FERRUM_*` via
-/// [`RuntimeConfigSnapshot::capture_current`] and installs it here when it
-/// applies the snapshot to the engine config; model code downstream reads
-/// [`active_runtime_snapshot`] instead of `std::env`, so no model/engine
-/// module freezes its own env config. Re-installable (RwLock, not OnceLock)
-/// so per-construction test paths can vary it after `std::env::set_var`.
-static ACTIVE_SNAPSHOT: RwLock<Option<RuntimeConfigSnapshot>> = RwLock::new(None);
-
-/// Install the process-wide runtime snapshot resolved at the composition root.
-pub fn install_runtime_snapshot(snapshot: RuntimeConfigSnapshot) {
-    *ACTIVE_SNAPSHOT
-        .write()
-        .expect("runtime snapshot lock poisoned") = Some(snapshot);
-}
-
-/// The installed runtime snapshot, or an empty snapshot when none was
-/// installed (unit tests that do not exercise runtime knobs see defaults).
-pub fn active_runtime_snapshot() -> RuntimeConfigSnapshot {
-    ACTIVE_SNAPSHOT
-        .read()
-        .expect("runtime snapshot lock poisoned")
-        .clone()
-        .unwrap_or_default()
-}
-
-/// Stable snapshot of non-default runtime configuration visible to the process.
+/// Stable snapshot of resolved runtime configuration for one assembly.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuntimeConfigSnapshot {
     /// Sorted by key for stable JSON and machine-readable diffs.
@@ -55,6 +26,39 @@ impl RuntimeConfigSnapshot {
                 ),
                 "FERRUM_SPEC_DRAFT" | "FERRUM_SPEC_N" => Some(
                     "speculative decoding has been retired; remove this option",
+                ),
+                "FERRUM_RECURRENT_STATE_MAX_SLOTS" => Some(
+                    "the legacy recurrent-state slot control has been retired; remove this option; it does not configure a model-owned state pool",
+                ),
+                "FERRUM_METAL_CAPTURE" => Some(
+                    "process-global Metal frame capture has been retired; use an explicit standalone GPU capture diagnostic",
+                ),
+                "FERRUM_MARLIN_TILE" | "FERRUM_VLLM_MOE_THREAD_K"
+                | "FERRUM_VLLM_MOE_THREAD_N" | "FERRUM_VLLM_MOE_BLOCKS_PER_SM" => Some(
+                    "process-global native tile overrides have been retired; remove this option to use the native operator's automatic selection",
+                ),
+                "FERRUM_PROFILE_COMMIT_SHA" | "FERRUM_PROFILE_ENV_HASH"
+                | "FERRUM_PROFILE_MODEL" | "FERRUM_PROFILE_CONCURRENCY"
+                | "FERRUM_PROFILE_RUNTIME_FLAGS_JSON" => Some(
+                    "process-global profile metadata has been retired; use serve --profile-commit-sha, --profile-env-hash, --profile-model, --profile-concurrency or --profile-runtime-flags-json for instance session metadata",
+                ),
+                "FERRUM_TRACE_OUT"
+                | "FERRUM_VLLM_MOE_LOG_CONFIG" | "FERRUM_VLLM_MOE_LOG_CONFIG_LIMIT"
+                | "FERRUM_VLLM_MOE_LOG_CONFIG_MIN_PAIRS" | "FERRUM_VLLM_MOE_LOG_CONFIG_MAX_PAIRS"
+                | "FERRUM_GRAPH_PROF"
+                | "FERRUM_MOE_DUMP" | "FERRUM_MOE_DUMP_BATCH_X_TOPK"
+                | "FERRUM_MARLIN_PROFILE" | "FERRUM_MARLIN_TRACE_SHAPES"
+                | "FERRUM_MARLIN_TRACE_SHAPES_MAX"
+                | "FERRUM_METAL_QUANT_PROFILE"
+                | "FERRUM_DECODE_OP_PROFILE" | "FERRUM_PREFILL_OP_PROFILE"
+                | "FERRUM_DECODE_LAYER_PROFILE" | "FERRUM_UNIFIED_PROFILE"
+                | "FERRUM_BATCHED_TRACE" | "FERRUM_MOE_PROFILE" => Some(
+                    "process-global backend profiling has been retired; remove this option and select an instance product profile with --profile-jsonl and --profile-detail",
+                ),
+                "FERRUM_BATCH_PREFILL_PROF" | "FERRUM_RBD_PROF"
+                | "FERRUM_UNIFIED_POST_PROF" | "FERRUM_NEXT_BATCH_PROF"
+                | "FERRUM_SCHED_NONE_PROF" => Some(
+                    "legacy executor and scheduler profiling has been retired; remove this option and select an instance product profile with --profile-jsonl and --profile-detail",
                 ),
                 _ => None,
             };
@@ -561,5 +565,53 @@ mod tests {
             .unwrap();
         assert_eq!(profile.source, RuntimeConfigSource::Cli);
         assert!(profile.affects.contains(&RuntimeConfigEffect::Diagnostics));
+    }
+}
+
+#[cfg(test)]
+mod retired_profiler_tests {
+    use super::*;
+    #[test]
+    fn retired_global_profile_controls_reject_even_disabled_values() {
+        for key in [
+            "FERRUM_METAL_CAPTURE",
+            "FERRUM_GRAPH_PROF",
+            "FERRUM_MOE_DUMP",
+            "FERRUM_MOE_DUMP_BATCH_X_TOPK",
+            "FERRUM_MARLIN_PROFILE",
+            "FERRUM_MARLIN_TRACE_SHAPES",
+            "FERRUM_MARLIN_TRACE_SHAPES_MAX",
+            "FERRUM_METAL_QUANT_PROFILE",
+            "FERRUM_DECODE_OP_PROFILE",
+            "FERRUM_PREFILL_OP_PROFILE",
+            "FERRUM_DECODE_LAYER_PROFILE",
+            "FERRUM_UNIFIED_PROFILE",
+            "FERRUM_BATCHED_TRACE",
+            "FERRUM_MOE_PROFILE",
+            "FERRUM_BATCH_PREFILL_PROF",
+            "FERRUM_RBD_PROF",
+            "FERRUM_UNIFIED_POST_PROF",
+            "FERRUM_NEXT_BATCH_PROF",
+            "FERRUM_SCHED_NONE_PROF",
+        ] {
+            for value in ["0", "1"] {
+                let snapshot = RuntimeConfigSnapshot::from_entries(vec![RuntimeConfigEntry::new(
+                    key,
+                    value,
+                    RuntimeConfigSource::Cli,
+                )]);
+                assert_eq!(snapshot.validate_retired_options().unwrap_err().0, key);
+            }
+        }
+        let retained = RuntimeConfigSnapshot::from_entries(vec![
+            RuntimeConfigEntry::new(
+                "FERRUM_PROFILE_JSONL",
+                "profile.jsonl",
+                RuntimeConfigSource::Cli,
+            ),
+            RuntimeConfigEntry::new("FERRUM_BATCH_DECODE_PROF", "1", RuntimeConfigSource::Cli),
+            RuntimeConfigEntry::new("FERRUM_UNIFIED_GRAPH", "1", RuntimeConfigSource::Cli),
+        ]);
+        assert!(retained.validate_retired_options().is_ok());
     }
 }

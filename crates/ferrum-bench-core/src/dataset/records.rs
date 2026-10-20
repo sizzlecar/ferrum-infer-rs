@@ -1,12 +1,13 @@
 //! Shared source-record semantics for selection and replay of a frozen selection.
 
 use ferrum_types::{FerrumError, Result};
-use serde::de::{SeqAccess, Visitor};
+use serde::de::{DeserializeOwned, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer as _, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::cell::Cell;
 use std::io::{BufRead, BufReader, Read};
+use std::marker::PhantomData;
 use std::num::{NonZeroU64, NonZeroUsize};
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -93,6 +94,39 @@ pub fn visit_sharegpt_records(
     limits: ShareGptReadLimits,
     mut visit: impl FnMut(u64, ShareGptRecord) -> Result<()>,
 ) -> Result<ShareGptReadReceipt> {
+    visit_records(input, limits, |index, record| {
+        visit(
+            index,
+            match record {
+                Some(value) => ShareGptRecord::Value(value),
+                None => ShareGptRecord::MalformedJsonLine,
+            },
+        )
+    })
+}
+
+/// Visits the original JSON bytes of each record without normalizing numbers,
+/// strings or object fields. `None` denotes a malformed nonblank JSONL record.
+/// The borrowed record is valid only during the callback; the same source,
+/// record and count limits and whole-source digest apply as to the value reader.
+pub fn visit_sharegpt_raw_records(
+    input: impl Read,
+    limits: ShareGptReadLimits,
+    mut visit: impl FnMut(u64, Option<&str>) -> Result<()>,
+) -> Result<ShareGptReadReceipt> {
+    visit_records::<Box<serde_json::value::RawValue>>(input, limits, |index, record| {
+        visit(
+            index,
+            record.as_deref().map(serde_json::value::RawValue::get),
+        )
+    })
+}
+
+fn visit_records<T: DeserializeOwned>(
+    input: impl Read,
+    limits: ShareGptReadLimits,
+    mut visit: impl FnMut(u64, Option<T>) -> Result<()>,
+) -> Result<ShareGptReadReceipt> {
     limits.validate()?;
     let mut reader = BufReader::new(SourceReader {
         input,
@@ -132,6 +166,7 @@ pub fn visit_sharegpt_records(
                 emit: &mut emit,
                 remaining: &remaining,
                 maximum: limits.maximum_record_bytes.get(),
+                record: PhantomData::<T>,
             })
             .and_then(|()| {
                 remaining.set(limits.maximum_record_bytes.get());
@@ -148,10 +183,7 @@ pub fn visit_sharegpt_records(
             if text.trim().is_empty() {
                 continue;
             }
-            emit(match serde_json::from_str(text) {
-                Ok(value) => ShareGptRecord::Value(value),
-                Err(_) => ShareGptRecord::MalformedJsonLine,
-            })?;
+            emit(serde_json::from_str::<T>(text).ok())?;
         }
         "jsonl"
     };
@@ -164,13 +196,16 @@ pub fn visit_sharegpt_records(
     })
 }
 
-struct ArrayVisitor<'a, F> {
+struct ArrayVisitor<'a, F, T> {
     emit: &'a mut F,
     remaining: &'a Cell<usize>,
     maximum: usize,
+    record: PhantomData<T>,
 }
 
-impl<'de, F: FnMut(ShareGptRecord) -> Result<()>> Visitor<'de> for ArrayVisitor<'_, F> {
+impl<'de, T: Deserialize<'de>, F: FnMut(Option<T>) -> Result<()>> Visitor<'de>
+    for ArrayVisitor<'_, F, T>
+{
     type Value = ();
     fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
         formatter.write_str("a ShareGPT array of conversation records")
@@ -178,10 +213,10 @@ impl<'de, F: FnMut(ShareGptRecord) -> Result<()>> Visitor<'de> for ArrayVisitor<
     fn visit_seq<A: SeqAccess<'de>>(self, mut sequence: A) -> std::result::Result<(), A::Error> {
         loop {
             self.remaining.set(self.maximum);
-            let Some(value) = sequence.next_element::<Value>()? else {
+            let Some(value) = sequence.next_element::<T>()? else {
                 return Ok(());
             };
-            (self.emit)(ShareGptRecord::Value(value)).map_err(serde::de::Error::custom)?;
+            (self.emit)(Some(value)).map_err(serde::de::Error::custom)?;
         }
     }
 }

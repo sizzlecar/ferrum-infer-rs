@@ -20,6 +20,7 @@ pub mod memory_profile;
 pub mod observability_product;
 pub mod observability_vertical_slice;
 pub mod runtime_env;
+mod slo_product;
 pub mod source_resolver;
 mod startup;
 pub mod terminal;

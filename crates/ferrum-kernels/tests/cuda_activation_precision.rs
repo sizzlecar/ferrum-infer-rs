@@ -14,14 +14,14 @@ const BRANCH: f32 = 42_912.0;
 
 #[test]
 fn default_f16_add_inplace_overflows_gemma3_sandwich_scale() {
-    let mut ctx = CudaBackend::new_context();
-    let mut residual = CudaBackend::from_slice(&[RESIDUAL, 1.0]);
-    let branch = CudaBackend::from_slice(&[BRANCH, 2.0]);
+    let mut ctx = CudaBackend::new_context(&ferrum_types::BackendContextConfig::default()).unwrap();
+    let mut residual = CudaBackend::from_slice_in_context(&mut ctx, &[RESIDUAL, 1.0]);
+    let branch = CudaBackend::from_slice_in_context(&mut ctx, &[BRANCH, 2.0]);
 
     CudaBackend::add_inplace(&mut ctx, &mut residual, &branch, 2);
     CudaBackend::sync(&mut ctx);
 
-    let out = CudaBackend::to_vec(&residual, 2);
+    let out = CudaBackend::to_vec_in_context(&mut ctx, &residual, 2);
     assert!(
         out[0].is_infinite() && out[0].is_sign_positive(),
         "expected FP16 residual add to overflow, got {}",
@@ -36,9 +36,9 @@ fn default_f16_add_inplace_overflows_gemma3_sandwich_scale() {
 
 #[test]
 fn f32_add_inplace_keeps_gemma3_sandwich_scale_finite() {
-    let mut ctx = CudaBackend::new_context();
-    let mut residual = CudaBackend::from_slice_typed::<f32>(&[RESIDUAL, 1.0]);
-    let branch = CudaBackend::from_slice_typed::<f32>(&[BRANCH, 2.0]);
+    let mut ctx = CudaBackend::new_context(&ferrum_types::BackendContextConfig::default()).unwrap();
+    let mut residual = CudaBackend::from_slice_typed_in_context::<f32>(&mut ctx, &[RESIDUAL, 1.0]);
+    let branch = CudaBackend::from_slice_typed_in_context::<f32>(&mut ctx, &[BRANCH, 2.0]);
 
     assert_eq!(residual.dtype(), Dtype::F32);
     assert_eq!(branch.dtype(), Dtype::F32);
@@ -46,7 +46,7 @@ fn f32_add_inplace_keeps_gemma3_sandwich_scale_finite() {
     CudaBackend::add_inplace(&mut ctx, &mut residual, &branch, 2);
     CudaBackend::sync(&mut ctx);
 
-    let out = CudaBackend::to_vec(&residual, 2);
+    let out = CudaBackend::to_vec_in_context(&mut ctx, &residual, 2);
     assert!(
         out[0].is_finite(),
         "F32 residual add should preserve finite sum, got {}",
@@ -62,16 +62,16 @@ fn f32_add_inplace_keeps_gemma3_sandwich_scale_finite() {
 
 #[test]
 fn f32_rms_norm_uses_f32_kernel() {
-    let mut ctx = CudaBackend::new_context();
-    let input = CudaBackend::from_slice_typed::<f32>(&[3.0, 4.0, 1.0, 2.0]);
-    let weight = CudaBackend::from_slice_typed::<f32>(&[1.5, 0.5]);
-    let mut out = CudaBackend::alloc_typed(Dtype::F32, 4);
+    let mut ctx = CudaBackend::new_context(&ferrum_types::BackendContextConfig::default()).unwrap();
+    let input = CudaBackend::from_slice_typed_in_context::<f32>(&mut ctx, &[3.0, 4.0, 1.0, 2.0]);
+    let weight = CudaBackend::from_slice_typed_in_context::<f32>(&mut ctx, &[1.5, 0.5]);
+    let mut out = CudaBackend::alloc_typed_in_context(&mut ctx, Dtype::F32, 4);
 
     CudaBackend::rms_norm(&mut ctx, &input, &weight, 1e-6, &mut out, 2, 2);
     CudaBackend::sync(&mut ctx);
 
     assert_eq!(out.dtype(), Dtype::F32);
-    let got = CudaBackend::to_vec(&out, 4);
+    let got = CudaBackend::to_vec_in_context(&mut ctx, &out, 4);
     let mut expected = Vec::new();
     for row in [[3.0f32, 4.0], [1.0, 2.0]] {
         let inv_rms = ((row[0] * row[0] + row[1] * row[1]) / 2.0 + 1e-6)
@@ -91,12 +91,12 @@ fn f32_rms_norm_uses_f32_kernel() {
 
 #[test]
 fn f32_shadow_sandwich_norm_hooks_match_reference() {
-    let mut ctx = CudaBackend::new_context();
-    let activation = CudaBackend::from_slice(&[3.0, 4.0, 1.0, 2.0]);
-    let weight = CudaBackend::from_slice(&[1.5, 0.5]);
-    let mut shadow = CudaBackend::alloc_typed(Dtype::F32, 4);
-    let mut branch = CudaBackend::alloc_typed(Dtype::F32, 4);
-    let mut activation_out = CudaBackend::alloc_typed(Dtype::F16, 4);
+    let mut ctx = CudaBackend::new_context(&ferrum_types::BackendContextConfig::default()).unwrap();
+    let activation = CudaBackend::from_slice_in_context(&mut ctx, &[3.0, 4.0, 1.0, 2.0]);
+    let weight = CudaBackend::from_slice_in_context(&mut ctx, &[1.5, 0.5]);
+    let mut shadow = CudaBackend::alloc_typed_in_context(&mut ctx, Dtype::F32, 4);
+    let mut branch = CudaBackend::alloc_typed_in_context(&mut ctx, Dtype::F32, 4);
+    let mut activation_out = CudaBackend::alloc_typed_in_context(&mut ctx, Dtype::F16, 4);
 
     CudaBackend::activation_to_f32_shadow(&mut ctx, &activation, &mut shadow, 4);
     CudaBackend::rms_norm_activation_to_f32(
@@ -122,7 +122,10 @@ fn f32_shadow_sandwich_norm_hooks_match_reference() {
     assert_eq!(shadow.dtype(), Dtype::F32);
     assert_eq!(branch.dtype(), Dtype::F32);
     assert_eq!(activation_out.dtype(), Dtype::F16);
-    assert_eq!(CudaBackend::to_vec(&shadow, 4), vec![3.0, 4.0, 1.0, 2.0]);
+    assert_eq!(
+        CudaBackend::to_vec_in_context(&mut ctx, &shadow, 4),
+        vec![3.0, 4.0, 1.0, 2.0]
+    );
 
     let mut expected = Vec::new();
     for row in [[3.0f32, 4.0], [1.0, 2.0]] {
@@ -133,7 +136,7 @@ fn f32_shadow_sandwich_norm_hooks_match_reference() {
         expected.push(row[1] * inv_rms * 0.5);
     }
 
-    for (idx, (got, expected)) in CudaBackend::to_vec(&branch, 4)
+    for (idx, (got, expected)) in CudaBackend::to_vec_in_context(&mut ctx, &branch, 4)
         .iter()
         .zip(expected.iter())
         .enumerate()
@@ -143,7 +146,7 @@ fn f32_shadow_sandwich_norm_hooks_match_reference() {
             "branch idx={idx} got={got} expected={expected}"
         );
     }
-    for (idx, (got, expected)) in CudaBackend::to_vec(&activation_out, 4)
+    for (idx, (got, expected)) in CudaBackend::to_vec_in_context(&mut ctx, &activation_out, 4)
         .iter()
         .zip(expected.iter())
         .enumerate()

@@ -57,6 +57,11 @@ impl GpuDeviceSelection {
         vec![
             RuntimeConfigEntry::new("FERRUM_BACKEND", "cuda", RuntimeConfigSource::Cli),
             RuntimeConfigEntry::new(
+                "FERRUM_CUDA_DEVICE",
+                self.selected_gpu_devices[0].to_string(),
+                RuntimeConfigSource::Cli,
+            ),
+            RuntimeConfigEntry::new(
                 GPU_DEVICES_RAW_KEY,
                 self.raw_cli_value.clone(),
                 RuntimeConfigSource::Cli,
@@ -389,6 +394,7 @@ mod tests {
         };
 
         assert_eq!(entry("FERRUM_BACKEND").effective_value, "cuda");
+        assert_eq!(entry("FERRUM_CUDA_DEVICE").effective_value, "1");
         assert_eq!(entry(GPU_DEVICES_RAW_KEY).effective_value, "1");
         assert_eq!(entry(REQUESTED_GPU_DEVICES_KEY).effective_value, "1");
         assert_eq!(entry(SELECTED_GPU_DEVICES_KEY).effective_value, "1");
@@ -397,6 +403,26 @@ mod tests {
             "single_gpu"
         );
         assert_eq!(entry(CUDA_DEVICE_COUNT_KEY).effective_value, "2");
+
+        // Both run and serve assemble the selected placement before applying
+        // the resolved snapshot. Explicit GPU selection must beat an old env
+        // ordinal and reach the original model context.
+        let mut resolved =
+            ferrum_types::RuntimeConfigSnapshot::from_env_vars([("FERRUM_CUDA_DEVICE", "0")]);
+        for entry in selection.runtime_config_entries() {
+            resolved.upsert_entry(entry);
+        }
+        let mut engine = ferrum_types::EngineConfig::default();
+        engine.backend.device = selection.primary_device();
+        engine.apply_runtime_config_snapshot(&resolved).unwrap();
+        assert_eq!(engine.backend.device, Device::CUDA(1));
+        assert_eq!(
+            engine
+                .llama_execution_config()
+                .backend_context
+                .device_ordinal,
+            1
+        );
     }
 
     #[test]

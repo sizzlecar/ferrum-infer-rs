@@ -232,8 +232,8 @@ async fn exercise_live_lifecycle(require_slo: bool) {
                 128
             )
         );
-        // A second visible update supplies decode feedback. It does not by
-        // itself guarantee enough independent work shapes for the affine fit.
+        // Visible updates exercise execution feedback without assuming that
+        // different work shapes share a learned cost domain.
         let warmup_updates = if require_slo { 2 } else { 1 };
         tokio::join!(
             cancelled.wait_for_content(warmup_updates),
@@ -271,26 +271,11 @@ async fn exercise_live_lifecycle(require_slo: bool) {
         });
         join_all(followups).await;
         let mut after = assert_drained(&client, &origin).await;
-        let adaptation_requests = if require_slo {
-            // The cold long-prefill scenario above must finish safely even
-            // when its TTFT is infeasible or the cost model is not ready.
-            // Exercise learned budgeting with a prefill that can exceed ITL
-            // while retaining TTFT room; the original cancellation load and
-            // all of its assertions remain unchanged.
-            let adapted_before = after["scheduler"]["slo"]["adapted_prefill_steps"]
-                .as_u64()
-                .expect("learned SLO-aware execution counter");
-            for coefficient in [
-                "fixed_step_ms",
-                "decode_ms_per_sequence",
-                "prefill_ms_per_token",
-            ] {
-                assert!(
-                    after["scheduler"]["slo"][coefficient].is_number(),
-                    "live traffic must supply an identifiable model: {}",
-                    after["scheduler"]["slo"]
-                );
-            }
+        let feedback_requests = if require_slo {
+            // Continue exercising mixed decode/prefill after warmup. This
+            // lifecycle test checks the real observer/worker connection;
+            // deterministic Engine tests establish learned budget decisions.
+            // Hardware speed and coverage do not imply a particular shrink.
             let mut decoder = Stream::start(
                 &client,
                 &origin,
@@ -302,21 +287,11 @@ async fn exercise_live_lifecycle(require_slo: bool) {
             decoder.wait_for_content(2).await;
             let prompt = format!(
                 "Read this list then repeat its colors: {}",
-                // Fill the configured 512-token chunk: a shorter prefill can
-                // legitimately fit ITL after backend execution gets faster.
                 "red green blue. ".repeat(128)
             );
             let prefill = Stream::start(&client, &origin, model, &prompt, 8).await;
             tokio::join!(decoder.finish(32), prefill.finish(8));
             after = assert_drained(&client, &origin).await;
-            assert!(
-                after["scheduler"]["slo"]["adapted_prefill_steps"]
-                    .as_u64()
-                    .expect("SLO-aware execution counter")
-                    > adapted_before,
-                "learned controller must use its budget for the followup prefill: {}",
-                after["scheduler"]["slo"]
-            );
             2
         } else {
             0
@@ -325,15 +300,25 @@ async fn exercise_live_lifecycle(require_slo: bool) {
             let previous = &before["scheduler"]["slo"];
             let current = &after["scheduler"]["slo"];
             assert_eq!(current["enabled"], true);
-            for field in ["observed_steps", "adapted_prefill_steps"] {
+            for field in ["planning_rounds"] {
                 assert!(
                     current[field]
                         .as_u64()
-                        .expect("SLO-aware execution counter")
-                        > previous[field].as_u64().expect("initial SLO-aware counter"),
+                        .expect("SLO planning counter")
+                        > previous[field].as_u64().expect("initial SLO planning counter"),
                     "live execution must advance {field}: before={previous}, after={current}"
                 );
             }
+            assert!(current["last_revision"].is_u64(), "planning must read a snapshot: {current}");
+            assert!(
+                current["feedback"]["accepted"].as_u64().expect("accepted execution observations")
+                    > previous["feedback"]["accepted"].as_u64().expect("initial accepted observations"),
+                "live execution must reach the independently owned worker: before={previous}, after={current}"
+            );
+            assert_eq!(
+                current["feedback"]["worker_failures"], previous["feedback"]["worker_failures"],
+                "feedback worker must remain alive while requests are served"
+            );
             eprintln!("scheduler SLO before={previous}, after={current}");
         }
         let completed = |state: &Value| {
@@ -343,7 +328,7 @@ async fn exercise_live_lifecycle(require_slo: bool) {
         };
         assert_eq!(
             completed(&after) - completed(&before),
-            2 + followup_count + adaptation_requests,
+            2 + followup_count + feedback_requests,
             "the disconnected request must not silently run to normal completion"
         );
         assert_eq!(

@@ -322,7 +322,7 @@ impl ContinuousBatchScheduler {
             request.prefix_restore.abandoned = true;
             return Ok(false);
         }
-        request.execution_capacity_deferral = Some(deferral);
+        request.execution_capacity_deferral = Some(deferral.into());
         request.prefix_restore.capacity_hold = true;
         Ok(true)
     }
@@ -363,11 +363,12 @@ impl ContinuousBatchScheduler {
         }
         let mut ignore = |_| {};
         let mut mode = WaitingAdmissionMode::Prepared {
-            wake,
+            initial_priority: None,
+            wake: Some(wake),
             observer: &mut ignore,
         };
         if had_maintenance
-            || !Self::execution_capacity_is_blocked(
+            || !self.execution_capacity_is_blocked(
                 request,
                 &mut mode,
                 ExecutionCapacityQueuePhase::Prefill,
@@ -378,7 +379,9 @@ impl ContinuousBatchScheduler {
         }
         let deferral = request
             .execution_capacity_deferral
-            .clone()
+            .as_ref()
+            .and_then(super::ExecutionCapacityDeferral::as_native)
+            .cloned()
             .expect("blocked gate retained its predicate");
         let runnable = self.prefix_restore_has_runnable_releaser(
             &proof.request_id,

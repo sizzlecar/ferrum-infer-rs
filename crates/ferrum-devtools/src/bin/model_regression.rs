@@ -52,7 +52,7 @@ struct Args {
     source_expectation: Option<ferrum_bench_core::release_regression::GgufSourceProfile>,
     #[arg(long, value_parser = ["cpu", "metal", "cuda"])]
     backend: String,
-    /// Explicit vNext causal KV storage, verified against the executing model plan.
+    /// Explicit KV storage, verified against the actual model or compiled plan.
     /// Prepared release tasks do not yet declare this independent selection.
     #[arg(long, value_enum, conflicts_with = "expected_task")]
     kv_dtype: Option<kv::KvDtype>,
@@ -409,10 +409,17 @@ async fn main() -> Result<()> {
             "target": expected.as_ref().map(|task| &task.profile.target),
             "binary_sha256": digest, "started_at": chrono::Utc::now().to_rfc3339(),
             "sampling": {"temperature": 0, "seed": 7, "max_tokens": args.max_tokens},
+            "serve_shutdown_verification": if cfg!(unix) { "sigterm_exit_zero" } else { "unsupported" },
             "environment_policy": if args.use_default_backend { "remove_inherited_ferrum_overrides" } else { "inherit" }, "cases": []
         }),
         failed: false,
     };
+    #[cfg(not(unix))]
+    {
+        report.document["serve_shutdown_limitation"] = json!(
+            "This runner has no graceful server signal on this platform; child kill/reap is cleanup only."
+        );
+    }
     if args.checks.contains(&Check::AutoToolsJson) {
         // The existing sampling fields describe run/Chat. Responses has its
         // own output-budget field and receives no seed parameter.
@@ -545,6 +552,8 @@ async fn main() -> Result<()> {
                 })
                 .await?;
             }
+            #[cfg(unix)]
+            record(&mut report, "serve-shutdown", server.shutdown()).await?;
         }
         Err(error) => {
             report.record("serve-startup", started.elapsed(), Err(error))?;

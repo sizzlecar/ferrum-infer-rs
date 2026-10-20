@@ -17,13 +17,17 @@ name = "ferrum-launcher"
 path = "src/bin/ferrum-launcher.rs"
 
 [dependencies]
+ferrum-journal = { workspace = true }
 ferrum-runtime = { workspace = true }
+ferrum-execution = { workspace = true }
 # Core dependencies
 ferrum-types = { workspace = true }
+ferrum-output = { workspace = true }
 ferrum-interfaces = { workspace = true }
 ferrum-engine = { workspace = true }
 ferrum-models = { workspace = true }
 ferrum-scheduler = { workspace = true }
+ferrum-slo = { workspace = true }
 ferrum-server = { workspace = true }
 ferrum-kernels = { workspace = true }
 ferrum-quantization = { workspace = true }
@@ -87,6 +91,7 @@ shellexpand = "3.1"
 libc = "0.2"
 
 [dev-dependencies]
+ferrum-execution = { workspace = true, features = ["test-support"] }
 axum = "0.7"
 rstest = "0.23"
 async-openai = { version = "0.27", default-features = false, features = ["rustls"] }

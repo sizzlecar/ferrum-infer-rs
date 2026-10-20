@@ -65,6 +65,8 @@ Defaults adapt execution and capacity to capabilities, hardware and memory; expl
 
 Support varies by combination; CPU is a compatibility backend. See [validation scope](docs/release-regression-catalog.md).
 
+This architecture update retires embedding, ASR, TTS and legacy execution APIs. See [migration notes](https://github.com/sizzlecar/ferrum-infer-rs/pull/441).
+
 ## Recent throughput
 
 **0.13 candidate · RTX 5090 · Qwen3.8-27B · ShareGPT.** Fixed 32 slots, context/batch 2048. Each cell: 200 requests × 2 repeats, 8 warmups per repeat, zero protocol errors. Throughput = total output tokens / total measured time; C is client concurrency.
@@ -89,7 +91,7 @@ Compressed-tensors INT4, group size 32; output tok/s:
 | 16 | 654.04 | 733.86 | 89.12% |
 | 32 | 836.79 | 1035.09 | 80.84% |
 
-Several cells fail latency SLOs. CT C32's second repeat reached **78.91%**: not every repeat met 80%. CT uses FP16 activations/KV in Ferrum versus BF16 in vLLM. [Full results](docs/performance-popular-models-p0.zh.md) include latency percentiles, memory, numerical differences and workload policy. Joint latency-SLO optimization is planned for the next version.
+Several cells fail latency SLOs. CT C32's second repeat reached **78.91%**: not every repeat met 80%. CT uses FP16 activations/KV in Ferrum versus BF16 in vLLM. [Full results](docs/performance-popular-models-p0.zh.md) include latency percentiles, memory, numerical differences and workload policy. This refactor provides execution and control interfaces for future joint throughput/latency-SLO optimization.
 
 ## Project
 

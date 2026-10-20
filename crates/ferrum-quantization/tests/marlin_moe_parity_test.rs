@@ -106,8 +106,10 @@ fn cuda_marlin_moe_fused_vs_per_expert() {
     let qw_refs: Vec<&[i32]> = experts.iter().map(|e| e.qweight.as_slice()).collect();
     let sc_refs: Vec<&[f32]> = experts.iter().map(|e| e.scales.as_slice()).collect();
     let qz_refs: Vec<&[i32]> = experts.iter().map(|e| e.qzeros.as_slice()).collect();
-    let stacked = <CudaBackend as BackendQuantMarlin>::load_gptq_stacked(
-        &qw_refs, &sc_refs, &qz_refs, None, 4, gs, k, n_per,
+    let mut ctx =
+        <CudaBackend as Backend>::new_context(&Default::default()).expect("backend context");
+    let stacked = <CudaBackend as BackendQuantMarlin>::load_gptq_stacked_in_context(
+        &mut ctx, &qw_refs, &sc_refs, &qz_refs, None, 4, gs, k, n_per,
     )
     .expect("stacked load_gptq");
 
@@ -116,8 +118,7 @@ fn cuda_marlin_moe_fused_vs_per_expert() {
     let a_data: Vec<f32> = (0..total_tokens * k)
         .map(|i| ((i as f32) * 0.0027).sin())
         .collect();
-    let mut ctx = <CudaBackend as Backend>::new_context();
-    let a_dev = CudaBackend::from_slice(&a_data);
+    let a_dev = CudaBackend::from_slice_in_context(&mut ctx, &a_data);
 
     // ── Reference: per-expert MarlinExpertStack::make_expert_linear ──
     // Build a single-expert `Linear<B>` view into the stacked tile via
@@ -131,15 +132,15 @@ fn cuda_marlin_moe_fused_vs_per_expert() {
         }
         let row_start = a_row_offsets[e];
         let a_e: Vec<f32> = a_data[row_start * k..(row_start + m_e) * k].to_vec();
-        let a_e_dev = CudaBackend::from_slice(&a_e);
-        let mut out_e_dev = CudaBackend::alloc(m_e * n_per);
+        let a_e_dev = CudaBackend::from_slice_in_context(&mut ctx, &a_e);
+        let mut out_e_dev = CudaBackend::alloc_in_context(&mut ctx, m_e * n_per);
         let view = stacked
             .clone()
-            .make_expert_linear(e * n_per, n_per, None)
+            .make_expert_linear_in_context(&mut ctx, e * n_per, n_per, None)
             .expect("make_expert_linear");
         view.forward(&mut ctx, &a_e_dev, &mut out_e_dev, m_e);
         <CudaBackend as Backend>::sync(&mut ctx);
-        let out_e = CudaBackend::to_vec(&out_e_dev, m_e * n_per);
+        let out_e = CudaBackend::to_vec_in_context(&mut ctx, &out_e_dev, m_e * n_per);
         c_ref[row_start * n_per..(row_start + m_e) * n_per].copy_from_slice(&out_e);
     }
 
@@ -150,7 +151,8 @@ fn cuda_marlin_moe_fused_vs_per_expert() {
     // and the kernel is the same — just routed via the trait so we
     // don't need to know which concrete store type backs the stack
     // (Marlin vs Triton).
-    let mut c_fused_dev = <CudaBackend as Backend>::alloc(total_tokens * n_per);
+    let mut c_fused_dev =
+        <CudaBackend as Backend>::alloc_in_context(&mut ctx, total_tokens * n_per);
     stacked.zero_workspace(&mut ctx).expect("zero_workspace");
     let dispatches: Vec<(usize, usize, usize, usize)> = (0..num_experts)
         .filter(|&e| tokens_per_expert[e] > 0)
@@ -160,7 +162,7 @@ fn cuda_marlin_moe_fused_vs_per_expert() {
         .gemm_phase_batched(&mut ctx, &a_dev, &dispatches, &mut c_fused_dev, k)
         .expect("gemm_phase_batched");
     <CudaBackend as Backend>::sync(&mut ctx);
-    let c_fused = CudaBackend::to_vec(&c_fused_dev, total_tokens * n_per);
+    let c_fused = CudaBackend::to_vec_in_context(&mut ctx, &c_fused_dev, total_tokens * n_per);
 
     // Compare per-expert.
     for e in 0..num_experts {

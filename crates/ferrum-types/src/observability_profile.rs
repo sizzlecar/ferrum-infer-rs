@@ -7,6 +7,9 @@ use serde_json::Value;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
+mod journal;
+pub use journal::ObservabilityJournalConfig;
+
 pub const OBSERVABILITY_PROFILE_SCHEMA_VERSION: u32 = 1;
 pub const DEFAULT_OBSERVABILITY_PROFILE_SAMPLE_RATE: f64 = 0.01;
 pub const SYNTHETIC_RUNTIME_PRESET_HASH: &str =
@@ -69,6 +72,12 @@ pub fn engine_token_timing_profile_attributes(
             serde_json::json!(average_itl_nanos / 1_000),
         ),
     ]);
+    if let Some(boundary) = timing.request_start_boundary {
+        attributes.insert(
+            "engine_request_start_boundary".to_string(),
+            serde_json::json!(boundary.as_str()),
+        );
+    }
     if let Some(ttft_nanos) = timing.ttft_nanos() {
         attributes.insert("ttft_us".to_string(), serde_json::json!(ttft_nanos / 1_000));
     }
@@ -180,6 +189,13 @@ pub enum ObservabilityProfileDetail {
 }
 
 impl ObservabilityProfileDetail {
+    /// Replay, verification and full captures require an intact artifact.
+    /// Other profiles are optional telemetry: transport loss is reported without
+    /// changing the outcome of already executed inference work.
+    pub const fn requires_complete_evidence(self) -> bool {
+        matches!(self, Self::Replay | Self::Verify | Self::Full)
+    }
+
     pub fn parse(value: &str) -> Option<Self> {
         match value.trim().to_ascii_lowercase().as_str() {
             "off" => Some(Self::Off),
@@ -222,6 +238,16 @@ impl ObservabilityProfileDetail {
             Self::Latency | Self::Kernel | Self::Replay | Self::Verify | Self::Full
         )
     }
+
+    /// Detailed diagnostics retain the actual submitted work and terminal
+    /// disposition. This does not request device timestamps or change an
+    /// executable's eligibility for reuse.
+    pub const fn captures_execution_facts(self) -> bool {
+        matches!(
+            self,
+            Self::Kernel | Self::Debug | Self::Replay | Self::Verify | Self::Full
+        )
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -231,6 +257,8 @@ pub struct FerrumObservabilityConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile_jsonl: Option<PathBuf>,
     pub profile_detail: ObservabilityProfileDetail,
+    #[serde(default)]
+    pub journal: ObservabilityJournalConfig,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory_profile_jsonl: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -257,6 +285,7 @@ impl FerrumObservabilityConfig {
             model: model.into(),
             profile_jsonl,
             profile_detail,
+            journal: ObservabilityJournalConfig::default(),
             memory_profile_jsonl,
             scheduler_trace_jsonl,
             request_dump_dir,
@@ -285,15 +314,14 @@ impl FerrumObservabilityConfig {
             && self.request_dump_dir.is_none()
     }
 
+    /// Any explicit artifact uses the standard instance-owned product schema.
+    /// Off still disables device timing and detailed execution facts.
     pub fn unified_product_profile_enabled(&self) -> bool {
         self.enabled()
-            && (self.profile_detail != ObservabilityProfileDetail::Off
-                || self.memory_profile_jsonl.is_some()
-                || self.scheduler_trace_jsonl.is_some()
-                || self.request_dump_dir.is_some())
     }
 
     pub fn validate(&self) -> std::result::Result<(), String> {
+        self.journal.validate().map_err(|error| error.to_string())?;
         if !self.profile_sample_rate.is_finite()
             || self.profile_sample_rate < 0.0
             || self.profile_sample_rate > 1.0
@@ -545,8 +573,10 @@ mod tests {
             Some(ObservabilityProfileDetail::Replay)
         );
         assert_eq!(ObservabilityProfileDetail::Replay.as_str(), "replay");
+        assert!(ObservabilityProfileDetail::Replay.requires_complete_evidence());
         assert!(ObservabilityProfileDetail::Replay.diagnostic_only());
         assert!(!ObservabilityProfileDetail::Basic.diagnostic_only());
+        assert!(!ObservabilityProfileDetail::Basic.requires_complete_evidence());
     }
 
     #[test]
@@ -571,6 +601,7 @@ mod tests {
     fn engine_token_timing_preserves_exact_commit_intervals() {
         let timing = EngineTokenTimingEvidence {
             clock_source: "rust_std_instant".to_string(),
+            request_start_boundary: None,
             wall_anchor_unix_nanos: 1_700_000_000_000_000_000,
             wall_anchor_max_error_nanos: 400,
             decode_ready_nanos_since_request_start: Some(2_000_000),
@@ -648,6 +679,21 @@ mod tests {
             attributes["itl_source"],
             serde_json::json!("engine_token_commit")
         );
+        assert!(!attributes.contains_key("engine_request_start_boundary"));
+        for boundary in [
+            crate::RequestIngressBoundary::EngineApi,
+            crate::RequestIngressBoundary::HttpHandler,
+            crate::RequestIngressBoundary::SchedulerApi,
+        ] {
+            let mut anchored = timing.clone();
+            anchored.request_start_boundary = Some(boundary);
+            let mut projected = engine_token_timing_profile_attributes(&anchored);
+            assert_eq!(
+                projected.remove("engine_request_start_boundary"),
+                Some(serde_json::json!(boundary.as_str()))
+            );
+            assert_eq!(projected, attributes);
+        }
     }
 
     #[test]
@@ -658,6 +704,28 @@ mod tests {
         );
         assert_eq!(ObservabilityProfileDetail::Verify.as_str(), "verify");
         assert!(ObservabilityProfileDetail::Verify.diagnostic_only());
+    }
+
+    #[test]
+    fn off_with_explicit_profile_uses_product_schema_without_device_capture() {
+        for entrypoint in [ProfileEntrypoint::Run, ProfileEntrypoint::Serve] {
+            let config = FerrumObservabilityConfig::new(
+                entrypoint,
+                "actual-model",
+                Some(PathBuf::from("profile.jsonl")),
+                ObservabilityProfileDetail::Off,
+                None,
+                None,
+                None,
+                1.0,
+            );
+            config.validate().unwrap();
+            assert!(config.enabled());
+            assert!(config.unified_product_profile_enabled());
+            assert!(!config.profile_detail.captures_engine_token_timing());
+            assert!(!config.profile_detail.captures_execution_facts());
+            assert!(!config.profile_detail.requires_complete_evidence());
+        }
     }
 
     #[test]

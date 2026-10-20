@@ -21,8 +21,8 @@
 
 #![cfg(all(target_os = "macos", feature = "metal"))]
 
+use crate::attention::metal::pipelines::MetalPipelines;
 use std::ffi::c_void;
-use std::sync::OnceLock;
 
 use metal::{
     Buffer, CompileOptions, ComputeCommandEncoderRef, ComputePipelineState, Device, MTLSize,
@@ -31,20 +31,16 @@ use metal::{
 const SHADER_SRC: &str = include_str!("q4_k_gemm.metal");
 const KERNEL_NAME: &str = "gemm_q4kw_f32a_f32o";
 
-static PIPELINE: OnceLock<ComputePipelineState> = OnceLock::new();
-
-fn pipeline(device: &Device) -> &'static ComputePipelineState {
-    PIPELINE.get_or_init(|| {
-        let lib = device
-            .new_library_with_source(SHADER_SRC, &CompileOptions::new())
-            .expect("compile q4_k_gemm.metal");
-        let function = lib
-            .get_function(KERNEL_NAME, None)
-            .expect("find gemm_q4kw_f32a_f32o");
-        device
-            .new_compute_pipeline_state_with_function(&function)
-            .expect("build gemm_q4kw_f32a_f32o pipeline")
-    })
+pub(crate) fn build_pipeline(device: &Device) -> ComputePipelineState {
+    let lib = device
+        .new_library_with_source(SHADER_SRC, &CompileOptions::new())
+        .expect("compile q4_k_gemm.metal");
+    let function = lib
+        .get_function(KERNEL_NAME, None)
+        .expect("find gemm_q4kw_f32a_f32o");
+    device
+        .new_compute_pipeline_state_with_function(&function)
+        .expect("build gemm_q4kw_f32a_f32o pipeline")
 }
 
 /// Dispatch the fused Q4_K GEMM on an existing compute encoder.
@@ -57,8 +53,8 @@ fn pipeline(device: &Device) -> &'static ComputePipelineState {
 ///         partial-tile store)
 /// `k`:    in_features (multiple of 256)
 /// `m`:    activation rows (batch size)
-pub fn dispatch_gemm_q4k_on_encoder(
-    device: &Device,
+pub(crate) fn dispatch_gemm_q4k_on_encoder(
+    pipes: &MetalPipelines,
     enc: &ComputeCommandEncoderRef,
     a: &Buffer,
     src0: &Buffer,
@@ -69,7 +65,7 @@ pub fn dispatch_gemm_q4k_on_encoder(
     k: usize,
 ) {
     // Standalone case: dst stride = n (out_features), no column offset.
-    dispatch_gemm_q4k_part(device, enc, a, src0, src0_byte_offset, c, 0, m, n, n, k);
+    dispatch_gemm_q4k_part(pipes, enc, a, src0, src0_byte_offset, c, 0, m, n, n, k);
 }
 
 /// Strided variant for `MultiQuantLinear` Fused: writes one part of a
@@ -78,8 +74,8 @@ pub fn dispatch_gemm_q4k_on_encoder(
 /// (write width per output row); `stride_c` is the total fused-output
 /// row stride. `src0_byte_offset` is the byte offset into the weight
 /// buffer (non-zero when `src0` is a shared zero-copy mmap buffer).
-pub fn dispatch_gemm_q4k_part(
-    device: &Device,
+pub(crate) fn dispatch_gemm_q4k_part(
+    pipes: &MetalPipelines,
     enc: &ComputeCommandEncoderRef,
     a: &Buffer,
     src0: &Buffer,
@@ -120,7 +116,7 @@ pub fn dispatch_gemm_q4k_part(
         stride_c: stride_c as i32, // dst row stride = total output rows
     };
 
-    let pipe = pipeline(device);
+    let pipe = pipes.q4_k_gemm_pipeline();
     enc.set_compute_pipeline_state(pipe);
     enc.set_buffer(0, Some(src0), src0_byte_offset);
     enc.set_buffer(1, Some(a), 0);
@@ -178,6 +174,7 @@ mod tests {
             eprintln!("no Metal device — skipping");
             return;
         };
+        let pipes = MetalPipelines::new(&device);
         let queue = device.new_command_queue();
 
         let a_buf = device.new_buffer_with_data(
@@ -194,7 +191,7 @@ mod tests {
 
         let cmd = queue.new_command_buffer();
         let enc = cmd.new_compute_command_encoder();
-        dispatch_gemm_q4k_on_encoder(&device, enc, &a_buf, &w_buf, 0, &c_buf, m, n, k);
+        dispatch_gemm_q4k_on_encoder(&pipes, enc, &a_buf, &w_buf, 0, &c_buf, m, n, k);
         enc.end_encoding();
         cmd.commit();
         cmd.wait_until_completed();
@@ -257,6 +254,7 @@ mod tests {
         let Some(device) = Device::system_default() else {
             return;
         };
+        let pipes = MetalPipelines::new(&device);
         let queue = device.new_command_queue();
 
         let a_buf = device.new_buffer_with_data(
@@ -273,7 +271,7 @@ mod tests {
 
         let cmd = queue.new_command_buffer();
         let enc = cmd.new_compute_command_encoder();
-        dispatch_gemm_q4k_on_encoder(&device, enc, &a_buf, &w_buf, 0, &c_buf, m, n, k);
+        dispatch_gemm_q4k_on_encoder(&pipes, enc, &a_buf, &w_buf, 0, &c_buf, m, n, k);
         enc.end_encoding();
         cmd.commit();
         cmd.wait_until_completed();

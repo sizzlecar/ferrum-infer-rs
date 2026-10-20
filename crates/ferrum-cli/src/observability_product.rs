@@ -1,3 +1,8 @@
+mod journal_session;
+mod session_metadata;
+pub use journal_session::{ProductEngineLifetime, ProductJournalSession};
+pub(crate) use session_metadata::ProductSessionMetadata;
+
 use chrono::{Duration, Utc};
 use clap::ValueEnum;
 use ferrum_types::{
@@ -76,20 +81,20 @@ impl Deref for ProductObservabilityConfig {
     }
 }
 
-pub struct ActualRunObservation {
+pub struct ActualRunObservation<'a> {
     pub request_id: String,
     pub duration_us: u64,
     pub sampling_params: SamplingParams,
     pub prompt_token_ids: Option<Vec<u32>>,
     pub prompt_token_count: Option<usize>,
     pub output_tokens: usize,
-    pub output_token_ids: Vec<u32>,
+    pub output_token_ids: &'a [ferrum_types::TokenId],
     pub chunk_count: usize,
     pub finish_reason: Option<String>,
     pub prompt_chars: usize,
     pub response_chars: usize,
-    pub response_text: String,
-    pub execution_evidence: Option<ferrum_types::InferenceExecutionEvidence>,
+    pub response_text: &'a str,
+    pub execution_evidence: Option<&'a ferrum_types::InferenceExecutionEvidence>,
     pub memory: Option<crate::memory_profile::ProcessMemoryObservation>,
     pub memory_stages: Vec<ActualMemoryStageObservation>,
 }
@@ -153,7 +158,13 @@ impl ActualMemoryStageObservation {
     }
 
     pub fn with_engine_cache_status(mut self, status: &ferrum_types::EngineStatus) -> Self {
-        let memory = &status.memory_usage;
+        let Some(memory) = status.memory_usage.known() else {
+            self.attributes.insert(
+                "resource_memory_observation".to_owned(),
+                json!("unavailable"),
+            );
+            return self;
+        };
         let dynamic_capacity_bytes = memory.cache_memory_bytes.saturating_add(memory.free_bytes);
         self.attributes.extend([
             (
@@ -185,6 +196,15 @@ impl ActualMemoryStageObservation {
 }
 
 impl ProductObservabilityConfig {
+    pub fn with_journal(
+        mut self,
+        journal: ferrum_types::ObservabilityJournalConfig,
+    ) -> Result<Self> {
+        journal.validate()?;
+        self.core.journal = journal;
+        Ok(self)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         entrypoint: ProfileEntrypoint,
@@ -248,7 +268,7 @@ pub fn write_synthetic_product_observability(
     let mut written = write_profile_outputs(
         config,
         &events,
-        ferrum_bench_core::JsonlJournalOpenMode::Truncate,
+        ferrum_journal::JsonlJournalOpenMode::Truncate,
         true,
         true,
         true,
@@ -262,13 +282,16 @@ pub fn write_synthetic_product_observability(
             &replay_command,
             ReplayBundleData {
                 request: request_dump(config, &request_id, &replay_command),
-                prompt_token_ids: Some(vec![101, 202, 303, 404]),
+                prompt_token_ids: Some(&[101, 202, 303, 404]),
                 prompt_token_count: Some(4),
                 prompt_token_unavailable_reason: None,
-                sampling_params: Some(SamplingParams::greedy()),
+                sampling_params: Some(&SamplingParams::greedy()),
                 backend: SYNTHETIC_BACKEND,
                 actual_model_smoke: false,
-                output_token_ids: Some(vec![909, 808]),
+                output_token_ids: Some(&[
+                    ferrum_types::TokenId::new(909),
+                    ferrum_types::TokenId::new(808),
+                ]),
                 output_text: Some("synthetic ok"),
                 finish_reason: Some("stop"),
                 failure_kind: None,
@@ -280,8 +303,9 @@ pub fn write_synthetic_product_observability(
 }
 
 pub fn write_actual_run_observability(
+    journals: &ProductJournalSession,
     config: &ProductObservabilityConfig,
-    observation: &ActualRunObservation,
+    observation: &ActualRunObservation<'_>,
 ) -> Result<Vec<PathBuf>> {
     if !config.enabled() {
         return Ok(Vec::new());
@@ -301,10 +325,11 @@ pub fn write_actual_run_observability(
     }
     let replay_command = replay_command(config);
     let events = actual_run_events(config, observation, &replay_command);
-    write_actual_run_artifacts(config, &events, observation, &replay_command)
+    write_actual_run_artifacts(journals, config, &events, observation, &replay_command)
 }
 
 pub fn write_actual_run_failure_observability(
+    journals: &ProductJournalSession,
     config: &ProductObservabilityConfig,
     observation: &ActualRunFailureObservation,
 ) -> Result<Vec<PathBuf>> {
@@ -317,10 +342,11 @@ pub fn write_actual_run_failure_observability(
     }
     let replay_command = replay_command(config);
     let events = actual_run_failure_events(config, observation, &replay_command);
-    write_actual_run_failure_artifacts(config, &events, observation, &replay_command)
+    write_actual_run_failure_artifacts(journals, config, &events, observation, &replay_command)
 }
 
 pub fn write_actual_serve_startup_observability(
+    journals: &ProductJournalSession,
     config: &ProductObservabilityConfig,
     startup_duration_us: u64,
     startup_memory: Option<crate::memory_profile::ProcessMemoryObservation>,
@@ -343,10 +369,11 @@ pub fn write_actual_serve_startup_observability(
         &memory_stages,
         &replay_command,
     );
-    write_actual_artifacts(config, &events, &request_id, &replay_command)
+    write_actual_artifacts(journals, config, &events, &request_id, &replay_command)
 }
 
 pub fn append_actual_serve_memory_stage_observability(
+    journals: &ProductJournalSession,
     config: &ProductObservabilityConfig,
     stage: ActualMemoryStageObservation,
 ) -> Result<Vec<PathBuf>> {
@@ -359,25 +386,20 @@ pub fn append_actual_serve_memory_stage_observability(
     }
     let request_id = format!("serve-memory-{}", Uuid::new_v4().simple());
     let events = actual_memory_stage_events(config, &request_id, &[stage], Utc::now());
-    write_profile_outputs(
-        config,
-        &events,
-        ferrum_bench_core::JsonlJournalOpenMode::Append,
-        true,
-        true,
-        false,
-    )
+    journals.write(&events, true, true, false)
 }
 
 fn write_actual_run_artifacts(
+    journals: &ProductJournalSession,
     config: &ProductObservabilityConfig,
     events: &[FerrumProfileEvent],
-    observation: &ActualRunObservation,
+    observation: &ActualRunObservation<'_>,
     replay_command: &str,
 ) -> Result<Vec<PathBuf>> {
     // Successful actual inference must prove its scheduler lifecycle at the engine boundary.
     // Adding a product fallback here would duplicate real events or hide missing engine evidence.
     let mut written = write_actual_artifacts_with_scheduler(
+        journals,
         config,
         events,
         &observation.request_id,
@@ -392,15 +414,15 @@ fn write_actual_run_artifacts(
             replay_command,
             ReplayBundleData {
                 request: actual_request_dump(config, &observation.request_id, replay_command),
-                prompt_token_ids: observation.prompt_token_ids.clone(),
+                prompt_token_ids: observation.prompt_token_ids.as_deref(),
                 prompt_token_count: observation.prompt_token_count,
                 prompt_token_unavailable_reason: observation.prompt_token_ids.is_none().then_some(
                     "rendered prompt token ids were unavailable for run one-shot observability",
                 ),
-                sampling_params: Some(observation.sampling_params.clone()),
+                sampling_params: Some(&observation.sampling_params),
                 backend: "actual",
                 actual_model_smoke: true,
-                output_token_ids: Some(observation.output_token_ids.clone()),
+                output_token_ids: Some(observation.output_token_ids),
                 output_text: Some(&observation.response_text),
                 finish_reason: observation.finish_reason.as_deref(),
                 failure_kind: None,
@@ -412,13 +434,19 @@ fn write_actual_run_artifacts(
 }
 
 fn write_actual_run_failure_artifacts(
+    journals: &ProductJournalSession,
     config: &ProductObservabilityConfig,
     events: &[FerrumProfileEvent],
     observation: &ActualRunFailureObservation,
     replay_command: &str,
 ) -> Result<Vec<PathBuf>> {
-    let mut written =
-        write_actual_artifacts(config, events, &observation.request_id, replay_command)?;
+    let mut written = write_actual_artifacts(
+        journals,
+        config,
+        events,
+        &observation.request_id,
+        replay_command,
+    )?;
     if let Some(dir) = &config.request_dump_dir {
         written.extend(write_replay_bundle(
             dir,
@@ -427,15 +455,15 @@ fn write_actual_run_failure_artifacts(
             replay_command,
             ReplayBundleData {
                 request: actual_request_dump(config, &observation.request_id, replay_command),
-                prompt_token_ids: observation.prompt_token_ids.clone(),
+                prompt_token_ids: observation.prompt_token_ids.as_deref(),
                 prompt_token_count: observation.prompt_token_count,
                 prompt_token_unavailable_reason: observation.prompt_token_ids.is_none().then_some(
                     "rendered prompt token ids were unavailable for run failure observability",
                 ),
-                sampling_params: Some(observation.sampling_params.clone()),
+                sampling_params: Some(&observation.sampling_params),
                 backend: "actual",
                 actual_model_smoke: true,
-                output_token_ids: Some(Vec::new()),
+                output_token_ids: Some(&[]),
                 output_text: Some(""),
                 finish_reason: Some("error"),
                 failure_kind: Some(observation.failure_kind.as_str()),
@@ -447,29 +475,31 @@ fn write_actual_run_failure_artifacts(
 }
 
 fn write_actual_artifacts(
+    journals: &ProductJournalSession,
     config: &ProductObservabilityConfig,
     events: &[FerrumProfileEvent],
     request_id: &str,
     replay_command: &str,
 ) -> Result<Vec<PathBuf>> {
-    write_actual_artifacts_with_scheduler(config, events, request_id, replay_command, true)
+    write_actual_artifacts_with_scheduler(
+        journals,
+        config,
+        events,
+        request_id,
+        replay_command,
+        true,
+    )
 }
 
 fn write_actual_artifacts_with_scheduler(
+    journals: &ProductJournalSession,
     config: &ProductObservabilityConfig,
     events: &[FerrumProfileEvent],
     request_id: &str,
     replay_command: &str,
     include_scheduler: bool,
 ) -> Result<Vec<PathBuf>> {
-    let mut written = write_profile_outputs(
-        config,
-        events,
-        ferrum_bench_core::JsonlJournalOpenMode::Append,
-        true,
-        true,
-        include_scheduler,
-    )?;
+    let mut written = journals.write(events, true, true, include_scheduler)?;
     if let Some(dir) = &config.request_dump_dir {
         fs_create_dir_all(dir)?;
         written.extend(write_replay_bundle(
@@ -487,7 +517,7 @@ fn write_actual_artifacts_with_scheduler(
                 sampling_params: None,
                 backend: "actual",
                 actual_model_smoke: true,
-                output_token_ids: Some(Vec::new()),
+                output_token_ids: Some(&[]),
                 output_text: None,
                 finish_reason: None,
                 failure_kind: None,
@@ -513,7 +543,7 @@ fn add_profile_output_target(
     let Some(path) = path else {
         return Ok(());
     };
-    let normalized = ferrum_bench_core::normalize_jsonl_path(path).map_err(|error| {
+    let normalized = ferrum_journal::normalize_jsonl_path(path).map_err(|error| {
         FerrumError::io(format!(
             "normalize observability JSONL path {}: {error}",
             path.display()
@@ -526,30 +556,43 @@ fn add_profile_output_target(
 fn write_profile_outputs(
     config: &ProductObservabilityConfig,
     events: &[FerrumProfileEvent],
-    mode: ferrum_bench_core::JsonlJournalOpenMode,
+    mode: ferrum_journal::JsonlJournalOpenMode,
     include_profile: bool,
     include_memory: bool,
     include_scheduler: bool,
 ) -> Result<Vec<PathBuf>> {
-    let mut targets = BTreeMap::<PathBuf, ProfileOutputRoles>::new();
-    if include_profile {
-        add_profile_output_target(&mut targets, config.profile_jsonl.as_ref(), |roles| {
-            &mut roles.profile
+    for event in events {
+        event.validate().map_err(|error| {
+            FerrumError::internal(format!("invalid product observability event: {error}"))
         })?;
     }
-    if include_memory {
-        add_profile_output_target(
-            &mut targets,
+    let mut targets = BTreeMap::<PathBuf, ProfileOutputRoles>::new();
+    let mut required_failure = None;
+    let roles: [(
+        bool,
+        Option<&PathBuf>,
+        fn(&mut ProfileOutputRoles) -> &mut bool,
+    ); 3] = [
+        (include_profile, config.profile_jsonl.as_ref(), |roles| {
+            &mut roles.profile
+        }),
+        (
+            include_memory,
             config.memory_profile_jsonl.as_ref(),
             |roles| &mut roles.memory,
-        )?;
-    }
-    if include_scheduler {
-        add_profile_output_target(
-            &mut targets,
+        ),
+        (
+            include_scheduler,
             config.scheduler_trace_jsonl.as_ref(),
             |roles| &mut roles.scheduler,
-        )?;
+        ),
+    ];
+    for (included, path, role) in roles {
+        if included {
+            if let Err(error) = add_profile_output_target(&mut targets, path, role) {
+                record_profile_transport_failure(config, path, error, &mut required_failure)?;
+            }
+        }
     }
 
     let mut written = Vec::with_capacity(targets.len());
@@ -566,10 +609,31 @@ fn write_profile_outputs(
         if selected.is_empty() {
             continue;
         }
-        write_profile_events(&path, mode, &selected)?;
-        written.push(path);
+        match write_profile_events(&path, mode, &selected, config.journal) {
+            Ok(()) => written.push(path),
+            Err(error) => {
+                record_profile_transport_failure(config, Some(&path), error, &mut required_failure)?
+            }
+        }
     }
-    Ok(written)
+    required_failure.map_or(Ok(written), Err)
+}
+
+fn record_profile_transport_failure(
+    config: &ProductObservabilityConfig,
+    path: Option<&PathBuf>,
+    error: FerrumError,
+    required_failure: &mut Option<FerrumError>,
+) -> Result<()> {
+    if !matches!(error, FerrumError::IO { .. }) {
+        return Err(error);
+    }
+    if config.profile_detail.requires_complete_evidence() {
+        required_failure.get_or_insert(error);
+    } else {
+        tracing::warn!(?path, %error, "Optional profile artifact is incomplete");
+    }
+    Ok(())
 }
 
 fn product_events(
@@ -698,7 +762,7 @@ fn product_events(
 
 fn actual_run_events(
     config: &ProductObservabilityConfig,
-    observation: &ActualRunObservation,
+    observation: &ActualRunObservation<'_>,
     replay_command: &str,
 ) -> Vec<FerrumProfileEvent> {
     let base = Utc::now();
@@ -1242,6 +1306,16 @@ fn runtime_preset_hash(config: &ProductObservabilityConfig) -> String {
     hasher.update(config.profile_detail.as_str().as_bytes());
     hasher.update(b"\0");
     hasher.update(config.profile_sample_rate.to_string().as_bytes());
+    for value in [
+        config.journal.queue_capacity,
+        config.journal.payload_capacity_bytes,
+        config.journal.max_record_bytes,
+        config.journal.max_batch_bytes,
+        config.journal.max_batch_records,
+    ] {
+        hasher.update(b"\0");
+        hasher.update(value.to_string().as_bytes());
+    }
     format!("sha256:{:x}", hasher.finalize())
 }
 
@@ -1408,13 +1482,13 @@ fn actual_attrs(config: &ProductObservabilityConfig) -> BTreeMap<String, Value> 
 
 struct ReplayBundleData<'a> {
     request: serde_json::Value,
-    prompt_token_ids: Option<Vec<u32>>,
+    prompt_token_ids: Option<&'a [u32]>,
     prompt_token_count: Option<usize>,
     prompt_token_unavailable_reason: Option<&'a str>,
-    sampling_params: Option<SamplingParams>,
+    sampling_params: Option<&'a SamplingParams>,
     backend: &'a str,
     actual_model_smoke: bool,
-    output_token_ids: Option<Vec<u32>>,
+    output_token_ids: Option<&'a [ferrum_types::TokenId]>,
     output_text: Option<&'a str>,
     finish_reason: Option<&'a str>,
     failure_kind: Option<&'a str>,
@@ -1442,18 +1516,47 @@ fn write_replay_bundle(
 
     let prompt_token_count = data
         .prompt_token_count
-        .or_else(|| data.prompt_token_ids.as_ref().map(Vec::len));
-    let output_token_count = data.output_token_ids.as_ref().map(Vec::len).unwrap_or(0);
-    let prompt_tokens = json!({
-        "schema_version": OBSERVABILITY_PROFILE_SCHEMA_VERSION,
-        "request_id": request_id,
-        "model": config.model,
-        "tokenizer_or_model": config.model,
-        "token_ids": data.prompt_token_ids,
-        "token_count": prompt_token_count,
-        "unavailable_reason": data.prompt_token_unavailable_reason,
-        "sanitized": true
-    });
+        .or_else(|| data.prompt_token_ids.map(<[u32]>::len));
+    let output_token_count = data
+        .output_token_ids
+        .map(<[ferrum_types::TokenId]>::len)
+        .unwrap_or(0);
+    #[derive(serde::Serialize)]
+    struct PromptTokens<'a> {
+        schema_version: u32,
+        request_id: &'a str,
+        model: &'a str,
+        tokenizer_or_model: &'a str,
+        token_ids: Option<&'a [u32]>,
+        token_count: Option<usize>,
+        unavailable_reason: Option<&'a str>,
+        sanitized: bool,
+    }
+    let prompt_tokens = PromptTokens {
+        schema_version: OBSERVABILITY_PROFILE_SCHEMA_VERSION,
+        request_id,
+        model: &config.model,
+        tokenizer_or_model: &config.model,
+        token_ids: data.prompt_token_ids,
+        token_count: prompt_token_count,
+        unavailable_reason: data.prompt_token_unavailable_reason,
+        sanitized: true,
+    };
+    #[derive(serde::Serialize)]
+    struct OutputTokens<'a> {
+        schema_version: u32,
+        request_id: &'a str,
+        token_ids: &'a [ferrum_types::TokenId],
+        token_count: usize,
+        finish_reason: Option<&'a str>,
+    }
+    let output_tokens = OutputTokens {
+        schema_version: OBSERVABILITY_PROFILE_SCHEMA_VERSION,
+        request_id,
+        token_ids: data.output_token_ids.unwrap_or_default(),
+        token_count: output_token_count,
+        finish_reason: data.finish_reason,
+    };
     let output_text = data.output_text.unwrap_or("");
     let sampling_unavailable_reason = if data.sampling_params.is_some() {
         Value::Null
@@ -1461,25 +1564,26 @@ fn write_replay_bundle(
         json!("sampling params unavailable for this replay bundle kind in WP9 L0")
     };
     let output_text_body = if data.actual_model_smoke && config.model != SYNTHETIC_MODEL {
-        format!(
+        std::borrow::Cow::Owned(format!(
             "[redacted actual output]\nsha256={}\nchars={}\n",
             sha256_hex(output_text.as_bytes()),
             output_text.chars().count()
-        )
+        ))
     } else {
-        format!("{output_text}\n")
+        std::borrow::Cow::Borrowed(output_text)
     };
-    let output_scan = bad_output_scan(
-        request_id,
-        output_text,
-        data.failure_kind,
-        output_text_body.as_bytes(),
-    );
+    let output_newline = !matches!(output_text_body, std::borrow::Cow::Owned(_));
+    let mut artifact_hash = Sha256::new();
+    artifact_hash.update(output_text_body.as_bytes());
+    if output_newline {
+        artifact_hash.update(b"\n");
+    }
+    let artifact_hash = format!("{:x}", artifact_hash.finalize());
+    let output_scan = bad_output_scan(request_id, output_text, data.failure_kind, &artifact_hash);
     let engine_replay_args = engine_replay_command_args(&bundle_dir);
     let engine_replay_command = replay_command_from_args(&engine_replay_args);
     let files = [
         ("request.json", data.request),
-        ("prompt_token_ids.json", prompt_tokens),
         (
             "sampling_params.json",
             json!({
@@ -1497,6 +1601,7 @@ fn write_replay_bundle(
                 "entrypoint": entrypoint_label(config.entrypoint),
                 "profile_detail": config.profile_detail.as_str(),
                 "profile_sample_rate": config.profile_sample_rate,
+                "profile_journal": config.journal,
                 "profile_jsonl": config.profile_jsonl.as_ref().map(|path| path.to_string_lossy().to_string()),
                 "memory_profile_jsonl": config.memory_profile_jsonl.as_ref().map(|path| path.to_string_lossy().to_string()),
                 "scheduler_trace_jsonl": config.scheduler_trace_jsonl.as_ref().map(|path| path.to_string_lossy().to_string()),
@@ -1512,16 +1617,6 @@ fn write_replay_bundle(
                 "backend": data.backend,
                 "model": config.model,
                 "actual_model_smoke": data.actual_model_smoke
-            }),
-        ),
-        (
-            "output_token_ids.json",
-            json!({
-                "schema_version": OBSERVABILITY_PROFILE_SCHEMA_VERSION,
-                "request_id": request_id,
-                "token_ids": data.output_token_ids.unwrap_or_default(),
-                "token_count": output_token_count,
-                "finish_reason": data.finish_reason
             }),
         ),
         ("bad_output_scan.json", output_scan),
@@ -1548,6 +1643,15 @@ fn write_replay_bundle(
         let path = bundle_dir.join(name);
         write_json(&path, &value)?;
         written.push(path);
+        if name == "request.json" {
+            let path = bundle_dir.join("prompt_token_ids.json");
+            write_json(&path, &prompt_tokens)?;
+            written.push(path);
+        } else if name == "backend_selection.json" {
+            let path = bundle_dir.join("output_token_ids.json");
+            write_json(&path, &output_tokens)?;
+            written.push(path);
+        }
     }
     if let Some(diagnostics) = data.failure_diagnostics {
         let path = bundle_dir.join("failure_diagnostics.json");
@@ -1555,7 +1659,14 @@ fn write_replay_bundle(
         written.push(path);
     }
     let output_text_path = bundle_dir.join("output_text.txt");
-    fs_write(&output_text_path, output_text_body)?;
+    let mut output_file =
+        fs::File::create(&output_text_path).map_err(|error| FerrumError::io(error.to_string()))?;
+    std::io::Write::write_all(&mut output_file, output_text_body.as_bytes())
+        .map_err(|error| FerrumError::io(error.to_string()))?;
+    if output_newline {
+        std::io::Write::write_all(&mut output_file, b"\n")
+            .map_err(|error| FerrumError::io(error.to_string()))?;
+    }
     written.push(output_text_path);
     Ok(written)
 }
@@ -1664,7 +1775,7 @@ fn bad_output_scan(
     request_id: &str,
     text: &str,
     failure_kind: Option<&str>,
-    output_artifact_bytes: &[u8],
+    output_artifact_sha256: &str,
 ) -> serde_json::Value {
     let mut reasons = Vec::new();
     let mut first_span: Option<serde_json::Value> = None;
@@ -1712,7 +1823,7 @@ fn bad_output_scan(
         "failure_kind": failure_kind,
         "output_chars": text.chars().count(),
         "classified_output_sha256": sha256_hex(text.as_bytes()),
-        "output_sha256": sha256_hex(output_artifact_bytes)
+        "output_sha256": output_artifact_sha256
     })
 }
 
@@ -1874,28 +1985,11 @@ fn push_path_arg(parts: &mut Vec<String>, flag: &str, path: Option<&PathBuf>) {
     }
 }
 
-#[cfg(test)]
-fn write_profile_jsonl(path: &Path, events: &[FerrumProfileEvent]) -> Result<()> {
-    write_profile_events(
-        path,
-        ferrum_bench_core::JsonlJournalOpenMode::Truncate,
-        events,
-    )
-}
-
-#[cfg(test)]
-fn append_profile_jsonl(path: &Path, events: &[FerrumProfileEvent]) -> Result<()> {
-    write_profile_events(
-        path,
-        ferrum_bench_core::JsonlJournalOpenMode::Append,
-        events,
-    )
-}
-
 fn write_profile_events(
     path: &Path,
-    mode: ferrum_bench_core::JsonlJournalOpenMode,
+    mode: ferrum_journal::JsonlJournalOpenMode,
     events: &[FerrumProfileEvent],
+    config: ferrum_types::ObservabilityJournalConfig,
 ) -> Result<()> {
     if events.is_empty() {
         return Err(FerrumError::internal("profile event set must be non-empty"));
@@ -1905,14 +1999,41 @@ fn write_profile_events(
             FerrumError::internal(format!("invalid product observability event: {err}"))
         })?;
     }
-    ferrum_bench_core::write_jsonl_records(path, mode, events)
-        .map_err(|error| FerrumError::io(error.to_string()))
+    ferrum_journal::jsonl_journal::write_jsonl_records_with_config(
+        path,
+        mode,
+        events,
+        config.into(),
+    )
+    .map_err(|error| {
+        if matches!(
+            error.kind(),
+            ferrum_journal::JsonlJournalErrorKind::Encoding
+                | ferrum_journal::JsonlJournalErrorKind::Panic
+                | ferrum_journal::JsonlJournalErrorKind::Config
+        ) {
+            FerrumError::serialization(error.to_string())
+        } else {
+            FerrumError::io(error.to_string())
+        }
+    })
 }
 
-fn write_json(path: &Path, value: &serde_json::Value) -> Result<()> {
-    let body = serde_json::to_string_pretty(value)
-        .map_err(|err| FerrumError::serialization(format!("failed to serialize JSON: {err}")))?;
-    fs_write(path, format!("{body}\n"))
+fn write_json<T: serde::Serialize + ?Sized>(path: &Path, value: &T) -> Result<()> {
+    use std::io::Write;
+    if let Some(parent) = path.parent() {
+        fs_create_dir_all(parent)?;
+    }
+    let file = fs::File::create(path)
+        .map_err(|error| FerrumError::io(format!("failed to write {}: {error}", path.display())))?;
+    let mut writer = std::io::BufWriter::new(file);
+    serde_json::to_writer_pretty(&mut writer, value).map_err(|error| {
+        FerrumError::serialization(format!("failed to serialize JSON: {error}"))
+    })?;
+    writer
+        .write_all(b"\n")
+        .and_then(|()| writer.flush())
+        .map_err(|error| FerrumError::io(error.to_string()))
 }
 
 fn fs_create_dir_all(path: &Path) -> Result<()> {
@@ -1952,6 +2073,73 @@ mod tests {
     use super::*;
 
     #[test]
+    fn profile_fanout_keeps_healthy_output_and_required_evidence_failure() {
+        for entrypoint in [ProfileEntrypoint::Run, ProfileEntrypoint::Serve] {
+            for detail in [
+                ProfileDetailArg::Basic,
+                ProfileDetailArg::Replay,
+                ProfileDetailArg::Verify,
+                ProfileDetailArg::Full,
+            ] {
+                let directory = tempfile::tempdir().unwrap();
+                let blocked_parent = directory.path().join("blocked");
+                fs::write(&blocked_parent, "occupied by a file").unwrap();
+                let failed = blocked_parent.join("profile.jsonl");
+                let healthy = directory.path().join("scheduler.jsonl");
+                let config = ProductObservabilityConfig::new(
+                    entrypoint,
+                    "test-model",
+                    Some(&failed),
+                    detail,
+                    None,
+                    Some(&healthy),
+                    None,
+                    1.0,
+                );
+                let events = product_events(&config, "request", "ferrum run");
+                let result = write_profile_outputs(
+                    &config,
+                    &events,
+                    ferrum_journal::JsonlJournalOpenMode::Truncate,
+                    true,
+                    false,
+                    true,
+                );
+                if config.profile_detail.requires_complete_evidence() {
+                    assert!(matches!(result, Err(FerrumError::IO { .. })));
+                } else {
+                    let written = result.unwrap();
+                    assert_eq!(written.len(), 1);
+                    assert_eq!(fs::read(&written[0]).unwrap(), fs::read(&healthy).unwrap());
+                }
+                let actual: Vec<FerrumProfileEvent> = fs::read_to_string(&healthy)
+                    .unwrap()
+                    .lines()
+                    .map(|line| serde_json::from_str(line).unwrap())
+                    .collect();
+                assert!(!actual.is_empty());
+                for event in actual {
+                    assert!(event.resource.is_some());
+                    event.validate().unwrap();
+                }
+                let mut invalid = events;
+                invalid[0].request_id.clear();
+                assert!(matches!(
+                    write_profile_outputs(
+                        &config,
+                        &invalid,
+                        ferrum_journal::JsonlJournalOpenMode::Append,
+                        true,
+                        false,
+                        true
+                    ),
+                    Err(FerrumError::Internal { .. })
+                ));
+            }
+        }
+    }
+
+    #[test]
     fn basic_metrics_only_product_writers_skip_artifacts_and_keep_validation() {
         for entrypoint in [ProfileEntrypoint::Run, ProfileEntrypoint::Serve] {
             let mut config = ProductObservabilityConfig::new(
@@ -1964,12 +2152,19 @@ mod tests {
                 None,
                 default_profile_sample_rate(),
             );
-            assert!(
-                write_actual_serve_startup_observability(&config, 1, None, Vec::new())
-                    .unwrap()
-                    .is_empty()
-            );
+            let journals =
+                ProductJournalSession::prepare(&config, &ferrum_types::EngineConfig::default());
+            assert!(write_actual_serve_startup_observability(
+                &journals,
+                &config,
+                1,
+                None,
+                Vec::new()
+            )
+            .unwrap()
+            .is_empty());
             assert!(append_actual_serve_memory_stage_observability(
+                &journals,
                 &config,
                 ActualMemoryStageObservation::new("shutdown", "shutdown", None, None),
             )
@@ -1988,14 +2183,21 @@ mod tests {
                 memory: None,
                 memory_stages: Vec::new(),
             };
-            assert!(write_actual_run_failure_observability(&config, &failure)
-                .unwrap()
-                .is_empty());
-            config.core.profile_sample_rate = f64::NAN;
-            assert!(write_actual_run_failure_observability(&config, &failure).is_err());
             assert!(
-                write_actual_serve_startup_observability(&config, 1, None, Vec::new()).is_err()
+                write_actual_run_failure_observability(&journals, &config, &failure)
+                    .unwrap()
+                    .is_empty()
             );
+            config.core.profile_sample_rate = f64::NAN;
+            assert!(write_actual_run_failure_observability(&journals, &config, &failure).is_err());
+            assert!(write_actual_serve_startup_observability(
+                &journals,
+                &config,
+                1,
+                None,
+                Vec::new()
+            )
+            .is_err());
         }
     }
 
@@ -2006,7 +2208,7 @@ mod tests {
             loaded_models: vec![ferrum_types::ModelId::from("test-model")],
             active_requests: 0,
             queued_requests: 0,
-            memory_usage: ferrum_types::MemoryUsage {
+            memory_usage: ferrum_types::MemoryObservation::Known(ferrum_types::MemoryUsage {
                 total_bytes: 900,
                 used_bytes: 500,
                 free_bytes: 400,
@@ -2014,7 +2216,7 @@ mod tests {
                 cpu_memory_bytes: None,
                 cache_memory_bytes: 100,
                 utilization_percent: 500.0 / 9.0,
-            },
+            }),
             uptime_seconds: 0,
             last_heartbeat: chrono::Utc::now(),
             version: "test".to_string(),
@@ -2027,6 +2229,41 @@ mod tests {
         assert_eq!(observation.attributes["kv_cache_used_bytes"], 100);
         assert_eq!(observation.attributes["resource_total_bytes"], 900);
         assert_eq!(observation.attributes["resource_used_bytes"], 500);
+    }
+
+    #[test]
+    fn engine_cache_observation_unknown_does_not_fabricate_zero_bytes() {
+        let status = ferrum_types::EngineStatus {
+            is_ready: true,
+            loaded_models: Vec::new(),
+            active_requests: 0,
+            queued_requests: 0,
+            memory_usage: ferrum_types::MemoryObservation::Unknown,
+            uptime_seconds: 0,
+            last_heartbeat: chrono::Utc::now(),
+            version: "test".into(),
+        };
+        let observation = ActualMemoryStageObservation::new("test", "cache_allocated", None, None)
+            .with_engine_cache_status(&status);
+        assert_eq!(
+            observation.attributes["resource_memory_observation"],
+            "unavailable"
+        );
+        for key in [
+            "kv_cache_total_bytes",
+            "kv_cache_used_bytes",
+            "kv_cache_free_bytes",
+            "resource_total_bytes",
+            "resource_used_bytes",
+            "resource_free_bytes",
+            "cache_memory_bytes",
+        ] {
+            assert!(
+                !observation.attributes.contains_key(key),
+                "fabricated {key}"
+            );
+        }
+        assert!(status.is_ready);
     }
 
     #[test]
@@ -2135,6 +2372,8 @@ mod tests {
             Some(&root.join("request_dump")),
             1.0,
         );
+        let journals =
+            ProductJournalSession::prepare(&config, &ferrum_types::EngineConfig::default());
         let memory = crate::memory_profile::ProcessMemoryObservation {
             before_bytes: 100,
             after_bytes: 200,
@@ -2143,6 +2382,7 @@ mod tests {
             source: "test",
         };
         write_actual_serve_startup_observability(
+            &journals,
             &config,
             42,
             Some(memory.clone()),
@@ -2162,7 +2402,9 @@ mod tests {
             ],
         )
         .unwrap();
+        journals.flush().unwrap();
         append_actual_serve_memory_stage_observability(
+            &journals,
             &config,
             ActualMemoryStageObservation::new(
                 "actual_serve_shutdown",
@@ -2172,6 +2414,7 @@ mod tests {
             ),
         )
         .unwrap();
+        journals.flush().unwrap();
         let profile = fs::read_to_string(root.join("profile.jsonl")).unwrap();
         assert!(profile.contains("\"phase\":\"actual_serve_startup\""));
         assert!(profile.contains("\"phase\":\"actual_serve_shutdown\""));
@@ -2211,9 +2454,16 @@ mod tests {
             1.0,
         );
 
+        let mut original_owner = ferrum_journal::JsonlJournalOwner::open(
+            &path,
+            ferrum_journal::JsonlJournalOpenMode::Append,
+            config.journal.into(),
+        )
+        .unwrap();
         let mut handles = Vec::new();
         for writer in 0..8 {
-            let path = path.clone();
+            let mut scope = original_owner.producer_scope().unwrap();
+            let producer = scope.producer::<FerrumProfileEvent>();
             let config = config.clone();
             handles.push(std::thread::spawn(move || {
                 for seq in 0..32 {
@@ -2230,8 +2480,14 @@ mod tests {
                     event.duration_us = Some(1);
                     event.attributes.insert("writer".to_string(), json!(writer));
                     event.attributes.insert("seq".to_string(), json!(seq));
-                    append_profile_jsonl(&path, &[event]).unwrap();
+                    // Concurrent tool producers share one explicitly supplied
+                    // scope each and one original ordered worker.
+                    ferrum_journal::write_jsonl_records_to(&producer, &[event])
+                        .unwrap()
+                        .result()
+                        .unwrap();
                 }
+                scope.finish().result().unwrap();
             }));
         }
 
@@ -2239,6 +2495,7 @@ mod tests {
             handle.join().unwrap();
         }
 
+        original_owner.close().unwrap().result().unwrap();
         let profile = fs::read_to_string(&path).unwrap();
         let mut parsed = 0usize;
         for line in profile.lines().filter(|line| !line.trim().is_empty()) {
@@ -2265,6 +2522,8 @@ mod tests {
             Some(&root.join("request_dump")),
             1.0,
         );
+        let journals =
+            ProductJournalSession::prepare(&config, &ferrum_types::EngineConfig::default());
         let memory = crate::memory_profile::ProcessMemoryObservation {
             before_bytes: 100,
             after_bytes: 200,
@@ -2273,6 +2532,7 @@ mod tests {
             source: "test",
         };
         write_actual_serve_startup_observability(
+            &journals,
             &config,
             42,
             Some(memory.clone()),
@@ -2306,6 +2566,7 @@ mod tests {
             ],
         )
         .unwrap();
+        journals.flush().unwrap();
         let memory_profile = fs::read_to_string(root.join("memory.jsonl")).unwrap();
         let memory_stages = memory_profile
             .lines()
@@ -2346,8 +2607,11 @@ mod tests {
             Some(&root.join("request_dump")),
             1.0,
         );
+        let journals =
+            ProductJournalSession::prepare(&config, &ferrum_types::EngineConfig::default());
         let request_id = "req-failure-test".to_string();
         write_actual_run_failure_observability(
+            &journals,
             &config,
             &ActualRunFailureObservation {
                 request_id: request_id.clone(),
@@ -2364,6 +2628,7 @@ mod tests {
             },
         )
         .unwrap();
+        journals.flush().unwrap();
         let profile = fs::read_to_string(root.join("profile.jsonl")).unwrap();
         let failure = profile
             .lines()
@@ -2394,8 +2659,8 @@ mod tests {
         fs::remove_dir_all(root).ok();
     }
 
-    #[test]
-    fn actual_run_observability_writes_prompt_token_ids() {
+    #[tokio::test]
+    async fn actual_run_observability_writes_prompt_token_ids() {
         let root = std::env::temp_dir().join(format!(
             "ferrum-run-observability-{}",
             Uuid::new_v4().simple()
@@ -2410,6 +2675,8 @@ mod tests {
             Some(&root.join("request_dump")),
             1.0,
         );
+        let journals =
+            ProductJournalSession::prepare(&config, &ferrum_types::EngineConfig::default());
         let request_id = "req-run-test".to_string();
         let native_event = actual_base_event(
             &config,
@@ -2418,8 +2685,11 @@ mod tests {
             ProfileEventKind::Instant,
             Utc::now(),
         );
-        write_profile_jsonl(&root.join("profile.jsonl"), &[native_event]).unwrap();
+        // Seed the earlier event through the original assembly producer. The
+        // product append must preserve it without opening a second writer.
+        journals.write(&[native_event], true, false, false).unwrap();
         write_actual_run_observability(
+            &journals,
             &config,
             &ActualRunObservation {
                 request_id: request_id.clone(),
@@ -2428,13 +2698,16 @@ mod tests {
                 prompt_token_ids: Some(vec![7, 8, 9]),
                 prompt_token_count: Some(3),
                 output_tokens: 2,
-                output_token_ids: vec![10, 11],
+                output_token_ids: &[
+                    ferrum_types::TokenId::new(10),
+                    ferrum_types::TokenId::new(11),
+                ],
                 chunk_count: 1,
                 finish_reason: Some("stop".to_string()),
                 prompt_chars: 12,
                 response_chars: 2,
-                response_text: "OK".to_string(),
-                execution_evidence: Some(ferrum_types::InferenceExecutionEvidence {
+                response_text: "OK",
+                execution_evidence: Some(&ferrum_types::InferenceExecutionEvidence {
                     prompt_token_ids: vec![
                         ferrum_types::TokenId::new(7),
                         ferrum_types::TokenId::new(8),
@@ -2446,6 +2719,9 @@ mod tests {
                     ],
                     engine_token_timing: Some(ferrum_types::EngineTokenTimingEvidence {
                         clock_source: "rust_std_instant".to_string(),
+                        request_start_boundary: Some(
+                            ferrum_types::RequestIngressBoundary::EngineApi,
+                        ),
                         wall_anchor_unix_nanos: 1_700_000_000_000_000_000,
                         wall_anchor_max_error_nanos: 500,
                         decode_ready_nanos_since_request_start: Some(1_000_000),
@@ -2483,6 +2759,8 @@ mod tests {
             },
         )
         .unwrap();
+        journals.finish().await.unwrap();
+        assert!(journals.is_closed());
         let bundle_dir = root.join("request_dump").join(&request_id);
         let prompt_tokens: serde_json::Value = serde_json::from_str(
             &fs::read_to_string(bundle_dir.join("prompt_token_ids.json")).unwrap(),
@@ -2524,6 +2802,10 @@ mod tests {
         );
         assert_eq!(generation["attributes"]["e2e_duration_us"], 42);
         assert_eq!(generation["attributes"]["profile_detail"], "latency");
+        assert_eq!(
+            generation["attributes"]["engine_request_start_boundary"],
+            "engine_api"
+        );
         assert_eq!(
             generation["attributes"]["engine_token_commit_nanos_since_request_start"],
             serde_json::json!([2_000_000, 4_000_000])
@@ -2575,7 +2857,7 @@ mod tests {
             .expect("shutdown stage");
         assert!(first_request_index < shutdown_index);
         assert!(
-            !root.join("scheduler.jsonl").exists(),
+            fs::read(root.join("scheduler.jsonl")).unwrap().is_empty(),
             "the engine owns successful actual-run scheduler lifecycles"
         );
         fs::remove_dir_all(root).ok();
@@ -2598,8 +2880,11 @@ mod tests {
             Some(&root.join("request_dump")),
             1.0,
         );
+        let journals =
+            ProductJournalSession::prepare(&config, &ferrum_types::EngineConfig::default());
         let request_id = "req-resource-failure-test".to_string();
         write_actual_run_failure_observability(
+            &journals,
             &config,
             &ActualRunFailureObservation {
                 request_id: request_id.clone(),
@@ -2622,6 +2907,7 @@ mod tests {
             },
         )
         .unwrap();
+        journals.flush().unwrap();
         let bundle_dir = root.join("request_dump").join(&request_id);
         let scan: serde_json::Value = serde_json::from_str(
             &fs::read_to_string(bundle_dir.join("bad_output_scan.json")).unwrap(),

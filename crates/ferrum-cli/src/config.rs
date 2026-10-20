@@ -10,6 +10,9 @@ use std::collections::HashMap;
 use std::path::Path;
 use tokio::fs;
 
+#[cfg(test)]
+mod journal_tests;
+
 /// CLI configuration
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(default)]
@@ -20,6 +23,17 @@ pub struct CliConfig {
 
     /// Shared run/serve scheduler policy; explicit CLI selection takes precedence.
     pub scheduler: SchedulerCliConfig,
+
+    /// Output sessions and byte budgets shared by run and serve. Retained
+    /// interactive assistant history keeps its original output session: a
+    /// small max_sessions can reject another turn until history is cleared.
+    pub output: ferrum_types::OutputConfig,
+
+    /// Bound the tokenizer decode cache for both run and serve; either zero disables it.
+    pub tokenizer_decode_cache: ferrum_types::TokenizerDecodeCacheConfig,
+
+    /// Per-writer observability limits used by run, serve, and their artifacts.
+    pub profile_journal: ferrum_types::ObservabilityJournalConfig,
 
     /// Server configuration
     pub server: ServerCliConfig,
@@ -227,11 +241,6 @@ pub struct RuntimeCliConfig {
     #[serde(default)]
     pub paged_max_seqs: Option<usize>,
 
-    /// Generic recurrent-state slot-pool size, equivalent to
-    /// `FERRUM_RECURRENT_STATE_MAX_SLOTS`.
-    #[serde(default)]
-    pub recurrent_state_max_slots: Option<usize>,
-
     /// Attention provider-family policy for the plan runtime. Physical
     /// V1/V2/varlen selection remains adaptive inside the compiled provider.
     #[serde(default)]
@@ -356,55 +365,10 @@ pub struct RuntimeCliConfig {
     #[serde(default)]
     pub unified_graph_lm_head_eager: Option<bool>,
 
-    /// Emit engine batch iteration profile logs, equivalent to
-    /// `FERRUM_BATCH_DECODE_PROF`.
+    /// Emit instance Engine iteration and first-text events to a configured
+    /// typed journal, equivalent to `FERRUM_BATCH_DECODE_PROF`.
     #[serde(default)]
     pub batch_decode_prof: Option<bool>,
-
-    /// Emit executor batch prefill profile logs, equivalent to
-    /// `FERRUM_BATCH_PREFILL_PROF`.
-    #[serde(default)]
-    pub batch_prefill_prof: Option<bool>,
-
-    /// Emit engine next-batch scheduler profile logs, equivalent to
-    /// `FERRUM_NEXT_BATCH_PROF`.
-    #[serde(default)]
-    pub next_batch_prof: Option<bool>,
-
-    /// Emit route/batched-decode profile logs, equivalent to
-    /// `FERRUM_RBD_PROF`.
-    #[serde(default)]
-    pub rbd_prof: Option<bool>,
-
-    /// Emit unified decode postprocess profile logs, equivalent to
-    /// `FERRUM_UNIFIED_POST_PROF`.
-    #[serde(default)]
-    pub unified_post_prof: Option<bool>,
-
-    /// Emit model decode operator profile logs, equivalent to
-    /// `FERRUM_DECODE_OP_PROFILE`.
-    #[serde(default)]
-    pub decode_op_profile: Option<bool>,
-
-    /// Emit model prefill operator profile logs, equivalent to
-    /// `FERRUM_PREFILL_OP_PROFILE`.
-    #[serde(default)]
-    pub prefill_op_profile: Option<bool>,
-
-    /// Emit dense Marlin inner-kernel timing counters, equivalent to
-    /// `FERRUM_MARLIN_PROFILE`.
-    #[serde(default)]
-    pub marlin_profile: Option<bool>,
-
-    /// Emit dense Marlin shape/label trace lines, equivalent to
-    /// `FERRUM_MARLIN_TRACE_SHAPES`.
-    #[serde(default)]
-    pub marlin_trace_shapes: Option<bool>,
-
-    /// Maximum dense Marlin shape/label trace lines, equivalent to
-    /// `FERRUM_MARLIN_TRACE_SHAPES_MAX`.
-    #[serde(default)]
-    pub marlin_trace_shapes_max: Option<usize>,
 
     /// vLLM paged attention policy, equivalent to
     /// `FERRUM_USE_VLLM_PAGED_ATTN`.
@@ -492,11 +456,6 @@ impl RuntimeCliConfig {
         push_usize_entry(&mut entries, "FERRUM_KV_MAX_BLOCKS", self.kv_max_blocks);
         push_usize_entry(&mut entries, "FERRUM_KV_CAPACITY", self.kv_capacity);
         push_usize_entry(&mut entries, "FERRUM_PAGED_MAX_SEQS", self.paged_max_seqs);
-        push_usize_entry(
-            &mut entries,
-            "FERRUM_RECURRENT_STATE_MAX_SLOTS",
-            self.recurrent_state_max_slots,
-        );
         push_string_entry(
             &mut entries,
             "FERRUM_ATTENTION_POLICY",
@@ -645,39 +604,6 @@ impl RuntimeCliConfig {
             "FERRUM_BATCH_DECODE_PROF",
             self.batch_decode_prof,
         );
-        push_true_entry(
-            &mut entries,
-            "FERRUM_BATCH_PREFILL_PROF",
-            self.batch_prefill_prof,
-        );
-        push_true_entry(&mut entries, "FERRUM_NEXT_BATCH_PROF", self.next_batch_prof);
-        push_true_entry(&mut entries, "FERRUM_RBD_PROF", self.rbd_prof);
-        push_true_entry(
-            &mut entries,
-            "FERRUM_UNIFIED_POST_PROF",
-            self.unified_post_prof,
-        );
-        push_true_entry(
-            &mut entries,
-            "FERRUM_DECODE_OP_PROFILE",
-            self.decode_op_profile,
-        );
-        push_true_entry(
-            &mut entries,
-            "FERRUM_PREFILL_OP_PROFILE",
-            self.prefill_op_profile,
-        );
-        push_true_entry(&mut entries, "FERRUM_MARLIN_PROFILE", self.marlin_profile);
-        push_true_entry(
-            &mut entries,
-            "FERRUM_MARLIN_TRACE_SHAPES",
-            self.marlin_trace_shapes,
-        );
-        push_usize_entry(
-            &mut entries,
-            "FERRUM_MARLIN_TRACE_SHAPES_MAX",
-            self.marlin_trace_shapes_max,
-        );
         push_bool_entry(
             &mut entries,
             "FERRUM_USE_VLLM_PAGED_ATTN",
@@ -797,6 +723,26 @@ fn push_true_entry(entries: &mut Vec<RuntimeConfigEntry>, key: &str, value: Opti
 }
 
 impl CliConfig {
+    pub fn apply_profile_journal_config(
+        &self,
+        engine: &mut ferrum_types::EngineConfig,
+    ) -> Result<()> {
+        self.profile_journal.validate()?;
+        engine.runtime.profile_journal = self.profile_journal;
+        Ok(())
+    }
+
+    pub fn apply_output_and_tokenizer_config(
+        &self,
+        engine: &mut ferrum_types::EngineConfig,
+    ) -> Result<()> {
+        self.output.validate()?;
+        self.tokenizer_decode_cache.validate()?;
+        engine.output = self.output.clone();
+        engine.model.tokenizer.decode_cache = self.tokenizer_decode_cache.clone();
+        Ok(())
+    }
+
     pub fn resolve_scheduler_slo(
         &self,
         cli: Option<ferrum_types::SchedulerSloConfig>,
@@ -828,9 +774,13 @@ impl CliConfig {
             ferrum_types::FerrumError::io_str(format!("Failed to read config file: {}", e))
         })?;
 
-        toml::from_str(&content).map_err(|e| {
+        let config: Self = toml::from_str(&content).map_err(|e| {
             ferrum_types::FerrumError::configuration(format!("Failed to parse config: {}", e))
-        })
+        })?;
+        config.output.validate()?;
+        config.tokenizer_decode_cache.validate()?;
+        config.profile_journal.validate()?;
+        Ok(config)
     }
 
     /// Save configuration to file
@@ -847,6 +797,9 @@ impl CliConfig {
     /// Validate configuration
     pub fn validate(&self) -> Result<()> {
         self.resolve_scheduler_slo(None)?;
+        self.profile_journal.validate()?;
+        self.output.validate()?;
+        self.tokenizer_decode_cache.validate()?;
         // Validate server config
         if self.server.port == 0 {
             return Err(ferrum_types::FerrumError::configuration(
@@ -995,6 +948,82 @@ mod tests {
     use super::*;
     use clap::{Parser, Subcommand};
 
+    #[tokio::test]
+    async fn output_and_tokenizer_cache_config_reaches_shared_engine_settings() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("ferrum.toml");
+        fs::write(&path, "[output]\nsemantic_bytes_total = 4096\nsemantic_bytes_per_session = 1024\n[tokenizer_decode_cache]\nmax_entries = 7\nmax_bytes = 8192\n").await.unwrap();
+        let config = CliConfig::load(&path).await.unwrap();
+        let mut engine = ferrum_types::EngineConfig::default();
+        config
+            .apply_output_and_tokenizer_config(&mut engine)
+            .unwrap();
+        assert_eq!(engine.output, config.output);
+        assert_eq!(
+            engine.model.tokenizer.decode_cache,
+            config.tokenizer_decode_cache
+        );
+        assert_eq!(engine.model.tokenizer.decode_cache.max_entries, 7);
+        assert_eq!(engine.model.tokenizer.decode_cache.max_bytes, 8192);
+        config.save(&path).await.unwrap();
+        let saved = CliConfig::load(&path).await.unwrap();
+        assert_eq!(saved.output, config.output);
+        assert_eq!(saved.tokenizer_decode_cache, config.tokenizer_decode_cache);
+        fs::write(
+            &path,
+            "[tokenizer_decode_cache]\nmax_entries = 0\nmax_bytes = 8192\n",
+        )
+        .await
+        .unwrap();
+        let disabled = CliConfig::load(&path).await.unwrap();
+        disabled
+            .apply_output_and_tokenizer_config(&mut engine)
+            .unwrap();
+        assert_eq!(engine.model.tokenizer.decode_cache.max_entries, 0);
+        fs::write(
+            &path,
+            "[output]\nsemantic_bytes_total = 10\nsemantic_bytes_per_session = 11\n",
+        )
+        .await
+        .unwrap();
+        assert!(CliConfig::load(&path).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn output_config_load_preserves_explicit_limits_and_defaults() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("ferrum.toml");
+        let missing = CliConfig::load(&path).await.unwrap();
+        assert_eq!(missing.output, ferrum_types::OutputConfig::default());
+        fs::write(
+            &path,
+            "[output]\nmax_sessions = 3\nengine_queue_items = 2\nqueued_bytes_total = 4096\nencoded_bytes_total = 8192\nmax_event_bytes = 2048\n",
+        )
+        .await
+        .unwrap();
+        let configured = CliConfig::load(&path).await.unwrap();
+        assert_eq!(configured.output.max_sessions, 3);
+        assert_eq!(configured.output.engine_queue_items, 2);
+        assert_eq!(configured.output.queued_bytes_total, 4096);
+        assert_eq!(configured.output.encoded_bytes_total, 8192);
+        assert_eq!(configured.output.max_event_bytes, 2048);
+        configured.save(&path).await.unwrap();
+        assert_eq!(
+            CliConfig::load(&path).await.unwrap().output,
+            configured.output
+        );
+
+        fs::write(&path, "[output]\nmax_sessions = 0\n")
+            .await
+            .unwrap();
+        assert!(CliConfig::load(&path)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("output.max_sessions"));
+        assert!(toml::from_str::<CliConfig>("[output]\nunlimited = true\n").is_err());
+    }
+
     #[test]
     fn scheduler_config_rejects_removed_and_unknown_fields_but_keeps_slo() {
         for (key, value) in [
@@ -1038,6 +1067,63 @@ mod tests {
                 .expect_err("removed execution options must not become ordinary decoding");
             assert!(error.to_string().contains("unknown field"), "{error}");
             assert!(error.to_string().contains(key), "{error}");
+        }
+    }
+
+    #[test]
+    fn runtime_config_rejects_retired_recurrent_state_slots() {
+        for value in [0, 16] {
+            let error = toml::from_str::<CliConfig>(&format!(
+                "[runtime]\nrecurrent_state_max_slots = {value}\n"
+            ))
+            .unwrap_err();
+            assert!(error.to_string().contains("unknown field"), "{error}");
+            assert!(
+                error.to_string().contains("recurrent_state_max_slots"),
+                "{error}"
+            );
+        }
+        let config: CliConfig = toml::from_str(
+            "[runtime]\nkv_max_blocks = 123\nkv_capacity = 4096\npaged_max_seqs = 8\n",
+        )
+        .unwrap();
+        assert_eq!(config.runtime.kv_max_blocks, Some(123));
+        assert_eq!(config.runtime.kv_capacity, Some(4096));
+        assert_eq!(config.runtime.paged_max_seqs, Some(8));
+    }
+
+    #[test]
+    fn runtime_config_rejects_retired_global_profiler_fields() {
+        for key in [
+            "decode_op_profile",
+            "prefill_op_profile",
+            "marlin_profile",
+            "marlin_trace_shapes",
+            "marlin_trace_shapes_max",
+            "batch_prefill_prof",
+            "next_batch_prof",
+            "rbd_prof",
+            "unified_post_prof",
+            "scheduler_none_prof",
+        ] {
+            for value in if key.ends_with("_max") {
+                ["0", "17"]
+            } else {
+                ["false", "true"]
+            } {
+                let error = toml::from_str::<CliConfig>(&format!("[runtime]\n{key} = {value}\n"))
+                    .unwrap_err();
+                assert!(error.to_string().contains("unknown field"), "{error}");
+                assert!(error.to_string().contains(key), "{error}");
+            }
+        }
+        for enabled in [false, true] {
+            let error = toml::from_str::<CliConfig>(&format!(
+                "[scheduler]\nscheduler_none_prof = {enabled}\n"
+            ))
+            .unwrap_err();
+            assert!(error.to_string().contains("unknown field"), "{error}");
+            assert!(error.to_string().contains("scheduler_none_prof"), "{error}");
         }
     }
 
@@ -1436,7 +1522,6 @@ mod tests {
             kv_max_blocks: Some(4096),
             kv_capacity: Some(2048),
             paged_max_seqs: Some(64),
-            recurrent_state_max_slots: Some(16),
             attention_policy: Some(AttentionExecutionPolicy::NativeAdaptive),
             max_batched_tokens: Some(2048),
             prefill_decode_execution: Some(ferrum_types::PrefillDecodeExecution::Mixed),
@@ -1457,15 +1542,6 @@ mod tests {
             unified_graph_layers_only: Some(true),
             unified_graph_lm_head_eager: Some(true),
             batch_decode_prof: Some(true),
-            batch_prefill_prof: Some(true),
-            next_batch_prof: Some(true),
-            rbd_prof: Some(true),
-            unified_post_prof: Some(true),
-            decode_op_profile: Some(true),
-            prefill_op_profile: Some(true),
-            marlin_profile: Some(true),
-            marlin_trace_shapes: Some(true),
-            marlin_trace_shapes_max: Some(17),
             use_vllm_paged_attn: Some(true),
             vllm_paged_attn_v1_short: Some(false),
             vllm_moe: Some(true),
@@ -1526,13 +1602,6 @@ mod tests {
         assert_eq!(entry("FERRUM_KV_MAX_BLOCKS").effective_value, "4096");
         assert_eq!(entry("FERRUM_KV_CAPACITY").effective_value, "2048");
         assert_eq!(entry("FERRUM_PAGED_MAX_SEQS").effective_value, "64");
-        assert_eq!(
-            entry("FERRUM_RECURRENT_STATE_MAX_SLOTS").effective_value,
-            "16"
-        );
-        assert!(entry("FERRUM_RECURRENT_STATE_MAX_SLOTS")
-            .affects
-            .contains(&RuntimeConfigEffect::Memory));
         assert_eq!(
             entry("FERRUM_ATTENTION_POLICY").effective_value,
             "native-adaptive"
@@ -1595,21 +1664,6 @@ mod tests {
         assert!(entry("FERRUM_BATCH_DECODE_PROF")
             .affects
             .contains(&RuntimeConfigEffect::Diagnostics));
-        assert_eq!(entry("FERRUM_BATCH_PREFILL_PROF").effective_value, "1");
-        assert_eq!(entry("FERRUM_NEXT_BATCH_PROF").effective_value, "1");
-        assert_eq!(entry("FERRUM_RBD_PROF").effective_value, "1");
-        assert_eq!(entry("FERRUM_UNIFIED_POST_PROF").effective_value, "1");
-        assert_eq!(entry("FERRUM_DECODE_OP_PROFILE").effective_value, "1");
-        assert_eq!(entry("FERRUM_PREFILL_OP_PROFILE").effective_value, "1");
-        assert_eq!(entry("FERRUM_MARLIN_PROFILE").effective_value, "1");
-        assert!(entry("FERRUM_MARLIN_PROFILE")
-            .affects
-            .contains(&RuntimeConfigEffect::Diagnostics));
-        assert_eq!(entry("FERRUM_MARLIN_TRACE_SHAPES").effective_value, "1");
-        assert_eq!(
-            entry("FERRUM_MARLIN_TRACE_SHAPES_MAX").effective_value,
-            "17"
-        );
         assert_eq!(entry("FERRUM_USE_VLLM_PAGED_ATTN").effective_value, "1");
         assert_eq!(
             entry("FERRUM_VLLM_PAGED_ATTN_V1_SHORT").effective_value,
@@ -1652,14 +1706,6 @@ mod tests {
     fn runtime_cli_config_diagnostic_presence_flags_are_opt_in() {
         let entries = RuntimeCliConfig {
             batch_decode_prof: Some(false),
-            batch_prefill_prof: Some(false),
-            next_batch_prof: Some(false),
-            rbd_prof: Some(false),
-            unified_post_prof: Some(false),
-            decode_op_profile: Some(false),
-            prefill_op_profile: Some(false),
-            marlin_profile: Some(false),
-            marlin_trace_shapes: Some(false),
             ..Default::default()
         }
         .runtime_config_entries();
@@ -1668,6 +1714,27 @@ mod tests {
             entries.is_empty(),
             "false diagnostic presence flags must not materialize as FERRUM_*_PROF=0"
         );
+    }
+
+    #[test]
+    fn runtime_cli_config_batch_decode_profile_remains_instance_configuration() {
+        for enabled in [false, true] {
+            let config: CliConfig =
+                toml::from_str(&format!("[runtime]\nbatch_decode_prof = {enabled}\n")).unwrap();
+            let snapshot = ferrum_types::RuntimeConfigSnapshot::from_entries(
+                config.runtime.runtime_config_entries(),
+            );
+            snapshot.validate_retired_options().unwrap();
+            let mut engine = ferrum_types::EngineConfig::default();
+            engine.apply_runtime_config_snapshot(&snapshot).unwrap();
+            assert_eq!(engine.runtime.batch_decode_prof, enabled);
+            assert_eq!(
+                engine.runtime.profile_detail,
+                ferrum_types::ObservabilityProfileDetail::Off
+            );
+            assert!(!engine.runtime.profile_detail.captures_execution_facts());
+            assert!(!engine.runtime.profile_detail.captures_engine_token_timing());
+        }
     }
 
     #[test]

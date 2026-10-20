@@ -119,6 +119,10 @@ pub struct NativeOperatorTranslationUnitDependencyLock {
 pub enum NativeOperatorCudaArchitecture {
     DeviceComputeCapability,
     Compute80Ptx,
+    /// Preserve the original PTX target except for the explicitly selected
+    /// SM120 native compilation path. This is not a minimum-architecture rule:
+    /// an unqualified future target retains the original compute_80 policy.
+    Compute80PtxWithSm120Native,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -5727,6 +5731,13 @@ fn architecture_argument(
             format!("-arch={compute_capability}")
         }
         NativeOperatorCudaArchitecture::Compute80Ptx => "-arch=compute_80".to_string(),
+        NativeOperatorCudaArchitecture::Compute80PtxWithSm120Native => {
+            if compute_capability == "sm_120" {
+                "-arch=sm_120".to_string()
+            } else {
+                "-arch=compute_80".to_string()
+            }
+        }
     }
 }
 
@@ -6248,6 +6259,160 @@ mod tests {
             .iter()
             .all(|path| fs::metadata(path).is_ok_and(|metadata| metadata.len() > 0))
         }));
+    }
+
+    #[test]
+    fn locked_architecture_policy_selects_native_only_for_sm120() {
+        let root = tempfile::tempdir().unwrap();
+        let (source_root, definition_path) = write_fixture(root.path());
+        let checked_in: NativeOperatorSourceDefinition = read_json(
+            &Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../native-operators/cuda/source-definitions/marlin.json"),
+        )
+        .unwrap();
+        assert_eq!(
+            checked_in.architecture,
+            NativeOperatorCudaArchitecture::Compute80PtxWithSm120Native,
+        );
+        let checked_in_plan: NativeOperatorSourceBuildPlan = read_json(
+            &Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../native-operators/cuda/source-locks/marlin.plan.json"),
+        )
+        .unwrap();
+        assert_eq!(
+            checked_in_plan.architecture, checked_in.architecture,
+            "regenerate the canonical source lock from the selected definition"
+        );
+        // Existing serialized policies retain their behavior. The new value
+        // is explicit; an older enum parser rejects it rather than ignoring
+        // an optional policy field and silently choosing the old target.
+        let serialized = serde_json::to_string(&checked_in.architecture).unwrap();
+        assert_eq!(serialized, "\"compute80_ptx_with_sm120_native\"");
+        assert_eq!(
+            serde_json::from_str::<NativeOperatorCudaArchitecture>(&serialized).unwrap(),
+            checked_in.architecture,
+        );
+        let mut definition = definition();
+        definition.architecture = checked_in.architecture;
+        write_json(&definition_path, &definition).unwrap();
+        let plan_path = root.path().join("native-sm120.plan.json");
+        let locked =
+            lock_native_operator_source_definition(&definition_path, &source_root, &plan_path)
+                .unwrap();
+        assert_eq!(locked.architecture, checked_in.architecture);
+        for (target, argument) in [
+            ("sm_80", "-arch=compute_80"),
+            ("sm_89", "-arch=compute_80"),
+            ("sm_90", "-arch=compute_80"),
+            ("sm_120", "-arch=sm_120"),
+            ("sm_121", "-arch=compute_80"),
+        ] {
+            let receipt = run_native_operator_source_build(&NativeOperatorSourceBuildRequest {
+                plan_path: plan_path.clone(),
+                source_root: source_root.clone(),
+                output_dir: root.path().join(target),
+                compute_capability: target.to_string(),
+                builder_sha: "7".repeat(40),
+                nvcc_path: PathBuf::from("/missing/nvcc"),
+                cuda_toolkit_root: PathBuf::from("/missing/cuda"),
+                ccbin_path: PathBuf::from("/missing/c++"),
+                ar_path: PathBuf::from("/missing/ar"),
+                nvcc_threads: 4,
+                object_cache_dir: root.path().join("object-cache"),
+                plan_only: true,
+            })
+            .unwrap();
+            assert_eq!(receipt.status, NativeOperatorSourceBuildStatus::Plan);
+            assert_eq!(receipt.compute_capability, target);
+            assert_eq!(receipt.architecture_argument, argument);
+            assert_eq!(
+                receipt
+                    .commands
+                    .iter()
+                    .filter(|command| command.translation_unit.is_some())
+                    .count(),
+                locked.translation_units.len()
+            );
+            assert!(receipt
+                .commands
+                .iter()
+                .filter(|command| command.translation_unit.is_some())
+                .all(|command| command.argv.iter().any(|value| value == argument)));
+        }
+        assert_eq!(
+            architecture_argument(NativeOperatorCudaArchitecture::Compute80Ptx, "sm_120"),
+            "-arch=compute_80"
+        );
+        assert_eq!(
+            architecture_argument(
+                NativeOperatorCudaArchitecture::DeviceComputeCapability,
+                "sm_89"
+            ),
+            "-arch=sm_89"
+        );
+    }
+
+    #[test]
+    fn sm120_policy_preserves_sm89_cache_and_rejects_forged_architecture_receipt() {
+        let root = tempfile::tempdir().unwrap();
+        let (source_root, definition_path) = write_fixture(root.path());
+        let old_plan = root.path().join("original.plan.json");
+        lock_native_operator_source_definition(&definition_path, &source_root, &old_plan).unwrap();
+        let mut definition = definition();
+        definition.architecture = NativeOperatorCudaArchitecture::Compute80PtxWithSm120Native;
+        write_json(&definition_path, &definition).unwrap();
+        let new_plan = root.path().join("native-sm120.plan.json");
+        lock_native_operator_source_definition(&definition_path, &source_root, &new_plan).unwrap();
+        let fake_cuda = write_fake_nvcc(root.path());
+        let build = |plan: &Path, target: &str, output: &str| {
+            run_native_operator_source_build(&NativeOperatorSourceBuildRequest {
+                plan_path: plan.to_path_buf(),
+                source_root: source_root.clone(),
+                output_dir: root.path().join(output),
+                compute_capability: target.to_string(),
+                builder_sha: "7".repeat(40),
+                nvcc_path: fake_cuda.nvcc.clone(),
+                cuda_toolkit_root: fake_cuda.root.clone(),
+                ccbin_path: fake_cuda.ccbin.clone(),
+                ar_path: PathBuf::from("/usr/bin/ar"),
+                nvcc_threads: 2,
+                object_cache_dir: root.path().join("object-cache"),
+                plan_only: false,
+            })
+            .unwrap()
+        };
+        // The existing compiler fixture produces actual host object/archive
+        // evidence. It tests the builder/cache contract, not CUDA arithmetic.
+        let original = build(&old_plan, "sm_89", "original-sm89");
+        let preserved = build(&new_plan, "sm_89", "preserved-sm89");
+        let native = build(&new_plan, "sm_120", "native-sm120");
+        assert_ne!(original.plan_sha256, preserved.plan_sha256);
+        assert_eq!(
+            original.architecture_argument,
+            preserved.architecture_argument
+        );
+        assert_eq!(
+            original.commands[0].object_cache_key,
+            preserved.commands[0].object_cache_key
+        );
+        assert!(preserved.compiled_translation_units.is_empty());
+        assert_eq!(preserved.cache_hit_translation_units, ["kernels/marlin.cu"]);
+        assert_eq!(native.architecture_argument, "-arch=sm_120");
+        assert_ne!(
+            native.commands[0].object_cache_key,
+            preserved.commands[0].object_cache_key
+        );
+        assert_eq!(native.compiled_translation_units, ["kernels/marlin.cu"]);
+        verify_source_build_receipt_against_plan_portable(&preserved, &new_plan).unwrap();
+        verify_source_build_receipt_against_plan_portable(&native, &new_plan).unwrap();
+        let mut forged = native;
+        forged.architecture_argument = "-arch=compute_80".to_string();
+        assert!(
+            verify_source_build_receipt_against_plan_portable(&forged, &new_plan)
+                .unwrap_err()
+                .to_string()
+                .contains("architecture argument differs from its plan")
+        );
     }
 
     #[test]
@@ -7022,7 +7187,7 @@ mod tests {
         let package_spec = crate::NativeOperatorPackageSpec {
             schema_version: crate::NATIVE_OPERATOR_PACKAGE_SPEC_SCHEMA_VERSION,
             operator: CudaNativeBuildUnit::Marlin.artifact_operator().to_string(),
-            operator_abi_version: "1".to_string(),
+            operator_abi_version: "2".to_string(),
             backend: ferrum_types::NativeOperatorBackend::Cuda,
             compute_capabilities: vec!["sm_89".to_string()],
             operation_bindings: vec![ferrum_types::NativeOperatorBinding {

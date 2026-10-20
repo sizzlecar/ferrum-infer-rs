@@ -1,7 +1,11 @@
 use super::*;
 
+#[path = "sequence_semantic.rs"]
+mod semantic;
+
 #[derive(Debug)]
 struct SequenceTokenTiming {
+    request_start_boundary: RequestIngressBoundary,
     wall_anchor_unix_nanos: i64,
     wall_anchor_max_error_nanos: u64,
     decode_ready_nanos_since_request_start: Option<u64>,
@@ -11,25 +15,23 @@ struct SequenceTokenTiming {
 }
 
 impl SequenceTokenTiming {
-    fn capture_anchor() -> Result<(Instant, Self)> {
-        let wall_before = system_time_unix_nanos(SystemTime::now())?;
-        let request_start = Instant::now();
-        let wall_after = system_time_unix_nanos(SystemTime::now())?;
-        let lower = wall_before.min(wall_after);
-        let upper = wall_before.max(wall_after);
-        let span = upper.saturating_sub(lower);
-        let midpoint = lower.saturating_add(span / 2);
-        Ok((
-            request_start,
-            Self {
-                wall_anchor_unix_nanos: midpoint,
-                wall_anchor_max_error_nanos: u64::try_from(span).unwrap_or(u64::MAX),
-                decode_ready_nanos_since_request_start: None,
-                token_commit_nanos_since_request_start: Vec::new(),
-                decode_stage_intervals: Vec::new(),
-                pending_decode_scheduling_started_at: None,
-            },
-        ))
+    fn from_ingress(anchor: RequestIngressAnchor) -> Result<Self> {
+        // Wall correlation can fail independently; ordinary requests retain
+        // their monotonic anchor without evaluating this opt-in conversion.
+        let wall = anchor.wall_correlation().map_err(|error| {
+            FerrumError::internal(format!(
+                "request ingress wall correlation unavailable: {error}"
+            ))
+        })?;
+        Ok(Self {
+            request_start_boundary: anchor.boundary(),
+            wall_anchor_unix_nanos: wall.unix_nanos,
+            wall_anchor_max_error_nanos: wall.max_error_nanos,
+            decode_ready_nanos_since_request_start: None,
+            token_commit_nanos_since_request_start: Vec::new(),
+            decode_stage_intervals: Vec::new(),
+            pending_decode_scheduling_started_at: None,
+        })
     }
 
     fn nanos_since_request_start(request_start: Instant, at: Instant) -> Option<u64> {
@@ -106,6 +108,7 @@ impl SequenceTokenTiming {
     fn into_evidence(self, output_tokens: usize) -> Result<EngineTokenTimingEvidence> {
         let evidence = EngineTokenTimingEvidence {
             clock_source: "rust_std_instant".to_string(),
+            request_start_boundary: Some(self.request_start_boundary),
             wall_anchor_unix_nanos: self.wall_anchor_unix_nanos,
             wall_anchor_max_error_nanos: self.wall_anchor_max_error_nanos,
             decode_ready_nanos_since_request_start: self.decode_ready_nanos_since_request_start,
@@ -117,14 +120,6 @@ impl SequenceTokenTiming {
         })?;
         Ok(evidence)
     }
-}
-
-fn system_time_unix_nanos(time: SystemTime) -> Result<i64> {
-    let duration = time.duration_since(UNIX_EPOCH).map_err(|error| {
-        FerrumError::internal(format!("system clock predates Unix epoch: {error}"))
-    })?;
-    i64::try_from(duration.as_nanos())
-        .map_err(|_| FerrumError::internal("system clock Unix nanos exceed i64"))
 }
 
 /// Selects which generated-token domain is visible to logits processors.
@@ -155,6 +150,7 @@ impl SequenceSamplingHistory {
         &mut self,
         start_token_index: usize,
         generated_tokens: &[TokenId],
+        credit: &mut OutputSemanticLease,
     ) -> Result<bool> {
         if start_token_index > generated_tokens.len() {
             return Err(FerrumError::internal(format!(
@@ -167,31 +163,64 @@ impl SequenceSamplingHistory {
             return Ok(false);
         }
         self.scope = scope;
-        self.rebuild_from(start_token_index, generated_tokens);
+        self.rebuild_from(start_token_index, generated_tokens, credit)?;
         Ok(true)
     }
 
-    pub(super) fn enter_hidden_structured_output(&mut self) -> bool {
+    pub(super) fn enter_hidden_structured_output(
+        &mut self,
+        credit: &mut OutputSemanticLease,
+    ) -> Result<bool> {
         if self.scope == SequenceSamplingHistoryScope::HiddenStructuredOutput {
-            return false;
+            return Ok(false);
         }
         self.scope = SequenceSamplingHistoryScope::HiddenStructuredOutput;
-        self.token_frequencies.clear();
-        true
+        self.clear(credit)?;
+        Ok(true)
     }
 
-    fn rebuild_from(&mut self, start_token_index: usize, generated_tokens: &[TokenId]) {
+    const ENTRY_BYTES: usize = std::mem::size_of::<TokenId>() + std::mem::size_of::<usize>();
+
+    fn clear(&mut self, credit: &mut OutputSemanticLease) -> Result<()> {
+        let bytes = self
+            .token_frequencies
+            .len()
+            .checked_mul(Self::ENTRY_BYTES)
+            .ok_or_else(|| FerrumError::internal("sampling history accounting overflow"))?;
+        let remaining = credit
+            .bytes()
+            .checked_sub(bytes)
+            .ok_or_else(|| FerrumError::internal("sampling history lost its content credit"))?;
         self.token_frequencies.clear();
-        for &token in &generated_tokens[start_token_index..] {
-            *self.token_frequencies.entry(token).or_insert(0) += 1;
+        credit.shrink_to(remaining)
+    }
+
+    fn rebuild_from(
+        &mut self,
+        start: usize,
+        generated: &[TokenId],
+        credit: &mut OutputSemanticLease,
+    ) -> Result<()> {
+        self.clear(credit)?;
+        for &token in &generated[start..] {
+            self.record(token, credit)?;
         }
+        Ok(())
     }
 
-    pub(super) fn record(&mut self, token: TokenId) {
+    pub(super) fn record(
+        &mut self,
+        token: TokenId,
+        credit: &mut OutputSemanticLease,
+    ) -> Result<()> {
         if self.scope == SequenceSamplingHistoryScope::HiddenStructuredOutput {
-            return;
+            return Ok(());
+        }
+        if !self.token_frequencies.contains_key(&token) {
+            credit.try_grow(Self::ENTRY_BYTES)?;
         }
         *self.token_frequencies.entry(token).or_insert(0) += 1;
+        Ok(())
     }
 
     pub(super) fn previous_tokens<'a>(
@@ -242,8 +271,24 @@ pub struct SequenceState {
     pub original_request: InferenceRequest,
     pub input_tokens: Vec<TokenId>,
     pub generated_tokens: Vec<TokenId>,
-    pub(super) model_kv: Option<SequenceModelKvState>,
-    pub(super) recurrent_state: Option<SequenceRecurrentState>,
+    // One credit owner for this request's retained generated payload. All
+    // mutable token/grammar/sampling state remains in this original state.
+    pub(super) output_semantic: OutputSemanticLease,
+    output_accounting_error: Option<FerrumError>,
+    /// The executor's sole live incarnation and committed token position.
+    /// This is an execution observation, not a second physical KV allocation.
+    /// Exact existing scheduler queue identity while preparation is in flight.
+    pub(super) pending_token_admission:
+        Option<ferrum_scheduler::implementations::continuous::PrefixRequestKey>,
+    pub(super) execution_frontier: Option<ferrum_execution::token_execution::ExecutionFrontier>,
+    /// Optional observation of an acknowledged prefix, tied to the original
+    /// incarnation. This identity is never exported to an attempt observer.
+    pub(super) confirmed_prefix_restore:
+        Option<(ferrum_execution::token_execution::ExecutorSequence, usize)>,
+    /// Preserve an interrupted participant's actual close observation until
+    /// terminal processing transfers it into the independent close registry.
+    pub(super) execution_close:
+        Option<Box<Mutex<ferrum_execution::token_execution::ExecutionCloseOutcome>>>,
     pub(super) sampling_params: SamplingParams,
     /// Immutable logits-processing and sampler plan prepared once per request.
     pub(super) sampling_plan: TokenSamplingPlan,
@@ -253,8 +298,8 @@ pub struct SequenceState {
     /// Number of prompt tokens already written into the model KV cache by
     /// opt-in unified chunked prefill. Zero for the normal full-prefill path.
     pub prefill_tokens_processed: usize,
-    pub stream_sender: Option<mpsc::Sender<Result<StreamChunk>>>,
-    pub response_sender: Option<tokio::sync::oneshot::Sender<Result<InferenceResponse>>>,
+    pub(super) stream_sender: Option<OutputSender>,
+    pub response_sender: Option<tokio::sync::oneshot::Sender<Result<InferenceOutput>>>,
     pub(super) request_slot: Option<RequestSlotLease>,
     pub start_time: Instant,
     /// Present only for callers that explicitly request the latency preset.
@@ -335,275 +380,15 @@ pub struct SequenceState {
     pub decoded_text_len: usize,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct SequenceKvAllocation {
-    pub(super) request_id: RequestId,
-    pub(super) blocks: usize,
-}
-
-impl SequenceKvAllocation {
-    pub(super) fn new(request_id: RequestId, blocks: usize) -> Self {
-        Self {
-            request_id,
-            blocks: blocks.max(1),
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-pub(super) enum SequenceKvRelease {
-    /// The model runtime is the only release authority. This covers vNext
-    /// plan-runtime leases and cloned prefix-cache references; neither has a
-    /// second allocation in the legacy engine KV manager.
-    RuntimeManaged,
-    /// Transitional legacy composition: release the model cache reference and
-    /// the exact engine KV-manager allocation together.
-    LegacyAllocated(SequenceKvAllocation),
-}
-
-#[derive(Debug, Clone)]
-pub(super) struct SequenceModelKvState {
-    pub(super) cache: Arc<dyn KvCacheHandle>,
-    pub(super) model_cache_id: String,
-    pub(super) release: SequenceKvRelease,
-}
-
-impl SequenceModelKvState {
-    pub(super) fn runtime_managed(cache: Arc<dyn KvCacheHandle>) -> Self {
-        let model_cache_id = cache.cache_id();
-        Self {
-            cache,
-            model_cache_id,
-            release: SequenceKvRelease::RuntimeManaged,
-        }
-    }
-
-    pub(super) fn legacy_allocated(
-        cache: Arc<dyn KvCacheHandle>,
-        allocation: SequenceKvAllocation,
-    ) -> Self {
-        let model_cache_id = cache.cache_id();
-        Self {
-            cache,
-            model_cache_id,
-            release: SequenceKvRelease::LegacyAllocated(allocation),
-        }
-    }
-
-    pub(super) fn handle(&self) -> Arc<dyn KvCacheHandle> {
-        self.cache.clone()
-    }
-
-    pub(super) fn legacy_allocation(&self) -> Option<&SequenceKvAllocation> {
-        match &self.release {
-            SequenceKvRelease::RuntimeManaged => None,
-            SequenceKvRelease::LegacyAllocated(allocation) => Some(allocation),
-        }
-    }
-
-    pub(super) fn model_cache_id(&self) -> &str {
-        &self.model_cache_id
-    }
-
-    pub(super) fn validate_replacement_cache(&self, cache: &Arc<dyn KvCacheHandle>) -> Result<()> {
-        let replacement_cache_id = cache.cache_id();
-        if replacement_cache_id != self.model_cache_id() {
-            return Err(FerrumError::internal(format!(
-                "decode replaced model cache authority {} with {}",
-                self.model_cache_id(),
-                replacement_cache_id
-            )));
-        }
-        Ok(())
-    }
-
-    pub(super) fn replace_cache_handle(&mut self, cache: Arc<dyn KvCacheHandle>) -> Result<()> {
-        self.validate_replacement_cache(&cache)?;
-        self.cache = cache;
-        Ok(())
-    }
-
-    pub(super) fn into_physical_resources(self) -> (Option<SequenceKvAllocation>, String) {
-        let legacy_allocation = match self.release {
-            SequenceKvRelease::RuntimeManaged => None,
-            SequenceKvRelease::LegacyAllocated(allocation) => Some(allocation),
-        };
-        (legacy_allocation, self.model_cache_id)
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct SequenceRecurrentAllocation {
-    pub(super) slots: Option<usize>,
-}
-
-impl SequenceRecurrentAllocation {
-    pub(super) fn new(slots: Option<usize>) -> Self {
-        Self {
-            slots: slots.map(|slots| slots.max(1)),
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-pub(super) struct SequenceRecurrentState {
-    pub(super) handle: Arc<dyn RecurrentStateHandle>,
-    pub(super) slots: Option<usize>,
-}
-
-impl SequenceRecurrentState {
-    pub(super) fn new(handle: Arc<dyn RecurrentStateHandle>, slots: Option<usize>) -> Self {
-        Self {
-            handle,
-            slots: slots.map(|slots| slots.max(1)),
-        }
-    }
-
-    pub(super) fn handle(&self) -> Arc<dyn RecurrentStateHandle> {
-        self.handle.clone()
-    }
-
-    pub(super) fn allocation(self) -> SequenceRecurrentAllocation {
-        SequenceRecurrentAllocation::new(self.slots)
-    }
-}
-
-#[derive(Debug, Default)]
-pub(super) struct SequencePhysicalResources {
-    pub(super) legacy_kv_allocation: Option<SequenceKvAllocation>,
-    pub(super) recurrent_state_allocation: Option<SequenceRecurrentAllocation>,
-    pub(super) model_cache_id: Option<String>,
-}
-
-#[cfg(test)]
-impl SequencePhysicalResources {
-    pub(super) fn model_cache_id(&self) -> Option<&str> {
-        self.model_cache_id.as_deref()
-    }
-}
-
 #[derive(Debug, Default)]
 pub(super) struct SequenceCompletionResources {
-    pub(super) physical: SequencePhysicalResources,
     pub(super) request_slot: Option<RequestSlotLease>,
-}
-
-#[derive(Debug, Default)]
-#[must_use = "unified prefill owned resources must be released or committed"]
-pub(super) struct UnifiedPrefillOwnedResources {
-    pub(super) legacy_kv_allocation: Option<SequenceKvAllocation>,
-    pub(super) recurrent_state_allocation: Option<SequenceRecurrentAllocation>,
-}
-
-impl UnifiedPrefillOwnedResources {
-    pub(super) fn with_fresh_kv(mut self, allocation: SequenceKvAllocation) -> Self {
-        self.legacy_kv_allocation = Some(allocation);
-        self
-    }
-
-    pub(super) fn with_fresh_recurrent_state(mut self, slots: usize) -> Self {
-        self.recurrent_state_allocation = Some(SequenceRecurrentAllocation::new(Some(slots)));
-        self
-    }
-
-    pub(super) fn commit(mut self) {
-        self.legacy_kv_allocation = None;
-        self.recurrent_state_allocation = None;
-    }
-
-    pub(super) fn is_empty(&self) -> bool {
-        self.legacy_kv_allocation.is_none() && self.recurrent_state_allocation.is_none()
-    }
-
-    pub(super) async fn release(mut self, engine: &EngineInner, owner_request_id: &RequestId) {
-        if let Some(kv_allocation) = self.legacy_kv_allocation.take() {
-            engine
-                .release_kv_allocation(
-                    owner_request_id,
-                    kv_allocation.request_id,
-                    kv_allocation.blocks,
-                )
-                .await;
-        }
-        if let Some(recurrent_allocation) = self.recurrent_state_allocation.take() {
-            let sequence_slots = engine
-                .sequences
-                .write()
-                .get_mut(owner_request_id)
-                .and_then(SequenceState::take_recurrent_state_allocation);
-            if sequence_slots != recurrent_allocation.slots {
-                warn!(
-                    request_id = %owner_request_id,
-                    sequence_slots = ?sequence_slots,
-                    owned_slots = ?recurrent_allocation.slots,
-                    "unified prefill recurrent ownership metadata differed from sequence state"
-                );
-            }
-            engine
-                .release_recurrent_allocation(
-                    owner_request_id,
-                    recurrent_allocation.slots.or(sequence_slots),
-                )
-                .await;
-        }
-    }
-}
-
-impl Drop for UnifiedPrefillOwnedResources {
-    fn drop(&mut self) {
-        if self.is_empty() {
-            return;
-        }
-        let message = "unified prefill resources dropped without explicit release or commit";
-        warn!(
-            legacy_kv_allocation = ?self.legacy_kv_allocation,
-            recurrent_state_allocation = ?self.recurrent_state_allocation,
-            "{message}"
-        );
-        #[cfg(test)]
-        if !std::thread::panicking() {
-            panic!("{message}");
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-pub(super) struct SequenceDecodeResources {
-    pub(super) seq_id: String,
-    pub(super) kv_cache: Arc<dyn KvCacheHandle>,
-    pub(super) recurrent_state: Option<Arc<dyn RecurrentStateHandle>>,
-    pub(super) last_token: TokenId,
-    pub(super) pos_offset: usize,
-}
-
-#[derive(Debug, Clone)]
-pub(super) struct SequencePrefillResources {
-    pub(super) kv_cache: Option<Arc<dyn KvCacheHandle>>,
-    pub(super) legacy_kv_allocation: Option<SequenceKvAllocation>,
-    pub(super) recurrent_state: Option<Arc<dyn RecurrentStateHandle>>,
-    pub(super) prefill_tokens_processed: usize,
-}
-
-#[cfg(test)]
-impl SequencePrefillResources {
-    pub(super) fn kv_cache_handle(&self) -> Option<Arc<dyn KvCacheHandle>> {
-        self.kv_cache.clone()
-    }
-
-    pub(super) fn kv_resource_blocks(&self) -> Option<usize> {
-        self.legacy_kv_allocation
-            .as_ref()
-            .map(|allocation| allocation.blocks)
-    }
-}
-
-#[derive(Debug, Default, PartialEq, Eq)]
-pub(super) struct ModelCacheRefUpdate {
-    pub(super) released: Option<String>,
-    pub(super) acquired: Option<String>,
+    pub(super) execution_frontier: Option<ferrum_execution::token_execution::ExecutionFrontier>,
+    pub(super) execution_close: Option<ferrum_execution::token_execution::ExecutionCloseOutcome>,
 }
 
 impl SequenceState {
+    #[cfg(test)]
     pub fn new(request: InferenceRequest, input_tokens: Vec<TokenId>) -> Self {
         Self::new_with_tokenizer(request, input_tokens, None)
     }
@@ -611,6 +396,7 @@ impl SequenceState {
     /// Build sequence state, optionally wiring a tokenizer for constrained
     /// decoding. Test-only direct constructors build a local grammar factory;
     /// product entrypoints use the fallible shared-factory constructor below.
+    #[cfg(test)]
     pub fn new_with_tokenizer(
         request: InferenceRequest,
         input_tokens: Vec<TokenId>,
@@ -619,6 +405,7 @@ impl SequenceState {
         Self::new_with_tokenizer_and_model_vocab_size(request, input_tokens, tokenizer, None)
     }
 
+    #[cfg(test)]
     pub fn new_with_tokenizer_and_model_vocab_size(
         request: InferenceRequest,
         input_tokens: Vec<TokenId>,
@@ -631,17 +418,23 @@ impl SequenceState {
             tokenizer,
             model_vocab_size,
             None,
+            OutputBudget::new(Default::default()).expect("valid fixture budget")
+                .try_open_session().expect("fixture output session"),
         )
         .expect("direct SequenceState construction requires supported sampling and structured-output contracts")
     }
 
     pub fn try_new_with_tokenizer_model_vocab_and_structured_factory(
-        request: InferenceRequest,
+        mut request: InferenceRequest,
         input_tokens: Vec<TokenId>,
         tokenizer: Option<Arc<dyn Tokenizer + Send + Sync>>,
         model_vocab_size: Option<usize>,
         shared_structured_factory: Option<&StructuredOutputFactory>,
+        output_session: OutputSession,
     ) -> Result<Self> {
+        // Direct internal/test construction uses the same local fallback;
+        // published product requests already carry their original API anchor.
+        let ingress = request.ensure_ingress(RequestIngressBoundary::EngineApi);
         request.sampling_params.validate()?;
         if request.sampling_params.tfs.is_some()
             || request.sampling_params.typical_p.is_some()
@@ -786,19 +579,23 @@ impl SequenceState {
                 mask.set_tokens_validity(&model_eos_token_ids, false);
             }
         }
-        let (start_time, token_timing) = if request.evidence_request.capture_engine_token_timing {
-            let (start_time, timing) = SequenceTokenTiming::capture_anchor()?;
-            (start_time, Some(timing))
-        } else {
-            (Instant::now(), None)
-        };
+        let start_time = ingress.instant();
+        let token_timing = request
+            .evidence_request
+            .capture_engine_token_timing
+            .then(|| SequenceTokenTiming::from_ingress(ingress))
+            .transpose()?;
         Ok(Self {
             request_id: request.id.clone(),
             original_request: request.clone(),
             input_tokens,
             generated_tokens: Vec::new(),
-            model_kv: None,
-            recurrent_state: None,
+            output_semantic: output_session.try_reserve_semantic(0)?,
+            output_accounting_error: None,
+            pending_token_admission: None,
+            execution_frontier: None,
+            confirmed_prefix_restore: None,
+            execution_close: None,
             sampling_params: request.sampling_params,
             sampling_plan,
             phase: RequestPhase::Waiting,
@@ -840,28 +637,50 @@ impl SequenceState {
     }
 
     pub(super) fn record_generated_token_commit(&mut self) {
+        if self.token_timing.is_some() && !self.reserve_timing_bytes(8) {
+            return;
+        }
         if let Some(timing) = &mut self.token_timing {
             timing.record_commit(self.start_time, Instant::now());
         }
     }
 
+    #[cfg(test)]
     pub(super) fn closes_pending_decode_scheduling(&self) -> bool {
         self.token_timing
             .as_ref()
             .is_some_and(|timing| timing.pending_decode_scheduling_started_at.is_some())
     }
 
-    pub(super) fn captures_engine_token_timing(&self) -> bool {
-        self.token_timing.is_some()
-    }
-
     pub(super) fn close_decode_scheduling(&mut self, ended_at: Instant) {
+        if self
+            .token_timing
+            .as_ref()
+            .is_some_and(|timing| timing.pending_decode_scheduling_started_at.is_some())
+            && !self.reserve_timing_bytes(64)
+        {
+            return;
+        }
         if let Some(timing) = &mut self.token_timing {
             timing.close_decode_scheduling(self.start_time, ended_at);
         }
     }
 
+    /// A real capacity yield stops decode eligibility until causal prefill
+    /// finishes again. Preserve the original ingress and first-ready evidence.
+    pub(super) fn pause_decode_scheduling(&mut self, at: Instant, capture_stages: bool) {
+        if capture_stages {
+            self.close_decode_scheduling(at);
+        }
+        if let Some(timing) = &mut self.token_timing {
+            timing.pending_decode_scheduling_started_at = None;
+        }
+    }
+
     pub(super) fn record_decode_execution(&mut self, started_at: Instant, ended_at: Instant) {
+        if self.token_timing.is_some() && !self.reserve_timing_bytes(64) {
+            return;
+        }
         if let Some(timing) = &mut self.token_timing {
             timing.record_decode_stage_interval(
                 self.start_time,
@@ -876,6 +695,19 @@ impl SequenceState {
         &mut self,
         postprocess_started_at: Option<Instant>,
     ) {
+        // A stage has two u64 endpoints and a fixed enum name; reserve a
+        // conservative constant, reconciled once when evidence is frozen.
+        if self.token_timing.is_some()
+            && !self.reserve_timing_bytes(
+                8 + if postprocess_started_at.is_some() {
+                    64
+                } else {
+                    0
+                },
+            )
+        {
+            return;
+        }
         let Some(timing) = &mut self.token_timing else {
             return;
         };
@@ -898,10 +730,28 @@ impl SequenceState {
     }
 
     pub(super) fn take_execution_evidence(&mut self) -> Result<Option<InferenceExecutionEvidence>> {
+        if let Some(error) = self.output_accounting_error.as_ref() {
+            return Err(error.clone());
+        }
         let capture_prompt = self
             .original_request
             .evidence_request
             .capture_prompt_token_ids;
+        if capture_prompt || self.token_timing.is_some() {
+            let copied = self
+                .generated_tokens
+                .len()
+                .checked_add(if capture_prompt {
+                    self.input_tokens.len()
+                } else {
+                    0
+                })
+                .and_then(|count| count.checked_mul(4))
+                .ok_or_else(|| {
+                    FerrumError::resource_exhausted("execution evidence size overflow")
+                })?;
+            self.output_semantic.try_grow(copied)?;
+        }
         let timing = self
             .token_timing
             .take()
@@ -968,277 +818,15 @@ impl SequenceState {
         )
     }
 
-    pub(super) fn take_physical_resources(&mut self) -> SequencePhysicalResources {
-        let (legacy_kv_allocation, model_cache_id) = self
-            .model_kv
-            .take()
-            .map(|state| {
-                let (legacy_kv_allocation, model_cache_id) = state.into_physical_resources();
-                (legacy_kv_allocation, Some(model_cache_id))
-            })
-            .unwrap_or((None, None));
-        let resources = SequencePhysicalResources {
-            legacy_kv_allocation,
-            recurrent_state_allocation: self
-                .recurrent_state
-                .take()
-                .map(SequenceRecurrentState::allocation),
-            model_cache_id,
-        };
-        resources
-    }
-
-    pub(super) fn take_physical_resources_for_recompute(&mut self) -> SequencePhysicalResources {
-        let resources = self.take_physical_resources();
-        self.prefill_complete = false;
-        self.prefill_tokens_processed = 0;
-        self.phase = RequestPhase::Waiting;
-        self.tokens_this_iteration = 0;
-        resources
-    }
-
     pub(super) fn take_completion_resources(&mut self) -> SequenceCompletionResources {
         SequenceCompletionResources {
-            physical: self.take_physical_resources(),
             request_slot: self.request_slot.take(),
+            execution_frontier: self.execution_frontier.take(),
+            execution_close: self
+                .execution_close
+                .take()
+                .map(|close| (*close).into_inner()),
         }
-    }
-
-    pub(super) fn model_cache_ref_update_for(&self, cache_id: &str) -> ModelCacheRefUpdate {
-        if self
-            .model_kv
-            .as_ref()
-            .is_some_and(|state| state.model_cache_id() == cache_id)
-        {
-            return ModelCacheRefUpdate::default();
-        }
-        let released = self
-            .model_kv
-            .as_ref()
-            .map(|state| state.model_cache_id().to_string());
-        ModelCacheRefUpdate {
-            released,
-            acquired: Some(cache_id.to_string()),
-        }
-    }
-
-    pub(super) fn install_model_kv_state(
-        &mut self,
-        state: SequenceModelKvState,
-    ) -> ModelCacheRefUpdate {
-        let model_cache_id = state.model_cache_id().to_string();
-        let model_cache_update = self.model_cache_ref_update_for(&model_cache_id);
-        self.model_kv = Some(state);
-        model_cache_update
-    }
-
-    pub(super) fn install_runtime_managed_model_kv(
-        &mut self,
-        kv_cache: Arc<dyn KvCacheHandle>,
-    ) -> ModelCacheRefUpdate {
-        self.install_model_kv_state(SequenceModelKvState::runtime_managed(kv_cache))
-    }
-
-    pub(super) fn install_legacy_allocated_model_kv(
-        &mut self,
-        kv_cache: Arc<dyn KvCacheHandle>,
-        allocation: SequenceKvAllocation,
-    ) -> ModelCacheRefUpdate {
-        self.install_model_kv_state(SequenceModelKvState::legacy_allocated(kv_cache, allocation))
-    }
-
-    pub(super) fn commit_prefill_physical_resources(
-        &mut self,
-        kv_cache: Arc<dyn KvCacheHandle>,
-        kv_resource_blocks: usize,
-        recurrent_state: Option<Arc<dyn RecurrentStateHandle>>,
-        recurrent_state_slots: Option<usize>,
-    ) -> ModelCacheRefUpdate {
-        let allocation = SequenceKvAllocation::new(self.request_id.clone(), kv_resource_blocks);
-        let model_cache_update = self.install_legacy_allocated_model_kv(kv_cache, allocation);
-        self.recurrent_state =
-            recurrent_state.map(|state| SequenceRecurrentState::new(state, recurrent_state_slots));
-        self.prefill_complete = true;
-        self.phase = RequestPhase::Decoding;
-        self.record_decode_ready();
-        model_cache_update
-    }
-
-    pub(super) fn commit_plan_runtime_prefill_chunk_resources(
-        &mut self,
-        kv_cache: Arc<dyn KvCacheHandle>,
-        prefill_tokens_processed: usize,
-        is_final_chunk: bool,
-    ) -> ModelCacheRefUpdate {
-        let model_cache_update = self.install_runtime_managed_model_kv(kv_cache);
-        self.recurrent_state = None;
-        self.prefill_tokens_processed = prefill_tokens_processed;
-        self.prefill_complete = is_final_chunk;
-        self.phase = if is_final_chunk {
-            RequestPhase::Decoding
-        } else {
-            RequestPhase::Prefilling
-        };
-        if is_final_chunk {
-            self.record_decode_ready();
-        }
-        model_cache_update
-    }
-
-    pub(super) fn commit_prefill_chunk_physical_resources(
-        &mut self,
-        kv_cache: Arc<dyn KvCacheHandle>,
-        legacy_kv_allocation: SequenceKvAllocation,
-        recurrent_state: Option<Arc<dyn RecurrentStateHandle>>,
-        prefill_tokens_processed: usize,
-        is_final_chunk: bool,
-    ) -> ModelCacheRefUpdate {
-        let model_cache_update =
-            self.install_legacy_allocated_model_kv(kv_cache, legacy_kv_allocation);
-        let existing_slots = self.recurrent_state.as_ref().and_then(|state| state.slots);
-        self.recurrent_state =
-            recurrent_state.map(|state| SequenceRecurrentState::new(state, existing_slots));
-        self.prefill_tokens_processed = prefill_tokens_processed;
-        self.prefill_complete = is_final_chunk;
-        self.phase = if is_final_chunk {
-            RequestPhase::Decoding
-        } else {
-            RequestPhase::Prefilling
-        };
-        if is_final_chunk {
-            self.record_decode_ready();
-        }
-        model_cache_update
-    }
-
-    pub(super) fn decode_model_cache_id_or_request_id(&self, request_id: &RequestId) -> String {
-        self.model_cache_id()
-            .map(str::to_string)
-            .unwrap_or_else(|| request_id.to_string())
-    }
-
-    pub(super) fn decode_model_kv_len_after_last_generated_token(&self) -> usize {
-        self.input_tokens
-            .len()
-            .saturating_add(self.generated_tokens.len())
-            .saturating_sub(1)
-    }
-
-    pub(super) fn decode_resources(
-        &self,
-        request_id: &RequestId,
-    ) -> Option<SequenceDecodeResources> {
-        Some(SequenceDecodeResources {
-            seq_id: self.decode_model_cache_id_or_request_id(request_id),
-            kv_cache: self.model_kv.as_ref()?.handle(),
-            recurrent_state: self
-                .recurrent_state
-                .as_ref()
-                .map(SequenceRecurrentState::handle),
-            last_token: self
-                .generated_tokens
-                .last()
-                .copied()
-                .unwrap_or(TokenId::new(0)),
-            pos_offset: self.decode_model_kv_len_after_last_generated_token(),
-        })
-    }
-
-    pub(super) fn ready_decode_resources(
-        &self,
-        request_id: &RequestId,
-    ) -> Option<SequenceDecodeResources> {
-        if !self.prefill_complete || self.generated_tokens.is_empty() {
-            return None;
-        }
-        self.decode_resources(request_id)
-    }
-
-    pub(super) fn is_preemptible_decode_candidate(&self) -> bool {
-        self.prefill_complete && self.model_kv.is_some()
-    }
-
-    pub(super) fn prefill_resources(&self) -> SequencePrefillResources {
-        SequencePrefillResources {
-            kv_cache: self.model_kv.as_ref().map(SequenceModelKvState::handle),
-            legacy_kv_allocation: self
-                .model_kv
-                .as_ref()
-                .and_then(SequenceModelKvState::legacy_allocation)
-                .cloned(),
-            recurrent_state: self
-                .recurrent_state
-                .as_ref()
-                .map(SequenceRecurrentState::handle),
-            prefill_tokens_processed: self.prefill_tokens_processed,
-        }
-    }
-
-    pub(super) fn recurrent_state_handle(&self) -> Option<Arc<dyn RecurrentStateHandle>> {
-        self.recurrent_state
-            .as_ref()
-            .map(SequenceRecurrentState::handle)
-    }
-
-    pub(super) fn recurrent_state_slots(&self) -> Option<usize> {
-        self.recurrent_state.as_ref().and_then(|state| state.slots)
-    }
-
-    pub(super) fn kv_cache_handle(&self) -> Option<Arc<dyn KvCacheHandle>> {
-        self.model_kv.as_ref().map(SequenceModelKvState::handle)
-    }
-
-    pub(super) fn kv_resource_blocks(&self) -> Option<usize> {
-        self.model_kv
-            .as_ref()
-            .and_then(SequenceModelKvState::legacy_allocation)
-            .map(|allocation| allocation.blocks)
-    }
-
-    pub(super) fn model_cache_id(&self) -> Option<&str> {
-        self.model_kv
-            .as_ref()
-            .map(SequenceModelKvState::model_cache_id)
-    }
-
-    #[cfg(test)]
-    pub(super) fn clear_model_kv_for_test(&mut self) {
-        self.model_kv = None;
-    }
-
-    pub(super) fn commit_decode_step_physical_resources(
-        &mut self,
-        kv_cache: Arc<dyn KvCacheHandle>,
-    ) -> Result<()> {
-        self.model_kv
-            .as_mut()
-            .ok_or_else(|| {
-                FerrumError::internal("decode completed without an active model KV lease")
-            })?
-            .replace_cache_handle(kv_cache)?;
-        self.tokens_this_iteration += 1;
-        Ok(())
-    }
-
-    pub(super) fn commit_decode_recurrent_state(
-        &mut self,
-        recurrent_state: Option<Arc<dyn RecurrentStateHandle>>,
-    ) {
-        let existing_slots = self.recurrent_state.as_ref().and_then(|state| state.slots);
-        self.recurrent_state =
-            recurrent_state.map(|state| SequenceRecurrentState::new(state, existing_slots));
-    }
-
-    pub(super) fn commit_recurrent_state_admission(
-        &mut self,
-        recurrent_state: Arc<dyn RecurrentStateHandle>,
-        slots: usize,
-    ) {
-        self.recurrent_state = Some(SequenceRecurrentState::new(recurrent_state, Some(slots)));
-    }
-
-    pub(super) fn take_recurrent_state_allocation(&mut self) -> Option<usize> {
-        self.recurrent_state.take().and_then(|state| state.slots)
     }
 
     pub fn model_decode_logits_policy(&self) -> LogitsReturnPolicy {
@@ -1389,9 +977,38 @@ impl SequenceState {
                 token.get()
             )));
         }
+        let growth = 4usize
+            .checked_add(
+                self.structured_output_processor
+                    .as_ref()
+                    .map_or(Ok(0), |processor| {
+                        processor.retained_token_growth_bound(token)
+                    })?,
+            )
+            .ok_or_else(|| FerrumError::resource_exhausted("generated output size overflow"))?;
+        let new_frequency = self.sampling_history.scope
+            != SequenceSamplingHistoryScope::HiddenStructuredOutput
+            && !self.sampling_history.token_frequencies.contains_key(&token);
+        let growth = growth
+            .checked_add(if new_frequency {
+                SequenceSamplingHistory::ENTRY_BYTES
+            } else {
+                0
+            })
+            .ok_or_else(|| FerrumError::resource_exhausted("generated output size overflow"))?;
+        // Acquire the whole growth before any mutable completion/grammar
+        // state changes. A later error retains this credit until that state
+        // really drops; it cannot claim those mutations were rolled back.
+        self.output_semantic.try_grow(growth)?;
         self.accept_response_completion_token(tokenizer, token)?;
+        if self.sampling_history.scope != SequenceSamplingHistoryScope::HiddenStructuredOutput {
+            *self
+                .sampling_history
+                .token_frequencies
+                .entry(token)
+                .or_insert(0) += 1;
+        }
         self.generated_tokens.push(token);
-        self.sampling_history.record(token);
         match next_pending_utf8_bytes {
             Some(Ok(bytes)) => {
                 self.pending_decoded_utf8_fragment = !bytes.is_empty();
@@ -1498,7 +1115,8 @@ impl SequenceState {
             // Replay has not resolved the hidden/visible boundary yet. Keep
             // penalties disabled until the grammar mask reports the exact
             // visible-output start, then rebuild that suffix once.
-            self.sampling_history.enter_hidden_structured_output();
+            self.sampling_history
+                .enter_hidden_structured_output(&mut self.output_semantic)?;
         }
         Ok(())
     }
@@ -1551,6 +1169,23 @@ impl SequenceState {
         None
     }
 
+    /// A declared wire terminator remains part of generated text even when
+    /// completion later reports an error. This does not authorize publication.
+    pub(in crate::continuous_engine) fn is_declared_wire_terminator(
+        &self,
+        tokenizer: Option<&(dyn Tokenizer + Send + Sync)>,
+        token: TokenId,
+    ) -> bool {
+        self.sampling_params.model_output_protocol
+            == ferrum_types::ModelOutputProtocol::HarmonyGptOss
+            && tokenizer.is_some_and(|tokenizer| {
+                ["<|call|>", "<|return|>"]
+                    .into_iter()
+                    .filter_map(|marker| tokenizer.token_id(marker))
+                    .any(|terminal| terminal == token)
+            })
+    }
+
     /// Return whether the just-committed token belongs in the incremental
     /// response stream.
     ///
@@ -1567,14 +1202,10 @@ impl SequenceState {
         match stop_reason {
             Some(FinishReason::Error) => false,
             Some(FinishReason::Stop | FinishReason::EOS) => {
-                self.sampling_params.model_output_protocol
-                    == ferrum_types::ModelOutputProtocol::HarmonyGptOss
-                    && (tokenizer.is_some_and(|tokenizer| {
-                        ["<|call|>", "<|return|>"]
-                            .into_iter()
-                            .filter_map(|marker| tokenizer.token_id(marker))
-                            .any(|terminal| terminal == token)
-                    }) || (stop_reason == Some(FinishReason::EOS)
+                self.is_declared_wire_terminator(tokenizer, token)
+                    || (self.sampling_params.model_output_protocol
+                        == ferrum_types::ModelOutputProtocol::HarmonyGptOss
+                        && stop_reason == Some(FinishReason::EOS)
                         && !self.stop_token_ids.contains(&token.get())
                         && self
                             .structured_output_processor
@@ -1586,7 +1217,7 @@ impl SequenceState {
                                         &self.stop_token_ids,
                                     )
                                     .unwrap_or(false)
-                            })))
+                            }))
             }
             _ => true,
         }
@@ -1667,10 +1298,12 @@ impl SequenceState {
                 self.sampling_history.activate_visible_structured_output(
                     start_token_index,
                     &self.generated_tokens,
+                    &mut self.output_semantic,
                 )?;
             }
             (true, None) => {
-                self.sampling_history.enter_hidden_structured_output();
+                self.sampling_history
+                    .enter_hidden_structured_output(&mut self.output_semantic)?;
             }
             (false, _) => {}
         }
@@ -1852,10 +1485,8 @@ impl Drop for SequenceState {
             let message = "sequence state dropped with owned request slot";
             warn!(
                 request_id = %self.request_id,
-                has_kv_cache = self.model_kv.is_some(),
-                kv_resource_blocks = ?self.kv_resource_blocks(),
-                has_recurrent_state = self.recurrent_state.is_some(),
-                recurrent_state_slots = ?self.recurrent_state_slots(),
+                execution_frontier = ?self.execution_frontier,
+                has_close_observation = self.execution_close.is_some(),
                 "{message}"
             );
             #[cfg(test)]
@@ -1946,282 +1577,5 @@ impl Drop for RequestSlotLease {
                 panic!("{message}");
             }
         }
-    }
-}
-
-#[must_use = "KV allocation leases must be consumed by release().await or into_committed_parts()"]
-pub(super) struct KvAllocationLease {
-    pub(super) owner_request_id: RequestId,
-    pub(super) allocation_request_id: RequestId,
-    pub(super) handle: Arc<dyn KvCacheHandle>,
-    pub(super) blocks: usize,
-    pub(super) armed: bool,
-}
-
-impl KvAllocationLease {
-    pub(super) fn new(
-        owner_request_id: RequestId,
-        allocation_request_id: RequestId,
-        handle: Arc<dyn KvCacheHandle>,
-        blocks: usize,
-    ) -> Self {
-        Self {
-            owner_request_id,
-            allocation_request_id,
-            handle,
-            blocks,
-            armed: true,
-        }
-    }
-
-    pub(super) fn handle(&self) -> Arc<dyn KvCacheHandle> {
-        self.handle.clone()
-    }
-
-    pub(super) fn blocks(&self) -> usize {
-        self.blocks
-    }
-
-    pub(super) async fn release(mut self, engine: &EngineInner) {
-        engine
-            .release_kv_allocation(
-                &self.owner_request_id,
-                self.allocation_request_id.clone(),
-                self.blocks,
-            )
-            .await;
-        self.armed = false;
-    }
-
-    pub(super) fn into_committed_parts(mut self) -> (RequestId, usize) {
-        self.armed = false;
-        (self.allocation_request_id.clone(), self.blocks)
-    }
-}
-
-impl Drop for KvAllocationLease {
-    fn drop(&mut self) {
-        if self.armed {
-            let message = "KV allocation lease dropped without explicit commit or async release";
-            warn!(
-                owner_request_id = %self.owner_request_id,
-                allocation_request_id = %self.allocation_request_id,
-                blocks = self.blocks,
-                "{message}"
-            );
-            #[cfg(test)]
-            if !std::thread::panicking() {
-                panic!("{message}");
-            }
-        }
-    }
-}
-
-#[must_use = "recurrent-state leases must be consumed by release().await or commit()"]
-pub(super) struct RecurrentStateLease {
-    pub(super) request_id: RequestId,
-    pub(super) handle: Arc<dyn RecurrentStateHandle>,
-    pub(super) slots: usize,
-    pub(super) capacity: Option<usize>,
-    pub(super) armed: bool,
-}
-
-impl RecurrentStateLease {
-    pub(super) fn new(
-        request_id: RequestId,
-        handle: Arc<dyn RecurrentStateHandle>,
-        slots: usize,
-        capacity: Option<usize>,
-    ) -> Self {
-        Self {
-            request_id,
-            handle,
-            slots,
-            capacity,
-            armed: true,
-        }
-    }
-
-    pub(super) fn handle(&self) -> Arc<dyn RecurrentStateHandle> {
-        self.handle.clone()
-    }
-
-    pub(super) fn slots(&self) -> usize {
-        self.slots
-    }
-
-    pub(super) async fn release(mut self, engine: &EngineInner) {
-        engine
-            .release_recurrent_allocation(&self.request_id, Some(self.slots))
-            .await;
-        self.armed = false;
-    }
-
-    pub(super) fn commit(mut self) -> usize {
-        self.armed = false;
-        self.slots
-    }
-}
-
-impl Drop for RecurrentStateLease {
-    fn drop(&mut self) {
-        if self.armed {
-            let message = "recurrent-state lease dropped without explicit commit or async release";
-            warn!(
-                request_id = %self.request_id,
-                slots = self.slots,
-                capacity = ?self.capacity,
-                "{message}"
-            );
-            #[cfg(test)]
-            if !std::thread::panicking() {
-                panic!("{message}");
-            }
-        }
-    }
-}
-
-pub(super) struct RecurrentStateAdmission {
-    pub(super) handle: Option<Arc<dyn RecurrentStateHandle>>,
-    pub(super) lease: Option<RecurrentStateLease>,
-}
-
-impl RecurrentStateAdmission {
-    pub(super) fn none() -> Self {
-        Self {
-            handle: None,
-            lease: None,
-        }
-    }
-
-    pub(super) fn existing(handle: Arc<dyn RecurrentStateHandle>) -> Self {
-        Self {
-            handle: Some(handle),
-            lease: None,
-        }
-    }
-
-    pub(super) fn fresh(lease: RecurrentStateLease) -> Self {
-        Self {
-            handle: Some(lease.handle()),
-            lease: Some(lease),
-        }
-    }
-
-    pub(super) fn handle(&self) -> Option<Arc<dyn RecurrentStateHandle>> {
-        self.handle.clone()
-    }
-
-    pub(super) fn fresh_slots(&self) -> Option<usize> {
-        self.lease.as_ref().map(RecurrentStateLease::slots)
-    }
-
-    pub(super) fn commit_fresh(&mut self) -> Option<usize> {
-        self.lease.take().map(RecurrentStateLease::commit)
-    }
-
-    pub(super) async fn release_fresh(&mut self, engine: &EngineInner) {
-        if let Some(lease) = self.lease.take() {
-            lease.release(engine).await;
-        }
-    }
-}
-
-#[must_use = "legacy backend workspace trace leases must be released or dropped"]
-pub(super) struct LegacyBackendWorkspaceTraceLease<'a> {
-    pub(super) engine: &'a EngineInner,
-    pub(super) request_ids: Vec<RequestId>,
-    pub(super) release_phase: &'static str,
-    pub(super) armed: bool,
-}
-
-impl<'a> LegacyBackendWorkspaceTraceLease<'a> {
-    pub(super) fn new(
-        engine: &'a EngineInner,
-        request_ids: Vec<RequestId>,
-        phase_prefix: &'static str,
-        release_phase: &'static str,
-    ) -> Self {
-        engine.trace_legacy_backend_workspace_acquire_many(&request_ids, phase_prefix);
-        Self {
-            engine,
-            request_ids,
-            release_phase,
-            armed: true,
-        }
-    }
-
-    pub(super) fn release(mut self) {
-        self.release_now();
-        self.armed = false;
-    }
-
-    pub(super) fn release_now(&self) {
-        self.engine
-            .trace_legacy_backend_workspace_release_many(&self.request_ids, self.release_phase);
-    }
-}
-
-impl Drop for LegacyBackendWorkspaceTraceLease<'_> {
-    fn drop(&mut self) {
-        if self.armed {
-            self.release_now();
-        }
-    }
-}
-
-pub(super) struct PendingBatchPrefill {
-    pub(super) request_id: RequestId,
-    pub(super) input_tokens: Vec<TokenId>,
-    pub(super) kv_lease: Option<KvAllocationLease>,
-    pub(super) recurrent_state: RecurrentStateAdmission,
-    pub(super) metadata: HashMap<String, serde_json::Value>,
-}
-
-impl PendingBatchPrefill {
-    pub(super) fn new(
-        request_id: RequestId,
-        input_tokens: Vec<TokenId>,
-        kv_lease: KvAllocationLease,
-        recurrent_state: RecurrentStateAdmission,
-        metadata: HashMap<String, serde_json::Value>,
-    ) -> Self {
-        Self {
-            request_id,
-            input_tokens,
-            kv_lease: Some(kv_lease),
-            recurrent_state,
-            metadata,
-        }
-    }
-
-    pub(super) fn kv_handle(&self) -> Result<Arc<dyn KvCacheHandle>> {
-        self.kv_lease
-            .as_ref()
-            .map(KvAllocationLease::handle)
-            .ok_or_else(|| FerrumError::internal("batch prefill KV lease already consumed"))
-    }
-
-    pub(super) fn kv_resource_blocks(&self) -> Result<usize> {
-        self.kv_lease
-            .as_ref()
-            .map(KvAllocationLease::blocks)
-            .ok_or_else(|| FerrumError::internal("batch prefill KV lease already consumed"))
-    }
-
-    pub(super) fn commit_kv(&mut self) -> Result<usize> {
-        let lease = self
-            .kv_lease
-            .take()
-            .ok_or_else(|| FerrumError::internal("batch prefill KV lease already consumed"))?;
-        let (_allocation_request_id, blocks) = lease.into_committed_parts();
-        Ok(blocks)
-    }
-
-    pub(super) async fn release_resources(&mut self, engine: &EngineInner) {
-        if let Some(lease) = self.kv_lease.take() {
-            lease.release(engine).await;
-        }
-        self.recurrent_state.release_fresh(engine).await;
     }
 }

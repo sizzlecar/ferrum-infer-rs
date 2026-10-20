@@ -1,18 +1,32 @@
+use ferrum_execution::model_executor::ExecutorSamplingOutput;
 use ferrum_interfaces::kv_dtype::KvInt8;
+
+mod token_execution;
 use ferrum_kernels::backend::{BackendInt8KvOps, KvLayer, MoeLlmBackend};
 use ferrum_types::{FerrumError, Result};
 
 use crate::common::{DecoderOnlyLLM, LlmRuntimeConfig};
 
-use super::llama_family::{
-    llama_family_decode_op_profile_enabled, LlamaFamilyModel, LlamaStageHiddenBridgeTiming,
-};
+use super::llama_family::{LlamaFamilyModel, LlamaStageHiddenBridgeTiming};
 
 fn elapsed_micros_u64(t0: std::time::Instant) -> u64 {
     t0.elapsed().as_micros().min(u64::MAX as u128) as u64
 }
 
 const MIN_OVERLAPPED_DECODE_BATCH: usize = 16;
+
+fn legacy_pipeline_sampling(products: Vec<ExecutorSamplingOutput>) -> Vec<Vec<f32>> {
+    products
+        .into_iter()
+        .map(|product| match product {
+            ExecutorSamplingOutput::FullLogits(logits) => logits,
+            ExecutorSamplingOutput::GreedyToken(token) => vec![token.get() as f32],
+            ExecutorSamplingOutput::NoSelectableFiniteLogit => std::panic::panic_any(
+                FerrumError::backend("No finite logits available for sampling"),
+            ),
+        })
+        .collect()
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PipelineHiddenDtype {
@@ -137,11 +151,22 @@ pub(crate) trait LlamaPipelineStageBatchOps<B: MoeLlmBackend> {
         hidden: &PipelineHidden<B>,
     ) -> (PipelineHidden<B>, LlamaStageHiddenBridgeTiming);
 
+    fn sampling_from_hidden_batch(
+        &mut self,
+        hidden: &PipelineHidden<B>,
+        force_full_logits: bool,
+    ) -> Vec<ExecutorSamplingOutput>;
+
+    // Compatibility for retained numerical callers. Token execution consumes
+    // the typed product produced by the actual head branch, never Vec length.
+    #[cfg(test)]
     fn logits_from_hidden_batch(
         &mut self,
         hidden: &PipelineHidden<B>,
         force_full_logits: bool,
-    ) -> Vec<Vec<f32>>;
+    ) -> Vec<Vec<f32>> {
+        legacy_pipeline_sampling(self.sampling_from_hidden_batch(hidden, force_full_logits))
+    }
 }
 
 impl<B> LlamaPipelineStageBatchOps<B> for LlamaFamilyModel<B, KvInt8>
@@ -189,11 +214,11 @@ where
         (PipelineHidden::host(out, batch.len(), h), bridge_timing)
     }
 
-    fn logits_from_hidden_batch(
+    fn sampling_from_hidden_batch(
         &mut self,
         hidden: &PipelineHidden<B>,
         _force_full_logits: bool,
-    ) -> Vec<Vec<f32>> {
+    ) -> Vec<ExecutorSamplingOutput> {
         let h = self.config().hidden_size;
         let hidden_slice = hidden.host_slice();
         assert_eq!(
@@ -206,7 +231,9 @@ where
         (0..hidden.row_count())
             .map(|row| {
                 let start = row * h;
-                self.logits_from_hidden(&hidden_slice[start..start + h])
+                ExecutorSamplingOutput::FullLogits(
+                    self.logits_from_hidden(&hidden_slice[start..start + h]),
+                )
             })
             .collect()
     }
@@ -588,11 +615,25 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyPipelineModel<B, K> {
                 stages.len()
             )));
         }
-        if placement.has_explicit_device_ordinals() && !B::supports_device_ordinal_scope() {
+        if placement.has_explicit_device_ordinals() && !B::supports_device_ordinal() {
             return Err(FerrumError::unsupported(
                 "Llama layer-split pipeline requested explicit backend device ordinals, \
-                 but the selected backend does not support device-scoped execution",
+                 but the selected backend does not support explicit device ordinals",
             ));
+        }
+        for (index, stage) in stages.iter().enumerate() {
+            let actual = stage.backend_device_ordinal().ok_or_else(|| {
+                FerrumError::model("Llama pipeline stage has no live original context")
+            })?;
+            if placement
+                .stage(index)
+                .backend_device_ordinal
+                .is_some_and(|requested| requested != actual)
+            {
+                return Err(FerrumError::config(format!(
+                    "Llama pipeline stage {index} was constructed on device {actual}, different from its placement",
+                )));
+            }
         }
         if placement.pipeline_mode() == LlamaPipelineMode::Overlapped && placement.len() != 2 {
             return Err(FerrumError::model(
@@ -687,37 +728,27 @@ where
         &mut self,
         batch: &[(String, u32, u32)],
         force_full_logits: bool,
-    ) -> Vec<Vec<f32>> {
-        let profile = llama_family_decode_op_profile_enabled();
+    ) -> Vec<ExecutorSamplingOutput> {
         let total_t0 = std::time::Instant::now();
         let mut stage_us: Vec<u64> = Vec::with_capacity(self.stages.len());
         let mut host_bridge_bytes = 0usize;
         let mut bridge_timing = LlamaStageHiddenBridgeTiming::default();
-        let stage_bridge = self.placement.stage_bridge();
 
         let stage_t0 = std::time::Instant::now();
-        let mut hidden =
-            B::with_device_ordinal(self.placement.stage(0).backend_device_ordinal, || {
-                self.stages[0].decode_stage_tokens_to_hidden_batch(batch)
-            });
+        let mut hidden = self.stages[0].decode_stage_tokens_to_hidden_batch(batch);
         stage_us.push(elapsed_micros_u64(stage_t0));
         for idx in 1..self.stages.len() {
-            let device = self.placement.stage(idx).backend_device_ordinal;
             host_bridge_bytes = host_bridge_bytes.saturating_add(hidden.len_bytes());
             let stage_t0 = std::time::Instant::now();
-            let (next_hidden, stage_bridge_timing) = B::with_device_ordinal(device, || {
-                self.stages[idx].decode_stage_hidden_from_host_batch(batch, &hidden)
-            });
+            let (next_hidden, stage_bridge_timing) =
+                self.stages[idx].decode_stage_hidden_from_host_batch(batch, &hidden);
             hidden = next_hidden;
             bridge_timing = bridge_timing.add(stage_bridge_timing);
             stage_us.push(elapsed_micros_u64(stage_t0));
         }
         let last_idx = self.stages.len() - 1;
         let logits_t0 = std::time::Instant::now();
-        let logits = B::with_device_ordinal(
-            self.placement.stage(last_idx).backend_device_ordinal,
-            || self.stages[last_idx].logits_from_hidden_batch(&hidden, force_full_logits),
-        );
+        let logits = self.stages[last_idx].sampling_from_hidden_batch(&hidden, force_full_logits);
         let logits_us = elapsed_micros_u64(logits_t0);
         let total_us = elapsed_micros_u64(total_t0);
         self.decode_stats.record(
@@ -733,27 +764,7 @@ where
             logits_us,
             total_us,
         );
-        if profile {
-            static PIPELINE_PROFILE_CALLS: std::sync::atomic::AtomicU64 =
-                std::sync::atomic::AtomicU64::new(0);
-            let n = PIPELINE_PROFILE_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            if n.is_multiple_of(8) {
-                eprintln!(
-                    "[pipeline-decode-profile] call#{} m={} hidden={:?} mode=batch bridge={} host_bridge_bytes={} bridge_us={} host_copy_us={} device_copy_us={} stage_us={:?} logits_us={} total_us={}",
-                    n,
-                    batch.len(),
-                    hidden.metadata_json(),
-                    stage_bridge.as_str(),
-                    host_bridge_bytes,
-                    bridge_timing.bridge_us,
-                    bridge_timing.host_copy_us,
-                    bridge_timing.device_copy_us,
-                    stage_us,
-                    logits_us,
-                    total_us,
-                );
-            }
-        }
+
         logits
     }
 
@@ -761,7 +772,7 @@ where
         &mut self,
         batch: &[(String, u32, u32)],
         force_full_logits: bool,
-    ) -> Vec<Vec<f32>> {
+    ) -> Vec<ExecutorSamplingOutput> {
         debug_assert_eq!(self.stages.len(), 2);
         let microbatch_size = self.decode_microbatch_size(batch.len());
         let chunks: Vec<Vec<(String, u32, u32)>> = batch
@@ -773,11 +784,7 @@ where
             return self.decode_batch_sequential_internal(batch, force_full_logits);
         }
 
-        let profile = llama_family_decode_op_profile_enabled();
         let total_t0 = std::time::Instant::now();
-        let stage0_device = self.placement.stage(0).backend_device_ordinal;
-        let stage1_device = self.placement.stage(1).backend_device_ordinal;
-        let stage_bridge = self.placement.stage_bridge();
         let (stage0_slice, stage1_slice) = self.stages.split_at_mut(1);
         let stage0 = &mut stage0_slice[0];
         let stage1 = &mut stage1_slice[0];
@@ -787,7 +794,7 @@ where
             PipelineHidden<B>,
             u64,
         )>(1);
-        let mut ordered_logits: Vec<Option<Vec<Vec<f32>>>> = vec![None; chunk_count];
+        let mut ordered_logits: Vec<Option<Vec<ExecutorSamplingOutput>>> = vec![None; chunk_count];
         let mut stage0_us_total = 0u64;
         let mut stage1_us_total = 0u64;
         let mut logits_us_total = 0u64;
@@ -798,9 +805,7 @@ where
             let worker = scope.spawn(move || {
                 for (idx, chunk) in chunks.into_iter().enumerate() {
                     let stage_t0 = std::time::Instant::now();
-                    let hidden = B::with_device_ordinal(stage0_device, || {
-                        stage0.decode_stage_tokens_to_hidden_batch(&chunk)
-                    });
+                    let hidden = stage0.decode_stage_tokens_to_hidden_batch(&chunk);
                     let stage_us = elapsed_micros_u64(stage_t0);
                     if tx.send((idx, chunk, hidden, stage_us)).is_err() {
                         break;
@@ -808,31 +813,44 @@ where
                 }
             });
 
-            for _ in 0..chunk_count {
-                let (idx, chunk, hidden, stage0_us) = rx
-                    .recv()
-                    .expect("pipeline stage0 worker ended before sending all microbatches");
-                stage0_us_total = stage0_us_total.saturating_add(stage0_us);
-                host_bridge_bytes = host_bridge_bytes.saturating_add(hidden.len_bytes());
-
-                let stage_t0 = std::time::Instant::now();
-                let (hidden, stage_bridge_timing) = B::with_device_ordinal(stage1_device, || {
-                    stage1.decode_stage_hidden_from_host_batch(&chunk, &hidden)
-                });
-                bridge_timing = bridge_timing.add(stage_bridge_timing);
-                stage1_us_total = stage1_us_total.saturating_add(elapsed_micros_u64(stage_t0));
-
-                let logits_t0 = std::time::Instant::now();
-                let logits = B::with_device_ordinal(stage1_device, || {
-                    stage1.logits_from_hidden_batch(&hidden, force_full_logits)
-                });
-                logits_us_total = logits_us_total.saturating_add(elapsed_micros_u64(logits_t0));
-                ordered_logits[idx] = Some(logits);
+            let consumer =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<()> {
+                    for _ in 0..chunk_count {
+                        let (idx, chunk, hidden, stage0_us) = rx.recv().map_err(|_| {
+                            FerrumError::backend("pipeline stage0 ended before all microbatches")
+                        })?;
+                        stage0_us_total = stage0_us_total.saturating_add(stage0_us);
+                        host_bridge_bytes = host_bridge_bytes.saturating_add(hidden.len_bytes());
+                        let stage_t0 = std::time::Instant::now();
+                        let (hidden, stage_bridge_timing) =
+                            stage1.decode_stage_hidden_from_host_batch(&chunk, &hidden);
+                        bridge_timing = bridge_timing.add(stage_bridge_timing);
+                        stage1_us_total =
+                            stage1_us_total.saturating_add(elapsed_micros_u64(stage_t0));
+                        let logits_t0 = std::time::Instant::now();
+                        let logits = stage1.sampling_from_hidden_batch(&hidden, force_full_logits);
+                        logits_us_total =
+                            logits_us_total.saturating_add(elapsed_micros_u64(logits_t0));
+                        ordered_logits[idx] = Some(logits);
+                    }
+                    Ok(())
+                }));
+            // On a later-stage failure disconnect the original bounded bridge
+            // before joining. The producer must not remain blocked on send.
+            drop(rx);
+            let producer = worker.join();
+            match consumer {
+                Err(payload) => std::panic::resume_unwind(payload),
+                Ok(Err(disconnected)) => match producer {
+                    Err(payload) => std::panic::resume_unwind(payload),
+                    Ok(()) => std::panic::panic_any(disconnected),
+                },
+                Ok(Ok(())) => {
+                    if let Err(payload) = producer {
+                        std::panic::resume_unwind(payload);
+                    }
+                }
             }
-
-            worker
-                .join()
-                .expect("pipeline stage0 worker panicked during overlapped decode");
         });
 
         let total_us = elapsed_micros_u64(total_t0);
@@ -850,28 +868,6 @@ where
             logits_us_total,
             total_us,
         );
-        if profile {
-            static PIPELINE_PROFILE_CALLS: std::sync::atomic::AtomicU64 =
-                std::sync::atomic::AtomicU64::new(0);
-            let n = PIPELINE_PROFILE_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            if n.is_multiple_of(8) {
-                eprintln!(
-                    "[pipeline-decode-profile] call#{} m={} mode=overlapped microbatch_size={} microbatch_count={} bridge={} host_bridge_bytes={} bridge_us={} host_copy_us={} device_copy_us={} stage_us={:?} logits_us={} total_us={}",
-                    n,
-                    batch.len(),
-                    microbatch_size,
-                    chunk_count,
-                    stage_bridge.as_str(),
-                    host_bridge_bytes,
-                    bridge_timing.bridge_us,
-                    bridge_timing.host_copy_us,
-                    bridge_timing.device_copy_us,
-                    stage_us,
-                    logits_us_total,
-                    total_us,
-                );
-            }
-        }
 
         let mut logits = Vec::with_capacity(batch.len());
         for chunk_logits in ordered_logits {
@@ -893,20 +889,56 @@ where
         &self.runtime_cfg
     }
 
-    fn supports_direct_token_execution(&self) -> bool {
-        B::host_execution_is_synchronous()
+    fn token_execution_mode(&self) -> crate::common::ModelTokenExecutionMode {
+        use crate::common::ModelTokenExecutionMode;
+        // Construction proves complete ordered stage coverage and the real
+        // embedding/head. Device execution additionally uses the aggregate
+        // original-stage observation/close contract below. No transient
+        // execution_context location is used as a capability declaration.
+        if B::host_execution_is_synchronous() {
+            ModelTokenExecutionMode::InlineSynchronous
+        } else if B::supports_retained_execution() {
+            ModelTokenExecutionMode::ManagedWorker
+        } else {
+            ModelTokenExecutionMode::Unsupported
+        }
+    }
+
+    fn retire_model(&mut self) -> crate::common::llm::ModelRetirementOutcome {
+        use crate::common::llm::ModelRetirementOutcome;
+        let mut first_error = None;
+        let mut retained = false;
+        for stage in &mut self.stages {
+            match stage.retire_model() {
+                ModelRetirementOutcome::Retired { error } => {
+                    if first_error.is_none() {
+                        first_error = error;
+                    }
+                }
+                ModelRetirementOutcome::Retained { error } => {
+                    retained = true;
+                    first_error.get_or_insert(error);
+                }
+            }
+        }
+        if retained {
+            ModelRetirementOutcome::Retained {
+                error: first_error.expect("retained stage reports its error"),
+            }
+        } else {
+            ModelRetirementOutcome::Retired { error: first_error }
+        }
     }
 
     fn execute_token_work(
         &mut self,
-        cache_id: &str,
-        work: crate::common::llm::ModelTokenWork<'_>,
-    ) -> crate::common::llm::ModelTokenOutcome {
+        input: &crate::common::llm::ModelTokenInput<'_>,
+    ) -> crate::common::llm::ModelTokenOutcome<crate::common::llm::ModelTokenProduct> {
         use crate::common::llm::{catch_host_execution, ModelTokenOutcome, ModelTokenWork};
+        let cache_id = input.cache_id;
+        let work = input.work;
         if !B::host_execution_is_synchronous() {
-            return ModelTokenOutcome::NotSubmitted(FerrumError::unsupported(
-                "device pipeline token execution requires retained stage submissions",
-            ));
+            return self.execute_pipeline_token_work(input);
         }
         let (position, count, tokens_valid) = match work {
             ModelTokenWork::Prefill { tokens, position } => (
@@ -951,24 +983,92 @@ where
                 stage.recover_host_token_scratch();
             }
         }
-        ModelTokenOutcome::Terminal(result)
+        ModelTokenOutcome::Terminal(result.map(|logits| {
+            input.sample.then_some(
+                ferrum_execution::model_executor::ExecutorSamplingOutput::FullLogits(logits),
+            )
+        }))
+    }
+
+    fn execute_token_batch(
+        &mut self,
+        inputs: &[crate::common::llm::ModelTokenInput<'_>],
+    ) -> crate::common::llm::ModelTokenBatchOutcome {
+        self.execute_pipeline_token_batch(inputs)
+    }
+
+    fn recover_token_execution(&mut self) -> crate::common::llm::ModelExecutionRecovery {
+        self.recover_pipeline_stages()
+    }
+
+    fn close_token_execution(
+        &mut self,
+        cache_id: &str,
+    ) -> crate::common::llm::ModelTokenCloseOutcome {
+        self.close_pipeline_sequence(cache_id)
     }
 
     fn close_token_sequence(&mut self, cache_id: &str) -> Result<()> {
-        if !B::host_execution_is_synchronous() {
-            return Err(FerrumError::unsupported(
-                "device pipeline closure requires each actual stage submission",
-            ));
+        use crate::common::llm::ModelTokenCloseOutcome;
+        match self.close_pipeline_sequence(cache_id) {
+            ModelTokenCloseOutcome::Ended { error: None } => Ok(()),
+            ModelTokenCloseOutcome::Ended { error: Some(error) }
+            | ModelTokenCloseOutcome::Held { error } => Err(error),
         }
-        crate::common::llm::catch_host_execution(|| self.release(cache_id))
     }
 
     fn prepare_kv_capacity(&mut self, cache_id: &str, capacity_hint: usize) {
-        for (index, stage) in self.stages.iter_mut().enumerate() {
-            B::with_device_ordinal(self.placement.stage(index).backend_device_ordinal, || {
-                stage.ensure_kv_with_capacity_hint(cache_id, Some(capacity_hint));
-            });
+        for stage in &mut self.stages {
+            stage.ensure_kv_with_capacity_hint(cache_id, Some(capacity_hint));
         }
+    }
+
+    fn reserve_token_kv_slots(
+        &mut self,
+        requests: &[ferrum_execution::model_executor::KvSlotRequest],
+    ) -> Result<crate::common::llm::ModelKvReservation> {
+        use crate::common::llm::ModelKvReservation;
+        if self.stages.is_empty() || self.stages.len() != self.placement.stages().len() {
+            return Err(FerrumError::request_validation(
+                "token reservation requires a complete layer-stage placement",
+            ));
+        }
+        for stage in &mut self.stages {
+            let result = stage.reserve_token_kv_slots(requests)?;
+            if matches!(result, ModelKvReservation::CapacityDeferred(_)) {
+                // This is the actual rejecting stage's allocator observation,
+                // not a fabricated aggregate pool. Earlier reservations stay
+                // with their stages until the caller closes the incarnation.
+                return Ok(result);
+            }
+        }
+        // Every stage reserved successfully. There is no single physical
+        // allocator snapshot representing these independent stage pools.
+        Ok(ModelKvReservation::Reserved(None))
+    }
+
+    fn prepare_token_kv(
+        &mut self,
+        request: crate::common::llm::ModelKvPreparation<'_>,
+    ) -> Result<crate::common::llm::ModelKvReservation> {
+        use crate::common::llm::ModelKvReservation;
+        if self.stages.is_empty() || self.stages.len() != self.placement.stages().len() {
+            return Err(FerrumError::request_validation(
+                "token preparation requires a complete layer-stage placement",
+            ));
+        }
+        for stage in &mut self.stages {
+            // Pipeline stage execution does not yet consume a common prefix
+            // span. Preserve stage-owned KV without acquiring independent
+            // shared-prefix spans per stage.
+            let result = stage.prepare_pipeline_token_kv(request)?;
+            if matches!(result, ModelKvReservation::CapacityDeferred(_)) {
+                // The rejecting stage supplies its actual allocator evidence.
+                // Earlier stage owners remain reachable for the same close.
+                return Ok(result);
+            }
+        }
+        Ok(ModelKvReservation::Reserved(None))
     }
 
     fn cache_metrics_snapshot(&self) -> Option<serde_json::Value> {
@@ -991,12 +1091,9 @@ where
     }
 
     fn prepare(&mut self, cache_id: &str, max_tokens: usize) {
-        for (idx, stage) in self.stages.iter_mut().enumerate() {
-            let device = self.placement.stage(idx).backend_device_ordinal;
-            B::with_device_ordinal(device, || {
-                stage.ensure_scratch(max_tokens);
-                stage.ensure_kv(cache_id);
-            });
+        for stage in &mut self.stages {
+            stage.ensure_scratch(max_tokens);
+            stage.ensure_kv(cache_id);
         }
     }
 
@@ -1012,26 +1109,18 @@ where
         assert!(!tokens.is_empty(), "pipeline prefill called with no tokens");
         let pos_offset = self.stages[0].cache_len(cache_id);
         let mut hidden =
-            B::with_device_ordinal(self.placement.stage(0).backend_device_ordinal, || {
-                self.stages[0].prefill_stage_tokens_to_hidden(cache_id, tokens, pos_offset)
-            });
+            self.stages[0].prefill_stage_tokens_to_hidden(cache_id, tokens, pos_offset);
         for idx in 1..self.stages.len() {
-            let device = self.placement.stage(idx).backend_device_ordinal;
-            hidden = B::with_device_ordinal(device, || {
-                self.stages[idx].prefill_stage_hidden_from_host(
-                    cache_id,
-                    &hidden,
-                    tokens.len(),
-                    pos_offset,
-                )
-            });
+            hidden = self.stages[idx].prefill_stage_hidden_from_host(
+                cache_id,
+                &hidden,
+                tokens.len(),
+                pos_offset,
+            );
         }
         let last_hidden = self.last_hidden_row(&hidden, tokens.len()).to_vec();
         let last_idx = self.stages.len() - 1;
-        B::with_device_ordinal(
-            self.placement.stage(last_idx).backend_device_ordinal,
-            || self.stages[last_idx].logits_from_hidden(&last_hidden),
-        )
+        self.stages[last_idx].logits_from_hidden(&last_hidden)
     }
 
     fn decode(&mut self, cache_id: &str, token: u32, pos: u32) -> Vec<f32> {
@@ -1041,28 +1130,20 @@ where
         let mut bridge_timing = LlamaStageHiddenBridgeTiming::default();
 
         let stage_t0 = std::time::Instant::now();
-        let mut hidden =
-            B::with_device_ordinal(self.placement.stage(0).backend_device_ordinal, || {
-                self.stages[0].decode_stage_token_to_hidden(cache_id, token, pos)
-            });
+        let mut hidden = self.stages[0].decode_stage_token_to_hidden(cache_id, token, pos);
         stage_us.push(elapsed_micros_u64(stage_t0));
         for idx in 1..self.stages.len() {
-            let device = self.placement.stage(idx).backend_device_ordinal;
             host_bridge_bytes = host_bridge_bytes.saturating_add(hidden.len() * size_of::<f32>());
             let stage_t0 = std::time::Instant::now();
-            let (next_hidden, stage_bridge_timing) = B::with_device_ordinal(device, || {
-                self.stages[idx].decode_stage_hidden_from_host_with_timing(cache_id, &hidden, pos)
-            });
+            let (next_hidden, stage_bridge_timing) =
+                self.stages[idx].decode_stage_hidden_from_host_with_timing(cache_id, &hidden, pos);
             hidden = next_hidden;
             bridge_timing = bridge_timing.add(stage_bridge_timing);
             stage_us.push(elapsed_micros_u64(stage_t0));
         }
         let last_idx = self.stages.len() - 1;
         let logits_t0 = std::time::Instant::now();
-        let logits = B::with_device_ordinal(
-            self.placement.stage(last_idx).backend_device_ordinal,
-            || self.stages[last_idx].logits_from_hidden(&hidden),
-        );
+        let logits = self.stages[last_idx].logits_from_hidden(&hidden);
         self.decode_stats.record(
             1,
             1,
@@ -1096,34 +1177,29 @@ where
             return vec![self.decode(cache_id, *token, *pos)];
         }
 
-        if self.pipeline_mode() == LlamaPipelineMode::Overlapped {
+        let output = if self.pipeline_mode() == LlamaPipelineMode::Overlapped {
             self.decode_batch_overlapped_two_stage(batch, force_full_logits)
         } else {
             self.decode_batch_sequential_internal(batch, force_full_logits)
-        }
+        };
+        legacy_pipeline_sampling(output)
     }
 
     fn release(&mut self, cache_id: &str) {
-        for (idx, stage) in self.stages.iter_mut().enumerate() {
-            B::with_device_ordinal(self.placement.stage(idx).backend_device_ordinal, || {
-                stage.release(cache_id);
-            });
+        for stage in &mut self.stages {
+            stage.release(cache_id);
         }
     }
 
     fn truncate_kv(&mut self, cache_id: &str, new_len: usize) {
-        for (idx, stage) in self.stages.iter_mut().enumerate() {
-            B::with_device_ordinal(self.placement.stage(idx).backend_device_ordinal, || {
-                stage.truncate_kv(cache_id, new_len);
-            });
+        for stage in &mut self.stages {
+            stage.truncate_kv(cache_id, new_len);
         }
     }
 
     fn reset(&mut self) {
-        for (idx, stage) in self.stages.iter_mut().enumerate() {
-            B::with_device_ordinal(self.placement.stage(idx).backend_device_ordinal, || {
-                stage.reset();
-            });
+        for stage in &mut self.stages {
+            stage.reset();
         }
     }
 }
@@ -1190,7 +1266,11 @@ mod tests {
     }
 
     impl WeightLoader<CpuBackend> for ParityLoader {
-        fn load_tensor(&self, name: &str) -> Result<Vec<f32>> {
+        fn load_tensor(
+            &self,
+            _ctx: &mut <CpuBackend as ferrum_kernels::backend::Backend>::Context,
+            name: &str,
+        ) -> Result<Vec<f32>> {
             if name == "model.embed_tokens.weight" {
                 return Ok(Self::deterministic_values(
                     name,
@@ -1212,15 +1292,23 @@ mod tests {
 
         fn load_linear(
             &self,
+            ctx: &mut <CpuBackend as ferrum_kernels::backend::Backend>::Context,
             name: &str,
-        ) -> Result<Box<dyn ferrum_quantization::Linear<CpuBackend>>> {
-            let (out_features, in_features) = self.linear_dims(name)?;
-            let weights = Self::deterministic_values(name, out_features * in_features, 0.0, 0.015);
-            Ok(Box::new(DenseLinear::<CpuBackend>::from_rows(
-                &weights,
-                out_features,
-                in_features,
-            )))
+        ) -> Result<ferrum_kernels::LoadedLinear<CpuBackend>> {
+            let linear = (|| -> Result<Box<dyn ferrum_quantization::Linear<CpuBackend>>> {
+                let (out_features, in_features) = self.linear_dims(name)?;
+                let weights =
+                    Self::deterministic_values(name, out_features * in_features, 0.0, 0.015);
+                Ok(Box::new(DenseLinear::<CpuBackend>::from_rows_in_context(
+                    ctx,
+                    &weights,
+                    out_features,
+                    in_features,
+                )))
+            })()?;
+            // SAFETY: these built-in projections own their weights and encode only
+            // backend work; the model retains them until checked graph retirement.
+            Ok(unsafe { ferrum_kernels::LoadedLinear::new_capture_stable(linear) })
         }
 
         fn has_tensor(&self, name: &str) -> bool {
@@ -1303,7 +1391,8 @@ mod tests {
 
     #[test]
     fn pipeline_direct_tokens_validate_before_mutation_and_match_real_forward() {
-        use crate::common::llm::{ModelTokenOutcome, ModelTokenWork};
+        use crate::common::llm::{ModelTokenInput, ModelTokenOutcome, ModelTokenWork};
+        use ferrum_execution::model_executor::{ExecutorSamplingOutput, LogitsReturnPolicy};
         let (mut full, mut pipeline) = build_full_and_pipeline();
         for stage in std::iter::once(&mut full).chain(pipeline.stages.iter_mut()) {
             stage.runtime_env.metal_paged_kv = Some(false);
@@ -1329,7 +1418,12 @@ mod tests {
             },
         ] {
             assert!(matches!(
-                pipeline.execute_token_work("pipe", work),
+                pipeline.execute_token_work(&ModelTokenInput {
+                    cache_id: "pipe",
+                    work,
+                    logits_policy: &LogitsReturnPolicy::FullLogits,
+                    sample: true,
+                }),
                 ModelTokenOutcome::NotSubmitted(_)
             ));
             assert!(pipeline
@@ -1337,13 +1431,17 @@ mod tests {
                 .iter()
                 .all(|stage| stage.kv_caches.is_empty()));
         }
-        let ModelTokenOutcome::Terminal(Ok(logits)) = pipeline.execute_token_work(
-            "pipe",
-            ModelTokenWork::Prefill {
-                tokens: &[0, 1],
-                position: 0,
-            },
-        ) else {
+        let ModelTokenOutcome::Terminal(Ok(Some(ExecutorSamplingOutput::FullLogits(logits)))) =
+            pipeline.execute_token_work(&ModelTokenInput {
+                cache_id: "pipe",
+                work: ModelTokenWork::Prefill {
+                    tokens: &[0, 1],
+                    position: 0,
+                },
+                logits_policy: &LogitsReturnPolicy::FullLogits,
+                sample: true,
+            })
+        else {
             panic!("expected real terminal prefill")
         };
         assert_logits_close("direct prefill", &full.prefill("full", &[0, 1]), &logits);
@@ -1351,13 +1449,17 @@ mod tests {
             .stages
             .iter()
             .all(|stage| stage.cache_len("pipe") == 2));
-        let ModelTokenOutcome::Terminal(Ok(logits)) = pipeline.execute_token_work(
-            "pipe",
-            ModelTokenWork::Decode {
-                token: 2,
-                position: 2,
-            },
-        ) else {
+        let ModelTokenOutcome::Terminal(Ok(Some(ExecutorSamplingOutput::FullLogits(logits)))) =
+            pipeline.execute_token_work(&ModelTokenInput {
+                cache_id: "pipe",
+                work: ModelTokenWork::Decode {
+                    token: 2,
+                    position: 2,
+                },
+                logits_policy: &LogitsReturnPolicy::FullLogits,
+                sample: true,
+            })
+        else {
             panic!("expected real terminal decode")
         };
         assert_logits_close("direct decode", &full.decode("full", 2, 2), &logits);
@@ -1372,15 +1474,119 @@ mod tests {
             .all(|stage| stage.kv_caches.is_empty()));
         pipeline.stages.clear();
         assert!(matches!(
-            pipeline.execute_token_work(
-                "missing",
-                ModelTokenWork::Prefill {
+            pipeline.execute_token_work(&ModelTokenInput {
+                cache_id: "missing",
+                work: ModelTokenWork::Prefill {
                     tokens: &[0],
                     position: 0
-                }
-            ),
+                },
+                logits_policy: &LogitsReturnPolicy::FullLogits,
+                sample: true,
+            }),
             ModelTokenOutcome::NotSubmitted(_)
         ));
+    }
+
+    #[test]
+    fn pipeline_token_preparation_later_stage_capacity_keeps_exact_stage_owners() {
+        use crate::common::llm::{ModelKvPreparation, ModelKvReservation};
+        let (_, mut pipeline) = build_full_and_pipeline();
+        let prompt: std::sync::Arc<[u32]> = std::sync::Arc::from([0]);
+        for stage in &mut pipeline.stages {
+            stage.runtime_env.metal_paged_kv = Some(true);
+            stage.runtime_env.prefix_cache = false;
+            stage.runtime_env.kv_capacity = Some(16);
+            stage.runtime_env.kv_max_blocks = Some(1);
+            stage.runtime_env.paged_max_seqs = 2;
+        }
+        assert!(matches!(
+            pipeline.stages[1]
+                .prepare_pipeline_token_kv(ModelKvPreparation {
+                    cache_id: "occupied",
+                    capacity_hint: 16,
+                    prompt: &prompt,
+                    adapter: None
+                })
+                .unwrap(),
+            ModelKvReservation::Reserved(_),
+        ));
+        let occupied = pipeline.stages[1].kv_caches["occupied"][0]
+            .paged_block_indices
+            .clone();
+        let ModelKvReservation::CapacityDeferred(rejected) = pipeline
+            .prepare_token_kv(ModelKvPreparation {
+                cache_id: "candidate",
+                capacity_hint: 16,
+                prompt: &prompt,
+                adapter: None,
+            })
+            .unwrap()
+        else {
+            panic!("the second stage's real pool is occupied");
+        };
+        assert_eq!(rejected.snapshot().total_blocks, 1);
+        assert_eq!(rejected.snapshot().free_blocks, 0);
+        assert_eq!(
+            pipeline.stages[0].kv_caches["candidate"][0]
+                .paged_block_indices
+                .len(),
+            1
+        );
+        assert!(pipeline.stages[1].kv_caches["candidate"]
+            .iter()
+            .all(|cache| cache.paged_block_indices.is_empty()));
+        pipeline.close_token_sequence("candidate").unwrap();
+        assert!(pipeline
+            .stages
+            .iter()
+            .all(|stage| !stage.kv_caches.contains_key("candidate")));
+        assert_eq!(
+            pipeline.stages[0]
+                .paged_block_alloc
+                .as_ref()
+                .unwrap()
+                .lock()
+                .unwrap()
+                .free_count(),
+            1
+        );
+        assert_eq!(
+            pipeline.stages[1]
+                .paged_block_alloc
+                .as_ref()
+                .unwrap()
+                .lock()
+                .unwrap()
+                .free_count(),
+            0
+        );
+        assert!(pipeline.stages[1].kv_caches["occupied"]
+            .iter()
+            .all(|cache| cache.len == 0 && cache.paged_block_indices == occupied));
+        pipeline.stages[1].close_token_sequence("occupied").unwrap();
+        assert!(matches!(
+            pipeline
+                .prepare_token_kv(ModelKvPreparation {
+                    cache_id: "retry",
+                    capacity_hint: 16,
+                    prompt: &prompt,
+                    adapter: None
+                })
+                .unwrap(),
+            ModelKvReservation::Reserved(_)
+        ));
+        pipeline.close_token_sequence("retry").unwrap();
+        assert!(pipeline.stages.iter().all(|stage| {
+            stage.kv_caches.is_empty()
+                && stage
+                    .paged_block_alloc
+                    .as_ref()
+                    .unwrap()
+                    .lock()
+                    .unwrap()
+                    .free_count()
+                    == 1
+        }));
     }
 
     #[test]
@@ -1722,6 +1928,6 @@ mod tests {
             Err(err) => err.to_string(),
         };
 
-        assert!(err.contains("does not support device-scoped execution"));
+        assert!(err.contains("does not support explicit device ordinals"));
     }
 }

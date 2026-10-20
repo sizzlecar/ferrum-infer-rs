@@ -232,6 +232,8 @@ impl ChatMessage {
 /// Tokenizer configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TokenizerConfig {
+    #[serde(default)]
+    pub decode_cache: ferrum_types::TokenizerDecodeCacheConfig,
     /// Tokenizer type
     pub tokenizer_type: TokenizerType,
     /// Path to tokenizer files

@@ -14,8 +14,9 @@ use std::path::{Path, PathBuf};
 
 // Bump these contracts when parsing/selection or tokenization semantics change.
 // Neither a build commit nor a machine identity is part of cache validity.
-const SELECTOR_CONTRACT: &str = "first-pair-reservoir-std-rng-shuffle-prefix-v1";
-const TOKENIZATION_CONTRACT: &str = "encode-no-special-tokens-no-truncation-no-padding-v1";
+pub(super) const SELECTOR_CONTRACT: &str = "first-pair-reservoir-std-rng-shuffle-prefix-v1";
+pub(super) const TOKENIZATION_CONTRACT: &str =
+    "encode-no-special-tokens-no-truncation-no-padding-v1";
 const CACHE_SCHEMA: u32 = 1;
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]

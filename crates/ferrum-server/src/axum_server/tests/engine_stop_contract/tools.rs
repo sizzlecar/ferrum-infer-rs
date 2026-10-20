@@ -49,7 +49,7 @@ async fn generate_with_choice(stream: bool, choice: Value) -> ToolObservation {
     script.extend(tokenizer.encode("unwanted continuation", false).unwrap());
     script.push(tokenizer.token_id(ORDINARY_EOS).unwrap());
     let max_tokens = script.len() + 4;
-    let executor = Arc::new(ScriptedExecutor::new(tokenizer.vocab_size(), script));
+    let executor = ScriptedExecutor::new(tokenizer.vocab_size(), script);
     // Both tools are declared, so the negative case isolates the named selector.
     let tools = json!([tool("weather"), tool("calendar")]);
     let mut wire = json!({

@@ -1,7 +1,7 @@
 //! `LlamaFamilyModel<MetalBackend>` correctness with fp16 weight storage.
 //!
 //! Uses the real `NativeSafetensorsLoader` so weights flow through
-//! `Backend::from_weight_bytes`. With `FERRUM_METAL_DTYPE=f16` big tensors
+//! `Backend::from_weight_bytes_in_context`. With typed F16 weight policy, big tensors
 //! (embed table, linear projections, lm_head) materialise as half-precision;
 //! tiny tensors (norm weights) stay f32 via the size threshold.
 //!
@@ -79,10 +79,8 @@ fn max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
 #[test]
 #[ignore]
 fn qwen3model_cpu_vs_metal_f16() {
-    // Force the fp16 weight path. `prefer_f16_weights()` caches on first
-    // read, so setting this before any Metal buffer is allocated binds
-    // the policy for the whole run.
-    std::env::set_var("FERRUM_METAL_DTYPE", "f16");
+    let mut backend_context = ferrum_types::BackendContextConfig::default();
+    backend_context.metal.prefer_f16_weights = true;
 
     let mp = qwen3_path().expect("Qwen3-0.6B not in HF cache");
     let def = load_model_def(&mp);
@@ -97,13 +95,16 @@ fn qwen3model_cpu_vs_metal_f16() {
     //   big  (≥ 1 M elems) promotes to F16 for memory savings
     {
         use ferrum_kernels::backend::{Backend, SrcDtype};
-        let small = MetalBackend::from_weight_bytes(&[0u8; 8], SrcDtype::BF16);
+        let mut context = MetalBackend::new_context(&backend_context).unwrap();
+        let small =
+            MetalBackend::from_weight_bytes_in_context(&mut context, &[0u8; 8], SrcDtype::BF16);
         assert!(
             !small.is_f16(),
             "tiny probe should stay F32 (under threshold)"
         );
         let big_bytes = vec![0u8; 2 * 1_048_576 * 2]; // 2 M bf16 elements
-        let big = MetalBackend::from_weight_bytes(&big_bytes, SrcDtype::BF16);
+        let big =
+            MetalBackend::from_weight_bytes_in_context(&mut context, &big_bytes, SrcDtype::BF16);
         assert!(big.is_f16(), "big probe should promote to F16");
         eprintln!(
             "✔ MetalBackend dtype dispatch: tiny→F32, big→F16 (big.is_f16={})",
@@ -112,7 +113,15 @@ fn qwen3model_cpu_vs_metal_f16() {
     }
 
     let mtl_loader = NativeSafetensorsLoader::<MetalBackend>::open(&mp).unwrap();
-    let mut mtl_model = LlamaFamilyModel::<MetalBackend>::new(qcfg, &mtl_loader).unwrap();
+    let mut mtl_model = LlamaFamilyModel::<MetalBackend>::new_with_execution_config(
+        qcfg,
+        &mtl_loader,
+        ferrum_types::LlamaExecutionConfig {
+            backend_context,
+            ..Default::default()
+        },
+    )
+    .unwrap();
     drop(mtl_loader);
 
     let prompt: Vec<u32> = vec![872, 111, 248, 104715, 0, 56568, 53481, 5048];

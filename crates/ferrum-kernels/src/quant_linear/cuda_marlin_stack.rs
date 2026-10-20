@@ -94,7 +94,7 @@ impl MarlinExpertStack<CudaBackend> for CudaMarlinExpertStack {
         };
         #[cfg(not(feature = "triton-kernels"))]
         let mw: &crate::marlin::MarlinWeight = self.store.as_ref();
-        let stream = ctx.stream.clone();
+        let stream = ctx.stream().clone();
         let raw_stream = stream.cu_stream();
         let (ws_ptr, _g) = mw.workspace.device_ptr(&stream);
         let ws_len = mw.workspace.len();
@@ -197,6 +197,26 @@ impl MarlinExpertStack<CudaBackend> for CudaMarlinExpertStack {
         // Marlin tile; its `forward` does the per-expert offset
         // GEMM via crate::backend::cuda::marlin_gemm_with_perm.
         let bias = bias_host.map(<CudaBackend as crate::backend::Backend>::from_slice);
+        Ok(Box::new(
+            crate::quant_linear::cuda_marlin::CudaMarlinStackedExpertLinear {
+                store: self.store.clone(),
+                expert_offset,
+                expert_n,
+                k: self.k,
+                bias,
+            },
+        ))
+    }
+    fn make_expert_linear_in_context(
+        self: Arc<Self>,
+        ctx: &mut <CudaBackend as crate::backend::Backend>::Context,
+        expert_offset: usize,
+        expert_n: usize,
+        bias_host: Option<&[f32]>,
+    ) -> Result<Box<dyn Linear<CudaBackend> + Send + Sync>> {
+        let bias = bias_host.map(|values| {
+            <CudaBackend as crate::backend::Backend>::from_slice_in_context(ctx, values)
+        });
         Ok(Box::new(
             crate::quant_linear::cuda_marlin::CudaMarlinStackedExpertLinear {
                 store: self.store.clone(),

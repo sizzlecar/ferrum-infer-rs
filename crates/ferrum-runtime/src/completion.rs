@@ -27,7 +27,9 @@ use super::{
 
 mod terminal_readback;
 pub(crate) use terminal_readback::TerminalReadbackPrepareError;
+mod extra_readback;
 mod readback_collection;
+pub use extra_readback::*;
 pub use readback_collection::*;
 mod readback_selection;
 pub use readback_selection::*;

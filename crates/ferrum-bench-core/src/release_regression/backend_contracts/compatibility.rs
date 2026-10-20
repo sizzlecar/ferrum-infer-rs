@@ -97,6 +97,21 @@ pub(super) fn groups(backend: Backend) -> Vec<ContractGroup> {
             name: format!("{module}::{name}"),
         })
         .collect();
+    if backend == Backend::Cuda {
+        tests.extend([
+            "override_retirement_tests::native_classic_dense_tile_retirement_preserves_cpu_reference",
+            "override_retirement_tests::native_classic_fused_tile_retirement_preserves_cpu_reference",
+            "override_retirement_tests::native_moe_f16_override_retirement_preserves_cpu_reference",
+            "override_retirement_tests::native_moe_fp8_override_retirement_preserves_cpu_reference",
+            "override_retirement_tests::native_moe_mxfp4_override_retirement_preserves_source_reference",
+            "profile_retirement_tests::native_moe_profile_retirement_ignores_environment_after_real_math",
+        ].into_iter().map(|test| ContractTest {
+            package: "ferrum-kernels".into(),
+            target: "ferrum_kernels".into(),
+            kind: "lib".into(),
+            name: format!("backend::cuda::marlin::{test}"),
+        }));
+    }
     tests.push(ContractTest {
         package: "ferrum-testkit".into(),
         target: "op_diff".into(),

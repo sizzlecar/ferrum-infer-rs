@@ -94,6 +94,19 @@ async fn main() {
     };
 
     if let Err(e) = command_future(cli.command, config).await {
+        if let Some(cleanup) = e.cleanup() {
+            // This timeout bounds CLI observation only. The original service
+            // retains its owner independently; unknown work is never released
+            // or reported as retired because this wait ended.
+            match tokio::time::timeout(std::time::Duration::from_secs(30), cleanup.wait()).await {
+                Ok(report) => {
+                    tracing::error!(phase = ?report.phase(), "failed construction resource retirement")
+                }
+                Err(_) => tracing::error!(
+                    "failed construction retirement still pending; original custody retained"
+                ),
+            }
+        }
         eprintln!("{} {}", "Error:".red().bold(), e);
         process::exit(1);
     }
@@ -105,24 +118,42 @@ async fn main() {
 fn command_future(
     command: Commands,
     config: CliConfig,
-) -> Pin<Box<dyn Future<Output = ferrum_types::Result<()>>>> {
+) -> Pin<Box<dyn Future<Output = ferrum_execution::ExecutorBuildResult<()>>>> {
     match command {
         Commands::Run(cmd) => Box::pin(run::execute(cmd, config)),
-        Commands::Bench(cmd) => Box::pin(bench::execute(cmd, config)),
-        Commands::BenchServe(cmd) => Box::pin(bench_serve::execute(cmd, config)),
-        Commands::ReplayBundle(cmd) => Box::pin(replay_bundle::execute(cmd, config)),
-        Commands::VnextDeterminism(cmd) => Box::pin(vnext_determinism::execute(cmd)),
+        Commands::Bench(cmd) => {
+            Box::pin(async move { bench::execute(cmd, config).await.map_err(Into::into) })
+        }
+        Commands::BenchServe(cmd) => {
+            Box::pin(async move { bench_serve::execute(cmd, config).await.map_err(Into::into) })
+        }
+        Commands::ReplayBundle(cmd) => Box::pin(async move {
+            replay_bundle::execute(cmd, config)
+                .await
+                .map_err(Into::into)
+        }),
+        Commands::VnextDeterminism(cmd) => {
+            Box::pin(async move { vnext_determinism::execute(cmd).await.map_err(Into::into) })
+        }
         Commands::Serve(cmd) => Box::pin(async move {
             let compatibility =
                 ferrum_cli::config::load_interleaved_system_coalescing("ferrum.toml").await;
             match compatibility {
                 Ok(configured) => serve::execute_cli(cmd, config, configured).await,
-                Err(error) => Err(error),
+                Err(error) => Err(error.into()),
             }
         }),
-        Commands::Stop(cmd) => Box::pin(stop::execute(cmd)),
-        Commands::Pull(cmd) => Box::pin(pull::execute(cmd, config)),
-        Commands::List(cmd) => Box::pin(list::execute(cmd, config)),
-        Commands::Doctor(cmd) => Box::pin(doctor::execute(cmd, config)),
+        Commands::Stop(cmd) => {
+            Box::pin(async move { stop::execute(cmd).await.map_err(Into::into) })
+        }
+        Commands::Pull(cmd) => {
+            Box::pin(async move { pull::execute(cmd, config).await.map_err(Into::into) })
+        }
+        Commands::List(cmd) => {
+            Box::pin(async move { list::execute(cmd, config).await.map_err(Into::into) })
+        }
+        Commands::Doctor(cmd) => {
+            Box::pin(async move { doctor::execute(cmd, config).await.map_err(Into::into) })
+        }
     }
 }

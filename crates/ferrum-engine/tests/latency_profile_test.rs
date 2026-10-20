@@ -4,11 +4,10 @@
 //! Uses mock components with configurable latency to simulate realistic timing.
 
 use ferrum_engine::{ContinuousBatchEngine, LlmInferenceEngine};
+use ferrum_output::InferenceOutput;
 use ferrum_scheduler::implementations::ContinuousBatchScheduler;
-use ferrum_testkit::{
-    MockKvCacheManager, MockModelExecutor, MockSampler, MockTensorFactory, MockTokenizer,
-};
-use ferrum_types::{InferenceRequest, InferenceResponse, SchedulerConfig};
+use ferrum_testkit::{MockModelExecutor, MockSampler, MockTokenizer};
+use ferrum_types::{InferenceRequest, SchedulerConfig};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -19,22 +18,18 @@ fn make_engine_with_latency(prefill_ms: u64, decode_ms: u64) -> ContinuousBatchE
     let scheduler = Arc::new(ContinuousBatchScheduler::new(SchedulerConfig::default()));
     let tokenizer = Arc::new(MockTokenizer::new(VOCAB_SIZE));
     let sampler = Arc::new(MockSampler);
-    let kv_cache = Arc::new(MockKvCacheManager::new(4096));
-    let executor = Arc::new(MockModelExecutor::new(
+    let executor = MockModelExecutor::new(
         VOCAB_SIZE,
         Duration::from_millis(prefill_ms),
         Duration::from_millis(decode_ms),
-    ));
-    let tensor_factory = Arc::new(MockTensorFactory);
+    );
 
     ContinuousBatchEngine::new(
         config,
         scheduler,
         tokenizer,
         sampler,
-        kv_cache,
-        executor,
-        tensor_factory,
+        ferrum_execution::executor_lifecycle::ExecutorOwner::new(Box::new(executor)),
     )
     .expect("legacy engine composition must match executor authority")
 }
@@ -108,7 +103,7 @@ async fn latency_profile_sequential() {
 
         // TTFT ≈ prefill time (first token from prefill)
         // TPOT ≈ (total - prefill) / (output_tokens - 1)
-        let output_tokens = resp.tokens.len();
+        let output_tokens = resp.response().tokens.len();
         if output_tokens > 1 {
             // Approximate TTFT as prefill + 1 decode
             let estimated_ttft = total_ms / output_tokens as f64;
@@ -160,14 +155,14 @@ async fn latency_profile_concurrent() {
             }));
         }
 
-        let results: Vec<(InferenceResponse, f64)> = futures::future::join_all(handles)
+        let results: Vec<(InferenceOutput, f64)> = futures::future::join_all(handles)
             .await
             .into_iter()
             .map(|r| r.unwrap())
             .collect();
 
         let wall_time = start.elapsed();
-        let total_tokens: usize = results.iter().map(|(r, _)| r.tokens.len()).sum();
+        let total_tokens: usize = results.iter().map(|(r, _)| r.response().tokens.len()).sum();
         let throughput = total_tokens as f64 / wall_time.as_secs_f64();
         let latencies: Vec<f64> = results.iter().map(|(_, ms)| *ms).collect();
         let lat_stats = LatencyStats::from_ms(latencies);
@@ -197,17 +192,14 @@ async fn throughput_scaling() {
         let scheduler = Arc::new(ContinuousBatchScheduler::new(SchedulerConfig::default()));
         let tokenizer = Arc::new(MockTokenizer::new(VOCAB_SIZE));
         let sampler = Arc::new(MockSampler);
-        let kv_cache = Arc::new(MockKvCacheManager::new(4096));
-        let executor = Arc::new(MockModelExecutor::instant(VOCAB_SIZE));
-        let tensor_factory = Arc::new(MockTensorFactory);
+        let executor = MockModelExecutor::instant(VOCAB_SIZE);
+
         ContinuousBatchEngine::new(
             config,
             scheduler,
             tokenizer,
             sampler,
-            kv_cache,
-            executor,
-            tensor_factory,
+            ferrum_execution::executor_lifecycle::ExecutorOwner::new(Box::new(executor)),
         )
         .expect("legacy engine composition must match executor authority")
     });
@@ -222,14 +214,14 @@ async fn throughput_scaling() {
         }));
     }
 
-    let results: Vec<InferenceResponse> = futures::future::join_all(handles)
+    let results: Vec<InferenceOutput> = futures::future::join_all(handles)
         .await
         .into_iter()
         .map(|r| r.unwrap())
         .collect();
 
     let wall_time = start.elapsed();
-    let total_tokens: usize = results.iter().map(|r| r.tokens.len()).sum();
+    let total_tokens: usize = results.iter().map(|r| r.response().tokens.len()).sum();
     let throughput = total_tokens as f64 / wall_time.as_secs_f64();
     let rps = num_requests as f64 / wall_time.as_secs_f64();
 

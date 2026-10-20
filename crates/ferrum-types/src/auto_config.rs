@@ -5,7 +5,7 @@
 
 use crate::{
     is_sha256_digest, parse_bool_env_value, parse_usize_env_value, AttentionExecutionPolicy,
-    CompiledNativeOperatorIdentity, ExecutionResourceAuthority, RuntimeConfigEffect,
+    CompiledNativeOperatorIdentity, ExecutionPlanningModel, RuntimeConfigEffect,
     RuntimeConfigEntry, RuntimeConfigSnapshot, RuntimeConfigSource,
     CUDA_NATIVE_ADAPTIVE_V1_MAX_SEQUENCE_TOKENS,
 };
@@ -325,12 +325,38 @@ pub enum WorkloadPriority {
     Balanced,
 }
 
+/// Cold selection of the KV allocation layout used by the retained model.
+/// This is supplied by the model/backend selector, never inferred from the
+/// planning-model tag. Unknown does not authorize a block-to-token limit.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SelectedKvCacheLayout {
+    #[default]
+    Unknown,
+    Contiguous,
+    Paged {
+        block_size_tokens: usize,
+    },
+}
+
+impl SelectedKvCacheLayout {
+    fn block_size_tokens(self) -> Option<usize> {
+        match self {
+            Self::Paged { block_size_tokens } => Some(block_size_tokens),
+            Self::Unknown | Self::Contiguous => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResolvedFerrumConfig {
     pub schema_version: u32,
     pub preset: Option<String>,
+    // Retain the historical observation field for stored configs/reports.
+    #[serde(default, rename = "execution_resource_authority")]
+    pub execution_planning_model: ExecutionPlanningModel,
     #[serde(default)]
-    pub execution_resource_authority: ExecutionResourceAuthority,
+    pub selected_kv_cache_layout: SelectedKvCacheLayout,
     #[serde(default)]
     pub requested_attention_policy: Option<AttentionExecutionPolicy>,
     #[serde(default)]
@@ -482,12 +508,8 @@ impl ResolvedFerrumConfig {
         let selected_max_model_len = self.selected_usize("max_model_len");
         let selected_kv_capacity = self.runtime_usize("FERRUM_KV_CAPACITY");
         let selected_max_batched_tokens = self.selected_usize("max_batched_tokens");
-        let selected_recurrent_state_max_slots = self.selected_recurrent_state_max_slots();
-        let selected_admission_limit = effective_admission_limit(
-            self.execution_resource_authority,
-            selected_max_sequences,
-            selected_recurrent_state_max_slots,
-        );
+        // This is the declared protocol ceiling, not a model-state capacity estimate.
+        let selected_admission_limit = selected_max_sequences;
         let selected_attention_policy = self.selected_string("attention_execution_policy");
         let selected_attention_impl = self.selected_string("attention_decode_backend");
         serde_json::json!({
@@ -495,7 +517,7 @@ impl ResolvedFerrumConfig {
             "preset": self.preset,
             "env_hash": self.runtime_env_hash(),
             "backend": backend.clone(),
-            "execution_resource_authority": self.execution_resource_authority,
+            "execution_resource_authority": self.execution_planning_model,
             "startup_memory_plan": self.startup_memory_plan,
             "requested_gpu_devices": requested_gpu_devices.clone(),
             "selected_gpu_devices": selected_gpu_devices.clone(),
@@ -507,7 +529,11 @@ impl ResolvedFerrumConfig {
             "selected_microbatch_size": selected_microbatch_size,
             "selected_stage_bridge": selected_stage_bridge,
             "selected_weight_placement": if selected_layer_split_plan.is_some() { "layer_split" } else { "single_device" },
-            "selected_kv_layout": if backend.eq_ignore_ascii_case("cpu") { "contiguous" } else { "paged" },
+            "selected_kv_layout": match self.selected_kv_cache_layout {
+                SelectedKvCacheLayout::Unknown => "unknown",
+                SelectedKvCacheLayout::Contiguous => "contiguous",
+                SelectedKvCacheLayout::Paged { .. } => "paged",
+            },
             "selected_attention_impl": selected_attention_impl,
             "selected_attention_policy": selected_attention_policy,
             "attention_execution": self.attention_execution_document(),
@@ -517,7 +543,6 @@ impl ResolvedFerrumConfig {
             "selected_kv_capacity": selected_kv_capacity,
             "selected_kv_capacity_source": "configured_token_limit",
             "selected_max_batched_tokens": selected_max_batched_tokens,
-            "selected_recurrent_state_max_slots": selected_recurrent_state_max_slots,
             "selected_admission_limit": selected_admission_limit,
             "entries": self.runtime_config.entries,
             "model_capabilities": self.model_capabilities,
@@ -530,20 +555,17 @@ impl ResolvedFerrumConfig {
 
     pub fn admission_summary_document(&self) -> serde_json::Value {
         let max_sequences = self.selected_usize("max_sequences");
-        let recurrent_state_max_slots = self.selected_recurrent_state_max_slots();
-        let effective_max_concurrent = effective_admission_limit(
-            self.execution_resource_authority,
-            max_sequences,
-            recurrent_state_max_slots,
-        );
+        let effective_max_concurrent = max_sequences;
         let kv_blocks = self.selected_usize("kv_block_count");
         let max_batched_tokens = self.selected_usize("max_batched_tokens");
         let max_model_len = self.selected_usize("max_model_len");
-        let kv_capacity_tokens =
-            kv_blocks.map(|blocks| blocks.saturating_mul(DEFAULT_KV_BLOCK_SIZE_TOKENS));
+        let block_size = self.selected_kv_cache_layout.block_size_tokens();
+        // Preserve the explicitly labelled geometry estimate for old reports;
+        // applicability is true only when the actual selector supplied Paged.
+        let kv_capacity_tokens = kv_blocks.map(|blocks| {
+            blocks.saturating_mul(block_size.unwrap_or(DEFAULT_KV_BLOCK_SIZE_TOKENS))
+        });
         let kv_bytes_per_token = kv_cache_bytes_per_token_for_model(&self.model_capabilities);
-        let recurrent_budget =
-            recurrent_state_budget_for(&self.model_capabilities, &self.hardware_capabilities);
         let scheduler_policy = self
             .selected_string("scheduler_admission_policy")
             .unwrap_or_else(|| "unknown".to_string());
@@ -551,20 +573,11 @@ impl ResolvedFerrumConfig {
             "source": "legacy_f16_geometry_estimate",
             "applies_to_selected_state_layout": false,
             "is_resident_usage": false,
-            "selected_state_evidence_source": if self.execution_resource_authority == ExecutionResourceAuthority::PlanRuntime { "executor.kv_storage.logical_sequence_state" } else { "legacy_runtime" },
+            "selected_state_evidence_source": if self.execution_planning_model == ExecutionPlanningModel::CompiledPlan { "executor.kv_storage.logical_sequence_state" } else { "legacy_runtime" },
             "vram_bytes": self.hardware_capabilities.vram_bytes,
             "estimated_weight_bytes": self.model_capabilities.estimated_weight_bytes,
             "kv_bytes_per_token": kv_bytes_per_token,
             "recurrent_state_bytes_per_sequence": self.model_capabilities.recurrent_state_bytes_per_sequence,
-            "recurrent_state_budget_bytes": recurrent_budget.map(|budget| budget.remaining_bytes),
-            "recurrent_state_budget_raw_slots": recurrent_budget.map(|budget| budget.raw_slots),
-            "recurrent_state_budget_max_slots": recurrent_budget.map(|budget| budget.floored_slots),
-            "recurrent_state_capacity_bytes": match (recurrent_state_max_slots, self.model_capabilities.recurrent_state_bytes_per_sequence) {
-                (Some(slots), Some(bytes_per_sequence)) => {
-                    (slots as u64).checked_mul(bytes_per_sequence)
-                }
-                _ => None,
-            },
             "kv_capacity_bytes": match (kv_capacity_tokens, kv_bytes_per_token) {
                 (Some(tokens), Some(bytes_per_token)) => {
                     (tokens as u64).checked_mul(bytes_per_token)
@@ -576,7 +589,7 @@ impl ResolvedFerrumConfig {
             "schema_version": 1,
             "backend": self.hardware_capabilities.backend,
             "model_architecture": self.model_capabilities.architecture,
-            "resource_authority": self.execution_resource_authority,
+            "resource_authority": self.execution_planning_model,
             "source": "startup_preflight",
             "scheduler_policy": scheduler_policy,
             "effective_max_concurrent": effective_max_concurrent,
@@ -590,18 +603,12 @@ impl ResolvedFerrumConfig {
             "failed_requests_total": 0u64,
             "completed_requests_total": 0u64,
             "max_sequences": max_sequences,
-            "recurrent_state_max_slots": if self.execution_resource_authority == ExecutionResourceAuthority::LegacyEngine {
-                recurrent_state_max_slots
-            } else {
-                None
-            },
-            "legacy_recurrent_state_max_slots_estimate": recurrent_state_max_slots,
-            "legacy_recurrent_state_limit_applies": self.execution_resource_authority == ExecutionResourceAuthority::LegacyEngine,
             "kv_capacity_source": "legacy_block_preflight_estimate",
-            "kv_capacity_applies_to_selected_state_layout": self.execution_resource_authority == ExecutionResourceAuthority::LegacyEngine,
+            "selected_kv_cache_layout": self.selected_kv_cache_layout,
+            "kv_capacity_applies_to_selected_state_layout": block_size.is_some(),
             "kv_capacity_is_resident_usage": false,
             "kv_block_count": kv_blocks,
-            "kv_block_size_tokens": DEFAULT_KV_BLOCK_SIZE_TOKENS,
+            "kv_block_size_tokens": block_size.unwrap_or(DEFAULT_KV_BLOCK_SIZE_TOKENS),
             "kv_capacity_tokens": kv_capacity_tokens,
             "max_model_length": max_model_len,
             "max_batched_tokens": max_batched_tokens,
@@ -637,11 +644,6 @@ impl ResolvedFerrumConfig {
             .map(|decision| decision.selected.clone())
     }
 
-    fn selected_recurrent_state_max_slots(&self) -> Option<usize> {
-        self.selected_usize("recurrent_state_max_slots")
-            .or_else(|| self.runtime_usize("FERRUM_RECURRENT_STATE_MAX_SLOTS"))
-    }
-
     fn selected_graph_mode(&self) -> Option<String> {
         self.selected_string("decode_graph_policy")
     }
@@ -653,10 +655,10 @@ impl ResolvedFerrumConfig {
         let requested_policy = self
             .requested_attention_policy
             .map(AttentionExecutionPolicy::as_runtime_value);
-        if self.execution_resource_authority != ExecutionResourceAuthority::PlanRuntime {
+        if self.execution_planning_model != ExecutionPlanningModel::CompiledPlan {
             return serde_json::json!({
                 "schema_version": 1,
-                "resource_authority": self.execution_resource_authority,
+                "resource_authority": self.execution_planning_model,
                 "requested_policy": null,
                 "compiled_policy": null,
                 "selection_scope": "legacy_runtime",
@@ -668,7 +670,7 @@ impl ResolvedFerrumConfig {
             compiled_policy == Some(AttentionExecutionPolicy::NativeAdaptive.as_runtime_value());
         serde_json::json!({
             "schema_version": 1,
-            "resource_authority": self.execution_resource_authority,
+            "resource_authority": self.execution_planning_model,
             "requested_policy": requested_policy,
             "compiled_policy": compiled_policy,
             "selection_scope": "per_invocation",
@@ -770,7 +772,8 @@ pub struct FerrumConfigBuilder {
     model: ModelCapabilities,
     hardware: HardwareCapabilities,
     workload: WorkloadProfile,
-    execution_resource_authority: ExecutionResourceAuthority,
+    execution_planning_model: ExecutionPlanningModel,
+    selected_kv_cache_layout: SelectedKvCacheLayout,
 }
 
 impl FerrumConfigBuilder {
@@ -780,7 +783,8 @@ impl FerrumConfigBuilder {
             model: ModelCapabilities::unknown(),
             hardware: HardwareCapabilities::unknown(),
             workload: WorkloadProfile::default(),
-            execution_resource_authority: ExecutionResourceAuthority::LegacyEngine,
+            execution_planning_model: ExecutionPlanningModel::ExecutorManaged,
+            selected_kv_cache_layout: SelectedKvCacheLayout::Unknown,
         }
     }
 
@@ -808,11 +812,15 @@ impl FerrumConfigBuilder {
         self
     }
 
-    pub fn with_execution_resource_authority(
-        mut self,
-        authority: ExecutionResourceAuthority,
-    ) -> Self {
-        self.execution_resource_authority = authority;
+    pub fn with_execution_planning_model(mut self, authority: ExecutionPlanningModel) -> Self {
+        self.execution_planning_model = authority;
+        self
+    }
+
+    /// The caller must use the same cold selector as its actual model allocator.
+    /// Compiled-runtime layouts are admitted by their plan and remain Unknown here.
+    pub fn with_selected_kv_cache_layout(mut self, layout: SelectedKvCacheLayout) -> Self {
+        self.selected_kv_cache_layout = layout;
         self
     }
 
@@ -820,10 +828,23 @@ impl FerrumConfigBuilder {
         if let Err((key, reason)) = self.runtime_config.validate_retired_options() {
             return self.invalid(key, reason);
         }
+        if self.selected_kv_cache_layout.block_size_tokens() == Some(0) {
+            return self.invalid(
+                "selected_kv_cache_layout",
+                "paged block size must be positive",
+            );
+        }
+        if self.execution_planning_model == ExecutionPlanningModel::CompiledPlan
+            && self.selected_kv_cache_layout != SelectedKvCacheLayout::Unknown
+        {
+            return self.invalid(
+                "selected_kv_cache_layout",
+                "compiled runtime capacity belongs to its actual plan",
+            );
+        }
         let mut decisions = Vec::new();
         let cuda_backend = self.is_cuda_backend();
-        let plan_runtime =
-            self.execution_resource_authority == ExecutionResourceAuthority::PlanRuntime;
+        let plan_runtime = self.execution_planning_model == ExecutionPlanningModel::CompiledPlan;
         if plan_runtime {
             for key in [
                 "FERRUM_USE_VLLM_PAGED_ATTN",
@@ -833,7 +854,7 @@ impl FerrumConfigBuilder {
                     return Err(AutoConfigError::InvalidOverride {
                         key: key.to_owned(),
                         reason: format!(
-                            "legacy attention control does not apply to PlanRuntime; use FERRUM_ATTENTION_POLICY=auto|portable|native-adaptive"
+                            "legacy attention control does not apply to CompiledPlan; use FERRUM_ATTENTION_POLICY=auto|portable|native-adaptive"
                         ),
                     });
                 }
@@ -954,29 +975,6 @@ impl FerrumConfigBuilder {
                 max_sequences.value = max_sequences.value.min(batch.value.max(1));
             }
         }
-        if plan_runtime && self.entry("FERRUM_RECURRENT_STATE_MAX_SLOTS").is_some() {
-            return self.invalid(
-                "FERRUM_RECURRENT_STATE_MAX_SLOTS",
-                "legacy engine recurrent-state slots do not control the plan runtime; use max sequences as the protocol ceiling and let dynamic resource admission defer on live capacity",
-            );
-        }
-        let default_recurrent_state_max_slots = (!plan_runtime)
-            .then(|| self.default_recurrent_state_max_slots(&max_sequences))
-            .flatten();
-        let recurrent_state_max_slots = if default_recurrent_state_max_slots.is_some()
-            || self.entry("FERRUM_RECURRENT_STATE_MAX_SLOTS").is_some()
-        {
-            let default = default_recurrent_state_max_slots
-                .as_ref()
-                .unwrap_or(&max_sequences);
-            Some(self.usize_value(
-                "FERRUM_RECURRENT_STATE_MAX_SLOTS",
-                default.value,
-                default.source,
-            )?)
-        } else {
-            None
-        };
         let default_kv_blocks = self.default_kv_blocks(&max_sequences);
         let kv_blocks = self.usize_value(
             "FERRUM_KV_MAX_BLOCKS",
@@ -1034,7 +1032,6 @@ impl FerrumConfigBuilder {
         self.validate_memory(
             kv_blocks.value,
             max_sequences.value,
-            recurrent_state_max_slots.as_ref().map(|slots| slots.value),
             max_batched_tokens.value,
             max_model_len.as_ref().map(|value| value.value),
         )?;
@@ -1173,15 +1170,6 @@ impl FerrumConfigBuilder {
                 );
             }
         }
-        if let Some(slots) = recurrent_state_max_slots.as_ref() {
-            if self.entry("FERRUM_RECURRENT_STATE_MAX_SLOTS").is_none() {
-                runtime_config.upsert(
-                    "FERRUM_RECURRENT_STATE_MAX_SLOTS",
-                    slots.value.to_string(),
-                    RuntimeConfigSource::MemoryProfile,
-                );
-            }
-        }
         decisions.push(self.moe_decision(vllm_moe));
         decisions.push(self.reusable_execution_decision(reusable_execution));
         decisions.push(self.decode_graph_decision(
@@ -1200,13 +1188,6 @@ impl FerrumConfigBuilder {
             max_sequences,
             RuntimeConfigEffect::Memory,
         ));
-        if let Some(slots) = recurrent_state_max_slots {
-            decisions.push(self.scalar_decision(
-                "recurrent_state_max_slots",
-                slots,
-                RuntimeConfigEffect::Memory,
-            ));
-        }
         decisions.push(self.scalar_decision(
             "max_batched_tokens",
             max_batched_tokens,
@@ -1260,7 +1241,8 @@ impl FerrumConfigBuilder {
         Ok(ResolvedFerrumConfig {
             schema_version: 1,
             preset: self.workload.preset.clone(),
-            execution_resource_authority: self.execution_resource_authority,
+            execution_planning_model: self.execution_planning_model,
+            selected_kv_cache_layout: self.selected_kv_cache_layout,
             requested_attention_policy: plan_attention
                 .as_ref()
                 .map(|(requested, _)| requested.value),
@@ -1343,10 +1325,10 @@ impl FerrumConfigBuilder {
         max_sequences: &ResolvedValue<usize>,
         kv_blocks: &ResolvedValue<usize>,
     ) -> ResolvedValue<usize> {
-        let kv_token_capacity = kv_blocks
-            .value
-            .saturating_mul(DEFAULT_KV_BLOCK_SIZE_TOKENS)
-            .max(max_sequences.value.max(1));
+        let kv_token_capacity = self
+            .selected_kv_cache_layout
+            .block_size_tokens()
+            .map(|block_size| kv_blocks.value.saturating_mul(block_size));
         let target = if self
             .workload
             .is_preset(QWEN25_72B_GPTQ_INT4_2X4090_LAYER_SPLIT_PRESET)
@@ -1355,19 +1337,16 @@ impl FerrumConfigBuilder {
         } else {
             max_sequences.value.max(1).saturating_mul(64)
         };
-        // PlanRuntime admits exact typed states and workspace against its
-        // device budget. Legacy block estimates do not cap its token work.
-        let value = if self.execution_resource_authority == ExecutionResourceAuthority::PlanRuntime
-        {
-            target
-        } else {
-            target.min(kv_token_capacity)
-        }
-        .max(max_sequences.value.max(1));
+        // Only the selected paged allocator turns this block count into token
+        // capacity. Contiguous and unqualified layouts retain the workload target.
+        let value = kv_token_capacity
+            .map_or(target, |capacity| target.min(capacity))
+            .max(max_sequences.value.max(1));
         ResolvedValue {
             value,
             source: if max_sequences.source == AutoConfigSource::HardwareCapability
-                || kv_blocks.source == AutoConfigSource::HardwareCapability
+                || (kv_token_capacity.is_some()
+                    && kv_blocks.source == AutoConfigSource::HardwareCapability)
             {
                 AutoConfigSource::HardwareCapability
             } else {
@@ -1395,7 +1374,7 @@ impl FerrumConfigBuilder {
         &self,
         max_sequences: &ResolvedValue<usize>,
     ) -> Option<ResolvedValue<usize>> {
-        if self.execution_resource_authority != ExecutionResourceAuthority::PlanRuntime
+        if self.execution_planning_model != ExecutionPlanningModel::CompiledPlan
             || max_sequences.value <= 1
         {
             return None;
@@ -1454,32 +1433,6 @@ impl FerrumConfigBuilder {
             },
             source_key: None,
         }
-    }
-
-    fn default_recurrent_state_max_slots(
-        &self,
-        max_sequences: &ResolvedValue<usize>,
-    ) -> Option<ResolvedValue<usize>> {
-        let limit = self.recurrent_state_budget_max_slots()?;
-        let selected = max_sequences.value.min(limit.max(1));
-        Some(ResolvedValue {
-            value: selected.max(1),
-            source: if selected < max_sequences.value {
-                AutoConfigSource::MemoryProfile
-            } else {
-                max_sequences.source
-            },
-            source_key: None,
-        })
-    }
-
-    fn recurrent_state_budget_max_slots(&self) -> Option<usize> {
-        self.recurrent_state_budget()
-            .map(|budget| budget.floored_slots)
-    }
-
-    fn recurrent_state_budget(&self) -> Option<RecurrentStateBudget> {
-        recurrent_state_budget_for(&self.model, &self.hardware)
     }
 
     fn kv_cache_bytes_per_token(&self) -> Option<u64> {
@@ -1874,7 +1827,6 @@ impl FerrumConfigBuilder {
         &self,
         kv_blocks: usize,
         max_sequences: usize,
-        recurrent_state_max_slots: Option<usize>,
         max_batched_tokens: usize,
         requested_max_model_len: Option<usize>,
     ) -> Result<(), AutoConfigError> {
@@ -1884,40 +1836,17 @@ impl FerrumConfigBuilder {
         if max_sequences == 0 {
             return self.invalid("FERRUM_PAGED_MAX_SEQS", "must be greater than zero");
         }
-        if recurrent_state_max_slots == Some(0) {
-            return self.invalid(
-                "FERRUM_RECURRENT_STATE_MAX_SLOTS",
-                "must be greater than zero",
-            );
-        }
-        if self.execution_resource_authority == ExecutionResourceAuthority::LegacyEngine {
-            if let Some(limit) = self.recurrent_state_budget_max_slots() {
-                let recurrent_slots = recurrent_state_max_slots.unwrap_or(max_sequences);
-                if recurrent_slots > limit {
-                    let key = if self.entry("FERRUM_RECURRENT_STATE_MAX_SLOTS").is_some() {
-                        "FERRUM_RECURRENT_STATE_MAX_SLOTS"
-                    } else {
-                        "FERRUM_PAGED_MAX_SEQS"
-                    };
-                    return Err(AutoConfigError::InvalidOverride {
-                        key: key.to_string(),
-                        reason: format!(
-                            "recurrent-state slot pool exceeds the model/hardware memory budget: slots={recurrent_slots}, budget={limit}; use FERRUM_RECURRENT_STATE_MAX_SLOTS={limit}, lower --max-num-seqs, or a larger-memory GPU."
-                        ),
-                    });
-                }
-            }
-        }
         if max_batched_tokens < max_sequences {
             return self.invalid(
                 "FERRUM_MAX_BATCHED_TOKENS",
                 "must be at least FERRUM_PAGED_MAX_SEQS",
             );
         }
-        let kv_token_capacity = kv_blocks.saturating_mul(DEFAULT_KV_BLOCK_SIZE_TOKENS);
-        if self.execution_resource_authority == ExecutionResourceAuthority::LegacyEngine
-            && max_batched_tokens > kv_token_capacity
-        {
+        let kv_token_capacity = self
+            .selected_kv_cache_layout
+            .block_size_tokens()
+            .map(|block_size| kv_blocks.saturating_mul(block_size));
+        if kv_token_capacity.is_some_and(|capacity| max_batched_tokens > capacity) {
             return self.invalid(
                 "FERRUM_MAX_BATCHED_TOKENS",
                 "exceeds KV cache token capacity",
@@ -1935,9 +1864,7 @@ impl FerrumConfigBuilder {
                     );
                 }
             }
-            if self.execution_resource_authority == ExecutionResourceAuthority::LegacyEngine
-                && max_model_len > kv_token_capacity
-            {
+            if kv_token_capacity.is_some_and(|capacity| max_model_len > capacity) {
                 return self.invalid(
                     "FERRUM_KV_MAX_BLOCKS",
                     "KV cache token capacity is smaller than FERRUM_MAX_MODEL_LEN",
@@ -2504,7 +2431,7 @@ impl FerrumConfigBuilder {
                 })?
                 .unwrap_or_default();
             if !self.is_cuda_backend()
-                || self.execution_resource_authority != ExecutionResourceAuthority::PlanRuntime
+                || self.execution_planning_model != ExecutionPlanningModel::CompiledPlan
                 || owner_mode != crate::SegmentBindingOwnerViewMode::Indexed
                 || upload != crate::ProgramBindingUploadStrategy::CompactScatter
             {
@@ -2584,7 +2511,7 @@ impl FerrumConfigBuilder {
             ),
         };
         if mode == crate::SamplingReadbackMode::Participant
-            && self.execution_resource_authority != ExecutionResourceAuthority::PlanRuntime
+            && self.execution_planning_model != ExecutionPlanningModel::CompiledPlan
         {
             return Err(AutoConfigError::InvalidOverride {
                 key: key.to_owned(),
@@ -2628,7 +2555,7 @@ impl FerrumConfigBuilder {
         };
         if strategy != crate::ProgramBindingUploadStrategy::Sparse
             && (!self.is_cuda_backend()
-                || self.execution_resource_authority != ExecutionResourceAuthority::PlanRuntime)
+                || self.execution_planning_model != ExecutionPlanningModel::CompiledPlan)
         {
             return Err(AutoConfigError::InvalidOverride {
                 key: key.to_owned(),
@@ -2685,7 +2612,7 @@ impl FerrumConfigBuilder {
                 })?
                 .unwrap_or_default();
             if !self.is_cuda_backend()
-                || self.execution_resource_authority != ExecutionResourceAuthority::PlanRuntime
+                || self.execution_planning_model != ExecutionPlanningModel::CompiledPlan
                 || !preparation.uses_decode_segment()
             {
                 return Err(AutoConfigError::InvalidOverride {
@@ -2729,7 +2656,7 @@ impl FerrumConfigBuilder {
         };
         if mode == crate::CausalDecodePreparationMode::Packed
             && (!self.is_cuda_backend()
-                || self.execution_resource_authority != ExecutionResourceAuthority::PlanRuntime
+                || self.execution_planning_model != ExecutionPlanningModel::CompiledPlan
                 || !self.hardware.compiled_features.vllm_paged_attn
                 || compiled_attention != Some(AttentionExecutionPolicy::NativeAdaptive))
         {
@@ -2787,7 +2714,7 @@ impl FerrumConfigBuilder {
                 })?
                 .unwrap_or_default();
             if !self.is_cuda_backend()
-                || self.execution_resource_authority != ExecutionResourceAuthority::PlanRuntime
+                || self.execution_planning_model != ExecutionPlanningModel::CompiledPlan
                 || !self.hardware.compiled_features.vllm_paged_attn
                 || !self
                     .hardware
@@ -2848,7 +2775,7 @@ impl FerrumConfigBuilder {
                 .map_err(invalid)?
                 .unwrap_or_default();
             if !self.is_cuda_backend()
-                || self.execution_resource_authority != ExecutionResourceAuthority::PlanRuntime
+                || self.execution_planning_model != ExecutionPlanningModel::CompiledPlan
                 || preparation != crate::InvocationPreparationStrategy::ResidentDecodeProgram
             {
                 return Err(invalid(format!(
@@ -2942,7 +2869,7 @@ impl FerrumConfigBuilder {
             mode,
             crate::Q4MmvqWeightDecode::SharedM8 | crate::Q4MmvqWeightDecode::SharedM4M8
         ) && (!self.is_cuda_backend()
-            || self.execution_resource_authority != ExecutionResourceAuthority::PlanRuntime
+            || self.execution_planning_model != ExecutionPlanningModel::CompiledPlan
             || !self.hardware.compiled_features.cuda_q4_shared_weight_decode)
         {
             return Err(AutoConfigError::InvalidOverride {
@@ -2983,7 +2910,7 @@ impl FerrumConfigBuilder {
             mode,
             crate::Q5MmvqWeightDecode::SharedM8 | crate::Q5MmvqWeightDecode::SharedM4M8
         ) && (!self.is_cuda_backend()
-            || self.execution_resource_authority != ExecutionResourceAuthority::PlanRuntime
+            || self.execution_planning_model != ExecutionPlanningModel::CompiledPlan
             || !self.hardware.compiled_features.cuda_q5_shared_weight_decode)
         {
             return Err(AutoConfigError::InvalidOverride {
@@ -3026,7 +2953,7 @@ impl FerrumConfigBuilder {
         if mode == crate::Q8ProjectionWeightPreparation::PredecodedF32
             && (!self.is_cuda_backend()
                 || !self.hardware.compiled_features.cuda
-                || self.execution_resource_authority != ExecutionResourceAuthority::PlanRuntime)
+                || self.execution_planning_model != ExecutionPlanningModel::CompiledPlan)
         {
             return Err(AutoConfigError::InvalidOverride {
                 key: key.to_owned(),
@@ -3420,36 +3347,6 @@ struct ResolvedValue<T> {
     source_key: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct RecurrentStateBudget {
-    remaining_bytes: u64,
-    bytes_per_sequence: u64,
-    raw_slots: usize,
-    floored_slots: usize,
-}
-
-fn recurrent_state_budget_for(
-    model: &ModelCapabilities,
-    hardware: &HardwareCapabilities,
-) -> Option<RecurrentStateBudget> {
-    if !(hardware.backend.eq_ignore_ascii_case("cuda")
-        || hardware.backend.eq_ignore_ascii_case("metal"))
-    {
-        return None;
-    }
-    let bytes_per_sequence = model.recurrent_state_bytes_per_sequence?.max(1);
-    let vram_bytes = hardware.vram_bytes?;
-    let weight_bytes = model.estimated_weight_bytes?;
-    let remaining = vram_bytes.saturating_sub(weight_bytes);
-    let raw_slots = (remaining / bytes_per_sequence) as usize;
-    Some(RecurrentStateBudget {
-        remaining_bytes: remaining,
-        bytes_per_sequence,
-        raw_slots,
-        floored_slots: floor_power_of_two(raw_slots.max(1)),
-    })
-}
-
 fn parse_compute_capability(value: &str) -> Option<(u32, u32)> {
     let value = value.trim();
     if value.is_empty() {
@@ -3474,29 +3371,6 @@ fn default_gpu_devices_for_backend(backend: &str) -> Option<Vec<usize>> {
 
 fn ceil_div(value: usize, divisor: usize) -> usize {
     value.div_ceil(divisor)
-}
-
-fn effective_admission_limit(
-    authority: ExecutionResourceAuthority,
-    max_sequences: Option<usize>,
-    recurrent_state_max_slots: Option<usize>,
-) -> Option<usize> {
-    if authority == ExecutionResourceAuthority::PlanRuntime {
-        return max_sequences;
-    }
-    match (max_sequences, recurrent_state_max_slots) {
-        (Some(max_sequences), Some(recurrent_slots)) => Some(max_sequences.min(recurrent_slots)),
-        (Some(max_sequences), None) => Some(max_sequences),
-        (None, Some(recurrent_slots)) => Some(recurrent_slots),
-        (None, None) => None,
-    }
-}
-
-fn floor_power_of_two(value: usize) -> usize {
-    if value <= 1 {
-        return 1;
-    }
-    1usize << (usize::BITS - 1 - value.leading_zeros())
 }
 
 fn auto_config_source_from_runtime(source: RuntimeConfigSource) -> AutoConfigSource {
@@ -3537,6 +3411,9 @@ mod tests {
             .with_model_capabilities(ModelCapabilities::qwen3_30b_a3b_gptq_int4())
             .with_hardware_capabilities(HardwareCapabilities::rtx4090_cuda(features))
             .with_workload_profile(WorkloadProfile::m3_qwen3_30b_a3b_int4())
+            .with_selected_kv_cache_layout(SelectedKvCacheLayout::Paged {
+                block_size_tokens: 16,
+            })
     }
 
     fn m3_with_hardware(
@@ -3547,6 +3424,9 @@ mod tests {
             .with_model_capabilities(ModelCapabilities::qwen3_30b_a3b_gptq_int4())
             .with_hardware_capabilities(hardware)
             .with_workload_profile(WorkloadProfile::m3_qwen3_30b_a3b_int4())
+            .with_selected_kv_cache_layout(SelectedKvCacheLayout::Paged {
+                block_size_tokens: 16,
+            })
     }
 
     fn qwen35_moe_gptq_int4_model() -> ModelCapabilities {
@@ -3656,6 +3536,32 @@ mod tests {
     }
 
     #[test]
+    fn retired_native_overrides_are_rejected_for_every_executor() {
+        for key in [
+            "FERRUM_MARLIN_TILE",
+            "FERRUM_VLLM_MOE_THREAD_K",
+            "FERRUM_VLLM_MOE_THREAD_N",
+            "FERRUM_VLLM_MOE_BLOCKS_PER_SM",
+        ] {
+            for value in ["", "0", "-1", "128"] {
+                for authority in [
+                    ExecutionPlanningModel::ExecutorManaged,
+                    ExecutionPlanningModel::CompiledPlan,
+                ] {
+                    let error = FerrumConfigBuilder::new(snapshot(&[(key, value)]))
+                        .with_execution_planning_model(authority)
+                        .resolve()
+                        .expect_err("native overrides must not affect executor selection");
+                    assert!(matches!(error,
+                        AutoConfigError::InvalidOverride { key: actual, reason }
+                        if actual == key && reason.contains("retired")
+                    ));
+                }
+            }
+        }
+    }
+
+    #[test]
     fn retired_execution_controls_are_rejected_for_every_executor() {
         for key in [
             "FERRUM_WHOLE_PROMPT_PREFIX_CACHE",
@@ -3664,11 +3570,11 @@ mod tests {
         ] {
             for value in ["", "false", "0", "1"] {
                 for authority in [
-                    ExecutionResourceAuthority::LegacyEngine,
-                    ExecutionResourceAuthority::PlanRuntime,
+                    ExecutionPlanningModel::ExecutorManaged,
+                    ExecutionPlanningModel::CompiledPlan,
                 ] {
                     let error = FerrumConfigBuilder::new(snapshot(&[(key, value)]))
-                        .with_execution_resource_authority(authority)
+                        .with_execution_planning_model(authority)
                         .resolve()
                         .expect_err("retired controls must not select ordinary decoding");
                     assert!(matches!(error,
@@ -3705,11 +3611,11 @@ mod tests {
         ] {
             for value in ["0", "1"] {
                 for authority in [
-                    ExecutionResourceAuthority::LegacyEngine,
-                    ExecutionResourceAuthority::PlanRuntime,
+                    ExecutionPlanningModel::ExecutorManaged,
+                    ExecutionPlanningModel::CompiledPlan,
                 ] {
                     let error = FerrumConfigBuilder::new(snapshot(&[(key, value)]))
-                        .with_execution_resource_authority(authority)
+                        .with_execution_planning_model(authority)
                         .resolve()
                         .expect_err("removed legacy controls cannot silently apply to typed MoE");
                     assert!(matches!(error,
@@ -3884,175 +3790,94 @@ mod tests {
     }
 
     #[test]
-    fn recurrent_state_budget_caps_default_slots_without_model_vram_special_case() {
-        let hardware =
-            HardwareCapabilities::rtx4090_cuda(CompiledKernelFeatures::m3_fast_path_without_fa2());
-        let workload = WorkloadProfile::serving_default_for_hardware(&hardware);
-        let resolved = FerrumConfigBuilder::new(snapshot(&[("FERRUM_PAGED_MAX_SEQS", "32")]))
-            .with_model_capabilities(synthetic_tight_recurrent_state_model())
-            .with_hardware_capabilities(hardware)
-            .with_workload_profile(workload)
-            .resolve()
-            .unwrap();
-        let decision = |selection: &str| {
-            resolved
-                .decisions
-                .iter()
-                .find(|decision| decision.selection == selection)
-                .unwrap_or_else(|| panic!("missing decision {selection}"))
-        };
-
-        assert_eq!(decision("max_sequences").selected, "32");
-        assert_eq!(decision("recurrent_state_max_slots").selected, "16");
-        assert_eq!(
-            decision("recurrent_state_max_slots").source,
-            AutoConfigSource::MemoryProfile
-        );
-        let entry = resolved
-            .runtime_config
-            .entries
-            .iter()
-            .find(|entry| entry.key == "FERRUM_RECURRENT_STATE_MAX_SLOTS")
-            .expect("memory-profile recurrent slot cap should reach effective runtime config");
-        assert_eq!(entry.effective_value, "16");
-        assert_eq!(entry.source, RuntimeConfigSource::MemoryProfile);
-        let doc = resolved.effective_config_document();
-        assert_eq!(doc["selected_max_sequences"], serde_json::json!(32));
-        assert_eq!(
-            doc["selected_recurrent_state_max_slots"],
-            serde_json::json!(16)
-        );
-        assert_eq!(doc["selected_admission_limit"], serde_json::json!(16));
-        assert_eq!(
-            doc["admission"]["effective_max_concurrent"],
-            serde_json::json!(16)
-        );
-        assert_eq!(
-            doc["admission"]["recurrent_state_max_slots"],
-            serde_json::json!(16)
-        );
-        assert_eq!(
-            doc["admission"]["memory_estimate"]["recurrent_state_bytes_per_sequence"],
-            serde_json::json!(65_863_680u64)
-        );
-        assert_eq!(
-            doc["admission"]["memory_estimate"]["recurrent_state_budget_bytes"],
-            serde_json::json!(24u64 * GIB - 24_419_939_760u64)
-        );
-        assert_eq!(
-            doc["admission"]["memory_estimate"]["recurrent_state_budget_raw_slots"],
-            serde_json::json!(20)
-        );
-        assert_eq!(
-            doc["admission"]["memory_estimate"]["recurrent_state_budget_max_slots"],
-            serde_json::json!(16)
-        );
-        assert_eq!(
-            doc["admission"]["memory_estimate"]["recurrent_state_capacity_bytes"],
-            serde_json::json!(16u64 * 65_863_680u64)
-        );
-    }
-
-    #[test]
-    fn qwen35_fast_recurrent_state_budget_selects_default_slots_without_vram_special_case() {
-        let hardware =
-            HardwareCapabilities::rtx4090_cuda(CompiledKernelFeatures::m3_fast_path_without_fa2());
-        let workload = WorkloadProfile::serving_default_for_hardware(&hardware);
-        let resolved = FerrumConfigBuilder::new(snapshot(&[("FERRUM_PAGED_MAX_SEQS", "32")]))
-            .with_model_capabilities(qwen35_moe_gptq_int4_model())
-            .with_hardware_capabilities(hardware)
-            .with_workload_profile(workload)
-            .resolve()
-            .unwrap();
-        let decision = |selection: &str| {
-            resolved
-                .decisions
-                .iter()
-                .find(|decision| decision.selection == selection)
-                .unwrap_or_else(|| panic!("missing decision {selection}"))
-        };
-
-        assert_eq!(decision("max_sequences").selected, "32");
-        assert_eq!(decision("recurrent_state_max_slots").selected, "32");
-        assert_eq!(
-            decision("recurrent_state_max_slots").source,
-            AutoConfigSource::Env
-        );
-        let doc = resolved.effective_config_document();
-        assert_eq!(doc["selected_max_sequences"], serde_json::json!(32));
-        assert_eq!(
-            doc["selected_recurrent_state_max_slots"],
-            serde_json::json!(32)
-        );
-        assert_eq!(doc["selected_admission_limit"], serde_json::json!(32));
-        assert_eq!(
-            doc["admission"]["memory_estimate"]["recurrent_state_bytes_per_sequence"],
-            serde_json::json!(32_931_840u64)
-        );
-        assert_eq!(
-            doc["admission"]["memory_estimate"]["recurrent_state_budget_raw_slots"],
-            serde_json::json!(40)
-        );
-        assert_eq!(
-            doc["admission"]["memory_estimate"]["recurrent_state_budget_max_slots"],
-            serde_json::json!(32)
-        );
-        assert_eq!(
-            doc["admission"]["memory_estimate"]["recurrent_state_capacity_bytes"],
-            serde_json::json!(32u64 * 32_931_840u64)
-        );
-    }
-
-    #[test]
-    fn recurrent_state_budget_rejects_explicit_slot_pool_above_budget() {
-        let hardware =
-            HardwareCapabilities::rtx4090_cuda(CompiledKernelFeatures::m3_fast_path_without_fa2());
-        let workload = WorkloadProfile::serving_default_for_hardware(&hardware);
-        let err = FerrumConfigBuilder::new(snapshot(&[
-            ("FERRUM_PAGED_MAX_SEQS", "32"),
-            ("FERRUM_RECURRENT_STATE_MAX_SLOTS", "32"),
-        ]))
-        .with_model_capabilities(synthetic_tight_recurrent_state_model())
-        .with_hardware_capabilities(hardware)
-        .with_workload_profile(workload)
-        .resolve()
-        .unwrap_err();
-
-        match err {
-            AutoConfigError::InvalidOverride { key, reason } => {
-                assert_eq!(key, "FERRUM_RECURRENT_STATE_MAX_SLOTS");
-                assert!(
-                    reason.contains("recurrent-state slot pool exceeds"),
-                    "{reason}"
+    fn recurrent_state_estimate_does_not_create_a_slot_pool_or_admission_cap() {
+        for model in [
+            synthetic_tight_recurrent_state_model(),
+            qwen35_moe_gptq_int4_model(),
+        ] {
+            for authority in [
+                ExecutionPlanningModel::ExecutorManaged,
+                ExecutionPlanningModel::CompiledPlan,
+            ] {
+                let hardware = HardwareCapabilities::rtx4090_cuda(
+                    CompiledKernelFeatures::m3_fast_path_without_fa2(),
                 );
-                assert!(
-                    reason.contains("FERRUM_RECURRENT_STATE_MAX_SLOTS=16"),
-                    "{reason}"
+                let workload = WorkloadProfile::serving_default_for_hardware(&hardware);
+                let expected_estimate = model.recurrent_state_bytes_per_sequence;
+                let resolved =
+                    FerrumConfigBuilder::new(snapshot(&[("FERRUM_PAGED_MAX_SEQS", "32")]))
+                        .with_model_capabilities(model.clone())
+                        .with_hardware_capabilities(hardware)
+                        .with_workload_profile(workload)
+                        .with_execution_planning_model(authority)
+                        .resolve()
+                        .unwrap();
+                assert!(resolved
+                    .decisions
+                    .iter()
+                    .all(|decision| decision.selection != "recurrent_state_max_slots"));
+                assert!(resolved
+                    .runtime_config
+                    .entries
+                    .iter()
+                    .all(|entry| entry.key != "FERRUM_RECURRENT_STATE_MAX_SLOTS"));
+                let doc = resolved.effective_config_document();
+                assert_eq!(doc["selected_max_sequences"], 32);
+                assert_eq!(doc["selected_admission_limit"], 32);
+                assert_eq!(doc["admission"]["effective_max_concurrent"], 32);
+                assert!(doc.get("selected_recurrent_state_max_slots").is_none());
+                for key in [
+                    "recurrent_state_max_slots",
+                    "legacy_recurrent_state_max_slots_estimate",
+                    "legacy_recurrent_state_limit_applies",
+                ] {
+                    assert!(doc["admission"].get(key).is_none(), "{key}");
+                }
+                let memory = &doc["admission"]["memory_estimate"];
+                assert_eq!(
+                    memory["recurrent_state_bytes_per_sequence"],
+                    serde_json::json!(expected_estimate)
                 );
+                assert_eq!(memory["is_resident_usage"], false);
+                for key in [
+                    "recurrent_state_budget_bytes",
+                    "recurrent_state_budget_raw_slots",
+                    "recurrent_state_budget_max_slots",
+                    "recurrent_state_capacity_bytes",
+                ] {
+                    assert!(memory.get(key).is_none(), "{key}");
+                }
             }
-            other => panic!("unexpected error: {other:?}"),
         }
     }
 
     #[test]
-    fn effective_admission_limit_respects_resource_authority() {
-        let legacy = ExecutionResourceAuthority::LegacyEngine;
-        let plan = ExecutionResourceAuthority::PlanRuntime;
-        assert_eq!(
-            effective_admission_limit(legacy, Some(32), Some(16)),
-            Some(16)
-        );
-        assert_eq!(
-            effective_admission_limit(legacy, Some(16), Some(32)),
-            Some(16)
-        );
-        assert_eq!(effective_admission_limit(legacy, Some(32), None), Some(32));
-        assert_eq!(effective_admission_limit(legacy, None, Some(16)), Some(16));
-        assert_eq!(effective_admission_limit(legacy, None, None), None);
-        assert_eq!(
-            effective_admission_limit(plan, Some(32), Some(16)),
-            Some(32)
-        );
+    fn auto_config_rejects_retired_recurrent_state_slots_for_each_authority() {
+        for authority in [
+            ExecutionPlanningModel::ExecutorManaged,
+            ExecutionPlanningModel::CompiledPlan,
+        ] {
+            for value in ["", "0", "16", "32"] {
+                let hardware = HardwareCapabilities::rtx4090_cuda(
+                    CompiledKernelFeatures::m3_fast_path_without_fa2(),
+                );
+                let workload = WorkloadProfile::serving_default_for_hardware(&hardware);
+                let error = FerrumConfigBuilder::new(snapshot(&[
+                    ("FERRUM_PAGED_MAX_SEQS", "32"),
+                    ("FERRUM_RECURRENT_STATE_MAX_SLOTS", value),
+                ]))
+                .with_model_capabilities(synthetic_tight_recurrent_state_model())
+                .with_hardware_capabilities(hardware)
+                .with_workload_profile(workload)
+                .with_execution_planning_model(authority)
+                .resolve()
+                .unwrap_err();
+                assert!(matches!(error,
+                    AutoConfigError::InvalidOverride { key, reason }
+                    if key == "FERRUM_RECURRENT_STATE_MAX_SLOTS" && reason.contains("retired")
+                ));
+            }
+        }
     }
 
     #[test]
@@ -4064,13 +3889,13 @@ mod tests {
             .with_model_capabilities(synthetic_tight_recurrent_state_model())
             .with_hardware_capabilities(hardware)
             .with_workload_profile(workload)
-            .with_execution_resource_authority(ExecutionResourceAuthority::PlanRuntime)
+            .with_execution_planning_model(ExecutionPlanningModel::CompiledPlan)
             .resolve()
             .unwrap();
 
         assert_eq!(
-            resolved.execution_resource_authority,
-            ExecutionResourceAuthority::PlanRuntime
+            resolved.execution_planning_model,
+            ExecutionPlanningModel::CompiledPlan
         );
         assert_eq!(
             resolved.requested_attention_policy,
@@ -4122,10 +3947,9 @@ mod tests {
             document["admission"]["effective_max_concurrent"],
             serde_json::json!(32)
         );
-        assert_eq!(
-            document["admission"]["legacy_recurrent_state_limit_applies"],
-            serde_json::json!(false)
-        );
+        assert!(document["admission"]
+            .get("legacy_recurrent_state_limit_applies")
+            .is_none());
     }
 
     #[test]
@@ -4134,8 +3958,8 @@ mod tests {
             HardwareCapabilities::rtx4090_cuda(CompiledKernelFeatures::m3_fast_path_without_fa2());
         let model = synthetic_tight_recurrent_state_model();
         for authority in [
-            ExecutionResourceAuthority::PlanRuntime,
-            ExecutionResourceAuthority::LegacyEngine,
+            ExecutionPlanningModel::CompiledPlan,
+            ExecutionPlanningModel::ExecutorManaged,
         ] {
             let document = FerrumConfigBuilder::new(snapshot(&[
                 ("FERRUM_KV_DTYPE", "int8"),
@@ -4143,7 +3967,7 @@ mod tests {
             ]))
             .with_model_capabilities(model.clone())
             .with_hardware_capabilities(hardware.clone())
-            .with_execution_resource_authority(authority)
+            .with_execution_planning_model(authority)
             .resolve()
             .unwrap()
             .effective_config_document();
@@ -4170,7 +3994,7 @@ mod tests {
             assert_eq!(admission["kv_capacity_is_resident_usage"], false);
             assert_eq!(
                 admission["kv_capacity_applies_to_selected_state_layout"],
-                authority == ExecutionResourceAuthority::LegacyEngine
+                false
             );
             let estimate = &admission["memory_estimate"];
             assert_eq!(
@@ -4180,7 +4004,7 @@ mod tests {
             assert_eq!(estimate["source"], "legacy_f16_geometry_estimate");
             assert_eq!(estimate["applies_to_selected_state_layout"], false);
             assert_eq!(estimate["is_resident_usage"], false);
-            if authority == ExecutionResourceAuthority::PlanRuntime {
+            if authority == ExecutionPlanningModel::CompiledPlan {
                 assert_eq!(
                     estimate["selected_state_evidence_source"],
                     "executor.kv_storage.logical_sequence_state"
@@ -4200,7 +4024,7 @@ mod tests {
             }
             FerrumConfigBuilder::new(snapshot(&entries))
                 .with_hardware_capabilities(hardware.clone())
-                .with_execution_resource_authority(ExecutionResourceAuthority::PlanRuntime)
+                .with_execution_planning_model(ExecutionPlanningModel::CompiledPlan)
                 .resolve()
         };
         for requested in [None, Some("auto"), Some("portable")] {
@@ -4242,6 +4066,127 @@ mod tests {
     }
 
     #[test]
+    fn selected_kv_layout_applies_block_limits_only_to_actual_paged_geometry() {
+        let mut model = ModelCapabilities::unknown();
+        model.max_context_len = Some(32);
+        let resolve = |layout, batch, window| {
+            FerrumConfigBuilder::new(snapshot(&[
+                ("FERRUM_KV_MAX_BLOCKS", "1"),
+                ("FERRUM_PAGED_MAX_SEQS", "1"),
+                ("FERRUM_MAX_BATCHED_TOKENS", batch),
+                ("FERRUM_MAX_MODEL_LEN", window),
+            ]))
+            .with_model_capabilities(model.clone())
+            .with_selected_kv_cache_layout(layout)
+            .resolve()
+        };
+        for layout in [
+            SelectedKvCacheLayout::Contiguous,
+            SelectedKvCacheLayout::Unknown,
+        ] {
+            let resolved = resolve(layout, "32", "32").unwrap();
+            assert_eq!(resolved.selected_usize("max_model_len"), Some(32));
+            assert_eq!(resolved.selected_usize("max_batched_tokens"), Some(32));
+            assert_eq!(resolved.selected_kv_cache_layout, layout);
+            assert_eq!(
+                resolved.admission_summary_document()
+                    ["kv_capacity_applies_to_selected_state_layout"],
+                false
+            );
+        }
+        let paged = SelectedKvCacheLayout::Paged {
+            block_size_tokens: 16,
+        };
+        assert!(
+            matches!(resolve(paged, "32", "16"), Err(AutoConfigError::InvalidOverride { key, .. }) if key == "FERRUM_MAX_BATCHED_TOKENS")
+        );
+        assert!(
+            matches!(resolve(paged, "16", "32"), Err(AutoConfigError::InvalidOverride { key, .. }) if key == "FERRUM_KV_MAX_BLOCKS")
+        );
+        let actual = resolve(paged, "16", "16").unwrap();
+        assert_eq!(
+            actual.admission_summary_document()["kv_capacity_tokens"],
+            16
+        );
+        assert_eq!(
+            actual.admission_summary_document()["kv_capacity_applies_to_selected_state_layout"],
+            true
+        );
+        // The selected allocator's geometry is the authority, not a hardcoded 16.
+        let wider = resolve(
+            SelectedKvCacheLayout::Paged {
+                block_size_tokens: 32,
+            },
+            "32",
+            "32",
+        )
+        .unwrap();
+        assert_eq!(wider.admission_summary_document()["kv_capacity_tokens"], 32);
+        assert!(resolve(
+            SelectedKvCacheLayout::Paged {
+                block_size_tokens: 0
+            },
+            "1",
+            "1"
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn selected_kv_layout_metadata_uses_same_selection_instead_of_backend_label() {
+        let mut hardware = HardwareCapabilities::unknown();
+        hardware.backend = "metal".into();
+        for (layout, label) in [
+            (SelectedKvCacheLayout::Unknown, "unknown"),
+            (SelectedKvCacheLayout::Contiguous, "contiguous"),
+            (
+                SelectedKvCacheLayout::Paged {
+                    block_size_tokens: 16,
+                },
+                "paged",
+            ),
+        ] {
+            let resolved = FerrumConfigBuilder::new(snapshot(&[]))
+                .with_hardware_capabilities(hardware.clone())
+                .with_selected_kv_cache_layout(layout)
+                .resolve()
+                .unwrap();
+            let document = resolved.effective_config_document();
+            assert_eq!(document["selected_kv_layout"], label);
+            assert_eq!(
+                document["admission"]["selected_kv_cache_layout"],
+                serde_json::to_value(layout).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn selected_kv_layout_default_workload_target_does_not_cap_contiguous_work() {
+        for (layout, expected) in [
+            (SelectedKvCacheLayout::Contiguous, 64),
+            (SelectedKvCacheLayout::Unknown, 64),
+            (
+                SelectedKvCacheLayout::Paged {
+                    block_size_tokens: 16,
+                },
+                16,
+            ),
+        ] {
+            let resolved = FerrumConfigBuilder::new(snapshot(&[
+                ("FERRUM_KV_MAX_BLOCKS", "1"),
+                ("FERRUM_PAGED_MAX_SEQS", "1"),
+            ]))
+            .with_selected_kv_cache_layout(layout)
+            .resolve()
+            .unwrap();
+            assert_eq!(
+                resolved.selected_usize("max_batched_tokens"),
+                Some(expected)
+            );
+        }
+    }
+
+    #[test]
     fn plan_runtime_context_and_batch_limits_do_not_inherit_legacy_kv_block_estimates() {
         let hardware =
             HardwareCapabilities::rtx4090_cuda(CompiledKernelFeatures::m3_fast_path_without_fa2());
@@ -4260,15 +4205,18 @@ mod tests {
             ]);
             let builder = FerrumConfigBuilder::new(entries.clone())
                 .with_hardware_capabilities(hardware.clone())
-                .with_model_capabilities(model.clone());
+                .with_model_capabilities(model.clone())
+                .with_selected_kv_cache_layout(SelectedKvCacheLayout::Paged {
+                    block_size_tokens: 16,
+                });
             assert!(
                 builder.resolve().is_err(),
-                "legacy capacity must remain enforced"
+                "selected paged capacity must remain enforced"
             );
             let resolved = FerrumConfigBuilder::new(entries)
                 .with_hardware_capabilities(hardware.clone())
                 .with_model_capabilities(model.clone())
-                .with_execution_resource_authority(ExecutionResourceAuthority::PlanRuntime)
+                .with_execution_planning_model(ExecutionPlanningModel::CompiledPlan)
                 .resolve()
                 .unwrap();
             let mut engine = crate::EngineConfig::default();
@@ -4284,7 +4232,7 @@ mod tests {
         let invalid = FerrumConfigBuilder::new(snapshot(&[("FERRUM_MAX_MODEL_LEN", "131073")]))
             .with_hardware_capabilities(hardware)
             .with_model_capabilities(model)
-            .with_execution_resource_authority(ExecutionResourceAuthority::PlanRuntime)
+            .with_execution_planning_model(ExecutionPlanningModel::CompiledPlan)
             .resolve()
             .unwrap_err();
         assert!(
@@ -4305,7 +4253,7 @@ mod tests {
                 .with_model_capabilities(synthetic_tight_recurrent_state_model())
                 .with_hardware_capabilities(hardware.clone())
                 .with_workload_profile(workload.clone())
-                .with_execution_resource_authority(ExecutionResourceAuthority::PlanRuntime)
+                .with_execution_planning_model(ExecutionPlanningModel::CompiledPlan)
                 .resolve()
                 .unwrap_err();
             assert!(matches!(
@@ -4319,29 +4267,6 @@ mod tests {
     }
 
     #[test]
-    fn plan_runtime_rejects_legacy_recurrent_slot_override() {
-        let hardware =
-            HardwareCapabilities::rtx4090_cuda(CompiledKernelFeatures::m3_fast_path_without_fa2());
-        let workload = WorkloadProfile::serving_default_for_hardware(&hardware);
-        let error = FerrumConfigBuilder::new(snapshot(&[
-            ("FERRUM_PAGED_MAX_SEQS", "32"),
-            ("FERRUM_RECURRENT_STATE_MAX_SLOTS", "16"),
-        ]))
-        .with_model_capabilities(synthetic_tight_recurrent_state_model())
-        .with_hardware_capabilities(hardware)
-        .with_workload_profile(workload)
-        .with_execution_resource_authority(ExecutionResourceAuthority::PlanRuntime)
-        .resolve()
-        .unwrap_err();
-
-        assert!(matches!(
-            error,
-            AutoConfigError::InvalidOverride { key, .. }
-                if key == "FERRUM_RECURRENT_STATE_MAX_SLOTS"
-        ));
-    }
-
-    #[test]
     fn metal_plan_runtime_preflight_matches_portable_runtime_capability() {
         let mut hardware = HardwareCapabilities::unknown();
         hardware.backend = "metal".to_owned();
@@ -4350,7 +4275,7 @@ mod tests {
             .with_model_capabilities(synthetic_tight_recurrent_state_model())
             .with_hardware_capabilities(hardware)
             .with_workload_profile(workload)
-            .with_execution_resource_authority(ExecutionResourceAuthority::PlanRuntime)
+            .with_execution_planning_model(ExecutionPlanningModel::CompiledPlan)
             .resolve()
             .unwrap();
 
@@ -4369,39 +4294,7 @@ mod tests {
     }
 
     #[test]
-    fn explicit_recurrent_state_slot_cap_can_keep_scheduler_width_above_state_pool() {
-        let hardware =
-            HardwareCapabilities::rtx4090_cuda(CompiledKernelFeatures::m3_fast_path_without_fa2());
-        let workload = WorkloadProfile::serving_default_for_hardware(&hardware);
-        let resolved = FerrumConfigBuilder::new(snapshot(&[
-            ("FERRUM_PAGED_MAX_SEQS", "32"),
-            ("FERRUM_RECURRENT_STATE_MAX_SLOTS", "16"),
-        ]))
-        .with_model_capabilities(synthetic_tight_recurrent_state_model())
-        .with_hardware_capabilities(hardware)
-        .with_workload_profile(workload)
-        .resolve()
-        .unwrap();
-        let decision = |selection: &str| {
-            resolved
-                .decisions
-                .iter()
-                .find(|decision| decision.selection == selection)
-                .unwrap_or_else(|| panic!("missing decision {selection}"))
-        };
-        assert_eq!(decision("max_sequences").selected, "32");
-        assert_eq!(decision("recurrent_state_max_slots").selected, "16");
-        let entry = resolved
-            .runtime_config
-            .entries
-            .iter()
-            .find(|entry| entry.key == "FERRUM_RECURRENT_STATE_MAX_SLOTS")
-            .expect("recurrent-state slot cap should reach effective runtime config");
-        assert_eq!(entry.effective_value, "16");
-    }
-
-    #[test]
-    fn recurrent_state_budget_ignores_removed_qwen35_slot_alias() {
+    fn removed_qwen35_slot_alias_does_not_create_a_recurrent_slot_cap() {
         let hardware =
             HardwareCapabilities::rtx4090_cuda(CompiledKernelFeatures::m3_fast_path_without_fa2());
         let workload = WorkloadProfile::serving_default_for_hardware(&hardware);
@@ -4414,62 +4307,19 @@ mod tests {
         .with_workload_profile(workload)
         .resolve()
         .unwrap();
-        let decision = resolved
+        assert_eq!(
+            resolved.effective_config_document()["selected_admission_limit"],
+            32
+        );
+        assert!(resolved
             .decisions
             .iter()
-            .find(|decision| decision.selection == "recurrent_state_max_slots")
-            .expect("missing recurrent_state_max_slots decision");
-        assert_eq!(decision.selected, "16");
-        assert_eq!(decision.source, AutoConfigSource::MemoryProfile);
-        assert_eq!(decision.source_key, None);
+            .all(|decision| decision.selection != "recurrent_state_max_slots"));
         assert!(resolved
             .runtime_config
             .entries
             .iter()
-            .any(|entry| entry.key == "FERRUM_RECURRENT_STATE_MAX_SLOTS"
-                && entry.effective_value == "16"));
-    }
-
-    #[test]
-    fn recurrent_state_budget_rejects_zero_slot_pool() {
-        let hardware =
-            HardwareCapabilities::rtx4090_cuda(CompiledKernelFeatures::m3_fast_path_without_fa2());
-        let workload = WorkloadProfile::serving_default_for_hardware(&hardware);
-        let err = FerrumConfigBuilder::new(snapshot(&[
-            ("FERRUM_PAGED_MAX_SEQS", "16"),
-            ("FERRUM_RECURRENT_STATE_MAX_SLOTS", "0"),
-        ]))
-        .with_model_capabilities(synthetic_tight_recurrent_state_model())
-        .with_hardware_capabilities(hardware)
-        .with_workload_profile(workload)
-        .resolve()
-        .unwrap_err();
-
-        assert!(matches!(
-            err,
-            AutoConfigError::InvalidOverride { key, .. }
-                if key == "FERRUM_RECURRENT_STATE_MAX_SLOTS"
-        ));
-    }
-
-    #[test]
-    fn recurrent_state_budget_allows_c32_when_memory_budget_fits() {
-        let mut hardware =
-            HardwareCapabilities::rtx4090_cuda(CompiledKernelFeatures::m3_fast_path_without_fa2());
-        hardware.vram_bytes = Some(48 * GIB);
-        let workload = WorkloadProfile::serving_default_for_hardware(&hardware);
-        let resolved = FerrumConfigBuilder::new(snapshot(&[("FERRUM_PAGED_MAX_SEQS", "32")]))
-            .with_model_capabilities(synthetic_tight_recurrent_state_model())
-            .with_hardware_capabilities(hardware)
-            .with_workload_profile(workload)
-            .resolve()
-            .unwrap();
-        let max_sequences = resolved
-            .decisions
-            .iter()
-            .find(|decision| decision.selection == "max_sequences")
-            .unwrap();
-        assert_eq!(max_sequences.selected, "32");
+            .all(|entry| entry.key != "FERRUM_RECURRENT_STATE_MAX_SLOTS"));
     }
 
     #[test]
@@ -5743,7 +5593,7 @@ mod tests {
 
     fn scheduler_resolution(
         backend: &str,
-        authority: ExecutionResourceAuthority,
+        authority: ExecutionPlanningModel,
         sequences: usize,
         runtime_config: RuntimeConfigSnapshot,
     ) -> ResolvedFerrumConfig {
@@ -5754,7 +5604,7 @@ mod tests {
         FerrumConfigBuilder::new(runtime_config)
             .with_hardware_capabilities(hardware)
             .with_workload_profile(workload)
-            .with_execution_resource_authority(authority)
+            .with_execution_planning_model(authority)
             .resolve()
             .unwrap()
     }
@@ -5787,12 +5637,8 @@ mod tests {
             let snapshot = value
                 .map(|value| snapshot_with_sources(&[(key, value, runtime_source)]))
                 .unwrap_or_default();
-            let resolved = scheduler_resolution(
-                "metal",
-                ExecutionResourceAuthority::PlanRuntime,
-                4,
-                snapshot,
-            );
+            let resolved =
+                scheduler_resolution("metal", ExecutionPlanningModel::CompiledPlan, 4, snapshot);
             let expected = value.unwrap_or("split");
             let entry = resolved
                 .runtime_config
@@ -5832,7 +5678,7 @@ mod tests {
         let key = "FERRUM_SAMPLING_READBACK_MODE";
         let baseline = scheduler_resolution(
             "cpu",
-            ExecutionResourceAuthority::PlanRuntime,
+            ExecutionPlanningModel::CompiledPlan,
             4,
             RuntimeConfigSnapshot::default(),
         );
@@ -5867,7 +5713,7 @@ mod tests {
                 .map(|v| snapshot_with_sources(&[(key, v, runtime_source)]))
                 .unwrap_or_default();
             let resolved =
-                scheduler_resolution("cpu", ExecutionResourceAuthority::PlanRuntime, 4, snapshot);
+                scheduler_resolution("cpu", ExecutionPlanningModel::CompiledPlan, 4, snapshot);
             let expected = value.unwrap_or("uniform");
             let entry = resolved
                 .runtime_config
@@ -5901,11 +5747,11 @@ mod tests {
             );
         }
         for (value, authority) in [
-            ("automatic", ExecutionResourceAuthority::PlanRuntime),
-            ("participant", ExecutionResourceAuthority::LegacyEngine),
+            ("automatic", ExecutionPlanningModel::CompiledPlan),
+            ("participant", ExecutionPlanningModel::ExecutorManaged),
         ] {
             let error = FerrumConfigBuilder::new(snapshot(&[(key, value)]))
-                .with_execution_resource_authority(authority)
+                .with_execution_planning_model(authority)
                 .resolve()
                 .unwrap_err();
             assert!(
@@ -5952,12 +5798,8 @@ mod tests {
             let snapshot = value
                 .map(|value| snapshot_with_sources(&[(key, value, runtime_source)]))
                 .unwrap_or_default();
-            let resolved = scheduler_resolution(
-                "metal",
-                ExecutionResourceAuthority::PlanRuntime,
-                4,
-                snapshot,
-            );
+            let resolved =
+                scheduler_resolution("metal", ExecutionPlanningModel::CompiledPlan, 4, snapshot);
             let expected = value.unwrap_or("full");
             let entry = resolved
                 .runtime_config
@@ -6038,7 +5880,7 @@ mod tests {
                 }
                 let resolved = scheduler_resolution(
                     "cuda",
-                    ExecutionResourceAuthority::PlanRuntime,
+                    ExecutionPlanningModel::CompiledPlan,
                     4,
                     RuntimeConfigSnapshot::from_entries(entries),
                 );
@@ -6092,35 +5934,35 @@ mod tests {
             for (backend, authority, owner, upload, supported) in [
                 (
                     "cuda",
-                    ExecutionResourceAuthority::PlanRuntime,
+                    ExecutionPlanningModel::CompiledPlan,
                     "indexed",
                     "compact-scatter",
                     true,
                 ),
                 (
                     "metal",
-                    ExecutionResourceAuthority::PlanRuntime,
+                    ExecutionPlanningModel::CompiledPlan,
                     "indexed",
                     "compact-scatter",
                     false,
                 ),
                 (
                     "cuda",
-                    ExecutionResourceAuthority::LegacyEngine,
+                    ExecutionPlanningModel::ExecutorManaged,
                     "indexed",
                     "compact-scatter",
                     false,
                 ),
                 (
                     "cuda",
-                    ExecutionResourceAuthority::PlanRuntime,
+                    ExecutionPlanningModel::CompiledPlan,
                     "legacy",
                     "compact-scatter",
                     false,
                 ),
                 (
                     "cuda",
-                    ExecutionResourceAuthority::PlanRuntime,
+                    ExecutionPlanningModel::CompiledPlan,
                     "indexed",
                     "sparse",
                     false,
@@ -6144,7 +5986,7 @@ mod tests {
                 hardware.compiled_features.cuda = backend == "cuda";
                 let result = FerrumConfigBuilder::new(entries)
                     .with_hardware_capabilities(hardware)
-                    .with_execution_resource_authority(authority)
+                    .with_execution_planning_model(authority)
                     .resolve();
                 if supported {
                     let resolved = result.unwrap();
@@ -6215,7 +6057,7 @@ mod tests {
                 let resolved =
                     FerrumConfigBuilder::new(RuntimeConfigSnapshot::from_entries(entries))
                         .with_hardware_capabilities(hardware)
-                        .with_execution_resource_authority(ExecutionResourceAuthority::PlanRuntime)
+                        .with_execution_planning_model(ExecutionPlanningModel::CompiledPlan)
                         .resolve()
                         .unwrap();
                 let expected = grouping.unwrap_or("fixed-execution-capacity");
@@ -6298,7 +6140,7 @@ mod tests {
             for (backend, authority, compiled, policy, kv, preparation, source) in [
                 (
                     "cuda",
-                    ExecutionResourceAuthority::PlanRuntime,
+                    ExecutionPlanningModel::CompiledPlan,
                     true,
                     "auto",
                     "fp16",
@@ -6307,7 +6149,7 @@ mod tests {
                 ),
                 (
                     "cpu",
-                    ExecutionResourceAuthority::PlanRuntime,
+                    ExecutionPlanningModel::CompiledPlan,
                     true,
                     "auto",
                     "fp16",
@@ -6316,7 +6158,7 @@ mod tests {
                 ),
                 (
                     "metal",
-                    ExecutionResourceAuthority::PlanRuntime,
+                    ExecutionPlanningModel::CompiledPlan,
                     true,
                     "auto",
                     "fp16",
@@ -6325,7 +6167,7 @@ mod tests {
                 ),
                 (
                     "cuda",
-                    ExecutionResourceAuthority::LegacyEngine,
+                    ExecutionPlanningModel::ExecutorManaged,
                     true,
                     "auto",
                     "fp16",
@@ -6334,7 +6176,7 @@ mod tests {
                 ),
                 (
                     "cuda",
-                    ExecutionResourceAuthority::PlanRuntime,
+                    ExecutionPlanningModel::CompiledPlan,
                     false,
                     "auto",
                     "fp16",
@@ -6343,7 +6185,7 @@ mod tests {
                 ),
                 (
                     "cuda",
-                    ExecutionResourceAuthority::PlanRuntime,
+                    ExecutionPlanningModel::CompiledPlan,
                     true,
                     "portable",
                     "fp16",
@@ -6352,7 +6194,7 @@ mod tests {
                 ),
                 (
                     "cuda",
-                    ExecutionResourceAuthority::PlanRuntime,
+                    ExecutionPlanningModel::CompiledPlan,
                     true,
                     "auto",
                     "int8",
@@ -6361,7 +6203,7 @@ mod tests {
                 ),
                 (
                     "cuda",
-                    ExecutionResourceAuthority::PlanRuntime,
+                    ExecutionPlanningModel::CompiledPlan,
                     true,
                     "auto",
                     "fp16",
@@ -6393,7 +6235,7 @@ mod tests {
                 hardware.supported_kv_dtypes = vec!["fp16".to_owned(), "int8".to_owned()];
                 let error = FerrumConfigBuilder::new(RuntimeConfigSnapshot::from_entries(entries))
                     .with_hardware_capabilities(hardware)
-                    .with_execution_resource_authority(authority)
+                    .with_execution_planning_model(authority)
                     .resolve()
                     .unwrap_err();
                 assert!(
@@ -6452,7 +6294,7 @@ mod tests {
             hardware.compiled_features.cuda_causal_gqa2 = compiled;
             let result = FerrumConfigBuilder::new(entries)
                 .with_hardware_capabilities(hardware)
-                .with_execution_resource_authority(ExecutionResourceAuthority::PlanRuntime)
+                .with_execution_planning_model(ExecutionPlanningModel::CompiledPlan)
                 .resolve();
             assert_eq!(result.is_ok(), supported, "{mode}/{grouping}: {result:?}");
             if let Ok(resolved) = result {
@@ -6511,7 +6353,7 @@ mod tests {
                 hardware.compiled_features.cuda_indexed_causal_attention = compiled;
                 let result = FerrumConfigBuilder::new(entries)
                     .with_hardware_capabilities(hardware)
-                    .with_execution_resource_authority(ExecutionResourceAuthority::PlanRuntime)
+                    .with_execution_planning_model(ExecutionPlanningModel::CompiledPlan)
                     .resolve();
                 if grouping != "contiguous" && !compiled {
                     assert!(
@@ -6566,9 +6408,7 @@ mod tests {
                     let resolved =
                         FerrumConfigBuilder::new(RuntimeConfigSnapshot::from_entries(entries))
                             .with_hardware_capabilities(hardware)
-                            .with_execution_resource_authority(
-                                ExecutionResourceAuthority::PlanRuntime,
-                            )
+                            .with_execution_planning_model(ExecutionPlanningModel::CompiledPlan)
                             .resolve()
                             .unwrap();
                     let expected = mode.unwrap_or("packed");
@@ -6628,7 +6468,7 @@ mod tests {
         for (backend, authority, compiled, policy, kv, source) in [
             (
                 "cuda",
-                ExecutionResourceAuthority::PlanRuntime,
+                ExecutionPlanningModel::CompiledPlan,
                 true,
                 "auto",
                 "fp16",
@@ -6636,7 +6476,7 @@ mod tests {
             ),
             (
                 "cpu",
-                ExecutionResourceAuthority::PlanRuntime,
+                ExecutionPlanningModel::CompiledPlan,
                 true,
                 "auto",
                 "fp16",
@@ -6644,7 +6484,7 @@ mod tests {
             ),
             (
                 "metal",
-                ExecutionResourceAuthority::PlanRuntime,
+                ExecutionPlanningModel::CompiledPlan,
                 true,
                 "auto",
                 "fp16",
@@ -6652,7 +6492,7 @@ mod tests {
             ),
             (
                 "cuda",
-                ExecutionResourceAuthority::LegacyEngine,
+                ExecutionPlanningModel::ExecutorManaged,
                 true,
                 "auto",
                 "fp16",
@@ -6660,7 +6500,7 @@ mod tests {
             ),
             (
                 "cuda",
-                ExecutionResourceAuthority::PlanRuntime,
+                ExecutionPlanningModel::CompiledPlan,
                 false,
                 "auto",
                 "fp16",
@@ -6668,7 +6508,7 @@ mod tests {
             ),
             (
                 "cuda",
-                ExecutionResourceAuthority::PlanRuntime,
+                ExecutionPlanningModel::CompiledPlan,
                 true,
                 "portable",
                 "fp16",
@@ -6676,7 +6516,7 @@ mod tests {
             ),
             (
                 "cuda",
-                ExecutionResourceAuthority::PlanRuntime,
+                ExecutionPlanningModel::CompiledPlan,
                 true,
                 "auto",
                 "int8",
@@ -6697,7 +6537,7 @@ mod tests {
             hardware.supported_kv_dtypes = vec!["fp16".to_owned(), "int8".to_owned()];
             let error = FerrumConfigBuilder::new(entries)
                 .with_hardware_capabilities(hardware)
-                .with_execution_resource_authority(authority)
+                .with_execution_planning_model(authority)
                 .resolve()
                 .unwrap_err();
             assert!(
@@ -6713,37 +6553,37 @@ mod tests {
         for (backend, authority, preparation, source) in [
             (
                 "cuda",
-                ExecutionResourceAuthority::PlanRuntime,
+                ExecutionPlanningModel::CompiledPlan,
                 "decode-segment",
                 RuntimeConfigSource::Env,
             ),
             (
                 "cpu",
-                ExecutionResourceAuthority::PlanRuntime,
+                ExecutionPlanningModel::CompiledPlan,
                 "decode-segment",
                 RuntimeConfigSource::Cli,
             ),
             (
                 "metal",
-                ExecutionResourceAuthority::PlanRuntime,
+                ExecutionPlanningModel::CompiledPlan,
                 "decode-segment",
                 RuntimeConfigSource::Cli,
             ),
             (
                 "cuda",
-                ExecutionResourceAuthority::LegacyEngine,
+                ExecutionPlanningModel::ExecutorManaged,
                 "decode-segment",
                 RuntimeConfigSource::Cli,
             ),
             (
                 "cuda",
-                ExecutionResourceAuthority::PlanRuntime,
+                ExecutionPlanningModel::CompiledPlan,
                 "full",
                 RuntimeConfigSource::Cli,
             ),
             (
                 "cuda",
-                ExecutionResourceAuthority::PlanRuntime,
+                ExecutionPlanningModel::CompiledPlan,
                 "identity-projection",
                 RuntimeConfigSource::Cli,
             ),
@@ -6760,7 +6600,7 @@ mod tests {
             hardware.backend = backend.to_owned();
             let error = FerrumConfigBuilder::new(snapshot)
                 .with_hardware_capabilities(hardware)
-                .with_execution_resource_authority(authority)
+                .with_execution_planning_model(authority)
                 .resolve()
                 .unwrap_err();
             assert!(
@@ -6770,7 +6610,7 @@ mod tests {
         for backend in ["cpu", "metal", "cuda"] {
             scheduler_resolution(
                 backend,
-                ExecutionResourceAuthority::LegacyEngine,
+                ExecutionPlanningModel::ExecutorManaged,
                 4,
                 RuntimeConfigSnapshot::default(),
             );
@@ -6791,7 +6631,7 @@ mod tests {
                     .unwrap_or_default();
                 let resolved = scheduler_resolution(
                     backend,
-                    ExecutionResourceAuthority::PlanRuntime,
+                    ExecutionPlanningModel::CompiledPlan,
                     4,
                     snapshot,
                 );
@@ -6867,7 +6707,7 @@ mod tests {
                 .map(|value| snapshot_with_sources(&[(key, value, runtime_source)]))
                 .unwrap_or_default();
             let resolved =
-                scheduler_resolution("cuda", ExecutionResourceAuthority::PlanRuntime, 4, snapshot);
+                scheduler_resolution("cuda", ExecutionPlanningModel::CompiledPlan, 4, snapshot);
             let expected = value.unwrap_or("sparse");
             let entry = resolved
                 .runtime_config
@@ -6905,16 +6745,16 @@ mod tests {
             matches!(error, AutoConfigError::InvalidOverride { key: actual, .. } if actual == key)
         );
         for (backend, authority) in [
-            ("cpu", ExecutionResourceAuthority::PlanRuntime),
-            ("metal", ExecutionResourceAuthority::PlanRuntime),
-            ("cuda", ExecutionResourceAuthority::LegacyEngine),
+            ("cpu", ExecutionPlanningModel::CompiledPlan),
+            ("metal", ExecutionPlanningModel::CompiledPlan),
+            ("cuda", ExecutionPlanningModel::ExecutorManaged),
         ] {
             let mut hardware = HardwareCapabilities::unknown();
             hardware.backend = backend.to_owned();
             for strategy in ["uniform-live-prefix", "compact-scatter"] {
                 let error = FerrumConfigBuilder::new(snapshot(&[(key, strategy)]))
                     .with_hardware_capabilities(hardware.clone())
-                    .with_execution_resource_authority(authority)
+                    .with_execution_planning_model(authority)
                     .resolve()
                     .unwrap_err();
                 assert!(
@@ -6940,7 +6780,7 @@ mod tests {
             ] {
                 let resolved = scheduler_resolution(
                     backend,
-                    ExecutionResourceAuthority::PlanRuntime,
+                    ExecutionPlanningModel::CompiledPlan,
                     4,
                     snapshot_with_sources(&[(key, value, runtime_source)]),
                 );
@@ -6982,7 +6822,7 @@ mod tests {
         for backend in ["cpu", "metal", "cuda"] {
             let resolved = scheduler_resolution(
                 backend,
-                ExecutionResourceAuthority::PlanRuntime,
+                ExecutionPlanningModel::CompiledPlan,
                 4,
                 snapshot(&[]),
             );
@@ -7027,7 +6867,7 @@ mod tests {
     fn metal_plan_active_prefill_default_reaches_engine_and_decision_trace() {
         let resolved = scheduler_resolution(
             "metal",
-            ExecutionResourceAuthority::PlanRuntime,
+            ExecutionPlanningModel::CompiledPlan,
             4,
             snapshot(&[]),
         );
@@ -7062,10 +6902,10 @@ mod tests {
     #[test]
     fn active_prefill_default_does_not_change_other_execution_paths() {
         for (backend, authority, sequences) in [
-            ("metal", ExecutionResourceAuthority::PlanRuntime, 1),
-            ("metal", ExecutionResourceAuthority::LegacyEngine, 4),
-            ("cpu", ExecutionResourceAuthority::PlanRuntime, 4),
-            ("cuda", ExecutionResourceAuthority::PlanRuntime, 4),
+            ("metal", ExecutionPlanningModel::CompiledPlan, 1),
+            ("metal", ExecutionPlanningModel::ExecutorManaged, 4),
+            ("cpu", ExecutionPlanningModel::CompiledPlan, 4),
+            ("cuda", ExecutionPlanningModel::CompiledPlan, 4),
         ] {
             let resolved = scheduler_resolution(backend, authority, sequences, snapshot(&[]));
             let mut engine = crate::EngineConfig::default();
@@ -7101,15 +6941,15 @@ mod tests {
             FerrumConfigBuilder::new(RuntimeConfigSnapshot::from_entries(entry))
                 .with_hardware_capabilities(hardware)
                 .with_workload_profile(workload)
-                .with_execution_resource_authority(authority)
+                .with_execution_planning_model(authority)
                 .resolve()
                 .unwrap()
         };
         for (authority, sequences, compiled_cuda, expected) in [
-            (ExecutionResourceAuthority::PlanRuntime, 4, true, Some(256)),
-            (ExecutionResourceAuthority::PlanRuntime, 1, true, None),
-            (ExecutionResourceAuthority::LegacyEngine, 4, true, None),
-            (ExecutionResourceAuthority::PlanRuntime, 4, false, None),
+            (ExecutionPlanningModel::CompiledPlan, 4, true, Some(256)),
+            (ExecutionPlanningModel::CompiledPlan, 1, true, None),
+            (ExecutionPlanningModel::ExecutorManaged, 4, true, None),
+            (ExecutionPlanningModel::CompiledPlan, 4, false, None),
         ] {
             let resolved = resolve(authority, sequences, compiled_cuda, None);
             let mut engine = crate::EngineConfig::default();
@@ -7151,7 +6991,7 @@ mod tests {
             ("32", RuntimeConfigSource::Default),
         ] {
             let resolved = resolve(
-                ExecutionResourceAuthority::PlanRuntime,
+                ExecutionPlanningModel::CompiledPlan,
                 4,
                 true,
                 Some(RuntimeConfigEntry::new(key, value, source)),
@@ -7199,7 +7039,7 @@ mod tests {
         ] {
             let resolved = scheduler_resolution(
                 "metal",
-                ExecutionResourceAuthority::PlanRuntime,
+                ExecutionPlanningModel::CompiledPlan,
                 4,
                 snapshot_with_sources(&[(
                     "FERRUM_ACTIVE_DECODE_PREFILL_CHUNK",
@@ -7248,7 +7088,7 @@ mod tests {
         ] {
             let resolved = scheduler_resolution(
                 "metal",
-                ExecutionResourceAuthority::PlanRuntime,
+                ExecutionPlanningModel::CompiledPlan,
                 4,
                 snapshot_with_sources(&[(key, value, RuntimeConfigSource::Cli)]),
             );
@@ -7464,6 +7304,37 @@ mod tests {
     }
 
     #[test]
+    fn execution_planning_model_preserves_resolved_config_wire_and_runtime_hash() {
+        for (planning_model, wire_label) in [
+            (ExecutionPlanningModel::ExecutorManaged, "legacy_engine"),
+            (ExecutionPlanningModel::CompiledPlan, "plan_runtime"),
+        ] {
+            let resolved = FerrumConfigBuilder::new(RuntimeConfigSnapshot::default())
+                .with_execution_planning_model(planning_model)
+                .resolve()
+                .unwrap();
+            let historical_wire = serde_json::to_value(&resolved).unwrap();
+            assert_eq!(historical_wire["execution_resource_authority"], wire_label);
+            assert!(historical_wire.get("execution_planning_model").is_none());
+            let reread: ResolvedFerrumConfig =
+                serde_json::from_value(historical_wire.clone()).unwrap();
+            assert_eq!(reread.execution_planning_model, planning_model);
+            assert_eq!(reread.runtime_config, resolved.runtime_config);
+            assert_eq!(reread.runtime_env_hash(), resolved.runtime_env_hash());
+            assert_eq!(serde_json::to_value(&reread).unwrap(), historical_wire);
+            let effective = reread.effective_config_document();
+            assert_eq!(effective["schema_version"], 1);
+            assert_eq!(effective["execution_resource_authority"], wire_label);
+            assert_eq!(effective["admission"]["resource_authority"], wire_label);
+            assert_eq!(
+                effective["attention_execution"]["resource_authority"],
+                wire_label
+            );
+            assert!(effective.get("execution_planning_model").is_none());
+        }
+    }
+
+    #[test]
     fn renders_effective_config_and_decision_trace_artifacts() {
         let resolved = m3(&[], CompiledKernelFeatures::m3_fast_path_without_fa2())
             .resolve()
@@ -7597,8 +7468,8 @@ mod tests {
         let key = crate::Q4_MMVQ_WEIGHT_DECODE_CONFIG_KEY;
         for backend in ["cpu", "metal", "cuda"] {
             for authority in [
-                ExecutionResourceAuthority::LegacyEngine,
-                ExecutionResourceAuthority::PlanRuntime,
+                ExecutionPlanningModel::ExecutorManaged,
+                ExecutionPlanningModel::CompiledPlan,
             ] {
                 for compiled in [false, true] {
                     for mode in ["baseline", "shared-m8", "shared-m4-m8"] {
@@ -7611,11 +7482,11 @@ mod tests {
                                 RuntimeConfigEntry::new(key, mode, RuntimeConfigSource::Cli),
                             ]))
                             .with_hardware_capabilities(hardware)
-                            .with_execution_resource_authority(authority);
+                            .with_execution_planning_model(authority);
                         let result = builder.resolve();
                         let supported = mode == "baseline"
                             || (backend == "cuda"
-                                && authority == ExecutionResourceAuthority::PlanRuntime
+                                && authority == ExecutionPlanningModel::CompiledPlan
                                 && compiled);
                         if supported {
                             let resolved = result.unwrap();
@@ -7655,7 +7526,7 @@ mod tests {
                 RuntimeConfigEntry::new(key, "shared-m8", source),
             ]))
             .with_hardware_capabilities(hardware)
-            .with_execution_resource_authority(ExecutionResourceAuthority::PlanRuntime)
+            .with_execution_planning_model(ExecutionPlanningModel::CompiledPlan)
             .resolve()
             .unwrap();
             let entry = resolved
@@ -7672,8 +7543,8 @@ mod tests {
         let key = crate::Q5_MMVQ_WEIGHT_DECODE_CONFIG_KEY;
         for backend in ["cpu", "metal", "cuda"] {
             for authority in [
-                ExecutionResourceAuthority::LegacyEngine,
-                ExecutionResourceAuthority::PlanRuntime,
+                ExecutionPlanningModel::ExecutorManaged,
+                ExecutionPlanningModel::CompiledPlan,
             ] {
                 for compiled in [false, true] {
                     for mode in ["baseline", "shared-m8", "shared-m4-m8"] {
@@ -7686,11 +7557,11 @@ mod tests {
                                 RuntimeConfigEntry::new(key, mode, RuntimeConfigSource::Cli),
                             ]))
                             .with_hardware_capabilities(hardware)
-                            .with_execution_resource_authority(authority);
+                            .with_execution_planning_model(authority);
                         let result = builder.resolve();
                         let supported = mode == "baseline"
                             || (backend == "cuda"
-                                && authority == ExecutionResourceAuthority::PlanRuntime
+                                && authority == ExecutionPlanningModel::CompiledPlan
                                 && compiled);
                         if supported {
                             let resolved = result.unwrap();
@@ -7730,7 +7601,7 @@ mod tests {
                 RuntimeConfigEntry::new(key, "shared-m8", source),
             ]))
             .with_hardware_capabilities(hardware)
-            .with_execution_resource_authority(ExecutionResourceAuthority::PlanRuntime)
+            .with_execution_planning_model(ExecutionPlanningModel::CompiledPlan)
             .resolve()
             .unwrap();
             let entry = resolved
@@ -7748,8 +7619,8 @@ mod tests {
         let key = crate::Q8_PROJECTION_WEIGHT_PREPARATION_CONFIG_KEY;
         for backend in ["cpu", "cuda"] {
             for authority in [
-                ExecutionResourceAuthority::LegacyEngine,
-                ExecutionResourceAuthority::PlanRuntime,
+                ExecutionPlanningModel::ExecutorManaged,
+                ExecutionPlanningModel::CompiledPlan,
             ] {
                 for compiled in [false, true] {
                     for mode in ["auto", "compressed", "predecoded-f32"] {
@@ -7761,12 +7632,12 @@ mod tests {
                                 RuntimeConfigEntry::new(key, mode, RuntimeConfigSource::Cli),
                             ]))
                             .with_hardware_capabilities(hardware)
-                            .with_execution_resource_authority(authority)
+                            .with_execution_planning_model(authority)
                             .resolve();
                         let supported = mode != "predecoded-f32"
                             || (backend == "cuda"
                                 && compiled
-                                && authority == ExecutionResourceAuthority::PlanRuntime);
+                                && authority == ExecutionPlanningModel::CompiledPlan);
                         if supported {
                             let resolved = result.unwrap();
                             let mut engine = crate::EngineConfig::default();
@@ -7886,42 +7757,48 @@ mod tests {
     #[test]
     fn sequence_backing_growth_requires_explicit_cuda_resident_execution() {
         let key = crate::SEQUENCE_BACKING_GROWTH_CONFIG_KEY;
-        use ExecutionResourceAuthority::{LegacyEngine, PlanRuntime};
+        use ExecutionPlanningModel::{CompiledPlan, ExecutorManaged};
         for (backend, authority, preparation, mode, supported) in [
-            ("cpu", PlanRuntime, "full", "exact", true),
+            ("cpu", CompiledPlan, "full", "exact", true),
             (
                 "cuda",
-                PlanRuntime,
+                CompiledPlan,
                 "resident-decode-program",
                 "paged-group4",
                 true,
             ),
-            ("cuda", PlanRuntime, "full", "paged-group4", false),
+            ("cuda", CompiledPlan, "full", "paged-group4", false),
             (
                 "cuda",
-                PlanRuntime,
+                CompiledPlan,
                 "resident-decode-program",
                 "paged-group4-grow-only",
                 true,
             ),
-            ("cuda", PlanRuntime, "full", "paged-group4-grow-only", false),
+            (
+                "cuda",
+                CompiledPlan,
+                "full",
+                "paged-group4-grow-only",
+                false,
+            ),
             (
                 "cpu",
-                PlanRuntime,
+                CompiledPlan,
                 "resident-decode-program",
                 "paged-group4-grow-only",
                 false,
             ),
             (
                 "metal",
-                PlanRuntime,
+                CompiledPlan,
                 "resident-decode-program",
                 "paged-group4-grow-only",
                 false,
             ),
             (
                 "cuda",
-                LegacyEngine,
+                ExecutorManaged,
                 "resident-decode-program",
                 "paged-group4-grow-only",
                 false,
@@ -7955,7 +7832,7 @@ mod tests {
             hardware.compiled_features.cuda = backend == "cuda";
             let builder = FerrumConfigBuilder::new(entries)
                 .with_hardware_capabilities(hardware)
-                .with_execution_resource_authority(authority);
+                .with_execution_planning_model(authority);
             assert_eq!(
                 builder.sequence_backing_growth_decision().is_ok(),
                 supported

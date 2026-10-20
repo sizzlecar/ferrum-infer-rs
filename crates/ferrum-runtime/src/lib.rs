@@ -3,8 +3,11 @@
 //! Runtime authority and evidence are validated independently of product
 //! request orchestration and concrete device backends.
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 extern crate self as ferrum_runtime;
+
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_support;
 
 mod admission;
 mod completion;
@@ -12,6 +15,7 @@ mod device;
 mod error;
 mod event;
 mod execution;
+mod execution_facts;
 mod identity;
 mod model;
 mod numerical;
@@ -30,6 +34,7 @@ pub use device::*;
 pub use error::*;
 pub use event::*;
 pub use execution::*;
+pub use execution_facts::*;
 pub use identity::*;
 pub use model::*;
 pub use numerical::*;

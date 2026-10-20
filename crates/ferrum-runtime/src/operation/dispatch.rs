@@ -8,26 +8,28 @@ use super::super::{
     DeviceCommandLogicalWork, DeviceComputePathRequirement, DeviceReusableExecutionCapture,
     DeviceReusableExecutionInvocation, DeviceReusableExecutionProgram,
     DeviceReusableExecutionProgramId, DeviceReusableExecutionTopologyFingerprint, DeviceRuntime,
-    DeviceTimingMode, ExecutablePlanView, ExecutionIdentityEnvelope, ExecutionIdentityParts,
-    ExecutionLane, InvocationResourceLease, LaneSubmitOutcome, NodeId, NodeInvocationId,
-    OperationId, ParticipantNodeKey, PreparedStepSubmissionWave, ProgramBindingNodeBinding,
-    ProviderId, ResourceId, SpanId, StepParticipantFrameAssignment, SubmissionWavePurpose,
-    TrustedActiveSequenceBinding, VNextError, EXECUTION_IDENTITY_VERSION,
+    DeviceTimingMode, ExecutablePlanView, ExecutionFactsCapture, ExecutionIdentityEnvelope,
+    ExecutionIdentityParts, ExecutionLane, InvocationResourceLease, LaneSubmitOutcome, NodeId,
+    NodeInvocationId, OperationId, ParticipantNodeKey, PreparedStepSubmissionWave,
+    ProgramBindingNodeBinding, ProviderId, ResourceId, SpanId, StepParticipantFrameAssignment,
+    SubmissionObservation, SubmissionWavePurpose, TrustedActiveSequenceBinding, VNextError,
+    EXECUTION_IDENTITY_VERSION,
 };
 use super::backing_upload::encode_submission_wave_backing_upload;
 use super::determinism::{
     SubmissionWaveDeterminismHandle, SubmissionWaveDeterminismReadbackPlan,
     SubmissionWaveDeterminismRestore,
 };
+use super::device_facts::{PreparedDeviceFacts, SubmissionAttachments};
 use super::dispatch_contract::{
-    BoundDeviceSubmissionAttribution, DisabledSubmissionWaveDispatchTimingSink,
-    DispatchRetryAuthority, OperationDispatchError, ProfiledSubmissionHandle,
-    SubmissionExecutionPolicy, SubmissionScratchInitialization, SubmissionWaveDispatchError,
-    SubmissionWaveDispatchStage, SubmissionWaveDispatchStageTimer,
+    DisabledSubmissionWaveDispatchTimingSink, DispatchRetryAuthority, OperationDispatchError,
+    ProfiledSubmissionHandle, SubmissionExecutionPolicy, SubmissionScratchInitialization,
+    SubmissionWaveDispatchError, SubmissionWaveDispatchStage, SubmissionWaveDispatchStageTimer,
     SubmissionWaveDispatchTimingSink, SubmissionWaveInputUpload,
 };
 use super::foundation::invalid_operation;
 use super::invocation::OperationInvocationResources;
+use super::work_facts::PreparedSubmissionWork;
 use super::workspace_encoding::{
     encode_provider_workspace_initialization, encode_submission_wave_workspace_initializations,
 };
@@ -922,6 +924,7 @@ impl OperationDispatch {
                         return Err(OperationDispatchError::PostSubmitContract {
                             error,
                             completion,
+                            observation: SubmissionObservation::default(),
                         });
                     }
                 };
@@ -930,6 +933,7 @@ impl OperationDispatch {
                     return Err(OperationDispatchError::PostSubmitContract {
                         error: invalid_operation("operation submit completion runtime drifted"),
                         completion,
+                        observation: SubmissionObservation::default(),
                     });
                 }
                 Ok(completion)
@@ -987,6 +991,7 @@ impl OperationDispatch {
             batch_identity,
             active_bindings,
             timing_mode,
+            ExecutionFactsCapture::Off,
             input_uploads,
             SubmissionExecutionPolicy::adaptive(),
             None,
@@ -1022,6 +1027,7 @@ impl OperationDispatch {
             batch_identity,
             active_bindings,
             timing_mode,
+            ExecutionFactsCapture::Off,
             input_uploads,
             execution_policy,
             None,
@@ -1062,6 +1068,7 @@ impl OperationDispatch {
             batch_identity,
             active_bindings,
             timing_mode,
+            ExecutionFactsCapture::Off,
             input_uploads,
             execution_policy,
             None,
@@ -1080,6 +1087,7 @@ impl OperationDispatch {
         batch_identity: &BatchOperationIdentity,
         active_bindings: I,
         timing_mode: DeviceTimingMode,
+        facts_capture: ExecutionFactsCapture,
         input_uploads: &[SubmissionWaveInputUpload],
         execution_policy: SubmissionExecutionPolicy,
         strategy: ferrum_types::InvocationPreparationStrategy,
@@ -1110,6 +1118,7 @@ impl OperationDispatch {
             batch_identity,
             active_bindings,
             timing_mode,
+            facts_capture,
             input_uploads,
             execution_policy,
             None,
@@ -1160,6 +1169,7 @@ impl OperationDispatch {
             batch_identity,
             active_bindings,
             timing_mode,
+            ExecutionFactsCapture::Off,
             &[],
             SubmissionExecutionPolicy::determinism_eager(scratch_fill),
             Some(restore),
@@ -1245,6 +1255,7 @@ impl OperationDispatch {
             batch_identity,
             active_bindings,
             timing_mode,
+            ExecutionFactsCapture::Off,
             &[],
             SubmissionExecutionPolicy::determinism_replayed(scratch_fill),
             Some(restore),
@@ -1288,6 +1299,7 @@ impl OperationDispatch {
             batch_identity,
             active_bindings,
             timing_mode,
+            ExecutionFactsCapture::Off,
             input_uploads,
             SubmissionExecutionPolicy::adaptive(),
             None,
@@ -1324,6 +1336,7 @@ impl OperationDispatch {
             batch_identity,
             active_bindings,
             timing_mode,
+            ExecutionFactsCapture::Off,
             input_uploads,
             execution_policy,
             None,
@@ -1362,6 +1375,7 @@ impl OperationDispatch {
             batch_identity,
             active_bindings,
             timing_mode,
+            ExecutionFactsCapture::Off,
             input_uploads,
             execution_policy,
             None,
@@ -1380,6 +1394,7 @@ impl OperationDispatch {
         batch_identity: &BatchOperationIdentity,
         active_bindings: I,
         timing_mode: DeviceTimingMode,
+        facts_capture: ExecutionFactsCapture,
         input_uploads: &[SubmissionWaveInputUpload],
         reusable_program: &DeviceReusableExecutionProgram,
         execution_policy: SubmissionExecutionPolicy,
@@ -1411,6 +1426,7 @@ impl OperationDispatch {
             batch_identity,
             active_bindings,
             timing_mode,
+            facts_capture,
             input_uploads,
             execution_policy,
             None,
@@ -1429,6 +1445,7 @@ impl OperationDispatch {
         batch_identity: &BatchOperationIdentity,
         active_bindings: I,
         timing_mode: DeviceTimingMode,
+        facts_capture: ExecutionFactsCapture,
         input_uploads: &[SubmissionWaveInputUpload],
         execution_policy: SubmissionExecutionPolicy,
         determinism_restore: Option<&SubmissionWaveDeterminismRestore>,
@@ -1589,6 +1606,8 @@ impl OperationDispatch {
                 "replay-required submission requires one sealed reusable execution program",
             )));
         }
+        let work = PreparedSubmissionWork::for_wave(facts_capture, batch_identity, &wave)
+            .map_err(SubmissionWaveDispatchError::Contract)?;
         wave.begin_dispatch()
             .map_err(SubmissionWaveDispatchError::Contract)?;
         let mut completion =
@@ -1620,6 +1639,7 @@ impl OperationDispatch {
             timing_mode,
             effective_compute_path,
         );
+        commands.set_execution_facts_capture(facts_capture);
         if effective_compute_path
             == DeviceComputePathRequirement::ReplayedWithDeclaredEagerBoundaries
         {
@@ -1914,7 +1934,8 @@ impl OperationDispatch {
                                 binding_node_index,
                                 active_bindings.clone(),
                             )
-                            .map_err(SubmissionWaveDispatchError::Contract)?;
+                            .map_err(SubmissionWaveDispatchError::Contract)?
+                            .with_execution_facts_capture(facts_capture);
                             drop(invocation_stage);
                             let expected_phase = invocation.operation().profile_phase;
                             let program_binding = invocation.program_binding().cloned();
@@ -2074,7 +2095,8 @@ impl OperationDispatch {
                     node_index,
                     active_bindings.clone(),
                 )
-                .map_err(SubmissionWaveDispatchError::Contract)?;
+                .map_err(SubmissionWaveDispatchError::Contract)?
+                .with_execution_facts_capture(facts_capture);
                 drop(invocation_stage);
                 let expected_phase = invocation.operation().profile_phase;
                 let program_binding = invocation.program_binding().cloned();
@@ -2223,7 +2245,8 @@ impl OperationDispatch {
                     node_index,
                     active_bindings.clone(),
                 )
-                .map_err(SubmissionWaveDispatchError::Contract)?;
+                .map_err(SubmissionWaveDispatchError::Contract)?
+                .with_execution_facts_capture(facts_capture);
                 drop(invocation_stage);
                 let expected_phase = invocation.operation().profile_phase;
                 let program_binding = invocation.program_binding().cloned();
@@ -2452,6 +2475,8 @@ impl OperationDispatch {
                 });
             }
         }
+        let device_facts = PreparedDeviceFacts::capture(facts_capture, &commands, reusable_program)
+            .map_err(SubmissionWaveDispatchError::Contract)?;
         completion.mark_submission_started();
         let submit_outcome = lane_reservation.submit_with_timing(commands, timing_sink);
         drop(lane_reservation);
@@ -2477,62 +2502,33 @@ impl OperationDispatch {
                 Err(SubmissionWaveDispatchError::SubmissionIndeterminate { recovery })
             }
             LaneSubmitOutcome::Submitted(fence) => {
-                // Attribution runs after submission, so even a panicking runtime
-                // must leave the original fence armed and observable.
-                let device_attribution =
-                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        runtime.submission_attribution(&fence)
-                    }));
+                let attachments = SubmissionAttachments::read(runtime, &fence, facts_capture);
+                let attachment_panicked = attachments.panicked();
                 let completion_arm_stage = SubmissionWaveDispatchStageTimer::start(
                     timing_sink,
                     SubmissionWaveDispatchStage::CompletionArm,
                 );
-                let completion = match completion.arm(fence, timing_mode) {
-                    Ok(completion) => completion,
-                    Err((error, completion)) => {
-                        return Err(SubmissionWaveDispatchError::PostSubmitContract {
-                            error,
-                            completion,
-                        });
-                    }
+                let (completion, arm_error) = match completion.arm(fence, timing_mode) {
+                    Ok(completion) => (completion, None),
+                    Err((error, completion)) => (completion, Some(error)),
                 };
-                let device_attribution = match device_attribution {
-                    Ok(attribution) => attribution,
-                    Err(_) => {
-                        lane.fail_closed();
-                        return Err(SubmissionWaveDispatchError::PostSubmitContract {
-                            error: invalid_operation("wave attribution panicked after submission"),
-                            completion,
-                        });
-                    }
-                };
-                if !lane.current_descriptor_matches_snapshot() {
+                let (observation, observation_error) =
+                    attachments.bind(completion.receipt(), work, device_facts);
+                let drifted = !lane.current_descriptor_matches_snapshot();
+                if attachment_panicked || drifted {
                     lane.fail_closed();
+                }
+                if let Some(error) = arm_error.or(observation_error).or_else(|| {
+                    drifted.then(|| invalid_operation("wave submit completion runtime drifted"))
+                }) {
                     return Err(SubmissionWaveDispatchError::PostSubmitContract {
-                        error: invalid_operation("wave submit completion runtime drifted"),
+                        error,
                         completion,
+                        observation,
                     });
                 }
-                let attribution = match device_attribution
-                    .map(|device| {
-                        BoundDeviceSubmissionAttribution::new(
-                            batch_identity.clone(),
-                            completion.receipt().fingerprint().to_owned(),
-                            device,
-                        )
-                    })
-                    .transpose()
-                {
-                    Ok(attribution) => attribution,
-                    Err(error) => {
-                        return Err(SubmissionWaveDispatchError::PostSubmitContract {
-                            error,
-                            completion,
-                        });
-                    }
-                };
                 drop(completion_arm_stage);
-                Ok(ProfiledSubmissionHandle::new(completion, attribution))
+                Ok(ProfiledSubmissionHandle::new(completion, observation))
             }
         };
         drop(lane_stage);

@@ -280,6 +280,7 @@ fn execute_observed(
                 &identity,
                 active.iter(),
                 DeviceTimingMode::Off,
+                ExecutionFactsCapture::Off,
                 &uploads,
                 replay,
                 SubmissionExecutionPolicy::determinism_replayed(0xa5),
@@ -297,6 +298,7 @@ fn execute_observed(
                 &identity,
                 active.iter(),
                 DeviceTimingMode::Off,
+                ExecutionFactsCapture::Off,
                 &uploads,
                 SubmissionExecutionPolicy::adaptive(),
                 InvocationPreparationStrategy::DecodeSegmentProgram,
@@ -313,7 +315,8 @@ fn execute_observed(
     if let Some(diagnostic) = diagnostic.as_mut() {
         diagnostic.prepare_and_submit_ns = prepare_started.unwrap().elapsed().as_nanos();
     }
-    let (handle, attribution) = profiled.into_parts();
+    let (handle, observation) = profiled.into_parts();
+    let (_, attribution, _) = observation.into_parts();
     let bootstrap_step = match &retire {
         Retire::Bootstrap(step) => Some(Arc::downgrade(step)),
         _ => None,

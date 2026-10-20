@@ -4,7 +4,6 @@ use super::*;
 use ferrum_engine::ContinuousBatchEngine;
 use ferrum_interfaces::{sampler::GreedySampler, Tokenizer};
 use ferrum_scheduler::ContinuousBatchScheduler;
-use ferrum_testkit::MockTensorFactory;
 use ferrum_tokenizer::HuggingFaceTokenizer;
 use ferrum_types::FerrumError;
 use futures::FutureExt;
@@ -22,7 +21,7 @@ use tokenizers::{
 mod executor;
 mod structured;
 mod tools;
-use executor::ScriptedExecutor;
+use executor::{ScriptedExecutor, ScriptedObservation};
 
 const STOP: &str = "STOP";
 const ORDINARY_EOS: &str = "<|endoftext|>";
@@ -37,7 +36,7 @@ struct Observation {
     prompt_tokens: usize,
     generated_tokens: usize,
     decoded_inputs: Vec<String>,
-    executor: Arc<ScriptedExecutor>,
+    executor: Arc<ScriptedObservation>,
 }
 
 fn template(protocol: ModelOutputProtocol) -> ModelChatTemplate {
@@ -118,10 +117,7 @@ async fn request(
         .iter()
         .map(|piece| tokenizer.token_id(piece).unwrap())
         .collect();
-    let executor = Arc::new(ScriptedExecutor::new(
-        tokenizer.vocab_size(),
-        script.clone(),
-    ));
+    let executor = ScriptedExecutor::new(tokenizer.vocab_size(), script.clone());
     let response = request_with_executor(
         protocol,
         tokenizer,
@@ -142,7 +138,7 @@ async fn request(
 async fn request_with_executor(
     protocol: ModelOutputProtocol,
     tokenizer: Arc<HuggingFaceTokenizer>,
-    executor: Arc<ScriptedExecutor>,
+    executor: ScriptedExecutor,
     max_tokens: usize,
     stop: Option<&str>,
     stream: bool,
@@ -170,27 +166,29 @@ async fn request_with_executor(
 async fn request_with_wire(
     protocol: ModelOutputProtocol,
     tokenizer: Arc<HuggingFaceTokenizer>,
-    executor: Arc<ScriptedExecutor>,
+    executor: ScriptedExecutor,
     wire: Value,
 ) -> Observation {
     let mut config = EngineConfig::default();
     config.model.model_id = ModelId::new("protocol-contract");
     config.scheduler.max_running_requests = 1;
     config.batching.max_num_batched_tokens = 256;
+    let observation = executor.observer();
     let engine = Arc::new(
-        ContinuousBatchEngine::new_plan_runtime(
+        ContinuousBatchEngine::new(
             config.clone(),
             Arc::new(ContinuousBatchScheduler::new(config.scheduler)),
             tokenizer.clone(),
             Arc::new(GreedySampler),
-            executor.clone(),
-            Arc::new(MockTensorFactory),
+            ferrum_execution::ExecutorOwner::new(Box::new(executor)),
         )
         .unwrap(),
     );
+    let executor = observation;
     let router = AxumServer::from_llm(engine.clone())
         .with_prompt_template(Some(template(protocol)))
-        .build_router();
+        .build_router()
+        .unwrap();
     // Preserve timeout/panic outcomes until the production engine is shut down.
     let outcome = AssertUnwindSafe(tokio::time::timeout(Duration::from_secs(5), async {
         let response = post_json(router, "/v1/chat/completions", wire).await;

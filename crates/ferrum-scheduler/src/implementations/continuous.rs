@@ -9,12 +9,19 @@
 //! - Memory-aware scheduling based on KV cache usage
 //! - Preemption support for long-running requests
 
+mod execution_capacity;
+pub use execution_capacity::{ExecutionCapacityDeferral, ExecutionCapacityReleaseSnapshot};
 mod prefix_rendezvous;
 mod prefix_restore;
 pub use prefix_rendezvous::{PrefixRendezvousCandidate, PrefixRendezvousHold, PrefixRequestKey};
 mod pressure;
 mod slo;
+mod time_policy;
 pub use slo::SchedulerSloSnapshot;
+mod token_admission;
+pub use token_admission::{
+    TokenAdmissionAccepted, TokenAdmissionApply, TokenAdmissionCandidate, TokenAdmissionRound,
+};
 
 #[cfg(test)]
 mod historical_replay_tests;
@@ -28,9 +35,11 @@ use pressure::{
 pub use pressure::{
     LogicalWorkGeneration, PressureEpisodeId, PressureEpisodeState, PressureHoldReleaseReason,
     PressureInvariantViolation, PressureInvariantViolationClass, PressureTransition,
-    PressureTransitionKind, PressureTransitionOrdinal, PressureYieldKind, PressureYieldTransaction,
+    PressureTransitionKind, PressureTransitionOrdinal, PressureWaitCondition, PressureYieldKind,
+    PressureYieldTransaction,
 };
 
+use crate::cost_prediction::{BatchSelection, TimePlanningRound};
 use crate::vnext::{
     AdmissionDeferral, AdmissionProbeOutcome, AdmissionQueueEligibility, AdmissionQueueEvent,
     AdmissionTickReceipt, AdmissionWakeEpochs, AdmissionWakeSnapshot, DynamicAdmissionQueue,
@@ -45,12 +54,11 @@ use ferrum_execution::model_executor::{
     ExecutorExecutionMaintenanceRetry, ExecutorPrefillAdmissionReceipt,
 };
 use ferrum_interfaces::scheduler::{PreparedPrefixRestore, SchedulerMetrics};
-use ferrum_runtime::{
-    AdmissionRejected, CapacityAvailabilityEpoch, CapacityAvailabilitySource, CapacityWaitCondition,
-};
+use ferrum_runtime::{AdmissionRejected, CapacityAvailabilityEpoch};
 use ferrum_types::{
-    BatchId, FerrumError, InferenceRequest, InferenceResponse, Priority, RequestId, RequestState,
-    Result, SchedulerConfig, PROMPT_TOKENS_METADATA_KEY,
+    AllocatorCapacityDomain, BatchId, FerrumError, InferenceRequest, InferenceResponse, Priority,
+    RequestId, RequestIngressBoundary, RequestState, Result, SchedulerConfig,
+    PROMPT_TOKENS_METADATA_KEY,
 };
 use indexmap::IndexMap;
 use parking_lot::{Mutex, RwLock};
@@ -64,6 +72,7 @@ use std::{
     },
     time::{Duration, Instant},
 };
+use time_policy::TimeDecision;
 use tracing::{debug, info, warn};
 
 const NO_CAPACITY_BACKPRESSURE_LIMIT: usize = usize::MAX;
@@ -77,7 +86,6 @@ struct ContinuousBatchRuntimeConfig {
     prefill_step_chunk: Option<usize>,
     active_decode_prefill_chunk: Option<usize>,
     active_decode_prefill_token_budget: Option<usize>,
-    scheduler_none_prof: bool,
 }
 
 impl ContinuousBatchRuntimeConfig {
@@ -90,7 +98,6 @@ impl ContinuousBatchRuntimeConfig {
             active_decode_prefill_token_budget: config
                 .active_decode_prefill_token_budget
                 .filter(|budget| *budget > 0),
-            scheduler_none_prof: config.scheduler_none_prof,
         }
     }
 }
@@ -136,6 +143,17 @@ const EXECUTION_READINESS_PENDING: u8 = 0;
 const EXECUTION_READINESS_READY: u8 = 1;
 const EXECUTION_READINESS_FAILED: u8 = 2;
 const EXECUTION_READINESS_CANCELLED: u8 = 3;
+
+/// Output eligibility only: waking this original ticket grants no execution
+/// capacity and cannot affect a replacement with the same RequestId.
+#[derive(Debug, Clone)]
+pub struct OutputReadinessWake(Arc<std::sync::atomic::AtomicBool>);
+
+impl OutputReadinessWake {
+    pub fn resume(&self) {
+        self.0.store(true, Ordering::Release);
+    }
+}
 
 #[derive(Debug)]
 struct ExecutionReadinessState {
@@ -321,6 +339,20 @@ pub struct ExecutionCapacityYieldCompletion {
     disposition: ExecutionCapacityYieldDisposition,
 }
 
+/// Preserve a completed queue mutation when later fence finalization fails.
+/// This is logical feedback, not proof of physical resource release.
+#[derive(Debug)]
+pub struct ExecutionCapacityYieldFailure {
+    victim_requeued: bool,
+    error: FerrumError,
+}
+
+impl ExecutionCapacityYieldFailure {
+    pub fn into_parts(self) -> (bool, FerrumError) {
+        (self.victim_requeued, self.error)
+    }
+}
+
 impl ExecutionCapacityYieldCompletion {
     pub const fn victim_requeued(&self) -> bool {
         self.victim_requeued
@@ -368,55 +400,6 @@ impl ExecutionCapacityYieldCompletion {
 
     pub const fn disposition(&self) -> ExecutionCapacityYieldDisposition {
         self.disposition
-    }
-}
-
-/// Engine-owned physical release capabilities observed at the instant an
-/// authoritative execution-capacity failure is routed to the scheduler.
-///
-/// Building this snapshot is a pressure-only operation. It keeps physical
-/// ownership out of the scheduler while preventing a logical queue phase from
-/// being mistaken for proof that a request can actually release capacity.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct ExecutionCapacityReleaseSnapshot {
-    release_sources_by_request: HashMap<RequestId, Vec<CapacityAvailabilitySource>>,
-}
-
-impl ExecutionCapacityReleaseSnapshot {
-    pub fn new(
-        capabilities: impl IntoIterator<Item = (RequestId, Vec<CapacityAvailabilitySource>)>,
-    ) -> Self {
-        let mut release_sources_by_request = HashMap::new();
-        for (request_id, mut sources) in capabilities {
-            sources.sort_unstable();
-            sources.dedup();
-            if !sources.is_empty() {
-                release_sources_by_request.insert(request_id, sources);
-            }
-        }
-        Self {
-            release_sources_by_request,
-        }
-    }
-
-    fn can_advance(&self, request_id: &RequestId, condition: &CapacityWaitCondition) -> bool {
-        let Some(release_sources) = self.release_sources_by_request.get(request_id) else {
-            return false;
-        };
-        condition
-            .observed()
-            .iter()
-            .any(|observed| release_sources.binary_search(&observed.source()).is_ok())
-    }
-
-    pub fn has_external_releaser(
-        &self,
-        blocked_request_id: &RequestId,
-        condition: &CapacityWaitCondition,
-    ) -> bool {
-        self.release_sources_by_request.keys().any(|request_id| {
-            request_id != blocked_request_id && self.can_advance(request_id, condition)
-        })
     }
 }
 
@@ -470,11 +453,12 @@ pub struct ContinuousBatchRequest {
     /// Stable identity retained across waiting -> active -> waiting cycles.
     pub waiting_admission_ticket: Option<WaitingAdmissionTicket>,
     /// Exact PlanRuntime capacity predicate suppressing blind execution retries.
-    pub execution_capacity_deferral: Option<AdmissionDeferral>,
+    pub execution_capacity_deferral: Option<ExecutionCapacityDeferral>,
     /// Exact non-capacity readiness ticket, currently used for Request-state
     /// hazards. It is compare-exact so a stale waiter cannot unblock a newer
     /// frontier generation that reuses the same product request id.
     execution_readiness_block: Option<ExecutionReadinessBlock>,
+    output_readiness: Option<OutputReadinessWake>,
     /// Scheduler-owned fairness yield after a proven physical backing mutation.
     execution_maintenance_retry: Option<ExecutionMaintenanceRetryTicket>,
     /// Rejects replay of a previously consumed maintenance mutation receipt.
@@ -507,6 +491,7 @@ impl ContinuousBatchRequest {
             waiting_admission_ticket: None,
             execution_capacity_deferral: None,
             execution_readiness_block: None,
+            output_readiness: None,
             execution_maintenance_retry: None,
             last_execution_maintenance_capacity_epoch: None,
         }
@@ -539,6 +524,25 @@ pub type ExecutorAdmissionProbeOutcome =
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExecutorAdmissionQueueObservation {
+    AllocatorCapacitySkippedUnchanged {
+        request_id: RequestId,
+        domain: AllocatorCapacityDomain,
+        observed_release_epoch: u64,
+        current_release_epoch: u64,
+    },
+    AllocatorCapacityResumed {
+        request_id: RequestId,
+        domain: AllocatorCapacityDomain,
+        observed_release_epoch: u64,
+        current_release_epoch: u64,
+    },
+    AllocatorCapacityWaitingForOwner {
+        request_id: RequestId,
+        domain: AllocatorCapacityDomain,
+        progress_owner_id: RequestId,
+        observed_release_epoch: u64,
+        current_release_epoch: u64,
+    },
     PressureHoldReleased {
         episode_id: PressureEpisodeId,
         transition_ordinal: PressureTransitionOrdinal,
@@ -547,8 +551,8 @@ pub enum ExecutorAdmissionQueueObservation {
         progress_baseline: LogicalWorkGeneration,
         progress_current: LogicalWorkGeneration,
         reason: PressureHoldReleaseReason,
-        previous_wait_condition: Option<CapacityWaitCondition>,
-        current_wait_condition: Option<CapacityWaitCondition>,
+        previous_wait_condition: Option<PressureWaitCondition>,
+        current_wait_condition: Option<PressureWaitCondition>,
         ticket: u64,
     },
     SkippedUnchanged {
@@ -600,24 +604,42 @@ type ExecutorAdmissionQueueEvent = AdmissionQueueEvent<
     FerrumError,
 >;
 
+/// This iteration's priority, captured before asynchronous general admission.
+/// It owns no execution authority or capacity: selection still checks the live
+/// queues, readiness, token budget and admission evidence.
+pub struct TokenBatchSelectionIntent {
+    hint: BatchHint,
+    skip_initial_decode: bool,
+}
+
 enum WaitingAdmissionMode<'a> {
     Legacy,
     Prepared {
-        wake: AdmissionWakeSnapshot<'a>,
+        wake: Option<AdmissionWakeSnapshot<'a>>,
         observer: &'a mut dyn FnMut(ExecutorAdmissionQueueObservation),
+        initial_priority: Option<bool>,
     },
     Dynamic {
-        wake: AdmissionWakeSnapshot<'a>,
+        wake: Option<AdmissionWakeSnapshot<'a>>,
         probe: &'a mut dyn FnMut(&InferenceRequest) -> ExecutorAdmissionProbeOutcome,
         observer: Option<&'a mut dyn FnMut(ExecutorAdmissionQueueObservation)>,
     },
 }
 
 impl<'a> WaitingAdmissionMode<'a> {
+    fn initial_priority(&self) -> Option<bool> {
+        match self {
+            Self::Prepared {
+                initial_priority, ..
+            } => *initial_priority,
+            _ => None,
+        }
+    }
+
     fn wake(&self) -> Option<AdmissionWakeSnapshot<'a>> {
         match self {
             Self::Legacy => None,
-            Self::Dynamic { wake, .. } | Self::Prepared { wake, .. } => Some(*wake),
+            Self::Dynamic { wake, .. } | Self::Prepared { wake, .. } => *wake,
         }
     }
 
@@ -823,7 +845,7 @@ pub struct ContinuousBatchScheduler {
     runtime_config: ContinuousBatchRuntimeConfig,
 
     /// Present only when the typed SLO policy is enabled.
-    slo_controller: Option<Mutex<slo::SloController>>,
+    slo_diagnostics: Mutex<SchedulerSloSnapshot>,
 }
 
 /// Continuous batching specific configuration
@@ -905,6 +927,236 @@ impl ContinuousBatchMetrics {
 }
 
 impl ContinuousBatchScheduler {
+    /// Publish one request synchronously under the scheduler's existing queue locks.
+    pub fn submit_request(&self, mut request: InferenceRequest) -> Result<RequestId> {
+        request.ensure_ingress(RequestIngressBoundary::SchedulerApi);
+        self.validate_slo()?;
+        let request_id = request.id.clone();
+        debug!(
+            "Submitting request {} to continuous batch scheduler",
+            request_id
+        );
+
+        // Check queue capacity
+        let waiting_count = self.waiting_count();
+        if waiting_count >= self.config.max_waiting_requests {
+            warn!("Queue is full, rejecting request {}", request_id);
+            return Err(FerrumError::scheduler(
+                "Queue is full, cannot accept more requests",
+            ));
+        }
+
+        // Create continuous batch request
+        let cb_request = ContinuousBatchRequest::new(request);
+
+        // Add to waiting queue
+        let mut waiting_queue = self.waiting_queue.write();
+        let mut request_index = self.request_index.write();
+        // Selection can now await outside this lock. Enforce the queue bound
+        // here as well, so concurrent submissions cannot both consume its last slot.
+        if waiting_queue.len() >= self.config.max_waiting_requests {
+            return Err(FerrumError::scheduler(
+                "Queue is full, cannot accept more requests",
+            ));
+        }
+        if request_index.contains_key(&request_id) {
+            return Err(FerrumError::scheduler(format!(
+                "Request {request_id} is already tracked by the scheduler"
+            )));
+        }
+        let queue_position = waiting_queue.len();
+
+        let mut req = cb_request;
+        req.inner.queue_position = Some(queue_position);
+
+        let ticket = waiting_queue
+            .enqueue(req)
+            .map_err(|error| FerrumError::scheduler(error.to_string()))?;
+        let queued = waiting_queue
+            .request_mut(ticket)
+            .expect("newly enqueued admission ticket remains present");
+        queued.inner.mark_queued_at(Instant::now());
+        queued.waiting_admission_ticket = Some(ticket);
+
+        // Update the lifecycle index and arm fill-first only when this request
+        // starts a new cohort after every prior request has left. Doing both
+        // under the index write lock makes the idle transition exact with
+        // respect to concurrent completion and submission.
+        if request_index.is_empty() {
+            self.fill_first_initial_cohort_armed
+                .store(true, Ordering::Release);
+        }
+        request_index.insert(request_id.clone(), RequestPhase::Waiting);
+
+        info!(
+            "Request {} queued at position {}",
+            request_id, queue_position
+        );
+        Ok(request_id)
+    }
+
+    /// End logical request tracking without claiming that executor capacity was released.
+    pub fn complete_request(
+        &self,
+        request_id: RequestId,
+        response: &InferenceResponse,
+    ) -> Result<()> {
+        debug!("Completing request {}", request_id);
+
+        // Remove from decode queue
+        let mut decode_queue = self.decode_queue.write();
+        if let Some(req) = decode_queue.remove(&request_id) {
+            // Record metrics
+            self.metrics_tracker.record_completion(&req);
+
+            match response.finish_reason {
+                ferrum_types::FinishReason::EOS
+                | ferrum_types::FinishReason::Stop
+                | ferrum_types::FinishReason::Length => {
+                    self.completed_counter.fetch_add(1, Ordering::Relaxed);
+                    debug!("Request {} completed successfully", request_id);
+                }
+                _ => {
+                    self.failed_counter.fetch_add(1, Ordering::Relaxed);
+                    warn!(
+                        "Request {} completed with error: {:?}",
+                        request_id, response.finish_reason
+                    );
+                }
+            }
+
+            // Remove from index
+            self.request_index.write().remove(&request_id);
+            self.record_pressure_frontier_terminal(&request_id);
+
+            Ok(())
+        } else {
+            // Try removing from prefill queue
+            drop(decode_queue);
+            let mut prefill_queue = self.prefill_queue.write();
+            if let Some(pos) = prefill_queue
+                .iter()
+                .position(|r| r.inner.request.id == request_id)
+            {
+                prefill_queue.remove(pos);
+                self.request_index.write().remove(&request_id);
+                self.record_pressure_frontier_terminal(&request_id);
+                match response.finish_reason {
+                    ferrum_types::FinishReason::EOS
+                    | ferrum_types::FinishReason::Stop
+                    | ferrum_types::FinishReason::Length => {
+                        self.completed_counter.fetch_add(1, Ordering::Relaxed);
+                    }
+                    _ => {
+                        self.failed_counter.fetch_add(1, Ordering::Relaxed);
+                        warn!(
+                            "Request {} completed with error during prefill: {:?}",
+                            request_id, response.finish_reason
+                        );
+                    }
+                }
+                return Ok(());
+            }
+            drop(prefill_queue);
+
+            if response.finish_reason == ferrum_types::FinishReason::Error {
+                let mut waiting = self.waiting_queue.write();
+                if let Some(position) =
+                    waiting.position(|request| request.inner.request.id == request_id)
+                {
+                    // A recompute recipient can fail while awaiting fresh
+                    // admission. This is a logical error completion, not a
+                    // cancellation or proof that physical resources ended.
+                    waiting.remove(position);
+                    self.request_index.write().remove(&request_id);
+                    self.record_pressure_frontier_terminal(&request_id);
+                    self.failed_counter.fetch_add(1, Ordering::Relaxed);
+                    return Ok(());
+                }
+            }
+
+            if self
+                .admission_failed_requests
+                .write()
+                .remove(&request_id)
+                .is_some()
+            {
+                self.request_index.write().remove(&request_id);
+                self.failed_counter.fetch_add(1, Ordering::Relaxed);
+                return Ok(());
+            }
+
+            warn!("Attempted to complete unknown request: {}", request_id);
+            Err(FerrumError::scheduler(format!(
+                "Request {} not found in active queues",
+                request_id
+            )))
+        }
+    }
+
+    /// Remove a logical request synchronously; physical release is reported separately.
+    pub fn cancel_request(&self, request_id: RequestId) -> Result<bool> {
+        debug!("Cancelling request {}", request_id);
+
+        // Check and remove from waiting queue
+        {
+            let mut waiting_queue = self.waiting_queue.write();
+            let waiting_position =
+                waiting_queue.position(|request| request.inner.request.id == request_id);
+            if let Some(pos) = waiting_position {
+                waiting_queue.remove(pos);
+                self.request_index.write().remove(&request_id);
+                self.record_pressure_frontier_terminal(&request_id);
+                self.cancelled_counter.fetch_add(1, Ordering::Relaxed);
+                info!("Request {} cancelled from waiting queue", request_id);
+                return Ok(true);
+            }
+        }
+
+        // Check and remove from prefill queue
+        {
+            let mut prefill_queue = self.prefill_queue.write();
+            if let Some(pos) = prefill_queue
+                .iter()
+                .position(|r| r.inner.request.id == request_id)
+            {
+                prefill_queue.remove(pos);
+                self.request_index.write().remove(&request_id);
+                self.record_pressure_frontier_terminal(&request_id);
+                self.cancelled_counter.fetch_add(1, Ordering::Relaxed);
+                warn!("Request {} cancelled during prefill", request_id);
+                return Ok(true);
+            }
+        }
+
+        // Check and remove from decode queue
+        {
+            let mut decode_queue = self.decode_queue.write();
+            if decode_queue.remove(&request_id).is_some() {
+                self.request_index.write().remove(&request_id);
+                self.record_pressure_frontier_terminal(&request_id);
+                self.cancelled_counter.fetch_add(1, Ordering::Relaxed);
+                warn!("Request {} cancelled during decode", request_id);
+                return Ok(true);
+            }
+            drop(decode_queue);
+        }
+
+        if self
+            .admission_failed_requests
+            .write()
+            .remove(&request_id)
+            .is_some()
+        {
+            self.request_index.write().remove(&request_id);
+            self.cancelled_counter.fetch_add(1, Ordering::Relaxed);
+            return Ok(true);
+        }
+
+        warn!("Request {} not found for cancellation", request_id);
+        Ok(false)
+    }
+
     /// Create new continuous batch scheduler
     pub fn new(config: SchedulerConfig) -> Self {
         Self::with_cb_config(config, ContinuousBatchConfig::default())
@@ -917,9 +1169,6 @@ impl ContinuousBatchScheduler {
             cb_config.max_prefill_batch, cb_config.max_decode_batch
         );
         let runtime_config = ContinuousBatchRuntimeConfig::from_scheduler_config(&config);
-        let slo_controller = config
-            .slo
-            .map(|_| Mutex::new(slo::SloController::default()));
 
         Self {
             config,
@@ -968,31 +1217,16 @@ impl ContinuousBatchScheduler {
             metrics_tracker: Arc::new(ContinuousBatchMetrics::new()),
             cb_config,
             runtime_config,
-            slo_controller,
-        }
-    }
-
-    /// Feed only completed, successful execution waves and their actual work.
-    /// Planned work, failures and no-progress retries must not train estimates.
-    pub fn record_execution_step(
-        &self,
-        prefill_tokens: usize,
-        decode_sequences: usize,
-        elapsed: Duration,
-    ) {
-        if let (Some(targets), Some(controller)) = (self.config.slo, &self.slo_controller) {
-            if targets.validate().is_ok() {
-                controller
-                    .lock()
-                    .record(targets, prefill_tokens, decode_sequences, elapsed);
-            }
+            slo_diagnostics: Mutex::new(SchedulerSloSnapshot::default()),
         }
     }
 
     pub fn slo_snapshot(&self) -> Option<SchedulerSloSnapshot> {
-        self.slo_controller
-            .as_ref()
-            .map(|controller| controller.lock().snapshot())
+        self.config.slo.map(|_| {
+            let mut snapshot = self.slo_diagnostics.lock().clone();
+            snapshot.enabled = true;
+            snapshot
+        })
     }
 
     fn validate_slo(&self) -> Result<()> {
@@ -1022,6 +1256,9 @@ impl ContinuousBatchScheduler {
         {
             let prefill = self.prefill_queue.read();
             for request in prefill.iter() {
+                if Self::output_is_blocked(request) {
+                    continue;
+                }
                 if request
                     .execution_readiness_block
                     .as_ref()
@@ -1032,12 +1269,18 @@ impl ContinuousBatchScheduler {
                 let Some(deferral) = request.execution_capacity_deferral.as_ref() else {
                     return Ok(None);
                 };
-                conditions.push(deferral.wait_condition().clone());
+                let Some(native) = deferral.as_native() else {
+                    return Ok(None);
+                };
+                conditions.push(native.wait_condition().clone());
             }
         }
         {
             let decode = self.decode_queue.read();
             for request in decode.requests.values() {
+                if Self::output_is_blocked(request) {
+                    continue;
+                }
                 if request
                     .execution_readiness_block
                     .as_ref()
@@ -1048,7 +1291,10 @@ impl ContinuousBatchScheduler {
                 let Some(deferral) = request.execution_capacity_deferral.as_ref() else {
                     return Ok(None);
                 };
-                conditions.push(deferral.wait_condition().clone());
+                let Some(native) = deferral.as_native() else {
+                    return Ok(None);
+                };
+                conditions.push(native.wait_condition().clone());
             }
         }
         let waiting_queue = self.waiting_queue.read();
@@ -1104,10 +1350,11 @@ impl ContinuousBatchScheduler {
         let condition = ferrum_runtime::CapacityWaitCondition::new(coordinator, observed)
             .map_err(|error| FerrumError::scheduler(error.to_string()))?;
         let pressure = self.pressure_coordinator.lock();
-        if pressure.has_pending_release_for(&condition) {
+        let pressure_condition = condition.clone().into();
+        if pressure.has_pending_release_for(&pressure_condition) {
             return Ok(None);
         }
-        if pressure.all_blocked_without_release_for(&condition) {
+        if pressure.all_blocked_without_release_for(&pressure_condition) {
             return Err(FerrumError::scheduler(
                 "capacity pressure contract reached all blocked frontiers without a pending release",
             ));
@@ -1127,16 +1374,95 @@ impl ContinuousBatchScheduler {
                 .iter()
                 .chain(decode.requests.values())
                 .all(|request| {
-                    request
-                        .execution_readiness_block
-                        .as_ref()
-                        .is_some_and(|block| {
-                            matches!(
-                                block.status(),
-                                EXECUTION_READINESS_PENDING | EXECUTION_READINESS_FAILED
-                            )
-                        })
+                    Self::output_is_blocked(request)
+                        || request
+                            .execution_readiness_block
+                            .as_ref()
+                            .is_some_and(|block| {
+                                matches!(
+                                    block.status(),
+                                    EXECUTION_READINESS_PENDING | EXECUTION_READINESS_FAILED
+                                )
+                            })
                 })
+    }
+
+    /// All active work is parked on a confirmed-release notification or an
+    /// independently observed readiness hold. The engine may wait on its work
+    /// notification; an advanced release epoch makes this false until re-probe.
+    pub fn all_active_allocator_capacity_blocked(&self) -> bool {
+        let epoch = self.capacity_release_epoch.load(Ordering::Acquire);
+        let prefill = self.prefill_queue.read();
+        let decode = self.decode_queue.read();
+        let pressure = self.pressure_coordinator.lock();
+        let mut saw_allocator = false;
+        let all_blocked = prefill
+            .iter()
+            .chain(decode.requests.values())
+            .all(|request| {
+                if Self::output_is_blocked(request) {
+                    return true;
+                }
+                if let Some(ExecutionCapacityDeferral::Allocator {
+                    domain,
+                    release_epoch,
+                }) = request.execution_capacity_deferral.as_ref()
+                {
+                    saw_allocator = true;
+                    return *release_epoch == epoch
+                        || pressure
+                            .allocator_retry_owner(&request.inner.request.id, domain)
+                            .is_some();
+                }
+                request
+                    .execution_readiness_block
+                    .as_ref()
+                    .is_some_and(|block| {
+                        matches!(
+                            block.status(),
+                            EXECUTION_READINESS_PENDING | EXECUTION_READINESS_FAILED
+                        )
+                    })
+            });
+        saw_allocator && all_blocked
+    }
+
+    /// Re-probe allocator waits when an external close can no longer prove a
+    /// future release. Invalidating an observation neither releases capacity
+    /// nor completes a pressure transaction. Exact pending release fences and
+    /// held participants remain blocked until their existing owner settles.
+    /// Returns whether an active wait was cleared and work should be notified.
+    pub fn invalidate_allocator_capacity_waits(&self) -> bool {
+        let mut prefill = self.prefill_queue.write();
+        let mut decode = self.decode_queue.write();
+        let pressure = self.pressure_coordinator.lock();
+        let mut invalidated = false;
+        for request in prefill.iter_mut().chain(decode.requests.values_mut()) {
+            let Some(deferral @ ExecutionCapacityDeferral::Allocator { .. }) =
+                request.execution_capacity_deferral.as_ref()
+            else {
+                continue;
+            };
+            if pressure.has_pending_release_for(&deferral.wait_condition())
+                || deferral
+                    .wait_condition()
+                    .as_allocator()
+                    .is_some_and(|(domain, _)| {
+                        pressure
+                            .allocator_retry_owner(&request.inner.request.id, domain)
+                            .is_some()
+                    })
+                || matches!(
+                    pressure.hold_status(&request.inner.request.id),
+                    PressureHoldStatus::Held { .. }
+                )
+            {
+                continue;
+            }
+            request.execution_capacity_deferral = None;
+            invalidated = true;
+        }
+        invalidated
     }
 
     /// Get number of decoding requests
@@ -1147,6 +1473,11 @@ impl ContinuousBatchScheduler {
     /// Get number of prefilling requests
     pub fn prefilling_count(&self) -> usize {
         self.prefill_queue.read().len()
+    }
+
+    /// Read the scheduler clock without locking or materializing queue contents.
+    pub fn current_iteration(&self) -> u64 {
+        self.current_iteration.load(Ordering::Relaxed)
     }
 
     /// Snapshot queue lengths and counters for explicit scheduler trace artifacts.
@@ -1345,6 +1676,11 @@ impl ContinuousBatchScheduler {
         let result = waiting_queue.requeue(ticket, request);
         match result {
             Ok(()) => {
+                waiting_queue
+                    .request_mut(ticket)
+                    .expect("successfully requeued admission ticket remains present")
+                    .inner
+                    .requeue_at(Instant::now());
                 request_index.insert(request_id, RequestPhase::Waiting);
                 true
             }
@@ -1372,6 +1708,9 @@ impl ContinuousBatchScheduler {
         empty_retry_epoch: Option<u64>,
     ) -> bool {
         let mut waiting_queue = self.waiting_queue.write();
+        if waiting_queue.scan_active() {
+            return false;
+        }
         let mut prefill_queue = self.prefill_queue.write();
         let mut request_index = self.request_index.write();
 
@@ -1387,13 +1726,11 @@ impl ContinuousBatchScheduler {
             req.prefix_restore.begin_admission();
             req.phase = RequestPhase::Prefilling;
             req.inner.state = RequestState::Running;
-            let started_at = chrono::Utc::now();
-            let wait_us = started_at
-                .signed_duration_since(req.inner.submitted_at)
-                .num_microseconds()
-                .unwrap_or(0)
-                .max(0) as u64;
-            req.inner.started_at = Some(started_at);
+            let wait_us = req
+                .inner
+                .mark_started_at(Instant::now())
+                .as_micros()
+                .min(u64::MAX as u128) as u64;
             self.total_wait_time_us
                 .fetch_add(wait_us, Ordering::Relaxed);
             self.admitted_counter.fetch_add(1, Ordering::Relaxed);
@@ -1431,20 +1768,20 @@ impl ContinuousBatchScheduler {
         request.prefix_restore.begin_admission();
         request.phase = RequestPhase::Prefilling;
         request.inner.state = RequestState::Running;
-        let started_at = chrono::Utc::now();
-        let wait_us = started_at
-            .signed_duration_since(request.inner.submitted_at)
-            .num_microseconds()
-            .unwrap_or(0)
-            .max(0) as u64;
-        request.inner.started_at = Some(started_at);
+        let wait_us = request
+            .inner
+            .mark_started_at(Instant::now())
+            .as_micros()
+            .min(u64::MAX as u128) as u64;
         self.total_wait_time_us
             .fetch_add(wait_us, Ordering::Relaxed);
         self.admitted_counter.fetch_add(1, Ordering::Relaxed);
+        let mut prefill = self.prefill_queue.write();
         self.request_index
             .write()
             .insert(request_id.clone(), RequestPhase::Prefilling);
-        self.prefill_queue.write().push_back(request);
+        prefill.push_back(request);
+        drop(prefill);
         self.consume_pressure_hold(&request_id);
         debug!("Typed admission promoted request {} to prefill", request_id);
     }
@@ -1484,130 +1821,19 @@ impl ContinuousBatchScheduler {
                 "dynamic admission requires a typed wake/probe mode",
             ));
         };
-        let wake = *wake;
-        self.dynamic_admission_ticks.fetch_add(1, Ordering::Relaxed);
-        let mut waiting = self.waiting_queue.write();
-        let maximum_probes = waiting.len().min(maximum_probes);
-        let mut events = self.dynamic_admission_events.lock();
-        let observer = std::cell::RefCell::new(observer);
-        let receipt = waiting
-            .schedule_into_observed_with_eligibility(
-                wake,
-                maximum_probes,
-                maximum_admissions,
-                &mut events,
-                |request, ticket| {
-                    if request.prefix_rendezvous.held() {
-                        return AdmissionQueueEligibility::Held;
-                    }
-                    let request_id = &request.inner.request.id;
-                    if !self.pressure_active.load(Ordering::Acquire) {
-                        return AdmissionQueueEligibility::Eligible;
-                    }
-                    let hold_status = {
-                        let coordinator = self.pressure_coordinator.lock();
-                        coordinator.hold_status(request_id)
-                    };
-                    match hold_status {
-                        PressureHoldStatus::Held { .. } => AdmissionQueueEligibility::Held,
-                        PressureHoldStatus::OwnerAdmissionEligible { .. } => {
-                            AdmissionQueueEligibility::Eligible
-                        }
-                        PressureHoldStatus::Released {
-                            episode_id,
-                            progress_owner_id,
-                            progress_baseline,
-                            progress_current,
-                            reason,
-                            ordinal,
-                            previous_wait_condition,
-                            current_wait_condition,
-                        } => {
-                            {
-                                let mut coordinator = self.pressure_coordinator.lock();
-                                if let Err(error) = coordinator.consume_released_hold(request_id) {
-                                    warn!(
-                                        request_id = %request_id,
-                                        error = %error,
-                                        "Pressure coordinator rejected terminal hold release"
-                                    );
-                                    return AdmissionQueueEligibility::Held;
-                                }
-                                self.pressure_active
-                                    .store(coordinator.has_records(), Ordering::Release);
-                            }
-                            if let Some(observer) = observer.borrow_mut().as_deref_mut() {
-                                observer(ExecutorAdmissionQueueObservation::PressureHoldReleased {
-                                    episode_id,
-                                    transition_ordinal: ordinal,
-                                    request_id: request_id.clone(),
-                                    progress_owner_id,
-                                    progress_baseline,
-                                    progress_current,
-                                    reason,
-                                    previous_wait_condition,
-                                    current_wait_condition,
-                                    ticket: ticket.get(),
-                                });
-                            }
-                            AdmissionQueueEligibility::Eligible
-                        }
-                        PressureHoldStatus::None => AdmissionQueueEligibility::Eligible,
-                    }
-                },
-                |_request, _ticket| {},
-                |request, ticket, deferral| {
-                    if let Some(observer) = observer.borrow_mut().as_deref_mut() {
-                        observer(ExecutorAdmissionQueueObservation::SkippedUnchanged {
-                            request_id: request.inner.request.id.clone(),
-                            ticket: ticket.get(),
-                            deferral: deferral.clone(),
-                            current: wake.epochs(),
-                        });
-                    }
-                },
-                |request| probe(&request.inner.request),
-            )
-            .map_err(|error| FerrumError::scheduler(error.to_string()))?;
-        drop(waiting);
-
-        self.dynamic_admission_probes
-            .fetch_add(receipt.probed() as u64, Ordering::Relaxed);
-        self.dynamic_admission_skipped_unchanged
-            .fetch_add(receipt.skipped_unchanged() as u64, Ordering::Relaxed);
-        self.dynamic_admission_deferred
-            .fetch_add(receipt.deferred() as u64, Ordering::Relaxed);
-        self.dynamic_backing_growth_requested
-            .fetch_add(receipt.backing_growth_requested() as u64, Ordering::Relaxed);
-
-        for event in events.drain(..) {
-            match event {
-                AdmissionQueueEvent::Admitted {
-                    request, admission, ..
-                } => self.promote_admitted_request(request, &admission),
-                AdmissionQueueEvent::PermanentRejected {
-                    request, rejection, ..
-                } => self.fail_typed_admission(
-                    request,
-                    FerrumError::request_validation(format!(
-                        "request cannot fit the vNext runtime: {rejection:?}"
-                    )),
-                ),
-                AdmissionQueueEvent::Faulted { request, error, .. } => {
-                    self.fail_typed_admission(request, error)
-                }
-                AdmissionQueueEvent::ContractFaulted { request, error, .. } => {
-                    self.fail_typed_admission(request, FerrumError::scheduler(error.to_string()))
-                }
-                AdmissionQueueEvent::PreemptionRequested { .. } => {}
-                AdmissionQueueEvent::BackingGrowthRequested { .. } => {}
-            }
-        }
-        Ok(receipt)
+        let round = self.begin_admission_round(maximum_probes, maximum_admissions, *wake)?;
+        let mut ignore_observation = |_| {};
+        let observer = observer.as_deref_mut().unwrap_or(&mut ignore_observation);
+        round.run_sync(*probe, observer)
     }
 
     pub fn take_admission_failures(&self) -> Vec<(RequestId, FerrumError)> {
         self.admission_failures.lock().drain(..).collect()
+    }
+
+    /// Transfer one failure so interrupted completion leaves later notices queued.
+    pub fn take_next_admission_failure(&self) -> Option<(RequestId, FerrumError)> {
+        self.admission_failures.lock().pop_front()
     }
 
     /// Fail one still-waiting typed admission after executor maintenance
@@ -1668,7 +1894,7 @@ impl ContinuousBatchScheduler {
         self.create_iteration_batch_with_admission(
             hint,
             WaitingAdmissionMode::Dynamic {
-                wake,
+                wake: Some(wake),
                 probe,
                 observer: None,
             },
@@ -1685,7 +1911,7 @@ impl ContinuousBatchScheduler {
         self.create_iteration_batch_with_admission(
             hint,
             WaitingAdmissionMode::Dynamic {
-                wake,
+                wake: Some(wake),
                 probe,
                 observer: Some(observer),
             },
@@ -1703,8 +1929,62 @@ impl ContinuousBatchScheduler {
     ) -> Result<Option<BatchPlan>> {
         self.create_iteration_batch_with_admission(
             hint,
-            WaitingAdmissionMode::Prepared { wake, observer },
+            WaitingAdmissionMode::Prepared {
+                wake: Some(wake),
+                observer,
+                initial_priority: None,
+            },
         )
+    }
+
+    /// Decide cold-cohort priority before general admission changes the active
+    /// population. This preserves the priority order of synchronous admission
+    /// without retaining scheduler locks across executor preparation.
+    pub fn prepare_token_batch_selection(&self, hint: BatchHint) -> TokenBatchSelectionIntent {
+        let skip_initial_decode = self.skip_decode_for_prefill_first(&hint);
+        TokenBatchSelectionIntent {
+            hint,
+            skip_initial_decode,
+        }
+    }
+
+    /// Select only work already admitted by the common token executor protocol.
+    /// Native snapshots remain optional evidence, never manufactured for an executor.
+    pub fn next_batch_with_token_admissions(
+        &self,
+        intent: TokenBatchSelectionIntent,
+        wake: Option<AdmissionWakeSnapshot<'_>>,
+        observer: &mut dyn FnMut(ExecutorAdmissionQueueObservation),
+        mut planning: Option<&mut TimePlanningRound>,
+    ) -> Result<BatchSelection> {
+        let batch = self.create_iteration_batch_with_time(
+            intent.hint,
+            WaitingAdmissionMode::Prepared {
+                wake,
+                observer,
+                initial_priority: Some(intent.skip_initial_decode),
+            },
+            Instant::now(),
+            planning.as_deref_mut(),
+        )?;
+        if let Some(round) = planning.as_ref() {
+            self.slo_diagnostics.lock().record(round);
+        }
+        Ok(BatchSelection {
+            batch,
+            retry_at: planning.as_ref().and_then(|round| round.retry_at()),
+            time_blocked: planning.as_ref().is_some_and(|round| round.time_blocked()),
+        })
+    }
+
+    pub fn waiting_for_confirmed_capacity_release(&self) -> bool {
+        self.waiting_queue
+            .read()
+            .waits_for_external_release(self.capacity_release_epoch.load(Ordering::Acquire))
+    }
+
+    pub fn confirmed_capacity_release_epoch(&self) -> u64 {
+        self.capacity_release_epoch.load(Ordering::Acquire)
     }
 
     /// Retain dynamically admitted work without constructing an execution
@@ -1719,26 +1999,18 @@ impl ContinuousBatchScheduler {
         probe: &mut dyn FnMut(&InferenceRequest) -> ExecutorAdmissionProbeOutcome,
         observer: &mut dyn FnMut(ExecutorAdmissionQueueObservation),
     ) -> Result<AdmissionTickReceipt> {
-        let active_capacity = self
-            .config
-            .max_running_requests
-            .saturating_sub(self.active_count());
-        let decode_capacity = self
-            .cb_config
-            .max_decode_batch
-            .saturating_sub(self.decoding_count());
-        let available_slots = active_capacity.min(decode_capacity);
-        let available_slots = self
-            .capacity_backpressure_admit_limit()
-            .map(|limit| available_slots.min(limit))
-            .unwrap_or(available_slots)
-            .min(maximum_admissions);
-        let mut mode = WaitingAdmissionMode::Dynamic {
-            wake,
-            probe,
-            observer: Some(observer),
-        };
-        self.admit_waiting_dynamically(available_slots, available_slots, &mut mode)
+        self.prepare_token_admission_observed(maximum_admissions, Some(wake), probe, observer)
+    }
+
+    pub fn prepare_token_admission_observed(
+        &self,
+        maximum_admissions: usize,
+        wake: Option<AdmissionWakeSnapshot<'_>>,
+        probe: &mut dyn FnMut(&InferenceRequest) -> ExecutorAdmissionProbeOutcome,
+        observer: &mut dyn FnMut(ExecutorAdmissionQueueObservation),
+    ) -> Result<AdmissionTickReceipt> {
+        self.begin_token_admission(maximum_admissions, wake)?
+            .run_sync(probe, observer)
     }
 
     /// Maximum waiting-prefix width that can join the next fill-first prefill
@@ -2019,7 +2291,7 @@ impl ContinuousBatchScheduler {
     ) -> Result<ExecutionCapacityAction> {
         self.plan_execution_capacity_pressure(
             std::slice::from_ref(request_id),
-            deferral,
+            deferral.into(),
             release_snapshot,
         )
     }
@@ -2032,7 +2304,32 @@ impl ContinuousBatchScheduler {
         deferral: AdmissionDeferral,
         release_snapshot: &ExecutionCapacityReleaseSnapshot,
     ) -> Result<ExecutionCapacityAction> {
-        self.plan_execution_capacity_pressure(request_ids, deferral, release_snapshot)
+        self.plan_execution_capacity_pressure(request_ids, deferral.into(), release_snapshot)
+    }
+
+    /// Preserve the exact unsubmitted frontier after an allocator fit
+    /// rejection. Capture `observed_release_epoch` before executor dispatch so
+    /// a release concurrent with the failed attempt is not lost.
+    pub fn defer_for_allocator_capacity(
+        &self,
+        request_id: &RequestId,
+        domain: AllocatorCapacityDomain,
+        observed_release_epoch: u64,
+        release_snapshot: &ExecutionCapacityReleaseSnapshot,
+    ) -> Result<ExecutionCapacityAction> {
+        if observed_release_epoch > self.capacity_release_epoch.load(Ordering::Acquire) {
+            return Err(FerrumError::scheduler(
+                "allocator capacity wait uses a future release epoch",
+            ));
+        }
+        self.plan_execution_capacity_pressure(
+            std::slice::from_ref(request_id),
+            ExecutionCapacityDeferral::Allocator {
+                domain,
+                release_epoch: observed_release_epoch,
+            },
+            release_snapshot,
+        )
     }
 
     /// Suspend only the exact active frontiers blocked by a non-capacity
@@ -2102,6 +2399,33 @@ impl ContinuousBatchScheduler {
             deferred_count: installed,
             wake: ExecutionReadinessWake { ticket_id, state },
         })
+    }
+
+    /// The engine serializes this installation with exact outer publication.
+    /// The returned capability belongs to this queue entry, not its string id.
+    pub fn pause_for_output(&self, request_id: &RequestId) -> Result<OutputReadinessWake> {
+        let mut prefill = self.prefill_queue.write();
+        let mut decode = self.decode_queue.write();
+        let request = prefill
+            .iter_mut()
+            .chain(decode.requests.values_mut())
+            .find(|request| &request.inner.request.id == request_id)
+            .ok_or_else(|| FerrumError::scheduler("output pause has no active request"))?;
+        if let Some(wake) = request.output_readiness.as_ref() {
+            if !wake.0.load(Ordering::Acquire) {
+                return Ok(wake.clone());
+            }
+        }
+        let wake = OutputReadinessWake(Arc::new(std::sync::atomic::AtomicBool::new(false)));
+        request.output_readiness = Some(wake.clone());
+        Ok(wake)
+    }
+
+    fn output_is_blocked(request: &ContinuousBatchRequest) -> bool {
+        request
+            .output_readiness
+            .as_ref()
+            .is_some_and(|wake| !wake.0.load(Ordering::Acquire))
     }
 
     fn rollback_execution_readiness_install(
@@ -2257,10 +2581,12 @@ impl ContinuousBatchScheduler {
     fn plan_execution_capacity_pressure(
         &self,
         request_ids: &[RequestId],
-        deferral: AdmissionDeferral,
+        deferral: ExecutionCapacityDeferral,
         release_snapshot: &ExecutionCapacityReleaseSnapshot,
     ) -> Result<ExecutionCapacityAction> {
-        if deferral.action() != ferrum_runtime::DeferredAction::WaitForRelease {
+        if deferral.as_native().is_some_and(|deferral| {
+            deferral.action() != ferrum_runtime::DeferredAction::WaitForRelease
+        }) {
             return Err(FerrumError::scheduler(
                 "active execution-capacity deferral must wait for release",
             ));
@@ -2282,13 +2608,37 @@ impl ContinuousBatchScheduler {
             return Ok(ExecutionCapacityAction::Deferred { count: 0 });
         }
 
-        let candidates =
-            self.execution_capacity_candidates(release_snapshot, deferral.wait_condition());
+        let condition = deferral.wait_condition();
+        let candidates = self.execution_capacity_candidates(release_snapshot, &condition);
+        let pending_release = match &deferral {
+            ExecutionCapacityDeferral::Native(_) => false,
+            ExecutionCapacityDeferral::Allocator { domain, .. } => {
+                if active_ids.len() != 1 {
+                    return Err(FerrumError::scheduler(
+                        "allocator pressure requires the retried singleton frontier",
+                    ));
+                }
+                let pending = release_snapshot.allocator_pending_release(&active_ids[0], domain)?;
+                if !pending
+                    && !candidates.iter().any(|candidate| {
+                        candidate.request_id != active_ids[0] && candidate.advances_wait_source
+                    })
+                {
+                    return Err(FerrumError::resource_exhausted(
+                        "allocator capacity has no live external release contributor",
+                    ));
+                }
+                pending
+            }
+        };
         let decision = {
             let mut coordinator = self.pressure_coordinator.lock();
-            let decision = coordinator
-                .plan_failure(&active_ids, deferral.wait_condition(), &candidates)
-                .map_err(|error| FerrumError::scheduler(error.to_string()))?;
+            let decision = if pending_release {
+                coordinator.plan_failure_with_pending_release(&active_ids, &condition, &candidates)
+            } else {
+                coordinator.plan_failure(&active_ids, &condition, &candidates)
+            }
+            .map_err(|error| FerrumError::scheduler(error.to_string()))?;
             self.pressure_active
                 .store(coordinator.has_records(), Ordering::Release);
             decision
@@ -2326,7 +2676,7 @@ impl ContinuousBatchScheduler {
     fn execution_capacity_candidates(
         &self,
         release_snapshot: &ExecutionCapacityReleaseSnapshot,
-        condition: &CapacityWaitCondition,
+        condition: &PressureWaitCondition,
     ) -> Vec<PressureCandidate> {
         let mut candidates = Vec::new();
         {
@@ -2339,11 +2689,11 @@ impl ContinuousBatchScheduler {
                     progress: request.logical_work_frontier.progress_generation(),
                     recompute_cost: request.logical_work_frontier.recompute_cost(),
                     advances_wait_source: release_snapshot
-                        .can_advance(&request.inner.request.id, condition),
+                        .can_advance_pressure(&request.inner.request.id, condition),
                     blocked_on: request
                         .execution_capacity_deferral
                         .as_ref()
-                        .map(|deferral| deferral.wait_condition().clone()),
+                        .map(ExecutionCapacityDeferral::wait_condition),
                 }
             }));
         }
@@ -2357,11 +2707,11 @@ impl ContinuousBatchScheduler {
                     progress: request.logical_work_frontier.progress_generation(),
                     recompute_cost: request.logical_work_frontier.recompute_cost(),
                     advances_wait_source: release_snapshot
-                        .can_advance(&request.inner.request.id, condition),
+                        .can_advance_pressure(&request.inner.request.id, condition),
                     blocked_on: request
                         .execution_capacity_deferral
                         .as_ref()
-                        .map(|deferral| deferral.wait_condition().clone()),
+                        .map(ExecutionCapacityDeferral::wait_condition),
                 }
             }));
         }
@@ -2378,7 +2728,7 @@ impl ContinuousBatchScheduler {
                     blocked_on: request
                         .execution_capacity_deferral
                         .as_ref()
-                        .map(|deferral| deferral.wait_condition().clone()),
+                        .map(ExecutionCapacityDeferral::wait_condition),
                 }
             }));
         }
@@ -2388,7 +2738,7 @@ impl ContinuousBatchScheduler {
     fn install_execution_capacity_deferral(
         &self,
         request_ids: &[RequestId],
-        deferral: &AdmissionDeferral,
+        deferral: &ExecutionCapacityDeferral,
         yielding: Option<&RequestId>,
     ) -> usize {
         let requested = request_ids.iter().collect::<HashSet<_>>();
@@ -2445,6 +2795,11 @@ impl ContinuousBatchScheduler {
     }
 
     fn record_capacity_release_progress(&self) {
+        self.advance_capacity_release_epoch();
+        self.record_resource_progress();
+    }
+
+    fn advance_capacity_release_epoch(&self) {
         self.capacity_release_epoch.fetch_add(1, Ordering::Relaxed);
         self.capacity_mixed_recompute_epoch
             .fetch_add(1, Ordering::Relaxed);
@@ -2452,12 +2807,27 @@ impl ContinuousBatchScheduler {
             .store(0, Ordering::Relaxed);
         self.capacity_mixed_recompute_observed_free_blocks
             .store(usize::MAX, Ordering::Relaxed);
-        self.record_resource_progress();
     }
 
-    /// Record physical capacity released outside an active scheduler queue.
+    /// Record a physical release confirmed by the execution owner.
+    ///
+    /// Logical completion, cancellation, preemption, and a pending release do
+    /// not establish this fact. The engine calls this once after an `Ended`
+    /// outcome, including when a previously held release reaches that outcome.
+    /// For recompute, requeue the released request before this notification so
+    /// its release-epoch predicate observes the same release. Actual dynamic
+    /// admission still requires the execution owner's capacity snapshot.
     pub fn record_external_capacity_release(&self) {
         self.record_capacity_release_progress();
+    }
+
+    /// Record an actual release after its capacity victim was requeued.
+    /// The requeue has just installed pressure from the failed root cohort;
+    /// the same release must wake its epoch predicate without relaxing that
+    /// fresh admission feedback. An unrelated later release still recovers
+    /// ordinary pressure through `record_external_capacity_release`.
+    pub fn record_external_capacity_release_after_recompute(&self) {
+        self.advance_capacity_release_epoch();
     }
 
     fn record_capacity_recompute_progress(&self) {
@@ -2567,8 +2937,9 @@ impl ContinuousBatchScheduler {
     /// would make `next_batch` schedule the same un-runnable work every
     /// iteration, which can starve decode and spin the scheduler.
     pub fn defer_prefill_to_waiting(&self, request_id: &RequestId) -> bool {
-        let mut prefill_queue = self.prefill_queue.write();
         let mut waiting_queue = self.waiting_queue.write();
+        let mut prefill_queue = self.prefill_queue.write();
+        let has_decode = !self.decode_queue.read().requests.is_empty();
         let mut request_index = self.request_index.write();
         let attempted_prefill_width = prefill_queue.len();
 
@@ -2579,7 +2950,6 @@ impl ContinuousBatchScheduler {
             let mut req = prefill_queue.remove(pos).unwrap();
             req.phase = RequestPhase::Waiting;
             req.inner.state = RequestState::Waiting;
-            req.inner.started_at = None;
             req.prefill_tokens = 0;
             req.kv_blocks.clear();
             req.chunked_prefill = false;
@@ -2590,7 +2960,7 @@ impl ContinuousBatchScheduler {
                 .capacity_release_epoch
                 .load(Ordering::Relaxed)
                 .saturating_add(1);
-            if !self.decode_queue.read().requests.is_empty() {
+            if has_decode {
                 req.capacity_deferred_mixed_attempt_epoch =
                     Some(self.capacity_mixed_recompute_epoch.load(Ordering::Relaxed));
             }
@@ -2612,6 +2982,9 @@ impl ContinuousBatchScheduler {
     /// state. Logical output lives in the engine sequence state; scheduler
     /// token counters are reset so the next prefill rebuilds from that logical
     /// context instead of resuming the stale physical decode phase.
+    /// If requeued, notify `record_external_capacity_release_after_recompute`
+    /// after this attempt; otherwise use `record_external_capacity_release`.
+    /// This method itself does not publish physical release progress.
     pub fn defer_decode_to_waiting_for_capacity(
         &self,
         request_id: &RequestId,
@@ -2651,14 +3024,70 @@ impl ContinuousBatchScheduler {
         Ok(ordinal)
     }
 
+    /// Snapshot only the original episode's live product requests. These
+    /// queue keys remain exact across admission/recompute, but not ID reuse.
+    pub fn execution_capacity_yield_requests(
+        &self,
+        transaction: &PressureYieldTransaction,
+    ) -> Result<Vec<PrefixRequestKey>> {
+        let waiting = self.waiting_queue.read();
+        let prefill = self.prefill_queue.read();
+        let decode = self.decode_queue.read();
+        let requests = self
+            .pressure_coordinator
+            .lock()
+            .release_transaction_requests(transaction)
+            .map_err(|error| FerrumError::scheduler(error.to_string()))?
+            .into_iter()
+            .collect::<HashSet<_>>();
+        let mut keys = waiting
+            .iter()
+            .chain(prefill.iter())
+            .chain(decode.requests.values())
+            .filter(|request| requests.contains(&request.inner.request.id))
+            .filter_map(PrefixRequestKey::from_request)
+            .collect::<Vec<_>>();
+        keys.sort_by_key(PrefixRequestKey::ordinal);
+        Ok(keys)
+    }
+
+    pub fn execution_capacity_request_is_current(&self, key: &PrefixRequestKey) -> bool {
+        let waiting = self.waiting_queue.read();
+        let prefill = self.prefill_queue.read();
+        let decode = self.decode_queue.read();
+        let matches = waiting
+            .iter()
+            .chain(prefill.iter())
+            .chain(decode.requests.values())
+            .any(|request| key.matches(request));
+        matches
+    }
+
+    /// Retain the original fence/holds, but cease promising a release wake.
+    /// Subsequent pressure queries fail explicitly until its real terminal
+    /// observation settles the original transaction.
+    pub fn mark_execution_capacity_yield_unproved(
+        &self,
+        transaction: &PressureYieldTransaction,
+    ) -> Result<bool> {
+        self.pressure_coordinator
+            .lock()
+            .mark_release_observation_failed(transaction)
+            .map_err(|error| FerrumError::scheduler(error.to_string()))
+    }
+
     /// Complete a phase-independent yield after the engine has released all
     /// physical resources and its release fence reached terminal state.
+    /// The caller then records the confirmed physical release with
+    /// `record_external_capacity_release_after_recompute` if a victim was
+    /// requeued, otherwise `record_external_capacity_release`. The failure
+    /// also preserves this fact if a later fence transition rejects.
     pub fn complete_execution_capacity_yield(
         &self,
         transaction: &PressureYieldTransaction,
         attempted_decode_width: usize,
         observed_free_blocks: Option<usize>,
-    ) -> Result<ExecutionCapacityYieldCompletion> {
+    ) -> std::result::Result<ExecutionCapacityYieldCompletion, ExecutionCapacityYieldFailure> {
         let request_id = transaction.victim_request_id();
         let victim_waiting_ticket = self.requeue_execution_capacity_victim(
             request_id,
@@ -2672,17 +3101,26 @@ impl ContinuousBatchScheduler {
         let (release_ordinal, disposition, installed_hold) = {
             let mut coordinator = self.pressure_coordinator.lock();
             if !requeued && transaction.kind() == PressureYieldKind::SelfRecompute {
-                let _ = coordinator
-                    .record_terminal(request_id)
-                    .map_err(|error| FerrumError::scheduler(error.to_string()))?;
+                let _ = coordinator.record_terminal(request_id).map_err(|error| {
+                    ExecutionCapacityYieldFailure {
+                        victim_requeued: requeued,
+                        error: FerrumError::scheduler(error.to_string()),
+                    }
+                })?;
             }
             let completion = coordinator
                 .complete_release_fence(transaction, progress_owner_wait_condition.as_ref())
-                .map_err(|error| FerrumError::scheduler(error.to_string()))?;
+                .map_err(|error| ExecutionCapacityYieldFailure {
+                    victim_requeued: requeued,
+                    error: FerrumError::scheduler(error.to_string()),
+                })?;
             if !requeued && transaction.kind() == PressureYieldKind::PeerHandoff {
-                let _ = coordinator
-                    .record_terminal(request_id)
-                    .map_err(|error| FerrumError::scheduler(error.to_string()))?;
+                let _ = coordinator.record_terminal(request_id).map_err(|error| {
+                    ExecutionCapacityYieldFailure {
+                        victim_requeued: requeued,
+                        error: FerrumError::scheduler(error.to_string()),
+                    }
+                })?;
             }
             self.pressure_active
                 .store(coordinator.has_records(), Ordering::Release);
@@ -2756,14 +3194,14 @@ impl ContinuousBatchScheduler {
     fn execution_capacity_wait_condition(
         &self,
         request_id: &RequestId,
-    ) -> Option<CapacityWaitCondition> {
+    ) -> Option<PressureWaitCondition> {
         if let Some(condition) = self
             .prefill_queue
             .read()
             .iter()
             .find(|request| request.inner.request.id == *request_id)
             .and_then(|request| request.execution_capacity_deferral.as_ref())
-            .map(|deferral| deferral.wait_condition().clone())
+            .map(ExecutionCapacityDeferral::wait_condition)
         {
             return Some(condition);
         }
@@ -2773,7 +3211,7 @@ impl ContinuousBatchScheduler {
             .requests
             .get(request_id)
             .and_then(|request| request.execution_capacity_deferral.as_ref())
-            .map(|deferral| deferral.wait_condition().clone())
+            .map(ExecutionCapacityDeferral::wait_condition)
         {
             return Some(condition);
         }
@@ -2782,11 +3220,16 @@ impl ContinuousBatchScheduler {
             .iter()
             .find(|request| request.inner.request.id == *request_id)
             .and_then(|request| request.execution_capacity_deferral.as_ref())
-            .map(|deferral| deferral.wait_condition().clone())
+            .map(ExecutionCapacityDeferral::wait_condition)
     }
 
     /// Resolve every planned-yield error path so a failed physical release
     /// cannot leave the scheduler claiming a pending fence forever.
+    /// `victim_released` must reflect a confirmed execution-owner release, not
+    /// a pending close. If true, notify physical release after this attempt,
+    /// using `record_external_capacity_release_after_recompute` only when the
+    /// returned requeue fact is true. An error before requeue uses the generic
+    /// `record_external_capacity_release` notification.
     pub fn abort_execution_capacity_yield(
         &self,
         transaction: &PressureYieldTransaction,
@@ -2848,7 +3291,6 @@ impl ContinuousBatchScheduler {
             let waiting_ticket = request.waiting_admission_ticket;
             request.phase = RequestPhase::Waiting;
             request.inner.state = RequestState::Waiting;
-            request.inner.started_at = None;
             request.prefill_tokens = 0;
             request.decode_tokens = 0;
             request.kv_blocks.clear();
@@ -2887,14 +3329,13 @@ impl ContinuousBatchScheduler {
         attempted_decode_width: usize,
         observed_free_blocks: Option<usize>,
     ) -> bool {
-        let mut decode_queue = self.decode_queue.write();
         let mut waiting_queue = self.waiting_queue.write();
+        let mut decode_queue = self.decode_queue.write();
         let mut request_index = self.request_index.write();
 
         if let Some(mut req) = decode_queue.remove(request_id) {
             req.phase = RequestPhase::Waiting;
             req.inner.state = RequestState::Waiting;
-            req.inner.started_at = None;
             req.prefill_tokens = 0;
             req.decode_tokens = 0;
             req.kv_blocks.clear();
@@ -3068,39 +3509,6 @@ impl ContinuousBatchScheduler {
         }
     }
 
-    fn prioritize_ttft(&self, queue: &mut VecDeque<ContinuousBatchRequest>) {
-        let (Some(targets), Some(controller)) = (self.config.slo, &self.slo_controller) else {
-            return;
-        };
-        let prefill_cost = controller.lock().prefill_ms_per_token().unwrap_or(0.0);
-        let now = chrono::Utc::now();
-        let urgency_window_ms = targets.tpot_ms.min(targets.itl_ms);
-        let slack = |request: &ContinuousBatchRequest| {
-            let age_ms = (now - request.inner.submitted_at)
-                .to_std()
-                .unwrap_or_default()
-                .as_secs_f64()
-                * 1000.0;
-            targets.ttft_ms - age_ms - self.remaining_prefill_tokens(request) as f64 * prefill_cost
-        };
-        // Keep non-urgent work stable. Only requests that are within one decode
-        // interval of exhausting their estimated TTFT slack move ahead. Waiting
-        // admission retains its existing FIFO and capacity/fairness barriers.
-        queue.make_contiguous().sort_by(|left, right| {
-            let left_slack = slack(left);
-            let right_slack = slack(right);
-            match (
-                left_slack <= urgency_window_ms,
-                right_slack <= urgency_window_ms,
-            ) {
-                (true, true) => left_slack.total_cmp(&right_slack),
-                (true, false) => std::cmp::Ordering::Less,
-                (false, true) => std::cmp::Ordering::Greater,
-                (false, false) => std::cmp::Ordering::Equal,
-            }
-        });
-    }
-
     fn chunked_prefill_budget_tokens(&self, req: &ContinuousBatchRequest, chunk: usize) -> usize {
         let remaining = if req.prefill_tokens == 0 {
             self.prompt_token_estimate(req)
@@ -3269,13 +3677,13 @@ impl ContinuousBatchScheduler {
     fn add_prefill_requests_to_batch(
         &self,
         iteration: u64,
+        now: Instant,
         hint: &BatchHint,
         batch_requests: &mut Vec<ScheduledRequest>,
         total_tokens: &mut usize,
         scheduled_request_ids: &mut HashSet<RequestId>,
         active_decode_prefill_tokens_remaining: &mut Option<usize>,
-        slo_static_prefill_tokens_remaining: &mut Option<usize>,
-        slo_prefill_limited: &mut bool,
+        planning: &mut Option<&mut TimePlanningRound>,
         active_decode_prefill_chunks_remaining: &mut Option<usize>,
         capacity_deferred_mixed_recompute_slots_remaining: &mut Option<usize>,
         active_decode_prefill_chunk: Option<usize>,
@@ -3289,7 +3697,8 @@ impl ContinuousBatchScheduler {
         }
 
         let mut prefill_queue = self.prefill_queue.write();
-        self.prioritize_ttft(&mut prefill_queue);
+        self.prioritize_ttft(&mut prefill_queue, now, planning.as_deref_mut());
+        let mut rejected = Vec::new();
         for req in prefill_queue.iter_mut() {
             if batch_requests.len() >= hint.max_batch_size {
                 break;
@@ -3307,7 +3716,7 @@ impl ContinuousBatchScheduler {
             if Self::execution_maintenance_retry_is_blocked(req, iteration)? {
                 continue;
             }
-            if Self::execution_capacity_is_blocked(
+            if self.execution_capacity_is_blocked(
                 req,
                 waiting_admission,
                 ExecutionCapacityQueuePhase::Prefill,
@@ -3343,23 +3752,12 @@ impl ContinuousBatchScheduler {
             if let Some(remaining) = active_decode_prefill_tokens_remaining.as_ref() {
                 step_tokens_remaining = step_tokens_remaining.min(*remaining);
             }
-            let prefill_chunk_tokens = self.prefill_budget_tokens(
+            let mut prefill_chunk_tokens = self.prefill_budget_tokens(
                 req,
                 active_decode_prefill_chunk,
                 prefill_step_chunk,
                 step_tokens_remaining,
             );
-            if let Some(static_remaining) = *slo_static_prefill_tokens_remaining {
-                // Count adaptation only when this runnable request would have
-                // received more work under the original static limits.
-                let static_chunk_tokens = self.prefill_budget_tokens(
-                    req,
-                    active_decode_prefill_chunk,
-                    prefill_step_chunk,
-                    static_remaining.min(hint.max_tokens.saturating_sub(*total_tokens)),
-                );
-                *slo_prefill_limited |= prefill_chunk_tokens < static_chunk_tokens;
-            }
             // Skip fully-prefilled requests that are still in the queue
             // (they'll be promoted by mark_prefill_chunk_processed on the
             // next iteration boundary).
@@ -3372,7 +3770,26 @@ impl ContinuousBatchScheduler {
                 }
             }
 
+            if let Some(round) = planning.as_deref_mut() {
+                match self.prefill_time_decision(req, prefill_chunk_tokens, round, now) {
+                    TimeDecision::Allow(tokens) => prefill_chunk_tokens = tokens,
+                    TimeDecision::Hold => continue,
+                    TimeDecision::Reject(error) => {
+                        rejected.push((req.inner.request.id.clone(), error));
+                        continue;
+                    }
+                }
+            }
+
             if *total_tokens + prefill_chunk_tokens <= hint.max_tokens {
+                if let Some(round) = planning.as_deref_mut() {
+                    round.selected_work(self.cost_work(
+                        req,
+                        prefill_chunk_tokens,
+                        false,
+                        round.prefill_shape_policy,
+                    ));
+                }
                 let mut scheduled = req.inner.clone();
                 scheduled.tokens_processed = req.prefill_chunk_offset;
                 scheduled.tokens_to_process = Some(prefill_chunk_tokens);
@@ -3382,9 +3799,6 @@ impl ContinuousBatchScheduler {
                 batch_requests.push(scheduled);
                 *total_tokens += prefill_chunk_tokens;
                 if let Some(remaining) = active_decode_prefill_tokens_remaining.as_mut() {
-                    *remaining = remaining.saturating_sub(prefill_chunk_tokens);
-                }
-                if let Some(remaining) = slo_static_prefill_tokens_remaining.as_mut() {
                     *remaining = remaining.saturating_sub(prefill_chunk_tokens);
                 }
                 if let Some(remaining) = active_decode_prefill_chunks_remaining.as_mut() {
@@ -3399,6 +3813,17 @@ impl ContinuousBatchScheduler {
                         *remaining = remaining.saturating_sub(1);
                     }
                 }
+            }
+        }
+        for (id, error) in rejected {
+            if let Some(index) = prefill_queue
+                .iter()
+                .position(|request| request.inner.request.id == id)
+            {
+                let request = prefill_queue
+                    .remove(index)
+                    .expect("rejected original prefill is still queued");
+                self.fail_typed_admission(request, error);
             }
         }
         Ok(())
@@ -3416,12 +3841,68 @@ impl ContinuousBatchScheduler {
     }
 
     fn execution_capacity_is_blocked(
+        &self,
         req: &mut ContinuousBatchRequest,
         waiting_admission: &mut WaitingAdmissionMode<'_>,
         phase: ExecutionCapacityQueuePhase,
     ) -> Result<bool> {
         let Some(deferral) = req.execution_capacity_deferral.clone() else {
             return Ok(false);
+        };
+        let deferral = match deferral {
+            ExecutionCapacityDeferral::Native(deferral) => deferral,
+            ExecutionCapacityDeferral::Allocator {
+                domain,
+                release_epoch,
+            } => {
+                let current = self.capacity_release_epoch.load(Ordering::Acquire);
+                if current < release_epoch {
+                    return Err(FerrumError::scheduler(
+                        "allocator release notification epoch regressed",
+                    ));
+                }
+                if current != release_epoch {
+                    let owner = self
+                        .pressure_coordinator
+                        .lock()
+                        .allocator_retry_owner(&req.inner.request.id, &domain)
+                        .cloned();
+                    if let Some(owner) = owner {
+                        waiting_admission.observe(
+                            ExecutorAdmissionQueueObservation::AllocatorCapacityWaitingForOwner {
+                                request_id: req.inner.request.id.clone(),
+                                domain,
+                                progress_owner_id: owner,
+                                observed_release_epoch: release_epoch,
+                                current_release_epoch: current,
+                            },
+                        );
+                        // Keep the actual old observation. Owner progress can
+                        // reopen this probe without another physical release.
+                        return Ok(true);
+                    }
+                }
+                let blocked = current == release_epoch;
+                waiting_admission.observe(if blocked {
+                    ExecutorAdmissionQueueObservation::AllocatorCapacitySkippedUnchanged {
+                        request_id: req.inner.request.id.clone(),
+                        domain,
+                        observed_release_epoch: release_epoch,
+                        current_release_epoch: current,
+                    }
+                } else {
+                    ExecutorAdmissionQueueObservation::AllocatorCapacityResumed {
+                        request_id: req.inner.request.id.clone(),
+                        domain,
+                        observed_release_epoch: release_epoch,
+                        current_release_epoch: current,
+                    }
+                });
+                if !blocked {
+                    req.execution_capacity_deferral = None;
+                }
+                return Ok(blocked);
+            }
         };
         let wake = waiting_admission.wake().ok_or_else(|| {
             FerrumError::scheduler(
@@ -3519,6 +4000,10 @@ impl ContinuousBatchScheduler {
     }
 
     fn execution_readiness_is_blocked(req: &mut ContinuousBatchRequest) -> bool {
+        if Self::output_is_blocked(req) {
+            return true;
+        }
+        req.output_readiness = None;
         let Some(block) = req.execution_readiness_block.as_ref() else {
             return false;
         };
@@ -3559,6 +4044,7 @@ impl ContinuousBatchScheduler {
         total_tokens: &mut usize,
         scheduled_request_ids: &mut HashSet<RequestId>,
         waiting_admission: &mut WaitingAdmissionMode<'_>,
+        planning: &mut Option<&mut TimePlanningRound>,
     ) -> Result<()> {
         let has_deferred_recompute_backlog = self.decode_capacity_deferred_backlog_len() > 0;
         let (enforce_execution_backpressure, decode_capacity_backpressure_limit) = {
@@ -3614,7 +4100,7 @@ impl ContinuousBatchScheduler {
             if Self::execution_maintenance_retry_is_blocked(req, iteration)? {
                 continue;
             }
-            if Self::execution_capacity_is_blocked(
+            if self.execution_capacity_is_blocked(
                 req,
                 waiting_admission,
                 ExecutionCapacityQueuePhase::Decode,
@@ -3623,6 +4109,9 @@ impl ContinuousBatchScheduler {
             }
 
             let mut scheduled = req.inner.clone();
+            if let Some(round) = planning.as_deref_mut() {
+                round.selected_work(self.cost_work(req, 1, true, round.prefill_shape_policy));
+            }
             scheduled.tokens_processed = req.total_tokens();
             scheduled.tokens_to_process = Some(1);
             req.logical_work_frontier.mark_scheduled(1);
@@ -3644,18 +4133,21 @@ impl ContinuousBatchScheduler {
     fn create_iteration_batch_with_admission(
         &self,
         hint: BatchHint,
-        mut waiting_admission: WaitingAdmissionMode<'_>,
+        waiting_admission: WaitingAdmissionMode<'_>,
     ) -> Result<Option<BatchPlan>> {
-        self.validate_slo()?;
-        if let Some(controller) = &self.slo_controller {
-            controller.lock().begin_iteration();
-        }
-        let iteration = self.current_iteration.fetch_add(1, Ordering::Relaxed);
-        self.metrics_tracker.record_iteration();
+        self.create_iteration_batch_with_admission_at(hint, waiting_admission, Instant::now())
+    }
 
-        let mut batch_requests = Vec::new();
-        let mut scheduled_request_ids = HashSet::new();
-        let mut total_tokens = 0;
+    fn create_iteration_batch_with_admission_at(
+        &self,
+        hint: BatchHint,
+        waiting_admission: WaitingAdmissionMode<'_>,
+        now: Instant,
+    ) -> Result<Option<BatchPlan>> {
+        self.create_iteration_batch_with_time(hint, waiting_admission, now, None)
+    }
+
+    fn skip_decode_for_prefill_first(&self, hint: &BatchHint) -> bool {
         let prefill_first_target = self
             .runtime_config
             .prefill_first_until_active
@@ -3670,7 +4162,7 @@ impl ContinuousBatchScheduler {
         let capacity_backpressure_active = self.capacity_backpressure_admit_limit().is_some();
         let fill_first_initial_cohort_armed =
             self.fill_first_initial_cohort_armed.load(Ordering::Acquire);
-        let skip_decode_for_prefill_first = fill_first_initial_cohort_armed
+        fill_first_initial_cohort_armed
             && !(self.config.slo.is_some() && decoding_count > 0)
             && !(self
                 .runtime_config
@@ -3683,7 +4175,31 @@ impl ContinuousBatchScheduler {
             && decoding_count < prefill_first_target
             && active_count < prefill_first_target
             && !(capacity_backpressure_active && decoding_count > 0)
-            && (self.prefilling_count() > 0 || self.waiting_count() > 0);
+            && (self.prefilling_count() > 0 || self.waiting_count() > 0)
+    }
+
+    fn create_iteration_batch_with_time(
+        &self,
+        hint: BatchHint,
+        mut waiting_admission: WaitingAdmissionMode<'_>,
+        now: Instant,
+        mut planning: Option<&mut TimePlanningRound>,
+    ) -> Result<Option<BatchPlan>> {
+        self.validate_slo()?;
+        if let Some(round) = planning.as_deref_mut() {
+            round.reset_selection();
+        }
+        let iteration = self.current_iteration.fetch_add(1, Ordering::Relaxed);
+        self.metrics_tracker.record_iteration();
+
+        let mut batch_requests = Vec::new();
+        let mut scheduled_request_ids = HashSet::new();
+        let mut total_tokens = 0;
+        let fill_first_initial_cohort_armed =
+            self.fill_first_initial_cohort_armed.load(Ordering::Acquire);
+        let skip_decode_for_prefill_first = waiting_admission
+            .initial_priority()
+            .unwrap_or_else(|| self.skip_decode_for_prefill_first(&hint));
         // First, collect decode requests (they have priority). The opt-in
         // fill-first experiment skips decodes until the active decode cohort
         // reaches the requested target, reducing early mixed prefill+decode
@@ -3696,6 +4212,7 @@ impl ContinuousBatchScheduler {
                 &mut total_tokens,
                 &mut scheduled_request_ids,
                 &mut waiting_admission,
+                &mut planning,
             )?;
         }
         let mut scheduled_decode_count = batch_requests.len();
@@ -3708,50 +4225,6 @@ impl ContinuousBatchScheduler {
             active_decode_prefill_chunk,
             prefill_step_chunk,
         );
-        let mut slo_static_prefill_tokens_remaining = None;
-        let mut slo_prefill_limited = false;
-        let dynamic_prefill_budget =
-            if let (Some(targets), Some(controller)) = (self.config.slo, &self.slo_controller) {
-                let live_limit = hint.max_tokens.saturating_sub(total_tokens);
-                let static_limit = active_decode_prefill_tokens_remaining
-                    .map_or(live_limit, |limit| limit.min(live_limit));
-                // Follow the existing prefill-queue -> controller lock order.
-                // Waiting admission stays unchanged; once admitted, a request
-                // participates with its real remaining work and chunk ceiling.
-                let prefill_queue = self.prefill_queue.read();
-                let now = chrono::Utc::now();
-                let active_prefills = prefill_queue
-                    .iter()
-                    // Recompute after visible output has no first-token deadline.
-                    .filter(|request| !request.slo_first_token_emitted)
-                    .map(|request| slo::PrefillTtftWork {
-                        remaining_tokens: self.remaining_prefill_tokens(request),
-                        chunk_cap: self.prefill_budget_tokens(
-                            request,
-                            active_decode_prefill_chunk,
-                            prefill_step_chunk,
-                            static_limit,
-                        ),
-                        age_ms: (now - request.inner.submitted_at)
-                            .to_std()
-                            .unwrap_or_default()
-                            .as_secs_f64()
-                            * 1000.0,
-                    });
-                let budget = controller.lock().budget(
-                    targets,
-                    scheduled_decode_count,
-                    static_limit,
-                    active_prefills,
-                );
-                slo_static_prefill_tokens_remaining = budget.map(|_| static_limit);
-                budget
-            } else {
-                None
-            };
-        if let Some(budget) = dynamic_prefill_budget {
-            active_decode_prefill_tokens_remaining = Some(budget);
-        }
         let mut active_decode_prefill_chunks_remaining = self.active_decode_prefill_budget_chunks(
             &hint,
             scheduled_decode_count,
@@ -3801,13 +4274,13 @@ impl ContinuousBatchScheduler {
         // max_tokens, which is pre-allocated to the same budget).
         self.add_prefill_requests_to_batch(
             iteration,
+            now,
             &hint,
             &mut batch_requests,
             &mut total_tokens,
             &mut scheduled_request_ids,
             &mut active_decode_prefill_tokens_remaining,
-            &mut slo_static_prefill_tokens_remaining,
-            &mut slo_prefill_limited,
+            &mut planning,
             &mut active_decode_prefill_chunks_remaining,
             &mut capacity_deferred_mixed_recompute_slots_remaining,
             active_decode_prefill_chunk,
@@ -3893,13 +4366,13 @@ impl ContinuousBatchScheduler {
         // the current batch already contains decode work.
         self.add_prefill_requests_to_batch(
             iteration,
+            now,
             &hint,
             &mut batch_requests,
             &mut total_tokens,
             &mut scheduled_request_ids,
             &mut active_decode_prefill_tokens_remaining,
-            &mut slo_static_prefill_tokens_remaining,
-            &mut slo_prefill_limited,
+            &mut planning,
             &mut active_decode_prefill_chunks_remaining,
             &mut capacity_deferred_mixed_recompute_slots_remaining,
             active_decode_prefill_chunk,
@@ -3922,6 +4395,7 @@ impl ContinuousBatchScheduler {
                 &mut total_tokens,
                 &mut scheduled_request_ids,
                 &mut waiting_admission,
+                &mut planning,
             )?;
             scheduled_decode_count += batch_requests.len() - batch_len_before_decode_fallback;
         }
@@ -3934,56 +4408,11 @@ impl ContinuousBatchScheduler {
                 .store(false, Ordering::Release);
         }
 
-        // FERRUM_SCHED_NONE_PROF=1: log when next_batch is about to return SOME.
-        if self.runtime_config.scheduler_none_prof && !batch_requests.is_empty() {
-            use std::sync::atomic::AtomicU64;
-            static SOME_PROF_N: AtomicU64 = AtomicU64::new(0);
-            let n = SOME_PROF_N.fetch_add(1, Ordering::Relaxed);
-            if n.is_multiple_of(64) {
-                let d_len = self.decode_queue.read().requests.len();
-                let p_len = self.prefill_queue.read().len();
-                let w_len = self.waiting_queue.read().len();
-                eprintln!(
-                    "[sched-some] n={} returning_batch={} | decode_queue={} prefill_queue={} waiting_queue={}",
-                    n,
-                    batch_requests.len(),
-                    d_len,
-                    p_len,
-                    w_len,
-                );
-            }
-        }
         if batch_requests.is_empty() {
-            // FERRUM_SCHED_NONE_PROF=1: log why we returned None. Rate-limited.
-            if self.runtime_config.scheduler_none_prof {
-                use std::sync::atomic::AtomicU64;
-                static NONE_PROF_N: AtomicU64 = AtomicU64::new(0);
-                let n = NONE_PROF_N.fetch_add(1, Ordering::Relaxed);
-                if n.is_multiple_of(512) {
-                    let d_len = self.decode_queue.read().requests.len();
-                    let p_len = self.prefill_queue.read().len();
-                    let w_len = self.waiting_queue.read().len();
-                    let d_count = self.decoding_count();
-                    eprintln!(
-                        "[sched-none] n={} decode_queue={} prefill_queue={} waiting_queue={} decoding_count={} hint.max_batch={}",
-                        n,
-                        d_len,
-                        p_len,
-                        w_len,
-                        d_count,
-                        hint.max_batch_size,
-                    );
-                }
-            }
             return Ok(None);
         }
 
         let batch_id = BatchId::new();
-        if let Some(controller) = &self.slo_controller {
-            controller.lock().mark_adapted_prefill(
-                slo_prefill_limited && batch_requests.len() > scheduled_decode_count,
-            );
-        }
         let max_seq_len = batch_requests
             .iter()
             .map(|r| r.request.sampling_params.max_tokens)
@@ -4036,18 +4465,25 @@ impl ContinuousBatchScheduler {
 
         // Promote to decode
         self.promote_to_decode(request_id);
-        if self.config.slo.is_some() {
-            if let Some(request) = self.decode_queue.write().requests.get_mut(request_id) {
-                // Legacy chunked prefill may already have promoted the request;
-                // record the first output here, after sampling actually finished.
-                request.slo_first_token_emitted = true;
-            }
-        }
+        self.mark_first_token_emitted(request_id);
         if found {
             if let Some(progress) = progress {
                 self.record_pressure_frontier_progress(request_id, progress);
             }
             self.record_resource_progress();
+        }
+    }
+
+    /// Record a successfully committed output token after scheduler progress
+    /// publication. Final prefill work alone does not prove sampling succeeded.
+    /// The marker survives requeue and distinguishes original prompt replay
+    /// from a causal context that includes generated output.
+    pub fn mark_first_token_emitted(&self, request_id: &RequestId) {
+        if self.config.slo.is_none() {
+            return;
+        }
+        if let Some(request) = self.decode_queue.write().requests.get_mut(request_id) {
+            request.slo_first_token_emitted = true;
         }
     }
 
@@ -4243,61 +4679,7 @@ impl Scheduler for ContinuousBatchScheduler {
     }
 
     async fn submit(&self, request: InferenceRequest) -> Result<RequestId> {
-        self.validate_slo()?;
-        let request_id = request.id.clone();
-        debug!(
-            "Submitting request {} to continuous batch scheduler",
-            request_id
-        );
-
-        // Check queue capacity
-        let waiting_count = self.waiting_count();
-        if waiting_count >= self.config.max_waiting_requests {
-            warn!("Queue is full, rejecting request {}", request_id);
-            return Err(FerrumError::scheduler(
-                "Queue is full, cannot accept more requests",
-            ));
-        }
-
-        // Create continuous batch request
-        let cb_request = ContinuousBatchRequest::new(request);
-
-        // Add to waiting queue
-        let mut waiting_queue = self.waiting_queue.write();
-        let mut request_index = self.request_index.write();
-        if request_index.contains_key(&request_id) {
-            return Err(FerrumError::scheduler(format!(
-                "Request {request_id} is already tracked by the scheduler"
-            )));
-        }
-        let queue_position = waiting_queue.len();
-
-        let mut req = cb_request;
-        req.inner.queue_position = Some(queue_position);
-
-        let ticket = waiting_queue
-            .enqueue(req)
-            .map_err(|error| FerrumError::scheduler(error.to_string()))?;
-        waiting_queue
-            .request_mut(ticket)
-            .expect("newly enqueued admission ticket remains present")
-            .waiting_admission_ticket = Some(ticket);
-
-        // Update the lifecycle index and arm fill-first only when this request
-        // starts a new cohort after every prior request has left. Doing both
-        // under the index write lock makes the idle transition exact with
-        // respect to concurrent completion and submission.
-        if request_index.is_empty() {
-            self.fill_first_initial_cohort_armed
-                .store(true, Ordering::Release);
-        }
-        request_index.insert(request_id.clone(), RequestPhase::Waiting);
-
-        info!(
-            "Request {} queued at position {}",
-            request_id, queue_position
-        );
-        Ok(request_id)
+        self.submit_request(request)
     }
 
     async fn next_batch(&self, hint: BatchHint) -> Option<BatchPlan> {
@@ -4305,146 +4687,11 @@ impl Scheduler for ContinuousBatchScheduler {
     }
 
     async fn complete(&self, request_id: RequestId, response: &InferenceResponse) -> Result<()> {
-        debug!("Completing request {}", request_id);
-
-        // Remove from decode queue
-        let mut decode_queue = self.decode_queue.write();
-        if let Some(req) = decode_queue.remove(&request_id) {
-            // Record metrics
-            self.metrics_tracker.record_completion(&req);
-
-            match response.finish_reason {
-                ferrum_types::FinishReason::EOS
-                | ferrum_types::FinishReason::Stop
-                | ferrum_types::FinishReason::Length => {
-                    self.completed_counter.fetch_add(1, Ordering::Relaxed);
-                    debug!("Request {} completed successfully", request_id);
-                }
-                _ => {
-                    self.failed_counter.fetch_add(1, Ordering::Relaxed);
-                    warn!(
-                        "Request {} completed with error: {:?}",
-                        request_id, response.finish_reason
-                    );
-                }
-            }
-
-            // Remove from index
-            self.request_index.write().remove(&request_id);
-            self.record_pressure_frontier_terminal(&request_id);
-            self.record_capacity_release_progress();
-
-            Ok(())
-        } else {
-            // Try removing from prefill queue
-            let mut prefill_queue = self.prefill_queue.write();
-            if let Some(pos) = prefill_queue
-                .iter()
-                .position(|r| r.inner.request.id == request_id)
-            {
-                prefill_queue.remove(pos);
-                self.request_index.write().remove(&request_id);
-                self.record_pressure_frontier_terminal(&request_id);
-                match response.finish_reason {
-                    ferrum_types::FinishReason::EOS
-                    | ferrum_types::FinishReason::Stop
-                    | ferrum_types::FinishReason::Length => {
-                        self.completed_counter.fetch_add(1, Ordering::Relaxed);
-                    }
-                    _ => {
-                        self.failed_counter.fetch_add(1, Ordering::Relaxed);
-                        warn!(
-                            "Request {} completed with error during prefill: {:?}",
-                            request_id, response.finish_reason
-                        );
-                    }
-                }
-                self.record_capacity_release_progress();
-                return Ok(());
-            }
-            drop(prefill_queue);
-
-            if self
-                .admission_failed_requests
-                .write()
-                .remove(&request_id)
-                .is_some()
-            {
-                self.request_index.write().remove(&request_id);
-                self.failed_counter.fetch_add(1, Ordering::Relaxed);
-                return Ok(());
-            }
-
-            warn!("Attempted to complete unknown request: {}", request_id);
-            Err(FerrumError::scheduler(format!(
-                "Request {} not found in active queues",
-                request_id
-            )))
-        }
+        self.complete_request(request_id, response)
     }
 
     async fn cancel(&self, request_id: RequestId) -> Result<bool> {
-        debug!("Cancelling request {}", request_id);
-
-        // Check and remove from waiting queue
-        {
-            let mut waiting_queue = self.waiting_queue.write();
-            let waiting_position =
-                waiting_queue.position(|request| request.inner.request.id == request_id);
-            if let Some(pos) = waiting_position {
-                waiting_queue.remove(pos);
-                self.request_index.write().remove(&request_id);
-                self.record_pressure_frontier_terminal(&request_id);
-                self.cancelled_counter.fetch_add(1, Ordering::Relaxed);
-                info!("Request {} cancelled from waiting queue", request_id);
-                return Ok(true);
-            }
-        }
-
-        // Check and remove from prefill queue
-        {
-            let mut prefill_queue = self.prefill_queue.write();
-            if let Some(pos) = prefill_queue
-                .iter()
-                .position(|r| r.inner.request.id == request_id)
-            {
-                prefill_queue.remove(pos);
-                self.request_index.write().remove(&request_id);
-                self.record_pressure_frontier_terminal(&request_id);
-                self.cancelled_counter.fetch_add(1, Ordering::Relaxed);
-                self.record_capacity_release_progress();
-                warn!("Request {} cancelled during prefill", request_id);
-                return Ok(true);
-            }
-        }
-
-        // Check and remove from decode queue
-        {
-            let mut decode_queue = self.decode_queue.write();
-            if decode_queue.remove(&request_id).is_some() {
-                self.request_index.write().remove(&request_id);
-                self.record_pressure_frontier_terminal(&request_id);
-                self.cancelled_counter.fetch_add(1, Ordering::Relaxed);
-                self.record_capacity_release_progress();
-                warn!("Request {} cancelled during decode", request_id);
-                return Ok(true);
-            }
-            drop(decode_queue);
-        }
-
-        if self
-            .admission_failed_requests
-            .write()
-            .remove(&request_id)
-            .is_some()
-        {
-            self.request_index.write().remove(&request_id);
-            self.cancelled_counter.fetch_add(1, Ordering::Relaxed);
-            return Ok(true);
-        }
-
-        warn!("Request {} not found for cancellation", request_id);
-        Ok(false)
+        self.cancel_request(request_id)
     }
 
     async fn update_priority(&self, request_id: RequestId, priority: Priority) -> Result<()> {
@@ -4567,8 +4814,6 @@ impl Scheduler for ContinuousBatchScheduler {
                 generation_state: HashMap::new(),
             };
 
-            let freed_resources = req.inner.allocated_resources.clone();
-
             // Move to preempted queue
             self.preempted_requests
                 .write()
@@ -4577,12 +4822,13 @@ impl Scheduler for ContinuousBatchScheduler {
                 .write()
                 .insert(request_id, RequestPhase::Preempted);
             self.preempted_counter.fetch_add(1, Ordering::Relaxed);
-            self.record_capacity_release_progress();
 
             Ok(PreemptionResult {
                 success: true,
                 saved_state: Some(state),
-                freed_resources,
+                // Moving queue ownership does not release executor resources.
+                // Keep allocated resources on the retained request for resume.
+                freed_resources: Default::default(),
             })
         } else {
             Err(FerrumError::scheduler(format!(
@@ -4635,10 +4881,15 @@ impl std::fmt::Debug for ContinuousBatchScheduler {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ferrum_runtime::{CapacityAvailabilitySource, CapacityWaitCondition};
     use ferrum_types::{ModelId, SamplingParams};
 
     mod active_decode_budget;
+    mod allocator_capacity;
+    mod capacity_release;
+    mod request_clock;
     mod slo_policy;
+    mod token_admission;
 
     fn create_test_request(priority: Priority) -> InferenceRequest {
         InferenceRequest {
@@ -4651,6 +4902,7 @@ mod tests {
             client_id: None,
             session_id: None,
             created_at: chrono::Utc::now(),
+            ingress: None,
             api_request: None,
             evidence_request: Default::default(),
             metadata: std::collections::HashMap::new(),
@@ -4716,6 +4968,8 @@ mod tests {
                     ttft_ms: 1000.0,
                     tpot_ms: 100.0,
                     itl_ms: 120.0,
+                    reference: Default::default(),
+                    unknown_cost: Default::default(),
                 }),
                 ..SchedulerConfig::default()
             });
@@ -6598,6 +6852,113 @@ mod tests {
     }
 
     #[test]
+    fn recompute_release_preserves_fresh_pressure_and_unrelated_release_recovers() {
+        let scheduler = ContinuousBatchScheduler::new(SchedulerConfig {
+            max_running_requests: 16,
+            prompt_token_estimate: true,
+            ..SchedulerConfig::default()
+        });
+        for _ in 0..8 {
+            enqueue_waiting(
+                &scheduler,
+                create_test_request_with_prompt_tokens(Priority::Normal, 128),
+            );
+        }
+        let batch = scheduler
+            .create_iteration_batch(BatchHint::simple(8))
+            .unwrap();
+        assert_eq!(batch.requests.len(), 8);
+        for request in &batch.requests {
+            scheduler.mark_prefill_complete(&request.request.id, 128);
+            assert_eq!(
+                scheduler.trace_phase(&request.request.id),
+                Some(RequestPhase::Decoding)
+            );
+        }
+        let victim = &batch.requests[0].request.id;
+        assert!(scheduler.defer_decode_to_waiting_for_capacity(victim, 8));
+        let before = scheduler.trace_snapshot();
+        assert_eq!(before.decode_capacity_backpressure_admit_limit, Some(4));
+        assert_eq!(before.capacity_backpressure_admit_limit, Some(4));
+        assert_eq!(before.capacity_blocked_waiting_len, 1);
+        assert_eq!(before.capacity_release_epoch, 0);
+
+        scheduler.record_external_capacity_release_after_recompute();
+        let released = scheduler.trace_snapshot();
+        assert_eq!(released.capacity_release_epoch, 1);
+        assert_eq!(released.capacity_blocked_waiting_len, 0);
+        assert_eq!(released.decode_capacity_backpressure_admit_limit, Some(4));
+        assert_eq!(released.capacity_backpressure_admit_limit, Some(4));
+        assert!(!released.decode_execution_pressure_enforced);
+
+        scheduler.record_external_capacity_release();
+        let recovered = scheduler.trace_snapshot();
+        assert_eq!(recovered.capacity_release_epoch, 2);
+        assert_eq!(recovered.decode_capacity_backpressure_admit_limit, Some(8));
+        assert_eq!(recovered.capacity_backpressure_admit_limit, Some(8));
+    }
+
+    #[tokio::test]
+    async fn failed_yield_completion_preserves_actual_requeue_feedback() {
+        use ferrum_runtime::{
+            CapacityAvailabilityEpoch, CapacityAvailabilitySource, CapacityWaitCondition,
+            DeferredAction,
+        };
+        let scheduler = ContinuousBatchScheduler::new(SchedulerConfig::default());
+        let request = create_test_request(Priority::Normal);
+        let request_id = request.id.clone();
+        scheduler.submit(request).await.unwrap();
+        let source = CapacityAvailabilitySource::ActiveSequenceSlots;
+        let availability = [CapacityAvailabilityEpoch::new(source, 1).unwrap()];
+        let wake = AdmissionWakeEpochs::new(std::num::NonZeroU64::new(37).unwrap(), 0, 0, 0);
+        scheduler
+            .next_batch_with_dynamic_admission(
+                BatchHint::simple(1),
+                AdmissionWakeSnapshot::new(wake, &availability),
+                &mut |request| {
+                    AdmissionProbeOutcome::Admitted(ExecutorPrefillAdmissionReceipt {
+                        request_id: request.id.clone(),
+                    })
+                },
+            )
+            .unwrap()
+            .unwrap();
+        scheduler.mark_prefill_complete(&request_id, 1);
+        assert_eq!(
+            scheduler.trace_phase(&request_id),
+            Some(RequestPhase::Decoding)
+        );
+        let condition = CapacityWaitCondition::from_observation(37, availability.to_vec()).unwrap();
+        let action = scheduler
+            .defer_decode_for_execution_capacity(
+                std::slice::from_ref(&request_id),
+                AdmissionDeferral::new(DeferredAction::WaitForRelease, wake, condition.clone()),
+                &execution_capacity_release_snapshot([&request_id], &condition),
+            )
+            .unwrap();
+        let ExecutionCapacityAction::YieldPlanned { transaction } = action else {
+            panic!("the exact source owner must yield");
+        };
+        // The real queue mutation precedes the deliberately missing fence arm.
+        // Its evidence must survive the subsequent coordinator rejection.
+        let failure = scheduler
+            .complete_execution_capacity_yield(&transaction, 1, None)
+            .expect_err("an unarmed release fence cannot complete");
+        let (requeued, _error) = failure.into_parts();
+        assert!(requeued);
+        assert_eq!(
+            scheduler.trace_phase(&request_id),
+            Some(RequestPhase::Waiting)
+        );
+        assert_eq!(scheduler.trace_snapshot().capacity_release_epoch, 0);
+        scheduler.record_external_capacity_release_after_recompute();
+        let released = scheduler.trace_snapshot();
+        assert_eq!(released.capacity_release_epoch, 1);
+        assert_eq!(released.decode_capacity_backpressure_admit_limit, Some(1));
+        assert_eq!(released.capacity_backpressure_admit_limit, Some(1));
+    }
+
+    #[test]
     fn capacity_deferred_prefill_retries_once_without_release_then_parks() {
         let scheduler = ContinuousBatchScheduler::new(SchedulerConfig {
             max_running_requests: 1,
@@ -6631,7 +6992,7 @@ mod tests {
         assert_eq!(parked.admitted_total, 2);
         assert_eq!(parked.capacity_deferred_total, 2);
 
-        scheduler.record_capacity_release_progress();
+        scheduler.record_external_capacity_release();
         let after_release = scheduler.create_iteration_batch(hint).unwrap();
         assert_eq!(after_release.requests[0].request.id, request_id);
     }
@@ -7250,6 +7611,8 @@ mod tests {
             .complete(first_ids[2].clone(), &response)
             .await
             .unwrap();
+        // The execution owner reports physical release separately from completion.
+        scheduler.record_external_capacity_release();
 
         let after_release = scheduler.create_iteration_batch(hint).unwrap();
         let after_release_ids: HashSet<RequestId> = after_release
@@ -7631,7 +7994,7 @@ mod tests {
             assert!(scheduler.defer_decode_to_waiting_for_capacity(request_id, 8));
         }
 
-        scheduler.record_capacity_release_progress();
+        scheduler.record_external_capacity_release();
 
         scheduler.defer_capacity_deferred_mixed_recompute_until_kv_capacity(
             Some(16),
@@ -7724,6 +8087,8 @@ mod tests {
             .complete(first_ids[1].clone(), &response)
             .await
             .unwrap();
+        // The execution owner reports physical release separately from completion.
+        scheduler.record_external_capacity_release();
 
         let after_release = scheduler.create_iteration_batch(hint).unwrap();
         let scheduled_ids: HashSet<RequestId> = after_release
@@ -7818,6 +8183,7 @@ mod tests {
             execution_evidence: None,
         };
         scheduler.complete(progressed_id, &response).await.unwrap();
+        scheduler.record_external_capacity_release();
 
         let after_release_batch = scheduler
             .create_iteration_batch(BatchHint {
@@ -7837,7 +8203,7 @@ mod tests {
             first_ids
                 .iter()
                 .any(|id| !second_ids.contains(id) && after_release_ids.contains(id)),
-            "actual request completion should release capacity and reopen blocked waiting prefills"
+            "confirmed physical release after completion should reopen blocked waiting prefills"
         );
     }
 
@@ -7883,7 +8249,7 @@ mod tests {
         assert_eq!(
             after_cancel.capacity_backpressure_admit_limit,
             Some(2),
-            "cancellation frees a slot but is not evidence that the failed admission width now fits"
+            "logical cancellation is not evidence that physical capacity or the failed admission width now fits"
         );
     }
 
@@ -8570,6 +8936,8 @@ mod tests {
             .complete(first_ids[0].clone(), &response)
             .await
             .unwrap();
+        // The execution owner reports physical release separately from completion.
+        scheduler.record_external_capacity_release();
 
         let after_release = scheduler.create_iteration_batch(hint).unwrap();
         let after_release_ids: HashSet<RequestId> = after_release
@@ -8858,7 +9226,7 @@ mod tests {
         )
         .with_hardware_capabilities(hardware)
         .with_workload_profile(workload)
-        .with_execution_resource_authority(ferrum_types::ExecutionResourceAuthority::PlanRuntime)
+        .with_execution_planning_model(ferrum_types::ExecutionPlanningModel::CompiledPlan)
         .resolve()
         .unwrap();
         let mut engine = ferrum_types::EngineConfig::default();

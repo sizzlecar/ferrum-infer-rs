@@ -169,6 +169,10 @@ pub struct ServerConfig {
     #[serde(default)]
     pub profile_detail: ferrum_types::ObservabilityProfileDetail,
 
+    /// Per-writer profile delivery limits, shared with the loaded engine.
+    #[serde(default)]
+    pub profile_journal: ferrum_types::ObservabilityJournalConfig,
+
     /// Optional product observability memory profile JSONL sink for request memory events.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory_profile_jsonl: Option<PathBuf>,
@@ -421,6 +425,7 @@ impl Default for ServerConfig {
             request_dump_dir: None,
             profile_jsonl: None,
             profile_detail: ferrum_types::ObservabilityProfileDetail::Off,
+            profile_journal: ferrum_types::ObservabilityJournalConfig::default(),
             memory_profile_jsonl: None,
         }
     }

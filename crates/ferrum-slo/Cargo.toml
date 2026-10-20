@@ -1,0 +1,32 @@
+[package]
+name = "ferrum-slo"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Bounded instance-local reference service-cost estimator for Ferrum"
+readme = "../../README.md"
+
+[dependencies]
+ferrum-types = { workspace = true }
+ferrum-execution = { workspace = true }
+ferrum-scheduler = { workspace = true }
+arc-swap = { workspace = true }
+tokio = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+crossbeam-channel = "0.5"
+
+[dev-dependencies]
+ferrum-engine = { workspace = true }
+ferrum-interfaces = { workspace = true }
+ferrum-kernels = { workspace = true }
+ferrum-models = { workspace = true, features = ["test-support"] }
+ferrum-runtime = { workspace = true }
+ferrum-testkit = { workspace = true }
+async-trait = { workspace = true }
+futures = { workspace = true }
+
+[features]
+default = []

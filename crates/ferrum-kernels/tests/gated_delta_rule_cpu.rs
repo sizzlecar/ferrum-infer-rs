@@ -2,7 +2,7 @@ use ferrum_kernels::backend::{cpu::CpuBackend, Backend};
 
 #[test]
 fn recurrent_gated_delta_rule_cpu_applies_decay_and_state_update() {
-    let mut ctx = CpuBackend::new_context();
+    let mut ctx = CpuBackend::new_context(&Default::default()).expect("backend context");
     let query = vec![1.0, 1.0];
     let key = vec![1.0, 1.0];
     let value = vec![2.0, 4.0];
@@ -38,7 +38,7 @@ fn recurrent_gated_delta_rule_cpu_applies_decay_and_state_update() {
 
 #[test]
 fn recurrent_gated_delta_rule_cpu_repeats_key_heads_over_value_heads() {
-    let mut ctx = CpuBackend::new_context();
+    let mut ctx = CpuBackend::new_context(&Default::default()).expect("backend context");
     let query = vec![2.0];
     let key = vec![3.0];
     let value = vec![5.0, 7.0];
@@ -110,7 +110,7 @@ fn recurrent_gated_delta_rule_batch_cpu_matches_repeated_single_token_updates() 
         .map(|i| ((i as f32 % 23.0) - 11.0) * 0.03)
         .collect();
 
-    let mut ctx = CpuBackend::new_context();
+    let mut ctx = CpuBackend::new_context(&Default::default()).expect("backend context");
     let mut out = vec![0.0; batch * out_len];
     let mut final_states = vec![0.0; batch * state_len];
     CpuBackend::recurrent_gated_delta_rule_batch_f32(

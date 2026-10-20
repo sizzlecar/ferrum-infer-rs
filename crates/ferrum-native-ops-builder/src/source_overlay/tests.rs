@@ -1,5 +1,67 @@
 use super::*;
 
+#[test]
+fn checked_in_instance_policy_overlays_bind_repository_sources_and_build_inputs() {
+    let repo = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .canonicalize()
+        .unwrap();
+    for (overlay, operator) in [
+        ("marlin-instance-policy", "marlin"),
+        ("vllm-moe-marlin-profiler-free", "vllm-moe-marlin"),
+    ] {
+        let path = repo.join(format!(
+            "native-operators/cuda/source-overlays/{overlay}.json"
+        ));
+        let bytes = fs::read(&path).unwrap();
+        let spec: NativeOperatorSourceOverlay = serde_json::from_slice(&bytes).unwrap();
+        let manifest: BundleManifest =
+            serde_json::from_slice(&checked_bytes(&repo, &spec.base_bundle_manifest).unwrap())
+                .unwrap();
+        let members = manifest
+            .members
+            .iter()
+            .map(|member| (member.path.as_str(), member.sha256.as_str()))
+            .collect::<BTreeMap<_, _>>();
+        for file in &spec.files {
+            assert_eq!(
+                members.get(file.path.as_str()).copied(),
+                Some(file.base_sha256.as_str())
+            );
+            if let Some(override_file) = &file.repository_override {
+                checked_bytes(&repo, override_file).unwrap();
+            }
+        }
+        let definition: crate::NativeOperatorSourceDefinition = read_json(&repo.join(format!(
+            "native-operators/cuda/source-definitions/{operator}.json"
+        )))
+        .unwrap();
+        let declared = definition
+            .translation_units
+            .iter()
+            .chain(&definition.headers)
+            .collect::<std::collections::BTreeSet<_>>();
+        let supplied = spec
+            .files
+            .iter()
+            .map(|file| &file.path)
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(declared, supplied);
+        assert_eq!(
+            definition.source_package_kind,
+            "ferrum-native-source-overlay"
+        );
+        assert_eq!(
+            definition
+                .source_package_revision
+                .rsplit_once("+sha256.")
+                .unwrap()
+                .1,
+            sha256_bytes(&bytes),
+        );
+    }
+}
+
 fn fixture(root: &Path) -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) {
     let base = root.join("base");
     let repo = root.join("repo");

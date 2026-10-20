@@ -2,7 +2,7 @@ use ferrum_kernels::backend::{cpu::CpuBackend, Backend, Dtype};
 
 #[test]
 fn activation_add_to_f32_shadow_default_matches_convert_then_add() {
-    let mut ctx = CpuBackend::new_context();
+    let mut ctx = CpuBackend::new_context(&Default::default()).expect("backend context");
     let src = CpuBackend::from_slice(&[0.5, -1.25, 2.0, 4.5]);
     let mut residual = CpuBackend::from_slice_typed::<f32>(&[1.0, 2.0, -3.0, 0.25]);
     let mut scratch = CpuBackend::alloc_typed(Dtype::F32, 4);

@@ -393,21 +393,40 @@ fn absent_submission_or_performance_never_satisfies_known_or_unknown_obligations
 
 #[test]
 fn vnext_device_contracts_require_their_own_producer_and_actual_execution_step() {
+    use ferrum_bench_core::release_regression::ObligationScope;
+
     let evidence = CiEvidence::default();
-    let mut obligations = Vec::new();
-    for backend in [Backend::Cpu, Backend::Metal, Backend::Cuda] {
-        let obligation = Obligation {
+    let lifecycle_obligation = |scope: ObligationScope| {
+        let ObligationScope::ExecutionPath {
+            backend,
+            execution_path,
+        } = &scope
+        else {
+            panic!("device lifecycle fixture requires an execution path");
+        };
+        let target = ExecutionTarget {
+            architecture: "llama_dense".into(),
+            protocol: ferrum_types::ModelOutputProtocol::Text,
+            precision: "gguf-q4_k_m".into(),
+            backend: *backend,
+            execution_path: execution_path.clone(),
+        };
+        Obligation {
             behavior: Behavior::SubmissionCompletion,
             layer: EvidenceLayer::BackendNumerics,
             entrypoints: vec![],
-            scope: backend_contracts::submission_scope(backend),
+            scope,
             reason: "device lifecycle".into(),
-            checkers: backend_contracts::contract_groups(backend)
+            checkers: backend_contracts::check_descriptors(&[target])
                 .into_iter()
-                .filter(|group| group.behavior == Behavior::SubmissionCompletion)
-                .map(|group| group.id)
+                .filter(|descriptor| descriptor.behavior == Behavior::SubmissionCompletion)
+                .map(|descriptor| descriptor.id)
                 .collect(),
-        };
+        }
+    };
+    let mut obligations = Vec::new();
+    for backend in [Backend::Cpu, Backend::Metal, Backend::Cuda] {
+        let obligation = lifecycle_obligation(backend_contracts::submission_scope(backend));
         assert!(!evidence.covers(0, &obligation));
         obligations.push(obligation);
     }
@@ -415,26 +434,48 @@ fn vnext_device_contracts_require_their_own_producer_and_actual_execution_step()
         required_devices(&obligations),
         [Backend::Cpu, Backend::Metal, Backend::Cuda]
     );
-    obligations[0].scope = submission_scope();
+    // The legacy Metal path now has its own real model-frame contract. It
+    // remains a Metal obligation even after the native Metal one is removed.
+    obligations[0] = lifecycle_obligation(submission_scope());
     obligations[1].behavior = Behavior::KernelNumerics;
+    assert_eq!(
+        required_devices(&obligations),
+        [Backend::Metal, Backend::Cuda]
+    );
+    obligations[0].layer = EvidenceLayer::Performance;
     assert_eq!(required_devices(&obligations), [Backend::Cuda]);
 
-    let mut actual = job();
-    actual.name = device_producer(Backend::Cuda).1.into();
-    assert!(producer(
-        &origin(),
-        std::slice::from_ref(&actual),
-        std::slice::from_ref(&actual),
-        17,
-        &"a".repeat(40),
-        1,
-        device_producer(Backend::Metal).1
-    )
-    .is_err());
-    // A successful general GPU job or upload cannot replace this execution.
-    assert!(step(&actual, DEVICE_EXECUTE).is_err());
-    actual.steps[0].name = DEVICE_EXECUTE.into();
-    step(&actual, DEVICE_EXECUTE).unwrap();
-    actual.steps[0].conclusion = Some("skipped".into());
-    assert!(step(&actual, DEVICE_EXECUTE).is_err());
+    for (backend, other) in [
+        (Backend::Metal, Backend::Cuda),
+        (Backend::Cuda, Backend::Metal),
+    ] {
+        let mut actual = job();
+        actual.name = device_producer(backend).1.into();
+        producer(
+            &origin(),
+            std::slice::from_ref(&actual),
+            std::slice::from_ref(&actual),
+            17,
+            &"a".repeat(40),
+            1,
+            device_producer(backend).1,
+        )
+        .unwrap();
+        assert!(producer(
+            &origin(),
+            std::slice::from_ref(&actual),
+            std::slice::from_ref(&actual),
+            17,
+            &"a".repeat(40),
+            1,
+            device_producer(other).1,
+        )
+        .is_err());
+        // A successful general GPU job or upload cannot replace this execution.
+        assert!(step(&actual, DEVICE_EXECUTE).is_err());
+        actual.steps[0].name = DEVICE_EXECUTE.into();
+        step(&actual, DEVICE_EXECUTE).unwrap();
+        actual.steps[0].conclusion = Some("skipped".into());
+        assert!(step(&actual, DEVICE_EXECUTE).is_err());
+    }
 }

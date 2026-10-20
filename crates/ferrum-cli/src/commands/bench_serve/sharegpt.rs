@@ -17,6 +17,7 @@ use std::fs::File;
 use std::path::PathBuf;
 
 mod cache;
+mod export;
 
 #[derive(Args, Clone, Debug)]
 pub struct ShareGptArgs {
@@ -49,6 +50,18 @@ pub struct ShareGptArgs {
     /// and selection settings. Omitted by default; does not change warmup.
     #[arg(long)]
     pub sharegpt_prepared_cache_dir: Option<PathBuf>,
+    /// Export a new fixed ShareGPT pool and provenance receipt, then return
+    /// before creating an HTTP client. The directory must not already exist.
+    #[arg(
+        long,
+        value_name = "DIRECTORY",
+        requires = "sharegpt_source_sha256",
+        conflicts_with = "sharegpt_prepared_cache_dir"
+    )]
+    pub export_sharegpt_pool: Option<PathBuf>,
+    /// Expected SHA256 of the complete parent file; only valid during export.
+    #[arg(long, value_name = "SHA256", requires = "export_sharegpt_pool")]
+    pub sharegpt_source_sha256: Option<String>,
 }
 
 impl Default for ShareGptArgs {
@@ -63,6 +76,8 @@ impl Default for ShareGptArgs {
             sharegpt_fixed_output_tokens: None,
             sharegpt_selection_pool_size: None,
             sharegpt_prepared_cache_dir: None,
+            export_sharegpt_pool: None,
+            sharegpt_source_sha256: None,
         }
     }
 }
@@ -95,6 +110,7 @@ impl ShareGptArgs {
 }
 
 pub(super) fn validate(cmd: &BenchServeCommand) -> Result<()> {
+    export::validate(cmd)?;
     if cmd.dataset != "sharegpt" {
         if cmd.sharegpt.sharegpt_selection_pool_size.is_some() {
             return Err(FerrumError::model(
@@ -113,7 +129,9 @@ pub(super) fn validate(cmd: &BenchServeCommand) -> Result<()> {
             "--dataset sharegpt requires --sharegpt-path and --seed",
         ));
     }
-    if cmd.sharegpt.sharegpt_selection_pool_size.is_some() {
+    if cmd.sharegpt.sharegpt_selection_pool_size.is_some()
+        && cmd.sharegpt.export_sharegpt_pool.is_none()
+    {
         let required = cmd
             .num_prompts
             .checked_add(cmd.warmup_requests)
@@ -134,6 +152,14 @@ pub(super) fn validate(cmd: &BenchServeCommand) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+pub(super) fn export_pool_if_requested(cmd: &BenchServeCommand) -> Result<bool> {
+    if cmd.sharegpt.export_sharegpt_pool.is_none() {
+        return Ok(false);
+    }
+    export::run(cmd)?;
+    Ok(true)
 }
 
 /// Deliberately independent of client concurrency and server/backend identity.

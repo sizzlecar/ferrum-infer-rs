@@ -11,10 +11,10 @@ readme = "../../README.md"
 [dependencies]
 # Core types
 ferrum-types = { workspace = true }
+ferrum-output = { workspace = true }
 
 # Async
 async-trait = { workspace = true }
-futures = { workspace = true }
 
 # Small vectors for performance
 smallvec = { version = "1.11", features = ["serde"] }

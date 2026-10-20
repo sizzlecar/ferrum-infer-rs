@@ -233,7 +233,7 @@ fn fitted_limits_reach_engine_and_effective_config_with_consistent_provenance() 
         RuntimeConfigSource::Cli,
     );
     let mut resolved = crate::FerrumConfigBuilder::new(snapshot)
-        .with_execution_resource_authority(crate::ExecutionResourceAuthority::PlanRuntime)
+        .with_execution_planning_model(crate::ExecutionPlanningModel::CompiledPlan)
         .resolve()
         .unwrap();
     resolved.apply_startup_memory_plan(&plan);

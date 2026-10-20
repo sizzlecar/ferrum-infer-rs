@@ -18,7 +18,6 @@
 
 use std::collections::HashMap;
 use std::ops::Range;
-use std::sync::atomic::AtomicU64;
 
 use ferrum_execution::model_executor::{
     KvSlotAllocation, KvSlotCapacitySnapshot, KvSlotRequest, KvSlotReservation, LogitsReturnPolicy,
@@ -31,62 +30,46 @@ use ferrum_kernels::backend::{
 };
 
 /// Graph cache key for the single-item decode path (`decode_internal`).
-/// Distinct from any `m_padded`-based key used by the batched path.
+/// Distinct from the nonzero native IDs allocated by the batched path.
 pub(crate) const SINGLE_ITEM_GRAPH_KEY: u64 = 0;
 const LLAMA_PAGED_BLOCK_SIZE: usize = 16;
 
-/// Diag counters for the batched graph dispatcher (replay vs eager).
-pub(crate) static BATCHED_GRAPH_REPLAY_COUNT: AtomicU64 = AtomicU64::new(0);
-pub(crate) static BATCHED_GRAPH_EAGER_COUNT: AtomicU64 = AtomicU64::new(0);
-
-pub(crate) static ATTN_TIME_US: AtomicU64 = AtomicU64::new(0);
-pub(crate) static ATTN_CALLS: AtomicU64 = AtomicU64::new(0);
-pub(crate) static QKR_TIME_US: AtomicU64 = AtomicU64::new(0);
-pub(crate) static QKR_CALLS: AtomicU64 = AtomicU64::new(0);
-pub(crate) static MATMUL_TIME_US: AtomicU64 = AtomicU64::new(0);
-pub(crate) static MATMUL_CALLS: AtomicU64 = AtomicU64::new(0);
-pub(crate) static NORM_TIME_US: AtomicU64 = AtomicU64::new(0);
-pub(crate) static NORM_CALLS: AtomicU64 = AtomicU64::new(0);
-pub(crate) static OTHER_TIME_US: AtomicU64 = AtomicU64::new(0);
-pub(crate) static OTHER_CALLS: AtomicU64 = AtomicU64::new(0);
-pub(crate) static TAIL_NORM_TIME_US: AtomicU64 = AtomicU64::new(0);
-pub(crate) static TAIL_NORM_CALLS: AtomicU64 = AtomicU64::new(0);
-pub(crate) static TAIL_GATE_UP_TIME_US: AtomicU64 = AtomicU64::new(0);
-pub(crate) static TAIL_GATE_UP_CALLS: AtomicU64 = AtomicU64::new(0);
-pub(crate) static TAIL_DOWN_TIME_US: AtomicU64 = AtomicU64::new(0);
-pub(crate) static TAIL_DOWN_CALLS: AtomicU64 = AtomicU64::new(0);
-pub(crate) static TAIL_ACT_TIME_US: AtomicU64 = AtomicU64::new(0);
-pub(crate) static TAIL_ACT_CALLS: AtomicU64 = AtomicU64::new(0);
-pub(crate) static TAIL_RESID_TIME_US: AtomicU64 = AtomicU64::new(0);
-pub(crate) static TAIL_RESID_CALLS: AtomicU64 = AtomicU64::new(0);
-use ferrum_quantization::{Linear, WeightLoader};
+use ferrum_quantization::WeightLoader;
 use ferrum_types::{Activation, Result};
 
-use crate::common::paged_pool::block_hash_chain;
 use crate::common::{DecoderOnlyLLM, LlmRuntimeConfig};
-use crate::lora::{load_runtime_lora_adapter, ActiveLoraAdapter, RuntimeLoraAdapter};
+use crate::lora::{
+    load_runtime_lora_adapter, ActiveLoraAdapter, RuntimeLoraAdapter, RuntimeLoraWorkspace,
+};
+
+mod allocator_reclaim;
+pub(super) mod device_execution;
+mod prefix_preparation;
+use device_execution::{DeviceFrameResult, FrameLayout, LlamaExecutionFrame};
 
 const DEFAULT_KV_CAPACITY: usize = 512;
 
 fn alloc_model_buffer<B: QuantLlmBackend + BackendMoeFused>(
-    label: &'static str,
+    ctx: &mut B::Context,
     len: usize,
 ) -> B::Buffer {
-    let _ = label;
-    #[cfg(feature = "cuda")]
-    let _alloc_label = ferrum_kernels::backend::cuda::push_alloc_label(label);
-    B::alloc(len)
+    // On an allocator panic, observe before earlier fields in the enclosing
+    // scratch construction can unwind. Successful allocation adds no sync.
+    let mut construction = device_execution::ConstructionContext::<B>::new(ctx);
+    let buffer = B::alloc_in_context(construction.context, len);
+    construction.transfer();
+    buffer
 }
 
 fn alloc_model_typed_buffer<B: QuantLlmBackend + BackendMoeFused>(
-    label: &'static str,
+    ctx: &mut B::Context,
     dtype: ferrum_kernels::backend::Dtype,
     len: usize,
 ) -> B::Buffer {
-    let _ = label;
-    #[cfg(feature = "cuda")]
-    let _alloc_label = ferrum_kernels::backend::cuda::push_alloc_label(label);
-    B::alloc_typed(dtype, len)
+    let mut construction = device_execution::ConstructionContext::<B>::new(ctx);
+    let buffer = B::alloc_typed_in_context(construction.context, dtype, len);
+    construction.transfer();
+    buffer
 }
 
 pub(crate) fn elapsed_micros_u64_floor1(t0: std::time::Instant) -> u64 {
@@ -200,68 +183,13 @@ fn write_f32_dump_with_width(dir: &str, label: &str, values: &[f32], row_width: 
     append_dump_summary(dir, label, stats_for(values), row_width);
 }
 
+use ferrum_types::{
+    LlamaExecutionConfig, LlamaExecutionOptions, LlamaNanTraceConfig, SelectedKvCacheLayout,
+};
+
+#[cfg(test)]
 fn nan_trace_raw_matches(raw: &str, local_layer: usize, source_layer: usize) -> bool {
-    LlamaNanTraceConfig::from_raw(raw).matches_layer(local_layer, source_layer)
-}
-
-fn parse_nan_trace_layer_selector(part: &str) -> Option<usize> {
-    let part = part.trim();
-    if part.is_empty() {
-        return None;
-    }
-    if let Ok(layer) = part.parse::<usize>() {
-        return Some(layer);
-    }
-    for prefix in ["layer", "source", "l"] {
-        if part.len() > prefix.len() && part[..prefix.len()].eq_ignore_ascii_case(prefix) {
-            return part[prefix.len()..].parse::<usize>().ok();
-        }
-    }
-    None
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum LlamaNanTraceConfig {
-    Disabled,
-    All,
-    Layers(Vec<usize>),
-}
-
-impl Default for LlamaNanTraceConfig {
-    fn default() -> Self {
-        Self::Disabled
-    }
-}
-
-impl LlamaNanTraceConfig {
-    fn from_raw(raw: &str) -> Self {
-        let raw = raw.trim();
-        if raw.is_empty() || raw == "1" || raw.eq_ignore_ascii_case("all") {
-            return Self::All;
-        }
-        if raw == "0" || raw.eq_ignore_ascii_case("false") {
-            return Self::Disabled;
-        }
-        let layers: Vec<_> = raw
-            .split(',')
-            .filter_map(parse_nan_trace_layer_selector)
-            .collect();
-        if layers.is_empty() {
-            Self::Disabled
-        } else {
-            Self::Layers(layers)
-        }
-    }
-
-    fn matches_layer(&self, local_layer: usize, source_layer: usize) -> bool {
-        match self {
-            Self::Disabled => false,
-            Self::All => true,
-            Self::Layers(layers) => layers
-                .iter()
-                .any(|&layer| layer == local_layer || layer == source_layer),
-        }
-    }
+    LlamaNanTraceConfig::from_runtime_value(raw).matches_layer(local_layer, source_layer)
 }
 
 fn nan_trace_dump<B: Backend>(
@@ -274,7 +202,7 @@ fn nan_trace_dump<B: Backend>(
     op_dump_dir: Option<&str>,
 ) {
     B::sync(ctx);
-    let v = B::to_vec(buf, len);
+    let v = B::to_vec_in_context(ctx, buf, len);
     let stats = stats_for(&v);
     let maxabs_index = stats
         .maxabs_index
@@ -344,11 +272,8 @@ pub(crate) struct LlamaFamilyRuntimeEnv {
     pub(crate) kv_max_blocks: Option<usize>,
     pub(crate) metal_paged_kv: Option<bool>,
     pub(crate) paged_max_seqs: usize,
-    pub(crate) decode_op_profile: bool,
-    pub(crate) prefill_op_profile: bool,
     pub(crate) prefix_cache: bool,
     pub(crate) cuda_graph: bool,
-    pub(crate) decode_layer_profile: bool,
     pub(crate) nan_trace: LlamaNanTraceConfig,
     /// `FERRUM_OP_DUMP=<dir>`: when nan tracing is enabled, write each traced
     /// op buffer as f32 little-endian `.bin` plus summary JSONL. Debug-only.
@@ -360,67 +285,18 @@ pub(crate) struct LlamaFamilyRuntimeEnv {
 }
 
 impl LlamaFamilyRuntimeEnv {
-    /// Resolve from the process-wide snapshot installed at the composition root
-    /// (was a direct `std::env::vars()` read). The model holds this in a
-    /// `runtime_env` field, resolved once at construction.
-    fn from_env() -> Self {
-        Self::from_runtime_config_snapshot(&ferrum_types::active_runtime_snapshot())
-    }
-
-    fn from_runtime_config_snapshot(snapshot: &ferrum_types::RuntimeConfigSnapshot) -> Self {
-        Self::from_env_vars(
-            snapshot
-                .entries
-                .iter()
-                .map(|e| (e.key.as_str(), e.effective_value.as_str())),
-        )
-    }
-
-    fn from_env_vars<I, K, V>(vars: I) -> Self
-    where
-        I: IntoIterator<Item = (K, V)>,
-        K: AsRef<str>,
-        V: AsRef<str>,
-    {
-        let mut config = Self {
-            kv_capacity: None,
-            kv_max_blocks: None,
-            metal_paged_kv: None,
-            paged_max_seqs: 32,
-            decode_op_profile: false,
-            prefill_op_profile: false,
-            prefix_cache: false,
-            cuda_graph: false,
-            decode_layer_profile: false,
-            nan_trace: LlamaNanTraceConfig::Disabled,
-            op_dump_dir: None,
-            layer_dump_dir: None,
-        };
-        for (name, value) in vars {
-            let value = value.as_ref();
-            match name.as_ref() {
-                "FERRUM_KV_CAPACITY" => config.kv_capacity = value.parse::<usize>().ok(),
-                "FERRUM_KV_MAX_BLOCKS" => {
-                    config.kv_max_blocks = value.parse::<usize>().ok().filter(|v| *v > 0)
-                }
-                "FERRUM_METAL_PAGED_KV" => config.metal_paged_kv = Some(value != "0"),
-                "FERRUM_PAGED_MAX_SEQS" => {
-                    if let Ok(max_seqs) = value.parse::<usize>() {
-                        config.paged_max_seqs = max_seqs;
-                    }
-                }
-                "FERRUM_DECODE_OP_PROFILE" => config.decode_op_profile = true,
-                "FERRUM_PREFILL_OP_PROFILE" => config.prefill_op_profile = true,
-                "FERRUM_PREFIX_CACHE" => config.prefix_cache = value == "1",
-                "FERRUM_CUDA_GRAPH" => config.cuda_graph = true,
-                "FERRUM_DECODE_LAYER_PROFILE" => config.decode_layer_profile = true,
-                "FERRUM_NAN_TRACE" => config.nan_trace = LlamaNanTraceConfig::from_raw(value),
-                "FERRUM_OP_DUMP" => config.op_dump_dir = Some(value.to_string()),
-                "FERRUM_LAYER_DUMP" => config.layer_dump_dir = Some(value.to_string()),
-                _ => {}
-            }
+    fn from_execution_config(config: &LlamaExecutionConfig) -> Self {
+        Self {
+            kv_capacity: config.kv_capacity,
+            kv_max_blocks: config.options.kv_max_blocks,
+            metal_paged_kv: config.options.metal_paged_kv,
+            paged_max_seqs: config.paged_max_seqs,
+            prefix_cache: config.prefix_cache,
+            cuda_graph: config.options.cuda_graph,
+            nan_trace: config.options.nan_trace.clone(),
+            op_dump_dir: config.options.op_dump_dir.clone(),
+            layer_dump_dir: config.options.layer_dump_dir.clone(),
         }
-        config
     }
 
     pub(crate) fn kv_capacity_for_model(&self, model_max: usize) -> usize {
@@ -435,16 +311,8 @@ impl LlamaFamilyRuntimeEnv {
             .max(1)
     }
 
-    fn paged_kv_enabled<B: BackendPagedKv>(&self) -> bool {
-        self.metal_paged_kv
-            .unwrap_or_else(|| B::supports_paged_kv())
-    }
-
     pub(crate) fn graph_capture_allowed(&self) -> bool {
-        !self.decode_op_profile
-            && !self.prefill_op_profile
-            && !self.decode_layer_profile
-            && self.nan_trace == LlamaNanTraceConfig::Disabled
+        self.nan_trace == LlamaNanTraceConfig::Disabled
             && self.op_dump_dir.is_none()
             && self.layer_dump_dir.is_none()
     }
@@ -454,16 +322,56 @@ fn paged_kv_allowed_for_layer_schedule(
     paged_enabled: bool,
     backend_supports_varlen_qkv: bool,
     sliding_window_pattern: usize,
+    requires_window: bool,
+    backend_supports_window: bool,
 ) -> bool {
-    paged_enabled && (sliding_window_pattern == 0 || backend_supports_varlen_qkv)
+    paged_enabled
+        && (sliding_window_pattern == 0 || backend_supports_varlen_qkv)
+        && (!requires_window || backend_supports_window)
 }
 
-/// Whether decode-op profiling is enabled, resolved from the runtime snapshot
-/// installed at the composition root. Used by pipeline paths that operate on a
-/// `LlamaFamilyPipelineModel` and so don't hold a `LlamaFamilyModel`'s
-/// `runtime_env` field. Called once per decode-batch, not per op.
-pub(crate) fn llama_family_decode_op_profile_enabled() -> bool {
-    LlamaFamilyRuntimeEnv::from_env().decode_op_profile
+fn selected_llama_kv_cache_layout<B: BackendPagedKv>(
+    requested_paged: Option<bool>,
+    sliding_window_pattern: usize,
+    requires_window: bool,
+) -> SelectedKvCacheLayout {
+    if paged_kv_allowed_for_layer_schedule(
+        requested_paged.unwrap_or_else(B::supports_paged_kv),
+        B::supports_varlen_qkv(),
+        sliding_window_pattern,
+        requires_window,
+        B::supports_windowed_paged_attention(),
+    ) {
+        SelectedKvCacheLayout::Paged {
+            block_size_tokens: LLAMA_PAGED_BLOCK_SIZE,
+        }
+    } else {
+        SelectedKvCacheLayout::Contiguous
+    }
+}
+
+/// The same original configuration chooses and validates allocation at cold
+/// construction and preparation. Dtype capability cannot be borrowed from FP16.
+fn selected_llama_kv_layout_for_dtype<B: BackendPagedKv, K: KvLayer<B>>(
+    cfg: &LlamaFamilyConfig,
+    requested_paged: Option<bool>,
+    source_layers: Range<usize>,
+) -> Result<SelectedKvCacheLayout> {
+    let requires_window = cfg.requires_windowed_attention(source_layers);
+    let mut layout = selected_llama_kv_cache_layout::<B>(
+        requested_paged,
+        cfg.sliding_window_pattern,
+        requires_window,
+    );
+    if requires_window && !K::supports_windowed_paged_attention() {
+        layout = SelectedKvCacheLayout::Contiguous;
+    }
+    if matches!(layout, SelectedKvCacheLayout::Contiguous) && !K::supports_contiguous() {
+        return Err(ferrum_types::FerrumError::unsupported(
+            "requested layer attention requires a contiguous or windowed paged KV implementation supported by this backend and KV dtype",
+        ));
+    }
+    Ok(layout)
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -580,6 +488,27 @@ impl Default for LlamaFamilyConfig {
 }
 
 impl LlamaFamilyConfig {
+    /// The allocation layout selected by the same policy used at cache creation.
+    /// This cold query allocates no device resources and does not infer layout
+    /// from a model name or execution resource-authority tag.
+    pub fn selected_kv_cache_layout<B: BackendPagedKv>(
+        &self,
+        options: &LlamaExecutionOptions,
+    ) -> SelectedKvCacheLayout {
+        selected_llama_kv_cache_layout::<B>(
+            options.metal_paged_kv,
+            self.sliding_window_pattern,
+            self.requires_windowed_attention(0..self.num_layers),
+        )
+    }
+
+    pub(crate) fn requires_windowed_attention(&self, source_layers: Range<usize>) -> bool {
+        self.sliding_window > 0
+            && source_layers
+                .into_iter()
+                .any(|li| llama_layer_attention_schedule(self, li).sliding_window > 0)
+    }
+
     pub fn to_runtime(&self) -> LlmRuntimeConfig {
         LlmRuntimeConfig {
             hidden_size: self.hidden_size,
@@ -813,15 +742,15 @@ fn json_f64(value: Option<&serde_json::Value>) -> Option<f64> {
     }
 }
 
-/// Per-layer weights. `Box<dyn Linear<B>>` means each projection can be
+/// Per-layer weights. `ferrum_kernels::LoadedLinear<B>` means each projection can be
 /// Dense / GPTQ / AWQ / GGUF without the surrounding code caring.
 pub struct LlamaFamilyLayer<B: QuantLlmBackend + BackendMoeFused> {
     pub input_ln_w: B::Buffer,
-    pub qkv_proj: Box<dyn Linear<B>>,
+    pub qkv_proj: ferrum_kernels::LoadedLinear<B>,
     /// QK-norm weight per head: `[head_dim]`. Optional for non-Qwen3 derivatives.
     pub q_norm_w: Option<B::Buffer>,
     pub k_norm_w: Option<B::Buffer>,
-    pub o_proj: Box<dyn Linear<B>>,
+    pub o_proj: ferrum_kernels::LoadedLinear<B>,
     /// Pre-MLP norm. Llama naming: `post_attention_layernorm`; Gemma 3
     /// sandwich naming: `pre_feedforward_layernorm`.
     pub post_ln_w: B::Buffer,
@@ -831,8 +760,8 @@ pub struct LlamaFamilyLayer<B: QuantLlmBackend + BackendMoeFused> {
     /// Gemma 3 sandwich: norm applied to the MLP output before the
     /// residual add (`post_feedforward_layernorm`).
     pub post_ffn_ln_w: Option<B::Buffer>,
-    pub gate_up_proj: Box<dyn Linear<B>>,
-    pub down_proj: Box<dyn Linear<B>>,
+    pub gate_up_proj: ferrum_kernels::LoadedLinear<B>,
+    pub down_proj: ferrum_kernels::LoadedLinear<B>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -872,7 +801,34 @@ impl LlamaFamilyLayerStageConfig {
     }
 }
 
+// Actual partial construction owners. Failure guards are declared after these
+// payloads so observation precedes their destruction, including unwinding.
+struct LayerConstruction<B: MoeLlmBackend> {
+    input_ln_w: Option<B::Buffer>,
+    qkv_proj: Option<ferrum_kernels::LoadedLinear<B>>,
+    o_proj: Option<ferrum_kernels::LoadedLinear<B>>,
+    post_ln_w: Option<B::Buffer>,
+    post_attn_ln_w: Option<B::Buffer>,
+    post_ffn_ln_w: Option<B::Buffer>,
+    gate_up_proj: Option<ferrum_kernels::LoadedLinear<B>>,
+    down_proj: Option<ferrum_kernels::LoadedLinear<B>>,
+    q_norm_w: Option<B::Buffer>,
+    k_norm_w: Option<B::Buffer>,
+}
+
+struct ModelConstruction<B: MoeLlmBackend> {
+    rope: Option<RopeCache<B>>,
+    rope_local: Option<RopeCache<B>>,
+    scratch: Option<LlamaFamilyScratch<B>>,
+    embed: Option<B::Buffer>,
+    layers: Option<Vec<LlamaFamilyLayer<B>>>,
+    lm_head: Option<ferrum_kernels::LoadedLinear<B>>,
+    final_norm: Option<B::Buffer>,
+    final_norm_w: Option<B::Buffer>,
+}
+
 fn load_llama_family_layers<B: MoeLlmBackend>(
+    ctx: &mut B::Context,
     cfg: &LlamaFamilyConfig,
     loader: &dyn WeightLoader<B>,
     source_layers: Range<usize>,
@@ -894,50 +850,95 @@ fn load_llama_family_layers<B: MoeLlmBackend>(
         .unwrap_or(1.0);
     for li in source_layers {
         let prefix = format!("model.layers.{li}");
-        let norm = |name: &str, len: usize, scale: f32| -> Result<B::Buffer> {
-            let t = loader.load_tensor(&format!("{prefix}.{name}.weight"))?;
-            Ok(fold_norm_weight::<B>(
-                t,
-                len,
-                cfg.rmsnorm_unit_offset,
-                scale,
-            ))
-        };
+        let norm =
+            |ctx: &mut B::Context, name: &str, len: usize, scale: f32| -> Result<B::Buffer> {
+                let t = loader.load_tensor(ctx, &format!("{prefix}.{name}.weight"))?;
+                Ok(fold_norm_weight::<B>(
+                    ctx,
+                    t,
+                    len,
+                    cfg.rmsnorm_unit_offset,
+                    scale,
+                ))
+            };
         let h = cfg.hidden_size;
-        let input_ln_w = norm("input_layernorm", h, 1.0)?;
-        let qkv_proj = loader.load_linear(&format!("{prefix}.self_attn.qkv_proj"))?;
-        let o_proj = loader.load_linear(&format!("{prefix}.self_attn.o_proj"))?;
-        let (post_ln_w, post_attn_ln_w, post_ffn_ln_w) = if cfg.sandwich_norms {
-            (
-                norm("pre_feedforward_layernorm", h, 1.0)?,
-                Some(norm("post_attention_layernorm", h, 1.0)?),
-                Some(norm("post_feedforward_layernorm", h, 1.0)?),
+        let mut partial = LayerConstruction::<B> {
+            input_ln_w: None,
+            qkv_proj: None,
+            o_proj: None,
+            post_ln_w: None,
+            post_attn_ln_w: None,
+            post_ffn_ln_w: None,
+            gate_up_proj: None,
+            down_proj: None,
+            q_norm_w: None,
+            k_norm_w: None,
+        };
+        let mut construction = device_execution::ConstructionContext::<B>::new(ctx);
+        partial.input_ln_w = Some(norm(construction.context, "input_layernorm", h, 1.0)?);
+        partial.qkv_proj = Some(loader.load_linear(
+            construction.context,
+            &format!("{prefix}.self_attn.qkv_proj"),
+        )?);
+        partial.o_proj =
+            Some(loader.load_linear(construction.context, &format!("{prefix}.self_attn.o_proj"))?);
+        if cfg.sandwich_norms {
+            partial.post_ln_w = Some(norm(
+                construction.context,
+                "pre_feedforward_layernorm",
+                h,
+                1.0,
+            )?);
+            partial.post_attn_ln_w = Some(norm(
+                construction.context,
+                "post_attention_layernorm",
+                h,
+                1.0,
+            )?);
+            partial.post_ffn_ln_w = Some(norm(
+                construction.context,
+                "post_feedforward_layernorm",
+                h,
+                1.0,
+            )?);
+        } else {
+            partial.post_ln_w = Some(norm(
+                construction.context,
+                "post_attention_layernorm",
+                h,
+                1.0,
+            )?);
+        }
+        partial.gate_up_proj =
+            Some(loader.load_linear(construction.context, &format!("{prefix}.mlp.gate_up_proj"))?);
+        partial.down_proj =
+            Some(loader.load_linear(construction.context, &format!("{prefix}.mlp.down_proj"))?);
+        if cfg.has_qk_norm {
+            partial.q_norm_w = norm(
+                construction.context,
+                "self_attn.q_norm",
+                cfg.head_dim,
+                q_norm_scale,
             )
-        } else {
-            (norm("post_attention_layernorm", h, 1.0)?, None, None)
-        };
-        let gate_up_proj = loader.load_linear(&format!("{prefix}.mlp.gate_up_proj"))?;
-        let down_proj = loader.load_linear(&format!("{prefix}.mlp.down_proj"))?;
-
-        let (q_norm_w, k_norm_w) = if cfg.has_qk_norm {
-            let q = norm("self_attn.q_norm", cfg.head_dim, q_norm_scale).ok();
-            let k = norm("self_attn.k_norm", cfg.head_dim, 1.0).ok();
-            (q, k)
-        } else {
-            (None, None)
-        };
-
+            .ok();
+            partial.k_norm_w =
+                norm(construction.context, "self_attn.k_norm", cfg.head_dim, 1.0).ok();
+        }
+        // Success transfers these exact owners into the still-guarded model
+        // construction; it does not introduce a per-layer synchronization.
+        construction.transfer();
+        drop(construction);
         layers.push(LlamaFamilyLayer {
-            input_ln_w,
-            qkv_proj,
-            q_norm_w,
-            k_norm_w,
-            o_proj,
-            post_ln_w,
-            post_attn_ln_w,
-            post_ffn_ln_w,
-            gate_up_proj,
-            down_proj,
+            input_ln_w: partial.input_ln_w.expect("loaded input norm"),
+            qkv_proj: partial.qkv_proj.expect("loaded qkv"),
+            q_norm_w: partial.q_norm_w,
+            k_norm_w: partial.k_norm_w,
+            o_proj: partial.o_proj.expect("loaded attention output"),
+            post_ln_w: partial.post_ln_w.expect("loaded post norm"),
+            post_attn_ln_w: partial.post_attn_ln_w,
+            post_ffn_ln_w: partial.post_ffn_ln_w,
+            gate_up_proj: partial.gate_up_proj.expect("loaded gate/up"),
+            down_proj: partial.down_proj.expect("loaded down"),
         });
     }
     Ok(layers)
@@ -947,6 +948,7 @@ fn load_llama_family_layers<B: MoeLlmBackend>(
 /// `w' = (w + 1)·scale` when `unit_offset` (Gemma RMSNorm is `x̂·(1+w)`),
 /// plus an optional extra scale (query_pre_attn_scalar fold on q_norm).
 fn fold_norm_weight<B: MoeLlmBackend>(
+    ctx: &mut B::Context,
     buf: B::Buffer,
     len: usize,
     unit_offset: bool,
@@ -955,18 +957,22 @@ fn fold_norm_weight<B: MoeLlmBackend>(
     if !unit_offset && scale == 1.0 {
         return buf;
     }
-    let mut v = B::to_vec(&buf, len);
+    let mut construction = device_execution::ConstructionContext::<B>::new(ctx);
+    let mut v = B::to_vec_in_context(construction.context, &buf, len);
     let off = if unit_offset { 1.0 } else { 0.0 };
     for x in v.iter_mut() {
         *x = (*x + off) * scale;
     }
-    B::from_slice(&v)
+    let output = B::from_slice_in_context(construction.context, &v);
+    construction.transfer();
+    output
 }
 
 fn load_llama_family_lm_head<B: MoeLlmBackend>(
+    ctx: &mut B::Context,
     cfg: &LlamaFamilyConfig,
     loader: &dyn WeightLoader<B>,
-) -> Result<Box<dyn Linear<B>>> {
+) -> Result<ferrum_kernels::LoadedLinear<B>> {
     // LM head: either dedicated `lm_head.weight` or tied to embedding.
     // Many models (Qwen3-4B, Llama-3.2-1B, some Qwen2.5) use TIED
     // embeddings — lm_head shares weights with model.embed_tokens. When
@@ -975,12 +981,13 @@ fn load_llama_family_lm_head<B: MoeLlmBackend>(
     // bytes, e.g. ~770MB for Qwen3-4B) but keeps the Linear trait's
     // owned-weights invariant. Sharing via Arc is a future optimisation.
     let lm_head = if loader.has_tensor("lm_head.weight") {
-        loader.load_linear("lm_head")?
+        loader.load_linear(ctx, "lm_head")?
     } else {
         tracing::info!(
             "LlamaFamilyModel: tied embeddings — loading model.embed_tokens.weight as lm_head"
         );
-        let as_linear = loader.load_linear("model.embed_tokens")?;
+        let as_linear = loader.load_linear(ctx, "model.embed_tokens")?;
+        let mut construction = device_execution::ConstructionContext::<B>::new(ctx);
         // Sanity check: shape must be [vocab, hidden].
         if as_linear.out_features() != cfg.vocab_size || as_linear.in_features() != cfg.hidden_size
         {
@@ -992,6 +999,8 @@ fn load_llama_family_lm_head<B: MoeLlmBackend>(
                 cfg.hidden_size
             )));
         }
+        construction.transfer();
+        drop(construction);
         as_linear
     };
     Ok(lm_head)
@@ -1259,6 +1268,8 @@ pub struct LlamaFamilyScratch<B: QuantLlmBackend + BackendMoeFused> {
     /// Stacked per-seq context lengths for batched paged dispatch
     /// (`[max_M]` u32).
     pub paged_batch_context_lens: Option<B::Buffer>,
+    /// Graph-only cumulative query rows [0, 1, ..., M], owned by original scratch.
+    pub(crate) paged_batch_cu_seqlens: Option<B::Buffer>,
     /// `max_blocks_per_seq` value baked into the stacked block_tables
     /// stride. Set when `paged_batch_block_tables` is allocated.
     pub paged_max_blocks_per_seq: usize,
@@ -1336,7 +1347,7 @@ pub struct LlamaFamilyScratch<B: QuantLlmBackend + BackendMoeFused> {
 }
 
 impl<B: QuantLlmBackend + BackendMoeFused> LlamaFamilyScratch<B> {
-    fn alloc(cfg: &LlamaFamilyConfig, max_tokens: usize) -> Self {
+    fn alloc(ctx: &mut B::Context, cfg: &LlamaFamilyConfig, max_tokens: usize) -> Self {
         let h = cfg.hidden_size;
         let im = cfg.intermediate_size;
         let q_dim = cfg.num_heads * cfg.head_dim;
@@ -1344,76 +1355,44 @@ impl<B: QuantLlmBackend + BackendMoeFused> LlamaFamilyScratch<B> {
         let qkv_dim = q_dim + 2 * kv_dim;
         let t = max_tokens;
         Self {
-            residual: Some(alloc_model_buffer::<B>("llama.scratch.residual", t * h)),
-            norm_out: alloc_model_buffer::<B>("llama.scratch.norm_out", t * h),
-            qkv_out: alloc_model_buffer::<B>("llama.scratch.qkv_out", t * qkv_dim),
+            residual: Some(alloc_model_buffer::<B>(ctx, t * h)),
+            norm_out: alloc_model_buffer::<B>(ctx, t * h),
+            qkv_out: alloc_model_buffer::<B>(ctx, t * qkv_dim),
             sandwich_tmp: cfg
                 .sandwich_norms
-                .then(|| alloc_model_buffer::<B>("llama.scratch.sandwich_tmp", t * h)),
+                .then(|| alloc_model_buffer::<B>(ctx, t * h)),
             residual_f32_shadow: (cfg.sandwich_norms && B::supports_device_f32_residual_shadow())
                 .then(|| {
-                    alloc_model_typed_buffer::<B>(
-                        "llama.scratch.residual_f32_shadow",
-                        ferrum_kernels::backend::Dtype::F32,
-                        t * h,
-                    )
+                    alloc_model_typed_buffer::<B>(ctx, ferrum_kernels::backend::Dtype::F32, t * h)
                 }),
             sandwich_branch_f32: (cfg.sandwich_norms && B::supports_device_f32_residual_shadow())
                 .then(|| {
-                    alloc_model_typed_buffer::<B>(
-                        "llama.scratch.sandwich_branch_f32",
-                        ferrum_kernels::backend::Dtype::F32,
-                        t * h,
-                    )
+                    alloc_model_typed_buffer::<B>(ctx, ferrum_kernels::backend::Dtype::F32, t * h)
                 }),
-            q_buf: alloc_model_buffer::<B>("llama.scratch.q_buf", t * q_dim),
-            k_buf: alloc_model_buffer::<B>("llama.scratch.k_buf", t * kv_dim),
-            v_buf: alloc_model_buffer::<B>("llama.scratch.v_buf", t * kv_dim),
-            q_head_major: alloc_model_buffer::<B>(
-                "llama.scratch.q_head_major",
-                cfg.num_heads * t * cfg.head_dim,
-            ),
-            k_head_major: alloc_model_buffer::<B>(
-                "llama.scratch.k_head_major",
-                cfg.num_kv_heads * t * cfg.head_dim,
-            ),
-            v_head_major: alloc_model_buffer::<B>(
-                "llama.scratch.v_head_major",
-                cfg.num_kv_heads * t * cfg.head_dim,
-            ),
-            attn_head_major_out: alloc_model_buffer::<B>(
-                "llama.scratch.attn_head_major_out",
-                cfg.num_heads * t * cfg.head_dim,
-            ),
-            attn_flat: alloc_model_buffer::<B>("llama.scratch.attn_flat", t * q_dim),
-            o_proj_out: alloc_model_buffer::<B>("llama.scratch.o_proj_out", t * h),
-            gate_up_out: alloc_model_buffer::<B>("llama.scratch.gate_up_out", t * 2 * im),
-            silu_out: alloc_model_buffer::<B>("llama.scratch.silu_out", t * im),
-            mlp_out: alloc_model_buffer::<B>("llama.scratch.mlp_out", t * h),
-            last_hidden: alloc_model_buffer::<B>("llama.scratch.last_hidden", h),
-            last_normed: alloc_model_buffer::<B>("llama.scratch.last_normed", h),
-            logits: alloc_model_buffer::<B>("llama.scratch.logits", cfg.vocab_size),
-            q_single: alloc_model_buffer::<B>("llama.scratch.q_single", q_dim),
-            k_single: alloc_model_buffer::<B>("llama.scratch.k_single", kv_dim),
-            v_single: alloc_model_buffer::<B>("llama.scratch.v_single", kv_dim),
-            q_head_major_single: alloc_model_buffer::<B>(
-                "llama.scratch.q_head_major_single",
-                q_dim,
-            ),
-            k_head_major_single: alloc_model_buffer::<B>(
-                "llama.scratch.k_head_major_single",
-                kv_dim,
-            ),
-            v_head_major_single: alloc_model_buffer::<B>(
-                "llama.scratch.v_head_major_single",
-                kv_dim,
-            ),
-            attn_head_major_single: alloc_model_buffer::<B>(
-                "llama.scratch.attn_head_major_single",
-                q_dim,
-            ),
-            attn_flat_single: alloc_model_buffer::<B>("llama.scratch.attn_flat_single", q_dim),
-            batch_logits: alloc_model_buffer::<B>("llama.scratch.batch_logits", cfg.vocab_size),
+            q_buf: alloc_model_buffer::<B>(ctx, t * q_dim),
+            k_buf: alloc_model_buffer::<B>(ctx, t * kv_dim),
+            v_buf: alloc_model_buffer::<B>(ctx, t * kv_dim),
+            q_head_major: alloc_model_buffer::<B>(ctx, cfg.num_heads * t * cfg.head_dim),
+            k_head_major: alloc_model_buffer::<B>(ctx, cfg.num_kv_heads * t * cfg.head_dim),
+            v_head_major: alloc_model_buffer::<B>(ctx, cfg.num_kv_heads * t * cfg.head_dim),
+            attn_head_major_out: alloc_model_buffer::<B>(ctx, cfg.num_heads * t * cfg.head_dim),
+            attn_flat: alloc_model_buffer::<B>(ctx, t * q_dim),
+            o_proj_out: alloc_model_buffer::<B>(ctx, t * h),
+            gate_up_out: alloc_model_buffer::<B>(ctx, t * 2 * im),
+            silu_out: alloc_model_buffer::<B>(ctx, t * im),
+            mlp_out: alloc_model_buffer::<B>(ctx, t * h),
+            last_hidden: alloc_model_buffer::<B>(ctx, h),
+            last_normed: alloc_model_buffer::<B>(ctx, h),
+            logits: alloc_model_buffer::<B>(ctx, cfg.vocab_size),
+            q_single: alloc_model_buffer::<B>(ctx, q_dim),
+            k_single: alloc_model_buffer::<B>(ctx, kv_dim),
+            v_single: alloc_model_buffer::<B>(ctx, kv_dim),
+            q_head_major_single: alloc_model_buffer::<B>(ctx, q_dim),
+            k_head_major_single: alloc_model_buffer::<B>(ctx, kv_dim),
+            v_head_major_single: alloc_model_buffer::<B>(ctx, kv_dim),
+            attn_head_major_single: alloc_model_buffer::<B>(ctx, q_dim),
+            attn_flat_single: alloc_model_buffer::<B>(ctx, q_dim),
+            batch_logits: alloc_model_buffer::<B>(ctx, cfg.vocab_size),
             batch_logits_capacity: 1,
             argmax_token_mask: None,
             argmax_token_mask_fingerprint: None,
@@ -1434,31 +1413,32 @@ impl<B: QuantLlmBackend + BackendMoeFused> LlamaFamilyScratch<B> {
             paged_batch_o: None,
             paged_batch_block_tables: None,
             paged_batch_context_lens: None,
+            paged_batch_cu_seqlens: None,
             paged_max_blocks_per_seq: 0,
             paged_max_seqs: 0,
             batch_positions: alloc_model_typed_buffer::<B>(
-                "llama.scratch.batch_positions",
+                ctx,
                 ferrum_kernels::backend::Dtype::U32,
                 t.max(1),
             ),
             batch_tokens: alloc_model_typed_buffer::<B>(
-                "llama.scratch.batch_tokens",
+                ctx,
                 ferrum_kernels::backend::Dtype::U32,
                 t.max(1),
             ),
             batch_kv_lens_pre: alloc_model_typed_buffer::<B>(
-                "llama.scratch.batch_kv_lens_pre",
+                ctx,
                 ferrum_kernels::backend::Dtype::U32,
                 t.max(1),
             ),
             batch_kv_lens_post: alloc_model_typed_buffer::<B>(
-                "llama.scratch.batch_kv_lens_post",
+                ctx,
                 ferrum_kernels::backend::Dtype::U32,
                 t.max(1),
             ),
-            q_normed_batched: alloc_model_buffer::<B>("llama.scratch.q_normed_batched", t * q_dim),
-            k_normed_batched: alloc_model_buffer::<B>("llama.scratch.k_normed_batched", t * kv_dim),
-            v_normed_batched: alloc_model_buffer::<B>("llama.scratch.v_normed_batched", t * kv_dim),
+            q_normed_batched: alloc_model_buffer::<B>(ctx, t * q_dim),
+            k_normed_batched: alloc_model_buffer::<B>(ctx, t * kv_dim),
+            v_normed_batched: alloc_model_buffer::<B>(ctx, t * kv_dim),
             unified_capacity: 0,
             unified_residual: None,
             unified_norm_out: None,
@@ -1481,13 +1461,19 @@ impl<B: QuantLlmBackend + BackendMoeFused> LlamaFamilyScratch<B> {
         }
     }
 
-    pub(crate) fn ensure_batch_logits(&mut self, cfg: &LlamaFamilyConfig, rows: usize) {
+    pub(crate) fn ensure_batch_logits(
+        &mut self,
+        ctx: &mut B::Context,
+        cfg: &LlamaFamilyConfig,
+        rows: usize,
+    ) {
         let rows = rows.max(1);
         if rows <= self.batch_logits_capacity {
             return;
         }
-        self.batch_logits =
-            alloc_model_buffer::<B>("llama.scratch.batch_logits.grow", rows * cfg.vocab_size);
+        B::retire_graphs_for_storage_mutation(ctx)
+            .unwrap_or_else(|error| std::panic::panic_any(error));
+        self.batch_logits = alloc_model_buffer::<B>(ctx, rows * cfg.vocab_size);
         self.batch_logits_capacity = rows;
     }
 
@@ -1500,7 +1486,7 @@ impl<B: QuantLlmBackend + BackendMoeFused> LlamaFamilyScratch<B> {
             || self.argmax_token_mask_len != mask.len();
         if needs_upload {
             let mut device_mask = alloc_model_typed_buffer::<B>(
-                "llama.scratch.argmax_token_mask",
+                ctx,
                 ferrum_kernels::backend::Dtype::I8,
                 mask.len().max(1),
             );
@@ -1545,7 +1531,7 @@ impl<B: QuantLlmBackend + BackendMoeFused> LlamaFamilyScratch<B> {
                 .checked_next_power_of_two()
                 .unwrap_or(offsets_len);
             self.argmax_repetition_offsets = Some(alloc_model_typed_buffer::<B>(
-                "llama.scratch.argmax_repetition_offsets",
+                ctx,
                 ferrum_kernels::backend::Dtype::U32,
                 capacity,
             ));
@@ -1557,7 +1543,7 @@ impl<B: QuantLlmBackend + BackendMoeFused> LlamaFamilyScratch<B> {
                 .checked_next_power_of_two()
                 .unwrap_or(token_ids_len);
             self.argmax_repetition_token_ids = Some(alloc_model_typed_buffer::<B>(
-                "llama.scratch.argmax_repetition_token_ids",
+                ctx,
                 ferrum_kernels::backend::Dtype::U32,
                 capacity,
             ));
@@ -1569,7 +1555,7 @@ impl<B: QuantLlmBackend + BackendMoeFused> LlamaFamilyScratch<B> {
                 .checked_next_power_of_two()
                 .unwrap_or(penalties_len);
             self.argmax_repetition_penalties = Some(alloc_model_typed_buffer::<B>(
-                "llama.scratch.argmax_repetition_penalties",
+                ctx,
                 ferrum_kernels::backend::Dtype::F32,
                 capacity,
             ));
@@ -1606,16 +1592,18 @@ impl<B: QuantLlmBackend + BackendMoeFused> LlamaFamilyScratch<B> {
         token_ids.len()
     }
 
-    pub(crate) fn ensure_unified_argmax_logits(&mut self, cfg: &LlamaFamilyConfig, rows: usize) {
+    pub(crate) fn ensure_unified_argmax_logits(
+        &mut self,
+        ctx: &mut B::Context,
+        cfg: &LlamaFamilyConfig,
+        rows: usize,
+    ) {
         let rows = rows.max(1);
         if rows <= self.unified_argmax_logits_capacity {
             return;
         }
         let capacity = rows.checked_next_power_of_two().unwrap_or(rows);
-        self.unified_argmax_logits = Some(alloc_model_buffer::<B>(
-            "llama.scratch.unified_argmax_logits",
-            capacity * cfg.vocab_size,
-        ));
+        self.unified_argmax_logits = Some(alloc_model_buffer::<B>(ctx, capacity * cfg.vocab_size));
         self.unified_argmax_logits_capacity = capacity;
     }
 
@@ -1626,6 +1614,7 @@ impl<B: QuantLlmBackend + BackendMoeFused> LlamaFamilyScratch<B> {
     /// references the previous pointers must be invalidated by the caller.
     pub(crate) fn ensure_unified_scratch(
         &mut self,
+        ctx: &mut B::Context,
         cfg: &LlamaFamilyConfig,
         m_total: usize,
         max_seqs: usize,
@@ -1649,6 +1638,10 @@ impl<B: QuantLlmBackend + BackendMoeFused> LlamaFamilyScratch<B> {
         let qkv_dim = q_dim + 2 * kv_dim;
         let im = cfg.intermediate_size;
         let v = cfg.vocab_size;
+        // Cached graphs must stop owning these addresses before any of the
+        // corresponding scratch allocations are replaced.
+        B::retire_graphs_for_storage_mutation(ctx)
+            .unwrap_or_else(|error| std::panic::panic_any(error));
         self.unified_residual = None;
         self.unified_norm_out = None;
         self.unified_qkv_out = None;
@@ -1662,73 +1655,61 @@ impl<B: QuantLlmBackend + BackendMoeFused> LlamaFamilyScratch<B> {
         self.unified_silu_out = None;
         self.unified_mlp_out = None;
 
-        self.unified_residual = Some(alloc_model_buffer::<B>("llama.unified.residual", cap * h));
-        self.unified_norm_out = Some(alloc_model_buffer::<B>("llama.unified.norm_out", cap * h));
-        self.unified_qkv_out = Some(alloc_model_buffer::<B>(
-            "llama.unified.qkv_out",
-            cap * qkv_dim,
-        ));
-        self.unified_packed_q = Some(alloc_model_buffer::<B>(
-            "llama.unified.packed_q",
-            cap * q_dim,
-        ));
-        self.unified_attn_out = Some(alloc_model_buffer::<B>(
-            "llama.unified.attn_out",
-            cap * q_dim,
-        ));
-        self.unified_o_proj_out =
-            Some(alloc_model_buffer::<B>("llama.unified.o_proj_out", cap * h));
+        self.unified_residual = Some(alloc_model_buffer::<B>(ctx, cap * h));
+        self.unified_norm_out = Some(alloc_model_buffer::<B>(ctx, cap * h));
+        self.unified_qkv_out = Some(alloc_model_buffer::<B>(ctx, cap * qkv_dim));
+        self.unified_packed_q = Some(alloc_model_buffer::<B>(ctx, cap * q_dim));
+        self.unified_attn_out = Some(alloc_model_buffer::<B>(ctx, cap * q_dim));
+        self.unified_o_proj_out = Some(alloc_model_buffer::<B>(ctx, cap * h));
         if cfg.sandwich_norms {
-            self.unified_sandwich_tmp = Some(alloc_model_buffer::<B>(
-                "llama.unified.sandwich_tmp",
-                cap * h,
-            ));
+            self.unified_sandwich_tmp = Some(alloc_model_buffer::<B>(ctx, cap * h));
             if B::supports_device_f32_residual_shadow() {
                 self.unified_residual_f32_shadow = Some(alloc_model_typed_buffer::<B>(
-                    "llama.unified.residual_f32_shadow",
+                    ctx,
                     ferrum_kernels::backend::Dtype::F32,
                     cap * h,
                 ));
                 self.unified_sandwich_branch_f32 = Some(alloc_model_typed_buffer::<B>(
-                    "llama.unified.sandwich_branch_f32",
+                    ctx,
                     ferrum_kernels::backend::Dtype::F32,
                     cap * h,
                 ));
             }
         }
-        self.unified_gate_up_out = Some(alloc_model_buffer::<B>(
-            "llama.unified.gate_up_out",
-            cap * 2 * im,
-        ));
-        self.unified_silu_out = Some(alloc_model_buffer::<B>("llama.unified.silu_out", cap * im));
-        self.unified_mlp_out = Some(alloc_model_buffer::<B>("llama.unified.mlp_out", cap * h));
+        self.unified_gate_up_out = Some(alloc_model_buffer::<B>(ctx, cap * 2 * im));
+        self.unified_silu_out = Some(alloc_model_buffer::<B>(ctx, cap * im));
+        self.unified_mlp_out = Some(alloc_model_buffer::<B>(ctx, cap * h));
         if self.unified_cu_seqlens_q.is_none() {
             self.unified_cu_seqlens_q = Some(alloc_model_typed_buffer::<B>(
-                "llama.unified.cu_seqlens_q",
+                ctx,
                 ferrum_kernels::backend::Dtype::U32,
                 max_seqs + 1,
             ));
             self.unified_pos_offsets = Some(alloc_model_typed_buffer::<B>(
-                "llama.unified.pos_offsets",
+                ctx,
                 ferrum_kernels::backend::Dtype::U32,
                 max_seqs,
             ));
             self.unified_block_tables = Some(alloc_model_typed_buffer::<B>(
-                "llama.unified.block_tables",
+                ctx,
                 ferrum_kernels::backend::Dtype::U32,
                 max_seqs * max_blocks_per_seq,
             ));
-            self.unified_packed_normed = Some(alloc_model_buffer::<B>(
-                "llama.unified.packed_normed",
-                max_seqs * h,
-            ));
-            self.unified_packed_logits = Some(alloc_model_buffer::<B>(
-                "llama.unified.packed_logits",
-                max_seqs * v,
-            ));
+            self.unified_packed_normed = Some(alloc_model_buffer::<B>(ctx, max_seqs * h));
+            self.unified_packed_logits = Some(alloc_model_buffer::<B>(ctx, max_seqs * v));
         }
         self.unified_capacity = cap;
         true
+    }
+
+    pub(crate) fn ensure_paged_decode_metadata(&mut self, ctx: &mut B::Context) {
+        if self.paged_batch_cu_seqlens.is_none() {
+            self.paged_batch_cu_seqlens = Some(alloc_model_typed_buffer::<B>(
+                ctx,
+                ferrum_kernels::backend::Dtype::U32,
+                self.paged_max_seqs + 1,
+            ));
+        }
     }
 
     /// Allocate scratch for batched paged dispatch (Phase 4b). Called
@@ -1736,6 +1717,7 @@ impl<B: QuantLlmBackend + BackendMoeFused> LlamaFamilyScratch<B> {
     /// the pool dimensions. Idempotent.
     fn enable_paged_batch(
         &mut self,
+        ctx: &mut B::Context,
         cfg: &LlamaFamilyConfig,
         max_seqs: usize,
         max_blocks_per_seq: usize,
@@ -1744,21 +1726,15 @@ impl<B: QuantLlmBackend + BackendMoeFused> LlamaFamilyScratch<B> {
             return;
         }
         let q_dim = cfg.num_heads * cfg.head_dim;
-        self.paged_batch_q = Some(alloc_model_buffer::<B>(
-            "llama.paged_batch.q",
-            max_seqs * q_dim,
-        ));
-        self.paged_batch_o = Some(alloc_model_buffer::<B>(
-            "llama.paged_batch.o",
-            max_seqs * q_dim,
-        ));
+        self.paged_batch_q = Some(alloc_model_buffer::<B>(ctx, max_seqs * q_dim));
+        self.paged_batch_o = Some(alloc_model_buffer::<B>(ctx, max_seqs * q_dim));
         self.paged_batch_block_tables = Some(alloc_model_typed_buffer::<B>(
-            "llama.paged_batch.block_tables",
+            ctx,
             ferrum_kernels::backend::Dtype::U32,
             max_seqs * max_blocks_per_seq,
         ));
         self.paged_batch_context_lens = Some(alloc_model_typed_buffer::<B>(
-            "llama.paged_batch.context_lens",
+            ctx,
             ferrum_kernels::backend::Dtype::U32,
             max_seqs,
         ));
@@ -1781,9 +1757,28 @@ impl<B: QuantLlmBackend + BackendMoeFused> LlamaFamilyScratch<B> {
 /// `B: BackendKvDtype<KvInt8>` bound is structurally required by the
 /// enum and is satisfied by all backends via stub impls (Cpu/Metal) or
 /// the real impl (CUDA).
+/// Graph-bound model buffers cannot be replaced through safe public field access.
+///
+/// ```compile_fail,E0616
+/// use ferrum_models::models::llama_family::LlamaFamilyModel;
+/// use ferrum_kernels::backend::cpu::CpuBackend;
+/// fn replace_logits(model: &mut LlamaFamilyModel<CpuBackend>) {
+///     model.scratch.logits = Vec::new();
+/// }
+/// ```
+/// ```compile_fail,E0616
+/// use ferrum_models::models::llama_family::LlamaFamilyModel;
+/// use ferrum_kernels::backend::cpu::CpuBackend;
+/// fn replace_weights(model: &mut LlamaFamilyModel<CpuBackend>) {
+///     model.layers.clear();
+/// }
+/// ```
 pub struct LlamaFamilyModel<B: MoeLlmBackend, K: KvLayer<B> = KvFp16> {
-    pub cfg: LlamaFamilyConfig,
-    pub runtime_cfg: LlmRuntimeConfig,
+    /// The original instance context is lent to one frame at a time. None
+    /// means borrowed or held by pending_device_frame; it never means create.
+    execution_context: Option<B::Context>,
+    pub(crate) cfg: LlamaFamilyConfig,
+    pub(crate) runtime_cfg: LlmRuntimeConfig,
 
     /// Backend capabilities resolved once at construction (the allowed
     /// "构造期 capability 决策一次"). Decode/prefill hot paths branch on these
@@ -1791,30 +1786,31 @@ pub struct LlamaFamilyModel<B: MoeLlmBackend, K: KvLayer<B> = KvFp16> {
     /// can't silently rot in the forward code.
     pub(crate) supports_varlen_qkv: bool,
     pub(crate) supports_batched_decode: bool,
-    /// Runtime knobs resolved once at construction from the snapshot installed
-    /// at the composition root (was a process-wide OnceLock reading env).
+    /// Runtime knobs resolved once from explicit instance construction options.
     /// Forward/decode read these fields instead of a global accessor.
     pub(crate) runtime_env: LlamaFamilyRuntimeEnv,
     pub(crate) batched_cfg: super::llama_family_forward_batched::LlamaBatchedRuntimeConfig,
 
-    /// Token embedding table. `None` for backbone-only models (e.g. the
-    /// Qwen3-TTS Talker, which embeds inputs externally and feeds via
-    /// `prefill_from_embeds`).
-    pub embed: Option<B::Buffer>,
+    /// Token embedding table. `None` for backbone-only models receiving
+    /// externally embedded inputs through `prefill_from_embeds`.
+    pub(crate) embed: Option<B::Buffer>,
     /// Source checkpoint layer range loaded into `layers`. Full LLM models
     /// use `0..cfg.num_layers`; layer-split stages load a contiguous subset.
-    pub layer_source_start: usize,
-    pub layer_source_end: usize,
-    pub layers: Vec<LlamaFamilyLayer<B>>,
-    pub final_norm_w: B::Buffer,
+    pub(crate) layer_source_start: usize,
+    pub(crate) layer_source_end: usize,
+    pub(crate) layers: Vec<LlamaFamilyLayer<B>>,
+    pub(crate) final_norm_w: B::Buffer,
     /// LM output head. `None` for backbone-only models.
-    pub lm_head: Option<Box<dyn Linear<B>>>,
+    pub(crate) lm_head: Option<ferrum_kernels::LoadedLinear<B>>,
 
-    pub rope: RopeCache<B>,
+    pub(crate) rope: RopeCache<B>,
     /// Second rope table for local-attention layers (Gemma 3 dual-θ
     /// scheduling). `None` for single-table families.
-    pub rope_local: Option<RopeCache<B>>,
-    pub scratch: LlamaFamilyScratch<B>,
+    pub(crate) rope_local: Option<RopeCache<B>>,
+    pub(crate) scratch: LlamaFamilyScratch<B>,
+    // An unresolved context keeps the exact moved scratch owners. The device
+    // worker must retain this entire model until actual terminal observation.
+    pending_device_frame: Option<LlamaExecutionFrame<B>>,
 
     /// Per-sequence KV caches, one `Vec<KvCache<B>>` of length `num_layers`.
     ///
@@ -1824,7 +1820,8 @@ pub struct LlamaFamilyModel<B: MoeLlmBackend, K: KvLayer<B> = KvFp16> {
     /// - **Paged mode** (`FERRUM_METAL_PAGED_KV=1`): k/v are unused
     ///   placeholders; the real K/V live in [`Self::paged_pools`] and
     ///   the cache's `block_table` + `context_lens` index into them.
-    pub kv_caches: HashMap<String, Vec<K::Layer>>,
+    pub(crate) kv_caches: HashMap<String, Vec<K::Layer>>,
+    prepared_prefixes: HashMap<String, prefix_preparation::PreparedPrefix>,
     /// Free pool of pre-allocated KV cache slots. Released caches return
     /// here instead of being dropped, so their device pointers stay valid
     /// across requests — critical for graph capture (pointers baked into
@@ -1842,22 +1839,27 @@ pub struct LlamaFamilyModel<B: MoeLlmBackend, K: KvLayer<B> = KvFp16> {
     //
     /// Shared K/V pools, one per layer. Sized at model load time for the
     /// configured `MAX_RUNNING_REQUESTS × max_blocks_per_seq` blocks.
-    pub paged_pools: Option<Vec<(B::Buffer, B::Buffer)>>,
+    pub(crate) paged_pools: Option<Vec<K::PagedPool>>,
     /// Block allocator hands out physical block indices from the pool.
     /// `Mutex` because the engine can call `ensure_kv` / `release_kv`
     /// from multiple threads in concurrent serving.
-    pub paged_block_alloc: Option<std::sync::Mutex<crate::common::paged_pool::BlockAllocator>>,
+    pub(crate) paged_block_alloc:
+        Option<std::sync::Mutex<crate::common::paged_pool::BlockAllocator>>,
     /// Paged-batch dispatch dimensions `(max_seqs, max_blocks_per_seq)`,
     /// pinned at the first `ensure_kv` when paged-KV is on. Stored on
     /// the model (not on scratch) so `ensure_scratch`'s realloc can
     /// re-call `enable_paged_batch` after wiping scratch's
     /// `paged_batch_block_tables` / `paged_batch_q` etc.
-    pub paged_dims: Option<(usize, usize)>,
+    pub(crate) paged_dims: Option<(usize, usize)>,
 
     // ── Graph capture state (CUDA only; harmless no-op on other backends) ──
     /// Count of eager decode steps run so far. After `GRAPH_WARMUP`, the
     /// next step captures the decode flow as a graph.
     pub(crate) graph_warmup: usize,
+    /// Exact live cache incarnation referenced by key 0 or its pending capture.
+    /// This lifetime binding survives failures until checked graph retirement;
+    /// `graph_capture_failed` separately denies capture/replay eligibility.
+    single_graph_cache_id: Option<String>,
     /// True if capture was attempted but failed (e.g. backend doesn't
     /// support graph capture). Stops further attempts, falls back to eager.
     pub(crate) graph_capture_failed: bool,
@@ -1865,14 +1867,15 @@ pub struct LlamaFamilyModel<B: MoeLlmBackend, K: KvLayer<B> = KvFp16> {
     pub(crate) batched_graph_warmup: usize,
     /// True if batched graph capture failed.
     pub(crate) batched_graph_failed: bool,
-    /// Set of `m_padded` values (as u64 graph keys) for which a batched
-    /// graph has been captured. Multi-slot via cuda.rs's HashMap-keyed
-    /// graph cache — different batch shapes don't thrash a single slot.
-    pub(crate) batched_graph_keys_seen: std::collections::HashSet<u64>,
-    /// Cache IDs for which device-pointer scratch is currently populated.
-    /// Populate only re-runs when the batch composition changes (new
-    /// requests joined / requests finished). Hot-path optimization:
-    /// avoids 3 sync cuMemcpyHtoD_v2's per decode token (~5% TPOT).
+    /// Complete captured shapes map to separate native graph IDs. Hash
+    /// equality alone never authorizes replay of a different shape.
+    pub(crate) batched_graph_keys_seen: std::collections::HashMap<
+        super::llama_family_forward_batched::BatchedDecodeGraphShape,
+        u64,
+    >,
+    /// Ordered live cache owners bound to the current batch graph set.
+    /// Changing or retiring a member requires checked graph retirement.
+    /// Host pointer staging is refreshed separately before every invocation.
     pub(crate) batched_pointers_for: Option<Vec<String>>,
     /// CUDA-graph state for the unified_forward path. Mirrors the
     /// `batched_graph_*` triple but keyed on `(m_total, num_seqs)`
@@ -1880,7 +1883,14 @@ pub struct LlamaFamilyModel<B: MoeLlmBackend, K: KvLayer<B> = KvFp16> {
     /// graph instead of thrashing a single slot.
     pub(crate) unified_graph_warmup: usize,
     pub(crate) unified_graph_failed: bool,
-    pub(crate) unified_graph_keys_seen: std::collections::HashSet<u64>,
+    /// A capture/replay attempt has not yet reached successful readback or
+    /// checked retirement. This includes captures that never installed a key.
+    /// Failure eligibility stays separate after the original closure retires.
+    pub(crate) unified_graph_retirement_pending: bool,
+    pub(crate) unified_graph_keys_seen:
+        std::collections::HashMap<super::llama_family_forward_batched::UnifiedGraphShape, u64>,
+    /// Monotonic IDs in the high-bit namespace, never a hash authorization.
+    pub(crate) unified_graph_next_key: u64,
 
     // ── Real paged-KV prefix cache counters ─────────────────────────────
     prefix_cache_hits: u64,
@@ -1890,6 +1900,9 @@ pub struct LlamaFamilyModel<B: MoeLlmBackend, K: KvLayer<B> = KvFp16> {
 
     // ── Startup LoRA runtime state ──────────────────────────────────────
     lora_adapters: HashMap<String, RuntimeLoraAdapter<B>>,
+    // Only this instance's original frame/context may prepare or borrow it.
+    // Pending execution retains the whole model, including this workspace.
+    lora_workspace: RuntimeLoraWorkspace<B>,
     lora_cache_adapters: HashMap<String, String>,
     lora_projection_applications: u64,
 }
@@ -1900,8 +1913,22 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
     /// The loader decides per-projection whether to instantiate DenseLinear,
     /// GptqLinear, etc. — this code doesn't care.
     pub fn new(cfg: LlamaFamilyConfig, loader: &dyn WeightLoader<B>) -> Result<Self> {
+        Self::new_with_execution_config(cfg, loader, LlamaExecutionConfig::default())
+    }
+
+    /// Construct with immutable instance options captured before any weight load.
+    pub fn new_with_execution_config(
+        cfg: LlamaFamilyConfig,
+        loader: &dyn WeightLoader<B>,
+        execution: LlamaExecutionConfig,
+    ) -> Result<Self> {
         let num_layers = cfg.num_layers;
-        Self::new_with_stage_config(cfg, loader, LlamaFamilyLayerStageConfig::full(num_layers))
+        Self::new_with_stage_config(
+            cfg,
+            loader,
+            LlamaFamilyLayerStageConfig::full(num_layers),
+            execution,
+        )
     }
 
     /// Build a backbone-only Qwen3 transformer stack (no embed, no lm_head).
@@ -1916,11 +1943,20 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
     /// the final `model.norm.weight`. `model.embed_tokens` and `lm_head`
     /// are NOT read.
     pub fn new_backbone_only(cfg: LlamaFamilyConfig, loader: &dyn WeightLoader<B>) -> Result<Self> {
+        Self::new_backbone_only_with_execution_config(cfg, loader, LlamaExecutionConfig::default())
+    }
+
+    pub fn new_backbone_only_with_execution_config(
+        cfg: LlamaFamilyConfig,
+        loader: &dyn WeightLoader<B>,
+        execution: LlamaExecutionConfig,
+    ) -> Result<Self> {
         let num_layers = cfg.num_layers;
         Self::new_with_stage_config(
             cfg,
             loader,
             LlamaFamilyLayerStageConfig::backbone(num_layers),
+            execution,
         )
     }
 
@@ -1932,14 +1968,38 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         loader: &dyn WeightLoader<B>,
         stage: LlamaFamilyLayerStageConfig,
     ) -> Result<Self> {
-        Self::new_with_stage_config(cfg, loader, stage)
+        Self::new_layer_stage_with_execution_config(
+            cfg,
+            loader,
+            stage,
+            LlamaExecutionConfig::default(),
+        )
+    }
+
+    pub fn new_layer_stage_with_execution_config(
+        cfg: LlamaFamilyConfig,
+        loader: &dyn WeightLoader<B>,
+        stage: LlamaFamilyLayerStageConfig,
+        execution: LlamaExecutionConfig,
+    ) -> Result<Self> {
+        Self::new_with_stage_config(cfg, loader, stage, execution)
     }
 
     fn new_with_stage_config(
         cfg: LlamaFamilyConfig,
         loader: &dyn WeightLoader<B>,
         stage: LlamaFamilyLayerStageConfig,
+        execution: LlamaExecutionConfig,
     ) -> Result<Self> {
+        let execution = execution
+            .normalized()
+            .map_err(ferrum_types::FerrumError::config)?;
+        let runtime_env = LlamaFamilyRuntimeEnv::from_execution_config(&execution);
+        let batched_cfg =
+            super::llama_family_forward_batched::LlamaBatchedRuntimeConfig::from_execution_config(
+                &execution,
+            );
+
         if stage.source_layers.is_empty() {
             return Err(ferrum_types::FerrumError::model(
                 "llama layer stage must include at least one source layer",
@@ -1952,41 +2012,115 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
             )));
         }
 
-        // Invalidate any graph from a previously-loaded model. The captured
-        // graph references the old model's scratch buffers; a fresh model
-        // gets fresh scratch, so reusing the graph would read/write freed
-        // pointers. Matters for test suites where multiple models coexist.
-        {
-            let mut ctx = B::new_context();
-            B::reset_all_graphs(&mut ctx);
-        }
-        let rope = build_rope_cache::<B>(&cfg);
-        // Local-attention rope table (Gemma 3): own θ, never rope-scaled.
-        let rope_local = cfg.rope_local_theta.map(|theta| {
-            let mut local_cfg = cfg.clone();
-            local_cfg.rope_theta = theta;
-            local_cfg.rope_scaling = None;
-            build_rope_cache::<B>(&local_cfg)
-        });
-        let scratch = LlamaFamilyScratch::alloc(&cfg, 1);
-        let embed = if stage.load_embedding {
-            Some(loader.load_tensor("model.embed_tokens.weight")?)
-        } else {
-            None
-        };
-        let layers = load_llama_family_layers(&cfg, loader, stage.source_layers.clone())?;
+        // Reject an unsupported dtype/layout before creating a device context
+        // or loading any weights. Preparation uses this same original policy.
+        selected_llama_kv_layout_for_dtype::<B, K>(
+            &cfg,
+            execution.options.metal_paged_kv,
+            stage.source_layers.clone(),
+        )?;
 
-        let lm_head = if stage.load_lm_head {
-            Some(load_llama_family_lm_head(&cfg, loader)?)
-        } else {
-            None
+        let graphs_requested = execution.options.cuda_graph
+            || execution.options.unified_graph
+            || execution.batched_graph;
+        if graphs_requested && K::graph_capture_contract().is_none() {
+            return Err(ferrum_types::FerrumError::unsupported(
+                "graph capture requires a capture-stable KV implementation",
+            ));
+        }
+        let mut context = B::new_context(&execution.backend_context)?;
+        // These are the actual partially built owners, declared before the
+        // guard so failure observes the original context before their Drop.
+        let mut partial = ModelConstruction::<B> {
+            rope: None,
+            rope_local: None,
+            scratch: None,
+            embed: None,
+            layers: None,
+            lm_head: None,
+            final_norm: None,
+            final_norm_w: None,
         };
-        let final_norm_w = fold_norm_weight::<B>(
-            loader.load_tensor("model.norm.weight")?,
-            cfg.hidden_size,
-            cfg.rmsnorm_unit_offset,
-            1.0,
-        );
+        {
+            let mut construction = device_execution::ConstructionContext::<B>::new(&mut context);
+            B::begin_execution(construction.context)?;
+            partial.rope = Some(build_rope_cache::<B>(construction.context, &cfg));
+            if let Some(theta) = cfg.rope_local_theta {
+                let mut local_cfg = cfg.clone();
+                local_cfg.rope_theta = theta;
+                local_cfg.rope_scaling = None;
+                partial.rope_local = Some(build_rope_cache::<B>(construction.context, &local_cfg));
+            }
+            partial.scratch = Some(LlamaFamilyScratch::alloc(construction.context, &cfg, 1));
+            if stage.load_embedding {
+                partial.embed =
+                    Some(loader.load_tensor(construction.context, "model.embed_tokens.weight")?);
+            }
+            partial.layers = Some(load_llama_family_layers(
+                construction.context,
+                &cfg,
+                loader,
+                stage.source_layers.clone(),
+            )?);
+            if stage.load_lm_head {
+                partial.lm_head = Some(load_llama_family_lm_head(
+                    construction.context,
+                    &cfg,
+                    loader,
+                )?);
+            }
+            if graphs_requested {
+                let stable_layers =
+                    partial
+                        .layers
+                        .as_ref()
+                        .expect("loaded layers")
+                        .iter()
+                        .all(|layer| {
+                            [
+                                &layer.qkv_proj,
+                                &layer.o_proj,
+                                &layer.gate_up_proj,
+                                &layer.down_proj,
+                            ]
+                            .iter()
+                            .all(|projection| projection.is_capture_stable())
+                        });
+                let stable_head = partial
+                    .lm_head
+                    .as_ref()
+                    .is_none_or(|head| head.is_capture_stable());
+                if !stable_layers || !stable_head {
+                    return Err(ferrum_types::FerrumError::unsupported(
+                        "explicit graph capture requires capture-stable loaded projections; use eager execution or an audited LoadedLinear::new_capture_stable implementation",
+                    ));
+                }
+            }
+            partial.final_norm =
+                Some(loader.load_tensor(construction.context, "model.norm.weight")?);
+            partial.final_norm_w = Some(fold_norm_weight::<B>(
+                construction.context,
+                partial.final_norm.take().expect("loaded final norm"),
+                cfg.hidden_size,
+                cfg.rmsnorm_unit_offset,
+                1.0,
+            ));
+            construction.complete()?;
+        }
+        let ModelConstruction {
+            rope,
+            rope_local,
+            scratch,
+            embed,
+            layers,
+            lm_head,
+            final_norm: _,
+            final_norm_w,
+        } = partial;
+        let rope = rope.expect("constructed rope");
+        let scratch = scratch.expect("constructed scratch");
+        let layers = layers.expect("constructed layers");
+        let final_norm_w = final_norm_w.expect("constructed norm");
 
         let layer_source_start = stage.source_layers.start;
         let layer_source_end = stage.source_layers.end;
@@ -2014,10 +2148,8 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
                 supports_varlen_qkv
             );
         }
-        let runtime_env = LlamaFamilyRuntimeEnv::from_env();
-        let batched_cfg =
-            super::llama_family_forward_batched::LlamaBatchedRuntimeConfig::from_env();
         Ok(Self {
+            execution_context: Some(context),
             cfg,
             runtime_cfg,
             supports_varlen_qkv,
@@ -2033,28 +2165,56 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
             rope,
             rope_local,
             scratch,
+            pending_device_frame: None,
             kv_caches: HashMap::new(),
+            prepared_prefixes: HashMap::new(),
             kv_free_pool: Vec::new(),
             paged_pools: None,
             paged_block_alloc: None,
             paged_dims: None,
             graph_warmup: 0,
+            single_graph_cache_id: None,
             graph_capture_failed: false,
             batched_graph_warmup: 0,
             batched_graph_failed: false,
-            batched_graph_keys_seen: std::collections::HashSet::new(),
+            batched_graph_keys_seen: std::collections::HashMap::new(),
             batched_pointers_for: None,
             unified_graph_warmup: 0,
             unified_graph_failed: false,
-            unified_graph_keys_seen: std::collections::HashSet::new(),
+            unified_graph_retirement_pending: false,
+            unified_graph_keys_seen: std::collections::HashMap::new(),
+            unified_graph_next_key: 0,
             prefix_cache_hits: 0,
             prefix_cache_misses: 0,
             prefix_cache_saved_prefill_tokens: 0,
             decode_batch_stats: LlamaDecodeBatchStats::default(),
             lora_adapters: HashMap::new(),
+            lora_workspace: RuntimeLoraWorkspace::default(),
             lora_cache_adapters: HashMap::new(),
             lora_projection_applications: 0,
         })
+    }
+
+    /// Immutable model geometry. Replacing graph-bound storage is only allowed
+    /// through the model's checked growth/retirement paths.
+    pub fn model_config(&self) -> &LlamaFamilyConfig {
+        &self.cfg
+    }
+
+    /// Read-only cache observation. No mutable owner escapes the model.
+    pub fn kv_caches(&self) -> &HashMap<String, Vec<K::Layer>> {
+        &self.kv_caches
+    }
+
+    pub(crate) fn backend_device_ordinal(&self) -> Option<usize> {
+        self.execution_context
+            .as_ref()
+            .or_else(|| {
+                self.pending_device_frame
+                    .as_ref()
+                    .map(|frame| &frame.context)
+            })
+            .map(|context| B::context_config(context).device_ordinal)
     }
 
     pub fn source_layer_range(&self) -> Range<usize> {
@@ -2090,45 +2250,64 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         Some(source_layer_index - self.layer_source_start)
     }
 
-    fn resize_scratch(&mut self, tokens: usize) {
+    pub(in crate::models) fn clear_graph_bookkeeping(&mut self) {
+        self.graph_warmup = 0;
+        self.single_graph_cache_id = None;
+        self.graph_capture_failed = false;
+        self.batched_graph_keys_seen.clear();
+        self.batched_graph_warmup = 0;
+        self.batched_graph_failed = false;
+        self.batched_pointers_for = None;
+        self.unified_graph_keys_seen.clear();
+        self.unified_graph_warmup = 0;
+        self.unified_graph_failed = false;
+        self.unified_graph_retirement_pending = false;
+    }
+
+    fn resize_scratch_in_context(&mut self, ctx: &mut B::Context, tokens: usize) {
         let tokens = tokens.max(1);
         if self.scratch.max_tokens == tokens {
             return;
         }
         // Any captured decode graph holds pointers to the old scratch
         // buffers; those are about to be freed. Invalidate ALL captured
-        // graphs (both single-item and per-m_padded batched) — every
+        // graphs (both single-item and shaped batched) — every
         // captured kernel-arg pointer into scratch is stale.
-        {
-            let mut ctx = B::new_context();
-            B::reset_all_graphs(&mut ctx);
-        }
-        let minimal = LlamaFamilyScratch::alloc(&self.cfg, 1);
-        let old = std::mem::replace(&mut self.scratch, minimal);
-        drop(old);
-        self.scratch = LlamaFamilyScratch::alloc(&self.cfg, tokens);
+        B::retire_graphs_for_storage_mutation(ctx)
+            .unwrap_or_else(|error| std::panic::panic_any(error));
+        self.scratch = LlamaFamilyScratch::alloc(ctx, &self.cfg, tokens);
         self.graph_warmup = 0;
+        self.single_graph_cache_id = None;
         self.graph_capture_failed = false;
         self.batched_graph_keys_seen.clear();
         self.batched_graph_warmup = 0;
         self.batched_graph_failed = false;
+        self.batched_pointers_for = None;
         self.unified_graph_keys_seen.clear();
         self.unified_graph_warmup = 0;
         self.unified_graph_failed = false;
+        self.unified_graph_retirement_pending = false;
         // Realloc wiped paged_batch_*. Re-enable using the dims
         // pinned at first ensure_kv. Without this, the next
         // `forward_layer_batched_decode` panics on
         // `paged_batch_block_tables missing`.
         if let Some((max_seqs, max_blocks_per_seq)) = self.paged_dims {
             self.scratch
-                .enable_paged_batch(&self.cfg, max_seqs, max_blocks_per_seq);
+                .enable_paged_batch(ctx, &self.cfg, max_seqs, max_blocks_per_seq);
         }
     }
 
     /// Grow scratch buffers if `tokens` exceeds the current sizing.
     pub(crate) fn ensure_scratch(&mut self, tokens: usize) {
+        self.run_preparation_frame(|model, frame| {
+            model.ensure_scratch_in_context(&mut frame.context, tokens);
+        })
+        .into_legacy_result();
+    }
+
+    pub(crate) fn ensure_scratch_in_context(&mut self, ctx: &mut B::Context, tokens: usize) {
         if self.scratch.max_tokens < tokens {
-            self.resize_scratch(tokens);
+            self.resize_scratch_in_context(ctx, tokens);
         }
     }
 
@@ -2141,6 +2320,24 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
 
     pub(crate) fn ensure_kv_with_capacity_hint(
         &mut self,
+        cache_id: &str,
+        capacity_hint: Option<usize>,
+    ) {
+        if let Err(error) = self.ensure_preparation_available() {
+            std::panic::panic_any(error);
+        }
+        if self.kv_caches.contains_key(cache_id) {
+            return;
+        }
+        self.run_preparation_frame(|model, frame| {
+            model.ensure_kv_in_context(&mut frame.context, cache_id, capacity_hint);
+        })
+        .into_legacy_result();
+    }
+
+    pub(in crate::models) fn ensure_kv_in_context(
+        &mut self,
+        ctx: &mut B::Context,
         cache_id: &str,
         capacity_hint: Option<usize>,
     ) {
@@ -2186,10 +2383,14 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         // env-var knowledge.
         // Windowed Gemma3 can use paged KV only on backends whose varlen QKV
         // path takes the per-layer sliding-window schedule.
-        let paged = paged_kv_allowed_for_layer_schedule(
-            runtime_env.paged_kv_enabled::<B>(),
-            B::supports_varlen_qkv(),
-            self.cfg.sliding_window_pattern,
+        let paged = matches!(
+            selected_llama_kv_layout_for_dtype::<B, K>(
+                &self.cfg,
+                runtime_env.metal_paged_kv,
+                self.source_layer_range(),
+            )
+            .expect("original KV layout validated at construction"),
+            SelectedKvCacheLayout::Paged { .. }
         );
         // Paged KV uses a vLLM-style global physical block pool. `kv_capacity`
         // defines the per-sequence logical table stride; `kv_max_blocks`
@@ -2205,10 +2406,20 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         // implies every request reserves its full context window.
         if paged && self.paged_pools.is_none() {
             let mut pools = Vec::with_capacity(self.local_layer_count());
+            // Observe the original allocation/upload context before an
+            // incomplete layer collection can unwind and release its buffers.
+            let mut construction = device_execution::ConstructionContext::<B>::new(ctx);
             for _ in self.local_layer_indices() {
-                let pool_floats = total_pool_blocks * nkv * LLAMA_PAGED_BLOCK_SIZE * hd;
-                pools.push((B::alloc(pool_floats), B::alloc(pool_floats)));
+                pools.push(K::alloc_paged_pool(
+                    construction.context,
+                    total_pool_blocks,
+                    LLAMA_PAGED_BLOCK_SIZE,
+                    nkv,
+                    hd,
+                ));
             }
+            construction.transfer();
+            drop(construction);
             self.paged_pools = Some(pools);
             self.paged_block_alloc = Some(std::sync::Mutex::new(
                 crate::common::paged_pool::BlockAllocator::new(total_pool_blocks as u32),
@@ -2221,7 +2432,7 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         // since the pools were first allocated.
         if paged {
             self.scratch
-                .enable_paged_batch(&self.cfg, max_seqs, max_blocks_per_seq);
+                .enable_paged_batch(ctx, &self.cfg, max_seqs, max_blocks_per_seq);
             // Pin dims on the model so `ensure_scratch`'s realloc can
             // re-init paged_batch_* after wiping scratch.
             self.paged_dims = Some((max_seqs, max_blocks_per_seq));
@@ -2235,18 +2446,39 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         // model's K marker. INT8 supports paged mode only — KvInt8::alloc_contig
         // panics, surfacing the misconfiguration here at first ensure_kv.
         let local_layer_count = self.local_layer_count();
-        let allocate_caches = || {
-            (0..local_layer_count)
-                .map(|_| {
-                    if paged {
-                        K::alloc_paged(max_blocks_per_seq, LLAMA_PAGED_BLOCK_SIZE, nkv, hd)
-                    } else {
-                        K::alloc_contig(contig_initial_capacity, nkv, hd)
-                    }
-                })
-                .collect()
+        let replaces_cached_storage = !paged
+            && capacity_hint.is_some()
+            && self
+                .kv_free_pool
+                .last()
+                .and_then(|layers| layers.first())
+                .is_some_and(|cache| K::capacity(cache) != contig_initial_capacity);
+        if replaces_cached_storage {
+            B::retire_graphs_for_storage_mutation(ctx)
+                .unwrap_or_else(|error| std::panic::panic_any(error));
+            self.clear_graph_bookkeeping();
+        }
+        let mut allocate_caches = || {
+            let mut caches = Vec::with_capacity(local_layer_count);
+            let mut construction = device_execution::ConstructionContext::<B>::new(ctx);
+            for _ in 0..local_layer_count {
+                caches.push(if paged {
+                    K::alloc_paged(
+                        construction.context,
+                        max_blocks_per_seq,
+                        LLAMA_PAGED_BLOCK_SIZE,
+                        nkv,
+                        hd,
+                    )
+                } else {
+                    K::alloc_contig(construction.context, contig_initial_capacity, nkv, hd)
+                });
+            }
+            construction.transfer();
+            drop(construction);
+            caches
         };
-        let mut caches = match self.kv_free_pool.pop() {
+        let caches = match self.kv_free_pool.pop() {
             Some(mut cached)
                 if !paged
                     && capacity_hint.is_some()
@@ -2271,19 +2503,26 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
             None => allocate_caches(),
         };
 
+        // The original model map owns the whole cache before the first table
+        // write. Unknown completion keeps that map and this exact context;
+        // it never returns the physical blocks to a different incarnation.
+        self.kv_caches.insert(cache_id.to_string(), caches);
+        let caches = self
+            .kv_caches
+            .get_mut(cache_id)
+            .expect("cache was inserted");
+
         // Physical blocks are allocated on demand before each forward writes
         // KV. At creation time the cache owns no blocks; block_table is all
         // zeroes and context_lens is zero.
         if paged {
             let padded = vec![0u32; max_blocks_per_seq];
-            let mut ctx_tmp = B::new_context();
             for c in caches.iter_mut() {
                 if let Some(bt) = K::block_table_mut(c) {
-                    B::write_typed::<u32>(&mut ctx_tmp, bt, &padded);
+                    B::write_typed::<u32>(ctx, bt, &padded);
                 }
                 K::paged_block_indices_mut(c).clear();
             }
-            B::sync(&mut ctx_tmp);
         }
 
         // Reset logical length; buffers stay. No need to zero the memory —
@@ -2292,12 +2531,9 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         for c in caches.iter_mut() {
             K::set_len(c, 0);
             if let Some(cl) = K::context_lens_mut(c) {
-                let mut ctx_tmp = B::new_context();
-                B::write_typed::<u32>(&mut ctx_tmp, cl, &[0u32]);
-                B::sync(&mut ctx_tmp);
+                B::write_typed::<u32>(ctx, cl, &[0u32]);
             }
         }
-        self.kv_caches.insert(cache_id.to_string(), caches);
     }
 
     pub(crate) fn ensure_paged_kv_capacity_for_cache_id(
@@ -2307,6 +2543,29 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         target_len: usize,
     ) -> Result<()> {
         if self.paged_pools.is_none() {
+            let caches = self.kv_caches.get(cache_id).ok_or_else(|| {
+                ferrum_types::FerrumError::model("KV preparation requires the original cache")
+            })?;
+            if caches.iter().any(|cache| target_len > K::capacity(cache)) {
+                if target_len > self.runtime_env.kv_capacity_for_model(self.cfg.max_seq_len) {
+                    return Err(ferrum_types::FerrumError::resource_exhausted(
+                        "KV target exceeds configured capacity",
+                    ));
+                }
+                // Previous invocations were observed before this frame began.
+                // Retire graph pointers before replacing any layer allocation.
+                B::retire_graphs_for_storage_mutation(ctx)?;
+                self.clear_graph_bookkeeping();
+                for cache in self.kv_caches.get_mut(cache_id).expect("original cache") {
+                    K::ensure_contig_capacity(
+                        ctx,
+                        cache,
+                        target_len,
+                        self.cfg.num_kv_heads,
+                        self.cfg.head_dim,
+                    )?;
+                }
+            }
             return Ok(());
         }
 
@@ -2376,8 +2635,54 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         &mut self,
         requests: &[KvSlotRequest],
     ) -> Result<Option<KvSlotReservation>> {
+        match self.reserve_paged_token_kv_slots(requests)? {
+            crate::common::llm::ModelKvReservation::Reserved(reservation) => Ok(reservation),
+            crate::common::llm::ModelKvReservation::CapacityDeferred(deferred) => {
+                Err(ferrum_types::FerrumError::resource_exhausted(format!(
+                    "paged KV admission: need {} admission blocks but only {} free",
+                    deferred.required_blocks(),
+                    deferred.snapshot().free_blocks,
+                )))
+            }
+        }
+    }
+
+    pub(crate) fn reserve_paged_token_kv_slots(
+        &mut self,
+        requests: &[KvSlotRequest],
+    ) -> Result<crate::common::llm::ModelKvReservation> {
+        self.ensure_preparation_available()?;
+        let needs_context = requests.iter().any(|request| {
+            let Some(caches) = self.kv_caches.get(&request.cache_id) else {
+                return true;
+            };
+            caches.first().is_some_and(|cache| {
+                let block_size = K::block_size(cache);
+                block_size > 0
+                    && request.target_len.div_ceil(block_size) > K::paged_block_indices(cache).len()
+            })
+        });
+        if !needs_context {
+            // Revalidate capacity/admission and preserve the real reservation
+            // evidence, without a context or synchronization on a cached hit.
+            return self.reserve_paged_token_kv_slots_in_context(None, requests);
+        }
+        match self.run_preparation_frame(|model, frame| {
+            model.reserve_paged_token_kv_slots_in_context(Some(&mut frame.context), requests)
+        }) {
+            DeviceFrameResult::Terminal(result) => result?,
+            DeviceFrameResult::Rejected(error) | DeviceFrameResult::Held(error) => Err(error),
+        }
+    }
+
+    pub(in crate::models) fn reserve_paged_token_kv_slots_in_context(
+        &mut self,
+        mut ctx: Option<&mut B::Context>,
+        requests: &[KvSlotRequest],
+    ) -> Result<crate::common::llm::ModelKvReservation> {
+        use crate::common::llm::ModelKvReservation;
         if requests.is_empty() {
-            return Ok(None);
+            return Ok(ModelKvReservation::Reserved(None));
         }
 
         let mut targets: Vec<(String, usize, usize)> = Vec::new();
@@ -2402,15 +2707,21 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         }
 
         for (cache_id, _, _) in &targets {
-            self.ensure_kv(cache_id);
+            if !self.kv_caches.contains_key(cache_id) {
+                self.ensure_kv_in_context(
+                    ctx.as_deref_mut()
+                        .expect("new cache requires a preparation context"),
+                    cache_id,
+                    None,
+                );
+            }
         }
         if self.paged_pools.is_none() {
-            return Ok(None);
+            return Ok(ModelKvReservation::Reserved(None));
         }
 
         let mut plans = Vec::with_capacity(targets.len());
         let mut block_size = 0usize;
-        let mut total_new_blocks = 0usize;
         let mut total_admission_new_blocks = 0usize;
         for (cache_id, target_len, admission_target_len) in &targets {
             let caches = self.kv_caches.get(cache_id).ok_or_else(|| {
@@ -2425,7 +2736,7 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
             })?;
             let this_block_size = K::block_size(cache);
             if this_block_size == 0 {
-                return Ok(None);
+                return Ok(ModelKvReservation::Reserved(None));
             }
             if block_size == 0 {
                 block_size = this_block_size;
@@ -2450,7 +2761,6 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
                 )));
             }
             let new_blocks = blocks_after.saturating_sub(blocks_before);
-            total_new_blocks += new_blocks;
             total_admission_new_blocks += admission_blocks_after.saturating_sub(blocks_before);
             plans.push(KvSlotAllocation {
                 cache_id: cache_id.clone(),
@@ -2465,17 +2775,33 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
                 "paged KV reservation missing block allocator while paged_pools is set",
             )
         })?;
-        let free_blocks_before = {
+        let (total_blocks, free_blocks_before) = {
             let alloc = alloc_arc.lock().unwrap_or_else(|p| p.into_inner());
-            alloc.free_count()
+            (alloc.capacity() as usize, alloc.free_count())
         };
         if total_admission_new_blocks > free_blocks_before {
-            return Err(ferrum_types::FerrumError::resource_exhausted(format!(
-                "paged KV admission: need {total_admission_new_blocks} admission blocks ({total_new_blocks} immediate) but only {free_blocks_before} free"
-            )));
+            if total_admission_new_blocks > total_blocks {
+                return Err(ferrum_types::FerrumError::resource_exhausted(format!(
+                    "paged KV admission requires {total_admission_new_blocks} blocks but the physical pool contains only {total_blocks}"
+                )));
+            }
+            return Ok(ModelKvReservation::CapacityDeferred(
+                ferrum_execution::token_execution::TokenAdmissionCapacityDeferral::new(
+                    alloc_arc
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .capacity_domain()
+                        .clone(),
+                    total_admission_new_blocks,
+                    KvSlotCapacitySnapshot {
+                        block_size,
+                        total_blocks,
+                        free_blocks: free_blocks_before,
+                    },
+                )?,
+            ));
         }
 
-        let mut ctx = B::new_context();
         for plan in &plans {
             if plan.new_blocks == 0 {
                 continue;
@@ -2509,154 +2835,27 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
             for cache in caches.iter_mut() {
                 *K::paged_block_indices_mut(cache) = block_indices.clone();
                 if let Some(block_table) = K::block_table_mut(cache) {
-                    B::write_typed::<u32>(&mut ctx, block_table, &padded);
+                    B::write_typed::<u32>(
+                        ctx.as_deref_mut()
+                            .expect("new blocks require a preparation context"),
+                        block_table,
+                        &padded,
+                    );
                 }
             }
         }
-        B::sync(&mut ctx);
 
         let (total_blocks, free_blocks_after) = {
             let alloc = alloc_arc.lock().unwrap_or_else(|p| p.into_inner());
             (alloc.capacity() as usize, alloc.free_count())
         };
-        Ok(Some(KvSlotReservation {
+        Ok(ModelKvReservation::Reserved(Some(KvSlotReservation {
             block_size,
             total_blocks,
             free_blocks_before,
             free_blocks_after,
             allocations: plans,
-        }))
-    }
-
-    fn record_prefix_cache_probe(&mut self, saved_tokens: usize) {
-        if saved_tokens > 0 {
-            self.prefix_cache_hits += 1;
-            self.prefix_cache_saved_prefill_tokens += saved_tokens as u64;
-        } else {
-            self.prefix_cache_misses += 1;
-        }
-    }
-
-    fn try_acquire_prefix_cache(&mut self, cache_id: &str, tokens: &[u32]) -> usize {
-        let Some(alloc_arc) = self.paged_block_alloc.as_ref() else {
-            return 0;
-        };
-        let caches = match self.kv_caches.get(cache_id) {
-            Some(caches) => caches,
-            None => return 0,
-        };
-        let block_size = caches.first().map(K::block_size).unwrap_or(0);
-        if block_size == 0 {
-            return 0;
-        }
-
-        let token_ids: Vec<ferrum_types::TokenId> = tokens
-            .iter()
-            .map(|&token| ferrum_types::TokenId::new(token))
-            .collect();
-        let hashes = block_hash_chain(&token_ids, block_size);
-        if hashes.is_empty() {
-            return 0;
-        }
-
-        let mut alloc = alloc_arc.lock().unwrap_or_else(|p| p.into_inner());
-        let mut matched = Vec::with_capacity(hashes.len());
-        for hash in hashes {
-            match alloc.try_acquire_by_hash(hash) {
-                Some(block) => matched.push(block),
-                None => break,
-            }
-        }
-        if matched.is_empty() {
-            return 0;
-        }
-        let n_matched = matched.len();
-
-        let displaced = caches
-            .first()
-            .map(|cache| {
-                let existing = K::paged_block_indices(cache);
-                existing[..n_matched.min(existing.len())].to_vec()
-            })
-            .unwrap_or_default();
-        alloc.free(&displaced);
-        drop(alloc);
-
-        let caches_mut = self.kv_caches.get_mut(cache_id).expect("cache present");
-        let max_blocks = caches_mut
-            .first()
-            .map(|cache| K::paged_block_indices(cache).len())
-            .unwrap_or(0);
-        let new_len = n_matched * block_size;
-        let mut ctx = B::new_context();
-        for cache in caches_mut.iter_mut() {
-            {
-                let indices = K::paged_block_indices_mut(cache);
-                if indices.len() < matched.len() {
-                    indices.resize(matched.len(), 0);
-                }
-                for (idx, &block) in matched.iter().enumerate() {
-                    indices[idx] = block;
-                }
-            }
-            K::set_len(cache, new_len);
-            let padded = {
-                let mut padded = K::paged_block_indices(cache).to_vec();
-                padded.resize(max_blocks, 0);
-                padded
-            };
-            if let Some(block_table) = K::block_table_mut(cache) {
-                B::write_typed::<u32>(&mut ctx, block_table, &padded);
-            }
-            if let Some(context_lens) = K::context_lens_mut(cache) {
-                B::write_typed::<u32>(&mut ctx, context_lens, &[new_len as u32]);
-            }
-        }
-        B::sync(&mut ctx);
-
-        new_len
-    }
-
-    fn register_prefix_cache(
-        &mut self,
-        cache_id: &str,
-        all_tokens: &[u32],
-        prior_cached_tokens: usize,
-    ) {
-        let Some(alloc_arc) = self.paged_block_alloc.as_ref() else {
-            return;
-        };
-        let caches = match self.kv_caches.get(cache_id) {
-            Some(caches) => caches,
-            None => return,
-        };
-        let cache0 = match caches.first() {
-            Some(cache) => cache,
-            None => return,
-        };
-        let block_size = K::block_size(cache0);
-        if block_size == 0 {
-            return;
-        }
-
-        let token_ids: Vec<ferrum_types::TokenId> = all_tokens
-            .iter()
-            .map(|&token| ferrum_types::TokenId::new(token))
-            .collect();
-        let hashes = block_hash_chain(&token_ids, block_size);
-        if hashes.is_empty() {
-            return;
-        }
-
-        let start_block = prior_cached_tokens / block_size;
-        let mut alloc = alloc_arc.lock().unwrap_or_else(|p| p.into_inner());
-        for i in start_block..hashes.len().min(K::paged_block_indices(cache0).len()) {
-            let block_end_token = (i + 1) * block_size;
-            if block_end_token > K::len(cache0) {
-                break;
-            }
-            alloc.register_block_hash(K::paged_block_indices(cache0)[i], hashes[i]);
-        }
+        })))
     }
 
     fn prefix_cache_snapshot_json(&self) -> serde_json::Value {
@@ -2785,14 +2984,32 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
             }
             return Ok(());
         }
-        let runtime = load_runtime_lora_adapter::<B>(&adapter)?;
-        self.validate_lora_adapter(&runtime)?;
-        self.lora_adapters.insert(adapter.name.clone(), runtime);
-        Ok(())
+        match self.run_preparation_frame(|model, frame| {
+            let runtime = load_runtime_lora_adapter::<B>(&mut frame.context, &adapter)?;
+            let validation = model.validate_lora_adapter(&runtime);
+            // Even an invalid upload remains an actual frame product until
+            // terminal observation; Held retains it with the original frame.
+            Ok::<_, ferrum_types::FerrumError>((runtime, validation))
+        }) {
+            DeviceFrameResult::Terminal(Ok(Ok((runtime, validation)))) => {
+                validation?;
+                self.lora_adapters.insert(adapter.name.clone(), runtime);
+                Ok(())
+            }
+            DeviceFrameResult::Terminal(Ok(Err(error)))
+            | DeviceFrameResult::Terminal(Err(error))
+            | DeviceFrameResult::Rejected(error)
+            | DeviceFrameResult::Held(error) => Err(error),
+        }
     }
 
     fn single_decode_graph_enabled(&self) -> bool {
         self.runtime_env.cuda_graph
+            && !self.graph_capture_failed
+            // This single-item route uploads a stack context-length value and
+            // encodes fixed paged write positions. Paged graphs use the separate
+            // batched/unified device-staged routes, never this capture region.
+            && self.paged_pools.is_none()
             && self.runtime_env.graph_capture_allowed()
             && !self.use_host_residual_shadow()
             && !self.use_device_residual_shadow()
@@ -2810,12 +3027,24 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         self.lora_adapters.get(adapter_name)
     }
 
-    fn active_lora_adapter_ptr_for_cache(
-        &self,
+    fn prepare_lora_workspace_for_cache(
+        &mut self,
+        ctx: &mut B::Context,
         cache_id: &str,
-    ) -> Option<*const RuntimeLoraAdapter<B>> {
-        self.active_lora_adapter_for_cache(cache_id)
-            .map(|adapter| adapter as *const RuntimeLoraAdapter<B>)
+        rows: usize,
+    ) {
+        // Prepare only the adapter consumed by this invocation. The original
+        // frame begins after its predecessor is terminal; LoRA is never
+        // captured, and its scratch remains owned by this model instance.
+        if let Some(adapter) = self
+            .lora_cache_adapters
+            .get(cache_id)
+            .and_then(|name| self.lora_adapters.get(name))
+        {
+            self.lora_workspace
+                .prepare(ctx, adapter, rows)
+                .unwrap_or_else(|error| std::panic::panic_any(error));
+        }
     }
 
     fn lora_metrics_snapshot_json(&self) -> serde_json::Value {
@@ -2875,20 +3104,21 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         tokens: usize,
         dim: usize,
     ) {
-        let weight_h = B::to_vec(weight, dim);
+        let weight_h = B::to_vec_in_context(ctx, weight, dim);
         let normed = Self::rms_norm_host(input, &weight_h, tokens, dim, eps);
         B::write_f32_to_activation(ctx, out, &normed);
     }
 
     fn rms_norm_device_to_host(
+        ctx: &mut B::Context,
         input: &B::Buffer,
         weight: &B::Buffer,
         eps: f32,
         tokens: usize,
         dim: usize,
     ) -> Vec<f32> {
-        let input_h = B::to_vec(input, tokens * dim);
-        let weight_h = B::to_vec(weight, dim);
+        let input_h = B::to_vec_in_context(ctx, input, tokens * dim);
+        let weight_h = B::to_vec_in_context(ctx, weight, dim);
         Self::rms_norm_host(&input_h, &weight_h, tokens, dim, eps)
     }
 
@@ -2988,16 +3218,9 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
             };
         }
         nt!("residual-in", residual, tokens * h, h);
-        let op_profile = self.runtime_env.decode_op_profile
-            || (self.runtime_env.prefill_op_profile && tokens > 1);
 
         // 1. Input RMSNorm
-        let _t0 = if op_profile {
-            B::sync(ctx);
-            Some(std::time::Instant::now())
-        } else {
-            None
-        };
+
         if let Some(host) = host_residual.as_deref() {
             Self::rms_norm_host_to_activation(
                 ctx,
@@ -3030,26 +3253,10 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
             );
         }
         nt!("input_norm", &self.scratch.norm_out, tokens * h, h);
-        if let Some(t0) = _t0 {
-            B::sync(ctx);
-            NORM_TIME_US.fetch_add(
-                t0.elapsed().as_micros() as u64,
-                std::sync::atomic::Ordering::Relaxed,
-            );
-            NORM_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        }
 
         // 2. Fused QKV projection (Linear dispatches to Dense/GPTQ/AWQ/GGUF)
-        let _t0 = if op_profile {
-            B::sync(ctx);
-            Some(std::time::Instant::now())
-        } else {
-            None
-        };
+
         {
-            #[cfg(feature = "cuda")]
-            let _alloc_label =
-                ferrum_kernels::backend::cuda::push_alloc_label("llama.forward_layer.qkv_proj");
             layer.qkv_proj.forward(
                 ctx,
                 &self.scratch.norm_out,
@@ -3063,12 +3270,15 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
             tokens * (q_dim + 2 * kv_dim),
             q_dim + 2 * kv_dim
         );
-        if let Some(adapter) = self.active_lora_adapter_ptr_for_cache(cache_id) {
-            // SAFETY: `lora_adapters` is not mutated during a forward pass;
-            // the pointer is used only for this immediate read-only call.
-            let applied = unsafe { &*adapter }
+        if let Some(adapter) = self
+            .lora_cache_adapters
+            .get(cache_id)
+            .and_then(|name| self.lora_adapters.get(name))
+        {
+            let applied = adapter
                 .apply_projection(
                     ctx,
+                    &mut self.lora_workspace,
                     source_li,
                     "qkv_proj",
                     &self.scratch.norm_out,
@@ -3077,14 +3287,6 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
                 )
                 .expect("validated LoRA qkv_proj");
             self.lora_projection_applications += applied as u64;
-        }
-        if let Some(t0) = _t0 {
-            B::sync(ctx);
-            MATMUL_TIME_US.fetch_add(
-                t0.elapsed().as_micros() as u64,
-                std::sync::atomic::Ordering::Relaxed,
-            );
-            MATMUL_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
 
         // 3-5. Fused split-QKV + QK-norm + RoPE + cache-write.
@@ -3123,15 +3325,14 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         //
         // Paged mode: also need this layer's shared pool buffers
         // (self.paged_pools[li]). The pool is a separate field from
-        // kv_caches, so we take a raw pointer to its (k, v) here while
+        // kv_caches, so we take a raw pointer to its typed pool here while
         // we still hold &mut self, then deref via unsafe inside the
         // paged dispatch below. Safety: paged_pools is allocated once
         // and never resized; we don't touch self.paged_pools while the
         // pointer is in use.
-        let paged_pool_ptr: Option<(*mut B::Buffer, *mut B::Buffer)> =
+        let paged_pool_ptr: Option<*mut K::PagedPool> =
             if let Some(pools) = self.paged_pools.as_mut() {
-                let pool = &mut pools[li];
-                Some((&mut pool.0 as *mut _, &mut pool.1 as *mut _))
+                Some(&mut pools[li] as *mut _)
             } else {
                 None
             };
@@ -3170,15 +3371,14 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
 
         // Paged path: K::paged_write fuses split_qkv_norm_rope + cache append
         // (FP16: into_paged_cache; INT8: split_qkv_norm_rope + int8_kv_append_paged).
-        // K::paged_decode_attention reads from layer-local INT8 buffers or the
-        // shared FP16 pool depending on K. Then K-agnostic post-attn tail.
+        // K::paged_decode_attention reads the same typed shared physical pool.
+        // Then K-agnostic post-attn tail.
         if cache_block_size > 0 {
-            let (pool_k_ptr, pool_v_ptr) =
+            let pool_ptr =
                 paged_pool_ptr.expect("paged_pools must be allocated when block_size > 0");
             // SAFETY: paged_pools is allocated once and never resized; the
             // raw pointers don't outlive this method scope.
-            let pool_k = unsafe { &mut *pool_k_ptr };
-            let pool_v = unsafe { &mut *pool_v_ptr };
+            let pool = unsafe { &mut *pool_ptr };
 
             K::paged_write(
                 ctx,
@@ -3191,8 +3391,7 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
                 &mut self.scratch.q_head_major,
                 &mut self.scratch.k_head_major,
                 &mut self.scratch.v_head_major,
-                pool_k,
-                pool_v,
+                pool,
                 tokens,
                 nh,
                 nkv,
@@ -3206,20 +3405,18 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
             let new_len = cache_len_before + tokens;
             K::set_len(&mut caches[li], new_len);
 
-            let pool_k_imm = unsafe { &*pool_k_ptr };
-            let pool_v_imm = unsafe { &*pool_v_ptr };
             K::paged_decode_attention(
                 ctx,
                 &mut caches[li],
                 &self.scratch.q_head_major,
-                pool_k_imm,
-                pool_v_imm,
+                pool,
                 &mut self.scratch.attn_head_major_out,
                 nh,
                 nkv,
                 hd,
                 new_len,
                 tokens,
+                layer_window,
             )
             .expect("K::paged_decode_attention");
 
@@ -3237,12 +3434,7 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
 
         // Non-paged (contig) path. INT8 path doesn't reach here:
         // KvInt8::alloc_contig panics in ensure_kv.
-        let _qkr_t0 = if op_profile {
-            B::sync(ctx);
-            Some(std::time::Instant::now())
-        } else {
-            None
-        };
+
         K::contig_write(
             ctx,
             &mut caches[li],
@@ -3272,24 +3464,15 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
             nh * tokens * hd,
             hd
         );
-        if let Some(t0) = _qkr_t0 {
-            B::sync(ctx);
-            QKR_TIME_US.fetch_add(
-                t0.elapsed().as_micros() as u64,
-                std::sync::atomic::Ordering::Relaxed,
-            );
-            QKR_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        }
+
         let new_len = cache_len_before + tokens;
-        K::set_len(&mut caches[li], new_len);
+        // Recording is not execution. Every captured layer keeps its original
+        // host frontier until the complete graph has actually finished.
+        if !B::graph_capture_in_flight(ctx) {
+            K::set_len(&mut caches[li], new_len);
+        }
         let kv_stride = cache_capacity;
 
-        let _attn_t0 = if op_profile {
-            B::sync(ctx);
-            Some(std::time::Instant::now())
-        } else {
-            None
-        };
         let attn_cfg = ferrum_kernels::backend::AttnConfig {
             num_heads: nh,
             num_kv_heads: nkv,
@@ -3307,6 +3490,7 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
             attn_cfg,
             tokens,
             pos_offset,
+            new_len,
         )
         .expect("K::contig_decode_attention");
         nt!(
@@ -3318,14 +3502,6 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         let _ = q_dim;
         let _ = kv_dim;
         let _ = dummy;
-        if let Some(t0) = _attn_t0 {
-            B::sync(ctx);
-            ATTN_TIME_US.fetch_add(
-                t0.elapsed().as_micros() as u64,
-                std::sync::atomic::Ordering::Relaxed,
-            );
-            ATTN_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        }
 
         self.forward_layer_post_attn_with_host_residual(
             ctx,
@@ -3412,18 +3588,19 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
 
         // 8. O projection.
         {
-            #[cfg(feature = "cuda")]
-            let _alloc_label =
-                ferrum_kernels::backend::cuda::push_alloc_label("llama.forward_layer.o_proj");
             layer
                 .o_proj
                 .forward(ctx, attn_token_major, &mut self.scratch.o_proj_out, tokens);
         }
-        if let Some(adapter) = self.active_lora_adapter_ptr_for_cache(cache_id) {
-            // SAFETY: see qkv_proj LoRA application above.
-            let applied = unsafe { &*adapter }
+        if let Some(adapter) = self
+            .lora_cache_adapters
+            .get(cache_id)
+            .and_then(|name| self.lora_adapters.get(name))
+        {
+            let applied = adapter
                 .apply_projection(
                     ctx,
+                    &mut self.lora_workspace,
                     source_li,
                     "o_proj",
                     attn_token_major,
@@ -3483,27 +3660,6 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
                 }
             };
         }
-        let tail_profile = self.runtime_env.decode_op_profile
-            || (self.runtime_env.prefill_op_profile && tokens > 1)
-            || self.batched_cfg.decode_op_profile_enabled();
-        macro_rules! time_tail {
-            ($bucket_us:expr, $bucket_n:expr, $body:block) => {{
-                if tail_profile {
-                    B::sync(ctx);
-                    let t0 = std::time::Instant::now();
-                    let out = { $body };
-                    B::sync(ctx);
-                    $bucket_us.fetch_add(
-                        t0.elapsed().as_micros() as u64,
-                        std::sync::atomic::Ordering::Relaxed,
-                    );
-                    $bucket_n.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    out
-                } else {
-                    $body
-                }
-            }};
-        }
 
         // 9. Residual + pre-MLP norm.
         //
@@ -3511,10 +3667,11 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         // (post_attention_layernorm in Gemma naming), add to residual,
         // then norm the residual with pre_feedforward_layernorm.
         // Legacy families: single fused residual-add + post-attn norm.
-        time_tail!(TAIL_NORM_TIME_US, TAIL_NORM_CALLS, {
+        {
             if let Some(post_attn_w) = &layer.post_attn_ln_w {
                 if let Some(host) = host_residual.as_deref_mut() {
                     let branch = Self::rms_norm_device_to_host(
+                        ctx,
                         &self.scratch.o_proj_out,
                         post_attn_w,
                         eps,
@@ -3611,26 +3768,24 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
                     h,
                 );
             }
-        });
+        };
 
         // 10. Fused gate+up projection.
-        time_tail!(TAIL_GATE_UP_TIME_US, TAIL_GATE_UP_CALLS, {
-            #[cfg(feature = "cuda")]
-            let _alloc_label =
-                ferrum_kernels::backend::cuda::push_alloc_label("llama.forward_layer.gate_up_proj");
+        {
             layer.gate_up_proj.forward(
                 ctx,
                 &self.scratch.norm_out,
                 &mut self.scratch.gate_up_out,
                 tokens,
             );
-            if let Some(adapter) =
-                cache_id.and_then(|cache_id| self.active_lora_adapter_ptr_for_cache(cache_id))
+            if let Some(adapter) = cache_id
+                .and_then(|cache_id| self.lora_cache_adapters.get(cache_id))
+                .and_then(|name| self.lora_adapters.get(name))
             {
-                // SAFETY: see qkv_proj LoRA application above.
-                let applied = unsafe { &*adapter }
+                let applied = adapter
                     .apply_projection(
                         ctx,
+                        &mut self.lora_workspace,
                         source_li,
                         "gate_up_proj",
                         &self.scratch.norm_out,
@@ -3640,7 +3795,7 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
                     .expect("validated LoRA gate_up_proj");
                 self.lora_projection_applications += applied as u64;
             }
-        });
+        };
 
         nt!("pre_mlp_norm", &self.scratch.norm_out, tokens * h, h);
         nt!(
@@ -3650,7 +3805,7 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
             2 * im
         );
         // 11. Gated activation: SwiGLU (silu) or GeGLU (gelu_tanh, Gemma).
-        time_tail!(TAIL_ACT_TIME_US, TAIL_ACT_CALLS, {
+        {
             match cfg.activation {
                 Activation::GeluTanh => B::fused_gelu_tanh_mul_split(
                     ctx,
@@ -3667,27 +3822,25 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
                     im,
                 ),
             }
-        });
+        };
 
         nt!("act_mul", &self.scratch.silu_out, tokens * im, im);
         // 12. Down projection.
-        time_tail!(TAIL_DOWN_TIME_US, TAIL_DOWN_CALLS, {
-            #[cfg(feature = "cuda")]
-            let _alloc_label =
-                ferrum_kernels::backend::cuda::push_alloc_label("llama.forward_layer.down_proj");
+        {
             layer.down_proj.forward(
                 ctx,
                 &self.scratch.silu_out,
                 &mut self.scratch.mlp_out,
                 tokens,
             );
-            if let Some(adapter) =
-                cache_id.and_then(|cache_id| self.active_lora_adapter_ptr_for_cache(cache_id))
+            if let Some(adapter) = cache_id
+                .and_then(|cache_id| self.lora_cache_adapters.get(cache_id))
+                .and_then(|name| self.lora_adapters.get(name))
             {
-                // SAFETY: see qkv_proj LoRA application above.
-                let applied = unsafe { &*adapter }
+                let applied = adapter
                     .apply_projection(
                         ctx,
+                        &mut self.lora_workspace,
                         source_li,
                         "down_proj",
                         &self.scratch.silu_out,
@@ -3697,15 +3850,16 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
                     .expect("validated LoRA down_proj");
                 self.lora_projection_applications += applied as u64;
             }
-        });
+        };
         nt!("down_proj", &self.scratch.mlp_out, tokens * h, h);
 
         // 13. Final residual add. Sandwich families norm the MLP output
         // (post_feedforward_layernorm) before adding it to the residual.
-        time_tail!(TAIL_RESID_TIME_US, TAIL_RESID_CALLS, {
+        {
             if let Some(post_ffn_w) = &layer.post_ffn_ln_w {
                 if let Some(host) = host_residual.as_deref_mut() {
                     let branch = Self::rms_norm_device_to_host(
+                        ctx,
                         &self.scratch.mlp_out,
                         post_ffn_w,
                         eps,
@@ -3756,7 +3910,7 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
             } else {
                 B::add_inplace(ctx, residual, &self.scratch.mlp_out, tokens * h);
             }
-        });
+        };
         if let Some(device) = device_residual.as_ref() {
             nt!("resid_ffn", &**device, tokens * h, h);
         } else if host_residual.is_none() {
@@ -3776,11 +3930,39 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
     /// `pos_offset = cache.len` the same way prefill_internal does, so
     /// chunked prefill semantics carry over for free.
     pub fn forward_verify(&mut self, cache_id: &str, tokens: &[u32]) -> Vec<f32> {
+        assert!(
+            !tokens.is_empty(),
+            "forward_verify called with empty tokens"
+        );
+        self.validate_prepared_legacy_write(
+            cache_id,
+            self.cache_len(cache_id),
+            tokens.len(),
+            Some(tokens),
+        )
+        .unwrap_or_else(|error| std::panic::panic_any(error));
+        self.run_device_frame(|model, frame| model.forward_verify_in_frame(frame, cache_id, tokens))
+            .into_legacy_result()
+    }
+
+    fn forward_verify_in_frame(
+        &mut self,
+        frame: &mut LlamaExecutionFrame<B>,
+        cache_id: &str,
+        tokens: &[u32],
+    ) -> Vec<f32> {
         let seq_len = tokens.len();
         assert!(seq_len > 0, "forward_verify called with empty tokens");
-        self.ensure_scratch(seq_len);
-        self.scratch.ensure_batch_logits(&self.cfg, seq_len);
-        self.ensure_kv(cache_id);
+        self.ensure_scratch_in_context(&mut frame.context, seq_len);
+        self.prepare_lora_workspace_for_cache(&mut frame.context, cache_id, seq_len);
+        let grows_batch_logits = seq_len > self.scratch.batch_logits_capacity;
+        self.scratch
+            .ensure_batch_logits(&mut frame.context, &self.cfg, seq_len);
+        if grows_batch_logits {
+            // A failed retirement must retain the original graph/cache binding.
+            self.clear_graph_bookkeeping();
+        }
+        self.ensure_kv_in_context(&mut frame.context, cache_id, None);
 
         let h = self.cfg.hidden_size;
         let vocab = self.cfg.vocab_size;
@@ -3792,14 +3974,18 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
             .map(|c| K::len(c))
             .unwrap_or(0);
 
-        let mut ctx = B::new_context();
+        let use_device_residual_shadow = self.use_device_residual_shadow();
+        frame
+            .take_scratch(
+                &mut self.scratch,
+                FrameLayout::Single,
+                use_device_residual_shadow,
+            )
+            .expect("take frame scratch");
+        let mut ctx = &mut frame.context;
         self.ensure_paged_kv_capacity_for_cache_id(&mut ctx, cache_id, pos_offset + seq_len)
             .expect("paged KV dynamic grow");
-        let mut residual = self
-            .scratch
-            .residual
-            .take()
-            .expect("scratch residual missing (previous call didn't restore)");
+        let mut residual = frame.residual.as_mut().expect("frame residual");
 
         let embed = self
             .embed
@@ -3810,34 +3996,18 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
             B::scale_inplace(&mut ctx, &mut residual, scale, seq_len * h);
         }
         let use_host_residual_shadow = self.use_host_residual_shadow();
-        let use_device_residual_shadow = self.use_device_residual_shadow();
+
         let mut host_residual = if use_host_residual_shadow {
             B::sync(&mut ctx);
-            Some(B::to_vec(&residual, seq_len * h))
+            Some(B::to_vec_in_context(ctx, &residual, seq_len * h))
         } else {
             None
         };
-        let mut device_residual_shadow = if use_device_residual_shadow {
-            let mut shadow = self
-                .scratch
-                .residual_f32_shadow
-                .take()
-                .expect("device F32 residual shadow scratch missing");
-            B::activation_to_f32_shadow(&mut ctx, &residual, &mut shadow, seq_len * h);
-            Some(shadow)
-        } else {
-            None
-        };
-        let mut device_branch_shadow = if use_device_residual_shadow {
-            Some(
-                self.scratch
-                    .sandwich_branch_f32
-                    .take()
-                    .expect("device F32 sandwich branch scratch missing"),
-            )
-        } else {
-            None
-        };
+        let mut device_residual_shadow = frame.residual_f32.as_mut();
+        if let Some(shadow) = device_residual_shadow.as_deref_mut() {
+            B::activation_to_f32_shadow(&mut ctx, &residual, shadow, seq_len * h);
+        }
+        let mut device_branch_shadow = frame.branch_f32.as_mut();
 
         for li in self.local_layer_indices() {
             self.forward_layer_with_residual_shadow(
@@ -3848,8 +4018,8 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
                 pos_offset,
                 seq_len,
                 host_residual.as_deref_mut(),
-                device_residual_shadow.as_mut(),
-                device_branch_shadow.as_mut(),
+                device_residual_shadow.as_deref_mut(),
+                device_branch_shadow.as_deref_mut(),
             );
         }
 
@@ -3895,9 +4065,6 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
             .as_ref()
             .expect("forward_verify called on backbone-only model (no lm_head)");
         {
-            #[cfg(feature = "cuda")]
-            let _alloc_label =
-                ferrum_kernels::backend::cuda::push_alloc_label("llama.forward_verify.lm_head");
             lm_head.forward(
                 &mut ctx,
                 &self.scratch.norm_out,
@@ -3906,13 +4073,10 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
             );
         }
 
-        B::sync(&mut ctx);
-        if use_device_residual_shadow {
-            self.scratch.residual_f32_shadow = device_residual_shadow;
-            self.scratch.sandwich_branch_f32 = device_branch_shadow;
-        }
-        self.scratch.residual = Some(residual);
-        B::to_vec(&self.scratch.batch_logits, seq_len * vocab)
+        let quiescent = device_execution::checked_sync::<B>(ctx);
+        let output = B::to_vec_in_context(ctx, &self.scratch.batch_logits, seq_len * vocab);
+        frame.completed = Some(quiescent);
+        output
     }
 
     /// Prefill: process `tokens` prompt tokens in a single batch, return
@@ -3923,60 +4087,68 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
     /// `[kv_len, kv_len + tokens.len())` so RoPE and causal masking stay
     /// aligned. Used by the engine's chunked-prefill path.
     pub fn prefill_internal(&mut self, cache_id: &str, tokens: &[u32]) -> Vec<f32> {
-        assert!(!tokens.is_empty(), "prefill called with empty token list");
-        self.ensure_kv(cache_id);
+        if self.prepared_prefixes.contains_key(cache_id) {
+            use crate::common::llm::{ModelTokenInput, ModelTokenOutcome, ModelTokenWork};
+            use ferrum_execution::model_executor::ExecutorSamplingOutput;
+            let position = self.cache_len(cache_id);
+            return match self.execute_managed_token_work(&ModelTokenInput {
+                cache_id,
+                work: ModelTokenWork::Prefill { tokens, position },
+                logits_policy: &LogitsReturnPolicy::FullLogits,
+                sample: true,
+            }) {
+                ModelTokenOutcome::Terminal(Ok(Some(ExecutorSamplingOutput::FullLogits(
+                    logits,
+                )))) => logits,
+                ModelTokenOutcome::Terminal(Err(error))
+                | ModelTokenOutcome::NotSubmitted(error)
+                | ModelTokenOutcome::Held(error) => std::panic::panic_any(error),
+                ModelTokenOutcome::CapacityDeferred(_) => {
+                    std::panic::panic_any(ferrum_types::FerrumError::resource_exhausted(
+                        "prepared prefill capacity deferred",
+                    ))
+                }
+                ModelTokenOutcome::Terminal(Ok(_)) => {
+                    panic!("full-logit prefill returned an incompatible product")
+                }
+            };
+        }
+        self.run_device_frame(|model, frame| model.prefill_in_frame(frame, cache_id, tokens))
+            .into_legacy_result()
+    }
 
-        let cache_len_before = self
+    fn prefill_in_frame(
+        &mut self,
+        frame: &mut LlamaExecutionFrame<B>,
+        cache_id: &str,
+        tokens: &[u32],
+    ) -> Vec<f32> {
+        assert!(!tokens.is_empty(), "prefill called with empty token list");
+        self.ensure_kv_in_context(&mut frame.context, cache_id, None);
+
+        let position = self
             .kv_caches
             .get(cache_id)
             .and_then(|layers| layers.first())
             .map(K::len)
             .unwrap_or(0);
-        let mut cached_prefix_tokens = if self.runtime_env.prefix_cache && cache_len_before == 0 {
-            self.try_acquire_prefix_cache(cache_id, tokens)
-        } else {
-            0
-        };
-        if cached_prefix_tokens >= tokens.len() {
-            let block_size = self
-                .kv_caches
-                .get(cache_id)
-                .and_then(|layers| layers.first())
-                .map(K::block_size)
-                .unwrap_or(16);
-            cached_prefix_tokens = cached_prefix_tokens
-                .saturating_sub(block_size)
-                .min(tokens.len() - 1);
-        }
-        if self.runtime_env.prefix_cache && cache_len_before == 0 {
-            self.record_prefix_cache_probe(cached_prefix_tokens);
-        }
-
-        if cached_prefix_tokens > 0 {
-            let caches_mut = self.kv_caches.get_mut(cache_id).expect("cache present");
-            let mut ctx_tmp = B::new_context();
-            for cache in caches_mut.iter_mut() {
-                if K::len(cache) != cached_prefix_tokens {
-                    K::set_len(cache, cached_prefix_tokens);
-                    if let Some(context_lens) = K::context_lens_mut(cache) {
-                        B::write_typed::<u32>(
-                            &mut ctx_tmp,
-                            context_lens,
-                            &[cached_prefix_tokens as u32],
-                        );
-                    }
-                }
-            }
-            B::sync(&mut ctx_tmp);
-        }
-
-        let suffix_tokens = &tokens[cached_prefix_tokens..];
-        let seq_len = suffix_tokens.len();
-        assert!(
-            seq_len > 0,
-            "prefix cache must leave at least one suffix token"
+        self.validate_prepared_prompt(
+            cache_id,
+            crate::common::llm::ModelTokenWork::Prefill { tokens, position },
+        )
+        .unwrap_or_else(|error| std::panic::panic_any(error));
+        assert_eq!(
+            self.reusable_prefix_for_work(
+                cache_id,
+                crate::common::llm::ModelTokenWork::Prefill { tokens, position }
+            ),
+            0,
+            "prepared shared prefix must be consumed before encoding the private suffix"
         );
-        self.ensure_scratch(seq_len);
+        let suffix_tokens = tokens;
+        let seq_len = tokens.len();
+        self.ensure_scratch_in_context(&mut frame.context, seq_len);
+        self.prepare_lora_workspace_for_cache(&mut frame.context, cache_id, seq_len);
 
         // Starting position for this chunk — 0 for a fresh prefill, kv_len
         // for the second+ chunk of a split prefill.
@@ -3989,9 +4161,12 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
 
         let h = self.cfg.hidden_size;
         let vocab = self.cfg.vocab_size;
-        let mut ctx = B::new_context();
-        self.ensure_paged_kv_capacity_for_cache_id(&mut ctx, cache_id, pos_offset + seq_len)
-            .expect("paged KV dynamic grow");
+        self.ensure_paged_kv_capacity_for_cache_id(
+            &mut frame.context,
+            cache_id,
+            pos_offset + seq_len,
+        )
+        .expect("paged KV dynamic grow");
 
         // Move `residual` out of `scratch` to work around the borrow checker:
         // `forward_layer` re-borrows `&mut self` to reach `self.layers` /
@@ -3999,11 +4174,17 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         // `&mut self.scratch.residual`. Use Option::take to move it out
         // (no placeholder alloc → no transient cuMemFreeAsync that could
         // corrupt stream pool state after graph ops on Blackwell).
-        let mut residual = self
-            .scratch
-            .residual
-            .take()
-            .expect("scratch residual missing (previous call didn't restore)");
+        let use_host_residual_shadow = self.use_host_residual_shadow();
+        let use_device_residual_shadow = self.use_device_residual_shadow();
+        frame
+            .take_scratch(
+                &mut self.scratch,
+                FrameLayout::Single,
+                use_device_residual_shadow,
+            )
+            .expect("single prefill frame scratch");
+        let mut ctx = &mut frame.context;
+        let mut residual = frame.residual.as_mut().expect("frame residual");
         let embed = self
             .embed
             .as_ref()
@@ -4012,70 +4193,24 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         if let Some(scale) = self.cfg.embed_scale {
             B::scale_inplace(&mut ctx, &mut residual, scale, suffix_tokens.len() * h);
         }
-        let use_host_residual_shadow = self.use_host_residual_shadow();
-        let use_device_residual_shadow = self.use_device_residual_shadow();
         let mut host_residual = if use_host_residual_shadow {
-            B::sync(&mut ctx);
-            Some(B::to_vec(&residual, seq_len * h))
+            device_execution::checked_sync::<B>(&mut ctx);
+            Some(B::to_vec_in_context(ctx, &residual, seq_len * h))
         } else {
             None
         };
-        let mut device_residual_shadow = if use_device_residual_shadow {
-            let mut shadow = self
-                .scratch
-                .residual_f32_shadow
-                .take()
-                .expect("device F32 residual shadow scratch missing");
-            B::activation_to_f32_shadow(&mut ctx, &residual, &mut shadow, seq_len * h);
-            Some(shadow)
-        } else {
-            None
-        };
-        let mut device_branch_shadow = if use_device_residual_shadow {
-            Some(
-                self.scratch
-                    .sandwich_branch_f32
-                    .take()
-                    .expect("device F32 sandwich branch scratch missing"),
-            )
-        } else {
-            None
-        };
-
-        let prefill_profile = self.runtime_env.prefill_op_profile;
-        let prefill_t0 = if prefill_profile {
-            B::sync(&mut ctx);
-            ATTN_TIME_US.swap(0, std::sync::atomic::Ordering::Relaxed);
-            ATTN_CALLS.swap(0, std::sync::atomic::Ordering::Relaxed);
-            QKR_TIME_US.swap(0, std::sync::atomic::Ordering::Relaxed);
-            QKR_CALLS.swap(0, std::sync::atomic::Ordering::Relaxed);
-            MATMUL_TIME_US.swap(0, std::sync::atomic::Ordering::Relaxed);
-            MATMUL_CALLS.swap(0, std::sync::atomic::Ordering::Relaxed);
-            NORM_TIME_US.swap(0, std::sync::atomic::Ordering::Relaxed);
-            NORM_CALLS.swap(0, std::sync::atomic::Ordering::Relaxed);
-            OTHER_TIME_US.swap(0, std::sync::atomic::Ordering::Relaxed);
-            OTHER_CALLS.swap(0, std::sync::atomic::Ordering::Relaxed);
-            TAIL_NORM_TIME_US.swap(0, std::sync::atomic::Ordering::Relaxed);
-            TAIL_NORM_CALLS.swap(0, std::sync::atomic::Ordering::Relaxed);
-            TAIL_GATE_UP_TIME_US.swap(0, std::sync::atomic::Ordering::Relaxed);
-            TAIL_GATE_UP_CALLS.swap(0, std::sync::atomic::Ordering::Relaxed);
-            TAIL_ACT_TIME_US.swap(0, std::sync::atomic::Ordering::Relaxed);
-            TAIL_ACT_CALLS.swap(0, std::sync::atomic::Ordering::Relaxed);
-            TAIL_DOWN_TIME_US.swap(0, std::sync::atomic::Ordering::Relaxed);
-            TAIL_DOWN_CALLS.swap(0, std::sync::atomic::Ordering::Relaxed);
-            TAIL_RESID_TIME_US.swap(0, std::sync::atomic::Ordering::Relaxed);
-            TAIL_RESID_CALLS.swap(0, std::sync::atomic::Ordering::Relaxed);
-            Some(std::time::Instant::now())
-        } else {
-            None
-        };
+        let device_residual_shadow = &mut frame.residual_f32;
+        if let Some(shadow) = device_residual_shadow.as_mut() {
+            B::activation_to_f32_shadow(&mut ctx, &residual, shadow, seq_len * h);
+        }
+        let device_branch_shadow = &mut frame.branch_f32;
 
         // W2 L1 gate: per-layer residual dumps for HF comparison.
         let layer_dump = self.runtime_env.layer_dump_dir.clone();
         let dump = |ctx: &mut B::Context, buf: &B::Buffer, name: &str| {
             if let Some(dir) = &layer_dump {
                 B::sync(ctx);
-                let v = B::to_vec(buf, seq_len * h);
+                let v = B::to_vec_in_context(ctx, buf, seq_len * h);
                 write_f32_dump(dir, name, &v);
             }
         };
@@ -4112,62 +4247,6 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
                     dump(&mut ctx, &residual, &format!("layer_{li:02}"));
                 }
             }
-        }
-
-        if let Some(t0) = prefill_t0 {
-            B::sync(&mut ctx);
-            let total_us = t0.elapsed().as_micros() as u64;
-            let attn_us = ATTN_TIME_US.swap(0, std::sync::atomic::Ordering::Relaxed);
-            let attn_n = ATTN_CALLS.swap(0, std::sync::atomic::Ordering::Relaxed);
-            let qkr_us = QKR_TIME_US.swap(0, std::sync::atomic::Ordering::Relaxed);
-            let qkr_n = QKR_CALLS.swap(0, std::sync::atomic::Ordering::Relaxed);
-            let mm_us = MATMUL_TIME_US.swap(0, std::sync::atomic::Ordering::Relaxed);
-            let mm_n = MATMUL_CALLS.swap(0, std::sync::atomic::Ordering::Relaxed);
-            let norm_us = NORM_TIME_US.swap(0, std::sync::atomic::Ordering::Relaxed);
-            let norm_n = NORM_CALLS.swap(0, std::sync::atomic::Ordering::Relaxed);
-            let other_us = OTHER_TIME_US.swap(0, std::sync::atomic::Ordering::Relaxed);
-            let other_n = OTHER_CALLS.swap(0, std::sync::atomic::Ordering::Relaxed);
-            let tail_norm_us = TAIL_NORM_TIME_US.swap(0, std::sync::atomic::Ordering::Relaxed);
-            let tail_norm_n = TAIL_NORM_CALLS.swap(0, std::sync::atomic::Ordering::Relaxed);
-            let tail_gate_up_us =
-                TAIL_GATE_UP_TIME_US.swap(0, std::sync::atomic::Ordering::Relaxed);
-            let tail_gate_up_n = TAIL_GATE_UP_CALLS.swap(0, std::sync::atomic::Ordering::Relaxed);
-            let tail_act_us = TAIL_ACT_TIME_US.swap(0, std::sync::atomic::Ordering::Relaxed);
-            let tail_act_n = TAIL_ACT_CALLS.swap(0, std::sync::atomic::Ordering::Relaxed);
-            let tail_down_us = TAIL_DOWN_TIME_US.swap(0, std::sync::atomic::Ordering::Relaxed);
-            let tail_down_n = TAIL_DOWN_CALLS.swap(0, std::sync::atomic::Ordering::Relaxed);
-            let tail_resid_us = TAIL_RESID_TIME_US.swap(0, std::sync::atomic::Ordering::Relaxed);
-            let tail_resid_n = TAIL_RESID_CALLS.swap(0, std::sync::atomic::Ordering::Relaxed);
-            eprintln!(
-                "[prefill-profile] tokens={} layers total={} ms",
-                seq_len,
-                total_us / 1000
-            );
-            let bucket = |label: &str, n: u64, us: u64| {
-                if n > 0 {
-                    eprintln!(
-                        "[prefill-profile] {label}: {} calls {} ms (avg {} us)",
-                        n,
-                        us / 1000,
-                        us / n
-                    );
-                }
-            };
-            bucket("flash_attn", attn_n, attn_us);
-            bucket("qk_norm_rope", qkr_n, qkr_us);
-            bucket("matmuls", mm_n, mm_us);
-            bucket("norms", norm_n, norm_us);
-            bucket("other", other_n, other_us);
-            bucket("tail_norm", tail_norm_n, tail_norm_us);
-            bucket("tail_gate_up", tail_gate_up_n, tail_gate_up_us);
-            bucket("tail_act", tail_act_n, tail_act_us);
-            bucket("tail_down", tail_down_n, tail_down_us);
-            bucket(
-                "tail_mlp",
-                tail_gate_up_n.max(tail_act_n).max(tail_down_n),
-                tail_gate_up_us + tail_act_us + tail_down_us,
-            );
-            bucket("tail_resid", tail_resid_n, tail_resid_us);
         }
 
         if let Some(host) = host_residual.as_deref() {
@@ -4224,9 +4303,6 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
             .as_ref()
             .expect("prefill_internal called on backbone-only model (no lm_head)");
         {
-            #[cfg(feature = "cuda")]
-            let _alloc_label =
-                ferrum_kernels::backend::cuda::push_alloc_label("llama.prefill.lm_head");
             lm_head.forward(
                 &mut ctx,
                 &self.scratch.last_normed,
@@ -4241,39 +4317,65 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         // data. CUDA's to_vec does an internal stream.synchronize, making
         // the call redundant there (~50µs/step cost), but correctness on
         // Metal requires the explicit flush here.
-        B::sync(&mut ctx);
+        let quiescent = device_execution::checked_sync::<B>(&mut ctx);
 
         if let Some(dir) = &layer_dump {
-            let v = B::to_vec(&self.scratch.logits, vocab);
+            let v = B::to_vec_in_context(ctx, &self.scratch.logits, vocab);
             write_f32_dump(dir, "logits", &v);
         }
 
-        // Restore residual into scratch for reuse on the next call.
-        if use_device_residual_shadow {
-            self.scratch.residual_f32_shadow = device_residual_shadow;
-            self.scratch.sandwich_branch_f32 = device_branch_shadow;
-        }
-        self.scratch.residual = Some(residual);
-        if self.runtime_env.prefix_cache && cache_len_before == 0 {
-            self.register_prefix_cache(cache_id, tokens, cached_prefix_tokens);
-        }
-
-        B::to_vec(&self.scratch.logits, vocab)
+        let logits = B::to_vec_in_context(ctx, &self.scratch.logits, vocab);
+        frame.completed = Some(quiescent);
+        logits
     }
 
-    /// Decode: process 1 token at position `pos`, return `[vocab_size]` logits.
+    fn standalone_token_execution_mode(&self) -> crate::common::ModelTokenExecutionMode {
+        use crate::common::ModelTokenExecutionMode;
+        if B::host_execution_is_synchronous() {
+            ModelTokenExecutionMode::InlineSynchronous
+        } else if B::supports_retained_execution()
+            && self.layer_source_start == 0
+            && self.layer_source_end == self.cfg.num_layers
+            && self.embed.is_some()
+            && self.lm_head.is_some()
+        {
+            // Standalone token work requires the complete model. Backbone
+            // and layer-stage entry points have separate execution contracts.
+            ModelTokenExecutionMode::ManagedWorker
+        } else {
+            ModelTokenExecutionMode::Unsupported
+        }
+    }
+
     pub(crate) fn execute_host_token_work(
         &mut self,
+        input: &crate::common::llm::ModelTokenInput<'_>,
+    ) -> crate::common::llm::ModelTokenOutcome<crate::common::llm::ModelTokenProduct> {
+        if !B::host_execution_is_synchronous() {
+            return crate::common::llm::ModelTokenOutcome::NotSubmitted(
+                ferrum_types::FerrumError::unsupported(
+                    "device token execution requires retained submission-context ownership",
+                ),
+            );
+        }
+        self.execute_managed_token_work(input)
+    }
+
+    pub(crate) fn recover_host_token_scratch(&mut self) {
+        assert!(B::host_execution_is_synchronous());
+        self.run_preparation_frame(|model, frame| {
+            model.resize_scratch_in_context(&mut frame.context, model.scratch.max_tokens);
+        })
+        .into_legacy_result();
+    }
+
+    pub(crate) fn validate_managed_token_work(
+        &self,
         cache_id: &str,
         work: crate::common::llm::ModelTokenWork<'_>,
-    ) -> crate::common::llm::ModelTokenOutcome {
-        use crate::common::llm::{catch_host_execution, ModelTokenOutcome, ModelTokenWork};
-        if !B::host_execution_is_synchronous() {
-            return ModelTokenOutcome::NotSubmitted(ferrum_types::FerrumError::unsupported(
-                "device token execution requires retained submission-context ownership",
-            ));
-        }
-        let (position, count, tokens_valid) = match work {
+    ) -> Result<()> {
+        use crate::common::llm::ModelTokenWork;
+        let (position, count, valid) = match work {
             ModelTokenWork::Prefill { tokens, position } => (
                 position,
                 tokens.len(),
@@ -4285,53 +4387,264 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
                 (position as usize, 1, (token as usize) < self.cfg.vocab_size)
             }
         };
+        self.ensure_preparation_available()?;
+        self.validate_prepared_prompt(cache_id, work)?;
         if count == 0
-            || !tokens_valid
-            || position.checked_add(count).is_none_or(|end| {
-                end > self.runtime_env.kv_capacity_for_model(self.cfg.max_seq_len)
-                    || end > u32::MAX as usize
-            })
+            || !valid
+            || position
+                .checked_add(count)
+                .is_none_or(|end| end > self.kv_capacity_limit() || end > u32::MAX as usize)
             || self
                 .kv_caches
                 .get(cache_id)
-                .is_some_and(|layers| layers.iter().any(|cache| K::len(cache) != position))
-            || (!self.kv_caches.contains_key(cache_id) && position != 0)
+                .is_none_or(|layers| layers.iter().any(|cache| K::len(cache) != position))
         {
-            return ModelTokenOutcome::NotSubmitted(ferrum_types::FerrumError::request_validation(
+            return Err(ferrum_types::FerrumError::request_validation(
                 "token work does not match the model's live per-layer KV frontier",
             ));
         }
-        let result = catch_host_execution(|| match work {
-            ModelTokenWork::Prefill { tokens, .. } => self.prefill_internal(cache_id, tokens),
-            ModelTokenWork::Decode { token, position } => {
-                self.decode_internal(cache_id, token, position)
-            }
-        });
-        if result.is_err() {
-            // Host operations have finished even when a layer panics. Rebuild
-            // only scratch that the unwinding core may have taken out; never
-            // reset another sequence's KV or claim the failed range committed.
-            self.recover_host_token_scratch();
-        }
-        ModelTokenOutcome::Terminal(result)
+        Ok(())
     }
 
-    pub(crate) fn recover_host_token_scratch(&mut self) {
-        assert!(B::host_execution_is_synchronous());
-        self.resize_scratch(self.scratch.max_tokens);
+    fn kv_capacity_limit(&self) -> usize {
+        self.runtime_env.kv_capacity_for_model(self.cfg.max_seq_len)
+    }
+
+    pub(crate) fn prepare_managed_token_capacity(
+        &mut self,
+        requests: &[KvSlotRequest],
+    ) -> crate::common::llm::ModelTokenOutcome<()> {
+        use crate::common::llm::{ModelKvReservation, ModelTokenOutcome};
+        // Cached extents take the existing context-free reservation path;
+        // growth retains and observes its actual preparation frame. No token
+        // computation has started at this boundary.
+        match self.reserve_paged_token_kv_slots(requests) {
+            Ok(ModelKvReservation::Reserved(_)) => ModelTokenOutcome::Terminal(Ok(())),
+            Ok(ModelKvReservation::CapacityDeferred(deferred)) => {
+                ModelTokenOutcome::CapacityDeferred(deferred)
+            }
+            Err(error) if self.pending_device_frame.is_some() => ModelTokenOutcome::Held(error),
+            Err(error) => ModelTokenOutcome::NotSubmitted(error),
+        }
+    }
+
+    pub(crate) fn execute_managed_token_work(
+        &mut self,
+        input: &crate::common::llm::ModelTokenInput<'_>,
+    ) -> crate::common::llm::ModelTokenOutcome<crate::common::llm::ModelTokenProduct> {
+        use crate::common::llm::{ModelTokenOutcome, ModelTokenWork};
+        use ferrum_execution::model_executor::ExecutorSamplingOutput;
+        let cache_id = input.cache_id;
+        let work = input.work;
+        if let Err(error) = self.validate_managed_token_work(cache_id, work) {
+            return ModelTokenOutcome::NotSubmitted(error);
+        }
+        let target_len = match work {
+            ModelTokenWork::Prefill { tokens, position } => position + tokens.len(),
+            ModelTokenWork::Decode { position, .. } => position as usize + 1,
+        };
+        let reused = self.reusable_prefix_for_work(cache_id, work);
+        let cached_only =
+            matches!(work, ModelTokenWork::Prefill { tokens, .. } if reused == tokens.len());
+        if cached_only && input.sample {
+            return ModelTokenOutcome::NotSubmitted(ferrum_types::FerrumError::request_validation(
+                "a fully cached intermediate chunk cannot supply sampling logits",
+            ));
+        }
+        match self.prepare_managed_token_capacity(&[KvSlotRequest {
+            cache_id: cache_id.to_owned(),
+            target_len,
+            admission_target_len: None,
+        }]) {
+            ModelTokenOutcome::Terminal(Ok(())) => {}
+            ModelTokenOutcome::CapacityDeferred(deferred) => {
+                return ModelTokenOutcome::CapacityDeferred(deferred)
+            }
+            ModelTokenOutcome::NotSubmitted(error) | ModelTokenOutcome::Terminal(Err(error)) => {
+                return ModelTokenOutcome::NotSubmitted(error)
+            }
+            ModelTokenOutcome::Held(error) => return ModelTokenOutcome::Held(error),
+        }
+        let result = if cached_only {
+            // Unified-memory length updates may encode no device operation.
+            // The preparation frame proves this precise host-only case; an
+            // empty ordinary execution context is never forged as completed.
+            self.run_preparation_frame(|model, frame| {
+                model.advance_cached_prefix(&mut frame.context, cache_id, target_len);
+                None
+            })
+        } else {
+            self.run_device_frame(|model, frame| {
+                let logits = match work {
+                    ModelTokenWork::Prefill { tokens, position } => {
+                        if reused != 0 {
+                            model.advance_cached_prefix(
+                                &mut frame.context,
+                                cache_id,
+                                position + reused,
+                            );
+                        }
+                        model.prefill_in_frame(frame, cache_id, &tokens[reused..])
+                    }
+                    ModelTokenWork::Decode { token, position } => {
+                        model.decode_in_frame(frame, cache_id, token, position)
+                    }
+                };
+                input
+                    .sample
+                    .then_some(ExecutorSamplingOutput::FullLogits(logits))
+            })
+        };
+        if matches!(&result, DeviceFrameResult::Terminal(Ok(_)))
+            && matches!(work, ModelTokenWork::Prefill { .. })
+        {
+            self.publish_prepared_prefix(cache_id, reused);
+        }
+        match result {
+            DeviceFrameResult::Rejected(error) => ModelTokenOutcome::NotSubmitted(error),
+            DeviceFrameResult::Terminal(result) => ModelTokenOutcome::Terminal(result),
+            DeviceFrameResult::Held(error) => ModelTokenOutcome::Held(error),
+        }
+    }
+
+    pub(crate) fn execute_managed_serial_tokens(
+        &mut self,
+        inputs: &[crate::common::llm::ModelTokenInput<'_>],
+    ) -> crate::common::llm::ModelTokenBatchOutcome {
+        use crate::common::llm::{ModelTokenBatchOutcome, ModelTokenOutcome};
+        let mut rows = Vec::with_capacity(inputs.len());
+        let mut held = false;
+        for input in inputs {
+            let outcome = if held {
+                ModelTokenOutcome::NotSubmitted(ferrum_types::FerrumError::backend(
+                    "earlier participant retains the model context",
+                ))
+            } else {
+                match self.execute_managed_token_work(input) {
+                    ModelTokenOutcome::CapacityDeferred(deferred) => {
+                        ModelTokenOutcome::CapacityDeferred(deferred)
+                    }
+                    ModelTokenOutcome::Terminal(result) => ModelTokenOutcome::Terminal(result),
+                    ModelTokenOutcome::NotSubmitted(error) => {
+                        ModelTokenOutcome::NotSubmitted(error)
+                    }
+                    ModelTokenOutcome::Held(error) => {
+                        held = true;
+                        ModelTokenOutcome::Held(error)
+                    }
+                }
+            };
+            rows.push(outcome);
+        }
+        ModelTokenBatchOutcome::Serial(rows)
+    }
+
+    fn close_managed_token_cache(
+        &mut self,
+        cache_id: &str,
+    ) -> crate::common::llm::ModelTokenCloseOutcome {
+        use crate::common::llm::{ModelExecutionRecovery, ModelTokenCloseOutcome};
+        let error = match self.recover_token_frame() {
+            ModelExecutionRecovery::Held { error } => {
+                return ModelTokenCloseOutcome::Held { error }
+            }
+            ModelExecutionRecovery::Quiescent { error } => error,
+        };
+        // Completion alone does not retire a cached executable. Before this
+        // incarnation can enter the free pool, retire its captured pointer
+        // closure on the original context. Failure keeps every cache owner.
+        if self.single_graph_cache_id.as_deref() == Some(cache_id)
+            || self
+                .batched_pointers_for
+                .as_ref()
+                .is_some_and(|owners| owners.iter().any(|id| id == cache_id))
+        {
+            let retired = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let context = self.execution_context.as_mut().ok_or_else(|| {
+                    ferrum_types::FerrumError::backend("single graph owner has no original context")
+                })?;
+                B::retire_graphs_for_storage_mutation(context)
+            }))
+            .map_err(device_execution::panic_error)
+            .and_then(|result| result);
+            if let Err(retirement_error) = retired {
+                return ModelTokenCloseOutcome::Held {
+                    error: error.unwrap_or(retirement_error),
+                };
+            }
+            self.clear_graph_bookkeeping();
+        }
+        // Every token/preparation encoder used the original retained frame.
+        // Its actual terminal observation permits metadata retirement; making
+        // and syncing an unrelated context here would prove nothing new.
+        self.graph_warmup = 0;
+        if self.single_graph_cache_id.is_none() {
+            self.graph_capture_failed = false;
+        }
+        self.lora_cache_adapters.remove(cache_id);
+        self.prepared_prefixes.remove(cache_id);
+        if let Some(mut caches) = self.kv_caches.remove(cache_id) {
+            if let Some(allocator) = &self.paged_block_alloc {
+                let mut allocator = allocator
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if let Some(first) = caches.first() {
+                    let indices = K::paged_block_indices(first);
+                    if !indices.is_empty() {
+                        allocator.free(indices);
+                    }
+                }
+                for cache in &mut caches {
+                    K::paged_block_indices_mut(cache).clear();
+                }
+            }
+            self.kv_free_pool.push(caches);
+        }
+        ModelTokenCloseOutcome::Ended { error }
     }
 
     /// Decode: process 1 token at position `pos`, return `[vocab_size]` logits.
     pub fn decode_internal(&mut self, cache_id: &str, token: u32, pos: u32) -> Vec<f32> {
-        self.ensure_scratch(1);
-        self.ensure_kv(cache_id);
+        self.validate_prepared_legacy_decode(cache_id, token, pos)
+            .unwrap_or_else(|error| std::panic::panic_any(error));
+        self.run_device_frame(|model, frame| model.decode_in_frame(frame, cache_id, token, pos))
+            .into_legacy_result()
+    }
+
+    fn decode_in_frame(
+        &mut self,
+        frame: &mut LlamaExecutionFrame<B>,
+        cache_id: &str,
+        token: u32,
+        pos: u32,
+    ) -> Vec<f32> {
+        if self.graph_capture_failed && self.single_graph_cache_id.is_some() {
+            // The previous invocation may have installed a graph or only a
+            // captured prefix. Its original owners remain bound until checked
+            // retirement succeeds, even if launch/completion was unresolved.
+            B::retire_graphs_for_storage_mutation(&mut frame.context)
+                .unwrap_or_else(|error| std::panic::panic_any(error));
+            self.clear_graph_bookkeeping();
+            self.graph_capture_failed = true;
+        }
+        self.ensure_scratch_in_context(&mut frame.context, 1);
+        self.prepare_lora_workspace_for_cache(&mut frame.context, cache_id, 1);
+        self.ensure_kv_in_context(&mut frame.context, cache_id, None);
 
         let h = self.cfg.hidden_size;
         let vocab = self.cfg.vocab_size;
 
-        // Context creation is cheap (CUDA reuses the process-global stream).
-        // The captured graph lives in a process-global slot, not on ctx.
-        let mut ctx = B::new_context();
+        // The frame borrows this model's original context and graph cache.
+        let use_host_residual_shadow = self.use_host_residual_shadow();
+        let use_device_residual_shadow = self.use_device_residual_shadow();
+        frame
+            .take_scratch(
+                &mut self.scratch,
+                FrameLayout::Single,
+                use_device_residual_shadow,
+            )
+            .expect("single decode frame scratch");
+        let mut ctx = &mut frame.context;
         let target_len = self.cache_len(cache_id).saturating_add(1);
         self.ensure_paged_kv_capacity_for_cache_id(&mut ctx, cache_id, target_len)
             .expect("paged KV dynamic grow");
@@ -4340,25 +4653,56 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         // we skip the
         // per-step device-state memcpy_htod trio entirely.
         const GRAPH_WARMUP: usize = 3;
-        let use_host_residual_shadow = self.use_host_residual_shadow();
-        let use_device_residual_shadow = self.use_device_residual_shadow();
         let graph_enabled = self.single_decode_graph_enabled();
 
         if graph_enabled {
+            if self
+                .single_graph_cache_id
+                .as_deref()
+                .is_some_and(|owner| owner != cache_id)
+            {
+                B::retire_graphs_for_storage_mutation(&mut ctx)
+                    .unwrap_or_else(|error| std::panic::panic_any(error));
+                self.clear_graph_bookkeeping();
+            }
             // Refresh device-side dynamic state (token/pos/kv_len) before
             // replay — captured graph reads these from device buffers.
             B::set_decode_state(&mut ctx, token, pos);
 
             // Fast path: graph replay (if available). Single-item path
             // uses key=SINGLE_ITEM_GRAPH_KEY (0) — separate from the
-            // batched path's m_padded keys.
-            match B::replay_graph(&mut ctx, SINGLE_ITEM_GRAPH_KEY) {
-                Ok(true) => {
-                    B::sync(&mut ctx);
-                    return B::to_vec(&self.scratch.logits, vocab);
+            // batched path's allocated nonzero keys.
+            // SAFETY: cold construction checked projection/KV capture contracts.
+            // The private model/frame owns all bindings through checked retirement;
+            // storage mutation retires cached graphs before replacing dependencies.
+            if self.single_graph_cache_id.as_deref() == Some(cache_id) {
+                // Any replay/observation unwind keeps the owner but removes its
+                // eligibility. A later invocation must retire it before eager use.
+                self.graph_capture_failed = true;
+                match unsafe { B::replay_graph(&mut ctx, SINGLE_ITEM_GRAPH_KEY) } {
+                    Ok(true) => {
+                        let quiescent = device_execution::checked_sync::<B>(&mut ctx);
+                        let logits = B::to_vec_in_context(ctx, &self.scratch.logits, vocab);
+                        // Replay skips the host layer loop, so publish its actual
+                        // successful KV advancement explicitly before returning.
+                        for cache in self
+                            .kv_caches
+                            .get_mut(cache_id)
+                            .expect("captured cache owner")
+                        {
+                            K::set_len(cache, target_len);
+                        }
+                        self.graph_capture_failed = false;
+                        frame.completed = Some(quiescent);
+                        return logits;
+                    }
+                    Ok(false) => {
+                        B::retire_graphs_for_storage_mutation(&mut ctx)
+                            .unwrap_or_else(|error| std::panic::panic_any(error));
+                        self.clear_graph_bookkeeping();
+                    }
+                    Err(error) => std::panic::panic_any(error),
                 }
-                Ok(false) => { /* no graph yet, fall through to eager */ }
-                Err(_) => { /* backend error or unsupported, eager */ }
             }
         }
 
@@ -4366,10 +4710,19 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
             graph_enabled && !self.graph_capture_failed && self.graph_warmup >= GRAPH_WARMUP;
 
         if should_capture {
+            // Bind the cache before capture can reference it. This is lifetime
+            // custody, not replay permission; success is published only after
+            // the first launch and checked completion/readback both succeed.
+            self.single_graph_cache_id = Some(cache_id.to_owned());
+            self.graph_capture_failed = true;
             B::set_dev_state_mode(&mut ctx, true);
-            if B::begin_graph_capture(&mut ctx).is_err() {
+            // SAFETY: cold construction checked projection/KV capture contracts.
+            // The private model/frame owns all bindings through checked retirement;
+            // storage mutation retires cached graphs before replacing dependencies.
+            if let Err(error) = unsafe { B::begin_graph_capture(&mut ctx) } {
                 self.graph_capture_failed = true;
                 B::set_dev_state_mode(&mut ctx, false);
+                std::panic::panic_any(error);
             }
         }
 
@@ -4378,11 +4731,7 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         // cuMemAllocFromPoolAsync(stream, 0) can return CUDA_ERROR_INVALID_VALUE
         // on Blackwell after graph replay corrupts the pool state. Size-1 is
         // always valid and costs 2 bytes of transient VRAM per decode step.
-        let mut residual = self
-            .scratch
-            .residual
-            .take()
-            .expect("scratch residual missing (previous call didn't restore)");
+        let mut residual = frame.residual.as_mut().expect("frame residual");
         let embed = self
             .embed
             .as_ref()
@@ -4392,133 +4741,28 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
             B::scale_inplace(&mut ctx, &mut residual, scale, h);
         }
         let mut host_residual = if use_host_residual_shadow {
-            B::sync(&mut ctx);
-            Some(B::to_vec(&residual, h))
+            device_execution::checked_sync::<B>(&mut ctx);
+            Some(B::to_vec_in_context(ctx, &residual, h))
         } else {
             None
         };
-        let mut device_residual_shadow = if use_device_residual_shadow {
-            let mut shadow = self
-                .scratch
-                .residual_f32_shadow
-                .take()
-                .expect("device F32 residual shadow scratch missing");
-            B::activation_to_f32_shadow(&mut ctx, &residual, &mut shadow, h);
-            Some(shadow)
-        } else {
-            None
-        };
-        let mut device_branch_shadow = if use_device_residual_shadow {
-            Some(
-                self.scratch
-                    .sandwich_branch_f32
-                    .take()
-                    .expect("device F32 sandwich branch scratch missing"),
-            )
-        } else {
-            None
-        };
-
-        // Per-layer wall-time profile (env-gated, off by default — adds
-        // a B::sync between layers which serializes the pipeline). Helps
-        // localise non-matmul bottlenecks during perf work.
-        let layer_profile = self.runtime_env.decode_layer_profile;
-        let mut layer_times = if layer_profile {
-            Some(Vec::with_capacity(self.local_layer_count()))
-        } else {
-            None
-        };
+        let device_residual_shadow = &mut frame.residual_f32;
+        if let Some(shadow) = device_residual_shadow.as_mut() {
+            B::activation_to_f32_shadow(&mut ctx, &residual, shadow, h);
+        }
+        let device_branch_shadow = &mut frame.branch_f32;
 
         for li in self.local_layer_indices() {
-            if layer_profile {
-                let t0 = std::time::Instant::now();
-                self.forward_layer_with_residual_shadow(
-                    &mut ctx,
-                    li,
-                    cache_id,
-                    &mut residual,
-                    pos as usize,
-                    1,
-                    host_residual.as_deref_mut(),
-                    device_residual_shadow.as_mut(),
-                    device_branch_shadow.as_mut(),
-                );
-                B::sync(&mut ctx);
-                let elapsed_us = t0.elapsed().as_micros() as u64;
-                if let Some(v) = layer_times.as_mut() {
-                    v.push(elapsed_us);
-                }
-            } else {
-                self.forward_layer_with_residual_shadow(
-                    &mut ctx,
-                    li,
-                    cache_id,
-                    &mut residual,
-                    pos as usize,
-                    1,
-                    host_residual.as_deref_mut(),
-                    device_residual_shadow.as_mut(),
-                    device_branch_shadow.as_mut(),
-                );
-            }
-        }
-        if let Some(times) = layer_times.take() {
-            let sum: u64 = times.iter().sum();
-            let avg = sum / times.len() as u64;
-            let mn = *times.iter().min().unwrap_or(&0);
-            let mx = *times.iter().max().unwrap_or(&0);
-            eprintln!(
-                "[layer-profile] {} layers total={} ms avg={} us min={} us max={} us",
-                times.len(),
-                sum / 1000,
-                avg,
-                mn,
-                mx
-            );
-            for (i, t) in times.iter().enumerate() {
-                eprint!("L{i}={}ms ", t / 1000);
-                if (i + 1) % 6 == 0 {
-                    eprintln!();
-                }
-            }
-            eprintln!();
-            let attn_us = ATTN_TIME_US.swap(0, std::sync::atomic::Ordering::Relaxed);
-            let attn_n = ATTN_CALLS.swap(0, std::sync::atomic::Ordering::Relaxed);
-            let qkr_us = QKR_TIME_US.swap(0, std::sync::atomic::Ordering::Relaxed);
-            let qkr_n = QKR_CALLS.swap(0, std::sync::atomic::Ordering::Relaxed);
-            let mm_us = MATMUL_TIME_US.swap(0, std::sync::atomic::Ordering::Relaxed);
-            let mm_n = MATMUL_CALLS.swap(0, std::sync::atomic::Ordering::Relaxed);
-            let norm_us = NORM_TIME_US.swap(0, std::sync::atomic::Ordering::Relaxed);
-            let norm_n = NORM_CALLS.swap(0, std::sync::atomic::Ordering::Relaxed);
-            let other_us = OTHER_TIME_US.swap(0, std::sync::atomic::Ordering::Relaxed);
-            let other_n = OTHER_CALLS.swap(0, std::sync::atomic::Ordering::Relaxed);
-            eprintln!(
-                "[op-profile] flash_attn: {} calls {} ms (avg {} us)",
-                attn_n,
-                attn_us / 1000,
-                if attn_n > 0 { attn_us / attn_n } else { 0 }
-            );
-            eprintln!(
-                "[op-profile] qk_norm_rope: {} calls {} ms (avg {} us)",
-                qkr_n,
-                qkr_us / 1000,
-                if qkr_n > 0 { qkr_us / qkr_n } else { 0 }
-            );
-            eprintln!(
-                "[op-profile] matmuls (Linear::forward): {} calls {} ms (avg {} us)",
-                mm_n,
-                mm_us / 1000,
-                if mm_n > 0 { mm_us / mm_n } else { 0 }
-            );
-            eprintln!(
-                "[op-profile] norms (rms+fused_add_rms): {} calls {} ms (avg {} us)",
-                norm_n,
-                norm_us / 1000,
-                if norm_n > 0 { norm_us / norm_n } else { 0 }
-            );
-            eprintln!(
-                "[op-profile] other (split_qkv, kv_append, transpose, silu, add): {} calls {} ms (avg {} us)",
-                other_n, other_us / 1000, if other_n > 0 { other_us / other_n } else { 0 }
+            self.forward_layer_with_residual_shadow(
+                &mut ctx,
+                li,
+                cache_id,
+                &mut residual,
+                pos as usize,
+                1,
+                host_residual.as_deref_mut(),
+                device_residual_shadow.as_mut(),
+                device_branch_shadow.as_mut(),
             );
         }
 
@@ -4559,9 +4803,6 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
             .as_ref()
             .expect("decode_internal called on backbone-only model (no lm_head)");
         {
-            #[cfg(feature = "cuda")]
-            let _alloc_label =
-                ferrum_kernels::backend::cuda::push_alloc_label("llama.decode.lm_head");
             lm_head.forward(
                 &mut ctx,
                 &self.scratch.last_normed,
@@ -4570,9 +4811,19 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
             );
         }
 
-        if should_capture && B::graph_capture_in_flight(&ctx) {
-            if B::end_graph_capture(&mut ctx, SINGLE_ITEM_GRAPH_KEY).is_err() {
+        if should_capture {
+            if !B::graph_capture_in_flight(&ctx) {
+                std::panic::panic_any(ferrum_types::FerrumError::backend(
+                    "single decode capture ended before graph installation",
+                ));
+            }
+            // SAFETY: cold construction checked projection/KV capture contracts.
+            // The private model/frame owns all bindings through checked retirement;
+            // storage mutation retires cached graphs before replacing dependencies.
+            if let Err(error) = unsafe { B::end_graph_capture(&mut ctx, SINGLE_ITEM_GRAPH_KEY) } {
                 self.graph_capture_failed = true;
+                B::set_dev_state_mode(&mut ctx, false);
+                std::panic::panic_any(error);
             } else {
                 // Stream capture mode RECORDS ops into the graph without
                 // executing them. scratch.logits still holds the previous
@@ -4580,8 +4831,23 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
                 // actually execute and produce this step's logits. Without
                 // this, the capture step's to_vec returns stale logits,
                 // yielding a 1-token offset in the generated sequence.
-                if B::replay_graph(&mut ctx, SINGLE_ITEM_GRAPH_KEY).is_err() {
-                    self.graph_capture_failed = true;
+                // SAFETY: cold construction checked projection/KV capture contracts.
+                // The private model/frame owns all bindings through checked retirement;
+                // storage mutation retires cached graphs before replacing dependencies.
+                match unsafe { B::replay_graph(&mut ctx, SINGLE_ITEM_GRAPH_KEY) } {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        self.graph_capture_failed = true;
+                        B::set_dev_state_mode(&mut ctx, false);
+                        std::panic::panic_any(ferrum_types::FerrumError::backend(
+                            "captured decode graph was unavailable before its first execution",
+                        ));
+                    }
+                    Err(error) => {
+                        self.graph_capture_failed = true;
+                        B::set_dev_state_mode(&mut ctx, false);
+                        std::panic::panic_any(error);
+                    }
                 }
             }
             B::set_dev_state_mode(&mut ctx, false);
@@ -4595,14 +4861,20 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         // data. CUDA's to_vec does an internal stream.synchronize, making
         // the call redundant there (~50µs/step cost), but correctness on
         // Metal requires the explicit flush here.
-        B::sync(&mut ctx);
-        if use_device_residual_shadow {
-            self.scratch.residual_f32_shadow = device_residual_shadow;
-            self.scratch.sandwich_branch_f32 = device_branch_shadow;
+        let quiescent = device_execution::checked_sync::<B>(&mut ctx);
+        let logits = B::to_vec_in_context(ctx, &self.scratch.logits, vocab);
+        if should_capture {
+            for cache in self
+                .kv_caches
+                .get_mut(cache_id)
+                .expect("captured cache owner")
+            {
+                K::set_len(cache, target_len);
+            }
+            self.graph_capture_failed = false;
         }
-        self.scratch.residual = Some(residual);
-
-        B::to_vec(&self.scratch.logits, vocab)
+        frame.completed = Some(quiescent);
+        logits
     }
 
     fn stage_tokens_to_hidden(
@@ -4611,21 +4883,49 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         tokens: &[u32],
         pos_offset: usize,
     ) -> Vec<f32> {
+        assert!(
+            !tokens.is_empty(),
+            "stage token forward called with zero length"
+        );
+        assert!(
+            self.embed.is_some(),
+            "stage token forward requires embedding"
+        );
+        self.validate_prepared_legacy_write(cache_id, pos_offset, tokens.len(), Some(tokens))
+            .unwrap_or_else(|error| std::panic::panic_any(error));
+        self.run_device_frame(|model, frame| {
+            model.stage_tokens_to_hidden_in_frame(frame, cache_id, tokens, pos_offset)
+        })
+        .into_legacy_result()
+    }
+
+    fn stage_tokens_to_hidden_in_frame(
+        &mut self,
+        frame: &mut LlamaExecutionFrame<B>,
+        cache_id: &str,
+        tokens: &[u32],
+        pos_offset: usize,
+    ) -> Vec<f32> {
         let seq_len = tokens.len();
         assert!(seq_len > 0, "stage token forward called with zero length");
-        self.ensure_scratch(seq_len);
-        self.ensure_kv(cache_id);
+        self.ensure_scratch_in_context(&mut frame.context, seq_len);
+        self.prepare_lora_workspace_for_cache(&mut frame.context, cache_id, seq_len);
+        self.ensure_kv_in_context(&mut frame.context, cache_id, None);
 
         let h = self.cfg.hidden_size;
-        let mut ctx = B::new_context();
+        let use_device_residual_shadow = self.use_device_residual_shadow();
+        frame
+            .take_scratch(
+                &mut self.scratch,
+                FrameLayout::Single,
+                use_device_residual_shadow,
+            )
+            .expect("take frame scratch");
+        let mut ctx = &mut frame.context;
         let target_len = self.cache_len(cache_id).saturating_add(seq_len);
         self.ensure_paged_kv_capacity_for_cache_id(&mut ctx, cache_id, target_len)
             .expect("paged KV dynamic grow");
-        let mut residual = self
-            .scratch
-            .residual
-            .take()
-            .expect("scratch residual missing (previous call didn't restore)");
+        let mut residual = frame.residual.as_mut().expect("frame residual");
         let embed = self
             .embed
             .as_ref()
@@ -4635,34 +4935,18 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
             B::scale_inplace(&mut ctx, &mut residual, scale, tokens.len() * h);
         }
         let use_host_residual_shadow = self.use_host_residual_shadow();
-        let use_device_residual_shadow = self.use_device_residual_shadow();
+
         let mut host_residual = if use_host_residual_shadow {
             B::sync(&mut ctx);
-            Some(B::to_vec(&residual, seq_len * h))
+            Some(B::to_vec_in_context(ctx, &residual, seq_len * h))
         } else {
             None
         };
-        let mut device_residual_shadow = if use_device_residual_shadow {
-            let mut shadow = self
-                .scratch
-                .residual_f32_shadow
-                .take()
-                .expect("device F32 residual shadow scratch missing");
-            B::activation_to_f32_shadow(&mut ctx, &residual, &mut shadow, seq_len * h);
-            Some(shadow)
-        } else {
-            None
-        };
-        let mut device_branch_shadow = if use_device_residual_shadow {
-            Some(
-                self.scratch
-                    .sandwich_branch_f32
-                    .take()
-                    .expect("device F32 sandwich branch scratch missing"),
-            )
-        } else {
-            None
-        };
+        let mut device_residual_shadow = frame.residual_f32.as_mut();
+        if let Some(shadow) = device_residual_shadow.as_deref_mut() {
+            B::activation_to_f32_shadow(&mut ctx, &residual, shadow, seq_len * h);
+        }
+        let mut device_branch_shadow = frame.branch_f32.as_mut();
 
         for li in self.local_layer_indices() {
             self.forward_layer_with_residual_shadow(
@@ -4673,24 +4957,20 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
                 pos_offset,
                 seq_len,
                 host_residual.as_deref_mut(),
-                device_residual_shadow.as_mut(),
-                device_branch_shadow.as_mut(),
+                device_residual_shadow.as_deref_mut(),
+                device_branch_shadow.as_deref_mut(),
             );
         }
 
-        B::sync(&mut ctx);
+        let quiescent = device_execution::checked_sync::<B>(ctx);
         let out = if let Some(host) = host_residual.as_deref() {
             host.to_vec()
         } else if let Some(device) = device_residual_shadow.as_ref() {
-            B::to_vec(device, seq_len * h)
+            B::to_vec_in_context(ctx, device, seq_len * h)
         } else {
-            B::to_vec(&residual, seq_len * h)
+            B::to_vec_in_context(ctx, &residual, seq_len * h)
         };
-        if use_device_residual_shadow {
-            self.scratch.residual_f32_shadow = device_residual_shadow;
-            self.scratch.sandwich_branch_f32 = device_branch_shadow;
-        }
-        self.scratch.residual = Some(residual);
+        frame.completed = Some(quiescent);
         out
     }
 
@@ -4734,6 +5014,30 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         seq_len: usize,
         pos_offset: usize,
     ) -> (Vec<f32>, LlamaStageHiddenBridgeTiming) {
+        assert!(seq_len > 0, "stage hidden forward called with zero length");
+        assert_eq!(
+            hidden.len(),
+            seq_len * self.cfg.hidden_size,
+            "stage hidden length"
+        );
+        self.validate_prepared_legacy_write(cache_id, pos_offset, seq_len, None)
+            .unwrap_or_else(|error| std::panic::panic_any(error));
+        self.run_device_frame(|model, frame| {
+            model.stage_hidden_from_host_with_timing_in_frame(
+                frame, cache_id, hidden, seq_len, pos_offset,
+            )
+        })
+        .into_legacy_result()
+    }
+
+    fn stage_hidden_from_host_with_timing_in_frame(
+        &mut self,
+        frame: &mut LlamaExecutionFrame<B>,
+        cache_id: &str,
+        hidden: &[f32],
+        seq_len: usize,
+        pos_offset: usize,
+    ) -> (Vec<f32>, LlamaStageHiddenBridgeTiming) {
         let h = self.cfg.hidden_size;
         assert_eq!(
             hidden.len(),
@@ -4744,22 +5048,23 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         );
         assert!(seq_len > 0, "stage hidden forward called with zero length");
 
-        self.ensure_scratch(seq_len);
-        self.ensure_kv(cache_id);
+        self.ensure_scratch_in_context(&mut frame.context, seq_len);
+        self.prepare_lora_workspace_for_cache(&mut frame.context, cache_id, seq_len);
+        self.ensure_kv_in_context(&mut frame.context, cache_id, None);
 
-        let mut ctx = B::new_context();
+        frame
+            .take_scratch(&mut self.scratch, FrameLayout::Single, false)
+            .expect("take frame scratch");
+        let mut ctx = &mut frame.context;
         let target_len = self.cache_len(cache_id).saturating_add(seq_len);
         self.ensure_paged_kv_capacity_for_cache_id(&mut ctx, cache_id, target_len)
             .expect("paged KV dynamic grow");
-        let mut residual = self
-            .scratch
-            .residual
-            .take()
-            .expect("scratch residual missing (previous call didn't restore)");
+        let mut residual = frame.residual.as_mut().expect("frame residual");
 
         let bridge_t0 = std::time::Instant::now();
         let host_copy_t0 = std::time::Instant::now();
-        let hidden_buf = B::from_slice(hidden);
+        frame.input = Some(B::from_slice_in_context(ctx, hidden));
+        let hidden_buf = frame.input.as_ref().expect("frame input");
         let host_copy_us = elapsed_micros_u64_floor1(host_copy_t0);
         let device_copy_t0 = std::time::Instant::now();
         B::copy_slice(&mut ctx, &hidden_buf, 0, &mut residual, 0, seq_len * h);
@@ -4774,9 +5079,9 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
             self.forward_layer(&mut ctx, li, cache_id, &mut residual, pos_offset, seq_len);
         }
 
-        B::sync(&mut ctx);
-        let out = B::to_vec(&residual, seq_len * h);
-        self.scratch.residual = Some(residual);
+        let quiescent = device_execution::checked_sync::<B>(ctx);
+        let out = B::to_vec_in_context(ctx, &residual, seq_len * h);
+        frame.completed = Some(quiescent);
         (out, bridge_timing)
     }
 
@@ -4817,6 +5122,16 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
     /// stage after local transformer layers have produced the final hidden
     /// state for sampling.
     pub fn logits_from_hidden(&mut self, hidden: &[f32]) -> Vec<f32> {
+        assert_eq!(hidden.len(), self.cfg.hidden_size, "hidden length");
+        self.run_device_frame(|model, frame| model.logits_from_hidden_in_frame(frame, hidden))
+            .into_legacy_result()
+    }
+
+    fn logits_from_hidden_in_frame(
+        &mut self,
+        frame: &mut LlamaExecutionFrame<B>,
+        hidden: &[f32],
+    ) -> Vec<f32> {
         let h = self.cfg.hidden_size;
         let vocab = self.cfg.vocab_size;
         assert_eq!(
@@ -4826,10 +5141,11 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
             hidden.len(),
             h
         );
-        self.ensure_scratch(1);
+        self.ensure_scratch_in_context(&mut frame.context, 1);
 
-        let mut ctx = B::new_context();
-        let hidden_buf = B::from_slice(hidden);
+        let mut ctx = &mut frame.context;
+        frame.input = Some(B::from_slice_in_context(ctx, hidden));
+        let hidden_buf = frame.input.as_ref().expect("frame input");
         B::rms_norm(
             &mut ctx,
             &hidden_buf,
@@ -4844,9 +5160,6 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
             .as_ref()
             .expect("logits_from_hidden called on stage without lm_head");
         {
-            #[cfg(feature = "cuda")]
-            let _alloc_label =
-                ferrum_kernels::backend::cuda::push_alloc_label("llama.logits_from_hidden.lm_head");
             lm_head.forward(
                 &mut ctx,
                 &self.scratch.last_normed,
@@ -4854,8 +5167,10 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
                 1,
             );
         }
-        B::sync(&mut ctx);
-        B::to_vec(&self.scratch.logits, vocab)
+        let quiescent = device_execution::checked_sync::<B>(ctx);
+        let output = B::to_vec_in_context(ctx, &self.scratch.logits, vocab);
+        frame.completed = Some(quiescent);
+        output
     }
 
     /// Prefill with pre-computed embeddings instead of token IDs.
@@ -4872,6 +5187,27 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         embeds: &[f32],
         seq_len: usize,
     ) -> Vec<f32> {
+        assert!(seq_len > 0, "prefill_from_embeds called with zero length");
+        assert_eq!(
+            embeds.len(),
+            seq_len * self.cfg.hidden_size,
+            "embedding length"
+        );
+        self.validate_prepared_legacy_write(cache_id, 0, seq_len, None)
+            .unwrap_or_else(|error| std::panic::panic_any(error));
+        self.run_device_frame(|model, frame| {
+            model.prefill_from_embeds_in_frame(frame, cache_id, embeds, seq_len)
+        })
+        .into_legacy_result()
+    }
+
+    fn prefill_from_embeds_in_frame(
+        &mut self,
+        frame: &mut LlamaExecutionFrame<B>,
+        cache_id: &str,
+        embeds: &[f32],
+        seq_len: usize,
+    ) -> Vec<f32> {
         let h = self.cfg.hidden_size;
         assert_eq!(
             embeds.len(),
@@ -4882,19 +5218,20 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         );
         assert!(seq_len > 0, "prefill_from_embeds called with zero length");
 
-        self.ensure_scratch(seq_len);
-        self.ensure_kv(cache_id);
+        self.ensure_scratch_in_context(&mut frame.context, seq_len);
+        self.prepare_lora_workspace_for_cache(&mut frame.context, cache_id, seq_len);
+        self.ensure_kv_in_context(&mut frame.context, cache_id, None);
+        self.ensure_paged_kv_capacity_for_cache_id(&mut frame.context, cache_id, seq_len)
+            .expect("KV preparation");
 
-        let mut ctx = B::new_context();
-        let mut residual = self
-            .scratch
-            .residual
-            .take()
-            .expect("scratch residual missing (previous call didn't restore)");
+        frame
+            .take_scratch(&mut self.scratch, FrameLayout::Single, false)
+            .expect("take frame scratch");
+        let mut ctx = &mut frame.context;
+        let mut residual = frame.residual.as_mut().expect("frame residual");
 
         // Upload embeds → residual[0 .. seq_len*h].
-        let embed_buf = B::from_slice(embeds);
-        B::copy_slice(&mut ctx, &embed_buf, 0, &mut residual, 0, seq_len * h);
+        B::write_f32_to_activation(ctx, &mut residual, embeds);
 
         for li in self.local_layer_indices() {
             self.forward_layer(&mut ctx, li, cache_id, &mut residual, 0, seq_len);
@@ -4908,15 +5245,32 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
             0,
             h,
         );
-        B::sync(&mut ctx);
-        self.scratch.residual = Some(residual);
-        B::to_vec(&self.scratch.last_hidden, h)
+        let quiescent = device_execution::checked_sync::<B>(ctx);
+        let output = B::to_vec_in_context(ctx, &self.scratch.last_hidden, h);
+        frame.completed = Some(quiescent);
+        output
     }
 
     /// Decode with a single pre-computed embedding (shape `[hidden]`).
     /// Returns the pre-norm hidden state for the position `pos`. Caller
     /// applies final norm + its own output head.
     pub fn decode_from_embed(&mut self, cache_id: &str, embed: &[f32], pos: u32) -> Vec<f32> {
+        assert_eq!(embed.len(), self.cfg.hidden_size, "embedding length");
+        self.validate_prepared_legacy_write(cache_id, pos as usize, 1, None)
+            .unwrap_or_else(|error| std::panic::panic_any(error));
+        self.run_device_frame(|model, frame| {
+            model.decode_from_embed_in_frame(frame, cache_id, embed, pos)
+        })
+        .into_legacy_result()
+    }
+
+    fn decode_from_embed_in_frame(
+        &mut self,
+        frame: &mut LlamaExecutionFrame<B>,
+        cache_id: &str,
+        embed: &[f32],
+        pos: u32,
+    ) -> Vec<f32> {
         let h = self.cfg.hidden_size;
         assert_eq!(
             embed.len(),
@@ -4926,27 +5280,29 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
             h
         );
 
-        self.ensure_scratch(1);
-        self.ensure_kv(cache_id);
+        self.ensure_scratch_in_context(&mut frame.context, 1);
+        self.prepare_lora_workspace_for_cache(&mut frame.context, cache_id, 1);
+        self.ensure_kv_in_context(&mut frame.context, cache_id, None);
+        self.ensure_paged_kv_capacity_for_cache_id(&mut frame.context, cache_id, pos as usize + 1)
+            .expect("KV preparation");
 
-        let mut ctx = B::new_context();
-        let mut residual = self
-            .scratch
-            .residual
-            .take()
-            .expect("scratch residual missing (previous call didn't restore)");
+        frame
+            .take_scratch(&mut self.scratch, FrameLayout::Single, false)
+            .expect("take frame scratch");
+        let mut ctx = &mut frame.context;
+        let mut residual = frame.residual.as_mut().expect("frame residual");
 
-        let embed_buf = B::from_slice(embed);
-        B::copy_slice(&mut ctx, &embed_buf, 0, &mut residual, 0, h);
+        B::write_f32_to_activation(ctx, &mut residual, embed);
 
         for li in self.local_layer_indices() {
             self.forward_layer(&mut ctx, li, cache_id, &mut residual, pos as usize, 1);
         }
 
         B::copy_slice(&mut ctx, &residual, 0, &mut self.scratch.last_hidden, 0, h);
-        B::sync(&mut ctx);
-        self.scratch.residual = Some(residual);
-        B::to_vec(&self.scratch.last_hidden, h)
+        let quiescent = device_execution::checked_sync::<B>(ctx);
+        let output = B::to_vec_in_context(ctx, &self.scratch.last_hidden, h);
+        frame.completed = Some(quiescent);
+        output
     }
 
     /// Variant of `prefill_from_embeds` that applies `final_norm` to every
@@ -4966,6 +5322,28 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         seq_len: usize,
         pos_offset: usize,
     ) -> Vec<f32> {
+        assert!(seq_len > 0, "prefill_all_post_norm called with zero length");
+        assert_eq!(
+            embeds.len(),
+            seq_len * self.cfg.hidden_size,
+            "embedding length"
+        );
+        self.validate_prepared_legacy_write(cache_id, pos_offset, seq_len, None)
+            .unwrap_or_else(|error| std::panic::panic_any(error));
+        self.run_device_frame(|model, frame| {
+            model.prefill_all_post_norm_in_frame(frame, cache_id, embeds, seq_len, pos_offset)
+        })
+        .into_legacy_result()
+    }
+
+    fn prefill_all_post_norm_in_frame(
+        &mut self,
+        frame: &mut LlamaExecutionFrame<B>,
+        cache_id: &str,
+        embeds: &[f32],
+        seq_len: usize,
+        pos_offset: usize,
+    ) -> Vec<f32> {
         let h = self.cfg.hidden_size;
         assert_eq!(
             embeds.len(),
@@ -4976,18 +5354,23 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         );
         assert!(seq_len > 0);
 
-        self.ensure_scratch(seq_len);
-        self.ensure_kv(cache_id);
+        self.ensure_scratch_in_context(&mut frame.context, seq_len);
+        self.prepare_lora_workspace_for_cache(&mut frame.context, cache_id, seq_len);
+        self.ensure_kv_in_context(&mut frame.context, cache_id, None);
+        self.ensure_paged_kv_capacity_for_cache_id(
+            &mut frame.context,
+            cache_id,
+            pos_offset + seq_len,
+        )
+        .expect("KV preparation");
 
-        let mut ctx = B::new_context();
-        let mut residual = self
-            .scratch
-            .residual
-            .take()
-            .expect("scratch residual missing (previous call didn't restore)");
+        frame
+            .take_scratch(&mut self.scratch, FrameLayout::Single, false)
+            .expect("take frame scratch");
+        let mut ctx = &mut frame.context;
+        let mut residual = frame.residual.as_mut().expect("frame residual");
 
-        let embed_buf = B::from_slice(embeds);
-        B::copy_slice(&mut ctx, &embed_buf, 0, &mut residual, 0, seq_len * h);
+        B::write_f32_to_activation(ctx, &mut residual, embeds);
 
         for li in self.local_layer_indices() {
             self.forward_layer(&mut ctx, li, cache_id, &mut residual, pos_offset, seq_len);
@@ -5003,9 +5386,10 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
             seq_len,
             h,
         );
-        B::sync(&mut ctx);
-        self.scratch.residual = Some(residual);
-        B::to_vec(&self.scratch.norm_out, seq_len * h)
+        let quiescent = device_execution::checked_sync::<B>(ctx);
+        let output = B::to_vec_in_context(ctx, &self.scratch.norm_out, seq_len * h);
+        frame.completed = Some(quiescent);
+        output
     }
 
     /// Decode-side companion to `prefill_all_post_norm`. Runs a single-token
@@ -5017,21 +5401,38 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         embed: &[f32],
         pos: u32,
     ) -> Vec<f32> {
+        assert_eq!(embed.len(), self.cfg.hidden_size, "embedding length");
+        self.validate_prepared_legacy_write(cache_id, pos as usize, 1, None)
+            .unwrap_or_else(|error| std::panic::panic_any(error));
+        self.run_device_frame(|model, frame| {
+            model.decode_post_norm_from_embed_in_frame(frame, cache_id, embed, pos)
+        })
+        .into_legacy_result()
+    }
+
+    fn decode_post_norm_from_embed_in_frame(
+        &mut self,
+        frame: &mut LlamaExecutionFrame<B>,
+        cache_id: &str,
+        embed: &[f32],
+        pos: u32,
+    ) -> Vec<f32> {
         let h = self.cfg.hidden_size;
         assert_eq!(embed.len(), h);
 
-        self.ensure_scratch(1);
-        self.ensure_kv(cache_id);
+        self.ensure_scratch_in_context(&mut frame.context, 1);
+        self.prepare_lora_workspace_for_cache(&mut frame.context, cache_id, 1);
+        self.ensure_kv_in_context(&mut frame.context, cache_id, None);
+        self.ensure_paged_kv_capacity_for_cache_id(&mut frame.context, cache_id, pos as usize + 1)
+            .expect("KV preparation");
 
-        let mut ctx = B::new_context();
-        let mut residual = self
-            .scratch
-            .residual
-            .take()
-            .expect("scratch residual missing (previous call didn't restore)");
+        frame
+            .take_scratch(&mut self.scratch, FrameLayout::Single, false)
+            .expect("take frame scratch");
+        let mut ctx = &mut frame.context;
+        let mut residual = frame.residual.as_mut().expect("frame residual");
 
-        let embed_buf = B::from_slice(embed);
-        B::copy_slice(&mut ctx, &embed_buf, 0, &mut residual, 0, h);
+        B::write_f32_to_activation(ctx, &mut residual, embed);
 
         for li in self.local_layer_indices() {
             self.forward_layer(&mut ctx, li, cache_id, &mut residual, pos as usize, 1);
@@ -5046,28 +5447,63 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
             1,
             h,
         );
-        B::sync(&mut ctx);
-        self.scratch.residual = Some(residual);
-        B::to_vec(&self.scratch.last_normed, h)
+        let quiescent = device_execution::checked_sync::<B>(ctx);
+        let output = B::to_vec_in_context(ctx, &self.scratch.last_normed, h);
+        frame.completed = Some(quiescent);
+        output
     }
 }
 
 // FP16 DecoderOnlyLLM impl — full path with batched + unified-forward overrides.
 impl<B: MoeLlmBackend> DecoderOnlyLLM for LlamaFamilyModel<B, KvFp16> {
+    fn observe_token_allocator_reclaim(
+        &self,
+        blocked_cache_id: &str,
+        domain: &ferrum_execution::token_execution::AllocatorCapacityDomain,
+        candidates: &[&str],
+    ) -> Result<Option<ferrum_execution::token_execution::TokenAllocatorReclaim>> {
+        self.observe_paged_allocator_reclaim(blocked_cache_id, domain, candidates)
+    }
+
     fn config(&self) -> &LlmRuntimeConfig {
         &self.runtime_cfg
     }
 
-    fn supports_direct_token_execution(&self) -> bool {
-        B::host_execution_is_synchronous()
+    fn token_execution_mode(&self) -> crate::common::ModelTokenExecutionMode {
+        self.standalone_token_execution_mode()
     }
 
     fn execute_token_work(
         &mut self,
+        input: &crate::common::llm::ModelTokenInput<'_>,
+    ) -> crate::common::llm::ModelTokenOutcome<crate::common::llm::ModelTokenProduct> {
+        if B::host_execution_is_synchronous() {
+            self.execute_host_token_work(input)
+        } else {
+            self.execute_managed_token_work(input)
+        }
+    }
+
+    fn execute_token_batch(
+        &mut self,
+        inputs: &[crate::common::llm::ModelTokenInput<'_>],
+    ) -> crate::common::llm::ModelTokenBatchOutcome {
+        self.execute_managed_fp16_tokens(inputs)
+    }
+
+    fn close_token_execution(
+        &mut self,
         cache_id: &str,
-        work: crate::common::llm::ModelTokenWork<'_>,
-    ) -> crate::common::llm::ModelTokenOutcome {
-        self.execute_host_token_work(cache_id, work)
+    ) -> crate::common::llm::ModelTokenCloseOutcome {
+        self.close_managed_token_cache(cache_id)
+    }
+
+    fn recover_token_execution(&mut self) -> crate::common::llm::ModelExecutionRecovery {
+        self.recover_token_frame()
+    }
+
+    fn retire_model(&mut self) -> crate::common::llm::ModelRetirementOutcome {
+        self.retire_original_model()
     }
 
     fn close_token_sequence(&mut self, cache_id: &str) -> Result<()> {
@@ -5076,6 +5512,7 @@ impl<B: MoeLlmBackend> DecoderOnlyLLM for LlamaFamilyModel<B, KvFp16> {
                 "device token closure requires its actual submission context",
             ));
         }
+        self.recover_device_frame()?;
         crate::common::llm::catch_host_execution(|| self.release(cache_id))
     }
 
@@ -5116,24 +5553,20 @@ impl<B: MoeLlmBackend> DecoderOnlyLLM for LlamaFamilyModel<B, KvFp16> {
 
         const WARMUP_CACHE: &str = "__ferrum_warmup__";
         let _ = self.prefill_internal(WARMUP_CACHE, &[0u32]);
-        if let Some(mut caches) = self.kv_caches.remove(WARMUP_CACHE) {
-            if let Some(alloc_arc) = self.paged_block_alloc.as_ref() {
-                let mut alloc = alloc_arc.lock().unwrap_or_else(|p| p.into_inner());
-                if let Some(c0) = caches.first() {
-                    if !c0.paged_block_indices.is_empty() {
-                        alloc.free(&c0.paged_block_indices);
-                    }
-                }
-                for c in caches.iter_mut() {
-                    c.paged_block_indices.clear();
-                }
-            }
-            self.kv_free_pool.push(caches);
-        }
+        // Use the same checked close as public release; even the warmup ID
+        // must not bypass retirement of a previously captured incarnation.
+        self.release_token_cache(WARMUP_CACHE);
     }
 
     fn prepare_kv_capacity(&mut self, cache_id: &str, capacity_hint: usize) {
         self.ensure_kv_with_capacity_hint(cache_id, Some(capacity_hint));
+    }
+
+    fn prepare_token_kv(
+        &mut self,
+        request: crate::common::llm::ModelKvPreparation<'_>,
+    ) -> Result<crate::common::llm::ModelKvReservation> {
+        self.prepare_token_kv_in_frame(request)
     }
 
     fn kv_capacity(&self) -> usize {
@@ -5145,6 +5578,13 @@ impl<B: MoeLlmBackend> DecoderOnlyLLM for LlamaFamilyModel<B, KvFp16> {
         requests: &[KvSlotRequest],
     ) -> std::result::Result<Option<KvSlotReservation>, ferrum_types::FerrumError> {
         self.reserve_paged_kv_slots(requests)
+    }
+
+    fn reserve_token_kv_slots(
+        &mut self,
+        requests: &[KvSlotRequest],
+    ) -> Result<crate::common::llm::ModelKvReservation> {
+        self.reserve_paged_token_kv_slots(requests)
     }
 
     fn kv_slot_capacity_snapshot(&self) -> Option<KvSlotCapacitySnapshot> {
@@ -5200,16 +5640,8 @@ impl<B: MoeLlmBackend> DecoderOnlyLLM for LlamaFamilyModel<B, KvFp16> {
         if items.is_empty() {
             return Ok(Vec::new());
         }
-        if self.runtime_env.prefix_cache
-            && items
-                .iter()
-                .any(|(_, tokens, pos_offset, _)| *pos_offset == 0 && tokens.len() > 1)
-        {
-            return Err(ferrum_types::FerrumError::unsupported(
-                "LlamaFamilyModel::unified_forward: fresh prefill with prefix cache enabled \
-                 routes through prefill_internal so real paged-block KV reuse can probe and \
-                 register block hashes",
-            ));
+        for (cache_id, tokens, position, _) in items {
+            self.validate_prepared_legacy_write(cache_id, *position, tokens.len(), Some(tokens))?;
         }
         if !self.supports_varlen_qkv {
             let reason = unified_varlen_qkv_unsupported_reason(
@@ -5257,78 +5689,69 @@ impl<B: MoeLlmBackend> DecoderOnlyLLM for LlamaFamilyModel<B, KvFp16> {
     }
 
     fn truncate_kv(&mut self, cache_id: &str, new_len: usize) {
-        if let Some(caches) = self.kv_caches.get_mut(cache_id) {
-            for c in caches.iter_mut() {
-                if new_len < c.len {
-                    c.len = new_len;
-                }
-            }
-        }
-        let mut ctx = B::new_context();
-        B::reset_graph(&mut ctx, SINGLE_ITEM_GRAPH_KEY);
-        self.graph_warmup = 0;
-        self.graph_capture_failed = false;
+        self.truncate_token_cache(cache_id, new_len);
     }
 
     fn release(&mut self, cache_id: &str) {
-        let mut ctx = B::new_context();
-        B::sync(&mut ctx);
-        self.graph_warmup = 0;
-        self.graph_capture_failed = false;
-        self.lora_cache_adapters.remove(cache_id);
-        if let Some(mut caches) = self.kv_caches.remove(cache_id) {
-            if let Some(alloc_arc) = self.paged_block_alloc.as_ref() {
-                let mut alloc = alloc_arc.lock().unwrap_or_else(|p| p.into_inner());
-                if let Some(c0) = caches.first() {
-                    if !c0.paged_block_indices.is_empty() {
-                        alloc.free(&c0.paged_block_indices);
-                    }
-                }
-                for c in caches.iter_mut() {
-                    c.paged_block_indices.clear();
-                }
-            }
-            self.kv_free_pool.push(caches);
-        }
+        self.release_token_cache(cache_id);
     }
 
     fn reset(&mut self) {
-        let mut ctx = B::new_context();
-        B::sync(&mut ctx);
-        B::reset_all_graphs(&mut ctx);
-        B::sync(&mut ctx);
-        self.graph_warmup = 0;
-        self.graph_capture_failed = false;
-        self.batched_graph_keys_seen.clear();
-        self.batched_graph_warmup = 0;
-        self.batched_graph_failed = false;
-        self.kv_caches.clear();
-        self.kv_free_pool.clear();
-        self.paged_pools = None;
-        self.paged_block_alloc = None;
-        self.paged_dims = None;
-        self.lora_cache_adapters.clear();
+        self.reset_token_caches();
     }
 }
 
-// INT8 DecoderOnlyLLM impl — minimal: no batched / unified-forward overrides
-// (default trait impl falls back to per-item decode). PR D will add INT8
-// batched paths once the kernels stabilize.
+// INT8 shares retained-frame ownership and per-participant token execution.
+// Batch work remains serial; it does not claim the FP16 fused batch contract.
 impl<B: MoeLlmBackend + BackendInt8KvOps> DecoderOnlyLLM for LlamaFamilyModel<B, KvInt8> {
+    fn retire_model(&mut self) -> crate::common::llm::ModelRetirementOutcome {
+        self.retire_original_model()
+    }
+
+    fn observe_token_allocator_reclaim(
+        &self,
+        blocked_cache_id: &str,
+        domain: &ferrum_execution::token_execution::AllocatorCapacityDomain,
+        candidates: &[&str],
+    ) -> Result<Option<ferrum_execution::token_execution::TokenAllocatorReclaim>> {
+        self.observe_paged_allocator_reclaim(blocked_cache_id, domain, candidates)
+    }
+
     fn config(&self) -> &LlmRuntimeConfig {
         &self.runtime_cfg
     }
 
-    fn supports_direct_token_execution(&self) -> bool {
-        B::host_execution_is_synchronous()
+    fn token_execution_mode(&self) -> crate::common::ModelTokenExecutionMode {
+        self.standalone_token_execution_mode()
     }
 
     fn execute_token_work(
         &mut self,
+        input: &crate::common::llm::ModelTokenInput<'_>,
+    ) -> crate::common::llm::ModelTokenOutcome<crate::common::llm::ModelTokenProduct> {
+        if B::host_execution_is_synchronous() {
+            self.execute_host_token_work(input)
+        } else {
+            self.execute_managed_token_work(input)
+        }
+    }
+
+    fn execute_token_batch(
+        &mut self,
+        inputs: &[crate::common::llm::ModelTokenInput<'_>],
+    ) -> crate::common::llm::ModelTokenBatchOutcome {
+        self.execute_managed_serial_tokens(inputs)
+    }
+
+    fn close_token_execution(
+        &mut self,
         cache_id: &str,
-        work: crate::common::llm::ModelTokenWork<'_>,
-    ) -> crate::common::llm::ModelTokenOutcome {
-        self.execute_host_token_work(cache_id, work)
+    ) -> crate::common::llm::ModelTokenCloseOutcome {
+        self.close_managed_token_cache(cache_id)
+    }
+
+    fn recover_token_execution(&mut self) -> crate::common::llm::ModelExecutionRecovery {
+        self.recover_token_frame()
     }
 
     fn close_token_sequence(&mut self, cache_id: &str) -> Result<()> {
@@ -5337,6 +5760,7 @@ impl<B: MoeLlmBackend + BackendInt8KvOps> DecoderOnlyLLM for LlamaFamilyModel<B,
                 "device token closure requires its actual submission context",
             ));
         }
+        self.recover_device_frame()?;
         crate::common::llm::catch_host_execution(|| self.release(cache_id))
     }
 
@@ -5377,24 +5801,20 @@ impl<B: MoeLlmBackend + BackendInt8KvOps> DecoderOnlyLLM for LlamaFamilyModel<B,
 
         const WARMUP_CACHE: &str = "__ferrum_warmup__";
         let _ = self.prefill_internal(WARMUP_CACHE, &[0u32]);
-        if let Some(mut caches) = self.kv_caches.remove(WARMUP_CACHE) {
-            if let Some(alloc_arc) = self.paged_block_alloc.as_ref() {
-                let mut alloc = alloc_arc.lock().unwrap_or_else(|p| p.into_inner());
-                if let Some(c0) = caches.first() {
-                    if !c0.paged_block_indices.is_empty() {
-                        alloc.free(&c0.paged_block_indices);
-                    }
-                }
-                for c in caches.iter_mut() {
-                    c.paged_block_indices.clear();
-                }
-            }
-            self.kv_free_pool.push(caches);
-        }
+        // Use the same checked close as public release; even the warmup ID
+        // must not bypass retirement of a previously captured incarnation.
+        self.release_token_cache(WARMUP_CACHE);
     }
 
     fn prepare_kv_capacity(&mut self, cache_id: &str, capacity_hint: usize) {
         self.ensure_kv_with_capacity_hint(cache_id, Some(capacity_hint));
+    }
+
+    fn prepare_token_kv(
+        &mut self,
+        request: crate::common::llm::ModelKvPreparation<'_>,
+    ) -> Result<crate::common::llm::ModelKvReservation> {
+        self.prepare_token_kv_in_frame(request)
     }
 
     fn kv_capacity(&self) -> usize {
@@ -5406,6 +5826,13 @@ impl<B: MoeLlmBackend + BackendInt8KvOps> DecoderOnlyLLM for LlamaFamilyModel<B,
         requests: &[KvSlotRequest],
     ) -> std::result::Result<Option<KvSlotReservation>, ferrum_types::FerrumError> {
         self.reserve_paged_kv_slots(requests)
+    }
+
+    fn reserve_token_kv_slots(
+        &mut self,
+        requests: &[KvSlotRequest],
+    ) -> Result<crate::common::llm::ModelKvReservation> {
+        self.reserve_paged_token_kv_slots(requests)
     }
 
     fn kv_slot_capacity_snapshot(&self) -> Option<KvSlotCapacitySnapshot> {
@@ -5433,58 +5860,22 @@ impl<B: MoeLlmBackend + BackendInt8KvOps> DecoderOnlyLLM for LlamaFamilyModel<B,
     }
 
     fn truncate_kv(&mut self, cache_id: &str, new_len: usize) {
-        if let Some(caches) = self.kv_caches.get_mut(cache_id) {
-            for c in caches.iter_mut() {
-                if new_len < c.len {
-                    c.len = new_len;
-                }
-            }
-        }
-        let mut ctx = B::new_context();
-        B::reset_graph(&mut ctx, SINGLE_ITEM_GRAPH_KEY);
-        self.graph_warmup = 0;
-        self.graph_capture_failed = false;
+        self.truncate_token_cache(cache_id, new_len);
     }
 
     fn release(&mut self, cache_id: &str) {
-        let mut ctx = B::new_context();
-        B::sync(&mut ctx);
-        self.graph_warmup = 0;
-        self.graph_capture_failed = false;
-        self.lora_cache_adapters.remove(cache_id);
-        if let Some(mut caches) = self.kv_caches.remove(cache_id) {
-            if let Some(alloc_arc) = self.paged_block_alloc.as_ref() {
-                let mut alloc = alloc_arc.lock().unwrap_or_else(|p| p.into_inner());
-                if let Some(c0) = caches.first() {
-                    if !c0.paged_block_indices.is_empty() {
-                        alloc.free(&c0.paged_block_indices);
-                    }
-                }
-                for c in caches.iter_mut() {
-                    c.paged_block_indices.clear();
-                }
-            }
-            self.kv_free_pool.push(caches);
-        }
+        self.release_token_cache(cache_id);
     }
 
     fn reset(&mut self) {
-        let mut ctx = B::new_context();
-        B::sync(&mut ctx);
-        B::reset_all_graphs(&mut ctx);
-        B::sync(&mut ctx);
-        self.graph_warmup = 0;
-        self.graph_capture_failed = false;
-        self.kv_caches.clear();
-        self.kv_free_pool.clear();
-        self.paged_pools = None;
-        self.paged_block_alloc = None;
-        self.paged_dims = None;
-        self.lora_cache_adapters.clear();
+        self.reset_token_caches();
     }
 }
 
-fn build_rope_cache<B: QuantLlmBackend + BackendMoeFused>(cfg: &LlamaFamilyConfig) -> RopeCache<B> {
+fn build_rope_cache<B: QuantLlmBackend + BackendMoeFused>(
+    ctx: &mut B::Context,
+    cfg: &LlamaFamilyConfig,
+) -> RopeCache<B> {
     let hd = cfg.head_dim;
     let half = hd / 2;
     let max = cfg.max_seq_len;
@@ -5498,9 +5889,15 @@ fn build_rope_cache<B: QuantLlmBackend + BackendMoeFused>(cfg: &LlamaFamilyConfi
             sin[pos * half + i] = angle.sin() as f32;
         }
     }
+    let mut partial = (None, None);
+    let mut construction = device_execution::ConstructionContext::<B>::new(ctx);
+    partial.0 = Some(B::from_slice_in_context(construction.context, &cos));
+    partial.1 = Some(B::from_slice_in_context(construction.context, &sin));
+    construction.transfer();
+    drop(construction);
     RopeCache {
-        cos: B::from_slice(&cos),
-        sin: B::from_slice(&sin),
+        cos: partial.0.expect("rope cos"),
+        sin: partial.1.expect("rope sin"),
     }
 }
 
@@ -5551,6 +5948,25 @@ fn scale_llama3_rope_freq(
 #[cfg(test)]
 #[path = "llama_family_lora_tests.rs"]
 mod lora_tests;
+
+#[cfg(all(test, feature = "cuda"))]
+mod int8_shared_pool_tests;
+
+#[cfg(all(
+    test,
+    any(
+        feature = "cuda",
+        all(feature = "metal", any(target_os = "macos", target_os = "ios"))
+    )
+))]
+mod prefix_cache_tests;
+
+#[cfg(test)]
+mod graph_contract_tests;
+#[cfg(test)]
+mod instance_config_tests;
+#[cfg(test)]
+mod paged_window_tests;
 
 #[cfg(test)]
 mod tests {
@@ -5641,17 +6057,32 @@ mod tests {
     }
 
     impl WeightLoader<CpuBackend> for RecordingLoader {
-        fn load_tensor(&self, name: &str) -> Result<Vec<f32>> {
+        fn load_tensor(
+            &self,
+            _ctx: &mut <CpuBackend as ferrum_kernels::backend::Backend>::Context,
+            name: &str,
+        ) -> Result<Vec<f32>> {
             self.tensors.lock().unwrap().push(name.to_string());
             Ok(vec![1.0])
         }
 
         fn load_linear(
             &self,
+            ctx: &mut <CpuBackend as ferrum_kernels::backend::Backend>::Context,
             name: &str,
-        ) -> Result<Box<dyn ferrum_quantization::Linear<CpuBackend>>> {
-            self.linears.lock().unwrap().push(name.to_string());
-            Ok(Box::new(DenseLinear::<CpuBackend>::from_rows(&[1.0], 1, 1)))
+        ) -> Result<ferrum_kernels::LoadedLinear<CpuBackend>> {
+            let linear = (|| -> Result<Box<dyn ferrum_quantization::Linear<CpuBackend>>> {
+                self.linears.lock().unwrap().push(name.to_string());
+                Ok(Box::new(DenseLinear::<CpuBackend>::from_rows_in_context(
+                    ctx,
+                    &[1.0],
+                    1,
+                    1,
+                )))
+            })()?;
+            // SAFETY: these built-in projections own their weights and encode only
+            // backend work; the model retains them until checked graph retirement.
+            Ok(unsafe { ferrum_kernels::LoadedLinear::new_capture_stable(linear) })
         }
 
         fn has_tensor(&self, _name: &str) -> bool {
@@ -5761,11 +6192,21 @@ mod tests {
 
     #[test]
     fn paged_kv_layer_schedule_allows_windowed_models_with_varlen_backend() {
-        assert!(paged_kv_allowed_for_layer_schedule(true, false, 0));
-        assert!(paged_kv_allowed_for_layer_schedule(true, true, 0));
-        assert!(!paged_kv_allowed_for_layer_schedule(true, false, 6));
-        assert!(paged_kv_allowed_for_layer_schedule(true, true, 6));
-        assert!(!paged_kv_allowed_for_layer_schedule(false, true, 6));
+        assert!(paged_kv_allowed_for_layer_schedule(
+            true, false, 0, false, false
+        ));
+        assert!(paged_kv_allowed_for_layer_schedule(
+            true, true, 0, false, false
+        ));
+        assert!(!paged_kv_allowed_for_layer_schedule(
+            true, false, 6, false, false
+        ));
+        assert!(paged_kv_allowed_for_layer_schedule(
+            true, true, 6, false, false
+        ));
+        assert!(!paged_kv_allowed_for_layer_schedule(
+            false, true, 6, false, false
+        ));
     }
 
     #[test]
@@ -5779,7 +6220,7 @@ mod tests {
         for current in [&mut model, &mut reference] {
             // Exercise real CPU forwards with its supported contiguous KV.
             // Paged allocation/release has separate tests below.
-            current.runtime_env = LlamaFamilyRuntimeEnv::from_env_vars([
+            current.runtime_env = runtime_for_entries([
                 ("FERRUM_METAL_PAGED_KV", "0"),
                 ("FERRUM_KV_CAPACITY", "128"),
                 ("FERRUM_PREFIX_CACHE", "0"),
@@ -5817,7 +6258,7 @@ mod tests {
         cfg.max_seq_len = 64;
         let loader = RecordingLoader::default();
         let mut model = LlamaFamilyModel::<CpuBackend>::new(cfg, &loader).unwrap();
-        model.runtime_env = LlamaFamilyRuntimeEnv::from_env_vars([
+        model.runtime_env = runtime_for_entries([
             ("FERRUM_METAL_PAGED_KV", "1"),
             ("FERRUM_KV_CAPACITY", "64"),
             ("FERRUM_KV_MAX_BLOCKS", "4"),
@@ -5840,7 +6281,8 @@ mod tests {
             4
         );
 
-        let mut ctx = CpuBackend::new_context();
+        let mut ctx =
+            CpuBackend::new_context(&ferrum_types::BackendContextConfig::default()).unwrap();
         model
             .ensure_paged_kv_capacity_for_cache_id(&mut ctx, "seq-a", 17)
             .unwrap();
@@ -5886,7 +6328,7 @@ mod tests {
         cfg.max_seq_len = 64;
         let loader = RecordingLoader::default();
         let mut model = LlamaFamilyModel::<CpuBackend>::new(cfg, &loader).unwrap();
-        model.runtime_env = LlamaFamilyRuntimeEnv::from_env_vars([
+        model.runtime_env = runtime_for_entries([
             ("FERRUM_METAL_PAGED_KV", "1"),
             ("FERRUM_KV_CAPACITY", "64"),
             ("FERRUM_KV_MAX_BLOCKS", "3"),
@@ -5959,7 +6401,7 @@ mod tests {
         cfg.max_seq_len = 64;
         let loader = RecordingLoader::default();
         let mut model = LlamaFamilyModel::<CpuBackend>::new(cfg, &loader).unwrap();
-        model.runtime_env = LlamaFamilyRuntimeEnv::from_env_vars([
+        model.runtime_env = runtime_for_entries([
             ("FERRUM_METAL_PAGED_KV", "1"),
             ("FERRUM_KV_CAPACITY", "64"),
             ("FERRUM_KV_MAX_BLOCKS", "2"),
@@ -5995,7 +6437,13 @@ mod tests {
         let cfg = test_llama_config(5, true);
         let loader = RecordingLoader::default();
 
-        let layers = load_llama_family_layers(&cfg, &loader, 2..4).unwrap();
+        let layers = load_llama_family_layers(
+            &mut CpuBackend::new_context(&ferrum_types::BackendContextConfig::default()).unwrap(),
+            &cfg,
+            &loader,
+            2..4,
+        )
+        .unwrap();
 
         assert_eq!(layers.len(), 2);
         assert!(layers.iter().all(|layer| layer.q_norm_w.is_some()));
@@ -6033,7 +6481,12 @@ mod tests {
         let cfg = test_llama_config(2, false);
         let loader = RecordingLoader::default();
 
-        let err = match load_llama_family_layers(&cfg, &loader, 1..3) {
+        let err = match load_llama_family_layers(
+            &mut CpuBackend::new_context(&ferrum_types::BackendContextConfig::default()).unwrap(),
+            &cfg,
+            &loader,
+            1..3,
+        ) {
             Ok(_) => panic!("expected out-of-bounds layer range to fail"),
             Err(err) => err,
         };
@@ -6167,17 +6620,24 @@ mod tests {
         assert!(logits[0].is_finite());
     }
 
+    fn runtime_for_entries<const N: usize>(entries: [(&str, &str); N]) -> LlamaFamilyRuntimeEnv {
+        let mut engine = ferrum_types::EngineConfig::default();
+        engine
+            .apply_runtime_config_snapshot(&ferrum_types::RuntimeConfigSnapshot::from_env_vars(
+                entries,
+            ))
+            .unwrap();
+        LlamaFamilyRuntimeEnv::from_execution_config(&engine.llama_execution_config())
+    }
+
     #[test]
     fn llama_family_runtime_env_parses_startup_knobs() {
-        let env = LlamaFamilyRuntimeEnv::from_env_vars([
+        let env = runtime_for_entries([
             ("FERRUM_KV_CAPACITY", "4096"),
             ("FERRUM_KV_MAX_BLOCKS", "1234"),
             ("FERRUM_METAL_PAGED_KV", "0"),
             ("FERRUM_PAGED_MAX_SEQS", "64"),
-            ("FERRUM_DECODE_OP_PROFILE", "0"),
-            ("FERRUM_PREFILL_OP_PROFILE", ""),
             ("FERRUM_CUDA_GRAPH", ""),
-            ("FERRUM_DECODE_LAYER_PROFILE", "false"),
             ("FERRUM_NAN_TRACE", "layer3, source9"),
             ("FERRUM_OP_DUMP", "/tmp/ferrum-op-dump"),
         ]);
@@ -6186,10 +6646,7 @@ mod tests {
         assert_eq!(env.kv_max_blocks, Some(1234));
         assert_eq!(env.metal_paged_kv, Some(false));
         assert_eq!(env.paged_max_seqs, 64);
-        assert!(env.decode_op_profile);
-        assert!(env.prefill_op_profile);
         assert!(env.cuda_graph);
-        assert!(env.decode_layer_profile);
         assert!(env.nan_trace.matches_layer(3, 9));
         assert_eq!(env.op_dump_dir.as_deref(), Some("/tmp/ferrum-op-dump"));
         assert!(!env.graph_capture_allowed());
@@ -6197,17 +6654,26 @@ mod tests {
     }
 
     #[test]
-    fn llama_family_runtime_env_uses_defaults_for_invalid_values() {
-        let env = LlamaFamilyRuntimeEnv::from_env_vars([
+    fn llama_family_runtime_config_rejects_invalid_product_capacity_and_keeps_library_defaults() {
+        for (key, value) in [
             ("FERRUM_KV_CAPACITY", "bad"),
             ("FERRUM_KV_MAX_BLOCKS", "0"),
             ("FERRUM_PAGED_MAX_SEQS", "bad"),
-            ("FERRUM_METAL_PAGED_KV", "1"),
-        ]);
+        ] {
+            let mut engine = ferrum_types::EngineConfig::default();
+            assert!(engine
+                .apply_runtime_config_snapshot(&ferrum_types::RuntimeConfigSnapshot::from_env_vars(
+                    [(key, value)]
+                ))
+                .is_err());
+        }
+        let env = LlamaFamilyRuntimeEnv::from_execution_config(
+            &ferrum_types::LlamaExecutionConfig::default(),
+        );
 
         assert_eq!(env.kv_capacity, None);
         assert_eq!(env.kv_max_blocks, None);
-        assert_eq!(env.metal_paged_kv, Some(true));
+        assert_eq!(env.metal_paged_kv, None);
         assert_eq!(env.paged_max_seqs, 32);
         assert_eq!(
             env.kv_capacity_for_model(DEFAULT_KV_CAPACITY * 2),
@@ -6234,13 +6700,21 @@ mod tests {
     #[test]
     fn prefill_scratch_keeps_batch_logits_lazy() {
         let cfg = test_llama_config(1, false);
-        let mut scratch = LlamaFamilyScratch::<CpuBackend>::alloc(&cfg, 128);
+        let mut scratch = LlamaFamilyScratch::<CpuBackend>::alloc(
+            &mut CpuBackend::new_context(&ferrum_types::BackendContextConfig::default()).unwrap(),
+            &cfg,
+            128,
+        );
 
         assert_eq!(scratch.max_tokens, 128);
         assert_eq!(scratch.batch_logits_capacity, 1);
         assert_eq!(scratch.batch_logits.len(), cfg.vocab_size);
 
-        scratch.ensure_batch_logits(&cfg, 128);
+        scratch.ensure_batch_logits(
+            &mut CpuBackend::new_context(&ferrum_types::BackendContextConfig::default()).unwrap(),
+            &cfg,
+            128,
+        );
         assert_eq!(scratch.batch_logits_capacity, 128);
         assert_eq!(scratch.batch_logits.len(), 128 * cfg.vocab_size);
     }
@@ -6377,7 +6851,9 @@ mod tests {
     fn cpu_gelu_tanh_mul_split_matches_reference() {
         use ferrum_kernels::backend::cpu::CpuBackend;
         use ferrum_kernels::backend::Backend;
-        let mut ctx = <CpuBackend as Backend>::new_context();
+        let mut ctx =
+            <CpuBackend as Backend>::new_context(&ferrum_types::BackendContextConfig::default())
+                .unwrap();
         let im = 3usize;
         // one token: gate = [-1, 0.5, 2], up = [1, 2, 3]
         let gate_up = vec![-1.0f32, 0.5, 2.0, 1.0, 2.0, 3.0];
@@ -6396,10 +6872,15 @@ mod tests {
     fn cpu_scale_inplace_scales() {
         use ferrum_kernels::backend::cpu::CpuBackend;
         use ferrum_kernels::backend::Backend;
-        let mut ctx = <CpuBackend as Backend>::new_context();
+        let mut ctx =
+            <CpuBackend as Backend>::new_context(&ferrum_types::BackendContextConfig::default())
+                .unwrap();
         let mut buf = <CpuBackend as Backend>::from_slice(&[1.0f32, -2.0, 0.5]);
         <CpuBackend as Backend>::scale_inplace(&mut ctx, &mut buf, 33.9375, 3);
         let v = <CpuBackend as Backend>::to_vec(&buf, 3);
         assert_eq!(v, vec![33.9375, -67.875, 16.96875]);
     }
 }
+
+#[cfg(all(test, feature = "cuda"))]
+mod single_graph_tests;

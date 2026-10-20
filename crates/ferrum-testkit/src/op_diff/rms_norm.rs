@@ -78,7 +78,7 @@ impl OpUnderTest for RmsNormOp {
         use ferrum_kernels::backend::Backend;
 
         let (x, w) = self.build_input(seed);
-        let mut ctx = CpuBackend::new_context();
+        let mut ctx = CpuBackend::new_context(&Default::default()).expect("backend context");
         let x_buf = CpuBackend::from_slice(&x);
         let w_buf = CpuBackend::from_slice(&w);
         let mut out = CpuBackend::alloc(self.output_len());
@@ -101,7 +101,7 @@ impl OpUnderTest for RmsNormOp {
         use ferrum_kernels::backend::Backend;
 
         let (x, w) = self.build_input(seed);
-        let mut ctx = MetalBackend::new_context();
+        let mut ctx = MetalBackend::new_context(&Default::default()).expect("backend context");
         let x_buf = MetalBackend::from_slice(&x);
         let w_buf = MetalBackend::from_slice(&w);
         let mut out = MetalBackend::alloc(self.output_len());
@@ -125,7 +125,7 @@ impl OpUnderTest for RmsNormOp {
         use ferrum_kernels::backend::Backend;
 
         let (x, w) = self.build_input(seed);
-        let mut ctx = CudaBackend::new_context();
+        let mut ctx = CudaBackend::new_context(&Default::default()).expect("backend context");
         let x_buf = CudaBackend::from_slice(&x);
         let w_buf = CudaBackend::from_slice(&w);
         let mut out = CudaBackend::alloc(self.output_len());

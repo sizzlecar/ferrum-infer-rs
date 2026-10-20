@@ -3,8 +3,8 @@
 //!
 //! Extracted from `cuda/mod.rs` (#8 Phase 4). Owns:
 //!
-//! - `SplitKScratch` process-global f32 partial buffers for split-K
-//!   phase 1 + `split_k_scratch_slot` / `with_split_k_scratch` helpers.
+//! - `SplitKScratch` instance-owned f32 partial buffers for split-K
+//!   phase 1 + `with_split_k_scratch`.
 //! - `paged_varlen_split_k_dispatch` (split-K varlen path used by
 //!   prefill on long contexts).
 //! - `paged_batched_flash_dispatch` (Stage 13a batched paged-decode
@@ -19,8 +19,7 @@
 //! All helpers stay private to this module; the trait impl is the
 //! only public surface.
 
-use std::collections::HashMap;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 use cudarc::driver::{
     CudaContext, CudaFunction, CudaModule, CudaSlice, CudaStream, DeviceRepr, LaunchConfig,
@@ -29,183 +28,106 @@ use cudarc::driver::{
 use ferrum_types::{FerrumError, Result};
 use half::f16;
 
-use super::{CudaBackend, CudaState, BATCHED_SCRATCH_CAP, HOST_STAGING_TOTAL};
-use crate::backend::{Backend, BackendPagedKv};
+use super::{CudaBackend, CudaState, BATCHED_SCRATCH_CAP};
+use crate::backend::{Backend, BackendPagedKv, PagedAttentionLaunchGeometry};
 use crate::ptx;
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct CudaPagedRuntimeConfig {
-    kv_capacity: usize,
-    paged_flash_splits: Option<usize>,
-    split_k_attn: Option<bool>,
-    fa2_source: bool,
-    paged_flash: bool,
-}
-
-impl CudaPagedRuntimeConfig {
-    fn from_env() -> Self {
-        Self::from_env_vars(std::env::vars())
-    }
-
-    fn from_env_vars<I, K, V>(vars: I) -> Self
-    where
-        I: IntoIterator<Item = (K, V)>,
-        K: AsRef<str>,
-        V: AsRef<str>,
-    {
-        let mut config = Self {
-            kv_capacity: 512,
-            paged_flash_splits: None,
-            split_k_attn: None,
-            fa2_source: false,
-            paged_flash: true,
-        };
-        for (name, value) in vars {
-            let value = value.as_ref();
-            match name.as_ref() {
-                "FERRUM_KV_CAPACITY" => {
-                    if let Ok(kv_capacity) = value.parse::<usize>() {
-                        config.kv_capacity = kv_capacity;
-                    }
-                }
-                "FERRUM_PAGED_FLASH_SPLITS" => {
-                    config.paged_flash_splits = value.parse::<usize>().ok();
-                }
-                "FERRUM_SPLIT_K_ATTN" => {
-                    config.split_k_attn = match value {
-                        "1" => Some(true),
-                        "0" => Some(false),
-                        _ => None,
-                    };
-                }
-                "FERRUM_FA2_SOURCE" => {
-                    config.fa2_source = matches!(value, "1" | "true" | "TRUE" | "on" | "ON");
-                }
-                "FERRUM_PAGED_FLASH" => config.paged_flash = value != "0",
-                _ => {}
-            }
-        }
-        config
-    }
-
-    fn shared_kv_for(&self, kv_len: usize) -> usize {
-        self.kv_capacity.max(kv_len).max(1)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::CudaPagedRuntimeConfig;
-
-    #[test]
-    fn cuda_paged_runtime_config_parses_startup_knobs() {
-        let config = CudaPagedRuntimeConfig::from_env_vars([
-            ("FERRUM_KV_CAPACITY", "4096"),
-            ("FERRUM_PAGED_FLASH_SPLITS", "4"),
-            ("FERRUM_SPLIT_K_ATTN", "1"),
-            ("FERRUM_FA2_SOURCE", "on"),
-            ("FERRUM_PAGED_FLASH", "0"),
-        ]);
-
-        assert_eq!(config.kv_capacity, 4096);
-        assert_eq!(config.paged_flash_splits, Some(4));
-        assert_eq!(config.split_k_attn, Some(true));
-        assert!(config.fa2_source);
-        assert!(!config.paged_flash);
-        assert_eq!(config.shared_kv_for(8192), 8192);
-    }
-
-    #[test]
-    fn cuda_paged_runtime_config_keeps_existing_defaults() {
-        let config = CudaPagedRuntimeConfig::from_env_vars([
-            ("FERRUM_KV_CAPACITY", "bad"),
-            ("FERRUM_PAGED_FLASH_SPLITS", "bad"),
-            ("FERRUM_SPLIT_K_ATTN", "auto"),
-            ("FERRUM_FA2_SOURCE", "trueish"),
-        ]);
-
-        assert_eq!(config.kv_capacity, 512);
-        assert_eq!(config.paged_flash_splits, None);
-        assert_eq!(config.split_k_attn, None);
-        assert!(!config.fa2_source);
-        assert!(config.paged_flash);
-        assert_eq!(config.shared_kv_for(128), 512);
-    }
-}
-
-fn cuda_paged_runtime_config() -> &'static CudaPagedRuntimeConfig {
-    static CONFIG: OnceLock<CudaPagedRuntimeConfig> = OnceLock::new();
-    CONFIG.get_or_init(CudaPagedRuntimeConfig::from_env)
-}
 
 // ────────────────────────────────────────────────────────────────────────
 // Paged-varlen split-K scratch + dispatch
 // ────────────────────────────────────────────────────────────────────────
 
-/// Process-global scratch for split-K phase1 outputs. Three buffers
+/// Per-context scratch for split-K phase1 outputs. Three buffers
 /// (partial_out f32, partial_m f32, partial_l f32) sized to the largest
 /// shape ever requested. Same lazy-grow pattern as Marlin gather scratch.
-struct SplitKScratch {
+pub(super) struct SplitKScratch {
     partial_out: CudaSlice<f32>, // [M_total * num_q_heads * num_splits * head_dim]
     partial_m: CudaSlice<f32>,   // [M_total * num_q_heads * num_splits]
     partial_l: CudaSlice<f32>,   // [M_total * num_q_heads * num_splits]
     out_capacity: usize,
     ml_capacity: usize,
 }
-unsafe impl Send for SplitKScratch {}
-unsafe impl Sync for SplitKScratch {}
-
-static SPLIT_K_SCRATCH: std::sync::OnceLock<std::sync::RwLock<HashMap<usize, SplitKScratch>>> =
-    std::sync::OnceLock::new();
-
-fn split_k_scratch_slots() -> &'static std::sync::RwLock<HashMap<usize, SplitKScratch>> {
-    SPLIT_K_SCRATCH.get_or_init(|| std::sync::RwLock::new(HashMap::new()))
-}
-
 fn with_split_k_scratch<R>(
-    stream: &Arc<CudaStream>,
-    ordinal: usize,
+    ctx: &mut CudaState,
     out_required: usize,
     ml_required: usize,
     body: impl FnOnce(&mut CudaSlice<f32>, &mut CudaSlice<f32>, &mut CudaSlice<f32>) -> R,
 ) -> R {
-    let slots = split_k_scratch_slots();
-    {
-        let g = slots.read().expect("SPLIT_K_SCRATCH poisoned");
-        if let Some(s) = g.get(&ordinal) {
-            if s.out_capacity >= out_required && s.ml_capacity >= ml_required {
-                drop(g);
-                let mut w = slots.write().expect("SPLIT_K_SCRATCH poisoned");
-                let s = w.get_mut(&ordinal).expect("just observed Some");
-                return body(&mut s.partial_out, &mut s.partial_m, &mut s.partial_l);
-            }
+    let need_new = ctx
+        .split_k_scratch
+        .as_ref()
+        .is_none_or(|s| s.out_capacity < out_required || s.ml_capacity < ml_required);
+    if need_new {
+        assert!(
+            !ctx.capture_in_flight,
+            "split-K scratch growth during CUDA capture"
+        );
+        let partial_out = unsafe { ctx.stream.alloc::<f32>(out_required) }
+            .expect("split-K partial_out allocation");
+        let partial_m =
+            unsafe { ctx.stream.alloc::<f32>(ml_required) }.expect("split-K partial_m allocation");
+        let partial_l =
+            unsafe { ctx.stream.alloc::<f32>(ml_required) }.expect("split-K partial_l allocation");
+        let next = SplitKScratch {
+            partial_out,
+            partial_m,
+            partial_l,
+            out_capacity: out_required,
+            ml_capacity: ml_required,
+        };
+        if let Some(previous) = ctx.split_k_scratch.replace(next) {
+            ctx.captured_storage.push(Box::new(previous));
         }
     }
-    let mut w = slots.write().expect("SPLIT_K_SCRATCH poisoned");
-    let need_new = match w.get(&ordinal) {
-        Some(s) => s.out_capacity < out_required || s.ml_capacity < ml_required,
-        None => true,
+    let scratch = ctx
+        .split_k_scratch
+        .as_mut()
+        .expect("prepared split-K scratch");
+    body(
+        &mut scratch.partial_out,
+        &mut scratch.partial_m,
+        &mut scratch.partial_l,
+    )
+}
+
+/// Both preparation and dispatch use the original context's frozen policy.
+fn varlen_geometry(
+    ctx: &CudaState,
+    num_seqs: usize,
+    tokens: usize,
+    max_kv: usize,
+) -> PagedAttentionLaunchGeometry {
+    PagedAttentionLaunchGeometry::cuda_varlen(
+        ctx.configuration.cuda.split_k_attn,
+        num_seqs,
+        tokens,
+        max_kv,
+    )
+}
+
+fn varlen_phase(
+    ctx: &mut CudaState,
+    geometry: PagedAttentionLaunchGeometry,
+) -> Result<CudaFunction> {
+    let (module, name) = match geometry {
+        PagedAttentionLaunchGeometry::SinglePass { .. } => {
+            ("paged_varlen_attn", "paged_varlen_attn_f16")
+        }
+        PagedAttentionLaunchGeometry::SplitK { .. } => (
+            "paged_varlen_split_k_phase1",
+            "paged_varlen_attn_split_k_phase1_f16",
+        ),
     };
-    if need_new {
-        let partial_out = unsafe { stream.alloc::<f32>(out_required) }
-            .expect("SPLIT_K_SCRATCH partial_out alloc");
-        let partial_m =
-            unsafe { stream.alloc::<f32>(ml_required) }.expect("SPLIT_K_SCRATCH partial_m alloc");
-        let partial_l =
-            unsafe { stream.alloc::<f32>(ml_required) }.expect("SPLIT_K_SCRATCH partial_l alloc");
-        w.insert(
-            ordinal,
-            SplitKScratch {
-                partial_out,
-                partial_m,
-                partial_l,
-                out_capacity: out_required,
-                ml_capacity: ml_required,
-            },
-        );
+    let function = ctx.func(module, ptx::PAGED_VARLEN_ATTENTION, name);
+    let shared = geometry.shared_bytes()?;
+    if shared > 48 * 1024 {
+        let shared = i32::try_from(shared)
+            .map_err(|_| FerrumError::model("paged attention dynamic shared extent exceeds i32"))?;
+        function.set_attribute(
+            cudarc::driver::sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+            shared,
+        ).map_err(|error| FerrumError::model(format!("paged attention shared-memory opt-in: {error}")))?;
     }
-    let s = w.get_mut(&ordinal).expect("just allocated");
-    body(&mut s.partial_out, &mut s.partial_m, &mut s.partial_l)
+    Ok(function)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -224,37 +146,26 @@ fn paged_varlen_split_k_dispatch(
     block_tables: &CudaSlice<u32>,
     num_seqs: usize,
     total_q_tokens: usize,
-    max_kv_len: usize,
     num_heads: usize,
     num_kv_heads: usize,
     head_dim: usize,
     sliding_window: usize,
     block_size: usize,
     max_blocks_per_seq: usize,
+    geometry: PagedAttentionLaunchGeometry,
 ) -> Result<()> {
-    // Pick num_splits based on kv_len. Microbench peak points:
-    //   kv ≤ 384  → N=2 (or skip if c≥16)
-    //   kv ≤ 1024 → N=4
-    //   kv ≤ 2048 → N=8
-    //   else      → N=16
-    let num_splits: usize = match max_kv_len {
-        kv if kv <= 384 => 2,
-        kv if kv <= 1024 => 4,
-        kv if kv <= 2048 => 8,
-        _ => 16,
+    let PagedAttentionLaunchGeometry::SplitK { num_splits, .. } = geometry else {
+        return Err(FerrumError::model(
+            "split-K dispatcher received a different launch route",
+        ));
     };
-
-    let chunk = (max_kv_len + num_splits - 1) / num_splits;
-    let out_required = total_q_tokens * num_heads * num_splits * head_dim;
-    let ml_required = total_q_tokens * num_heads * num_splits;
+    let (out_required, ml_required) = geometry
+        .split_scratch(total_q_tokens, num_heads, head_dim)?
+        .expect("split-K geometry");
     let scale: f32 = 1.0 / (head_dim as f32).sqrt();
     let stream = ctx.stream.clone();
 
-    let phase1 = ctx.func(
-        "paged_varlen_split_k_phase1",
-        ptx::PAGED_VARLEN_ATTENTION,
-        "paged_varlen_attn_split_k_phase1_f16",
-    );
+    let phase1 = varlen_phase(ctx, geometry)?;
     let reduce = ctx.func(
         "paged_varlen_split_k_reduce",
         ptx::PAGED_VARLEN_ATTENTION,
@@ -262,8 +173,7 @@ fn paged_varlen_split_k_dispatch(
     );
 
     with_split_k_scratch(
-        &stream,
-        ctx.ordinal,
+        ctx,
         out_required,
         ml_required,
         |partial_out, partial_m, partial_l| {
@@ -305,7 +215,7 @@ fn paged_varlen_split_k_dispatch(
             b1.arg(&scale);
             b1.arg(&swi);
             b1.arg(&nsp);
-            let shmem1 = (chunk.max(1) as u32) * 4;
+            let shmem1 = geometry.shared_bytes()?;
             unsafe {
                 b1.launch(LaunchConfig {
                     grid_dim: (num_heads as u32, total_q_tokens as u32, num_splits as u32),
@@ -387,7 +297,7 @@ fn paged_batched_flash_dispatch(
     //                          count, even when kv≤768; old "splits=2 +5%" claim was
     //                          measured under sync-instrumented bench).
     // Override via FERRUM_PAGED_FLASH_SPLITS for tuning.
-    let force_splits = cuda_paged_runtime_config().paged_flash_splits;
+    let force_splits = ctx.configuration.cuda.paged_flash_splits;
     // 128 SMs on Ada/Hopper-class; conservative under-estimate.
     const SM_TARGET: usize = 128;
     let base_grid = num_seqs * num_heads;
@@ -457,10 +367,10 @@ fn paged_batched_flash_dispatch(
         ptx::PAGED_DECODE_ATTENTION,
         "paged_batched_flash_decode_reduce_f16",
     );
+    let safe_kv = ctx.configuration.cuda.kv_capacity;
 
     with_split_k_scratch(
-        &stream,
-        ctx.ordinal,
+        ctx,
         out_required,
         ml_required,
         |partial_out, partial_m, partial_l| {
@@ -497,7 +407,6 @@ fn paged_batched_flash_dispatch(
             b1.arg(&nsp);
             // Match graph-capture sizing rationale used elsewhere — size
             // shared to FERRUM_KV_CAPACITY ceiling, not current chunk.
-            let safe_kv = cuda_paged_runtime_config().kv_capacity;
             let safe_chunk = (safe_kv + num_splits - 1) / num_splits;
             let shmem1 = (safe_chunk.max(chunk).max(1) as u32) * 4;
             unsafe {
@@ -574,7 +483,7 @@ fn paged_batched_decode_single_pass(
     // builder so we can opt into the extended dynamic-shared limit if the
     // request exceeds the 48 KB default — without the opt-in cuLaunchKernel
     // returns CUDA_ERROR_INVALID_VALUE.
-    let safe_kv_max = cuda_paged_runtime_config().kv_capacity;
+    let safe_kv_max = ctx.configuration.cuda.kv_capacity;
     let shared_kv = safe_kv_max.max(max_kv_len).max(1);
     let shared_bytes = (shared_kv as u32) * 4;
     if shared_bytes > 48 * 1024 {
@@ -614,6 +523,9 @@ impl BackendPagedKv for CudaBackend {
     /// wall time at c=16). Override via FERRUM_METAL_PAGED_KV=0 if a
     /// caller specifically wants legacy contig KV.
     fn supports_paged_kv() -> bool {
+        true
+    }
+    fn supports_windowed_paged_attention() -> bool {
         true
     }
     fn supports_varlen_qkv() -> bool {
@@ -847,98 +759,60 @@ impl BackendPagedKv for CudaBackend {
             ));
         }
 
+        if ctx.capture_in_flight {
+            return Err(FerrumError::backend(
+                "batched pointer preparation must precede capture",
+            ));
+        }
         let stream = ctx.stream.clone();
-        // Lazy-alloc all three device scratch buffers to HOST_STAGING_TOTAL
-        // u64 elements. Done outside any captured stream — sync allocs only.
-        if ctx.batched_scratch_u64_cache.is_none() {
-            ctx.batched_scratch_u64_cache = Some(
-                stream
-                    .alloc_zeros::<u64>(HOST_STAGING_TOTAL)
-                    .map_err(|e| FerrumError::model(format!("alloc cache_ptrs: {e}")))?,
-            );
-        }
-        if ctx.batched_scratch_u64_k.is_none() {
-            ctx.batched_scratch_u64_k = Some(
-                stream
-                    .alloc_zeros::<u64>(HOST_STAGING_TOTAL)
-                    .map_err(|e| FerrumError::model(format!("alloc k_ptrs: {e}")))?,
-            );
-        }
-        if ctx.batched_scratch_u64_v.is_none() {
-            ctx.batched_scratch_u64_v = Some(
-                stream
-                    .alloc_zeros::<u64>(HOST_STAGING_TOTAL)
-                    .map_err(|e| FerrumError::model(format!("alloc v_ptrs: {e}")))?,
-            );
-        }
-        // Fill host arrays at every slot we'll launch from. Layout:
-        //   K-append (kv_cache_append): slot = li → host_cache_ptrs[li * CAP ..]
-        //   V-append (kv_cache_append): slot = li + MAX_LAYERS_FOR_GRAPH
-        //   flash_attn:                 slot = li → host_k_ptrs / host_v_ptrs
-        for li in 0..num_layers {
-            let k_off = li * BATCHED_SCRATCH_CAP;
-            let v_off = (li + super::MAX_LAYERS_FOR_GRAPH) * BATCHED_SCRATCH_CAP;
-            for i in 0..m {
-                let (kp, _) = k_caches[li * m + i].as_f16().device_ptr(&stream);
-                let (vp, _) = v_caches[li * m + i].as_f16().device_ptr(&stream);
-                ctx.batched_host_cache_ptrs[k_off + i] = kp;
-                ctx.batched_host_cache_ptrs[v_off + i] = vp;
-                ctx.batched_host_k_ptrs[k_off + i] = kp;
-                ctx.batched_host_v_ptrs[k_off + i] = vp;
+        // These are the SAME original-context arrays consumed by append and
+        // attention nodes, with distinct slots for every layer and K/V role.
+        // Graph nodes upload them on each replay; no second device-table owner
+        // or temporary host allocation is introduced here.
+        super::with_batched_scratch_mut(&mut ctx.batched_scratch, |tables| {
+            for li in 0..num_layers {
+                let k_off = li * BATCHED_SCRATCH_CAP;
+                let v_off = (li + super::MAX_LAYERS_FOR_GRAPH) * BATCHED_SCRATCH_CAP;
+                for i in 0..m {
+                    let (kp, _) = k_caches[li * m + i].as_f16().device_ptr(&stream);
+                    let (vp, _) = v_caches[li * m + i].as_f16().device_ptr(&stream);
+                    tables.host_cache_ptrs[k_off + i] = kp;
+                    tables.host_cache_ptrs[v_off + i] = vp;
+                    tables.host_k_ptrs[k_off + i] = kp;
+                    tables.host_v_ptrs[k_off + i] = vp;
+                }
             }
-        }
-        // Bind context for sync memcpys (tokio thread-shift safe).
-        ctx.ctx
-            .bind_to_thread()
-            .map_err(|e| FerrumError::unsupported(format!("populate bind_to_thread: {e}")))?;
-
-        // Sync memcpy each entire host array to its device scratch in one shot.
-        // cuMemcpyHtoD_v2 is on the legacy default (null) stream → NOT
-        // captured by stream capture, so the captured graph contains
-        // only kernel launches. Device scratch is fresh before every
-        // call, including pure-replay (which doesn't re-enter Rust).
-        let total_bytes = HOST_STAGING_TOTAL * std::mem::size_of::<u64>();
-        unsafe {
-            use cudarc::driver::{sys, DevicePtrMut};
-            let scratch_cache = ctx.batched_scratch_u64_cache.as_mut().unwrap();
-            let (dst, _g) = scratch_cache.device_ptr_mut(&stream);
-            let st = sys::cuMemcpyHtoD_v2(
-                dst,
-                ctx.batched_host_cache_ptrs.as_ptr() as *const std::ffi::c_void,
-                total_bytes,
-            );
-            if st != sys::CUresult::CUDA_SUCCESS {
-                return Err(FerrumError::unsupported(format!(
-                    "populate cache_ptrs sync memcpy: {st:?}"
-                )));
-            }
-            let scratch_k = ctx.batched_scratch_u64_k.as_mut().unwrap();
-            let (dst, _g) = scratch_k.device_ptr_mut(&stream);
-            let st = sys::cuMemcpyHtoD_v2(
-                dst,
-                ctx.batched_host_k_ptrs.as_ptr() as *const std::ffi::c_void,
-                total_bytes,
-            );
-            if st != sys::CUresult::CUDA_SUCCESS {
-                return Err(FerrumError::unsupported(format!(
-                    "populate k_ptrs sync memcpy: {st:?}"
-                )));
-            }
-            let scratch_v = ctx.batched_scratch_u64_v.as_mut().unwrap();
-            let (dst, _g) = scratch_v.device_ptr_mut(&stream);
-            let st = sys::cuMemcpyHtoD_v2(
-                dst,
-                ctx.batched_host_v_ptrs.as_ptr() as *const std::ffi::c_void,
-                total_bytes,
-            );
-            if st != sys::CUresult::CUDA_SUCCESS {
-                return Err(FerrumError::unsupported(format!(
-                    "populate v_ptrs sync memcpy: {st:?}"
-                )));
-            }
-        }
+        });
         Ok(())
     }
+
+    fn prepare_paged_varlen_attention(
+        ctx: &mut Self::Context,
+        num_seqs: usize,
+        total_q_tokens: usize,
+        max_kv_len: usize,
+        num_heads: usize,
+        head_dim: usize,
+    ) -> Result<PagedAttentionLaunchGeometry> {
+        if ctx.capture_in_flight {
+            return Err(FerrumError::unsupported(
+                "varlen attention preparation must precede capture",
+            ));
+        }
+        let geometry = varlen_geometry(ctx, num_seqs, total_q_tokens, max_kv_len);
+        // Load the same phase and validate extended shared memory before capture.
+        let _ = varlen_phase(ctx, geometry)?;
+        if let Some((out, ml)) = geometry.split_scratch(total_q_tokens, num_heads, head_dim)? {
+            with_split_k_scratch(ctx, out, ml, |_, _, _| ());
+            let _ = ctx.func(
+                "paged_varlen_split_k_reduce",
+                ptx::PAGED_VARLEN_ATTENTION,
+                "paged_varlen_split_k_reduce_f16",
+            );
+        }
+        Ok(geometry)
+    }
+
     fn paged_varlen_attention(
         ctx: &mut Self::Context,
         q: &Self::Buffer,
@@ -973,12 +847,9 @@ impl BackendPagedKv for CudaBackend {
         // (4800 × 32 × 8 × 128 × 4 ≈ 628 MB). Skip split-K when the grid
         // is already well-occupied via q-tokens (>64) — the per-call
         // transient cost dominates any kernel win.
-        let use_split_k = match cuda_paged_runtime_config().split_k_attn {
-            Some(force) => force,
-            None => total_q_tokens <= 64 && (num_seqs <= 4 || max_kv_len >= 768),
-        };
+        let geometry = varlen_geometry(ctx, num_seqs, total_q_tokens, max_kv_len);
 
-        if use_split_k {
+        if matches!(geometry, PagedAttentionLaunchGeometry::SplitK { .. }) {
             return paged_varlen_split_k_dispatch(
                 ctx,
                 q.as_f16(),
@@ -990,21 +861,17 @@ impl BackendPagedKv for CudaBackend {
                 block_tables.as_u32(),
                 num_seqs,
                 total_q_tokens,
-                max_kv_len,
                 num_heads,
                 num_kv_heads,
                 head_dim,
                 sliding_window,
                 block_size,
                 max_blocks_per_seq,
+                geometry,
             );
         }
 
-        let func = ctx.func(
-            "paged_varlen_attn",
-            ptx::PAGED_VARLEN_ATTENTION,
-            "paged_varlen_attn_f16",
-        );
+        let func = varlen_phase(ctx, geometry)?;
         let scale: f32 = 1.0 / (head_dim as f32).sqrt();
         let stream = ctx.stream.clone();
         // After B-2 typed-buffer migration: integer scratch
@@ -1025,28 +892,8 @@ impl BackendPagedKv for CudaBackend {
         let mbps = max_blocks_per_seq as i32;
         let bsi = block_size as i32;
         let swi = sliding_window as i32;
-        // Compute shared_bytes BEFORE the launch builder so we can opt into
-        // the extended dynamic shared-memory limit if needed.
-        //
-        // CUDA graph capture freezes `shared_mem_bytes` at capture time. The
-        // unified graph key carries the same power-of-two KV bucket, so replay
-        // remains safe while short-context batches avoid reserving the whole
-        // configured context window per CTA.
-        let shared_kv = crate::backend::attention_score_capacity_bucket(max_kv_len);
-        let shared_bytes = (shared_kv as u32) * 4;
-        // If shared exceeds the default 48 KB per-block budget, opt into
-        // the extended limit (sm_89/Hopper/Blackwell support up to
-        // 100/228 KB). Without this opt-in, cuLaunchKernel returns
-        // CUDA_ERROR_INVALID_VALUE — exactly the panic observed on the
-        // 3rd `ferrum run` chat turn when Chat-profile autosizer sets
-        // FERRUM_KV_CAPACITY=16384 (= 64 KB shared) and the long-context
-        // prefill (q_len>64) routes through the non-split-K path.
-        if shared_bytes > 48 * 1024 {
-            let _ = func.set_attribute(
-                cudarc::driver::sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
-                shared_bytes as i32,
-            );
-        }
+        // Preparation, dispatch and graph equality share this exact extent.
+        let shared_bytes = geometry.shared_bytes()?;
         let mut b = stream.launch_builder(&func);
         b.arg(&qv);
         b.arg(&kp);
@@ -1095,7 +942,7 @@ impl BackendPagedKv for CudaBackend {
         max_blocks_per_seq: usize,
     ) -> Result<()> {
         #[cfg(feature = "fa2-source")]
-        if cuda_paged_runtime_config().fa2_source {
+        if ctx.configuration.cuda.fa2_source {
             return super::fa2_source::paged_varlen_attention_fa2_source(
                 super::fa2_source::Fa2SourcePagedVarlenArgs {
                     stream: &ctx.stream,
@@ -1121,6 +968,9 @@ impl BackendPagedKv for CudaBackend {
         }
 
         super::fa2_ffi::paged_varlen_attention_fa2_ffi(
+            ctx.fa2_shim.as_ref().ok_or_else(|| {
+                FerrumError::unsupported("FA2 direct FFI requires an explicitly configured shim")
+            })?,
             &ctx.stream,
             q.as_f16(),
             k_pool.as_f16(),
@@ -1168,10 +1018,17 @@ impl BackendPagedKv for CudaBackend {
         block_size: usize,
         max_num_blocks_per_seq: usize,
         q_len: usize,
+        sliding_window: usize,
+        host_context_lens: Option<&[u32]>,
     ) -> Result<()> {
-        let max_kv_len = block_size * max_num_blocks_per_seq;
+        if q_len == 0 || num_seqs == 0 {
+            return Ok(());
+        }
+        let max_kv_len = block_size
+            .checked_mul(max_num_blocks_per_seq)
+            .ok_or_else(|| FerrumError::model("paged attention capacity overflow"))?;
 
-        if q_len == 1 {
+        if q_len == 1 && sliding_window == 0 {
             return Self::paged_batched_decode_attention(
                 ctx,
                 q,
@@ -1191,43 +1048,124 @@ impl BackendPagedKv for CudaBackend {
         }
 
         // q_len > 1: this prefill wrapper accepts one sequence per call.
-        if num_seqs != 1 {
+        if q_len > 1 && num_seqs != 1 {
             return Err(FerrumError::model(format!(
                 "paged_decode_attention(CUDA): q_len={q_len} num_seqs={num_seqs} \
                  not supported (caller must split prefill into per-seq calls)"
             )));
         }
 
-        // Build cu_seqlens_q = [0, q_len] and pos_offsets = [final_kv_len - q_len].
-        // alloc_u32 + write_u32 (NOT from_slice_i32 — that default goes
-        // through f32→f16 and zeroes the bit pattern).
-        // Need final_kv_len from context_lens[0] — D2H 4 bytes (cold path).
-        // Post-Phase-B-2 context_lens is `CudaBuf::U32` (typed), so we read
-        // the U32 variant directly — the prior `transmute::<u32>` route was
-        // for the f16-bit-tunneled allocation that B-2 retired.
-        let cl_host: Vec<u32> = {
-            let stream = ctx.stream.clone();
-            let view = context_lens.as_u32().slice(0..1);
-            let mut h = vec![0u32; 1];
-            stream
-                .memcpy_dtoh(&view, h.as_mut_slice())
-                .map_err(|e| FerrumError::model(format!("dtoh context_lens: {e}")))?;
-            stream
-                .synchronize()
-                .map_err(|e| FerrumError::model(format!("dtoh sync: {e}")))?;
-            h
-        };
-        let final_kv_len = cl_host[0] as usize;
-        if final_kv_len < q_len {
-            return Err(FerrumError::model(format!(
-                "paged_decode_attention(CUDA): final_kv_len={final_kv_len} < q_len={q_len}"
-            )));
+        // This wrapper reads host lengths and prepares metadata. A graph must
+        // instead call the device-staged varlen entry with durable caller views.
+        if ctx.capture_in_flight {
+            return Err(FerrumError::unsupported(
+                "windowed/prefill paged wrapper must prepare metadata outside graph capture",
+            ));
         }
-        let pos_offset = (final_kv_len - q_len) as u32;
-        let mut cu_seqlens_q_buf = <Self as Backend>::alloc_typed(crate::backend::Dtype::U32, 2);
-        <Self as Backend>::write_typed::<u32>(ctx, &mut cu_seqlens_q_buf, &[0u32, q_len as u32]);
-        let mut pos_offsets_buf = <Self as Backend>::alloc_typed(crate::backend::Dtype::U32, 1);
-        <Self as Backend>::write_typed::<u32>(ctx, &mut pos_offsets_buf, &[pos_offset]);
+        let total_q_tokens = num_seqs
+            .checked_mul(q_len)
+            .ok_or_else(|| FerrumError::model("paged query extent overflow"))?;
+        // The producer already owns these exact lengths. Do not read them
+        // back from the device, which would add a barrier at every local layer.
+        // Preserve only the existing full-attention prefill fallback for direct
+        // callers that do not have a host projection.
+        let copied_lengths;
+        let cl_host = match host_context_lens {
+            Some(lengths) if lengths.len() == num_seqs => lengths,
+            Some(_) => return Err(FerrumError::model("paged host context length count mismatch")),
+            None if sliding_window != 0 => return Err(FerrumError::unsupported(
+                "windowed paged attention requires original host lengths or device-staged varlen metadata",
+            )),
+            None => {
+                let stream = ctx.stream.clone();
+                let view = context_lens.as_u32().slice(0..num_seqs);
+                let mut h = vec![0u32; num_seqs];
+                stream.memcpy_dtoh(&view, h.as_mut_slice())
+                    .map_err(|e| FerrumError::model(format!("dtoh context_lens: {e}")))?;
+                stream.synchronize()
+                    .map_err(|e| FerrumError::model(format!("dtoh sync: {e}")))?;
+                copied_lengths = h;
+                &copied_lengths
+            }
+        };
+        let mut cu_seqlens = Vec::with_capacity(num_seqs + 1);
+        for seq in 0..=num_seqs {
+            cu_seqlens.push(
+                u32::try_from(
+                    seq.checked_mul(q_len)
+                        .ok_or_else(|| FerrumError::model("paged query offset overflow"))?,
+                )
+                .map_err(|_| FerrumError::model("paged query offset exceeds u32"))?,
+            );
+        }
+        let positions: Vec<u32> = cl_host
+            .iter()
+            .map(|&len| {
+                (len as usize)
+                    .checked_sub(q_len)
+                    .and_then(|pos| u32::try_from(pos).ok())
+                    .ok_or_else(|| FerrumError::model("paged query exceeds final KV length"))
+            })
+            .collect::<Result<_>>()?;
+        let final_kv_len = cl_host.iter().copied().max().unwrap() as usize;
+        if final_kv_len > max_kv_len {
+            return Err(FerrumError::model(
+                "paged context exceeds declared block-table capacity",
+            ));
+        }
+        if ctx.paged_attn_metadata_capacity < num_seqs {
+            let grown = num_seqs.checked_next_power_of_two().unwrap_or(num_seqs);
+            let stream = ctx.stream.clone();
+            let next_cu = crate::backend::CudaBuf::from_u32(
+                stream
+                    .alloc_zeros::<u32>(grown + 1)
+                    .map_err(|e| FerrumError::model(format!("paged query metadata: {e}")))?,
+            );
+            if let Some(previous) = ctx.paged_attn_cu_seqlens.replace(next_cu) {
+                ctx.captured_storage.push(Box::new(previous));
+            }
+            let next_pos = crate::backend::CudaBuf::from_u32(
+                stream
+                    .alloc_zeros::<u32>(grown)
+                    .map_err(|e| FerrumError::model(format!("paged position metadata: {e}")))?,
+            );
+            if let Some(previous) = ctx.paged_attn_pos_offsets.replace(next_pos) {
+                ctx.captured_storage.push(Box::new(previous));
+            }
+            ctx.paged_attn_metadata_capacity = grown;
+        }
+        // The original context owns these allocations through all queued work.
+        // Backend writes/varlen dispatch do not mutate these metadata fields.
+        let cu_ptr = ctx.paged_attn_cu_seqlens.as_mut().unwrap() as *mut crate::backend::CudaBuf;
+        let pos_ptr = ctx.paged_attn_pos_offsets.as_mut().unwrap() as *mut crate::backend::CudaBuf;
+        unsafe {
+            <Self as Backend>::write_typed::<u32>(ctx, &mut *cu_ptr, &cu_seqlens);
+            <Self as Backend>::write_typed::<u32>(ctx, &mut *pos_ptr, &positions);
+        }
+        if q_len == 1 {
+            // For one query per sequence, token/head-major layouts coincide.
+            return unsafe {
+                Self::paged_varlen_attention(
+                    ctx,
+                    q,
+                    k_pool,
+                    v_pool,
+                    out,
+                    &*cu_ptr,
+                    &*pos_ptr,
+                    block_tables,
+                    num_seqs,
+                    total_q_tokens,
+                    final_kv_len,
+                    num_heads,
+                    num_kv_heads,
+                    head_dim,
+                    sliding_window,
+                    block_size,
+                    max_num_blocks_per_seq,
+                )
+            };
+        }
 
         // The paged-write kernel produces q_out[token, head, dim], which
         // paged_varlen_attention reads directly. Its output is also
@@ -1241,17 +1179,24 @@ impl BackendPagedKv for CudaBackend {
         if ctx.paged_attn_out_tm_capacity < q_n {
             let stream = ctx.stream.clone();
             let n_grown = q_n.next_power_of_two().max(q_n);
-            ctx.paged_attn_out_tm = Some(crate::backend::CudaBuf::from_f16(
+            assert!(
+                !ctx.capture_in_flight,
+                "paged output scratch growth during CUDA capture"
+            );
+            let next = crate::backend::CudaBuf::from_f16(
                 stream
                     .alloc_zeros::<f16>(n_grown)
                     .map_err(|e| FerrumError::model(format!("alloc paged_attn_out_tm: {e}")))?,
-            ));
+            );
+            if let Some(previous) = ctx.paged_attn_out_tm.replace(next) {
+                ctx.captured_storage.push(Box::new(previous));
+            }
             ctx.paged_attn_out_tm_capacity = n_grown;
         }
 
-        // SAFETY: paged_varlen_attention only touches ctx.modules and
-        // ctx.stream (disjoint from paged_attn_out_tm). Same for
-        // transpose_token_to_head. We take a raw pointer to the cached
+        // SAFETY: varlen dispatch and transpose may update other context
+        // scratch, but do not replace the metadata/output fields above.
+        // We take a raw pointer to the cached
         // buffer so we can pass it as a normal &mut/& while ctx is also
         // borrowed by the kernel-call methods.
         let out_tm_ptr: *mut crate::backend::CudaBuf =
@@ -1265,8 +1210,8 @@ impl BackendPagedKv for CudaBackend {
                 k_pool,
                 v_pool,
                 &mut *out_tm_ptr,
-                &cu_seqlens_q_buf,
-                &pos_offsets_buf,
+                &*cu_ptr,
+                &*pos_ptr,
                 block_tables,
                 1,
                 q_len,
@@ -1274,7 +1219,7 @@ impl BackendPagedKv for CudaBackend {
                 num_heads,
                 num_kv_heads,
                 head_dim,
-                0,
+                sliding_window,
                 block_size,
                 max_num_blocks_per_seq,
             )?;
@@ -1319,7 +1264,7 @@ impl BackendPagedKv for CudaBackend {
         // saturates SMs at low kv. Bench M3 c=1/8/16/32 across +21% / +3% /
         // +3.5% / +10.8% over the single-pass kernel — every concurrency
         // wins. Set FERRUM_PAGED_FLASH=0 to opt out.
-        if cuda_paged_runtime_config().paged_flash {
+        if ctx.configuration.cuda.paged_flash {
             return paged_batched_flash_dispatch(
                 ctx,
                 q.as_f16(),
@@ -1373,7 +1318,7 @@ impl BackendPagedKv for CudaBackend {
         // Same shared-mem sizing rationale as paged_varlen_attention
         // (graph capture freezes shared_mem_bytes; size to
         // FERRUM_KV_CAPACITY ceiling).
-        let shared_kv = cuda_paged_runtime_config().shared_kv_for(max_kv_len);
+        let shared_kv = ctx.configuration.cuda.shared_kv_for(max_kv_len);
         let shared_bytes = (shared_kv as u32) * 4;
         unsafe {
             b.launch(LaunchConfig {
@@ -1726,10 +1671,8 @@ impl BackendPagedKv for CudaBackend {
         if num_seqs == 0 {
             return Ok(());
         }
-        let stream = ctx.stream.clone();
         super::vllm_paged_attn::dispatch_paged_attention_v2(
-            &stream,
-            ctx.ordinal,
+            ctx,
             out.as_f16_mut(),
             q.as_f16(),
             k_pool.as_f16(),
@@ -1792,20 +1735,28 @@ impl BackendPagedKv for CudaBackend {
             )));
         }
         let pos_offset = (final_kv_len - q_len) as u32;
-        let mut cu_seqlens_q_buf = <Self as Backend>::alloc_typed(crate::backend::Dtype::U32, 2);
+        let mut cu_seqlens_q_buf =
+            <Self as Backend>::alloc_typed_in_context(ctx, crate::backend::Dtype::U32, 2);
         <Self as Backend>::write_typed::<u32>(ctx, &mut cu_seqlens_q_buf, &[0u32, q_len as u32]);
-        let mut pos_offsets_buf = <Self as Backend>::alloc_typed(crate::backend::Dtype::U32, 1);
+        let mut pos_offsets_buf =
+            <Self as Backend>::alloc_typed_in_context(ctx, crate::backend::Dtype::U32, 1);
         <Self as Backend>::write_typed::<u32>(ctx, &mut pos_offsets_buf, &[pos_offset]);
 
         let q_n = q_len * num_heads * head_dim;
         if ctx.paged_attn_out_tm_capacity < q_n {
             let stream = ctx.stream.clone();
             let n_grown = q_n.next_power_of_two().max(q_n);
-            ctx.paged_attn_out_tm = Some(crate::backend::CudaBuf::from_f16(
-                stream.alloc_zeros::<f16>(n_grown).map_err(|e| {
-                    FerrumError::model(format!("alloc paged_attn_out_tm vllm: {e}"))
-                })?,
-            ));
+            assert!(
+                !ctx.capture_in_flight,
+                "paged output scratch growth during CUDA capture"
+            );
+            let next =
+                crate::backend::CudaBuf::from_f16(stream.alloc_zeros::<f16>(n_grown).map_err(
+                    |e| FerrumError::model(format!("alloc paged_attn_out_tm vllm: {e}")),
+                )?);
+            if let Some(previous) = ctx.paged_attn_out_tm.replace(next) {
+                ctx.captured_storage.push(Box::new(previous));
+            }
             ctx.paged_attn_out_tm_capacity = n_grown;
         }
 
@@ -1816,7 +1767,7 @@ impl BackendPagedKv for CudaBackend {
         );
         let scale: f32 = 1.0 / (head_dim as f32).sqrt();
         let stream = ctx.stream.clone();
-        let shared_kv = cuda_paged_runtime_config().shared_kv_for(final_kv_len);
+        let shared_kv = ctx.configuration.cuda.shared_kv_for(final_kv_len);
         let shared_bytes = (shared_kv as u32) * 4;
         if shared_bytes > 48 * 1024 {
             let _ = func.set_attribute(
@@ -1907,7 +1858,7 @@ impl BackendPagedKv for CudaBackend {
         );
         let scale: f32 = 1.0 / (head_dim as f32).sqrt();
         let stream = ctx.stream.clone();
-        let shared_kv = cuda_paged_runtime_config().shared_kv_for(max_kv_len);
+        let shared_kv = ctx.configuration.cuda.shared_kv_for(max_kv_len);
         let shared_bytes = (shared_kv as u32) * 4;
         if shared_bytes > 48 * 1024 {
             let _ = func.set_attribute(
@@ -1986,7 +1937,7 @@ impl BackendPagedKv for CudaBackend {
         );
         let scale: f32 = 1.0 / (head_dim as f32).sqrt();
         let stream = ctx.stream.clone();
-        let shared_kv = cuda_paged_runtime_config().shared_kv_for(max_kv_len);
+        let shared_kv = ctx.configuration.cuda.shared_kv_for(max_kv_len);
         let shared_bytes = (4 * shared_kv as u32) * 4;
         if shared_bytes > 48 * 1024 {
             let _ = func.set_attribute(
