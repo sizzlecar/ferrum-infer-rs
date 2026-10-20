@@ -65,6 +65,8 @@ ferrum serve --model qwen3.5:4b-q4_k_m --served-model-name ferrum --disable-thin
 
 并非任意架构、格式和设备组合都受支持，也不由文本支持推断视觉能力；范围见[回归目录](docs/release-regression-catalog.md)。
 
+本次架构更新退役 embedding、ASR、TTS 入口及旧执行 API，升级见[迁移说明](docs/goal-architecture-refactor.zh.md)。
+
 默认执行策略按设备、算子能力和容量选择；合资格的 SM120 GGUF 路径可采用 8 位激活量化及整数点积，数值路径或批布局可能改变输出。`--numerical-profile qwen3_5.f32-master` 保留原混合精度参考路径，见[数值执行策略](docs/numerical-execution.zh.md)与[缓存说明](docs/cache-product.md)。
 
 ## 近期性能
@@ -93,7 +95,7 @@ RTX 5090、Qwen3.8-27B、固定 ShareGPT 样本；服务容量保持 32 槽、�
 
 多档延迟 SLO 未通过；吞吐过线不代表 SLO 达成。INT4 对比中 Ferrum 的激活/KV 为 FP16，vLLM 为 BF16；C32 第二轮比例为 **78.91%**，未证明每轮稳定达到 80%。同 GGUF 文件也不等于内部算术相同，零协议错误不等于所有回答语义正确。这些结果仅覆盖上述模型、硬件与负载。
 
-完整配置、TTFT/TPOT/可见 SSE ITL 的 P50/P99、显存与内存峰值、质量边界见[结果与决定](docs/performance-popular-models-p0.zh.md)。联合 SLO 优化安排在下一版本。
+完整配置、TTFT/TPOT/可见 SSE ITL 的 P50/P99、显存与内存峰值、质量边界见[结果与决定](docs/performance-popular-models-p0.zh.md)。本次重构建立执行与控制接口；吞吐和延迟的联合优化仍属后续工作。
 
 ## 项目说明
 

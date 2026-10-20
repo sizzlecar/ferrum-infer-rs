@@ -4,7 +4,7 @@
 
 R0 六批退役与修复已合并（PR #429–#434）。执行契约、runtime、受管驱动、输出及生产日志已分责，旧控制流和重复资源管理已退出。原实例的构建失败、执行、取消与关闭，以及真实 CPU mixed 执行和 Metal 前缀恢复闭环均已验证；必需 CI 检查通过。27B GGUF 在两种受控布局下新旧版本完整生成一致，不据此宣称历史 HTTP 差异已唯一归因或任意调度顺序输出不变。
 
-正式 CT C8/C32 与 Metal C8 的相对吞吐、延迟预算通过，CT 采样设备内存预算通过；GGUF 正式对照、Metal C4 和当前 Metal 设备内存仍待收尾。CT C32 两臂的绝对延迟 SLO 均未达标，Metal 未声明有限绝对 SLO。双物理 GPU 仍未实测，Metal 计时计数器间歇分配失败仍是已知限制。详细证据留在仓外，不将本次重构扩大为全工作负载 SLO 优化。
+当前候选的 CUDA 27B GGUF/CT C32 新鲜同窗对照通过相对吞吐、延迟和采样设备内存预算；CT C8 的既有资格按原证据范围保留。Metal C8 新鲜对照通过客户端相对吞吐和延迟预算，设备内存 A/B 及 C4 延迟波动仍待收尾。CUDA C32 两臂的绝对延迟 SLO 均未达标，Metal 未声明有限绝对 SLO。双物理 GPU 仍未实测，Metal 计时计数器间歇分配失败仍是已知限制。详细证据留在仓外，不将本次重构扩大为全工作负载 SLO 优化。
 
 ## 1. 目标与第一原则
 
@@ -45,7 +45,7 @@ R0 六批退役与修复已合并（PR #429–#434）。执行契约、runtime�
 
 MoE API 迁移：移除旧 `Qwen3MoeModel`、`Qwen3MoeConfig`、`Qwen3MoeLayer` 和独立 `GgufRuntime`；通过产品来源注册入口使用保留的 typed MoE。旧 CPU MoE 整模型路径随之退役，CPU 路由/dispatch 数值参考不代表 typed CPU MoE 可运行。旧 MoE graph/batch 专属选项明确拒绝；`[runtime]` 未知字段及已有 `ferrum.toml` 的读取/解析错误会报错，缺少配置文件仍使用默认值。
 
-观测 API 迁移：移除 bench-core 全局 profile/trace writer、旧算子计数诊断与 native profile set/clear 导出；历史 `ProfileEvent` 解析保留。`run` / `serve` 显式指定日志路径时统一使用实例产品 schema，`Off` 仍不采集设备计时或计算事实。旧诊断配置明确拒绝；保留的 serve metadata 参数仅作为用户声明。MoE native 包升级至 operator ABI 2，数学入口签名不变；旧包须更换，不能仅删除 Rust 调用后继续链接旧 writer。
+观测 API 迁移：移除 bench-core 全局 profile/trace writer、旧算子计数诊断与 native profile set/clear 导出；历史 `ProfileEvent` 解析保留。`run` / `serve` 显式指定日志路径时统一使用实例产品 schema，`Off` 仍不采集设备计时或计算事实。旧诊断配置明确拒绝；保留的 serve metadata 参数仅作为用户声明。classic Marlin 使用 operator ABI 2，MoE Marlin 使用 operator ABI 3；共享 descriptor ABI 2 和数学入口签名保留。CUDA 源码构建须使用更新的锁定算子包，不能继续链接旧 writer。
 
 后端配置 API：`Backend::new_context(&BackendContextConfig)` 返回可失败的原实例，`context_config` 提供加载与执行共享的不可变策略；移除设备选择 TLS，layer stage 显式绑定设备。库直接构造使用固定默认配置，CLI 仅在冷装配解析来源。Metal 默认设备目录与弱 mmap 索引、独立 CUDA decode 诊断及 native override 仍有各自边界，不据此宣称所有全局状态已消除。
 
