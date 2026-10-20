@@ -365,6 +365,121 @@ fn task_inventory_is_exact_and_policy_comes_from_candidate_configuration() {
 }
 
 #[test]
+fn numerical_obligation_requires_every_checker_from_its_verified_source() {
+    use ferrum_bench_core::release_regression::{
+        contracts::{
+            CommandObservation, CommandStatus, ContractGroupResult, ContractReport, ContractStatus,
+            ContractTestResult, HarnessArtifact,
+        },
+        ObligationScope,
+    };
+
+    // Producer-shaped consumer fixtures; no device execution is claimed here.
+    let observation = CommandObservation {
+        status: CommandStatus::Passed,
+        exit_code: Some(0),
+        elapsed_ms: 1,
+        stdout: "fixture.stdout".into(),
+        stderr: "fixture.stderr".into(),
+        error: None,
+    };
+    let report = BackendContractReport {
+        schema_version: 1,
+        backend: Backend::Metal,
+        execution: ContractReport {
+            schema_version: 1,
+            status: ContractStatus::Passed,
+            groups: backend_contracts::contract_groups(Backend::Metal)
+                .into_iter()
+                .map(|group| ContractGroupResult {
+                    id: group.id,
+                    behavior: group.behavior,
+                    status: ContractStatus::Passed,
+                    tests: group
+                        .tests
+                        .into_iter()
+                        .map(|binding| ContractTestResult {
+                            artifact: Some(HarnessArtifact {
+                                package: binding.package.clone(),
+                                package_id: binding.package.clone(),
+                                target: binding.target.clone(),
+                                kind: binding.kind.clone(),
+                                executable: "fixture-device-tests".into(),
+                                manifest_path: "Cargo.toml".into(),
+                            }),
+                            binding,
+                            registered: true,
+                            listing: Some(observation.clone()),
+                            execution: Some(observation.clone()),
+                            error: None,
+                        })
+                        .collect(),
+                })
+                .collect(),
+        },
+    };
+    let target = ExecutionTarget {
+        architecture: "llama_dense".into(),
+        protocol: ferrum_types::ModelOutputProtocol::Text,
+        precision: "gguf-q4_k_m".into(),
+        backend: Backend::Metal,
+        execution_path: ferrum_bench_core::release_regression::submission::LEGACY_EXECUTION_PATH
+            .into(),
+    };
+    let backend_checker = backend_contracts::check_descriptors(&[target])
+        .into_iter()
+        .find(|descriptor| descriptor.behavior == Behavior::SubmissionCompletion)
+        .unwrap()
+        .id;
+    let obligation = Obligation {
+        behavior: Behavior::SubmissionCompletion,
+        layer: EvidenceLayer::BackendNumerics,
+        entrypoints: vec![],
+        scope: submission_scope(),
+        reason: "independent lifecycle and submission checks".into(),
+        checkers: vec![backend_checker, SUBMISSION_CHECK_ID.into()],
+    };
+    let mut evidence = CiEvidence::default();
+    assert!(!evidence.covers(0, &obligation));
+    evidence.submission = Some(submission::verified_fixture());
+    assert!(!evidence.covers(0, &obligation));
+    evidence
+        .device_contracts
+        .push(backend_contracts::verify_report(Backend::Metal, &report).unwrap());
+    assert!(evidence.covers(0, &obligation));
+
+    let mut reversed = obligation.clone();
+    reversed.checkers.reverse();
+    assert!(evidence.covers(0, &reversed));
+
+    evidence.submission = None;
+    assert!(!evidence.covers(0, &obligation));
+    evidence.submission = Some(submission::verified_fixture());
+    let mut unknown = obligation.clone();
+    unknown.checkers.push("unexecuted-checker".into());
+    assert!(!evidence.covers(0, &unknown));
+    let mut empty = obligation.clone();
+    empty.checkers.clear();
+    assert!(!evidence.covers(0, &empty));
+    let mut wrong_backend = obligation.clone();
+    wrong_backend.scope = ObligationScope::ExecutionPath {
+        backend: Backend::Cuda,
+        execution_path: ferrum_bench_core::release_regression::submission::LEGACY_EXECUTION_PATH
+            .into(),
+    };
+    assert!(!evidence.covers(0, &wrong_backend));
+    let mut wrong_path = obligation.clone();
+    wrong_path.scope = backend_contracts::submission_scope(Backend::Metal);
+    assert!(!evidence.covers(0, &wrong_path));
+    let mut wrong_behavior = obligation.clone();
+    wrong_behavior.behavior = Behavior::KernelNumerics;
+    assert!(!evidence.covers(0, &wrong_behavior));
+    let mut wrong_entrypoint = obligation;
+    wrong_entrypoint.entrypoints.push(Entrypoint::Run);
+    assert!(!evidence.covers(0, &wrong_entrypoint));
+}
+
+#[test]
 fn absent_submission_or_performance_never_satisfies_known_or_unknown_obligations() {
     let evidence = CiEvidence::default();
     let mut obligation = Obligation {

@@ -51,15 +51,22 @@ impl CiEvidence {
     pub(super) fn covers(&self, index: usize, obligation: &Obligation) -> bool {
         match obligation.layer {
             EvidenceLayer::BackendNumerics => {
-                self.submission.as_ref().is_some_and(|verified| {
-                    obligation.behavior == Behavior::SubmissionCompletion
-                        && obligation.scope == verified.scope()
-                        && obligation.entrypoints.is_empty()
-                        && obligation.checkers == [verified.checker_id()]
-                }) || self
-                    .device_contracts
-                    .iter()
-                    .any(|verified| verified.covers(obligation))
+                // Independent producers each certify one registered checker.
+                // An obligation can require several; none may be omitted.
+                !obligation.checkers.is_empty()
+                    && obligation.checkers.iter().all(|checker| {
+                        let mut single = obligation.clone();
+                        single.checkers = vec![checker.clone()];
+                        self.submission.as_ref().is_some_and(|verified| {
+                            single.behavior == Behavior::SubmissionCompletion
+                                && single.scope == verified.scope()
+                                && single.entrypoints.is_empty()
+                                && single.checkers == [verified.checker_id()]
+                        }) || self
+                            .device_contracts
+                            .iter()
+                            .any(|verified| verified.covers(&single))
+                    })
             }
             EvidenceLayer::Performance => self.performance.get(&index) == Some(obligation),
             _ => false,

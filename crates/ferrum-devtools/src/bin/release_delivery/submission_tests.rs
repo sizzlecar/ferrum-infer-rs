@@ -71,6 +71,13 @@ fn verify_value(value: &Value, expected: &SubmissionConfig) -> Result<VerifiedSu
     verify(&serde_json::to_vec(value).unwrap(), expected)
 }
 
+// Reuse the validated serialization fixture in evidence-composition unit tests.
+// This is consumer test data, not evidence of hardware execution.
+pub(crate) fn verified_fixture() -> VerifiedSubmission {
+    let expected = config(3, 7, 9);
+    verify_value(&fixture(&expected), &expected).unwrap()
+}
+
 #[test]
 fn replay_accepts_registered_shapes_and_only_returns_submission_scope() {
     for expected in [config(1, 3, 5), config(3, 7, 9)] {
