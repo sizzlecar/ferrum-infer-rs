@@ -301,11 +301,27 @@ async fn attempt_completed_and_definitely_not_submitted_keep_distinct_work() {
 
 #[tokio::test]
 async fn attempt_sampling_failure_keeps_both_completed_model_ranges() {
+    sampling_failure_keeps_completed_ranges(false).await;
+}
+
+#[tokio::test]
+async fn attempt_sampling_failure_keeps_completed_ranges_when_healthy_peer_reaches_eos() {
+    sampling_failure_keeps_completed_ranges(true).await;
+}
+
+async fn sampling_failure_keeps_completed_ranges(healthy_ends: bool) {
     let recorder = Arc::new(AttemptRecorder::default());
     let (engine, executor, mut inputs) = fixture_observed(2, false, Some(recorder.clone())).await;
     plan_full_prompt(&mut inputs);
     let (failure_sender, failure_receiver) = tokio::sync::oneshot::channel();
     inputs[0].handle.lock().as_mut().unwrap().response_sender = Some(failure_sender);
+    let (healthy_sender, healthy_receiver) = tokio::sync::oneshot::channel();
+    inputs[1].handle.lock().as_mut().unwrap().response_sender = Some(healthy_sender);
+    let healthy_token = if healthy_ends {
+        TinyTokenizer::new(executor.info().vocab_size).eos_token_id()
+    } else {
+        7
+    };
     let selected = inputs.iter().collect::<Vec<_>>();
     let works = inputs
         .iter()
@@ -331,7 +347,12 @@ async fn attempt_sampling_failure_keeps_both_completed_model_ranges() {
                             executor.info().vocab_size
                         ])
                     } else {
-                        ExecutorSamplingOutput::FullLogits(vec![0.0; executor.info().vocab_size])
+                        // Exercise each lifetime explicitly. Uniform logits
+                        // can randomly select EOS and legitimately retire the
+                        // peer that the continuation case expects to inspect.
+                        let mut logits = vec![f32::NEG_INFINITY; executor.info().vocab_size];
+                        logits[healthy_token as usize] = 0.0;
+                        ExecutorSamplingOutput::FullLogits(logits)
                     }),
                 )
                 .unwrap()
@@ -363,16 +384,6 @@ async fn attempt_sampling_failure_keeps_both_completed_model_ranges() {
     assert_eq!(summary.eligibility, ExecutionAttemptEligibility::Completed);
     assert!(summary.participants[0].product_failed);
     assert!(!summary.participants[1].product_failed);
-    assert_eq!(
-        inputs[1]
-            .handle
-            .lock()
-            .as_ref()
-            .unwrap()
-            .generated_tokens
-            .len(),
-        1
-    );
     for participant in &summary.participants {
         let AttemptParticipantOutcome::Completed {
             work,
@@ -383,18 +394,32 @@ async fn attempt_sampling_failure_keeps_both_completed_model_ranges() {
         };
         assert_eq!(work.range().unwrap().as_range(), 0..2);
     }
-    assert_eq!(
-        inputs[1]
-            .handle
-            .lock()
-            .as_ref()
+    if healthy_ends {
+        let response = tokio::time::timeout(Duration::from_secs(3), healthy_receiver)
+            .await
             .unwrap()
-            .execution_frontier
-            .as_ref()
             .unwrap()
-            .consumed_tokens(),
-        2
-    );
+            .unwrap();
+        assert_eq!(
+            response.response().finish_reason,
+            ferrum_types::FinishReason::EOS
+        );
+        assert_eq!(response.response().tokens, vec![TokenId(healthy_token)]);
+        assert!(inputs[1].handle.lock().is_none());
+        assert!(inputs[1].frontier.sequence().observed_end().is_some());
+    } else {
+        let handle = inputs[1].handle.lock();
+        let sequence = handle.as_ref().unwrap();
+        assert_eq!(sequence.generated_tokens, vec![TokenId(healthy_token)]);
+        assert_eq!(
+            sequence
+                .execution_frontier
+                .as_ref()
+                .unwrap()
+                .consumed_tokens(),
+            2
+        );
+    }
     drop(works);
     engine.shutdown().await.unwrap();
 }
