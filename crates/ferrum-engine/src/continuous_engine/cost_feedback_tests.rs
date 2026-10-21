@@ -130,8 +130,13 @@ impl CostSnapshotSource for Source {
     }
 }
 
-fn policy() -> ferrum_types::SchedulerSloConfig {
-    "ttft:1000,tpot:100,itl:100".parse().unwrap()
+pub(super) fn policy() -> ferrum_types::SchedulerSloConfig {
+    // These fixtures provide per-invocation costs, not joint stopping or
+    // completion evidence. Keep their reference-step consumer contract explicit.
+    let mut policy: ferrum_types::SchedulerSloConfig =
+        "ttft:1000,tpot:100,itl:100".parse().unwrap();
+    policy.strategy = ferrum_types::SloStrategy::ReferenceStepDiagnostic;
+    policy
 }
 
 fn engine(

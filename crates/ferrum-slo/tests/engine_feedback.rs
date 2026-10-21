@@ -236,7 +236,7 @@ async fn reference_actual_cpu_feedback_changes_next_prefill_and_preserves_output
         query: Default::default(),
         planning: Default::default(),
         joint: Default::default(),
-        strategy: Default::default(),
+        strategy: ferrum_types::SloStrategy::ReferenceStepDiagnostic,
         unknown_stopping: Default::default(),
         unknown_cost: Default::default(),
     };

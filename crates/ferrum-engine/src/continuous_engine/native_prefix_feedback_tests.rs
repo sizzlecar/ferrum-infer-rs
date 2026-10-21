@@ -320,7 +320,7 @@ async fn native_prefix_feedback_metal_learns_acknowledged_restore_and_retires_or
         query: Default::default(),
         planning: Default::default(),
         joint: Default::default(),
-        strategy: Default::default(),
+        strategy: ferrum_types::SloStrategy::ReferenceStepDiagnostic,
         unknown_stopping: Default::default(),
         unknown_cost: Default::default(),
     });
