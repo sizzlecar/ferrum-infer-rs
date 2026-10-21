@@ -170,15 +170,17 @@ impl CudaDeviceRuntime {
         {
             return Err(CudaDeviceRuntimeError::contract("CUDA tensor budgets require finite positive limits and a versioned profile identity"));
         }
-        if config.device.capabilities.len() != 1
-            || !config
-                .device
-                .capabilities
-                .iter()
-                .all(|capability| capability.as_str() == ferrum_runtime::SILU_BF16_CAPABILITY_ID)
+        if config.device.capabilities.is_empty()
+            || !config.device.capabilities.iter().all(|capability| {
+                matches!(
+                    capability.as_str(),
+                    ferrum_runtime::SILU_BF16_CAPABILITY_ID
+                        | ferrum_runtime::DENSE_LINEAR_BF16_CAPABILITY_ID
+                )
+            })
         {
             return Err(CudaDeviceRuntimeError::contract(
-                "this CUDA tensor eager profile admits only its fixed BF16 SiLU provider bundle",
+                "this CUDA tensor eager profile admits only its BF16 SiLU and Dense provider bundle",
             ));
         }
         let streams = u64::try_from(config.maximum_streams)
@@ -297,6 +299,21 @@ impl CudaDeviceRuntime {
         Ok(CudaTensorProviderRetention {
             owner: Arc::clone(owner),
         })
+    }
+
+    /// Retains existing bootstrap capacity for providers that reuse a lane's
+    /// native handles and create no additional modules, handles or contexts.
+    pub(crate) fn tensor_bootstrap_retention(
+        &self,
+    ) -> Result<DeviceCapacityRetention, CudaDeviceRuntimeError> {
+        self.tensor_eager
+            .as_ref()
+            .map(|owner| owner._bootstrap.clone())
+            .ok_or_else(|| {
+                CudaDeviceRuntimeError::contract(
+                    "CUDA tensor provider requires a bounded tensor runtime",
+                )
+            })
     }
 }
 

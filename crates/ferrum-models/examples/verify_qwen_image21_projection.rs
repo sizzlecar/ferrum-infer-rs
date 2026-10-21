@@ -1,4 +1,4 @@
-//! Reproducible, bounded img_in verification through the managed Reference executor.
+//! Reproducible, bounded img_in verification through managed Reference or CUDA execution.
 //!
 //! Usage: verify_qwen_image21_projection --config CONFIG --weight-fragment BF16
 //! --weight-sha256 HEX --artifact-dir NEW_DIRECTORY_OUTSIDE_A_GIT_WORKTREE
@@ -7,15 +7,14 @@
 //! Candle F64 is an independent mathematical reference, not deployed Torch/vLLM
 //! parity. Preparation and Candle allocations are outside the runtime Host ledger.
 
+#[path = "verify_qwen_image21_projection/arguments.rs"]
+mod arguments;
 #[path = "verify_qwen_image21_projection/artifacts.rs"]
 mod artifacts;
 #[path = "verify_qwen_image21_projection/execution.rs"]
 mod execution;
 #[path = "verify_qwen_image21_projection/oracle.rs"]
 mod oracle;
-
-use std::ffi::OsString;
-use std::path::PathBuf;
 
 use anyhow::{bail, Context, Result};
 use ferrum_models::qwen_image21::{QwenImage21Config, StructureLimits};
@@ -24,58 +23,7 @@ use serde_json::json;
 
 const ROWS: usize = 4;
 const MAX_WEIGHT_BYTES: usize = 512 * 1024;
-const USAGE: &str = "verify_qwen_image21_projection --config CONFIG --weight-fragment BF16 --weight-sha256 HEX --artifact-dir NEW_DIRECTORY_OUTSIDE_A_GIT_WORKTREE";
-
-struct Arguments {
-    config: PathBuf,
-    weight_fragment: PathBuf,
-    weight_sha256: String,
-    artifact_dir: PathBuf,
-}
-
-impl Arguments {
-    fn parse(arguments: impl IntoIterator<Item = OsString>) -> Result<Option<Self>> {
-        let mut arguments = arguments.into_iter().peekable();
-        if arguments
-            .peek()
-            .is_some_and(|value| value == "--help" || value == "-h")
-        {
-            arguments.next();
-            if arguments.next().is_some() {
-                bail!("--help accepts no other arguments");
-            }
-            return Ok(None);
-        }
-        let (mut config, mut fragment, mut digest, mut directory) = (None, None, None, None);
-        while let Some(flag) = arguments.next() {
-            let value = arguments.next().context("every option requires a value")?;
-            let slot = match flag.to_str() {
-                Some("--config") => &mut config,
-                Some("--weight-fragment") => &mut fragment,
-                Some("--weight-sha256") => &mut digest,
-                Some("--artifact-dir") => &mut directory,
-                _ => bail!("unknown option {flag:?}; {USAGE}"),
-            };
-            if slot.replace(value).is_some() {
-                bail!("duplicate option {flag:?}");
-            }
-        }
-        let weight_sha256 = digest
-            .context(USAGE)?
-            .into_string()
-            .map_err(|_| anyhow::anyhow!("SHA256 must be ASCII hexadecimal"))?;
-        if weight_sha256.len() != 64 || !weight_sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
-        {
-            bail!("--weight-sha256 requires exactly 64 hexadecimal digits");
-        }
-        Ok(Some(Self {
-            config: config.context(USAGE)?.into(),
-            weight_fragment: fragment.context(USAGE)?.into(),
-            weight_sha256: weight_sha256.to_ascii_lowercase(),
-            artifact_dir: directory.context(USAGE)?.into(),
-        }))
-    }
-}
+use arguments::{Arguments, USAGE};
 
 #[derive(Serialize)]
 struct CaseResult {
@@ -86,6 +34,7 @@ struct CaseResult {
 }
 
 fn run(arguments: Arguments) -> Result<()> {
+    arguments.backend.ensure_available()?;
     let limits = StructureLimits::default();
     let config_bytes =
         artifacts::read_bounded(&arguments.config, limits.metadata_file_bytes() as usize)?;
@@ -120,7 +69,8 @@ fn run(arguments: Arguments) -> Result<()> {
     let artifacts = artifacts::Artifacts::create(&arguments.artifact_dir)?;
     artifacts.json("declaration.json", &json!({
         "schema": "ferrum.qwen_image21.projection-verification.v1",
-        "scope": "partial img_in only; independent CPU mathematics; no Torch/vLLM parity",
+        "scope": "partial img_in only; selected managed backend against independent CPU mathematics; no Torch/vLLM parity",
+        "execution_backend": arguments.backend,
         "source": {
             "config_path": arguments.config.canonicalize()?.display().to_string(),
             "config_sha256": artifacts::sha256(&config_bytes),
@@ -142,8 +92,12 @@ fn run(arguments: Arguments) -> Result<()> {
     artifacts.bytes("dense-input.bf16", &dense)?;
 
     let result = (|| -> Result<()> {
-        let mut executor =
-            execution::ProjectionExecutor::new(&config, artifacts.directory(), shape)?;
+        let mut executor = execution::ProjectionExecutor::new(
+            &config,
+            artifacts.directory(),
+            shape,
+            &arguments.backend,
+        )?;
         artifacts.json("execution.json", &executor.provenance())?;
         let mut reports = Vec::with_capacity(2);
         for (name, input) in [("analytic", probes.as_slice()), ("dense", dense.as_slice())] {
@@ -200,6 +154,7 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::OsString;
 
     #[test]
     fn arguments_reject_duplicate_unknown_and_malformed_digest() {
@@ -246,6 +201,7 @@ mod tests {
             weight_fragment: fragment,
             weight_sha256: artifacts::sha256(&weight),
             artifact_dir: directory.clone(),
+            backend: arguments::Backend::Reference,
         })
         .unwrap();
         // Independent column picks/sign changes: the expected output does

@@ -162,6 +162,36 @@ fn registration_requires_checked_canonical_config_and_declared_profile() {
         .is_err());
 }
 
+#[test]
+fn cuda_profile_is_explicit_and_preserves_the_same_no_bias_program() {
+    let config = config_from(&hf_config());
+    let provider = QwenImage21ImageProjectionFamily::new().unwrap();
+    let profiles = provider.numerical_profiles(&config).unwrap();
+    assert_eq!(profiles.auto_preference(), &[profile_id()]);
+    let cuda_id =
+        NumericalProfileId::new(QwenImage21ImageProjectionFamily::CUDA_PROFILE_ID).unwrap();
+    assert_ne!(cuda_id, profile_id());
+    let registration = registration();
+    let definition = registration
+        .define(&serde_json::to_value(&config).unwrap())
+        .unwrap();
+    let cuda = registration.prepare(&definition, &cuda_id).unwrap();
+    let reference = registration.prepare(&definition, &profile_id()).unwrap();
+    assert_eq!(cuda.program(), reference.program());
+    assert_eq!(cuda.weights(), reference.weights());
+    assert_eq!(
+        cuda.numerical_profile().operations,
+        reference.numerical_profile().operations
+    );
+    assert_eq!(cuda.numerical_profile().id, cuda_id);
+    assert_ne!(
+        cuda.fingerprint().unwrap(),
+        reference.fingerprint().unwrap()
+    );
+    assert_eq!(cuda.program().weights().len(), 1);
+    assert_eq!(cuda.program().blocks()[0].nodes[0].inputs.len(), 2);
+}
+
 /// Deliberately carries every required transformer weight into a projection.
 /// Preparation must reject this without weakening the core schema contract.
 struct FullSchemaProjection(QwenImage21ImageProjectionFamily);

@@ -2,6 +2,7 @@
 //! upload packet or a replayable executable.
 
 use super::*;
+use ferrum_runtime::{BufferUsage, HostMemoryClass};
 
 /// Armed before the first possible enqueue. Any unwind, including timing or
 /// bookkeeping callbacks, preserves commands instead of dropping DMA owners.
@@ -65,10 +66,46 @@ impl Drop for SubmissionGuard<'_> {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum UploadPurpose {
+    Input,
+    StaticWeight,
+}
+
+impl UploadPurpose {
+    pub(super) fn new(
+        class: HostMemoryClass,
+        usage: BufferUsage,
+    ) -> Result<Self, CudaDeviceRuntimeError> {
+        match (class, usage) {
+            (HostMemoryClass::InputPreprocess, BufferUsage::Activations) => Ok(Self::Input),
+            (HostMemoryClass::TransferStaging, BufferUsage::Weights) => Ok(Self::StaticWeight),
+            _ => Err(CudaDeviceRuntimeError::contract(
+                "managed CUDA upload class differs from destination usage",
+            )),
+        }
+    }
+
+    fn phase(self) -> DeviceCommandPhase {
+        match self {
+            Self::Input => DeviceCommandPhase::DynamicBinding,
+            Self::StaticWeight => DeviceCommandPhase::Initialization,
+        }
+    }
+
+    fn host_class(self) -> HostMemoryClass {
+        match self {
+            Self::Input => HostMemoryClass::InputPreprocess,
+            Self::StaticWeight => HostMemoryClass::TransferStaging,
+        }
+    }
+}
+
 pub(super) struct ManagedUpload {
     source: ManagedHostBytes,
     destination: CudaBufferRegion,
     layout: HostTransferLayout,
+    purpose: UploadPurpose,
 }
 
 impl ManagedUpload {
@@ -91,7 +128,7 @@ impl ManagedUpload {
             .validate_bytes(self.source.len())
             .map_err(|error| CudaDeviceRuntimeError::contract(error.to_string()))?;
         if self.source.is_empty()
-            || self.source.class() != ferrum_runtime::HostMemoryClass::InputPreprocess
+            || self.source.class() != self.purpose.host_class()
             || self.destination.runtime_instance != runtime_instance
             || self.layout.element_type() != self.destination.element_type
             || self.destination.length_bytes != self.source.len() as u64
@@ -105,9 +142,100 @@ impl ManagedUpload {
     }
 }
 
+/// Typed eager transfers never enter the legacy executable/upload packet.
+/// A static zero has no host payload and is admitted only in Initialization.
+pub(super) enum TensorTransfer {
+    Upload(ManagedUpload),
+    StaticZero(CudaBufferRegion),
+}
+
+impl TensorTransfer {
+    pub(super) fn enqueue(&self, stream: &CudaStream) -> Result<(), CudaDeviceRuntimeError> {
+        match self {
+            Self::Upload(upload) => upload.enqueue(stream),
+            Self::StaticZero(destination) => {
+                let bytes = checked_usize(destination.length_bytes, "CUDA static zero length")?;
+                unsafe {
+                    cudarc::driver::result::memset_d8_async(
+                        destination.device_ptr,
+                        0,
+                        bytes,
+                        stream.cu_stream(),
+                    )
+                }
+                .map_err(|error| CudaDeviceRuntimeError::driver("static zero", error))
+            }
+        }
+    }
+
+    fn validate(&self, runtime_instance: u64) -> Result<(), CudaDeviceRuntimeError> {
+        match self {
+            Self::Upload(upload) => upload.validate(runtime_instance),
+            Self::StaticZero(destination) => {
+                if destination.runtime_instance != runtime_instance || destination.length_bytes == 0
+                {
+                    return Err(CudaDeviceRuntimeError::contract(
+                        "invalid CUDA static zero region",
+                    ));
+                }
+                checked_usize(destination.length_bytes, "CUDA static zero length")?;
+                Ok(())
+            }
+        }
+    }
+
+    fn phase(&self) -> DeviceCommandPhase {
+        match self {
+            Self::Upload(upload) => upload.purpose.phase(),
+            Self::StaticZero(_) => DeviceCommandPhase::Initialization,
+        }
+    }
+
+    fn operation(&self) -> &'static str {
+        match self {
+            Self::Upload(_) => HOST_UPLOAD_NATIVE_OPERATION_ID.as_str(),
+            Self::StaticZero(_) => DEVICE_ZERO_NATIVE_OPERATION_ID.as_str(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn managed_upload_roles_do_not_turn_weights_into_request_inputs() {
+        let input =
+            UploadPurpose::new(HostMemoryClass::InputPreprocess, BufferUsage::Activations).unwrap();
+        assert_eq!(input.phase(), DeviceCommandPhase::DynamicBinding);
+        let weights =
+            UploadPurpose::new(HostMemoryClass::TransferStaging, BufferUsage::Weights).unwrap();
+        assert_eq!(weights.phase(), DeviceCommandPhase::Initialization);
+        for (class, usage) in [
+            (HostMemoryClass::InputPreprocess, BufferUsage::Weights),
+            (HostMemoryClass::TransferStaging, BufferUsage::Activations),
+            (HostMemoryClass::Output, BufferUsage::Weights),
+            (HostMemoryClass::WeightBacking, BufferUsage::Weights),
+            (HostMemoryClass::TransferStaging, BufferUsage::Persistent),
+        ] {
+            assert!(UploadPurpose::new(class, usage).is_err());
+        }
+    }
+
+    #[test]
+    fn tensor_compute_cannot_be_submitted_as_initialization_or_input_upload() {
+        let command = tensor_command();
+        assert!(command
+            .validate_tensor_phase(DeviceCommandPhase::Compute)
+            .is_ok());
+        for phase in [
+            DeviceCommandPhase::Initialization,
+            DeviceCommandPhase::DynamicBinding,
+            DeviceCommandPhase::ResultBinding,
+        ] {
+            assert!(command.validate_tensor_phase(phase).is_err());
+        }
+    }
 
     #[test]
     fn managed_pieces_use_exact_length_and_nonzero_destination_offsets() {
@@ -207,17 +335,33 @@ impl CudaDeviceCommand {
         source: ManagedHostBytes,
         destination: CudaBufferRegion,
         layout: HostTransferLayout,
+        purpose: UploadPurpose,
     ) -> Result<Self, CudaDeviceRuntimeError> {
         let upload = ManagedUpload {
             source,
             destination,
             layout,
+            purpose,
         };
-        upload.validate(runtime_instance)?;
+        Self::tensor_transfer_command(runtime_instance, TensorTransfer::Upload(upload))
+    }
+
+    pub(super) fn static_zero(
+        runtime_instance: u64,
+        destination: CudaBufferRegion,
+    ) -> Result<Self, CudaDeviceRuntimeError> {
+        Self::tensor_transfer_command(runtime_instance, TensorTransfer::StaticZero(destination))
+    }
+
+    fn tensor_transfer_command(
+        runtime_instance: u64,
+        transfer: TensorTransfer,
+    ) -> Result<Self, CudaDeviceRuntimeError> {
+        transfer.validate(runtime_instance)?;
         Ok(Self {
             completion_checks: Vec::new(),
             runtime_instance,
-            operation: HOST_UPLOAD_NATIVE_OPERATION_ID.as_str(),
+            operation: transfer.operation(),
             batching_form: DeviceBatchingForm::Scalar,
             participant_start: 0,
             participant_count: 0,
@@ -234,18 +378,19 @@ impl CudaDeviceCommand {
             binding_program: None,
             reusable_execution: None,
             tensor_work: None,
-            managed_upload: Some(upload),
+            tensor_transfer: Some(transfer),
             tensor_flight: None,
             execution_facts: None,
         })
     }
 
     pub(super) fn validate_managed_transfer(&self) -> Result<(), CudaDeviceRuntimeError> {
-        let Some(upload) = &self.managed_upload else {
+        let Some(upload) = &self.tensor_transfer else {
             return Ok(());
         };
         upload.validate(self.runtime_instance)?;
-        if self.executable.is_some()
+        if self.operation != upload.operation()
+            || self.executable.is_some()
             || self.replay_key.is_some()
             || self.reusable_address_scope.is_some()
             || self.reusable_execution.is_some()
@@ -262,7 +407,28 @@ impl CudaDeviceCommand {
             || !self.fence_dependencies.is_empty()
         {
             return Err(CudaDeviceRuntimeError::contract(
-                "managed CUDA upload cannot enter a cached executable",
+                "managed CUDA transfer cannot enter a cached executable",
+            ));
+        }
+        Ok(())
+    }
+
+    pub(super) fn validate_tensor_phase(
+        &self,
+        phase: DeviceCommandPhase,
+    ) -> Result<(), CudaDeviceRuntimeError> {
+        let expected = if let Some(transfer) = &self.tensor_transfer {
+            transfer.phase()
+        } else if self.tensor_work.is_some() {
+            DeviceCommandPhase::Compute
+        } else {
+            return Err(CudaDeviceRuntimeError::contract(
+                "CUDA tensor eager runtime rejects token and unmanaged commands",
+            ));
+        };
+        if phase != expected {
+            return Err(CudaDeviceRuntimeError::contract(
+                "CUDA tensor command differs from its required submission phase",
             ));
         }
         Ok(())

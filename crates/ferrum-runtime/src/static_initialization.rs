@@ -10,7 +10,8 @@ use super::{
     new_deferred_device_cleanup_domain, BufferUsage, DeferredDeviceCleanupDisposition,
     DeferredDeviceCleanupDomainId, DeferredDeviceCleanupMaintenanceReceipt,
     DeferredDeviceCleanupStatus, DeferredDeviceCleanupTask, DeviceRuntime, ElementType,
-    ExecutionPlan, ExecutionWeights, FailureDomain, FailureEnvelope, ModelWeights,
+    ExecutionPlan, ExecutionWeights, FailureDomain, FailureEnvelope, HostMemoryAccount,
+    HostMemoryClass, HostMemoryError, HostMemoryReservation, ManagedHostBytes, ModelWeights,
     PlanRuntimeResources, ResourceId, ResourceTransaction, ResourceTransactionDriver,
     TransactionCommitted, VNextError, MAX_DEFERRED_DEVICE_CLEANUP_MAINTENANCE_TASKS,
 };
@@ -550,7 +551,32 @@ where
         self.initialize_static_with_input(
             family,
             plan,
-            StaticInitializationInput::Stored(source),
+            StaticInitializationInput::Stored(source, None),
+            policy,
+        )
+    }
+
+    /// Uploads stored weights through account-owned, bounded staging chunks.
+    ///
+    /// Each chunk is admitted as [`HostMemoryClass::TransferStaging`] before
+    /// allocating or copying bytes. The backend must retain that exact owner
+    /// until its upload is quiescent; unsupported managed uploads never fall
+    /// back to a raw-byte upload. Device transforms and native weight imports
+    /// are not used by this entrypoint. Existing source/materializer backing,
+    /// including mmap pages or format conversion allocations, is outside this
+    /// staging budget; this is not a bound on total host RSS.
+    pub fn initialize_static_managed(
+        self,
+        family: &PreparedModelFamily,
+        plan: &ExecutionPlan,
+        source: &dyn WeightComponentSource,
+        host: &HostMemoryAccount,
+        policy: StaticInitializationPolicy,
+    ) -> Result<InitializedResourceTransaction<D>, StaticInitializationFailure<D>> {
+        self.initialize_static_with_input(
+            family,
+            plan,
+            StaticInitializationInput::Stored(source, Some(host)),
             policy,
         )
     }
@@ -590,7 +616,10 @@ where
 
 enum StaticInitializationInput<'source> {
     None,
-    Stored(&'source dyn WeightComponentSource),
+    Stored(
+        &'source dyn WeightComponentSource,
+        Option<&'source HostMemoryAccount>,
+    ),
 }
 
 fn initialize_static_inner<D>(
@@ -606,16 +635,17 @@ where
     let initialization_started = Instant::now();
     let setup_started = Instant::now();
     preflight_transaction(transaction, family, plan).map_err(contract_failure)?;
-    let stored = match (input, family.weights(), plan.payload().execution_weights()) {
+    let (stored, managed_host) = match (input, family.weights(), plan.payload().execution_weights())
+    {
         (StaticInitializationInput::None, ModelWeights::None, ExecutionWeights::None) => {
             validate_without_weights(plan).map_err(contract_failure)?;
-            None
+            (None, None)
         }
         (
-            StaticInitializationInput::Stored(source),
+            StaticInitializationInput::Stored(source, host),
             ModelWeights::Stored(_),
             ExecutionWeights::Stored(weights),
-        ) => Some((source, weights)),
+        ) => (Some((source, weights)), host),
         _ => {
             return Err(contract_failure(VNextError::InvalidExecutionPlan {
                 reason: "static initialization source mode differs from family or plan weights"
@@ -634,21 +664,68 @@ where
         .execution_weights()
         .static_weight_transforms()
         .is_empty();
-    let mut weight_import = if placements.is_empty() || has_required_weight_transforms {
-        None
-    } else {
-        match runtime.begin_static_weight_import() {
-            None => None,
-            Some(Ok(import)) => Some(import),
-            Some(Err(error)) => {
-                return Err(InitializationStepFailure::Quiescent(device_failure(
-                    &runtime,
-                    &error,
-                    "static_weight_import_begin",
-                )))
+    if managed_host.is_some()
+        && (has_required_weight_transforms || !runtime.supports_managed_tensor_io())
+    {
+        return Err(contract_failure(VNextError::InvalidExecutionPlan {
+            reason: "managed static initialization requires managed host upload support and no device weight transforms".to_owned(),
+        }));
+    }
+    // Admit the first real chunk before even a zero batch can be submitted.
+    // Holding this reservation (rather than merely observing free capacity)
+    // prevents a concurrent host user from taking its admission in between.
+    let mut first_staging = match (managed_host, stored) {
+        (Some(host), Some((_, weights))) => {
+            let first = weights
+                .schema()
+                .components
+                .iter()
+                .find(|component| placements.contains_key(&component.id));
+            match first {
+                Some(component) => {
+                    let element_bytes = component.physical_element_type().size_bytes();
+                    let maximum = policy.maximum_staging_bytes()
+                        - policy.maximum_staging_bytes() % element_bytes;
+                    let bytes = component
+                        .physical_bytes()
+                        .map_err(contract_failure)?
+                        .min(maximum);
+                    let bytes = usize::try_from(bytes).map_err(|_| {
+                        contract_failure(VNextError::InvalidExecutionPlan {
+                            reason: "managed static staging exceeds host address space".to_owned(),
+                        })
+                    })?;
+                    Some(
+                        host.reserve(HostMemoryClass::TransferStaging, bytes)
+                            .map_err(|error| {
+                                InitializationStepFailure::Quiescent(resource_failure(
+                                    "static_host_staging",
+                                    error,
+                                ))
+                            })?,
+                    )
+                }
+                None => None,
             }
         }
+        _ => None,
     };
+    let mut weight_import =
+        if placements.is_empty() || has_required_weight_transforms || managed_host.is_some() {
+            None
+        } else {
+            match runtime.begin_static_weight_import() {
+                None => None,
+                Some(Ok(import)) => Some(import),
+                Some(Err(error)) => {
+                    return Err(InitializationStepFailure::Quiescent(device_failure(
+                        &runtime,
+                        &error,
+                        "static_weight_import_begin",
+                    )))
+                }
+            }
+        };
     let created_stream = runtime.create_stream().map_err(|error| {
         InitializationStepFailure::Quiescent(device_failure(
             &runtime,
@@ -905,8 +982,54 @@ where
                         chunk_bytes_u64 / element_bytes,
                     )
                     .map_err(contract_failure)?;
+                    // If prior chunks own the remaining host quota, retire
+                    // that bounded batch once before retrying admission. Never
+                    // wait while retaining the very staging capacity needed
+                    // by this chunk, and never bypass a genuine capacity error.
+                    let managed_bytes = if let Some(host) = managed_host {
+                        let source_bytes = &bytes[source_offset..source_end];
+                        let mut staged = match first_staging.take() {
+                            Some(reservation) => copy_staged_upload(reservation, source_bytes),
+                            None => stage_upload(host, source_bytes),
+                        };
+                        if matches!(staged, Err(HostMemoryError::Capacity { .. }))
+                            && pending_staging_bytes != 0
+                        {
+                            submission_wait_duration += submit_pending(
+                                &runtime,
+                                &mut stream,
+                                &mut pending,
+                                &mut pending_staging_bytes,
+                            )?;
+                            submission_batch_count += 1;
+                            staged = stage_upload(host, source_bytes);
+                        }
+                        Some(staged.map_err(|error| {
+                            InitializationStepFailure::Quiescent(resource_failure(
+                                "static_host_staging",
+                                error,
+                            ))
+                        })?)
+                    } else {
+                        None
+                    };
                     let encode_started = Instant::now();
-                    let command =
+                    let command = if let Some(managed_bytes) = managed_bytes {
+                        with_static_buffer(transaction, &placement.resource_id, |buffer| {
+                            runtime.encode_managed_upload(
+                                managed_bytes,
+                                layout,
+                                buffer,
+                                destination_offset,
+                            )
+                        })
+                        .map_err(|error| {
+                            runtime_or_contract_failure(&runtime, error, "static_managed_upload_encode")
+                        })?
+                        .ok_or_else(|| contract_failure(VNextError::InvalidExecutionPlan {
+                            reason: "runtime declined managed static upload; raw upload fallback is forbidden".to_owned(),
+                        }))?
+                    } else {
                         with_static_buffer(transaction, &placement.resource_id, |buffer| {
                             runtime.encode_upload(
                                 &bytes[source_offset..source_end],
@@ -917,7 +1040,8 @@ where
                         })
                         .map_err(|error| {
                             runtime_or_contract_failure(&runtime, error, "static_upload_encode")
-                        })?;
+                        })?
+                    };
                     device_encode_duration += encode_started.elapsed();
                     pending.push(command);
                     pending_staging_bytes += chunk_bytes_u64;
@@ -981,6 +1105,29 @@ where
         ),
         source_files,
     })
+}
+
+fn stage_upload(
+    host: &HostMemoryAccount,
+    bytes: &[u8],
+) -> Result<ManagedHostBytes, HostMemoryError> {
+    copy_staged_upload(
+        host.reserve(HostMemoryClass::TransferStaging, bytes.len())?,
+        bytes,
+    )
+}
+
+fn copy_staged_upload(
+    reservation: HostMemoryReservation,
+    bytes: &[u8],
+) -> Result<ManagedHostBytes, HostMemoryError> {
+    if reservation.bytes() != bytes.len() || reservation.class() != HostMemoryClass::TransferStaging
+    {
+        return Err(HostMemoryError::InvalidReservation);
+    }
+    let mut staging = reservation.allocate_zeroed()?;
+    staging.as_mut().copy_from_slice(bytes);
+    Ok(staging.freeze())
 }
 
 fn submit_pending<R>(
@@ -1584,3 +1731,7 @@ pub(crate) static STATIC_PROVISION_CLEANUP_TEST: std::sync::Mutex<()> = std::syn
 #[cfg(test)]
 #[path = "static_initialization/retirement_tests.rs"]
 mod retirement_tests;
+
+#[cfg(test)]
+#[path = "static_initialization/managed_staging_tests.rs"]
+mod managed_staging_tests;

@@ -66,6 +66,7 @@ mod native_io;
 mod q6_head;
 pub use q6_head::CudaQ6MmqF32LastTokenProvider;
 mod selection;
+mod tensor_dense_bf16;
 mod tensor_silu;
 mod transformer;
 use ferrum_runtime::{
@@ -82,6 +83,10 @@ use native_io::TokenPrecision;
 use selection::{
     argmax_dispatches, ArgmaxArguments, ArgmaxBatchArguments, ArgmaxFunctions, ArgmaxPrecision,
     ARGMAX_BATCH_ROWS,
+};
+pub use tensor_dense_bf16::{
+    NUMERICAL_PROFILE_ID as CUDA_DENSE_BF16_NUMERICAL_PROFILE_ID,
+    NUMERICAL_PROFILE_IDENTITY as CUDA_DENSE_BF16_NUMERICAL_PROFILE_IDENTITY,
 };
 pub use tensor_silu::{
     NUMERICAL_PROFILE_ID as CUDA_SILU_BF16_NUMERICAL_PROFILE_ID,
@@ -320,14 +325,18 @@ pub fn cuda_tensor_runtime_config(
     let mut config =
         cuda_vnext_runtime_config(ordinal, device_id, AttentionExecutionPolicy::Portable)?;
     let numerical = tensor_silu::numerical_fingerprint();
+    let dense_numerical = tensor_dense_bf16::source_fingerprint();
     config.runtime_implementation_fingerprint = implementation_fingerprint(&[
         config.runtime_implementation_fingerprint.as_bytes(),
         numerical.as_bytes(),
+        dense_numerical.as_bytes(),
         include_bytes!("vnext_runtime/tensor_io.rs"),
         include_bytes!("vnext_runtime/tensor_eager.rs"),
     ]);
-    config.capabilities =
-        BTreeSet::from([CapabilityId::new(ferrum_runtime::SILU_BF16_CAPABILITY_ID)?]);
+    config.capabilities = BTreeSet::from([
+        CapabilityId::new(ferrum_runtime::SILU_BF16_CAPABILITY_ID)?,
+        CapabilityId::new(ferrum_runtime::DENSE_LINEAR_BF16_CAPABILITY_ID)?,
+    ]);
     config.dynamic_storage_profiles = BTreeSet::from([DynamicStorageProfile::new(
         DynamicStorageAllocator::LinearArena,
         DynamicStorageView::Contiguous,
@@ -347,6 +356,23 @@ pub fn cuda_vnext_silu_bf16_provider(
 /// an implementation; qualification still requires running on the target GPU.
 pub fn cuda_silu_bf16_implementation_fingerprint() -> String {
     tensor_silu::numerical_fingerprint()
+}
+
+/// Fixed-tensor BF16 Dense with an explicit FP32 cuBLAS profile and zero
+/// user workspace. A zero-workspace library failure is returned without an
+/// implicit-workspace fallback. The existing token provider is unchanged.
+pub fn cuda_vnext_dense_bf16_provider(
+    runtime: &CudaDeviceRuntime,
+) -> Result<Box<dyn OperationProvider<CudaDeviceRuntime>>, CudaDeviceRuntimeError> {
+    Ok(Box::new(
+        tensor_dense_bf16::CudaTensorDenseBf16Provider::new(runtime)?,
+    ))
+}
+
+/// Loaded cuBLAS version for validation provenance. NVIDIA supports this
+/// query with a null handle; it creates no extra cuBLAS handle or workspace.
+pub fn cuda_dense_bf16_cublas_version() -> Result<i32, CudaDeviceRuntimeError> {
+    tensor_dense_bf16::cublas_version()
 }
 
 pub(crate) fn rn_fragment_mma_compiled() -> bool {

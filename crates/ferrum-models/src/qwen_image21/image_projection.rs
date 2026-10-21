@@ -42,6 +42,10 @@ pub struct QwenImage21ImageProjectionFamily {
 }
 
 impl QwenImage21ImageProjectionFamily {
+    /// Explicit CUDA cuBLAS profile. Its reduction is not the Reference fold;
+    /// provider and live-library fingerprints further identify its execution.
+    pub const CUDA_PROFILE_ID: &'static str = "cuda.cublas.gemmex.bf16_f32.no_workspace.v1";
+
     pub fn new() -> Result<Self, VNextError> {
         Ok(Self {
             family_id: ModelFamilyId::new(IMAGE_PROJECTION_FAMILY_ID)?,
@@ -127,27 +131,34 @@ impl ModelFamilyProvider for QwenImage21ImageProjectionFamily {
     fn numerical_profiles(&self, _: &Self::Config) -> Result<FamilyNumericalProfiles, VNextError> {
         let profile_id = NumericalProfileId::new(IMAGE_PROJECTION_PROFILE_ID)
             .map_err(|reason| invalid_config("numerical_profile", reason))?;
+        let cuda_profile_id = NumericalProfileId::new(Self::CUDA_PROFILE_ID)
+            .map_err(|reason| invalid_config("numerical_profile", reason))?;
         let output_id = ProgramValueId::new(IMAGE_PROJECTION_OUTPUT_ID)?;
+        let profile = NumericalExecutionProfile {
+            id: profile_id.clone(),
+            family_id: self.family_id.clone(),
+            version: ContractVersion::new(1, 0),
+            primary_activation: output_id.clone(),
+            boundaries: BTreeMap::from([(output_id, ElementType::Bf16)]),
+            states: Vec::new(),
+            kv_storage: Vec::new(),
+            operations: vec![NumericalOperationContract {
+                operation_id: OperationId::new(DENSE_LINEAR_BF16_OPERATION_ID)?,
+                version: ContractVersion::new(1, 0),
+                multiplication_type: Some(ElementType::F32),
+                accumulation_type: Some(ElementType::F32),
+                staged_arithmetic: None,
+                composite_arithmetic: None,
+            }],
+        };
+        let mut cuda_profile = profile.clone();
+        cuda_profile.id = cuda_profile_id;
         FamilyNumericalProfiles::new(
             self.family_id(),
             ContractVersion::new(1, 0),
-            vec![NumericalExecutionProfile {
-                id: profile_id.clone(),
-                family_id: self.family_id.clone(),
-                version: ContractVersion::new(1, 0),
-                primary_activation: output_id.clone(),
-                boundaries: BTreeMap::from([(output_id, ElementType::Bf16)]),
-                states: Vec::new(),
-                kv_storage: Vec::new(),
-                operations: vec![NumericalOperationContract {
-                    operation_id: OperationId::new(DENSE_LINEAR_BF16_OPERATION_ID)?,
-                    version: ContractVersion::new(1, 0),
-                    multiplication_type: Some(ElementType::F32),
-                    accumulation_type: Some(ElementType::F32),
-                    staged_arithmetic: None,
-                    composite_arithmetic: None,
-                }],
-            }],
+            vec![profile, cuda_profile],
+            // CUDA requires explicit selection; the established default stays
+            // the Reference-oriented profile for existing callers.
             vec![profile_id],
         )
     }

@@ -1156,7 +1156,7 @@ impl CudaBindingProgramSink {
             binding_program: Some(projection),
             reusable_execution: None,
             tensor_work: None,
-            managed_upload: None,
+            tensor_transfer: None,
             tensor_flight: None,
             execution_facts: None,
             completion_checks: checks,
@@ -1189,7 +1189,7 @@ pub struct CudaDeviceCommand {
     tensor_work: Option<DeviceCommandLogicalWork>,
     // Never copied into a cached executable. The original accounted owner is
     // retained by this submission, its fence, or its quarantine record.
-    managed_upload: Option<tensor_io::ManagedUpload>,
+    tensor_transfer: Option<tensor_io::TensorTransfer>,
     // Pure provider descriptions, independent of replay keys and resource owners.
     execution_facts: Option<Arc<[ProjectionInvocationTemplate]>>,
     tensor_flight: Option<Arc<tensor_eager::TensorFlightRetention>>,
@@ -1367,7 +1367,7 @@ impl CudaDeviceCommand {
             program_binding_patch: None,
             reusable_execution: None,
             tensor_work: None,
-            managed_upload: None,
+            tensor_transfer: None,
             tensor_flight: None,
             execution_facts: None,
             completion_checks: Vec::new(),
@@ -1584,7 +1584,7 @@ impl CudaDeviceCommand {
             program_binding_patch: None,
             reusable_execution: None,
             tensor_work: None,
-            managed_upload: None,
+            tensor_transfer: None,
             tensor_flight: None,
             execution_facts: None,
             completion_checks: Vec::new(),
@@ -1633,7 +1633,7 @@ impl CudaDeviceCommand {
             program_binding_patch: None,
             reusable_execution: None,
             tensor_work: None,
-            managed_upload: None,
+            tensor_transfer: None,
             tensor_flight: None,
             execution_facts: None,
             completion_checks: Vec::new(),
@@ -1671,7 +1671,7 @@ impl CudaDeviceCommand {
             program_binding_patch: None,
             reusable_execution: None,
             tensor_work: None,
-            managed_upload: None,
+            tensor_transfer: None,
             tensor_flight: None,
             execution_facts: None,
             completion_checks: Vec::new(),
@@ -1783,7 +1783,7 @@ impl CudaDeviceCommand {
             }),
             reusable_execution: None,
             tensor_work: None,
-            managed_upload: None,
+            tensor_transfer: None,
             tensor_flight: None,
             execution_facts: None,
             completion_checks: Vec::new(),
@@ -1915,7 +1915,7 @@ impl CudaDeviceCommand {
             program_binding_patch: None,
             reusable_execution: Some(invocation),
             tensor_work: None,
-            managed_upload: None,
+            tensor_transfer: None,
             tensor_flight: None,
             execution_facts: None,
             completion_checks: Vec::new(),
@@ -2225,7 +2225,7 @@ impl CudaDeviceCommand {
                 program_binding_patch: None,
                 reusable_execution: None,
                 tensor_work: None,
-                managed_upload: None,
+                tensor_transfer: None,
                 tensor_flight: None,
                 execution_facts: None,
                 completion_checks,
@@ -2316,7 +2316,7 @@ impl CudaDeviceCommand {
             program_binding_patch: None,
             reusable_execution: None,
             tensor_work: None,
-            managed_upload: None,
+            tensor_transfer: None,
             tensor_flight: None,
             execution_facts: None,
             completion_checks,
@@ -2388,7 +2388,7 @@ impl CudaDeviceCommand {
             program_binding_patch: None,
             reusable_execution: None,
             tensor_work: None,
-            managed_upload: None,
+            tensor_transfer: None,
             tensor_flight: None,
             execution_facts: None,
             completion_checks: Vec::new(),
@@ -2400,7 +2400,7 @@ impl CudaDeviceCommand {
         stream: &CudaStream,
         blas: &CudaBlas,
     ) -> Result<CudaEnqueuedWork, CudaDeviceRuntimeError> {
-        if let Some(upload) = &self.managed_upload {
+        if let Some(upload) = &self.tensor_transfer {
             upload.enqueue(stream)?;
             return Ok(CudaEnqueuedWork::Static);
         }
@@ -2716,7 +2716,7 @@ fn validate_conditional_dependency(
 ) -> Result<(), CudaDeviceRuntimeError> {
     use ferrum_runtime::DeviceCommandPhase;
     if command.tensor_work.is_some()
-        || command.managed_upload.is_some()
+        || command.tensor_transfer.is_some()
         || phase != DeviceCommandPhase::DynamicBinding
         || node_index.is_some()
         || execution_path != DeviceExecutionPath::Eager
@@ -5350,6 +5350,7 @@ impl DeviceRuntime for CudaDeviceRuntime {
             return Ok(None);
         }
         self.validate_buffer(destination)?;
+        let purpose = tensor_io::UploadPurpose::new(source.class(), destination.descriptor.usage)?;
         layout
             .validate_bytes(source.len())
             .map_err(|error| CudaDeviceRuntimeError::contract(error.to_string()))?;
@@ -5371,6 +5372,7 @@ impl DeviceRuntime for CudaDeviceRuntime {
             source,
             destination.region(range.start as u64..range.end as u64)?,
             layout,
+            purpose,
         )
         .map(Some)
     }
@@ -5389,6 +5391,17 @@ impl DeviceRuntime for CudaDeviceRuntime {
             "CUDA zero",
         )?;
         let destination_region = destination.region(destination_offset_bytes..destination_end)?;
+        if self.tensor_eager.is_some() {
+            if !matches!(
+                destination.descriptor.usage,
+                ferrum_runtime::BufferUsage::Weights | ferrum_runtime::BufferUsage::Persistent
+            ) {
+                return Err(CudaDeviceRuntimeError::contract(
+                    "CUDA tensor static zero requires weights or plan-persistent storage",
+                ));
+            }
+            return CudaDeviceCommand::static_zero(self.runtime_instance, destination_region);
+        }
         Ok(CudaDeviceCommand::transfer(
             self.runtime_instance,
             DEVICE_ZERO_NATIVE_OPERATION_ID.as_str(),
@@ -5517,17 +5530,13 @@ impl DeviceRuntime for CudaDeviceRuntime {
                 validate_tensor_command(&command)?;
                 command.validate_managed_transfer()?;
                 if self.tensor_eager.is_some() {
-                    if command.managed_upload.is_none() && command.tensor_work.is_none() {
-                        return Err(CudaDeviceRuntimeError::contract(
-                            "CUDA tensor eager runtime rejects token and unmanaged commands",
-                        ));
-                    }
-                } else if command.tensor_work.is_some() || command.managed_upload.is_some() {
+                    command.validate_tensor_phase(phase)?;
+                } else if command.tensor_work.is_some() || command.tensor_transfer.is_some() {
                     return Err(CudaDeviceRuntimeError::contract(
                         "CUDA tensor work requires a bounded tensor eager runtime",
                     ));
                 }
-                if (command.tensor_work.is_some() || command.managed_upload.is_some())
+                if (command.tensor_work.is_some() || command.tensor_transfer.is_some())
                     && (reusable_execution_capture.is_some()
                         || !matches!(
                             compute_path_requirement,
@@ -7149,7 +7158,7 @@ mod tests {
             program_binding_patch: None,
             reusable_execution: None,
             tensor_work: None,
-            managed_upload: None,
+            tensor_transfer: None,
             tensor_flight: None,
             execution_facts: None,
             completion_checks: Vec::new(),

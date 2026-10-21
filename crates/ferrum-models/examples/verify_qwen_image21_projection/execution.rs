@@ -16,7 +16,12 @@ use ferrum_runtime::*;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
+use super::arguments::Backend;
 use super::oracle::ProjectionShape;
+
+#[cfg(feature = "cuda")]
+#[path = "cuda.rs"]
+mod cuda;
 
 fn id<T>(value: impl Into<String>) -> Result<T>
 where
@@ -70,14 +75,10 @@ impl RuntimePolicy for TensorPolicy {
     }
 }
 
-pub struct ProjectionExecutor {
-    executor: PreparedTensorExecutor<ReferenceDeviceRuntime>,
-    resources: Arc<PlanRuntimeResources<ReferenceDeviceRuntime>>,
-    composition: ReferenceVNextComposition,
-    host: HostMemoryAccount,
-    input_spec: ResolvedTensorSpec,
-    output_spec: ResolvedTensorSpec,
-    provenance: Value,
+pub enum ProjectionExecutor {
+    Reference(ManagedProjection<ReferenceDeviceRuntime>),
+    #[cfg(feature = "cuda")]
+    Cuda(ManagedProjection<ferrum_kernels::backend::cuda::vnext_runtime::CudaDeviceRuntime>),
 }
 
 impl ProjectionExecutor {
@@ -85,21 +86,115 @@ impl ProjectionExecutor {
         config: &QwenImage21Config,
         directory: &Path,
         shape: ProjectionShape,
+        backend: &Backend,
+    ) -> Result<Self> {
+        match backend {
+            Backend::Reference => {
+                let composition = ReferenceVNextComposition::create(id(
+                    "device.reference.qwen_image21.projection",
+                )?)?;
+                let settings = ExecutionSettings {
+                    profile: IMAGE_PROJECTION_PROFILE_ID,
+                    backend: "Reference",
+                    capacity_bytes: composition.runtime().descriptor().total_memory_bytes,
+                    staging_bytes: 65_536,
+                    backend_configuration: json!({"backend": "reference"}),
+                    live_allocations: Some(|runtime: &ReferenceDeviceRuntime| {
+                        runtime.snapshot().live_allocations
+                    }),
+                };
+                Ok(Self::Reference(ManagedProjection::new(
+                    config,
+                    directory,
+                    shape,
+                    Arc::clone(composition.runtime()),
+                    composition.registry(),
+                    composition.catalog(),
+                    composition.weight_materializers(),
+                    settings,
+                )?))
+            }
+            Backend::Cuda(options) => {
+                #[cfg(feature = "cuda")]
+                {
+                    cuda::create(config, directory, shape, options).map(Self::Cuda)
+                }
+                #[cfg(not(feature = "cuda"))]
+                {
+                    let _ = options;
+                    bail!("CUDA backend requires --features cuda")
+                }
+            }
+        }
+    }
+
+    pub fn provenance(&self) -> &Value {
+        match self {
+            Self::Reference(executor) => executor.provenance(),
+            #[cfg(feature = "cuda")]
+            Self::Cuda(executor) => executor.provenance(),
+        }
+    }
+
+    pub fn execute(&mut self, name: &str, input: &[u8]) -> Result<ManagedHostBytes> {
+        match self {
+            Self::Reference(executor) => executor.execute(name, input),
+            #[cfg(feature = "cuda")]
+            Self::Cuda(executor) => executor.execute(name, input),
+        }
+    }
+
+    pub fn close(self) -> Result<Value> {
+        match self {
+            Self::Reference(executor) => executor.close(),
+            #[cfg(feature = "cuda")]
+            Self::Cuda(executor) => executor.close(),
+        }
+    }
+}
+
+struct ExecutionSettings<R> {
+    profile: &'static str,
+    backend: &'static str,
+    capacity_bytes: u64,
+    staging_bytes: usize,
+    backend_configuration: Value,
+    live_allocations: Option<fn(&R) -> u64>,
+}
+
+pub struct ManagedProjection<R: DeviceRuntime> {
+    executor: PreparedTensorExecutor<R>,
+    resources: Arc<PlanRuntimeResources<R>>,
+    runtime: Arc<R>,
+    live_allocations: Option<fn(&R) -> u64>,
+    host: HostMemoryAccount,
+    input_spec: ResolvedTensorSpec,
+    output_spec: ResolvedTensorSpec,
+    provenance: Value,
+}
+
+impl<R: DeviceRuntime> ManagedProjection<R> {
+    fn new(
+        config: &QwenImage21Config,
+        directory: &Path,
+        shape: ProjectionShape,
+        runtime: Arc<R>,
+        registry: &OperationRuntimeRegistry<R>,
+        catalog: &CapabilityCatalog,
+        weight_materializers: &WeightMaterializerRegistry,
+        settings: ExecutionSettings<R>,
     ) -> Result<Self> {
         if shape.inputs as u64 != config.in_channels()
             || shape.outputs as u64 != config.hidden_size()
         {
             bail!("tool shape does not match the checked family configuration");
         }
-        let profile =
-            NumericalProfileId::new(IMAGE_PROJECTION_PROFILE_ID).map_err(anyhow::Error::msg)?;
+        let profile = NumericalProfileId::new(settings.profile).map_err(anyhow::Error::msg)?;
         let family = TypedFamilyRegistration::new(QwenImage21ImageProjectionFamily::new()?)
             .prepare_with_profile(&serde_json::to_value(config)?, &profile)?;
-        let composition =
-            ReferenceVNextComposition::create(id("device.reference.qwen_image21.projection")?)?;
-        let descriptor = composition.runtime().descriptor();
+        let descriptor = runtime.descriptor();
         let policy = TensorPolicy {
-            capacity_bytes: descriptor.total_memory_bytes,
+            capacity_bytes: settings.capacity_bytes,
             storage_profiles: descriptor
                 .dynamic_storage_profiles
                 .iter()
@@ -114,43 +209,46 @@ impl ProjectionExecutor {
                 layout: ResolvedTensorLayout::Contiguous,
             },
         )]))?;
-        options.require_weight_materializer(composition.weight_materializer_id().clone());
+        options.require_weight_materializer(id(IDENTITY_WEIGHT_MATERIALIZER_ID)?);
         if !options.retain_completion_value(id(IMAGE_PROJECTION_OUTPUT_ID)?) {
             bail!("projection output was already retained unexpectedly");
         }
         let compilation = ProgramPlanCompiler::compile_with_weight_materializers(
             &family,
-            composition.catalog(),
+            catalog,
             &policy,
-            &composition.registry().planning(),
-            composition.weight_materializers(),
+            &registry.planning(),
+            weight_materializers,
             &options,
         )?;
         let executable = compilation.executable();
         let plan = executable.execution_plan();
-        let providers = composition.registry().bind_plan(executable)?;
+        let providers = registry.bind_plan(executable)?;
         let source = SafetensorsArchive::open(directory)?;
-        let resources = initialize_resources(
-            Arc::clone(composition.runtime()),
-            &family,
-            plan,
-            &source,
-            shape.weight_bytes()? as u64,
-        )?;
         let input_bytes = shape.input_bytes()?;
         let output_bytes = shape.output_bytes()?;
         let total_bytes = input_bytes
             .checked_add(output_bytes)
+            .and_then(|bytes| bytes.checked_add(settings.staging_bytes))
             .context("Host capacity overflows")?;
         let host = HostMemoryAccount::new(HostMemoryLimits::new(
             total_bytes,
             HostMemoryClassLimits {
                 input_preprocess_bytes: input_bytes,
-                transfer_staging_bytes: 0,
+                transfer_staging_bytes: settings.staging_bytes,
                 output_bytes,
                 weight_backing_bytes: 0,
             },
         )?);
+        let resources = initialize_resources(
+            Arc::clone(&runtime),
+            &family,
+            plan,
+            &source,
+            shape.weight_bytes()? as u64,
+            &host,
+            settings.staging_bytes,
+        )?;
         let executor = PreparedTensorExecutor::new(
             executable.clone(),
             providers,
@@ -170,17 +268,23 @@ impl ProjectionExecutor {
         let output_spec = tensor_spec(shape.outputs as u64)?;
         let provenance = json!({
             "family": IMAGE_PROJECTION_FAMILY_ID,
-            "profile": IMAGE_PROJECTION_PROFILE_ID,
+            "profile": settings.profile,
             "operation": DENSE_LINEAR_BF16_OPERATION_ID,
             "operation_version": "1.0",
             "numerical_validation": "OperationDefined; independent Candle F64 error bounds, analytic BF16 bits",
             "plan_hash": plan.plan_hash(),
             "runtime_fingerprint": descriptor.runtime_implementation_fingerprint,
-            "device_class": "Reference",
-            "runtime_capacity_bytes": descriptor.total_memory_bytes,
+            "providers": plan.payload().nodes().iter().map(|node| json!({
+                "provider_id": node.provider_resources().provider_id(),
+                "implementation_fingerprint": node.provider_implementation_fingerprint(),
+            })).collect::<Vec<_>>(),
+            "device_class": settings.backend,
+            "backend_configuration": settings.backend_configuration,
+            "runtime_capacity_bytes": settings.capacity_bytes,
             "managed_host_capacity_bytes": total_bytes,
             "managed_input_bytes": input_bytes,
             "managed_output_bytes": output_bytes,
+            "managed_transfer_staging_bytes": settings.staging_bytes,
             "initialized_weight_bytes": shape.weight_bytes()?,
             "work": "FixedTensor; no token or KV placeholder",
             "timing_scope": "no performance or throughput claim"
@@ -188,7 +292,8 @@ impl ProjectionExecutor {
         Ok(Self {
             executor,
             resources,
-            composition,
+            runtime,
+            live_allocations: settings.live_allocations,
             host,
             input_spec,
             output_spec,
@@ -241,7 +346,8 @@ impl ProjectionExecutor {
         let Self {
             executor,
             resources,
-            composition,
+            runtime,
+            live_allocations,
             host,
             ..
         } = self;
@@ -253,9 +359,9 @@ impl ProjectionExecutor {
             }
             Err(error) => bail!("projection close failed: {:?}", error.failure()),
         };
-        let snapshot = composition.runtime().snapshot();
+        let live_allocations = live_allocations.map(|snapshot| snapshot(&runtime));
         let usage = host.usage()?;
-        if snapshot.live_allocations != 0
+        if live_allocations.is_some_and(|count| count != 0)
             || usage.committed_bytes() != 0
             || usage.allocated_bytes() != 0
         {
@@ -263,21 +369,23 @@ impl ProjectionExecutor {
         }
         Ok(json!({
             "released_static_resources": released,
-            "runtime_live_allocations": snapshot.live_allocations,
+            "runtime_live_allocations": live_allocations,
             "managed_host_committed_bytes": usage.committed_bytes(),
             "managed_host_allocated_bytes": usage.allocated_bytes(),
-            "scope": "this executor's device allocations and injected Host account, not process RSS"
+            "scope": "plan close receipt and injected Host account; CUDA allocation count is unavailable (null), not inferred zero; no process RSS or opaque-memory qualification"
         }))
     }
 }
 
-fn initialize_resources(
-    runtime: Arc<ReferenceDeviceRuntime>,
+fn initialize_resources<R: DeviceRuntime>(
+    runtime: Arc<R>,
     family: &PreparedModelFamily,
     plan: &ExecutionPlan,
     source: &SafetensorsArchive,
     expected_bytes: u64,
-) -> Result<Arc<PlanRuntimeResources<ReferenceDeviceRuntime>>> {
+    host: &HostMemoryAccount,
+    staging_bytes: usize,
+) -> Result<Arc<PlanRuntimeResources<R>>> {
     let provisioned =
         plan.provision_static(runtime.clone(), id("request.projection.provision")?)?;
     let permit = match provisioned.into_provisioning() {
@@ -311,11 +419,12 @@ fn initialize_resources(
         committed.maintenance_controller().initialize_pool(&pool)?;
     }
     let initialized = committed
-        .initialize_static(
+        .initialize_static_managed(
             family,
             plan,
             source,
-            StaticInitializationPolicy::new(1 << 20, 8)?,
+            host,
+            StaticInitializationPolicy::new(u64::try_from(staging_bytes)?, 64)?,
         )
         .map_err(|error| anyhow::anyhow!("static initialization failed: {error:?}"))?;
     if initialized.receipt().uploaded_bytes() != expected_bytes {
