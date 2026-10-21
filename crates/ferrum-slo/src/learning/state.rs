@@ -106,6 +106,10 @@ impl Clock {
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Semantics {
+    // Files written before width history existed used Recent exclusively.
+    // A missing field must never be inferred as the caller's selected policy.
+    #[serde(default)]
+    training_history: super::TrainingHistoryPolicy,
     calibration_samples: usize,
     minimum_samples: usize,
     calibration_ttl_ms: u64,
@@ -118,6 +122,7 @@ struct Semantics {
 impl From<&LearningConfig> for Semantics {
     fn from(config: &LearningConfig) -> Self {
         Self {
+            training_history: config.training_history,
             calibration_samples: config.calibration_samples,
             minimum_samples: config.min_calibration_samples,
             calibration_ttl_ms: config.calibration_ttl_ms,

@@ -146,6 +146,14 @@ pub(crate) fn resolve_product_slo(mut slo: SloConfig) -> Result<SloConfig> {
     Ok(slo)
 }
 
+fn learning_config(slo: &SloConfig) -> LearningConfig {
+    LearningConfig {
+        query: slo.policy.query,
+        training_history: slo.training_history,
+        ..LearningConfig::default()
+    }
+}
+
 impl ProductExecutionFeedback {
     /// Off allocates no learning queue, worker, source, or request observer.
     pub(crate) fn prepare(
@@ -218,7 +226,10 @@ impl ProductExecutionFeedback {
                 });
             }
             _ => {
-                let learning = LearningConfig::default();
+                let learning = learning_config(&slo);
+                learning
+                    .validate()
+                    .map_err(|error| FerrumError::config(error.to_string()))?;
                 if slo.policy.query.max_participants > learning.collection.max_participants
                     || !ExecutionAttemptSummary::projected_bytes(slo.policy.query.max_participants)
                         .is_some_and(|bytes| bytes <= learning.collection.max_summary_bytes)
@@ -270,7 +281,7 @@ impl ProductExecutionFeedback {
                     (None, PersistenceStatus::SkippedUnbound { reason: reason.clone() })
                 }
             };
-            let learning = LearningConfig { query: slo.policy.query, ..LearningConfig::default() };
+            let learning = learning_config(&slo);
             let learner = match slo.predictor {
                 PredictorFamily::Auto => LearningEstimator::spawn_auto_with_state(learning, bound.identity, state_path.as_deref()),
                 PredictorFamily::QuantileGbdt => LearningEstimator::spawn_with_state(learning, bound.identity, ModelFamily::Gbdt, state_path.as_deref()),
@@ -343,6 +354,33 @@ impl ProductExecutionFeedback {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shared_product_toml_passes_width_history_to_both_learned_modes() {
+        for mode in ["observe", "learn_and_control"] {
+            let raw = format!("ttft_ms = 200\ntpot_ms = 15\nitl_ms = 50\nmode = '{mode}'\npredictor = 'physical'\n[training_history]\nmode = 'width_stratified'\nsamples_per_width = 2\n");
+            let slo: SloConfig = toml::from_str(&raw).unwrap();
+            let learned = learning_config(&slo);
+            assert_eq!(
+                learned.training_history,
+                ferrum_types::TrainingHistoryPolicy::WidthStratified {
+                    samples_per_width: 2
+                }
+            );
+            assert_eq!(
+                (
+                    learned.training_samples,
+                    learned.validation_samples,
+                    learned.calibration_samples
+                ),
+                (128, 32, 32)
+            );
+            learned.validate().unwrap();
+            let mut engine = EngineConfig::default();
+            ProductExecutionFeedback::prepare(&mut engine, Some(slo), None).unwrap();
+            assert_eq!(engine.scheduler.slo.is_some(), mode == "learn_and_control");
+        }
+    }
 
     #[test]
     fn default_and_explicit_off_need_no_runtime_or_worker() {

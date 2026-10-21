@@ -78,6 +78,37 @@ combination inside the envelope; calibration can still use a same-domain global
 fallback. Refitting rebuilds support from that fit's evidence and does not carry
 forward an old envelope automatically.
 
+The default training history policy is `recent`: each fit uses the latest 128
+training, 32 validation and 32 calibration observations from its domain's
+512-observation window. Both entrypoints also accept this optional TOML setting:
+
+```toml
+[scheduler.slo.training_history]
+mode = "width_stratified"
+samples_per_width = 2
+```
+
+`samples_per_width` must be 1 or 2. This policy retains that many newest eligible
+actual observations per batch width and work domain, separately from the ordinary
+window. Before a fit, it combines fresh retained observations with window entries
+strictly before the unchanged validation suffix, removes duplicate sequence IDs,
+and selects the fixed training count round-robin by ascending width, newest first
+within each width. The validation and calibration suffixes stay chronological and
+disjoint. Selection never depends on labels, residuals or benchmark responses.
+The temporary union and per-domain history are included in configured memory
+bounds. Widths with no eligible measured evidence gain no support.
+
+Retained observations keep their original timestamps. With `width_stratified`,
+model expiry is bounded by the oldest observation used in any fitting or
+qualification partition; another fit cannot renew old width evidence. New
+revisions recompute residuals from their own calibration suffix and never copy
+the previous revision's envelope or residuals. The policy and representative
+count must match persisted state exactly; older files without this setting mean
+`recent`. Observation histories are not persisted and refill after restart.
+This is empirical support retention, not conditional calibration or a guarantee
+that every future width or context will be supported. Experiments must freeze
+the same declared history policy across compared arms.
+
 Completion estimates select arrivals by original ingress age, from the configured
 maturity through the stopping evidence TTL (60 seconds by default), inclusively.
 The same bounds apply to successes, failures, active requests and missing facts.

@@ -10,6 +10,9 @@ use ferrum_types::RequestId;
 #[path = "online_qualification_tests.rs"]
 mod online_qualification;
 
+#[path = "width_history_fit_tests.rs"]
+mod width_history_fit;
+
 fn config() -> LearningConfig {
     LearningConfig {
         training_samples: 4,

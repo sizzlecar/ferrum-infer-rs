@@ -197,6 +197,32 @@ pub enum SloStrategy {
     ReferenceStepDiagnostic,
 }
 
+/// Label-independent selection of actual execution observations for fitting.
+/// Validation/calibration remain the fixed most-recent chronological suffix.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "mode", rename_all = "snake_case", deny_unknown_fields)]
+pub enum TrainingHistoryPolicy {
+    #[default]
+    Recent,
+    WidthStratified {
+        samples_per_width: usize,
+    },
+}
+
+impl TrainingHistoryPolicy {
+    pub fn validate(self) -> Result<(), String> {
+        match self {
+            Self::Recent => Ok(()),
+            Self::WidthStratified {
+                samples_per_width: 1..=2,
+            } => Ok(()),
+            Self::WidthStratified { .. } => {
+                Err("SLO width history requires 1 or 2 samples per width".into())
+            }
+        }
+    }
+}
+
 /// Product configuration retains the existing flat `[scheduler.slo]` wire
 /// shape. Only `policy` is projected into the engine/scheduler configuration.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -204,6 +230,7 @@ pub struct SloConfig {
     pub policy: crate::SchedulerSloConfig,
     pub mode: SloMode,
     pub predictor: PredictorFamily,
+    pub training_history: TrainingHistoryPolicy,
     pub reference: ReferenceEstimatorConfig,
     // Legacy summary bounds are converted by assembly, which knows the
     // execution-summary layout. They never become neutral query byte bounds.
@@ -216,6 +243,7 @@ impl SloConfig {
             policy,
             mode: SloMode::LearnAndControl,
             predictor: PredictorFamily::Auto,
+            training_history: TrainingHistoryPolicy::Recent,
             reference: ReferenceEstimatorConfig::default(),
             legacy_query_observer_limits: None,
         }
@@ -223,6 +251,12 @@ impl SloConfig {
 
     pub fn validate(&self) -> Result<(), String> {
         self.policy.validate()?;
+        self.training_history.validate()?;
+        if self.predictor == PredictorFamily::ReferenceDiagnostic
+            && self.training_history != TrainingHistoryPolicy::Recent
+        {
+            return Err("SLO width history requires a learned predictor".into());
+        }
         self.reference.validate()
     }
 
@@ -252,7 +286,7 @@ impl Serialize for SloConfig {
     {
         use serde::ser::SerializeStruct;
         let migrated = self.legacy_query_observer_limits.is_none();
-        let mut state = serializer.serialize_struct("SloConfig", 11 + usize::from(migrated))?;
+        let mut state = serializer.serialize_struct("SloConfig", 12 + usize::from(migrated))?;
         state.serialize_field("ttft_ms", &self.policy.ttft_ms)?;
         state.serialize_field("tpot_ms", &self.policy.tpot_ms)?;
         state.serialize_field("itl_ms", &self.policy.itl_ms)?;
@@ -266,6 +300,7 @@ impl Serialize for SloConfig {
         state.serialize_field("unknown_stopping", &self.policy.unknown_stopping)?;
         state.serialize_field("mode", &self.mode)?;
         state.serialize_field("predictor", &self.predictor)?;
+        state.serialize_field("training_history", &self.training_history)?;
         state.serialize_field("reference", &self.reference)?;
         state.end()
     }
@@ -307,6 +342,8 @@ impl<'de> Deserialize<'de> for SloConfig {
             #[serde(default)]
             predictor: Option<PredictorFamily>,
             #[serde(default)]
+            training_history: TrainingHistoryPolicy,
+            #[serde(default)]
             reference: Option<ReferenceEstimatorConfig>,
         }
         let wire = Wire::deserialize(deserializer)?;
@@ -335,6 +372,7 @@ impl<'de> Deserialize<'de> for SloConfig {
             } else {
                 PredictorFamily::Auto
             }),
+            training_history: wire.training_history,
             reference,
             legacy_query_observer_limits,
         };
@@ -450,6 +488,36 @@ impl UnknownCostPolicy {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn training_history_policy_is_typed_bounded_and_defaults_to_recent() {
+        let mut config: SloConfig = "ttft:200,tpot:15,itl:50".parse().unwrap();
+        assert_eq!(config.training_history, TrainingHistoryPolicy::Recent);
+        config.training_history = TrainingHistoryPolicy::WidthStratified {
+            samples_per_width: 2,
+        };
+        let encoded = serde_json::to_value(config).unwrap();
+        assert_eq!(encoded["training_history"]["mode"], "width_stratified");
+        assert_eq!(
+            serde_json::from_value::<SloConfig>(encoded.clone()).unwrap(),
+            config
+        );
+        let mut legacy = encoded.clone();
+        legacy.as_object_mut().unwrap().remove("training_history");
+        assert_eq!(
+            serde_json::from_value::<SloConfig>(legacy)
+                .unwrap()
+                .training_history,
+            TrainingHistoryPolicy::Recent
+        );
+        for count in [0, 3] {
+            let mut invalid = encoded.clone();
+            invalid["training_history"]["samples_per_width"] = count.into();
+            assert!(serde_json::from_value::<SloConfig>(invalid).is_err());
+        }
+        config.predictor = PredictorFamily::ReferenceDiagnostic;
+        assert!(config.validate().is_err());
+    }
 
     #[test]
     fn known_infeasible_admission_wait_is_explicit_and_bounded() {

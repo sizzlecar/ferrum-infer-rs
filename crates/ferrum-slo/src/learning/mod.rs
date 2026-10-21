@@ -6,8 +6,10 @@ mod owner;
 mod snapshot;
 mod state;
 mod telemetry;
+mod width_history;
 mod worker;
 
+pub use ferrum_types::TrainingHistoryPolicy;
 pub use owner::{AutoFallbackReason, FamilyResolution, LearningEstimatorOwner};
 pub use state::{LearningStateError, StateLoadReport, StateLoadStatus, StateSaveReport};
 pub use telemetry::{DomainPredictionStats, LearningPredictionStats};
@@ -34,6 +36,7 @@ pub struct LearningConfig {
     /// At most the nine phase/reuse combinations for one execution identity.
     pub max_domains: usize,
     pub window_samples: usize,
+    pub training_history: TrainingHistoryPolicy,
     pub training_samples: usize,
     pub validation_samples: usize,
     pub calibration_samples: usize,
@@ -56,6 +59,7 @@ impl Default for LearningConfig {
             training: TrainingBudget::default(),
             max_domains: 9,
             window_samples: 512,
+            training_history: TrainingHistoryPolicy::Recent,
             training_samples: 128,
             validation_samples: 32,
             calibration_samples: 32,
@@ -73,6 +77,9 @@ impl LearningConfig {
     pub fn validate(&self) -> Result<(), EstimatorError> {
         let invalid = |message: &str| EstimatorError::Configuration(message.into());
         self.collection.validate()?;
+        self.training_history
+            .validate()
+            .map_err(|message| invalid(&message))?;
         self.query
             .validate()
             .map_err(EstimatorError::Configuration)?;
@@ -123,8 +130,13 @@ impl LearningConfig {
             .map_err(|e| invalid(&e.to_string()))?;
         let calibration = crate::calibration::OnlineCalibrator::<crate::model::FeatureDomain>::retained_bytes_bound(self.calibration_config())
             .ok_or_else(|| invalid("calibration memory bound overflow"))?;
+        let history_samples = self
+            .width_history_capacity()
+            .ok_or_else(|| invalid("width history bound overflow"))?;
         let per_domain = self
             .window_samples
+            .checked_add(history_samples)
+            .ok_or_else(|| invalid("width history bound overflow"))?
             .checked_mul(std::mem::size_of::<worker::Observation>())
             .and_then(|n| n.checked_add(models))
             .and_then(|n| n.checked_add(calibration))
@@ -152,6 +164,10 @@ impl LearningConfig {
             .owned_bytes_bound(fit)
             .map_err(|e| invalid(&e.to_string()))?
             .checked_add(self.required_samples() * std::mem::size_of::<worker::Observation>())
+            .and_then(|n| {
+                self.width_training_scratch_bytes()
+                    .and_then(|bytes| n.checked_add(bytes))
+            })
             .and_then(|n| n.checked_add(fit * std::mem::size_of::<crate::model::TrainingSample>()))
             .and_then(|n| {
                 n.checked_add(
@@ -184,6 +200,30 @@ impl LearningConfig {
 
     fn required_samples(&self) -> usize {
         self.training_samples + self.validation_samples + self.calibration_samples
+    }
+
+    fn width_history_capacity(&self) -> Option<usize> {
+        match self.training_history {
+            TrainingHistoryPolicy::Recent => Some(0),
+            TrainingHistoryPolicy::WidthStratified { samples_per_width } => self
+                .collection
+                .max_participants
+                .checked_mul(samples_per_width),
+        }
+    }
+
+    fn width_training_scratch_bytes(&self) -> Option<usize> {
+        if self.training_history == TrainingHistoryPolicy::Recent {
+            return Some(0);
+        }
+        self.window_samples
+            .checked_add(self.width_history_capacity()?)?
+            .checked_mul(std::mem::size_of::<worker::Observation>())?
+            .checked_add(
+                self.collection
+                    .max_participants
+                    .checked_mul(std::mem::size_of::<(usize, usize)>())?,
+            )
     }
 }
 

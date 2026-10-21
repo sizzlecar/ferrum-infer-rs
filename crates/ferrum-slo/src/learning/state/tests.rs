@@ -31,6 +31,53 @@ fn config() -> LearningConfig {
 fn identity() -> ExecutionIdentity {
     ExecutionIdentity::new("persistence/immutable-source/cpu/f32".into()).unwrap()
 }
+
+#[test]
+fn width_history_state_requires_exact_policy_and_legacy_files_mean_recent() {
+    let (mut config, snapshot, clock) = fixture(ModelFamily::Physical);
+    let (bytes, _) = encode(&snapshot, &config, ModelFamily::Physical, clock).unwrap();
+    let mut legacy: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    legacy["semantics"]
+        .as_object_mut()
+        .unwrap()
+        .remove("training_history");
+    let legacy = serde_json::to_vec(&legacy).unwrap();
+    assert!(decode(&legacy, &config, &identity(), ModelFamily::Physical, clock).is_ok());
+    config.training_history = super::super::TrainingHistoryPolicy::WidthStratified {
+        samples_per_width: 2,
+    };
+    assert!(decode(&legacy, &config, &identity(), ModelFamily::Physical, clock).is_err());
+    assert!(decode(&bytes, &config, &identity(), ModelFamily::Physical, clock).is_err());
+    let (stratified, _) = encode(&snapshot, &config, ModelFamily::Physical, clock).unwrap();
+    assert!(decode(
+        &stratified,
+        &config,
+        &identity(),
+        ModelFamily::Physical,
+        clock
+    )
+    .is_ok());
+    config.training_history = super::super::TrainingHistoryPolicy::WidthStratified {
+        samples_per_width: 1,
+    };
+    assert!(decode(
+        &stratified,
+        &config,
+        &identity(),
+        ModelFamily::Physical,
+        clock
+    )
+    .is_err());
+    config.training_history = super::super::TrainingHistoryPolicy::Recent;
+    assert!(decode(
+        &stratified,
+        &config,
+        &identity(),
+        ModelFamily::Physical,
+        clock
+    )
+    .is_err());
+}
 fn work() -> CostWork {
     CostWork {
         kind: AttemptWorkKind::Decode,

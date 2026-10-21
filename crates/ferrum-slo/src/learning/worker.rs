@@ -17,9 +17,9 @@ use std::{
 
 #[derive(Clone, Copy)]
 pub(super) struct Observation {
-    sample: TrainingSample,
-    completed_at: Instant,
-    sequence: u64,
+    pub(super) sample: TrainingSample,
+    pub(super) completed_at: Instant,
+    pub(super) sequence: u64,
 }
 
 struct Active {
@@ -35,6 +35,7 @@ struct Active {
 pub(super) struct Domain {
     key: FeatureDomain,
     window: VecDeque<Observation>,
+    width_history: super::width_history::WidthHistory,
     seen: u64,
     since_attempt: usize,
     active: Option<Active>,
@@ -63,6 +64,7 @@ impl Learner {
             learner.domains.push(Domain {
                 key: domain.model.domain(),
                 window: VecDeque::with_capacity(learner.config.window_samples),
+                width_history: super::width_history::WidthHistory::new(&learner.config),
                 seen: 0,
                 since_attempt: 0,
                 active: Some(Active {
@@ -162,6 +164,7 @@ impl Learner {
             self.domains.push(Domain {
                 key,
                 window: VecDeque::with_capacity(self.config.window_samples),
+                width_history: super::width_history::WidthHistory::new(&self.config),
                 seen: 0,
                 since_attempt: 0,
                 active: None,
@@ -265,11 +268,13 @@ impl Learner {
         if domain.window.len() == self.config.window_samples {
             domain.window.pop_front();
         }
-        domain.window.push_back(Observation {
+        let observation = Observation {
             sample,
             completed_at,
             sequence,
-        });
+        };
+        domain.window.push_back(observation);
+        domain.width_history.observe(&self.config, observation, now);
         domain.since_attempt = domain.since_attempt.saturating_add(1);
         shared
             .counters
@@ -373,8 +378,8 @@ fn fit(
     revision: u64,
     now: Instant,
 ) -> Result<Active, ModelError> {
-    let start = domain.window.len() - config.required_samples();
-    let observations: Vec<_> = domain.window.iter().skip(start).copied().collect();
+    let observations =
+        super::width_history::fit_observations(config, &domain.window, &domain.width_history, now)?;
     let training_end = config.training_samples;
     let fitting_end = training_end + config.validation_samples;
     let samples: Vec<_> = observations[..fitting_end]
@@ -388,8 +393,17 @@ fn fit(
         &samples[training_end..],
         &config.training,
     )?;
-    let model_expires_at = observations[training_end - 1]
-        .completed_at
+    let evidence_time = match config.training_history {
+        super::TrainingHistoryPolicy::Recent => observations[training_end - 1].completed_at,
+        // Every retained support point must expire on its original clock.
+        // A new fit must not use current labels to renew old width evidence.
+        super::TrainingHistoryPolicy::WidthStratified { .. } => observations
+            .iter()
+            .map(|observation| observation.completed_at)
+            .min()
+            .expect("populated fit partitions"),
+    };
+    let model_expires_at = evidence_time
         .checked_add(Duration::from_millis(config.model_ttl_ms))
         .filter(|expires| *expires > now)
         .ok_or(ModelError::InvalidData("training evidence expired"))?;
