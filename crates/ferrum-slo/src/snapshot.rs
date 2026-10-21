@@ -179,9 +179,6 @@ impl Source {
             sender,
         )
     }
-    pub fn revision(&self) -> u64 {
-        self.snapshots.load().revision
-    }
     pub fn install(&self, snapshot: Snapshot) {
         self.snapshots.store(Arc::new(snapshot));
     }

@@ -96,6 +96,7 @@ pub(crate) struct Correction {
     pub samples: usize,
     pub observed_at: Instant,
     pub expires_at: Instant,
+    #[cfg(test)]
     pub conditional: bool,
 }
 
@@ -124,7 +125,7 @@ impl WindowSnapshot {
         now: Instant,
         config: CalibrationConfig,
         quantile: f64,
-        conditional: bool,
+        _conditional: bool,
     ) -> Option<Correction> {
         let mut samples = 0;
         let mut oldest = None;
@@ -149,7 +150,8 @@ impl WindowSnapshot {
             samples,
             observed_at: newest?,
             expires_at: oldest?.checked_add(config.ttl)?,
-            conditional,
+            #[cfg(test)]
+            conditional: _conditional,
         })
     }
 }
