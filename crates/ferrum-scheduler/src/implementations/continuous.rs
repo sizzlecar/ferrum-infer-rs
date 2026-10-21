@@ -19,7 +19,7 @@ mod joint_selection;
 mod pressure;
 mod slo;
 mod time_policy;
-pub use slo::SchedulerSloSnapshot;
+pub use slo::{PlanningRoundObservation, SchedulerSloSnapshot};
 mod token_admission;
 pub use token_admission::{
     TokenAdmissionAccepted, TokenAdmissionApply, TokenAdmissionCandidate, TokenAdmissionRound,
@@ -1959,6 +1959,9 @@ impl ContinuousBatchScheduler {
         observer: &mut dyn FnMut(ExecutorAdmissionQueueObservation),
         mut planning: Option<&mut TimePlanningRound>,
     ) -> Result<BatchSelection> {
+        if let Some(round) = planning.as_deref_mut() {
+            round.selection_attempted = true;
+        }
         let batch = self.create_iteration_batch_with_time(
             intent.hint,
             WaitingAdmissionMode::Prepared {
@@ -1968,10 +1971,14 @@ impl ContinuousBatchScheduler {
             },
             Instant::now(),
             planning.as_deref_mut(),
-        )?;
-        if let Some(round) = planning.as_ref() {
+        );
+        if let Some(round) = planning
+            .as_ref()
+            .filter(|round| !round.diagnostics_scope_owned)
+        {
             self.slo_diagnostics.lock().record(round);
         }
+        let batch = batch?;
         Ok(BatchSelection {
             batch,
             retry_at: planning.as_ref().and_then(|round| round.retry_at()),

@@ -246,6 +246,47 @@ async fn cost_feedback_requires_both_inputs_and_keeps_default_off() {
 }
 
 #[tokio::test]
+async fn cost_feedback_counts_admission_only_progress_and_selection_once() {
+    let mut config = EngineConfig::default();
+    config.scheduler.slo = Some(policy());
+    config.scheduler.max_running_requests = 2;
+    config.scheduler.prefill_first_until_active = Some(2);
+    config.batching.max_batch_size = 2;
+    config.batching.max_num_batched_tokens = 16;
+    let source = Source::new(true);
+    let (engine, executor, tokenizer) = engine(config, source.clone(), false);
+    submit(&engine, &tokenizer, "test").await;
+
+    let outcome = engine
+        .active_inner()
+        .unwrap()
+        .run_iteration()
+        .await
+        .unwrap();
+    assert!(matches!(outcome, EngineIterationOutcome::Progressed));
+    assert_eq!(executor.prefill_calls.load(Ordering::Relaxed), 0);
+    assert_eq!(executor.batch_prefill_calls.load(Ordering::Relaxed), 0);
+    let admitted = engine.scheduler.slo_snapshot().unwrap();
+    assert_eq!(admitted.planning_rounds, 1);
+    assert_eq!(admitted.planning_rounds_before_selection, 1);
+    assert_eq!(source.load_count(), 1);
+
+    engine
+        .active_inner()
+        .unwrap()
+        .run_iteration()
+        .await
+        .unwrap();
+    assert_eq!(engine.scheduler.decoding_count(), 1);
+    let selected = engine.scheduler.slo_snapshot().unwrap();
+    assert_eq!(selected.planning_rounds, 2);
+    assert_eq!(selected.planning_rounds_before_selection, 1);
+    assert_eq!(source.load_count(), 2);
+    engine.shutdown().await.unwrap();
+    engine.wait_for_shutdown_completion().await.unwrap();
+}
+
+#[tokio::test]
 async fn cost_feedback_one_snapshot_spans_backing_growth_rounds_and_final_selection() {
     let mut config = EngineConfig::default();
     config.scheduler.slo = Some(policy());

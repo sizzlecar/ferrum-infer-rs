@@ -1290,7 +1290,7 @@ impl EngineInner {
         // rounds. Keep one immutable prediction version across all of them;
         // prediction queries still use their current monotonic time.
         let prefill_shape_policy = self.model_executor.prefill_shape_policy();
-        let mut planning = self.config.scheduler.slo.map(|policy| {
+        let mut planning = self.scheduler.observe_planning_round(self.config.scheduler.slo.map(|policy| {
             TimePlanningRound::new(
                 self.cost_snapshot_source
                     .as_ref()
@@ -1307,7 +1307,7 @@ impl EngineInner {
                     }
                 },
             )
-        });
+        }));
         if self
             .prepare_token_prefill_cohort(&hint, planning.as_mut())
             .await?
@@ -1359,6 +1359,7 @@ impl EngineInner {
             );
             (scheduled, observations)
         };
+        let planning = planning.finish();
         for observation in observations {
             self.trace_executor_admission_queue_observation(observation);
         }

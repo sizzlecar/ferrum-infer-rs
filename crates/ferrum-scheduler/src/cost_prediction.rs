@@ -287,6 +287,9 @@ pub struct TimePlanningRound {
     pub(crate) retry_at: Option<Instant>,
     pub(crate) time_blocked: bool,
     pub(crate) statistics: PlanningStatistics,
+    pub(crate) diagnostics_scope_owned: bool,
+    pub(crate) diagnostic_revision: Option<u64>,
+    pub(crate) selection_attempted: bool,
     pub(crate) selected: Vec<CostWork>,
     pub(crate) selected_exact: bool,
     pub(crate) execution_already_projected: bool,
@@ -318,6 +321,8 @@ impl TimePlanningRound {
                     max_participants: 0,
                     max_query_bytes: 0,
                 });
+        let diagnostic_revision =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| snapshot.revision())).ok();
         Self {
             snapshot,
             config,
@@ -327,6 +332,9 @@ impl TimePlanningRound {
             retry_at: None,
             time_blocked: false,
             statistics: PlanningStatistics::default(),
+            diagnostics_scope_owned: false,
+            diagnostic_revision,
+            selection_attempted: false,
             selected: Vec::new(),
             selected_exact: true,
             execution_already_projected: true,

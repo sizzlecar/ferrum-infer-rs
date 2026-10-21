@@ -134,6 +134,11 @@ It includes binding and persistence status, load status, collection drops,
 training failures, fit time and feedback delay. Feedback delay is the interval
 from actual invocation completion to worker consumption, including queue time.
 
+`planning_rounds` includes turns that end during admission, including errors and
+cancellation. `planning_rounds_before_selection` identifies that subset; each
+Engine turn is recorded once, before device execution. These counters describe
+planning activity and do not establish SLO feasibility or actual intervention.
+
 `live_prediction` groups actual invocation counters by model family and by
 phase/reuse domain for the current process. The observer freezes one center, risk base and available
 calibrated upper prediction before execution. Completion records center signed,
