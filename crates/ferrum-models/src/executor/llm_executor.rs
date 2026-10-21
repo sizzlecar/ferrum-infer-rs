@@ -284,6 +284,16 @@ impl ModelExecutor for LlmExecutor {
         self.lock_model().ok()?.paged_admission_capacity_snapshot()
     }
 
+    fn persistent_cohort_capacity(
+        &self,
+        query: &ferrum_execution::model_executor::PersistentCapacityQuery<'_>,
+    ) -> std::result::Result<
+        ferrum_execution::model_executor::PersistentCohortCapacitySnapshot,
+        ferrum_execution::model_executor::PersistentCapacityUnknown,
+    > {
+        self.observe_persistent_cohort_capacity(query)
+    }
+
     fn capabilities(&self) -> ExecutorCapabilities {
         let cfg = &self.model_config;
         ExecutorCapabilities {

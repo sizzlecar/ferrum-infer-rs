@@ -45,6 +45,7 @@ use crate::lora::{
 
 mod allocator_reclaim;
 pub(super) mod device_execution;
+mod persistent_capacity;
 mod prefix_preparation;
 use device_execution::{DeviceFrameResult, FrameLayout, LlamaExecutionFrame};
 
@@ -5579,6 +5580,13 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
 
 // FP16 DecoderOnlyLLM impl — full path with batched + unified-forward overrides.
 impl<B: MoeLlmBackend> DecoderOnlyLLM for LlamaFamilyModel<B, KvFp16> {
+    fn persistent_capacity_for_cohort(
+        &self,
+        query: &crate::common::llm::ModelPersistentCapacityQuery<'_>,
+    ) -> std::result::Result<(), ferrum_execution::model_executor::PersistentCapacityUnknown> {
+        self.observe_persistent_capacity(query)
+    }
+
     fn observe_token_allocator_reclaim(
         &self,
         blocked_cache_id: &str,

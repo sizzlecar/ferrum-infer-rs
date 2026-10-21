@@ -188,6 +188,13 @@ pub trait Backend: Send + Sync + Sized + 'static {
         None
     }
 
+    /// Read-only usable byte length of this exact buffer view. Implementations
+    /// must account for view offsets/lengths, not report a larger backing allocation.
+    /// This observation must not allocate, synchronize or read device contents.
+    fn buffer_storage_bytes(_buffer: &Self::Buffer) -> Option<usize> {
+        None
+    }
+
     /// Whether `LlamaFamilyModel::decode_batch_internal` may use its optimized
     /// batched decode path on this backend.
     ///

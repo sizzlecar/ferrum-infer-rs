@@ -11,7 +11,9 @@ use ferrum_execution::model_executor::{
 };
 use ferrum_types::Result;
 
+mod capacity;
 mod token;
+pub use capacity::{ModelCapacityResident, ModelPersistentCapacityQuery};
 pub(crate) use token::catch_host_execution;
 pub use token::{
     ModelExecutionRecovery, ModelKvPreparation, ModelKvReservation, ModelRetirementOutcome,
@@ -51,6 +53,15 @@ pub struct LlmRuntimeConfig {
 pub trait DecoderOnlyLLM: Send + Sync {
     /// Runtime-facing configuration.
     fn config(&self) -> &LlmRuntimeConfig;
+
+    /// Prove bounded cohort reuse using actual persistent owners and already
+    /// allocated backing. No reservation, future growth or transient guarantee.
+    fn persistent_capacity_for_cohort(
+        &self,
+        _query: &ModelPersistentCapacityQuery<'_>,
+    ) -> std::result::Result<(), ferrum_execution::model_executor::PersistentCapacityUnknown> {
+        Err(ferrum_execution::model_executor::PersistentCapacityUnknown::Unsupported)
+    }
 
     /// Qualified execution and closure for this configured implementation.
     /// The executor snapshots this immutable declaration at construction.

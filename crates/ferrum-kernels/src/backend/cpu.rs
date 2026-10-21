@@ -383,6 +383,10 @@ impl Backend for CpuBackend {
         Some(super::Dtype::F32)
     }
 
+    fn buffer_storage_bytes(buffer: &Self::Buffer) -> Option<usize> {
+        buffer.len().checked_mul(std::mem::size_of::<f32>())
+    }
+
     fn zero_buffer(_ctx: &mut Self::Context, buf: &mut Self::Buffer, len: usize) -> Result<()> {
         if buf.len() < len {
             return Err(FerrumError::model(format!(

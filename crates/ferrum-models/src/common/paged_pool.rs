@@ -144,6 +144,36 @@ pub struct BlockAllocator {
 }
 
 impl BlockAllocator {
+    /// Validate complete physical ownership without allocating or interpreting
+    /// prefix hash entries as pinned storage. Caller provides bounded scratch.
+    pub(crate) fn matches_complete_references(
+        &self,
+        references: &[u16],
+        seen: &mut [usize],
+    ) -> bool {
+        let capacity = self.capacity as usize;
+        if references.len() != capacity
+            || seen.len() != capacity
+            || self.ref_counts.len() != capacity
+            || references != self.ref_counts
+            || self.free_list.len() > capacity
+        {
+            return false;
+        }
+        seen.fill(0);
+        for &block in &self.free_list {
+            let index = block as usize;
+            if index >= capacity || references[index] != 0 || seen[index] != 0 {
+                return false;
+            }
+            seen[index] = 1;
+        }
+        references
+            .iter()
+            .zip(seen)
+            .all(|(&refs, seen)| (refs == 0) == (*seen == 1))
+    }
+
     /// Create a fresh allocator. All `num_blocks` blocks start free.
     /// Free-list is built so `allocate()` returns block 0 first, then 1,
     /// etc. — predictable for tests and ensures the lower physical

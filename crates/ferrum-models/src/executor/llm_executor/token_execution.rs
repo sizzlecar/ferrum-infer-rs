@@ -8,6 +8,7 @@
 use std::collections::HashMap;
 
 mod capacity;
+mod persistent_capacity;
 
 #[cfg(test)]
 use ferrum_execution::model_executor::{ExecutorSamplingOutput, LogitsReturnPolicy};

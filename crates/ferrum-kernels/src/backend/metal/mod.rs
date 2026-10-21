@@ -839,6 +839,14 @@ impl Backend for MetalBackend {
         Some(super::Dtype::F32)
     }
 
+    fn buffer_storage_bytes(buffer: &Self::Buffer) -> Option<usize> {
+        // MetalBuf has no offset: its logical typed length is the usable view.
+        // A backing MTLBuffer may be larger, but cannot enlarge that view.
+        let bytes = buffer.n.checked_mul(buffer.dtype.bytes_per_elem())?;
+        let backing = usize::try_from(buffer.raw.length()).ok()?;
+        (bytes <= backing).then_some(bytes)
+    }
+
     // ── Q4_K_M ────────────────────────────────────────────────────────
 
     /// Phase D step 2+3: unified typed uploader. Replaces from_slice_i32 +
