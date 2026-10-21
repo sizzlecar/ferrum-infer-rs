@@ -93,6 +93,7 @@ impl SchedulerSloSnapshot {
             .max(value.joint_cost_cache_peak_bytes);
         self.selections.joint_comparisons += value.joint_comparisons;
         self.selections.joint_interventions += value.joint_interventions;
+        self.selections.joint_decode_only_interventions += value.joint_decode_only_interventions;
         self.selections.joint_unknown_resources += value.joint_unknown_resources;
         self.selections.joint_unresolved += value.joint_unresolved;
         self.selections

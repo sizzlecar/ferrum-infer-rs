@@ -4,19 +4,25 @@ use ferrum_execution::{
     model_executor::{PrefillChunk, PrefillShapePolicy},
     token_execution::ExecutionRange,
 };
+use std::num::NonZeroUsize;
 
 /// A first-wave action changes only already admitted prefill work. The complete
 /// original static wave stays an explicit candidate. Every later wave uses the
 /// same copied policy, independent of the first action.
 #[derive(Debug, Clone, Copy)]
-pub(super) struct FirstAction {
-    pub prefill_limit: Option<usize>,
+pub(super) enum FirstAction {
+    Static,
+    PrefillLimit(NonZeroUsize),
+    /// Omit prefill from a mixed first wave while all its decoders progress.
+    /// This is not an empty wave or permission to change later continuation.
+    DecodeOnly,
 }
 
 #[derive(Debug, Clone, Copy)]
 pub(super) struct RequestShape {
     pub restored_tokens: usize,
     pub execution_ceiling: Option<usize>,
+    pub decode_only_allowed: bool,
 }
 
 pub(super) struct CohortTrajectory {
@@ -36,6 +42,26 @@ pub(super) struct CohortTrajectory {
 }
 
 impl CohortTrajectory {
+    pub(super) fn allows_decode_only(&self, members: &[GroupMember]) -> bool {
+        let mut has_prefill = false;
+        let mut has_decode = false;
+        for member in members {
+            let Some(shape) = self.shapes.get(member.request) else {
+                return false;
+            };
+            match member.work.kind {
+                AttemptWorkKind::Prefill => {
+                    if !shape.decode_only_allowed {
+                        return false;
+                    }
+                    has_prefill = true;
+                }
+                AttemptWorkKind::Decode => has_decode = true,
+            }
+        }
+        has_prefill && has_decode
+    }
+
     fn work(
         &self,
         index: usize,
@@ -226,22 +252,31 @@ impl TrajectoryAdapter<FirstAction> for CohortTrajectory {
         } else {
             self.natural_members(requests)?
         };
-        if let Some(limit) = first_action.and_then(|action| action.prefill_limit) {
-            if limit == 0 {
-                return Err(Unsupported::InvalidPlan);
+        match first_action {
+            Some(FirstAction::DecodeOnly) => {
+                if !self.allows_decode_only(&members) {
+                    return Err(Unsupported::InvalidPlan);
+                }
+                members.retain(|member| member.work.kind == AttemptWorkKind::Decode);
             }
-            for member in &mut members {
-                if member.work.kind == AttemptWorkKind::Prefill {
-                    let request = requests
-                        .get(member.request)
-                        .ok_or(Unsupported::InvalidPlan)?;
-                    member.work = self.work(
-                        member.request,
-                        request,
-                        limit.min(member.work.requested.as_range().len()),
-                    )?;
+            Some(FirstAction::PrefillLimit(limit)) => {
+                for member in &mut members {
+                    if member.work.kind == AttemptWorkKind::Prefill {
+                        let request = requests
+                            .get(member.request)
+                            .ok_or(Unsupported::InvalidPlan)?;
+                        member.work = self.work(
+                            member.request,
+                            request,
+                            limit.get().min(member.work.requested.as_range().len()),
+                        )?;
+                    }
                 }
             }
+            Some(FirstAction::Static) | None => {}
+        }
+        if members.is_empty() {
+            return Err(Unsupported::InvalidPlan);
         }
         self.push(members, plan)
     }

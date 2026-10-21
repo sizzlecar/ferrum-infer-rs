@@ -5,6 +5,7 @@ use crate::cost_prediction::{
 };
 use ferrum_interfaces::request_observation::*;
 
+mod decode_only;
 mod fill_first;
 mod partial_support;
 mod persistent_capacity;

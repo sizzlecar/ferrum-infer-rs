@@ -144,6 +144,23 @@ Missing facts with unknown ingress age remain unresolved. Recent successes canno
 enter early, and expired arrivals cannot linger as unknown only because a quiet
 service has not yet filled its count-based observation window.
 
+The joint policy keeps the original static wave and compares smaller prefill
+chunks. When that wave contains both prefill and decode work, it can also
+consider a decode-only first wave. This action retains every selected decoder
+and postpones the selected prefills; it does not change their admission, prompt
+position, output limit, or resource ownership. All candidates use the same
+continuation after the first wave and retain the existing support, planning,
+joint-risk, and gain checks.
+
+A request can be postponed this way only once without actual logical prefill
+progress. Planning another wave, restoring a cached prefix, or moving queues
+does not renew that eligibility. An executed prefill chunk that advances its
+logical progress does. A pure prefill wave cannot become an empty batch, and
+ordinary scheduling remains responsible for resource waits and subsequent
+work. These rules do not establish a measured latency or throughput benefit.
+`joint_decode_only_interventions` counts successfully applied decode-only waves
+within `joint_interventions`; merely evaluating or rejecting one does not count.
+
 ## Unknown and infeasible forecasts
 
 `unknown_cost` and `unknown_stopping` each accept `static_fallback`, `reject`, or

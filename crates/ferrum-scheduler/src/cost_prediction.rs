@@ -660,6 +660,9 @@ pub(crate) struct PlanningStatistics {
     pub joint_cost_cache_peak_bytes: u64,
     pub joint_comparisons: u64,
     pub joint_interventions: u64,
+    /// Successful decode-only first-wave applications; a subset of interventions.
+    /// Candidate evaluation and an attempted but failed application do not count.
+    pub joint_decode_only_interventions: u64,
     pub joint_unknown_resources: u64,
     pub joint_unresolved: u64,
     /// Returned comparison failures only; not inferred causes or request counts.

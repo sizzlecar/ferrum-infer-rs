@@ -112,15 +112,20 @@ fn assert_applied_rescue(alternative_step: Duration, ttft_limit: Duration) {
     assert_eq!(tokens(&batch, &prefill), 1);
     assert_eq!(tokens(&batch, &decoder), 1);
     assert_eq!(round.statistics.joint_interventions, 1);
-    // Known: seed plus three alternative groups. Unknown: static tail once
-    // per rank; Unknown distributions are intentionally not cached.
-    assert_actual_query_count(&round, &source, 4, 2);
+    assert_eq!(round.statistics.joint_decode_only_interventions, 0);
+    // Known: seed plus three prefill-limit groups, then DecodeOnly's singleton
+    // decoder and full-prefill group with the advanced decoder. Its final
+    // prefiller decode reuses the cache. Unknown: static tail once per rank;
+    // Unknown distributions are intentionally not cached.
+    assert_actual_query_count(&round, &source, 6, 2);
     let decision = round.statistics.joint_decision.dispatch;
     assert_eq!(decision.computed, 1);
     assert_eq!(decision.returned, 1);
     assert_eq!(decision.consumed, 1);
     assert_eq!(decision.post_finish_time_rejected, 0);
     assert_eq!(decision.outcomes.alternative, 1);
+    assert_eq!(decision.candidates.joint.feasible, 1);
+    assert_eq!(decision.candidates.joint.infeasible, 1);
     assert_eq!(decision.candidates.gates.eligible, 1);
     assert_eq!(decision.unresolved.decisions, 0);
     assert!(decision.latest_unresolved.is_none());
@@ -138,9 +143,10 @@ fn assert_applied_rescue(alternative_step: Duration, ttft_limit: Duration) {
             1
         );
         assert_eq!(health.selections.joint_interventions, 1);
+        assert_eq!(health.selections.joint_decode_only_interventions, 0);
         serde_json::to_value(health).unwrap();
     }
-    assert_actual_query_count(&round, &source, 4, 2);
+    assert_actual_query_count(&round, &source, 6, 2);
 }
 
 #[test]
@@ -165,9 +171,11 @@ fn actual_dispatch_records_unresolved_candidate_and_keeps_static_work() {
     assert_eq!(tokens(&batch, &prefill), 2);
     assert_eq!(tokens(&batch, &decoder), 1);
     assert_eq!(round.statistics.joint_interventions, 0);
-    // Known: seed plus two alternative groups. Both the static and candidate
-    // tails are Unknown, so each is queried again in the second rank.
-    assert_actual_query_count(&round, &source, 3, 4);
+    assert_eq!(round.statistics.joint_decode_only_interventions, 0);
+    // Known: seed plus two prefill-limit groups. The static tail, prefill-limit
+    // tail, and DecodeOnly's first singleton group are Unknown. Each is queried
+    // again in the second rank because Unknown distributions are not cached.
+    assert_actual_query_count(&round, &source, 3, 6);
     let decision = round.statistics.joint_decision.dispatch;
     assert_eq!(decision.computed, 1);
     assert_eq!(decision.returned, 1);
@@ -175,10 +183,10 @@ fn actual_dispatch_records_unresolved_candidate_and_keeps_static_work() {
     assert_eq!(decision.outcomes.feasibility_unresolved, 1);
     assert_eq!(decision.unresolved.decisions, 1);
     assert_eq!(decision.unresolved.no_alternatives, 0);
-    assert_eq!(decision.unresolved.candidates.joint.unresolved, 1);
+    assert_eq!(decision.unresolved.candidates.joint.unresolved, 2);
     let witness = decision.latest_unresolved.unwrap();
     assert_eq!(witness.partial_static_ranks, 2);
-    assert_eq!(witness.alternatives_total, 1);
+    assert_eq!(witness.alternatives_total, 2);
     assert_eq!(
         witness.alternatives[0].unwrap().unfinished_request_mass,
         2.0
@@ -202,7 +210,7 @@ fn actual_dispatch_records_unresolved_candidate_and_keeps_static_work() {
             .decisions,
         1
     );
-    assert_actual_query_count(&round, &source, 3, 4);
+    assert_actual_query_count(&round, &source, 3, 6);
 }
 
 #[test]

@@ -264,8 +264,8 @@ pub struct UnresolvedDecisionWitness {
     pub failure_limits: [f64; 4],
     pub product_success: ProductSuccessEvidence,
     pub static_action: ActionDecisionEvidence,
-    /// The production adapter creates at most two alternatives. Generic callers
-    /// still evaluate/count every alternative; omitted details are explicit.
+    /// Retain details for the first two alternatives. Every alternative is
+    /// evaluated and counted; any omitted details are explicit.
     pub alternatives: [Option<ActionDecisionEvidence>; 2],
     pub details_omitted: usize,
 }

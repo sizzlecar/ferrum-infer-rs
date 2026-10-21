@@ -8,6 +8,7 @@ use crate::{cost_prediction::*, joint_policy::*};
 use ferrum_interfaces::request_observation::{
     CompletionQuery, RequestStoppingObservation, StoppingForecast, StoppingQuery,
 };
+use std::num::NonZeroUsize;
 use trajectory::{CohortTrajectory, FirstAction, RequestShape};
 
 struct Cohort {
@@ -20,7 +21,7 @@ impl ContinuousBatchScheduler {
     pub(super) fn select_joint_first_wave(
         &self,
         hint: &BatchHint,
-        batch: &mut [ScheduledRequest],
+        batch: &mut Vec<ScheduledRequest>,
         round: &mut TimePlanningRound,
         now: Instant,
     ) {
@@ -36,6 +37,8 @@ impl ContinuousBatchScheduler {
             Ok(Some(action)) => {
                 if self.apply_joint_first_wave(batch, round, action) {
                     round.statistics.joint_interventions += 1;
+                    round.statistics.joint_decode_only_interventions +=
+                        u64::from(matches!(action, FirstAction::DecodeOnly));
                 } else {
                     round.statistics.static_fallbacks += 1;
                 }
@@ -147,21 +150,22 @@ impl ContinuousBatchScheduler {
             .map(|member| member.work.requested.as_range().len())
             .max()
             .unwrap_or(0);
-        let static_action = FirstAction {
-            prefill_limit: None,
-        };
+        let static_action = FirstAction::Static;
         let mut alternatives = if largest >= 2 {
-            vec![FirstAction {
-                prefill_limit: Some(largest.div_ceil(2)),
-            }]
+            vec![FirstAction::PrefillLimit(
+                NonZeroUsize::new(largest.div_ceil(2)).expect("positive prefill limit"),
+            )]
         } else {
             Vec::new()
         };
         let quarter = largest.div_ceil(4);
         if quarter < largest.div_ceil(2) {
-            alternatives.push(FirstAction {
-                prefill_limit: Some(quarter),
-            });
+            alternatives.push(FirstAction::PrefillLimit(
+                NonZeroUsize::new(quarter).expect("positive prefill limit"),
+            ));
+        }
+        if cohort.trajectory.allows_decode_only(&first_wave) {
+            alternatives.push(FirstAction::DecodeOnly);
         }
         if alternatives.len() + 1 > round.config.planning.max_candidates {
             return Err(Unsupported::CandidateBudget);
@@ -332,12 +336,14 @@ impl ContinuousBatchScheduler {
 
     fn apply_joint_first_wave(
         &self,
-        batch: &mut [ScheduledRequest],
+        batch: &mut Vec<ScheduledRequest>,
         round: &mut TimePlanningRound,
         action: FirstAction,
     ) -> bool {
-        let Some(limit) = action.prefill_limit else {
-            return false;
+        let limit = match action {
+            FirstAction::Static => return false,
+            FirstAction::DecodeOnly => return self.apply_joint_decode_only(batch, round),
+            FirstAction::PrefillLimit(limit) => limit.get(),
         };
         let mut prefill = self.prefill_queue.write();
         let mut updates = Vec::new();
@@ -385,6 +391,110 @@ impl ContinuousBatchScheduler {
             round.selected[index] = work;
             round.statistics.shrunk_prefills += 1;
         }
+        true
+    }
+
+    fn apply_joint_decode_only(
+        &self,
+        batch: &mut Vec<ScheduledRequest>,
+        round: &mut TimePlanningRound,
+    ) -> bool {
+        use ferrum_execution::execution_attempt::AttemptWorkKind;
+
+        if !round.cost_selection_is_exact(batch.len()) {
+            return false;
+        }
+        let mut prefill = self.prefill_queue.write();
+        let decode = self.decode_queue.read();
+        let mut prefill_count = 0;
+        let mut decode_count = 0;
+        // Validate the entire original wave before touching its reservations.
+        // Nominal prefill ranges can differ from exact projected cost ranges;
+        // recompute that projection instead of treating them as interchangeable.
+        for (index, (scheduled, selected)) in batch.iter().zip(&round.selected).enumerate() {
+            if batch[..index]
+                .iter()
+                .any(|previous| previous.request.id == scheduled.request.id)
+            {
+                return false;
+            }
+            let Some(tokens) = scheduled.tokens_to_process else {
+                return false;
+            };
+            let (request, is_decode) = match selected.kind {
+                AttemptWorkKind::Prefill => {
+                    let Some(request) = prefill
+                        .iter()
+                        .find(|request| request.inner.request.id == scheduled.request.id)
+                    else {
+                        return false;
+                    };
+                    if request.phase != RequestPhase::Prefilling
+                        || scheduled.tokens_processed != request.prefill_chunk_offset
+                        || request
+                            .joint_decode_only_deferred_generation
+                            .is_some_and(|last| {
+                                request.logical_work_frontier.progress_generation() <= last
+                            })
+                    {
+                        return false;
+                    }
+                    prefill_count += 1;
+                    (request, false)
+                }
+                AttemptWorkKind::Decode => {
+                    let Some(request) = decode.requests.get(&scheduled.request.id) else {
+                        return false;
+                    };
+                    if request.phase != RequestPhase::Decoding
+                        || scheduled.tokens_processed != request.total_tokens()
+                        || tokens != 1
+                    {
+                        return false;
+                    }
+                    decode_count += 1;
+                    (request, true)
+                }
+            };
+            if request.capacity_deferred_from_decode
+                || request.prefix_restore.is_pending()
+                || request.execution_capacity_deferral.is_some()
+                || request.execution_readiness_block.is_some()
+                || request.execution_maintenance_retry.is_some()
+                || request.output_readiness.is_some()
+                || request.capacity_deferred_until_release_epoch > 0
+                || request.prefix_rendezvous.held()
+                || self.cost_work(request, tokens, is_decode, round.prefill_shape_policy)
+                    != Some((*selected, true))
+            {
+                return false;
+            }
+        }
+        if prefill_count == 0 || decode_count == 0 {
+            return false;
+        }
+        // The skipped prefill remains admitted and queued. Only the pending
+        // schedule is withdrawn, without publishing progress or releasing KV.
+        for (scheduled, selected) in batch.iter().zip(&round.selected) {
+            if selected.kind == AttemptWorkKind::Prefill {
+                let request = prefill
+                    .iter_mut()
+                    .find(|request| request.inner.request.id == scheduled.request.id)
+                    .expect("validated locked prefill member");
+                request.joint_decode_only_deferred_generation =
+                    Some(request.logical_work_frontier.progress_generation());
+                request.logical_work_frontier.mark_scheduled(0);
+            }
+        }
+        let mut index = 0;
+        batch.retain(|_| {
+            let keep = round.selected[index].kind == AttemptWorkKind::Decode;
+            index += 1;
+            keep
+        });
+        round
+            .selected
+            .retain(|work| work.kind == AttemptWorkKind::Decode);
         true
     }
 
@@ -609,6 +719,9 @@ impl ContinuousBatchScheduler {
             shapes.push(RequestShape {
                 restored_tokens: request.prefix_restore.restored_tokens(),
                 execution_ceiling: request.prefill_execution_chunk_ceiling,
+                decode_only_allowed: request
+                    .joint_decode_only_deferred_generation
+                    .is_none_or(|last| request.logical_work_frontier.progress_generation() > last),
             });
             initial_admission.push(if index < residents {
                 InitialAdmission::Resident

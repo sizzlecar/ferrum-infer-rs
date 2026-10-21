@@ -426,6 +426,9 @@ pub struct ContinuousBatchRequest {
     slo_first_token_emitted: bool,
     /// Phase-independent logical progress and resident-work state.
     logical_work_frontier: LogicalWorkFrontier,
+    /// A decode-only first wave may defer this frontier once. Only actual
+    /// logical progress, not replanning or prefix restoration, renews it.
+    joint_decode_only_deferred_generation: Option<LogicalWorkGeneration>,
     /// Optional restore state for this admission, separate from compute work.
     prefix_restore: PrefixRestoreState,
     prefix_rendezvous: prefix_rendezvous::PrefixRendezvousRequestState,
@@ -477,6 +480,7 @@ impl ContinuousBatchRequest {
             decode_tokens: 0,
             slo_first_token_emitted: false,
             logical_work_frontier: LogicalWorkFrontier::default(),
+            joint_decode_only_deferred_generation: None,
             prefix_restore: PrefixRestoreState::default(),
             prefix_rendezvous: prefix_rendezvous::PrefixRendezvousRequestState::default(),
             kv_blocks: Vec::new(),
