@@ -89,8 +89,13 @@ pub use tensor_dense_bf16::{
     NUMERICAL_PROFILE_IDENTITY as CUDA_DENSE_BF16_NUMERICAL_PROFILE_IDENTITY,
 };
 pub use tensor_silu::{
+    BUNDLE_NUMERICAL_IDENTITY as CUDA_POINTWISE_BF16_NUMERICAL_PROFILE_IDENTITY,
+    GATED_RESIDUAL_NUMERICAL_PROFILE_ID as CUDA_GATED_RESIDUAL_BF16_NUMERICAL_PROFILE_ID,
+    MODULATION_NUMERICAL_PROFILE_ID as CUDA_MODULATION_SCALE_BF16_NUMERICAL_PROFILE_ID,
     NUMERICAL_PROFILE_ID as CUDA_SILU_BF16_NUMERICAL_PROFILE_ID,
     NUMERICAL_PROFILE_IDENTITY as CUDA_SILU_BF16_NUMERICAL_PROFILE_IDENTITY,
+    SILU_MUL_NUMERICAL_PROFILE_ID as CUDA_SILU_MUL_BF16_NUMERICAL_PROFILE_ID,
+    TANH_NUMERICAL_PROFILE_ID as CUDA_TANH_BF16_NUMERICAL_PROFILE_ID,
 };
 
 const TOKEN_EMBEDDING_PROVIDER_ID: &str = "provider.cuda.token_embedding.f16";
@@ -335,6 +340,10 @@ pub fn cuda_tensor_runtime_config(
     ]);
     config.capabilities = BTreeSet::from([
         CapabilityId::new(ferrum_runtime::SILU_BF16_CAPABILITY_ID)?,
+        CapabilityId::new(ferrum_runtime::SILU_MUL_BF16_CAPABILITY_ID)?,
+        CapabilityId::new(ferrum_runtime::TANH_BF16_CAPABILITY_ID)?,
+        CapabilityId::new(ferrum_runtime::MODULATION_SCALE_BF16_CAPABILITY_ID)?,
+        CapabilityId::new(ferrum_runtime::GATED_RESIDUAL_BF16_CAPABILITY_ID)?,
         CapabilityId::new(ferrum_runtime::DENSE_LINEAR_BF16_CAPABILITY_ID)?,
     ]);
     config.dynamic_storage_profiles = BTreeSet::from([DynamicStorageProfile::new(
@@ -349,7 +358,21 @@ pub fn cuda_tensor_runtime_config(
 pub fn cuda_vnext_silu_bf16_provider(
     runtime: &CudaDeviceRuntime,
 ) -> Result<Box<dyn OperationProvider<CudaDeviceRuntime>>, CudaDeviceRuntimeError> {
-    Ok(Box::new(tensor_silu::CudaTensorSiluProvider::new(runtime)?))
+    Ok(Box::new(tensor_silu::CudaTensorPointwiseProvider::single(
+        runtime,
+        tensor_silu::Kind::Silu,
+    )?))
+}
+
+/// Builds the five independent BF16 pointwise providers from one native
+/// module load and one shared capacity permit. Register their corresponding
+/// standard contracts alongside them. Do not combine this bundle with the
+/// standalone SiLU factory in the same runtime: only one bundle may be live.
+/// An encoded command retains the bundle after its provider is dropped.
+pub fn cuda_vnext_tensor_pointwise_providers(
+    runtime: &CudaDeviceRuntime,
+) -> Result<Vec<Box<dyn OperationProvider<CudaDeviceRuntime>>>, CudaDeviceRuntimeError> {
+    tensor_silu::providers(runtime)
 }
 
 /// Source, precise build options, and compiled PTX identity. This identifies

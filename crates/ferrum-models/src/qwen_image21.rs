@@ -5,11 +5,13 @@
 //! Transformer, text conditioning and image-generation pipeline remain separate
 //! work. Weight payloads use the existing runtime weight-source interface.
 
+mod block0_mlp;
 mod config;
 mod headers;
 mod image_projection;
 mod weights;
 
+pub use block0_mlp::QwenImage21Block0MlpFamily;
 pub use config::QwenImage21Config;
 pub use headers::{
     HeaderEvidence, PayloadVerification, QwenImage21Structure, ShardStructure, TensorStructure,

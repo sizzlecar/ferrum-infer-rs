@@ -2,8 +2,8 @@
 
 `CudaDeviceRuntime::new_tensor_eager(CudaTensorRuntimeConfig)` is the first
 bounded CUDA execution path for fixed tensor components. Its providers implement
-unary BF16 SiLU and BF16 Dense with FP32 accumulation. Full image generation is
-still in development.
+BF16 SiLU, SiLU-mul, tanh, modulation scale, gated residual, and BF16 Dense
+with FP32 accumulation. Full image generation is still in development.
 
 The path uses the ordinary program compiler, `PlanRuntimeResources`, and
 `PreparedTensorExecutor`. SiLU uses `ModelWeights::None`; Dense can bind stored
@@ -30,6 +30,10 @@ bootstrap authority; encoded commands retain the same owner. Commands, streams,
 fences and quarantine retain allocations and transfer owners until retirement.
 Unknown native creation or abandoned in-flight work conservatively retains
 reservations. This can require process restart after an unrecoverable error.
+The pointwise factory loads five functions once and shares the module owner
+between their providers. SiLU-mul rounds SiLU to BF16 before multiplication;
+modulation rounds `1 + scale`, and gated residual rounds `gate * update`, before
+their final operation. Each operation has its own CUDA numerical profile.
 
 Managed upload retains the original `ManagedHostBytes` through submission. It
 does not copy payloads into the token upload packet or a cached executable.
@@ -82,3 +86,19 @@ probes and dense inputs against an independent CPU F64 mathematical oracle.
 Artifacts record the configured budgets, provider identity, full output tensors,
 and comparisons. This is a partial projection check, not a full DiT block or
 deployed FP8/PyTorch equivalence. Reference remains the example's default backend.
+
+`verify_qwen_image21_mlp` accepts the same backend and budget options, plus
+`--config`, `--model-dir`, and `--artifact-dir`. Its optional `--index-file`
+defaults to `diffusion_pytorch_model.safetensors.index.json`; the weight archive
+selects this index explicitly without falling back to another file. It maps the
+existing shards and uploads only block 0's three MLP weights. Use an explicit
+staging budget such as `--cuda-transfer-staging-bytes 16777216` to avoid thousands
+of small synchronous upload chunks for those 288 MiB of BF16 weights.
+
+The MLP example takes an already normalized/modulated basis input. It checks
+every gate, up, and SiLU-mul channel and a predeclared subset of final output
+coordinates against expectations prepared from weights before execution. It
+preserves all four output tensors in external artifacts. This is a partial MLP
+check, not attention, a complete DiT block, image generation, or throughput
+qualification. Source mmap and oracle allocations are outside the managed host
+staging account.

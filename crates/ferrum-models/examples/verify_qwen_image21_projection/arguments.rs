@@ -92,6 +92,20 @@ impl Arguments {
         let config = values.remove("--config").context(USAGE)?.into();
         let weight_fragment = values.remove("--weight-fragment").context(USAGE)?.into();
         let artifact_dir = values.remove("--artifact-dir").context(USAGE)?.into();
+        let backend = Backend::parse_options(&mut values)?;
+        Ok(Some(Self {
+            config,
+            weight_fragment,
+            weight_sha256: weight_sha256.to_ascii_lowercase(),
+            artifact_dir,
+            backend,
+        }))
+    }
+}
+
+impl Backend {
+    /// Shared typed backend options for the standalone verification examples.
+    pub fn parse_options(mut values: &mut BTreeMap<String, OsString>) -> Result<Self> {
         let backend_name = values
             .remove("--backend")
             .unwrap_or_else(|| "reference".into());
@@ -149,13 +163,7 @@ impl Arguments {
         if !values.is_empty() {
             bail!("CUDA options require --backend cuda");
         }
-        Ok(Some(Self {
-            config,
-            weight_fragment,
-            weight_sha256: weight_sha256.to_ascii_lowercase(),
-            artifact_dir,
-            backend,
-        }))
+        Ok(backend)
     }
 }
 

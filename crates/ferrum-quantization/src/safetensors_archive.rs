@@ -89,6 +89,31 @@ impl SafetensorsArchive {
     pub fn open(model_dir: impl AsRef<Path>) -> Result<Self> {
         let model_dir = model_dir.as_ref();
         let shard_paths = discover_shards(model_dir)?;
+        Self::open_shards(shard_paths)
+    }
+
+    /// Opens an explicitly selected weight-map index in `model_dir`.
+    ///
+    /// The index name is a portable basename (no drive prefix), and shard paths remain relative to the
+    /// same model directory. This does not fall back to `model.safetensors`
+    /// or another index if the selected file is absent or invalid.
+    pub fn open_with_index(model_dir: impl AsRef<Path>, index_filename: &str) -> Result<Self> {
+        if index_filename.is_empty()
+            || matches!(index_filename, "." | "..")
+            || index_filename.contains(['/', '\\', ':'])
+        {
+            return Err(FerrumError::model(
+                "safetensors index must be an explicit file name within the model directory",
+            ));
+        }
+        let model_dir = model_dir.as_ref();
+        Self::open_shards(discover_index_shards(
+            model_dir,
+            &model_dir.join(index_filename),
+        )?)
+    }
+
+    fn open_shards(shard_paths: Vec<(String, PathBuf)>) -> Result<Self> {
         let mut shards = Vec::with_capacity(shard_paths.len());
         let mut tensors = BTreeMap::new();
         for (shard_index, (relative_path, path)) in shard_paths.into_iter().enumerate() {
@@ -635,6 +660,10 @@ fn discover_shards(model_dir: &Path) -> Result<Vec<(String, PathBuf)>> {
         return Ok(vec![(single_name.to_owned(), single)]);
     }
     let index_path = model_dir.join("model.safetensors.index.json");
+    discover_index_shards(model_dir, &index_path)
+}
+
+fn discover_index_shards(model_dir: &Path, index_path: &Path) -> Result<Vec<(String, PathBuf)>> {
     let raw = std::fs::read_to_string(&index_path)
         .map_err(|error| FerrumError::io(format!("read {index_path:?}: {error}")))?;
     let value: serde_json::Value = serde_json::from_str(&raw)
@@ -706,6 +735,67 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
+
+    #[test]
+    fn explicit_index_selects_its_shards_even_when_a_default_single_file_exists() {
+        let directory = tempdir().unwrap();
+        for (file, tensor, bytes) in [
+            ("model.safetensors", "unrelated", [9_u8, 9]),
+            ("weights-a.safetensors", "left", [1_u8, 2]),
+            ("weights-b.safetensors", "right", [3_u8, 4]),
+        ] {
+            let tensors =
+                BTreeMap::from([(tensor, TensorView::new(Dtype::U8, vec![2], &bytes).unwrap())]);
+            serialize_to_file(tensors, &None, &directory.path().join(file)).unwrap();
+        }
+        let index = "diffusion_pytorch_model.safetensors.index.json";
+        std::fs::write(
+            directory.path().join(index),
+            serde_json::to_vec(&serde_json::json!({
+                "weight_map": {
+                    "left": "weights-a.safetensors",
+                    "right": "weights-b.safetensors"
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let archive = SafetensorsArchive::open_with_index(directory.path(), index).unwrap();
+        assert_eq!(archive.tensor_count(), 2);
+        assert_eq!(archive.tensor("left").unwrap().bytes(), &[1, 2]);
+        assert_eq!(archive.tensor("right").unwrap().bytes(), &[3, 4]);
+        assert!(!archive.contains("unrelated"));
+        assert!(SafetensorsArchive::open(directory.path())
+            .unwrap()
+            .contains("unrelated"));
+    }
+
+    #[test]
+    fn explicit_index_rejects_invalid_names_and_missing_or_escaping_shards() {
+        let directory = tempdir().unwrap();
+        for name in [
+            "",
+            ".",
+            "..",
+            "../index.json",
+            "/index.json",
+            "sub/index.json",
+            "sub\\index.json",
+            "C:weights.index.json",
+        ] {
+            assert!(SafetensorsArchive::open_with_index(directory.path(), name).is_err());
+        }
+        let index = "weights.index.json";
+        assert!(SafetensorsArchive::open_with_index(directory.path(), index).is_err());
+        for shard in ["../weights.safetensors", "missing.safetensors"] {
+            std::fs::write(
+                directory.path().join(index),
+                serde_json::to_vec(&serde_json::json!({"weight_map": {"weight": shard}})).unwrap(),
+            )
+            .unwrap();
+            assert!(SafetensorsArchive::open_with_index(directory.path(), index).is_err());
+        }
+    }
 
     #[test]
     fn tensor_retains_its_exact_mmap_range_after_archive_drop() {
