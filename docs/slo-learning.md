@@ -98,7 +98,35 @@ disjoint. Selection never depends on labels, residuals or benchmark responses.
 The temporary union and per-domain history are included in configured memory
 bounds. Widths with no eligible measured evidence gain no support.
 
-Retained observations keep their original timestamps. With `width_stratified`,
+To retain causal feature extrema as training candidates as well, select:
+
+```toml
+[scheduler.slo.training_history]
+mode = "width_and_extrema"
+samples_per_width = 2
+```
+
+This policy keeps at most 18 distinct actual observations for the nine feature
+axes' minima and maxima, in addition to the bounded width history. An observation
+enters that reservoir only after it leaves the latest validation/calibration
+suffix. Before fitting, fresh extrema from the causal candidate union receive
+priority within the unchanged training sample count; remaining slots are selected
+by width and recency, accounting for the already selected records. If distinct
+extrema exceed the training budget, the candidate fit fails and the previous
+coherent model/calibrator remains active. This policy does not enlarge training
+or calibration windows, change the collection workload, or extrapolate support.
+
+The reservoir retains original timestamps and labels. Labels of old extremal
+observations enter training only; they are never copied into the new model's
+calibration suffix. Equal extrema can use a newer actual observation, but replay
+does not renew evidence. This bounded reservoir is not an exact record of all
+observations within the TTL: after a dominant extreme expires, a discarded
+runner-up may no longer be available, and support may shrink. It also cannot
+guarantee a direct training representative for every width when there are more
+widths than training slots. The default `recent` and existing `width_stratified`
+selection rules remain unchanged.
+
+Retained observations keep their original timestamps. With either width policy,
 model expiry is bounded by the oldest observation used in any fitting or
 qualification partition; another fit cannot renew old width evidence. New
 revisions recompute residuals from their own calibration suffix and never copy

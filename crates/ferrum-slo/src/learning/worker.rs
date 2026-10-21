@@ -275,6 +275,9 @@ impl Learner {
         };
         domain.window.push_back(observation);
         domain.width_history.observe(&self.config, observation, now);
+        domain
+            .width_history
+            .promote_prefix(&self.config, &domain.window, now);
         domain.since_attempt = domain.since_attempt.saturating_add(1);
         shared
             .counters
@@ -398,7 +401,8 @@ fn fit(
         super::TrainingHistoryPolicy::Recent => observations[training_end - 1].completed_at,
         // Every retained support point must expire on its original clock.
         // A new fit must not use current labels to renew old width evidence.
-        super::TrainingHistoryPolicy::WidthStratified { .. } => observations
+        super::TrainingHistoryPolicy::WidthStratified { .. }
+        | super::TrainingHistoryPolicy::WidthAndExtrema { .. } => observations
             .iter()
             .map(|observation| observation.completed_at)
             .min()

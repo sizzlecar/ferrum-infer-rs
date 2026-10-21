@@ -2,6 +2,7 @@
 //! A published model and its signed residuals always have the same revision.
 //! Final performance evaluation data are not inputs to this training interface.
 
+mod extrema_history;
 mod owner;
 mod rejection;
 mod snapshot;
@@ -135,6 +136,7 @@ impl LearningConfig {
             .ok_or_else(|| invalid("calibration memory bound overflow"))?;
         let history_samples = self
             .width_history_capacity()
+            .and_then(|count| count.checked_add(self.extrema_history_capacity()))
             .ok_or_else(|| invalid("width history bound overflow"))?;
         let rejection_bytes =
             rejection::Recorder::retained_bytes_bound(self.query.max_participants)
@@ -212,10 +214,22 @@ impl LearningConfig {
     fn width_history_capacity(&self) -> Option<usize> {
         match self.training_history {
             TrainingHistoryPolicy::Recent => Some(0),
-            TrainingHistoryPolicy::WidthStratified { samples_per_width } => self
+            TrainingHistoryPolicy::WidthStratified { samples_per_width }
+            | TrainingHistoryPolicy::WidthAndExtrema { samples_per_width } => self
                 .collection
                 .max_participants
                 .checked_mul(samples_per_width),
+        }
+    }
+
+    fn extrema_history_capacity(&self) -> usize {
+        if matches!(
+            self.training_history,
+            TrainingHistoryPolicy::WidthAndExtrema { .. }
+        ) {
+            extrema_history::MAX_EXTREMA
+        } else {
+            0
         }
     }
 
@@ -225,12 +239,23 @@ impl LearningConfig {
         }
         self.window_samples
             .checked_add(self.width_history_capacity()?)?
+            .checked_add(self.extrema_history_capacity())?
             .checked_mul(std::mem::size_of::<worker::Observation>())?
             .checked_add(
                 self.collection
                     .max_participants
                     .checked_mul(std::mem::size_of::<(usize, usize)>())?,
             )
+            .and_then(|bytes| {
+                let cursor_bytes = if self.extrema_history_capacity() == 0 {
+                    0
+                } else {
+                    self.collection
+                        .max_participants
+                        .checked_mul(std::mem::size_of::<(usize, usize)>())?
+                };
+                bytes.checked_add(cursor_bytes)
+            })
     }
 }
 

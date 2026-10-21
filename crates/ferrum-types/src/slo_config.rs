@@ -207,6 +207,11 @@ pub enum TrainingHistoryPolicy {
     WidthStratified {
         samples_per_width: usize,
     },
+    /// Causal feature extrema enter the fixed training budget before the
+    /// remaining slots are selected by width. Calibration is never replayed.
+    WidthAndExtrema {
+        samples_per_width: usize,
+    },
 }
 
 impl TrainingHistoryPolicy {
@@ -215,8 +220,11 @@ impl TrainingHistoryPolicy {
             Self::Recent => Ok(()),
             Self::WidthStratified {
                 samples_per_width: 1..=2,
+            }
+            | Self::WidthAndExtrema {
+                samples_per_width: 1..=2,
             } => Ok(()),
-            Self::WidthStratified { .. } => {
+            Self::WidthStratified { .. } | Self::WidthAndExtrema { .. } => {
                 Err("SLO width history requires 1 or 2 samples per width".into())
             }
         }
@@ -493,27 +501,40 @@ mod tests {
     fn training_history_policy_is_typed_bounded_and_defaults_to_recent() {
         let mut config: SloConfig = "ttft:200,tpot:15,itl:50".parse().unwrap();
         assert_eq!(config.training_history, TrainingHistoryPolicy::Recent);
-        config.training_history = TrainingHistoryPolicy::WidthStratified {
-            samples_per_width: 2,
-        };
-        let encoded = serde_json::to_value(config).unwrap();
-        assert_eq!(encoded["training_history"]["mode"], "width_stratified");
-        assert_eq!(
-            serde_json::from_value::<SloConfig>(encoded.clone()).unwrap(),
-            config
-        );
-        let mut legacy = encoded.clone();
-        legacy.as_object_mut().unwrap().remove("training_history");
-        assert_eq!(
-            serde_json::from_value::<SloConfig>(legacy)
-                .unwrap()
-                .training_history,
-            TrainingHistoryPolicy::Recent
-        );
-        for count in [0, 3] {
-            let mut invalid = encoded.clone();
-            invalid["training_history"]["samples_per_width"] = count.into();
-            assert!(serde_json::from_value::<SloConfig>(invalid).is_err());
+        for (mode, policy) in [
+            (
+                "width_stratified",
+                TrainingHistoryPolicy::WidthStratified {
+                    samples_per_width: 2,
+                },
+            ),
+            (
+                "width_and_extrema",
+                TrainingHistoryPolicy::WidthAndExtrema {
+                    samples_per_width: 2,
+                },
+            ),
+        ] {
+            config.training_history = policy;
+            let encoded = serde_json::to_value(config).unwrap();
+            assert_eq!(encoded["training_history"]["mode"], mode);
+            assert_eq!(
+                serde_json::from_value::<SloConfig>(encoded.clone()).unwrap(),
+                config
+            );
+            let mut legacy = encoded.clone();
+            legacy.as_object_mut().unwrap().remove("training_history");
+            assert_eq!(
+                serde_json::from_value::<SloConfig>(legacy)
+                    .unwrap()
+                    .training_history,
+                TrainingHistoryPolicy::Recent
+            );
+            for count in [0, 3] {
+                let mut invalid = encoded.clone();
+                invalid["training_history"]["samples_per_width"] = count.into();
+                assert!(serde_json::from_value::<SloConfig>(invalid).is_err());
+            }
         }
         config.predictor = PredictorFamily::ReferenceDiagnostic;
         assert!(config.validate().is_err());

@@ -13,6 +13,9 @@ mod online_qualification;
 #[path = "width_history_fit_tests.rs"]
 mod width_history_fit;
 
+#[path = "extrema_fit_tests.rs"]
+mod extrema_fit;
+
 #[path = "prediction_rejection_tests.rs"]
 mod prediction_rejection;
 

@@ -359,27 +359,37 @@ mod tests {
     #[test]
     fn shared_product_toml_passes_width_history_to_both_learned_modes() {
         for mode in ["observe", "learn_and_control"] {
-            let raw = format!("ttft_ms = 200\ntpot_ms = 15\nitl_ms = 50\nmode = '{mode}'\npredictor = 'physical'\n[training_history]\nmode = 'width_stratified'\nsamples_per_width = 2\n");
-            let slo: SloConfig = toml::from_str(&raw).unwrap();
-            let learned = learning_config(&slo);
-            assert_eq!(
-                learned.training_history,
-                ferrum_types::TrainingHistoryPolicy::WidthStratified {
-                    samples_per_width: 2
-                }
-            );
-            assert_eq!(
+            for (history_mode, policy) in [
                 (
-                    learned.training_samples,
-                    learned.validation_samples,
-                    learned.calibration_samples
+                    "width_stratified",
+                    ferrum_types::TrainingHistoryPolicy::WidthStratified {
+                        samples_per_width: 2,
+                    },
                 ),
-                (128, 32, 32)
-            );
-            learned.validate().unwrap();
-            let mut engine = EngineConfig::default();
-            ProductExecutionFeedback::prepare(&mut engine, Some(slo), None).unwrap();
-            assert_eq!(engine.scheduler.slo.is_some(), mode == "learn_and_control");
+                (
+                    "width_and_extrema",
+                    ferrum_types::TrainingHistoryPolicy::WidthAndExtrema {
+                        samples_per_width: 2,
+                    },
+                ),
+            ] {
+                let raw = format!("ttft_ms = 200\ntpot_ms = 15\nitl_ms = 50\nmode = '{mode}'\npredictor = 'physical'\n[training_history]\nmode = '{history_mode}'\nsamples_per_width = 2\n");
+                let slo: SloConfig = toml::from_str(&raw).unwrap();
+                let learned = learning_config(&slo);
+                assert_eq!(learned.training_history, policy);
+                assert_eq!(
+                    (
+                        learned.training_samples,
+                        learned.validation_samples,
+                        learned.calibration_samples
+                    ),
+                    (128, 32, 32)
+                );
+                learned.validate().unwrap();
+                let mut engine = EngineConfig::default();
+                ProductExecutionFeedback::prepare(&mut engine, Some(slo), None).unwrap();
+                assert_eq!(engine.scheduler.slo.is_some(), mode == "learn_and_control");
+            }
         }
     }
 

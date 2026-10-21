@@ -78,6 +78,38 @@ fn width_history_state_requires_exact_policy_and_legacy_files_mean_recent() {
     )
     .is_err());
 }
+
+#[test]
+fn extrema_history_state_requires_its_explicit_policy_and_width_count() {
+    let (mut config, snapshot, clock) = fixture(ModelFamily::Physical);
+    config.training_history = super::super::TrainingHistoryPolicy::WidthAndExtrema {
+        samples_per_width: 2,
+    };
+    let (bytes, _) = encode(&snapshot, &config, ModelFamily::Physical, clock).unwrap();
+    assert!(decode(&bytes, &config, &identity(), ModelFamily::Physical, clock).is_ok());
+    for policy in [
+        super::super::TrainingHistoryPolicy::Recent,
+        super::super::TrainingHistoryPolicy::WidthStratified {
+            samples_per_width: 2,
+        },
+        super::super::TrainingHistoryPolicy::WidthAndExtrema {
+            samples_per_width: 1,
+        },
+    ] {
+        let mut mismatched = config.clone();
+        mismatched.training_history = policy;
+        assert!(decode(
+            &bytes,
+            &mismatched,
+            &identity(),
+            ModelFamily::Physical,
+            clock
+        )
+        .is_err());
+        let (other, _) = encode(&snapshot, &mismatched, ModelFamily::Physical, clock).unwrap();
+        assert!(decode(&other, &config, &identity(), ModelFamily::Physical, clock).is_err());
+    }
+}
 fn work() -> CostWork {
     CostWork {
         kind: AttemptWorkKind::Decode,

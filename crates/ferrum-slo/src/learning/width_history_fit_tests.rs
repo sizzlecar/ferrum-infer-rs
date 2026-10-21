@@ -8,6 +8,108 @@ fn width_sample(width: usize, seconds: f64) -> TrainingSample {
 }
 
 #[test]
+fn width_history_latest_same_width_fit_can_forget_fresh_observed_context() {
+    for family in [ModelFamily::Physical, ModelFamily::Gbdt] {
+        let config = LearningConfig {
+            training_history: super::super::super::TrainingHistoryPolicy::WidthStratified {
+                samples_per_width: 2,
+            },
+            window_samples: 16,
+            model_ttl_ms: 1_000,
+            ..config()
+        };
+        let shared = shared(&config);
+        let mut learner = Learner::new(config, identity(), family);
+        let start = Instant::now();
+        let completed = |context: usize, sequence: u64| {
+            let at = start + Duration::from_millis(sequence);
+            ExecutionAttemptSummary {
+                started_at: at - Duration::from_millis(1),
+                completed_at: at,
+                eligibility: ExecutionAttemptEligibility::Completed,
+                participants: vec![ExecutionAttemptParticipant {
+                    request_id: RequestId::new(),
+                    kind: AttemptWorkKind::Decode,
+                    requested: ExecutionRange::new(context - 1, 1).unwrap(),
+                    context_tokens: context,
+                    prefix_restore: AttemptPrefixRestore::NoneObserved,
+                    internally_reused_tokens: None,
+                    product_failed: false,
+                    outcome: AttemptParticipantOutcome::Completed {
+                        work: ExecutedTokenWork::Decode {
+                            position: context - 1,
+                        },
+                        frontier_committed: true,
+                    },
+                }],
+            }
+        };
+        for sequence in 1..=8 {
+            let observation = completed(80, sequence);
+            learner.apply(&shared, &observation, observation.completed_at);
+        }
+        assert_eq!(shared.stats().model_fits, 1);
+        for sequence in 9..=15 {
+            let observation = completed(16, sequence);
+            learner.apply(&shared, &observation, observation.completed_at);
+        }
+        let old = learner.snapshot(start + Duration::from_millis(15)).unwrap();
+        let old_revision = old.domains[0].model_revision;
+        let original = completed(80, 8);
+        let original_work: Vec<_> = original.participants.iter().map(sample_work).collect();
+        let original_query = CostQuery {
+            work: &original_work,
+            work_is_exact: true,
+            execution: CostExecution::SingleInvocation,
+        };
+
+        let observation = completed(16, 16);
+        let now = observation.completed_at;
+        learner.apply(&shared, &observation, now);
+        let new = learner.snapshot(now).unwrap();
+        assert_eq!(shared.stats().model_fits, 2);
+        assert!(new.domains[0].model_revision > old_revision);
+        assert!(now < old.domains[0].model_expires_at);
+        assert!(now < new.domains[0].model_expires_at);
+        // This is selection loss, not age expiration or a missing old fact:
+        // every original context-80 observation still occupies the main window.
+        let domain = &learner.domains[0];
+        assert_eq!(domain.window.len(), 16);
+        assert_eq!(
+            domain
+                .window
+                .iter()
+                .filter(|item| item.sample.features.values()[8] == 80.0)
+                .count(),
+            8
+        );
+        assert_eq!(domain.active.as_ref().unwrap().fitting_through, 14);
+        assert!(matches!(
+            old.predict(&original_query, now),
+            CostPrediction::Known { .. }
+        ));
+        assert_eq!(
+            new.predict(&original_query, now),
+            CostPrediction::Unknown(CostUnknownReason::UnsupportedWithDetail(
+                CostUnsupportedDetail::OutsideObservedSupport
+            ))
+        );
+        let recent_work: Vec<_> = observation.participants.iter().map(sample_work).collect();
+        assert!(matches!(
+            new.predict(
+                &CostQuery {
+                    work: &recent_work,
+                    work_is_exact: true,
+                    execution: CostExecution::SingleInvocation,
+                },
+                now
+            ),
+            CostPrediction::Known { .. }
+        ));
+    }
+}
+
+#[test]
 fn width_history_refits_both_families_from_real_support_without_renewing_old_evidence() {
     for family in [ModelFamily::Physical, ModelFamily::Gbdt] {
         for policy in [
