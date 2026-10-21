@@ -5,6 +5,7 @@ use super::{
     FerrumError, PreparedRepeat, PromptCase, Result, ShareGptDatasetEvidence, ShareGptFilter,
     ShareGptReadLimits,
 };
+use ferrum_bench_core::dataset::ShareGptExclusionEvidence;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
@@ -14,7 +15,8 @@ use std::path::{Path, PathBuf};
 
 // Bump these contracts when parsing/selection or tokenization semantics change.
 // Neither a build commit nor a machine identity is part of cache validity.
-pub(super) const SELECTOR_CONTRACT: &str = "first-pair-reservoir-std-rng-shuffle-prefix-v1";
+pub(super) const SELECTOR_CONTRACT: &str =
+    "first-pair-history-excluded-reservoir-std-rng-shuffle-prefix-v2";
 pub(super) const TOKENIZATION_CONTRACT: &str =
     "encode-no-special-tokens-no-truncation-no-padding-v1";
 const CACHE_SCHEMA: u32 = 1;
@@ -30,6 +32,7 @@ struct CacheIdentity {
     effective_tokenizer_sha256: String,
     reader_config_sha256: String,
     filter: ShareGptFilter,
+    exclusions: Option<ShareGptExclusionEvidence>,
     selection_pool_size: Option<u32>,
     effective_pool_size: usize,
     prompt_seed: u64,
@@ -101,6 +104,10 @@ impl PreparedCache {
                 effective_tokenizer_sha256: json_hash(&tokenizer_value)?,
                 reader_config_sha256: json_hash(&ShareGptReadLimits::default())?,
                 filter: cmd.sharegpt.filter(),
+                exclusions: super::exclusions::Exclusions::load(
+                    &cmd.sharegpt.sharegpt_exclude_path,
+                )?
+                .evidence(),
                 selection_pool_size: cmd.sharegpt.sharegpt_selection_pool_size,
                 effective_pool_size: cmd.sharegpt.pool_size(count)?,
                 prompt_seed,
@@ -202,6 +209,7 @@ fn valid_payload(payload: &CachedRepeat, identity: &CacheIdentity) -> bool {
         || evidence.source_sha256 != identity.source_sha256
         || evidence.tokenizer_sha256 != identity.tokenizer_sha256
         || evidence.filter != identity.filter
+        || evidence.exclusions != identity.exclusions
         || evidence.selection_pool_size != identity.selection_pool_size
         || evidence.prompt_seed != identity.prompt_seed
         || evidence.ignore_eos != identity.ignore_eos

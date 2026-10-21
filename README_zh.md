@@ -57,6 +57,8 @@ ferrum serve --model qwen3.5:4b-q4_k_m --served-model-name ferrum --disable-thin
 
 首次运行自动下载权重；上下文、批处理及并发按可用内存适配，显式设置优先。示例关闭思考，删除 `--disable-thinking` 即恢复模型模板默认行为。
 
+`run` 和 `serve` 均可选择只学习观测或学习并控制，配置模型选择与执行实例绑定的持久化状态，见 [SLO 学习与调度](docs/slo-learning.md)。测量要求见[性能评估](docs/performance-evaluation.md)。
+
 应用的 API 地址设为 `http://127.0.0.1:8000/v1`，模型名设为 `ferrum`。支持 Chat Completions、无状态 Responses、流式输出、工具调用和结构化输出，具体字段见 [API 兼容说明](docs/openai-api-compatibility.md)。下载资产与发行状态见 [Releases](https://github.com/sizzlecar/ferrum-infer-rs/releases)。
 
 ## 模型与格式
