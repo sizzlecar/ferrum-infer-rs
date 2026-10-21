@@ -14,10 +14,12 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::watch;
 
+mod decision_diagnostics;
 mod persistent_capacity;
 mod scenario_diagnostics;
 mod unsupported_counts;
 mod unsupported_detail;
+pub(crate) use decision_diagnostics::{DecisionConsumerOutcome, JointDecisionDiagnostics};
 pub(crate) use scenario_diagnostics::{ComparisonKind, JointEvaluationDiagnostics};
 pub(crate) use unsupported_counts::JointUnsupportedCounts;
 pub use unsupported_detail::CostUnsupportedCounts;
@@ -649,6 +651,7 @@ pub(crate) struct PlanningStatistics {
     /// Entered scenario evaluations, separated from pre-evaluation failures
     /// and from each other at the actual admission/dispatch call sites.
     pub joint_evaluation: JointEvaluationDiagnostics,
+    pub joint_decision: JointDecisionDiagnostics,
     /// Actual immutable cost-distribution calls in completed comparisons.
     pub joint_cost_snapshot_queries: u64,
     /// Reuses of exact cost distributions, distinct from model calls.

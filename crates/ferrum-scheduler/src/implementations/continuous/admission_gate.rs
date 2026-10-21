@@ -2,6 +2,7 @@
 //! runs outside queue locks; exact queue incarnations are revalidated inside.
 
 use super::*;
+use crate::cost_prediction::{ComparisonKind, DecisionConsumerOutcome};
 use crate::joint_policy::{JointFeasibility, PolicyChoice, Unsupported};
 use ferrum_types::{KnownInfeasibleAdmissionPolicy, SloStrategy};
 
@@ -148,7 +149,7 @@ impl ContinuousBatchScheduler {
         if let Ok(decision) = &result {
             apply_before = apply_before.min(decision.valid_until);
         }
-        let verdict = match result {
+        let verdict = match &result {
             Ok(decision)
                 if decision.static_risk.classify(&round.config) == JointFeasibility::Feasible =>
             {
@@ -161,8 +162,26 @@ impl ContinuousBatchScheduler {
                 Verdict::RequiresAction
             }
             Ok(_) => Verdict::Unknown(Unsupported::FeasibilityUnresolved),
-            Err(error) => Verdict::Unknown(error),
+            Err(error) => Verdict::Unknown(*error),
         };
+        if let Ok(decision) = &result {
+            let outcome = match verdict {
+                Verdict::StaticFeasible => Some(DecisionConsumerOutcome::StaticFeasible),
+                Verdict::AllKnownInfeasible => Some(DecisionConsumerOutcome::AllKnownInfeasible),
+                Verdict::RequiresAction => Some(DecisionConsumerOutcome::RequiresAction),
+                Verdict::Unknown(Unsupported::FeasibilityUnresolved) => {
+                    Some(DecisionConsumerOutcome::FeasibilityUnresolved)
+                }
+                _ => None,
+            };
+            if let Some(outcome) = outcome {
+                round.statistics.joint_decision.consume(
+                    ComparisonKind::Admission,
+                    outcome,
+                    &decision.observation,
+                );
+            }
+        }
         match verdict {
             Verdict::Unknown(reason) => round.statistics.record_joint_unsupported(reason),
             Verdict::RequiresAction => {

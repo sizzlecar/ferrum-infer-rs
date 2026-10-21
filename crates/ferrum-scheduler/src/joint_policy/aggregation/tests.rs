@@ -1,5 +1,7 @@
 use super::*;
 
+mod decision_diagnostics;
+
 fn config() -> SchedulerSloConfig {
     "ttft:10,tpot:15,itl:15".parse().unwrap()
 }

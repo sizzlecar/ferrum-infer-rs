@@ -14,6 +14,7 @@ pub struct ScenarioPolicyDecision {
     /// True for observed debt, or when completion by a partial static window's
     /// lower bound was not proved. It is never a claim about the unknown window.
     pub any_window_debt: Vec<bool>,
+    pub observation: DecisionObservation,
 }
 
 #[derive(Default)]
@@ -35,6 +36,7 @@ struct Totals {
     unsupported_mass: f64,
     window_debt: bool,
     partial_window_unproven: bool,
+    unfinished_request_mass: f64,
 }
 
 struct Member {
@@ -58,6 +60,7 @@ pub struct ScenarioRiskAccumulator {
     revision: Option<u64>,
     ttft_limit: Duration,
     tpot_limit: Duration,
+    product_success_evidence: ProductSuccessEvidence,
 }
 
 impl ScenarioRiskAccumulator {
@@ -78,7 +81,9 @@ impl ScenarioRiskAccumulator {
             return Err(Unsupported::InvalidState);
         }
         let mut members = Vec::with_capacity(requests.len());
+        let mut product_success_evidence = ProductSuccessEvidence::default();
         for (request, success) in requests.iter().zip(product_success) {
+            let unavailable = success.is_none();
             let success = success.unwrap_or(ProbabilityInterval {
                 lower: 0.0,
                 upper: 1.0,
@@ -95,6 +100,11 @@ impl ScenarioRiskAccumulator {
             {
                 return Err(Unsupported::InvalidState);
             }
+            product_success_evidence.unavailable_requests += usize::from(unavailable);
+            product_success_evidence.uncertain_requests +=
+                usize::from(success.lower < success.upper);
+            product_success_evidence.success_lower_sum += success.lower;
+            product_success_evidence.success_upper_sum += success.upper;
             members.push(Member {
                 id: request.id.clone(),
                 prompt_tokens: request.prompt_tokens,
@@ -117,6 +127,7 @@ impl ScenarioRiskAccumulator {
                 .map_err(|_| Unsupported::InvalidState)?,
             tpot_limit: Duration::try_from_secs_f64(config.tpot_ms / 1000.0)
                 .map_err(|_| Unsupported::InvalidState)?,
+            product_success_evidence,
         })
     }
 
@@ -332,31 +343,52 @@ impl ScenarioRiskAccumulator {
             .iter()
             .map(Totals::target_time)
             .collect::<Vec<_>>();
-        let mut static_status = risks[0].classify(&self.config);
+        let static_raw = risks[0].classify(&self.config);
+        let mut static_status = static_raw;
         if self.partial_static_ranks > 0 && static_status != JointFeasibility::Infeasible {
             // Risk intervals alone never authorize optimization of a static
             // trajectory whose full cost/window is unknown.
             static_status = JointFeasibility::Unresolved;
         }
         let mut best = None;
+        let mut candidates = CandidateDecisionCounts::default();
+        let mut retained_gates = [None; 2];
         for index in 1..self.totals.len() {
-            if risks[index].classify(&self.config) != JointFeasibility::Feasible {
+            let joint = risks[index].classify(&self.config);
+            let metrics = MetricClasses::from_risk(risks[index], &self.config);
+            let mut record = |gate| {
+                candidates.record(joint, metrics, gate);
+                if let Some(slot) = retained_gates.get_mut(index - 1) {
+                    *slot = Some(gate);
+                }
+            };
+            if joint != JointFeasibility::Feasible {
+                record(if joint == JointFeasibility::Infeasible {
+                    SelectionGate::RiskInfeasible
+                } else {
+                    SelectionGate::RiskUnresolved
+                });
                 continue;
             }
             if self.totals[index].partial_window_unproven {
+                record(SelectionGate::PartialWindowUnproven);
                 continue;
             }
             let Some(time) = times[index] else {
+                record(SelectionGate::TargetTimeUnavailable);
                 continue;
             };
             if static_status == JointFeasibility::Feasible {
                 if self.totals[index].window_debt {
+                    record(SelectionGate::StaticFeasibleWindowDebt);
                     continue;
                 }
                 let (Some(static_time), Some(evidence)) = (times[0], paired[index - 1]) else {
+                    record(SelectionGate::StaticTimeOrPairedEvidenceUnavailable);
                     continue;
                 };
                 let Some(gain) = static_time.checked_sub(time) else {
+                    record(SelectionGate::CandidateNotFaster);
                     continue;
                 };
                 if evidence
@@ -364,11 +396,14 @@ impl ScenarioRiskAccumulator {
                     .checked_add(evidence.control_cost)
                     .is_none_or(|margin| gain <= margin)
                 {
+                    record(SelectionGate::GainNotAboveEvidenceMargin);
                     continue;
                 }
             } else if static_status == JointFeasibility::Unresolved {
+                record(SelectionGate::StaticUnresolved);
                 continue;
             }
+            record(SelectionGate::Eligible);
             if best.is_none_or(|(_, previous)| time < previous) {
                 best = Some((index - 1, time));
             }
@@ -390,6 +425,47 @@ impl ScenarioRiskAccumulator {
         } else {
             PolicyChoice::Unresolved
         };
+        let observation = DecisionObservation {
+            choice,
+            alternatives_total: self.totals.len() - 1,
+            static_raw,
+            static_effective: static_status,
+            static_metrics: MetricClasses::from_risk(risks[0], &self.config),
+            candidates,
+            unresolved: (choice == PolicyChoice::Unresolved).then(|| UnresolvedDecisionWitness {
+                revision: self.revision,
+                alternatives_total: self.totals.len() - 1,
+                static_raw,
+                static_effective: static_status,
+                partial_static_ranks: self.partial_static_ranks,
+                endpoint_unresolved_mass: summary.unresolved_mass,
+                failure_limits: [
+                    1.0 - self.config.joint.ttft_quantile,
+                    1.0 - self.config.joint.tpot_quantile,
+                    1.0 - self.config.joint.itl_quantile,
+                    1.0 - self.config.joint.min_completion_rate,
+                ],
+                product_success: self.product_success_evidence,
+                static_action: self.totals[0].decision_evidence(
+                    risks[0],
+                    &self.config,
+                    times[0],
+                    None,
+                ),
+                alternatives: std::array::from_fn(|slot| {
+                    let index = slot + 1;
+                    self.totals.get(index).map(|totals| {
+                        totals.decision_evidence(
+                            risks[index],
+                            &self.config,
+                            times[index],
+                            retained_gates[slot],
+                        )
+                    })
+                }),
+                details_omitted: (self.totals.len() - 1).saturating_sub(2),
+            }),
+        };
         Ok(ScenarioPolicyDecision {
             valid_until: summary.valid_until,
             choice,
@@ -401,6 +477,7 @@ impl ScenarioRiskAccumulator {
                 .iter()
                 .map(|totals| totals.window_debt)
                 .collect(),
+            observation,
         })
     }
 }
@@ -456,6 +533,7 @@ fn accumulate_request(
             totals.completion_upper += weight;
         }
         None => {
+            totals.unfinished_request_mass += weight;
             totals.completion_lower += weight * (1.0 - success.upper);
             totals.completion_upper += weight;
         }
@@ -467,6 +545,7 @@ fn accumulate_unknown(totals: &mut Totals, weight: f64, members: &[Member]) {
         return;
     }
     totals.unsupported_mass += weight;
+    totals.unfinished_request_mass += weight * members.len() as f64;
     totals.ttft_unknown += weight * members.len() as f64;
     for member in members {
         if member.cap >= 2 {
@@ -481,6 +560,36 @@ fn accumulate_unknown(totals: &mut Totals, weight: f64, members: &[Member]) {
 }
 
 impl Totals {
+    fn decision_evidence(
+        &self,
+        risk: QueueRisk,
+        config: &SchedulerSloConfig,
+        target_time: Option<Duration>,
+        first_gate: Option<SelectionGate>,
+    ) -> ActionDecisionEvidence {
+        ActionDecisionEvidence {
+            joint: risk.classify(config),
+            metrics: MetricClasses::from_risk(risk, config),
+            denominators: RiskDenominators {
+                requests: risk.request_count,
+                tpot_known_eligible: self.tpot_eligible,
+                tpot_unknown_eligible: self.tpot_unknown_eligible,
+                tpot_unknown_outcome: self.tpot_unknown_outcome,
+                tpot_undefined: self.tpot_undefined,
+                itl_known_events: self.itl_events,
+                itl_unknown_events: self.itl_unknown_events,
+            },
+            risk,
+            target_time,
+            known_target_time_mass: self.time_mass,
+            unsupported_trajectory_mass: self.unsupported_mass,
+            unfinished_request_mass: self.unfinished_request_mass,
+            window_debt: self.window_debt,
+            partial_window_unproven: self.partial_window_unproven,
+            first_gate,
+        }
+    }
+
     fn risk(&self, requests: usize) -> QueueRisk {
         let interval = |lower: f64, upper: f64| ProbabilityInterval {
             lower: lower.clamp(0.0, 1.0),

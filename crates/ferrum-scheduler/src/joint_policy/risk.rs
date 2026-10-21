@@ -1,14 +1,15 @@
 use ferrum_interfaces::request_observation::StoppingForecast;
 use ferrum_types::SchedulerSloConfig;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum JointFeasibility {
     Feasible,
     Infeasible,
     Unresolved,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize)]
 pub struct ProbabilityInterval {
     pub lower: f64,
     pub upper: f64,
@@ -48,7 +49,7 @@ pub struct RequestRisk<'a> {
     pub product_success: Option<ProbabilityInterval>,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, serde::Serialize)]
 pub struct QueueRisk {
     pub ttft: ProbabilityInterval,
     pub tpot: Option<ProbabilityInterval>,

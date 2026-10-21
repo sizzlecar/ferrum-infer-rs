@@ -3,11 +3,13 @@
 
 mod admission;
 mod aggregation;
+mod decision_observation;
 mod diagnostics;
 mod risk;
 mod scenarios;
 pub use admission::*;
 pub use aggregation::*;
+pub use decision_observation::*;
 pub use diagnostics::*;
 pub use risk::*;
 pub use scenarios::*;
@@ -382,7 +384,8 @@ pub struct PairedActionEvidence {
     pub control_cost: Duration,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum PolicyChoice {
     Static,
     Alternative(usize),

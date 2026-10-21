@@ -2,6 +2,8 @@
 
 use super::*;
 
+mod decision_diagnostics;
+
 #[derive(Clone, Copy)]
 enum RejectAt {
     StaticContinuation,

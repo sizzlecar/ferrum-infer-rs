@@ -1,6 +1,8 @@
 use super::*;
 use crate::cost_prediction::CostUnsupportedDetail;
 
+mod decision_diagnostics;
+
 struct FixedGapCost {
     base: ConditionalSnapshot,
     reject_singletons: bool,

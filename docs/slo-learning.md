@@ -257,6 +257,43 @@ only. A completed traversal is not proof of a feasible action or a policy change
 Evaluator elapsed time is measured wall time, not OS CPU time or the charged
 planning budget. Rank and query maxima are maxima, not additive counters.
 
+`joint_decision.admission` and `.dispatch` distinguish decisions computed by the
+risk accumulator, decisions returned after the final time check, and decisions
+consumed by the admission or dispatch policy. A post-finish time rejection is
+counted separately. Consumer outcomes describe the selected policy or admission
+verdict; only `joint_interventions` records successfully applied dispatch edits.
+An evaluator error does not produce a completed decision observation.
+
+The `unresolved` counters describe only final `FeasibilityUnresolved` consumer
+outcomes. They separate zero alternatives, the static risk classification, its
+effective selection classification, and the candidates' metric classifications
+and first reached selection gates. A partial static trajectory can have an
+effective `Unresolved` selection status even when its risk bounds are feasible;
+the admission policy still evaluates its original risk bounds. Candidate counts
+use alternatives as their denominator, while static counts use decisions.
+Completion and window flags are nonexclusive observations. A candidate's first
+gate is the branch actually reached, not a list of every condition it might fail.
+Undefined TPOT or ITL is distinct from feasible or unresolved risk.
+
+Each consumer retains its latest `FeasibilityUnresolved` witness: the static
+action and at most two alternatives, their original risk intervals, weighted
+TPOT/ITL denominators, target-time support, and window facts. Omitted alternative
+details are explicit; all alternatives still enter the counters and policy.
+The failure-limit array is ordered TTFT, TPOT, ITL, completion. Product-success
+uncertainty is separate from request mass whose modeled completion is unknown.
+Partial-static ranks and unresolved endpoint mass do not imply complete cost
+coverage. This witness belongs to one aggregate and is not joined to the cost
+owner's separately retained rejection. It contains no prompts or request IDs.
+
+`joint_decision.retained_bytes_bound` describes one fixed Rust diagnostics value,
+including both consumer slots. It excludes other copies, cold serialization,
+allocator overhead and process RSS. The payload does not grow with requests or
+health reads. Risk aggregation runs before the existing final comparison time
+check. Admission verdict recording and diagnostics merging remain outside that
+timer, so it does not measure all observation overhead. These diagnostics make
+no claim of negligible runtime cost and issue no additional model or stopping
+queries.
+
 A model-support rejection does not spend unissued queries. Later admission or
 dispatch work in the same round can use only the remaining original allowance;
 this introduces no retry loop and does not relax support requirements. An

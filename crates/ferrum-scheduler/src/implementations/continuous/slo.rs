@@ -78,6 +78,7 @@ impl SchedulerSloSnapshot {
         self.last_revision = round.diagnostic_revision;
         let value = &round.statistics;
         self.selections.joint_evaluation.add(value.joint_evaluation);
+        self.selections.joint_decision.add(&value.joint_decision);
         self.selections.joint_cost_snapshot_queries = self
             .selections
             .joint_cost_snapshot_queries

@@ -2,6 +2,8 @@ use super::*;
 use crate::joint_policy::FailureOrigin;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+mod decision_diagnostics;
+
 #[derive(Clone, Copy)]
 enum Fault {
     Unknown,
@@ -274,6 +276,18 @@ fn joint_query_charge_cached_ranks_count_only_original_provider_calls() {
         diagnostics.admission.simulation_queries + diagnostics.dispatch.simulation_queries > costs
     );
     assert_eq!(round.statistics.joint_cost_snapshot_queries, costs);
+    // Both actual consumers see one returned decision. Gate preparation and
+    // later admission use must not count the same decision twice.
+    let decisions = round.statistics.joint_decision;
+    for consumer in [decisions.admission, decisions.dispatch] {
+        assert_eq!(consumer.computed, 1);
+        assert_eq!(consumer.returned, 1);
+        assert_eq!(consumer.post_finish_time_rejected, 0);
+        assert_eq!(consumer.consumed, 1);
+        assert_eq!(consumer.outcomes.static_feasible, 1);
+        assert_eq!(consumer.unresolved.decisions, 0);
+        assert!(consumer.latest_unresolved.is_none());
+    }
 }
 
 #[test]

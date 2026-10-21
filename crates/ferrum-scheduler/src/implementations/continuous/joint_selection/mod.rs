@@ -57,16 +57,33 @@ impl ContinuousBatchScheduler {
     ) -> std::result::Result<Option<FirstAction>, Unsupported> {
         let (decision, alternatives, _) =
             self.evaluate_joint_action_set(hint, batch, round, now, ComparisonKind::Dispatch)?;
+        let mut record = |outcome| {
+            round.statistics.joint_decision.consume(
+                ComparisonKind::Dispatch,
+                outcome,
+                &decision.observation,
+            );
+        };
         match decision.choice {
-            PolicyChoice::Alternative(index) => Ok(alternatives.get(index).copied()),
-            PolicyChoice::Static => Ok(None),
+            PolicyChoice::Alternative(index) => {
+                record(DecisionConsumerOutcome::Alternative);
+                Ok(alternatives.get(index).copied())
+            }
+            PolicyChoice::Static => {
+                record(DecisionConsumerOutcome::StaticFeasible);
+                Ok(None)
+            }
             PolicyChoice::AllKnownInfeasible => {
+                record(DecisionConsumerOutcome::AllKnownInfeasible);
                 round.statistics.joint_known_infeasible += 1;
                 Ok(None)
             }
             // Several kinds of unresolved scenario mass can reach this point.
             // Do not relabel an aggregate outcome as a cost-model failure.
-            PolicyChoice::Unresolved => Err(Unsupported::FeasibilityUnresolved),
+            PolicyChoice::Unresolved => {
+                record(DecisionConsumerOutcome::FeasibilityUnresolved);
+                Err(Unsupported::FeasibilityUnresolved)
+            }
         }
     }
 
@@ -81,6 +98,11 @@ impl ContinuousBatchScheduler {
             .evaluate_joint_action_set(hint, &[], round, now, ComparisonKind::Admission)
             .and_then(|(decision, _, missing_stopping)| {
                 if decision.choice == PolicyChoice::Unresolved && missing_stopping {
+                    round.statistics.joint_decision.consume(
+                        ComparisonKind::Admission,
+                        DecisionConsumerOutcome::StoppingCoverage,
+                        &decision.observation,
+                    );
                     Err(Unsupported::StoppingCoverage)
                 } else {
                     Ok(decision)
@@ -296,9 +318,15 @@ impl ContinuousBatchScheduler {
             return Err(error);
         }
         let decision = aggregate.finish(summary, &vec![None; alternatives.len()])?;
+        round.statistics.joint_decision.computed(comparison_kind);
         if started.elapsed() > remaining_time {
+            round
+                .statistics
+                .joint_decision
+                .post_finish_time_rejected(comparison_kind);
             return Err(Unsupported::TimeBudget);
         }
+        round.statistics.joint_decision.returned(comparison_kind);
         Ok((decision, alternatives, missing_stopping))
     }
 
