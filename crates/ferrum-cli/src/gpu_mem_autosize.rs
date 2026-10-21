@@ -269,6 +269,30 @@ pub fn apply_auto_size_with_profile(model_dir: &Path, gpu_util: f32, profile: Au
 
 /// Legacy pool sizing against the caller's typed request. Product startup
 /// keeps these inferred entries separate from the original user environment.
+pub(crate) fn auto_size_runtime_entries_for_device(
+    device: &ferrum_types::Device,
+    model_dir: &Path,
+    gpu_util: f32,
+    profile: AutoSizeProfile,
+    current: &RuntimeConfigSnapshot,
+) -> Vec<RuntimeConfigEntry> {
+    if matches!(device, ferrum_types::Device::CUDA(_)) {
+        return auto_size_runtime_entries(model_dir, gpu_util, profile, current);
+    }
+    // The legacy GPU estimator queries NVIDIA memory and assumes its physical
+    // KV storage. It cannot size a Metal/CPU pool, even if nvidia-smi exists on
+    // the host. Preserve the independent typed batch default without probing.
+    if snapshot_value(current, "FERRUM_MAX_BATCHED_TOKENS").is_none() {
+        vec![RuntimeConfigEntry::new(
+            "FERRUM_MAX_BATCHED_TOKENS",
+            DEFAULT_MAX_BATCHED_TOKENS.to_string(),
+            RuntimeConfigSource::MemoryProfile,
+        )]
+    } else {
+        Vec::new()
+    }
+}
+
 pub fn auto_size_runtime_entries(
     model_dir: &Path,
     gpu_util: f32,
@@ -612,6 +636,50 @@ fn kv_pool_copies_from_snapshot(snapshot: &RuntimeConfigSnapshot) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn non_cuda_autosizing_only_preserves_independent_batch_defaults() {
+        for device in [ferrum_types::Device::CPU, ferrum_types::Device::ROCm(0)] {
+            let entries = auto_size_runtime_entries_for_device(
+                &device,
+                Path::new("unused-model-source"),
+                0.9,
+                AutoSizeProfile::Server,
+                &RuntimeConfigSnapshot::default(),
+            );
+            assert_eq!(
+                entries,
+                vec![RuntimeConfigEntry::new(
+                    "FERRUM_MAX_BATCHED_TOKENS",
+                    DEFAULT_MAX_BATCHED_TOKENS.to_string(),
+                    RuntimeConfigSource::MemoryProfile
+                )]
+            );
+            let explicit = RuntimeConfigSnapshot::from_entries([RuntimeConfigEntry::new(
+                "FERRUM_MAX_BATCHED_TOKENS",
+                "512",
+                RuntimeConfigSource::Cli,
+            )]);
+            assert!(auto_size_runtime_entries_for_device(
+                &device,
+                Path::new("unused-model-source"),
+                0.9,
+                AutoSizeProfile::Chat,
+                &explicit
+            )
+            .is_empty());
+        }
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        assert!(auto_size_runtime_entries_for_device(
+            &ferrum_types::Device::Metal,
+            Path::new("unused-model-source"),
+            0.9,
+            AutoSizeProfile::Chat,
+            &RuntimeConfigSnapshot::default()
+        )
+        .iter()
+        .all(|entry| entry.key == "FERRUM_MAX_BATCHED_TOKENS"));
+    }
 
     fn snapshot(vars: &[(&str, &str)]) -> RuntimeConfigSnapshot {
         RuntimeConfigSnapshot::from_env_vars(vars.iter().copied())

@@ -181,6 +181,13 @@ pub trait Backend: Send + Sync + Sized + 'static {
         std::mem::size_of::<half::f16>()
     }
 
+    /// Actual element type returned by `alloc` and `alloc_in_context`.
+    /// Unknown custom allocators must not inherit a precision claim from the
+    /// legacy default byte width. This cold declaration allocates nothing.
+    fn activation_storage_dtype() -> Option<super::Dtype> {
+        None
+    }
+
     /// Whether `LlamaFamilyModel::decode_batch_internal` may use its optimized
     /// batched decode path on this backend.
     ///
@@ -2353,16 +2360,11 @@ impl<T> MoeLlmBackend for T where T: QuantLlmBackend + BackendMoeFused {}
 // KV cache dtype axis (dim 5 of the 5-dimension architecture)
 // ════════════════════════════════════════════════════════════════════════
 //
-// Each model's KV cache has its own precision independent of the model's
-// compute precision. vLLM 0.6+ ships INT8 / FP8 KV caches that halve KV
-// memory at small (<1%) accuracy hit. Today ferrum's KV is hardcoded
-// FP16 on CUDA / Metal — to support INT8/FP8 KV in a future PR, the
-// type system needs an explicit axis.
-//
-// Phase 4 scope: scaffolding only. All concrete backends impl
-// `BackendKvDtype<KvFp16>` so existing models keep working unchanged.
-// Future PR: implement BackendKvDtype<KvInt8> on CUDA + a new model
-// type-parameter `K: KvDtypeKind` to wire it through.
+// KV storage is independent of weight precision. The legacy KvFp16 marker
+// selects normal backend buffers: F16 on CUDA and F32 on CPU/Metal. CUDA's
+// KvInt8 implementation owns separate I8 values and F16 scale arrays.
+// KvLayer::physical_storage declares the actual payload layout; markers do
+// not establish its allocation width or a total runtime memory budget.
 
 // `KvDtypeKind` + `KvFp16` / `KvBf16` / `KvInt8` / `KvFp8` markers moved
 // to `ferrum_interfaces::kv_dtype` (no GPU deps, so the right place is
@@ -2375,7 +2377,8 @@ pub use ferrum_interfaces::kv_dtype::{KvBf16, KvDtypeKind, KvFp16, KvFp8, KvInt8
 ///
 /// The two associated types carry the K-specific storage shape:
 ///   - `KvBuffer`: per-layer K/V element storage. For `K = KvFp16` it
-///     is the backend's normal `Self::Buffer` (FP16). For `K = KvInt8`
+///     is the backend's normal `Self::Buffer` (CUDA F16, CPU/Metal F32).
+///     For `K = KvInt8`
 ///     it is the backend's INT8 buffer (e.g. `CudaSlice<i8>` on CUDA).
 ///   - `KvScales`: per-token-per-kv-head scales. For `K = KvFp16` this
 ///     is the unit type `()` (no scales). For `K = KvInt8` / `KvFp8`
@@ -2408,6 +2411,11 @@ pub trait BackendKvDtype<K: KvDtypeKind>: BackendPagedKv {
 /// gets a chance to call into these.
 #[allow(clippy::too_many_arguments)]
 pub trait BackendInt8KvOps: Backend + BackendKvDtype<KvInt8> {
+    /// Physical values/scales layout of `alloc_paged_int8_pool`.
+    fn int8_kv_storage() -> Option<ferrum_types::KvCacheStorage> {
+        None
+    }
+
     /// Allocate the model layer's physical INT8 storage once, using the same
     /// total block capacity as its allocator. Sequence tables reference it.
     fn alloc_paged_int8_pool(

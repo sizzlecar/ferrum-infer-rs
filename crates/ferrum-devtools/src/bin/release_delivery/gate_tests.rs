@@ -820,14 +820,28 @@ fn prepared_capacity_cannot_override_quick_start_or_the_functional_workload() {
 
 #[test]
 fn local_metal_capacity_and_backend_are_bound_without_overriding_quick_start() {
-    for quick_start in [true, false] {
+    for (quick_start, execution_path, functional_capacity) in [
+        (
+            true,
+            "production-plan-runtime",
+            DEFAULT_METAL_FUNCTIONAL_CAPACITY,
+        ),
+        (
+            false,
+            "production-plan-runtime",
+            DEFAULT_METAL_FUNCTIONAL_CAPACITY,
+        ),
+        (true, "legacy-model-executor", DEFAULT_FUNCTIONAL_CAPACITY),
+        (false, "legacy-model-executor", DEFAULT_FUNCTIONAL_CAPACITY),
+    ] {
         let mut expected = task();
         expected.profile.id = "small-metal".into();
         expected.profile.model = format!("fixture/small@{}", "a".repeat(40));
         expected.profile.target.backend = Backend::Metal;
+        expected.profile.target.execution_path = execution_path.into();
         expected.disable_thinking = quick_start;
         expected.use_default_backend = quick_start;
-        expected.runtime_capacity = (!quick_start).then_some(DEFAULT_METAL_FUNCTIONAL_CAPACITY);
+        expected.runtime_capacity = (!quick_start).then_some(functional_capacity);
         let mut plan = make_plan(&expected);
         plan.release_metal = Some(ReleaseMetalPolicy {
             model_limitations: Vec::new(),

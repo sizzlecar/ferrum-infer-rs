@@ -777,9 +777,9 @@ pub struct RunCommand {
     #[arg(long, default_value = "0.9")]
     pub gpu_memory_utilization: f32,
 
-    /// Exact device-wide memory budget available to runtime weights and
-    /// dynamic resources. This is a typed capacity ceiling shared by `run`
-    /// and `serve`; omit it to use the normal pressure-threshold policy.
+    /// Exact memory budget for weights and dynamic resources of compiled-plan
+    /// executors. Legacy executors reject this option because they cannot
+    /// enforce a total bound; their KV pool has separate capacity/block controls.
     #[arg(long, value_name = "BYTES")]
     pub runtime_memory_budget_bytes: Option<std::num::NonZeroUsize>,
 
@@ -1181,7 +1181,8 @@ pub async fn execute(
         if let Some((profile, utilization)) =
             run_autosize_for_device(&device, cmd.gpu_memory_utilization)
         {
-            let entries = crate::gpu_mem_autosize::auto_size_runtime_entries(
+            let entries = crate::gpu_mem_autosize::auto_size_runtime_entries_for_device(
+                &device,
                 &source.local_path,
                 utilization,
                 profile,
@@ -1232,6 +1233,14 @@ pub async fn execute(
         typed_model_capabilities,
         execution_planning_model,
         selected_kv_cache_layout,
+        crate::startup::selected_kv_cache_storage(
+            execution_planning_model,
+            model_definition_for_config.as_ref(),
+            Some(&source.local_path),
+            &device,
+            &engine_config,
+            &effective_runtime_config,
+        )?,
         model_definition_for_config.as_ref(),
         crate::commands::serve::model_weight_bytes_from_path(&source.local_path),
         effective_runtime_config,
@@ -2952,6 +2961,7 @@ fn run_startup_auto_config(
     typed_model_capabilities: Option<ModelCapabilities>,
     execution_planning_model: ferrum_types::ExecutionPlanningModel,
     selected_kv_cache_layout: ferrum_types::SelectedKvCacheLayout,
+    selected_kv_cache_storage: Option<ferrum_types::KvCacheStorage>,
     model_definition: Option<&ferrum_models::ModelDefinition>,
     model_weight_bytes: Option<u64>,
     runtime_config: RuntimeConfigSnapshot,
@@ -2975,6 +2985,7 @@ fn run_startup_auto_config(
         workload,
         execution_planning_model,
         selected_kv_cache_layout,
+        selected_kv_cache_storage,
         crate::startup::StartupUsage::SingleRequest,
     )
 }
@@ -3800,6 +3811,7 @@ mod tests {
                 ferrum_types::SelectedKvCacheLayout::Unknown,
                 None,
                 None,
+                None,
                 effective,
             )
             .unwrap();
@@ -4252,6 +4264,7 @@ mod tests {
             None,
             authority,
             layout,
+            Some(ferrum_types::KvCacheStorage::F32),
             Some(&definition),
             None,
             requested,
@@ -4283,6 +4296,7 @@ mod tests {
             ferrum_types::SelectedKvCacheLayout::Unknown,
             None,
             None,
+            None,
             RuntimeConfigSnapshot::from_entries(Vec::new()),
         )
         .expect("auto config");
@@ -4295,6 +4309,129 @@ mod tests {
         assert_eq!(doc["workload_profile"]["target_concurrency"], 1);
         assert_eq!(doc["admission"]["effective_max_concurrent"], 1);
         assert!(doc["decisions"].is_array());
+    }
+
+    #[test]
+    fn run_legacy_capacity_reaches_execution_and_rejects_total_budget() {
+        let mut request = RuntimeConfigSnapshot::from_entries([
+            RuntimeConfigEntry::new("FERRUM_KV_CAPACITY", "8192", RuntimeConfigSource::Default),
+            RuntimeConfigEntry::new("FERRUM_MAX_MODEL_LEN", "2048", RuntimeConfigSource::Cli),
+            RuntimeConfigEntry::new("FERRUM_PAGED_MAX_SEQS", "16", RuntimeConfigSource::Cli),
+            RuntimeConfigEntry::new("FERRUM_MAX_BATCHED_TOKENS", "512", RuntimeConfigSource::Cli),
+        ]);
+        let resolve = |request| {
+            run_startup_auto_config(
+                ferrum_types::HardwareCapabilities {
+                    backend: "metal".into(),
+                    ..ferrum_types::HardwareCapabilities::unknown()
+                },
+                Some(ModelCapabilities {
+                    max_context_len: Some(40960),
+                    ..ModelCapabilities::unknown()
+                }),
+                ferrum_types::ExecutionPlanningModel::ExecutorManaged,
+                ferrum_types::SelectedKvCacheLayout::Paged {
+                    block_size_tokens: 16,
+                },
+                Some(ferrum_types::KvCacheStorage::F32),
+                None,
+                None,
+                request,
+            )
+        };
+        let resolved = resolve(request.clone()).unwrap();
+        let mut engine = ferrum_types::EngineConfig::default();
+        engine
+            .apply_runtime_config_snapshot(&resolved.runtime_config)
+            .unwrap();
+        assert_eq!(engine.llama_execution_config().kv_capacity, Some(2048));
+        assert_eq!(
+            engine.llama_execution_config().options.kv_max_blocks,
+            Some(2048)
+        );
+        assert_eq!(engine.scheduler.max_running_requests, 16);
+        assert_eq!(engine.batching.max_num_batched_tokens, 512);
+        request.upsert(
+            "FERRUM_RUNTIME_MEMORY_BUDGET_BYTES",
+            "8589934592",
+            RuntimeConfigSource::Cli,
+        );
+        assert!(resolve(request)
+            .unwrap_err()
+            .to_string()
+            .contains("cannot enforce a total memory bound"));
+    }
+
+    #[test]
+    fn run_legacy_autosizer_batch_fits_the_materialized_pool() {
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        let device = ferrum_types::Device::Metal;
+        #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+        let device = ferrum_types::Device::CPU;
+        for (context, sequences, expected_batch, expected_blocks) in [
+            (1024, 1, 1024, 64),
+            (512, 2, 1024, 64),
+            (40960, 1, 2048, 2560),
+        ] {
+            let mut request = RuntimeConfigSnapshot::from_entries([
+                RuntimeConfigEntry::new("FERRUM_KV_CAPACITY", "8192", RuntimeConfigSource::Default),
+                RuntimeConfigEntry::new(
+                    "FERRUM_MAX_MODEL_LEN",
+                    context.to_string(),
+                    RuntimeConfigSource::Cli,
+                ),
+                RuntimeConfigEntry::new(
+                    "FERRUM_PAGED_MAX_SEQS",
+                    sequences.to_string(),
+                    RuntimeConfigSource::Cli,
+                ),
+            ]);
+            for entry in crate::gpu_mem_autosize::auto_size_runtime_entries_for_device(
+                &device,
+                Path::new("unused-model-source"),
+                0.9,
+                crate::gpu_mem_autosize::AutoSizeProfile::Chat,
+                &request,
+            ) {
+                request.upsert_entry(entry);
+            }
+            assert_eq!(
+                request
+                    .entries
+                    .iter()
+                    .find(|entry| entry.key == "FERRUM_MAX_BATCHED_TOKENS")
+                    .unwrap()
+                    .source,
+                RuntimeConfigSource::MemoryProfile
+            );
+            let resolved = run_startup_auto_config(
+                ferrum_types::HardwareCapabilities::unknown(),
+                Some(ModelCapabilities {
+                    max_context_len: Some(40960),
+                    ..ModelCapabilities::unknown()
+                }),
+                ferrum_types::ExecutionPlanningModel::ExecutorManaged,
+                ferrum_types::SelectedKvCacheLayout::Paged {
+                    block_size_tokens: 16,
+                },
+                Some(ferrum_types::KvCacheStorage::F32),
+                None,
+                None,
+                request,
+            )
+            .unwrap();
+            let mut engine = ferrum_types::EngineConfig::default();
+            engine
+                .apply_runtime_config_snapshot(&resolved.runtime_config)
+                .unwrap();
+            assert_eq!(engine.llama_execution_config().kv_capacity, Some(context));
+            assert_eq!(
+                engine.llama_execution_config().options.kv_max_blocks,
+                Some(expected_blocks)
+            );
+            assert_eq!(engine.scheduler.max_running_requests, sequences);
+            assert_eq!(engine.batching.max_num_batched_tokens, expected_batch);
+        }
     }
 
     #[test]
@@ -5082,6 +5219,7 @@ mod tests {
             ferrum_types::SelectedKvCacheLayout::Unknown,
             None,
             None,
+            None,
             effective,
         )
         .unwrap();
@@ -5250,6 +5388,7 @@ mod tests {
             ferrum_types::SelectedKvCacheLayout::Unknown,
             None,
             None,
+            None,
             effective,
         )
         .unwrap();
@@ -5297,6 +5436,7 @@ mod tests {
             Some(model),
             ferrum_types::ExecutionPlanningModel::CompiledPlan,
             ferrum_types::SelectedKvCacheLayout::Unknown,
+            None,
             None,
             None,
             run_base_runtime_config(&CliConfig::default(), RuntimeConfigSnapshot::default()),
@@ -5466,6 +5606,7 @@ mod tests {
             None,
             ferrum_types::ExecutionPlanningModel::CompiledPlan,
             ferrum_types::SelectedKvCacheLayout::Unknown,
+            None,
             None,
             None,
             effective,

@@ -438,6 +438,10 @@ impl Backend for CudaBackend {
         crate::backend::timer::CudaTimer::new()
     }
 
+    fn activation_storage_dtype() -> Option<super::Dtype> {
+        Some(super::Dtype::F16)
+    }
+
     fn supports_qk_norm_rope_batched_per_item() -> bool {
         true
     }

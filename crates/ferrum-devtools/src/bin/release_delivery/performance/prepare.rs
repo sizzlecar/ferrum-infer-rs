@@ -226,7 +226,7 @@ pub async fn prepare(args: PerformancePrepareArgs) -> Result<(), String> {
         serde_json::from_slice(&plan_bytes).map_err(|e| format!("performance plan: {e}"))?;
     let selected = requirements(&document, &args.profile_id)?;
     let policy: PerformancePolicy = read_json(&args.policy)?;
-    policy.validate()?;
+    policy.validate_target(&selected.profile.target)?;
     let baseline = metadata(&args.baseline_abi, &document.provenance.base)?;
     let candidate = metadata(&args.candidate_abi, &document.provenance.candidate)?;
     binary_bindings(&document, &baseline, &candidate)?;

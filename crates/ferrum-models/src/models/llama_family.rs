@@ -489,6 +489,19 @@ impl Default for LlamaFamilyConfig {
 }
 
 impl LlamaFamilyConfig {
+    pub(crate) fn selected_kv_cache_storage<B: BackendPagedKv, K: KvLayer<B>>(
+        &self,
+        options: &LlamaExecutionOptions,
+    ) -> Option<ferrum_types::KvCacheStorage> {
+        selected_llama_kv_layout_for_dtype::<B, K>(
+            self,
+            options.metal_paged_kv,
+            0..self.num_layers,
+        )
+        .ok()?;
+        K::physical_storage()
+    }
+
     /// The allocation layout selected by the same policy used at cache creation.
     /// This cold query allocates no device resources and does not infer layout
     /// from a model name or execution resource-authority tag.
@@ -2860,7 +2873,7 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
     }
 
     fn prefix_cache_snapshot_json(&self) -> serde_json::Value {
-        let (entries, block_size) = self
+        let (entries, block_size, physical_pool_blocks) = self
             .paged_block_alloc
             .as_ref()
             .and_then(|alloc| {
@@ -2869,16 +2882,24 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
                     .kv_caches
                     .values()
                     .find_map(|layers| layers.first().map(K::block_size))
-                    .unwrap_or(16);
-                Some((alloc.hash_table_size() as u64, block_size))
+                    .unwrap_or(LLAMA_PAGED_BLOCK_SIZE);
+                Some((
+                    alloc.hash_table_size() as u64,
+                    block_size,
+                    Some(alloc.capacity()),
+                ))
             })
-            .unwrap_or((0, 16));
-        let bytes_per_entry = (block_size
-            * self.local_layer_count()
-            * self.cfg.num_kv_heads
-            * self.cfg.head_dim
-            * K::BYTES_PER_ELEM
-            * 2) as u64;
+            .unwrap_or((0, LLAMA_PAGED_BLOCK_SIZE, None));
+        let physical_storage = K::physical_storage();
+        let bytes_per_entry = physical_storage
+            .and_then(|storage| {
+                storage.bytes_per_token(
+                    self.local_layer_count(),
+                    self.cfg.num_kv_heads,
+                    self.cfg.head_dim,
+                )
+            })
+            .and_then(|bytes| bytes.checked_mul(u64::try_from(block_size).ok()?));
         serde_json::json!({
             "position": "real-kv-reuse",
             "source": "llama-family-paged-block-prefix-cache",
@@ -2888,9 +2909,15 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
             "evictions": 0u64,
             "saved_prefill_tokens": self.prefix_cache_saved_prefill_tokens,
             "entries": entries,
-            "bytes": entries.saturating_mul(bytes_per_entry),
+            "bytes": bytes_per_entry.and_then(|bytes| entries.checked_mul(bytes)),
+            "bytes_scope": "cached_block_kv_payload_including_scales",
+            "physical_pool_blocks": physical_pool_blocks,
+            "physical_pool_bytes": physical_pool_blocks.and_then(|blocks| {
+                bytes_per_entry?.checked_mul(u64::from(blocks))
+            }),
             "block_size": block_size,
-            "kv_dtype": K::NAME,
+            "kv_dtype": physical_storage.map(|storage| storage.name()),
+            "kv_marker": K::NAME,
             "decode_batch": self.decode_batch_stats.snapshot_json(),
         })
     }
@@ -6295,6 +6322,47 @@ mod tests {
         assert!(model.kv_free_pool.is_empty());
         assert_eq!(model.prefill("seq-b", &[3, 4, 5]), other);
         assert_eq!(model.cache_len("seq-b"), 3);
+    }
+
+    #[test]
+    fn physical_kv_storage_diagnostics_count_f32_pool_and_cached_blocks_separately() {
+        let mut cfg = test_llama_config(2, false);
+        cfg.max_seq_len = 64;
+        let loader = RecordingLoader::default();
+        let mut model = LlamaFamilyModel::<CpuBackend>::new(cfg, &loader).unwrap();
+        model.runtime_env = runtime_for_entries([
+            ("FERRUM_METAL_PAGED_KV", "1"),
+            ("FERRUM_KV_CAPACITY", "64"),
+            ("FERRUM_KV_MAX_BLOCKS", "4"),
+            ("FERRUM_PAGED_MAX_SEQS", "2"),
+        ]);
+        assert!(model.prefix_cache_snapshot_json()["physical_pool_bytes"].is_null());
+        model.ensure_kv("resident");
+        let actual_payload: usize = model
+            .paged_pools
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|(k, v)| std::mem::size_of_val(k.as_slice()) + std::mem::size_of_val(v.as_slice()))
+            .sum();
+        {
+            let mut alloc = model.paged_block_alloc.as_ref().unwrap().lock().unwrap();
+            let block = alloc.allocate().unwrap();
+            alloc.register_block_hash(
+                block,
+                crate::common::paged_pool::block_hash(
+                    0,
+                    &[ferrum_types::TokenId::new(1); super::LLAMA_PAGED_BLOCK_SIZE],
+                ),
+            );
+        }
+        let snapshot = model.prefix_cache_snapshot_json();
+        assert_eq!(snapshot["kv_marker"], "fp16");
+        assert_eq!(snapshot["kv_dtype"], "f32");
+        assert_eq!(snapshot["entries"], 1);
+        assert_eq!(snapshot["physical_pool_blocks"], 4);
+        assert_eq!(snapshot["physical_pool_bytes"], actual_payload as u64);
+        assert_eq!(snapshot["bytes"], (actual_payload / 4) as u64);
     }
 
     #[test]

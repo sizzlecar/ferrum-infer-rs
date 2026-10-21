@@ -9,6 +9,28 @@ concurrency cell; use llama.cpp on the same hardware/model as the first baseline
 where that exact format is supported. Disclose unsupported artifacts and intentional
 differences instead of silently substituting precision or output policies.
 
+## Freeze the actual server capacity
+
+Record the effective configuration from both `run` and `serve`. For retained
+legacy executors, `--kv-capacity` limits each sequence's logical KV table and
+`--kv-max-blocks` sizes the shared physical pool. The pool need not reserve the
+full context for every admitted sequence. Freeze both limits, context, active
+sequence count and batch size across comparison arms; client concurrency does
+not resize the server.
+
+`--runtime-memory-budget-bytes` requires a compiled-plan executor with total
+resource accounting. Legacy executors reject that option. Their KV limits bound
+the selected pool, not model weights, execution workspace or process memory.
+Do not report an unsupported total budget as enforced, or replace a failed
+capacity measurement with an undisclosed smaller pool.
+
+Record source weight precision, materialized weight precision and actual KV
+storage separately. The retained `KvFp16` implementation uses F32 KV storage on
+CPU and Metal, and F16 on CUDA. Use the selected storage geometry when computing
+pool bytes; a precision marker or weight-file size is not resident memory usage.
+Allocated buffer capacity, current resident memory and process lifetime peak are
+distinct observations, especially with lazily backed shared-memory buffers.
+
 ## Freeze a ShareGPT workload
 
 `ferrum bench-serve --dataset sharegpt` selects first human/assistant pairs without

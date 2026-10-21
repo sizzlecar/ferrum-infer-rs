@@ -306,7 +306,7 @@ The release catalog requires these three independently identified profiles:
 |---|---|---|
 | `release-qwen35-4b-gguf-metal` | Qwen3.5 4B Q4_K_M GGUF, production plan runtime | Sole Metal Quick Start; product context, concurrency and memory defaults |
 | `release-qwen35-08b-safetensors-metal` | Qwen3.5 0.8B BF16/F32 SafeTensors, production plan runtime | Context 2048, one sequence, 10 GiB runtime memory budget |
-| `llama-dense-metal` | Llama 3.1 8B Q4_K_M GGUF, legacy model executor | Context 2048, one sequence, 10 GiB runtime memory budget |
+| `llama-dense-metal` | Llama 3.1 8B Q4_K_M GGUF, legacy model executor | Context 2048, one sequence; resolved logical KV and physical pool limits |
 
 The [catalog](release-regression-catalog.json) fixes weight revisions, GGUF
 filenames and independent semantic sources. These are release model tasks, not
@@ -319,13 +319,19 @@ retains the independent legacy-executor check; an unverified smaller Llama
 source or different RoPE configuration is not a valid drop-in substitute.
 
 For the two non-Quick-Start profiles, prepared expectations bind
-`--context-tokens 2048 --max-num-seqs 1 --runtime-memory-budget-bytes 10737418240`
-in both `run` and `serve`. The controlled output budget remains 512 tokens.
-The 10 GiB value is a typed runtime planning budget, not an operating-system
-RSS hard limit, a reservation of all other host memory, or proof that loading
-and execution fit. Only actual candidate CI results on the selected release host can
-establish the tested capacity and semantics. OOM, timeout and invalid output
-remain failures; the policy does not waive them.
+`--context-tokens 2048 --max-num-seqs 1` in both `run` and `serve`. The controlled
+output budget remains 512 tokens. The compiled-plan SafeTensors profile also uses
+`--runtime-memory-budget-bytes 10737418240`. That value bounds the runtime's
+accounted resources; it is not an operating-system RSS hard limit or a reservation
+of all other host memory.
+
+The legacy Llama executor rejects a total runtime budget because it cannot
+enforce one. Its resolved KV capacity and physical pool limits are recorded
+separately from measured total memory. Performance comparisons requiring an
+enforced total budget reject that execution path before measurement. Only actual
+candidate CI results on the selected release host establish tested capacity and
+semantics. OOM, timeout and invalid output remain failures; the policy does not
+waive them.
 
 Device Quality selects the `ferrum-metal` pool, currently the local Mac and the
 16 GiB MacBook Pro. Release models and Homebrew verification select the local

@@ -835,6 +835,10 @@ impl Backend for MetalBackend {
         std::mem::size_of::<f32>()
     }
 
+    fn activation_storage_dtype() -> Option<super::Dtype> {
+        Some(super::Dtype::F32)
+    }
+
     // ── Q4_K_M ────────────────────────────────────────────────────────
 
     /// Phase D step 2+3: unified typed uploader. Replaces from_slice_i32 +

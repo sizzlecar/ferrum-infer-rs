@@ -379,6 +379,10 @@ impl Backend for CpuBackend {
         std::mem::size_of::<f32>()
     }
 
+    fn activation_storage_dtype() -> Option<super::Dtype> {
+        Some(super::Dtype::F32)
+    }
+
     fn zero_buffer(_ctx: &mut Self::Context, buf: &mut Self::Buffer, len: usize) -> Result<()> {
         if buf.len() < len {
             return Err(FerrumError::model(format!(

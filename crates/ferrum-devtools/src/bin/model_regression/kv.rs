@@ -1,6 +1,6 @@
 //! Actual KV selection with separate compiled-plan and model-owned evidence.
 use anyhow::{ensure, Context, Result};
-use ferrum_types::KvStorageFormat;
+use ferrum_types::{KvCacheStorage, KvStorageFormat};
 use serde::Serialize;
 use serde_json::Value;
 
@@ -48,11 +48,34 @@ pub(super) fn validate_storage(dtype: Option<KvDtype>, observed: &Value) -> Resu
         model["source"] == MODEL_KV_SOURCE,
         "KV evidence is neither a resolved plan nor an actual model cache: {model}"
     );
+    validate_model_storage(Some(dtype), model)
+}
+
+fn validate_model_storage(expected: Option<KvDtype>, model: &Value) -> Result<()> {
+    let marker = match model["kv_marker"].as_str() {
+        Some("fp16") => KvDtype::Fp16,
+        Some("int8") => KvDtype::Int8,
+        _ => anyhow::bail!("model-owned KV evidence has no supported implementation marker"),
+    };
+    if let Some(expected) = expected {
+        ensure!(
+            marker == expected,
+            "actual model KV marker was {}, expected {}",
+            marker.cli_name(),
+            expected.cli_name()
+        );
+    }
+    let storage: KvCacheStorage = serde_json::from_value(model["kv_dtype"].clone())
+        .context("model-owned KV evidence has no typed physical storage")?;
     ensure!(
-        model["kv_dtype"].as_str() == Some(dtype.cli_name()),
-        "actual model KV dtype was {}, expected {}",
-        model["kv_dtype"],
-        dtype.cli_name()
+        matches!(
+            (marker, storage),
+            (KvDtype::Fp16, KvCacheStorage::F32 | KvCacheStorage::F16)
+                | (KvDtype::Int8, KvCacheStorage::Int8PerTokenHeadF16Scales)
+        ),
+        "actual model KV storage {} is incompatible with marker {}",
+        storage.name(),
+        marker.cli_name()
     );
     Ok(())
 }
@@ -103,13 +126,11 @@ pub(super) fn validate_completed_health(health: &Value) -> Result<()> {
                 health["kv_storage"].is_null(),
                 "model-owned KV health cannot masquerade as a compiled plan"
             );
-            // The retained Llama model reports its compile-time KV type, not a
+            // The retained Llama model reports its implementation marker and
+            // physical payload separately, not a
             // vNext profile or last_failure field. Its real errors propagate to
             // the scheduler and the checked product request/shutdown outcomes.
-            ensure!(
-                matches!(prefix["kv_dtype"].as_str(), Some("fp16" | "int8")),
-                "model-owned KV evidence has no supported actual dtype"
-            );
+            validate_model_storage(None, prefix)?;
             ensure!(health["status"] == "healthy", "model server is not healthy");
             ensure!(
                 health["scheduler"]["successful_requests"]
@@ -186,8 +207,12 @@ mod tests {
 
     #[test]
     fn kv_model_owned_evidence_uses_actual_source_and_dtype_for_both_entrypoints() {
-        for dtype in [KvDtype::Fp16, KvDtype::Int8] {
-            let snapshot = json!({"source": MODEL_KV_SOURCE, "kv_dtype": dtype.cli_name()});
+        for (dtype, storage) in [
+            (KvDtype::Fp16, KvCacheStorage::F32),
+            (KvDtype::Fp16, KvCacheStorage::F16),
+            (KvDtype::Int8, KvCacheStorage::Int8PerTokenHeadF16Scales),
+        ] {
+            let snapshot = json!({"source": MODEL_KV_SOURCE, "kv_marker": dtype.cli_name(), "kv_dtype": storage});
             let run = json!({"model_kv_storage": snapshot});
             let serve = json!({"kv_storage": null, "cache": {"prefix_cache": snapshot}});
             validate_storage(Some(dtype), &run).unwrap();
@@ -198,7 +223,7 @@ mod tests {
             };
             assert!(validate_storage(Some(other), &run).is_err());
             assert!(validate_storage(Some(other), &serve).is_err());
-            for field in ["source", "kv_dtype"] {
+            for field in ["source", "kv_marker", "kv_dtype"] {
                 let mut missing = run.clone();
                 missing["model_kv_storage"]
                     .as_object_mut()
@@ -206,6 +231,15 @@ mod tests {
                     .remove(field);
                 assert!(validate_storage(Some(dtype), &missing).is_err());
             }
+            let mut mismatched_storage = run.clone();
+            mismatched_storage["model_kv_storage"]["kv_dtype"] = json!(match dtype {
+                KvDtype::Fp16 => KvCacheStorage::Int8PerTokenHeadF16Scales,
+                KvDtype::Int8 => KvCacheStorage::F16,
+            });
+            assert!(validate_storage(Some(dtype), &mismatched_storage).is_err());
+            let mut marker_only = run.clone();
+            marker_only["model_kv_storage"]["kv_dtype"] = json!(dtype.cli_name());
+            assert!(validate_storage(Some(dtype), &marker_only).is_err());
             let echo = json!({"runtime": {"kv_dtype": dtype.cli_name()},
                 "numerical_execution": {"requested": "auto"}});
             assert!(validate_storage(Some(dtype), &echo).is_err());
@@ -217,7 +251,8 @@ mod tests {
 
     #[test]
     fn kv_model_evidence_cannot_bypass_or_relabel_a_present_compiled_plan() {
-        let model = json!({"source": MODEL_KV_SOURCE, "kv_dtype": "int8"});
+        let model = json!({"source": MODEL_KV_SOURCE, "kv_marker": "int8",
+            "kv_dtype": KvCacheStorage::Int8PerTokenHeadF16Scales});
         for plan in [
             json!({}),
             json!({"source": "requested_configuration", "selected": "int8"}),
@@ -240,7 +275,8 @@ mod tests {
         let model = json!({"status": "healthy",
             "scheduler": {"failed_requests": 0, "successful_requests": 2},
             "kv_storage": null,
-            "cache": {"prefix_cache": {"source": MODEL_KV_SOURCE, "kv_dtype": "int8"}}});
+            "cache": {"prefix_cache": {"source": MODEL_KV_SOURCE, "kv_marker": "int8",
+                "kv_dtype": KvCacheStorage::Int8PerTokenHeadF16Scales}}});
         let plan = json!({"scheduler": {"failed_requests": 0},
             "cache": {"prefix_cache": {"source": "vnext-native-sequence-checkpoint-cache",
                 "last_failure": null}}});
@@ -277,6 +313,24 @@ mod tests {
         let mut mixed = model.clone();
         mixed["kv_storage"] = json!({"source": "resolved_model_plan"});
         assert!(validate_completed_health(&mixed).is_err());
+        for (marker, storage) in [
+            (
+                Value::Null,
+                json!(KvCacheStorage::Int8PerTokenHeadF16Scales),
+            ),
+            (json!("int8"), Value::Null),
+            (json!("int8"), json!("int8")),
+            (json!("int8"), json!(KvCacheStorage::F32)),
+            (
+                json!("fp16"),
+                json!(KvCacheStorage::Int8PerTokenHeadF16Scales),
+            ),
+        ] {
+            let mut invalid = model.clone();
+            invalid["cache"]["prefix_cache"]["kv_marker"] = marker;
+            invalid["cache"]["prefix_cache"]["kv_dtype"] = storage;
+            assert!(validate_completed_health(&invalid).is_err());
+        }
         let mut unknown = model;
         unknown["cache"]["prefix_cache"]["source"] = json!("requested_configuration");
         assert!(validate_completed_health(&unknown).is_err());

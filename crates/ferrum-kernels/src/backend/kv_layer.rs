@@ -22,6 +22,9 @@ use crate::backend::{
 };
 use ferrum_interfaces::kv_dtype::{KvDtypeKind, KvFp16, KvInt8};
 
+#[cfg(test)]
+mod physical_storage_tests;
+
 /// Type-bound storage and contiguous-replay contract for one backend/KV implementation.
 /// Safe code cannot reuse a proof for another backend's Layer/PagedPool methods.
 /// This is not permission to capture every KV helper: the paged single-item
@@ -75,6 +78,12 @@ impl<B: Backend, K: ?Sized> KvGraphCaptureContract<B, K> {
 /// Per-K-dtype dispatch trait.
 #[allow(clippy::too_many_arguments)]
 pub trait KvLayer<B: Backend>: KvDtypeKind {
+    /// Actual physical payload allocated by this implementation. The marker
+    /// alone does not establish its precision or byte width.
+    fn physical_storage() -> Option<ferrum_types::KvCacheStorage> {
+        None
+    }
+
     /// Explicit storage/attention capabilities for this backend and KV dtype.
     /// A custom implementation must opt in to every layout it implements.
     fn supports_contiguous() -> bool {
@@ -250,6 +259,14 @@ pub trait KvLayer<B: Backend>: KvDtypeKind {
 // ─────────────────────────────────────────────────────────────────────
 
 impl<B: Backend + crate::backend::BackendPagedKv> KvLayer<B> for KvFp16 {
+    fn physical_storage() -> Option<ferrum_types::KvCacheStorage> {
+        match B::activation_storage_dtype()? {
+            crate::backend::Dtype::F32 => Some(ferrum_types::KvCacheStorage::F32),
+            crate::backend::Dtype::F16 => Some(ferrum_types::KvCacheStorage::F16),
+            _ => None,
+        }
+    }
+
     fn supports_contiguous() -> bool {
         true
     }
@@ -705,6 +722,10 @@ impl<B: Backend + crate::backend::BackendPagedKv> KvLayer<B> for KvFp16 {
 // ─────────────────────────────────────────────────────────────────────
 
 impl<B: Backend + BackendInt8KvOps> KvLayer<B> for KvInt8 {
+    fn physical_storage() -> Option<ferrum_types::KvCacheStorage> {
+        B::int8_kv_storage()
+    }
+
     fn graph_capture_contract() -> Option<KvGraphCaptureContract<B, Self>> {
         // SAFETY: INT8 owns its persistent paged views and has no contiguous
         // path. Batch/unified callers use their graph-aware backend operations;

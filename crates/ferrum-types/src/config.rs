@@ -1531,7 +1531,9 @@ pub enum KvCacheType {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum KvCacheDtype {
-    /// FP16 K/V — the validated production path on every backend.
+    /// FP16 request and legacy compatibility marker. Retained CPU/Metal
+    /// implementations store F32 values; retained CUDA stores F16. The actual
+    /// executor's selected storage declaration is authoritative for byte counts.
     #[default]
     Fp16,
     /// BF16 K/V — same memory cost as FP16, slightly different precision.

@@ -3,12 +3,17 @@
 use clap::{Parser, Subcommand};
 use ferrum_bench_core::release_regression::model_schedule::model_task_schedule;
 use ferrum_bench_core::release_regression::model_tasks::{
-    verify_model_reports, ExpectedModelRun, DEFAULT_CUDA_FUNCTIONAL_CAPACITY,
-    DEFAULT_FUNCTIONAL_CAPACITY, DEFAULT_METAL_FUNCTIONAL_CAPACITY, DEFAULT_STOP_PROMPT,
+    verify_model_reports, ExpectedModelRun, DEFAULT_STOP_PROMPT,
 };
+#[cfg(test)]
 use ferrum_bench_core::release_regression::{
-    Backend, CloudCudaMode, CudaModelLane, Gap, MetalModelLane, Plan,
+    model_tasks::{
+        DEFAULT_CUDA_FUNCTIONAL_CAPACITY, DEFAULT_FUNCTIONAL_CAPACITY,
+        DEFAULT_METAL_FUNCTIONAL_CAPACITY,
+    },
+    MetalModelLane,
 };
+use ferrum_bench_core::release_regression::{Backend, CloudCudaMode, CudaModelLane, Gap, Plan};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
@@ -211,15 +216,7 @@ fn prepare_lane(
         let asset = by_backend
             .get(&run.profile.target.backend)
             .ok_or_else(|| format!("no staged binary for profile {}", run.profile.id))?;
-        let runtime_capacity = if run.quick_start {
-            None
-        } else if run.cuda_lane == Some(CudaModelLane::Local) {
-            Some(DEFAULT_CUDA_FUNCTIONAL_CAPACITY)
-        } else if run.metal_lane == Some(MetalModelLane::Local) {
-            Some(DEFAULT_METAL_FUNCTIONAL_CAPACITY)
-        } else {
-            Some(DEFAULT_FUNCTIONAL_CAPACITY)
-        };
+        let runtime_capacity = run.default_runtime_capacity();
         if let Some(capacity) = runtime_capacity {
             capacity.validate(max_tokens)?;
         }

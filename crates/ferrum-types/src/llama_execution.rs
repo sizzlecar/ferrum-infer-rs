@@ -148,6 +148,15 @@ impl LlamaExecutionConfig {
     }
 
     pub fn validate(&self) -> Result<(), String> {
+        if self
+            .options
+            .kv_max_blocks
+            .is_some_and(|blocks| u32::try_from(blocks).is_err())
+        {
+            return Err(
+                "kv_max_blocks exceeds the physical allocator's u32 block index domain".into(),
+            );
+        }
         if let (Some(alias), Some(canonical)) = (
             self.options.split_k_attn,
             self.backend_context.cuda.split_k_attn,
@@ -205,6 +214,19 @@ mod tests {
         assert_eq!(execution.options.kv_max_blocks, None);
         assert!(!engine.runtime.gptq_gidx_trace);
         assert_ne!(engine.kv_cache.max_blocks, 0);
+    }
+
+    #[test]
+    fn llama_instance_rejects_physical_block_index_truncation() {
+        let Ok(blocks) = usize::try_from(u64::from(u32::MAX) + 1) else {
+            return;
+        };
+        let mut execution = LlamaExecutionConfig::default();
+        execution.options.kv_max_blocks = Some(blocks);
+        assert!(execution
+            .validate()
+            .unwrap_err()
+            .contains("u32 block index domain"));
     }
 
     #[test]
