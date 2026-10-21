@@ -13,8 +13,8 @@ use std::sync::mpsc;
 
 type WorkerTask<'a> = Pin<Box<dyn Future<Output = ()> + 'a>>;
 
-/// Holding the first worker job makes one manual poll a deterministic enqueue
-/// or queue-capacity wait. Drop also opens the gate if an assertion fails.
+/// Holds a worker job after its start acknowledgement, allowing tests to control
+/// queue capacity. Drop also opens the gate if an assertion fails.
 pub(super) struct WorkerGate<'a> {
     release: Option<mpsc::Sender<()>>,
     completion: WorkerTask<'a>,
@@ -33,8 +33,14 @@ impl<'a> WorkerGate<'a> {
                 .await
                 .unwrap();
         });
-        assert!(futures::poll!(completion.as_mut()).is_pending());
-        started_receiver.await.unwrap();
+        // Submission can yield before enqueueing when the queue is full or the
+        // async task exhausts its cooperative budget. Keep driving it until the
+        // worker actually acknowledges the gate; one Pending poll is no proof
+        // that a job was accepted.
+        tokio::select! {
+            started = started_receiver => started.unwrap(),
+            _ = completion.as_mut() => panic!("worker gate completed before release"),
+        }
         Self {
             release: Some(release),
             completion,
@@ -52,6 +58,36 @@ impl Drop for WorkerGate<'_> {
         if let Some(release) = self.release.take() {
             let _ = release.send(());
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn worker_gate_keeps_submitting_when_the_queue_was_full() {
+        let worker = VNextCompletionWorker::new().unwrap();
+        let first = WorkerGate::closed(&worker).await;
+
+        // The worker is blocked in the first gate. Accept one queued marker,
+        // filling its actual one-entry queue before constructing another gate.
+        let mut queued = Box::pin(tokio::task::unconstrained(marker(&worker)));
+        assert!(futures::poll!(queued.as_mut()).is_pending());
+        assert_eq!(worker.metrics_snapshot()["scheduled_tasks"], 2);
+        let mut waiting = Box::pin(WorkerGate::closed(&worker));
+        assert!(futures::poll!(waiting.as_mut()).is_pending());
+        assert_eq!(worker.metrics_snapshot()["scheduled_tasks"], 2);
+
+        first.open().await;
+        queued.await;
+        // This timeout bounds a deadlock failure; ordering comes from the real
+        // queue and acknowledgements, without sleeps or repeated observations.
+        let next = tokio::time::timeout(std::time::Duration::from_secs(10), waiting)
+            .await
+            .expect("gate submission must resume after queued capacity is released");
+        assert_eq!(worker.metrics_snapshot()["scheduled_tasks"], 3);
+        next.open().await;
     }
 }
 
