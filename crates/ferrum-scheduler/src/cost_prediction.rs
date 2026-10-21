@@ -15,8 +15,12 @@ use std::time::{Duration, Instant};
 use tokio::sync::watch;
 
 mod persistent_capacity;
+mod scenario_diagnostics;
 mod unsupported_counts;
+mod unsupported_detail;
+pub(crate) use scenario_diagnostics::{ComparisonKind, JointEvaluationDiagnostics};
 pub(crate) use unsupported_counts::JointUnsupportedCounts;
+pub use unsupported_detail::CostUnsupportedCounts;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CostWork {
@@ -58,14 +62,56 @@ pub enum CostExecution {
     SequentialPrefillThenDecode,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub enum CostUnknownReason {
     NoCoverage,
     Stale,
     InexactWork,
     UnsupportedDomain,
+    /// Same conservative decision class as `UnsupportedDomain`; the detail is
+    /// a bounded observation of this rejection, never permission to extrapolate.
+    UnsupportedWithDetail(CostUnsupportedDetail),
     QueryLimit,
     PlanningBudget,
+}
+
+/// Model-independent reasons for a rejected service-cost query. These expose
+/// neither a predictor's feature schema nor its coefficients/support values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CostUnsupportedDetail {
+    Unspecified,
+    /// The requested invocation grouping has no supported joint interpretation.
+    ExecutionComposition,
+    /// Requested ranges/context/reuse facts cannot form valid model input.
+    InvalidWorkProjection,
+    ExecutionIdentityMismatch,
+    FeatureDomainMismatch,
+    /// At least one input is outside the model's observed empirical support.
+    OutsideObservedSupport,
+    /// The fixed model returned a negative or nonfinite service-time estimate.
+    InvalidBasePrediction,
+    /// A predicted/calibrated time cannot be represented as a Duration.
+    UnrepresentableDuration,
+    /// A returned scenario's timing/support, rank or probability contract failed.
+    InvalidScenarioDistribution,
+}
+
+impl CostUnknownReason {
+    pub const fn coarse(self) -> Self {
+        match self {
+            Self::UnsupportedWithDetail(_) => Self::UnsupportedDomain,
+            reason => reason,
+        }
+    }
+
+    pub const fn unsupported_detail(self) -> Option<CostUnsupportedDetail> {
+        match self {
+            Self::UnsupportedDomain => Some(CostUnsupportedDetail::Unspecified),
+            Self::UnsupportedWithDetail(detail) => Some(detail),
+            _ => None,
+        }
+    }
 }
 
 /// Interpretation of the risk cost, never a client-visible SLO certificate.
@@ -169,7 +215,9 @@ impl CostScenarioPrediction {
                 .abs()
                 > 1e-9
         {
-            return Self::Unknown(CostUnknownReason::UnsupportedDomain);
+            return Self::Unknown(CostUnknownReason::UnsupportedWithDetail(
+                CostUnsupportedDetail::InvalidScenarioDistribution,
+            ));
         }
         self
     }
@@ -565,6 +613,9 @@ impl TimePlanningRound {
 
 #[derive(Debug, Clone, Copy, Default, serde::Serialize)]
 pub(crate) struct PlanningStatistics {
+    /// Entered scenario evaluations, separated from pre-evaluation failures
+    /// and from each other at the actual admission/dispatch call sites.
+    pub joint_evaluation: JointEvaluationDiagnostics,
     /// Actual immutable cost-distribution calls in completed comparisons.
     pub joint_cost_snapshot_queries: u64,
     /// Reuses of exact cost distributions, distinct from model calls.
@@ -577,6 +628,9 @@ pub(crate) struct PlanningStatistics {
     pub joint_unresolved: u64,
     /// Returned comparison failures only; not inferred causes or request counts.
     pub joint_unsupported: JointUnsupportedCounts,
+    /// Subdivision of the unsupported-domain parent bucket, not additional
+    /// comparison failures to add to that bucket.
+    pub joint_cost_unsupported_detail: CostUnsupportedCounts,
     /// A supported alternative could not be applied by the admission gate.
     pub joint_admission_action_required: u64,
     pub joint_known_infeasible: u64,
@@ -592,6 +646,9 @@ pub(crate) struct PlanningStatistics {
 impl PlanningStatistics {
     pub(crate) fn record_joint_unsupported(&mut self, reason: crate::joint_policy::Unsupported) {
         self.joint_unsupported.record(reason);
+        if let crate::joint_policy::Unsupported::Cost(reason) = reason {
+            self.joint_cost_unsupported_detail.record(reason);
+        }
         let aggregate = if reason.is_resource_unknown() {
             &mut self.joint_unknown_resources
         } else {
@@ -658,7 +715,9 @@ mod tests {
             }
             assert_eq!(
                 invalid.validated(now, 2),
-                CostScenarioPrediction::Unknown(CostUnknownReason::UnsupportedDomain)
+                CostScenarioPrediction::Unknown(CostUnknownReason::UnsupportedWithDetail(
+                    CostUnsupportedDetail::InvalidScenarioDistribution,
+                ))
             );
         }
     }

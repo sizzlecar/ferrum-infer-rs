@@ -332,7 +332,10 @@ fn split_twenty_then_thirty_credits_prefill_at_a_twenty_five_ms_window() {
         &mut QueryBudget {
             queries: 0,
             started: Instant::now(),
+            diagnostics: &diagnostics::Recorder::new(config.planning.max_queries),
+            rank: None,
         },
+        1,
     )
     .unwrap();
     assert_eq!(result.window_progress[0].output_tokens, 1);

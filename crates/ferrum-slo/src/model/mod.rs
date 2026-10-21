@@ -26,6 +26,28 @@ pub enum ModelError {
     Persistence(String),
 }
 
+/// Owner-local rejection facts. Feature coordinates and support bounds never
+/// cross the neutral scheduler query interface.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum PredictionRejection {
+    ExecutionIdentityMismatch,
+    FeatureDomainMismatch,
+    OutsideObservedSupport,
+    InvalidWorkFeatures(ModelError),
+    InvalidBasePrediction(ModelError),
+}
+
+impl PredictionRejection {
+    fn into_model_error(self) -> ModelError {
+        match self {
+            Self::ExecutionIdentityMismatch
+            | Self::FeatureDomainMismatch
+            | Self::OutsideObservedSupport => ModelError::UnsupportedDomain,
+            Self::InvalidWorkFeatures(error) | Self::InvalidBasePrediction(error) => error,
+        }
+    }
+}
+
 /// Complete canonical assembly identity, not a hash or a model-name heuristic.
 /// The owner must bind model/source, device, precision and executor configuration.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -376,10 +398,31 @@ impl FittedModel {
         identity: &ExecutionIdentity,
         features: &WorkFeatures,
     ) -> Result<BasePrediction, ModelError> {
-        if identity != &self.identity || !self.support.contains(features) {
-            return Err(ModelError::UnsupportedDomain);
+        self.predict_detailed(identity, features)
+            .map_err(PredictionRejection::into_model_error)
+    }
+
+    pub(crate) fn predict_detailed(
+        &self,
+        identity: &ExecutionIdentity,
+        features: &WorkFeatures,
+    ) -> Result<BasePrediction, PredictionRejection> {
+        if identity != &self.identity {
+            return Err(PredictionRejection::ExecutionIdentityMismatch);
         }
-        self.predict_features(features)
+        if features.domain() != self.support.domain {
+            return Err(PredictionRejection::FeatureDomainMismatch);
+        }
+        if features.values().iter().any(|x| !x.is_finite()) {
+            // Previously rejected by Support::contains before model evaluation.
+            return Err(PredictionRejection::InvalidWorkFeatures(
+                ModelError::UnsupportedDomain,
+            ));
+        }
+        if !self.support.contains(features) {
+            return Err(PredictionRejection::OutsideObservedSupport);
+        }
+        self.predict_features_detailed(features)
     }
 
     /// Qualified out-of-fit observations may extend only the measured feature
@@ -421,7 +464,17 @@ impl FittedModel {
     }
 
     fn predict_features(&self, features: &WorkFeatures) -> Result<BasePrediction, ModelError> {
-        features.validate()?;
+        self.predict_features_detailed(features)
+            .map_err(PredictionRejection::into_model_error)
+    }
+
+    fn predict_features_detailed(
+        &self,
+        features: &WorkFeatures,
+    ) -> Result<BasePrediction, PredictionRejection> {
+        features
+            .validate()
+            .map_err(PredictionRejection::InvalidWorkFeatures)?;
         let x = std::array::from_fn(|i| features.values()[i] / self.scales[i]);
         let result = match &self.predictor {
             Predictor::Physical(model) => {
@@ -438,7 +491,9 @@ impl FittedModel {
             || result.central_seconds < 0.0
             || result.risk_base_seconds < 0.0
         {
-            return Err(ModelError::InvalidData("invalid model prediction"));
+            return Err(PredictionRejection::InvalidBasePrediction(
+                ModelError::InvalidData("invalid model prediction"),
+            ));
         }
         Ok(result)
     }

@@ -56,8 +56,36 @@ impl SloPolicy {
     /// or removed by renormalizing the remaining rank weights.
     pub fn evaluate_scenarios_with_requests<Action, Adapter: TrajectoryAdapter<Action>>(
         input: EvaluationInput<'_, Action, Adapter>,
+        assign: impl FnMut(ScenarioRank, &mut [SimulatedRequest]) -> Result<(), Unsupported>,
+        visit: impl FnMut(ScenarioRank, &Comparison),
+    ) -> Result<ScenarioEvaluation, Unsupported> {
+        Self::evaluate_scenarios_with_diagnostics(
+            input,
+            assign,
+            visit,
+            &mut ScenarioDiagnostics::default(),
+        )
+    }
+
+    /// The fixed-size receipt is populated on every return. Partial traversal
+    /// remains unusable for feasibility, but its actual work is observable.
+    pub fn evaluate_scenarios_with_diagnostics<Action, Adapter: TrajectoryAdapter<Action>>(
+        input: EvaluationInput<'_, Action, Adapter>,
+        assign: impl FnMut(ScenarioRank, &mut [SimulatedRequest]) -> Result<(), Unsupported>,
+        visit: impl FnMut(ScenarioRank, &Comparison),
+        report: &mut ScenarioDiagnostics,
+    ) -> Result<ScenarioEvaluation, Unsupported> {
+        let recorder = diagnostics::Recorder::new(input.config.planning.max_queries);
+        let result = Self::evaluate_scenarios_recorded(input, assign, visit, &recorder);
+        *report = recorder.finish(result.as_ref().err().copied());
+        result
+    }
+
+    fn evaluate_scenarios_recorded<Action, Adapter: TrajectoryAdapter<Action>>(
+        input: EvaluationInput<'_, Action, Adapter>,
         mut assign: impl FnMut(ScenarioRank, &mut [SimulatedRequest]) -> Result<(), Unsupported>,
         mut visit: impl FnMut(ScenarioRank, &Comparison),
+        diagnostics: &diagnostics::Recorder,
     ) -> Result<ScenarioEvaluation, Unsupported> {
         if input.requests.is_empty() {
             return Err(Unsupported::EmptyCohort);
@@ -76,7 +104,11 @@ impl SloPolicy {
         let limits = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             input.snapshot.query_limits()
         }))
-        .map_err(|_| Unsupported::Cost(CostUnknownReason::UnsupportedDomain))?;
+        .map_err(|_| {
+            let reason = Unsupported::Cost(CostUnknownReason::UnsupportedDomain);
+            diagnostics.failure(reason, FailureOrigin::ProviderPanic);
+            reason
+        })?;
         let mut plan = PlanBuilder {
             groups: Vec::new(),
             participant_limit: input.config.planning.max_participants,
@@ -96,6 +128,17 @@ impl SloPolicy {
             validate_member(input.requests, *member)?;
         }
         let work = group.iter().map(|member| member.work).collect::<Vec<_>>();
+        diagnostics.point(
+            EvaluationPoint {
+                stage: EvaluationStage::Seed,
+                candidate: Some(0),
+                round: Some(0),
+                group: Some(0),
+                ..EvaluationPoint::default()
+            },
+            0,
+        );
+        diagnostics.provider_call();
         let seed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             input.snapshot.cost_scenarios(
                 &CostQuery {
@@ -107,8 +150,13 @@ impl SloPolicy {
                 input.config.planning.max_scenarios,
             )
         }))
-        .map_err(|_| Unsupported::Cost(CostUnknownReason::UnsupportedDomain))?
-        .validated(input.now, input.config.planning.max_scenarios);
+        .map_err(|_| {
+            let reason = Unsupported::Cost(CostUnknownReason::UnsupportedDomain);
+            diagnostics.failure(reason, FailureOrigin::ProviderPanic);
+            reason
+        })?;
+        let seed_was_known = matches!(seed, CostScenarioPrediction::Known { .. });
+        let seed = seed.validated(input.now, input.config.planning.max_scenarios);
         let (weights, dependence, seed_expiry) = match &seed {
             CostScenarioPrediction::Known {
                 scenarios,
@@ -123,7 +171,17 @@ impl SloPolicy {
                 *dependence,
                 *expires_at,
             ),
-            CostScenarioPrediction::Unknown(reason) => return Err(Unsupported::Cost(*reason)),
+            CostScenarioPrediction::Unknown(reason) => {
+                diagnostics.failure(
+                    Unsupported::Cost(*reason),
+                    if seed_was_known {
+                        FailureOrigin::ScenarioContract
+                    } else {
+                        FailureOrigin::Provider
+                    },
+                );
+                return Err(Unsupported::Cost(*reason));
+            }
         };
         let queries = AtomicUsize::new(1);
         let mut cache = ScenarioCache::new(
@@ -139,6 +197,7 @@ impl SloPolicy {
             },
             seed,
         );
+        diagnostics.cache_bytes(cache.retained_bytes());
         let cache = parking_lot::Mutex::new(cache);
         let valid_until = parking_lot::Mutex::new(seed_expiry);
         let mut resolved_mass = 0.0;
@@ -146,9 +205,19 @@ impl SloPolicy {
         let mut unresolved_ranks = 0;
         let mut quantile_lower = 0.0;
         for (rank, weight) in weights.iter().copied().enumerate() {
+            diagnostics.point(
+                EvaluationPoint {
+                    stage: EvaluationStage::RankAssignment,
+                    rank: Some(rank),
+                    ..EvaluationPoint::default()
+                },
+                0,
+            );
             if started.elapsed() >= Duration::from_micros(input.config.planning.max_elapsed_us) {
+                diagnostics.failure(Unsupported::TimeBudget, FailureOrigin::PreQueryTime);
                 return Err(Unsupported::TimeBudget);
             }
+            diagnostics.rank_attempt();
             let rank_info = ScenarioRank {
                 index: rank,
                 count: weights.len(),
@@ -158,7 +227,9 @@ impl SloPolicy {
             };
             quantile_lower = rank_info.quantile_upper;
             let mut requests = input.requests.to_vec();
-            if assign(rank_info, &mut requests).is_err() {
+            if let Err(reason) = assign(rank_info, &mut requests) {
+                diagnostics.failure(reason, FailureOrigin::RankAssignment);
+                diagnostics.rank_finished(true);
                 unresolved_mass += weight;
                 unresolved_ranks += 1;
                 continue;
@@ -177,6 +248,7 @@ impl SloPolicy {
                         || request.risk_clock != original.risk_clock
                 })
             {
+                diagnostics.failure(Unsupported::InvalidState, FailureOrigin::RankAssignment);
                 return Err(Unsupported::InvalidState);
             }
             let snapshot = ConditionalSnapshot {
@@ -190,23 +262,36 @@ impl SloPolicy {
                 queries: &queries,
                 cache: &cache,
                 valid_until: &valid_until,
+                diagnostics,
             };
-            let comparison = Self::evaluate(EvaluationInput {
-                snapshot: &snapshot,
-                now: input.now,
-                config: input.config,
-                execution: input.execution,
-                requests: &requests,
-                resources: input.resources,
-                adapter: input.adapter,
-                static_action: input.static_action,
-                alternatives: input.alternatives,
-                static_window_rounds: input.static_window_rounds,
-            })?;
+            let failures = diagnostics.failures();
+            let comparison = Self::evaluate_recorded(
+                EvaluationInput {
+                    snapshot: &snapshot,
+                    now: input.now,
+                    config: input.config,
+                    execution: input.execution,
+                    requests: &requests,
+                    resources: input.resources,
+                    adapter: input.adapter,
+                    static_action: input.static_action,
+                    alternatives: input.alternatives,
+                    static_window_rounds: input.static_window_rounds,
+                },
+                diagnostics,
+                Some(rank),
+            );
+            if let Err(reason) = comparison {
+                diagnostics.fallback_failure(failures, reason, FailureOrigin::Evaluation);
+                return Err(reason);
+            }
+            let comparison = comparison?;
             visit(rank_info, &comparison);
             resolved_mass += weight;
+            diagnostics.rank_finished(false);
         }
         if started.elapsed() >= Duration::from_micros(input.config.planning.max_elapsed_us) {
+            diagnostics.failure(Unsupported::TimeBudget, FailureOrigin::SimulationTime);
             return Err(Unsupported::TimeBudget);
         }
         let valid_until = *valid_until.lock();
@@ -236,6 +321,7 @@ struct ConditionalSnapshot<'a> {
     queries: &'a AtomicUsize,
     cache: &'a parking_lot::Mutex<ScenarioCache>,
     valid_until: &'a parking_lot::Mutex<Instant>,
+    diagnostics: &'a diagnostics::Recorder,
 }
 
 impl CostSnapshot for ConditionalSnapshot<'_> {
@@ -247,11 +333,17 @@ impl CostSnapshot for ConditionalSnapshot<'_> {
     }
     fn predict(&self, query: &CostQuery<'_>, now: Instant) -> CostPrediction {
         if self.started.elapsed() >= Duration::from_micros(self.config.planning.max_elapsed_us) {
+            self.diagnostics.failure(
+                Unsupported::Cost(CostUnknownReason::PlanningBudget),
+                FailureOrigin::PreQueryTime,
+            );
             return CostPrediction::Unknown(CostUnknownReason::PlanningBudget);
         }
         // This mutex protects only comparison-local memoization, never the
         // estimator or execution. No lock is held across an original query.
-        if let Some(prediction) = self.cache.lock().get(query, now, self.rank) {
+        let cached = self.cache.lock().get(query, now, self.rank);
+        if let Some(prediction) = cached {
+            self.diagnostics.cache_hit();
             return prediction;
         }
         if self
@@ -261,14 +353,30 @@ impl CostSnapshot for ConditionalSnapshot<'_> {
             })
             .is_err()
         {
+            self.diagnostics.failure(
+                Unsupported::Cost(CostUnknownReason::PlanningBudget),
+                FailureOrigin::ProviderQueryBudget,
+            );
             return CostPrediction::Unknown(CostUnknownReason::PlanningBudget);
         }
-        let distribution = self
-            .original
-            .cost_scenarios(query, now, self.config.planning.max_scenarios)
-            .validated(now, self.config.planning.max_scenarios);
+        self.diagnostics.provider_call();
+        let distribution =
+            self.original
+                .cost_scenarios(query, now, self.config.planning.max_scenarios);
+        let was_known = matches!(distribution, CostScenarioPrediction::Known { .. });
+        let distribution = distribution.validated(now, self.config.planning.max_scenarios);
         match &distribution {
-            CostScenarioPrediction::Unknown(reason) => CostPrediction::Unknown(*reason),
+            CostScenarioPrediction::Unknown(reason) => {
+                self.diagnostics.failure(
+                    Unsupported::Cost(*reason),
+                    if was_known {
+                        FailureOrigin::ScenarioContract
+                    } else {
+                        FailureOrigin::Provider
+                    },
+                );
+                CostPrediction::Unknown(*reason)
+            }
             CostScenarioPrediction::Known {
                 scenarios,
                 dependence,
@@ -278,16 +386,16 @@ impl CostSnapshot for ConditionalSnapshot<'_> {
                 expires_at,
                 ..
             } => {
-                if *dependence != self.dependence
-                    || scenarios.len() != self.weights.len()
-                    || scenarios
-                        .iter()
-                        .zip(self.weights)
-                        .any(|(scenario, weight)| (scenario.weight - weight).abs() > 1e-12)
-                    || self.started.elapsed()
-                        >= Duration::from_micros(self.config.planning.max_elapsed_us)
-                {
-                    return CostPrediction::Unknown(CostUnknownReason::UnsupportedDomain);
+                if let Some((reason, origin)) = conditional_distribution_failure(
+                    self.started.elapsed(),
+                    Duration::from_micros(self.config.planning.max_elapsed_us),
+                    *dependence,
+                    self.dependence,
+                    scenarios,
+                    self.weights,
+                ) {
+                    self.diagnostics.failure(Unsupported::Cost(reason), origin);
+                    return CostPrediction::Unknown(reason);
                 }
                 let service_time = scenarios[self.rank].service_time;
                 let mut valid_until = self.valid_until.lock();
@@ -304,9 +412,47 @@ impl CostSnapshot for ConditionalSnapshot<'_> {
                     expires_at: *expires_at,
                 };
                 drop(valid_until);
-                self.cache.lock().insert(query, distribution);
+                let bytes = {
+                    let mut cache = self.cache.lock();
+                    cache.insert(query, distribution);
+                    cache.retained_bytes()
+                };
+                self.diagnostics.cache_bytes(bytes);
                 prediction
             }
         }
     }
+}
+
+/// Use the actual post-provider elapsed duration. Keeping this decision pure
+/// also permits exact boundary tests without sleeps or machine-speed gates.
+fn conditional_distribution_failure(
+    elapsed: Duration,
+    limit: Duration,
+    dependence: CostScenarioDependence,
+    expected_dependence: CostScenarioDependence,
+    scenarios: &[CostScenario],
+    weights: &[f64],
+) -> Option<(CostUnknownReason, FailureOrigin)> {
+    if elapsed >= limit {
+        return Some((
+            CostUnknownReason::PlanningBudget,
+            FailureOrigin::PostQueryTime,
+        ));
+    }
+    if dependence != expected_dependence
+        || scenarios.len() != weights.len()
+        || scenarios
+            .iter()
+            .zip(weights)
+            .any(|(scenario, weight)| (scenario.weight - weight).abs() > 1e-12)
+    {
+        return Some((
+            CostUnknownReason::UnsupportedWithDetail(
+                CostUnsupportedDetail::InvalidScenarioDistribution,
+            ),
+            FailureOrigin::ScenarioContract,
+        ));
+    }
+    None
 }

@@ -3,10 +3,12 @@
 
 mod admission;
 mod aggregation;
+mod diagnostics;
 mod risk;
 mod scenarios;
 pub use admission::*;
 pub use aggregation::*;
+pub use diagnostics::*;
 pub use risk::*;
 pub use scenarios::*;
 
@@ -15,7 +17,7 @@ use ferrum_execution::execution_attempt::AttemptWorkKind;
 use ferrum_types::{CostQueryLimits, RequestId, SchedulerSloConfig};
 use std::time::{Duration, Instant};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub enum Unsupported {
     EmptyCohort,
     ParticipantBudget,
@@ -309,6 +311,15 @@ impl SloPolicy {
     pub fn evaluate<Action, Adapter: TrajectoryAdapter<Action>>(
         input: EvaluationInput<'_, Action, Adapter>,
     ) -> Result<Comparison, Unsupported> {
+        let diagnostics = diagnostics::Recorder::new(input.config.planning.max_queries);
+        Self::evaluate_recorded(input, &diagnostics, None)
+    }
+
+    fn evaluate_recorded<Action, Adapter: TrajectoryAdapter<Action>>(
+        input: EvaluationInput<'_, Action, Adapter>,
+        diagnostics: &diagnostics::Recorder,
+        rank: Option<usize>,
+    ) -> Result<Comparison, Unsupported> {
         if input.requests.is_empty() {
             return Err(Unsupported::EmptyCohort);
         }
@@ -336,8 +347,10 @@ impl SloPolicy {
         let mut budget = QueryBudget {
             queries: 0,
             started,
+            diagnostics,
+            rank,
         };
-        let static_result = simulate(&input, input.static_action, None, &mut budget)?;
+        let static_result = simulate(&input, input.static_action, None, &mut budget, 0)?;
         let window = static_result.central_elapsed;
         let targets = static_result
             .requests
@@ -347,12 +360,14 @@ impl SloPolicy {
         let alternatives = input
             .alternatives
             .iter()
-            .map(|action| {
+            .enumerate()
+            .map(|(index, action)| {
                 simulate(
                     &input,
                     action,
                     Some((window, targets.as_slice())),
                     &mut budget,
+                    index + 1,
                 )
             })
             .collect();
@@ -431,16 +446,36 @@ impl SloPolicy {
     }
 }
 
-struct QueryBudget {
+struct QueryBudget<'a> {
     queries: usize,
     started: Instant,
+    diagnostics: &'a diagnostics::Recorder,
+    rank: Option<usize>,
 }
 
 fn simulate<Action, Adapter: TrajectoryAdapter<Action>>(
     input: &EvaluationInput<'_, Action, Adapter>,
     action: &Action,
     probe: Option<(Duration, &[Progress])>,
-    budget: &mut QueryBudget,
+    budget: &mut QueryBudget<'_>,
+    candidate: usize,
+) -> Result<TrajectoryResult, Unsupported> {
+    let failures = budget.diagnostics.failures();
+    let result = simulate_recorded(input, action, probe, budget, candidate);
+    if let Err(reason) = result {
+        budget
+            .diagnostics
+            .fallback_failure(failures, reason, FailureOrigin::Simulation);
+    }
+    result
+}
+
+fn simulate_recorded<Action, Adapter: TrajectoryAdapter<Action>>(
+    input: &EvaluationInput<'_, Action, Adapter>,
+    action: &Action,
+    probe: Option<(Duration, &[Progress])>,
+    budget: &mut QueryBudget<'_>,
+    candidate: usize,
 ) -> Result<TrajectoryResult, Unsupported> {
     let mut requests = input.requests.to_vec();
     let mut central = Duration::ZERO;
@@ -456,10 +491,27 @@ fn simulate<Action, Adapter: TrajectoryAdapter<Action>>(
     let itl_limit = Duration::try_from_secs_f64(input.config.itl_ms / 1000.0)
         .map_err(|_| Unsupported::InvalidState)?;
     loop {
+        budget.diagnostics.point(
+            EvaluationPoint {
+                stage: EvaluationStage::Simulation,
+                rank: budget.rank,
+                candidate: Some(candidate),
+                round: Some(rounds),
+                group: None,
+            },
+            budget.queries,
+        );
         if budget.queries >= input.config.planning.max_queries {
+            budget.diagnostics.failure(
+                Unsupported::QueryBudget,
+                FailureOrigin::SimulationQueryBudget,
+            );
             return Err(Unsupported::QueryBudget);
         }
         if budget.started.elapsed() >= Duration::from_micros(input.config.planning.max_elapsed_us) {
+            budget
+                .diagnostics
+                .failure(Unsupported::TimeBudget, FailureOrigin::SimulationTime);
             return Err(Unsupported::TimeBudget);
         }
         let mut plan = PlanBuilder {
@@ -469,7 +521,13 @@ fn simulate<Action, Adapter: TrajectoryAdapter<Action>>(
                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     input.snapshot.query_limits()
                 }))
-                .map_err(|_| Unsupported::Cost(CostUnknownReason::UnsupportedDomain))?,
+                .map_err(|_| {
+                    let reason = Unsupported::Cost(CostUnknownReason::UnsupportedDomain);
+                    budget
+                        .diagnostics
+                        .failure(reason, FailureOrigin::ProviderPanic);
+                    reason
+                })?,
             ),
             execution: input.execution,
             active: input
@@ -484,8 +542,22 @@ fn simulate<Action, Adapter: TrajectoryAdapter<Action>>(
         if plan.groups.is_empty() {
             return Err(Unsupported::NoProgress);
         }
-        for group in plan.groups {
+        for (group_index, group) in plan.groups.into_iter().enumerate() {
+            budget.diagnostics.point(
+                EvaluationPoint {
+                    stage: EvaluationStage::Simulation,
+                    rank: budget.rank,
+                    candidate: Some(candidate),
+                    round: Some(rounds),
+                    group: Some(group_index),
+                },
+                budget.queries,
+            );
             if budget.queries >= input.config.planning.max_queries {
+                budget.diagnostics.failure(
+                    Unsupported::QueryBudget,
+                    FailureOrigin::SimulationQueryBudget,
+                );
                 return Err(Unsupported::QueryBudget);
             }
             for member in &group {
@@ -493,6 +565,7 @@ fn simulate<Action, Adapter: TrajectoryAdapter<Action>>(
             }
             let work = group.iter().map(|member| member.work).collect::<Vec<_>>();
             budget.queries += 1;
+            budget.diagnostics.simulation_query(budget.queries);
             let prediction = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 input.snapshot.predict(
                     &CostQuery {
@@ -503,7 +576,13 @@ fn simulate<Action, Adapter: TrajectoryAdapter<Action>>(
                     input.now,
                 )
             }))
-            .map_err(|_| Unsupported::Cost(CostUnknownReason::UnsupportedDomain))?;
+            .map_err(|_| {
+                let reason = Unsupported::Cost(CostUnknownReason::UnsupportedDomain);
+                budget
+                    .diagnostics
+                    .failure(reason, FailureOrigin::ProviderPanic);
+                reason
+            })?;
             let CostPrediction::Known {
                 central_service_time,
                 upper_service_time,
@@ -525,7 +604,13 @@ fn simulate<Action, Adapter: TrajectoryAdapter<Action>>(
                 || central_service_time.is_zero()
                 || upper_service_time.is_zero()
             {
-                return Err(Unsupported::Cost(CostUnknownReason::UnsupportedDomain));
+                let reason = Unsupported::Cost(CostUnknownReason::UnsupportedWithDetail(
+                    CostUnsupportedDetail::InvalidScenarioDistribution,
+                ));
+                budget
+                    .diagnostics
+                    .failure(reason, FailureOrigin::ScenarioContract);
+                return Err(reason);
             }
             match group_risk {
                 CostRisk::EngineeringMargin => cost_risk.union_failure_upper = 1.0,
@@ -534,7 +619,13 @@ fn simulate<Action, Adapter: TrajectoryAdapter<Action>>(
                 }
                 CostRisk::CalibratedQuantile { quantile, .. } => {
                     if !quantile.is_finite() || quantile <= 0.0 || quantile >= 1.0 {
-                        return Err(Unsupported::Cost(CostUnknownReason::UnsupportedDomain));
+                        let reason = Unsupported::Cost(CostUnknownReason::UnsupportedWithDetail(
+                            CostUnsupportedDetail::InvalidScenarioDistribution,
+                        ));
+                        budget
+                            .diagnostics
+                            .failure(reason, FailureOrigin::ScenarioContract);
+                        return Err(reason);
                     }
                     cost_risk.union_failure_upper =
                         (cost_risk.union_failure_upper + 1.0 - quantile).min(1.0);
@@ -544,6 +635,9 @@ fn simulate<Action, Adapter: TrajectoryAdapter<Action>>(
             if budget.started.elapsed()
                 >= Duration::from_micros(input.config.planning.max_elapsed_us)
             {
+                budget
+                    .diagnostics
+                    .failure(Unsupported::TimeBudget, FailureOrigin::PostQueryTime);
                 return Err(Unsupported::TimeBudget);
             }
             central = central

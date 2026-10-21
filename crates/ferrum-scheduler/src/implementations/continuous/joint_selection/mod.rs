@@ -57,7 +57,7 @@ impl ContinuousBatchScheduler {
         now: Instant,
     ) -> std::result::Result<Option<FirstAction>, Unsupported> {
         let (decision, alternatives, _) =
-            self.evaluate_joint_action_set(hint, batch, round, now)?;
+            self.evaluate_joint_action_set(hint, batch, round, now, ComparisonKind::Dispatch)?;
         match decision.choice {
             PolicyChoice::Alternative(index) => Ok(alternatives.get(index).copied()),
             PolicyChoice::Static => Ok(None),
@@ -79,7 +79,7 @@ impl ContinuousBatchScheduler {
     ) -> std::result::Result<ScenarioPolicyDecision, Unsupported> {
         let started = Instant::now();
         let result = self
-            .evaluate_joint_action_set(hint, &[], round, now)
+            .evaluate_joint_action_set(hint, &[], round, now, ComparisonKind::Admission)
             .and_then(|(decision, _, missing_stopping)| {
                 if decision.choice == PolicyChoice::Unresolved && missing_stopping {
                     Err(Unsupported::StoppingCoverage)
@@ -97,6 +97,7 @@ impl ContinuousBatchScheduler {
         batch: &[ScheduledRequest],
         round: &mut TimePlanningRound,
         now: Instant,
+        comparison_kind: ComparisonKind,
     ) -> std::result::Result<(ScenarioPolicyDecision, Vec<FirstAction>, bool), Unsupported> {
         let started = Instant::now();
         let remaining_time = Duration::from_micros(round.config.planning.max_elapsed_us)
@@ -236,7 +237,8 @@ impl ContinuousBatchScheduler {
         let mut aggregate =
             ScenarioRiskAccumulator::new(&cohort.requests, alternatives.len(), &config, &success)?;
         let mut aggregate_error = None;
-        let summary = SloPolicy::evaluate_scenarios_with_requests(
+        let mut diagnostics = ScenarioDiagnostics::default();
+        let summary = SloPolicy::evaluate_scenarios_with_diagnostics(
             EvaluationInput {
                 snapshot: round.snapshot.as_ref(),
                 now,
@@ -268,7 +270,12 @@ impl ContinuousBatchScheduler {
                     aggregate_error = aggregate.observe(rank, comparison).err();
                 }
             },
+            &mut diagnostics,
         );
+        round
+            .statistics
+            .joint_evaluation
+            .record(comparison_kind, diagnostics, summary.is_ok());
         // A failed evaluation cannot renew a sub-round's exhausted query budget.
         round.query_count = round.query_count.saturating_add(
             summary

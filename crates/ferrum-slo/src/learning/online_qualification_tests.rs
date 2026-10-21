@@ -75,7 +75,9 @@ fn real_new_point_qualifies_fixed_model_without_changing_old_snapshot_or_unseen_
         let work: Vec<_> = observation.participants.iter().map(sample_work).collect();
         assert_eq!(
             predict_work(&old, &work, at),
-            CostPrediction::Unknown(CostUnknownReason::UnsupportedDomain)
+            CostPrediction::Unknown(CostUnknownReason::UnsupportedWithDetail(
+                CostUnsupportedDetail::OutsideObservedSupport
+            ))
         );
 
         assert!(learner.apply(&shared, &observation, at));
@@ -90,13 +92,17 @@ fn real_new_point_qualifies_fixed_model_without_changing_old_snapshot_or_unseen_
         );
         assert_eq!(
             predict_work(&old, &work, at),
-            CostPrediction::Unknown(CostUnknownReason::UnsupportedDomain)
+            CostPrediction::Unknown(CostUnknownReason::UnsupportedWithDetail(
+                CostUnsupportedDetail::OutsideObservedSupport
+            ))
         );
         let future = observed(1, 17, at, 50);
         let future_work: Vec<_> = future.participants.iter().map(sample_work).collect();
         assert_eq!(
             predict_work(&new, &future_work, at),
-            CostPrediction::Unknown(CostUnknownReason::UnsupportedDomain)
+            CostPrediction::Unknown(CostUnknownReason::UnsupportedWithDetail(
+                CostUnsupportedDetail::OutsideObservedSupport
+            ))
         );
         assert_eq!(
             shared.stats().worker_base_prediction_known,

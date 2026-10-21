@@ -13,6 +13,9 @@ mod online_qualification;
 #[path = "width_history_fit_tests.rs"]
 mod width_history_fit;
 
+#[path = "prediction_rejection_tests.rs"]
+mod prediction_rejection;
+
 fn config() -> LearningConfig {
     LearningConfig {
         training_samples: 4,
@@ -203,7 +206,9 @@ fn expired_calibration_and_split_work_are_explicit_unknown() {
             },
             end
         ),
-        CostPrediction::Unknown(CostUnknownReason::UnsupportedDomain)
+        CostPrediction::Unknown(CostUnknownReason::UnsupportedWithDetail(
+            CostUnsupportedDetail::ExecutionComposition,
+        ))
     );
     assert!(matches!(
         snapshot.predict(
@@ -426,7 +431,9 @@ fn chronological_decode_growth_and_jitter_qualify_only_measured_feature_envelope
                     },
                     now
                 ),
-                CostPrediction::Unknown(CostUnknownReason::UnsupportedDomain)
+                CostPrediction::Unknown(CostUnknownReason::UnsupportedWithDetail(
+                    CostUnsupportedDetail::OutsideObservedSupport,
+                ))
             );
         }
     }

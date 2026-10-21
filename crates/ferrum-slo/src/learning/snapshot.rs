@@ -1,6 +1,9 @@
 use crate::{
-    calibration::CalibrationSnapshot,
-    model::{ExecutionIdentity, FeatureDomain, FittedModel, WorkFeatures},
+    calibration::{CalibrationSnapshot, Correction},
+    model::{
+        BasePrediction, ExecutionIdentity, FeatureDomain, FittedModel, PredictionRejection,
+        WorkFeatures,
+    },
 };
 use arc_swap::ArcSwap;
 use ferrum_execution::execution_attempt::AttemptWorkKind;
@@ -28,20 +31,49 @@ pub(super) struct Snapshot {
     pub domains: Vec<Domain>,
 }
 
-impl CostSnapshot for Snapshot {
-    fn revision(&self) -> u64 {
-        self.revision
-    }
-    fn query_limits(&self) -> CostQueryLimits {
-        self.query
-    }
+struct PreparedPrediction<'a> {
+    domain: &'a Domain,
+    base: BasePrediction,
+    bucket: u32,
+    correction: Correction,
+    central_service_time: Duration,
+    upper_service_time: Duration,
+}
 
-    fn predict(&self, query: &CostQuery<'_>, now: Instant) -> CostPrediction {
+fn unsupported(detail: CostUnsupportedDetail) -> CostUnknownReason {
+    CostUnknownReason::UnsupportedWithDetail(detail)
+}
+
+fn model_rejection(reason: PredictionRejection) -> CostUnknownReason {
+    unsupported(match reason {
+        PredictionRejection::ExecutionIdentityMismatch => {
+            CostUnsupportedDetail::ExecutionIdentityMismatch
+        }
+        PredictionRejection::FeatureDomainMismatch => CostUnsupportedDetail::FeatureDomainMismatch,
+        PredictionRejection::OutsideObservedSupport => {
+            CostUnsupportedDetail::OutsideObservedSupport
+        }
+        PredictionRejection::InvalidWorkFeatures(_) => CostUnsupportedDetail::InvalidWorkProjection,
+        PredictionRejection::InvalidBasePrediction(_) => {
+            CostUnsupportedDetail::InvalidBasePrediction
+        }
+    })
+}
+
+impl Snapshot {
+    /// One immutable query preparation shared by scalar and scenario results.
+    /// Diagnostics describe the rejecting branch; they never run a second fit
+    /// or prediction, refresh evidence, or change any support/expiry rule.
+    fn prepare(
+        &self,
+        query: &CostQuery<'_>,
+        now: Instant,
+    ) -> Result<PreparedPrediction<'_>, CostUnknownReason> {
         if !CostQuery::fits(query.work.len(), self.query) {
-            return CostPrediction::Unknown(CostUnknownReason::QueryLimit);
+            return Err(CostUnknownReason::QueryLimit);
         }
         if !query.work_is_exact {
-            return CostPrediction::Unknown(CostUnknownReason::InexactWork);
+            return Err(CostUnknownReason::InexactWork);
         }
         if query.execution == CostExecution::SequentialPrefillThenDecode
             && query
@@ -51,24 +83,24 @@ impl CostSnapshot for Snapshot {
             && query.work.iter().any(|w| w.kind == AttemptWorkKind::Decode)
         {
             // No inferred joint quantile from pure-phase or mixed-invocation fits.
-            return CostPrediction::Unknown(CostUnknownReason::UnsupportedDomain);
+            return Err(unsupported(CostUnsupportedDetail::ExecutionComposition));
         }
-        let Ok(features) = WorkFeatures::extract(query.work, self.query.max_participants) else {
-            return CostPrediction::Unknown(CostUnknownReason::UnsupportedDomain);
-        };
+        let features = WorkFeatures::extract(query.work, self.query.max_participants)
+            .map_err(|_| unsupported(CostUnsupportedDetail::InvalidWorkProjection))?;
         let Some(domain) = self
             .domains
             .iter()
             .find(|d| d.model.domain() == features.domain())
         else {
-            return CostPrediction::Unknown(CostUnknownReason::NoCoverage);
+            return Err(CostUnknownReason::NoCoverage);
         };
         if now >= domain.model_expires_at {
-            return CostPrediction::Unknown(CostUnknownReason::Stale);
+            return Err(CostUnknownReason::Stale);
         }
-        let Ok(base) = domain.model.predict(&self.identity, &features) else {
-            return CostPrediction::Unknown(CostUnknownReason::UnsupportedDomain);
-        };
+        let base = domain
+            .model
+            .predict_detailed(&self.identity, &features)
+            .map_err(model_rejection)?;
         let bucket = self
             .boundaries
             .partition_point(|limit| (*limit as f64) < features.work_tokens())
@@ -79,27 +111,54 @@ impl CostSnapshot for Snapshot {
                 .correction(domain.model_revision, &features.domain(), bucket, now)
         else {
             // Every installed version had qualified same-domain calibration.
-            return CostPrediction::Unknown(CostUnknownReason::Stale);
+            return Err(CostUnknownReason::Stale);
         };
         let Ok(central_service_time) = Duration::try_from_secs_f64(base.central_seconds) else {
-            return CostPrediction::Unknown(CostUnknownReason::UnsupportedDomain);
+            return Err(unsupported(CostUnsupportedDetail::UnrepresentableDuration));
         };
         let Ok(upper_service_time) = Duration::try_from_secs_f64(
             (base.risk_base_seconds + correction.signed_seconds).max(0.0),
         ) else {
-            return CostPrediction::Unknown(CostUnknownReason::UnsupportedDomain);
+            return Err(unsupported(CostUnsupportedDetail::UnrepresentableDuration));
         };
-        CostPrediction::Known {
+        Ok(PreparedPrediction {
+            domain,
+            base,
+            bucket,
+            correction,
             central_service_time,
             upper_service_time,
+        })
+    }
+}
+
+impl CostSnapshot for Snapshot {
+    fn revision(&self) -> u64 {
+        self.revision
+    }
+    fn query_limits(&self) -> CostQueryLimits {
+        self.query
+    }
+
+    fn predict(&self, query: &CostQuery<'_>, now: Instant) -> CostPrediction {
+        let prepared = match self.prepare(query, now) {
+            Ok(prepared) => prepared,
+            Err(reason) => return CostPrediction::Unknown(reason),
+        };
+        CostPrediction::Known {
+            central_service_time: prepared.central_service_time,
+            upper_service_time: prepared.upper_service_time,
             risk: CostRisk::CalibratedQuantile {
                 quantile: self.quantile,
                 approximation: CostRiskApproximation::EmpiricalConditional,
             },
             support: CostSupport::ValidatedFeatureDomain,
-            samples: correction.samples,
-            observed_at: correction.observed_at,
-            expires_at: correction.expires_at.min(domain.model_expires_at),
+            samples: prepared.correction.samples,
+            observed_at: prepared.correction.observed_at,
+            expires_at: prepared
+                .correction
+                .expires_at
+                .min(prepared.domain.model_expires_at),
         }
     }
 
@@ -112,36 +171,16 @@ impl CostSnapshot for Snapshot {
         if max_scenarios == 0 {
             return CostScenarioPrediction::Unknown(CostUnknownReason::QueryLimit);
         }
-        let (central_service_time, support) = match self.predict(query, now) {
-            CostPrediction::Known {
-                central_service_time,
-                support,
-                ..
-            } => (central_service_time, support),
-            CostPrediction::Unknown(reason) => return CostScenarioPrediction::Unknown(reason),
+        let prepared = match self.prepare(query, now) {
+            Ok(prepared) => prepared,
+            Err(reason) => return CostScenarioPrediction::Unknown(reason),
         };
-        let Ok(features) = WorkFeatures::extract(query.work, self.query.max_participants) else {
-            return CostScenarioPrediction::Unknown(CostUnknownReason::UnsupportedDomain);
-        };
-        let Some(domain) = self
-            .domains
-            .iter()
-            .find(|d| d.model.domain() == features.domain())
-        else {
-            return CostScenarioPrediction::Unknown(CostUnknownReason::NoCoverage);
-        };
-        let Ok(base) = domain.model.predict(&self.identity, &features) else {
-            return CostScenarioPrediction::Unknown(CostUnknownReason::UnsupportedDomain);
-        };
-        let bucket = self
-            .boundaries
-            .partition_point(|limit| (*limit as f64) < features.work_tokens())
-            as u32;
+        let domain = prepared.domain;
         let count = max_scenarios.min(32);
         let Some(residuals) = domain.calibration.scenarios(
             domain.model_revision,
-            &features.domain(),
-            bucket,
+            &domain.model.domain(),
+            prepared.bucket,
             now,
             count,
         ) else {
@@ -150,9 +189,11 @@ impl CostSnapshot for Snapshot {
         let mut scenarios = Vec::with_capacity(count);
         for (rank, residual) in residuals.signed_seconds.into_iter().enumerate() {
             let Ok(service_time) =
-                Duration::try_from_secs_f64((base.risk_base_seconds + residual).max(0.0))
+                Duration::try_from_secs_f64((prepared.base.risk_base_seconds + residual).max(0.0))
             else {
-                return CostScenarioPrediction::Unknown(CostUnknownReason::UnsupportedDomain);
+                return CostScenarioPrediction::Unknown(unsupported(
+                    CostUnsupportedDetail::UnrepresentableDuration,
+                ));
             };
             scenarios.push(CostScenario {
                 rank,
@@ -163,10 +204,10 @@ impl CostSnapshot for Snapshot {
             });
         }
         CostScenarioPrediction::Known {
-            central_service_time,
+            central_service_time: prepared.central_service_time,
             scenarios,
             dependence: CostScenarioDependence::SharedResidualRank,
-            support,
+            support: CostSupport::ValidatedFeatureDomain,
             samples: residuals.correction.samples,
             observed_at: residuals.correction.observed_at,
             expires_at: residuals.correction.expires_at.min(domain.model_expires_at),

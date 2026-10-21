@@ -1,6 +1,8 @@
 use super::*;
 use ferrum_execution::{execution_attempt::AttemptPrefixRestore, token_execution::ExecutionRange};
 
+mod diagnostics;
+
 struct Snapshot {
     at: Instant,
     calls: AtomicUsize,

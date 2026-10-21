@@ -200,6 +200,27 @@ cancellation. `planning_rounds_before_selection` identifies that subset; each
 Engine turn is recorded once, before device execution. These counters describe
 planning activity and do not establish SLO feasibility or actual intervention.
 
+`joint_evaluation.admission` and `.dispatch` count entered scenario evaluations,
+including failed traversals. Their denominator excludes cohort or capacity checks
+that return before the evaluator. `provider_calls` includes the seed and failed
+calls to the original cost provider; `simulation_queries` also includes exact
+cache hits. Both differ from the conservative query-budget charge. The older
+`joint_cost_snapshot_queries` and cache counters describe completed traversals
+only. A completed traversal is not proof of a feasible action or a policy change.
+Evaluator elapsed time is measured wall time, not OS CPU time or the charged
+planning budget. Rank and query maxima are maxima, not additive counters.
+
+Each population retains its latest first failure and latest terminal failure,
+including the rank, candidate, wave, invocation group and consumed query counts.
+An unsupported alternative can produce a first failure in an otherwise completed
+traversal. These bounded samples do not describe the frequency of every cause.
+`joint_cost_unsupported_detail` subdivides the existing unsupported-domain bucket;
+do not add it to that parent bucket. Details distinguish unqualified work or
+empirical support, invalid numeric predictions and scenario-contract failures
+without exposing model-private features. Deadline exhaustion after a provider
+call is a planning-budget failure, not evidence of missing model support. These
+diagnostics do not change support bounds, deadlines, candidates or fallback policy.
+
 `live_prediction` groups actual invocation counters by model family and by
 phase/reuse domain for the current process. The observer freezes one center, risk base and available
 calibrated upper prediction before execution. Completion records center signed,

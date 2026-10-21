@@ -103,7 +103,9 @@ impl Reason {
             Unsupported::Cost(CostUnknownReason::NoCoverage) => Self::CostNoCoverage,
             Unsupported::Cost(CostUnknownReason::Stale) => Self::CostStale,
             Unsupported::Cost(CostUnknownReason::InexactWork) => Self::CostInexactWork,
-            Unsupported::Cost(CostUnknownReason::UnsupportedDomain) => Self::CostUnsupportedDomain,
+            Unsupported::Cost(
+                CostUnknownReason::UnsupportedDomain | CostUnknownReason::UnsupportedWithDetail(_),
+            ) => Self::CostUnsupportedDomain,
             Unsupported::Cost(CostUnknownReason::QueryLimit) => Self::CostQueryLimit,
             Unsupported::Cost(CostUnknownReason::PlanningBudget) => Self::CostPlanningBudget,
         }

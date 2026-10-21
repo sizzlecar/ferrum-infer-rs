@@ -77,6 +77,7 @@ impl SchedulerSloSnapshot {
         // turn creation. Drop/cancellation must not invoke provider callbacks.
         self.last_revision = round.diagnostic_revision;
         let value = &round.statistics;
+        self.selections.joint_evaluation.add(value.joint_evaluation);
         self.selections.joint_cost_snapshot_queries = self
             .selections
             .joint_cost_snapshot_queries
@@ -96,6 +97,9 @@ impl SchedulerSloSnapshot {
         self.selections
             .joint_unsupported
             .add(value.joint_unsupported);
+        self.selections
+            .joint_cost_unsupported_detail
+            .merge(value.joint_cost_unsupported_detail);
         self.selections.joint_admission_action_required = self
             .selections
             .joint_admission_action_required
@@ -182,5 +186,96 @@ mod tests {
             assert_eq!(snapshot.last_revision, (!panic).then_some(7));
             assert_eq!(provider.calls.load(Ordering::Relaxed), 1);
         }
+    }
+
+    #[tokio::test]
+    async fn failed_evaluation_work_survives_early_scope_exit_and_stays_separate() {
+        use crate::cost_prediction::ComparisonKind;
+        use crate::joint_policy::{
+            EvaluationFailure, EvaluationPoint, EvaluationStage, FailureOrigin,
+            ScenarioDiagnostics, Unsupported,
+        };
+
+        let policy = "ttft:1000,tpot:100,itl:100".parse().unwrap();
+        let scheduler = Arc::new(super::super::ContinuousBatchScheduler::new(
+            ferrum_types::SchedulerConfig {
+                slo: Some(policy),
+                ..Default::default()
+            },
+        ));
+        let provider = Arc::new(RevisionProbe {
+            scheduler: scheduler.clone(),
+            calls: AtomicUsize::new(0),
+            panic: false,
+        });
+        let mut round = TimePlanningRound::new(
+            provider.clone(),
+            policy,
+            PrefillShapePolicy::Identity,
+            CostExecution::SingleInvocation,
+        );
+        let failure = EvaluationFailure {
+            reason: Unsupported::Cost(CostUnknownReason::PlanningBudget),
+            origin: FailureOrigin::PostQueryTime,
+            point: EvaluationPoint {
+                stage: EvaluationStage::Simulation,
+                rank: Some(1),
+                candidate: Some(0),
+                round: Some(3),
+                group: Some(0),
+            },
+            provider_calls: 2,
+            simulation_queries: 4,
+            rank_simulation_queries: 4,
+            query_limit: 8,
+            elapsed_us: 10,
+        };
+        round.statistics.joint_evaluation.record(
+            ComparisonKind::Admission,
+            ScenarioDiagnostics {
+                provider_calls: 2,
+                simulation_queries: 4,
+                cache_hits: 3,
+                elapsed_us: 10,
+                first_failure: Some(failure),
+                terminal_failure: Some(failure),
+                failure_count: 1,
+                ..Default::default()
+            },
+            false,
+        );
+        round.statistics.joint_evaluation.record(
+            ComparisonKind::Dispatch,
+            ScenarioDiagnostics {
+                provider_calls: 1,
+                simulation_queries: 3,
+                cache_hits: 3,
+                elapsed_us: 5,
+                ..Default::default()
+            },
+            true,
+        );
+        // Admission can return before selection; finishing must preserve its
+        // partial query work once without invoking any provider on scope drop.
+        let finished = scheduler.observe_planning_round(Some(round)).finish();
+        drop(finished);
+        let snapshot = scheduler.slo_snapshot().unwrap();
+        assert_eq!(snapshot.planning_rounds, 1);
+        assert_eq!(snapshot.planning_rounds_before_selection, 1);
+        let evaluation = snapshot.selections.joint_evaluation;
+        assert_eq!(evaluation.admission.evaluations, 1);
+        assert_eq!(evaluation.admission.failed_traversals, 1);
+        assert_eq!(evaluation.admission.provider_calls, 2);
+        assert_eq!(evaluation.admission.simulation_queries, 4);
+        assert_eq!(evaluation.admission.latest_terminal_failure, Some(failure));
+        assert_eq!(evaluation.dispatch.completed_traversals, 1);
+        assert_eq!(evaluation.dispatch.provider_calls, 1);
+        assert_eq!(evaluation.dispatch.latest_terminal_failure, None);
+        let health = serde_json::to_value(snapshot).unwrap();
+        assert_eq!(
+            health["joint_evaluation"]["admission"]["latest_terminal_failure"]["origin"],
+            "post_query_time"
+        );
+        assert_eq!(provider.calls.load(Ordering::Relaxed), 1);
     }
 }

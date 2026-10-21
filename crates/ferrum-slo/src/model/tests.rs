@@ -5,6 +5,9 @@ use ferrum_execution::{
 };
 use ferrum_scheduler::cost_prediction::CostWork;
 
+#[path = "prediction_rejection_tests.rs"]
+mod prediction_rejection;
+
 fn identity() -> ExecutionIdentity {
     ExecutionIdentity::new(
         "fixture-source:revision-1/device:cpu/precision:f32/executor:single".into(),
