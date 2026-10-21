@@ -2,11 +2,12 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use ferrum_runtime::{
-    dense_linear_contract, CapabilityCatalog, CapabilityId, ContractVersion, DeviceClass,
-    DeviceDescriptor, DeviceId, DeviceRuntime, DynamicStorageAllocator, DynamicStorageProfile,
-    DynamicStorageView, EngineProviderDescriptor, OperationContract, OperationProvider,
-    OperationRuntimeRegistry, ProviderId, VNextError, WeightMaterializerId,
-    WeightMaterializerRegistry, DENSE_LINEAR_F16_CAPABILITY_ID, IDENTITY_WEIGHT_MATERIALIZER_ID,
+    dense_linear_bf16_contract, dense_linear_contract, CapabilityCatalog, CapabilityId,
+    ContractVersion, DeviceClass, DeviceDescriptor, DeviceId, DeviceRuntime,
+    DynamicStorageAllocator, DynamicStorageProfile, DynamicStorageView, EngineProviderDescriptor,
+    OperationContract, OperationProvider, OperationRuntimeRegistry, ProviderId, VNextError,
+    WeightMaterializerId, WeightMaterializerRegistry, DENSE_LINEAR_BF16_CAPABILITY_ID,
+    DENSE_LINEAR_F16_CAPABILITY_ID, IDENTITY_WEIGHT_MATERIALIZER_ID,
 };
 
 use super::dense_linear::{implementation_fingerprint, ReferenceDenseLinearProvider};
@@ -19,9 +20,10 @@ pub const REFERENCE_DENSE_SAFETENSORS_FORMAT_ID: &str = "weight-format.safetenso
 const REFERENCE_MEMORY_BYTES: u64 = 64 * 1024 * 1024;
 
 pub fn reference_vnext_capabilities() -> Result<BTreeSet<CapabilityId>, VNextError> {
-    Ok(BTreeSet::from([CapabilityId::new(
-        DENSE_LINEAR_F16_CAPABILITY_ID,
-    )?]))
+    Ok(BTreeSet::from([
+        CapabilityId::new(DENSE_LINEAR_F16_CAPABILITY_ID)?,
+        CapabilityId::new(DENSE_LINEAR_BF16_CAPABILITY_ID)?,
+    ]))
 }
 
 pub(super) fn reference_vnext_runtime_config(
@@ -50,9 +52,14 @@ pub(super) fn reference_vnext_runtime_config(
 pub fn reference_vnext_operation_registry(
     runtime: &ReferenceDeviceRuntime,
 ) -> Result<OperationRuntimeRegistry<ReferenceDeviceRuntime>, ReferenceDeviceRuntimeError> {
-    let contracts: Vec<Box<dyn OperationContract>> =
-        vec![Box::new(dense_linear_contract().map_err(contract_error)?)];
-    let providers = vec![reference_vnext_dense_linear_provider(runtime)?];
+    let contracts: Vec<Box<dyn OperationContract>> = vec![
+        Box::new(dense_linear_contract().map_err(contract_error)?),
+        Box::new(dense_linear_bf16_contract().map_err(contract_error)?),
+    ];
+    let providers = vec![
+        reference_vnext_dense_linear_provider(runtime)?,
+        reference_vnext_dense_linear_bf16_provider(runtime)?,
+    ];
     OperationRuntimeRegistry::new(contracts, providers).map_err(contract_error)
 }
 
@@ -63,6 +70,13 @@ pub fn reference_vnext_dense_linear_provider(
     runtime: &ReferenceDeviceRuntime,
 ) -> Result<Box<dyn OperationProvider<ReferenceDeviceRuntime>>, ReferenceDeviceRuntimeError> {
     Ok(Box::new(ReferenceDenseLinearProvider::new(runtime)?))
+}
+
+/// Builds the independent BF16-storage, FP32-arithmetic dense provider.
+pub fn reference_vnext_dense_linear_bf16_provider(
+    runtime: &ReferenceDeviceRuntime,
+) -> Result<Box<dyn OperationProvider<ReferenceDeviceRuntime>>, ReferenceDeviceRuntimeError> {
+    Ok(Box::new(ReferenceDenseLinearProvider::new_bf16(runtime)?))
 }
 
 /// Single composition authority for reference planning, allocation, weight

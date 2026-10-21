@@ -9,9 +9,9 @@ mod dense_linear;
 mod runtime;
 
 pub use composition::{
-    reference_vnext_capabilities, reference_vnext_dense_linear_provider,
-    reference_vnext_operation_registry, ReferenceVNextComposition,
-    REFERENCE_DENSE_SAFETENSORS_FORMAT_ID,
+    reference_vnext_capabilities, reference_vnext_dense_linear_bf16_provider,
+    reference_vnext_dense_linear_provider, reference_vnext_operation_registry,
+    ReferenceVNextComposition, REFERENCE_DENSE_SAFETENSORS_FORMAT_ID,
 };
 pub use runtime::{
     ReferenceDeviceBuffer, ReferenceDeviceCommand, ReferenceDeviceFence, ReferenceDeviceRuntime,

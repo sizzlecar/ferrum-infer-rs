@@ -1,17 +1,23 @@
-//! Qwen-Image 2.1 Transformer configuration and checkpoint structure preflight.
+//! Qwen-Image 2.1 Transformer metadata and its isolated image-input projection.
 //!
-//! This module consumes small JSON metadata only. Detached safetensors headers
-//! establish declared structure, not payload authenticity or executable model
-//! support. It produces the same runtime `WeightSchema` a future model program
-//! will consume, without claiming to implement that program or a weight source.
+//! Detached safetensors headers establish declared structure, not payload
+//! authenticity. The image-projection family executes only `img_in`; the full
+//! Transformer, text conditioning and image-generation pipeline remain separate
+//! work. Weight payloads use the existing runtime weight-source interface.
 
 mod config;
 mod headers;
+mod image_projection;
 mod weights;
 
 pub use config::QwenImage21Config;
 pub use headers::{
     HeaderEvidence, PayloadVerification, QwenImage21Structure, ShardStructure, TensorStructure,
+};
+pub use image_projection::{
+    QwenImage21ImageProjectionFamily, IMAGE_PROJECTION_FAMILY_ID, IMAGE_PROJECTION_INPUT_ID,
+    IMAGE_PROJECTION_NODE_ID, IMAGE_PROJECTION_OUTPUT_ID, IMAGE_PROJECTION_PROFILE_ID,
+    IMAGE_PROJECTION_WEIGHT_ID,
 };
 pub use weights::{ExpectedTensor, ExpectedWeights};
 

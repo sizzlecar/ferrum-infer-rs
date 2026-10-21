@@ -1,39 +1,72 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use ferrum_runtime::{
-    dense_linear_contract, AttributeId, BatchedOperationInvocation, CapabilityId, ContractVersion,
-    DeviceBatchingForm, DeviceRuntime, DynamicStorageRequirement, ElementType,
-    EncodedDeviceOperation, ExecutionIdentityEnvelope, InvocationWorkProjection, NodeWorkContract,
-    OperationContract, OperationFailure, OperationProvider, OperationProviderDescriptor,
-    OperationResourceEstimate, OperationResourceEstimateRequest, OperationResourceEstimator,
-    ProfilePhase, ProviderExecutionSemantics, ProviderId, ProviderStorageBindingRequirement,
-    ResolvedValueBinding, ResolvedValueRole, ReusableExecutionTopology,
-    ReusableExecutionTopologyRequest, SemanticValue, TensorOperationInvocation, VNextError,
-    WeightFormatId, DENSE_LINEAR_F16_CAPABILITY_ID, DENSE_LINEAR_OPERATION_ID,
+    dense_linear_bf16_contract, dense_linear_contract, AttributeId, BatchedOperationInvocation,
+    CapabilityId, ContractVersion, DeviceBatchingForm, DeviceRuntime, DynamicStorageRequirement,
+    ElementType, EncodedDeviceOperation, ExecutionIdentityEnvelope, InvocationWorkProjection,
+    NodeWorkContract, OperationContract, OperationFailure, OperationProvider,
+    OperationProviderDescriptor, OperationResourceEstimate, OperationResourceEstimateRequest,
+    OperationResourceEstimator, ProfilePhase, ProviderExecutionSemantics, ProviderId,
+    ProviderStorageBindingRequirement, ResolvedValueBinding, ResolvedValueRole,
+    ReusableExecutionTopology, ReusableExecutionTopologyRequest, SemanticValue,
+    TensorOperationInvocation, VNextError, WeightFormatId, DENSE_LINEAR_BF16_CAPABILITY_ID,
+    DENSE_LINEAR_BF16_OPERATION_ID, DENSE_LINEAR_F16_CAPABILITY_ID, DENSE_LINEAR_OPERATION_ID,
 };
 use sha2::{Digest, Sha256};
 
 use super::composition::REFERENCE_DENSE_SAFETENSORS_FORMAT_ID;
 use super::runtime::{
-    ReferenceDenseLinearLaunch, ReferenceDeviceBuffer, ReferenceDeviceCommand,
-    ReferenceDeviceRuntime, ReferenceDeviceRuntimeError,
+    ReferenceDenseLinearLaunch, ReferenceDenseScalar, ReferenceDeviceBuffer,
+    ReferenceDeviceCommand, ReferenceDeviceRuntime, ReferenceDeviceRuntimeError,
 };
 
-const PROVIDER_ID: &str = "provider.reference.dense_linear.f16";
-const ESTIMATOR_ID: &str = "resource-estimator.reference.dense_linear.f16";
 const VALUE_ALIGNMENT_BYTES: u64 = 16;
+
+fn operation_id(scalar: ReferenceDenseScalar) -> &'static str {
+    match scalar {
+        ReferenceDenseScalar::F16 => DENSE_LINEAR_OPERATION_ID,
+        ReferenceDenseScalar::Bf16 => DENSE_LINEAR_BF16_OPERATION_ID,
+    }
+}
 
 pub(super) struct ReferenceDenseLinearProvider {
     descriptor: OperationProviderDescriptor,
+    scalar: ReferenceDenseScalar,
 }
 
 impl ReferenceDenseLinearProvider {
     pub(super) fn new(
         runtime: &ReferenceDeviceRuntime,
     ) -> Result<Self, ReferenceDeviceRuntimeError> {
-        let contract = dense_linear_contract().map_err(contract_error)?;
-        let capability =
-            CapabilityId::new(DENSE_LINEAR_F16_CAPABILITY_ID).map_err(contract_error)?;
+        Self::new_for(runtime, ReferenceDenseScalar::F16)
+    }
+
+    pub(super) fn new_bf16(
+        runtime: &ReferenceDeviceRuntime,
+    ) -> Result<Self, ReferenceDeviceRuntimeError> {
+        Self::new_for(runtime, ReferenceDenseScalar::Bf16)
+    }
+
+    fn new_for(
+        runtime: &ReferenceDeviceRuntime,
+        scalar: ReferenceDenseScalar,
+    ) -> Result<Self, ReferenceDeviceRuntimeError> {
+        let (contract, capability, provider_id, estimator_id) = match scalar {
+            ReferenceDenseScalar::F16 => (
+                dense_linear_contract(),
+                DENSE_LINEAR_F16_CAPABILITY_ID,
+                "provider.reference.dense_linear.f16",
+                "resource-estimator.reference.dense_linear.f16",
+            ),
+            ReferenceDenseScalar::Bf16 => (
+                dense_linear_bf16_contract(),
+                DENSE_LINEAR_BF16_CAPABILITY_ID,
+                "provider.reference.dense_linear.bf16",
+                "resource-estimator.reference.dense_linear.bf16",
+            ),
+        };
+        let contract = contract.map_err(contract_error)?;
+        let capability = CapabilityId::new(capability).map_err(contract_error)?;
         if !runtime.descriptor().capabilities.contains(&capability) {
             return Err(ReferenceDeviceRuntimeError::contract(
                 "reference runtime does not advertise dense-linear capability",
@@ -41,12 +74,12 @@ impl ReferenceDenseLinearProvider {
         }
         let provider_fingerprint = implementation_fingerprint(&[
             include_str!("dense_linear.rs").as_bytes(),
-            PROVIDER_ID.as_bytes(),
+            provider_id.as_bytes(),
         ]);
         let estimator_fingerprint =
-            implementation_fingerprint(&[ESTIMATOR_ID.as_bytes(), provider_fingerprint.as_bytes()]);
+            implementation_fingerprint(&[estimator_id.as_bytes(), provider_fingerprint.as_bytes()]);
         let descriptor = OperationProviderDescriptor::new(
-            ProviderId::new(PROVIDER_ID).map_err(contract_error)?,
+            ProviderId::new(provider_id).map_err(contract_error)?,
             contract.descriptor().id.clone(),
             contract
                 .descriptor()
@@ -61,13 +94,13 @@ impl ReferenceDenseLinearProvider {
                 .map_err(contract_error)?]),
             BTreeSet::new(),
             contiguous_bindings(2),
-            ESTIMATOR_ID,
+            estimator_id,
             ContractVersion::new(1, 0),
             estimator_fingerprint,
         )
         .map_err(contract_error)?
         .with_fixed_tensor_work(true);
-        Ok(Self { descriptor })
+        Ok(Self { descriptor, scalar })
     }
 }
 
@@ -80,7 +113,7 @@ impl OperationResourceEstimator for ReferenceDenseLinearProvider {
         &self,
         request: OperationResourceEstimateRequest<'_>,
     ) -> Result<OperationResourceEstimate, VNextError> {
-        if request.operation().id.as_str() != DENSE_LINEAR_OPERATION_ID
+        if request.operation().id != *self.descriptor.operation_id()
             || request.operation().fingerprint()? != self.descriptor.operation_fingerprint()
         {
             return Err(invalid_plan(
@@ -113,7 +146,7 @@ impl OperationProvider<ReferenceDeviceRuntime> for ReferenceDenseLinearProvider 
         invocation: BatchedOperationInvocation<'_, ReferenceDeviceBuffer>,
     ) -> Result<EncodedDeviceOperation<ReferenceDeviceCommand>, OperationFailure> {
         let identity = invocation.participants()[0].identity().clone();
-        encode_dense_linear(invocation)
+        encode_dense_linear(invocation, self.scalar)
             .map(EncodedDeviceOperation::compute)
             .map_err(|message| provider_failure(identity, message))
     }
@@ -123,7 +156,7 @@ impl OperationProvider<ReferenceDeviceRuntime> for ReferenceDenseLinearProvider 
         invocation: TensorOperationInvocation<'_, ReferenceDeviceBuffer>,
     ) -> Result<Option<EncodedDeviceOperation<ReferenceDeviceCommand>>, OperationFailure> {
         let identity = invocation.participants()[0].identity().clone();
-        encode_tensor_dense_linear(invocation)
+        encode_tensor_dense_linear(invocation, self.scalar)
             .map(EncodedDeviceOperation::compute)
             .map(Some)
             .map_err(|message| provider_failure(identity, message))
@@ -132,11 +165,12 @@ impl OperationProvider<ReferenceDeviceRuntime> for ReferenceDenseLinearProvider 
 
 fn encode_tensor_dense_linear(
     invocation: TensorOperationInvocation<'_, ReferenceDeviceBuffer>,
+    scalar: ReferenceDenseScalar,
 ) -> Result<ReferenceDeviceCommand, String> {
     let [participant] = invocation.participants() else {
         return Err("reference tensor dense-linear requires one participant".to_owned());
     };
-    if invocation.operation().id.as_str() != DENSE_LINEAR_OPERATION_ID
+    if invocation.operation().id.as_str() != operation_id(scalar)
         || !matches!(participant.work(), NodeWorkContract::Fixed)
         || !invocation.resource_work_shape().resource_work().is_tensor()
     {
@@ -144,26 +178,28 @@ fn encode_tensor_dense_linear(
     }
     let in_features = dimension(participant.attributes(), "in_features")?;
     let out_features = dimension(participant.attributes(), "out_features")?;
-    validate_participant_signature(participant, in_features, out_features)?;
+    validate_participant_signature(participant, in_features, out_features, scalar)?;
     let input = binding(participant.bindings(), ResolvedValueRole::Input, 0)?;
     let weight = binding(participant.bindings(), ResolvedValueRole::Input, 1)?;
     let output = binding(participant.bindings(), ResolvedValueRole::Output, 0)?;
     let launch = reference_launch(
-        contiguous_region(participant, input)?,
-        contiguous_region(participant, weight)?,
-        contiguous_region(participant, output)?,
+        contiguous_region(participant, input, scalar.element_type())?,
+        contiguous_region(participant, weight, scalar.element_type())?,
+        contiguous_region(participant, output, scalar.element_type())?,
         input.tensor().dimensions()[0],
         in_features,
         out_features,
+        scalar,
     )?;
     ReferenceDeviceCommand::dense_tensor(launch).map_err(|error| error.to_string())
 }
 
 fn encode_dense_linear(
     invocation: BatchedOperationInvocation<'_, ReferenceDeviceBuffer>,
+    scalar: ReferenceDenseScalar,
 ) -> Result<ReferenceDeviceCommand, String> {
     if invocation.participants().is_empty()
-        || invocation.operation().id.as_str() != DENSE_LINEAR_OPERATION_ID
+        || invocation.operation().id.as_str() != operation_id(scalar)
     {
         return Err(
             "reference dense-linear provider received another or empty operation".to_owned(),
@@ -178,18 +214,19 @@ fn encode_dense_linear(
         {
             return Err("reference dense-linear participant attributes disagree".to_owned());
         }
-        validate_participant_signature(participant, in_features, out_features)?;
+        validate_participant_signature(participant, in_features, out_features, scalar)?;
     }
     let token_ranges = invocation.participant_token_ranges();
     if token_ranges.len() != invocation.participants().len() {
         return Err("reference dense-linear participant ranges are incomplete".to_owned());
     }
     let weight_binding = binding(first.bindings(), ResolvedValueRole::Input, 1)?;
-    let weight = contiguous_region(first, weight_binding)?;
+    let weight = contiguous_region(first, weight_binding, scalar.element_type())?;
     for participant in &invocation.participants()[1..] {
         let candidate = contiguous_region(
             participant,
             binding(participant.bindings(), ResolvedValueRole::Input, 1)?,
+            scalar.element_type(),
         )?;
         if !weight.same_physical_region(&candidate) {
             return Err("reference dense-linear participants do not share one weight".to_owned());
@@ -205,7 +242,7 @@ fn encode_dense_linear(
                 &invocation,
                 ResolvedValueRole::Input,
                 0,
-                ElementType::F16,
+                scalar.element_type(),
                 rows,
             )?,
             weight,
@@ -213,12 +250,13 @@ fn encode_dense_linear(
                 &invocation,
                 ResolvedValueRole::Output,
                 0,
-                ElementType::F16,
+                scalar.element_type(),
                 rows,
             )?,
             rows,
             in_features,
             out_features,
+            scalar,
         )?);
     } else {
         for (participant, token_range) in invocation.participants().iter().zip(token_ranges) {
@@ -237,7 +275,7 @@ fn encode_dense_linear(
                 contiguous_token_region(
                     participant,
                     binding(participant.bindings(), ResolvedValueRole::Input, 0)?,
-                    ElementType::F16,
+                    scalar.element_type(),
                     input_start,
                     rows,
                 )?,
@@ -245,13 +283,14 @@ fn encode_dense_linear(
                 contiguous_token_region(
                     participant,
                     binding(participant.bindings(), ResolvedValueRole::Output, 0)?,
-                    ElementType::F16,
+                    scalar.element_type(),
                     output_start,
                     rows,
                 )?,
                 rows,
                 in_features,
                 out_features,
+                scalar,
             )?);
         }
     }
@@ -273,6 +312,7 @@ fn validate_participant_signature<'a, W: InvocationWorkProjection<'a>>(
     participant: &ferrum_runtime::OperationInvocation<'a, ReferenceDeviceBuffer, W>,
     in_features: usize,
     out_features: usize,
+    scalar: ReferenceDenseScalar,
 ) -> Result<(), String> {
     let input = binding(participant.bindings(), ResolvedValueRole::Input, 0)?;
     let weight = binding(participant.bindings(), ResolvedValueRole::Input, 1)?;
@@ -285,6 +325,9 @@ fn validate_participant_signature<'a, W: InvocationWorkProjection<'a>>(
         || input_dimensions[1] != in_features as u64
         || weight.tensor().dimensions() != [out_features as u64, in_features as u64]
         || output_dimensions[1] != out_features as u64
+        || [input, weight, output]
+            .iter()
+            .any(|binding| binding.tensor().element_type() != scalar.element_type())
     {
         return Err(
             "reference dense-linear invocation differs from its resolved signature".to_owned(),
@@ -300,49 +343,33 @@ fn reference_launch(
     rows: u64,
     in_features: usize,
     out_features: usize,
+    scalar: ReferenceDenseScalar,
 ) -> Result<ReferenceDenseLinearLaunch, String> {
     let rows = usize::try_from(rows)
         .map_err(|_| "reference dense-linear row count exceeds usize".to_owned())?;
-    let expected_input = rows
-        .checked_mul(in_features)
-        .and_then(|elements| elements.checked_mul(2))
-        .ok_or_else(|| "reference dense-linear input size overflows".to_owned())?;
-    let expected_weight = out_features
-        .checked_mul(in_features)
-        .and_then(|elements| elements.checked_mul(2))
-        .ok_or_else(|| "reference dense-linear weight size overflows".to_owned())?;
-    let expected_output = rows
-        .checked_mul(out_features)
-        .and_then(|elements| elements.checked_mul(2))
-        .ok_or_else(|| "reference dense-linear output size overflows".to_owned())?;
-    if input.length_bytes() != expected_input
-        || weight.length_bytes() != expected_weight
-        || output.length_bytes() != expected_output
-        || input.element_type() != ElementType::F16
-        || weight.element_type() != ElementType::F16
-        || output.element_type() != ElementType::F16
-    {
-        return Err("reference dense-linear physical ranges differ from runtime work".to_owned());
-    }
-    Ok(ReferenceDenseLinearLaunch {
+    let launch = ReferenceDenseLinearLaunch {
         input,
         weight,
         output,
         rows,
         in_features,
         out_features,
-    })
+        scalar,
+    };
+    launch.validate().map_err(|error| error.to_string())?;
+    Ok(launch)
 }
 
 fn contiguous_region<'a, W: InvocationWorkProjection<'a>>(
     participant: &ferrum_runtime::OperationInvocation<'a, ReferenceDeviceBuffer, W>,
     binding: &ResolvedValueBinding,
+    element_type: ElementType,
 ) -> Result<super::runtime::ReferenceBufferRegion, String> {
     let [component] = binding.storage().components() else {
         return Err("reference operation requires one storage component per value".to_owned());
     };
-    if component.element_type() != ElementType::F16 {
-        return Err("reference dense-linear binding is not F16".to_owned());
+    if component.element_type() != element_type {
+        return Err("reference dense-linear binding differs from its scalar contract".to_owned());
     }
     let view = participant
         .views()
@@ -577,4 +604,60 @@ pub(super) fn implementation_fingerprint(parts: &[&[u8]]) -> String {
         digest.update(part);
     }
     format!("{:x}", digest.finalize())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::backend::reference::{
+        reference_vnext_dense_linear_bf16_provider, reference_vnext_dense_linear_provider,
+        ReferenceVNextComposition,
+    };
+    use ferrum_runtime::DeviceId;
+
+    #[test]
+    fn precision_providers_have_independent_contracts_capabilities_and_estimators() {
+        let composition = ReferenceVNextComposition::create(
+            DeviceId::new("device.reference.precision-contracts").unwrap(),
+        )
+        .unwrap();
+        let f16 = reference_vnext_dense_linear_provider(composition.runtime()).unwrap();
+        let bf16 = reference_vnext_dense_linear_bf16_provider(composition.runtime()).unwrap();
+        let a = f16.descriptor();
+        let b = bf16.descriptor();
+        assert_eq!(a.operation_id().as_str(), DENSE_LINEAR_OPERATION_ID);
+        assert_eq!(b.operation_id().as_str(), DENSE_LINEAR_BF16_OPERATION_ID);
+        assert_eq!(
+            a.operation_fingerprint(),
+            dense_linear_contract()
+                .unwrap()
+                .descriptor()
+                .fingerprint()
+                .unwrap()
+        );
+        assert_eq!(
+            b.operation_fingerprint(),
+            dense_linear_bf16_contract()
+                .unwrap()
+                .descriptor()
+                .fingerprint()
+                .unwrap()
+        );
+        assert_ne!(a.provider_id(), b.provider_id());
+        assert_ne!(a.resource_estimator_id(), b.resource_estimator_id());
+        assert_ne!(
+            a.provider_implementation_fingerprint(),
+            b.provider_implementation_fingerprint()
+        );
+        assert_eq!(
+            a.capabilities(),
+            &BTreeSet::from([CapabilityId::new(DENSE_LINEAR_F16_CAPABILITY_ID).unwrap()])
+        );
+        assert_eq!(
+            b.capabilities(),
+            &BTreeSet::from([CapabilityId::new(DENSE_LINEAR_BF16_CAPABILITY_ID).unwrap()])
+        );
+        assert!(a.supports_fixed_tensor_work());
+        assert!(b.supports_fixed_tensor_work());
+    }
 }

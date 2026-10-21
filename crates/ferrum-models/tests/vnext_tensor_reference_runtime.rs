@@ -1,5 +1,5 @@
-//! Real F16 dense weights through the tensor-component runtime path.
-//! This fixture establishes no BF16 or image-model numerical coverage.
+//! Real F16/BF16 safetensors through the tensor-component runtime path.
+//! Tiny independent arithmetic fixtures do not establish image-model parity.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Arc, OnceLock};
@@ -26,6 +26,9 @@ const EXPECTED_VALUES: [f32; 4] = [3.0, 1.0, 0.0, -5.0];
 #[path = "vnext_tensor_reference_runtime/tensor_faults.rs"]
 mod tensor_faults;
 
+#[path = "vnext_tensor_reference_runtime/bf16.rs"]
+mod bf16;
+
 fn id<T>(value: impl Into<String>) -> T
 where
     T: TryFrom<String, Error = VNextError>,
@@ -48,14 +51,49 @@ struct TinyTensorConfig {
     out_features: u64,
 }
 
-struct TinyTensorFamily;
+#[derive(Clone, Copy)]
+enum TinyTensorPrecision {
+    F16,
+    Bf16,
+}
+
+impl TinyTensorPrecision {
+    fn element_type(self) -> ElementType {
+        match self {
+            Self::F16 => ElementType::F16,
+            Self::Bf16 => ElementType::Bf16,
+        }
+    }
+
+    fn operation_id(self) -> &'static str {
+        match self {
+            Self::F16 => DENSE_LINEAR_OPERATION_ID,
+            Self::Bf16 => DENSE_LINEAR_BF16_OPERATION_ID,
+        }
+    }
+
+    fn profile_id(self) -> &'static str {
+        match self {
+            Self::F16 => PROFILE_ID,
+            Self::Bf16 => "reference.tensor.bf16",
+        }
+    }
+}
+
+struct TinyTensorFamily(TinyTensorPrecision);
 
 impl ModelFamilyProvider for TinyTensorFamily {
     type Config = TinyTensorConfig;
 
     fn family_id(&self) -> &ModelFamilyId {
-        static FAMILY: OnceLock<ModelFamilyId> = OnceLock::new();
-        FAMILY.get_or_init(|| id("family.reference.tensor-dense"))
+        static F16: OnceLock<ModelFamilyId> = OnceLock::new();
+        static BF16: OnceLock<ModelFamilyId> = OnceLock::new();
+        match self.0 {
+            TinyTensorPrecision::F16 => F16.get_or_init(|| id("family.reference.tensor-dense")),
+            TinyTensorPrecision::Bf16 => {
+                BF16.get_or_init(|| id("family.reference.tensor-dense.bf16"))
+            }
+        }
     }
 
     fn external_metadata_ids(&self) -> BTreeSet<ExternalModelMetadataId> {
@@ -112,14 +150,14 @@ impl ModelFamilyProvider for TinyTensorFamily {
                 external_names: vec!["linear.weight".to_owned()],
                 dimensions: vec![config.out_features, config.in_features],
                 encoding: WeightEncoding::Dense {
-                    element_type: ElementType::F16,
+                    element_type: self.0.element_type(),
                 },
                 required: true,
             }],
             tensors: vec![WeightTensorSpec {
                 id: id("weight.tensor.linear"),
                 dimensions: vec![config.out_features, config.in_features],
-                logical_element_type: ElementType::F16,
+                logical_element_type: self.0.element_type(),
                 physical_layout: PhysicalWeightLayout::Dense {
                     component_id: id("weight.component.tensor.linear"),
                 },
@@ -129,7 +167,7 @@ impl ModelFamilyProvider for TinyTensorFamily {
     }
 
     fn numerical_profiles(&self, _: &Self::Config) -> Result<FamilyNumericalProfiles, VNextError> {
-        let profile_id = NumericalProfileId::new(PROFILE_ID).unwrap();
+        let profile_id = NumericalProfileId::new(self.0.profile_id()).unwrap();
         FamilyNumericalProfiles::new(
             self.family_id(),
             ContractVersion::new(1, 0),
@@ -139,10 +177,10 @@ impl ModelFamilyProvider for TinyTensorFamily {
                 version: ContractVersion::new(1, 0),
                 kv_storage: vec![],
                 primary_activation: id(OUTPUT_ID),
-                boundaries: BTreeMap::from([(id(OUTPUT_ID), ElementType::F16)]),
+                boundaries: BTreeMap::from([(id(OUTPUT_ID), self.0.element_type())]),
                 states: vec![],
                 operations: vec![NumericalOperationContract {
-                    operation_id: id(DENSE_LINEAR_OPERATION_ID),
+                    operation_id: id(self.0.operation_id()),
                     version: ContractVersion::new(1, 0),
                     multiplication_type: Some(ElementType::F32),
                     accumulation_type: Some(ElementType::F32),
@@ -166,7 +204,7 @@ impl ModelFamilyProvider for TinyTensorFamily {
                 id: "block.tensor.dense".to_owned(),
                 nodes: vec![ProgramNode {
                     id: id("node.tensor.dense"),
-                    operation_id: id(DENSE_LINEAR_OPERATION_ID),
+                    operation_id: id(self.0.operation_id()),
                     required_version: ContractVersion::new(1, 0),
                     work: ProgramNodeWorkSpec::Fixed,
                     inputs: vec![id(INPUT_ID), id("value.tensor.weight")],
@@ -189,7 +227,7 @@ impl ModelFamilyProvider for TinyTensorFamily {
                 value_id: id("value.tensor.weight"),
                 tensor: ProgramTensorSpec {
                     dimensions: vec![config.out_features, config.in_features],
-                    element_type: ElementType::F16,
+                    element_type: self.0.element_type(),
                     layout: ResolvedTensorLayout::Contiguous,
                 },
             }],
@@ -343,9 +381,19 @@ struct TensorFixture {
 }
 
 fn source_and_family() -> (tempfile::TempDir, SafetensorsArchive, PreparedModelFamily) {
+    source_and_family_with_precision(TinyTensorPrecision::F16, &f16_bytes(&WEIGHT_VALUES))
+}
+
+fn source_and_family_with_precision(
+    precision: TinyTensorPrecision,
+    weight_bytes: &[u8],
+) -> (tempfile::TempDir, SafetensorsArchive, PreparedModelFamily) {
     let source_directory = tempfile::tempdir().unwrap();
-    let weight_bytes = f16_bytes(&WEIGHT_VALUES);
-    let tensor = TensorView::new(Dtype::F16, vec![2, 3], &weight_bytes).unwrap();
+    let dtype = match precision {
+        TinyTensorPrecision::F16 => Dtype::F16,
+        TinyTensorPrecision::Bf16 => Dtype::BF16,
+    };
+    let tensor = TensorView::new(dtype, vec![2, 3], weight_bytes).unwrap();
     serialize_to_file(
         vec![("linear.weight".to_owned(), tensor)],
         &None::<HashMap<String, String>>,
@@ -353,10 +401,10 @@ fn source_and_family() -> (tempfile::TempDir, SafetensorsArchive, PreparedModelF
     )
     .unwrap();
     let source = SafetensorsArchive::open(source_directory.path()).unwrap();
-    let family = TypedFamilyRegistration::new(TinyTensorFamily)
+    let family = TypedFamilyRegistration::new(TinyTensorFamily(precision))
         .prepare_with_profile(
             &json!({"rows":2,"in_features":3,"out_features":2}),
-            &NumericalProfileId::new(PROFILE_ID).unwrap(),
+            &NumericalProfileId::new(precision.profile_id()).unwrap(),
         )
         .unwrap();
     assert_eq!(family.metadata(), &ModelSemanticMetadata::TensorComponent);
@@ -364,7 +412,16 @@ fn source_and_family() -> (tempfile::TempDir, SafetensorsArchive, PreparedModelF
 }
 
 fn build_fixture(host: HostMemoryAccount) -> TensorFixture {
-    let (source_directory, source, family) = source_and_family();
+    build_fixture_with_precision(host, TinyTensorPrecision::F16, &f16_bytes(&WEIGHT_VALUES))
+}
+
+fn build_fixture_with_precision(
+    host: HostMemoryAccount,
+    precision: TinyTensorPrecision,
+    weight_bytes: &[u8],
+) -> TensorFixture {
+    let (source_directory, source, family) =
+        source_and_family_with_precision(precision, weight_bytes);
     let composition = ReferenceVNextComposition::create(id("device.reference.tensor")).unwrap();
     let policy = TensorPolicy {
         capacity_bytes: composition.runtime().descriptor().total_memory_bytes,
@@ -380,7 +437,7 @@ fn build_fixture(host: HostMemoryAccount) -> TensorFixture {
         id(INPUT_ID),
         ProgramTensorSpec {
             dimensions: vec![2, 3],
-            element_type: ElementType::F16,
+            element_type: precision.element_type(),
             layout: ResolvedTensorLayout::Contiguous,
         },
     )]))

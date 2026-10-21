@@ -1,4 +1,3 @@
-use std::collections::BTreeSet;
 use std::error::Error;
 use std::fmt;
 use std::ops::Range;
@@ -6,17 +5,16 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use ferrum_runtime::{
-    BufferDescriptor, CapabilityId, CopyRegion, DefinitelyNotSubmitted, DeviceAllocationPermit,
+    BufferDescriptor, CopyRegion, DefinitelyNotSubmitted, DeviceAllocationPermit,
     DeviceBatchingForm, DeviceBufferRetention, DeviceClass, DeviceCommandBatch,
     DeviceCommandLogicalWork, DeviceCommandPhase, DeviceComputePathRequirement, DeviceDescriptor,
     DeviceErrorReport, DeviceExecutionPath, DeviceNativeOperationId, DeviceNativeWorkAttribution,
     DeviceRuntime, DeviceSubmissionAttribution, DeviceTerminal, DeviceTerminalReceipt,
     DeviceTimingMode, ElementType, FenceIndeterminate, FenceQuery, HostTransferLayout,
-    ManagedHostBuffer, ManagedHostBytes, StreamState, VNextError, DENSE_LINEAR_F16_CAPABILITY_ID,
-    DEVICE_COPY_NATIVE_OPERATION_ID, DEVICE_ZERO_NATIVE_OPERATION_ID,
-    HOST_UPLOAD_NATIVE_OPERATION_ID,
+    ManagedHostBuffer, ManagedHostBytes, StreamState, VNextError, DEVICE_COPY_NATIVE_OPERATION_ID,
+    DEVICE_ZERO_NATIVE_OPERATION_ID, HOST_UPLOAD_NATIVE_OPERATION_ID,
 };
-use half::f16;
+use half::{bf16, f16};
 
 static NEXT_RUNTIME_INSTANCE: AtomicU64 = AtomicU64::new(1);
 static NEXT_STREAM_INSTANCE: AtomicU64 = AtomicU64::new(1);
@@ -50,6 +48,7 @@ impl Error for ReferenceDeviceRuntimeError {}
 struct ReferenceAllocation {
     bytes: Mutex<Box<[u8]>>,
     logical_offset_bytes: usize,
+    logical_size_bytes: usize,
     live_allocations: Arc<AtomicU64>,
 }
 
@@ -169,7 +168,32 @@ impl ReferenceBufferRegion {
                 "reference command contains a buffer from another runtime",
             ));
         }
+        self.validate_range()
+    }
+
+    fn validate_range(&self) -> Result<(), ReferenceDeviceRuntimeError> {
+        let end = self.offset_bytes.checked_add(self.length_bytes);
+        let allocation_end = self
+            .allocation
+            .logical_offset_bytes
+            .checked_add(self.allocation.logical_size_bytes);
+        if self.length_bytes == 0
+            || self.offset_bytes < self.allocation.logical_offset_bytes
+            || end
+                .zip(allocation_end)
+                .is_none_or(|(end, limit)| end > limit)
+        {
+            return Err(ReferenceDeviceRuntimeError::contract(
+                "reference command region exceeds its allocation",
+            ));
+        }
         Ok(())
+    }
+
+    fn overlaps(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.allocation, &other.allocation)
+            && self.offset_bytes < other.offset_bytes + other.length_bytes
+            && other.offset_bytes < self.offset_bytes + self.length_bytes
     }
 
     fn read(&self) -> Vec<u8> {
@@ -189,6 +213,35 @@ impl ReferenceBufferRegion {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReferenceDenseScalar {
+    F16,
+    Bf16,
+}
+
+impl ReferenceDenseScalar {
+    pub(crate) const fn element_type(self) -> ElementType {
+        match self {
+            Self::F16 => ElementType::F16,
+            Self::Bf16 => ElementType::Bf16,
+        }
+    }
+
+    fn decode(self, bits: u16) -> f32 {
+        match self {
+            Self::F16 => f16::from_bits(bits).to_f32(),
+            Self::Bf16 => bf16::from_bits(bits).to_f32(),
+        }
+    }
+
+    fn encode(self, value: f32) -> u16 {
+        match self {
+            Self::F16 => f16::from_f32(value).to_bits(),
+            Self::Bf16 => bf16::from_f32(value).to_bits(),
+        }
+    }
+}
+
 pub(crate) struct ReferenceDenseLinearLaunch {
     pub(crate) input: ReferenceBufferRegion,
     pub(crate) weight: ReferenceBufferRegion,
@@ -196,6 +249,39 @@ pub(crate) struct ReferenceDenseLinearLaunch {
     pub(crate) rows: usize,
     pub(crate) in_features: usize,
     pub(crate) out_features: usize,
+    pub(crate) scalar: ReferenceDenseScalar,
+}
+
+impl ReferenceDenseLinearLaunch {
+    pub(crate) fn validate(&self) -> Result<(), ReferenceDeviceRuntimeError> {
+        if self.rows == 0 || self.in_features == 0 || self.out_features == 0 {
+            return Err(ReferenceDeviceRuntimeError::contract(
+                "reference dense-linear dimensions must be positive",
+            ));
+        }
+        for (region, left, right) in [
+            (&self.input, self.rows, self.in_features),
+            (&self.weight, self.out_features, self.in_features),
+            (&self.output, self.rows, self.out_features),
+        ] {
+            region.validate_range()?;
+            let expected = left.checked_mul(right).and_then(|n| n.checked_mul(2));
+            if expected != Some(region.length_bytes)
+                || region.element_type != self.scalar.element_type()
+                || (region.offset_bytes - region.allocation.logical_offset_bytes) % 2 != 0
+            {
+                return Err(ReferenceDeviceRuntimeError::contract(
+                    "reference dense-linear shape, range, alignment or scalar type differs",
+                ));
+            }
+        }
+        if self.output.overlaps(&self.input) || self.output.overlaps(&self.weight) {
+            return Err(ReferenceDeviceRuntimeError::contract(
+                "reference dense-linear output overlaps a read operand",
+            ));
+        }
+        Ok(())
+    }
 }
 
 enum ReferenceCommandKind {
@@ -258,6 +344,9 @@ impl ReferenceDeviceCommand {
                 "reference dense-linear attribution has no participants or work",
             ));
         }
+        for launch in &launches {
+            launch.validate()?;
+        }
         let compute_dispatch_count = u64::try_from(launches.len()).map_err(|_| {
             ReferenceDeviceRuntimeError::contract(
                 "reference dense-linear dispatch count exceeds u64",
@@ -280,6 +369,7 @@ impl ReferenceDeviceCommand {
     pub(crate) fn dense_tensor(
         launch: ReferenceDenseLinearLaunch,
     ) -> Result<Self, ReferenceDeviceRuntimeError> {
+        launch.validate()?;
         let rows = u64::try_from(launch.rows).map_err(|_| {
             ReferenceDeviceRuntimeError::contract("reference tensor rows exceed u64")
         })?;
@@ -389,18 +479,44 @@ impl ReferenceDeviceCommand {
                 destination,
             } => {
                 source.validate_runtime(runtime_instance)?;
-                destination.validate_runtime(runtime_instance)
+                destination.validate_runtime(runtime_instance)?;
+                if source.length_bytes != destination.length_bytes
+                    || source.element_type != destination.element_type
+                {
+                    return Err(ReferenceDeviceRuntimeError::contract(
+                        "reference copy source and destination disagree",
+                    ));
+                }
+                Ok(())
             }
-            ReferenceCommandKind::Upload { destination, .. }
-            | ReferenceCommandKind::ManagedUpload { destination, .. }
-            | ReferenceCommandKind::Zero { destination } => {
+            ReferenceCommandKind::Upload {
+                source,
+                destination,
+            } => {
+                destination.validate_runtime(runtime_instance)?;
+                validate_upload_length(source.len(), destination)
+            }
+            ReferenceCommandKind::ManagedUpload {
+                source,
+                destination,
+            } => {
+                destination.validate_runtime(runtime_instance)?;
+                validate_upload_length(source.len(), destination)
+            }
+            ReferenceCommandKind::Zero { destination } => {
                 destination.validate_runtime(runtime_instance)
             }
             ReferenceCommandKind::DenseLinear { launches } => {
+                if launches.is_empty() {
+                    return Err(ReferenceDeviceRuntimeError::contract(
+                        "reference dense-linear command has no launches",
+                    ));
+                }
                 for launch in launches {
                     launch.input.validate_runtime(runtime_instance)?;
                     launch.weight.validate_runtime(runtime_instance)?;
                     launch.output.validate_runtime(runtime_instance)?;
+                    launch.validate()?;
                 }
                 Ok(())
             }
@@ -447,28 +563,89 @@ impl ReferenceDeviceCommand {
 }
 
 fn execute_dense_linear(launch: &ReferenceDenseLinearLaunch) {
-    let input = launch.input.read();
-    let weight = launch.weight.read();
-    let mut output = vec![0_u8; launch.output.length_bytes()];
+    // Fixed-size metadata only. Every distinct allocation is locked once, in
+    // a global address order, including when two or all three roles share it.
+    // Preflight proved that output does not overlap either read operand.
+    let mut storage = DenseAllocationLocks::new(launch);
     for row in 0..launch.rows {
         for out_feature in 0..launch.out_features {
             let mut sum = 0.0_f32;
             for in_feature in 0..launch.in_features {
                 let input_index = row * launch.in_features + in_feature;
                 let weight_index = out_feature * launch.in_features + in_feature;
-                sum += read_f16(&input, input_index) * read_f16(&weight, weight_index);
+                let input = storage.read(0, input_index, launch.scalar);
+                let weight = storage.read(1, weight_index, launch.scalar);
+                // Preserve the existing F16 left-to-right FP32 arithmetic.
+                // BF16 follows the same order and rounds only at the output.
+                sum += input * weight;
             }
             let output_index = row * launch.out_features + out_feature;
-            let bytes = f16::from_f32(sum).to_bits().to_le_bytes();
-            output[output_index * 2..output_index * 2 + 2].copy_from_slice(&bytes);
+            storage.write_output(output_index, launch.scalar.encode(sum));
         }
     }
-    launch.output.write(&output);
 }
 
-fn read_f16(bytes: &[u8], index: usize) -> f32 {
-    let offset = index * 2;
-    f16::from_bits(u16::from_le_bytes([bytes[offset], bytes[offset + 1]])).to_f32()
+struct DenseAllocationLocks<'a> {
+    guards: [Option<MutexGuard<'a, Box<[u8]>>>; 3],
+    slots: [usize; 3],
+    offsets: [usize; 3],
+}
+
+impl<'a> DenseAllocationLocks<'a> {
+    fn new(launch: &'a ReferenceDenseLinearLaunch) -> Self {
+        let regions = [&launch.input, &launch.weight, &launch.output];
+        let mut allocations = regions.map(|region| region.allocation.as_ref());
+        allocations.sort_unstable_by_key(|allocation| *allocation as *const _ as usize);
+        let mut unique: [Option<&'a ReferenceAllocation>; 3] = [None; 3];
+        let mut count = 0;
+        for allocation in allocations {
+            if count == 0 || !std::ptr::eq(unique[count - 1].unwrap(), allocation) {
+                unique[count] = Some(allocation);
+                count += 1;
+            }
+        }
+        let mut guards = [None, None, None];
+        for index in 0..count {
+            guards[index] = Some(unique[index].unwrap().lock());
+        }
+        let slots = regions.map(|region| {
+            unique[..count]
+                .iter()
+                .position(|allocation| {
+                    std::ptr::eq(allocation.unwrap(), region.allocation.as_ref())
+                })
+                .expect("each dense role is present in its allocation table")
+        });
+        Self {
+            guards,
+            slots,
+            offsets: regions.map(|region| region.offset_bytes),
+        }
+    }
+
+    fn read(&self, role: usize, index: usize, scalar: ReferenceDenseScalar) -> f32 {
+        let bytes = self.guards[self.slots[role]].as_ref().unwrap();
+        let offset = self.offsets[role] + index * 2;
+        scalar.decode(u16::from_le_bytes([bytes[offset], bytes[offset + 1]]))
+    }
+
+    fn write_output(&mut self, index: usize, bits: u16) {
+        let bytes = self.guards[self.slots[2]].as_mut().unwrap();
+        let offset = self.offsets[2] + index * 2;
+        bytes[offset..offset + 2].copy_from_slice(&bits.to_le_bytes());
+    }
+}
+
+fn validate_upload_length(
+    length: usize,
+    destination: &ReferenceBufferRegion,
+) -> Result<(), ReferenceDeviceRuntimeError> {
+    if length != destination.length_bytes {
+        return Err(ReferenceDeviceRuntimeError::contract(
+            "reference upload source and destination lengths disagree",
+        ));
+    }
+    Ok(())
 }
 
 fn aligned_storage(
@@ -576,9 +753,8 @@ impl ReferenceDeviceRuntime {
             .descriptor
             .validate()
             .map_err(|error| ReferenceDeviceRuntimeError::contract(error.to_string()))?;
-        let supported_capabilities =
-            BTreeSet::from([CapabilityId::new(DENSE_LINEAR_F16_CAPABILITY_ID)
-                .map_err(|error| ReferenceDeviceRuntimeError::contract(error.to_string()))?]);
+        let supported_capabilities = super::composition::reference_vnext_capabilities()
+            .map_err(|error| ReferenceDeviceRuntimeError::contract(error.to_string()))?;
         if config.descriptor.class != DeviceClass::Reference
             || config.descriptor.capabilities != supported_capabilities
         {
@@ -597,6 +773,77 @@ impl ReferenceDeviceRuntime {
             descriptor: config.descriptor,
             runtime_instance,
             counters: ReferenceRuntimeCounters::default(),
+        })
+    }
+
+    // Shared by DeviceRuntime::submit and focused backend preflight tests.
+    // This accepts only already-owned commands, never creates core permits.
+    fn submit_entries(
+        &self,
+        stream: &mut ReferenceDeviceStream,
+        entries: Vec<(DeviceCommandPhase, Option<u32>, ReferenceDeviceCommand)>,
+        attribution_required: bool,
+    ) -> Result<ReferenceDeviceFence, DefinitelyNotSubmitted<ReferenceDeviceRuntimeError>> {
+        if stream.runtime_instance != self.runtime_instance || entries.is_empty() {
+            return Err(DefinitelyNotSubmitted::new(
+                ReferenceDeviceRuntimeError::contract(
+                    "reference submission has a foreign stream or no commands",
+                ),
+            ));
+        }
+        // Every command and every launch is validated before any upload,
+        // compute, zeroing or stream transition takes effect.
+        for (_, _, command) in &entries {
+            command
+                .validate_runtime(self.runtime_instance)
+                .map_err(DefinitelyNotSubmitted::new)?;
+        }
+        let attribution = if attribution_required {
+            let rows = entries
+                .iter()
+                .enumerate()
+                .map(|(index, (phase, node, command))| {
+                    let index = u32::try_from(index).map_err(|_| {
+                        ReferenceDeviceRuntimeError::contract("reference command index exceeds u32")
+                    })?;
+                    command.attribution(index, *node, *phase)
+                })
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(DefinitelyNotSubmitted::new)?;
+            Some(DeviceSubmissionAttribution::new(rows).ok_or_else(|| {
+                DefinitelyNotSubmitted::new(ReferenceDeviceRuntimeError::contract(
+                    "reference submission attribution is empty or unordered",
+                ))
+            })?)
+        } else {
+            None
+        };
+        let command_count = u64::try_from(entries.len()).map_err(|_| {
+            DefinitelyNotSubmitted::new(ReferenceDeviceRuntimeError::contract(
+                "reference command count exceeds u64",
+            ))
+        })?;
+        let fence_instance = NEXT_FENCE_INSTANCE
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+                value.checked_add(1)
+            })
+            .map_err(|_| {
+                DefinitelyNotSubmitted::new(ReferenceDeviceRuntimeError::contract(
+                    "reference fence identity space exhausted",
+                ))
+            })?;
+        for (_, _, command) in &entries {
+            command.execute(&self.counters);
+        }
+        self.counters.submissions.fetch_add(1, Ordering::Relaxed);
+        self.counters
+            .commands
+            .fetch_add(command_count, Ordering::Relaxed);
+        stream.state = StreamState::Submitted;
+        Ok(ReferenceDeviceFence {
+            runtime_instance: self.runtime_instance,
+            fence_instance,
+            attribution,
         })
     }
 
@@ -654,6 +901,7 @@ impl DeviceRuntime for ReferenceDeviceRuntime {
             allocation: Arc::new(ReferenceAllocation {
                 bytes: Mutex::new(bytes),
                 logical_offset_bytes,
+                logical_size_bytes: size,
                 live_allocations: Arc::clone(&self.counters.live_allocations),
             }),
         })
@@ -850,50 +1098,7 @@ impl DeviceRuntime for ReferenceDeviceRuntime {
             })
             .collect::<Result<Vec<_>, ReferenceDeviceRuntimeError>>()
             .map_err(DefinitelyNotSubmitted::new)?;
-        for (_, _, command) in &entries {
-            command
-                .validate_runtime(self.runtime_instance)
-                .map_err(DefinitelyNotSubmitted::new)?;
-        }
-        let attribution = if attribution_required {
-            let rows = entries
-                .iter()
-                .enumerate()
-                .map(|(command_index, (phase, node_index, command))| {
-                    let command_index = u32::try_from(command_index).map_err(|_| {
-                        ReferenceDeviceRuntimeError::contract("reference command index exceeds u32")
-                    })?;
-                    command.attribution(command_index, *node_index, *phase)
-                })
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(DefinitelyNotSubmitted::new)?;
-            Some(DeviceSubmissionAttribution::new(rows).ok_or_else(|| {
-                DefinitelyNotSubmitted::new(ReferenceDeviceRuntimeError::contract(
-                    "reference submission attribution is empty or unordered",
-                ))
-            })?)
-        } else {
-            None
-        };
-        for (_, _, command) in &entries {
-            command.execute(&self.counters);
-        }
-        self.counters.submissions.fetch_add(1, Ordering::Relaxed);
-        self.counters.commands.fetch_add(
-            u64::try_from(entries.len()).expect("reference command count fits u64"),
-            Ordering::Relaxed,
-        );
-        stream.state = StreamState::Submitted;
-        let fence_instance = NEXT_FENCE_INSTANCE
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
-                value.checked_add(1)
-            })
-            .expect("reference fence identity space exhausted");
-        Ok(ReferenceDeviceFence {
-            runtime_instance: self.runtime_instance,
-            fence_instance,
-            attribution,
-        })
+        self.submit_entries(stream, entries, attribution_required)
     }
 
     fn submission_attribution(&self, fence: &Self::Fence) -> Option<DeviceSubmissionAttribution> {
@@ -1113,18 +1318,18 @@ mod tests {
     use super::*;
     use crate::backend::reference::composition::reference_vnext_runtime_config;
     use ferrum_runtime::{
-        BufferUsage, DeviceId, DeviceLogicalWork, HostMemoryAccount, HostMemoryClass,
+        BufferUsage, CapabilityId, DeviceId, DeviceLogicalWork, HostMemoryAccount, HostMemoryClass,
         HostMemoryClassLimits, HostMemoryLimits, ResourceId,
     };
 
-    fn config() -> ReferenceDeviceRuntimeConfig {
+    pub(super) fn config() -> ReferenceDeviceRuntimeConfig {
         reference_vnext_runtime_config(
             DeviceId::new("device.reference.runtime-test").expect("valid device id"),
         )
         .expect("valid reference config")
     }
 
-    fn buffer(
+    pub(super) fn buffer(
         runtime: &ReferenceDeviceRuntime,
         resource_id: &str,
         contents: &[u8],
@@ -1149,6 +1354,7 @@ mod tests {
             allocation: Arc::new(ReferenceAllocation {
                 bytes: Mutex::new(bytes),
                 logical_offset_bytes,
+                logical_size_bytes: contents.len(),
                 live_allocations: Arc::clone(&runtime.counters.live_allocations),
             }),
         };
@@ -1461,6 +1667,7 @@ mod tests {
             rows: 2,
             in_features: 3,
             out_features: 2,
+            scalar: ReferenceDenseScalar::F16,
         };
         let command = ReferenceDeviceCommand::dense_tensor(launch()).unwrap();
         let attribution = command
@@ -1494,3 +1701,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "runtime/dense_tests.rs"]
+mod dense_tests;
