@@ -74,7 +74,10 @@ pub struct ScenarioDiagnostics {
     pub cache_peak_bytes: usize,
     pub elapsed_us: u64,
     pub rank_attempts: usize,
+    /// Visited ranks whose static trajectory is complete. Alternatives can
+    /// still be unsupported. Partial static and unassigned ranks are separate.
     pub rank_completed: usize,
+    pub rank_partial_static: usize,
     pub rank_unresolved: usize,
     pub max_rank_simulation_queries: usize,
     /// Observed rejected trajectories/assignments, not all possible causes.
@@ -166,6 +169,11 @@ impl Recorder {
 
     pub(super) fn failures(&self) -> u64 {
         self.state.lock().report.failure_count
+    }
+
+    pub(super) fn rank_partial_static(&self) {
+        let mut state = self.state.lock();
+        state.report.rank_partial_static = state.report.rank_partial_static.saturating_add(1);
     }
 
     pub(super) fn failure(&self, reason: Unsupported, origin: FailureOrigin) {

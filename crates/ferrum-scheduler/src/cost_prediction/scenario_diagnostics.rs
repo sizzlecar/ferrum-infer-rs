@@ -39,6 +39,7 @@ impl JointEvaluationDiagnostics {
             elapsed_max_us: value.elapsed_us,
             rank_attempts: value.rank_attempts,
             rank_completed: value.rank_completed,
+            rank_partial_static: value.rank_partial_static,
             rank_unresolved: value.rank_unresolved,
             max_rank_simulation_queries: value.max_rank_simulation_queries,
             observed_failures: value.failure_count,
@@ -69,6 +70,7 @@ pub(crate) struct EvaluationTotals {
     pub elapsed_max_us: u64,
     pub rank_attempts: usize,
     pub rank_completed: usize,
+    pub rank_partial_static: usize,
     pub rank_unresolved: usize,
     pub max_rank_simulation_queries: usize,
     pub observed_failures: u64,
@@ -96,6 +98,7 @@ impl EvaluationTotals {
             elapsed_total_us,
             rank_attempts,
             rank_completed,
+            rank_partial_static,
             rank_unresolved,
             observed_failures,
         );

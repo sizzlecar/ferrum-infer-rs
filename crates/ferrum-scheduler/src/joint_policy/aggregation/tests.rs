@@ -60,9 +60,9 @@ fn comparison(
 ) -> Comparison {
     Comparison {
         revision: 1,
-        window: static_result.target_reached_at,
+        window: StaticWindow::Exact(static_result.central_elapsed),
         targets: static_result.window_progress.clone(),
-        static_result,
+        static_result: StaticTrajectory::Complete(static_result),
         alternatives,
     }
 }
@@ -88,6 +88,7 @@ fn summary(ranks: usize, unresolved_ranks: usize) -> ScenarioEvaluation {
         resolved_mass: (ranks - unresolved_ranks) as f64 / ranks as f64,
         unresolved_mass: unresolved_ranks as f64 / ranks as f64,
         unresolved_ranks,
+        partial_static_ranks: 0,
     }
 }
 
@@ -278,13 +279,18 @@ fn marginal_costs_and_incomplete_or_repeated_rank_visits_are_rejected() {
         vec![],
     );
     let mut aggregate = ScenarioRiskAccumulator::new(&requests, 0, &config(), &success(1)).unwrap();
-    comparison.static_result.cost_risk.conditional_scenario = None;
+    let StaticTrajectory::Complete(result) = &mut comparison.static_result else {
+        panic!("complete fixture")
+    };
+    result.cost_risk.conditional_scenario = None;
     assert_eq!(
         aggregate.observe(rank(0, 1), &comparison),
         Err(Unsupported::InvalidState)
     );
-    comparison.static_result.cost_risk.conditional_scenario =
-        Some(CostScenarioDependence::SharedResidualRank);
+    let StaticTrajectory::Complete(result) = &mut comparison.static_result else {
+        panic!("complete fixture")
+    };
+    result.cost_risk.conditional_scenario = Some(CostScenarioDependence::SharedResidualRank);
     aggregate.observe(rank(0, 2), &comparison).unwrap();
     assert_eq!(
         aggregate.observe(rank(0, 2), &comparison),

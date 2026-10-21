@@ -11,6 +11,8 @@ pub struct ScenarioPolicyDecision {
     pub alternative_risks: Vec<QueueRisk>,
     pub static_target_time: Option<Duration>,
     pub alternative_target_times: Vec<Option<Duration>>,
+    /// True for observed debt, or when completion by a partial static window's
+    /// lower bound was not proved. It is never a claim about the unknown window.
     pub any_window_debt: Vec<bool>,
 }
 
@@ -32,6 +34,7 @@ struct Totals {
     time_mass: f64,
     unsupported_mass: f64,
     window_debt: bool,
+    partial_window_unproven: bool,
 }
 
 struct Member {
@@ -48,6 +51,7 @@ pub struct ScenarioRiskAccumulator {
     totals: Vec<Totals>,
     observed_mass: f64,
     observed_ranks: usize,
+    partial_static_ranks: usize,
     quantile_upper: f64,
     last_rank: Option<usize>,
     rank_count: Option<usize>,
@@ -104,6 +108,7 @@ impl ScenarioRiskAccumulator {
             totals: (0..=alternatives).map(|_| Totals::default()).collect(),
             observed_mass: 0.0,
             observed_ranks: 0,
+            partial_static_ranks: 0,
             quantile_upper: 0.0,
             last_rank: None,
             rank_count: None,
@@ -143,56 +148,83 @@ impl ScenarioRiskAccumulator {
         {
             return Err(Unsupported::InvalidState);
         }
-        // Validate all known trajectories before mutating any aggregate.
-        for result in std::iter::once(&comparison.static_result).chain(
-            comparison
-                .alternatives
-                .iter()
-                .filter_map(|result| result.as_ref().ok()),
-        ) {
-            if result.requests.len() != self.members.len()
-                || result.window_progress.len() != self.members.len()
-                || result.cost_risk.conditional_scenario
-                    != Some(CostScenarioDependence::SharedResidualRank)
-                || result.cost_risk.empirical_quantiles
-                || result.cost_risk.union_failure_upper != 0.0
-                || result
-                    .requests
+        let static_requests = comparison.static_result.requests();
+        let partial_static = match (&comparison.static_result, comparison.window) {
+            (StaticTrajectory::Complete(result), StaticWindow::Exact(window))
+                if window == result.central_elapsed
+                    && result.window_progress.len() == self.members.len() =>
+            {
+                false
+            }
+            (StaticTrajectory::OutsideSupportPrefix(prefix), StaticWindow::AtLeast(lower))
+                if lower == prefix.central_elapsed
+                    && !lower.is_zero()
+                    && prefix.unsupported
+                        == Unsupported::Cost(CostUnknownReason::UnsupportedWithDetail(
+                            CostUnsupportedDetail::OutsideObservedSupport,
+                        ))
+                    && prefix.requests.iter().any(|request| !request.finished())
+                    && comparison.targets.iter().zip(&prefix.requests).all(
+                        |(target, request)| {
+                            *target
+                                == Progress {
+                                    prefill_tokens: request.prompt_tokens,
+                                    output_tokens: request.scenario_end_tokens,
+                                }
+                        },
+                    ) =>
+            {
+                true
+            }
+            _ => return Err(Unsupported::InvalidState),
+        };
+        // Validate all retained trajectories before mutating any aggregate.
+        // A partial static carries real clocks, never a fake completed result.
+        for (requests, cost_risk) in
+            std::iter::once((static_requests, comparison.static_result.cost_risk())).chain(
+                comparison
+                    .alternatives
                     .iter()
-                    .zip(&self.members)
-                    .any(|(request, member)| {
-                        request.id != member.id
-                            || request.prompt_tokens != member.prompt_tokens
-                            || request.output_cap != member.cap
-                            || request.scenario_end_tokens == 0
-                            || request.scenario_end_tokens > member.cap
-                            || request.output_tokens > request.scenario_end_tokens
-                            || request.prefill_tokens > request.prompt_tokens
-                            || request.central_clock.first_output
-                                > request.central_clock.last_output
-                            || request.central_clock.completed.is_some_and(|completed| {
-                                request
-                                    .central_clock
-                                    .last_output
-                                    .is_none_or(|last| completed < last)
-                                    || request.output_tokens != request.scenario_end_tokens
-                            })
-                            || (request.output_tokens > 0
-                                && request.central_clock.first_output.is_none())
-                            || (request.output_tokens == 0
-                                && request.central_clock.last_output.is_some())
-                            || request.central_clock.violating_interval_count
-                                > request.central_clock.interval_count
-                            || request.central_clock.interval_count
-                                > request.output_tokens.saturating_sub(1)
-                    })
+                    .filter_map(|result| result.as_ref().ok())
+                    .map(|result| (result.requests.as_slice(), &result.cost_risk)),
+            )
+        {
+            if requests.len() != self.members.len()
+                || cost_risk.conditional_scenario
+                    != Some(CostScenarioDependence::SharedResidualRank)
+                || cost_risk.empirical_quantiles
+                || cost_risk.union_failure_upper != 0.0
+                || requests.iter().zip(&self.members).any(|(request, member)| {
+                    request.id != member.id
+                        || request.prompt_tokens != member.prompt_tokens
+                        || request.output_cap != member.cap
+                        || request.scenario_end_tokens == 0
+                        || request.scenario_end_tokens > member.cap
+                        || request.output_tokens > request.scenario_end_tokens
+                        || request.prefill_tokens > request.prompt_tokens
+                        || request.central_clock.first_output > request.central_clock.last_output
+                        || request.central_clock.completed.is_some_and(|completed| {
+                            request
+                                .central_clock
+                                .last_output
+                                .is_none_or(|last| completed < last)
+                                || request.output_tokens != request.scenario_end_tokens
+                        })
+                        || (request.output_tokens > 0
+                            && request.central_clock.first_output.is_none())
+                        || (request.output_tokens == 0
+                            && request.central_clock.last_output.is_some())
+                        || request.central_clock.violating_interval_count
+                            > request.central_clock.interval_count
+                        || request.central_clock.interval_count
+                            > request.output_tokens.saturating_sub(1)
+                })
             {
                 return Err(Unsupported::InvalidState);
             }
-            if result
-                .requests
+            if requests
                 .iter()
-                .zip(&comparison.static_result.requests)
+                .zip(static_requests)
                 .any(|(request, reference)| {
                     request.scenario_end_tokens != reference.scenario_end_tokens
                 })
@@ -200,19 +232,44 @@ impl ScenarioRiskAccumulator {
                 return Err(Unsupported::InvalidState);
             }
         }
-        for (index, outcome) in std::iter::once(Ok(&comparison.static_result))
-            .chain(
-                comparison
-                    .alternatives
-                    .iter()
-                    .map(|outcome| outcome.as_ref()),
-            )
-            .enumerate()
+        if comparison
+            .alternatives
+            .iter()
+            .filter_map(|result| result.as_ref().ok())
+            .any(|result| result.window_progress.len() != self.members.len())
         {
-            let totals = &mut self.totals[index];
+            return Err(Unsupported::InvalidState);
+        }
+        let static_totals = &mut self.totals[0];
+        if let Some(result) = comparison.static_result.complete() {
+            static_totals.target_seconds += rank.weight * result.target_reached_at.as_secs_f64();
+            static_totals.time_mass += rank.weight;
+        } else {
+            // Cost uncertainty is retained once per rank. Known request clocks
+            // still contribute their lower/upper risk facts below.
+            static_totals.unsupported_mass += rank.weight;
+            self.partial_static_ranks += 1;
+        }
+        for (request, member) in static_requests.iter().zip(&self.members) {
+            accumulate_request(
+                static_totals,
+                rank.weight,
+                request,
+                member.product_success,
+                self.ttft_limit,
+                self.tpot_limit,
+                Duration::from_millis(self.config.joint.request_deadline_ms),
+            );
+        }
+        for (index, outcome) in comparison.alternatives.iter().enumerate() {
+            let totals = &mut self.totals[index + 1];
             match outcome {
                 Ok(result) => {
                     totals.window_debt |= result.has_window_debt(&comparison.targets);
+                    if partial_static && !comparison.partial_window_covered(result) {
+                        totals.partial_window_unproven = true;
+                        totals.window_debt = true;
+                    }
                     totals.target_seconds += rank.weight * result.target_reached_at.as_secs_f64();
                     totals.time_mass += rank.weight;
                     for (request, member) in result.requests.iter().zip(&self.members) {
@@ -251,6 +308,7 @@ impl ScenarioRiskAccumulator {
             || summary.ranks > self.config.planning.max_scenarios
             || self.rank_count.is_some_and(|count| count != summary.ranks)
             || self.observed_ranks.checked_add(summary.unresolved_ranks) != Some(summary.ranks)
+            || self.partial_static_ranks != summary.partial_static_ranks
             || !summary.resolved_mass.is_finite()
             || !summary.unresolved_mass.is_finite()
             || summary.resolved_mass < 0.0
@@ -274,10 +332,18 @@ impl ScenarioRiskAccumulator {
             .iter()
             .map(Totals::target_time)
             .collect::<Vec<_>>();
-        let static_status = risks[0].classify(&self.config);
+        let mut static_status = risks[0].classify(&self.config);
+        if self.partial_static_ranks > 0 && static_status != JointFeasibility::Infeasible {
+            // Risk intervals alone never authorize optimization of a static
+            // trajectory whose full cost/window is unknown.
+            static_status = JointFeasibility::Unresolved;
+        }
         let mut best = None;
         for index in 1..self.totals.len() {
             if risks[index].classify(&self.config) != JointFeasibility::Feasible {
+                continue;
+            }
+            if self.totals[index].partial_window_unproven {
                 continue;
             }
             let Some(time) = times[index] else {

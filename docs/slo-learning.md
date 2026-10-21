@@ -124,6 +124,23 @@ service has not yet filled its count-based observation window.
 `static_fallback`. A fallback is ordinary scheduling and is not reported as SLO
 assurance.
 
+For a full `ScenarioCompletion` comparison, a known initial scenario distribution
+and at least one applied known execution group can establish a static trajectory
+prefix. If a later static cost query is outside observed support, the planner
+may retain that prefix as a lower bound. Full static completion time remains
+unknown, and the target remains all declared endpoints. An alternative can
+rescue this case only when the static risk lower bound is already Infeasible,
+every candidate rank completes, and each candidate rank corresponding to a
+partial static trajectory finishes within that static prefix's known lower
+bound. An unknown initial distribution, no applied known prefix, finite planning
+horizons, or other failures retain their existing Unknown/error behavior.
+
+`rank_partial_static` reports these partial trajectories separately.
+`resolved_mass` means endpoints have been assigned to risk categories; it does
+not mean every execution cost was covered. An unfinished static tail cannot be
+declared Feasible. This rule neither expands model support nor establishes an
+observed serving SLO improvement.
+
 Known infeasibility has a separate admission policy under
 `[scheduler.slo.joint.known_infeasible_admission]`: `mode = "reject"` by default,
 or `mode = "wait"` with `max_wait_ms`. A rejected or timed-out arrival remains in

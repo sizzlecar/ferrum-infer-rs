@@ -6,6 +6,7 @@ use crate::cost_prediction::{
 use ferrum_interfaces::request_observation::*;
 
 mod fill_first;
+mod partial_support;
 mod persistent_capacity;
 mod query_budget;
 

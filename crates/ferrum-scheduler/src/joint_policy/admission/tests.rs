@@ -158,7 +158,7 @@ fn input<'a>(
         adapter,
         static_action: &(),
         alternatives: &[],
-        static_window_rounds: 100,
+        horizon: EvaluationHorizon::StaticRounds(100),
     }
 }
 
@@ -186,13 +186,17 @@ fn natural_endpoints_release_slots_and_waiting_ttft_stays_in_the_same_cohort() {
             &config(),
         ))
         .unwrap();
-        assert_eq!(result.static_result.requests.len(), 2);
+        assert_eq!(result.static_result.complete().unwrap().requests.len(), 2);
         assert_eq!(
-            result.static_result.requests[1].central_clock.first_output,
+            result.static_result.complete().unwrap().requests[1]
+                .central_clock
+                .first_output,
             Some(Duration::from_millis(expected_ms))
         );
         assert_eq!(
-            result.static_result.requests[0].central_clock.completed,
+            result.static_result.complete().unwrap().requests[0]
+                .central_clock
+                .completed,
             Some(Duration::from_millis(expected_ms - 10))
         );
     }
@@ -222,7 +226,7 @@ fn split_group_completion_releases_execution_slots_only_for_the_next_wave() {
         &config(),
     ))
     .unwrap();
-    let clocks = &result.static_result.requests;
+    let clocks = &result.static_result.complete().unwrap().requests;
     assert_eq!(
         clocks[0].central_clock.completed,
         Some(Duration::from_millis(10))
@@ -235,7 +239,7 @@ fn split_group_completion_releases_execution_slots_only_for_the_next_wave() {
         clocks[2].central_clock.first_output,
         Some(Duration::from_millis(30))
     );
-    assert_eq!(result.static_result.queries, 3);
+    assert_eq!(result.static_result.complete().unwrap().queries, 3);
 }
 
 #[test]
@@ -262,7 +266,9 @@ fn incomplete_prefill_and_admitted_zero_work_keep_their_slots() {
     ))
     .unwrap();
     assert_eq!(
-        result.static_result.requests[1].central_clock.first_output,
+        result.static_result.complete().unwrap().requests[1]
+            .central_clock
+            .first_output,
         Some(Duration::from_millis(40))
     );
     let slots = AdmissionSlotPlan::new(
@@ -310,7 +316,7 @@ fn unknown_stopping_rank_never_fills_cap_or_credits_waiting_release() {
         |rank, comparison| {
             observed.push((
                 rank.weight,
-                comparison.static_result.requests[1]
+                comparison.static_result.complete().unwrap().requests[1]
                     .central_clock
                     .first_output,
             ))

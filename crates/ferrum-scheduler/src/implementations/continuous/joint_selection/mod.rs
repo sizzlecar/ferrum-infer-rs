@@ -14,7 +14,6 @@ struct Cohort {
     requests: Vec<SimulatedRequest>,
     facts: Vec<RequestStoppingObservation>,
     trajectory: CohortTrajectory,
-    horizon: usize,
 }
 
 impl ContinuousBatchScheduler {
@@ -250,7 +249,7 @@ impl ContinuousBatchScheduler {
                 adapter: &cohort.trajectory,
                 static_action: &static_action,
                 alternatives: &alternatives,
-                static_window_rounds: cohort.horizon,
+                horizon: EvaluationHorizon::ScenarioCompletion,
             },
             |rank, requests| {
                 for (request, forecast) in requests.iter_mut().zip(&forecasts) {
@@ -402,7 +401,6 @@ impl ContinuousBatchScheduler {
         }
         let capacity = round.capacity();
         let mut blocks = 0usize;
-        let mut horizon = 0usize;
         let mut requests = Vec::with_capacity(facts.len());
         let mut ordered_facts = Vec::with_capacity(facts.len());
         let mut shapes = Vec::with_capacity(facts.len());
@@ -551,10 +549,6 @@ impl ContinuousBatchScheduler {
                     .checked_add(context_cap.div_ceil(capacity.block_size))
                     .ok_or(Unsupported::Arithmetic)?;
             }
-            horizon = horizon
-                .checked_add(prompt.saturating_sub(prefilled))
-                .and_then(|value| value.checked_add(fact.cap - fact.generated_tokens))
-                .ok_or(Unsupported::Arithmetic)?;
             let count = usize::try_from(clock.nonempty_text_events.saturating_sub(1))
                 .map_err(|_| Unsupported::Arithmetic)?;
             let violating = usize::try_from(clock.violating_text_intervals)
@@ -619,7 +613,6 @@ impl ContinuousBatchScheduler {
         Ok(Cohort {
             requests,
             facts: ordered_facts,
-            horizon,
             trajectory: CohortTrajectory {
                 first_wave,
                 shapes,

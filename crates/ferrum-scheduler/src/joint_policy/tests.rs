@@ -133,7 +133,7 @@ fn comparison() -> Comparison {
         adapter: &Adapter,
         static_action: &Action::Full,
         alternatives: &[Action::ShortFirst],
-        static_window_rounds: 4,
+        horizon: EvaluationHorizon::StaticRounds(4),
     })
     .unwrap()
 }
@@ -142,7 +142,10 @@ fn comparison() -> Comparison {
 fn same_window_and_target_expose_the_twelve_96_vs_eleven_84_counterexample() {
     let comparison = comparison();
     let alternative = comparison.alternatives[0].as_ref().unwrap();
-    assert_eq!(comparison.window, Duration::from_millis(96));
+    assert_eq!(
+        comparison.window,
+        StaticWindow::Exact(Duration::from_millis(96))
+    );
     assert_eq!(
         comparison
             .targets
@@ -323,7 +326,7 @@ fn split_twenty_then_thirty_credits_prefill_at_a_twenty_five_ms_window() {
         adapter: &SplitAdapter,
         static_action: &Action::Full,
         alternatives: &[],
-        static_window_rounds: 1,
+        horizon: EvaluationHorizon::StaticRounds(1),
     };
     let result = simulate(
         &input,
@@ -338,6 +341,7 @@ fn split_twenty_then_thirty_credits_prefill_at_a_twenty_five_ms_window() {
         1,
     )
     .unwrap();
+    let result = result.complete().unwrap();
     assert_eq!(result.window_progress[0].output_tokens, 1);
     assert_eq!(result.window_progress[1].output_tokens, 1);
     assert_eq!(result.target_reached_at, Duration::from_millis(30));
@@ -369,7 +373,7 @@ fn missing_resources_or_exhausted_queries_cannot_report_gain() {
         adapter: &Adapter,
         static_action: &Action::Full,
         alternatives: &[Action::ShortFirst],
-        static_window_rounds: 4,
+        horizon: EvaluationHorizon::StaticRounds(4),
     };
     let result = SloPolicy::evaluate(input()).unwrap();
     assert!(matches!(
@@ -618,11 +622,16 @@ fn shared_rank_scenarios_keep_declared_dependence_and_a_global_resource_budget()
                 adapter: &Adapter,
                 static_action: &Action::Full,
                 alternatives: &[Action::ShortFirst],
-                static_window_rounds: 4,
+                horizon: EvaluationHorizon::StaticRounds(4),
             },
             |rank, weight, comparison| {
                 assert_eq!(
-                    comparison.static_result.cost_risk.conditional_scenario,
+                    comparison
+                        .static_result
+                        .complete()
+                        .unwrap()
+                        .cost_risk
+                        .conditional_scenario,
                     Some(CostScenarioDependence::SharedResidualRank)
                 );
                 outcomes.push((rank, weight, comparison.window));
@@ -640,8 +649,14 @@ fn shared_rank_scenarios_keep_declared_dependence_and_a_global_resource_budget()
     snapshot.change_weights = false;
     config.planning.max_queries = 5;
     assert!(run(&snapshot, &config).is_err());
-    assert_eq!(outcomes[0], (0, 0.25, Duration::from_millis(48)));
-    assert_eq!(outcomes[1], (1, 0.75, Duration::from_millis(192)));
+    assert_eq!(
+        outcomes[0],
+        (0, 0.25, StaticWindow::Exact(Duration::from_millis(48)))
+    );
+    assert_eq!(
+        outcomes[1],
+        (1, 0.75, StaticWindow::Exact(Duration::from_millis(192)))
+    );
 }
 
 #[test]
@@ -665,7 +680,7 @@ fn engineering_margin_does_not_invent_a_complete_scenario_distribution() {
             adapter: &Adapter,
             static_action: &Action::Full,
             alternatives: &[],
-            static_window_rounds: 1,
+            horizon: EvaluationHorizon::StaticRounds(1),
         },
         |_, _, _| called = true,
     );
@@ -729,7 +744,7 @@ fn per_rank_discrete_endpoints_complete_at_eight_and_twenty_five_without_cap_fil
         adapter: &Adapter,
         static_action: &Action::Full,
         alternatives: &[],
-        static_window_rounds: 100,
+        horizon: EvaluationHorizon::StaticRounds(100),
     };
     let mut endpoints = Vec::new();
     let complete = SloPolicy::evaluate_scenarios_with_requests(
@@ -741,7 +756,7 @@ fn per_rank_discrete_endpoints_complete_at_eight_and_twenty_five_without_cap_fil
         |rank, comparison| {
             endpoints.push((
                 rank.weight,
-                comparison.static_result.requests[0].output_tokens,
+                comparison.static_result.complete().unwrap().requests[0].output_tokens,
             ));
         },
     )
@@ -762,7 +777,7 @@ fn per_rank_discrete_endpoints_complete_at_eight_and_twenty_five_without_cap_fil
         |rank, comparison| {
             endpoints.push((
                 rank.weight,
-                comparison.static_result.requests[0].output_tokens,
+                comparison.static_result.complete().unwrap().requests[0].output_tokens,
             ))
         },
     )
@@ -817,10 +832,10 @@ fn interval_risk_counts_historical_and_future_events_instead_of_using_only_maxim
         adapter: &Adapter,
         static_action: &Action::Full,
         alternatives: &[],
-        static_window_rounds: 1,
+        horizon: EvaluationHorizon::StaticRounds(1),
     })
     .unwrap();
-    let clock = comparison.static_result.requests[0].central_clock;
+    let clock = comparison.static_result.complete().unwrap().requests[0].central_clock;
     assert_eq!(clock.interval_count, 3);
     assert_eq!(clock.violating_interval_count, 2);
     assert_eq!(clock.maximum_output_interval, Duration::from_millis(99));

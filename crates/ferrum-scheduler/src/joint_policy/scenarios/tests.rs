@@ -2,6 +2,7 @@ use super::*;
 use ferrum_execution::{execution_attempt::AttemptPrefixRestore, token_execution::ExecutionRange};
 
 mod diagnostics;
+mod partial_support;
 
 struct Snapshot {
     at: Instant,
@@ -149,13 +150,15 @@ fn complete_scenario_cache_preserves_all_ranks_under_realistic_decode_horizon() 
                 adapter: &Split,
                 static_action: &128,
                 alternatives: &[64, 32],
-                static_window_rounds: 16 * (256 + 64),
+                horizon: EvaluationHorizon::StaticRounds(16 * (256 + 64)),
             },
             |_, _, comparison| {
                 if config.planning.max_cost_cache_bytes > 0 {
                     assert!(comparison.alternatives.iter().all(Result::is_ok));
                     assert!(comparison
                         .static_result
+                        .complete()
+                        .unwrap()
                         .requests
                         .iter()
                         .all(SimulatedRequest::finished));
@@ -176,6 +179,101 @@ fn complete_scenario_cache_preserves_all_ranks_under_realistic_decode_horizon() 
     // A separate uncached comparison must not inherit this snapshot's prior
     // calls or an earlier comparison's retained predictions.
     assert!(run(&config).is_err());
+}
+
+#[test]
+fn scenario_completion_matches_the_previous_remaining_progress_bound() {
+    let snapshot = Snapshot {
+        at: Instant::now(),
+        calls: AtomicUsize::new(0),
+    };
+    let mut config: SchedulerSloConfig = "ttft:1000,tpot:100,itl:100".parse().unwrap();
+    config.planning.max_elapsed_us = 1_000_000;
+    config.planning.max_scenarios = 2;
+    let requests = (0..3)
+        .map(|index| {
+            let mut request = request();
+            request.output_cap = 3 + index;
+            request.scenario_end_tokens = request.output_cap;
+            if index == 0 {
+                request.prompt_tokens = 4;
+                request.prefill_tokens = 0;
+                request.output_tokens = 0;
+                request.central_clock = RequestClock::default();
+                request.risk_clock = RequestClock::default();
+            }
+            request
+        })
+        .collect::<Vec<_>>();
+    // This was the production adapter's cap-based round bound. Every legal
+    // wave consumes at least one unit of remaining prompt/output progress.
+    let bound = requests
+        .iter()
+        .map(|request| {
+            request.prompt_tokens - request.prefill_tokens + request.output_cap
+                - request.output_tokens
+        })
+        .sum();
+    let run = |horizon| {
+        let mut observed = Vec::new();
+        let summary = SloPolicy::evaluate_scenarios(
+            EvaluationInput {
+                snapshot: &snapshot,
+                now: snapshot.at,
+                config: &config,
+                execution: CostExecution::SequentialPrefillThenDecode,
+                requests: &requests,
+                resources: ResourceSupport {
+                    waiting_requests: 0,
+                    kv_reserved_through_scenario_end: true,
+                },
+                adapter: &Split,
+                static_action: &4,
+                alternatives: &[2, 1],
+                horizon,
+            },
+            |_, _, comparison| {
+                let static_result = comparison.static_result.complete().unwrap();
+                assert!(static_result
+                    .requests
+                    .iter()
+                    .all(SimulatedRequest::finished));
+                observed.push((
+                    comparison.window,
+                    comparison.targets.clone(),
+                    static_result
+                        .requests
+                        .iter()
+                        .map(|request| request.central_clock)
+                        .collect::<Vec<_>>(),
+                    comparison
+                        .alternatives
+                        .iter()
+                        .map(|result| {
+                            let result = result.as_ref().unwrap();
+                            (
+                                result.target_reached_at,
+                                result.window_progress.clone(),
+                                result
+                                    .requests
+                                    .iter()
+                                    .map(|request| request.central_clock)
+                                    .collect::<Vec<_>>(),
+                            )
+                        })
+                        .collect::<Vec<_>>(),
+                ));
+            },
+        )
+        .unwrap();
+        (summary, observed)
+    };
+    let (bounded, bounded_observed) = run(EvaluationHorizon::StaticRounds(bound));
+    let (complete, complete_observed) = run(EvaluationHorizon::ScenarioCompletion);
+    assert_eq!(bounded_observed, complete_observed);
+    assert_eq!(bounded.queries, complete.queries);
+    assert_eq!(bounded.resolved_mass, complete.resolved_mass);
+    assert_eq!(complete.partial_static_ranks, 0);
 }
 
 #[test]

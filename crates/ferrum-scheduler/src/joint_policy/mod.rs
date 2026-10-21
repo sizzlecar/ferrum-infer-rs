@@ -242,10 +242,19 @@ pub struct EvaluationInput<'a, Action, Adapter> {
     pub adapter: &'a Adapter,
     pub static_action: &'a Action,
     pub alternatives: &'a [Action],
-    /// The static trajectory fixes the common window at this round's final
-    /// invocation boundary, or earlier when the cohort completes. This horizon
-    /// is not itself a latency SLO.
-    pub static_window_rounds: usize,
+    pub horizon: EvaluationHorizon,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EvaluationHorizon {
+    /// The static trajectory fixes the common window at this wave's final
+    /// invocation boundary, or earlier when the cohort completes.
+    StaticRounds(usize),
+    /// Targets are the full, assigned endpoints of this scenario. This is not
+    /// a latency SLO and does not relax the global query or elapsed budgets.
+    /// Only a scenario evaluation with a known seed distribution may retain a
+    /// later static support prefix; an unseeded evaluation still returns Err.
+    ScenarioCompletion,
 }
 
 #[derive(Debug, Clone)]
@@ -283,10 +292,72 @@ impl TrajectoryResult {
 #[derive(Debug)]
 pub struct Comparison {
     pub revision: u64,
-    pub window: Duration,
+    pub window: StaticWindow,
     pub targets: Vec<Progress>,
-    pub static_result: TrajectoryResult,
+    pub static_result: StaticTrajectory,
     pub alternatives: Vec<Result<TrajectoryResult, Unsupported>>,
+}
+
+/// An observed prefix is a lower bound on the unknown full static window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StaticWindow {
+    Exact(Duration),
+    AtLeast(Duration),
+}
+
+#[derive(Debug)]
+pub enum StaticTrajectory {
+    Complete(TrajectoryResult),
+    OutsideSupportPrefix(TrajectoryPrefix),
+}
+
+/// Only successfully priced invocation groups have been applied. The rejected
+/// group contributes neither progress nor elapsed time. No completion/target
+/// time is invented for the unknown suffix.
+#[derive(Debug)]
+pub struct TrajectoryPrefix {
+    pub requests: Vec<SimulatedRequest>,
+    pub central_elapsed: Duration,
+    pub risk_elapsed: Duration,
+    pub queries: usize,
+    pub cost_risk: CostRiskBudget,
+    pub unsupported: Unsupported,
+}
+
+impl StaticTrajectory {
+    pub fn complete(&self) -> Option<&TrajectoryResult> {
+        match self {
+            Self::Complete(result) => Some(result),
+            Self::OutsideSupportPrefix(_) => None,
+        }
+    }
+
+    pub fn requests(&self) -> &[SimulatedRequest] {
+        match self {
+            Self::Complete(result) => &result.requests,
+            Self::OutsideSupportPrefix(prefix) => &prefix.requests,
+        }
+    }
+
+    fn cost_risk(&self) -> &CostRiskBudget {
+        match self {
+            Self::Complete(result) => &result.cost_risk,
+            Self::OutsideSupportPrefix(prefix) => &prefix.cost_risk,
+        }
+    }
+}
+
+impl Comparison {
+    fn partial_window_covered(&self, result: &TrajectoryResult) -> bool {
+        match self.window {
+            StaticWindow::Exact(_) => true,
+            StaticWindow::AtLeast(lower) => {
+                result.requests.iter().all(SimulatedRequest::finished)
+                    && !result.has_window_debt(&self.targets)
+                    && result.central_elapsed <= lower
+            }
+        }
+    }
 }
 
 /// Paired action-difference uncertainty comes from independent measurements;
@@ -333,7 +404,7 @@ impl SloPolicy {
         if !input.resources.kv_reserved_through_scenario_end {
             return Err(Unsupported::UnknownKvCapacity);
         }
-        if input.static_window_rounds == 0
+        if input.horizon == EvaluationHorizon::StaticRounds(0)
             || input.requests.iter().enumerate().any(|(index, request)| {
                 !request.valid()
                     || input.requests[..index]
@@ -350,27 +421,68 @@ impl SloPolicy {
             diagnostics,
             rank,
         };
+        // Freeze full endpoint targets before any potentially partial static
+        // traversal. A support gap must never shorten an alternative's goal.
+        let endpoint_targets =
+            (input.horizon == EvaluationHorizon::ScenarioCompletion).then(|| {
+                input
+                    .requests
+                    .iter()
+                    .map(|request| Progress {
+                        prefill_tokens: request.prompt_tokens,
+                        output_tokens: request.scenario_end_tokens,
+                    })
+                    .collect::<Vec<_>>()
+            });
         let static_result = simulate(&input, input.static_action, None, &mut budget, 0)?;
-        let window = static_result.central_elapsed;
-        let targets = static_result
-            .requests
-            .iter()
-            .map(SimulatedRequest::progress)
-            .collect::<Vec<_>>();
+        let window = match &static_result {
+            StaticTrajectory::Complete(result) => StaticWindow::Exact(result.central_elapsed),
+            StaticTrajectory::OutsideSupportPrefix(prefix) => {
+                StaticWindow::AtLeast(prefix.central_elapsed)
+            }
+        };
+        let targets = endpoint_targets.unwrap_or_else(|| {
+            static_result
+                .requests()
+                .iter()
+                .map(SimulatedRequest::progress)
+                .collect()
+        });
         let alternatives = input
             .alternatives
             .iter()
             .enumerate()
             .map(|(index, action)| {
-                simulate(
+                let result = simulate(
                     &input,
                     action,
-                    Some((window, targets.as_slice())),
+                    match window {
+                        StaticWindow::Exact(window) => Some((window, targets.as_slice())),
+                        StaticWindow::AtLeast(_) => None,
+                    },
                     &mut budget,
                     index + 1,
-                )
+                )?;
+                match result {
+                    StaticTrajectory::Complete(result) => Ok(result),
+                    StaticTrajectory::OutsideSupportPrefix(prefix) => Err(prefix.unsupported),
+                }
             })
-            .collect();
+            .collect::<Vec<_>>();
+        if matches!(static_result, StaticTrajectory::OutsideSupportPrefix(_)) {
+            if let Some(reason) = alternatives
+                .iter()
+                .filter_map(|result| result.as_ref().err())
+                .find(|reason| {
+                    **reason
+                        != Unsupported::Cost(CostUnknownReason::UnsupportedWithDetail(
+                            CostUnsupportedDetail::OutsideObservedSupport,
+                        ))
+                })
+            {
+                return Err(*reason);
+            }
+        }
         Ok(Comparison {
             revision: input.snapshot.revision(),
             window,
@@ -399,6 +511,9 @@ impl SloPolicy {
             if alternative_risks[index] != JointFeasibility::Feasible {
                 continue;
             }
+            if !comparison.partial_window_covered(result) {
+                continue;
+            }
             if static_risk == JointFeasibility::Feasible {
                 if result.has_window_debt(&comparison.targets) {
                     continue;
@@ -406,8 +521,10 @@ impl SloPolicy {
                 let Some(evidence) = paired[index] else {
                     continue;
                 };
-                let Some(gain) = comparison
-                    .static_result
+                let Some(static_result) = comparison.static_result.complete() else {
+                    continue;
+                };
+                let Some(gain) = static_result
                     .target_reached_at
                     .checked_sub(result.target_reached_at)
                 else {
@@ -430,10 +547,13 @@ impl SloPolicy {
         if let Some((index, _)) = best {
             return PolicyChoice::Alternative(index);
         }
-        if static_risk == JointFeasibility::Feasible {
+        if static_risk == JointFeasibility::Feasible
+            && comparison.static_result.complete().is_some()
+        {
             return PolicyChoice::Static;
         }
         if static_risk == JointFeasibility::Infeasible
+            && comparison.static_result.complete().is_some()
             && comparison.alternatives.iter().all(Result::is_ok)
             && alternative_risks
                 .iter()
@@ -459,13 +579,19 @@ fn simulate<Action, Adapter: TrajectoryAdapter<Action>>(
     probe: Option<(Duration, &[Progress])>,
     budget: &mut QueryBudget<'_>,
     candidate: usize,
-) -> Result<TrajectoryResult, Unsupported> {
+) -> Result<StaticTrajectory, Unsupported> {
     let failures = budget.diagnostics.failures();
     let result = simulate_recorded(input, action, probe, budget, candidate);
-    if let Err(reason) = result {
+    if let Err(reason) = &result {
         budget
             .diagnostics
-            .fallback_failure(failures, reason, FailureOrigin::Simulation);
+            .fallback_failure(failures, *reason, FailureOrigin::Simulation);
+    } else if let Ok(StaticTrajectory::OutsideSupportPrefix(prefix)) = &result {
+        budget.diagnostics.fallback_failure(
+            failures,
+            prefix.unsupported,
+            FailureOrigin::Simulation,
+        );
     }
     result
 }
@@ -476,7 +602,7 @@ fn simulate_recorded<Action, Adapter: TrajectoryAdapter<Action>>(
     probe: Option<(Duration, &[Progress])>,
     budget: &mut QueryBudget<'_>,
     candidate: usize,
-) -> Result<TrajectoryResult, Unsupported> {
+) -> Result<StaticTrajectory, Unsupported> {
     let mut requests = input.requests.to_vec();
     let mut central = Duration::ZERO;
     let mut risk = Duration::ZERO;
@@ -596,6 +722,32 @@ fn simulate_recorded<Action, Adapter: TrajectoryAdapter<Action>>(
                 let CostPrediction::Unknown(reason) = prediction else {
                     unreachable!()
                 };
+                if candidate == 0
+                    && budget.rank.is_some()
+                    && input.horizon == EvaluationHorizon::ScenarioCompletion
+                    && reason
+                        == CostUnknownReason::UnsupportedWithDetail(
+                            CostUnsupportedDetail::OutsideObservedSupport,
+                        )
+                    && !central.is_zero()
+                {
+                    if budget.started.elapsed()
+                        >= Duration::from_micros(input.config.planning.max_elapsed_us)
+                    {
+                        budget
+                            .diagnostics
+                            .failure(Unsupported::TimeBudget, FailureOrigin::PostQueryTime);
+                        return Err(Unsupported::TimeBudget);
+                    }
+                    return Ok(StaticTrajectory::OutsideSupportPrefix(TrajectoryPrefix {
+                        requests,
+                        central_elapsed: central,
+                        risk_elapsed: risk,
+                        queries: budget.queries - query_start,
+                        cost_risk,
+                        unsupported: Unsupported::Cost(reason),
+                    }));
+                }
                 return Err(Unsupported::Cost(reason));
             };
             if observed_at > input.now
@@ -670,7 +822,7 @@ fn simulate_recorded<Action, Adapter: TrajectoryAdapter<Action>>(
                 // Continue normal scheduling after early target attainment until
                 // the common window has also been observed. No paused winners.
                 if central >= window && reached.is_some() {
-                    return Ok(TrajectoryResult {
+                    return Ok(StaticTrajectory::Complete(TrajectoryResult {
                         requests,
                         window_progress,
                         target_reached_at: reached.unwrap(),
@@ -678,17 +830,17 @@ fn simulate_recorded<Action, Adapter: TrajectoryAdapter<Action>>(
                         risk_elapsed: risk,
                         queries: budget.queries - query_start,
                         cost_risk,
-                    });
+                    }));
                 }
             }
         }
         rounds += 1;
         if probe.is_none()
-            && (rounds >= input.static_window_rounds
+            && (matches!(input.horizon, EvaluationHorizon::StaticRounds(limit) if rounds >= limit)
                 || requests.iter().all(SimulatedRequest::finished))
         {
             window_progress = requests.iter().map(SimulatedRequest::progress).collect();
-            return Ok(TrajectoryResult {
+            return Ok(StaticTrajectory::Complete(TrajectoryResult {
                 requests,
                 window_progress,
                 target_reached_at: central,
@@ -696,7 +848,7 @@ fn simulate_recorded<Action, Adapter: TrajectoryAdapter<Action>>(
                 risk_elapsed: risk,
                 queries: budget.queries - query_start,
                 cost_risk,
-            });
+            }));
         }
         if requests.iter().all(SimulatedRequest::finished) {
             if let Some((_, targets)) = probe {
@@ -706,7 +858,7 @@ fn simulate_recorded<Action, Adapter: TrajectoryAdapter<Action>>(
                     .all(|(request, target)| request.progress().covers(*target))
                 {
                     window_progress = requests.iter().map(SimulatedRequest::progress).collect();
-                    return Ok(TrajectoryResult {
+                    return Ok(StaticTrajectory::Complete(TrajectoryResult {
                         requests,
                         window_progress,
                         target_reached_at: reached.unwrap_or(central),
@@ -714,7 +866,7 @@ fn simulate_recorded<Action, Adapter: TrajectoryAdapter<Action>>(
                         risk_elapsed: risk,
                         queries: budget.queries - query_start,
                         cost_risk,
-                    });
+                    }));
                 }
             }
             return Err(Unsupported::NoProgress);

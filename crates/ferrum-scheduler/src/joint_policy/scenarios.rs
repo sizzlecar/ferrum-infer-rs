@@ -8,7 +8,8 @@ mod tests;
 
 /// Complete traversal of the declared empirical rank support. The callback's
 /// partial aggregates must be discarded if traversal returns an error. Each
-/// comparison can still contain unsupported alternatives; those remain unknown.
+/// comparison can still contain unsupported alternatives or a static support
+/// prefix; their unknown suffixes remain explicit and are never renormalized.
 #[derive(Debug, Clone, Copy)]
 pub struct ScenarioEvaluation {
     /// Earliest expiry of any conditional cost distribution actually queried.
@@ -18,9 +19,12 @@ pub struct ScenarioEvaluation {
     pub queries: usize,
     pub cache_hits: usize,
     pub cache_retained_bytes: usize,
+    /// Mass with assigned stopping endpoints and a visited comparison. This
+    /// does not assert complete cost support for static or every alternative.
     pub resolved_mass: f64,
     pub unresolved_mass: f64,
     pub unresolved_ranks: usize,
+    pub partial_static_ranks: usize,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -203,6 +207,7 @@ impl SloPolicy {
         let mut resolved_mass = 0.0;
         let mut unresolved_mass = 0.0;
         let mut unresolved_ranks = 0;
+        let mut partial_static_ranks = 0;
         let mut quantile_lower = 0.0;
         for (rank, weight) in weights.iter().copied().enumerate() {
             diagnostics.point(
@@ -276,7 +281,7 @@ impl SloPolicy {
                     adapter: input.adapter,
                     static_action: input.static_action,
                     alternatives: input.alternatives,
-                    static_window_rounds: input.static_window_rounds,
+                    horizon: input.horizon,
                 },
                 diagnostics,
                 Some(rank),
@@ -288,7 +293,12 @@ impl SloPolicy {
             let comparison = comparison?;
             visit(rank_info, &comparison);
             resolved_mass += weight;
-            diagnostics.rank_finished(false);
+            if comparison.static_result.complete().is_some() {
+                diagnostics.rank_finished(false);
+            } else {
+                partial_static_ranks += 1;
+                diagnostics.rank_partial_static();
+            }
         }
         if started.elapsed() >= Duration::from_micros(input.config.planning.max_elapsed_us) {
             diagnostics.failure(Unsupported::TimeBudget, FailureOrigin::SimulationTime);
@@ -306,6 +316,7 @@ impl SloPolicy {
             resolved_mass,
             unresolved_mass,
             unresolved_ranks,
+            partial_static_ranks,
         })
     }
 }
