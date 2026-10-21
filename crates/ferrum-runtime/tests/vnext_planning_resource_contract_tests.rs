@@ -559,7 +559,7 @@ fn provider_formula_is_policy_invariant_and_core_binds_token_ceiling() {
         )
         .unwrap();
         assert_eq!(
-            plan.payload().maximum_scheduled_tokens(),
+            plan.payload().maximum_scheduled_tokens().unwrap(),
             maximum_scheduled_tokens
         );
         let scratch = plan

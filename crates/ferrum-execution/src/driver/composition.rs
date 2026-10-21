@@ -259,7 +259,11 @@ impl<'a, R: DeviceRuntime> CompiledProgram<'a, R> {
         if plan.selected.context_tokens != self.config.maximum_model_tokens
             || plan.selected.max_sequences as u64 != u64::from(memory.maximum_active_sequences())
             || plan.selected.max_batch_tokens as u64
-                != self.config.runtime_policy.maximum_scheduled_tokens()
+                != self
+                    .config
+                    .runtime_policy
+                    .maximum_scheduled_tokens()
+                    .map_err(|error| FerrumError::config(error.to_string()))?
             || plan.request.usable_capacity_bytes != memory.usable_capacity_bytes()
             || plan.context_peak_bytes > memory.usable_capacity_bytes()
             || plan.decode_peak_bytes > memory.usable_capacity_bytes()

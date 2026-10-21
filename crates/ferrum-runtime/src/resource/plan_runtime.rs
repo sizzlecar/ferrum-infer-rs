@@ -1127,6 +1127,28 @@ where
         )
     }
 
+    pub(super) fn work_limits(&self) -> crate::RuntimeWorkLimits {
+        match &self.resources.static_resources {
+            PlanRuntimeStatic::NoStatic { binding } => binding.work_limits(),
+            PlanRuntimeStatic::Static(source) => source.admission.work_limits(),
+        }
+    }
+
+    fn validate_work_shapes(
+        &self,
+        immediate: DynamicResourceShape,
+        fit: DynamicResourceShape,
+    ) -> Result<(), VNextError> {
+        if self.work_limits().is_tensor() != immediate.is_tensor()
+            || immediate.is_tensor() != fit.is_tensor()
+        {
+            return Err(invalid_resource(
+                "work evidence domain differs from its compiled plan",
+            ));
+        }
+        Ok(())
+    }
+
     pub(super) fn scoped_demand(
         &self,
         lifetime: AllocationLifetime,
@@ -1137,6 +1159,7 @@ where
         fit_policy: AdmissionFitPolicy,
         pressure_action: AdmissionPressureAction,
     ) -> Result<(AdmissionDemand, Vec<EvaluatedBackingRequest<'_>>), VNextError> {
+        self.validate_work_shapes(immediate_shape, fit_shape)?;
         if (lifetime == AllocationLifetime::Invocation) != node_id.is_some() {
             return Err(invalid_resource(
                 "invocation resource demand requires one exact node identity",
@@ -1149,12 +1172,12 @@ where
                     AllocationLifetime::Step | AllocationLifetime::Invocation
                 ) && bucket.capacity().covers(
                     immediate_shape.sequences(),
-                    immediate_shape.tokens(),
-                    immediate_shape.pages(),
+                    immediate_shape.tokens()?,
+                    immediate_shape.pages()?,
                 ) && bucket.capacity().covers(
                     fit_shape.sequences(),
-                    fit_shape.tokens(),
-                    fit_shape.pages(),
+                    fit_shape.tokens()?,
+                    fit_shape.pages()?,
                 ) =>
             {
                 DynamicResourceShape::from_validated(
@@ -1357,8 +1380,8 @@ where
     ) -> Result<(AdmissionDemand, Vec<EvaluatedBackingRequest<'_>>), VNextError> {
         if committed.sequences() != 1
             || target.sequences() != 1
-            || target.tokens() < committed.tokens()
-            || target.pages() < committed.pages()
+            || target.tokens()? < committed.tokens()?
+            || target.pages()? < committed.pages()?
         {
             return Err(invalid_resource(
                 "sequence extension target must monotonically advance one committed sequence",
@@ -1477,12 +1500,12 @@ where
             Some(bucket)
                 if bucket.capacity().covers(
                     immediate_shape.sequences(),
-                    immediate_shape.tokens(),
-                    immediate_shape.pages(),
+                    immediate_shape.tokens()?,
+                    immediate_shape.pages()?,
                 ) && bucket.capacity().covers(
                     fit_shape.sequences(),
-                    fit_shape.tokens(),
-                    fit_shape.pages(),
+                    fit_shape.tokens()?,
+                    fit_shape.pages()?,
                 ) =>
             {
                 // Physical reusable capacity is compiled once with the immutable

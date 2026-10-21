@@ -136,7 +136,7 @@ pub(crate) fn packed_step_token_range_to_participant_local_readback(
         ));
     }
     let token_range = work_shape
-        .participant_token_ranges()
+        .participant_token_ranges()?
         .get(participant_index)
         .ok_or_else(|| invalid_operation("packed participant token readback is out of range"))?;
     let DynamicResourceDemand::Tokens {
@@ -148,7 +148,7 @@ pub(crate) fn packed_step_token_range_to_participant_local_readback(
             "packed participant token readback requires token demand",
         ));
     };
-    if work_shape.immediate_tokens() > *maximum_tokens {
+    if work_shape.immediate_tokens()? > *maximum_tokens {
         return Err(invalid_operation(
             "packed participant token readback exceeds its planned ceiling",
         ));
@@ -183,7 +183,19 @@ fn translate_step_participant_range(
             "participant resource projection has an empty semantic range",
         ));
     }
-    if participant_index >= work_shape.participant_token_ranges().len() {
+    if work_shape.resource_work().is_tensor() {
+        return match demand {
+            DynamicResourceDemand::Fixed { bytes }
+                if participant_index == 0 && semantic_range.end <= *bytes =>
+            {
+                Ok(semantic_range)
+            }
+            _ => Err(invalid_operation(
+                "tensor projection requires the exact singleton fixed backing range",
+            )),
+        };
+    }
+    if participant_index >= work_shape.participant_token_ranges()?.len() {
         return Err(invalid_operation(
             "participant resource projection is out of range",
         ));
@@ -219,12 +231,12 @@ fn translate_step_participant_range(
             bytes_per_token,
             maximum_tokens,
         } => {
-            if work_shape.immediate_tokens() > *maximum_tokens {
+            if work_shape.immediate_tokens()? > *maximum_tokens {
                 return Err(invalid_operation(
                     "participant token resource projection exceeds its planned ceiling",
                 ));
             }
-            let token_range = &work_shape.participant_token_ranges()[participant_index];
+            let token_range = &work_shape.participant_token_ranges()?[participant_index];
             let source = token_range.source_token_range();
             let packed = token_range.immediate_token_range();
             let source_start = source
@@ -587,7 +599,7 @@ pub(super) fn sequence_execution_shape(
 ) -> Result<DynamicResourceShape, VNextError> {
     if committed.sequences() != 1
         || source_end_tokens == 0
-        || source_end_tokens > committed.tokens()
+        || source_end_tokens > committed.tokens()?
     {
         return Err(invalid_operation(
             "sequence operation frontier is empty or exceeds committed backing",
@@ -596,7 +608,7 @@ pub(super) fn sequence_execution_shape(
     Ok(DynamicResourceShape::from_validated(
         1,
         source_end_tokens,
-        committed.pages(),
+        committed.pages()?,
     ))
 }
 
@@ -1246,8 +1258,8 @@ mod operation_buffer_region_tests {
         let projected = sequence_execution_shape(committed, 4).unwrap();
 
         assert_eq!(projected.sequences(), 1);
-        assert_eq!(projected.tokens(), 4);
-        assert_eq!(projected.pages(), 3);
+        assert_eq!(projected.tokens().unwrap(), 4);
+        assert_eq!(projected.pages().unwrap(), 3);
         assert!(sequence_execution_shape(committed, 0).is_err());
         assert!(sequence_execution_shape(committed, 9).is_err());
         assert!(

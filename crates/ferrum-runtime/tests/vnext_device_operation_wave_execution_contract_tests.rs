@@ -200,7 +200,7 @@ fn kernel_profile_binds_native_work_to_exact_plan_nodes() {
         assert_eq!(command.execution_path(), DeviceExecutionPath::Eager);
         assert_eq!(command.batching_form(), DeviceBatchingForm::Scalar);
         assert_eq!(command.participant_count(), 1);
-        assert_eq!(command.token_count(), 1);
+        assert_eq!(command.token_count(), Some(1));
         assert_eq!(command.compute_dispatch_count(), 1);
         assert_eq!(command.transfer_command_count(), 0);
     }

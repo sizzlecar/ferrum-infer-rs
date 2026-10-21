@@ -34,6 +34,9 @@ pub use weight::*;
 mod work;
 pub use work::*;
 
+mod tensor;
+pub use tensor::*;
+
 mod reusable;
 pub use reusable::*;
 

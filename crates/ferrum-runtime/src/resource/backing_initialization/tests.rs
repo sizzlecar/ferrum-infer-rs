@@ -331,7 +331,7 @@ fn restore_initialization_boundary_only_state_does_not_infer_a_token_capacity_li
     spec.layouts.remove(0);
     let harness = RestoreHarness::new(spec);
     let guard = harness.reserve();
-    assert_eq!(guard.backing().committed_tokens(), 1);
+    assert_eq!(guard.backing().committed_tokens().unwrap(), 1);
     let (prepared, bytes) = prepare(&harness, &guard, 9);
     assert_eq!(bytes.logical_bytes(), 4);
     let mut commands = DeviceCommandBatch::with_capacity(0);

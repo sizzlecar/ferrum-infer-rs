@@ -20,7 +20,7 @@ fn single_pass_live_wave_matches_reference_and_keeps_per_consumer_checks() {
                 .unwrap();
             let node = identity.materialize_node(0).unwrap();
             let make = || {
-                BatchedOperationInvocation::from_resources(
+                BatchedOperationInvocation::<_, crate::TokenInvocationWork<'_>>::from_resources(
                     fixture.runtime.as_ref(),
                     &fixture.resolved,
                     provider.dispatch(),
@@ -58,7 +58,7 @@ fn paired_live_wave_single_pass_coverage() {
                 .unwrap();
             let node = identity.materialize_node(0).unwrap();
             let make = || {
-                BatchedOperationInvocation::from_resources(
+                BatchedOperationInvocation::<_, crate::TokenInvocationWork<'_>>::from_resources(
                     fixture.runtime.as_ref(),
                     &fixture.resolved,
                     provider.dispatch(),

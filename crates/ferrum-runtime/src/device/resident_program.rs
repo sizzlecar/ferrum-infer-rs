@@ -1,22 +1,21 @@
 //! Current-use authority for a cold, complete resident decode binding program.
 use super::DeviceBufferRetention;
 use crate::{
-    BatchWorkShape, DeviceResidentPlanDependencyBatch, EncodedResidentPlanDependency,
-    SequencePhysicalBindingTable,
+    DeviceResidentPlanDependencyBatch, EncodedResidentPlanDependency, SequencePhysicalBindingTable,
 };
 use std::sync::Arc;
 
 /// An append-only physical-table transition checked by Core under current
 /// resource authority. Creating this does not consume dependencies or enqueue.
 pub struct DeviceResidentDecodeRefresh<'a, B> {
-    work: &'a BatchWorkShape,
+    work: crate::TokenBatchWorkView<'a>,
     previous: &'a [Arc<SequencePhysicalBindingTable<B>>],
     current: &'a [Arc<SequencePhysicalBindingTable<B>>],
 }
 
 impl<'a, B> DeviceResidentDecodeRefresh<'a, B> {
     pub(crate) fn new(
-        work: &'a BatchWorkShape,
+        work: crate::TokenBatchWorkView<'a>,
         previous: &'a [Arc<SequencePhysicalBindingTable<B>>],
         current: &'a [Arc<SequencePhysicalBindingTable<B>>],
     ) -> Self {
@@ -26,8 +25,8 @@ impl<'a, B> DeviceResidentDecodeRefresh<'a, B> {
             current,
         }
     }
-    pub fn work_shape(&self) -> &BatchWorkShape {
-        self.work
+    pub fn work_shape(&self) -> &crate::TokenBatchWorkView<'_> {
+        &self.work
     }
     pub fn previous_tables(&self) -> &[Arc<SequencePhysicalBindingTable<B>>] {
         self.previous
@@ -40,14 +39,14 @@ impl<'a, B> DeviceResidentDecodeRefresh<'a, B> {
 /// Core constructs this only after current resource/frame/window validation.
 /// It cannot be cloned or manufactured by an operation provider.
 pub struct DeviceResidentDecodeRequest<'a> {
-    work: &'a BatchWorkShape,
+    work: crate::TokenBatchWorkView<'a>,
     retention: DeviceBufferRetention,
     dependencies: Option<DeviceResidentPlanDependencyBatch>,
 }
 
 impl<'a> DeviceResidentDecodeRequest<'a> {
     pub(crate) fn new(
-        work: &'a BatchWorkShape,
+        work: crate::TokenBatchWorkView<'a>,
         retention: DeviceBufferRetention,
         dependencies: DeviceResidentPlanDependencyBatch,
     ) -> Self {
@@ -58,8 +57,8 @@ impl<'a> DeviceResidentDecodeRequest<'a> {
         }
     }
 
-    pub fn work_shape(&self) -> &BatchWorkShape {
-        self.work
+    pub fn work_shape(&self) -> &crate::TokenBatchWorkView<'_> {
+        &self.work
     }
     pub fn retention(&self) -> &DeviceBufferRetention {
         &self.retention

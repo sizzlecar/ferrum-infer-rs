@@ -162,8 +162,8 @@ where
         || recipe.program_id.runtime_implementation_fingerprint()
             != identity.runtime_implementation_fingerprint()
         || recipe.program_id.immediate_sequences() != first.work_shape().immediate_sequences()
-        || recipe.program_id.immediate_tokens() != first.work_shape().immediate_tokens()
-        || recipe.program_id.immediate_pages() != first.work_shape().immediate_pages()
+        || recipe.program_id.immediate_tokens() != first.work_shape().immediate_tokens()?
+        || recipe.program_id.immediate_pages() != first.work_shape().immediate_pages()?
     {
         return Err(invalid_operation(
             "segment recipe differs from its current Plan, lane, or exact work shape",
@@ -240,7 +240,7 @@ where
                                     current.participant_backing_snapshot(participant_index)?;
                                 let tokens = first
                                     .work_shape()
-                                    .participant_token_ranges()
+                                    .participant_token_ranges()?
                                     .get(participant_index)
                                     .ok_or_else(|| {
                                         invalid_operation(
@@ -624,7 +624,9 @@ where
             program_binding: wave
                 .claimed_backing()
                 .program_binding_node(compiled.node_index),
-            work_shape: wave.nodes()[compiled.node_index].work_shape(),
+            work_shape: wave.nodes()[compiled.node_index]
+                .work_shape()
+                .token_view()?,
             regions,
             dependencies,
         });
@@ -737,8 +739,8 @@ where
         || recipe.program_id.runtime_implementation_fingerprint()
             != identity.runtime_implementation_fingerprint()
         || recipe.program_id.immediate_sequences() != first.work_shape().immediate_sequences()
-        || recipe.program_id.immediate_tokens() != first.work_shape().immediate_tokens()
-        || recipe.program_id.immediate_pages() != first.work_shape().immediate_pages()
+        || recipe.program_id.immediate_tokens() != first.work_shape().immediate_tokens()?
+        || recipe.program_id.immediate_pages() != first.work_shape().immediate_pages()?
     {
         return Err(invalid_operation(
             "segment recipe differs from its current Plan, lane, or exact work shape",
@@ -860,7 +862,7 @@ where
                         AllocationLifetime::Sequence => {
                             let tokens = first
                                 .work_shape()
-                                .participant_token_ranges()
+                                .participant_token_ranges()?
                                 .get(participant)
                                 .ok_or_else(|| {
                                     invalid_operation("segment participant token range is missing")
@@ -1096,7 +1098,7 @@ where
         resources: &resources,
         expected: &expected,
         owners,
-        work_shape: first.work_shape(),
+        work_shape: first.work_shape().token_view()?,
         program_bindings,
         dependencies,
     };

@@ -11,7 +11,7 @@ use super::segment_compile::CompiledSegmentBindingRecipe;
 use super::{OperationBufferStorageKind, ResolvedValueRole, RetainedPlanDependencyAuthority};
 use crate::resource::{SegmentPlanResourceView, SegmentWindowResource};
 use crate::{
-    BatchWorkShape, BufferDescriptor, BufferUsage, DeviceBufferRetention, ElementType,
+    BufferDescriptor, BufferUsage, DeviceBufferRetention, ElementType,
     EncodedReusableExecutionBindings, ProgramBindingNodeBinding, ResourceId,
     SegmentBackingWindowView, VNextError, WeightId,
 };
@@ -365,7 +365,7 @@ pub struct PreparedSegmentBindingNode<'a, B> {
     pub(crate) node_index: u32,
     pub(crate) declaration: &'a SegmentBindingDeclaration,
     pub(crate) program_binding: Option<ProgramBindingNodeBinding>,
-    pub(crate) work_shape: &'a BatchWorkShape,
+    pub(crate) work_shape: crate::TokenBatchWorkView<'a>,
     /// Participant-major, followed by declaration region index.
     pub(crate) regions: Vec<PreparedSegmentBindingRegion<'a, B>>,
     pub(crate) dependencies: Vec<Option<RetainedPlanDependencyAuthority>>,
@@ -381,8 +381,8 @@ impl<B> PreparedSegmentBindingNode<'_, B> {
     pub fn program_binding(&self) -> Option<&ProgramBindingNodeBinding> {
         self.program_binding.as_ref()
     }
-    pub fn work_shape(&self) -> &BatchWorkShape {
-        self.work_shape
+    pub fn work_shape(&self) -> &crate::TokenBatchWorkView<'_> {
+        &self.work_shape
     }
     pub fn participant_count(&self) -> usize {
         self.work_shape.participant_token_ranges().len()
@@ -515,7 +515,7 @@ pub struct PreparedSegmentBindingFrame<'w, B> {
     pub(super) resources: &'w [SegmentFrameResource],
     pub(super) expected: &'w [crate::SegmentBackingExpectation],
     pub(super) owners: Vec<SegmentBindingOwnerView<'w, B>>,
-    pub(super) work_shape: &'w BatchWorkShape,
+    pub(super) work_shape: crate::TokenBatchWorkView<'w>,
     pub(super) program_bindings: Vec<Option<ProgramBindingNodeBinding>>,
     pub(super) dependencies: Vec<Vec<Option<RetainedPlanDependencyAuthority>>>,
 }
@@ -565,8 +565,8 @@ impl<'f, 'w, B> PreparedSegmentBindingNodeView<'f, 'w, B> {
     pub fn program_binding(&self) -> Option<&'f ProgramBindingNodeBinding> {
         self.frame.program_bindings[self.index].as_ref()
     }
-    pub fn work_shape(&self) -> &'f BatchWorkShape {
-        self.frame.work_shape
+    pub fn work_shape(&self) -> &crate::TokenBatchWorkView<'w> {
+        &self.frame.work_shape
     }
     pub fn participant_count(&self) -> usize {
         self.frame.work_shape.participant_token_ranges().len()

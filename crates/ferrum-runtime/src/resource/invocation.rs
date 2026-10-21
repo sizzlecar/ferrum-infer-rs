@@ -474,6 +474,20 @@ where
 
     /// Reuses the exact immutable work authority admitted for this step when a
     /// submission wave binds the same participants and token spans.
+    pub fn shared_tensor_invocation_work_shape(&self) -> Result<Arc<BatchWorkShape>, VNextError> {
+        if !self
+            .claimed_backing
+            .work_shape()
+            .resource_work()
+            .is_tensor()
+        {
+            return Err(invalid_resource(
+                "tensor invocation requires an admitted tensor step",
+            ));
+        }
+        Ok(Arc::clone(self.claimed_backing.work_shape_arc()))
+    }
+
     pub fn shared_all_invocation_work_shape(
         &self,
         token_spans: &[TokenSpanWork],
@@ -481,7 +495,7 @@ where
         let work_shape = self.claimed_backing.work_shape();
         if token_spans.len() != self.participants.len()
             || work_shape
-                .participant_work()
+                .participant_work()?
                 .iter()
                 .zip(token_spans)
                 .any(|(bound, requested)| bound.token_span() != requested)
@@ -1267,36 +1281,43 @@ where
                 frame_id: step_participant.frame.frame_id,
                 batch_step_id: self.batch_step_id,
             };
-            let admitted = self.work_shape().participant_work()[index].token_span();
-            // Imported Step admission requires retained token evidence and
-            // stores that same immutable work Arc. Default untracked execution
-            // keeps its existing flight-stage validation without another lock.
-            if admitted.checkpoint_tokens().is_some() {
-                // The held frame prevents frontier advancement or restore.
-                let state =
-                    participant.slot.state.lock().map_err(|_| {
+            if self.work_shape().resource_work().is_tensor() {
+                if self.work_shape().resource_work() != work_shape.resource_work() {
+                    return Err(invalid_resource(
+                        "tensor invocation work differs from admitted step inputs",
+                    ));
+                }
+            } else {
+                let admitted = self.work_shape().participant_work()?[index].token_span();
+                // Imported Step admission requires retained token evidence and
+                // stores that same immutable work Arc. Default untracked execution
+                // keeps its existing flight-stage validation without another lock.
+                if admitted.checkpoint_tokens().is_some() {
+                    // The held frame prevents frontier advancement or restore.
+                    let state = participant.slot.state.lock().map_err(|_| {
                         invalid_resource("sequence session state mutex is poisoned")
                     })?;
-                let super::SequenceSessionSlotState::Active(active) = &*state else {
-                    return Err(invalid_resource("invocation session is no longer active"));
-                };
-                if active.epoch != participant.epoch
-                    || active.fingerprint != participant.fingerprint
-                    || active.active_frame != Some(frame)
-                {
-                    return Err(invalid_resource("invocation lost its exact Step frame"));
-                }
-                if let Some(span) = active.completed_boundary.bind_imported_invocation_work(
-                    admitted,
-                    work_shape.participant_work()[request_index].token_span(),
-                    participant.resources().request.plan.plan_hash(),
-                )? {
-                    let work = canonical_work
-                        .get_or_insert_with(|| work_shape.participant_work().to_vec());
-                    work[request_index] = BatchParticipantTokenSpan::new(
-                        work_shape.participants()[request_index],
-                        span,
-                    );
+                    let super::SequenceSessionSlotState::Active(active) = &*state else {
+                        return Err(invalid_resource("invocation session is no longer active"));
+                    };
+                    if active.epoch != participant.epoch
+                        || active.fingerprint != participant.fingerprint
+                        || active.active_frame != Some(frame)
+                    {
+                        return Err(invalid_resource("invocation lost its exact Step frame"));
+                    }
+                    if let Some(span) = active.completed_boundary.bind_imported_invocation_work(
+                        admitted,
+                        work_shape.participant_work()?[request_index].token_span(),
+                        participant.resources().request.plan.plan_hash(),
+                    )? {
+                        let participant_work = work_shape.participant_work()?;
+                        let work = canonical_work.get_or_insert_with(|| participant_work.to_vec());
+                        work[request_index] = BatchParticipantTokenSpan::new(
+                            work_shape.participants()[request_index],
+                            span,
+                        );
+                    }
                 }
             }
             participant_frames.push(StepParticipantFrameAssignment::new(
@@ -2457,11 +2478,10 @@ where
                     authority.sequence_authority() != participant.sequence_authority()
                         || authority.request_authority() != participant.request_authority()
                 })
-            || claimed_backing.work_shape().immediate_tokens()
-                > step.work_shape().immediate_tokens()
-            || claimed_backing.work_shape().immediate_pages() > step.work_shape().immediate_pages()
-            || claimed_backing.work_shape().fit_tokens() > step.work_shape().fit_tokens()
-            || claimed_backing.work_shape().fit_pages() > step.work_shape().fit_pages()
+            || !step
+                .work_shape()
+                .resource_work()
+                .covers_work(claimed_backing.work_shape().resource_work())?
         {
             return Err(invalid_resource(
                 "invocation work shape differs from participants or exceeds its step",

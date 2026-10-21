@@ -14,6 +14,7 @@ use super::{
     TokenSpanWork, TrustedPlanRuntimeEvidence, VNextError,
 };
 use crate::DeviceReusableExecutionProgramId;
+use crate::ResourceWorkShape;
 use crate::{ReusableExecutionBucketId, ReusableExecutionBucketSpec};
 
 /// Resources whose lifetime is one exact continuous-batch execution frame.
@@ -126,6 +127,30 @@ where
 
     pub fn plan_evidence(&self) -> &TrustedPlanRuntimeEvidence {
         &self.plan_evidence
+    }
+
+    pub fn bind_tensor_work_shape(
+        &self,
+        work: &ResourceWorkShape,
+    ) -> Result<BatchWorkShape, VNextError> {
+        let [session] = self.sessions.as_slice() else {
+            return Err(invalid_resource(
+                "fixed tensor work requires exactly one execution session",
+            ));
+        };
+        session.resources().request.plan.validate_work_root(work)?;
+        if !session.resources().request.work_shape().covers_fit(work)? {
+            return Err(invalid_resource(
+                "tensor batch inputs differ from admitted session work",
+            ));
+        }
+        BatchWorkShape::from_tensor(
+            BatchParticipantAuthority::new(
+                session.sequence_authority(),
+                session.request_authority(),
+            ),
+            work.clone(),
+        )
     }
 
     pub fn bind_work_shape(
@@ -924,7 +949,7 @@ where
     R: DeviceRuntime,
 {
     if candidates.is_empty()
-        || candidates.len() != work_shape.participant_work().len()
+        || candidates.len() != work_shape.participants().len()
         || candidates.iter().enumerate().any(|(index, candidate)| {
             candidates[..index]
                 .iter()
@@ -973,18 +998,20 @@ where
             }
         }
     }
-    for ((candidate, state), work) in candidates
-        .iter()
-        .zip(&states)
-        .zip(work_shape.participant_work())
-    {
-        let SequenceSessionSlotState::Active(active) = &**state else {
-            unreachable!("all session frame candidates were validated");
-        };
-        active.completed_boundary.validate_imported_work(
-            work.token_span(),
-            candidate.resources.request.plan.plan_hash(),
-        )?;
+    if !work_shape.resource_work().is_tensor() {
+        for ((candidate, state), work) in candidates
+            .iter()
+            .zip(&states)
+            .zip(work_shape.participant_work()?)
+        {
+            let SequenceSessionSlotState::Active(active) = &**state else {
+                unreachable!("all session frame candidates were validated");
+            };
+            active.completed_boundary.validate_imported_work(
+                work.token_span(),
+                candidate.resources.request.plan.plan_hash(),
+            )?;
+        }
     }
     // Frame capture and extension publication use the same slot -> backing
     // lock order. Allocator, device, copy, and fence work stay outside it.
@@ -2100,8 +2127,8 @@ impl ClaimedSubmissionWaveBacking {
             lane_slot.layout_fingerprint().to_owned(),
             lane_slot.slot_id(),
             self.work_shape.immediate_sequences(),
-            self.work_shape.immediate_tokens(),
-            self.work_shape.immediate_pages(),
+            self.work_shape.immediate_tokens()?,
+            self.work_shape.immediate_pages()?,
         )
         .map(Some)
     }

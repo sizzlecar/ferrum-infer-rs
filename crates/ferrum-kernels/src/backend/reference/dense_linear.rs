@@ -3,13 +3,13 @@ use std::collections::{BTreeMap, BTreeSet};
 use ferrum_runtime::{
     dense_linear_contract, AttributeId, BatchedOperationInvocation, CapabilityId, ContractVersion,
     DeviceBatchingForm, DeviceRuntime, DynamicStorageRequirement, ElementType,
-    EncodedDeviceOperation, ExecutionIdentityEnvelope, OperationContract, OperationFailure,
-    OperationProvider, OperationProviderDescriptor, OperationResourceEstimate,
-    OperationResourceEstimateRequest, OperationResourceEstimator, ProfilePhase,
-    ProviderExecutionSemantics, ProviderId, ProviderStorageBindingRequirement,
+    EncodedDeviceOperation, ExecutionIdentityEnvelope, InvocationWorkProjection, NodeWorkContract,
+    OperationContract, OperationFailure, OperationProvider, OperationProviderDescriptor,
+    OperationResourceEstimate, OperationResourceEstimateRequest, OperationResourceEstimator,
+    ProfilePhase, ProviderExecutionSemantics, ProviderId, ProviderStorageBindingRequirement,
     ResolvedValueBinding, ResolvedValueRole, ReusableExecutionTopology,
-    ReusableExecutionTopologyRequest, SemanticValue, VNextError, WeightFormatId,
-    DENSE_LINEAR_F16_CAPABILITY_ID, DENSE_LINEAR_OPERATION_ID,
+    ReusableExecutionTopologyRequest, SemanticValue, TensorOperationInvocation, VNextError,
+    WeightFormatId, DENSE_LINEAR_F16_CAPABILITY_ID, DENSE_LINEAR_OPERATION_ID,
 };
 use sha2::{Digest, Sha256};
 
@@ -65,7 +65,8 @@ impl ReferenceDenseLinearProvider {
             ContractVersion::new(1, 0),
             estimator_fingerprint,
         )
-        .map_err(contract_error)?;
+        .map_err(contract_error)?
+        .with_fixed_tensor_work(true);
         Ok(Self { descriptor })
     }
 }
@@ -116,6 +117,46 @@ impl OperationProvider<ReferenceDeviceRuntime> for ReferenceDenseLinearProvider 
             .map(EncodedDeviceOperation::compute)
             .map_err(|message| provider_failure(identity, message))
     }
+
+    fn encode_tensor_selected(
+        &self,
+        invocation: TensorOperationInvocation<'_, ReferenceDeviceBuffer>,
+    ) -> Result<Option<EncodedDeviceOperation<ReferenceDeviceCommand>>, OperationFailure> {
+        let identity = invocation.participants()[0].identity().clone();
+        encode_tensor_dense_linear(invocation)
+            .map(EncodedDeviceOperation::compute)
+            .map(Some)
+            .map_err(|message| provider_failure(identity, message))
+    }
+}
+
+fn encode_tensor_dense_linear(
+    invocation: TensorOperationInvocation<'_, ReferenceDeviceBuffer>,
+) -> Result<ReferenceDeviceCommand, String> {
+    let [participant] = invocation.participants() else {
+        return Err("reference tensor dense-linear requires one participant".to_owned());
+    };
+    if invocation.operation().id.as_str() != DENSE_LINEAR_OPERATION_ID
+        || !matches!(participant.work(), NodeWorkContract::Fixed)
+        || !invocation.resource_work_shape().resource_work().is_tensor()
+    {
+        return Err("reference tensor dense-linear requires its fixed tensor contract".to_owned());
+    }
+    let in_features = dimension(participant.attributes(), "in_features")?;
+    let out_features = dimension(participant.attributes(), "out_features")?;
+    validate_participant_signature(participant, in_features, out_features)?;
+    let input = binding(participant.bindings(), ResolvedValueRole::Input, 0)?;
+    let weight = binding(participant.bindings(), ResolvedValueRole::Input, 1)?;
+    let output = binding(participant.bindings(), ResolvedValueRole::Output, 0)?;
+    let launch = reference_launch(
+        contiguous_region(participant, input)?,
+        contiguous_region(participant, weight)?,
+        contiguous_region(participant, output)?,
+        input.tensor().dimensions()[0],
+        in_features,
+        out_features,
+    )?;
+    ReferenceDeviceCommand::dense_tensor(launch).map_err(|error| error.to_string())
 }
 
 fn encode_dense_linear(
@@ -228,8 +269,8 @@ fn encode_dense_linear(
         .map_err(|error| error.to_string())
 }
 
-fn validate_participant_signature(
-    participant: &ferrum_runtime::OperationInvocation<'_, ReferenceDeviceBuffer>,
+fn validate_participant_signature<'a, W: InvocationWorkProjection<'a>>(
+    participant: &ferrum_runtime::OperationInvocation<'a, ReferenceDeviceBuffer, W>,
     in_features: usize,
     out_features: usize,
 ) -> Result<(), String> {
@@ -293,8 +334,8 @@ fn reference_launch(
     })
 }
 
-fn contiguous_region(
-    participant: &ferrum_runtime::OperationInvocation<'_, ReferenceDeviceBuffer>,
+fn contiguous_region<'a, W: InvocationWorkProjection<'a>>(
+    participant: &ferrum_runtime::OperationInvocation<'a, ReferenceDeviceBuffer, W>,
     binding: &ResolvedValueBinding,
 ) -> Result<super::runtime::ReferenceBufferRegion, String> {
     let [component] = binding.storage().components() else {

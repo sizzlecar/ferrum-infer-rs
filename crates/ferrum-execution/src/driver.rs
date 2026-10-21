@@ -1350,7 +1350,7 @@ impl VNextReusableExecutionCatalogMissKey {
     }
 
     fn without_program_identity(
-        work_shape: &BatchWorkShape,
+        work_shape: ferrum_runtime::TokenBatchWorkView<'_>,
         reason: VNextReusableExecutionCatalogMissReason,
     ) -> Self {
         Self {
@@ -6805,6 +6805,9 @@ impl<R: DeviceRuntime> ProgramExecutor<R> {
                 .bind_work_shape(spans.to_vec())
                 .map_err(|error| FerrumError::backend(error.to_string()))?,
         );
+        let token_work = work_shape
+            .token_view()
+            .map_err(|error| FerrumError::backend(error.to_string()))?;
         let reusable_bucket_id = self
             .resolved_plan
             .execution_plan()
@@ -6816,9 +6819,9 @@ impl<R: DeviceRuntime> ProgramExecutor<R> {
                     let bucket = resolved.bucket();
                     bucket.class_id().as_str() == kind.reusable_execution_class()
                         && bucket.capacity().covers(
-                            work_shape.immediate_sequences(),
-                            work_shape.immediate_tokens(),
-                            work_shape.immediate_pages(),
+                            token_work.immediate_sequences(),
+                            token_work.immediate_tokens(),
+                            token_work.immediate_pages(),
                         )
                 })
             })
@@ -7458,9 +7461,17 @@ impl<R: DeviceRuntime> ProgramExecutor<R> {
                         }
                     }
                     None if catalog.is_some() => {
+                        let token_work = match wave.claimed_backing().work_shape().token_view() {
+                            Ok(work) => work,
+                            Err(error) => {
+                                return DispatchOutcome::QuiescentFailure(FerrumError::backend(
+                                    error.to_string(),
+                                ));
+                            }
+                        };
                         reusable_catalog_miss = Some(
                             VNextReusableExecutionCatalogMissKey::without_program_identity(
-                                wave.claimed_backing().work_shape(),
+                                token_work,
                                 VNextReusableExecutionCatalogMissReason::ProgramIdentityUnavailable,
                             ),
                         );

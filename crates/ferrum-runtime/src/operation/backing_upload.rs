@@ -16,11 +16,64 @@ pub(super) fn encode_submission_wave_backing_upload<R>(
     logical_offset_bytes: u64,
     bytes: &[u8],
     context: &'static str,
-    mut push: impl FnMut(R::Command),
+    push: impl FnMut(R::Command),
 ) -> Result<usize, SubmissionWaveDispatchError<R>>
 where
     R: DeviceRuntime,
 {
+    encode_backing_upload(
+        runtime,
+        identity,
+        backing,
+        expected_usage,
+        element_type,
+        logical_offset_bytes,
+        bytes,
+        None,
+        context,
+        push,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn encode_submission_wave_managed_backing_upload<R: DeviceRuntime>(
+    runtime: &R,
+    identity: &ExecutionIdentityEnvelope,
+    backing: &LogicalBackingBufferView<'_, R::Buffer>,
+    expected_usage: BufferUsage,
+    element_type: ElementType,
+    logical_offset_bytes: u64,
+    bytes: &crate::ManagedHostBytes,
+    context: &'static str,
+    push: impl FnMut(R::Command),
+) -> Result<usize, SubmissionWaveDispatchError<R>> {
+    encode_backing_upload(
+        runtime,
+        identity,
+        backing,
+        expected_usage,
+        element_type,
+        logical_offset_bytes,
+        bytes.bytes(),
+        Some(bytes),
+        context,
+        push,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn encode_backing_upload<R: DeviceRuntime>(
+    runtime: &R,
+    identity: &ExecutionIdentityEnvelope,
+    backing: &LogicalBackingBufferView<'_, R::Buffer>,
+    expected_usage: BufferUsage,
+    element_type: ElementType,
+    logical_offset_bytes: u64,
+    bytes: &[u8],
+    managed: Option<&crate::ManagedHostBytes>,
+    context: &'static str,
+    mut push: impl FnMut(R::Command),
+) -> Result<usize, SubmissionWaveDispatchError<R>> {
     let byte_len = u64::try_from(bytes.len()).map_err(|_| {
         SubmissionWaveDispatchError::Contract(invalid_operation(format!(
             "{context} byte length exceeds u64"
@@ -104,17 +157,31 @@ where
             }
             let layout = HostTransferLayout::new(element_type, piece_bytes / element_bytes)
                 .map_err(SubmissionWaveDispatchError::Contract)?;
-            let command = runtime
-                .encode_upload(
-                    &bytes[source_start..source_end],
-                    layout,
-                    segment.buffer(),
-                    destination_offset,
-                )
+            let command_result = if let Some(managed) = managed {
+                let source = managed.slice(source_start..source_end).map_err(|error| {
+                    SubmissionWaveDispatchError::Contract(invalid_operation(error.to_string()))
+                })?;
+                runtime.encode_managed_upload(source, layout, segment.buffer(), destination_offset)
+            } else {
+                runtime
+                    .encode_upload(
+                        &bytes[source_start..source_end],
+                        layout,
+                        segment.buffer(),
+                        destination_offset,
+                    )
+                    .map(Some)
+            };
+            let command = command_result
                 .map_err(|error| {
                     classify_device_error(runtime, identity.clone(), &error)
                         .map(SubmissionWaveDispatchError::InputUpload)
                         .unwrap_or_else(SubmissionWaveDispatchError::Contract)
+                })?
+                .ok_or_else(|| {
+                    SubmissionWaveDispatchError::Contract(invalid_operation(
+                        "backend declined owner-retaining managed upload",
+                    ))
                 })?;
             push(command);
             command_count = command_count.checked_add(1).ok_or_else(|| {

@@ -89,7 +89,9 @@ impl CpuDeviceCommand {
         self.batching_form = work.batching_form();
         self.participant_start = work.participant_start();
         self.participant_count = work.participant_count();
-        self.token_count = work.token_count();
+        self.token_count = work.token_count().ok_or_else(|| {
+            CpuRuntimeError::new("backend does not support tensor logical attribution")
+        })?;
         Ok(self)
     }
 

@@ -347,6 +347,7 @@ impl ResourcePoolIdentity {
 /// This is trusted output and intentionally cannot be deserialized directly.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct StaticProvisioningBinding {
+    pub(super) work_limits: crate::RuntimeWorkLimits,
     pub(super) pool_identity: ResourcePoolIdentity,
     pub(super) plan_id: PlanId,
     pub(super) plan_hash: PlanHash,
@@ -362,6 +363,9 @@ pub struct StaticProvisioningBinding {
 }
 
 impl StaticProvisioningBinding {
+    pub const fn work_limits(&self) -> crate::RuntimeWorkLimits {
+        self.work_limits
+    }
     pub fn pool_identity(&self) -> &ResourcePoolIdentity {
         &self.pool_identity
     }

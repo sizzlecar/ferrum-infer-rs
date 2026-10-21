@@ -363,21 +363,22 @@ fn segment_compile_current_state_extent_accepts_real_growth_beyond_canonical_min
         .bind(&fixture.resolved, wave.nodes()[0].node_id())
         .unwrap();
     let node = identity.materialize_node(0).unwrap();
-    let invocation = BatchedOperationInvocation::from_resources(
-        fixture.runtime.as_ref(),
-        &fixture.resolved,
-        provider.dispatch(),
-        &identity,
-        node,
-        OperationInvocationResources::Wave {
-            wave: &wave,
-            node_index: 0,
-        },
-        active.iter(),
-        false,
-        true,
-    )
-    .unwrap();
+    let invocation =
+        BatchedOperationInvocation::<_, crate::TokenInvocationWork<'_>>::from_resources(
+            fixture.runtime.as_ref(),
+            &fixture.resolved,
+            provider.dispatch(),
+            &identity,
+            node,
+            OperationInvocationResources::Wave {
+                wave: &wave,
+                node_index: 0,
+            },
+            active.iter(),
+            false,
+            true,
+        )
+        .unwrap();
     let view = invocation.participants()[0]
         .views()
         .iter()

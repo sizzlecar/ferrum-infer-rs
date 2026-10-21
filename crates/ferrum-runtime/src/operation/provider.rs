@@ -240,6 +240,8 @@ pub struct OperationProviderDescriptor {
     operation_fingerprint: String,
     provider_implementation_fingerprint: String,
     execution_semantics: ProviderExecutionSemantics,
+    #[serde(default)]
+    fixed_tensor_work: bool,
     #[serde(skip_serializing_if = "ProviderCheckpointCapability::is_unsupported")]
     checkpoint: ProviderCheckpointCapability,
     version: ContractVersion,
@@ -261,6 +263,8 @@ struct OperationProviderDescriptorWire {
     operation_fingerprint: String,
     provider_implementation_fingerprint: String,
     execution_semantics: ProviderExecutionSemantics,
+    #[serde(default)]
+    fixed_tensor_work: bool,
     #[serde(default)]
     checkpoint: ProviderCheckpointCapability,
     version: ContractVersion,
@@ -298,7 +302,8 @@ impl<'de> Deserialize<'de> for OperationProviderDescriptor {
             wire.resource_estimator_implementation_fingerprint,
         )
         .map_err(serde::de::Error::custom)?
-        .with_checkpoint_capability(wire.checkpoint);
+        .with_checkpoint_capability(wire.checkpoint)
+        .with_fixed_tensor_work(wire.fixed_tensor_work);
         if descriptor.dynamic_storage_bindings != original_bindings {
             return Err(serde::de::Error::custom(
                 "provider storage binding requirements are not canonical",
@@ -357,6 +362,7 @@ impl OperationProviderDescriptor {
             operation_fingerprint,
             provider_implementation_fingerprint,
             execution_semantics,
+            fixed_tensor_work: false,
             checkpoint: ProviderCheckpointCapability::Unsupported,
             version,
             device_id,
@@ -368,6 +374,16 @@ impl OperationProviderDescriptor {
             resource_estimator_version,
             resource_estimator_implementation_fingerprint,
         })
+    }
+
+    /// Opts this exact implementation into fixed tensor invocation.
+    pub fn with_fixed_tensor_work(mut self, supported: bool) -> Self {
+        self.fixed_tensor_work = supported;
+        self
+    }
+
+    pub const fn supports_fixed_tensor_work(&self) -> bool {
+        self.fixed_tensor_work
     }
 
     pub fn provider_id(&self) -> &ProviderId {

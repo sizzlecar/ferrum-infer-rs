@@ -1326,8 +1326,10 @@ impl RuntimePolicy for AdversarialRuntimePolicy {
         self.maximum_active_sequences
     }
 
-    fn maximum_scheduled_tokens(&self) -> u64 {
-        self.maximum_scheduled_tokens
+    fn work_limits(&self) -> crate::RuntimeWorkLimits {
+        crate::RuntimeWorkLimits::Tokens {
+            maximum_scheduled_tokens: self.maximum_scheduled_tokens,
+        }
     }
 
     fn attention_execution_policy(&self) -> ferrum_types::AttentionExecutionPolicy {

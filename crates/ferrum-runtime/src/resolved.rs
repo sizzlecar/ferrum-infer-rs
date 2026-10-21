@@ -1365,8 +1365,10 @@ impl RuntimePolicy for ResolvedRuntimePolicy {
         self.memory.maximum_active_sequences
     }
 
-    fn maximum_scheduled_tokens(&self) -> u64 {
-        self.admission.maximum_scheduled_tokens
+    fn work_limits(&self) -> crate::RuntimeWorkLimits {
+        crate::RuntimeWorkLimits::Tokens {
+            maximum_scheduled_tokens: self.admission.maximum_scheduled_tokens,
+        }
     }
 
     fn attention_execution_policy(&self) -> AttentionExecutionPolicy {

@@ -388,8 +388,14 @@ impl SubmissionWaveDeterminismRestoreLayout {
             || wave.nodes().iter().enumerate().any(|(node_index, node)| {
                 node.plan_evidence_ref().plan_hash() != witness_plan.plan_hash()
                     || node.participant_count() as usize != participant_count
-                    || node.work_shape().participant_work().len() != participant_count
-                    || node.work_shape().participant_token_ranges().len() != participant_count
+                    || !node
+                        .work_shape()
+                        .participant_work()
+                        .is_ok_and(|work| work.len() == participant_count)
+                    || !node
+                        .work_shape()
+                        .participant_token_ranges()
+                        .is_ok_and(|ranges| ranges.len() == participant_count)
                     || batch_identity.node_id_at(node_index) != Some(node.node_id())
                     || batch_identity.node_participant_count(node_index) != Some(participant_count)
             })
@@ -986,7 +992,7 @@ fn logical_work_fingerprints<R: DeviceRuntime>(
         .map(|node| {
             let physical_spans = node
                 .work_shape()
-                .participant_work()
+                .participant_work()?
                 .iter()
                 .map(|work| work.token_span().clone())
                 .collect::<Vec<_>>();

@@ -11,9 +11,10 @@ use ferrum_runtime::{
     DeviceCommandLogicalWork, DeviceCommandPhase, DeviceComputePathRequirement, DeviceDescriptor,
     DeviceErrorReport, DeviceExecutionPath, DeviceNativeOperationId, DeviceNativeWorkAttribution,
     DeviceRuntime, DeviceSubmissionAttribution, DeviceTerminal, DeviceTerminalReceipt,
-    DeviceTimingMode, ElementType, FenceIndeterminate, FenceQuery, HostTransferLayout, StreamState,
-    VNextError, DENSE_LINEAR_F16_CAPABILITY_ID, DEVICE_COPY_NATIVE_OPERATION_ID,
-    DEVICE_ZERO_NATIVE_OPERATION_ID, HOST_UPLOAD_NATIVE_OPERATION_ID,
+    DeviceTimingMode, ElementType, FenceIndeterminate, FenceQuery, HostTransferLayout,
+    ManagedHostBuffer, ManagedHostBytes, StreamState, VNextError, DENSE_LINEAR_F16_CAPABILITY_ID,
+    DEVICE_COPY_NATIVE_OPERATION_ID, DEVICE_ZERO_NATIVE_OPERATION_ID,
+    HOST_UPLOAD_NATIVE_OPERATION_ID,
 };
 use half::f16;
 
@@ -206,6 +207,10 @@ enum ReferenceCommandKind {
         source: Box<[u8]>,
         destination: ReferenceBufferRegion,
     },
+    ManagedUpload {
+        source: ManagedHostBytes,
+        destination: ReferenceBufferRegion,
+    },
     Zero {
         destination: ReferenceBufferRegion,
     },
@@ -217,10 +222,7 @@ enum ReferenceCommandKind {
 /// An owned, fully validated command for the synchronous reference runtime.
 pub struct ReferenceDeviceCommand {
     operation: &'static str,
-    batching_form: DeviceBatchingForm,
-    participant_start: u32,
-    participant_count: u32,
-    token_count: u64,
+    logical_work: Option<DeviceCommandLogicalWork>,
     compute_dispatch_count: u64,
     transfer_command_count: u64,
     kind: ReferenceCommandKind,
@@ -231,6 +233,7 @@ impl fmt::Debug for ReferenceDeviceCommand {
         let kind = match self.kind {
             ReferenceCommandKind::Copy { .. } => "copy",
             ReferenceCommandKind::Upload { .. } => "upload",
+            ReferenceCommandKind::ManagedUpload { .. } => "managed_upload",
             ReferenceCommandKind::Zero { .. } => "zero",
             ReferenceCommandKind::DenseLinear { .. } => "dense_linear",
         };
@@ -238,10 +241,7 @@ impl fmt::Debug for ReferenceDeviceCommand {
             .debug_struct("ReferenceDeviceCommand")
             .field("kind", &kind)
             .field("operation", &self.operation)
-            .field("batching_form", &self.batching_form)
-            .field("participant_start", &self.participant_start)
-            .field("participant_count", &self.participant_count)
-            .field("token_count", &self.token_count)
+            .field("logical_work", &self.logical_work)
             .finish()
     }
 }
@@ -265,10 +265,10 @@ impl ReferenceDeviceCommand {
         })?;
         Ok(Self {
             operation: "vnext_dense_linear",
-            batching_form,
-            participant_start: 0,
-            participant_count,
-            token_count,
+            logical_work: Some(
+                DeviceCommandLogicalWork::new(batching_form, participant_count, token_count)
+                    .map_err(|error| ReferenceDeviceRuntimeError::contract(error.to_string()))?,
+            ),
             compute_dispatch_count,
             transfer_command_count: 0,
             kind: ReferenceCommandKind::DenseLinear {
@@ -277,13 +277,47 @@ impl ReferenceDeviceCommand {
         })
     }
 
+    pub(crate) fn dense_tensor(
+        launch: ReferenceDenseLinearLaunch,
+    ) -> Result<Self, ReferenceDeviceRuntimeError> {
+        let rows = u64::try_from(launch.rows).map_err(|_| {
+            ReferenceDeviceRuntimeError::contract("reference tensor rows exceed u64")
+        })?;
+        let in_features = u64::try_from(launch.in_features).map_err(|_| {
+            ReferenceDeviceRuntimeError::contract("reference tensor input width exceeds u64")
+        })?;
+        let out_features = u64::try_from(launch.out_features).map_err(|_| {
+            ReferenceDeviceRuntimeError::contract("reference tensor output width exceeds u64")
+        })?;
+        let element_count = rows.checked_mul(out_features).ok_or_else(|| {
+            ReferenceDeviceRuntimeError::contract("reference tensor element count overflows")
+        })?;
+        let arithmetic_operations = element_count
+            .checked_mul(in_features)
+            .and_then(|operations| operations.checked_mul(2))
+            .ok_or_else(|| {
+                ReferenceDeviceRuntimeError::contract(
+                    "reference tensor arithmetic operation count overflows",
+                )
+            })?;
+        let logical_work =
+            DeviceCommandLogicalWork::tensor(element_count, arithmetic_operations)
+                .map_err(|error| ReferenceDeviceRuntimeError::contract(error.to_string()))?;
+        Ok(Self {
+            operation: "vnext_dense_linear",
+            logical_work: Some(logical_work),
+            compute_dispatch_count: 1,
+            transfer_command_count: 0,
+            kind: ReferenceCommandKind::DenseLinear {
+                launches: vec![launch].into_boxed_slice(),
+            },
+        })
+    }
+
     fn transfer(operation: &'static str, kind: ReferenceCommandKind) -> Self {
         Self {
             operation,
-            batching_form: DeviceBatchingForm::Scalar,
-            participant_start: 0,
-            participant_count: 0,
-            token_count: 0,
+            logical_work: None,
             compute_dispatch_count: 0,
             transfer_command_count: 1,
             kind,
@@ -294,15 +328,12 @@ impl ReferenceDeviceCommand {
         mut self,
         logical_work: DeviceCommandLogicalWork,
     ) -> Result<Self, ReferenceDeviceRuntimeError> {
-        if self.participant_count != 0 || self.token_count != 0 {
+        if self.logical_work.is_some() {
             return Err(ReferenceDeviceRuntimeError::contract(
                 "reference core logical work cannot replace provider command attribution",
             ));
         }
-        self.batching_form = logical_work.batching_form();
-        self.participant_start = logical_work.participant_start();
-        self.participant_count = logical_work.participant_count();
-        self.token_count = logical_work.token_count();
+        self.logical_work = Some(logical_work);
         Ok(self)
     }
 
@@ -317,21 +348,34 @@ impl ReferenceDeviceCommand {
                 "reference command attribution has a non-portable native operation identity",
             )
         })?;
-        DeviceNativeWorkAttribution::with_participant_range(
-            command_index,
-            node_index,
-            phase,
-            native_op_id,
-            DeviceExecutionPath::Eager,
-            self.batching_form,
-            self.participant_start,
-            self.participant_count,
-            self.token_count,
-            self.compute_dispatch_count,
-            self.transfer_command_count,
-            None,
-        )
-        .ok_or_else(|| {
+        let attribution = if let Some(logical_work) = self.logical_work {
+            DeviceNativeWorkAttribution::with_logical_work(
+                command_index,
+                node_index,
+                phase,
+                native_op_id,
+                DeviceExecutionPath::Eager,
+                logical_work,
+                self.compute_dispatch_count,
+                self.transfer_command_count,
+            )
+        } else {
+            DeviceNativeWorkAttribution::with_participant_range(
+                command_index,
+                node_index,
+                phase,
+                native_op_id,
+                DeviceExecutionPath::Eager,
+                DeviceBatchingForm::Scalar,
+                0,
+                0,
+                0,
+                self.compute_dispatch_count,
+                self.transfer_command_count,
+                None,
+            )
+        };
+        attribution.ok_or_else(|| {
             ReferenceDeviceRuntimeError::contract(
                 "reference command attribution has invalid native work metadata",
             )
@@ -348,6 +392,7 @@ impl ReferenceDeviceCommand {
                 destination.validate_runtime(runtime_instance)
             }
             ReferenceCommandKind::Upload { destination, .. }
+            | ReferenceCommandKind::ManagedUpload { destination, .. }
             | ReferenceCommandKind::Zero { destination } => {
                 destination.validate_runtime(runtime_instance)
             }
@@ -375,6 +420,16 @@ impl ReferenceDeviceCommand {
                 destination.write(source);
                 counters.uploaded_bytes.fetch_add(
                     u64::try_from(source.len()).expect("reference upload length fits u64"),
+                    Ordering::Relaxed,
+                );
+            }
+            ReferenceCommandKind::ManagedUpload {
+                source,
+                destination,
+            } => {
+                destination.write(source.bytes());
+                counters.uploaded_bytes.fetch_add(
+                    u64::try_from(source.len()).expect("reference managed upload length fits u64"),
                     Ordering::Relaxed,
                 );
             }
@@ -694,6 +749,48 @@ impl DeviceRuntime for ReferenceDeviceRuntime {
         ))
     }
 
+    fn supports_managed_tensor_io(&self) -> bool {
+        true
+    }
+
+    fn encode_managed_upload(
+        &self,
+        source: ManagedHostBytes,
+        source_layout: HostTransferLayout,
+        destination: &Self::Buffer,
+        destination_offset_bytes: u64,
+    ) -> Result<Option<Self::Command>, Self::Error> {
+        source_layout
+            .validate_bytes(source.len())
+            .map_err(|error| ReferenceDeviceRuntimeError::contract(error.to_string()))?;
+        if destination.runtime_instance != self.runtime_instance {
+            return Err(ReferenceDeviceRuntimeError::contract(
+                "reference managed upload belongs to another runtime",
+            ));
+        }
+        if source_layout.element_type() != destination.descriptor.element_type {
+            return Err(ReferenceDeviceRuntimeError::contract(
+                "reference managed upload layout differs from destination element type",
+            ));
+        }
+        let length = source_layout
+            .byte_len()
+            .map_err(|error| ReferenceDeviceRuntimeError::contract(error.to_string()))?;
+        let end = destination_offset_bytes
+            .checked_add(length)
+            .ok_or_else(|| {
+                ReferenceDeviceRuntimeError::contract("reference managed upload range overflows")
+            })?;
+        let destination = destination.region(destination_offset_bytes..end)?;
+        Ok(Some(ReferenceDeviceCommand::transfer(
+            HOST_UPLOAD_NATIVE_OPERATION_ID.as_str(),
+            ReferenceCommandKind::ManagedUpload {
+                source,
+                destination,
+            },
+        )))
+    }
+
     fn encode_zero(
         &self,
         destination: &Self::Buffer,
@@ -903,6 +1000,82 @@ impl DeviceRuntime for ReferenceDeviceRuntime {
         Ok(output)
     }
 
+    fn readback_managed_into(
+        &self,
+        stream: &mut Self::Stream,
+        source: &Self::Buffer,
+        region: CopyRegion,
+        output_layout: HostTransferLayout,
+        destination: &mut ManagedHostBuffer,
+    ) -> Result<bool, Self::Error> {
+        if stream.runtime_instance != self.runtime_instance
+            || source.runtime_instance != self.runtime_instance
+        {
+            return Err(ReferenceDeviceRuntimeError::contract(
+                "reference managed readback belongs to another runtime",
+            ));
+        }
+        if output_layout.element_type() != source.descriptor.element_type {
+            return Err(ReferenceDeviceRuntimeError::contract(
+                "reference managed readback layout differs from source element type",
+            ));
+        }
+        let piece_bytes = output_layout
+            .byte_len()
+            .map_err(|error| ReferenceDeviceRuntimeError::contract(error.to_string()))?;
+        if piece_bytes != region.length_bytes() {
+            return Err(ReferenceDeviceRuntimeError::contract(
+                "reference managed readback piece differs from its transfer layout",
+            ));
+        }
+        let output_bytes = u64::try_from(destination.as_ref().len()).map_err(|_| {
+            ReferenceDeviceRuntimeError::contract(
+                "reference managed readback destination exceeds u64",
+            )
+        })?;
+        let source_end = region
+            .source_offset_bytes()
+            .checked_add(region.length_bytes())
+            .filter(|&end| end <= source.descriptor.size_bytes)
+            .ok_or_else(|| {
+                ReferenceDeviceRuntimeError::contract(
+                    "reference managed readback source exceeds its admitted allocation",
+                )
+            })?;
+        let output_end = region
+            .destination_offset_bytes()
+            .checked_add(region.length_bytes())
+            .filter(|&end| end <= output_bytes)
+            .ok_or_else(|| {
+                ReferenceDeviceRuntimeError::contract(
+                    "reference managed readback destination exceeds its managed allocation",
+                )
+            })?;
+        let output_start = usize::try_from(region.destination_offset_bytes()).map_err(|_| {
+            ReferenceDeviceRuntimeError::contract("reference managed readback offset exceeds usize")
+        })?;
+        let output_end = usize::try_from(output_end).map_err(|_| {
+            ReferenceDeviceRuntimeError::contract("reference managed readback end exceeds usize")
+        })?;
+        let source = source.region(region.source_offset_bytes()..source_end)?;
+        if source.length_bytes != output_end - output_start {
+            return Err(ReferenceDeviceRuntimeError::contract(
+                "reference managed readback source and destination lengths differ",
+            ));
+        }
+        // All fallible validation precedes writes. This synchronous path copies
+        // directly into admitted host backing and never retains its borrow.
+        self.synchronize(stream)?;
+        let source_bytes = source.allocation.lock();
+        destination.as_mut()[output_start..output_end].copy_from_slice(
+            &source_bytes[source.offset_bytes..source.offset_bytes + source.length_bytes],
+        );
+        self.counters
+            .readback_bytes
+            .fetch_add(region.length_bytes(), Ordering::Relaxed);
+        Ok(true)
+    }
+
     fn describe_error(&self, error: &Self::Error) -> Result<DeviceErrorReport, VNextError> {
         DeviceErrorReport::new("reference_runtime", error.to_string(), false)
     }
@@ -939,7 +1112,10 @@ fn validate_submission_requirements(
 mod tests {
     use super::*;
     use crate::backend::reference::composition::reference_vnext_runtime_config;
-    use ferrum_runtime::{BufferUsage, DeviceId, ResourceId};
+    use ferrum_runtime::{
+        BufferUsage, DeviceId, DeviceLogicalWork, HostMemoryAccount, HostMemoryClass,
+        HostMemoryClassLimits, HostMemoryLimits, ResourceId,
+    };
 
     fn config() -> ReferenceDeviceRuntimeConfig {
         reference_vnext_runtime_config(
@@ -981,6 +1157,21 @@ mod tests {
             .expect("test buffer region")
             .write(contents);
         buffer
+    }
+
+    fn host_account(total: usize) -> HostMemoryAccount {
+        HostMemoryAccount::new(
+            HostMemoryLimits::new(
+                total,
+                HostMemoryClassLimits {
+                    input_preprocess_bytes: total,
+                    transfer_staging_bytes: total,
+                    output_bytes: total,
+                    weight_backing_bytes: total,
+                },
+            )
+            .unwrap(),
+        )
     }
 
     #[test]
@@ -1086,5 +1277,220 @@ mod tests {
                 HostTransferLayout::new(ElementType::F16, 3).expect("valid mismatched layout"),
             )
             .is_err());
+    }
+
+    #[test]
+    fn managed_upload_retains_the_actual_sliced_backing_until_command_drop() {
+        let runtime = ReferenceDeviceRuntime::new(config()).unwrap();
+        assert!(runtime.supports_managed_tensor_io());
+        let host = host_account(8);
+        let mut backing = host
+            .allocate_zeroed(HostMemoryClass::InputPreprocess, 8)
+            .unwrap();
+        backing
+            .as_mut()
+            .copy_from_slice(&[90, 91, 10, 11, 12, 13, 92, 93]);
+        let backing = backing.freeze();
+        let source = backing.slice(2..6).unwrap();
+        let destination = buffer(
+            &runtime,
+            "resource.reference.managed-upload",
+            &[0; 6],
+            16,
+            ElementType::U8,
+        );
+        let command = runtime
+            .encode_managed_upload(
+                source,
+                HostTransferLayout::new(ElementType::U8, 4).unwrap(),
+                &destination,
+                1,
+            )
+            .unwrap()
+            .unwrap();
+        drop(backing);
+        assert_eq!(host.usage().unwrap().committed_bytes(), 8);
+        assert_eq!(runtime.snapshot().uploaded_bytes, 0);
+        command.execute(&runtime.counters);
+        assert_eq!(
+            destination.region(0..6).unwrap().read(),
+            [0, 10, 11, 12, 13, 0]
+        );
+        assert_eq!(runtime.snapshot().uploaded_bytes, 4);
+        assert_eq!(host.usage().unwrap().committed_bytes(), 8);
+        drop(command);
+        assert_eq!(host.usage().unwrap().committed_bytes(), 0);
+    }
+
+    #[test]
+    fn managed_upload_rejects_foreign_runtime_and_overflow_without_a_command() {
+        let runtime = ReferenceDeviceRuntime::new(config()).unwrap();
+        let foreign = ReferenceDeviceRuntime::new(config()).unwrap();
+        let host = host_account(4);
+        let source = host
+            .allocate_zeroed(HostMemoryClass::InputPreprocess, 4)
+            .unwrap()
+            .freeze();
+        let local_destination = buffer(
+            &runtime,
+            "resource.reference.local",
+            &[0; 4],
+            16,
+            ElementType::U8,
+        );
+        let foreign_destination = buffer(
+            &foreign,
+            "resource.reference.foreign",
+            &[0; 4],
+            16,
+            ElementType::U8,
+        );
+        let layout = HostTransferLayout::new(ElementType::U8, 4).unwrap();
+        assert!(runtime
+            .encode_managed_upload(source.clone(), layout, &foreign_destination, 0)
+            .is_err());
+        assert!(runtime
+            .encode_managed_upload(source.clone(), layout, &local_destination, u64::MAX)
+            .is_err());
+        assert!(runtime
+            .encode_managed_upload(source.clone(), layout, &local_destination, 1)
+            .is_err());
+        assert_eq!(host.usage().unwrap().committed_bytes(), 4);
+        assert_eq!(runtime.snapshot().uploaded_bytes, 0);
+        drop(source);
+        assert_eq!(host.usage().unwrap().committed_bytes(), 0);
+    }
+
+    #[test]
+    fn managed_readback_preserves_destination_on_validation_failure_and_copies_exact_region() {
+        let runtime = ReferenceDeviceRuntime::new(config()).unwrap();
+        let foreign = ReferenceDeviceRuntime::new(config()).unwrap();
+        let host = host_account(6);
+        let source = buffer(
+            &runtime,
+            "resource.reference.managed-readback",
+            &[10, 11, 12, 13],
+            16,
+            ElementType::U8,
+        );
+        let foreign_source = buffer(
+            &foreign,
+            "resource.reference.foreign-readback",
+            &[10, 11, 12, 13],
+            16,
+            ElementType::U8,
+        );
+        let mut destination = host.allocate_zeroed(HostMemoryClass::Output, 6).unwrap();
+        destination.as_mut().fill(0xa5);
+        let mut stream = runtime.create_stream().unwrap();
+        // The layout describes this two-byte piece; destination is the complete
+        // six-byte host result, and the copy starts at a nonzero host offset.
+        let layout = HostTransferLayout::new(ElementType::U8, 2).unwrap();
+        let valid_region = CopyRegion::new(1, 2, 2).unwrap();
+        for (read_source, region, read_layout) in [
+            (&foreign_source, valid_region, layout),
+            (&source, CopyRegion::new(3, 0, 2).unwrap(), layout),
+            (&source, CopyRegion::new(0, 5, 2).unwrap(), layout),
+            (
+                &source,
+                valid_region,
+                HostTransferLayout::new(ElementType::F16, 1).unwrap(),
+            ),
+            (
+                &source,
+                valid_region,
+                HostTransferLayout::new(ElementType::U8, 1).unwrap(),
+            ),
+        ] {
+            assert!(runtime
+                .readback_managed_into(
+                    &mut stream,
+                    read_source,
+                    region,
+                    read_layout,
+                    &mut destination
+                )
+                .is_err());
+            assert_eq!(destination.as_ref(), &[0xa5; 6]);
+            assert_eq!(runtime.snapshot().readback_bytes, 0);
+        }
+        assert!(runtime
+            .readback_managed_into(&mut stream, &source, valid_region, layout, &mut destination)
+            .unwrap());
+        assert_eq!(destination.as_ref(), &[0xa5, 0xa5, 11, 12, 0xa5, 0xa5]);
+        assert_eq!(runtime.snapshot().readback_bytes, 2);
+        assert_eq!(host.usage().unwrap().committed_bytes(), 6);
+        drop(destination);
+        assert_eq!(host.usage().unwrap().committed_bytes(), 0);
+    }
+
+    #[test]
+    fn fixed_tensor_dense_reports_tensor_work_and_computes_rectangular_f16_values() {
+        let runtime = ReferenceDeviceRuntime::new(config()).unwrap();
+        let encode = |values: &[f32]| -> Vec<u8> {
+            values
+                .iter()
+                .flat_map(|value| f16::from_f32(*value).to_bits().to_le_bytes())
+                .collect()
+        };
+        let input = buffer(
+            &runtime,
+            "resource.reference.tensor-input",
+            &encode(&[1., 2., 3., -1., 0., 2.]),
+            16,
+            ElementType::F16,
+        );
+        let weight = buffer(
+            &runtime,
+            "resource.reference.tensor-weight",
+            &encode(&[2., -1., 1., 1., 3., -2.]),
+            16,
+            ElementType::F16,
+        );
+        let output = buffer(
+            &runtime,
+            "resource.reference.tensor-output",
+            &[0; 8],
+            16,
+            ElementType::F16,
+        );
+        let launch = || ReferenceDenseLinearLaunch {
+            input: input.region(0..12).unwrap(),
+            weight: weight.region(0..12).unwrap(),
+            output: output.region(0..8).unwrap(),
+            rows: 2,
+            in_features: 3,
+            out_features: 2,
+        };
+        let command = ReferenceDeviceCommand::dense_tensor(launch()).unwrap();
+        let attribution = command
+            .attribution(0, Some(0), DeviceCommandPhase::Compute)
+            .unwrap();
+        assert_eq!(attribution.token_count(), None);
+        assert_eq!(
+            attribution.logical_work(),
+            DeviceLogicalWork::Tensor {
+                element_count: 4,
+                arithmetic_operations: 24
+            }
+        );
+        assert_eq!(attribution.participant_count(), 1);
+        assert_eq!(attribution.compute_dispatch_count(), 1);
+        command.execute(&runtime.counters);
+        assert_eq!(
+            output.region(0..8).unwrap().read(),
+            encode(&[3., 1., 0., -5.])
+        );
+        assert_eq!(runtime.snapshot().dense_linear_launches, 1);
+        let token_command =
+            ReferenceDeviceCommand::dense_linear(vec![launch()], DeviceBatchingForm::Scalar, 1, 2)
+                .unwrap();
+        assert_eq!(
+            token_command
+                .attribution(0, Some(0), DeviceCommandPhase::Compute)
+                .unwrap()
+                .token_count(),
+            Some(2)
+        );
     }
 }

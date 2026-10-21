@@ -396,7 +396,7 @@ impl Fixture {
                 "verify actual row merge, not offered concurrency"
             );
             assert_eq!(count, participants);
-            assert_eq!(token_count, u64::from(participants));
+            assert_eq!(token_count, Some(u64::from(participants)));
             let launches = if packed { 1 } else { u64::from(participants) };
             let mmq = self.head.quantized()
                 && !self.head.transformed()
@@ -415,7 +415,7 @@ impl Fixture {
                 assert_eq!(dependency.batching_form(), DeviceBatchingForm::Scalar);
                 assert_eq!(dependency.participant_start(), 0);
                 assert_eq!(dependency.participant_count(), 0);
-                assert_eq!(dependency.token_count(), 0);
+                assert_eq!(dependency.token_count(), Some(0));
                 let work = (
                     dependency.compute_dispatch_count(),
                     dependency.transfer_command_count(),

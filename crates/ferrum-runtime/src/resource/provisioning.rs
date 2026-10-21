@@ -299,6 +299,7 @@ impl ExecutionPlan {
             admission_generation: generation,
         };
         let binding = StaticProvisioningBinding {
+            work_limits: payload.work_limits(),
             pool_identity,
             plan_id: payload.plan_id().clone(),
             plan_hash: self.plan_hash().clone(),

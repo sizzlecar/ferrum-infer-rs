@@ -70,11 +70,16 @@ where
             "scratch workspace logical participants differ from its resource work",
         )));
     }
-    let logical_work = DeviceCommandLogicalWork::new(
-        DeviceBatchingForm::Packed,
-        participant_count,
-        work.immediate_tokens(),
-    )
+    let logical_work = if work.is_tensor() {
+        DeviceCommandLogicalWork::tensor(required_bytes, 0)
+    } else {
+        DeviceCommandLogicalWork::new(
+            DeviceBatchingForm::Packed,
+            participant_count,
+            work.immediate_tokens()
+                .map_err(OperationDispatchError::Contract)?,
+        )
+    }
     .map_err(OperationDispatchError::Contract)?;
     let identity = participant.identity().clone();
     let mut encoded_bytes = 0_u64;

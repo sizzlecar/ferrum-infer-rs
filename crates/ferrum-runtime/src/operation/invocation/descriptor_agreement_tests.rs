@@ -79,7 +79,7 @@ fn descriptor_agreement_rechecks_runtime_metadata_on_later_participants() {
                                     .store(true, Ordering::Release);
                             }
                         });
-                        BatchedOperationInvocation::from_resources(
+                        BatchedOperationInvocation::<_, crate::TokenInvocationWork<'_>>::from_resources(
                             fixture.runtime.as_ref(),
                             &fixture.resolved,
                             provider.dispatch(),
@@ -154,7 +154,10 @@ fn descriptor_agreement_rechecks_runtime_between_the_two_comparisons() {
                                         .store(comparison, Ordering::Release);
                                 }
                             });
-                            let result = BatchedOperationInvocation::from_resources(
+                            let result = BatchedOperationInvocation::<
+                                _,
+                                crate::TokenInvocationWork<'_>,
+                            >::from_resources(
                                 fixture.runtime.as_ref(),
                                 &fixture.resolved,
                                 provider.dispatch(),
@@ -249,7 +252,7 @@ fn descriptor_agreement_rechecks_each_plan_operand_on_later_participants() {
                                 resolved.switch.set(true);
                             }
                         });
-                        let result = BatchedOperationInvocation::from_resources(
+                        let result = BatchedOperationInvocation::<_, crate::TokenInvocationWork<'_>>::from_resources(
                             fixture.runtime.as_ref(),
                             &resolved,
                             provider.dispatch(),
@@ -289,7 +292,7 @@ fn paired_live_wave_descriptor_agreement() {
             let node = identity.materialize_node(0).unwrap();
             let make = |reference| {
                 with_reference_comparison(reference, || {
-                    BatchedOperationInvocation::from_resources(
+                    BatchedOperationInvocation::<_, crate::TokenInvocationWork<'_>>::from_resources(
                         fixture.runtime.as_ref(),
                         &fixture.resolved,
                         provider.dispatch(),

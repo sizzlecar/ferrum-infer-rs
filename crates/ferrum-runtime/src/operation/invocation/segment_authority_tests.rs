@@ -54,7 +54,7 @@ fn segment_wave_authority_matches_constructor_and_rejects_full_or_reordered_acti
                 .unwrap();
             let node = identity.materialize_node(node_index).unwrap();
             let make = |bindings: &[TrustedActiveSequenceBinding]| {
-                BatchedOperationInvocation::from_resources(
+                BatchedOperationInvocation::<_, crate::TokenInvocationWork<'_>>::from_resources(
                     fixture.runtime.as_ref(),
                     &fixture.resolved,
                     provider.dispatch(),
@@ -168,21 +168,23 @@ fn segment_wave_authority_rejects_previous_frames_and_replaced_live_sessions() {
         .registry
         .bind(&fixture.resolved, wave.nodes()[0].node_id())
         .unwrap();
-    assert!(BatchedOperationInvocation::from_resources(
-        fixture.runtime.as_ref(),
-        &fixture.resolved,
-        provider.dispatch(),
-        &identity,
-        identity.materialize_node(0).unwrap(),
-        OperationInvocationResources::Wave {
-            wave: &wave,
-            node_index: 0
-        },
-        mixed.iter(),
-        false,
-        true,
-    )
-    .is_err());
+    assert!(
+        BatchedOperationInvocation::<_, crate::TokenInvocationWork<'_>>::from_resources(
+            fixture.runtime.as_ref(),
+            &fixture.resolved,
+            provider.dispatch(),
+            &identity,
+            identity.materialize_node(0).unwrap(),
+            OperationInvocationResources::Wave {
+                wave: &wave,
+                node_index: 0
+            },
+            mixed.iter(),
+            false,
+            true,
+        )
+        .is_err()
+    );
     drop(provider);
     drop(wave);
     step.try_retire_normal().unwrap();

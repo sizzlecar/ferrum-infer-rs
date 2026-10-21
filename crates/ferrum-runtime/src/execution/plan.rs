@@ -3,24 +3,23 @@ use super::{
     joint_candidate_components, joint_partial_precedes, node_weight_requirements,
     provider_resource_estimator_input_fingerprint, static_contiguous_storage_profile,
     storage_incompatible_resource_ids, tensor_storage_layout_fingerprint,
-    validate_active_sequence_ceiling, validate_program_bindings, validate_scheduled_token_ceiling,
-    validate_semantic_binding, workspace_base_id, workspace_storage_layout_fingerprint,
-    AliasPolicy, AllocationKind, AllocationLifetime, BTreeMap, BTreeSet, BufferUsage,
-    CanonicalValueBinding, CapabilityCatalog, CapabilityId, DimensionConstraint,
-    DynamicResourceDemand, DynamicResourceDescriptor, DynamicStorageContract,
-    DynamicStorageProfile, DynamicStorageRequirement, ElementType, ExecutionPlanPayload,
-    ExecutionWeightPlan, GlobalValueRange, JointComponentSolution, JointPartialSelection,
-    JointProviderCandidate, JointProviderStorageSelection, JointSelectionObjective, MemoryPlan,
-    NodeId, NodeTokenBindingProjection, NodeWorkContract, OperationDescriptor,
-    OperationRegistryAuthority, PlanBuildRequest, PlanExactAlias, PlanExactAliasKind, PlanHash,
-    PlanHashMaterial, PlanId, PlanNode, PlanNodeResolution, PlanProviderRejectReason,
-    PlanStateEffect, PreparedModelFamily, ProgramNode, ProgramNodeWorkSpec, ProgramValueId,
-    ProviderCompatibilityRequest, ProviderId, ProviderResourcePlan, ProviderSelection,
-    ProviderSelectionReason, ProviderWorkspaceScope, QuantizationFormatId, RejectedProvider,
-    ResolvedValueBinding, ResolvedValueRole, ResourceAllocation, ResourceId,
-    ReusableExecutionMemoryPlan, ReusableExecutionPolicy, RuntimePolicy, Serialize,
-    StateCapacityDemand, StateDependencyTracker, StateInitialization, StateLifetime,
-    StaticWeightTransformPlan, TensorAccess, TrustedExecutionWeightPlan, VNextError,
+    validate_active_sequence_ceiling, validate_program_bindings, validate_semantic_binding,
+    workspace_base_id, workspace_storage_layout_fingerprint, AliasPolicy, AllocationKind,
+    AllocationLifetime, BTreeMap, BTreeSet, BufferUsage, CanonicalValueBinding, CapabilityCatalog,
+    CapabilityId, DimensionConstraint, DynamicResourceDemand, DynamicResourceDescriptor,
+    DynamicStorageContract, DynamicStorageProfile, DynamicStorageRequirement, ElementType,
+    ExecutionPlanPayload, ExecutionWeightPlan, GlobalValueRange, JointComponentSolution,
+    JointPartialSelection, JointProviderCandidate, JointProviderStorageSelection,
+    JointSelectionObjective, MemoryPlan, NodeId, NodeTokenBindingProjection, NodeWorkContract,
+    OperationDescriptor, OperationRegistryAuthority, PlanBuildRequest, PlanExactAlias,
+    PlanExactAliasKind, PlanHash, PlanHashMaterial, PlanId, PlanNode, PlanNodeResolution,
+    PlanProviderRejectReason, PlanStateEffect, PreparedModelFamily, ProgramNode,
+    ProgramNodeWorkSpec, ProgramValueId, ProviderCompatibilityRequest, ProviderId,
+    ProviderResourcePlan, ProviderSelection, ProviderSelectionReason, ProviderWorkspaceScope,
+    QuantizationFormatId, RejectedProvider, ResolvedValueBinding, ResolvedValueRole,
+    ResourceAllocation, ResourceId, ReusableExecutionMemoryPlan, ReusableExecutionPolicy,
+    RuntimePolicy, Serialize, StateCapacityDemand, StateDependencyTracker, StateInitialization,
+    StateLifetime, StaticWeightTransformPlan, TensorAccess, TrustedExecutionWeightPlan, VNextError,
     ValueAllocationAccumulator, ValueResourceDemand, WeightFormatId, WeightSchema,
     EXECUTION_PLAN_SCHEMA, STATIC_WEIGHT_TRANSFORM_SCRATCH_ALIGNMENT_BYTES,
 };
@@ -43,6 +42,38 @@ pub struct ExecutionPlan {
 }
 
 impl ExecutionPlan {
+    pub(super) fn validate_work_domain<P: RuntimePolicy>(
+        family: &PreparedModelFamily,
+        policy: &P,
+    ) -> Result<(), VNextError> {
+        let tensor = matches!(
+            family.metadata(),
+            crate::ModelSemanticMetadata::TensorComponent
+        );
+        if tensor != policy.work_limits().is_tensor() {
+            return Err(invalid_plan(
+                "model semantics and runtime work domain disagree",
+            ));
+        }
+        if tensor
+            && (policy.maximum_active_sequences() != 1
+                || policy.reusable_execution_policy().is_some()
+                || policy.checkpoint_capacity_policy().is_some()
+                || family.program().checkpoint_inputs().is_some()
+                || family
+                    .program()
+                    .blocks()
+                    .iter()
+                    .flat_map(|block| &block.nodes)
+                    .any(|node| !matches!(node.work, ProgramNodeWorkSpec::Fixed))
+                || family.program().states().iter().any(|state| {
+                    !matches!(state.capacity_demand, StateCapacityDemand::FixedPerScope)
+                }))
+        {
+            return Err(invalid_plan("fixed tensor plans require one job, fixed node/state work, and ordinary execution without checkpoint or reusable capacity"));
+        }
+        Ok(())
+    }
     /// Capacity is a selectable candidate outcome only during fresh planning.
     /// Rebuilding evidence for an existing plan must reject impossible memory
     /// claims as contract violations, including changed node liveness.
@@ -59,8 +90,9 @@ impl ExecutionPlan {
         request.policy.validate()?;
         let maximum_active_sequences = request.policy.maximum_active_sequences();
         validate_active_sequence_ceiling(maximum_active_sequences)?;
-        let maximum_scheduled_tokens = request.policy.maximum_scheduled_tokens();
-        validate_scheduled_token_ceiling(maximum_scheduled_tokens)?;
+        let work_limits = request.policy.work_limits();
+        work_limits.validate()?;
+        Self::validate_work_domain(request.family, request.policy)?;
         let operation_registry_authority = request
             .node_resolutions
             .first()
@@ -195,8 +227,25 @@ impl ExecutionPlan {
         }
         Self::validate_semantic_coverage(family, &bound_values)?;
         Self::validate_global_storage_aliasing(&canonical_values, &nodes)?;
-        let retained_completion_values =
-            resolve_retained_completion_values(&nodes, &request.completion_retention)?;
+        let tensor_ports = if work_limits.is_tensor() {
+            Some(super::CompiledTensorPorts::derive(family, &nodes)?)
+        } else {
+            None
+        };
+        let retention = if work_limits.is_tensor() {
+            CompletionRetentionSpec::new(
+                request
+                    .completion_retention
+                    .values()
+                    .iter()
+                    .cloned()
+                    .chain(family.program().outputs().iter().cloned())
+                    .collect(),
+            )
+        } else {
+            request.completion_retention.clone()
+        };
+        let retained_completion_values = resolve_retained_completion_values(&nodes, &retention)?;
         let terminal_output_resources = nodes
             .iter()
             .flat_map(|node| node.values())
@@ -218,7 +267,7 @@ impl ExecutionPlan {
             policy_capacity,
             memory_reserve,
             maximum_active_sequences,
-            maximum_scheduled_tokens,
+            work_limits,
             &nodes,
             &selected_resource_profiles,
             request.policy.reusable_execution_policy(),
@@ -249,7 +298,8 @@ impl ExecutionPlan {
             capability_catalog_fingerprint,
             policy_version: request.policy.version(),
             policy_fingerprint,
-            maximum_scheduled_tokens,
+            work_limits,
+            tensor_ports,
             execution_weights: request.execution_weights.plan().clone(),
             weight_format,
             quantization_formats,
@@ -365,6 +415,15 @@ impl ExecutionPlan {
                     program_node.id
                 ))
             })?;
+        if matches!(
+            family.metadata(),
+            crate::ModelSemanticMetadata::TensorComponent
+        ) && !selected_provider.supports_fixed_tensor_work()
+        {
+            return Err(invalid_plan(
+                "selected provider does not support fixed tensor work",
+            ));
+        }
         if provider_resources.estimator_id != selected_provider.resource_estimator_id()
             || provider_resources.estimator_version
                 != selected_provider.resource_estimator_version()
@@ -1550,13 +1609,13 @@ impl ExecutionPlan {
         policy_capacity_bytes: u64,
         reserve_bytes: u64,
         maximum_active_sequences: u32,
-        maximum_scheduled_tokens: u64,
+        work_limits: super::RuntimeWorkLimits,
         nodes: &[PlanNode],
         selected_resource_profiles: &BTreeMap<ResourceId, DynamicStorageProfile>,
         reusable_execution_policy: Option<&ReusableExecutionPolicy>,
         retained_completion_resources: &BTreeSet<ResourceId>,
     ) -> Result<MemoryPlan, VNextError> {
-        validate_scheduled_token_ceiling(maximum_scheduled_tokens)?;
+        work_limits.validate()?;
         let program_inputs = family
             .program()
             .inputs()
@@ -1648,7 +1707,7 @@ impl ExecutionPlan {
                         end,
                         token_projection,
                         maximum_active_sequences,
-                        maximum_scheduled_tokens,
+                        work_limits,
                         product_io_resources.contains(component.resource_id()),
                     )?;
                     let initialization = state_initializations
@@ -1712,7 +1771,7 @@ impl ExecutionPlan {
                     resource_id,
                     workspace
                         .size_formula
-                        .bind_runtime_limits(maximum_active_sequences, maximum_scheduled_tokens)?,
+                        .bind_runtime_limits(maximum_active_sequences, work_limits)?,
                     workspace.alignment_bytes,
                     BufferUsage::Scratch,
                     ElementType::U8,
@@ -1757,7 +1816,7 @@ impl ExecutionPlan {
                     resource_id,
                     workspace
                         .size_formula
-                        .bind_runtime_limits(maximum_active_sequences, maximum_scheduled_tokens)?,
+                        .bind_runtime_limits(maximum_active_sequences, work_limits)?,
                     workspace.alignment_bytes,
                     BufferUsage::Binding,
                     ElementType::U8,
@@ -1833,10 +1892,9 @@ impl ExecutionPlan {
                         )?;
                         dynamic_descriptors.push(DynamicResourceDescriptor::new(
                             resource_id,
-                            workspace.size_formula.bind_runtime_limits(
-                                maximum_active_sequences,
-                                maximum_scheduled_tokens,
-                            )?,
+                            workspace
+                                .size_formula
+                                .bind_runtime_limits(maximum_active_sequences, work_limits)?,
                             workspace.alignment_bytes,
                             BufferUsage::Persistent,
                             ElementType::U8,
@@ -1936,7 +1994,7 @@ impl ExecutionPlan {
         minimum_bytes: u64,
         token_projection: Option<(u64, u64)>,
         maximum_active_sequences: u32,
-        maximum_scheduled_tokens: u64,
+        work_limits: super::RuntimeWorkLimits,
         is_product_io_resource: bool,
     ) -> Result<ValueResourceDemand, VNextError> {
         if family
@@ -1965,18 +2023,15 @@ impl ExecutionPlan {
                         "token-scaled activation has zero bytes or canonical tokens",
                     ));
                 }
-                let maximum_tokens = Self::activation_token_capacity(
-                    lifetime,
-                    canonical_tokens,
-                    maximum_scheduled_tokens,
-                )?;
+                let maximum_tokens =
+                    Self::activation_token_capacity(lifetime, canonical_tokens, work_limits)?;
                 return Ok(ValueResourceDemand::TokenScaled {
                     lifetime,
                     bytes_per_token,
                     maximum_tokens,
                 });
             }
-            if is_product_io_resource {
+            if is_product_io_resource && !work_limits.is_tensor() {
                 return Ok(ValueResourceDemand::ParticipantFixed {
                     lifetime,
                     maximum_participants: maximum_active_sequences,
@@ -2013,8 +2068,9 @@ impl ExecutionPlan {
     pub(super) fn activation_token_capacity(
         lifetime: AllocationLifetime,
         canonical_tokens: u64,
-        maximum_scheduled_tokens: u64,
+        work_limits: super::RuntimeWorkLimits,
     ) -> Result<u64, VNextError> {
+        let maximum_scheduled_tokens = work_limits.maximum_scheduled_tokens()?;
         if canonical_tokens == 0 {
             return Err(invalid_plan(
                 "token-scaled activation has zero canonical tokens",
@@ -2023,7 +2079,6 @@ impl ExecutionPlan {
         if lifetime == AllocationLifetime::Request {
             Ok(canonical_tokens)
         } else {
-            validate_scheduled_token_ceiling(maximum_scheduled_tokens)?;
             Ok(maximum_scheduled_tokens)
         }
     }
@@ -2062,7 +2117,7 @@ impl ExecutionPlan {
             || !is_canonical_sha256(&self.payload.capability_catalog_fingerprint)
             || !is_canonical_sha256(&self.payload.device_runtime_implementation_fingerprint)
             || !is_canonical_sha256(&self.payload.policy_fingerprint)
-            || self.payload.maximum_scheduled_tokens == 0
+            || self.payload.work_limits.validate().is_err()
         {
             return Err(invalid_plan("plan provenance or node set is invalid"));
         }
@@ -2350,7 +2405,7 @@ impl ExecutionPlan {
                 if descriptor.demand
                     != workspace.size_formula.bind_runtime_limits(
                         self.payload.memory.maximum_active_sequences,
-                        self.payload.maximum_scheduled_tokens,
+                        self.payload.work_limits,
                     )?
                     || descriptor.alignment_bytes != workspace.alignment_bytes
                     || descriptor.usage != BufferUsage::Scratch
@@ -2378,7 +2433,7 @@ impl ExecutionPlan {
                 if descriptor.demand
                     != workspace.size_formula.bind_runtime_limits(
                         self.payload.memory.maximum_active_sequences,
-                        self.payload.maximum_scheduled_tokens,
+                        self.payload.work_limits,
                     )?
                     || descriptor.alignment_bytes != workspace.alignment_bytes
                     || descriptor.usage != BufferUsage::Binding
@@ -2445,7 +2500,7 @@ impl ExecutionPlan {
                         if descriptor.demand
                             != workspace.size_formula.bind_runtime_limits(
                                 self.payload.memory.maximum_active_sequences,
-                                self.payload.maximum_scheduled_tokens,
+                                self.payload.work_limits,
                             )?
                             || descriptor.alignment_bytes != workspace.alignment_bytes
                             || descriptor.usage != BufferUsage::Persistent

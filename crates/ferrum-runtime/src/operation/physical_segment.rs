@@ -21,7 +21,7 @@ pub struct PreparedPhysicalSegmentWave<'w, B> {
     pub(super) sequence_bytes: Vec<u64>,
     pub(super) fresh_backing: Option<&'w SegmentBackingBatch<B>>,
     pub(super) fresh_expected: &'w [SegmentBackingExpectation],
-    pub(super) work_shape: &'w BatchWorkShape,
+    pub(super) work_shape: crate::TokenBatchWorkView<'w>,
     pub(super) program_bindings: Vec<Option<ProgramBindingNodeBinding>>,
     pub(super) dependencies: Vec<Vec<Option<RetainedPlanDependencyAuthority>>>,
 }
@@ -81,8 +81,8 @@ impl<'f, 'w, B> PreparedPhysicalSegmentNodeView<'f, 'w, B> {
     pub fn participant_count(&self) -> usize {
         self.wave.work_shape.participant_token_ranges().len()
     }
-    pub fn work_shape(&self) -> &'f BatchWorkShape {
-        self.wave.work_shape
+    pub fn work_shape(&self) -> &crate::TokenBatchWorkView<'w> {
+        &self.wave.work_shape
     }
     pub fn program_binding(&self) -> Option<&'f ProgramBindingNodeBinding> {
         self.wave.program_bindings[self.index].as_ref()

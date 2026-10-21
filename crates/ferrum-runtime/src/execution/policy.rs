@@ -7,6 +7,63 @@ use super::{
 use crate::{CheckpointCapacityPolicy, ExecutionDeterminismRequirement};
 use ferrum_types::AttentionExecutionPolicy;
 
+/// Work dimensions are part of the compiled capacity contract. Tensor jobs
+/// have no token ceiling; their exact extents come from compiled port bindings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum RuntimeWorkLimits {
+    Tokens { maximum_scheduled_tokens: u64 },
+    FixedTensor,
+}
+
+impl<'de> serde::Deserialize<'de> for RuntimeWorkLimits {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        // A struct variant, unlike a Serde internally tagged unit variant,
+        // rejects fields from another work domain as well as unknown fields.
+        #[derive(serde::Deserialize)]
+        #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+        enum Wire {
+            Tokens { maximum_scheduled_tokens: u64 },
+            FixedTensor {},
+        }
+        let limits = match Wire::deserialize(deserializer)? {
+            Wire::Tokens {
+                maximum_scheduled_tokens,
+            } => Self::Tokens {
+                maximum_scheduled_tokens,
+            },
+            Wire::FixedTensor {} => Self::FixedTensor,
+        };
+        limits.validate().map_err(serde::de::Error::custom)?;
+        Ok(limits)
+    }
+}
+
+impl RuntimeWorkLimits {
+    pub fn maximum_scheduled_tokens(self) -> Result<u64, VNextError> {
+        match self {
+            Self::Tokens {
+                maximum_scheduled_tokens,
+            } => {
+                super::validate_scheduled_token_ceiling(maximum_scheduled_tokens)?;
+                Ok(maximum_scheduled_tokens)
+            }
+            Self::FixedTensor => Err(invalid_plan("tensor work has no token dimension")),
+        }
+    }
+
+    pub fn validate(self) -> Result<(), VNextError> {
+        match self {
+            Self::Tokens { .. } => self.maximum_scheduled_tokens().map(|_| ()),
+            Self::FixedTensor => Ok(()),
+        }
+    }
+
+    pub const fn is_tensor(self) -> bool {
+        matches!(self, Self::FixedTensor)
+    }
+}
+
 /// Typed policy selected before planning. Memory capacity is part of the
 /// public policy contract so a plan cannot depend on an undocumented env var.
 pub trait RuntimePolicy:
@@ -24,10 +81,14 @@ pub trait RuntimePolicy:
     /// iterate, or materialize resources up to this value.
     fn maximum_active_sequences(&self) -> u32;
 
-    /// A non-zero ceiling for tokens selected into one scheduler step. This is
-    /// not installed capacity: admission still evaluates the exact step shape
-    /// against then-live backing before any provider work is encoded.
-    fn maximum_scheduled_tokens(&self) -> u64;
+    /// The compiled work domain and its logical limits. A token ceiling is not
+    /// installed capacity; tensor extents come from compiled ports. Admission
+    /// evaluates the exact step against live backing before provider encoding.
+    fn work_limits(&self) -> RuntimeWorkLimits;
+
+    fn maximum_scheduled_tokens(&self) -> Result<u64, VNextError> {
+        self.work_limits().maximum_scheduled_tokens()
+    }
 
     /// Provider-family policy sealed into the plan fingerprint. Physical
     /// kernel variants remain an invocation-time provider decision.

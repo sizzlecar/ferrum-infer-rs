@@ -130,10 +130,10 @@ fn prefix_restore_extension_retains_request_fit_without_reserving_future_tokens(
         else {
             panic!("restoring a resident prefix must not wait for future-token backing")
         };
-        assert_eq!(backing.committed_tokens(), 5);
+        assert_eq!(backing.committed_tokens().unwrap(), 5);
         assert_eq!(session.fingerprint(), &identity);
         assert_eq!(request.work_shape(), &admitted_work);
-        assert_eq!(admitted_work.fit_tokens(), maximum_tokens as u64);
+        assert_eq!(admitted_work.fit_tokens().unwrap(), maximum_tokens as u64);
         let after = root.dynamic_pool_status().unwrap();
         for (before, after) in initial.pools().iter().zip(after.pools()) {
             assert_eq!(before.pool_id(), after.pool_id());

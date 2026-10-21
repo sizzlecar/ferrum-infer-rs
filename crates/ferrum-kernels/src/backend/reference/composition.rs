@@ -52,9 +52,17 @@ pub fn reference_vnext_operation_registry(
 ) -> Result<OperationRuntimeRegistry<ReferenceDeviceRuntime>, ReferenceDeviceRuntimeError> {
     let contracts: Vec<Box<dyn OperationContract>> =
         vec![Box::new(dense_linear_contract().map_err(contract_error)?)];
-    let providers: Vec<Box<dyn OperationProvider<ReferenceDeviceRuntime>>> =
-        vec![Box::new(ReferenceDenseLinearProvider::new(runtime)?)];
+    let providers = vec![reference_vnext_dense_linear_provider(runtime)?];
     OperationRuntimeRegistry::new(contracts, providers).map_err(contract_error)
+}
+
+/// Builds the actual reference dense implementation for an explicitly
+/// assembled registry, including runtime wrappers used for fault injection.
+/// Core still creates the provider's invocation and submission authority.
+pub fn reference_vnext_dense_linear_provider(
+    runtime: &ReferenceDeviceRuntime,
+) -> Result<Box<dyn OperationProvider<ReferenceDeviceRuntime>>, ReferenceDeviceRuntimeError> {
+    Ok(Box::new(ReferenceDenseLinearProvider::new(runtime)?))
 }
 
 /// Single composition authority for reference planning, allocation, weight

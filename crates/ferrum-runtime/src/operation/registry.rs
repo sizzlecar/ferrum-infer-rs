@@ -47,7 +47,7 @@ pub struct ReusableExecutionTopologyRequest<'a> {
     binding_resource: Option<&'a super::super::ResourceId>,
     persistent_resource: Option<&'a super::super::ResourceId>,
     memory: &'a MemoryPlan,
-    work_shape: &'a BatchWorkShape,
+    work_shape: crate::TokenBatchWorkView<'a>,
     claimed_backing: &'a ClaimedSubmissionWaveBacking,
     step_backing: &'a [LogicalBackingSliceAuthority],
 }
@@ -122,7 +122,7 @@ impl<'a> ReusableExecutionTopologyRequest<'a> {
             binding_resource,
             persistent_resource,
             memory,
-            work_shape,
+            work_shape: work_shape.token_view()?,
             claimed_backing,
             step_backing,
         })
@@ -144,8 +144,8 @@ impl<'a> ReusableExecutionTopologyRequest<'a> {
         self.bindings
     }
 
-    pub fn work_shape(&self) -> &BatchWorkShape {
-        self.work_shape
+    pub fn work_shape(&self) -> &crate::TokenBatchWorkView<'_> {
+        &self.work_shape
     }
 
     /// Returns whether one resolved value uses the packed token coordinates of
@@ -628,6 +628,16 @@ pub trait OperationProvider<R: DeviceRuntime>: OperationResourceEstimator {
         &self,
         invocation: BatchedOperationInvocation<'_, R::Buffer>,
     ) -> Result<EncodedDeviceOperation<R::Command>, OperationFailure>;
+
+    /// Exact-shape tensor work has no token projection. Declining here is a
+    /// contract rejection before submission, even if a descriptor incorrectly
+    /// advertised support.
+    fn encode_tensor_selected(
+        &self,
+        _invocation: super::TensorOperationInvocation<'_, R::Buffer>,
+    ) -> Result<Option<EncodedDeviceOperation<R::Command>>, OperationFailure> {
+        Ok(None)
+    }
 
     /// Cold full encoding may declare a closed whole-segment binding rule.
     /// The default remains unsupported; a successful ordinary encode alone

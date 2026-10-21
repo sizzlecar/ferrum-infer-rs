@@ -88,6 +88,7 @@ pub(super) fn prepare_wave_for_node_scope(
     let participant_work = step
         .work_shape()
         .participant_work()
+        .unwrap()
         .iter()
         .map(|work| work.token_span().clone())
         .collect::<Vec<_>>();

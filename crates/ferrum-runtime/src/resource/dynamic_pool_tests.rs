@@ -871,6 +871,9 @@ fn harness_with_checkpoint_policy(
         admission_generation: generation,
     };
     let binding = StaticProvisioningBinding {
+        work_limits: crate::RuntimeWorkLimits::Tokens {
+            maximum_scheduled_tokens: 4096,
+        },
         pool_identity,
         plan_id,
         plan_hash,
@@ -5017,8 +5020,8 @@ fn request_token_backing_covers_nonzero_chunk_source_range() {
         _ => panic!("resident full-input request backing must admit"),
     };
 
-    assert_eq!(admitted.work_shape().immediate_tokens(), 1);
-    assert_eq!(admitted.work_shape().fit_tokens(), 4);
+    assert_eq!(admitted.work_shape().immediate_tokens().unwrap(), 1);
+    assert_eq!(admitted.work_shape().fit_tokens().unwrap(), 4);
     assert_eq!(admitted.backing_slices().len(), 1);
     assert_eq!(admitted.backing_slices()[0].size_bytes(), 256);
     let snapshot = harness
@@ -5232,8 +5235,8 @@ fn sequence_physical_catalog_shares_without_extent_growth_and_retains_logical_ow
         _ => panic!("logical token progress must publish a new snapshot"),
     };
     assert_ne!(initial.generation(), advanced.generation());
-    assert_eq!(initial.committed_tokens(), 1);
-    assert_eq!(advanced.committed_tokens(), 2);
+    assert_eq!(initial.committed_tokens().unwrap(), 1);
+    assert_eq!(advanced.committed_tokens().unwrap(), 2);
     assert!(std::ptr::eq(
         initial.backing_slices(),
         advanced.backing_slices()
@@ -5355,7 +5358,7 @@ fn sequence_backing_extension_publishes_atomically_between_frames() {
     assert_eq!(initial.generation().get(), 1);
     assert_eq!(first_captured.generation().get(), 1);
     assert_eq!(extended.generation().get(), 2);
-    assert_eq!(extended.committed_tokens(), 2);
+    assert_eq!(extended.committed_tokens().unwrap(), 2);
     assert_eq!(extended.backing_slices().len(), 2);
     assert_ne!(
         initial.backing_slices().as_ptr(),
@@ -5520,7 +5523,7 @@ fn sequence_backing_extension_waits_for_released_capacity_then_retries() {
         _ => panic!("released backing capacity must admit the pending extension"),
     };
     assert_eq!(extended.generation().get(), 2);
-    assert_eq!(extended.committed_tokens(), 2);
+    assert_eq!(extended.committed_tokens().unwrap(), 2);
     assert_eq!(extended.backing_slices().len(), 2);
 
     session.request_cancel().unwrap();
@@ -5607,7 +5610,7 @@ fn three_initial_sequence_bundles_precede_typed_token_extension_deferral() {
         SequenceResourceExtensionDecision::Extended(snapshot) => snapshot,
         _ => panic!("released token-scaled backing must resume the deferred extension"),
     };
-    assert_eq!(extended.committed_tokens(), 2);
+    assert_eq!(extended.committed_tokens().unwrap(), 2);
 
     session.request_cancel().unwrap();
     session.try_abort().unwrap();

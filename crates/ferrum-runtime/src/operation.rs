@@ -109,7 +109,10 @@ pub use identity::{
     BatchOperationIdentity, BatchOperationIdentityMaterializationSnapshot,
     BatchOperationNodeIdentity, BatchOperationParticipantIdentity,
 };
-pub use invocation::{BatchedOperationInvocation, OperationInvocation};
+pub use invocation::{
+    BatchedOperationInvocation, InvocationWorkProjection, OperationInvocation,
+    TensorInvocationWork, TensorOperationInvocation, TokenInvocationWork,
+};
 pub use preparation::{InvocationPreparationSink, InvocationPreparationStats};
 pub use provider::{
     EngineProviderDescriptor, ExecutionDeterminismRequirement, OperationFailure,

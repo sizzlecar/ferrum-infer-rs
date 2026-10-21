@@ -138,7 +138,7 @@ pub(super) fn with_prepared_physical_wave<
                                     "physical Sequence resource differs from its Plan ordinal",
                                 )
                             })?;
-                        let tokens = &first.work_shape().participant_token_ranges()[participant];
+                        let tokens = &first.work_shape().participant_token_ranges()?[participant];
                         let bytes = descriptor.evaluate_request_bytes_for_shape(
                             sequence_execution_shape(
                                 context.sequence_shape(participant)?,
@@ -344,7 +344,7 @@ pub(super) fn with_prepared_physical_wave<
         sequence_bytes,
         fresh_backing: fresh_backing.as_ref(),
         fresh_expected: &fresh_expected,
-        work_shape: first.work_shape(),
+        work_shape: first.work_shape().token_view()?,
         program_bindings,
         dependencies,
     };

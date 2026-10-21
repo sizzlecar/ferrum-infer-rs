@@ -12,7 +12,12 @@ pub mod execution_attempt;
 pub mod executor_lifecycle;
 pub mod model_executor;
 pub mod prepared_model;
+pub mod tensor;
 pub mod token_execution;
+pub use tensor::{
+    PreparedTensorExecutor, TensorAdmissionFailure, TensorAdmissionStage, TensorExecutionError,
+    TensorExecutionOutput, TensorExecutionRetirement, TensorExecutorConfig,
+};
 
 #[cfg(any(test, feature = "test-support"))]
 pub use driver::test_support;

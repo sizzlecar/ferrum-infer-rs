@@ -372,7 +372,7 @@ pub(in crate::resource) fn validate_completed_participants<R: DeviceRuntime>(
     work: &crate::BatchWorkShape,
     admitted: &[crate::resource::AdmittedStepParticipant<R>],
 ) -> Result<StepCompletedBoundaryProof, VNextError> {
-    if admitted.is_empty() || admitted.len() != work.participant_work().len() {
+    if admitted.is_empty() || admitted.len() != work.participants().len() {
         return Err(invalid_resource(
             "completed resident/wave participant cardinality differs from fresh work",
         ));
@@ -390,9 +390,7 @@ pub(in crate::resource) fn validate_completed_participants<R: DeviceRuntime>(
         })
         .collect::<Result<Vec<_>, _>>()?;
     let mut participants = Vec::with_capacity(admitted.len());
-    for ((participant, state), token_span) in
-        admitted.iter().zip(&states).zip(work.participant_work())
-    {
+    for (index, (participant, state)) in admitted.iter().zip(&states).enumerate() {
         let SequenceSessionSlotState::Active(active) = &**state else {
             return Err(invalid_resource(
                 "completed wave session is no longer active",
@@ -416,15 +414,21 @@ pub(in crate::resource) fn validate_completed_participants<R: DeviceRuntime>(
                 "completed wave backing generation changed",
             ));
         }
-        participants.push(boundary_from_span(
-            active,
-            token_span.token_span(),
-            plan_hash,
-            batch_step_id,
-            batch_invocation_id,
-            participant.frame.frame_id,
-            backing.current.generation(),
-        )?);
+        let boundary = if work.resource_work().is_tensor() {
+            None
+        } else {
+            Some(boundary_from_span(
+                active,
+                work.participant_work()?[index].token_span(),
+                plan_hash,
+                batch_step_id,
+                batch_invocation_id,
+                participant.frame.frame_id,
+                backing.current.generation(),
+            )?)
+        }
+        .flatten();
+        participants.push(boundary);
     }
     Ok(StepCompletedBoundaryProof {
         batch_step_id,

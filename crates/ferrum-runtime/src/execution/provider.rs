@@ -36,7 +36,8 @@ pub struct ExecutionPlanPayload {
     pub(super) capability_catalog_fingerprint: String,
     pub(super) policy_version: ContractVersion,
     pub(super) policy_fingerprint: String,
-    pub(super) maximum_scheduled_tokens: u64,
+    pub(super) work_limits: super::RuntimeWorkLimits,
+    pub(super) tensor_ports: Option<super::CompiledTensorPorts>,
     pub(super) execution_weights: ExecutionWeightPlan,
     pub(super) weight_format: WeightFormatId,
     pub(super) quantization_formats: BTreeSet<QuantizationFormatId>,
@@ -89,8 +90,16 @@ impl ExecutionPlanPayload {
         &self.policy_fingerprint
     }
 
-    pub const fn maximum_scheduled_tokens(&self) -> u64 {
-        self.maximum_scheduled_tokens
+    pub const fn work_limits(&self) -> super::RuntimeWorkLimits {
+        self.work_limits
+    }
+
+    pub fn tensor_ports(&self) -> Option<&super::CompiledTensorPorts> {
+        self.tensor_ports.as_ref()
+    }
+
+    pub fn maximum_scheduled_tokens(&self) -> Result<u64, super::VNextError> {
+        self.work_limits.maximum_scheduled_tokens()
     }
 
     pub fn execution_weights(&self) -> &ExecutionWeightPlan {
@@ -133,7 +142,8 @@ pub(super) struct PlanHashMaterial<'a> {
     pub(super) capability_catalog_fingerprint: &'a str,
     pub(super) policy_version: ContractVersion,
     pub(super) policy_fingerprint: &'a str,
-    pub(super) maximum_scheduled_tokens: u64,
+    pub(super) work_limits: super::RuntimeWorkLimits,
+    pub(super) tensor_ports: &'a Option<super::CompiledTensorPorts>,
     pub(super) execution_weights: &'a ExecutionWeightPlan,
     pub(super) weight_format: &'a WeightFormatId,
     pub(super) quantization_formats: &'a BTreeSet<QuantizationFormatId>,
@@ -158,7 +168,8 @@ impl<'a> From<&'a ExecutionPlanPayload> for PlanHashMaterial<'a> {
             capability_catalog_fingerprint: &payload.capability_catalog_fingerprint,
             policy_version: payload.policy_version,
             policy_fingerprint: &payload.policy_fingerprint,
-            maximum_scheduled_tokens: payload.maximum_scheduled_tokens,
+            work_limits: payload.work_limits,
+            tensor_ports: &payload.tensor_ports,
             execution_weights: &payload.execution_weights,
             weight_format: &payload.weight_format,
             quantization_formats: &payload.quantization_formats,
@@ -227,7 +238,8 @@ pub(super) struct UnvalidatedExecutionPlanPayload {
     pub(super) capability_catalog_fingerprint: String,
     pub(super) policy_version: ContractVersion,
     pub(super) policy_fingerprint: String,
-    pub(super) maximum_scheduled_tokens: u64,
+    pub(super) work_limits: super::RuntimeWorkLimits,
+    pub(super) tensor_ports: Option<super::CompiledTensorPorts>,
     pub(super) execution_weights: ExecutionWeightPlan,
     pub(super) weight_format: WeightFormatId,
     pub(super) quantization_formats: BTreeSet<QuantizationFormatId>,

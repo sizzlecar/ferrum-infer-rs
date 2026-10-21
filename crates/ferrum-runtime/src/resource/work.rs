@@ -224,10 +224,49 @@ impl BatchParticipantTokenSpan {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct BatchWorkShape {
     participants: Vec<BatchParticipantAuthority>,
-    participant_work: Vec<BatchParticipantTokenSpan>,
-    participant_token_ranges: Vec<BatchParticipantTokenRange>,
+    token_work: Option<TokenBatchEvidence>,
     resource_work: ResourceWorkShape,
     fingerprint: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct TokenBatchEvidence {
+    participant_work: Vec<BatchParticipantTokenSpan>,
+    participant_token_ranges: Vec<BatchParticipantTokenRange>,
+}
+
+/// A checked token-only projection. Tensor work cannot construct this view.
+#[derive(Debug, Clone, Copy)]
+pub struct TokenBatchWorkView<'a> {
+    batch: &'a BatchWorkShape,
+    token: &'a crate::TokenResourceWorkShape,
+    evidence: &'a TokenBatchEvidence,
+}
+impl std::ops::Deref for TokenBatchWorkView<'_> {
+    type Target = BatchWorkShape;
+    fn deref(&self) -> &Self::Target {
+        self.batch
+    }
+}
+impl TokenBatchWorkView<'_> {
+    pub fn participant_work(&self) -> &[BatchParticipantTokenSpan] {
+        &self.evidence.participant_work
+    }
+    pub fn participant_token_ranges(&self) -> &[BatchParticipantTokenRange] {
+        &self.evidence.participant_token_ranges
+    }
+    pub const fn immediate_tokens(&self) -> u64 {
+        self.token.immediate_tokens()
+    }
+    pub const fn immediate_pages(&self) -> u64 {
+        self.token.immediate_pages()
+    }
+    pub const fn fit_tokens(&self) -> u64 {
+        self.token.fit_tokens()
+    }
+    pub const fn fit_pages(&self) -> u64 {
+        self.token.fit_pages()
+    }
 }
 
 impl BatchWorkShape {
@@ -274,7 +313,7 @@ impl BatchWorkShape {
         if resource_work.immediate_sequences()
             != u32::try_from(participants.len())
                 .map_err(|_| invalid_resource("batch work participant count exceeds u32"))?
-            || next_token != resource_work.immediate_tokens()
+            || next_token != resource_work.immediate_tokens()?
         {
             return Err(invalid_resource(
                 "batch work shape aggregate differs from participant evidence",
@@ -298,8 +337,10 @@ impl BatchWorkShape {
         })?;
         Ok(Self {
             participants,
-            participant_work,
-            participant_token_ranges,
+            token_work: Some(TokenBatchEvidence {
+                participant_work,
+                participant_token_ranges,
+            }),
             resource_work,
             fingerprint: format!("{:x}", Sha256::digest(bytes)),
         })
@@ -329,12 +370,55 @@ impl BatchWorkShape {
         &self.participants
     }
 
-    pub fn participant_work(&self) -> &[BatchParticipantTokenSpan] {
-        &self.participant_work
+    pub fn token_view(&self) -> Result<TokenBatchWorkView<'_>, VNextError> {
+        let evidence = self
+            .token_work
+            .as_ref()
+            .ok_or_else(|| invalid_resource("tensor batch has no token work view"))?;
+        Ok(TokenBatchWorkView {
+            batch: self,
+            token: self.resource_work.token_view()?,
+            evidence,
+        })
     }
 
-    pub fn participant_token_ranges(&self) -> &[BatchParticipantTokenRange] {
-        &self.participant_token_ranges
+    pub fn participant_work(&self) -> Result<&[BatchParticipantTokenSpan], VNextError> {
+        Ok(&self
+            .token_work
+            .as_ref()
+            .ok_or_else(|| invalid_resource("tensor batch has no token spans"))?
+            .participant_work)
+    }
+    pub fn participant_token_ranges(&self) -> Result<&[BatchParticipantTokenRange], VNextError> {
+        Ok(&self
+            .token_work
+            .as_ref()
+            .ok_or_else(|| invalid_resource("tensor batch has no token ranges"))?
+            .participant_token_ranges)
+    }
+
+    pub(super) fn from_tensor(
+        participant: BatchParticipantAuthority,
+        resource_work: ResourceWorkShape,
+    ) -> Result<Self, VNextError> {
+        if !resource_work.is_tensor() {
+            return Err(invalid_resource(
+                "tensor batch requires root-bound tensor evidence",
+            ));
+        }
+        let participants = vec![participant];
+        let bytes = serde_json::to_vec(&(
+            "ferrum.tensor-batch.v1",
+            &participants,
+            resource_work.fingerprint(),
+        ))
+        .map_err(|error| invalid_resource(format!("tensor batch fingerprint: {error}")))?;
+        Ok(Self {
+            participants,
+            token_work: None,
+            resource_work,
+            fingerprint: format!("{:x}", Sha256::digest(bytes)),
+        })
     }
 
     pub fn resource_work(&self) -> &ResourceWorkShape {
@@ -345,11 +429,11 @@ impl BatchWorkShape {
         self.resource_work.immediate_sequences()
     }
 
-    pub const fn immediate_tokens(&self) -> u64 {
+    pub fn immediate_tokens(&self) -> Result<u64, VNextError> {
         self.resource_work.immediate_tokens()
     }
 
-    pub const fn immediate_pages(&self) -> u64 {
+    pub fn immediate_pages(&self) -> Result<u64, VNextError> {
         self.resource_work.immediate_pages()
     }
 
@@ -357,11 +441,11 @@ impl BatchWorkShape {
         self.resource_work.fit_sequences()
     }
 
-    pub const fn fit_tokens(&self) -> u64 {
+    pub fn fit_tokens(&self) -> Result<u64, VNextError> {
         self.resource_work.fit_tokens()
     }
 
-    pub const fn fit_pages(&self) -> u64 {
+    pub fn fit_pages(&self) -> Result<u64, VNextError> {
         self.resource_work.fit_pages()
     }
 

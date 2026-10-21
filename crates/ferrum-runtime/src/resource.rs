@@ -37,6 +37,9 @@ use super::{
     MAX_DEFERRED_DEVICE_CLEANUP_MAINTENANCE_TASKS,
 };
 
+mod tensor;
+pub use tensor::*;
+
 mod contracts;
 pub use contracts::*;
 mod capacity;

@@ -1813,7 +1813,10 @@ fn unknown_inputs_fail_closed() {
         }};
     }
 
-    reject!(|value| value["payload"]["schema"]["major"] = json!(9));
+    reject!(|value| {
+        let current_major = value["payload"]["schema"]["major"].as_u64().unwrap();
+        value["payload"]["schema"]["major"] = json!(current_major.checked_add(1).unwrap());
+    });
     reject!(|value| value["payload"]["family_id"] = json!("family.other"));
     reject!(|value| value["payload"]["device_id"] = json!("device.other"));
     reject!(|value| value["payload"]["prepared_family_fingerprint"] = json!(sha('0')));

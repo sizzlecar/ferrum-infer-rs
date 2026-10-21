@@ -145,7 +145,7 @@ fn same_wave_materialization_matches_reference_and_keeps_runtime_checks() {
                 .unwrap();
             let node = identity.materialize_node(0).unwrap();
             let make = |share| {
-                BatchedOperationInvocation::from_resources(
+                BatchedOperationInvocation::<_, crate::TokenInvocationWork<'_>>::from_resources(
                     fixture.runtime.as_ref(),
                     &fixture.resolved,
                     provider.dispatch(),
@@ -205,7 +205,7 @@ fn same_wave_materialization_matches_reference_and_keeps_runtime_checks() {
                             .tamper_buffer_descriptor = true;
                     }
                 });
-                assert!(BatchedOperationInvocation::from_resources(
+                assert!(BatchedOperationInvocation::<_, crate::TokenInvocationWork<'_>>::from_resources(
                     fixture.runtime.as_ref(),
                     &fixture.resolved,
                     provider.dispatch(),
@@ -225,7 +225,7 @@ fn same_wave_materialization_matches_reference_and_keeps_runtime_checks() {
                     .lock()
                     .unwrap()
                     .tamper_buffer_descriptor = false;
-                assert!(BatchedOperationInvocation::from_resources(
+                assert!(BatchedOperationInvocation::<_, crate::TokenInvocationWork<'_>>::from_resources(
                     fixture.runtime.as_ref(),
                     &fixture.resolved,
                     provider.dispatch(),
@@ -258,7 +258,7 @@ fn paired_live_wave_invocation_materialization() {
                 .unwrap();
             let node = identity.materialize_node(0).unwrap();
             let make = |reference: bool| {
-                BatchedOperationInvocation::from_resources(
+                BatchedOperationInvocation::<_, crate::TokenInvocationWork<'_>>::from_resources(
                     fixture.runtime.as_ref(),
                     &fixture.resolved,
                     provider.dispatch(),
@@ -320,7 +320,7 @@ fn shared_materialization_preserves_unequal_participant_token_windows() {
             .unwrap();
         let node = identity.materialize_node(0).unwrap();
         let make = |share| {
-            BatchedOperationInvocation::from_resources(
+            BatchedOperationInvocation::<_, crate::TokenInvocationWork<'_>>::from_resources(
                 fixture.runtime.as_ref(),
                 &fixture.resolved,
                 provider.dispatch(),
@@ -337,7 +337,10 @@ fn shared_materialization_preserves_unequal_participant_token_windows() {
             .unwrap()
         };
         assert_eq!(snapshot(&make(false)), snapshot(&make(true)));
-        let ranges = wave.nodes()[0].work_shape().participant_token_ranges();
+        let ranges = wave.nodes()[0]
+            .work_shape()
+            .participant_token_ranges()
+            .unwrap();
         let widths = ranges
             .iter()
             .map(|r| r.immediate_tokens())

@@ -70,7 +70,8 @@ impl PreparedSubmissionWork {
         work: &BatchWorkShape,
     ) -> Result<ExecutionNodeWork, VNextError> {
         if identity.work_shape_fingerprint_at(index) != Some(work.fingerprint())
-            || identity.node_participant_count(index) != Some(work.participant_token_ranges().len())
+            || identity.node_participant_count(index)
+                != Some(work.participant_token_ranges()?.len())
         {
             return Err(invalid_operation(
                 "observed token work differs from the bound node",
@@ -80,7 +81,7 @@ impl PreparedSubmissionWork {
             .map_err(|_| invalid_operation("observed node index exceeds u32"))?;
         Ok(ExecutionNodeWork::new(
             index,
-            work.participant_token_ranges().into(),
+            work.participant_token_ranges()?.into(),
         ))
     }
 

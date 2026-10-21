@@ -734,6 +734,7 @@ fn execute_reference_batch(
     let token_ranges = token_wave_node
         .work_shape()
         .participant_token_ranges()
+        .unwrap()
         .to_vec();
     assert_eq!(token_ranges.len(), canonical_cases.len());
     let batch_identity = OperationDispatch::bind_submission_wave_identity(

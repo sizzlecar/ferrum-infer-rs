@@ -15,7 +15,9 @@ use super::super::{
     SubmissionObservation, SubmissionWavePurpose, TrustedActiveSequenceBinding, VNextError,
     EXECUTION_IDENTITY_VERSION,
 };
-use super::backing_upload::encode_submission_wave_backing_upload;
+use super::backing_upload::{
+    encode_submission_wave_backing_upload, encode_submission_wave_managed_backing_upload,
+};
 use super::determinism::{
     SubmissionWaveDeterminismHandle, SubmissionWaveDeterminismReadbackPlan,
     SubmissionWaveDeterminismRestore,
@@ -1464,6 +1466,19 @@ impl OperationDispatch {
             timing_sink,
             SubmissionWaveDispatchStage::ContractValidateAndReserve,
         );
+        if resolved
+            .execution_plan()
+            .payload()
+            .work_limits()
+            .is_tensor()
+            && (facts_capture != ExecutionFactsCapture::Off
+                || determinism_restore.is_some()
+                || reusable_program.is_some())
+        {
+            return Err(SubmissionWaveDispatchError::Contract(invalid_operation(
+                "fixed tensor first slice supports ordinary submission with execution facts capture Off",
+            )));
+        }
         let active_participant_count = active_bindings.len();
         if providers.is_empty()
             || providers.len() != wave.nodes().len()
@@ -2022,7 +2037,8 @@ impl OperationDispatch {
                             .wave()
                             .claimed_backing()
                             .work_shape()
-                            .immediate_tokens(),
+                            .immediate_tokens()
+                            .map_err(SubmissionWaveDispatchError::Contract)?,
                     )
                     .map_err(SubmissionWaveDispatchError::Contract)?;
                     let compute = runtime
@@ -2235,24 +2251,56 @@ impl OperationDispatch {
                     timing_sink,
                     SubmissionWaveDispatchStage::NodeInvocationConstruct,
                 );
-                let invocation = BatchedOperationInvocation::from_wave_node(
-                    runtime,
-                    resolved,
-                    provider.dispatch(),
-                    batch_identity,
-                    node_identity,
-                    completion.wave(),
-                    node_index,
-                    active_bindings.clone(),
-                )
-                .map_err(SubmissionWaveDispatchError::Contract)?
-                .with_execution_facts_capture(facts_capture);
-                drop(invocation_stage);
-                let expected_phase = invocation.operation().profile_phase;
-                let program_binding = invocation.program_binding().cloned();
-                let dependency_scope = invocation.retained_dependency_scope.clone();
-                let mut operation = match provider.provider().encode_selected(invocation) {
-                    Ok(operation) => operation,
+                let (expected_phase, program_binding, dependency_scope, encoded) = if resolved
+                    .execution_plan()
+                    .payload()
+                    .work_limits()
+                    .is_tensor()
+                {
+                    let invocation = super::TensorOperationInvocation::from_wave_node(
+                        runtime,
+                        resolved,
+                        provider.dispatch(),
+                        batch_identity,
+                        node_identity,
+                        completion.wave(),
+                        node_index,
+                        active_bindings.clone(),
+                    )
+                    .map_err(SubmissionWaveDispatchError::Contract)?;
+                    let phase = invocation.operation().profile_phase;
+                    let binding = invocation.program_binding().cloned();
+                    let scope = invocation.retained_dependency_scope.clone();
+                    drop(invocation_stage);
+                    let encoded = provider.provider().encode_tensor_selected(invocation);
+                    (phase, binding, scope, encoded)
+                } else {
+                    let invocation = BatchedOperationInvocation::from_wave_node(
+                        runtime,
+                        resolved,
+                        provider.dispatch(),
+                        batch_identity,
+                        node_identity,
+                        completion.wave(),
+                        node_index,
+                        active_bindings.clone(),
+                    )
+                    .map_err(SubmissionWaveDispatchError::Contract)?
+                    .with_execution_facts_capture(facts_capture);
+                    let phase = invocation.operation().profile_phase;
+                    let binding = invocation.program_binding().cloned();
+                    let scope = invocation.retained_dependency_scope.clone();
+                    drop(invocation_stage);
+                    let encoded = provider.provider().encode_selected(invocation).map(Some);
+                    (phase, binding, scope, encoded)
+                };
+                let mut operation = match encoded {
+                    Ok(Some(operation)) => operation,
+                    Ok(None) => {
+                        return Err(SubmissionWaveDispatchError::Contract(invalid_operation(
+                            "selected provider declined the compiled fixed tensor work domain",
+                        )))
+                    }
                     Err(failure)
                         if node_identity.contains_identity(failure.identity())
                             && failure.phase() == expected_phase =>
@@ -2648,6 +2696,7 @@ where
             let participant_work = prepared_node
                 .work_shape()
                 .participant_work()
+                .map_err(SubmissionWaveDispatchError::Contract)?
                 .get(participant_index)
                 .ok_or_else(|| {
                     SubmissionWaveDispatchError::Contract(invalid_operation(
@@ -2717,6 +2766,67 @@ pub(super) fn encode_submission_wave_inputs<R>(
 where
     R: DeviceRuntime,
 {
+    // Tensor inputs are a complete exact binding set, never arbitrary host
+    // writes into a permit. Validate all sources before encoding any command.
+    if let Some(ports) = resolved.execution_plan().payload().tensor_ports() {
+        if !runtime.supports_managed_tensor_io() || uploads.len() != ports.inputs().len() {
+            return Err(SubmissionWaveDispatchError::Contract(invalid_operation(
+                "tensor submission requires supported managed IO and its complete input set",
+            )));
+        }
+        let mut seen = BTreeSet::new();
+        for upload in uploads {
+            let port = ports
+                .inputs()
+                .iter()
+                .find(|port| {
+                    port.node_id() == upload.node_id() && port.ordinal() == upload.input_ordinal()
+                })
+                .ok_or_else(|| {
+                    SubmissionWaveDispatchError::Contract(invalid_operation(
+                        "tensor upload is not a compiled input port",
+                    ))
+                })?;
+            let work = completion
+                .work_shape_for_node(port.node_id())
+                .map_err(SubmissionWaveDispatchError::Contract)?;
+            let evidence = work.resource_work().tensor_evidence().ok_or_else(|| {
+                SubmissionWaveDispatchError::Contract(invalid_operation(
+                    "tensor upload lacks admitted tensor evidence",
+                ))
+            })?;
+            let input = evidence
+                .inputs()
+                .iter()
+                .find(|input| input.value_id() == port.value_id())
+                .ok_or_else(|| {
+                    SubmissionWaveDispatchError::Contract(invalid_operation(
+                        "tensor upload lacks its owned input",
+                    ))
+                })?;
+            if !seen.insert(port.value_id())
+                || upload.participant_index() != 0
+                || upload.logical_offset_bytes() != 0
+                || upload.source_layout().element_type() != port.tensor().element_type()
+                || upload
+                    .source_layout()
+                    .byte_len()
+                    .map_err(SubmissionWaveDispatchError::Contract)?
+                    != port
+                        .tensor()
+                        .minimum_storage_bytes()
+                        .map_err(SubmissionWaveDispatchError::Contract)?
+                || upload
+                    .managed_bytes()
+                    .is_none_or(|bytes| !bytes.same_region(input.bytes()))
+            {
+                return Err(SubmissionWaveDispatchError::Contract(invalid_operation(
+                    "tensor upload differs from its exact admitted owner, port or byte range",
+                )));
+            }
+        }
+    }
+
     struct ValidatedInputUpload<'a> {
         upload: &'a SubmissionWaveInputUpload,
         identity: super::super::ExecutionIdentityEnvelope,
@@ -2886,7 +2996,24 @@ where
                     component.resource_id(),
                 )
                 .map_err(SubmissionWaveDispatchError::Contract)?;
-            if contiguous_end == validated_cursor + 1 {
+            if let Some(managed) = first.upload.managed_bytes() {
+                if contiguous_end != validated_cursor + 1 {
+                    return Err(SubmissionWaveDispatchError::Contract(invalid_operation(
+                        "managed tensor input aggregation requires an explicit accounted backing",
+                    )));
+                }
+                encode_submission_wave_managed_backing_upload(
+                    runtime,
+                    &first.identity,
+                    &backing,
+                    BufferUsage::Activations,
+                    first.upload.source_layout().element_type(),
+                    first.destination.start,
+                    managed,
+                    "managed tensor input upload",
+                    |command| commands.push_dynamic_binding(command),
+                )?;
+            } else if contiguous_end == validated_cursor + 1 {
                 encode_submission_wave_backing_upload(
                     runtime,
                     &first.identity,
