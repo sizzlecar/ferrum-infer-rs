@@ -18,6 +18,10 @@ use half::{bf16, f16};
 
 mod layer_norm;
 pub(crate) use layer_norm::ReferenceLayerNormLaunch;
+mod pointwise;
+pub(crate) use pointwise::{
+    ReferenceGatedResidualLaunch, ReferenceModulationScaleLaunch, ReferencePointwiseShape,
+};
 
 static NEXT_RUNTIME_INSTANCE: AtomicU64 = AtomicU64::new(1);
 static NEXT_STREAM_INSTANCE: AtomicU64 = AtomicU64::new(1);
@@ -309,6 +313,12 @@ enum ReferenceCommandKind {
     LayerNorm {
         launch: ReferenceLayerNormLaunch,
     },
+    ModulationScale {
+        launch: ReferenceModulationScaleLaunch,
+    },
+    GatedResidual {
+        launch: ReferenceGatedResidualLaunch,
+    },
 }
 
 /// An owned, fully validated command for the synchronous reference runtime.
@@ -329,6 +339,8 @@ impl fmt::Debug for ReferenceDeviceCommand {
             ReferenceCommandKind::Zero { .. } => "zero",
             ReferenceCommandKind::DenseLinear { .. } => "dense_linear",
             ReferenceCommandKind::LayerNorm { .. } => "layer_norm",
+            ReferenceCommandKind::ModulationScale { .. } => "modulation_scale",
+            ReferenceCommandKind::GatedResidual { .. } => "gated_residual",
         };
         formatter
             .debug_struct("ReferenceDeviceCommand")
@@ -422,6 +434,32 @@ impl ReferenceDeviceCommand {
             compute_dispatch_count: 1,
             transfer_command_count: 0,
             kind: ReferenceCommandKind::LayerNorm { launch },
+        })
+    }
+
+    pub(crate) fn modulation_scale_tensor(
+        launch: ReferenceModulationScaleLaunch,
+    ) -> Result<Self, ReferenceDeviceRuntimeError> {
+        launch.validate()?;
+        Ok(Self {
+            operation: "vnext_modulation_scale_bf16",
+            logical_work: Some(launch.shape.logical_work()?),
+            compute_dispatch_count: 1,
+            transfer_command_count: 0,
+            kind: ReferenceCommandKind::ModulationScale { launch },
+        })
+    }
+
+    pub(crate) fn gated_residual_tensor(
+        launch: ReferenceGatedResidualLaunch,
+    ) -> Result<Self, ReferenceDeviceRuntimeError> {
+        launch.validate()?;
+        Ok(Self {
+            operation: "vnext_gated_residual_bf16",
+            logical_work: Some(launch.shape.logical_work()?),
+            compute_dispatch_count: 1,
+            transfer_command_count: 0,
+            kind: ReferenceCommandKind::GatedResidual { launch },
         })
     }
 
@@ -548,6 +586,12 @@ impl ReferenceDeviceCommand {
                 launch.logical_work()?;
                 Ok(())
             }
+            ReferenceCommandKind::ModulationScale { launch } => {
+                launch.validate_runtime(runtime_instance)
+            }
+            ReferenceCommandKind::GatedResidual { launch } => {
+                launch.validate_runtime(runtime_instance)
+            }
         }
     }
 
@@ -589,6 +633,18 @@ impl ReferenceDeviceCommand {
             ReferenceCommandKind::LayerNorm { launch } => {
                 layer_norm::execute(launch);
                 counters.layer_norm_launches.fetch_add(1, Ordering::Relaxed);
+            }
+            ReferenceCommandKind::ModulationScale { launch } => {
+                pointwise::execute_modulation(launch);
+                counters
+                    .modulation_scale_launches
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            ReferenceCommandKind::GatedResidual { launch } => {
+                pointwise::execute_gated_residual(launch);
+                counters
+                    .gated_residual_launches
+                    .fetch_add(1, Ordering::Relaxed);
             }
         }
     }
@@ -755,6 +811,8 @@ struct ReferenceRuntimeCounters {
     uploaded_bytes: AtomicU64,
     dense_linear_launches: AtomicU64,
     layer_norm_launches: AtomicU64,
+    modulation_scale_launches: AtomicU64,
+    gated_residual_launches: AtomicU64,
     readback_bytes: AtomicU64,
 }
 
@@ -767,6 +825,8 @@ pub struct ReferenceDeviceRuntimeSnapshot {
     pub uploaded_bytes: u64,
     pub dense_linear_launches: u64,
     pub layer_norm_launches: u64,
+    pub modulation_scale_launches: u64,
+    pub gated_residual_launches: u64,
     pub readback_bytes: u64,
 }
 
@@ -889,6 +949,14 @@ impl ReferenceDeviceRuntime {
             uploaded_bytes: self.counters.uploaded_bytes.load(Ordering::Relaxed),
             dense_linear_launches: self.counters.dense_linear_launches.load(Ordering::Relaxed),
             layer_norm_launches: self.counters.layer_norm_launches.load(Ordering::Relaxed),
+            modulation_scale_launches: self
+                .counters
+                .modulation_scale_launches
+                .load(Ordering::Relaxed),
+            gated_residual_launches: self
+                .counters
+                .gated_residual_launches
+                .load(Ordering::Relaxed),
             readback_bytes: self.counters.readback_bytes.load(Ordering::Relaxed),
         }
     }

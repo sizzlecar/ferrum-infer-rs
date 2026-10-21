@@ -32,6 +32,9 @@ mod bf16;
 #[path = "vnext_tensor_reference_runtime/layer_norm.rs"]
 mod layer_norm;
 
+#[path = "vnext_tensor_reference_runtime/pointwise.rs"]
+mod pointwise;
+
 fn id<T>(value: impl Into<String>) -> T
 where
     T: TryFrom<String, Error = VNextError>,

@@ -12,6 +12,8 @@ mod q6_mmq_f32;
 pub use q6_mmq_f32::*;
 mod layer_norm_bf16;
 pub use layer_norm_bf16::*;
+mod pointwise_bf16;
+pub use pointwise_bf16::*;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroU32;
