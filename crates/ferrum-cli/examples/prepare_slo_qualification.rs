@@ -197,3 +197,7 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 #[path = "prepare_slo_qualification/independent_tests.rs"]
 mod independent_tests;
+
+#[cfg(test)]
+#[path = "prepare_slo_qualification/search_boundary_tests.rs"]
+mod search_boundary_tests;

@@ -62,12 +62,45 @@ pub(super) fn bounded_search(
             evaluations: visited.len(),
         });
     }
-    let estimate = probed
+    let mut estimate = probed
         .filter(|&n| n > base)
         .map_or(0, |n| {
             target.saturating_sub(base).saturating_mul(probe) / (n - base)
         })
         .min(max_repeats);
+    // Zero padding can change a template/token boundary, so the first short
+    // slope is only a proposal. Reuse the actual far-point observation to form
+    // one bounded secant proposal between two nonzero measurements. Neither
+    // proposal is accepted without rendering it, and every call uses the same
+    // visited set and original evaluation budget. Flat/inverted/overflowing
+    // slopes retain the finite neighborhood fallback below.
+    if let Some(actual) = observe(estimate, max_evaluations, &mut visited, &mut eval)? {
+        if actual == target {
+            return Ok(SearchHit {
+                repeats: estimate,
+                evaluations: visited.len(),
+            });
+        }
+        if let Some(probed) = probed.filter(|_| probe > 0 && estimate > 0) {
+            let corrected = (|| -> Option<usize> {
+                let x0 = i128::try_from(probe).ok()?;
+                let x1 = i128::try_from(estimate).ok()?;
+                let y0 = i128::try_from(probed).ok()?;
+                let y1 = i128::try_from(actual).ok()?;
+                let dx = x1.checked_sub(x0)?;
+                let dy = y1.checked_sub(y0)?;
+                if dx == 0 || dy == 0 || dx.signum() != dy.signum() {
+                    return None;
+                }
+                let distance = i128::try_from(target).ok()?.checked_sub(y1)?;
+                let proposal = x1.checked_add(distance.checked_mul(dx)?.checked_div(dy)?)?;
+                usize::try_from(proposal.clamp(0, i128::try_from(max_repeats).ok()?)).ok()
+            })();
+            if let Some(corrected) = corrected {
+                estimate = corrected;
+            }
+        }
+    }
     // Enumeration is bounded even when all legal positions were already tried.
     for distance in 0..=max_repeats {
         for candidate in [
