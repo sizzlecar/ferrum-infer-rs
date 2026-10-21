@@ -113,9 +113,15 @@ pub async fn native_resident_capacity_requires_complete_live_incarnations<R: Dev
         ExecutionCloseDisposition::Ended(_)
     ));
     assert!(fixture.resident_cohort_capacity_snapshot(&cohort).is_none());
+    // Ended proves terminal ownership, not that the cancellation recovery
+    // sweep has released its registry/settlement locks and retained Arcs.
+    // The FIFO gate drains that sweep and holds the worker quiescent while
+    // observing capacity; a contended production query must still be unknown.
+    let recovery_idle = lifecycle::WorkerGate::closed(&fixture.completion_worker).await;
     assert!(fixture
         .resident_cohort_capacity_snapshot(std::slice::from_ref(&request))
         .is_some());
+    recovery_idle.open().await;
     assert!(matches!(
         fixture.cancel_tokens(first.sequence()).unwrap().disposition,
         ExecutionCloseDisposition::Ended(_)
