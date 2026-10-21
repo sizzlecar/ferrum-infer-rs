@@ -22,6 +22,9 @@ mod prediction_rejection;
 #[path = "rejection_witness_tests.rs"]
 mod rejection_witness;
 
+#[path = "trajectory_support_tests.rs"]
+mod trajectory_support;
+
 fn config() -> LearningConfig {
     LearningConfig {
         training_samples: 4,

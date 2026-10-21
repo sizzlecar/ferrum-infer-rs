@@ -174,6 +174,23 @@ not mean every execution cost was covered. An unfinished static tail cannot be
 declared Feasible. This rule neither expands model support nor establishes an
 observed serving SLO improvement.
 
+A Known prediction for the next execution does not establish support through a
+request's stopping endpoint. Decode context grows as output is generated, and
+alternative batches can have different aggregate work features. A cold process
+that has only completed shorter requests can therefore keep falling back while
+longer requests run. Increasing the number of short warmup requests does not
+qualify those unseen costs. Retaining a candidate's known prefix also cannot
+prove a required 100% completion rate while its remaining completion time is
+unknown.
+
+Learning can qualify new work after an eligible execution actually completes;
+the snapshot already captured by a comparison remains unchanged. Prior training
+or initialization must supply real completed observations, separate fitting
+from calibration, and preserve the original evidence timestamps. Cost support,
+fresh calibration, stopping-rule support, and product completion evidence are
+distinct requirements. More training data or a loaded model alone does not
+establish all four, or guarantee the client latency SLOs.
+
 Known infeasibility has a separate admission policy under
 `[scheduler.slo.joint.known_infeasible_admission]`: `mode = "reject"` by default,
 or `mode = "wait"` with `max_wait_ms`. A rejected or timed-out arrival remains in
