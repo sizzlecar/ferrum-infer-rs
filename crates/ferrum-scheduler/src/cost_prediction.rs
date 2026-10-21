@@ -341,16 +341,27 @@ impl TimePlanningRound {
     pub fn revision(&self) -> u64 {
         self.snapshot.revision()
     }
+
+    pub fn max_request_participants(&self) -> usize {
+        self.config.planning.max_participants
+    }
+
+    /// Invalidate a previous cohort before attempting a fresh bounded capture.
+    /// A missing member or failed projection must not leave old facts usable.
+    /// The immutable predictor and the round's consumed budgets are unchanged.
+    pub fn clear_request_facts(&mut self) {
+        self.request_facts = None;
+        self.admission_gate = None;
+        self.request_clocks = None;
+        self.request_fact_bytes = 0;
+    }
     /// Freeze the complete request cohort. Missing, duplicate or over-budget
     /// members invalidate the whole projection rather than authorizing a prefix.
     pub fn set_request_facts(
         &mut self,
         facts: impl IntoIterator<Item = (RequestId, RequestStoppingObservation)>,
     ) -> bool {
-        self.request_facts = None;
-        self.admission_gate = None;
-        self.request_clocks = None;
-        self.request_fact_bytes = 0;
+        self.clear_request_facts();
         let mut retained = Vec::new();
         let mut bytes = 0usize;
         for (request_id, fact) in facts {

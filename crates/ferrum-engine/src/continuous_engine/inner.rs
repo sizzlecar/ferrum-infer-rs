@@ -1291,7 +1291,7 @@ impl EngineInner {
         // prediction queries still use their current monotonic time.
         let prefill_shape_policy = self.model_executor.prefill_shape_policy();
         let mut planning = self.config.scheduler.slo.map(|policy| {
-            let mut round = TimePlanningRound::new(
+            TimePlanningRound::new(
                 self.cost_snapshot_source
                     .as_ref()
                     .expect("feedback validated before startup")
@@ -1306,9 +1306,7 @@ impl EngineInner {
                         ferrum_scheduler::cost_prediction::CostExecution::SingleInvocation
                     }
                 },
-            );
-            self.capture_planning_request_facts(&mut round, policy.planning.max_participants);
-            round
+            )
         });
         if self
             .prepare_token_prefill_cohort(&hint, planning.as_mut())
@@ -1329,6 +1327,12 @@ impl EngineInner {
         if self.model_executor.supports_plan_runtime_prefix_restore() {
             self.restore_admitted_prefixes().await?;
             self.refresh_prefix_rendezvous()?;
+        }
+        if let Some(round) = planning.as_mut() {
+            // Admission can retire a rejected member and prefix restoration
+            // can change its execution frontier. The iteration lock excludes
+            // new product publication, but does not freeze those mutations.
+            self.capture_planning_request_facts(round, round.max_request_participants());
         }
         let (scheduled, observations) = {
             let mut availability = self.dynamic_admission_availability.lock();

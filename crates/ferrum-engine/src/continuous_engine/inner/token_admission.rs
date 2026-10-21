@@ -409,23 +409,17 @@ impl EngineInner {
         matches!(result.outcome, AdmissionProbeOutcome::Admitted(_)) && pending.publish().is_ok()
     }
 
-    pub(super) async fn prepare_dynamic_admission_round(
+    pub(in crate::continuous_engine) async fn prepare_dynamic_admission_round(
         &self,
         maximum_admissions: usize,
         mut planning: Option<&mut TimePlanningRound>,
     ) -> Result<(usize, Vec<ExecutorPrefillMaintenanceDeferral>)> {
         if let Some(round) = planning.as_deref_mut() {
             // This path is shared by ordinary admission and fill-first retries.
-            // Refresh resource evidence after earlier asynchronous admissions;
+            // Refresh membership, clocks and resource evidence after earlier
+            // asynchronous admissions and their terminal cleanup;
             // the immutable cost/stopping snapshot remains fixed for the turn.
-            round.set_capacity(self.model_executor.paged_admission_capacity_snapshot().map(
-                |snapshot| ferrum_scheduler::cost_prediction::PlanningCapacity {
-                    block_size: snapshot.slots.block_size,
-                    total_blocks: snapshot.slots.total_blocks,
-                    free_blocks: snapshot.slots.free_blocks,
-                    admission_coverage: snapshot.coverage,
-                },
-            ));
+            self.capture_planning_request_facts(round, round.max_request_participants());
             self.scheduler.prepare_joint_admission_gate(
                 &ferrum_interfaces::BatchHint {
                     max_batch_size: self.config.batching.max_batch_size,

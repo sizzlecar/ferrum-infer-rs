@@ -490,3 +490,116 @@ fn kv_resource_release_does_not_replace_product_lifecycle_or_verified_prefix() {
     sequence.prefill_tokens_processed = 0;
     assert_eq!(sequence.stopping_observation, Some(fact));
 }
+
+#[tokio::test]
+async fn planning_recaptures_after_admission_cleanup_and_invalidates_failed_projection() {
+    use ferrum_scheduler::cost_prediction::{
+        CostExecution, CostPrediction, CostQuery, CostSnapshot, CostUnknownReason,
+    };
+
+    struct Snapshot;
+    impl CostSnapshot for Snapshot {
+        fn revision(&self) -> u64 {
+            73
+        }
+        fn query_limits(&self) -> ferrum_types::CostQueryLimits {
+            Default::default()
+        }
+        fn predict(&self, _: &CostQuery<'_>, _: Instant) -> CostPrediction {
+            CostPrediction::Unknown(CostUnknownReason::NoCoverage)
+        }
+    }
+
+    let cfg = TinyLlamaConfig::default();
+    let config = EngineConfig::default();
+    let engine = ContinuousBatchEngine::new_observed_with_requests(
+        config.clone(),
+        Arc::new(ContinuousBatchScheduler::new(config.scheduler)),
+        tiny_tokenizer(&cfg),
+        Arc::new(crate::registry::GreedySampler),
+        ExecutorOwner::new(Box::new(ferrum_models::LlmExecutor::new(
+            Box::new(tiny_llama_model_with_execution_config(
+                &cfg,
+                Default::default(),
+            )),
+            tiny_model_info(&cfg),
+        ))),
+        None,
+        None,
+        None,
+        Some(Arc::new(Recorder::default())),
+    )
+    .unwrap();
+    let mut ids = Vec::new();
+    let mut responses = Vec::new();
+    for _ in 0..2 {
+        let mut request = request();
+        request.ensure_ingress(ferrum_types::RequestIngressBoundary::EngineApi);
+        let mut sequence = SequenceState::new(request.clone(), vec![TokenId::new(1)]);
+        let (sender, response) = tokio::sync::oneshot::channel();
+        sequence.response_sender = Some(sender);
+        responses.push(Some(response));
+        ids.push(request.id.clone());
+        engine.publish_request(request, sequence).await.unwrap();
+    }
+    let inner = engine.active_inner().unwrap();
+    let mut round = TimePlanningRound::new(
+        Arc::new(Snapshot),
+        "ttft:1000,tpot:100,itl:100".parse().unwrap(),
+        ferrum_execution::model_executor::PrefillShapePolicy::Identity,
+        CostExecution::SingleInvocation,
+    );
+    inner
+        .prepare_dynamic_admission_round(0, Some(&mut round))
+        .await
+        .unwrap();
+    assert_eq!(round.request_facts().unwrap().len(), 2);
+    assert_eq!(round.request_clocks().unwrap().len(), 2);
+
+    // The real scheduler failure queue and engine terminal path remove one
+    // lifetime during a subround. A subsequent subround must not reuse it.
+    inner.scheduler.fail_waiting_admission(
+        &ids[0],
+        FerrumError::request_validation("injected admission rejection"),
+    );
+    inner
+        .prepare_dynamic_admission_round(0, Some(&mut round))
+        .await
+        .unwrap();
+    assert!(inner.sequences.get(&ids[0]).is_none());
+    assert!(matches!(
+        responses[0].take().unwrap().await.unwrap(),
+        Err(FerrumError::RequestValidation { message }) if message == "injected admission rejection"
+    ));
+    inner
+        .prepare_dynamic_admission_round(0, Some(&mut round))
+        .await
+        .unwrap();
+    let facts = round.request_facts().unwrap();
+    assert_eq!(facts.len(), 1);
+    assert_eq!(facts[0].0, ids[1]);
+    assert_eq!(round.request_clocks().unwrap()[0].0, ids[1]);
+    assert_eq!(
+        round.revision(),
+        73,
+        "cohort refresh must not reload the model"
+    );
+
+    let handle = inner.sequences.get(&ids[1]).unwrap();
+    handle.lock().as_mut().unwrap().stopping_observation = None;
+    inner.capture_planning_request_facts(&mut round, 2);
+    assert!(round.request_facts().is_none());
+    assert!(round.request_clocks().is_none());
+    assert_eq!(round.revision(), 73);
+    drop(handle);
+    drop(inner);
+    // The output-control owner also reports the injected request failure;
+    // this must not be mistaken for a new cleanup or planning error.
+    let error = engine.shutdown().await.unwrap_err();
+    assert!(matches!(error, FerrumError::RequestValidation { message }
+        if message == "injected admission rejection"));
+    if let Err(error) = engine.wait_for_shutdown_completion().await {
+        assert!(matches!(error, FerrumError::RequestValidation { message }
+            if message == "injected admission rejection"));
+    }
+}

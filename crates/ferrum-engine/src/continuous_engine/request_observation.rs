@@ -129,6 +129,7 @@ impl EngineInner {
         max_members: usize,
     ) {
         use ferrum_scheduler::cost_prediction::{PlanningCapacity, RequestClockFacts};
+        round.clear_request_facts();
         round.set_capacity(self.model_executor.paged_admission_capacity_snapshot().map(
             |snapshot| PlanningCapacity {
                 block_size: snapshot.slots.block_size,
