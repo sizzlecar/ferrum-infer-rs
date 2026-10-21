@@ -299,6 +299,7 @@ pub struct FixtureOptions {
     pub nonfinite_token: Option<usize>,
     pub reusable_startup: bool,
     pub usable_capacity_bytes: Option<usize>,
+    pub maximum_tokens: usize,
 }
 
 impl Default for FixtureOptions {
@@ -308,6 +309,7 @@ impl Default for FixtureOptions {
             nonfinite_token: None,
             reusable_startup: false,
             usable_capacity_bytes: None,
+            maximum_tokens: MAX_TOKENS,
         }
     }
 }
@@ -465,7 +467,7 @@ impl<R: DeviceRuntime> Fixture<R> {
             1,
             VOCAB,
             VOCAB,
-            MAX_TOKENS,
+            options.maximum_tokens,
             if options.logits_type == ElementType::F16 {
                 ferrum_types::DataType::FP16
             } else {
@@ -484,8 +486,8 @@ impl<R: DeviceRuntime> Fixture<R> {
         let mut engine = EngineConfig::default();
         engine.scheduler.max_running_requests = 3;
         engine.scheduler.max_waiting_requests = 3;
-        engine.batching.max_num_batched_tokens = MAX_TOKENS;
-        engine.runtime.max_model_len = Some(MAX_TOKENS);
+        engine.batching.max_num_batched_tokens = options.maximum_tokens;
+        engine.runtime.max_model_len = Some(options.maximum_tokens);
         engine.runtime.sampling_readback_mode = mode;
         engine.memory.usable_capacity_bytes = options.usable_capacity_bytes;
         if matches!(&info.device, Device::CUDA(_)) {

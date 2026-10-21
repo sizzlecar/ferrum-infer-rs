@@ -4,6 +4,8 @@ use ferrum_models::test_support::{
 };
 use futures::StreamExt;
 
+mod resident_capacity;
+
 struct Recorder {
     records: Mutex<Vec<RequestStoppingObservation>>,
     max_rule_bytes: usize,

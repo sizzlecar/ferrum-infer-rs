@@ -878,7 +878,7 @@ impl EngineInner {
         );
     }
 
-    fn execute_executor_prefill_maintenance(
+    pub(in crate::continuous_engine) fn execute_executor_prefill_maintenance(
         &self,
         maintenance: Vec<ExecutorPrefillMaintenanceDeferral>,
     ) {

@@ -481,7 +481,8 @@ impl TimePlanningRound {
         });
     }
 
-    pub(crate) fn resident_capacity(
+    /// Current complete-cohort observation, invalidated by fact/resource refresh.
+    pub fn resident_capacity(
         &self,
     ) -> Option<ferrum_execution::model_executor::ResidentCohortCapacitySnapshot> {
         self.resident_capacity

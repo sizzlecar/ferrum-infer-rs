@@ -165,16 +165,18 @@ impl EngineInner {
             let Some(fact) = &sequence.stopping_observation else {
                 return;
             };
-            if sequence.execution_close.is_none() && sequence.pending_token_admission.is_none() {
-                if let Some((frontier, through_tokens)) = sequence
-                    .execution_frontier
-                    .as_ref()
-                    .zip(sequence.input_tokens.len().checked_add(fact.cap))
-                {
+            if sequence.execution_close.is_none()
+                && sequence.pending_token_admission.is_none()
+                && fact.cap == sequence.sampling_params.max_tokens
+            {
+                if let Some(frontier) = sequence.execution_frontier.as_ref() {
                     residents.push(
                         ferrum_execution::model_executor::ResidentSequenceCapacityRequest {
                             sequence: frontier.sequence().clone(),
-                            through_tokens,
+                            // The final sampled token is not consumed by a
+                            // subsequent invocation. Use the same execution
+                            // ceiling as actual admission, including replay.
+                            through_tokens: sequence.model_maximum_sequence_tokens(),
                         },
                     );
                 }
