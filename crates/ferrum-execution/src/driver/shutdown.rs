@@ -83,6 +83,16 @@ pub(super) fn preparation_error<R: DeviceRuntime>(
     crate::ExecutorBuildError::with_cleanup(cause, cleanup)
 }
 
+/// Preserve the original no-static plan and any quarantined dynamic allocation
+/// when cold startup maintenance fails before the executor is constructed.
+pub(super) fn resources_error<R: DeviceRuntime>(
+    resources: Arc<PlanRuntimeResources<R>>,
+    cause: FerrumError,
+) -> crate::ExecutorBuildError {
+    let cleanup = begin_owned(Owner::Resources(Some(resources)), Some(cause.clone()));
+    crate::ExecutorBuildError::with_cleanup(cause, cleanup)
+}
+
 fn begin_owned<R: DeviceRuntime>(
     owner: Owner<R>,
     error: Option<FerrumError>,

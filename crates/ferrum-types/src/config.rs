@@ -889,6 +889,14 @@ impl EngineConfig {
                 value,
             )?);
         }
+        if let Some(entry) = snapshot
+            .entries
+            .iter()
+            .find(|entry| entry.key == crate::PERSISTENT_POOL_PREPARATION_CONFIG_KEY)
+        {
+            self.memory.persistent_pool_preparation =
+                crate::PersistentPoolPreparation::parse_config_entry(entry)?;
+        }
         if let Some(value) = runtime_config_value(snapshot, "FERRUM_BATCHED_GRAPH") {
             self.backend.enable_cuda_graphs = parse_presence_bool(value)?;
         }
@@ -1574,6 +1582,9 @@ impl KvCacheDtype {
 /// Memory management configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MemoryConfig {
+    /// Optional startup residency; the original allocator may reclaim it later.
+    #[serde(default)]
+    pub persistent_pool_preparation: crate::PersistentPoolPreparation,
     /// Memory pool size in bytes
     pub pool_size: Option<usize>,
     /// Exact device-wide usable runtime budget in bytes. When present this
@@ -1655,6 +1666,7 @@ impl MemoryConfig {
 impl Default for MemoryConfig {
     fn default() -> Self {
         Self {
+            persistent_pool_preparation: crate::PersistentPoolPreparation::DemandDriven,
             pool_size: None,
             usable_capacity_bytes: None,
             enable_pooling: true,

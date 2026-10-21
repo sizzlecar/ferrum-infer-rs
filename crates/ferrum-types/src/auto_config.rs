@@ -1310,6 +1310,7 @@ impl FerrumConfigBuilder {
             )?,
             execution.causal_decode_kv_reuse_decision()?,
             execution.sequence_backing_growth_decision()?,
+            execution.persistent_pool_preparation_decision()?,
             execution.q4_mmvq_weight_decode_decision()?,
             execution.q5_mmvq_weight_decode_decision()?,
             execution.q8_projection_weight_preparation_decision()?,
@@ -3011,6 +3012,46 @@ impl FerrumConfigBuilder {
             vec![
                 RuntimeConfigEffect::Performance,
                 RuntimeConfigEffect::Memory,
+            ],
+        ))
+    }
+
+    fn persistent_pool_preparation_decision(&self) -> Result<AutoConfigDecision, AutoConfigError> {
+        let key = crate::PERSISTENT_POOL_PREPARATION_CONFIG_KEY;
+        let invalid = |reason| AutoConfigError::InvalidOverride {
+            key: key.to_owned(),
+            reason,
+        };
+        let (mode, source, source_key) = match self.entry(key) {
+            Some(entry) => (
+                crate::PersistentPoolPreparation::parse_config_entry(entry).map_err(invalid)?,
+                auto_config_source_from_runtime(entry.source),
+                Some(key.to_owned()),
+            ),
+            None => (
+                crate::PersistentPoolPreparation::DemandDriven,
+                AutoConfigSource::Default,
+                None,
+            ),
+        };
+        if mode == crate::PersistentPoolPreparation::ConfiguredEnvelope
+            && self.execution_planning_model != ExecutionPlanningModel::CompiledPlan
+        {
+            return Err(invalid(
+                "configured-envelope persistent pool preparation requires a compiled-plan executor"
+                    .into(),
+            ));
+        }
+        Ok(self.decision(
+            "persistent_pool_preparation",
+            mode.as_runtime_value(),
+            source,
+            source_key,
+            ["demand-driven", "configured-envelope"],
+            Vec::new(),
+            vec![
+                RuntimeConfigEffect::Memory,
+                RuntimeConfigEffect::Performance,
             ],
         ))
     }

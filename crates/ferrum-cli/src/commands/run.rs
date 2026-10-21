@@ -783,6 +783,11 @@ pub struct RunCommand {
     #[arg(long, value_name = "BYTES")]
     pub runtime_memory_budget_bytes: Option<std::num::NonZeroUsize>,
 
+    /// Preallocate the configured persistent envelope at startup (native plans only).
+    /// Original maintenance may reclaim idle backing; this is not a hard resident floor.
+    #[arg(long, value_enum)]
+    pub persistent_pool_preparation: Option<crate::commands::PersistentPoolPreparationArg>,
+
     /// vLLM-compatible alias for `FERRUM_MAX_MODEL_LEN`.
     #[arg(long, value_name = "N")]
     pub max_model_len: Option<usize>,
@@ -2827,6 +2832,12 @@ fn run_startup_cli_runtime_entries(
     );
     crate::runtime_env::push_cli_runtime_entry(
         &mut entries,
+        ferrum_types::PERSISTENT_POOL_PREPARATION_CONFIG_KEY,
+        cmd.persistent_pool_preparation
+            .map(crate::commands::PersistentPoolPreparationArg::as_runtime_value),
+    );
+    crate::runtime_env::push_cli_runtime_entry(
+        &mut entries,
         ferrum_types::Q4_MMVQ_WEIGHT_DECODE_CONFIG_KEY,
         cmd.q4_mmvq_weight_decode
             .map(crate::commands::Q4MmvqWeightDecodeArg::as_runtime_value),
@@ -3396,6 +3407,7 @@ mod tests {
             seed: None,
             gpu_memory_utilization: 0.9,
             runtime_memory_budget_bytes: None,
+            persistent_pool_preparation: None,
             max_model_len: None,
             max_num_seqs: None,
             max_num_batched_tokens: None,
@@ -6568,6 +6580,47 @@ mod tests {
                     .unwrap()
                     .source,
                 source
+            );
+        }
+    }
+
+    #[test]
+    fn persistent_pool_preparation_run_preserves_config_and_cli_precedence() {
+        use ferrum_types::PersistentPoolPreparation as Mode;
+        for (cli, expected) in [
+            (None, Mode::ConfiguredEnvelope),
+            (
+                Some(crate::commands::PersistentPoolPreparationArg::DemandDriven),
+                Mode::DemandDriven,
+            ),
+        ] {
+            let entries = crate::config::RuntimeCliConfig {
+                persistent_pool_preparation: Some(Mode::ConfiguredEnvelope),
+                ..Default::default()
+            }
+            .runtime_config_entries();
+            let mut command = test_run_cmd();
+            command.persistent_pool_preparation = cli;
+            let snapshot = crate::commands::serve::merge_runtime_config_sources(
+                entries,
+                ferrum_types::RuntimeConfigSnapshot::default(),
+                run_startup_cli_runtime_entries(&command, None),
+            );
+            let mut engine = ferrum_types::EngineConfig::default();
+            engine.apply_runtime_config_snapshot(&snapshot).unwrap();
+            assert_eq!(engine.memory.persistent_pool_preparation, expected);
+            let entry = snapshot
+                .entries
+                .iter()
+                .find(|e| e.key == ferrum_types::PERSISTENT_POOL_PREPARATION_CONFIG_KEY)
+                .unwrap();
+            assert_eq!(
+                entry.source,
+                if cli.is_some() {
+                    ferrum_types::RuntimeConfigSource::Cli
+                } else {
+                    ferrum_types::RuntimeConfigSource::ConfigFile
+                }
             );
         }
     }

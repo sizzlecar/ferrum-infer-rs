@@ -11,6 +11,7 @@ fn execution_config_is_typed_only(key: &str) -> bool {
     matches!(
         key,
         "FERRUM_KV_MAX_BLOCKS"
+            | "FERRUM_PERSISTENT_POOL_PREPARATION"
             | "FERRUM_METAL_PAGED_KV"
             | "FERRUM_PAGED_MAX_SEQS"
             | "FERRUM_CUDA_GRAPH"
@@ -158,6 +159,25 @@ pub fn runtime_snapshot_value<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn persistent_pool_preparation_never_materializes_hidden_environment() {
+        let entry = RuntimeConfigEntry::new(
+            ferrum_types::PERSISTENT_POOL_PREPARATION_CONFIG_KEY,
+            "configured-envelope",
+            RuntimeConfigSource::Cli,
+        );
+        let before = std::env::var_os(&entry.key);
+        assert!(materialize_runtime_env_defaults(std::slice::from_ref(&entry)).is_empty());
+        assert!(
+            materialize_runtime_env_effective(&RuntimeConfigSnapshot::from_entries([entry]))
+                .is_empty()
+        );
+        assert_eq!(
+            std::env::var_os(ferrum_types::PERSISTENT_POOL_PREPARATION_CONFIG_KEY),
+            before
+        );
+    }
 
     fn snapshot(entries: &[(&str, &str, RuntimeConfigSource)]) -> RuntimeConfigSnapshot {
         RuntimeConfigSnapshot::from_entries(

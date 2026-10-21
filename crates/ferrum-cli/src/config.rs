@@ -219,6 +219,9 @@ pub struct DevConfig {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct RuntimeCliConfig {
+    /// Initial persistent-pool residency for compiled-plan executors only.
+    #[serde(default)]
+    pub persistent_pool_preparation: Option<ferrum_types::PersistentPoolPreparation>,
     /// Named startup/runtime preset. Presets provide product-owned default
     /// bundles and can still be overridden by explicit runtime keys below,
     /// environment variables, or CLI flags.
@@ -517,6 +520,12 @@ impl RuntimeCliConfig {
             ferrum_types::SEQUENCE_BACKING_GROWTH_CONFIG_KEY,
             self.sequence_backing_growth
                 .map(ferrum_types::SequenceBackingGrowth::as_runtime_value),
+        );
+        push_string_entry(
+            &mut entries,
+            ferrum_types::PERSISTENT_POOL_PREPARATION_CONFIG_KEY,
+            self.persistent_pool_preparation
+                .map(ferrum_types::PersistentPoolPreparation::as_runtime_value),
         );
         push_string_entry(
             &mut entries,
@@ -1939,5 +1948,32 @@ mod tests {
             "[runtime]\nsequence_backing_growth = \"automatic\"\n"
         )
         .is_err());
+    }
+
+    #[test]
+    fn persistent_pool_preparation_toml_values_are_typed() {
+        for mode in [
+            ferrum_types::PersistentPoolPreparation::DemandDriven,
+            ferrum_types::PersistentPoolPreparation::ConfiguredEnvelope,
+        ] {
+            let parsed: CliConfig = toml::from_str(&format!(
+                "[runtime]\npersistent_pool_preparation = {:?}\n",
+                mode.as_runtime_value()
+            ))
+            .unwrap();
+            assert_eq!(parsed.runtime.persistent_pool_preparation, Some(mode));
+            let entry = parsed
+                .runtime
+                .runtime_config_entries()
+                .into_iter()
+                .find(|e| e.key == ferrum_types::PERSISTENT_POOL_PREPARATION_CONFIG_KEY)
+                .unwrap();
+            assert_eq!(entry.effective_value, mode.as_runtime_value());
+            assert_eq!(entry.source, ferrum_types::RuntimeConfigSource::ConfigFile);
+        }
+        assert!(
+            toml::from_str::<CliConfig>("[runtime]\npersistent_pool_preparation = \"auto\"\n")
+                .is_err()
+        );
     }
 }

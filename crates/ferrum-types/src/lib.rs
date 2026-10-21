@@ -68,3 +68,5 @@ pub type Result<T> = std::result::Result<T, FerrumError>;
 
 /// Block identifier type  
 pub type BlockId = u32;
+mod persistent_pool_preparation;
+pub use persistent_pool_preparation::*;

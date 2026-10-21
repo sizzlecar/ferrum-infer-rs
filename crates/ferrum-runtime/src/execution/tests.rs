@@ -808,6 +808,75 @@ fn startup_memory_accounts_for_hybrid_state_and_each_sequences_physical_padding(
 }
 
 #[test]
+fn persistent_startup_peak_includes_static_and_transient_wave_without_preallocating_wave() {
+    let fixed_storage = DynamicStorageContract::new(
+        linear_profile(),
+        canonical_fingerprint(&"persistent-cell", "test").unwrap(),
+    )
+    .unwrap();
+    let sequence = DynamicResourceDescriptor::new(
+        ResourceId::new("sequence/state").unwrap(),
+        DynamicResourceDemand::fixed(64).unwrap(),
+        16,
+        BufferUsage::State,
+        ElementType::U8,
+        AllocationLifetime::Sequence,
+        AllocationKind::Value,
+        fixed_storage,
+        StateInitialization::None,
+        8,
+    )
+    .unwrap();
+    let storage = DynamicStorageContract::new(
+        linear_profile(),
+        workspace_storage_layout_fingerprint().unwrap(),
+    )
+    .unwrap();
+    let weight = ResourceAllocation::new(
+        ResourceId::new("weight/data").unwrap(),
+        128,
+        16,
+        BufferUsage::Persistent,
+        ElementType::U8,
+        AllocationKind::Persistent {
+            node_id: NodeId::new("node/test").unwrap(),
+        },
+        storage.clone(),
+    )
+    .unwrap();
+    let workspace = step_descriptor("activation/test", 64, BufferUsage::Activations, storage);
+    let nodes = [plan_node("node/test", &[], &["activation/test"])];
+    let make = |capacity| {
+        MemoryPlan::from_core(
+            capacity,
+            capacity,
+            0,
+            8,
+            vec![weight.clone()],
+            vec![sequence.clone(), workspace.clone()],
+            &nodes,
+            None,
+        )
+        .unwrap()
+    };
+    let full = make(2048).persistent_preallocation_plan(4, 4, 8).unwrap();
+    assert_eq!(full.persistent_bytes(), 4 * 64);
+    assert_eq!(full.checked_peak_bytes(), 128 + 4 * 64 + 8 * 64);
+    assert_eq!(
+        full.pools().len(),
+        1,
+        "transient wave pool is not preallocated"
+    );
+    assert!(matches!(
+        make(895).persistent_preallocation_plan(4, 4, 8),
+        Err(VNextError::PlanCapacityExceeded {
+            required_bytes: 896,
+            usable_capacity_bytes: 895
+        })
+    ));
+}
+
+#[test]
 fn startup_memory_reuses_only_proven_step_slots_and_ordered_invocations() {
     let storage = DynamicStorageContract::new(
         linear_profile(),

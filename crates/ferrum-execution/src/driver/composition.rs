@@ -96,6 +96,7 @@ pub struct CompiledProgram<'a, R: DeviceRuntime> {
     pub(super) checkpoint_selection: Option<VNextCheckpointSelection>,
     pub(super) repetition_capacity: u64,
     pub(super) executor_startup: StartupPhaseTimer,
+    pub(super) persistent_preallocation: Option<PersistentPreallocationPlan>,
 }
 
 impl<R: DeviceRuntime> RuntimeComposition<R> {
@@ -195,6 +196,24 @@ impl<R: DeviceRuntime> RuntimeComposition<R> {
         config
             .plan_observation
             .validate_compilation(family, &compilation)?;
+        // Metadata-only full-shape rejection precedes static provisioning and
+        // weight initialization. Default demand-driven startup adds no work.
+        let persistent_preallocation = match config.persistent_pool_preparation {
+            ferrum_types::PersistentPoolPreparation::DemandDriven => None,
+            ferrum_types::PersistentPoolPreparation::ConfiguredEnvelope => Some(
+                compilation
+                    .executable()
+                    .execution_plan()
+                    .payload()
+                    .memory()
+                    .persistent_preallocation_plan(
+                        input_capacity,
+                        config.runtime_policy.memory().maximum_active_sequences,
+                        config.runtime_policy.admission().maximum_scheduled_tokens,
+                    )
+                    .map_err(ProgramCompilationError::from_plan)?,
+            ),
+        };
         compile_phase.finish();
         Ok(CompiledProgram {
             composition: self,
@@ -206,6 +225,7 @@ impl<R: DeviceRuntime> RuntimeComposition<R> {
             checkpoint_selection,
             repetition_capacity,
             executor_startup,
+            persistent_preallocation,
         })
     }
 }

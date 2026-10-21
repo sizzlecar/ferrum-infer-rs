@@ -12,7 +12,9 @@ use super::{
     StepResourceSlotKind, VNextError, MAX_EXECUTION_PLAN_RESOURCE_ROWS,
 };
 
+mod persistent_preallocation;
 mod startup;
+pub use persistent_preallocation::*;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct MemoryPlan {
@@ -40,7 +42,7 @@ pub struct MemoryPlan {
 
 impl MemoryPlan {
     #[cfg(test)]
-    pub(super) fn from_core(
+    pub(crate) fn from_core(
         device_capacity_bytes: u64,
         policy_capacity_bytes: u64,
         reserve_bytes: u64,

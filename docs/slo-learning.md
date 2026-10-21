@@ -230,3 +230,10 @@ Use [performance evaluation](performance-evaluation.md) for held-out request
 selection, fixed workload/capacity, latency definitions and reporting. Compare
 static, Observe, Physical and GBDT under the same initial state; do not tune the
 family on the final evaluation requests.
+
+Compiled-plan comparisons can explicitly select
+[`configured-envelope` persistent pool preparation](persistent-pool-preparation.md)
+for every arm on that backend. Its default remains `demand-driven`; the option
+checks the full configured memory shape and allocates persistent backing before
+readiness. The backing remains reclaimable, and the scheduler still checks
+actual owners on every capacity observation.

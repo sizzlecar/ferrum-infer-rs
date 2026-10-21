@@ -3,6 +3,21 @@
 use clap::ValueEnum;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum PersistentPoolPreparationArg {
+    DemandDriven,
+    ConfiguredEnvelope,
+}
+
+impl PersistentPoolPreparationArg {
+    pub const fn as_runtime_value(self) -> &'static str {
+        match self {
+            Self::DemandDriven => "demand-driven",
+            Self::ConfiguredEnvelope => "configured-envelope",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum PrefillDecodeExecutionArg {
     Split,
     Mixed,
@@ -938,6 +953,44 @@ mod tests {
                 "test-model",
                 "--sequence-backing-growth",
                 "automatic"
+            ])
+            .is_err());
+        }
+    }
+
+    #[test]
+    fn persistent_pool_preparation_cli_values_match_run_and_serve() {
+        for command in ["run", "serve"] {
+            let selected =
+                |arguments: &[&str]| match TestCli::try_parse_from(arguments).unwrap().command {
+                    TestCommand::Run(cmd) => cmd.persistent_pool_preparation,
+                    TestCommand::Serve(cmd) => cmd.persistent_pool_preparation,
+                };
+            assert_eq!(selected(&["ferrum", command, "test-model"]), None);
+            for (value, expected) in [
+                ("demand-driven", PersistentPoolPreparationArg::DemandDriven),
+                (
+                    "configured-envelope",
+                    PersistentPoolPreparationArg::ConfiguredEnvelope,
+                ),
+            ] {
+                assert_eq!(
+                    selected(&[
+                        "ferrum",
+                        command,
+                        "test-model",
+                        "--persistent-pool-preparation",
+                        value
+                    ]),
+                    Some(expected)
+                );
+            }
+            assert!(TestCli::try_parse_from([
+                "ferrum",
+                command,
+                "test-model",
+                "--persistent-pool-preparation",
+                "auto"
             ])
             .is_err());
         }

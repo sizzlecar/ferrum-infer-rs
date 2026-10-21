@@ -973,6 +973,14 @@ fn validate_causal_decode_preparation_mode(
     config: &ComponentConfig,
     plan_runtime: bool,
 ) -> Result<()> {
+    if config.engine_config.memory.persistent_pool_preparation
+        == ferrum_types::PersistentPoolPreparation::ConfiguredEnvelope
+        && !plan_runtime
+    {
+        return Err(FerrumError::unsupported(
+            "configured-envelope persistent pool preparation requires a compiled-plan executor",
+        ));
+    }
     validate_q4_mmvq_weight_decode(config, plan_runtime)?;
     validate_q5_mmvq_weight_decode(config, plan_runtime)?;
     validate_q8_projection_weight_preparation(config, plan_runtime)?;
@@ -1875,6 +1883,7 @@ pub(crate) mod tests {
     use std::path::{Path, PathBuf};
 
     mod mixed_batch_tests;
+    mod persistent_startup_tests;
 
     #[test]
     fn sequence_backing_growth_direct_factories_reject_unsupported_execution() {

@@ -103,6 +103,11 @@ pub struct ServeCommand {
     #[arg(long, value_name = "BYTES")]
     pub runtime_memory_budget_bytes: Option<std::num::NonZeroUsize>,
 
+    /// Preallocate the configured persistent envelope at startup (native plans only).
+    /// Original maintenance may reclaim idle backing; this is not a hard resident floor.
+    #[arg(long, value_enum)]
+    pub persistent_pool_preparation: Option<crate::commands::PersistentPoolPreparationArg>,
+
     /// vLLM-compatible alias for `FERRUM_MAX_MODEL_LEN`.
     #[arg(long, value_name = "N")]
     pub max_model_len: Option<usize>,
@@ -482,6 +487,7 @@ async fn run_serve_lifecycle(
         layer_split_pipeline_mode,
         gpu_memory_utilization,
         runtime_memory_budget_bytes,
+        persistent_pool_preparation,
         max_model_len,
         max_num_seqs,
         max_num_batched_tokens,
@@ -891,6 +897,10 @@ async fn run_serve_lifecycle(
     push_sequence_backing_growth_cli_entry(
         &mut startup_cli_runtime_entries,
         sequence_backing_growth,
+    );
+    push_persistent_pool_preparation_cli_entry(
+        &mut startup_cli_runtime_entries,
+        persistent_pool_preparation,
     );
     push_q4_mmvq_weight_decode_cli_entry(&mut startup_cli_runtime_entries, q4_mmvq_weight_decode);
     push_q5_mmvq_weight_decode_cli_entry(&mut startup_cli_runtime_entries, q5_mmvq_weight_decode);
@@ -1901,6 +1911,17 @@ fn push_sequence_backing_growth_cli_entry(
     );
 }
 
+fn push_persistent_pool_preparation_cli_entry(
+    entries: &mut Vec<RuntimeConfigEntry>,
+    policy: Option<crate::commands::PersistentPoolPreparationArg>,
+) {
+    push_cli_runtime_entry(
+        entries,
+        ferrum_types::PERSISTENT_POOL_PREPARATION_CONFIG_KEY,
+        policy.map(crate::commands::PersistentPoolPreparationArg::as_runtime_value),
+    );
+}
+
 fn push_cli_runtime_usize(entries: &mut Vec<RuntimeConfigEntry>, key: &str, value: Option<usize>) {
     if let Some(value) = value {
         entries.push(RuntimeConfigEntry::new(
@@ -2088,7 +2109,11 @@ pub(crate) fn write_resolved_execution_config(
     // from requested runtime options. Keep the source and dtype vocabulary
     // intact: a model-owned cache is not a resolved numerical plan.
     object.remove("model_kv_storage");
+    object.remove("startup_persistent_preparation");
     if let Some(snapshot) = executor_snapshot {
+        if let Some(receipt) = snapshot.get("startup_persistent_preparation") {
+            object.insert("startup_persistent_preparation".into(), receipt.clone());
+        }
         if let (Some(source), Some(dtype)) = (
             snapshot.get("source").and_then(serde_json::Value::as_str),
             snapshot.get("kv_dtype").and_then(serde_json::Value::as_str),
@@ -4329,6 +4354,11 @@ mod tests {
             "numerical_execution": {"selected_profile": "fixture.int8"},
             "kv_storage": {"source": "resolved_model_plan", "selected": "int8_per_token_head_f32_scale_v1"},
             "attention_execution_policy": "portable",
+            "startup_persistent_preparation": {
+                "mode": "configured-envelope",
+                "plan": {"context_tokens": 16, "active_sequences": 4, "step_tokens": 8, "checked_peak_bytes": 896},
+                "actual_growth": {"growths": [{"pool_id": "fixture-pool", "chunk_bytes": 256, "published_capacity_bytes": 256}]}
+            },
         });
         let slo = "ttft:200,tpot:15,itl:50".parse().unwrap();
         write_resolved_execution_config(Some(&path), Some(&selected), Some(slo)).unwrap();
@@ -4345,8 +4375,21 @@ mod tests {
         );
         assert_eq!(actual["attention_execution_policy"], "portable");
         assert_eq!(
+            actual["startup_persistent_preparation"],
+            selected["startup_persistent_preparation"]
+        );
+        assert_eq!(
             actual["scheduler"]["slo"],
             serde_json::to_value(slo).unwrap()
+        );
+        write_resolved_execution_config(Some(&path), Some(&serde_json::json!({})), None).unwrap();
+        let without_receipt: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert!(
+            without_receipt
+                .get("startup_persistent_preparation")
+                .is_none(),
+            "a later snapshot without an owner receipt must clear stale preparation evidence"
         );
     }
     #[test]
@@ -4782,6 +4825,47 @@ mod tests {
                     .unwrap()
                     .source,
                 source
+            );
+        }
+    }
+
+    #[test]
+    fn persistent_pool_preparation_serve_preserves_config_and_cli_precedence() {
+        use ferrum_types::PersistentPoolPreparation as Mode;
+        for (cli, expected) in [
+            (None, Mode::ConfiguredEnvelope),
+            (
+                Some(crate::commands::PersistentPoolPreparationArg::DemandDriven),
+                Mode::DemandDriven,
+            ),
+        ] {
+            let entries = crate::config::RuntimeCliConfig {
+                persistent_pool_preparation: Some(Mode::ConfiguredEnvelope),
+                ..Default::default()
+            }
+            .runtime_config_entries();
+            let mut cli_entries = Vec::new();
+            push_persistent_pool_preparation_cli_entry(&mut cli_entries, cli);
+            let snapshot = merge_runtime_config_sources(
+                entries,
+                RuntimeConfigSnapshot::default(),
+                cli_entries,
+            );
+            let mut engine = ferrum_types::EngineConfig::default();
+            engine.apply_runtime_config_snapshot(&snapshot).unwrap();
+            assert_eq!(engine.memory.persistent_pool_preparation, expected);
+            let entry = snapshot
+                .entries
+                .iter()
+                .find(|e| e.key == ferrum_types::PERSISTENT_POOL_PREPARATION_CONFIG_KEY)
+                .unwrap();
+            assert_eq!(
+                entry.source,
+                if cli.is_some() {
+                    RuntimeConfigSource::Cli
+                } else {
+                    RuntimeConfigSource::ConfigFile
+                }
             );
         }
     }

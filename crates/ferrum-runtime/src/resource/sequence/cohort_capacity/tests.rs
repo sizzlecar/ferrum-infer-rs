@@ -1,5 +1,33 @@
 use super::*;
 
+impl Harness {
+    /// Other parallel fixtures share the process cleanup registry. Wait only
+    /// for its transient observation contention; preserve every actual result.
+    pub(super) fn observed_persistent_capacity(
+        &self,
+        residents: &[(Arc<SequenceSession<TestRuntime>>, u64)],
+        ceilings: &[u64],
+        slots: usize,
+        budget: PersistentCapacityInspectionBudget,
+    ) -> Result<(), PersistentCapacityUnknown> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            let _settled_cleanup = self.root.deferred_cleanup_status();
+            let result = self
+                .root
+                .persistent_capacity_for_cohort(residents, ceilings, slots, budget);
+            if result != Err(PersistentCapacityUnknown::Contended) {
+                return result;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "original capacity observation remained contended"
+            );
+            std::thread::yield_now();
+        }
+    }
+}
+
 fn envelope_harness(profile: DynamicStorageProfile, demand: TestDemand, bytes: u64) -> Harness {
     let catalog = pool_catalog(profile, AllocationLifetime::Sequence, 'b', 1, 4096, demand);
     let h = harness(new_runtime(&catalog, 4096), catalog, 4096, false);
@@ -19,15 +47,13 @@ fn persistent_envelope_bounds_live_slots_instead_of_allocating_the_waiting_queue
     let before = h.root.dynamic_pool_status().unwrap();
     let allocations = h.runtime.allocate_calls();
     assert_eq!(
-        h.root
-            .persistent_capacity_for_cohort(&[], &ceilings, 8, Default::default()),
+        h.observed_persistent_capacity(&[], &ceilings, 8, Default::default()),
         Ok(())
     );
     assert_eq!(h.root.dynamic_pool_status().unwrap(), before);
     assert_eq!(h.runtime.allocate_calls(), allocations);
     assert_eq!(
-        h.root
-            .persistent_capacity_for_cohort(&[], &ceilings, 4, Default::default()),
+        h.observed_persistent_capacity(&[], &ceilings, 4, Default::default()),
         Err(PersistentCapacityUnknown::PendingOwner)
     );
 }
@@ -42,7 +68,7 @@ fn persistent_envelope_counts_exact_current_owner_and_rejects_unreturned_owner()
     let ceilings = [4; 16];
     let before = h.root.dynamic_pool_status().unwrap();
     assert_eq!(
-        h.root.persistent_capacity_for_cohort(
+        h.observed_persistent_capacity(
             &[(Arc::clone(&session), 4)],
             &ceilings,
             8,
@@ -54,14 +80,12 @@ fn persistent_envelope_counts_exact_current_owner_and_rejects_unreturned_owner()
     drop(session);
     // Last backing generation still retains the original logical slot/parent.
     assert_eq!(
-        h.root
-            .persistent_capacity_for_cohort(&[], &ceilings, 8, Default::default()),
+        h.observed_persistent_capacity(&[], &ceilings, 8, Default::default()),
         Err(PersistentCapacityUnknown::PendingOwner)
     );
     drop(retained);
     assert_eq!(
-        h.root
-            .persistent_capacity_for_cohort(&[], &ceilings, 8, Default::default()),
+        h.observed_persistent_capacity(&[], &ceilings, 8, Default::default()),
         Ok(())
     );
 }
@@ -97,8 +121,7 @@ fn persistent_envelope_requires_actual_backing_and_every_persistent_pool() {
         .grow_pool(&fixed_id, 448)
         .unwrap();
     assert_eq!(
-        h.root
-            .persistent_capacity_for_cohort(&[], &[4; 16], 8, Default::default()),
+        h.observed_persistent_capacity(&[], &[4; 16], 8, Default::default()),
         Err(PersistentCapacityUnknown::InsufficientBacking)
     );
     h.root
@@ -106,8 +129,7 @@ fn persistent_envelope_requires_actual_backing_and_every_persistent_pool() {
         .grow_pool(&fixed_id, 64)
         .unwrap();
     assert_eq!(
-        h.root
-            .persistent_capacity_for_cohort(&[], &[4; 16], 8, Default::default()),
+        h.observed_persistent_capacity(&[], &[4; 16], 8, Default::default()),
         Ok(())
     );
 }
@@ -116,17 +138,13 @@ fn persistent_envelope_requires_actual_backing_and_every_persistent_pool() {
 fn persistent_envelope_rejects_variable_or_misaligned_contiguous_packing() {
     let variable = envelope_harness(linear_profile(), TestDemand::Tokens, 2048);
     assert_eq!(
-        variable
-            .root
-            .persistent_capacity_for_cohort(&[], &[4; 8], 8, Default::default()),
+        variable.observed_persistent_capacity(&[], &[4; 8], 8, Default::default()),
         Err(PersistentCapacityUnknown::UnsupportedPacking)
     );
     let fixed = envelope_harness(linear_profile(), TestDemand::Fixed, 528);
     // Enough aggregate bytes but a 16-byte tail is not a complete64-byte cell.
     assert_eq!(
-        fixed
-            .root
-            .persistent_capacity_for_cohort(&[], &[4; 8], 8, Default::default()),
+        fixed.observed_persistent_capacity(&[], &[4; 8], 8, Default::default()),
         Err(PersistentCapacityUnknown::UnsupportedPacking)
     );
 }
@@ -142,14 +160,12 @@ fn persistent_envelope_rejects_prepared_foreign_claim_and_recovers_after_rollbac
         panic!("existing backing must prepare");
     };
     assert_eq!(
-        h.root
-            .persistent_capacity_for_cohort(&[], &[4; 16], 8, Default::default()),
+        h.observed_persistent_capacity(&[], &[4; 16], 8, Default::default()),
         Err(PersistentCapacityUnknown::PendingOwner)
     );
     drop(prepared);
     assert_eq!(
-        h.root
-            .persistent_capacity_for_cohort(&[], &[4; 16], 8, Default::default()),
+        h.observed_persistent_capacity(&[], &[4; 16], 8, Default::default()),
         Ok(())
     );
 }
@@ -162,8 +178,7 @@ fn persistent_envelope_stays_bounded_and_try_only() {
         ..Default::default()
     };
     assert_eq!(
-        h.root
-            .persistent_capacity_for_cohort(&[], &[4; 8], 8, budget),
+        h.observed_persistent_capacity(&[], &[4; 8], 8, budget),
         Err(PersistentCapacityUnknown::InspectionBudget)
     );
     let pool = &h.root.dynamic_pools.pools[&h.pool_ids[0]];

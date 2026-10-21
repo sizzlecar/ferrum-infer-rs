@@ -171,6 +171,19 @@ fn validate_memory_authority(
     authority: ExecutionPlanningModel,
     requested: &RuntimeConfigSnapshot,
 ) -> Result<()> {
+    if let Some(entry) = requested
+        .entries
+        .iter()
+        .find(|entry| entry.key == ferrum_types::PERSISTENT_POOL_PREPARATION_CONFIG_KEY)
+    {
+        let preparation = ferrum_types::PersistentPoolPreparation::parse_config_entry(entry)
+            .map_err(FerrumError::config)?;
+        if preparation == ferrum_types::PersistentPoolPreparation::ConfiguredEnvelope
+            && authority != ExecutionPlanningModel::CompiledPlan
+        {
+            return Err(FerrumError::config("configured-envelope persistent pool preparation requires a compiled-plan executor; the selected executor does not expose this startup allocation authority"));
+        }
+    }
     if authority == ExecutionPlanningModel::ExecutorManaged
         && crate::runtime_env::runtime_snapshot_value(
             requested,
@@ -840,6 +853,71 @@ mod tests {
             )
             .unwrap_err();
             assert!(error.to_string().contains("kv_max_blocks"));
+        }
+    }
+
+    #[test]
+    fn persistent_pool_preparation_rejects_legacy_before_probe_for_both_usages() {
+        let requested = RuntimeConfigSnapshot::from_entries([RuntimeConfigEntry::new(
+            ferrum_types::PERSISTENT_POOL_PREPARATION_CONFIG_KEY,
+            "configured-envelope",
+            RuntimeConfigSource::Cli,
+        )]);
+        assert!(memory_request(
+            &ferrum_types::Device::ROCm(0),
+            ExecutionPlanningModel::ExecutorManaged,
+            0.9,
+            &requested
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("compiled-plan executor"));
+        for usage in [StartupUsage::SingleRequest, StartupUsage::PersistentServing] {
+            assert!(resolve_config(
+                requested.clone(),
+                model(),
+                hardware(),
+                WorkloadProfile::serving_default(),
+                ExecutionPlanningModel::ExecutorManaged,
+                SelectedKvCacheLayout::Unknown,
+                None,
+                usage
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("compiled-plan executor"));
+        }
+        assert!(
+            validate_memory_authority(ExecutionPlanningModel::CompiledPlan, &requested).is_ok()
+        );
+        let hardware = HardwareCapabilities::rtx4090_cuda(ferrum_types::CompiledKernelFeatures {
+            cuda: true,
+            cuda_graph: true,
+            vllm_paged_attn: true,
+            cuda_indexed_causal_attention: true,
+            cuda_causal_gqa2: true,
+            ..Default::default()
+        });
+        for usage in [StartupUsage::SingleRequest, StartupUsage::PersistentServing] {
+            let resolved = resolve_config(
+                requested.clone(),
+                model(),
+                hardware.clone(),
+                WorkloadProfile::serving_default(),
+                ExecutionPlanningModel::CompiledPlan,
+                SelectedKvCacheLayout::Unknown,
+                None,
+                usage,
+            )
+            .unwrap();
+            let mut engine = EngineConfig::default();
+            engine
+                .apply_runtime_config_snapshot(&resolved.runtime_config)
+                .unwrap();
+            assert_eq!(
+                engine.memory.persistent_pool_preparation,
+                ferrum_types::PersistentPoolPreparation::ConfiguredEnvelope
+            );
         }
     }
 }

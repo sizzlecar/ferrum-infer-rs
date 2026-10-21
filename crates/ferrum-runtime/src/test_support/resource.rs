@@ -712,6 +712,7 @@ pub(crate) enum PostAllocationBehavior {
 pub struct Trace {
     pub(crate) calls: Vec<String>,
     pub(crate) runtime_allocate_calls: u64,
+    pub(crate) runtime_allocation_failure_at: Option<u64>,
     pub(crate) static_fence_indeterminate: bool,
     pub(crate) release_panics: BTreeSet<ResourceId>,
     pub(crate) hook_panics: BTreeSet<String>,
@@ -776,6 +777,9 @@ impl DeviceRuntime for TestRuntime {
         let drift = {
             let mut trace = self.trace.lock().unwrap();
             trace.runtime_allocate_calls += 1;
+            if trace.runtime_allocation_failure_at == Some(trace.runtime_allocate_calls) {
+                return Err(TestRuntimeError("injected runtime allocation failure"));
+            }
             trace.drift_on_allocate
         };
         if drift {
