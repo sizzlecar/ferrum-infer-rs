@@ -38,6 +38,9 @@ mod pointwise;
 #[path = "vnext_tensor_reference_runtime/activations.rs"]
 mod activations;
 
+#[path = "vnext_tensor_reference_runtime/weightless.rs"]
+mod weightless;
+
 fn id<T>(value: impl Into<String>) -> T
 where
     T: TryFrom<String, Error = VNextError>,
@@ -148,8 +151,8 @@ impl ModelFamilyProvider for TinyTensorFamily {
         Ok(config)
     }
 
-    fn weight_schema(&self, config: &Self::Config) -> Result<WeightSchema, VNextError> {
-        Ok(WeightSchema {
+    fn weights(&self, config: &Self::Config) -> Result<ModelWeights, VNextError> {
+        Ok(ModelWeights::Stored(WeightSchema {
             format_id: id(REFERENCE_DENSE_SAFETENSORS_FORMAT_ID),
             layout_id: id("weight-layout.reference.tensor-dense"),
             version: ContractVersion::new(1, 0),
@@ -172,7 +175,7 @@ impl ModelFamilyProvider for TinyTensorFamily {
                 },
                 required: true,
             }],
-        })
+        }))
     }
 
     fn numerical_profiles(&self, _: &Self::Config) -> Result<FamilyNumericalProfiles, VNextError> {

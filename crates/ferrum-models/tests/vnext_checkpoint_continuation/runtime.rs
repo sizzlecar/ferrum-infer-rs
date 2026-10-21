@@ -153,7 +153,7 @@ impl Fixture {
         }
         // Ordinary pool initialization only. Foreground admission and optional
         // checkpoint retention must request their own subsequent maintenance.
-        let mut source = family::Weights::new(family.weight_schema());
+        let mut source = family::Weights::new(family.stored_weight_schema().unwrap());
         if let Some(token) = nonfinite_token {
             source.set_nonfinite_embedding(token);
         }

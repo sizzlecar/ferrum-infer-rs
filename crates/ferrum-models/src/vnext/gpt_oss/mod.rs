@@ -8,8 +8,8 @@ use ferrum_quantization::{Mxfp4SafetensorsSource, SafetensorsArchive};
 use ferrum_runtime::{
     CausalLanguageMetadata, ExternalModelMetadataId, FamilyNumericalProfiles, ModelFamilyId,
     ModelFamilyProvider, ModelFamilyRegistration, ModelProgram, ModelSemanticMetadata,
-    NumericalExecutionProfile, TypedFamilyRegistration, VNextError, WeightComponentSource,
-    WeightSchema,
+    ModelWeights, NumericalExecutionProfile, TypedFamilyRegistration, VNextError,
+    WeightComponentSource,
 };
 use ferrum_types::{DataType, ModelOutputProtocol, ReasoningEffort, ReasoningEffortSupport};
 use serde::{Deserialize, Serialize};
@@ -129,8 +129,11 @@ impl ModelFamilyProvider for GptOssFamilyProvider {
         Ok(config)
     }
 
-    fn weight_schema(&self, config: &Self::Config) -> Result<WeightSchema, VNextError> {
-        config.weights.weight_schema(&config.semantic)
+    fn weights(&self, config: &Self::Config) -> Result<ModelWeights, VNextError> {
+        config
+            .weights
+            .weight_schema(&config.semantic)
+            .map(ModelWeights::Stored)
     }
 
     fn numerical_profiles(

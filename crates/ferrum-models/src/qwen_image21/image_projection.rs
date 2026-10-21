@@ -8,7 +8,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use ferrum_runtime::{
     AttributeId, ContractVersion, ElementType, ExternalModelMetadataId, FamilyNumericalProfiles,
-    ModelFamilyId, ModelFamilyProvider, ModelProgram, ModelSemanticMetadata, NodeId,
+    ModelFamilyId, ModelFamilyProvider, ModelProgram, ModelSemanticMetadata, ModelWeights, NodeId,
     NumericalExecutionProfile, NumericalOperationContract, NumericalProfileId, OperationId,
     ProgramBlock, ProgramNode, ProgramNodeWorkSpec, ProgramTensorSpec, ProgramValueId,
     ResolvedTensorLayout, SemanticValue, VNextError, WeightId, WeightLayoutId, WeightReference,
@@ -96,7 +96,7 @@ impl ModelFamilyProvider for QwenImage21ImageProjectionFamily {
         Ok(config)
     }
 
-    fn weight_schema(&self, config: &Self::Config) -> Result<WeightSchema, VNextError> {
+    fn weights(&self, config: &Self::Config) -> Result<ModelWeights, VNextError> {
         let full = ExpectedWeights::from_config(config, StructureLimits::default())
             .and_then(|expected| expected.weight_schema())
             .map_err(|error| invalid_config("weight_schema", error.to_string()))?;
@@ -121,7 +121,7 @@ impl ModelFamilyProvider for QwenImage21ImageProjectionFamily {
             tensors: vec![tensor],
         };
         schema.validate(self.family_id())?;
-        Ok(schema)
+        Ok(ModelWeights::Stored(schema))
     }
 
     fn numerical_profiles(&self, _: &Self::Config) -> Result<FamilyNumericalProfiles, VNextError> {

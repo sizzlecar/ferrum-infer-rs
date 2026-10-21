@@ -99,7 +99,7 @@ pub(super) fn validate_program_bindings(
 
 pub(super) fn validate_semantic_binding(
     family: &PreparedModelFamily,
-    execution_weight_schema: &WeightSchema,
+    execution_weight_schema: Option<&WeightSchema>,
     binding: &ResolvedValueBinding,
 ) -> Result<(), VNextError> {
     if let Some(weight) = family
@@ -114,6 +114,8 @@ pub(super) fn validate_semantic_binding(
                 binding.value_id()
             )));
         }
+        let execution_weight_schema = execution_weight_schema
+            .ok_or_else(|| invalid_plan("weight binding requires stored execution weights"))?;
         validate_program_tensor(&weight.tensor, binding.tensor(), "weight")?;
         let expected_weight =
             ResolvedWeightBinding::from_schema(execution_weight_schema, &weight.weight_id)?;
@@ -129,6 +131,11 @@ pub(super) fn validate_semantic_binding(
             binding.storage(),
         )?;
         return Ok(());
+    }
+    if binding.weight().is_some() {
+        return Err(invalid_plan(
+            "non-weight semantic value carries a physical weight binding",
+        ));
     }
     if let Some(state) = family
         .program()

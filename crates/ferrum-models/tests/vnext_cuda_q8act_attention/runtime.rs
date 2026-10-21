@@ -160,7 +160,7 @@ impl Fixture {
         // admission provisions the actual first work shape. Preallocating each
         // minimum can strand a smaller contiguous extent below a full-width
         // claim even when no execution owns that extent.
-        let source = family::Weights::new(family.weight_schema());
+        let source = family::Weights::new(family.stored_weight_schema().unwrap());
         let initialized = committed
             .initialize_static(
                 &family,

@@ -7,7 +7,7 @@ use super::{
 use crate::ProviderExecutionSemantics;
 use std::sync::Arc;
 
-pub const EXECUTION_PLAN_SCHEMA: PlanSchemaVersion = PlanSchemaVersion::new(9, 0);
+pub const EXECUTION_PLAN_SCHEMA: PlanSchemaVersion = PlanSchemaVersion::new(10, 0);
 pub const MAX_EXECUTION_PLAN_WIRE_BYTES: usize = 16 * 1024 * 1024;
 /// Maximum number of O(graph) static allocations plus dynamic descriptors.
 /// This limit is independent of the concurrency ceiling.

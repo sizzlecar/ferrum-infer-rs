@@ -8,6 +8,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use vnext_numerical_fixture::*;
 
+#[path = "vnext_model_wire/weights.rs"]
+mod weights;
+
 fn id<T>(value: impl Into<String>) -> T
 where
     T: TryFrom<String, Error = VNextError>,
@@ -111,8 +114,8 @@ impl ModelFamilyProvider for TestFamily {
         Ok(config)
     }
 
-    fn weight_schema(&self, config: &Self::Config) -> Result<WeightSchema, VNextError> {
-        Ok(WeightSchema {
+    fn weights(&self, config: &Self::Config) -> Result<ModelWeights, VNextError> {
+        Ok(ModelWeights::Stored(WeightSchema {
             format_id: id("weight-format.model-wire-test"),
             layout_id: id("weight-layout.model-wire-test"),
             version: ContractVersion::new(1, 0),
@@ -135,7 +138,7 @@ impl ModelFamilyProvider for TestFamily {
                 },
                 required: true,
             }],
-        })
+        }))
     }
 
     fn numerical_profiles(
@@ -360,7 +363,7 @@ impl ModelFamilyProvider for DuplicateExternalFamily {
         })
     }
 
-    fn weight_schema(&self, _config: &Self::Config) -> Result<WeightSchema, VNextError> {
+    fn weights(&self, _config: &Self::Config) -> Result<ModelWeights, VNextError> {
         unreachable!("identity-only adversarial registration")
     }
 
@@ -429,7 +432,7 @@ impl ModelFamilyProvider for ChangingFamily {
         Ok(config)
     }
 
-    fn weight_schema(&self, _config: &Self::Config) -> Result<WeightSchema, VNextError> {
+    fn weights(&self, _config: &Self::Config) -> Result<ModelWeights, VNextError> {
         unreachable!("changed raw input must fail before schema construction")
     }
 
@@ -550,8 +553,8 @@ impl ModelFamilyProvider for OneShotFamily {
         })
     }
 
-    fn weight_schema(&self, config: &Self::Config) -> Result<WeightSchema, VNextError> {
-        TestFamily.weight_schema(&TestConfig {
+    fn weights(&self, config: &Self::Config) -> Result<ModelWeights, VNextError> {
+        TestFamily.weights(&TestConfig {
             model_type: config.model_type.clone(),
             width: config.width,
             block_size: default_block_size(),
@@ -651,8 +654,8 @@ impl ModelFamilyProvider for AliasedFamily {
         TestFamily.parse_config(raw)
     }
 
-    fn weight_schema(&self, config: &Self::Config) -> Result<WeightSchema, VNextError> {
-        TestFamily.weight_schema(config)
+    fn weights(&self, config: &Self::Config) -> Result<ModelWeights, VNextError> {
+        TestFamily.weights(config)
     }
 
     fn numerical_profiles(

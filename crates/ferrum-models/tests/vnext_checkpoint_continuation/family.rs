@@ -1,4 +1,5 @@
 use super::*;
+use ferrum_runtime::ModelWeights;
 
 #[path = "hadamard.rs"]
 mod hadamard;
@@ -144,7 +145,7 @@ impl Family {
             .collect()
     }
 
-    fn weights(&self) -> Vec<Weight> {
+    fn weight_tensors(&self) -> Vec<Weight> {
         let mut weights = vec![
             Weight::dense("embedding", vec![VOCAB, HIDDEN], ElementType::F16),
             Weight::dense("input_norm", vec![HIDDEN], ElementType::F16),
@@ -279,8 +280,8 @@ impl ModelFamilyProvider for Family {
         self.validate_config_identity(raw, &value)?;
         Ok(value)
     }
-    fn weight_schema(&self, _config: &AttentionKind) -> Result<WeightSchema, VNextError> {
-        let weights = self.weights();
+    fn weights(&self, _config: &AttentionKind) -> Result<ModelWeights, VNextError> {
+        let weights = self.weight_tensors();
         let mut schema = WeightSchema {
             format_id: id(FORMAT),
             layout_id: id("weight-layout.fixture.attention.native"),
@@ -291,7 +292,7 @@ impl ModelFamilyProvider for Family {
         if self.kind.hadamard() {
             hadamard::configure(&mut schema);
         }
-        Ok(schema)
+        Ok(ModelWeights::Stored(schema))
     }
     fn numerical_profiles(
         &self,
@@ -349,7 +350,7 @@ impl ModelFamilyProvider for Family {
         _config: &AttentionKind,
         _profile: &NumericalExecutionProfile,
     ) -> Result<ModelProgram, VNextError> {
-        let weights = self.weights();
+        let weights = self.weight_tensors();
         let mut attention_inputs = vec![id("value.embedding")];
         attention_inputs.extend(
             weights

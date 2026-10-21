@@ -51,7 +51,10 @@ fn upstream_prefill_require_lowers_new_ids_without_changing_auto_or_old_profiles
     selected.validate_program(prepared.program()).unwrap();
     let prior = registration.prepare(&definition, &candidate_id()).unwrap();
     assert_eq!(prepared.program().states(), prior.program().states());
-    assert_eq!(prepared.weight_schema(), prior.weight_schema());
+    assert_eq!(
+        prepared.stored_weight_schema().unwrap(),
+        prior.stored_weight_schema().unwrap()
+    );
     for kind in [
         UpstreamMarkerV2Profile::SwiGluPrefill,
         UpstreamMarkerV2Profile::GatedDeltaPrefill,
@@ -135,7 +138,10 @@ fn upstream_marker_v2_require_lowers_real_trio_and_preserves_auto_state_and_head
     );
     let prepared = registration.prepare(&definition, &candidate_id()).unwrap();
     let baseline = registration.prepare(&definition, &strict_id).unwrap();
-    assert_eq!(prepared.weight_schema(), baseline.weight_schema());
+    assert_eq!(
+        prepared.stored_weight_schema().unwrap(),
+        baseline.stored_weight_schema().unwrap()
+    );
     assert_eq!(prepared.program().states(), baseline.program().states());
     selected.validate_program(prepared.program()).unwrap();
     for kind in [
@@ -330,7 +336,10 @@ fn hybrid_g32_mmq_require_lowers_new_ids_without_changing_auto_or_old_profiles()
     selected.validate_program(prepared.program()).unwrap();
     let prior = registration.prepare(&definition, &candidate_id()).unwrap();
     assert_eq!(prepared.program().states(), prior.program().states());
-    assert_eq!(prepared.weight_schema(), prior.weight_schema());
+    assert_eq!(
+        prepared.stored_weight_schema().unwrap(),
+        prior.stored_weight_schema().unwrap()
+    );
     for kind in [
         UpstreamMarkerV2Profile::SwiGluG32MmqPrefill,
         UpstreamMarkerV2Profile::GatedDeltaG32MmqPrefill,

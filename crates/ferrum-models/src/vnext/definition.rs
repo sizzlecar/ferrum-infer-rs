@@ -146,7 +146,11 @@ impl DefinedProductionModel {
                     .filter_map(element_type_label),
             );
         }
-        let formats = self.definition.weight_schema().quantization_formats();
+        let formats = self
+            .definition
+            .stored_weight_schema()
+            .map_err(|error| FerrumError::model(error.to_string()))?
+            .quantization_formats();
         let weight_bytes = self.sources.weight_payload_bytes()?;
         Ok(ModelCapabilities {
             architecture: self.descriptor.architecture().to_owned(),

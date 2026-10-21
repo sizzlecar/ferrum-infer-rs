@@ -3,6 +3,7 @@
 //! the actual Reference scalar implementation in ferrum-kernels.
 
 use super::*;
+use ferrum_runtime::ModelWeights;
 
 const UP: &str = "value.activation.up";
 const RAW_GATE: &str = "value.activation.raw_gate";
@@ -112,8 +113,8 @@ impl ModelFamilyProvider for ActivationFamily {
         Ok(config)
     }
 
-    fn weight_schema(&self, config: &Config) -> Result<WeightSchema, VNextError> {
-        TinyTensorFamily(TinyTensorPrecision::Bf16).weight_schema(&TinyTensorConfig {
+    fn weights(&self, config: &Config) -> Result<ModelWeights, VNextError> {
+        TinyTensorFamily(TinyTensorPrecision::Bf16).weights(&TinyTensorConfig {
             rows: config.rows,
             in_features: 1,
             out_features: config.width,

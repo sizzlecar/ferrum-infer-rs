@@ -156,8 +156,8 @@ impl ModelFamilyProvider for TestFamily {
         Ok(config)
     }
 
-    fn weight_schema(&self, config: &Self::Config) -> Result<WeightSchema, VNextError> {
-        Ok(WeightSchema {
+    fn weights(&self, config: &Self::Config) -> Result<ModelWeights, VNextError> {
+        Ok(ModelWeights::Stored(WeightSchema {
             format_id: id("weight-format.dense"),
             layout_id: id("weight-layout.dense"),
             version: ContractVersion::new(1, 0),
@@ -180,7 +180,7 @@ impl ModelFamilyProvider for TestFamily {
                 },
                 required: true,
             }],
-        })
+        }))
     }
 
     fn numerical_profiles(
@@ -299,8 +299,8 @@ impl ModelFamilyProvider for OrderedSchemaFamily {
         TestFamily.parse_config(raw)
     }
 
-    fn weight_schema(&self, config: &Self::Config) -> Result<WeightSchema, VNextError> {
-        let mut schema = TestFamily.weight_schema(config)?;
+    fn weights(&self, config: &Self::Config) -> Result<ModelWeights, VNextError> {
+        let mut schema = TestFamily.weights(config)?.stored_schema()?.clone();
         schema.components[0].external_names = if self.reverse_sources {
             vec!["weight.z".to_owned(), "weight.a".to_owned()]
         } else {
@@ -358,7 +358,7 @@ impl ModelFamilyProvider for OrderedSchemaFamily {
             schema.components.reverse();
             schema.tensors.reverse();
         }
-        Ok(schema)
+        Ok(ModelWeights::Stored(schema))
     }
 
     fn numerical_profiles(
@@ -419,8 +419,8 @@ impl ModelFamilyProvider for FixedSchemaFamily {
         TestFamily.parse_config(raw)
     }
 
-    fn weight_schema(&self, _config: &Self::Config) -> Result<WeightSchema, VNextError> {
-        Ok(self.schema.clone())
+    fn weights(&self, _config: &Self::Config) -> Result<ModelWeights, VNextError> {
+        Ok(ModelWeights::Stored(self.schema.clone()))
     }
 
     fn numerical_profiles(
@@ -509,8 +509,8 @@ impl ModelFamilyProvider for SequentialScratchFamily {
         TestFamily.parse_config(raw)
     }
 
-    fn weight_schema(&self, config: &Self::Config) -> Result<WeightSchema, VNextError> {
-        TestFamily.weight_schema(config)
+    fn weights(&self, config: &Self::Config) -> Result<ModelWeights, VNextError> {
+        TestFamily.weights(config)
     }
 
     fn numerical_profiles(
@@ -1359,7 +1359,8 @@ pub(crate) fn resolved_tensor(element_type: ElementType) -> ResolvedTensorSpec {
 
 pub(crate) fn resolved_test_weight() -> ResolvedWeightBinding {
     let family = TestRegistry::new().prepare();
-    ResolvedWeightBinding::from_schema(family.weight_schema(), &id("weight.matrix")).unwrap()
+    ResolvedWeightBinding::from_schema(family.stored_weight_schema().unwrap(), &id("weight.matrix"))
+        .unwrap()
 }
 
 pub(crate) fn binding(
@@ -1667,8 +1668,8 @@ impl ModelFamilyProvider for GraphFamily {
         Ok(config)
     }
 
-    fn weight_schema(&self, _config: &Self::Config) -> Result<WeightSchema, VNextError> {
-        Ok(WeightSchema {
+    fn weights(&self, _config: &Self::Config) -> Result<ModelWeights, VNextError> {
+        Ok(ModelWeights::Stored(WeightSchema {
             format_id: id("weight-format.execution-graph"),
             layout_id: id("weight-layout.execution-graph"),
             version: ContractVersion::new(1, 0),
@@ -1691,7 +1692,7 @@ impl ModelFamilyProvider for GraphFamily {
                 },
                 required: true,
             }],
-        })
+        }))
     }
 
     fn numerical_profiles(

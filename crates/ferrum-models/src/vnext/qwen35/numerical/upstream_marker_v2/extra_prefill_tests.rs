@@ -54,7 +54,10 @@ fn upstream_extra_prefill_require_lowers_trio_with_real_kv_and_leaves_auto_stric
     let prepared = registration.prepare(&definition, &candidate_id()).unwrap();
     let baseline = registration.prepare(&definition, &strict_id).unwrap();
     assert_eq!(prepared.program().states(), baseline.program().states());
-    assert_eq!(prepared.weight_schema(), baseline.weight_schema());
+    assert_eq!(
+        prepared.stored_weight_schema().unwrap(),
+        baseline.stored_weight_schema().unwrap()
+    );
     selected.validate_program(prepared.program()).unwrap();
     let mut restored = selected.clone();
     restored.id = strict.id.clone();

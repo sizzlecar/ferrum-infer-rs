@@ -2,7 +2,7 @@ use super::{
     invalid_plan, node_weight_requirements, provider_resource_estimator_input_fingerprint,
     validate_active_sequence_ceiling, validate_program_bindings, validate_semantic_binding,
     workspace_base_id, BTreeMap, BTreeSet, BufferUsage, CapabilityCatalog, CapabilityId,
-    DynamicStorageRequirement, ExecutionWeightPlan, NodeId, OperationPlanningHandle,
+    DynamicStorageRequirement, ExecutionWeights, NodeId, OperationPlanningHandle,
     OperationPlanningRegistry, OperationRegistryAuthority, OperationResourceEstimateRequest,
     PlanNodeResolution, PlanProviderRejectReason, PreparedModelFamily,
     ProviderCompatibilityRequest, ProviderId, ProviderResourcePlan, ResolvedValueBinding,
@@ -88,7 +88,7 @@ impl PlanNodeResolution {
         preferred_provider: Option<ProviderId>,
     ) -> Result<Self, VNextError> {
         let prepared_family_fingerprint = family.fingerprint()?;
-        let execution_weights = ExecutionWeightPlan::identity(family)?;
+        let execution_weights = ExecutionWeights::for_family(family)?;
         Self::resolve_with_family_fingerprint(
             family,
             execution_weights.schema(),
@@ -106,7 +106,7 @@ impl PlanNodeResolution {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn resolve_with_family_fingerprint<P: RuntimePolicy>(
         family: &PreparedModelFamily,
-        execution_weight_schema: &WeightSchema,
+        execution_weight_schema: Option<&WeightSchema>,
         prepared_family_fingerprint: &str,
         catalog: &CapabilityCatalog,
         policy: &P,

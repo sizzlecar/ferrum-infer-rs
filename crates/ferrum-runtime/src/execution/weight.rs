@@ -810,7 +810,7 @@ fn verify_numeric_weight_quality_artifact(
             "approximate weight quality artifact differs from the selected materializer",
         ));
     }
-    if artifact.source.weight_format_id != family.weight_schema().format_id
+    if artifact.source.weight_format_id != family.stored_weight_schema()?.format_id
         || artifact.execution.weight_format_id != execution_schema.format_id
         || artifact.execution.weight_layout_id != execution_schema.layout_id
         || artifact.execution.quantization_format_ids != execution_schema.quantization_formats()
@@ -934,7 +934,7 @@ fn verify_numeric_weight_quality_artifact(
         authority_implementation_fingerprint:
             numeric_weight_quality_authority_implementation_fingerprint()?,
         artifact_sha256: format!("{:x}", Sha256::digest(artifact_bytes)),
-        source_schema_fingerprint: family.weight_schema().fingerprint()?,
+        source_schema_fingerprint: family.stored_weight_schema()?.fingerprint()?,
         execution_schema_fingerprint: execution_schema.fingerprint()?,
         execution_contract_fingerprint: quality_contract
             .execution_contract_fingerprint()
@@ -948,7 +948,7 @@ fn verify_numeric_weight_quality_artifact(
         inf_count: total_inf_count,
     };
     record.validate_against(
-        &family.weight_schema().fingerprint()?,
+        &family.stored_weight_schema()?.fingerprint()?,
         &execution_schema.fingerprint()?,
         quality_contract,
     )?;
@@ -1383,7 +1383,7 @@ impl WeightMaterializer for IdentityWeightMaterializer {
         family: &PreparedModelFamily,
         _device: &DeviceDescriptor,
     ) -> Result<WeightSchema, VNextError> {
-        Ok(family.weight_schema().clone())
+        Ok(family.stored_weight_schema()?.clone())
     }
 
     fn materialize_component<'source>(
@@ -1412,7 +1412,7 @@ fn identity_component_sources(
     execution_schema: &WeightSchema,
 ) -> Result<BTreeMap<WeightId, Vec<WeightId>>, VNextError> {
     let source_ids = family
-        .weight_schema()
+        .stored_weight_schema()?
         .components
         .iter()
         .map(|component| component.id.clone())
@@ -1493,6 +1493,7 @@ impl WeightMaterializerRegistry {
         catalog: &CapabilityCatalog,
         materializer_id: &WeightMaterializerId,
     ) -> Result<TrustedExecutionWeightPlan, VNextError> {
+        family.stored_weight_schema()?;
         let materializer = self.registered_materializer(catalog, materializer_id)?;
         let descriptor = materializer.descriptor();
         if descriptor.fidelity() != WeightMaterializationFidelity::Exact {
@@ -1545,6 +1546,7 @@ impl WeightMaterializerRegistry {
         materializer_id: &WeightMaterializerId,
         artifact_bytes: &[u8],
     ) -> Result<TrustedExecutionWeightPlan, VNextError> {
+        family.stored_weight_schema()?;
         let materializer = self.registered_materializer(catalog, materializer_id)?;
         let descriptor = materializer.descriptor();
         if descriptor.fidelity() != WeightMaterializationFidelity::Approximate {
@@ -1632,7 +1634,7 @@ impl TrustedExecutionWeightPlan {
         let materializer: Arc<dyn WeightMaterializer> =
             Arc::new(IdentityWeightMaterializer::new()?);
         let descriptor = materializer.descriptor().clone();
-        let schema = family.weight_schema().clone();
+        let schema = family.stored_weight_schema()?.clone();
         let component_sources = materializer.component_sources(family, &schema)?;
         Ok(Self {
             plan: ExecutionWeightPlan::from_materializer(
@@ -1736,7 +1738,7 @@ impl TrustedExecutionWeightPlan {
             .iter()
             .map(|source_id| {
                 let source_component_index = family
-                    .weight_schema()
+                    .stored_weight_schema()?
                     .components
                     .binary_search_by(|component| component.id.cmp(source_id))
                     .map_err(|_| {
@@ -1745,7 +1747,7 @@ impl TrustedExecutionWeightPlan {
                             first_execution_component.id
                         ))
                     })?;
-                Ok(&family.weight_schema().components[source_component_index])
+                Ok(&family.stored_weight_schema()?.components[source_component_index])
             })
             .collect::<Result<Vec<_>, _>>()?;
         let payloads = self.materializer.materialize_components(
@@ -1860,7 +1862,7 @@ pub struct ExecutionWeightPlan {
 impl ExecutionWeightPlan {
     pub fn identity(family: &PreparedModelFamily) -> Result<Self, VNextError> {
         let descriptor = WeightMaterializerDescriptor::identity()?;
-        let schema = family.weight_schema().clone();
+        let schema = family.stored_weight_schema()?.clone();
         let component_sources = identity_component_sources(family, &schema)?;
         Self::from_materializer(family, &descriptor, schema, component_sources, Vec::new())
     }
@@ -1892,7 +1894,7 @@ impl ExecutionWeightPlan {
     ) -> Result<Self, VNextError> {
         static_weight_transforms.sort();
         let plan = Self {
-            source_schema_fingerprint: family.weight_schema().fingerprint()?,
+            source_schema_fingerprint: family.stored_weight_schema()?.fingerprint()?,
             materializer_id: descriptor.id().clone(),
             materializer_version: descriptor.version(),
             materializer_implementation_fingerprint: descriptor
@@ -2044,13 +2046,13 @@ impl ExecutionWeightPlan {
         family: &PreparedModelFamily,
     ) -> Result<(), VNextError> {
         self.validate_structure(family.family_id())?;
-        if self.source_schema_fingerprint != family.weight_schema().fingerprint()? {
+        if self.source_schema_fingerprint != family.stored_weight_schema()?.fingerprint()? {
             return Err(invalid_plan(
                 "execution weight plan source schema differs from its prepared family",
             ));
         }
         let source_components = family
-            .weight_schema()
+            .stored_weight_schema()?
             .components
             .iter()
             .map(|component| (&component.id, component))
@@ -2075,7 +2077,7 @@ impl ExecutionWeightPlan {
             )));
         }
         let source_tensors = family
-            .weight_schema()
+            .stored_weight_schema()?
             .tensors
             .iter()
             .map(|tensor| (&tensor.id, tensor))

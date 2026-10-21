@@ -85,7 +85,10 @@ fn q6_head_profile_require_changes_only_head_and_keeps_body_and_kv_exact() {
     );
     let prepared = registration.prepare(&definition, &id()).unwrap();
     let baseline = registration.prepare(&definition, &body_id).unwrap();
-    assert_eq!(prepared.weight_schema(), baseline.weight_schema());
+    assert_eq!(
+        prepared.stored_weight_schema().unwrap(),
+        baseline.stored_weight_schema().unwrap()
+    );
     assert_eq!(prepared.program().states(), baseline.program().states());
     candidate.validate_program(prepared.program()).unwrap();
     let nodes: Vec<_> = prepared

@@ -161,8 +161,8 @@ impl ModelFamilyProvider for TestFamily {
         Ok(config)
     }
 
-    fn weight_schema(&self, config: &Self::Config) -> Result<WeightSchema, VNextError> {
-        Ok(WeightSchema {
+    fn weights(&self, config: &Self::Config) -> Result<ModelWeights, VNextError> {
+        Ok(ModelWeights::Stored(WeightSchema {
             format_id: id("weight-format.resource-dense"),
             layout_id: id("weight-layout.resource-dense"),
             version: ContractVersion::new(1, 0),
@@ -185,7 +185,7 @@ impl ModelFamilyProvider for TestFamily {
                 },
                 required: true,
             }],
-        })
+        }))
     }
 
     fn numerical_profiles(
@@ -527,8 +527,11 @@ pub(crate) fn node_resolution(
             AliasPolicy::NoAlias,
             BufferUsage::Weights,
             Some(
-                ResolvedWeightBinding::from_schema(family.weight_schema(), &id("weight.matrix"))
-                    .unwrap(),
+                ResolvedWeightBinding::from_schema(
+                    family.stored_weight_schema().unwrap(),
+                    &id("weight.matrix"),
+                )
+                .unwrap(),
             ),
             weight_storage,
         )

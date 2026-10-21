@@ -1,4 +1,5 @@
 use super::*;
+use ferrum_runtime::ModelWeights;
 
 /// Wrap the existing tiny stateful model without changing its public fixture.
 /// Attention inputs and state ABI remain real; only versioned operation policy
@@ -59,8 +60,8 @@ impl ModelFamilyProvider for Family {
         self.base.semantic_metadata(config)
     }
 
-    fn weight_schema(&self, config: &AttentionKind) -> Result<WeightSchema, VNextError> {
-        let mut schema = self.base.weight_schema(config)?;
+    fn weights(&self, config: &AttentionKind) -> Result<ModelWeights, VNextError> {
+        let mut schema = self.base.weights(config)?.stored_schema()?.clone();
         let names: &[&str] = match self.selected {
             Q8ActAttentionProfile::GatedDelta => &["qkvzba", "o"],
             Q8ActAttentionProfile::Causal => &["q", "k", "v", "o"],
@@ -130,7 +131,7 @@ impl ModelFamilyProvider for Family {
             assert_eq!(offset, rows);
             tensor.physical_layout = PhysicalWeightLayout::Composite { parts };
         }
-        Ok(schema)
+        Ok(ModelWeights::Stored(schema))
     }
 
     fn numerical_profiles(

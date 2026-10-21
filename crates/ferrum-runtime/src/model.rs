@@ -103,6 +103,90 @@ pub struct WeightSchema {
     pub tensors: Vec<WeightTensorSpec>,
 }
 
+/// Whether a family has physical checkpoint weights. Absence is a semantic
+/// choice, not an empty stored schema or a materializer implementation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", content = "schema", rename_all = "snake_case")]
+pub enum ModelWeights {
+    None,
+    Stored(WeightSchema),
+}
+
+impl<'de> Deserialize<'de> for ModelWeights {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        // An empty struct variant rejects stored fields on None. A derived
+        // unit variant can otherwise ignore fields despite deny_unknown_fields.
+        #[derive(Deserialize)]
+        #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+        enum Wire {
+            None {},
+            Stored { schema: WeightSchema },
+        }
+        Ok(match Wire::deserialize(deserializer)? {
+            Wire::None {} => Self::None,
+            Wire::Stored { schema } => Self::Stored(schema),
+        })
+    }
+}
+
+impl From<WeightSchema> for ModelWeights {
+    fn from(schema: WeightSchema) -> Self {
+        Self::Stored(schema)
+    }
+}
+
+impl ModelWeights {
+    pub fn stored_schema(&self) -> Result<&WeightSchema, VNextError> {
+        match self {
+            Self::Stored(schema) => Ok(schema),
+            Self::None => Err(VNextError::InvalidExecutionPlan {
+                reason: "model declares no stored weights".to_owned(),
+            }),
+        }
+    }
+
+    fn normalize(&mut self) {
+        if let Self::Stored(schema) = self {
+            schema.normalize();
+        }
+    }
+
+    fn validate(
+        &self,
+        family_id: &ModelFamilyId,
+        metadata: &ModelSemanticMetadata,
+    ) -> Result<(), VNextError> {
+        match self {
+            Self::Stored(schema) => schema.validate(family_id),
+            Self::None if matches!(metadata, ModelSemanticMetadata::TensorComponent) => Ok(()),
+            Self::None => Err(VNextError::InvalidModelConfig {
+                family_id: family_id.to_string(),
+                field: "weights".to_owned(),
+                reason: "causal language families require stored weights".to_owned(),
+            }),
+        }
+    }
+
+    fn validate_program_references(
+        &self,
+        family_id: &ModelFamilyId,
+        program: &ModelProgram,
+    ) -> Result<(), VNextError> {
+        match self {
+            Self::Stored(schema) => schema.validate_program_references(family_id, program),
+            Self::None if program.weights().is_empty() => Ok(()),
+            Self::None => Err(VNextError::InvalidModelConfig {
+                family_id: family_id.to_string(),
+                field: "program.weights".to_owned(),
+                reason: "a family without stored weights cannot declare program weights".to_owned(),
+            }),
+        }
+    }
+}
+
 impl WeightSchema {
     pub(crate) fn normalize(&mut self) {
         self.components
@@ -2192,15 +2276,18 @@ pub trait ModelFamilyProvider: Send + Sync + 'static {
 
     fn parse_config(&self, raw: &serde_json::Value) -> Result<Self::Config, VNextError>;
 
-    fn weight_schema(&self, config: &Self::Config) -> Result<WeightSchema, VNextError>;
+    /// Declares checkpoint presence explicitly. Core only permits `None` for
+    /// tensor components whose prepared program has no weight references.
+    fn weights(&self, config: &Self::Config) -> Result<ModelWeights, VNextError>;
 
     fn numerical_profiles(
         &self,
         config: &Self::Config,
     ) -> Result<FamilyNumericalProfiles, VNextError>;
 
-    /// Specialization may change logical decoding dtype, never the source's
-    /// physical components, layouts, dimensions or tensor identities.
+    /// Called only for stored weights. Specialization may change logical
+    /// decoding dtype, never presence, physical components, layouts,
+    /// dimensions or tensor identities.
     fn specialize_weight_schema(
         &self,
         _config: &Self::Config,
@@ -2250,7 +2337,7 @@ struct ModelFamilyDefinitionParts {
     family_id: ModelFamilyId,
     external_metadata_id: ExternalModelMetadataId,
     canonical_config: serde_json::Value,
-    weight_schema: WeightSchema,
+    weights: ModelWeights,
     metadata: ModelSemanticMetadata,
     numerical_profiles: FamilyNumericalProfiles,
 }
@@ -2274,8 +2361,11 @@ impl ModelFamilyDefinition {
     pub fn canonical_config(&self) -> &serde_json::Value {
         &self.parts.canonical_config
     }
-    pub fn weight_schema(&self) -> &WeightSchema {
-        &self.parts.weight_schema
+    pub fn weights(&self) -> &ModelWeights {
+        &self.parts.weights
+    }
+    pub fn stored_weight_schema(&self) -> Result<&WeightSchema, VNextError> {
+        self.parts.weights.stored_schema()
     }
     pub fn metadata(&self) -> &ModelSemanticMetadata {
         &self.parts.metadata
@@ -2295,7 +2385,7 @@ impl ModelFamilyDefinition {
 
 /// Maximum raw JSON bytes accepted before decoding a prepared family package.
 pub const MAX_PREPARED_MODEL_FAMILY_WIRE_BYTES: usize = 16 * 1024 * 1024;
-pub const PREPARED_MODEL_FAMILY_WIRE_VERSION: u32 = 3;
+pub const PREPARED_MODEL_FAMILY_WIRE_VERSION: u32 = 4;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct PreparedModelFamily {
@@ -2305,7 +2395,7 @@ pub struct PreparedModelFamily {
     canonical_config: serde_json::Value,
     config_fingerprint: String,
     numerical_profile: NumericalExecutionProfile,
-    weight_schema: WeightSchema,
+    weights: ModelWeights,
     program: ModelProgram,
     metadata: ModelSemanticMetadata,
 }
@@ -2320,7 +2410,7 @@ pub struct UnvalidatedPreparedModelFamily {
     canonical_config: serde_json::Value,
     config_fingerprint: String,
     numerical_profile: NumericalExecutionProfile,
-    weight_schema: WeightSchema,
+    weights: ModelWeights,
     program: ModelProgram,
     metadata: ModelSemanticMetadata,
 }
@@ -2336,7 +2426,7 @@ pub(crate) struct PreparedModelFamilyWire {
     canonical_config: serde_json::Value,
     config_fingerprint: String,
     numerical_profile: NumericalExecutionProfile,
-    weight_schema: WeightSchema,
+    weights: ModelWeights,
     program: ModelProgram,
     metadata: ModelSemanticMetadata,
 }
@@ -2350,7 +2440,7 @@ struct PreparedModelFamilyWireFields {
     canonical_config: serde_json::Value,
     config_fingerprint: String,
     numerical_profile: NumericalExecutionProfile,
-    weight_schema: WeightSchema,
+    weights: ModelWeights,
     program: ModelProgram,
     metadata: ModelSemanticMetadata,
 }
@@ -2381,7 +2471,7 @@ impl<'de> Deserialize<'de> for PreparedModelFamilyWire {
             canonical_config: fields.canonical_config,
             config_fingerprint: fields.config_fingerprint,
             numerical_profile: fields.numerical_profile,
-            weight_schema: fields.weight_schema,
+            weights: fields.weights,
             program: fields.program,
             metadata: fields.metadata,
         })
@@ -2397,7 +2487,7 @@ impl From<PreparedModelFamilyWire> for UnvalidatedPreparedModelFamily {
             canonical_config: wire.canonical_config,
             config_fingerprint: wire.config_fingerprint,
             numerical_profile: wire.numerical_profile,
-            weight_schema: wire.weight_schema,
+            weights: wire.weights,
             program: wire.program,
             metadata: wire.metadata,
         }
@@ -2434,7 +2524,7 @@ impl UnvalidatedPreparedModelFamily {
             && rebuilt.external_metadata_id == self.external_metadata_id
             && rebuilt.canonical_config == self.canonical_config
             && rebuilt.config_fingerprint == self.config_fingerprint
-            && rebuilt.weight_schema == self.weight_schema
+            && rebuilt.weights == self.weights
             && rebuilt.program == self.program
             && rebuilt.metadata == self.metadata;
         if !exact_match {
@@ -2454,7 +2544,7 @@ impl PreparedModelFamily {
         family_id: ModelFamilyId,
         external_metadata_id: ExternalModelMetadataId,
         canonical_config: serde_json::Value,
-        mut weight_schema: WeightSchema,
+        mut weights: ModelWeights,
         mut numerical_profile: NumericalExecutionProfile,
         program: ModelProgram,
         metadata: ModelSemanticMetadata,
@@ -2474,9 +2564,9 @@ impl PreparedModelFamily {
                 message: error.to_string(),
             })?;
         let config_fingerprint = format!("{:x}", Sha256::digest(config_bytes));
-        weight_schema.validate(&family_id)?;
-        weight_schema.normalize();
-        weight_schema.validate(&family_id)?;
+        weights.validate(&family_id, &metadata)?;
+        weights.normalize();
+        weights.validate(&family_id, &metadata)?;
         if program.family_id() != &family_id {
             return Err(VNextError::InvalidModelConfig {
                 family_id: family_id.to_string(),
@@ -2484,7 +2574,7 @@ impl PreparedModelFamily {
                 reason: "program family does not match prepared family".to_owned(),
             });
         }
-        weight_schema.validate_program_references(&family_id, &program)?;
+        weights.validate_program_references(&family_id, &program)?;
         numerical_profile.normalize();
         numerical_profile.validate_program(&program)?;
         Self::validate_metadata(&family_id, &metadata)?;
@@ -2495,7 +2585,7 @@ impl PreparedModelFamily {
             canonical_config,
             config_fingerprint,
             numerical_profile,
-            weight_schema,
+            weights,
             program,
             metadata,
         })
@@ -2548,8 +2638,12 @@ impl PreparedModelFamily {
         &self.config_fingerprint
     }
 
-    pub fn weight_schema(&self) -> &WeightSchema {
-        &self.weight_schema
+    pub fn weights(&self) -> &ModelWeights {
+        &self.weights
+    }
+
+    pub fn stored_weight_schema(&self) -> Result<&WeightSchema, VNextError> {
+        self.weights.stored_schema()
     }
 
     pub fn numerical_profile(&self) -> &NumericalExecutionProfile {
@@ -2759,10 +2853,10 @@ impl<P: ModelFamilyProvider> ModelFamilyRegistration for TypedFamilyRegistration
             }
         })?);
         validate_raw_config_consumed(self.provider.family_id(), raw_config, &typed_config)?;
-        let mut weight_schema = self.provider.weight_schema(&config)?;
-        weight_schema.validate(self.provider.family_id())?;
-        weight_schema.normalize();
+        let mut weights = self.provider.weights(&config)?;
         let metadata = self.provider.semantic_metadata(&config)?;
+        weights.validate(self.provider.family_id(), &metadata)?;
+        weights.normalize();
         PreparedModelFamily::validate_metadata(self.provider.family_id(), &metadata)?;
         let numerical_profiles = self.provider.numerical_profiles(&config)?;
         if numerical_profiles
@@ -2781,7 +2875,7 @@ impl<P: ModelFamilyProvider> ModelFamilyRegistration for TypedFamilyRegistration
                 family_id: self.provider.family_id().clone(),
                 external_metadata_id,
                 canonical_config: typed_config,
-                weight_schema,
+                weights,
                 metadata,
                 numerical_profiles,
             },
@@ -2819,37 +2913,44 @@ impl<P: ModelFamilyProvider> DefinedFamilyPreparation for TypedDefinedFamily<P> 
         definition: &ModelFamilyDefinition,
         selected: &NumericalExecutionProfile,
     ) -> Result<PreparedModelFamily, VNextError> {
-        let weight_schema = self.provider.specialize_weight_schema(
-            &self.config,
-            definition.weight_schema(),
-            selected,
-        )?;
-        let mut physical_identity = weight_schema.clone();
-        physical_identity.normalize();
-        for tensor in &mut physical_identity.tensors {
-            let source = definition
-                .weight_schema()
-                .tensor(&tensor.id)
-                .ok_or_else(|| VNextError::InvalidModelConfig {
-                    family_id: self.provider.family_id().to_string(),
-                    field: "numerical_profile.weight_schema".to_owned(),
-                    reason: "numerical specialization introduced a source tensor".to_owned(),
-                })?;
-            tensor.logical_element_type = source.logical_element_type;
-        }
-        if &physical_identity != definition.weight_schema() {
-            return Err(VNextError::InvalidModelConfig {
-                family_id: self.provider.family_id().to_string(),
-                field: "numerical_profile.weight_schema".to_owned(),
-                reason: "numerical specialization changed source physical identity".to_owned(),
-            });
-        }
+        let weights = match definition.weights() {
+            ModelWeights::None => ModelWeights::None,
+            ModelWeights::Stored(source_schema) => {
+                let schema = self.provider.specialize_weight_schema(
+                    &self.config,
+                    source_schema,
+                    selected,
+                )?;
+                let mut physical_identity = schema.clone();
+                physical_identity.normalize();
+                for tensor in &mut physical_identity.tensors {
+                    let source = source_schema.tensor(&tensor.id).ok_or_else(|| {
+                        VNextError::InvalidModelConfig {
+                            family_id: self.provider.family_id().to_string(),
+                            field: "numerical_profile.weight_schema".to_owned(),
+                            reason: "numerical specialization introduced a source tensor"
+                                .to_owned(),
+                        }
+                    })?;
+                    tensor.logical_element_type = source.logical_element_type;
+                }
+                if &physical_identity != source_schema {
+                    return Err(VNextError::InvalidModelConfig {
+                        family_id: self.provider.family_id().to_string(),
+                        field: "numerical_profile.weight_schema".to_owned(),
+                        reason: "numerical specialization changed source physical identity"
+                            .to_owned(),
+                    });
+                }
+                ModelWeights::Stored(schema)
+            }
+        };
         let program = self.provider.semantic_program(&self.config, selected)?;
         PreparedModelFamily::from_canonical_config(
             self.provider.family_id().clone(),
             definition.external_metadata_id().clone(),
             definition.canonical_config().clone(),
-            weight_schema,
+            weights,
             selected.clone(),
             program,
             definition.metadata().clone(),

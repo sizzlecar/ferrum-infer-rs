@@ -68,7 +68,7 @@ fn projection_definition_keeps_only_the_required_img_in_weight() {
         definition.metadata(),
         &ModelSemanticMetadata::TensorComponent
     );
-    let schema = definition.weight_schema();
+    let schema = definition.stored_weight_schema().unwrap();
     let [component] = schema.components.as_slice() else {
         panic!("projection must retain exactly its physical weight component")
     };
@@ -192,10 +192,11 @@ impl ModelFamilyProvider for FullSchemaProjection {
     fn parse_config(&self, raw: &Value) -> Result<Self::Config, VNextError> {
         self.0.parse_config(raw)
     }
-    fn weight_schema(&self, config: &Self::Config) -> Result<WeightSchema, VNextError> {
+    fn weights(&self, config: &Self::Config) -> Result<ModelWeights, VNextError> {
         ExpectedWeights::from_config(config, StructureLimits::default())
             .and_then(|expected| expected.weight_schema())
             .map_err(|error| invalid_config("weight_schema", error.to_string()))
+            .map(ModelWeights::Stored)
     }
     fn numerical_profiles(
         &self,

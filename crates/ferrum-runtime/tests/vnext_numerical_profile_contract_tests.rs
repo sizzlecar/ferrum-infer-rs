@@ -117,8 +117,8 @@ impl ModelFamilyProvider for Family {
         }
         Ok(config)
     }
-    fn weight_schema(&self, config: &Config) -> Result<WeightSchema, VNextError> {
-        Ok(WeightSchema {
+    fn weights(&self, config: &Config) -> Result<ModelWeights, VNextError> {
+        Ok(ModelWeights::Stored(WeightSchema {
             format_id: id("weight-format.gguf"),
             layout_id: id("weight-layout.gguf-q4-k"),
             version: ContractVersion::new(1, 0),
@@ -147,7 +147,7 @@ impl ModelFamilyProvider for Family {
                 },
                 required: true,
             }],
-        })
+        }))
     }
     fn numerical_profiles(&self, _config: &Config) -> Result<FamilyNumericalProfiles, VNextError> {
         FamilyNumericalProfiles::new(
@@ -286,16 +286,16 @@ fn definition_has_no_program_and_same_gguf_source_prepares_two_numerical_abis() 
         .unwrap();
     assert_eq!(calls.load(Ordering::SeqCst), 2);
     assert_eq!(
-        f16.weight_schema().components,
-        definition.weight_schema().components
+        f16.stored_weight_schema().unwrap().components,
+        definition.stored_weight_schema().unwrap().components
     );
     assert_eq!(
-        f16.weight_schema().components,
-        f32.weight_schema().components
+        f16.stored_weight_schema().unwrap().components,
+        f32.stored_weight_schema().unwrap().components
     );
     assert_ne!(
-        f16.weight_schema().tensors[0].logical_element_type,
-        f32.weight_schema().tensors[0].logical_element_type
+        f16.stored_weight_schema().unwrap().tensors[0].logical_element_type,
+        f32.stored_weight_schema().unwrap().tensors[0].logical_element_type
     );
     assert_eq!(f16.config_fingerprint(), f32.config_fingerprint());
     assert_ne!(f16.fingerprint().unwrap(), f32.fingerprint().unwrap());

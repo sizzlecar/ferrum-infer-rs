@@ -2,6 +2,7 @@
 //! expected bits. These are component fixtures, not a complete Qwen block.
 
 use super::*;
+use ferrum_runtime::ModelWeights;
 
 #[path = "pointwise_oracle.rs"]
 mod oracle;
@@ -158,8 +159,8 @@ impl ModelFamilyProvider for PointwiseFamily {
         Ok(config)
     }
 
-    fn weight_schema(&self, config: &Config) -> Result<WeightSchema, VNextError> {
-        TinyTensorFamily(TinyTensorPrecision::Bf16).weight_schema(&TinyTensorConfig {
+    fn weights(&self, config: &Config) -> Result<ModelWeights, VNextError> {
+        TinyTensorFamily(TinyTensorPrecision::Bf16).weights(&TinyTensorConfig {
             rows: config.rows,
             in_features: 1,
             out_features: config.width,

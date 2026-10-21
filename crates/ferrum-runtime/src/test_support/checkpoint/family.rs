@@ -31,8 +31,8 @@ impl ModelFamilyProvider for Family {
     fn parse_config(&self, raw: &Value) -> Result<TestConfig, VNextError> {
         TestFamily.parse_config(raw)
     }
-    fn weight_schema(&self, config: &TestConfig) -> Result<WeightSchema, VNextError> {
-        TestFamily.weight_schema(config)
+    fn weights(&self, config: &TestConfig) -> Result<ModelWeights, VNextError> {
+        TestFamily.weights(config)
     }
     fn numerical_profiles(&self, _: &TestConfig) -> Result<FamilyNumericalProfiles, VNextError> {
         let mut activations = vec!["value.output"];

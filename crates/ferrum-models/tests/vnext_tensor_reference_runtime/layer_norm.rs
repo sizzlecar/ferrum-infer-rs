@@ -3,6 +3,7 @@
 //! projects a scalar basis into the exact normalization input under test.
 
 use super::*;
+use ferrum_runtime::ModelWeights;
 use half::bf16;
 
 #[path = "layer_norm_oracle.rs"]
@@ -68,8 +69,8 @@ impl ModelFamilyProvider for DenseNormFamily {
         Ok(config)
     }
 
-    fn weight_schema(&self, config: &NormConfig) -> Result<WeightSchema, VNextError> {
-        TinyTensorFamily(TinyTensorPrecision::Bf16).weight_schema(&TinyTensorConfig {
+    fn weights(&self, config: &NormConfig) -> Result<ModelWeights, VNextError> {
+        TinyTensorFamily(TinyTensorPrecision::Bf16).weights(&TinyTensorConfig {
             rows: config.rows,
             in_features: config.in_features,
             out_features: config.hidden_size,

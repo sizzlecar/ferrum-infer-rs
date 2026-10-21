@@ -86,7 +86,7 @@ impl WeightMaterializer for DerivedComponentMaterializer {
         family: &PreparedModelFamily,
         _device: &DeviceDescriptor,
     ) -> Result<WeightSchema, VNextError> {
-        let mut schema = family.weight_schema().clone();
+        let mut schema = family.stored_weight_schema().unwrap().clone();
         schema.layout_id = id("weight-layout.device-operation-derived");
         schema.components[0].id = id("weight.execution.left");
         schema.components[0].external_names = vec![
@@ -313,7 +313,7 @@ impl WeightMaterializer for StaticTransformMaterializer {
         family: &PreparedModelFamily,
         _device: &DeviceDescriptor,
     ) -> Result<WeightSchema, VNextError> {
-        let mut schema = family.weight_schema().clone();
+        let mut schema = family.stored_weight_schema().unwrap().clone();
         schema.layout_id = id(format!(
             "weight-layout.device-operation-static-transform-{}",
             self.transform_count
@@ -910,8 +910,16 @@ fn handoff(
 fn static_initialization_uploads_schema_components_before_handoff() {
     let (resolved, plan, runtime, trace) = test_plan();
     let family = &resolved.parts().prepared_family;
-    let execution_weight_schema = plan.payload().execution_weights().schema();
-    assert_eq!(execution_weight_schema, family.weight_schema());
+    let execution_weight_schema = plan
+        .payload()
+        .execution_weights()
+        .stored()
+        .unwrap()
+        .schema();
+    assert_eq!(
+        execution_weight_schema,
+        family.stored_weight_schema().unwrap()
+    );
     let expected_uploaded_bytes = execution_weight_schema
         .components
         .iter()
@@ -982,7 +990,11 @@ fn static_initialization_uploads_schema_components_before_handoff() {
 fn static_initialization_materializes_derived_components_through_trusted_plan_authority() {
     let (family, plan, runtime, trace) = derived_component_test_plan();
     assert_eq!(
-        plan.payload().execution_weights().component_sources(),
+        plan.payload()
+            .execution_weights()
+            .stored()
+            .unwrap()
+            .component_sources(),
         &BTreeMap::from([
             (
                 id("weight.execution.left"),
@@ -1056,7 +1068,7 @@ fn required_static_transforms_preserve_sources_destinations_and_reuse_maximum_sc
         base: base_runtime,
         calls: Arc::clone(&calls),
     });
-    let execution_weights = plan.payload().execution_weights();
+    let execution_weights = plan.payload().execution_weights().stored().unwrap();
     let scratch_allocations = plan
         .payload()
         .memory()
@@ -1176,7 +1188,12 @@ fn static_initialization_seals_backend_weight_import_without_upload_commands() {
     let (resolved, plan, runtime, trace) = test_plan();
     trace.lock().unwrap().static_weight_import_enabled = true;
     let family = &resolved.parts().prepared_family;
-    let execution_weight_schema = plan.payload().execution_weights().schema();
+    let execution_weight_schema = plan
+        .payload()
+        .execution_weights()
+        .stored()
+        .unwrap()
+        .schema();
     let expected_imported_bytes = execution_weight_schema
         .components
         .iter()

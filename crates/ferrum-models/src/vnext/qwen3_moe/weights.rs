@@ -2004,7 +2004,8 @@ mod tests {
         let router_id = layer_component_id(0, ROUTER_ROLE).unwrap();
         let router = prepared
             .family()
-            .weight_schema()
+            .stored_weight_schema()
+            .unwrap()
             .components
             .iter()
             .find(|component| component.id == router_id)

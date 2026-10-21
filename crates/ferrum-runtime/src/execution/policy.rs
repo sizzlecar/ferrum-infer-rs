@@ -1,8 +1,7 @@
 use super::{
     canonical_fingerprint, invalid_plan, CapabilityCatalog, CompletionRetentionSpec,
-    ContractVersion, DynamicStorageProfile, ExecutionWeightPlan, PlanNodeResolution,
-    PreparedModelFamily, ReusableExecutionPolicy, Serialize, TrustedExecutionWeightPlan,
-    VNextError,
+    ContractVersion, DynamicStorageProfile, ExecutionWeights, PlanNodeResolution,
+    PreparedModelFamily, ReusableExecutionPolicy, Serialize, TrustedExecutionWeights, VNextError,
 };
 use crate::{CheckpointCapacityPolicy, ExecutionDeterminismRequirement};
 use ferrum_types::AttentionExecutionPolicy;
@@ -128,7 +127,7 @@ pub struct PlanBuildRequest<'a, P: RuntimePolicy> {
     pub(super) policy: &'a P,
     pub(super) node_resolutions: Vec<PlanNodeResolution>,
     pub(super) completion_retention: CompletionRetentionSpec,
-    pub(super) execution_weights: TrustedExecutionWeightPlan,
+    pub(super) execution_weights: TrustedExecutionWeights,
 }
 
 impl<'a, P: RuntimePolicy> PlanBuildRequest<'a, P> {
@@ -148,7 +147,7 @@ impl<'a, P: RuntimePolicy> PlanBuildRequest<'a, P> {
             policy,
             node_resolutions,
             completion_retention: CompletionRetentionSpec::default(),
-            execution_weights: TrustedExecutionWeightPlan::identity(family)?,
+            execution_weights: TrustedExecutionWeights::for_family(family)?,
         })
     }
 
@@ -179,8 +178,9 @@ impl<'a, P: RuntimePolicy> PlanBuildRequest<'a, P> {
 
     pub fn with_execution_weights(
         mut self,
-        execution_weights: TrustedExecutionWeightPlan,
+        execution_weights: impl Into<TrustedExecutionWeights>,
     ) -> Result<Self, VNextError> {
+        let execution_weights = execution_weights.into();
         execution_weights.validate_against_catalog(self.family, self.capabilities)?;
         self.execution_weights = execution_weights;
         Ok(self)
@@ -198,7 +198,7 @@ impl<'a, P: RuntimePolicy> PlanBuildRequest<'a, P> {
         self.policy
     }
 
-    pub fn execution_weights(&self) -> &ExecutionWeightPlan {
-        self.execution_weights.plan()
+    pub fn execution_weights(&self) -> ExecutionWeights {
+        self.execution_weights.declaration()
     }
 }

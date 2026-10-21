@@ -22,7 +22,7 @@ use ferrum_runtime::{
     CompositeWeightPart, ContractVersion, ElementType, ExternalModelMetadataId,
     FamilyNumericalProfiles, GatedDeltaDecayParameterization, GatedDeltaValueHeadMapping,
     KvStorageFormat, ModelFamilyId, ModelFamilyProvider, ModelFamilyRegistration, ModelProgram,
-    ModelSemanticMetadata, NodeId, NumericalExecutionProfile, OperationId,
+    ModelSemanticMetadata, ModelWeights, NodeId, NumericalExecutionProfile, OperationId,
     PhysicalWeightComponentBinding, PhysicalWeightLayout, PhysicalWeightPadding,
     PreparedModelFamily, ProgramBlock, ProgramCheckpointInputs, ProgramNode, ProgramNodeWorkSpec,
     ProgramTensorSpec, ProgramValueId, QuantizationFormatId, QuantizationGrouping,
@@ -907,7 +907,7 @@ impl ModelFamilyProvider for Qwen35FamilyProvider {
         Ok(config)
     }
 
-    fn weight_schema(&self, config: &Self::Config) -> Result<WeightSchema, VNextError> {
+    fn weights(&self, config: &Self::Config) -> Result<ModelWeights, VNextError> {
         match config.weight_format {
             FamilyWeightFormat::SafetensorsDense => safetensors_weight_schema(config),
             FamilyWeightFormat::SafetensorsGptqMarlin
@@ -917,6 +917,7 @@ impl ModelFamilyProvider for Qwen35FamilyProvider {
             }
             FamilyWeightFormat::GgufNative => gguf_weight_schema(config),
         }
+        .map(ModelWeights::Stored)
     }
 
     fn numerical_profiles(
@@ -5656,11 +5657,16 @@ mod tests {
 
         let prepared = prepare_from_model_dir(&output_dir).unwrap();
         assert_eq!(
-            prepared.family().weight_schema().format_id.as_str(),
+            prepared
+                .family()
+                .stored_weight_schema()
+                .unwrap()
+                .format_id
+                .as_str(),
             "weight-format.safetensors.fp8-e4m3-block-grid-inverse-scale"
         );
         let mut prepared_pairs = Vec::new();
-        for tensor in &prepared.family().weight_schema().tensors {
+        for tensor in &prepared.family().stored_weight_schema().unwrap().tensors {
             collect_block_fp8_source_pairs(&tensor.physical_layout, &mut prepared_pairs);
         }
         assert_eq!(prepared_pairs.len(), QWEN35_08B_DERIVED_FP8_PAIR_COUNT);
@@ -6289,11 +6295,21 @@ mod tests {
             MOE_EXTERNAL_METADATA_ID
         );
         assert_eq!(
-            prepared.family().weight_schema().format_id.as_str(),
+            prepared
+                .family()
+                .stored_weight_schema()
+                .unwrap()
+                .format_id
+                .as_str(),
             "weight-format.safetensors.fp8-e4m3-block-grid-inverse-scale"
         );
         assert_eq!(
-            prepared.family().weight_schema().layout_id.as_str(),
+            prepared
+                .family()
+                .stored_weight_schema()
+                .unwrap()
+                .layout_id
+                .as_str(),
             "weight-layout.qwen3_5.hybrid_moe.fp8_block_grid.expert_major.packed_gdn_qkvzba"
         );
         assert_eq!(
@@ -6306,7 +6322,8 @@ mod tests {
         );
         let prepared_value_source_count = prepared
             .family()
-            .weight_schema()
+            .stored_weight_schema()
+            .unwrap()
             .components
             .iter()
             .filter(|component| component.role == WeightComponentRole::PackedValues)
@@ -6382,7 +6399,7 @@ mod tests {
         let prepared = TypedFamilyRegistration::new(Qwen35FamilyProvider::new().unwrap())
             .prepare_fixture(&serde_json::to_value(config).unwrap())
             .unwrap();
-        let schema = prepared.weight_schema();
+        let schema = prepared.stored_weight_schema().unwrap();
 
         assert_eq!(
             schema.format_id.as_str(),
@@ -6439,7 +6456,7 @@ mod tests {
                 &serde_json::to_value(test_official_marlin_block_fp8_config()).unwrap(),
             )
             .unwrap();
-        let source_schema = prepared.weight_schema();
+        let source_schema = prepared.stored_weight_schema().unwrap();
         let denominator = QuantizedProviderAttributionDenominator::from_prepared_family(&prepared)
             .unwrap()
             .expect("official block-FP8 family has a quantized attribution denominator");
@@ -6677,8 +6694,16 @@ mod tests {
             .prepare_fixture(&serde_json::to_value(qwen36_config).unwrap())
             .unwrap();
         assert_eq!(
-            qwen38.weight_schema().fingerprint().unwrap(),
-            qwen36.weight_schema().fingerprint().unwrap()
+            qwen38
+                .stored_weight_schema()
+                .unwrap()
+                .fingerprint()
+                .unwrap(),
+            qwen36
+                .stored_weight_schema()
+                .unwrap()
+                .fingerprint()
+                .unwrap()
         );
         assert_eq!(
             qwen38.program().fingerprint().unwrap(),
@@ -7880,7 +7905,7 @@ mod tests {
         let prepared = TypedFamilyRegistration::new(Qwen35FamilyProvider::new().unwrap())
             .prepare_fixture(&serde_json::to_value(&config).unwrap())
             .unwrap();
-        let schema = prepared.weight_schema();
+        let schema = prepared.stored_weight_schema().unwrap();
         assert_eq!(
             schema.format_id.as_str(),
             "weight-format.safetensors.gptq-marlin-int4"
@@ -7977,7 +8002,7 @@ mod tests {
         let prepared = TypedFamilyRegistration::new(Qwen35FamilyProvider::new().unwrap())
             .prepare_fixture(&serde_json::to_value(&config).unwrap())
             .unwrap();
-        let schema = prepared.weight_schema();
+        let schema = prepared.stored_weight_schema().unwrap();
         assert_eq!(
             schema.format_id.as_str(),
             "weight-format.safetensors.fp8-e4m3-block-grid-inverse-scale"
@@ -8274,11 +8299,16 @@ mod tests {
                 .find(|weight| weight.weight_id == weight_id)
                 .unwrap();
             assert_eq!(program_weight.tensor.dimensions, dimensions);
-            let schema_weight = prepared.weight_schema().tensor(&weight_id).unwrap();
+            let schema_weight = prepared
+                .stored_weight_schema()
+                .unwrap()
+                .tensor(&weight_id)
+                .unwrap();
             assert_eq!(schema_weight.dimensions, dimensions);
         }
         let routed_gate_up = prepared
-            .weight_schema()
+            .stored_weight_schema()
+            .unwrap()
             .tensor(&moe_weight_id(0, MOE_ROUTED_GATE_UP_ROLE).unwrap())
             .unwrap();
         assert!(matches!(
@@ -8286,10 +8316,13 @@ mod tests {
             PhysicalWeightLayout::Composite { ref parts } if parts.len() == 2
         ));
         assert_eq!(
-            prepared.weight_schema().layout_id.as_str(),
+            prepared.stored_weight_schema().unwrap().layout_id.as_str(),
             "weight-layout.qwen3_5.hybrid_moe.gguf.native.packed_gdn_qkvzba"
         );
-        assert_eq!(prepared.weight_schema().version, ContractVersion::new(2, 2));
+        assert_eq!(
+            prepared.stored_weight_schema().unwrap().version,
+            ContractVersion::new(2, 2)
+        );
     }
 
     #[test]
@@ -8323,7 +8356,7 @@ mod tests {
                         .count(),
                     expected_count,
                     "unexpected {operation_id} count for {:?}",
-                    prepared.weight_schema().format_id
+                    prepared.stored_weight_schema().unwrap().format_id
                 );
             }
             assert_eq!(
@@ -8452,10 +8485,13 @@ mod tests {
         let f32_id = NumericalProfileId::new(F32_MASTER_NUMERICAL_PROFILE_ID).unwrap();
         let f16 = registration.prepare(&definition, &f16_id).unwrap();
         let f32 = registration.prepare(&definition, &f32_id).unwrap();
-        assert_eq!(f16.weight_schema(), f32.weight_schema());
         assert_eq!(
-            f16.weight_schema().components,
-            definition.weight_schema().components
+            f16.stored_weight_schema().unwrap(),
+            f32.stored_weight_schema().unwrap()
+        );
+        assert_eq!(
+            f16.stored_weight_schema().unwrap().components,
+            definition.stored_weight_schema().unwrap().components
         );
         assert_eq!(f16.canonical_config(), f32.canonical_config());
         assert_eq!(f16.config_fingerprint(), f32.config_fingerprint());
@@ -8533,8 +8569,8 @@ mod tests {
                 .define(&serde_json::to_value(&config).unwrap())
                 .unwrap();
             assert_ne!(
-                gguf.weight_schema().format_id,
-                safetensors.weight_schema().format_id
+                gguf.stored_weight_schema().unwrap().format_id,
+                safetensors.stored_weight_schema().unwrap().format_id
             );
             assert_eq!(gguf.numerical_profiles(), safetensors.numerical_profiles());
             for candidate in gguf
@@ -8978,13 +9014,17 @@ mod tests {
                 })
                 .count()
         );
-        assert_eq!(prepared.weight_schema().version, ContractVersion::new(1, 4));
         assert_eq!(
-            prepared.weight_schema().layout_id.as_str(),
+            prepared.stored_weight_schema().unwrap().version,
+            ContractVersion::new(1, 4)
+        );
+        assert_eq!(
+            prepared.stored_weight_schema().unwrap().layout_id.as_str(),
             "weight-layout.qwen3_5.dense_hybrid.packed_gate_up.packed_gdn_qkvzba"
         );
         for component in prepared
-            .weight_schema()
+            .stored_weight_schema()
+            .unwrap()
             .components
             .iter()
             .filter(|component| component.external_names.len() == 1)
@@ -9022,7 +9062,8 @@ mod tests {
             }
         }
         let packed_mlp = prepared
-            .weight_schema()
+            .stored_weight_schema()
+            .unwrap()
             .components
             .iter()
             .filter(|component| component.dimensions == [2, 32, 16])
@@ -9037,7 +9078,8 @@ mod tests {
                     }
         }));
         let packed_gdn = prepared
-            .weight_schema()
+            .stored_weight_schema()
+            .unwrap()
             .components
             .iter()
             .filter(|component| {
@@ -9113,14 +9155,16 @@ mod tests {
         let text = Qwen35TextConfig::from_hf_config_value(&config.hf_config).unwrap();
         let conv_channels = (text.linear_qk_total_dim() * 2 + text.linear_value_total_dim()) as u64;
         let conv_component = prepared
-            .weight_schema()
+            .stored_weight_schema()
+            .unwrap()
             .components
             .iter()
             .find(|component| component.external_names[0].contains("layers.0.linear_attn.conv1d"))
             .unwrap();
         assert_eq!(conv_component.dimensions, [conv_channels, 1, 4]);
         let conv_tensor = prepared
-            .weight_schema()
+            .stored_weight_schema()
+            .unwrap()
             .tensors
             .iter()
             .find(|tensor| match &tensor.physical_layout {
@@ -9372,8 +9416,8 @@ mod tests {
         assert!(Arc::ptr_eq(prepared.weight_source(), f16.weight_source()));
         assert!(Arc::ptr_eq(prepared.sources(), f16.sources()));
         assert_eq!(
-            prepared.family().weight_schema(),
-            f16.family().weight_schema()
+            prepared.family().stored_weight_schema().unwrap(),
+            f16.family().stored_weight_schema().unwrap()
         );
         assert_eq!(
             prepared.family().config_fingerprint(),
@@ -9386,7 +9430,7 @@ mod tests {
         assert_eq!(prepared.descriptor().execution_dtype(), DataType::FP32);
         assert_eq!(f16.descriptor().execution_dtype(), DataType::FP16);
         assert_eq!(startup, prepared.model_capabilities().unwrap());
-        let schema = prepared.family().weight_schema();
+        let schema = prepared.family().stored_weight_schema().unwrap();
         assert_eq!(schema.format_id.as_str(), "weight-format.gguf.native-block");
         assert!(schema
             .quantization_formats()
@@ -9504,7 +9548,7 @@ mod tests {
             .unwrap(),
         );
         let prepared = prepare_from_sources(sources).unwrap();
-        let schema = prepared.family().weight_schema();
+        let schema = prepared.family().stored_weight_schema().unwrap();
         assert_eq!(
             prepared.family().program().blocks()[0]
                 .nodes

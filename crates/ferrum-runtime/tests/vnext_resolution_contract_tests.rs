@@ -1,5 +1,6 @@
 mod vnext_core_contract;
 
+use ferrum_runtime::ModelWeights;
 use vnext_core_contract::*;
 
 fn bytes_sha256(bytes: &[u8]) -> String {
@@ -758,11 +759,16 @@ fn fixture_resolution_value(inputs: &ResolvedModelPlanInputs, field: ResolutionF
             serde_json::to_value(inputs.prepared_family.family_id()).unwrap()
         }
         ResolutionField::WeightSchema => {
-            serde_json::to_value(inputs.prepared_family.weight_schema()).unwrap()
+            serde_json::to_value(inputs.prepared_family.stored_weight_schema().unwrap()).unwrap()
         }
-        ResolutionField::WeightFormat => {
-            serde_json::to_value(&inputs.prepared_family.weight_schema().format_id).unwrap()
-        }
+        ResolutionField::WeightFormat => serde_json::to_value(
+            &inputs
+                .prepared_family
+                .stored_weight_schema()
+                .unwrap()
+                .format_id,
+        )
+        .unwrap(),
         ResolutionField::Tokenizer => serde_json::to_value(&inputs.tokenizer).unwrap(),
         ResolutionField::Template => serde_json::to_value(
             &inputs
@@ -850,7 +856,7 @@ impl ModelFamilyProvider for DuplicateMetadataFamily {
         })
     }
 
-    fn weight_schema(&self, _config: &Self::Config) -> Result<WeightSchema, VNextError> {
+    fn weights(&self, _config: &Self::Config) -> Result<ModelWeights, VNextError> {
         unreachable!("identity-only adversarial registration")
     }
 

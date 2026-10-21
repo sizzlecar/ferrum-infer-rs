@@ -92,8 +92,8 @@ impl ModelFamilyProvider for TinyDenseFamily {
         Ok(config)
     }
 
-    fn weight_schema(&self, config: &Self::Config) -> Result<WeightSchema, VNextError> {
-        Ok(WeightSchema {
+    fn weights(&self, config: &Self::Config) -> Result<ModelWeights, VNextError> {
+        Ok(ModelWeights::Stored(WeightSchema {
             format_id: id(REFERENCE_DENSE_SAFETENSORS_FORMAT_ID),
             layout_id: id("weight-layout.reference.tiny-dense"),
             version: ContractVersion::new(1, 0),
@@ -116,7 +116,7 @@ impl ModelFamilyProvider for TinyDenseFamily {
                 },
                 required: true,
             }],
-        })
+        }))
     }
 
     fn numerical_profiles(

@@ -152,7 +152,7 @@ impl WeightMaterializer for GptOssMxfp4ToMarlinWeightMaterializer {
         family: &PreparedModelFamily,
         _device: &DeviceDescriptor,
     ) -> Result<WeightSchema, VNextError> {
-        derive_execution_schema(family.weight_schema(), family.family_id())
+        derive_execution_schema(family.stored_weight_schema()?, family.family_id())
     }
 
     fn component_sources(
@@ -160,13 +160,13 @@ impl WeightMaterializer for GptOssMxfp4ToMarlinWeightMaterializer {
         family: &PreparedModelFamily,
         execution_schema: &WeightSchema,
     ) -> Result<BTreeMap<WeightId, Vec<WeightId>>, VNextError> {
-        let expected = derive_execution_schema(family.weight_schema(), family.family_id())?;
+        let expected = derive_execution_schema(family.stored_weight_schema()?, family.family_id())?;
         if &expected != execution_schema {
             return Err(invalid_plan(
                 "GPT-OSS MXFP4 execution schema differs from the exact materializer output",
             ));
         }
-        let candidates = collect_candidates(family.weight_schema())?;
+        let candidates = collect_candidates(family.stored_weight_schema()?)?;
         let mut derived_sources = BTreeMap::new();
         for candidate in candidates {
             let sources = vec![
@@ -249,13 +249,13 @@ pub(crate) fn mxfp4_marlin_transform_descriptors(
     family: &PreparedModelFamily,
     execution_schema: &WeightSchema,
 ) -> Result<Vec<Mxfp4MarlinTransformDescriptor>, VNextError> {
-    let expected = derive_execution_schema(family.weight_schema(), family.family_id())?;
+    let expected = derive_execution_schema(family.stored_weight_schema()?, family.family_id())?;
     if &expected != execution_schema {
         return Err(invalid_plan(
             "GPT-OSS MXFP4 execution schema differs from the exact materializer output",
         ));
     }
-    collect_candidates(family.weight_schema())?
+    collect_candidates(family.stored_weight_schema()?)?
         .into_iter()
         .map(|candidate| Ok(candidate.weight.transform_descriptor()))
         .collect()

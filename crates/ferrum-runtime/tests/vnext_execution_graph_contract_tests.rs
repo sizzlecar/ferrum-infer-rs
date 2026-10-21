@@ -353,7 +353,12 @@ fn graph_plan_fixture(
             &policy,
             &planning_handle,
             node.id.clone(),
-            graph_node_bindings(node, family.weight_schema(), &alias_policy, alias_storage),
+            graph_node_bindings(
+                node,
+                family.stored_weight_schema().unwrap(),
+                &alias_policy,
+                alias_storage,
+            ),
             BTreeSet::new(),
             None,
         )?);

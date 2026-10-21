@@ -1,7 +1,7 @@
 use super::{
     invalid_plan, CapabilityCatalog, CompletionRetentionSpec, Deserialize, ExecutionPlan,
     PlanBuildRequest, PlanNodeResolution, PlanSchemaVersion, PreparedModelFamily, RuntimePolicy,
-    TrustedExecutionWeightPlan, UnvalidatedExecutionPlan, UnvalidatedExecutionPlanWire, VNextError,
+    TrustedExecutionWeights, UnvalidatedExecutionPlan, UnvalidatedExecutionPlanWire, VNextError,
     EXECUTION_PLAN_SCHEMA, MAX_EXECUTION_PLAN_WIRE_BYTES,
 };
 
@@ -100,7 +100,7 @@ impl ExecutionPlan {
         policy: &P,
         node_resolutions: Vec<PlanNodeResolution>,
         completion_retention: CompletionRetentionSpec,
-        execution_weights: TrustedExecutionWeightPlan,
+        execution_weights: impl Into<TrustedExecutionWeights>,
     ) -> Result<Self, VNextError> {
         Self::decode_untrusted(bytes)?.revalidate_with_execution_weights(
             family,
@@ -184,7 +184,7 @@ impl UnvalidatedExecutionPlan {
         node_resolutions: Vec<PlanNodeResolution>,
         completion_retention: CompletionRetentionSpec,
     ) -> Result<ExecutionPlan, VNextError> {
-        let execution_weights = TrustedExecutionWeightPlan::identity(family)?;
+        let execution_weights = TrustedExecutionWeights::for_family(family)?;
         self.revalidate_with_execution_weights(
             family,
             capabilities,
@@ -202,7 +202,7 @@ impl UnvalidatedExecutionPlan {
         policy: &P,
         node_resolutions: Vec<PlanNodeResolution>,
         completion_retention: CompletionRetentionSpec,
-        execution_weights: TrustedExecutionWeightPlan,
+        execution_weights: impl Into<TrustedExecutionWeights>,
     ) -> Result<ExecutionPlan, VNextError> {
         if self.payload.schema != EXECUTION_PLAN_SCHEMA {
             return Err(VNextError::UnsupportedPlanSchema {

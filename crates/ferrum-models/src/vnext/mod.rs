@@ -517,7 +517,11 @@ impl PreparedProductionModel {
                     )
                 })
             })?;
-        let quantization_formats = self.family.weight_schema().quantization_formats();
+        let quantization_formats = self
+            .family
+            .stored_weight_schema()
+            .map_err(|error| ferrum_types::FerrumError::model(error.to_string()))?
+            .quantization_formats();
         let quantization = (!quantization_formats.is_empty()).then(|| {
             quantization_formats
                 .iter()

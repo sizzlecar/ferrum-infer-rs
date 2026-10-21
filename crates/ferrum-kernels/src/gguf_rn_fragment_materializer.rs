@@ -52,7 +52,7 @@ pub fn gguf_rn_fragment_materializer_selection(
     let prepared = plan::prepare(family)?;
     let artifact = quality::artifact(
         materializer.descriptor(),
-        family.weight_schema(),
+        family.stored_weight_schema()?,
         &prepared.schema,
     )?;
     WeightMaterializerSelection::numeric_quality_artifact(

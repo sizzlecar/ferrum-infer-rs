@@ -4,10 +4,20 @@ use super::*;
 fn extra_fixture_declares_six_real_formats_and_preserves_state_and_old_profiles() {
     for kind in [AttentionKind::GatedDelta, AttentionKind::Causal] {
         let original = Family::new(kind);
-        let old_schema = original.weight_schema(&kind).unwrap();
+        let old_schema = original
+            .weights(&kind)
+            .unwrap()
+            .stored_schema()
+            .unwrap()
+            .clone();
         let old_profile = serde_json::to_vec(&original.numerical_profiles(&kind).unwrap()).unwrap();
         let extra = Family::extra(kind);
-        let schema = extra.weight_schema(&kind).unwrap();
+        let schema = extra
+            .weights(&kind)
+            .unwrap()
+            .stored_schema()
+            .unwrap()
+            .clone();
         assert_eq!(extra.states(), original.states());
         assert_eq!(
             schema
@@ -83,7 +93,15 @@ fn extra_fixture_declares_six_real_formats_and_preserves_state_and_old_profiles(
                 .as_str()
                 .contains("q3k-q4k-q5k-iq3s-iq4nl-iq4xs"));
         }
-        assert_eq!(original.weight_schema(&kind).unwrap(), old_schema);
+        assert_eq!(
+            original
+                .weights(&kind)
+                .unwrap()
+                .stored_schema()
+                .unwrap()
+                .clone(),
+            old_schema
+        );
         assert_eq!(
             serde_json::to_vec(&original.numerical_profiles(&kind).unwrap()).unwrap(),
             old_profile
@@ -94,7 +112,12 @@ fn extra_fixture_declares_six_real_formats_and_preserves_state_and_old_profiles(
 #[test]
 fn extra_fixture_weight_source_preserves_original_component_bytes() {
     for kind in [AttentionKind::GatedDelta, AttentionKind::Causal] {
-        let schema = Family::new(kind).weight_schema(&kind).unwrap();
+        let schema = Family::new(kind)
+            .weights(&kind)
+            .unwrap()
+            .stored_schema()
+            .unwrap()
+            .clone();
         let old = attention_family::Weights::new(&schema);
         let wrapper = Weights::new(&schema);
         for component in &schema.components {

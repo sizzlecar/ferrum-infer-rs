@@ -84,11 +84,16 @@ pub(crate) fn resolution_value(inputs: &ResolvedModelPlanInputs, field: Resoluti
             serde_json::to_value(inputs.prepared_family.family_id()).unwrap()
         }
         ResolutionField::WeightSchema => {
-            serde_json::to_value(inputs.prepared_family.weight_schema()).unwrap()
+            serde_json::to_value(inputs.prepared_family.stored_weight_schema().unwrap()).unwrap()
         }
-        ResolutionField::WeightFormat => {
-            serde_json::to_value(&inputs.prepared_family.weight_schema().format_id).unwrap()
-        }
+        ResolutionField::WeightFormat => serde_json::to_value(
+            &inputs
+                .prepared_family
+                .stored_weight_schema()
+                .unwrap()
+                .format_id,
+        )
+        .unwrap(),
         ResolutionField::Tokenizer => serde_json::to_value(&inputs.tokenizer).unwrap(),
         ResolutionField::Template => serde_json::to_value(
             &inputs

@@ -873,9 +873,10 @@ pub fn cuda_weight_materializer_selection(
     let block_fp8_weight_format = WeightFormatId::new(BLOCK_FP8_SAFETENSORS_FORMAT_ID)?;
     let block_fp8_quantization =
         QuantizationFormatId::new(BLOCK_FP8_SOURCE_QUANTIZATION_FORMAT_ID)?;
-    let quantization_formats = family.weight_schema().quantization_formats();
+    let source_schema = family.stored_weight_schema()?;
+    let quantization_formats = source_schema.quantization_formats();
     let has_block_fp8_quantization = quantization_formats.contains(&block_fp8_quantization);
-    let has_block_fp8_weight_format = family.weight_schema().format_id == block_fp8_weight_format;
+    let has_block_fp8_weight_format = source_schema.format_id == block_fp8_weight_format;
     let mxfp4_weight_format = WeightFormatId::new(
         crate::mxfp4_marlin_materializer::GPT_OSS_MXFP4_SOURCE_WEIGHT_FORMAT_ID,
     )?;
@@ -883,7 +884,7 @@ pub fn cuda_weight_materializer_selection(
         crate::mxfp4_marlin_materializer::GPT_OSS_MXFP4_SOURCE_QUANTIZATION_FORMAT_ID,
     )?;
     let has_mxfp4_quantization = quantization_formats.contains(&mxfp4_quantization);
-    let has_mxfp4_weight_format = family.weight_schema().format_id == mxfp4_weight_format;
+    let has_mxfp4_weight_format = source_schema.format_id == mxfp4_weight_format;
 
     if has_block_fp8_weight_format != has_block_fp8_quantization
         || (has_block_fp8_weight_format

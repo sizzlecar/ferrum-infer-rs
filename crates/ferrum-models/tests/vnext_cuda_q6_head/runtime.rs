@@ -144,7 +144,11 @@ impl Fixture {
                 panic!("indeterminate static commit: {:?}", e.failure())
             }
         };
-        let source = Weights::new(family.weight_schema(), bad_token, bad_weight);
+        let source = Weights::new(
+            family.stored_weight_schema().unwrap(),
+            bad_token,
+            bad_weight,
+        );
         let initialized = committed
             .initialize_static(
                 &family,

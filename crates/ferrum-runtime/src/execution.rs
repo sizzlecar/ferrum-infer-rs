@@ -31,6 +31,9 @@ pub(crate) use binding::*;
 mod weight;
 pub use weight::*;
 
+mod weight_presence;
+pub use weight_presence::*;
+
 mod work;
 pub use work::*;
 

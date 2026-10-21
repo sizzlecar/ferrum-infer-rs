@@ -56,15 +56,16 @@ fn q6_head_fixture_declares_last_token_and_exact_input_oracle() {
         );
         assert_eq!(
             family
-                .weight_schema()
+                .stored_weight_schema()
+                .unwrap()
                 .components
                 .iter()
                 .filter(|component| component.id.as_str().starts_with("component.head"))
                 .count(),
             head.parts()
         );
-        let source = Weights::new(family.weight_schema(), None, false);
-        for component in &family.weight_schema().components {
+        let source = Weights::new(family.stored_weight_schema().unwrap(), None, false);
+        for component in &family.stored_weight_schema().unwrap().components {
             source.component(component).unwrap();
         }
         let a = source.expected(3);

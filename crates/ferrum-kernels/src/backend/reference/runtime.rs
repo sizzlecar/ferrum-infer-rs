@@ -24,6 +24,8 @@ pub(crate) use pointwise::{
 };
 mod transcendental;
 #[cfg(test)]
+mod weightless_initialization;
+#[cfg(test)]
 pub(super) use transcendental::{silu_bf16_bits, silu_mul_bf16_bits, tanh_bf16_bits};
 pub(crate) use transcendental::{
     ReferenceActivationShape, ReferenceSiluMulLaunch, ReferenceUnaryKind, ReferenceUnaryLaunch,

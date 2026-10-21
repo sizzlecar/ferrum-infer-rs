@@ -24,10 +24,14 @@ mod tests {
         for kind in [AttentionKind::GatedDelta, AttentionKind::Causal] {
             let old = Family::extra_prefill(kind, 2052);
             let new = Family::extra_all_rows(kind, 2052);
-            let schema = new.weight_schema(&kind).unwrap();
-            assert_eq!(schema, old.weight_schema(&kind).unwrap());
+            let schema = new.weights(&kind).unwrap().stored_schema().unwrap().clone();
+            assert_eq!(
+                schema,
+                old.weights(&kind).unwrap().stored_schema().unwrap().clone()
+            );
             assert_eq!(new.states(), old.states());
-            let old_weights = Weights::new(&old.weight_schema(&kind).unwrap());
+            let old_weights =
+                Weights::new(&old.weights(&kind).unwrap().stored_schema().unwrap().clone());
             let new_weights = Weights::new(&schema);
             for component in &schema.components {
                 assert_eq!(

@@ -137,8 +137,8 @@ impl ModelFamilyProvider for TestFamily {
         Ok(config)
     }
 
-    fn weight_schema(&self, config: &Self::Config) -> Result<WeightSchema, VNextError> {
-        Ok(WeightSchema {
+    fn weights(&self, config: &Self::Config) -> Result<ModelWeights, VNextError> {
+        Ok(ModelWeights::Stored(WeightSchema {
             format_id: id("weight-format.resource-dense"),
             layout_id: id("weight-layout.resource-dense"),
             version: ContractVersion::new(1, 0),
@@ -161,7 +161,7 @@ impl ModelFamilyProvider for TestFamily {
                 },
                 required: true,
             }],
-        })
+        }))
     }
 
     fn numerical_profiles(
@@ -565,8 +565,11 @@ fn node_resolution_with_weight_storage(
             AliasPolicy::NoAlias,
             BufferUsage::Weights,
             Some(
-                ResolvedWeightBinding::from_schema(family.weight_schema(), &id("weight.matrix"))
-                    .unwrap(),
+                ResolvedWeightBinding::from_schema(
+                    family.stored_weight_schema().unwrap(),
+                    &id("weight.matrix"),
+                )
+                .unwrap(),
             ),
             weight_storage,
         )
@@ -1699,13 +1702,14 @@ pub fn failed_static_initialization(
     // Include the actual zero-initialization and weight uploads in the first
     // submitted batch, so the injected unknown fence covers real weight work.
     let staging_bytes = family
-        .weight_schema()
+        .stored_weight_schema()
+        .unwrap()
         .components
         .iter()
         .map(|component| component.physical_bytes().unwrap())
         .sum();
-    let commands =
-        committed.reservations().reservations().len() + family.weight_schema().components.len();
+    let commands = committed.reservations().reservations().len()
+        + family.stored_weight_schema().unwrap().components.len();
     let failure = committed
         .initialize_static(
             &family,
@@ -1790,8 +1794,8 @@ impl ModelFamilyProvider for StaticRetirementFamily {
     fn parse_config(&self, raw: &Value) -> Result<Self::Config, VNextError> {
         TestFamily.parse_config(raw)
     }
-    fn weight_schema(&self, config: &Self::Config) -> Result<WeightSchema, VNextError> {
-        let mut schema = TestFamily.weight_schema(config)?;
+    fn weights(&self, config: &Self::Config) -> Result<ModelWeights, VNextError> {
+        let mut schema = TestFamily.weights(config)?.stored_schema()?.clone();
         schema.components = ["left", "right"]
             .iter()
             .map(|name| WeightComponentSpec {
@@ -1819,7 +1823,7 @@ impl ModelFamilyProvider for StaticRetirementFamily {
                 })
                 .collect(),
         };
-        Ok(schema)
+        Ok(ModelWeights::Stored(schema))
     }
     fn numerical_profiles(
         &self,

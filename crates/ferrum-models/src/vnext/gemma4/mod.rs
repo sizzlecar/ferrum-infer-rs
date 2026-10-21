@@ -12,8 +12,8 @@ use ferrum_quantization::{CompressedTensorsMarlinSafetensorsSource, SafetensorsA
 use ferrum_runtime::{
     CausalLanguageMetadata, ExternalModelMetadataId, FamilyNumericalProfiles, ModelFamilyId,
     ModelFamilyProvider, ModelFamilyRegistration, ModelProgram, ModelSemanticMetadata,
-    NumericalExecutionProfile, PreparedModelFamily, TypedFamilyRegistration, VNextError,
-    WeightComponentSource, WeightSchema,
+    ModelWeights, NumericalExecutionProfile, PreparedModelFamily, TypedFamilyRegistration,
+    VNextError, WeightComponentSource,
 };
 use ferrum_types::{DataType, ModelOutputProtocol};
 use serde::{Deserialize, Serialize};
@@ -120,8 +120,11 @@ impl ModelFamilyProvider for Gemma4FamilyProvider {
         Ok(config)
     }
 
-    fn weight_schema(&self, config: &Self::Config) -> Result<WeightSchema, VNextError> {
-        config.weights.weight_schema(&config.semantic)
+    fn weights(&self, config: &Self::Config) -> Result<ModelWeights, VNextError> {
+        config
+            .weights
+            .weight_schema(&config.semantic)
+            .map(ModelWeights::Stored)
     }
 
     fn numerical_profiles(

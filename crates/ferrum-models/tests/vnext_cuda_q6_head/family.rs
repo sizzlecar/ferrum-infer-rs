@@ -1,4 +1,5 @@
 use super::*;
+use ferrum_runtime::ModelWeights;
 pub const HIDDEN: u64 = legacy_family::HIDDEN;
 pub const OUTPUTS: u64 = 132;
 // Capture and replay both before and after an admitted participant retires.
@@ -91,8 +92,12 @@ impl ModelFamilyProvider for Family {
         self.validate_config_identity(raw, &value)?;
         Ok(value)
     }
-    fn weight_schema(&self, _: &Head) -> Result<WeightSchema, VNextError> {
-        let mut schema = self.base.weight_schema(&AttentionKind::Causal)?;
+    fn weights(&self, _: &Head) -> Result<ModelWeights, VNextError> {
+        let mut schema = self
+            .base
+            .weights(&AttentionKind::Causal)?
+            .stored_schema()?
+            .clone();
         schema.layout_id = id("weight-layout.fixture.q6-head");
         schema
             .components
@@ -182,7 +187,7 @@ impl ModelFamilyProvider for Family {
             physical_layout,
             required: true,
         });
-        Ok(schema)
+        Ok(ModelWeights::Stored(schema))
     }
     fn numerical_profiles(&self, _: &Head) -> Result<FamilyNumericalProfiles, VNextError> {
         let catalog = self.base.numerical_profiles(&AttentionKind::Causal)?;
@@ -357,8 +362,11 @@ impl Weights {
             values.insert(c.id.clone(), bytes);
         }
         let base_schema = legacy_family::Family::new(AttentionKind::Causal)
-            .weight_schema(&AttentionKind::Causal)
-            .unwrap();
+            .weights(&AttentionKind::Causal)
+            .unwrap()
+            .stored_schema()
+            .unwrap()
+            .clone();
         Self {
             values,
             base: legacy_family::Weights::new(&base_schema),

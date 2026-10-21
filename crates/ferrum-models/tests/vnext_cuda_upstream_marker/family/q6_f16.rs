@@ -139,7 +139,7 @@ fn q6_f16_fixture_prepares_real_blocks_and_joined_ffn_banks() {
                 Some(selected.arithmetic())
             );
         }
-        let schema = prepared.weight_schema();
+        let schema = prepared.stored_weight_schema().unwrap();
         let joined = schema
             .tensors
             .iter()

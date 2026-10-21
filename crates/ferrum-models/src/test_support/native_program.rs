@@ -73,7 +73,7 @@ impl ModelFamilyProvider for LanguageFamily {
         Ok(raw.clone())
     }
 
-    fn weight_schema(&self, _: &Value) -> std::result::Result<WeightSchema, VNextError> {
+    fn weights(&self, _: &Value) -> std::result::Result<ModelWeights, VNextError> {
         let dimensions = vec![VOCAB as u64, VOCAB as u64];
         let names = ["embedding", "head"];
         let components = names
@@ -103,13 +103,13 @@ impl ModelFamilyProvider for LanguageFamily {
                 required: true,
             })
             .collect::<Vec<_>>();
-        Ok(WeightSchema {
+        Ok(ModelWeights::Stored(WeightSchema {
             format_id: id("weight-format.safetensors.dense"),
             layout_id: id("weight-layout.fixture.sampling-readback"),
             version: ContractVersion::new(1, 0),
             components: components.into(),
             tensors: tensors.into(),
-        })
+        }))
     }
 
     fn numerical_profiles(
@@ -642,12 +642,19 @@ pub(crate) fn resolve_plan(
         ),
         (
             ResolutionField::WeightSchema,
-            serde_json::to_value(inputs.prepared_family.weight_schema()).unwrap(),
+            serde_json::to_value(inputs.prepared_family.stored_weight_schema().unwrap()).unwrap(),
             ResolutionDecisionSource::TypedModelResolution,
         ),
         (
             ResolutionField::WeightFormat,
-            serde_json::to_value(&inputs.prepared_family.weight_schema().format_id).unwrap(),
+            serde_json::to_value(
+                &inputs
+                    .prepared_family
+                    .stored_weight_schema()
+                    .unwrap()
+                    .format_id,
+            )
+            .unwrap(),
             ResolutionDecisionSource::TypedModelResolution,
         ),
         (

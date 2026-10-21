@@ -255,8 +255,8 @@ impl ModelFamilyProvider for TestFamily {
         Ok(config)
     }
 
-    fn weight_schema(&self, _config: &Self::Config) -> Result<WeightSchema, VNextError> {
-        Ok(WeightSchema {
+    fn weights(&self, _config: &Self::Config) -> Result<ModelWeights, VNextError> {
+        Ok(ModelWeights::Stored(WeightSchema {
             format_id: id("weight-format.device-operation-composite"),
             layout_id: id("weight-layout.device-operation-composite"),
             version: ContractVersion::new(1, 0),
@@ -306,7 +306,7 @@ impl ModelFamilyProvider for TestFamily {
                 },
                 required: true,
             }],
-        })
+        }))
     }
 
     fn numerical_profiles(
@@ -1240,7 +1240,8 @@ fn resolved_weight() -> ResolvedWeightBinding {
     let family = TypedFamilyRegistration::new(TestFamily)
         .prepare_fixture(&json!({"width": 4}))
         .unwrap();
-    ResolvedWeightBinding::from_schema(family.weight_schema(), &id("weight.matrix")).unwrap()
+    ResolvedWeightBinding::from_schema(family.stored_weight_schema().unwrap(), &id("weight.matrix"))
+        .unwrap()
 }
 
 pub(crate) fn single_binding(

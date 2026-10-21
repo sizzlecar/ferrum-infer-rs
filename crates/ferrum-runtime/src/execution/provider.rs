@@ -1,7 +1,7 @@
 use super::sequence_checkpoint::{SequenceCheckpointLayout, SequenceCheckpointLayoutData};
 use super::{
     AttributeId, BTreeMap, BTreeSet, CapabilityId, ContractVersion, Deserialize, Deserializer,
-    ExecutionWeightPlan, MemoryPlan, ModelFamilyId, NodeId, NodeWorkContract, OperationId,
+    ExecutionWeights, MemoryPlan, ModelFamilyId, NodeId, NodeWorkContract, OperationId,
     OperationRegistryAuthority, PlanExactAlias, PlanHash, PlanId, PlanNode,
     PlanProviderRejectReason, PlanSchemaVersion, PlanStateEffect, ProviderId, ProviderResourcePlan,
     ProviderSelection, ProviderWorkspaceRequirement, QuantizationFormatId, ResolvedValueBinding,
@@ -38,8 +38,8 @@ pub struct ExecutionPlanPayload {
     pub(super) policy_fingerprint: String,
     pub(super) work_limits: super::RuntimeWorkLimits,
     pub(super) tensor_ports: Option<super::CompiledTensorPorts>,
-    pub(super) execution_weights: ExecutionWeightPlan,
-    pub(super) weight_format: WeightFormatId,
+    pub(super) execution_weights: ExecutionWeights,
+    pub(super) weight_format: Option<WeightFormatId>,
     pub(super) quantization_formats: BTreeSet<QuantizationFormatId>,
     pub(super) retained_completion_values: Vec<RetainedCompletionValue>,
     pub(super) terminal_output_resources: Vec<ResourceId>,
@@ -102,12 +102,12 @@ impl ExecutionPlanPayload {
         self.work_limits.maximum_scheduled_tokens()
     }
 
-    pub fn execution_weights(&self) -> &ExecutionWeightPlan {
+    pub fn execution_weights(&self) -> &ExecutionWeights {
         &self.execution_weights
     }
 
-    pub fn weight_format(&self) -> &WeightFormatId {
-        &self.weight_format
+    pub fn weight_format(&self) -> Option<&WeightFormatId> {
+        self.weight_format.as_ref()
     }
 
     pub fn quantization_formats(&self) -> &BTreeSet<QuantizationFormatId> {
@@ -144,8 +144,8 @@ pub(super) struct PlanHashMaterial<'a> {
     pub(super) policy_fingerprint: &'a str,
     pub(super) work_limits: super::RuntimeWorkLimits,
     pub(super) tensor_ports: &'a Option<super::CompiledTensorPorts>,
-    pub(super) execution_weights: &'a ExecutionWeightPlan,
-    pub(super) weight_format: &'a WeightFormatId,
+    pub(super) execution_weights: &'a ExecutionWeights,
+    pub(super) weight_format: &'a Option<WeightFormatId>,
     pub(super) quantization_formats: &'a BTreeSet<QuantizationFormatId>,
     pub(super) retained_completion_values: &'a [RetainedCompletionValue],
     pub(super) terminal_output_resources: &'a [ResourceId],
@@ -240,8 +240,8 @@ pub(super) struct UnvalidatedExecutionPlanPayload {
     pub(super) policy_fingerprint: String,
     pub(super) work_limits: super::RuntimeWorkLimits,
     pub(super) tensor_ports: Option<super::CompiledTensorPorts>,
-    pub(super) execution_weights: ExecutionWeightPlan,
-    pub(super) weight_format: WeightFormatId,
+    pub(super) execution_weights: ExecutionWeights,
+    pub(super) weight_format: Option<WeightFormatId>,
     pub(super) quantization_formats: BTreeSet<QuantizationFormatId>,
     pub(super) retained_completion_values: Vec<RetainedCompletionValue>,
     pub(super) terminal_output_resources: Vec<ResourceId>,

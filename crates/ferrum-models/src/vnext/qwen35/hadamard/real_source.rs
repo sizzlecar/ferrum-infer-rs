@@ -42,10 +42,10 @@ fn prepares_real_hadamard_gguf_with_shared_signs_and_packed_payloads() {
         .unwrap();
     assert!(Arc::ptr_eq(master.weight_source(), f16.weight_source()));
     assert_eq!(
-        master.family().weight_schema(),
-        f16.family().weight_schema()
+        master.family().stored_weight_schema().unwrap(),
+        f16.family().stored_weight_schema().unwrap()
     );
-    let schema = master.family().weight_schema();
+    let schema = master.family().stored_weight_schema().unwrap();
     let mut packed_components = 0_usize;
     let mut packed_bytes = 0_u64;
     let mut sign_components = 0_usize;

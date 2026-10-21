@@ -8,7 +8,7 @@ use super::{
     AllocationLifetime, BTreeMap, BTreeSet, BufferUsage, CanonicalValueBinding, CapabilityCatalog,
     CapabilityId, DimensionConstraint, DynamicResourceDemand, DynamicResourceDescriptor,
     DynamicStorageContract, DynamicStorageProfile, DynamicStorageRequirement, ElementType,
-    ExecutionPlanPayload, ExecutionWeightPlan, GlobalValueRange, JointComponentSolution,
+    ExecutionPlanPayload, ExecutionWeights, GlobalValueRange, JointComponentSolution,
     JointPartialSelection, JointProviderCandidate, JointProviderStorageSelection,
     JointSelectionObjective, MemoryPlan, NodeId, NodeTokenBindingProjection, NodeWorkContract,
     OperationDescriptor, OperationRegistryAuthority, PlanBuildRequest, PlanExactAlias,
@@ -19,7 +19,7 @@ use super::{
     QuantizationFormatId, RejectedProvider, ResolvedValueBinding, ResolvedValueRole,
     ResourceAllocation, ResourceId, ReusableExecutionMemoryPlan, ReusableExecutionPolicy,
     RuntimePolicy, Serialize, StateCapacityDemand, StateDependencyTracker, StateInitialization,
-    StateLifetime, StaticWeightTransformPlan, TensorAccess, TrustedExecutionWeightPlan, VNextError,
+    StateLifetime, StaticWeightTransformPlan, TensorAccess, TrustedExecutionWeights, VNextError,
     ValueAllocationAccumulator, ValueResourceDemand, WeightFormatId, WeightSchema,
     EXECUTION_PLAN_SCHEMA, STATIC_WEIGHT_TRANSFORM_SCRATCH_ALIGNMENT_BYTES,
 };
@@ -36,7 +36,7 @@ pub struct ExecutionPlan {
     #[serde(skip)]
     pub(super) operation_registry_authority: OperationRegistryAuthority,
     #[serde(skip)]
-    pub(super) trusted_execution_weights: TrustedExecutionWeightPlan,
+    pub(super) trusted_execution_weights: TrustedExecutionWeights,
     #[serde(skip)]
     pub(super) checkpoint_unsupported_reasons: Vec<super::SequenceCheckpointUnsupportedReason>,
 }
@@ -122,7 +122,7 @@ impl ExecutionPlan {
         request
             .execution_weights
             .validate_against_catalog(family, request.capabilities)?;
-        let execution_weight_schema = request.execution_weights.plan().schema();
+        let execution_weight_schema = request.execution_weights.schema();
         let prepared_family_fingerprint = family.fingerprint()?;
         let program_fingerprint = program.fingerprint()?;
         let capability_catalog_fingerprint = request.capabilities.fingerprint()?;
@@ -132,8 +132,10 @@ impl ExecutionPlan {
             .runtime_implementation_fingerprint
             .clone();
         let policy_fingerprint = canonical_runtime_policy_fingerprint(request.policy)?;
-        let weight_format = execution_weight_schema.format_id.clone();
-        let quantization_formats = execution_weight_schema.quantization_formats();
+        let weight_format = execution_weight_schema.map(|schema| schema.format_id.clone());
+        let quantization_formats = execution_weight_schema
+            .map(WeightSchema::quantization_formats)
+            .unwrap_or_default();
 
         let mut resolutions = BTreeMap::new();
         for resolution in request.node_resolutions {
@@ -262,7 +264,7 @@ impl ExecutionPlan {
             .collect::<BTreeSet<_>>();
         let memory = Self::build_memory_plan(
             family,
-            request.execution_weights.plan(),
+            &request.execution_weights.declaration(),
             device_capacity,
             policy_capacity,
             memory_reserve,
@@ -300,7 +302,7 @@ impl ExecutionPlan {
             policy_fingerprint,
             work_limits,
             tensor_ports,
-            execution_weights: request.execution_weights.plan().clone(),
+            execution_weights: request.execution_weights.declaration(),
             weight_format,
             quantization_formats,
             retained_completion_values,
@@ -328,7 +330,7 @@ impl ExecutionPlan {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn build_node(
         family: &PreparedModelFamily,
-        execution_weight_schema: &WeightSchema,
+        execution_weight_schema: Option<&WeightSchema>,
         prepared_family_fingerprint: &str,
         program_node: &ProgramNode,
         resolution: PlanNodeResolution,
@@ -1604,7 +1606,7 @@ impl ExecutionPlan {
 
     pub(super) fn build_memory_plan(
         family: &PreparedModelFamily,
-        execution_weights: &ExecutionWeightPlan,
+        execution_weights: &ExecutionWeights,
         device_capacity_bytes: u64,
         policy_capacity_bytes: u64,
         reserve_bytes: u64,
@@ -2124,14 +2126,35 @@ impl ExecutionPlan {
         self.payload
             .execution_weights
             .validate_structure(&self.payload.family_id)?;
-        if &self.payload.execution_weights != self.trusted_execution_weights.plan()
-            || self.payload.weight_format != self.payload.execution_weights.schema().format_id
-            || self.payload.quantization_formats
-                != self
+        if self.payload.execution_weights.is_none()
+            && (!self.payload.work_limits.is_tensor()
+                || self
                     .payload
-                    .execution_weights
-                    .schema()
-                    .quantization_formats()
+                    .nodes
+                    .iter()
+                    .flat_map(|node| node.values())
+                    .any(|value| value.usage() == BufferUsage::Weights || value.weight().is_some())
+                || self
+                    .payload
+                    .memory
+                    .static_allocations()
+                    .iter()
+                    .any(|allocation| allocation.usage() == BufferUsage::Weights)
+                || self
+                    .payload
+                    .memory
+                    .dynamic_descriptors()
+                    .iter()
+                    .any(|allocation| allocation.usage() == BufferUsage::Weights))
+        {
+            return Err(invalid_plan(
+                "absent execution weights cannot carry weight bindings, allocations or token work",
+            ));
+        }
+        if self.payload.execution_weights != self.trusted_execution_weights.declaration()
+            || self.payload.weight_format != self.payload.execution_weights.weight_format().cloned()
+            || self.payload.quantization_formats
+                != self.payload.execution_weights.quantization_formats()
         {
             return Err(invalid_plan(
                 "execution weight summary differs from the execution weight plan",

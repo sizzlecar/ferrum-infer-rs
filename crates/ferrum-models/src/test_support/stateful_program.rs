@@ -140,8 +140,8 @@ impl ModelFamilyProvider for LanguageFamily {
         Ok(config)
     }
 
-    fn weight_schema(&self, config: &LanguageConfig) -> Result<WeightSchema, VNextError> {
-        let mut schema = self.0.weight_schema(&config.attention)?;
+    fn weights(&self, config: &LanguageConfig) -> Result<ModelWeights, VNextError> {
+        let mut schema = self.0.weights(&config.attention)?.stored_schema()?.clone();
         schema.components.push(WeightComponentSpec {
             id: id("component.head"),
             role: WeightComponentRole::Values,
@@ -161,7 +161,7 @@ impl ModelFamilyProvider for LanguageFamily {
             },
             required: true,
         });
-        Ok(schema)
+        Ok(ModelWeights::Stored(schema))
     }
 
     fn numerical_profiles(
@@ -407,9 +407,13 @@ fn build_executor<R: DeviceRuntime>(
         .prepare(&definition, &id(Family::new(kind).profile_id()))
         .unwrap();
     let path = directory.join("startup.gguf");
-    write_weights(&path, family.weight_schema(), kind);
-    let source =
-        GgufWeightComponentSource::open_with_schema(&path, family.weight_schema(), None).unwrap();
+    write_weights(&path, family.stored_weight_schema().unwrap(), kind);
+    let source = GgufWeightComponentSource::open_with_schema(
+        &path,
+        family.stored_weight_schema().unwrap(),
+        None,
+    )
+    .unwrap();
     assert_eq!(
         source.file().architecture().unwrap(),
         family_config.model_type
@@ -439,7 +443,8 @@ fn build_executor<R: DeviceRuntime>(
         family.external_metadata_id(),
     );
     let parameter_count = family
-        .weight_schema()
+        .stored_weight_schema()
+        .unwrap()
         .tensors
         .iter()
         .map(|tensor| tensor.dimensions.iter().product::<u64>())
