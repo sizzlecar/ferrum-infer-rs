@@ -256,13 +256,14 @@ impl EngineInner {
                     self.model_executor
                         .resident_cohort_capacity_snapshot(&residents),
                 );
-            } else if round
-                .request_facts()
-                .is_some_and(|facts| persistent.len() == facts.len())
+            }
+            if round.resident_capacity().is_none()
+                && round
+                    .request_facts()
+                    .is_some_and(|facts| persistent.len() == facts.len())
             {
-                // Waiting members need their own complete original-owner
-                // proof. A resident count or free KV blocks cannot substitute
-                // for reusable metadata and every declared persistent pool.
+                // Also try owners that expose only the general complete-cohort
+                // capability, even when every member is already resident.
                 let max_live_sequences = self.config.scheduler.max_running_requests;
                 let query = PersistentCapacityQuery {
                     members: &persistent,

@@ -21,6 +21,72 @@ impl CostSnapshot for Snapshot {
     }
 }
 
+#[tokio::test]
+async fn planning_paged_residents_use_general_capacity_when_resident_only_api_is_unknown() {
+    let cfg = TinyLlamaConfig::default();
+    let mut config = EngineConfig::default();
+    config.backend.device = Device::CPU;
+    config.scheduler.max_running_requests = 2;
+    config.batching.max_batch_size = 2;
+    let mut execution = config.llama_execution_config();
+    execution.options.metal_paged_kv = Some(true);
+    execution.kv_capacity = Some(64);
+    execution.options.kv_max_blocks = Some(8);
+    let model = tiny_llama_model_with_execution_config(&cfg, execution);
+    let engine = ContinuousBatchEngine::new_observed_with_requests(
+        config.clone(),
+        Arc::new(ContinuousBatchScheduler::new(config.scheduler)),
+        tiny_tokenizer(&cfg),
+        Arc::new(crate::registry::GreedySampler),
+        ExecutorOwner::new(Box::new(ferrum_models::LlmExecutor::new(
+            Box::new(model),
+            tiny_model_info(&cfg),
+        ))),
+        None,
+        None,
+        None,
+        Some(Arc::new(Recorder::default())),
+    )
+    .unwrap();
+    let mut request = request();
+    request.ensure_ingress(ferrum_types::RequestIngressBoundary::EngineApi);
+    let mut sequence = SequenceState::new(request.clone(), vec![TokenId(1), TokenId(2)]);
+    let (sender, _response) = tokio::sync::oneshot::channel();
+    sequence.response_sender = Some(sender);
+    engine.publish_request(request, sequence).await.unwrap();
+    let inner = engine.active_inner().unwrap();
+    assert_eq!(
+        inner
+            .prepare_dynamic_admission_round(1, None)
+            .await
+            .unwrap()
+            .0,
+        1
+    );
+    let mut round = TimePlanningRound::new(
+        Arc::new(Snapshot),
+        "ttft:1000,tpot:100,itl:100".parse().unwrap(),
+        PrefillShapePolicy::Identity,
+        CostExecution::SingleInvocation,
+    );
+    inner.capture_planning_request_facts(&mut round, 1);
+    assert!(
+        round.resident_capacity().is_none(),
+        "legacy owner uses the general capability"
+    );
+    let proof = round
+        .persistent_capacity()
+        .expect("fully resident paged cohort remains supported");
+    assert_eq!(proof.members().len(), 1);
+    assert!(matches!(
+        proof.members()[0].state,
+        ferrum_execution::model_executor::PersistentCapacityState::Resident { .. }
+    ));
+    drop(inner);
+    engine.shutdown().await.unwrap();
+    engine.wait_for_shutdown_completion().await.unwrap();
+}
+
 // These are real product admissions into a real CPU ProgramExecutor. The
 // fixture's native embedding/head program needs no attention KV; its owner
 // still enforces the admitted request and sequence ceilings.
