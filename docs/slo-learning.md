@@ -393,3 +393,30 @@ for every arm on that backend. Its default remains `demand-driven`; the option
 checks the full configured memory shape and allocates persistent backing before
 readiness. The backing remains reclaimable, and the scheduler still checks
 actual owners on every capacity observation.
+
+## Offline qualification inputs
+
+The [offline example](../crates/ferrum-cli/examples/prepare_slo_qualification.rs)
+prepares synthetic inputs using a [typed recipe](../crates/ferrum-cli/examples/prepare_slo_qualification/recipe.rs)
+and local tokenizer/template files:
+
+```sh
+cargo run -p ferrum-cli --example prepare_slo_qualification -- RECIPE.json NEW_OUTPUT_DIRECTORY
+```
+
+The recipe declares the template source, output protocol, context/block geometry,
+request policy and finite stages. Ferrum's renderer and actual special-token-aware
+encoding must reach each requested input length exactly. The example writes client
+configurations, rendered-token audits and source/output hashes into a new directory
+without overwriting an existing destination. It does not load weights, execute
+inference, read generated answers or access a dataset or network.
+
+These outputs establish prepared input geometry only. Bind recipe declarations to
+the actual server configuration before use. Prefix audits compare all prior
+prepared token sequences and report potential reuse; nonce text does not establish
+a cache miss. Finite search/file/payload limits do not impose a hard RSS or time
+sandbox on template/tokenizer internals. Actual invocation width, successful
+execution, model/calibration qualification and latency SLOs require separate
+observations. Synthetic initialization is not the primary ShareGPT benchmark.
+Declare stage sequencing, failure stops and measurement boundaries separately;
+the tool has no default request matrix.

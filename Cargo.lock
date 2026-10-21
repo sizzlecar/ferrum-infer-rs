@@ -1303,6 +1303,7 @@ dependencies = [
  "ferrum-scheduler",
  "ferrum-server",
  "ferrum-slo",
+ "ferrum-tokenizer",
  "ferrum-types",
  "futures",
  "indicatif",
