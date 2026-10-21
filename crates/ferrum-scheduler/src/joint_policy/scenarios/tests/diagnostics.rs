@@ -256,13 +256,15 @@ fn cached_alternative_simulation_exhaustion_is_sticky_without_fake_provider_call
         &[128, 128],
         |_, _| Ok(()),
     );
-    let result = result.unwrap();
-    assert_eq!(result.queries, 1);
+    assert!(matches!(result, Err(Unsupported::QueryBudget)));
     assert_eq!(report.provider_calls, 1);
     assert_eq!(snapshot.calls.load(Ordering::Relaxed), 1);
-    assert_eq!(report.simulation_queries, 4);
-    assert_eq!(report.cache_hits, 4);
-    assert!(report.terminal_failure.is_none());
+    // Stop at rank zero's actual refusal rather than visiting the next rank.
+    assert_eq!(report.simulation_queries, 2);
+    assert_eq!(report.cache_hits, 2);
+    assert_eq!(report.rank_attempts, 1);
+    assert_eq!(report.rank_completed, 0);
+    assert_eq!(report.terminal_failure, report.first_failure);
     assert!(report.query_budget_exhausted);
     assert_eq!(
         report.first_failure.unwrap().origin,

@@ -47,6 +47,20 @@ pub enum Unsupported {
 }
 
 impl Unsupported {
+    /// A refused planning operation invalidates the comparison, even when an
+    /// earlier candidate completed. A per-query provider support limit is a
+    /// different contract and remains local to that candidate.
+    fn is_hard_budget_failure(self) -> bool {
+        matches!(
+            self,
+            Self::ParticipantBudget
+                | Self::CandidateBudget
+                | Self::QueryBudget
+                | Self::TimeBudget
+                | Self::Cost(CostUnknownReason::PlanningBudget)
+        )
+    }
+
     /// Preserve the existing resource/unresolved partition when refining a
     /// previously generic resource reason. This is diagnostic classification,
     /// never authority to admit or change the unknown policy.
@@ -448,27 +462,29 @@ impl SloPolicy {
                 .map(SimulatedRequest::progress)
                 .collect()
         });
-        let alternatives = input
-            .alternatives
-            .iter()
-            .enumerate()
-            .map(|(index, action)| {
-                let result = simulate(
-                    &input,
-                    action,
-                    match window {
-                        StaticWindow::Exact(window) => Some((window, targets.as_slice())),
-                        StaticWindow::AtLeast(_) => None,
-                    },
-                    &mut budget,
-                    index + 1,
-                )?;
-                match result {
-                    StaticTrajectory::Complete(result) => Ok(result),
-                    StaticTrajectory::OutsideSupportPrefix(prefix) => Err(prefix.unsupported),
+        let mut alternatives = Vec::with_capacity(input.alternatives.len());
+        for (index, action) in input.alternatives.iter().enumerate() {
+            let result = simulate(
+                &input,
+                action,
+                match window {
+                    StaticWindow::Exact(window) => Some((window, targets.as_slice())),
+                    StaticWindow::AtLeast(_) => None,
+                },
+                &mut budget,
+                index + 1,
+            )
+            .and_then(|result| match result {
+                StaticTrajectory::Complete(result) => Ok(result),
+                StaticTrajectory::OutsideSupportPrefix(prefix) => Err(prefix.unsupported),
+            });
+            if let Err(reason) = &result {
+                if reason.is_hard_budget_failure() {
+                    return Err(*reason);
                 }
-            })
-            .collect::<Vec<_>>();
+            }
+            alternatives.push(result);
+        }
         if matches!(static_result, StaticTrajectory::OutsideSupportPrefix(_)) {
             if let Some(reason) = alternatives
                 .iter()

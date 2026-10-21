@@ -375,20 +375,10 @@ fn missing_resources_or_exhausted_queries_cannot_report_gain() {
         alternatives: &[Action::ShortFirst],
         horizon: EvaluationHorizon::StaticRounds(4),
     };
-    let result = SloPolicy::evaluate(input()).unwrap();
     assert!(matches!(
-        result.alternatives[0],
+        SloPolicy::evaluate(input()),
         Err(Unsupported::QueryBudget)
     ));
-    assert_eq!(
-        SloPolicy::choose(
-            &result,
-            JointFeasibility::Infeasible,
-            &[JointFeasibility::Feasible],
-            &[None]
-        ),
-        PolicyChoice::Unresolved
-    );
     let mut waiting = input();
     waiting.resources.waiting_requests = 1;
     assert!(matches!(

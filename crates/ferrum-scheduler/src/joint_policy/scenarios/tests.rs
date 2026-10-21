@@ -1,6 +1,7 @@
 use super::*;
 use ferrum_execution::{execution_attempt::AttemptPrefixRestore, token_execution::ExecutionRange};
 
+mod budget_selection;
 mod diagnostics;
 mod partial_support;
 
