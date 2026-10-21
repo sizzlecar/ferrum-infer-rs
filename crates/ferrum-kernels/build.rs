@@ -49,6 +49,7 @@ static CUDA_BUILD_SUMMARY_ROWS: OnceLock<Mutex<Vec<serde_json::Value>>> = OnceLo
 const CORE_PTX_KERNELS: &[&str] = &[
     "kernels/fused_add_rms_norm.cu",
     "kernels/fused_silu_mul.cu",
+    "kernels/vnext_bf16_silu.cu",
     "kernels/rms_norm.cu",
     "kernels/sandwich_norm.cu",
     "kernels/rope.cu",
@@ -1462,11 +1463,18 @@ fn compile_core_ptx(out_dir: &Path, native_build_cache: Option<&CudaNativeBuildC
         // the cache identity and the actual compiler invocation.
         let precise_math = matches!(
             *kernel,
-            gguf::KERNEL | "kernels/residual_add.cu" | "kernels/argmax_rows.cu"
+            gguf::KERNEL
+                | "kernels/residual_add.cu"
+                | "kernels/argmax_rows.cu"
+                | "kernels/vnext_bf16_silu.cu"
         );
+        let precise_transcendental = *kernel == "kernels/vnext_bf16_silu.cu";
         if precise_math {
             flags.retain(|flag| flag != "--use_fast_math");
             flags.push("--fmad=false".into());
+        }
+        if precise_transcendental {
+            flags.extend(["--ftz=false", "--prec-div=true", "--prec-sqrt=true"].map(str::to_owned));
         }
         if *kernel == gguf::KERNEL {
             flags.push(format!("-I{}", out_dir.display()));
@@ -1545,6 +1553,9 @@ fn compile_core_ptx(out_dir: &Path, native_build_cache: Option<&CudaNativeBuildC
                     command.arg("--fmad=false");
                 } else {
                     command.arg("--use_fast_math");
+                }
+                if precise_transcendental {
+                    command.args(["--ftz=false", "--prec-div=true", "--prec-sqrt=true"]);
                 }
                 if *kernel == gguf::KERNEL {
                     command.arg(format!("-I{}", out_dir.display()));

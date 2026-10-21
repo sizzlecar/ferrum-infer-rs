@@ -81,6 +81,7 @@ fn buffer(
             _base: base,
             aligned_ptr: ptr,
             requested_bytes: BYTES as u64,
+            _tensor_owner: None,
         }),
     })
 }

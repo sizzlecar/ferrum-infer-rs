@@ -66,6 +66,7 @@ mod native_io;
 mod q6_head;
 pub use q6_head::CudaQ6MmqF32LastTokenProvider;
 mod selection;
+mod tensor_silu;
 mod transformer;
 use ferrum_runtime::{
     causal_paged_attention_f32_master_contract, causal_paged_attention_f32_master_int8_kv_contract,
@@ -81,6 +82,10 @@ use native_io::TokenPrecision;
 use selection::{
     argmax_dispatches, ArgmaxArguments, ArgmaxBatchArguments, ArgmaxFunctions, ArgmaxPrecision,
     ARGMAX_BATCH_ROWS,
+};
+pub use tensor_silu::{
+    NUMERICAL_PROFILE_ID as CUDA_SILU_BF16_NUMERICAL_PROFILE_ID,
+    NUMERICAL_PROFILE_IDENTITY as CUDA_SILU_BF16_NUMERICAL_PROFILE_IDENTITY,
 };
 
 const TOKEN_EMBEDDING_PROVIDER_ID: &str = "provider.cuda.token_embedding.f16";
@@ -303,6 +308,45 @@ pub fn cuda_vnext_runtime_config(
             )?,
         ]),
     })
+}
+
+/// Minimal capability/configuration for the bounded, eager tensor constructor.
+/// This does not construct a device or choose opaque memory allowances; pass
+/// it as `CudaTensorRuntimeConfig::device` to `new_tensor_eager`.
+pub fn cuda_tensor_runtime_config(
+    ordinal: usize,
+    device_id: DeviceId,
+) -> Result<CudaDeviceRuntimeConfig, VNextError> {
+    let mut config =
+        cuda_vnext_runtime_config(ordinal, device_id, AttentionExecutionPolicy::Portable)?;
+    let numerical = tensor_silu::numerical_fingerprint();
+    config.runtime_implementation_fingerprint = implementation_fingerprint(&[
+        config.runtime_implementation_fingerprint.as_bytes(),
+        numerical.as_bytes(),
+        include_bytes!("vnext_runtime/tensor_io.rs"),
+        include_bytes!("vnext_runtime/tensor_eager.rs"),
+    ]);
+    config.capabilities =
+        BTreeSet::from([CapabilityId::new(ferrum_runtime::SILU_BF16_CAPABILITY_ID)?]);
+    config.dynamic_storage_profiles = BTreeSet::from([DynamicStorageProfile::new(
+        DynamicStorageAllocator::LinearArena,
+        DynamicStorageView::Contiguous,
+    )?]);
+    Ok(config)
+}
+
+/// The fixed-tensor SiLU provider, without token kernels/materializers or
+/// graph registration. Build one registry from this and `silu_bf16_contract`.
+pub fn cuda_vnext_silu_bf16_provider(
+    runtime: &CudaDeviceRuntime,
+) -> Result<Box<dyn OperationProvider<CudaDeviceRuntime>>, CudaDeviceRuntimeError> {
+    Ok(Box::new(tensor_silu::CudaTensorSiluProvider::new(runtime)?))
+}
+
+/// Source, precise build options, and compiled PTX identity. This identifies
+/// an implementation; qualification still requires running on the target GPU.
+pub fn cuda_silu_bf16_implementation_fingerprint() -> String {
+    tensor_silu::numerical_fingerprint()
 }
 
 pub(crate) fn rn_fragment_mma_compiled() -> bool {

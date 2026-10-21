@@ -44,6 +44,7 @@ mod contracts;
 pub use contracts::*;
 mod capacity;
 use capacity::*;
+pub use capacity::{DeviceCapacityOwner, DeviceCapacityRetention, DeviceOpaqueMemoryKind};
 mod provisioning;
 pub use provisioning::*;
 mod allocation;

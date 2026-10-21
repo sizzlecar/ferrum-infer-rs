@@ -9,6 +9,7 @@ use std::collections::BTreeSet;
 use std::error::Error;
 use std::fmt;
 use std::ops::Range;
+use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Instant;
@@ -39,9 +40,9 @@ use ferrum_runtime::{
     DeviceTerminal, DeviceTerminalReceipt, DeviceTimingMeasurement, DeviceTimingMode,
     DeviceTimingUnavailableReason, DisabledDeviceSubmissionTimingSink, DynamicStorageProfile,
     ElementType, ExecutionFactsCapture, FenceIndeterminate, FenceQuery, HostTransferLayout,
-    ProgramBindingNodeBinding, ProjectionInvocationTemplate, RetainedHostMemoryRegion,
-    StaticWeightTransformPlan, StaticWeightTransformRequest, StreamState, VNextError,
-    DEVICE_COPY_NATIVE_OPERATION_ID, DEVICE_ZERO_NATIVE_OPERATION_ID,
+    ManagedHostBuffer, ManagedHostBytes, ProgramBindingNodeBinding, ProjectionInvocationTemplate,
+    RetainedHostMemoryRegion, StaticWeightTransformPlan, StaticWeightTransformRequest, StreamState,
+    VNextError, DEVICE_COPY_NATIVE_OPERATION_ID, DEVICE_ZERO_NATIVE_OPERATION_ID,
     HOST_UPLOAD_NATIVE_OPERATION_ID,
 };
 use ferrum_types::{AttentionExecutionPolicy, ProgramBindingUploadStrategy};
@@ -63,6 +64,8 @@ mod resident_program;
 mod segment_oracle;
 mod segment_owners;
 mod sequence_physical;
+mod tensor_eager;
+mod tensor_io;
 mod terminal_readback;
 pub(crate) use resident_program::{ResidentColdParts, ResidentControlRule};
 use segment_owners::CudaProgramBindingRetention;
@@ -71,6 +74,9 @@ pub(crate) use sequence_physical::{
     CudaBindingProgramRanges, CudaPhysicalOwnerBuilder, CudaPhysicalRowWindow,
     CudaSequencePhysicalTable,
 };
+pub(crate) use tensor_eager::CudaTensorProviderRetention;
+pub use tensor_eager::{CudaTensorRuntimeConfig, CUDA_TENSOR_MAX_COMMANDS_PER_SUBMISSION};
+use tensor_io::validate_tensor_command;
 
 static NEXT_RUNTIME_INSTANCE: AtomicU64 = AtomicU64::new(1);
 static NEXT_STREAM_INSTANCE: AtomicU64 = AtomicU64::new(1);
@@ -135,6 +141,7 @@ enum CudaRuntimePurpose {
 #[derive(Debug)]
 pub enum CudaDeviceRuntimeError {
     Contract(String),
+    Capacity(VNextError),
     Driver {
         operation: &'static str,
         source: DriverError,
@@ -146,6 +153,9 @@ pub enum CudaDeviceRuntimeError {
 }
 
 impl CudaDeviceRuntimeError {
+    pub(super) fn capacity(error: VNextError) -> Self {
+        Self::Capacity(error)
+    }
     pub(super) fn contract(message: impl Into<String>) -> Self {
         Self::Contract(message.into())
     }
@@ -160,7 +170,7 @@ impl CudaDeviceRuntimeError {
 
     fn driver_code(&self) -> Option<cudarc::driver::sys::CUresult> {
         match self {
-            Self::Contract(_) => None,
+            Self::Contract(_) | Self::Capacity(_) => None,
             Self::Driver { source, .. } => Some(source.0),
             Self::Blas { .. } => None,
         }
@@ -171,6 +181,7 @@ impl fmt::Display for CudaDeviceRuntimeError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Contract(message) => formatter.write_str(message),
+            Self::Capacity(error) => write!(formatter, "{error}"),
             Self::Driver { operation, source } => {
                 write!(formatter, "CUDA {operation} failed: {source:?}")
             }
@@ -185,6 +196,7 @@ impl Error for CudaDeviceRuntimeError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Contract(_) => None,
+            Self::Capacity(error) => Some(error),
             Self::Driver { .. } => None,
             Self::Blas { source, .. } => Some(source),
         }
@@ -195,6 +207,7 @@ struct CudaAllocation {
     _base: CudaSlice<u8>,
     aligned_ptr: cudarc::driver::sys::CUdeviceptr,
     requested_bytes: u64,
+    _tensor_owner: Option<Arc<tensor_eager::TensorEagerState>>,
 }
 
 unsafe impl Send for CudaAllocation {}
@@ -1142,6 +1155,9 @@ impl CudaBindingProgramSink {
             program_binding_patch: None,
             binding_program: Some(projection),
             reusable_execution: None,
+            tensor_work: None,
+            managed_upload: None,
+            tensor_flight: None,
             execution_facts: None,
             completion_checks: checks,
         })
@@ -1170,8 +1186,13 @@ pub struct CudaDeviceCommand {
     program_binding_patch: Option<CudaProgramBindingPatch>,
     binding_program: Option<Arc<CudaBindingProgramProjection>>,
     reusable_execution: Option<DeviceReusableExecutionInvocation>,
+    tensor_work: Option<DeviceCommandLogicalWork>,
+    // Never copied into a cached executable. The original accounted owner is
+    // retained by this submission, its fence, or its quarantine record.
+    managed_upload: Option<tensor_io::ManagedUpload>,
     // Pure provider descriptions, independent of replay keys and resource owners.
     execution_facts: Option<Arc<[ProjectionInvocationTemplate]>>,
+    tensor_flight: Option<Arc<tensor_eager::TensorFlightRetention>>,
 }
 
 impl fmt::Debug for CudaDeviceCommand {
@@ -1345,6 +1366,9 @@ impl CudaDeviceCommand {
             binding_program: None,
             program_binding_patch: None,
             reusable_execution: None,
+            tensor_work: None,
+            managed_upload: None,
+            tensor_flight: None,
             execution_facts: None,
             completion_checks: Vec::new(),
         })
@@ -1559,6 +1583,9 @@ impl CudaDeviceCommand {
             binding_program: None,
             program_binding_patch: None,
             reusable_execution: None,
+            tensor_work: None,
+            managed_upload: None,
+            tensor_flight: None,
             execution_facts: None,
             completion_checks: Vec::new(),
         })
@@ -1605,6 +1632,9 @@ impl CudaDeviceCommand {
             binding_program: None,
             program_binding_patch: None,
             reusable_execution: None,
+            tensor_work: None,
+            managed_upload: None,
+            tensor_flight: None,
             execution_facts: None,
             completion_checks: Vec::new(),
         })
@@ -1640,6 +1670,9 @@ impl CudaDeviceCommand {
             binding_program: None,
             program_binding_patch: None,
             reusable_execution: None,
+            tensor_work: None,
+            managed_upload: None,
+            tensor_flight: None,
             execution_facts: None,
             completion_checks: Vec::new(),
         }
@@ -1749,6 +1782,9 @@ impl CudaDeviceCommand {
                 retention,
             }),
             reusable_execution: None,
+            tensor_work: None,
+            managed_upload: None,
+            tensor_flight: None,
             execution_facts: None,
             completion_checks: Vec::new(),
         })
@@ -1762,7 +1798,10 @@ impl CudaDeviceCommand {
         compute_dispatch_count: u64,
         transfer_command_count: u64,
     ) -> Result<Self, CudaDeviceRuntimeError> {
-        if participant_count == 0 || (compute_dispatch_count == 0 && transfer_command_count == 0) {
+        if self.tensor_work.is_some()
+            || participant_count == 0
+            || (compute_dispatch_count == 0 && transfer_command_count == 0)
+        {
             return Err(CudaDeviceRuntimeError::contract(
                 "CUDA operation attribution has no participants or native work",
             ));
@@ -1771,6 +1810,38 @@ impl CudaDeviceCommand {
         self.participant_start = 0;
         self.participant_count = participant_count;
         self.token_count = token_count;
+        self.compute_dispatch_count = compute_dispatch_count;
+        self.transfer_command_count = transfer_command_count;
+        Ok(self)
+    }
+
+    /// Eager fixed-tensor work; these counts are observations, not resource authority.
+    pub(crate) fn with_tensor_work(
+        mut self,
+        element_count: u64,
+        arithmetic_operations: u64,
+        compute_dispatch_count: u64,
+        transfer_command_count: u64,
+    ) -> Result<Self, CudaDeviceRuntimeError> {
+        if self.participant_count != 0
+            || self.token_count != 0
+            || self.tensor_work.is_some()
+            || self.replay_key.is_some()
+            || self.reusable_address_scope.is_some()
+            || self.reusable_execution.is_some()
+            || self.work_declaration() != CudaWorkDeclaration::Static
+            || (compute_dispatch_count == 0 && transfer_command_count == 0)
+        {
+            return Err(CudaDeviceRuntimeError::contract(
+                "CUDA tensor work requires an unattributed eager command",
+            ));
+        }
+        let work = DeviceCommandLogicalWork::tensor(element_count, arithmetic_operations)
+            .map_err(|error| CudaDeviceRuntimeError::contract(error.to_string()))?;
+        self.batching_form = work.batching_form();
+        self.participant_start = work.participant_start();
+        self.participant_count = work.participant_count();
+        self.tensor_work = Some(work);
         self.compute_dispatch_count = compute_dispatch_count;
         self.transfer_command_count = transfer_command_count;
         Ok(self)
@@ -1795,7 +1866,7 @@ impl CudaDeviceCommand {
         mut self,
         logical_work: DeviceCommandLogicalWork,
     ) -> Result<Self, CudaDeviceRuntimeError> {
-        if self.participant_count != 0 || self.token_count != 0 {
+        if self.participant_count != 0 || self.token_count != 0 || self.tensor_work.is_some() {
             return Err(CudaDeviceRuntimeError::contract(
                 "CUDA core logical work cannot replace provider command attribution",
             ));
@@ -1803,9 +1874,10 @@ impl CudaDeviceCommand {
         self.batching_form = logical_work.batching_form();
         self.participant_start = logical_work.participant_start();
         self.participant_count = logical_work.participant_count();
-        self.token_count = logical_work.token_count().ok_or_else(|| {
-            CudaDeviceRuntimeError::contract("backend does not support tensor logical attribution")
-        })?;
+        match logical_work.token_count() {
+            Some(tokens) => self.token_count = tokens,
+            None => self.tensor_work = Some(logical_work),
+        }
         Ok(self)
     }
 
@@ -1842,6 +1914,9 @@ impl CudaDeviceCommand {
             binding_program: None,
             program_binding_patch: None,
             reusable_execution: Some(invocation),
+            tensor_work: None,
+            managed_upload: None,
+            tensor_flight: None,
             execution_facts: None,
             completion_checks: Vec::new(),
         }
@@ -2149,6 +2224,9 @@ impl CudaDeviceCommand {
                 binding_program: None,
                 program_binding_patch: None,
                 reusable_execution: None,
+                tensor_work: None,
+                managed_upload: None,
+                tensor_flight: None,
                 execution_facts: None,
                 completion_checks,
             }]);
@@ -2237,6 +2315,9 @@ impl CudaDeviceCommand {
             binding_program: None,
             program_binding_patch: None,
             reusable_execution: None,
+            tensor_work: None,
+            managed_upload: None,
+            tensor_flight: None,
             execution_facts: None,
             completion_checks,
         }])
@@ -2306,6 +2387,9 @@ impl CudaDeviceCommand {
             binding_program: None,
             program_binding_patch: None,
             reusable_execution: None,
+            tensor_work: None,
+            managed_upload: None,
+            tensor_flight: None,
             execution_facts: None,
             completion_checks: Vec::new(),
         }])
@@ -2316,6 +2400,10 @@ impl CudaDeviceCommand {
         stream: &CudaStream,
         blas: &CudaBlas,
     ) -> Result<CudaEnqueuedWork, CudaDeviceRuntimeError> {
+        if let Some(upload) = &self.managed_upload {
+            upload.enqueue(stream)?;
+            return Ok(CudaEnqueuedWork::Static);
+        }
         let executable = self.executable.as_ref().ok_or_else(|| {
             CudaDeviceRuntimeError::contract(
                 "uncoalesced CUDA program binding patch cannot enqueue",
@@ -2566,6 +2654,32 @@ fn cuda_submission_attribution(
                     ))
                 }
             };
+            if let Some(work) = command.tensor_work {
+                validate_tensor_command(command)?;
+                if execution_paths[command_index as usize] != DeviceExecutionPath::Eager
+                    || reusable_graph_node_counts
+                        .and_then(|counts| counts[command_index as usize])
+                        .is_some()
+                    || dependency != 0
+                {
+                    return Err(CudaDeviceRuntimeError::contract(
+                        "CUDA tensor work cannot use token replay attribution",
+                    ));
+                }
+                return DeviceNativeWorkAttribution::with_logical_work(
+                    command_index,
+                    command_node_indices[command_index as usize],
+                    command_phases[command_index as usize],
+                    native_op_id,
+                    DeviceExecutionPath::Eager,
+                    work,
+                    compute,
+                    transfer,
+                )
+                .ok_or_else(|| {
+                    CudaDeviceRuntimeError::contract("invalid CUDA tensor attribution")
+                });
+            }
             DeviceNativeWorkAttribution::with_participant_range_and_dependencies(
                 command_index,
                 command_node_indices[command_index as usize],
@@ -2601,7 +2715,9 @@ fn validate_conditional_dependency(
     graph_nodes: Option<u64>,
 ) -> Result<(), CudaDeviceRuntimeError> {
     use ferrum_runtime::DeviceCommandPhase;
-    if phase != DeviceCommandPhase::DynamicBinding
+    if command.tensor_work.is_some()
+        || command.managed_upload.is_some()
+        || phase != DeviceCommandPhase::DynamicBinding
         || node_index.is_some()
         || execution_path != DeviceExecutionPath::Eager
         || graph_nodes.is_some()
@@ -2660,6 +2776,26 @@ fn validate_cuda_submission_attribution(
                 paths[index],
                 graph_nodes,
             )?;
+        } else if let Some(work) = command.tensor_work {
+            validate_tensor_command(command)?;
+            if paths[index] != DeviceExecutionPath::Eager
+                || graph_nodes.is_some()
+                || DeviceNativeWorkAttribution::with_logical_work(
+                    command_index,
+                    node_indices[index],
+                    phases[index],
+                    native_op_id,
+                    paths[index],
+                    work,
+                    command.compute_dispatch_count,
+                    command.transfer_command_count,
+                )
+                .is_none()
+            {
+                return Err(CudaDeviceRuntimeError::contract(
+                    "invalid CUDA eager tensor attribution",
+                ));
+            }
         } else if DeviceNativeWorkAttribution::with_participant_range(
             command_index,
             node_indices[index],
@@ -2692,6 +2828,7 @@ pub struct CudaDeviceStream {
     state: Arc<CudaStreamState>,
     executable_cache: CudaExecutableCache,
     terminal_readback_pool: Arc<terminal_readback::Pool>,
+    tensor_lane: Option<Arc<tensor_eager::TensorLaneRetention>>,
 }
 
 impl fmt::Debug for CudaDeviceStream {
@@ -2807,6 +2944,27 @@ pub struct CudaDeviceFence {
     _stream: Arc<CudaStream>,
     _blas: Arc<CudaBlas>,
     _commands: Vec<CudaDeviceCommand>,
+}
+
+impl Drop for CudaDeviceFence {
+    fn drop(&mut self) {
+        if self
+            ._commands
+            .iter()
+            .any(|command| command.tensor_flight.is_some())
+            && !self.terminal_accounted.load(Ordering::Acquire)
+            && (self.stream_state.recording.load(Ordering::Acquire)
+                || self.stream_state.in_flight.load(Ordering::Acquire) != 0)
+        {
+            // A caller dropping an unobserved fence cannot revoke DMA owners.
+            // Core normally recovers through its reaper; abandonment retains
+            // the native owners and their quotas conservatively.
+            self.stream_state.fail();
+            std::mem::forget(Arc::clone(&self._stream));
+            std::mem::forget(Arc::clone(&self._blas));
+            std::mem::forget(std::mem::take(&mut self._commands));
+        }
+    }
 }
 
 enum CudaFenceTiming {
@@ -3129,6 +3287,24 @@ pub struct CudaDeviceRuntime {
     #[cfg(feature = "vllm-marlin")]
     mxfp4_marlin_prepare: Mxfp4MarlinPrepareFunctions,
     quarantined: Mutex<Vec<QuarantinedSubmission>>,
+    tensor_eager: Option<Arc<tensor_eager::TensorEagerState>>,
+}
+
+impl Drop for CudaDeviceRuntime {
+    fn drop(&mut self) {
+        if self.tensor_eager.is_some() {
+            // Failed synchronization never authorizes releasing a native
+            // submission or returning its host/device capacity allowances.
+            let pending = std::mem::take(
+                self.quarantined
+                    .get_mut()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+            );
+            if !pending.is_empty() {
+                std::mem::forget(pending);
+            }
+        }
+    }
 }
 
 impl fmt::Debug for CudaDeviceRuntime {
@@ -3349,6 +3525,7 @@ impl CudaDeviceRuntime {
             #[cfg(feature = "vllm-marlin")]
             mxfp4_marlin_prepare,
             quarantined: Mutex::new(Vec::new()),
+            tensor_eager: None,
         })
     }
 
@@ -4555,10 +4732,18 @@ impl DeviceRuntime for CudaDeviceRuntime {
         permit: ferrum_runtime::DeviceAllocationPermit<'_>,
     ) -> Result<Self::Buffer, Self::Error> {
         let request = permit.into_request();
-        let extra_alignment = request
-            .alignment_bytes()
-            .checked_sub(1)
-            .ok_or_else(|| CudaDeviceRuntimeError::contract("CUDA allocation alignment is zero"))?;
+        let extra_alignment = if self.tensor_eager.is_some() {
+            if request.alignment_bytes() == 0 || request.alignment_bytes() > 256 {
+                return Err(CudaDeviceRuntimeError::contract(
+                    "CUDA tensor allocations support alignment up to 256 bytes",
+                ));
+            }
+            0
+        } else {
+            request.alignment_bytes().checked_sub(1).ok_or_else(|| {
+                CudaDeviceRuntimeError::contract("CUDA allocation alignment is zero")
+            })?
+        };
         let allocation_bytes = request
             .size_bytes()
             .checked_add(extra_alignment)
@@ -4569,6 +4754,11 @@ impl DeviceRuntime for CudaDeviceRuntime {
         let (base_ptr, base_use) = base.device_ptr(&self.allocation_stream);
         drop(base_use);
         let alignment = request.alignment_bytes();
+        if self.tensor_eager.is_some() && base_ptr % alignment != 0 {
+            return Err(CudaDeviceRuntimeError::contract(
+                "CUDA allocation did not satisfy its admitted alignment",
+            ));
+        }
         let aligned_ptr = base_ptr
             .checked_add(alignment - 1)
             .map(|pointer| pointer & !(alignment - 1))
@@ -4590,6 +4780,7 @@ impl DeviceRuntime for CudaDeviceRuntime {
                 _base: base,
                 aligned_ptr,
                 requested_bytes: request.size_bytes(),
+                _tensor_owner: self.tensor_eager.clone(),
             }),
         })
     }
@@ -4629,6 +4820,9 @@ impl DeviceRuntime for CudaDeviceRuntime {
         &self,
         request: StaticWeightTransformRequest<'_, '_, Self::Buffer>,
     ) -> Option<Result<Self::Command, Self::Error>> {
+        if self.tensor_eager.is_some() {
+            return None;
+        }
         #[cfg(feature = "vllm-marlin")]
         {
             Some(match request.plan() {
@@ -4653,14 +4847,24 @@ impl DeviceRuntime for CudaDeviceRuntime {
                 current.checked_add(1)
             })
             .map_err(|_| CudaDeviceRuntimeError::contract("CUDA stream identity exhausted"))?;
-        let stream = self
-            .context
-            .new_stream()
-            .map_err(|error| CudaDeviceRuntimeError::driver("stream creation", error))?;
-        let blas = Arc::new(
-            CudaBlas::new(Arc::clone(&stream))
-                .map_err(|error| CudaDeviceRuntimeError::blas("cuBLAS handle creation", error))?,
-        );
+        let create = || {
+            let stream = self
+                .context
+                .new_stream()
+                .map_err(|error| CudaDeviceRuntimeError::driver("stream creation", error))?;
+            let blas =
+                Arc::new(CudaBlas::new(Arc::clone(&stream)).map_err(|error| {
+                    CudaDeviceRuntimeError::blas("cuBLAS handle creation", error)
+                })?);
+            Ok((stream, blas))
+        };
+        let ((stream, blas), tensor_lane) = if let Some(owner) = &self.tensor_eager {
+            let lane = owner.reserve_lane()?;
+            let (native, lane) = tensor_eager::create_native(lane, create)?;
+            (native, Some(lane))
+        } else {
+            (create()?, None)
+        };
         Ok(CudaDeviceStream {
             id,
             runtime_instance: self.runtime_instance,
@@ -4669,6 +4873,7 @@ impl DeviceRuntime for CudaDeviceRuntime {
             state: Arc::new(CudaStreamState::new()),
             executable_cache: CudaExecutableCache::new(),
             terminal_readback_pool: Arc::new(terminal_readback::Pool::new()),
+            tensor_lane,
         })
     }
 
@@ -5079,6 +5284,11 @@ impl DeviceRuntime for CudaDeviceRuntime {
         destination: &Self::Buffer,
         destination_offset_bytes: u64,
     ) -> Result<Self::Command, Self::Error> {
+        if self.tensor_eager.is_some() {
+            return Err(CudaDeviceRuntimeError::contract(
+                "CUDA tensor eager uploads require accounted host owners",
+            ));
+        }
         self.validate_buffer(destination)?;
         source_layout
             .validate_bytes(source.len())
@@ -5123,6 +5333,46 @@ impl DeviceRuntime for CudaDeviceRuntime {
         .expect("fresh CUDA upload has one owner")
         .host_upload_layout = Some(source_layout);
         Ok(command)
+    }
+
+    fn supports_managed_tensor_io(&self) -> bool {
+        self.tensor_eager.is_some()
+    }
+
+    fn encode_managed_upload(
+        &self,
+        source: ManagedHostBytes,
+        layout: HostTransferLayout,
+        destination: &Self::Buffer,
+        destination_offset_bytes: u64,
+    ) -> Result<Option<Self::Command>, Self::Error> {
+        if self.tensor_eager.is_none() {
+            return Ok(None);
+        }
+        self.validate_buffer(destination)?;
+        layout
+            .validate_bytes(source.len())
+            .map_err(|error| CudaDeviceRuntimeError::contract(error.to_string()))?;
+        if layout.element_type() != destination.descriptor.element_type {
+            return Err(CudaDeviceRuntimeError::contract(
+                "managed CUDA upload dtype differs",
+            ));
+        }
+        let region = CopyRegion::new(0, destination_offset_bytes, source.len() as u64)
+            .map_err(|error| CudaDeviceRuntimeError::contract(error.to_string()))?;
+        let (_, range) = tensor_io::transfer_range(
+            layout,
+            source.len() as u64,
+            destination.descriptor.size_bytes,
+            region,
+        )?;
+        CudaDeviceCommand::managed_upload(
+            self.runtime_instance,
+            source,
+            destination.region(range.start as u64..range.end as u64)?,
+            layout,
+        )
+        .map(Some)
     }
 
     fn encode_zero(
@@ -5203,7 +5453,21 @@ impl DeviceRuntime for CudaDeviceRuntime {
                 CudaDeviceRuntimeError::contract("CUDA command batch is empty"),
             ));
         }
+        if self.tensor_eager.is_some() && commands.reusable_execution_capture().is_some() {
+            return Err(DefinitelyNotSubmitted::new(
+                CudaDeviceRuntimeError::contract(
+                    "CUDA tensor eager runtime cannot capture reusable executables",
+                ),
+            ));
+        }
         let mut terminal_readback = commands.take_terminal_readback();
+        if self.tensor_eager.is_some() && terminal_readback.is_some() {
+            return Err(DefinitelyNotSubmitted::new(
+                CudaDeviceRuntimeError::contract(
+                    "CUDA tensor eager output uses synchronous managed readback",
+                ),
+            ));
+        }
         if terminal_readback.as_ref().is_some_and(|tail| {
             tail.runtime_instance != self.runtime_instance
                 || tail.replay_key.is_some()
@@ -5218,6 +5482,17 @@ impl DeviceRuntime for CudaDeviceRuntime {
         }
         let timing_mode = commands.timing_mode();
         let facts_capture = commands.execution_facts_capture();
+        if self.tensor_eager.is_some()
+            && (timing_mode != DeviceTimingMode::Off
+                || facts_capture != ExecutionFactsCapture::Off
+                || commands.len() > CUDA_TENSOR_MAX_COMMANDS_PER_SUBMISSION)
+        {
+            return Err(DefinitelyNotSubmitted::new(
+                CudaDeviceRuntimeError::contract(
+                    "CUDA tensor eager profile requires timing/facts off and at most 64 commands",
+                ),
+            ));
+        }
         let compute_path_requirement = commands.compute_path_requirement();
         let declared_eager_compute_node_indices = commands
             .declared_eager_compute_node_indices()
@@ -5239,6 +5514,31 @@ impl DeviceRuntime for CudaDeviceRuntime {
                     Some(logical_work) => command.bind_core_logical_work(logical_work)?,
                     None => command,
                 };
+                validate_tensor_command(&command)?;
+                command.validate_managed_transfer()?;
+                if self.tensor_eager.is_some() {
+                    if command.managed_upload.is_none() && command.tensor_work.is_none() {
+                        return Err(CudaDeviceRuntimeError::contract(
+                            "CUDA tensor eager runtime rejects token and unmanaged commands",
+                        ));
+                    }
+                } else if command.tensor_work.is_some() || command.managed_upload.is_some() {
+                    return Err(CudaDeviceRuntimeError::contract(
+                        "CUDA tensor work requires a bounded tensor eager runtime",
+                    ));
+                }
+                if (command.tensor_work.is_some() || command.managed_upload.is_some())
+                    && (reusable_execution_capture.is_some()
+                        || !matches!(
+                            compute_path_requirement,
+                            DeviceComputePathRequirement::Adaptive
+                                | DeviceComputePathRequirement::EagerOnly
+                        ))
+                {
+                    return Err(CudaDeviceRuntimeError::contract(
+                        "CUDA tensor submissions require eager execution without capture",
+                    ));
+                }
                 if command.work_declaration() == CudaWorkDeclaration::ConditionalDependency {
                     validate_conditional_dependency(
                         &command,
@@ -5393,6 +5693,10 @@ impl DeviceRuntime for CudaDeviceRuntime {
                 error,
             )));
         }
+        if let Some(lane) = &stream.tensor_lane {
+            let flight = lane.reserve_flight().map_err(DefinitelyNotSubmitted::new)?;
+            commands[0].tensor_flight = Some(flight);
+        }
         for invocation in commands
             .iter()
             .filter_map(CudaDeviceCommand::reusable_execution_invocation)
@@ -5443,9 +5747,11 @@ impl DeviceRuntime for CudaDeviceRuntime {
             | DeviceComputePathRequirement::ReplayedWithDeclaredEagerBoundaries => Vec::new(),
         };
         let capture_allowed = stream.state.is_quiescent();
+        let mut commands = tensor_io::SubmissionGuard::new(self, stream, commands);
         if let Err(error) = stream.state.begin_submission() {
             return Err(DefinitelyNotSubmitted::new(error));
         }
+        commands.arm();
         let mut replay_observation = DeviceReusableExecutionObservation::default();
         if S::ENABLED {
             for _ in &executable_candidates {
@@ -5464,7 +5770,7 @@ impl DeviceRuntime for CudaDeviceRuntime {
             Ok(preparation) => preparation,
             Err(error) => {
                 stream.state.fail();
-                self.quarantine(stream, commands);
+                self.quarantine(stream, commands.take());
                 panic!(
                     "CUDA submission became indeterminate while preparing reusable executables: {error}"
                 );
@@ -5531,7 +5837,7 @@ impl DeviceRuntime for CudaDeviceRuntime {
                 timing_sink,
             ) {
                 stream.state.fail();
-                self.quarantine(stream, commands);
+                self.quarantine(stream, commands.take());
                 panic!(
                     "CUDA submission became indeterminate while registering a reusable program: {error}"
                 );
@@ -5611,7 +5917,7 @@ impl DeviceRuntime for CudaDeviceRuntime {
                                 });
                             let Some(reusable_graph_node_count) = reusable_graph_node_count else {
                                 stream.state.fail();
-                                self.quarantine(stream, commands);
+                                self.quarantine(stream, commands.take());
                                 panic!(
                                     "CUDA submission became indeterminate because replay graph attribution overflowed u64"
                                 );
@@ -5625,7 +5931,7 @@ impl DeviceRuntime for CudaDeviceRuntime {
                             );
                             let Some(replayed) = replayed else {
                                 stream.state.fail();
-                                self.quarantine(stream, commands);
+                                self.quarantine(stream, commands.take());
                                 panic!(
                                     "CUDA submission became indeterminate because sealed replay attribution drifted"
                                 );
@@ -5664,12 +5970,12 @@ impl DeviceRuntime for CudaDeviceRuntime {
                     }
                     Ok(None) => {
                         stream.state.fail();
-                        self.quarantine(stream, commands);
+                        self.quarantine(stream, commands.take());
                         panic!("CUDA reusable execution disappeared after pre-submit validation");
                     }
                     Err(error) => {
                         stream.state.fail();
-                        self.quarantine(stream, commands);
+                        self.quarantine(stream, commands.take());
                         panic!(
                             "CUDA submission became indeterminate while launching a reusable program: {error}"
                         );
@@ -5786,7 +6092,7 @@ impl DeviceRuntime for CudaDeviceRuntime {
                 }
                 Some(Err(error)) => {
                     stream.state.fail();
-                    self.quarantine(stream, commands);
+                    self.quarantine(stream, commands.take());
                     panic!(
                         "CUDA submission became indeterminate while launching a reusable executable: {error}"
                     );
@@ -5803,15 +6109,24 @@ impl DeviceRuntime for CudaDeviceRuntime {
                 timing_sink,
                 DeviceEnqueueStage::EagerCommand,
                 false,
-                || commands[index].enqueue(&stream.stream, &stream.blas),
+                || {
+                    catch_unwind(AssertUnwindSafe(|| {
+                        commands[index].enqueue(&stream.stream, &stream.blas)
+                    }))
+                },
             ) {
-                Ok(work) => work,
-                Err(error) => {
+                Ok(Ok(work)) => work,
+                Ok(Err(error)) => {
                     stream.state.fail();
-                    self.quarantine(stream, commands);
+                    self.quarantine(stream, commands.take());
                     panic!(
                         "CUDA submission became indeterminate while enqueueing its batch: {error}"
                     );
+                }
+                Err(payload) => {
+                    stream.state.fail();
+                    self.quarantine(stream, commands.take());
+                    resume_unwind(payload);
                 }
             };
             if let (Some(observed), CudaEnqueuedWork::Dependency(work)) =
@@ -5866,7 +6181,7 @@ impl DeviceRuntime for CudaDeviceRuntime {
         );
         if let Err(error) = numerical_snapshot {
             stream.state.fail();
-            self.quarantine(stream, commands);
+            self.quarantine(stream, commands.take());
             panic!(
                 "CUDA submission became indeterminate while snapshotting numerical status: {error}"
             );
@@ -5878,7 +6193,7 @@ impl DeviceRuntime for CudaDeviceRuntime {
             if let Err(error) = tail.enqueue(&stream.stream, &stream.blas) {
                 commands.push(terminal_readback.take().expect("present terminal tail"));
                 stream.state.fail();
-                self.quarantine(stream, commands);
+                self.quarantine(stream, commands.take());
                 panic!(
                     "CUDA submission became indeterminate while copying terminal outputs: {error}"
                 );
@@ -5909,7 +6224,7 @@ impl DeviceRuntime for CudaDeviceRuntime {
                     commands.push(tail);
                 }
                 stream.state.fail();
-                self.quarantine(stream, commands);
+                self.quarantine(stream, commands.take());
                 panic!(
                     "CUDA submission became indeterminate while binding native attribution: {error}"
                 );
@@ -5952,13 +6267,13 @@ impl DeviceRuntime for CudaDeviceRuntime {
             Ok(event) => event,
             Err(error) => {
                 stream.state.fail();
-                self.quarantine(stream, commands);
+                self.quarantine(stream, commands.take());
                 panic!("CUDA submission became indeterminate while recording its fence: {error:?}");
             }
         };
         if let Err(error) = stream.state.submission_recorded() {
             stream.state.fail();
-            self.quarantine(stream, commands);
+            self.quarantine(stream, commands.take());
             panic!("CUDA submission became indeterminate while accounting its fence: {error}");
         }
         let fence = CudaDeviceFence {
@@ -5972,7 +6287,7 @@ impl DeviceRuntime for CudaDeviceRuntime {
             terminal_accounted: AtomicBool::new(false),
             _stream: Arc::clone(&stream.stream),
             _blas: Arc::clone(&stream.blas),
-            _commands: commands,
+            _commands: commands.take(),
         };
         drop(fence_stage);
         Ok(fence)
@@ -6072,6 +6387,11 @@ impl DeviceRuntime for CudaDeviceRuntime {
         region: CopyRegion,
         output_layout: HostTransferLayout,
     ) -> Result<Vec<u8>, Self::Error> {
+        if self.tensor_eager.is_some() {
+            return Err(CudaDeviceRuntimeError::contract(
+                "CUDA tensor eager readback requires accounted output storage",
+            ));
+        }
         self.validate_stream(stream)?;
         self.validate_buffer(source)?;
         if output_layout.element_type() != source.descriptor.element_type {
@@ -6112,8 +6432,52 @@ impl DeviceRuntime for CudaDeviceRuntime {
         Ok(output)
     }
 
+    fn readback_managed_into(
+        &self,
+        stream: &mut Self::Stream,
+        source: &Self::Buffer,
+        region: CopyRegion,
+        layout: HostTransferLayout,
+        destination: &mut ManagedHostBuffer,
+    ) -> Result<bool, Self::Error> {
+        if self.tensor_eager.is_none() {
+            return Ok(false);
+        }
+        self.validate_stream(stream)?;
+        self.validate_buffer(source)?;
+        if layout.element_type() != source.descriptor.element_type
+            || destination.class() != ferrum_runtime::HostMemoryClass::Output
+        {
+            return Err(CudaDeviceRuntimeError::contract(
+                "managed CUDA readback dtype or host class differs",
+            ));
+        }
+        let (source_range, destination_range) = tensor_io::transfer_range(
+            layout,
+            source.descriptor.size_bytes,
+            destination.len() as u64,
+            region,
+        )?;
+        let source_region = source.region(source_range.start as u64..source_range.end as u64)?;
+        self.synchronize(stream)?;
+        // Synchronous D2H never stores a borrowed host destination. On failure,
+        // Core discards the entire output, including any partially written bytes.
+        unsafe {
+            cudarc::driver::result::memcpy_dtoh_sync(
+                &mut destination.as_mut()[destination_range],
+                source_region.device_ptr,
+            )
+        }
+        .map_err(|error| CudaDeviceRuntimeError::driver("managed host readback", error))?;
+        Ok(true)
+    }
+
     fn describe_error(&self, error: &Self::Error) -> Result<DeviceErrorReport, VNextError> {
         let (code, retryable) = match error {
+            CudaDeviceRuntimeError::Capacity(VNextError::DeviceCapacityUnavailable(_)) => {
+                ("cuda_device_capacity_unavailable", true)
+            }
+            CudaDeviceRuntimeError::Capacity(_) => ("cuda_device_capacity_contract", false),
             CudaDeviceRuntimeError::Blas { source, .. }
                 if source.0 == cudarc::cublas::sys::cublasStatus_t::CUBLAS_STATUS_ALLOC_FAILED =>
             {
@@ -6183,6 +6547,7 @@ mod tests {
                 _base: base,
                 aligned_ptr: pointer,
                 requested_bytes: 4,
+                _tensor_owner: None,
             }),
             _core_retention: None,
             reusable_address_scope: None,
@@ -6783,6 +7148,9 @@ mod tests {
             binding_program: None,
             program_binding_patch: None,
             reusable_execution: None,
+            tensor_work: None,
+            managed_upload: None,
+            tensor_flight: None,
             execution_facts: None,
             completion_checks: Vec::new(),
         }
