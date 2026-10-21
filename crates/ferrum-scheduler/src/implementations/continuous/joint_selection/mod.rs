@@ -366,7 +366,13 @@ impl ContinuousBatchScheduler {
         now: Instant,
     ) -> std::result::Result<Cohort, Unsupported> {
         if self.pressure_active.load(Ordering::Acquire)
-            || self.runtime_config.prefill_first_until_active.is_some()
+            // The first actual static decode disarms fill-first for this busy
+            // cohort before this comparison. From that point the copied
+            // decode-first continuation is exact, including later arrivals.
+            // Only an empty-to-new-cohort transition can arm it again. Keep
+            // the unmodeled cold fill phase conservative.
+            || (self.runtime_config.prefill_first_until_active.is_some()
+                && self.fill_first_initial_cohort_armed.load(Ordering::Acquire))
             || self.config.prefix_rendezvous_max_wait_ms.is_some()
             || self.decode_capacity_backpressure_limit().is_some()
         {

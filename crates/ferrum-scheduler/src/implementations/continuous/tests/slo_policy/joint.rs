@@ -5,6 +5,8 @@ use crate::cost_prediction::{
 };
 use ferrum_interfaces::request_observation::*;
 
+mod fill_first;
+
 struct ConditionalSnapshot {
     at: Instant,
     stopping_known: bool,
@@ -105,15 +107,37 @@ fn fixture(
     RequestId,
     Instant,
 ) {
+    fixture_with_policy(
+        execution,
+        stopping_known,
+        completion_known,
+        SchedulerConfig {
+            active_decode_prefill_chunk: Some(8),
+            ..SchedulerConfig::default()
+        },
+    )
+}
+
+fn fixture_with_policy(
+    execution: CostExecution,
+    stopping_known: bool,
+    completion_known: bool,
+    policy: SchedulerConfig,
+) -> (
+    ContinuousBatchScheduler,
+    TimePlanningRound,
+    RequestId,
+    RequestId,
+    Instant,
+) {
     let mut config = targets();
     config.strategy = ferrum_types::SloStrategy::Joint;
     config.itl_ms = 100.0;
     config.tpot_ms = 500.0;
     let scheduler = ContinuousBatchScheduler::new(SchedulerConfig {
         max_running_requests: 8,
-        active_decode_prefill_chunk: Some(8),
         slo: Some(config),
-        ..SchedulerConfig::default()
+        ..policy
     });
     let ingress = RequestIngressAnchor::capture(RequestIngressBoundary::SchedulerApi);
     let now = ingress.instant() + Duration::from_millis(50);
