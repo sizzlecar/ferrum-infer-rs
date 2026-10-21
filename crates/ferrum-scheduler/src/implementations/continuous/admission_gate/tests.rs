@@ -21,14 +21,14 @@ impl CostSnapshot for NoCost {
     }
 }
 
-fn fixture() -> (
+pub(super) fn fixture() -> (
     ContinuousBatchScheduler,
     TimePlanningRound,
     RequestId,
     Instant,
 ) {
     let ingress = RequestIngressAnchor::capture(RequestIngressBoundary::SchedulerApi);
-    let request = InferenceRequest {
+    let mut request = InferenceRequest {
         id: RequestId::new(),
         prompt: "test".into(),
         model_id: ModelId::new("test-model"),
@@ -43,6 +43,9 @@ fn fixture() -> (
         evidence_request: Default::default(),
         metadata: Default::default(),
     };
+    request
+        .metadata
+        .insert(PROMPT_TOKENS_METADATA_KEY.into(), serde_json::json!(1));
     let id = request.id.clone();
     let mut config = SchedulerSloConfig {
         ttft_ms: 1000.0,
@@ -87,7 +90,7 @@ fn freeze(
             .waiting_queue
             .read()
             .iter()
-            .map(|request| Member::capture(request).unwrap())
+            .map(|request| Member::capture(scheduler, request).unwrap())
             .collect(),
         verdict,
         created_at: now,

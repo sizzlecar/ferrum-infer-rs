@@ -184,11 +184,26 @@ feedback. Further decisions can tighten it; it clears when the original prefill
 enters decode or the request ends. New arrivals and reused request IDs do not
 inherit it. The policy cap is separate from the executor's capacity ceiling.
 `joint_prefill_phase_interventions` counts successful installations within
-`joint_interventions`, not completed GPU executions. This action is currently
-dispatch-only: admission does not assume a future phase installation, so some
-arrivals may still be conservatively rejected. Positive chunks and the modeled
-progress check do not establish general starvation freedom or measured SLO
-compliance. The shared scheduler applies these rules to both `run` and `serve`.
+`joint_interventions`, not completed GPU executions.
+
+Admission can also compare a persistent cap for the eligible waiting and resident
+prefills in its original natural first wave. This preview applies caps before
+normal token-budget accounting, including any work that fills the released
+budget. If selected, the scheduler validates the entire captured cohort and
+atomically installs the caps before reevaluating admission. Installing a cap
+does not reserve resources, admit a request, or advance its work frontier; the
+original executor still decides resource admission. Waiting requests retain
+their caps when they are admitted.
+
+The fresh admission comparison uses the same remaining time and query budget,
+without proposing another cap installation. If it becomes unknown, the declared
+unknown policy still applies and the installed caps remain. A usable cost model
+does not imply known resource capacity or guaranteed admission. The separate
+`joint_admission_prefill_phase_commits` counter records successful pre-admission
+installations; it is not included in dispatch's `joint_interventions` and does
+not assert successful execution or SLO compliance. Positive chunks and the
+modeled progress check do not establish general starvation freedom. The shared
+scheduler applies these rules to both `run` and `serve`.
 
 ## Unknown and infeasible forecasts
 

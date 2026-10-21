@@ -20,6 +20,45 @@ struct Cohort {
     facts: Vec<RequestStoppingObservation>,
     trajectory: CohortTrajectory,
     wave_bindings: Vec<WaveBinding>,
+    cap_bindings: Vec<PrefillCapTarget>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum AdmissionCapMode {
+    Propose,
+    ExistingOnly,
+}
+
+#[derive(Debug)]
+pub(super) struct JointAdmissionEvaluation {
+    pub(super) decision: ScenarioPolicyDecision,
+    pub(super) prefill_cap: Option<PrefillCapProposal>,
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct PrefillCapProposal {
+    pub(super) targets: Vec<PrefillCapTarget>,
+    pub(super) limit: NonZeroUsize,
+    pub(super) valid_until: Instant,
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct PrefillCapTarget {
+    pub(super) request: usize,
+    pub(super) key: PrefixRequestKey,
+    pub(super) phase: RequestPhase,
+    pub(super) generation: LogicalWorkGeneration,
+    pub(super) prompt_tokens: usize,
+    pub(super) prefilled_tokens: usize,
+    pub(super) prior_cap: Option<PrefillPhaseCap>,
+}
+
+struct JointActionEvaluation {
+    decision: ScenarioPolicyDecision,
+    alternatives: Vec<FirstAction>,
+    missing_stopping: bool,
+    wave_bindings: Vec<WaveBinding>,
+    prefill_cap: Option<PrefillCapProposal>,
 }
 
 #[derive(Clone)]
@@ -80,8 +119,20 @@ impl ContinuousBatchScheduler {
         round: &mut TimePlanningRound,
         now: Instant,
     ) -> std::result::Result<Option<SelectedJointAction>, Unsupported> {
-        let (decision, alternatives, _, wave_bindings) =
-            self.evaluate_joint_action_set(hint, batch, round, now, ComparisonKind::Dispatch)?;
+        let JointActionEvaluation {
+            decision,
+            alternatives,
+            wave_bindings,
+            ..
+        } = self.evaluate_joint_action_set(
+            hint,
+            batch,
+            round,
+            now,
+            ComparisonKind::Dispatch,
+            AdmissionCapMode::ExistingOnly,
+            0,
+        )?;
         let mut record = |outcome| {
             round.statistics.joint_decision.consume(
                 ComparisonKind::Dispatch,
@@ -123,11 +174,27 @@ impl ContinuousBatchScheduler {
         hint: &BatchHint,
         round: &mut TimePlanningRound,
         now: Instant,
-    ) -> std::result::Result<ScenarioPolicyDecision, Unsupported> {
+        mode: AdmissionCapMode,
+        captured_member_bytes: usize,
+    ) -> std::result::Result<JointAdmissionEvaluation, Unsupported> {
         let started = Instant::now();
         let result = self
-            .evaluate_joint_action_set(hint, &[], round, now, ComparisonKind::Admission)
-            .and_then(|(decision, _, missing_stopping, _)| {
+            .evaluate_joint_action_set(
+                hint,
+                &[],
+                round,
+                now,
+                ComparisonKind::Admission,
+                mode,
+                captured_member_bytes,
+            )
+            .and_then(|evaluation| {
+                let JointActionEvaluation {
+                    decision,
+                    missing_stopping,
+                    prefill_cap,
+                    ..
+                } = evaluation;
                 if decision.choice == PolicyChoice::Unresolved && missing_stopping {
                     round.statistics.joint_decision.consume(
                         ComparisonKind::Admission,
@@ -136,7 +203,10 @@ impl ContinuousBatchScheduler {
                     );
                     Err(Unsupported::StoppingCoverage)
                 } else {
-                    Ok(decision)
+                    Ok(JointAdmissionEvaluation {
+                        decision,
+                        prefill_cap,
+                    })
                 }
             });
         round.prediction_elapsed = round.prediction_elapsed.saturating_add(started.elapsed());
@@ -150,20 +220,15 @@ impl ContinuousBatchScheduler {
         round: &mut TimePlanningRound,
         now: Instant,
         comparison_kind: ComparisonKind,
-    ) -> std::result::Result<
-        (
-            ScenarioPolicyDecision,
-            Vec<FirstAction>,
-            bool,
-            Vec<WaveBinding>,
-        ),
-        Unsupported,
-    > {
+        cap_mode: AdmissionCapMode,
+        captured_member_bytes: usize,
+    ) -> std::result::Result<JointActionEvaluation, Unsupported> {
         let started = Instant::now();
         let remaining_time = Duration::from_micros(round.config.planning.max_elapsed_us)
             .checked_sub(round.prediction_elapsed)
             .ok_or(Unsupported::TimeBudget)?;
-        let mut cohort = self.joint_cohort(hint, batch, round, now)?;
+        let mut cohort =
+            self.joint_cohort(hint, batch, round, now, cap_mode, captured_member_bytes)?;
         // Both candidates pay this round's declared maximum control delay.
         // These are model-relative timing proxies; future host/transport gaps
         // still require same-hardware client measurements and calibration.
@@ -186,6 +251,30 @@ impl ContinuousBatchScheduler {
             .map(|member| member.work.requested.as_range().len())
             .max()
             .unwrap_or(0);
+        if cap_mode == AdmissionCapMode::Propose {
+            // Fix the target set before any cap changes packing. The resulting
+            // preview may fill the released token budget with other members,
+            // but those members do not inherit the commitment.
+            cohort.cap_bindings.retain(|binding| {
+                first_wave.iter().any(|member| {
+                    member.request == binding.request
+                        && member.work.kind
+                            == ferrum_execution::execution_attempt::AttemptWorkKind::Prefill
+                })
+            });
+            cohort
+                .trajectory
+                .cap_commit_targets
+                .try_reserve_exact(cohort.cap_bindings.len())
+                .map_err(|_| Unsupported::ParticipantBudget)?;
+            cohort
+                .trajectory
+                .cap_commit_targets
+                .extend(cohort.cap_bindings.iter().map(|binding| PrefillTarget {
+                    request: binding.request,
+                    prompt_tokens: binding.prompt_tokens,
+                }));
+        }
         let static_action = FirstAction::Static;
         let mut alternatives = if largest >= 2 {
             vec![FirstAction::PrefillLimit(
@@ -203,8 +292,8 @@ impl ContinuousBatchScheduler {
         if cohort.trajectory.allows_decode_only(&first_wave) {
             alternatives.push(FirstAction::DecodeOnly);
         }
-        // These finite phases bind only the actual resident first wave. The
-        // empty-batch admission projection cannot install a future promise.
+        // Dispatch phases bind its already selected resident first wave.
+        // Admission commitments below instead preview natural repacking.
         if !batch.is_empty() && cohort.wave_bindings.len() == batch.len() {
             for limit in [largest.div_ceil(2), quarter] {
                 let Some(limit) = NonZeroUsize::new(limit) else {
@@ -215,6 +304,18 @@ impl ContinuousBatchScheduler {
                 }) && cohort.trajectory.allows_prefill_phase(&cohort.requests, limit)
                 {
                     alternatives.push(FirstAction::PrefillPhaseLimit(limit));
+                }
+            }
+        }
+        if cap_mode == AdmissionCapMode::Propose {
+            for limit in [largest.div_ceil(2), quarter] {
+                let Some(limit) = NonZeroUsize::new(limit) else {
+                    continue;
+                };
+                if cohort.trajectory.allows_cap_commit(&cohort.requests, limit)
+                    && !alternatives.iter().any(|action| matches!(action, FirstAction::PrefillCapCommit(previous) if *previous == limit))
+                {
+                    alternatives.push(FirstAction::PrefillCapCommit(limit));
                 }
             }
         }
@@ -412,12 +513,24 @@ impl ContinuousBatchScheduler {
             return Err(Unsupported::TimeBudget);
         }
         round.statistics.joint_decision.returned(comparison_kind);
-        Ok((
+        let prefill_cap = match decision.choice {
+            PolicyChoice::Alternative(index) => match alternatives.get(index) {
+                Some(FirstAction::PrefillCapCommit(limit)) => Some(PrefillCapProposal {
+                    targets: cohort.cap_bindings,
+                    limit: *limit,
+                    valid_until: decision.valid_until,
+                }),
+                _ => None,
+            },
+            _ => None,
+        };
+        Ok(JointActionEvaluation {
             decision,
             alternatives,
             missing_stopping,
-            cohort.wave_bindings,
-        ))
+            wave_bindings: cohort.wave_bindings,
+            prefill_cap,
+        })
     }
 
     pub(super) fn apply_joint_first_wave(
@@ -428,6 +541,9 @@ impl ContinuousBatchScheduler {
     ) -> bool {
         let limit = match selected.action {
             FirstAction::Static => return false,
+            // Admission commits policy before a fresh gate; this is never an
+            // edit of an already selected dispatch batch.
+            FirstAction::PrefillCapCommit(_) => return false,
             FirstAction::DecodeOnly => return self.apply_joint_decode_only(batch, round),
             FirstAction::PrefillLimit(limit) => limit.get(),
             FirstAction::PrefillPhaseLimit(limit) => {
@@ -598,6 +714,8 @@ impl ContinuousBatchScheduler {
         batch: &[ScheduledRequest],
         round: &TimePlanningRound,
         now: Instant,
+        cap_mode: AdmissionCapMode,
+        captured_member_bytes: usize,
     ) -> std::result::Result<Cohort, Unsupported> {
         if self.pressure_active.load(Ordering::Acquire) {
             return Err(Unsupported::PressureActive);
@@ -620,6 +738,53 @@ impl ContinuousBatchScheduler {
         }
         let facts = round.request_facts().ok_or(Unsupported::InvalidState)?;
         let clocks = round.request_clocks().ok_or(Unsupported::InvalidState)?;
+        if cap_mode == AdmissionCapMode::Propose || captured_member_bytes > 0 {
+            // Include the caller's still-live frozen cohort. Bounds are checked
+            // before allocating proposal bindings or the phase target payload.
+            // Two copies cover a retained proposal/target set alongside core
+            // phase scratch; the implementation normally moves the proposal.
+            let forecast_bytes = facts
+                .iter()
+                .try_fold(0usize, |bytes, (_, fact)| {
+                    fact.cap
+                        .checked_mul(std::mem::size_of::<
+                            ferrum_interfaces::request_observation::StoppingMass,
+                        >())
+                        .and_then(|next| bytes.checked_add(next))
+                })
+                .ok_or(Unsupported::ParticipantBudget)?;
+            let proposal_bytes = if cap_mode == AdmissionCapMode::Propose {
+                facts
+                    .len()
+                    .checked_mul(std::mem::size_of::<PrefillCapTarget>())
+                    .and_then(|bindings| {
+                        ContinuationPhase::prefill_targets_bytes_bound(facts.len())
+                            .and_then(|targets| bindings.checked_add(targets))
+                    })
+                    .and_then(|bytes| bytes.checked_mul(2))
+                    .ok_or(Unsupported::ParticipantBudget)?
+            } else {
+                0
+            };
+            let bytes = clocks
+                .len()
+                .checked_mul(std::mem::size_of::<(RequestId, RequestClockFacts)>())
+                .and_then(|bytes| bytes.checked_add(round.request_fact_bytes))
+                .and_then(|bytes| bytes.checked_add(captured_member_bytes))
+                .and_then(|bytes| {
+                    bytes.checked_add(
+                        round
+                            .persistent_capacity()
+                            .map_or(0, |proof| proof.retained_bytes()),
+                    )
+                })
+                .and_then(|bytes| bytes.checked_add(forecast_bytes))
+                .and_then(|bytes| bytes.checked_add(proposal_bytes))
+                .ok_or(Unsupported::ParticipantBudget)?;
+            if bytes > round.config.planning.max_request_fact_bytes {
+                return Err(Unsupported::ParticipantBudget);
+            }
+        }
         let limit = hint
             .max_batch_size
             .min(self.cb_config.max_decode_batch)
@@ -637,6 +802,12 @@ impl ContinuousBatchScheduler {
         let mut ordered_facts = Vec::with_capacity(facts.len());
         let mut shapes = Vec::with_capacity(facts.len());
         let mut initial_admission = Vec::with_capacity(facts.len());
+        let mut cap_bindings = Vec::new();
+        if cap_mode == AdmissionCapMode::Propose {
+            cap_bindings
+                .try_reserve_exact(facts.len())
+                .map_err(|_| Unsupported::ParticipantBudget)?;
+        }
         let waiting = self.waiting_queue.read();
         let prefill = self.prefill_queue.read();
         let decode = self.decode_queue.read();
@@ -824,6 +995,24 @@ impl ContinuousBatchScheduler {
                     .joint_decode_only_deferred_generation
                     .is_none_or(|last| request.logical_work_frontier.progress_generation() > last),
             });
+            if cap_mode == AdmissionCapMode::Propose
+                && matches!(
+                    request.phase,
+                    RequestPhase::Waiting | RequestPhase::Prefilling
+                )
+                && prefilled < prompt
+            {
+                cap_bindings.push(PrefillCapTarget {
+                    request: index,
+                    key: PrefixRequestKey::from_request(request)
+                        .ok_or(Unsupported::InvalidState)?,
+                    phase: request.phase,
+                    generation: request.logical_work_frontier.progress_generation(),
+                    prompt_tokens: prompt,
+                    prefilled_tokens: prefilled,
+                    prior_cap: request.joint_prefill_phase_cap,
+                });
+            }
             initial_admission.push(if index < residents {
                 InitialAdmission::Resident
             } else {
@@ -908,8 +1097,10 @@ impl ContinuousBatchScheduler {
             requests,
             facts: ordered_facts,
             wave_bindings,
+            cap_bindings,
             trajectory: CohortTrajectory {
                 first_wave,
+                cap_commit_targets: Vec::new(),
                 shapes,
                 admission: AdmissionSlotPlan::new(
                     &initial_admission,

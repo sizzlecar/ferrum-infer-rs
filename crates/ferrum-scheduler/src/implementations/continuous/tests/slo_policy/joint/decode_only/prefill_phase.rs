@@ -1,6 +1,8 @@
 //! Actual multi-wave scheduling, rather than a simulated phase-only gain.
 use super::*;
 
+mod admission_precommit;
+
 struct PhaseCosts {
     base: ConditionalSnapshot,
     unavailable: bool,
@@ -77,6 +79,10 @@ impl PhaseFixture {
     }
 
     fn with_capacity(max_running_requests: usize) -> Self {
+        Self::with_admission(max_running_requests, false)
+    }
+
+    fn with_admission(max_running_requests: usize, waiting_prefill: bool) -> Self {
         let mut config: SchedulerSloConfig = "ttft:1000000,tpot:50000,itl:15000".parse().unwrap();
         config.strategy = ferrum_types::SloStrategy::Joint;
         config.planning.max_elapsed_us = 1_000_000;
@@ -101,8 +107,13 @@ impl PhaseFixture {
         prefill.stream = true;
         let prefill_id = prefill.id.clone();
         enqueue_waiting(&scheduler, decoder);
+        if waiting_prefill {
+            admit(&scheduler, None);
+        }
         enqueue_waiting(&scheduler, prefill);
-        admit(&scheduler, None);
+        if !waiting_prefill {
+            admit(&scheduler, None);
+        }
         scheduler.mark_prefill_complete(&decoder_id, 1);
         scheduler.update_decode_progress(&decoder_id, 1);
         Self {
@@ -130,6 +141,7 @@ impl PhaseFixture {
             .read()
             .iter()
             .chain(self.scheduler.decode_queue.read().requests.values())
+            .chain(self.scheduler.waiting_queue.read().iter())
             .map(|request| {
                 (
                     request.inner.request.id.clone(),

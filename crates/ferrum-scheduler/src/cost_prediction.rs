@@ -665,6 +665,9 @@ pub(crate) struct PlanningStatistics {
     pub joint_decode_only_interventions: u64,
     /// Successful first-wave applies that install an explicit prefill phase.
     pub joint_prefill_phase_interventions: u64,
+    /// Atomic admission-time cap commitments, before a fresh admission gate.
+    /// These are policy changes, not dispatched work or resource admissions.
+    pub joint_admission_prefill_phase_commits: u64,
     pub joint_unknown_resources: u64,
     pub joint_unresolved: u64,
     /// Returned comparison failures only; not inferred causes or request counts.
@@ -672,7 +675,8 @@ pub(crate) struct PlanningStatistics {
     /// Subdivision of the unsupported-domain parent bucket, not additional
     /// comparison failures to add to that bucket.
     pub joint_cost_unsupported_detail: CostUnsupportedCounts,
-    /// A supported alternative could not be applied by the admission gate.
+    /// A comparison requires an alternative action, before any policy
+    /// commitment and fresh admission comparison.
     pub joint_admission_action_required: u64,
     pub joint_known_infeasible: u64,
     pub known_queries: u64,

@@ -3,6 +3,7 @@ use crate::cost_prediction::{
     CostScenario, CostScenarioDependence, CostScenarioPrediction, PlanningCapacity,
     RequestClockFacts,
 };
+use crate::implementations::continuous::joint_selection::AdmissionCapMode;
 use ferrum_interfaces::request_observation::*;
 
 mod decode_only;
@@ -348,7 +349,13 @@ fn resident_capacity_cannot_authorize_waiting_admission() {
         },
     ));
     assert!(matches!(
-        scheduler.evaluate_joint_admission(&hint(), &mut round, now),
+        scheduler.evaluate_joint_admission(
+            &hint(),
+            &mut round,
+            now,
+            AdmissionCapMode::ExistingOnly,
+            0
+        ),
         Err(crate::joint_policy::Unsupported::MissingCapacity)
     ));
 }
@@ -461,8 +468,9 @@ fn waiting_fixture(
 fn joint_admission_accounts_for_waiting_ttft_and_rejects_before_executor_probe() {
     let (scheduler, mut round, now) = waiting_fixture(2, 1, 25.0);
     let decision = scheduler
-        .evaluate_joint_admission(&hint(), &mut round, now)
-        .unwrap();
+        .evaluate_joint_admission(&hint(), &mut round, now, AdmissionCapMode::ExistingOnly, 0)
+        .unwrap()
+        .decision;
     assert_eq!(
         decision.choice,
         crate::joint_policy::PolicyChoice::AllKnownInfeasible
@@ -483,8 +491,9 @@ fn joint_admission_accounts_for_waiting_ttft_and_rejects_before_executor_probe()
 fn joint_admission_feasible_waiting_retains_all_arrival_denominators() {
     let (scheduler, mut round, now) = waiting_fixture(3, 1, 100.0);
     let decision = scheduler
-        .evaluate_joint_admission(&hint(), &mut round, now)
-        .unwrap();
+        .evaluate_joint_admission(&hint(), &mut round, now, AdmissionCapMode::ExistingOnly, 0)
+        .unwrap()
+        .decision;
     assert_eq!(decision.choice, crate::joint_policy::PolicyChoice::Static);
     assert_eq!(decision.static_risk.request_count, 3);
     assert_eq!(decision.static_risk.completion_failure.upper, 0.0);
@@ -512,13 +521,25 @@ fn joint_admission_does_not_recredit_metadata_after_scan_promotions() {
     admit(&scheduler, None);
     assert_eq!(scheduler.waiting_count(), 1);
     assert!(matches!(
-        scheduler.evaluate_joint_admission(&hint(), &mut round, now),
+        scheduler.evaluate_joint_admission(
+            &hint(),
+            &mut round,
+            now,
+            AdmissionCapMode::ExistingOnly,
+            0
+        ),
         Err(crate::joint_policy::Unsupported::AdmissionCapacity)
     ));
     capacity.admission_coverage = ferrum_execution::model_executor::PagedAdmissionCoverage::Unknown;
     round.set_capacity(Some(capacity));
     assert!(matches!(
-        scheduler.evaluate_joint_admission(&hint(), &mut round, now),
+        scheduler.evaluate_joint_admission(
+            &hint(),
+            &mut round,
+            now,
+            AdmissionCapMode::ExistingOnly,
+            0
+        ),
         Err(crate::joint_policy::Unsupported::AdmissionCapacity)
     ));
 }

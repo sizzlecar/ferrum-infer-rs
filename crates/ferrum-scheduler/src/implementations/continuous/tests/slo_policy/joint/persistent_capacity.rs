@@ -48,8 +48,9 @@ fn persistent_capacity_supports_sequential_waiting_without_fabricated_free_block
     let observation = proof(&round, 1, 2);
     attach(&mut round, observation);
     let decision = scheduler
-        .evaluate_joint_admission(&hint(), &mut round, now)
-        .unwrap();
+        .evaluate_joint_admission(&hint(), &mut round, now, AdmissionCapMode::ExistingOnly, 0)
+        .unwrap()
+        .decision;
     assert_eq!(decision.choice, crate::joint_policy::PolicyChoice::Static);
     assert_eq!(decision.static_risk.request_count, 3);
     assert!(round.capacity().is_none());
@@ -64,8 +65,9 @@ fn persistent_capacity_supports_sequential_waiting_without_fabricated_free_block
     let observation = proof(&round, 1, 2);
     attach(&mut round, observation);
     let decision = scheduler
-        .evaluate_joint_admission(&hint(), &mut round, now)
-        .unwrap();
+        .evaluate_joint_admission(&hint(), &mut round, now, AdmissionCapMode::ExistingOnly, 0)
+        .unwrap()
+        .decision;
     assert_eq!(
         decision.choice,
         crate::joint_policy::PolicyChoice::AllKnownInfeasible
@@ -85,7 +87,13 @@ fn persistent_capacity_rejects_insufficient_slots_or_execution_ceiling() {
         attach(&mut round, observation);
         assert_eq!(
             scheduler
-                .evaluate_joint_admission(&hint(), &mut round, now)
+                .evaluate_joint_admission(
+                    &hint(),
+                    &mut round,
+                    now,
+                    AdmissionCapMode::ExistingOnly,
+                    0
+                )
                 .unwrap_err(),
             expected
         );
@@ -165,7 +173,7 @@ fn persistent_capacity_requires_current_incarnation_and_queue_residency() {
     assert!(round.persistent_capacity().is_some());
     assert_eq!(
         scheduler
-            .evaluate_joint_admission(&hint(), &mut round, now)
+            .evaluate_joint_admission(&hint(), &mut round, now, AdmissionCapMode::ExistingOnly, 0)
             .unwrap_err(),
         crate::joint_policy::Unsupported::AdmissionCapacity
     );

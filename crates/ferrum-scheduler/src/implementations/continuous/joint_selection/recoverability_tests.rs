@@ -182,6 +182,7 @@ fn fixture() -> (SchedulerSloConfig, Vec<SimulatedRequest>, PhaseAdapter) {
     ];
     let original = CohortTrajectory {
         first_wave: Vec::new(),
+        cap_commit_targets: Vec::new(),
         shapes: vec![
             RequestShape {
                 restored_tokens: 0,

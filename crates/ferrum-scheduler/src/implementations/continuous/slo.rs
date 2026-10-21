@@ -96,6 +96,8 @@ impl SchedulerSloSnapshot {
         self.selections.joint_decode_only_interventions += value.joint_decode_only_interventions;
         self.selections.joint_prefill_phase_interventions +=
             value.joint_prefill_phase_interventions;
+        self.selections.joint_admission_prefill_phase_commits +=
+            value.joint_admission_prefill_phase_commits;
         self.selections.joint_unknown_resources += value.joint_unknown_resources;
         self.selections.joint_unresolved += value.joint_unresolved;
         self.selections
