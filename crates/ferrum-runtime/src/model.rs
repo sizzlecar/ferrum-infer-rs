@@ -2106,9 +2106,65 @@ pub struct SpecialTokenMetadata {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ModelSemanticMetadata {
+#[serde(deny_unknown_fields)]
+pub struct CausalLanguageMetadata {
     pub template: TemplateMetadata,
     pub special_tokens: SpecialTokenMetadata,
+}
+
+/// Product semantics of a prepared component, separate from its tensor program.
+/// Tensor components use the program's input/output identities and numerical
+/// contracts; they do not manufacture a chat template or end-of-sequence token.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ModelSemanticMetadata {
+    CausalLanguage(CausalLanguageMetadata),
+    TensorComponent,
+}
+
+// Serde's internally tagged unit variant ignores leftover map fields. Decode
+// it as an empty struct instead so tensor metadata cannot silently discard
+// language fields or caller-supplied semantic overrides.
+#[derive(Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+enum ModelSemanticMetadataWire {
+    CausalLanguage(CausalLanguageMetadata),
+    TensorComponent {},
+}
+
+impl<'de> Deserialize<'de> for ModelSemanticMetadata {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Ok(
+            match ModelSemanticMetadataWire::deserialize(deserializer)? {
+                ModelSemanticMetadataWire::CausalLanguage(metadata) => {
+                    Self::CausalLanguage(metadata)
+                }
+                ModelSemanticMetadataWire::TensorComponent {} => Self::TensorComponent,
+            },
+        )
+    }
+}
+
+impl ModelSemanticMetadata {
+    /// A language-only adapter must explicitly reject tensor components before
+    /// opening tokenizer, sampling, or token execution resources.
+    pub fn causal_language(&self) -> Result<&CausalLanguageMetadata, VNextError> {
+        match self {
+            Self::CausalLanguage(metadata) => Ok(metadata),
+            Self::TensorComponent => Err(VNextError::InvalidExecutionPlan {
+                reason: "tensor component cannot enter a causal language execution path".to_owned(),
+            }),
+        }
+    }
+}
+
+impl From<CausalLanguageMetadata> for ModelSemanticMetadata {
+    fn from(metadata: CausalLanguageMetadata) -> Self {
+        Self::CausalLanguage(metadata)
+    }
 }
 
 /// Compile-time model family provider with a typed, validated configuration.
@@ -2239,7 +2295,7 @@ impl ModelFamilyDefinition {
 
 /// Maximum raw JSON bytes accepted before decoding a prepared family package.
 pub const MAX_PREPARED_MODEL_FAMILY_WIRE_BYTES: usize = 16 * 1024 * 1024;
-pub const PREPARED_MODEL_FAMILY_WIRE_VERSION: u32 = 2;
+pub const PREPARED_MODEL_FAMILY_WIRE_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct PreparedModelFamily {
@@ -2449,6 +2505,11 @@ impl PreparedModelFamily {
         family_id: &ModelFamilyId,
         metadata: &ModelSemanticMetadata,
     ) -> Result<(), VNextError> {
+        let ModelSemanticMetadata::CausalLanguage(metadata) = metadata else {
+            // The model program remains responsible for ports, states and
+            // operations. Numerical profiles still validate that exact program.
+            return Ok(());
+        };
         let source = metadata.template.source_file.as_str();
         let valid_source = !source.is_empty()
             && !source.starts_with('/')

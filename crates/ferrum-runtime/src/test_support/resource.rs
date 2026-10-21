@@ -226,19 +226,21 @@ impl ModelFamilyProvider for TestFamily {
         &self,
         _config: &Self::Config,
     ) -> Result<ModelSemanticMetadata, VNextError> {
-        Ok(ModelSemanticMetadata {
-            template: TemplateMetadata {
-                template: "{{ messages }}".to_owned(),
-                source_file: "template.json".to_owned(),
-                sha256: sha('a'),
+        Ok(ModelSemanticMetadata::CausalLanguage(
+            crate::CausalLanguageMetadata {
+                template: TemplateMetadata {
+                    template: "{{ messages }}".to_owned(),
+                    source_file: "template.json".to_owned(),
+                    sha256: sha('a'),
+                },
+                special_tokens: SpecialTokenMetadata {
+                    bos_token_id: Some(1),
+                    eos_token_ids: BTreeSet::from([2]),
+                    pad_token_id: Some(0),
+                    collision_policy: SpecialTokenCollisionPolicy::require_distinct(),
+                },
             },
-            special_tokens: SpecialTokenMetadata {
-                bos_token_id: Some(1),
-                eos_token_ids: BTreeSet::from([2]),
-                pad_token_id: Some(0),
-                collision_policy: SpecialTokenCollisionPolicy::require_distinct(),
-            },
-        })
+        ))
     }
 }
 

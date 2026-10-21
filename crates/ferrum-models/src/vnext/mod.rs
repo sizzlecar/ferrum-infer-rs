@@ -390,6 +390,10 @@ impl PreparedProductionModel {
         mut descriptor: CausalLanguageModelDescriptor,
         sources: Arc<ProductionModelSourceBundle>,
     ) -> ferrum_types::Result<Self> {
+        family
+            .metadata()
+            .causal_language()
+            .map_err(|error| ferrum_types::FerrumError::model(error.to_string()))?;
         descriptor.execution_dtype = match family
             .numerical_profile()
             .activation_type()
@@ -467,7 +471,12 @@ impl PreparedProductionModel {
         requested_model: impl Into<String>,
         resolved_model: impl Into<String>,
     ) -> ferrum_types::Result<ferrum_runtime::ProductModelSourceIdentity> {
-        let template = &self.family.metadata().template;
+        let template = &self
+            .family
+            .metadata()
+            .causal_language()
+            .map_err(|error| ferrum_types::FerrumError::model(error.to_string()))?
+            .template;
         self.sources.product_source_identity(
             requested_model,
             resolved_model,

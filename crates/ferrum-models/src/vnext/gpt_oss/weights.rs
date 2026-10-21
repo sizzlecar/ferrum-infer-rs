@@ -1621,7 +1621,13 @@ mod tests {
             ferrum_types::ModelOutputProtocol::HarmonyGptOss
         );
         assert_eq!(
-            prepared.family().metadata().special_tokens.eos_token_ids,
+            prepared
+                .family()
+                .metadata()
+                .causal_language()
+                .unwrap()
+                .special_tokens
+                .eos_token_ids,
             BTreeSet::from([199_999, 200_002, 200_012])
         );
         assert_eq!(

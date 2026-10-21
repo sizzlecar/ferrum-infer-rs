@@ -29,6 +29,7 @@ members = [
     # Product crates
     "crates/ferrum-engine",
     "crates/ferrum-models",
+    "crates/ferrum-diffusion",
     "crates/ferrum-server",
     "crates/ferrum-cli",
     "crates/ferrum-testkit",
@@ -144,6 +145,7 @@ ferrum-quantization = { path = "crates/ferrum-quantization", version = "0.14.0" 
 # Internal product crates
 ferrum-engine = { path = "crates/ferrum-engine", version = "0.14.0" }
 ferrum-models = { path = "crates/ferrum-models", version = "0.14.0" }
+ferrum-diffusion = { path = "crates/ferrum-diffusion", version = "0.14.0" }
 ferrum-server = { path = "crates/ferrum-server", version = "0.14.0" }
 ferrum-cli = { path = "crates/ferrum-cli", version = "0.14.0" }
 ferrum-testkit = { path = "crates/ferrum-testkit", version = "0.14.0" }

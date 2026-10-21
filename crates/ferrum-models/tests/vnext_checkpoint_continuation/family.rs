@@ -407,7 +407,7 @@ impl ModelFamilyProvider for Family {
         &self,
         _config: &AttentionKind,
     ) -> Result<ModelSemanticMetadata, VNextError> {
-        Ok(ModelSemanticMetadata {
+        Ok(CausalLanguageMetadata {
             template: TemplateMetadata {
                 template: "{{ messages }}".into(),
                 source_file: "fixture-template.json".into(),
@@ -419,7 +419,8 @@ impl ModelFamilyProvider for Family {
                 pad_token_id: Some(0),
                 collision_policy: SpecialTokenCollisionPolicy::require_distinct(),
             },
-        })
+        }
+        .into())
     }
 }
 

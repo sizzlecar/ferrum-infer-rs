@@ -44,6 +44,10 @@ impl DefinedProductionModel {
         let definition = registration
             .define(raw)
             .map_err(|error| FerrumError::model(error.to_string()))?;
+        definition
+            .metadata()
+            .causal_language()
+            .map_err(|error| FerrumError::model(error.to_string()))?;
         Ok(Self {
             definition,
             registration: Arc::new(registration),
@@ -68,7 +72,12 @@ impl DefinedProductionModel {
         requested_model: impl Into<String>,
         resolved_model: impl Into<String>,
     ) -> Result<ferrum_runtime::ProductModelSourceIdentity> {
-        let template = &self.definition.metadata().template;
+        let template = &self
+            .definition
+            .metadata()
+            .causal_language()
+            .map_err(|error| FerrumError::model(error.to_string()))?
+            .template;
         self.sources.product_source_identity(
             requested_model,
             resolved_model,

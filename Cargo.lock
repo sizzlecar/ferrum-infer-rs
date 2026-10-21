@@ -1360,6 +1360,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "ferrum-diffusion"
+version = "0.14.0"
+dependencies = [
+ "thiserror 1.0.69",
+]
+
+[[package]]
 name = "ferrum-engine"
 version = "0.14.0"
 dependencies = [

@@ -230,7 +230,7 @@ impl ModelFamilyProvider for TinyDenseFamily {
         &self,
         _config: &Self::Config,
     ) -> Result<ModelSemanticMetadata, VNextError> {
-        Ok(ModelSemanticMetadata {
+        Ok(CausalLanguageMetadata {
             template: TemplateMetadata {
                 template: "{{ messages }}".to_owned(),
                 source_file: "reference-template.json".to_owned(),
@@ -242,7 +242,8 @@ impl ModelFamilyProvider for TinyDenseFamily {
                 pad_token_id: Some(0),
                 collision_policy: SpecialTokenCollisionPolicy::require_distinct(),
             },
-        })
+        }
+        .into())
     }
 }
 

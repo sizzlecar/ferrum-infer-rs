@@ -90,12 +90,24 @@ pub(crate) fn resolution_value(inputs: &ResolvedModelPlanInputs, field: Resoluti
             serde_json::to_value(&inputs.prepared_family.weight_schema().format_id).unwrap()
         }
         ResolutionField::Tokenizer => serde_json::to_value(&inputs.tokenizer).unwrap(),
-        ResolutionField::Template => {
-            serde_json::to_value(&inputs.prepared_family.metadata().template).unwrap()
-        }
-        ResolutionField::SpecialTokens => {
-            serde_json::to_value(&inputs.prepared_family.metadata().special_tokens).unwrap()
-        }
+        ResolutionField::Template => serde_json::to_value(
+            &inputs
+                .prepared_family
+                .metadata()
+                .causal_language()
+                .unwrap()
+                .template,
+        )
+        .unwrap(),
+        ResolutionField::SpecialTokens => serde_json::to_value(
+            &inputs
+                .prepared_family
+                .metadata()
+                .causal_language()
+                .unwrap()
+                .special_tokens,
+        )
+        .unwrap(),
         ResolutionField::Device => serde_json::to_value(&inputs.device).unwrap(),
         ResolutionField::Capabilities => serde_json::to_value(&inputs.capabilities).unwrap(),
         ResolutionField::RuntimePreset => json!({

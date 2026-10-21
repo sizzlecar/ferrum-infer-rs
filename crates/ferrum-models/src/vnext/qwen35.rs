@@ -18,19 +18,19 @@ use ferrum_quantization::{
     COMPRESSED_TENSORS_MARLIN_INT4_FORMAT_ID, GPTQ_MARLIN_INT4_FORMAT_ID,
 };
 use ferrum_runtime::{
-    AttributeId, BlockQuantizationSpec, CanonicalRational, CompositeWeightPart, ContractVersion,
-    ElementType, ExternalModelMetadataId, FamilyNumericalProfiles, GatedDeltaDecayParameterization,
-    GatedDeltaValueHeadMapping, KvStorageFormat, ModelFamilyId, ModelFamilyProvider,
-    ModelFamilyRegistration, ModelProgram, ModelSemanticMetadata, NodeId,
-    NumericalExecutionProfile, OperationId, PhysicalWeightComponentBinding, PhysicalWeightLayout,
-    PhysicalWeightPadding, PreparedModelFamily, ProgramBlock, ProgramCheckpointInputs, ProgramNode,
-    ProgramNodeWorkSpec, ProgramTensorSpec, ProgramValueId, QuantizationFormatId,
-    QuantizationGrouping, QuantizationPacking, QuantizationSpec,
-    QuantizedProviderAttributionDenominator, ResolvedTensorLayout, SemanticValue,
-    StateCapacityDemand, StateId, StateInitialization, StateLifetime, StateSpec,
-    TypedFamilyRegistration, VNextError, WeightComponentRole, WeightComponentSource,
-    WeightComponentSpec, WeightEncoding, WeightFormatId, WeightId, WeightLayoutId, WeightReference,
-    WeightSchema, WeightTensorSpec,
+    AttributeId, BlockQuantizationSpec, CanonicalRational, CausalLanguageMetadata,
+    CompositeWeightPart, ContractVersion, ElementType, ExternalModelMetadataId,
+    FamilyNumericalProfiles, GatedDeltaDecayParameterization, GatedDeltaValueHeadMapping,
+    KvStorageFormat, ModelFamilyId, ModelFamilyProvider, ModelFamilyRegistration, ModelProgram,
+    ModelSemanticMetadata, NodeId, NumericalExecutionProfile, OperationId,
+    PhysicalWeightComponentBinding, PhysicalWeightLayout, PhysicalWeightPadding,
+    PreparedModelFamily, ProgramBlock, ProgramCheckpointInputs, ProgramNode, ProgramNodeWorkSpec,
+    ProgramTensorSpec, ProgramValueId, QuantizationFormatId, QuantizationGrouping,
+    QuantizationPacking, QuantizationSpec, QuantizedProviderAttributionDenominator,
+    ResolvedTensorLayout, SemanticValue, StateCapacityDemand, StateId, StateInitialization,
+    StateLifetime, StateSpec, TypedFamilyRegistration, VNextError, WeightComponentRole,
+    WeightComponentSource, WeightComponentSpec, WeightEncoding, WeightFormatId, WeightId,
+    WeightLayoutId, WeightReference, WeightSchema, WeightTensorSpec,
     CAUSAL_PAGED_ATTENTION_F32_MASTER_GGUF_F16_PROJECTIONS_OPERATION_ID,
     CAUSAL_PAGED_ATTENTION_F32_MASTER_INT8_KV_OPERATION_ID,
     CAUSAL_PAGED_ATTENTION_F32_MASTER_OPERATION_ID, CAUSAL_PAGED_ATTENTION_INT8_KV_OPERATION_ID,
@@ -501,7 +501,7 @@ pub struct Qwen35FamilyConfig {
     vocab_size: u64,
     max_position_embeddings: u64,
     rms_norm_epsilon: CanonicalRational,
-    metadata: ModelSemanticMetadata,
+    metadata: CausalLanguageMetadata,
     weight_format: FamilyWeightFormat,
     recurrent_weight_abi: RecurrentWeightAbi,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1457,7 +1457,7 @@ impl ModelFamilyProvider for Qwen35FamilyProvider {
         &self,
         config: &Self::Config,
     ) -> Result<ModelSemanticMetadata, VNextError> {
-        Ok(config.metadata.clone())
+        Ok(config.metadata.clone().into())
     }
 }
 
@@ -8627,7 +8627,10 @@ mod tests {
             let prepared = TypedFamilyRegistration::new(Qwen35FamilyProvider::new().unwrap())
                 .prepare_fixture(&raw)
                 .unwrap();
-            assert_eq!(prepared.metadata().template, config.metadata.template);
+            assert_eq!(
+                prepared.metadata().causal_language().unwrap().template,
+                config.metadata.template
+            );
             config.metadata.template.source_file = "unregistered.jinja".into();
             assert!(
                 TypedFamilyRegistration::new(Qwen35FamilyProvider::new().unwrap())
@@ -9055,7 +9058,12 @@ mod tests {
                     }
         }));
         assert_eq!(
-            prepared.metadata().special_tokens.eos_token_ids,
+            prepared
+                .metadata()
+                .causal_language()
+                .unwrap()
+                .special_tokens
+                .eos_token_ids,
             BTreeSet::from([2])
         );
         assert_eq!(prepared.fingerprint().unwrap().len(), 64);

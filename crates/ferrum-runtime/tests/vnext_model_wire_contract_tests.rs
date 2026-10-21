@@ -30,6 +30,8 @@ struct TestConfig {
     quantization_config: Option<TestQuantizationConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     weight_layout: Option<TestWeightLayoutConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    metadata: Option<ModelSemanticMetadata>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -196,21 +198,26 @@ impl ModelFamilyProvider for TestFamily {
 
     fn semantic_metadata(
         &self,
-        _config: &Self::Config,
+        config: &Self::Config,
     ) -> Result<ModelSemanticMetadata, VNextError> {
-        Ok(ModelSemanticMetadata {
-            template: TemplateMetadata {
-                template: "{{ messages }}".to_owned(),
-                source_file: "template.json".to_owned(),
-                sha256: sha('a'),
+        if let Some(metadata) = &config.metadata {
+            return Ok(metadata.clone());
+        }
+        Ok(ModelSemanticMetadata::CausalLanguage(
+            ferrum_runtime::CausalLanguageMetadata {
+                template: TemplateMetadata {
+                    template: "{{ messages }}".to_owned(),
+                    source_file: "template.json".to_owned(),
+                    sha256: sha('a'),
+                },
+                special_tokens: SpecialTokenMetadata {
+                    bos_token_id: Some(1),
+                    eos_token_ids: BTreeSet::from([2]),
+                    pad_token_id: Some(0),
+                    collision_policy: SpecialTokenCollisionPolicy::require_distinct(),
+                },
             },
-            special_tokens: SpecialTokenMetadata {
-                bos_token_id: Some(1),
-                eos_token_ids: BTreeSet::from([2]),
-                pad_token_id: Some(0),
-                collision_policy: SpecialTokenCollisionPolicy::require_distinct(),
-            },
-        })
+        ))
     }
 }
 
@@ -550,6 +557,7 @@ impl ModelFamilyProvider for OneShotFamily {
             block_size: default_block_size(),
             quantization_config: None,
             weight_layout: None,
+            metadata: None,
         })
     }
 
@@ -577,6 +585,7 @@ impl ModelFamilyProvider for OneShotFamily {
                 block_size: default_block_size(),
                 quantization_config: None,
                 weight_layout: None,
+                metadata: None,
             },
             profile,
         )
@@ -592,6 +601,7 @@ impl ModelFamilyProvider for OneShotFamily {
             block_size: default_block_size(),
             quantization_config: None,
             weight_layout: None,
+            metadata: None,
         })
     }
 }
@@ -836,6 +846,97 @@ fn prepared_family_wire_round_trip_requires_external_typed_registry() {
         PreparedModelFamily::from_json_validated(&bytes, &registry).unwrap(),
         prepared
     );
+}
+
+#[test]
+fn tensor_component_prepares_without_text_metadata_and_revalidates_its_program() {
+    let registry = TestRegistry::new();
+    let config = json!({
+        "model_type": "metadata.model-wire-test",
+        "width": 4,
+        "metadata": { "kind": "tensor_component" }
+    });
+    let definition = registry.registration.define(&config).unwrap();
+    assert_eq!(
+        definition.metadata(),
+        &ModelSemanticMetadata::TensorComponent
+    );
+    let prepared = registry.registration.prepare_fixture(&config).unwrap();
+    assert_eq!(prepared.metadata(), &ModelSemanticMetadata::TensorComponent);
+    assert!(prepared.metadata().causal_language().is_err());
+    assert_eq!(
+        prepared.program().inputs(),
+        &[id::<ProgramValueId>("value.input")]
+    );
+    assert_eq!(
+        prepared.program().outputs(),
+        &[id::<ProgramValueId>("value.output")]
+    );
+    let bytes = serde_json::to_vec(&prepared).unwrap();
+    assert_eq!(
+        PreparedModelFamily::from_json_validated(&bytes, &registry).unwrap(),
+        prepared
+    );
+
+    // Changing only the wire role cannot bypass the typed provider's contract.
+    let mut forged = serde_json::to_value(registry.prepare()).unwrap();
+    forged["metadata"] = json!({ "kind": "tensor_component" });
+    assert!(PreparedModelFamily::from_json_validated(
+        &serde_json::to_vec(&forged).unwrap(),
+        &registry
+    )
+    .is_err());
+
+    // Tensor semantics do not bypass the existing source/shape checks.
+    let mut invalid_shape = config;
+    invalid_shape["width"] = json!(0);
+    assert!(registry
+        .registration
+        .prepare_fixture(&invalid_shape)
+        .is_err());
+}
+
+#[test]
+fn causal_language_semantics_still_require_template_source_checksum_and_eos() {
+    let registry = TestRegistry::new();
+    let valid = registry.prepare();
+    let metadata = serde_json::to_value(valid.metadata()).unwrap();
+    for invalid in [
+        ("template", "template", json!("")),
+        ("template", "source_file", json!("../template.json")),
+        ("template", "sha256", json!("not-a-hash")),
+        ("special_tokens", "eos_token_ids", json!([])),
+    ] {
+        let mut changed = metadata.clone();
+        changed[invalid.0][invalid.1] = invalid.2;
+        let config = json!({
+            "model_type": "metadata.model-wire-test", "width": 4,
+            "metadata": changed
+        });
+        assert!(registry.registration.define(&config).is_err());
+        assert!(registry.registration.prepare_fixture(&config).is_err());
+    }
+}
+
+#[test]
+fn metadata_wire_requires_explicit_role_and_rejects_role_incompatible_fields() {
+    let tensor = json!({ "kind": "tensor_component" });
+    assert_eq!(
+        serde_json::from_value::<ModelSemanticMetadata>(tensor.clone()).unwrap(),
+        ModelSemanticMetadata::TensorComponent
+    );
+    for changed in [
+        json!({}),
+        json!({ "kind": "unknown" }),
+        json!({ "kind": "tensor_component", "template": {} }),
+        json!({ "kind": "tensor_component", "special_tokens": {} }),
+        json!({ "kind": "causal_language" }),
+    ] {
+        assert!(serde_json::from_value::<ModelSemanticMetadata>(changed).is_err());
+    }
+    let mut legacy = serde_json::to_value(TestRegistry::new().prepare()).unwrap();
+    legacy["wire_version"] = json!(PREPARED_MODEL_FAMILY_WIRE_VERSION - 1);
+    assert!(PreparedModelFamily::decode_untrusted(&serde_json::to_vec(&legacy).unwrap()).is_err());
 }
 
 #[test]

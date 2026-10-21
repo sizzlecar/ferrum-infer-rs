@@ -270,7 +270,7 @@ impl ModelFamilyProvider for LanguageFamily {
         &self,
         _: &Value,
     ) -> std::result::Result<ModelSemanticMetadata, VNextError> {
-        Ok(ModelSemanticMetadata {
+        Ok(CausalLanguageMetadata {
             template: TemplateMetadata {
                 template: "{{ messages }}".into(),
                 source_file: "tokenizer_config.json".into(),
@@ -282,7 +282,8 @@ impl ModelFamilyProvider for LanguageFamily {
                 pad_token_id: None,
                 collision_policy: SpecialTokenCollisionPolicy::require_distinct(),
             },
-        })
+        }
+        .into())
     }
 }
 
@@ -656,12 +657,28 @@ pub(crate) fn resolve_plan(
         ),
         (
             ResolutionField::Template,
-            serde_json::to_value(&inputs.prepared_family.metadata().template).unwrap(),
+            serde_json::to_value(
+                &inputs
+                    .prepared_family
+                    .metadata()
+                    .causal_language()
+                    .unwrap()
+                    .template,
+            )
+            .unwrap(),
             ResolutionDecisionSource::TypedModelResolution,
         ),
         (
             ResolutionField::SpecialTokens,
-            serde_json::to_value(&inputs.prepared_family.metadata().special_tokens).unwrap(),
+            serde_json::to_value(
+                &inputs
+                    .prepared_family
+                    .metadata()
+                    .causal_language()
+                    .unwrap()
+                    .special_tokens,
+            )
+            .unwrap(),
             ResolutionDecisionSource::TypedModelResolution,
         ),
         (

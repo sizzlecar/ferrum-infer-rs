@@ -205,19 +205,21 @@ impl ModelFamilyProvider for Family {
     }
     fn semantic_metadata(&self, _config: &Config) -> Result<ModelSemanticMetadata, VNextError> {
         let template = "{{ messages }}";
-        Ok(ModelSemanticMetadata {
-            template: TemplateMetadata {
-                template: template.into(),
-                source_file: "chat_template.jinja".into(),
-                sha256: format!("{:x}", Sha256::digest(template.as_bytes())),
+        Ok(ModelSemanticMetadata::CausalLanguage(
+            ferrum_runtime::CausalLanguageMetadata {
+                template: TemplateMetadata {
+                    template: template.into(),
+                    source_file: "chat_template.jinja".into(),
+                    sha256: format!("{:x}", Sha256::digest(template.as_bytes())),
+                },
+                special_tokens: SpecialTokenMetadata {
+                    bos_token_id: None,
+                    eos_token_ids: BTreeSet::from([2]),
+                    pad_token_id: None,
+                    collision_policy: SpecialTokenCollisionPolicy::require_distinct(),
+                },
             },
-            special_tokens: SpecialTokenMetadata {
-                bos_token_id: None,
-                eos_token_ids: BTreeSet::from([2]),
-                pad_token_id: None,
-                collision_policy: SpecialTokenCollisionPolicy::require_distinct(),
-            },
-        })
+        ))
     }
 }
 

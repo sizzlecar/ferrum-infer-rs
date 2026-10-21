@@ -3,7 +3,7 @@
 use std::collections::BTreeSet;
 
 use ferrum_runtime::{
-    ModelSemanticMetadata, SpecialTokenCollision, SpecialTokenCollisionPolicy,
+    CausalLanguageMetadata, SpecialTokenCollision, SpecialTokenCollisionPolicy,
     SpecialTokenMetadata, SpecialTokenRole, TemplateMetadata,
 };
 use serde_json::{Map, Value};
@@ -14,7 +14,7 @@ pub(super) fn parse_hf_model_semantic_metadata(
     tokenizer_config_bytes: &[u8],
     chat_template_jinja: Option<&[u8]>,
     chat_template_json: Option<&[u8]>,
-) -> Result<ModelSemanticMetadata, String> {
+) -> Result<CausalLanguageMetadata, String> {
     let tokenizer_config: Value = serde_json::from_slice(tokenizer_config_bytes)
         .map_err(|error| format!("parse tokenizer tokenizer_config.json: {error}"))?;
     // Modern HF snapshots save a standalone template. Select it from the
@@ -45,7 +45,7 @@ pub(super) fn parse_hf_model_semantic_metadata(
         return Err(format!("{source_file} chat template must be non-empty"));
     }
     let special_tokens = parse_special_tokens(model_config, &tokenizer_config)?;
-    Ok(ModelSemanticMetadata {
+    Ok(CausalLanguageMetadata {
         template: TemplateMetadata {
             template,
             source_file: source_file.to_owned(),
@@ -80,7 +80,7 @@ pub(super) fn parse_hf_model_semantic_metadata_with_external_template(
     tokenizer_config_bytes: &[u8],
     chat_template_bytes: &[u8],
     generation_config_bytes: &[u8],
-) -> Result<ModelSemanticMetadata, String> {
+) -> Result<CausalLanguageMetadata, String> {
     let tokenizer_config: Value = serde_json::from_slice(tokenizer_config_bytes)
         .map_err(|error| format!("parse tokenizer tokenizer_config.json: {error}"))?;
     let generation_config: Value = serde_json::from_slice(generation_config_bytes)
@@ -95,7 +95,7 @@ pub(super) fn parse_hf_model_semantic_metadata_with_external_template(
     }
     let special_tokens =
         parse_special_tokens_with_generation(model_config, &tokenizer_config, generation_config)?;
-    Ok(ModelSemanticMetadata {
+    Ok(CausalLanguageMetadata {
         template: TemplateMetadata {
             template: template.to_owned(),
             source_file: "chat_template.jinja".to_owned(),

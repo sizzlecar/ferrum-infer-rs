@@ -133,6 +133,10 @@ impl<'a> PreparedExecutionInput<'a> {
         original_sources: &'a OriginalModelSources,
         resolved_sources: &'a ResolvedModelSources,
     ) -> Result<Self> {
+        family
+            .metadata()
+            .causal_language()
+            .map_err(|error| invalid(error.to_string()))?;
         let activation = family
             .numerical_profile()
             .activation_type()

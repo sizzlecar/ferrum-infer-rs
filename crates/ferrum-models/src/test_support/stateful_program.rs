@@ -284,10 +284,14 @@ impl ModelFamilyProvider for LanguageFamily {
         &self,
         config: &LanguageConfig,
     ) -> Result<ModelSemanticMetadata, VNextError> {
-        let mut metadata = self.0.semantic_metadata(&config.attention)?;
+        let mut metadata = self
+            .0
+            .semantic_metadata(&config.attention)?
+            .causal_language()?
+            .clone();
         metadata.template.source_file = "tokenizer_config.json".to_owned();
         metadata.template.sha256 = format!("{:x}", Sha256::digest(TOKENIZER_CONFIG));
-        Ok(metadata)
+        Ok(metadata.into())
     }
 }
 
@@ -464,7 +468,12 @@ fn build_executor<R: DeviceRuntime>(
     let info = prepared.model_info(name.into(), device);
     // Product stop tokens retain the actual family's EOS declaration. Declare
     // only the roles that these exact IDs alias; model metadata stays intact.
-    let special = &prepared.family().metadata().special_tokens;
+    let special = &prepared
+        .family()
+        .metadata()
+        .causal_language()
+        .unwrap()
+        .special_tokens;
     let token_ids = special.eos_token_ids.clone();
     let mut allowed_roles = BTreeSet::new();
     if !token_ids.is_empty() {

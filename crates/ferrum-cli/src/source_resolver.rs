@@ -817,7 +817,12 @@ fn load_product_chat_template_source(
 pub fn load_defined_product_chat_template(
     prepared: &ferrum_models::vnext::DefinedProductionModel,
 ) -> Result<ModelChatTemplate> {
-    let metadata = &prepared.definition().metadata().template;
+    let metadata = &prepared
+        .definition()
+        .metadata()
+        .causal_language()
+        .map_err(|error| FerrumError::model(error.to_string()))?
+        .template;
     let mut selected = load_product_chat_template_source(prepared.sources(), &metadata.source_file)
         .ok_or_else(|| {
             FerrumError::model(format!(
