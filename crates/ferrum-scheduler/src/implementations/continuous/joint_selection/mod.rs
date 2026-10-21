@@ -223,12 +223,10 @@ impl ContinuousBatchScheduler {
             missing_stopping |= !valid || completion.unresolved_mass > 0.0;
         }
         let mut config = round.config;
-        config.planning.max_queries = config
-            .planning
-            .max_queries
-            .checked_sub(round.query_count)
-            .filter(|count| *count > 0)
-            .ok_or(Unsupported::QueryBudget)?;
+        config.planning.max_queries = round.remaining_queries();
+        if config.planning.max_queries == 0 {
+            return Err(Unsupported::QueryBudget);
+        }
         config.planning.max_elapsed_us = remaining_time
             .checked_sub(started.elapsed())
             .and_then(|time| u64::try_from(time.as_micros()).ok())
@@ -276,12 +274,12 @@ impl ContinuousBatchScheduler {
             .statistics
             .joint_evaluation
             .record(comparison_kind, diagnostics, summary.is_ok());
-        // A failed evaluation cannot renew a sub-round's exhausted query budget.
-        round.query_count = round.query_count.saturating_add(
-            summary
-                .as_ref()
-                .map_or(config.planning.max_queries, |summary| summary.queries),
-        );
+        // Early Unknown, invalid distributions and panics still made only the
+        // recorded original-provider calls. A genuine query-budget boundary is
+        // sticky across subrounds, independently of the actual call counter.
+        if !round.charge_scenario_queries(&diagnostics) {
+            return Err(Unsupported::QueryBudget);
+        }
         let summary = summary?;
         round.statistics.joint_cost_snapshot_queries = round
             .statistics

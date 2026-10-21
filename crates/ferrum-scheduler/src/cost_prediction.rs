@@ -344,6 +344,9 @@ pub struct TimePlanningRound {
     pub(crate) execution_already_projected: bool,
     pub(crate) selected_over_limit: bool,
     pub(crate) query_count: usize,
+    /// A real query guard (or a provider's unspecified budget refusal) stops
+    /// all later subrounds without inventing additional provider calls.
+    pub(crate) query_budget_exhausted: bool,
     pub(crate) prediction_elapsed: Duration,
     request_facts: Option<Vec<(RequestId, RequestStoppingObservation)>>,
     pub(crate) request_fact_bytes: usize,
@@ -390,6 +393,7 @@ impl TimePlanningRound {
             execution_already_projected: true,
             selected_over_limit: false,
             query_count: 0,
+            query_budget_exhausted: false,
             prediction_elapsed: Duration::ZERO,
             request_facts: None,
             request_fact_bytes: 0,
@@ -553,8 +557,37 @@ impl TimePlanningRound {
         self.resident_capacity
     }
 
+    pub(crate) fn remaining_queries(&self) -> usize {
+        if self.query_budget_exhausted {
+            0
+        } else {
+            self.config
+                .planning
+                .max_queries
+                .saturating_sub(self.query_count)
+        }
+    }
+
+    /// Charge the original cost provider on every exit. Simulation calls and
+    /// cache hits are bounded separately and must not consume this counter.
+    pub(crate) fn charge_scenario_queries(
+        &mut self,
+        diagnostics: &crate::joint_policy::ScenarioDiagnostics,
+    ) -> bool {
+        let Some(calls) = usize::try_from(diagnostics.provider_calls)
+            .ok()
+            .filter(|calls| *calls <= self.remaining_queries())
+        else {
+            self.query_budget_exhausted = true;
+            return false;
+        };
+        self.query_count += calls;
+        self.query_budget_exhausted |= diagnostics.query_budget_exhausted;
+        true
+    }
+
     pub fn stopping_forecast(&mut self, query: &StoppingQuery<'_>) -> StoppingForecast {
-        if self.query_count >= self.config.planning.max_queries
+        if self.remaining_queries() == 0
             || self.prediction_elapsed >= Duration::from_micros(self.config.planning.max_elapsed_us)
         {
             return StoppingForecast::unknown();
@@ -573,7 +606,7 @@ impl TimePlanningRound {
         }
     }
     pub fn completion_forecast(&mut self, query: &CompletionQuery<'_>) -> CompletionForecast {
-        if self.query_count >= self.config.planning.max_queries
+        if self.remaining_queries() == 0
             || self.prediction_elapsed >= Duration::from_micros(self.config.planning.max_elapsed_us)
         {
             return CompletionForecast::unknown();

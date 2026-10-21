@@ -56,13 +56,18 @@ pub struct EvaluationFailure {
     pub elapsed_us: u64,
 }
 
-/// Always returned through the out parameter, including early failure. Query
-/// counts are observations, separate from the conservative budget charge a
-/// scheduler applies after an incomplete evaluation.
+/// Always returned through the out parameter, including early failure. Actual
+/// provider calls and a sticky budget boundary remain separate: cached
+/// simulation work can exhaust its guard without making another provider call.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
 pub struct ScenarioDiagnostics {
     /// Actual original provider calls, including seed and failed calls.
     pub provider_calls: u64,
+    /// Any provider/simulation query-budget exhaustion, including an unsupported
+    /// alternative in an otherwise successful traversal. An original provider's
+    /// unspecified PlanningBudget also stops later queries conservatively; its
+    /// internal work is unknown and is never added to provider_calls.
+    pub query_budget_exhausted: bool,
     /// Calls to the simulation snapshot, including cache hits.
     pub simulation_queries: u64,
     pub cache_hits: u64,
@@ -166,6 +171,15 @@ impl Recorder {
     pub(super) fn failure(&self, reason: Unsupported, origin: FailureOrigin) {
         let elapsed_us = self.elapsed_us();
         let mut state = self.state.lock();
+        state.report.query_budget_exhausted |= matches!(reason, Unsupported::QueryBudget)
+            || matches!(
+                origin,
+                FailureOrigin::ProviderQueryBudget | FailureOrigin::SimulationQueryBudget
+            )
+            || (matches!(
+                reason,
+                Unsupported::Cost(crate::cost_prediction::CostUnknownReason::PlanningBudget)
+            ) && origin == FailureOrigin::Provider);
         let failure = EvaluationFailure {
             reason,
             origin,

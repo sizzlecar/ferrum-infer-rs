@@ -63,6 +63,7 @@ fn failed_simulation_retains_actual_provider_and_cached_query_counts() {
     assert_eq!(report.provider_calls, 2);
     assert_eq!(report.simulation_queries, 2);
     assert_eq!(report.cache_hits, 1);
+    assert!(report.query_budget_exhausted);
     assert_eq!(report.rank_attempts, 1);
     assert_eq!(report.rank_completed, 0);
     let failure = report.terminal_failure.unwrap();
@@ -104,6 +105,7 @@ fn failed_uncached_provider_budget_is_distinct_from_simulation_budget() {
     );
     assert_eq!(report.simulation_queries, 2);
     assert_eq!(report.cache_hits, 0);
+    assert!(report.query_budget_exhausted);
     let failure = report.terminal_failure.unwrap();
     assert_eq!(failure.origin, FailureOrigin::ProviderQueryBudget);
     assert_eq!(failure.point.round, Some(1));
@@ -174,6 +176,7 @@ fn rejected_seed_counts_real_call_without_inventing_simulated_queries() {
     ));
     assert_eq!(report.provider_calls, 1);
     assert_eq!(report.simulation_queries, 0);
+    assert!(!report.query_budget_exhausted);
     assert_eq!(report.rank_attempts, 0);
     let failure = report.terminal_failure.unwrap();
     assert_eq!(failure.point.stage, EvaluationStage::Seed);
@@ -218,12 +221,62 @@ fn unsupported_alternative_is_observed_without_marking_successful_traversal_fail
     assert_eq!(report.rank_completed, 2);
     assert_eq!(report.failure_count, 2);
     assert!(report.terminal_failure.is_none());
+    assert!(!report.query_budget_exhausted);
     let failure = report.first_failure.unwrap();
     assert_eq!(failure.origin, FailureOrigin::Provider);
     assert_eq!(failure.point.rank, Some(0));
     assert_eq!(failure.point.candidate, Some(1));
     assert_eq!(failure.point.round, Some(0));
     assert_eq!(failure.point.group, Some(0));
+}
+
+#[test]
+fn cached_alternative_simulation_exhaustion_is_sticky_without_fake_provider_calls() {
+    let snapshot = std::sync::Arc::new(Snapshot {
+        at: Instant::now(),
+        calls: AtomicUsize::new(0),
+    });
+    let mut config = config();
+    config.planning.max_queries = 2;
+    let mut request = request();
+    request.prompt_tokens = 128;
+    request.prefill_tokens = 0;
+    request.output_tokens = 0;
+    request.output_cap = 1;
+    request.scenario_end_tokens = 1;
+    request.central_clock = RequestClock::default();
+    request.risk_clock = RequestClock::default();
+    // Identical actions deliberately reuse the same cached distribution. The
+    // third action hits the simulation guard, not the original provider limit.
+    let (result, report) = run(
+        snapshot.as_ref(),
+        snapshot.at,
+        &config,
+        &[request],
+        &[128, 128],
+        |_, _| Ok(()),
+    );
+    let result = result.unwrap();
+    assert_eq!(result.queries, 1);
+    assert_eq!(report.provider_calls, 1);
+    assert_eq!(snapshot.calls.load(Ordering::Relaxed), 1);
+    assert_eq!(report.simulation_queries, 4);
+    assert_eq!(report.cache_hits, 4);
+    assert!(report.terminal_failure.is_none());
+    assert!(report.query_budget_exhausted);
+    assert_eq!(
+        report.first_failure.unwrap().origin,
+        FailureOrigin::SimulationQueryBudget
+    );
+    let mut round = crate::cost_prediction::TimePlanningRound::new(
+        snapshot,
+        config,
+        ferrum_execution::model_executor::PrefillShapePolicy::Identity,
+        CostExecution::SingleInvocation,
+    );
+    assert!(round.charge_scenario_queries(&report));
+    assert_eq!(round.query_count, 1);
+    assert_eq!(round.remaining_queries(), 0);
 }
 
 #[test]

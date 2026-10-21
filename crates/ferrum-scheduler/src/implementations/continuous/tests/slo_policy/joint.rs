@@ -7,6 +7,7 @@ use ferrum_interfaces::request_observation::*;
 
 mod fill_first;
 mod persistent_capacity;
+mod query_budget;
 
 struct ConditionalSnapshot {
     at: Instant,

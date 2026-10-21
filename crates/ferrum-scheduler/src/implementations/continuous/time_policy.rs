@@ -19,7 +19,7 @@ impl TimePlanningRound {
     }
 
     fn reserve_query(&mut self) -> bool {
-        if self.query_count >= self.config.planning.max_queries
+        if self.remaining_queries() == 0
             || self.prediction_elapsed >= Duration::from_micros(self.config.planning.max_elapsed_us)
         {
             return false;

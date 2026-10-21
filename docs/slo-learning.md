@@ -202,13 +202,25 @@ planning activity and do not establish SLO feasibility or actual intervention.
 
 `joint_evaluation.admission` and `.dispatch` count entered scenario evaluations,
 including failed traversals. Their denominator excludes cohort or capacity checks
-that return before the evaluator. `provider_calls` includes the seed and failed
-calls to the original cost provider; `simulation_queries` also includes exact
-cache hits. Both differ from the conservative query-budget charge. The older
+that return before the evaluator. `provider_calls` includes seed, failed and
+panicking calls to the original cost provider. It supplies the scenario part of
+the round's actual query charge; stopping and completion forecasts are charged
+separately. `simulation_queries` also includes exact cache hits, which do not
+consume another provider call. The older
 `joint_cost_snapshot_queries` and cache counters describe completed traversals
 only. A completed traversal is not proof of a feasible action or a policy change.
 Evaluator elapsed time is measured wall time, not OS CPU time or the charged
 planning budget. Rank and query maxima are maxima, not additive counters.
+
+A model-support rejection does not spend unissued queries. Later admission or
+dispatch work in the same round can use only the remaining original allowance;
+this introduces no retry loop and does not relax support requirements. An
+evaluation that exhausts its provider or simulation query budget prevents
+subsequent forecasts and evaluations in that round after it returns, including
+when an unsuccessful alternative
+observed the exhaustion. An opaque provider planning-budget rejection also
+closes the round conservatively without inventing a call count.
+The elapsed-time limit remains cumulative and is not refunded after a failure.
 
 Each population retains its latest first failure and latest terminal failure,
 including the rank, candidate, wave, invocation group and consumed query counts.
