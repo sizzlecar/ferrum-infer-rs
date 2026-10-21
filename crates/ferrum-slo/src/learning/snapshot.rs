@@ -29,6 +29,9 @@ pub(super) struct Snapshot {
     pub boundaries: Arc<[usize]>,
     pub quantile: f64,
     pub domains: Vec<Domain>,
+    // Publication attaches the source's one shared slot; training/restore
+    // snapshots do not create or persist another recorder.
+    pub rejections: Option<Arc<super::rejection::Recorder>>,
 }
 
 struct PreparedPrediction<'a> {
@@ -97,10 +100,17 @@ impl Snapshot {
         if now >= domain.model_expires_at {
             return Err(CostUnknownReason::Stale);
         }
-        let base = domain
-            .model
-            .predict_detailed(&self.identity, &features)
-            .map_err(model_rejection)?;
+        let base = match domain.model.predict_detailed(&self.identity, &features) {
+            Ok(base) => base,
+            Err(reason) => {
+                if reason == PredictionRejection::OutsideObservedSupport {
+                    if let Some(recorder) = &self.rejections {
+                        recorder.record(self.revision, domain, &features, query, now);
+                    }
+                }
+                return Err(model_rejection(reason));
+            }
+        };
         let bucket = self
             .boundaries
             .partition_point(|limit| (*limit as f64) < features.work_tokens())
@@ -218,11 +228,15 @@ impl CostSnapshot for Snapshot {
 pub(super) struct Source {
     snapshots: ArcSwap<Snapshot>,
     revisions: watch::Receiver<u64>,
+    rejections: Arc<super::rejection::Recorder>,
 }
 
 impl Source {
     pub fn load_typed(&self) -> Arc<Snapshot> {
         self.snapshots.load_full()
+    }
+    pub fn rejection_stats(&self) -> super::LearningQueryRejectionStats {
+        self.rejections.stats()
     }
     pub fn new(
         query: CostQueryLimits,
@@ -230,6 +244,10 @@ impl Source {
         boundaries: Vec<usize>,
     ) -> (Self, watch::Sender<u64>) {
         let (sender, revisions) = watch::channel(0);
+        let rejections = Arc::new(super::rejection::Recorder::new(
+            query.max_participants,
+            Instant::now(),
+        ));
         (
             Self {
                 snapshots: ArcSwap::from_pointee(Snapshot {
@@ -239,13 +257,16 @@ impl Source {
                     boundaries: boundaries.into(),
                     quantile: 0.95,
                     domains: Vec::new(),
+                    rejections: Some(rejections.clone()),
                 }),
                 revisions,
+                rejections,
             },
             sender,
         )
     }
-    pub fn install(&self, snapshot: Snapshot) {
+    pub fn install(&self, mut snapshot: Snapshot) {
+        snapshot.rejections = Some(self.rejections.clone());
         self.snapshots.store(Arc::new(snapshot));
     }
 }

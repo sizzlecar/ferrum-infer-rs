@@ -233,6 +233,25 @@ without exposing model-private features. Deadline exhaustion after a provider
 call is a planning-budget failure, not evidence of missing model support. These
 diagnostics do not change support bounds, deadlines, candidates or fallback policy.
 
+The learned owner's cold `query_rejections` statistics record calls rejected
+outside observed feature support. `below_axis_counts` and `above_axis_counts`
+can both count several axes for one query; they are not disjoint percentages.
+The bounded `last` witness contains that call's exact work, features, model
+bounds, revisions and validity remainder. It is explicitly unjoined to scheduler
+admission/dispatch samples and describes the last successfully retained call,
+not necessarily the latest query clock. It contains no prompt, response or
+request identifier. An observed feature box does not establish coverage of
+every combination within the box.
+
+All published snapshots share one preallocated recorder. A rejected call copies
+at most the configured participant limit using `try_lock`; contention drops the
+witness instead of waiting. The counters expose dropped and overwritten samples.
+Cold reads can report `last_witness_read_busy`, and concurrent counter and witness
+reads are not an atomic snapshot. The fixed recorder and work payload count
+toward `max_retained_bytes`; cold returned copies and allocator/RSS overhead do
+not. Diagnostics are not persisted with learned models and do not re-evaluate
+predictions, alter support, or prove negligible runtime overhead.
+
 `live_prediction` groups actual invocation counters by model family and by
 phase/reuse domain for the current process. The observer freezes one center, risk base and available
 calibrated upper prediction before execution. Completion records center signed,

@@ -350,6 +350,7 @@ impl Learner {
             boundaries: self.config.work_bucket_boundaries.clone().into(),
             quantile: self.config.training.risk_quantile,
             domains,
+            rejections: None,
         }
     }
 }

@@ -3,6 +3,7 @@
 //! Final performance evaluation data are not inputs to this training interface.
 
 mod owner;
+mod rejection;
 mod snapshot;
 mod state;
 mod telemetry;
@@ -11,6 +12,7 @@ mod worker;
 
 pub use ferrum_types::TrainingHistoryPolicy;
 pub use owner::{AutoFallbackReason, FamilyResolution, LearningEstimatorOwner};
+pub use rejection::{LearningQueryRejectionStats, OutsideSupportWitness, RejectionWork};
 pub use state::{LearningStateError, StateLoadReport, StateLoadStatus, StateSaveReport};
 pub use telemetry::{DomainPredictionStats, LearningPredictionStats};
 
@@ -46,7 +48,8 @@ pub struct LearningConfig {
     pub model_ttl_ms: u64,
     /// Inclusive upper bounds on requested product tokens, not physical tokens.
     pub work_bucket_boundaries: Vec<usize>,
-    /// Retained learning vectors/models, excluding collection, fit scratch and
+    /// Retained learning vectors/models and the one source-local rejection
+    /// recorder, excluding collection, fit scratch, cold diagnostic copies and
     /// caller-retained old snapshots; allocator/RSS is measured independently.
     pub max_retained_bytes: usize,
 }
@@ -133,6 +136,9 @@ impl LearningConfig {
         let history_samples = self
             .width_history_capacity()
             .ok_or_else(|| invalid("width history bound overflow"))?;
+        let rejection_bytes =
+            rejection::Recorder::retained_bytes_bound(self.query.max_participants)
+                .ok_or_else(|| invalid("rejection recorder memory bound overflow"))?;
         let per_domain = self
             .window_samples
             .checked_add(history_samples)
@@ -155,6 +161,7 @@ impl LearningConfig {
                 )
             })
             .and_then(|n| n.checked_add(std::mem::size_of::<telemetry::Telemetry>()))
+            .and_then(|n| n.checked_add(rejection_bytes))
             .ok_or_else(|| invalid("retained memory bound overflow"))?;
         if self.max_retained_bytes > 32 * 1024 * 1024 || retained > self.max_retained_bytes {
             return Err(invalid("learning retained memory budget exceeded"));

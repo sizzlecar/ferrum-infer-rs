@@ -314,6 +314,7 @@ impl ProductExecutionFeedback {
                     if let CostOwner::Learning(owner) = &owners.cost {
                         value["state_load"] = serde_json::json!(owner.load_report());
                         value["live_prediction"] = serde_json::json!(owner.prediction_stats());
+                        value["query_rejections"] = serde_json::json!(owner.rejection_stats());
                         value["predictor_selection"] = serde_json::json!(owner.family_resolution());
                     }
                     value
@@ -459,6 +460,11 @@ mod tests {
                     .await
                     .unwrap();
                 assert!(feedback.stats().is_some());
+                let rejection_stats = &feedback.stats().unwrap()["query_rejections"];
+                assert_eq!(rejection_stats["outside_observed_support"], 0);
+                assert_eq!(rejection_stats["axes"].as_array().unwrap().len(), 9);
+                assert_eq!(rejection_stats["last_witness_read_busy"], false);
+                assert!(rejection_stats["last"].is_null());
                 assert_eq!(
                     feedback.stats().unwrap()["execution_binding"]["scope"],
                     "InstanceScoped"

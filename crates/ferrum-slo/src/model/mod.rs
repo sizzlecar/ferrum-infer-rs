@@ -379,6 +379,10 @@ impl FittedModel {
         (&self.support.minimum, &self.support.maximum)
     }
 
+    pub(crate) fn feature_schema(&self) -> u32 {
+        self.schema
+    }
+
     pub fn family(&self) -> ModelFamily {
         match self.predictor {
             Predictor::Physical(_) => ModelFamily::Physical,

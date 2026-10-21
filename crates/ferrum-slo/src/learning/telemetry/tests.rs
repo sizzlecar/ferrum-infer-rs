@@ -86,6 +86,7 @@ fn snapshot(family: ModelFamily, revision: u64, center: f64, upper: f64, now: In
         query: CostQueryLimits::default(),
         boundaries: Vec::new().into(),
         quantile: 0.95,
+        rejections: None,
         domains: vec![Domain {
             model: Arc::new(model),
             model_revision: revision,

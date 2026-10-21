@@ -30,6 +30,8 @@ fn scalar_and_scenarios_report_same_precise_rejection_without_relaxing_support()
         let mut learner = Learner::new(config, identity(), family);
         let end = fill(&mut learner, &shared, Instant::now(), 0.01, 0.02);
         let mut snapshot = learner.snapshot(end).unwrap();
+        let recorder = Arc::new(crate::learning::rejection::Recorder::new(256, end));
+        snapshot.rejections = Some(recorder.clone());
         let known = CostQuery {
             work: &[work()],
             work_is_exact: true,
@@ -129,5 +131,10 @@ fn scalar_and_scenarios_report_same_precise_rejection_without_relaxing_support()
             end,
             CostUnknownReason::Stale,
         );
+        // Only the one outside-support query (scalar + scenarios) is counted.
+        // Invalid projection, composition, identity and expiry never enter it.
+        let stats = recorder.stats();
+        assert_eq!(stats.outside_observed_support, 2);
+        assert_eq!(stats.stored, 2);
     }
 }

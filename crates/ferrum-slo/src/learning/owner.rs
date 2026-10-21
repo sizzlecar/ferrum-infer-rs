@@ -57,6 +57,9 @@ impl LearningEstimatorOwner {
     pub fn prediction_stats(&self) -> super::LearningPredictionStats {
         self.telemetry.stats()
     }
+    pub fn rejection_stats(&self) -> super::LearningQueryRejectionStats {
+        self.source.rejection_stats()
+    }
     pub fn family(&self) -> ModelFamily {
         self.family
     }

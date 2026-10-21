@@ -136,6 +136,7 @@ fn fixture(family: ModelFamily) -> (LearningConfig, snapshot::Snapshot, Clock) {
         identity: Arc::new(identity()),
         boundaries: config.work_bucket_boundaries.clone().into(),
         quantile: config.training.risk_quantile,
+        rejections: None,
         domains: vec![snapshot::Domain {
             model: Arc::new(model),
             model_revision: 1,

@@ -16,6 +16,9 @@ mod width_history_fit;
 #[path = "prediction_rejection_tests.rs"]
 mod prediction_rejection;
 
+#[path = "rejection_witness_tests.rs"]
+mod rejection_witness;
+
 fn config() -> LearningConfig {
     LearningConfig {
         training_samples: 4,
