@@ -92,6 +92,101 @@ fn disconnected_or_closed_collection_does_not_retain_payload_credit() {
 }
 
 #[test]
+fn ready_envelope_is_drained_before_publishing_its_admission_only_placeholder() {
+    let now = Instant::now();
+    let (observer, receiver) = paused_collector(2, 4096);
+    let mut window = StoppingWindow::new(StoppingConfig {
+        min_risk_set: 1,
+        ..Default::default()
+    })
+    .unwrap();
+    let first = fact(now);
+    window.observe(&first, now);
+    let mut second = first.clone();
+    second.lifecycle.admission = 2;
+    observer.record_admission(second.lifecycle, second.admitted_at);
+    assert_eq!(
+        observer.try_record(&second),
+        RequestObservationDelivery::Recorded
+    );
+    // Model select! choosing the ready wake before the ready Envelope.
+    observer.shared.advance_window(&mut window);
+    assert_eq!(window.stats().unobserved_lifetimes, 1);
+    assert_eq!(
+        drain_ready_records(&observer.shared, &receiver, &mut window, 2),
+        1
+    );
+    observer.shared.advance_window(&mut window);
+    let query = StoppingQuery {
+        rules: &first.rules,
+        cap: first.cap,
+        verified_survival_through: 0,
+        horizon: first.cap,
+        now: Instant::now(),
+    };
+    let forecast = window.snapshot().forecast(&query);
+    assert_eq!(forecast.unresolved_mass, 0.0);
+    assert_eq!(forecast.resolved_mass(), 1.0);
+    assert_eq!(observer.shared.stats().processed, 1);
+    assert_eq!(observer.shared.stats().queued_records, 0);
+}
+
+#[test]
+fn publication_drain_is_bounded_and_never_hides_a_genuinely_missing_lifecycle() {
+    let now = Instant::now();
+    let (observer, receiver) = paused_collector(2, 4096);
+    let first = fact(now);
+    assert_eq!(
+        observer.try_record(&first),
+        RequestObservationDelivery::Recorded
+    );
+    let mut second = first.clone();
+    second.lifecycle.admission = 2;
+    assert_eq!(
+        observer.try_record(&second),
+        RequestObservationDelivery::Recorded
+    );
+    observer.record_admission(
+        RequestLifecycleId {
+            producer: 1,
+            admission: 3,
+        },
+        now,
+    );
+    let mut window = StoppingWindow::new(StoppingConfig {
+        min_risk_set: 1,
+        ..Default::default()
+    })
+    .unwrap();
+    assert_eq!(
+        drain_ready_records(&observer.shared, &receiver, &mut window, 1),
+        1
+    );
+    assert_eq!(
+        observer.shared.stats().queued_records,
+        1,
+        "ready backlog is bounded per publication"
+    );
+    observer.shared.advance_window(&mut window);
+    assert_eq!(window.stats().unobserved_lifetimes, 2);
+    assert_eq!(
+        drain_ready_records(&observer.shared, &receiver, &mut window, 1),
+        1
+    );
+    observer.shared.advance_window(&mut window);
+    assert_eq!(window.stats().unobserved_lifetimes, 1);
+    let forecast = window.snapshot().forecast(&StoppingQuery {
+        rules: &first.rules,
+        cap: first.cap,
+        verified_survival_through: 0,
+        horizon: first.cap,
+        now: Instant::now(),
+    });
+    assert_eq!(forecast.unresolved_mass, 1.0 / 3.0);
+    assert_eq!(observer.shared.stats().processed, 2);
+}
+
+#[test]
 fn full_queue_preserves_last_unseen_admission_watermark_without_allocating_a_placeholder() {
     let now = Instant::now();
     let (observer, receiver) = paused_collector(1, 4096);

@@ -156,6 +156,37 @@ struct Envelope {
     observation: RequestStoppingObservation,
     _credit: Credit,
 }
+
+fn apply_envelope(shared: &Shared, window: &mut StoppingWindow, envelope: Envelope) {
+    let now = Instant::now();
+    if let Some(delay) = now.checked_duration_since(envelope.observation.observed_at) {
+        shared.counters.max_feedback_delay_ns.fetch_max(
+            delay.as_nanos().min(u64::MAX as u128) as u64,
+            Ordering::Relaxed,
+        );
+    }
+    window.observe(&envelope.observation, now);
+    shared.counters.processed.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Consume a bounded batch already ready when publication is due. A wake can
+/// win select! even with a queued initial fact; publishing that avoidable gap
+/// would unnecessarily censor the next immutable forecast. Concurrent or lost
+/// notices still remain unknown: this is not an atomic producer/worker barrier.
+fn drain_ready_records(
+    shared: &Shared,
+    receiver: &crossbeam_channel::Receiver<Envelope>,
+    window: &mut StoppingWindow,
+    max_records: usize,
+) -> usize {
+    let mut processed = 0;
+    for envelope in receiver.try_iter().take(max_records) {
+        apply_envelope(shared, window, envelope);
+        processed += 1;
+    }
+    processed
+}
+
 struct Observer {
     shared: Arc<Shared>,
     sender: crossbeam_channel::Sender<Envelope>,
@@ -383,33 +414,47 @@ impl StoppingEstimatorOwner {
         let worker_shared = shared.clone();
         let worker_source = source.clone();
         let worker = runtime.spawn_blocking(move || {
-            let mut dirty = false; let mut published_at = Instant::now();
+            let mut dirty = false;
+            let mut published_at = Instant::now();
             while !worker_shared.drained() {
                 crossbeam_channel::select! {
                     recv(receiver) -> message => {
                         let Ok(envelope) = message else { break; };
-                        let now = Instant::now();
-                        if let Some(delay) = now.checked_duration_since(envelope.observation.observed_at) {
-                            worker_shared.counters.max_feedback_delay_ns.fetch_max(delay.as_nanos().min(u64::MAX as u128) as u64, Ordering::Relaxed);
-                        }
-                        window.observe(&envelope.observation, now);
-                        worker_shared.counters.processed.fetch_add(1, Ordering::Relaxed);
+                        apply_envelope(&worker_shared, &mut window, envelope);
                         dirty = true;
                     }
                     recv(wake_receiver) -> _ => {},
                     default(config.publish_interval) => {},
                 }
                 dirty |= worker_shared.advance_window(&mut window);
-                if dirty && published_at.elapsed() >= config.publish_interval {
-                    worker_source.table.store(Arc::new(window.snapshot()));
-                    worker_shared.counters.published.fetch_add(1, Ordering::Relaxed);
-                    published_at = Instant::now(); dirty = false;
+                if published_at.elapsed() >= config.publish_interval {
+                    dirty |= drain_ready_records(
+                        &worker_shared,
+                        &receiver,
+                        &mut window,
+                        config.queue_capacity,
+                    ) > 0;
+                    // Preserve admission-only and dropped lifetimes even when
+                    // their corresponding Envelope was never available.
+                    dirty |= worker_shared.advance_window(&mut window);
+                    if dirty {
+                        worker_source.table.store(Arc::new(window.snapshot()));
+                        worker_shared
+                            .counters
+                            .published
+                            .fetch_add(1, Ordering::Relaxed);
+                        published_at = Instant::now();
+                        dirty = false;
+                    }
                 }
             }
             dirty |= worker_shared.advance_window(&mut window);
             if dirty {
                 worker_source.table.store(Arc::new(window.snapshot()));
-                worker_shared.counters.published.fetch_add(1, Ordering::Relaxed);
+                worker_shared
+                    .counters
+                    .published
+                    .fetch_add(1, Ordering::Relaxed);
             }
             window.stats()
         });
