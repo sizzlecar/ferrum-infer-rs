@@ -115,6 +115,17 @@ Auto restores a fresh compatible state's family; absent or stale state falls
 back to Physical with a visible resolution reason. Reusing a numerically valid
 state does not establish comparative performance for that family.
 
+Joint planning also needs executor-owned resource evidence. For a complete
+resident cohort, compiled-plan executors can account for held persistent state
+and remaining paged growth through each request's admitted ceiling, using
+currently allocated physical pools and logical availability. This observation
+uses nonblocking locks and supports up to 64 resident sequences. It does not
+reserve capacity, credit future pool growth, or authorize waiting admissions.
+Incomplete cohorts, contention, unsupported growth and missing admission
+evidence remain Unknown. Cohort changes invalidate the observation, and actual
+execution retains its normal resource checks. Fact and resource projection time
+counts toward the same planning time limit as candidate comparison.
+
 ## Diagnostics
 
 Server health exposes scheduler diagnostics and `scheduler_slo.feedback`; the

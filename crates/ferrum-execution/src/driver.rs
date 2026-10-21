@@ -67,6 +67,7 @@ mod composition;
 mod determinism;
 mod input_uploads;
 mod invocation_preparation;
+mod resident_capacity;
 mod resident_decode;
 pub use composition::{CompiledProgram, ProgramCompilationError, RuntimeComposition};
 use resident_decode::{
@@ -9118,6 +9119,13 @@ impl<R: DeviceRuntime> ModelExecutor for ProgramExecutor<R> {
                 "resolved vNext admission limits violated their typed contract: {reason}"
             ))
         })
+    }
+
+    fn resident_cohort_capacity_snapshot(
+        &self,
+        cohort: &[crate::model_executor::ResidentSequenceCapacityRequest],
+    ) -> Option<crate::model_executor::ResidentCohortCapacitySnapshot> {
+        self.native_resident_cohort_capacity(cohort)
     }
 
     fn resolved_model_plan(&self) -> Option<&ResolvedModelPlan> {

@@ -43,6 +43,88 @@ pub(super) async fn execute_one<R: DeviceRuntime>(
     completed.pop().unwrap()
 }
 
+pub async fn native_resident_capacity_requires_complete_live_incarnations<R: DeviceRuntime>(
+    fixture: &ProgramExecutor<R>,
+    other: &ProgramExecutor<R>,
+) {
+    use crate::model_executor::ResidentSequenceCapacityRequest;
+    let tokens = [TokenId::new(0), TokenId::new(1)];
+    let first = admit_tokens(fixture, &RequestId::new(), &tokens).await;
+    let request = ResidentSequenceCapacityRequest {
+        sequence: first.sequence().clone(),
+        through_tokens: 16,
+    };
+    let before = fixture.plan_runtime_resource_snapshot().unwrap();
+    let proof = fixture
+        .resident_cohort_capacity_snapshot(std::slice::from_ref(&request))
+        .unwrap();
+    assert_eq!(proof.participants, 1);
+    assert_eq!(proof.max_batch_sequences, 1);
+    assert_eq!(fixture.plan_runtime_resource_snapshot().unwrap(), before);
+    assert!(other
+        .resident_cohort_capacity_snapshot(std::slice::from_ref(&request))
+        .is_none());
+    assert!(fixture
+        .resident_cohort_capacity_snapshot(&[ResidentSequenceCapacityRequest {
+            through_tokens: 17,
+            ..request.clone()
+        }])
+        .is_none());
+    assert!(fixture
+        .resident_cohort_capacity_snapshot(&[request.clone(), request.clone()])
+        .is_none());
+    let second = admit_tokens(fixture, &RequestId::new(), &tokens).await;
+    assert!(fixture
+        .resident_cohort_capacity_snapshot(std::slice::from_ref(&request))
+        .is_none());
+    let cohort = [
+        request.clone(),
+        ResidentSequenceCapacityRequest {
+            sequence: second.sequence().clone(),
+            through_tokens: 16,
+        },
+    ];
+    assert_eq!(
+        fixture
+            .resident_cohort_capacity_snapshot(&cohort)
+            .unwrap()
+            .participants,
+        2
+    );
+    {
+        let owner = fixture.sequences.lock().token_index[&request.sequence]
+            .upgrade()
+            .unwrap();
+        let _busy = owner.operation.lock().await;
+        assert!(fixture.resident_cohort_capacity_snapshot(&cohort).is_none());
+    }
+    {
+        let owner = fixture.sequences.lock().token_index[&request.sequence]
+            .upgrade()
+            .unwrap();
+        let _busy = owner.settlement.lock();
+        assert!(fixture.resident_cohort_capacity_snapshot(&cohort).is_none());
+    }
+    assert!(matches!(
+        fixture
+            .cancel_tokens(second.sequence())
+            .unwrap()
+            .disposition,
+        ExecutionCloseDisposition::Ended(_)
+    ));
+    assert!(fixture.resident_cohort_capacity_snapshot(&cohort).is_none());
+    assert!(fixture
+        .resident_cohort_capacity_snapshot(std::slice::from_ref(&request))
+        .is_some());
+    assert!(matches!(
+        fixture.cancel_tokens(first.sequence()).unwrap().disposition,
+        ExecutionCloseDisposition::Ended(_)
+    ));
+    assert!(fixture
+        .resident_cohort_capacity_snapshot(&[request])
+        .is_none());
+}
+
 pub async fn native_tokens_cpu_partial_final_decode_and_terminal_receipt<R: DeviceRuntime>(
     fixture: &ProgramExecutor<R>,
 ) {

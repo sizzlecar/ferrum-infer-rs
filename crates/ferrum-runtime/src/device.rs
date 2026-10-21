@@ -284,6 +284,19 @@ pub(crate) fn deferred_device_cleanup_status(
         .unwrap_or_else(empty_deferred_device_cleanup_status)
 }
 
+pub(crate) fn try_deferred_device_cleanup_status(
+    domain_id: DeferredDeviceCleanupDomainId,
+) -> Option<DeferredDeviceCleanupStatus> {
+    let registry = deferred_device_cleanup_registry().try_lock().ok()?;
+    Some(
+        registry
+            .domains
+            .get(&domain_id)
+            .map(deferred_device_cleanup_domain_status)
+            .unwrap_or_else(empty_deferred_device_cleanup_status),
+    )
+}
+
 pub(crate) fn maintain_deferred_device_cleanups(
     domain_id: DeferredDeviceCleanupDomainId,
     maximum_tasks: usize,

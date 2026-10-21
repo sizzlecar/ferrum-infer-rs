@@ -299,6 +299,7 @@ pub struct TimePlanningRound {
     pub(crate) capacity_initial_new_sequences: Option<usize>,
     request_clocks: Option<Vec<(RequestId, RequestClockFacts)>>,
     capacity: Option<PlanningCapacity>,
+    resident_capacity: Option<ferrum_execution::model_executor::ResidentCohortCapacitySnapshot>,
 }
 
 impl TimePlanningRound {
@@ -335,6 +336,7 @@ impl TimePlanningRound {
             capacity_initial_new_sequences: None,
             request_clocks: None,
             capacity: None,
+            resident_capacity: None,
         }
     }
 
@@ -346,6 +348,11 @@ impl TimePlanningRound {
         self.config.planning.max_participants
     }
 
+    /// Include owner fact/resource projection in the same comparison budget.
+    pub fn charge_projection_time(&mut self, elapsed: Duration) {
+        self.prediction_elapsed = self.prediction_elapsed.saturating_add(elapsed);
+    }
+
     /// Invalidate a previous cohort before attempting a fresh bounded capture.
     /// A missing member or failed projection must not leave old facts usable.
     /// The immutable predictor and the round's consumed budgets are unchanged.
@@ -354,6 +361,7 @@ impl TimePlanningRound {
         self.admission_gate = None;
         self.request_clocks = None;
         self.request_fact_bytes = 0;
+        self.resident_capacity = None;
     }
     /// Freeze the complete request cohort. Missing, duplicate or over-budget
     /// members invalidate the whole projection rather than authorizing a prefix.
@@ -445,6 +453,7 @@ impl TimePlanningRound {
     pub fn set_capacity(&mut self, capacity: Option<PlanningCapacity>) {
         self.admission_gate = None;
         self.capacity_initial_new_sequences = None;
+        self.resident_capacity = None;
         self.capacity = capacity.filter(|value| {
             value.block_size > 0
                 && value.total_blocks > 0
@@ -454,6 +463,28 @@ impl TimePlanningRound {
 
     pub fn capacity(&self) -> Option<PlanningCapacity> {
         self.capacity
+    }
+
+    /// Bind an executor's complete resident-cohort proof to these exact facts.
+    /// This cannot authorize new admission and is invalidated on recapture.
+    pub fn set_resident_capacity(
+        &mut self,
+        capacity: Option<ferrum_execution::model_executor::ResidentCohortCapacitySnapshot>,
+    ) {
+        self.admission_gate = None;
+        self.resident_capacity = capacity.filter(|proof| {
+            self.request_facts.as_ref().is_some_and(|facts| {
+                !facts.is_empty()
+                    && proof.participants == facts.len()
+                    && proof.max_batch_sequences >= facts.len()
+            })
+        });
+    }
+
+    pub(crate) fn resident_capacity(
+        &self,
+    ) -> Option<ferrum_execution::model_executor::ResidentCohortCapacitySnapshot> {
+        self.resident_capacity
     }
 
     pub fn stopping_forecast(&mut self, query: &StoppingQuery<'_>) -> StoppingForecast {

@@ -2255,6 +2255,16 @@ impl LogicalAdmissionCoordinator {
         }
     }
 
+    /// Read-only planning observation. Contended or poisoned mutexes remain
+    /// unknown; this path neither waits nor repairs coordinator state.
+    pub(crate) fn try_snapshot(&self) -> Option<CapacitySnapshot> {
+        self.inner
+            .state
+            .try_lock()
+            .ok()
+            .map(|state| state.snapshot(self.id()))
+    }
+
     pub fn epochs(&self) -> Result<CapacityEpochs, VNextError> {
         let state = self.inner.lock_state()?;
         if state.poisoned {
@@ -3193,6 +3203,18 @@ mod tests {
             maximum_active_sequences,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn resident_capacity_snapshot_is_unknown_while_coordinator_is_busy() {
+        let coordinator = coordinator(2);
+        let state = coordinator.inner.state.lock().unwrap();
+        assert!(coordinator.try_snapshot().is_none());
+        drop(state);
+        assert_eq!(
+            coordinator.try_snapshot(),
+            Some(coordinator.snapshot().unwrap())
+        );
     }
 
     fn wait_for_domains(

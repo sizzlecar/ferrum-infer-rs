@@ -789,6 +789,19 @@ where
         deferred_device_cleanup_status(self.deferred_cleanup_domain)
     }
 
+    /// Nonblocking equivalent for read-only planning. Mutation and admission
+    /// continue to use the diagnostic lifecycle check above.
+    pub(super) fn try_read_lifecycle(&self) -> Option<RwLockReadGuard<'_, ()>> {
+        let lifecycle = self.lifecycle.try_read().ok()?;
+        if self.phase.load(Ordering::Acquire) != PLAN_RUNTIME_OPEN
+            || crate::device::try_deferred_device_cleanup_status(self.deferred_cleanup_domain)?
+                .is_saturated()
+        {
+            return None;
+        }
+        Some(lifecycle)
+    }
+
     pub fn create_execution_lane(
         &self,
     ) -> Result<Arc<ExecutionLane<R>>, ExecutionLaneCreationError<R::Error>> {

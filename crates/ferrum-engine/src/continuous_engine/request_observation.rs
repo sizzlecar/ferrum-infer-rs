@@ -128,6 +128,16 @@ impl EngineInner {
         round: &mut TimePlanningRound,
         max_members: usize,
     ) {
+        let started = Instant::now();
+        self.capture_current_planning_request_facts(round, max_members);
+        round.charge_projection_time(started.elapsed());
+    }
+
+    fn capture_current_planning_request_facts(
+        &self,
+        round: &mut TimePlanningRound,
+        max_members: usize,
+    ) {
         use ferrum_scheduler::cost_prediction::{PlanningCapacity, RequestClockFacts};
         round.clear_request_facts();
         round.set_capacity(self.model_executor.paged_admission_capacity_snapshot().map(
@@ -143,6 +153,7 @@ impl EngineInner {
         };
         let mut facts = Vec::with_capacity(handles.len());
         let mut clocks = Vec::with_capacity(handles.len());
+        let mut residents = Vec::with_capacity(handles.len());
         for handle in handles {
             let state = handle.lock();
             let Some(sequence) = state
@@ -154,6 +165,20 @@ impl EngineInner {
             let Some(fact) = &sequence.stopping_observation else {
                 return;
             };
+            if sequence.execution_close.is_none() && sequence.pending_token_admission.is_none() {
+                if let Some((frontier, through_tokens)) = sequence
+                    .execution_frontier
+                    .as_ref()
+                    .zip(sequence.input_tokens.len().checked_add(fact.cap))
+                {
+                    residents.push(
+                        ferrum_execution::model_executor::ResidentSequenceCapacityRequest {
+                            sequence: frontier.sequence().clone(),
+                            through_tokens,
+                        },
+                    );
+                }
+            }
             let clock = if let Some(sender) = &sequence.stream_sender {
                 let Some(clock) = sender.text_clock_snapshot(sequence.generated_tokens.len())
                 else {
@@ -182,7 +207,19 @@ impl EngineInner {
             clocks.push((handle.request_id().clone(), clock));
         }
         if round.set_request_facts(facts) {
-            round.set_request_clocks(clocks);
+            if round.set_request_clocks(clocks)
+                && round
+                    .request_facts()
+                    .is_some_and(|facts| residents.len() == facts.len())
+            {
+                // Query after releasing every sequence lock. The executor
+                // proves actual ownership/growth for these exact incarnations;
+                // a configured maximum or generic free byte count is insufficient.
+                round.set_resident_capacity(
+                    self.model_executor
+                        .resident_cohort_capacity_snapshot(&residents),
+                );
+            }
         }
     }
 

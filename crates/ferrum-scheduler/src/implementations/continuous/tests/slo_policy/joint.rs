@@ -278,6 +278,54 @@ fn joint_dispatch_keeps_static_when_stopping_completion_or_capacity_is_unknown()
 }
 
 #[test]
+fn joint_dispatch_uses_complete_resident_proof_without_inventing_free_kv_blocks() {
+    use ferrum_execution::model_executor::ResidentCohortCapacitySnapshot;
+    for (participants, width, recapture, expected_tokens) in [
+        (2, 2, false, 4),
+        (1, 2, false, 8),
+        (2, 1, false, 8),
+        (2, 2, true, 8),
+    ] {
+        let (scheduler, mut round, prefill, decoder, now) =
+            fixture(CostExecution::SequentialPrefillThenDecode, true, true);
+        round.set_capacity(None);
+        round.set_resident_capacity(Some(ResidentCohortCapacitySnapshot {
+            participants,
+            max_batch_sequences: width,
+        }));
+        if recapture {
+            let facts = round.request_facts().unwrap().to_vec();
+            let clocks = round.request_clocks().unwrap().to_vec();
+            assert!(round.set_request_facts(facts));
+            assert!(round.set_request_clocks(clocks));
+        }
+        let batch = next(&scheduler, &mut round, now);
+        assert_eq!(tokens(&batch, &prefill), expected_tokens);
+        assert_eq!(tokens(&batch, &decoder), 1);
+        assert_eq!(
+            round.statistics.joint_interventions,
+            u64::from(expected_tokens == 4)
+        );
+    }
+}
+
+#[test]
+fn resident_capacity_cannot_authorize_waiting_admission() {
+    let (scheduler, mut round, now) = waiting_fixture(2, 1, 25.0);
+    round.set_capacity(None);
+    round.set_resident_capacity(Some(
+        ferrum_execution::model_executor::ResidentCohortCapacitySnapshot {
+            participants: 2,
+            max_batch_sequences: 2,
+        },
+    ));
+    assert!(matches!(
+        scheduler.evaluate_joint_admission(&hint(), &mut round, now),
+        Err(crate::joint_policy::Unsupported::UnknownKvCapacity)
+    ));
+}
+
+#[test]
 fn joint_dispatch_preserves_nominal_static_budget_before_prompt_tail_projection() {
     let (scheduler, mut round, prefill, _, now) =
         fixture(CostExecution::SingleInvocation, true, true);

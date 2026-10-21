@@ -107,6 +107,25 @@ pub struct PagedAdmissionCapacitySnapshot {
     pub coverage: PagedAdmissionCoverage,
 }
 
+/// An exact live incarnation and the context ceiling to be considered. This
+/// query carries no admission or resource authority.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResidentSequenceCapacityRequest {
+    pub sequence: crate::token_execution::ExecutorSequence,
+    pub through_tokens: usize,
+}
+
+/// Point-in-time support for the complete supplied resident cohort. The owner
+/// accounts for already held request/recurrent/sequence state and all remaining
+/// persistent growth through each requested ceiling. No new admission, device
+/// growth, transient workspace, reservation, or execution success is promised.
+/// The caller must discard this observation when the cohort changes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResidentCohortCapacitySnapshot {
+    pub participants: usize,
+    pub max_batch_sequences: usize,
+}
+
 /// Token-validity mask for model-side greedy argmax.
 ///
 /// `valid_token_mask[id] != 0` means token `id` may be selected. Tokens at or
@@ -2392,6 +2411,16 @@ pub trait ModelExecutor: Send + Sync + 'static {
                 slots,
                 coverage: PagedAdmissionCoverage::Unknown,
             })
+    }
+
+    /// Observe persistent capacity for these exact resident incarnations. An
+    /// incomplete cohort, unsupported storage, contention, or unknown physical
+    /// ownership returns `None`. This does not authorize future admission.
+    fn resident_cohort_capacity_snapshot(
+        &self,
+        _cohort: &[ResidentSequenceCapacityRequest],
+    ) -> Option<ResidentCohortCapacitySnapshot> {
+        None
     }
 
     /// Get executor capabilities

@@ -24,6 +24,8 @@ mod state_transfer;
 pub(crate) use state_transfer::*;
 mod completed_boundary;
 pub(crate) use completed_boundary::*;
+mod resident_capacity;
+pub use resident_capacity::MAX_RESIDENT_CAPACITY_PARTICIPANTS;
 
 pub(super) fn sequence_dispatch_is_poisoned(gate: &AtomicU64) -> bool {
     gate.load(Ordering::Acquire) & SEQUENCE_DISPATCH_POISONED_BIT != 0

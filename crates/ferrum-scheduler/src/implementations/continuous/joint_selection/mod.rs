@@ -385,7 +385,7 @@ impl ContinuousBatchScheduler {
         {
             return Err(Unsupported::ParticipantBudget);
         }
-        let capacity = round.capacity().ok_or(Unsupported::UnknownKvCapacity)?;
+        let capacity = round.capacity();
         let mut blocks = 0usize;
         let mut horizon = 0usize;
         let mut requests = Vec::with_capacity(facts.len());
@@ -398,12 +398,20 @@ impl ContinuousBatchScheduler {
         if prefill.len() + decode.requests.len() + waiting.len() != facts.len() {
             return Err(Unsupported::InvalidState);
         }
+        let resident_proof = waiting.is_empty()
+            && round.resident_capacity().is_some_and(|proof| {
+                proof.participants == facts.len() && proof.max_batch_sequences >= facts.len()
+            });
+        if !resident_proof && capacity.is_none() {
+            return Err(Unsupported::UnknownKvCapacity);
+        }
         if !waiting.is_empty()
             && (self.config.max_running_requests > limit || waiting.has_capacity_deferrals())
         {
             return Err(Unsupported::WaitingResources);
         }
         if !waiting.is_empty() {
+            let capacity = capacity.ok_or(Unsupported::UnknownKvCapacity)?;
             // Capacity preceded physical admission. Preserve the whole initial
             // demand as members move to residency. Without an exact baseline,
             // conservatively charge every cohort member.
@@ -492,11 +500,14 @@ impl ContinuousBatchScheduler {
             let context_cap = prompt
                 .checked_add(fact.cap)
                 .ok_or(Unsupported::Arithmetic)?;
-            // Charge the entire prompt+cap again against genuinely free blocks:
-            // no guessed retained capacity, shared-prefix credit or early EOS.
-            blocks = blocks
-                .checked_add(context_cap.div_ceil(capacity.block_size))
-                .ok_or(Unsupported::Arithmetic)?;
+            if !resident_proof {
+                // Without exact complete-cohort ownership evidence, charge the
+                // entire prompt+cap again. No guessed retained or prefix credit.
+                let capacity = capacity.ok_or(Unsupported::UnknownKvCapacity)?;
+                blocks = blocks
+                    .checked_add(context_cap.div_ceil(capacity.block_size))
+                    .ok_or(Unsupported::Arithmetic)?;
+            }
             horizon = horizon
                 .checked_add(prompt.saturating_sub(prefilled))
                 .and_then(|value| value.checked_add(fact.cap - fact.generated_tokens))
@@ -542,7 +553,7 @@ impl ContinuousBatchScheduler {
                 }
             });
         }
-        if blocks > capacity.free_blocks {
+        if !resident_proof && capacity.is_none_or(|capacity| blocks > capacity.free_blocks) {
             return Err(Unsupported::UnknownKvCapacity);
         }
         if !batch.is_empty() && !round.cost_selection_is_exact(batch.len()) {

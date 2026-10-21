@@ -20,6 +20,9 @@ mod checkpoint_maintenance_tests;
 #[path = "capacity_pressure_tests.rs"]
 mod capacity_pressure_tests;
 
+#[path = "sequence/resident_capacity/tests.rs"]
+mod resident_capacity_tests;
+
 #[path = "pool_resident_reclaim_tests.rs"]
 mod pool_resident_reclaim_tests;
 
