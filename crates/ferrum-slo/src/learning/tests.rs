@@ -7,6 +7,9 @@ use ferrum_execution::{
 use ferrum_scheduler::cost_prediction::*;
 use ferrum_types::RequestId;
 
+#[path = "online_qualification_tests.rs"]
+mod online_qualification;
+
 fn config() -> LearningConfig {
     LearningConfig {
         training_samples: 4,

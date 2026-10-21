@@ -68,6 +68,16 @@ measured feature envelope, expired evidence and missing stopping/completion
 support remain unknown. Shared residual-rank scenarios are an empirical
 dependence assumption, not a coverage certificate.
 
+Between fits, a fresh eligible committed invocation may extend the current
+model's envelope to include its actually measured features, using the same
+qualification as the disjoint calibration suffix. Its label updates only the
+signed residual for the unchanged model revision; coefficients, scaling and
+model expiry stay fixed. Prior snapshots and pre-execution Unknown diagnostics
+remain unchanged. Qualification does not assert conditional coverage for every
+combination inside the envelope; calibration can still use a same-domain global
+fallback. Refitting rebuilds support from that fit's evidence and does not carry
+forward an old envelope automatically.
+
 Completion estimates select arrivals by original ingress age, from the configured
 maturity through the stopping evidence TTL (60 seconds by default), inclusively.
 The same bounds apply to successes, failures, active requests and missing facts.

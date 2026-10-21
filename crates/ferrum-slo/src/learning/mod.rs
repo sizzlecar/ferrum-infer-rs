@@ -133,6 +133,9 @@ impl LearningConfig {
             .ok_or_else(|| invalid("retained memory bound overflow"))?;
         let retained = per_domain
             .checked_mul(self.max_domains)
+            // The single worker can hold one temporary qualified model copy
+            // before publishing it with its accepted same-version residual.
+            .and_then(|n| n.checked_add(models))
             .and_then(|n| {
                 n.checked_add(
                     2 * 64 * 1024

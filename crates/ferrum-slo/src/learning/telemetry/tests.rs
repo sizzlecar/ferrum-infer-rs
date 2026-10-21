@@ -280,3 +280,49 @@ fn unknown_and_worker_delay_are_separate_from_error_samples_and_direct_producers
         (1, 7_000_000, 7_000_000)
     );
 }
+
+#[test]
+fn post_execution_feature_qualification_cannot_rewrite_a_frozen_unknown_ticket() {
+    for family in [ModelFamily::Physical, ModelFamily::Gbdt] {
+        let now = Instant::now();
+        let mut first = snapshot(family, 1, 0.01, 0.03, now);
+        let telemetry = Arc::new(Telemetry::new(family, 0.95));
+        let mut sample = summary(now, 40);
+        let participant = &mut sample.participants[0];
+        participant.requested = ExecutionRange::new(4, 1).unwrap();
+        participant.context_tokens = 5;
+        participant.outcome = AttemptParticipantOutcome::Completed {
+            work: ExecutedTokenWork::Decode { position: 4 },
+            frontier_committed: true,
+        };
+        let measured = WorkFeatures::extract(&[sample_work(participant)], 8).unwrap();
+        let (prediction, unknown) = freeze(&first, measured, now);
+        assert!(prediction.is_none());
+        assert_eq!(unknown, Some(CostUnknownReason::UnsupportedDomain));
+        let ticket = Completion {
+            target: Arc::new(Sink(true)),
+            telemetry: telemetry.clone(),
+            features: measured,
+            frozen_at: now,
+            prediction,
+            unknown,
+        };
+        let (qualified, _) = first.domains[0]
+            .model
+            .qualify_observed_copy(&first.identity, &measured)
+            .unwrap();
+        first.domains[0].model = Arc::new(qualified);
+        first.revision += 1;
+        assert!(freeze(&first, measured, sample.completed_at).0.is_some());
+        let (source, _) = Source::new(first.query, (*first.identity).clone(), vec![]);
+        source.install(first);
+        ticket.record_at(&sample, sample.completed_at);
+        let stats = telemetry.stats();
+        let d = &stats.domains[index(measured.domain())];
+        assert_eq!(
+            (d.eligible, d.unsupported, d.base_known, d.calibrated_known),
+            (1, 1, 0, 0)
+        );
+        assert_eq!(d.mismatched_or_noncausal, 0);
+    }
+}

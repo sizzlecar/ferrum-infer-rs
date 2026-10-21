@@ -388,14 +388,36 @@ impl FittedModel {
     /// unseen combination inside its box has calibrated conditional coverage.
     pub(crate) fn qualify_observed_features(
         &mut self,
+        identity: &ExecutionIdentity,
         features: &WorkFeatures,
     ) -> Result<BasePrediction, ModelError> {
-        if features.domain() != self.support.domain {
-            return Err(ModelError::UnsupportedDomain);
-        }
-        let base = self.predict_features(features)?;
+        let base = self.predict_observed_features(identity, features)?;
         self.support.include(features);
         Ok(base)
+    }
+
+    /// Copy only after a real observation has a valid fixed-model prediction.
+    /// Existing published snapshots keep their original support declaration.
+    pub(crate) fn qualify_observed_copy(
+        &self,
+        identity: &ExecutionIdentity,
+        features: &WorkFeatures,
+    ) -> Result<(Self, BasePrediction), ModelError> {
+        let base = self.predict_observed_features(identity, features)?;
+        let mut qualified = self.clone();
+        qualified.support.include(features);
+        Ok((qualified, base))
+    }
+
+    fn predict_observed_features(
+        &self,
+        identity: &ExecutionIdentity,
+        features: &WorkFeatures,
+    ) -> Result<BasePrediction, ModelError> {
+        if identity != &self.identity || features.domain() != self.support.domain {
+            return Err(ModelError::UnsupportedDomain);
+        }
+        self.predict_features(features)
     }
 
     fn predict_features(&self, features: &WorkFeatures) -> Result<BasePrediction, ModelError> {

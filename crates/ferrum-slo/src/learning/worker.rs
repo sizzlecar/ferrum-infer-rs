@@ -196,16 +196,52 @@ impl Learner {
                     .calibration_after
                     .is_none_or(|cutoff| completed_at >= cutoff)
             {
-                if let Ok(base) = active.model.predict(&self.identity, &sample.features) {
-                    predicted = true;
-                    changed = active.calibration.observe(
-                        active.model_revision,
-                        key,
-                        self.config.bucket(sample.features.work_tokens()),
-                        sample.service_seconds,
-                        base.risk_base_seconds,
-                        completed_at,
-                    );
+                match active.model.predict(&self.identity, &sample.features) {
+                    Ok(base) => {
+                        predicted = true;
+                        changed = active.calibration.observe(
+                            active.model_revision,
+                            key,
+                            self.config.bucket(sample.features.work_tokens()),
+                            sample.service_seconds,
+                            base.risk_base_seconds,
+                            completed_at,
+                        );
+                    }
+                    Err(ModelError::UnsupportedDomain)
+                        if now < active.model_expires_at
+                            && now.checked_duration_since(completed_at).is_some_and(|age| {
+                                age < Duration::from_millis(self.config.calibration_ttl_ms)
+                            })
+                            && sample.service_seconds.is_finite()
+                            && sample.service_seconds > 0.0 =>
+                    {
+                        // Match the disjoint calibration suffix: a verified
+                        // execution may qualify its measured features without
+                        // changing coefficients, scaling, or model freshness.
+                        // Validation precedes the bounded copy. Publish it only
+                        // with an accepted residual from this same risk head.
+                        if let Ok((qualified, base)) = active
+                            .model
+                            .qualify_observed_copy(&self.identity, &sample.features)
+                        {
+                            changed = active.calibration.observe(
+                                active.model_revision,
+                                key,
+                                self.config.bucket(sample.features.work_tokens()),
+                                sample.service_seconds,
+                                base.risk_base_seconds,
+                                completed_at,
+                            );
+                            if changed {
+                                active.model = Arc::new(qualified);
+                            }
+                        }
+                        // The previous published envelope was still Unknown.
+                        // Do not retrospectively count this as a known worker
+                        // prediction or alter the pre-execution frozen ticket.
+                    }
+                    Err(_) => {}
                 }
             }
         }
@@ -368,7 +404,8 @@ fn fit(
         }
         // The suffix supplies out-of-fit residuals. Feature qualification does
         // not inspect its labels or change fitted coefficients/tree selection.
-        let Ok(base) = model.qualify_observed_features(&observation.sample.features) else {
+        let Ok(base) = model.qualify_observed_features(identity, &observation.sample.features)
+        else {
             continue;
         };
         calibration.observe(
