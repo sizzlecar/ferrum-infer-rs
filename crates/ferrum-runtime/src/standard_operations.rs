@@ -12,6 +12,8 @@ mod q6_mmq_f32;
 pub use q6_mmq_f32::*;
 mod layer_norm_bf16;
 pub use layer_norm_bf16::*;
+mod head_rms_norm_bf16;
+pub use head_rms_norm_bf16::*;
 mod pointwise_bf16;
 pub use pointwise_bf16::*;
 mod transcendental_bf16;

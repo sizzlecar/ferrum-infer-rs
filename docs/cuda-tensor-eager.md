@@ -2,8 +2,9 @@
 
 `CudaDeviceRuntime::new_tensor_eager(CudaTensorRuntimeConfig)` is the first
 bounded CUDA execution path for fixed tensor components. Its providers implement
-BF16 SiLU, SiLU-mul, tanh, modulation scale, gated residual, and BF16 Dense
-with FP32 accumulation. Full image generation is still in development.
+BF16 SiLU, SiLU-mul, tanh, modulation scale, gated residual, LayerNorm,
+head-wise RMSNorm, and BF16 Dense with FP32 accumulation. Full image generation
+is still in development.
 
 The path uses the ordinary program compiler, `PlanRuntimeResources`, and
 `PreparedTensorExecutor`. SiLU uses `ModelWeights::None`; Dense can bind stored
@@ -30,10 +31,23 @@ bootstrap authority; encoded commands retain the same owner. Commands, streams,
 fences and quarantine retain allocations and transfer owners until retirement.
 Unknown native creation or abandoned in-flight work conservatively retains
 reservations. This can require process restart after an unrecoverable error.
-The pointwise factory loads five functions once and shares the module owner
-between their providers. SiLU-mul rounds SiLU to BF16 before multiplication;
+The pointwise factory returns five providers sharing one module owner.
+SiLU-mul rounds SiLU to BF16 before multiplication;
 modulation rounds `1 + scale`, and gated residual rounds `gate * update`, before
 their final operation. Each operation has its own CUDA numerical profile.
+The complete `cuda_vnext_tensor_bf16_providers` factory also returns LayerNorm
+and head-wise RMSNorm. All seven functions share that same module and permit;
+the older pointwise factory still returns only its five providers.
+
+CUDA normalization currently accepts power-of-two widths up to 4096. Both
+providers check this during planning and encoding. They use a bounded
+adjacent-pair FP32 reduction, explicit square root and reciprocal division, and
+at most 16 KiB of dynamic CTA shared memory plus scalar shared storage. They
+allocate no global scratch. LayerNorm computes population variance in two
+passes without affine parameters. Head RMSNorm preserves its BF16 normalized
+boundary before multiplying the shared gamma vector; see
+[the operation contract](bf16-head-rms-norm.md). Their numerical profiles are
+independent of deployment kernels using `rsqrt` or another reduction order.
 
 Managed upload retains the original `ManagedHostBytes` through submission. It
 does not copy payloads into the token upload packet or a cached executable.

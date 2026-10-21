@@ -91,7 +91,10 @@ pub use tensor_dense_bf16::{
 pub use tensor_silu::{
     BUNDLE_NUMERICAL_IDENTITY as CUDA_POINTWISE_BF16_NUMERICAL_PROFILE_IDENTITY,
     GATED_RESIDUAL_NUMERICAL_PROFILE_ID as CUDA_GATED_RESIDUAL_BF16_NUMERICAL_PROFILE_ID,
+    HEAD_RMS_NORM_PROFILE_ID as CUDA_HEAD_RMS_NORM_BF16_NUMERICAL_PROFILE_ID,
+    LAYER_NORM_PROFILE_ID as CUDA_LAYER_NORM_BF16_NUMERICAL_PROFILE_ID,
     MODULATION_NUMERICAL_PROFILE_ID as CUDA_MODULATION_SCALE_BF16_NUMERICAL_PROFILE_ID,
+    NORM_NUMERICAL_IDENTITY as CUDA_NORMALIZATION_BF16_NUMERICAL_PROFILE_IDENTITY,
     NUMERICAL_PROFILE_ID as CUDA_SILU_BF16_NUMERICAL_PROFILE_ID,
     NUMERICAL_PROFILE_IDENTITY as CUDA_SILU_BF16_NUMERICAL_PROFILE_IDENTITY,
     SILU_MUL_NUMERICAL_PROFILE_ID as CUDA_SILU_MUL_BF16_NUMERICAL_PROFILE_ID,
@@ -345,6 +348,8 @@ pub fn cuda_tensor_runtime_config(
         CapabilityId::new(ferrum_runtime::MODULATION_SCALE_BF16_CAPABILITY_ID)?,
         CapabilityId::new(ferrum_runtime::GATED_RESIDUAL_BF16_CAPABILITY_ID)?,
         CapabilityId::new(ferrum_runtime::DENSE_LINEAR_BF16_CAPABILITY_ID)?,
+        CapabilityId::new(ferrum_runtime::LAYER_NORM_BF16_CAPABILITY_ID)?,
+        CapabilityId::new(ferrum_runtime::HEAD_RMS_NORM_BF16_CAPABILITY_ID)?,
     ]);
     config.dynamic_storage_profiles = BTreeSet::from([DynamicStorageProfile::new(
         DynamicStorageAllocator::LinearArena,
@@ -373,6 +378,18 @@ pub fn cuda_vnext_tensor_pointwise_providers(
     runtime: &CudaDeviceRuntime,
 ) -> Result<Vec<Box<dyn OperationProvider<CudaDeviceRuntime>>>, CudaDeviceRuntimeError> {
     tensor_silu::providers(runtime)
+}
+
+/// Builds five BF16 pointwise and two normalization providers sharing one
+/// native module/capacity permit. Register all seven corresponding contracts.
+/// LayerNorm and HeadRmsNorm support power-of-two reduction widths <=4096;
+/// their estimators reject unsupported geometry before execution. No global
+/// normalization workspace is allocated. Do not combine this factory with
+/// another module-bundle factory on the same runtime.
+pub fn cuda_vnext_tensor_bf16_providers(
+    runtime: &CudaDeviceRuntime,
+) -> Result<Vec<Box<dyn OperationProvider<CudaDeviceRuntime>>>, CudaDeviceRuntimeError> {
+    tensor_silu::component_providers(runtime)
 }
 
 /// Source, precise build options, and compiled PTX identity. This identifies

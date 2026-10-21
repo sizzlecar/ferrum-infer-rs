@@ -12,6 +12,7 @@ pub(super) struct RetainedFunctions {
     // Every CudaFunction retains the same native module/context. Field order
     // releases these owners before returning the one module capacity permit.
     functions: [CudaFunction; 5],
+    norm_functions: [CudaFunction; 2],
     _provider: CudaTensorProviderRetention,
 }
 
@@ -30,15 +31,25 @@ impl RetainedFunctions {
                     CudaDeviceRuntimeError::driver("BF16 pointwise function load", error)
                 })
             };
-            Ok::<_, CudaDeviceRuntimeError>([
+            let pointwise = [
                 load(Kind::Silu)?,
                 load(Kind::SiluMul)?,
                 load(Kind::Tanh)?,
                 load(Kind::Modulation)?,
                 load(Kind::GatedResidual)?,
-            ])
+            ];
+            let load_norm = |kind: norm::Kind| {
+                module.load_function(kind.function()).map_err(|error| {
+                    CudaDeviceRuntimeError::driver("BF16 normalization function load", error)
+                })
+            };
+            let normalization = [
+                load_norm(norm::Kind::Layer)?,
+                load_norm(norm::Kind::HeadRms)?,
+            ];
+            Ok::<_, CudaDeviceRuntimeError>((pointwise, normalization))
         }));
-        let functions = match loaded {
+        let (functions, norm_functions) = match loaded {
             Ok(Ok(functions)) => functions,
             Ok(Err(error)) => {
                 // A partially failed load has not certified native cleanup.
@@ -52,11 +63,16 @@ impl RetainedFunctions {
         };
         Ok(Arc::new(Self {
             functions,
+            norm_functions,
             _provider: provider,
         }))
     }
 
     pub(super) fn function(&self, kind: Kind) -> &CudaFunction {
         &self.functions[kind.index()]
+    }
+
+    pub(super) fn norm_function(&self, kind: norm::Kind) -> &CudaFunction {
+        &self.norm_functions[kind.index()]
     }
 }

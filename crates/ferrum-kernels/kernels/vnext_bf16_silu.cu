@@ -113,3 +113,89 @@ extern "C" __global__ void ferrum_vnext_tanh_probe(
         output[index] = __float_as_uint(ferrum_tanh(ferrum_bf16_decode(input[index])));
     }
 }
+
+// Power-of-two adjacent-pair tree. Each stage writes only the left endpoint
+// of a disjoint subtree, so no thread overwrites another thread's input.
+// The provider validates 1 <= width <= 4096 and launch shared bytes=4*width.
+__device__ __forceinline__ void ferrum_norm_pairwise(float* values, uint32_t width) {
+    for (uint32_t stride = 1; stride < width; stride *= 2) {
+        for (uint32_t left = threadIdx.x * (2 * stride); left < width;
+             left += blockDim.x * (2 * stride)) {
+            values[left] = __fadd_rn(values[left], values[left + stride]);
+        }
+        __syncthreads();
+    }
+}
+
+// Two-pass population LayerNorm, no affine weights. Shared memory is bounded
+// CTA storage (4*width dynamic bytes + two static scalars), not a global
+// workspace. Nonfinite data follows IEEE arithmetic; preflight is structural.
+extern "C" __global__ void ferrum_vnext_layer_norm_bf16(
+    const uint16_t* input, uint16_t* output,
+    uint64_t rows, uint32_t width, float epsilon) {
+    extern __shared__ float values[];
+    __shared__ float mean;
+    __shared__ float inverse;
+    for (uint64_t row = blockIdx.x; row < rows; row += gridDim.x) {
+        const uint64_t start = row * width;
+        for (uint32_t column = threadIdx.x; column < width; column += blockDim.x) {
+            values[column] = ferrum_bf16_decode(input[start + column]);
+        }
+        __syncthreads();
+        ferrum_norm_pairwise(values, width);
+        if (threadIdx.x == 0) {
+            mean = __fdiv_rn(values[0], static_cast<float>(width));
+        }
+        __syncthreads();
+        for (uint32_t column = threadIdx.x; column < width; column += blockDim.x) {
+            const float centered = __fsub_rn(ferrum_bf16_decode(input[start + column]), mean);
+            values[column] = __fmul_rn(centered, centered);
+        }
+        __syncthreads();
+        ferrum_norm_pairwise(values, width);
+        if (threadIdx.x == 0) {
+            const float variance = __fdiv_rn(values[0], static_cast<float>(width));
+            const float root = __fsqrt_rn(__fadd_rn(variance, epsilon));
+            inverse = __fdiv_rn(1.0f, root);
+        }
+        __syncthreads();
+        for (uint32_t column = threadIdx.x; column < width; column += blockDim.x) {
+            const float centered = __fsub_rn(ferrum_bf16_decode(input[start + column]), mean);
+            output[start + column] = ferrum_bf16_rne(__fmul_rn(centered, inverse));
+        }
+        // All readers finish before a block reuses shared storage for its next row.
+        __syncthreads();
+    }
+}
+
+// Contiguous [rows, columns] is divided into adjacent heads of width D.
+// gamma[D] is shared across heads, and the normalized BF16 boundary precedes
+// the affine multiplication. This is not zero-centered RMSNorm or RoPE.
+extern "C" __global__ void ferrum_vnext_head_rms_norm_bf16(
+    const uint16_t* input, const uint16_t* gamma, uint16_t* output,
+    uint64_t groups, uint32_t width, float epsilon) {
+    extern __shared__ float values[];
+    __shared__ float inverse;
+    for (uint64_t group = blockIdx.x; group < groups; group += gridDim.x) {
+        const uint64_t start = group * width;
+        for (uint32_t column = threadIdx.x; column < width; column += blockDim.x) {
+            const float value = ferrum_bf16_decode(input[start + column]);
+            values[column] = __fmul_rn(value, value);
+        }
+        __syncthreads();
+        ferrum_norm_pairwise(values, width);
+        if (threadIdx.x == 0) {
+            const float mean_square = __fdiv_rn(values[0], static_cast<float>(width));
+            const float root = __fsqrt_rn(__fadd_rn(mean_square, epsilon));
+            inverse = __fdiv_rn(1.0f, root);
+        }
+        __syncthreads();
+        for (uint32_t column = threadIdx.x; column < width; column += blockDim.x) {
+            const uint16_t normalized = ferrum_bf16_rne(__fmul_rn(
+                ferrum_bf16_decode(input[start + column]), inverse));
+            output[start + column] = ferrum_bf16_rne(__fmul_rn(
+                ferrum_bf16_decode(normalized), ferrum_bf16_decode(gamma[column])));
+        }
+        __syncthreads();
+    }
+}

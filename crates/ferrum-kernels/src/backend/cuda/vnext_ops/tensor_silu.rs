@@ -32,8 +32,12 @@ use super::{binding, contract_error, implementation_fingerprint, provider_failur
 
 mod bundle;
 mod geometry;
+mod norm;
 use bundle::RetainedFunctions;
 use geometry::{geometry, Shape};
+pub use norm::{
+    HEAD_RMS_NORM_PROFILE_ID, LAYER_NORM_PROFILE_ID, NUMERICAL_IDENTITY as NORM_NUMERICAL_IDENTITY,
+};
 
 pub const NUMERICAL_PROFILE_ID: &str = "cuda.libdevice.precise.silu.bf16.v1";
 pub const SILU_MUL_NUMERICAL_PROFILE_ID: &str = "cuda.libdevice.precise.silu_mul.bf16.v1";
@@ -173,6 +177,8 @@ pub(super) fn numerical_fingerprint() -> String {
         include_bytes!("tensor_silu.rs"),
         include_bytes!("tensor_silu/bundle.rs"),
         include_bytes!("tensor_silu/geometry.rs"),
+        include_bytes!("tensor_silu/norm.rs"),
+        norm::NUMERICAL_IDENTITY.as_bytes(),
         include_bytes!(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/kernels/vnext_bf16_silu.cu"
@@ -249,12 +255,30 @@ impl CudaTensorPointwiseProvider {
 pub(super) fn providers(
     runtime: &CudaDeviceRuntime,
 ) -> Result<Vec<Box<dyn OperationProvider<CudaDeviceRuntime>>>, CudaDeviceRuntimeError> {
+    assemble_providers(runtime, false)
+}
+
+pub(super) fn component_providers(
+    runtime: &CudaDeviceRuntime,
+) -> Result<Vec<Box<dyn OperationProvider<CudaDeviceRuntime>>>, CudaDeviceRuntimeError> {
+    assemble_providers(runtime, true)
+}
+
+fn assemble_providers(
+    runtime: &CudaDeviceRuntime,
+    with_normalization: bool,
+) -> Result<Vec<Box<dyn OperationProvider<CudaDeviceRuntime>>>, CudaDeviceRuntimeError> {
     let descriptors = Kind::ALL
         .into_iter()
         .map(|kind| descriptor(runtime.descriptor(), kind).map(|descriptor| (kind, descriptor)))
         .collect::<Result<Vec<_>, _>>()?;
+    let norm_descriptors = if with_normalization {
+        norm::descriptors(runtime.descriptor())?
+    } else {
+        Vec::new()
+    };
     let kernels = RetainedFunctions::load(runtime)?;
-    Ok(descriptors
+    let mut providers = descriptors
         .into_iter()
         .map(|(kind, descriptor)| {
             Box::new(CudaTensorPointwiseProvider {
@@ -263,7 +287,9 @@ pub(super) fn providers(
                 kernels: Arc::clone(&kernels),
             }) as Box<dyn OperationProvider<CudaDeviceRuntime>>
         })
-        .collect())
+        .collect::<Vec<_>>();
+    providers.extend(norm::providers(norm_descriptors, &kernels));
+    Ok(providers)
 }
 
 impl OperationResourceEstimator for CudaTensorPointwiseProvider {

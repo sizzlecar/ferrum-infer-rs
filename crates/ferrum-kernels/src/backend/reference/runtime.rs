@@ -18,6 +18,8 @@ use half::{bf16, f16};
 
 mod layer_norm;
 pub(crate) use layer_norm::ReferenceLayerNormLaunch;
+mod head_rms_norm;
+pub(crate) use head_rms_norm::{ReferenceHeadRmsNormLaunch, ReferenceHeadRmsNormShape};
 mod pointwise;
 pub(crate) use pointwise::{
     ReferenceGatedResidualLaunch, ReferenceModulationScaleLaunch, ReferencePointwiseShape,
@@ -321,6 +323,9 @@ enum ReferenceCommandKind {
     LayerNorm {
         launch: ReferenceLayerNormLaunch,
     },
+    HeadRmsNorm {
+        launch: ReferenceHeadRmsNormLaunch,
+    },
     ModulationScale {
         launch: ReferenceModulationScaleLaunch,
     },
@@ -353,6 +358,7 @@ impl fmt::Debug for ReferenceDeviceCommand {
             ReferenceCommandKind::Zero { .. } => "zero",
             ReferenceCommandKind::DenseLinear { .. } => "dense_linear",
             ReferenceCommandKind::LayerNorm { .. } => "layer_norm",
+            ReferenceCommandKind::HeadRmsNorm { .. } => "head_rms_norm",
             ReferenceCommandKind::ModulationScale { .. } => "modulation_scale",
             ReferenceCommandKind::GatedResidual { .. } => "gated_residual",
             ReferenceCommandKind::UnaryActivation { launch: ref unary } => match unary.kind {
@@ -439,6 +445,19 @@ impl ReferenceDeviceCommand {
             kind: ReferenceCommandKind::DenseLinear {
                 launches: vec![launch].into_boxed_slice(),
             },
+        })
+    }
+
+    pub(crate) fn head_rms_norm_tensor(
+        launch: ReferenceHeadRmsNormLaunch,
+    ) -> Result<Self, ReferenceDeviceRuntimeError> {
+        launch.validate()?;
+        Ok(Self {
+            operation: "vnext_head_rms_norm_bf16",
+            logical_work: Some(launch.shape.logical_work()?),
+            compute_dispatch_count: 1,
+            transfer_command_count: 0,
+            kind: ReferenceCommandKind::HeadRmsNorm { launch },
         })
     }
 
@@ -627,6 +646,9 @@ impl ReferenceDeviceCommand {
                 }
                 Ok(())
             }
+            ReferenceCommandKind::HeadRmsNorm { launch } => {
+                launch.validate_runtime(runtime_instance)
+            }
             ReferenceCommandKind::LayerNorm { launch } => {
                 launch.input.validate_runtime(runtime_instance)?;
                 launch.output.validate_runtime(runtime_instance)?;
@@ -685,6 +707,12 @@ impl ReferenceDeviceCommand {
             ReferenceCommandKind::LayerNorm { launch } => {
                 layer_norm::execute(launch);
                 counters.layer_norm_launches.fetch_add(1, Ordering::Relaxed);
+            }
+            ReferenceCommandKind::HeadRmsNorm { launch } => {
+                head_rms_norm::execute(launch);
+                counters
+                    .head_rms_norm_launches
+                    .fetch_add(1, Ordering::Relaxed);
             }
             ReferenceCommandKind::ModulationScale { launch } => {
                 pointwise::execute_modulation(launch);
@@ -875,6 +903,7 @@ struct ReferenceRuntimeCounters {
     uploaded_bytes: AtomicU64,
     dense_linear_launches: AtomicU64,
     layer_norm_launches: AtomicU64,
+    head_rms_norm_launches: AtomicU64,
     modulation_scale_launches: AtomicU64,
     gated_residual_launches: AtomicU64,
     silu_launches: AtomicU64,
@@ -892,6 +921,7 @@ pub struct ReferenceDeviceRuntimeSnapshot {
     pub uploaded_bytes: u64,
     pub dense_linear_launches: u64,
     pub layer_norm_launches: u64,
+    pub head_rms_norm_launches: u64,
     pub modulation_scale_launches: u64,
     pub gated_residual_launches: u64,
     pub silu_launches: u64,
@@ -1019,6 +1049,7 @@ impl ReferenceDeviceRuntime {
             uploaded_bytes: self.counters.uploaded_bytes.load(Ordering::Relaxed),
             dense_linear_launches: self.counters.dense_linear_launches.load(Ordering::Relaxed),
             layer_norm_launches: self.counters.layer_norm_launches.load(Ordering::Relaxed),
+            head_rms_norm_launches: self.counters.head_rms_norm_launches.load(Ordering::Relaxed),
             modulation_scale_launches: self
                 .counters
                 .modulation_scale_launches

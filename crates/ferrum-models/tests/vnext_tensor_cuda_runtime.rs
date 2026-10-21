@@ -2,6 +2,9 @@
 //! Run explicitly under an exclusive GPU window. This is not image-model parity.
 #![cfg(feature = "cuda")]
 
+#[path = "vnext_tensor_cuda_runtime/normalization.rs"]
+mod normalization;
+
 use ferrum_execution::{PreparedTensorExecutor, TensorExecutorConfig};
 use ferrum_kernels::backend::cuda::{
     vnext_ops::{
