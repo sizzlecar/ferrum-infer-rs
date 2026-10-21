@@ -135,6 +135,67 @@ fn known_bad_wait_uses_original_ingress_and_then_rejects() {
 }
 
 #[test]
+fn zero_admission_allowance_still_consumes_wait_or_reject_eligibility() {
+    for policy in [
+        KnownInfeasibleAdmissionPolicy::Wait { max_wait_ms: 100 },
+        KnownInfeasibleAdmissionPolicy::Reject,
+    ] {
+        let (scheduler, mut round, id, ingress) = fixture();
+        round.config.joint.known_infeasible_admission = policy;
+        let waiting = matches!(policy, KnownInfeasibleAdmissionPolicy::Wait { .. });
+        let now = ingress + Duration::from_millis(50);
+        let mut scan = scheduler.begin_token_admission(0, None).unwrap();
+
+        // A closed scan still evaluates each original ticket's eligibility.
+        // It cannot yield an executor candidate, but Wait retains its wake
+        // deadline and Reject records the decision without removing the item.
+        assert!(scan
+            .next_at(&mut |_| {}, Some(&mut round), now)
+            .unwrap()
+            .is_none());
+        assert_eq!(round.statistics.joint_known_infeasible, 1);
+        assert_eq!(round.statistics.held_candidates, u64::from(waiting));
+        assert_eq!(round.statistics.rejected_candidates, u64::from(!waiting));
+        assert_eq!(round.time_blocked(), waiting);
+        assert_eq!(
+            round.retry_at(),
+            waiting.then_some(ingress + Duration::from_millis(100))
+        );
+
+        // The same scan does not reevaluate an already visited ticket.
+        assert!(scan
+            .next_at(&mut |_| {}, Some(&mut round), now)
+            .unwrap()
+            .is_none());
+        assert_eq!(round.statistics.joint_known_infeasible, 1);
+        let receipt = scan.finish().unwrap();
+        assert_eq!(receipt.probed(), 0);
+        assert_eq!(receipt.admitted(), 0);
+        assert_eq!(receipt.held(), usize::from(waiting));
+        assert_eq!(receipt.waiting_after(), 1);
+        assert_eq!(scheduler.waiting_count(), 1);
+        assert!(scheduler.admission_failed_requests.read().is_empty());
+
+        // Actual terminal rejection requires a later scan with authority to
+        // select the ticket. Wait expires against the original ingress clock.
+        let mut scan = scheduler.begin_token_admission(1, None).unwrap();
+        assert!(scan
+            .next_at(
+                &mut |_| {},
+                Some(&mut round),
+                ingress + Duration::from_millis(101),
+            )
+            .unwrap()
+            .is_none());
+        let receipt = scan.finish().unwrap();
+        assert_eq!(receipt.probed(), 1);
+        assert_eq!(receipt.admitted(), 0);
+        assert_eq!(receipt.waiting_after(), 0);
+        assert!(scheduler.admission_failed_requests.read().contains_key(&id));
+    }
+}
+
+#[test]
 fn changed_cohort_or_capacity_invalidates_frozen_verdict() {
     let (scheduler, mut round, id, now) = fixture();
     let replacement = scheduler
