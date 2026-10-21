@@ -121,6 +121,7 @@ async fn token_admission_later_publish_error_retires_earlier_real_faulted_fronti
     let (resume, resume_receiver) = oneshot::channel();
     let gate_observation = Arc::new(AdmissionObservation {
         closed: Mutex::new(Vec::new()),
+        ..Default::default()
     });
     let gate = AdmissionGate {
         inner,

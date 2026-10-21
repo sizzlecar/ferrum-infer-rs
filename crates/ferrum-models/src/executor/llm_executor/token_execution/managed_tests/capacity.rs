@@ -4,6 +4,45 @@
 
 use super::*;
 
+#[tokio::test]
+async fn physical_sequence_slots_inline_preserves_typed_shortfall_without_new_cache() {
+    let fixture = fixture(false, false, 8);
+    fixture.storage.lock().runtime_env.paged_max_seqs = 1;
+    let prompt = [TokenId(1), TokenId(2)];
+    let first = admit(&fixture.executor, &RequestId::new(), &prompt).await;
+    let waiting = RequestId::new();
+    let outcome = fixture
+        .executor
+        .admit_tokens(ExecutionAdmission {
+            context: ExecutorPrefillAdmission::for_startup(&waiting, &prompt, 32),
+            adapter: None,
+        })
+        .await
+        .unwrap();
+    assert!(matches!(
+        outcome,
+        TokenAdmissionOutcome::SequenceSlotsDeferred(_)
+    ));
+    assert_eq!(fixture.storage.lock().kv_caches.len(), 1);
+    assert_eq!(fixture.executor.token_sequences.lock().live.len(), 1);
+    assert!(
+        terminal(fixture.executor.cancel_tokens(first.sequence()).unwrap())
+            .await
+            .error
+            .is_none()
+    );
+    let replacement = admit(&fixture.executor, &waiting, &prompt).await;
+    assert!(terminal(
+        fixture
+            .executor
+            .cancel_tokens(replacement.sequence())
+            .unwrap()
+    )
+    .await
+    .error
+    .is_none());
+}
+
 struct CapacityModel {
     storage: Arc<Mutex<LlamaFamilyModel<CpuBackend>>>,
     numerical: Arc<Mutex<LlamaFamilyModel<CpuBackend>>>,

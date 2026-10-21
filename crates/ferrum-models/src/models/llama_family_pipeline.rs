@@ -1035,7 +1035,7 @@ where
         }
         for stage in &mut self.stages {
             let result = stage.reserve_token_kv_slots(requests)?;
-            if matches!(result, ModelKvReservation::CapacityDeferred(_)) {
+            if !matches!(result, ModelKvReservation::Reserved(_)) {
                 // This is the actual rejecting stage's allocator observation,
                 // not a fabricated aggregate pool. Earlier reservations stay
                 // with their stages until the caller closes the incarnation.
@@ -1062,7 +1062,7 @@ where
             // span. Preserve stage-owned KV without acquiring independent
             // shared-prefix spans per stage.
             let result = stage.prepare_pipeline_token_kv(request)?;
-            if matches!(result, ModelKvReservation::CapacityDeferred(_)) {
+            if !matches!(result, ModelKvReservation::Reserved(_)) {
                 // The rejecting stage supplies its actual allocator evidence.
                 // Earlier stage owners remain reachable for the same close.
                 return Ok(result);

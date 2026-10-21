@@ -2349,6 +2349,43 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         .into_legacy_result();
     }
 
+    /// Count actual cache owners under the original model lock. A cache that
+    /// is logically complete but awaiting device/graph retirement still lives
+    /// in `kv_caches`; configured batch width is not evidence of its release.
+    fn new_paged_sequence_slots(
+        &self,
+        required_slots: usize,
+    ) -> Result<Option<ferrum_execution::token_execution::TokenSequenceSlotDeferral>> {
+        if required_slots == 0
+            || !matches!(
+                selected_llama_kv_layout_for_dtype::<B, K>(
+                    &self.cfg,
+                    self.runtime_env.metal_paged_kv,
+                    self.source_layer_range(),
+                )?,
+                SelectedKvCacheLayout::Paged { .. }
+            )
+        {
+            return Ok(None);
+        }
+        let capacity = self.runtime_env.paged_max_seqs;
+        let occupied = self.kv_caches.len();
+        if capacity == 0 || occupied > capacity || required_slots > capacity {
+            return Err(ferrum_types::FerrumError::resource_exhausted(
+                "paged sequence metadata demand exceeds the configured physical slot capacity",
+            ));
+        }
+        if required_slots <= capacity - occupied {
+            return Ok(None);
+        }
+        ferrum_execution::token_execution::TokenSequenceSlotDeferral::new(
+            capacity,
+            occupied,
+            required_slots,
+        )
+        .map(Some)
+    }
+
     pub(in crate::models) fn ensure_kv_in_context(
         &mut self,
         ctx: &mut B::Context,
@@ -2357,6 +2394,15 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
     ) {
         if self.kv_caches.contains_key(cache_id) {
             return;
+        }
+        // Keep the invariant at the common construction point, including
+        // legacy and batched callers. Their existing frame boundary translates
+        // capacity errors into the ordinary error path. Typed admission checks
+        // before entering preparation and preserves a retryable slot deferral.
+        match self.new_paged_sequence_slots(1) {
+            Ok(None) => {}
+            Ok(Some(deferred)) => std::panic::panic_any(deferred.capacity_error()),
+            Err(error) => std::panic::panic_any(error),
         }
         let nkv = self.cfg.num_kv_heads;
         let hd = self.cfg.head_dim;
@@ -2658,6 +2704,9 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
                     deferred.snapshot().free_blocks,
                 )))
             }
+            crate::common::llm::ModelKvReservation::SequenceSlotsDeferred(deferred) => {
+                Err(deferred.capacity_error())
+            }
         }
     }
 
@@ -2720,6 +2769,13 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
             }
         }
 
+        let new_slots = targets
+            .iter()
+            .filter(|(cache_id, _, _)| !self.kv_caches.contains_key(cache_id))
+            .count();
+        if let Some(deferred) = self.new_paged_sequence_slots(new_slots)? {
+            return Ok(ModelKvReservation::SequenceSlotsDeferred(deferred));
+        }
         for (cache_id, _, _) in &targets {
             if !self.kv_caches.contains_key(cache_id) {
                 self.ensure_kv_in_context(
@@ -4486,6 +4542,9 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
             Ok(ModelKvReservation::Reserved(_)) => ModelTokenOutcome::Terminal(Ok(())),
             Ok(ModelKvReservation::CapacityDeferred(deferred)) => {
                 ModelTokenOutcome::CapacityDeferred(deferred)
+            }
+            Ok(ModelKvReservation::SequenceSlotsDeferred(deferred)) => {
+                ModelTokenOutcome::NotSubmitted(deferred.capacity_error())
             }
             Err(error) if self.pending_device_frame.is_some() => ModelTokenOutcome::Held(error),
             Err(error) => ModelTokenOutcome::NotSubmitted(error),

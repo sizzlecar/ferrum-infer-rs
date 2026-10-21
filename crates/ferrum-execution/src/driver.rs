@@ -5223,7 +5223,9 @@ impl<R: DeviceRuntime> ProgramExecutor<R> {
                         }
                     }
                 }
-                TokenAdmissionOutcome::Deferred(_) | TokenAdmissionOutcome::CapacityDeferred(_) => {
+                TokenAdmissionOutcome::Deferred(_)
+                | TokenAdmissionOutcome::CapacityDeferred(_)
+                | TokenAdmissionOutcome::SequenceSlotsDeferred(_) => {
                     resources.cancel_pending();
                     return Ok(None);
                 }

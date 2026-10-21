@@ -199,6 +199,10 @@ impl TokenWorkerState {
                 entry.closing = true;
                 Ok(TokenAdmissionOutcome::CapacityDeferred(deferred))
             }
+            Ok(ModelKvReservation::SequenceSlotsDeferred(deferred)) => {
+                entry.closing = true;
+                Ok(TokenAdmissionOutcome::SequenceSlotsDeferred(deferred))
+            }
             Ok(ModelKvReservation::Reserved(_)) => Err(FerrumError::request_validation(
                 "token admission was cancelled during preparation",
             )),

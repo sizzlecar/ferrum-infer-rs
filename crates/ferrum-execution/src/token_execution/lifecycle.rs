@@ -45,6 +45,10 @@ pub enum TokenAdmissionOutcome {
     /// Retry only after an actual physical release notification. This snapshot
     /// is diagnostic evidence, never a reservation or permission to execute.
     CapacityDeferred(TokenAdmissionCapacityDeferral),
+    /// Actual persistent sequence metadata slots are occupied, including
+    /// owners awaiting physical retirement. Uses the same confirmed-release
+    /// retry protocol as allocator capacity, without claiming a KV shortfall.
+    SequenceSlotsDeferred(TokenSequenceSlotDeferral),
     MaintenanceDeferred(ExecutorPrefillMaintenanceDeferral),
     PermanentRejected(ferrum_runtime::AdmissionRejected),
 }
@@ -58,6 +62,59 @@ pub struct TokenAdmissionCapacityDeferral {
     domain: AllocatorCapacityDomain,
     required_blocks: usize,
     snapshot: crate::model_executor::KvSlotCapacitySnapshot,
+}
+
+/// A physical sequence-slot shortfall observed by the original model owner.
+/// These are persistent cache owners, not logical scheduler queue members.
+/// Only actual retirement makes an occupied slot reusable. This observation
+/// neither reserves a slot nor promises that a future allocation will succeed.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct TokenSequenceSlotDeferral {
+    capacity_slots: usize,
+    occupied_slots: usize,
+    required_slots: usize,
+}
+
+impl TokenSequenceSlotDeferral {
+    pub fn new(
+        capacity_slots: usize,
+        occupied_slots: usize,
+        required_slots: usize,
+    ) -> Result<Self> {
+        if capacity_slots == 0
+            || occupied_slots > capacity_slots
+            || required_slots <= capacity_slots - occupied_slots
+            || required_slots > capacity_slots
+        {
+            return Err(invalid(
+                "sequence-slot deferral requires a satisfiable physical slot shortfall",
+            ));
+        }
+        Ok(Self {
+            capacity_slots,
+            occupied_slots,
+            required_slots,
+        })
+    }
+
+    pub fn capacity_slots(&self) -> usize {
+        self.capacity_slots
+    }
+    pub fn occupied_slots(&self) -> usize {
+        self.occupied_slots
+    }
+    pub fn required_slots(&self) -> usize {
+        self.required_slots
+    }
+
+    /// Legacy preparation APIs report an ordinary capacity error. The typed
+    /// admission path retains this deferral and waits for confirmed release.
+    pub fn capacity_error(&self) -> ferrum_types::FerrumError {
+        ferrum_types::FerrumError::resource_exhausted(format!(
+            "paged sequence metadata capacity: need {} slots, {} of {} physical slots occupied",
+            self.required_slots, self.occupied_slots, self.capacity_slots,
+        ))
+    }
 }
 
 /// Read-only, pressure-path observation of one physical allocator. Candidate
@@ -392,5 +449,19 @@ mod tests {
         // physical pool can be made runnable by waiting for another release.
         assert!(TokenAdmissionCapacityDeferral::new(domain.clone(), 2, snapshot.clone()).is_err());
         assert!(TokenAdmissionCapacityDeferral::new(domain, 9, snapshot).is_err());
+    }
+
+    #[test]
+    fn physical_sequence_slots_do_not_fabricate_kv_shortfalls() {
+        let deferred = TokenSequenceSlotDeferral::new(2, 2, 1).unwrap();
+        assert_eq!(deferred.capacity_slots(), 2);
+        assert_eq!(deferred.occupied_slots(), 2);
+        assert_eq!(deferred.required_slots(), 1);
+        assert!(TokenSequenceSlotDeferral::new(2, 1, 2).is_ok());
+        for (capacity, occupied, required) in
+            [(0, 0, 1), (2, 1, 1), (2, 2, 0), (2, 2, 3), (2, 3, 1)]
+        {
+            assert!(TokenSequenceSlotDeferral::new(capacity, occupied, required).is_err());
+        }
     }
 }

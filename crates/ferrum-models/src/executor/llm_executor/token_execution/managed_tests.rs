@@ -23,6 +23,7 @@ mod capacity;
     all(feature = "metal", any(target_os = "macos", target_os = "ios"))
 ))]
 mod gpu_capacity;
+mod sequence_slots;
 
 struct Gate {
     entered: oneshot::Sender<()>,
@@ -35,6 +36,8 @@ struct Control {
     close_once: AtomicBool,
     batches: AtomicU64,
     omit_middle_result: AtomicBool,
+    held_cache: Mutex<Option<String>>,
+    held_close_seen: Mutex<Option<oneshot::Sender<()>>>,
 }
 
 impl Control {
@@ -133,6 +136,14 @@ impl<B: MoeLlmBackend> DecoderOnlyLLM for ManagedModel<B> {
         self.model.lock().recover_token_execution()
     }
     fn close_token_execution(&mut self, id: &str) -> ModelTokenCloseOutcome {
+        if self.control.held_cache.lock().as_deref() == Some(id) {
+            if let Some(seen) = self.control.held_close_seen.lock().take() {
+                let _ = seen.send(());
+            }
+            return ModelTokenCloseOutcome::Held {
+                error: FerrumError::backend("controlled original cache retirement remains held"),
+            };
+        }
         if self.control.close_once.swap(false, Ordering::AcqRel) {
             if let Some(gate) = self.control.gate.lock().take() {
                 let _ = gate.entered.send(());

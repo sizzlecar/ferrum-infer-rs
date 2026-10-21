@@ -15,6 +15,8 @@ use tokio::sync::oneshot;
 
 #[path = "tests/readiness.rs"]
 mod readiness;
+#[path = "tests/sequence_slots.rs"]
+mod sequence_slots;
 
 struct AdmissionGate {
     inner: Arc<ExecutorScope>,
@@ -24,8 +26,13 @@ struct AdmissionGate {
     resume: Mutex<Option<oneshot::Receiver<()>>>,
 }
 
+#[derive(Default)]
 struct AdmissionObservation {
     closed: Mutex<Vec<ExecutorSequence>>,
+    slot_capacity: Mutex<Option<usize>>,
+    slot_owners: Mutex<Vec<ExecutorSequence>>,
+    admission_attempts: std::sync::atomic::AtomicUsize,
+    close_gate: Mutex<Option<(oneshot::Sender<ExecutorSequence>, oneshot::Receiver<()>)>>,
 }
 
 impl std::ops::Deref for AdmissionGate {
@@ -99,10 +106,27 @@ impl ModelExecutor for AdmissionGate {
     }
 
     async fn admit_tokens(&self, input: ExecutionAdmission<'_>) -> Result<TokenAdmissionOutcome> {
+        self.admission_attempts.fetch_add(1, Ordering::SeqCst);
+        if let Some(capacity) = *self.slot_capacity.lock() {
+            let occupied = self
+                .slot_owners
+                .lock()
+                .iter()
+                .filter(|owner| owner.observed_end().is_none())
+                .count();
+            if occupied >= capacity {
+                return Ok(TokenAdmissionOutcome::SequenceSlotsDeferred(
+                    ferrum_execution::token_execution::TokenSequenceSlotDeferral::new(
+                        capacity, occupied, 1,
+                    )?,
+                ));
+            }
+        }
         let outcome = self.inner.admit_tokens(input).await?;
         let TokenAdmissionOutcome::Admitted(frontier) = outcome else {
             return Ok(outcome);
         };
+        self.slot_owners.lock().push(frontier.sequence().clone());
         let mut pending = PendingAdmission {
             executor: self,
             frontier: Some(frontier),
@@ -133,6 +157,13 @@ impl ModelExecutor for AdmissionGate {
         sequence: &ExecutorSequence,
         reason: ExecutionEndReason,
     ) -> Result<ExecutionCloseOutcome> {
+        let gate = self.close_gate.lock().take();
+        if let Some((entered, resume)) = gate {
+            entered.send(sequence.clone()).unwrap();
+            resume
+                .await
+                .map_err(|_| FerrumError::internal("physical close test gate dropped"))?;
+        }
         self.inner.finish_tokens(sequence, reason).await
     }
 
@@ -194,6 +225,7 @@ async fn fixture() -> Fixture {
     let (resume, resume_receiver) = oneshot::channel();
     let executor = Arc::new(AdmissionObservation {
         closed: Mutex::new(Vec::new()),
+        ..Default::default()
     });
     let implementation = AdmissionGate {
         inner,

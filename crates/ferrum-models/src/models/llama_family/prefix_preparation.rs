@@ -165,6 +165,12 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
             }]);
         }
 
+        if !self.kv_caches.contains_key(request.cache_id) {
+            if let Some(deferred) = self.new_paged_sequence_slots(1)? {
+                return Ok(ModelKvReservation::SequenceSlotsDeferred(deferred));
+            }
+        }
+
         // A base prefix can never be acquired before the adapter's semantics
         // have been validated. Prefix-enabled LoRA remains explicitly rejected.
         if let Some(adapter) = request.adapter {

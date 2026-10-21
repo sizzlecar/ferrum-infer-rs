@@ -317,6 +317,15 @@ impl EngineInner {
                 outcome: AdmissionProbeOutcome::CapacityDeferred,
                 maintenance: None,
             },
+            Ok(TokenAdmissionOutcome::SequenceSlotsDeferred(deferred)) => {
+                ExecutorPrefillProbeResult {
+                    trace: capture_admission_trace(
+                        ExecutorPrefillAdmissionTraceEvidence::SequenceSlotsDeferred(deferred),
+                    ),
+                    outcome: AdmissionProbeOutcome::CapacityDeferred,
+                    maintenance: None,
+                }
+            }
             Ok(TokenAdmissionOutcome::Deferred(deferred)) => {
                 if deferred.action() == DeferredAction::AwaitBackingGrowth {
                     self.model_executor.cancel_prefill_admission(&request.id);
