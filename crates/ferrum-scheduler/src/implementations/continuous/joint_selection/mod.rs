@@ -42,12 +42,8 @@ impl ContinuousBatchScheduler {
                 }
             }
             Ok(None) => {}
-            Err(Unsupported::WaitingResources | Unsupported::UnknownKvCapacity) => {
-                round.statistics.joint_unknown_resources += 1;
-                round.statistics.static_fallbacks += 1;
-            }
-            Err(_) => {
-                round.statistics.joint_unresolved += 1;
+            Err(reason) => {
+                round.statistics.record_joint_unsupported(reason);
                 round.statistics.static_fallbacks += 1;
             }
         }
@@ -69,7 +65,9 @@ impl ContinuousBatchScheduler {
                 round.statistics.joint_known_infeasible += 1;
                 Ok(None)
             }
-            PolicyChoice::Unresolved => Err(Unsupported::Cost(CostUnknownReason::NoCoverage)),
+            // Several kinds of unresolved scenario mass can reach this point.
+            // Do not relabel an aggregate outcome as a cost-model failure.
+            PolicyChoice::Unresolved => Err(Unsupported::FeasibilityUnresolved),
         }
     }
 
@@ -365,18 +363,24 @@ impl ContinuousBatchScheduler {
         round: &TimePlanningRound,
         now: Instant,
     ) -> std::result::Result<Cohort, Unsupported> {
-        if self.pressure_active.load(Ordering::Acquire)
-            // The first actual static decode disarms fill-first for this busy
-            // cohort before this comparison. From that point the copied
-            // decode-first continuation is exact, including later arrivals.
-            // Only an empty-to-new-cohort transition can arm it again. Keep
-            // the unmodeled cold fill phase conservative.
-            || (self.runtime_config.prefill_first_until_active.is_some()
-                && self.fill_first_initial_cohort_armed.load(Ordering::Acquire))
-            || self.config.prefix_rendezvous_max_wait_ms.is_some()
-            || self.decode_capacity_backpressure_limit().is_some()
+        if self.pressure_active.load(Ordering::Acquire) {
+            return Err(Unsupported::PressureActive);
+        }
+        // The first actual static decode disarms fill-first for this busy
+        // cohort before this comparison. From that point the copied
+        // decode-first continuation is exact, including later arrivals.
+        // Only an empty-to-new-cohort transition can arm it again. Keep
+        // the unmodeled cold fill phase conservative.
+        if self.runtime_config.prefill_first_until_active.is_some()
+            && self.fill_first_initial_cohort_armed.load(Ordering::Acquire)
         {
-            return Err(Unsupported::UnknownKvCapacity);
+            return Err(Unsupported::ColdFillFirst);
+        }
+        if self.config.prefix_rendezvous_max_wait_ms.is_some() {
+            return Err(Unsupported::PrefixRendezvous);
+        }
+        if self.decode_capacity_backpressure_limit().is_some() {
+            return Err(Unsupported::DecodeBackpressure);
         }
         let facts = round.request_facts().ok_or(Unsupported::InvalidState)?;
         let clocks = round.request_clocks().ok_or(Unsupported::InvalidState)?;
@@ -409,7 +413,7 @@ impl ContinuousBatchScheduler {
                 proof.participants == facts.len() && proof.max_batch_sequences >= facts.len()
             });
         if !resident_proof && capacity.is_none() {
-            return Err(Unsupported::UnknownKvCapacity);
+            return Err(Unsupported::MissingCapacity);
         }
         if !waiting.is_empty()
             && (self.config.max_running_requests > limit || waiting.has_capacity_deferrals())
@@ -417,7 +421,7 @@ impl ContinuousBatchScheduler {
             return Err(Unsupported::WaitingResources);
         }
         if !waiting.is_empty() {
-            let capacity = capacity.ok_or(Unsupported::UnknownKvCapacity)?;
+            let capacity = capacity.ok_or(Unsupported::MissingCapacity)?;
             // Capacity preceded physical admission. Preserve the whole initial
             // demand as members move to residency. Without an exact baseline,
             // conservatively charge every cohort member.
@@ -441,10 +445,10 @@ impl ContinuousBatchScheduler {
                             .and_then(|prompt| prompt.checked_add(fact.cap))
                             .is_none_or(|tokens| tokens > max_sequence_tokens)
                     }) {
-                        return Err(Unsupported::UnknownKvCapacity);
+                        return Err(Unsupported::AdmissionCapacity);
                     }
                 }
-                _ => return Err(Unsupported::UnknownKvCapacity),
+                _ => return Err(Unsupported::AdmissionCapacity),
             }
         }
         if waiting.is_empty() && facts.len() > limit {
@@ -466,7 +470,7 @@ impl ContinuousBatchScheduler {
                 || request.capacity_deferred_until_release_epoch > 0
                 || request.prefix_rendezvous.held()
             {
-                return Err(Unsupported::InvalidState);
+                return Err(Unsupported::PendingRequestState);
             }
             let id = &request.inner.request.id;
             let fact = &facts
@@ -479,19 +483,22 @@ impl ContinuousBatchScheduler {
                 .find(|(candidate, _)| candidate == id)
                 .map(|(_, clock)| clock)
                 .ok_or(Unsupported::InvalidState)?;
-            if fact.terminal.is_some()
-                || clock.generated_tokens != fact.generated_tokens
-                || fact.generated_tokens >= fact.cap
+            if fact.terminal.is_some() || fact.generated_tokens >= fact.cap {
+                return Err(Unsupported::InvalidState);
+            }
+            if clock.generated_tokens != fact.generated_tokens
                 || clock.captured_at > now
                 || clock.itl_threshold
                     != Duration::try_from_secs_f64(round.config.itl_ms / 1000.0).ok()
                 || (fact.generated_tokens > 0 && clock.first_text.is_none())
             {
-                return Err(Unsupported::InvalidState);
+                return Err(Unsupported::InvalidClock);
             }
-            if !clock.streaming
-                || (fact.generated_tokens > 0
-                    && clock.nonempty_text_events != fact.generated_tokens as u64)
+            if !clock.streaming {
+                return Err(Unsupported::NonStreamingClock);
+            }
+            if fact.generated_tokens > 0
+                && clock.nonempty_text_events != fact.generated_tokens as u64
             {
                 return Err(Unsupported::HistoricalTextCoalescing);
             }
@@ -509,7 +516,7 @@ impl ContinuousBatchScheduler {
             if !resident_proof {
                 // Without exact complete-cohort ownership evidence, charge the
                 // entire prompt+cap again. No guessed retained or prefix credit.
-                let capacity = capacity.ok_or(Unsupported::UnknownKvCapacity)?;
+                let capacity = capacity.ok_or(Unsupported::MissingCapacity)?;
                 blocks = blocks
                     .checked_add(context_cap.div_ceil(capacity.block_size))
                     .ok_or(Unsupported::Arithmetic)?;
@@ -560,7 +567,7 @@ impl ContinuousBatchScheduler {
             });
         }
         if !resident_proof && capacity.is_none_or(|capacity| blocks > capacity.free_blocks) {
-            return Err(Unsupported::UnknownKvCapacity);
+            return Err(Unsupported::InsufficientCapacity);
         }
         if !batch.is_empty() && !round.cost_selection_is_exact(batch.len()) {
             return Err(Unsupported::Cost(CostUnknownReason::InexactWork));

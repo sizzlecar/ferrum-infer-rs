@@ -345,7 +345,7 @@ fn resident_capacity_cannot_authorize_waiting_admission() {
     ));
     assert!(matches!(
         scheduler.evaluate_joint_admission(&hint(), &mut round, now),
-        Err(crate::joint_policy::Unsupported::UnknownKvCapacity)
+        Err(crate::joint_policy::Unsupported::MissingCapacity)
     ));
 }
 
@@ -509,13 +509,13 @@ fn joint_admission_does_not_recredit_metadata_after_scan_promotions() {
     assert_eq!(scheduler.waiting_count(), 1);
     assert!(matches!(
         scheduler.evaluate_joint_admission(&hint(), &mut round, now),
-        Err(crate::joint_policy::Unsupported::UnknownKvCapacity)
+        Err(crate::joint_policy::Unsupported::AdmissionCapacity)
     ));
     capacity.admission_coverage = ferrum_execution::model_executor::PagedAdmissionCoverage::Unknown;
     round.set_capacity(Some(capacity));
     assert!(matches!(
         scheduler.evaluate_joint_admission(&hint(), &mut round, now),
-        Err(crate::joint_policy::Unsupported::UnknownKvCapacity)
+        Err(crate::joint_policy::Unsupported::AdmissionCapacity)
     ));
 }
 
@@ -543,5 +543,30 @@ fn joint_dispatch_does_not_interpret_coalesced_or_nonstreaming_history_as_token_
         assert_eq!(tokens(&batch, &prefill), 8);
         assert_eq!(round.statistics.joint_interventions, 0);
         assert_eq!(round.statistics.joint_unresolved, 1);
+        let reason = if coalesced {
+            "historical_text_coalescing"
+        } else {
+            "non_streaming_clock"
+        };
+        let reasons = serde_json::to_value(round.statistics.joint_unsupported).unwrap();
+        assert_eq!(reasons[reason], 1);
+        assert_eq!(reasons["invalid_state"], 0);
     }
+}
+
+#[test]
+fn joint_dispatch_records_missing_capacity_without_changing_static_fallback() {
+    let (scheduler, mut round, prefill, decoder, now) =
+        fixture(CostExecution::SingleInvocation, true, true);
+    round.set_capacity(None);
+    let batch = next(&scheduler, &mut round, now);
+    assert_eq!(tokens(&batch, &prefill), 8);
+    assert_eq!(tokens(&batch, &decoder), 1);
+    assert_eq!(round.statistics.joint_unknown_resources, 1);
+    assert_eq!(round.statistics.joint_unresolved, 0);
+    assert_eq!(round.statistics.static_fallbacks, 1);
+    assert_eq!(
+        serde_json::to_value(round.statistics.joint_unsupported).unwrap()["missing_capacity"],
+        1
+    );
 }

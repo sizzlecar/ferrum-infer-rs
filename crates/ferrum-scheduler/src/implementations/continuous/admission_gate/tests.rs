@@ -182,6 +182,45 @@ fn unknown_action_uses_declared_fallback_and_expired_gate_is_not_feasible() {
 }
 
 #[test]
+fn refined_reasons_preserve_cost_and_stopping_unknown_policies() {
+    for reason in [
+        Unsupported::ColdFillFirst,
+        Unsupported::MissingCapacity,
+        Unsupported::InvalidClock,
+        Unsupported::FeasibilityUnresolved,
+    ] {
+        let (scheduler, mut round, _, now) = fixture();
+        round.config.unknown_cost = UnknownCostPolicy::Wait {
+            max_wait_ms: 100,
+            on_timeout: CostFallback::Reject,
+        };
+        round.config.unknown_stopping = UnknownCostPolicy::StaticFallback;
+        freeze(&scheduler, &mut round, Verdict::Unknown(reason), now);
+        let waiting = scheduler.waiting_queue.read();
+        let request = waiting.iter().next().unwrap();
+        assert!(matches!(
+            scheduler.joint_admission_time_decision(request, &mut round, now),
+            time_policy::TimeDecision::Hold
+        ));
+        assert!(matches!(
+            scheduler.joint_admission_time_decision(
+                request,
+                &mut round,
+                now + Duration::from_millis(101)
+            ),
+            time_policy::TimeDecision::Reject(_)
+        ));
+        round.config.unknown_cost = UnknownCostPolicy::Reject;
+        round.admission_gate.as_mut().unwrap().verdict =
+            Verdict::Unknown(Unsupported::StoppingCoverage);
+        assert!(matches!(
+            scheduler.joint_admission_time_decision(request, &mut round, now),
+            time_policy::TimeDecision::Allow(_)
+        ));
+    }
+}
+
+#[test]
 fn already_admitted_zero_offset_and_recompute_are_never_stranded() {
     let (scheduler, mut round, _, now) = fixture();
     let mut waiting = scheduler.waiting_queue.write();

@@ -153,16 +153,18 @@ impl ContinuousBatchScheduler {
             Ok(decision) if matches!(decision.choice, PolicyChoice::Alternative(_)) => {
                 Verdict::RequiresAction
             }
-            Ok(_) => Verdict::Unknown(Unsupported::Cost(
-                crate::cost_prediction::CostUnknownReason::NoCoverage,
-            )),
+            Ok(_) => Verdict::Unknown(Unsupported::FeasibilityUnresolved),
             Err(error) => Verdict::Unknown(error),
         };
         match verdict {
-            Verdict::Unknown(Unsupported::UnknownKvCapacity | Unsupported::WaitingResources) => {
-                round.statistics.joint_unknown_resources += 1;
+            Verdict::Unknown(reason) => round.statistics.record_joint_unsupported(reason),
+            Verdict::RequiresAction => {
+                round.statistics.joint_unresolved += 1;
+                round.statistics.joint_admission_action_required = round
+                    .statistics
+                    .joint_admission_action_required
+                    .saturating_add(1);
             }
-            Verdict::RequiresAction | Verdict::Unknown(_) => round.statistics.joint_unresolved += 1,
             _ => {}
         }
         round.admission_gate = Some(FrozenAdmissionGate {

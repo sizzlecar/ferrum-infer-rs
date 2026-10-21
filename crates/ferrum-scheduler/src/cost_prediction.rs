@@ -14,6 +14,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::watch;
 
+mod unsupported_counts;
+pub(crate) use unsupported_counts::JointUnsupportedCounts;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CostWork {
     pub kind: AttemptWorkKind,
@@ -558,6 +561,10 @@ pub(crate) struct PlanningStatistics {
     pub joint_interventions: u64,
     pub joint_unknown_resources: u64,
     pub joint_unresolved: u64,
+    /// Returned comparison failures only; not inferred causes or request counts.
+    pub joint_unsupported: JointUnsupportedCounts,
+    /// A supported alternative could not be applied by the admission gate.
+    pub joint_admission_action_required: u64,
     pub joint_known_infeasible: u64,
     pub known_queries: u64,
     pub unknown_queries: u64,
@@ -566,6 +573,18 @@ pub(crate) struct PlanningStatistics {
     pub shrunk_prefills: u64,
     pub static_fallbacks: u64,
     pub budget_misses: u64,
+}
+
+impl PlanningStatistics {
+    pub(crate) fn record_joint_unsupported(&mut self, reason: crate::joint_policy::Unsupported) {
+        self.joint_unsupported.record(reason);
+        let aggregate = if reason.is_resource_unknown() {
+            &mut self.joint_unknown_resources
+        } else {
+            &mut self.joint_unresolved
+        };
+        *aggregate = aggregate.saturating_add(1);
+    }
 }
 
 #[derive(Debug)]

@@ -24,13 +24,44 @@ pub enum Unsupported {
     TimeBudget,
     WaitingResources,
     UnknownKvCapacity,
+    PressureActive,
+    ColdFillFirst,
+    PrefixRendezvous,
+    DecodeBackpressure,
+    MissingCapacity,
+    InsufficientCapacity,
+    AdmissionCapacity,
+    PendingRequestState,
+    InvalidClock,
+    NonStreamingClock,
     HistoricalTextCoalescing,
     StoppingCoverage,
+    FeasibilityUnresolved,
     InvalidState,
     InvalidPlan,
     NoProgress,
     Cost(CostUnknownReason),
     Arithmetic,
+}
+
+impl Unsupported {
+    /// Preserve the existing resource/unresolved partition when refining a
+    /// previously generic resource reason. This is diagnostic classification,
+    /// never authority to admit or change the unknown policy.
+    pub(crate) fn is_resource_unknown(self) -> bool {
+        matches!(
+            self,
+            Self::WaitingResources
+                | Self::UnknownKvCapacity
+                | Self::PressureActive
+                | Self::ColdFillFirst
+                | Self::PrefixRendezvous
+                | Self::DecodeBackpressure
+                | Self::MissingCapacity
+                | Self::InsufficientCapacity
+                | Self::AdmissionCapacity
+        )
+    }
 }
 
 /// The resource owner must guarantee headroom for the entire declared cohort.

@@ -34,6 +34,13 @@ impl SchedulerSloSnapshot {
         self.selections.joint_interventions += value.joint_interventions;
         self.selections.joint_unknown_resources += value.joint_unknown_resources;
         self.selections.joint_unresolved += value.joint_unresolved;
+        self.selections
+            .joint_unsupported
+            .add(value.joint_unsupported);
+        self.selections.joint_admission_action_required = self
+            .selections
+            .joint_admission_action_required
+            .saturating_add(value.joint_admission_action_required);
         self.selections.joint_known_infeasible += value.joint_known_infeasible;
         self.selections.known_queries += value.known_queries;
         self.selections.unknown_queries += value.unknown_queries;

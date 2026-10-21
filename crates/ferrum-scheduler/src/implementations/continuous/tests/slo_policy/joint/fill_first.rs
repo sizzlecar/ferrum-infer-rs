@@ -24,6 +24,15 @@ fn joint_fill_first_preserves_armed_cold_wave() {
             .fill_first_initial_cohort_armed
             .load(Ordering::Acquire));
         assert_eq!(round.statistics.joint_unknown_resources, 1);
+        let reasons = serde_json::to_value(round.statistics.joint_unsupported).unwrap();
+        assert_eq!(reasons["cold_fill_first"], 1);
+        assert_eq!(reasons["unknown_kv_capacity"], 0);
+        let mut snapshot = crate::implementations::continuous::SchedulerSloSnapshot::default();
+        snapshot.record(&round);
+        snapshot.record(&round);
+        let health = serde_json::to_value(snapshot).unwrap();
+        assert_eq!(health["joint_unsupported"]["cold_fill_first"], 2);
+        assert_eq!(health["joint_unknown_resources"], 2);
         assert_eq!(round.statistics.joint_cost_snapshot_queries, 0);
         assert_eq!(round.statistics.joint_interventions, 0);
     }
