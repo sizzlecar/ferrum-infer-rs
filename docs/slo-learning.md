@@ -144,6 +144,15 @@ Missing facts with unknown ingress age remain unresolved. Recent successes canno
 enter early, and expired arrivals cannot linger as unknown only because a quiet
 service has not yet filled its count-based observation window.
 
+An observed stopping forecast filters the retained records once, then sweeps
+integer risk-set and natural-stop events over the requested positions. Its work
+is bounded by the retained record count plus the configured forecast-position
+limit. Temporary event storage uses two machine-sized counters per position
+(at most 64 KiB with the default 4096 positions on a 64-bit host). Each query
+checks the original observation times and rule identity; it does not cache or
+renew evidence across query times. Cap endpoints, support gaps and unresolved
+probability mass retain their existing meaning.
+
 The joint policy keeps the original static wave and compares smaller prefill
 chunks. When that wave contains both prefill and decode work, it can also
 consider a decode-only first wave. This action retains every selected decoder

@@ -1,5 +1,6 @@
-//! Admission-ordered, bounded stopping evidence. All work runs off the inference
-//! thread. Unknown suffixes are censored, never treated as active or complete.
+//! Admission-ordered, bounded stopping evidence. Window maintenance runs off the
+//! inference thread; immutable forecasts perform bounded query work. Unknown
+//! suffixes are censored, never treated as active or complete.
 
 use ferrum_interfaces::request_observation::*;
 use std::{
@@ -54,6 +55,8 @@ impl StoppingConfig {
             .map_err(|_| "stopping window exceeds addressable memory")?;
         std::alloc::Layout::array::<StoppingMass>(self.max_forecast_positions)
             .map_err(|_| "stopping forecast exceeds addressable memory")?;
+        std::alloc::Layout::array::<RiskEvents>(self.max_forecast_positions)
+            .map_err(|_| "stopping forecast scratch exceeds addressable memory")?;
         self.window_requests
             .checked_mul(self.max_rule_bytes)
             .filter(|bytes| *bytes <= isize::MAX as usize)
@@ -346,6 +349,15 @@ pub struct StoppingTable {
     unobserved_admission_times: Vec<Option<Instant>>,
 }
 
+/// One bounded query's integer event counts, discarded after forecasting.
+/// A record contributes to the risk set through its verified prefix, including
+/// the natural endpoint itself when one was observed.
+#[derive(Clone, Copy, Default)]
+struct RiskEvents {
+    risk_ends: usize,
+    natural_ends: usize,
+}
+
 impl StoppingSnapshot for StoppingTable {
     fn completion_forecast(&self, query: &CompletionQuery<'_>) -> CompletionForecast {
         if query.cap == 0
@@ -446,29 +458,74 @@ impl StoppingSnapshot for StoppingTable {
                 }
             };
         }
-        let unknown_members = self.unobserved_admission_times.len()
-            + self
-                .records
-                .iter()
-                .filter(|record| record.fact.is_none())
-                .count();
-        let known_members = self
-            .records
-            .iter()
-            .filter(|record| {
-                record.fact.as_ref().is_some_and(|fact| {
-                    fact.rules.as_ref() == query.rules
-                        && query
-                            .now
-                            .checked_duration_since(record.observed_at)
-                            .is_some_and(|age| age <= self.config.ttl)
-                        && !(matches!(
-                            fact.terminal,
-                            Some(RequestTerminalReason::Eos | RequestTerminalReason::Stop)
-                        ) && fact.generated_tokens <= query.verified_survival_through)
-                })
-            })
-            .count();
+        // Only statistical positions need scratch: the cap remains an explicit
+        // endpoint and is handled before the work-limit check below. Subtraction
+        // avoids forming cap + 1 or horizon + 1, including usize::MAX queries.
+        let positions = horizon
+            .min(query.cap - 1)
+            .saturating_sub(query.verified_survival_through)
+            .min(self.config.max_forecast_positions);
+        let mut events = vec![RiskEvents::default(); positions].into_boxed_slice();
+        let mut unknown_members = self.unobserved_admission_times.len();
+        let mut known_members = 0usize;
+        let mut risk = 0usize;
+        // Rule equality and freshness are invariant throughout this query.
+        // Filter once, then sweep integer endpoints instead of rescanning every
+        // retained request at every forecast position.
+        for record in &self.records {
+            let Some(fact) = &record.fact else {
+                // Preserve missing-domain membership even when it has no usable
+                // observation timestamp; it was never a freshness-filtered fact.
+                unknown_members += 1;
+                continue;
+            };
+            if fact.rules.as_ref() != query.rules
+                || query
+                    .now
+                    .checked_duration_since(record.observed_at)
+                    .is_none_or(|age| age > self.config.ttl)
+            {
+                continue;
+            }
+            let terminal_stop = matches!(
+                fact.terminal,
+                Some(RequestTerminalReason::Eos | RequestTerminalReason::Stop)
+            );
+            if !(terminal_stop && fact.generated_tokens <= query.verified_survival_through) {
+                known_members += 1;
+            }
+            let natural_end = !record.conflicted && terminal_stop;
+            // All facts enter through is_consistent(): an EOS/Stop at g has
+            // verified survival g-1. Conflict handling clears the terminal and
+            // retains only a common verified prefix; completion enrichment does
+            // not change either boundary. Thus this is one continuous risk
+            // interval, exactly the old natural-end OR verified-prefix test.
+            let risk_through = if natural_end {
+                fact.verified_survival_through.max(fact.generated_tokens)
+            } else {
+                fact.verified_survival_through
+            };
+            if let Some(distance) = risk_through
+                .checked_sub(query.verified_survival_through)
+                .filter(|distance| *distance > 0)
+            {
+                risk += 1;
+                if let Some(event) = events.get_mut(distance - 1) {
+                    event.risk_ends += 1;
+                }
+            }
+            if natural_end {
+                if let Some(distance) = fact
+                    .generated_tokens
+                    .checked_sub(query.verified_survival_through)
+                    .filter(|distance| *distance > 0)
+                {
+                    if let Some(event) = events.get_mut(distance - 1) {
+                        event.natural_ends += 1;
+                    }
+                }
+            }
+        }
         let unknown_mass = if unknown_members == 0 {
             0.0
         } else {
@@ -492,43 +549,23 @@ impl StoppingSnapshot for StoppingTable {
                 forecast.known_survival_mass = 0.0;
                 break;
             }
-            let mut risk = 0usize;
-            let mut ended = 0usize;
-            for record in &self.records {
-                let Some(fact) = &record.fact else {
-                    continue;
-                };
-                if fact.rules.as_ref() != query.rules
-                    || query
-                        .now
-                        .checked_duration_since(record.observed_at)
-                        .is_none_or(|age| age > self.config.ttl)
-                {
-                    continue;
-                }
-                let natural_end = !record.conflicted
-                    && matches!(
-                        fact.terminal,
-                        Some(RequestTerminalReason::Eos | RequestTerminalReason::Stop)
-                    );
-                if natural_end && fact.generated_tokens == generated {
-                    risk += 1;
-                    ended += 1;
-                } else if fact.verified_survival_through >= generated {
-                    risk += 1;
-                }
-            }
+            let event = events[position];
             if risk < self.config.min_risk_set {
                 forecast.unresolved_mass += forecast.known_survival_mass;
                 forecast.known_survival_mass = 0.0;
                 break;
             }
-            if ended > 0 {
-                push_stop(&mut forecast, generated, ended as f64 / risk as f64);
+            if event.natural_ends > 0 {
+                push_stop(
+                    &mut forecast,
+                    generated,
+                    event.natural_ends as f64 / risk as f64,
+                );
             }
             if forecast.known_survival_mass <= 0.0 {
                 break;
             }
+            risk -= event.risk_ends;
         }
         forecast
     }
@@ -550,3 +587,6 @@ fn push_stop(forecast: &mut StoppingForecast, generated_tokens: usize, hazard: f
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod forecast_scan_tests;
