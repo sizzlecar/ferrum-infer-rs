@@ -129,6 +129,8 @@ mod metrics_only_tests;
 mod mixed_batch_tests;
 #[path = "partial_batch_tests.rs"]
 mod partial_batch_tests;
+#[path = "prefill_phase_feedback_tests.rs"]
+mod prefill_phase_feedback_tests;
 #[path = "prefix_prompt_tail_tests.rs"]
 mod prefix_prompt_tail_tests;
 #[path = "token_capacity_tests.rs"]
