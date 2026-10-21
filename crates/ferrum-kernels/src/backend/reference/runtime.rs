@@ -22,6 +22,12 @@ mod pointwise;
 pub(crate) use pointwise::{
     ReferenceGatedResidualLaunch, ReferenceModulationScaleLaunch, ReferencePointwiseShape,
 };
+mod transcendental;
+#[cfg(test)]
+pub(super) use transcendental::{silu_bf16_bits, silu_mul_bf16_bits, tanh_bf16_bits};
+pub(crate) use transcendental::{
+    ReferenceActivationShape, ReferenceSiluMulLaunch, ReferenceUnaryKind, ReferenceUnaryLaunch,
+};
 
 static NEXT_RUNTIME_INSTANCE: AtomicU64 = AtomicU64::new(1);
 static NEXT_STREAM_INSTANCE: AtomicU64 = AtomicU64::new(1);
@@ -319,6 +325,12 @@ enum ReferenceCommandKind {
     GatedResidual {
         launch: ReferenceGatedResidualLaunch,
     },
+    UnaryActivation {
+        launch: ReferenceUnaryLaunch,
+    },
+    SiluMul {
+        launch: ReferenceSiluMulLaunch,
+    },
 }
 
 /// An owned, fully validated command for the synchronous reference runtime.
@@ -341,6 +353,11 @@ impl fmt::Debug for ReferenceDeviceCommand {
             ReferenceCommandKind::LayerNorm { .. } => "layer_norm",
             ReferenceCommandKind::ModulationScale { .. } => "modulation_scale",
             ReferenceCommandKind::GatedResidual { .. } => "gated_residual",
+            ReferenceCommandKind::UnaryActivation { launch: ref unary } => match unary.kind {
+                ReferenceUnaryKind::Silu => "silu",
+                ReferenceUnaryKind::Tanh => "tanh",
+            },
+            ReferenceCommandKind::SiluMul { .. } => "silu_mul",
         };
         formatter
             .debug_struct("ReferenceDeviceCommand")
@@ -460,6 +477,35 @@ impl ReferenceDeviceCommand {
             compute_dispatch_count: 1,
             transfer_command_count: 0,
             kind: ReferenceCommandKind::GatedResidual { launch },
+        })
+    }
+
+    pub(crate) fn unary_activation_tensor(
+        launch: ReferenceUnaryLaunch,
+    ) -> Result<Self, ReferenceDeviceRuntimeError> {
+        launch.validate()?;
+        Ok(Self {
+            operation: match launch.kind {
+                ReferenceUnaryKind::Silu => "vnext_silu_bf16",
+                ReferenceUnaryKind::Tanh => "vnext_tanh_bf16",
+            },
+            logical_work: Some(launch.logical_work()?),
+            compute_dispatch_count: 1,
+            transfer_command_count: 0,
+            kind: ReferenceCommandKind::UnaryActivation { launch },
+        })
+    }
+
+    pub(crate) fn silu_mul_tensor(
+        launch: ReferenceSiluMulLaunch,
+    ) -> Result<Self, ReferenceDeviceRuntimeError> {
+        launch.validate()?;
+        Ok(Self {
+            operation: "vnext_silu_mul_bf16",
+            logical_work: Some(launch.logical_work()?),
+            compute_dispatch_count: 1,
+            transfer_command_count: 0,
+            kind: ReferenceCommandKind::SiluMul { launch },
         })
     }
 
@@ -592,6 +638,10 @@ impl ReferenceDeviceCommand {
             ReferenceCommandKind::GatedResidual { launch } => {
                 launch.validate_runtime(runtime_instance)
             }
+            ReferenceCommandKind::UnaryActivation { launch } => {
+                launch.validate_runtime(runtime_instance)
+            }
+            ReferenceCommandKind::SiluMul { launch } => launch.validate_runtime(runtime_instance),
         }
     }
 
@@ -645,6 +695,18 @@ impl ReferenceDeviceCommand {
                 counters
                     .gated_residual_launches
                     .fetch_add(1, Ordering::Relaxed);
+            }
+            ReferenceCommandKind::UnaryActivation { launch } => {
+                transcendental::execute_unary(launch);
+                let count = match launch.kind {
+                    ReferenceUnaryKind::Silu => &counters.silu_launches,
+                    ReferenceUnaryKind::Tanh => &counters.tanh_launches,
+                };
+                count.fetch_add(1, Ordering::Relaxed);
+            }
+            ReferenceCommandKind::SiluMul { launch } => {
+                transcendental::execute_silu_mul(launch);
+                counters.silu_mul_launches.fetch_add(1, Ordering::Relaxed);
             }
         }
     }
@@ -813,6 +875,9 @@ struct ReferenceRuntimeCounters {
     layer_norm_launches: AtomicU64,
     modulation_scale_launches: AtomicU64,
     gated_residual_launches: AtomicU64,
+    silu_launches: AtomicU64,
+    silu_mul_launches: AtomicU64,
+    tanh_launches: AtomicU64,
     readback_bytes: AtomicU64,
 }
 
@@ -827,6 +892,9 @@ pub struct ReferenceDeviceRuntimeSnapshot {
     pub layer_norm_launches: u64,
     pub modulation_scale_launches: u64,
     pub gated_residual_launches: u64,
+    pub silu_launches: u64,
+    pub silu_mul_launches: u64,
+    pub tanh_launches: u64,
     pub readback_bytes: u64,
 }
 
@@ -957,6 +1025,9 @@ impl ReferenceDeviceRuntime {
                 .counters
                 .gated_residual_launches
                 .load(Ordering::Relaxed),
+            silu_launches: self.counters.silu_launches.load(Ordering::Relaxed),
+            silu_mul_launches: self.counters.silu_mul_launches.load(Ordering::Relaxed),
+            tanh_launches: self.counters.tanh_launches.load(Ordering::Relaxed),
             readback_bytes: self.counters.readback_bytes.load(Ordering::Relaxed),
         }
     }

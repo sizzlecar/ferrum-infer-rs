@@ -3,14 +3,15 @@ use std::sync::Arc;
 
 use ferrum_runtime::{
     dense_linear_bf16_contract, dense_linear_contract, gated_residual_bf16_contract,
-    layer_norm_bf16_contract, modulation_scale_bf16_contract, CapabilityCatalog, CapabilityId,
-    ContractVersion, DeviceClass, DeviceDescriptor, DeviceId, DeviceRuntime,
-    DynamicStorageAllocator, DynamicStorageProfile, DynamicStorageView, EngineProviderDescriptor,
-    OperationContract, OperationProvider, OperationRuntimeRegistry, ProviderId, VNextError,
-    WeightMaterializerId, WeightMaterializerRegistry, DENSE_LINEAR_BF16_CAPABILITY_ID,
-    DENSE_LINEAR_F16_CAPABILITY_ID, GATED_RESIDUAL_BF16_CAPABILITY_ID,
-    IDENTITY_WEIGHT_MATERIALIZER_ID, LAYER_NORM_BF16_CAPABILITY_ID,
-    MODULATION_SCALE_BF16_CAPABILITY_ID,
+    layer_norm_bf16_contract, modulation_scale_bf16_contract, silu_bf16_contract,
+    silu_mul_bf16_contract, tanh_bf16_contract, CapabilityCatalog, CapabilityId, ContractVersion,
+    DeviceClass, DeviceDescriptor, DeviceId, DeviceRuntime, DynamicStorageAllocator,
+    DynamicStorageProfile, DynamicStorageView, EngineProviderDescriptor, OperationContract,
+    OperationProvider, OperationRuntimeRegistry, ProviderId, VNextError, WeightMaterializerId,
+    WeightMaterializerRegistry, DENSE_LINEAR_BF16_CAPABILITY_ID, DENSE_LINEAR_F16_CAPABILITY_ID,
+    GATED_RESIDUAL_BF16_CAPABILITY_ID, IDENTITY_WEIGHT_MATERIALIZER_ID,
+    LAYER_NORM_BF16_CAPABILITY_ID, MODULATION_SCALE_BF16_CAPABILITY_ID, SILU_BF16_CAPABILITY_ID,
+    SILU_MUL_BF16_CAPABILITY_ID, TANH_BF16_CAPABILITY_ID,
 };
 
 use super::dense_linear::{implementation_fingerprint, ReferenceDenseLinearProvider};
@@ -18,6 +19,10 @@ use super::layer_norm::ReferenceLayerNormProvider;
 use super::pointwise::{ReferencePointwiseKind, ReferencePointwiseProvider};
 use super::runtime::{
     ReferenceDeviceRuntime, ReferenceDeviceRuntimeConfig, ReferenceDeviceRuntimeError,
+};
+use super::transcendental::{
+    numerical_implementation_fingerprint, ReferenceTranscendentalKind,
+    ReferenceTranscendentalProvider,
 };
 
 const REFERENCE_ENGINE_PROVIDER_ID: &str = "provider.engine.reference.vnext";
@@ -31,12 +36,16 @@ pub fn reference_vnext_capabilities() -> Result<BTreeSet<CapabilityId>, VNextErr
         CapabilityId::new(LAYER_NORM_BF16_CAPABILITY_ID)?,
         CapabilityId::new(MODULATION_SCALE_BF16_CAPABILITY_ID)?,
         CapabilityId::new(GATED_RESIDUAL_BF16_CAPABILITY_ID)?,
+        CapabilityId::new(SILU_BF16_CAPABILITY_ID)?,
+        CapabilityId::new(SILU_MUL_BF16_CAPABILITY_ID)?,
+        CapabilityId::new(TANH_BF16_CAPABILITY_ID)?,
     ]))
 }
 
 pub(super) fn reference_vnext_runtime_config(
     device_id: DeviceId,
 ) -> Result<ReferenceDeviceRuntimeConfig, VNextError> {
+    let numerical = numerical_implementation_fingerprint();
     let descriptor = DeviceDescriptor {
         id: device_id,
         class: DeviceClass::Reference,
@@ -49,6 +58,8 @@ pub(super) fn reference_vnext_runtime_config(
             include_str!("runtime/layer_norm.rs").as_bytes(),
             include_str!("pointwise.rs").as_bytes(),
             include_str!("runtime/pointwise.rs").as_bytes(),
+            numerical.as_bytes(),
+            include_str!("transcendental/provider.rs").as_bytes(),
             include_str!("composition.rs").as_bytes(),
         ]),
         capabilities: reference_vnext_capabilities()?,
@@ -70,6 +81,9 @@ pub fn reference_vnext_operation_registry(
         Box::new(layer_norm_bf16_contract().map_err(contract_error)?),
         Box::new(modulation_scale_bf16_contract().map_err(contract_error)?),
         Box::new(gated_residual_bf16_contract().map_err(contract_error)?),
+        Box::new(silu_bf16_contract().map_err(contract_error)?),
+        Box::new(silu_mul_bf16_contract().map_err(contract_error)?),
+        Box::new(tanh_bf16_contract().map_err(contract_error)?),
     ];
     let providers = vec![
         reference_vnext_dense_linear_provider(runtime)?,
@@ -77,6 +91,9 @@ pub fn reference_vnext_operation_registry(
         reference_vnext_layer_norm_bf16_provider(runtime)?,
         reference_vnext_modulation_scale_bf16_provider(runtime)?,
         reference_vnext_gated_residual_bf16_provider(runtime)?,
+        reference_vnext_silu_bf16_provider(runtime)?,
+        reference_vnext_silu_mul_bf16_provider(runtime)?,
+        reference_vnext_tanh_bf16_provider(runtime)?,
     ];
     OperationRuntimeRegistry::new(contracts, providers).map_err(contract_error)
 }
@@ -123,6 +140,36 @@ pub fn reference_vnext_gated_residual_bf16_provider(
     Ok(Box::new(ReferencePointwiseProvider::new(
         runtime,
         ReferencePointwiseKind::GatedResidual,
+    )?))
+}
+
+/// Builds unary SiLU under the fixed Reference FP32/BF16 numerical profile.
+pub fn reference_vnext_silu_bf16_provider(
+    runtime: &ReferenceDeviceRuntime,
+) -> Result<Box<dyn OperationProvider<ReferenceDeviceRuntime>>, ReferenceDeviceRuntimeError> {
+    Ok(Box::new(ReferenceTranscendentalProvider::new(
+        runtime,
+        ReferenceTranscendentalKind::Silu,
+    )?))
+}
+
+/// Builds SiLU-mul with a BF16 activation boundary before the FP32 multiply.
+pub fn reference_vnext_silu_mul_bf16_provider(
+    runtime: &ReferenceDeviceRuntime,
+) -> Result<Box<dyn OperationProvider<ReferenceDeviceRuntime>>, ReferenceDeviceRuntimeError> {
+    Ok(Box::new(ReferenceTranscendentalProvider::new(
+        runtime,
+        ReferenceTranscendentalKind::SiluMul,
+    )?))
+}
+
+/// Builds tanh under the fixed Reference libm/BF16 numerical profile.
+pub fn reference_vnext_tanh_bf16_provider(
+    runtime: &ReferenceDeviceRuntime,
+) -> Result<Box<dyn OperationProvider<ReferenceDeviceRuntime>>, ReferenceDeviceRuntimeError> {
+    Ok(Box::new(ReferenceTranscendentalProvider::new(
+        runtime,
+        ReferenceTranscendentalKind::Tanh,
     )?))
 }
 

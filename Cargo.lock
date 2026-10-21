@@ -1492,6 +1492,7 @@ dependencies = [
  "half",
  "libc",
  "libloading 0.8.9",
+ "libm",
  "metal 0.31.0",
  "rayon",
  "serde",

@@ -14,6 +14,8 @@ mod layer_norm_bf16;
 pub use layer_norm_bf16::*;
 mod pointwise_bf16;
 pub use pointwise_bf16::*;
+mod transcendental_bf16;
+pub use transcendental_bf16::*;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroU32;

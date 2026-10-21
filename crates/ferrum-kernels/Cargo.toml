@@ -15,6 +15,8 @@ ferrum-native-ops = { workspace = true }
 # Trace writer for FERRUM_TRACE_OUT chrome-trace JSON (Phase 1.5).
 candle-core = { workspace = true }
 half = { workspace = true }
+# The Reference transcendental numerical profile identifies this exact implementation.
+libm = "=0.2.15"
 float8 = { workspace = true }
 tracing = { workspace = true }
 serde = { workspace = true }
