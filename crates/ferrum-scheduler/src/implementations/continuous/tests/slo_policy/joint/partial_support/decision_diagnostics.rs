@@ -115,7 +115,9 @@ fn assert_applied_rescue(alternative_step: Duration, ttft_limit: Duration) {
     assert_eq!(round.statistics.joint_decode_only_interventions, 0);
     // Known: seed plus three prefill-limit groups, then DecodeOnly's singleton
     // decoder and full-prefill group with the advanced decoder. Its final
-    // prefiller decode reuses the cache. Unknown: static tail once per rank;
+    // prefiller decode reuses the cache. The phase-limit candidate has the
+    // exact same complete work as the one-wave limit in this two-token prompt,
+    // so its Known queries all reuse that cache. Unknown: static tail once per rank;
     // Unknown distributions are intentionally not cached.
     assert_actual_query_count(&round, &source, 6, 2);
     let decision = round.statistics.joint_decision.dispatch;
@@ -124,9 +126,9 @@ fn assert_applied_rescue(alternative_step: Duration, ttft_limit: Duration) {
     assert_eq!(decision.consumed, 1);
     assert_eq!(decision.post_finish_time_rejected, 0);
     assert_eq!(decision.outcomes.alternative, 1);
-    assert_eq!(decision.candidates.joint.feasible, 1);
+    assert_eq!(decision.candidates.joint.feasible, 2);
     assert_eq!(decision.candidates.joint.infeasible, 1);
-    assert_eq!(decision.candidates.gates.eligible, 1);
+    assert_eq!(decision.candidates.gates.eligible, 2);
     assert_eq!(decision.unresolved.decisions, 0);
     assert!(decision.latest_unresolved.is_none());
     // Reading and serializing cold health must not replay the decision.
@@ -173,9 +175,9 @@ fn actual_dispatch_records_unresolved_candidate_and_keeps_static_work() {
     assert_eq!(round.statistics.joint_interventions, 0);
     assert_eq!(round.statistics.joint_decode_only_interventions, 0);
     // Known: seed plus two prefill-limit groups. The static tail, prefill-limit
-    // tail, and DecodeOnly's first singleton group are Unknown. Each is queried
+    // tail, phase-limit's same tail, and DecodeOnly's first singleton group are Unknown. Each is queried
     // again in the second rank because Unknown distributions are not cached.
-    assert_actual_query_count(&round, &source, 3, 6);
+    assert_actual_query_count(&round, &source, 3, 8);
     let decision = round.statistics.joint_decision.dispatch;
     assert_eq!(decision.computed, 1);
     assert_eq!(decision.returned, 1);
@@ -183,10 +185,11 @@ fn actual_dispatch_records_unresolved_candidate_and_keeps_static_work() {
     assert_eq!(decision.outcomes.feasibility_unresolved, 1);
     assert_eq!(decision.unresolved.decisions, 1);
     assert_eq!(decision.unresolved.no_alternatives, 0);
-    assert_eq!(decision.unresolved.candidates.joint.unresolved, 2);
+    assert_eq!(decision.unresolved.candidates.joint.unresolved, 3);
     let witness = decision.latest_unresolved.unwrap();
     assert_eq!(witness.partial_static_ranks, 2);
-    assert_eq!(witness.alternatives_total, 2);
+    assert_eq!(witness.alternatives_total, 3);
+    assert_eq!(witness.details_omitted, 1);
     assert_eq!(
         witness.alternatives[0].unwrap().unfinished_request_mass,
         2.0
@@ -210,7 +213,7 @@ fn actual_dispatch_records_unresolved_candidate_and_keeps_static_work() {
             .decisions,
         1
     );
-    assert_actual_query_count(&round, &source, 3, 6);
+    assert_actual_query_count(&round, &source, 3, 8);
 }
 
 #[test]

@@ -6,13 +6,13 @@ use ferrum_execution::{
 };
 use std::num::NonZeroUsize;
 
-/// A first-wave action changes only already admitted prefill work. The complete
-/// original static wave stays an explicit candidate. Every later wave uses the
-/// same copied policy, independent of the first action.
+/// Actions change already admitted prefill work. A phase action has an explicit
+/// completion fence; after that fence every action uses the same continuation.
 #[derive(Debug, Clone, Copy)]
 pub(super) enum FirstAction {
     Static,
     PrefillLimit(NonZeroUsize),
+    PrefillPhaseLimit(NonZeroUsize),
     /// Omit prefill from a mixed first wave while all its decoders progress.
     /// This is not an empty wave or permission to change later continuation.
     DecodeOnly,
@@ -22,6 +22,8 @@ pub(super) enum FirstAction {
 pub(super) struct RequestShape {
     pub restored_tokens: usize,
     pub execution_ceiling: Option<usize>,
+    /// An already selected phase is common to static and all new candidates.
+    pub phase_cap: Option<NonZeroUsize>,
     pub decode_only_allowed: bool,
 }
 
@@ -42,6 +44,25 @@ pub(super) struct CohortTrajectory {
 }
 
 impl CohortTrajectory {
+    pub(super) fn allows_prefill_phase(
+        &self,
+        requests: &[SimulatedRequest],
+        limit: NonZeroUsize,
+    ) -> bool {
+        // Empty first_wave is the admission projection, not an actual selected
+        // resident wave. It cannot promise a commitment for a waiting request.
+        self.first_wave.iter().any(|member| {
+            member.work.kind == AttemptWorkKind::Prefill
+                && self.shapes[member.request]
+                    .phase_cap
+                    .is_none_or(|existing| existing > limit)
+                && requests[member.request]
+                    .prompt_tokens
+                    .saturating_sub(requests[member.request].prefill_tokens)
+                    > limit.get()
+        })
+    }
+
     pub(super) fn allows_decode_only(&self, members: &[GroupMember]) -> bool {
         let mut has_prefill = false;
         let mut has_decode = false;
@@ -136,6 +157,14 @@ impl CohortTrajectory {
         &self,
         requests: &[SimulatedRequest],
     ) -> Result<Vec<GroupMember>, Unsupported> {
+        self.natural_members_with_phase(requests, None)
+    }
+
+    fn natural_members_with_phase(
+        &self,
+        requests: &[SimulatedRequest],
+        phase: Option<(NonZeroUsize, &ContinuationPhase)>,
+    ) -> Result<Vec<GroupMember>, Unsupported> {
         if requests.len() != self.shapes.len() {
             return Err(Unsupported::ParticipantBudget);
         }
@@ -218,6 +247,20 @@ impl CohortTrajectory {
             let tokens = self.shapes[index]
                 .execution_ceiling
                 .map_or(tokens, |ceiling| ceiling.min(tokens));
+            let tokens = self.shapes[index]
+                .phase_cap
+                .map_or(tokens, |cap| cap.get().min(tokens));
+            let tokens = phase.map_or(tokens, |(limit, phase)| {
+                if phase
+                    .prefill_targets()
+                    .iter()
+                    .any(|target| target.request == index)
+                {
+                    tokens.min(limit.get())
+                } else {
+                    tokens
+                }
+            });
             let work = self.work(index, request, tokens)?;
             members.push(GroupMember {
                 request: index,
@@ -241,6 +284,41 @@ impl TrajectoryAdapter<FirstAction> for CohortTrajectory {
         Some(&self.admission)
     }
 
+    fn continuation_phase(
+        &self,
+        action: &FirstAction,
+        _: &[SimulatedRequest],
+        phase: &mut PhaseBuilder<'_>,
+    ) -> Result<(), Unsupported> {
+        if matches!(action, FirstAction::PrefillPhaseLimit(_)) {
+            if self.first_wave.is_empty() {
+                return Err(Unsupported::InvalidPlan);
+            }
+            for member in &self.first_wave {
+                if member.work.kind == AttemptWorkKind::Prefill {
+                    phase.prefill_target(member.request)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn plan_phase(
+        &self,
+        action: &FirstAction,
+        phase: &ContinuationPhase,
+        requests: &[SimulatedRequest],
+        plan: &mut PlanBuilder,
+    ) -> Result<(), Unsupported> {
+        let FirstAction::PrefillPhaseLimit(limit) = action else {
+            return Err(Unsupported::InvalidPlan);
+        };
+        self.push(
+            self.natural_members_with_phase(requests, Some((*limit, phase)))?,
+            plan,
+        )
+    }
+
     fn plan(
         &self,
         first_action: Option<&FirstAction>,
@@ -259,7 +337,7 @@ impl TrajectoryAdapter<FirstAction> for CohortTrajectory {
                 }
                 members.retain(|member| member.work.kind == AttemptWorkKind::Decode);
             }
-            Some(FirstAction::PrefillLimit(limit)) => {
+            Some(FirstAction::PrefillLimit(limit) | FirstAction::PrefillPhaseLimit(limit)) => {
                 for member in &mut members {
                     if member.work.kind == AttemptWorkKind::Prefill {
                         let request = requests

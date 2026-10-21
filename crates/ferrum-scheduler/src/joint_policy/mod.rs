@@ -5,12 +5,14 @@ mod admission;
 mod aggregation;
 mod decision_observation;
 mod diagnostics;
+mod phase;
 mod risk;
 mod scenarios;
 pub use admission::*;
 pub use aggregation::*;
 pub use decision_observation::*;
 pub use diagnostics::*;
+pub use phase::{ContinuationPhase, PhaseBuilder, PrefillTarget};
 pub use risk::*;
 pub use scenarios::*;
 
@@ -228,9 +230,10 @@ impl PlanBuilder {
     }
 }
 
-/// Only the first round receives an action. Every following round calls this
-/// same adapter with `None`, so action-specific continuation cannot be selected
-/// by passing a different callback or a purported matching identity string.
+/// By default only the first round receives an action, followed by this same
+/// adapter with `None`. An explicit bounded phase may retain that action until
+/// the core observes its frozen prefill endpoints; every later wave again uses
+/// the original `None` continuation. The adapter cannot renew the phase fence.
 pub trait TrajectoryAdapter<Action> {
     /// Absent support keeps any initial waiting cohort unresolved. A supplied
     /// plan is shared across actions and determines legal members once per
@@ -238,6 +241,27 @@ pub trait TrajectoryAdapter<Action> {
     /// later group of that same wave.
     fn admission_slots(&self) -> Option<&AdmissionSlotPlan> {
         None
+    }
+
+    fn continuation_phase(
+        &self,
+        _action: &Action,
+        _requests: &[SimulatedRequest],
+        _phase: &mut PhaseBuilder<'_>,
+    ) -> Result<(), Unsupported> {
+        Ok(())
+    }
+
+    /// Active-phase work uses explicit core-owned state. Declaring a phase
+    /// without implementing its subsequent waves fails closed.
+    fn plan_phase(
+        &self,
+        _action: &Action,
+        _phase: &ContinuationPhase,
+        _requests: &[SimulatedRequest],
+        _plan: &mut PlanBuilder,
+    ) -> Result<(), Unsupported> {
+        Err(Unsupported::InvalidPlan)
     }
 
     fn plan(
@@ -657,6 +681,7 @@ fn simulate_recorded<Action, Adapter: TrajectoryAdapter<Action>>(
     let mut reached = None;
     let query_start = budget.queries;
     let mut rounds = 0usize;
+    let mut phase: Option<phase::PhaseState> = None;
     let mut cost_risk = CostRiskBudget::default();
     let itl_limit = Duration::try_from_secs_f64(input.config.itl_ms / 1000.0)
         .map_err(|_| Unsupported::InvalidState)?;
@@ -706,9 +731,27 @@ fn simulate_recorded<Action, Adapter: TrajectoryAdapter<Action>>(
                 .map(|slots| slots.active_mask(&requests))
                 .transpose()?,
         };
-        input
-            .adapter
-            .plan((rounds == 0).then_some(action), &requests, &mut plan)?;
+        if rounds == 0 {
+            let mut declaration = PhaseBuilder::new(
+                &requests,
+                input.config.planning.max_participants,
+                input.config.planning.max_request_fact_bytes,
+            );
+            input
+                .adapter
+                .continuation_phase(action, &requests, &mut declaration)?;
+            phase = declaration
+                .finish()
+                .map(|phase| phase::PhaseState::new(phase, &requests))
+                .transpose()?;
+            input.adapter.plan(Some(action), &requests, &mut plan)?;
+        } else if let Some(phase) = &phase {
+            input
+                .adapter
+                .plan_phase(action, phase.phase(), &requests, &mut plan)?;
+        } else {
+            input.adapter.plan(None, &requests, &mut plan)?;
+        }
         if plan.groups.is_empty() {
             return Err(Unsupported::NoProgress);
         }
@@ -866,6 +909,9 @@ fn simulate_recorded<Action, Adapter: TrajectoryAdapter<Action>>(
                 // Continue normal scheduling after early target attainment until
                 // the common window has also been observed. No paused winners.
                 if central >= window && reached.is_some() {
+                    if let Some(phase) = &phase {
+                        phase.progressed(&requests)?;
+                    }
                     return Ok(StaticTrajectory::Complete(TrajectoryResult {
                         requests,
                         window_progress,
@@ -877,6 +923,14 @@ fn simulate_recorded<Action, Adapter: TrajectoryAdapter<Action>>(
                     }));
                 }
             }
+        }
+        if phase
+            .as_mut()
+            .map(|phase| phase.advance(&requests))
+            .transpose()?
+            .unwrap_or(false)
+        {
+            phase = None;
         }
         rounds += 1;
         if probe.is_none()

@@ -67,7 +67,7 @@ use parking_lot::{Mutex, RwLock};
 use serde::Serialize;
 use std::{
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
-    num::NonZeroU64,
+    num::{NonZeroU64, NonZeroUsize},
     sync::{
         atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering},
         Arc,
@@ -411,6 +411,13 @@ struct ExecutionMaintenanceRetryTicket {
     latest_capacity_epoch: u64,
 }
 
+/// A finite policy commitment, separate from observed execution capacity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PrefillPhaseCap {
+    limit: NonZeroUsize,
+    prompt_tokens: usize,
+}
+
 /// Extended scheduled request with continuous batching metadata
 #[derive(Debug, Clone)]
 pub struct ContinuousBatchRequest {
@@ -429,6 +436,9 @@ pub struct ContinuousBatchRequest {
     /// A decode-only first wave may defer this frontier once. Only actual
     /// logical progress, not replanning or prefix restoration, renews it.
     joint_decode_only_deferred_generation: Option<LogicalWorkGeneration>,
+    /// A selected positive chunk limit lasts through this original prefill.
+    /// It is not a capacity estimate and survives a later prediction expiry.
+    joint_prefill_phase_cap: Option<PrefillPhaseCap>,
     /// Optional restore state for this admission, separate from compute work.
     prefix_restore: PrefixRestoreState,
     prefix_rendezvous: prefix_rendezvous::PrefixRendezvousRequestState,
@@ -481,6 +491,7 @@ impl ContinuousBatchRequest {
             slo_first_token_emitted: false,
             logical_work_frontier: LogicalWorkFrontier::default(),
             joint_decode_only_deferred_generation: None,
+            joint_prefill_phase_cap: None,
             prefix_restore: PrefixRestoreState::default(),
             prefix_rendezvous: prefix_rendezvous::PrefixRendezvousRequestState::default(),
             kv_blocks: Vec::new(),
@@ -3392,6 +3403,7 @@ impl ContinuousBatchScheduler {
         {
             let mut req = prefill_queue.remove(pos).unwrap();
             req.phase = RequestPhase::Decoding;
+            req.joint_prefill_phase_cap = None;
             req.capacity_deferred_until_release_epoch = 0;
             req.capacity_deferred_mixed_attempt_epoch = None;
             req.capacity_deferred_empty_retry_epoch = None;
@@ -3533,6 +3545,9 @@ impl ContinuousBatchScheduler {
     }
 
     fn apply_prefill_execution_chunk_ceiling(req: &ContinuousBatchRequest, tokens: usize) -> usize {
+        let tokens = req
+            .joint_prefill_phase_cap
+            .map_or(tokens, |cap| tokens.min(cap.limit.get()));
         let tokens = req
             .prefill_execution_chunk_ceiling
             .map(|ceiling| tokens.min(ceiling))

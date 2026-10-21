@@ -1,6 +1,7 @@
 //! Compare legal first-wave edits against the actual static wave. Resource
 //! owners retain admission/commit authority; unsupported projections keep it.
 
+mod prefill_phase;
 mod trajectory;
 
 #[cfg(test)]
@@ -18,6 +19,22 @@ struct Cohort {
     requests: Vec<SimulatedRequest>,
     facts: Vec<RequestStoppingObservation>,
     trajectory: CohortTrajectory,
+    wave_bindings: Vec<WaveBinding>,
+}
+
+#[derive(Clone)]
+struct WaveBinding {
+    id: RequestId,
+    ticket: WaitingAdmissionTicket,
+    generation: LogicalWorkGeneration,
+    prompt_tokens: usize,
+    offset: usize,
+    work: CostWork,
+}
+
+pub(super) struct SelectedJointAction {
+    action: FirstAction,
+    wave_bindings: Vec<WaveBinding>,
 }
 
 impl ContinuousBatchScheduler {
@@ -38,10 +55,12 @@ impl ContinuousBatchScheduler {
         round.prediction_elapsed = prior_elapsed.saturating_add(started.elapsed());
         match outcome {
             Ok(Some(action)) => {
+                let decode_only = matches!(action.action, FirstAction::DecodeOnly);
+                let phase = matches!(action.action, FirstAction::PrefillPhaseLimit(_));
                 if self.apply_joint_first_wave(batch, round, action) {
                     round.statistics.joint_interventions += 1;
-                    round.statistics.joint_decode_only_interventions +=
-                        u64::from(matches!(action, FirstAction::DecodeOnly));
+                    round.statistics.joint_decode_only_interventions += u64::from(decode_only);
+                    round.statistics.joint_prefill_phase_interventions += u64::from(phase);
                 } else {
                     round.statistics.static_fallbacks += 1;
                 }
@@ -54,14 +73,14 @@ impl ContinuousBatchScheduler {
         }
     }
 
-    fn compare_joint_first_wave(
+    pub(super) fn compare_joint_first_wave(
         &self,
         hint: &BatchHint,
         batch: &[ScheduledRequest],
         round: &mut TimePlanningRound,
         now: Instant,
-    ) -> std::result::Result<Option<FirstAction>, Unsupported> {
-        let (decision, alternatives, _) =
+    ) -> std::result::Result<Option<SelectedJointAction>, Unsupported> {
+        let (decision, alternatives, _, wave_bindings) =
             self.evaluate_joint_action_set(hint, batch, round, now, ComparisonKind::Dispatch)?;
         let mut record = |outcome| {
             round.statistics.joint_decision.consume(
@@ -73,7 +92,13 @@ impl ContinuousBatchScheduler {
         match decision.choice {
             PolicyChoice::Alternative(index) => {
                 record(DecisionConsumerOutcome::Alternative);
-                Ok(alternatives.get(index).copied())
+                Ok(alternatives
+                    .get(index)
+                    .copied()
+                    .map(|action| SelectedJointAction {
+                        action,
+                        wave_bindings,
+                    }))
             }
             PolicyChoice::Static => {
                 record(DecisionConsumerOutcome::StaticFeasible);
@@ -102,7 +127,7 @@ impl ContinuousBatchScheduler {
         let started = Instant::now();
         let result = self
             .evaluate_joint_action_set(hint, &[], round, now, ComparisonKind::Admission)
-            .and_then(|(decision, _, missing_stopping)| {
+            .and_then(|(decision, _, missing_stopping, _)| {
                 if decision.choice == PolicyChoice::Unresolved && missing_stopping {
                     round.statistics.joint_decision.consume(
                         ComparisonKind::Admission,
@@ -125,7 +150,15 @@ impl ContinuousBatchScheduler {
         round: &mut TimePlanningRound,
         now: Instant,
         comparison_kind: ComparisonKind,
-    ) -> std::result::Result<(ScenarioPolicyDecision, Vec<FirstAction>, bool), Unsupported> {
+    ) -> std::result::Result<
+        (
+            ScenarioPolicyDecision,
+            Vec<FirstAction>,
+            bool,
+            Vec<WaveBinding>,
+        ),
+        Unsupported,
+    > {
         let started = Instant::now();
         let remaining_time = Duration::from_micros(round.config.planning.max_elapsed_us)
             .checked_sub(round.prediction_elapsed)
@@ -170,6 +203,21 @@ impl ContinuousBatchScheduler {
         if cohort.trajectory.allows_decode_only(&first_wave) {
             alternatives.push(FirstAction::DecodeOnly);
         }
+        // These finite phases bind only the actual resident first wave. The
+        // empty-batch admission projection cannot install a future promise.
+        if !batch.is_empty() && cohort.wave_bindings.len() == batch.len() {
+            for limit in [largest.div_ceil(2), quarter] {
+                let Some(limit) = NonZeroUsize::new(limit) else {
+                    continue;
+                };
+                if !alternatives.iter().any(|action| {
+                    matches!(action, FirstAction::PrefillPhaseLimit(previous) if *previous == limit)
+                }) && cohort.trajectory.allows_prefill_phase(&cohort.requests, limit)
+                {
+                    alternatives.push(FirstAction::PrefillPhaseLimit(limit));
+                }
+            }
+        }
         if alternatives.len() + 1 > round.config.planning.max_candidates {
             return Err(Unsupported::CandidateBudget);
         }
@@ -186,6 +234,36 @@ impl ContinuousBatchScheduler {
             .ok_or(Unsupported::ParticipantBudget)?;
         if forecast_bytes > round.config.planning.max_request_fact_bytes {
             return Err(Unsupported::ParticipantBudget);
+        }
+        if alternatives
+            .iter()
+            .any(|action| matches!(action, FirstAction::PrefillPhaseLimit(_)))
+        {
+            let phase_bytes = ContinuationPhase::prefill_targets_bytes_bound(cohort.requests.len())
+                .ok_or(Unsupported::ParticipantBudget)?;
+            let clocks_bytes = round
+                .request_clocks()
+                .ok_or(Unsupported::InvalidClock)?
+                .len()
+                .checked_mul(std::mem::size_of::<(RequestId, RequestClockFacts)>())
+                .ok_or(Unsupported::ParticipantBudget)?;
+            let binding_bytes = cohort
+                .wave_bindings
+                .len()
+                .checked_mul(std::mem::size_of::<WaveBinding>())
+                // The later apply uses smaller per-member update tuples.
+                .and_then(|bytes| bytes.checked_mul(2))
+                .ok_or(Unsupported::ParticipantBudget)?;
+            let bytes = round
+                .request_fact_bytes
+                .checked_add(clocks_bytes)
+                .and_then(|bytes| bytes.checked_add(forecast_bytes))
+                .and_then(|bytes| bytes.checked_add(binding_bytes))
+                .and_then(|bytes| bytes.checked_add(phase_bytes))
+                .ok_or(Unsupported::ParticipantBudget)?;
+            if bytes > round.config.planning.max_request_fact_bytes {
+                return Err(Unsupported::ParticipantBudget);
+            }
         }
         let mut forecasts = Vec::with_capacity(cohort.facts.len());
         let mut success = Vec::with_capacity(cohort.facts.len());
@@ -334,19 +412,32 @@ impl ContinuousBatchScheduler {
             return Err(Unsupported::TimeBudget);
         }
         round.statistics.joint_decision.returned(comparison_kind);
-        Ok((decision, alternatives, missing_stopping))
+        Ok((
+            decision,
+            alternatives,
+            missing_stopping,
+            cohort.wave_bindings,
+        ))
     }
 
-    fn apply_joint_first_wave(
+    pub(super) fn apply_joint_first_wave(
         &self,
         batch: &mut Vec<ScheduledRequest>,
         round: &mut TimePlanningRound,
-        action: FirstAction,
+        selected: SelectedJointAction,
     ) -> bool {
-        let limit = match action {
+        let limit = match selected.action {
             FirstAction::Static => return false,
             FirstAction::DecodeOnly => return self.apply_joint_decode_only(batch, round),
             FirstAction::PrefillLimit(limit) => limit.get(),
+            FirstAction::PrefillPhaseLimit(limit) => {
+                return self.apply_joint_prefill_phase(
+                    batch,
+                    round,
+                    limit,
+                    &selected.wave_bindings,
+                );
+            }
         };
         let mut prefill = self.prefill_queue.write();
         let mut updates = Vec::new();
@@ -654,6 +745,12 @@ impl ContinuousBatchScheduler {
             let prompt = self
                 .prompt_token_estimate(request)
                 .ok_or(Unsupported::InvalidState)?;
+            if request
+                .joint_prefill_phase_cap
+                .is_some_and(|cap| cap.prompt_tokens != prompt)
+            {
+                return Err(Unsupported::InvalidState);
+            }
             let prefilled = if request.phase == RequestPhase::Decoding {
                 prompt
             } else {
@@ -722,6 +819,7 @@ impl ContinuousBatchScheduler {
             shapes.push(RequestShape {
                 restored_tokens: request.prefix_restore.restored_tokens(),
                 execution_ceiling: request.prefill_execution_chunk_ceiling,
+                phase_cap: request.joint_prefill_phase_cap.map(|cap| cap.limit),
                 decode_only_allowed: request
                     .joint_decode_only_deferred_generation
                     .is_none_or(|last| request.logical_work_frontier.progress_generation() > last),
@@ -754,9 +852,62 @@ impl ContinuousBatchScheduler {
                 })
             })
             .collect::<std::result::Result<Vec<_>, Unsupported>>()?;
+        let binding_count = if first_wave.iter().any(|member| {
+            member.work.kind == ferrum_execution::execution_attempt::AttemptWorkKind::Prefill
+                && shapes[member.request]
+                    .phase_cap
+                    .is_none_or(|cap| cap.get() > 1)
+                && requests[member.request]
+                    .prompt_tokens
+                    .saturating_sub(requests[member.request].prefill_tokens)
+                    > 1
+        }) {
+            batch.len()
+        } else {
+            0
+        };
+        let binding_bytes = binding_count
+            .checked_mul(std::mem::size_of::<WaveBinding>())
+            .and_then(|bytes| bytes.checked_add(round.request_fact_bytes))
+            .and_then(|bytes| {
+                clocks
+                    .len()
+                    .checked_mul(std::mem::size_of::<(RequestId, RequestClockFacts)>())
+                    .and_then(|clocks| bytes.checked_add(clocks))
+            })
+            .ok_or(Unsupported::ParticipantBudget)?;
+        if binding_bytes > round.config.planning.max_request_fact_bytes {
+            return Err(Unsupported::ParticipantBudget);
+        }
+        let mut wave_bindings = Vec::new();
+        wave_bindings
+            .try_reserve_exact(binding_count)
+            .map_err(|_| Unsupported::ParticipantBudget)?;
+        for (scheduled, member) in batch.iter().zip(&first_wave).take(binding_count) {
+            let request = prefill
+                .iter()
+                .chain(decode.requests.values())
+                .find(|request| request.inner.request.id == scheduled.request.id)
+                .ok_or(Unsupported::InvalidState)?;
+            let Some(ticket) = request.waiting_admission_ticket else {
+                // Legacy externally constructed fixtures can still use the
+                // original actions, but cannot install a lifecycle commitment.
+                wave_bindings.clear();
+                break;
+            };
+            wave_bindings.push(WaveBinding {
+                id: scheduled.request.id.clone(),
+                ticket,
+                generation: request.logical_work_frontier.progress_generation(),
+                prompt_tokens: requests[member.request].prompt_tokens,
+                offset: scheduled.tokens_processed,
+                work: member.work,
+            });
+        }
         Ok(Cohort {
             requests,
             facts: ordered_facts,
+            wave_bindings,
             trajectory: CohortTrajectory {
                 first_wave,
                 shapes,

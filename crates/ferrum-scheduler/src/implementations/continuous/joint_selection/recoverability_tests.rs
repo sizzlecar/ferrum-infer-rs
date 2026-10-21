@@ -186,6 +186,7 @@ fn fixture() -> (SchedulerSloConfig, Vec<SimulatedRequest>, PhaseAdapter) {
             RequestShape {
                 restored_tokens: 0,
                 execution_ceiling: None,
+                phase_cap: None,
                 decode_only_allowed: true,
             };
             2

@@ -157,8 +157,8 @@ The joint policy keeps the original static wave and compares smaller prefill
 chunks. When that wave contains both prefill and decode work, it can also
 consider a decode-only first wave. This action retains every selected decoder
 and postpones the selected prefills; it does not change their admission, prompt
-position, output limit, or resource ownership. All candidates use the same
-continuation after the first wave and retain the existing support, planning,
+position, output limit, or resource ownership. These first-wave actions use the
+same continuation after that wave and retain the existing support, planning,
 joint-risk, and gain checks.
 
 A request can be postponed this way only once without actual logical prefill
@@ -169,6 +169,26 @@ ordinary scheduling remains responsible for resource waits and subsequent
 work. These rules do not establish a measured latency or throughput benefit.
 `joint_decode_only_interventions` counts successfully applied decode-only waves
 within `joint_interventions`; merely evaluating or rejecting one does not count.
+
+Dispatch also compares positive prefill phase limits derived from half and a
+quarter of the selected prefill chunk. A phase binds only the actual selected
+resident prefills, through their original prompt endpoints. Every simulated
+phase wave must advance those endpoints; after completion it resumes the same
+ordinary continuation. The real scheduler installs the selected limits
+atomically against the request lifecycle and work frontier. It applies each
+limit before charging later token budgets, so remaining capacity can serve
+other work.
+
+An installed limit survives stale or unknown forecasts and execution-capacity
+feedback. Further decisions can tighten it; it clears when the original prefill
+enters decode or the request ends. New arrivals and reused request IDs do not
+inherit it. The policy cap is separate from the executor's capacity ceiling.
+`joint_prefill_phase_interventions` counts successful installations within
+`joint_interventions`, not completed GPU executions. This action is currently
+dispatch-only: admission does not assume a future phase installation, so some
+arrivals may still be conservatively rejected. Positive chunks and the modeled
+progress check do not establish general starvation freedom or measured SLO
+compliance. The shared scheduler applies these rules to both `run` and `serve`.
 
 ## Unknown and infeasible forecasts
 

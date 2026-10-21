@@ -1,6 +1,8 @@
 use super::*;
 use std::sync::atomic::AtomicUsize;
 
+mod prefill_phase;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Blocker {
     None,
@@ -310,9 +312,11 @@ fn joint_decode_only_wave_is_feasible_and_defers_without_losing_prefill_work() {
         assert_eq!(decision.returned, 1);
         assert_eq!(decision.consumed, 1);
         assert_eq!(decision.outcomes.alternative, 1);
-        assert_eq!(decision.candidates.joint.infeasible, 2);
+        // Both one-wave limits and both finite phase limits delay the decoder
+        // beyond5s on their very first wave. DecodeOnly remains the sole rescue.
+        assert_eq!(decision.candidates.joint.infeasible, 4);
         assert_eq!(decision.candidates.joint.feasible, 1);
-        assert_eq!(decision.candidates.metrics.itl.infeasible, 2);
+        assert_eq!(decision.candidates.metrics.itl.infeasible, 4);
         assert_eq!(decision.candidates.gates.eligible, 1);
         assert_eq!(round.statistics.joint_evaluation.dispatch.rank_completed, 2);
         assert_eq!(
@@ -393,7 +397,7 @@ fn joint_decode_only_wave_is_feasible_and_defers_without_losing_prefill_work() {
 
 #[test]
 fn joint_decode_only_is_not_an_empty_or_pure_prefill_action() {
-    for (prefill, decode, expected_candidates) in [(true, false, 2), (false, true, 0)] {
+    for (prefill, decode, expected_candidates) in [(true, false, 4), (false, true, 0)] {
         let fixture = decode_only_fixture(
             prefill,
             decode,

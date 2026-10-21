@@ -663,6 +663,8 @@ pub(crate) struct PlanningStatistics {
     /// Successful decode-only first-wave applications; a subset of interventions.
     /// Candidate evaluation and an attempted but failed application do not count.
     pub joint_decode_only_interventions: u64,
+    /// Successful first-wave applies that install an explicit prefill phase.
+    pub joint_prefill_phase_interventions: u64,
     pub joint_unknown_resources: u64,
     pub joint_unresolved: u64,
     /// Returned comparison failures only; not inferred causes or request counts.
