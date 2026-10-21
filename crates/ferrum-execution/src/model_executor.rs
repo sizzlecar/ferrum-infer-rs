@@ -81,6 +81,32 @@ pub struct KvSlotCapacitySnapshot {
     pub free_blocks: usize,
 }
 
+/// Scope of a paged owner's persistent admission proof. Unknown is the default:
+/// a free KV block count does not account for recurrent state, other pools, or
+/// per-sequence device metadata that would require a new allocation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum PagedAdmissionCoverage {
+    #[default]
+    Unknown,
+    /// All persistent request/sequence storage is covered by the observed KV
+    /// pool and already allocated reusable metadata. Existing sequences retain
+    /// their own metadata; only newly admitted sequences consume this bound.
+    /// This does not promise transient workspace, execution success, or reserve
+    /// any storage. Actual admission remains the original owner's authority.
+    AllPersistentState {
+        max_new_sequences: usize,
+        max_sequence_tokens: usize,
+        max_batch_sequences: usize,
+    },
+}
+
+/// KV blocks and persistent-state coverage observed under the same owner lock.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PagedAdmissionCapacitySnapshot {
+    pub slots: KvSlotCapacitySnapshot,
+    pub coverage: PagedAdmissionCoverage,
+}
+
 /// Token-validity mask for model-side greedy argmax.
 ///
 /// `valid_token_mask[id] != 0` means token `id` may be selected. Tokens at or
@@ -2089,6 +2115,15 @@ pub trait ModelExecutor: Send + Sync + 'static {
     /// Get model information and metadata
     fn info(&self) -> &ModelInfo;
 
+    /// Optional identity of the concrete executor implementation. A product
+    /// may combine this with its executable/operator fingerprints, loaded
+    /// sources, effective configuration and physical device evidence to bind
+    /// persisted performance models. This identifier alone authorizes no reuse.
+    /// Custom executors without that evidence remain instance scoped.
+    fn implementation_identity(&self) -> Option<&'static str> {
+        None
+    }
+
     /// Declares the resource planning model used by this implementation.
     /// Both variants execute and close through the same exact token sequence
     /// protocol. `CompiledPlan` additionally exposes its immutable resolved plan
@@ -2346,6 +2381,17 @@ pub trait ModelExecutor: Send + Sync + 'static {
     /// Executors without model-owned paged KV return `None`.
     fn kv_slot_capacity_snapshot(&self) -> Option<KvSlotCapacitySnapshot> {
         None
+    }
+
+    /// Read-only cohort admission evidence from the original resource owner.
+    /// Implementations may strengthen coverage only when all persistent pools
+    /// and required per-sequence metadata are accounted for by this snapshot.
+    fn paged_admission_capacity_snapshot(&self) -> Option<PagedAdmissionCapacitySnapshot> {
+        self.kv_slot_capacity_snapshot()
+            .map(|slots| PagedAdmissionCapacitySnapshot {
+                slots,
+                coverage: PagedAdmissionCoverage::Unknown,
+            })
     }
 
     /// Get executor capabilities

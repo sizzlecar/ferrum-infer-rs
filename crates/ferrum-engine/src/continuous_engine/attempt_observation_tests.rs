@@ -66,6 +66,88 @@ async fn real_cpu_engine(
     real_cpu_engine_config(observer, EngineConfig::default()).await
 }
 
+struct PreparedRecorder {
+    target: Arc<AttemptRecorder>,
+    prepared: Arc<AtomicU64>,
+    completed: Arc<AtomicU64>,
+    panic_prepare: bool,
+    panic_complete: bool,
+}
+struct PreparedCompletion {
+    target: Arc<AttemptRecorder>,
+    prepared_at: Instant,
+    completed: Arc<AtomicU64>,
+    panic_complete: bool,
+}
+impl ExecutionAttemptObserver for PreparedRecorder {
+    fn limits(&self) -> ExecutionAttemptLimits {
+        self.target.limits()
+    }
+    fn prepare(
+        &self,
+        participants: &[ExecutionAttemptParticipant],
+    ) -> Option<Box<dyn ExecutionAttemptCompletion>> {
+        assert!(participants
+            .iter()
+            .all(|p| p.outcome == AttemptParticipantOutcome::Unverified));
+        self.prepared.fetch_add(1, Ordering::Relaxed);
+        assert!(!self.panic_prepare, "injected prepare panic");
+        Some(Box::new(PreparedCompletion {
+            target: self.target.clone(),
+            prepared_at: Instant::now(),
+            completed: self.completed.clone(),
+            panic_complete: self.panic_complete,
+        }))
+    }
+    fn try_record(&self, summary: &ExecutionAttemptSummary) -> ExecutionAttemptDelivery {
+        self.target.try_record(summary)
+    }
+}
+impl ExecutionAttemptCompletion for PreparedCompletion {
+    fn try_record(self: Box<Self>, summary: &ExecutionAttemptSummary) -> ExecutionAttemptDelivery {
+        assert!(summary.started_at >= self.prepared_at);
+        self.completed.fetch_add(1, Ordering::Relaxed);
+        assert!(!self.panic_complete, "injected completion panic");
+        self.target.try_record(summary)
+    }
+}
+
+#[tokio::test]
+async fn frozen_attempt_callback_precedes_real_execution_and_panics_preserve_outputs() {
+    let off = real_cpu_engine(None).await;
+    let baseline = off.infer(request()).await.unwrap();
+    off.shutdown().await.unwrap();
+    off.wait_for_shutdown_completion().await.unwrap();
+    for (panic_prepare, panic_complete) in [(false, false), (true, false), (false, true)] {
+        let target = Arc::new(AttemptRecorder::default());
+        let prepared = Arc::new(AtomicU64::new(0));
+        let completed = Arc::new(AtomicU64::new(0));
+        let observer = Arc::new(PreparedRecorder {
+            target: target.clone(),
+            prepared: prepared.clone(),
+            completed: completed.clone(),
+            panic_prepare,
+            panic_complete,
+        });
+        let on = real_cpu_engine(Some(observer)).await;
+        let result = on.infer(request()).await.unwrap();
+        on.shutdown().await.unwrap();
+        on.wait_for_shutdown_completion().await.unwrap();
+        assert_eq!(result.response().tokens, baseline.response().tokens);
+        assert_eq!(result.response().text, baseline.response().text);
+        let expected = prepared.load(Ordering::Relaxed);
+        assert!(expected > 0);
+        assert_eq!(
+            completed.load(Ordering::Relaxed),
+            if panic_prepare { 0 } else { expected }
+        );
+        assert_eq!(
+            target.take().len() as u64,
+            if panic_complete { 0 } else { expected }
+        );
+    }
+}
+
 async fn real_cpu_engine_config(
     observer: Option<Arc<dyn ExecutionAttemptObserver>>,
     config: EngineConfig,

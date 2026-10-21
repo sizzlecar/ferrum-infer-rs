@@ -116,6 +116,7 @@ fn predict(
         &CostQuery {
             work: &work(sample),
             work_is_exact: true,
+            execution: ferrum_scheduler::cost_prediction::CostExecution::SingleInvocation,
         },
         now,
     )
@@ -323,7 +324,8 @@ async fn reference_publishes_immutable_bounded_windows_and_expiring_estimates() 
         latest.predict(
             &CostQuery {
                 work: &work(&first),
-                work_is_exact: false
+                work_is_exact: false,
+                execution: ferrum_scheduler::cost_prediction::CostExecution::SingleInvocation,
             },
             Instant::now()
         ),

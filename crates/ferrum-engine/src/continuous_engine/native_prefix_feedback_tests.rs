@@ -176,6 +176,9 @@ struct PredictionWitness {
 }
 
 impl CostSnapshot for PredictionWitness {
+    fn query_limits(&self) -> ferrum_types::CostQueryLimits {
+        self.original.query_limits()
+    }
     fn revision(&self) -> u64 {
         self.original.revision()
     }
@@ -243,6 +246,7 @@ fn predict(snapshot: &dyn CostSnapshot, work: CostWork) -> CostPrediction {
         &CostQuery {
             work: &[work],
             work_is_exact: true,
+            execution: ferrum_scheduler::cost_prediction::CostExecution::SingleInvocation,
         },
         Instant::now(),
     )
@@ -313,7 +317,11 @@ async fn native_prefix_feedback_metal_learns_acknowledged_restore_and_retires_or
         ttft_ms: 60_000.0,
         tpot_ms: 60_000.0,
         itl_ms: 60_000.0,
-        reference: reference_config,
+        query: Default::default(),
+        planning: Default::default(),
+        joint: Default::default(),
+        strategy: Default::default(),
+        unknown_stopping: Default::default(),
         unknown_cost: Default::default(),
     });
     let tokenizer = Arc::new(FixtureTokenizer::new());

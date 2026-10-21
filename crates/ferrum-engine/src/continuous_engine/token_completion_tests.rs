@@ -359,6 +359,15 @@ pub(super) async fn fixture_with_tokenizer(
     publication_error: bool,
     make_tokenizer: impl FnOnce(usize) -> Arc<dyn Tokenizer>,
 ) -> Fixture {
+    fixture_with_feedback(delayed, publication_error, make_tokenizer, None).await
+}
+
+pub(super) async fn fixture_with_feedback(
+    delayed: bool,
+    publication_error: bool,
+    make_tokenizer: impl FnOnce(usize) -> Arc<dyn Tokenizer>,
+    observer: Option<Arc<dyn ferrum_interfaces::request_observation::RequestStoppingObserver>>,
+) -> Fixture {
     let (inner, model, cfg) = observed_cpu_model_owned();
     let owner = ExecutorOwner::new(inner);
     let inner = Arc::new(owner.scope().unwrap());
@@ -386,12 +395,17 @@ pub(super) async fn fixture_with_tokenizer(
     config.runtime.scheduler_trace_jsonl = Some(trace.path().join("trace.jsonl"));
     let scheduler = Arc::new(ContinuousBatchScheduler::new(config.scheduler.clone()));
     let tokenizer = make_tokenizer(cfg.vocab_size);
-    let engine = ContinuousBatchEngine::new(
+    let observed = observer.is_some();
+    let engine = ContinuousBatchEngine::new_observed_with_requests(
         config,
         scheduler.clone(),
         tokenizer.clone(),
         Arc::new(crate::registry::GreedySampler),
         owned_executor,
+        None,
+        None,
+        None,
+        observer,
     )
     .unwrap();
     executor
@@ -399,7 +413,7 @@ pub(super) async fn fixture_with_tokenizer(
         .bind(&engine.active_inner().unwrap().model_executor);
     let engine_inner = engine.active_inner().unwrap();
     let mut request = InferenceRequest::new("real token closure", "tiny-llama-test");
-    request.sampling_params.max_tokens = 4;
+    request.sampling_params.max_tokens = if observed { 1 } else { 4 };
     request.sampling_params.temperature = 0.0;
     request.evidence_request.capture_engine_token_timing = true;
     let request_id = request.id.clone();
@@ -459,6 +473,7 @@ pub(super) async fn fixture_with_tokenizer(
         Some(tokenizer),
         Some(cfg.vocab_size),
     );
+    engine_inner.attach_request_stopping(&mut state);
     state.execution_frontier = Some(completion.next_frontier().clone());
     state.prefill_complete = true;
     state.prefill_tokens_processed = prompt.len();

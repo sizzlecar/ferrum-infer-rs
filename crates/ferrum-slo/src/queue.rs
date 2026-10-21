@@ -5,6 +5,60 @@ use std::sync::{
     Arc,
 };
 
+/// Nonblocking execution collection bounds shared by all estimator families.
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct CollectionConfig {
+    pub queue_capacity: usize,
+    pub max_queue_bytes: usize,
+    pub max_participants: usize,
+    pub max_summary_bytes: usize,
+}
+
+impl Default for CollectionConfig {
+    fn default() -> Self {
+        ReferenceEstimatorConfig::default().into()
+    }
+}
+
+impl From<ReferenceEstimatorConfig> for CollectionConfig {
+    fn from(config: ReferenceEstimatorConfig) -> Self {
+        Self {
+            queue_capacity: config.queue_capacity,
+            max_queue_bytes: config.max_queue_bytes,
+            max_participants: config.max_participants,
+            max_summary_bytes: config.max_summary_bytes,
+        }
+    }
+}
+
+impl CollectionConfig {
+    pub fn validate(self) -> Result<(), crate::EstimatorError> {
+        let invalid = |message: &str| crate::EstimatorError::Configuration(message.into());
+        if self.queue_capacity == 0
+            || self.max_participants == 0
+            || self.max_queue_bytes < self.max_summary_bytes
+        {
+            return Err(invalid("invalid observation capacity"));
+        }
+        self.queue_capacity
+            .checked_add(1)
+            .and_then(usize::checked_next_power_of_two)
+            .and_then(|mark| mark.checked_mul(2))
+            .ok_or_else(|| invalid("queue index overflow"))?;
+        std::alloc::Layout::array::<Envelope>(self.queue_capacity)
+            .map_err(|_| invalid("queue allocation extent overflow"))?;
+        let one = ExecutionAttemptSummary::projected_bytes(1)
+            .ok_or_else(|| invalid("summary extent overflow"))?;
+        if one > self.max_summary_bytes || one > self.max_queue_bytes {
+            return Err(invalid("observation byte limit must fit one participant"));
+        }
+        ExecutionAttemptSummary::projected_bytes(self.max_participants)
+            .ok_or_else(|| invalid("participant extent overflow"))?;
+        Ok(())
+    }
+}
+
 macro_rules! counters {
     ($($field:ident),+ $(,)?) => {
         #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
@@ -36,12 +90,22 @@ counters!(
     trained_samples,
     published_snapshots,
     training_failures,
+    model_fit_attempts,
+    model_fits,
+    calibration_updates,
+    worker_base_prediction_known,
+    worker_base_prediction_unknown,
+    feedback_delay_samples,
+    feedback_delay_total_ns,
+    feedback_delay_max_ns,
+    model_fit_total_ns,
+    model_fit_max_ns,
     worker_failures,
     discarded_pending
 );
 
 pub(super) struct Shared {
-    pub config: ReferenceEstimatorConfig,
+    pub config: CollectionConfig,
     pub counters: Counters,
     records: AtomicUsize,
     bytes: AtomicUsize,
@@ -51,9 +115,9 @@ pub(super) struct Shared {
 }
 
 impl Shared {
-    pub fn new(config: ReferenceEstimatorConfig, wake: crossbeam_channel::Sender<()>) -> Self {
+    pub fn new(config: impl Into<CollectionConfig>, wake: crossbeam_channel::Sender<()>) -> Self {
         Self {
-            config,
+            config: config.into(),
             counters: Counters::default(),
             records: AtomicUsize::new(0),
             bytes: AtomicUsize::new(0),

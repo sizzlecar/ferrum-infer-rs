@@ -267,6 +267,8 @@ impl SequenceSamplingHistory {
 #[derive(Debug)]
 pub struct SequenceState {
     pub request_id: RequestId,
+    pub(super) stopping_observation:
+        Option<ferrum_interfaces::request_observation::RequestStoppingObservation>,
     /// Original request — kept for re-submission after preemption.
     pub original_request: InferenceRequest,
     pub input_tokens: Vec<TokenId>,
@@ -306,20 +308,14 @@ pub struct SequenceState {
     /// One entry is recorded after each generated token becomes committed
     /// engine state, independent of text decoding or stream flushing.
     token_timing: Option<SequenceTokenTiming>,
-    /// Wall-clock `Instant` at which the first SSE chunk was actually
-    /// sent to the client stream. Populated lazily by `send_stream_update`
-    /// the first time a non-empty delta is emitted (multi-byte UTF-8
-    /// buffering can defer that past the first scheduler-completed token).
-    /// Used to record `ferrum.engine.ttft_seconds` and as the start point
-    /// of the TPOT window.
+    /// First nonempty text publication into engine output custody. Pending
+    /// backpressured text can precede successful channel delivery. Retained
+    /// for legacy engine metrics; planning reads OutputSender's delivery clock.
     pub first_emit_at: Option<Instant>,
-    /// Wall-clock `Instant` at the most recent successfully-sent chunk.
-    /// Used to compute per-token ITL deltas (`ferrum.engine.itl_seconds`).
+    /// Most recent nonempty publication, under the same legacy metric semantics.
     pub last_emit_at: Option<Instant>,
-    /// Count of stream chunks successfully sent to the client. Lags
-    /// `generated_tokens.len()` by the number of tokens currently buffered
-    /// for a multi-byte UTF-8 sequence (so a Chinese char split across
-    /// 2 BPE tokens emits once, increments the count by 1).
+    /// Nonempty text publications, which may still await channel delivery and
+    /// may combine multiple generated tokens into one text event.
     pub emitted_chunks: u32,
     pub tokens_this_iteration: usize,
     /// Number of times this request has been preempted.
@@ -587,6 +583,7 @@ impl SequenceState {
             .transpose()?;
         Ok(Self {
             request_id: request.id.clone(),
+            stopping_observation: None,
             original_request: request.clone(),
             input_tokens,
             generated_tokens: Vec::new(),

@@ -7,7 +7,7 @@ use ferrum_types::{
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use tokio::fs;
 
 #[cfg(test)]
@@ -59,7 +59,9 @@ pub struct CliConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct SchedulerCliConfig {
     /// Optional latency targets for adaptive scheduling, in milliseconds.
-    pub slo: Option<ferrum_types::SchedulerSloConfig>,
+    pub slo: Option<ferrum_types::SloConfig>,
+    /// Optional model/calibration state loaded at startup and saved on shutdown.
+    pub slo_state_path: Option<PathBuf>,
 }
 
 /// Server CLI configuration
@@ -745,8 +747,8 @@ impl CliConfig {
 
     pub fn resolve_scheduler_slo(
         &self,
-        cli: Option<ferrum_types::SchedulerSloConfig>,
-    ) -> Result<Option<ferrum_types::SchedulerSloConfig>> {
+        cli: Option<ferrum_types::SloConfig>,
+    ) -> Result<Option<ferrum_types::SloConfig>> {
         let slo = cli.or(self.scheduler.slo);
         if let Some(slo) = slo {
             slo.validate().map_err(ferrum_types::FerrumError::config)?;
@@ -1044,7 +1046,12 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            config.resolve_scheduler_slo(None).unwrap().unwrap().tpot_ms,
+            config
+                .resolve_scheduler_slo(None)
+                .unwrap()
+                .unwrap()
+                .policy
+                .tpot_ms,
             15.0
         );
         assert_eq!(config.runtime.prefix_cache, Some(false));

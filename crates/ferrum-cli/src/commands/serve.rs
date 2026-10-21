@@ -169,7 +169,11 @@ pub struct ServeCommand {
 
     /// Enable adaptive scheduling with millisecond latency targets, e.g. ttft:200,tpot:15,itl:50.
     #[arg(long, value_name = "TARGETS")]
-    pub scheduler_slo: Option<ferrum_types::SchedulerSloConfig>,
+    pub scheduler_slo: Option<ferrum_types::SloConfig>,
+
+    /// Load and save the instance-bound learned SLO state at this path.
+    #[arg(long, value_name = "PATH")]
+    pub scheduler_slo_state: Option<PathBuf>,
 
     /// Sequence fit gate used before prefill admission.
     #[arg(long, value_enum)]
@@ -494,6 +498,7 @@ async fn run_serve_lifecycle(
         q5_mmvq_weight_decode,
         q8_projection_weight_preparation,
         scheduler_slo,
+        scheduler_slo_state,
         sequence_fit_policy,
         scheduler_prefill_first_until_active,
         scheduler_prefill_step_chunk,
@@ -544,6 +549,9 @@ async fn run_serve_lifecycle(
     } = cmd;
 
     let scheduler_slo = config.resolve_scheduler_slo(scheduler_slo)?;
+    let scheduler_slo_state = scheduler_slo_state
+        .as_deref()
+        .or(config.scheduler.slo_state_path.as_deref());
     let default_enable_thinking = if enable_thinking {
         Some(true)
     } else if disable_thinking {
@@ -668,7 +676,7 @@ async fn run_serve_lifecycle(
     let mut product_engine_config = product_input.engine_config;
     config.apply_output_and_tokenizer_config(&mut product_engine_config)?;
     config.apply_profile_journal_config(&mut product_engine_config)?;
-    product_engine_config.scheduler.slo = scheduler_slo;
+    product_engine_config.scheduler.slo = scheduler_slo.and_then(|slo| slo.scheduler_policy());
     product_engine_config.numerical_execution =
         config.resolve_numerical_execution(numerical_profile.as_ref());
     let config_runtime_entries = config.runtime.runtime_config_entries();
@@ -1111,7 +1119,12 @@ async fn run_serve_lifecycle(
             metadata.write(&journals, &product_observability)?;
         }
         let scopes = journals.engine_scopes(&engine_config)?;
-        let feedback = crate::slo_product::ProductExecutionFeedback::prepare(&engine_config)?;
+        let feedback = crate::slo_product::ProductExecutionFeedback::prepare_with_state(
+            &mut engine_config,
+            scheduler_slo,
+            model_sources.as_deref(),
+            scheduler_slo_state,
+        )?;
         let mut builder =
             ferrum_engine::EngineBuilder::new(engine_config).with_journal_scopes(scopes);
         builder = feedback.configure(builder);
@@ -1188,7 +1201,7 @@ async fn run_serve_lifecycle(
     write_resolved_execution_config(
         effective_config_json.as_deref(),
         resolved_execution_metrics.as_ref(),
-        scheduler_slo,
+        scheduler_slo.and_then(|slo| slo.scheduler_policy()),
     )?;
     let server = server
         .with_auto_config(startup_auto_config)
@@ -2332,7 +2345,7 @@ fn infer_sm_count_from_gpu_name(name: &str) -> Option<u32> {
     }
 }
 
-fn compiled_kernel_features() -> CompiledKernelFeatures {
+pub(crate) fn compiled_kernel_features() -> CompiledKernelFeatures {
     let fa2_native = ferrum_kernels::native_ops::compiled_fa2_native_operator_artifact();
     let native_operator_artifacts =
         ferrum_kernels::native_ops::compiled_native_operator_artifacts().to_vec();

@@ -43,8 +43,27 @@ pub enum ExecutionAttemptDelivery {
 /// is consumed or duplicated by this interface.
 pub trait ExecutionAttemptObserver: Send + Sync {
     fn limits(&self) -> ExecutionAttemptLimits;
+    /// Called once after bounded work projection, before the actual invocation.
+    /// Optional private observation state must be bounded and nonblocking; it
+    /// confers no execution authority and must not retain execution owners.
+    /// Outcomes in `participants` are not yet known. A panic is isolated by the
+    /// engine. Implementations must obey their CPU budget: synchronous callbacks
+    /// cannot be safely interrupted by a timeout.
+    fn prepare(
+        &self,
+        _participants: &[ExecutionAttemptParticipant],
+    ) -> Option<Box<dyn ExecutionAttemptCompletion>> {
+        None
+    }
     fn try_record(&self, summary: &ExecutionAttemptSummary) -> ExecutionAttemptDelivery;
     fn record_drop(&self, _reason: ExecutionAttemptDrop) {}
+}
+
+/// Private per-invocation observation continuation. Dropping it has no effect on
+/// execution. The engine calls it at most once with the validated outcome and
+/// does not also call the observer's ordinary `try_record` for that invocation.
+pub trait ExecutionAttemptCompletion: Send {
+    fn try_record(self: Box<Self>, summary: &ExecutionAttemptSummary) -> ExecutionAttemptDelivery;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -66,6 +66,7 @@ pub(super) fn fingerprint(members: impl ExactSizeIterator<Item = Member>) -> u64
 #[derive(Clone)]
 pub(super) struct Entry {
     pub members: Vec<Member>,
+    pub central: Duration,
     pub upper: Duration,
     pub samples: usize,
     pub observed: Instant,
@@ -83,12 +84,34 @@ impl CostSnapshot for Snapshot {
         self.revision
     }
 
+    fn query_limits(&self) -> ferrum_types::CostQueryLimits {
+        ferrum_types::CostQueryLimits {
+            max_participants: self.maximum_participants,
+            max_query_bytes: CostQuery::projected_bytes(self.maximum_participants)
+                .unwrap_or(usize::MAX),
+        }
+    }
+
     fn predict(&self, query: &CostQuery<'_>, now: Instant) -> CostPrediction {
-        if query.work.len() > self.maximum_participants {
+        if !CostQuery::fits(query.work.len(), self.query_limits()) {
             return CostPrediction::Unknown(CostUnknownReason::QueryLimit);
         }
         if !query.work_is_exact {
             return CostPrediction::Unknown(CostUnknownReason::InexactWork);
+        }
+        // These entries are labels from exactly one executor invocation. A
+        // mixed single-call label cannot cover an ordered pair of invocations.
+        if query.execution == CostExecution::SequentialPrefillThenDecode
+            && query
+                .work
+                .iter()
+                .any(|work| work.kind == AttemptWorkKind::Prefill)
+            && query
+                .work
+                .iter()
+                .any(|work| work.kind == AttemptWorkKind::Decode)
+        {
+            return CostPrediction::Unknown(CostUnknownReason::UnsupportedDomain);
         }
         if query.work.is_empty()
             || query
@@ -125,7 +148,10 @@ impl CostSnapshot for Snapshot {
             return CostPrediction::Unknown(CostUnknownReason::Stale);
         }
         CostPrediction::Known {
+            central_service_time: entry.central,
             upper_service_time: entry.upper,
+            risk: CostRisk::EngineeringMargin,
+            support: CostSupport::ExactObservedWork,
             samples: entry.samples,
             observed_at: entry.observed,
             expires_at: entry.expires,
@@ -167,5 +193,73 @@ impl CostSnapshotSource for Source {
     }
     fn subscribe(&self) -> watch::Receiver<u64> {
         self.revisions.clone()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ferrum_execution::token_execution::ExecutionRange;
+
+    #[test]
+    fn a_mixed_invocation_label_does_not_cover_sequential_groups() {
+        let now = Instant::now();
+        let work = [
+            CostWork {
+                kind: AttemptWorkKind::Prefill,
+                requested: ExecutionRange::new(0, 4).unwrap(),
+                context_tokens: 4,
+                prefix_restore: AttemptPrefixRestore::NoneObserved,
+                internally_reused_tokens: None,
+            },
+            CostWork {
+                kind: AttemptWorkKind::Decode,
+                requested: ExecutionRange::new(4, 1).unwrap(),
+                context_tokens: 5,
+                prefix_restore: AttemptPrefixRestore::NoneObserved,
+                internally_reused_tokens: None,
+            },
+        ];
+        let members: Vec<_> = work
+            .iter()
+            .copied()
+            .map(Member::from_work)
+            .collect::<Option<_>>()
+            .unwrap();
+        let snapshot = Snapshot {
+            revision: 1,
+            maximum_participants: 2,
+            entries: HashMap::from([(
+                fingerprint(members.iter().cloned()),
+                vec![Entry {
+                    members,
+                    central: Duration::from_millis(10),
+                    upper: Duration::from_millis(15),
+                    samples: 4,
+                    observed: now,
+                    expires: now + Duration::from_secs(1),
+                }],
+            )]),
+        };
+        let mut query = CostQuery {
+            work: &work,
+            work_is_exact: true,
+            execution: CostExecution::SingleInvocation,
+        };
+        assert!(
+            matches!(snapshot.predict(&query, now), CostPrediction::Known {
+            central_service_time,
+            upper_service_time,
+            risk: CostRisk::EngineeringMargin,
+            support: CostSupport::ExactObservedWork,
+            ..
+        } if central_service_time == Duration::from_millis(10)
+            && upper_service_time == Duration::from_millis(15))
+        );
+        query.execution = CostExecution::SequentialPrefillThenDecode;
+        assert_eq!(
+            snapshot.predict(&query, now),
+            CostPrediction::Unknown(CostUnknownReason::UnsupportedDomain)
+        );
     }
 }

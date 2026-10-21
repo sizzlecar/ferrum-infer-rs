@@ -8,6 +8,7 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 pub(super) struct TokenAttemptCapture {
     pub(super) participants: Vec<ExecutionAttemptParticipant>,
     interval: Option<TokenExecutionTiming>,
+    completion: Option<Box<dyn ExecutionAttemptCompletion>>,
 }
 
 impl TokenAttemptCapture {
@@ -109,7 +110,7 @@ impl EngineInner {
                 .increment(1);
             return None;
         }
-        let participants = inputs
+        let participants: Vec<_> = inputs
             .iter()
             .map(|input| {
                 let state = input.handle.lock();
@@ -143,9 +144,18 @@ impl EngineInner {
                 }
             })
             .collect();
+        // Every sequence lock used for projection has been released before the
+        // optional observer reads its immutable predictor snapshot.
+        let completion = catch_unwind(AssertUnwindSafe(|| observer.prepare(&participants)))
+            .unwrap_or_else(|_| {
+                counter!("ferrum.engine.execution_attempt_dropped_total", "reason" => "prepare_panic")
+                    .increment(1);
+                None
+            });
         Some(TokenAttemptCapture {
             participants,
             interval: None,
+            completion,
         })
     }
 
@@ -179,7 +189,10 @@ impl EngineInner {
         };
         // The actual frontier and continuation owners are already retained.
         // An optional observer cannot prevent publication or trigger replay.
-        match catch_unwind(AssertUnwindSafe(|| observer.try_record(&summary))) {
+        match catch_unwind(AssertUnwindSafe(|| match capture.completion {
+            Some(completion) => completion.try_record(&summary),
+            None => observer.try_record(&summary),
+        })) {
             Ok(ExecutionAttemptDelivery::Recorded) => {}
             Ok(ExecutionAttemptDelivery::Dropped(_)) => {
                 counter!("ferrum.engine.execution_attempt_dropped_total", "reason" => "observer")

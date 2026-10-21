@@ -1196,15 +1196,28 @@ pub struct SchedulerSloConfig {
     #[serde(deserialize_with = "deserialize_slo_milliseconds")]
     pub itl_ms: f64,
     #[serde(default)]
-    pub reference: crate::ReferenceEstimatorConfig,
+    pub query: crate::CostQueryLimits,
+    #[serde(default)]
+    pub planning: crate::SloPlanningBudget,
+    #[serde(default)]
+    pub joint: crate::JointSloTargets,
+    #[serde(default)]
+    pub strategy: crate::SloStrategy,
     #[serde(default)]
     pub unknown_cost: crate::UnknownCostPolicy,
+    /// Stopping-distribution uncertainty is independent of execution cost
+    /// uncertainty; neither fallback declares joint SLO feasibility.
+    #[serde(default)]
+    pub unknown_stopping: crate::UnknownCostPolicy,
 }
 
 impl SchedulerSloConfig {
     pub fn validate(&self) -> std::result::Result<(), String> {
-        self.reference.validate()?;
+        self.query.validate()?;
+        self.planning.validate()?;
+        self.joint.validate()?;
         self.unknown_cost.validate()?;
+        self.unknown_stopping.validate()?;
         for (name, value) in [
             ("ttft", self.ttft_ms),
             ("tpot", self.tpot_ms),
@@ -1252,8 +1265,12 @@ impl std::str::FromStr for SchedulerSloConfig {
             ttft_ms,
             tpot_ms,
             itl_ms,
-            reference: crate::ReferenceEstimatorConfig::default(),
+            query: crate::CostQueryLimits::default(),
+            planning: crate::SloPlanningBudget::default(),
+            joint: crate::JointSloTargets::default(),
+            strategy: crate::SloStrategy::default(),
             unknown_cost: crate::UnknownCostPolicy::default(),
+            unknown_stopping: crate::UnknownCostPolicy::default(),
         };
         slo.validate()?;
         Ok(slo)

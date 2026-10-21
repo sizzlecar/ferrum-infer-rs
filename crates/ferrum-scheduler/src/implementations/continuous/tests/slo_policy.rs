@@ -1,10 +1,12 @@
 use super::*;
 use crate::cost_prediction::{
-    CostPrediction, CostQuery, CostSnapshot, CostUnknownReason, CostWork, TimePlanningRound,
+    CostExecution, CostPrediction, CostQuery, CostRisk, CostSnapshot, CostSupport,
+    CostUnknownReason, CostWork, TimePlanningRound,
 };
 use ferrum_execution::execution_attempt::{AttemptPrefixRestore, AttemptWorkKind};
 use ferrum_execution::model_executor::PrefillShapePolicy;
 
+mod joint;
 mod prefill_shape;
 use ferrum_types::{CostFallback, RequestIngressAnchor, SchedulerSloConfig, UnknownCostPolicy};
 
@@ -14,9 +16,13 @@ struct Snapshot {
     unknown: bool,
     minimum_covered_prefill: usize,
     calls: Mutex<Vec<(u64, Vec<CostWork>)>>,
+    limits: ferrum_types::CostQueryLimits,
 }
 
 impl CostSnapshot for Snapshot {
+    fn query_limits(&self) -> ferrum_types::CostQueryLimits {
+        self.limits
+    }
     fn revision(&self) -> u64 {
         self.revision
     }
@@ -42,7 +48,10 @@ impl CostSnapshot for Snapshot {
                 })
                 .sum::<u64>();
         CostPrediction::Known {
+            central_service_time: Duration::from_micros(micros),
             upper_service_time: Duration::from_micros(micros),
+            risk: CostRisk::EngineeringMargin,
+            support: CostSupport::ExactObservedWork,
             samples: 2,
             observed_at: self.at,
             expires_at: self.at + Duration::from_secs(10),
@@ -57,6 +66,7 @@ fn snapshot(revision: u64, at: Instant, unknown: bool) -> Arc<Snapshot> {
         unknown,
         minimum_covered_prefill: 0,
         calls: Mutex::new(Vec::new()),
+        limits: ferrum_types::CostQueryLimits::default(),
     })
 }
 
@@ -65,7 +75,11 @@ fn targets() -> SchedulerSloConfig {
         ttft_ms: 1000.0,
         tpot_ms: 100.0,
         itl_ms: 120.0,
-        reference: Default::default(),
+        query: Default::default(),
+        planning: Default::default(),
+        joint: Default::default(),
+        strategy: ferrum_types::SloStrategy::ReferenceStepDiagnostic,
+        unknown_stopping: Default::default(),
         unknown_cost: Default::default(),
     }
 }
@@ -139,8 +153,12 @@ fn slo_snapshot_budget_changes_real_batch_and_respects_static_caps() {
             if static_budget.is_some() { 14 } else { 201 } * 16
         );
         let source = snapshot(7, Instant::now(), false);
-        let mut planning =
-            TimePlanningRound::new(source.clone(), targets(), PrefillShapePolicy::Identity);
+        let mut planning = TimePlanningRound::new(
+            source.clone(),
+            targets(),
+            PrefillShapePolicy::Identity,
+            CostExecution::SingleInvocation,
+        );
         let adapted = select(&sched, Some(&mut planning)).batch.unwrap();
         assert_eq!(
             adapted.resource_requirements.gpu_memory,
@@ -162,8 +180,12 @@ fn slo_snapshot_budget_changes_real_batch_and_respects_static_caps() {
         assert_eq!(stats.last_revision, Some(7));
         assert_eq!(stats.planning_rounds, 1);
         assert!(stats.selections.known_queries > 0);
-        let mut narrow_round =
-            TimePlanningRound::new(source, targets(), PrefillShapePolicy::Identity);
+        let mut narrow_round = TimePlanningRound::new(
+            source,
+            targets(),
+            PrefillShapePolicy::Identity,
+            CostExecution::SingleInvocation,
+        );
         let narrow = sched
             .next_batch_with_token_admissions(
                 sched.prepare_token_batch_selection(BatchHint {
@@ -187,7 +209,12 @@ fn slo_one_snapshot_survives_admission_subrounds_and_final_selection() {
     let now = Instant::now();
     let old = snapshot(3, now, false);
     let published = snapshot(4, now, true);
-    let mut planning = TimePlanningRound::new(old.clone(), targets(), PrefillShapePolicy::Identity);
+    let mut planning = TimePlanningRound::new(
+        old.clone(),
+        targets(),
+        PrefillShapePolicy::Identity,
+        CostExecution::SingleInvocation,
+    );
     waiting(&sched, 32);
     admit(&sched, Some(&mut planning));
     // A source can publish here, but the already-owned planning round must
@@ -204,8 +231,12 @@ fn slo_one_snapshot_survives_admission_subrounds_and_final_selection() {
     );
     assert!(old.calls.lock().iter().all(|(revision, _)| *revision == 3));
     assert!(published.calls.lock().is_empty());
-    let mut next =
-        TimePlanningRound::new(published.clone(), targets(), PrefillShapePolicy::Identity);
+    let mut next = TimePlanningRound::new(
+        published.clone(),
+        targets(),
+        PrefillShapePolicy::Identity,
+        CostExecution::SingleInvocation,
+    );
     assert_eq!(
         select(&sched, Some(&mut next))
             .batch
@@ -237,8 +268,12 @@ fn slo_unknown_wait_uses_original_ingress_and_never_renews_deadline() {
         let source = snapshot(1, ingress.instant(), true);
         let epoch = sched.confirmed_capacity_release_epoch();
         for elapsed in [10, 75] {
-            let mut planning =
-                TimePlanningRound::new(source.clone(), config, PrefillShapePolicy::Identity);
+            let mut planning = TimePlanningRound::new(
+                source.clone(),
+                config,
+                PrefillShapePolicy::Identity,
+                CostExecution::SingleInvocation,
+            );
             let mut round = sched.begin_token_admission(1, None).unwrap();
             assert!(round
                 .next_at(
@@ -259,7 +294,12 @@ fn slo_unknown_wait_uses_original_ingress_and_never_renews_deadline() {
             assert_eq!(sched.waiting_count(), 1);
             assert_eq!(sched.confirmed_capacity_release_epoch(), epoch);
         }
-        let mut planning = TimePlanningRound::new(source, config, PrefillShapePolicy::Identity);
+        let mut planning = TimePlanningRound::new(
+            source,
+            config,
+            PrefillShapePolicy::Identity,
+            CostExecution::SingleInvocation,
+        );
         let mut round = sched.begin_token_admission(1, None).unwrap();
         let candidate = round
             .next_at(
@@ -310,6 +350,7 @@ fn slo_unknown_reject_uses_original_failure_without_executor_probe() {
             ..targets()
         },
         PrefillShapePolicy::Identity,
+        CostExecution::SingleInvocation,
     );
     let mut round = sched.begin_token_admission(1, None).unwrap();
     assert!(round
@@ -343,6 +384,7 @@ fn slo_stale_and_inexact_are_unknown_while_existing_decode_progresses() {
             ..targets()
         },
         PrefillShapePolicy::Identity,
+        CostExecution::SingleInvocation,
     );
     let batch = sched
         .create_iteration_batch_with_time(
@@ -366,8 +408,12 @@ fn slo_stale_and_inexact_are_unknown_while_existing_decode_progresses() {
     enqueue_waiting(&inexact_sched, create_test_request(Priority::Normal));
     admit(&inexact_sched, None);
     let source = snapshot(2, Instant::now(), false);
-    let mut inexact =
-        TimePlanningRound::new(source.clone(), targets(), PrefillShapePolicy::Identity);
+    let mut inexact = TimePlanningRound::new(
+        source.clone(),
+        targets(),
+        PrefillShapePolicy::Identity,
+        CostExecution::SingleInvocation,
+    );
     assert!(select(&inexact_sched, Some(&mut inexact)).batch.is_some());
     assert!(source.calls.lock().is_empty());
     assert!(inexact.statistics.static_fallbacks > 0);
@@ -381,8 +427,13 @@ fn slo_query_limit_is_checked_before_projection_and_preserves_decode() {
     admit(&sched, None);
     let source = snapshot(1, Instant::now(), false);
     let mut config = targets();
-    config.reference.max_participants = 1;
-    let mut planning = TimePlanningRound::new(source.clone(), config, PrefillShapePolicy::Identity);
+    config.query.max_participants = 1;
+    let mut planning = TimePlanningRound::new(
+        source.clone(),
+        config,
+        PrefillShapePolicy::Identity,
+        CostExecution::SingleInvocation,
+    );
     assert_eq!(
         select(&sched, Some(&mut planning))
             .batch
@@ -395,6 +446,51 @@ fn slo_query_limit_is_checked_before_projection_and_preserves_decode() {
     assert!(planning.selected_over_limit);
     assert!(planning.statistics.static_fallbacks > 0);
     assert!(source.calls.lock().iter().all(|(_, work)| work.len() <= 1));
+}
+
+#[test]
+fn slo_snapshot_byte_support_is_checked_before_querying() {
+    let sched = scheduler(None);
+    waiting(&sched, 32);
+    let mut source = snapshot(1, Instant::now(), false);
+    Arc::get_mut(&mut source).unwrap().limits.max_query_bytes =
+        CostQuery::projected_bytes(1).unwrap() - 1;
+    let mut planning = TimePlanningRound::new(
+        source.clone(),
+        targets(),
+        PrefillShapePolicy::Identity,
+        CostExecution::SingleInvocation,
+    );
+    admit(&sched, Some(&mut planning));
+    assert!(select(&sched, Some(&mut planning)).batch.is_some());
+    assert!(source.calls.lock().is_empty());
+    assert!(planning.statistics.static_fallbacks > 0);
+}
+
+#[test]
+fn slo_round_query_and_time_budgets_do_not_renew_between_admissions() {
+    for exhausted_time in [false, true] {
+        let sched = scheduler(None);
+        let source = snapshot(1, Instant::now(), false);
+        let mut config = targets();
+        config.planning.max_queries = 1;
+        let mut planning = TimePlanningRound::new(
+            source.clone(),
+            config,
+            PrefillShapePolicy::Identity,
+            CostExecution::SingleInvocation,
+        );
+        if exhausted_time {
+            planning.prediction_elapsed = Duration::from_micros(config.planning.max_elapsed_us);
+        }
+        waiting(&sched, 32);
+        admit(&sched, Some(&mut planning));
+        waiting(&sched, 64);
+        admit(&sched, Some(&mut planning));
+        assert!(select(&sched, Some(&mut planning)).batch.is_some());
+        assert_eq!(source.calls.lock().len(), usize::from(!exhausted_time));
+        assert!(planning.statistics.static_fallbacks > 0);
+    }
 }
 
 #[test]
@@ -526,12 +622,18 @@ fn slo_known_oversize_then_unknown_preserves_declared_policy_and_counts_final_sh
                 unknown: false,
                 minimum_covered_prefill: 100,
                 calls: Mutex::new(Vec::new()),
+                limits: ferrum_types::CostQueryLimits::default(),
             });
             let mut config = targets();
             config.ttft_ms = 50.0;
             config.itl_ms = 50.0;
             config.unknown_cost = policy;
-            let mut planning = TimePlanningRound::new(source, config, PrefillShapePolicy::Identity);
+            let mut planning = TimePlanningRound::new(
+                source,
+                config,
+                PrefillShapePolicy::Identity,
+                CostExecution::SingleInvocation,
+            );
             let batch = sched
                 .create_iteration_batch_with_time(
                     hint(),
@@ -606,6 +708,7 @@ fn request_clock_ttft_priority_uses_ingress_and_excludes_recompute() {
             snapshot(1, ingress.instant(), false),
             targets(),
             PrefillShapePolicy::Identity,
+            CostExecution::SingleInvocation,
         );
         sched.prioritize_ttft(
             &mut queue,
@@ -638,4 +741,38 @@ async fn slo_invalid_programmatic_targets_reject_requests() {
         .await
         .is_err());
     assert_eq!(sched.waiting_count(), 0);
+}
+
+#[test]
+fn slo_joint_stale_cost_preserves_admitted_and_partial_prefill_progress() {
+    for completed in [0, 7] {
+        let sched = scheduler(None);
+        let id = waiting(&sched, 32);
+        admit(&sched, None);
+        if completed > 0 {
+            assert!(!sched.mark_prefill_chunk_processed(&id, 32, completed));
+        }
+        let now = Instant::now();
+        let mut planning = TimePlanningRound::new(
+            snapshot(1, now, true),
+            SchedulerSloConfig {
+                strategy: ferrum_types::SloStrategy::Joint,
+                unknown_cost: UnknownCostPolicy::Reject,
+                ..targets()
+            },
+            PrefillShapePolicy::Identity,
+            CostExecution::SingleInvocation,
+        );
+        let selection = select(&sched, Some(&mut planning));
+        let batch = selection
+            .batch
+            .expect("accepted work retains bounded progress");
+        assert!(batch
+            .requests
+            .iter()
+            .any(|request| request.request.id == id));
+        assert!(sched.take_admission_failures().is_empty());
+        assert!(!selection.time_blocked);
+        assert!(planning.statistics.static_fallbacks > 0);
+    }
 }

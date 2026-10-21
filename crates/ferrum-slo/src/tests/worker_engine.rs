@@ -79,7 +79,11 @@ async fn engine(
             ttft_ms: 10_000.0,
             tpot_ms: 10_000.0,
             itl_ms: 10_000.0,
-            reference: ReferenceEstimatorConfig::default(),
+            query: Default::default(),
+            planning: Default::default(),
+            joint: Default::default(),
+            strategy: Default::default(),
+            unknown_stopping: Default::default(),
             unknown_cost: Default::default(),
         });
     }

@@ -6,12 +6,16 @@
 //! Queue accounting bounds retained logical payload, not allocator overhead or RSS;
 //! readers own any old immutable snapshots they retain.
 
+mod calibration;
+pub mod learning;
+pub mod model;
 mod queue;
 mod snapshot;
+pub mod stopping;
 mod worker;
 
 pub use ferrum_types::ReferenceEstimatorConfig;
-pub use queue::ReferenceEstimatorStats;
+pub use queue::{CollectionConfig, ReferenceEstimatorStats};
 
 use ferrum_execution::execution_attempt::ExecutionAttemptObserver;
 use ferrum_scheduler::cost_prediction::CostSnapshotSource;
@@ -48,7 +52,7 @@ pub struct ReferenceEstimator;
 pub struct ReferenceEstimatorOwner {
     shared: Arc<queue::Shared>,
     observer: Arc<queue::Observer>,
-    source: Arc<snapshot::Source>,
+    source: Arc<dyn CostSnapshotSource>,
     completion: watch::Receiver<Option<Result<WorkerExit, EstimatorError>>>,
 }
 
@@ -64,56 +68,70 @@ impl ReferenceEstimator {
         hooks: worker::Hooks,
     ) -> Result<ReferenceEstimatorOwner, EstimatorError> {
         validate(&config)?;
-        let runtime = tokio::runtime::Handle::try_current()
-            .map_err(|_| EstimatorError::RuntimeUnavailable)?;
-        let (sender, receiver) = crossbeam_channel::bounded(config.queue_capacity);
-        let (wake, wake_receiver) = crossbeam_channel::bounded(1);
-        let shared = Arc::new(queue::Shared::new(config, wake));
-        let observer = Arc::new(queue::Observer::new(Arc::clone(&shared), sender));
         let (source, revisions) = snapshot::Source::new(config.max_participants);
         let source = Arc::new(source);
-        let (completion_sender, completion) = watch::channel(None);
-        let worker_shared = Arc::clone(&shared);
         let worker_source = Arc::clone(&source);
-        let task = runtime.spawn_blocking(move || {
+        spawn_owner(config.into(), source, move |shared, receiver, wake| {
             worker::run(
                 config,
-                worker_shared,
+                shared,
                 worker_source,
                 revisions,
                 receiver,
-                wake_receiver,
+                wake,
                 hooks,
             )
-        });
-        // This service owns the only JoinHandle, including after the public
-        // owner and every shutdown future have been dropped.
-        let joined_shared = Arc::clone(&shared);
-        let joined_source = Arc::clone(&source);
-        runtime.spawn(async move {
-            let result = match task.await {
-                Ok(()) => Ok(WorkerExit {
-                    stats: joined_shared.stats(),
-                    revision: joined_source.revision(),
-                }),
-                Err(error) => {
-                    joined_shared.worker_failed();
-                    Err(if error.is_panic() {
-                        EstimatorError::WorkerPanicked
-                    } else {
-                        EstimatorError::WorkerCancelled
-                    })
-                }
-            };
-            completion_sender.send_replace(Some(result));
-        });
-        Ok(ReferenceEstimatorOwner {
-            shared,
-            observer,
-            source,
-            completion,
         })
     }
+}
+
+/// All predictor families share bounded collection, worker ownership and join.
+fn spawn_owner(
+    config: CollectionConfig,
+    source: Arc<dyn CostSnapshotSource>,
+    run: impl FnOnce(
+            Arc<queue::Shared>,
+            crossbeam_channel::Receiver<queue::Envelope>,
+            crossbeam_channel::Receiver<()>,
+        ) + Send
+        + 'static,
+) -> Result<ReferenceEstimatorOwner, EstimatorError> {
+    config.validate()?;
+    let runtime =
+        tokio::runtime::Handle::try_current().map_err(|_| EstimatorError::RuntimeUnavailable)?;
+    let (sender, receiver) = crossbeam_channel::bounded(config.queue_capacity);
+    let (wake, wake_receiver) = crossbeam_channel::bounded(1);
+    let shared = Arc::new(queue::Shared::new(config, wake));
+    let observer = Arc::new(queue::Observer::new(Arc::clone(&shared), sender));
+    let (completion_sender, completion) = watch::channel(None);
+    let worker_shared = Arc::clone(&shared);
+    let task = runtime.spawn_blocking(move || run(worker_shared, receiver, wake_receiver));
+    // Retain the unique join even if the caller drops its shutdown future.
+    let joined_shared = Arc::clone(&shared);
+    let joined_source = Arc::clone(&source);
+    runtime.spawn(async move {
+        let result = match task.await {
+            Ok(()) => Ok(WorkerExit {
+                stats: joined_shared.stats(),
+                revision: joined_source.load().revision(),
+            }),
+            Err(error) => {
+                joined_shared.worker_failed();
+                Err(if error.is_panic() {
+                    EstimatorError::WorkerPanicked
+                } else {
+                    EstimatorError::WorkerCancelled
+                })
+            }
+        };
+        completion_sender.send_replace(Some(result));
+    });
+    Ok(ReferenceEstimatorOwner {
+        shared,
+        observer,
+        source,
+        completion,
+    })
 }
 
 impl ReferenceEstimatorOwner {

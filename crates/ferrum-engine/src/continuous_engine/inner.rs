@@ -1291,14 +1291,24 @@ impl EngineInner {
         // prediction queries still use their current monotonic time.
         let prefill_shape_policy = self.model_executor.prefill_shape_policy();
         let mut planning = self.config.scheduler.slo.map(|policy| {
-            TimePlanningRound::new(
+            let mut round = TimePlanningRound::new(
                 self.cost_snapshot_source
                     .as_ref()
                     .expect("feedback validated before startup")
                     .load(),
                 policy,
                 prefill_shape_policy,
-            )
+                match self.config.batching.prefill_decode_execution {
+                    ferrum_types::PrefillDecodeExecution::Split => {
+                        ferrum_scheduler::cost_prediction::CostExecution::SequentialPrefillThenDecode
+                    }
+                    ferrum_types::PrefillDecodeExecution::Mixed => {
+                        ferrum_scheduler::cost_prediction::CostExecution::SingleInvocation
+                    }
+                },
+            );
+            self.capture_planning_request_facts(&mut round, policy.planning.max_participants);
+            round
         });
         if self
             .prepare_token_prefill_cohort(&hint, planning.as_mut())

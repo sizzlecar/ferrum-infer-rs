@@ -2,9 +2,7 @@
 //! in the original admission/commit protocol.
 use super::*;
 use crate::cost_prediction::*;
-use ferrum_execution::execution_attempt::{
-    AttemptPrefixRestore, AttemptWorkKind, ExecutionAttemptSummary,
-};
+use ferrum_execution::execution_attempt::{AttemptPrefixRestore, AttemptWorkKind};
 use ferrum_execution::model_executor::{PrefillChunk, PrefillShapePolicy};
 use ferrum_execution::token_execution::ExecutionRange;
 use ferrum_types::{CostFallback, UnknownCostPolicy};
@@ -17,29 +15,43 @@ pub(super) enum TimeDecision {
 
 impl TimePlanningRound {
     fn fits_query(&self, count: usize) -> bool {
-        count <= self.config.reference.max_participants
-            && ExecutionAttemptSummary::projected_bytes(count)
-                .is_some_and(|bytes| bytes <= self.config.reference.max_summary_bytes)
+        CostQuery::fits(count, self.query_limits)
+    }
+
+    fn reserve_query(&mut self) -> bool {
+        if self.query_count >= self.config.planning.max_queries
+            || self.prediction_elapsed >= Duration::from_micros(self.config.planning.max_elapsed_us)
+        {
+            return false;
+        }
+        self.query_count += 1;
+        true
     }
 
     fn predict(&mut self, work: &[CostWork], exact: bool, now: Instant) -> CostPrediction {
-        let prediction = if !self.fits_query(work.len()) {
+        let prediction = if !self.reserve_query() {
+            CostPrediction::Unknown(CostUnknownReason::PlanningBudget)
+        } else if !self.fits_query(work.len()) {
             CostPrediction::Unknown(CostUnknownReason::QueryLimit)
         } else if !exact {
             CostPrediction::Unknown(CostUnknownReason::InexactWork)
         } else {
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let started = Instant::now();
+            let prediction = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 self.snapshot.predict(
                     &CostQuery {
                         work,
                         work_is_exact: exact,
+                        execution: self.execution,
                     },
                     now,
                 )
             }))
             .unwrap_or(CostPrediction::Unknown(
                 CostUnknownReason::UnsupportedDomain,
-            ))
+            ));
+            self.prediction_elapsed += started.elapsed();
+            prediction
         };
         self.validate_prediction(prediction, now)
     }
@@ -50,14 +62,20 @@ impl TimePlanningRound {
                 CostPrediction::Unknown(CostUnknownReason::Stale)
             }
             CostPrediction::Known {
+                central_service_time,
                 upper_service_time,
+                risk,
                 samples,
                 observed_at,
                 expires_at,
-            } if upper_service_time.is_zero()
+                ..
+            } if central_service_time.is_zero()
+                || upper_service_time.is_zero()
                 || samples == 0
                 || observed_at > now
-                || expires_at <= observed_at =>
+                || expires_at <= observed_at
+                || matches!(risk, CostRisk::CalibratedQuantile { quantile, .. }
+                    if !quantile.is_finite() || quantile <= 0.0 || quantile >= 1.0) =>
             {
                 CostPrediction::Unknown(CostUnknownReason::UnsupportedDomain)
             }
@@ -97,12 +115,30 @@ impl TimePlanningRound {
         tokens: usize,
         now: Instant,
     ) -> TimeDecision {
-        // A recompute restoring an existing decoder must not deadlock the
-        // progress needed to free resources or produce a new observation.
-        if request.capacity_deferred_from_decode || request.slo_first_token_emitted {
+        self.unknown_policy(self.config.unknown_cost, reason, request, tokens, now)
+    }
+
+    pub(super) fn unknown_policy(
+        &mut self,
+        policy: UnknownCostPolicy,
+        reason: CostUnknownReason,
+        request: &ContinuousBatchRequest,
+        tokens: usize,
+        now: Instant,
+    ) -> TimeDecision {
+        // Cost expiry cannot strand an already admitted/started request. The
+        // logical state survives KV release/recompute and includes partial
+        // prefill; an offset alone misses admitted zero-offset and replay work.
+        let admitted = request.logical_work_frontier.work_kind()
+            != pressure::LogicalWorkKind::Waiting
+            || request.logical_work_frontier.progress_generation() != LogicalWorkGeneration::ZERO;
+        if (self.config.strategy == ferrum_types::SloStrategy::Joint && admitted)
+            || request.capacity_deferred_from_decode
+            || request.slo_first_token_emitted
+        {
             return self.fallback(CostFallback::StaticFallback, tokens, reason);
         }
-        match self.config.unknown_cost {
+        match policy {
             UnknownCostPolicy::StaticFallback => {
                 self.fallback(CostFallback::StaticFallback, tokens, reason)
             }
@@ -131,6 +167,7 @@ impl TimePlanningRound {
     pub(super) fn reset_selection(&mut self) {
         self.selected.clear();
         self.selected_exact = true;
+        self.execution_already_projected = true;
         self.selected_over_limit = false;
     }
 
@@ -153,6 +190,12 @@ impl TimePlanningRound {
         exact: bool,
         now: Instant,
     ) -> CostPrediction {
+        if !self.reserve_query() {
+            return self.validate_prediction(
+                CostPrediction::Unknown(CostUnknownReason::PlanningBudget),
+                now,
+            );
+        }
         if self.selected_over_limit || !self.fits_query(self.selected.len().saturating_add(1)) {
             return self
                 .validate_prediction(CostPrediction::Unknown(CostUnknownReason::QueryLimit), now);
@@ -162,11 +205,13 @@ impl TimePlanningRound {
                 .validate_prediction(CostPrediction::Unknown(CostUnknownReason::InexactWork), now);
         }
         self.selected.push(work);
+        let started = Instant::now();
         let prediction = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             self.snapshot.predict(
                 &CostQuery {
                     work: &self.selected,
                     work_is_exact: true,
+                    execution: self.execution,
                 },
                 now,
             )
@@ -174,6 +219,7 @@ impl TimePlanningRound {
         .unwrap_or(CostPrediction::Unknown(
             CostUnknownReason::UnsupportedDomain,
         ));
+        self.prediction_elapsed += started.elapsed();
         self.selected.pop();
         self.validate_prediction(prediction, now)
     }
@@ -266,6 +312,9 @@ impl ContinuousBatchScheduler {
         planning: &mut TimePlanningRound,
         now: Instant,
     ) -> TimeDecision {
+        if planning.config.strategy == ferrum_types::SloStrategy::Joint {
+            return self.joint_admission_time_decision(request, planning, now);
+        }
         let maximum = self.remaining_prefill_tokens(request).max(1);
         let projected = self.cost_work(request, maximum, false, planning.prefill_shape_policy);
         let tokens = projected.map_or(maximum, |(work, _)| work.requested.as_range().len());
@@ -288,6 +337,11 @@ impl ContinuousBatchScheduler {
         planning: &mut TimePlanningRound,
         now: Instant,
     ) -> TimeDecision {
+        if planning.config.strategy == ferrum_types::SloStrategy::Joint {
+            // Preserve the static scheduler's nominal token/quota spending.
+            // Exact projected device work is recorded separately below.
+            return TimeDecision::Allow(maximum);
+        }
         let projected_maximum = self
             .cost_work(request, maximum, false, planning.prefill_shape_policy)
             .map_or(maximum, |(work, _)| work.requested.as_range().len());
@@ -377,6 +431,9 @@ impl ContinuousBatchScheduler {
         let Some(planning) = planning else {
             return;
         };
+        if planning.config.strategy == ferrum_types::SloStrategy::Joint {
+            return;
+        }
         let urgency_ms = planning.config.tpot_ms.min(planning.config.itl_ms);
         queue.make_contiguous().sort_by_cached_key(|request| {
             if request.slo_first_token_emitted || request.capacity_deferred_from_decode {

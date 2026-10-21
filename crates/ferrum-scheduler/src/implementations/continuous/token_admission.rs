@@ -90,6 +90,10 @@ impl TokenAdmissionRound<'_> {
         loop {
             let scan = self.scan.as_mut().expect("live admission round");
             let mut waiting = self.scheduler.waiting_queue.write();
+            if let Some(round) = planning.as_deref_mut() {
+                self.scheduler
+                    .revalidate_joint_admission_gate(&waiting, round);
+            }
             let mut events = self.scheduler.dynamic_admission_events.lock();
             events.clear();
             let observer = std::cell::RefCell::new(&mut *observer);
@@ -148,6 +152,14 @@ impl TokenAdmissionRound<'_> {
                     ) {
                         QueueProbeApplication::Applied => {
                             self.scheduler.apply_token_admission_events(&mut events);
+                            // Joint rejection changed the captured arrival
+                            // cohort. Finish this scan so ordinary terminal
+                            // cleanup runs before the next frozen comparison.
+                            if planning.as_deref().is_some_and(|round| {
+                                round.config.strategy == ferrum_types::SloStrategy::Joint
+                            }) {
+                                return Ok(None);
+                            }
                             continue;
                         }
                         QueueProbeApplication::Unapplied { error, .. } => {

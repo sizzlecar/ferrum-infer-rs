@@ -11,6 +11,7 @@ impl SequenceHandle {
         Arc::new_cyclic(|weak| {
             if let Some(sender) = &state.stream_sender {
                 sender.bind_sequence(weak.clone());
+                sender.configure_text_clock(state.start_time);
             }
             Self {
                 request_id,
@@ -42,6 +43,11 @@ impl SequenceRegistry {
 
     pub(super) fn snapshot(&self) -> Vec<Arc<SequenceHandle>> {
         self.index.read().values().cloned().collect()
+    }
+
+    pub(super) fn snapshot_bounded(&self, max_members: usize) -> Option<Vec<Arc<SequenceHandle>>> {
+        let index = self.index.read();
+        (index.len() <= max_members).then(|| index.values().cloned().collect())
     }
 
     pub(super) fn len(&self) -> usize {

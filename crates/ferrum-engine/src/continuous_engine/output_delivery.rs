@@ -5,6 +5,7 @@ use ferrum_output::{OutputChunk, OutputSession};
 use ferrum_scheduler::implementations::continuous::OutputReadinessWake;
 use std::ops::Range;
 
+mod clock;
 mod registry;
 pub(super) use registry::OutputTaskRegistry;
 
@@ -36,6 +37,8 @@ struct Delivery {
     // Weak back-reference: the live state already owns this OutputSender.
     sequence: Mutex<Weak<SequenceHandle>>,
     state: Mutex<DeliveryState>,
+    text_clock: Mutex<Option<clock::DeliveryTextClock>>,
+    text_clock_enabled: AtomicBool,
     changed: Notify,
     terminal: Arc<Mutex<OutputTerminal>>,
     #[cfg(test)]
@@ -117,6 +120,8 @@ impl OutputSender {
                 inner,
                 request_id,
                 sequence: Mutex::new(Weak::new()),
+                text_clock: Mutex::new(None),
+                text_clock_enabled: AtomicBool::new(false),
                 changed: Notify::new(),
                 terminal: Arc::clone(&terminal),
                 #[cfg(test)]
@@ -142,6 +147,39 @@ impl OutputSender {
         *self.0.sequence.lock() = sequence;
     }
 
+    pub(super) fn configure_text_clock(&self, ingress: Instant) {
+        let inner = self.0.inner.upgrade();
+        if inner.as_ref().is_some_and(|inner| {
+            inner.request_stopping_observer.is_none() && inner.config.scheduler.slo.is_none()
+        }) {
+            return;
+        }
+        let threshold = inner
+            .and_then(|inner| inner.config.scheduler.slo)
+            .and_then(|slo| Duration::try_from_secs_f64(slo.itl_ms / 1000.0).ok());
+        self.0
+            .text_clock
+            .lock()
+            .get_or_insert_with(|| clock::DeliveryTextClock::new(ingress, threshold));
+        self.0.text_clock_enabled.store(true, Ordering::Release);
+    }
+
+    pub(super) fn text_clock_snapshot(
+        &self,
+        generated: usize,
+    ) -> Option<ferrum_scheduler::cost_prediction::RequestClockFacts> {
+        let clock = self.0.text_clock.lock();
+        clock.as_ref()?.snapshot(Instant::now(), generated)
+    }
+
+    fn record_delivered_text(&self, nonempty: bool) {
+        if nonempty && self.0.text_clock_enabled.load(Ordering::Acquire) {
+            if let Some(clock) = self.0.text_clock.lock().as_mut() {
+                clock.record(Instant::now());
+            }
+        }
+    }
+
     pub(super) fn source_sequence(&self) -> Option<Arc<SequenceHandle>> {
         self.0.sequence.lock().upgrade()
     }
@@ -160,6 +198,7 @@ impl OutputSender {
         chunk: StreamChunk,
         mut credit: OutputSemanticLease,
     ) -> Result<()> {
+        let nonempty = !chunk.text.is_empty();
         credit.try_resize(semantic_cost(&chunk)?)?;
         let cost = OutputChunk::queued_cost(&chunk)?;
         let lease = tokio::select! {
@@ -173,6 +212,7 @@ impl OutputSender {
             .send(Ok(chunk))
             .await
             .map_err(|_| FerrumError::internal("output receiver closed"))?;
+        self.record_delivered_text(nonempty);
         self.0.terminal.lock().delivered = true;
         Ok(())
     }
@@ -194,6 +234,7 @@ impl OutputSender {
         bytes: Range<usize>,
         terminal: Option<FinishReason>,
     ) -> Result<()> {
+        let nonempty = !chunk.text.is_empty();
         let cost = OutputChunk::queued_cost(&chunk)?;
         let mut span = TextSpan {
             bytes,
@@ -209,6 +250,7 @@ impl OutputSender {
                 let charged = OutputChunk::new(chunk, lease)?;
                 match self.0.sender.try_send(Ok(charged)) {
                     Ok(()) => {
+                        self.record_delivered_text(nonempty);
                         state.enqueued_bytes = span.bytes.end;
                         return Ok(());
                     }
@@ -273,6 +315,7 @@ impl OutputSender {
     }
 
     pub(super) async fn send(&self, item: Result<StreamChunk>) -> Result<()> {
+        let nonempty = item.as_ref().is_ok_and(|chunk| !chunk.text.is_empty());
         let terminal = item
             .as_ref()
             .map_or(true, |chunk| chunk.finish_reason.is_some());
@@ -293,6 +336,7 @@ impl OutputSender {
             .send(item)
             .await
             .map_err(|_| FerrumError::internal("output receiver closed"))?;
+        self.record_delivered_text(nonempty);
         if terminal {
             self.0.terminal.lock().delivered = true;
         }
@@ -444,7 +488,11 @@ impl OutputSender {
                         }
                     };
                     if let Some(chunk) = chunk {
+                        let nonempty = !chunk.chunk().text.is_empty();
                         sent = self.0.sender.send(Ok(chunk)).await.is_ok();
+                        if sent {
+                            self.record_delivered_text(nonempty);
+                        }
                     }
                 }
                 let mut state = self.0.state.lock();

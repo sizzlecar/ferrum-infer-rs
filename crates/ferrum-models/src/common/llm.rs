@@ -7,6 +7,7 @@
 
 use ferrum_execution::model_executor::{
     KvSlotCapacitySnapshot, KvSlotRequest, KvSlotReservation, LogitsReturnPolicy,
+    PagedAdmissionCapacitySnapshot, PagedAdmissionCoverage,
 };
 use ferrum_types::Result;
 
@@ -267,6 +268,16 @@ pub trait DecoderOnlyLLM: Send + Sync {
     /// Snapshot model-owned paged-KV capacity without allocating slots.
     fn kv_slot_capacity_snapshot(&self) -> Option<KvSlotCapacitySnapshot> {
         None
+    }
+
+    /// Observe all persistent admission limits together with the original KV
+    /// block snapshot. Existing models retain Unknown coverage by default.
+    fn paged_admission_capacity_snapshot(&self) -> Option<PagedAdmissionCapacitySnapshot> {
+        self.kv_slot_capacity_snapshot()
+            .map(|slots| PagedAdmissionCapacitySnapshot {
+                slots,
+                coverage: PagedAdmissionCoverage::Unknown,
+            })
     }
 
     /// Observe joint reclaimability in one actual allocator without releasing

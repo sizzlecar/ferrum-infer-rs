@@ -4,7 +4,7 @@
 use super::*;
 use crate::continuous_engine::attempt_observation_tests::AttemptRecorder;
 use ferrum_scheduler::cost_prediction::{
-    CostPrediction, CostQuery, CostSnapshot, CostUnknownReason, CostWork,
+    CostPrediction, CostQuery, CostRisk, CostSnapshot, CostSupport, CostUnknownReason, CostWork,
 };
 use tokio::sync::watch;
 
@@ -18,6 +18,9 @@ struct Snapshot {
 }
 
 impl CostSnapshot for Snapshot {
+    fn query_limits(&self) -> ferrum_types::CostQueryLimits {
+        ferrum_types::CostQueryLimits::default()
+    }
     fn revision(&self) -> u64 {
         self.revision
     }
@@ -32,7 +35,10 @@ impl CostSnapshot for Snapshot {
         self.queried.notify_one();
         if self.known {
             CostPrediction::Known {
+                central_service_time: Duration::from_micros(10),
                 upper_service_time: Duration::from_micros(10),
+                risk: CostRisk::EngineeringMargin,
+                support: CostSupport::ExactObservedWork,
                 samples: 4,
                 observed_at: self.created,
                 expires_at: self.created + Duration::from_secs(3600),

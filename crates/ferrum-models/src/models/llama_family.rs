@@ -21,6 +21,7 @@ use std::ops::Range;
 
 use ferrum_execution::model_executor::{
     KvSlotAllocation, KvSlotCapacitySnapshot, KvSlotRequest, KvSlotReservation, LogitsReturnPolicy,
+    PagedAdmissionCapacitySnapshot, PagedAdmissionCoverage,
 };
 use ferrum_interfaces::kv_dtype::{KvDtypeKind, KvFp16, KvInt8};
 use ferrum_kernels::backend::{
@@ -4410,6 +4411,42 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         self.runtime_env.kv_capacity_for_model(self.cfg.max_seq_len)
     }
 
+    fn paged_admission_snapshot(&self) -> Option<PagedAdmissionCapacitySnapshot> {
+        let allocator = self.paged_block_alloc.as_ref()?;
+        let allocator = allocator
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let slots = KvSlotCapacitySnapshot {
+            block_size: LLAMA_PAGED_BLOCK_SIZE,
+            total_blocks: allocator.capacity() as usize,
+            free_blocks: allocator.free_count(),
+        };
+        // This implementation's only persistent semantic sequence state is KV.
+        // Paged payload lives in the shared pool, but a NEW metadata slot still
+        // allocates device block tables/context lengths. Credit only slots
+        // retired by the original close protocol and retained in kv_free_pool.
+        // Do not infer spare metadata from free KV blocks or general memory.
+        let coverage = match self.paged_dims {
+            Some((max_batch_sequences, blocks_per_sequence))
+                if self.pending_device_frame.is_none()
+                    && self.paged_pools.is_some()
+                    && max_batch_sequences > 0
+                    && blocks_per_sequence > 0 =>
+            {
+                match blocks_per_sequence.checked_mul(LLAMA_PAGED_BLOCK_SIZE) {
+                    Some(tokens) => PagedAdmissionCoverage::AllPersistentState {
+                        max_new_sequences: self.kv_free_pool.len(),
+                        max_sequence_tokens: tokens.min(self.kv_capacity_limit()),
+                        max_batch_sequences,
+                    },
+                    None => PagedAdmissionCoverage::Unknown,
+                }
+            }
+            _ => PagedAdmissionCoverage::Unknown,
+        };
+        Some(PagedAdmissionCapacitySnapshot { slots, coverage })
+    }
+
     pub(crate) fn prepare_managed_token_capacity(
         &mut self,
         requests: &[KvSlotRequest],
@@ -5597,6 +5634,10 @@ impl<B: MoeLlmBackend> DecoderOnlyLLM for LlamaFamilyModel<B, KvFp16> {
         })
     }
 
+    fn paged_admission_capacity_snapshot(&self) -> Option<PagedAdmissionCapacitySnapshot> {
+        self.paged_admission_snapshot()
+    }
+
     fn prefill(&mut self, cache_id: &str, tokens: &[u32]) -> Vec<f32> {
         self.prefill_internal(cache_id, tokens)
     }
@@ -5843,6 +5884,10 @@ impl<B: MoeLlmBackend + BackendInt8KvOps> DecoderOnlyLLM for LlamaFamilyModel<B,
             total_blocks: alloc.capacity() as usize,
             free_blocks: alloc.free_count(),
         })
+    }
+
+    fn paged_admission_capacity_snapshot(&self) -> Option<PagedAdmissionCapacitySnapshot> {
+        self.paged_admission_snapshot()
     }
 
     fn prefill(&mut self, cache_id: &str, tokens: &[u32]) -> Vec<f32> {
@@ -6250,6 +6295,54 @@ mod tests {
         assert!(model.kv_free_pool.is_empty());
         assert_eq!(model.prefill("seq-b", &[3, 4, 5]), other);
         assert_eq!(model.cache_len("seq-b"), 3);
+    }
+
+    #[test]
+    fn paged_admission_coverage_counts_only_retired_metadata_slots() {
+        use crate::common::DecoderOnlyLLM;
+        use ferrum_execution::model_executor::PagedAdmissionCoverage;
+
+        let mut cfg = test_llama_config(2, false);
+        cfg.max_seq_len = 63;
+        let loader = RecordingLoader::default();
+        let mut model = LlamaFamilyModel::<CpuBackend>::new(cfg, &loader).unwrap();
+        model.runtime_env = runtime_for_entries([
+            ("FERRUM_METAL_PAGED_KV", "1"),
+            ("FERRUM_KV_CAPACITY", "63"),
+            ("FERRUM_KV_MAX_BLOCKS", "4"),
+            ("FERRUM_PAGED_MAX_SEQS", "2"),
+        ]);
+        assert!(model.paged_admission_capacity_snapshot().is_none());
+        model.ensure_kv("resident");
+        let initial = model.paged_admission_capacity_snapshot().unwrap();
+        assert_eq!(initial.slots.free_blocks, 4);
+        assert_eq!(
+            initial.coverage,
+            PagedAdmissionCoverage::AllPersistentState {
+                max_new_sequences: 0,
+                max_sequence_tokens: 63,
+                max_batch_sequences: 2,
+            },
+            "free payload blocks do not prove another device metadata allocation"
+        );
+        assert_eq!(
+            model.paged_admission_capacity_snapshot(),
+            Some(initial.clone())
+        );
+
+        model.release("resident");
+        let reusable = model.paged_admission_capacity_snapshot().unwrap();
+        assert_eq!(reusable.slots, initial.slots);
+        assert_eq!(
+            reusable.coverage,
+            PagedAdmissionCoverage::AllPersistentState {
+                max_new_sequences: 1,
+                max_sequence_tokens: 63,
+                max_batch_sequences: 2,
+            }
+        );
+        model.ensure_kv("new-incarnation");
+        assert_eq!(model.paged_admission_capacity_snapshot(), Some(initial));
     }
 
     #[test]

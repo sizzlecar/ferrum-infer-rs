@@ -18,6 +18,23 @@ impl SchedulerSloSnapshot {
         self.planning_rounds += 1;
         self.last_revision = Some(round.revision());
         let value = &round.statistics;
+        self.selections.joint_cost_snapshot_queries = self
+            .selections
+            .joint_cost_snapshot_queries
+            .saturating_add(value.joint_cost_snapshot_queries);
+        self.selections.joint_cost_cache_hits = self
+            .selections
+            .joint_cost_cache_hits
+            .saturating_add(value.joint_cost_cache_hits);
+        self.selections.joint_cost_cache_peak_bytes = self
+            .selections
+            .joint_cost_cache_peak_bytes
+            .max(value.joint_cost_cache_peak_bytes);
+        self.selections.joint_comparisons += value.joint_comparisons;
+        self.selections.joint_interventions += value.joint_interventions;
+        self.selections.joint_unknown_resources += value.joint_unknown_resources;
+        self.selections.joint_unresolved += value.joint_unresolved;
+        self.selections.joint_known_infeasible += value.joint_known_infeasible;
         self.selections.known_queries += value.known_queries;
         self.selections.unknown_queries += value.unknown_queries;
         self.selections.held_candidates += value.held_candidates;

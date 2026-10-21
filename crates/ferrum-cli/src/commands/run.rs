@@ -850,7 +850,11 @@ pub struct RunCommand {
 
     /// Enable adaptive scheduling with millisecond latency targets, e.g. ttft:200,tpot:15,itl:50.
     #[arg(long, value_name = "TARGETS")]
-    pub scheduler_slo: Option<ferrum_types::SchedulerSloConfig>,
+    pub scheduler_slo: Option<ferrum_types::SloConfig>,
+
+    /// Load and save the instance-bound learned SLO state at this path.
+    #[arg(long, value_name = "PATH")]
+    pub scheduler_slo_state: Option<PathBuf>,
 
     /// Cap total prefill tokens per scheduler iteration with active decode; 0 disables.
     #[arg(long, value_name = "N")]
@@ -977,6 +981,10 @@ pub async fn execute(
     // Capture user input once, before model selection or device preparation.
     let user_environment = crate::runtime_env::capture_supported_runtime_environment()?;
     let scheduler_slo = config.resolve_scheduler_slo(cmd.scheduler_slo)?;
+    let scheduler_slo_state = cmd
+        .scheduler_slo_state
+        .as_deref()
+        .or(config.scheduler.slo_state_path.as_deref());
     if let Some(out_dir) = cmd.observability_vertical_slice_out.as_ref() {
         crate::observability_vertical_slice::write_observability_vertical_slice(
             ferrum_types::ProfileEntrypoint::Run,
@@ -1069,7 +1077,7 @@ pub async fn execute(
     let mut engine_config = product_input.engine_config;
     config.apply_output_and_tokenizer_config(&mut engine_config)?;
     config.apply_profile_journal_config(&mut engine_config)?;
-    engine_config.scheduler.slo = scheduler_slo;
+    engine_config.scheduler.slo = scheduler_slo.and_then(|slo| slo.scheduler_policy());
     engine_config.numerical_execution =
         config.resolve_numerical_execution(cmd.numerical_profile.as_ref());
     // Family candidates and startup sizing must see the same KV request as
@@ -1256,7 +1264,12 @@ pub async fn execute(
         .or_else(|| crate::runtime_env::runtime_snapshot_value(&runtime_config, "FERRUM_KV_DTYPE"));
     apply_kv_dtype_override(&mut engine_config, effective_kv_dtype)?;
     let numerical_execution = engine_config.numerical_execution.clone();
-    let feedback = crate::slo_product::ProductExecutionFeedback::prepare(&engine_config)?;
+    let feedback = crate::slo_product::ProductExecutionFeedback::prepare_with_state(
+        &mut engine_config,
+        scheduler_slo,
+        model_sources.as_deref(),
+        scheduler_slo_state,
+    )?;
     let journals = crate::observability_product::ProductJournalSession::prepare(
         &product_observability,
         &engine_config,
@@ -3389,6 +3402,7 @@ mod tests {
             q5_mmvq_weight_decode: None,
             q8_projection_weight_preparation: None,
             scheduler_slo: None,
+            scheduler_slo_state: None,
             scheduler_active_decode_prefill_token_budget: None,
             sequence_fit_policy: None,
             prefix_rendezvous_max_wait_ms: None,

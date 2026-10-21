@@ -414,6 +414,31 @@ impl EngineInner {
         maximum_admissions: usize,
         mut planning: Option<&mut TimePlanningRound>,
     ) -> Result<(usize, Vec<ExecutorPrefillMaintenanceDeferral>)> {
+        if let Some(round) = planning.as_deref_mut() {
+            // This path is shared by ordinary admission and fill-first retries.
+            // Refresh resource evidence after earlier asynchronous admissions;
+            // the immutable cost/stopping snapshot remains fixed for the turn.
+            round.set_capacity(self.model_executor.paged_admission_capacity_snapshot().map(
+                |snapshot| ferrum_scheduler::cost_prediction::PlanningCapacity {
+                    block_size: snapshot.slots.block_size,
+                    total_blocks: snapshot.slots.total_blocks,
+                    free_blocks: snapshot.slots.free_blocks,
+                    admission_coverage: snapshot.coverage,
+                },
+            ));
+            self.scheduler.prepare_joint_admission_gate(
+                &ferrum_interfaces::BatchHint {
+                    max_batch_size: self.config.batching.max_batch_size,
+                    max_tokens: self.config.batching.max_num_batched_tokens,
+                    target_latency_ms: None,
+                    available_memory: None,
+                    resource_constraints:
+                        ferrum_interfaces::scheduler::ResourceConstraints::default(),
+                },
+                round,
+                Instant::now(),
+            );
+        }
         let mut availability = AdmissionAvailability::take(&self.dynamic_admission_availability);
         let epochs = self
             .model_executor

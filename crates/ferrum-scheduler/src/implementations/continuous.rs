@@ -14,6 +14,8 @@ pub use execution_capacity::{ExecutionCapacityDeferral, ExecutionCapacityRelease
 mod prefix_rendezvous;
 mod prefix_restore;
 pub use prefix_rendezvous::{PrefixRendezvousCandidate, PrefixRendezvousHold, PrefixRequestKey};
+pub(crate) mod admission_gate;
+mod joint_selection;
 mod pressure;
 mod slo;
 mod time_policy;
@@ -3561,7 +3563,10 @@ impl ContinuousBatchScheduler {
         }
         // An enabled latency policy must be able to enforce its aggregate
         // budget even if a caller disabled the optional static chunk policy.
-        let tokens = if self.cb_config.enable_chunked_prefill || self.config.slo.is_some() {
+        let tokens = if self.cb_config.enable_chunked_prefill
+            || self.config.slo.is_some_and(|slo| {
+                slo.strategy == ferrum_types::SloStrategy::ReferenceStepDiagnostic
+            }) {
             remaining.min(step_tokens_remaining).max(1)
         } else {
             remaining.max(1)
@@ -3783,12 +3788,18 @@ impl ContinuousBatchScheduler {
 
             if *total_tokens + prefill_chunk_tokens <= hint.max_tokens {
                 if let Some(round) = planning.as_deref_mut() {
-                    round.selected_work(self.cost_work(
+                    let projected = self.cost_work(
                         req,
                         prefill_chunk_tokens,
                         false,
                         round.prefill_shape_policy,
-                    ));
+                    );
+                    if projected.is_some_and(|(work, _)| {
+                        work.requested.as_range().len() != prefill_chunk_tokens
+                    }) {
+                        round.execution_already_projected = false;
+                    }
+                    round.selected_work(projected);
                 }
                 let mut scheduled = req.inner.clone();
                 scheduled.tokens_processed = req.prefill_chunk_offset;
@@ -4163,7 +4174,9 @@ impl ContinuousBatchScheduler {
         let fill_first_initial_cohort_armed =
             self.fill_first_initial_cohort_armed.load(Ordering::Acquire);
         fill_first_initial_cohort_armed
-            && !(self.config.slo.is_some() && decoding_count > 0)
+            && !(self.config.slo.is_some_and(|slo| {
+                slo.strategy == ferrum_types::SloStrategy::ReferenceStepDiagnostic
+            }) && decoding_count > 0)
             && !(self
                 .runtime_config
                 .active_decode_prefill_token_budget
@@ -4410,6 +4423,14 @@ impl ContinuousBatchScheduler {
 
         if batch_requests.is_empty() {
             return Ok(None);
+        }
+
+        if let Some(round) = planning.as_deref_mut() {
+            self.select_joint_first_wave(&hint, &mut batch_requests, round, now);
+            total_tokens = batch_requests
+                .iter()
+                .filter_map(|request| request.tokens_to_process)
+                .sum();
         }
 
         let batch_id = BatchId::new();
@@ -4968,7 +4989,11 @@ mod tests {
                     ttft_ms: 1000.0,
                     tpot_ms: 100.0,
                     itl_ms: 120.0,
-                    reference: Default::default(),
+                    query: Default::default(),
+                    planning: Default::default(),
+                    joint: Default::default(),
+                    strategy: Default::default(),
+                    unknown_stopping: Default::default(),
                     unknown_cost: Default::default(),
                 }),
                 ..SchedulerConfig::default()

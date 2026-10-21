@@ -121,10 +121,18 @@ pub(in crate::continuous_engine) struct CompletionHandoff {
     completion_error: Option<FerrumError>,
     terminal_token_trace: Option<SequenceTokenTraceEvidence>,
     token_close: Option<Result<execution_close::ExecutionCloseTicket>>,
+    stopping_observation:
+        Option<ferrum_interfaces::request_observation::RequestStoppingObservation>,
+    product_delivery_failed: bool,
 }
 
 impl Drop for CompletionHandoff {
     fn drop(&mut self) {
+        if let (Some(observation), Some(inner)) =
+            (self.stopping_observation.take(), self.inner.upgrade())
+        {
+            inner.observe_product_completion(observation, false);
+        }
         // An output stop may drop a not-yet-polled completion or interrupt a
         // queue/close wait. Its physical ticket is only an observer; preserve
         // the client terminal and trace without awaiting that observer.
@@ -459,13 +467,19 @@ impl EngineInner {
 
     // ── stream helper ──────────────────────────────────────────────────
 
-    pub(super) fn stop_reason_for_sequence(
+    pub(in crate::continuous_engine) fn stop_reason_for_sequence(
         &self,
         handle: &Arc<SequenceHandle>,
     ) -> Option<FinishReason> {
-        match handle.lock().as_ref() {
+        match handle.lock().as_mut() {
             Some(seq) if self.sequences.is_current(handle) => {
-                seq.stop_reason(Some(self.tokenizer.as_ref()))
+                let reason = seq.stop_reason(Some(self.tokenizer.as_ref()));
+                if reason.is_none() {
+                    self.observe_verified_survival(seq);
+                } else if let Some(reason) = reason {
+                    self.retain_verified_stop(seq, reason);
+                }
+                reason
             }
             Some(_) => Some(FinishReason::Error),
             None => Some(FinishReason::Error),
@@ -784,6 +798,8 @@ impl EngineInner {
             }
             // Keep the index occupied until scheduler termination and exact
             // physical handoff are complete. Old Arcs subsequently see Taken.
+            let generated = sequence.generated_tokens.len();
+            let _ = self.observe_request_terminal(sequence, generated, FinishReason::Cancelled);
             state.take();
             self.sequences.remove_exact(handle);
             (
@@ -1190,6 +1206,7 @@ impl EngineInner {
             terminal_error,
             terminal_token_trace,
             token_close,
+            stopping_observation,
         ) = {
             if let Some(seq) = state.as_mut() {
                 if !self.sequences.is_current(handle) || !expected.matches(self, seq) {
@@ -1390,6 +1407,11 @@ impl EngineInner {
                     slot.close(self);
                 }
                 let senders = (seq.stream_sender.take(), seq.response_sender.take());
+                let stopping_observation = self.observe_request_terminal(
+                    seq,
+                    response.usage.completion_tokens,
+                    response.finish_reason,
+                );
                 // The index remains occupied until synchronous scheduler
                 // termination and exact owner transfer finish. Unwinding
                 // earlier leaves the remaining state in its original handle.
@@ -1407,6 +1429,7 @@ impl EngineInner {
                     terminal_error,
                     terminal_token_trace,
                     token_close,
+                    stopping_observation,
                 )
             } else {
                 return None;
@@ -1439,6 +1462,8 @@ impl EngineInner {
             completion_error,
             terminal_token_trace,
             token_close,
+            stopping_observation,
+            product_delivery_failed: false,
         })
     }
 
@@ -1515,6 +1540,12 @@ impl EngineInner {
         let result = self
             .finish_request_completion(request_id, &mut handoff, stream_sender)
             .await;
+        if let Some(observation) = handoff.stopping_observation.take() {
+            self.observe_product_completion(
+                observation,
+                result.is_ok() && !handoff.product_delivery_failed,
+            );
+        }
         if let Some(done) = handoff.done.take() {
             let _ = done.send(result);
         }
@@ -1586,7 +1617,9 @@ impl EngineInner {
                     }
                 }
             };
-            let _ = tx.send(result);
+            if tx.send(result).is_err() {
+                handoff.product_delivery_failed = true;
+            }
         }
         if let Some(sender) = stream_sender.filter(|_| !known_stream_error) {
             if let Some(error) = handoff.terminal_error.as_ref() {
@@ -1644,6 +1677,7 @@ impl EngineInner {
                     Err(error) => Err(error),
                 };
                 if let Err(error) = sent {
+                    handoff.product_delivery_failed = true;
                     if !sender.is_closed() {
                         let _ = sender.send(Err(error.clone())).await;
                         completion_error.get_or_insert(error);
