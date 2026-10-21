@@ -158,10 +158,15 @@ prefix. If a later static cost query is outside observed support, the planner
 may retain that prefix as a lower bound. Full static completion time remains
 unknown, and the target remains all declared endpoints. An alternative can
 rescue this case only when the static risk lower bound is already Infeasible,
-every candidate rank completes, and each candidate rank corresponding to a
-partial static trajectory finishes within that static prefix's known lower
-bound. An unknown initial distribution, no applied known prefix, finite planning
-horizons, or other failures retain their existing Unknown/error behavior.
+every candidate rank has fully supported costs and completes every declared
+request endpoint with a completion clock, and its joint risk is Feasible. The
+candidate need not finish before the static prefix's lower bound: that bound
+does not establish when the full static trajectory would finish. Static target
+time remains unknown and the window-unproven diagnostic remains observable;
+selection does not prove a relative throughput gain. Static-Feasible optimization
+still requires its existing paired gain and common-window checks. An unknown
+initial distribution, no applied known prefix, finite planning horizons, or
+other failures retain their existing Unknown/error behavior.
 
 `rank_partial_static` reports these partial trajectories separately.
 `resolved_mass` means endpoints have been assigned to risk categories; it does

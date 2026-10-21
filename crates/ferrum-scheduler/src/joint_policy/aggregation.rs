@@ -36,6 +36,9 @@ struct Totals {
     unsupported_mass: f64,
     window_debt: bool,
     partial_window_unproven: bool,
+    /// Control evidence from every rank's final request state, including Exact
+    /// ranks. This is independent of diagnostic unfinished probability mass.
+    endpoint_completion_unproven: bool,
     unfinished_request_mass: f64,
 }
 
@@ -276,6 +279,8 @@ impl ScenarioRiskAccumulator {
             let totals = &mut self.totals[index + 1];
             match outcome {
                 Ok(result) => {
+                    totals.endpoint_completion_unproven |= !result.has_completed_endpoints()
+                        || !comparison.partial_endpoints_covered(result);
                     totals.window_debt |= result.has_window_debt(&comparison.targets);
                     if partial_static && !comparison.partial_window_covered(result) {
                         totals.partial_window_unproven = true;
@@ -370,7 +375,16 @@ impl ScenarioRiskAccumulator {
                 });
                 continue;
             }
-            if self.totals[index].partial_window_unproven {
+            if self.partial_static_ranks > 0 && self.totals[index].endpoint_completion_unproven {
+                record(SelectionGate::PartialWindowUnproven);
+                continue;
+            }
+            // A violated static policy may trade throughput for feasibility.
+            // Keep complete endpoint/support evidence, but do not require a
+            // rescue to beat a lower bound on an unknown static completion.
+            if static_status != JointFeasibility::Infeasible
+                && self.totals[index].partial_window_unproven
+            {
                 record(SelectionGate::PartialWindowUnproven);
                 continue;
             }
@@ -545,6 +559,7 @@ fn accumulate_unknown(totals: &mut Totals, weight: f64, members: &[Member]) {
         return;
     }
     totals.unsupported_mass += weight;
+    totals.endpoint_completion_unproven = true;
     totals.unfinished_request_mass += weight * members.len() as f64;
     totals.ttft_unknown += weight * members.len() as f64;
     for member in members {

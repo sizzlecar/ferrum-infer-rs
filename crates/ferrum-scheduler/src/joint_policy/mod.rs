@@ -295,6 +295,17 @@ pub struct CostRiskBudget {
 }
 
 impl TrajectoryResult {
+    /// Final endpoint evidence, independent of an earlier Exact window's
+    /// progress. A token frontier without its completion clock is insufficient.
+    fn has_completed_endpoints(&self) -> bool {
+        !self.requests.is_empty()
+            && self.requests.iter().all(|request| {
+                request.prefill_tokens == request.prompt_tokens
+                    && request.output_tokens == request.scenario_end_tokens
+                    && request.central_clock.completed.is_some()
+            })
+    }
+
     pub fn has_window_debt(&self, targets: &[Progress]) -> bool {
         self.window_progress.len() != targets.len()
             || self
@@ -364,13 +375,22 @@ impl StaticTrajectory {
 }
 
 impl Comparison {
+    fn partial_endpoints_covered(&self, result: &TrajectoryResult) -> bool {
+        match self.window {
+            StaticWindow::Exact(_) => true,
+            // An AtLeast alternative has no window probe: its window_progress
+            // is its final endpoint progress, not progress at the prefix time.
+            StaticWindow::AtLeast(_) => {
+                result.has_completed_endpoints() && !result.has_window_debt(&self.targets)
+            }
+        }
+    }
+
     fn partial_window_covered(&self, result: &TrajectoryResult) -> bool {
         match self.window {
             StaticWindow::Exact(_) => true,
             StaticWindow::AtLeast(lower) => {
-                result.requests.iter().all(SimulatedRequest::finished)
-                    && !result.has_window_debt(&self.targets)
-                    && result.central_elapsed <= lower
+                self.partial_endpoints_covered(result) && result.central_elapsed <= lower
             }
         }
     }
@@ -530,7 +550,12 @@ impl SloPolicy {
             if alternative_risks[index] != JointFeasibility::Feasible {
                 continue;
             }
-            if !comparison.partial_window_covered(result) {
+            if !comparison.partial_endpoints_covered(result) {
+                continue;
+            }
+            if static_risk != JointFeasibility::Infeasible
+                && !comparison.partial_window_covered(result)
+            {
                 continue;
             }
             if static_risk == JointFeasibility::Feasible {

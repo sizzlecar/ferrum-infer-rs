@@ -6,6 +6,7 @@ mod decision_diagnostics;
 
 #[derive(Clone, Copy)]
 enum RejectAt {
+    NoGap { static_tail_ms: u64 },
     StaticContinuation,
     StaticAndSingletonContext(usize),
     EveryDecodeContinuation,
@@ -67,6 +68,7 @@ impl CostSnapshot for PartialSupportSnapshot {
             .iter()
             .all(|work| work.kind == AttemptWorkKind::Decode);
         let rejected = match self.reject_at {
+            RejectAt::NoGap { .. } => false,
             RejectAt::StaticContinuation => decode_only && query.work.len() == 2,
             RejectAt::StaticAndSingletonContext(context) => {
                 decode_only
@@ -80,7 +82,15 @@ impl CostSnapshot for PartialSupportSnapshot {
         if rejected {
             return CostScenarioPrediction::Unknown(self.reason);
         }
-        let duration = Duration::from_millis(if full_prefill {
+        let static_tail = match self.reject_at {
+            RejectAt::NoGap { static_tail_ms } if decode_only && query.work.len() == 2 => {
+                Some(static_tail_ms)
+            }
+            _ => None,
+        };
+        let duration = Duration::from_millis(if let Some(static_tail_ms) = static_tail {
+            static_tail_ms
+        } else if full_prefill {
             self.static_first_ms
         } else {
             self.alternative_step_ms
@@ -343,7 +353,7 @@ fn a_feasible_alternative_does_not_rescue_an_unresolved_static_prefix() {
 }
 
 #[test]
-fn completion_after_the_static_prefix_cannot_invent_an_exact_common_window() {
+fn partial_rescue_can_complete_after_the_static_prefix_without_inventing_a_window() {
     let mut snapshot = PartialSupportSnapshot::new(RejectAt::StaticContinuation);
     snapshot.alternative_step_ms = 40;
     let mut config = partial_config();
@@ -363,10 +373,123 @@ fn completion_after_the_static_prefix_cannot_invent_an_exact_common_window() {
         Some(Duration::from_millis(120))
     );
     assert!(decision.static_target_time.is_none());
-    // Actual static completion might be before or after 120 ms. A 100 ms
-    // known-prefix lower bound alone cannot prove candidate progress at it.
+    // Actual static completion might be before or after 120 ms. Rescue of an
+    // already violated static policy does not claim a common-window speedup.
     assert_eq!(decision.any_window_debt, vec![true]);
-    assert_eq!(decision.choice, PolicyChoice::Unresolved);
+    assert_eq!(decision.choice, PolicyChoice::Alternative(0));
+    assert_eq!(decision.observation.candidates.gates.eligible, 1);
+}
+
+#[test]
+fn partial_rescue_matches_complete_static_rescue_on_both_sides_of_candidate_time() {
+    for static_tail_ms in [1, 100] {
+        let mut snapshot = PartialSupportSnapshot::new(RejectAt::NoGap { static_tail_ms });
+        snapshot.alternative_step_ms = 40;
+        let mut config = partial_config();
+        config.ttft_ms = 90.0;
+        let (decision, diagnostics) = evaluate_partial(&snapshot, &config);
+        let decision = decision.unwrap();
+        assert_eq!(diagnostics.rank_partial_static, 0);
+        assert_eq!(
+            decision.static_risk.classify(&config),
+            JointFeasibility::Infeasible
+        );
+        assert_eq!(
+            decision.alternative_risks[0].classify(&config),
+            JointFeasibility::Feasible
+        );
+        assert_eq!(
+            decision.static_target_time,
+            Some(Duration::from_millis(100 + static_tail_ms))
+        );
+        assert_eq!(
+            decision.alternative_target_times[0],
+            Some(Duration::from_millis(120))
+        );
+        assert_eq!(decision.any_window_debt, vec![static_tail_ms == 1]);
+        assert_eq!(decision.choice, PolicyChoice::Alternative(0));
+    }
+}
+
+#[test]
+fn partial_rescue_direct_choose_requires_final_endpoints_and_completion_clocks() {
+    let mut snapshot = PartialSupportSnapshot::new(RejectAt::StaticContinuation);
+    snapshot.alternative_step_ms = 40;
+    let mut config = partial_config();
+    config.ttft_ms = 90.0;
+    let requests = partial_requests();
+    let mut diagnostics = ScenarioDiagnostics::default();
+    let summary = SloPolicy::evaluate_scenarios_with_diagnostics(
+        EvaluationInput {
+            snapshot: &snapshot,
+            now: snapshot.at,
+            config: &config,
+            execution: CostExecution::SingleInvocation,
+            requests: &requests,
+            resources: ResourceSupport {
+                waiting_requests: 0,
+                kv_reserved_through_scenario_end: true,
+            },
+            adapter: &MixedContinuation,
+            static_action: &2,
+            alternatives: &[1],
+            horizon: EvaluationHorizon::ScenarioCompletion,
+        },
+        |_, _| Ok(()),
+        |_, comparison| {
+            let choose = |value: &Comparison, static_status| {
+                SloPolicy::choose(value, static_status, &[JointFeasibility::Feasible], &[None])
+            };
+            assert_eq!(
+                choose(comparison, JointFeasibility::Infeasible),
+                PolicyChoice::Alternative(0)
+            );
+            assert_eq!(
+                choose(comparison, JointFeasibility::Unresolved),
+                PolicyChoice::Unresolved
+            );
+            let StaticTrajectory::OutsideSupportPrefix(prefix) = &comparison.static_result else {
+                panic!("expected the actual static support gap");
+            };
+            let candidate = comparison.alternatives[0].as_ref().unwrap();
+            assert!(candidate.has_completed_endpoints());
+            assert_eq!(candidate.central_elapsed, Duration::from_millis(120));
+            assert!(!comparison.partial_window_covered(candidate));
+            for missing in 0..4 {
+                let mut candidate = candidate.clone();
+                match missing {
+                    0 => candidate.requests[0].prefill_tokens -= 1,
+                    1 => candidate.requests[0].output_tokens -= 1,
+                    2 => candidate.requests[0].central_clock.completed = None,
+                    _ => candidate.window_progress[0].output_tokens -= 1,
+                }
+                // A caller-supplied Feasible risk cannot substitute for the
+                // endpoint evidence required by this public selection API.
+                let incomplete = Comparison {
+                    revision: comparison.revision,
+                    window: comparison.window,
+                    targets: comparison.targets.clone(),
+                    static_result: StaticTrajectory::OutsideSupportPrefix(TrajectoryPrefix {
+                        requests: prefix.requests.clone(),
+                        central_elapsed: prefix.central_elapsed,
+                        risk_elapsed: prefix.risk_elapsed,
+                        queries: prefix.queries,
+                        cost_risk: prefix.cost_risk,
+                        unsupported: prefix.unsupported,
+                    }),
+                    alternatives: vec![Ok(candidate)],
+                };
+                assert_eq!(
+                    choose(&incomplete, JointFeasibility::Infeasible),
+                    PolicyChoice::Unresolved
+                );
+            }
+        },
+        &mut diagnostics,
+    )
+    .unwrap();
+    assert_eq!(summary.partial_static_ranks, 2);
+    assert_eq!(diagnostics.rank_partial_static, 2);
 }
 
 #[test]

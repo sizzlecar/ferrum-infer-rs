@@ -123,6 +123,8 @@ impl MetricClassCounts {
 pub enum SelectionGate {
     RiskInfeasible,
     RiskUnresolved,
+    /// Missing complete endpoint evidence for a partial-static comparison, or
+    /// an unproved common-window bound when static is not known infeasible.
     PartialWindowUnproven,
     TargetTimeUnavailable,
     StaticFeasibleWindowDebt,

@@ -104,9 +104,9 @@ fn observed_next(
     (batch, round)
 }
 
-#[test]
-fn actual_dispatch_records_one_applied_rescue_without_more_provider_queries() {
-    let (scheduler, mut round, prefill, decoder, _) = partial_fixture(false);
+fn assert_applied_rescue(alternative_step: Duration, ttft_limit: Duration) {
+    let (scheduler, mut round, prefill, decoder, _) =
+        partial_fixture_with_timing(false, alternative_step, ttft_limit);
     let source = count_snapshot(&mut round, false);
     let (batch, round) = observed_next(&scheduler, round);
     assert_eq!(tokens(&batch, &prefill), 1);
@@ -121,6 +121,7 @@ fn actual_dispatch_records_one_applied_rescue_without_more_provider_queries() {
     assert_eq!(decision.consumed, 1);
     assert_eq!(decision.post_finish_time_rejected, 0);
     assert_eq!(decision.outcomes.alternative, 1);
+    assert_eq!(decision.candidates.gates.eligible, 1);
     assert_eq!(decision.unresolved.decisions, 0);
     assert!(decision.latest_unresolved.is_none());
     // Reading and serializing cold health must not replay the decision.
@@ -140,6 +141,20 @@ fn actual_dispatch_records_one_applied_rescue_without_more_provider_queries() {
         serde_json::to_value(health).unwrap();
     }
     assert_actual_query_count(&round, &source, 4, 2);
+}
+
+#[test]
+fn actual_dispatch_records_one_applied_rescue_without_more_provider_queries() {
+    assert_applied_rescue(Duration::from_secs(10), Duration::from_secs(50));
+}
+
+#[test]
+fn actual_dispatch_applies_complete_rescue_later_than_the_static_prefix_bound() {
+    // Preserve the 100:120 counterexample in simulated seconds so the real
+    // one-second planning allowance cannot dominate its SLO margins. Static
+    // TTFT 100 exceeds 90; candidate TTFT 80 and TPOT/ITL 40 meet the frozen
+    // fixture targets even though full completion 120 exceeds prefix 100.
+    assert_applied_rescue(Duration::from_secs(40), Duration::from_secs(90));
 }
 
 #[test]

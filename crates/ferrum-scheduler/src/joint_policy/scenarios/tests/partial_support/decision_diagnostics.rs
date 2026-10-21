@@ -31,14 +31,14 @@ fn complete_rescue_reports_an_eligible_action_without_an_unresolved_witness() {
 }
 
 #[test]
-fn later_complete_candidate_reports_partial_window_gate_not_completion_uncertainty() {
+fn later_complete_rescue_keeps_window_fact_without_recording_a_selection_block() {
     let mut snapshot = PartialSupportSnapshot::new(RejectAt::StaticContinuation);
     snapshot.alternative_step_ms = 40;
     let mut config = partial_config();
     config.ttft_ms = 90.0;
     let (decision, _) = evaluate_partial(&snapshot, &config);
     let decision = decision.unwrap();
-    assert_eq!(decision.choice, PolicyChoice::Unresolved);
+    assert_eq!(decision.choice, PolicyChoice::Alternative(0));
     assert_eq!(decision.observation.candidates.joint.feasible, 1);
     assert_eq!(
         decision
@@ -46,24 +46,16 @@ fn later_complete_candidate_reports_partial_window_gate_not_completion_uncertain
             .candidates
             .gates
             .partial_window_unproven,
-        1
+        0
     );
-    let witness = decision.observation.unresolved.unwrap();
-    assert_eq!(witness.partial_static_ranks, 2);
-    assert_eq!(witness.endpoint_unresolved_mass, 0.0);
-    assert_eq!(witness.static_action.target_time, None);
-    let candidate = witness.alternatives[0].unwrap();
+    assert_eq!(decision.observation.candidates.gates.eligible, 1);
+    assert!(decision.observation.unresolved.is_none());
+    assert_eq!(decision.static_target_time, None);
     assert_eq!(
-        candidate.first_gate,
-        Some(SelectionGate::PartialWindowUnproven)
+        decision.alternative_target_times[0],
+        Some(Duration::from_millis(120))
     );
-    assert_eq!(candidate.metrics.completion_failure, MetricClass::Feasible);
-    assert_eq!(candidate.target_time, Some(Duration::from_millis(120)));
-    assert_eq!(candidate.known_target_time_mass, 1.0);
-    assert_eq!(candidate.unfinished_request_mass, 0.0);
-    assert_eq!(candidate.unsupported_trajectory_mass, 0.0);
-    assert!(candidate.window_debt);
-    assert!(candidate.partial_window_unproven);
+    assert_eq!(decision.any_window_debt, vec![true]);
 }
 
 #[test]

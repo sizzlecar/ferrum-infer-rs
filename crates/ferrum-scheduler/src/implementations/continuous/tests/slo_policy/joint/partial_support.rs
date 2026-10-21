@@ -6,6 +6,7 @@ mod decision_diagnostics;
 struct FixedGapCost {
     base: ConditionalSnapshot,
     reject_singletons: bool,
+    alternative_step: Duration,
 }
 
 impl FixedGapCost {
@@ -20,7 +21,11 @@ impl FixedGapCost {
         let full_prefill = query.work.iter().any(|work| {
             work.kind == AttemptWorkKind::Prefill && work.requested.as_range().len() == 2
         });
-        Some(Duration::from_secs(if full_prefill { 100 } else { 10 }))
+        Some(if full_prefill {
+            Duration::from_secs(100)
+        } else {
+            self.alternative_step
+        })
     }
 }
 
@@ -96,10 +101,29 @@ fn partial_fixture(
     RequestId,
     Instant,
 ) {
+    partial_fixture_with_timing(
+        reject_singletons,
+        Duration::from_secs(10),
+        Duration::from_secs(50),
+    )
+}
+
+fn partial_fixture_with_timing(
+    reject_singletons: bool,
+    alternative_step: Duration,
+    ttft_limit: Duration,
+) -> (
+    ContinuousBatchScheduler,
+    TimePlanningRound,
+    RequestId,
+    RequestId,
+    Instant,
+) {
     // These are simulated service durations, not host timing requirements.
     // The one-second planning allowance is charged to both trajectories and
     // remains small relative to the declared fifty-second latency limits.
     let mut config: SchedulerSloConfig = "ttft:50000,tpot:50000,itl:50000".parse().unwrap();
+    config.ttft_ms = ttft_limit.as_secs_f64() * 1_000.0;
     config.strategy = ferrum_types::SloStrategy::Joint;
     config.planning.max_elapsed_us = 1_000_000;
     config.planning.max_scenarios = 2;
@@ -135,6 +159,7 @@ fn partial_fixture(
             completion_known: true,
         },
         reject_singletons,
+        alternative_step,
     });
     let mut round = TimePlanningRound::new(
         source,
