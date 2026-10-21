@@ -19,6 +19,9 @@ pub struct StoppingConfig {
     pub max_rule_bytes: usize,
     pub min_risk_set: usize,
     pub max_forecast_positions: usize,
+    /// Maximum fact age for stopping hazards and maximum ingress age for the
+    /// completion cohort. Completion uses the inclusive [maturity, ttl] range
+    /// for every outcome, including active and missing observations.
     pub ttl: Duration,
 }
 
@@ -352,12 +355,16 @@ impl StoppingSnapshot for StoppingTable {
         {
             return CompletionForecast::unknown();
         }
+        // Select the cohort by immutable ingress age before examining outcomes.
+        // Otherwise expired completed requests would remain unknown forever in
+        // a low-arrival window while recent successes entered its denominator.
+        // Missing timestamps cannot prove either age boundary and stay unknown.
         let missing_mature = self
             .unobserved_admission_times
             .iter()
             .filter(|time| {
                 time.and_then(|time| query.now.checked_duration_since(time))
-                    .is_none_or(|age| age >= query.maturity)
+                    .is_none_or(|age| age >= query.maturity && age <= self.config.ttl)
             })
             .count();
         let (mut matched, mut succeeded, mut failed, mut unresolved) =
@@ -366,7 +373,7 @@ impl StoppingSnapshot for StoppingTable {
             if query
                 .now
                 .checked_duration_since(record.admitted_at)
-                .is_none_or(|age| age < query.maturity)
+                .is_none_or(|age| age < query.maturity || age > self.config.ttl)
             {
                 continue;
             }

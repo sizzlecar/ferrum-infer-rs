@@ -146,6 +146,11 @@ fn admission_timestamp_precedes_watermark_and_survives_a_dropped_initial_fact() 
     .unwrap();
     window.observe(&receiver.recv().unwrap().observation, now);
     observer.shared.advance_window(&mut window);
+    let mut recent_success = completed.clone();
+    recent_success.lifecycle.admission = 3;
+    recent_success.admitted_at = now;
+    recent_success.observed_at = now;
+    window.observe(&recent_success, now);
     let query = CompletionQuery {
         rules: &completed.rules,
         cap: completed.cap,
@@ -163,7 +168,8 @@ fn admission_timestamp_precedes_watermark_and_survives_a_dropped_initial_fact() 
         ..query
     });
     assert_eq!(later.samples, 2);
-    assert_eq!(later.unresolved_mass, 1.0);
+    assert_eq!(later.succeeded_mass, 0.5);
+    assert_eq!(later.unresolved_mass, 0.5);
 
     // A delayed old producer never overwrites a more recent ring incarnation.
     let newer = RequestLifecycleId {

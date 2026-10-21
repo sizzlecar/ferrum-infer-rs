@@ -487,8 +487,7 @@ fn matured_completion_cohort_retains_failures_and_unknowns_and_excludes_recent_s
         now: now + Duration::from_secs(100),
         ..query
     });
-    assert_eq!(stale.samples, 6);
-    assert_eq!(stale.unresolved_mass, 1.0);
+    assert_eq!(stale, CompletionForecast::unknown());
 }
 
 #[test]
@@ -506,14 +505,14 @@ fn product_completion_enrichment_preserves_natural_stop_freshness_and_conflicts_
         rules: &key,
         cap: 100,
         maturity: Duration::from_secs(30),
-        now: start + Duration::from_secs(61),
+        now: start + Duration::from_secs(59),
     };
     assert_eq!(
         window.snapshot().completion_forecast(&query).succeeded_mass,
         1.0
     );
     assert_eq!(
-        forecast(&window, query.now, 100, 100).unresolved_mass,
+        forecast(&window, query.now + Duration::from_secs(2), 100, 100).unresolved_mass,
         1.0,
         "late product delivery cannot refresh the earlier natural endpoint"
     );
@@ -642,6 +641,11 @@ fn recent_missing_and_domain_rejected_admissions_enter_only_when_mature() {
     rejected.observed_at = now;
     rejected.rules = rules("rejected-domain");
     window.observe(&rejected, now);
+    let mut recent_success = completed.clone();
+    recent_success.lifecycle.admission = 5;
+    recent_success.admitted_at = now;
+    recent_success.observed_at = now;
+    window.observe(&recent_success, now);
     assert_eq!(window.stats().unobserved_lifetimes, 2);
     assert_eq!(window.stats().domain_limit, 1);
     let query = CompletionQuery {
@@ -661,11 +665,127 @@ fn recent_missing_and_domain_rejected_admissions_enter_only_when_mature() {
         now: now + Duration::from_secs(30),
         ..query
     });
-    assert_eq!(later.samples, 4);
+    assert_eq!(later.samples, 3);
+    assert_eq!(later.succeeded_mass, 1.0 / 3.0);
     assert_eq!(
-        later.unresolved_mass, 1.0,
-        "newly mature missing members and expired success stay unknown"
+        later.unresolved_mass,
+        2.0 / 3.0,
+        "missing and rejected members enter at maturity; old ingress expires uniformly"
     );
+}
+
+#[test]
+fn completion_ingress_age_boundaries_apply_to_every_outcome_and_missing_fact() {
+    let start = clock();
+    let mut window = window(8);
+    for (admission, terminal, outcome) in [
+        (
+            1,
+            Some(RequestTerminalReason::Eos),
+            Some(RequestCompletionOutcome::Succeeded),
+        ),
+        (
+            2,
+            Some(RequestTerminalReason::Error),
+            Some(RequestCompletionOutcome::Failed),
+        ),
+        (3, None, None),
+    ] {
+        let mut observation = fact(admission, 8, terminal);
+        observation.completion = outcome;
+        window.observe(&observation, start);
+    }
+    window.record_admission(
+        RequestLifecycleId {
+            producer: 1,
+            admission: 4,
+        },
+        start,
+    );
+    let key = rules("ordinary-eos");
+    let query = CompletionQuery {
+        rules: &key,
+        cap: 100,
+        maturity: Duration::from_secs(30),
+        now: start + Duration::from_secs(30),
+    };
+    assert_eq!(
+        window.snapshot().completion_forecast(&CompletionQuery {
+            now: query.now - Duration::from_nanos(1),
+            ..query
+        }),
+        CompletionForecast::unknown()
+    );
+    let mature = window.snapshot().completion_forecast(&query);
+    assert_eq!(mature.samples, 4);
+    assert_eq!(mature.succeeded_mass, 0.25);
+    assert_eq!(mature.failed_mass, 0.25);
+    assert_eq!(mature.unresolved_mass, 0.5);
+    let boundary = start + Duration::from_secs(60);
+    assert_eq!(
+        window.snapshot().completion_forecast(&CompletionQuery {
+            now: boundary,
+            ..query
+        }),
+        mature
+    );
+    assert_eq!(
+        window.snapshot().completion_forecast(&CompletionQuery {
+            now: boundary + Duration::from_nanos(1),
+            ..query
+        }),
+        CompletionForecast::unknown()
+    );
+}
+
+#[test]
+fn completed_episodes_do_not_poison_later_cohorts_before_count_eviction() {
+    let start = clock();
+    let mut window = window(16);
+    for admission in 1..=3 {
+        let ingress = start + Duration::from_secs((admission - 1) * 45);
+        let mut observation = fact(admission, 8, Some(RequestTerminalReason::Eos));
+        observation.admitted_at = ingress;
+        observation.observed_at = ingress;
+        observation.completion = Some(RequestCompletionOutcome::Succeeded);
+        window.observe(&observation, ingress);
+        let query = CompletionQuery {
+            rules: &observation.rules,
+            cap: 100,
+            maturity: Duration::from_secs(30),
+            now: ingress + Duration::from_secs(35),
+        };
+        let result = window.snapshot().completion_forecast(&query);
+        assert_eq!(result.samples, 1);
+        assert_eq!(result.succeeded_mass, 1.0);
+        assert_eq!(result.unresolved_mass, 0.0);
+    }
+    assert_eq!(
+        window.retained_requests(),
+        3,
+        "expiry is independent of count eviction"
+    );
+    assert_eq!(window.config.ttl, Duration::from_secs(60));
+}
+
+#[test]
+fn missing_admission_timestamp_cannot_be_assumed_expired_from_later_serials() {
+    let now = clock() + Duration::from_secs(1000);
+    let mut window = window(4);
+    let mut observation = fact(2, 8, Some(RequestTerminalReason::Eos));
+    observation.admitted_at = now - Duration::from_secs(40);
+    observation.observed_at = observation.admitted_at;
+    observation.completion = Some(RequestCompletionOutcome::Succeeded);
+    window.observe(&observation, now);
+    let result = window.snapshot().completion_forecast(&CompletionQuery {
+        rules: &observation.rules,
+        cap: 100,
+        maturity: Duration::from_secs(30),
+        now,
+    });
+    assert_eq!(result.samples, 2);
+    assert_eq!(result.succeeded_mass, 0.5);
+    assert_eq!(result.unresolved_mass, 0.5);
 }
 
 #[test]

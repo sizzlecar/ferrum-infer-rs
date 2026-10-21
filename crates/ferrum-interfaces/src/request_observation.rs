@@ -218,8 +218,9 @@ pub struct StoppingQuery<'a> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CompletionApproximation {
     /// Same-instance, full stopping-domain and exact-cap empirical arrival
-    /// proportion in a fixed minimum-age cohort. Recent successes and pending
-    /// requests are excluded equally; every matured missing outcome is unknown.
+    /// proportion in the inclusive ingress-age [maturity, stopping TTL] cohort.
+    /// Success, failure, active and missing outcomes use the same age bounds;
+    /// missing outcomes within the cohort or with unknown ingress stay unknown.
     /// Applying this to current arrivals assumes cohort exchangeability, not
     /// finite-sample, conditional-on-progress or joint coverage certainty.
     EmpiricalMaturedCohort,

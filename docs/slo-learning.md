@@ -68,6 +68,13 @@ measured feature envelope, expired evidence and missing stopping/completion
 support remain unknown. Shared residual-rank scenarios are an empirical
 dependence assumption, not a coverage certificate.
 
+Completion estimates select arrivals by original ingress age, from the configured
+maturity through the stopping evidence TTL (60 seconds by default), inclusively.
+The same bounds apply to successes, failures, active requests and missing facts.
+Missing facts with unknown ingress age remain unresolved. Recent successes cannot
+enter early, and expired arrivals cannot linger as unknown only because a quiet
+service has not yet filled its count-based observation window.
+
 ## Unknown and infeasible forecasts
 
 `unknown_cost` and `unknown_stopping` each accept `static_fallback`, `reject`, or
