@@ -16,6 +16,9 @@ use ferrum_runtime::{
 };
 use half::{bf16, f16};
 
+mod layer_norm;
+pub(crate) use layer_norm::ReferenceLayerNormLaunch;
+
 static NEXT_RUNTIME_INSTANCE: AtomicU64 = AtomicU64::new(1);
 static NEXT_STREAM_INSTANCE: AtomicU64 = AtomicU64::new(1);
 static NEXT_FENCE_INSTANCE: AtomicU64 = AtomicU64::new(1);
@@ -303,6 +306,9 @@ enum ReferenceCommandKind {
     DenseLinear {
         launches: Box<[ReferenceDenseLinearLaunch]>,
     },
+    LayerNorm {
+        launch: ReferenceLayerNormLaunch,
+    },
 }
 
 /// An owned, fully validated command for the synchronous reference runtime.
@@ -322,6 +328,7 @@ impl fmt::Debug for ReferenceDeviceCommand {
             ReferenceCommandKind::ManagedUpload { .. } => "managed_upload",
             ReferenceCommandKind::Zero { .. } => "zero",
             ReferenceCommandKind::DenseLinear { .. } => "dense_linear",
+            ReferenceCommandKind::LayerNorm { .. } => "layer_norm",
         };
         formatter
             .debug_struct("ReferenceDeviceCommand")
@@ -401,6 +408,20 @@ impl ReferenceDeviceCommand {
             kind: ReferenceCommandKind::DenseLinear {
                 launches: vec![launch].into_boxed_slice(),
             },
+        })
+    }
+
+    pub(crate) fn layer_norm_tensor(
+        launch: ReferenceLayerNormLaunch,
+    ) -> Result<Self, ReferenceDeviceRuntimeError> {
+        launch.validate()?;
+        let logical_work = launch.logical_work()?;
+        Ok(Self {
+            operation: "vnext_layer_norm_bf16",
+            logical_work: Some(logical_work),
+            compute_dispatch_count: 1,
+            transfer_command_count: 0,
+            kind: ReferenceCommandKind::LayerNorm { launch },
         })
     }
 
@@ -520,6 +541,13 @@ impl ReferenceDeviceCommand {
                 }
                 Ok(())
             }
+            ReferenceCommandKind::LayerNorm { launch } => {
+                launch.input.validate_runtime(runtime_instance)?;
+                launch.output.validate_runtime(runtime_instance)?;
+                launch.validate()?;
+                launch.logical_work()?;
+                Ok(())
+            }
         }
     }
 
@@ -558,6 +586,10 @@ impl ReferenceDeviceCommand {
                         .fetch_add(1, Ordering::Relaxed);
                 }
             }
+            ReferenceCommandKind::LayerNorm { launch } => {
+                layer_norm::execute(launch);
+                counters.layer_norm_launches.fetch_add(1, Ordering::Relaxed);
+            }
         }
     }
 }
@@ -566,37 +598,36 @@ fn execute_dense_linear(launch: &ReferenceDenseLinearLaunch) {
     // Fixed-size metadata only. Every distinct allocation is locked once, in
     // a global address order, including when two or all three roles share it.
     // Preflight proved that output does not overlap either read operand.
-    let mut storage = DenseAllocationLocks::new(launch);
+    let mut storage = AllocationLocks::new([&launch.input, &launch.weight, &launch.output]);
     for row in 0..launch.rows {
         for out_feature in 0..launch.out_features {
             let mut sum = 0.0_f32;
             for in_feature in 0..launch.in_features {
                 let input_index = row * launch.in_features + in_feature;
                 let weight_index = out_feature * launch.in_features + in_feature;
-                let input = storage.read(0, input_index, launch.scalar);
-                let weight = storage.read(1, weight_index, launch.scalar);
+                let input = launch.scalar.decode(storage.read_bits(0, input_index));
+                let weight = launch.scalar.decode(storage.read_bits(1, weight_index));
                 // Preserve the existing F16 left-to-right FP32 arithmetic.
                 // BF16 follows the same order and rounds only at the output.
                 sum += input * weight;
             }
             let output_index = row * launch.out_features + out_feature;
-            storage.write_output(output_index, launch.scalar.encode(sum));
+            storage.write_bits(2, output_index, launch.scalar.encode(sum));
         }
     }
 }
 
-struct DenseAllocationLocks<'a> {
-    guards: [Option<MutexGuard<'a, Box<[u8]>>>; 3],
-    slots: [usize; 3],
-    offsets: [usize; 3],
+struct AllocationLocks<'a, const N: usize> {
+    guards: [Option<MutexGuard<'a, Box<[u8]>>>; N],
+    slots: [usize; N],
+    offsets: [usize; N],
 }
 
-impl<'a> DenseAllocationLocks<'a> {
-    fn new(launch: &'a ReferenceDenseLinearLaunch) -> Self {
-        let regions = [&launch.input, &launch.weight, &launch.output];
+impl<'a, const N: usize> AllocationLocks<'a, N> {
+    fn new(regions: [&'a ReferenceBufferRegion; N]) -> Self {
         let mut allocations = regions.map(|region| region.allocation.as_ref());
         allocations.sort_unstable_by_key(|allocation| *allocation as *const _ as usize);
-        let mut unique: [Option<&'a ReferenceAllocation>; 3] = [None; 3];
+        let mut unique: [Option<&'a ReferenceAllocation>; N] = [None; N];
         let mut count = 0;
         for allocation in allocations {
             if count == 0 || !std::ptr::eq(unique[count - 1].unwrap(), allocation) {
@@ -604,7 +635,7 @@ impl<'a> DenseAllocationLocks<'a> {
                 count += 1;
             }
         }
-        let mut guards = [None, None, None];
+        let mut guards = std::array::from_fn(|_| None);
         for index in 0..count {
             guards[index] = Some(unique[index].unwrap().lock());
         }
@@ -614,7 +645,7 @@ impl<'a> DenseAllocationLocks<'a> {
                 .position(|allocation| {
                     std::ptr::eq(allocation.unwrap(), region.allocation.as_ref())
                 })
-                .expect("each dense role is present in its allocation table")
+                .expect("each operand role is present in its allocation table")
         });
         Self {
             guards,
@@ -623,15 +654,15 @@ impl<'a> DenseAllocationLocks<'a> {
         }
     }
 
-    fn read(&self, role: usize, index: usize, scalar: ReferenceDenseScalar) -> f32 {
+    fn read_bits(&self, role: usize, index: usize) -> u16 {
         let bytes = self.guards[self.slots[role]].as_ref().unwrap();
         let offset = self.offsets[role] + index * 2;
-        scalar.decode(u16::from_le_bytes([bytes[offset], bytes[offset + 1]]))
+        u16::from_le_bytes([bytes[offset], bytes[offset + 1]])
     }
 
-    fn write_output(&mut self, index: usize, bits: u16) {
-        let bytes = self.guards[self.slots[2]].as_mut().unwrap();
-        let offset = self.offsets[2] + index * 2;
+    fn write_bits(&mut self, role: usize, index: usize, bits: u16) {
+        let bytes = self.guards[self.slots[role]].as_mut().unwrap();
+        let offset = self.offsets[role] + index * 2;
         bytes[offset..offset + 2].copy_from_slice(&bits.to_le_bytes());
     }
 }
@@ -723,6 +754,7 @@ struct ReferenceRuntimeCounters {
     commands: AtomicU64,
     uploaded_bytes: AtomicU64,
     dense_linear_launches: AtomicU64,
+    layer_norm_launches: AtomicU64,
     readback_bytes: AtomicU64,
 }
 
@@ -734,6 +766,7 @@ pub struct ReferenceDeviceRuntimeSnapshot {
     pub commands: u64,
     pub uploaded_bytes: u64,
     pub dense_linear_launches: u64,
+    pub layer_norm_launches: u64,
     pub readback_bytes: u64,
 }
 
@@ -855,6 +888,7 @@ impl ReferenceDeviceRuntime {
             commands: self.counters.commands.load(Ordering::Relaxed),
             uploaded_bytes: self.counters.uploaded_bytes.load(Ordering::Relaxed),
             dense_linear_launches: self.counters.dense_linear_launches.load(Ordering::Relaxed),
+            layer_norm_launches: self.counters.layer_norm_launches.load(Ordering::Relaxed),
             readback_bytes: self.counters.readback_bytes.load(Ordering::Relaxed),
         }
     }

@@ -2,15 +2,16 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use ferrum_runtime::{
-    dense_linear_bf16_contract, dense_linear_contract, CapabilityCatalog, CapabilityId,
-    ContractVersion, DeviceClass, DeviceDescriptor, DeviceId, DeviceRuntime,
+    dense_linear_bf16_contract, dense_linear_contract, layer_norm_bf16_contract, CapabilityCatalog,
+    CapabilityId, ContractVersion, DeviceClass, DeviceDescriptor, DeviceId, DeviceRuntime,
     DynamicStorageAllocator, DynamicStorageProfile, DynamicStorageView, EngineProviderDescriptor,
     OperationContract, OperationProvider, OperationRuntimeRegistry, ProviderId, VNextError,
     WeightMaterializerId, WeightMaterializerRegistry, DENSE_LINEAR_BF16_CAPABILITY_ID,
-    DENSE_LINEAR_F16_CAPABILITY_ID, IDENTITY_WEIGHT_MATERIALIZER_ID,
+    DENSE_LINEAR_F16_CAPABILITY_ID, IDENTITY_WEIGHT_MATERIALIZER_ID, LAYER_NORM_BF16_CAPABILITY_ID,
 };
 
 use super::dense_linear::{implementation_fingerprint, ReferenceDenseLinearProvider};
+use super::layer_norm::ReferenceLayerNormProvider;
 use super::runtime::{
     ReferenceDeviceRuntime, ReferenceDeviceRuntimeConfig, ReferenceDeviceRuntimeError,
 };
@@ -23,6 +24,7 @@ pub fn reference_vnext_capabilities() -> Result<BTreeSet<CapabilityId>, VNextErr
     Ok(BTreeSet::from([
         CapabilityId::new(DENSE_LINEAR_F16_CAPABILITY_ID)?,
         CapabilityId::new(DENSE_LINEAR_BF16_CAPABILITY_ID)?,
+        CapabilityId::new(LAYER_NORM_BF16_CAPABILITY_ID)?,
     ]))
 }
 
@@ -37,6 +39,8 @@ pub(super) fn reference_vnext_runtime_config(
         runtime_implementation_fingerprint: implementation_fingerprint(&[
             include_str!("runtime.rs").as_bytes(),
             include_str!("dense_linear.rs").as_bytes(),
+            include_str!("layer_norm.rs").as_bytes(),
+            include_str!("runtime/layer_norm.rs").as_bytes(),
             include_str!("composition.rs").as_bytes(),
         ]),
         capabilities: reference_vnext_capabilities()?,
@@ -55,10 +59,12 @@ pub fn reference_vnext_operation_registry(
     let contracts: Vec<Box<dyn OperationContract>> = vec![
         Box::new(dense_linear_contract().map_err(contract_error)?),
         Box::new(dense_linear_bf16_contract().map_err(contract_error)?),
+        Box::new(layer_norm_bf16_contract().map_err(contract_error)?),
     ];
     let providers = vec![
         reference_vnext_dense_linear_provider(runtime)?,
         reference_vnext_dense_linear_bf16_provider(runtime)?,
+        reference_vnext_layer_norm_bf16_provider(runtime)?,
     ];
     OperationRuntimeRegistry::new(contracts, providers).map_err(contract_error)
 }
@@ -77,6 +83,14 @@ pub fn reference_vnext_dense_linear_bf16_provider(
     runtime: &ReferenceDeviceRuntime,
 ) -> Result<Box<dyn OperationProvider<ReferenceDeviceRuntime>>, ReferenceDeviceRuntimeError> {
     Ok(Box::new(ReferenceDenseLinearProvider::new_bf16(runtime)?))
+}
+
+/// Builds the fixed-tensor BF16 population LayerNorm implementation without
+/// affine parameters. Token invocations are rejected explicitly.
+pub fn reference_vnext_layer_norm_bf16_provider(
+    runtime: &ReferenceDeviceRuntime,
+) -> Result<Box<dyn OperationProvider<ReferenceDeviceRuntime>>, ReferenceDeviceRuntimeError> {
+    Ok(Box::new(ReferenceLayerNormProvider::new(runtime)?))
 }
 
 /// Single composition authority for reference planning, allocation, weight

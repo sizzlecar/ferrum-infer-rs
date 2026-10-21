@@ -360,7 +360,7 @@ fn reference_launch(
     Ok(launch)
 }
 
-fn contiguous_region<'a, W: InvocationWorkProjection<'a>>(
+pub(super) fn contiguous_region<'a, W: InvocationWorkProjection<'a>>(
     participant: &ferrum_runtime::OperationInvocation<'a, ReferenceDeviceBuffer, W>,
     binding: &ResolvedValueBinding,
     element_type: ElementType,
@@ -369,7 +369,7 @@ fn contiguous_region<'a, W: InvocationWorkProjection<'a>>(
         return Err("reference operation requires one storage component per value".to_owned());
     };
     if component.element_type() != element_type {
-        return Err("reference dense-linear binding differs from its scalar contract".to_owned());
+        return Err("reference binding differs from its scalar contract".to_owned());
     }
     let view = participant
         .views()
@@ -531,7 +531,7 @@ fn token_binding_is_packed(
         .map_err(|error| error.to_string())
 }
 
-fn binding(
+pub(super) fn binding(
     bindings: &[ResolvedValueBinding],
     role: ResolvedValueRole,
     ordinal: u32,
@@ -559,7 +559,7 @@ fn dimension(
     }
 }
 
-fn contiguous_bindings(input_count: u32) -> Vec<ProviderStorageBindingRequirement> {
+pub(super) fn contiguous_bindings(input_count: u32) -> Vec<ProviderStorageBindingRequirement> {
     (0..input_count)
         .map(|ordinal| {
             ProviderStorageBindingRequirement::new(

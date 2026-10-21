@@ -366,8 +366,11 @@ fn reverse_role_order_concurrent_dense_commands_share_one_global_lock_order() {
         out_features: 1,
         scalar: ReferenceDenseScalar::F16,
     });
-    let first_slots = DenseAllocationLocks::new(&launches[0]).slots;
-    let second_slots = DenseAllocationLocks::new(&launches[1]).slots;
+    let slots = |launch: &ReferenceDenseLinearLaunch| {
+        AllocationLocks::new([&launch.input, &launch.weight, &launch.output]).slots
+    };
+    let first_slots = slots(&launches[0]);
+    let second_slots = slots(&launches[1]);
     assert_ne!(first_slots[0], first_slots[1]);
     assert_eq!(first_slots[0], second_slots[1]);
     assert_eq!(first_slots[1], second_slots[0]);

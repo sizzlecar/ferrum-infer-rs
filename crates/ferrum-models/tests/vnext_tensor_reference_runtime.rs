@@ -29,6 +29,9 @@ mod tensor_faults;
 #[path = "vnext_tensor_reference_runtime/bf16.rs"]
 mod bf16;
 
+#[path = "vnext_tensor_reference_runtime/layer_norm.rs"]
+mod layer_norm;
+
 fn id<T>(value: impl Into<String>) -> T
 where
     T: TryFrom<String, Error = VNextError>,
@@ -473,6 +476,16 @@ fn initialize_resources<R: DeviceRuntime>(
     plan: &ExecutionPlan,
     source: &SafetensorsArchive,
 ) -> Arc<PlanRuntimeResources<R>> {
+    initialize_resources_with_weight_bytes(runtime, family, plan, source, 12)
+}
+
+fn initialize_resources_with_weight_bytes<R: DeviceRuntime>(
+    runtime: Arc<R>,
+    family: &PreparedModelFamily,
+    plan: &ExecutionPlan,
+    source: &SafetensorsArchive,
+    expected_weight_bytes: u64,
+) -> Arc<PlanRuntimeResources<R>> {
     let provisioned = plan
         .provision_static(runtime.clone(), id("request.tensor.provision"))
         .unwrap();
@@ -518,7 +531,10 @@ fn initialize_resources<R: DeviceRuntime>(
             StaticInitializationPolicy::new(1 << 20, 8).unwrap(),
         )
         .unwrap();
-    assert_eq!(initialized.receipt().uploaded_bytes(), 12);
+    assert_eq!(
+        initialized.receipt().uploaded_bytes(),
+        expected_weight_bytes
+    );
     match initialized.into_plan_runtime() {
         Ok(resources) => resources,
         Err(error) => panic!(
