@@ -412,7 +412,12 @@ impl ContinuousBatchScheduler {
             && round.resident_capacity().is_some_and(|proof| {
                 proof.participants == facts.len() && proof.max_batch_sequences >= facts.len()
             });
-        if !resident_proof && capacity.is_none() {
+        let persistent_proof = round.persistent_capacity().filter(|proof| {
+            proof.max_live_sequences() >= self.config.max_running_requests
+                && proof.max_wave_sequences() >= limit
+        });
+        let complete_proof = resident_proof || persistent_proof.is_some();
+        if !complete_proof && capacity.is_none() {
             return Err(Unsupported::MissingCapacity);
         }
         if !waiting.is_empty()
@@ -420,7 +425,7 @@ impl ContinuousBatchScheduler {
         {
             return Err(Unsupported::WaitingResources);
         }
-        if !waiting.is_empty() {
+        if !waiting.is_empty() && persistent_proof.is_none() {
             let capacity = capacity.ok_or(Unsupported::MissingCapacity)?;
             // Capacity preceded physical admission. Preserve the whole initial
             // demand as members move to residency. Without an exact baseline,
@@ -513,7 +518,27 @@ impl ContinuousBatchScheduler {
             let context_cap = prompt
                 .checked_add(fact.cap)
                 .ok_or(Unsupported::Arithmetic)?;
-            if !resident_proof {
+            if let Some(proof) = persistent_proof {
+                let member = proof
+                    .members()
+                    .iter()
+                    .find(|member| member.request_id == *id && member.lifecycle == fact.lifecycle)
+                    .ok_or(Unsupported::AdmissionCapacity)?;
+                if matches!(
+                    member.state,
+                    ferrum_execution::model_executor::PersistentCapacityState::Resident { .. }
+                ) != (index < residents)
+                {
+                    return Err(Unsupported::AdmissionCapacity);
+                }
+                // The final sampled token is not consumed. Replay may have
+                // required a higher original admission ceiling, which remains
+                // conservative for this trajectory's prompt + output demand.
+                if member.through_tokens < context_cap.saturating_sub(1) {
+                    return Err(Unsupported::AdmissionCapacity);
+                }
+            }
+            if !complete_proof {
                 // Without exact complete-cohort ownership evidence, charge the
                 // entire prompt+cap again. No guessed retained or prefix credit.
                 let capacity = capacity.ok_or(Unsupported::MissingCapacity)?;
@@ -566,7 +591,7 @@ impl ContinuousBatchScheduler {
                 }
             });
         }
-        if !resident_proof && capacity.is_none_or(|capacity| blocks > capacity.free_blocks) {
+        if !complete_proof && capacity.is_none_or(|capacity| blocks > capacity.free_blocks) {
             return Err(Unsupported::InsufficientCapacity);
         }
         if !batch.is_empty() && !round.cost_selection_is_exact(batch.len()) {

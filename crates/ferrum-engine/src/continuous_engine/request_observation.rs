@@ -138,6 +138,9 @@ impl EngineInner {
         round: &mut TimePlanningRound,
         max_members: usize,
     ) {
+        use ferrum_execution::model_executor::{
+            PersistentCapacityMember, PersistentCapacityQuery, PersistentCapacityState,
+        };
         use ferrum_scheduler::cost_prediction::{PlanningCapacity, RequestClockFacts};
         round.clear_request_facts();
         round.set_capacity(self.model_executor.paged_admission_capacity_snapshot().map(
@@ -154,6 +157,7 @@ impl EngineInner {
         let mut facts = Vec::with_capacity(handles.len());
         let mut clocks = Vec::with_capacity(handles.len());
         let mut residents = Vec::with_capacity(handles.len());
+        let mut persistent = Vec::with_capacity(handles.len());
         for handle in handles {
             let state = handle.lock();
             let Some(sequence) = state
@@ -165,6 +169,15 @@ impl EngineInner {
             let Some(fact) = &sequence.stopping_observation else {
                 return;
             };
+            // This neutral query describes the base execution plan only.
+            // Adapter admission can load additional persistent storage, which
+            // the token ceiling alone cannot certify for a future waiter.
+            let base_plan_only = matches!(
+                ferrum_interfaces::adapter::parse_lora_selection(
+                    &sequence.original_request.metadata
+                ),
+                Ok(None)
+            );
             if sequence.execution_close.is_none()
                 && sequence.pending_token_admission.is_none()
                 && fact.cap == sequence.sampling_params.max_tokens
@@ -179,6 +192,26 @@ impl EngineInner {
                             through_tokens: sequence.model_maximum_sequence_tokens(),
                         },
                     );
+                    if base_plan_only {
+                        persistent.push(PersistentCapacityMember {
+                            request_id: handle.request_id().clone(),
+                            lifecycle: fact.lifecycle,
+                            state: PersistentCapacityState::Resident {
+                                sequence: frontier.sequence().clone(),
+                            },
+                            through_tokens: sequence.model_maximum_sequence_tokens(),
+                        });
+                    }
+                } else if base_plan_only
+                    && sequence.prefill_tokens_processed == 0
+                    && sequence.generated_tokens.is_empty()
+                {
+                    persistent.push(PersistentCapacityMember {
+                        request_id: handle.request_id().clone(),
+                        lifecycle: fact.lifecycle,
+                        state: PersistentCapacityState::Waiting,
+                        through_tokens: sequence.model_maximum_sequence_tokens(),
+                    });
                 }
             }
             let clock = if let Some(sender) = &sequence.stream_sender {
@@ -209,10 +242,12 @@ impl EngineInner {
             clocks.push((handle.request_id().clone(), clock));
         }
         if round.set_request_facts(facts) {
-            if round.set_request_clocks(clocks)
-                && round
-                    .request_facts()
-                    .is_some_and(|facts| residents.len() == facts.len())
+            if !round.set_request_clocks(clocks) {
+                return;
+            }
+            if round
+                .request_facts()
+                .is_some_and(|facts| residents.len() == facts.len())
             {
                 // Query after releasing every sequence lock. The executor
                 // proves actual ownership/growth for these exact incarnations;
@@ -221,6 +256,28 @@ impl EngineInner {
                     self.model_executor
                         .resident_cohort_capacity_snapshot(&residents),
                 );
+            } else if round
+                .request_facts()
+                .is_some_and(|facts| persistent.len() == facts.len())
+            {
+                // Waiting members need their own complete original-owner
+                // proof. A resident count or free KV blocks cannot substitute
+                // for reusable metadata and every declared persistent pool.
+                let max_live_sequences = self.config.scheduler.max_running_requests;
+                let query = PersistentCapacityQuery {
+                    members: &persistent,
+                    max_live_sequences,
+                    max_wave_sequences: max_live_sequences
+                        .min(self.config.batching.max_batch_size)
+                        .min(self.config.batching.max_num_batched_tokens),
+                    inspection_budget: Default::default(),
+                };
+                if query.validate().is_ok() {
+                    round.set_persistent_capacity(
+                        &query,
+                        self.model_executor.persistent_cohort_capacity(&query).ok(),
+                    );
+                }
             }
         }
     }

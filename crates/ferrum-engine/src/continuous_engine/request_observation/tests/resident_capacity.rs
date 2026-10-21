@@ -87,6 +87,34 @@ async fn planning_resident_capacity_uses_actual_program_admission_ceiling() {
             round.resident_capacity().is_none(),
             "waiting is not resident"
         );
+        let waiting_proof = round
+            .persistent_capacity()
+            .expect("base plan waiting capacity is observed");
+        assert_eq!(waiting_proof.members()[0].through_tokens, expected_ceiling);
+        assert!(matches!(
+            waiting_proof.members()[0].state,
+            ferrum_execution::model_executor::PersistentCapacityState::Waiting
+        ));
+        // A future adapter load is not described by the base plan's ceiling.
+        // Reprojection must clear the previous successful observation.
+        let waiting_handle = inner.sequences.get(&id).unwrap();
+        {
+            let mut state = waiting_handle.lock();
+            let metadata = &mut state.as_mut().unwrap().original_request.metadata;
+            metadata.insert("ferrum_lora_adapter".into(), "tenant-a".into());
+            metadata.insert("ferrum_lora_path".into(), "/adapters/not-loaded".into());
+        }
+        inner.capture_planning_request_facts(&mut round, 1);
+        assert!(round.persistent_capacity().is_none());
+        {
+            let mut state = waiting_handle.lock();
+            let metadata = &mut state.as_mut().unwrap().original_request.metadata;
+            metadata.remove("ferrum_lora_adapter");
+            metadata.remove("ferrum_lora_path");
+        }
+        drop(waiting_handle);
+        inner.capture_planning_request_facts(&mut round, 1);
+        assert!(round.persistent_capacity().is_some());
         tokio::time::timeout(std::time::Duration::from_secs(10), async {
             loop {
                 let (admitted, maintenance) = inner

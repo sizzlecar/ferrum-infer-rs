@@ -17,7 +17,9 @@ use std::{
     sync::Arc,
 };
 
+mod cohort_capacity;
 mod prefill_shape;
+pub use cohort_capacity::*;
 mod prefix_capture;
 mod prefix_restore;
 pub use prefill_shape::{PrefillShapePlan, PrefillShapePolicy};
@@ -2421,6 +2423,15 @@ pub trait ModelExecutor: Send + Sync + 'static {
         _cohort: &[ResidentSequenceCapacityRequest],
     ) -> Option<ResidentCohortCapacitySnapshot> {
         None
+    }
+
+    /// Bounded read-only support for exact resident and waiting members using
+    /// existing persistent backing and the original owner's admission rules.
+    fn persistent_cohort_capacity(
+        &self,
+        _query: &PersistentCapacityQuery<'_>,
+    ) -> std::result::Result<PersistentCohortCapacitySnapshot, PersistentCapacityUnknown> {
+        Err(PersistentCapacityUnknown::Unsupported)
     }
 
     /// Get executor capabilities

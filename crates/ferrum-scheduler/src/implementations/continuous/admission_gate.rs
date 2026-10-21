@@ -116,6 +116,13 @@ impl ContinuousBatchScheduler {
                     )>())
                 })
                 .and_then(|bytes| bytes.checked_add(round.request_fact_bytes))
+                .and_then(|bytes| {
+                    bytes.checked_add(
+                        round
+                            .persistent_capacity()
+                            .map_or(0, |proof| proof.retained_bytes()),
+                    )
+                })
             else {
                 return;
             };

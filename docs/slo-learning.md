@@ -136,6 +136,26 @@ evidence remain Unknown. Cohort changes invalidate the observation, and actual
 execution retains its normal resource checks. Fact and resource projection time
 counts toward the same planning time limit as candidate comparison.
 
+A separate complete-cohort observation can cover sequential waiting admissions.
+It binds every request lifetime, execution incarnation and admitted context
+ceiling, including the final sampled token's lack of subsequent consumption.
+The original owner must prove the worst persistent demand of any supported
+simultaneously live subset from actual allocated storage and reusable metadata.
+The initial native implementation supports declared sequence-only persistent
+pools with page-aligned growth or homogeneous fixed contiguous cells. Foreign,
+prepared, retiring, checkpoint or unsupported storage ownership yields Unknown;
+configured maxima alone do not prove residency. Adapter loads are outside this
+base-plan query. Actual admission and release retain their original authority.
+
+The trajectory uses the explicit `next_wave_after_modeled_completion` slot
+release assumption, also exposed as `waiting_slot_release_assumption` in health.
+It does not model asynchronous close, recovery or release-notification delay.
+The capacity observation establishes neither a release-time bound nor latency
+coverage, and equal assumptions across candidates do not imply equal errors.
+Client-observed TTFT, TPOT, visible SSE ITL and completion remain the acceptance
+criteria. Reprojection invalidates prior cohort observations; exact current
+query, queue residency and retained-memory budgets are checked before use.
+
 ## Diagnostics
 
 Server health exposes scheduler diagnostics and `scheduler_slo.feedback`; the

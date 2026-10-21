@@ -14,6 +14,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::watch;
 
+mod persistent_capacity;
 mod unsupported_counts;
 pub(crate) use unsupported_counts::JointUnsupportedCounts;
 
@@ -306,6 +307,7 @@ pub struct TimePlanningRound {
     request_clocks: Option<Vec<(RequestId, RequestClockFacts)>>,
     capacity: Option<PlanningCapacity>,
     resident_capacity: Option<ferrum_execution::model_executor::ResidentCohortCapacitySnapshot>,
+    persistent_capacity: Option<ferrum_execution::model_executor::PersistentCohortCapacitySnapshot>,
 }
 
 impl TimePlanningRound {
@@ -348,6 +350,7 @@ impl TimePlanningRound {
             request_clocks: None,
             capacity: None,
             resident_capacity: None,
+            persistent_capacity: None,
         }
     }
 
@@ -373,6 +376,7 @@ impl TimePlanningRound {
         self.request_clocks = None;
         self.request_fact_bytes = 0;
         self.resident_capacity = None;
+        self.persistent_capacity = None;
     }
     /// Freeze the complete request cohort. Missing, duplicate or over-budget
     /// members invalidate the whole projection rather than authorizing a prefix.
@@ -424,6 +428,7 @@ impl TimePlanningRound {
         clocks: impl IntoIterator<Item = (RequestId, RequestClockFacts)>,
     ) -> bool {
         self.admission_gate = None;
+        self.persistent_capacity = None;
         self.request_clocks = None;
         let Some(facts) = &self.request_facts else {
             return false;
@@ -465,6 +470,7 @@ impl TimePlanningRound {
         self.admission_gate = None;
         self.capacity_initial_new_sequences = None;
         self.resident_capacity = None;
+        self.persistent_capacity = None;
         self.capacity = capacity.filter(|value| {
             value.block_size > 0
                 && value.total_blocks > 0

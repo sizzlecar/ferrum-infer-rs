@@ -63,6 +63,7 @@ use self::{
 };
 
 mod backing_maintenance;
+mod cohort_capacity;
 mod composition;
 mod determinism;
 mod input_uploads;
@@ -9128,6 +9129,16 @@ impl<R: DeviceRuntime> ModelExecutor for ProgramExecutor<R> {
         cohort: &[crate::model_executor::ResidentSequenceCapacityRequest],
     ) -> Option<crate::model_executor::ResidentCohortCapacitySnapshot> {
         self.native_resident_cohort_capacity(cohort)
+    }
+
+    fn persistent_cohort_capacity(
+        &self,
+        query: &crate::model_executor::PersistentCapacityQuery<'_>,
+    ) -> std::result::Result<
+        crate::model_executor::PersistentCohortCapacitySnapshot,
+        crate::model_executor::PersistentCapacityUnknown,
+    > {
+        self.native_persistent_cohort_capacity(query)
     }
 
     fn resolved_model_plan(&self) -> Option<&ResolvedModelPlan> {

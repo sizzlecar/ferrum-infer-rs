@@ -3,6 +3,16 @@
 
 use super::*;
 
+/// Timing assumption of the trajectory model, not a physical release guarantee.
+/// Original asynchronous close/recovery can delay real admission beyond this
+/// modeled boundary; only client measurements establish latency compliance.
+#[derive(Debug, Clone, Copy, Default, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AdmissionSlotReleaseAssumption {
+    #[default]
+    NextWaveAfterModeledCompletion,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InitialAdmission {
     Resident,

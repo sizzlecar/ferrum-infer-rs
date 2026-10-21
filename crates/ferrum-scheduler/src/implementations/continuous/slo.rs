@@ -58,6 +58,7 @@ impl super::ContinuousBatchScheduler {
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct SchedulerSloSnapshot {
     pub enabled: bool,
+    pub waiting_slot_release_assumption: crate::joint_policy::AdmissionSlotReleaseAssumption,
     pub planning_rounds: u64,
     /// Created turns that ended before entering batch selection, including
     /// admission-only progress, errors and cancelled admission futures.
