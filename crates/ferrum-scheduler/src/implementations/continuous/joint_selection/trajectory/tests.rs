@@ -23,6 +23,7 @@ fn shape(cap: Option<usize>) -> RequestShape {
         restored_tokens: 0,
         execution_ceiling: None,
         phase_cap: cap.and_then(NonZeroUsize::new),
+        phase_packing: PrefillPacking::Refill,
         decode_only_allowed: true,
     }
 }

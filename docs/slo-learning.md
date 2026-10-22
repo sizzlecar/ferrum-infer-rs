@@ -175,9 +175,22 @@ quarter of the selected prefill chunk. A phase binds only the actual selected
 resident prefills, through their original prompt endpoints. Every simulated
 phase wave must advance those endpoints; after completion it resumes the same
 ordinary continuation. The real scheduler installs the selected limits
-atomically against the request lifecycle and work frontier. It applies each
-limit before charging later token budgets, so remaining capacity can serve
-other work.
+atomically against the request lifecycle, work frontier and prior phase state.
+The two durable candidates preserve a policy budget charge while reducing actual
+execution. With a configured prefill chunk, that charge uses the current chunk
+before shortening it for the prompt's final tail. It remains bounded by the
+current step and active-decode budgets, executor ceiling and any prior cap's
+budget basis. Saved execution tokens therefore do not immediately admit more
+prefill work into the same wave, including its final short chunk. Both prefill
+selection passes share this accounting; cost queries, progress and resource
+requirements still describe only actual execution tokens.
+
+Without a configured chunk, the charge keeps the ordinary request-bounded
+proposal before the new cap; it does not invent a chunk size. The existing
+first-wave-only smaller-chunk actions retain ordinary refill behavior. These
+finite alternatives keep the existing candidate and planning budgets. Neither
+packing rule guarantees that every future wave is inside the learned support
+envelope; a genuine one-token tail, for example, still needs measured support.
 
 An installed limit survives stale or unknown forecasts and execution-capacity
 feedback. Further decisions can tighten it; it clears when the original prefill
@@ -187,9 +200,9 @@ inherit it. The policy cap is separate from the executor's capacity ceiling.
 `joint_interventions`, not completed GPU executions.
 
 Admission can also compare a persistent cap for the eligible waiting and resident
-prefills in its original natural first wave. This preview applies caps before
-normal token-budget accounting, including any work that fills the released
-budget. If selected, the scheduler validates the entire captured cohort and
+prefills in its original natural first wave. This preview uses the same actual
+work and policy budget charges as subsequent scheduling. If selected, the
+scheduler validates the entire captured cohort and
 atomically installs the caps before reevaluating admission. Installing a cap
 does not reserve resources, admit a request, or advance its work frontier; the
 original executor still decides resource admission. Waiting requests retain

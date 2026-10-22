@@ -8,6 +8,7 @@ impl ContinuousBatchScheduler {
         batch: &mut [ScheduledRequest],
         round: &mut TimePlanningRound,
         limit: NonZeroUsize,
+        packing_mode: PrefillPackingMode,
         bindings: &[WaveBinding],
     ) -> bool {
         if bindings.len() != batch.len() || !round.cost_selection_is_exact(batch.len()) {
@@ -61,6 +62,7 @@ impl ContinuousBatchScheduler {
                 }
             };
             if request.waiting_admission_ticket != Some(binding.ticket)
+                || request.joint_prefill_phase_cap != binding.prior_cap
                 || request.logical_work_frontier.progress_generation() != binding.generation
                 || self.prompt_token_estimate(request) != Some(binding.prompt_tokens)
                 || request.capacity_deferred_from_decode
@@ -85,12 +87,12 @@ impl ContinuousBatchScheduler {
             {
                 return false;
             }
-            let cap = PrefillPhaseCap {
-                limit: request
-                    .joint_prefill_phase_cap
-                    .map_or(limit, |old| old.limit.min(limit)),
-                prompt_tokens: binding.prompt_tokens,
-            };
+            let cap = PrefillPhaseCap::selected(
+                request.joint_prefill_phase_cap,
+                limit,
+                binding.prompt_tokens,
+                packing_mode,
+            );
             let Some((work, true)) = self.cost_work(
                 request,
                 tokens.min(cap.limit.get()),

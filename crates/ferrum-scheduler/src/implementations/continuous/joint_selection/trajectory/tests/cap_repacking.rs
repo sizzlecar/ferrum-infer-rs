@@ -6,6 +6,8 @@ use ferrum_types::{CostQueryLimits, SchedulerSloConfig};
 use std::sync::Mutex;
 use std::time::Instant;
 
+mod nominal_reservation;
+
 fn fixture() -> (Vec<SimulatedRequest>, CohortTrajectory) {
     // Different already-computed offsets identify owners in actual CostWork.
     // Every resident still has exactly two ordinary 128-token chunks to run.

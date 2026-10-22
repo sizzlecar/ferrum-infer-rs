@@ -1,3 +1,4 @@
+use super::super::prefill_budget::{PrefillPacking, PrefillPackingMode, PrefillWorkBudget};
 use crate::{cost_prediction::*, joint_policy::*};
 use ferrum_execution::{
     execution_attempt::{AttemptPrefixRestore, AttemptWorkKind},
@@ -16,15 +17,29 @@ pub(super) enum FirstAction {
     Static,
     PrefillLimit(NonZeroUsize),
     PrefillPhaseLimit(NonZeroUsize),
+    ReservedPrefillPhaseLimit(NonZeroUsize),
     /// Preview a durable cap before admission, including natural first-wave
     /// repacking. This does not itself grant an execution slot or reservation.
     PrefillCapCommit(NonZeroUsize),
+    ReservedPrefillCapCommit(NonZeroUsize),
     /// The captured waiters may first need original resident slot releases.
     /// This positive cap never bypasses that admission plan.
     DeferredPrefillCapCommit(NonZeroUsize),
+    DeferredReservedPrefillCapCommit(NonZeroUsize),
     /// Omit prefill from a mixed first wave while all its decoders progress.
     /// This is not an empty wave or permission to change later continuation.
     DecodeOnly,
+}
+
+impl FirstAction {
+    pub(super) fn packing_mode(self) -> PrefillPackingMode {
+        match self {
+            Self::ReservedPrefillPhaseLimit(_)
+            | Self::ReservedPrefillCapCommit(_)
+            | Self::DeferredReservedPrefillCapCommit(_) => PrefillPackingMode::ReservePolicyChunk,
+            _ => PrefillPackingMode::Refill,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -33,6 +48,7 @@ pub(super) struct RequestShape {
     pub execution_ceiling: Option<usize>,
     /// An already selected phase is common to static and all new candidates.
     pub phase_cap: Option<NonZeroUsize>,
+    pub phase_packing: PrefillPacking,
     pub decode_only_allowed: bool,
 }
 
@@ -222,13 +238,17 @@ impl CohortTrajectory {
             return Err(Unsupported::ParticipantBudget);
         }
         let active = self.admission.active_mask(requests)?;
-        self.natural_members_from_active(requests, phase, &active)
+        self.natural_members_from_active(
+            requests,
+            phase.map(|(limit, targets)| (limit, targets, PrefillPackingMode::Refill)),
+            &active,
+        )
     }
 
     fn natural_members_from_active(
         &self,
         requests: &[SimulatedRequest],
-        phase: Option<(NonZeroUsize, &[PrefillTarget])>,
+        phase: Option<(NonZeroUsize, &[PrefillTarget], PrefillPackingMode)>,
         active: &[bool],
     ) -> Result<Vec<GroupMember>, Unsupported> {
         if requests.len() != self.shapes.len() || active.len() != requests.len() {
@@ -312,17 +332,26 @@ impl CohortTrajectory {
             let tokens = self.shapes[index]
                 .execution_ceiling
                 .map_or(tokens, |ceiling| ceiling.min(tokens));
-            let tokens = self.shapes[index]
-                .phase_cap
-                .map_or(tokens, |cap| cap.get().min(tokens));
-            let tokens = phase.map_or(tokens, |(limit, phase)| {
-                if phase.iter().any(|target| target.request == index) {
-                    tokens.min(limit.get())
-                } else {
-                    tokens
+            let shape = &self.shapes[index];
+            let (cap, packing) = match phase {
+                Some((limit, targets, mode))
+                    if targets.iter().any(|target| target.request == index) =>
+                {
+                    (
+                        Some(shape.phase_cap.map_or(limit, |prior| prior.min(limit))),
+                        shape.phase_packing.after_selection(shape.phase_cap, mode),
+                    )
                 }
+                _ => (shape.phase_cap, shape.phase_packing),
+            };
+            let quantum = chunk.map(|chunk| {
+                let quantum = chunk.min(budget);
+                shape
+                    .execution_ceiling
+                    .map_or(quantum, |ceiling| quantum.min(ceiling))
             });
-            let work = self.work(index, request, tokens)?;
+            let charge = PrefillWorkBudget::for_cap(tokens, quantum, cap, packing);
+            let work = self.work(index, request, charge.execution_tokens)?;
             members.push(GroupMember {
                 request: index,
                 work,
@@ -330,8 +359,8 @@ impl CohortTrajectory {
             // Static scheduling spends the nominal chunk before the executor's
             // prompt-tail projection. A shorter execution is not extra budget
             // for a later participant in this same wave.
-            remaining -= tokens;
-            prefill_budget -= tokens;
+            remaining -= charge.nominal_charge;
+            prefill_budget -= charge.nominal_charge;
         }
         if members.is_empty() {
             return Err(Unsupported::NoProgress);
@@ -351,7 +380,10 @@ impl TrajectoryAdapter<FirstAction> for CohortTrajectory {
         _: &[SimulatedRequest],
         phase: &mut PhaseBuilder<'_>,
     ) -> Result<(), Unsupported> {
-        if matches!(action, FirstAction::PrefillPhaseLimit(_)) {
+        if matches!(
+            action,
+            FirstAction::PrefillPhaseLimit(_) | FirstAction::ReservedPrefillPhaseLimit(_)
+        ) {
             if self.first_wave.is_empty() {
                 return Err(Unsupported::InvalidPlan);
             }
@@ -361,7 +393,10 @@ impl TrajectoryAdapter<FirstAction> for CohortTrajectory {
                 }
             }
         }
-        if matches!(action, FirstAction::PrefillCapCommit(_)) {
+        if matches!(
+            action,
+            FirstAction::PrefillCapCommit(_) | FirstAction::ReservedPrefillCapCommit(_)
+        ) {
             if !self.first_wave.is_empty() || self.cap_commit_targets.is_empty() {
                 return Err(Unsupported::InvalidPlan);
             }
@@ -369,7 +404,11 @@ impl TrajectoryAdapter<FirstAction> for CohortTrajectory {
                 phase.prefill_target(target.request)?;
             }
         }
-        if matches!(action, FirstAction::DeferredPrefillCapCommit(_)) {
+        if matches!(
+            action,
+            FirstAction::DeferredPrefillCapCommit(_)
+                | FirstAction::DeferredReservedPrefillCapCommit(_)
+        ) {
             if !self.first_wave.is_empty() || self.cap_commit_targets.is_empty() {
                 return Err(Unsupported::InvalidPlan);
             }
@@ -388,15 +427,18 @@ impl TrajectoryAdapter<FirstAction> for CohortTrajectory {
         plan: &mut PlanBuilder,
     ) -> Result<(), Unsupported> {
         let (FirstAction::PrefillPhaseLimit(limit)
+        | FirstAction::ReservedPrefillPhaseLimit(limit)
         | FirstAction::PrefillCapCommit(limit)
-        | FirstAction::DeferredPrefillCapCommit(limit)) = action
+        | FirstAction::ReservedPrefillCapCommit(limit)
+        | FirstAction::DeferredPrefillCapCommit(limit)
+        | FirstAction::DeferredReservedPrefillCapCommit(limit)) = action
         else {
             return Err(Unsupported::InvalidPlan);
         };
         self.push(
             self.natural_members_from_active(
                 requests,
-                Some((*limit, phase.prefill_targets())),
+                Some((*limit, phase.prefill_targets(), action.packing_mode())),
                 plan.active_mask().ok_or(Unsupported::InvalidState)?,
             )?,
             plan,
@@ -410,7 +452,10 @@ impl TrajectoryAdapter<FirstAction> for CohortTrajectory {
         plan: &mut PlanBuilder,
     ) -> Result<(), Unsupported> {
         if let Some(
-            FirstAction::PrefillCapCommit(limit) | FirstAction::DeferredPrefillCapCommit(limit),
+            action @ (FirstAction::PrefillCapCommit(limit)
+            | FirstAction::ReservedPrefillCapCommit(limit)
+            | FirstAction::DeferredPrefillCapCommit(limit)
+            | FirstAction::DeferredReservedPrefillCapCommit(limit)),
         ) = first_action
         {
             if !self.first_wave.is_empty() || self.cap_commit_targets.is_empty() {
@@ -419,7 +464,7 @@ impl TrajectoryAdapter<FirstAction> for CohortTrajectory {
             return self.push(
                 self.natural_members_from_active(
                     requests,
-                    Some((*limit, &self.cap_commit_targets)),
+                    Some((*limit, &self.cap_commit_targets, action.packing_mode())),
                     plan.active_mask().ok_or(Unsupported::InvalidState)?,
                 )?,
                 plan,
@@ -441,7 +486,11 @@ impl TrajectoryAdapter<FirstAction> for CohortTrajectory {
                 }
                 members.retain(|member| member.work.kind == AttemptWorkKind::Decode);
             }
-            Some(FirstAction::PrefillLimit(limit) | FirstAction::PrefillPhaseLimit(limit)) => {
+            Some(
+                FirstAction::PrefillLimit(limit)
+                | FirstAction::PrefillPhaseLimit(limit)
+                | FirstAction::ReservedPrefillPhaseLimit(limit),
+            ) => {
                 for member in &mut members {
                     if member.work.kind == AttemptWorkKind::Prefill {
                         let request = requests
@@ -456,7 +505,12 @@ impl TrajectoryAdapter<FirstAction> for CohortTrajectory {
                 }
             }
             Some(FirstAction::Static) | None => {}
-            Some(FirstAction::PrefillCapCommit(_) | FirstAction::DeferredPrefillCapCommit(_)) => {
+            Some(
+                FirstAction::PrefillCapCommit(_)
+                | FirstAction::ReservedPrefillCapCommit(_)
+                | FirstAction::DeferredPrefillCapCommit(_)
+                | FirstAction::DeferredReservedPrefillCapCommit(_),
+            ) => {
                 unreachable!("handled before fixed-wave planning")
             }
         }

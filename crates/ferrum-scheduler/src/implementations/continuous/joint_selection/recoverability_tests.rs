@@ -190,6 +190,7 @@ fn fixture() -> (SchedulerSloConfig, Vec<SimulatedRequest>, PhaseAdapter) {
                 restored_tokens: 0,
                 execution_ceiling: None,
                 phase_cap: None,
+                phase_packing: super::PrefillPacking::Refill,
                 decode_only_allowed: true,
             };
             2

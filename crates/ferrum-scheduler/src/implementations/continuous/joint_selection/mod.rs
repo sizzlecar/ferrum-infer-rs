@@ -42,6 +42,7 @@ pub(super) struct JointAdmissionEvaluation {
 pub(super) struct PrefillCapProposal {
     pub(super) targets: Vec<PrefillCapTarget>,
     pub(super) limit: NonZeroUsize,
+    pub(super) packing_mode: PrefillPackingMode,
     pub(super) valid_until: Instant,
 }
 
@@ -72,6 +73,7 @@ struct WaveBinding {
     prompt_tokens: usize,
     offset: usize,
     work: CostWork,
+    prior_cap: Option<PrefillPhaseCap>,
 }
 
 pub(super) struct SelectedJointAction {
@@ -98,7 +100,10 @@ impl ContinuousBatchScheduler {
         match outcome {
             Ok(Some(action)) => {
                 let decode_only = matches!(action.action, FirstAction::DecodeOnly);
-                let phase = matches!(action.action, FirstAction::PrefillPhaseLimit(_));
+                let phase = matches!(
+                    action.action,
+                    FirstAction::PrefillPhaseLimit(_) | FirstAction::ReservedPrefillPhaseLimit(_)
+                );
                 if self.apply_joint_first_wave(batch, round, action) {
                     round.statistics.joint_interventions += 1;
                     round.statistics.joint_decode_only_interventions += u64::from(decode_only);
@@ -300,18 +305,22 @@ impl ContinuousBatchScheduler {
         if cohort.trajectory.allows_decode_only(&first_wave) {
             alternatives.push(FirstAction::DecodeOnly);
         }
-        // Dispatch phases bind its already selected resident first wave.
-        // Admission commitments below instead preview natural repacking.
+        // The existing two durable-action slots now compare reserved half and
+        // quarter (deduplicated). Old refill actions remain valid explicit
+        // inputs and installed baselines; do not expand the automatic search
+        // into a Cartesian product of modes and sizes.
+        // Dispatch binds its selected resident wave; admission previews the
+        // corresponding natural packing before any ownership is granted.
         if !batch.is_empty() && cohort.wave_bindings.len() == batch.len() {
             for limit in [largest.div_ceil(2), quarter] {
                 let Some(limit) = NonZeroUsize::new(limit) else {
                     continue;
                 };
                 if !alternatives.iter().any(|action| {
-                    matches!(action, FirstAction::PrefillPhaseLimit(previous) if *previous == limit)
+                    matches!(action, FirstAction::PrefillPhaseLimit(previous) | FirstAction::ReservedPrefillPhaseLimit(previous) if *previous == limit)
                 }) && cohort.trajectory.allows_prefill_phase(&cohort.requests, limit)
                 {
-                    alternatives.push(FirstAction::PrefillPhaseLimit(limit));
+                    alternatives.push(FirstAction::ReservedPrefillPhaseLimit(limit));
                 }
             }
         }
@@ -327,9 +336,9 @@ impl ContinuousBatchScheduler {
                     continue;
                 };
                 if (!deferred || scale >= 2) && cohort.trajectory.allows_cap_commit(&cohort.requests, limit)
-                    && !alternatives.iter().any(|action| matches!(action, FirstAction::PrefillCapCommit(previous) | FirstAction::DeferredPrefillCapCommit(previous) if *previous == limit))
+                    && !alternatives.iter().any(|action| matches!(action, FirstAction::PrefillCapCommit(previous) | FirstAction::ReservedPrefillCapCommit(previous) | FirstAction::DeferredPrefillCapCommit(previous) | FirstAction::DeferredReservedPrefillCapCommit(previous) if *previous == limit))
                 {
-                    alternatives.push(if deferred { FirstAction::DeferredPrefillCapCommit(limit) } else { FirstAction::PrefillCapCommit(limit) });
+                    alternatives.push(if deferred { FirstAction::DeferredReservedPrefillCapCommit(limit) } else { FirstAction::ReservedPrefillCapCommit(limit) });
                 }
             }
         }
@@ -350,10 +359,12 @@ impl ContinuousBatchScheduler {
         if forecast_bytes > round.config.planning.max_request_fact_bytes {
             return Err(Unsupported::ParticipantBudget);
         }
-        if alternatives
-            .iter()
-            .any(|action| matches!(action, FirstAction::PrefillPhaseLimit(_)))
-        {
+        if alternatives.iter().any(|action| {
+            matches!(
+                action,
+                FirstAction::PrefillPhaseLimit(_) | FirstAction::ReservedPrefillPhaseLimit(_)
+            )
+        }) {
             let phase_bytes = ContinuationPhase::prefill_targets_bytes_bound(cohort.requests.len())
                 .ok_or(Unsupported::ParticipantBudget)?;
             let clocks_bytes = round
@@ -530,11 +541,14 @@ impl ContinuousBatchScheduler {
         let prefill_cap = match decision.choice {
             PolicyChoice::Alternative(index) => match alternatives.get(index) {
                 Some(
-                    FirstAction::PrefillCapCommit(limit)
-                    | FirstAction::DeferredPrefillCapCommit(limit),
+                    action @ (FirstAction::PrefillCapCommit(limit)
+                    | FirstAction::ReservedPrefillCapCommit(limit)
+                    | FirstAction::DeferredPrefillCapCommit(limit)
+                    | FirstAction::DeferredReservedPrefillCapCommit(limit)),
                 ) => Some(PrefillCapProposal {
                     targets: cohort.cap_bindings,
                     limit: *limit,
+                    packing_mode: action.packing_mode(),
                     valid_until: decision.valid_until,
                 }),
                 _ => None,
@@ -560,16 +574,19 @@ impl ContinuousBatchScheduler {
             FirstAction::Static => return false,
             // Admission commits policy before a fresh gate; this is never an
             // edit of an already selected dispatch batch.
-            FirstAction::PrefillCapCommit(_) | FirstAction::DeferredPrefillCapCommit(_) => {
-                return false
-            }
+            FirstAction::PrefillCapCommit(_)
+            | FirstAction::ReservedPrefillCapCommit(_)
+            | FirstAction::DeferredPrefillCapCommit(_)
+            | FirstAction::DeferredReservedPrefillCapCommit(_) => return false,
             FirstAction::DecodeOnly => return self.apply_joint_decode_only(batch, round),
             FirstAction::PrefillLimit(limit) => limit.get(),
-            FirstAction::PrefillPhaseLimit(limit) => {
+            action @ (FirstAction::PrefillPhaseLimit(limit)
+            | FirstAction::ReservedPrefillPhaseLimit(limit)) => {
                 return self.apply_joint_prefill_phase(
                     batch,
                     round,
                     limit,
+                    action.packing_mode(),
                     &selected.wave_bindings,
                 );
             }
@@ -1010,6 +1027,9 @@ impl ContinuousBatchScheduler {
                 restored_tokens: request.prefix_restore.restored_tokens(),
                 execution_ceiling: request.prefill_execution_chunk_ceiling,
                 phase_cap: request.joint_prefill_phase_cap.map(|cap| cap.limit),
+                phase_packing: request
+                    .joint_prefill_phase_cap
+                    .map_or(PrefillPacking::Refill, |cap| cap.packing),
                 decode_only_allowed: request
                     .joint_decode_only_deferred_generation
                     .is_none_or(|last| request.logical_work_frontier.progress_generation() > last),
@@ -1110,6 +1130,7 @@ impl ContinuousBatchScheduler {
                 prompt_tokens: requests[member.request].prompt_tokens,
                 offset: scheduled.tokens_processed,
                 work: member.work,
+                prior_cap: request.joint_prefill_phase_cap,
             });
         }
         Ok(Cohort {

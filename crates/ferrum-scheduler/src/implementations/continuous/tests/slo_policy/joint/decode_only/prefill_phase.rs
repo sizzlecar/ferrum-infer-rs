@@ -2,6 +2,7 @@
 use super::*;
 
 mod admission_precommit;
+mod nominal_reservation;
 
 struct PhaseCosts {
     base: ConditionalSnapshot,
@@ -341,8 +342,8 @@ fn committed_phase_is_budgeted_before_new_arrivals_without_requiring_new_predict
     assert_eq!(tokens(&batch, &fixture.prefill), 1);
     assert_eq!(
         tokens(&batch, &newcomer_id),
-        4,
-        "the committed cap must spend one token, not spend four then clip to one"
+        1,
+        "the reserved phase executes one token but debits its ordinary four-token chunk before packing the newcomer"
     );
     let queue = fixture.scheduler.prefill_queue.read();
     assert_eq!(

@@ -114,12 +114,12 @@ impl ContinuousBatchScheduler {
                 }
                 _ => unreachable!("target residency was checked above"),
             }
-            let cap = PrefillPhaseCap {
-                limit: target
-                    .prior_cap
-                    .map_or(proposal.limit, |old| old.limit.min(proposal.limit)),
-                prompt_tokens: target.prompt_tokens,
-            };
+            let cap = PrefillPhaseCap::selected(
+                target.prior_cap,
+                proposal.limit,
+                target.prompt_tokens,
+                proposal.packing_mode,
+            );
             changes |= target.prior_cap != Some(cap);
         }
         if !changes || Instant::now() >= deadline {
@@ -136,12 +136,12 @@ impl ContinuousBatchScheduler {
                 _ => unreachable!("only waiting/prefilling targets passed validation"),
             }
             .expect("exact target remains owned under the same locks");
-            request.joint_prefill_phase_cap = Some(PrefillPhaseCap {
-                limit: target
-                    .prior_cap
-                    .map_or(proposal.limit, |old| old.limit.min(proposal.limit)),
-                prompt_tokens: target.prompt_tokens,
-            });
+            request.joint_prefill_phase_cap = Some(PrefillPhaseCap::selected(
+                target.prior_cap,
+                proposal.limit,
+                target.prompt_tokens,
+                proposal.packing_mode,
+            ));
         }
         true
     }

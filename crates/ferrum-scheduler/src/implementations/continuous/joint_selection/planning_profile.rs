@@ -120,6 +120,7 @@ fn fixture() -> (
                 restored_tokens: 0,
                 execution_ceiling: None,
                 phase_cap: None,
+                phase_packing: super::PrefillPacking::Refill,
                 decode_only_allowed: true,
             };
             requests.len()
@@ -156,13 +157,15 @@ fn fixture() -> (
     assert!(adapter.allows_prefill_phase(&requests, half));
     assert!(adapter.allows_prefill_phase(&requests, quarter));
     // These are the current legal dispatch alternatives for this fixed actual
-    // first wave. Admission precommit and unimplemented actions are excluded.
+    // first wave, including both current reserved durable slots. Admission
+    // precommit and old explicit refill phases are excluded. A changed action
+    // trajectory is not a same-query microbenchmark against older profiles.
     let alternatives = vec![
         FirstAction::PrefillLimit(half),
         FirstAction::PrefillLimit(quarter),
         FirstAction::DecodeOnly,
-        FirstAction::PrefillPhaseLimit(half),
-        FirstAction::PrefillPhaseLimit(quarter),
+        FirstAction::ReservedPrefillPhaseLimit(half),
+        FirstAction::ReservedPrefillPhaseLimit(quarter),
     ];
     (config, requests, adapter, alternatives)
 }

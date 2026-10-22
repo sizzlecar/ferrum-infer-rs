@@ -50,6 +50,7 @@ fn pair() -> (
             })
             .collect(),
         limit: NonZeroUsize::new(1).unwrap(),
+        packing_mode: PrefillPackingMode::Refill,
         valid_until: Instant::now() + Duration::from_secs(60),
     };
     (scheduler, round, members, proposal)
