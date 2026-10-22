@@ -2,6 +2,7 @@ use super::*;
 use ferrum_execution::{execution_attempt::AttemptWorkKind, token_execution::ExecutionRange};
 
 mod compact_payload;
+mod ordinal_hints;
 mod two_slot;
 
 fn work() -> CostWork {
@@ -149,6 +150,7 @@ fn colliding_keys_require_every_work_field_exactness_execution_length_and_order(
         };
         cache.insert(&stored, distribution(at, 2));
         for (queried_index, (name, work, exact, execution)) in variants.iter().enumerate() {
+            cache.begin_rank();
             let query = CostQuery {
                 work,
                 work_is_exact: *exact,
@@ -176,7 +178,8 @@ fn reused_miss_key_accounts_for_the_entry_present_at_insertion_and_keeps_bounds(
     ];
     let a = cost_query(&a);
     let b = cost_query(&b);
-    let slot_bytes = std::mem::size_of::<Option<Entry>>();
+    let slot_bytes =
+        std::mem::size_of::<Option<Entry>>() + std::mem::size_of::<Option<NonZeroUsize>>();
     let budget =
         slot_bytes + 2 * std::mem::size_of::<CostWork>() + 4 * std::mem::size_of::<Duration>();
     let mut cache = ScenarioCache::new(at, budget, 1);

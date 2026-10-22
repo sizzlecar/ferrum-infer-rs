@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// Pigeonhole construction over legal decode work, independent of a particular
 /// hash value or host word width. No distribution-quality threshold is assumed.
-fn colliding_work(slots: usize, count: usize) -> Vec<CostWork> {
+pub(super) fn colliding_work(slots: usize, count: usize) -> Vec<CostWork> {
     let mut buckets = vec![Vec::new(); slots];
     for context in 2..=slots * (count - 1) + 2 {
         let work = CostWork {
@@ -21,7 +21,11 @@ fn colliding_work(slots: usize, count: usize) -> Vec<CostWork> {
     unreachable!("more lawful distinct keys than the bounded buckets can hold")
 }
 
-fn keyed_distribution(at: Instant, work: CostWork, count: usize) -> CostScenarioPrediction {
+pub(super) fn keyed_distribution(
+    at: Instant,
+    work: CostWork,
+    count: usize,
+) -> CostScenarioPrediction {
     let mut prediction = distribution(at, count);
     if let CostScenarioPrediction::Known {
         central_service_time,
@@ -140,6 +144,7 @@ fn two_slot_capacity_failure_preserves_both_entries_and_one_slot_never_duplicate
     let at = Instant::now();
     let keys = colliding_work(2, 3);
     let budget = 2 * std::mem::size_of::<Option<Entry>>()
+        + 2 * std::mem::size_of::<Option<NonZeroUsize>>()
         + 2 * std::mem::size_of::<CostWork>()
         + 4 * std::mem::size_of::<Duration>();
     let mut cache = ScenarioCache::new(at, budget, 2);

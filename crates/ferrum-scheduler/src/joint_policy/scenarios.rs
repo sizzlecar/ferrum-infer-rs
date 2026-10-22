@@ -228,6 +228,7 @@ impl SloPolicy {
                 return Err(Unsupported::TimeBudget);
             }
             diagnostics.rank_attempt();
+            cache.lock().begin_rank();
             let rank_info = ScenarioRank {
                 index: rank,
                 count: weights.len(),

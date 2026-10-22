@@ -1,11 +1,12 @@
 //! Memoization belongs to one immutable snapshot, one query time and one
-//! comparison. At most two existing slots are inspected per key; collisions
-//! may still evict entries, and exact work equality is always required.
+//! comparison. One untrusted ordinal hint can avoid hashing; otherwise the
+//! original two-slot lookup applies. Exact work equality is always required.
 
 use super::*;
 use ferrum_execution::execution_attempt::AttemptPrefixRestore;
 use rustc_hash::FxHasher;
 use std::hash::{Hash, Hasher};
+use std::num::NonZeroUsize;
 
 #[cfg(test)]
 mod tests;
@@ -19,6 +20,7 @@ pub(super) struct InsertionKey<'a> {
     slot: usize,
     at: Instant,
     slots_len: usize,
+    hint_ordinal: Option<usize>,
 }
 
 struct Entry {
@@ -66,9 +68,17 @@ impl Entry {
 pub(super) struct ScenarioCache {
     at: Instant,
     slots: Box<[Option<Entry>]>,
+    /// Slot + 1, never an entry reference or a cached prediction. A changed
+    /// rank topology or replacement is harmless because every hit is checked.
+    hints: Box<[Option<NonZeroUsize>]>,
+    next_hint: usize,
     max_bytes: usize,
     retained_bytes: usize,
     hits: usize,
+    #[cfg(test)]
+    hint_hits: usize,
+    #[cfg(test)]
+    hash_lookups: usize,
 }
 
 impl ScenarioCache {
@@ -84,12 +94,38 @@ impl ScenarioCache {
         let slots = std::iter::repeat_with(|| None)
             .take(count)
             .collect::<Box<[_]>>();
+        let slot_bytes = std::mem::size_of_val(slots.as_ref());
+        // Keep the existing slot/hash geometry. Hints consume part of the same
+        // retained-byte budget, so payload insertion may fail earlier. No new
+        // budget is granted and a missing hint only uses the original lookup.
+        let hint_count = count.min(
+            max_bytes.saturating_sub(slot_bytes) / std::mem::size_of::<Option<NonZeroUsize>>(),
+        );
+        let hints = vec![None; hint_count].into_boxed_slice();
         Self {
             at,
-            retained_bytes: std::mem::size_of_val(slots.as_ref()),
+            retained_bytes: slot_bytes + std::mem::size_of_val(hints.as_ref()),
             slots,
+            hints,
+            next_hint: 0,
             max_bytes,
             hits: 0,
+            #[cfg(test)]
+            hint_hits: 0,
+            #[cfg(test)]
+            hash_lookups: 0,
+        }
+    }
+
+    /// Retain only untrusted lookup locations from the preceding traversal.
+    /// Endpoints, candidate failures and ordering may differ in this rank.
+    pub(super) fn begin_rank(&mut self) {
+        self.next_hint = 0;
+    }
+
+    fn remember_hint(&mut self, ordinal: Option<usize>, slot: usize) {
+        if let Some(hint) = ordinal.and_then(|ordinal| self.hints.get_mut(ordinal)) {
+            *hint = slot.checked_add(1).and_then(NonZeroUsize::new);
         }
     }
 
@@ -120,14 +156,36 @@ impl ScenarioCache {
         if self.at != at || self.slots.is_empty() {
             return (None, None);
         }
+        let ordinal = (self.next_hint < self.hints.len()).then_some(self.next_hint);
+        self.next_hint = self.next_hint.saturating_add(1);
+        let hinted = ordinal
+            .and_then(|ordinal| self.hints[ordinal])
+            .and_then(|slot| self.slots.get(slot.get() - 1))
+            .and_then(Option::as_ref)
+            .filter(|entry| entry.matches(query))
+            .and_then(|entry| entry.prediction(rank));
+        if let Some(prediction) = hinted {
+            self.hits = self.hits.saturating_add(1);
+            #[cfg(test)]
+            {
+                self.hint_hits += 1;
+            }
+            return (Some(prediction), None);
+        }
+        #[cfg(test)]
+        {
+            self.hash_lookups += 1;
+        }
         let slot = index(query, self.slots.len());
         let prediction = self.probe_slots(slot).find_map(|slot| {
             self.slots[slot]
                 .as_ref()
                 .filter(|entry| entry.matches(query))
                 .and_then(|entry| entry.prediction(rank))
+                .map(|prediction| (slot, prediction))
         });
-        if let Some(prediction) = prediction {
+        if let Some((slot, prediction)) = prediction {
+            self.remember_hint(ordinal, slot);
             self.hits = self.hits.saturating_add(1);
             return (Some(prediction), None);
         }
@@ -138,6 +196,7 @@ impl ScenarioCache {
                 slot,
                 at,
                 slots_len: self.slots.len(),
+                hint_ordinal: ordinal,
             }),
         )
     }
@@ -155,6 +214,7 @@ impl ScenarioCache {
             slot: index(query, self.slots.len()),
             at: self.at,
             slots_len: self.slots.len(),
+            hint_ordinal: None,
         };
         self.insert_with_key(Some(key), prediction);
     }
@@ -234,6 +294,9 @@ impl ScenarioCache {
             expires_at,
         });
         self.retained_bytes = bytes;
+        // The provider ran outside the lock. Associate the actual current slot
+        // with the original lookup ordinal, not a later cursor or primary slot.
+        self.remember_hint(key.hint_ordinal, slot);
     }
 
     fn probe_slots(&self, primary: usize) -> impl Iterator<Item = usize> {

@@ -111,6 +111,7 @@ fn compact_payload_keeps_all_rank_values_weights_metadata_and_actual_query_quota
     assert_eq!(
         cache.lock().retained_bytes(),
         std::mem::size_of::<Option<Entry>>()
+            + std::mem::size_of::<Option<NonZeroUsize>>()
             + std::mem::size_of::<CostWork>()
             + count * std::mem::size_of::<Duration>()
     );
@@ -142,6 +143,7 @@ fn compact_payload_exact_byte_boundary_and_rejected_replacement_preserve_old_ent
     let work = [work()];
     let query = cost_query(&work);
     let minimum = std::mem::size_of::<Option<Entry>>()
+        + std::mem::size_of::<Option<NonZeroUsize>>()
         + std::mem::size_of::<CostWork>()
         + count * std::mem::size_of::<Duration>();
     let mut exact = ScenarioCache::new(at, minimum, 1);
@@ -176,6 +178,7 @@ fn compact_payload_exact_byte_boundary_and_rejected_replacement_preserve_old_ent
     assert_eq!(
         exact.retained_bytes(),
         std::mem::size_of::<Option<Entry>>()
+            + std::mem::size_of::<Option<NonZeroUsize>>()
             + 2 * std::mem::size_of::<CostWork>()
             + 2 * std::mem::size_of::<Duration>()
     );
