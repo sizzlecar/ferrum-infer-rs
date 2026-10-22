@@ -790,6 +790,7 @@ fn simulate_recorded<Action, Adapter: TrajectoryAdapter<Action>>(
     mut trace: Option<&mut scenarios::TraceEvaluation<'_, '_>>,
 ) -> Result<StaticTrajectory, Unsupported> {
     let mut requests = input.requests.to_vec();
+    let mut clock_coupling = ClockCoupling::for_requests(&requests);
     let mut central = Duration::ZERO;
     let mut risk = Duration::ZERO;
     let mut window_progress = requests
@@ -1046,6 +1047,7 @@ fn simulate_recorded<Action, Adapter: TrajectoryAdapter<Action>>(
             risk = risk
                 .checked_add(upper_service_time)
                 .ok_or(Unsupported::Arithmetic)?;
+            clock_coupling.observe_elapsed(central, risk);
             for member in group {
                 apply_member(
                     &mut requests[member.request],
@@ -1053,6 +1055,7 @@ fn simulate_recorded<Action, Adapter: TrajectoryAdapter<Action>>(
                     central,
                     risk,
                     itl_limit,
+                    clock_coupling,
                 )?;
                 if reuse_active_mask && requests[member.request].finished() {
                     // Refresh only at the next wave boundary. A split group's
@@ -1203,12 +1206,40 @@ fn validate_member(requests: &[SimulatedRequest], member: GroupMember) -> Result
     }
 }
 
+/// A simulation-local proof. Unequal elapsed values permanently invalidate it,
+/// even if later service times bring the cumulative elapsed values together.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ClockCoupling {
+    Equal,
+    Independent,
+}
+
+impl ClockCoupling {
+    fn for_requests(requests: &[SimulatedRequest]) -> Self {
+        if requests
+            .iter()
+            .all(|request| request.central_clock == request.risk_clock)
+        {
+            Self::Equal
+        } else {
+            Self::Independent
+        }
+    }
+
+    fn observe_elapsed(&mut self, central: Duration, risk: Duration) {
+        if central != risk {
+            *self = Self::Independent;
+        }
+    }
+}
+
 fn apply_member(
     request: &mut SimulatedRequest,
     work: CostWork,
     central: Duration,
     risk: Duration,
     itl_limit: Duration,
+    clock_coupling: ClockCoupling,
 ) -> Result<(), Unsupported> {
     let emitted = match work.kind {
         AttemptWorkKind::Prefill => {
@@ -1222,37 +1253,60 @@ fn apply_member(
             .output_tokens
             .checked_add(1)
             .ok_or(Unsupported::Arithmetic)?;
-        for (clock, elapsed) in [
-            (&mut request.central_clock, central),
-            (&mut request.risk_clock, risk),
-        ] {
-            let at = request
-                .age
-                .checked_add(elapsed)
-                .ok_or(Unsupported::Arithmetic)?;
-            if let Some(previous) = clock.last_output {
-                let interval = at.checked_sub(previous).ok_or(Unsupported::InvalidState)?;
-                clock.maximum_output_interval = clock.maximum_output_interval.max(interval);
-                // Explicit future approximation: one emitted token produces
-                // one visible update. Historical fields use delivered text
-                // events; real client SSE coalescing is validated separately.
-                clock.interval_count = clock
-                    .interval_count
-                    .checked_add(1)
-                    .ok_or(Unsupported::Arithmetic)?;
-                if interval > itl_limit {
-                    clock.violating_interval_count = clock
-                        .violating_interval_count
-                        .checked_add(1)
-                        .ok_or(Unsupported::Arithmetic)?;
-                }
-            }
-            clock.first_output.get_or_insert(at);
-            clock.last_output = Some(at);
-            if request.output_tokens == request.scenario_end_tokens {
-                clock.completed = Some(at);
-            }
+        let completed = request.output_tokens == request.scenario_end_tokens;
+        apply_clock(
+            &mut request.central_clock,
+            request.age,
+            central,
+            itl_limit,
+            completed,
+        )?;
+        if clock_coupling == ClockCoupling::Equal {
+            // The second update has the same starting fields and arguments.
+            // Copy only after the first update succeeds: its error/mutation
+            // order remains identical to the independent-clock path.
+            request.risk_clock = request.central_clock;
+        } else {
+            apply_clock(
+                &mut request.risk_clock,
+                request.age,
+                risk,
+                itl_limit,
+                completed,
+            )?;
         }
+    }
+    Ok(())
+}
+
+fn apply_clock(
+    clock: &mut RequestClock,
+    age: Duration,
+    elapsed: Duration,
+    itl_limit: Duration,
+    completed: bool,
+) -> Result<(), Unsupported> {
+    let at = age.checked_add(elapsed).ok_or(Unsupported::Arithmetic)?;
+    if let Some(previous) = clock.last_output {
+        let interval = at.checked_sub(previous).ok_or(Unsupported::InvalidState)?;
+        clock.maximum_output_interval = clock.maximum_output_interval.max(interval);
+        // Explicit future approximation: one emitted token produces one
+        // visible update. Historical fields retain delivered text events.
+        clock.interval_count = clock
+            .interval_count
+            .checked_add(1)
+            .ok_or(Unsupported::Arithmetic)?;
+        if interval > itl_limit {
+            clock.violating_interval_count = clock
+                .violating_interval_count
+                .checked_add(1)
+                .ok_or(Unsupported::Arithmetic)?;
+        }
+    }
+    clock.first_output.get_or_insert(at);
+    clock.last_output = Some(at);
+    if completed {
+        clock.completed = Some(at);
     }
     Ok(())
 }

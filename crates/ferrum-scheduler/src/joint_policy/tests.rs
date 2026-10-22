@@ -4,6 +4,7 @@ use ferrum_execution::token_execution::ExecutionRange;
 use ferrum_interfaces::request_observation::{StoppingForecast, StoppingMass};
 
 mod buffers;
+mod clock_updates;
 
 struct Snapshot {
     at: Instant,
