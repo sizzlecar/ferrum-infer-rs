@@ -3,6 +3,10 @@
 
 use std::sync::atomic::AtomicUsize;
 
+use crate::backend::cuda_tensor_memory_policy::{AutoMemoryPolicy, RetainedNative};
+pub use crate::backend::cuda_tensor_memory_policy::{
+    CudaMemoryUtilization, CudaTensorMemoryObservation, CUDA_TENSOR_AUTO_MEMORY_POLICY_VERSION,
+};
 use ferrum_runtime::{DeviceCapacityOwner, DeviceCapacityRetention, DeviceOpaqueMemoryKind};
 
 use super::*;
@@ -27,9 +31,27 @@ pub struct CudaTensorRuntimeConfig {
     pub opaque_memory_profile: String,
 }
 
+/// Automatically bounds the same process-wide account used by all tensor
+/// plans. There is no second explicit usable-memory budget in this input.
+/// The optional maximum only tightens the automatic ceiling.
+pub struct CudaTensorRuntimeAutoConfig {
+    pub device: CudaDeviceRuntimeConfig,
+    pub utilization: CudaMemoryUtilization,
+    pub maximum_memory_bytes: Option<u64>,
+    pub bootstrap_memory_bytes: u64,
+    pub stream_memory_bytes: u64,
+    pub maximum_streams: usize,
+    pub maximum_in_flight_per_stream: usize,
+    pub maximum_commands_per_submission: usize,
+    pub opaque_memory_profile: String,
+}
+
 pub(super) struct TensorEagerState {
-    capacity: DeviceCapacityOwner,
+    // Bootstrap may retain the provisional owner. Drop its claim before the
+    // final lower ceiling, which must govern all native owners until cleanup.
     _bootstrap: DeviceCapacityRetention,
+    capacity: DeviceCapacityOwner,
+    memory_observation: Option<CudaTensorMemoryObservation>,
     stream_bytes: u64,
     maximum_streams: usize,
     maximum_in_flight: usize,
@@ -207,9 +229,70 @@ fn driver_status(
     }
 }
 
+fn query_device_total(ordinal: usize) -> Result<u64, CudaDeviceRuntimeError> {
+    let ordinal = i32::try_from(ordinal)
+        .map_err(|_| CudaDeviceRuntimeError::contract("CUDA ordinal exceeds i32"))?;
+    let mut device = 0;
+    let mut total = 0_usize;
+    // These driver device queries do not create/retain a CUDA context.
+    unsafe {
+        driver_status(cudarc::driver::sys::cuInit(0), "driver initialization")?;
+        driver_status(
+            cudarc::driver::sys::cuDeviceGet(&mut device, ordinal),
+            "device query",
+        )?;
+        driver_status(
+            cudarc::driver::sys::cuDeviceTotalMem_v2(&mut total, device),
+            "device memory query",
+        )?;
+    }
+    u64::try_from(total).map_err(|_| CudaDeviceRuntimeError::contract("CUDA memory exceeds u64"))
+}
+
 impl CudaDeviceRuntime {
     pub fn new_tensor_eager(
+        config: CudaTensorRuntimeConfig,
+    ) -> Result<Self, CudaDeviceRuntimeError> {
+        Self::new_tensor_eager_with_observation(config, None)
+    }
+
+    /// Creates one runtime/context and queries free memory on that context.
+    /// The conservative total ceiling is min(observed free, floor(total *
+    /// utilization), optional maximum). Bootstrap remains charged within it;
+    /// its declared allowance is never added back to observed free memory.
+    pub fn new_tensor_eager_auto(
+        config: CudaTensorRuntimeAutoConfig,
+    ) -> Result<Self, CudaDeviceRuntimeError> {
+        let policy = AutoMemoryPolicy::new(config.utilization, config.maximum_memory_bytes)
+            .map_err(CudaDeviceRuntimeError::contract)?;
+        let total = query_device_total(config.device.ordinal)?;
+        let usable_memory_bytes = policy
+            .provisional_ceiling(total)
+            .map_err(CudaDeviceRuntimeError::contract)?;
+        Self::new_tensor_eager_with_observation(
+            CudaTensorRuntimeConfig {
+                device: config.device,
+                usable_memory_bytes,
+                bootstrap_memory_bytes: config.bootstrap_memory_bytes,
+                stream_memory_bytes: config.stream_memory_bytes,
+                maximum_streams: config.maximum_streams,
+                maximum_in_flight_per_stream: config.maximum_in_flight_per_stream,
+                maximum_commands_per_submission: config.maximum_commands_per_submission,
+                opaque_memory_profile: config.opaque_memory_profile,
+            },
+            Some((policy, total)),
+        )
+    }
+
+    pub fn tensor_memory_observation(&self) -> Option<&CudaTensorMemoryObservation> {
+        self.tensor_eager
+            .as_ref()
+            .and_then(|state| state.memory_observation.as_ref())
+    }
+
+    fn new_tensor_eager_with_observation(
         mut config: CudaTensorRuntimeConfig,
+        automatic: Option<(AutoMemoryPolicy, u64)>,
     ) -> Result<Self, CudaDeviceRuntimeError> {
         if config.device.device_id.as_str() != format!("device.cuda.{}", config.device.ordinal) {
             return Err(CudaDeviceRuntimeError::contract(
@@ -287,29 +370,26 @@ impl CudaDeviceRuntime {
         )?;
         // Driver device queries do not construct a CUDA context. Charge its
         // opaque allowance before the existing constructor can create one.
-        let ordinal = i32::try_from(config.device.ordinal)
-            .map_err(|_| CudaDeviceRuntimeError::contract("CUDA ordinal exceeds i32"))?;
-        let mut device = 0;
-        let mut total = 0_usize;
-        unsafe {
-            driver_status(cudarc::driver::sys::cuInit(0), "driver initialization")?;
-            driver_status(
-                cudarc::driver::sys::cuDeviceGet(&mut device, ordinal),
-                "device query",
-            )?;
-            driver_status(
-                cudarc::driver::sys::cuDeviceTotalMem_v2(&mut total, device),
-                "device memory query",
-            )?;
-        }
+        let total = match automatic {
+            Some((_, total)) => total,
+            None => query_device_total(config.device.ordinal)?,
+        };
         // Numeric policy and resource policy jointly identify this runtime.
         use sha2::{Digest, Sha256};
         let mut hash = Sha256::new();
         for part in [
-            "ferrum-cuda-tensor-eager-v1".to_owned(),
+            if automatic.is_some() {
+                "ferrum-cuda-tensor-eager-auto-v1"
+            } else {
+                "ferrum-cuda-tensor-eager-v1"
+            }
+            .to_owned(),
             config.device.runtime_implementation_fingerprint.clone(),
             config.opaque_memory_profile.clone(),
-            config.usable_memory_bytes.to_string(),
+            automatic.map_or_else(
+                || config.usable_memory_bytes.to_string(),
+                |(policy, _)| policy.identity(),
+            ),
             config.bootstrap_memory_bytes.to_string(),
             config.stream_memory_bytes.to_string(),
             config.maximum_streams.to_string(),
@@ -319,14 +399,18 @@ impl CudaDeviceRuntime {
             hash.update((part.len() as u64).to_le_bytes());
             hash.update(part.as_bytes());
         }
+        if automatic.is_some() {
+            let implementation = include_bytes!("tensor_eager/memory_policy.rs");
+            hash.update((implementation.len() as u64).to_le_bytes());
+            hash.update(implementation);
+        }
         config.device.runtime_implementation_fingerprint = format!("{:x}", hash.finalize());
         let descriptor = DeviceDescriptor {
             id: config.device.device_id.clone(),
             class: DeviceClass::Accelerator,
             ordinal: u32::try_from(config.device.ordinal)
                 .map_err(|_| CudaDeviceRuntimeError::contract("CUDA ordinal exceeds u32"))?,
-            total_memory_bytes: u64::try_from(total)
-                .map_err(|_| CudaDeviceRuntimeError::contract("CUDA memory exceeds u64"))?,
+            total_memory_bytes: total,
             runtime_implementation_fingerprint: config
                 .device
                 .runtime_implementation_fingerprint
@@ -345,6 +429,7 @@ impl CudaDeviceRuntime {
         let state = Arc::new(TensorEagerState {
             capacity,
             _bootstrap: bootstrap,
+            memory_observation: None,
             stream_bytes: config.stream_memory_bytes,
             maximum_streams: config.maximum_streams,
             maximum_in_flight: config.maximum_in_flight_per_stream,
@@ -352,13 +437,47 @@ impl CudaDeviceRuntime {
             streams: AtomicUsize::new(0),
             provider_live: AtomicBool::new(false),
         });
-        let (mut runtime, state) = create_native(state, || Self::new(config.device))?;
-        if runtime.descriptor() != &descriptor {
-            std::mem::forget(state);
+        let (runtime, state) = create_native(state, || Self::new(config.device))?;
+        let mut guard = RetainedNative::new(runtime, state);
+        if guard.native().descriptor() != &descriptor {
+            guard.retain_owner();
             return Err(CudaDeviceRuntimeError::contract(
                 "CUDA tensor device descriptor changed during context creation",
             ));
         }
+        if let Some((policy, _)) = automatic {
+            let (free, observed_total) =
+                guard.native().context.mem_get_info().map_err(|error| {
+                    CudaDeviceRuntimeError::driver("context free-memory query", error)
+                })?;
+            let free = u64::try_from(free)
+                .map_err(|_| CudaDeviceRuntimeError::contract("CUDA free memory exceeds u64"))?;
+            let observed_total = u64::try_from(observed_total).map_err(|_| {
+                CudaDeviceRuntimeError::contract("CUDA observed total memory exceeds u64")
+            })?;
+            if observed_total != total {
+                return Err(CudaDeviceRuntimeError::contract(
+                    "CUDA context total memory differs from its pre-context descriptor",
+                ));
+            }
+            let observation = policy
+                .observe(observed_total, free, overhead)
+                .map_err(CudaDeviceRuntimeError::contract)?;
+            // Opening a second owner only lowers the shared ceiling; it does
+            // not duplicate the bootstrap claim. Both owners use the original
+            // immutable descriptor. No registry has observed this runtime yet.
+            let state = Arc::get_mut(guard.owner_mut()).ok_or_else(|| {
+                CudaDeviceRuntimeError::contract(
+                    "CUDA constructor quota unexpectedly escaped before publication",
+                )
+            })?;
+            let final_capacity =
+                DeviceCapacityOwner::open(&descriptor, observation.effective_ceiling_bytes())
+                    .map_err(CudaDeviceRuntimeError::capacity)?;
+            state.capacity = final_capacity;
+            state.memory_observation = Some(observation);
+        }
+        let (mut runtime, state) = guard.into_parts();
         runtime.tensor_eager = Some(state);
         Ok(runtime)
     }
@@ -497,6 +616,7 @@ mod tests {
                 .reserve(DeviceOpaqueMemoryKind::Bootstrap, 16)
                 .unwrap(),
             capacity: capacity.clone(),
+            memory_observation: None,
             stream_bytes: 32,
             maximum_streams: 1,
             maximum_in_flight: 1,

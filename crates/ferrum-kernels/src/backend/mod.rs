@@ -60,4 +60,10 @@ pub mod metal;
 #[cfg(feature = "cuda")]
 pub mod cuda;
 
+// CUDA admission arithmetic and constructor ownership are independently
+// testable without loading the CUDA driver or creating a context.
+#[cfg(any(feature = "cuda", test))]
+#[path = "cuda/vnext_runtime/tensor_eager/memory_policy.rs"]
+mod cuda_tensor_memory_policy;
+
 pub mod timer;

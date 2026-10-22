@@ -81,7 +81,10 @@ pub mod rope;
 pub mod vnext_ops;
 mod vnext_replay;
 pub mod vnext_runtime;
-pub use vnext_runtime::{CudaCudnnConfig, CudaTensorRuntimeConfig};
+pub use vnext_runtime::{
+    CudaCudnnConfig, CudaMemoryUtilization, CudaTensorMemoryObservation,
+    CudaTensorRuntimeAutoConfig, CudaTensorRuntimeConfig, CUDA_TENSOR_AUTO_MEMORY_POLICY_VERSION,
+};
 mod vnext_tool_correlation;
 
 // Triton kernels (only when the `triton-kernels` feature is also on —

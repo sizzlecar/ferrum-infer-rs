@@ -78,7 +78,11 @@ pub(crate) use sequence_physical::{
     CudaSequencePhysicalTable,
 };
 pub(crate) use tensor_eager::CudaTensorProviderRetention;
-pub use tensor_eager::{CudaTensorRuntimeConfig, CUDA_TENSOR_MAX_COMMANDS_PER_SUBMISSION};
+pub use tensor_eager::{
+    CudaMemoryUtilization, CudaTensorMemoryObservation, CudaTensorRuntimeAutoConfig,
+    CudaTensorRuntimeConfig, CUDA_TENSOR_AUTO_MEMORY_POLICY_VERSION,
+    CUDA_TENSOR_MAX_COMMANDS_PER_SUBMISSION,
+};
 use tensor_io::validate_tensor_command;
 
 static NEXT_RUNTIME_INSTANCE: AtomicU64 = AtomicU64::new(1);
