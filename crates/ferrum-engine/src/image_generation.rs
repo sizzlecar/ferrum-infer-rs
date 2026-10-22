@@ -316,6 +316,9 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
     /// VAE follows the explicit decoder policy, reusing one initialized session
     /// within this batch. Output views retain their actual execution backing:
     /// one image under SingleImage, the whole batch under FullBatch.
+    /// Execution uses canonical token-length order to reuse exact mask plans;
+    /// outputs and receipt batch indices retain the caller's original order.
+    /// Per-execution stage timings follow that internal execution order.
     pub fn generate_batch(
         &mut self,
         requests: Vec<ImageGenerationRequest>,
@@ -401,6 +404,7 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
     ) -> Result<Vec<TensorExecutionOutput>, ImageGenerationFailure<R>> {
         let PreparedRequest {
             prompts,
+            request_order,
             transformer,
             decoder,
             latent_shape,
@@ -413,6 +417,7 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
             source,
             active: None,
         };
+        let ordered_requests = request_order.requests(requests).map_err(process)?;
 
         let inputs = prompts
             .managed_inputs(
@@ -448,7 +453,7 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
             .allocate_zeroed(HostMemoryClass::InputPreprocess, latent_shape.byte_len())
             .map_err(|e| process(e.into()))?;
         let mut noise = self.start_stage(noise_stage, job, stages)?;
-        for (index, request) in requests.iter().enumerate() {
+        for (index, request) in ordered_requests.enumerate() {
             let state = match noise_state(&self.host, request.seed) {
                 Ok(state) => state,
                 Err(error) => return Err(noise.processing(error)),
@@ -560,7 +565,9 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
             .into_input_tensor()
             .map_err(process)?;
         drop(normalized);
-        self.decode_batch(decode_stage, &decoder, input, requests.len(), job, stages)
+        let outputs =
+            self.decode_batch(decode_stage, &decoder, input, requests.len(), job, stages)?;
+        request_order.restore_outputs(outputs).map_err(process)
     }
 }
 

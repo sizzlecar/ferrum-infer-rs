@@ -1,6 +1,7 @@
 use super::*;
 
 mod adapter;
+mod batch_order;
 mod decoder;
 mod directory;
 mod fixture;

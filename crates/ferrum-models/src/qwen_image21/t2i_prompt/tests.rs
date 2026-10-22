@@ -126,6 +126,45 @@ fn actual_tokenizer_calls_keep_raw_template_dynamic_crop_and_left_padding() {
 }
 
 #[test]
+fn canonical_token_batch_preserves_rows_and_stable_ties_without_weakening_limits() {
+    let t = tokenizer();
+    let prompts = ["blue cat", "cat", "blue", "cat blue cat"];
+    let original = t.prepare(&prompts, 8192).unwrap();
+    let (canonical, order) = t.prepare_canonical(&prompts, 8192).unwrap();
+    assert_eq!(order, [1, 2, 0, 3]);
+    assert_eq!(canonical.valid_input_lengths(), [15, 15, 16, 17]);
+    let sequence = original.sequence_length();
+    for (execution_index, &request_index) in order.iter().enumerate() {
+        assert_eq!(
+            &canonical.input_ids()[execution_index * sequence..(execution_index + 1) * sequence],
+            &original.input_ids()[request_index * sequence..(request_index + 1) * sequence]
+        );
+        assert_eq!(
+            canonical.layout().key_runs()[execution_index],
+            original.layout().key_runs()[request_index]
+        );
+    }
+    let (reordered, _) = t
+        .prepare_canonical(&["cat blue cat", "blue", "blue cat", "cat"], 8192)
+        .unwrap();
+    assert_eq!(canonical.layout(), reordered.layout());
+    assert_eq!(
+        canonical.valid_feature_lengths(),
+        reordered.valid_feature_lengths()
+    );
+    assert_eq!(
+        canonical.drop_prefix_tokens(),
+        original.drop_prefix_tokens()
+    );
+    assert!(t.prepare_canonical(&["blue cat"], 1).is_err());
+    assert!(t
+        .prepare_canonical(&["cat", "<|image_pad|>"], 8192)
+        .is_err());
+    assert!(t.prepare_canonical(&[], 8192).is_err());
+    assert!(t.prepare_canonical(&["cat"; 17], 8192).is_err());
+}
+
+#[test]
 fn real_jinja_semantics_accept_equivalent_templates_and_reject_unknown_calls_or_wrong_crop() {
     let (t, c, j) = tokenizer_sources();
     let mut equivalent = b"{# independently formatted equivalent template #}".to_vec();

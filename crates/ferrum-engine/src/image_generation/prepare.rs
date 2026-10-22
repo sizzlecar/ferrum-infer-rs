@@ -2,6 +2,7 @@ use super::*;
 
 pub(super) struct PreparedRequest<R: DeviceRuntime> {
     pub prompts: QwenImage21T2iPromptBatch,
+    pub request_order: BatchOrder,
     pub transformer: QwenImage21TransformerConfig,
     pub decoder: QwenImage21VaeDecoderConfig,
     pub latent_shape: QwenImage21LatentShape,
@@ -9,6 +10,54 @@ pub(super) struct PreparedRequest<R: DeviceRuntime> {
     pub noise_stage: PreparedStage<R>,
     pub denoise_stage: PreparedStage<R>,
     pub decode_stage: PreparedStage<R>,
+}
+
+/// Execution-to-request mapping. This only moves bounded owners/metadata, never
+/// copies tensor payloads or changes the exact mask used to compile a plan.
+pub(super) struct BatchOrder {
+    request_indices: Vec<usize>,
+}
+impl BatchOrder {
+    pub(super) fn new(request_indices: Vec<usize>, batch: usize) -> anyhow::Result<Self> {
+        ensure!(
+            (1..=STRUCTURED_ATTENTION_BF16_MAX_BATCH).contains(&batch)
+                && request_indices.len() == batch,
+            "canonical batch permutation has an invalid length"
+        );
+        let mut seen = [false; STRUCTURED_ATTENTION_BF16_MAX_BATCH];
+        for &index in &request_indices {
+            ensure!(
+                index < batch && !seen[index],
+                "canonical batch permutation must contain each request exactly once"
+            );
+            seen[index] = true;
+        }
+        Ok(Self { request_indices })
+    }
+
+    pub(super) fn requests<'a>(
+        &'a self,
+        requests: &'a [ImageGenerationRequest],
+    ) -> anyhow::Result<impl Iterator<Item = &'a ImageGenerationRequest>> {
+        ensure!(
+            requests.len() == self.request_indices.len(),
+            "request count differs from its canonical batch permutation"
+        );
+        Ok(self.request_indices.iter().map(|&index| &requests[index]))
+    }
+
+    pub(super) fn restore_outputs(
+        &self,
+        outputs: Vec<TensorExecutionOutput>,
+    ) -> anyhow::Result<Vec<TensorExecutionOutput>> {
+        ensure!(
+            outputs.len() == self.request_indices.len(),
+            "decoder output count differs from its canonical batch permutation"
+        );
+        let mut indexed: Vec<_> = self.request_indices.iter().copied().zip(outputs).collect();
+        indexed.sort_unstable_by_key(|(index, _)| *index);
+        Ok(indexed.into_iter().map(|(_, output)| output).collect())
+    }
 }
 
 impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
@@ -26,10 +75,11 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
             .iter()
             .map(|r| r.prompt.as_str())
             .collect::<Vec<_>>();
-        let prompts = self
+        let (prompts, order) = self
             .assets
             .tokenizer
-            .prepare(&prompt_text, self.config.maximum_user_tokens)?;
+            .prepare_canonical(&prompt_text, self.config.maximum_user_tokens)?;
+        let request_order = BatchOrder::new(order, batch)?;
         let text = Qwen3VLTextConfig::new(self.assets.text.clone(), prompts.layout().clone())?;
         let layout = QwenImage21T2iLayout::new(
             u32::try_from(prompts.feature_sequence_length())?,
@@ -123,6 +173,7 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
         ])?;
         Ok(PreparedRequest {
             prompts,
+            request_order,
             transformer,
             decoder,
             latent_shape,

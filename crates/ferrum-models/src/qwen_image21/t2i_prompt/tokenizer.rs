@@ -117,6 +117,41 @@ impl QwenImage21T2iTokenizer {
         prompts: &[&str],
         maximum_user_tokens: usize,
     ) -> Result<QwenImage21T2iPromptBatch> {
+        let samples = self.encode_samples(prompts, maximum_user_tokens)?;
+        QwenImage21T2iPromptBatch::from_encoded(samples, self.prefix.len(), self.pad)
+    }
+
+    /// Tokenize once, then order this pure-T2I batch by ascending valid length.
+    /// With the common prefix and left padding, length determines each sample's
+    /// complete key mask and cropped feature length. Equal lengths keep their
+    /// input order; prompt content and seed are not cache-key substitutes.
+    ///
+    /// The returned indices map execution positions to original prompt positions.
+    /// Callers must apply this same permutation to all per-request inputs and
+    /// restore output order. Only bounded token/control metadata is rearranged.
+    pub fn prepare_canonical(
+        &self,
+        prompts: &[&str],
+        maximum_user_tokens: usize,
+    ) -> Result<(QwenImage21T2iPromptBatch, Vec<usize>)> {
+        let mut samples: Vec<_> = self
+            .encode_samples(prompts, maximum_user_tokens)?
+            .into_iter()
+            .enumerate()
+            .collect();
+        samples.sort_by_key(|(_, tokens)| tokens.len());
+        let (order, samples): (Vec<_>, Vec<_>) = samples.into_iter().unzip();
+        Ok((
+            QwenImage21T2iPromptBatch::from_encoded(samples, self.prefix.len(), self.pad)?,
+            order,
+        ))
+    }
+
+    fn encode_samples(
+        &self,
+        prompts: &[&str],
+        maximum_user_tokens: usize,
+    ) -> Result<Vec<Vec<u32>>> {
         ensure!(
             !prompts.is_empty() && prompts.len() <= 16,
             "T2I requires 1..=16 prompts"
@@ -133,7 +168,7 @@ impl QwenImage21T2iTokenizer {
             bytes <= MAX_TOTAL_PROMPT_BYTES,
             "batch raw prompts exceed 1 MiB"
         );
-        let samples = prompts
+        prompts
             .iter()
             .map(|prompt| {
                 let ids = encode(
@@ -155,8 +190,7 @@ impl QwenImage21T2iTokenizer {
                 );
                 Ok(ids)
             })
-            .collect::<Result<Vec<_>>>()?;
-        QwenImage21T2iPromptBatch::from_encoded(samples, self.prefix.len(), self.pad)
+            .collect()
     }
 }
 fn encode(engine: &Tokenizer, text: &str, special: bool) -> Result<Vec<u32>> {
