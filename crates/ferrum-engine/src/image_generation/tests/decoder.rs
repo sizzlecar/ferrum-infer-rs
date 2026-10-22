@@ -291,6 +291,12 @@ fn cached_decoder_plan_reinitializes_without_retaining_device_or_host_payloads()
             });
         assert_eq!(pipeline.runtime.snapshot().live_allocations, 0);
         assert_eq!(receipts[0].execution.completed_executions, 2);
+        assert!(!receipts[0].execution.session_reused);
+        assert!(receipts[0].close.is_some());
+        assert!(matches!(
+            receipts[0].retirement,
+            ImageStageRetirement::Closed
+        ));
         let ComponentInitializationReceipt::Initialized { receipt } =
             &receipts[0].execution.initialization
         else {
@@ -310,4 +316,66 @@ fn cached_decoder_plan_reinitializes_without_retaining_device_or_host_payloads()
     drop(source);
     assert_eq!(pipeline.host.usage().unwrap().committed_bytes(), 0);
     assert_eq!(pipeline.runtime.snapshot().live_allocations, 0);
+}
+
+#[test]
+fn resident_real_decoder_reuses_one_initialization_and_shutdown_preserves_host_images() {
+    let (mut pipeline, directory) = super::adapter::pipeline(2);
+    pipeline.host = host(65536);
+    pipeline.config.residency = ImageResidencyPolicy::DenoiserAndDecoder;
+    pipeline.config.static_initialization = StaticInitializationPolicy::new(65536, 64).unwrap();
+    let config = pipeline.assets.decoder_batch(1, 2, 2).unwrap();
+    pipeline.assets.sources.vae =
+        decoder_source(&directory.path().join("resident-numeric-vae"), &config);
+    let source = input(&pipeline.host);
+    let mut outputs = Vec::new();
+    let mut uploaded = 0;
+    for job in 0..2 {
+        let (prepared, decoder) = stage(&pipeline, 1);
+        let mut receipts = Vec::new();
+        let images = pipeline
+            .decode_batch(prepared, &decoder, source.clone(), 2, job, &mut receipts)
+            .unwrap_or_else(|_| panic!("resident real decoder"));
+        assert_eq!(receipts.len(), 1);
+        assert_eq!(receipts[0].execution.session_reused, job == 1);
+        assert_eq!(receipts[0].execution.completed_executions, 2);
+        assert!(receipts[0].close.is_none());
+        assert!(matches!(
+            receipts[0].retirement,
+            ImageStageRetirement::Resident { .. }
+        ));
+        let snapshot = pipeline.runtime.snapshot();
+        if job == 1 {
+            assert_eq!(
+                snapshot.uploaded_bytes - uploaded,
+                source.bytes().len() as u64
+            );
+        }
+        uploaded = snapshot.uploaded_bytes;
+        assert!(snapshot.live_allocations > 0);
+        assert_ne!(images[0].bytes().bytes(), images[1].bytes().bytes());
+        outputs.push(images);
+    }
+    for sample in 0..2 {
+        assert_eq!(
+            outputs[0][sample].bytes().bytes(),
+            outputs[1][sample].bytes().bytes()
+        );
+    }
+    let receipt = pipeline.shutdown().unwrap();
+    assert_eq!(receipt.len(), 1);
+    assert!(receipt[0].close.is_some());
+    assert_eq!(pipeline.runtime.snapshot().live_allocations, 0);
+    drop(source);
+    assert_eq!(
+        pipeline.host.usage().unwrap().committed_bytes(),
+        4 * 4 * 32 * 32 * 2
+    );
+    for batch in &outputs {
+        for output in batch {
+            QwenImage21RgbaOutput::new(&pipeline.host, output.tensor(), output.bytes()).unwrap();
+        }
+    }
+    drop(outputs);
+    assert_eq!(pipeline.host.usage().unwrap().committed_bytes(), 0);
 }

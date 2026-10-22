@@ -18,6 +18,7 @@ use sha2::{Digest, Sha256};
 
 use super::{CudaDeviceRuntime, CudaDeviceRuntimeError};
 
+mod dependencies;
 mod ffi;
 mod sdpa;
 use ffi::{check, Api, Descriptor, ForwardPerformance, Handle};
@@ -32,6 +33,12 @@ pub(crate) use sdpa::{
 #[derive(Clone, Debug)]
 pub struct CudaCudnnConfig {
     pub library_path: PathBuf,
+    /// Trusted, immutable native dependency files, loaded in this order before
+    /// cuDNN. Empty preserves the existing deployment-loader behavior. Explicit
+    /// dependencies currently require the Linux GNU loader; no environment or
+    /// global symbol visibility is changed. Their memory belongs to this same
+    /// declared opaque allowance, which is not a measured upper bound.
+    pub dependency_libraries: Vec<PathBuf>,
     pub opaque_memory_bytes: u64,
     pub workspace_limit_bytes: u64,
     pub opaque_memory_profile: String,
@@ -53,6 +60,8 @@ impl CudaCudnnConfig {
                 "cuDNN requires an absolute library path, positive opaque allowance, bounded workspace and versioned profile",
             ));
         }
+        dependencies::validate_paths(&self.dependency_libraries)
+            .map_err(CudaDeviceRuntimeError::contract)?;
         Ok(())
     }
 }
@@ -104,6 +113,11 @@ impl CudaCudnnOwner {
         // The complete sibling bundle is pinned as deployment provenance;
         // callers must not replace it or preload a conflicting cuDNN instance.
         let library_identity = library_fingerprint(config)?;
+        let dependencies = dependencies::Selection::prepare(&config.dependency_libraries)
+            .map_err(CudaDeviceRuntimeError::contract)?;
+        dependencies
+            .validate_loader_support()
+            .map_err(CudaDeviceRuntimeError::contract)?;
         let bootstrap = runtime.tensor_bootstrap_retention()?;
         let opaque = runtime.reserve_tensor_opaque(config.opaque_memory_bytes)?;
         let context = Arc::clone(runtime.context());
@@ -111,7 +125,7 @@ impl CudaCudnnOwner {
             .bind_to_thread()
             .map_err(|e| CudaDeviceRuntimeError::driver("cuDNN context bind", e))?;
         let loaded = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
-            Api::load(&config.library_path)
+            Api::load(&config.library_path, &dependencies)
         }));
         let api = match loaded {
             Ok(Ok(api)) => api,
@@ -176,12 +190,15 @@ impl CudaCudnnOwner {
         }
         let mut digest = Sha256::new();
         digest.update(library_identity);
+        digest.update(dependencies.fingerprint());
         digest.update(version.to_le_bytes());
         digest.update(config.opaque_memory_bytes.to_le_bytes());
         digest.update(config.workspace_limit_bytes.to_le_bytes());
         digest.update(config.opaque_memory_profile.as_bytes());
         digest.update(include_bytes!("cudnn.rs"));
         digest.update(include_bytes!("cudnn/ffi.rs"));
+        digest.update(include_bytes!("cudnn/dependencies.rs"));
+        digest.update(include_bytes!("cudnn/dependencies/linux.rs"));
         digest.update(include_bytes!("cudnn/sdpa.rs"));
         digest.update(include_bytes!("cudnn/sdpa/native.rs"));
         Ok(Arc::new(Self {

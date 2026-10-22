@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 pub struct ImageProductConfig {
     /// Public identity only; it does not select a model implementation.
     pub model: String,
-    /// Explicit selection of a cold functional execution mode, not G3 qualification.
+    /// Explicit experimental execution policy, not throughput qualification.
     pub execution_profile: ImageExecutionProfile,
     pub metadata: MetadataPaths,
     pub weights: WeightPaths,
@@ -22,12 +22,14 @@ pub struct ImageProductConfig {
 pub enum ImageExecutionProfile {
     ExperimentalSerialCold,
     ExperimentalBatchedCold,
+    ExperimentalResidentV1,
 }
 impl ImageExecutionProfile {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::ExperimentalSerialCold => "experimental_serial_cold",
             Self::ExperimentalBatchedCold => "experimental_batched_cold",
+            Self::ExperimentalResidentV1 => "experimental_resident_v1",
         }
     }
 }
@@ -133,6 +135,9 @@ pub struct CudaConfig {
 #[serde(deny_unknown_fields)]
 pub struct CudnnConfig {
     pub library_path: PathBuf,
+    /// Ordered explicit dependencies, loaded under the same admitted owner.
+    #[serde(default)]
+    pub dependency_libraries: Vec<PathBuf>,
     pub opaque_memory_bytes: u64,
     pub workspace_limit_bytes: u64,
     pub opaque_memory_profile: String,
@@ -171,6 +176,8 @@ pub struct PipelineConfig {
     pub decoder_batch_policy: ferrum_engine::image_generation::ImageDecoderBatchPolicy,
     #[serde(default)]
     pub plan_cache: ferrum_engine::image_generation::ImagePlanCachePolicy,
+    #[serde(default)]
+    pub residency: ferrum_engine::image_generation::ImageResidencyPolicy,
     pub maximum_staging_bytes: u64,
     pub maximum_initialization_commands: usize,
     pub maximum_backing_maintenance_passes: usize,
@@ -204,6 +211,7 @@ impl PipelineConfig {
             maximum_batch_size: self.maximum_batch_size,
             decoder_batch_policy: self.decoder_batch_policy,
             plan_cache: self.plan_cache,
+            residency: self.residency,
             static_initialization: StaticInitializationPolicy::new(
                 self.maximum_staging_bytes,
                 self.maximum_initialization_commands,
@@ -291,6 +299,10 @@ impl ImageProductConfig {
             .expect("canonical configuration path has a parent");
         config.resolve_paths(base);
         let ImageBackendConfig::Cuda(cuda) = &config.backend;
+        ensure!(
+            cuda.cudnn.dependency_libraries.len() <= 16,
+            "cuDNN dependency list exceeds 16 libraries"
+        );
         cuda.host.limits()?;
         cuda.resolved_pipeline()?;
         if let Some(serving) = &config.serving {
@@ -301,6 +313,21 @@ impl ImageProductConfig {
     }
     fn validate_execution_profile(&self) -> Result<()> {
         let ImageBackendConfig::Cuda(cuda) = &self.backend;
+        use ferrum_engine::image_generation::ImageResidencyPolicy;
+        ensure!(
+            matches!(
+                (self.execution_profile, cuda.pipeline.residency),
+                (
+                    ImageExecutionProfile::ExperimentalResidentV1,
+                    ImageResidencyPolicy::DenoiserAndDecoder
+                ) | (
+                    ImageExecutionProfile::ExperimentalSerialCold
+                        | ImageExecutionProfile::ExperimentalBatchedCold,
+                    ImageResidencyPolicy::Cold
+                )
+            ),
+            "execution_profile must match the explicit pipeline residency policy"
+        );
         if self.execution_profile == ImageExecutionProfile::ExperimentalSerialCold {
             ensure!(
                 cuda.pipeline.maximum_batch_size == 1,
@@ -352,6 +379,11 @@ impl ImageProductConfig {
         if cuda.cudnn.library_path.is_relative() {
             cuda.cudnn.library_path = base.join(&cuda.cudnn.library_path);
         }
+        for path in &mut cuda.cudnn.dependency_libraries {
+            if path.is_relative() {
+                *path = base.join(&*path);
+            }
+        }
     }
 }
 
@@ -374,6 +406,7 @@ impl CudaConfig {
                 attention_policy: self.attention_policy,
                 cudnn: ferrum_kernels::backend::cuda::CudaCudnnConfig {
                     library_path: self.cudnn.library_path.clone(),
+                    dependency_libraries: self.cudnn.dependency_libraries.clone(),
                     opaque_memory_bytes: self.cudnn.opaque_memory_bytes,
                     workspace_limit_bytes: self.cudnn.workspace_limit_bytes,
                     opaque_memory_profile: self.cudnn.opaque_memory_profile.clone(),
@@ -397,6 +430,7 @@ impl PipelineConfig {
             maximum_batch_size: self.maximum_batch_size,
             decoder_batch_policy: self.decoder_batch_policy,
             plan_cache: self.plan_cache,
+            residency: self.residency,
             static_initialization: StaticInitializationPolicy::new(
                 self.maximum_staging_bytes,
                 self.maximum_initialization_commands,

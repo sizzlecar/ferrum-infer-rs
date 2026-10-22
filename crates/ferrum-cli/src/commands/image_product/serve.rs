@@ -94,7 +94,7 @@ pub async fn execute_serve_source(
         };
         tracing::info!(composition=%serde_json::to_string(&composition).map_err(anyhow::Error::from)?, "image CUDA composition and observed conservative memory ceiling");
         tracing::warn!(profile=product.profile, max_num_seqs=serving.max_num_seqs,
-            "image HTTP uses configured cold batches; no cross-batch residency or G3 throughput qualification");
+            "experimental image HTTP uses its declared residency policy; no G3 throughput qualification");
         let mut task = {
             let server = server.clone();
             tokio::spawn(async move { server.start(&server_config).await })

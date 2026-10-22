@@ -43,6 +43,7 @@ fn algorithm_selection_filters_capacity_determinism_status_and_math() {
 fn config_rejects_implicit_paths_and_unbounded_or_unlabelled_allowances() {
     let config = CudaCudnnConfig {
         library_path: PathBuf::from("/deployment/libcudnn.so.9"),
+        dependency_libraries: Vec::new(),
         opaque_memory_bytes: 64,
         workspace_limit_bytes: 0,
         opaque_memory_profile: "experimental-test-v1".into(),

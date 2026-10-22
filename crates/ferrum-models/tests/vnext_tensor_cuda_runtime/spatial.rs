@@ -242,6 +242,7 @@ fn managed_cuda_cudnn_conv_norm_nchw_pointwise_scratch_and_retirement() {
     );
     let cudnn = CudaCudnnConfig {
         library_path,
+        dependency_libraries: Vec::new(),
         opaque_memory_bytes: 64 << 20,
         workspace_limit_bytes: WORKSPACE_BYTES,
         opaque_memory_profile: "experimental-unqualified-spatial-test-v1".into(),

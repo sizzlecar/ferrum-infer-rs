@@ -1,18 +1,16 @@
-//! Cold Qwen-Image 2.1 request batches on injected runtime owners.
+//! Qwen-Image 2.1 request batches on injected runtime owners.
 //!
-//! This cold BF16 path qualifies G2 functionality. It is not the G3 serving
-//! architecture: it reloads stage weights for every batch. A bounded optional
-//! cache reuses compiled plans for identical stage geometry. Compatible
-//! requests share real batched component forwards within that batch. Throughput
-//! qualification additionally requires retained component sessions, explicit
-//! residency/offload policies and measurements; configuring a batch limit is
-//! not evidence that a particular workload fits or meets throughput targets.
+//! Cold is the default. Optional DenoiserAndDecoder residency retains two
+//! exact-plan sessions, releasing idle dynamic backing between stages. TE and
+//! noise stay cold. A bounded optional cache reuses compiled plans. Compatible
+//! requests share real batched component forwards. These policies are not
+//! throughput qualification or proof that every configured shape fits.
 //!
 //! Metadata preparation is separate from backend construction. The pipeline
 //! never constructs a runtime or Host account, launches a helper process, or
 //! exchanges tensor payloads through files. All four component plans compile
-//! before the first upload. Each stage must close successfully before the next
-//! begins; a stage failure returns the original recovery owner and stops this
+//! before the first upload. Each stage must close or release idle dynamic
+//! backing before the next begins; a failure retains recovery owners and stops this
 //! pipeline instance. This first path has no CFG, image editing or video,
 //! device-resident denoise cache, or claim of Torch parity/performance parity.
 //! Host claims cover managed tensor payloads and static transfer staging, not
@@ -25,14 +23,16 @@ pub mod cuda;
 mod decoder;
 mod plan_cache;
 mod prepare;
+mod residency;
 pub mod service;
 mod stage;
 pub use assets::{ImageAssetReceipt, QwenImage21Assets, QwenImage21Metadata, QwenImage21Sources};
 pub use attention_policy::ImageCudaAttentionPolicy;
 pub use plan_cache::ImagePlanCachePolicy;
+pub use residency::ImageResidencyPolicy;
 pub use stage::{
     ActiveImageStage, ImageGenerationError, ImageGenerationFailure, ImageStage,
-    ImageStageExecutionReceipt, ImageStagePlanReceipt, ImageStageReceipt,
+    ImageStageExecutionReceipt, ImageStagePlanReceipt, ImageStageReceipt, ImageStageRetirement,
 };
 
 use anyhow::{ensure, Context};
@@ -107,6 +107,7 @@ pub struct ImagePipelineConfig {
     pub maximum_batch_size: usize,
     pub decoder_batch_policy: ImageDecoderBatchPolicy,
     pub plan_cache: ImagePlanCachePolicy,
+    pub residency: ImageResidencyPolicy,
     pub static_initialization: StaticInitializationPolicy,
     pub executor: TensorExecutorConfig,
 }
@@ -187,6 +188,7 @@ pub struct ImageGenerationReceipt {
     pub batch_size: usize,
     pub batch_index: usize,
     pub decoder_batch_policy: ImageDecoderBatchPolicy,
+    pub residency: ImageResidencyPolicy,
     pub width: u32,
     pub height: u32,
     pub seed: u64,
@@ -217,6 +219,7 @@ pub struct QwenImage21Pipeline<R: DeviceRuntime> {
     next_job: u64,
     stopped: bool,
     plan_cache: plan_cache::StagePlanCache<R>,
+    resident_stages: residency::ResidentStages<R>,
 }
 
 impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
@@ -265,6 +268,7 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
             next_job: 0,
             stopped: false,
             plan_cache: plan_cache::StagePlanCache::new(),
+            resident_stages: residency::ResidentStages::new(),
         })
     }
 
@@ -286,7 +290,8 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
     /// One real shared TE/DiT forward per stage (and timestep), with each
     /// request's independent fresh Philox stream. All requests must have the
     /// same geometry and this pipeline's fixed schedule/profile. Components
-    /// still cold-load per batch; no cross-batch residency is claimed here.
+    /// follow the explicit residency policy; exact-plan misses close the old
+    /// session before initialization and do not reuse incompatible masks.
     /// VAE follows the explicit decoder policy, reusing one initialized session
     /// within this batch. Output views retain their actual execution backing:
     /// one image under SingleImage, the whole batch under FullBatch.
@@ -334,6 +339,7 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
                                 batch_size: requests.len(),
                                 batch_index,
                                 decoder_batch_policy: self.config.decoder_batch_policy,
+                                residency: self.config.residency,
                                 width: request.width,
                                 height: request.height,
                                 seed: request.seed,
@@ -365,7 +371,7 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
     }
 
     fn run(
-        &self,
+        &mut self,
         prepared: PreparedRequest<R>,
         requests: &[ImageGenerationRequest],
         job: u64,
@@ -401,13 +407,9 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
             .map_err(process)?
             .into_parts()
             .1;
-        let text = text_stage.start(
-            self,
-            job,
-            ComponentWeightSource::Stored(self.assets.sources.text_encoder.as_ref()),
-        )?;
+        let text = self.start_stage(text_stage, job, stages)?;
         let (text, outputs) = text.execute(job, Vec::from(inputs))?;
-        stages.push(text.close()?);
+        self.finish_stage(text, stages)?;
         let hidden = only_output(outputs, Qwen3VLTextEncoderFamily::OUTPUT_ID).map_err(process)?;
         let features = prompts
             .crop_hidden(&self.host, &self.assets.text, &hidden)
@@ -424,7 +426,7 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
             .host
             .allocate_zeroed(HostMemoryClass::InputPreprocess, latent_shape.byte_len())
             .map_err(|e| process(e.into()))?;
-        let mut noise = noise_stage.start(self, job, ComponentWeightSource::None)?;
+        let mut noise = self.start_stage(noise_stage, job, stages)?;
         for (index, request) in requests.iter().enumerate() {
             let state = match noise_state(&self.host, request.seed) {
                 Ok(state) => state,
@@ -450,7 +452,7 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
                 return Err(noise.processing(error));
             }
         }
-        stages.push(noise.close()?);
+        self.finish_stage(noise, stages)?;
         let batch_noise = ManagedHostTensor::new(
             id(NormalNoiseFamily::OUTPUT_ID).map_err(process)?,
             latent_shape
@@ -488,11 +490,7 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
             self.profiles.euler,
         )
         .map_err(|e| process(e.into()))?;
-        let mut denoiser = denoise_stage.start(
-            self,
-            job,
-            ComponentWeightSource::Stored(self.assets.sources.transformer.as_ref()),
-        )?;
+        let mut denoiser = self.start_stage(denoise_stage, job, stages)?;
         while let Some(step) = solver.current_step() {
             let time = match transformer.managed_time_features(&self.host, step.timestep().as_f32())
             {
@@ -524,7 +522,7 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
                 scheduler_timestep: step.timestep().as_f32(),
             });
         }
-        stages.push(denoiser.close()?);
+        self.finish_stage(denoiser, stages)?;
         drop((text_input, frequencies, solver));
 
         let normalized = QwenImage21ManagedLatents::new(

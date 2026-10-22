@@ -85,9 +85,20 @@ pub trait ImageGenerator: Send + 'static {
         &mut self,
         requests: Vec<ImageGenerationRequest>,
     ) -> Result<Vec<ImageGenerationOutput>, ImageBatchError>;
+    /// Explicitly retire retained sessions after normal worker shutdown.
+    /// Errors must retain original recovery owners. A fatal generation error
+    /// bypasses this hook so its recovery authority is not disturbed.
+    fn shutdown(&mut self) -> Result<(), GeneratorError> {
+        Ok(())
+    }
 }
 
 impl<R: DeviceRuntime> ImageGenerator for QwenImage21Pipeline<R> {
+    fn shutdown(&mut self) -> Result<(), GeneratorError> {
+        QwenImage21Pipeline::shutdown(self)
+            .map(|_| ())
+            .map_err(|error| Box::new(error) as GeneratorError)
+    }
     fn host_account(&self) -> &HostMemoryAccount {
         self.host_account()
     }
@@ -373,10 +384,16 @@ trait BatchWorker: Send + 'static {
         &mut self,
         requests: Vec<ImageGenerationRequest>,
     ) -> Result<Vec<Self::Output>, ImageBatchError>;
+    fn shutdown(&mut self) -> Result<(), GeneratorError> {
+        Ok(())
+    }
 }
 struct GeneratorAdapter<P>(P);
 impl<P: ImageGenerator> BatchWorker for GeneratorAdapter<P> {
     type Output = ImageGenerationOutput;
+    fn shutdown(&mut self) -> Result<(), GeneratorError> {
+        self.0.shutdown()
+    }
     fn compatible(&self, a: &ImageGenerationRequest, b: &ImageGenerationRequest) -> bool {
         self.0.compatible(a, b)
     }
@@ -743,10 +760,17 @@ fn worker_loop<O: Send + 'static>(
         }
         None
     }));
-    let failure = match run {
+    let mut failure = match run {
         Ok(failure) => failure,
         Err(panic) => Some(ImageWorkerFailure::Panic(panic)),
     };
+    if failure.is_none() {
+        failure = match catch_unwind(AssertUnwindSafe(|| worker.shutdown())) {
+            Ok(Ok(())) => None,
+            Ok(Err(error)) => Some(ImageWorkerFailure::Generation(error)),
+            Err(panic) => Some(ImageWorkerFailure::Panic(panic)),
+        };
+    }
     {
         let mut state = shared.lock();
         state.accepting = false;

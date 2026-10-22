@@ -7,6 +7,7 @@ mod fixture;
 mod ownership;
 mod plan_cache;
 mod preflight;
+mod residency;
 
 fn config() -> ImagePipelineConfig {
     ImagePipelineConfig {
@@ -17,6 +18,7 @@ fn config() -> ImagePipelineConfig {
         maximum_batch_size: ImagePipelineConfig::DEFAULT_MAXIMUM_BATCH_SIZE,
         decoder_batch_policy: ImageDecoderBatchPolicy::default(),
         plan_cache: ImagePlanCachePolicy::default(),
+        residency: ImageResidencyPolicy::default(),
         static_initialization: StaticInitializationPolicy::new(256, 8).unwrap(),
         executor: TensorExecutorConfig::default(),
     }

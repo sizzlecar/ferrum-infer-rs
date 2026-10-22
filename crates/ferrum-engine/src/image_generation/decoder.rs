@@ -4,7 +4,7 @@ use super::*;
 
 impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
     pub(super) fn decode_batch(
-        &self,
+        &mut self,
         stage: PreparedStage<R>,
         decoder: &QwenImage21VaeDecoderConfig,
         input: ManagedHostTensor,
@@ -29,11 +29,7 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
                 source,
                 active: None,
             })?;
-        let mut vae = stage.start(
-            self,
-            job,
-            ComponentWeightSource::Stored(self.assets.sources.vae.as_ref()),
-        )?;
+        let mut vae = self.start_stage(stage, job, stages)?;
         let mut images = Vec::with_capacity(request_batch);
         for input in inputs {
             let (active, outputs) = vae.execute(job, vec![input])?;
@@ -54,9 +50,8 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
                 return Err(vae.processing(source));
             }
         }
-        // A close error retains the original session/root; no later stage or
-        // successful image response is permitted until that close succeeds.
-        stages.push(vae.close()?);
+        // A close or idle-release failure retains the original session/root.
+        self.finish_stage(vae, stages)?;
         Ok(images)
     }
 }

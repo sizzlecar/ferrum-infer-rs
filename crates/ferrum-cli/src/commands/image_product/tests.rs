@@ -45,6 +45,7 @@ fn image_configuration_is_explicit_strict_and_resolves_from_its_directory() {
         ferrum_engine::image_generation::ImageDecoderBatchPolicy::SingleImage
     );
     assert_eq!(cuda.cudnn.library_path, base.join("lib/libcudnn.so.9"));
+    assert!(cuda.cudnn.dependency_libraries.is_empty());
     assert!(
         matches!(config.weights.vae, WeightSource::Single{directory,file}
         if directory == base.join("vae") && file == "diffusion.safetensors")
@@ -65,6 +66,34 @@ fn image_configuration_is_explicit_strict_and_resolves_from_its_directory() {
     let duplicate = format!("{{\"model\":\"duplicate\",{}", &original[1..]);
     assert!(serde_json::from_str::<ImageProductConfig>(&duplicate).is_err());
     fs::write(&path, b"[]").unwrap();
+    assert!(ImageProductConfig::load(&path).is_err());
+}
+
+#[test]
+fn explicit_cudnn_dependencies_keep_declared_order_without_loading_native_code() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("image.json");
+    let mut wire = configuration();
+    wire["backend"]["cudnn"]["dependency_libraries"] =
+        json!(["lib/libnvrtc.so.13", "lib/libnvJitLink.so.13"]);
+    fs::write(&path, serde_json::to_vec(&wire).unwrap()).unwrap();
+    let config = ImageProductConfig::load(&path).unwrap();
+    let ImageBackendConfig::Cuda(cuda) = config.backend;
+    let base = fs::canonicalize(directory.path()).unwrap();
+    assert_eq!(
+        cuda.cudnn.dependency_libraries,
+        vec![
+            base.join("lib/libnvrtc.so.13"),
+            base.join("lib/libnvJitLink.so.13")
+        ]
+    );
+    #[cfg(feature = "cuda")]
+    assert_eq!(
+        cuda.resolved().unwrap().cudnn.dependency_libraries,
+        cuda.cudnn.dependency_libraries
+    );
+    wire["backend"]["cudnn"]["dependency_libraries"] = json!(vec!["lib/missing.so"; 17]);
+    fs::write(&path, serde_json::to_vec(&wire).unwrap()).unwrap();
     assert!(ImageProductConfig::load(&path).is_err());
 }
 
@@ -203,6 +232,57 @@ fn decoder_batch_policy_is_explicit_independent_and_strict() {
     ] {
         wire["backend"]["pipeline"]["decoder_batch_policy"] = invalid;
         assert!(serde_json::from_value::<ImageProductConfig>(wire.clone()).is_err());
+    }
+}
+
+#[test]
+fn residency_is_explicit_and_shared_by_run_and_serve_configuration() {
+    use ferrum_engine::image_generation::ImageResidencyPolicy;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("image.json");
+    let load = |wire: &Value| {
+        fs::write(&path, serde_json::to_vec(wire).unwrap()).unwrap();
+        ImageProductConfig::load(&path)
+    };
+    let mut wire = configuration();
+    let ImageBackendConfig::Cuda(cuda) = load(&wire).unwrap().backend;
+    assert_eq!(
+        cuda.resolved_pipeline().unwrap().residency,
+        ImageResidencyPolicy::Cold
+    );
+    wire["backend"]["pipeline"]["residency"] = json!("denoiser_and_decoder");
+    assert!(load(&wire).is_err()); // A cold execution identity must remain truthful.
+    wire["execution_profile"] = json!("experimental_resident_v1");
+    for serving in [false, true] {
+        if serving {
+            wire["serving"] = json!({"maximum_pending":2,"maximum_prompt_bytes":4096,
+                "max_num_seqs":1,"request_batch_max_wait_ms":0,"default_width":512,
+                "default_height":512,"default_seed":0,"rgba_scratch_bytes":16384,"output":{}});
+        }
+        let config = load(&wire).unwrap();
+        assert_eq!(
+            config.execution_profile.as_str(),
+            "experimental_resident_v1"
+        );
+        let ImageBackendConfig::Cuda(cuda) = config.backend;
+        assert_eq!(
+            cuda.resolved_pipeline().unwrap().residency,
+            ImageResidencyPolicy::DenoiserAndDecoder
+        );
+        #[cfg(feature = "cuda")]
+        assert_eq!(
+            cuda.resolved().unwrap().pipeline.residency,
+            ImageResidencyPolicy::DenoiserAndDecoder
+        );
+    }
+    wire["backend"]["pipeline"]
+        .as_object_mut()
+        .unwrap()
+        .remove("residency");
+    assert!(load(&wire).is_err()); // Default cold cannot silently become resident.
+    for bad in [json!(null), json!(true), json!("all"), json!({"cold":{}})] {
+        wire["backend"]["pipeline"]["residency"] = bad;
+        assert!(load(&wire).is_err());
     }
 }
 

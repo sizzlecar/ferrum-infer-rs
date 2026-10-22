@@ -34,7 +34,7 @@ pub struct ImageStagePlanReceipt {
     pub minimum_step_bytes: u64,
     /// Host wall time for family identity and plan compilation; not GPU time.
     pub compile_wall_duration_us: u64,
-    /// Reused immutable compilation; initialization still provisions a new session.
+    /// Reused immutable compilation. Session reuse is reported separately.
     pub plan_cache_hit: bool,
 }
 
@@ -42,6 +42,9 @@ pub struct ImageStagePlanReceipt {
 pub struct ImageStageExecutionReceipt {
     pub plan: ImageStagePlanReceipt,
     pub initialization: ComponentInitializationReceipt,
+    /// The initialization receipt belongs to the retained session's original
+    /// initialization. When true, no initialization occurred for this batch.
+    pub session_reused: bool,
     pub completed_executions: usize,
     /// Host wall time around component initialization, including no-static setup.
     pub initialization_wall_duration_us: u64,
@@ -54,8 +57,19 @@ pub struct ImageStageExecutionReceipt {
 #[derive(Debug, Clone, Serialize)]
 pub struct ImageStageReceipt {
     pub execution: ImageStageExecutionReceipt,
-    pub close: PlanRuntimeCloseReceipt,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub close: Option<PlanRuntimeCloseReceipt>,
+    pub retirement: ImageStageRetirement,
     pub close_wall_duration_us: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ImageStageRetirement {
+    Closed,
+    Resident {
+        idle_release: DynamicPoolRebalanceReceipt,
+    },
 }
 
 /// Recovery owns the actual active session rather than a formatted diagnostic.
@@ -102,12 +116,31 @@ impl<R: DeviceRuntime> fmt::Display for ImageGenerationError<R> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match &self.failure {
             ImageGenerationFailure::Preflight(e) => write!(f, "image preflight: {e}"),
-            ImageGenerationFailure::Unavailable => f.write_str("image pipeline stopped after a stage failure; recover retained owners before replacing it"),
-            ImageGenerationFailure::Initialization { plan, source } => write!(f, "image {:?} initialization: {source}", plan.stage),
-            ImageGenerationFailure::Execution { source, active } => write!(f, "image {:?} execution: {source}", active.receipt.plan.stage),
-            ImageGenerationFailure::Processing { source, .. } => write!(f, "image processing: {source}"),
-            ImageGenerationFailure::CloseReferenced { receipt, .. } => write!(f, "image {:?} close still has live owners", receipt.plan.stage),
-            ImageGenerationFailure::Close { receipt, source } => write!(f, "image {:?} close: {:?}", receipt.plan.stage, source.failure()),
+            ImageGenerationFailure::Unavailable => f.write_str(
+                "image pipeline stopped; recover any retained failure owners before replacing it",
+            ),
+            ImageGenerationFailure::Initialization { plan, source } => {
+                write!(f, "image {:?} initialization: {source}", plan.stage)
+            }
+            ImageGenerationFailure::Execution { source, active } => write!(
+                f,
+                "image {:?} execution: {source}",
+                active.receipt.plan.stage
+            ),
+            ImageGenerationFailure::Processing { source, .. } => {
+                write!(f, "image processing: {source}")
+            }
+            ImageGenerationFailure::CloseReferenced { receipt, .. } => write!(
+                f,
+                "image {:?} close still has live owners",
+                receipt.plan.stage
+            ),
+            ImageGenerationFailure::Close { receipt, source } => write!(
+                f,
+                "image {:?} close: {:?}",
+                receipt.plan.stage,
+                source.failure()
+            ),
         }
     }
 }
@@ -216,6 +249,7 @@ impl<R: DeviceRuntime> PreparedStage<R> {
                 receipt: ImageStageExecutionReceipt {
                     plan,
                     initialization: session.initialization_receipt().clone(),
+                    session_reused: false,
                     completed_executions: 0,
                     initialization_wall_duration_us: elapsed_us(started),
                     execution_wall_durations_us: Vec::new(),
@@ -273,7 +307,8 @@ impl<R: DeviceRuntime> ActiveImageStage<R> {
         match session.close() {
             Ok(PlanRuntimeCloseOutcome::Closed(close)) => Ok(ImageStageReceipt {
                 execution: receipt,
-                close,
+                close: Some(close),
+                retirement: ImageStageRetirement::Closed,
                 close_wall_duration_us: elapsed_us(started),
             }),
             Ok(outcome @ PlanRuntimeCloseOutcome::Referenced { .. }) => {

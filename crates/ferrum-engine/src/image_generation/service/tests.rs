@@ -10,9 +10,18 @@ struct Fixture {
     panic: Option<Arc<AtomicUsize>>,
     wrong_count: bool,
     dropped: Arc<AtomicUsize>,
+    shutdown_calls: Arc<AtomicUsize>,
+    shutdown_failure: Option<Arc<AtomicUsize>>,
 }
 impl BatchWorker for Fixture {
     type Output = u64;
+    fn shutdown(&mut self) -> Result<(), GeneratorError> {
+        self.shutdown_calls.fetch_add(1, Ordering::SeqCst);
+        match self.shutdown_failure.take() {
+            Some(owner) => Err(Box::new(OriginalFailure(owner))),
+            None => Ok(()),
+        }
+    }
     fn compatible(&self, a: &ImageGenerationRequest, b: &ImageGenerationRequest) -> bool {
         // A typed-generator-specific key may further partition same-size jobs.
         a.prompt.starts_with('a') == b.prompt.starts_with('a')
@@ -74,6 +83,8 @@ fn fixture() -> Fixture {
         panic: None,
         wrong_count: false,
         dropped: Arc::new(AtomicUsize::new(0)),
+        shutdown_calls: Arc::new(AtomicUsize::new(0)),
+        shutdown_failure: None,
     }
 }
 fn request(seed: u64) -> ImageGenerationRequest {
@@ -112,10 +123,65 @@ fn release_retirement(mut retired: Retirement<u64>) {
 }
 
 #[tokio::test]
+async fn shutdown_failure_preserves_original_error_and_worker_owner() {
+    let mut f = fixture();
+    let error_dropped = Arc::new(AtomicUsize::new(0));
+    f.shutdown_failure = Some(error_dropped.clone());
+    let worker_dropped = f.dropped.clone();
+    let calls = f.shutdown_calls.clone();
+    let service = start(f, config(1, 0, 1));
+    assert_eq!(
+        service
+            .try_submit(request(7))
+            .unwrap()
+            .wait()
+            .await
+            .unwrap(),
+        7
+    );
+    let retired = service.shutdown().await.unwrap();
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    let Some(ImageWorkerFailure::Generation(error)) = &retired.failure else {
+        panic!("original shutdown failure")
+    };
+    assert!(error.downcast_ref::<OriginalFailure>().is_some());
+    assert_eq!(error_dropped.load(Ordering::SeqCst), 0);
+    assert_eq!(worker_dropped.load(Ordering::SeqCst), 0);
+    release_retirement(retired);
+    assert_eq!(error_dropped.load(Ordering::SeqCst), 1);
+    assert_eq!(worker_dropped.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn fatal_generation_does_not_invoke_shutdown_on_unrecovered_native_owners() {
+    let mut f = fixture();
+    let owner = Arc::new(AtomicUsize::new(0));
+    f.fail = Some(owner.clone());
+    let calls = f.shutdown_calls.clone();
+    let service = start(f, config(1, 0, 1));
+    assert!(service
+        .try_submit(request(3))
+        .unwrap()
+        .wait()
+        .await
+        .is_err());
+    let retired = service.shutdown().await.unwrap();
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    assert_eq!(owner.load(Ordering::SeqCst), 0);
+    let Some(ImageWorkerFailure::Generation(error)) = &retired.failure else {
+        panic!("original execution failure")
+    };
+    assert!(error.downcast_ref::<OriginalFailure>().is_some());
+    release_retirement(retired);
+    assert_eq!(owner.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
 async fn compatible_requests_are_one_actual_batch_with_ordered_independent_results() {
     let f = fixture();
     let calls = f.calls.clone();
     let dropped = f.dropped.clone();
+    let shutdown_calls = f.shutdown_calls.clone();
     let service = start(f, config(2, 30_000, 2));
     let first = service.try_submit(request(11)).unwrap();
     let second = service.try_submit(request(29)).unwrap();
@@ -124,6 +190,7 @@ async fn compatible_requests_are_one_actual_batch_with_ordered_independent_resul
     assert_eq!(*calls.lock().unwrap(), vec![vec![11, 29]]);
     let retired = service.shutdown().await.unwrap();
     assert!(retired.failure.is_none());
+    assert_eq!(shutdown_calls.load(Ordering::SeqCst), 1);
     drop(retired);
     assert_eq!(dropped.load(Ordering::SeqCst), 1);
 }

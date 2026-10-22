@@ -50,6 +50,7 @@ pub struct ImageCudaPipelineLimits {
     pub maximum_batch_size: usize,
     pub decoder_batch_policy: super::ImageDecoderBatchPolicy,
     pub plan_cache: super::ImagePlanCachePolicy,
+    pub residency: super::ImageResidencyPolicy,
     pub static_initialization: StaticInitializationPolicy,
     pub executor: ferrum_execution::TensorExecutorConfig,
 }
@@ -78,6 +79,7 @@ impl ImageCudaPipelineLimits {
             maximum_batch_size: self.maximum_batch_size,
             decoder_batch_policy: self.decoder_batch_policy,
             plan_cache: self.plan_cache,
+            residency: self.residency,
             static_initialization: self.static_initialization,
             executor: self.executor,
         }
@@ -494,6 +496,7 @@ mod tests {
             attention_policy: ImageCudaAttentionPolicy::Sequential,
             cudnn: CudaCudnnConfig {
                 library_path: "/explicit/libcudnn.so.9".into(),
+                dependency_libraries: Vec::new(),
                 opaque_memory_bytes: 4096,
                 workspace_limit_bytes: 0,
                 opaque_memory_profile: "experimental-cudnn-test-v1".into(),
@@ -515,6 +518,7 @@ mod tests {
                 maximum_batch_size: ImagePipelineConfig::DEFAULT_MAXIMUM_BATCH_SIZE,
                 decoder_batch_policy: crate::image_generation::ImageDecoderBatchPolicy::default(),
                 plan_cache: crate::image_generation::ImagePlanCachePolicy::default(),
+                residency: crate::image_generation::ImageResidencyPolicy::default(),
                 static_initialization: StaticInitializationPolicy::new(1024, 32).unwrap(),
                 executor: TensorExecutorConfig::default(),
             },

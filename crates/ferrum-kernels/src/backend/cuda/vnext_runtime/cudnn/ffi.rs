@@ -97,15 +97,24 @@ pub(super) struct Api {
     // Symbols are copied only while this library is retained. It must outlive
     // every native handle and all submitted commands using these functions.
     _library: Library,
+    // Field drop order releases cuDNN before its explicitly loaded dependencies
+    // (stored in reverse loading order).
+    // Every SDPA plan/execution retains this Api through its native owner.
+    _dependencies: Vec<Library>,
 }
 
 impl Api {
     /// Loading native code is permitted only after the caller reserves its
     /// opaque capacity. The supplied deployment library is trusted and immutable.
-    pub(super) unsafe fn load(path: &Path) -> Result<Self, String> {
+    pub(super) unsafe fn load(
+        path: &Path,
+        selected_dependencies: &super::dependencies::Selection,
+    ) -> Result<Self, String> {
         // After successful dlopen, a missing symbol/panic does not certify
         // native-initializer cleanup. Preserve the library with the caller's
         // fail-closed capacity/context retention on those paths.
+        let mut dependencies =
+            std::mem::ManuallyDrop::new(unsafe { selected_dependencies.load() }?);
         let mut library = std::mem::ManuallyDrop::new(
             unsafe { Library::new(path) }.map_err(|e| format!("cuDNN library load: {e}"))?,
         );
@@ -143,6 +152,7 @@ impl Api {
             workspace: symbol!("cudnnGetConvolutionForwardWorkspaceSize"),
             forward: symbol!("cudnnConvolutionForward"),
             _library: unsafe { std::mem::ManuallyDrop::take(&mut library) },
+            _dependencies: unsafe { std::mem::ManuallyDrop::take(&mut dependencies) },
         })
     }
 }

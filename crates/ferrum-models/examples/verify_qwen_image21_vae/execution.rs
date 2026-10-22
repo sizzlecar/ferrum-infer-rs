@@ -76,6 +76,7 @@ pub fn run(
                 let declared = args.cudnn.as_ref().context("missing typed cuDNN options")?;
                 let cudnn = CudaCudnnConfig {
                     library_path: declared.library.clone(),
+                    dependency_libraries: Vec::new(),
                     opaque_memory_bytes: declared.opaque_memory_bytes,
                     workspace_limit_bytes: declared.workspace_bytes,
                     opaque_memory_profile: declared.memory_profile.clone(),

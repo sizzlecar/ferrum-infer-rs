@@ -25,9 +25,13 @@ fn cuda_config() -> (CudaCudnnConfig, CudnnSdpaPlanPolicy) {
             "set FERRUM_TEST_CUDNN_LIBRARY_PATH to an explicit absolute cuDNN 9.20 library path",
         );
     assert!(library_path.is_absolute());
+    let dependency_libraries = std::env::var_os("FERRUM_TEST_CUDNN_DEPENDENCY_LIBRARIES")
+        .map(|paths| std::env::split_paths(&paths).collect())
+        .unwrap_or_default();
     (
         CudaCudnnConfig {
             library_path,
+            dependency_libraries,
             opaque_memory_bytes: 64 << 20,
             workspace_limit_bytes: WORKSPACE_LIMIT,
             opaque_memory_profile: "experimental-fused-attention-test-v1".into(),

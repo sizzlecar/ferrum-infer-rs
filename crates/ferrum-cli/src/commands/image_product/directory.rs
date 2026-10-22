@@ -109,6 +109,7 @@ impl DirectoryOptions {
             decoder_batch_policy:
                 ferrum_engine::image_generation::ImageDecoderBatchPolicy::SingleImage,
             plan_cache: ferrum_engine::image_generation::ImagePlanCachePolicy::LastPerStage,
+            residency: ferrum_engine::image_generation::ImageResidencyPolicy::Cold,
             maximum_staging_bytes: 16 * MIB,
             maximum_initialization_commands: 64,
             maximum_backing_maintenance_passes: 8,
@@ -136,6 +137,7 @@ impl DirectoryOptions {
             attention_policy: ferrum_engine::image_generation::ImageCudaAttentionPolicy::Sequential,
             cudnn: ferrum_kernels::backend::cuda::CudaCudnnConfig {
                 library_path: super::library::resolve(self.cudnn_library.as_deref())?,
+                dependency_libraries: Vec::new(),
                 opaque_memory_bytes: 64 * MIB,
                 workspace_limit_bytes: 16 * MIB,
                 opaque_memory_profile: "experimental-unqualified-cudnn-v1".into(),

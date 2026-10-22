@@ -77,7 +77,8 @@ pub fn execute_run_source(
         let mut pipeline = Box::new(pipeline);
         tracing::warn!(
             profile = product.profile,
-            "image run reloads component weights; no throughput qualification"
+            residency = ?pipeline.residency_policy(),
+            "experimental image run; no throughput qualification"
         );
         let output = match pipeline.generate(ImageGenerationRequest {
             prompt,
@@ -87,6 +88,12 @@ pub fn execute_run_source(
             n: 1,
         }) {
             Ok(output) => output,
+            Err(source) => return Err(ImageProductError::Generation { source, pipeline }),
+        };
+        // Close native sessions before fallible output encoding. The returned
+        // image keeps its independent managed Host backing after device close.
+        let shutdown = match pipeline.shutdown() {
+            Ok(receipts) => receipts,
             Err(source) => return Err(ImageProductError::Generation { source, pipeline }),
         };
         // The model adapter checks every pixel is finite before touching a sink.
@@ -126,6 +133,7 @@ pub fn execute_run_source(
                 "png": {"width": png.dimensions().width(), "height": png.dimensions().height(),
                     "encoded_bytes": png.encoded_bytes(), "color_type": "rgba8"},
                 "generation": output.receipt,
+                "shutdown": shutdown,
             }))
             .map_err(anyhow::Error::from)?
         );

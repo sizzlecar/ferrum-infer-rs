@@ -67,6 +67,7 @@ fn stage_execution_failure_keeps_real_stored_resources_until_explicit_recovery_c
         .unwrap();
     let active = ActiveImageStage {
         receipt: ImageStageExecutionReceipt {
+            session_reused: false,
             plan,
             initialization: session.initialization_receipt().clone(),
             completed_executions: 0,
@@ -94,7 +95,7 @@ fn stage_execution_failure_keeps_real_stored_resources_until_explicit_recovery_c
     // Retain the error and actual session until the caller chooses recovery.
     drop(source);
     match active.close() {
-        Ok(receipt) => assert_eq!(receipt.close.released_static_resources(), 1),
+        Ok(receipt) => assert_eq!(receipt.close.unwrap().released_static_resources(), 1),
         Err(_) => panic!("pre-submission failure must permit explicit close"),
     }
     assert_eq!(composition.runtime().snapshot().live_allocations, 0);

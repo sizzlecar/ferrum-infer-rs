@@ -577,6 +577,7 @@ fn managed_cuda_implicit_and_explicit_symmetric_padding_use_declared_scratch() {
     assert!(library_path.is_absolute());
     let config = CudaCudnnConfig {
         library_path,
+        dependency_libraries: Vec::new(),
         opaque_memory_bytes: 64 << 20,
         workspace_limit_bytes: WORKSPACE_BYTES,
         opaque_memory_profile: "experimental-unqualified-spatial-decoder-test-v1".into(),
