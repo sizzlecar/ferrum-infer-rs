@@ -77,3 +77,20 @@ A fatal generation error bypasses the hook: the original error plus pipeline
 remain available for recovery instead of closing around unrecovered work.
 Idle-release, execution and close failures stop successful response processing;
 they do not publish a fake closed receipt or silently retry another policy.
+
+The CUDA configuration accepts `backend.cudnn.dependency_libraries`, an ordered
+list of up to 16 absolute native library file paths. Empty preserves the system
+loader behavior. On Linux GNU, an explicit entry is loaded before cuDNN and
+checked against the actual mapped path and SONAME resolution. File contents,
+canonical paths and order enter the provider identity. The selected deployment
+files must remain immutable for the runtime's lifetime.
+
+Declare compiler dependencies as well as the compiler library when required by
+the selected cuDNN installation. For example, the tested CUDA 13 installation
+needed `libnvrtc-builtins.so.13.0`, `libnvJitLink.so.13`, and `libnvrtc.so.13`, in
+that order, as absolute files from the same installation. Selecting only the
+last two loaded successfully but left cuDNN JIT compilation failing. This list
+is deployment-specific; it is not an automatic search path or a claim to pin
+every transitive dependency. No environment variable is changed by the loader.
+Native owners retain these libraries under the declared cuDNN opaque allowance;
+that allowance is not a measurement of the native library's peak memory usage.

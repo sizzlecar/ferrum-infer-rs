@@ -163,7 +163,7 @@ impl ImageHttpService {
     pub(super) fn health(&self) -> serde_json::Value {
         serde_json::json!({
             "model":self.model_name(), "ready":self.service.is_accepting(),
-            "profile":"experimental_cold_functional",
+            "profile":"experimental_functional",
             "qualification":"functional pipeline only; not G3 or measured throughput",
             "scheduler":self.service.snapshot(),
             "output":{
@@ -260,6 +260,12 @@ fn parse_size(size: &str) -> Result<(u32, u32), ServerError> {
 }
 
 fn service_error(error: ImageServiceError) -> ServerError {
+    if matches!(
+        error.kind(),
+        ImageServiceErrorKind::Generation | ImageServiceErrorKind::WorkerPanic
+    ) {
+        tracing::error!(error = %error, "image generation failed");
+    }
     match error.kind() {
         ImageServiceErrorKind::InvalidRequest => {
             ServerError::invalid_request(error.to_string(), None)
