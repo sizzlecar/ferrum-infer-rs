@@ -44,6 +44,7 @@ fn complete(
 
 fn trajectory(requests: Vec<SimulatedRequest>, target_ms: u64) -> TrajectoryResult {
     TrajectoryResult {
+        bounded_timing: None,
         window_progress: requests.iter().map(SimulatedRequest::progress).collect(),
         requests,
         target_reached_at: Duration::from_millis(target_ms),

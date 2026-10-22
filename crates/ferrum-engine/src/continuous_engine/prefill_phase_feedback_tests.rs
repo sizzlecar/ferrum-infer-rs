@@ -280,8 +280,10 @@ struct EngineFixture {
     requests: Arc<ObserveRequests>,
 }
 
-fn engine_fixture(availability: Availability) -> EngineFixture {
+fn engine_fixture(availability: Availability, trace_path: PathBuf) -> EngineFixture {
     let mut config = EngineConfig::default();
+    config.runtime.scheduler_trace_jsonl = Some(trace_path);
+    config.runtime.profile_entrypoint = Some(ProfileEntrypoint::Serve);
     config.backend.device = Device::CPU;
     config.scheduler.max_running_requests = 2;
     config.scheduler.prefill_step_chunk = Some(4);
@@ -361,13 +363,15 @@ fn engine_fixture(availability: Availability) -> EngineFixture {
 
 #[tokio::test(flavor = "current_thread")]
 async fn joint_prefill_phase_engine_keeps_actual_ranges_after_snapshot_becomes_stale() {
+    let trace = tempfile::tempdir().unwrap();
+    let trace_path = trace.path().join("iterations.jsonl");
     let EngineFixture {
         engine,
         tokenizer,
         source,
         attempts,
         requests,
-    } = engine_fixture(Availability::Cold);
+    } = engine_fixture(Availability::Cold, trace_path.clone());
     let mut decoder = submit(&engine, 1).await;
     step(&engine, &mut [&mut decoder]).await;
     assert_eq!(decoder.tokens.len(), 1);
@@ -436,4 +440,46 @@ async fn joint_prefill_phase_engine_keeps_actual_ranges_after_snapshot_becomes_s
     assert!(engine.active_inner().unwrap().sequences.is_empty());
     engine.shutdown().await.unwrap();
     engine.wait_for_shutdown_completion().await.unwrap();
+    let events = read_engine_profile_events(&trace_path);
+    let selected_iteration = events
+        .iter()
+        .find(|event| {
+            event.phase == "scheduler.iteration"
+                && event.attributes["slo_planning"]["statistics"]
+                    ["joint_prefill_phase_interventions"]
+                    == 1
+        })
+        .expect("the applied phase and actual selected range share one iteration");
+    assert_eq!(selected_iteration.attributes["result"], "some_ok");
+    let planning = &selected_iteration.attributes["slo_planning"];
+    assert_eq!(planning["snapshot_revision"], 2);
+    assert!(planning["query_count"].as_u64().unwrap() > 0);
+    assert!(planning["prediction_elapsed_us"].is_u64());
+    let row = selected_iteration.attributes["plan"]["requests"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["request_id"] == prefill.id.to_string())
+        .unwrap();
+    assert_eq!(row["phase"], "Prefilling");
+    assert_eq!(
+        row["scheduled_range"],
+        serde_json::json!({"start": 4, "end": 5})
+    );
+    assert_eq!(row["execution_frontier_before"], 4);
+    assert_eq!(
+        selected_iteration.attributes["engine_counters"]["prefill_tokens_delta"],
+        1
+    );
+    let applied_total: u64 = events
+        .iter()
+        .filter(|event| event.phase == "scheduler.iteration")
+        .filter_map(|event| {
+            event.attributes["slo_planning"]["statistics"]["joint_interventions"].as_u64()
+        })
+        .sum();
+    assert_eq!(
+        applied_total,
+        final_stats["joint_interventions"].as_u64().unwrap()
+    );
 }

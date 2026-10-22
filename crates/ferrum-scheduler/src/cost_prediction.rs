@@ -363,7 +363,28 @@ pub struct TimePlanningRound {
     persistent_capacity: Option<ferrum_execution::model_executor::PersistentCohortCapacitySnapshot>,
 }
 
+/// Borrowed, read-only diagnostics for one Engine planning turn. Constructing
+/// this projection does not query the provider or grant scheduling authority.
+#[derive(serde::Serialize)]
+pub struct TimePlanningDiagnostics<'a> {
+    snapshot_revision: Option<u64>,
+    query_count: usize,
+    query_budget_exhausted: bool,
+    prediction_elapsed_us: u64,
+    statistics: &'a PlanningStatistics,
+}
+
 impl TimePlanningRound {
+    pub fn diagnostics(&self) -> TimePlanningDiagnostics<'_> {
+        TimePlanningDiagnostics {
+            snapshot_revision: self.diagnostic_revision,
+            query_count: self.query_count,
+            query_budget_exhausted: self.query_budget_exhausted,
+            prediction_elapsed_us: self.prediction_elapsed.as_micros().min(u64::MAX as u128) as u64,
+            statistics: &self.statistics,
+        }
+    }
+
     pub fn new(
         snapshot: Arc<dyn CostSnapshot>,
         config: SchedulerSloConfig,

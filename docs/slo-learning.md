@@ -94,8 +94,20 @@ and is ineligible when static would advance prefill. The strategy never
 silently expands the configured horizon to make an action eligible.
 
 The ranking uses equally weighted, SLO-normalized local delay/debt proxies for
-TTFT, TPOT and ITL, over the same request cohort. It retains waiting requests,
-unfinished work and open text intervals. Historical violations are not erased.
+generated service opportunities, over the same request cohort. A generated
+token may produce no text. Bounded trajectories therefore keep the observed
+text clock unchanged and advance a separate service-opportunity clock; a
+forecast token never increments the observed event count or clears a text
+stall. Legal histories with different token and text-event counts, including
+generated tokens before any text, can participate. The observation boundary is
+the engine output channel, before server protocol projection and transport;
+client-visible SSE timing still requires end-to-end measurement.
+
+The comparison retains waiting requests and unfinished work. Observed open
+TTFT/text-gap exposure is reported separately at the larger of the static and
+candidate durations, without inventing future text updates or adding another
+scoring weight. Future visible timing remains unknown even at the token cap.
+Historical violations are not erased.
 Prefill service-rate extrapolation is a ranking heuristic, not a physical time
 bound. When both plans leave a waiter without service or first text, a shorter
 candidate observation earns no waiting-time improvement: its exposure score
@@ -124,6 +136,14 @@ selected and applied actions, retained static actions, unknown comparisons and
 invalidated applications separately. The scores are local ranking proxies,
 not violation probabilities or client SLO verdicts. Full-trajectory `joint`
 remains the default during validation of this new strategy.
+
+The shared engine also writes `scheduler.iteration` events when
+`--scheduler-trace-jsonl` is enabled. These link the iteration and batch IDs to
+the final scheduled request ranges, that planning round's statistics and
+prediction time, and the engine process result and host duration. Scheduled
+ranges are not proof of successful device work: request failure/close events
+and committed-token deltas must be checked separately. These records support
+execution diagnosis; client timestamps remain the latency measurement.
 
 Defaults bound resource use. They do not specify the experiment's sample size,
 acceptable regression, or confidence level. Models publish only after disjoint

@@ -1,4 +1,6 @@
 use super::*;
+#[path = "bounded_rounds/clock_semantics.rs"]
+mod clock_semantics;
 use ferrum_execution::{execution_attempt::AttemptPrefixRestore, token_execution::ExecutionRange};
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
@@ -316,7 +318,14 @@ fn bounded_rounds_do_not_grow_with_prompt_or_output_endpoint() {
             assert_eq!(result.requests[0].central_clock, requests[0].central_clock);
         } else {
             assert_eq!(result.requests[0].output_tokens, 4);
-            assert_eq!(result.requests[0].central_clock.interval_count, 3);
+            assert_eq!(result.requests[0].central_clock, requests[0].central_clock);
+            assert_eq!(
+                result.bounded_timing.as_ref().unwrap().requests[0]
+                    .central
+                    .projection
+                    .interval_count,
+                3
+            );
             assert_eq!(result.requests[0].central_clock.completed, None);
         }
     }
@@ -409,14 +418,28 @@ fn bounded_rounds_count_whole_split_waves_and_keep_waiters_and_clocks() {
     assert_eq!(result.requests[0].prefill_tokens, 16);
     assert_eq!(result.requests[1].output_tokens, 3);
     assert_eq!(
-        result.requests[1].central_clock.last_output,
+        result.bounded_timing.as_ref().unwrap().requests[1]
+            .central
+            .projection
+            .last_output,
         Some(Duration::from_millis(9))
     );
     assert_eq!(
-        result.requests[1].risk_clock.last_output,
+        result.bounded_timing.as_ref().unwrap().requests[1]
+            .risk
+            .projection
+            .last_output,
         Some(Duration::from_millis(13))
     );
-    assert_eq!(result.requests[1].central_clock.interval_count, 2);
+    assert_eq!(result.requests[1].central_clock, requests[1].central_clock);
+    assert_eq!(result.requests[1].risk_clock, requests[1].risk_clock);
+    assert_eq!(
+        result.bounded_timing.as_ref().unwrap().requests[1]
+            .central
+            .projection
+            .interval_count,
+        2
+    );
     let waiting = &result.requests[2];
     assert_eq!(waiting.id, requests[2].id);
     assert_eq!(waiting.progress(), requests[2].progress());
@@ -466,12 +489,19 @@ fn bounded_rounds_stop_early_at_declared_endpoints_and_keep_query_guards() {
     .unwrap();
     let result = comparison.static_result.complete().unwrap();
     assert_eq!(snapshot.call_count(), 2);
-    assert!(result.has_completed_endpoints());
+    assert!(
+        !result.has_completed_endpoints(),
+        "a reached generated cap is not an observed text completion"
+    );
     assert_eq!(result.requests[0].output_tokens, 3);
     assert_eq!(
-        result.requests[0].central_clock.completed,
+        result.bounded_timing.as_ref().unwrap().requests[0]
+            .central
+            .projection
+            .completed,
         Some(Duration::from_millis(7))
     );
+    assert_eq!(result.requests[0].central_clock, requests[0].central_clock);
 
     let requests = [decode(64)];
     let snapshot = Snapshot::new();

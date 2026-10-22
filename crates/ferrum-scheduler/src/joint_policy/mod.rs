@@ -12,7 +12,7 @@ mod risk;
 mod scenarios;
 pub use admission::*;
 pub use aggregation::*;
-pub use bounded::{BoundedAccumulator, BoundedDecision};
+pub use bounded::{BoundedAccumulator, BoundedDecision, BoundedTiming, ServiceOpportunityClock};
 pub use decision_observation::*;
 pub use diagnostics::*;
 use groups::GroupView;
@@ -162,6 +162,41 @@ impl SimulatedRequest {
                         || (clock.first_output.is_some() && clock.last_output.is_some()))
             })
     }
+
+    /// Bounded control observes text independently of generated token progress.
+    /// An empty decoded piece may leave no text even after several tokens;
+    /// terminal projection may also publish several text spans for one token.
+    fn valid_bounded(&self) -> bool {
+        self.prompt_tokens > 0
+            && self.prefill_tokens <= self.prompt_tokens
+            && self.scenario_end_tokens > 0
+            && self.scenario_end_tokens <= self.output_cap
+            && self.output_tokens <= self.scenario_end_tokens
+            && (self.output_tokens == 0 || self.prefill_tokens == self.prompt_tokens)
+            && [self.central_clock, self.risk_clock].iter().all(|clock| {
+                let ordered = match (clock.first_output, clock.last_output) {
+                    (None, None) => {
+                        clock.interval_count == 0
+                            && clock.violating_interval_count == 0
+                            && clock.maximum_output_interval.is_zero()
+                    }
+                    (Some(first), Some(last)) => {
+                        first <= last
+                            && last <= self.age
+                            && clock.maximum_output_interval <= last - first
+                            && (clock.interval_count > 0 || first == last)
+                    }
+                    _ => false,
+                };
+                ordered
+                    && clock.violating_interval_count <= clock.interval_count
+                    && clock.completed.is_none_or(|at| {
+                        self.finished()
+                            && at <= self.age
+                            && clock.last_output.is_none_or(|last| last <= at)
+                    })
+            })
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -283,6 +318,9 @@ pub struct TrajectoryResult {
     pub risk_elapsed: Duration,
     pub queries: usize,
     pub cost_risk: CostRiskBudget,
+    /// Present only for BoundedRounds. Request clocks remain the immutable
+    /// observed text history; generated service opportunities live here.
+    pub bounded_timing: Option<BoundedTiming>,
 }
 
 /// Union accounting for the invocation risk costs used by this trajectory.
@@ -449,10 +487,13 @@ impl SloPolicy {
             input.horizon,
             EvaluationHorizon::StaticRounds(0) | EvaluationHorizon::BoundedRounds(0)
         ) || input.requests.iter().enumerate().any(|(index, request)| {
-            !request.valid()
-                || input.requests[..index]
-                    .iter()
-                    .any(|prior| prior.id == request.id)
+            !(if matches!(input.horizon, EvaluationHorizon::BoundedRounds(_)) {
+                request.valid_bounded()
+            } else {
+                request.valid()
+            }) || input.requests[..index]
+                .iter()
+                .any(|prior| prior.id == request.id)
         }) {
             return Err(Unsupported::InvalidState);
         }
@@ -665,6 +706,22 @@ fn simulate_recorded<Action, Adapter: TrajectoryAdapter<Action>>(
     candidate: usize,
     mut trace: Option<&mut scenarios::TraceEvaluation<'_, '_>>,
 ) -> Result<StaticTrajectory, Unsupported> {
+    // All successful alternatives coexist with static until the comparison is
+    // visited. Reserve their complete timing payload against the original
+    // participant/fact limit, rather than checking each Vec in isolation.
+    let mut bounded_timing = if matches!(input.horizon, EvaluationHorizon::BoundedRounds(_)) {
+        let bytes = BoundedTiming::retained_bytes_bound(
+            input.requests.len(),
+            input.alternatives.len().saturating_add(1),
+        )
+        .ok_or(Unsupported::ParticipantBudget)?;
+        if bytes > input.config.planning.max_request_fact_bytes {
+            return Err(Unsupported::ParticipantBudget);
+        }
+        Some(BoundedTiming::new(input.requests)?)
+    } else {
+        None
+    };
     let mut requests = input.requests.to_vec();
     let mut clock_coupling = ClockCoupling::for_requests(&requests);
     let mut central = Duration::ZERO;
@@ -924,14 +981,26 @@ fn simulate_recorded<Action, Adapter: TrajectoryAdapter<Action>>(
                 .ok_or(Unsupported::Arithmetic)?;
             clock_coupling.observe_elapsed(central, risk);
             for member in group.iter() {
-                apply_member(
-                    &mut requests[member.request],
-                    member.work,
-                    central,
-                    risk,
-                    itl_limit,
-                    clock_coupling,
-                )?;
+                if let Some(timing) = bounded_timing.as_mut() {
+                    timing.apply_member(
+                        member.request,
+                        &mut requests[member.request],
+                        member.work,
+                        central,
+                        risk,
+                        itl_limit,
+                        clock_coupling,
+                    )?;
+                } else {
+                    apply_member(
+                        &mut requests[member.request],
+                        member.work,
+                        central,
+                        risk,
+                        itl_limit,
+                        clock_coupling,
+                    )?;
+                }
                 if reuse_active_mask && requests[member.request].finished() {
                     // Refresh only at the next wave boundary. A split group's
                     // completion cannot admit a waiter into this same wave.
@@ -980,6 +1049,7 @@ fn simulate_recorded<Action, Adapter: TrajectoryAdapter<Action>>(
                         risk_elapsed: risk,
                         queries: budget.queries - query_start,
                         cost_risk,
+                        bounded_timing,
                     }));
                 }
             }
@@ -1021,6 +1091,7 @@ fn simulate_recorded<Action, Adapter: TrajectoryAdapter<Action>>(
                 risk_elapsed: risk,
                 queries: budget.queries - query_start,
                 cost_risk,
+                bounded_timing,
             }));
         }
         if requests.iter().all(SimulatedRequest::finished) {
@@ -1041,6 +1112,7 @@ fn simulate_recorded<Action, Adapter: TrajectoryAdapter<Action>>(
                         risk_elapsed: risk,
                         queries: budget.queries - query_start,
                         cost_risk,
+                        bounded_timing,
                     }));
                 }
             }

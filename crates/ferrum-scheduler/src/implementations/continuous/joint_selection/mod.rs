@@ -942,14 +942,17 @@ impl ContinuousBatchScheduler {
                 || clock.captured_at > now
                 || clock.itl_threshold
                     != Duration::try_from_secs_f64(round.config.itl_ms / 1000.0).ok()
-                || (fact.generated_tokens > 0 && clock.first_text.is_none())
+                || (round.config.strategy != ferrum_types::SloStrategy::Bounded
+                    && fact.generated_tokens > 0
+                    && clock.first_text.is_none())
             {
                 return Err(Unsupported::InvalidClock);
             }
             if !clock.streaming {
                 return Err(Unsupported::NonStreamingClock);
             }
-            if fact.generated_tokens > 0
+            if round.config.strategy != ferrum_types::SloStrategy::Bounded
+                && fact.generated_tokens > 0
                 && clock.nonempty_text_events != fact.generated_tokens as u64
             {
                 return Err(Unsupported::HistoricalTextCoalescing);

@@ -1,7 +1,7 @@
 //! Receding finite-event control. The result is a local ranking proxy, never
 //! a complete-request feasibility certificate or authority to reject admission.
 use super::*;
-use crate::joint_policy::BoundedAccumulator;
+use crate::joint_policy::{BoundedAccumulator, BoundedTiming};
 
 impl ContinuousBatchScheduler {
     pub(super) fn select_bounded_first_wave(
@@ -108,6 +108,13 @@ impl ContinuousBatchScheduler {
             .and_then(|bytes| {
                 BoundedAccumulator::retained_bytes_bound(alternatives.len())
                     .and_then(|aggregate| bytes.checked_add(aggregate))
+            })
+            .and_then(|bytes| {
+                BoundedTiming::retained_bytes_bound(
+                    cohort.requests.len(),
+                    alternatives.len().checked_add(1)?,
+                )
+                .and_then(|timing| bytes.checked_add(timing))
             })
             .ok_or(Unsupported::ParticipantBudget)?;
         if retained_bytes > round.config.planning.max_request_fact_bytes {

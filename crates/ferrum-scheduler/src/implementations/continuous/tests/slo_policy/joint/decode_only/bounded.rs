@@ -16,6 +16,73 @@ fn cost_calls(source: &MixedCost) -> usize {
 }
 
 #[test]
+fn bounded_actual_selection_accepts_text_history_independently_of_generated_count() {
+    for events in [0, 1, 3] {
+        let (scheduler, mut round, _, decoder, now) =
+            fixture(CostExecution::SequentialPrefillThenDecode, false, false);
+        round.config.strategy = ferrum_types::SloStrategy::Bounded;
+        round.config.planning.max_elapsed_us = 1_000_000;
+        let mut clocks = round.request_clocks().unwrap().to_vec();
+        let clock = &mut clocks.iter_mut().find(|(id, _)| *id == decoder).unwrap().1;
+        assert_eq!(clock.generated_tokens, 2);
+        clock.nonempty_text_events = events;
+        clock.first_text = (events > 0).then_some(Duration::from_millis(5));
+        clock.last_text = match events {
+            0 => None,
+            1 => clock.first_text,
+            _ => Some(Duration::from_millis(10)),
+        };
+        clock.max_text_interval = (events > 1).then_some(Duration::from_millis(3));
+        let original = *clock;
+        assert!(round.set_request_clocks(clocks));
+        let batch = next(&scheduler, &mut round, now);
+        assert!(!batch.is_empty());
+        assert_eq!(round.statistics.bounded.comparisons, 1);
+        assert_eq!(round.statistics.bounded.evaluated, 1);
+        assert_eq!(round.statistics.bounded.unknown, 0);
+        let reasons = serde_json::to_value(round.statistics.joint_unsupported).unwrap();
+        assert_eq!(reasons["historical_text_coalescing"], 0);
+        assert_eq!(reasons["invalid_clock"], 0);
+        assert_eq!(
+            round
+                .request_clocks()
+                .unwrap()
+                .iter()
+                .find(|(id, _)| *id == decoder)
+                .unwrap()
+                .1,
+            original
+        );
+        assert!(round.query_count > 0);
+    }
+}
+
+#[test]
+fn bounded_nonstreaming_clock_remains_unknown_without_inventing_visible_history() {
+    let mut fixture = bounded_fixture(CostExecution::SingleInvocation, Blocker::None);
+    let mut clocks = fixture.round.request_clocks().unwrap().to_vec();
+    let clock = &mut clocks
+        .iter_mut()
+        .find(|(id, _)| Some(id) == fixture.decoder.as_ref())
+        .unwrap()
+        .1;
+    clock.streaming = false;
+    clock.nonempty_text_events = 0;
+    clock.first_text = None;
+    clock.last_text = None;
+    assert!(fixture.round.set_request_clocks(clocks));
+    let (batch, round) = observed_selection(&fixture.scheduler, fixture.round);
+    assert_eq!(batch.size(), 2);
+    assert_eq!(round.statistics.bounded.evaluated, 0);
+    assert_eq!(round.statistics.bounded.applied, 0);
+    assert_eq!(round.query_count, 0);
+    assert_eq!(
+        serde_json::to_value(round.statistics.joint_unsupported).unwrap()["non_streaming_clock"],
+        1
+    );
+}
+
+#[test]
 fn bounded_supported_action_does_not_require_stopping_or_completion_forecasts() {
     for execution in [
         CostExecution::SingleInvocation,
