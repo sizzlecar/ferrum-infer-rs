@@ -199,6 +199,8 @@ pub struct UnvalidatedProviderResourcePlan {
     pub(super) persistent: Option<ProviderWorkspaceRequirement>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) projection_numerics: Option<crate::PreparedProjectionNumerics>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) prepared_implementation_fingerprint: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

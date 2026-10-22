@@ -69,7 +69,11 @@ mod tensor_eager;
 mod tensor_io;
 mod terminal_readback;
 pub use cudnn::CudaCudnnConfig;
+pub use cudnn::CudnnSdpaPlanPolicy;
 pub(crate) use cudnn::{CudaCudnnOwner, CudnnConv2dDescriptor};
+pub(crate) use cudnn::{
+    CudaCudnnSdpaCache, CudnnSdpaBindings, CudnnSdpaExecution, CudnnSdpaPlan, CudnnSdpaSignature,
+};
 pub(crate) use resident_program::{ResidentColdParts, ResidentControlRule};
 use segment_owners::CudaProgramBindingRetention;
 pub(crate) use segment_owners::{CudaSegmentOwnerBuilder, CudaSegmentOwnerTable, CudaSegmentRange};

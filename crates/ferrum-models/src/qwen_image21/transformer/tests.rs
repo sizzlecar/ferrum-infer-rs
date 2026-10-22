@@ -2,6 +2,58 @@ use super::*;
 use serde_json::json;
 type F = QwenImage21TransformerFamily;
 
+#[test]
+fn fused_transformer_profile_selects_every_dit_attention_without_changing_transport() {
+    let config = QwenImage21TransformerConfig::new(
+        transformer(2, true, true),
+        QwenImage21T2iLayout::new(3, 2, 2, vec![3, 1]).unwrap(),
+    )
+    .unwrap();
+    let family = F::new().unwrap();
+    let profiles = family.numerical_profiles(&config).unwrap();
+    let fused_id = profile_id(F::CUDA_FUSED_PROFILE_ID).unwrap();
+    let legacy = profiles
+        .resolve(&profile_id(F::CUDA_PROFILE_ID).unwrap())
+        .unwrap();
+    let fused = profiles.resolve(&fused_id).unwrap();
+    assert!(!profiles.auto_preference().contains(&fused_id));
+    assert_eq!(legacy.boundaries, fused.boundaries);
+    assert_ne!(legacy.fingerprint().unwrap(), fused.fingerprint().unwrap());
+    let original = family.semantic_program(&config, legacy).unwrap();
+    let candidate = family.semantic_program(&config, fused).unwrap();
+    assert_eq!(original.inputs(), candidate.inputs());
+    assert_eq!(
+        original.input_tensor_specs(),
+        candidate.input_tensor_specs()
+    );
+    assert_eq!(original.weights(), candidate.weights());
+    assert_eq!(candidate.outputs(), &[id(F::VELOCITY_ID)]);
+    let mut changed = 0;
+    for (left, right) in original.blocks()[0]
+        .nodes
+        .iter()
+        .zip(&candidate.blocks()[0].nodes)
+    {
+        let mut restored = right.clone();
+        if right.operation_id.as_str() == STRUCTURED_ATTENTION_FUSED_BF16_OPERATION_ID {
+            assert_eq!(
+                left.operation_id.as_str(),
+                STRUCTURED_ATTENTION_BF16_OPERATION_ID
+            );
+            restored.operation_id = left.operation_id.clone();
+            changed += 1;
+        }
+        assert_eq!(&restored, left);
+    }
+    assert_eq!(changed, config.transformer().layers());
+    assert!(legacy.validate_program(&candidate).is_err());
+    assert!(fused.validate_program(&original).is_err());
+    let prepared = TypedFamilyRegistration::new(F::new().unwrap())
+        .prepare_with_profile(&serde_json::to_value(config).unwrap(), &fused_id)
+        .unwrap();
+    assert_eq!(prepared.program(), &candidate);
+}
+
 fn transformer(layers: u64, causal_condition: bool, real: bool) -> QwenImage21Config {
     QwenImage21Config::from_hf_json(
         &serde_json::to_vec(&json!({

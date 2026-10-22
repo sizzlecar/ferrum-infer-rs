@@ -33,6 +33,10 @@ impl QwenImage21Block0Family {
     pub const FAMILY_ID: &'static str = "family.qwen_image21.block0";
     pub const REFERENCE_PROFILE_ID: &'static str = "qwen_image21.block0.reference.bf16_f32.v1";
     pub const CUDA_PROFILE_ID: &'static str = "qwen_image21.block0.cuda.bf16_f32.v1";
+    /// Explicit experimental vendor-fused attention; other block operations
+    /// keep the existing CUDA numerical choices.
+    pub const CUDA_FUSED_PROFILE_ID: &'static str =
+        "qwen_image21.block0.cuda.fused_attention.experimental.v1";
     pub const INPUT_ID: &'static str = "value.qwen_image21.block0.x";
     pub const SCALE1_ID: &'static str = "value.qwen_image21.block0.scale1";
     pub const GATE1_ID: &'static str = "value.qwen_image21.block0.gate1";
@@ -175,6 +179,9 @@ impl ModelFamilyProvider for QwenImage21Block0Family {
         let mlp = Mlp::new()?.numerical_profiles(config.transformer())?;
         let mut profiles = Vec::new();
         for (name, attention_name, mlp_name) in profile_sources() {
+            if name == Self::CUDA_FUSED_PROFILE_ID && config.transformer().head_dim() != 128 {
+                continue;
+            }
             let mut profile = attention.resolve(&profile_id(attention_name)?)?.clone();
             let mlp = mlp.resolve(&profile_id(mlp_name)?)?;
             if !profile.states.is_empty()
@@ -286,7 +293,7 @@ impl ModelFamilyProvider for QwenImage21Block0Family {
     }
 }
 
-fn profile_sources() -> [(&'static str, &'static str, &'static str); 2] {
+fn profile_sources() -> [(&'static str, &'static str, &'static str); 3] {
     [
         (
             QwenImage21Block0Family::REFERENCE_PROFILE_ID,
@@ -296,6 +303,11 @@ fn profile_sources() -> [(&'static str, &'static str, &'static str); 2] {
         (
             QwenImage21Block0Family::CUDA_PROFILE_ID,
             Attention::CUDA_PROFILE_ID,
+            Mlp::CUDA_PROFILE_ID,
+        ),
+        (
+            QwenImage21Block0Family::CUDA_FUSED_PROFILE_ID,
+            Attention::CUDA_FUSED_PROFILE_ID,
             Mlp::CUDA_PROFILE_ID,
         ),
     ]

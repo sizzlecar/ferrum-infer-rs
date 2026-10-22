@@ -97,6 +97,8 @@ pub use tensor_silu::{
     CHANNEL_L2_IMAGE_PROFILE_ID as CUDA_CHANNEL_L2_NORM_IMAGE_BF16_NUMERICAL_PROFILE_ID,
     CHANNEL_L2_PROFILE_ID as CUDA_CHANNEL_L2_NORM_BF16_NUMERICAL_PROFILE_ID,
     CONV2D_PROFILE_ID as CUDA_CONV2D_BF16_NUMERICAL_PROFILE_ID,
+    FUSED_ATTENTION_NUMERICAL_IDENTITY as CUDA_STRUCTURED_ATTENTION_FUSED_BF16_NUMERICAL_PROFILE_IDENTITY,
+    FUSED_ATTENTION_NUMERICAL_PROFILE_ID as CUDA_STRUCTURED_ATTENTION_FUSED_BF16_NUMERICAL_PROFILE_ID,
     GATED_RESIDUAL_NUMERICAL_PROFILE_ID as CUDA_GATED_RESIDUAL_BF16_NUMERICAL_PROFILE_ID,
     GELU_TANH_PROFILE_ID as CUDA_GELU_TANH_BF16_NUMERICAL_PROFILE_ID,
     GQA_NUMERICAL_IDENTITY as CUDA_STRUCTURED_GQA_ATTENTION_BF16_NUMERICAL_PROFILE_IDENTITY,
@@ -368,6 +370,8 @@ pub fn cuda_tensor_runtime_config(
         include_bytes!("vnext_runtime/tensor_eager.rs"),
         include_bytes!("vnext_runtime/cudnn.rs"),
         include_bytes!("vnext_runtime/cudnn/ffi.rs"),
+        include_bytes!("vnext_runtime/cudnn/sdpa.rs"),
+        include_bytes!("vnext_runtime/cudnn/sdpa/native.rs"),
     ]);
     config.capabilities = BTreeSet::from([
         CapabilityId::new(ferrum_runtime::SILU_BF16_CAPABILITY_ID)?,
@@ -381,6 +385,7 @@ pub fn cuda_tensor_runtime_config(
         CapabilityId::new(ferrum_runtime::HEAD_RMS_NORM_BF16_CAPABILITY_ID)?,
         CapabilityId::new(ferrum_runtime::ADJACENT_ROPE_BF16_CAPABILITY_ID)?,
         CapabilityId::new(ferrum_runtime::STRUCTURED_ATTENTION_BF16_CAPABILITY_ID)?,
+        CapabilityId::new(ferrum_runtime::STRUCTURED_ATTENTION_FUSED_BF16_CAPABILITY_ID)?,
         CapabilityId::new(ferrum_runtime::ZERO_CENTERED_RMS_NORM_BF16_CAPABILITY_ID)?,
         CapabilityId::new(ferrum_runtime::GELU_TANH_BF16_CAPABILITY_ID)?,
         CapabilityId::new(ferrum_runtime::ROW_GATHER_BF16_CAPABILITY_ID)?,
@@ -455,6 +460,20 @@ pub fn cuda_vnext_tensor_providers_with_cudnn(
     selected: &[CudaTensorOperation],
 ) -> Result<Vec<Box<dyn OperationProvider<CudaDeviceRuntime>>>, CudaDeviceRuntimeError> {
     tensor_silu::providers_with_cudnn(runtime, config, selected)
+}
+
+/// Opt-in segmented cuDNN SDPA alongside the selected native operations and
+/// Conv2D, sharing one module permit and one separately charged cuDNN owner.
+/// The explicit finite cache quota is additional to the cuDNN owner's opaque
+/// allowance. Register `structured_attention_fused_bf16_contract` as well as
+/// the selected contracts; legacy attention remains available independently.
+pub fn cuda_vnext_tensor_providers_with_cudnn_sdpa(
+    runtime: &CudaDeviceRuntime,
+    config: &super::vnext_runtime::CudaCudnnConfig,
+    policy: super::vnext_runtime::CudnnSdpaPlanPolicy,
+    selected: &[CudaTensorOperation],
+) -> Result<Vec<Box<dyn OperationProvider<CudaDeviceRuntime>>>, CudaDeviceRuntimeError> {
+    tensor_silu::providers_with_cudnn_sdpa(runtime, config, policy, selected)
 }
 
 /// Builds the five independent BF16 pointwise providers from one native

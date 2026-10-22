@@ -648,6 +648,7 @@ pub struct OperationInvocation<'a, B, W = TokenInvocationWork<'a>> {
     work_projection: W,
     claimed_backing_fingerprint: &'a str,
     projection_numerics: Option<&'a crate::PreparedProjectionNumerics>,
+    prepared_implementation_fingerprint: Option<&'a str>,
 }
 
 /// Checks this fresh wave's common participant authority once. The private
@@ -1241,6 +1242,8 @@ impl<'a, B, W: InvocationWorkProjection<'a>> OperationInvocation<'a, B, W> {
             work_projection: W::bind(resources.work_shape()?)?,
             claimed_backing_fingerprint: resources.backing_fingerprint(),
             projection_numerics: provider_resources.projection_numerics(),
+            prepared_implementation_fingerprint: provider_resources
+                .prepared_implementation_fingerprint(),
         })
     }
 
@@ -1262,6 +1265,10 @@ impl<'a, B, W: InvocationWorkProjection<'a>> OperationInvocation<'a, B, W> {
 
     pub fn projection_numerics(&self) -> Option<&crate::PreparedProjectionNumerics> {
         self.projection_numerics
+    }
+
+    pub fn prepared_implementation_fingerprint(&self) -> Option<&str> {
+        self.prepared_implementation_fingerprint
     }
 
     pub fn views(&self) -> &[OperationBufferView<'a, B>] {
@@ -1523,6 +1530,12 @@ impl<'a, B, W: InvocationWorkProjection<'a>> BatchedOperationInvocation<'a, B, W
 
     pub fn participants(&self) -> &[OperationInvocation<'a, B, W>] {
         &self.participants
+    }
+
+    /// Every participant is bound to this same compiled node's provider
+    /// resource plan. Available to fixed tensor and token providers alike.
+    pub fn prepared_implementation_fingerprint(&self) -> Option<&str> {
+        self.participants[0].prepared_implementation_fingerprint()
     }
 
     pub fn operation(&self) -> &OperationDescriptor {

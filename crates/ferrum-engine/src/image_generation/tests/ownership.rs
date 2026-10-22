@@ -49,6 +49,7 @@ fn stage_execution_failure_keeps_real_stored_resources_until_explicit_recovery_c
             .memory()
             .minimum_step_bytes(),
         compile_wall_duration_us: 0,
+        plan_cache_hit: false,
     };
     let session = component
         .initialize(

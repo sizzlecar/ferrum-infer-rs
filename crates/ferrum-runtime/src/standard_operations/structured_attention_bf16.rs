@@ -3,6 +3,8 @@ use super::*;
 use crate::{ResolvedTensorLayout, ResolvedTensorSpec, SemanticValue};
 mod mask;
 pub use mask::StructuredAttentionBf16Mask;
+mod fused;
+pub use fused::*;
 
 pub const STRUCTURED_ATTENTION_BF16_OPERATION_ID: &str = "operation.structured_attention.bf16";
 pub const STRUCTURED_ATTENTION_BF16_CAPABILITY_ID: &str =

@@ -264,3 +264,50 @@ fn later_decoder_output_quota_failure_retains_the_active_session_for_close() {
     assert_eq!(pipeline.runtime.snapshot().live_allocations, 0);
     assert_eq!(pipeline.host.usage().unwrap().committed_bytes(), 0);
 }
+
+#[test]
+fn cached_decoder_plan_reinitializes_without_retaining_device_or_host_payloads() {
+    let (mut pipeline, directory) = super::adapter::pipeline(2);
+    pipeline.host = host(65536);
+    pipeline.config.static_initialization = StaticInitializationPolicy::new(65536, 64).unwrap();
+    let config = pipeline.assets.decoder_batch(1, 2, 2).unwrap();
+    pipeline.assets.sources.vae =
+        decoder_source(&directory.path().join("cached-numeric-vae"), &config);
+    let source = input(&pipeline.host);
+    let mut previous = None;
+    let mut previous_plan = None;
+    for job in 0..2 {
+        let (prepared, decoder) = stage(&pipeline, 1);
+        assert_eq!(prepared.plan.plan_cache_hit, job == 1);
+        if let Some(ref previous) = previous_plan {
+            assert!(Arc::ptr_eq(previous, &prepared.component));
+        }
+        previous_plan = Some(prepared.component.clone());
+        let mut receipts = Vec::new();
+        let images = pipeline
+            .decode_batch(prepared, &decoder, source.clone(), 2, job, &mut receipts)
+            .unwrap_or_else(|_| {
+                panic!("cached component must initialize a new independent session")
+            });
+        assert_eq!(pipeline.runtime.snapshot().live_allocations, 0);
+        assert_eq!(receipts[0].execution.completed_executions, 2);
+        let ComponentInitializationReceipt::Initialized { receipt } =
+            &receipts[0].execution.initialization
+        else {
+            panic!("weights must be reinitialized")
+        };
+        assert!(receipt.uploaded_bytes() > 0);
+        let bytes = images
+            .iter()
+            .map(|image| image.bytes().bytes().to_vec())
+            .collect::<Vec<_>>();
+        if let Some(ref previous) = previous {
+            assert_eq!(&bytes, previous);
+        }
+        previous = Some(bytes);
+        drop(images);
+    }
+    drop(source);
+    assert_eq!(pipeline.host.usage().unwrap().committed_bytes(), 0);
+    assert_eq!(pipeline.runtime.snapshot().live_allocations, 0);
+}

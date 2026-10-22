@@ -27,6 +27,11 @@ impl QwenImage21Block0AttentionFamily {
     pub const REFERENCE_PROFILE_ID: &'static str =
         "qwen_image21.block0_attention.reference.bf16_f32.v1";
     pub const CUDA_PROFILE_ID: &'static str = "qwen_image21.block0_attention.cuda.bf16_f32.v1";
+    /// Explicit vendor-fused attention choice; does not change the legacy CUDA
+    /// profile or claim its sequential FP32 softmax rounding. Initial providers
+    /// support head_dim 128; numerical qualification is separate evidence.
+    pub const CUDA_FUSED_PROFILE_ID: &'static str =
+        "qwen_image21.block0_attention.cuda.fused_attention.experimental.v1";
     pub const INPUT_ID: &'static str = Qk::INPUT_ID;
     pub const FREQUENCIES_ID: &'static str = Qk::FREQUENCIES_ID;
     pub const QUERY_ID: &'static str = Qk::QUERY_ID;
@@ -164,7 +169,15 @@ impl ModelFamilyProvider for QwenImage21Block0AttentionFamily {
                 Self::CUDA_PROFILE_ID,
                 QwenImage21QkFrontend::Rotary.cuda_profile_id(),
             ),
+            (
+                Self::CUDA_FUSED_PROFILE_ID,
+                QwenImage21QkFrontend::Rotary.cuda_profile_id(),
+            ),
         ] {
+            let fused = name == Self::CUDA_FUSED_PROFILE_ID;
+            if fused && config.transformer().head_dim() != 128 {
+                continue;
+            }
             let source_id =
                 NumericalProfileId::new(source_name).map_err(|e| invalid("profile", e))?;
             let mut profile = source.resolve(&source_id)?.clone();
@@ -177,10 +190,17 @@ impl ModelFamilyProvider for QwenImage21Block0AttentionFamily {
                     .insert(ProgramValueId::new(*output)?, ElementType::Bf16);
             }
             profile.operations.push(NumericalOperationContract {
-                operation_id: OperationId::new(STRUCTURED_ATTENTION_BF16_OPERATION_ID)?,
+                operation_id: OperationId::new(if fused {
+                    STRUCTURED_ATTENTION_FUSED_BF16_OPERATION_ID
+                } else {
+                    STRUCTURED_ATTENTION_BF16_OPERATION_ID
+                })?,
                 version: ContractVersion::new(1, 0),
-                multiplication_type: Some(ElementType::F32),
-                accumulation_type: Some(ElementType::F32),
+                // Vendor SDPA does not expose each internal probability/
+                // reduction rounding boundary. Its distinct operation version
+                // owns that contract; do not mislabel it as all-FP32 online.
+                multiplication_type: (!fused).then_some(ElementType::F32),
+                accumulation_type: (!fused).then_some(ElementType::F32),
                 staged_arithmetic: None,
                 composite_arithmetic: None,
             });
@@ -208,7 +228,8 @@ impl ModelFamilyProvider for QwenImage21Block0AttentionFamily {
         }
         let frontend = Qk::with_frontend(QwenImage21QkFrontend::Rotary)?;
         let base_profiles = frontend.numerical_profiles(config.transformer())?;
-        let base_name = if profile.id.as_str() == Self::CUDA_PROFILE_ID {
+        let fused = profile.id.as_str() == Self::CUDA_FUSED_PROFILE_ID;
+        let base_name = if profile.id.as_str() == Self::CUDA_PROFILE_ID || fused {
             QwenImage21QkFrontend::Rotary.cuda_profile_id()
         } else {
             QwenImage21QkFrontend::Rotary.reference_profile_id()
@@ -271,7 +292,11 @@ impl ModelFamilyProvider for QwenImage21Block0AttentionFamily {
         )?);
         nodes.push(ProgramNode {
             id: NodeId::new("node.qwen_image21.block0_attention.attention")?,
-            operation_id: OperationId::new(STRUCTURED_ATTENTION_BF16_OPERATION_ID)?,
+            operation_id: OperationId::new(if fused {
+                STRUCTURED_ATTENTION_FUSED_BF16_OPERATION_ID
+            } else {
+                STRUCTURED_ATTENTION_BF16_OPERATION_ID
+            })?,
             required_version: ContractVersion::new(1, 0),
             work: ProgramNodeWorkSpec::Fixed,
             inputs: [Self::QUERY_ROTATED_ID, Self::KEY_ROTATED_ID, Self::VALUE_ID]

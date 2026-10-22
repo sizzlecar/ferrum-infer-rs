@@ -269,16 +269,18 @@ static_assert(sizeof(FerrumStructuredAttentionMask) == 2312, "attention mask ABI
 __device__ __forceinline__ void ferrum_structured_attention_body(
     const uint16_t* query, const uint16_t* key, const uint16_t* value,
     uint16_t* output, uint64_t groups, uint64_t query_heads, uint64_t key_value_heads, uint32_t sequence,
-    uint32_t width, float scale, const FerrumStructuredAttentionMask& mask) {
+    uint32_t width, float scale, const FerrumStructuredAttentionMask& mask,
+    uint32_t first_query, uint32_t query_count, uint32_t first_batch) {
     extern __shared__ float dot_values[];
     __shared__ uint32_t visible_end, seen, poisoned, first_key;
     __shared__ float maximum, denominator, correction, weight, inverse;
     for (uint64_t group = blockIdx.x; group < groups; group += gridDim.x) {
         const uint64_t head = group % query_heads;
         const uint64_t kv_head = head / (query_heads / key_value_heads);
-        const uint64_t row = group / query_heads;
-        const uint32_t batch = static_cast<uint32_t>(row / sequence);
-        const uint32_t q = static_cast<uint32_t>(row % sequence);
+        const uint64_t local_row = group / query_heads;
+        const uint32_t batch = first_batch + static_cast<uint32_t>(local_row / query_count);
+        const uint32_t q = first_query + static_cast<uint32_t>(local_row % query_count);
+        const uint64_t row = static_cast<uint64_t>(batch) * sequence + q;
         const uint64_t columns = query_heads * width;
         const uint64_t kv_columns = key_value_heads * width;
         const uint64_t query_offset = row * columns + head * width + threadIdx.x;
@@ -356,7 +358,7 @@ extern "C" __global__ void ferrum_vnext_structured_attention_bf16(
     uint16_t* output, uint64_t groups, uint64_t heads, uint32_t sequence,
     uint32_t width, float scale, const FerrumStructuredAttentionMask mask) {
     ferrum_structured_attention_body(query, key, value, output, groups,
-        heads, heads, sequence, width, scale, mask);
+        heads, heads, sequence, width, scale, mask, 0, sequence, 0);
 }
 
 // GQA has a separate semantic contract, but does not repeat the KV tensors.
@@ -365,7 +367,77 @@ extern "C" __global__ void ferrum_vnext_structured_gqa_attention_bf16(
     uint16_t* output, uint64_t groups, uint64_t query_heads, uint64_t key_value_heads,
     uint32_t sequence, uint32_t width, float scale, const FerrumStructuredAttentionMask mask) {
     ferrum_structured_attention_body(query, key, value, output, groups,
-        query_heads, key_value_heads, sequence, width, scale, mask);
+        query_heads, key_value_heads, sequence, width, scale, mask, 0, sequence, 0);
+}
+
+// The fallback runs only these query rows; it never computes the whole graph
+// before a fused SDPA call. Original equal-head/GQA entrypoint ABIs are intact.
+extern "C" __global__ void ferrum_vnext_structured_attention_range_bf16(
+    const uint16_t* query, const uint16_t* key, const uint16_t* value,
+    uint16_t* output, uint64_t groups, uint64_t heads, uint32_t sequence,
+    uint32_t width, float scale, const FerrumStructuredAttentionMask mask,
+    uint32_t first_query, uint32_t query_count, uint32_t first_batch) {
+    ferrum_structured_attention_body(query, key, value, output, groups,
+        heads, heads, sequence, width, scale, mask, first_query, query_count, first_batch);
+}
+
+// Pack only valid prefix keys, preserving their original order. Zero padding
+// never reads an excluded key/value. Both GPU length arrays share admitted
+// scratch with the payload and are fully initialized before cuDNN execution.
+extern "C" __global__ void ferrum_vnext_attention_pack_kv_bf16(
+    const uint16_t* key, const uint16_t* value, uint16_t* packed_key,
+    uint16_t* packed_value, int32_t* query_lengths, int32_t* key_lengths,
+    uint64_t columns, uint32_t sequence, uint32_t first_batch,
+    uint32_t batches, uint32_t query_count, uint32_t visible_end,
+    uint32_t packed_rows, const FerrumStructuredAttentionMask mask) {
+    const uint64_t count = static_cast<uint64_t>(batches) * packed_rows * columns;
+    for (uint64_t i = static_cast<uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+         i < count; i += static_cast<uint64_t>(blockDim.x) * gridDim.x) {
+        const uint32_t local_batch = static_cast<uint32_t>(i / (packed_rows * columns));
+        const uint32_t batch = first_batch + local_batch;
+        const uint32_t packed_row = static_cast<uint32_t>((i / columns) % packed_rows);
+        const uint64_t column = i % columns;
+        uint32_t begin = 0, valid_rows = 0, source_row = 0;
+        bool found = false;
+        for (uint32_t run = 0; run < mask.key_run_counts[batch]; ++run) {
+            const uint32_t end = min(mask.key_run_ends[batch * 32 + run], visible_end);
+            if (end > begin && ((mask.key_valid_masks[batch] >> run) & 1U)) {
+                const uint32_t length = end - begin;
+                if (packed_row >= valid_rows && packed_row - valid_rows < length) {
+                    source_row = begin + packed_row - valid_rows;
+                    found = true;
+                }
+                valid_rows += length;
+            }
+            begin = end;
+            if (end == visible_end) break;
+        }
+        if (found) {
+            const uint64_t source = (static_cast<uint64_t>(batch) * sequence + source_row)
+                * columns + column;
+            packed_key[i] = key[source];
+            packed_value[i] = value[source];
+        } else {
+            packed_key[i] = 0;
+            packed_value[i] = 0;
+        }
+        if (packed_row == 0 && column == 0) {
+            query_lengths[local_batch] = static_cast<int32_t>(query_count);
+            key_lengths[local_batch] = static_cast<int32_t>(valid_rows);
+        }
+    }
+}
+
+extern "C" __global__ void ferrum_vnext_attention_zero_range_bf16(
+    uint16_t* output, uint64_t columns, uint32_t sequence,
+    uint32_t first_batch, uint32_t batches, uint32_t first_query, uint32_t query_count) {
+    const uint64_t count = static_cast<uint64_t>(batches) * query_count * columns;
+    for (uint64_t i = static_cast<uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+         i < count; i += static_cast<uint64_t>(blockDim.x) * gridDim.x) {
+        const uint64_t batch = first_batch + i / (static_cast<uint64_t>(query_count) * columns);
+        const uint64_t query = first_query + (i / columns) % query_count;
+        output[(batch * sequence + query) * columns + i % columns] = 0;
+    }
 }
 
 // Whole-row zero-centered RMS. Weight is stored BF16; weight+1 and x*inverse

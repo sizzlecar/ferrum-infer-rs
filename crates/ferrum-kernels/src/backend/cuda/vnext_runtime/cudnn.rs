@@ -3,6 +3,8 @@
 //! A fixed handle and four descriptors are shared under one mutex. No find/
 //! autotune API is called, and native workspace always comes from an admitted
 //! operation scratch view. Opaque allowances are declarations, not measurements.
+//! Optional SDPA graphs use a separately reserved, bounded plan/binding cache;
+//! their commands retain this same library/context owner through completion.
 
 use std::ffi::c_void;
 use std::fs::File;
@@ -17,7 +19,12 @@ use sha2::{Digest, Sha256};
 use super::{CudaDeviceRuntime, CudaDeviceRuntimeError};
 
 mod ffi;
+mod sdpa;
 use ffi::{check, Api, Descriptor, ForwardPerformance, Handle};
+pub use sdpa::CudnnSdpaPlanPolicy;
+pub(crate) use sdpa::{
+    CudaCudnnSdpaCache, CudnnSdpaBindings, CudnnSdpaExecution, CudnnSdpaPlan, CudnnSdpaSignature,
+};
 
 /// Deployment configuration for a separately charged cuDNN provider owner.
 /// The library and its sibling cuDNN 9 libraries must be trusted, immutable
@@ -175,6 +182,8 @@ impl CudaCudnnOwner {
         digest.update(config.opaque_memory_profile.as_bytes());
         digest.update(include_bytes!("cudnn.rs"));
         digest.update(include_bytes!("cudnn/ffi.rs"));
+        digest.update(include_bytes!("cudnn/sdpa.rs"));
+        digest.update(include_bytes!("cudnn/sdpa/native.rs"));
         Ok(Arc::new(Self {
             inner: Mutex::new(Some(native)),
             fingerprint: format!("{:x}", digest.finalize()),

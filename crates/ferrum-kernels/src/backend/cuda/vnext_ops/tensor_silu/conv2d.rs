@@ -3,7 +3,9 @@
 //! separately adding BF16 bias. No fused bias/activation entrypoint is used.
 
 use super::*;
-use crate::backend::cuda::vnext_runtime::{CudaCudnnConfig, CudaCudnnOwner, CudnnConv2dDescriptor};
+use crate::backend::cuda::vnext_runtime::{
+    CudaCudnnConfig, CudaCudnnOwner, CudaCudnnSdpaCache, CudnnConv2dDescriptor, CudnnSdpaPlanPolicy,
+};
 use ferrum_runtime::{
     conv2d_bf16_contract, Conv2dBf16Geometry, Conv2dPaddingMode, DynamicStorageRequirement,
     PhysicalWeightLayout, ProviderWorkspaceRequirement, ProviderWorkspaceReusePolicy,
@@ -32,10 +34,38 @@ pub(crate) fn providers(
     config: &CudaCudnnConfig,
     selected: &[CudaTensorOperation],
 ) -> Result<Vec<Box<dyn OperationProvider<CudaDeviceRuntime>>>, CudaDeviceRuntimeError> {
+    providers_impl(runtime, config, selected, None)
+}
+
+pub(crate) fn providers_with_sdpa(
+    runtime: &CudaDeviceRuntime,
+    config: &CudaCudnnConfig,
+    policy: CudnnSdpaPlanPolicy,
+    selected: &[CudaTensorOperation],
+) -> Result<Vec<Box<dyn OperationProvider<CudaDeviceRuntime>>>, CudaDeviceRuntimeError> {
+    providers_impl(runtime, config, selected, Some(policy))
+}
+
+fn providers_impl(
+    runtime: &CudaDeviceRuntime,
+    config: &CudaCudnnConfig,
+    selected: &[CudaTensorOperation],
+    sdpa_policy: Option<CudnnSdpaPlanPolicy>,
+) -> Result<Vec<Box<dyn OperationProvider<CudaDeviceRuntime>>>, CudaDeviceRuntimeError> {
     let capability = CapabilityId::new(CONV2D_BF16_CAPABILITY_ID).map_err(contract_error)?;
     if !runtime.descriptor().capabilities.contains(&capability) {
         return Err(CudaDeviceRuntimeError::contract(
             "CUDA runtime lacks BF16 convolution capability",
+        ));
+    }
+    if sdpa_policy.is_some()
+        && !runtime.descriptor().capabilities.contains(
+            &CapabilityId::new(ferrum_runtime::STRUCTURED_ATTENTION_FUSED_BF16_CAPABILITY_ID)
+                .map_err(contract_error)?,
+        )
+    {
+        return Err(CudaDeviceRuntimeError::contract(
+            "CUDA runtime lacks fused attention capability",
         ));
     }
     let descriptors = if selected.is_empty() {
@@ -44,6 +74,9 @@ pub(crate) fn providers(
         selection::runtime_descriptors(runtime, selected)?
     };
     let owner = CudaCudnnOwner::new(runtime, config)?;
+    let sdpa = sdpa_policy
+        .map(|policy| CudaCudnnSdpaCache::new(runtime, Arc::clone(&owner), policy).map(Arc::new))
+        .transpose()?;
     let contract = conv2d_bf16_contract().map_err(contract_error)?;
     let implementation = implementation_fingerprint(&[
         numerical_fingerprint().as_bytes(),
@@ -78,6 +111,13 @@ pub(crate) fn providers(
     .with_fixed_tensor_work(true);
     let kernels = RetainedFunctions::load(runtime)?;
     let mut providers = selection::providers_from_descriptors(descriptors, &kernels);
+    if let Some(cache) = sdpa {
+        providers.push(cudnn_attention::provider(
+            runtime.descriptor(),
+            &kernels,
+            cache,
+        )?);
+    }
     providers.push(Box::new(ConvProvider {
         descriptor,
         kernels,

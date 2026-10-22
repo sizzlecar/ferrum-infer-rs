@@ -7,6 +7,61 @@ use serde_json::json;
 
 type F = QwenImage21Block0Family;
 
+#[test]
+fn fused_block_profile_changes_attention_only_and_keeps_all_boundaries() {
+    let config = QwenImage21Block0Config::new(
+        QwenImage21AttentionConfig::new(
+            transformer(1, 128, 0.75),
+            QwenImage21AttentionLayout::uniform(2, false).unwrap(),
+        )
+        .unwrap(),
+        QwenImage21Block0Broadcast::Elementwise,
+    )
+    .unwrap();
+    let family = F::new().unwrap();
+    let profiles = family.numerical_profiles(&config).unwrap();
+    let fused_id = profile_id(F::CUDA_FUSED_PROFILE_ID).unwrap();
+    let original = family
+        .semantic_program(
+            &config,
+            profiles
+                .resolve(&profile_id(F::CUDA_PROFILE_ID).unwrap())
+                .unwrap(),
+        )
+        .unwrap();
+    let profile = profiles.resolve(&fused_id).unwrap();
+    let candidate = family.semantic_program(&config, profile).unwrap();
+    profile.validate_program(&candidate).unwrap();
+    assert_eq!(candidate.outputs(), &F::OUTPUT_IDS.map(value));
+    assert_eq!(original.weights(), candidate.weights());
+    assert_eq!(
+        original.input_tensor_specs(),
+        candidate.input_tensor_specs()
+    );
+    assert!(!profiles.auto_preference().contains(&fused_id));
+    let mut changed = 0;
+    for (left, right) in original.blocks()[0]
+        .nodes
+        .iter()
+        .zip(&candidate.blocks()[0].nodes)
+    {
+        let mut restored = right.clone();
+        if right.operation_id.as_str() == STRUCTURED_ATTENTION_FUSED_BF16_OPERATION_ID {
+            assert_eq!(
+                left.operation_id.as_str(),
+                STRUCTURED_ATTENTION_BF16_OPERATION_ID
+            );
+            restored.operation_id = left.operation_id.clone();
+            changed += 1;
+        }
+        assert_eq!(&restored, left);
+    }
+    assert_eq!(changed, 1);
+    TypedFamilyRegistration::new(F::new().unwrap())
+        .prepare_with_profile(&serde_json::to_value(config).unwrap(), &fused_id)
+        .unwrap();
+}
+
 fn transformer(heads: u64, head_dim: u64, epsilon: f64) -> QwenImage21Config {
     QwenImage21Config::from_hf_json(
         &serde_json::to_vec(&json!({

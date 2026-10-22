@@ -1,7 +1,8 @@
 //! Cold Qwen-Image 2.1 request batches on injected runtime owners.
 //!
 //! This cold BF16 path qualifies G2 functionality. It is not the G3 serving
-//! architecture: it recompiles/reloads stages for every batch. Compatible
+//! architecture: it reloads stage weights for every batch. A bounded optional
+//! cache reuses compiled plans for identical stage geometry. Compatible
 //! requests share real batched component forwards within that batch. Throughput
 //! qualification additionally requires retained component sessions, explicit
 //! residency/offload policies and measurements; configuring a batch limit is
@@ -18,13 +19,17 @@
 //! tokenizer/metadata containers, mapped checkpoints, or total process RSS.
 
 mod assets;
+mod attention_policy;
 #[cfg(feature = "cuda")]
 pub mod cuda;
 mod decoder;
+mod plan_cache;
 mod prepare;
 pub mod service;
 mod stage;
 pub use assets::{ImageAssetReceipt, QwenImage21Assets, QwenImage21Metadata, QwenImage21Sources};
+pub use attention_policy::ImageCudaAttentionPolicy;
+pub use plan_cache::ImagePlanCachePolicy;
 pub use stage::{
     ActiveImageStage, ImageGenerationError, ImageGenerationFailure, ImageStage,
     ImageStageExecutionReceipt, ImageStagePlanReceipt, ImageStageReceipt,
@@ -101,6 +106,7 @@ pub struct ImagePipelineConfig {
     /// defaults to one; larger cold batches require explicit opt-in.
     pub maximum_batch_size: usize,
     pub decoder_batch_policy: ImageDecoderBatchPolicy,
+    pub plan_cache: ImagePlanCachePolicy,
     pub static_initialization: StaticInitializationPolicy,
     pub executor: TensorExecutorConfig,
 }
@@ -210,6 +216,7 @@ pub struct QwenImage21Pipeline<R: DeviceRuntime> {
     policy: TensorComponentPolicy,
     next_job: u64,
     stopped: bool,
+    plan_cache: plan_cache::StagePlanCache<R>,
 }
 
 impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
@@ -257,6 +264,7 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
             policy,
             next_job: 0,
             stopped: false,
+            plan_cache: plan_cache::StagePlanCache::new(),
         })
     }
 

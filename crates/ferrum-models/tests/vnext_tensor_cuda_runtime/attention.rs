@@ -6,6 +6,8 @@ use ferrum_kernels::backend::cuda::vnext_ops::{
 use half::bf16;
 #[path = "attention/family.rs"]
 mod family;
+#[path = "attention/newfused.rs"]
+mod newfused;
 use family::{AttentionConfig, AttentionFamily};
 const INPUTS: [&str; 3] = [
     "value.attention.query",

@@ -221,6 +221,42 @@ fn managed_static_failure_retains_original_recoverable_transaction() {
     assert!(weak.upgrade().is_none());
 }
 
+#[test]
+fn repeated_component_initialization_admits_independent_roots() {
+    let compiled = compile(&Config {
+        stored: false,
+        persistent: true,
+    });
+    let runtime = f::runtime(compiled.executable().execution_plan());
+    let mut roots = Vec::new();
+    for index in 0..2 {
+        let mut config = init_config();
+        config.transaction_id = f::id(&format!("transaction.component.repeat.{index}"));
+        config.request_id = f::id(&format!("request.component.repeat.{index}"));
+        config.run_id = f::id(&format!("run.component.repeat.{index}"));
+        let failure = compiled
+            .initialize(runtime.clone(), host(), ComponentWeightSource::None, config)
+            .err()
+            .unwrap();
+        let ComponentInitializationError::Executor {
+            resources, receipt, ..
+        } = failure
+        else {
+            panic!("fixture must reach managed IO refusal after its own static initialization");
+        };
+        assert!(matches!(
+            receipt,
+            ComponentInitializationReceipt::Initialized { .. }
+        ));
+        roots.push(resources);
+    }
+    assert!(!Arc::ptr_eq(&roots[0], &roots[1]));
+    let second = roots.pop().unwrap();
+    assert_eq!(close(roots.pop().unwrap()), 1);
+    assert!(!second.is_closing());
+    assert_eq!(close(second), 1);
+}
+
 fn close(resources: Arc<PlanRuntimeResources<f::TestRuntime>>) -> usize {
     match PlanRuntimeResources::close(resources).unwrap_or_else(|_| panic!("close failed")) {
         PlanRuntimeCloseOutcome::Closed(receipt) => receipt.released_static_resources(),

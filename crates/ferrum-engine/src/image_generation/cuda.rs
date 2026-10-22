@@ -6,14 +6,17 @@
 //! cuDNN retains its separately admitted opaque owner inside that same runtime.
 //! Opaque allowances are declarations, not measured memory qualification.
 
-use super::{ImagePipelineConfig, QwenImage21Assets, QwenImage21Pipeline, QwenImage21Profiles};
+use super::{
+    ImageCudaAttentionPolicy, ImagePipelineConfig, QwenImage21Assets, QwenImage21Pipeline,
+    QwenImage21Profiles,
+};
 use anyhow::{ensure, Context, Result};
 use ferrum_diffusion::Bf16EulerProfile;
 use ferrum_kernels::backend::cuda::{
     vnext_ops::*,
     vnext_runtime::{CudaDeviceCommand, CudaDeviceRuntime, CudaTensorRuntimeConfig},
     CudaCudnnConfig, CudaMemoryUtilization, CudaTensorMemoryObservation,
-    CudaTensorRuntimeAutoConfig,
+    CudaTensorRuntimeAutoConfig, CudnnSdpaPlanPolicy,
 };
 use ferrum_models::normal_noise::{NormalNoiseConfig, NormalNoiseFamily};
 use ferrum_models::qwen3_vl_text::{
@@ -46,6 +49,7 @@ pub struct ImageCudaPipelineLimits {
     pub maximum_height: u32,
     pub maximum_batch_size: usize,
     pub decoder_batch_policy: super::ImageDecoderBatchPolicy,
+    pub plan_cache: super::ImagePlanCachePolicy,
     pub static_initialization: StaticInitializationPolicy,
     pub executor: ferrum_execution::TensorExecutorConfig,
 }
@@ -73,6 +77,7 @@ impl ImageCudaPipelineLimits {
             maximum_height: self.maximum_height,
             maximum_batch_size: self.maximum_batch_size,
             decoder_batch_policy: self.decoder_batch_policy,
+            plan_cache: self.plan_cache,
             static_initialization: self.static_initialization,
             executor: self.executor,
         }
@@ -88,6 +93,9 @@ pub struct ImageCudaCompositionReceipt {
     /// component plans retain the provider's library fingerprint separately.
     pub cudnn_library: std::path::PathBuf,
     pub cudnn_workspace_limit_bytes: u64,
+    pub attention_policy: ImageCudaAttentionPolicy,
+    /// Additional experimental plan-cache allowance, not a measured peak.
+    pub attention_opaque_memory_bytes: u64,
     /// These allowances are declared, not measured native memory peaks.
     pub runtime_opaque_profile: String,
     pub cudnn_opaque_profile: String,
@@ -105,6 +113,7 @@ pub struct QwenImage21CudaConfig {
     pub maximum_commands_per_submission: usize,
     pub opaque_memory_profile: String,
     pub cudnn: CudaCudnnConfig,
+    pub attention_policy: ImageCudaAttentionPolicy,
     pub host: HostMemoryLimits,
     pub pipeline: ImageCudaPipelineLimits,
 }
@@ -195,9 +204,9 @@ impl QwenImage21CudaConfig {
         ImageCudaCompositionReceipt,
     )> {
         self.validate()?;
-        let profiles = cuda_profiles()?;
+        let profiles = cuda_profiles(self.attention_policy)?;
         self.validate_assets(&assets, &profiles)?;
-        let contracts = contracts()?;
+        let contracts = contracts(self.attention_policy)?;
         let materializers = WeightMaterializerRegistry::identity_only()?;
         let device = cuda_tensor_runtime_config(
             self.ordinal,
@@ -252,16 +261,33 @@ impl QwenImage21CudaConfig {
             observed_memory,
             cudnn_library: self.cudnn.library_path.clone(),
             cudnn_workspace_limit_bytes: self.cudnn.workspace_limit_bytes,
+            attention_policy: self.attention_policy,
+            attention_opaque_memory_bytes: self.attention_policy.additional_opaque_bytes(),
             runtime_opaque_profile: self.opaque_memory_profile.clone(),
             cudnn_opaque_profile: self.cudnn.opaque_memory_profile.clone(),
         };
         // ALL includes Philox. Do not call the standalone Philox factory:
         // it would try to acquire a second live native-module permit.
-        let mut providers = cuda_vnext_tensor_providers_with_cudnn(
-            &runtime,
-            &self.cudnn,
-            &CudaTensorOperation::ALL,
-        )?;
+        let mut providers = match self.attention_policy {
+            ImageCudaAttentionPolicy::Sequential => cuda_vnext_tensor_providers_with_cudnn(
+                &runtime,
+                &self.cudnn,
+                &CudaTensorOperation::ALL,
+            )?,
+            ImageCudaAttentionPolicy::CudnnSdpaExperimentalV1 => {
+                cuda_vnext_tensor_providers_with_cudnn_sdpa(
+                    &runtime,
+                    &self.cudnn,
+                    CudnnSdpaPlanPolicy {
+                        maximum_plans: 64,
+                        maximum_live_bindings: 2048,
+                        opaque_memory_bytes: self.attention_policy.additional_opaque_bytes(),
+                        workspace_limit_bytes: self.cudnn.workspace_limit_bytes,
+                    },
+                    &CudaTensorOperation::ALL,
+                )?
+            }
+        };
         providers.push(cuda_vnext_dense_bf16_provider(&runtime)?);
         let registry = OperationRuntimeRegistry::new(contracts, providers)?;
         let descriptor = runtime.descriptor();
@@ -324,6 +350,7 @@ impl QwenImage21CudaConfig {
             .checked_mul(u64::try_from(self.maximum_streams)?)
             .and_then(|n| n.checked_add(self.bootstrap_memory_bytes))
             .and_then(|n| n.checked_add(self.cudnn.opaque_memory_bytes))
+            .and_then(|n| n.checked_add(self.attention_policy.additional_opaque_bytes()))
             .context("CUDA opaque allowance total overflows")
     }
 
@@ -399,19 +426,24 @@ fn validate_profile(profile: &str, label: &str) -> Result<()> {
     Ok(())
 }
 
-fn cuda_profiles() -> Result<QwenImage21Profiles> {
+fn cuda_profiles(attention: ImageCudaAttentionPolicy) -> Result<QwenImage21Profiles> {
     let id = |value: &str| NumericalProfileId::new(value).map_err(anyhow::Error::msg);
     Ok(QwenImage21Profiles {
         text_encoder: id(Qwen3VLTextEncoderFamily::CUDA_PROFILE_ID)?,
         noise: id(CUDA_PHILOX_NORMAL_BF16_NUMERICAL_PROFILE_ID)?,
-        denoiser: id(QwenImage21TransformerFamily::CUDA_PROFILE_ID)?,
+        denoiser: id(match attention {
+            ImageCudaAttentionPolicy::Sequential => QwenImage21TransformerFamily::CUDA_PROFILE_ID,
+            ImageCudaAttentionPolicy::CudnnSdpaExperimentalV1 => {
+                QwenImage21TransformerFamily::CUDA_FUSED_PROFILE_ID
+            }
+        })?,
         decoder: id(QwenImage21VaeDecoderFamily::CUDA_PROFILE_ID)?,
         euler: Bf16EulerProfile::CudaScalarBf16StagedRneV1,
     })
 }
 
-fn contracts() -> Result<Vec<Box<dyn OperationContract>>> {
-    Ok(vec![
+fn contracts(attention: ImageCudaAttentionPolicy) -> Result<Vec<Box<dyn OperationContract>>> {
+    let mut contracts: Vec<Box<dyn OperationContract>> = vec![
         Box::new(silu_bf16_contract()?),
         Box::new(silu_mul_bf16_contract()?),
         Box::new(tanh_bf16_contract()?),
@@ -437,7 +469,11 @@ fn contracts() -> Result<Vec<Box<dyn OperationContract>>> {
         Box::new(philox_normal_bf16_contract()?),
         Box::new(conv2d_bf16_contract()?),
         Box::new(dense_linear_bf16_contract()?),
-    ])
+    ];
+    if attention == ImageCudaAttentionPolicy::CudnnSdpaExperimentalV1 {
+        contracts.push(Box::new(structured_attention_fused_bf16_contract()?));
+    }
+    Ok(contracts)
 }
 
 #[cfg(test)]
@@ -455,6 +491,7 @@ mod tests {
             maximum_in_flight_per_stream: 1,
             maximum_commands_per_submission: 1024,
             opaque_memory_profile: "experimental-unqualified-test-v1".into(),
+            attention_policy: ImageCudaAttentionPolicy::Sequential,
             cudnn: CudaCudnnConfig {
                 library_path: "/explicit/libcudnn.so.9".into(),
                 opaque_memory_bytes: 4096,
@@ -477,6 +514,7 @@ mod tests {
                 maximum_height: 512,
                 maximum_batch_size: ImagePipelineConfig::DEFAULT_MAXIMUM_BATCH_SIZE,
                 decoder_batch_policy: crate::image_generation::ImageDecoderBatchPolicy::default(),
+                plan_cache: crate::image_generation::ImagePlanCachePolicy::default(),
                 static_initialization: StaticInitializationPolicy::new(1024, 32).unwrap(),
                 executor: TensorExecutorConfig::default(),
             },
@@ -544,7 +582,7 @@ mod tests {
 
     #[test]
     fn all_registered_contracts_are_unique_and_profiles_are_explicit_cuda() {
-        let contracts = contracts().unwrap();
+        let contracts = contracts(ImageCudaAttentionPolicy::Sequential).unwrap();
         let ids = contracts
             .iter()
             .map(|contract| contract.descriptor().id.clone())
@@ -558,7 +596,7 @@ mod tests {
         ] {
             assert!(ids.contains(&OperationId::new(required).unwrap()));
         }
-        let profiles = cuda_profiles().unwrap();
+        let profiles = cuda_profiles(ImageCudaAttentionPolicy::Sequential).unwrap();
         assert_eq!(
             profiles.text_encoder.as_str(),
             Qwen3VLTextEncoderFamily::CUDA_PROFILE_ID
@@ -576,5 +614,42 @@ mod tests {
             QwenImage21VaeDecoderFamily::CUDA_PROFILE_ID
         );
         assert_eq!(profiles.euler, Bf16EulerProfile::CudaScalarBf16StagedRneV1);
+    }
+
+    #[test]
+    fn explicit_fused_policy_changes_only_dit_profile_and_charges_native_cache() {
+        let sequential = cuda_profiles(ImageCudaAttentionPolicy::Sequential).unwrap();
+        let fused = cuda_profiles(ImageCudaAttentionPolicy::CudnnSdpaExperimentalV1).unwrap();
+        assert_eq!(sequential.text_encoder, fused.text_encoder);
+        assert_eq!(sequential.decoder, fused.decoder);
+        assert_eq!(sequential.noise, fused.noise);
+        assert_eq!(sequential.euler, fused.euler);
+        assert_ne!(sequential.denoiser, fused.denoiser);
+        assert_eq!(
+            fused.denoiser.as_str(),
+            QwenImage21TransformerFamily::CUDA_FUSED_PROFILE_ID
+        );
+        let legacy = contracts(ImageCudaAttentionPolicy::Sequential).unwrap();
+        let fused = contracts(ImageCudaAttentionPolicy::CudnnSdpaExperimentalV1).unwrap();
+        assert!(!legacy
+            .iter()
+            .any(|c| c.descriptor().id.as_str() == STRUCTURED_ATTENTION_FUSED_BF16_OPERATION_ID));
+        assert_eq!(
+            fused
+                .iter()
+                .filter(
+                    |c| c.descriptor().id.as_str() == STRUCTURED_ATTENTION_FUSED_BF16_OPERATION_ID
+                )
+                .count(),
+            1
+        );
+        let mut c = config();
+        let before = c.opaque_bytes().unwrap();
+        c.attention_policy = ImageCudaAttentionPolicy::CudnnSdpaExperimentalV1;
+        assert_eq!(c.opaque_bytes().unwrap(), before + 128 * 1024 * 1024);
+        assert!(c.validate().is_err());
+        c.memory =
+            ImageCudaMemoryPolicy::ExplicitTotal(NonZeroU64::new(1024 * 1024 * 1024).unwrap());
+        c.validate().unwrap();
     }
 }

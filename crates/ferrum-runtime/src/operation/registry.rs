@@ -434,6 +434,7 @@ pub struct OperationResourceEstimate {
     binding: Option<ProviderWorkspaceRequirement>,
     persistent: Option<ProviderWorkspaceRequirement>,
     projection_numerics: Option<crate::PreparedProjectionNumerics>,
+    prepared_implementation_fingerprint: Option<String>,
 }
 
 impl OperationResourceEstimate {
@@ -457,6 +458,7 @@ impl OperationResourceEstimate {
             binding: None,
             persistent,
             projection_numerics: None,
+            prepared_implementation_fingerprint: None,
         }
     }
 
@@ -472,6 +474,26 @@ impl OperationResourceEstimate {
 
     pub fn projection_numerics(&self) -> Option<&crate::PreparedProjectionNumerics> {
         self.projection_numerics.as_ref()
+    }
+
+    /// Bind the shape-specific native implementation selected during resource
+    /// estimation. This identity grants no buffer or execution authority.
+    pub fn with_prepared_implementation_fingerprint(
+        mut self,
+        fingerprint: impl Into<String>,
+    ) -> Result<Self, VNextError> {
+        let fingerprint = fingerprint.into();
+        if !canonical_sha256(&fingerprint) {
+            return Err(invalid_operation(
+                "prepared implementation fingerprint must be canonical SHA-256",
+            ));
+        }
+        self.prepared_implementation_fingerprint = Some(fingerprint);
+        Ok(self)
+    }
+
+    pub fn prepared_implementation_fingerprint(&self) -> Option<&str> {
+        self.prepared_implementation_fingerprint.as_deref()
     }
 
     pub fn estimator_id(&self) -> &str {
@@ -995,6 +1017,33 @@ where
     R: DeviceRuntime,
 {
     providers: Vec<BoundOperationProvider<'static, R>>,
+}
+
+// Copy immutable authority, never execution state or runtime resources. Each
+// entry keeps the exact provider object and verified plan/node binding.
+impl<R: DeviceRuntime> Clone for BoundOperationProviderSet<R> {
+    fn clone(&self) -> Self {
+        Self {
+            providers: self
+                .providers
+                .iter()
+                .map(|binding| BoundOperationProvider {
+                    provider: match &binding.provider {
+                        BoundOperationProviderSource::Borrowed(provider) => {
+                            BoundOperationProviderSource::Borrowed(*provider)
+                        }
+                        BoundOperationProviderSource::Owned(provider) => {
+                            BoundOperationProviderSource::Owned(provider.clone())
+                        }
+                    },
+                    plan_id: binding.plan_id.clone(),
+                    plan_hash: binding.plan_hash.clone(),
+                    node_id: binding.node_id.clone(),
+                    dispatch: binding.dispatch.clone(),
+                })
+                .collect(),
+        }
+    }
 }
 
 impl<R> BoundOperationProviderSet<R>

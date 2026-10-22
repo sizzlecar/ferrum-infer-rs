@@ -35,6 +35,7 @@ use super::{binding, contract_error, implementation_fingerprint, provider_failur
 mod attention;
 mod bundle;
 mod conv2d;
+mod cudnn_attention;
 mod geometry;
 mod gqa;
 mod half_split_rope;
@@ -57,7 +58,12 @@ pub use attention::{
 };
 use bundle::RetainedFunctions;
 pub(super) use conv2d::providers as providers_with_cudnn;
+pub(super) use conv2d::providers_with_sdpa as providers_with_cudnn_sdpa;
 pub use conv2d::NUMERICAL_PROFILE_ID as CONV2D_PROFILE_ID;
+pub use cudnn_attention::{
+    NUMERICAL_IDENTITY as FUSED_ATTENTION_NUMERICAL_IDENTITY,
+    NUMERICAL_PROFILE_ID as FUSED_ATTENTION_NUMERICAL_PROFILE_ID,
+};
 use geometry::{geometry, Shape};
 pub use gqa::{
     NUMERICAL_IDENTITY as GQA_NUMERICAL_IDENTITY, NUMERICAL_PROFILE_ID as GQA_NUMERICAL_PROFILE_ID,
@@ -254,6 +260,9 @@ pub(super) fn numerical_fingerprint() -> String {
         include_bytes!("tensor_silu.rs"),
         include_bytes!("tensor_silu/bundle.rs"),
         include_bytes!("tensor_silu/conv2d.rs"),
+        include_bytes!("tensor_silu/cudnn_attention.rs"),
+        include_bytes!("tensor_silu/cudnn_attention/layout.rs"),
+        cudnn_attention::NUMERICAL_IDENTITY.as_bytes(),
         include_bytes!("tensor_silu/spatial.rs"),
         include_bytes!("tensor_silu/spatial_extended.rs"),
         spatial_extended::NUMERICAL_IDENTITY.as_bytes(),

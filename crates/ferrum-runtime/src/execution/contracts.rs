@@ -313,6 +313,7 @@ impl PlanNode {
             binding: None,
             persistent: None,
             projection_numerics: None,
+            prepared_implementation_fingerprint: None,
         };
         let selected_provider = provider_resources.provider_id().clone();
         Self {

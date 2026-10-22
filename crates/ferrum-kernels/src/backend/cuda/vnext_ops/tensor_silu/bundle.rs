@@ -15,6 +15,7 @@ pub(super) struct RetainedFunctions {
     norm_functions: [CudaFunction; 3],
     rope_function: CudaFunction,
     attention_function: CudaFunction,
+    fused_attention_functions: [CudaFunction; 3],
     transport_functions: [CudaFunction; 2],
     half_split_rope_function: CudaFunction,
     gqa_attention_function: CudaFunction,
@@ -65,6 +66,23 @@ impl RetainedFunctions {
                 module.load_function(attention::FUNCTION).map_err(|error| {
                     CudaDeviceRuntimeError::driver("BF16 structured attention function load", error)
                 })?;
+            let fused_attention_functions = [
+                "ferrum_vnext_structured_attention_range_bf16",
+                "ferrum_vnext_attention_pack_kv_bf16",
+                "ferrum_vnext_attention_zero_range_bf16",
+            ]
+            .map(|name| module.load_function(name));
+            let [range, pack, zero] = fused_attention_functions;
+            let fused_attention_functions = [range, pack, zero].map(|function| {
+                function.map_err(|error| {
+                    CudaDeviceRuntimeError::driver(
+                        "BF16 fused attention support function load",
+                        error,
+                    )
+                })
+            });
+            let [range, pack, zero] = fused_attention_functions;
+            let fused_attention_functions = [range?, pack?, zero?];
             let load_transport = |kind: transport::Kind| {
                 module.load_function(kind.function()).map_err(|error| {
                     CudaDeviceRuntimeError::driver("BF16 transport function load", error)
@@ -119,6 +137,7 @@ impl RetainedFunctions {
                 normalization,
                 rope_function,
                 attention_function,
+                fused_attention_functions,
                 transport,
                 half_split_rope_function,
                 gqa_attention_function,
@@ -132,6 +151,7 @@ impl RetainedFunctions {
             norm_functions,
             rope_function,
             attention_function,
+            fused_attention_functions,
             transport_functions,
             half_split_rope_function,
             gqa_attention_function,
@@ -155,6 +175,7 @@ impl RetainedFunctions {
             norm_functions,
             rope_function,
             attention_function,
+            fused_attention_functions,
             transport_functions,
             half_split_rope_function,
             gqa_attention_function,
@@ -191,6 +212,10 @@ impl RetainedFunctions {
 
     pub(super) fn attention_function(&self) -> &CudaFunction {
         &self.attention_function
+    }
+
+    pub(super) fn fused_attention_function(&self, index: usize) -> &CudaFunction {
+        &self.fused_attention_functions[index]
     }
 
     pub(super) fn half_split_rope_function(&self) -> &CudaFunction {

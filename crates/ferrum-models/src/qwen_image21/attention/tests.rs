@@ -115,6 +115,72 @@ fn layout_is_canonical_config_and_changes_trusted_family_identity() {
 }
 
 #[test]
+fn fused_attention_is_an_explicit_separate_profile_and_operation() {
+    type F = QwenImage21Block0AttentionFamily;
+    let config = QwenImage21AttentionConfig::new(
+        transformer(2, 128),
+        QwenImage21AttentionLayout::uniform(2, true).unwrap(),
+    )
+    .unwrap();
+    let family = F::new().unwrap();
+    let profiles = family.numerical_profiles(&config).unwrap();
+    let legacy_id = NumericalProfileId::new(F::CUDA_PROFILE_ID).unwrap();
+    let fused_id = NumericalProfileId::new(F::CUDA_FUSED_PROFILE_ID).unwrap();
+    assert!(!profiles.auto_preference().contains(&fused_id));
+    let legacy = profiles.resolve(&legacy_id).unwrap();
+    let fused = profiles.resolve(&fused_id).unwrap();
+    assert_ne!(legacy.fingerprint().unwrap(), fused.fingerprint().unwrap());
+    assert_eq!(legacy.boundaries, fused.boundaries);
+    let original = family.semantic_program(&config, legacy).unwrap();
+    let candidate = family.semantic_program(&config, fused).unwrap();
+    assert_eq!(original.inputs(), candidate.inputs());
+    assert_eq!(original.weights(), candidate.weights());
+    assert_eq!(original.outputs(), candidate.outputs());
+    for (left, right) in original.blocks()[0]
+        .nodes
+        .iter()
+        .zip(&candidate.blocks()[0].nodes)
+    {
+        if left.operation_id.as_str() == STRUCTURED_ATTENTION_BF16_OPERATION_ID {
+            assert_eq!(
+                right.operation_id.as_str(),
+                STRUCTURED_ATTENTION_FUSED_BF16_OPERATION_ID
+            );
+            let mut restored = right.clone();
+            restored.operation_id = left.operation_id.clone();
+            assert_eq!(&restored, left);
+        } else {
+            assert_eq!(left, right);
+        }
+    }
+    let operation = fused
+        .operations
+        .iter()
+        .find(|op| op.operation_id.as_str() == STRUCTURED_ATTENTION_FUSED_BF16_OPERATION_ID)
+        .unwrap();
+    assert_eq!(operation.multiplication_type, None);
+    assert_eq!(operation.accumulation_type, None);
+    assert!(legacy.validate_program(&candidate).is_err());
+    assert!(fused.validate_program(&original).is_err());
+    fused.validate_program(&candidate).unwrap();
+    let prepared = TypedFamilyRegistration::new(F::new().unwrap())
+        .prepare_with_profile(&serde_json::to_value(config).unwrap(), &fused_id)
+        .unwrap();
+    assert_eq!(prepared.program(), &candidate);
+
+    let unsupported = QwenImage21AttentionConfig::new(
+        transformer(2, 8),
+        QwenImage21AttentionLayout::uniform(2, true).unwrap(),
+    )
+    .unwrap();
+    assert!(family
+        .numerical_profiles(&unsupported)
+        .unwrap()
+        .resolve(&fused_id)
+        .is_err());
+}
+
+#[test]
 fn layout_rejects_invalid_runs_and_keeps_adjacent_image_boundaries() {
     assert!(QwenImage21AttentionLayout::uniform(0, false).is_err());
     assert!(QwenImage21AttentionLayout::new(

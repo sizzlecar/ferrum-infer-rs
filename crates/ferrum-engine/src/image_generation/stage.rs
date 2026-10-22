@@ -34,6 +34,8 @@ pub struct ImageStagePlanReceipt {
     pub minimum_step_bytes: u64,
     /// Host wall time for family identity and plan compilation; not GPU time.
     pub compile_wall_duration_us: u64,
+    /// Reused immutable compilation; initialization still provisions a new session.
+    pub plan_cache_hit: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -117,8 +119,8 @@ impl<R: DeviceRuntime> fmt::Debug for ImageGenerationError<R> {
 impl<R: DeviceRuntime> std::error::Error for ImageGenerationError<R> {}
 
 pub(super) struct PreparedStage<R: DeviceRuntime> {
-    component: CompiledTensorComponent<R>,
-    plan: ImageStagePlanReceipt,
+    pub(super) component: Arc<CompiledTensorComponent<R>>,
+    pub(super) plan: ImageStagePlanReceipt,
 }
 impl<R: DeviceRuntime> PreparedStage<R> {
     pub(super) fn compile(
@@ -131,6 +133,17 @@ impl<R: DeviceRuntime> PreparedStage<R> {
         let started = Instant::now();
         ensure!(batch_size > 0, "stage batch size must be positive");
         let family_fingerprint = family.fingerprint()?;
+        if pipeline.config.plan_cache == ImagePlanCachePolicy::LastPerStage {
+            if let Some((component, mut plan)) =
+                pipeline
+                    .plan_cache
+                    .get(stage, batch_size, &family_fingerprint, options)?
+            {
+                plan.compile_wall_duration_us = elapsed_us(started);
+                plan.plan_cache_hit = true;
+                return Ok(Self { component, plan });
+            }
+        }
         let family_id = family.family_id().clone();
         let profile = family.numerical_profile().id.clone();
         let component = CompiledTensorComponent::compile(
@@ -149,8 +162,8 @@ impl<R: DeviceRuntime> PreparedStage<R> {
         let memory = component.executable().execution_plan().payload().memory();
         let static_bytes = memory.static_bytes();
         let minimum_step_bytes = memory.minimum_step_bytes();
-        Ok(Self {
-            component,
+        let prepared = Self {
+            component: Arc::new(component),
             plan: ImageStagePlanReceipt {
                 stage,
                 batch_size,
@@ -161,8 +174,17 @@ impl<R: DeviceRuntime> PreparedStage<R> {
                 static_bytes,
                 minimum_step_bytes,
                 compile_wall_duration_us: elapsed_us(started),
+                plan_cache_hit: false,
             },
-        })
+        };
+        if pipeline.config.plan_cache == ImagePlanCachePolicy::LastPerStage {
+            pipeline.plan_cache.insert(
+                prepared.component.clone(),
+                prepared.plan.clone(),
+                options.clone(),
+            )?;
+        }
+        Ok(prepared)
     }
 
     pub(super) fn start(

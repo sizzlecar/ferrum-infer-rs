@@ -133,7 +133,8 @@ pub enum ComponentInitializationReceipt {
 
 /// Compilation and provider binding happen before physical provisioning. The
 /// registry remains a caller-owned capability selection; no model/backend
-/// names are interpreted here. A compiled component can be activated once.
+/// names are interpreted here. Repeated initialization reuses compilation and
+/// provider authority; each session independently admits all runtime resources.
 pub struct CompiledTensorComponent<R: DeviceRuntime> {
     family: PreparedModelFamily,
     executable: ExecutablePlan,
@@ -188,7 +189,7 @@ impl<R: DeviceRuntime> CompiledTensorComponent<R> {
     /// mmap/materializer backing remains owned by its source, and is not a
     /// claim that this staging account bounds total process RSS.
     pub fn initialize(
-        self,
+        &self,
         runtime: Arc<R>,
         host: HostMemoryAccount,
         source: ComponentWeightSource<'_>,
@@ -201,7 +202,7 @@ impl<R: DeviceRuntime> CompiledTensorComponent<R> {
         } = self;
         let (resources, receipt) = initialize_resources(
             runtime,
-            &family,
+            family,
             executable.execution_plan(),
             source,
             &host,
@@ -209,7 +210,7 @@ impl<R: DeviceRuntime> CompiledTensorComponent<R> {
         )?;
         match PreparedTensorExecutor::new(
             executable.clone(),
-            providers,
+            providers.clone(),
             resources.clone(),
             host,
             config.executor,
@@ -217,7 +218,7 @@ impl<R: DeviceRuntime> CompiledTensorComponent<R> {
             Ok(executor) => Ok(TensorComponentSession {
                 executor: Some(executor),
                 resources: Some(resources),
-                executable,
+                executable: executable.clone(),
                 receipt,
             }),
             Err(source) => Err(ComponentInitializationError::Executor {

@@ -32,6 +32,7 @@ pub(super) struct ForwardPerformance {
 }
 
 pub(super) struct Api {
+    pub graph: GraphApi,
     pub version: unsafe extern "C" fn() -> usize,
     pub create: unsafe extern "C" fn(*mut Handle) -> c_int,
     pub destroy: unsafe extern "C" fn(Handle) -> c_int,
@@ -115,6 +116,14 @@ impl Api {
             };
         }
         Ok(Self {
+            graph: GraphApi {
+                create: symbol!("cudnnBackendCreateDescriptor"),
+                destroy: symbol!("cudnnBackendDestroyDescriptor"),
+                set: symbol!("cudnnBackendSetAttribute"),
+                get: symbol!("cudnnBackendGetAttribute"),
+                finalize: symbol!("cudnnBackendFinalize"),
+                execute: symbol!("cudnnBackendExecute"),
+            },
             version: symbol!("cudnnGetVersion"),
             create: symbol!("cudnnCreate"),
             destroy: symbol!("cudnnDestroy"),
@@ -136,6 +145,19 @@ impl Api {
             _library: unsafe { std::mem::ManuallyDrop::take(&mut library) },
         })
     }
+}
+
+/// Narrow Graph ABI checked against the deployed cuDNN 9.20.0 cudnn_graph.h.
+/// The owning Api retains the explicitly selected library. No enum from native
+/// code is materialized as a Rust enum, and no allocator API is exposed.
+#[derive(Clone, Copy)]
+pub(super) struct GraphApi {
+    pub create: unsafe extern "C" fn(c_int, *mut Descriptor) -> c_int,
+    pub destroy: unsafe extern "C" fn(Descriptor) -> c_int,
+    pub set: unsafe extern "C" fn(Descriptor, c_int, c_int, i64, *const c_void) -> c_int,
+    pub get: unsafe extern "C" fn(Descriptor, c_int, c_int, i64, *mut i64, *mut c_void) -> c_int,
+    pub finalize: unsafe extern "C" fn(Descriptor) -> c_int,
+    pub execute: unsafe extern "C" fn(Handle, Descriptor, Descriptor) -> c_int,
 }
 
 pub(super) fn check(status: c_int, operation: &str) -> Result<(), String> {

@@ -33,6 +33,10 @@ impl QwenImage21TransformerFamily {
     pub const REFERENCE_PROFILE_ID: &'static str =
         "qwen_image21.transformer.t2i.reference.bf16_f32.v1";
     pub const CUDA_PROFILE_ID: &'static str = "qwen_image21.transformer.t2i.cuda.bf16_f32.v1";
+    /// All DiT attention nodes use the distinct vendor-fused operation. This
+    /// does not select VAE attention or alter the legacy CUDA profile.
+    pub const CUDA_FUSED_PROFILE_ID: &'static str =
+        "qwen_image21.transformer.t2i.cuda.fused_attention.experimental.v1";
     pub const LATENTS_ID: &'static str = "value.qwen_image21.transformer.latents";
     pub const TEXT_ID: &'static str = "value.qwen_image21.transformer.text";
     pub const TIME_FEATURES_ID: &'static str = "value.qwen_image21.transformer.time_features";
@@ -106,6 +110,9 @@ impl ModelFamilyProvider for QwenImage21TransformerFamily {
         let source = block.numerical_profiles(&block_config)?;
         let mut profiles = Vec::new();
         for (name, source_name) in profile_sources() {
+            if name == Self::CUDA_FUSED_PROFILE_ID && config.transformer().head_dim() != 128 {
+                continue;
+            }
             let mut profile = source.resolve(&profile_id(source_name)?)?.clone();
             let graph = program::build(self, config, source_name)?;
             profile.id = profile_id(name)?;
@@ -179,7 +186,7 @@ impl ModelFamilyProvider for QwenImage21TransformerFamily {
     }
 }
 
-fn profile_sources() -> [(&'static str, &'static str); 2] {
+fn profile_sources() -> [(&'static str, &'static str); 3] {
     [
         (
             QwenImage21TransformerFamily::REFERENCE_PROFILE_ID,
@@ -188,6 +195,10 @@ fn profile_sources() -> [(&'static str, &'static str); 2] {
         (
             QwenImage21TransformerFamily::CUDA_PROFILE_ID,
             Block::CUDA_PROFILE_ID,
+        ),
+        (
+            QwenImage21TransformerFamily::CUDA_FUSED_PROFILE_ID,
+            Block::CUDA_FUSED_PROFILE_ID,
         ),
     ]
 }

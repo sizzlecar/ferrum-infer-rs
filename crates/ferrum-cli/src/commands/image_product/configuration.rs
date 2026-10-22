@@ -123,6 +123,9 @@ pub struct CudaConfig {
     pub maximum_commands_per_submission: usize,
     pub opaque_memory_profile: String,
     pub cudnn: CudnnConfig,
+    /// Opt-in DiT SDPA. Legacy JSON without this field keeps sequential attention.
+    #[serde(default)]
+    pub attention_policy: ferrum_engine::image_generation::ImageCudaAttentionPolicy,
     pub host: HostConfig,
     pub pipeline: PipelineConfig,
 }
@@ -166,6 +169,8 @@ pub struct PipelineConfig {
     pub maximum_batch_size: usize,
     #[serde(default)]
     pub decoder_batch_policy: ferrum_engine::image_generation::ImageDecoderBatchPolicy,
+    #[serde(default)]
+    pub plan_cache: ferrum_engine::image_generation::ImagePlanCachePolicy,
     pub maximum_staging_bytes: u64,
     pub maximum_initialization_commands: usize,
     pub maximum_backing_maintenance_passes: usize,
@@ -198,6 +203,7 @@ impl PipelineConfig {
             maximum_height: self.maximum_height,
             maximum_batch_size: self.maximum_batch_size,
             decoder_batch_policy: self.decoder_batch_policy,
+            plan_cache: self.plan_cache,
             static_initialization: StaticInitializationPolicy::new(
                 self.maximum_staging_bytes,
                 self.maximum_initialization_commands,
@@ -206,6 +212,51 @@ impl PipelineConfig {
                 maximum_backing_maintenance_passes: self.maximum_backing_maintenance_passes,
             },
         })
+    }
+}
+
+#[cfg(test)]
+mod attention_policy_tests {
+    use super::*;
+    use ferrum_engine::image_generation::ImageCudaAttentionPolicy;
+
+    #[test]
+    fn actual_cuda_wire_requires_explicit_sdpa_and_rejects_unknown_policy() {
+        let mut wire = serde_json::json!({
+            "ordinal":0,"usable_memory_bytes":1024,"bootstrap_memory_bytes":64,
+            "stream_memory_bytes":64,"maximum_streams":1,"maximum_in_flight_per_stream":1,
+            "maximum_commands_per_submission":2048,"opaque_memory_profile":"test",
+            "cudnn":{"library_path":"/explicit/libcudnn.so.9","opaque_memory_bytes":64,
+                "workspace_limit_bytes":0,"opaque_memory_profile":"test"},
+            "host":{"total_bytes":4096,"input_preprocess_bytes":1024,
+                "transfer_staging_bytes":1024,"output_bytes":1024,"weight_backing_bytes":0},
+            "pipeline":{"maximum_user_tokens":512,"maximum_width":512,"maximum_height":512,
+                "maximum_staging_bytes":64,"maximum_initialization_commands":8,
+                "maximum_backing_maintenance_passes":8}
+        });
+        let legacy: CudaConfig = serde_json::from_value(wire.clone()).unwrap();
+        assert_eq!(
+            legacy.attention_policy,
+            ImageCudaAttentionPolicy::Sequential
+        );
+        wire["attention_policy"] = serde_json::json!("cudnn_sdpa_experimental_v1");
+        let explicit: CudaConfig = serde_json::from_value(wire.clone()).unwrap();
+        assert_eq!(
+            explicit.attention_policy,
+            ImageCudaAttentionPolicy::CudnnSdpaExperimentalV1
+        );
+        assert_eq!(
+            legacy.resolved_pipeline().unwrap().device_capacity_bytes,
+            explicit.resolved_pipeline().unwrap().device_capacity_bytes
+        );
+        for value in [
+            serde_json::json!("fused"),
+            serde_json::json!(null),
+            serde_json::json!({}),
+        ] {
+            wire["attention_policy"] = value;
+            assert!(serde_json::from_value::<CudaConfig>(wire.clone()).is_err());
+        }
     }
 }
 
@@ -320,6 +371,7 @@ impl CudaConfig {
                 maximum_in_flight_per_stream: self.maximum_in_flight_per_stream,
                 maximum_commands_per_submission: self.maximum_commands_per_submission,
                 opaque_memory_profile: self.opaque_memory_profile.clone(),
+                attention_policy: self.attention_policy,
                 cudnn: ferrum_kernels::backend::cuda::CudaCudnnConfig {
                     library_path: self.cudnn.library_path.clone(),
                     opaque_memory_bytes: self.cudnn.opaque_memory_bytes,
@@ -344,6 +396,7 @@ impl PipelineConfig {
             maximum_height: self.maximum_height,
             maximum_batch_size: self.maximum_batch_size,
             decoder_batch_policy: self.decoder_batch_policy,
+            plan_cache: self.plan_cache,
             static_initialization: StaticInitializationPolicy::new(
                 self.maximum_staging_bytes,
                 self.maximum_initialization_commands,
