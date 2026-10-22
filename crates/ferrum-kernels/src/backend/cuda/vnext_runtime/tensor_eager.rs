@@ -253,6 +253,9 @@ impl CudaDeviceRuntime {
                         | ferrum_runtime::STRUCTURED_GQA_ATTENTION_BF16_CAPABILITY_ID
                         | ferrum_runtime::CONV2D_BF16_CAPABILITY_ID
                         | ferrum_runtime::CHANNEL_L2_NORM_BF16_CAPABILITY_ID
+                        | ferrum_runtime::CHANNEL_L2_NORM_IMAGE_BF16_CAPABILITY_ID
+                        | ferrum_runtime::SPATIAL_ATTENTION_BF16_CAPABILITY_ID
+                        | ferrum_runtime::SPATIAL_UPSAMPLE_GATHER_BF16_CAPABILITY_ID
                         | ferrum_runtime::SILU_NCHW_BF16_CAPABILITY_ID
                         | ferrum_runtime::PLAIN_RESIDUAL_ADD_NCHW_BF16_CAPABILITY_ID
                 )

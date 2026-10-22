@@ -42,6 +42,7 @@ mod norm;
 mod rope;
 mod selection;
 mod spatial;
+mod spatial_extended;
 mod text_projection;
 mod transport;
 pub use attention::{
@@ -68,8 +69,13 @@ pub use rope::{
 };
 pub use selection::CudaTensorOperation;
 pub use spatial::{
-    ADD_PROFILE_ID as RESIDUAL_ADD_NCHW_PROFILE_ID, L2_PROFILE_ID as CHANNEL_L2_PROFILE_ID,
+    ADD_PROFILE_ID as RESIDUAL_ADD_NCHW_PROFILE_ID,
+    L2_IMAGE_PROFILE_ID as CHANNEL_L2_IMAGE_PROFILE_ID, L2_PROFILE_ID as CHANNEL_L2_PROFILE_ID,
     SILU_PROFILE_ID as SILU_NCHW_PROFILE_ID,
+};
+pub use spatial_extended::{
+    ATTENTION_PROFILE_ID as SPATIAL_ATTENTION_PROFILE_ID,
+    GATHER_PROFILE_ID as SPATIAL_GATHER_PROFILE_ID,
 };
 pub use text_projection::{
     GELU_TANH_PROFILE_ID, NUMERICAL_IDENTITY as TEXT_PROJECTION_NUMERICAL_IDENTITY,
@@ -243,6 +249,8 @@ pub(super) fn numerical_fingerprint() -> String {
         include_bytes!("tensor_silu/bundle.rs"),
         include_bytes!("tensor_silu/conv2d.rs"),
         include_bytes!("tensor_silu/spatial.rs"),
+        include_bytes!("tensor_silu/spatial_extended.rs"),
+        spatial_extended::NUMERICAL_IDENTITY.as_bytes(),
         include_bytes!("tensor_silu/geometry.rs"),
         include_bytes!("tensor_silu/norm.rs"),
         include_bytes!("tensor_silu/rope.rs"),

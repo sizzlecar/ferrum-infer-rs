@@ -555,3 +555,102 @@ extern "C" __global__ void ferrum_vnext_channel_l2_norm_bf16(
         __syncthreads();
     }
 }
+
+// Part of the precise BF16 module. This is a distinct single-head
+// spatial profile; it does not change structured attention's reduction.
+#define FERRUM_SPATIAL_SLOTS(M) M(0) M(1) M(2) M(3) M(4) M(5) M(6) M(7)
+
+extern "C" __global__ void ferrum_vnext_spatial_attention_bf16(
+    const uint16_t* qkv, uint16_t* output, uint64_t positions,
+    uint32_t channels, uint64_t spatial, uint32_t tree_width, float scale) {
+    extern __shared__ float reduction[];
+    __shared__ float maximum, denominator, alpha, probability, inverse, score;
+    __shared__ uint32_t poisoned;
+    // Exactly 256 threads. Slots are compile-time scalar names, not a
+    // dynamically indexed per-thread C-element array or an S-squared buffer.
+    for (uint64_t position = blockIdx.x; position < positions; position += gridDim.x) {
+        const uint64_t batch = position / spatial;
+        const uint64_t query = position % spatial;
+        const uint64_t qbase = batch * 3 * channels * spatial;
+#define DECLARE_SLOT(I) \
+        const uint32_t c##I = threadIdx.x + I * 256; \
+        const float q##I = c##I < channels ? ferrum_bf16_decode(qkv[qbase + static_cast<uint64_t>(c##I) * spatial + query]) : 0.0f; \
+        float acc##I = 0.0f;
+        FERRUM_SPATIAL_SLOTS(DECLARE_SLOT)
+#undef DECLARE_SLOT
+        if (threadIdx.x == 0) { poisoned = 0; maximum = 0.0f; denominator = 0.0f; }
+        __syncthreads();
+        for (uint64_t key = 0; key < spatial; ++key) {
+#define DOT_SLOT(I) \
+            if (c##I < tree_width) reduction[c##I] = c##I < channels \
+                ? __fmul_rn(q##I, ferrum_bf16_decode(qkv[qbase + (static_cast<uint64_t>(channels) + c##I) * spatial + key])) : 0.0f;
+            FERRUM_SPATIAL_SLOTS(DOT_SLOT)
+#undef DOT_SLOT
+            __syncthreads();
+            for (uint32_t span = 1; span < tree_width; span *= 2) {
+                for (uint32_t pair = threadIdx.x; pair < tree_width / (2 * span); pair += 256) {
+                    const uint32_t start = pair * 2 * span;
+                    reduction[start] = __fadd_rn(reduction[start], reduction[start + span]);
+                }
+                __syncthreads();
+            }
+            if (threadIdx.x == 0) {
+                score = __fmul_rn(reduction[0], scale);
+                if (!isfinite(score)) { poisoned = 1; }
+                else if (key == 0) { maximum = score; denominator = 1.0f; }
+                else {
+                    const float next = fmaxf(maximum, score);
+                    alpha = expf(__fsub_rn(maximum, next));
+                    probability = expf(__fsub_rn(score, next));
+                    denominator = __fadd_rn(__fmul_rn(denominator, alpha), probability);
+                    maximum = next;
+                }
+            }
+            __syncthreads();
+            if (poisoned) break;
+#define UPDATE_SLOT(I) \
+            if (c##I < channels) { \
+                const float v = ferrum_bf16_decode(qkv[qbase + (2 * static_cast<uint64_t>(channels) + c##I) * spatial + key]); \
+                acc##I = key == 0 ? v : __fadd_rn(__fmul_rn(acc##I, alpha), __fmul_rn(probability, v)); \
+            }
+            FERRUM_SPATIAL_SLOTS(UPDATE_SLOT)
+#undef UPDATE_SLOT
+            __syncthreads();
+        }
+        if (threadIdx.x == 0) inverse = poisoned ? 0.0f : __fdiv_rn(1.0f, denominator);
+        __syncthreads();
+#define STORE_SLOT(I) \
+        if (c##I < channels) output[(batch * channels + c##I) * spatial + query] = poisoned \
+            ? static_cast<uint16_t>(0x7fc0U) : ferrum_bf16_rne(__fmul_rn(acc##I, inverse));
+        FERRUM_SPATIAL_SLOTS(STORE_SLOT)
+#undef STORE_SLOT
+        __syncthreads();
+    }
+}
+#undef FERRUM_SPATIAL_SLOTS
+
+struct FerrumSpatialGather {
+    uint64_t offsets[64];
+    uint64_t input_channels, input_height, input_width;
+    uint64_t output_channels, output_height, output_width;
+    uint64_t scale_h, scale_w, channel_stride;
+};
+static_assert(sizeof(FerrumSpatialGather) == 584, "spatial gather ABI");
+
+// Source index arithmetic was checked from geometry before submission. The
+// tile metadata is a bounded value argument, never an unaccounted allocation.
+extern "C" __global__ void ferrum_vnext_spatial_upsample_gather_bf16(
+    const uint16_t* input, uint16_t* output, uint64_t elements, FerrumSpatialGather shape) {
+    const uint64_t first = static_cast<uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const uint64_t step = static_cast<uint64_t>(gridDim.x) * blockDim.x;
+    for (uint64_t i = first; i < elements; i += step) {
+        const uint64_t x = i % shape.output_width;
+        const uint64_t y = (i / shape.output_width) % shape.output_height;
+        const uint64_t plane = i / (shape.output_height * shape.output_width);
+        const uint64_t batch = plane / shape.output_channels;
+        const uint64_t channel = (plane % shape.output_channels) * shape.channel_stride
+            + shape.offsets[(y % shape.scale_h) * shape.scale_w + x % shape.scale_w];
+        output[i] = input[((batch * shape.input_channels + channel) * shape.input_height
+            + y / shape.scale_h) * shape.input_width + x / shape.scale_w];
+    }
+}

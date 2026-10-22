@@ -14,6 +14,7 @@ mod image_projection;
 mod qk_norm;
 pub mod t2i_prompt;
 mod transformer;
+mod vae_decoder;
 mod vae_stem;
 mod weights;
 
@@ -36,6 +37,9 @@ pub use qk_norm::{QwenImage21Block0QkNormFamily, QwenImage21QkFrontend};
 pub use transformer::{
     QwenImage21ModelTimestep, QwenImage21RotaryFrequencies, QwenImage21T2iLayout,
     QwenImage21Timestep256, QwenImage21TransformerConfig, QwenImage21TransformerFamily,
+};
+pub use vae_decoder::{
+    QwenImage21VaeDecoderConfig, QwenImage21VaeDecoderFamily, QwenImage21VaeDecoderWeight,
 };
 pub use vae_stem::{QwenImage21VaeStemConfig, QwenImage21VaeStemFamily, QwenImage21VaeStemWeight};
 pub use weights::{ExpectedTensor, ExpectedWeights};

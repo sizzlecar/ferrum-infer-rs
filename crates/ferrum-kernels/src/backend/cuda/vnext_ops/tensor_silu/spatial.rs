@@ -3,20 +3,23 @@
 
 use super::*;
 use ferrum_runtime::{
-    channel_l2_norm_bf16_contract, plain_residual_add_nchw_bf16_contract, silu_nchw_bf16_contract,
-    Bf16NchwGeometry, ChannelL2NormBf16Geometry, PhysicalWeightLayout, WeightFormatId,
-    CHANNEL_L2_NORM_BF16_CAPABILITY_ID, CHANNEL_L2_NORM_BF16_OPERATION_ID,
+    channel_l2_norm_bf16_contract, channel_l2_norm_image_bf16_contract,
+    plain_residual_add_nchw_bf16_contract, silu_nchw_bf16_contract, Bf16NchwGeometry,
+    ChannelL2NormBf16Geometry, ChannelL2NormImageBf16Geometry, PhysicalWeightLayout,
+    WeightFormatId, CHANNEL_L2_NORM_BF16_CAPABILITY_ID, CHANNEL_L2_NORM_BF16_OPERATION_ID,
+    CHANNEL_L2_NORM_IMAGE_BF16_CAPABILITY_ID, CHANNEL_L2_NORM_IMAGE_BF16_OPERATION_ID,
     PLAIN_RESIDUAL_ADD_NCHW_BF16_CAPABILITY_ID, PLAIN_RESIDUAL_ADD_NCHW_BF16_OPERATION_ID,
     SILU_NCHW_BF16_CAPABILITY_ID, SILU_NCHW_BF16_OPERATION_ID,
 };
 
 pub const L2_PROFILE_ID: &str = "cuda.ieee.channel_l2_norm.bf16.padded_pairwise.v1";
+pub const L2_IMAGE_PROFILE_ID: &str = "cuda.ieee.channel_l2_norm_image.bf16.padded_pairwise.v1";
 pub const SILU_PROFILE_ID: &str = "cuda.libdevice.precise.silu.nchw.bf16.v1";
 pub const ADD_PROFILE_ID: &str = "cuda.ieee.plain_residual_add.nchw.bf16.v1";
 pub const NUMERICAL_IDENTITY:&str=concat!(
     "NCHW;C=1..4096;L2=zero-padded-next-power-of-two-adjacent-FP32-square-sum-tree;",
     "RN32-sqrt;NaN-propagating-clamp-min-epsilon;B(div_rn)->B(scale_mul)->B(gamma_mul)->B(add_positive_zero);",
-    "scale-and-epsilon=(rational-as-f64)-as-f32;gamma-actual[C,1,1,1];",
+    "scale-and-epsilon=(rational-as-f64)-as-f32;gamma-actual[C,1,1,1]-or-independent-image-contract[C,1,1];",
     "silu=existing-precise-FP32-expf-div-profile;add=B(RN32(x+u));",
     "logical-work-L2=6/elements;Silu=4/elements;Add=1/elements;",
     "no-global-scratch;shared=4*nextpow2(C);no-ATen-reduction-or-deployment-bitwise-claim"
@@ -25,6 +28,7 @@ pub const NUMERICAL_IDENTITY:&str=concat!(
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum SpatialKind {
     ChannelL2,
+    ChannelL2Image,
     Silu,
     ResidualAdd,
 }
@@ -39,6 +43,7 @@ impl SpatialKind {
     fn id(self) -> &'static str {
         match self {
             Self::ChannelL2 => CHANNEL_L2_NORM_BF16_OPERATION_ID,
+            Self::ChannelL2Image => CHANNEL_L2_NORM_IMAGE_BF16_OPERATION_ID,
             Self::Silu => SILU_NCHW_BF16_OPERATION_ID,
             Self::ResidualAdd => PLAIN_RESIDUAL_ADD_NCHW_BF16_OPERATION_ID,
         }
@@ -46,6 +51,7 @@ impl SpatialKind {
     fn capability(self) -> &'static str {
         match self {
             Self::ChannelL2 => CHANNEL_L2_NORM_BF16_CAPABILITY_ID,
+            Self::ChannelL2Image => CHANNEL_L2_NORM_IMAGE_BF16_CAPABILITY_ID,
             Self::Silu => SILU_NCHW_BF16_CAPABILITY_ID,
             Self::ResidualAdd => PLAIN_RESIDUAL_ADD_NCHW_BF16_CAPABILITY_ID,
         }
@@ -53,6 +59,7 @@ impl SpatialKind {
     fn profile(self) -> &'static str {
         match self {
             Self::ChannelL2 => L2_PROFILE_ID,
+            Self::ChannelL2Image => L2_IMAGE_PROFILE_ID,
             Self::Silu => SILU_PROFILE_ID,
             Self::ResidualAdd => ADD_PROFILE_ID,
         }
@@ -60,6 +67,7 @@ impl SpatialKind {
     fn native_operation(self) -> &'static str {
         match self {
             Self::ChannelL2 => "vnext_channel_l2_norm_bf16",
+            Self::ChannelL2Image => "vnext_channel_l2_norm_image_bf16",
             Self::Silu => "vnext_silu_nchw_bf16",
             Self::ResidualAdd => "vnext_plain_residual_add_nchw_bf16",
         }
@@ -67,6 +75,7 @@ impl SpatialKind {
     fn provider(self) -> &'static str {
         match self {
             Self::ChannelL2 => "provider.cuda.channel_l2_norm.bf16",
+            Self::ChannelL2Image => "provider.cuda.channel_l2_norm_image.bf16",
             Self::Silu => "provider.cuda.silu.nchw.bf16",
             Self::ResidualAdd => "provider.cuda.plain_residual_add.nchw.bf16",
         }
@@ -74,6 +83,7 @@ impl SpatialKind {
     fn estimator(self) -> &'static str {
         match self {
             Self::ChannelL2 => "resource-estimator.cuda.channel_l2_norm.bf16",
+            Self::ChannelL2Image => "resource-estimator.cuda.channel_l2_norm_image.bf16",
             Self::Silu => "resource-estimator.cuda.silu.nchw.bf16",
             Self::ResidualAdd => "resource-estimator.cuda.plain_residual_add.nchw.bf16",
         }
@@ -81,6 +91,7 @@ impl SpatialKind {
     fn contract(self) -> Result<StandardOperationContract, VNextError> {
         match self {
             Self::ChannelL2 => channel_l2_norm_bf16_contract(),
+            Self::ChannelL2Image => channel_l2_norm_image_bf16_contract(),
             Self::Silu => silu_nchw_bf16_contract(),
             Self::ResidualAdd => plain_residual_add_nchw_bf16_contract(),
         }
@@ -216,7 +227,9 @@ impl SpatialProvider {
         let kind = self.kind;
         let mut regions = Vec::with_capacity(kind.inputs() as usize + 1);
         for ordinal in 0..kind.inputs() {
-            let bytes = if ordinal == 1 && kind == SpatialKind::ChannelL2 {
+            let bytes = if ordinal == 1
+                && matches!(kind, SpatialKind::ChannelL2 | SpatialKind::ChannelL2Image)
+            {
                 s.channels * 2
             } else {
                 s.bytes
@@ -245,7 +258,7 @@ impl SpatialProvider {
         CudaDeviceCommand::operation(kind.native_operation(), regions, move |stream, regions| {
             let x = regions[0].device_ptr();
             let out = regions[kind.inputs() as usize].device_ptr();
-            if kind == SpatialKind::ChannelL2 {
+            if matches!(kind, SpatialKind::ChannelL2 | SpatialKind::ChannelL2Image) {
                 let gamma = regions[1].device_ptr();
                 let mut launch = stream.launch_builder(kernels.spatial_function(2));
                 launch
@@ -336,32 +349,39 @@ fn geometry(
         .ok_or("CUDA NCHW byte extent exceeds address space")?;
     let spatial = g.height() * g.width();
     let positions = g.batch() * spatial;
-    let (epsilon, scale, tree_width, work) = if kind == SpatialKind::ChannelL2 {
-        let gamma = binding(values, ResolvedValueRole::Input, 1)?;
-        let n = ChannelL2NormBf16Geometry::new(x.tensor(), gamma.tensor(), y.tensor(), attrs)
-            .map_err(|e| e.to_string())?;
-        if g.channels() > 4096 {
-            return Err("CUDA channel L2 normalization supports C<=4096".into());
-        }
-        (
-            n.effective_epsilon(),
-            n.effective_scale(),
-            g.channels().next_power_of_two() as u32,
-            6,
-        )
-    } else {
-        if !attrs.is_empty() {
-            return Err("CUDA NCHW pointwise accepts no attributes".into());
-        }
-        if kind == SpatialKind::ResidualAdd
-            && binding(values, ResolvedValueRole::Input, 1)?.tensor() != x.tensor()
-        {
-            return Err(
-                "CUDA NCHW residual requires an exact second input shape/dtype/layout".into(),
-            );
-        }
-        (0.0, 0.0, 0, if kind == SpatialKind::Silu { 4 } else { 1 })
-    };
+    let (epsilon, scale, tree_width, work) =
+        if matches!(kind, SpatialKind::ChannelL2 | SpatialKind::ChannelL2Image) {
+            let gamma = binding(values, ResolvedValueRole::Input, 1)?;
+            let n = if kind == SpatialKind::ChannelL2Image {
+                ChannelL2NormImageBf16Geometry::new(x.tensor(), gamma.tensor(), y.tensor(), attrs)
+                    .map_err(|e| e.to_string())?
+                    .arithmetic_geometry()
+            } else {
+                ChannelL2NormBf16Geometry::new(x.tensor(), gamma.tensor(), y.tensor(), attrs)
+                    .map_err(|e| e.to_string())?
+            };
+            if g.channels() > 4096 {
+                return Err("CUDA channel L2 normalization supports C<=4096".into());
+            }
+            (
+                n.effective_epsilon(),
+                n.effective_scale(),
+                g.channels().next_power_of_two() as u32,
+                6,
+            )
+        } else {
+            if !attrs.is_empty() {
+                return Err("CUDA NCHW pointwise accepts no attributes".into());
+            }
+            if kind == SpatialKind::ResidualAdd
+                && binding(values, ResolvedValueRole::Input, 1)?.tensor() != x.tensor()
+            {
+                return Err(
+                    "CUDA NCHW residual requires an exact second input shape/dtype/layout".into(),
+                );
+            }
+            (0.0, 0.0, 0, if kind == SpatialKind::Silu { 4 } else { 1 })
+        };
     let operations = elements
         .checked_mul(work)
         .ok_or("CUDA NCHW logical work overflows")?;

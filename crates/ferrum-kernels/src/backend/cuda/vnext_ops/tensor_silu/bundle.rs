@@ -19,6 +19,7 @@ pub(super) struct RetainedFunctions {
     half_split_rope_function: CudaFunction,
     gqa_attention_function: CudaFunction,
     spatial_functions: [CudaFunction; 3],
+    extended_spatial_functions: [CudaFunction; 2],
     _provider: CudaTensorProviderRetention,
 }
 
@@ -96,6 +97,19 @@ impl RetainedFunctions {
             let spatial_functions: [CudaFunction; 3] = spatial_functions
                 .try_into()
                 .unwrap_or_else(|_| unreachable!());
+            let extended_spatial_functions = [
+                module.load_function(spatial_extended::Kind::Attention.function()),
+                module.load_function(spatial_extended::Kind::Gather.function()),
+            ];
+            let [attention, gather] = extended_spatial_functions;
+            let extended_spatial_functions = [
+                attention.map_err(|e| {
+                    CudaDeviceRuntimeError::driver("BF16 spatial attention function load", e)
+                })?,
+                gather.map_err(|e| {
+                    CudaDeviceRuntimeError::driver("BF16 spatial gather function load", e)
+                })?,
+            ];
             Ok::<_, CudaDeviceRuntimeError>((
                 pointwise,
                 normalization,
@@ -105,6 +119,7 @@ impl RetainedFunctions {
                 half_split_rope_function,
                 gqa_attention_function,
                 spatial_functions,
+                extended_spatial_functions,
             ))
         }));
         let (
@@ -116,6 +131,7 @@ impl RetainedFunctions {
             half_split_rope_function,
             gqa_attention_function,
             spatial_functions,
+            extended_spatial_functions,
         ) = match loaded {
             Ok(Ok(functions)) => functions,
             Ok(Err(error)) => {
@@ -137,12 +153,17 @@ impl RetainedFunctions {
             half_split_rope_function,
             gqa_attention_function,
             spatial_functions,
+            extended_spatial_functions,
             _provider: provider,
         }))
     }
 
     pub(super) fn function(&self, kind: Kind) -> &CudaFunction {
         &self.functions[kind.index()]
+    }
+
+    pub(super) fn extended_spatial_function(&self, kind: spatial_extended::Kind) -> &CudaFunction {
+        &self.extended_spatial_functions[kind.index()]
     }
 
     pub(super) fn spatial_function(&self, index: usize) -> &CudaFunction {

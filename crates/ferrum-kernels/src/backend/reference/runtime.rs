@@ -30,6 +30,8 @@ pub(crate) use zero_centered_rms_norm::{
 mod gelu_tanh;
 mod spatial_bf16;
 pub(crate) use spatial_bf16::{ReferenceChannelL2NormLaunch, ReferenceConv2dLaunch};
+mod spatial_decoder;
+pub(crate) use spatial_decoder::{ReferenceSpatialDecoderGeometry, ReferenceSpatialDecoderLaunch};
 mod head_rms_norm;
 pub(crate) use head_rms_norm::{ReferenceHeadRmsNormLaunch, ReferenceHeadRmsNormShape};
 mod plain_residual_add;
@@ -324,6 +326,9 @@ impl ReferenceDenseLinearLaunch {
 }
 
 enum ReferenceCommandKind {
+    SpatialDecoder {
+        launch: ReferenceSpatialDecoderLaunch,
+    },
     Copy {
         source: ReferenceBufferRegion,
         destination: ReferenceBufferRegion,
@@ -404,6 +409,7 @@ pub struct ReferenceDeviceCommand {
 impl fmt::Debug for ReferenceDeviceCommand {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         let kind = match self.kind {
+            ReferenceCommandKind::SpatialDecoder { .. } => "spatial_decoder",
             ReferenceCommandKind::Copy { .. } => "copy",
             ReferenceCommandKind::Upload { .. } => "upload",
             ReferenceCommandKind::ManagedUpload { .. } => "managed_upload",
@@ -614,6 +620,18 @@ impl ReferenceDeviceCommand {
         })
     }
 
+    pub(crate) fn spatial_decoder_tensor(
+        launch: ReferenceSpatialDecoderLaunch,
+    ) -> Result<Self, ReferenceDeviceRuntimeError> {
+        launch.validate()?;
+        Ok(Self {
+            operation: launch.operation(),
+            logical_work: Some(launch.logical_work()?),
+            compute_dispatch_count: 1,
+            transfer_command_count: 0,
+            kind: ReferenceCommandKind::SpatialDecoder { launch },
+        })
+    }
     pub(crate) fn conv2d_tensor(
         launch: ReferenceConv2dLaunch,
     ) -> Result<Self, ReferenceDeviceRuntimeError> {
@@ -847,6 +865,9 @@ impl ReferenceDeviceCommand {
             ReferenceCommandKind::HeadRmsNorm { launch } => {
                 launch.validate_runtime(runtime_instance)
             }
+            ReferenceCommandKind::SpatialDecoder { launch } => {
+                launch.validate_runtime(runtime_instance)
+            }
             ReferenceCommandKind::Conv2d { launch } => launch.validate_runtime(runtime_instance),
             ReferenceCommandKind::ChannelL2Norm { launch } => {
                 launch.validate_runtime(runtime_instance)
@@ -946,6 +967,18 @@ impl ReferenceDeviceCommand {
                 counters
                     .head_rms_norm_launches
                     .fetch_add(1, Ordering::Relaxed);
+            }
+            ReferenceCommandKind::SpatialDecoder { launch } => {
+                spatial_decoder::execute(launch);
+                match launch.shape {
+                    ReferenceSpatialDecoderGeometry::Attention(_) => {
+                        &counters.spatial_attention_launches
+                    }
+                    ReferenceSpatialDecoderGeometry::Upsample(_) => {
+                        &counters.spatial_upsample_gather_launches
+                    }
+                }
+                .fetch_add(1, Ordering::Relaxed);
             }
             ReferenceCommandKind::Conv2d { launch } => {
                 spatial_bf16::execute_conv2d(launch);
@@ -1191,6 +1224,8 @@ struct ReferenceRuntimeCounters {
     head_rms_norm_launches: AtomicU64,
     conv2d_launches: AtomicU64,
     channel_l2_norm_launches: AtomicU64,
+    spatial_attention_launches: AtomicU64,
+    spatial_upsample_gather_launches: AtomicU64,
     row_gather_launches: AtomicU64,
     batched_row_concat_launches: AtomicU64,
     zero_centered_rms_norm_launches: AtomicU64,
@@ -1220,6 +1255,8 @@ pub struct ReferenceDeviceRuntimeSnapshot {
     pub head_rms_norm_launches: u64,
     pub conv2d_launches: u64,
     pub channel_l2_norm_launches: u64,
+    pub spatial_attention_launches: u64,
+    pub spatial_upsample_gather_launches: u64,
     pub row_gather_launches: u64,
     pub batched_row_concat_launches: u64,
     pub zero_centered_rms_norm_launches: u64,
@@ -1358,6 +1395,14 @@ impl ReferenceDeviceRuntime {
             layer_norm_launches: self.counters.layer_norm_launches.load(Ordering::Relaxed),
             head_rms_norm_launches: self.counters.head_rms_norm_launches.load(Ordering::Relaxed),
             conv2d_launches: self.counters.conv2d_launches.load(Ordering::Relaxed),
+            spatial_attention_launches: self
+                .counters
+                .spatial_attention_launches
+                .load(Ordering::Relaxed),
+            spatial_upsample_gather_launches: self
+                .counters
+                .spatial_upsample_gather_launches
+                .load(Ordering::Relaxed),
             channel_l2_norm_launches: self
                 .counters
                 .channel_l2_norm_launches

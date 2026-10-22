@@ -27,10 +27,13 @@ pub enum CudaTensorOperation {
     ChannelL2Norm,
     SiluNchw,
     PlainResidualAddNchw,
+    ChannelL2NormImage,
+    SpatialAttention,
+    SpatialUpsampleGather,
 }
 
 impl CudaTensorOperation {
-    pub const ALL: [Self; 19] = [
+    pub const ALL: [Self; 22] = [
         Self::Silu,
         Self::SiluMul,
         Self::Tanh,
@@ -50,6 +53,9 @@ impl CudaTensorOperation {
         Self::ChannelL2Norm,
         Self::SiluNchw,
         Self::PlainResidualAddNchw,
+        Self::ChannelL2NormImage,
+        Self::SpatialAttention,
+        Self::SpatialUpsampleGather,
     ];
 
     fn pointwise(self) -> Option<Kind> {
@@ -85,6 +91,15 @@ impl CudaTensorOperation {
             return norm::descriptor(device, kind);
         }
         match self {
+            Self::ChannelL2NormImage => {
+                spatial::descriptor(device, spatial::SpatialKind::ChannelL2Image)
+            }
+            Self::SpatialAttention => {
+                spatial_extended::descriptor(device, spatial_extended::Kind::Attention)
+            }
+            Self::SpatialUpsampleGather => {
+                spatial_extended::descriptor(device, spatial_extended::Kind::Gather)
+            }
             Self::ChannelL2Norm => spatial::descriptor(device, spatial::SpatialKind::ChannelL2),
             Self::SiluNchw => spatial::descriptor(device, spatial::SpatialKind::Silu),
             Self::PlainResidualAddNchw => {
@@ -120,6 +135,15 @@ impl CudaTensorOperation {
             return norm::provider(kind, descriptor, kernels);
         }
         match self {
+            Self::ChannelL2NormImage => {
+                spatial::provider(spatial::SpatialKind::ChannelL2Image, descriptor, kernels)
+            }
+            Self::SpatialAttention => {
+                spatial_extended::provider(spatial_extended::Kind::Attention, descriptor, kernels)
+            }
+            Self::SpatialUpsampleGather => {
+                spatial_extended::provider(spatial_extended::Kind::Gather, descriptor, kernels)
+            }
             Self::ChannelL2Norm => {
                 spatial::provider(spatial::SpatialKind::ChannelL2, descriptor, kernels)
             }

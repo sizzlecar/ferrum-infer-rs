@@ -14,9 +14,11 @@ use ferrum_runtime::{
 pub const NUMERICAL_PROFILE_ID: &str = "cuda.cudnn9.conv2d.bf16_f32.separate_bias.v1";
 pub const NUMERICAL_IDENTITY: &str = concat!(
     "NCHW/OIHW-cross-correlation;BF16-input-weight-output;FP32-compute;",
-    "explicit-materialized-zero-padding;deterministic-v7-heuristic-within-admitted-workspace;",
+    "padding-mode-is-a-plan-attribute:explicit-materialized-zero-or-implicit-symmetric-cuDNN-descriptor;",
+    "implicit-mode-has-no-materialized-padding-scratch;deterministic-v7-heuristic-within-admitted-workspace;",
     "math=DEFAULT-or-TENSOR_OP;no-ALLOW_CONVERSION;no-find-or-unbudgeted-workspace;",
-    "B(convolution)-then-B(RN32(output+bias));no-Torch-or-Reference-bitwise-claim;",
+    "B(convolution)-then-B(RN32(output+bias));nonfinite-padding-paths-not-asserted-equivalent;",
+    "no-Torch-or-Reference-bitwise-claim;",
     "logical-work=nominal-2*output-elements*reduction-extent"
 );
 const PROVIDER: &str = "provider.cuda.conv2d.bf16.cudnn9";
@@ -347,9 +349,7 @@ struct Shape {
 }
 impl Shape {
     fn new(g: Conv2dBf16Geometry, workspace_bytes: u64) -> Result<Self, String> {
-        if g.padding_mode() != Conv2dPaddingMode::ExplicitZero {
-            return Err("CUDA convolution initially supports explicit_zero padding only".into());
-        }
+        let explicit = g.padding_mode() == Conv2dPaddingMode::ExplicitZero;
         let dim = |x: u64| {
             i32::try_from(x)
                 .ok()
@@ -363,6 +363,11 @@ impl Shape {
                 .ok_or_else(|| "CUDA convolution byte extent exceeds address space".to_owned())
         };
         let pad = g.padding();
+        if !explicit && (pad[0] != pad[1] || pad[2] != pad[3]) {
+            return Err(
+                "cuDNN implicit_zero padding must be symmetric on each spatial axis".into(),
+            );
+        }
         let ph = g
             .input_height()
             .checked_add(pad[0])
@@ -373,8 +378,18 @@ impl Shape {
             .checked_add(pad[2])
             .and_then(|x| x.checked_add(pad[3]))
             .ok_or("padded width overflows")?;
+        let native_height = if explicit { ph } else { g.input_height() };
+        let native_width = if explicit { pw } else { g.input_width() };
+        let native_padding = if explicit {
+            [0, 0]
+        } else {
+            [
+                i32::try_from(pad[0]).map_err(|_| "cuDNN height padding exceeds i32")?,
+                i32::try_from(pad[2]).map_err(|_| "cuDNN width padding exceeds i32")?,
+            ]
+        };
         for dimensions in [
-            [g.batch(), g.input_channels(), ph, pw],
+            [g.batch(), g.input_channels(), native_height, native_width],
             [
                 g.batch(),
                 g.output_channels(),
@@ -399,7 +414,7 @@ impl Shape {
                 );
             }
         }
-        let padding_bytes = if pad == [0; 4] {
+        let padding_bytes = if !explicit || pad == [0; 4] {
             0
         } else {
             bytes(&[g.batch(), g.input_channels(), ph, pw])?
@@ -410,8 +425,8 @@ impl Shape {
                 input: [
                     dim(g.batch())?,
                     dim(g.input_channels())?,
-                    dim(ph)?,
-                    dim(pw)?,
+                    dim(native_height)?,
+                    dim(native_width)?,
                 ],
                 filter: [
                     dim(g.output_channels())?,
@@ -425,7 +440,7 @@ impl Shape {
                     dim(g.output_height())?,
                     dim(g.output_width())?,
                 ],
-                padding: [0, 0],
+                padding: native_padding,
                 stride: [dim(g.stride()[0])?, dim(g.stride()[1])?],
                 dilation: [dim(g.dilation()[0])?, dim(g.dilation()[1])?],
                 groups: dim(g.groups())?,

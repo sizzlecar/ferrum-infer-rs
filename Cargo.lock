@@ -1363,6 +1363,8 @@ dependencies = [
 name = "ferrum-diffusion"
 version = "0.14.0"
 dependencies = [
+ "ferrum-runtime",
+ "half",
  "thiserror 1.0.69",
 ]
 

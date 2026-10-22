@@ -37,6 +37,7 @@ use super::runtime::{
     ReferenceDeviceRuntime, ReferenceDeviceRuntimeConfig, ReferenceDeviceRuntimeError,
 };
 use super::spatial_bf16::{ReferenceSpatialProvider, SpatialKind};
+use super::spatial_decoder::{DecoderKind, ReferenceSpatialDecoderProvider};
 use super::structured_attention::ReferenceStructuredAttentionProvider;
 use super::structured_gqa_attention::ReferenceStructuredGqaAttentionProvider;
 use super::transcendental::{
@@ -49,6 +50,11 @@ use ferrum_runtime::{
     CONV2D_BF16_CAPABILITY_ID,
 };
 use ferrum_runtime::{
+    channel_l2_norm_image_bf16_contract, spatial_attention_bf16_contract,
+    spatial_upsample_gather_bf16_contract, CHANNEL_L2_NORM_IMAGE_BF16_CAPABILITY_ID,
+    SPATIAL_ATTENTION_BF16_CAPABILITY_ID, SPATIAL_UPSAMPLE_GATHER_BF16_CAPABILITY_ID,
+};
+use ferrum_runtime::{
     plain_residual_add_nchw_bf16_contract, silu_nchw_bf16_contract,
     PLAIN_RESIDUAL_ADD_NCHW_BF16_CAPABILITY_ID, SILU_NCHW_BF16_CAPABILITY_ID,
 };
@@ -59,6 +65,9 @@ const REFERENCE_MEMORY_BYTES: u64 = 64 * 1024 * 1024;
 
 pub fn reference_vnext_capabilities() -> Result<BTreeSet<CapabilityId>, VNextError> {
     Ok(BTreeSet::from([
+        CapabilityId::new(CHANNEL_L2_NORM_IMAGE_BF16_CAPABILITY_ID)?,
+        CapabilityId::new(SPATIAL_ATTENTION_BF16_CAPABILITY_ID)?,
+        CapabilityId::new(SPATIAL_UPSAMPLE_GATHER_BF16_CAPABILITY_ID)?,
         CapabilityId::new(CONV2D_BF16_CAPABILITY_ID)?,
         CapabilityId::new(CHANNEL_L2_NORM_BF16_CAPABILITY_ID)?,
         CapabilityId::new(SILU_NCHW_BF16_CAPABILITY_ID)?,
@@ -108,6 +117,8 @@ fn reference_vnext_runtime_config_with_capacity(
         runtime_implementation_fingerprint: implementation_fingerprint(&[
             &capacity_bytes.to_le_bytes(),
             include_str!("runtime.rs").as_bytes(),
+            include_str!("spatial_decoder.rs").as_bytes(),
+            include_str!("runtime/spatial_decoder.rs").as_bytes(),
             include_str!("spatial_bf16.rs").as_bytes(),
             include_str!("runtime/spatial_bf16.rs").as_bytes(),
             include_str!("plain_residual_add.rs").as_bytes(),
@@ -151,6 +162,9 @@ pub fn reference_vnext_operation_registry(
     runtime: &ReferenceDeviceRuntime,
 ) -> Result<OperationRuntimeRegistry<ReferenceDeviceRuntime>, ReferenceDeviceRuntimeError> {
     let contracts: Vec<Box<dyn OperationContract>> = vec![
+        Box::new(channel_l2_norm_image_bf16_contract().map_err(contract_error)?),
+        Box::new(spatial_attention_bf16_contract().map_err(contract_error)?),
+        Box::new(spatial_upsample_gather_bf16_contract().map_err(contract_error)?),
         Box::new(conv2d_bf16_contract().map_err(contract_error)?),
         Box::new(channel_l2_norm_bf16_contract().map_err(contract_error)?),
         Box::new(silu_nchw_bf16_contract().map_err(contract_error)?),
@@ -175,6 +189,9 @@ pub fn reference_vnext_operation_registry(
         Box::new(tanh_bf16_contract().map_err(contract_error)?),
     ];
     let providers = vec![
+        reference_vnext_channel_l2_norm_image_bf16_provider(runtime)?,
+        reference_vnext_spatial_attention_bf16_provider(runtime)?,
+        reference_vnext_spatial_upsample_gather_bf16_provider(runtime)?,
         reference_vnext_conv2d_bf16_provider(runtime)?,
         reference_vnext_channel_l2_norm_bf16_provider(runtime)?,
         reference_vnext_silu_nchw_bf16_provider(runtime)?,
@@ -204,6 +221,30 @@ pub fn reference_vnext_operation_registry(
 /// Builds the actual reference dense implementation for an explicitly
 /// assembled registry, including runtime wrappers used for fault injection.
 /// Core still creates the provider's invocation and submission authority.
+pub fn reference_vnext_channel_l2_norm_image_bf16_provider(
+    runtime: &ReferenceDeviceRuntime,
+) -> Result<Box<dyn OperationProvider<ReferenceDeviceRuntime>>, ReferenceDeviceRuntimeError> {
+    Ok(Box::new(ReferenceSpatialDecoderProvider::new(
+        runtime,
+        DecoderKind::Norm,
+    )?))
+}
+pub fn reference_vnext_spatial_attention_bf16_provider(
+    runtime: &ReferenceDeviceRuntime,
+) -> Result<Box<dyn OperationProvider<ReferenceDeviceRuntime>>, ReferenceDeviceRuntimeError> {
+    Ok(Box::new(ReferenceSpatialDecoderProvider::new(
+        runtime,
+        DecoderKind::Attention,
+    )?))
+}
+pub fn reference_vnext_spatial_upsample_gather_bf16_provider(
+    runtime: &ReferenceDeviceRuntime,
+) -> Result<Box<dyn OperationProvider<ReferenceDeviceRuntime>>, ReferenceDeviceRuntimeError> {
+    Ok(Box::new(ReferenceSpatialDecoderProvider::new(
+        runtime,
+        DecoderKind::Upsample,
+    )?))
+}
 pub fn reference_vnext_dense_linear_provider(
     runtime: &ReferenceDeviceRuntime,
 ) -> Result<Box<dyn OperationProvider<ReferenceDeviceRuntime>>, ReferenceDeviceRuntimeError> {

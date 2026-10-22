@@ -63,6 +63,37 @@ fn attributes() -> BTreeMap<AttributeId, SemanticValue> {
 }
 
 #[test]
+fn image_norm_accepts_actual_rank_three_gamma_and_keeps_rank_four_contract_distinct() {
+    let x = [2, 1152, 3, 5];
+    let image = [
+        input("x", 0, &x),
+        input("gamma", 1, &[1152, 1, 1]),
+        output(&x),
+    ];
+    let s = geometry(SpatialKind::ChannelL2Image, &image, &attributes()).unwrap();
+    assert_eq!(
+        (s.channels, s.tree_width, s.elements, s.operations),
+        (1152, 2048, 34560, 207360)
+    );
+    assert!(geometry(SpatialKind::ChannelL2, &image, &attributes()).is_err());
+    let volume = [
+        input("x", 0, &x),
+        input("gamma", 1, &[1152, 1, 1, 1]),
+        output(&x),
+    ];
+    assert!(geometry(SpatialKind::ChannelL2Image, &volume, &attributes()).is_err());
+    assert!(geometry(SpatialKind::ChannelL2, &volume, &attributes()).is_ok());
+    assert_ne!(
+        SpatialKind::ChannelL2.profile(),
+        SpatialKind::ChannelL2Image.profile()
+    );
+    assert_ne!(
+        SpatialKind::ChannelL2.id(),
+        SpatialKind::ChannelL2Image.id()
+    );
+}
+
+#[test]
 fn real_non_power_of_two_channels_use_bounded_padded_tree() {
     let s = geometry(
         SpatialKind::ChannelL2,

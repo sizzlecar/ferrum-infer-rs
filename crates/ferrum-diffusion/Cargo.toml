@@ -9,4 +9,6 @@ description = "Diffusion schedules and numerical contracts for Ferrum"
 readme = "../../README.md"
 
 [dependencies]
+ferrum-runtime = { workspace = true }
+half = { workspace = true }
 thiserror = { workspace = true }

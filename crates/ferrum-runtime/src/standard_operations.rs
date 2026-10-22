@@ -1,3 +1,11 @@
+mod channel_l2_norm_image_bf16;
+#[cfg(test)]
+mod spatial_decoder_tests;
+pub use channel_l2_norm_image_bf16::*;
+mod spatial_attention_bf16;
+pub use spatial_attention_bf16::*;
+mod spatial_upsample_gather_bf16;
+pub use spatial_upsample_gather_bf16::*;
 mod nchw_pointwise_bf16;
 pub use nchw_pointwise_bf16::*;
 mod conv2d_bf16;

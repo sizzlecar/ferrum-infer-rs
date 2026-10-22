@@ -87,7 +87,45 @@ fn no_padding_and_zero_workspace_require_no_scratch() {
         &attrs,
     )
     .unwrap();
-    assert!(Shape::new(g, 0).is_err());
+    assert_eq!(Shape::new(g, 0).unwrap().native.padding, [0, 0]);
+}
+
+#[test]
+fn symmetric_implicit_padding_uses_native_descriptor_and_only_library_workspace() {
+    let mut attrs = attributes([1, 1, 2, 2], [1, 1]);
+    attrs.insert(
+        AttributeId::new("padding_mode").unwrap(),
+        SemanticValue::Text("implicit_zero".into()),
+    );
+    let g = Conv2dBf16Geometry::new(
+        &tensor(&[2, 3, 4, 5]),
+        &tensor(&[6, 3, 3, 3]),
+        &tensor(&[6]),
+        &tensor(&[2, 6, 4, 7]),
+        &attrs,
+    )
+    .unwrap();
+    let s = Shape::new(g, 1024).unwrap();
+    assert_eq!(s.native.input, [2, 3, 4, 5]);
+    assert_eq!(s.native.padding, [1, 2]);
+    assert_eq!(
+        (s.padding_bytes, s.workspace_offset, s.scratch_bytes),
+        (0, 0, 1024)
+    );
+    assert_eq!(s.output_bytes, 2 * 6 * 4 * 7 * 2);
+    attrs.insert(
+        AttributeId::new("padding").unwrap(),
+        SemanticValue::Integers(vec![0, 2, 2, 2]),
+    );
+    let asymmetric = Conv2dBf16Geometry::new(
+        &tensor(&[2, 3, 4, 5]),
+        &tensor(&[6, 3, 3, 3]),
+        &tensor(&[6]),
+        &tensor(&[2, 6, 4, 7]),
+        &attrs,
+    )
+    .unwrap();
+    assert!(Shape::new(asymmetric, 1024).is_err());
 }
 
 #[test]
