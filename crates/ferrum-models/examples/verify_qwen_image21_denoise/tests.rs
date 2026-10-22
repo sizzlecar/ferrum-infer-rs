@@ -185,6 +185,31 @@ fn two_nonzero_managed_dit_steps_share_initialized_weights_and_retire() -> Resul
         &serde_json::to_value(&cfg)?,
         &NumericalProfileId::new(Family::REFERENCE_PROFILE_ID).map_err(anyhow::Error::msg)?,
     )?;
+    let nodes = family
+        .program()
+        .blocks()
+        .iter()
+        .flat_map(|block| &block.nodes)
+        .collect::<Vec<_>>();
+    let gates = nodes
+        .iter()
+        .filter(|node| node.operation_id.as_str() == TANH_BF16_OPERATION_ID)
+        .collect::<Vec<_>>();
+    // The two residual branches share their timestep gates across all layers.
+    // Check the consumers instead of freezing an incidental total node count.
+    assert_eq!(gates.len(), 2);
+    for gate in &gates {
+        assert_eq!(gate.outputs.len(), 1);
+        let consumers = nodes
+            .iter()
+            .filter(|node| node.inputs.contains(&gate.outputs[0]))
+            .collect::<Vec<_>>();
+        assert_eq!(consumers.len() as u64, cfg.transformer().layers());
+        assert!(consumers.iter().all(|node| {
+            node.operation_id.as_str() == GATED_RESIDUAL_BF16_OPERATION_ID
+                && node.inputs[1] == gate.outputs[0]
+        }));
+    }
     let c = ReferenceVNextComposition::create_with_capacity(
         shared::id("device.test.denoise")?,
         16 << 20,
@@ -228,7 +253,14 @@ fn two_nonzero_managed_dit_steps_share_initialized_weights_and_retire() -> Resul
         result.steps[0]["latent_sha256"]
     );
     assert_eq!(result.steps[1]["completed_steps"], 2);
-    assert_eq!(result.provenance["node_count"], 64);
+    assert_eq!(
+        result.provenance["node_count"].as_u64(),
+        Some(nodes.len() as u64)
+    );
+    assert_eq!(
+        c.runtime().snapshot().tanh_launches,
+        (gates.len() * result.steps.len()) as u64
+    );
     assert_eq!(host.usage()?.allocated_bytes(), budget.inputs[0]);
     drop(result);
     assert_eq!(host.usage()?.allocated_bytes(), 0);
