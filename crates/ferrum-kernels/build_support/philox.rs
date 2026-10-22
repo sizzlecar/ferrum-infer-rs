@@ -126,10 +126,14 @@ pub fn identity(
 /// Windows backslashes unless they escape whitespace, '#', ':' or '\\'.
 pub fn parse_dependencies(source: &str) -> Result<Vec<PathBuf>, String> {
     let normalized = source.replace("\\\r\n", " ").replace("\\\n", " ");
-    let body = normalized
-        .trim_start()
-        .strip_prefix("ferrum_philox:")
+    let (target, body) = normalized
+        .split_once(':')
         .ok_or("unexpected Philox dependency target")?;
+    // NVCC's Make output permits whitespace before the rule delimiter.
+    // Split only the target delimiter, preserving drive letters in paths.
+    if target.trim() != "ferrum_philox" {
+        return Err("unexpected Philox dependency target".into());
+    }
     let mut paths = Vec::new();
     let mut word = String::new();
     let mut chars = body.chars().peekable();
@@ -176,8 +180,27 @@ mod tests {
         );
     }
     #[test]
+    fn nvcc_dependency_target_accepts_make_whitespace() {
+        assert_eq!(
+            parse_dependencies(
+                "\nferrum_philox : kernels/vnext_bf16_silu.cu \\\n    /usr/include/stdc-predef.h\n"
+            )
+            .unwrap(),
+            vec![
+                PathBuf::from("kernels/vnext_bf16_silu.cu"),
+                PathBuf::from("/usr/include/stdc-predef.h")
+            ]
+        );
+        assert_eq!(
+            parse_dependencies(" \tferrum_philox\t: C:\\CUDA\\include\\curand_normal.h").unwrap(),
+            vec![PathBuf::from(r"C:\CUDA\include\curand_normal.h")]
+        );
+    }
+    #[test]
     fn malformed_or_empty_dependency_output_is_rejected() {
         assert!(parse_dependencies("other: a.h").is_err());
+        assert!(parse_dependencies("ferrum_philox_suffix : a.h").is_err());
+        assert!(parse_dependencies("ferrum_philox other : a.h").is_err());
         assert!(parse_dependencies("ferrum_philox:\n").is_err());
     }
 }
