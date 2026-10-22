@@ -6,6 +6,7 @@
 //! work. Weight payloads use the existing runtime weight-source interface.
 
 mod attention;
+mod block0;
 mod block0_mlp;
 mod config;
 mod headers;
@@ -17,6 +18,7 @@ pub use attention::{
     QwenImage21AttentionConfig, QwenImage21AttentionKeyRun, QwenImage21AttentionLayout,
     QwenImage21AttentionSegment, QwenImage21Block0AttentionFamily,
 };
+pub use block0::{QwenImage21Block0Broadcast, QwenImage21Block0Config, QwenImage21Block0Family};
 pub use block0_mlp::QwenImage21Block0MlpFamily;
 pub use config::QwenImage21Config;
 pub use headers::{
