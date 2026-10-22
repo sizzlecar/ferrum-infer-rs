@@ -45,10 +45,10 @@ using Gemm = cutlass::gemm::device::GemmUniversalAdapter<Kernel>;
 inline Kernel::Arguments arguments(const FerrumCutlassFp8RequestV1& r,
     const Input* a, const Input* b, const float* as, const float* ws, Output* y) {
   const auto shape = cute::make_shape(int(r.rows), int(r.outputs), int(r.inputs), 1);
-  typename Kernel::StrideA stride_a = cute::make_stride(int64_t(r.inputs), cute::_1{}, cute::_0{});
-  typename Kernel::StrideB stride_b = cute::make_stride(int64_t(r.inputs), cute::_1{}, cute::_0{});
-  typename Kernel::StrideC stride_c = cute::make_stride(int64_t(r.outputs), cute::_1{}, cute::_0{});
-  typename Kernel::StrideD stride_d = cute::make_stride(int64_t(r.outputs), cute::_1{}, cute::_0{});
+  typename Kernel::StrideA stride_a = cute::make_stride(int64_t(r.inputs), cute::_1{}, int64_t(0));
+  typename Kernel::StrideB stride_b = cute::make_stride(int64_t(r.inputs), cute::_1{}, int64_t(0));
+  typename Kernel::StrideC stride_c = cute::make_stride(int64_t(r.outputs), cute::_1{}, int64_t(0));
+  typename Kernel::StrideD stride_d = cute::make_stride(int64_t(r.outputs), cute::_1{}, int64_t(0));
   WeightScale::Arguments ws_args{};
   ws_args.scalar_ptrs[0] = ws;
   ScaledAccumulator::Arguments scaled_args{ws_args, {}, {}};
