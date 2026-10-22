@@ -7559,6 +7559,7 @@ mod tests {
             PhysicalWeightLayout::Dense { .. }
             | PhysicalWeightLayout::Stored { .. }
             | PhysicalWeightLayout::Quantized { .. }
+            | PhysicalWeightLayout::QuantizedTensor { .. }
             | PhysicalWeightLayout::RnF16DenseAndFragmentV1 { .. }
             | PhysicalWeightLayout::BlockQuantized { .. } => {}
         }
@@ -7598,6 +7599,7 @@ mod tests {
             }
             PhysicalWeightLayout::Dense { .. }
             | PhysicalWeightLayout::Stored { .. }
+            | PhysicalWeightLayout::QuantizedTensor { .. }
             | PhysicalWeightLayout::RnF16DenseAndFragmentV1 { .. }
             | PhysicalWeightLayout::BlockQuantized { .. } => {}
         }

@@ -337,6 +337,9 @@ fn resolve_layout_node(
         PhysicalWeightLayout::QuantizedBlockGrid { .. } => {
             Err("Metal does not support quantized block-grid physical weight layouts".to_owned())
         }
+        PhysicalWeightLayout::QuantizedTensor { .. } => {
+            Err("Metal does not support whole-tensor quantized physical weight layouts".to_owned())
+        }
         PhysicalWeightLayout::BlockQuantized {
             blocks,
             block_axis,

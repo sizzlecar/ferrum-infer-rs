@@ -1070,7 +1070,7 @@ impl<'schema, 'references> PhysicalLayoutValidator<'schema, 'references> {
                     .resolved_size(semantic_dimensions[axis]);
                 if group_size == 0 {
                     return Err(self.invalid(
-                        "two-dimensional block grouping requires a block-grid quantized layout",
+                        "whole-tensor or two-dimensional block grouping requires its corresponding quantized layout",
                     ));
                 }
                 let grouped_dimensions =
@@ -1278,6 +1278,63 @@ impl<'schema, 'references> PhysicalLayoutValidator<'schema, 'references> {
                 if scales_component.dense_element_type() != Some(quantization.scale_type) {
                     return Err(self.invalid(
                         "block-grid scale component dtype differs from the quantization spec",
+                    ));
+                }
+            }
+            PhysicalWeightLayout::QuantizedTensor {
+                packed_values,
+                packed_dimensions,
+                scales,
+            } => {
+                if !matches!(
+                    logical_element_type,
+                    ElementType::F16 | ElementType::Bf16 | ElementType::F32
+                ) {
+                    return Err(self.invalid(
+                        "whole-tensor quantized logical weight dtype must be floating point",
+                    ));
+                }
+                let quantization = {
+                    let component = self.component(&packed_values.component_id)?;
+                    let WeightEncoding::Quantized(spec) = &component.encoding else {
+                        return Err(self.invalid(
+                            "whole-tensor packed-values component does not carry a quantization spec",
+                        ));
+                    };
+                    spec.clone()
+                };
+                if quantization.grouping != super::QuantizationGrouping::WholeTensor
+                    || quantization.zero_point_type.is_some()
+                {
+                    return Err(self.invalid(
+                        "whole-tensor layout requires WholeTensor grouping and no zero point",
+                    ));
+                }
+                let packed_bytes = checked_elements(semantic_dimensions)
+                    .and_then(|elements| {
+                        elements.checked_mul(u64::from(quantization.bits_per_weight))
+                    })
+                    .and_then(|bits| bits.checked_add(7))
+                    .map(|bits| bits / 8)
+                    .ok_or_else(|| self.invalid("whole-tensor packed-values size overflows u64"))?;
+                if packed_dimensions.is_empty()
+                    || checked_elements(packed_dimensions) != Some(packed_bytes)
+                {
+                    return Err(self.invalid(format!(
+                        "whole-tensor packed-values semantic shape must contain exactly {packed_bytes} storage bytes"
+                    )));
+                }
+                self.bind_component(
+                    packed_values,
+                    packed_dimensions,
+                    WeightComponentRole::PackedValues,
+                    depth,
+                )?;
+                let scales_component =
+                    self.bind_component(scales, &[1], WeightComponentRole::Scales, depth)?;
+                if scales_component.dense_element_type() != Some(quantization.scale_type) {
+                    return Err(self.invalid(
+                        "whole-tensor scale component dtype differs from the quantization spec",
                     ));
                 }
             }

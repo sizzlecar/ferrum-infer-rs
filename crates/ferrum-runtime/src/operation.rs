@@ -153,6 +153,6 @@ pub use weight_contract::{
     PhysicalWeightComponentBinding, PhysicalWeightLayout, PhysicalWeightPadding,
     QuantizationGrouping, QuantizationPacking, QuantizationSpec, ResolvedWeightBinding,
     ResolvedWeightComponentLayout, RnF16FragmentPlanV1, RnF16FragmentSourceFormatV1,
-    WeightComponentRole, WeightEncoding, MAX_PHYSICAL_WEIGHT_LAYOUT_DEPTH,
-    MAX_PHYSICAL_WEIGHT_LAYOUT_NODES, RN_F16_FRAGMENT_ABI_V1,
+    WeightComponentRole, WeightEncoding, FP8_E4M3FN_WHOLE_TENSOR_F32_FORMAT_ID,
+    MAX_PHYSICAL_WEIGHT_LAYOUT_DEPTH, MAX_PHYSICAL_WEIGHT_LAYOUT_NODES, RN_F16_FRAGMENT_ABI_V1,
 };
