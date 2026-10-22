@@ -20,6 +20,7 @@ pub(super) struct RetainedFunctions {
     gqa_attention_function: CudaFunction,
     spatial_functions: [CudaFunction; 3],
     extended_spatial_functions: [CudaFunction; 2],
+    philox_function: CudaFunction,
     _provider: CudaTensorProviderRetention,
 }
 
@@ -110,6 +111,9 @@ impl RetainedFunctions {
                     CudaDeviceRuntimeError::driver("BF16 spatial gather function load", e)
                 })?,
             ];
+            let philox_function = module.load_function(philox::FUNCTION).map_err(|e| {
+                CudaDeviceRuntimeError::driver("BF16 Philox normal function load", e)
+            })?;
             Ok::<_, CudaDeviceRuntimeError>((
                 pointwise,
                 normalization,
@@ -120,6 +124,7 @@ impl RetainedFunctions {
                 gqa_attention_function,
                 spatial_functions,
                 extended_spatial_functions,
+                philox_function,
             ))
         }));
         let (
@@ -132,6 +137,7 @@ impl RetainedFunctions {
             gqa_attention_function,
             spatial_functions,
             extended_spatial_functions,
+            philox_function,
         ) = match loaded {
             Ok(Ok(functions)) => functions,
             Ok(Err(error)) => {
@@ -154,12 +160,17 @@ impl RetainedFunctions {
             gqa_attention_function,
             spatial_functions,
             extended_spatial_functions,
+            philox_function,
             _provider: provider,
         }))
     }
 
     pub(super) fn function(&self, kind: Kind) -> &CudaFunction {
         &self.functions[kind.index()]
+    }
+
+    pub(super) fn philox_function(&self) -> &CudaFunction {
+        &self.philox_function
     }
 
     pub(super) fn extended_spatial_function(&self, kind: spatial_extended::Kind) -> &CudaFunction {

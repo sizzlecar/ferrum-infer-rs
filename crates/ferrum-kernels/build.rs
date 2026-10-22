@@ -11,6 +11,8 @@ mod host;
 use host::HostTools;
 #[path = "build_support/gguf.rs"]
 mod gguf;
+#[path = "build_support/philox.rs"]
+mod philox;
 
 use ferrum_native_ops::{
     legacy_signature_matches_without_numeric_line, load_manifest,
@@ -1479,8 +1481,22 @@ fn compile_core_ptx(out_dir: &Path, native_build_cache: Option<&CudaNativeBuildC
         if *kernel == gguf::KERNEL {
             flags.push(format!("-I{}", out_dir.display()));
         }
-        let legacy_signature = core_ptx_signature(kernel, &flags);
-        let content_signature = content_core_ptx_signature(kernel, &flags);
+        let mut legacy_signature = core_ptx_signature(kernel, &flags);
+        let mut content_signature = content_core_ptx_signature(kernel, &flags);
+        if *kernel == "kernels/vnext_bf16_silu.cu" {
+            let identity = philox::identity(
+                &nvcc,
+                cuda_root.as_deref(),
+                kernel,
+                &flags,
+                HostTools::current() == HostTools::Unix,
+            )
+            .unwrap_or_else(|error| panic!("[core-ptx] {error}"));
+            println!("cargo:rustc-env=FERRUM_PHILOX_BUILD_IDENTITY_SHA256={identity}");
+            let extra = format!("\nphilox-transitive-input-sha256={identity}");
+            legacy_signature.push_str(&extra);
+            content_signature.push_str(&extra);
+        }
         let signature = cuda_native_input_signature(&content_signature);
         let stem = Path::new(kernel)
             .file_stem()

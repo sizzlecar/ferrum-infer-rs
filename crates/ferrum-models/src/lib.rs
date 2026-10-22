@@ -22,6 +22,7 @@ pub mod loader;
 pub mod lora;
 pub mod models;
 pub mod moe;
+pub mod normal_noise;
 pub mod pipeline_source;
 pub mod qwen35_config;
 #[cfg(any(test, feature = "test-support"))]

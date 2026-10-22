@@ -1,3 +1,5 @@
+mod philox_normal_bf16;
+pub use philox_normal_bf16::*;
 mod channel_l2_norm_image_bf16;
 #[cfg(test)]
 mod spatial_decoder_tests;

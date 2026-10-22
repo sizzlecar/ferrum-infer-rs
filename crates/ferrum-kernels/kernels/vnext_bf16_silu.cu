@@ -4,6 +4,7 @@
 // build.rs compiles this translation unit with --ftz=false --prec-div=true
 // --prec-sqrt=true --fmad=false and without --use_fast_math.
 #include <cuda_runtime.h>
+#include <curand_kernel.h>
 #include <math.h>
 #include <stdint.h>
 
@@ -23,6 +24,28 @@ __device__ __forceinline__ uint16_t ferrum_bf16_rne(float value) {
 
 __device__ __forceinline__ float ferrum_bf16_decode(uint16_t value) {
     return __uint_as_float(static_cast<uint32_t>(value) << 16);
+}
+
+// Torch v2.13.0 DistributionTemplates.h contiguous 32-bit launch mapping.
+// Geometry is queried from the actual device by the provider. This shares the
+// algorithm/mapping, not a claim that toolkit 12.8 headers/flags match Torch's
+// deployed cu130 binary bit-for-bit. No global RNG-state allocation exists.
+extern "C" __global__ void ferrum_vnext_philox_normal_bf16(
+    const uint32_t* words, uint16_t* output, uint64_t elements, uint64_t rounds) {
+    const uint64_t seed = static_cast<uint64_t>(words[0]) | (static_cast<uint64_t>(words[1]) << 32);
+    const uint64_t offset = static_cast<uint64_t>(words[2]) | (static_cast<uint64_t>(words[3]) << 32);
+    const uint64_t thread = static_cast<uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const uint64_t stride = static_cast<uint64_t>(gridDim.x) * blockDim.x;
+    curandStatePhilox4_32_10_t state;
+    curand_init(seed, thread, offset, &state);
+    for (uint64_t round = 0; round < rounds; ++round) {
+        const float4 values = curand_normal4(&state);
+        const uint64_t base = thread + round * stride * 4;
+        if (base < elements) output[base] = ferrum_bf16_rne(__fadd_rn(__fmul_rn(values.x, 1.0f), 0.0f));
+        if (base + stride < elements) output[base + stride] = ferrum_bf16_rne(__fadd_rn(__fmul_rn(values.y, 1.0f), 0.0f));
+        if (base + 2 * stride < elements) output[base + 2 * stride] = ferrum_bf16_rne(__fadd_rn(__fmul_rn(values.z, 1.0f), 0.0f));
+        if (base + 3 * stride < elements) output[base + 3 * stride] = ferrum_bf16_rne(__fadd_rn(__fmul_rn(values.w, 1.0f), 0.0f));
+    }
 }
 
 __device__ __forceinline__ uint16_t ferrum_silu_bf16_value(float x) {

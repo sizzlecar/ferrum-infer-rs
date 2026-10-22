@@ -89,7 +89,7 @@ pub use tensor_dense_bf16::{
     NUMERICAL_PROFILE_IDENTITY as CUDA_DENSE_BF16_NUMERICAL_PROFILE_IDENTITY,
 };
 pub use tensor_silu::{
-    CudaTensorOperation,
+    CudaPhiloxDeviceGeometry, CudaPhiloxLaunchGeometry, CudaTensorOperation,
     ATTENTION_NUMERICAL_IDENTITY as CUDA_STRUCTURED_ATTENTION_BF16_NUMERICAL_PROFILE_IDENTITY,
     ATTENTION_NUMERICAL_PROFILE_ID as CUDA_STRUCTURED_ATTENTION_BF16_NUMERICAL_PROFILE_ID,
     BATCHED_ROW_CONCAT_PROFILE_ID as CUDA_BATCHED_ROW_CONCAT_BF16_NUMERICAL_PROFILE_ID,
@@ -109,6 +109,9 @@ pub use tensor_silu::{
     NORM_NUMERICAL_IDENTITY as CUDA_NORMALIZATION_BF16_NUMERICAL_PROFILE_IDENTITY,
     NUMERICAL_PROFILE_ID as CUDA_SILU_BF16_NUMERICAL_PROFILE_ID,
     NUMERICAL_PROFILE_IDENTITY as CUDA_SILU_BF16_NUMERICAL_PROFILE_IDENTITY,
+    PHILOX_BUILD_IDENTITY_SHA256 as CUDA_PHILOX_BUILD_IDENTITY_SHA256,
+    PHILOX_NORMAL_IDENTITY as CUDA_PHILOX_NORMAL_BF16_NUMERICAL_PROFILE_IDENTITY,
+    PHILOX_NORMAL_PROFILE_ID as CUDA_PHILOX_NORMAL_BF16_NUMERICAL_PROFILE_ID,
     PLAIN_RESIDUAL_ADD_NUMERICAL_PROFILE_ID as CUDA_PLAIN_RESIDUAL_ADD_BF16_NUMERICAL_PROFILE_ID,
     RESIDUAL_ADD_NCHW_PROFILE_ID as CUDA_PLAIN_RESIDUAL_ADD_NCHW_BF16_NUMERICAL_PROFILE_ID,
     ROPE_NUMERICAL_IDENTITY as CUDA_ADJACENT_ROPE_BF16_NUMERICAL_PROFILE_IDENTITY,
@@ -368,6 +371,7 @@ pub fn cuda_tensor_runtime_config(
     ]);
     config.capabilities = BTreeSet::from([
         CapabilityId::new(ferrum_runtime::SILU_BF16_CAPABILITY_ID)?,
+        CapabilityId::new(ferrum_runtime::PHILOX_NORMAL_BF16_CAPABILITY_ID)?,
         CapabilityId::new(ferrum_runtime::SILU_MUL_BF16_CAPABILITY_ID)?,
         CapabilityId::new(ferrum_runtime::TANH_BF16_CAPABILITY_ID)?,
         CapabilityId::new(ferrum_runtime::MODULATION_SCALE_BF16_CAPABILITY_ID)?,
@@ -408,6 +412,16 @@ pub fn cuda_vnext_silu_bf16_provider(
     providers
         .pop()
         .ok_or_else(|| CudaDeviceRuntimeError::contract("SiLU selection produced no provider"))
+}
+
+/// Standalone explicit-state RNG provider. Device SM/thread limits become part
+/// of this provider's fingerprint. It acquires the same single module permit
+/// as other tensor factories, so the previous bundle must retire first.
+/// Fresh offset-zero output has NOT been qualified against deployed Torch.
+pub fn cuda_vnext_philox_normal_bf16_provider(
+    runtime: &CudaDeviceRuntime,
+) -> Result<Box<dyn OperationProvider<CudaDeviceRuntime>>, CudaDeviceRuntimeError> {
+    tensor_silu::philox_provider(runtime)
 }
 
 /// Assemble an explicitly selected subset from one shared native module and

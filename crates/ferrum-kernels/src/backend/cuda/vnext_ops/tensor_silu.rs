@@ -39,6 +39,13 @@ mod geometry;
 mod gqa;
 mod half_split_rope;
 mod norm;
+mod philox;
+pub(super) use philox::create as philox_provider;
+pub use philox::{
+    CudaPhiloxDeviceGeometry, CudaPhiloxLaunchGeometry,
+    BUILD_IDENTITY_SHA256 as PHILOX_BUILD_IDENTITY_SHA256,
+    NUMERICAL_IDENTITY as PHILOX_NORMAL_IDENTITY, NUMERICAL_PROFILE_ID as PHILOX_NORMAL_PROFILE_ID,
+};
 mod rope;
 mod selection;
 mod spatial;
@@ -253,6 +260,8 @@ pub(super) fn numerical_fingerprint() -> String {
         spatial_extended::NUMERICAL_IDENTITY.as_bytes(),
         include_bytes!("tensor_silu/geometry.rs"),
         include_bytes!("tensor_silu/norm.rs"),
+        include_bytes!("tensor_silu/philox.rs"),
+        philox::BUILD_IDENTITY_SHA256.as_bytes(),
         include_bytes!("tensor_silu/rope.rs"),
         include_bytes!("tensor_silu/attention.rs"),
         include_bytes!("tensor_silu/selection.rs"),
