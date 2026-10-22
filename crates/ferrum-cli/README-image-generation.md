@@ -14,7 +14,7 @@ Choose one explicit experimental profile:
 - `experimental_serial_cold` retains one request per execution. Its pipeline
   `maximum_batch_size` and serving `max_num_seqs` must both be `1`.
 - `experimental_batched_cold` enables compatible requests to share one real
-  TE/DiT/VAE forward per stage and denoise step. Set pipeline
+  TE/DiT forward per stage and denoise step. Set pipeline
   `maximum_batch_size` explicitly and keep serving `max_num_seqs` at or below it.
   The implementation ceiling is `STRUCTURED_ATTENTION_BF16_MAX_BATCH` (currently
   16). Larger or mixed-size batches are rejected, not serialized into fake batches.
@@ -25,6 +25,32 @@ The configured `max_num_seqs * maximum_prompt_bytes` must fit the T2I tokenizer'
 1 MiB combined raw-prompt bound, so individually admitted requests can compose.
 The independent request field `n=1` still selects one returned image per request;
 it does not restrict the number of requests in a batch.
+
+`backend.pipeline.decoder_batch_policy` independently selects VAE execution:
+
+- `single_image` (default) compiles a B1 decoder, initializes its weights once
+  per request batch, and reuses that session for each image. Inputs are exact
+  NCHW views of the same accounted Host backing. Each output retains its own
+  accounted single-image allocation. TE and DiT still execute the admitted B.
+- `full_batch` explicitly selects the experimental diagnostic B-wide decoder.
+  Its output slices retain the entire B-wide allocation until the last owner
+  drops. This may require much more device activation capacity.
+
+Receipts record the selected policy, each stage's compiled `batch_size`, and
+`completed_executions`: decoding B requests uses B executions under `single_image`
+and one under `full_batch`. Both close the one decoder session before returning
+images. Sample-independent mathematics does not establish bitwise equality:
+backend convolution algorithms can change with batch geometry. Neither policy
+promises a fixed VRAM peak or fit without actual plan admission and measurement;
+Host input/output storage still grows with request count.
+
+Device limits share one capacity account. `backend.usable_memory_bytes` is the
+runtime's declared ceiling; each live plan's `pipeline.device_capacity_bytes`
+can tighten that same ceiling. Bootstrap, stream and cuDNN opaque reservations
+are already charged there alongside tensor storage. For a declared 30 GiB
+process ceiling, setting both fields to 30 GiB does not create 60 GiB of budget;
+subtracting the opaque reservations from the plan field would tighten the total
+again. Keep measured free-device headroom explicit when choosing these limits.
 
 Both profiles recompile and reload component weights for each batch. The batched
 profile is experimental and unqualified until actual GPU tests establish its
@@ -101,6 +127,7 @@ Metadata may live separately from the checkpoint directories.
       "maximum_width": 512,
       "maximum_height": 512,
       "maximum_batch_size": 1,
+      "decoder_batch_policy": "single_image",
       "maximum_staging_bytes": 16777216,
       "maximum_initialization_commands": 64,
       "maximum_backing_maintenance_passes": 8
@@ -138,3 +165,5 @@ requests at the same dimensions with independently selected seeds. This enables
 the batched path but does not guarantee every arrival is batched, that existing
 memory limits fit it, or that a latency/throughput objective is met. `run` remains
 a one-request invocation even when its configuration permits a larger batch.
+Keep `decoder_batch_policy: "single_image"` for the bounded decoder experiment;
+select `"full_batch"` explicitly when measuring the B-wide decoder diagnostic.

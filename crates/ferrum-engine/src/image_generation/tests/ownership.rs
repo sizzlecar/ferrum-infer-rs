@@ -27,6 +27,7 @@ fn stage_execution_failure_keeps_real_stored_resources_until_explicit_recovery_c
     let component = compile(&composition, projection(), &projection_options()).unwrap();
     let plan = ImageStagePlanReceipt {
         stage: ImageStage::Denoiser,
+        batch_size: 1,
         family: component.family().family_id().clone(),
         profile: component.family().numerical_profile().id.clone(),
         family_fingerprint: component.family().fingerprint().unwrap(),

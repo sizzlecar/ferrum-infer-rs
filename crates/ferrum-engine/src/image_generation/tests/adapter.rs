@@ -96,7 +96,7 @@ fn tokenizer() -> (Vec<u8>, Vec<u8>, Vec<u8>) {
     )
 }
 
-fn pipeline(
+pub(super) fn pipeline(
     maximum_batch_size: usize,
 ) -> (
     QwenImage21Pipeline<ReferenceDeviceRuntime>,

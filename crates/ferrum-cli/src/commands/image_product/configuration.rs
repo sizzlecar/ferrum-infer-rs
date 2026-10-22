@@ -165,6 +165,8 @@ pub struct PipelineConfig {
     pub maximum_height: u32,
     #[serde(default = "default_maximum_batch_size")]
     pub maximum_batch_size: usize,
+    #[serde(default)]
+    pub decoder_batch_policy: ferrum_engine::image_generation::ImageDecoderBatchPolicy,
     pub maximum_staging_bytes: u64,
     pub maximum_initialization_commands: usize,
     pub maximum_backing_maintenance_passes: usize,
@@ -193,6 +195,7 @@ impl PipelineConfig {
             maximum_width: self.maximum_width,
             maximum_height: self.maximum_height,
             maximum_batch_size: self.maximum_batch_size,
+            decoder_batch_policy: self.decoder_batch_policy,
             static_initialization: StaticInitializationPolicy::new(
                 self.maximum_staging_bytes,
                 self.maximum_initialization_commands,

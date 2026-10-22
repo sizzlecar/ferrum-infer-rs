@@ -43,11 +43,12 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
         )?;
         let transformer =
             QwenImage21TransformerConfig::new(self.assets.transformer.clone(), layout)?;
-        let decoder = self.assets.decoder_batch(batch, height, width)?;
+        let decoder_batch = self.config.decoder_batch_policy.batch_size(batch);
+        let decoder = self.assets.decoder_batch(decoder_batch, height, width)?;
         ensure!(
             decoder.output_tensor()?.dimensions()
                 == [
-                    u64::try_from(batch)?,
+                    u64::try_from(decoder_batch)?,
                     4,
                     u64::from(request.height),
                     u64::from(request.width)
@@ -71,24 +72,28 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
             .prepare_with_profile(&serde_json::to_value(&decoder)?, &self.profiles.decoder)?;
         let text_stage = PreparedStage::compile(
             ImageStage::TextEncoder,
+            batch,
             text_family,
             &text.compile_options()?,
             self,
         )?;
         let noise_stage = PreparedStage::compile(
             ImageStage::Noise,
+            1,
             noise_family,
             &noise.compile_options()?,
             self,
         )?;
         let denoise_stage = PreparedStage::compile(
             ImageStage::Denoiser,
+            batch,
             dit_family,
             &transformer.compile_options()?,
             self,
         )?;
         let decode_stage = PreparedStage::compile(
             ImageStage::Decoder,
+            decoder_batch,
             vae_family,
             &decoder.compile_options()?,
             self,

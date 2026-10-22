@@ -13,7 +13,9 @@
 
 use super::{configuration::ImageBackendConfig, source, ImageProductConfig, ImageProductError};
 use anyhow::{ensure, Context, Result};
-use ferrum_engine::image_generation::{ImageGenerationOutput, ImageGenerationRequest};
+use ferrum_engine::image_generation::{
+    ImageDecoderBatchPolicy, ImageGenerationOutput, ImageGenerationRequest, ImageStage,
+};
 use ferrum_models::qwen_image21::pipeline_adapters::QwenImage21RgbaOutput;
 use ferrum_output::png::{write_rgba8_png, PngDimensions, PngLimits};
 use ferrum_runtime::{HostMemoryAccount, HostMemoryClass};
@@ -160,6 +162,7 @@ fn cuda_product_one_real_batch_of_two_preserves_outputs_and_retires_host(
     let requests = requests(&config)?;
     let ImageBackendConfig::Cuda(cuda) = &config.backend;
     let cuda = cuda.resolved()?;
+    let decoder_policy = cuda.pipeline.decoder_batch_policy;
     cuda.validate()?;
     let assets = config.prepare_assets()?;
     // Atomic exclusive creation rejects old evidence before device construction.
@@ -186,6 +189,27 @@ fn cuda_product_one_real_batch_of_two_preserves_outputs_and_retires_host(
             outputs[0].receipt.job == outputs[1].receipt.job,
             "outputs did not originate in one admitted batch"
         );
+        for output in &outputs {
+            ensure!(
+                output.receipt.decoder_batch_policy == decoder_policy,
+                "decoder policy receipt mismatch"
+            );
+            let decoder = output
+                .receipt
+                .stages
+                .iter()
+                .find(|stage| stage.execution.plan.stage == ImageStage::Decoder)
+                .context("missing decoder receipt")?;
+            let (batch, executions) = match decoder_policy {
+                ImageDecoderBatchPolicy::SingleImage => (1, 2),
+                ImageDecoderBatchPolicy::FullBatch => (2, 1),
+            };
+            ensure!(
+                decoder.execution.plan.batch_size == batch
+                    && decoder.execution.completed_executions == executions,
+                "decoder did not execute the configured geometry/count"
+            );
+        }
         ensure!(
             !outputs[0].rgba.bytes().same_region(outputs[1].rgba.bytes()),
             "independent outputs alias the same batch slice"
@@ -209,6 +233,10 @@ fn cuda_product_one_real_batch_of_two_preserves_outputs_and_retires_host(
     })()?;
     let (records, batch_bytes) = inspect;
     let final_alias = outputs[1].rgba.bytes().clone();
+    let retained_bytes = match decoder_policy {
+        ImageDecoderBatchPolicy::SingleImage => final_alias.len(),
+        ImageDecoderBatchPolicy::FullBatch => batch_bytes,
+    };
     let final_alias_sha = format!("{:x}", Sha256::digest(final_alias.bytes()));
     drop(outputs);
     drop(pipeline);
@@ -216,9 +244,9 @@ fn cuda_product_one_real_batch_of_two_preserves_outputs_and_retires_host(
         let retained = host.usage()?;
         ensure!(
             host.owns(&final_alias)
-                && retained.committed_bytes() == batch_bytes
-                && retained.allocated_bytes() == batch_bytes,
-            "last output slice must retain its entire batch backing across pipeline drop"
+                && retained.committed_bytes() == retained_bytes
+                && retained.allocated_bytes() == retained_bytes,
+            "last output slice must retain its actual execution backing across pipeline drop"
         );
         ensure!(
             format!("{:x}", Sha256::digest(final_alias.bytes())) == final_alias_sha,
@@ -234,7 +262,8 @@ fn cuda_product_one_real_batch_of_two_preserves_outputs_and_retires_host(
             &artifact_dir.join("result.json"),
             &json!({
                 "status":"passed", "qualification":"functional cold B2; no G3/performance/Torch parity claim",
-                "batch_size":2,"outputs":records,"retained_batch_bytes":batch_bytes,
+                "batch_size":2,"outputs":records,"decoder_batch_policy":decoder_policy,
+                "total_output_bytes":batch_bytes,"retained_execution_bytes":retained_bytes,
                 "host_final_committed_bytes":released.committed_bytes(),
                 "host_final_allocated_bytes":released.allocated_bytes(),
             }),

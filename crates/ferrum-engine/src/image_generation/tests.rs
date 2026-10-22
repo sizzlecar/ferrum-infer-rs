@@ -1,6 +1,7 @@
 use super::*;
 
 mod adapter;
+mod decoder;
 mod fixture;
 mod ownership;
 mod preflight;
@@ -12,6 +13,7 @@ fn config() -> ImagePipelineConfig {
         maximum_width: 1024,
         maximum_height: 1024,
         maximum_batch_size: ImagePipelineConfig::DEFAULT_MAXIMUM_BATCH_SIZE,
+        decoder_batch_policy: ImageDecoderBatchPolicy::default(),
         static_initialization: StaticInitializationPolicy::new(256, 8).unwrap(),
         executor: TensorExecutorConfig::default(),
     }

@@ -23,6 +23,8 @@ impl ImageStage {
 #[derive(Debug, Clone, Serialize)]
 pub struct ImageStagePlanReceipt {
     pub stage: ImageStage,
+    /// Actual fixed batch geometry compiled for each execution of this stage.
+    pub batch_size: usize,
     pub family: ModelFamilyId,
     pub profile: NumericalProfileId,
     pub family_fingerprint: String,
@@ -109,10 +111,12 @@ pub(super) struct PreparedStage<R: DeviceRuntime> {
 impl<R: DeviceRuntime> PreparedStage<R> {
     pub(super) fn compile(
         stage: ImageStage,
+        batch_size: usize,
         family: PreparedModelFamily,
         options: &ProgramPlanCompileOptions,
         pipeline: &QwenImage21Pipeline<R>,
     ) -> anyhow::Result<Self> {
+        ensure!(batch_size > 0, "stage batch size must be positive");
         let family_fingerprint = family.fingerprint()?;
         let family_id = family.family_id().clone();
         let profile = family.numerical_profile().id.clone();
@@ -133,6 +137,7 @@ impl<R: DeviceRuntime> PreparedStage<R> {
             component,
             plan: ImageStagePlanReceipt {
                 stage,
+                batch_size,
                 family: family_id,
                 profile,
                 family_fingerprint,

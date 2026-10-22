@@ -25,9 +25,11 @@ use ferrum_models::qwen_image21::{
 use ferrum_runtime::*;
 use std::sync::Arc;
 
-/// Every limit is supplied explicitly. `pipeline.device_capacity_bytes` is the
-/// plan's storage ceiling; `usable_memory_bytes` also contains runtime/stream
-/// and cuDNN opaque claims. Neither substitutes for actual plan admission.
+/// Every limit is supplied explicitly. Each live plan's
+/// `pipeline.device_capacity_bytes` also caps the shared device account, which
+/// includes runtime/stream and cuDNN opaque claims. Setting it lower than
+/// `usable_memory_bytes` tightens the process ceiling; it is not an independent
+/// allowance for tensor storage. Actual plan and pool admission still apply.
 #[derive(Debug, Clone)]
 pub struct QwenImage21CudaConfig {
     pub ordinal: usize,
@@ -88,7 +90,7 @@ impl QwenImage21CudaConfig {
         );
         ensure!(
             self.pipeline.device_capacity_bytes <= self.usable_memory_bytes,
-            "pipeline storage ceiling exceeds declared usable device capacity"
+            "pipeline device-account ceiling exceeds declared usable device capacity"
         );
         ensure!(
             self.cudnn.workspace_limit_bytes < self.usable_memory_bytes - overhead,
@@ -346,6 +348,7 @@ mod tests {
                 maximum_width: 512,
                 maximum_height: 512,
                 maximum_batch_size: ImagePipelineConfig::DEFAULT_MAXIMUM_BATCH_SIZE,
+                decoder_batch_policy: crate::image_generation::ImageDecoderBatchPolicy::default(),
                 static_initialization: StaticInitializationPolicy::new(1024, 32).unwrap(),
                 executor: TensorExecutorConfig::default(),
             },

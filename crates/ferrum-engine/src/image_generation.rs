@@ -20,6 +20,7 @@
 mod assets;
 #[cfg(feature = "cuda")]
 pub mod cuda;
+mod decoder;
 mod prepare;
 pub mod service;
 mod stage;
@@ -69,6 +70,27 @@ pub struct QwenImage21Profiles {
     pub euler: Bf16EulerProfile,
 }
 
+/// Controls only the decoder's compiled batch geometry. TE and DiT retain
+/// the admitted request batch. Neither choice implies cross-batch residency
+/// or bitwise agreement between backend algorithms selected for different B.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ImageDecoderBatchPolicy {
+    /// Initialize one B1 decoder, then execute it once per request.
+    #[default]
+    SingleImage,
+    /// Diagnostic path: initialize one decoder at the complete request B.
+    FullBatch,
+}
+impl ImageDecoderBatchPolicy {
+    fn batch_size(self, request_batch: usize) -> usize {
+        match self {
+            Self::SingleImage => 1,
+            Self::FullBatch => request_batch,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ImagePipelineConfig {
     pub device_capacity_bytes: u64,
@@ -78,6 +100,7 @@ pub struct ImagePipelineConfig {
     /// Admission ceiling for one real request batch. Product configuration
     /// defaults to one; larger cold batches require explicit opt-in.
     pub maximum_batch_size: usize,
+    pub decoder_batch_policy: ImageDecoderBatchPolicy,
     pub static_initialization: StaticInitializationPolicy,
     pub executor: TensorExecutorConfig,
 }
@@ -157,6 +180,7 @@ pub struct ImageGenerationReceipt {
     pub job: u64,
     pub batch_size: usize,
     pub batch_index: usize,
+    pub decoder_batch_policy: ImageDecoderBatchPolicy,
     pub width: u32,
     pub height: u32,
     pub seed: u64,
@@ -251,11 +275,13 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
         Ok(outputs.remove(0))
     }
 
-    /// One real shared TE/DiT/VAE forward per stage (and timestep), with each
+    /// One real shared TE/DiT forward per stage (and timestep), with each
     /// request's independent fresh Philox stream. All requests must have the
     /// same geometry and this pipeline's fixed schedule/profile. Components
     /// still cold-load per batch; no cross-batch residency is claimed here.
-    /// Output slices retain the entire batch backing until the last one drops.
+    /// VAE follows the explicit decoder policy, reusing one initialized session
+    /// within this batch. Output views retain their actual execution backing:
+    /// one image under SingleImage, the whole batch under FullBatch.
     pub fn generate_batch(
         &mut self,
         requests: Vec<ImageGenerationRequest>,
@@ -281,22 +307,25 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
         let mut steps = Vec::with_capacity(self.assets.schedule.evaluation_count());
         let result = self
             .run(prepared, &requests, job, &mut stages, &mut steps)
-            .and_then(|rgba| {
+            .and_then(|outputs| {
+                if outputs.len() != requests.len() {
+                    return Err(ImageGenerationFailure::Processing {
+                        source: anyhow::anyhow!("decoder returned an unexpected image count"),
+                        active: None,
+                    });
+                }
                 requests
                     .iter()
+                    .zip(outputs)
                     .enumerate()
-                    .map(|(batch_index, request)| {
+                    .map(|(batch_index, (request, rgba))| {
                         Ok(ImageGenerationOutput {
-                            rgba: rgba.batch_item(batch_index).map_err(|e| {
-                                ImageGenerationFailure::Processing {
-                                    source: e.into(),
-                                    active: None,
-                                }
-                            })?,
+                            rgba,
                             receipt: ImageGenerationReceipt {
                                 job,
                                 batch_size: requests.len(),
                                 batch_index,
+                                decoder_batch_policy: self.config.decoder_batch_policy,
                                 width: request.width,
                                 height: request.height,
                                 seed: request.seed,
@@ -334,7 +363,7 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
         job: u64,
         stages: &mut Vec<ImageStageReceipt>,
         steps: &mut Vec<ImageDenoiseStepReceipt>,
-    ) -> Result<TensorExecutionOutput, ImageGenerationFailure<R>> {
+    ) -> Result<Vec<TensorExecutionOutput>, ImageGenerationFailure<R>> {
         let PreparedRequest {
             prompts,
             transformer,
@@ -504,24 +533,7 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
             .into_input_tensor()
             .map_err(process)?;
         drop(normalized);
-        let vae = decode_stage.start(
-            self,
-            job,
-            ComponentWeightSource::Stored(self.assets.sources.vae.as_ref()),
-        )?;
-        let (vae, outputs) = vae.execute(job, vec![input])?;
-        stages.push(vae.close()?);
-        let rgba = only_output(outputs, QwenImage21VaeDecoderFamily::OUTPUT_ID).map_err(process)?;
-        let validation = (|| -> anyhow::Result<()> {
-            ensure!(
-                rgba.tensor() == &decoder.output_tensor()?,
-                "actual RGBA differs from requested decoder shape"
-            );
-            QwenImage21RgbaOutput::new(&self.host, rgba.tensor(), rgba.bytes())?;
-            Ok(())
-        })();
-        validation.map_err(process)?;
-        Ok(rgba)
+        self.decode_batch(decode_stage, &decoder, input, requests.len(), job, stages)
     }
 }
 

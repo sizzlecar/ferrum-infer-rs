@@ -40,6 +40,10 @@ fn image_configuration_is_explicit_strict_and_resolves_from_its_directory() {
     );
     let ImageBackendConfig::Cuda(cuda) = config.backend;
     assert_eq!(cuda.pipeline.maximum_batch_size, 1);
+    assert_eq!(
+        cuda.pipeline.resolved().unwrap().decoder_batch_policy,
+        ferrum_engine::image_generation::ImageDecoderBatchPolicy::SingleImage
+    );
     assert_eq!(cuda.cudnn.library_path, base.join("lib/libcudnn.so.9"));
     assert!(
         matches!(config.weights.vae, WeightSource::Single{directory,file}
@@ -103,6 +107,37 @@ fn experimental_batch_profile_connects_service_limit_to_real_pipeline_capacity()
     wire["backend"]["pipeline"]["maximum_batch_size"] =
         json!(ferrum_runtime::STRUCTURED_ATTENTION_BF16_MAX_BATCH);
     assert!(load(&wire).is_ok());
+}
+
+#[test]
+fn decoder_batch_policy_is_explicit_independent_and_strict() {
+    use ferrum_engine::image_generation::ImageDecoderBatchPolicy;
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("image.json");
+    let mut wire = configuration();
+    wire["execution_profile"] = json!("experimental_batched_cold");
+    wire["backend"]["pipeline"]["maximum_batch_size"] = json!(8);
+    for (name, expected) in [
+        ("single_image", ImageDecoderBatchPolicy::SingleImage),
+        ("full_batch", ImageDecoderBatchPolicy::FullBatch),
+    ] {
+        wire["backend"]["pipeline"]["decoder_batch_policy"] = json!(name);
+        fs::write(&path, serde_json::to_vec(&wire).unwrap()).unwrap();
+        let config = ImageProductConfig::load(&path).unwrap();
+        let ImageBackendConfig::Cuda(cuda) = config.backend;
+        let resolved = cuda.pipeline.resolved().unwrap();
+        assert_eq!(resolved.maximum_batch_size, 8);
+        assert_eq!(resolved.decoder_batch_policy, expected);
+    }
+    for invalid in [
+        json!(2),
+        json!(null),
+        json!("automatic"),
+        json!({"single_image": {"max": 4}}),
+    ] {
+        wire["backend"]["pipeline"]["decoder_batch_policy"] = invalid;
+        assert!(serde_json::from_value::<ImageProductConfig>(wire.clone()).is_err());
+    }
 }
 
 #[test]
