@@ -1393,6 +1393,7 @@ dependencies = [
  "criterion",
  "crossbeam-channel",
  "crossbeam-utils",
+ "ferrum-diffusion",
  "ferrum-execution",
  "ferrum-interfaces",
  "ferrum-journal",

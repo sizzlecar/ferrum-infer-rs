@@ -10,6 +10,7 @@ readme = "../../README.md"
 [dependencies]
 ferrum-runtime = { workspace = true }
 ferrum-execution = { workspace = true }
+ferrum-diffusion = { workspace = true }
 # Core dependencies - New architecture
 ferrum-types = { workspace = true }
 ferrum-output = { workspace = true }
