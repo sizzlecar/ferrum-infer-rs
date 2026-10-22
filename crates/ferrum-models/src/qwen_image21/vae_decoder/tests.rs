@@ -19,6 +19,78 @@ fn real() -> QwenImage21VaeDecoderConfig {
         .unwrap()
 }
 
+const UP3_SHORTCUT: &str =
+    "value.qwen_image21.vae.decoder.decoder.up_blocks.3.first_frame_shortcut";
+const UP4_SHORTCUT: &str =
+    "value.qwen_image21.vae.decoder.decoder.up_blocks.4.resnets.0.conv_shortcut";
+
+/// The production family intentionally exports only RGBA. Retaining an
+/// intermediate allocation does not turn it into an executor completion port;
+/// this test adapter explicitly declares the two inspected boundaries.
+struct DiagnosticDecoder(QwenImage21VaeDecoderFamily);
+impl ModelFamilyProvider for DiagnosticDecoder {
+    type Config = QwenImage21VaeDecoderConfig;
+    fn family_id(&self) -> &ModelFamilyId {
+        self.0.family_id()
+    }
+    fn external_metadata_ids(&self) -> BTreeSet<ExternalModelMetadataId> {
+        self.0.external_metadata_ids()
+    }
+    fn validate_config_identity(
+        &self,
+        raw: &Value,
+        config: &Self::Config,
+    ) -> Result<(), VNextError> {
+        self.0.validate_config_identity(raw, config)
+    }
+    fn validated_external_metadata_id(
+        &self,
+        raw: &Value,
+        config: &Self::Config,
+    ) -> Result<ExternalModelMetadataId, VNextError> {
+        self.0.validated_external_metadata_id(raw, config)
+    }
+    fn parse_config(&self, raw: &Value) -> Result<Self::Config, VNextError> {
+        self.0.parse_config(raw)
+    }
+    fn weights(&self, config: &Self::Config) -> Result<ModelWeights, VNextError> {
+        self.0.weights(config)
+    }
+    fn numerical_profiles(
+        &self,
+        config: &Self::Config,
+    ) -> Result<FamilyNumericalProfiles, VNextError> {
+        self.0.numerical_profiles(config)
+    }
+    fn semantic_program(
+        &self,
+        config: &Self::Config,
+        profile: &NumericalExecutionProfile,
+    ) -> Result<ModelProgram, VNextError> {
+        let program = self.0.semantic_program(config, profile)?;
+        let mut outputs = program.outputs().to_vec();
+        outputs.extend([
+            ProgramValueId::new(UP3_SHORTCUT)?,
+            ProgramValueId::new(UP4_SHORTCUT)?,
+        ]);
+        ModelProgram::new(
+            program.family_id().clone(),
+            program.inputs().to_vec(),
+            program.blocks().to_vec(),
+            program.states().to_vec(),
+            program.weights().to_vec(),
+            outputs,
+        )?
+        .with_input_tensor_specs(program.input_tensor_specs().clone())
+    }
+    fn semantic_metadata(
+        &self,
+        config: &Self::Config,
+    ) -> Result<ModelSemanticMetadata, VNextError> {
+        self.0.semantic_metadata(config)
+    }
+}
+
 #[test]
 fn full_decoder_matches_real_single_frame_schema_without_temporal_or_encoder_weights() {
     let c = real();
@@ -199,12 +271,14 @@ fn complete_tiny_decoder_executes_with_real_weights_and_preserves_up_block_mappi
         1,
     )
     .unwrap();
-    let family = TypedFamilyRegistration::new(QwenImage21VaeDecoderFamily::new().unwrap())
-        .prepare_with_profile(
-            &serde_json::to_value(&c).unwrap(),
-            &NumericalProfileId::new(QwenImage21VaeDecoderFamily::REFERENCE_PROFILE_ID).unwrap(),
-        )
-        .unwrap();
+    let family = TypedFamilyRegistration::new(DiagnosticDecoder(
+        QwenImage21VaeDecoderFamily::new().unwrap(),
+    ))
+    .prepare_with_profile(
+        &serde_json::to_value(&c).unwrap(),
+        &NumericalProfileId::new(QwenImage21VaeDecoderFamily::REFERENCE_PROFILE_ID).unwrap(),
+    )
+    .unwrap();
     let mut payloads = BTreeMap::new();
     for w in c.expected_weights().unwrap() {
         let name = w.external_name();
@@ -266,9 +340,8 @@ fn complete_tiny_decoder_executes_with_real_weights_and_preserves_up_block_mappi
     )
     .unwrap();
     let mut options = c.compile_options().unwrap();
-    let shortcut = "value.qwen_image21.vae.decoder.decoder.up_blocks.3.first_frame_shortcut";
-    let last_shortcut =
-        "value.qwen_image21.vae.decoder.decoder.up_blocks.4.resnets.0.conv_shortcut";
+    let shortcut = UP3_SHORTCUT;
+    let last_shortcut = UP4_SHORTCUT;
     options.retain_completion_value(id(shortcut));
     options.retain_completion_value(id(last_shortcut));
     let input = [0x00, 0x3f, 0x80, 0xbf];
