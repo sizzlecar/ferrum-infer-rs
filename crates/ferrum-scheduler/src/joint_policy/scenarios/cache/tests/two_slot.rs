@@ -50,8 +50,7 @@ fn two_slot_collisions_keep_distinct_full_rank_distributions_without_growing_sto
     assert_eq!(cache.slots.len(), 4);
     assert_eq!(
         cache.retained_bytes(),
-        slot_bytes
-            + 2 * (std::mem::size_of::<CostWork>() + 3 * std::mem::size_of::<CostScenario>())
+        slot_bytes + 2 * (std::mem::size_of::<CostWork>() + 3 * std::mem::size_of::<Duration>())
     );
     for rank in 0..3 {
         for work in &keys[..2] {
@@ -106,7 +105,7 @@ fn two_slot_miss_token_rechecks_current_exact_key_before_empties_and_debits_actu
     );
     assert_eq!(
         cache.retained_bytes(),
-        slot_bytes + 2 * std::mem::size_of::<CostWork>() + 5 * std::mem::size_of::<CostScenario>()
+        slot_bytes + 2 * std::mem::size_of::<CostWork>() + 5 * std::mem::size_of::<Duration>()
     );
     assert!(cache.get(&cost_query(&[keys[0]]), at, 1).is_some());
     assert!(cache.get(&query, at, 2).is_some());
@@ -132,7 +131,7 @@ fn two_slot_miss_token_rechecks_current_exact_key_before_empties_and_debits_actu
     );
     assert_eq!(
         cache.retained_bytes(),
-        slot_bytes + std::mem::size_of::<CostWork>() + 4 * std::mem::size_of::<CostScenario>()
+        slot_bytes + std::mem::size_of::<CostWork>() + 4 * std::mem::size_of::<Duration>()
     );
 }
 
@@ -142,7 +141,7 @@ fn two_slot_capacity_failure_preserves_both_entries_and_one_slot_never_duplicate
     let keys = colliding_work(2, 3);
     let budget = 2 * std::mem::size_of::<Option<Entry>>()
         + 2 * std::mem::size_of::<CostWork>()
-        + 4 * std::mem::size_of::<CostScenario>();
+        + 4 * std::mem::size_of::<Duration>();
     let mut cache = ScenarioCache::new(at, budget, 2);
     for work in &keys[..2] {
         cache.insert(&cost_query(&[*work]), keyed_distribution(at, *work, 2));

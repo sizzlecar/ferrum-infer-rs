@@ -25,7 +25,9 @@ struct Entry {
     work: Box<[CostWork]>,
     exact: bool,
     execution: CostExecution,
-    scenarios: Box<[CostScenario]>,
+    // Ranks are consecutive and weights/coupling were checked before insert.
+    // Keep every rank value; the comparison owns the shared weight vector.
+    service_times: Box<[Duration]>,
     dependence: CostScenarioDependence,
     support: CostSupport,
     samples: usize,
@@ -41,11 +43,12 @@ impl Entry {
     }
 
     fn payload_bytes(&self) -> usize {
-        std::mem::size_of_val(self.work.as_ref()) + std::mem::size_of_val(self.scenarios.as_ref())
+        std::mem::size_of_val(self.work.as_ref())
+            + std::mem::size_of_val(self.service_times.as_ref())
     }
 
     fn prediction(&self, rank: usize) -> Option<CostPrediction> {
-        let service_time = self.scenarios.get(rank)?.service_time;
+        let service_time = *self.service_times.get(rank)?;
         Some(CostPrediction::Known {
             central_service_time: service_time,
             upper_service_time: service_time,
@@ -72,6 +75,8 @@ impl ScenarioCache {
     pub(super) fn new(at: Instant, max_bytes: usize, max_queries: usize) -> Self {
         // Include all allocated slot storage, even empty entries. Payloads use
         // boxed slices, so their retained capacity equals the accounted length.
+        // Preserve the previous conservative slot geometry. Packing payloads
+        // more densely does not also change key hashing or collision buckets.
         let minimum = std::mem::size_of::<Option<Entry>>()
             + std::mem::size_of::<CostWork>()
             + std::mem::size_of::<CostScenario>();
@@ -202,7 +207,7 @@ impl ScenarioCache {
             .and_then(|work| {
                 scenarios
                     .len()
-                    .checked_mul(std::mem::size_of::<CostScenario>())
+                    .checked_mul(std::mem::size_of::<Duration>())
                     .and_then(|scenarios| work.checked_add(scenarios))
             })
             .and_then(|new| self.retained_bytes.checked_sub(previous)?.checked_add(new))
@@ -218,7 +223,10 @@ impl ScenarioCache {
             work: query.work.into(),
             exact: query.work_is_exact,
             execution: query.execution,
-            scenarios: scenarios.into_boxed_slice(),
+            service_times: scenarios
+                .into_iter()
+                .map(|scenario| scenario.service_time)
+                .collect::<Box<[_]>>(),
             dependence,
             support,
             samples,
