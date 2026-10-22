@@ -368,7 +368,9 @@ pub trait TrajectoryAdapter<Action> {
 /// Crate-private opt-in for the concrete scheduler's token-only topology.
 /// The same immutable adapter, action and complete endpoint vector must produce
 /// the same ordered work independent of rank clocks. Public adapters do not
-/// acquire this authority by implementing TrajectoryAdapter.
+/// acquire this authority by implementing TrajectoryAdapter. Its captured
+/// admission slot plan must also remain immutable: only completion of a request
+/// can change the active membership between waves.
 pub(crate) trait ReplayableTrajectory<Action>: TrajectoryAdapter<Action> {
     fn replay_members(
         &self,
@@ -798,6 +800,10 @@ fn simulate_recorded<Action, Adapter: TrajectoryAdapter<Action>>(
     let query_start = budget.queries;
     let mut rounds = 0usize;
     let mut phase: Option<phase::PhaseState> = None;
+    // Only the private concrete adapter path promises immutable slot topology.
+    // Each rank/action simulation starts with an independently validated mask.
+    let reuse_active_mask = trace.is_some();
+    let mut active_mask_dirty = true;
     let mut cost_risk = CostRiskBudget::default();
     let itl_limit = Duration::try_from_secs_f64(input.config.itl_ms / 1000.0)
         .map_err(|_| Unsupported::InvalidState)?;
@@ -849,9 +855,13 @@ fn simulate_recorded<Action, Adapter: TrajectoryAdapter<Action>>(
             })?,
         );
         if let Some(slots) = input.adapter.admission_slots() {
-            slots.active_mask_into(&requests, plan.active.get_or_insert_with(Vec::new))?;
+            if !reuse_active_mask || active_mask_dirty {
+                slots.active_mask_into(&requests, plan.active.get_or_insert_with(Vec::new))?;
+                active_mask_dirty = false;
+            }
         } else {
             plan.active = None;
+            active_mask_dirty = true;
         }
         if rounds == 0 {
             let mut declaration = PhaseBuilder::new(
@@ -1044,6 +1054,11 @@ fn simulate_recorded<Action, Adapter: TrajectoryAdapter<Action>>(
                     risk,
                     itl_limit,
                 )?;
+                if reuse_active_mask && requests[member.request].finished() {
+                    // Refresh only at the next wave boundary. A split group's
+                    // completion cannot admit a waiter into this same wave.
+                    active_mask_dirty = true;
+                }
             }
             if let Some((window, targets)) = probe {
                 if central <= window {

@@ -4,6 +4,8 @@
 
 use super::*;
 
+mod active_mask_reuse;
+
 struct Counted<'a> {
     adapter: &'a CohortTrajectory,
     planned: AtomicUsize,
