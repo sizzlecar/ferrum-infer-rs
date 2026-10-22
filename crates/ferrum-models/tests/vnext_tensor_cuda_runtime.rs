@@ -10,6 +10,8 @@ mod normalization;
 mod rotary;
 #[path = "vnext_tensor_cuda_runtime/spatial.rs"]
 mod spatial;
+#[path = "vnext_tensor_cuda_runtime/spatial_decoder.rs"]
+mod spatial_decoder;
 #[path = "vnext_tensor_cuda_runtime/text.rs"]
 mod text;
 #[path = "vnext_tensor_cuda_runtime/transport.rs"]
