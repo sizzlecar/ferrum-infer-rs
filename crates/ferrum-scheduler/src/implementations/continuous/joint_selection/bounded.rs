@@ -11,23 +11,20 @@ impl ContinuousBatchScheduler {
         round: &mut TimePlanningRound,
         now: Instant,
     ) {
+        round.bounded_decision = None;
         let started = Instant::now();
         let prior_elapsed = round.prediction_elapsed;
         round.statistics.bounded.comparisons += 1;
         match self.compare_bounded_first_wave(hint, batch, round, now) {
             Ok(Some(action)) => {
-                round.statistics.bounded.selected += 1;
-                let decode_only = matches!(action.action, FirstAction::DecodeOnly);
-                if self.apply_joint_first_wave(batch, round, action) {
-                    round.statistics.bounded.applied += 1;
-                    round.statistics.joint_interventions += 1;
-                    round.statistics.joint_decode_only_interventions += u64::from(decode_only);
-                } else {
-                    round.statistics.bounded.invalidated += 1;
-                    round.statistics.static_fallbacks += 1;
-                }
+                self.apply_bounded_first_wave(batch, round, action);
             }
-            Ok(None) => round.statistics.bounded.retained += 1,
+            Ok(None) => {
+                if let Some(evidence) = &mut round.bounded_decision {
+                    evidence.outcome = BoundedDecisionOutcome::Retained;
+                }
+                round.statistics.bounded.retained += 1;
+            }
             Err(reason) => {
                 round.statistics.bounded.unknown += 1;
                 round.statistics.record_joint_unsupported(reason);
@@ -37,13 +34,40 @@ impl ContinuousBatchScheduler {
         round.prediction_elapsed = prior_elapsed.saturating_add(started.elapsed());
     }
 
-    fn compare_bounded_first_wave(
+    // Kept separate from comparison so the actual frontier validation remains
+    // the sole authority for the diagnostic's Applied/Invalidated distinction.
+    pub(in super::super) fn apply_bounded_first_wave(
+        &self,
+        batch: &mut Vec<ScheduledRequest>,
+        round: &mut TimePlanningRound,
+        action: SelectedJointAction,
+    ) {
+        round.statistics.bounded.selected += 1;
+        let decode_only = matches!(action.action, FirstAction::DecodeOnly);
+        if self.apply_joint_first_wave(batch, round, action) {
+            if let Some(evidence) = &mut round.bounded_decision {
+                evidence.outcome = BoundedDecisionOutcome::Applied;
+            }
+            round.statistics.bounded.applied += 1;
+            round.statistics.joint_interventions += 1;
+            round.statistics.joint_decode_only_interventions += u64::from(decode_only);
+        } else {
+            if let Some(evidence) = &mut round.bounded_decision {
+                evidence.outcome = BoundedDecisionOutcome::Invalidated;
+            }
+            round.statistics.bounded.invalidated += 1;
+            round.statistics.static_fallbacks += 1;
+        }
+    }
+
+    pub(in super::super) fn compare_bounded_first_wave(
         &self,
         hint: &BatchHint,
         batch: &[ScheduledRequest],
         round: &mut TimePlanningRound,
         now: Instant,
     ) -> std::result::Result<Option<SelectedJointAction>, Unsupported> {
+        round.bounded_decision = None;
         let started = Instant::now();
         let remaining_time = Duration::from_micros(round.config.planning.max_elapsed_us)
             .checked_sub(round.prediction_elapsed)
@@ -110,6 +134,10 @@ impl ContinuousBatchScheduler {
                     .and_then(|aggregate| bytes.checked_add(aggregate))
             })
             .and_then(|bytes| {
+                BoundedDecisionDiagnostic::additional_bytes_bound(alternatives.len())
+                    .and_then(|actions| bytes.checked_add(actions))
+            })
+            .and_then(|bytes| {
                 BoundedTiming::retained_bytes_bound(
                     cohort.requests.len(),
                     alternatives.len().checked_add(1)?,
@@ -120,6 +148,18 @@ impl ContinuousBatchScheduler {
         if retained_bytes > round.config.planning.max_request_fact_bytes {
             return Err(Unsupported::ParticipantBudget);
         }
+        // Labels are the only new dynamic payload. Build them after the shared
+        // byte guard, once; the larger evidence Vec moves out of the accumulator.
+        let candidate_actions = alternatives
+            .iter()
+            .map(|action| match *action {
+                FirstAction::PrefillLimit(max_tokens) => {
+                    BoundedActionDiagnostic::PrefillLimit { max_tokens }
+                }
+                FirstAction::DecodeOnly => BoundedActionDiagnostic::DecodeOnly,
+                _ => unreachable!("bounded alternatives are first-wave edits"),
+            })
+            .collect();
         let mut config = round.config;
         config.planning.max_queries = round.remaining_queries();
         if config.planning.max_queries == 0 {
@@ -190,15 +230,39 @@ impl ContinuousBatchScheduler {
         round.statistics.bounded.evaluated += 1;
         round.statistics.bounded.last_static_score = Some(decision.static_score);
         round.statistics.bounded.last_selected_score = decision.selected_score;
+        let selected = decision.selected;
+        let valid_until = decision.valid_until;
+        round.bounded_decision = Some(BoundedDecisionDiagnostic::new(
+            round.diagnostic_revision,
+            &config,
+            now,
+            decision,
+            candidate_actions,
+        ));
         // The model's cost support expires independently of the CPU budget.
-        let apply_at = now
-            .checked_add(started.elapsed())
-            .ok_or(Unsupported::Arithmetic)?;
-        if started.elapsed() >= remaining_time || apply_at >= decision.valid_until {
+        let Some(apply_at) = now.checked_add(started.elapsed()) else {
+            if let Some(evidence) = &mut round.bounded_decision {
+                evidence.outcome = BoundedDecisionOutcome::RejectedAfterEvaluation {
+                    reason: Unsupported::Arithmetic,
+                    cpu_budget_exhausted: false,
+                    cost_expired: false,
+                };
+            }
+            return Err(Unsupported::Arithmetic);
+        };
+        let cpu_budget_exhausted = started.elapsed() >= remaining_time;
+        let cost_expired = apply_at >= valid_until;
+        if cpu_budget_exhausted || cost_expired {
+            if let Some(evidence) = &mut round.bounded_decision {
+                evidence.outcome = BoundedDecisionOutcome::RejectedAfterEvaluation {
+                    reason: Unsupported::TimeBudget,
+                    cpu_budget_exhausted,
+                    cost_expired,
+                };
+            }
             return Err(Unsupported::TimeBudget);
         }
-        Ok(decision
-            .selected
+        Ok(selected
             .and_then(|index| alternatives.get(index).copied())
             .map(|action| SelectedJointAction {
                 action,

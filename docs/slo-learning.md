@@ -169,6 +169,24 @@ ranges are not proof of successful device work: request failure/close events
 and committed-token deltas must be checked separately. These records support
 execution diagnosis; client timestamps remain the latency measurement.
 
+For a completed bounded comparison, `slo_planning.bounded_decision` retains
+the already computed static and candidate score components, action labels,
+selected index, snapshot revision and finite horizon. The `outcome` distinguishes
+a computed choice from retaining static, applying an edit, invalidating it at
+the batch frontier, or rejecting it after evaluation. A post-evaluation rejection
+also reports CPU-budget exhaustion and cost expiry separately. `cost_valid_for`
+is measured from the comparison's frozen time, not from trace serialization.
+New selections and rounds clear this evidence; an unsupported comparison or one
+without alternatives does not inherit the previous decision.
+
+These finite-prefix proxies explain the ranking, not counterfactual execution
+benefit, exact first-wave device time, or client SLO compliance. The existing
+evidence vector moves into the planning round without additional model queries
+or simulation. Action labels count against the shared request-fact byte budget,
+so a comparison close to that limit can fall back earlier. Trace serialization
+is conditional on the public trace option, but retaining the evidence still has
+a bounded memory and CPU cost; it is not a zero-overhead diagnostic.
+
 Defaults bound resource use. They do not specify the experiment's sample size,
 acceptable regression, or confidence level. Models publish only after disjoint
 training, validation and calibration partitions qualify. Work outside the

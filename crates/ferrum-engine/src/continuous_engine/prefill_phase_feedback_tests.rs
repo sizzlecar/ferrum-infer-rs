@@ -281,9 +281,23 @@ struct EngineFixture {
 }
 
 fn engine_fixture(availability: Availability, trace_path: PathBuf) -> EngineFixture {
+    engine_fixture_with_policy(
+        availability,
+        trace_path,
+        ferrum_types::SloStrategy::Joint,
+        ProfileEntrypoint::Serve,
+    )
+}
+
+fn engine_fixture_with_policy(
+    availability: Availability,
+    trace_path: PathBuf,
+    strategy: ferrum_types::SloStrategy,
+    entrypoint: ProfileEntrypoint,
+) -> EngineFixture {
     let mut config = EngineConfig::default();
     config.runtime.scheduler_trace_jsonl = Some(trace_path);
-    config.runtime.profile_entrypoint = Some(ProfileEntrypoint::Serve);
+    config.runtime.profile_entrypoint = Some(entrypoint);
     config.backend.device = Device::CPU;
     config.scheduler.max_running_requests = 2;
     config.scheduler.prefill_step_chunk = Some(4);
@@ -293,7 +307,7 @@ fn engine_fixture(availability: Availability, trace_path: PathBuf) -> EngineFixt
     config.batching.prefill_decode_execution = ferrum_types::PrefillDecodeExecution::Split;
     let mut policy: ferrum_types::SchedulerSloConfig =
         "ttft:1000000,tpot:50000,itl:15000".parse().unwrap();
-    policy.strategy = ferrum_types::SloStrategy::Joint;
+    policy.strategy = strategy;
     policy.planning.max_scenarios = 2;
     // A correctness-test CPU resource allowance; its existing modeled control
     // delay remains included in the selected conditional trajectory.
@@ -358,6 +372,126 @@ fn engine_fixture(availability: Availability, trace_path: PathBuf) -> EngineFixt
         source,
         attempts,
         requests,
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn bounded_decision_trace_uses_actual_queries_and_clears_after_stale_snapshot() {
+    for entrypoint in [ProfileEntrypoint::Run, ProfileEntrypoint::Serve] {
+        let trace = tempfile::tempdir().unwrap();
+        let trace_path = trace.path().join("iterations.jsonl");
+        let EngineFixture {
+            engine,
+            source,
+            attempts,
+            ..
+        } = engine_fixture_with_policy(
+            Availability::Cold,
+            trace_path.clone(),
+            ferrum_types::SloStrategy::Bounded,
+            entrypoint,
+        );
+        // Use the real admission/execution owner before switching the cost
+        // snapshot. A Known cost surface alone is not a resource proof.
+        let mut decoder = submit(&engine, 1).await;
+        step(&engine, &mut [&mut decoder]).await;
+        let mut prefill = submit(&engine, 36).await;
+        step(&engine, &mut [&mut decoder, &mut prefill]).await;
+        attempts.take();
+
+        source.publish(Availability::Known);
+        let queries_before = source.queried.lock().len();
+        step(&engine, &mut [&mut decoder, &mut prefill]).await;
+        let known_queries = source.queried.lock().len() - queries_before;
+        let known_work = attempts.take();
+        assert!(known_queries > 0);
+        assert!(!known_work.is_empty());
+        let mut known_prefill_ranges = Vec::new();
+        append_prefills(known_work, &prefill.id, &mut known_prefill_ranges);
+
+        source.publish(Availability::Stale);
+        step(&engine, &mut [&mut decoder, &mut prefill]).await;
+        assert!(source.queried.lock().contains(&3));
+        for _ in 0..96 {
+            if decoder.terminal.is_some() && prefill.terminal.is_some() {
+                break;
+            }
+            step(&engine, &mut [&mut decoder, &mut prefill]).await;
+        }
+        for stream in [&decoder, &prefill] {
+            let terminal = stream.terminal.as_ref().expect("real output completes");
+            assert_eq!(terminal.finish_reason, Some(FinishReason::Length));
+            assert_eq!(terminal.usage.as_ref().unwrap().completion_tokens, 64);
+            assert_eq!(stream.tokens.len(), 64);
+        }
+        engine.shutdown().await.unwrap();
+        engine.wait_for_shutdown_completion().await.unwrap();
+
+        let events = read_engine_profile_events(&trace_path);
+        let iterations: Vec<_> = events
+            .iter()
+            .filter(|event| event.phase == "scheduler.iteration")
+            .collect();
+        let known = iterations
+            .iter()
+            .find(|event| event.attributes["slo_planning"]["snapshot_revision"] == 2)
+            .expect("the actual Known iteration is publicly traced");
+        assert_eq!(known.entrypoint, entrypoint);
+        assert_eq!(known.attributes["result"], "some_ok");
+        let planning = &known.attributes["slo_planning"];
+        // Both counters cover the actual snapshot calls. Merely projecting
+        // an already computed decision must not query the provider again.
+        assert_eq!(planning["query_count"], known_queries as u64);
+        let stats = &planning["statistics"]["bounded"];
+        assert_eq!(stats["provider_calls"], known_queries as u64);
+        assert_eq!(stats["evaluated"], 1);
+        let decision = &planning["bounded_decision"];
+        assert!(decision.is_object(), "{planning}");
+        assert_eq!(decision["snapshot_revision"], 2);
+        assert_eq!(decision["request_count"], 2);
+        assert_eq!(decision["observed_ranks"], 2);
+        assert_eq!(decision["static_score"], stats["last_static_score"]);
+        assert_eq!(decision["selected_score"], stats["last_selected_score"]);
+        let actions = decision["candidate_actions"].as_array().unwrap();
+        let alternatives = decision["alternatives"].as_array().unwrap();
+        assert!(!actions.is_empty());
+        assert_eq!(actions.len(), alternatives.len());
+        assert_eq!(decision["static_action"]["kind"], "static");
+        if let Some(selected) = decision["selected_index"].as_u64() {
+            assert!((selected as usize) < alternatives.len());
+            assert_eq!(decision["outcome"]["status"], "applied");
+            assert_eq!(stats["selected"], 1);
+            assert_eq!(stats["applied"], 1);
+            match actions[selected as usize]["kind"].as_str().unwrap() {
+                "prefill_limit" => {
+                    let limit = actions[selected as usize]["max_tokens"].as_u64().unwrap();
+                    assert_eq!(known_prefill_ranges, vec![(4, limit as usize)]);
+                }
+                "decode_only" => assert!(known_prefill_ranges.is_empty()),
+                other => panic!("unexpected bounded action: {other}"),
+            }
+        } else {
+            assert_eq!(decision["outcome"]["status"], "retained");
+            assert_eq!(stats["selected"], 0);
+            assert_eq!(stats["applied"], 0);
+            assert_eq!(known_prefill_ranges, vec![(4, 4)]);
+        }
+        let mut saw_stale_round = false;
+        for event in iterations {
+            assert_eq!(event.entrypoint, entrypoint);
+            let planning = &event.attributes["slo_planning"];
+            saw_stale_round |= planning["snapshot_revision"] == 3;
+            if planning["snapshot_revision"] != 2 {
+                if planning.is_object() {
+                    assert!(planning.get("bounded_decision").is_some());
+                }
+                assert!(
+                    planning["bounded_decision"].is_null(),
+                    "cold, stale and no-alternative iterations must not inherit the Known evidence"
+                );
+            }
+        }
+        assert!(saw_stale_round);
     }
 }
 

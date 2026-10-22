@@ -168,6 +168,7 @@ impl TimePlanningRound {
     }
 
     pub(super) fn reset_selection(&mut self) {
+        self.bounded_decision = None;
         self.selected.clear();
         self.selected_exact = true;
         self.execution_already_projected = true;

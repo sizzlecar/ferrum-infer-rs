@@ -12,6 +12,7 @@ mod risk;
 mod scenarios;
 pub use admission::*;
 pub use aggregation::*;
+pub(crate) use bounded::BoundedActionEvidence;
 pub use bounded::{BoundedAccumulator, BoundedDecision, BoundedTiming, ServiceOpportunityClock};
 pub use decision_observation::*;
 pub use diagnostics::*;

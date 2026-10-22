@@ -90,6 +90,9 @@ impl ContinuousBatchScheduler {
         round: &mut TimePlanningRound,
         now: Instant,
     ) {
+        // A new selection, including a non-bounded strategy, cannot expose a
+        // previous comparison as evidence for this batch.
+        round.bounded_decision = None;
         if round.config.strategy == ferrum_types::SloStrategy::Bounded {
             self.select_bounded_first_wave(hint, batch, round, now);
             return;

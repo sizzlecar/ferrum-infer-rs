@@ -1,6 +1,8 @@
 //! Bounded control consumes supported future work, not complete-request proof.
 use super::*;
 
+mod decision_diagnostics;
+
 fn bounded_fixture(execution: CostExecution, blocker: Blocker) -> DecodeOnlyFixture {
     let mut fixture = decode_only_fixture(true, true, execution, blocker);
     fixture.round.config.strategy = ferrum_types::SloStrategy::Bounded;

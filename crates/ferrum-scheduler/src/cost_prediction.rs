@@ -14,11 +14,15 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::watch;
 
+mod bounded_diagnostics;
 mod decision_diagnostics;
 mod persistent_capacity;
 mod scenario_diagnostics;
 mod unsupported_counts;
 mod unsupported_detail;
+pub(crate) use bounded_diagnostics::{
+    BoundedActionDiagnostic, BoundedDecisionDiagnostic, BoundedDecisionOutcome,
+};
 pub(crate) use decision_diagnostics::{DecisionConsumerOutcome, JointDecisionDiagnostics};
 pub(crate) use scenario_diagnostics::{ComparisonKind, JointEvaluationDiagnostics};
 pub(crate) use unsupported_counts::JointUnsupportedCounts;
@@ -340,6 +344,9 @@ pub struct TimePlanningRound {
     pub(crate) statistics: PlanningStatistics,
     pub(crate) diagnostics_scope_owned: bool,
     pub(crate) diagnostic_revision: Option<u64>,
+    /// Only the latest attempted bounded comparison in this round. Never
+    /// merged into the Copy aggregate health counters.
+    pub(crate) bounded_decision: Option<BoundedDecisionDiagnostic>,
     pub(crate) selection_attempted: bool,
     pub(crate) selected: Vec<CostWork>,
     pub(crate) selected_exact: bool,
@@ -372,6 +379,7 @@ pub struct TimePlanningDiagnostics<'a> {
     query_budget_exhausted: bool,
     prediction_elapsed_us: u64,
     statistics: &'a PlanningStatistics,
+    bounded_decision: Option<&'a BoundedDecisionDiagnostic>,
 }
 
 impl TimePlanningRound {
@@ -382,6 +390,7 @@ impl TimePlanningRound {
             query_budget_exhausted: self.query_budget_exhausted,
             prediction_elapsed_us: self.prediction_elapsed.as_micros().min(u64::MAX as u128) as u64,
             statistics: &self.statistics,
+            bounded_decision: self.bounded_decision.as_ref(),
         }
     }
 
@@ -410,6 +419,7 @@ impl TimePlanningRound {
             statistics: PlanningStatistics::default(),
             diagnostics_scope_owned: false,
             diagnostic_revision,
+            bounded_decision: None,
             selection_attempted: false,
             selected: Vec::new(),
             selected_exact: true,
@@ -446,6 +456,7 @@ impl TimePlanningRound {
     /// A missing member or failed projection must not leave old facts usable.
     /// The immutable predictor and the round's consumed budgets are unchanged.
     pub fn clear_request_facts(&mut self) {
+        self.bounded_decision = None;
         self.request_facts = None;
         self.admission_gate = None;
         self.request_clocks = None;
