@@ -21,6 +21,39 @@ impl CostSnapshot for Snapshot {
     }
 }
 
+#[derive(Clone, Copy)]
+enum CapacityObservation {
+    Persistent,
+    Resident,
+}
+
+async fn observe_capacity(
+    inner: &EngineInner,
+    round: &mut TimePlanningRound,
+    expected: CapacityObservation,
+) {
+    // Production planning intentionally returns Unknown on contention, including
+    // the process-wide deferred-cleanup registry used by unrelated parallel
+    // tests. Actual admission does not make that read-only observation blocking.
+    // This quiescent fixture requires an eventual positive proof; it neither
+    // retries admission nor accepts Unknown as evidence of capacity.
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            inner.capture_planning_request_facts(round, 1);
+            let observed = match expected {
+                CapacityObservation::Persistent => round.persistent_capacity().is_some(),
+                CapacityObservation::Resident => round.resident_capacity().is_some(),
+            };
+            if observed {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("quiescent actual owner must eventually expose the required capacity proof");
+}
+
 #[tokio::test]
 async fn planning_paged_residents_use_general_capacity_when_resident_only_api_is_unknown() {
     let cfg = TinyLlamaConfig::default();
@@ -148,7 +181,7 @@ async fn planning_resident_capacity_uses_actual_program_admission_ceiling() {
             PrefillShapePolicy::Identity,
             CostExecution::SingleInvocation,
         );
-        inner.capture_planning_request_facts(&mut round, 1);
+        observe_capacity(&inner, &mut round, CapacityObservation::Persistent).await;
         assert!(
             round.resident_capacity().is_none(),
             "waiting is not resident"
@@ -179,7 +212,7 @@ async fn planning_resident_capacity_uses_actual_program_admission_ceiling() {
             metadata.remove("ferrum_lora_path");
         }
         drop(waiting_handle);
-        inner.capture_planning_request_facts(&mut round, 1);
+        observe_capacity(&inner, &mut round, CapacityObservation::Persistent).await;
         assert!(round.persistent_capacity().is_some());
         tokio::time::timeout(std::time::Duration::from_secs(10), async {
             loop {
@@ -197,7 +230,7 @@ async fn planning_resident_capacity_uses_actual_program_admission_ceiling() {
         })
         .await
         .expect("native admission and maintenance must complete");
-        inner.capture_planning_request_facts(&mut round, 1);
+        observe_capacity(&inner, &mut round, CapacityObservation::Resident).await;
         let proof = round
             .resident_capacity()
             .expect("actual admission is covered");
@@ -230,7 +263,7 @@ async fn planning_resident_capacity_uses_actual_program_admission_ceiling() {
         inner.capture_planning_request_facts(&mut round, 1);
         assert!(round.resident_capacity().is_none());
         handle.lock().as_mut().unwrap().sampling_params.max_tokens = cap;
-        inner.capture_planning_request_facts(&mut round, 1);
+        observe_capacity(&inner, &mut round, CapacityObservation::Resident).await;
         assert!(round.resident_capacity().is_some());
         drop(handle);
         drop(inner);
