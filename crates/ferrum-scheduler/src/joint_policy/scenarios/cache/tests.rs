@@ -1,6 +1,8 @@
 use super::*;
 use ferrum_execution::{execution_attempt::AttemptWorkKind, token_execution::ExecutionRange};
 
+mod two_slot;
+
 fn work() -> CostWork {
     CostWork {
         kind: AttemptWorkKind::Decode,

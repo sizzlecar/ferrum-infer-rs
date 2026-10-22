@@ -1,5 +1,6 @@
 //! Memoization belongs to one immutable snapshot, one query time and one
-//! comparison. Hash collisions only evict entries; exact work equality is required.
+//! comparison. At most two existing slots are inspected per key; collisions
+//! may still evict entries, and exact work equality is always required.
 
 use super::*;
 use ferrum_execution::execution_attempt::AttemptPrefixRestore;
@@ -33,6 +34,12 @@ struct Entry {
 }
 
 impl Entry {
+    fn matches(&self, query: &CostQuery<'_>) -> bool {
+        self.exact == query.work_is_exact
+            && self.execution == query.execution
+            && self.work.as_ref() == query.work
+    }
+
     fn payload_bytes(&self) -> usize {
         std::mem::size_of_val(self.work.as_ref()) + std::mem::size_of_val(self.scenarios.as_ref())
     }
@@ -109,12 +116,11 @@ impl ScenarioCache {
             return (None, None);
         }
         let slot = index(query, self.slots.len());
-        let prediction = self.slots[slot].as_ref().and_then(|entry| {
-            (entry.exact == query.work_is_exact
-                && entry.execution == query.execution
-                && entry.work.as_ref() == query.work)
-                .then(|| entry.prediction(rank))
-                .flatten()
+        let prediction = self.probe_slots(slot).find_map(|slot| {
+            self.slots[slot]
+                .as_ref()
+                .filter(|entry| entry.matches(query))
+                .and_then(|entry| entry.prediction(rank))
         });
         if let Some(prediction) = prediction {
             self.hits = self.hits.saturating_add(1);
@@ -160,7 +166,6 @@ impl ScenarioCache {
             return;
         }
         let query = key.query;
-        let slot = key.slot;
         let CostScenarioPrediction::Known {
             scenarios,
             dependence,
@@ -173,6 +178,22 @@ impl ScenarioCache {
         else {
             return;
         };
+        // The provider runs without the cache lock. Search CURRENT entries for
+        // this exact key before considering empties, so an interleaved insert
+        // cannot create two copies with different distributions. A third
+        // colliding key deterministically replaces its primary slot.
+        let slot = self
+            .probe_slots(key.slot)
+            .find(|slot| {
+                self.slots[*slot]
+                    .as_ref()
+                    .is_some_and(|entry| entry.matches(&query))
+            })
+            .or_else(|| {
+                self.probe_slots(key.slot)
+                    .find(|slot| self.slots[*slot].is_none())
+            })
+            .unwrap_or(key.slot);
         let previous = self.slots[slot].as_ref().map_or(0, Entry::payload_bytes);
         let Some(bytes) = query
             .work
@@ -205,6 +226,20 @@ impl ScenarioCache {
             expires_at,
         });
         self.retained_bytes = bytes;
+    }
+
+    fn probe_slots(&self, primary: usize) -> impl Iterator<Item = usize> {
+        debug_assert!(primary < self.slots.len());
+        let secondary = if primary == self.slots.len() - 1 {
+            0
+        } else {
+            primary + 1
+        };
+        // Fixed stack storage only. The one-slot case must neither repeat a
+        // lookup nor count a hit twice; zero slots never reach this helper.
+        [primary, secondary]
+            .into_iter()
+            .take(self.slots.len().min(2))
     }
 }
 
