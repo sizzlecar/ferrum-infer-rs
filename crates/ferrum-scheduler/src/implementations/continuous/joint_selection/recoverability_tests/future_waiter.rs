@@ -11,6 +11,8 @@ use ferrum_execution::token_execution::ExecutorSequenceIssuer;
 use ferrum_interfaces::request_observation::*;
 use ferrum_types::{ModelId, SamplingParams};
 
+mod deferred_commit;
+
 struct ScaledCosts(Instant);
 
 impl CostSnapshot for ScaledCosts {
@@ -264,11 +266,16 @@ impl FutureFixture {
             .unwrap()
             .iter()
             .zip(&self.requests)
-            .enumerate()
-            .map(|(index, ((id, fact), request))| PersistentCapacityMember {
+            .map(|((id, fact), request)| PersistentCapacityMember {
                 request_id: id.clone(),
                 lifecycle: fact.lifecycle,
-                state: if index == 2 {
+                state: if self
+                    .scheduler
+                    .waiting_queue
+                    .read()
+                    .iter()
+                    .any(|waiting| waiting.inner.request.id == *id)
+                {
                     PersistentCapacityState::Waiting
                 } else {
                     PersistentCapacityState::Resident {
@@ -431,7 +438,7 @@ fn complete_counterfactual(
 }
 
 #[test]
-fn future_waiter_cap64_can_be_feasible_when_current_first_wave_has_no_prefill_target() {
+fn future_waiter_cap64_counterfactual_preserves_the_first_wave_only_baseline_gap() {
     let fixture = FutureFixture::new(false);
     let mut round = fixture.round();
     let current = fixture
@@ -440,7 +447,10 @@ fn future_waiter_cap64_can_be_feasible_when_current_first_wave_has_no_prefill_ta
             &FutureFixture::hint(),
             &mut round,
             fixture.now,
-            AdmissionCapMode::Propose,
+            // ExistingOnly freezes the old baseline: no new cap is proposed
+            // and this decode-only first wave has no ordinary alternatives.
+            // The deferred_commit tests separately exercise the new Propose.
+            AdmissionCapMode::ExistingOnly,
             0,
         )
         .unwrap();
@@ -450,25 +460,6 @@ fn future_waiter_cap64_can_be_feasible_when_current_first_wave_has_no_prefill_ta
     assert_eq!(current.decision.static_risk.request_count, 3);
     assert!((current.decision.static_risk.itl.unwrap().lower - 16.0 / 189.0).abs() < 1e-12);
 
-    let mut gate_round = fixture.round();
-    fixture.scheduler.prepare_joint_admission_gate(
-        &FutureFixture::hint(),
-        &mut gate_round,
-        fixture.now,
-    );
-    assert_eq!(
-        gate_round
-            .statistics
-            .joint_decision
-            .admission
-            .outcomes
-            .all_known_infeasible,
-        1
-    );
-    assert_eq!(
-        gate_round.statistics.joint_admission_prefill_phase_commits,
-        0
-    );
     assert_eq!(fixture.scheduler.active_count(), 2);
     assert_eq!(fixture.scheduler.waiting_count(), 1);
     assert!(fixture

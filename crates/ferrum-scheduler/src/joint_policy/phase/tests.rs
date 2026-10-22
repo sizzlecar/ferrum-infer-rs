@@ -436,7 +436,7 @@ fn explicit_prefill_phase_builder_rejects_unbound_completed_duplicate_and_over_b
     builder.prefill_target(0).unwrap();
     builder.prefill_target(1).unwrap();
     assert!(matches!(
-        PhaseState::new(builder.finish().unwrap(), &huge),
+        PhaseState::new(builder.finish().unwrap(), &huge, None),
         Err(Unsupported::Arithmetic)
     ));
 }

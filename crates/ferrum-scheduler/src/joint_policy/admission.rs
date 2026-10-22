@@ -70,6 +70,11 @@ impl AdmissionSlotPlan {
         self.waiting_order.len()
     }
 
+    /// Immutable membership in this captured cohort, before modeled release.
+    pub fn initial_admission(&self, request: usize) -> Option<InitialAdmission> {
+        self.initial.get(request).copied()
+    }
+
     /// The same frozen order is used for every candidate and continuation.
     /// Initially resident requests retain their slots until completion. The
     /// first unfinished waiters occupy released slots, even when token limits

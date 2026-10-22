@@ -742,8 +742,15 @@ fn simulate_recorded<Action, Adapter: TrajectoryAdapter<Action>>(
                 .continuation_phase(action, &requests, &mut declaration)?;
             phase = declaration
                 .finish()
-                .map(|phase| phase::PhaseState::new(phase, &requests))
+                .map(|phase| {
+                    phase::PhaseState::new(phase, &requests, input.adapter.admission_slots())
+                })
                 .transpose()?;
+        }
+        if let Some(phase) = &mut phase {
+            phase.begin_wave(&requests, plan.active.as_deref())?;
+        }
+        if rounds == 0 {
             input.adapter.plan(Some(action), &requests, &mut plan)?;
         } else if let Some(phase) = &phase {
             input

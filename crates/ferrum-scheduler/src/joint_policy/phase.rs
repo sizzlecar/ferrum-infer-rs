@@ -13,12 +13,15 @@ pub struct PrefillTarget {
 #[derive(Debug)]
 pub enum ContinuationPhase {
     PrefillTargets(Vec<PrefillTarget>),
+    /// Original waiting members may need modeled slot releases before their
+    /// prefill can advance. The original admission plan remains authoritative.
+    DeferredPrefillTargets(Vec<PrefillTarget>),
 }
 
 impl ContinuationPhase {
     pub fn prefill_targets(&self) -> &[PrefillTarget] {
         match self {
-            Self::PrefillTargets(targets) => targets,
+            Self::PrefillTargets(targets) | Self::DeferredPrefillTargets(targets) => targets,
         }
     }
 
@@ -37,6 +40,7 @@ pub struct PhaseBuilder<'a> {
     max_targets: usize,
     max_bytes: usize,
     targets: Vec<PrefillTarget>,
+    deferred: bool,
 }
 
 impl<'a> PhaseBuilder<'a> {
@@ -50,10 +54,29 @@ impl<'a> PhaseBuilder<'a> {
             max_targets,
             max_bytes,
             targets: Vec::new(),
+            deferred: false,
         }
     }
 
     pub fn prefill_target(&mut self, request: usize) -> Result<(), Unsupported> {
+        if self.deferred {
+            return Err(Unsupported::InvalidPlan);
+        }
+        self.push(request)
+    }
+
+    /// Declare only a captured waiting owner. The core checks its original
+    /// admission state before invoking the adapter's first plan.
+    pub fn deferred_prefill_target(&mut self, request: usize) -> Result<(), Unsupported> {
+        if !self.targets.is_empty() && !self.deferred {
+            return Err(Unsupported::InvalidPlan);
+        }
+        self.push(request)?;
+        self.deferred = true;
+        Ok(())
+    }
+
+    fn push(&mut self, request: usize) -> Result<(), Unsupported> {
         let count = self
             .targets
             .len()
@@ -82,36 +105,94 @@ impl<'a> PhaseBuilder<'a> {
     }
 
     pub(super) fn finish(self) -> Option<ContinuationPhase> {
-        (!self.targets.is_empty()).then_some(ContinuationPhase::PrefillTargets(self.targets))
+        (!self.targets.is_empty()).then(|| {
+            if self.deferred {
+                ContinuationPhase::DeferredPrefillTargets(self.targets)
+            } else {
+                ContinuationPhase::PrefillTargets(self.targets)
+            }
+        })
     }
 }
 
 pub(super) struct PhaseState {
     phase: ContinuationPhase,
     remaining: usize,
+    cohort_remaining: Option<usize>,
+    awaiting_slot: bool,
 }
 
 impl PhaseState {
     pub(super) fn new(
         phase: ContinuationPhase,
         requests: &[SimulatedRequest],
+        slots: Option<&AdmissionSlotPlan>,
     ) -> Result<Self, Unsupported> {
         let remaining = remaining(&phase, requests)?;
         if remaining == 0 {
             return Err(Unsupported::InvalidPlan);
         }
-        Ok(Self { phase, remaining })
+        let cohort_remaining = if matches!(&phase, ContinuationPhase::DeferredPrefillTargets(_)) {
+            let slots = slots.ok_or(Unsupported::WaitingResources)?;
+            for target in phase.prefill_targets() {
+                if !matches!(
+                    slots.initial_admission(target.request),
+                    Some(InitialAdmission::Waiting { .. })
+                ) || requests[target.request].prefill_tokens != 0
+                    || requests[target.request].output_tokens != 0
+                {
+                    return Err(Unsupported::InvalidPlan);
+                }
+            }
+            Some(cohort_remaining(requests)?)
+        } else {
+            None
+        };
+        Ok(Self {
+            phase,
+            remaining,
+            cohort_remaining,
+            awaiting_slot: false,
+        })
     }
 
     pub(super) fn phase(&self) -> &ContinuationPhase {
         &self.phase
     }
 
-    /// Successful completion of a wave (including an early common-window
-    /// return) must contain real prefill progress on the frozen target set.
+    /// Freeze eligibility at the wave boundary, including split invocations.
+    /// A slot released by one group cannot admit a target in a later group of
+    /// this same wave. No additional active-mask allocation is needed.
+    pub(super) fn begin_wave(
+        &mut self,
+        requests: &[SimulatedRequest],
+        active: Option<&[bool]>,
+    ) -> Result<(), Unsupported> {
+        if self.cohort_remaining.is_some() {
+            let active = active
+                .filter(|active| active.len() == requests.len())
+                .ok_or(Unsupported::WaitingResources)?;
+            self.awaiting_slot = !self.phase.prefill_targets().iter().any(|target| {
+                requests[target.request].prefill_tokens < target.prompt_tokens
+                    && active[target.request]
+            });
+        }
+        Ok(())
+    }
+
+    /// Once any unfinished target is eligible, real target prefill progress is
+    /// mandatory. Before that boundary, the original active owners must reduce
+    /// the checked finite cohort work. PlanBuilder forbids inactive work.
     pub(super) fn progressed(&self, requests: &[SimulatedRequest]) -> Result<usize, Unsupported> {
         let remaining = remaining(&self.phase, requests)?;
-        if remaining >= self.remaining {
+        let progresses = if self.awaiting_slot {
+            remaining <= self.remaining
+                && cohort_remaining(requests)?
+                    < self.cohort_remaining.ok_or(Unsupported::InvalidPlan)?
+        } else {
+            remaining < self.remaining
+        };
+        if !progresses {
             return Err(Unsupported::NoProgress);
         }
         Ok(remaining)
@@ -119,8 +200,28 @@ impl PhaseState {
 
     pub(super) fn advance(&mut self, requests: &[SimulatedRequest]) -> Result<bool, Unsupported> {
         self.remaining = self.progressed(requests)?;
+        if self.cohort_remaining.is_some() {
+            self.cohort_remaining = Some(cohort_remaining(requests)?);
+        }
         Ok(self.remaining == 0)
     }
+}
+
+fn cohort_remaining(requests: &[SimulatedRequest]) -> Result<usize, Unsupported> {
+    requests.iter().try_fold(0usize, |total, request| {
+        let prefill = request
+            .prompt_tokens
+            .checked_sub(request.prefill_tokens)
+            .ok_or(Unsupported::InvalidState)?;
+        let output = request
+            .scenario_end_tokens
+            .checked_sub(request.output_tokens)
+            .ok_or(Unsupported::InvalidState)?;
+        total
+            .checked_add(prefill)
+            .and_then(|total| total.checked_add(output))
+            .ok_or(Unsupported::Arithmetic)
+    })
 }
 
 fn remaining(
@@ -147,3 +248,6 @@ fn remaining(
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod deferred_tests;

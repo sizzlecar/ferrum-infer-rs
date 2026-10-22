@@ -255,15 +255,20 @@ impl ContinuousBatchScheduler {
             .max()
             .unwrap_or(0);
         if cap_mode == AdmissionCapMode::Propose {
-            // Fix the target set before any cap changes packing. The resulting
-            // preview may fill the released token budget with other members,
-            // but those members do not inherit the commitment.
+            // Preserve the existing natural-prefill target set. When there is
+            // no prefill in this wave, a distinct deferred phase may bind only
+            // original captured waiters; it still uses the original slot plan.
+            // Future arrivals and token-budget backfill never inherit targets.
             cohort.cap_bindings.retain(|binding| {
-                first_wave.iter().any(|member| {
-                    member.request == binding.request
-                        && member.work.kind
-                            == ferrum_execution::execution_attempt::AttemptWorkKind::Prefill
-                })
+                if largest == 0 {
+                    binding.phase == RequestPhase::Waiting
+                } else {
+                    first_wave.iter().any(|member| {
+                        member.request == binding.request
+                            && member.work.kind
+                                == ferrum_execution::execution_attempt::AttemptWorkKind::Prefill
+                    })
+                }
             });
             cohort
                 .trajectory
@@ -311,14 +316,20 @@ impl ContinuousBatchScheduler {
             }
         }
         if cap_mode == AdmissionCapMode::Propose {
-            for limit in [largest.div_ceil(2), quarter] {
+            let deferred = largest == 0;
+            let scale = if deferred {
+                cohort.trajectory.deferred_prefill_scale(&cohort.requests)
+            } else {
+                largest
+            };
+            for limit in [scale.div_ceil(2), scale.div_ceil(4)] {
                 let Some(limit) = NonZeroUsize::new(limit) else {
                     continue;
                 };
-                if cohort.trajectory.allows_cap_commit(&cohort.requests, limit)
-                    && !alternatives.iter().any(|action| matches!(action, FirstAction::PrefillCapCommit(previous) if *previous == limit))
+                if (!deferred || scale >= 2) && cohort.trajectory.allows_cap_commit(&cohort.requests, limit)
+                    && !alternatives.iter().any(|action| matches!(action, FirstAction::PrefillCapCommit(previous) | FirstAction::DeferredPrefillCapCommit(previous) if *previous == limit))
                 {
-                    alternatives.push(FirstAction::PrefillCapCommit(limit));
+                    alternatives.push(if deferred { FirstAction::DeferredPrefillCapCommit(limit) } else { FirstAction::PrefillCapCommit(limit) });
                 }
             }
         }
@@ -518,7 +529,10 @@ impl ContinuousBatchScheduler {
         round.statistics.joint_decision.returned(comparison_kind);
         let prefill_cap = match decision.choice {
             PolicyChoice::Alternative(index) => match alternatives.get(index) {
-                Some(FirstAction::PrefillCapCommit(limit)) => Some(PrefillCapProposal {
+                Some(
+                    FirstAction::PrefillCapCommit(limit)
+                    | FirstAction::DeferredPrefillCapCommit(limit),
+                ) => Some(PrefillCapProposal {
                     targets: cohort.cap_bindings,
                     limit: *limit,
                     valid_until: decision.valid_until,
@@ -546,7 +560,9 @@ impl ContinuousBatchScheduler {
             FirstAction::Static => return false,
             // Admission commits policy before a fresh gate; this is never an
             // edit of an already selected dispatch batch.
-            FirstAction::PrefillCapCommit(_) => return false,
+            FirstAction::PrefillCapCommit(_) | FirstAction::DeferredPrefillCapCommit(_) => {
+                return false
+            }
             FirstAction::DecodeOnly => return self.apply_joint_decode_only(batch, round),
             FirstAction::PrefillLimit(limit) => limit.get(),
             FirstAction::PrefillPhaseLimit(limit) => {

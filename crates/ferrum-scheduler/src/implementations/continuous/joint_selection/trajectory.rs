@@ -19,6 +19,9 @@ pub(super) enum FirstAction {
     /// Preview a durable cap before admission, including natural first-wave
     /// repacking. This does not itself grant an execution slot or reservation.
     PrefillCapCommit(NonZeroUsize),
+    /// The captured waiters may first need original resident slot releases.
+    /// This positive cap never bypasses that admission plan.
+    DeferredPrefillCapCommit(NonZeroUsize),
     /// Omit prefill from a mixed first wave while all its decoders progress.
     /// This is not an empty wave or permission to change later continuation.
     DecodeOnly,
@@ -51,6 +54,37 @@ pub(super) struct CohortTrajectory {
 }
 
 impl CohortTrajectory {
+    /// A finite positive search scale from the declared prefill policy and
+    /// frozen work, even when the current natural wave is decode-only. It is
+    /// not a prediction that a waiting owner already has an execution slot.
+    pub(super) fn deferred_prefill_scale(&self, requests: &[SimulatedRequest]) -> usize {
+        self.cap_commit_targets
+            .iter()
+            .filter_map(|target| {
+                if !matches!(
+                    self.admission.initial_admission(target.request),
+                    Some(InitialAdmission::Waiting { .. })
+                ) {
+                    return None;
+                }
+                let request = requests.get(target.request)?;
+                let shape = self.shapes.get(target.request)?;
+                let left = request.prompt_tokens.checked_sub(request.prefill_tokens)?;
+                let mut scale = left
+                    .min(self.prefill_step_chunk.unwrap_or(self.max_tokens))
+                    .min(self.max_tokens);
+                if let Some(ceiling) = shape.execution_ceiling {
+                    scale = scale.min(ceiling);
+                }
+                if let Some(cap) = shape.phase_cap {
+                    scale = scale.min(cap.get());
+                }
+                Some(scale)
+            })
+            .max()
+            .unwrap_or(0)
+    }
+
     pub(super) fn allows_cap_commit(
         &self,
         requests: &[SimulatedRequest],
@@ -330,6 +364,14 @@ impl TrajectoryAdapter<FirstAction> for CohortTrajectory {
                 phase.prefill_target(target.request)?;
             }
         }
+        if matches!(action, FirstAction::DeferredPrefillCapCommit(_)) {
+            if !self.first_wave.is_empty() || self.cap_commit_targets.is_empty() {
+                return Err(Unsupported::InvalidPlan);
+            }
+            for target in &self.cap_commit_targets {
+                phase.deferred_prefill_target(target.request)?;
+            }
+        }
         Ok(())
     }
 
@@ -340,7 +382,9 @@ impl TrajectoryAdapter<FirstAction> for CohortTrajectory {
         requests: &[SimulatedRequest],
         plan: &mut PlanBuilder,
     ) -> Result<(), Unsupported> {
-        let (FirstAction::PrefillPhaseLimit(limit) | FirstAction::PrefillCapCommit(limit)) = action
+        let (FirstAction::PrefillPhaseLimit(limit)
+        | FirstAction::PrefillCapCommit(limit)
+        | FirstAction::DeferredPrefillCapCommit(limit)) = action
         else {
             return Err(Unsupported::InvalidPlan);
         };
@@ -356,7 +400,10 @@ impl TrajectoryAdapter<FirstAction> for CohortTrajectory {
         requests: &[SimulatedRequest],
         plan: &mut PlanBuilder,
     ) -> Result<(), Unsupported> {
-        if let Some(FirstAction::PrefillCapCommit(limit)) = first_action {
+        if let Some(
+            FirstAction::PrefillCapCommit(limit) | FirstAction::DeferredPrefillCapCommit(limit),
+        ) = first_action
+        {
             if !self.first_wave.is_empty() || self.cap_commit_targets.is_empty() {
                 return Err(Unsupported::InvalidPlan);
             }
@@ -395,7 +442,7 @@ impl TrajectoryAdapter<FirstAction> for CohortTrajectory {
                 }
             }
             Some(FirstAction::Static) | None => {}
-            Some(FirstAction::PrefillCapCommit(_)) => {
+            Some(FirstAction::PrefillCapCommit(_) | FirstAction::DeferredPrefillCapCommit(_)) => {
                 unreachable!("handled before fixed-wave planning")
             }
         }
