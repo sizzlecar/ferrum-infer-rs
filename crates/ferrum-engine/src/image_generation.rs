@@ -284,6 +284,7 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
     /// Include the composition's one aggregate native allowance in resident
     /// batch planning. Reference has no native overhead and keeps zero. This
     /// does not reduce the runtime ceiling or duplicate a capacity reservation.
+    #[cfg(any(feature = "cuda", test))]
     pub(super) fn with_device_opaque_allowance(mut self, bytes: u64) -> anyhow::Result<Self> {
         ensure!(
             bytes < self.config.device_capacity_bytes,

@@ -11,6 +11,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 // Reuse the existing observation-only proxy, including its real allocations,
 // uploads and computation. This is a second module instance, not copied code.
+// This fixture uses only the fence-failure subset of the shared fault controls.
+#[allow(dead_code)]
 #[path = "fault_runtime.rs"]
 mod fault_runtime;
 use fault_runtime::{FaultRuntime, FenceMode};

@@ -70,6 +70,8 @@ impl Artifacts {
         Ok(Self { directory })
     }
 
+    // Shared by several diagnostic binaries; not every binary reads paths back.
+    #[allow(dead_code)]
     pub fn directory(&self) -> &Path {
         &self.directory
     }
@@ -89,6 +91,8 @@ impl Artifacts {
             .open(self.directory.join(name))?)
     }
 
+    // Some consumers produce JSON-only diagnoses using this same artifact type.
+    #[allow(dead_code)]
     pub fn bytes(&self, name: &str, bytes: &[u8]) -> Result<()> {
         let mut file = self.file(name)?;
         file.write_all(bytes)?;
@@ -104,6 +108,8 @@ impl Artifacts {
         Ok(())
     }
 
+    // Only the projection diagnostic exports a one-weight safetensors archive.
+    #[allow(dead_code)]
     pub fn single_weight_archive(
         &self,
         weight: &[u8],

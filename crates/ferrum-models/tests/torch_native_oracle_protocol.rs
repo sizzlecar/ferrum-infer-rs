@@ -4,5 +4,7 @@
 //! Run with `cargo test -p ferrum-models --test torch_native_oracle_protocol`.
 //! The ignored subprocess worker is invoked by its Rust timeout test only.
 
+// This target exercises protocol/ownership tests without building or running Torch.
+#[allow(dead_code)]
 #[path = "support/torch_native_oracle.rs"]
 mod native;

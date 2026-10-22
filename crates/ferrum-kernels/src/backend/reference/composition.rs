@@ -93,6 +93,7 @@ pub fn reference_vnext_capabilities() -> Result<BTreeSet<CapabilityId>, VNextErr
     ]))
 }
 
+#[cfg(test)]
 pub(super) fn reference_vnext_runtime_config(
     device_id: DeviceId,
 ) -> Result<ReferenceDeviceRuntimeConfig, VNextError> {

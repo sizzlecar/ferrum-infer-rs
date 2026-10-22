@@ -80,6 +80,12 @@ Choose one explicit experimental profile in that JSON:
   `maximum_batch_size` explicitly and keep serving `max_num_seqs` at or below it.
   The implementation ceiling is `STRUCTURED_ATTENTION_BF16_MAX_BATCH` (currently
   16). Larger or mixed-size batches are rejected, not serialized into fake batches.
+- `experimental_resident_v1` explicitly enables cross-batch residency with
+  `backend.pipeline.residency` set to `denoiser_and_decoder` or
+  `all_model_components`. The latter also retains text-encoder weights.
+  Residency is independent of precision and decoder batching; it does not
+  change the default cold preset. See the [runtime and retirement contract](../../docs/image-generation-runtime.md)
+  for exact-plan reuse, compatible weight snapshots, admission and shutdown.
 
 The pipeline maximum defaults to `1` when omitted. The service collects compatible
 FIFO requests up to `max_num_seqs`, bounded by `request_batch_max_wait_ms`.
@@ -90,8 +96,9 @@ it does not restrict the number of requests in a batch.
 
 `backend.pipeline.decoder_batch_policy` independently selects VAE execution:
 
-- `single_image` (default) compiles a B1 decoder, initializes its weights once
-  per request batch, and reuses that session for each image. Inputs are exact
+- `single_image` (default) compiles a B1 decoder and reuses one session for each
+  image in a request batch. Cold execution initializes that session per batch;
+  an explicit resident policy can reuse it across batches. Inputs are exact
   NCHW views of the same accounted Host backing. Each output retains its own
   accounted single-image allocation. TE and DiT still execute the admitted B.
 - `full_batch` explicitly selects the experimental diagnostic B-wide decoder.
@@ -100,8 +107,10 @@ it does not restrict the number of requests in a batch.
 
 Receipts record the selected policy, each stage's compiled `batch_size`, and
 `completed_executions`: decoding B requests uses B executions under `single_image`
-and one under `full_batch`. Both close the one decoder session before returning
-images. Sample-independent mathematics does not establish bitwise equality:
+and one under `full_batch`. Cold execution closes its decoder session before
+returning images. Resident execution reports `retirement.kind="resident"` and retains
+the session after trimming idle dynamic storage; explicit shutdown retires it.
+Sample-independent mathematics does not establish bitwise equality:
 backend convolution algorithms can change with batch geometry. Neither policy
 promises a fixed VRAM peak or fit without actual plan admission and measurement;
 Host input/output storage still grows with request count.
@@ -117,11 +126,11 @@ measured free-device headroom. Older configurations containing
 `pipeline.device_capacity_bytes` are rejected: remove that field and retain the
 intended total ceiling in `backend.usable_memory_bytes`.
 
-Both profiles recompile and reload component weights for each batch. The batched
-profile is experimental and unqualified until actual GPU tests establish its
-functional scope; neither profile establishes G3 readiness or throughput parity.
-Actual Host/device admission still decides whether a requested batch fits. There
-is no cross-batch component residency in this implementation.
+The cold profiles reload component weights for each batch. Compiled-plan caches
+can avoid recompilation when their complete typed keys match; plan caching alone
+does not retain device weights. All profiles remain experimental: selecting one
+does not establish G3 readiness, throughput parity or capacity for every shape.
+Actual Host/device admission still decides whether a requested batch fits.
 
 The HTTP path is `POST /v1/images/generations` with `model`, `prompt`, optional
 `size` (`WIDTHxHEIGHT`), `seed`, `n=1` and `response_format="b64_json"`.
@@ -131,6 +140,8 @@ for either image route. `--image-config` also rejects simultaneous MODEL,
 backend/budget flags and `--image-cudnn-library`: change its explicit JSON instead.
 Image defaults for `run` are 512×512 pixels and seed zero. HTTP defaults come from
 the named preset or the explicit `serving` configuration.
+Only text-to-image generation is exposed. Image editing, image-to-image inputs
+and `/v1/images/edits` are not supported by this product path.
 
 `run` creates its PNG destination exclusively, preserving RGBA and alpha. It
 emits a JSON receipt to stdout after the PNG is finished and synced. A failed

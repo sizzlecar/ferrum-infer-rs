@@ -4,7 +4,11 @@ Ferrum exposes OpenAI-shaped HTTP endpoints for local serving. This document
 describes the current product contract for the always-on server path.
 
 Ferrum serves text language models through chat completions, Responses, text
-completions, and model discovery. Experimental standalone embedding, ASR, and
+completions, and model discovery. An independently configured experimental
+text-to-image service exposes image generations through the same server.
+It is selected by a registered local pipeline directory or explicit
+`--image-config`; see the [image CLI and HTTP contract](../crates/ferrum-cli/README-image-generation.md).
+Experimental standalone embedding, ASR, and
 TTS implementations have been retired. Their HTTP routes return 404; the
 `embed`, `transcribe`, and `tts` CLI commands are no longer available.
 
@@ -20,6 +24,8 @@ will define their own contracts at the model registration and assembly boundary.
 | `POST /v1/chat/completions` | Supported | Non-streaming and streaming chat responses. |
 | `POST /v1/responses` | Supported, stateless | Ordered text/reasoning/tool history, non-streaming and streaming output, usage, and caller-owned function/namespace-tool loops. |
 | `POST /v1/completions` | Supported | Non-streaming and streaming text completions with a single string `prompt`; prompt arrays/objects are rejected with `param=prompt`. |
+| `POST /v1/images/generations` | Experimental, requires configured image service | Text-to-image only; `n=1`, `b64_json`, explicit model/prompt and optional size/seed. Unknown fields and unsupported controls are rejected. Without an image service, valid requests return HTTP 503. |
+| `POST /v1/images/edits` | Not supported | Returns HTTP 404; no image-to-image input path is exposed. |
 | `GET /v1/models` | Supported | Lists public model names and optional effective serving capacity. |
 | `POST /v1/embeddings` | Removed | Returns HTTP 404; requests are not routed to a text model. |
 | `POST /v1/audio/transcriptions` | Removed | Returns HTTP 404. |

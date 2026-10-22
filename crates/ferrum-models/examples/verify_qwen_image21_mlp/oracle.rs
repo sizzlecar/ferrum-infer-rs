@@ -1,7 +1,11 @@
 //! Predeclared one-row basis oracle. No candidate values produce expectations.
 //! Pure interval and integer-rounding helpers are shared with primitive qualification.
+// Reuse interval construction; primitive-qualification report methods are unused.
+#[allow(dead_code)]
 #[path = "../../../ferrum-kernels/src/backend/reference/transcendental/oracle/allowed.rs"]
 mod allowed;
+// SiLU needs exp, not the sibling tanh enclosure.
+#[allow(dead_code)]
 #[path = "../../../ferrum-kernels/src/backend/reference/transcendental/oracle/interval.rs"]
 mod interval;
 #[path = "../../../ferrum-kernels/src/backend/reference/transcendental/oracle/rounding.rs"]

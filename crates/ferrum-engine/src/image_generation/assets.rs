@@ -149,6 +149,7 @@ impl QwenImage21Assets {
         Ok(u32::try_from(self.vae.output_tensor()?.dimensions()[2])?)
     }
 
+    #[cfg(feature = "cuda")]
     pub(super) fn decoder(
         &self,
         height: u32,

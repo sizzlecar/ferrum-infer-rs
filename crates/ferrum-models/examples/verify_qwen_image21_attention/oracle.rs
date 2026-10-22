@@ -5,10 +5,16 @@
 mod arithmetic;
 #[path = "dense.rs"]
 mod dense;
+// This consumer needs Q/K allowed sets, not the standalone QK report/rotary API.
+#[allow(dead_code)]
 #[path = "../verify_qwen_image21_qk_norm/oracle.rs"]
 mod qk;
+// Attention uses the exp enclosure, not the shared tanh enclosure.
+#[allow(dead_code)]
 #[path = "../../../ferrum-kernels/src/backend/reference/transcendental/oracle/interval.rs"]
 mod real_interval;
+// Only conversion/rounding helpers are needed by this oracle.
+#[allow(dead_code)]
 #[path = "../../../ferrum-kernels/src/backend/reference/transcendental/oracle/rounding.rs"]
 mod rounding;
 #[cfg(test)]

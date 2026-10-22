@@ -2,41 +2,57 @@
 //! All tensor payloads use one Host account and the ordinary device ledger.
 //! See --help. Synthetic finite dyadic data probes shapes, not model quality.
 use std::any::Any;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
+#[cfg(any(feature = "cuda-cutlass-fp8", test))]
+use std::collections::BTreeSet;
+#[cfg(feature = "cuda-cutlass-fp8")]
 use std::sync::OnceLock;
 
 use anyhow::{ensure, Context, Result};
+#[cfg(any(feature = "cuda-cutlass-fp8", test))]
 use ferrum_runtime::*;
+#[cfg(any(feature = "cuda-cutlass-fp8", test))]
 use half::bf16;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::json;
+#[cfg(feature = "cuda-cutlass-fp8")]
+use serde_json::Value;
 
 #[path = "bench_managed_fp8/arguments.rs"]
 mod arguments;
 #[cfg(feature = "cuda-cutlass-fp8")]
 #[path = "bench_managed_fp8/execution.rs"]
 mod execution;
+#[cfg(feature = "cuda-cutlass-fp8")]
 #[path = "bench_managed_fp8/family.rs"]
 mod family;
+#[cfg(any(feature = "cuda-cutlass-fp8", test))]
 #[path = "bench_managed_fp8/pattern.rs"]
 mod pattern;
 
+#[cfg(any(feature = "cuda-cutlass-fp8", test))]
 const X: &str = "value.fp8.bench.input";
+#[cfg(feature = "cuda-cutlass-fp8")]
 const W: &str = "value.fp8.bench.weight";
+#[cfg(feature = "cuda-cutlass-fp8")]
 const Y: &str = "value.fp8.bench.output";
+#[cfg(feature = "cuda-cutlass-fp8")]
 const PROFILE: &str = "cuda.cutlass.sm120.w8a8.bf16.rowwise_e4m3fn.v1";
 
+#[cfg(any(feature = "cuda-cutlass-fp8", test))]
 fn id<T: TryFrom<String>>(name: impl Into<String>) -> T
 where
     T::Error: std::fmt::Debug,
 {
     T::try_from(name.into()).expect("internal benchmark identifier")
 }
+#[cfg(any(feature = "cuda-cutlass-fp8", test))]
 fn invalid(reason: impl Into<String>) -> VNextError {
     VNextError::InvalidExecutionPlan {
         reason: reason.into(),
     }
 }
+#[cfg(feature = "cuda-cutlass-fp8")]
 fn tensor(dimensions: Vec<u64>) -> ProgramTensorSpec {
     ProgramTensorSpec {
         dimensions,

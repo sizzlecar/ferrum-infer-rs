@@ -119,6 +119,7 @@ impl Arguments {
         );
         Ok(e)
     }
+    #[cfg(feature = "cuda-cutlass-fp8")]
     pub fn host_limits(&self) -> Result<HostMemoryLimits> {
         let e = self.validate()?;
         Ok(HostMemoryLimits::new(

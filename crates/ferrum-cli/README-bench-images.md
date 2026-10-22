@@ -54,8 +54,27 @@ decoded RGBA8 hash and PNG file hash, plus per-repetition and pooled success/err
 counts, E2E P50/P99 and validated images/second. PNG bytes/base64 are not written
 to the report or logs. The dataset itself is included for reproducibility.
 
+To retain the validated images for inspection, provide both
+`--capture-dir /path/to/new-directory` and
+`--maximum-capture-bytes BYTES`, with a nonzero aggregate encoded-PNG byte limit.
+The directory must not exist. Each image, including warmup images, uses an
+exclusive file with numeric endpoint/phase/repetition/sample indices; prompts
+and sample IDs never become path components. The client writes the validated
+PNG buffer directly, without a second PNG copy or an unbounded writer queue.
+The report links capture records to sample IDs and records independent capture
+failures. Incomplete capture makes the command exit nonzero after the report is
+saved, while retaining the HTTP/validation result; a failed write may leave a
+partial file and is never reported as a complete capture.
+
 The primary throughput denominator includes client PNG validation and all failed
-requests. A separate first-send to last-body-reception span is recorded; it can
+requests, plus local capture IO when enabled. Request E2E ends at complete HTTP
+body reception and excludes both validation and capture. With capture enabled,
+validation time includes blocking-worker queue time through decode completion,
+but excludes saving; capture records contain separate save timing. Without
+capture, the original validation cutoff after worker join is retained.
+Capture can delay the next paced request, so compare capture-enabled and
+capture-disabled throughput only with that difference disclosed.
+A separate first-send to last-body-reception span is recorded; it can
 overlap validation of earlier responses and is not server-only throughput.
 Latency percentiles include successful, validated images only; failures remain
 explicit. Client admission follows dataset order, while concurrent network/server

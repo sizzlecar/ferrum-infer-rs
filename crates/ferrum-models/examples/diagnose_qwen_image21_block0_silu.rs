@@ -2,6 +2,8 @@
 //! This never executes CUDA or changes the original Block0 acceptance criterion.
 #[path = "verify_qwen_image21_projection/artifacts.rs"]
 mod artifacts;
+// Share artifact identity checks; SiLU replay does not load Dense weight slices.
+#[allow(dead_code)]
 #[path = "diagnose_qwen_image21_block0_dense/source.rs"]
 mod source;
 

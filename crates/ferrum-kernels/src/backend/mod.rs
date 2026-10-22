@@ -63,6 +63,8 @@ pub mod cuda;
 // CUDA admission arithmetic and constructor ownership are independently
 // testable without loading the CUDA driver or creating a context.
 #[cfg(any(feature = "cuda", test))]
+// CPU tests exercise policy arithmetic and drop order, not every CUDA accessor.
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
 #[path = "cuda/vnext_runtime/tensor_eager/memory_policy.rs"]
 mod cuda_tensor_memory_policy;
 

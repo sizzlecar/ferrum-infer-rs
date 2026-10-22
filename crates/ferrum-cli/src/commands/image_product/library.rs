@@ -52,6 +52,7 @@ fn first_library(directories: &[PathBuf]) -> Result<Option<PathBuf>> {
     }
     Ok(None)
 }
+#[cfg(any(target_os = "linux", test))]
 fn cache_paths(cache: &str) -> impl Iterator<Item = PathBuf> + '_ {
     cache.lines().filter_map(|line| {
         let (description, path) = line.split_once("=>")?;

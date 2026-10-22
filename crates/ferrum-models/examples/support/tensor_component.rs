@@ -115,12 +115,14 @@ pub fn initialize_resources<R: DeviceRuntime>(
 
 /// Caller-owned source bytes plus their explicit tensor port. This descriptor
 /// grants no runtime authority; bytes enter the executor only after Host charge.
+#[allow(dead_code)] // Some examples reuse only initialization and policy helpers.
 pub struct ComponentInput<'a> {
     pub value_id: ProgramValueId,
     pub tensor: ResolvedTensorSpec,
     pub bytes: &'a [u8],
 }
 
+#[allow(dead_code)] // Shared consumers may run their own execution/retirement loop.
 pub struct StoredComponentRuntime<'a, R: DeviceRuntime> {
     pub runtime: Arc<R>,
     pub registry: &'a OperationRuntimeRegistry<R>,
@@ -133,6 +135,7 @@ pub struct StoredComponentRuntime<'a, R: DeviceRuntime> {
 
 /// Shared managed execution for diagnostic Stored tensor components. Output
 /// capacity comes from compiler-derived ports, never an assumed node count.
+#[allow(dead_code)] // Not used by consumers with a custom managed execution loop.
 pub fn execute_stored_component<R: DeviceRuntime>(
     family: &PreparedModelFamily,
     source: &dyn WeightComponentSource,
@@ -164,6 +167,7 @@ pub fn execute_stored_component<R: DeviceRuntime>(
 /// Uses the model adapter's complete compile options, including shape-dependent
 /// transport outputs. Supplied input tensors must exactly match those options;
 /// an intermediate spec never grants permission to change an input ABI.
+#[allow(dead_code)] // Only consumers with shape-dependent ports use this variant.
 pub fn execute_stored_component_with_options<R: DeviceRuntime>(
     family: &PreparedModelFamily,
     source: &dyn WeightComponentSource,

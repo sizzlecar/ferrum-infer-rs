@@ -3,6 +3,8 @@
 //! BF16 sets retain BOTH normalization and learned-scale conversions.
 #[path = "rotary.rs"]
 mod rotary;
+// Reuse the qualified integer conversion helpers, without its SiLU operations.
+#[allow(dead_code)]
 #[path = "../../../ferrum-kernels/src/backend/reference/transcendental/oracle/rounding.rs"]
 mod rounding;
 pub use rotary::RotaryProbe;
@@ -298,6 +300,7 @@ impl Prepared {
         self.rotary.as_ref().map(|(_, bytes)| bytes.as_slice())
     }
     /// Candidate-independent allowed sets prepared before execution.
+    #[allow(dead_code)] // Consumed by the attention oracle, not the standalone QK runner.
     pub fn expected_bf16(&self) -> &[Vec<Vec<u16>>] {
         &self.expected
     }

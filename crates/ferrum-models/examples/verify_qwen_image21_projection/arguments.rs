@@ -36,6 +36,8 @@ impl Backend {
     }
 }
 
+// Sibling examples reuse Backend/CudaOptions without the projection CLI parser.
+#[allow(dead_code)]
 pub struct Arguments {
     pub config: PathBuf,
     pub weight_fragment: PathBuf,
@@ -45,6 +47,7 @@ pub struct Arguments {
 }
 
 impl Arguments {
+    #[allow(dead_code)] // Used by the projection CLI; siblings parse their own inputs.
     pub fn parse(arguments: impl IntoIterator<Item = OsString>) -> Result<Option<Self>> {
         let mut arguments = arguments.into_iter().peekable();
         if arguments

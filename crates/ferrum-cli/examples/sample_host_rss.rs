@@ -11,7 +11,7 @@ use clap::Parser;
 use serde::Serialize;
 use std::path::PathBuf;
 
-#[cfg(unix)]
+#[cfg(all(unix, any(target_os = "linux", test)))]
 #[path = "sample_host_rss/sampling.rs"]
 mod sampling;
 
@@ -47,6 +47,7 @@ struct Arguments {
     stop_file: Option<PathBuf>,
 }
 
+#[cfg(all(unix, any(target_os = "linux", test)))]
 impl Arguments {
     fn validate(&self) -> std::io::Result<()> {
         let invalid = |message| std::io::Error::new(std::io::ErrorKind::InvalidInput, message);
@@ -88,6 +89,7 @@ impl Arguments {
     }
 }
 
+#[cfg(all(unix, any(target_os = "linux", test)))]
 fn create_output(path: &std::path::Path) -> std::io::Result<std::fs::File> {
     std::fs::OpenOptions::new()
         .write(true)

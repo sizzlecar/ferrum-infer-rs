@@ -11,10 +11,14 @@
 
 #[path = "../examples/verify_qwen_image21_projection/artifacts.rs"]
 mod artifacts;
+// Full-matrix replay uses exact dots without the selected-point report helpers.
+#[allow(dead_code)]
 #[path = "../examples/diagnose_qwen_image21_block0_dense/dyadic.rs"]
 mod dyadic;
 #[path = "support/torch_linear_oracle.rs"]
 mod linear;
+// Share native process/library ownership, not the Philox generation entrypoint.
+#[allow(dead_code)]
 #[path = "support/torch_native_oracle.rs"]
 mod native;
 #[path = "../examples/diagnose_qwen_image21_block0_dense/source.rs"]
