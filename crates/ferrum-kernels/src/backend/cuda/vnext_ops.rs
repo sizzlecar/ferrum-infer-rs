@@ -89,6 +89,8 @@ pub use tensor_dense_bf16::{
     NUMERICAL_PROFILE_IDENTITY as CUDA_DENSE_BF16_NUMERICAL_PROFILE_IDENTITY,
 };
 pub use tensor_silu::{
+    ATTENTION_NUMERICAL_IDENTITY as CUDA_STRUCTURED_ATTENTION_BF16_NUMERICAL_PROFILE_IDENTITY,
+    ATTENTION_NUMERICAL_PROFILE_ID as CUDA_STRUCTURED_ATTENTION_BF16_NUMERICAL_PROFILE_ID,
     BUNDLE_NUMERICAL_IDENTITY as CUDA_POINTWISE_BF16_NUMERICAL_PROFILE_IDENTITY,
     GATED_RESIDUAL_NUMERICAL_PROFILE_ID as CUDA_GATED_RESIDUAL_BF16_NUMERICAL_PROFILE_ID,
     HEAD_RMS_NORM_PROFILE_ID as CUDA_HEAD_RMS_NORM_BF16_NUMERICAL_PROFILE_ID,
@@ -353,6 +355,7 @@ pub fn cuda_tensor_runtime_config(
         CapabilityId::new(ferrum_runtime::LAYER_NORM_BF16_CAPABILITY_ID)?,
         CapabilityId::new(ferrum_runtime::HEAD_RMS_NORM_BF16_CAPABILITY_ID)?,
         CapabilityId::new(ferrum_runtime::ADJACENT_ROPE_BF16_CAPABILITY_ID)?,
+        CapabilityId::new(ferrum_runtime::STRUCTURED_ATTENTION_BF16_CAPABILITY_ID)?,
     ]);
     config.dynamic_storage_profiles = BTreeSet::from([DynamicStorageProfile::new(
         DynamicStorageAllocator::LinearArena,
@@ -404,6 +407,21 @@ pub fn cuda_vnext_tensor_component_providers(
     runtime: &CudaDeviceRuntime,
 ) -> Result<Vec<Box<dyn OperationProvider<CudaDeviceRuntime>>>, CudaDeviceRuntimeError> {
     tensor_silu::all_component_providers(runtime)
+}
+
+/// Builds nine providers: the existing eight tensor component providers plus
+/// bounded, nonpaged structured BF16 attention, sharing one native module and
+/// capacity permit. Attention passes its mask by value (2312 bytes; the entire
+/// pointer/scalar/mask parameter list is below 4 KiB). Its declared shared
+/// storage is 4*D dynamic bytes plus 36 static bytes, with no global score or
+/// workspace buffer. This is not a measurement of total native device usage.
+/// Register the corresponding contracts or retain only the required providers.
+/// Dense remains separate; the five/seven/eight-provider factory sets persist.
+/// This baseline implementation makes no optimized-throughput claim.
+pub fn cuda_vnext_tensor_attention_providers(
+    runtime: &CudaDeviceRuntime,
+) -> Result<Vec<Box<dyn OperationProvider<CudaDeviceRuntime>>>, CudaDeviceRuntimeError> {
+    tensor_silu::attention_providers(runtime)
 }
 
 /// Source, precise build options, and compiled PTX identity. This identifies

@@ -20,6 +20,8 @@ mod layer_norm;
 pub(crate) use layer_norm::ReferenceLayerNormLaunch;
 mod head_rms_norm;
 pub(crate) use head_rms_norm::{ReferenceHeadRmsNormLaunch, ReferenceHeadRmsNormShape};
+mod structured_attention;
+pub(crate) use structured_attention::ReferenceStructuredAttentionLaunch;
 mod adjacent_rope;
 pub(crate) use adjacent_rope::{ReferenceAdjacentRopeLaunch, ReferenceAdjacentRopeShape};
 mod pointwise;
@@ -328,6 +330,9 @@ enum ReferenceCommandKind {
     HeadRmsNorm {
         launch: ReferenceHeadRmsNormLaunch,
     },
+    StructuredAttention {
+        launch: ReferenceStructuredAttentionLaunch,
+    },
     AdjacentRope {
         launch: ReferenceAdjacentRopeLaunch,
     },
@@ -364,6 +369,7 @@ impl fmt::Debug for ReferenceDeviceCommand {
             ReferenceCommandKind::DenseLinear { .. } => "dense_linear",
             ReferenceCommandKind::LayerNorm { .. } => "layer_norm",
             ReferenceCommandKind::HeadRmsNorm { .. } => "head_rms_norm",
+            ReferenceCommandKind::StructuredAttention { .. } => "structured_attention",
             ReferenceCommandKind::AdjacentRope { .. } => "adjacent_rope",
             ReferenceCommandKind::ModulationScale { .. } => "modulation_scale",
             ReferenceCommandKind::GatedResidual { .. } => "gated_residual",
@@ -451,6 +457,19 @@ impl ReferenceDeviceCommand {
             kind: ReferenceCommandKind::DenseLinear {
                 launches: vec![launch].into_boxed_slice(),
             },
+        })
+    }
+
+    pub(crate) fn structured_attention_tensor(
+        launch: ReferenceStructuredAttentionLaunch,
+    ) -> Result<Self, ReferenceDeviceRuntimeError> {
+        launch.validate()?;
+        Ok(Self {
+            operation: "vnext_structured_attention_bf16",
+            logical_work: Some(launch.logical_work()?),
+            compute_dispatch_count: 1,
+            transfer_command_count: 0,
+            kind: ReferenceCommandKind::StructuredAttention { launch },
         })
     }
 
@@ -668,6 +687,9 @@ impl ReferenceDeviceCommand {
             ReferenceCommandKind::HeadRmsNorm { launch } => {
                 launch.validate_runtime(runtime_instance)
             }
+            ReferenceCommandKind::StructuredAttention { launch } => {
+                launch.validate_runtime(runtime_instance)
+            }
             ReferenceCommandKind::AdjacentRope { launch } => {
                 launch.validate_runtime(runtime_instance)
             }
@@ -734,6 +756,12 @@ impl ReferenceDeviceCommand {
                 head_rms_norm::execute(launch);
                 counters
                     .head_rms_norm_launches
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            ReferenceCommandKind::StructuredAttention { launch } => {
+                structured_attention::execute(launch);
+                counters
+                    .structured_attention_launches
                     .fetch_add(1, Ordering::Relaxed);
             }
             ReferenceCommandKind::AdjacentRope { launch } => {
@@ -944,6 +972,7 @@ struct ReferenceRuntimeCounters {
     layer_norm_launches: AtomicU64,
     head_rms_norm_launches: AtomicU64,
     adjacent_rope_launches: AtomicU64,
+    structured_attention_launches: AtomicU64,
     modulation_scale_launches: AtomicU64,
     gated_residual_launches: AtomicU64,
     silu_launches: AtomicU64,
@@ -963,6 +992,7 @@ pub struct ReferenceDeviceRuntimeSnapshot {
     pub layer_norm_launches: u64,
     pub head_rms_norm_launches: u64,
     pub adjacent_rope_launches: u64,
+    pub structured_attention_launches: u64,
     pub modulation_scale_launches: u64,
     pub gated_residual_launches: u64,
     pub silu_launches: u64,
@@ -1092,6 +1122,10 @@ impl ReferenceDeviceRuntime {
             layer_norm_launches: self.counters.layer_norm_launches.load(Ordering::Relaxed),
             head_rms_norm_launches: self.counters.head_rms_norm_launches.load(Ordering::Relaxed),
             adjacent_rope_launches: self.counters.adjacent_rope_launches.load(Ordering::Relaxed),
+            structured_attention_launches: self
+                .counters
+                .structured_attention_launches
+                .load(Ordering::Relaxed),
             modulation_scale_launches: self
                 .counters
                 .modulation_scale_launches

@@ -41,6 +41,12 @@ and head-wise RMSNorm. The `cuda_vnext_tensor_component_providers` factory adds
 All eight functions share that same module and permit; the older factories
 still return their original five or seven providers.
 
+The `cuda_vnext_tensor_attention_providers` factory adds
+[structured BF16 attention](bf16-structured-attention.md) as a ninth provider
+under the same module permit. Its mask is bounded by-value launch metadata;
+its Q/K/V/output remain admitted tensors. The eight-provider factory remains
+available without the attention provider.
+
 CUDA normalization currently accepts power-of-two widths up to 4096. Both
 providers check this during planning and encoding. They use a bounded
 adjacent-pair FP32 reduction, explicit square root and reciprocal division, and

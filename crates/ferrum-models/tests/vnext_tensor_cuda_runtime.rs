@@ -2,6 +2,8 @@
 //! Run explicitly under an exclusive GPU window. This is not image-model parity.
 #![cfg(feature = "cuda")]
 
+#[path = "vnext_tensor_cuda_runtime/attention.rs"]
+mod attention;
 #[path = "vnext_tensor_cuda_runtime/normalization.rs"]
 mod normalization;
 #[path = "vnext_tensor_cuda_runtime/rotary.rs"]

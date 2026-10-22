@@ -14,6 +14,7 @@ pub(super) struct RetainedFunctions {
     functions: [CudaFunction; 5],
     norm_functions: [CudaFunction; 2],
     rope_function: CudaFunction,
+    attention_function: CudaFunction,
     _provider: CudaTensorProviderRetention,
 }
 
@@ -51,9 +52,18 @@ impl RetainedFunctions {
             let rope_function = module.load_function(rope::FUNCTION).map_err(|error| {
                 CudaDeviceRuntimeError::driver("BF16 adjacent RoPE function load", error)
             })?;
-            Ok::<_, CudaDeviceRuntimeError>((pointwise, normalization, rope_function))
+            let attention_function =
+                module.load_function(attention::FUNCTION).map_err(|error| {
+                    CudaDeviceRuntimeError::driver("BF16 structured attention function load", error)
+                })?;
+            Ok::<_, CudaDeviceRuntimeError>((
+                pointwise,
+                normalization,
+                rope_function,
+                attention_function,
+            ))
         }));
-        let (functions, norm_functions, rope_function) = match loaded {
+        let (functions, norm_functions, rope_function, attention_function) = match loaded {
             Ok(Ok(functions)) => functions,
             Ok(Err(error)) => {
                 // A partially failed load has not certified native cleanup.
@@ -69,6 +79,7 @@ impl RetainedFunctions {
             functions,
             norm_functions,
             rope_function,
+            attention_function,
             _provider: provider,
         }))
     }
@@ -83,5 +94,9 @@ impl RetainedFunctions {
 
     pub(super) fn rope_function(&self) -> &CudaFunction {
         &self.rope_function
+    }
+
+    pub(super) fn attention_function(&self) -> &CudaFunction {
+        &self.attention_function
     }
 }

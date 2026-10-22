@@ -225,3 +225,102 @@ extern "C" __global__ void ferrum_vnext_adjacent_rope_bf16(
         output[2 * pair + 1] = ferrum_bf16_rne(__fmaf_rn(b, c, positive_product));
     }
 }
+
+// Mirrors Rust NativeMask. Bounded kernel parameters, not an unaccounted
+// device metadata allocation. All fields are validated before submission.
+struct FerrumStructuredAttentionMask {
+    uint32_t segment_count;
+    uint32_t segment_ends[32];
+    uint32_t bidirectional_mask;
+    uint32_t key_run_counts[16];
+    uint32_t key_run_ends[16 * 32];
+    uint32_t key_valid_masks[16];
+};
+static_assert(sizeof(FerrumStructuredAttentionMask) == 2312, "attention mask ABI");
+
+// One CTA per (batch, query, head). Each thread owns one query scalar and one
+// output accumulator. There is no S*S score matrix or per-thread D-array.
+// Finite scores use explicit separate FP32 operations and precise expf.
+// Any visible nonfinite score poisons that query's whole head with NaNs;
+// visible V values otherwise propagate IEEE arithmetic component-wise.
+extern "C" __global__ void ferrum_vnext_structured_attention_bf16(
+    const uint16_t* query, const uint16_t* key, const uint16_t* value,
+    uint16_t* output, uint64_t groups, uint64_t heads, uint32_t sequence,
+    uint32_t width, float scale, const FerrumStructuredAttentionMask mask) {
+    extern __shared__ float dot_values[];
+    __shared__ uint32_t visible_end, seen, poisoned, first_key;
+    __shared__ float maximum, denominator, correction, weight, inverse;
+    for (uint64_t group = blockIdx.x; group < groups; group += gridDim.x) {
+        const uint64_t head = group % heads;
+        const uint64_t row = group / heads;
+        const uint32_t batch = static_cast<uint32_t>(row / sequence);
+        const uint32_t q = static_cast<uint32_t>(row % sequence);
+        const uint64_t columns = heads * width;
+        const uint64_t query_offset = row * columns + head * width + threadIdx.x;
+        float q_scalar = 0.0f;
+        float accumulator = 0.0f;
+        if (threadIdx.x == 0) {
+            visible_end = q + 1;
+            for (uint32_t segment = 0; segment < mask.segment_count; ++segment) {
+                if (q < mask.segment_ends[segment]) {
+                    if ((mask.bidirectional_mask >> segment) & 1U) {
+                        visible_end = mask.segment_ends[segment];
+                    }
+                    break;
+                }
+            }
+            seen = 0;
+            poisoned = 0;
+        }
+        __syncthreads();
+        uint32_t run = 0;
+        for (uint32_t k = 0; k < visible_end; ++k) {
+            while (run + 1 < mask.key_run_counts[batch]
+                   && k >= mask.key_run_ends[batch * 32 + run]) {
+                ++run;
+            }
+            // Uniform within the CTA. Excluded keys are not loaded, so a
+            // masked NaN/Inf cannot contaminate either scores or values.
+            if (((mask.key_valid_masks[batch] >> run) & 1U) == 0) continue;
+            // No Q/K/V load for an empty visible set. Q is loaded only at
+            // the first visible key and retained in one scalar register.
+            if (!seen) q_scalar = ferrum_bf16_decode(query[query_offset]);
+            const uint64_t kv_offset = (static_cast<uint64_t>(batch) * sequence + k)
+                * columns + head * width + threadIdx.x;
+            dot_values[threadIdx.x] = __fmul_rn(q_scalar, ferrum_bf16_decode(key[kv_offset]));
+            __syncthreads();
+            ferrum_norm_pairwise(dot_values, width);
+            if (threadIdx.x == 0) {
+                const float score = __fmul_rn(dot_values[0], scale);
+                if (!isfinite(score)) {
+                    poisoned = 1;
+                } else if (!seen) {
+                    first_key = 1;
+                    seen = 1;
+                    maximum = score;
+                    denominator = 1.0f;
+                } else {
+                    first_key = 0;
+                    const float next_maximum = fmaxf(maximum, score);
+                    correction = expf(__fsub_rn(maximum, next_maximum));
+                    weight = expf(__fsub_rn(score, next_maximum));
+                    denominator = __fadd_rn(__fmul_rn(denominator, correction), weight);
+                    maximum = next_maximum;
+                }
+            }
+            __syncthreads();
+            if (poisoned) break;
+            const float v = ferrum_bf16_decode(value[kv_offset]);
+            accumulator = first_key ? v : __fadd_rn(
+                __fmul_rn(accumulator, correction), __fmul_rn(weight, v));
+            __syncthreads();
+        }
+        if (threadIdx.x == 0 && seen && !poisoned) {
+            inverse = __fdiv_rn(1.0f, denominator);
+        }
+        __syncthreads();
+        output[query_offset] = poisoned ? 0x7fc0U :
+            (seen ? ferrum_bf16_rne(__fmul_rn(accumulator, inverse)) : 0U);
+        __syncthreads();
+    }
+}

@@ -30,10 +30,15 @@ use super::super::vnext_runtime::{
 };
 use super::{binding, contract_error, implementation_fingerprint, provider_failure};
 
+mod attention;
 mod bundle;
 mod geometry;
 mod norm;
 mod rope;
+pub use attention::{
+    NUMERICAL_IDENTITY as ATTENTION_NUMERICAL_IDENTITY,
+    NUMERICAL_PROFILE_ID as ATTENTION_NUMERICAL_PROFILE_ID,
+};
 use bundle::RetainedFunctions;
 use geometry::{geometry, Shape};
 pub use norm::{
@@ -184,6 +189,7 @@ pub(super) fn numerical_fingerprint() -> String {
         include_bytes!("tensor_silu/geometry.rs"),
         include_bytes!("tensor_silu/norm.rs"),
         include_bytes!("tensor_silu/rope.rs"),
+        include_bytes!("tensor_silu/attention.rs"),
         norm::NUMERICAL_IDENTITY.as_bytes(),
         include_bytes!(concat!(
             env!("CARGO_MANIFEST_DIR"),
@@ -261,25 +267,32 @@ impl CudaTensorPointwiseProvider {
 pub(super) fn providers(
     runtime: &CudaDeviceRuntime,
 ) -> Result<Vec<Box<dyn OperationProvider<CudaDeviceRuntime>>>, CudaDeviceRuntimeError> {
-    assemble_providers(runtime, false, false)
+    assemble_providers(runtime, false, false, false)
 }
 
 pub(super) fn component_providers(
     runtime: &CudaDeviceRuntime,
 ) -> Result<Vec<Box<dyn OperationProvider<CudaDeviceRuntime>>>, CudaDeviceRuntimeError> {
-    assemble_providers(runtime, true, false)
+    assemble_providers(runtime, true, false, false)
 }
 
 pub(super) fn all_component_providers(
     runtime: &CudaDeviceRuntime,
 ) -> Result<Vec<Box<dyn OperationProvider<CudaDeviceRuntime>>>, CudaDeviceRuntimeError> {
-    assemble_providers(runtime, true, true)
+    assemble_providers(runtime, true, true, false)
+}
+
+pub(super) fn attention_providers(
+    runtime: &CudaDeviceRuntime,
+) -> Result<Vec<Box<dyn OperationProvider<CudaDeviceRuntime>>>, CudaDeviceRuntimeError> {
+    assemble_providers(runtime, true, true, true)
 }
 
 fn assemble_providers(
     runtime: &CudaDeviceRuntime,
     with_normalization: bool,
     with_rope: bool,
+    with_attention: bool,
 ) -> Result<Vec<Box<dyn OperationProvider<CudaDeviceRuntime>>>, CudaDeviceRuntimeError> {
     let descriptors = Kind::ALL
         .into_iter()
@@ -292,6 +305,9 @@ fn assemble_providers(
     };
     let rope_descriptor = with_rope
         .then(|| rope::descriptor(runtime.descriptor()))
+        .transpose()?;
+    let attention_descriptor = with_attention
+        .then(|| attention::descriptor(runtime.descriptor()))
         .transpose()?;
     let kernels = RetainedFunctions::load(runtime)?;
     let mut providers = descriptors
@@ -307,6 +323,9 @@ fn assemble_providers(
     providers.extend(norm::providers(norm_descriptors, &kernels));
     if let Some(descriptor) = rope_descriptor {
         providers.push(rope::provider(descriptor, &kernels));
+    }
+    if let Some(descriptor) = attention_descriptor {
+        providers.push(attention::provider(descriptor, &kernels));
     }
     Ok(providers)
 }
