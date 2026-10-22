@@ -233,6 +233,37 @@ where
         })
     }
 
+    /// Publish exactly this successfully initialized installation for immutable
+    /// reuse by compatible fixed-tensor plans. Original allocation, transaction,
+    /// generation and capacity ownership remain intact.
+    pub fn into_shared_plan_runtime(
+        self,
+        plan: &ExecutionPlan,
+    ) -> Result<
+        (
+            Arc<PlanRuntimeResources<D::Runtime>>,
+            super::SharedComponentWeights<D::Runtime>,
+        ),
+        StaticInitializationFailure<D>,
+    >
+    where
+        D: 'static,
+    {
+        let contract = match super::resource::SharedWeightContract::from_plan(plan) {
+            Ok(contract) => contract,
+            Err(error) => return Err(self.abort_activation(error)),
+        };
+        if self.transaction.admission().plan_id() != plan.payload().plan_id()
+            || self.transaction.admission().plan_hash() != plan.plan_hash()
+        {
+            return Err(self.abort_activation(VNextError::InvalidExecutionPlan {
+                reason: "shared weight publication differs from the initialized plan".to_owned(),
+            }));
+        }
+        self.into_plan_runtime()
+            .map(|resources| PlanRuntimeResources::publish_initialized_weights(resources, contract))
+    }
+
     /// Stop after successful initialization when a cold activation check fails.
     /// Only this initialized owner can supply the quiescence proof; callers do
     /// not manufacture a stream, fence or a permission to release a raw lease.

@@ -1,7 +1,8 @@
 //! Qwen-Image 2.1 request batches on injected runtime owners.
 //!
 //! Cold is the default. Optional DenoiserAndDecoder residency retains two
-//! exact-plan sessions, releasing idle dynamic backing between stages. TE and
+//! exact-plan sessions and immutable weight snapshots across compatible plans,
+//! releasing idle dynamic backing between stages. TE and
 //! noise stay cold. A bounded optional cache reuses compiled plans. Compatible
 //! requests share real batched component forwards. These policies are not
 //! throughput qualification or proof that every configured shape fits.

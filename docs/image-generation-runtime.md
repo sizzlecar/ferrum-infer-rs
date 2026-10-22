@@ -53,10 +53,17 @@ insufficient device ceiling remains an admission error, not an implicit offload.
 
 Only an identical complete plan can reuse a session. Different geometry,
 mask, profile, or provider implementation closes the old session before
-initializing its replacement. Historical prompts with different padded text
-lengths or validity masks can therefore miss the DiT session cache: this does
-not promise that an arbitrary eight-prompt workload avoids uploads. Sources,
-runtime, profiles and policy remain fixed within the pipeline instance.
+binding its replacement. Resident mode also keeps one explicitly initialized
+readonly weight snapshot per retained stage. A replacement with the same
+execution weight plan, physical component placements and static layout can
+bind that snapshot without source reads, materialization or weight uploads.
+The original physical allocation and capacity claim remain single-owned;
+each new plan has separate dynamic pools and logical admission. A mismatch
+in that physical contract, runtime instance or admission ceiling fails before
+attachment, with no silent cold fallback. Sources, runtime, profiles and
+policy remain fixed within the pipeline instance. This mechanism does not
+infer equal checkpoint contents from paths or schema names, and supports no
+mutable static state or device static transforms.
 
 After a resident stage completes, the runtime must release its idle dynamic
 backing before the session enters the slot. Its static resources stay charged.
@@ -69,8 +76,18 @@ uploaded bytes again for reused sessions. Plan-change evictions and shutdown
 produce explicit zero-execution close receipts rather than counting previous
 execution timings twice.
 
+`weights_reused: true` distinguishes shared physical weights from a new cold
+upload. A changed-plan attachment has `session_reused: false`,
+`weights_reused: true` and an `initialization.kind: "shared_weights"` receipt
+identifying its original sealed installation. Exact-session reuse has both
+flags true. Closing a session can release zero static resources because the
+snapshot still owns them; this does not mean that its physical bytes are free.
+
 `QwenImage21Pipeline::shutdown` stops admission and explicitly closes retained
-sessions. Returned image Host backing remains usable after that close. CLI run
+sessions, then closes the final weight snapshots. Snapshot retirement produces
+separate `retirement.kind: "shared_weights_closed"` receipts. A referenced or
+failed snapshot close retains its typed physical owner for recovery. Returned
+image Host backing remains usable after that close. CLI run
 calls shutdown before PNG encoding. The HTTP worker calls the same hook after
 normal shutdown, and its joined shutdown owner retains any original failure.
 A fatal generation error bypasses the hook: the original error plus pipeline

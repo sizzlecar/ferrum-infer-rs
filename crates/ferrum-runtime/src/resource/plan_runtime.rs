@@ -18,7 +18,8 @@ use super::{
     ResourcePoolIdentity, ResourcePoolOwnership, ResourceReservation, ResourceReservationBatch,
     ResourceTransactionAction, ResourceTransactionContext, ResourceTransactionDriver,
     ResourceTransactionIdentity, ResourceTransactionState, RwLock, RwLockReadGuard, Serialize,
-    StaticProvisioningBinding, StaticProvisioningLease, VNextError,
+    SharedComponentWeights, SharedComponentWeightsEvidence, StaticProvisioningBinding,
+    StaticProvisioningLease, VNextError,
 };
 use crate::{
     ResolvedReusableExecutionBucket, ReusableExecutionBucketId, ReusableExecutionBucketSpec,
@@ -109,7 +110,7 @@ where
             .collect()
     }
 
-    fn release_all(&mut self) -> Result<usize, ResourceDriverFailure> {
+    pub(super) fn release_all(&mut self) -> Result<usize, ResourceDriverFailure> {
         let mut released = 0;
         for order in 0..self.states.len() {
             if self.states[order] == ResourceTransactionState::Released {
@@ -328,8 +329,30 @@ pub(super) enum PlanRuntimeStatic<R>
 where
     R: DeviceRuntime,
 {
-    NoStatic { binding: StaticProvisioningBinding },
+    NoStatic {
+        binding: StaticProvisioningBinding,
+    },
     Static(PlanStaticResources<R>),
+    Shared {
+        binding: StaticProvisioningBinding,
+        weights: SharedComponentWeights<R>,
+    },
+}
+
+impl<R: DeviceRuntime> PlanRuntimeStatic<R> {
+    fn binding(&self) -> &StaticProvisioningBinding {
+        match self {
+            Self::NoStatic { binding } | Self::Shared { binding, .. } => binding,
+            Self::Static(source) => &source.admission,
+        }
+    }
+    fn lease(&self) -> Option<&StaticProvisioningLease<R>> {
+        match self {
+            Self::NoStatic { .. } => None,
+            Self::Static(source) => source.lease.as_ref(),
+            Self::Shared { weights, .. } => Some(weights.lease()),
+        }
+    }
 }
 
 /// Unique plan-lifetime owner of the runtime, dynamic pools, maintenance
@@ -677,6 +700,8 @@ pub struct TrustedPlanRuntimeEvidence {
     static_provisioning_binding: Option<StaticProvisioningBinding>,
     static_pool_identity: Option<ResourcePoolIdentity>,
     static_provisioning_identity: Option<ResourceTransactionIdentity>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    shared_component_weights: Option<SharedComponentWeightsEvidence>,
 }
 
 impl TrustedPlanRuntimeEvidence {
@@ -711,6 +736,10 @@ impl TrustedPlanRuntimeEvidence {
     pub fn static_provisioning_identity(&self) -> Option<&ResourceTransactionIdentity> {
         self.static_provisioning_identity.as_ref()
     }
+
+    pub fn shared_component_weights(&self) -> Option<&SharedComponentWeightsEvidence> {
+        self.shared_component_weights.as_ref()
+    }
 }
 
 impl<R> NoStatic<R>
@@ -743,11 +772,8 @@ where
     R: DeviceRuntime,
 {
     fn evidence(&self) -> TrustedPlanRuntimeEvidence {
-        let (binding, identity) = match &self.static_resources {
-            PlanRuntimeStatic::NoStatic { binding } => (binding, None),
-            PlanRuntimeStatic::Static(source) => (&source.admission, Some(&source.identity)),
-        };
-        let has_static = matches!(&self.static_resources, PlanRuntimeStatic::Static(_));
+        let binding = self.static_resources.binding();
+        let lease = self.static_resources.lease();
         TrustedPlanRuntimeEvidence {
             plan_id: binding.plan_id().clone(),
             plan_hash: binding.plan_hash().clone(),
@@ -756,9 +782,13 @@ where
                 .device_runtime_implementation_fingerprint()
                 .to_owned(),
             coordinator_id: self.dynamic_pools.logical_admission.id(),
-            static_provisioning_binding: has_static.then(|| binding.clone()),
-            static_pool_identity: has_static.then(|| binding.pool_identity().clone()),
-            static_provisioning_identity: identity.cloned(),
+            static_provisioning_binding: lease.map(|lease| lease.admission().clone()),
+            static_pool_identity: lease.map(|lease| lease.admission().pool_identity().clone()),
+            static_provisioning_identity: lease.map(|lease| lease.identity().clone()),
+            shared_component_weights: match &self.static_resources {
+                PlanRuntimeStatic::Shared { weights, .. } => Some(weights.evidence().clone()),
+                _ => None,
+            },
         }
     }
 
@@ -993,6 +1023,22 @@ where
                     }),
                 }
             }
+            PlanRuntimeStatic::Shared { weights, .. } => {
+                drop(runtime);
+                match weights.release_attachment() {
+                    Ok(released_static_resources) => {
+                        Ok(PlanRuntimeCloseOutcome::Closed(PlanRuntimeCloseReceipt {
+                            evidence,
+                            released_static_resources,
+                        }))
+                    }
+                    Err(failure) => Err(PlanRuntimeCloseFailure {
+                        failure: failure.failure,
+                        evidence,
+                        static_resources: Some(failure.resources),
+                    }),
+                }
+            }
         }
     }
 }
@@ -1028,35 +1074,22 @@ where
     }
 
     pub fn plan_id(&self) -> &PlanId {
-        match &self.resources.static_resources {
-            PlanRuntimeStatic::NoStatic { binding } => binding.plan_id(),
-            PlanRuntimeStatic::Static(source) => source.admission.plan_id(),
-        }
+        self.resources.static_resources.binding().plan_id()
     }
 
     pub fn plan_hash(&self) -> &PlanHash {
-        match &self.resources.static_resources {
-            PlanRuntimeStatic::NoStatic { binding } => binding.plan_hash(),
-            PlanRuntimeStatic::Static(source) => source.admission.plan_hash(),
-        }
+        self.resources.static_resources.binding().plan_hash()
     }
 
     pub fn device_id(&self) -> &DeviceId {
-        match &self.resources.static_resources {
-            PlanRuntimeStatic::NoStatic { binding } => binding.device_id(),
-            PlanRuntimeStatic::Static(source) => source.admission.device_id(),
-        }
+        self.resources.static_resources.binding().device_id()
     }
 
     pub fn runtime_implementation_fingerprint(&self) -> &str {
-        match &self.resources.static_resources {
-            PlanRuntimeStatic::NoStatic { binding } => {
-                binding.device_runtime_implementation_fingerprint()
-            }
-            PlanRuntimeStatic::Static(source) => {
-                source.admission.device_runtime_implementation_fingerprint()
-            }
-        }
+        self.resources
+            .static_resources
+            .binding()
+            .device_runtime_implementation_fingerprint()
     }
 
     pub fn coordinator_id(&self) -> LogicalAdmissionCoordinatorId {
@@ -1064,10 +1097,7 @@ where
     }
 
     pub fn static_provisioning(&self) -> Option<&StaticProvisioningLease<R>> {
-        match &self.resources.static_resources {
-            PlanRuntimeStatic::NoStatic { .. } => None,
-            PlanRuntimeStatic::Static(source) => source.lease.as_ref(),
-        }
+        self.resources.static_resources.lease()
     }
 
     pub fn evidence(&self) -> TrustedPlanRuntimeEvidence {
@@ -1097,10 +1127,7 @@ where
                 return Ok(None);
             }
         }
-        let binding = match &self.resources.static_resources {
-            PlanRuntimeStatic::NoStatic { binding } => binding,
-            PlanRuntimeStatic::Static(source) => &source.admission,
-        };
+        let binding = self.resources.static_resources.binding();
         let minimum_required =
             pools
                 .domains
@@ -1128,10 +1155,7 @@ where
     }
 
     pub(super) fn work_limits(&self) -> crate::RuntimeWorkLimits {
-        match &self.resources.static_resources {
-            PlanRuntimeStatic::NoStatic { binding } => binding.work_limits(),
-            PlanRuntimeStatic::Static(source) => source.admission.work_limits(),
-        }
+        self.resources.static_resources.binding().work_limits()
     }
 
     fn validate_work_shapes(

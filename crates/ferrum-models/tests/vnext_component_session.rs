@@ -20,6 +20,9 @@ use half::bf16;
 use safetensors::tensor::{serialize_to_file, Dtype, TensorView};
 use serde_json::json;
 
+#[path = "vnext_component_session/shared_weights.rs"]
+mod shared_weights;
+
 const DEVICE_BYTES: u64 = 4096;
 const INPUT_BYTES: usize = 12;
 const OUTPUT_BYTES: usize = 24;
@@ -112,49 +115,14 @@ impl Fixture {
     }
 
     fn initialize(&self, suffix: &str) -> TensorComponentSession<ReferenceDeviceRuntime> {
+        let component = self.compile_rows(2, &self.family);
         let runtime = self.composition.runtime();
-        let policy = TensorComponentPolicy::new(
-            DEVICE_BYTES,
-            runtime
-                .descriptor()
-                .dynamic_storage_profiles
-                .iter()
-                .copied()
-                .collect(),
-        )
-        .unwrap();
-        // Deliberately do not retain the output here: the component compiler
-        // must retain every output declared by the existing typed family.
-        let options = ProgramPlanCompileOptions::new(BTreeMap::from([(
-            id(IMAGE_PROJECTION_INPUT_ID),
-            ProgramTensorSpec {
-                dimensions: vec![2, 3],
-                element_type: ElementType::Bf16,
-                layout: ResolvedTensorLayout::Contiguous,
-            },
-        )]))
-        .unwrap();
-        let component = CompiledTensorComponent::compile(
-            self.family.clone(),
-            self.composition.registry(),
-            self.composition.catalog(),
-            &policy,
-            self.composition.weight_materializers(),
-            &options,
-        )
-        .unwrap();
         let session = component
             .initialize(
                 runtime.clone(),
                 self.host.clone(),
                 ComponentWeightSource::Stored(&self.source),
-                ComponentInitializationConfig {
-                    request_id: id(format!("request.component.init.{suffix}")),
-                    run_id: id(format!("run.component.init.{suffix}")),
-                    transaction_id: id(format!("transaction.component.init.{suffix}")),
-                    static_policy: StaticInitializationPolicy::new(WEIGHT_BYTES as u64, 8).unwrap(),
-                    executor: TensorExecutorConfig::default(),
-                },
+                Self::init_config(suffix),
             )
             .unwrap();
         let ComponentInitializationReceipt::Initialized { receipt } =
@@ -171,6 +139,54 @@ impl Fixture {
             .is_err());
         assert_eq!(self.host.usage().unwrap().committed_bytes(), 0);
         session
+    }
+
+    fn init_config(suffix: &str) -> ComponentInitializationConfig {
+        ComponentInitializationConfig {
+            request_id: id(format!("request.component.init.{suffix}")),
+            run_id: id(format!("run.component.init.{suffix}")),
+            transaction_id: id(format!("transaction.component.init.{suffix}")),
+            static_policy: StaticInitializationPolicy::new(WEIGHT_BYTES as u64, 8).unwrap(),
+            executor: TensorExecutorConfig::default(),
+        }
+    }
+
+    fn compile_rows(
+        &self,
+        rows: u64,
+        family: &PreparedModelFamily,
+    ) -> CompiledTensorComponent<ReferenceDeviceRuntime> {
+        let runtime = self.composition.runtime();
+        let policy = TensorComponentPolicy::new(
+            DEVICE_BYTES,
+            runtime
+                .descriptor()
+                .dynamic_storage_profiles
+                .iter()
+                .copied()
+                .collect(),
+        )
+        .unwrap();
+        // Deliberately do not retain the output here: the component compiler
+        // must retain every output declared by the existing typed family.
+        let options = ProgramPlanCompileOptions::new(BTreeMap::from([(
+            id(IMAGE_PROJECTION_INPUT_ID),
+            ProgramTensorSpec {
+                dimensions: vec![rows, family.program().weights()[0].tensor.dimensions[1]],
+                element_type: ElementType::Bf16,
+                layout: ResolvedTensorLayout::Contiguous,
+            },
+        )]))
+        .unwrap();
+        CompiledTensorComponent::compile(
+            family.clone(),
+            self.composition.registry(),
+            self.composition.catalog(),
+            &policy,
+            self.composition.weight_materializers(),
+            &options,
+        )
+        .unwrap()
     }
 
     fn input(&self, factor: f32) -> ManagedHostTensor {

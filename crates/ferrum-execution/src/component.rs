@@ -129,6 +129,9 @@ pub enum ComponentInitializationReceipt {
     Initialized {
         receipt: StaticInitializationReceipt,
     },
+    SharedWeights {
+        evidence: SharedComponentWeightsEvidence,
+    },
 }
 
 /// Compilation and provider binding happen before physical provisioning. The
@@ -195,30 +198,83 @@ impl<R: DeviceRuntime> CompiledTensorComponent<R> {
         source: ComponentWeightSource<'_>,
         config: ComponentInitializationConfig,
     ) -> Result<TensorComponentSession<R>, ComponentInitializationError<R>> {
-        let Self {
-            family,
-            executable,
-            providers,
-        } = self;
-        let (resources, receipt) = initialize_resources(
+        let (resources, receipt, _) = initialize_resources(
             runtime,
-            family,
-            executable.execution_plan(),
+            &self.family,
+            self.executable.execution_plan(),
             source,
             &host,
             &config,
+            false,
         )?;
+        self.create_session(resources, receipt, host, config.executor)
+    }
+
+    /// Cold initialize once, then explicitly retain this exact immutable
+    /// installation for compatible plans. No path/content cache is consulted.
+    pub fn initialize_shared_weights(
+        &self,
+        runtime: Arc<R>,
+        host: HostMemoryAccount,
+        source: ComponentWeightSource<'_>,
+        config: ComponentInitializationConfig,
+    ) -> Result<
+        (TensorComponentSession<R>, SharedComponentWeights<R>),
+        ComponentInitializationError<R>,
+    > {
+        SharedComponentWeights::<R>::validate_plan(self.executable.execution_plan())?;
+        let (resources, receipt, weights) = initialize_resources(
+            runtime,
+            &self.family,
+            self.executable.execution_plan(),
+            source,
+            &host,
+            &config,
+            true,
+        )?;
+        let weights = weights.expect("shared initialization returns its sealed owner");
+        self.create_session(resources, receipt, host, config.executor)
+            .map(|session| (session, weights))
+    }
+
+    /// Attach an existing installation; deliberately takes no checkpoint source.
+    /// The new plan has independent dynamic pools and uses the same device ledger.
+    pub fn initialize_with_shared_weights(
+        &self,
+        runtime: Arc<R>,
+        host: HostMemoryAccount,
+        weights: &SharedComponentWeights<R>,
+        config: ComponentInitializationConfig,
+    ) -> Result<TensorComponentSession<R>, ComponentInitializationError<R>> {
+        let resources =
+            weights.bind_plan(self.executable.execution_plan(), runtime, config.request_id)?;
+        let receipt = ComponentInitializationReceipt::SharedWeights {
+            evidence: weights.evidence().clone(),
+        };
+        // As for NoStatic plans, backing starts empty and grows through the
+        // executor's existing bounded admission/maintenance path. This avoids
+        // eager native allocations while merely attaching a weight snapshot.
+        self.create_session(resources, receipt, host, config.executor)
+    }
+
+    fn create_session(
+        &self,
+        resources: Arc<PlanRuntimeResources<R>>,
+        receipt: ComponentInitializationReceipt,
+        host: HostMemoryAccount,
+        config: TensorExecutorConfig,
+    ) -> Result<TensorComponentSession<R>, ComponentInitializationError<R>> {
         match PreparedTensorExecutor::new(
-            executable.clone(),
-            providers.clone(),
+            self.executable.clone(),
+            self.providers.clone(),
             resources.clone(),
             host,
-            config.executor,
+            config,
         ) {
             Ok(executor) => Ok(TensorComponentSession {
                 executor: Some(executor),
                 resources: Some(resources),
-                executable: executable.clone(),
+                executable: self.executable.clone(),
                 receipt,
             }),
             Err(source) => Err(ComponentInitializationError::Executor {
@@ -295,8 +351,13 @@ fn initialize_resources<R: DeviceRuntime>(
     source: ComponentWeightSource<'_>,
     host: &HostMemoryAccount,
     config: &ComponentInitializationConfig,
+    share_weights: bool,
 ) -> Result<
-    (Arc<PlanRuntimeResources<R>>, ComponentInitializationReceipt),
+    (
+        Arc<PlanRuntimeResources<R>>,
+        ComponentInitializationReceipt,
+        Option<SharedComponentWeights<R>>,
+    ),
     ComponentInitializationError<R>,
 > {
     source.validate(family.weights())?;
@@ -309,6 +370,7 @@ fn initialize_resources<R: DeviceRuntime>(
             return Ok((
                 provisioned.into_plan_runtime(),
                 ComponentInitializationReceipt::NoStatic,
+                None,
             ));
         }
         StaticProvisioning::Required(permit) => permit,
@@ -350,9 +412,16 @@ fn initialize_resources<R: DeviceRuntime>(
     let receipt = ComponentInitializationReceipt::Initialized {
         receipt: initialized.receipt().clone(),
     };
-    match initialized.into_plan_runtime() {
-        Ok(resources) => Ok((resources, receipt)),
-        Err(source) => Err(ComponentInitializationError::Handoff { source, receipt }),
+    if share_weights {
+        match initialized.into_shared_plan_runtime(plan) {
+            Ok((resources, weights)) => Ok((resources, receipt, Some(weights))),
+            Err(source) => Err(ComponentInitializationError::Handoff { source, receipt }),
+        }
+    } else {
+        match initialized.into_plan_runtime() {
+            Ok(resources) => Ok((resources, receipt, None)),
+            Err(source) => Err(ComponentInitializationError::Handoff { source, receipt }),
+        }
     }
 }
 

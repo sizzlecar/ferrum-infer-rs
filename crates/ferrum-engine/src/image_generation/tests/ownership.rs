@@ -68,6 +68,7 @@ fn stage_execution_failure_keeps_real_stored_resources_until_explicit_recovery_c
     let active = ActiveImageStage {
         receipt: ImageStageExecutionReceipt {
             session_reused: false,
+            weights_reused: false,
             plan,
             initialization: session.initialization_receipt().clone(),
             completed_executions: 0,

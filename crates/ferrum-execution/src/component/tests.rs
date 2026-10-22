@@ -12,6 +12,35 @@ mod fixture;
 use fixture::*;
 
 struct UnreadSource(AtomicUsize);
+
+#[test]
+fn shared_weight_publication_rejects_none_and_mutable_static_before_source_access() {
+    let source = UnreadSource(AtomicUsize::new(0));
+    for (stored, persistent) in [(false, false), (false, true), (true, true)] {
+        let compiled = compile(&Config { stored, persistent });
+        let runtime = f::runtime(compiled.executable().execution_plan());
+        let weak = Arc::downgrade(&runtime);
+        let error = compiled
+            .initialize_shared_weights(
+                runtime,
+                host(),
+                if stored {
+                    ComponentWeightSource::Stored(&source)
+                } else {
+                    ComponentWeightSource::None
+                },
+                init_config(),
+            )
+            .err()
+            .unwrap();
+        assert!(matches!(error, ComponentInitializationError::Contract(_)));
+        assert!(
+            weak.upgrade().is_none(),
+            "rejected sharing must retain no new runtime owner"
+        );
+    }
+    assert_eq!(source.0.load(Ordering::Relaxed), 0);
+}
 impl WeightComponentSource for UnreadSource {
     fn component<'a>(
         &'a self,

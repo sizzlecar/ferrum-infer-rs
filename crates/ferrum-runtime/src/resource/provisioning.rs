@@ -1,8 +1,8 @@
 use super::{
     device_capacity_account, invalid_resource, issue_generation,
     validate_runtime_descriptor_for_admission, Arc, BTreeMap, BTreeSet, CapacityDomainId,
-    CapacityDomainSpec, CapacityUnits, DeviceCapacityClaim, DeviceId, DeviceRuntime,
-    DynamicBackingPoolSpec, DynamicPoolDomainSpec, DynamicPoolMaintenanceController,
+    CapacityDomainSpec, CapacityUnits, DeviceCapacityBudget, DeviceCapacityClaim, DeviceId,
+    DeviceRuntime, DynamicBackingPoolSpec, DynamicPoolDomainSpec, DynamicPoolMaintenanceController,
     DynamicPoolSet, DynamicResourceDescriptor, ExecutionPlan, LogicalAdmissionCoordinator,
     PlanHash, PlanId, PlanNode, RequestIdentity, ResourcePoolId, ResourcePoolIdentity,
     ResourceReservationBatch, StaticProvisioningBinding, VNextError,
@@ -252,6 +252,49 @@ impl ExecutionPlan {
     where
         R: DeviceRuntime,
     {
+        let PlanProvisioningBase {
+            maintenance_controller,
+            dynamic_pools,
+            reservations,
+            budget,
+            binding,
+            runtime,
+        } = self.prepare_plan_provisioning(runtime, request_id, false)?;
+        if reservations.reservations().is_empty() {
+            return Ok(ProvisionedPlanResources::new(StaticProvisioning::NoStatic(
+                NoStatic {
+                    maintenance_controller,
+                    dynamic_pools,
+                    binding,
+                    runtime,
+                },
+            )));
+        }
+        let account = device_capacity_account(
+            binding.device_id(),
+            binding.device_runtime_implementation_fingerprint(),
+            binding.device_capacity_bytes(),
+        )?;
+        let capacity_claim = account.claim(&budget, reservations.total_size_bytes())?;
+        Ok(ProvisionedPlanResources::new(StaticProvisioning::Required(
+            StaticProvisioningPermit {
+                maintenance_controller,
+                dynamic_pools,
+                reservations,
+                capacity_claim,
+                binding,
+                runtime,
+                seal: AdmissionSeal,
+            },
+        )))
+    }
+
+    pub(super) fn prepare_plan_provisioning<R: DeviceRuntime>(
+        &self,
+        runtime: Arc<R>,
+        request_id: RequestIdentity,
+        shared_static: bool,
+    ) -> Result<PlanProvisioningBase<R>, VNextError> {
         let payload = self.payload();
         let memory = payload.memory();
         if runtime.descriptor().id != *payload.device_id()
@@ -311,7 +354,11 @@ impl ExecutionPlan {
             device_capacity_bytes: memory.device_capacity_bytes(),
             usable_capacity_bytes: memory.usable_capacity_bytes(),
             plan_static_bytes: memory.static_bytes(),
-            admitted_bytes: memory.static_bytes(),
+            admitted_bytes: if shared_static {
+                0
+            } else {
+                memory.static_bytes()
+            },
             maximum_active_sequences: memory.maximum_active_sequences(),
             admission_generation: generation,
         };
@@ -343,27 +390,22 @@ impl ExecutionPlan {
         )?;
         let maintenance_controller =
             DynamicPoolMaintenanceController::new(Arc::clone(&dynamic_pools));
-        if memory.static_allocations().is_empty() {
-            return Ok(ProvisionedPlanResources::new(StaticProvisioning::NoStatic(
-                NoStatic {
-                    maintenance_controller,
-                    dynamic_pools,
-                    binding,
-                    runtime,
-                },
-            )));
-        }
-        let capacity_claim = account.claim(&budget, reservations.total_size_bytes())?;
-        Ok(ProvisionedPlanResources::new(StaticProvisioning::Required(
-            StaticProvisioningPermit {
-                maintenance_controller,
-                dynamic_pools,
-                reservations,
-                capacity_claim,
-                binding,
-                runtime,
-                seal: AdmissionSeal,
-            },
-        )))
+        Ok(PlanProvisioningBase {
+            maintenance_controller,
+            dynamic_pools,
+            reservations,
+            budget,
+            binding,
+            runtime,
+        })
     }
+}
+
+pub(super) struct PlanProvisioningBase<R: DeviceRuntime> {
+    pub(super) maintenance_controller: DynamicPoolMaintenanceController<R>,
+    pub(super) dynamic_pools: Arc<DynamicPoolSet<R>>,
+    pub(super) reservations: ResourceReservationBatch,
+    pub(super) budget: Arc<DeviceCapacityBudget>,
+    pub(super) binding: StaticProvisioningBinding,
+    pub(super) runtime: Arc<R>,
 }

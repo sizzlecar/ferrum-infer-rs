@@ -1,5 +1,5 @@
-//! Two bounded, exact-plan session slots. Static and dynamic storage continue
-//! to use the existing runtime authority; this module creates no allocator.
+//! Two bounded session/snapshot slots. Compatible plans share the same sealed
+//! physical weights; dynamic storage remains independently admitted.
 use super::*;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
@@ -9,19 +9,36 @@ pub enum ImageResidencyPolicy {
     Cold,
     /// Retain DiT and VAE static state between batches, releasing idle dynamic
     /// backing after each stage. TE and noise remain cold. Different complete
-    /// plans (including masks/profiles) are closed before replacement.
+    /// plans (including masks/profiles) are closed before replacement. A new
+    /// plan may explicitly bind the same readonly physical weight snapshot;
+    /// incompatible weight contracts fail instead of being silently reused.
     DenoiserAndDecoder,
 }
 
 pub(super) struct ResidentStages<R: DeviceRuntime> {
     denoiser: Option<ActiveImageStage<R>>,
     decoder: Option<ActiveImageStage<R>>,
+    denoiser_weights: Option<ResidentWeights<R>>,
+    decoder_weights: Option<ResidentWeights<R>>,
+}
+struct ResidentWeights<R: DeviceRuntime> {
+    weights: SharedComponentWeights<R>,
+    origin: ImageStageExecutionReceipt,
 }
 impl<R: DeviceRuntime> ResidentStages<R> {
     pub(super) fn new() -> Self {
         Self {
             denoiser: None,
             decoder: None,
+            denoiser_weights: None,
+            decoder_weights: None,
+        }
+    }
+    fn weights_slot(&mut self, stage: ImageStage) -> Option<&mut Option<ResidentWeights<R>>> {
+        match stage {
+            ImageStage::Denoiser => Some(&mut self.denoiser_weights),
+            ImageStage::Decoder => Some(&mut self.decoder_weights),
+            _ => None,
         }
     }
     fn slot(&mut self, stage: ImageStage) -> Option<&mut Option<ActiveImageStage<R>>> {
@@ -56,6 +73,7 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
                 previous.receipt.execution_wall_durations_us.clear();
                 previous.receipt.initialization_wall_duration_us = 0;
                 previous.receipt.session_reused = true;
+                previous.receipt.weights_reused = true;
                 if previous.receipt.plan.plan_hash == prepared.plan.plan_hash
                     && previous.receipt.plan.family_fingerprint == prepared.plan.family_fingerprint
                     && previous.receipt.plan.profile == prepared.plan.profile
@@ -70,6 +88,17 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
                 previous.receipt.plan.compile_wall_duration_us = 0;
                 stages.push(previous.close()?);
             }
+            if let Some(weights) = self
+                .resident_stages
+                .weights_slot(prepared.plan.stage)
+                .and_then(|slot| slot.as_ref())
+                .map(|entry| entry.weights.clone())
+            {
+                // The runtime checks the actual Arc and full physical contract.
+                // On failure the slot keeps its snapshot; no source read or
+                // cold fallback can silently replace the selected installation.
+                return prepared.start_attached(self, job, &weights);
+            }
         }
         let source = match prepared.plan.stage {
             ImageStage::TextEncoder => {
@@ -81,7 +110,22 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
             }
             ImageStage::Decoder => ComponentWeightSource::Stored(self.assets.sources.vae.as_ref()),
         };
-        prepared.start(self, job, source)
+        let stage = prepared.plan.stage;
+        if self.config.residency == ImageResidencyPolicy::DenoiserAndDecoder
+            && matches!(stage, ImageStage::Denoiser | ImageStage::Decoder)
+        {
+            let (active, weights) = prepared.start_shared(self, job, source)?;
+            *self
+                .resident_stages
+                .weights_slot(stage)
+                .expect("resident weight stage") = Some(ResidentWeights {
+                weights,
+                origin: active.receipt.clone(),
+            });
+            Ok(active)
+        } else {
+            prepared.start(self, job, source)
+        }
     }
 
     pub(super) fn finish_stage(
@@ -133,6 +177,7 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
                 active.receipt.initialization_wall_duration_us = 0;
                 active.receipt.plan.compile_wall_duration_us = 0;
                 active.receipt.session_reused = true;
+                active.receipt.weights_reused = true;
                 match active.close() {
                     Ok(receipt) => completed_stages.push(receipt),
                     Err(failure) => {
@@ -143,6 +188,47 @@ impl<R: DeviceRuntime> QwenImage21Pipeline<R> {
                         })
                     }
                 }
+            }
+        }
+        // Every session has retired before any final snapshot release. A live
+        // failure/foreign execution owner makes close Referenced, never success.
+        for stage in [ImageStage::Denoiser, ImageStage::Decoder] {
+            if let Some(ResidentWeights {
+                weights,
+                mut origin,
+            }) = self
+                .resident_stages
+                .weights_slot(stage)
+                .and_then(Option::take)
+            {
+                origin.completed_executions = 0;
+                origin.execution_wall_durations_us.clear();
+                origin.initialization_wall_duration_us = 0;
+                origin.plan.compile_wall_duration_us = 0;
+                origin.session_reused = false;
+                origin.weights_reused = true;
+                let started = std::time::Instant::now();
+                let failure = match weights.close() {
+                    Ok(SharedComponentWeightsCloseOutcome::Closed(receipt)) => {
+                        completed_stages.push(ImageStageReceipt {
+                            execution: origin,
+                            close: None,
+                            retirement: ImageStageRetirement::SharedWeightsClosed { receipt },
+                            close_wall_duration_us: u64::try_from(started.elapsed().as_micros())
+                                .unwrap_or(u64::MAX),
+                        });
+                        continue;
+                    }
+                    Ok(outcome @ SharedComponentWeightsCloseOutcome::Referenced { .. }) => {
+                        ImageGenerationFailure::SharedWeightsReferenced { stage, outcome }
+                    }
+                    Err(source) => ImageGenerationFailure::SharedWeightsClose { stage, source },
+                };
+                return Err(ImageGenerationError {
+                    failure,
+                    completed_stages,
+                    completed_steps: Vec::new(),
+                });
             }
         }
         Ok(completed_stages)

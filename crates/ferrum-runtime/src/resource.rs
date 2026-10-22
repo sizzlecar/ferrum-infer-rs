@@ -96,6 +96,8 @@ mod work;
 pub use work::*;
 mod plan_runtime;
 pub use plan_runtime::*;
+mod shared_weights;
+pub use shared_weights::*;
 mod checkpoint;
 pub(crate) use checkpoint::*;
 pub use checkpoint::{

@@ -45,6 +45,9 @@ pub struct ImageStageExecutionReceipt {
     /// The initialization receipt belongs to the retained session's original
     /// initialization. When true, no initialization occurred for this batch.
     pub session_reused: bool,
+    /// This acquisition read an existing immutable installation, either through
+    /// the same session or a newly bound compatible plan. No weight upload ran.
+    pub weights_reused: bool,
     pub completed_executions: usize,
     /// Host wall time around component initialization, including no-static setup.
     pub initialization_wall_duration_us: u64,
@@ -67,6 +70,10 @@ pub struct ImageStageReceipt {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ImageStageRetirement {
     Closed,
+    /// The last physical snapshot owner retired after all resident sessions.
+    SharedWeightsClosed {
+        receipt: SharedComponentWeightsCloseReceipt,
+    },
     Resident {
         idle_release: DynamicPoolRebalanceReceipt,
     },
@@ -102,6 +109,14 @@ pub enum ImageGenerationFailure<R: DeviceRuntime> {
     Close {
         receipt: ImageStageExecutionReceipt,
         source: PlanRuntimeCloseFailure<R>,
+    },
+    SharedWeightsReferenced {
+        stage: ImageStage,
+        outcome: SharedComponentWeightsCloseOutcome<R>,
+    },
+    SharedWeightsClose {
+        stage: ImageStage,
+        source: SharedComponentWeightsCloseFailure<R>,
     },
 }
 
@@ -141,6 +156,16 @@ impl<R: DeviceRuntime> fmt::Display for ImageGenerationError<R> {
                 receipt.plan.stage,
                 source.failure()
             ),
+            ImageGenerationFailure::SharedWeightsReferenced { stage, .. } => {
+                write!(f, "image {stage:?} weight snapshot still has live owners")
+            }
+            ImageGenerationFailure::SharedWeightsClose { stage, source } => {
+                write!(
+                    f,
+                    "image {stage:?} weight retirement: {:?}",
+                    source.failure()
+                )
+            }
         }
     }
 }
@@ -154,6 +179,12 @@ impl<R: DeviceRuntime> std::error::Error for ImageGenerationError<R> {}
 pub(super) struct PreparedStage<R: DeviceRuntime> {
     pub(super) component: Arc<CompiledTensorComponent<R>>,
     pub(super) plan: ImageStagePlanReceipt,
+}
+
+enum StageWeightInitialization<'a, R: DeviceRuntime> {
+    Cold(ComponentWeightSource<'a>),
+    Share(ComponentWeightSource<'a>),
+    Attach(&'a SharedComponentWeights<R>),
 }
 impl<R: DeviceRuntime> PreparedStage<R> {
     pub(super) fn compile(
@@ -226,6 +257,42 @@ impl<R: DeviceRuntime> PreparedStage<R> {
         job: u64,
         source: ComponentWeightSource<'_>,
     ) -> Result<ActiveImageStage<R>, ImageGenerationFailure<R>> {
+        self.start_with_mode(pipeline, job, StageWeightInitialization::Cold(source))
+            .map(|(active, _)| active)
+    }
+
+    pub(super) fn start_shared(
+        self,
+        pipeline: &QwenImage21Pipeline<R>,
+        job: u64,
+        source: ComponentWeightSource<'_>,
+    ) -> Result<(ActiveImageStage<R>, SharedComponentWeights<R>), ImageGenerationFailure<R>> {
+        self.start_with_mode(pipeline, job, StageWeightInitialization::Share(source))
+            .map(|(active, weights)| {
+                (
+                    active,
+                    weights.expect("shared initialization returns its snapshot"),
+                )
+            })
+    }
+
+    pub(super) fn start_attached(
+        self,
+        pipeline: &QwenImage21Pipeline<R>,
+        job: u64,
+        weights: &SharedComponentWeights<R>,
+    ) -> Result<ActiveImageStage<R>, ImageGenerationFailure<R>> {
+        self.start_with_mode(pipeline, job, StageWeightInitialization::Attach(weights))
+            .map(|(active, _)| active)
+    }
+
+    fn start_with_mode(
+        self,
+        pipeline: &QwenImage21Pipeline<R>,
+        job: u64,
+        mode: StageWeightInitialization<'_, R>,
+    ) -> Result<(ActiveImageStage<R>, Option<SharedComponentWeights<R>>), ImageGenerationFailure<R>>
+    {
         let Self { component, plan } = self;
         let name = plan.stage.name();
         let config = (|| -> anyhow::Result<_> {
@@ -239,23 +306,49 @@ impl<R: DeviceRuntime> PreparedStage<R> {
         })()
         .map_err(ImageGenerationFailure::Preflight)?;
         let started = Instant::now();
-        match component.initialize(
-            pipeline.runtime.clone(),
-            pipeline.host.clone(),
-            source,
-            config,
-        ) {
-            Ok(session) => Ok(ActiveImageStage {
-                receipt: ImageStageExecutionReceipt {
-                    plan,
-                    initialization: session.initialization_receipt().clone(),
-                    session_reused: false,
-                    completed_executions: 0,
-                    initialization_wall_duration_us: elapsed_us(started),
-                    execution_wall_durations_us: Vec::new(),
+        let weights_reused = matches!(&mode, StageWeightInitialization::Attach(_));
+        let initialized = match mode {
+            StageWeightInitialization::Cold(source) => component
+                .initialize(
+                    pipeline.runtime.clone(),
+                    pipeline.host.clone(),
+                    source,
+                    config,
+                )
+                .map(|session| (session, None)),
+            StageWeightInitialization::Share(source) => component
+                .initialize_shared_weights(
+                    pipeline.runtime.clone(),
+                    pipeline.host.clone(),
+                    source,
+                    config,
+                )
+                .map(|(session, weights)| (session, Some(weights))),
+            StageWeightInitialization::Attach(weights) => component
+                .initialize_with_shared_weights(
+                    pipeline.runtime.clone(),
+                    pipeline.host.clone(),
+                    weights,
+                    config,
+                )
+                .map(|session| (session, None)),
+        };
+        match initialized {
+            Ok((session, weights)) => Ok((
+                ActiveImageStage {
+                    receipt: ImageStageExecutionReceipt {
+                        plan,
+                        initialization: session.initialization_receipt().clone(),
+                        session_reused: false,
+                        weights_reused,
+                        completed_executions: 0,
+                        initialization_wall_duration_us: elapsed_us(started),
+                        execution_wall_durations_us: Vec::new(),
+                    },
+                    session,
                 },
-                session,
-            }),
+                weights,
+            )),
             Err(source) => Err(ImageGenerationFailure::Initialization { plan, source }),
         }
     }

@@ -363,8 +363,12 @@ fn resident_real_decoder_reuses_one_initialization_and_shutdown_preserves_host_i
         );
     }
     let receipt = pipeline.shutdown().unwrap();
-    assert_eq!(receipt.len(), 1);
+    assert_eq!(receipt.len(), 2);
     assert!(receipt[0].close.is_some());
+    assert!(matches!(
+        receipt[1].retirement,
+        ImageStageRetirement::SharedWeightsClosed { .. }
+    ));
     assert_eq!(pipeline.runtime.snapshot().live_allocations, 0);
     drop(source);
     assert_eq!(
