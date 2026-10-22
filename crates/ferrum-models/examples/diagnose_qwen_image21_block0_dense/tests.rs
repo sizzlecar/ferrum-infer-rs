@@ -80,6 +80,30 @@ fn integer_bf16_ties_signed_zero_and_carry() {
 }
 
 #[test]
+fn dyadic_subtraction_rejects_minimum_signed_integer_without_sign_flip() {
+    let negative_max = Exact {
+        numerator: -i128::MAX,
+        exponent: 0,
+    };
+    let one = Exact {
+        numerator: 1,
+        exponent: 0,
+    };
+    assert!(negative_max.subtract(one).is_err());
+    let minimum = Exact {
+        numerator: i128::MIN,
+        exponent: 0,
+    };
+    let zero = Exact {
+        numerator: 0,
+        exponent: 0,
+    };
+    assert!(minimum.subtract(zero).is_err());
+    assert!(zero.subtract(minimum).is_err());
+    assert_eq!(negative_max.subtract(zero).unwrap().numerator, -i128::MAX);
+}
+
+#[test]
 fn artifact_replay_checks_hashes_and_exact_oi_row() -> Result<()> {
     use ferrum_models::qwen_image21::{
         QwenImage21Block0AttentionFamily as A, QwenImage21Block0Family as B,

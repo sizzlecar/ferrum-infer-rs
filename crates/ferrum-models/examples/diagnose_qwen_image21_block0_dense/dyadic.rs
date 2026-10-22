@@ -31,6 +31,10 @@ impl Exact {
         self.numerator as f64 * 2_f64.powi(self.exponent)
     }
     pub fn subtract(self, rhs: Self) -> Result<Self> {
+        ensure!(
+            self.numerator != i128::MIN && rhs.numerator != i128::MIN,
+            "unresolved: dyadic operand magnitude exceeds i128::MAX"
+        );
         if rhs.numerator == 0 {
             return Ok(self);
         }
@@ -38,12 +42,11 @@ impl Exact {
             return Ok(Self::new(-rhs.numerator, rhs.exponent));
         }
         let e = self.exponent.min(rhs.exponent);
-        Ok(Self::new(
-            scale(self.numerator, (self.exponent - e) as u32)?
-                .checked_sub(scale(rhs.numerator, (rhs.exponent - e) as u32)?)
-                .context("unresolved: dyadic subtraction exceeds i128")?,
-            e,
-        ))
+        let numerator = scale(self.numerator, (self.exponent - e) as u32)?
+            .checked_sub(scale(rhs.numerator, (rhs.exponent - e) as u32)?)
+            .filter(|value| *value != i128::MIN)
+            .context("unresolved: dyadic subtraction magnitude exceeds i128::MAX")?;
+        Ok(Self::new(numerator, e))
     }
     pub fn round_bf16(self) -> Result<u16> {
         let negative = self.numerator < 0;
