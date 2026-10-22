@@ -61,6 +61,9 @@ pub use allocation::*;
 mod solver;
 use solver::*;
 
+mod completion_order;
+use completion_order::CompletionOrderCache;
+
 mod memory;
 pub use memory::*;
 

@@ -3,14 +3,14 @@ use super::{
     invalid_plan, minimum_for_lifetime, node_completion_precedes, quantize_storage_bytes,
     static_contiguous_storage_profile, validate_active_sequence_ceiling,
     validate_pool_liveness_rows, workspace_storage_layout_fingerprint, AllocationKind,
-    AllocationLifetime, BTreeMap, BTreeSet, BufferRequest, BufferUsage, CanonicalU128, Deserialize,
-    Deserializer, DynamicBackingPoolId, DynamicBackingPoolSpec, DynamicResourceDemand,
-    DynamicResourceDescriptor, DynamicResourceShape, ElementType, InvocationLivenessMode,
-    InvocationResourceLiveness, NodeId, NodeWorkContract, PlanNode, PoolAggregateEvidence,
-    PoolCompatibilityKey, ResolvedReusableExecutionBucket, ResolvedValueRole, ResourceAllocation,
-    ResourceId, ReusableExecutionMemoryPlan, ReusableExecutionPolicy, ReusablePoolWorkspaceBudget,
-    Serialize, StepResourceSlot, StepResourceSlotKind, VNextError,
-    MAX_EXECUTION_PLAN_RESOURCE_ROWS,
+    AllocationLifetime, BTreeMap, BTreeSet, BufferRequest, BufferUsage, CanonicalU128,
+    CompletionOrderCache, Deserialize, Deserializer, DynamicBackingPoolId, DynamicBackingPoolSpec,
+    DynamicResourceDemand, DynamicResourceDescriptor, DynamicResourceShape, ElementType,
+    InvocationLivenessMode, InvocationResourceLiveness, NodeId, NodeWorkContract, PlanNode,
+    PoolAggregateEvidence, PoolCompatibilityKey, ResolvedReusableExecutionBucket,
+    ResolvedValueRole, ResourceAllocation, ResourceId, ReusableExecutionMemoryPlan,
+    ReusableExecutionPolicy, ReusablePoolWorkspaceBudget, Serialize, StepResourceSlot,
+    StepResourceSlotKind, VNextError, MAX_EXECUTION_PLAN_RESOURCE_ROWS,
 };
 
 mod startup;
@@ -720,6 +720,25 @@ impl MemoryPlan {
         descriptors: &[&DynamicResourceDescriptor],
         retained_completion_resources: &BTreeSet<ResourceId>,
     ) -> Result<Vec<StepResourceSlot>, VNextError> {
+        let nodes_by_id = nodes
+            .iter()
+            .map(|node| (node.id.clone(), node))
+            .collect::<BTreeMap<_, _>>();
+        let mut completion_order = CompletionOrderCache::new(&nodes_by_id);
+        Self::derive_pool_step_slots_with_order(
+            nodes,
+            descriptors,
+            retained_completion_resources,
+            |predecessor, successor| completion_order.precedes(predecessor, successor),
+        )
+    }
+
+    pub(super) fn derive_pool_step_slots_with_order(
+        nodes: &[PlanNode],
+        descriptors: &[&DynamicResourceDescriptor],
+        retained_completion_resources: &BTreeSet<ResourceId>,
+        mut precedes: impl FnMut(&NodeId, &NodeId) -> Result<bool, VNextError>,
+    ) -> Result<Vec<StepResourceSlot>, VNextError> {
         struct Interval<'a> {
             resource_id: &'a ResourceId,
             first_user: usize,
@@ -727,10 +746,6 @@ impl MemoryPlan {
             reusable: bool,
         }
 
-        let nodes_by_id = nodes
-            .iter()
-            .map(|node| (node.id.clone(), node))
-            .collect::<BTreeMap<_, _>>();
         // Fixed tensor inputs are uploaded before the whole submission wave,
         // even when their first consumer is much later. Only node-produced
         // values may therefore use the first/last-user liveness intervals.
@@ -805,19 +820,11 @@ impl MemoryPlan {
             ))
         });
 
-        let ordered_without_overlap = |left: &Interval<'_>, right: &Interval<'_>| {
+        let mut ordered_without_overlap = |left: &Interval<'_>, right: &Interval<'_>| {
             let left_before = left.last_user < right.first_user
-                && node_completion_precedes(
-                    &nodes_by_id,
-                    &nodes[left.last_user].id,
-                    &nodes[right.first_user].id,
-                )?;
+                && precedes(&nodes[left.last_user].id, &nodes[right.first_user].id)?;
             let right_before = right.last_user < left.first_user
-                && node_completion_precedes(
-                    &nodes_by_id,
-                    &nodes[right.last_user].id,
-                    &nodes[left.first_user].id,
-                )?;
+                && precedes(&nodes[right.last_user].id, &nodes[left.first_user].id)?;
             Ok::<bool, VNextError>(left_before || right_before)
         };
 

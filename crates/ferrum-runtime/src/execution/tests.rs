@@ -8,6 +8,9 @@ use crate::{
 #[path = "fixed_tensor_liveness_tests.rs"]
 mod fixed_tensor_liveness;
 
+#[path = "completion_order_cache_tests.rs"]
+mod completion_order_cache;
+
 #[test]
 fn execution_plan_wire_limit_is_symmetric() {
     super::validation::validate_execution_plan_wire_size(
